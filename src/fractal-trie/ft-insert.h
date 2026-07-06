@@ -561,16 +561,29 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 	struct cds_ft_inode_flag **deferred_slot = NULL;
 	struct cds_ft_inode_flag *deferred_child2 = NULL;
 	struct cds_ft_inode_flag **deferred_slot2 = NULL;
+	struct cds_ft_inode_flag *cur_parent;
 	bool branch_cluster_leaf = (suffix_len == 0);
 
 	unsigned int junction_depth = node_depth + diverge_pos;
 
+	/*
+	 * ONE resolved snapshot of the live cn->child (§9): the slot may carry
+	 * a peer's parked flip proxy -- kind-dispatching the raw latch faults
+	 * (item_to_metadata on the latch memory), and multiple raw re-reads
+	 * could tear across the peer's flip.  Every use below (sizing, the
+	 * fresh suffix's forward wiring, the deferred-edge captures) consumes
+	 * THIS value; a post-snapshot peer commit is caught by our forward
+	 * CAS / §4.B guard at commit time (ABORT -> re-descend).
+	 */
+	struct cds_ft_inode_flag *old_child_flag =
+		ft_cn_child_dereference_acquire_prefetch(cn);
+
 	/* Compute old child's nr_keys for the new nodes. */
-	if (!ft_node_external(cn->child)) {
+	if (!ft_node_external(old_child_flag)) {
 		struct cds_ft_metadata *cm =
-			cds_ft_item_to_metadata(ft_node_ptr(cn->child));
+			cds_ft_item_to_metadata(ft_node_ptr(old_child_flag));
 		old_child_nr_keys = ft_nr_keys_get(cm);
-	} else if (cn->child) {
+	} else if (old_child_flag) {
 		old_child_nr_keys = 1;	/* external leaf */
 	} else {
 		old_child_nr_keys = 0;
@@ -583,7 +596,7 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 
 		sfx = alloc_compressed_node(ft, suffix_len, &sfx_meta);
 		if (!sfx) goto error;
-		sfx->child = cn->child;
+		sfx->child = old_child_flag;
 		sfx->len = suffix_len;
 		memcpy(sfx->key_bytes, &cn->key_bytes[diverge_pos + 1], suffix_len);
 		ft_meta_nr_child_set(sfx_meta, 1);
@@ -598,12 +611,12 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 		 * below would otherwise recover sfx through it).  sfx->child
 		 * already points at cn->child (a write into the new sfx only).
 		 */
-		deferred_child = cn->child;
+		deferred_child = old_child_flag;
 		deferred_parent = old_suffix_flag;
 		deferred_slot = &sfx->child;
 	} else {
 		/* suffix_len == 0: old child directly. */
-		old_suffix_flag = cn->child;
+		old_suffix_flag = old_child_flag;
 	}
 
 	/* 2. Build new branch -> new leaf. */
@@ -694,7 +707,7 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 					old_ordinal, FT_PF_NONE);
 			ft_node_get_nth_skip(branch_flag, &deferred_slot2,
 					new_ordinal, FT_PF_NONE);
-			deferred_child = cn->child;
+			deferred_child = old_child_flag;
 			deferred_parent = branch_flag;
 			deferred_child2 = new_branch_flag;
 		}
@@ -809,7 +822,18 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 		ft->rank_stats ? node_depth + 2 : 0);
 	if (ret)
 		goto error;
-	ft_set_parent(ft, top_flag, cn_meta->parent, parent_slot);
+	/*
+	 * Resolve cn's parent back-pointer through a peer's parked flip proxy
+	 * (§9): the guard above validated the RESOLVED (parent, slot) pair,
+	 * but a raw re-read here can hand the type-7 latch itself to
+	 * ft_set_parent, whose ft_slot_to_byte type-dispatches on it (garbage
+	 * type -> assert / garbage bookkeeping stored on the fresh top).  The
+	 * resolved committed-or-old parent is a live node; if the peer's
+	 * commit re-homes cn afterwards, our forward CAS / §4.B guard aborts
+	 * and the fresh cluster (with its transient parent value) is discarded.
+	 */
+	cur_parent = ft_resolve_flip_proxy(rcu_dereference(cn_meta->parent));
+	ft_set_parent(ft, top_flag, cur_parent, parent_slot);
 	if (deferred_child2)
 		ft_set_parent(ft, deferred_child2, deferred_parent, deferred_slot2);
 	if (deferred_child) {
@@ -825,7 +849,7 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 		ic->live_parent = deferred_parent;
 		ic->live_slot = deferred_slot;
 	}
-	ft_insert_publish_or_park(ft, cn_meta->parent, parent_slot, top_flag, ic);
+	ft_insert_publish_or_park(ft, cur_parent, parent_slot, top_flag, ic);
 
 	/*
 	 * 7. Free the old compressed node.  Parked publish: readers resolve
@@ -918,11 +942,21 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 	struct cds_ft_inode_flag *deferred_parent = NULL;
 	struct cds_ft_inode_flag **deferred_slot = NULL;
 
-	if (!ft_node_external(cn->child)) {
+	/*
+	 * ONE resolved snapshot of the live cn->child (§9) -- see
+	 * ft_split_compressed_insert: a raw read may hand a peer's parked
+	 * flip proxy to the kind dispatch, and re-reads could tear across
+	 * the peer's flip.  All uses below consume this value; a
+	 * post-snapshot peer commit aborts ours at the forward CAS.
+	 */
+	struct cds_ft_inode_flag *old_child_flag =
+		ft_cn_child_dereference_acquire_prefetch(cn);
+
+	if (!ft_node_external(old_child_flag)) {
 		struct cds_ft_metadata *cm =
-			cds_ft_item_to_metadata(ft_node_ptr(cn->child));
+			cds_ft_item_to_metadata(ft_node_ptr(old_child_flag));
 		child_nr_keys = ft_nr_keys_get(cm);
-	} else if (cn->child) {
+	} else if (old_child_flag) {
 		child_nr_keys = 1;
 	} else {
 		child_nr_keys = 0;
@@ -948,7 +982,7 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 
 		sfx = alloc_compressed_node(ft, suffix_len, &sfx_meta);
 		if (!sfx) goto error;
-		sfx->child = cn->child;
+		sfx->child = old_child_flag;
 		sfx->len = suffix_len;
 		memcpy(sfx->key_bytes, &cn->key_bytes[remaining + 1],
 			suffix_len);
@@ -965,7 +999,7 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 		 * below would recover sfx through it.  sfx->child already
 		 * points at cn->child (a write into the new sfx only).
 		 */
-		deferred_child = cn->child;
+		deferred_child = old_child_flag;
 		deferred_parent = suffix_flag;	/* PLAIN sfx flag */
 		deferred_slot = &sfx->child;
 	} else if (suffix_len == 1) {
@@ -978,7 +1012,7 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 		 */
 		ret = ft_node_set_nth(ft, &dest,
 			cn->key_bytes[remaining + 1],
-			cn->child, NULL, NULL,
+			old_child_flag, NULL, NULL,
 			node_depth + remaining + 1, true);
 		if (ret) goto error;
 		{
@@ -989,12 +1023,12 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 		}
 		suffix_flag = dest;
 		created[nr_created++] = dest;
-		deferred_child = cn->child;
+		deferred_child = old_child_flag;
 		deferred_parent = dest;
 		ft_node_get_nth_skip(dest, &deferred_slot,
 			cn->key_bytes[remaining + 1], FT_PF_NONE);
 	} else {
-		suffix_flag = cn->child;
+		suffix_flag = old_child_flag;
 	}
 
 	/* Junction: internal node with suffix child. */
@@ -1029,7 +1063,7 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 			 * its suffix-direction child is the live cn->child.
 			 * Record the deferred edge against the final junction.
 			 */
-			deferred_child = cn->child;
+			deferred_child = old_child_flag;
 			deferred_parent = jct_flag;
 			ft_node_get_nth_skip(jct_flag, &deferred_slot,
 				jct_ordinal, FT_PF_NONE);
@@ -1117,8 +1151,15 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 	 * the single deferred back-pointer (the live old child into the new
 	 * suffix / junction).  No allocation happens past here; the caller
 	 * publishes the top forward immediately after we return.
+	 *
+	 * Resolve cn's parent through a peer's parked flip proxy (§9): a raw
+	 * read can hand the type-7 latch to ft_set_parent's type dispatch
+	 * (see ft_split_compressed_insert).  A post-resolve peer re-home is
+	 * caught by the caller's forward CAS / §4.B guard as ABORT.
 	 */
-	ft_set_parent(ft, top_flag, cn_meta->parent, parent_slot);
+	ft_set_parent(ft, top_flag,
+		ft_resolve_flip_proxy(rcu_dereference(cn_meta->parent)),
+		parent_slot);
 	/* Return the live edge; the caller defers (parked) or wires (direct). */
 	*live_child_ret = deferred_child;
 	*live_parent_ret = deferred_parent;
