@@ -353,9 +353,10 @@ int ft_insert_commit_arm(struct cds_ft *ft, struct ft_insert_commit *ic,
  * ft_dereference_external -- and the structural publish then commits atomically
  * with the ordinal-cell splice at the single MCAS flip commit.  No transient
  * half-spliced list state.  Settles direct (publish_to_parent false: there is
- * no parent child-slot to re-encode).  @ic must be armed.  The fresh-key case
- * parks old == NULL, so a reader resolves the proxy to "no head" until the
- * commit.
+ * no parent child-slot to re-encode).  @ic must be armed.  Records old ==
+ * @metadata->external_nodes read here, so it serves BOTH the fresh-key case
+ * (old == NULL: a reader resolves the proxy to "no head" until the commit) AND
+ * the chain-replace case (old == the chain being replaced -> @node).
  */
 static
 void ft_insert_park_external_nodes(struct cds_ft *ft,
@@ -2036,59 +2037,40 @@ int _cds_ft_insert(struct cds_ft *ft,
 				/* New key at this internal node. */
 				ft_external_head_set_parent(ft, node, d.nf);
 				node->next = NULL;
-				if (ft->ordered_list || ft->rank_stats) {
-					/*
-					 * Park the external_nodes publish into the
-					 * one-commit batch -- readers resolve the
-					 * proxy via ft_dereference_external -- so the
-					 * structural publish commits atomically with
-					 * the ordinal-cell splice (list on) at
-					 * insert_done's single flip, and the +1 key
-					 * count (rank stats) rides the SAME commit.
-					 * List on always needs the txn for the splice;
-					 * list off takes it only with rank stats on,
-					 * to fold the count (else the infallible lone
-					 * flip below).
-					 */
-					ret = ft_insert_commit_arm(ft, &ic,
-						ft->rank_stats ?
-							d.depth + 2 : 0);
-					if (ret)
-						goto insert_done;
-					ft_insert_park_external_nodes(ft,
-						metadata, node, &ic);
-					ic.count_from = d.nf;
-					/*
-					 * I1 (list on) / I2 (list off) count fold:
-					 * @d.nf is the STABLE
-					 * existing internal node the new key's
-					 * external_nodes publish lands on, so its
-					 * parent chain is commit-invariant.  Record
-					 * the +1 count walk into the same txn (no
-					 * fresh nodes on the path) and skip the
-					 * post-commit propagate.
-					 */
-					ic.count_folded = true;
-				} else {
-					/*
-					 * List off, no rank stats: external_nodes is
-					 * the single reader-visible slot (readers
-					 * resolve via ft_dereference_external) and
-					 * there is no count to fold, so commit the
-					 * NEW-key publish as a lone 1-edge flip -- an
-					 * infallible release store, MCAS-expressible --
-					 * instead of arming a txn.
-					 */
-					struct ft_ord_cell_edge edge = {
-						.slot = (struct ft_ord_cell **)
-							&metadata->external_nodes,
-						.old_target = NULL,
-						.new_target = (struct ft_ord_cell *)
-							node,
-					};
-
-					ft_ord_cell_flip_one(&edge);
-				}
+				/*
+				 * Park the external_nodes publish into the one-commit
+				 * batch -- readers resolve the proxy via
+				 * ft_dereference_external -- so the structural publish
+				 * commits atomically with the ordinal-cell splice (list
+				 * on) at insert_done's single flip, the +1 key count
+				 * (rank stats) rides the SAME commit, AND the §4.B
+				 * VALIDATE guard on the LIVE holder @metadata rides it
+				 * too (ft_insert_park_external_nodes records it), so a
+				 * concurrent remove that froze the holder aborts this
+				 * publish.  List off + rank off carries only the forward
+				 * external_nodes edge + that guard: a 2-record MCAS
+				 * commit, slab-allocated and past the engine's nr==1
+				 * fast path (no malloc) -- the multi-writer cost of
+				 * guarding this in-place publish, no longer a bare lone
+				 * flip.
+				 */
+				ret = ft_insert_commit_arm(ft, &ic,
+					ft->rank_stats ? d.depth + 2 : 0);
+				if (ret)
+					goto insert_done;
+				ft_insert_park_external_nodes(ft,
+					metadata, node, &ic);
+				ic.count_from = d.nf;
+				/*
+				 * I1 (list on) / I2 (list off) count fold: @d.nf is
+				 * the STABLE existing internal node the new key's
+				 * external_nodes publish lands on, so its parent chain
+				 * is commit-invariant.  Record the +1 count walk into
+				 * the same txn (no fresh nodes on the path) and skip
+				 * the post-commit propagate.  (Rank stats off: the
+				 * record is a no-op and the flag skips a no-op walk.)
+				 */
+				ic.count_folded = true;
 				ret = 0;
 			}
 		} else {
@@ -2470,61 +2452,45 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 					/*
 					 * List off: external_nodes is the single
 					 * reader-visible slot (readers resolve via
-					 * ft_dereference_external).  Commit the swap as a
-					 * 1-edge flip -- a lone release store, infallible
-					 * and MCAS-expressible -- instead of a bare store.
+					 * ft_dereference_external).  Publish the
+					 * replacement head through the guarded park so the
+					 * §4.B VALIDATE guard on the LIVE holder @metadata
+					 * rides the flip -- the park reads old ==
+					 * external_nodes (the chain being replaced) -> node
+					 * and records the guard, a 2-record slab-allocated
+					 * MCAS commit rather than a bare lone store.  Replace:
+					 * key count unchanged, so no count fold (arm 0).
 					 */
-					struct ft_ord_cell_edge edge = {
-						.slot = (struct ft_ord_cell **)
-							&metadata->external_nodes,
-						.old_target = (struct ft_ord_cell *)
-							external_nodes,
-						.new_target = (struct ft_ord_cell *) node,
-					};
-
-					ft_ord_cell_flip_one(&edge);
+					ret = ft_insert_commit_arm(ft, &ic, 0);
+					if (ret)
+						goto insert_replace_done;
+					ft_insert_park_external_nodes(ft,
+						metadata, node, &ic);
 				}
 			} else {
 				/* No external nodes yet. New key at this node. */
 				ft_external_head_set_parent(ft, node, d.nf);
 				node->next = NULL;
-				if (ft->ordered_list || ft->rank_stats) {
-					/*
-					 * Park external_nodes -- readers resolve the
-					 * proxy via ft_dereference_external -- so it
-					 * commits atomically with the ordinal-cell
-					 * splice (no transient half-spliced list).
-					 */
-					ret = ft_insert_commit_arm(ft, &ic,
-						ft->rank_stats ?
-							d.depth + 2 : 0);
-					if (ret)
-						goto insert_replace_done;
-					ft_insert_park_external_nodes(ft,
-						metadata, node, &ic);
-					ic.count_from = d.nf;
-					/* I1 (list on) / I2 (list off) count fold: see cds_ft_insert. */
-					ic.count_folded = true;
-				} else {
-					/*
-					 * List off, no rank stats: external_nodes is
-					 * the single reader-visible slot (readers
-					 * resolve via ft_dereference_external) and
-					 * there is no count to fold, so commit the
-					 * NEW-key publish as a lone 1-edge flip -- an
-					 * infallible release store, MCAS-expressible --
-					 * instead of arming a txn.
-					 */
-					struct ft_ord_cell_edge edge = {
-						.slot = (struct ft_ord_cell **)
-							&metadata->external_nodes,
-						.old_target = NULL,
-						.new_target = (struct ft_ord_cell *)
-							node,
-					};
-
-					ft_ord_cell_flip_one(&edge);
-				}
+				/*
+				 * Park external_nodes -- readers resolve the proxy via
+				 * ft_dereference_external -- so it commits atomically
+				 * with the ordinal-cell splice (list on) AND the §4.B
+				 * VALIDATE guard on the LIVE holder @metadata rides the
+				 * flip (ft_insert_park_external_nodes records it).  List
+				 * off + rank off carries only the forward edge + that
+				 * guard: a 2-record slab-allocated MCAS commit, not a
+				 * bare lone flip -- the multi-writer cost of guarding
+				 * this in-place publish.
+				 */
+				ret = ft_insert_commit_arm(ft, &ic,
+					ft->rank_stats ? d.depth + 2 : 0);
+				if (ret)
+					goto insert_replace_done;
+				ft_insert_park_external_nodes(ft,
+					metadata, node, &ic);
+				ic.count_from = d.nf;
+				/* I1 (list on) / I2 (list off) count fold: see cds_ft_insert. */
+				ic.count_folded = true;
 			}
 			ret = 0;
 		} else {

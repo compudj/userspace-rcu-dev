@@ -2665,71 +2665,49 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 #endif
 			if (!prefix_fused) {
 				/*
-				 * Non-fused external_nodes -> NULL clear.  Ordered
-				 * list on: fuse with the head cell's unsplice in ONE
-				 * flip (a reader never sees the prefix key gone from
-				 * the structural index but present in the ordered
-				 * list; readers resolve a parked proxy on
-				 * external_nodes via ft_dereference_external;
-				 * @pub.armed tells the deferred-free block below the
-				 * unsplice happened).  List off: express the node ->
-				 * NULL clear as a 1-edge flip (a lone release store,
-				 * MCAS-expressible) rather than a bare store.
-				 */
-				/*
-				 * Fold the prefix key's -1 onto the clear: the holder
-				 * stays in place (keeps its children), so its -1 is the
-				 * holder->root walk -- a multi-edge R1.  Take a caller-
-				 * reserved bounded txn whenever the count must ride
-				 * (ordered_list || rank_stats), record the walk from
-				 * holder_flag, and let ft_remove_one_commit flip the
+				 * Non-fused external_nodes -> NULL clear, always on a
+				 * pre-reserved bounded txn (no bare lone clear even with
+				 * both flags off).  ft_remove_one_commit flips the
 				 * external_nodes -> NULL clear, the head cell's unsplice
-				 * (list on) and the count edges TOGETHER
-				 * (ft_ord_cell_flip_into, infallible): a reader never sees
-				 * the key gone from one index but present in the other,
-				 * nor a count out of step with the structure (parked
-				 * proxies resolve via ft_dereference_external / nr_keys via
-				 * ft_nr_keys_load).  The pre-reserved txn commits
-				 * infallibly, so no pre-decrement and no OOM rollback --
-				 * the only abort is the arm, which leaves the key in place.
-				 * List off + rank stats off: the infallible lone clear,
-				 * unchanged.
+				 * (ordered list on; @pub.armed tells the deferred-free
+				 * block below it happened), the prefix key's -1 count
+				 * walk from holder_flag (rank stats on) AND the §4.B
+				 * VALIDATE guard on the LIVE holder TOGETHER in ONE flip
+				 * (ft_ord_cell_flip_into, infallible commit): a reader
+				 * never sees the key gone from one index but present in
+				 * the other, nor a count out of step with the structure
+				 * (parked proxies resolve via ft_dereference_external /
+				 * nr_keys via ft_nr_keys_load), and a concurrent remove
+				 * that froze the holder aborts this clear.  The holder
+				 * stays in place (keeps its children), so its -1 is the
+				 * holder->root walk -- a multi-edge R1.  Pre-reserved =>
+				 * infallible commit: no pre-decrement, no OOM rollback;
+				 * the only abort is the arm, which leaves the key in
+				 * place.  List off + rank off: the forward clear + the
+				 * guard, a 2-record slab-allocated MCAS commit.
 				 */
-				if (ft->ordered_list || ft->rank_stats) {
-					struct ft_flip_txn *txn = ft_flip_txn_create_bounded(
-						FT_REMOVE_COMMIT_REC_MAX_EDGES + 1 +
-						(ft->rank_stats ? key_len + 1 : 0));
+				struct ft_flip_txn *txn = ft_flip_txn_create_bounded(
+					FT_REMOVE_COMMIT_REC_MAX_EDGES + 1 +
+					(ft->rank_stats ? key_len + 1 : 0));
 
-					if (!txn) {
-						if (unsplice_txn)
-							ft_flip_txn_destroy(unsplice_txn);
-						*result_node = NULL;
-						return CDS_FT_STATUS_MEMORY_ERROR;
-					}
-					/* VALIDATE (§4.B): guard the LIVE holder whose
-					 * external_nodes this clear empties. */
-					ft_flip_txn_guard_parent(ft, txn, holder_flag);
-					ft_flip_txn_record_count_parent(ft, txn,
-						holder_flag, -1);
-					ft_remove_one_commit(ft,
-						(struct cds_ft_inode_flag **) &holder_meta->external_nodes,
-						(struct cds_ft_inode_flag *) chain_head, NULL,
-						NULL, dead_cell, NULL, txn, NULL);
-					if (ft->ordered_list)
-						pub.armed = true;
-					ret = 0;
-				} else {
-					struct ft_ord_cell_edge edge = {
-						.slot = (struct ft_ord_cell **)
-							&holder_meta->external_nodes,
-						.old_target = (struct ft_ord_cell *)
-							chain_head,
-						.new_target = NULL,
-					};
-
-					ft_ord_cell_flip_one(&edge);
-					ret = 0;
+				if (!txn) {
+					if (unsplice_txn)
+						ft_flip_txn_destroy(unsplice_txn);
+					*result_node = NULL;
+					return CDS_FT_STATUS_MEMORY_ERROR;
 				}
+				/* VALIDATE (§4.B): guard the LIVE holder whose
+				 * external_nodes this clear empties. */
+				ft_flip_txn_guard_parent(ft, txn, holder_flag);
+				ft_flip_txn_record_count_parent(ft, txn,
+					holder_flag, -1);
+				ft_remove_one_commit(ft,
+					(struct cds_ft_inode_flag **) &holder_meta->external_nodes,
+					(struct cds_ft_inode_flag *) chain_head, NULL,
+					NULL, dead_cell, NULL, txn, NULL);
+				if (ft->ordered_list)
+					pub.armed = true;
+				ret = 0;
 				if (ret == 0) {
 					ft_chain_mark_removed_flip(ft, chain_head);
 					assert(ft_meta_nr_child(holder_meta) > 0);
