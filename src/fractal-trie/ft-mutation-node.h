@@ -702,10 +702,28 @@ int ft_popcount_node_replace_ptr(struct cds_ft *ft, const struct cds_ft_type *ty
 	assert(ft_popcount_node_get_nr_child(type, node) <= type->max_child);
 
 	if (!newptr) {
+#ifndef FEATURE_FT_INSERT_IN_PLACE
+		/*
+		 * Recompact-on-remove (default, concurrent-safe): EVERY delete
+		 * rebuilds the node fresh (FT_RECOMPACT_DEL, dropping child n)
+		 * so a consistent (bitmap, nr_child) is published in ONE pointer
+		 * swap.  The in-place alternative below stores NULL into the
+		 * child slot and decrements nr_child IN PLACE on the LIVE node;
+		 * a concurrent lookup reads that torn -- the bitmap and nr_child
+		 * are separate words, so a reader that sampled nr_child before
+		 * the decrement walks a child index i >= the new nr_child and
+		 * trips ft_popcount_node_get_ith_pos's `i < nr_child` assert.
+		 * Under FEATURE_FT_INSERT_IN_PLACE (single writer, no concurrent
+		 * reader mid-mutation) the in-place fast path is retained; there
+		 * we only recompact once the node would shrink below min_child.
+		 */
+		return -EFBIG;
+#else
 		if (ft_meta_nr_child(metadata) <= type->min_child) {
 			/* We need to try recompacting the node */
 			return -EFBIG;
 		}
+#endif
 	}
 	dbg_printf("popcount replace ptr: node %p\n", node);
 	assert(*node_flag_ptr != NULL);
@@ -761,9 +779,20 @@ int ft_pigeon_node_replace_ptr(struct cds_ft *ft, const struct cds_ft_type *type
 	assert(ft_type_is_pigeon(type->type_class));
 
 	if (!newptr) {
+#ifndef FEATURE_FT_INSERT_IN_PLACE
+		/*
+		 * Recompact-on-remove (default, concurrent-safe): rebuild the
+		 * node fresh rather than soft-deleting the slot and decrementing
+		 * nr_child IN PLACE on the LIVE node -- a concurrent lookup reads
+		 * the nr_child change torn against the pointer/bitmap state.  See
+		 * the popcount variant for the full rationale.
+		 */
+		return -EFBIG;
+#else
 		/* We should try recompacting the node */
 		if (ft_meta_nr_child(metadata) <= type->min_child)
 			return -EFBIG;
+#endif
 	}
 	dbg_printf("ft_pigeon_node_replace_ptr: replace ptr: %p by %p\n", *node_flag_ptr, newptr);
 	assert(*node_flag_ptr != NULL);
