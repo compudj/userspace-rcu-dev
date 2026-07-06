@@ -1599,6 +1599,7 @@ int ft_chain_node(struct cds_ft *ft, struct cds_ft_node *last_node,
 		struct cds_ft_node *node)
 {
 	struct ft_flip_txn *t;
+	enum urcu_txn_status st;
 
 	FT_TP(chain_node, (const void *) last_node, (const void *) node);
 	/*
@@ -1613,16 +1614,30 @@ int ft_chain_node(struct cds_ft *ft, struct cds_ft_node *last_node,
 	 * abort; @node is built invisibly, next = NULL, prev = last_node), folded
 	 * into a single-edge flip-txn instead of a bare store.  Both next and
 	 * prev ride the txn; the commit is the engine's single-edge fast path.
-	 * Fallible now: the txn allocation can OOM (the caller unwinds @node).
-	 * Under the current retained writer exclusion the prepare cannot fail
-	 * (@last_node is not concurrently deletable); an -ENOENT/-EAGAIN re-descend
-	 * retry is a concurrent-writer (Phase 4.3) concern.
+	 * Fallible: the txn allocation can OOM (the caller unwinds @node).
+	 *
+	 * CONCURRENT WRITERS (Phase 4.3): a peer freezing/removing @last_node
+	 * conflicts here -- at prepare time (-ENOENT tail already marked /
+	 * -EAGAIN neighbour mid-deletion; nothing recorded installs without a
+	 * commit) or at commit time (ABORT: the expected-value CAS on
+	 * last_node->next lost; nothing installed).  Both map to -EAGAIN: the
+	 * callers route to insert_done, whose -EAGAIN handler ages the op's
+	 * persistent handle and re-descends from root (restart_attempt resets
+	 * @node's prev/next).  Previously ABORT was folded into 0 -- a silently
+	 * LOST duplicate under contention.
 	 */
 	t = ft_flip_txn_create_bounded(FT_HLIST_INSERT_AFTER_MAX_EDGES);
 	if (!t)
 		return -ENOMEM;
-	(void) ft_hlist_insert_after_prepare(ft_flip_txn_handle(t), node, last_node);
-	return ft_flip_txn_commit(ft, t) < 0 ? -ENOMEM : 0;
+	if (ft_hlist_insert_after_prepare(ft_flip_txn_handle(t), node,
+			last_node)) {
+		ft_flip_txn_destroy(t);
+		return -EAGAIN;
+	}
+	st = ft_flip_txn_commit(ft, t);
+	if (st < 0)
+		return -ENOMEM;
+	return st > 0 ? -EAGAIN : 0;
 }
 
 /*
