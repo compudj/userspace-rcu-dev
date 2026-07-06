@@ -997,6 +997,22 @@ int ft_node_recompact(enum ft_recompact mode,
 			old_type_index, new_type_index);
 	new_type = &ft_types[new_type_index];
 	if (new_type_index != NODE_INDEX_NULL) {
+		/*
+		 * Phase 4.3 atomic re-home: when this recompact retires a LIVE
+		 * published node whose children stay reader-reachable (retire_txn
+		 * set = the unlink/forward-publish commit; not a build-invisible
+		 * cluster leaf), the reparent sweep below records each child's
+		 * (parent, offset) as a co-committed pair INTO @retire_txn so it
+		 * flips atomically with the publish -- not two plain stores a peer
+		 * reads torn.  Widen the txn for the <=2 edges per child up front
+		 * (<= old nr_child + 1); an OOM here aborts cleanly, nothing
+		 * allocated yet -- a single-commit insert may fail its widen
+		 * (unlike a graft/merge second commit, which pre-reserves).
+		 */
+		if (retire_txn && !cluster_leaf && metadata &&
+				!ft_flip_txn_reserve_extra(retire_txn,
+					2 * (ft_meta_nr_child(metadata) + 1)))
+			return -ENOMEM;
 		new_node = alloc_cds_ft_node(ft, new_type, &new_metadata);
 		if (!new_node)
 			return -ENOMEM;
@@ -1005,12 +1021,31 @@ int ft_node_recompact(enum ft_recompact mode,
 
 		dbg_printf("Recompact inherit from %p\n", metadata);
 		if (metadata) {
-			new_metadata->parent = metadata->parent;
+			struct cds_ft_inode_flag *inh_parent;
+			struct cds_ft_inode_flag **inh_slot =
+				ft_resolve_parent_slot(metadata, ft, &inh_parent);
+
+			/*
+			 * Inherit the retired node's (parent, offset) as ONE
+			 * CONSISTENT snapshot (Phase 4.3 atomic re-home): a peer
+			 * that re-homes @metadata's node commits its parent and
+			 * state-word offset atomically, so copying them via two raw
+			 * reads could tear -- the fresh copy would then invert its
+			 * publish slot against the wrong parent and fault
+			 * ft_slot_to_byte.  ft_resolve_parent_slot recovers the pair
+			 * from a single MCAS status snapshot (a plain read when no
+			 * re-home is in flight, so single-writer is unchanged).
+			 */
+			new_metadata->parent = inh_parent;
 			/* The retyped node keeps its own incoming edge byte. */
 			new_metadata->incoming_byte = metadata->incoming_byte;
 #ifdef FEATURE_FT_SKIP_COMPRESSED
-			ft_meta_parent_slot_offset_set(new_metadata,
-				ft_meta_parent_slot_offset(metadata));
+			ft_meta_parent_slot_offset_set(new_metadata, inh_parent ?
+				(unsigned int) ((char *) inh_slot -
+					(char *) ft_node_ptr(inh_parent))
+					/ sizeof(void *) : 0);
+#else
+			(void) inh_slot;
 #endif
 			/*
 			 * Recompact: new_metadata->parent is already inherited
@@ -1273,7 +1308,12 @@ skip_copy:
 					continue;
 				ft_node_get_nth_skip(new_node_flag,
 						&slot, v, FT_PF_NONE);
-				ft_set_parent(ft, iter, new_node_flag, slot);
+				if (retire_txn)
+					ft_reparent_record(ft, retire_txn, iter,
+							new_node_flag, slot);
+				else
+					ft_set_parent(ft, iter, new_node_flag,
+							slot);
 			}
 			break;
 		}
@@ -1291,7 +1331,12 @@ skip_copy:
 					continue;
 				ft_node_get_nth_skip(new_node_flag,
 						&slot, i, FT_PF_NONE);
-				ft_set_parent(ft, iter, new_node_flag, slot);
+				if (retire_txn)
+					ft_reparent_record(ft, retire_txn, iter,
+							new_node_flag, slot);
+				else
+					ft_set_parent(ft, iter, new_node_flag,
+							slot);
 			}
 			break;
 		}

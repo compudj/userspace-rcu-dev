@@ -1394,7 +1394,32 @@ int ft_attach_node(struct cds_ft *ft,
 		 * if the attach target is a compressed node's child.
 		 */
 		if (iter_dest_node_flag != attach_node_flag) {
+			struct cds_ft_metadata *idest_meta =
+				cds_ft_item_to_metadata(
+					ft_node_ptr(iter_dest_node_flag));
 			unsigned int k;
+
+			/*
+			 * Phase 4.3 atomic re-home: the fresh copy inherited the attach
+			 * node's (parent, offset) as a CONSISTENT snapshot (ft_node_
+			 * recompact).  If a peer re-homed the attach node since this op's
+			 * descent -- recompacted its grandparent -- the inherited slot no
+			 * longer matches the descent-captured @attach_node_flag_ptr, and
+			 * publishing @iter_dest at the stale slot would invert it against
+			 * the fresh copy's NEW parent and fault ft_slot_to_byte (the
+			 * dominant FT_INV_MW crash).  Re-descend rather than publish a
+			 * torn (parent, slot) pair.  ft_get_parent_slot is consistent now
+			 * (A.1 pair-resolver + A.2 atomic reparent), so this can no longer
+			 * pass spuriously on a torn back-pointer.  No-op under exclusion.
+			 * @iter_dest is a successfully-built fresh copy NOT tracked in
+			 * created_nodes[], so free it here before the shared unwind.
+			 */
+			if (ft_get_parent_slot(idest_meta, ft) != attach_node_flag_ptr) {
+				free_cds_ft_node_unpublished(ft,
+					ft_node_ptr(iter_dest_node_flag));
+				ret = -EAGAIN;
+				goto check_error;
+			}
 
 			/*
 			 * One-commit AND the reserve recompacted the attach node: the
@@ -1413,8 +1438,10 @@ int ft_attach_node(struct cds_ft *ft,
 			 * VALIDATE (§4.B): guard the LIVE grandparent this relocation
 			 * republishes into -- a concurrent remover that froze it aborts
 			 * this commit (Phase 4.3 load-bearing; no-op under exclusion).
+			 * Use the fresh copy's inherited (resolved) parent -- the same
+			 * consistent snapshot the publish slot below is verified against.
 			 */
-			ft_flip_txn_guard_parent(ft, ic->txn, metadata->parent);
+			ft_flip_txn_guard_parent(ft, ic->txn, idest_meta->parent);
 			_ft_publish_to_parent(ft, attach_node_flag,
 				attach_node_flag_ptr, iter_dest_node_flag, &rec);
 			for (k = 0; k < rec.n; k++)

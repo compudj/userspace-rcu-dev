@@ -204,6 +204,26 @@ bool ft_flip_txn_reserve(struct ft_flip_txn *t, unsigned int cap)
 }
 
 /*
+ * Widen @t's reservation by @extra records beyond its current capacity.  A
+ * single-commit op (the insert recompact reparent sweep) that discovers extra
+ * edges mid-build grows its txn here.  Unlike a two-commit graft/merge SECOND
+ * commit -- which must pre-reserve so its post-detach publish cannot fail -- a
+ * single-commit op's commit may still fail cleanly (freeze-before-install leaves
+ * the structure byte-for-byte untouched), so an OOM here just aborts/retries the
+ * op.  urcu_txn_reserve is grow-safe after records are recorded (records move to
+ * the grown descriptor; proxies form from the final address only at install).
+ * Returns false on OOM (nothing new recorded -> caller aborts).
+ */
+static inline
+bool ft_flip_txn_reserve_extra(struct ft_flip_txn *t, unsigned int extra)
+{
+	unsigned int cur = (t->mtxn.mcas && t->mtxn.mcas != URCU_TXN_ENOMEM) ?
+			t->mtxn.mcas->cap : 0;
+
+	return ft_flip_txn_reserve(t, cur + extra);
+}
+
+/*
  * Take a caller-reserved flip-txn when @pre supplies one, NULLing the caller's
  * slot to transfer ownership: from here on the consuming bulk op commits and
  * reclaims it, and the caller frees only what it still holds.  Returns NULL when
@@ -2815,6 +2835,113 @@ void ft_glue_record_back_edge(struct cds_ft *ft, struct ft_flip_txn *txn,
 		ft_flip_txn_record_reserved(txn, (void **) &meta->parent,
 			meta->parent, parent_nf);
 	}
+}
+
+/*
+ * ft_reparent_record_meta: record a metadata-bearing child's re-home as a
+ * co-committed (parent, offset) PAIR into @txn.  The parent pointer flips via a
+ * type-7 structural edge and the state-word offset via an FT_STATE_PROXY edge, so
+ * a concurrent reader recovering (parent, slot) through ft_resolve_parent_slot
+ * observes them atomically -- a plain two-store update tears (the dominant
+ * FT_INV_MW crash: parent = new copy, offset = stale index of the old one).  Both
+ * edges are ALWAYS recorded (a same-value offset when the slot index is
+ * unchanged) so a reader that finds the parent proxy is guaranteed the paired
+ * offset proxy -- no snapshot re-spin.  incoming_byte is key-invariant across a
+ * recompact, so its plain store is a same-value write, safe before the commit.
+ */
+static
+void ft_reparent_record_meta(struct ft_flip_txn *txn,
+		struct cds_ft_metadata *meta,
+		struct cds_ft_inode_flag *parent_nf,
+		struct cds_ft_inode_flag **slot)
+{
+	uintptr_t old_state = meta->state, new_state = old_state;
+
+	if (slot) {
+		unsigned int off = parent_nf ? (unsigned int) ((char *) slot -
+			(char *) ft_node_ptr(parent_nf)) / sizeof(void *) : 0;
+
+		new_state = (old_state & ~FT_STATE_PSO_MASK)
+			| (((uintptr_t) off & FT_STATE_PSO_VALMASK)
+				<< FT_STATE_PSO_SHIFT);
+		if (parent_nf && !ft_node_compressed(parent_nf)
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+				&& !ft_node_skip_compressed(parent_nf)
+#endif
+		   )
+			meta->incoming_byte = ft_slot_to_byte(
+				&ft_types[ft_node_type(parent_nf)],
+				ft_node_ptr(parent_nf), slot);
+	}
+	ft_flip_txn_record_reserved(txn, (void **) &meta->parent,
+		meta->parent, parent_nf);
+	ft_flip_txn_record_tag(txn, (void **) &meta->state,
+		(void *) old_state, (void *) new_state, FT_STATE_PROXY);
+}
+
+/*
+ * Record a LIVE, reader-reachable child's re-home into @txn (Phase 4.3 atomic
+ * re-home).  The recompact reparent sweep moves each child of a node from the
+ * retiring old copy to the fresh copy; the child stays reachable through the old
+ * copy until the forward publish, so its back-pointer update must flip ATOMICALLY
+ * with that publish (all recorded into the SAME @txn = @retire_txn) and its
+ * (parent, offset) must be a co-committed pair.  Mirrors ft_set_parent's
+ * child-kind dispatch exactly; unlike ft_glue_record_back_edge (whose graft
+ * children are build-invisible, so their offset store is unobservable) the offset
+ * rides @txn beside the parent.  @child_nf is never a flip proxy at a live slot;
+ * the guard mirrors ft_set_parent's for reparent sweeps that flow over one.
+ */
+static
+void ft_reparent_record(struct cds_ft *ft, struct ft_flip_txn *txn,
+		struct cds_ft_inode_flag *child_nf,
+		struct cds_ft_inode_flag *parent_nf,
+		struct cds_ft_inode_flag **slot)
+{
+	if (!child_nf)
+		return;
+	if (caa_unlikely(ft_node_flip_proxy(child_nf)))
+		return;
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+	if (ft_node_skip_compressed(child_nf)) {
+		struct cds_ft_compressed_node *cn =
+			ft_skip_to_compressed(ft, child_nf);
+
+		ft_reparent_record_meta(txn,
+			cds_ft_item_to_metadata((struct cds_ft_inode *) cn),
+			parent_nf, slot);
+		return;
+	}
+	if (ft_node_compressed(child_nf)) {
+		struct cds_ft_compressed_node *cn =
+			ft_compressed_node_ptr(child_nf);
+
+		ft_reparent_record_meta(txn,
+			cds_ft_item_to_metadata((struct cds_ft_inode *) cn),
+			parent_nf, slot);
+		return;
+	}
+#endif
+	if (ft_node_external(child_nf)) {
+		struct cds_ft_node *en = (struct cds_ft_node *) child_nf;
+
+		/*
+		 * External head: no metadata / offset -- only the parent edge
+		 * rides @txn (cell->parent list-on, en->prev list-off), which a
+		 * reader resolves via ft_resolve_head_prev.
+		 */
+		if (ft->ordered_list) {
+			struct ft_ord_cell *cell = ft_ord_cell_ptr(en->prev);
+
+			ft_flip_txn_record_reserved(txn, (void **) &cell->parent,
+				cell->parent, parent_nf);
+		} else {
+			ft_flip_txn_record_reserved(txn, (void **) &en->prev,
+				en->prev, parent_nf);
+		}
+		return;
+	}
+	ft_reparent_record_meta(txn,
+		cds_ft_item_to_metadata(ft_node_ptr(child_nf)), parent_nf, slot);
 }
 
 static
