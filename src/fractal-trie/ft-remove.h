@@ -1933,9 +1933,11 @@ int ft_unchain_node(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 		unsigned int n_s;
 
 		txn = ft_flip_txn_create_bounded(FT_PUB_SEDGE_MAX_EDGES +
-			FT_HLIST_FREEZE_MAX_EDGES);
+			FT_HLIST_FREEZE_MAX_EDGES + 1);
 		if (!txn)
 			return -ENOMEM;
+		/* VALIDATE (§4.B): guard the LIVE holder this head-clear publishes into. */
+		ft_flip_txn_guard_parent(ft, txn, parent_nf);
 		_ft_publish_to_parent(ft, parent_nf,
 			(struct cds_ft_inode_flag **) head_slot, NULL, &rec);
 		n_s = ft_pub_rec_sedges(&rec, sedges);
@@ -2695,7 +2697,7 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 				 */
 				if (ft->ordered_list || ft->rank_stats) {
 					struct ft_flip_txn *txn = ft_flip_txn_create_bounded(
-						FT_REMOVE_COMMIT_REC_MAX_EDGES +
+						FT_REMOVE_COMMIT_REC_MAX_EDGES + 1 +
 						(ft->rank_stats ? key_len + 1 : 0));
 
 					if (!txn) {
@@ -2704,6 +2706,9 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 						*result_node = NULL;
 						return CDS_FT_STATUS_MEMORY_ERROR;
 					}
+					/* VALIDATE (§4.B): guard the LIVE holder whose
+					 * external_nodes this clear empties. */
+					ft_flip_txn_guard_parent(ft, txn, holder_flag);
 					ft_flip_txn_record_count_parent(ft, txn,
 						holder_flag, -1);
 					ft_remove_one_commit(ft,
