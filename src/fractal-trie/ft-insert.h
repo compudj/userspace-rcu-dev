@@ -2396,6 +2396,21 @@ insert_done:
 		urcu_txn_end(&optxn);
 		goto restart_attempt;
 	}
+	if (caa_unlikely(cst == URCU_TXN_STATUS_MEMORY_ERROR && ret == 0)) {
+		/*
+		 * Unreachable today: the one-commit txn is pre-reserved, so its
+		 * commit is infallible ("reserved => infallible").  Defensive:
+		 * should that invariant ever break, the failed commit published
+		 * NOTHING (freeze-before-install; its on-abort action already
+		 * freed the fresh cluster), so falling through with ret == 0
+		 * would silently LOSE the insert.  Unwind like a failed attempt
+		 * and surface the error instead.
+		 */
+		node->prev = NULL;
+		if (ft->ordered_list)
+			ft_ord_cell_free_unpublished(ft, precell);
+		ret = -ENOMEM;
+	}
 	/*
 	 * Terminal outcome (success or error): close this attempt's read-side
 	 * section and release the escalation turn if held.
