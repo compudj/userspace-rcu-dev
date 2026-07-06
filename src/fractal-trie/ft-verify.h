@@ -1078,15 +1078,24 @@ out:
  * pointers are self-consistent.
  *
  * Must be called with mutual exclusion wrt ALL updaters (writer
- * quiescence).  This is BY DESIGN and stronger than "the caller is a
- * writer": the walk reads slots and state words raw -- no MCAS proxy
- * resolution -- and ft_verify_no_proxy_at_rest treats ANY reachable
- * in-flight proxy as an integrity error, because at rest a committed
- * txn leaves none.  Under multi-writer, one writer's own exclusion is
- * NOT enough (a peer mid-commit legitimately parks proxies): quiesce
- * every writer first.  Verify is deliberately NOT taught to resolve /
- * tolerate in-flight proxies -- its premise is quiescence (decision
- * 2026-07-06; doc/design/mcas-multiwriter-readiness.md §9 scope).
+ * quiescence).  This is stronger than "the caller is a writer": the
+ * walk reads slots and state words raw -- no MCAS proxy resolution --
+ * and ft_verify_no_proxy_at_rest treats ANY reachable in-flight proxy
+ * as an integrity error, because at rest a committed txn leaves none.
+ * Its checks are also inherently AT-REST checks: the global/cross-word
+ * invariants (nr_keys sums, nr_child vs actual slot population, parent
+ * symmetry, ord-list<->trie agreement) span words that different peer
+ * txns commit independently, so no per-slot resolution can make them
+ * meaningful mid-flight -- resolution yields old-XOR-new per WORD,
+ * never a global snapshot.
+ *
+ * The multi-writer counterpart is a (future) CONCURRENT VERIFIER: a
+ * §9-disciplined walk (resolve every slot; an in-flight proxy is
+ * normal, not an error) restricted to invariants stable under peer
+ * commits -- per-node body-local checks on RCU-live immutable bodies,
+ * plus word-sets that commit atomically in ONE txn and have a
+ * dedicated consistent resolver (the (parent, offset) pair, the state
+ * word).  See the verify-at-mutation hook note below.
  *
  * @out: file stream for diagnostic output on failure (may be NULL
  *       to suppress output).
@@ -1164,12 +1173,19 @@ enum cds_ft_status cds_ft_verify(const struct cds_ft *ft, FILE *out)
  * the walk entirely (only the increment-and-compare runs).  On
  * mismatch, abort with diagnostic.
  *
- * MULTI-WRITER: this hook fires under ONE writer's scope, which is
- * not the all-updater exclusion cds_ft_verify requires (see its
- * header) -- a concurrent peer's parked proxies would false-positive.
- * FEATURE_FT_VERIFY_AT_MUTATION is therefore a single-writer /
- * externally-serialized-writers debug facility by design; do not
- * enable it on workloads with concurrent writers on the same trie.
+ * MULTI-WRITER: "verify-at-mutation" is a MISNOMER under concurrent
+ * writers -- the name describes the trigger cadence, but the hook
+ * fires under ONE writer's scope, so what runs here is inherently a
+ * CONCURRENT verifier: peers may be mid-commit, and their parked
+ * proxies / half-visible txns are normal states, not corruption.  The
+ * contract therefore holds under MW only once this hook runs the
+ * concurrent-verifier subset (resolve every slot per doc §9; check
+ * only invariants stable under peer commits -- see the cds_ft_verify
+ * header for the split).  TODAY it still calls the full at-rest
+ * cds_ft_verify, whose global checks need all-updater quiescence, so
+ * until that subset is split out, enable FEATURE_FT_VERIFY_AT_MUTATION
+ * only with externally-serialized writers -- an implementation gap,
+ * not a design restriction.
  */
 void ft_writer_scope_verify(struct cds_ft *ft)
 {
