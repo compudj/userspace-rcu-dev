@@ -1970,7 +1970,8 @@ int ft_unchain_node(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
  *         with an internal node. Unlink the node from its list, leaving
  *         the external nodes list empty.
  */
-enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
+static
+enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 		struct cds_ft_iter *iter,
 		struct cds_ft_node *node)
 {
@@ -1981,7 +1982,6 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 	size_t key_len = ft_key_len(ft, ft_iter_resolve_key_len(iter));
 	int ret;
 
-	CDS_FT_SCOPED_WRITER(ft);
 	FT_TP(remove_enter, (const void *) ft, (const void *) iter,
 		iter_key(iter), key_len);
 
@@ -2381,6 +2381,34 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 	}
 }
 
+enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
+		struct cds_ft_iter *iter,
+		struct cds_ft_node *node)
+{
+	struct urcu_mcas_txn optxn;
+	enum cds_ft_status s;
+
+	CDS_FT_SCOPED_WRITER(ft);
+	/*
+	 * FT-owned per-op read-side bracket (doc §11 Phase A): on a concurrent
+	 * trie the body's position derivation, parked records, and internal
+	 * commits must run inside a read-side section so a peer writer's
+	 * call_rcu-deferred frees cannot reclaim under them; a caller-held
+	 * section merely nests.  @node's liveness AT ENTRY remains the
+	 * caller's obligation (it is a reference returned by a lookup, valid
+	 * only under the caller's own section -- the §11 reference-lifetime
+	 * contract).  The op's internal txns are still standalone (not bound
+	 * to @optxn): remove has no retry loop yet, so there is no aging to
+	 * carry across attempts -- binding them comes with the remove-side
+	 * ABORT-retry work.  Exclusive trie: the bracket opens nothing.
+	 */
+	ft_txn_op_init(ft, &optxn);
+	urcu_txn_begin(&optxn);
+	s = _cds_ft_remove_locked(ft, iter, node);
+	urcu_txn_end(&optxn);
+	return s;
+}
+
 /*
  * ft_locate_chain_head: derive an external chain head's position with no
  * descent, from the head itself (head->prev is its holder) and the key.
@@ -2436,7 +2464,8 @@ bool ft_locate_chain_head(struct cds_ft *ft, struct cds_ft_node *head,
 	return (struct cds_ft_node *) ft_node_ptr(**head_slot_p) == head;
 }
 
-enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
+static
+enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 		struct cds_ft_iter *iter,
 		struct cds_ft_node **result_node)
 {
@@ -2449,7 +2478,6 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 	const uint8_t *iter_key;
 	size_t key_len = ft_key_len(ft, ft_iter_resolve_key_len(iter));
 
-	CDS_FT_SCOPED_WRITER(ft);
 	/*
 	 * If the iterator has a valid path, the RCU read-side lock must
 	 * be held.
@@ -2792,5 +2820,26 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 	}
 
 	return CDS_FT_STATUS_OK;
+}
+
+enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
+		struct cds_ft_iter *iter,
+		struct cds_ft_node **result_node)
+{
+	struct urcu_mcas_txn optxn;
+	enum cds_ft_status s;
+
+	CDS_FT_SCOPED_WRITER(ft);
+	/*
+	 * FT-owned per-op read-side bracket (doc §11 Phase A) -- see
+	 * cds_ft_remove.  Internal txns are still standalone (no retry loop
+	 * to carry aging across yet); exclusive trie: the bracket opens
+	 * nothing.
+	 */
+	ft_txn_op_init(ft, &optxn);
+	urcu_txn_begin(&optxn);
+	s = _cds_ft_remove_all_locked(ft, iter, result_node);
+	urcu_txn_end(&optxn);
+	return s;
 }
 
