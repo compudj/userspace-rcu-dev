@@ -844,11 +844,40 @@ void ft_flip_txn_guard_parent(const struct cds_ft *ft, struct ft_flip_txn *t,
 	 * force-onto-txn pass.  NULL @parent_nf: a &ft->root publish, auto-guarded
 	 * by the root-slot CAS.  Either way there is no live parent to guard here.
 	 */
+	uintptr_t v, live;
+
 	if (!t || !parent_nf)
 		return;
-	(void) urcu_txn_load_validate(t->mtxn,
+	/*
+	 * §4.B VALIDATE as ONE record: read the holder's state (unrecorded)
+	 * and expect its LIVE value at commit -- {live -> live}, a pure
+	 * validate that writes nothing new.
+	 *
+	 *  - live holder: identical to the former {v -> v} stability guard; a
+	 *    retire DURING the commit window changes the word (the tombstone
+	 *    is one-way) and fails the compare.
+	 *  - holder retired BEFORE this guard (the already-DEAD case a
+	 *    stability-only {DEAD -> DEAD} record would PASS, committing this
+	 *    publish into a retired copy = a lost update): the live
+	 *    expectation cannot match -> guaranteed ABORT -> a retry-enabled
+	 *    op re-derives against the current tree.
+	 *
+	 * Composes ORDER-FREE with an op that fuses a REAL state edge
+	 * (nr_child--) on the same word in the same attempt: a guard never
+	 * advances the record's new_ptr (urcu_txn_validate, upgrade-free), the
+	 * engine keeps a record's original expected old on upgrade, and a
+	 * mismatching expected old between the two poisons the descriptor
+	 * (commit aborts) -- so a live holder's guard and decrement fuse into
+	 * one record either way, and a dead one still fails.  Dead-at-guard is
+	 * unreachable under a single writer.
+	 */
+	v = (uintptr_t) urcu_txn_load(t->mtxn,
 			(void **) &ft_flag_to_metadata(ft, parent_nf)->state,
 			FT_STATE_PROXY);
+	live = v & ~FT_STATE_TOMBSTONE;
+	urcu_txn_validate(t->mtxn,
+			(void **) &ft_flag_to_metadata(ft, parent_nf)->state,
+			(void *) live, FT_STATE_PROXY);
 }
 
 /*
@@ -1750,8 +1779,14 @@ int ft_remove_one_commit(struct cds_ft *ft,
  * incoming_byte the child inherits via the parent's own slot, so no
  * incoming_byte write is needed here (matching ft_park_live_parent_edge).
  */
+static void ft_reparent_record_meta(struct ft_flip_txn *txn,
+		struct cds_ft_metadata *meta,
+		struct cds_ft_inode_flag *parent_nf,
+		struct cds_ft_inode_flag **slot);
+
 static
 void ft_pub_rec_add_back_edge(struct cds_ft *ft, struct ft_pub_rec *rec,
+		struct ft_flip_txn *txn,
 		struct cds_ft_inode_flag *child,
 		struct cds_ft_inode_flag *new_parent,
 		struct cds_ft_inode_flag **slot)
@@ -1774,8 +1809,20 @@ void ft_pub_rec_add_back_edge(struct cds_ft *ft, struct ft_pub_rec *rec,
 		meta = cds_ft_item_to_metadata(ft_node_ptr(child));
 
 	if (meta) {
-		ft_set_parent_slot(meta, new_parent, slot);
-		field = &meta->parent;
+		/*
+		 * LIVE child with metadata: its (parent, offset) must be a
+		 * CO-COMMITTED pair riding @txn (ft_reparent_record_meta
+		 * records parent + the state-word PSO edge together).  The
+		 * former eager ft_set_parent_slot left the offset as a SETTLED
+		 * store: an ABORTED flip discarded the parent edge but kept the
+		 * offset -- a mismatched (old parent, new offset) pair that
+		 * downstream slot derivation consumed unvalidated.  The
+		 * incoming_byte settled store inside reparent_record_meta is
+		 * skipped here (the new parent is always compressed), matching
+		 * the "no incoming_byte write" contract above.
+		 */
+		ft_reparent_record_meta(txn, meta, new_parent, slot);
+		return;
 	} else if (ft->ordered_list) {
 		field = &ft_ord_cell_ptr(
 			((struct cds_ft_node *) child)->prev)->parent;

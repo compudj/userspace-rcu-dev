@@ -436,16 +436,19 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		return 1;	/* merge does not apply: caller falls back */
 	/*
 	 * Pre-reserve the commit flip-txn BEFORE any pre-flip side-effect.  The
-	 * surviving child's parent-slot offset is wired by ft_pub_rec_add_back_edge
-	 * below (write-side, unobserved only while the parked parent proxy makes an
-	 * up-walk reanchor) -- an aborted flip would leave that offset mismatched
-	 * against the still-old parent, with no proxy to trigger a reanchor.  With
-	 * the txn reserved the publish commits through ft_ord_cell_flip_into and
-	 * cannot fail, so the only failure points are this reservation and the
-	 * new_cn allocation, both BEFORE the build's first side-effect.
+	 * surviving child's (parent, parent-slot-offset) pair is RECORDED into
+	 * @txn by ft_pub_rec_add_back_edge below (ft_reparent_record_meta: both
+	 * edges co-committed), so an aborted flip discards the pair coherently
+	 * -- no settled offset survives against the still-old parent.  With the
+	 * txn reserved the publish commits through ft_ord_cell_flip_into without
+	 * allocating, so the only OOM points are this reservation and the new_cn
+	 * allocation, both BEFORE the build's first side-effect (a concurrent-
+	 * writer ABORT surfaces as -EAGAIN with new_cn reclaimed, see the commit
+	 * site below).
 	 */
 	txn = ft_flip_txn_create_bounded(FT_REMOVE_COMMIT_REC_MAX_EDGES + 3
 			+ 1 /* §4.B parent guard */
+			+ 1 /* back-edge (parent, offset) pair: the state-word edge */
 			+ nr_orphans + (trailing_orphan ? 1 : 0)
 			+ (freeze_leaf ? FT_HLIST_FREEZE_MAX_EDGES : 0)
 			+ count_reserve /* nr_keys walk from publish_parent (R3 fold) */);
@@ -516,8 +519,8 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		 * the pre-reserved @txn (ft_ord_cell_flip_into), so it is
 		 * allocation-free past this point and cannot fail.
 		 */
-		ft_pub_rec_add_back_edge(ft, &rec, new_cn->child, new_cn_flag,
-			&new_cn->child);
+		ft_pub_rec_add_back_edge(ft, &rec, txn, new_cn->child,
+			new_cn_flag, &new_cn->child);
 		new_cn_pub = ft_publish_compressed(ft, new_cn, new_cn_flag);
 		/* VALIDATE (§4.B): guard the LIVE (great-)grandparent publish_parent. */
 		ft_flip_txn_guard_parent(ft, txn, publish_parent);

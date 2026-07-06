@@ -582,6 +582,25 @@ void *urcu_txn_load_validate(struct urcu_mcas_txn *txn, void **slot,
 }
 
 /*
+ * Record a load-only guard with a CALLER-SUPPLIED expected value: commit
+ * succeeds only if @slot resolves to @expected at the install point.  Like
+ * urcu_txn_load_validate, but the expectation is derived from the read rather
+ * than being the read itself -- e.g. a state word's LIVE image (tombstone bit
+ * cleared), so a slot already carrying the dead value fails the compare
+ * instead of being validated as-is.  Guard semantics compose order-free with
+ * a real write on the same slot in the same attempt: a guard never advances
+ * the record's new_ptr (a prior write is preserved), and a differing expected
+ * old between the two poisons the descriptor (the commit aborts).  Sticky on
+ * OOM like store.
+ */
+static inline
+void urcu_txn_validate(struct urcu_mcas_txn *txn, void **slot,
+		void *expected, uintptr_t tag)
+{
+	(void) urcu_txn__record(txn, slot, expected, expected, 0, tag);
+}
+
+/*
  * Buffer a write {*slot: old -> new}.  @old_ptr is the value the caller saw.
  * If @slot already carries a record (a prior store, or a load-validate guard),
  * the write upgrades it in place rather than adding a second -- one record per
