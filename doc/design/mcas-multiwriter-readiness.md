@@ -946,11 +946,15 @@ caller-side obligations — both about things the internal bracket cannot provid
   fair-mutex turn**, so a contended writer eventually commits — **no livelock**.
   `urcu_txn_end` closes the section on success or terminal error.
 - The FT's per-attempt **bounded** allocation reconciles with the persistent
-  handle through the engine's `min_alloc`/`reserve`/grow. Capacity is
-  **grow-monotone**: an attempt grows the handle when it needs more edges than
-  any prior attempt (a retry re-plans against a reshaped tree, so it may
-  legitimately need more), and the handle never shrinks — steady-state retries
-  allocate nothing.
+  handle through the engine's `min_alloc`/`reserve`/grow: each attempt
+  allocates ONE descriptor, sized by its explicit `reserve` (the op's exact
+  worst-case bound, recomputed per attempt — a retry re-plans against a
+  reshaped tree, so the bound may differ). `min_alloc` — overwritten by that
+  reserve, refreshed to the realized size at commit — is only the *floor* for
+  an attempt's initial descriptor: it prevents mid-attempt `grow` steps when
+  a write-set exceeds a (smaller or absent) reservation. For an op like
+  insert, whose arm reserves an exact bound every attempt, the learned floor
+  is redundant — the per-attempt reserve already precludes mid-attempt growth.
 - **Reclaim rides the txn:** `defer_on_commit` schedules the retired nodes'
   `call_rcu`; the on-abort action frees the fresh cluster — the single reclaim
   place §10 audits against.
