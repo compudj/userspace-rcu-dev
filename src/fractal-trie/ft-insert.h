@@ -161,10 +161,12 @@ void ft_park_live_parent_edge(struct cds_ft *ft,
  * wiring (parent, slot offset, incoming_byte) was done at record time.
  */
 static
-void ft_insert_one_commit(struct cds_ft *ft, const uint8_t *key,
+enum urcu_txn_status ft_insert_one_commit(struct cds_ft *ft, const uint8_t *key,
 		size_t key_len, struct ft_ord_cell *cell,
 		struct ft_insert_commit *ic)
 {
+	enum urcu_txn_status st;
+
 	if (cell) {
 		struct ft_ord_cell *pred;
 		struct urcu_txn_list_node *pred_lnode;
@@ -248,8 +250,18 @@ void ft_insert_one_commit(struct cds_ft *ft, const uint8_t *key,
 	 * (parent, slot offset, incoming_byte) was done at record time, while
 	 * still invisible.
 	 */
-	ft_flip_txn_commit(ft, ic->txn);
+	st = ft_flip_txn_commit(ft, ic->txn);
 	ic->txn = NULL;
+	/*
+	 * ABORT (a concurrent writer froze a guarded node or won the forward-slot
+	 * CAS between this op's descent and here) or MEMORY_ERROR: the commit is
+	 * atomic, so NOTHING was installed -- the node this commit meant to retire
+	 * is STILL LIVE and reachable, and freeing it here would be a use-after-
+	 * free.  Leave every free_old_* untouched and surface the status; the
+	 * caller rolls back the fresh (unpublished) cluster and re-descends.
+	 */
+	if (caa_unlikely(st != URCU_TXN_STATUS_OK))
+		return st;
 	/*
 	 * The old compressed node a split replaced, or the old internal node a
 	 * recompact-relocation publish replaced: readers resolved the parked
@@ -260,6 +272,7 @@ void ft_insert_one_commit(struct cds_ft *ft, const uint8_t *key,
 		free_compressed_node(ft, ic->free_old_cn);
 	if (ic->free_old_node)
 		free_cds_ft_node(ft, ic->free_old_node);
+	return URCU_TXN_STATUS_OK;
 }
 
 /*

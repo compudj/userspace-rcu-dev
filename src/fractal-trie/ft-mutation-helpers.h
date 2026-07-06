@@ -258,10 +258,15 @@ void ft_flip_txn_destroy(struct ft_flip_txn *t)
  * pre-sized @mtxn, so its commit is infallible (returns OK); an un-reserved store
  * that could not grow left @mtxn sticky-ENOMEM, so the commit returns
  * MEMORY_ERROR with nothing parked (freeze-before-install -- the structure is
- * byte-for-byte untouched).  ABORT (a racing writer won a contended slot) cannot
- * occur under the retained caller exclusion this POC runs under, so the retry
- * loop runs exactly once; it is present as the per-op concurrent shape.  @t is
- * consumed.
+ * byte-for-byte untouched).  ABORT (a peer writer froze a guarded node, or won a
+ * forward-slot expected-value CAS, between this op's descent and its commit) is
+ * SURFACED to the caller, not retried in place: the commit consumes the
+ * descriptor (urcu_mcas_commit reclaims it even on abort), so re-driving the same
+ * @mtxn would short-circuit to a spurious OK with nothing published.  A permanent
+ * structural conflict is resolved by the FT op re-reading the tree and rebuilding
+ * a fresh txn (re-descend), per doc/design/step4-concurrent-engine-plan.md; the
+ * ABORT return is what tells it to.  Under the retained single-writer exclusion
+ * ABORT never occurs, so this is behaviour-identical there.  @t is consumed.
  */
 static inline
 enum urcu_txn_status ft_flip_txn_commit(struct cds_ft *ft,
@@ -272,9 +277,7 @@ enum urcu_txn_status ft_flip_txn_commit(struct cds_ft *ft,
 				ft->group->flavor->update_call_rcu;
 	enum urcu_txn_status st;
 
-	do {
-		st = urcu_txn_commit_flavor(&t->mtxn, reclaim);
-	} while (caa_unlikely(st == URCU_TXN_STATUS_ABORT));
+	st = urcu_txn_commit_flavor(&t->mtxn, reclaim);
 	free(t);
 	return st;
 }

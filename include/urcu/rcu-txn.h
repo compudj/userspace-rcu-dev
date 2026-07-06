@@ -224,6 +224,27 @@ void urcu_txn_domain_init(struct urcu_txn_domain *d)
 	d->active = 0;
 }
 
+/*
+ * Caller-level deferred cleanup, dispatched by the commit OUTCOME.  A mutator
+ * that builds fresh nodes and retires old ones registers, during its prepare
+ * (edge-recording) phase:
+ *   - on-commit actions -- run IFF the txn commits (finalize: grace-defer the
+ *     now-unreachable retired nodes), and
+ *   - on-abort actions -- run IFF the txn aborts or is abandoned before commit
+ *     (rollback: free the fresh, never-published nodes; reset caller state).
+ * The commit drains exactly one list by outcome, so composing N prepares into
+ * one txn accumulates every op's cleanup and one commit dispatches them all --
+ * the composer need not track each op's finalize/rollback itself.  Each action
+ * is a {fn, arg} closure; @arg is typically the op's scope struct (which must
+ * outlive the commit -- normally the caller's stack frame in its retry loop).
+ * The count is bounded (reserve-style, like the write-set): assert on overflow.
+ */
+#define URCU_TXN_MAX_DEFER	4
+struct urcu_txn_defer_action {
+	void (*fn)(void *arg);
+	void *arg;
+};
+
 struct urcu_mcas_txn {
 	struct urcu_txn_domain *domain;	/* escalation domain, or NULL */
 	const struct rcu_flavor_struct *flavor;	/* RCU flavor for the read-side
@@ -246,6 +267,11 @@ struct urcu_mcas_txn {
 	struct cds_fair_mutex_node waiter;	/* our node while awaiting the turn */
 	int in_fallback;		/* we currently hold the lock */
 	int retrying;			/* commit asked retry: keep the turn */
+	/* Deferred cleanup dispatched by the commit outcome (see above). */
+	unsigned int nr_on_commit;
+	unsigned int nr_on_abort;
+	struct urcu_txn_defer_action on_commit[URCU_TXN_MAX_DEFER];
+	struct urcu_txn_defer_action on_abort[URCU_TXN_MAX_DEFER];
 };
 
 /*
@@ -271,6 +297,8 @@ void urcu_txn_init_flavor(struct urcu_mcas_txn *txn,
 	txn->mcas = NULL;
 	txn->in_fallback = 0;
 	txn->retrying = 0;
+	txn->nr_on_commit = 0;
+	txn->nr_on_abort = 0;
 }
 
 /* Initialize a handle bracketed in the compile-time-selected RCU flavor. */
@@ -406,6 +434,14 @@ void urcu_txn_begin(struct urcu_mcas_txn *txn)
 	if (urcu_txn__want_fallback(txn))
 		urcu_txn__enter_fallback(txn);
 	txn->mcas = NULL;		/* prior attempt's descriptor already consumed/freed */
+	/*
+	 * A new attempt starts with an empty deferred-cleanup set: the prior
+	 * attempt's actions were drained by its commit outcome (or by an
+	 * explicit urcu_txn_abort).  Reset defensively so a prepare that bails
+	 * before registering leaves nothing stale for the next attempt.
+	 */
+	txn->nr_on_commit = 0;
+	txn->nr_on_abort = 0;
 	urcu_txn_read_lock(txn);
 }
 
@@ -561,6 +597,59 @@ int urcu_txn_store(struct urcu_mcas_txn *txn, void **slot,
 }
 
 /*
+ * Register a deferred action to run IFF this attempt commits (finalize).  See
+ * struct urcu_txn_defer_action.  Call during the prepare (edge-recording) phase,
+ * after begin, before commit.  Bounded: assert on overflow (reserve-style).
+ */
+static inline
+void urcu_txn_defer_on_commit(struct urcu_mcas_txn *txn,
+		void (*fn)(void *), void *arg)
+{
+	urcu_assert_debug(txn->nr_on_commit < URCU_TXN_MAX_DEFER);
+	txn->on_commit[txn->nr_on_commit].fn = fn;
+	txn->on_commit[txn->nr_on_commit].arg = arg;
+	txn->nr_on_commit++;
+}
+
+/*
+ * Register a deferred action to run IFF this attempt aborts or is abandoned
+ * before commit (rollback).  Paired with urcu_txn_defer_on_commit; see it.
+ */
+static inline
+void urcu_txn_defer_on_abort(struct urcu_mcas_txn *txn,
+		void (*fn)(void *), void *arg)
+{
+	urcu_assert_debug(txn->nr_on_abort < URCU_TXN_MAX_DEFER);
+	txn->on_abort[txn->nr_on_abort].fn = fn;
+	txn->on_abort[txn->nr_on_abort].arg = arg;
+	txn->nr_on_abort++;
+}
+
+/* Run @n deferred actions in registration order, then the caller resets. */
+static inline
+void urcu_txn__run_defer(struct urcu_txn_defer_action *a, unsigned int n)
+{
+	unsigned int i;
+
+	for (i = 0; i < n; i++)
+		a[i].fn(a[i].arg);
+}
+
+/*
+ * Drain the on-abort actions and clear the deferred sets WITHOUT committing --
+ * for a prepare that bails before commit (e.g. -ENOMEM/-EEXIST) or a guard-
+ * driven re-read (pair with urcu_txn_conflict).  Does not touch the write-set
+ * descriptor; use end()/destroy for that.
+ */
+static inline
+void urcu_txn_abort(struct urcu_mcas_txn *txn)
+{
+	urcu_txn__run_defer(txn->on_abort, txn->nr_on_abort);
+	txn->nr_on_commit = 0;
+	txn->nr_on_abort = 0;
+}
+
+/*
  * Commit the buffered write-set through the MCAS, deferring reclaim through
  * @call_rcu_fn.  Returns enum urcu_txn_status: OK on commit, ABORT on a
  * contention abort (the caller re-runs begin..commit; the retry count is
@@ -578,20 +667,38 @@ enum urcu_txn_status urcu_txn_commit_flavor(struct urcu_mcas_txn *txn,
 			void (*)(struct rcu_head *)))
 {
 	struct urcu_mcas *m = txn->mcas;
+	enum urcu_txn_status st;
 
 	if (caa_unlikely(m == URCU_TXN_ENOMEM)) {
 		txn->mcas = NULL;
-		return URCU_TXN_STATUS_MEMORY_ERROR;
+		st = URCU_TXN_STATUS_MEMORY_ERROR;
+	} else if (!m) {
+		st = URCU_TXN_STATUS_OK;	/* empty write-set: trivially committed */
+	} else {
+		txn->min_alloc = m->nr;		/* learn the realized size: a retry won't re-grow */
+		txn->mcas = NULL;		/* mcas_commit consumes the descriptor */
+		if (urcu_mcas_commit(m, call_rcu_fn)) {
+			st = URCU_TXN_STATUS_OK;
+		} else {
+			txn->retry++;		/* aged for the next attempt */
+			txn->retrying = 1;	/* keep the turn across the retry */
+			st = URCU_TXN_STATUS_ABORT;
+		}
 	}
-	if (!m)
-		return URCU_TXN_STATUS_OK;	/* empty write-set: trivially committed */
-	txn->min_alloc = m->nr;		/* learn the realized size: a retry won't re-grow */
-	txn->mcas = NULL;		/* mcas_commit consumes the descriptor */
-	if (urcu_mcas_commit(m, call_rcu_fn))
-		return URCU_TXN_STATUS_OK;
-	txn->retry++;			/* aged for the next attempt */
-	txn->retrying = 1;		/* keep the turn across the retry */
-	return URCU_TXN_STATUS_ABORT;
+	/*
+	 * Dispatch the caller's deferred cleanup by outcome: finalize on a
+	 * successful commit (the retired nodes are now unreachable), roll back
+	 * otherwise (the fresh nodes were never published).  Both ABORT (the
+	 * caller re-drives the bracket) and MEMORY_ERROR leave nothing installed,
+	 * so both take the rollback path.
+	 */
+	if (st == URCU_TXN_STATUS_OK)
+		urcu_txn__run_defer(txn->on_commit, txn->nr_on_commit);
+	else
+		urcu_txn__run_defer(txn->on_abort, txn->nr_on_abort);
+	txn->nr_on_commit = 0;
+	txn->nr_on_abort = 0;
+	return st;
 }
 
 /*
