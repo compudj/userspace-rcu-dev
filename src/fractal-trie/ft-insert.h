@@ -255,7 +255,7 @@ enum urcu_txn_status ft_insert_one_commit(struct cds_ft *ft, const uint8_t *key,
 		 * (incl. head/tail) collapse to its 2.
 		 */
 		pred_lnode = pred ? ft_ord_cell_lnode(pred) : &ft->ord_sentinel.node;
-		(void) urcu_txn_list_insert_after_prepare(&ic->txn->mtxn,
+		(void) urcu_txn_list_insert_after_prepare(ft_flip_txn_handle(ic->txn),
 			ft_ord_cell_lnode(cell), pred_lnode);
 	}
 
@@ -315,8 +315,8 @@ enum urcu_txn_status ft_insert_one_commit(struct cds_ft *ft, const uint8_t *key,
 	 * publish decision.  @ic outlives the commit (the caller's retry frame).
 	 */
 	ic->ft = ft;
-	urcu_txn_defer_on_commit(&ic->txn->mtxn, ft_insert_finalize_cb, ic);
-	urcu_txn_defer_on_abort(&ic->txn->mtxn, ft_insert_abort_cb, ic);
+	urcu_txn_defer_on_commit(ft_flip_txn_handle(ic->txn), ft_insert_finalize_cb, ic);
+	urcu_txn_defer_on_abort(ft_flip_txn_handle(ic->txn), ft_insert_abort_cb, ic);
 	st = ft_flip_txn_commit(ft, ic->txn);
 	ic->txn = NULL;
 	return st;
@@ -436,7 +436,7 @@ void ft_insert_park_external_nodes(struct cds_ft *ft,
 	 * the recompact-relocation grandparent guard are mutually exclusive
 	 * insert shapes); no-op under retained exclusion.
 	 */
-	(void) urcu_txn_load_validate(&ic->txn->mtxn,
+	(void) urcu_txn_load_validate(ft_flip_txn_handle(ic->txn),
 		(void **) &metadata->state, FT_STATE_PROXY);
 	ic->slot = (struct cds_ft_inode_flag **) &metadata->external_nodes;
 	ic->publish_to_parent = false;
@@ -1611,7 +1611,7 @@ int ft_chain_node(struct cds_ft *ft, struct cds_ft_node *last_node,
 	t = ft_flip_txn_create_bounded(FT_HLIST_INSERT_AFTER_MAX_EDGES);
 	if (!t)
 		return -ENOMEM;
-	(void) ft_hlist_insert_after_prepare(&t->mtxn, node, last_node);
+	(void) ft_hlist_insert_after_prepare(ft_flip_txn_handle(t), node, last_node);
 	return ft_flip_txn_commit(ft, t) < 0 ? -ENOMEM : 0;
 }
 
@@ -3066,7 +3066,7 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 				FT_TP(replace_exit, (int) s);
 				return s;
 			}
-			(void) ft_hlist_replace_prepare(&txn->mtxn,
+			(void) ft_hlist_replace_prepare(ft_flip_txn_handle(txn),
 				old_node, new_node);
 			if (ft_flip_txn_commit(ft, txn) < 0) {
 				new_node->next = NULL;
@@ -3114,7 +3114,7 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 			 * preserved) into the swap commit (doc §4.B); the reservation
 			 * above carries the extra edge.
 			 */
-			ft_hlist_freeze_prepare(&txn->mtxn, old_node);
+			ft_hlist_freeze_prepare(ft_flip_txn_handle(txn), old_node);
 			ft_ord_cell_swap_publish_multi(ft, old_cell, new_cell,
 				sedges, n_s, txn);
 			ft_ord_cell_free(ft, old_cell);
@@ -3148,7 +3148,7 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 				(struct cds_ft_inode_flag *) new_node, &rec);
 			n_s = ft_pub_rec_sedges(&rec, sedges);
 			/* Fuse @old_node's freeze into the structural publish (doc §4.B). */
-			ft_hlist_freeze_prepare(&txn->mtxn, old_node);
+			ft_hlist_freeze_prepare(ft_flip_txn_handle(txn), old_node);
 			ft_ord_cell_flip_into(ft, txn, sedges, n_s);
 		}
 	}

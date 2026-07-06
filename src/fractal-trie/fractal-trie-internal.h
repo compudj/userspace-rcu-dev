@@ -1354,6 +1354,19 @@ struct cds_ft {
 	struct cds_ft_compact_state *active_compact;
 
 	/*
+	 * Per-trie writer-contention escalation domain (<urcu/rcu-txn.h>): a
+	 * concurrent-mode op's persistent txn handle binds it (ft_txn_op_init)
+	 * so a starved writer escalates into the FIFO fair-mutex lane after
+	 * URCU_TXN_FALLBACK aborted attempts (doc/design/
+	 * mcas-multiwriter-readiness.md §11).  Per-trie because writer
+	 * contention is per-trie (ops on different tries share no slots).
+	 * Initialized at create; no destructor (futex/word state only).
+	 * Unused (never escalates) on an exclusive trie -- ft_txn_op_init
+	 * binds NULL there.
+	 */
+	struct urcu_txn_domain txn_domain;
+
+	/*
 	 * Writer-side scratch iterator for ordinal-cell predecessor discovery
 	 * (ft_ord_cell_find_pred_from_head).  Allocated eagerly in
 	 * cds_ft_create when the group enables the ordered list, reused across

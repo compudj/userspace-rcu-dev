@@ -534,7 +534,7 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		 * retiring a leaf through this merge.
 		 */
 		if (freeze_leaf)
-			ft_hlist_freeze_prepare(&txn->mtxn, freeze_leaf);
+			ft_hlist_freeze_prepare(ft_flip_txn_handle(txn), freeze_leaf);
 		/*
 		 * R3 fold: the retired key's -1 walk from the merged node's stable
 		 * parent (publish_parent) up to root rides THIS commit atomically
@@ -1028,7 +1028,7 @@ int ft_detach_node(struct cds_ft *ft,
 			 * one MARK edge into @orphan_txn, the +1 reserved above.
 			 */
 			if (freeze_leaf) {
-				ft_hlist_freeze_prepare(&orphan_txn->mtxn,
+				ft_hlist_freeze_prepare(ft_flip_txn_handle(orphan_txn),
 					freeze_leaf);
 				freeze_leaf_fused = true;
 			}
@@ -1412,7 +1412,7 @@ int ft_detach_node(struct cds_ft *ft,
 			 * froze it in its merge flip.
 			 */
 			if (!boundary_fused && freeze_leaf && pub && commit_txn) {
-				ft_hlist_freeze_prepare(&commit_txn->mtxn,
+				ft_hlist_freeze_prepare(ft_flip_txn_handle(commit_txn),
 					freeze_leaf);
 				freeze_leaf_fused = true;
 			}
@@ -1834,7 +1834,7 @@ int ft_promote_head(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 		 * while @node is still unmarked (doc §4.B).  The reservation above
 		 * carries the extra edge.
 		 */
-		ft_hlist_freeze_prepare(&txn->mtxn, node);
+		ft_hlist_freeze_prepare(ft_flip_txn_handle(txn), node);
 		ft_ord_cell_swap_publish_multi(ft, old_cell, new_cell, sedges,
 			n_s, txn);
 		ft_ord_cell_free(ft, old_cell);
@@ -1864,7 +1864,7 @@ int ft_promote_head(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 			(struct cds_ft_inode_flag *) next_node, &rec);
 		n_s = ft_pub_rec_sedges(&rec, sedges);
 		/* Fuse @node's freeze into the structural publish (doc §4.B). */
-		ft_hlist_freeze_prepare(&txn->mtxn, node);
+		ft_hlist_freeze_prepare(ft_flip_txn_handle(txn), node);
 		ft_ord_cell_flip_into(ft, txn, sedges, n_s);
 	}
 	return 0;
@@ -1897,7 +1897,7 @@ int ft_unchain_node(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 
 		if (!txn)
 			return -ENOMEM;
-		(void) ft_hlist_del_prepare(&txn->mtxn, node);
+		(void) ft_hlist_del_prepare(ft_flip_txn_handle(txn), node);
 		return ft_flip_txn_commit(ft, txn) < 0 ? -ENOMEM : 0;
 	} else if (next_node) {
 		/*
@@ -1941,7 +1941,7 @@ int ft_unchain_node(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 		_ft_publish_to_parent(ft, parent_nf,
 			(struct cds_ft_inode_flag **) head_slot, NULL, &rec);
 		n_s = ft_pub_rec_sedges(&rec, sedges);
-		ft_hlist_freeze_prepare(&txn->mtxn, node);
+		ft_hlist_freeze_prepare(ft_flip_txn_handle(txn), node);
 		ft_ord_cell_flip_into(ft, txn, sedges, n_s);
 	}
 	return 0;

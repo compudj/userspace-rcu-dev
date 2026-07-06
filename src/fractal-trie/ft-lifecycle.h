@@ -711,6 +711,11 @@ enum cds_ft_status cds_ft_create(struct cds_ft_group *ft_group,
 #endif
 	if (attr)
 		ft->exclusive = attr->exclusive;
+	/*
+	 * Writer-contention escalation domain for the concurrent-mode ops'
+	 * persistent txn handles (ft_txn_op_init, doc §11).
+	 */
+	urcu_txn_domain_init(&ft->txn_domain);
 
 	/*
 	 * Allocate the root node (smallest popcount_2l type, initially empty).

@@ -132,9 +132,50 @@ struct cds_ft_inode_flag *ft_descent_step(struct cds_ft *ft, struct ft_descent *
  * the commit returns a clean MEMORY_ERROR with nothing parked.
  */
 struct ft_flip_txn {
-	struct urcu_mcas_txn mtxn;	/* the concurrent commit engine handle */
+	struct urcu_mcas_txn *mtxn;	/* the concurrent commit engine handle:
+					 * &own (standalone txn), or the op's
+					 * PERSISTENT handle (create_bounded_on)
+					 * whose retry aging / FIFO turn / learned
+					 * size span the op's restart_attempt loop
+					 * (doc/design/mcas-multiwriter-readiness.md
+					 * §11) */
+	struct urcu_mcas_txn own;	/* backing handle for standalone txns */
 	bool reserved;			/* @mtxn pre-reserved (bounded) => infallible commit */
 };
+
+/*
+ * The engine handle behind @t -- pass to the urcu_txn_* / *_prepare primitives
+ * that record directly into the transaction.
+ */
+static inline
+struct urcu_mcas_txn *ft_flip_txn_handle(struct ft_flip_txn *t)
+{
+	return t->mtxn;
+}
+
+/*
+ * Initialize an op's PERSISTENT engine handle (doc §11): one handle spans the
+ * op's whole restart_attempt retry loop, so contention aging (txn->retry, the
+ * FIFO fair-mutex turn) and the learned descriptor size survive across
+ * attempts instead of resetting with each per-attempt ft_flip_txn.  Bind the
+ * trie's escalation domain and the group's RCU flavor, so urcu_txn_begin() /
+ * urcu_txn_end() bracket each attempt in the FT's RUNTIME flavor -- the FT
+ * owns the read-side bracket; a caller-held section merely nests.
+ *
+ * EXCLUSIVE trie: no concurrent writer (NULL domain -- never escalates) and
+ * no concurrent reader (NULL flavor -- the bracket falls back to the
+ * URCU_TXN_RCU_READ_LOCK macro, which fractal-trie-internal.h no-ops), so
+ * begin()/end() only manage the per-attempt descriptor / deferred-cleanup
+ * state: behavior-identical to the pre-bracket exclusive path.
+ */
+static inline
+void ft_txn_op_init(struct cds_ft *ft, struct urcu_mcas_txn *op)
+{
+	if (ft->exclusive)
+		urcu_txn_init_flavor(op, NULL, NULL);
+	else
+		urcu_txn_init_flavor(op, &ft->txn_domain, ft->group->flavor);
+}
 
 static inline
 struct ft_flip_txn *ft_flip_txn_create(void)
@@ -143,7 +184,8 @@ struct ft_flip_txn *ft_flip_txn_create(void)
 
 	if (!t)
 		return NULL;
-	urcu_txn_init(&t->mtxn, NULL);	/* flavor-agnostic: the caller brackets the
+	t->mtxn = &t->own;
+	urcu_txn_init(t->mtxn, NULL);	/* flavor-agnostic: the caller brackets the
 					 * RCU read side; no escalation domain
 					 * under POC exclusion */
 	t->reserved = false;		/* unbounded: @mtxn grows as edges record */
@@ -185,10 +227,50 @@ struct ft_flip_txn *ft_flip_txn_create_bounded(unsigned int cap)
 	t = (struct ft_flip_txn *) malloc(sizeof(*t));
 	if (!t)
 		return NULL;
-	urcu_txn_init(&t->mtxn, NULL);	/* no escalation domain under POC exclusion */
-	if (urcu_txn_reserve(&t->mtxn, cap) < 0) {
-		if (t->mtxn.mcas && t->mtxn.mcas != URCU_TXN_ENOMEM)
-			urcu_mcas_destroy(t->mtxn.mcas);
+	t->mtxn = &t->own;
+	urcu_txn_init(t->mtxn, NULL);	/* no escalation domain under POC exclusion */
+	if (urcu_txn_reserve(t->mtxn, cap) < 0) {
+		if (t->mtxn->mcas && t->mtxn->mcas != URCU_TXN_ENOMEM)
+			urcu_mcas_destroy(t->mtxn->mcas);
+		free(t);
+		return NULL;
+	}
+	t->reserved = true;
+	return t;
+}
+
+/*
+ * Bounded FT flip-txn BOUND to an op's persistent engine handle (@op,
+ * ft_txn_op_init'd before the op's restart_attempt loop and bracketed by
+ * urcu_txn_begin()/urcu_txn_end() per attempt): the recording facade is this
+ * per-attempt wrapper, but the retry aging, FIFO escalation turn, and learned
+ * descriptor size live in @op and survive the wrapper (commit/destroy free
+ * only the wrapper).  The reservation sizes @op's descriptor for this attempt
+ * exactly as create_bounded does for a standalone txn.  Returns NULL on OOM
+ * (malloc, or a failed reserve -- the sticky URCU_TXN_ENOMEM marker stays in
+ * @op and the op's terminal urcu_txn_end() clears it) -> the caller bails
+ * with -ENOMEM.  Shares the fault-injection countdown with create_bounded.
+ */
+static inline
+struct ft_flip_txn *ft_flip_txn_create_bounded_on(struct urcu_mcas_txn *op,
+		unsigned int cap)
+{
+	struct ft_flip_txn *t;
+
+#ifdef FEATURE_FT_FAULT_INJECT
+	if (cds_ft_fault_flip_countdown >= 0) {
+		if (cds_ft_fault_flip_countdown == 0) {
+			cds_ft_fault_flip_countdown = -1;
+			return NULL;
+		}
+		cds_ft_fault_flip_countdown--;
+	}
+#endif
+	t = (struct ft_flip_txn *) malloc(sizeof(*t));
+	if (!t)
+		return NULL;
+	t->mtxn = op;
+	if (urcu_txn_reserve(op, cap) < 0) {
 		free(t);
 		return NULL;
 	}
@@ -205,7 +287,7 @@ struct ft_flip_txn *ft_flip_txn_create_bounded(unsigned int cap)
 static inline
 bool ft_flip_txn_reserve(struct ft_flip_txn *t, unsigned int cap)
 {
-	if (urcu_txn_reserve(&t->mtxn, cap) < 0)
+	if (urcu_txn_reserve(t->mtxn, cap) < 0)
 		return false;
 	t->reserved = true;
 	return true;
@@ -225,8 +307,8 @@ bool ft_flip_txn_reserve(struct ft_flip_txn *t, unsigned int cap)
 static inline
 bool ft_flip_txn_reserve_extra(struct ft_flip_txn *t, unsigned int extra)
 {
-	unsigned int cur = (t->mtxn.mcas && t->mtxn.mcas != URCU_TXN_ENOMEM) ?
-			t->mtxn.mcas->cap : 0;
+	unsigned int cur = (t->mtxn->mcas && t->mtxn->mcas != URCU_TXN_ENOMEM) ?
+			t->mtxn->mcas->cap : 0;
 
 	return ft_flip_txn_reserve(t, cur + extra);
 }
@@ -272,8 +354,18 @@ static void ft_flip_txn_call_rcu_now(struct rcu_head *head,
 static inline
 void ft_flip_txn_destroy(struct ft_flip_txn *t)
 {
-	if (t->mtxn.mcas && t->mtxn.mcas != URCU_TXN_ENOMEM)
-		urcu_mcas_destroy(t->mtxn.mcas);
+	if (t->mtxn->mcas && t->mtxn->mcas != URCU_TXN_ENOMEM) {
+		urcu_mcas_destroy(t->mtxn->mcas);
+		/*
+		 * Leave a BOUND persistent handle clean for the op's next
+		 * attempt / its urcu_txn_end() (which would otherwise
+		 * double-destroy).  A sticky URCU_TXN_ENOMEM marker is
+		 * preserved above (only a live descriptor is destroyed), so
+		 * an OOM already recorded on the handle still surfaces.
+		 * Harmless for a standalone txn (@own dies with the wrapper).
+		 */
+		t->mtxn->mcas = NULL;
+	}
 	free(t);
 }
 
@@ -305,7 +397,7 @@ enum urcu_txn_status ft_flip_txn_commit(struct cds_ft *ft,
 				ft->group->flavor->update_call_rcu;
 	enum urcu_txn_status st;
 
-	st = urcu_txn_commit_flavor(&t->mtxn, reclaim);
+	st = urcu_txn_commit_flavor(t->mtxn, reclaim);
 	free(t);
 	return st;
 }
@@ -322,7 +414,7 @@ static inline
 void ft_flip_txn_record_tag(struct ft_flip_txn *t, void **slot,
 		void *old_ptr, void *new_ptr, uintptr_t tag)
 {
-	int ret = urcu_txn_store(&t->mtxn, slot, old_ptr, new_ptr, tag);
+	int ret = urcu_txn_store(t->mtxn, slot, old_ptr, new_ptr, tag);
 
 	assert(!ret);
 	(void) ret;	/* reserved up front -> never fails */
@@ -753,7 +845,7 @@ void ft_flip_txn_guard_parent(const struct cds_ft *ft, struct ft_flip_txn *t,
 	 */
 	if (!t || !parent_nf)
 		return;
-	(void) urcu_txn_load_validate(&t->mtxn,
+	(void) urcu_txn_load_validate(t->mtxn,
 			(void **) &ft_flag_to_metadata(ft, parent_nf)->state,
 			FT_STATE_PROXY);
 }
@@ -1394,7 +1486,7 @@ int ft_ord_cell_swap(struct cds_ft *ft, struct ft_ord_cell *old_cell,
 	 * the old head / tail relocation -- no endpoint edge.  The concurrent op
 	 * takes (old, new), matching the single-updater list and cds_list_replace_rcu().
 	 */
-	(void) urcu_txn_list_replace_prepare(&t->mtxn, ft_ord_cell_lnode(old_cell),
+	(void) urcu_txn_list_replace_prepare(t->mtxn, ft_ord_cell_lnode(old_cell),
 		ft_ord_cell_lnode(new_cell));
 	return ft_flip_txn_commit(ft, t) < 0 ? -ENOMEM : 0;
 }
@@ -3355,7 +3447,7 @@ void ft_glue_record_splices(struct cds_ft *ft, struct ft_glue *g,
 		 * slots -- recorded edges do not install until the commit -- so it
 		 * always finds the true pre-merge tail.
 		 */
-		ft_hlist_append_run_prepare(&txn->mtxn, tail, src_head);
+		ft_hlist_append_run_prepare(ft_flip_txn_handle(txn), tail, src_head);
 	}
 }
 
