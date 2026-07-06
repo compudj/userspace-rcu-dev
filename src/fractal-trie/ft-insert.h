@@ -333,8 +333,9 @@ int ft_insert_commit_arm(struct cds_ft *ft, struct ft_insert_commit *ic,
 	 * + <=4 cell neighbour edges (list-on) + the live re-parent edge (<=7);
 	 * + the <=2 freeze-on-free tombstone edges (an old compressed and/or old
 	 * internal node this commit retires) now fused into the same flip as the
-	 * unlink (atomic detach, doc §4.B); + 1 VALIDATE freeze guard on the
-	 * relocation's live grandparent (ft_flip_txn_guard_parent, §4.B validate);
+	 * unlink (atomic detach, doc §4.B); + 1 VALIDATE freeze guard (the
+	 * relocation's live grandparent, or -- mutually exclusive insert shape --
+	 * the in-place external-head park holder; §4.B validate);
 	 * + @count_edges nr_keys count edges (rank-stats-ON count fold), one per
 	 * STABLE ancestor from the count base to the root -- sized by the caller to
 	 * the ACTUAL descent depth (0 when the shape does not fold its count).
@@ -365,6 +366,17 @@ void ft_insert_park_external_nodes(struct cds_ft *ft,
 	ft_flip_txn_record_reserved(ic->txn,
 		(void **) &metadata->external_nodes,
 		(void *) metadata->external_nodes, (void *) node);
+	/*
+	 * VALIDATE (§4.B): guard the LIVE holder @metadata this external head
+	 * parks into, so a concurrent remove that froze it aborts this commit.
+	 * Guarded directly (metadata in hand, always a real node -- never the
+	 * &ft->root null-parent case ft_flip_txn_guard_parent handles).  Fits the
+	 * one guard slot the arm's edge budget reserves (this in-place park and
+	 * the recompact-relocation grandparent guard are mutually exclusive
+	 * insert shapes); no-op under retained exclusion.
+	 */
+	(void) urcu_txn_load_validate(&ic->txn->mtxn,
+		(void **) &metadata->state, FT_STATE_PROXY);
 	ic->slot = (struct cds_ft_inode_flag **) &metadata->external_nodes;
 	ic->publish_to_parent = false;
 }
