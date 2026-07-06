@@ -95,10 +95,11 @@
  * and strip the mark); never touch the raw fields.  Mutators loop internally
  * until they commit or definitively fail; they return 0 / 1 on success,
  * -ENOENT if the anchor was deleted, -ENOMEM on descriptor OOM.  Each transacts
- * through the list head's escalation domain, so a mutator repeatedly bypassed
- * on the optimistic path escalates into the domain's fair lane and commits
- * within a bounded number of retries -- the list is starvation-resistant, not
- * merely livelock-free.
+ * through the caller-supplied escalation domain (a struct urcu_txn_domain *, one
+ * per logical structure -- see the head comment below), so a mutator repeatedly
+ * bypassed on the optimistic path escalates into that domain's fair lane and
+ * commits within a bounded number of retries -- the list is
+ * starvation-resistant, not merely livelock-free.
  */
 
 #include <errno.h>
@@ -122,28 +123,38 @@ struct urcu_txn_list_node {
 };
 
 /*
- * A list is its circular sentinel node plus the per-list escalation domain that
- * the concurrent transaction front-end funnels starved or oversized mutators
- * through (see <urcu/rcu-txn.h>).  The domain lives here, once
- * per list, which is why the mutators below take the head: an element is
- * reached only via its list, and a mutator needs that list's domain to stay
+ * A list is just its circular sentinel node.  The escalation DOMAIN -- the fair
+ * lane the concurrent transaction front-end funnels starved or oversized
+ * mutators through (see <urcu/rcu-txn.h>) -- is NOT embedded here: the mutators
+ * below take a struct urcu_txn_domain * explicitly, so a whole set of lists that
+ * form one logical structure shares ONE domain (or a small striped set), rather
+ * than paying a fair-mutex per list.  This matches <urcu/rcu-txn-hlist.h>, whose
+ * bucket heads likewise carry no domain.  The domain init'd for a list must
+ * outlive every mutator transacting through it, and every mutator on a given
+ * structure should be handed the same domain for that structure to stay
  * starvation-resistant under adversarial contention.
  *
- * The domain wraps a fair mutex with no static initializer, so a head must be
- * initialized at runtime with urcu_txn_list_init() -- there is no static
- * HEAD_INIT form.
+ * The head is domain-free, so -- unlike the concurrent hlist's single pointer,
+ * but like the single-writer <urcu/rcu-txn-sw-list.h> -- it has a static
+ * initializer: URCU_TXN_LIST_HEAD_INIT(name) / URCU_TXN_LIST_HEAD(name), or
+ * urcu_txn_list_init() at runtime.  The domain is init'd separately with
+ * urcu_txn_domain_init().
  */
 struct urcu_txn_list_head {
 	struct urcu_txn_list_node node;	/* circular sentinel */
-	struct urcu_txn_domain domain;	/* shared escalation domain */
 };
+
+#define URCU_TXN_LIST_HEAD_INIT(name) \
+	{ .node = { .next = &(name).node, .prev = &(name).node } }
+
+#define URCU_TXN_LIST_HEAD(name) \
+	struct urcu_txn_list_head name = URCU_TXN_LIST_HEAD_INIT(name)
 
 static inline
 void urcu_txn_list_init(struct urcu_txn_list_head *head)
 {
 	head->node.next = &head->node;
 	head->node.prev = &head->node;
-	urcu_txn_domain_init(&head->domain);
 }
 
 /* Logical-deletion mark: bit 1 of a node's next pointer. */
@@ -267,21 +278,22 @@ int urcu_txn_list_insert_after_prepare(struct urcu_mcas_txn *txn,
 }
 
 /*
- * Insert @newp immediately after @pos in list @head.  Returns 0 on success,
- * -ENOENT if @pos has been deleted, -ENOMEM on descriptor allocation failure.
- * @head supplies the list's escalation domain (see the contract above).  This
- * is the self-contained convenience form: a thin bracket around
+ * Insert @newp immediately after @pos, transacting through @domain's escalation
+ * lane.  Returns 0 on success, -ENOENT if @pos has been deleted, -ENOMEM on
+ * descriptor allocation failure.  @domain is the escalation domain shared across
+ * the structure @pos belongs to (see the contract above).  This is the
+ * self-contained convenience form: a thin bracket around
  * urcu_txn_list_insert_after_prepare().
  */
 static inline
 int urcu_txn_list_insert_after_rcu(struct urcu_txn_list_node *newp,
 		struct urcu_txn_list_node *pos,
-		struct urcu_txn_list_head *head)
+		struct urcu_txn_domain *domain)
 {
 	struct urcu_mcas_txn txn;
 	int ret, prep;
 
-	urcu_txn_init(&txn, &head->domain);
+	urcu_txn_init(&txn, domain);
 	for (;;) {
 		urcu_txn_begin(&txn);
 		prep = urcu_txn_list_insert_after_prepare(&txn, newp, pos);
@@ -303,9 +315,9 @@ int urcu_txn_list_insert_after_rcu(struct urcu_txn_list_node *newp,
 }
 
 /*
- * Insert @newp after @pos in list @head, but only if @guard_slot still holds
- * @guard_expected at the commit -- the structural insert and that check
- * linearize as ONE MCAS (a load-validate guard).  Use it when the insert
+ * Insert @newp after @pos, transacting through @domain, but only if @guard_slot
+ * still holds @guard_expected at the commit -- the structural insert and that
+ * check linearize as ONE MCAS (a load-validate guard).  Use it when the insert
  * depends on a word the list does not otherwise touch: a per-node "live" /
  * generation marker the embedder keeps beside its node, a container-freeze
  * flag, etc.  @guard_slot must be engine-transacted (every writer of it goes
@@ -320,13 +332,13 @@ static inline
 int urcu_txn_list_insert_after_guarded_rcu(
 		struct urcu_txn_list_node *newp,
 		struct urcu_txn_list_node *pos,
-		struct urcu_txn_list_head *head,
+		struct urcu_txn_domain *domain,
 		void **guard_slot, void *guard_expected)
 {
 	struct urcu_mcas_txn txn;
 	int ret;
 
-	urcu_txn_init(&txn, &head->domain);
+	urcu_txn_init(&txn, domain);
 	for (;;) {
 		void *pn;
 		struct urcu_txn_list_node *succ;
@@ -414,19 +426,19 @@ int urcu_txn_list_insert_before_prepare(struct urcu_mcas_txn *txn,
 }
 
 /*
- * Insert @newp immediately before @pos in list @head.  Returns 0 / -ENOENT /
- * -ENOMEM as for insert_after.  Convenience bracket around
+ * Insert @newp immediately before @pos, transacting through @domain.  Returns
+ * 0 / -ENOENT / -ENOMEM as for insert_after.  Convenience bracket around
  * urcu_txn_list_insert_before_prepare().
  */
 static inline
 int urcu_txn_list_insert_before_rcu(struct urcu_txn_list_node *newp,
 		struct urcu_txn_list_node *pos,
-		struct urcu_txn_list_head *head)
+		struct urcu_txn_domain *domain)
 {
 	struct urcu_mcas_txn txn;
 	int ret, prep;
 
-	urcu_txn_init(&txn, &head->domain);
+	urcu_txn_init(&txn, domain);
 	do {
 		urcu_txn_begin(&txn);
 		prep = urcu_txn_list_insert_before_prepare(&txn, newp, pos);
@@ -441,26 +453,30 @@ int urcu_txn_list_insert_before_rcu(struct urcu_txn_list_node *newp,
 }
 
 /*
- * Add @newp at the head of list @head (just after the sentinel).  The sentinel
- * is immortal, so this never observes a deleted anchor: it returns 0, or
- * -ENOMEM on descriptor allocation failure (never -ENOENT).
+ * Add @newp at the head of list @head (just after the sentinel), transacting
+ * through @domain.  The sentinel is immortal, so this never observes a deleted
+ * anchor: it returns 0, or -ENOMEM on descriptor allocation failure (never
+ * -ENOENT).
  */
 static inline
 int urcu_txn_list_add_rcu(struct urcu_txn_list_node *newp,
-		struct urcu_txn_list_head *head)
+		struct urcu_txn_list_head *head,
+		struct urcu_txn_domain *domain)
 {
-	return urcu_txn_list_insert_after_rcu(newp, &head->node, head);
+	return urcu_txn_list_insert_after_rcu(newp, &head->node, domain);
 }
 
 /*
- * Add @newp at the tail of list @head (just before the sentinel).  Returns 0,
- * or -ENOMEM on descriptor allocation failure (never -ENOENT).
+ * Add @newp at the tail of list @head (just before the sentinel), transacting
+ * through @domain.  Returns 0, or -ENOMEM on descriptor allocation failure
+ * (never -ENOENT).
  */
 static inline
 int urcu_txn_list_add_tail_rcu(struct urcu_txn_list_node *newp,
-		struct urcu_txn_list_head *head)
+		struct urcu_txn_list_head *head,
+		struct urcu_txn_domain *domain)
 {
-	return urcu_txn_list_insert_before_rcu(newp, &head->node, head);
+	return urcu_txn_list_insert_before_rcu(newp, &head->node, domain);
 }
 
 /*
@@ -523,19 +539,20 @@ int urcu_txn_list_del_prepare(struct urcu_mcas_txn *txn,
 }
 
 /*
- * Remove @elem from list @head.  Returns 1 if THIS call removed it (the caller
- * reclaims @elem after a grace period), 0 if it was already deleted (the caller
- * must NOT reclaim), or -ENOMEM on descriptor allocation failure.  Convenience
- * bracket around urcu_txn_list_del_prepare().
+ * Remove @elem, transacting through @domain.  @elem need not name its list --
+ * only the structure's shared domain.  Returns 1 if THIS call removed it (the
+ * caller reclaims @elem after a grace period), 0 if it was already deleted (the
+ * caller must NOT reclaim), or -ENOMEM on descriptor allocation failure.
+ * Convenience bracket around urcu_txn_list_del_prepare().
  */
 static inline
 int urcu_txn_list_del_rcu(struct urcu_txn_list_node *elem,
-		struct urcu_txn_list_head *head)
+		struct urcu_txn_domain *domain)
 {
 	struct urcu_mcas_txn txn;
 	int ret, prep;
 
-	urcu_txn_init(&txn, &head->domain);
+	urcu_txn_init(&txn, domain);
 	for (;;) {
 		urcu_txn_begin(&txn);
 		prep = urcu_txn_list_del_prepare(&txn, elem);
@@ -622,21 +639,21 @@ int urcu_txn_list_replace_prepare(struct urcu_mcas_txn *txn,
 }
 
 /*
- * Replace @old with @newp atomically with respect to RCU readers.  Argument
- * order is (old, new), as cds_list_replace_rcu().  Returns 0 on
- * success (the caller reclaims @old after a grace period), -ENOENT if @old was
- * already deleted/replaced, or -ENOMEM on descriptor allocation failure.
- * Convenience bracket around urcu_txn_list_replace_prepare().
+ * Replace @old with @newp atomically with respect to RCU readers, transacting
+ * through @domain.  Argument order is (old, new), as cds_list_replace_rcu().
+ * Returns 0 on success (the caller reclaims @old after a grace period), -ENOENT
+ * if @old was already deleted/replaced, or -ENOMEM on descriptor allocation
+ * failure.  Convenience bracket around urcu_txn_list_replace_prepare().
  */
 static inline
 int urcu_txn_list_replace_rcu(struct urcu_txn_list_node *old,
 		struct urcu_txn_list_node *newp,
-		struct urcu_txn_list_head *head)
+		struct urcu_txn_domain *domain)
 {
 	struct urcu_mcas_txn txn;
 	int ret, prep;
 
-	urcu_txn_init(&txn, &head->domain);
+	urcu_txn_init(&txn, domain);
 	for (;;) {
 		urcu_txn_begin(&txn);
 		prep = urcu_txn_list_replace_prepare(&txn, old, newp);

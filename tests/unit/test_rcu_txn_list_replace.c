@@ -46,6 +46,7 @@ struct lnode {
 };
 
 static struct urcu_txn_list_head g_head;
+static struct urcu_txn_domain g_dom;	/* shared escalation domain */
 static struct lnode A, B, C, Bp, Ap;
 
 static int in_list(struct urcu_txn_list_node *n)
@@ -94,16 +95,17 @@ int main(void)
 	plan_tests(NR_TESTS);
 	rcu_register_thread();
 	urcu_txn_list_init(&g_head);
+	urcu_txn_domain_init(&g_dom);
 
 	A.id = 1; B.id = 2; C.id = 3; Bp.id = 20; Ap.id = 10;
 
 	/* Build head -> A -> B -> C. */
-	urcu_txn_list_add_rcu(&C.node, &g_head);
-	urcu_txn_list_add_rcu(&B.node, &g_head);
-	urcu_txn_list_add_rcu(&A.node, &g_head);
+	urcu_txn_list_add_rcu(&C.node, &g_head, &g_dom);
+	urcu_txn_list_add_rcu(&B.node, &g_head, &g_dom);
+	urcu_txn_list_add_rcu(&A.node, &g_head, &g_dom);
 
 	/* 1. Replace B with Bp. */
-	r = urcu_txn_list_replace_rcu(&B.node, &Bp.node, &g_head);
+	r = urcu_txn_list_replace_rcu(&B.node, &Bp.node, &g_dom);
 	ok(r == 0, "replace returns 0 (Bp took B's slot)");
 	ok(in_list(&Bp.node) && !in_list(&B.node),
 		"Bp is now in the list and B is not");
@@ -133,8 +135,8 @@ int main(void)
 	rcu_read_unlock();
 
 	/* 6. Replacing an already-deleted node returns -ENOENT, links nothing. */
-	(void) urcu_txn_list_del_rcu(&A.node, &g_head);
-	r = urcu_txn_list_replace_rcu(&A.node, &Ap.node, &g_head);
+	(void) urcu_txn_list_del_rcu(&A.node, &g_dom);
+	r = urcu_txn_list_replace_rcu(&A.node, &Ap.node, &g_dom);
 	ok(r == -ENOENT && !in_list(&Ap.node),
 		"replacing a deleted node returns -ENOENT and links nothing");
 

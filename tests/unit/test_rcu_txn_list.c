@@ -65,6 +65,7 @@ struct lnode {
 };
 
 static struct urcu_txn_list_head g_head;
+static struct urcu_txn_domain g_dom;	/* shared escalation domain */
 static int g_stop;
 
 static int key_of(struct urcu_txn_list_node *n)
@@ -95,7 +96,7 @@ static void sorted_insert(int key)
 	if (!n)
 		abort();
 	n->key = key;
-	urcu_txn_init(&txn, &g_head.domain);
+	urcu_txn_init(&txn, &g_dom);
 	do {
 		struct urcu_txn_list_node *prev = &g_head.node, *succ;
 
@@ -139,7 +140,7 @@ static void delete_key(int key)
 			break;			/* sorted: past @key, absent */
 	}
 	if (target) {
-		int r = urcu_txn_list_del_rcu(&target->node, &g_head);
+		int r = urcu_txn_list_del_rcu(&target->node, &g_dom);
 
 		rcu_read_unlock();
 		if (r == 1)			/* this call removed it -> reclaim */
@@ -267,6 +268,7 @@ int main(void)
 	plan_tests(NR_TESTS);
 	rcu_register_thread();
 	urcu_txn_list_init(&g_head);
+	urcu_txn_domain_init(&g_dom);
 
 	for (i = 0; i < NR_READERS; i++) {
 		rs[i].walks = 0;
@@ -308,7 +310,7 @@ int main(void)
 		struct lnode *n = caa_container_of(p, struct lnode, node);
 		struct urcu_txn_list_node *nextp = urcu_txn_list_next_rcu(p);
 
-		if (urcu_txn_list_del_rcu(&n->node, &g_head) == 1)
+		if (urcu_txn_list_del_rcu(&n->node, &g_dom) == 1)
 			call_rcu(&n->rh, lnode_free);
 		p = nextp;
 	}
