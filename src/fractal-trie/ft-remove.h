@@ -158,7 +158,10 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 				&cn->child,
 				(struct cds_ft_inode_flag *) topmost_external_nodes,
 				&rec);
-			ft_remove_commit_rec(ft, &rec, fuse_cell, run, txn);
+			if (ft_remove_commit_rec(ft, &rec, fuse_cell, run,
+					txn) > 0)
+				/* Peer won: nothing installed (txn consumed). */
+				return -EAGAIN;
 			pub->armed = true;
 		} else {
 			struct ft_pub_rec rec = { .n = 0 };
@@ -178,7 +181,9 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 				&cn->child,
 				(struct cds_ft_inode_flag *) topmost_external_nodes,
 				&rec);
-			ft_remove_commit_rec(ft, &rec, NULL, NULL, txn);
+			if (ft_remove_commit_rec(ft, &rec, NULL, NULL, txn) > 0)
+				/* Peer won: nothing installed (txn consumed). */
+				return -EAGAIN;
 		}
 		*nr_clear = 0;
 		return 0;
@@ -249,7 +254,16 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			if (count_delta)
 				ft_flip_txn_record_count_parent(ft, txn,
 					src_meta->parent, count_delta);
-			ft_remove_commit_rec(ft, &rec, NULL, NULL, txn);
+			if (ft_remove_commit_rec(ft, &rec, NULL, NULL, txn) > 0) {
+				/*
+				 * Peer won: the fresh internal never published;
+				 * the retired compressed node stays live and
+				 * linked (its tombstone was discarded with the
+				 * aborted commit).
+				 */
+				free_cds_ft_node_unpublished(ft, fresh);
+				return -EAGAIN;
+			}
 		}
 		free_compressed_node(ft,
 			ft_compressed_node_ptr(iter_node_flag));
@@ -545,7 +559,18 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		if (count_delta)
 			ft_flip_txn_record_count_parent(ft, txn, publish_parent,
 				count_delta);
-		ft_remove_commit_rec(ft, &rec, dead_cell, run, txn);
+		if (ft_remove_commit_rec(ft, &rec, dead_cell, run, txn) > 0) {
+			/*
+			 * Peer won: NOTHING installed -- the collapsed chain
+			 * (boundary + parent_cn/child_cn) is still live and
+			 * linked (its tombstones, freezes, and count edges were
+			 * discarded with the aborted commit).  Only the
+			 * never-published merged node is ours to reclaim; the
+			 * caller retries and re-plans against the current tree.
+			 */
+			free_compressed_node_unpublished(ft, new_cn);
+			return -EAGAIN;
+		}
 	}
 
 	free_cds_ft_node(ft, ft_node_ptr(iter_node_flag));
@@ -1037,7 +1062,13 @@ int ft_detach_node(struct cds_ft *ft,
 				topmost_external_nodes, &nr_clear, fuse_cell,
 				pub, run, orphan_txn, count_delta);
 			if (ret) {
-				ft_flip_txn_destroy(orphan_txn);
+				/*
+				 * -EAGAIN: the commit CONSUMED @orphan_txn (a
+				 * peer won mid-flip); only a pre-commit failure
+				 * (-ENOMEM before the commit) leaves it live.
+				 */
+				if (ret != -EAGAIN)
+					ft_flip_txn_destroy(orphan_txn);
 				goto end;
 			}
 		}
@@ -1444,8 +1475,9 @@ int ft_detach_node(struct cds_ft *ft,
 						iter_node_flag, count_delta);
 					count_folded = true;
 				}
-				ft_remove_one_commit(ft, pub->slot, pub->old_val,
-					pub->new_val, pub->state_meta,
+				ret = ft_remove_one_commit(ft, pub->slot,
+					pub->old_val, pub->new_val,
+					pub->state_meta,
 					fuse_cell, run, commit_txn, NULL);
 				commit_txn_used = (commit_txn != NULL);
 			}
@@ -1458,11 +1490,13 @@ int ft_detach_node(struct cds_ft *ft,
 			 * not precede it).  The tombstones are already recorded above --
 			 * into @commit_txn (pub) or standalone (list-off).
 			 */
-			for (fi = 0; fi < nr_to_free; fi++)
-				orphan_free[fi] = to_free[fi];
-			nr_orphan_free = nr_to_free;
-			orphan_trailing = trailing_skip_cn_flag;
-			free_orphans_pending = true;
+			if (!ret) {
+				for (fi = 0; fi < nr_to_free; fi++)
+					orphan_free[fi] = to_free[fi];
+				nr_orphan_free = nr_to_free;
+				orphan_trailing = trailing_skip_cn_flag;
+				free_orphans_pending = true;
+			}
 		}
 	}
 	if (ret)
@@ -1540,8 +1574,13 @@ int ft_detach_node(struct cds_ft *ft,
 			 * pre-reserved txn (reserved above; this arm requires
 			 * fuse_cell/run) and cannot fail.
 			 */
-			ft_remove_commit_rec(ft, &rec, fuse_cell, run,
-				commit_txn_used ? NULL : commit_txn);
+			if (ft_remove_commit_rec(ft, &rec, fuse_cell, run,
+					commit_txn_used ? NULL : commit_txn) > 0) {
+				/* Peer won: nothing installed (txn consumed). */
+				commit_txn_used = (commit_txn != NULL);
+				ret = -EAGAIN;
+				goto end;
+			}
 			commit_txn_used = (commit_txn != NULL);
 			pub->armed = true;
 		} else if (!(pub && pub->armed) &&
@@ -1588,8 +1627,13 @@ int ft_detach_node(struct cds_ft *ft,
 					iter_meta->parent, count_delta);
 				count_folded = true;
 			}
-			ft_remove_commit_rec(ft, &rec, NULL, NULL,
-				commit_txn_used ? NULL : commit_txn);
+			if (ft_remove_commit_rec(ft, &rec, NULL, NULL,
+					commit_txn_used ? NULL : commit_txn) > 0) {
+				/* Peer won: nothing installed (txn consumed). */
+				commit_txn_used = (commit_txn != NULL);
+				ret = -EAGAIN;
+				goto end;
+			}
 			commit_txn_used = (commit_txn != NULL);
 		}
 		/*
@@ -1668,8 +1712,20 @@ end:
 	if (commit_txn && !commit_txn_used)
 		ft_flip_txn_destroy(commit_txn);
 	/* Reclaim safely after replacement. */
-	if (old_recompacted_node)
-		free_cds_ft_node(ft, old_recompacted_node);
+	if (old_recompacted_node) {
+		if (ret == -EAGAIN)
+			/*
+			 * ABORTED republish: the rebuilt copy never published
+			 * (its child re-parent edges and the old copy's
+			 * tombstone were recorded into the aborted commit and
+			 * discarded with it).  The OLD node stays live and
+			 * linked; reclaim the never-visible FRESH copy instead.
+			 */
+			free_cds_ft_node_unpublished(ft,
+				ft_node_ptr(iter_node_flag));
+		else
+			free_cds_ft_node(ft, old_recompacted_node);
+	}
 
 	/*
 	 * Standalone fallback for a caller-supplied @retire_glue that no commit
@@ -1835,8 +1891,17 @@ int ft_promote_head(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 		 * carries the extra edge.
 		 */
 		ft_hlist_freeze_prepare(ft_flip_txn_handle(txn), node);
-		ft_ord_cell_swap_publish_multi(ft, old_cell, new_cell, sedges,
-			n_s, txn);
+		if (ft_ord_cell_swap_publish_multi(ft, old_cell, new_cell,
+				sedges, n_s, txn)) {
+			/*
+			 * Peer won the commit: NOTHING installed -- @old_cell is
+			 * still the linked head cell (must NOT be freed) and the
+			 * fresh @new_cell never published.  Reclaim only ours
+			 * and retry from a fresh derivation.
+			 */
+			ft_ord_cell_free_unpublished(ft, new_cell);
+			return -EAGAIN;
+		}
 		ft_ord_cell_free(ft, old_cell);
 	} else {
 		/*
@@ -1854,8 +1919,11 @@ int ft_promote_head(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 			ft_flip_txn_create_bounded(FT_PUB_SEDGE_MAX_EDGES +
 				FT_HLIST_FREEZE_MAX_EDGES + 1);	/* +1: §4.B parent guard */
 
+		void *prev_save;
+
 		if (!txn)
 			return -ENOMEM;
+		prev_save = next_node->prev;
 		next_node->prev = node->prev;	/* inherit parent */
 		/* VALIDATE (§4.B): guard the LIVE holder this head-promote publishes into. */
 		ft_flip_txn_guard_parent(ft, txn, parent_nf);
@@ -1865,7 +1933,19 @@ int ft_promote_head(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 		n_s = ft_pub_rec_sedges(&rec, sedges);
 		/* Fuse @node's freeze into the structural publish (doc §4.B). */
 		ft_hlist_freeze_prepare(ft_flip_txn_handle(txn), node);
-		ft_ord_cell_flip_into(ft, txn, sedges, n_s);
+		if (ft_ord_cell_flip_into(ft, txn, sedges, n_s) > 0) {
+			/*
+			 * Peer won: the promote never published.  Undo the
+			 * pre-commit SETTLED prev store -- @next_node is still
+			 * an interior chain node whose prev must again name its
+			 * predecessor @node.  The transient parent-valued prev
+			 * a concurrent up-walker may have read is benign: both
+			 * anchors reach the same position (same class as
+			 * insert's parent-before-publish window).
+			 */
+			next_node->prev = prev_save;
+			return -EAGAIN;
+		}
 	}
 	return 0;
 }
@@ -1894,11 +1974,25 @@ int ft_unchain_node(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 		 */
 		struct ft_flip_txn *txn =
 			ft_flip_txn_create_bounded(FT_HLIST_DEL_MAX_EDGES);
+		enum urcu_txn_status st;
 
 		if (!txn)
 			return -ENOMEM;
-		(void) ft_hlist_del_prepare(ft_flip_txn_handle(txn), node);
-		return ft_flip_txn_commit(ft, txn) < 0 ? -ENOMEM : 0;
+		if (ft_hlist_del_prepare(ft_flip_txn_handle(txn), node)) {
+			/*
+			 * Peer conflict observed at prepare time (@node or a
+			 * neighbour mid-deletion): nothing was installed
+			 * (records never install without a commit) -- drop the
+			 * txn and retry from a fresh position derivation.
+			 */
+			ft_flip_txn_destroy(txn);
+			return -EAGAIN;
+		}
+		st = ft_flip_txn_commit(ft, txn);
+		if (st < 0)
+			return -ENOMEM;
+		/* ABORT: peer won, nothing installed, @node fully chained. */
+		return st > 0 ? -EAGAIN : 0;
 	} else if (next_node) {
 		/*
 		 * Head with a successor: prev is the cell flag (list on) or the
@@ -1942,7 +2036,9 @@ int ft_unchain_node(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 			(struct cds_ft_inode_flag **) head_slot, NULL, &rec);
 		n_s = ft_pub_rec_sedges(&rec, sedges);
 		ft_hlist_freeze_prepare(ft_flip_txn_handle(txn), node);
-		ft_ord_cell_flip_into(ft, txn, sedges, n_s);
+		if (ft_ord_cell_flip_into(ft, txn, sedges, n_s) > 0)
+			/* Peer won: nothing installed, @node still chained. */
+			return -EAGAIN;
 	}
 	return 0;
 }
@@ -1973,7 +2069,8 @@ int ft_unchain_node(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 static
 enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 		struct cds_ft_iter *iter,
-		struct cds_ft_node *node)
+		struct cds_ft_node *node,
+		bool *need_retry)
 {
 	struct cds_ft_inode_flag *holder_flag;
 	struct cds_ft_metadata *holder_meta;
@@ -2105,7 +2202,15 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 
 		holder_meta = cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
 		head_slot = &cn->child;
-		if ((struct cds_ft_node *) ft_node_ptr(*head_slot) != node) {
+		/*
+		 * Resolve a peer's mid-commit flip proxy before the identity
+		 * compare (§9): a raw proxy value would spuriously mismatch a
+		 * slot that still resolves to @node.  A genuine post-resolve
+		 * mismatch (a peer republished the holder) is caught by the
+		 * commit's expected-value CAS / §4.B guard as ABORT -> retry.
+		 */
+		if ((struct cds_ft_node *) ft_node_ptr(ft_resolve_flip_proxy(
+				rcu_dereference(*head_slot))) != node) {
 			dbg_printf("cds_ft_remove: node %p not at compressed child slot\n", node);
 			/* Drop the pre-reserved unsplice txn (nothing published yet). */
 			if (unsplice_txn)
@@ -2256,13 +2361,12 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 					ft_flip_txn_guard_parent(ft, txn, holder_flag);
 					ft_flip_txn_record_count_parent(ft, txn,
 						holder_flag, -1);
-					ft_remove_one_commit(ft,
+					ret = ft_remove_one_commit(ft,
 						(struct cds_ft_inode_flag **) &holder_meta->external_nodes,
 						(struct cds_ft_inode_flag *) node, NULL,
 						NULL, dead_cell, NULL, txn, node);
-					if (fuse_remove)
+					if (ret == 0 && fuse_remove)
 						pub.armed = true;
-					ret = 0;
 				} else {
 					/* List off + rank stats off: unchanged; no count. */
 					ret = ft_unchain_node(ft, holder_flag,
@@ -2302,6 +2406,8 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 		holder_meta = cds_ft_item_to_metadata(ft_node_ptr(holder_flag));
 		child = ft_node_get_nth_skip(holder_flag, &head_slot,
 			iter_key[key_len - 1], FT_PF_NONE);
+		/* Resolve a peer's mid-commit proxy before the identity compare (§9). */
+		child = ft_resolve_flip_proxy(child);
 		if (!child ||
 		    (struct cds_ft_node *) ft_node_ptr(child) != node) {
 			dbg_printf("cds_ft_remove: node %p not at key slot\n", node);
@@ -2342,14 +2448,33 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 			/* An in-place / fused structural commit already carried the
 			 * unsplice (pub.armed); otherwise commit it now through the
 			 * txn pre-reserved before the structural change. */
-			if (!pub.armed)
-				ft_ord_cell_unsplice(ft, unsplice_txn, dead_cell);
-			else
+			if (!pub.armed) {
+				/*
+				 * Two-commit fallback: the structural commit is
+				 * PUBLIC, so this unsplice must complete -- on a
+				 * peer conflict DRIVE IT FORWARD (each ABORT
+				 * means a peer committed: obstruction-free), and
+				 * retry the small bounded re-reservation too
+				 * (the aborted commit consumed the txn); backing
+				 * out would leave the key gone from the
+				 * structural index but present in the ordered
+				 * list.
+				 */
+				while (ft_ord_cell_unsplice(ft, unsplice_txn,
+						dead_cell) > 0) {
+					do {
+						unsplice_txn =
+							ft_flip_txn_create_bounded(
+							FT_ORD_CELL_UNSPLICE_MAX_EDGES);
+					} while (caa_unlikely(!unsplice_txn));
+				}
+			} else
 				ft_flip_txn_destroy(unsplice_txn);
 			ft_ord_cell_free(ft, dead_cell);
 		} else {
-			/* Removal aborted (MEMORY_ERROR): nothing left the trie, the
-			 * cell stays in the list -- release the unused reservation. */
+			/* Removal aborted (MEMORY_ERROR or a peer conflict):
+			 * nothing left the trie, the cell stays in the list --
+			 * release the unused reservation. */
 			ft_flip_txn_destroy(unsplice_txn);
 		}
 	}
@@ -2376,6 +2501,15 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 	case -ENOMEM:
 		FT_TP(remove_exit, (int) CDS_FT_STATUS_MEMORY_ERROR);
 		return CDS_FT_STATUS_MEMORY_ERROR;
+	case -EAGAIN:
+		/*
+		 * A peer writer won a commit this attempt (ABORT) or moved the
+		 * position pre-commit: NOTHING was published and every fused
+		 * edge (freeze, count, tombstone) was discarded with it.
+		 * Signal the wrapper's retry loop to re-derive and re-attempt.
+		 */
+		*need_retry = true;
+		return CDS_FT_STATUS_OK;	/* value unused: wrapper retries */
 	default:
 		abort();
 	}
@@ -2387,24 +2521,42 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 {
 	struct urcu_mcas_txn optxn;
 	enum cds_ft_status s;
+	bool need_retry;
 
 	CDS_FT_SCOPED_WRITER(ft);
 	/*
-	 * FT-owned per-op read-side bracket (doc §11 Phase A): on a concurrent
-	 * trie the body's position derivation, parked records, and internal
-	 * commits must run inside a read-side section so a peer writer's
-	 * call_rcu-deferred frees cannot reclaim under them; a caller-held
-	 * section merely nests.  @node's liveness AT ENTRY remains the
-	 * caller's obligation (it is a reference returned by a lookup, valid
-	 * only under the caller's own section -- the §11 reference-lifetime
-	 * contract).  The op's internal txns are still standalone (not bound
-	 * to @optxn): remove has no retry loop yet, so there is no aging to
-	 * carry across attempts -- binding them comes with the remove-side
-	 * ABORT-retry work.  Exclusive trie: the bracket opens nothing.
+	 * FT-owned per-op read-side bracket + retry identity (doc §11): on a
+	 * concurrent trie the body's position derivation, parked records, and
+	 * internal commits must run inside a read-side section so a peer
+	 * writer's call_rcu-deferred frees cannot reclaim under them; a
+	 * caller-held section merely nests.  @node's liveness AT ENTRY remains
+	 * the caller's obligation (a lookup reference, valid only under the
+	 * caller's own section -- the §11 reference-lifetime contract).
+	 *
+	 * RETRY: a peer-conflict attempt (a commit ABORT, or a pre-commit
+	 * position conflict) publishes nothing and signals @need_retry; the
+	 * loop re-derives the position from node->prev against the current
+	 * tree and re-attempts.  The op's internal txns are still standalone
+	 * (the pre-reserved unsplice txn coexists with the main commit txn, so
+	 * they cannot share one handle), so contention aging is carried
+	 * manually on the PERSISTENT @optxn via urcu_txn_conflict: after
+	 * URCU_TXN_FALLBACK conflicts the domain escalates this writer into
+	 * the per-trie FIFO fair-mutex lane -- every writer's begin() honors
+	 * domain->active, so the lane drains the contention and the retry
+	 * terminates (no livelock).  Exclusive trie: the bracket opens nothing
+	 * and no conflict ever fires.
 	 */
 	ft_txn_op_init(ft, &optxn);
-	urcu_txn_begin(&optxn);
-	s = _cds_ft_remove_locked(ft, iter, node);
+	for (;;) {
+		need_retry = false;
+		urcu_txn_begin(&optxn);
+		s = _cds_ft_remove_locked(ft, iter, node, &need_retry);
+		if (!need_retry)
+			break;
+		/* Age the conflict, keep the FIFO turn, close the attempt. */
+		urcu_txn_conflict(&optxn);
+		urcu_txn_end(&optxn);
+	}
 	urcu_txn_end(&optxn);
 	return s;
 }
