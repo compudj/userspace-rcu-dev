@@ -43,9 +43,12 @@ multi-writer gate and is not started.
 > flip-latch descriptor edge, never a bare `rcu_assign_pointer` / release store —
 > so the commit body is swappable for an MCAS.
 
-**Status: NOT met.** The 2026-06-24 audit classified 274 in-scope store sites and
-confirmed **~62 reader-reachable edges still publish via bare stores** (plus 7
-compaction sites), concentrated in a few root causes:
+**Status: MET — campaign closed, re-certified gap → 0 (2026-06-26).** The
+2026-06-24 audit classified 274 in-scope store sites and found **~62
+reader-reachable edges still publishing via bare stores** (plus 7 compaction
+sites); the conversion campaign closed them all, and the re-certification
+(`fractal-trie-review-2026-06/MCAS_EDGE_AUDIT_2026-06-26f.md`, 39 audited sites)
+counts the remaining gap at **zero**. The root causes were:
 
 - the systemic **list-OFF bypass** (every list-ON txn path has an `else` that does
   the same edge bare);
@@ -57,17 +60,18 @@ compaction sites), concentrated in a few root causes:
 - the `ft_node_recompact` republish sweep (also reached by ordinary insert/remove
   tier changes, not just `cds_ft_compact`).
 
-Nearly all are mechanically closable by routing through the existing
+Nearly all were mechanically closable by routing through the existing
 `urcu_flip_txn` / `ft_ord_cell_flip` / `ft_glue_record_back_edge` machinery, whose
 `nr==1` bare-store fast path makes the conversion **zero runtime cost**. The
-campaign that closes them is phased in the audit file.
+campaign that closed them is phased in the audit file.
 
 **Completeness oracle.** Because every conversion is behavior-identical under one
 writer (the `nr==1` path *is* a bare release store), the functional suite **cannot
 detect a missed conversion** — green tells you nothing about coverage. The
-completeness check is the **edge audit re-run** (gap count -> 0); a lightweight
-standing static guard (grep mutation modules for bare reader-visible stores
-against an allowlist of proven build-invisible sites) is recommended so the
+completeness check is the **edge audit re-run** (gap count -> 0), performed
+2026-06-26 with gap 0; a lightweight standing static guard (grep mutation
+modules for bare reader-visible stores against an allowlist of proven
+build-invisible sites) remains recommended-but-unbuilt (decision item 4) so the
 invariant cannot silently regress.
 
 ---
@@ -433,15 +437,19 @@ Mapping the node-word mutations to that rule:
 
 ### 4.1 Implementation gate: `FEATURE_FT_INSERT_IN_PLACE` (recompact-on-insert)
 
-The occupancy-bitmap insert (site 1) is retired behind a build gate
-(`FEATURE_FT_INSERT_IN_PLACE`, default on). With it **off**, a new-occupancy
-`ft_*_node_set_nth` on a *live* node returns `-ERANGE` instead of setting the
-bitmap bit in place, so the wrapper routes the insert through
-`ft_node_recompact(ADD_SAME)` — the same whole-node rebuild a non-tail insert
-already takes today. Both popcount and pigeon recompact uniformly. Behavior-
-identical under one writer, so the off build validates the MCAS-ready shape
+The occupancy-bitmap insert (site 1) is retired behind a build gate:
+`FEATURE_FT_INSERT_IN_PLACE` is **opt-in**, and **recompact-on-insert is the
+default** (the default was flipped once the MW campaign landed;
+`-DNO_FEATURE_FT_INSERT_IN_PLACE` still force-disables an explicit opt-in). By
+default, a new-occupancy `ft_*_node_set_nth` on a *live* node returns `-ERANGE`
+instead of setting the bitmap bit in place, so the wrapper routes the insert
+through `ft_node_recompact(ADD_SAME)` — the same whole-node rebuild a non-tail
+insert already takes. Both popcount and pigeon recompact uniformly. Behavior-
+identical under one writer, so the default build validates the MCAS-ready shape
 (no in-place bitmap mutation on the insert path) on the current suite. Cost:
-the O(1) in-place insert becomes an O(node) alloc-and-copy.
+the O(1) in-place insert becomes an O(node) alloc-and-copy; re-enabling the
+in-place fast path for a single-writer / exclusive trie is a future runtime
+perf knob (§5.2).
 
 ### 4.2 Hint vs truth — the pigeon bitmap and `nr_child` (deferred refinements)
 
@@ -513,14 +521,23 @@ correctness story but the most expensive (every delete is O(node) too); the stat
 word above buys back the O(1) remove for the non-re-rank case. Exclusivity (§5.2)
 gates all of it: an exclusive trie keeps the cheap in-place mutate-count path.
 
-**Status:** **implemented** — the recompact-on-insert gate (§4.1), the unified
+**Status:** **implemented** — the recompact-on-insert default (§4.1), the unified
 `nr_child`+tombstone+proxy state word, and the pigeon sticky-hint bitmap. The
 freeze MARK is now recorded at every node retire (the internal-node state bit
 and the chain-leaf `next` tombstone, §4 DECISION FINAL). With recompact-on-insert
-(§4.1) on, no reader-visible in-place node-word mutation survives — refinement 1
-is total. What remains is the **validate** side: folding the lone-edge marks into
-the unlink commit (atomic detach) and a writer failing its CAS once the target is
-`DEAD`, both pending the MCAS commit body (§4.B).
+(§4.1) as the default, no reader-visible in-place node-word mutation survives —
+refinement 1 is total. The **validate** side is well underway: the MCAS commit
+body exists and runs concurrent (`urcu_txn` / `urcu_mcas`), and the Phase-4.2
+atomic-detach campaign folded the marks into their unlink commits across the
+whole dup-chain surface (interior/head × remove/replace), the single-leaf
+detach/remove paths, and the graft/merge/detach family, with state-word
+validate edges guarding the `external_nodes` publishes/clears. Remaining: the
+standalone whole-chain / freeze-leaf marks on the detach and remove-all paths
+(5 lone-edge `ft_*_mark_removed_flip` call sites in ft-remove.h) plus the
+list-off pub-less lone store — to be folded into their unlink commits, or
+proven safe as-is and allowlisted (mark-BEFORE-unlink is the conservative
+order: a dead-but-still-linked window only costs racing writers a spurious
+abort/retry; the reverse order would be unsafe).
 
 ### 4.3 Commit granularity — single-word edges vs node identity
 
@@ -743,10 +760,10 @@ helping is a later refinement, not a correctness prerequisite.
 
 | | meaning | status | validated by |
 |---|---|---|---|
-| **Invariant 1** | every reader-visible edge is a flip-latch descriptor edge | NOT met (~62 gaps) | re-run the edge audit (functional tests cannot detect a miss) |
-| **Invariant 2** | freeze-on-free: a freed node fails a concurrent writer's CAS, still resolves for readers; writer re-validates | mechanism leaning to (B) metadata **seqcount** word folded into the flip-latch record (§4 revised); (A) `old==new` proxy kept for narrow-node local use; not implemented | (TBD — needs a multi-writer stress harness) |
+| **Invariant 1** | every reader-visible edge is a flip-latch descriptor edge | **MET** — campaign closed; re-certified gap → 0, 2026-06-26 (§2) | the edge-audit re-run (functional tests cannot detect a miss); standing static guard still open (decision item 4) |
+| **Invariant 2** | freeze-on-free: a freed node fails a concurrent writer's CAS, still resolves for readers; writer re-validates | mechanism **SETTLED** (§4 DECISION FINAL): one-way `deleted` latch — state-word bit (internal) + `next` tombstone (chain leaf); MARK side implemented at every retire; VALIDATE side in progress (§4.2 status) | `FT_DEBUG_TOMBSTONE_AUDIT` builds + the `FT_INV_MW` writer oracle in concurrent mode |
 
-Invariant 1 is the prerequisite the campaign closes. **Invariant 2 is the actual
+Invariant 1 is the prerequisite the campaign closed. **Invariant 2 is the actual
 lock-free enabler** — without it, a fully edge-expressible structure is still
 unsafe for multi-writer because an insert can commit into a concurrently-detached
 branch.
@@ -758,8 +775,12 @@ multi-writer cost is *transitioning a shared subtree to exclusive* — quiescing
 writers inside it (§5.3).
 
 ### Decisions / open questions
-1. ~~Freeze mechanism: (A) slot tombstone vs (B) node mark~~ — **SETTLED (§4):
-   (A), encoded as an `old == new` flip-proxy, commit-skips-settle, intentional-only.**
+1. ~~Freeze mechanism: (A) slot tombstone vs (B) node mark~~ — **SETTLED (§4
+   DECISION FINAL): the hybrid one-way `deleted` latch** — a state-word bit for
+   internal/compressed nodes (§4.B) and the `next`-word tombstone for
+   duplicate-chain leaves (§4.A); the seqcount is retired. (The earlier
+   "(A), `old == new` flip-proxy" settlement was superseded twice; see the §4
+   decision trail.)
 2. **Tier-3 bulk ops** (shared subtree → exclusive): subtree-wide freezing vs a
    per-subtree "sealed" epoch the writers check (§5.3). Exclusive/transient sides
    need neither (§5.2).
@@ -771,3 +792,171 @@ writers inside it (§5.3).
    **reserve capacity from the payload (invariant), re-record targets from dst (per
    retry)**. Needs `commit2_bound(payload)` + a reset/re-record txn mode. Obstruction-
    free across the GP; descriptor-helping is an optional later lock-freedom upgrade.
+6. ~~Read-side consistency under concurrent writers.~~ — **SETTLED (§9,
+   2026-07-06): fine-grained** — resolve the proxy at every slot read; no coarse
+   read-side re-descent (RCU covers lifetime, immutability covers content).
+7. ~~Reclaim ownership / the `nr_live>0` double-free.~~ — **SETTLED (§10,
+   2026-07-06): exactly-once retire, the tombstone flip is the single-owner
+   token.** A double-free is a bug (a free outside a won tombstone), never
+   tolerated by atomic accounting.
+8. ~~Who owns the txn `begin`/`end` (read-side bracket + retry identity).~~ —
+   **SETTLED (§11, 2026-07-06, refined): the FT API owns it unconditionally**
+   (read-side sections nest, so the internal bracket composes with any
+   caller-held section). The caller is never *required* to bracket; a caller
+   section is needed only to extend returned-reference lifetime (reads —
+   unchanged contract) and is FORBIDDEN across a two-commit op (§11).
+9. **Two-commit terminal-failure disposition (§7.1/§10):** if commit2 fails
+   terminally (`MEMORY_ERR` past what §7.2 pre-reservation excludes), who owns
+   the drained, exclusive, RCU-live payload? It holds live keys — a synchronous
+   free silently loses data; hand-back to the caller as a detached trie (the
+   `cds_ft_detach` shape) preserves it. **Undecided** — must be written down,
+   or the §10 audit cannot classify that free path.
+
+---
+
+## 9. Read-side consistency under concurrent writers (addendum 2026-07-06)
+
+Sections 1–8 specify how a writer *commits*. They do not specify what a
+concurrent *reader* — or a writer's own descent, which reads exactly like a
+reader — may observe, and that omission is the source of the descent/scan
+crashes (a garbage-type dereference `ft_type_is_popcount`, a SIGSEGV in
+`ft_descent_step`). **Decision (2026-07-06): fine-grained resolution** — resolve
+at every slot read; no coarse read-side retry.
+
+A reader is protected by three orthogonal mechanisms, one per hazard:
+
+| hazard | mechanism |
+|---|---|
+| the node it points at is being **freed** | RCU: the op runs in a read-side section (§11) and concurrent-mode reclaim is deferred via `call_rcu`, so nothing it can reach is freed before its grace period |
+| the node's **content** changes under it | immutability: a published node body (bitmap, pointer array, `len`, `key_bytes`, `incoming_byte`, `alloc_index`) is never mutated in place — a change builds a fresh node (§4.3), so the reader sees a stable snapshot |
+| a **slot it reads is mid-flip** | resolution: a slot may transiently hold a proxy during a peer's commit window (a type-7 structural proxy, a state-word `FT_STATE_PROXY`, or a list `URCU_MCAS_TAG`); the reader must resolve it to the committed-or-old value before using it |
+
+The first two are global properties requiring nothing at each site. **The third
+is a per-site obligation**, and it is the one the code violates: a raw slot read
+whose value is then dereferenced or type-classified will, in the flip window,
+read the proxy latch — low nibble `0xF` = internal type-7 — and either jump
+through a bogus type (`ft_type_is_popcount` / SIGILL) or dereference the latch as
+node memory (SIGSEGV).
+
+**The obligation:** every slot read that is subsequently dereferenced,
+type-classified, or compared as a node identity resolves first, through the
+matching resolver:
+
+| slot class | resolver |
+|---|---|
+| child slot (descent, scanners, `get_nth`) | `ft_resolve_flip_proxy` |
+| compressed `cn->child` | `ft_resolve_flip_proxy` |
+| parent / back-pointer (up-walk, reanchor) | `ft_resolve_parent_slot` / `ft_resolve_head_prev` |
+| state word (`nr_child`, PSO, tombstone) | `ft_meta_nr_child_load` / `ft_meta_parent_slot_offset_load` / `ft_meta_tombstone` |
+| ordered-list link | `urcu_txn_list_resolve` |
+
+**Consequence — no read-side re-descent.** Because RCU covers lifetime and
+immutability covers content, a reader never restarts because a writer recompacted
+under it: it reads the old node consistently and only resolves the mid-flip slot.
+This is why fine-grained resolution suffices and a coarse read-side retry is
+unnecessary.
+
+**Completeness is an audit, not a guess.** As with Invariant 1, functional tests
+cannot prove the absence of a miss; resolution coverage is enumerated
+site-by-site. The write-descent sites (`ft_descent_step`,
+`ft_descent_traverse_compressed`, `ft_park_live_parent_edge`) were closed
+2026-07-06; the read/scan path is the remaining sweep (Phase B).
+
+## 10. Reclaim — exactly-once retire, via the tombstone token (addendum 2026-07-06)
+
+**Invariant: a node is `call_rcu`'d exactly once.** A `range->nr_live > 0`
+failure at free time is a double-free bug, to be root-caused and eliminated —
+never masked by making the arena counter tolerate it.
+
+Exactly-once is not separate bookkeeping; it *is* freeze-on-free (§3, §4.B). The
+**tombstone flip is the single-owner retire token**:
+
+- A node is retired by exactly the writer whose commit sets that node's tombstone
+  **atomically with unlinking its last reader edge** (atomic detach).
+- The tombstone is one-way `LIVE→DEAD` and commits through the MCAS, so **only one
+  writer can win it**. A concurrent writer that would also retire the node finds
+  it already tombstoned — its state-word load-validate fails, its commit aborts,
+  and it frees nothing.
+- An **aborted** commit frees only its own **fresh, never-published** nodes
+  (freeze-before-install): those never reached a reader, so no peer can also own
+  them.
+- The **retry** rebuilds fresh nodes; it never re-hands a previous attempt's node
+  to `call_rcu`.
+
+So the free owner is unambiguous: a published node is freed by the commit that
+tombstones+unlinks it (once); an unpublished node by its sole builder on abort
+(once). A double-free means a path **frees outside a won tombstone**:
+
+1. an abort/error path frees a node a racing peer actually **published** (it must
+   free only its own unpublished fresh nodes);
+2. a node is retired by **two commits** because one retire path emits **no
+   tombstone edge** (a residual lone-flip / non-atomic retire the freeze-guard
+   cannot veto);
+3. the **retry** frees a node the previous attempt already gave to `call_rcu`.
+
+One disposition is currently *unspecified* and must be decided before the audit
+can classify it: the drained, exclusive payload of a two-commit op whose commit2
+fails terminally (decision item 9).
+
+**Audit obligation:** enumerate every `call_rcu`-of-a-node site (`free_cds_ft_node`
+/ `free_compressed_node` and the deferred-free lists) and confirm each is reached
+only by winning that node's tombstone flip in the same committing txn. Any free
+not gated by a won tombstone is the bug. Finite and mechanical, the same shape as
+the Invariant-1 and §9 audits.
+
+## 11. Transaction scoping, retry, and progress — FT-owned (addendum 2026-07-06)
+
+The retry loop (`restart_attempt`) and the FIFO livelock-escape need a real
+**transaction identity** spanning the loop; the caller's `rcu_read_lock` is only
+reclaim protection, not that identity. **Decision (2026-07-06, refined): the FT
+API owns the txn `begin`/`end`, unconditionally.** Read-side sections nest, so
+the FT-internal bracket composes with any section the caller may hold — no op
+needs a carve-out for "the caller might already be a reader."
+`urcu_txn_init_flavor` exists precisely for a flavor-agnostic embedder, so
+`begin`/`end` open the read-side section in the FT's runtime flavor.
+
+The caller contract that falls out is uniform for op *safety*, with exactly two
+caller-side obligations — both about things the internal bracket cannot provide:
+
+- **Single-commit op** (insert, remove, point lookup): one internal
+  `begin`/`end` bracket around the whole op. The caller is never *required* to
+  hold `rcu_read_lock`; a caller-held outer section is harmless (it nests).
+- **Reference-returning reads** (lookup, iteration): the internal bracket ends
+  at return, so it cannot keep the *result* alive. A caller that dereferences a
+  returned node reference must hold its own enclosing read-side section, exactly
+  as the public API documents today — nesting makes the internal bracket
+  compatible with that contract, not a substitute for it.
+- **Two-commit op** (graft, merge, detach between live tries): two internal
+  brackets around the internal drain — `begin`/detach/`end`, `synchronize_rcu`,
+  `begin`/attach/`end`. Here the caller **MUST NOT** hold a read-side section:
+  the inner `end` closes only the nested section, so a caller-held outer section
+  would still be open across the internal `synchronize_rcu` — self-deadlock.
+  This is the one asymmetry in the contract, and nesting cannot remove it.
+
+**The retry, concretely:**
+
+- A **persistent** `urcu_mcas_txn` is `urcu_txn_init_flavor`'d **once, before
+  `restart_attempt`**, with the trie's escalation **domain** (today the FT passes
+  `NULL` — the dormancy) and the FT flavor.
+- Each attempt: `urcu_txn_begin` (claims the FIFO turn if the domain escalated) →
+  descend → `reserve`/record edges → `commit_flavor`. On `ABORT` the engine ages
+  `txn->retry`++ and sets `txn->retrying` (keep the turn); the FT re-descends from
+  root.
+- After `URCU_TXN_FALLBACK` retries the domain escalates the thread to a **FIFO
+  fair-mutex turn**, so a contended writer eventually commits — **no livelock**.
+  `urcu_txn_end` closes the section on success or terminal error.
+- The FT's per-attempt **bounded** allocation reconciles with the persistent
+  handle through the engine's `min_alloc`/`reserve`/grow. Capacity is
+  **grow-monotone**: an attempt grows the handle when it needs more edges than
+  any prior attempt (a retry re-plans against a reshaped tree, so it may
+  legitimately need more), and the handle never shrinks — steady-state retries
+  allocate nothing.
+- **Reclaim rides the txn:** `defer_on_commit` schedules the retired nodes'
+  `call_rcu`; the on-abort action frees the fresh cluster — the single reclaim
+  place §10 audits against.
+
+**Migration:** the FT currently drives `commit_flavor` directly with a fresh
+per-attempt txn, `NULL` domain, and no `begin`/`end`; the read-side is the
+caller's `rcu_read_lock` (e.g. `mw_writer`). Phase A moves to the persistent-handle
++ domain + FT-owned bracket, after which the caller's manual `rcu_read_lock` is
+removed. This is the foundation the implementation plan starts from.
