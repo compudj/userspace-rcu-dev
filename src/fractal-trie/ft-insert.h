@@ -1183,11 +1183,25 @@ int ft_attach_node(struct cds_ft *ft,
 	if (attach_node_flag)
 		metadata = cds_ft_item_to_metadata(ft_node_ptr(attach_node_flag));
 
-	/* Concurrent update prevented by mutual exclusion. */
-	assert(!(old_node_flag_ptr && (ft_node_ptr(*old_node_flag_ptr) && !external_nodes)));
-	assert(!(attach_node_flag_ptr && ft_node_ptr(*attach_node_flag_ptr) !=
-			ft_node_ptr(attach_node_flag)));
-	(void) old_node_flag_ptr;	/* Used by assert above; silence -DNDEBUG. */
+	/*
+	 * Concurrent-writer conflict detection (was a single-writer "concurrent
+	 * update prevented by mutual exclusion" assert, false under MW): a peer
+	 * mutated the old / attach slot between this writer's descent and here --
+	 * the old slot now holds a live node with nowhere to chain it, or the
+	 * attach slot no longer matches the descent-captured node (a peer's flip
+	 * proxy also reads != the captured node here, so it too routes to retry).
+	 * Bail to the from-root restart_attempt rather than build against a stale
+	 * slot: nothing is armed or built yet (nr_created_nodes == 0), so
+	 * check_error is a clean unwind.  The commit's forward-CAS + parent guard
+	 * would surface the same conflict as ABORT; failing fast here just skips a
+	 * doomed build.  No-op under retained exclusion.
+	 */
+	if ((old_node_flag_ptr && ft_node_ptr(*old_node_flag_ptr) && !external_nodes) ||
+			(attach_node_flag_ptr && ft_node_ptr(*attach_node_flag_ptr) !=
+				ft_node_ptr(attach_node_flag))) {
+		ret = -EAGAIN;
+		goto check_error;
+	}
 
 	/* Create new branch, starting from bottom */
 	iter_node_flag = (struct cds_ft_inode_flag *) child_node;
