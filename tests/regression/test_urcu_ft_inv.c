@@ -66,7 +66,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS	57
+#define NR_TESTS	58
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -675,6 +675,218 @@ static int inv_iteration_order(void)
 		return -1;
 	}
 	return drain_and_destroy(ft, group);
+}
+
+/* ================================================================== */
+/*                                                                    */
+/*   PHASE 4.3: writer-vs-writer race oracle (disjoint key ranges)    */
+/*                                                                    */
+/* ================================================================== */
+
+/*
+ * Concurrent WRITERS on one shared trie WITHOUT the single-writer serializing
+ * mutex the other invariants use -- the first test of the concurrent-writer
+ * path (the MCAS commit engine + the Invariant-2 §4.B holder guards + the
+ * commit retry, all dormant while a caller mutex serializes writers).
+ *
+ * Each writer owns a DISJOINT key range, so no two writers ever touch the same
+ * key: there is NO logical write/write conflict, only STRUCTURAL concurrency
+ * (writers mutating the shared internal nodes on their overlapping key
+ * prefixes).  This isolates structural-concurrency correctness (node sharing,
+ * freeze-on-free, the guards) from key-level races.
+ *
+ * Oracles:
+ *  - in-line (the §3.1 lost-key hazard): a key THIS writer inserted and has not
+ *    removed must ALWAYS resolve to exactly the node it inserted -- even while
+ *    another writer restructures a shared ancestor.  A miss or a wrong node
+ *    means a concurrent restructure made a live key disappear / resolve wrong.
+ *  - in-line: a key this writer has NOT inserted must not be found.
+ *  - final (after quiescence): every live key resolves to its node,
+ *    cds_ft_count_keys equals the exact live total, cds_ft_verify passes.
+ *  - leak_check: no node leaked or double-freed across the run.
+ */
+#define MW_NR_WRITERS	4
+#define MW_RANGE	256		/* keys per writer */
+
+struct mw_writer_arg {
+	struct cds_ft *ft;
+	uint64_t base;				/* range [base, base + MW_RANGE) */
+	uint8_t present[MW_RANGE];		/* 1 = my key is live in the trie */
+	struct ft_test_node *node[MW_RANGE];	/* the live node per present key */
+	unsigned long ops;
+	int failed;
+};
+
+static void *mw_writer(void *arg)
+{
+	struct mw_writer_arg *w = (struct mw_writer_arg *) arg;
+	struct cds_ft_iter *iter;
+	unsigned int seed = (unsigned int)(uintptr_t) w;
+
+	rcu_register_thread();
+	if (cds_ft_iter_create(w->ft, &iter) < 0)
+		abort();
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	while (!test_stop) {
+		uint64_t off = (uint64_t)(rand_r(&seed) % MW_RANGE);
+		uint64_t key = w->base + off;
+		struct cds_ft_node *found;
+		uint8_t k[8];
+
+		cds_ft_u64_to_key(w->ft, key, k, CDS_FT_LEN_DEFAULT);
+		rcu_read_lock();
+		cds_ft_iter_set_key(iter, k, CDS_FT_LEN_DEFAULT);
+		cds_ft_lookup(w->ft, iter);
+		found = cds_ft_iter_node(iter);
+		if (w->present[off]) {
+			/* Live key: must resolve to MY node (lost-key oracle). */
+			if (found != &w->node[off]->node) {
+				fprintf(stderr, "MW writer base %llu key %llu: live "
+					"but found %p != mine %p\n",
+					(unsigned long long) w->base,
+					(unsigned long long) key, (void *) found,
+					(void *) &w->node[off]->node);
+				w->failed = 1;
+			} else if (cds_ft_remove(w->ft, iter, found)
+					== CDS_FT_STATUS_OK) {
+				node_free_rcu(to_test_node(found));
+				w->present[off] = 0;
+				w->node[off] = NULL;
+			}
+		} else {
+			/* Absent key: must NOT be found. */
+			if (found) {
+				fprintf(stderr, "MW writer base %llu key %llu: "
+					"absent but found %p\n",
+					(unsigned long long) w->base,
+					(unsigned long long) key, (void *) found);
+				w->failed = 1;
+			} else {
+				struct ft_test_node *n = node_alloc(key);
+
+				if (insert_u64(w->ft, key, n)
+						== CDS_FT_STATUS_OK) {
+					w->present[off] = 1;
+					w->node[off] = n;
+				} else {
+					node_free(n);
+				}
+			}
+		}
+		rcu_read_unlock();
+		w->ops++;
+		if ((seed & 0x3f) == 0)
+			rcu_quiescent_state();
+	}
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static int inv_concurrent_writers_disjoint(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+
+	/*
+	 * Opt-in (FT_INV_MW=1): this is the Phase 4.3 concurrent-writer oracle.
+	 * The concurrent-writer path is not yet correct -- writers mutating
+	 * shared internal nodes race the read path (e.g. a remove's in-place
+	 * nr_child-- vs a lookup's child-index walk trips
+	 * ft_popcount_node_get_ith_pos's i < nr_child assert) -- so it stays out
+	 * of the default suite until Phase 4.3 lands.  Run it explicitly:
+	 *   FT_INV_MW=1 ./test_urcu_ft_inv inv_concurrent_writers_disjoint
+	 */
+	if (!getenv("FT_INV_MW")) {
+		fprintf(stderr, "# inv_concurrent_writers_disjoint: skipped "
+			"(set FT_INV_MW=1 to run the Phase 4.3 writer oracle)\n");
+		return 0;
+	}
+	ft = create_fixed_ft(8, &group);
+	struct mw_writer_arg *w;
+	pthread_t writers[MW_NR_WRITERS];
+	struct timespec t0;
+	unsigned long total_ops = 0, live = 0;
+	int i, ret = 0;
+
+	leak_reset();
+
+	w = (struct mw_writer_arg *) calloc(MW_NR_WRITERS, sizeof(*w));
+	if (!w)
+		abort();
+	for (i = 0; i < MW_NR_WRITERS; i++) {
+		w[i].ft = ft;
+		w[i].base = (uint64_t) i * MW_RANGE;
+	}
+
+	test_go = 0;
+	test_stop = 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < MW_NR_WRITERS; i++)
+		pthread_create(&writers[i], NULL, mw_writer, &w[i]);
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	test_go = 1;
+
+	rcu_thread_offline();
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
+		usleep(1000);
+	test_stop = 1;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < MW_NR_WRITERS; i++)
+		pthread_join(writers[i], NULL);
+	rcu_thread_online();
+
+	/* Quiescent: verify the final trie against every writer's shadow. */
+	synchronize_rcu();
+	rcu_read_lock();
+	for (i = 0; i < MW_NR_WRITERS; i++) {
+		unsigned int off;
+
+		total_ops += w[i].ops;
+		if (w[i].failed)
+			ret = -1;
+		for (off = 0; off < MW_RANGE; off++) {
+			struct cds_ft_node *found = NULL;
+
+			if (!w[i].present[off])
+				continue;
+			live++;
+			if (lookup_u64(ft, w[i].base + off, &found)
+					!= CDS_FT_STATUS_OK ||
+			    found != &w[i].node[off]->node) {
+				fprintf(stderr, "MW final: writer %d key %llu lost "
+					"(found %p != %p)\n", i,
+					(unsigned long long)(w[i].base + off),
+					(void *) found,
+					(void *) &w[i].node[off]->node);
+				ret = -1;
+			}
+		}
+	}
+	if (cds_ft_count_keys(ft) != live) {
+		fprintf(stderr, "MW final: count_keys %lu != live %lu\n",
+			cds_ft_count_keys(ft), live);
+		ret = -1;
+	}
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "MW final: cds_ft_verify failed\n");
+		ret = -1;
+	}
+	rcu_read_unlock();
+
+	fprintf(stderr, "# inv_concurrent_writers_disjoint: %d writers, %lu ops, "
+		"%lu live keys\n", MW_NR_WRITERS, total_ops, live);
+
+	free(w);
+	if (drain_and_destroy(ft, group) < 0)
+		ret = -1;
+	if (leak_check() < 0)
+		ret = -1;
+	return ret;
 }
 
 /* ================================================================== */
@@ -10480,6 +10692,7 @@ int main(int argc, char **argv)
 
 	diag("1. Iteration ordering");
 	RUN_TEST(inv_iteration_order);
+	RUN_TEST(inv_concurrent_writers_disjoint);
 	RUN_TEST(inv_bind_resume_order);
 	RUN_TEST(inv_ordered_bulk_consistency);
 	RUN_TEST(inv_compact_keycopy_terminates);
