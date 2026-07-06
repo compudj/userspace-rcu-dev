@@ -56,6 +56,7 @@ fi
 ALL_CONFIGS=(
 	"default||u ion ioff"
 	"fault-audit|-DFEATURE_FT_FAULT_INJECT -DFT_DEBUG_TOMBSTONE_AUDIT|u ioff"
+	"audit|-DFT_DEBUG_TOMBSTONE_AUDIT|u ion ioff"
 	"vam|-DFEATURE_FT_VERIFY_AT_MUTATION|u"
 	"noskip|-DNO_FEATURE_FT_SKIP_COMPRESSED|u ioff"
 	"nocompress|-DNO_FEATURE_FT_COMPRESS|u ioff"

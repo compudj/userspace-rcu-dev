@@ -197,6 +197,30 @@ struct cds_ft_compressed_node *ft_compact_relocate_compressed(struct cds_ft *ft,
 
 		ft_ord_cell_flip_one(&edge);
 	}
+	/*
+	 * Freeze the retired compressed node dead (§4.B freeze-on-free) before it
+	 * is handed to call_rcu.  Its structural unlink is the bare child
+	 * back-reference redirect above (skip case, gp_slot == NULL) or the
+	 * grandparent forward flip (traditional) -- neither is yet a flip-txn edge
+	 * this mark can ride, so it is a lone-edge mark (the atomic mark+unlink
+	 * fold, mirroring ft_compact_relocate_at, awaits the bidir-list weld:
+	 * project_ft_bidir_list_integration).  Placed AFTER the unlink so a live,
+	 * reader-reachable node is never marked dead: @cn is already detached
+	 * (unreachable via its child's back-pointer / grandparent slot) and merely
+	 * awaiting its grace period, exactly the transient ft_skip_reanchor already
+	 * tolerates; the mark just adds the advisory tombstone bit a future
+	 * concurrent writer's freeze-guard CAS will consult.
+	 */
+	ft_meta_tombstone_set_flip(cn_meta);
+#ifdef FT_DEBUG_TOMBSTONE_AUDIT
+	/*
+	 * Freeze-on-free guard (doc §4.B): the compactor's always-deferred free
+	 * bypasses free_compressed_node's assert, so enforce it here at the
+	 * retire site -- every relocated-away compressed node must be tombstoned
+	 * before it is handed to call_rcu.
+	 */
+	assert(ft_meta_tombstone(cn_meta));
+#endif
 	/* Always-deferred free: see ft_compact_relocate_at. */
 	FT_TP(compressed_free, (const void *) ft_compressed_node_flag(cn));
 	cds_ft_free_item_deferred(ft, cn_meta);
