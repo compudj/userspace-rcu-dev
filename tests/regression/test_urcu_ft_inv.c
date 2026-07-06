@@ -742,7 +742,14 @@ static void *mw_writer(void *arg)
 		cds_ft_lookup(w->ft, iter);
 		found = cds_ft_iter_node(iter);
 		if (w->present[off]) {
-			/* Live key: must resolve to MY node (lost-key oracle). */
+			/*
+			 * Live key: must resolve to MY node (lost-key oracle).
+			 * The lookup reference (@found, and the iter's cached
+			 * path) is valid only under this thread's read-side
+			 * section, and cds_ft_remove consumes it -- so the
+			 * caller section spans lookup + remove (the §11
+			 * reference-lifetime contract).
+			 */
 			if (found != &w->node[off]->node) {
 				fprintf(stderr, "MW writer base %llu key %llu: live "
 					"but found %p != mine %p\n",
@@ -756,8 +763,17 @@ static void *mw_writer(void *arg)
 				w->present[off] = 0;
 				w->node[off] = NULL;
 			}
+			rcu_read_unlock();
 		} else {
-			/* Absent key: must NOT be found. */
+			/*
+			 * Absent key: only @found's boolean presence is
+			 * consumed past this point, so the lookup section
+			 * closes HERE and the insert below runs with NO
+			 * caller-held read-side section -- the FT owns its
+			 * own bracket (§11 Phase A).  This is the standing
+			 * oracle for that caller contract.
+			 */
+			rcu_read_unlock();
 			if (found) {
 				fprintf(stderr, "MW writer base %llu key %llu: "
 					"absent but found %p\n",
@@ -776,7 +792,6 @@ static void *mw_writer(void *arg)
 				}
 			}
 		}
-		rcu_read_unlock();
 		w->ops++;
 		if ((seed & 0x3f) == 0)
 			rcu_quiescent_state();
