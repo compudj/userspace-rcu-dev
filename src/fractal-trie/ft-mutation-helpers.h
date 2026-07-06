@@ -70,7 +70,15 @@ void ft_descent_traverse_compressed(struct ft_descent *d,
 	d->ppnfp = d->pnfp;
 	d->pnf   = d->nf;
 	d->pnfp  = d->nfp;
-	d->nf    = cn->child;
+	/*
+	 * Resolve a transient type-7 flip proxy a peer parked on cn->child
+	 * (Phase 4.3) to its committed-or-old target BEFORE it becomes the
+	 * descent cursor: the next ft_descent_step reads d->pnf as a node, so an
+	 * unresolved proxy (low nibble 0xF reads as internal type 7) would drive
+	 * a get_nth off a garbage type -> SIGILL.  d->nfp still names the raw
+	 * slot; only the snapshot d->nf is resolved (mirrors ft_node_get_nth).
+	 */
+	d->nf    = ft_resolve_flip_proxy(cn->child);
 	d->nfp   = &cn->child;
 	d->depth += cn->len;
 	*iter_key += cn->len;

@@ -1732,6 +1732,18 @@ struct cds_ft_inode_flag *ft_node_get_nth(const struct cds_ft *ft, struct cds_ft
 	struct cds_ft_inode_flag *child =
 		ft_node_get_nth_skip(node_flag, node_flag_ptr, n, pf_hint);
 
+	/*
+	 * Resolve a type-7 flip proxy transiently occupying the slot (Phase 4.3:
+	 * a peer's one-commit publish or merge flip in its install-to-settle
+	 * window) BEFORE the skip handler classifies the child -- an unresolved
+	 * proxy's low nibble reads as internal type 7, so the descent would
+	 * dereference the proxy latch as node memory on its next step (a SIGILL /
+	 * SIGSEGV garbage jump in ft_descent_step).  Predicted-not-taken when no
+	 * flip is in flight (single-writer unchanged); the resolved value may
+	 * itself be skip-encoded, hence resolve-then-skip order.  Mirrors
+	 * ft_node_get_nth_reanchor's leading resolve.
+	 */
+	child = ft_resolve_flip_proxy(child);
 	return ft_resolve_skip_compressed(ft, child);
 }
 

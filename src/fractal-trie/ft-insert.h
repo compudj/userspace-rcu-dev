@@ -152,6 +152,15 @@ void ft_park_live_parent_edge(struct cds_ft *ft,
 	struct cds_ft_metadata *meta = NULL;
 	struct cds_ft_inode_flag **field;
 
+	/*
+	 * @child was captured from a live slot (e.g. cn->child) a peer may be
+	 * mid-flip on (Phase 4.3): resolve a transient type-7 flip proxy to its
+	 * committed-or-old target before the kind dispatch below, else a 0xF-
+	 * tagged proxy falls through to the internal branch and item_to_metadata
+	 * faults on the proxy latch.  A conflicting peer commit is caught later
+	 * by this txn's MCAS expected-old check.
+	 */
+	child = ft_resolve_flip_proxy(child);
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 	if (ft_node_skip_compressed(child))
 		meta = cds_ft_item_to_metadata((struct cds_ft_inode *)
