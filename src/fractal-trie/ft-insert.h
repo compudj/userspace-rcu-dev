@@ -78,7 +78,52 @@ struct ft_insert_commit {
 	struct cds_ft_inode_flag *live_parent;
 	struct cds_ft_inode_flag **live_slot;
 	bool publish_to_parent;			/* settle via ft_publish_to_parent */
+	/*
+	 * Concurrent-writer commit-outcome scope (see the deferred-action model
+	 * in <urcu/rcu-txn.h>).  @ft anchors the finalize/rollback callbacks;
+	 * @created[0..nr_created) are this attempt's fresh, still-unpublished
+	 * cluster nodes -- freed by the on-abort rollback when a peer writer wins
+	 * the commit (or by the build's own error path pre-commit).  The
+	 * on-commit finalize frees the retired free_old_* above.
+	 */
+	struct cds_ft *ft;
+	struct cds_ft_inode_flag *created[FT_MAX_DEPTH];
+	int nr_created;
 };
+
+static void ft_free_unpublished_split_cluster(struct cds_ft *ft,
+		struct cds_ft_inode_flag *const *created, int nr_created);
+
+/*
+ * on-commit finalize: the commit installed, so the nodes this op retired are
+ * now unreachable -- queue their grace-period-deferred free.  Registered into
+ * the txn by the prepare; the engine runs it iff the commit succeeds.
+ */
+static
+void ft_insert_finalize_cb(void *arg)
+{
+	struct ft_insert_commit *ic = arg;
+
+	if (ic->free_old_cn)
+		free_compressed_node(ic->ft, ic->free_old_cn);
+	if (ic->free_old_node)
+		free_cds_ft_node(ic->ft, ic->free_old_node);
+}
+
+/*
+ * on-abort rollback: a peer writer won the commit (or it hit ENOMEM), so
+ * NOTHING was installed -- the fresh cluster this attempt built was never
+ * reader-reachable.  Free it (immediate, no grace period needed) so the
+ * re-descend starts clean.  The retire targets stay live and untouched; the
+ * caller resets @node's list linkage before retrying.
+ */
+static
+void ft_insert_abort_cb(void *arg)
+{
+	struct ft_insert_commit *ic = arg;
+
+	ft_free_unpublished_split_cluster(ic->ft, ic->created, ic->nr_created);
+}
 
 /*
  * Park the deferred LIVE re-parent edge (split-compressed one-commit) into
@@ -250,29 +295,22 @@ enum urcu_txn_status ft_insert_one_commit(struct cds_ft *ft, const uint8_t *key,
 	 * (parent, slot offset, incoming_byte) was done at record time, while
 	 * still invisible.
 	 */
+	/*
+	 * Register the commit-outcome cleanup, then commit.  The engine runs the
+	 * finalize (grace-free the retired free_old_* nodes -- readers resolved the
+	 * parked proxy to them until now) IFF the commit lands, or the rollback
+	 * (free the fresh unpublished cluster) IFF a peer writer won the forward
+	 * slot / froze a guarded node.  So both hazards -- "the retire target is
+	 * still live on abort, don't free it" and "the fresh cluster leaked on
+	 * abort, do free it" -- are dispatched by outcome, atomically with the
+	 * publish decision.  @ic outlives the commit (the caller's retry frame).
+	 */
+	ic->ft = ft;
+	urcu_txn_defer_on_commit(&ic->txn->mtxn, ft_insert_finalize_cb, ic);
+	urcu_txn_defer_on_abort(&ic->txn->mtxn, ft_insert_abort_cb, ic);
 	st = ft_flip_txn_commit(ft, ic->txn);
 	ic->txn = NULL;
-	/*
-	 * ABORT (a concurrent writer froze a guarded node or won the forward-slot
-	 * CAS between this op's descent and here) or MEMORY_ERROR: the commit is
-	 * atomic, so NOTHING was installed -- the node this commit meant to retire
-	 * is STILL LIVE and reachable, and freeing it here would be a use-after-
-	 * free.  Leave every free_old_* untouched and surface the status; the
-	 * caller rolls back the fresh (unpublished) cluster and re-descends.
-	 */
-	if (caa_unlikely(st != URCU_TXN_STATUS_OK))
-		return st;
-	/*
-	 * The old compressed node a split replaced, or the old internal node a
-	 * recompact-relocation publish replaced: readers resolved the parked
-	 * proxy to it until the commit above, so only now may its grace-period-
-	 * deferred free be queued.
-	 */
-	if (ic->free_old_cn)
-		free_compressed_node(ft, ic->free_old_cn);
-	if (ic->free_old_node)
-		free_cds_ft_node(ft, ic->free_old_node);
-	return URCU_TXN_STATUS_OK;
+	return st;
 }
 
 /*
@@ -724,6 +762,30 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 	 * full post-commit count, so the walk never touches one.  Reserve by the
 	 * actual node depth (0 when rank stats are off).
 	 */
+	/*
+	 * Concurrent-writer conflict check (Phase 4.3).  @parent_slot was recorded
+	 * at descent as cn's slot in its parent; a peer writer may since have
+	 * re-parented cn -- split cn's parent and re-homed cn under a fresh
+	 * junction -- so cn_meta->parent and @parent_slot now disagree.
+	 * ft_set_parent below would invert that (parent, slot) pair against the
+	 * wrong node's bitmap and fault.  cn's CURRENT slot (recomputed from
+	 * cn_meta) must still be @parent_slot; if not, signal a re-descend.  The
+	 * fresh cluster is unreachable, so free it now.  (The residual commit-time
+	 * window -- cn re-parented AFTER this check but before the forward install
+	 * -- is caught by the forward slot's expected-value CAS and the §4.B freeze
+	 * guard, both recorded by ft_insert_publish_or_park, surfacing as ABORT.)
+	 */
+	if (ft_get_parent_slot(cn_meta, ft) != parent_slot) {
+		ft_free_unpublished_split_cluster(ft, created, nr_created);
+		return -EAGAIN;
+	}
+	/*
+	 * Hand the fresh cluster to the op scope so the commit's on-abort rollback
+	 * frees it if a peer writer wins the forward slot at commit time.
+	 */
+	memcpy(ic->created, created, (size_t) nr_created * sizeof(created[0]));
+	ic->nr_created = nr_created;
+
 	ret = ft_insert_commit_arm(ft, ic,
 		ft->rank_stats ? node_depth + 2 : 0);
 	if (ret)
@@ -1879,6 +1941,8 @@ int _cds_ft_insert(struct cds_ft *ft,
 	int nr_snapshot = 0;
 	int ret;
 	struct ft_ord_cell *precell;
+	void *cell = NULL;			/* @precell's carrier; reused across retries */
+	enum urcu_txn_status cst = URCU_TXN_STATUS_OK;	/* last commit outcome */
 	struct ft_insert_commit ic = { 0 };
 
 	if (!valid_external_node(node) || !valid_key_len(ft, key_len))
@@ -1910,25 +1974,39 @@ int _cds_ft_insert(struct cds_ft *ft,
 	 */
 	precell = NULL;
 	if (ft->ordered_list) {
-		void *cell = ft_ord_cell_alloc(ft, node, NULL);
+		cell = ft_ord_cell_alloc(ft, node, NULL);
 
 		if (!cell)
 			return -ENOMEM;
-		node->prev = cell;
 		precell = ft_ord_cell_ptr(cell);
-		/*
-		 * Head's last edge byte for the up-walk key rebuild: the cell is
-		 * the head's metadata record and @key is ordinal here, so
-		 * key[key_len - 1] is the byte the head hangs under (ignored by the
-		 * up-walk when the head's parent is a compressed node, whose
-		 * key_bytes already span the head's position).
-		 */
-		if (key_len)
-			cds_ft_item_to_metadata(precell)->incoming_byte =
-				(uint8_t) key[key_len - 1];
 	}
 
 	key_depth = key_len + 1;
+
+restart_attempt:
+	/*
+	 * Per-attempt setup, re-entered on a concurrent-writer conflict (a
+	 * pre-commit -EAGAIN or a commit ABORT): the failed attempt published
+	 * nothing and its fresh cluster was already rolled back, so re-arm the
+	 * caller's node linkage, clear the commit scope, and re-descend from the
+	 * root against the now-current tree.  @precell is allocated once (above)
+	 * and REUSED across attempts -- it is spliced only by a committing attempt.
+	 *
+	 * Head's last edge byte for the up-walk key rebuild: the cell is the head's
+	 * metadata record and @key is ordinal here, so key[key_len - 1] is the byte
+	 * the head hangs under (ignored by the up-walk when the head's parent is a
+	 * compressed node, whose key_bytes already span the head's position).
+	 */
+	ic = (struct ft_insert_commit){ 0 };
+	ic.ft = ft;
+	cst = URCU_TXN_STATUS_OK;
+	node->prev = cell;			/* NULL when the list is off */
+	node->next = NULL;
+	if (precell && key_len)
+		cds_ft_item_to_metadata(precell)->incoming_byte =
+			(uint8_t) key[key_len - 1];
+	iter_key = key;
+	nr_snapshot = 0;
 
 	dbg_printf("cds_ft_insert attempt: node %p\n", node);
 	ft_descent_init(&d, ft);
@@ -2140,6 +2218,19 @@ int _cds_ft_insert(struct cds_ft *ft,
 
 insert_done:
 	/*
+	 * Concurrent-writer pre-commit conflict (-EAGAIN): the build found its
+	 * descended position moved under a peer writer and bailed BEFORE arming or
+	 * committing anything, freeing its own fresh cluster.  @precell is
+	 * untouched (reused); re-descend against the now-current tree.
+	 */
+	if (ret == -EAGAIN) {
+		if (ic.txn) {
+			ft_flip_txn_destroy(ic.txn);
+			ic.txn = NULL;
+		}
+		goto restart_attempt;
+	}
+	/*
 	 * @node became a fresh head iff node->prev is still its (cell) carrier
 	 * -- i.e. not external.  A duplicate append (ft_chain_node repointed
 	 * node->prev at the predecessor) or a failed insert leaves @precell
@@ -2169,7 +2260,7 @@ insert_done:
 			 * reader flips from not-present to the new key
 			 * atomically.  The +1 count folds into that commit.
 			 */
-			ft_insert_one_commit(ft, _key, _key_len, NULL, &ic);
+			cst = ft_insert_one_commit(ft, _key, _key_len, NULL, &ic);
 			assert(ic.count_folded || !ft->rank_stats);
 		} else if (ic.txn) {
 			/* Armed but nothing parked (duplicate append): no
@@ -2197,7 +2288,7 @@ insert_done:
 			 * list.  The +1 count (the key only now counts) folds
 			 * into that commit, from the shape's recorded base.
 			 */
-			ft_insert_one_commit(ft, _key, _key_len, precell, &ic);
+			cst = ft_insert_one_commit(ft, _key, _key_len, precell, &ic);
 			assert(ic.count_folded || !ft->rank_stats);
 		}
 		/*
@@ -2208,6 +2299,15 @@ insert_done:
 		 * atomically by ft_insert_one_commit above.
 		 */
 	}
+	/*
+	 * Concurrent-writer commit conflict: a peer writer won the forward slot's
+	 * expected-value CAS (or froze a §4.B-guarded node) at commit time, so
+	 * nothing published and the fresh cluster was rolled back by the txn's
+	 * on-abort action.  @precell was not spliced (the commit is atomic);
+	 * re-descend and retry.
+	 */
+	if (cst == URCU_TXN_STATUS_ABORT)
+		goto restart_attempt;
 	if (ret == 0) {
 		if (key_len > uatomic_load(&ft->max_used_key_len, CMM_RELAXED))
 			uatomic_store(&ft->max_used_key_len, key_len, CMM_RELAXED);
