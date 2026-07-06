@@ -2429,24 +2429,37 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 				if (ft->ordered_list) {
 					struct ft_ord_cell *old_cell =
 						ft_ord_cell_ptr(external_nodes->prev);
+					struct ft_ord_cell_edge sedge = {
+						.slot = (struct ft_ord_cell **)
+							&metadata->external_nodes,
+						.old_target = (struct ft_ord_cell *)
+							external_nodes,
+						.new_target = (struct ft_ord_cell *)
+							node,
+					};
+					struct ft_flip_txn *txn =
+						ft_flip_txn_create_bounded(
+						FT_ORD_CELL_SWAP_PUBLISH_MAX_EDGES + 1);
 
 					/*
 					 * The flip is the op's sole side-effect (the
 					 * new head is fresh); on OOM nothing is applied,
 					 * the old chain is intact (do NOT free its cell)
-					 * and the replace aborts retriably.
+					 * and the replace aborts retriably.  Arm a
+					 * pre-reserved txn so the §4.B VALIDATE guard on
+					 * the LIVE holder @d.nf rides the swap flip (a
+					 * concurrent remove that froze the holder aborts
+					 * this replace); ft_ord_cell_swap_publish_multi
+					 * then fuses the external_nodes publish + the head
+					 * cell's swap and commits it infallibly.
 					 */
-					if (ft_ord_cell_swap_publish(ft, old_cell,
-							precell,
-							(struct cds_ft_inode_flag **)
-								&metadata->external_nodes,
-							(struct cds_ft_inode_flag *)
-								external_nodes,
-							(struct cds_ft_inode_flag *)
-								node) != 0) {
+					if (!txn) {
 						ret = -ENOMEM;
 						goto insert_replace_done;
 					}
+					ft_flip_txn_guard_parent(ft, txn, d.nf);
+					ft_ord_cell_swap_publish_multi(ft, old_cell,
+						precell, &sedge, 1, txn);
 					ft_ord_cell_free(ft, old_cell);
 				} else {
 					/*

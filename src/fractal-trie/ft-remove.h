@@ -2242,7 +2242,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 				 */
 				if (ft->ordered_list || ft->rank_stats) {
 					struct ft_flip_txn *txn = ft_flip_txn_create_bounded(
-						FT_REMOVE_COMMIT_REC_MAX_EDGES +
+						FT_REMOVE_COMMIT_REC_MAX_EDGES + 1 +
 						(ft->rank_stats ? key_len + 1 : 0));
 
 					if (!txn) {
@@ -2251,6 +2251,9 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 						FT_TP(remove_exit, (int) CDS_FT_STATUS_MEMORY_ERROR);
 						return CDS_FT_STATUS_MEMORY_ERROR;
 					}
+					/* VALIDATE (§4.B): guard the LIVE holder whose
+					 * external_nodes this single-node clear empties. */
+					ft_flip_txn_guard_parent(ft, txn, holder_flag);
 					ft_flip_txn_record_count_parent(ft, txn,
 						holder_flag, -1);
 					ft_remove_one_commit(ft,
