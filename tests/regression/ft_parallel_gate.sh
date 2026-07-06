@@ -108,6 +108,10 @@ run_one() {	# $1=name $2=tests -- build lib+tests, run the TAP suites
 	if ! make -C "$dir/src" -j"$J" >"$GATE/$name.build" 2>&1; then
 		echo "$name: BUILD FAIL (see $GATE/$name.build)" >> "$out"; return
 	fi
+	# libtap et al must exist first, else the test binaries fail to link
+	# silently and every suite reports ok=0 (a false PASS -- see the ok=0
+	# gate below).
+	make -C "$dir/tests/utils"      -j"$J" >>"$GATE/$name.build" 2>&1
 	make -C "$dir/tests/unit"       test_urcu_ft_unit -j"$J" >>"$GATE/$name.build" 2>&1
 	make -C "$dir/tests/regression" test_urcu_ft_inv  -j"$J" >>"$GATE/$name.build" 2>&1
 	echo "$name: build ok" >> "$out"
@@ -145,8 +149,11 @@ for c in "${CONFIGS[@]}"; do
 	fi
 	cat "$GATE/$n.result"
 	# Fail on a bad build, any failing/aborted test, or a missing 'build ok'.
+	# Also fail on ok=0: a test suite that produced zero 'ok' lines built
+	# but never ran (missing/unlinked binary, e.g. tests/utils not built) --
+	# notok/abrt alone would let that pass as a false GREEN.
 	if ! grep -q 'build ok' "$GATE/$n.result" || \
-	   grep -qE 'BUILD FAIL|notok=[1-9]|abrt=[1-9]' "$GATE/$n.result"; then
+	   grep -qE 'BUILD FAIL|notok=[1-9]|abrt=[1-9]|ok=0 notok=' "$GATE/$n.result"; then
 		rc=1
 	fi
 done
