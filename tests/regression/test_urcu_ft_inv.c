@@ -806,6 +806,15 @@ static int inv_concurrent_writers_disjoint(void)
 		return 0;
 	}
 	ft = create_fixed_ft(8, &group);
+	/*
+	 * Concurrent writers REQUIRE concurrent mode: exclusive mode reclaims
+	 * retired nodes in place with no grace period (ft_flip_txn_call_rcu_now),
+	 * so a peer standing on a just-retired node reads recycled memory (UAF)
+	 * and two writers double-free it.  Concurrent mode defers reclaim through
+	 * the flavor's call_rcu, so a writer's rcu_read_lock-guarded descent keeps
+	 * every node it touches live until its grace period.
+	 */
+	cds_ft_make_concurrent(ft);
 	struct mw_writer_arg *w;
 	pthread_t writers[MW_NR_WRITERS];
 	struct timespec t0;
