@@ -1716,21 +1716,94 @@ void ft_set_parent_slot(struct cds_ft_metadata *meta,
  *
  * @ft is needed for the root case (parent == NULL).
  */
+/*
+ * ft_resolve_parent_slot: recover a node's parent AND its parent-slot address as
+ * a CONSISTENT snapshot, tolerating a mid-commit atomic re-home (Phase 4.3).
+ *
+ * A re-home commits @meta->parent (a type-7 flip-proxy) and the state-word offset
+ * (FT_STATE_PROXY) as ONE 2-edge MCAS txn.  Resolving each field with a SEPARATE
+ * status load can tear across the commit's status flip -- read parent -> OLD,
+ * flip, read offset -> NEW -> a slot address computed off the wrong parent body
+ * -> ft_slot_to_byte OOB.  So the two edges must be driven from a SINGLE status
+ * snapshot: when @meta->parent carries the proxy, take its txn @t, read
+ * urcu_mcas_status(t) ONCE, and resolve BOTH edges through it.  Offset changes
+ * only as part of a re-home, so an offset proxy is always @t's (co-committed);
+ * anything else (a freeze/tombstone parking the state word, which leaves the
+ * offset unchanged) resolves independently.  A re-home that begins mid-snapshot
+ * is caught by the coherence re-read of @meta->parent and retried.
+ *
+ * No re-home in flight (single writer, or between commits) => the fast path is a
+ * plain parent load + a proxy-tolerant offset load, behaviour-identical to the
+ * pre-4.3 raw recovery.  @parent_out (optional) receives the parent that matches
+ * the returned slot.  Call from within an RCU read-side section.
+ */
+static inline
+struct cds_ft_inode_flag **ft_resolve_parent_slot(
+		const struct cds_ft_metadata *meta, struct cds_ft *ft,
+		struct cds_ft_inode_flag **parent_out)
+{
+	struct cds_ft_inode_flag *parent;
+	void *state;
+
+	for (;;) {
+		struct cds_ft_inode_flag *praw = rcu_dereference(meta->parent);
+		void *sraw = uatomic_load((void **) (uintptr_t) &meta->state,
+				CMM_ACQUIRE);
+
+		if (caa_likely(!ft_node_flip_proxy(praw))) {
+			/*
+			 * No re-home parking @meta->parent.  The state word may
+			 * still carry an unrelated proxy (a freeze that leaves the
+			 * offset unchanged); resolve it independently.  A re-home
+			 * that STARTS after this load is caught by the coherence
+			 * re-read below.
+			 */
+			parent = praw;
+			state = urcu_mcas_resolve(sraw, FT_STATE_PROXY);
+		} else {
+			struct urcu_mcas_record *rp = ft_flip_proxy_ptr(praw);
+			struct urcu_mcas *t = rp->mcas;
+			unsigned long st = urcu_mcas_status(t);
+
+			parent = (struct cds_ft_inode_flag *)
+				(st == URCU_MCAS_SUCCEEDED ? rp->new_ptr : rp->old_ptr);
+			if (caa_likely(urcu_mcas_is_proxy(sraw, FT_STATE_PROXY))) {
+				struct urcu_mcas_record *rs =
+					urcu_mcas_untag(sraw, FT_STATE_PROXY);
+
+				if (caa_unlikely(rs->mcas != t))
+					continue;	/* stale offset edge: re-snapshot */
+				state = st == URCU_MCAS_SUCCEEDED ?
+						rs->new_ptr : rs->old_ptr;
+			} else {
+				/* Parent parked but offset already settled: re-snapshot. */
+				continue;
+			}
+		}
+		/*
+		 * Coherence guard: the snapshot is torn only if a re-home landed
+		 * on @meta->parent between the two loads above.  A stable parent
+		 * edge means (parent, offset) came from one consistent view.
+		 */
+		if (caa_likely(rcu_dereference(meta->parent) == praw))
+			break;
+	}
+
+	if (parent_out)
+		*parent_out = parent;
+	if (!parent)
+		return &ft->root;
+	return (struct cds_ft_inode_flag **)
+		((char *) ft_node_ptr(parent) +
+		 (((uintptr_t) state >> FT_STATE_PSO_SHIFT) & FT_STATE_PSO_VALMASK)
+		 * sizeof(void *));
+}
+
 static inline
 struct cds_ft_inode_flag **ft_get_parent_slot(const struct cds_ft_metadata *meta,
 		struct cds_ft *ft)
 {
-	if (!meta->parent)
-		return &ft->root;
-	/*
-	 * Resolve a mid-commit proxy on the state word (Phase 4.3): a raw offset
-	 * read of a peer-owned node being retired/re-homed would yield the proxy
-	 * pointer's bits and send this slot address off @meta->parent's body.
-	 * Under writer exclusion urcu_mcas_read short-circuits to a plain load.
-	 */
-	return (struct cds_ft_inode_flag **)
-		((char *) ft_node_ptr(meta->parent) +
-		 ft_meta_parent_slot_offset_load(meta) * sizeof(void *));
+	return ft_resolve_parent_slot(meta, ft, NULL);
 }
 
 /*
