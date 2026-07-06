@@ -2792,7 +2792,11 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 			 * unsplice (pub.armed); otherwise commit it now through the
 			 * txn pre-reserved before the structural change. */
 			if (!pub.armed)
-				ft_ord_cell_unsplice(ft, unsplice_txn, dead_cell);
+				/* remove_all: not yet retry-enabled (whole-chain
+				 * standalone marks block it); ABORT unreachable
+				 * under its current exclusion. */
+				(void) ft_ord_cell_unsplice(ft, unsplice_txn,
+					dead_cell);
 			else
 				ft_flip_txn_destroy(unsplice_txn);
 			ft_ord_cell_free(ft, dead_cell);

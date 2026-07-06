@@ -2712,7 +2712,8 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 						goto insert_replace_done;
 					}
 					ft_flip_txn_guard_parent(ft, txn, d.nf);
-					ft_ord_cell_flip_into(ft, txn, &sedge, 1);
+					/* Replace op, not yet MW-hardened (no retry loop). */
+				(void) ft_ord_cell_flip_into(ft, txn, &sedge, 1);
 				}
 			} else {
 				/* No external nodes yet. New key at this node. */
@@ -3207,7 +3208,8 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 			n_s = ft_pub_rec_sedges(&rec, sedges);
 			/* Fuse @old_node's freeze into the structural publish (doc §4.B). */
 			ft_hlist_freeze_prepare(ft_flip_txn_handle(txn), old_node);
-			ft_ord_cell_flip_into(ft, txn, sedges, n_s);
+			/* Replace op, not yet MW-hardened (no retry loop). */
+		(void) ft_ord_cell_flip_into(ft, txn, sedges, n_s);
 		}
 	}
 

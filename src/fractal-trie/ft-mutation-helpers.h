@@ -506,7 +506,7 @@ struct ft_remove_pub {
 	bool armed;
 };
 
-static void ft_ord_cell_flip_into(struct cds_ft *ft, struct ft_flip_txn *t,
+static enum urcu_txn_status ft_ord_cell_flip_into(struct cds_ft *ft, struct ft_flip_txn *t,
 		struct ft_ord_cell_edge *edges, unsigned int n);
 
 /*
@@ -660,7 +660,8 @@ void ft_root_list_swap_publish(struct cds_ft *ft, struct ft_flip_txn *txn,
 	 * reserves in its fallible prefix), committed infallibly here -- the
 	 * un-abortable post-drain root swap reaches an allocation-free commit.
 	 */
-	ft_ord_cell_flip_into(ft, txn, edges, n);
+	/* Bulk op, not yet MW-hardened: ABORT unreachable under its exclusion. */
+	(void) ft_ord_cell_flip_into(ft, txn, edges, n);
 }
 
 /*
@@ -1018,7 +1019,8 @@ void ft_root_list_swap_publish_dual(struct ft_flip_txn *txn,
 	 * always flip, so this commit is always multi-edge (>= 2) even with the
 	 * ordered list off -- it can never reduce to a lone store.
 	 */
-	ft_ord_cell_flip_into(a->ft, txn, edges, n);
+	/* Bulk op, not yet MW-hardened: ABORT unreachable under its exclusion. */
+	(void) ft_ord_cell_flip_into(a->ft, txn, edges, n);
 }
 
 /*
@@ -1207,7 +1209,8 @@ void ft_ord_cell_run_detach(struct cds_ft *ft, struct ft_flip_txn *txn,
 	unsigned int n = ft_ord_cell_run_detach_edges(ft, first_head, last_head,
 		&first, &last, edges, 0);
 
-	ft_ord_cell_flip_into(ft, txn, edges, n);
+	/* Bulk op, not yet MW-hardened: ABORT unreachable under its exclusion. */
+	(void) ft_ord_cell_flip_into(ft, txn, edges, n);
 	ft_ord_cell_run_install(into, first, last);
 }
 
@@ -1237,14 +1240,23 @@ struct ft_detach_run {
  * record every edge (freeze-before-install -- record_reserved cannot fail),
  * commit (park each proxy, flip the group, settle to the new target -- a lone
  * edge reduces to a single release store with no proxy / no grace period), then
- * reclaim the txn (deferred-freed when a proxy is owed).  Infallible -- no
+ * reclaim the txn (deferred-freed when a proxy is owed).  OOM-infallible -- no
  * allocation, hence no bare-store fallback.  @t is consumed (do not reuse / free
  * it).  This is the "pre-reserve always" commit: an op reserves its txn where
  * failure is clean (the build prefix, before any reader-visible change) and
- * commits through it here where failure is impossible.
+ * commits through it here where ALLOCATION failure is impossible.
+ *
+ * RETURNS the commit status: under concurrent writers the engine commit may
+ * ABORT (a peer won an expected-value CAS / froze a guarded node) -- then
+ * NOTHING was installed and the txn's recorded edges (freezes, counts,
+ * tombstones) were all discarded together.  A retry-enabled op (cds_ft_remove,
+ * cds_ft_insert one-commit) MUST propagate ABORT so its retry loop re-descends;
+ * an op not yet MW-hardened void-casts the return with a comment (ABORT is
+ * unreachable under its current exclusion).
  */
 static
-void ft_ord_cell_flip_into(struct cds_ft *ft, struct ft_flip_txn *t,
+enum urcu_txn_status ft_ord_cell_flip_into(struct cds_ft *ft,
+		struct ft_flip_txn *t,
 		struct ft_ord_cell_edge *edges, unsigned int n)
 {
 	unsigned int i;
@@ -1254,19 +1266,20 @@ void ft_ord_cell_flip_into(struct cds_ft *ft, struct ft_flip_txn *t,
 			(void *) edges[i].old_target,
 			(void *) edges[i].new_target,
 			ft_edge_tag(&edges[i]));
-	ft_flip_txn_commit(ft, t);
+	return ft_flip_txn_commit(ft, t);
 }
 
 /*
- * Fallible self-allocating flip: returns 0, or -ENOMEM with NOTHING installed.
- * For an ABORTABLE caller -- the flip is the op's commit / abort boundary, so on
- * OOM the op returns CDS_FT_STATUS_MEMORY_ERROR with the structure untouched.  A
- * single check, no per-edge handling: the edge count @n is known, so it is one
- * bounded malloc whose failure is reported here (freeze-before-install means an
- * un-built txn installs nothing).  A lone edge takes the infallible on-stack path
- * and always returns 0.  (Un-abortable post-drain commits do NOT use this -- they
- * pre-reserve a txn in the build phase and commit through ft_ord_cell_flip_into,
- * which cannot fail.)
+ * Fallible self-allocating flip: returns 0, -ENOMEM with NOTHING installed, or
+ * -EAGAIN with NOTHING installed (concurrent-writer commit ABORT -- the caller's
+ * retry loop re-descends).  For an ABORTABLE caller -- the flip is the op's
+ * commit / abort boundary, so on OOM the op returns CDS_FT_STATUS_MEMORY_ERROR
+ * with the structure untouched.  A single check, no per-edge handling: the edge
+ * count @n is known, so it is one bounded malloc whose failure is reported here
+ * (freeze-before-install means an un-built txn installs nothing).  A lone edge
+ * takes the on-stack single-store path and always returns 0 -- it cannot ABORT
+ * (no engine txn), which also means it cannot DETECT a peer conflict: the
+ * lone-store paths are the documented not-yet-MW residue (Group E/F force-a-txn).
  */
 static
 int ft_ord_cell_flip_try(struct cds_ft *ft, struct ft_ord_cell_edge *edges,
@@ -1284,8 +1297,7 @@ int ft_ord_cell_flip_try(struct cds_ft *ft, struct ft_ord_cell_edge *edges,
 	t = ft_flip_txn_create_bounded(n);
 	if (caa_unlikely(!t))
 		return -ENOMEM;
-	ft_ord_cell_flip_into(ft, t, edges, n);
-	return 0;
+	return ft_ord_cell_flip_into(ft, t, edges, n) > 0 ? -EAGAIN : 0;
 }
 
 /*
@@ -1428,13 +1440,21 @@ unsigned int ft_ord_cell_unsplice_edges(struct cds_ft *ft,
  * and ft_ord_cell_flip_into commits it here infallibly.
  */
 static
-void ft_ord_cell_unsplice(struct cds_ft *ft, struct ft_flip_txn *txn,
+enum urcu_txn_status ft_ord_cell_unsplice(struct cds_ft *ft,
+		struct ft_flip_txn *txn,
 		struct ft_ord_cell *cell)
 {
 	struct ft_ord_cell_edge edges[FT_ORD_CELL_UNSPLICE_MAX_EDGES] = { 0 };
 	unsigned int n = ft_ord_cell_unsplice_edges(ft, cell, edges, 0);
 
-	ft_ord_cell_flip_into(ft, txn, edges, n);
+	/*
+	 * ABORT (>0) propagates: this is the two-commit fallback's SECOND
+	 * commit, running after the structural commit is public, so a
+	 * retry-enabled caller must DRIVE IT FORWARD (re-attempt the unsplice)
+	 * rather than retry the whole op -- the key is already gone from the
+	 * structural index and must not stay in the ordered list.
+	 */
+	return ft_ord_cell_flip_into(ft, txn, edges, n);
 }
 
 /*
@@ -1558,10 +1578,11 @@ unsigned int ft_ord_cell_swap_edges(struct cds_ft *ft,
  * (ft_resolve_head_prev reads a head's prev RAW), so it CANNOT ride the flip;
  * the caller instead PRE-RESERVES @txn (>= FT_ORD_CELL_SWAP_PUBLISH_MAX_EDGES)
  * in its fallible prefix, before the live store, and the commit here goes through
- * the infallible ft_ord_cell_flip_into (returns 0).  @txn NULL = the fresh-head
+ * the OOM-infallible ft_ord_cell_flip_into.  @txn NULL = the fresh-head
  * case (no live store precedes the flip, so the flip is the op's sole
- * side-effect): self-allocate via ft_ord_cell_flip_try, returning 0 or -ENOMEM
- * with NOTHING applied (abort clean).
+ * side-effect): self-allocate via ft_ord_cell_flip_try.  Returns 0, -ENOMEM
+ * (nothing applied), or -EAGAIN (concurrent-writer commit ABORT, nothing
+ * applied -- the caller unwinds its pre-flip side-effects and retries).
  */
 static
 int ft_ord_cell_swap_publish_multi(struct cds_ft *ft,
@@ -1576,10 +1597,9 @@ int ft_ord_cell_swap_publish_multi(struct cds_ft *ft,
 		edges[n++] = sedges[i];
 	if (new_cell)
 		n = ft_ord_cell_swap_edges(ft, old_cell, new_cell, edges, n);
-	if (txn) {
-		ft_ord_cell_flip_into(ft, txn, edges, n);
-		return 0;
-	}
+	if (txn)
+		return ft_ord_cell_flip_into(ft, txn, edges, n) > 0 ?
+			-EAGAIN : 0;
 	return ft_ord_cell_flip_try(ft, edges, n);
 }
 
@@ -1674,10 +1694,13 @@ int ft_remove_one_commit(struct cds_ft *ft,
 	 * edge, just not atomic with the structure -- as in the pre-fusion path).
 	 *
 	 * @txn non-NULL: a caller-PRE-RESERVED bounded txn -- the flip commits
-	 * through it (ft_ord_cell_flip_into, infallible); returns 0.  @txn NULL:
-	 * commit via ft_ord_cell_flip_try, which installs nothing on OOM (a lone
-	 * edge is the infallible on-stack store), and return -ENOMEM so the caller
-	 * aborts the removal with the structure untouched.
+	 * through it (ft_ord_cell_flip_into, OOM-infallible); returns 0, or
+	 * -EAGAIN on a concurrent-writer commit ABORT (nothing installed -- the
+	 * fused count/freeze/tombstone edges were discarded with it; the caller
+	 * retries).  @txn NULL: commit via ft_ord_cell_flip_try, which installs
+	 * nothing on OOM (a lone edge is the infallible on-stack store), and
+	 * return -ENOMEM so the caller aborts the removal with the structure
+	 * untouched (-EAGAIN likewise propagates from a multi-edge conflict).
 	 */
 	if (txn) {
 		if (state_meta) {
@@ -1687,19 +1710,22 @@ int ft_remove_one_commit(struct cds_ft *ft,
 				old - FT_STATE_NR_CHILD_ONE);
 			n++;
 		}
-		ft_ord_cell_flip_into(ft, txn, edges, n);
+		if (ft_ord_cell_flip_into(ft, txn, edges, n) > 0)
+			return -EAGAIN;	/* peer won: nothing installed, caller retries */
 	} else {
 		int cret = ft_ord_cell_flip_try(ft, edges, n);
 
 		if (cret)
-			return cret;	/* nothing installed: caller aborts (no dec) */
+			return cret;	/* nothing installed: caller aborts/retries (no dec) */
 		if (state_meta)
 			ft_meta_nr_child_dec_flip(state_meta);
 	}
 	if (run) {
 		/* @into NULL = EXCISE-ONLY (the merge source side): the run is
 		 * unlinked from @ft's list but not re-homed; its cells keep their
-		 * internal links for the dst splice/interleave. */
+		 * internal links for the dst splice/interleave.  Reached only on a
+		 * COMMITTED flip (an ABORT returned above), so the arm is never
+		 * ghost-armed against an unchanged list. */
 		if (run->into)
 			ft_ord_cell_run_install(run->into, run->first, run->last);
 		run->armed = true;
@@ -1772,15 +1798,20 @@ void ft_pub_rec_add_back_edge(struct cds_ft *ft, struct ft_pub_rec *rec,
  *
  * @txn: when non-NULL, a caller-PRE-RESERVED bounded txn (capacity >=
  * FT_REMOVE_COMMIT_REC_MAX_EDGES) reserved in the op's fallible build phase --
- * the flip then commits through it (ft_ord_cell_flip_into) and CANNOT fail, so
- * a caller that has already wired a pre-flip side-effect (e.g. a child's
- * parent-slot offset via ft_pub_rec_add_back_edge) reaches an allocation-free
- * point of no return.  NULL keeps the transitional self-allocating flip (bare-
- * store fallback) for callers not yet migrated.
+ * the flip then commits through it (ft_ord_cell_flip_into) and cannot
+ * ALLOC-fail, so a caller that has already wired a pre-flip side-effect (e.g. a
+ * child's parent-slot offset via ft_pub_rec_add_back_edge) reaches an
+ * allocation-free point of no return.  NULL keeps the transitional
+ * self-allocating flip (bare-store fallback) for callers not yet migrated.
+ *
+ * RETURNS the commit status: ABORT (>0) means a peer writer won and NOTHING
+ * was installed (all fused edges discarded); a retry-enabled caller unwinds
+ * and re-descends.  The @txn-NULL lone-store path cannot abort (returns OK).
  */
 #define FT_REMOVE_COMMIT_REC_MAX_EDGES	8	/* <=3 structural (+back-edge) + <=4 cell/run + 1 DEL-recompact tombstone */
 static
-void ft_remove_commit_rec(struct cds_ft *ft, struct ft_pub_rec *rec,
+enum urcu_txn_status ft_remove_commit_rec(struct cds_ft *ft,
+		struct ft_pub_rec *rec,
 		struct ft_ord_cell *dead_cell, struct ft_detach_run *run,
 		struct ft_flip_txn *txn)
 {
@@ -1799,7 +1830,11 @@ void ft_remove_commit_rec(struct cds_ft *ft, struct ft_pub_rec *rec,
 	else if (dead_cell)
 		n = ft_ord_cell_unsplice_edges(ft, dead_cell, edges, n);
 	if (txn) {
-		ft_ord_cell_flip_into(ft, txn, edges, n);
+		enum urcu_txn_status st = ft_ord_cell_flip_into(ft, txn,
+				edges, n);
+
+		if (st > 0)
+			return st;	/* peer won: nothing installed, no run arm */
 	} else {
 		/*
 		 * NULL @txn: a non-fused recompaction / external-promote whose
@@ -1818,11 +1853,13 @@ void ft_remove_commit_rec(struct cds_ft *ft, struct ft_pub_rec *rec,
 	if (run) {
 		/* @into NULL = EXCISE-ONLY (the merge source side): the run is
 		 * unlinked from @ft's list but not re-homed; its cells keep their
-		 * internal links for the dst splice/interleave. */
+		 * internal links for the dst splice/interleave.  Reached only on
+		 * a COMMITTED flip (ABORT returned above). */
 		if (run->into)
 			ft_ord_cell_run_install(run->into, run->first, run->last);
 		run->armed = true;
 	}
+	return URCU_TXN_STATUS_OK;
 }
 
 /*
@@ -1962,7 +1999,8 @@ void ft_ord_cell_run_splice(struct cds_ft *dst, struct ft_flip_txn *txn,
 	unsigned int n = ft_ord_cell_run_splice_edges(dst, run_first, run_last,
 		pred, succ, edges, 0);
 
-	ft_ord_cell_flip_into(dst, txn, edges, n);
+	/* Bulk op, not yet MW-hardened: ABORT unreachable under its exclusion. */
+	(void) ft_ord_cell_flip_into(dst, txn, edges, n);
 }
 
 /*
@@ -2056,7 +2094,8 @@ void ft_ord_cell_run_replace(struct cds_ft *dst, struct ft_flip_txn *txn,
 	unsigned int n = ft_ord_cell_run_replace_edges(dst, d_first, d_last,
 		s_first, s_last, edges, 0);
 
-	ft_ord_cell_flip_into(dst, txn, edges, n);
+	/* Bulk op, not yet MW-hardened: ABORT unreachable under its exclusion. */
+	(void) ft_ord_cell_flip_into(dst, txn, edges, n);
 }
 
 /*
@@ -2103,7 +2142,8 @@ void ft_ord_cell_flip_rec_replace(struct cds_ft *ft, struct ft_flip_txn *txn,
 	}
 	n = ft_ord_cell_run_replace_edges(ft, run->d_first, run->d_last,
 		run->s_first, run->s_last, edges, n);
-	ft_ord_cell_flip_into(ft, txn, edges, n);
+	/* Bulk op, not yet MW-hardened: ABORT unreachable under its exclusion. */
+	(void) ft_ord_cell_flip_into(ft, txn, edges, n);
 	run->armed = true;
 }
 
@@ -2148,7 +2188,8 @@ void ft_ord_cell_run_unlink(struct cds_ft *ft, struct ft_flip_txn *txn,
 	edges[n].old_target = last;
 	edges[n].new_target = pred;
 	n++;
-	ft_ord_cell_flip_into(ft, txn, edges, n);
+	/* Bulk op, not yet MW-hardened: ABORT unreachable under its exclusion. */
+	(void) ft_ord_cell_flip_into(ft, txn, edges, n);
 }
 #endif /* FEATURE_FT_MERGE */
 
@@ -3511,7 +3552,8 @@ void ft_glue_publish(struct cds_ft *ft, struct ft_flip_txn *txn,
 	if (g->count_delta)
 		ft_flip_txn_record_count_parent(ft, txn, g->publish_parent,
 			g->count_delta);
-	ft_ord_cell_flip_into(ft, txn, sedges, n);
+	/* Bulk op, not yet MW-hardened: ABORT unreachable under its exclusion. */
+	(void) ft_ord_cell_flip_into(ft, txn, sedges, n);
 }
 
 /*

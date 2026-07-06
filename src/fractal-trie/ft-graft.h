@@ -2401,8 +2401,10 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 			 */
 			if (extract_txn) {
 				if (n)
-					ft_ord_cell_flip_into(swap_ft, extract_txn,
-						edges, n);
+					/* Bulk op, not yet MW-hardened: ABORT
+					 * unreachable under its exclusion. */
+					(void) ft_ord_cell_flip_into(swap_ft,
+						extract_txn, edges, n);
 				else
 					ft_flip_txn_destroy(extract_txn);
 				extract_txn = NULL;	/* consumed / freed */
