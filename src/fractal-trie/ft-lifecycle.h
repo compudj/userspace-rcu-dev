@@ -857,9 +857,11 @@ bool cds_ft_empty(struct cds_ft *ft)
 	 * Empty trie: the root has no children and no NIL-key entries.
 	 * For popcount root, nr_child is derived from the bitmap and a
 	 * freshly-allocated (calloc'd) root with bitmap == 0 correctly
-	 * reports nr_child == 0.
+	 * reports nr_child == 0.  Resolve the state word through the MCAS
+	 * proxy (§9): a peer's mid-commit FT_STATE_PROXY word would
+	 * otherwise read as garbage count bits.
 	 */
-	if (ft_meta_nr_child(rmeta) != 0)
+	if (ft_meta_nr_child_load(rmeta) != 0)
 		return false;
 	return !uatomic_load(&rmeta->external_nodes, CMM_RELAXED);
 }
@@ -923,7 +925,12 @@ void calc_stats_node(const struct cds_ft *ft __attribute__((unused)),
 
 	metadata = cds_ft_item_to_metadata(ft_node_ptr(node_flag));
 	node_stats->count++;
-	node_stats->distribution[ft_meta_nr_child(metadata)]++;
+	/*
+	 * Proxy-resolved load (§9): the raw state word is the ARRAY INDEX
+	 * here -- a mid-flip FT_STATE_PROXY word's 9-bit count field can
+	 * read up to 511, overrunning distribution[257].
+	 */
+	node_stats->distribution[ft_meta_nr_child_load(metadata)]++;
 	stats->level[level].nr_internal_nodes++;
 	stats->level[level].has_nodes = true;
 }
@@ -946,7 +953,8 @@ void calc_stats_node_recursive(const struct cds_ft *ft, struct cds_ft_inode_flag
 			continue;
 		if (ft_node_internal(child_node_flag)) {
 			struct cds_ft_metadata *metadata = cds_ft_item_to_metadata(ft_node_ptr(child_node_flag));
-			struct cds_ft_node *external_nodes = rcu_dereference(metadata->external_nodes);
+			struct cds_ft_node *external_nodes =
+				ft_dereference_external_acquire(metadata->external_nodes);
 
 			calc_stats_node(ft, child_node_flag, stats, level);
 			if (external_nodes) {
@@ -968,7 +976,9 @@ void calc_stats_node_recursive(const struct cds_ft *ft, struct cds_ft_inode_flag
 				ft_compressed_node_ptr(child_node_flag);
 			struct cds_ft_metadata *metadata =
 				cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
-			struct cds_ft_node *external_nodes = rcu_dereference(metadata->external_nodes);
+			struct cds_ft_node *external_nodes =
+				ft_dereference_external_acquire(metadata->external_nodes);
+			struct cds_ft_inode_flag *cn_child;
 			int j;
 
 			stats->level[level].nr_internal_nodes++;
@@ -992,14 +1002,16 @@ void calc_stats_node_recursive(const struct cds_ft *ft, struct cds_ft_inode_flag
 				stats->level[level + j].nr_compressed_nodes++;
 				stats->level[level + j].has_nodes = true;
 			}
-			if (cn->child &&
-			    !ft_node_external(cn->child))
-				calc_stats_node_recursive(ft, cn->child, stats, level + cn->len);
-			else if (cn->child) {
+			/* Proxy-resolved (§9): raw cn->child is type-classified + recursed. */
+			cn_child = ft_cn_child_dereference_acquire_prefetch(cn);
+			if (cn_child &&
+			    !ft_node_external(cn_child))
+				calc_stats_node_recursive(ft, cn_child, stats, level + cn->len);
+			else if (cn_child) {
 				struct cds_ft_node *iter_node;
 				unsigned int count = 0;
 
-				iter_node = (struct cds_ft_node *) ft_node_ptr(cn->child);
+				iter_node = (struct cds_ft_node *) ft_node_ptr(cn_child);
 				cds_ft_for_each_duplicate_rcu(iter_node) {
 					if (count++ == 0)
 						stats->level[level + cn->len].nr_external_nodes++;
@@ -1100,7 +1112,8 @@ void cds_ft_show_stats(const struct cds_ft *ft, FILE *out)
 		return;
 	}
 
-	node_flag = rcu_dereference(ft->root);
+	/* Proxy-resolved root load (§9) -- cds_ft_show_stats has no exclusion contract. */
+	node_flag = ft_root_dereference(ft);
 
 	/* Root is always present and always internal. */
 	calc_stats_node(ft, node_flag, stats, level);

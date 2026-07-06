@@ -61,13 +61,17 @@ void show_node_recursive(const struct cds_ft *ft, FILE *out, struct cds_ft_inode
 				fprintf(out, "Level %d, key value: %u, (meta)external node list ptr: %p\n",
 					level, key, external_nodes);
 			}
-			if (cn->child &&
-			    !ft_node_external(cn->child))
-				show_node_recursive(ft, out, cn->child, level + cn->len);
-			else if (cn->child) {
+			/* Proxy-resolved (§9): raw cn->child is type-classified + recursed. */
+			struct cds_ft_inode_flag *cn_child =
+				ft_cn_child_dereference_acquire_prefetch(cn);
+
+			if (cn_child &&
+			    !ft_node_external(cn_child))
+				show_node_recursive(ft, out, cn_child, level + cn->len);
+			else if (cn_child) {
 				print_indent(out, level + cn->len);
 				fprintf(out, "Level %d, compressed child: external node list ptr: %p\n",
-					level + (int) cn->len, ft_node_ptr(cn->child));
+					level + (int) cn->len, ft_node_ptr(cn_child));
 			}
 		} else {
 			print_indent(out, level);
@@ -86,7 +90,8 @@ void show_pretty(const struct cds_ft *ft, FILE *out)
 	fprintf(out, "Show Fractal Trie %p\n", ft);
 	fprintf(out, "---------------------------------------------------\n");
 
-	node_flag = rcu_dereference(ft->root);
+	/* Proxy-resolved root load (§9) -- cds_ft_show has no exclusion contract. */
+	node_flag = ft_root_dereference(ft);
 
 	/* Root is always present and always internal. */
 	{
@@ -203,10 +208,16 @@ void json_emit_node(const struct cds_ft *ft, FILE *out,
 			fprintf(out, ",\"external_nodes\":\"%p\"",
 				(void *) external_nodes);
 		fprintf(out, ",\"child\":");
-		if (cn->child)
-			json_emit_node(ft, out, cn->child, level + cn->len);
-		else
-			fprintf(out, "null");
+		/* Proxy-resolved (§9): the recursion type-classifies its argument. */
+		{
+			struct cds_ft_inode_flag *cn_child =
+				ft_cn_child_dereference_acquire_prefetch(cn);
+
+			if (cn_child)
+				json_emit_node(ft, out, cn_child, level + cn->len);
+			else
+				fprintf(out, "null");
+		}
 		fprintf(out, "}");
 		return;
 	}
@@ -248,7 +259,8 @@ void show_json(const struct cds_ft *ft, FILE *out)
 {
 	struct cds_ft_inode_flag *node_flag;
 
-	node_flag = rcu_dereference(ft->root);
+	/* Proxy-resolved root load (§9) -- cds_ft_show has no exclusion contract. */
+	node_flag = ft_root_dereference(ft);
 	fprintf(out, "{\"ft\":\"%p\",\"root\":", ft);
 	json_emit_node(ft, out, node_flag, 0);
 	fprintf(out, "}\n");
