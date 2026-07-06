@@ -51,7 +51,7 @@
 #ifdef FEATURE_FT_FAULT_INJECT
 #define NR_TESTS 316
 #else
-#define NR_TESTS 274
+#define NR_TESTS 275
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -3102,6 +3102,95 @@ static int test_rank_stats_prefix_exact(void)
 	if (rank_stats_prefix_exact_run(true) < 0)
 		return -1;
 	return rank_stats_prefix_exact_run(false);
+}
+
+/*
+ * Order-statistics ON, count-NEUTRAL chain replace at an INTERNAL-node holder.
+ * Insert "abc" then "ab": "ab" is a prefix of "abc", so it ends at an internal
+ * node and is stored via that node's external_nodes chain.  insert_replace("ab")
+ * swaps that chain for a fresh head -- a replace changes NO key count, so it must
+ * NOT enter the count-folding one-commit path.  Regression guard: routing this
+ * list-off replace through ft_insert_park_external_nodes tripped
+ * insert_one_commit's assert(count_folded || !ft->rank_stats) (list off + rank
+ * stats on aborts every assert build).  cds_ft_verify (gated on rank stats) +
+ * cds_ft_count_keys confirm the count stays 2 across the replace.  BOTH list
+ * modes: list-off is the regressed standalone-commit path, list-on exercises the
+ * guarded ft_ord_cell_swap_publish_multi.
+ */
+static int rank_stats_prefix_replace_exact_run(bool ordered_list)
+{
+	struct cds_ft_group *group = NULL;
+	struct cds_ft *ft = create_varlen_rankstats_list_ft(ordered_list, &group);
+	const char *lm = ordered_list ? "list-on" : "list-off";
+	struct ft_test_node *n_abc = node_alloc(0);
+	struct ft_test_node *n_ab = node_alloc(0);
+	struct ft_test_node *n_ab2 = NULL;
+	struct cds_ft_node *old_head = NULL;
+	int ret = 0;
+	enum cds_ft_status s;
+
+	rcu_read_lock();
+	s = cds_ft_insert(ft, (const uint8_t *) "abc", 3, &n_abc->node);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "rank_stats prefix_replace (%s): insert abc: %d\n",
+			lm, s);
+		node_free(n_abc);
+		ret = -1;
+		goto out;
+	}
+	/*
+	 * "ab" is a prefix of "abc": it ends at an internal node and is stored
+	 * via that node's external_nodes chain -- the internal-holder shape the
+	 * replace below exercises.
+	 */
+	s = cds_ft_insert(ft, (const uint8_t *) "ab", 2, &n_ab->node);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "rank_stats prefix_replace (%s): insert ab: %d\n",
+			lm, s);
+		node_free(n_ab);
+		ret = -1;
+		goto out;
+	}
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK ||
+	    cds_ft_count_keys(ft) != 2) {
+		fprintf(stderr, "rank_stats prefix_replace (%s): pre-replace "
+			"count %lu != 2\n", lm, cds_ft_count_keys(ft));
+		ret = -1;
+		goto out;
+	}
+	/* The count-NEUTRAL chain replace at the internal-node holder. */
+	n_ab2 = node_alloc(0);
+	s = cds_ft_insert_replace(ft, (const uint8_t *) "ab", 2,
+			&n_ab2->node, &old_head);
+	if (s != CDS_FT_STATUS_DUPLICATE_FOUND || old_head != &n_ab->node) {
+		fprintf(stderr, "rank_stats prefix_replace (%s): replace ab: %d "
+			"old_head %p\n", lm, s, (void *) old_head);
+		node_free(n_ab2);
+		old_head = NULL;
+		ret = -1;
+		goto out;
+	}
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK ||
+	    cds_ft_count_keys(ft) != 2) {
+		fprintf(stderr, "rank_stats prefix_replace (%s): post-replace "
+			"count %lu != 2\n", lm, cds_ft_count_keys(ft));
+		ret = -1;
+		goto out;
+	}
+out:
+	rcu_read_unlock();
+	if (old_head)			/* replace succeeded: n_ab is replaced out */
+		node_free_rcu(n_ab);
+	if (drain_and_destroy(ft, group) < 0)
+		ret = -1;
+	return ret;
+}
+
+static int test_rank_stats_prefix_replace_exact(void)
+{
+	if (rank_stats_prefix_replace_exact_run(true) < 0)
+		return -1;
+	return rank_stats_prefix_replace_exact_run(false);
 }
 
 /*
@@ -25253,6 +25342,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_iter_skip_duplicates);
 	RUN_TEST(test_iter_skip_varlen);
 	RUN_TEST(test_rank_stats_prefix_exact);
+	RUN_TEST(test_rank_stats_prefix_replace_exact);
 	RUN_TEST(test_rank_stats_attach_exact);
 	RUN_TEST(test_rank_stats_key_shorter_exact);
 	RUN_TEST(test_rank_stats_past_child_exact);

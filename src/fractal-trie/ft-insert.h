@@ -2463,22 +2463,35 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 					ft_ord_cell_free(ft, old_cell);
 				} else {
 					/*
-					 * List off: external_nodes is the single
+					 * List off replace: external_nodes is the single
 					 * reader-visible slot (readers resolve via
-					 * ft_dereference_external).  Publish the
-					 * replacement head through the guarded park so the
-					 * §4.B VALIDATE guard on the LIVE holder @metadata
-					 * rides the flip -- the park reads old ==
-					 * external_nodes (the chain being replaced) -> node
-					 * and records the guard, a 2-record slab-allocated
-					 * MCAS commit rather than a bare lone store.  Replace:
-					 * key count unchanged, so no count fold (arm 0).
+					 * ft_dereference_external).  Publish external_nodes:
+					 * old chain -> @node on a guarded STANDALONE txn so
+					 * the §4.B VALIDATE guard on the LIVE holder @d.nf
+					 * rides the flip -- NOT the park: a replace changes
+					 * no key count, so it must NOT enter the count-
+					 * folding one-commit path (insert_one_commit asserts
+					 * count_folded when rank stats are on).  Mirrors the
+					 * list-on chain replace above, minus the cell.  Two
+					 * edges: the forward external_nodes store + the guard.
 					 */
-					ret = ft_insert_commit_arm(ft, &ic, 0);
-					if (ret)
+					struct ft_ord_cell_edge sedge = {
+						.slot = (struct ft_ord_cell **)
+							&metadata->external_nodes,
+						.old_target = (struct ft_ord_cell *)
+							external_nodes,
+						.new_target = (struct ft_ord_cell *)
+							node,
+					};
+					struct ft_flip_txn *txn =
+						ft_flip_txn_create_bounded(2);
+
+					if (!txn) {
+						ret = -ENOMEM;
 						goto insert_replace_done;
-					ft_insert_park_external_nodes(ft,
-						metadata, node, &ic);
+					}
+					ft_flip_txn_guard_parent(ft, txn, d.nf);
+					ft_ord_cell_flip_into(ft, txn, &sedge, 1);
 				}
 			} else {
 				/* No external nodes yet. New key at this node. */
