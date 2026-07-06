@@ -1077,7 +1077,16 @@ out:
  * from the root, checking that nr_child, nr_keys, and parent
  * pointers are self-consistent.
  *
- * Must be called with mutual exclusion wrt updaters.
+ * Must be called with mutual exclusion wrt ALL updaters (writer
+ * quiescence).  This is BY DESIGN and stronger than "the caller is a
+ * writer": the walk reads slots and state words raw -- no MCAS proxy
+ * resolution -- and ft_verify_no_proxy_at_rest treats ANY reachable
+ * in-flight proxy as an integrity error, because at rest a committed
+ * txn leaves none.  Under multi-writer, one writer's own exclusion is
+ * NOT enough (a peer mid-commit legitimately parks proxies): quiesce
+ * every writer first.  Verify is deliberately NOT taught to resolve /
+ * tolerate in-flight proxies -- its premise is quiescence (decision
+ * 2026-07-06; doc/design/mcas-multiwriter-readiness.md §9 scope).
  *
  * @out: file stream for diagnostic output on failure (may be NULL
  *       to suppress output).
@@ -1154,6 +1163,13 @@ enum cds_ft_status cds_ft_verify(const struct cds_ft *ft, FILE *out)
  * cadence-drift issue on long-running workloads.  Period 0 disables
  * the walk entirely (only the increment-and-compare runs).  On
  * mismatch, abort with diagnostic.
+ *
+ * MULTI-WRITER: this hook fires under ONE writer's scope, which is
+ * not the all-updater exclusion cds_ft_verify requires (see its
+ * header) -- a concurrent peer's parked proxies would false-positive.
+ * FEATURE_FT_VERIFY_AT_MUTATION is therefore a single-writer /
+ * externally-serialized-writers debug facility by design; do not
+ * enable it on workloads with concurrent writers on the same trie.
  */
 void ft_writer_scope_verify(struct cds_ft *ft)
 {
