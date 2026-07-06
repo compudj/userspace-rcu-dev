@@ -116,6 +116,16 @@ single mask-compare on the hot path.
   (today they are separate lone-edge flips — "the bridge"). The node goes
   LIVE→DEAD atomically with removal, so a concurrent writer sees live-or-dead, never
   the torn window.
+- **Live up-walk back-edges** (`meta->parent` / external `->prev` / `cell->parent`
+  re-pointed on a *kept* node during a restructure): NO separate validate needed
+  (SAFE-BY-FUSION). Each back-edge is fused as an edge into the same flip-txn as the
+  forward publish, and its target (the new parent) is always a fresh build-invisible
+  cluster node — unreachable to a concurrent remover, so there is no live target to
+  freeze. The only live node in the commit is the forward-publish target, already
+  covered by the internal-node guard above; the reanchor readers resolve the parked
+  proxy (old-XOR-new atomically) and rely on fresh-cluster parents being wired before
+  the cluster is reachable. Full argument + per-site inventory:
+  `fractal-trie-review-2026-06/PHASE4.2_ATOMIC_DETACH_SCOPE.md` "BACK-EDGE(live)".
 
 ### 3.4 Two-commit cross-trie ops (§7)
 Graft src-disappear, `cds_ft_merge_at`, the dual root swaps (and the phase-B

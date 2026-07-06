@@ -261,6 +261,21 @@ ft-helpers.h:2249/2322).
 
 # VALIDATE-SIDE INVENTORY (2026-07-03) — the OTHER half of Phase 4.2
 
+> STATUS (2026-07-05): landing items **#1 B-CHAIN DONE**, **#3 grandparent-relocation DONE**
+> (17 guard_parent sites), **#2 A-GUARD-EXPLICIT — all txn-routed forward publishes into a LIVE
+> node now GUARDED**: remove-side external_nodes clears (ft_unchain_node head-clear + cds_ft_remove
+> prefix-clear) @a570d3ee/3755d42e; insert NEW-key external_nodes PARK (ft_insert_park_external_nodes,
+> guarded directly on &metadata->state, reuses the arm's one budgeted guard slot — mutually exclusive
+> with the recompact-relocation grandparent guard, no reservation bump) @eaaf7da8. REMAINING:
+> (2b) the strictly-PLAIN lone-edge external_nodes sub-cases (insert ~2078/2473/2514, remove
+> ~2526/2725; rank_stats+ordered_list BOTH off) — need FORCE-ONTO-TXN plumbing first (the list-off
+> pub-less residual, deferred by this doc). **(#4) BACK-EDGE reanchor Inv-2 write-up DONE 2026-07-05**
+> (BACK-EDGE(live) bucket): all live back-edges SAFE-BY-FUSION ⇒ 0 guards. NIL-key-at-root clear =
+> ROOT-exempt (not guarded, correct). Then Phase 4.3 (relax exclusion → guards load-bearing;
+> writer-vs-writer race oracle + TSAN). Per-increment gate: full 7-config (incl. audit leg =
+> reservation-overflow check) green.
+
+
 The atomic-detach half (fuse the freeze MARK into the unlink txn) is DONE. This is the scope of the
 **validate side**: guards so that, once concurrent per-trie writers are enabled, a writer publishing an
 edge INTO a live node P aborts if a concurrent remover FROZE P (set `FT_STATE_TOMBSTONE` in
@@ -388,10 +403,54 @@ degraded lone-edge store), so the recorded `old` value auto-guards: a concurrent
 - remove 1586 (chain unlink/relink, old==node) — CHAIN-LEAF class (next-word REMOVED flag, not `->state`);
   part of the DEFERRED chain-leaf reader-proxy residual, not this pass.
 
-**BACK-EDGE(live)** — writer-only up-walk fields (`meta->parent` / external `prev` / `cell->parent`) on a
-LIVE re-parented node. NOT a child-array publish; the reanchor up-walk is the only reader. Likely already
-safe (each is FUSED into its one commit, closing the back-channel window), but needs the reanchor-reader
-hazard write-up before declaring done. Sites: insert 132, ft-mh 2831/2842/2864/2867/2892, merge 1658 loop.
+**BACK-EDGE(live) — RESOLVED 2026-07-05: 0 dedicated guards needed (SAFE-BY-FUSION).** Writer-only up-walk
+fields (`meta->parent` / external head `->prev` / `cell->parent`) re-pointed on a LIVE re-parented node
+during a restructure (insert split, DEL-recompaction, merge spine, graft rekey). NOT a child-array publish;
+the only readers are the reanchor up-walks. This is the reanchor-reader hazard write-up the bucket waited on.
+
+Every live back-edge is written through one of three helpers, each FUSING the back-edge as an MCAS descriptor
+edge into the SAME flip-txn that carries the forward structural publish — no bare-store-before-publish
+back-channel survives (the historical `ft_set_parent`-before-publish was replaced; ft-insert.h:69-92 explains
+why: an un-fused bare store exposes a fresh head to a reanchor up-walk before its cell splices =
+`inv_insert_splice_window`):
+- `ft_park_live_parent_edge` (ft-insert.h:100-144, `record_reserved` @:143) — insert, into `ic->txn`.
+- `ft_pub_rec_add_back_edge` (ft-mutation-helpers.h:1641-1675, @:1674) — remove chain-compress, rec→txn.
+- `ft_glue_record_back_edge` (ft-mutation-helpers.h:2774-2852, @:2788/2799/2821/2824/2849) — merge/graft glue.
+
+Sites (current) + the forward guard in the SAME commit: INSERT ft-insert.h:214 (arms 729/1311/1603/1754),
+guard @298; REMOVE ft-remove.h:505, guard @509; MERGE ft-merge.h:1668-1674 loop, guard @1677; GRAFT/glue
+ft-mutation-helpers.h:3075-3080 (+ graft.h:561), guards @3090/3308/3346 / graft.h:613. (Spot-verified merge:
+the back-edge loop and the guarded forward publish both `record` into one `txn`, ft-merge.h:1668-1679.)
+
+THE INVARIANT-2 ARGUMENT (why the bucket adds no guard):
+1. The back-edge TARGET (the NEW parent) is ALWAYS a FRESH, build-invisible cluster node
+   (`old_suffix`/`branch`/`iter_node`/`new_cn`/`M`/`st->attached`, all built pre-commit). A fresh node is
+   unreachable to any other writer until the atomic commit ⇒ a concurrent remover CANNOT reach and
+   freeze/tombstone the target. There is no live-target-being-frozen hazard for the back-edge to catch.
+2. The re-parented LIVE child is KEPT, not retired; a reanchor reading its `parent` gets old-XOR-new
+   ATOMICALLY — the fused edge auto-installs a proxy resolving to OLD until the single flip (ft-merge.h:1661).
+3. The old parent this op RETIRES is frozen+tombstoned INTO the same commit (atomic detach, e.g.
+   ft-insert.h:227-232) ⇒ no reanchor window climbs into a dead node: pre-commit resolves to the still-live
+   old parent, post-commit to the fresh new parent (whose own parent back-pointer was wired build-invisible
+   into the guarded live `publish_parent`).
+4. The ONLY live node in each commit is the FORWARD publish target (grandparent / dst `pub_parent`), already
+   covered by `ft_flip_txn_guard_parent` → `urcu_txn_load_validate(&P->state)` in the SAME flip.
+5. Reader side: all three reanchor readers resolve a flip proxy before use — `ft_get_parent_rcu`
+   (ft-helpers.h:1318), `ft_skip_to_compressed` (:1427), `ft_skip_reanchor` (:1504) — and rest on the
+   invariant (ft-helpers.h:1466-1474) that the writer wires every fresh cluster's parent (incl. the top's,
+   into the live parent) BEFORE the cluster becomes reachable, and a detach NULLs `parent` only after a grace
+   period. Design-doc framing: transactional-flip-latch.md §8:312-314 ("reader holds a stale deep reference …
+   survives the latch"), §10:353-357 (proxy resolution is universal on every read hot path).
+
+⇒ CONFIRMED SAFE-BY-FUSION for all four site-groups; the BACK-EDGE(live) bucket needs 0 guards, resting on
+(i) the forward-edge state guard already present in each commit and (ii) the fresh-parents-wired-before-
+reachable reader invariant.
+
+CAVEAT (separate item, NOT a back-edge gap): the `external_nodes` FORWARD field is flagged in
+transactional-flip-latch.md:376-384 / §11 as a reader-resolve gap (six ft-ordered-query.h readers load it via
+non-resolving `ft_dereference_acquire`). That is the A-GUARD `external_nodes` forward slot, distinct from the
+external head's `prev` / `cell->parent` BACK-edge fields handled here (which resolve via `ft_resolve_head_prev`
++ `ft_resolve_flip_proxy`).
 
 **OUT OF THIS PASS (no internal-node `->state` guard applies):**
 - **ROOT / cross-trie** (the trie-root pointer has no owner-node state word; hazard is straddler/ABA,
@@ -435,7 +494,9 @@ bit consistent across layouts + confirm readers/writers tolerate the wider soft-
    parent (no-op under exclusion; exact on the recompact baseline — no masked primitive).
 3. **Grandparent-relocation guard** — full-word tombstone validate on the grandparent for the child-adding
    recompact-relocate publishes (insert 1264 / graft 592 / merge). No-op under exclusion.
-4. **BACK-EDGE reanchor write-up** — argue or guard the 7 up-walk re-parents.
+4. **BACK-EDGE reanchor write-up** — DONE 2026-07-05 (see the BACK-EDGE(live) bucket above): all live
+   back-edges are SAFE-BY-FUSION (fused into the guarded forward commit; target is always a fresh
+   build-invisible cluster node) ⇒ 0 dedicated guards. No code change.
 5. **(Phase 4.3)** runtime-gate recompact (insert AND remove) on the concurrent-writer mode (in-place stays
    the exclusive/single-writer fast path); ROOT/cross-trie via the §3.4 drain; chain-leaf/list next-mark
    validate (remove 1586 + LIST-EDGE) rides the deferred chain-leaf reader-proxy residual.
