@@ -95,12 +95,15 @@
  * override of the engine is needed.
  */
 /*
- * FT is a flavor-agnostic library: it brackets its own RCU read-side section
- * through the group's RCU flavor (flavor->read_lock / read_unlock) and drives
- * the concurrent engine with only init / reserve / store / commit_flavor --
- * never urcu_txn_begin() / urcu_txn_end().  Override their RCU bracket to
- * no-ops so those (unused) inlines compile without binding a concrete flavor's
- * rcu_read_lock symbol into the flavor-agnostic build.
+ * FT is a flavor-agnostic library: it brackets its RCU read-side sections
+ * through the group's RCU flavor bound at RUNTIME.  An op-scoped persistent
+ * txn handle binds that flavor (ft_txn_op_init -> urcu_txn_init_flavor), so
+ * urcu_txn_begin() / urcu_txn_end() open the section in it directly (doc
+ * §11: the FT owns the bracket).  An EXCLUSIVE trie binds no flavor -- there
+ * is no reader to defend and frees are synchronous -- so its begin()/end()
+ * fall back to the URCU_TXN_RCU_READ_LOCK macros: override them to no-ops so
+ * the exclusive bracket opens nothing and no compile-time flavor's
+ * rcu_read_lock symbol is bound into the flavor-agnostic build.
  */
 #define URCU_TXN_RCU_READ_LOCK()	do { } while (0)
 #define URCU_TXN_RCU_READ_UNLOCK()	do { } while (0)

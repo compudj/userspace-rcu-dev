@@ -31,6 +31,15 @@
  */
 struct ft_insert_commit {
 	struct ft_flip_txn *txn;		/* armed at the publish site */
+	/*
+	 * The op's PERSISTENT engine handle (ft_txn_op_init'd before the op's
+	 * restart_attempt loop, doc §11): the arm binds @txn to it, so retry
+	 * aging, the FIFO escalation turn, and the learned descriptor size span
+	 * the whole retry loop.  NULL for an op not yet migrated to the
+	 * persistent handle (_cds_ft_insert_replace) -- the arm then creates a
+	 * standalone per-attempt txn as before.
+	 */
+	struct urcu_mcas_txn *op;
 	struct cds_ft_inode_flag **slot;	/* forward-publish sentinel (one-commit
 						 * parked) -- the txn settles the edges */
 	/*
@@ -400,7 +409,8 @@ int ft_insert_commit_arm(struct cds_ft *ft, struct ft_insert_commit *ic,
 	 * STABLE ancestor from the count base to the root -- sized by the caller to
 	 * the ACTUAL descent depth (0 when the shape does not fold its count).
 	 */
-	ic->txn = ft_flip_txn_create_bounded(12 + count_edges);
+	ic->txn = ic->op ? ft_flip_txn_create_bounded_on(ic->op, 12 + count_edges) :
+			ft_flip_txn_create_bounded(12 + count_edges);
 	if (!ic->txn)
 		return -ENOMEM;
 	return 0;
@@ -1994,6 +2004,7 @@ int _cds_ft_insert(struct cds_ft *ft,
 	void *cell = NULL;			/* @precell's carrier; reused across retries */
 	enum urcu_txn_status cst = URCU_TXN_STATUS_OK;	/* last commit outcome */
 	struct ft_insert_commit ic = { 0 };
+	struct urcu_mcas_txn optxn;		/* persistent handle spanning the retry loop */
 
 	if (!valid_external_node(node) || !valid_key_len(ft, key_len))
 		return -EINVAL;
@@ -2033,7 +2044,22 @@ int _cds_ft_insert(struct cds_ft *ft,
 
 	key_depth = key_len + 1;
 
+	/*
+	 * The op's persistent engine handle (doc §11): initialized ONCE, so
+	 * contention aging (txn->retry), the FIFO fair-mutex escalation turn,
+	 * and the learned descriptor size span every attempt of the loop below.
+	 * Each attempt is bracketed by urcu_txn_begin()/urcu_txn_end(): the FT
+	 * owns its read-side section -- on a concurrent trie the descent must
+	 * run inside one so a peer writer's call_rcu-deferred frees cannot
+	 * reclaim nodes under it; a caller-held section merely nests.  On an
+	 * exclusive trie the bracket opens nothing (NULL flavor) and the domain
+	 * is NULL (never escalates) -- behavior-identical to the pre-bracket
+	 * path.
+	 */
+	ft_txn_op_init(ft, &optxn);
+
 restart_attempt:
+	urcu_txn_begin(&optxn);
 	/*
 	 * Per-attempt setup, re-entered on a concurrent-writer conflict (a
 	 * pre-commit -EAGAIN or a commit ABORT): the failed attempt published
@@ -2049,6 +2075,7 @@ restart_attempt:
 	 */
 	ic = (struct ft_insert_commit){ 0 };
 	ic.ft = ft;
+	ic.op = &optxn;
 	cst = URCU_TXN_STATUS_OK;
 	node->prev = cell;			/* NULL when the list is off */
 	node->next = NULL;
@@ -2278,6 +2305,14 @@ insert_done:
 			ft_flip_txn_destroy(ic.txn);
 			ic.txn = NULL;
 		}
+		/*
+		 * Age the pre-commit conflict exactly as a commit ABORT would,
+		 * keeping the FIFO turn (urcu_txn_conflict): without it a
+		 * writer that keeps bailing on the same hot slot never
+		 * advances txn->retry, never escalates, and can livelock.
+		 */
+		urcu_txn_conflict(&optxn);
+		urcu_txn_end(&optxn);
 		goto restart_attempt;
 	}
 	/*
@@ -2356,8 +2391,16 @@ insert_done:
 	 * on-abort action.  @precell was not spliced (the commit is atomic);
 	 * re-descend and retry.
 	 */
-	if (cst == URCU_TXN_STATUS_ABORT)
+	if (cst == URCU_TXN_STATUS_ABORT) {
+		/* The commit already aged the handle (retry++, keep the turn). */
+		urcu_txn_end(&optxn);
 		goto restart_attempt;
+	}
+	/*
+	 * Terminal outcome (success or error): close this attempt's read-side
+	 * section and release the escalation turn if held.
+	 */
+	urcu_txn_end(&optxn);
 	if (ret == 0) {
 		if (key_len > uatomic_load(&ft->max_used_key_len, CMM_RELAXED))
 			uatomic_store(&ft->max_used_key_len, key_len, CMM_RELAXED);
