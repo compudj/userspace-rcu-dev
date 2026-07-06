@@ -719,7 +719,7 @@ int ft_popcount_node_replace_ptr(struct cds_ft *ft, const struct cds_ft_type *ty
 		 */
 		return -EFBIG;
 #else
-		if (ft_meta_nr_child(metadata) <= type->min_child) {
+		if (ft_meta_nr_child_load(metadata) <= type->min_child) {
 			/* We need to try recompacting the node */
 			return -EFBIG;
 		}
@@ -761,7 +761,7 @@ int ft_popcount_node_replace_ptr(struct cds_ft *ft, const struct cds_ft_type *ty
 		ft_meta_nr_child_dec_flip(metadata);
 	dbg_printf("popcount replace ptr: %u child, metadata: %u child, for node %p newptr %p\n",
 		(unsigned int) ft_popcount_node_get_nr_child(type, node),
-		(unsigned int) ft_meta_nr_child(metadata),
+		(unsigned int) ft_meta_nr_child_load(metadata),
 		node, newptr);
 	return 0;
 }
@@ -790,7 +790,7 @@ int ft_pigeon_node_replace_ptr(struct cds_ft *ft, const struct cds_ft_type *type
 		return -EFBIG;
 #else
 		/* We should try recompacting the node */
-		if (ft_meta_nr_child(metadata) <= type->min_child)
+		if (ft_meta_nr_child_load(metadata) <= type->min_child)
 			return -EFBIG;
 #endif
 	}
@@ -885,6 +885,16 @@ unsigned int find_nearest_type_index(unsigned int type_index,
 		return is_root ? 0 : NODE_INDEX_NULL;
 	}
 	for (;;) {
+		/*
+		 * Bound the search against ft_types[] (Phase 4.3 defense): a
+		 * garbage @nr_nodes -- e.g. a raw read of a node whose state word a
+		 * peer parked with a re-home proxy, before the ft_meta_nr_child_load
+		 * callers -- would otherwise walk @type_index off the end of the
+		 * table (unbounded ++), reading junk min/max_child and spinning
+		 * (the FT_INV_MW hang) or faulting.  With the resolving loads this
+		 * never fires; keep it so no future raw read can wedge the trie.
+		 */
+		assert(type_index < FT_TYPE_MAX_NR);
 		type = &ft_types[type_index];
 		if (nr_nodes < type->min_child)
 			type_index--;
@@ -964,9 +974,9 @@ int ft_node_recompact(enum ft_recompact mode,
 	switch (mode) {
 	case FT_RECOMPACT_ADD_SAME:
 		new_type_index = find_nearest_type_index(old_type_index,
-			ft_meta_nr_child(metadata) + 1, false);
+			ft_meta_nr_child_load(metadata) + 1, false);
 		dbg_printf("Recompact for node with %u children\n",
-			ft_meta_nr_child(metadata) + 1);
+			ft_meta_nr_child_load(metadata) + 1);
 		break;
 	case FT_RECOMPACT_ADD_NEXT:
 		if (!metadata || old_type_index == NODE_INDEX_NULL) {
@@ -974,16 +984,16 @@ int ft_node_recompact(enum ft_recompact mode,
 			dbg_printf("Recompact for NULL\n");
 		} else {
 			new_type_index = find_nearest_type_index(old_type_index,
-				ft_meta_nr_child(metadata) + 1, false);
+				ft_meta_nr_child_load(metadata) + 1, false);
 			dbg_printf("Recompact for node with %u children\n",
-				ft_meta_nr_child(metadata) + 1);
+				ft_meta_nr_child_load(metadata) + 1);
 		}
 		break;
 	case FT_RECOMPACT_DEL:
 		new_type_index = find_nearest_type_index(old_type_index,
-			ft_meta_nr_child(metadata) - 1, is_root);
+			ft_meta_nr_child_load(metadata) - 1, is_root);
 		dbg_printf("Recompact for node with %u children\n",
-			ft_meta_nr_child(metadata) - 1);
+			ft_meta_nr_child_load(metadata) - 1);
 		break;
 	case FT_RECOMPACT_RELOCATE:
 		new_type_index = old_type_index;	/* same type, pure relocation */
@@ -1011,7 +1021,7 @@ int ft_node_recompact(enum ft_recompact mode,
 		 */
 		if (retire_txn && !cluster_leaf && metadata &&
 				!ft_flip_txn_reserve_extra(retire_txn,
-					2 * (ft_meta_nr_child(metadata) + 1)))
+					2 * (ft_meta_nr_child_load(metadata) + 1)))
 			return -ENOMEM;
 		new_node = alloc_cds_ft_node(ft, new_type, &new_metadata);
 		if (!new_node)
