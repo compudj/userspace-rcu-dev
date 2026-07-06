@@ -704,6 +704,27 @@ unsigned int ft_meta_nr_child_load(const struct cds_ft_metadata *meta)
 }
 
 /*
+ * Proxy-resolving read of a node's parent-slot offset -- the Phase 4.3 mirror of
+ * ft_meta_nr_child_load anticipated at the ft_meta_parent_slot_offset declaration.
+ * parent_slot_offset shares the state word with the flip proxy, so a RAW read of
+ * a live peer-owned node mid-commit returns the proxy pointer's bits as the
+ * offset (arbitrary, up to FT_STATE_PSO_VALMASK): ft_get_parent_slot would then
+ * compute ptr(parent) + garbage*8 = a WILD address and fault on deref, before any
+ * commit guard runs.  urcu_mcas_read resolves the proxy to the real state word
+ * first (and short-circuits to a plain load when no proxy is parked -- always so
+ * under writer exclusion, so it is free off the commit window).  The direct
+ * ft_meta_parent_slot_offset stays for a node the caller owns / that is quiescent.
+ */
+static inline
+unsigned int ft_meta_parent_slot_offset_load(const struct cds_ft_metadata *meta)
+{
+	return (unsigned int) (((uintptr_t) urcu_mcas_read(
+			(void **) (uintptr_t) &meta->state,
+			FT_STATE_PROXY) >> FT_STATE_PSO_SHIFT)
+			& FT_STATE_PSO_VALMASK);
+}
+
+/*
  * ft_parent_depth_span: number of key bytes a parent's slot covers.
  * Trivially 1 for every surviving node type (compressed/skip-compressed
  * still resolve via metadata->parent on the multi-byte hop, but the
@@ -1701,9 +1722,15 @@ struct cds_ft_inode_flag **ft_get_parent_slot(const struct cds_ft_metadata *meta
 {
 	if (!meta->parent)
 		return &ft->root;
+	/*
+	 * Resolve a mid-commit proxy on the state word (Phase 4.3): a raw offset
+	 * read of a peer-owned node being retired/re-homed would yield the proxy
+	 * pointer's bits and send this slot address off @meta->parent's body.
+	 * Under writer exclusion urcu_mcas_read short-circuits to a plain load.
+	 */
 	return (struct cds_ft_inode_flag **)
 		((char *) ft_node_ptr(meta->parent) +
-		 ft_meta_parent_slot_offset(meta) * sizeof(void *));
+		 ft_meta_parent_slot_offset_load(meta) * sizeof(void *));
 }
 
 /*
