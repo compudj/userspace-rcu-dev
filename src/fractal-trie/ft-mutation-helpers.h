@@ -1001,11 +1001,20 @@ void ft_meta_state_transition(struct cds_ft_metadata *meta,
 		uintptr_t s = CMM_LOAD_SHARED(meta->state);
 
 		if (caa_unlikely(s & FT_STATE_PROXY)) {
+			/*
+			 * Bounded by the latch owner's settle (owner-only; a
+			 * writer dying mid-install would wedge this, but
+			 * writer death mid-mutation is already fatal to the
+			 * trie by contract).
+			 */
 			caa_cpu_relax();
 			continue;
 		}
-		if (caa_likely(uatomic_cmpxchg(&meta->state, s, f(s)) == s))
+		if (caa_likely(uatomic_cmpxchg(&meta->state, s, f(s)) == s)) {
+			FT_TP(edge_lone, (const void *) &meta->state,
+				(const void *) s, (const void *) f(s));
 			return;
+		}
 	}
 }
 
@@ -1196,12 +1205,21 @@ void ft_flip_txn_guard_parent(const struct cds_ft *ft, struct ft_flip_txn *t,
  * mark into a latch POINTER -- the corrupted-record trample the raw
  * read + blind flip allowed -- and re-derives from the fresh successor on a
  * CAS miss so a peer's committed relink is never overwritten stale.
- * Infallible; idempotent (re-marking is a same-value CAS).  The mark and the
- * predecessor relink that unlinks @node should eventually ride ONE flip
- * (atomic detach); a standalone mark is the bridge.
+ * Infallible; idempotent (re-marking is a same-value CAS).  The wait is
+ * bounded by the latch owner's settle (owner-only; a writer dying mid-install
+ * would wedge it, but writer death mid-mutation is already fatal to the trie
+ * by contract).  The mark and the predecessor relink that unlinks @node
+ * should eventually ride ONE flip (atomic detach); a standalone mark is the
+ * bridge.
+ *
+ * RETURNS the clean successor the mark was CASed over (mark bit stripped, no
+ * proxy -- the loop validated bit 0 clear): the ONE proxy-safe way for a
+ * chain sweep to advance, since a raw ft_node_next masks only the mark bit
+ * and would hand a parked latch pointer to the next iteration.
  */
 static
-void ft_node_mark_removed_flip(struct cds_ft *ft, struct cds_ft_node *node)
+struct cds_ft_node *ft_node_mark_removed_flip(struct cds_ft *ft,
+		struct cds_ft_node *node)
 {
 	(void) ft;
 	for (;;) {
@@ -1213,8 +1231,14 @@ void ft_node_mark_removed_flip(struct cds_ft *ft, struct cds_ft_node *node)
 		}
 		if (caa_likely(uatomic_cmpxchg(&node->next, old,
 				(struct cds_ft_node *) ((uintptr_t) old |
-					CDS_FT_NODE_REMOVED_FLAG)) == old))
-			return;
+					CDS_FT_NODE_REMOVED_FLAG)) == old)) {
+			FT_TP(edge_lone, (const void *) &node->next,
+				(const void *) old,
+				(const void *) ((uintptr_t) old |
+					CDS_FT_NODE_REMOVED_FLAG));
+			return (struct cds_ft_node *) ((uintptr_t) old &
+					~(uintptr_t) CDS_FT_NODE_REMOVED_FLAG);
+		}
 	}
 }
 
@@ -1222,17 +1246,16 @@ void ft_node_mark_removed_flip(struct cds_ft *ft, struct cds_ft_node *node)
  * Tombstone every node in a duplicate chain (cds_ft_remove_all detaches a whole
  * chain at once), each via ft_node_mark_removed_flip so the marks are committed
  * edges.  Successor pointers stay intact so the caller can still traverse the
- * returned chain to reclaim it.
+ * returned chain to reclaim it.  The sweep advances on the successor the mark
+ * VALIDATED (proxy-free), not a raw ft_node_next re-read that masks only the
+ * mark bit -- a peer's latch parked on an interior next would otherwise walk
+ * the sweep into descriptor memory.
  */
 static
 void ft_chain_mark_removed_flip(struct cds_ft *ft, struct cds_ft_node *head)
 {
-	while (head) {
-		struct cds_ft_node *next = ft_node_next(head);
-
-		ft_node_mark_removed_flip(ft, head);
-		head = next;
-	}
+	while (head)
+		head = ft_node_mark_removed_flip(ft, head);
 }
 
 /*
