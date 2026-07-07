@@ -1613,11 +1613,14 @@ check_error:
 		/*
 		 * All goto-check_error paths in this function are before
 		 * ft_publish_to_parent, so created_nodes[] never escaped
-		 * the writer's stack -- immediate-free is safe.  An armed
-		 * one-commit txn has no recorded edges yet (the slot edge is
-		 * recorded only after the last fallible step, the reserve
-		 * set_nth, succeeds; nothing is ever stored in a live slot
-		 * during the build): destroy it.
+		 * the writer's stack -- immediate-free is safe.  The armed
+		 * one-commit txn MAY already carry recorded edges (a reserve
+		 * recompact records the external-head back-channel, reparent
+		 * pairs and the retire tombstone before a later step bails
+		 * -EAGAIN): records are PREPARE-state only -- nothing is
+		 * installed in a live slot during the build -- and the
+		 * UNCONDITIONAL destroy below discards them coherently.  Do
+		 * not "optimize" the destroy behind a records-empty check.
 		 */
 		if (ic->txn) {
 			ft_flip_txn_destroy(ic->txn);

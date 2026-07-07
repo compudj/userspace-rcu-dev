@@ -966,11 +966,18 @@ int ft_node_recompact(enum ft_recompact mode,
 	 */
 	bool new_init_done = false;
 	/*
-	 * Plain-store back-channel arm (build-invisible / no-txn): the
-	 * Phase-2 prev publish is deferred to after the copy loops so the
-	 * copied-slot latch bail point has no reader-visible effect.  The
-	 * retire_txn arm records the edge into the commit instead.
+	 * ONE resolved snapshot of the old node's external-head word: the
+	 * word itself is flip-managed (a key-disappearing remove parks its
+	 * proxy there), so a raw multi-read could inherit a latch or tear
+	 * across a peer's head swap.  Captured latch-checked below; every
+	 * later use (Phase-1 metadata, back-channel derive, deferred plain
+	 * publish) goes through this snapshot.  Non-NULL also flags the
+	 * deferred plain-store arm (build-invisible / no-txn): its Phase-2
+	 * prev publish moves to after the copy loops so the copied-slot
+	 * latch bail point has no reader-visible effect; the retire_txn arm
+	 * records the edge into the commit instead.
 	 */
+	struct cds_ft_node *ext_snapshot = NULL;
 	bool bc_plain = false;
 	/*
 	 * DEL: the to-remove slot's value, captured ONCE (latch-checked at
@@ -978,7 +985,10 @@ int ft_node_recompact(enum ft_recompact mode,
 	 * capture -- re-reading *nullify_node_flag_ptr per iteration could
 	 * see a peer's latch park between reads and silently COPY the child
 	 * being removed.  A child flag appears in exactly one slot, so the
-	 * value compare is exact.
+	 * value compare is exact AGAINST THIS CAPTURE; it does NOT detect a
+	 * peer's clean republish of the slot (old -> fresh copy) in the
+	 * capture->copy window -- that stale-plan window is closed by the F2
+	 * COPYING fence (the mark precedes the capture), not here.
 	 */
 	struct cds_ft_inode_flag *nullify_val = NULL;
 
@@ -1075,10 +1085,22 @@ int ft_node_recompact(enum ft_recompact mode,
 #else
 			(void) inh_slot;
 #endif
+			ext_snapshot = (struct cds_ft_node *)
+				rcu_dereference(metadata->external_nodes);
+			if (caa_unlikely(ft_node_flip_proxy(
+					(struct cds_ft_inode_flag *)
+						ext_snapshot))) {
+				/*
+				 * Peer flip parked on the head word itself
+				 * (key-disappearing remove): nothing exposed
+				 * yet -- bail and retry after it settles.
+				 */
+				free_cds_ft_node_unpublished(ft, new_node);
+				return -EAGAIN;
+			}
 			ft_metadata_set_external_nodes(new_node_flag,
-				new_metadata, metadata->external_nodes);
-			if (retire_txn && !cluster_leaf &&
-					metadata->external_nodes) {
+				new_metadata, ext_snapshot);
+			if (retire_txn && !cluster_leaf && ext_snapshot) {
 				/*
 				 * Live retire: the external head's back-channel
 				 * (cell->parent / head->prev) re-points to the
@@ -1097,11 +1119,10 @@ int ft_node_recompact(enum ft_recompact mode,
 
 				if (ft->ordered_list)
 					bc_slot = (void **) &ft_ord_cell_ptr(
-						metadata->external_nodes->prev
-						)->parent;
+						ext_snapshot->prev)->parent;
 				else
 					bc_slot = (void **)
-						&metadata->external_nodes->prev;
+						&ext_snapshot->prev;
 				bc_old = (struct cds_ft_inode_flag *)
 					rcu_dereference(*bc_slot);
 				if (caa_unlikely(ft_node_flip_proxy(bc_old))) {
@@ -1121,7 +1142,7 @@ int ft_node_recompact(enum ft_recompact mode,
 				 * latch bail point has zero reader-visible
 				 * effects to undo.
 				 */
-				bc_plain = metadata->external_nodes != NULL;
+				bc_plain = ext_snapshot != NULL;
 			}
 			ft_nr_keys_store(ft,new_metadata,
 				ft_nr_keys_get(metadata), CMM_RELAXED);
@@ -1299,7 +1320,7 @@ skip_copy:
 	 */
 	if (bc_plain)
 		ft_publish_external_nodes_prev(ft, new_node_flag,
-			metadata->external_nodes);
+			ext_snapshot);
 
 	/*
 	 * Inherit the old node's parent pointer so upward walks
