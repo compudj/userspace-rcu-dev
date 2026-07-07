@@ -1747,12 +1747,48 @@ int ft_attach_node(struct cds_ft *ft,
 			ic->count_folded = true;
 		} else {
 			/*
-			 * In-place reserve (dest == attach node): a redundant
-			 * same-value republish; the direct publish handles the
-			 * skip-slot bookkeeping.
+			 * In-place reserve (dest == attach node): republish the
+			 * attach node at its OWN grandparent slot.  The store is a
+			 * same-value forward store whose real work is
+			 * ft_set_parent_slot's parent_slot_offset / incoming_byte
+			 * maintenance (and, for a compressed grandparent, the SKIP
+			 * dual).  Under MW it must NOT be a bare direct store: if a
+			 * peer re-homed the attach node since this op's descent
+			 * (recompacted its grandparent), @attach_node_flag_ptr is a
+			 * STALE slot in the retired grandparent, and a direct
+			 * ft_publish_to_parent would (a) drive ft_set_parent_slot's
+			 * offset / ft_slot_to_byte against the fresh grandparent from
+			 * the stale slot -- garbage parent_slot_offset, the dominant
+			 * FT_INV_MW fault -- and (b) fire its `*slot != new_child`
+			 * store, resurrecting the retired attach node over the peer's
+			 * copy, un-rolled-back by a commit ABORT.  Mirror the
+			 * relocation branch above: re-descend if the attach node
+			 * moved, guard the live grandparent, and record the
+			 * (same-value) reader-visible edges into ic->txn so a peer
+			 * freeze/relocate ABORTS this commit.  ft_set_parent_slot
+			 * still runs immediately (it is not gated by @rec),
+			 * preserving the in-place metadata bookkeeping the direct
+			 * store performed (why dropping the call outright is wrong).
 			 */
-			ft_publish_to_parent(ft, attach_node_flag,
-				attach_node_flag_ptr, iter_dest_node_flag);
+			struct cds_ft_metadata *attach_meta =
+				cds_ft_item_to_metadata(
+					ft_node_ptr(attach_node_flag));
+			unsigned int k;
+
+			if (ft_get_parent_slot(attach_meta, ft) !=
+					attach_node_flag_ptr) {
+				ret = -EAGAIN;
+				goto check_error;
+			}
+			ft_flip_txn_guard_parent(ft, ic->txn,
+				attach_meta->parent);
+			_ft_publish_to_parent(ft, attach_node_flag,
+				attach_node_flag_ptr, iter_dest_node_flag, &rec);
+			for (k = 0; k < rec.n; k++)
+				ft_flip_txn_record_reserved(ic->txn,
+					(void **) rec.slot[k],
+					(void *) rec.old_val[k],
+					(void *) rec.new_val[k]);
 			/*
 			 * I6 count fold (rank stats ON): the attach node stays in
 			 * place, so its metadata->parent chain up to the root is
