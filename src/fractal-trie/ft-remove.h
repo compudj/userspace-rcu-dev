@@ -1631,6 +1631,27 @@ int ft_detach_node(struct cds_ft *ft,
 						rcu_assign_pointer(*pub->head_parent_field,
 							pub->head_parent_new);
 				}
+				/*
+				 * §4.B VALIDATE (Phase 4.3, MW): the EXTERNAL-PROMOTE
+				 * in-place commit stores pub->slot INSIDE the live holder
+				 * @iter_node_flag but records NO state edge on it --
+				 * pub->state_meta is NULL for a promote (set only for a
+				 * pure leaf delete, which fuses a real nr_child-- that
+				 * self-guards the holder).  The forward CAS below validates
+				 * only the slot VALUE (the displaced old child), so a peer
+				 * that recompacts/freezes the holder through its grandparent
+				 * slot leaves that value intact in the retired copy: the CAS
+				 * still matches and the promoted head is published into a
+				 * reclaimed node (UAF).  Guard the holder's state word so
+				 * such a peer's freeze-on-free ABORTs this commit --
+				 * symmetric with the external-CLEAR guards (2547, 3071).
+				 * Reuses the "+1 §4.B parent guard" reservation on
+				 * @commit_txn (mutually exclusive with the recompaction
+				 * republish guard, which fires only on the pub-UNARMED path).
+				 */
+				if (commit_txn && !pub->state_meta)
+					ft_flip_txn_guard_parent(ft, commit_txn,
+						iter_node_flag);
 				ret = ft_remove_one_commit(ft, pub->slot,
 					pub->old_val, pub->new_val,
 					pub->state_meta,
