@@ -3476,13 +3476,28 @@ void ft_reparent_record_meta(struct ft_flip_txn *txn,
 		struct cds_ft_inode_flag *parent_nf,
 		struct cds_ft_inode_flag **slot)
 {
-	uintptr_t old_state = meta->state, new_state = old_state;
+	uintptr_t old_state = meta->state;
+	/*
+	 * §4.B VALIDATE (Phase 4.3, MW): expect the re-homed child CLEAN-LIVE at
+	 * commit.  A RAW old_state bakes a peer's already-set TOMBSTONE/COPYING
+	 * into the expected-old, so a child a peer FROZE (retired) between the
+	 * recompact copy loop's read (ft_node_recompact) and this sweep would
+	 * MATCH at commit and re-home a DEAD child into the fresh copy = a
+	 * published edge dangling to reclaimed memory (the MW concurrent-
+	 * recompaction UAF).  Masking one-way death (TOMBSTONE) AND the reversible
+	 * copy fence (COPYING) -- identical to ft_flip_txn_guard_parent -- makes
+	 * such a child MISMATCH -> ABORT -> retry against the live tree.  A
+	 * genuinely live child carries neither bit, so live_state == old_state and
+	 * this is a no-op for it.
+	 */
+	uintptr_t live_state = old_state & ~(FT_STATE_TOMBSTONE | FT_STATE_COPYING);
+	uintptr_t new_state = live_state;
 
 	if (slot) {
 		unsigned int off = parent_nf ? (unsigned int) ((char *) slot -
 			(char *) ft_node_ptr(parent_nf)) / sizeof(void *) : 0;
 
-		new_state = (old_state & ~FT_STATE_PSO_MASK)
+		new_state = (live_state & ~FT_STATE_PSO_MASK)
 			| (((uintptr_t) off & FT_STATE_PSO_VALMASK)
 				<< FT_STATE_PSO_SHIFT);
 		if (parent_nf && !ft_node_compressed(parent_nf)
@@ -3497,7 +3512,7 @@ void ft_reparent_record_meta(struct ft_flip_txn *txn,
 	ft_flip_txn_record_reserved(txn, (void **) &meta->parent,
 		meta->parent, parent_nf);
 	ft_flip_txn_record_tag(txn, (void **) &meta->state,
-		(void *) old_state, (void *) new_state, FT_STATE_PROXY);
+		(void *) live_state, (void *) new_state, FT_STATE_PROXY);
 }
 
 /*
