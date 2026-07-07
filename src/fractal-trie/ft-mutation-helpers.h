@@ -47,7 +47,17 @@ static
 void ft_descent_init(struct ft_descent *d, struct cds_ft *ft)
 {
 	d->depth = 0;
-	d->nf = ft->root;
+	/*
+	 * Resolve a transient type-7 flip proxy a peer parked on the ROOT slot
+	 * (Phase 4.3: a root recompact's forward edge mid-commit) to its
+	 * committed-or-old target, exactly as ft_descent_traverse_compressed
+	 * does for cn->child: the descent reads d->nf as a node, so an
+	 * unresolved proxy (low nibble 0xF reads as internal type 7) drives
+	 * the first get_nth's type dispatch off a garbage entry -> wild jump.
+	 * d->nfp still names the raw slot; only the snapshot d->nf is resolved
+	 * (mirrors ft_node_get_nth).
+	 */
+	d->nf = ft_resolve_flip_proxy(rcu_dereference(ft->root));
 	d->nfp = &ft->root;
 	d->pnf = NULL;
 	d->pnfp = NULL;

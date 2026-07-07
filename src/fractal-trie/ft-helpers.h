@@ -2441,7 +2441,13 @@ bool valid_external_node(struct cds_ft_node *node)
 static inline
 struct cds_ft_metadata *ft_root_metadata(const struct cds_ft *ft)
 {
-	return cds_ft_item_to_metadata(ft_node_ptr(ft->root));
+	/*
+	 * Resolve a peer's parked flip proxy on the root slot (Phase 4.3, a
+	 * root recompact mid-commit): ft_node_ptr on the raw proxy would mask
+	 * the tag and hand back a RECORD address as a node.
+	 */
+	return cds_ft_item_to_metadata(ft_node_ptr(
+		ft_resolve_flip_proxy(rcu_dereference(ft->root))));
 }
 
 static
