@@ -1806,6 +1806,62 @@ struct cds_ft_inode_flag **ft_get_parent_slot(const struct cds_ft_metadata *meta
 	return ft_resolve_parent_slot(meta, ft, NULL);
 }
 
+#ifdef FT_ENABLE_TRACING
+#include <stdio.h>
+#include <stdlib.h>
+/*
+ * Flight-recorder WRITE-side mis-wire validator (tracing builds only): a
+ * forward-slot publish whose NEW value is a PLAIN compressed flag must name
+ * a live cn whose (parent, PSO) pair derives the very slot being written --
+ * every legit producer (fresh publish, recompact republish) wires the pair
+ * before publishing, and the SKIP_X dual writes the skip FORM (exempt via
+ * the plain-only filter).  Publishing a plain cn flag into any OTHER slot,
+ * or naming a tombstoned / len==0 target, is a mis-wire caught AT CREATION
+ * -- the abort core shows exactly who built the edge, and the snapshot
+ * carries the window.  Wired at the _ft_publish_to_parent(_meta) entries
+ * (the canonical forward-slot recorders), NOT at the txn record choke point:
+ * back-pointer FIELDS legitimately hold plain cn flags (a child's
+ * meta->parent naming its fresh cn parent) and would false-fire there.
+ */
+static
+void ft_trace_pub_check(struct cds_ft *ft,
+		struct cds_ft_inode_flag **slot, struct cds_ft_inode_flag *nf,
+		unsigned int site)
+{
+	struct cds_ft_compressed_node *cn;
+	struct cds_ft_metadata *meta;
+	uintptr_t state;
+	struct cds_ft_inode_flag *rt_parent;
+	struct cds_ft_inode_flag **rt_slotp;
+
+	if (!nf || !ft_node_compressed(nf))
+		return;
+	cn = ft_compressed_node_ptr(nf);
+	meta = cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
+	state = (uintptr_t) urcu_mcas_read((void **) &meta->state,
+			FT_STATE_PROXY);
+	rt_parent = ft_resolve_flip_proxy(rcu_dereference(meta->parent));
+	rt_slotp = rt_parent ? ft_get_parent_slot(meta, ft) : NULL;
+	if (caa_likely(cn->len != 0 && !(state & FT_STATE_TOMBSTONE) &&
+			rt_slotp == slot))
+		return;
+	FT_TP(miswire, site, (const void *) nf, (const void *) cn,
+		(unsigned int) cn->len, state, (const void *) rt_parent,
+		(const void *) rt_slotp);
+	fprintf(stderr, "FT PUB-MISWIRE site %u slot %p new %p target %p "
+		"len %u state %#lx rt_parent %p rt_slot %p\n",
+		site, (void *) slot, (void *) nf, (void *) cn,
+		(unsigned int) cn->len, (unsigned long) state,
+		(void *) rt_parent, (void *) rt_slotp);
+	(void) system("lttng snapshot record 1>&2");
+	abort();
+}
+#define FT_TRACE_PUB_CHECK(ft, slot, nf, site) \
+	ft_trace_pub_check(ft, slot, nf, site)
+#else
+#define FT_TRACE_PUB_CHECK(ft, slot, nf, site) do { } while (0)
+#endif	/* FT_ENABLE_TRACING */
+
 /*
  * ft_flag_to_metadata: get the metadata for any node flag, including
  * skip-compressed pointers.  For skip pointers, returns the
@@ -1944,6 +2000,8 @@ void _ft_publish_to_parent_meta(struct cds_ft *ft,
 	 * exception (the root has no parent).  Catches forward-before-parent
 	 * bugs at their source.
 	 */
+	/* Flight-recorder write-side mis-wire validator (tracing builds only). */
+	FT_TRACE_PUB_CHECK(ft, parent_slot, new_child, 4);
 #ifndef NDEBUG
 	if (new_child && parent_slot != &ft->root) {
 		struct cds_ft_inode_flag *cp;

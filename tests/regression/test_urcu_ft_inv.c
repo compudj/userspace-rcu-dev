@@ -708,6 +708,65 @@ static int inv_iteration_order(void)
 #define MW_NR_WRITERS	4
 #define MW_RANGE	256		/* keys per writer */
 
+/*
+ * Flight-recorder hooks for the MW oracle (FT_INV_ABORT_ON_VIOLATION=1):
+ * dump the LTTng snapshot ring and abort on the FIRST oracle violation, and
+ * likewise from a fatal-signal handler so an uncontrolled SIGSEGV/SIGBUS
+ * also captures its window.  system() in a signal handler is not
+ * async-signal-safe -- accepted scaffolding at crash time, matching the
+ * existing violation() helper.
+ */
+static void mw_violation_snapshot(void)
+{
+	if (!getenv("FT_INV_ABORT_ON_VIOLATION"))
+		return;
+	(void) system("lttng snapshot record 1>&2");
+	abort();
+}
+
+static void mw_fatal_action(int sig, siginfo_t *si, void *uctx)
+{
+	if (sig == SIGSEGV || sig == SIGBUS || sig == SIGILL) {
+		/*
+		 * Land the fault context IN the trace timeline: si_addr (the
+		 * faulting data address) and the sigframe instruction pointer,
+		 * so the fault correlates by address with the edge/alloc
+		 * breadcrumb window.
+		 */
+		void *ip = NULL;
+#if defined(__x86_64__)
+		ucontext_t *uc = (ucontext_t *) uctx;
+
+		ip = (void *) uc->uc_mcontext.gregs[REG_RIP];
+#else
+		(void) uctx;
+#endif
+		FT_TEST_TP(fatal_signal, sig, (const void *) si->si_addr,
+			(const void *) ip);
+		fprintf(stderr, "FATAL sig %d addr %p ip %p\n", sig,
+			si ? si->si_addr : NULL, ip);
+	}
+	(void) system("lttng snapshot record 1>&2");
+	signal(sig, SIG_DFL);
+	raise(sig);
+}
+
+static void mw_install_fatal_handler(void)
+{
+	struct sigaction sa;
+
+	if (!getenv("FT_INV_ABORT_ON_VIOLATION"))
+		return;
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_sigaction = mw_fatal_action;
+	sa.sa_flags = SA_SIGINFO;
+	sigemptyset(&sa.sa_mask);
+	sigaction(SIGSEGV, &sa, NULL);
+	sigaction(SIGBUS, &sa, NULL);
+	sigaction(SIGILL, &sa, NULL);
+	sigaction(SIGABRT, &sa, NULL);
+}
+
 struct mw_writer_arg {
 	struct cds_ft *ft;
 	uint64_t base;				/* range [base, base + MW_RANGE) */
@@ -751,12 +810,41 @@ static void *mw_writer(void *arg)
 			 * reference-lifetime contract).
 			 */
 			if (found != &w->node[off]->node) {
+				/*
+				 * DISCRIMINATOR (flight-recorder campaign): the
+				 * key was proven present-in-structure at abort
+				 * time, so classify the read failure before
+				 * declaring it -- retry on the SAME iter (same
+				 * state, later instant: transient mid-flip
+				 * anomaly if it now hits) and on a FRESH iter
+				 * (virgin state: iter-cache/reanchor bug if
+				 * only this one hits).  Still NIL on both =>
+				 * persistent descent mis-validation.
+				 */
+				struct cds_ft_iter *fresh = NULL;
+				struct cds_ft_node *re_same = NULL, *re_fresh = NULL;
+
+				cds_ft_iter_set_key(iter, k, CDS_FT_LEN_DEFAULT);
+				cds_ft_lookup(w->ft, iter);
+				re_same = cds_ft_iter_node(iter);
+				if (cds_ft_iter_create(w->ft, &fresh) ==
+						CDS_FT_STATUS_OK) {
+					cds_ft_iter_set_key(fresh, k,
+						CDS_FT_LEN_DEFAULT);
+					cds_ft_lookup(w->ft, fresh);
+					re_fresh = cds_ft_iter_node(fresh);
+				}
 				fprintf(stderr, "MW writer base %llu key %llu: live "
-					"but found %p != mine %p\n",
+					"but found %p != mine %p (retry same-iter %p "
+					"fresh-iter %p)\n",
 					(unsigned long long) w->base,
 					(unsigned long long) key, (void *) found,
-					(void *) &w->node[off]->node);
+					(void *) &w->node[off]->node,
+					(void *) re_same, (void *) re_fresh);
+				if (fresh)
+					cds_ft_iter_destroy(fresh);
 				w->failed = 1;
+				mw_violation_snapshot();
 			} else if (cds_ft_remove(w->ft, iter, found)
 					== CDS_FT_STATUS_OK) {
 				node_free_rcu(to_test_node(found));
@@ -780,6 +868,7 @@ static void *mw_writer(void *arg)
 					(unsigned long long) w->base,
 					(unsigned long long) key, (void *) found);
 				w->failed = 1;
+				mw_violation_snapshot();
 			} else {
 				struct ft_test_node *n = node_alloc(key);
 
@@ -820,6 +909,7 @@ static int inv_concurrent_writers_disjoint(void)
 			"(set FT_INV_MW=1 to run the Phase 4.3 writer oracle)\n");
 		return 0;
 	}
+	mw_install_fatal_handler();
 	ft = create_fixed_ft(8, &group);
 	/*
 	 * Concurrent writers REQUIRE concurrent mode: exclusive mode reclaims

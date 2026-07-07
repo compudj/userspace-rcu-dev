@@ -473,17 +473,28 @@ void ft_trace_miswire_check(struct cds_ft *ft,
 	 * proved that catch benign: a descent that read the slot just before a
 	 * peer's retire flip legally holds the dead-but-RCU-live target for a
 	 * few hundred ns, and its own commit then aborts on the expected-old
-	 * CAS.  The true corruption signatures are a garbage path length and
-	 * the round-trip KIND mismatch (the tree wires this address as an
-	 * INTERNAL node while our edge tags it compressed).
+	 * CAS.  A LIVE legit cn must round-trip to ITSELF: its parent's slot
+	 * holds either its plain flag or its SKIP form (which names the
+	 * external head -- resolve it back to the cn to compare).  A live
+	 * target that round-trips ANYWHERE ELSE is corruption: a mis-tagged
+	 * edge to an internal node, or recycled memory whose metadata walks
+	 * off into the weeds (the len byte alone cannot discriminate --
+	 * uint8_t never exceeds FT_MAX_KEY_LEN).
 	 */
-	bad = cn->len == 0 ||
-		(rt_val && ft_node_ptr(rt_val) == (void *) cn &&
-		 !ft_node_compressed(rt_val)
+	bool self_rt = false;
+
+	if (rt_val) {
+		if (ft_node_ptr(rt_val) == (void *) cn &&
+		    ft_node_compressed(rt_val))
+			self_rt = true;
 #ifdef FEATURE_FT_SKIP_COMPRESSED
-		 && !ft_node_skip_compressed(rt_val)
+		else if (ft_node_skip_compressed(rt_val) &&
+			 ft_skip_to_compressed(ft, rt_val) == cn)
+			self_rt = true;
 #endif
-		);
+	}
+	bad = cn->len == 0 ||
+		(!(state & FT_STATE_TOMBSTONE) && !self_rt);
 	if (caa_likely(!bad))
 		return;
 	FT_TP(miswire, site, (const void *) edge, (const void *) cn,

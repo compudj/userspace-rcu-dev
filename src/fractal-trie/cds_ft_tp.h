@@ -621,6 +621,25 @@ LTTNG_UST_TRACEPOINT_EVENT(cds_ft, txn_commit,
 	)
 )
 
+/*
+ * Fatal-signal context (SIGSEGV class), emitted from the test's sigaction
+ * handler before the snapshot dump: the faulting address (siginfo si_addr)
+ * and instruction pointer (sigframe REG_RIP), so the fault correlates by
+ * address with the breadcrumb window in the same timeline.
+ */
+LTTNG_UST_TRACEPOINT_EVENT(cds_ft, fatal_signal,
+	LTTNG_UST_TP_ARGS(
+		int, signo,
+		const void *, addr,
+		const void *, ip
+	),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_integer(int, signo, signo)
+		lttng_ust_field_integer_hex(uintptr_t, addr, (uintptr_t) addr)
+		lttng_ust_field_integer_hex(uintptr_t, ip, (uintptr_t) ip)
+	)
+)
+
 /* Arena item lifecycle: kind 0 = internal node, 1 = compressed node. */
 LTTNG_UST_TRACEPOINT_EVENT(cds_ft, item_alloc,
 	LTTNG_UST_TP_ARGS(
