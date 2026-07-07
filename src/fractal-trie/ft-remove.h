@@ -2695,10 +2695,17 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 	}
 
 	/*
-	 * detach should not replace a NULL pointer because it has been
-	 * found by a mutex-protected traversal within this function.
+	 * -ENOENT (detach's replace reached an emptied FT_NULL slot, or the
+	 * unchain found the node already gone) is NOT a bug under Phase 4.3
+	 * concurrent writers: the position was derived by a NON-exclusive
+	 * traversal, so a peer's recompaction can retype/empty the cached parent
+	 * slot between the derivation and the replace.  That path publishes
+	 * nothing and destroys every pre-reserved txn (see end:), so it is a
+	 * clean abort -- routed to the retry loop below exactly like -EAGAIN
+	 * (re-derive the position from node->prev against the current tree).
+	 * (Under single-writer exclusion the found-implies-replaceable invariant
+	 * still holds, so -ENOENT does not arise there.)
 	 */
-	assert(ret != -ENOENT);
 
 	/*
 	 * Invalidate the iterator path. The trie structure may have
@@ -2717,11 +2724,14 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 		FT_TP(remove_exit, (int) CDS_FT_STATUS_MEMORY_ERROR);
 		return CDS_FT_STATUS_MEMORY_ERROR;
 	case -EAGAIN:
+	case -ENOENT:
 		/*
-		 * A peer writer won a commit this attempt (ABORT) or moved the
-		 * position pre-commit: NOTHING was published and every fused
-		 * edge (freeze, count, tombstone) was discarded with it.
-		 * Signal the wrapper's retry loop to re-derive and re-attempt.
+		 * A peer writer won a commit this attempt (ABORT), or moved /
+		 * recompaction-retyped the position pre-commit (-ENOENT: the
+		 * cached slot emptied to FT_NULL, or the node was already
+		 * unchained): NOTHING was published and every fused edge
+		 * (freeze, count, tombstone) was discarded with it.  Signal the
+		 * wrapper's retry loop to re-derive and re-attempt.
 		 */
 		*need_retry = true;
 		return CDS_FT_STATUS_OK;	/* value unused: wrapper retries */
