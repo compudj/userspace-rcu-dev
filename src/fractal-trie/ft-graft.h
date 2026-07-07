@@ -448,9 +448,19 @@ enum cds_ft_status ft_store_at_graft_point_prepare(struct cds_ft *ft,
 				ft_compressed_node_ptr(graft_payload),
 				graft_payload);
 		dest = d->pnf;
+		/*
+		 * @glue->txn as the retire txn: a reserve that RECOMPACTS the
+		 * live dst attach node must record its reparent sweep and the
+		 * external-head back-channel INTO the glue commit (co-committed
+		 * (parent, offset) pairs), not apply them as immediate stores
+		 * onto the unpublished copy -- those were reader-visible via
+		 * up-walks from the still-reachable children for the whole
+		 * build-to-commit window.  NULL only on the txn-less merge-rekey
+		 * flow, which keeps the legacy immediate wiring (its own item).
+		 */
 		ret = ft_node_set_nth_rec(ft, &dest, key[key_len - 1], NULL,
 			&st->old_recompacted_node, pmeta, d->depth - 1, false,
-			&st->reserve_rec, NULL);
+			&st->reserve_rec, glue->txn);
 		if (ret)
 			return CDS_FT_STATUS_MEMORY_ERROR;
 
@@ -518,9 +528,11 @@ enum cds_ft_status ft_store_at_graft_point_prepare(struct cds_ft *ft,
 			 * the final slot and the wiring completes invisibly in
 			 * commit.
 			 */
+			/* Same retire-txn routing as the depth == key_len arm. */
 			ret = ft_node_set_nth_rec(ft, &dest, key[i - 1], NULL,
 				&st->old_recompacted_node, pmeta,
-				d->depth - 1, false, &st->reserve_rec, NULL);
+				d->depth - 1, false, &st->reserve_rec,
+				glue->txn);
 			if (ret)
 				return CDS_FT_STATUS_MEMORY_ERROR;
 
