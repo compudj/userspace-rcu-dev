@@ -532,6 +532,18 @@ int urcu_mcas_plant(struct urcu_mcas *t,
  * hold-and-wait.  That bound is still O(writers) of real stack, so the recursive
  * descent is additionally capped at URCU_MCAS_HELP_MAX_DEPTH (see the note there);
  * @depth is the current help-recursion depth (0 at the owner/reader entry).
+ *
+ * ONE phase, EVERY record plants -- including pure validates (old == new).
+ * This is a documented, load-bearing property, not an implementation accident:
+ * a parked guard occupies its word until the owner's settle, which is what the
+ * FT COPYING copy-fence protocol pairs its mark CAS against (see the contract
+ * note at urcu_txn_validate in <urcu/rcu-txn.h>).  Splitting the install into
+ * write-parks followed by evaluate-only validates (a "two-phase install")
+ * would let guards stop occupying their words -- a scalability lever on
+ * guard-hot state words -- but only the two-phase ordering keeps it sound,
+ * and it invalidates the single-plant/steal arbitration argument as audited.
+ * Deliberately not done (2026-07-06); re-derive both arguments before ever
+ * changing this.
  */
 static inline
 void urcu_mcas_drive_install_depth(struct urcu_mcas *t, unsigned int depth)

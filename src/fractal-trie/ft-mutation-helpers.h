@@ -386,9 +386,15 @@ static void ft_flip_txn_call_rcu_now(struct rcu_head *head,
  * one consistent snapshot the whole copy plan (sizing, tombstone expected-old)
  * must derive from.
  *
- * Residual window (accepted for this phase, closed by the engine two-phase
- * install, F2 3/3): a peer whose clean-LIVE guard was VALIDATED before the
- * mark but whose payload slot parks after the copier read that slot.
+ * The Dekker pairing this mark forms with a peer's §4.B guard is closed by a
+ * LOAD-BEARING engine contract: pure validates PARK a proxy like writes (see
+ * the contract note at urcu_txn_validate, <urcu/rcu-txn.h>).  A guard planted
+ * before the mark occupies the word, so the mark's dirty check sees it and
+ * bails; a guard planted after expects the CLEAN image and mismatches the
+ * fenced word; and a peer payload parked between the mark and the copy read
+ * is caught by the copy loops' latch bail.  The once-planned engine two-phase
+ * install ("F2 3/3") was DROPPED as unnecessary under that contract
+ * (2026-07-06 decision, CORE_682870_FORENSICS.md).
  */
 static inline
 int ft_meta_copying_mark(struct cds_ft_metadata *meta,
@@ -413,10 +419,14 @@ int ft_meta_copying_mark(struct cds_ft_metadata *meta,
  * value, COPYING included), and the node stays LIVE.  The word may transiently
  * hold a peer's parked proxy (a doomed guard mid-install -- it validates
  * clean-LIVE and the fence is still set -- or a peer write that will mismatch
- * the fence-pinned value): wait for the owner to settle, then CAS.  Bounded by
- * the peer's install/settle; the F2 3/3 help-to-terminal read will replace the
- * wait with helping.  The CAS loop (not a blind AND) is what keeps a parked
- * proxy POINTER from being corrupted by a bit-clear.
+ * the fence-pinned value): wait for the owner to settle, then CAS.  The wait
+ * is bounded by the owner's settle, which is owner-only (helping a foreign
+ * txn drives it terminal but cannot make its word plain), so a helping read
+ * would not shorten it -- part of why the engine-side "F2 3/3" was dropped.
+ * A writer thread dying mid-install would wedge this loop, but a writer dying
+ * mid-mutation is already fatal to the trie under the library's contract.
+ * The CAS loop (not a blind AND) is what keeps a parked proxy POINTER from
+ * being corrupted by a bit-clear.
  */
 static inline
 void ft_meta_copying_clear(struct cds_ft_metadata *meta)

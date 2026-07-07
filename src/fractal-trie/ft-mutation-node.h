@@ -1352,9 +1352,16 @@ int ft_node_recompact(enum ft_recompact mode,
 		break;
 	}
 	default:
+		/*
+		 * Statically unreachable (every ft_types entry is POPCOUNT /
+		 * PIGEON / NULL), but route through abandon_fresh anyway: it is
+		 * the one failure arm past the COPYING mark, and `goto end`
+		 * here would leak both the fresh node and the fence if a new
+		 * type class ever forgot to extend this switch.
+		 */
 		assert(0);
 		ret = -EINVAL;
-		goto end;
+		goto abandon_fresh;
 	}
 skip_copy:
 

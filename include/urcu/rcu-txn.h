@@ -592,6 +592,26 @@ void *urcu_txn_load_validate(struct urcu_mcas_txn *txn, void **slot,
  * the record's new_ptr (a prior write is preserved), and a differing expected
  * old between the two poisons the descriptor (the commit aborts).  Sticky on
  * OOM like store.
+ *
+ * LOAD-BEARING CONTRACT -- guards PARK like writes.  A pure validate is a
+ * {expected -> expected} record, and the install phase plants a proxy for
+ * EVERY record in slot-address order (urcu_mcas_drive_install makes no
+ * write-vs-validate distinction).  A guard therefore OCCUPIES its word from
+ * plant until the owner's settle, and that occupancy is what embedders'
+ * fence protocols pair against: the FT COPYING copy fence
+ * (fractal-trie-internal.h FT_STATE_COPYING) relies on a §4.B state-word
+ * guard either being VISIBLE to the fence's mark CAS (proxy bit -> the
+ * copier bails) or evaluating AFTER the mark (clean expectation mismatches
+ * -> the guarded op aborts) -- the Dekker/store-buffering pairing that keeps
+ * a body copy consistent without per-slot validate records.  Do NOT
+ * optimize pure validates into non-parking evaluate-only reads: evaluating
+ * a guard without occupying the word reopens the window (guard passes
+ * early, the fence goes up, the guarded write parks after the copier's
+ * body read -- both sides blind).  A non-parking validate is sound only
+ * with a two-phase install (all write-parks first, validates evaluated
+ * second, then decide) -- the "F2 3/3" design deliberately DROPPED in favor
+ * of this documented invariant (2026-07-06 decision, rationale in
+ * fractal-trie-review-2026-06/CORE_682870_FORENSICS.md).
  */
 static inline
 void urcu_txn_validate(struct urcu_mcas_txn *txn, void **slot,
