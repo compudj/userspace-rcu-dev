@@ -954,16 +954,49 @@ void ft_meta_nr_child_set(struct cds_ft_metadata *meta, unsigned int n)
 		| (meta->state & ~FT_STATE_NR_CHILD_MASK);
 }
 
+/*
+ * nr_child +/- 1 as a LATCH-HONORING CAS transition (Phase 4.3).  The former
+ * plain read-modify-write raced concurrent writers on SHARED nodes -- the
+ * set_nth type arms run on a LIVE published node whenever an in-place insert
+ * (the case-0 reserve) targets a spine node two writers share, so a plain +=
+ * both LOSES increments (nr_child < popcount, feeding garbage to every
+ * rank-bounded walk) and, worse, does ARITHMETIC ON A PARKED FT_STATE_PROXY
+ * pointer when a peer's state edge is mid-commit -- minting a corrupted
+ * near-pointer with tag bits that a resolver then chases.  The CAS loop
+ * re-derives from the current word and waits out a parked proxy (bounded by
+ * the owner's settle), mirroring ft_meta_state_transition.  A fresh
+ * single-owner node pays one uncontended CAS.
+ */
 static inline
 void ft_meta_nr_child_inc(struct cds_ft_metadata *meta)
 {
-	meta->state += FT_STATE_NR_CHILD_ONE;
+	for (;;) {
+		uintptr_t s = CMM_LOAD_SHARED(meta->state);
+
+		if (caa_unlikely(s & FT_STATE_PROXY)) {
+			caa_cpu_relax();
+			continue;
+		}
+		if (caa_likely(uatomic_cmpxchg(&meta->state, s,
+				s + FT_STATE_NR_CHILD_ONE) == s))
+			return;
+	}
 }
 
 static inline
 void ft_meta_nr_child_dec(struct cds_ft_metadata *meta)
 {
-	meta->state -= FT_STATE_NR_CHILD_ONE;
+	for (;;) {
+		uintptr_t s = CMM_LOAD_SHARED(meta->state);
+
+		if (caa_unlikely(s & FT_STATE_PROXY)) {
+			caa_cpu_relax();
+			continue;
+		}
+		if (caa_likely(uatomic_cmpxchg(&meta->state, s,
+				s - FT_STATE_NR_CHILD_ONE) == s))
+			return;
+	}
 }
 
 /*
