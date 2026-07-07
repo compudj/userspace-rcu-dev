@@ -1681,6 +1681,24 @@ int ft_detach_node(struct cds_ft *ft,
 		    old_recompacted_node && !topmost_external_nodes) {
 			struct ft_pub_rec rec = { .n = 0 };
 
+			/*
+			 * MW consistency: @detach_parent_flag_ptr was recovered by the
+			 * up-prune walk, while @iter_meta->parent and its state-word slot
+			 * offset were inherited by the recompact from a later snapshot.  A
+			 * peer re-home of the grandparent between the two tears the pair --
+			 * _ft_publish_to_parent_meta would then compute the fresh copy's
+			 * offset (ft_set_parent_slot -> ft_slot_to_byte) off the wrong
+			 * parent body and fault out of range against its bitmap.  Bail to a
+			 * re-descend when iter_meta's OWN resolved slot no longer IS
+			 * @detach_parent_flag_ptr: nothing is published yet (this fresh
+			 * copy is build-invisible), so the end: unwind discards the copy and
+			 * the unconsumed txn, exactly as the peer-won -EAGAIN below.
+			 */
+			if (ft_get_parent_slot(iter_meta, ft) !=
+					detach_parent_flag_ptr) {
+				ret = -EAGAIN;
+				goto end;
+			}
 			/* VALIDATE (§4.B): guard the LIVE grandparent iter_meta->parent. */
 			ft_flip_txn_guard_parent(ft, commit_txn, iter_meta->parent);
 			_ft_publish_to_parent(ft, iter_meta->parent,
@@ -1736,6 +1754,32 @@ int ft_detach_node(struct cds_ft *ft,
 			 * through to the no-op else.  (pub->armed and
 			 * old_recompacted_node are mutually exclusive.)
 			 */
+			/*
+			 * MW consistency, RECOMPACTION sub-case ONLY (old_recompacted_node
+			 * set).  A non-fused recompaction publishes a build-invisible fresh
+			 * copy whose (parent, offset) the recompact inherited as ONE plain
+			 * snapshot, so ft_get_parent_slot(iter_meta) is a STABLE value no
+			 * peer can write; a grandparent re-home that tears it vs
+			 * @detach_parent_flag_ptr would fault ft_slot_to_byte in
+			 * _ft_publish_to_parent_meta, so bail to a re-descend -- the fresh
+			 * copy is freed and the recorded (unconsumed) txn destroyed at end:,
+			 * nothing published yet (as the fused site above).
+			 *
+			 * Do NOT guard the external-promote sub-case (old_recompacted_node
+			 * == NULL, reachable list-off with pub == NULL): there
+			 * @iter_node_flag is the LIVE holder whose promoted head was already
+			 * published reader-visibly above, so a -EAGAIN here would STRAND
+			 * that mutation (the caller retries as "nothing published"), and its
+			 * parent is peer-writable -- a check-then-use cannot make the raw
+			 * re-read in _ft_publish_to_parent_meta atomic anyway.  That torn
+			 * pair is a separate, pre-existing list-off gap.
+			 */
+			if (old_recompacted_node &&
+			    ft_get_parent_slot(iter_meta, ft) !=
+					detach_parent_flag_ptr) {
+				ret = -EAGAIN;
+				goto end;
+			}
 			/* VALIDATE (§4.B): guard the LIVE grandparent iter_meta->parent. */
 			ft_flip_txn_guard_parent(ft, commit_txn, iter_meta->parent);
 			_ft_publish_to_parent(ft, iter_meta->parent,
