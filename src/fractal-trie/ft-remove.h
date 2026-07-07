@@ -870,14 +870,26 @@ int ft_detach_node(struct cds_ft *ft,
 	 * external_nodes, or the root (parent == NULL).
 	 */
 	/*
-	 * Resolve a skip-compressed initial parent slot.  When the detach is
-	 * bootstrapped from a leaf whose holder is a compressed node (e.g.
-	 * cds_ft_remove deriving the position from node->prev), the slot that
-	 * holds the holder is skip-encoded (SKIP_X(cn->child)); ft_node_ptr
-	 * does not strip the skip high bits, so resolve to the plain
-	 * compressed flag here.  No-op for a plain (descent-supplied) slot.
+	 * Resolve the initial parent slot.  Two layers:
+	 *
+	 *  - Flip-proxy: @detach_parent_flag_ptr is a forward child slot (the
+	 *    grandparent's slot to the holder), which a concurrent recompaction
+	 *    re-home transiently parks a type-7 MCAS proxy in.  A raw load feeds
+	 *    that proxy to cds_ft_item_to_metadata() at the top of the up-walk
+	 *    below and faults (the SAME crash the loop-body parent read guards
+	 *    against, but on iteration 0).  Resolve it exactly as cds_ft_remove
+	 *    does at its compressed-child identity compare.  @cur is only ever
+	 *    dereferenced here (never a CAS expected-old), so resolving is sound.
+	 *
+	 *  - Skip-compressed: when the detach is bootstrapped from a leaf whose
+	 *    holder is a compressed node (e.g. cds_ft_remove deriving the
+	 *    position from node->prev), the slot is skip-encoded (SKIP_X(cn->
+	 *    child)); ft_node_ptr does not strip the skip high bits, so resolve
+	 *    to the plain compressed flag.  No-op for a plain (descent) slot.
 	 */
-	cur = ft_resolve_skip_compressed(ft, *detach_parent_flag_ptr);
+	cur = ft_resolve_skip_compressed(ft,
+		ft_resolve_flip_proxy(
+			(struct cds_ft_inode_flag *) rcu_dereference(*detach_parent_flag_ptr)));
 	cur_depth = detach_depth - ft_parent_depth_span(cur, *detach_node_flag_ptr);
 
 	/*
@@ -889,11 +901,28 @@ int ft_detach_node(struct cds_ft *ft,
 
 	while (cur) {
 		struct cds_ft_metadata *metadata;
+		struct cds_ft_inode_flag *resolved_parent;
 		bool is_root;
 
 		metadata = cds_ft_item_to_metadata(ft_node_ptr(cur));
 		metadata_stack[nr_metadata++] = metadata;
-		is_root = (metadata->parent == NULL);
+		/*
+		 * ONE proxy-resolved snapshot of this ancestor's parent
+		 * back-pointer, consumed by every use below (the is_root
+		 * boundary test, the boundary parent_meta classify, and the
+		 * climb).  &metadata->parent is a flip-txn parked slot
+		 * (ft_reparent_record_meta), so a concurrent recompaction
+		 * re-home transiently parks a type-7 proxy here; a raw load fed
+		 * to cds_ft_item_to_metadata() computes metadata off the
+		 * latch/record memory and faults (the dominant FT_INV_MW
+		 * up-walk crash), and a raw non-NULL proxy also mis-answers
+		 * is_root.  Resolve once (a predicted-not-taken mask-compare
+		 * when no re-home is in flight -- single-writer unchanged),
+		 * exactly as the reader up-walk ft_skip_reanchor does.
+		 */
+		resolved_parent = ft_resolve_flip_proxy(
+			(struct cds_ft_inode_flag *) rcu_dereference(metadata->parent));
+		is_root = (resolved_parent == NULL);
 
 		assert(ft_meta_nr_child(metadata) > 0);
 		if (!prev_external_nodes_found && (ft_meta_nr_child(metadata) == 1 && !metadata->external_nodes && !is_root)) {
@@ -921,7 +950,7 @@ int ft_detach_node(struct cds_ft *ft,
 			if (!is_root) {
 				struct cds_ft_metadata *parent_meta =
 					cds_ft_item_to_metadata(
-						ft_node_ptr(metadata->parent));
+						ft_node_ptr(resolved_parent));
 				metadata_stack[nr_metadata++] = parent_meta;
 			}
 			/*
@@ -950,7 +979,7 @@ int ft_detach_node(struct cds_ft *ft,
 		 * update detach pointers to prune at this level.
 		 */
 		{
-			struct cds_ft_inode_flag *parent_nf = metadata->parent;
+			struct cds_ft_inode_flag *parent_nf = resolved_parent;
 
 			if (!parent_nf)
 				break;
