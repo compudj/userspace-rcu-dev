@@ -978,46 +978,80 @@ void ft_state_edge(struct ft_ord_cell_edge *edge, uintptr_t *state_slot,
 }
 
 /*
- * The remove-side nr_child-- as a COMMITTED flip edge, replacing the bare
- * in-place ft_meta_nr_child_dec on a LIVE node.  Same net effect under one
- * writer -- a lone-edge flip is one release store, byte-identical to the bare
- * decrement (and the node-state word is writer-side only, so no reader ever
- * resolves its transient proxy) -- but under multi-writer MCAS the decrement
- * becomes a CAS-with-expected on the state word instead of a disjoint in-place
- * store (doc/design/mcas-multiwriter-readiness.md §4.2).  The structural
- * child-slot edge still commits separately here; fusing the two into one flip
- * (atomic {structure, count}) is a follow-up.
+ * Latch-honoring standalone STATE-WORD transition (F3 lone-store hardening):
+ * apply @f(s) to the state word through a proxy-tolerant CAS loop.  The prior
+ * shape -- raw read + one release store of the derived value -- wrote
+ * f(latch-pointer) back into the word when a peer's MCAS proxy was parked at
+ * the read (e.g. proxy|TOMBSTONE = a corrupted record pointer the peer's
+ * settle then CAS-misses, leaving a dangling latch forever).  The loop waits
+ * out a parked proxy (owner settles in bounded steps; under one writer no
+ * proxy ever appears, so the first CAS succeeds -- behaviour-identical) and
+ * re-derives from the fresh value on CAS failure, so a racing peer's
+ * committed state change is never overwritten with a stale image.  These
+ * standalone marks remain OUTSIDE commit arbitration by design (no
+ * expected-old validation of a plan -- their transitions are self-contained:
+ * one-way bit sets and exact-count adjustments); paths whose retire must be
+ * atomic with an unlink use the recorded ft_flip_txn_record_* forms instead.
+ */
+static inline
+void ft_meta_state_transition(struct cds_ft_metadata *meta,
+		uintptr_t (*f)(uintptr_t))
+{
+	for (;;) {
+		uintptr_t s = CMM_LOAD_SHARED(meta->state);
+
+		if (caa_unlikely(s & FT_STATE_PROXY)) {
+			caa_cpu_relax();
+			continue;
+		}
+		if (caa_likely(uatomic_cmpxchg(&meta->state, s, f(s)) == s))
+			return;
+	}
+}
+
+static inline
+uintptr_t ft_state_f_nr_child_dec(uintptr_t s)
+{
+	return s - FT_STATE_NR_CHILD_ONE;
+}
+
+static inline
+uintptr_t ft_state_f_tombstone(uintptr_t s)
+{
+	return s | FT_STATE_TOMBSTONE;
+}
+
+/*
+ * The remove-side nr_child-- as a latch-honoring standalone transition,
+ * replacing the bare in-place ft_meta_nr_child_dec on a LIVE node.  Same net
+ * effect under one writer; under multi-writer the CAS loop re-derives from
+ * the current word, so a peer's concurrent state commit is never overwritten
+ * with a stale count (doc/design/mcas-multiwriter-readiness.md §4.2).  The
+ * structural child-slot edge still commits separately here; fusing the two
+ * into one flip (atomic {structure, count}) is a follow-up.
  */
 static
 void ft_meta_nr_child_dec_flip(struct cds_ft_metadata *meta)
 {
-	struct ft_ord_cell_edge edge;
-	uintptr_t old = meta->state;
-
-	ft_state_edge(&edge, &meta->state, old, old - FT_STATE_NR_CHILD_ONE);
-	ft_ord_cell_flip_one(&edge);
+	ft_meta_state_transition(meta, ft_state_f_nr_child_dec);
 }
 
 /*
  * Set a node's one-way LIVE->DEAD tombstone (state bit 1, §4.B freeze-on-free)
- * as a COMMITTED flip edge, at the point the node is DETACHED from the trie.
- * Under one writer this is a no-op store on a node about to be reclaimed --
- * nothing reads the bit (the arena re-zeroes metadata on reallocation) -- so it
- * is behaviour-identical; under multi-writer MCAS the mark is what a concurrent
- * writer targeting the node validates (expected = live) so its commit fails
- * once the node is dead (doc/design/mcas-multiwriter-readiness.md §4.B).  Lone
- * edge => on-stack, infallible.  Idempotent: re-marking a dead node is a same-
- * value store.  The mark and the structural unlink that retires the node should
- * eventually ride ONE flip (atomic detach); a lone-edge mark is the bridge.
+ * as a latch-honoring standalone transition, at the point the node is DETACHED
+ * from the trie.  Under one writer this is one uncontended CAS on a node about
+ * to be reclaimed -- behaviour-identical; under multi-writer MCAS the mark is
+ * what a concurrent writer targeting the node validates (expected = live) so
+ * its commit fails once the node is dead (doc §4.B), and the CAS loop keeps
+ * the mark from trampling a parked latch or a peer's concurrent state commit.
+ * Infallible; idempotent (re-marking a dead node is a same-value CAS).  The
+ * mark and the structural unlink that retires the node should eventually ride
+ * ONE flip (atomic detach); a standalone mark is the bridge.
  */
 static
 void ft_meta_tombstone_set_flip(struct cds_ft_metadata *meta)
 {
-	struct ft_ord_cell_edge edge;
-	uintptr_t old = meta->state;
-
-	ft_state_edge(&edge, &meta->state, old, old | FT_STATE_TOMBSTONE);
-	ft_ord_cell_flip_one(&edge);
+	ft_meta_state_transition(meta, ft_state_f_tombstone);
 }
 
 /*
@@ -1152,22 +1186,36 @@ void ft_flip_txn_guard_parent(const struct cds_ft *ft, struct ft_flip_txn *t,
  * bit-set sitting outside the descriptor protocol (doc/design/mcas-multiwriter-
  * readiness.md §4 DECISION FINAL, refinement-1 site 2).
  *
- * The successor pointer is preserved (only bit 0 is set), so a concurrent reader
- * positioned on @node still follows the chain (readers mask the bit in
- * cds_ft_node_next_rcu).  Under one writer the commit is one release store of a
- * low bit readers ignore -- behaviour-identical to the prior relaxed
- * CMM_STORE_SHARED; under multi-writer MCAS it is a CAS-with-expected on next.
- * Lone edge => on-stack, infallible; idempotent (re-marking is a same-value
- * store).  The mark and the predecessor relink that unlinks @node should
- * eventually ride ONE flip (atomic detach); a lone-edge mark is the bridge.
+ * The successor pointer is preserved (only the mark bit is set), so a
+ * concurrent reader positioned on @node still follows the chain (readers mask
+ * the bit in cds_ft_node_next_rcu).  Under one writer the commit is one
+ * uncontended CAS of a low bit readers ignore -- behaviour-identical; under
+ * multi-writer the latch-honoring loop (F3, mirror of
+ * ft_meta_state_transition) waits out a parked FT_HLIST_TAG proxy (engine
+ * bit 0; the mark is bit 1, so the two never alias) instead of OR-ing the
+ * mark into a latch POINTER -- the corrupted-record trample the raw
+ * read + blind flip allowed -- and re-derives from the fresh successor on a
+ * CAS miss so a peer's committed relink is never overwritten stale.
+ * Infallible; idempotent (re-marking is a same-value CAS).  The mark and the
+ * predecessor relink that unlinks @node should eventually ride ONE flip
+ * (atomic detach); a standalone mark is the bridge.
  */
 static
 void ft_node_mark_removed_flip(struct cds_ft *ft, struct cds_ft_node *node)
 {
-	struct cds_ft_node *old = node->next;
+	(void) ft;
+	for (;;) {
+		struct cds_ft_node *old = CMM_LOAD_SHARED(node->next);
 
-	ft_chain_next_flip(ft, &node->next, old, (struct cds_ft_node *)
-			((uintptr_t) old | CDS_FT_NODE_REMOVED_FLAG));
+		if (caa_unlikely((uintptr_t) old & FT_HLIST_TAG)) {
+			caa_cpu_relax();
+			continue;
+		}
+		if (caa_likely(uatomic_cmpxchg(&node->next, old,
+				(struct cds_ft_node *) ((uintptr_t) old |
+					CDS_FT_NODE_REMOVED_FLAG)) == old))
+			return;
+	}
 }
 
 /*
