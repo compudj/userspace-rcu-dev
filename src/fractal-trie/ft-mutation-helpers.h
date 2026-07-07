@@ -1758,14 +1758,25 @@ struct ft_ord_cell *ft_ord_cell_find_pred_from_head(struct cds_ft *ft,
  * edges with its structural unlink in a single flip (ft_remove_one_commit);
  * ft_ord_cell_unsplice is the standalone (two-commit) wrapper.
  *
- * The two edges this records -- pred->next: cell -> succ and succ->prev: cell ->
- * pred -- are EXACTLY urcu_txn_list_del_prepare's edge set on @cell->lnode;
- * the public op is used directly where the cell records straight into a held txn
- * (the point ops), while the fused removes build into this edge array to commit
- * the cell unsplice and the structural unlink in one flip.  Sentinel topology:
- * @pred / @succ resolve to @ft's sentinel pseudo-cell when @cell is the list
- * first / last, so &pred->lnode.next / &succ->lnode.prev IS the old head / tail
- * endpoint flip -- no separate endpoint edge.
+ * The three edges this records -- pred->next: cell -> succ, succ->prev: cell ->
+ * pred, and the DELETION MARK cell->next: succ -> succ|URCU_TXN_LIST_MARK --
+ * are EXACTLY urcu_txn_list_del_prepare's edge set on @cell->lnode; the public
+ * op is used directly where the cell records straight into a held txn (the
+ * point ops), while the fused removes build into this edge array to commit the
+ * cell unsplice and the structural unlink in one flip.  THE MARK IS
+ * LOAD-BEARING under concurrent writers: it is the ONLY thing
+ * urcu_txn_list_insert_after_prepare's deleted-pos (-ENOENT) and
+ * deleted-neighbour (-EAGAIN) checks can see -- an unmarked dead cell keeps
+ * bit-identical links, so a peer's splice whose position search captured this
+ * cell as pred/succ before the unsplice would otherwise commit INTO the dead
+ * segment whenever the neighbour values still match (arena recycling makes the
+ * match likely), producing an out-of-order or resurrected cell.  Readers
+ * mask the bit (urcu_txn_list_next_rcu strips URCU_MCAS_TAG |
+ * URCU_TXN_LIST_MARK), so a parked reader still walks off the dead cell
+ * exactly as before.  Sentinel topology: @pred / @succ resolve to @ft's
+ * sentinel pseudo-cell when @cell is the list first / last, so
+ * &pred->lnode.next / &succ->lnode.prev IS the old head / tail endpoint flip
+ * -- no separate endpoint edge.
  */
 static
 unsigned int ft_ord_cell_unsplice_edges(struct cds_ft *ft,
@@ -1786,11 +1797,17 @@ unsigned int ft_ord_cell_unsplice_edges(struct cds_ft *ft,
 	edges[n].old_target = cell;
 	edges[n].new_target = pred;
 	n++;
+	edges[n].tag = URCU_MCAS_TAG;	/* deletion mark: see the comment above */
+	edges[n].slot = (struct ft_ord_cell **) &cell->lnode.next;
+	edges[n].old_target = succ;
+	edges[n].new_target = (struct ft_ord_cell *)
+		urcu_txn_list_set_mark(ft_ord_cell_lnode(succ));
+	n++;
 	return n;
 }
 
-/* Max edges an unsplice commits: the two neighbour back-edges. */
-#define FT_ORD_CELL_UNSPLICE_MAX_EDGES	2
+/* Max edges an unsplice commits: two neighbour back-edges + the deletion mark. */
+#define FT_ORD_CELL_UNSPLICE_MAX_EDGES	3
 
 /*
  * Remove @cell from the ordered cell list (its key disappeared) by committing
@@ -1910,16 +1927,29 @@ unsigned int ft_ord_cell_swap_edges(struct cds_ft *ft,
 	edges[n].old_target = old_cell;
 	edges[n].new_target = new_cell;
 	n++;
+	/*
+	 * Deletion mark on the RETIRED cell (urcu_txn_list_del_prepare parity --
+	 * see ft_ord_cell_unsplice_edges): without it, a peer's splice that
+	 * captured @old_cell as its pred/succ before this swap would find its
+	 * bit-identical links and commit into the retired cell.  Readers mask
+	 * the bit.
+	 */
+	edges[n].tag = URCU_MCAS_TAG;
+	edges[n].slot = (struct ft_ord_cell **) &old_cell->lnode.next;
+	edges[n].old_target = succ;
+	edges[n].new_target = (struct ft_ord_cell *)
+		urcu_txn_list_set_mark(ft_ord_cell_lnode(succ));
+	n++;
 	return n;
 }
 
 /*
  * Edges ft_ord_cell_swap_publish_multi commits: <=2 structural (the forward
- * publish + a compressed parent's SKIP_X dual) + <=4 cell (two neighbour
- * back-edges + the head/tail endpoint repairs).  A caller that must pre-reserve
- * its flip-txn sizes it to this.
+ * publish + a compressed parent's SKIP_X dual) + <=5 cell (two neighbour
+ * back-edges + the retired cell's deletion mark + the head/tail endpoint
+ * repairs).  A caller that must pre-reserve its flip-txn sizes it to this.
  */
-#define FT_ORD_CELL_SWAP_PUBLISH_MAX_EDGES	6
+#define FT_ORD_CELL_SWAP_PUBLISH_MAX_EDGES	7
 
 /*
  * Replace touching up to 2 reader-visible structural slots, fused with the head
@@ -2187,7 +2217,7 @@ void ft_pub_rec_add_back_edge(struct cds_ft *ft, struct ft_pub_rec *rec,
  * was installed (all fused edges discarded); a retry-enabled caller unwinds
  * and re-descends.  The @txn-NULL lone-store path cannot abort (returns OK).
  */
-#define FT_REMOVE_COMMIT_REC_MAX_EDGES	8	/* <=3 structural (+back-edge) + <=4 cell/run + 1 DEL-recompact tombstone */
+#define FT_REMOVE_COMMIT_REC_MAX_EDGES	9	/* <=3 structural (+back-edge) + <=5 cell/run (unsplice = 2 back-edges + deletion mark) + 1 DEL-recompact tombstone */
 static
 enum urcu_txn_status ft_remove_commit_rec(struct cds_ft *ft,
 		struct ft_pub_rec *rec,

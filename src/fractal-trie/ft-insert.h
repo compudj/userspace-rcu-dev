@@ -274,8 +274,29 @@ enum urcu_txn_status ft_insert_one_commit(struct cds_ft *ft, const uint8_t *key,
 		 * (incl. head/tail) collapse to its 2.
 		 */
 		pred_lnode = pred ? ft_ord_cell_lnode(pred) : &ft->ord_sentinel.node;
-		(void) urcu_txn_list_insert_after_prepare(ft_flip_txn_handle(ic->txn),
-			ft_ord_cell_lnode(cell), pred_lnode);
+		/*
+		 * A FAILING prepare is a peer conflict, not a soft no-op: -ENOENT
+		 * = @pred died (its next carries the fused unsplice's deletion
+		 * mark) between the position search and here; -EAGAIN = the
+		 * successor is mid-deletion.  Splicing anyway (the former void
+		 * cast) would target a retired cell whose bit-identical links
+		 * still match -- the resurrected / out-of-order cell class the
+		 * ord-verify catches at rest.  Unwind exactly as a commit ABORT
+		 * would (nothing is installed -- records are discarded with the
+		 * descriptor, registered fences cleared by the destroy, the fresh
+		 * cluster freed as the on-abort rollback does) and let the
+		 * caller's ABORT path re-descend; age the handle first, exactly
+		 * as a real commit ABORT ages it.
+		 */
+		if (urcu_txn_list_insert_after_prepare(ft_flip_txn_handle(ic->txn),
+				ft_ord_cell_lnode(cell), pred_lnode) < 0) {
+			ft_free_unpublished_split_cluster(ft, ic->created,
+				ic->nr_created);
+			urcu_txn_conflict(ft_flip_txn_handle(ic->txn));
+			ft_flip_txn_destroy(ic->txn);
+			ic->txn = NULL;
+			return URCU_TXN_STATUS_ABORT;
+		}
 	}
 
 	/*
@@ -1585,6 +1606,14 @@ int ft_attach_node(struct cds_ft *ft,
 			ic->free_old_node = old_recompacted_node;
 			old_recompacted_node = NULL;
 			/*
+			 * The relocated fresh copy is unpublished until the commit
+			 * flips the grandparent slot: track it with the cluster from
+			 * here on (the earlier -EAGAIN guard freed it separately
+			 * because it was NOT yet tracked), so the success handoff
+			 * below covers it for the commit-ABORT rollback.
+			 */
+			created_nodes[nr_created_nodes++] = iter_dest_node_flag;
+			/*
 			 * I7 count fold (rank stats ON): the reserve recompacted
 			 * the attach node, so the relocated copy iter_dest_node_flag
 			 * (a fresh node published at the grandparent slot) carries
@@ -1666,6 +1695,18 @@ int ft_attach_node(struct cds_ft *ft,
 
 	/* Success */
 	ret = 0;
+	/*
+	 * Hand the fresh cluster to the op scope: it stays unpublished until
+	 * the one-commit flips the parked slots, so a commit ABORT's rollback
+	 * (ft_insert_abort_cb) must free it -- without this handoff, every
+	 * commit-time ABORT of the attach shapes leaked the whole fresh branch
+	 * (only the split builders handed their clusters over).
+	 */
+	if (ic->txn) {
+		memcpy(ic->created, created_nodes,
+			(size_t) nr_created_nodes * sizeof(created_nodes[0]));
+		ic->nr_created = nr_created_nodes;
+	}
 
 check_error:
 	if (ret) {
@@ -2020,6 +2061,36 @@ int ft_insert_compressed_key_shorter(struct cds_ft *ft,
 	 */
 	ft_flip_txn_copying_register(ic->txn, cn_meta);
 	ic->free_old_cn_fence = cn_fence;
+	/*
+	 * Concurrent-writer conflict check (mirror of the diverge builder's
+	 * pre-arm guard): @d->nfp was recorded at descent as the cn's slot in
+	 * its parent; a peer may since have re-homed the cn, so consuming the
+	 * stale (parent, slot) pair below would invert it against the wrong
+	 * node's body and fault ft_slot_to_byte mid-build.  The fence does not
+	 * cover this (a re-home committed BEFORE the mark leaves the cn clean).
+	 * Re-derive from the cn's own resolved (parent, offset) pair; disagree
+	 * -> unwind exactly as the arm-failure above (nothing published) and
+	 * re-descend.
+	 */
+	if (ft_get_parent_slot(cn_meta, ft) != d->nfp) {
+		jct_meta->external_nodes = NULL;
+		node->next = NULL;
+		ft_free_unpublished_split_cluster(ft, split_created,
+			split_nr_created);
+		/* Registered above: the txn owns the fence; discard both. */
+		ft_flip_txn_destroy(ic->txn);
+		ic->txn = NULL;
+		return -EAGAIN;
+	}
+	/*
+	 * Hand the fresh cluster to the op scope: the commit's on-abort
+	 * rollback (ft_insert_abort_cb) frees it if a peer writer wins at
+	 * commit time -- without this, every commit ABORT of the key-shorter
+	 * shape leaked the unpublished split cluster.
+	 */
+	memcpy(ic->created, split_created,
+		(size_t) split_nr_created * sizeof(split_created[0]));
+	ic->nr_created = split_nr_created;
 	/*
 	 * top_flag's own back-pointer was wired in the split (it is a fresh
 	 * cluster node).  The LIVE old-child re-parent is the back-channel that
