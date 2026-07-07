@@ -1445,8 +1445,6 @@ int ft_detach_node(struct cds_ft *ft,
 		}
 #endif
 		if (!boundary_fused) {
-			struct cds_ft_inode_flag *bparent =
-				metadata_stack[nr_branch - 1]->parent;
 			/*
 			 * Pre-reserve the commit txn BEFORE ft_node_replace_ptr's pre-flip
 			 * side-effects -- the in-place delete's nr_child decrement (it
@@ -1469,31 +1467,31 @@ int ft_detach_node(struct cds_ft *ft,
 			 * boundary shrinks, ft_node_replace_ptr's recompact records the old
 			 * copy's freeze-on-free tombstone INTO @commit_txn, so it flips
 			 * atomically with the forward republish this same txn commits below
-			 * (atomic detach, §4.B) rather than as an early standalone flip.  A
-			 * key-disappearing remove on an ordered-list trie always unsplices a
-			 * cell (fuse_cell), so @commit_txn is always reserved and every DEL
-			 * recompaction retire fuses; only a list-off shrink under a
-			 * non-compressed parent with no run leaves @commit_txn NULL, where the
-			 * recompact falls back to the standalone tombstone flip (still safe:
-			 * one writer, and the freeze is a no-op until the multi-writer engine).
+			 * (atomic detach, §4.B) rather than as an early standalone flip.
+			 *
+			 * FORCE-TXN: created UNCONDITIONALLY.  The former residual gate
+			 * (list-off shrink under a non-compressed parent with no run,
+			 * rank-stats off) left @commit_txn NULL, sending the DEL
+			 * recompaction down ft_node_recompact's retire_txn-NULL arm --
+			 * an IMMEDIATE reparent sweep + external-head prev store onto
+			 * the not-yet-published copy, reader-followable through the
+			 * still-reachable children until the republish (the early
+			 * live-wire class).  With the txn always present, every DEL
+			 * retire records its sweep, tombstone and forward republish
+			 * into ONE flip.  A txn no commit consumes is freed unused at
+			 * @end; the new -ENOMEM aborts before any side-effect.
 			 */
-			if (fuse_cell || run ||
-			    (bparent && (ft_node_compressed(bparent) ||
-					 ft_node_skip_compressed(bparent))) ||
-			    (pub && (nr_to_free > 0 || trailing_skip_cn_flag)) ||
-			    ft->rank_stats /* carry the nr_keys fold walk */) {
-				commit_txn = ft_flip_txn_create_bounded(
-					FT_REMOVE_COMMIT_REC_MAX_EDGES
-					+ 1 /* §4.B parent guard (Site 1 arms excl.) */
-					+ nr_to_free
-					+ (trailing_skip_cn_flag ? 1 : 0)
-					+ (retire_glue ? retire_glue->cap_free : 0)
-					+ (ft->rank_stats ? detach_depth + 1 : 0) /* nr_keys fold walk */
-					+ (freeze_leaf ? FT_HLIST_FREEZE_MAX_EDGES : 0));
-				if (!commit_txn) {
-					ret = -ENOMEM;
-					goto end;
-				}
+			commit_txn = ft_flip_txn_create_bounded(
+				FT_REMOVE_COMMIT_REC_MAX_EDGES
+				+ 1 /* §4.B parent guard (Site 1 arms excl.) */
+				+ nr_to_free
+				+ (trailing_skip_cn_flag ? 1 : 0)
+				+ (retire_glue ? retire_glue->cap_free : 0)
+				+ (ft->rank_stats ? detach_depth + 1 : 0) /* nr_keys fold walk */
+				+ (freeze_leaf ? FT_HLIST_FREEZE_MAX_EDGES : 0));
+			if (!commit_txn) {
+				ret = -ENOMEM;
+				goto end;
 			}
 			ret = ft_node_replace_ptr(ft,
 				detach_node_flag_ptr,
