@@ -93,8 +93,11 @@ void ft_compact_relocate_at(struct cds_ft *ft, struct cds_ft_inode_flag **holder
 	if (ret != 0) {
 		/*
 		 * Node allocation failed inside the recompact before any
-		 * reader-visible store (nothing recorded into @rec, *holder
-		 * unchanged): best-effort, leave the node in place.
+		 * reader-visible store, or the copy met a peer's parked flip
+		 * proxy and abandoned itself (-EAGAIN, side effects undone).
+		 * Either way nothing was recorded into @rec and *holder is
+		 * unchanged: best-effort, leave the node in place (a bailed
+		 * relocation is retried by a later compaction pass).
 		 */
 		if (txn)
 			ft_flip_txn_destroy(txn);	/* reserved, unused */

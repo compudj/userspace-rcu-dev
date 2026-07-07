@@ -468,7 +468,27 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		memcpy(&new_cn->key_bytes[parent_len + 1],
 			child_cn->key_bytes, child_len);
 	new_cn->len = (uint8_t) merged_len;
-	new_cn->child = child_cn ? child_cn->child : surviving_child;
+	if (child_cn) {
+		struct cds_ft_inode_flag *child_child =
+			rcu_dereference(child_cn->child);
+
+		/*
+		 * A peer latch parked on the boundary cn's child must not be
+		 * embedded in the merged cn (the peer settles only the
+		 * ORIGINAL slot; an embedded copy dangles into its reclaimed
+		 * descriptor -- see the recompact copy-loop bail).  Nothing
+		 * recorded into @txn yet and new_cn never published: reclaim
+		 * both and let the caller retry after the peer settles.
+		 */
+		if (caa_unlikely(ft_node_flip_proxy(child_child))) {
+			free_compressed_node_unpublished(ft, new_cn);
+			ft_flip_txn_destroy(txn);
+			return -EAGAIN;
+		}
+		new_cn->child = child_child;
+	} else {
+		new_cn->child = surviving_child;
+	}
 	ft_meta_nr_child_set(new_cn_meta, 1);
 	/*
 	 * Build the merged node with its POST-removal count (top + @count_delta,
@@ -2976,6 +2996,12 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 		 * ancestors).  Surface the real error with a NULL out-param --
 		 * the header contract -- so the caller cannot reclaim the
 		 * still-reachable chain.
+		 *
+		 * KNOWN MW GAP: a peer-conflict -EAGAIN (copied-slot latch
+		 * bail, chain-compress abort) also lands here as MEMORY_ERROR
+		 * -- remove_all has no retry loop yet ("not yet retry-
+		 * enabled" above).  Nothing is published either way; the
+		 * error class is wrong, not the structure.
 		 */
 		*result_node = NULL;
 		return CDS_FT_STATUS_MEMORY_ERROR;

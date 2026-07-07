@@ -965,6 +965,22 @@ int ft_node_recompact(enum ft_recompact mode,
 	 * (no per-subnode state).
 	 */
 	bool new_init_done = false;
+	/*
+	 * Plain-store back-channel arm (build-invisible / no-txn): the
+	 * Phase-2 prev publish is deferred to after the copy loops so the
+	 * copied-slot latch bail point has no reader-visible effect.  The
+	 * retire_txn arm records the edge into the commit instead.
+	 */
+	bool bc_plain = false;
+	/*
+	 * DEL: the to-remove slot's value, captured ONCE (latch-checked at
+	 * capture).  The copy loops compare child VALUES against this stable
+	 * capture -- re-reading *nullify_node_flag_ptr per iteration could
+	 * see a peer's latch park between reads and silently COPY the child
+	 * being removed.  A child flag appears in exactly one slot, so the
+	 * value compare is exact.
+	 */
+	struct cds_ft_inode_flag *nullify_val = NULL;
 
 	/*
 	 * Need to find nearest type index even for ADD_SAME, so that
@@ -1015,13 +1031,15 @@ int ft_node_recompact(enum ft_recompact mode,
 		 * (parent, offset) as a co-committed pair INTO @retire_txn so it
 		 * flips atomically with the publish -- not two plain stores a peer
 		 * reads torn.  Widen the txn for the <=2 edges per child up front
-		 * (<= old nr_child + 1); an OOM here aborts cleanly, nothing
-		 * allocated yet -- a single-commit insert may fail its widen
-		 * (unlike a graft/merge second commit, which pre-reserves).
+		 * (<= old nr_child + 1), +1 for the external head's back-channel
+		 * edge below; an OOM here aborts cleanly, nothing allocated yet --
+		 * a single-commit insert may fail its widen (unlike a graft/merge
+		 * second commit, which pre-reserves).
 		 */
 		if (retire_txn && !cluster_leaf && metadata &&
 				!ft_flip_txn_reserve_extra(retire_txn,
-					2 * (ft_meta_nr_child_load(metadata) + 1)))
+					2 * (ft_meta_nr_child_load(metadata) + 1)
+					+ 1))
 			return -ENOMEM;
 		new_node = alloc_cds_ft_node(ft, new_type, &new_metadata);
 		if (!new_node)
@@ -1057,18 +1075,54 @@ int ft_node_recompact(enum ft_recompact mode,
 #else
 			(void) inh_slot;
 #endif
-			/*
-			 * Recompact: new_metadata->parent is already inherited
-			 * above, so the back-channel prev = new_node_flag is
-			 * safe to publish here (up-walkers reach a parent-wired
-			 * node).  Split into the Phase-1 metadata write + the
-			 * Phase-2 prev publish for consistency with the other
-			 * external-nodes attach sites.
-			 */
 			ft_metadata_set_external_nodes(new_node_flag,
 				new_metadata, metadata->external_nodes);
-			ft_publish_external_nodes_prev(ft, new_node_flag,
-				metadata->external_nodes);
+			if (retire_txn && !cluster_leaf &&
+					metadata->external_nodes) {
+				/*
+				 * Live retire: the external head's back-channel
+				 * (cell->parent / head->prev) re-points to the
+				 * fresh node ATOMICALLY with the forward publish
+				 * -- a RECORDED edge riding @retire_txn (+1
+				 * reserved above), not an early plain store a
+				 * peer observes against the not-yet-published
+				 * copy, and discarded coherently on ABORT or on
+				 * the copied-slot latch bail below.  A peer
+				 * latch already parked on the back-channel word
+				 * (concurrent head re-home) aborts this attempt
+				 * up front.
+				 */
+				void **bc_slot;
+				struct cds_ft_inode_flag *bc_old;
+
+				if (ft->ordered_list)
+					bc_slot = (void **) &ft_ord_cell_ptr(
+						metadata->external_nodes->prev
+						)->parent;
+				else
+					bc_slot = (void **)
+						&metadata->external_nodes->prev;
+				bc_old = (struct cds_ft_inode_flag *)
+					rcu_dereference(*bc_slot);
+				if (caa_unlikely(ft_node_flip_proxy(bc_old))) {
+					free_cds_ft_node_unpublished(ft, new_node);
+					return -EAGAIN;
+				}
+				ft_flip_txn_record_reserved(retire_txn, bc_slot,
+					bc_old, new_node_flag);
+			} else {
+				/*
+				 * Build-invisible / legacy no-txn arm: the
+				 * back-channel prev publish stays a plain store,
+				 * DEFERRED to after the copy loops (the helper's
+				 * contract only needs it at-or-just-before the
+				 * forward publish, and new_metadata->parent is
+				 * already inherited above) so the copied-slot
+				 * latch bail point has zero reader-visible
+				 * effects to undo.
+				 */
+				bc_plain = metadata->external_nodes != NULL;
+			}
 			ft_nr_keys_store(ft,new_metadata,
 				ft_nr_keys_get(metadata), CMM_RELAXED);
 		}
@@ -1088,6 +1142,14 @@ int ft_node_recompact(enum ft_recompact mode,
 	 * away -- catch a regression here, at the dereference site.
 	 */
 	assert(mode != FT_RECOMPACT_DEL || new_type_index != NODE_INDEX_NULL);
+
+	if (mode == FT_RECOMPACT_DEL) {
+		nullify_val = rcu_dereference(*nullify_node_flag_ptr);
+		if (caa_unlikely(ft_node_flip_proxy(nullify_val))) {
+			ret = -EAGAIN;
+			goto abandon_fresh;
+		}
+	}
 
 	if (new_type_index == NODE_INDEX_NULL)
 		goto skip_copy;
@@ -1119,7 +1181,21 @@ int ft_node_recompact(enum ft_recompact mode,
 			ft_popcount_node_get_ith_pos(old_type, old_node, i, &v, &iter);
 			if (!iter)
 				continue;
-			if (mode == FT_RECOMPACT_DEL && *nullify_node_flag_ptr == iter)
+			/*
+			 * A peer's parked flip proxy (type-7 latch) must not be
+			 * copied into the fresh body: the peer's settle CASes
+			 * only the ORIGINAL slot, so an embedded copy dangles
+			 * into the peer's reclaimed MCAS descriptor after its
+			 * grace period -- a permanent wild edge (and the
+			 * reparent sweep below would skip the child, leaving
+			 * its back-pointer on the retired node).  Abandon the
+			 * copy and retry after the peer settles.
+			 */
+			if (caa_unlikely(ft_node_flip_proxy(iter))) {
+				ret = -EAGAIN;
+				goto abandon_fresh;
+			}
+			if (mode == FT_RECOMPACT_DEL && nullify_val == iter)
 				continue;
 			if (new_type->popcount_2l)
 				ret = ft_popcount_2l_node_set_nth(new_type,
@@ -1166,7 +1242,12 @@ int ft_node_recompact(enum ft_recompact mode,
 			iter = ft_pigeon_node_get_ith_pos(old_type, old_node, i);
 			if (!iter)
 				continue;
-			if (mode == FT_RECOMPACT_DEL && *nullify_node_flag_ptr == iter)
+			/* Copied-slot latch: see the popcount loop above. */
+			if (caa_unlikely(ft_node_flip_proxy(iter))) {
+				ret = -EAGAIN;
+				goto abandon_fresh;
+			}
+			if (mode == FT_RECOMPACT_DEL && nullify_val == iter)
 				continue;
 			if (new_type->popcount_2l)
 				ret = ft_popcount_2l_node_set_nth(new_type,
@@ -1209,6 +1290,16 @@ skip_copy:
 	}
 
 #undef RECOMPACT_IS_INIT
+
+	/*
+	 * Deferred Phase-2 back-channel publish (plain-store arm only; the
+	 * retire_txn arm recorded it above): past the copy loops the attempt
+	 * can no longer bail, so this is the first moment the fresh node may
+	 * become peer-visible.
+	 */
+	if (bc_plain)
+		ft_publish_external_nodes_prev(ft, new_node_flag,
+			metadata->external_nodes);
 
 	/*
 	 * Inherit the old node's parent pointer so upward walks
@@ -1404,6 +1495,19 @@ skip_copy:
 
 	ret = 0;
 end:
+	return ret;
+
+abandon_fresh:
+	/*
+	 * Latch bail (copied slot or DEL-target capture): the fresh body
+	 * never became peer-visible -- nothing recorded into @rec, forward
+	 * slot untouched, the retire_txn arm's back-channel edge is a RECORD
+	 * discarded with the abandoned attempt, and the plain-store arm's
+	 * prev publish is deferred past this point.  Reclaim the never-
+	 * escaped copy immediately; -EAGAIN re-descends after the peer
+	 * settles.
+	 */
+	free_cds_ft_node_unpublished(ft, new_node);
 	return ret;
 }
 
