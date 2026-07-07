@@ -916,8 +916,17 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 	 * window -- cn re-parented AFTER this check but before the forward install
 	 * -- is caught by the forward slot's expected-value CAS and the §4.B freeze
 	 * guard, both recorded by ft_insert_publish_or_park, surfacing as ABORT.)
+	 *
+	 * Capture @cur_parent from the SAME resolved snapshot that validates the
+	 * slot: a peer re-home commits cn_meta->parent and the state-word slot
+	 * offset as ONE co-committed MCAS pair, so a separate raw re-read of the
+	 * parent below could return a peer's freshly re-homed parent P2 while
+	 * @parent_slot still indexes the old parent P1 -- ft_set_parent would then
+	 * invert (P2, @parent_slot) and fault ft_slot_to_byte with an out-of-range
+	 * rank against P2's bitmap.  One snapshot keeps the pair consistent; a
+	 * re-home landing AFTER it is caught by the commit CAS.
 	 */
-	if (ft_get_parent_slot(cn_meta, ft) != parent_slot) {
+	if (ft_resolve_parent_slot(cn_meta, ft, &cur_parent) != parent_slot) {
 		ft_free_unpublished_split_cluster(ft, created, nr_created);
 		ft_meta_copying_clear(cn_meta);
 		return -EAGAIN;
@@ -943,16 +952,16 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 	ft_flip_txn_copying_register(ic->txn, cn_meta);
 	ic->free_old_cn_fence = cn_fence;
 	/*
-	 * Resolve cn's parent back-pointer through a peer's parked flip proxy
-	 * (§9): the guard above validated the RESOLVED (parent, slot) pair,
-	 * but a raw re-read here can hand the type-7 latch itself to
-	 * ft_set_parent, whose ft_slot_to_byte type-dispatches on it (garbage
-	 * type -> assert / garbage bookkeeping stored on the fresh top).  The
-	 * resolved committed-or-old parent is a live node; if the peer's
-	 * commit re-homes cn afterwards, our forward CAS / §4.B guard aborts
-	 * and the fresh cluster (with its transient parent value) is discarded.
+	 * @cur_parent came from the guard's ft_resolve_parent_slot snapshot,
+	 * consistent with @parent_slot (a peer re-home commits the parent and its
+	 * slot offset as one MCAS pair, resolved from a single status snapshot, so
+	 * the pair cannot tear).  Do NOT re-read cn_meta->parent here: a raw reload
+	 * could observe a peer's re-homed parent while @parent_slot still indexes
+	 * the old one, faulting ft_slot_to_byte on the mismatched bitmap.  A flip
+	 * proxy is already resolved by ft_resolve_parent_slot (never the type-7
+	 * latch itself).  If the peer re-homes cn AFTER the guard, our forward CAS
+	 * / §4.B guard aborts and this fresh cluster is discarded.
 	 */
-	cur_parent = ft_resolve_flip_proxy(rcu_dereference(cn_meta->parent));
 	ft_set_parent(ft, top_flag, cur_parent, parent_slot);
 	if (deferred_child2)
 		ft_set_parent(ft, deferred_child2, deferred_parent, deferred_slot2);
@@ -1278,14 +1287,24 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 	 * suffix / junction).  No allocation happens past here; the caller
 	 * publishes the top forward immediately after we return.
 	 *
-	 * Resolve cn's parent through a peer's parked flip proxy (§9): a raw
-	 * read can hand the type-7 latch to ft_set_parent's type dispatch
-	 * (see ft_split_compressed_insert).  A post-resolve peer re-home is
-	 * caught by the caller's forward CAS / §4.B guard as ABORT.
+	 * Wire top_flag's back-pointer from ONE resolved (parent, slot) snapshot
+	 * (§9 / see ft_split_compressed_insert): a peer re-home commits
+	 * cn_meta->parent and its slot offset as one MCAS pair, so a raw re-read
+	 * of the parent could pair a re-homed parent P2 with @parent_slot (still
+	 * indexing the old parent P1) and fault ft_slot_to_byte with an
+	 * out-of-range rank against P2's bitmap.  Only wire when the resolved slot
+	 * still IS @parent_slot (the consistent, non-re-homed pair, with any flip
+	 * proxy already resolved); a re-home makes the pair disagree -> skip (the
+	 * cluster stays build-invisible) and the caller's post-build (parent,
+	 * slot) guard unwinds the whole insert with -EAGAIN before any publish.  A
+	 * re-home AFTER that guard is caught by the forward CAS / §4.B as ABORT.
 	 */
-	ft_set_parent(ft, top_flag,
-		ft_resolve_flip_proxy(rcu_dereference(cn_meta->parent)),
-		parent_slot);
+	{
+		struct cds_ft_inode_flag *cur_parent;
+
+		if (ft_resolve_parent_slot(cn_meta, ft, &cur_parent) == parent_slot)
+			ft_set_parent(ft, top_flag, cur_parent, parent_slot);
+	}
 	/* Return the live edge; the caller defers (parked) or wires (direct). */
 	*live_child_ret = deferred_child;
 	*live_parent_ret = deferred_parent;
