@@ -64,7 +64,17 @@ struct ft_insert_commit {
 	 * resolving the proxy to it until the commit, so its (grace-period-
 	 * deferred) free must be queued only AFTER the commit -- a free queued
 	 * pre-commit would not cover readers that pick the proxy up later.
+	 *
+	 * @free_old_cn_fence: the COPYING-fence snapshot the split builder took
+	 * on this cn's state word at ENTRY (F2 fence extended to the split-retire
+	 * family): the builder's whole plan -- diverge slicing, cn->child
+	 * snapshot, deferred-edge captures -- derives from the fenced cn, and
+	 * ft_insert_one_commit records the retire as the precise
+	 * {COPYING|s -> TOMBSTONE|s} transition, so a peer state change under the
+	 * fence (a concurrent split/collapse/re-home of the SAME cn) aborts
+	 * exactly one side instead of being erased by a ratified stale plan.
 	 */
+	uintptr_t free_old_cn_fence;
 	struct cds_ft_compressed_node *free_old_cn;
 	/*
 	 * Old internal node replaced by a recompact-relocation forward publish
@@ -290,11 +300,26 @@ enum urcu_txn_status ft_insert_one_commit(struct cds_ft *ft, const uint8_t *key,
 	 * last abort point (all recording is infallible into the pre-reserved txn).
 	 */
 	if (ic->free_old_cn)
-		ft_flip_txn_record_tombstone(ic->txn, cds_ft_item_to_metadata(
-			(struct cds_ft_inode *) ic->free_old_cn));
-	if (ic->free_old_node)
-		ft_flip_txn_record_tombstone(ic->txn,
-			cds_ft_item_to_metadata(ic->free_old_node));
+		/*
+		 * FENCED retire (F2 split extension): the expected old is the
+		 * builder's entry-mark snapshot, so the commit ratifies exactly
+		 * the cn state the split plan was derived from; the fence itself
+		 * was registered with @txn at arm time (cleared on every
+		 * non-commit outcome, consumed by this transition on commit).
+		 */
+		ft_flip_txn_record_tombstone_copying(ic->txn,
+			cds_ft_item_to_metadata(
+				(struct cds_ft_inode *) ic->free_old_cn),
+			ic->free_old_cn_fence);
+	/*
+	 * @free_old_node needs NO record here: its sole producer is the
+	 * ft_attach_node relocation, whose recompact runs with @ic->txn as the
+	 * retire txn and records the fenced {COPYING|s -> TOMBSTONE|s}
+	 * transition itself.  A second raw {s -> s|TOMBSTONE} record on the
+	 * same word would same-slot-UPGRADE the recompact's new value and leak
+	 * the fence bit into the dead word.  The deferred free below still
+	 * covers it.
+	 */
 	/*
 	 * Order-statistics count fold (rank stats ON): record the +1 key-count
 	 * propagation as nr_keys value-CAS edges on the STABLE ancestor chain from
@@ -523,6 +548,24 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 	struct cds_ft_compressed_node *cn = ft_compressed_node_ptr(compressed_flag);
 	struct cds_ft_metadata *cn_meta =
 		cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
+	/*
+	 * F2 COPYING fence, split-retire extension: this split retires @cn and
+	 * derives its WHOLE plan from it -- the diverge slicing over
+	 * cn->key_bytes, the cn->child snapshot, the deferred-edge captures --
+	 * so fence @cn BEFORE the first read, exactly as a recompact fences the
+	 * node it copies.  Single-splitter exclusion: a peer split / collapse /
+	 * retire of the SAME cn either holds the fence (mark fails -> -EAGAIN,
+	 * re-descend) or aborts at commit against the fenced tombstone's
+	 * precise expected old (ft_insert_one_commit records
+	 * {COPYING|s -> TOMBSTONE|s} from @cn_fence).  Cleared locally on every
+	 * bail until the arm registers it with @ic->txn (whose every terminal
+	 * path then owns the outcome).
+	 */
+	uintptr_t cn_fence;
+	int fret = ft_meta_copying_mark(cn_meta, &cn_fence);
+
+	if (fret)
+		return fret;	/* -EAGAIN: peer owns @cn; nothing built */
 
 	/*
 	 * Compressed metadata never carries external_nodes
@@ -809,6 +852,7 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 	 */
 	if (ft_get_parent_slot(cn_meta, ft) != parent_slot) {
 		ft_free_unpublished_split_cluster(ft, created, nr_created);
+		ft_meta_copying_clear(cn_meta);
 		return -EAGAIN;
 	}
 	/*
@@ -822,6 +866,15 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 		ft->rank_stats ? node_depth + 2 : 0);
 	if (ret)
 		goto error;
+	/*
+	 * The armed txn now owns the fence outcome: registered for the clear on
+	 * every non-commit terminal (destroy / ABORT / MEMORY_ERROR), consumed
+	 * by the fenced tombstone transition on commit.  Past this point the
+	 * local error path must NOT clear it (the caller's unwind destroys
+	 * @ic->txn, which drains the registry).
+	 */
+	ft_flip_txn_copying_register(ic->txn, cn_meta);
+	ic->free_old_cn_fence = cn_fence;
 	/*
 	 * Resolve cn's parent back-pointer through a peer's parked flip proxy
 	 * (§9): the guard above validated the RESOLVED (parent, slot) pair,
@@ -860,7 +913,13 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 	return 0;
 
 error:
+	/*
+	 * Reached only BEFORE the post-arm registration (build allocation
+	 * failures, or the arm itself failing with @ic->txn never created), so
+	 * the fence is still locally owned: lift it with the cluster teardown.
+	 */
 	ft_free_unpublished_split_cluster(ft, created, nr_created);
+	ft_meta_copying_clear(cn_meta);
 	return -ENOMEM;
 }
 
@@ -1877,6 +1936,9 @@ int ft_insert_compressed_key_shorter(struct cds_ft *ft,
 	struct cds_ft_inode_flag **live_slot;
 	struct cds_ft_inode_flag *split_created[FT_MAX_DEPTH];
 	int split_nr_created = 0;
+	struct cds_ft_metadata *cn_meta = cds_ft_item_to_metadata(
+		(struct cds_ft_inode *) ft_compressed_node_ptr(d->nf));
+	uintptr_t cn_fence;
 	int sret;
 
 	/*
@@ -1888,12 +1950,24 @@ int ft_insert_compressed_key_shorter(struct cds_ft *ft,
 	 */
 	(void) unique_node_ret;
 
+	/*
+	 * F2 COPYING fence, split-retire extension (see
+	 * ft_split_compressed_insert): the key-shorter split retires @d->nf and
+	 * plans from its body + child, so fence it before the builder's first
+	 * read.  ft_insert_one_commit records the retire from @cn_fence.
+	 */
+	sret = ft_meta_copying_mark(cn_meta, &cn_fence);
+	if (sret)
+		return sret;	/* -EAGAIN: peer owns the cn; nothing built */
+
 	sret = ft_split_compressed_key_shorter(ft,
 		d->nf, d->nfp, remaining, &top_flag, &jct_flag, d->depth,
 		&live_child, &live_parent, &live_slot,
 		split_created, &split_nr_created);
-	if (sret)
+	if (sret) {
+		ft_meta_copying_clear(cn_meta);
 		return sret;
+	}
 	jct_meta = cds_ft_item_to_metadata(ft_node_ptr(jct_flag));
 	assert(!ft_node_compressed(jct_flag));
 	assert(jct_meta->external_nodes == NULL);	/* always a fresh head */
@@ -1937,8 +2011,15 @@ int ft_insert_compressed_key_shorter(struct cds_ft *ft,
 		node->next = NULL;
 		ft_free_unpublished_split_cluster(ft, split_created,
 			split_nr_created);
+		ft_meta_copying_clear(cn_meta);
 		return sret;
 	}
+	/*
+	 * The armed txn now owns the fence outcome (registered clear on every
+	 * non-commit terminal; consumed by the fenced tombstone on commit).
+	 */
+	ft_flip_txn_copying_register(ic->txn, cn_meta);
+	ic->free_old_cn_fence = cn_fence;
 	/*
 	 * top_flag's own back-pointer was wired in the split (it is a fresh
 	 * cluster node).  The LIVE old-child re-parent is the back-channel that
