@@ -731,6 +731,17 @@ struct ft_remove_pub {
 	struct cds_ft_inode_flag *old_val;
 	struct cds_ft_inode_flag *new_val;	/* NULL for delete; chain head for promote */
 	struct cds_ft_metadata *state_meta;	/* non-NULL (delete) => fuse its nr_child-- */
+	/*
+	 * External promote: the promoted head's back-channel re-parent
+	 * (cell->parent list-on, node->prev list-off) captured at arm time and
+	 * COMMITTED with the forward flip -- an eager arm-time store survived a
+	 * commit ABORT (and the remove retry loop makes ABORT routine), leaving
+	 * the still-second-in-chain head pointing at the holder.  NULL field
+	 * when the armed op is not a promote.
+	 */
+	struct cds_ft_inode_flag **head_parent_field;
+	struct cds_ft_inode_flag *head_parent_old;
+	struct cds_ft_inode_flag *head_parent_new;
 	bool armed;
 };
 
@@ -2267,7 +2278,7 @@ void ft_pub_rec_add_back_edge(struct cds_ft *ft, struct ft_pub_rec *rec,
  * was installed (all fused edges discarded); a retry-enabled caller unwinds
  * and re-descends.  The @txn-NULL lone-store path cannot abort (returns OK).
  */
-#define FT_REMOVE_COMMIT_REC_MAX_EDGES	9	/* <=3 structural (+back-edge) + <=5 cell/run (unsplice = 2 back-edges + deletion mark) + 1 DEL-recompact tombstone */
+#define FT_REMOVE_COMMIT_REC_MAX_EDGES	10	/* <=3 structural (+back-edge) + <=5 cell/run (unsplice = 2 back-edges + deletion mark) + 1 DEL-recompact tombstone + 1 promote head re-parent */
 static
 enum urcu_txn_status ft_remove_commit_rec(struct cds_ft *ft,
 		struct ft_pub_rec *rec,

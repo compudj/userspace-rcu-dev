@@ -1586,6 +1586,24 @@ int ft_detach_node(struct cds_ft *ft,
 						iter_node_flag, count_delta);
 					count_folded = true;
 				}
+				/*
+				 * External promote: the promoted head's back-channel
+				 * re-parent (captured by replace_ptr into @pub) rides
+				 * THIS commit so an ABORT discards it with the forward
+				 * flip.  The @commit_txn-NULL lone-edge boundary keeps
+				 * the pre-fusion timing: apply it just before the lone
+				 * forward store (single writer, cannot abort).
+				 */
+				if (pub->head_parent_field) {
+					if (commit_txn)
+						ft_flip_txn_record_reserved(commit_txn,
+							(void **) pub->head_parent_field,
+							pub->head_parent_old,
+							pub->head_parent_new);
+					else
+						rcu_assign_pointer(*pub->head_parent_field,
+							pub->head_parent_new);
+				}
 				ret = ft_remove_one_commit(ft, pub->slot,
 					pub->old_val, pub->new_val,
 					pub->state_meta,

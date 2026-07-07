@@ -732,13 +732,23 @@ int ft_popcount_node_replace_ptr(struct cds_ft *ft, const struct cds_ft_type *ty
 	 * commits it in one flip with the dead head cell's unsplice.  A delete
 	 * (NULL newptr) stores NULL and decrements nr_child in place
 	 * (reader-invisible for navigation); an external promote (non-NULL
-	 * newptr) replaces the child with the external chain head, so it wires
-	 * the promoted external's back-pointer first (parent-first) and leaves
-	 * nr_child unchanged.
+	 * newptr) replaces the child with the external chain head -- its
+	 * back-pointer re-parent is CAPTURED into @pub and committed with the
+	 * forward flip (an arm-time store survived a commit ABORT torn, with
+	 * the retrying remove leaving the still-chained head pointing at the
+	 * holder).  nr_child unchanged for a promote.
 	 */
 	if (pub) {
-		if (newptr)
-			ft_set_parent(ft, newptr, node_flag, node_flag_ptr);
+		if (newptr) {
+			struct cds_ft_node *en = (struct cds_ft_node *)
+				ft_node_ptr(newptr);
+
+			pub->head_parent_field = ft->ordered_list ?
+				&ft_ord_cell_ptr(en->prev)->parent :
+				(struct cds_ft_inode_flag **) &en->prev;
+			pub->head_parent_old = *pub->head_parent_field;
+			pub->head_parent_new = node_flag;
+		}
 		pub->slot = node_flag_ptr;
 		pub->old_val = *node_flag_ptr;
 		pub->new_val = newptr;
@@ -804,14 +814,22 @@ int ft_pigeon_node_replace_ptr(struct cds_ft *ft, const struct cds_ft_type *type
 	 * place: the pointer load is the source of truth (ft_pigeon_node_get_nth
 	 * reads node->data[n] directly and the directional scan rescans past a set
 	 * bit over a NULL slot), and a later recompact rebuilds a clean bitmap from
-	 * the occupied slots.  An external PROMOTE (non-NULL newptr) wires the
-	 * promoted external's back-pointer first (parent-first), leaves the slot
-	 * occupied and nr_child unchanged.  See the popcount variant (same
-	 * soft-delete).
+	 * the occupied slots.  An external PROMOTE (non-NULL newptr) captures the
+	 * promoted external's back-pointer re-parent into @pub -- committed WITH
+	 * the forward flip, not stored at arm time (see the popcount variant) --
+	 * and leaves the slot occupied and nr_child unchanged.
 	 */
 	if (pub) {
-		if (newptr)
-			ft_set_parent(ft, newptr, node_flag, node_flag_ptr);
+		if (newptr) {
+			struct cds_ft_node *en = (struct cds_ft_node *)
+				ft_node_ptr(newptr);
+
+			pub->head_parent_field = ft->ordered_list ?
+				&ft_ord_cell_ptr(en->prev)->parent :
+				(struct cds_ft_inode_flag **) &en->prev;
+			pub->head_parent_old = *pub->head_parent_field;
+			pub->head_parent_new = node_flag;
+		}
 		pub->slot = node_flag_ptr;
 		pub->old_val = *node_flag_ptr;
 		pub->new_val = newptr;
@@ -1562,6 +1580,7 @@ skip_copy:
 		*old_node_flag_ptr = new_node_flag;
 	if (old_node && old_node_ret)
 		*old_node_ret = old_node;
+
 
 	/*
 	 * The old node is RETIRED: the fresh copy is fully wired above and the
