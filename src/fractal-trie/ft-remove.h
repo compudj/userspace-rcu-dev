@@ -3001,9 +3001,12 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 
 	if (ret) {
 		/*
-		 * Leaf-key detach ENOMEM: nothing was published (the chain is
-		 * still live in the trie; the count undo above restored the
-		 * ancestors).  Surface the real error with a NULL out-param --
+		 * Leaf-key detach ENOMEM: nothing was published -- the chain is
+		 * still live in the trie, and the -1 count rides the commit
+		 * (ft_flip_txn_record_count_parent), so a failed/aborted commit
+		 * discarded it with the rest: no standalone pre-decrement
+		 * remains to restore (the old "count undo" is gone with the
+		 * R-fold).  Surface the real error with a NULL out-param --
 		 * the header contract -- so the caller cannot reclaim the
 		 * still-reachable chain.
 		 *
