@@ -934,10 +934,16 @@ struct cds_ft_metadata {
  * the low tag bits untouched.
  */
 static inline
+unsigned int ft_state_nr_child(uintptr_t state)
+{
+	return (unsigned int) ((state >> FT_STATE_NR_CHILD_SHIFT)
+			& FT_STATE_NR_CHILD_VALMASK);
+}
+
+static inline
 unsigned int ft_meta_nr_child(const struct cds_ft_metadata *meta)
 {
-	return (unsigned int) ((meta->state >> FT_STATE_NR_CHILD_SHIFT)
-			& FT_STATE_NR_CHILD_VALMASK);
+	return ft_state_nr_child(meta->state);
 }
 
 static inline

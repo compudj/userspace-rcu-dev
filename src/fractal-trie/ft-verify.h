@@ -442,6 +442,20 @@ int ft_verify_node_compressed(const struct cds_ft *ft, FILE *out,
 		return -1;
 	}
 	/*
+	 * FT_STATE_COPYING is a REVERSIBLE mid-copy fence: at rest (all-updater
+	 * quiescence) every copier has committed (fence consumed by the
+	 * {COPYING|s -> TOMBSTONE|s} transition) or unwound (fence cleared by
+	 * the txn wrapper's registry).  A set bit here is a leaked fence -- a
+	 * bail path that skipped ft_meta_copying_clear -- which would make
+	 * every future peer publish into this node abort forever.
+	 */
+	if (cn_meta->state & FT_STATE_COPYING) {
+		if (out)
+			fprintf(out, "ft_verify: depth %u: compressed node %p COPYING fence set at rest (leaked copy fence)\n",
+				depth, node_flag);
+		return -1;
+	}
+	/*
 	 * cn->child / nr_child bookkeeping must agree:
 	 *   nr_child == 1 implies cn->child is non-NULL (the one child);
 	 *   nr_child == 0 implies cn->child is NULL.
@@ -763,6 +777,13 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 						(unsigned int) type->max_child);
 				return -1;
 			}
+		}
+		/* Leaked COPYING fence: see the compressed-node check. */
+		if (metadata->state & FT_STATE_COPYING) {
+			if (out)
+				fprintf(out, "ft_verify: depth %u: internal node %p COPYING fence set at rest (leaked copy fence)\n",
+					depth, node_flag);
+			return -1;
 		}
 		/* Count external nodes attached to this node's metadata. */
 		if (ft_verify_no_proxy_at_rest(out, "external_nodes",

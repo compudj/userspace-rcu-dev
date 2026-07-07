@@ -131,6 +131,13 @@ struct cds_ft_inode_flag *ft_descent_step(struct cds_ft *ft, struct ft_descent *
  * ft_flip_txn_reserve); should a store still fail to grow, the OOM is sticky and
  * the commit returns a clean MEMORY_ERROR with nothing parked.
  */
+/*
+ * Upper bound of FT_STATE_COPYING fences one commit can hold: a recompact
+ * retire fences ONE node; the chain-compress fused merge fences the collapsed
+ * chain (boundary + old parent cn + old child cn = 3).
+ */
+#define FT_FLIP_TXN_MAX_COPYING	4
+
 struct ft_flip_txn {
 	struct urcu_mcas_txn *mtxn;	/* the concurrent commit engine handle:
 					 * &own (standalone txn), or the op's
@@ -141,6 +148,19 @@ struct ft_flip_txn {
 					 * §11) */
 	struct urcu_mcas_txn own;	/* backing handle for standalone txns */
 	bool reserved;			/* @mtxn pre-reserved (bounded) => infallible commit */
+	/*
+	 * FT_STATE_COPYING fence registry (MW F2, CORE_682870 fix plan): the
+	 * nodes this commit's op MARKED with the reversible copy fence.  On
+	 * commit OK the fence is consumed by the recorded state transition
+	 * {COPYING|s -> TOMBSTONE|s}; on EVERY other terminal outcome of the
+	 * wrapper -- commit ABORT / MEMORY_ERROR (ft_flip_txn_commit) or a
+	 * pre-commit bail (ft_flip_txn_destroy) -- the fence must be CLEARED
+	 * or every later peer publish into the node aborts forever.  The two
+	 * terminal paths drain this registry so no caller unwind can leak a
+	 * fence.
+	 */
+	struct cds_ft_metadata *copying[FT_FLIP_TXN_MAX_COPYING];
+	unsigned int nr_copying;
 };
 
 /*
@@ -189,6 +209,7 @@ struct ft_flip_txn *ft_flip_txn_create(void)
 					 * RCU read side; no escalation domain
 					 * under POC exclusion */
 	t->reserved = false;		/* unbounded: @mtxn grows as edges record */
+	t->nr_copying = 0;
 	return t;
 }
 
@@ -236,6 +257,7 @@ struct ft_flip_txn *ft_flip_txn_create_bounded(unsigned int cap)
 		return NULL;
 	}
 	t->reserved = true;
+	t->nr_copying = 0;
 	return t;
 }
 
@@ -275,6 +297,7 @@ struct ft_flip_txn *ft_flip_txn_create_bounded_on(struct urcu_mcas_txn *op,
 		return NULL;
 	}
 	t->reserved = true;
+	t->nr_copying = 0;
 	return t;
 }
 
@@ -346,14 +369,114 @@ static void ft_flip_txn_call_rcu_now(struct rcu_head *head,
 }
 
 /*
+ * FT_STATE_COPYING copy fence, MARK side (MW F2, Option A --
+ * fractal-trie-internal.h at the bit's definition, CORE_682870 fix plan).  A
+ * body copier (recompact retire / chain-compress collapse) CASes
+ * {clean -> |COPYING} on the node it is about to read, BEFORE the first body
+ * read: from that point every peer publish into the node fails its §4.B
+ * clean-LIVE guard at commit, so the copied body cannot go stale between the
+ * copy and the copier's own commit without SOMEONE aborting -- the copier's
+ * state record {COPYING|s -> TOMBSTONE|s} pins the whole word from mark to
+ * commit (a peer state change under the fence, e.g. a write record that
+ * captured its expected old after the mark, mismatches the copier's expected
+ * old instead: exactly one side survives).  A dirty word at the mark -- a
+ * parked proxy, a tombstone (real retire), or COPYING (single-copier
+ * exclusion) -- fails the mark: -EAGAIN, the op re-descends after the peer
+ * settles.  On success *@state_snapshot returns the CLEAN pre-mark word: the
+ * one consistent snapshot the whole copy plan (sizing, tombstone expected-old)
+ * must derive from.
+ *
+ * Residual window (accepted for this phase, closed by the engine two-phase
+ * install, F2 3/3): a peer whose clean-LIVE guard was VALIDATED before the
+ * mark but whose payload slot parks after the copier read that slot.
+ */
+static inline
+int ft_meta_copying_mark(struct cds_ft_metadata *meta,
+		uintptr_t *state_snapshot)
+{
+	uintptr_t s = CMM_LOAD_SHARED(meta->state);
+
+	if (caa_unlikely(s & (FT_STATE_PROXY | FT_STATE_TOMBSTONE |
+			FT_STATE_COPYING)))
+		return -EAGAIN;
+	if (caa_unlikely(uatomic_cmpxchg(&meta->state, s,
+			s | FT_STATE_COPYING) != s))
+		return -EAGAIN;
+	*state_snapshot = s;
+	return 0;
+}
+
+/*
+ * FT_STATE_COPYING copy fence, CLEAR side: drop ONLY the reversible fence bit,
+ * preserving every other field -- the copy was abandoned (pre-commit bail) or
+ * its commit aborted (the engine settled the state record back to its old
+ * value, COPYING included), and the node stays LIVE.  The word may transiently
+ * hold a peer's parked proxy (a doomed guard mid-install -- it validates
+ * clean-LIVE and the fence is still set -- or a peer write that will mismatch
+ * the fence-pinned value): wait for the owner to settle, then CAS.  Bounded by
+ * the peer's install/settle; the F2 3/3 help-to-terminal read will replace the
+ * wait with helping.  The CAS loop (not a blind AND) is what keeps a parked
+ * proxy POINTER from being corrupted by a bit-clear.
+ */
+static inline
+void ft_meta_copying_clear(struct cds_ft_metadata *meta)
+{
+	for (;;) {
+		uintptr_t s = CMM_LOAD_SHARED(meta->state);
+
+		if (caa_unlikely(s & FT_STATE_PROXY)) {
+			caa_cpu_relax();
+			continue;
+		}
+		/*
+		 * Only the fence owner clears COPYING, and peers preserve
+		 * foreign state bits, so the bit is still set here (NDEBUG
+		 * builds degrade to a harmless same-value CAS if it is not).
+		 */
+		assert(s & FT_STATE_COPYING);
+		if (caa_likely(uatomic_cmpxchg(&meta->state, s,
+				s & ~FT_STATE_COPYING) == s))
+			return;
+	}
+}
+
+/*
+ * Register a marked fence with the commit wrapper that owns its outcome: the
+ * two terminal paths (ft_flip_txn_commit on ABORT / MEMORY_ERROR,
+ * ft_flip_txn_destroy on a pre-commit bail) clear every registered fence, and
+ * a commit OK consumes it through the recorded {COPYING|s -> TOMBSTONE|s}
+ * transition instead.  Register only once the mark's holder can no longer
+ * clear it itself (i.e. when the op hands the outcome to the txn).
+ */
+static inline
+void ft_flip_txn_copying_register(struct ft_flip_txn *t,
+		struct cds_ft_metadata *meta)
+{
+	assert(t->nr_copying < FT_FLIP_TXN_MAX_COPYING);
+	t->copying[t->nr_copying++] = meta;
+}
+
+static inline
+void ft_flip_txn_copying_clear_all(struct ft_flip_txn *t)
+{
+	unsigned int i;
+
+	for (i = 0; i < t->nr_copying; i++)
+		ft_meta_copying_clear(t->copying[i]);
+	t->nr_copying = 0;
+}
+
+/*
  * Drop an FT flip-txn that was NOT committed (an op aborted before publishing --
  * an OOM or a no-op path).  Nothing was stored into any slot
  * (freeze-before-install), so this frees any live (uncommitted) MCAS descriptor
- * and the handle; no grace period is owed.
+ * and the handle; no grace period is owed.  Registered COPYING fences are
+ * cleared (the marked nodes stay live; nothing retires them).
  */
 static inline
 void ft_flip_txn_destroy(struct ft_flip_txn *t)
 {
+	ft_flip_txn_copying_clear_all(t);
 	if (t->mtxn->mcas && t->mtxn->mcas != URCU_TXN_ENOMEM) {
 		urcu_mcas_destroy(t->mtxn->mcas);
 		/*
@@ -399,6 +522,16 @@ enum urcu_txn_status ft_flip_txn_commit(struct cds_ft *ft,
 
 	st = urcu_txn_commit_flavor(t->mtxn, reclaim);
 	FT_TP(txn_commit, (const void *) t->mtxn, (int) st);
+	/*
+	 * COPYING fences: a committed txn transitioned each registered node
+	 * {COPYING|s -> TOMBSTONE|s} (the fence is consumed by the retire);
+	 * ABORT settled the state record back to its old value -- fence still
+	 * set -- and MEMORY_ERROR parked nothing, so both must clear the
+	 * reversible bit or the still-live nodes would fail every later peer
+	 * guard forever.
+	 */
+	if (caa_unlikely(st != URCU_TXN_STATUS_OK))
+		ft_flip_txn_copying_clear_all(t);
 	free(t);
 	return st;
 }
@@ -898,6 +1031,29 @@ void ft_flip_txn_record_tombstone(struct ft_flip_txn *t,
 
 	ft_flip_txn_record_tag(t, (void **) &meta->state,
 			(void *) old, (void *) (old | FT_STATE_TOMBSTONE),
+			FT_STATE_PROXY);
+}
+
+/*
+ * The FENCED variant for a node the op marked with ft_meta_copying_mark: the
+ * expected old is the mark's CLEAN snapshot with the fence bit -- NOT a fresh
+ * raw read -- so the commit ratifies exactly the world the copy plan was
+ * derived from (the CORE_682870 defect-1 fix: a stale plan can no longer be
+ * ratified by a coincidentally-matching late capture).  The new value drops
+ * the reversible fence and sets the one-way tombstone in the same atomic
+ * transition {COPYING|s -> TOMBSTONE|s}: tombstone semantics (commit-atomic,
+ * exactly-once retire token) are unchanged.  Any peer state change under the
+ * fence -- a re-home's PSO pair, a fused count, a foreign tombstone -- makes
+ * this record's expected old mismatch: the copier aborts and its fence is
+ * cleared by the commit wrapper's registry.
+ */
+static inline
+void ft_flip_txn_record_tombstone_copying(struct ft_flip_txn *t,
+		struct cds_ft_metadata *meta, uintptr_t state_snapshot)
+{
+	ft_flip_txn_record_tag(t, (void **) &meta->state,
+			(void *) (state_snapshot | FT_STATE_COPYING),
+			(void *) (state_snapshot | FT_STATE_TOMBSTONE),
 			FT_STATE_PROXY);
 }
 

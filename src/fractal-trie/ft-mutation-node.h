@@ -991,6 +991,34 @@ int ft_node_recompact(enum ft_recompact mode,
 	 * COPYING fence (the mark precedes the capture), not here.
 	 */
 	struct cds_ft_inode_flag *nullify_val = NULL;
+	/*
+	 * F2 COPYING fence state: set when this recompact retires a LIVE
+	 * published node (@retire_txn arm) -- @fence_state is the clean
+	 * pre-mark state word, the ONE snapshot the whole copy plan (type
+	 * sizing, tombstone expected-old) derives from.
+	 */
+	uintptr_t fence_state = 0;
+	bool fenced = false;
+
+	/*
+	 * F2 COPYING fence, MARK (doc at ft_meta_copying_mark): a live-retire
+	 * copy fences the old node BEFORE any body/state read below -- the
+	 * sizing nr_child loads, the (parent, offset) inherit, the external-
+	 * head snapshot, and the copy loops all read under the fence, and the
+	 * commit's state record {COPYING|s -> TOMBSTONE|s} pins the word so a
+	 * peer publish that slips a state change under the fence aborts one of
+	 * the two.  A dirty mark (peer proxy / concurrent copier / real
+	 * retire) bails to the op's retry before anything is allocated.  The
+	 * build-invisible (@cluster_leaf) and legacy no-txn arms copy nodes no
+	 * peer publishes into (unpublished cluster / retained exclusion), so
+	 * they stay unfenced.
+	 */
+	if (retire_txn && !cluster_leaf && metadata && old_node) {
+		ret = ft_meta_copying_mark(metadata, &fence_state);
+		if (ret)
+			return ret;
+		fenced = true;
+	}
 
 	/*
 	 * Need to find nearest type index even for ADD_SAME, so that
@@ -1049,11 +1077,17 @@ int ft_node_recompact(enum ft_recompact mode,
 		if (retire_txn && !cluster_leaf && metadata &&
 				!ft_flip_txn_reserve_extra(retire_txn,
 					2 * (ft_meta_nr_child_load(metadata) + 1)
-					+ 1))
+					+ 1)) {
+			if (fenced)
+				ft_meta_copying_clear(metadata);
 			return -ENOMEM;
+		}
 		new_node = alloc_cds_ft_node(ft, new_type, &new_metadata);
-		if (!new_node)
+		if (!new_node) {
+			if (fenced)
+				ft_meta_copying_clear(metadata);
 			return -ENOMEM;
+		}
 
 		new_node_flag = ft_node_flag(new_node, new_type_index);
 
@@ -1096,6 +1130,8 @@ int ft_node_recompact(enum ft_recompact mode,
 				 * yet -- bail and retry after it settles.
 				 */
 				free_cds_ft_node_unpublished(ft, new_node);
+				if (fenced)
+					ft_meta_copying_clear(metadata);
 				return -EAGAIN;
 			}
 			ft_metadata_set_external_nodes(new_node_flag,
@@ -1127,6 +1163,8 @@ int ft_node_recompact(enum ft_recompact mode,
 					rcu_dereference(*bc_slot);
 				if (caa_unlikely(ft_node_flip_proxy(bc_old))) {
 					free_cds_ft_node_unpublished(ft, new_node);
+					if (fenced)
+						ft_meta_copying_clear(metadata);
 					return -EAGAIN;
 				}
 				ft_flip_txn_record_reserved(retire_txn, bc_slot,
@@ -1216,6 +1254,25 @@ int ft_node_recompact(enum ft_recompact mode,
 				ret = -EAGAIN;
 				goto abandon_fresh;
 			}
+			/*
+			 * Fenced ADD: the descent chose @n because the old
+			 * node had no child there -- a live child at @n now
+			 * means a peer COMMITTED an insert at this byte
+			 * between the descent's read and the fence mark (the
+			 * one window the state pin cannot cover: the mark
+			 * snapshot already includes the peer's count).  The
+			 * blind set_nth below would overwrite the peer's
+			 * whole subtree; re-descend and dive into it instead.
+			 * Never fires single-writer (the descent's read
+			 * holds).
+			 */
+			if (caa_unlikely(fenced &&
+					(mode == FT_RECOMPACT_ADD_NEXT ||
+					 mode == FT_RECOMPACT_ADD_SAME) &&
+					v == n)) {
+				ret = -EAGAIN;
+				goto abandon_fresh;
+			}
 			if (mode == FT_RECOMPACT_DEL && nullify_val == iter)
 				continue;
 			if (new_type->popcount_2l)
@@ -1265,6 +1322,14 @@ int ft_node_recompact(enum ft_recompact mode,
 				continue;
 			/* Copied-slot latch: see the popcount loop above. */
 			if (caa_unlikely(ft_node_flip_proxy(iter))) {
+				ret = -EAGAIN;
+				goto abandon_fresh;
+			}
+			/* Fenced ADD occupied byte: see the popcount loop. */
+			if (caa_unlikely(fenced &&
+					(mode == FT_RECOMPACT_ADD_NEXT ||
+					 mode == FT_RECOMPACT_ADD_SAME) &&
+					(uint8_t) i == n)) {
 				ret = -EAGAIN;
 				goto abandon_fresh;
 			}
@@ -1508,7 +1573,20 @@ skip_copy:
 	 * a caller not yet routing its retire through a txn).
 	 */
 	if (old_node && metadata) {
-		if (retire_txn)
+		if (fenced) {
+			/*
+			 * Fenced retire: the tombstone's expected old is the
+			 * MARK snapshot -- the commit ratifies exactly the
+			 * state the copy was planned against -- and the fence
+			 * hands its outcome to @retire_txn (commit OK consumes
+			 * it via the {COPYING|s -> TOMBSTONE|s} transition;
+			 * every other terminal outcome clears it through the
+			 * wrapper's registry).
+			 */
+			ft_flip_txn_record_tombstone_copying(retire_txn,
+					metadata, fence_state);
+			ft_flip_txn_copying_register(retire_txn, metadata);
+		} else if (retire_txn)
 			ft_flip_txn_record_tombstone(retire_txn, metadata);
 		else
 			ft_meta_tombstone_set_flip(metadata);
@@ -1520,15 +1598,18 @@ end:
 
 abandon_fresh:
 	/*
-	 * Latch bail (copied slot or DEL-target capture): the fresh body
-	 * never became peer-visible -- nothing recorded into @rec, forward
-	 * slot untouched, the retire_txn arm's back-channel edge is a RECORD
-	 * discarded with the abandoned attempt, and the plain-store arm's
-	 * prev publish is deferred past this point.  Reclaim the never-
-	 * escaped copy immediately; -EAGAIN re-descends after the peer
-	 * settles.
+	 * Latch bail (copied slot, DEL-target capture, or a fenced ADD's
+	 * occupied byte): the fresh body never became peer-visible -- nothing
+	 * recorded into @rec, forward slot untouched, the retire_txn arm's
+	 * back-channel edge is a RECORD discarded with the abandoned attempt,
+	 * and the plain-store arm's prev publish is deferred past this point.
+	 * Reclaim the never-escaped copy immediately and lift the copy fence
+	 * (not yet registered with @retire_txn -- registration happens only on
+	 * the success path above); -EAGAIN re-descends after the peer settles.
 	 */
 	free_cds_ft_node_unpublished(ft, new_node);
+	if (fenced)
+		ft_meta_copying_clear(metadata);
 	return ret;
 }
 

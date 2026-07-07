@@ -371,6 +371,12 @@ void ft_detach_freeze_orphans(struct cds_ft *ft, struct ft_flip_txn *txn,
  * this runs as the removal's commit, not a second flip after it).  Both are
  * stable across the removal: the merge never rebuilds the parent or the
  * surviving child.
+ * @plan_nr_child: the boundary's child count the caller's plan assumed (2 for
+ * the shape-D fold that retires one of the two, 1 for the post-removal
+ * collapses) -- re-validated against the boundary's COPYING-fence snapshot
+ * together with the @surviving_byte -> @surviving_child mapping, so a peer
+ * commit between the caller's derivation and the fence mark surfaces as
+ * -EAGAIN instead of a merge built from a stale plan.
  * @dead_cell / @run: the dead key's ordered-list unsplice, folded into the
  * merge flip (NULL when the ordered list is off / no fusion).
  * @orphans / @nr_orphans / @trailing_orphan: an optional orphan chain the SAME
@@ -380,14 +386,17 @@ void ft_detach_freeze_orphans(struct cds_ft *ft, struct ft_flip_txn *txn,
  * callers (no extra chain retired by their flip); the txn reservation grows to
  * cover them.
  *
- * Returns 0 when the merge committed; -ENOMEM when @new_cn could not be
- * allocated (NOTHING was published -- the caller aborts the whole removal,
- * structure untouched); a positive value when the merge does not apply
- * because the merged length would exceed the compressed-node bound (caller
- * falls back to the non-fused removal, leaving the boundary 1-child internal
- * as before).  The replaced nodes (@boundary, @parent_cn, @child_cn) are
- * enumerated explicitly at the commit so a future MCAS can fold each one's
- * sequence counter into the same transaction.
+ * Returns 0 when the merge committed; -ENOMEM when the txn or @new_cn could
+ * not be allocated (NOTHING was published -- the caller aborts the whole
+ * removal, structure untouched); -EAGAIN on a peer conflict (a dirty COPYING
+ * mark, a failed plan re-validation, a parked latch in a captured slot, or a
+ * commit ABORT -- nothing installed, every fence cleared, the caller's retry
+ * re-descends); a positive value when the merge does not apply because the
+ * merged length would exceed the compressed-node bound (caller falls back to
+ * the non-fused removal, leaving the boundary 1-child internal as before).
+ * The replaced nodes (@boundary, @parent_cn, @child_cn) are enumerated
+ * explicitly at the commit so a future MCAS can fold each one's sequence
+ * counter into the same transaction.
  */
 static
 int ft_chain_compress_fused(struct cds_ft *ft,
@@ -396,6 +405,7 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		struct cds_ft_inode_flag **slot_ptr,
 		struct cds_ft_inode_flag *surviving_child,
 		uint8_t surviving_byte,
+		unsigned int plan_nr_child,
 		struct ft_ord_cell *dead_cell,
 		struct ft_detach_run *run,
 		struct cds_ft_inode_flag **orphans,
@@ -405,7 +415,6 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		long count_delta,
 		unsigned int count_reserve)
 {
-	bool parent_compressed, child_compressed;
 	struct cds_ft_compressed_node *parent_cn, *child_cn;
 	struct cds_ft_metadata *parent_cn_meta;
 	unsigned int parent_len, child_len, merged_len;
@@ -414,26 +423,11 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 	struct cds_ft_inode_flag *new_cn_flag;
 	struct cds_ft_inode_flag **publish_slot;
 	struct cds_ft_inode_flag *publish_parent;
+	struct cds_ft_inode_flag *iter_parent;
 	struct ft_flip_txn *txn;
+	uintptr_t s_iter, s_pcn = 0, s_ccn = 0;
 
 	assert(surviving_child);
-	parent_compressed = ft_node_compressed(iter_meta->parent);
-	child_compressed = ft_node_compressed(surviving_child);
-	parent_cn = parent_compressed
-		? ft_compressed_node_ptr(iter_meta->parent)
-		: NULL;
-	parent_cn_meta = parent_cn
-		? cds_ft_item_to_metadata((struct cds_ft_inode *) parent_cn)
-		: NULL;
-	child_cn = child_compressed
-		? ft_compressed_node_ptr(surviving_child)
-		: NULL;
-	parent_len = parent_cn ? parent_cn->len : 0;
-	child_len = child_cn ? child_cn->len : 0;
-	merged_len = parent_len + 1 + child_len;
-
-	if (merged_len > FT_SKIP_LEN_MAX)
-		return 1;	/* merge does not apply: caller falls back */
 	/*
 	 * Pre-reserve the commit flip-txn BEFORE any pre-flip side-effect.  The
 	 * surviving child's (parent, parent-slot-offset) pair is RECORDED into
@@ -444,7 +438,11 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 	 * allocating, so the only OOM points are this reservation and the new_cn
 	 * allocation, both BEFORE the build's first side-effect (a concurrent-
 	 * writer ABORT surfaces as -EAGAIN with new_cn reclaimed, see the commit
-	 * site below).
+	 * site below).  Created FIRST (its sizing needs only the caller's
+	 * arguments) so the COPYING fences below can register with it: every
+	 * bail from here on is a ft_flip_txn_destroy or the commit itself, and
+	 * both terminal paths drain the fence registry -- no unwind can leak a
+	 * fence.
 	 */
 	txn = ft_flip_txn_create_bounded(FT_REMOVE_COMMIT_REC_MAX_EDGES + 3
 			+ 1 /* §4.B parent guard */
@@ -454,6 +452,83 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 			+ count_reserve /* nr_keys walk from publish_parent (R3 fold) */);
 	if (!txn)
 		return -ENOMEM;	/* nothing touched: caller aborts */
+	/*
+	 * F2 COPYING fence (doc at ft_meta_copying_mark): fence the whole
+	 * collapsed chain -- the boundary and the two compressed nodes whose
+	 * bodies the merged node subsumes -- BEFORE trusting any of their
+	 * mutable state.  Each mark's clean snapshot feeds that node's
+	 * tombstone expected-old at the commit, so a peer state change under
+	 * any fence aborts exactly one side.  A dirty mark (peer proxy, a
+	 * concurrent copier, a real retire -- e.g. a peer already re-published
+	 * the surviving child and tombstoned the old copy this plan captured)
+	 * bails to the caller's retry.
+	 */
+	if (ft_meta_copying_mark(iter_meta, &s_iter)) {
+		ft_flip_txn_destroy(txn);
+		return -EAGAIN;
+	}
+	ft_flip_txn_copying_register(txn, iter_meta);
+	/*
+	 * Re-validate the caller's PRE-fence plan under the fence: the
+	 * boundary must still have the child population the plan was derived
+	 * from (@plan_nr_child: 2 for the shape-D fold that retires one of the
+	 * two, 1 for the post-removal collapses), and @surviving_byte must
+	 * still map to @surviving_child -- a peer commit between the caller's
+	 * derivation and the mark (an insert into the boundary, a child
+	 * republish) is exactly what the mark snapshot cannot vouch for.
+	 * Never fires single-writer.
+	 */
+	if (caa_unlikely(ft_state_nr_child(s_iter) != plan_nr_child ||
+			ft_node_get_nth(ft, iter_node_flag, NULL,
+				surviving_byte, FT_PF_NONE)
+					!= surviving_child)) {
+		ft_flip_txn_destroy(txn);
+		return -EAGAIN;
+	}
+	/*
+	 * ONE snapshot of the boundary's parent (latch-checked): the F1
+	 * discipline -- a peer's parked flip proxy must be neither classified
+	 * nor embedded.
+	 */
+	iter_parent = (struct cds_ft_inode_flag *)
+		rcu_dereference(iter_meta->parent);
+	if (caa_unlikely(ft_node_flip_proxy(iter_parent))) {
+		ft_flip_txn_destroy(txn);
+		return -EAGAIN;
+	}
+	parent_cn = ft_node_compressed(iter_parent)
+		? ft_compressed_node_ptr(iter_parent)
+		: NULL;
+	parent_cn_meta = parent_cn
+		? cds_ft_item_to_metadata((struct cds_ft_inode *) parent_cn)
+		: NULL;
+	if (parent_cn_meta && ft_meta_copying_mark(parent_cn_meta, &s_pcn)) {
+		ft_flip_txn_destroy(txn);
+		return -EAGAIN;
+	}
+	if (parent_cn_meta)
+		ft_flip_txn_copying_register(txn, parent_cn_meta);
+	child_cn = ft_node_compressed(surviving_child)
+		? ft_compressed_node_ptr(surviving_child)
+		: NULL;
+	if (child_cn && ft_meta_copying_mark(
+			cds_ft_item_to_metadata((struct cds_ft_inode *) child_cn),
+			&s_ccn)) {
+		ft_flip_txn_destroy(txn);
+		return -EAGAIN;
+	}
+	if (child_cn)
+		ft_flip_txn_copying_register(txn,
+			cds_ft_item_to_metadata((struct cds_ft_inode *) child_cn));
+	parent_len = parent_cn ? parent_cn->len : 0;
+	child_len = child_cn ? child_cn->len : 0;
+	merged_len = parent_len + 1 + child_len;
+
+	if (merged_len > FT_SKIP_LEN_MAX) {
+		/* Merge does not apply: caller falls back (fences cleared). */
+		ft_flip_txn_destroy(txn);
+		return 1;
+	}
 	new_cn = alloc_compressed_node(ft, merged_len, &new_cn_meta);
 	if (!new_cn) {
 		ft_flip_txn_destroy(txn);	/* PREPARE state: no grace period */
@@ -506,14 +581,18 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 	if (parent_cn) {
 		/*
 		 * Replace parent_cn at its own slot in the grandparent.
-		 * Inherit grandparent context from parent_cn.
+		 * Inherit grandparent context from parent_cn as ONE consistent
+		 * (parent, slot) snapshot (Phase 4.3 atomic re-home): a peer
+		 * re-homing parent_cn commits its parent and state-word offset
+		 * atomically, so two raw reads could tear across that commit.
 		 */
-		new_cn_meta->parent = parent_cn_meta->parent;
-		publish_parent = parent_cn_meta->parent;
-		publish_slot = ft_get_parent_slot(parent_cn_meta, ft);
+		publish_slot = ft_resolve_parent_slot(parent_cn_meta, ft,
+			&publish_parent);
+		new_cn_meta->parent = publish_parent;
 	} else {
-		new_cn_meta->parent = iter_meta->parent;
-		publish_parent = iter_meta->parent;
+		/* The boundary's own latch-checked parent snapshot above. */
+		new_cn_meta->parent = iter_parent;
+		publish_parent = iter_parent;
 		publish_slot = slot_ptr;
 	}
 	ft_set_parent_slot(new_cn_meta, new_cn_meta->parent, publish_slot);
@@ -553,14 +632,20 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		 * gets its one-way LIVE->DEAD tombstone RECORDED INTO @txn (the +3
 		 * reserved above), so the freeze flips ATOMICALLY with the commit
 		 * that unlinks it: an aborted commit leaves every node live.  A
-		 * no-op under one writer.
+		 * no-op under one writer.  All three are FENCED (marked COPYING
+		 * above), so each expected old is its mark's clean snapshot: the
+		 * commit ratifies exactly the chain state this merge was built
+		 * from, and {COPYING|s -> TOMBSTONE|s} consumes the fence.
 		 */
-		ft_flip_txn_record_tombstone(txn, iter_meta);
+		ft_flip_txn_record_tombstone_copying(txn, iter_meta, s_iter);
 		if (parent_cn)
-			ft_flip_txn_record_tombstone(txn, parent_cn_meta);
+			ft_flip_txn_record_tombstone_copying(txn, parent_cn_meta,
+				s_pcn);
 		if (child_cn)
-			ft_flip_txn_record_tombstone(txn, cds_ft_item_to_metadata(
-				(struct cds_ft_inode *) child_cn));
+			ft_flip_txn_record_tombstone_copying(txn,
+				cds_ft_item_to_metadata(
+					(struct cds_ft_inode *) child_cn),
+				s_ccn);
 		ft_detach_freeze_orphans(ft, txn, orphans, nr_orphans,
 			trailing_orphan);
 		/*
@@ -628,7 +713,8 @@ void ft_canonicalize_chain_compress(struct cds_ft *ft,
 	if (!surviving_child)
 		return;
 	(void) ft_chain_compress_fused(ft, iter_node_flag, iter_meta,
-		slot_ptr, surviving_child, surviving_byte, NULL, NULL,
+		slot_ptr, surviving_child, surviving_byte,
+		1 /* already-committed 1-child boundary */, NULL, NULL,
 		NULL, 0, NULL, NULL, 0 /* count-neutral canonicalize */, 0);
 }
 #endif
@@ -1321,7 +1407,9 @@ int ft_detach_node(struct cds_ft *ft,
 					int cret = ft_chain_compress_fused(ft,
 						iter_node_flag, bmeta,
 						detach_parent_flag_ptr,
-						s_child, s_byte, fuse_cell, run,
+						s_child, s_byte,
+						2 /* shape-D: survivor + the child this commit detaches */,
+						fuse_cell, run,
 						to_free, nr_to_free,
 						trailing_skip_cn_flag, freeze_leaf,
 						count_delta,
@@ -2329,7 +2417,9 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 				cret = ft_chain_compress_fused(ft,
 					holder_flag, holder_meta,
 					ft_get_parent_slot(holder_meta, ft),
-					s_child, s_byte, fuse_cell, NULL,
+					s_child, s_byte,
+					1 /* sole body child; the removed entry is external */,
+					fuse_cell, NULL,
 					NULL, 0, NULL, node,
 					-1, ft->rank_stats ? key_len + 1 : 0);
 
@@ -2865,6 +2955,7 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 					holder_flag, holder_meta,
 					ft_get_parent_slot(holder_meta, ft),
 					s_child, s_byte,
+					1 /* sole body child; the removed entry is external */,
 					ft->ordered_list ? dead_cell : NULL,
 					NULL, NULL, 0, NULL, NULL,
 					-1, ft->rank_stats ? key_len + 1 : 0);
