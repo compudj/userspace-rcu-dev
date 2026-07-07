@@ -1662,15 +1662,44 @@ int ft_ord_cell_flip_try(struct cds_ft *ft, struct ft_ord_cell_edge *edges,
 }
 
 /*
+ * Per-op ON-STACK scratch iterator for the writer-side splice-position
+ * searches.  These used to run on a single per-trie scratch iterator
+ * (ft->ord_cell_scratch_iter, "writers are serialized") -- under Phase-4.3
+ * multi-writer, concurrent inserts' pred searches clobbered each other's
+ * iter_key/cursor MID-DESCENT, producing internally-consistent but key-order
+ * wrong pred/succ brackets (the ord-cell mis-order family; trace-proven: a
+ * search's query bytes mutated to a peer's key between its compressed-node
+ * compare and its going-up walk).  An on-stack iterator is private by
+ * construction.  Layout mirrors cds_ft_iter_create: header + ordinal-key
+ * buffer + FT_KEY_READABLE_PAD tail so the descent's wide loads stay in
+ * bounds.  Header-only zeroing: set_key fills the key bytes and lengths.
+ */
+struct ft_stack_iter {
+	struct cds_ft_iter it;
+	uint8_t key_buf[FT_MAX_KEY_LEN + FT_KEY_READABLE_PAD];
+};
+
+static inline
+struct cds_ft_iter *ft_stack_iter_init(struct ft_stack_iter *si,
+		struct cds_ft *ft)
+{
+	memset(&si->it, 0, sizeof(si->it));
+	si->it.ft = ft;
+	si->it.cache_mode = CDS_FT_ITER_CACHED;
+	return &si->it;
+}
+
+/*
  * Find the cell of the in-order predecessor (mode LT) / successor (mode GT)
- * of @key via the eager relational descent on the writer's cell scratch
- * iterator.  Returns NULL when none exists (@key is the new minimum/maximum).
+ * of @key via the eager relational descent on a private on-stack iterator.
+ * Returns NULL when none exists (@key is the new minimum/maximum).
  */
 static
 struct ft_ord_cell *ft_ord_cell_find_rel(struct cds_ft *ft, const uint8_t *key,
 		size_t key_len, enum ft_lookup_inequality mode)
 {
-	struct cds_ft_iter *it = ft->ord_cell_scratch_iter;
+	struct ft_stack_iter si;
+	struct cds_ft_iter *it = ft_stack_iter_init(&si, ft);
 	struct cds_ft_node *head;
 
 	if (cds_ft_iter_set_key(it, key, key_len) != CDS_FT_STATUS_OK)
@@ -1705,13 +1734,22 @@ struct ft_ord_cell *ft_ord_cell_find_rel(struct cds_ft *ft, const uint8_t *key,
  * A compressed/skip-compressed holder makes the impl fall back to a root
  * re-descent internally (correctness preserved, no descent saved for that key).
  */
+/*
+ * Returns 0 with *@pred_ret = the predecessor cell (NULL = the key is the
+ * new minimum), or -EAGAIN on an INTERNAL failure (iterator setup / lookup
+ * machinery error).  The two used to be conflated in a NULL return: an
+ * internal failure then read as "new minimum" and spliced the cell at the
+ * list head (the sentinel-splice mis-order class).
+ */
 static
-struct ft_ord_cell *ft_ord_cell_find_pred_from_head(struct cds_ft *ft,
+int ft_ord_cell_find_pred_from_head(struct cds_ft *ft,
 		const uint8_t *key, size_t key_len, struct ft_ord_cell *cell,
-		bool from_root)
+		bool from_root, struct ft_ord_cell **pred_ret)
 {
-	struct cds_ft_iter *it = ft->ord_cell_scratch_iter;
+	struct ft_stack_iter si;
+	struct cds_ft_iter *it = ft_stack_iter_init(&si, ft);
 	struct cds_ft_node *pred_head;
+	enum cds_ft_status s;
 
 	/*
 	 * Write the search key into iter_key (set_key clears cache_valid/node and
@@ -1732,9 +1770,10 @@ struct ft_ord_cell *ft_ord_cell_find_pred_from_head(struct cds_ft *ft,
 	 * reachable and consistent.  Costs one extra descent, on the split path
 	 * only.
 	 */
+	*pred_ret = NULL;
 	it->node = NULL;
 	if (cds_ft_iter_set_key(it, key, key_len) != CDS_FT_STATUS_OK)
-		return NULL;
+		return -EAGAIN;	/* internal failure, NOT "new minimum" */
 	if (!from_root) {
 		it->node = cell->node;
 		it->cache_valid = true;
@@ -1742,13 +1781,24 @@ struct ft_ord_cell *ft_ord_cell_find_pred_from_head(struct cds_ft *ft,
 		it->prefix_len = 0;
 		it->path_len = it->key_len + 1;
 	}
-	if (cds_ft_lookup_inequality_impl(ft, it, FT_LOOKUP_LT,
-			FT_LOOKUP_LIMIT_NONE, false, !from_root) != CDS_FT_STATUS_OK)
-		return NULL;
+	s = cds_ft_lookup_inequality_impl(ft, it, FT_LOOKUP_LT,
+			FT_LOOKUP_LIMIT_NONE, false, !from_root);
+	/*
+	 * Genuine "no predecessor" arrives as NOT_FOUND with no landed node
+	 * (every ft_ineq_descend terminal pairs status with node: OK iff a
+	 * node landed).  Anything else -- a real error, or the
+	 * impossible-by-code OK-with-no-node -- is a lookup-machinery
+	 * inconsistency and MUST NOT read as "new minimum".
+	 */
+	if (s == CDS_FT_STATUS_NOT_FOUND)
+		return 0;	/* new minimum: *pred_ret stays NULL */
+	if (s != CDS_FT_STATUS_OK)
+		return -EAGAIN;
 	pred_head = cds_ft_iter_node(it);
 	if (!pred_head)
-		return NULL;
-	return ft_ord_cell_ptr(rcu_dereference(pred_head->prev));
+		return -EAGAIN;	/* OK without a node: defensive, never a pred claim */
+	*pred_ret = ft_ord_cell_ptr(rcu_dereference(pred_head->prev));
+	return 0;
 }
 
 /*

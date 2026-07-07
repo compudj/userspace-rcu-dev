@@ -1392,13 +1392,6 @@ struct cds_ft {
 	 */
 	struct urcu_txn_domain txn_domain;
 
-	/*
-	 * Writer-side scratch iterator for ordinal-cell predecessor discovery
-	 * (ft_ord_cell_find_pred_from_head).  Allocated eagerly in
-	 * cds_ft_create when the group enables the ordered list, reused across
-	 * mutations (writers are serialized).  Destroyed in cds_ft_destroy.
-	 */
-	struct cds_ft_iter *ord_cell_scratch_iter;
 
 	/*
 	 * Per-trie circular sentinel of the ordinal-cell list.  The list is a

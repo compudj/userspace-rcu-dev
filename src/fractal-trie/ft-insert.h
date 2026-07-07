@@ -259,8 +259,10 @@ enum urcu_txn_status ft_insert_one_commit(struct cds_ft *ft, const uint8_t *key,
 		 *     (the parked external_nodes resolves to "no head"), no live re-parent.
 		 * TODO(perf): the from-root cases re-descend; revisit if they show up hot.
 		 */
-		pred = ft_ord_cell_find_pred_from_head(ft, key, key_len, cell,
-			ic->live_child != NULL || !ic->publish_to_parent);
+		if (ft_ord_cell_find_pred_from_head(ft, key, key_len, cell,
+				ic->live_child != NULL || !ic->publish_to_parent,
+				&pred) < 0)
+			goto splice_conflict;
 		/*
 		 * ORDER-INTENT capture + confirm (concurrent writers): the search
 		 * decided "@cell belongs between @pred and @pred's successor" by
@@ -280,8 +282,10 @@ enum urcu_txn_status ft_insert_one_commit(struct cds_ft *ft, const uint8_t *key,
 		 */
 		succ0 = ft_ord_cell_resolve_ord(pred ?
 			&pred->lnode.next : &ft->ord_sentinel.node.next);
-		pred2 = ft_ord_cell_find_pred_from_head(ft, key, key_len, cell,
-			ic->live_child != NULL || !ic->publish_to_parent);
+		if (ft_ord_cell_find_pred_from_head(ft, key, key_len, cell,
+				ic->live_child != NULL || !ic->publish_to_parent,
+				&pred2) < 0)
+			goto splice_conflict;
 		/*
 		 * Splice @cell between @pred and @succ0 via the composable op,
 		 * recorded straight into the structural commit txn (FT's type-7
@@ -309,16 +313,24 @@ enum urcu_txn_status ft_insert_one_commit(struct cds_ft *ft, const uint8_t *key,
 		 * ABORT path re-descend; age the handle first, exactly as a real
 		 * commit ABORT ages it.
 		 */
-		if (pred2 != pred ||
-		    urcu_txn_list_insert_between_prepare(ft_flip_txn_handle(ic->txn),
-				ft_ord_cell_lnode(cell), pred_lnode,
-				ft_ord_cell_lnode(succ0)) < 0) {
+		{
+			int prep_ret = -9999;
+
+			if (pred2 == pred) {
+				prep_ret = urcu_txn_list_insert_between_prepare(
+					ft_flip_txn_handle(ic->txn),
+					ft_ord_cell_lnode(cell), pred_lnode,
+					ft_ord_cell_lnode(succ0));
+			}
+			if (pred2 != pred || prep_ret < 0) {
+splice_conflict:
 			ft_free_unpublished_split_cluster(ft, ic->created,
 				ic->nr_created);
 			urcu_txn_conflict(ft_flip_txn_handle(ic->txn));
 			ft_flip_txn_destroy(ic->txn);
 			ic->txn = NULL;
 			return URCU_TXN_STATUS_ABORT;
+			}
 		}
 	}
 

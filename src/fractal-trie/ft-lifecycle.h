@@ -742,20 +742,6 @@ enum cds_ft_status cds_ft_create(struct cds_ft_group *ft_group,
 	ft->root = ft_node_flag(root_node, 0);
 	FT_TP(root_publish, (const void *) ft, (const void *) ft->root);
 
-	/*
-	 * Ordinal-cell list enabled: eagerly allocate the writer-side scratch
-	 * iterator used for cell predecessor discovery
-	 * (ft_ord_cell_find_pred_from_head).  The ordinal-cell list sentinel was
-	 * already inited (empty) above.
-	 */
-	if (ft_group->ordered_list_set &&
-	    cds_ft_iter_create(ft, &ft->ord_cell_scratch_iter) != CDS_FT_STATUS_OK) {
-		free_cds_ft_node_unpublished(ft, root_node);
-		free(ft);
-		*result_ft = NULL;
-		return CDS_FT_STATUS_MEMORY_ERROR;
-	}
-
 	uatomic_inc(&ft_group->nr_ft_instances, CMM_RELAXED);
 	*result_ft = ft;
 	FT_TP(ft_create, (const void *) ft, (const void *) ft_group);
@@ -801,8 +787,6 @@ void cds_ft_destroy(struct cds_ft *ft)
 	 * runs in cds_ft_group_destroy, once all tries have drained.
 	 */
 	flavor->barrier();
-	if (ft->ord_cell_scratch_iter)
-		cds_ft_iter_destroy(ft->ord_cell_scratch_iter);
 	uatomic_dec(&ft->group->nr_ft_instances, CMM_RELAXED);
 	free(ft);
 }
