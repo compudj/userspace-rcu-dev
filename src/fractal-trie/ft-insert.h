@@ -155,11 +155,12 @@ void ft_insert_abort_cb(void *arg)
  * the window where the head was tree-reachable (via the re-parented child) but
  * not yet in the ordered list.
  *
- * The slot-offset / incoming-byte bookkeeping is set NOW, for the new parent: a
- * reader gated at the OLD parent -- always the compressed node being split, so
- * compressed -- skips incoming_byte, hence the early write is unobservable
- * until the commit makes the (possibly internal) new parent current.  Records
- * the parent-field edge (old -> @new_parent) into @txn; the commit settles it.
+ * For a metadata-bearing child the (parent, slot-offset) bookkeeping rides
+ * @txn as a CO-COMMITTED pair (ft_reparent_record_meta): parent pointer via a
+ * structural edge, offset via an FT_STATE_PROXY state edge -- so a commit
+ * ABORT discards BOTH and the live child never carries a torn (old parent,
+ * new-cluster offset) pair.  incoming_byte stays a plain same-value store
+ * (key-invariant re-home).  External heads carry only the parent edge.
  */
 static
 void ft_park_live_parent_edge(struct cds_ft *ft,
@@ -193,9 +194,22 @@ void ft_park_live_parent_edge(struct cds_ft *ft,
 		meta = cds_ft_item_to_metadata(ft_node_ptr(child));
 
 	if (meta) {
-		ft_set_parent_slot(meta, new_parent, slot);
-		field = &meta->parent;
-	} else if (ft->ordered_list) {
+		/*
+		 * Metadata-bearing child: the (parent, slot-offset) pair rides
+		 * @txn CO-COMMITTED (ft_reparent_record_meta) instead of an
+		 * eager ft_set_parent_slot + parent-only record.  The eager
+		 * offset store was unobservable in flight (readers gated at the
+		 * OLD parent, always compressed here, skip incoming_byte) but
+		 * SURVIVED a commit ABORT: the discarded parent record left the
+		 * live child with (old parent, new-cluster offset) -- a torn
+		 * pair feeding ft_resolve_parent_slot / the split (parent, slot)
+		 * guards after the fresh cluster was freed, under the MW retry
+		 * loop that makes ABORT routine.
+		 */
+		ft_reparent_record_meta(txn, meta, new_parent, slot);
+		return;
+	}
+	if (ft->ordered_list) {
 		/*
 		 * External head, ordered list ON: its parent lives in the cell
 		 * carried by node->prev.
@@ -313,25 +327,19 @@ enum urcu_txn_status ft_insert_one_commit(struct cds_ft *ft, const uint8_t *key,
 		 * ABORT path re-descend; age the handle first, exactly as a real
 		 * commit ABORT ages it.
 		 */
-		{
-			int prep_ret = -9999;
-
-			if (pred2 == pred) {
-				prep_ret = urcu_txn_list_insert_between_prepare(
-					ft_flip_txn_handle(ic->txn),
-					ft_ord_cell_lnode(cell), pred_lnode,
-					ft_ord_cell_lnode(succ0));
-			}
-			if (pred2 != pred || prep_ret < 0) {
+		if (pred2 == pred &&
+		    urcu_txn_list_insert_between_prepare(ft_flip_txn_handle(ic->txn),
+				ft_ord_cell_lnode(cell), pred_lnode,
+				ft_ord_cell_lnode(succ0)) >= 0)
+			goto spliced;
 splice_conflict:
-			ft_free_unpublished_split_cluster(ft, ic->created,
-				ic->nr_created);
-			urcu_txn_conflict(ft_flip_txn_handle(ic->txn));
-			ft_flip_txn_destroy(ic->txn);
-			ic->txn = NULL;
-			return URCU_TXN_STATUS_ABORT;
-			}
-		}
+		ft_free_unpublished_split_cluster(ft, ic->created,
+			ic->nr_created);
+		urcu_txn_conflict(ft_flip_txn_handle(ic->txn));
+		ft_flip_txn_destroy(ic->txn);
+		ic->txn = NULL;
+		return URCU_TXN_STATUS_ABORT;
+spliced:;
 	}
 
 	/*
@@ -488,10 +496,13 @@ int ft_insert_commit_arm(struct cds_ft *ft, struct ft_insert_commit *ic,
 	 * the in-place external-head park holder; §4.B validate);
 	 * + @count_edges nr_keys count edges (rank-stats-ON count fold), one per
 	 * STABLE ancestor from the count base to the root -- sized by the caller to
-	 * the ACTUAL descent depth (0 when the shape does not fold its count).
+	 * the ACTUAL descent depth (0 when the shape does not fold its count);
+	 * + 1 for the live re-parent's paired state edge (ft_reparent_record_meta
+	 * records parent AND slot-offset, two records, when the parked live child
+	 * bears metadata).
 	 */
-	ic->txn = ic->op ? ft_flip_txn_create_bounded_on(ic->op, 12 + count_edges) :
-			ft_flip_txn_create_bounded(12 + count_edges);
+	ic->txn = ic->op ? ft_flip_txn_create_bounded_on(ic->op, 13 + count_edges) :
+			ft_flip_txn_create_bounded(13 + count_edges);
 	if (!ic->txn)
 		return -ENOMEM;
 	return 0;
