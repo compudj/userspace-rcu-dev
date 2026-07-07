@@ -224,6 +224,12 @@ int urcu_txn_list_empty(struct urcu_txn_list_head *head)
  * by the caller's RCU read-side section (see the contract above).
  */
 static inline
+int urcu_txn_list__insert_prepare(struct urcu_mcas_txn *txn,
+		struct urcu_txn_list_node *newp,
+		struct urcu_txn_list_node *pos,
+		struct urcu_txn_list_node *succ);
+
+static inline
 int urcu_txn_list_insert_after_prepare(struct urcu_mcas_txn *txn,
 		struct urcu_txn_list_node *newp,
 		struct urcu_txn_list_node *pos)
@@ -234,6 +240,45 @@ int urcu_txn_list_insert_after_prepare(struct urcu_mcas_txn *txn,
 	if (urcu_txn_list_is_marked(pn))
 		return -ENOENT;				/* @pos was deleted */
 	succ = (struct urcu_txn_list_node *) pn;	/* unmarked successor */
+	return urcu_txn_list__insert_prepare(txn, newp, pos, succ);
+}
+
+/*
+ * urcu_txn_list_insert_between_prepare: insert_after_prepare with the caller's
+ * ORDER INTENT pinned.  insert_after derives the successor FRESH from
+ * @pos->next at prepare time -- it inserts after @pos wherever @pos's
+ * neighbourhood has moved to -- which is correct for positional lists but NOT
+ * for a caller that decided "@newp belongs between @pos and @succ_expected" by
+ * some external ordering (keys): a peer's insert-after(@pos) committed between
+ * that decision and this prepare would silently land @newp BEFORE the peer's
+ * node.  This variant refuses (-EAGAIN) when @pos->next no longer equals
+ * @succ_expected, and records @succ_expected as the &pos->next expected old --
+ * so any later interposition fails the commit's value CAS instead of being
+ * adopted.  -ENOENT as insert_after (@pos deleted).  The caller re-derives its
+ * position on either failure.
+ */
+static inline
+int urcu_txn_list_insert_between_prepare(struct urcu_mcas_txn *txn,
+		struct urcu_txn_list_node *newp,
+		struct urcu_txn_list_node *pos,
+		struct urcu_txn_list_node *succ_expected)
+{
+	void *pn = urcu_txn_load(txn, (void **) &pos->next, URCU_MCAS_TAG);
+
+	if (urcu_txn_list_is_marked(pn))
+		return -ENOENT;				/* @pos was deleted */
+	if ((struct urcu_txn_list_node *) pn != succ_expected)
+		return -EAGAIN;				/* order intent stale: re-derive */
+	return urcu_txn_list__insert_prepare(txn, newp, pos, succ_expected);
+}
+
+/* Common tail of the insert prepares: @succ is @pos's validated successor. */
+static inline
+int urcu_txn_list__insert_prepare(struct urcu_mcas_txn *txn,
+		struct urcu_txn_list_node *newp,
+		struct urcu_txn_list_node *pos,
+		struct urcu_txn_list_node *succ)
+{
 
 	/*
 	 * We write &succ->prev but NOT &succ->next.  The next slot that serializes

@@ -241,7 +241,7 @@ enum urcu_txn_status ft_insert_one_commit(struct cds_ft *ft, const uint8_t *key,
 	enum urcu_txn_status st;
 
 	if (cell) {
-		struct ft_ord_cell *pred;
+		struct ft_ord_cell *pred, *pred2, *succ0;
 		struct urcu_txn_list_node *pred_lnode;
 
 		/*
@@ -262,34 +262,57 @@ enum urcu_txn_status ft_insert_one_commit(struct cds_ft *ft, const uint8_t *key,
 		pred = ft_ord_cell_find_pred_from_head(ft, key, key_len, cell,
 			ic->live_child != NULL || !ic->publish_to_parent);
 		/*
-		 * Splice @cell after @pred via the public composable op, recorded
-		 * straight into the structural commit txn (FT's type-7 proxy tag
-		 * applies, so the splice is atomic with the structural publish for a
-		 * bidirectional ordered reader).  Sentinel topology: a new MINIMUM (no
-		 * predecessor) splices after the sentinel node -- add_after(sentinel) IS
-		 * the old "head was @succ" endpoint flip; a new maximum lands before the
-		 * sentinel naturally (pred->next was the sentinel).  add_after_prepare
-		 * records pred->next: succ -> cell and succ->prev: pred -> cell, where
-		 * either neighbour may be the sentinel -- the old <=4 hand-built edges
-		 * (incl. head/tail) collapse to its 2.
+		 * ORDER-INTENT capture + confirm (concurrent writers): the search
+		 * decided "@cell belongs between @pred and @pred's successor" by
+		 * KEY order, but a peer key committed after the search can
+		 * interpose between @pred and ours -- an insert-after-@pred would
+		 * then land BEFORE the interposed key (internally consistent
+		 * list, wrong key order; nothing dead, so neither the deletion
+		 * mark nor any expected-old catches it).  Capture the successor,
+		 * then RE-RUN the (seeded, cheap) predecessor search: it
+		 * returning @pred again proves no key sat between @pred and ours
+		 * at an instant AFTER the capture, and the insert_between prepare
+		 * below records @succ0 as &pred->next's expected old -- so any
+		 * interposition after that instant fails the commit's value CAS.
+		 * A recycled-@pred coincidence (freed and re-bound in the window)
+		 * re-initializes pred->next, which then mismatches @succ0 the
+		 * same way.  Never diverges under a single writer.
+		 */
+		succ0 = ft_ord_cell_resolve_ord(pred ?
+			&pred->lnode.next : &ft->ord_sentinel.node.next);
+		pred2 = ft_ord_cell_find_pred_from_head(ft, key, key_len, cell,
+			ic->live_child != NULL || !ic->publish_to_parent);
+		/*
+		 * Splice @cell between @pred and @succ0 via the composable op,
+		 * recorded straight into the structural commit txn (FT's type-7
+		 * proxy tag applies, so the splice is atomic with the structural
+		 * publish for a bidirectional ordered reader).  Sentinel topology:
+		 * a new MINIMUM (no predecessor) splices after the sentinel node;
+		 * a new maximum lands before the sentinel naturally (@succ0 is the
+		 * sentinel pseudo-cell).  The prepare records pred->next:
+		 * succ0 -> cell and succ0->prev: pred -> cell, where either
+		 * neighbour may be the sentinel.
 		 */
 		pred_lnode = pred ? ft_ord_cell_lnode(pred) : &ft->ord_sentinel.node;
 		/*
-		 * A FAILING prepare is a peer conflict, not a soft no-op: -ENOENT
-		 * = @pred died (its next carries the fused unsplice's deletion
-		 * mark) between the position search and here; -EAGAIN = the
-		 * successor is mid-deletion.  Splicing anyway (the former void
-		 * cast) would target a retired cell whose bit-identical links
-		 * still match -- the resurrected / out-of-order cell class the
-		 * ord-verify catches at rest.  Unwind exactly as a commit ABORT
-		 * would (nothing is installed -- records are discarded with the
-		 * descriptor, registered fences cleared by the destroy, the fresh
-		 * cluster freed as the on-abort rollback does) and let the
-		 * caller's ABORT path re-descend; age the handle first, exactly
-		 * as a real commit ABORT ages it.
+		 * A FAILING confirm or prepare is a peer conflict, not a soft
+		 * no-op: pred2 != pred = a key interposed (or @pred's key
+		 * vanished) around the capture; -ENOENT = @pred died (its next
+		 * carries the fused unsplice's deletion mark); -EAGAIN = the
+		 * order intent went stale or the successor is mid-deletion.
+		 * Splicing anyway (the former void cast) produced the
+		 * resurrected / out-of-order cell class the ord-verify catches
+		 * at rest.  Unwind exactly as a commit ABORT would (nothing is
+		 * installed -- records are discarded with the descriptor,
+		 * registered fences cleared by the destroy, the fresh cluster
+		 * freed as the on-abort rollback does) and let the caller's
+		 * ABORT path re-descend; age the handle first, exactly as a real
+		 * commit ABORT ages it.
 		 */
-		if (urcu_txn_list_insert_after_prepare(ft_flip_txn_handle(ic->txn),
-				ft_ord_cell_lnode(cell), pred_lnode) < 0) {
+		if (pred2 != pred ||
+		    urcu_txn_list_insert_between_prepare(ft_flip_txn_handle(ic->txn),
+				ft_ord_cell_lnode(cell), pred_lnode,
+				ft_ord_cell_lnode(succ0)) < 0) {
 			ft_free_unpublished_split_cluster(ft, ic->created,
 				ic->nr_created);
 			urcu_txn_conflict(ft_flip_txn_handle(ic->txn));
