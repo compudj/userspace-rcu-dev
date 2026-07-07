@@ -180,26 +180,46 @@ struct cds_ft_compressed_node *ft_compact_relocate_compressed(struct cds_ft *ft,
 	cn2_meta->external_nodes = NULL;		/* never set on a compressed node */
 	ft_nr_keys_store(ft,cn2_meta, ft_nr_keys_get(cn_meta), CMM_RELAXED);
 	cn2_flag = ft_compressed_node_flag(cn2);
-	/* Redirect the child's back-reference (internal: parent; external: prev). */
-	ft_set_parent(ft, cn2->child, cn2_flag, &cn2->child);
 	if (gp_slot) {
 		/*
-		 * Forward publish into the live grandparent slot.  A traditional
-		 * compressed node is reached via a PLAIN child slot of a plain
-		 * internal grandparent (the descent never chains two compressed
-		 * nodes), so this is a lone structural edge with no SKIP_X dual:
-		 * commit it as a single on-stack release store captured as a
-		 * {slot, old, new} flip descriptor (byte-identical to a bare
-		 * rcu_assign_pointer, but MCAS-expressible -- a bare store would
-		 * discard the compare-and-swap "expected" value).
+		 * Traditional compressed node: TWO reader-followable edges move
+		 * -- the live child's back-reference (internal: parent+offset;
+		 * external: prev) and the grandparent forward slot.  Commit them
+		 * as ONE pre-reserved flip txn: the old two-step (bare back-ref
+		 * store, then a lone forward flip) left a window where an
+		 * up-walk from the still-reachable child entered the
+		 * NOT-YET-PUBLISHED copy, and a peer mutation between the steps
+		 * would be published over by a stale copy (the stale-plan
+		 * class).  ft_reparent_record dispatches the child kind and
+		 * co-commits the (parent, offset) pair; the forward edge is a
+		 * plain structural record (no SKIP_X dual: the descent never
+		 * chains two compressed nodes).  OOM: nothing recorded is
+		 * installed -- destroy the txn, free the unpublished copy, leave
+		 * @cn in place and stop the pass.
 		 */
-		struct ft_ord_cell_edge edge = {
-			.slot = (struct ft_ord_cell **) gp_slot,
-			.old_target = (struct ft_ord_cell *) *gp_slot,
-			.new_target = (struct ft_ord_cell *) cn2_flag,
-		};
+		struct ft_flip_txn *t = ft_flip_txn_create_bounded(3);
 
-		ft_ord_cell_flip_one(&edge);
+		if (!t) {
+			free_compressed_node_unpublished(ft, cn2);
+			*oom = true;
+			return cn;
+		}
+		ft_reparent_record(ft, t, cn2->child, cn2_flag, &cn2->child);
+		ft_flip_txn_record_reserved(t, (void **) gp_slot, *gp_slot,
+			cn2_flag);
+		if (ft_flip_txn_commit(ft, t) != URCU_TXN_STATUS_OK) {
+			free_compressed_node_unpublished(ft, cn2);
+			*oom = true;
+			return cn;
+		}
+	} else {
+		/*
+		 * Skip form: the skip pointer addresses the TARGET, so the
+		 * child's back-reference redirect IS the lone structural edge
+		 * publishing the relocation -- a single atomic store, no
+		 * two-step window.
+		 */
+		ft_set_parent(ft, cn2->child, cn2_flag, &cn2->child);
 	}
 	/*
 	 * Freeze the retired compressed node dead (§4.B freeze-on-free) before it
