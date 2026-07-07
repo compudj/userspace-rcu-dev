@@ -1928,45 +1928,55 @@ int ft_promote_head(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 		ft_ord_cell_free(ft, old_cell);
 	} else {
 		/*
-		 * List off: the head's prev IS the flagged parent, inherited in
-		 * place on the not-yet-published successor.  @next_node is already
-		 * live and its prev is read RAW (ft_resolve_head_prev) during skip
-		 * resolution, so that store cannot ride the flip as a folded proxy
-		 * -- it stays a SETTLED store, and the flip is made infallible by
-		 * PRE-RESERVING its bounded txn (<=2 edges: forward slot + a
-		 * compressed parent's SKIP_X dual) BEFORE the live store.  On
-		 * reservation OOM abort here: @next_node and the head slot are
-		 * untouched, so the caller returns CDS_FT_STATUS_MEMORY_ERROR.
+		 * List off: the head's prev IS the flagged parent, inherited on
+		 * the promoted successor as a FOLDED edge riding the swap commit
+		 * -- it flips ATOMICALLY with the forward head publish and
+		 * @node's freeze, never a pre-commit reader-visible store (and
+		 * never a hand-rolled restore on a peer-won commit, which the
+		 * remove-retry skeptic flagged as assuming one-remover-per-node).
+		 * The prev readers resolve a parked proxy at the load
+		 * (ft_dereference_prev_resolved / ft_node_holder), mirroring the
+		 * cell arm above; the forward publish's forward-before-parent
+		 * check reads the folded INTENDED value, not the not-yet-stored
+		 * slot.  A peer latch already parked on either word aborts the
+		 * attempt before anything is recorded.
 		 */
 		struct ft_flip_txn *txn =
 			ft_flip_txn_create_bounded(FT_PUB_SEDGE_MAX_EDGES +
-				FT_HLIST_FREEZE_MAX_EDGES + 1);	/* +1: §4.B parent guard */
+				FT_HLIST_FREEZE_MAX_EDGES + 2);	/* +1 §4.B parent guard, +1 prev fold */
 
 		void *prev_save;
+		void *inherit;
 
 		if (!txn)
 			return -ENOMEM;
-		prev_save = next_node->prev;
-		next_node->prev = node->prev;	/* inherit parent */
+		prev_save = rcu_dereference(next_node->prev);
+		inherit = rcu_dereference(node->prev);
+		if (caa_unlikely(ft_node_flip_proxy(
+					(struct cds_ft_inode_flag *) prev_save) ||
+				ft_node_flip_proxy(
+					(struct cds_ft_inode_flag *) inherit))) {
+			ft_flip_txn_destroy(txn);	/* PREPARE state: nothing recorded */
+			return -EAGAIN;
+		}
+		ft_flip_txn_record_reserved(txn, (void **) &next_node->prev,
+			prev_save, inherit);
 		/* VALIDATE (§4.B): guard the LIVE holder this head-promote publishes into. */
 		ft_flip_txn_guard_parent(ft, txn, parent_nf);
-		_ft_publish_to_parent(ft, parent_nf,
+		_ft_publish_to_parent_meta(ft, parent_nf,
 			(struct cds_ft_inode_flag **) head_slot,
-			(struct cds_ft_inode_flag *) next_node, &rec);
+			(struct cds_ft_inode_flag *) next_node, NULL,
+			inherit /* folded prev: intended parent value */, &rec);
 		n_s = ft_pub_rec_sedges(&rec, sedges);
 		/* Fuse @node's freeze into the structural publish (doc §4.B). */
 		ft_hlist_freeze_prepare(ft_flip_txn_handle(txn), node);
 		if (ft_ord_cell_flip_into(ft, txn, sedges, n_s) > 0) {
 			/*
-			 * Peer won: the promote never published.  Undo the
-			 * pre-commit SETTLED prev store -- @next_node is still
-			 * an interior chain node whose prev must again name its
-			 * predecessor @node.  The transient parent-valued prev
-			 * a concurrent up-walker may have read is benign: both
-			 * anchors reach the same position (same class as
-			 * insert's parent-before-publish window).
+			 * Peer won: NOTHING installed -- the folded prev edge
+			 * was discarded with the aborted commit, @next_node's
+			 * prev still names its predecessor @node.  Retry from a
+			 * fresh derivation; nothing to undo.
 			 */
-			next_node->prev = prev_save;
 			return -EAGAIN;
 		}
 	}

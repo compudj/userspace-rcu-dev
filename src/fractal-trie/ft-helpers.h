@@ -1209,7 +1209,14 @@ static inline
 struct cds_ft_inode_flag *ft_node_holder(struct cds_ft *ft,
 		const struct cds_ft_node *node)
 {
-	void *prev = node->prev;
+	/*
+	 * Resolve a parked flip proxy at the load: once a head-promote folds
+	 * its prev-inherit store onto the commit flip-txn (Phase 4.3), this
+	 * word transiently carries FT's type-7 proxy, and a raw external/cell
+	 * classification of the proxy value would mis-derive the holder.
+	 */
+	void *prev = (void *) ft_resolve_flip_proxy((struct cds_ft_inode_flag *)
+			rcu_dereference(((struct cds_ft_node *) node)->prev));
 
 	if (ft_node_external((struct cds_ft_inode_flag *) prev))
 		return (struct cds_ft_inode_flag *) prev;
