@@ -815,6 +815,23 @@ struct ft_pub_rec {
 #define FT_STATE_PSO_BITS		8
 #define FT_STATE_PSO_VALMASK		(((uintptr_t) 1 << FT_STATE_PSO_BITS) - 1)
 #define FT_STATE_PSO_MASK		(FT_STATE_PSO_VALMASK << FT_STATE_PSO_SHIFT)
+/*
+ * FT_STATE_COPYING (bit 19, above parent_slot_offset): REVERSIBLE per-node
+ * copy fence (MW campaign, Option A -- doc/design + CORE_682870 fix plan F2).
+ * A recompact/collapse that must read a LIVE node's whole body sets this bit
+ * with a standalone CAS {clean -> |COPYING} BEFORE the body reads: every peer
+ * publish into the node aborts on its §4.B guard (the guard's clean-LIVE
+ * expectation masks this bit like the tombstone), so the copied body is
+ * consistent without per-slot validate records.  On COMMIT the same state
+ * record transitions {COPYING|s -> TOMBSTONE|s} -- the one-way tombstone
+ * semantics (exactly-once retire token, freeze-on-free) are UNCHANGED and
+ * still land atomically at commit.  On ABORT the copier CAS-clears ONLY this
+ * bit.  Unlike the tombstone, COPYING is reversible BY DESIGN and never
+ * implies death; it is never set at rest.  The mark CAS failing (bit already
+ * set) = a concurrent copier or a real retire: -EAGAIN.
+ */
+#define FT_STATE_COPYING		((uintptr_t) 1 << \
+					(FT_STATE_PSO_SHIFT + FT_STATE_PSO_BITS))
 #define FT_STATE_TAG_MASK		(FT_STATE_PROXY | FT_STATE_TOMBSTONE)
 
 struct cds_ft_metadata {

@@ -962,7 +962,14 @@ void ft_flip_txn_guard_parent(const struct cds_ft *ft, struct ft_flip_txn *t,
 	v = (uintptr_t) urcu_txn_load(t->mtxn,
 			(void **) &ft_flag_to_metadata(ft, parent_nf)->state,
 			FT_STATE_PROXY);
-	live = v & ~FT_STATE_TOMBSTONE;
+	/*
+	 * The clean-LIVE expectation masks BOTH one-way death (tombstone) and
+	 * the reversible copy fence (FT_STATE_COPYING): a holder under a
+	 * peer's body copy at validate time mismatches -> ABORT -> retry; a
+	 * copier that ABORTED and cleared the fence before our validate
+	 * matches -> proceed (the copy was abandoned, the holder unchanged).
+	 */
+	live = v & ~(FT_STATE_TOMBSTONE | FT_STATE_COPYING);
 	urcu_txn_validate(t->mtxn,
 			(void **) &ft_flag_to_metadata(ft, parent_nf)->state,
 			(void *) live, FT_STATE_PROXY);
