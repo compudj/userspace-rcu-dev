@@ -493,7 +493,10 @@ int ft_insert_commit_arm(struct cds_ft *ft, struct ft_insert_commit *ic,
 	 * internal node this commit retires) now fused into the same flip as the
 	 * unlink (atomic detach, doc §4.B); + 1 VALIDATE freeze guard (the
 	 * relocation's live grandparent, or -- mutually exclusive insert shape --
-	 * the in-place external-head park holder; §4.B validate);
+	 * the in-place external-head park holder; §4.B validate); + 1 VALIDATE
+	 * freeze guard on the IN-PLACE attach holder (the reserved-byte edge below
+	 * stores a slot INSIDE the live attach node -- NOT mutually exclusive with
+	 * the external-head park holder above, so it needs its own reservation);
 	 * + @count_edges nr_keys count edges (rank-stats-ON count fold), one per
 	 * STABLE ancestor from the count base to the root -- sized by the caller to
 	 * the ACTUAL descent depth (0 when the shape does not fold its count);
@@ -501,8 +504,8 @@ int ft_insert_commit_arm(struct cds_ft *ft, struct ft_insert_commit *ic,
 	 * records parent AND slot-offset, two records, when the parked live child
 	 * bears metadata).
 	 */
-	ic->txn = ic->op ? ft_flip_txn_create_bounded_on(ic->op, 13 + count_edges) :
-			ft_flip_txn_create_bounded(13 + count_edges);
+	ic->txn = ic->op ? ft_flip_txn_create_bounded_on(ic->op, 14 + count_edges) :
+			ft_flip_txn_create_bounded(14 + count_edges);
 	if (!ic->txn)
 		return -ENOMEM;
 	return 0;
@@ -1576,6 +1579,27 @@ int ft_attach_node(struct cds_ft *ft,
 			assert(slot_ptr);
 			ft_set_parent(ft, iter_node_flag, iter_dest_node_flag,
 				slot_ptr);
+			/*
+			 * §4.B VALIDATE (Phase 4.3, MW): the reserved-byte edge
+			 * below stores @slot_ptr, a slot INSIDE @iter_dest_node_flag.
+			 * When the reserve stayed IN PLACE (iter_dest == attach node)
+			 * that slot lives in the LIVE, reader-reachable attach node,
+			 * yet the forward CAS below validates only the slot VALUE
+			 * (NULL for a new byte) -- a peer that recompacts/relocates
+			 * the attach node through its grandparent slot leaves that
+			 * value intact in the retired copy, so the CAS still matches
+			 * and commits the new key into a reclaimed node (UAF + lost
+			 * insert).  Guard the holder's state word so a peer's
+			 * freeze-on-free (COPYING/TOMBSTONE) between this descent and
+			 * the commit ABORTs instead -- symmetric with the split path
+			 * (ft_insert_publish_or_park) and the external-clear guards in
+			 * ft-remove.h.  A RELOCATION reserve publishes a build-
+			 * invisible fresh copy, guarded at its grandparent slot below
+			 * (iter_dest != attach), so it needs no guard here.
+			 */
+			if (iter_dest_node_flag == attach_node_flag)
+				ft_flip_txn_guard_parent(ft, ic->txn,
+					iter_dest_node_flag);
 			ft_flip_txn_record_reserved(ic->txn, (void **) slot_ptr,
 				(void *) old_node_flag,
 				(void *) iter_node_flag);
