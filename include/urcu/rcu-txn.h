@@ -656,6 +656,48 @@ int urcu_txn_store(struct urcu_mcas_txn *txn, void **slot,
 }
 
 /*
+ * Buffer a COPY_SLOT edge (see urcu_mcas_add_copy_slot): freeze @src at the
+ * definite value @val for this transaction -- readers resolve @src to @val,
+ * settle restores @src to @val on commit AND abort -- and at install publish
+ * @val into the fresh, still-unpublished word @dst.  @val is the value the
+ * caller has already resolved @src to (a proxy driven to a definite child); the
+ * install read-set check (@src == @val) catches a peer that changed @src in the
+ * prep->install window and aborts.  Unlike a store this never reconciles (a
+ * copy-src is a distinct slot), so it always appends.  Returns 0, or -ENOMEM
+ * (sticky, like store) if the descriptor could not be allocated or grown.
+ */
+static inline
+int urcu_txn_copy_slot(struct urcu_mcas_txn *txn, void **src, void *val,
+		void **dst, uintptr_t tag)
+{
+	struct urcu_mcas *m = txn->mcas;
+
+	if (caa_unlikely(m == URCU_TXN_ENOMEM))
+		return -ENOMEM;		/* sticky: an earlier record already failed */
+	if (!m) {
+		m = urcu_mcas_create(txn->min_alloc ? txn->min_alloc :
+				URCU_TXN_INIT, txn->retry);
+		if (caa_unlikely(!m)) {
+			txn->mcas = URCU_TXN_ENOMEM;
+			return -ENOMEM;
+		}
+		txn->mcas = m;
+	}
+	if (caa_unlikely(!urcu_mcas_add_copy_slot(m, src, val, dst, tag))) {
+		/* Descriptor full: grow (may move it) and retry. */
+		m = urcu_mcas_grow(m);
+		if (caa_unlikely(!m)) {
+			urcu_mcas_destroy(txn->mcas);	/* unpublished: sync free */
+			txn->mcas = URCU_TXN_ENOMEM;
+			return -ENOMEM;
+		}
+		txn->mcas = m;
+		urcu_mcas_add_copy_slot(m, src, val, dst, tag);
+	}
+	return 0;
+}
+
+/*
  * Register a deferred action to run IFF this attempt commits (finalize).  See
  * struct urcu_txn_defer_action.  Call during the prepare (edge-recording) phase,
  * after begin, before commit.  Bounded: assert on overflow (reserve-style).

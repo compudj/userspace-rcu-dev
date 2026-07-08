@@ -209,6 +209,24 @@ enum urcu_mcas_status {
 
 struct urcu_mcas;
 
+/*
+ * Record kind discriminant.  A CAS record installs {*slot: old -> new}.  A
+ * COPY_SLOT record is a CAS record with old == new == a definite value V (so it
+ * parks a proxy on @slot, resolves to V for readers, and settle restores @slot
+ * to V on BOTH outcomes -- an identity edge that merely FREEZES @slot for the
+ * transaction) PLUS a side effect: at install it publishes V into a second,
+ * still-unpublished word @dst (`*dst = V`).  It is the helpable building block
+ * for copying one child slot of a node under recompaction into the fresh node,
+ * catching a peer that updates @slot in the prep->install window via the same
+ * read-set check as a CAS (install expects @slot == V).  It sorts by @slot
+ * address and settles exactly like the CAS it is; only the @dst publish and the
+ * nr==1 fast-path exclusion are specific to it.
+ */
+enum urcu_mcas_record_kind {
+	URCU_MCAS_REC_CAS = 0,
+	URCU_MCAS_REC_COPY_SLOT,
+};
+
 struct urcu_mcas_record {
 	void **slot;			/* transacted word (bit 0 must be free) */
 	void *old_ptr;			/* expected old value */
@@ -245,6 +263,9 @@ struct urcu_mcas_record {
 	 * time and never blocks while owning it -- no hold-and-wait, no lock order.
 	 */
 	int state;
+	unsigned int kind;		/* enum urcu_mcas_record_kind (packs with state) */
+	void **dst;			/* COPY_SLOT only: copy target, *dst = new_ptr at
+					 * install; never read for a CAS record */
 } __attribute__((aligned(16)));
 
 /* Per-record install word values + initializer (see struct urcu_mcas_record). */
@@ -668,6 +689,19 @@ void urcu_mcas_drive_install_depth(struct urcu_mcas *t, unsigned int depth)
 				break;		/* installed (or already) */
 			/* raced: slot changed under us -> re-evaluate */
 		}
+		/*
+		 * COPY_SLOT side effect: r->slot now bears our proxy (resolves to
+		 * r->new_ptr == the frozen value V), so publish V into the fresh
+		 * word r->dst.  Runs on EVERY driver that reaches an installed
+		 * COPY_SLOT record (planted by us or found installed): the store is
+		 * idempotent (V is fixed) and r->dst is not yet reader-reachable, so
+		 * concurrent helpers writing the same V do not race an observer.  Any
+		 * driver that reaches the commit CAS below has passed here for every
+		 * record, so a committed transaction has published every dst before it
+		 * linearizes.
+		 */
+		if (r->kind == URCU_MCAS_REC_COPY_SLOT)
+			uatomic_store(r->dst, r->new_ptr, CMM_RELAXED);
 	}
 	/* every record installed -> commit */
 	uatomic_cmpxchg(&t->status, URCU_MCAS_UNDECIDED,
@@ -933,10 +967,41 @@ bool urcu_mcas_add(struct urcu_mcas *t, void **slot,
 	if (t->nr == t->cap)
 		return false;
 	r = &t->recs[t->nr++];
+	r->kind = URCU_MCAS_REC_CAS;
 	r->slot = slot;
 	r->old_ptr = old_ptr;
 	r->new_ptr = new_ptr;
 	r->proxy_tag = tag;	/* the slot's tag; travels with the record */
+	return true;
+}
+
+/*
+ * Append one COPY_SLOT edge: freeze @src at its definite current value @val for
+ * the transaction (park a proxy on @src, resolve to @val for readers, restore
+ * @src to @val on commit AND abort -- @src stays traversable either way) and, at
+ * install, publish @val into the fresh, still-unpublished word @dst.  @val is the
+ * value the caller has already resolved @src to (proxy -> a definite child); the
+ * install-time read-set check (@src == @val) catches a peer that changed @src in
+ * the prep->install window and aborts, so the caller re-resolves on retry.  @tag
+ * is @src's proxy-tag.  Like urcu_mcas_add, back-pointer deferred to commit; the
+ * record does NOT go through urcu_mcas_record reconcile (a copy-src never shares
+ * a slot with a store).  Returns false if the descriptor is full (caller grows).
+ */
+static inline
+bool urcu_mcas_add_copy_slot(struct urcu_mcas *t, void **src, void *val,
+		void **dst, uintptr_t tag)
+{
+	struct urcu_mcas_record *r;
+
+	if (t->nr == t->cap)
+		return false;
+	r = &t->recs[t->nr++];
+	r->kind = URCU_MCAS_REC_COPY_SLOT;
+	r->slot = src;
+	r->old_ptr = val;	/* expected old == committed new: an identity edge */
+	r->new_ptr = val;
+	r->proxy_tag = tag;
+	r->dst = dst;
 	return true;
 }
 
@@ -964,6 +1029,8 @@ bool urcu_mcas_record(struct urcu_mcas *t, void **slot,
 	unsigned int i;
 
 	for (i = 0; i < t->nr; i++) {
+		if (t->recs[i].kind == URCU_MCAS_REC_COPY_SLOT)
+			continue;	/* copy-src is not a store; never merge */
 		if (t->recs[i].slot != slot)
 			continue;
 		if (caa_unlikely(t->recs[i].old_ptr != old_ptr)) {
@@ -1082,12 +1149,15 @@ bool urcu_mcas_commit(struct urcu_mcas *t,
 		urcu_mcas_destroy(t);
 		return true;
 	}
-	if (t->nr == 1 && t->retry < URCU_MCAS_ESCALATE) {
+	if (t->nr == 1 && t->retry < URCU_MCAS_ESCALATE &&
+			t->recs[0].kind == URCU_MCAS_REC_CAS) {
 		/*
 		 * Single edge, not yet starved: the CAS itself is the atomic
 		 * commit.  Fast and -- while the slot is plain -- fair; once it
 		 * has retried enough to suspect a proxy is locking it out, the
 		 * escalation below makes it a real, visible transaction instead.
+		 * A lone COPY_SLOT is excluded: its bare old==new CAS is a no-op
+		 * that would skip the dst publish, so it takes the full drive path.
 		 */
 		struct urcu_mcas_record *r = &t->recs[0];
 

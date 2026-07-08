@@ -1,0 +1,321 @@
+// SPDX-FileCopyrightText: 2026 Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+//
+// SPDX-License-Identifier: LGPL-2.1-or-later
+
+/*
+ * White-box test for the COPY_SLOT engine record (urcu_mcas_add_copy_slot /
+ * urcu_txn_copy_slot): the helpable building block recompaction uses to copy one
+ * child slot of a node into the fresh node while FREEZING the source.
+ *
+ * A COPY_SLOT record is a CAS record with old == new == V -- an identity edge
+ * that merely freezes the source slot for the transaction (readers resolve it to
+ * V; settle restores it to V on commit AND abort, so the source stays
+ * traversable either way) -- PLUS a side effect: at install it publishes V into
+ * a second, still-unpublished word @dst (the fresh node's slot).
+ *
+ * Destination lifetime (mirrors the recompaction reclamation contract).
+ * -------------------------------------------------------------------------
+ * @dst is a transacted output word, and the engine's slot-lifetime precondition
+ * (rcu-txn.h) applies to it exactly as to @slot: the *dst = V publish is run by
+ * ANY driver, including a helper that read the transaction UNDECIDED and then
+ * stalled -- so its store can land AFTER the owner has returned from commit.  If
+ * @dst pointed into the owner's stack (reused by the next op), that late store
+ * would corrupt a later op's destination.  So the destination is a heap "fresh
+ * node", allocated FRESH PER ATTEMPT and reclaimed through call_rcu (committed
+ * AND aborted), so a lagging helper's late copy always lands in still-live,
+ * grace-period-protected memory -- exactly what recompaction must do with N'.
+ *
+ * Three properties are checked:
+ *
+ *  1. Single-threaded, multi-record: a txn of two COPY_SLOT records publishes
+ *     each source value into its dst and leaves the sources unchanged.
+ *
+ *  2. Single-threaded, lone record: a txn of ONE COPY_SLOT still publishes dst
+ *     and restores the source -- it must NOT take the nr==1 bare-CAS fast path,
+ *     whose old==new no-op CAS would skip the dst publish.
+ *
+ *  3. Concurrent atomicity + window-catch: writers run transfer transactions
+ *     over a pair of source words (sum invariant 0); copiers snapshot the pair
+ *     with two COPY_SLOT records into a fresh node and commit.  Every committed
+ *     snapshot has sum 0 -- the two copies linearize TOGETHER at the one
+ *     status-word commit, and a writer that changes a source in the
+ *     prep->install window aborts the copier (read-set check src == V) rather
+ *     than letting it publish a torn snapshot -- and the copies never disturb
+ *     the sources (the final source sum stays 0).
+ *
+ * Slots carry a per-word monotonic version (lf_bump) so a stored word never
+ * repeats a bit pattern (the engine's non-ABA precondition).  QSBR flavor.
+ */
+
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#ifndef _LGPL_SOURCE
+#define _LGPL_SOURCE
+#endif
+
+#include <inttypes.h>
+#include <pthread.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+#include <urcu/compiler.h>
+#include <urcu/uatomic.h>
+#include <urcu-qsbr.h>
+#include <urcu-call-rcu.h>
+#include <urcu/rcu-txn.h>
+
+#include "tap.h"
+
+#define NR_TESTS	5
+#define NR_WRITERS	4
+#define NR_COPIERS	4
+#define NR_WORKERS	(NR_WRITERS + NR_COPIERS)
+#define OPS_PER_WORKER	40000
+#define RETRY_BOUND	512		/* generous worst single-op bypass bound */
+
+/* The transfer pair snapshotted by copiers and mutated by writers. */
+static void *g_src[2];
+
+/*
+ * The recompaction "fresh node" analog: a heap-allocated destination whose slots
+ * receive the COPY_SLOT publishes.  Reclaimed through call_rcu so a lagging
+ * helper's late *dst = V store never touches freed memory.
+ */
+struct fresh_node {
+	void *slot[2];
+	struct rcu_head rcu;
+};
+
+static void free_fresh_rcu(struct rcu_head *h)
+{
+	free(caa_container_of(h, struct fresh_node, rcu));
+}
+
+struct worker_arg {
+	long committed;
+	unsigned long max_retry;
+	long violations;		/* copier: torn snapshots observed (must be 0) */
+};
+
+static intptr_t lf_val(uintptr_t w) { return (intptr_t) w >> 32; }
+static uintptr_t lf_bump(uintptr_t w, intptr_t delta)
+{
+	intptr_t val = lf_val(w) + delta;
+	unsigned int ver = (unsigned int) ((w >> 1) & 0x7fffffffu) + 1;
+	return ((uintptr_t) (uint32_t) (int32_t) val << 32)
+		| ((uintptr_t) (ver & 0x7fffffffu) << 1);
+}
+
+/* Writer: {g_src[0] += 2, g_src[1] -= 2} -- keeps lf_val sum invariantly 0. */
+static void *writer(void *arg)
+{
+	struct worker_arg *wa = (struct worker_arg *) arg;
+	long n;
+
+	rcu_register_thread();
+	for (n = 0; n < OPS_PER_WORKER; n++) {
+		struct urcu_mcas_txn tx;
+		int ret;
+
+		urcu_txn_init(&tx, NULL);
+		do {
+			uintptr_t o0, o1;
+
+			urcu_txn_begin(&tx);
+			o0 = (uintptr_t) urcu_txn_load(&tx, &g_src[0], URCU_MCAS_TAG);
+			o1 = (uintptr_t) urcu_txn_load(&tx, &g_src[1], URCU_MCAS_TAG);
+			urcu_txn_store(&tx, &g_src[0], (void *) o0,
+					(void *) lf_bump(o0, 2), URCU_MCAS_TAG);
+			urcu_txn_store(&tx, &g_src[1], (void *) o1,
+					(void *) lf_bump(o1, -2), URCU_MCAS_TAG);
+			ret = urcu_txn_commit(&tx);
+			urcu_txn_end(&tx);
+			if (ret < 0)
+				abort();	/* MEMORY_ERROR */
+		} while (ret == URCU_TXN_STATUS_ABORT);
+
+		if (tx.retry > wa->max_retry)
+			wa->max_retry = tx.retry;
+		wa->committed++;
+		rcu_quiescent_state();
+	}
+	rcu_unregister_thread();
+	return NULL;
+}
+
+/* Copier: snapshot the pair via two COPY_SLOT records; committed sum must be 0. */
+static void *copier(void *arg)
+{
+	struct worker_arg *wa = (struct worker_arg *) arg;
+	long n;
+
+	rcu_register_thread();
+	for (n = 0; n < OPS_PER_WORKER; n++) {
+		struct urcu_mcas_txn tx;
+		struct fresh_node *fn = NULL;
+		void *d0, *d1;
+		int ret;
+
+		urcu_txn_init(&tx, NULL);
+		do {
+			void *v0, *v1;
+
+			/*
+			 * Fresh destination per ATTEMPT: an aborted attempt's node
+			 * may still be written by a lagging helper, so it is never
+			 * reused -- it is call_rcu'd below and a new one allocated.
+			 */
+			fn = malloc(sizeof(*fn));
+			if (!fn)
+				abort();
+			uatomic_store(&fn->slot[0], NULL, CMM_RELAXED);
+			uatomic_store(&fn->slot[1], NULL, CMM_RELAXED);
+
+			urcu_txn_begin(&tx);
+			v0 = urcu_txn_load(&tx, &g_src[0], URCU_MCAS_TAG);
+			v1 = urcu_txn_load(&tx, &g_src[1], URCU_MCAS_TAG);
+			(void) urcu_txn_copy_slot(&tx, &g_src[0], v0, &fn->slot[0],
+					URCU_MCAS_TAG);
+			(void) urcu_txn_copy_slot(&tx, &g_src[1], v1, &fn->slot[1],
+					URCU_MCAS_TAG);
+			ret = urcu_txn_commit(&tx);
+			urcu_txn_end(&tx);
+			if (ret < 0)
+				abort();	/* MEMORY_ERROR */
+			if (ret == URCU_TXN_STATUS_ABORT) {
+				/* Aborted: GP-defer -- a helper may still write it. */
+				call_rcu(&fn->rcu, free_fresh_rcu);
+				fn = NULL;
+			}
+		} while (ret == URCU_TXN_STATUS_ABORT);
+
+		/* Committed: the fresh node holds a consistent snapshot of the pair. */
+		d0 = uatomic_load(&fn->slot[0], CMM_ACQUIRE);
+		d1 = uatomic_load(&fn->slot[1], CMM_ACQUIRE);
+		if (lf_val((uintptr_t) d0) + lf_val((uintptr_t) d1) != 0)
+			wa->violations++;
+		call_rcu(&fn->rcu, free_fresh_rcu);	/* lagging helpers may re-write */
+
+		if (tx.retry > wa->max_retry)
+			wa->max_retry = tx.retry;
+		wa->committed++;
+		rcu_quiescent_state();
+	}
+	rcu_unregister_thread();
+	return NULL;
+}
+
+/*
+ * Single-threaded sanity: run @nr COPY_SLOT records (1 or 2) copying g_src[0..nr)
+ * into a fresh node, then check every dst got the source value and every source
+ * is unchanged.  Single-threaded, so no helper can touch the node: a plain free
+ * is enough.  Returns true on success.
+ */
+static bool sanity_copy(unsigned int nr)
+{
+	struct urcu_mcas_txn tx;
+	struct fresh_node *fn = malloc(sizeof(*fn));
+	uintptr_t before[2];
+	unsigned int i;
+	bool ok_res = true;
+	int ret;
+
+	if (!fn)
+		return false;
+	for (i = 0; i < nr; i++) {
+		before[i] = (uintptr_t) g_src[i];
+		fn->slot[i] = NULL;
+	}
+
+	urcu_txn_init(&tx, NULL);
+	do {
+		urcu_txn_begin(&tx);
+		for (i = 0; i < nr; i++) {
+			void *v = urcu_txn_load(&tx, &g_src[i], URCU_MCAS_TAG);
+			(void) urcu_txn_copy_slot(&tx, &g_src[i], v, &fn->slot[i],
+					URCU_MCAS_TAG);
+		}
+		ret = urcu_txn_commit(&tx);
+		urcu_txn_end(&tx);
+		if (ret < 0) {
+			free(fn);
+			return false;
+		}
+	} while (ret == URCU_TXN_STATUS_ABORT);
+
+	for (i = 0; i < nr; i++) {
+		if ((uintptr_t) fn->slot[i] != before[i])	/* dst published */
+			ok_res = false;
+		if ((uintptr_t) g_src[i] != before[i])	/* source restored/unchanged */
+			ok_res = false;
+	}
+	free(fn);
+	return ok_res;
+}
+
+int main(void)
+{
+	pthread_t th[NR_WORKERS];
+	struct worker_arg args[NR_WORKERS];
+	long total = 0, violations = 0;
+	unsigned long max_retry = 0;
+	intptr_t sum;
+	bool multi_ok, lone_ok;
+	int i;
+
+	plan_tests(NR_TESTS);
+	rcu_register_thread();
+
+	/* (1) + (2) single-threaded, before any contention. */
+	g_src[0] = (void *) lf_bump(0, 7);
+	g_src[1] = (void *) lf_bump(0, -7);
+	multi_ok = sanity_copy(2);
+	ok(multi_ok,
+		"COPY_SLOT (2 records) publishes each dst and leaves the sources intact");
+
+	g_src[0] = (void *) lf_bump((uintptr_t) g_src[0], 3);
+	lone_ok = sanity_copy(1);
+	ok(lone_ok,
+		"lone COPY_SLOT publishes dst (skips the nr==1 bare-CAS fast path)");
+
+	/* (3)-(5) concurrent: reset the pair to sum 0. */
+	g_src[0] = NULL;
+	g_src[1] = NULL;
+	for (i = 0; i < NR_WORKERS; i++) {
+		args[i].committed = 0;
+		args[i].max_retry = 0;
+		args[i].violations = 0;
+		pthread_create(&th[i], NULL,
+				i < NR_WRITERS ? writer : copier, &args[i]);
+	}
+	rcu_thread_offline();
+	for (i = 0; i < NR_WORKERS; i++) {
+		pthread_join(th[i], NULL);
+		total += args[i].committed;
+		violations += args[i].violations;
+		if (args[i].max_retry > max_retry)
+			max_retry = args[i].max_retry;
+	}
+	rcu_thread_online();
+
+	sum = lf_val((uintptr_t) g_src[0]) + lf_val((uintptr_t) g_src[1]);
+
+	diag("%d writers + %d copiers x %d ops = %ld committed; snapshot violations "
+		"= %ld; final source sum = %" PRIdPTR "; max single-op retry = %lu",
+		NR_WRITERS, NR_COPIERS, OPS_PER_WORKER, total, violations, sum,
+		max_retry);
+
+	ok(violations == 0,
+		"every committed COPY_SLOT snapshot was atomic (pair sum invariant 0)");
+	ok(sum == 0,
+		"COPY_SLOT never disturbed a source (writers' sum invariant preserved)");
+	ok(total == (long) NR_WORKERS * OPS_PER_WORKER && max_retry < RETRY_BOUND,
+		"every transaction eventually committed with bounded retry");
+
+	rcu_barrier();
+	rcu_unregister_thread();
+	return exit_status();
+}
