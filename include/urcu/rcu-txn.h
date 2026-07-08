@@ -71,7 +71,27 @@
  *   - every read of a transacted slot resolves through the engine accessor
  *     (proxy -> status), never the raw word;
  *   - a node's payload is initialized before the commit that links it -- commit
- *     is the release edge, so build-then-commit publishes it safely.
+ *     is the release edge, so build-then-commit publishes it safely;
+ *   - the backing memory of every transacted slot OUTLIVES every transaction that
+ *     can still reference it: it must sit in RCU-protected memory (reclaimed only
+ *     after a grace period, once no in-flight or helping transaction can still
+ *     name it) or be permanently allocated.  The engine mutates a slot with a bare
+ *     uatomic_cmpxchg -- at install, at the owner's settle, and at a helper's
+ *     steal/settle -- and those writes can land AFTER the op that logically
+ *     consumed the slot: a helper driving a foreign descriptor, or a lagging
+ *     owner, may still hold a record whose ->slot points into an object a peer has
+ *     since unlinked.  If that object were freed and its memory reallocated with a
+ *     DIFFERENT layout while the transaction is still pending -- so the word that
+ *     was a transacted pointer is now, say, an unrelated integer -- the late
+ *     cmpxchg would silently corrupt the reused memory.  RCU reclamation closes
+ *     this: the grace period cannot elapse while any read-side section that could
+ *     still reach the slot is open (a committing/helping thread holds one), so no
+ *     transacted object is freed under a pending write.  A type-safe-by-RCU
+ *     allocator (memory reused only for the SAME type, so the word keeps its
+ *     pointer/tag semantics) would likely suffice as well, since the engine
+ *     already tolerates the slot-value ABA such reuse permits (install-once gates
+ *     on the per-record latch, not the slot value) -- what must never happen is
+ *     reuse that changes the word's SEMANTICS out from under a pending cmpxchg.
  *
  * The handle holds only what the engine does not: the cross-attempt retry count
  * (aging priority) and a pointer to this attempt's descriptor -- the write-set
