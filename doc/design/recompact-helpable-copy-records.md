@@ -1,9 +1,15 @@
 # Helpable recompaction via txn copy-records
 
-Status: DESIGN (2026-07-07). Companion to `mcas-multiwriter-readiness.md`.
-Author of idea: Mathieu Desnoyers. Captured during the MW-hardening campaign
-(session 9e075fe0) as the intended fix for the AUDIT #1 recompact copy-loop
-parked-latch defect.
+Status: ENGINE BUILT (2026-07-08), recompact wiring in progress. Companion to
+`mcas-multiwriter-readiness.md`. Author of idea: Mathieu Desnoyers. Captured
+during the MW-hardening campaign (session 9e075fe0) as the intended fix for the
+AUDIT #1 recompact copy-loop parked-latch defect.
+
+NOTE (2026-07-08): the two-"action-record" design below (§2 memcpy +
+copy_ptr_array) was SUPERSEDED. The engine building blocks actually built are a
+single **COPY_SLOT** CAS-family record + a **priority-resolve** helper; see
+"§2bis Final design" immediately after §2. §1 (problem) and §3/§4
+(claim/reclamation) still hold. The action-record text is kept for provenance.
 
 ## 1. Problem (AUDIT #1, CERTAIN, permanent)
 
@@ -60,6 +66,86 @@ Two new **record kinds** (both "action records", not CAS records):
   *before* the forward-publish record. They carry no slot, so the engine's
   commit-time record sort (rcu-mcas.h ~1021, sorts by slot) must keep them in
   sequence rather than address-order.
+
+## 2bis. Final design (BUILT 2026-07-08) — COPY_SLOT record + priority-resolve
+
+The action-record idea above was dropped: an action record has no live slot, so
+it cannot itself catch a peer that mutates a source child slot in the copy
+window, and the positional-sort special-case complicates the engine. The built
+design is smaller and needs no new record *class* — a COPY_SLOT is a CAS record.
+
+### The AUDIT #1 latch is a concurrent CHILD recompact
+
+The parked flip-proxy the copy loop meets on one of `N`'s child slots is a peer
+**child recompact's forward-publish** (it CASes `N.child[b]`, the child's own
+grandparent slot, from `child -> child'`). It does NOT touch `N.status`, so the
+F2 COPYING fence — which pins `N.status` — cannot see it. That is exactly the
+gap: `N.status` is fenced, but a per-child-slot republish is not.
+
+### COPY_SLOT record `{src, V, dst}` (rcu-mcas.h, committed 25e18335)
+
+A CAS record with `old == new == V`: an identity edge that FREEZES `src`
+(readers resolve to V; settle restores V on BOTH commit and abort, so `N` stays
+traversable) PLUS a side effect — at install it publishes V into the fresh,
+still-unpublished word `dst` (`N'`'s slot). It sorts by `src` address and
+settles like the CAS it is; only the dst publish and the nr==1 fast-path
+exclusion are specific to it. `urcu_txn_copy_slot` / `ft_flip_txn_record_copy_slot`
+wrap it.
+
+- **Window-catch = the read-set check.** V is the child the prep resolved `src`
+  to; if a peer changes `src` in the prep->install window, install's
+  `resolved != V` aborts, and the op re-resolves on retry. So the copy is never
+  committed stale (contrast the reverted "read src at commit" idea, which would
+  let the copy disagree with the separately-built reparent record for V).
+- **dst must be RCU-safe.** The dst publish runs on ANY driver incl. a lagging
+  helper, so it can land after the owner returned from commit — `N'` must be
+  `call_rcu`-deferred PER ATTEMPT (commit AND abort), never reused. Same
+  slot-lifetime precondition as `src` (rcu-txn.h). This IS the §4 reclamation
+  rule; validated by test_rcu_mcas_copy_slot (stack dst -> ~40% torn snapshots;
+  per-attempt GP-deferred -> 0).
+
+### Priority-resolve (rcu-mcas.h, committed 4107a0fa)
+
+Prep resolves each proxied child slot to a definite child V. `urcu_mcas_read`
+only HELPS a foreign proxy; a stream of peer child-recompacts could keep it
+busy. `urcu_mcas_resolve_prio` arbitrates by AGING PRIORITY (shared
+`urcu_mcas_engage_foreign`: help a higher-priority owner, evict a lower one),
+returning V, or CAP (help budget spent) -> the op aborts with `-EAGAIN` and
+retries; the existing `urcu_txn_conflict` path ages the persistent handle, so
+the next attempt outranks and evicts. `urcu_txn_resolve_prio` /
+`ft_flip_txn_resolve_prio` wrap it (self = the reserved descriptor).
+
+Note: prep-resolution correctness does NOT require the priority variant —
+during the copy loop the recompact holds no proxies yet, and the *commit*-time
+COPY_SLOT install already does the aging help/evict + window-catch, so plain
+`urcu_mcas_read` would be correct too. `resolve_prio` is used because its
+prep-time evict lets an aged recompact FREEZE the source before building `N'`,
+avoiding the build-then-abort `N'` rebuild churn (which feeds the call_rcu
+drain balloon) under sustained child-recompact contention.
+
+### Reparent stays separate; the proxy-skip disappears
+
+The child reparent stays per-child (`ft_reparent_record`, unchanged). Today it
+SKIPS a proxy-valued child (leaving an orphaned back-pointer on the retired
+node) — but once the copy loop resolves every slot to a definite V, `N'` holds
+no proxies, so the sweep reparents ALL children. Resolving the copy closes the
+orphaned-back-pointer half of AUDIT #1 for free.
+
+### Recompact wiring (retire_txn arm only)
+
+The build-invisible / cluster-leaf / no-txn arms copy nodes no peer publishes
+into, so they keep the raw-read + proxy-bail (defensive; unreachable). For the
+live-retire (`retire_txn`) arm, per surviving child slot at byte b:
+
+1. `ft_flip_txn_resolve_prio(&N.child[b])` -> V (CAP -> `-EAGAIN`, abandon_fresh);
+2. `set_nth(N', b, V)` builds the compact layout + plain-writes V;
+3. `ft_flip_txn_record_copy_slot(&N.child[b], V, &N'.slot[b])` freezes src +
+   records the helpable dst publish.
+
+Reserve widens by `nr_child` (one COPY_SLOT per child) on top of the existing
+`2*(nr_child+1)+1` reparent/back-channel budget. The claim stays the F2
+`{COPYING|s -> TOMBSTONE|s}` record on `N.status`; commit = claim + N COPY_SLOTs
++ reparents + forward-publish, one helpable txn.
 
 ### Reclamation under helping — `N'` must be GP-deferred, not immediate-freed
 
