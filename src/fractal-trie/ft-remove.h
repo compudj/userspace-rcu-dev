@@ -802,27 +802,30 @@ int ft_detach_node(struct cds_ft *ft,
 	 */
 	bool count_folded = false;
 	/*
-	 * nr_keys fold (list-off residual close): force the list-off lone forward
-	 * store through a commit txn so the count folds ATOMICALLY with the unlink.
-	 * When the caller supplies no @pub (list-off: there is no ordered-list cell
-	 * to fuse, so the in-place delete / external promote would store bare via
-	 * ft_node_replace_ptr and leave its -@count_delta walk to a standalone
-	 * post-commit root-ward RMW), but order-statistics are
-	 * on, defer that store into a LOCAL pub instead: the pub-armed arm below
-	 * commits it via ft_remove_one_commit and records the -@count_delta walk
-	 * from the surviving holder @iter_node_flag into the SAME commit (the fold
-	 * at the `pub->armed` block), exactly as the list-on fused path already
-	 * does.  This is the single choke point for every ft_detach_node caller
+	 * Force the list-off lone forward store through a commit txn (MW safety +
+	 * nr_keys fold).  When the caller supplies no @pub (list-off: there is no
+	 * ordered-list cell to fuse), an in-place external promote would otherwise
+	 * store bare into the LIVE holder's child slot via ft_node_replace_ptr's
+	 * lone-edge arm (ft_node_child_edge_flip) -- a blind rcu_assign that under
+	 * MW resurrects a peer's relocated node / smashes a parked latch and is NOT
+	 * §4.B-guarded (the concurrent-recompaction premise requires EVERY live
+	 * child-slot mutation to be a proxy'd, holder-serialized txn).  Defer that
+	 * store into a LOCAL pub instead: the pub-armed arm below commits it via
+	 * ft_remove_one_commit through @commit_txn (holder guard + structural edge)
+	 * and -- when order statistics are on -- records the -@count_delta walk from
+	 * the surviving holder into the SAME commit, exactly as the list-on fused
+	 * path does.  This is the single choke point for every ft_detach_node caller
 	 * (leaf remove, remove_all, whole-subtree detach, merge src-unlink,
-	 * graft_swap extract) -- each passes pub == NULL in list-off with a signed
-	 * @count_delta, and each folds here uniformly.  A no-op when !rank_stats:
-	 * @pub stays NULL and the bare lone-edge store is byte-identical (the
-	 * count walk is irrelevant without order-statistics).  @local_pub outlives
-	 * every use (whole-function scope); ft_detach_node never returns @pub.
+	 * graft_swap extract): each passes pub == NULL in list-off, and each is now
+	 * routed uniformly through the txn.  A recompaction shape never arms @pub,
+	 * so it is unaffected (its rebuilt copy is published by the recompaction
+	 * path below); when !rank_stats @count_delta is 0 so the fold is a no-op and
+	 * only the guarded structural edge commits.  @local_pub outlives every use
+	 * (whole-function scope); ft_detach_node never returns @pub.
 	 */
 	struct ft_remove_pub local_pub = { .armed = false };
 
-	if (!pub && ft->rank_stats)
+	if (!pub)
 		pub = &local_pub;
 
 	FT_TP(detach_node_enter, (const void *) *detach_node_flag_ptr, detach_depth);
