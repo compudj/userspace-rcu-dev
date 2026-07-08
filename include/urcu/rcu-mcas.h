@@ -536,6 +536,56 @@ int urcu_mcas_plant(struct urcu_mcas *t,
 }
 #endif
 
+/* Forward decl: engage_foreign and drive_install_depth are mutually recursive. */
+static inline
+void urcu_mcas_drive_install_depth(struct urcu_mcas *t, unsigned int depth);
+
+/*
+ * Engage a foreign proxy owner @e met in a slot, by aging priority -- the ONE
+ * arbitration shared by the install loop (urcu_mcas_drive_install_depth) and
+ * prep-time resolution (urcu_mcas_resolve_prio):
+ *
+ *   - @e already terminal              -> RESOLVED (caller reads @e's status and
+ *                                         resolves the slot through it);
+ *   - @e outranks @self, within budget -> help @e install one level down, then
+ *                                         RETRY (caller re-reads the slot);
+ *   - @e outranks @self, budget spent  -> CAP (caller must escalate/abort and
+ *                                         retry at a higher aging priority --
+ *                                         spinning on @e would be an unbounded
+ *                                         wait on its whole transaction);
+ *   - @self outranks @e                -> evict @e (UNDECIDED -> FAILED), RESOLVED.
+ *
+ * Because urcu_mcas_outranks() is antisymmetric and both fields are immutable,
+ * the two parties compute the identical verdict, so eviction never livelocks.
+ * @self and @e must differ.  After RESOLVED via eviction the caller re-reads
+ * @e's status (the evict CAS may have raced @e's own decision), so this returns
+ * only the verdict, not the status.
+ */
+enum urcu_mcas_engage {
+	URCU_MCAS_ENGAGE_RESOLVED,	/* @e is terminal: resolve the slot through it */
+	URCU_MCAS_ENGAGE_RETRY,		/* helped @e forward: re-read the slot */
+	URCU_MCAS_ENGAGE_CAP,		/* @e outranks and help budget spent: escalate */
+};
+
+static inline
+enum urcu_mcas_engage urcu_mcas_engage_foreign(struct urcu_mcas *self,
+		struct urcu_mcas *e, unsigned int depth)
+{
+	if (urcu_mcas_status(e) != URCU_MCAS_UNDECIDED)
+		return URCU_MCAS_ENGAGE_RESOLVED;	/* already terminal */
+	if (!urcu_mcas_outranks(self, e)) {
+		if (depth >= URCU_MCAS_HELP_MAX_DEPTH) {
+			URCU_MCAS_STAT(help_capped);
+			return URCU_MCAS_ENGAGE_CAP;
+		}
+		urcu_mcas_drive_install_depth(e, depth + 1);
+		return URCU_MCAS_ENGAGE_RETRY;		/* helped: re-read */
+	}
+	URCU_MCAS_STAT(evict);			/* we outrank E: evict lower priority */
+	uatomic_cmpxchg(&e->status, URCU_MCAS_UNDECIDED, URCU_MCAS_FAILED);
+	return URCU_MCAS_ENGAGE_RESOLVED;
+}
+
 /*
  * Install phase: drive transaction @t to a terminal status (SUCCEEDED or
  * FAILED) by installing its records in slot-address order.  Each plant (plain
@@ -603,46 +653,34 @@ void urcu_mcas_drive_install_depth(struct urcu_mcas *t, unsigned int depth)
 
 				if (e == t)
 					break;	/* own proxy (distinct-slot inv.) */
-				est = urcu_mcas_status(e);
-				if (est == URCU_MCAS_UNDECIDED) {
-					if (!urcu_mcas_outranks(t, e)) {
-						/*
-						 * E outranks us: help it decide
-						 * (install only), then re-read -- but
-						 * cap the C-stack descent.  Past the cap
-						 * we do NOT spin on E: that is an
-						 * unbounded wait on E's whole transaction,
-						 * not a TSE-coverable few-insn window like
-						 * the install latch.  Escalate instead --
-						 * abort T (FAILED) so the caller retries
-						 * with a higher aging-priority; once T
-						 * out-retries E it outranks and evicts E,
-						 * so progress never hinges on E's owner
-						 * being scheduled.
-						 */
-						if (depth >= URCU_MCAS_HELP_MAX_DEPTH) {
-							URCU_MCAS_STAT(help_capped);
-							uatomic_cmpxchg(&t->status,
-								URCU_MCAS_UNDECIDED,
-								URCU_MCAS_FAILED);
-							return;
-						}
-						urcu_mcas_drive_install_depth(e,
-							depth + 1);
-						continue;
-					}
-					/* We outrank E: evict the lower priority. */
-					URCU_MCAS_STAT(evict);
-					uatomic_cmpxchg(&e->status,
+				/*
+				 * Engage E by aging priority (shared with prep's
+				 * urcu_mcas_resolve_prio).  Past the help-depth cap
+				 * we do NOT spin on E -- that is an unbounded wait on
+				 * E's whole transaction, not a TSE-coverable few-insn
+				 * window like the install latch -- so escalate: abort
+				 * T (FAILED) and let the caller retry at a higher
+				 * aging priority (once T out-retries E it outranks and
+				 * evicts E, so progress never hinges on E's owner
+				 * being scheduled).
+				 */
+				switch (urcu_mcas_engage_foreign(t, e, depth)) {
+				case URCU_MCAS_ENGAGE_CAP:
+					uatomic_cmpxchg(&t->status,
 						URCU_MCAS_UNDECIDED,
 						URCU_MCAS_FAILED);
-					est = urcu_mcas_status(e);
+					return;
+				case URCU_MCAS_ENGAGE_RETRY:
+					continue;	/* helped E: re-read */
+				case URCU_MCAS_ENGAGE_RESOLVED:
+					break;
 				}
 				/*
 				 * E is terminal now (possibly still unsettled --
 				 * owner-only settle).  It resolves this slot to its
 				 * new (SUCCEEDED) or old (FAILED).
 				 */
+				est = urcu_mcas_status(e);
 				resolved = (est == URCU_MCAS_SUCCEEDED) ?
 						fr->new_ptr : fr->old_ptr;
 				if (resolved != r->old_ptr) {
@@ -808,6 +846,60 @@ void *urcu_mcas_read(void **slot, uintptr_t tag)
 		if (urcu_mcas_status(e) != URCU_MCAS_UNDECIDED)
 			return urcu_mcas_resolve(v, tag);	/* terminal: logical value */
 		urcu_mcas_drive_install(e);		/* help decide, then re-read */
+	}
+}
+
+/*
+ * Prep-time priority resolve: like urcu_mcas_read(), read @slot and return its
+ * current logical value -- but when @slot bears a foreign UNDECIDED proxy,
+ * arbitrate by AGING PRIORITY (urcu_mcas_engage_foreign) instead of only
+ * helping: a starved @self evicts a lower-priority owner rather than waiting on
+ * it.  This lets a mutator resolve a proxied slot to a DEFINITE value before it
+ * has parked anything -- e.g. recompaction prep resolving a proxied child slot
+ * to the one child it will reparent -- with the same bounded-blocking progress
+ * as the install loop, so a stream of peer latches cannot livelock prep.
+ *
+ * @self is the caller's own descriptor (its aging priority); it holds no proxy
+ * on @slot yet (prep runs before @self parks anything).  @depth is the
+ * help-recursion budget (0 at the top-level caller).
+ *
+ * Returns 1 and sets *@out to the resolved definite value.  Returns 0 when a
+ * higher-priority owner holds @slot and the help budget is spent (CAP): the
+ * caller must abort its attempt and retry -- @self's retry count then climbs
+ * until it outranks and can evict the blocker.  The value is definite only AT
+ * the resolve point (the owner may still be unsettled, or a newcomer may
+ * re-proxy the slot after we return), so a caller that will TRANSACT @slot
+ * re-validates at commit through the record's own read-set check (for a
+ * COPY_SLOT, src == V); resolve_prio just picks the value to build against.
+ * Call within an RCU read-side section.
+ */
+static inline
+int urcu_mcas_resolve_prio(void **slot, uintptr_t tag, struct urcu_mcas *self,
+		unsigned int depth, void **out)
+{
+	for (;;) {
+		void *v = uatomic_load(slot, CMM_ACQUIRE);
+		struct urcu_mcas *e;
+
+		if (caa_likely(!urcu_mcas_is_proxy(v, tag))) {
+			*out = v;			/* plain value: done */
+			return 1;
+		}
+		e = urcu_mcas_untag(v, tag)->mcas;
+		if (caa_unlikely(e == self)) {
+			/* Our own proxy (not expected in prep): resolve through it. */
+			*out = urcu_mcas_resolve(v, tag);
+			return 1;
+		}
+		switch (urcu_mcas_engage_foreign(self, e, depth)) {
+		case URCU_MCAS_ENGAGE_CAP:
+			return 0;			/* caller aborts+retries higher */
+		case URCU_MCAS_ENGAGE_RETRY:
+			continue;			/* helped E: re-read */
+		case URCU_MCAS_ENGAGE_RESOLVED:
+			*out = urcu_mcas_resolve(v, tag);	/* E terminal: logical value */
+			return 1;
+		}
 	}
 }
 

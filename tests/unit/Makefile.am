@@ -31,6 +31,7 @@ noinst_PROGRAMS = \
 	test_rcu_mcas_linger \
 	test_rcu_mcas_republish \
 	test_rcu_mcas_copy_slot \
+	test_rcu_mcas_resolve_prio \
 	test_rcu_txn \
 	test_rcu_txn_grow \
 	test_rcu_txn_fallback \
@@ -82,6 +83,7 @@ TESTS = \
 	test_rcu_mcas_linger \
 	test_rcu_mcas_republish \
 	test_rcu_mcas_copy_slot \
+	test_rcu_mcas_resolve_prio \
 	test_rcu_txn \
 	test_rcu_txn_grow \
 	test_rcu_txn_fallback \
@@ -170,6 +172,9 @@ test_rcu_mcas_republish_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
 
 test_rcu_mcas_copy_slot_SOURCES = test_rcu_mcas_copy_slot.c
 test_rcu_mcas_copy_slot_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
+
+test_rcu_mcas_resolve_prio_SOURCES = test_rcu_mcas_resolve_prio.c
+test_rcu_mcas_resolve_prio_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
 
 test_rcu_txn_SOURCES = test_rcu_txn.c
 test_rcu_txn_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)

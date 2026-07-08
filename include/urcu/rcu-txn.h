@@ -698,6 +698,33 @@ int urcu_txn_copy_slot(struct urcu_mcas_txn *txn, void **src, void *val,
 }
 
 /*
+ * Resolve @slot to a definite value by AGING PRIORITY for a mutator that will
+ * transact it in this attempt (see urcu_mcas_resolve_prio): unlike urcu_txn_load
+ * (help-only), a starved attempt EVICTS a lower-priority owner rather than
+ * waiting on it, so a stream of peer proxies cannot livelock the prepare -- e.g.
+ * recompaction resolving a proxied child slot to the one child it will reparent.
+ *
+ * Requires the descriptor to exist: call after urcu_txn_reserve, so this
+ * attempt's descriptor -- carrying its aging priority (txn->retry) -- is
+ * available as @self.  Returns 1 and sets *@out to the resolved value, or 0 when
+ * the caller must abort the attempt and retry at a higher priority (a
+ * higher-priority owner holds @slot and the bounded help budget is spent -- the
+ * next attempt's higher retry lets it outrank and evict the blocker).  The value
+ * is definite only at the resolve point; a caller transacting @slot re-validates
+ * at commit through the record's own read-set check (for a COPY_SLOT, src == V).
+ */
+static inline
+int urcu_txn_resolve_prio(struct urcu_mcas_txn *txn, void **slot, uintptr_t tag,
+		void **out)
+{
+	struct urcu_mcas *self = txn->mcas;
+
+	/* Descriptor must exist (reserve first): it IS @self, the aging priority. */
+	urcu_assert_debug(self && self != URCU_TXN_ENOMEM);
+	return urcu_mcas_resolve_prio(slot, tag, self, 0, out);
+}
+
+/*
  * Register a deferred action to run IFF this attempt commits (finalize).  See
  * struct urcu_txn_defer_action.  Call during the prepare (edge-recording) phase,
  * after begin, before commit.  Bounded: assert on overflow (reserve-style).
