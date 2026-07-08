@@ -3145,35 +3145,79 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 				}
 #endif
 				if (ft->ordered_list) {
-					/* Swap the structural slot(s) AND the head's
-					 * cell in one flip.  The new head is fresh, so
-					 * the flip is the op's sole side-effect: self-
-					 * allocate (NULL txn); on OOM nothing is applied,
-					 * the old head's cell is NOT freed and the replace
-					 * aborts retriably. */
+					/*
+					 * Swap the structural slot(s) AND the head's
+					 * cell in one flip.  MW: the forward edge stores
+					 * into the LIVE holder @d.pnf's child slot, so
+					 * guard it §4.B -- a {live->live} VALIDATE on
+					 * @d.pnf rides the same flip, so a peer that
+					 * relocated/froze @d.pnf ABORTS this commit rather
+					 * than the store landing in a stale/freed slot (the
+					 * SKIP dual's grandparent slot resolves off @d.pnf,
+					 * whose liveness the guard covers).  Pre-reserve the
+					 * txn (guard + swap/publish edges) BEFORE any live
+					 * store so the flip is OOM-infallible; on create
+					 * failure nothing is applied, the old head's cell is
+					 * NOT freed and the replace aborts retriably.
+					 */
 					struct ft_ord_cell *old_cell =
 						ft_ord_cell_ptr((*old_node_ret)->prev);
+					struct ft_flip_txn *txn =
+						ft_flip_txn_create_bounded(
+							FT_ORD_CELL_SWAP_PUBLISH_MAX_EDGES +
+							1 /* §4.B parent guard */);
 
+					if (!txn) {
+						ret = -ENOMEM;
+						goto insert_replace_done;
+					}
+					/* VALIDATE (§4.B): guard the LIVE holder @d.pnf. */
+					ft_flip_txn_guard_parent(ft, txn, d.pnf);
+					/*
+					 * Replace op, not yet MW-hardened (no retry loop):
+					 * on a peer-conflict ABORT the commit installs
+					 * nothing (the old head and its cell stay live), so
+					 * surface -EAGAIN -- the done handler frees @precell
+					 * unpublished and resets @node exactly as the OOM
+					 * path does -- and do NOT free @old_cell (the swap
+					 * did not happen).
+					 */
 					if (ft_ord_cell_swap_publish_multi(ft, old_cell,
 							precell, sedges, n_sedge,
-							NULL) != 0) {
-						ret = -ENOMEM;
+							txn) != 0) {
+						ret = -EAGAIN;
 						goto insert_replace_done;
 					}
 					ft_ord_cell_free(ft, old_cell);
 				} else {
 					/*
-					 * List off: no cell.  The new head is fresh, so
-					 * the flip is the op's sole side-effect with no
-					 * pre-flip live store -- abortable: self-allocate
-					 * (ft_ord_cell_flip_try); on a multi-edge OOM
-					 * nothing is applied, the old head is NOT freed and
-					 * the replace aborts retriably.  A lone edge takes
-					 * the infallible on-stack store.
+					 * List off: no cell.  The forward edge stores into
+					 * the LIVE holder @d.pnf's child slot -- guard it
+					 * §4.B and force the (possibly lone) edge through a
+					 * PRE-RESERVED txn so the guard can ABORT a peer
+					 * conflict: a bare lone store commits infallibly but
+					 * cannot detect one (the not-yet-MW lone-store
+					 * residue).  Pre-reserve BEFORE any live store; on
+					 * create failure nothing is applied, the old head is
+					 * NOT freed and the replace aborts retriably.
 					 */
-					if (ft_ord_cell_flip_try(ft, sedges,
-							n_sedge) != 0) {
+					struct ft_flip_txn *txn =
+						ft_flip_txn_create_bounded(
+							FT_PUB_SEDGE_MAX_EDGES +
+							1 /* §4.B parent guard */);
+
+					if (!txn) {
 						ret = -ENOMEM;
+						goto insert_replace_done;
+					}
+					/* VALIDATE (§4.B): guard the LIVE holder @d.pnf. */
+					ft_flip_txn_guard_parent(ft, txn, d.pnf);
+					/* Replace op, not yet MW-hardened (no retry loop):
+					 * -EAGAIN on a peer-conflict ABORT (nothing
+					 * installed); the caller re-descends. */
+					if (ft_ord_cell_flip_into(ft, txn, sedges,
+							n_sedge) != 0) {
+						ret = -EAGAIN;
 						goto insert_replace_done;
 					}
 				}
