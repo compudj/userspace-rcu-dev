@@ -1,0 +1,599 @@
+// SPDX-FileCopyrightText: 2026 Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+//
+// SPDX-License-Identifier: LGPL-2.1-or-later
+
+#ifndef _URCU_RCU_TXN_SKIPLIST_H
+#define _URCU_RCU_TXN_SKIPLIST_H
+
+/*
+ * rcu-txn-skiplist: an ordered, concurrent-writer skiplist built on the RCU
+ * MCAS engine (<urcu/rcu-mcas.h>).  It is the ordered sibling of the hash-bucket
+ * <urcu/rcu-txn-hlist.h>: a node is a small tower of transacted forward "next"
+ * pointers, and insert/delete/move commit EVERY level of the tower in ONE MCAS,
+ * so a node appears or disappears at all levels atomically.  See the design note
+ * design/rcu-txn-skiplist.md in the benchmark tree for the rationale.
+ *
+ * Why the txn skiplist is simpler than a locking / existence skiplist
+ * ------------------------------------------------------------------
+ * A lock-based or "existence" skiplist links a tower one level at a time, so a
+ * node is transiently half-inserted; coordinating that window is what forces the
+ * classic machinery -- a per-node spinlock (writer exclusion), a seqlock the
+ * readers spin on to detect a half-linked node, and a separate "deleted" word.
+ * MCAS commits all level pointers at once, so the half-linked window never
+ * exists.  That deletes the spinlock AND the seqlock outright, and folds the
+ * "deleted" flag from a word into a single MARK bit in the next pointer -- the
+ * same tombstone <urcu/rcu-txn-hlist.h> carries.  What is left is: a node is an
+ * array of MARK-able "next" slots, and each operation is the hlist edge-recording
+ * pattern applied once per level in a single commit.
+ *
+ * Forward-only: no back pointer (contrast with the hlist's pprev)
+ * --------------------------------------------------------------
+ * A node carries only forward "next" pointers, no per-level "prev".  Deletion
+ * therefore re-derives the per-level predecessors by a top-down search from the
+ * head (O(log n) expected), exactly as a textbook skiplist does.  This is the
+ * OPPOSITE choice from <urcu/rcu-txn-hlist.h>, which keeps a pprev so del(elem)
+ * needs no search -- and the difference is deliberate: pprev costs the hlist one
+ * extra pointer and one extra commit edge because the hlist is single-level,
+ * whereas per-level back pointers would DOUBLE both a skiplist node's footprint
+ * AND (worse, in the MCAS world) the number of transacted slots every insert and
+ * delete must commit, merely to avoid a cheap read-only descent.  The scarce
+ * resource here is commit width -- the slots a descriptor holds, that conflict,
+ * that helpers traverse -- so the skiplist inherits the hlist's MARK but not its
+ * pprev; the search replaces it.
+ *
+ * Node / mark layout
+ * ------------------
+ *   Node: { unsigned int toplevel;                      (highest level index)
+ *           struct urcu_txn_skiplist_node *next[toplevel + 1]; }  (flexible;
+ *                                                 transacted; each MARK-able)
+ * The node is embedded LAST in the caller's element (the flexible array runs
+ * past it); allocate sizeof(element) + (toplevel + 1) * sizeof(void *).  Every
+ * slot -- a node's next[] and the head's next[] -- is transacted under
+ * URCU_TXN_SKIPLIST_TAG (the engine proxy tag, default URCU_MCAS_TAG / bit 0,
+ * overridable before include like the hlist tag).  A "next" value carries an
+ * optional deletion MARK on bit 1 (URCU_TXN_SKIPLIST_MARK), meaning "this node
+ * is logically deleted"; readers strip it per hop (urcu_txn_skiplist_resolve).
+ * URCU_TXN_SKIPLIST_TAG must satisfy (value & TAG) != TAG for every live value a
+ * slot holds (a possibly-MARK-ed node pointer, or NULL) -- holds for bit-0 TAG.
+ *
+ * Why the tombstone is required (and why it is per level)
+ * ------------------------------------------------------
+ * Identical in spirit to <urcu/rcu-txn-hlist.h>.  Two things detect a racing
+ * deletion; only ONE is the mark:
+ *
+ *  (1) A NEIGHBOUR moved -- a structural slot conflict, NOT the mark.  Every
+ *      adjacency at level L is named by the single slot pred[L]->next[L].  An
+ *      insert between pred[L] and its successor, a delete of pred[L], and a
+ *      delete of that successor all CAS THAT SAME slot with the same expected
+ *      old value, so the MCAS commits at most one; the losers fail their
+ *      old-value check, abort, re-search and proceed.  Unlike the hlist there is
+ *      no backward "pprev" edge, so an insert touches only pred[L]->next[L] (no
+ *      successor-side load-validate): every race at a level funnels through that
+ *      one shared slot.
+ *
+ *  (2) The node used AS A PREDECESSOR was deleted -- the mark's one and only job.
+ *      An insert whose pred[L] is @N, racing del(@N), would CAS @N->next[L]
+ *      (its pred slot) while del(@N) CASes @N's OWN predecessor -- disjoint
+ *      slots, so absent a tombstone both commit and the inserted node is
+ *      orphaned (nothing points to it once @N is unlinked).  del(@N) therefore
+ *      MARKs @N->next[L] as part of the same commit, turning the insert's pred
+ *      slot into a shared slot: the insert's old-value check now fails and it
+ *      retries against a fresh search.  Because an insert may use @N as its
+ *      predecessor at ANY level up to @N->toplevel, del MARKs @N->next[L] at
+ *      EVERY level @N occupies -- a level-0-only mark would leave the higher
+ *      levels' inserts unserialized.
+ *
+ * Operations (each one MCAS commit)
+ * ---------------------------------
+ *   insert(new, key)  -- new->toplevel levels, each: pred[L]->next[L]: succ -> new
+ *                        (and new->next[L] = succ, built invisibly).  1 visible
+ *                        edge per level.
+ *   del(key)          -- node's toplevel+1 levels, each: MARK node->next[L], and
+ *                        pred[L]->next[L]: node -> node->next[L].  2 edges/level.
+ *   move              -- del(key) in list A composed with insert(new, key) in
+ *                        list B in ONE txn (see the _prepare forms): a reader
+ *                        sees the key in exactly one of A / B, never both/neither.
+ *
+ * Reclaim, read/write contract, escalation
+ * ----------------------------------------
+ * As in <urcu/rcu-txn-hlist.h>: del() reports whether THIS call removed the node
+ * (so two concurrent deletes cannot double-free); reclaim it after a grace
+ * period.  Mutators commit through <urcu/rcu-txn.h>, which opens an RCU read-side
+ * section per attempt and defers descriptor reclaim through the flavor's
+ * call_rcu; include this header AFTER an RCU flavor.  A self-contained mutator
+ * loops internally until it commits or definitively fails.  The escalation
+ * DOMAIN is taken explicitly (not embedded in the head), so several skiplists may
+ * share one domain.  Readers descend forward within an RCU read-side section
+ * through the accessors below (which resolve the proxy and strip the mark);
+ * never touch the raw fields.
+ *
+ * Composition caveat: buffered writes are invisible to a txn's own loads, and
+ * the _prepare forms search with plain rcu_dereference (not txn loads), so
+ * composing two prepares that touch the SAME skiplist within one txn is not
+ * supported; compose across DISTINCT skiplists (as a move / rotation does).
+ */
+
+#include <errno.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdlib.h>
+
+#include <urcu/compiler.h>
+#include <urcu/uatomic.h>
+#include <urcu/call-rcu.h>
+#include <urcu/rcu-mcas.h>
+#include <urcu/rcu-txn.h>
+#include <urcu-pointer.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* Maximum tower height (levels 0 .. URCU_TXN_SKIPLIST_MAX_LEVELS - 1). */
+#ifndef URCU_TXN_SKIPLIST_MAX_LEVELS
+#define URCU_TXN_SKIPLIST_MAX_LEVELS	8
+#endif
+
+/* Engine proxy tag for every skiplist slot (head and node next[]).  Override
+ * before include to drive the chain under an embedder's own tag (see the hlist
+ * header).  Must satisfy (value & TAG) != TAG for every live value a slot holds. */
+#ifndef URCU_TXN_SKIPLIST_TAG
+#define URCU_TXN_SKIPLIST_TAG		URCU_MCAS_TAG
+#endif
+
+/* Logical-deletion mark: bit 1 of a node's next pointer (matches
+ * <urcu/rcu-txn-hlist.h>; override before include, must be free in every live
+ * "next" value). */
+#ifndef URCU_TXN_SKIPLIST_MARK
+#define URCU_TXN_SKIPLIST_MARK		2UL
+#endif
+
+struct urcu_txn_skiplist_node {
+	unsigned int toplevel;			/* highest level index; next[0..toplevel] */
+	/* transacted, MARK-able forward pointers; flexible array [toplevel + 1] */
+	struct urcu_txn_skiplist_node *next[];
+};
+
+/*
+ * A skiplist is a comparison callback plus a head node whose tower spans all
+ * URCU_TXN_SKIPLIST_MAX_LEVELS (so the descent starts uniformly from it, with no
+ * head special case -- the head's next[] slots are ordinary "next" slots).  cmp
+ * returns <0 / 0 / >0 for node's key <, ==, > @key; it is never called on the
+ * head (the descent only compares head->next[L], which are real keyed nodes).
+ */
+struct urcu_txn_skiplist {
+	int (*cmp)(struct urcu_txn_skiplist_node *node, void *key);
+	struct urcu_txn_skiplist_node *head;
+};
+
+static inline
+void *urcu_txn_skiplist_set_mark(struct urcu_txn_skiplist_node *n)
+{
+	return (void *) ((uintptr_t) n | URCU_TXN_SKIPLIST_MARK);
+}
+
+static inline
+int urcu_txn_skiplist_is_marked(void *v)
+{
+	return (int) ((uintptr_t) v & URCU_TXN_SKIPLIST_MARK);
+}
+
+static inline
+struct urcu_txn_skiplist_node *urcu_txn_skiplist_unmark(void *v)
+{
+	return (struct urcu_txn_skiplist_node *)
+			((uintptr_t) v & ~(uintptr_t) URCU_TXN_SKIPLIST_MARK);
+}
+
+/*
+ * Resolve a raw "next" slot value: strip the engine proxy, then the mark.  Fast
+ * path -- a clean value (neither a proxy under URCU_TXN_SKIPLIST_TAG nor MARK-ed)
+ * is returned untouched.  Mirrors urcu_txn_hlist_resolve.
+ */
+static inline
+struct urcu_txn_skiplist_node *urcu_txn_skiplist_resolve(void *raw)
+{
+	uintptr_t v = (uintptr_t) raw;
+
+	if (caa_unlikely(v & (URCU_TXN_SKIPLIST_TAG | URCU_TXN_SKIPLIST_MARK)))
+		return urcu_txn_skiplist_unmark(
+				urcu_mcas_resolve(raw, URCU_TXN_SKIPLIST_TAG));
+	return (struct urcu_txn_skiplist_node *) raw;
+}
+
+/* Resolved forward step at @level (call within an RCU read-side section). */
+static inline
+struct urcu_txn_skiplist_node *urcu_txn_skiplist_next_rcu(
+		struct urcu_txn_skiplist_node *node, unsigned int level)
+{
+	return urcu_txn_skiplist_resolve(
+			(void *) rcu_dereference(node->next[level]));
+}
+
+/*
+ * Pick a tower height (0 .. MAX-1) from a caller-supplied random word: an
+ * exponential, power-of-two decrease with level (probability 2^-(level+1)),
+ * truncated to the maximum.  The primitive stays PRNG-free -- the caller feeds a
+ * random() word -- so a benchmark can control the distribution.
+ */
+static inline
+unsigned int urcu_txn_skiplist_random_level(unsigned long r)
+{
+	unsigned int level = 0;
+
+	while ((r & 0x1UL) && level < URCU_TXN_SKIPLIST_MAX_LEVELS - 1) {
+		level++;
+		r >>= 1;
+	}
+	return level;
+}
+
+/*
+ * Initialize @node's tower to @toplevel levels, all next NULL.  Call before
+ * handing @node to an insert.  The caller must have allocated toplevel + 1
+ * trailing next[] slots.
+ */
+static inline
+void urcu_txn_skiplist_node_init(struct urcu_txn_skiplist_node *node,
+		unsigned int toplevel)
+{
+	unsigned int i;
+
+	node->toplevel = toplevel;
+	for (i = 0; i <= toplevel; i++)
+		node->next[i] = NULL;
+}
+
+/*
+ * Initialize an empty skiplist: allocate a full-height head node.  Returns 0, or
+ * -ENOMEM.  Pair with urcu_txn_skiplist_destroy().
+ */
+static inline
+int urcu_txn_skiplist_init(struct urcu_txn_skiplist *sl,
+		int (*cmp)(struct urcu_txn_skiplist_node *node, void *key))
+{
+	sl->cmp = cmp;
+	sl->head = (struct urcu_txn_skiplist_node *) malloc(sizeof(*sl->head)
+			+ URCU_TXN_SKIPLIST_MAX_LEVELS * sizeof(sl->head->next[0]));
+	if (sl->head == NULL)
+		return -ENOMEM;
+	urcu_txn_skiplist_node_init(sl->head, URCU_TXN_SKIPLIST_MAX_LEVELS - 1);
+	return 0;
+}
+
+/* Free the head node.  The skiplist must be empty and quiescent. */
+static inline
+void urcu_txn_skiplist_destroy(struct urcu_txn_skiplist *sl)
+{
+	free(sl->head);
+	sl->head = NULL;
+}
+
+static inline
+int urcu_txn_skiplist_empty(struct urcu_txn_skiplist *sl)
+{
+	return urcu_txn_skiplist_next_rcu(sl->head, 0) == NULL;
+}
+
+/*
+ * Descend from the head, recording in @update[L] the predecessor node at each
+ * level (the last node whose key < @key, or the head) and, if @succ is non-NULL,
+ * in @succ[L] that level's successor -- the first node with key >= @key, or NULL.
+ * Returns the level-0 successor (the first node with key >= @key overall).
+ *
+ * The (pred, succ) pair search validates at each level -- pred.key < @key <=
+ * succ.key -- is exactly what a mutator must transact against: the caller uses
+ * @succ[L] as its store's old value, so the commit's old-value check re-proves
+ * pred and succ are still consecutive (nobody spliced in between) while the
+ * key ordering is inherited from this search.  Plain RCU-resolved loads: a
+ * predecessor/successor made stale by a racing update just fails that check and
+ * the caller retries.  Call within an RCU read-side section.
+ */
+static inline
+struct urcu_txn_skiplist_node *urcu_txn_skiplist_search(
+		struct urcu_txn_skiplist *sl, void *key,
+		struct urcu_txn_skiplist_node **update,
+		struct urcu_txn_skiplist_node **succ)
+{
+	struct urcu_txn_skiplist_node *pred = sl->head;
+	struct urcu_txn_skiplist_node *cur = NULL;
+	int level;
+
+	for (level = (int) sl->head->toplevel; level >= 0; level--) {
+		cur = urcu_txn_skiplist_next_rcu(pred, (unsigned int) level);
+		while (cur != NULL && sl->cmp(cur, key) < 0) {
+			pred = cur;
+			cur = urcu_txn_skiplist_next_rcu(pred, (unsigned int) level);
+		}
+		update[level] = pred;
+		if (succ != NULL)
+			succ[level] = cur;
+	}
+	return cur;		/* == succ[0]: first node with key >= @key */
+}
+
+/*
+ * Look up @key.  Returns the node with that key, or NULL.  Call within an RCU
+ * read-side section.  (A node concurrently being deleted may still be returned
+ * -- an RCU-legal race; the resolve strips its mark.)
+ */
+static inline
+struct urcu_txn_skiplist_node *urcu_txn_skiplist_lookup_rcu(
+		struct urcu_txn_skiplist *sl, void *key)
+{
+	struct urcu_txn_skiplist_node *pred = sl->head;
+	struct urcu_txn_skiplist_node *cur;
+	int level;
+
+	for (level = (int) sl->head->toplevel; level >= 0; level--) {
+		cur = urcu_txn_skiplist_next_rcu(pred, (unsigned int) level);
+		while (cur != NULL && sl->cmp(cur, key) < 0) {
+			pred = cur;
+			cur = urcu_txn_skiplist_next_rcu(pred, (unsigned int) level);
+		}
+	}
+	cur = urcu_txn_skiplist_next_rcu(pred, 0);
+	if (cur != NULL && sl->cmp(cur, key) == 0)
+		return cur;
+	return NULL;
+}
+
+/*
+ * urcu_txn_skiplist_insert_prepare: record inserting @newp (whose tower height
+ * newp->toplevel and trailing next[] the caller has already sized/initialized)
+ * under @key into @sl, WITHOUT committing.  Composable form.  Returns 0,
+ * -EEXIST if @key is already present, or -EAGAIN if a predecessor is
+ * mid-deletion (retry).  OOM is sticky to the commit.
+ */
+static inline
+int urcu_txn_skiplist_insert_prepare(struct urcu_mcas_txn *txn,
+		struct urcu_txn_skiplist *sl,
+		struct urcu_txn_skiplist_node *newp, void *key)
+{
+	struct urcu_txn_skiplist_node *update[URCU_TXN_SKIPLIST_MAX_LEVELS];
+	struct urcu_txn_skiplist_node *ssucc[URCU_TXN_SKIPLIST_MAX_LEVELS];
+	struct urcu_txn_skiplist_node *cand;
+	unsigned int level, top = newp->toplevel;
+
+	cand = urcu_txn_skiplist_search(sl, key, update, ssucc);
+	if (cand != NULL && sl->cmp(cand, key) == 0)
+		return -EEXIST;
+	/*
+	 * Splice newp between the (pred, succ) pair search validated at each level:
+	 * pred[L].key < @key < succ[L].key (succ.key is strictly > @key since @key
+	 * is absent).  The store {pred[L]->next[L]: pv -> newp} carries old value
+	 * @pv, which must still resolve to @succ -- so the commit re-proves pred and
+	 * succ are consecutive (no node spliced in between, pred not repointed) at
+	 * the install point, while the key ordering is inherited from search and
+	 * needs no runtime re-check.
+	 */
+	for (level = 0; level <= top; level++) {
+		struct urcu_txn_skiplist_node *pred = update[level];
+		struct urcu_txn_skiplist_node *succ = ssucc[level];
+		void *pv = urcu_txn_load(txn, (void **) &pred->next[level],
+				URCU_TXN_SKIPLIST_TAG);
+
+		/*
+		 * @pred must be alive (its own next not tombstoned) and still adjacent
+		 * to @succ.  is_marked(pv) reports pred's deletion (the mark lives on a
+		 * node's own forward pointer); resolve(pv) != succ means a racing
+		 * insert/delete moved the edge -- re-search either way.
+		 */
+		if (urcu_txn_skiplist_is_marked(pv)
+				|| urcu_txn_skiplist_resolve(pv) != succ)
+			return -EAGAIN;
+		/*
+		 * @succ must not be logically deleted: its mark lives on succ->next[L],
+		 * not on @pv, so the adjacency check above cannot see it.  Fold succ's
+		 * tombstone state into the commit's conflict set with a load-validate
+		 * guard {snv -> snv} -- if @succ is (or becomes, before our install
+		 * point) deleted, the commit aborts and we re-search.
+		 */
+		if (succ != NULL) {
+			void *snv = urcu_txn_load_validate(txn,
+					(void **) &succ->next[level],
+					URCU_TXN_SKIPLIST_TAG);
+
+			if (urcu_txn_skiplist_is_marked(snv))
+				return -EAGAIN;
+		}
+		newp->next[level] = succ;
+		urcu_txn_store(txn, (void **) &pred->next[level], pv, newp,
+				URCU_TXN_SKIPLIST_TAG);
+	}
+	return 0;
+}
+
+/*
+ * urcu_txn_skiplist_del_prepare: record removing the node with @key from @sl,
+ * WITHOUT committing.  On a committed OK, THIS call removed it and *removed is
+ * set to the node (reclaim it after a grace period).  Composable form.  Returns
+ * 0 (recorded; *removed set), -ENOENT if @key is not present or already being
+ * deleted (*removed = NULL; do NOT reclaim), or -EAGAIN (retry).  OOM is sticky
+ * to the commit.
+ */
+static inline
+int urcu_txn_skiplist_del_prepare(struct urcu_mcas_txn *txn,
+		struct urcu_txn_skiplist *sl, void *key,
+		struct urcu_txn_skiplist_node **removed)
+{
+	struct urcu_txn_skiplist_node *update[URCU_TXN_SKIPLIST_MAX_LEVELS];
+	struct urcu_txn_skiplist_node *node, *succ;
+	unsigned int level, top;
+
+	*removed = NULL;
+	/*
+	 * Delete's successor is the victim's OWN forward pointer (node->next[L],
+	 * loaded below), not search's per-level successor (which for the victim is
+	 * the victim itself, since victim.key == @key) -- so pass NULL for @succ.
+	 */
+	node = urcu_txn_skiplist_search(sl, key, update, NULL);
+	if (node == NULL || sl->cmp(node, key) != 0)
+		return -ENOENT;			/* not present */
+	top = node->toplevel;
+	/*
+	 * Each level the node occupies: MARK node->next[L] (logical delete + the
+	 * shared-slot conflict that catches an insert using @node as pred[L]), and
+	 * unlink update[L]->next[L] : node -> node's successor.  Read node->next[L]
+	 * fresh via the txn; an already-MARK-ed next[0] means a peer beat us.  The
+	 * unlink's old value is @node: if a racing update changed update[L]->next[L]
+	 * (neighbour moved / predecessor deleted) the commit's old-value check fails
+	 * and the caller re-searches.
+	 */
+	for (level = 0; level <= top; level++) {
+		void *nv = urcu_txn_load(txn, (void **) &node->next[level],
+				URCU_TXN_SKIPLIST_TAG);
+		void *pv = urcu_txn_load(txn,
+				(void **) &update[level]->next[level],
+				URCU_TXN_SKIPLIST_TAG);
+
+		/* @node itself is already being deleted (its next is tombstoned). */
+		if (urcu_txn_skiplist_is_marked(nv))
+			return level == 0 ? -ENOENT : -EAGAIN;
+		/*
+		 * Validate the predecessor before betting on it.  search() resolves
+		 * marks, so update[level] may be a logically-deleted node, or a racing
+		 * insert/delete may have moved it off @node.  A stale/tombstoned
+		 * predecessor whose slot happens to still read @node would splice a
+		 * dead node's region (orphaning a live node); one whose slot is MARK-ed
+		 * would abort on every retry against the same resolved-through search.
+		 * Bet on the loaded value @pv (which must resolve to @node and be
+		 * unmarked), mirroring insert_prepare's is_marked(sv) guard.
+		 */
+		if (urcu_txn_skiplist_is_marked(pv) ||
+				urcu_txn_skiplist_resolve(pv) != node)
+			return -EAGAIN;
+		/*
+		 * The new successor must not be logically deleted either: we are about
+		 * to make update[level] point at @succ = resolve(nv).  is_marked(nv)
+		 * reports @node's state, not @succ's (a node's mark lives on its OWN
+		 * forward pointer), so @succ may be a tombstoned node still physically
+		 * linked -- splicing update[level] -> @succ(dead) would orphan it.  Fold
+		 * @succ's tombstone state into the commit's conflict set, mirroring
+		 * insert_prepare's successor load-validate guard.
+		 */
+		succ = urcu_txn_skiplist_resolve(nv);
+		if (succ != NULL) {
+			void *snv = urcu_txn_load_validate(txn,
+					(void **) &succ->next[level],
+					URCU_TXN_SKIPLIST_TAG);
+
+			if (urcu_txn_skiplist_is_marked(snv))
+				return -EAGAIN;
+		}
+		urcu_txn_store(txn, (void **) &node->next[level], nv,
+				urcu_txn_skiplist_set_mark(
+					(struct urcu_txn_skiplist_node *) nv),
+				URCU_TXN_SKIPLIST_TAG);
+		urcu_txn_store(txn, (void **) &update[level]->next[level], pv,
+				(struct urcu_txn_skiplist_node *) nv,
+				URCU_TXN_SKIPLIST_TAG);
+	}
+	*removed = node;
+	return 0;
+}
+
+/*
+ * Insert @newp under @key into @sl, transacting through @domain.  Returns 0,
+ * -EEXIST if @key is already present, or -ENOMEM on descriptor OOM.
+ * Self-contained bracket around urcu_txn_skiplist_insert_prepare().
+ */
+static inline
+int urcu_txn_skiplist_add_rcu(struct urcu_txn_skiplist *sl,
+		struct urcu_txn_skiplist_node *newp, void *key,
+		struct urcu_txn_domain *domain)
+{
+	struct urcu_mcas_txn txn;
+	int ret, prep;
+
+	urcu_txn_init(&txn, domain);
+	for (;;) {
+		urcu_txn_begin(&txn);
+		prep = urcu_txn_skiplist_insert_prepare(&txn, sl, newp, key);
+		if (prep == -EAGAIN) {			/* predecessor moved: retry */
+			urcu_txn_conflict(&txn);
+			urcu_txn_end(&txn);
+			continue;
+		}
+		if (prep) {				/* -EEXIST */
+			urcu_txn_end(&txn);
+			return prep;
+		}
+		ret = urcu_txn_commit(&txn);
+		urcu_txn_end(&txn);
+		if (ret != URCU_TXN_STATUS_ABORT)
+			break;
+	}
+	return ret < 0 ? -ENOMEM : 0;
+}
+
+/*
+ * Remove the node with @key from @sl, transacting through @domain.  Returns 1 if
+ * THIS call removed it (and, if @removed is non-NULL, stores the node there for
+ * reclaim after a grace period), 0 if @key was not present, or -ENOMEM on
+ * descriptor OOM.  Self-contained bracket around urcu_txn_skiplist_del_prepare().
+ */
+static inline
+int urcu_txn_skiplist_del_rcu(struct urcu_txn_skiplist *sl, void *key,
+		struct urcu_txn_domain *domain,
+		struct urcu_txn_skiplist_node **removed)
+{
+	struct urcu_txn_skiplist_node *node;
+	struct urcu_mcas_txn txn;
+	int ret, prep;
+
+	if (removed != NULL)
+		*removed = NULL;
+	urcu_txn_init(&txn, domain);
+	for (;;) {
+		urcu_txn_begin(&txn);
+		prep = urcu_txn_skiplist_del_prepare(&txn, sl, key, &node);
+		if (prep == -EAGAIN) {			/* neighbour moved: retry */
+			urcu_txn_conflict(&txn);
+			urcu_txn_end(&txn);
+			continue;
+		}
+		if (prep) {				/* -ENOENT: not present */
+			urcu_txn_end(&txn);
+			return 0;
+		}
+		ret = urcu_txn_commit(&txn);
+		urcu_txn_end(&txn);
+		if (ret != URCU_TXN_STATUS_ABORT)
+			break;
+	}
+	if (ret < 0)
+		return -ENOMEM;
+	if (removed != NULL)
+		*removed = node;
+	return 1;
+}
+
+#define urcu_txn_skiplist_entry(ptr, type, member) \
+	caa_container_of(ptr, type, member)
+
+/* container_of that maps a NULL terminator to a NULL entry. */
+#define urcu_txn_skiplist_entry_safe(ptr, type, member) \
+	__extension__ ({ __typeof__(ptr) ___ptr = (ptr); \
+		___ptr ? urcu_txn_skiplist_entry(___ptr, type, member) : NULL; })
+
+/* Iterate the level-0 chain in key order (within an RCU read-side section). */
+#define urcu_txn_skiplist_for_each_rcu(pos, sl) \
+	for (pos = urcu_txn_skiplist_next_rcu((sl)->head, 0); \
+		(pos) != NULL; \
+		pos = urcu_txn_skiplist_next_rcu(pos, 0))
+
+#define urcu_txn_skiplist_for_each_entry_rcu(pos, sl, member) \
+	for (pos = urcu_txn_skiplist_entry_safe( \
+			urcu_txn_skiplist_next_rcu((sl)->head, 0), \
+			__typeof__(*(pos)), member); \
+		(pos) != NULL; \
+		pos = urcu_txn_skiplist_entry_safe( \
+			urcu_txn_skiplist_next_rcu(&(pos)->member, 0), \
+			__typeof__(*(pos)), member))
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif	/* _URCU_RCU_TXN_SKIPLIST_H */

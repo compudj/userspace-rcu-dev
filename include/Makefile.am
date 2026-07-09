@@ -50,6 +50,7 @@ nobase_include_HEADERS = \
 	urcu/rcu-txn-sw-hlist.h \
 	urcu/rcu-txn-list.h \
 	urcu/rcu-txn-hlist.h \
+	urcu/rcu-txn-skiplist.h \
 	urcu/rcuhlist.h \
 	urcu/rculfhash.h \
 	urcu/rculfqueue.h \
