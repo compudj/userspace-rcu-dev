@@ -436,10 +436,17 @@ void ft_insert_publish_or_park(struct cds_ft *ft,
 		struct cds_ft_inode_flag *parent_nf,
 		struct cds_ft_inode_flag **slot,
 		struct cds_ft_inode_flag *new_top,
+		struct cds_ft_inode_flag *expected_old,
 		struct ft_insert_commit *ic)
 {
 	struct ft_pub_rec rec = { .n = 0 };
 	unsigned int k;
+
+	/*
+	 * @expected_old: the plan-snapshot value of *slot (the old subtree this
+	 * divergence replaces), captured by the caller BEFORE its build so the
+	 * commit CAS rejects a peer that raced the slot -- see ft_pub_rec_add.
+	 */
 
 	/*
 	 * @ic is mandatory and armed by the caller (a bulk insert is a graft /
@@ -454,7 +461,7 @@ void ft_insert_publish_or_park(struct cds_ft *ft,
 	 * covers whichever fires.
 	 */
 	ft_flip_txn_guard_parent(ft, ic->txn, parent_nf);
-	_ft_publish_to_parent(ft, parent_nf, slot, new_top, &rec);
+	_ft_publish_to_parent(ft, parent_nf, slot, new_top, expected_old, &rec);
 	for (k = 0; k < rec.n; k++)
 		ft_flip_txn_record_reserved(ic->txn,
 			(void **) rec.slot[k],
@@ -633,9 +640,21 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 	 */
 	uintptr_t cn_fence;
 	int fret = ft_meta_copying_mark(cn_meta, &cn_fence);
+	struct cds_ft_inode_flag *fwd_expected_old;	/* set post-fence */
 
 	if (fret)
 		return fret;	/* -EAGAIN: peer owns @cn; nothing built */
+
+	/*
+	 * Plan-snapshot the raw grandparent slot NOW (post-fence, pre-build):
+	 * *parent_slot is the skip-PRESERVED, flip-proxy-resolved reference to
+	 * @cn -- a SKIP_X flag under skip-compression, NOT the skip-resolved
+	 * @compressed_flag -- which is exactly what the forward publish CAS must
+	 * match.  Passing @compressed_flag would mismatch the stored SKIP_X
+	 * forever (livelock); re-reading at publish time would ratify a peer
+	 * that raced @cn's grandparent slot during the build.
+	 */
+	fwd_expected_old = ft_resolve_flip_proxy(*parent_slot);
 
 	/*
 	 * Compressed metadata never carries external_nodes
@@ -981,7 +1000,8 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 		ic->live_parent = deferred_parent;
 		ic->live_slot = deferred_slot;
 	}
-	ft_insert_publish_or_park(ft, cur_parent, parent_slot, top_flag, ic);
+	ft_insert_publish_or_park(ft, cur_parent, parent_slot, top_flag,
+		fwd_expected_old, ic);
 
 	/*
 	 * 7. Free the old compressed node.  Parked publish: readers resolve
@@ -1686,7 +1706,8 @@ int ft_attach_node(struct cds_ft *ft,
 			 */
 			ft_flip_txn_guard_parent(ft, ic->txn, idest_meta->parent);
 			_ft_publish_to_parent(ft, attach_node_flag,
-				attach_node_flag_ptr, iter_dest_node_flag, &rec);
+				attach_node_flag_ptr, iter_dest_node_flag,
+				attach_node_flag, &rec);
 			for (k = 0; k < rec.n; k++)
 				ft_flip_txn_record_reserved(ic->txn,
 					(void **) rec.slot[k],
@@ -1783,7 +1804,8 @@ int ft_attach_node(struct cds_ft *ft,
 			ft_flip_txn_guard_parent(ft, ic->txn,
 				attach_meta->parent);
 			_ft_publish_to_parent(ft, attach_node_flag,
-				attach_node_flag_ptr, iter_dest_node_flag, &rec);
+				attach_node_flag_ptr, iter_dest_node_flag,
+				attach_node_flag, &rec);
 			for (k = 0; k < rec.n; k++)
 				ft_flip_txn_record_reserved(ic->txn,
 					(void **) rec.slot[k],
@@ -2023,7 +2045,9 @@ int ft_insert_compressed_past_child(struct cds_ft *ft,
 	ic->live_child = (struct cds_ft_inode_flag *) cn->child;
 	ic->live_parent = branch;
 	ic->live_slot = NULL;
-	ft_insert_publish_or_park(ft, d->nf, &cn->child, branch, ic);
+	/* &cn->child's plan-snapshot old is the displaced child == ic->live_child. */
+	ft_insert_publish_or_park(ft, d->nf, &cn->child, branch,
+		ic->live_child, ic);
 	/*
 	 * I5 count fold: @d->nf is the STABLE compressed node whose child slot
 	 * (&cn->child) this commit flips to the fresh branch; the branch was
@@ -2106,6 +2130,7 @@ int ft_insert_compressed_key_shorter(struct cds_ft *ft,
 		(struct cds_ft_inode *) ft_compressed_node_ptr(d->nf));
 	uintptr_t cn_fence;
 	int sret;
+	struct cds_ft_inode_flag *fwd_expected_old;	/* set post-fence */
 
 	/*
 	 * A key-shorter insert is always a NEW key: a key ending inside a
@@ -2125,6 +2150,16 @@ int ft_insert_compressed_key_shorter(struct cds_ft *ft,
 	sret = ft_meta_copying_mark(cn_meta, &cn_fence);
 	if (sret)
 		return sret;	/* -EAGAIN: peer owns the cn; nothing built */
+
+	/*
+	 * Plan-snapshot the raw parent slot NOW (post-fence, pre-build): the
+	 * skip-PRESERVED, flip-proxy-resolved reference to @d->nf the forward
+	 * publish CAS must match.  @d->nf is skip-RESOLVED, so under
+	 * skip-compression it differs from the stored SKIP_X (livelock if
+	 * passed); capturing pre-build also avoids ratifying a peer that raced
+	 * the slot during the split builder.
+	 */
+	fwd_expected_old = ft_resolve_flip_proxy(*d->nfp);
 
 	sret = ft_split_compressed_key_shorter(ft,
 		d->nf, d->nfp, remaining, &top_flag, &jct_flag, d->depth,
@@ -2226,7 +2261,8 @@ int ft_insert_compressed_key_shorter(struct cds_ft *ft,
 	ic->live_child = live_child;
 	ic->live_parent = live_parent;
 	ic->live_slot = live_slot;
-	ft_insert_publish_or_park(ft, d->pnf, d->nfp, top_flag, ic);
+	ft_insert_publish_or_park(ft, d->pnf, d->nfp, top_flag,
+		fwd_expected_old, ic);
 	/*
 	 * I4 count fold: @d->pnf is the STABLE parent whose child slot (d->nfp)
 	 * this commit flips from the old compressed node to the fresh split
@@ -3549,7 +3585,8 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 			/* VALIDATE (§4.B): guard the LIVE holder parent_nf. */
 			ft_flip_txn_guard_parent(ft, txn, parent_nf);
 			_ft_publish_to_parent(ft, parent_nf, pub_slot,
-				(struct cds_ft_inode_flag *) new_node, &rec);
+				(struct cds_ft_inode_flag *) new_node,
+				(struct cds_ft_inode_flag *) old_node, &rec);
 			n_s = ft_pub_rec_sedges(&rec, sedges);
 			/*
 			 * Fuse @old_node's freeze (mark old_node->next, target
@@ -3587,7 +3624,8 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 			/* VALIDATE (§4.B): guard the LIVE holder parent_nf. */
 			ft_flip_txn_guard_parent(ft, txn, parent_nf);
 			_ft_publish_to_parent(ft, parent_nf, pub_slot,
-				(struct cds_ft_inode_flag *) new_node, &rec);
+				(struct cds_ft_inode_flag *) new_node,
+				(struct cds_ft_inode_flag *) old_node, &rec);
 			n_s = ft_pub_rec_sedges(&rec, sedges);
 			/* Fuse @old_node's freeze into the structural publish (doc §4.B). */
 			ft_hlist_freeze_prepare(ft_flip_txn_handle(txn), old_node);

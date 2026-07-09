@@ -1510,8 +1510,9 @@ skip_copy:
 							new_node_flag, cn->len);
 
 					if (rec)
+						/* SW compaction: *slot == plan old. */
 						ft_pub_rec_add(rec, skip_slot,
-							skip_new);
+							*skip_slot, skip_new);
 					else
 						*skip_slot = skip_new;
 				}
@@ -1608,7 +1609,9 @@ skip_copy:
 	 * architecture expose an unwired copy).
 	 */
 	if (mode == FT_RECOMPACT_RELOCATE)
-		ft_pub_rec_add(rec, old_node_flag_ptr, new_node_flag);
+		/* SW compaction: *slot == plan old. */
+		ft_pub_rec_add(rec, old_node_flag_ptr, *old_node_flag_ptr,
+			new_node_flag);
 	else
 		*old_node_flag_ptr = new_node_flag;
 	if (old_node && old_node_ret)

@@ -63,6 +63,7 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 		struct cds_ft_inode_flag *iter_node_flag,
 		struct cds_ft_inode_flag **detach_parent_flag_ptr,
 		struct cds_ft_node *topmost_external_nodes,
+		struct cds_ft_inode_flag *elevated_old_child,
 		int *nr_clear,
 		struct ft_ord_cell *fuse_cell,
 		struct ft_remove_pub *pub,
@@ -157,7 +158,7 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			_ft_publish_to_parent(ft, ft_compressed_node_flag(cn),
 				&cn->child,
 				(struct cds_ft_inode_flag *) topmost_external_nodes,
-				&rec);
+				elevated_old_child, &rec);
 			if (ft_remove_commit_rec(ft, &rec, fuse_cell, run,
 					txn) > 0)
 				/* Peer won: nothing installed (txn consumed). */
@@ -180,7 +181,7 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			_ft_publish_to_parent(ft, ft_compressed_node_flag(cn),
 				&cn->child,
 				(struct cds_ft_inode_flag *) topmost_external_nodes,
-				&rec);
+				elevated_old_child, &rec);
 			if (ft_remove_commit_rec(ft, &rec, NULL, NULL, txn) > 0)
 				/* Peer won: nothing installed (txn consumed). */
 				return -EAGAIN;
@@ -229,7 +230,8 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			ft_flip_txn_guard_parent(ft, txn, src_meta->parent);
 			_ft_publish_to_parent(ft, src_meta->parent,
 				detach_parent_flag_ptr,
-				ft_node_flag(fresh, 0), &rec);
+				ft_node_flag(fresh, 0),
+				iter_node_flag, &rec);
 			/*
 			 * Freeze the retired compressed node dead (§4.B freeze-on-
 			 * free): this compressed->fresh-internal recompaction retires
@@ -601,6 +603,14 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 	{
 		struct ft_pub_rec rec = { .n = 0 };
 		struct cds_ft_inode_flag *new_cn_pub;
+		/*
+		 * Plan snapshot of publish_slot's old value: it still holds the
+		 * collapsed chain's reference (parent_cn's grandparent flag, or
+		 * @iter_node_flag) resolved just above -- nothing has been stored
+		 * yet.  The commit CAS rejects a peer that raced it (see
+		 * ft_pub_rec_add).
+		 */
+		struct cds_ft_inode_flag *pub_expected_old = *publish_slot;
 
 		/*
 		 * Chain-compress canonicalization publish: the merged compressed
@@ -624,7 +634,7 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		/* VALIDATE (§4.B): guard the LIVE (great-)grandparent publish_parent. */
 		ft_flip_txn_guard_parent(ft, txn, publish_parent);
 		_ft_publish_to_parent_meta(ft, publish_parent, publish_slot,
-			new_cn_pub, new_cn_meta, NULL, &rec);
+			new_cn_pub, pub_expected_old, new_cn_meta, NULL, &rec);
 		/*
 		 * Freeze-on-free (doc §4.B, atomic detach): the collapsed chain
 		 * this commit retires -- the 1-child boundary @iter_node_flag and
@@ -789,6 +799,15 @@ int ft_detach_node(struct cds_ft *ft,
 	 * chain reaches the original detach child).
 	 */
 	struct cds_ft_inode_flag *elevated_old_child;
+	/*
+	 * Snapshot of the holder slot (@detach_parent_flag_ptr) taken BEFORE
+	 * ft_node_replace_ptr overwrites @iter_node_flag with the fresh
+	 * recompacted copy: the plan-snapshot expected-old for the forward
+	 * republish that flips the holder slot to that copy (defect #1).  In the
+	 * external-promote sub-case (no recompaction) it equals the unchanged
+	 * @iter_node_flag, so the same-value republish still holds.
+	 */
+	struct cds_ft_inode_flag *holder_old_flag;
 	/*
 	 * nr_keys count fold (LEAF Increment 2): the removed leaf's @count_delta
 	 * (-1, or 0 for a count-neutral move detach) rides the SAME commit that
@@ -1061,6 +1080,8 @@ int ft_detach_node(struct cds_ft *ft,
 
 	iter_node_flag = *detach_parent_flag_ptr;
 	elevated_old_child = *detach_node_flag_ptr;
+	/* Plan-snapshot the holder slot before any recompaction overwrite. */
+	holder_old_flag = iter_node_flag;
 
 	/*
 	 * Replace within parent.  If the parent is a compressed node:
@@ -1215,7 +1236,8 @@ int ft_detach_node(struct cds_ft *ft,
 			}
 			ret = ft_detach_node_replace_compressed_parent(ft,
 				iter_node_flag, detach_parent_flag_ptr,
-				topmost_external_nodes, &nr_clear, fuse_cell,
+				topmost_external_nodes, elevated_old_child,
+				&nr_clear, fuse_cell,
 				pub, run, orphan_txn, count_delta);
 			if (ret) {
 				/*
@@ -1770,7 +1792,8 @@ int ft_detach_node(struct cds_ft *ft,
 			/* VALIDATE (§4.B): guard the LIVE grandparent iter_meta->parent. */
 			ft_flip_txn_guard_parent(ft, commit_txn, iter_meta->parent);
 			_ft_publish_to_parent(ft, iter_meta->parent,
-				detach_parent_flag_ptr, iter_node_flag, &rec);
+				detach_parent_flag_ptr, iter_node_flag,
+				holder_old_flag, &rec);
 			/*
 			 * nr_keys fold (LEAF Increment 2): the recompaction's -1
 			 * walk from the STABLE grandparent iter_meta->parent (the
@@ -1851,7 +1874,8 @@ int ft_detach_node(struct cds_ft *ft,
 			/* VALIDATE (§4.B): guard the LIVE grandparent iter_meta->parent. */
 			ft_flip_txn_guard_parent(ft, commit_txn, iter_meta->parent);
 			_ft_publish_to_parent(ft, iter_meta->parent,
-				detach_parent_flag_ptr, iter_node_flag, &rec);
+				detach_parent_flag_ptr, iter_node_flag,
+				holder_old_flag, &rec);
 			/*
 			 * nr_keys fold (LEAF Increment 2): a non-fused RECOMPACTION
 			 * folds the -1 walk from the stable grandparent onto this
@@ -2120,8 +2144,9 @@ int ft_promote_head(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 		ft_flip_txn_guard_parent(ft, txn, parent_nf);
 		_ft_publish_to_parent_meta(ft, parent_nf,
 			(struct cds_ft_inode_flag **) head_slot,
-			(struct cds_ft_inode_flag *) next_node, NULL,
-			new_cell_flag, &rec);
+			(struct cds_ft_inode_flag *) next_node,
+			(struct cds_ft_inode_flag *) node,
+			NULL, new_cell_flag, &rec);
 		n_s = ft_pub_rec_sedges(&rec, sedges);
 		/*
 		 * Fuse @node's freeze (mark node->next, target preserved) into the
@@ -2181,8 +2206,9 @@ int ft_promote_head(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 		ft_flip_txn_guard_parent(ft, txn, parent_nf);
 		_ft_publish_to_parent_meta(ft, parent_nf,
 			(struct cds_ft_inode_flag **) head_slot,
-			(struct cds_ft_inode_flag *) next_node, NULL,
-			inherit /* folded prev: intended parent value */, &rec);
+			(struct cds_ft_inode_flag *) next_node,
+			(struct cds_ft_inode_flag *) node,
+			NULL, inherit /* folded prev: intended parent value */, &rec);
 		n_s = ft_pub_rec_sedges(&rec, sedges);
 		/* Fuse @node's freeze into the structural publish (doc §4.B). */
 		ft_hlist_freeze_prepare(ft_flip_txn_handle(txn), node);
@@ -2282,7 +2308,8 @@ int ft_unchain_node(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 		/* VALIDATE (§4.B): guard the LIVE holder this head-clear publishes into. */
 		ft_flip_txn_guard_parent(ft, txn, parent_nf);
 		_ft_publish_to_parent(ft, parent_nf,
-			(struct cds_ft_inode_flag **) head_slot, NULL, &rec);
+			(struct cds_ft_inode_flag **) head_slot, NULL,
+			(struct cds_ft_inode_flag *) node, &rec);
 		n_s = ft_pub_rec_sedges(&rec, sedges);
 		ft_hlist_freeze_prepare(ft_flip_txn_handle(txn), node);
 		if (ft_ord_cell_flip_into(ft, txn, sedges, n_s) > 0)

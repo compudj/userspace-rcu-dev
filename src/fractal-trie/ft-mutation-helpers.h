@@ -2263,7 +2263,11 @@ void ft_pub_rec_add_back_edge(struct cds_ft *ft, struct ft_pub_rec *rec,
 		field = (struct cds_ft_inode_flag **)
 			&((struct cds_ft_node *) child)->prev;
 	}
-	ft_pub_rec_add(rec, field, new_parent);
+	/*
+	 * Back-edge expected-old = the child's current back-pointer (cell->parent
+	 * / prev); matches the sibling ft_reparent_record_meta's raw meta->parent.
+	 */
+	ft_pub_rec_add(rec, field, *field, new_parent);
 }
 
 /*
@@ -3818,7 +3822,7 @@ void ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue *g,
 	/* VALIDATE (§4.B): guard the LIVE dst parent this cluster publishes into. */
 	ft_flip_txn_guard_parent(ft, g->txn, g->publish_parent);
 	_ft_publish_to_parent(ft, g->publish_parent, g->publish_slot, g->top,
-		&rec);
+		*g->publish_slot /* SW graft: still holds the old child */, &rec);
 	for (j = 0; j < rec.n; j++)
 		ft_flip_txn_record_reserved(g->txn, (void **) rec.slot[j],
 			rec.old_val[j], rec.new_val[j]);
@@ -4036,7 +4040,7 @@ void ft_glue_publish(struct cds_ft *ft, struct ft_flip_txn *txn,
 	/* VALIDATE (§4.B): guard the LIVE dst parent this cluster publishes into. */
 	ft_flip_txn_guard_parent(ft, txn, g->publish_parent);
 	_ft_publish_to_parent(ft, g->publish_parent, g->publish_slot, g->top,
-		&rec);
+		*g->publish_slot /* SW graft: still holds the old child */, &rec);
 	n = ft_pub_rec_sedges(&rec, sedges);
 	/*
 	 * Order-statistics fold (BULK): record the +count_delta nr_keys walk
@@ -4075,7 +4079,7 @@ void ft_glue_publish_replace(struct cds_ft *ft, struct ft_flip_txn *txn,
 	/* VALIDATE (§4.B): guard the LIVE dst parent this cluster publishes into. */
 	ft_flip_txn_guard_parent(ft, txn, g->publish_parent);
 	_ft_publish_to_parent(ft, g->publish_parent, g->publish_slot, g->top,
-		&rec);
+		*g->publish_slot /* SW graft: still holds the old child */, &rec);
 	/* Order-statistics fold (BULK): see ft_glue_publish. */
 	if (g->count_delta)
 		ft_flip_txn_record_count_parent(ft, txn, g->publish_parent,

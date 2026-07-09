@@ -1961,11 +1961,21 @@ struct cds_ft_metadata *ft_skip_to_compressed_meta(struct cds_ft *ft,
  */
 static
 void ft_pub_rec_add(struct ft_pub_rec *rec, struct cds_ft_inode_flag **slot,
+		struct cds_ft_inode_flag *expected_old,
 		struct cds_ft_inode_flag *new_val)
 {
 	assert(rec->n < 3);
 	rec->slot[rec->n] = slot;
-	rec->old_val[rec->n] = *slot;
+	/*
+	 * @expected_old is the value the slot held in the snapshot the
+	 * publishing PLAN was derived from -- NOT a fresh *slot re-read at
+	 * record time.  Recording the plan snapshot makes the commit-time
+	 * MCAS reject (abort) a peer that published into this slot between the
+	 * plan and the record, instead of ratifying the stale plan because a
+	 * fresh raw capture happens to match the peer's value (CORE_682870
+	 * defect #1: "stale plan ratified by fresh expected-old").
+	 */
+	rec->old_val[rec->n] = expected_old;
 	rec->new_val[rec->n] = new_val;
 	rec->n++;
 }
@@ -1975,10 +1985,19 @@ void _ft_publish_to_parent_meta(struct cds_ft *ft,
 		struct cds_ft_inode_flag *parent_nf,
 		struct cds_ft_inode_flag **parent_slot,
 		struct cds_ft_inode_flag *new_child,
+		struct cds_ft_inode_flag *expected_old,
 		struct cds_ft_metadata *new_child_meta,
 		void *folded_child_prev,
 		struct ft_pub_rec *rec)
 {
+	/*
+	 * @expected_old: the value @parent_slot held in the snapshot the
+	 * caller's publish plan was derived from (the RECORDED path only; the
+	 * direct rec==NULL arms below republish a same value and ignore it).
+	 * The compressed-parent SKIP_X dual mirrors the same child, so its
+	 * plan-snapshot value is ft_skip_compressed_flag(expected_old, cn->len)
+	 * -- both edges commit against the plan, not a record-time re-read.
+	 */
 	/*
 	 * @new_child_meta (optional): @new_child's metadata, supplied by the
 	 * caller so we DON'T recover it from the slot value.  Required when the
@@ -2122,7 +2141,10 @@ void _ft_publish_to_parent_meta(struct cds_ft *ft,
 						cn->len);
 
 				if (rec)
-					ft_pub_rec_add(rec, skip_slot, skip_new);
+					ft_pub_rec_add(rec, skip_slot,
+						ft_skip_compressed_flag(
+							expected_old, cn->len),
+						skip_new);
 				else if (*skip_slot != skip_new)
 					rcu_assign_pointer(*skip_slot, skip_new);
 			}
@@ -2157,7 +2179,7 @@ void _ft_publish_to_parent_meta(struct cds_ft *ft,
 		FT_TP(root_publish, (const void *) ft,
 			(const void *) new_child);
 	if (rec)
-		ft_pub_rec_add(rec, parent_slot, new_child);
+		ft_pub_rec_add(rec, parent_slot, expected_old, new_child);
 	else if (*parent_slot != new_child)
 		/*
 		 * Direct (rec == NULL) publish.  The only two callers -- the
@@ -2182,20 +2204,26 @@ void _ft_publish_to_parent(struct cds_ft *ft,
 		struct cds_ft_inode_flag *parent_nf,
 		struct cds_ft_inode_flag **parent_slot,
 		struct cds_ft_inode_flag *new_child,
+		struct cds_ft_inode_flag *expected_old,
 		struct ft_pub_rec *rec)
 {
 	_ft_publish_to_parent_meta(ft, parent_nf, parent_slot, new_child,
-		NULL, NULL, rec);
+		expected_old, NULL, NULL, rec);
 }
 
-/* Direct publish (original behaviour): perform the stores immediately. */
+/*
+ * Direct publish (original behaviour): perform the stores immediately.
+ * rec == NULL, so @expected_old is unused (the direct arm republishes the
+ * value already present); pass the live slot value to satisfy the interface.
+ */
 static
 void ft_publish_to_parent(struct cds_ft *ft,
 		struct cds_ft_inode_flag *parent_nf,
 		struct cds_ft_inode_flag **parent_slot,
 		struct cds_ft_inode_flag *new_child)
 {
-	_ft_publish_to_parent(ft, parent_nf, parent_slot, new_child, NULL);
+	_ft_publish_to_parent(ft, parent_nf, parent_slot, new_child,
+		*parent_slot, NULL);
 }
 
 /*

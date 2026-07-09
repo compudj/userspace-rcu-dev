@@ -625,7 +625,9 @@ void ft_store_at_graft_point_commit(struct cds_ft *ft,
 			ft_flip_txn_guard_parent(ft, st->glue->txn,
 				st->publish_pmeta->parent);
 			_ft_publish_to_parent(ft, st->dest,
-				st->pnfp, st->dest, &st->reserve_rec);
+				st->pnfp, st->dest,
+				*st->pnfp /* SW graft: old dst node */,
+				&st->reserve_rec);
 			for (k = 0; k < st->reserve_rec.n; k++)
 				ft_flip_txn_record_reserved(st->glue->txn,
 					(void **) st->reserve_rec.slot[k],
