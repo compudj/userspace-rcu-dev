@@ -1002,12 +1002,11 @@ void ft_meta_nr_child_dec(struct cds_ft_metadata *meta)
 /*
  * parent_slot_offset: the pointer-stride offset of this node's slot in its
  * parent body, held in @state bits FT_STATE_PSO_SHIFT.. (above nr_child).  This
- * raw reader suits a node the caller owns / that is quiescent (all backtrack
- * callers today run under writer exclusion); the setter replaces only the
- * offset field and preserves nr_child + the tag bits.  When concurrent writers
- * land (Phase 4.3), a resolving _load variant will mirror ft_meta_nr_child_load
- * to skip a mid-commit proxy.  Root nodes (parent == NULL) leave this 0 and
- * never read it.
+ * raw reader suits a node the caller owns / that is quiescent; a reader that may
+ * race a mid-commit proxy uses the resolving ft_meta_parent_slot_offset_load,
+ * and a backtracker recovering the (parent, offset) PAIR must use
+ * ft_resolve_parent_slot (same-mcas + stability re-read).  Root nodes
+ * (parent == NULL) leave this 0 and never read it.
  */
 static inline
 unsigned int ft_meta_parent_slot_offset(const struct cds_ft_metadata *meta)
@@ -1016,11 +1015,55 @@ unsigned int ft_meta_parent_slot_offset(const struct cds_ft_metadata *meta)
 			& FT_STATE_PSO_VALMASK);
 }
 
+/*
+ * The setter replaces only the offset field and preserves nr_child + the tag
+ * bits.  It CASes for the two reasons ft_meta_nr_child_inc above documents:
+ * @state is shared with nr_child, TOMBSTONE and COPYING, which peers update by
+ * cmpxchg, so a plain read-modify-write would LOSE a peer's concurrent update;
+ * and when a peer has parked an FT_STATE_PROXY the word holds a PROXY POINTER,
+ * so masking an offset into it would mint a corrupted near-pointer that a
+ * resolver later chases.
+ *
+ * Both hazards are REACHABLE TODAY on the concurrent point-op path: the
+ * in-place reserve insert republishes the LIVE attach node at its own slot
+ * (ft-insert.h, "In-place reserve (dest == attach node)"), reaching this setter
+ * via _ft_publish_to_parent_meta on a node peers are mutating.  A peer
+ * reserving a different byte in that same node CASes its nr_child
+ * (_ft_node_set_nth -> ft_meta_nr_child_inc), and a peer re-homing it parks an
+ * FT_STATE_PROXY on its state (ft_reparent_record_meta).  The node is not
+ * COPYING-fenced there, and the op guards its GRANDparent, not it.
+ *
+ * The remaining LIVE-node callers -- ft_glue_record_back_edge and the whole-trie
+ * detach root -- are safe only because merge / graft / compaction still run
+ * under the application's mutual exclusion between mutators, and are not yet
+ * MW-hardened.  Making this word CAS-only removes its last plain RMW, which is
+ * also the precondition for letting those bulk ops run concurrently.
+ *
+ * Wait out a parked proxy rather than skipping it: the offset must land on the
+ * settled word, and the wait is bounded by the owner's settle.  Skip the CAS
+ * entirely when the offset is unchanged -- the in-place reserve's same-value
+ * republish is the hot case.  A fresh single-owner node pays one uncontended
+ * CAS.
+ */
 static inline
 void ft_meta_parent_slot_offset_set(struct cds_ft_metadata *meta, unsigned int off)
 {
-	meta->state = (meta->state & ~FT_STATE_PSO_MASK)
-		| (((uintptr_t) off & FT_STATE_PSO_VALMASK) << FT_STATE_PSO_SHIFT);
+	for (;;) {
+		uintptr_t s = CMM_LOAD_SHARED(meta->state);
+		uintptr_t n;
+
+		if (caa_unlikely(s & FT_STATE_PROXY)) {
+			caa_cpu_relax();
+			continue;
+		}
+		n = (s & ~FT_STATE_PSO_MASK)
+			| (((uintptr_t) off & FT_STATE_PSO_VALMASK)
+				<< FT_STATE_PSO_SHIFT);
+		if (n == s)
+			return;		/* same-value republish: nothing to do */
+		if (caa_likely(uatomic_cmpxchg(&meta->state, s, n) == s))
+			return;
+	}
 }
 
 /*
