@@ -1428,7 +1428,40 @@ skip_copy:
 	if (old_node) {
 		struct cds_ft_metadata *old_meta =
 			cds_ft_item_to_metadata(old_node);
-		struct cds_ft_inode_flag *old_parent = old_meta->parent;
+		/*
+		 * F1 discipline on the BACK-EDGE: never clone a peer's parked flip
+		 * proxy into the fresh copy's parent.  The peer's txn record names
+		 * the OLD node's &meta->parent, so a cloned proxy at the fresh
+		 * copy's meta->parent is owned by nobody and is NEVER settled: it
+		 * outlives the owner's reclaim (its rcu_head is already queued),
+		 * so ft_resolve_parent_slot() either spins forever in its
+		 * unbounded for(;;) -- the "parent parked but offset settled" arm,
+		 * observed as a 1-core MW livelock -- or later resolves through
+		 * freed descriptor memory (the CORE_682870 dangling-proxy UAF).
+		 *
+		 * Resolving is exact, not just a fresher guess, because a
+		 * parked @meta->parent here is always a DOOMED peer.  The only
+		 * writer that parks it is ft_reparent_record_meta(), which ALWAYS
+		 * records the &meta->state edge alongside it.  So either the peer
+		 * parked before our ft_meta_copying_mark(), which then observed
+		 * FT_STATE_PROXY and bailed -EAGAIN (we never reach here), or it
+		 * parks after, and its state-word install fails against the word
+		 * the fence pinned to {COPYING|s -> TOMBSTONE|s}, aborting it.
+		 * Either way ft_resolve_flip_proxy() returns old_ptr == the true
+		 * current parent.  (A peer that COMMITTED before the mark leaves a
+		 * plain, coherent new parent; the caller's ft_get_parent_slot()
+		 * re-validate handles that orthogonal case.)
+		 *
+		 * Resolving also keeps ft_node_compressed() below from misreading
+		 * the 0xF proxy tag (bit 1 set) as a compressed node.
+		 *
+		 * The unfenced arms (retire_txn == NULL / @cluster_leaf) copy only
+		 * build-invisible nodes, into whose meta->parent no peer can park:
+		 * there the resolve is the identity.
+		 */
+		struct cds_ft_inode_flag *old_parent = ft_resolve_flip_proxy(
+			(struct cds_ft_inode_flag *)
+				rcu_dereference(old_meta->parent));
 
 		new_metadata->parent = old_parent;
 		/*
