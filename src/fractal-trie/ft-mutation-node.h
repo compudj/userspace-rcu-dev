@@ -1129,14 +1129,18 @@ int ft_node_recompact(enum ft_recompact mode,
 			new_metadata->parent = inh_parent;
 			/* The retyped node keeps its own incoming edge byte. */
 			new_metadata->incoming_byte = metadata->incoming_byte;
-#ifdef FEATURE_FT_SKIP_COMPRESSED
+			/*
+			 * Set the offset on EVERY build: it is no longer
+			 * skip-specific -- it backs the parent-pointer backtrack's
+			 * O(1) slot recovery for plain-internal nodes too.  It must
+			 * come from @inh_slot (the coherent snapshot above), never
+			 * from a second raw read of the state word, which would tear
+			 * against @inh_parent.
+			 */
 			ft_meta_parent_slot_offset_set(new_metadata, inh_parent ?
 				(unsigned int) ((char *) inh_slot -
 					(char *) ft_node_ptr(inh_parent))
 					/ sizeof(void *) : 0);
-#else
-			(void) inh_slot;
-#endif
 			ext_snapshot = (struct cds_ft_node *)
 				rcu_dereference(metadata->external_nodes);
 			if (caa_unlikely(ft_node_flip_proxy(
@@ -1463,16 +1467,30 @@ skip_copy:
 			(struct cds_ft_inode_flag *)
 				rcu_dereference(old_meta->parent));
 
-		new_metadata->parent = old_parent;
 		/*
-		 * The recompacted node replaces the old node at the SAME slot
-		 * in the SAME parent, so its parent-slot offset is identical.
-		 * Inherit it on every build (the offset is no longer
-		 * skip-specific -- it backs the parent-pointer backtrack's O(1)
-		 * slot recovery for plain-internal nodes too).
+		 * Inherit (parent, offset) ONLY for a dest with no @metadata --
+		 * a build-invisible node (fresh cluster/junction) that no peer can
+		 * reach, so nothing parks its back-edge and the raw pair below is
+		 * trivially coherent.
+		 *
+		 * A LIVE node (@metadata set) already got its (parent, offset)
+		 * from the ONE coherent ft_resolve_parent_slot() snapshot above.
+		 * Re-deriving them here from two raw reads would TEAR against that
+		 * snapshot if a peer re-homed the node in between: the parent
+		 * pointer and the state-word offset flip as a co-committed PAIR
+		 * (ft_reparent_record_meta), and only ft_resolve_parent_slot's
+		 * same-mcas + stability re-read recovers them atomically.  It is
+		 * currently a same-value rewrite because the COPYING fence keeps
+		 * a peer from parking either edge -- but relying on the fence for
+		 * COHERENCE (as opposed to for the resolve's exactness below) is
+		 * an invariant this code should not have to know.
 		 */
-		ft_meta_parent_slot_offset_set(new_metadata,
-			ft_meta_parent_slot_offset(old_meta));
+		assert(!metadata || metadata == old_meta);
+		if (!metadata) {
+			new_metadata->parent = old_parent;
+			ft_meta_parent_slot_offset_set(new_metadata,
+				ft_meta_parent_slot_offset(old_meta));
+		}
 
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 		if (old_parent && ft_node_compressed(old_parent)) {
