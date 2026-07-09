@@ -860,8 +860,21 @@ int ft_detach_node(struct cds_ft *ft,
 		if (detach_child && !ft_node_external(detach_child)) {
 			struct cds_ft_metadata *child_meta =
 				ft_flag_to_metadata(ft, detach_child);
+			/*
+			 * Resolve a parked flip proxy before capture: a concurrent
+			 * one-commit splice (ft_insert_park_external_nodes)
+			 * transiently installs its descriptor in external_nodes, and
+			 * this value is republished RAW into cn->child + the SKIP_X
+			 * dual by the external-promote below.  Snapshotting a peer's
+			 * latch into a structural slot leaves a dangling descriptor
+			 * once that txn settles and reclaims -- and the SKIP_X form
+			 * dispatches the 0xF flag as a node (ft_node_external fails ->
+			 * item_to_metadata faults).  Mirror every ft_dereference_external
+			 * descent reader; the common no-splice case is one masked test.
+			 */
 			if (child_meta && child_meta->external_nodes)
-				topmost_external_nodes = child_meta->external_nodes;
+				topmost_external_nodes = ft_dereference_external(
+					child_meta->external_nodes);
 		}
 	}
 
@@ -972,8 +985,10 @@ int ft_detach_node(struct cds_ft *ft,
 		 * on the path is the one promoted; prev_external_nodes_found then
 		 * stops the climb at the next, surviving level).
 		 */
+		/* Resolve a parked splice proxy before republish (see above). */
 		if (metadata->external_nodes && !topmost_external_nodes)
-			topmost_external_nodes = metadata->external_nodes;
+			topmost_external_nodes = ft_dereference_external(
+				metadata->external_nodes);
 		if (topmost_external_nodes)
 			prev_external_nodes_found = true;
 
