@@ -194,6 +194,19 @@ extern "C" {
 #endif
 
 /*
+ * Value urcu_txn_init() gives a fresh handle's read-your-own-writes mode (see
+ * urcu_txn_enable_ryw).  0 -- the historical invisible-writes semantics -- unless
+ * overridden before include.  Building a whole embedder (or the test suite) with
+ * -DURCU_TXN_RYW_DEFAULT=1 turns RYW on for every transaction that does not set
+ * the mode explicitly, which is how a structure is AUDITED under it: RYW must
+ * only ever make a mutator see MORE of its own transaction, never less, so a
+ * correct structure passes either way.
+ */
+#ifndef URCU_TXN_RYW_DEFAULT
+#define URCU_TXN_RYW_DEFAULT	0
+#endif
+
+/*
  * Compile-time fallback for the RCU read-side bracket, used by
  * urcu_txn_read_lock()/urcu_txn_read_unlock() (hence begin()/end()) ONLY when a
  * handle binds no flavor (urcu_txn_init's NULL).  Defaults to the
@@ -288,7 +301,19 @@ void urcu_txn_init_flavor(struct urcu_mcas_txn *txn,
 	txn->mcas = NULL;
 	txn->in_fallback = 0;
 	txn->retrying = 0;
-	txn->ryw = 0;
+	txn->ryw = URCU_TXN_RYW_DEFAULT;
+}
+
+/*
+ * Set this handle's read-your-own-writes mode explicitly, overriding
+ * URCU_TXN_RYW_DEFAULT.  Call after init and before the first begin(); do not
+ * flip it mid-transaction.  A caller that must not inherit a build-wide default
+ * -- notably a test asserting the non-RYW behaviour -- states the mode here.
+ */
+static inline
+void urcu_txn_set_ryw(struct urcu_mcas_txn *txn, int on)
+{
+	txn->ryw = on;
 }
 
 /*
@@ -321,7 +346,7 @@ void urcu_txn_init_flavor(struct urcu_mcas_txn *txn,
 static inline
 void urcu_txn_enable_ryw(struct urcu_mcas_txn *txn)
 {
-	txn->ryw = 1;
+	urcu_txn_set_ryw(txn, 1);
 }
 
 /* Initialize a handle bracketed in the compile-time-selected RCU flavor. */

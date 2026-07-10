@@ -238,8 +238,7 @@ static int batch_commit(struct op *ops, int n, int ryw)
 	enum urcu_txn_status st;
 
 	urcu_txn_init(&txn, &g_dom);
-	if (ryw)
-		urcu_txn_enable_ryw(&txn);
+	urcu_txn_set_ryw(&txn, ryw);	/* explicit: ignore URCU_TXN_RYW_DEFAULT */
 	for (;;) {
 		int retry = 0, err = 0;
 

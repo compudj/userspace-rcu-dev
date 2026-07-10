@@ -18,8 +18,13 @@
  *   2. guard fails mid-flight -> commit ABORT, write NOT applied;
  *   3. validate-then-store same slot -> one record, commits as the write;
  *   4. store-then-validate same slot -> write preserved (validate never
- *      downgrades a pending write), one record;
- *   5. pure guard, unchanged  -> commit OK, slot untouched.
+ *      downgrades a pending write), one record, and without RYW the validate
+ *      reads the slot's COMMITTED value;
+ *   5. pure guard, unchanged  -> commit OK, slot untouched;
+ *   6. store-then-validate under urcu_txn_enable_ryw() -> the validate reads
+ *      this transaction's PENDING value instead, its record chains rather than
+ *      poisoning, and the record set and committed effect are unchanged.  Only
+ *      the value returned to the caller differs between the two modes.
  *
  * QSBR flavor (the commit defers descriptor reclaim through call_rcu).
  */
@@ -41,7 +46,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS	5
+#define NR_TESTS	6
 
 /* Opaque, bit-0-clear slot values (the engine owns bit 0). */
 #define CLEAR	((void *) 0x100)
@@ -106,9 +111,13 @@ int main(void)
 		"validate-then-store on one slot -> one record, commits the write");
 
 	/* 4. store-then-validate same slot: the validate must NOT downgrade the
-	 * pending write; still one record; the write stands. */
+	 * pending write; still one record; the write stands.  The VALUE the
+	 * validate returns is mode-dependent, so pin the mode: without RYW a load
+	 * never sees the bracket's own buffered store, and returns the slot's
+	 * committed value. */
 	g_w = VX;
 	urcu_txn_init(&tx, NULL);
+	urcu_txn_set_ryw(&tx, 0);	/* explicit: ignore URCU_TXN_RYW_DEFAULT */
 	urcu_txn_begin(&tx);
 	urcu_txn_store(&tx, &g_w, VX, VZ, URCU_MCAS_TAG);
 	vv = urcu_txn_load_validate(&tx, &g_w, URCU_MCAS_TAG);
@@ -116,7 +125,7 @@ int main(void)
 	st = urcu_txn_commit(&tx);
 	urcu_txn_end(&tx);
 	ok(vv == VX && nr2 == 1 && st == URCU_TXN_STATUS_OK && g_w == VZ,
-		"store-then-validate on one slot -> write preserved, one record");
+		"store-then-validate, no RYW -> reads the committed value, write preserved");
 
 	/* 5. Pure guard over an unchanged word: commit OK, no modification. */
 	g_w = VX;
@@ -127,6 +136,23 @@ int main(void)
 	urcu_txn_end(&tx);
 	ok(vv == VX && st == URCU_TXN_STATUS_OK && g_w == VX,
 		"pure guard over an unchanged word commits without modifying it");
+
+	/* 6. The same shape under read-your-own-writes: the validate observes this
+	 * transaction's PENDING value instead of the committed one, and its record
+	 * chains rather than poisoning (the old it presents is the pending new).
+	 * The record set and the committed effect are identical either way -- only
+	 * the value handed back to the caller differs. */
+	g_w = VX;
+	urcu_txn_init(&tx, NULL);
+	urcu_txn_set_ryw(&tx, 1);
+	urcu_txn_begin(&tx);
+	urcu_txn_store(&tx, &g_w, VX, VZ, URCU_MCAS_TAG);
+	vv = urcu_txn_load_validate(&tx, &g_w, URCU_MCAS_TAG);
+	nr2 = tx.mcas->nr;
+	st = urcu_txn_commit(&tx);
+	urcu_txn_end(&tx);
+	ok(vv == VZ && nr2 == 1 && st == URCU_TXN_STATUS_OK && g_w == VZ,
+		"store-then-validate, RYW -> reads its own pending write, one record, write stands");
 
 	rcu_barrier();			/* drain deferred descriptor frees */
 	rcu_unregister_thread();

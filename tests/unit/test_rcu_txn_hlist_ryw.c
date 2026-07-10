@@ -130,8 +130,7 @@ static int del_two(struct urcu_txn_hlist_node *a, struct urcu_txn_hlist_node *b,
 	enum urcu_txn_status st;
 
 	urcu_txn_init(&txn, &g_dom);
-	if (ryw)
-		urcu_txn_enable_ryw(&txn);
+	urcu_txn_set_ryw(&txn, ryw);	/* explicit: ignore URCU_TXN_RYW_DEFAULT */
 	for (;;) {
 		int prep, retry = 0, err = 0;
 
