@@ -242,6 +242,58 @@ extern "C" {
 #define URCU_TXN_ENOMEM	((struct urcu_mcas *) -1L)
 
 /*
+ * THE READ POLICY.  Help iff the loaded slot ends up in this transaction's
+ * read/write set; read optimistically ONLY to navigate.
+ *
+ * urcu_txn_load_optimistic() resolves an undecided parker to its logical old --
+ * the value the slot takes if the parker aborts -- without driving the parker to
+ * a decision.  For a slot the transaction then stores (or load-validates), that
+ * value is stale by construction whenever the parker goes on to commit, so the
+ * record's old_ptr cannot match at install and the plant CAS is DOOMED: the
+ * attempt is guaranteed to abort.  A helping load instead pays the parker's
+ * install once and returns the decided value, which commits either way.  The
+ * saving is real only for a load whose value nothing later depends on: a
+ * traversal hop that merely points at the next node.
+ *
+ * Measured both directions.  Making rcu-txn-hlist.h's *_prepare loads optimistic
+ * cost 30% at 64 buckets / 192 writers (abort:commit 0.61 -> 0.86) and was
+ * invisible at the 4096 buckets the published benchmark used, where nothing
+ * aborts at all.  The converse -- rcu-txn-skiplist.h helping its five _prepare
+ * loads while its descent stays optimistic -- gained 8.2% at 192 writers.
+ *
+ * The policy is a property of the CALL SEQUENCE, not of contention, so it is
+ * checkable single-threaded: for every slot entering the read/write set, the
+ * most recent load of that slot in the same attempt must have helped.  Build
+ * with -DURCU_TXN_DEBUG_READ_POLICY to enforce it -- every urcu_txn__record()
+ * (store or load-validate) is checked against the kind of the last load, and a
+ * violation aborts with a diagnostic.  Add -DURCU_TXN_DEBUG_READ_POLICY_SOFT to
+ * count violations in the handle instead of aborting, which is what
+ * tests/unit/test_rcu_txn_read_policy.c does so it can assert on the count.
+ *
+ * The check costs a hash-table probe per load and per record, and grows the
+ * on-stack handle by URCU_TXN_RP_SLOTS entries.  Debug builds only.
+ *
+ * A slot never loaded in this attempt is not a violation: a blind store (a fresh
+ * node's own field, a head whose old value the caller already holds) has no
+ * read to speak of.  Note that urcu_txn_load_validate_optimistic() is a read-set
+ * read that does not help, so it violates the policy BY CONSTRUCTION -- it has no
+ * callers, and this is why.
+ */
+#ifdef URCU_TXN_DEBUG_READ_POLICY
+# include <stdio.h>
+# include <stdlib.h>
+# include <string.h>
+# ifndef URCU_TXN_RP_SLOTS
+#  define URCU_TXN_RP_SLOTS	256		/* power of two */
+# endif
+# define URCU_TXN_RP_PROBE	8		/* linear probe before evicting */
+struct urcu_txn__rp_entry {
+	void **slot;		/* NULL: empty */
+	int optimistic;		/* kind of the most recent load of @slot */
+};
+#endif
+
+/*
  * Per-contention-domain escalation state, shared by every handle that transacts
  * the same structure.  Pass &domain to urcu_txn_init(), or NULL to
  * disable the fallback (pure optimistic retry).
@@ -290,7 +342,132 @@ struct urcu_mcas_txn {
 					 * invisible-writes semantics).  Set with
 					 * urcu_txn_enable_ryw() before the first
 					 * begin(); never flip mid-transaction. */
+#ifdef URCU_TXN_DEBUG_READ_POLICY
+	struct urcu_txn__rp_entry rp[URCU_TXN_RP_SLOTS];
+					/* kind of the most recent load of each
+					 * slot THIS attempt; cleared by begin() */
+	unsigned long rp_violations;	/* records made on a slot whose last load
+					 * was optimistic; sums over the attempts
+					 * of one transaction */
+	unsigned long rp_evicted;	/* table overflowed: a mark was dropped, so
+					 * a zero violation count is NOT a proof */
+#endif
 };
+
+#ifdef URCU_TXN_DEBUG_READ_POLICY
+
+static inline
+unsigned int urcu_txn__rp_hash(void **slot)
+{
+	uintptr_t h = (uintptr_t) slot >> 3;	/* slots are pointer-aligned */
+
+	h *= 0x9e3779b97f4a7c15ULL;
+	return (unsigned int) ((h >> 40) & (URCU_TXN_RP_SLOTS - 1));
+}
+
+/* A new attempt reloads everything: forget every load. */
+static inline
+void urcu_txn__rp_reset(struct urcu_mcas_txn *txn)
+{
+	memset(txn->rp, 0, sizeof(txn->rp));
+}
+
+/* Remember the kind of the most recent load of @slot. */
+static inline
+void urcu_txn__rp_note(struct urcu_mcas_txn *txn, void **slot, int optimistic)
+{
+	unsigned int h = urcu_txn__rp_hash(slot), i;
+
+	for (i = 0; i < URCU_TXN_RP_PROBE; i++) {
+		struct urcu_txn__rp_entry *e =
+			&txn->rp[(h + i) & (URCU_TXN_RP_SLOTS - 1)];
+
+		if (e->slot == NULL || e->slot == slot) {
+			e->slot = slot;
+			e->optimistic = optimistic;
+			return;
+		}
+	}
+	txn->rp[h].slot = slot;		/* evict: the dropped mark is a MISSED check */
+	txn->rp[h].optimistic = optimistic;
+	txn->rp_evicted++;
+}
+
+/*
+ * @slot is entering the read/write set.  Its last load must have helped.  A slot
+ * with no mark was never loaded here (a blind store): nothing to check.  Once
+ * checked, the slot is settled -- a later store chains onto the record rather
+ * than off a fresh physical read -- so clear the mark rather than report twice.
+ */
+static inline
+void urcu_txn__rp_check(struct urcu_mcas_txn *txn, void **slot)
+{
+	unsigned int h = urcu_txn__rp_hash(slot), i;
+
+	for (i = 0; i < URCU_TXN_RP_PROBE; i++) {
+		struct urcu_txn__rp_entry *e =
+			&txn->rp[(h + i) & (URCU_TXN_RP_SLOTS - 1)];
+
+		if (e->slot == NULL)
+			return;
+		if (e->slot != slot)
+			continue;
+		if (!e->optimistic)
+			return;
+		e->optimistic = 0;
+		txn->rp_violations++;
+#ifndef URCU_TXN_DEBUG_READ_POLICY_SOFT
+		fprintf(stderr, "urcu-txn: read-policy violation: slot %p enters "
+			"the read/write set, but its last load in this attempt "
+			"was optimistic.  The plant CAS is doomed whenever the "
+			"parker commits.  Use urcu_txn_load()/urcu_txn_load_validate() "
+			"for a slot this transaction stores or guards; keep "
+			"urcu_txn_load_optimistic() for navigation.\n", (void *) slot);
+		abort();
+#endif
+		return;
+	}
+}
+
+/*
+ * Records made this transaction on a slot whose last load was optimistic, and
+ * marks the probe table dropped.  Both are 0 unless built with
+ * -DURCU_TXN_DEBUG_READ_POLICY; a violation count is only meaningful when the
+ * eviction count is 0.
+ */
+static inline
+unsigned long urcu_txn_read_policy_violations(const struct urcu_mcas_txn *txn)
+{
+	return txn->rp_violations;
+}
+
+static inline
+unsigned long urcu_txn_read_policy_evicted(const struct urcu_mcas_txn *txn)
+{
+	return txn->rp_evicted;
+}
+
+#else	/* !URCU_TXN_DEBUG_READ_POLICY */
+
+# define urcu_txn__rp_reset(txn)		do { } while (0)
+# define urcu_txn__rp_note(txn, slot, opt)	do { } while (0)
+# define urcu_txn__rp_check(txn, slot)		do { } while (0)
+
+static inline
+unsigned long urcu_txn_read_policy_violations(const struct urcu_mcas_txn *txn)
+{
+	(void) txn;
+	return 0;
+}
+
+static inline
+unsigned long urcu_txn_read_policy_evicted(const struct urcu_mcas_txn *txn)
+{
+	(void) txn;
+	return 0;
+}
+
+#endif	/* URCU_TXN_DEBUG_READ_POLICY */
 
 /*
  * Initialize a handle before its retry loop (retry := 0, no reservation),
@@ -317,6 +494,11 @@ void urcu_txn_init_flavor(struct urcu_mcas_txn *txn,
 	txn->fb_published = 0;
 	txn->retrying = 0;
 	txn->ryw = URCU_TXN_RYW_DEFAULT;
+#ifdef URCU_TXN_DEBUG_READ_POLICY
+	txn->rp_violations = 0;
+	txn->rp_evicted = 0;
+	urcu_txn__rp_reset(txn);
+#endif
 }
 
 /*
@@ -557,6 +739,7 @@ void urcu_txn_begin(struct urcu_mcas_txn *txn)
 	else
 		urcu_txn__maybe_publish(txn);	/* joiner that starved: promote */
 	txn->mcas = NULL;		/* prior attempt's descriptor already consumed/freed */
+	urcu_txn__rp_reset(txn);	/* debug: a new attempt reloads every slot */
 	urcu_txn_read_lock(txn);
 }
 
@@ -642,6 +825,7 @@ int urcu_txn__record(struct urcu_mcas_txn *txn, void **slot,
 {
 	struct urcu_mcas *m = txn->mcas;
 
+	urcu_txn__rp_check(txn, slot);	/* debug: @slot enters the read/write set */
 	if (caa_unlikely(m == URCU_TXN_ENOMEM))
 		return -ENOMEM;		/* sticky: an earlier record already failed */
 	if (!m) {
@@ -696,8 +880,11 @@ void *urcu_txn__load(struct urcu_mcas_txn *txn, void **slot, uintptr_t tag,
 		struct urcu_mcas_record *r = urcu_mcas_find(txn->mcas, slot);
 
 		if (r != NULL)
-			return r->new_ptr;	/* this attempt's pending value */
+			return r->new_ptr;	/* this attempt's pending value:
+						 * already in the write set, no
+						 * physical read to classify */
 	}
+	urcu_txn__rp_note(txn, slot, optimistic);	/* debug: read-policy */
 	return optimistic ? urcu_mcas_read_optimistic(slot, tag)
 			: urcu_mcas_read(slot, tag);
 }

@@ -45,6 +45,7 @@ noinst_PROGRAMS = \
 	test_rcu_txn_skiplist \
 	test_rcu_txn_skiplist_ryw \
 	test_rcu_txn_slab \
+	test_rcu_txn_read_policy \
 	test_fair_mutex \
 	test_urcu_multiflavor \
 	test_urcu_multiflavor_cxx \
@@ -100,6 +101,7 @@ TESTS = \
 	test_rcu_txn_skiplist \
 	test_rcu_txn_skiplist_ryw \
 	test_rcu_txn_slab \
+	test_rcu_txn_read_policy \
 	test_fair_mutex \
 	test_urcu_multiflavor \
 	test_urcu_multiflavor_cxx \
@@ -222,6 +224,16 @@ test_rcu_txn_slab_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
 # reuse/carve directly (the counters are unconditional struct fields; the flag
 # only enables the per-TU increments).  Harmless for a correctness test.
 test_rcu_txn_slab_CPPFLAGS = $(AM_CPPFLAGS) -DURCU_TXN_CACHE_STATS
+
+test_rcu_txn_read_policy_SOURCES = test_rcu_txn_read_policy.c
+test_rcu_txn_read_policy_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
+# Built in read-policy SOFT-counting mode so the test can assert on
+# urcu_txn_read_policy_violations() instead of aborting on the first violation
+# (the negative-control case deliberately provokes one).  In a default build the
+# read-policy machinery is compiled out entirely, so this flag is what makes the
+# check exist at all -- see the header block above URCU_TXN_ENOMEM in rcu-txn.h.
+test_rcu_txn_read_policy_CPPFLAGS = $(AM_CPPFLAGS) \
+	-DURCU_TXN_DEBUG_READ_POLICY -DURCU_TXN_DEBUG_READ_POLICY_SOFT
 
 test_fair_mutex_SOURCES = test_fair_mutex.c
 test_fair_mutex_LDADD = $(URCU_COMMON_LIB) $(TAP_LIB)
