@@ -227,7 +227,7 @@ extern "C" {
  * rather than on lock-free helping.  A stepping stone toward a no-steal,
  * plain-store install (the proxy as a pure spinlatch).
  */
-#ifdef URCU_MCAS_NO_HELP
+#if defined(URCU_MCAS_NO_HELP) || defined(URCU_MCAS_NO_STEAL)
 # ifndef URCU_MCAS_WAIT_PATIENCE
 #  define URCU_MCAS_WAIT_PATIENCE 8192	/* spins on a blocker's status before escalating */
 # endif
@@ -580,6 +580,39 @@ wait:
  * descent is additionally capped at URCU_MCAS_HELP_MAX_DEPTH (see the note there);
  * @depth is the current help-recursion depth (0 at the owner/reader entry).
  */
+/*
+ * Drive @t to a terminal status (SUCCEEDED or FAILED): @t's OWN decision, taken
+ * by its driver.  With help and stealing present this races other drivers
+ * (helpers deciding, evictors failing @t), so it is a CAS off UNDECIDED --
+ * whoever wins publishes the decision.  Under -DURCU_MCAS_NO_STEAL AND
+ * -DURCU_MCAS_NO_HELP the owner is the SOLE writer of its status (no evictor, no
+ * helper) and writes it at most once per drive, so the CAS collapses to a plain
+ * RELEASE store -- the commit point, like existence's group-word flip.  RELEASE
+ * so the planted proxies and committed values publish before a reader can
+ * observe the terminal status.  Used only for @t's own status; a foreign
+ * eviction (&e->status) stays an explicit CAS, and is compiled out under
+ * no-steal anyway.
+ */
+static inline
+void urcu_mcas_decide(struct urcu_mcas *t, unsigned long to)
+{
+#if defined(URCU_MCAS_NO_STEAL) && defined(URCU_MCAS_NO_HELP)
+	/*
+	 * Sole-writer invariant: @t is written only by its owner, at most once
+	 * per drive (every FAILED site returns immediately; SUCCEEDED is only
+	 * reached once, after the record loop).  So the status MUST be UNDECIDED
+	 * here -- a plain store would otherwise clobber an already-published
+	 * decision, exactly the case the CAS's UNDECIDED guard makes a no-op.
+	 * Assert it (debug-only) so any future path that breaks single-writer --
+	 * or reaches a decision twice -- trips instead of silently overwriting.
+	 */
+	urcu_assert_debug(urcu_mcas_status(t) == URCU_MCAS_UNDECIDED);
+	uatomic_store(&t->status, to, CMM_RELEASE);
+#else
+	(void) uatomic_cmpxchg(&t->status, URCU_MCAS_UNDECIDED, to);
+#endif
+}
+
 static inline
 void urcu_mcas_drive_install_depth(struct urcu_mcas *t, unsigned int depth)
 {
@@ -587,6 +620,9 @@ void urcu_mcas_drive_install_depth(struct urcu_mcas *t, unsigned int depth)
 	unsigned int i;
 
 	URCU_MCAS_STAT(drive);
+#ifdef URCU_MCAS_NO_STEAL
+	(void) depth;			/* no help recursion under no-steal */
+#endif
 
 	if (st != URCU_MCAS_UNDECIDED)
 		return;			/* already terminal */
@@ -612,11 +648,49 @@ void urcu_mcas_drive_install_depth(struct urcu_mcas *t, unsigned int depth)
 				struct urcu_mcas_record *fr =
 					urcu_mcas_untag(v, r->proxy_tag);
 				struct urcu_mcas *e = fr->mcas;
+#ifndef URCU_MCAS_NO_STEAL
 				unsigned long est;
 				void *resolved;
+#endif
 
 				if (e == t)
 					break;	/* own proxy (distinct-slot inv.) */
+#ifdef URCU_MCAS_NO_STEAL
+				/*
+				 * No-steal: never displace E's proxy.  Wait for
+				 * E's owner to SETTLE this slot to a plain value,
+				 * then re-read and acquire it plainly -- the proxy
+				 * is a pure spinlatch.  Records are installed in
+				 * slot-address order (commit sorts), so holding the
+				 * lower slots while waiting on this one cannot
+				 * deadlock: E, having reached this slot, already
+				 * passed every lower one without blocking, so it
+				 * holds none we hold.  Bounded, then escalate
+				 * (abort T -> retry -> fair-mutex fallback), since
+				 * with no eviction a preempted owner is not
+				 * rescued by aging.
+				 */
+				{
+					unsigned int patience =
+						URCU_MCAS_WAIT_PATIENCE;
+
+					while (urcu_mcas_is_proxy(
+						uatomic_load(r->slot, CMM_ACQUIRE),
+						r->proxy_tag)) {
+						if (urcu_mcas_status(t) !=
+								URCU_MCAS_UNDECIDED)
+							return;
+						if (patience-- == 0) {
+							URCU_MCAS_STAT(help_capped);
+							urcu_mcas_decide(t,
+								URCU_MCAS_FAILED);
+							return;
+						}
+						caa_cpu_relax();
+					}
+					continue;	/* slot plain now: re-read + acquire */
+				}
+#else
 				est = urcu_mcas_status(e);
 				if (est == URCU_MCAS_UNDECIDED) {
 					if (!urcu_mcas_outranks(t, e)) {
@@ -638,6 +712,12 @@ void urcu_mcas_drive_install_depth(struct urcu_mcas *t, unsigned int depth)
 						while ((est = urcu_mcas_status(e)) ==
 								URCU_MCAS_UNDECIDED) {
 							if (patience-- == 0) {
+								/*
+								 * Multi-driver path (eviction still
+								 * live here): a racing evictor may
+								 * have failed @t already, so this
+								 * must stay a CAS, not urcu_mcas_decide.
+								 */
 								URCU_MCAS_STAT(help_capped);
 								uatomic_cmpxchg(&t->status,
 									URCU_MCAS_UNDECIDED,
@@ -714,12 +794,11 @@ void urcu_mcas_drive_install_depth(struct urcu_mcas *t, unsigned int depth)
 					break;	/* installed (or already) */
 				}
 				continue;	/* raced (settled / stolen): re-read */
+#endif	/* URCU_MCAS_NO_STEAL */
 			}
 			if (v != r->old_ptr) {
 				/* read-set invalid -> abort this txn */
-				uatomic_cmpxchg(&t->status,
-					URCU_MCAS_UNDECIDED,
-					URCU_MCAS_FAILED);
+				urcu_mcas_decide(t, URCU_MCAS_FAILED);
 				return;
 			}
 			/*
@@ -735,8 +814,7 @@ void urcu_mcas_drive_install_depth(struct urcu_mcas *t, unsigned int depth)
 		}
 	}
 	/* every record installed -> commit */
-	uatomic_cmpxchg(&t->status, URCU_MCAS_UNDECIDED,
-			URCU_MCAS_SUCCEEDED);
+	urcu_mcas_decide(t, URCU_MCAS_SUCCEEDED);
 }
 
 /*
@@ -792,8 +870,9 @@ void urcu_mcas_settle(struct urcu_mcas *t)
 	for (i = 0; i < t->nr; i++) {
 		struct urcu_mcas_record *r = &t->recs[i];
 		void *want = (st == URCU_MCAS_SUCCEEDED) ? r->new_ptr : r->old_ptr;
+		void *tagv = urcu_mcas_tag(r, r->proxy_tag);
 
-#ifndef URCU_MCAS_NO_ABA_FIX
+#if !defined(URCU_MCAS_NO_ABA_FIX) && !defined(URCU_MCAS_NO_STEAL)
 		/*
 		 * Claim r's install word (FREE -> DONE) so no plant can begin
 		 * once settle returns (see above), spinning out a planter's
@@ -811,7 +890,21 @@ void urcu_mcas_settle(struct urcu_mcas *t)
 				caa_cpu_relax();
 		}
 #endif
-		(void) uatomic_cmpxchg(r->slot, urcu_mcas_tag(r, r->proxy_tag), want);
+#ifdef URCU_MCAS_NO_STEAL
+		/*
+		 * No-steal: no thief ever displaces our proxy, and no-help means
+		 * we are the sole driver, so once we are here nothing but us can
+		 * touch a slot that still holds our proxy.  The CAS collapses to a
+		 * load + conditional plain STORE -- the proxy is a spinlatch and
+		 * this is its release.  A slot that does NOT hold our proxy (a
+		 * record we never planted because the drive aborted early) is left
+		 * untouched, exactly as the CAS's mismatch would.
+		 */
+		if (uatomic_load(r->slot, CMM_RELAXED) == tagv)
+			uatomic_store(r->slot, want, CMM_RELEASE);
+#else
+		(void) uatomic_cmpxchg(r->slot, tagv, want);
+#endif
 	}
 }
 
