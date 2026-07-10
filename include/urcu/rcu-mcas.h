@@ -201,6 +201,38 @@ extern "C" {
 #define URCU_MCAS_HELP_MAX_DEPTH 8
 #endif
 
+/*
+ * -DURCU_MCAS_NO_HELP (prototype): never drive a FOREIGN transaction to a
+ * decision -- neither a committer meeting a lower-priority proxy in one of its
+ * own record slots, nor a reader (urcu_mcas_read) that lands on an undecided
+ * proxy.  A thread that outranks the blocker still EVICTS it (status CAS) and
+ * steals; a thread the blocker outranks WAITS on the blocker's status for a
+ * bounded spin and then, if still undecided, ESCALATES exactly as the depth cap
+ * does -- aborts the transaction it is committing so it retries with a higher
+ * aging priority and eventually outranks and evicts the blocker.  So there is
+ * exactly ONE driver per transaction: its owner, in commit(), sequential with
+ * its own settle().
+ *
+ * That single-planter invariant is what the per-record install word
+ * (FREE/BUSY/DONE) exists to enforce across MULTIPLE drivers; with one driver it
+ * is unnecessary, and -DURCU_MCAS_NO_HELP is meant to be built together with
+ * -DURCU_MCAS_NO_ABA_FIX (which drops both r->state CASes) to realize the cheap
+ * install SAFELY -- the A-B-A / stale-first-install re-park the install word
+ * guards against can only be produced by a second, stalled driver, which no-help
+ * removes.  Progress is unaffected: the engine already treats helping as a
+ * latency optimization, not a progress requirement (see the escalation note
+ * above).  What changes is the guarantee: the engine becomes bounded-BLOCKING
+ * (a preempted owner blocks waiters until aging lets one evict it), leaning on
+ * that aging escalation and the transaction front-end's fair-mutex fallback
+ * rather than on lock-free helping.  A stepping stone toward a no-steal,
+ * plain-store install (the proxy as a pure spinlatch).
+ */
+#ifdef URCU_MCAS_NO_HELP
+# ifndef URCU_MCAS_WAIT_PATIENCE
+#  define URCU_MCAS_WAIT_PATIENCE 8192	/* spins on a blocker's status before escalating */
+# endif
+#endif
+
 enum urcu_mcas_status {
 	URCU_MCAS_UNDECIDED = 0,
 	URCU_MCAS_SUCCEEDED = 1,
@@ -588,6 +620,34 @@ void urcu_mcas_drive_install_depth(struct urcu_mcas *t, unsigned int depth)
 				est = urcu_mcas_status(e);
 				if (est == URCU_MCAS_UNDECIDED) {
 					if (!urcu_mcas_outranks(t, e)) {
+#ifdef URCU_MCAS_NO_HELP
+						/*
+						 * No-help: do NOT drive E.  Wait a
+						 * bounded spin for E's own owner to
+						 * decide it, then fall through to resolve
+						 * -- and if it stays undecided past the
+						 * cap (its owner is stalled), escalate
+						 * exactly as the help cap does: abort T so
+						 * it retries higher-ranked and later
+						 * outranks and evicts E.  Single driver
+						 * per transaction; see URCU_MCAS_NO_HELP.
+						 */
+						unsigned int patience =
+							URCU_MCAS_WAIT_PATIENCE;
+
+						while ((est = urcu_mcas_status(e)) ==
+								URCU_MCAS_UNDECIDED) {
+							if (patience-- == 0) {
+								URCU_MCAS_STAT(help_capped);
+								uatomic_cmpxchg(&t->status,
+									URCU_MCAS_UNDECIDED,
+									URCU_MCAS_FAILED);
+								return;
+							}
+							caa_cpu_relax();
+						}
+						/* est terminal: fall through to resolve. */
+#else
 						/*
 						 * E outranks us: help it decide
 						 * (install only), then re-read -- but
@@ -612,13 +672,15 @@ void urcu_mcas_drive_install_depth(struct urcu_mcas *t, unsigned int depth)
 						urcu_mcas_drive_install_depth(e,
 							depth + 1);
 						continue;
+#endif
+					} else {
+						/* We outrank E: evict the lower priority. */
+						URCU_MCAS_STAT(evict);
+						uatomic_cmpxchg(&e->status,
+							URCU_MCAS_UNDECIDED,
+							URCU_MCAS_FAILED);
+						est = urcu_mcas_status(e);
 					}
-					/* We outrank E: evict the lower priority. */
-					URCU_MCAS_STAT(evict);
-					uatomic_cmpxchg(&e->status,
-						URCU_MCAS_UNDECIDED,
-						URCU_MCAS_FAILED);
-					est = urcu_mcas_status(e);
 				}
 				/*
 				 * E is terminal now (possibly still unsettled --
@@ -776,7 +838,28 @@ void *urcu_mcas_read(void **slot, uintptr_t tag)
 		e = urcu_mcas_untag(v, tag)->mcas;
 		if (urcu_mcas_status(e) != URCU_MCAS_UNDECIDED)
 			return urcu_mcas_resolve(v, tag);	/* terminal: logical value */
+#ifdef URCU_MCAS_NO_HELP
+		{
+			/*
+			 * No-help: never drive E.  Wait a bounded spin for E's
+			 * owner to decide it, then loop to re-read (the freshest
+			 * value); if it stays undecided past the cap, return its
+			 * logical value (E's old) -- for a read-set caller that is
+			 * an optimistic old, reconciled at commit exactly like
+			 * urcu_mcas_read_optimistic().  See URCU_MCAS_NO_HELP.
+			 */
+			unsigned int patience = URCU_MCAS_WAIT_PATIENCE;
+
+			while (urcu_mcas_status(e) == URCU_MCAS_UNDECIDED) {
+				if (patience-- == 0)
+					return urcu_mcas_resolve(v, tag);
+				caa_cpu_relax();
+			}
+			continue;	/* E decided: re-read for the freshest value */
+		}
+#else
 		urcu_mcas_drive_install(e);		/* help decide, then re-read */
+#endif
 	}
 }
 
