@@ -119,18 +119,17 @@
  * allocates lazily and grows on its own without it.
  *
  * Escalation fallback.  The optimistic retry above is bounded-blocking but not
- * starvation-free: a large or repeatedly-bypassed transaction can be
- * defeated by a stream of smaller ones (the single-edge fast path and the
- * read->install window let a committer change a footprint slot between this
- * op's read and its install).  When a handle crosses a threshold it
- * escalates into a per-domain fair mutex (urcu/fair-mutex.h) -- an
- * MCS-style lock -- and publishes domain->active so every *future*
- * transaction funnels through the same lane.  That closes the
- * optimistic-writer set: the escalated op then contends only with the
- * finite in-flight set (bounded by thread count) and commits within a
- * bounded number of retries while holding its turn -- progress is
- * guaranteed with no quiescence (no synchronize_rcu).  The lane only
- * serializes *who pushes with top priority*; commits still go through the
+ * starvation-free: a large or repeatedly-bypassed transaction can be defeated
+ * by a stream of smaller ones (the single-edge fast path and the read->install
+ * window let a committer change a footprint slot between this op's read and
+ * its install).  When a handle crosses a threshold it escalates into a
+ * per-domain fair mutex (urcu/fair-mutex.h) -- an MCS-style lock -- and
+ * publishes domain->active so every *future* transaction funnels through the
+ * same lane.  That closes the optimistic-writer set: the escalated op then
+ * contends only with the finite in-flight set (bounded by thread count) and
+ * commits within a bounded number of retries while holding its turn --
+ * progress is guaranteed with no quiescence (no synchronize_rcu).  The lane
+ * only serializes *who pushes with top priority*; commits still go through the
  * concurrency-safe MCAS path, so the residual in-flight optimistic writers
  * stay correct.  Two triggers escalate a handle (both gated on a non-NULL
  * domain -- NULL never escalates):
@@ -139,12 +138,24 @@
  *     reserve(n >= BIG) escalates immediately, before building any nodes,
  *     and a handle whose realized write-set reached BIG escalates on its
  *     next attempt.
+ *
+ * Only a handle that met a trigger ITSELF -- an INITIATOR -- publishes
+ * domain->active.  A handle that escalates merely because it read the flag is a
+ * JOINER: it takes a turn but advertises nothing, so it cannot outlive the
+ * episode that captured it.  Were every holder to re-assert the flag, the
+ * episode would sustain itself -- the flag is up whenever anyone holds the
+ * lane, each arrival that samples it queues, and queuing guarantees a next
+ * holder to raise it again -- so leaving the regime would require the lane to
+ * drain with no arrival sampling it, i.e. write-side quiescence, which never
+ * arrives under load.  A joiner that starves inside the lane is promoted to
+ * initiator (urcu_txn__maybe_publish), so the funnel persists exactly as long
+ * as some transaction still needs it.
+ *
  * A handle keeps its turn across aborts (retry in place -- releasing would
  * forfeit the guaranteed turn) and releases it only on a terminal outcome
- * (commit, error, or a bail that ends the bracket); each departing holder
- * clears domain->active just before its unlock and the incoming holder
- * re-asserts it, so once the lane drains the domain reverts to the
- * optimistic regime.
+ * (commit, error, or a bail that ends the bracket); a departing initiator
+ * clears domain->active just before its unlock, ending the episode, and the
+ * domain reverts to the optimistic regime once the remaining joiners drain.
  *
  * RCU.  The bracket opens an RCU read-side section per attempt, and commit
  * uses the flavor's call_rcu, so include this header AFTER an RCU flavor
@@ -269,6 +280,8 @@ struct urcu_mcas_txn {
 	struct cds_fair_mutex_node waiter;	/* our node while awaiting the turn */
 	int in_fallback;		/* we currently hold the lock (thread-private,
 					 * but relaxed-atomic: see __exit_fallback) */
+	int fb_published;		/* we raised domain->active and owe the clear:
+					 * set only for an initiator, never a joiner */
 	int retrying;			/* commit asked retry: keep the turn */
 	int ryw;			/* read-your-own-writes: loads see this
 					 * attempt's buffered stores, and a store
@@ -301,6 +314,7 @@ void urcu_txn_init_flavor(struct urcu_mcas_txn *txn,
 	txn->min_alloc = 0;
 	txn->mcas = NULL;
 	uatomic_store(&txn->in_fallback, 0, CMM_RELAXED);
+	txn->fb_published = 0;
 	txn->retrying = 0;
 	txn->ryw = URCU_TXN_RYW_DEFAULT;
 }
@@ -396,6 +410,20 @@ void urcu_txn_read_unlock(struct urcu_mcas_txn *txn)
  * deliberately enters while inside the bracket; begin() enters before opening
  * it (nothing is pinned yet).
  */
+
+/*
+ * Does this handle earn the lane on its own merits -- starved, or known large?
+ * Such a handle is an INITIATOR: it advertises the episode.  A handle that
+ * escalates only because domain->active was up is a joiner and advertises
+ * nothing.  The distinction is what makes an episode terminate.
+ */
+static inline
+int urcu_txn__self_qualifies(const struct urcu_mcas_txn *txn)
+{
+	return txn->retry >= URCU_TXN_FALLBACK ||
+		txn->min_alloc >= URCU_TXN_BIG;
+}
+
 static inline
 void urcu_txn__enter_fallback(struct urcu_mcas_txn *txn)
 {
@@ -415,14 +443,23 @@ void urcu_txn__enter_fallback(struct urcu_mcas_txn *txn)
 	 * invariant this relies on.
 	 */
 	cds_fair_mutex_lock(&txn->domain->lock, &txn->waiter);
-	uatomic_store(&txn->domain->active, 1, CMM_RELAXED);
+	/*
+	 * Advertise the episode only if we met a trigger ourselves; a joiner
+	 * publishes nothing, so it cannot outlive the initiator that captured it
+	 * (see the escalation-fallback paragraph at the top of this header).
+	 */
+	if (urcu_txn__self_qualifies(txn)) {
+		uatomic_store(&txn->domain->active, 1, CMM_RELAXED);
+		txn->fb_published = 1;
+	}
 	uatomic_store(&txn->in_fallback, 1, CMM_RELAXED);
 }
 
 /*
- * Release the lock.  domain->active is cleared BEFORE the unlock; when we are
- * the last holder the lane drains with the flag already down and the domain
- * reverts to the optimistic path.
+ * Release the lock.  An initiator clears domain->active BEFORE the unlock, so
+ * the episode ends when its initiator leaves rather than when the lane happens
+ * to empty; any joiners still queued drain with the flag already down and the
+ * domain reverts to the optimistic path.
  */
 static inline
 void urcu_txn__exit_fallback(struct urcu_mcas_txn *txn)
@@ -430,20 +467,23 @@ void urcu_txn__exit_fallback(struct urcu_mcas_txn *txn)
 	/*
 	 * Clear the episode flag BEFORE releasing the lock.  Clearing after --
 	 * even gated on the unlock's "last holder" return -- races the next
-	 * holder: the actual lock release is the dequeue's tail-reset cmpxchg
+	 * INITIATOR: the actual lock release is the dequeue's tail-reset cmpxchg
 	 * INSIDE cds_fair_mutex_unlock(), so by the time it returns "last", a
 	 * new thread may have acquired the freed lock and stored active = 1;
 	 * our late 0 would then overwrite the new episode's advertisement, and
 	 * that whole episode would run unfunnelled -- no future transaction
 	 * takes the lane, so "closes the optimistic-writer set" silently fails
-	 * in exactly the starved case the lane exists for.  Clearing first
-	 * costs at worst a momentary 0 flicker on a mid-episode hand-off (the
-	 * incoming holder re-stores 1 right after lock() returns, see
-	 * urcu_txn__enter_fallback): a stale read mis-routes one bounded
-	 * attempt, which the advisory flag already tolerates (see
-	 * urcu_txn__want_fallback).
+	 * in exactly the starved case the lane exists for.
+	 *
+	 * Only a publisher clears, and only its own advertisement: at most one
+	 * handle has fb_published set at a time, because a handle publishes only
+	 * while it is the lock holder (on acquiring, or on being promoted mid-
+	 * episode by begin()).  So the store below cannot erase a peer's flag.
 	 */
-	uatomic_store(&txn->domain->active, 0, CMM_RELAXED);
+	if (txn->fb_published) {
+		uatomic_store(&txn->domain->active, 0, CMM_RELAXED);
+		txn->fb_published = 0;
+	}
 	/*
 	 * Drop in_fallback INSIDE the critical section, not after the unlock.
 	 * Callers read it as "we already own the lane": want_fallback()
@@ -478,8 +518,25 @@ int urcu_txn__want_fallback(struct urcu_mcas_txn *txn)
 {
 	return txn->domain && !uatomic_load(&txn->in_fallback, CMM_RELAXED) &&
 		(uatomic_load(&txn->domain->active, CMM_RELAXED) ||
-		 txn->retry >= URCU_TXN_FALLBACK ||
-		 txn->min_alloc >= URCU_TXN_BIG);
+		 urcu_txn__self_qualifies(txn));
+}
+
+/*
+ * A handle that starves (or grows large) while ALREADY holding its turn must be
+ * promoted to initiator: it now needs the funnel that the departed initiator's
+ * episode had been giving it.  want_fallback() cannot do this -- it is gated on
+ * !in_fallback -- so without this a joiner would retry forever inside the lane
+ * with the optimistic-writer set wide open, which is precisely the starvation
+ * the lane exists to end.
+ */
+static inline
+void urcu_txn__maybe_publish(struct urcu_mcas_txn *txn)
+{
+	if (txn->domain && uatomic_load(&txn->in_fallback, CMM_RELAXED) &&
+			!txn->fb_published && urcu_txn__self_qualifies(txn)) {
+		uatomic_store(&txn->domain->active, 1, CMM_RELAXED);
+		txn->fb_published = 1;
+	}
 }
 
 /* Begin one attempt: clear the write-set and open the RCU read-side section. */
@@ -497,6 +554,8 @@ void urcu_txn_begin(struct urcu_mcas_txn *txn)
 	 */
 	if (urcu_txn__want_fallback(txn))
 		urcu_txn__enter_fallback(txn);
+	else
+		urcu_txn__maybe_publish(txn);	/* joiner that starved: promote */
 	txn->mcas = NULL;		/* prior attempt's descriptor already consumed/freed */
 	urcu_txn_read_lock(txn);
 }
