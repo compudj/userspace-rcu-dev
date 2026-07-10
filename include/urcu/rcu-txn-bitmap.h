@@ -55,7 +55,7 @@
 #include <stdint.h>			/* uintptr_t */
 
 #include <urcu/compiler.h>		/* CAA_BITS_PER_LONG, caa_likely */
-#include <urcu/rcu-mcas.h>		/* urcu_mcas_read, URCU_MCAS_TAG */
+#include <urcu/rcu-mcas.h>		/* urcu_mcas_read_optimistic, URCU_MCAS_TAG */
 #include <urcu/rcu-txn.h>		/* urcu_txn_load/store/begin/commit/... */
 
 #ifdef __cplusplus
@@ -85,8 +85,38 @@ void urcu_txn_bitmap__locate(size_t bit, size_t *word, uintptr_t *mask)
 static inline
 uintptr_t urcu_txn_bitmap_word_rcu(const uintptr_t *words, size_t w)
 {
-	return (uintptr_t) urcu_mcas_read((void **) &((uintptr_t *) words)[w],
-			URCU_MCAS_TAG);
+	/*
+	 * Optimistic: a pure reader never helps.  An UNDECIDED transaction has not
+	 * linearized, so this word's logical value IS its old_ptr -- exactly what
+	 * urcu_mcas_read_optimistic() returns -- and helping would make every bitmap
+	 * probe pay for a stranger's install.
+	 *
+	 * The rule (measured): help iff the loaded slot belongs to the caller's own
+	 * read/write set, because there a stale value dooms the install-time CAS and
+	 * costs an abort.  Read optimistically otherwise.  urcu_txn_bitmap_*_prepare
+	 * below load the very word they store, so they keep the helping urcu_txn_load;
+	 * this accessor stores nothing, so it must not help.
+	 *
+	 * ⚠ This accessor -- and the _rcu scans built on it (rank, weight, find_*) --
+	 * never was a multi-word snapshot: it holds no descriptor, records nothing,
+	 * and resolves each word against its own moment, so a scan can straddle a
+	 * range commit under EITHER policy.  Not helping does widen that window (a
+	 * helping scan, once it touches one word of a writer's range, drives that
+	 * writer terminal and sees one decision for the rest of the range).  Nothing
+	 * guaranteed is lost, because nothing was guaranteed.
+	 *
+	 * The multi-word guarantee lives elsewhere, and is STRONG: take a read-only
+	 * transaction and urcu_txn_load_validate() each word, retrying on ABORT (the
+	 * guarded-snapshot pattern in tests/unit/test_rcu_txn_bitmap.c, T4).  Each
+	 * such load emits a full old == new MCAS record -- it PLANTS a proxy in the
+	 * word, so a concurrent writer's plant CAS off that word conflicts, and the
+	 * whole read set linearizes on the transaction's single status-word CAS.
+	 * That is a genuine atomic multi-word snapshot, not a re-check.  (Note
+	 * urcu_txn_load_validate_optimistic() records identically: "optimistic"
+	 * governs only whether the initial read helps, never the read set.)
+	 */
+	return (uintptr_t) urcu_mcas_read_optimistic(
+			(void **) &((uintptr_t *) words)[w], URCU_MCAS_TAG);
 }
 
 /* True iff logical @bit is set.  Call within an RCU read-side section. */
