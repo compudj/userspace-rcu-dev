@@ -781,6 +781,52 @@ void *urcu_mcas_read(void **slot, uintptr_t tag)
 }
 
 /*
+ * Load @slot and return the value it currently denotes, WITHOUT helping an
+ * undecided transaction to a decision: the non-blocking counterpart of
+ * urcu_mcas_read().
+ *
+ * An UNDECIDED transaction has not linearized, so a slot parked with its proxy
+ * still logically holds that record's old_ptr -- exactly what urcu_mcas_resolve()
+ * returns.  The caller therefore linearizes ahead of E's commit and moves on,
+ * rather than driving E's whole install (every record, every latch) just to read
+ * one word.  Under N-way contention on a shared slot that helping is quadratic:
+ * each arrival drags itself through the victim's entire transaction.
+ *
+ * What this gives up against urcu_mcas_read() is only STABILITY of the returned
+ * value, never safety:
+ *
+ *   - It is not weaker for observers.  A plain reader already resolves each slot
+ *     against E's status at the moment it looks, so a walk spanning two of E's
+ *     slots across E's commit could always straddle it.  urcu_mcas_read() does
+ *     not fix that either: it helps E decide, but a *later* slot may be parked by
+ *     a different transaction that commits in between.
+ *
+ *   - It is safe for a transaction's read set.  The logical old returned here is
+ *     reconciled at install: commit() re-reads the slot, resolves whatever proxy
+ *     it finds, and compares against the recorded old_ptr -- a value that has
+ *     since changed aborts, one that has not is stolen.  A stale optimistic read
+ *     is therefore an extra abort, never a wrong commit.
+ *
+ *   - Progress is unaffected.  urcu_mcas_drive_install() still helps at INSTALL
+ *     time, so a descheduled owner's proxies are still driven to a decision by
+ *     whoever needs the slot; only the read stops paying for it.
+ *
+ * Prefer this for traversal -- reads whose value feeds a search and will be
+ * validated at commit.  Prefer urcu_mcas_read() when the caller needs the value
+ * to be stable at the point of the read itself.  Call within an RCU read-side
+ * section.
+ */
+static inline
+void *urcu_mcas_read_optimistic(void **slot, uintptr_t tag)
+{
+	void *v = uatomic_load(slot, CMM_ACQUIRE);
+
+	if (caa_likely(!urcu_mcas_is_proxy(v, tag)))
+		return v;
+	return urcu_mcas_resolve(v, tag);	/* undecided: E's old, its logical value */
+}
+
+/*
  * Allocate a descriptor blob of @size bytes, 16-byte aligned.  The descriptor
  * holds the inline records that get tagged into slots, so its base must be
  * 16-byte aligned for every inline record to keep its low 4 bits free (see the

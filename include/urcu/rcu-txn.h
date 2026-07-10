@@ -689,7 +689,8 @@ int urcu_txn__record(struct urcu_mcas_txn *txn, void **slot,
  * first loads (before any store) free even under RYW.
  */
 static inline
-void *urcu_txn_load(struct urcu_mcas_txn *txn, void **slot, uintptr_t tag)
+void *urcu_txn__load(struct urcu_mcas_txn *txn, void **slot, uintptr_t tag,
+		int optimistic)
 {
 	if (txn->ryw && txn->mcas != NULL && txn->mcas != URCU_TXN_ENOMEM) {
 		struct urcu_mcas_record *r = urcu_mcas_find(txn->mcas, slot);
@@ -697,7 +698,34 @@ void *urcu_txn_load(struct urcu_mcas_txn *txn, void **slot, uintptr_t tag)
 		if (r != NULL)
 			return r->new_ptr;	/* this attempt's pending value */
 	}
-	return urcu_mcas_read(slot, tag);
+	return optimistic ? urcu_mcas_read_optimistic(slot, tag)
+			: urcu_mcas_read(slot, tag);
+}
+
+static inline
+void *urcu_txn_load(struct urcu_mcas_txn *txn, void **slot, uintptr_t tag)
+{
+	return urcu_txn__load(txn, slot, tag, 0);
+}
+
+/*
+ * urcu_txn_load without helping an undecided transaction decide: forwards to
+ * urcu_mcas_read_optimistic() (see it for why this is safe for a read set).  The
+ * value is the slot's logical value at the moment of the read, and commit()
+ * reconciles it against the install-time physical value exactly as for
+ * urcu_txn_load -- a value that moved aborts.  A stale read costs an abort, not
+ * correctness, so this trades a rare extra retry for not dragging every reader
+ * of a contended slot through the parking transaction's whole install.
+ *
+ * Route TRAVERSAL through here: reads that locate a write site and are checked
+ * at commit anyway.  Keep urcu_txn_load() for a value the op must see settled at
+ * the point it reads it.  RYW is honoured identically.
+ */
+static inline
+void *urcu_txn_load_optimistic(struct urcu_mcas_txn *txn, void **slot,
+		uintptr_t tag)
+{
+	return urcu_txn__load(txn, slot, tag, 1);
 }
 
 /*
@@ -729,6 +757,24 @@ void *urcu_txn_load_validate(struct urcu_mcas_txn *txn, void **slot,
 		uintptr_t tag)
 {
 	void *v = urcu_txn_load(txn, slot, tag);
+
+	(void) urcu_txn__record(txn, slot, v, v, 0, tag);
+	return v;
+}
+
+/*
+ * urcu_txn_load_validate that reads optimistically (urcu_txn_load_optimistic).
+ * The guard is unchanged -- the commit still requires @slot to resolve to the
+ * value returned here -- so an undecided parker observed as its logical old is
+ * simply a guard on that old: it holds if the parker aborts, and aborts us if it
+ * commits.  Exactly the outcome the helping read would have reached, one attempt
+ * later.
+ */
+static inline
+void *urcu_txn_load_validate_optimistic(struct urcu_mcas_txn *txn, void **slot,
+		uintptr_t tag)
+{
+	void *v = urcu_txn_load_optimistic(txn, slot, tag);
 
 	(void) urcu_txn__record(txn, slot, v, v, 0, tag);
 	return v;
