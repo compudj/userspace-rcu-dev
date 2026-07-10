@@ -42,6 +42,7 @@ noinst_PROGRAMS = \
 	test_rcu_txn_hlist_ryw \
 	test_rcu_txn_bitmap \
 	test_rcu_txn_skiplist \
+	test_rcu_txn_skiplist_ryw \
 	test_rcu_txn_slab \
 	test_fair_mutex \
 	test_urcu_multiflavor \
@@ -95,6 +96,7 @@ TESTS = \
 	test_rcu_txn_hlist_ryw \
 	test_rcu_txn_bitmap \
 	test_rcu_txn_skiplist \
+	test_rcu_txn_skiplist_ryw \
 	test_rcu_txn_slab \
 	test_fair_mutex \
 	test_urcu_multiflavor \
@@ -205,6 +207,9 @@ test_rcu_txn_bitmap_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
 
 test_rcu_txn_skiplist_SOURCES = test_rcu_txn_skiplist.c
 test_rcu_txn_skiplist_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
+
+test_rcu_txn_skiplist_ryw_SOURCES = test_rcu_txn_skiplist_ryw.c
+test_rcu_txn_skiplist_ryw_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
 
 test_rcu_txn_slab_SOURCES = test_rcu_txn_slab.c
 test_rcu_txn_slab_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)

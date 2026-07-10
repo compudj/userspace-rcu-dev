@@ -107,10 +107,25 @@
  * through the accessors below (which resolve the proxy and strip the mark);
  * never touch the raw fields.
  *
- * Composition caveat: buffered writes are invisible to a txn's own loads, and
- * the _prepare forms search with plain rcu_dereference (not txn loads), so
- * composing two prepares that touch the SAME skiplist within one txn is not
- * supported; compose across DISTINCT skiplists (as a move / rotation does).
+ * Composing several prepares that touch the SAME skiplist
+ * ---------------------------------------------------------
+ * The _prepare forms search THROUGH the txn (urcu_txn_skiplist_search takes it),
+ * so what they see depends on the handle's semantics:
+ *
+ *   - default (invisible buffered writes): a second prepare on the same skiplist
+ *     searches the COMMITTED structure, blind to the first's pending edits.  It
+ *     can pick a predecessor the first prepare has already displaced, and the two
+ *     stores then collide on that one pred->next[L] slot.  Both present the same
+ *     old, the engine's one-record-per-slot upgrade overwrites new_ptr, and an
+ *     edge is silently destroyed -- a torn tower, not merely a lost key.  So:
+ *     compose only across DISTINCT skiplists (as a move / rotation does).
+ *
+ *   - urcu_txn_enable_ryw() (see <urcu/rcu-txn.h>): the descent observes the
+ *     txn's own pending edits, so each prepare lands on its true post-batch
+ *     predecessor -- often a node this txn allocated and has not published, whose
+ *     slots need no record at all -- and where a published slot genuinely takes
+ *     two edits, the chained store fuses them into one record.  Composing several
+ *     prepares on ONE skiplist in ONE txn is then supported.
  */
 
 #include <errno.h>
@@ -276,6 +291,24 @@ int urcu_txn_skiplist_empty(struct urcu_txn_skiplist *sl)
 }
 
 /*
+ * Resolved forward step at @level taken THROUGH a transaction: identical to
+ * urcu_txn_skiplist_next_rcu() except that, when @txn opted into
+ * read-your-own-writes, the hop observes the transaction's own buffered stores.
+ * That is what lets a later edit in a batch traverse the structure as the commit
+ * will leave it rather than as it is, so it computes its write site against the
+ * batch's pending edits.  With RYW off (the default) this is exactly the plain
+ * resolved read.  Call within the txn's RCU read-side section.
+ */
+static inline
+struct urcu_txn_skiplist_node *urcu_txn_skiplist_next_txn(
+		struct urcu_mcas_txn *txn,
+		struct urcu_txn_skiplist_node *node, unsigned int level)
+{
+	return urcu_txn_skiplist_resolve(urcu_txn_load(txn,
+			(void **) &node->next[level], URCU_TXN_SKIPLIST_TAG));
+}
+
+/*
  * Descend from the head, recording in @update[L] the predecessor node at each
  * level (the last node whose key < @key, or the head) and, if @succ is non-NULL,
  * in @succ[L] that level's successor -- the first node with key >= @key, or NULL.
@@ -288,9 +321,19 @@ int urcu_txn_skiplist_empty(struct urcu_txn_skiplist *sl)
  * key ordering is inherited from this search.  Plain RCU-resolved loads: a
  * predecessor/successor made stale by a racing update just fails that check and
  * the caller retries.  Call within an RCU read-side section.
+ *
+ * The descent hops through @txn, so a RYW handle sees the transaction's OWN
+ * pending edits (see urcu_txn_enable_ryw): a node this transaction already
+ * deleted is already unlinked in that view and can never be picked as a
+ * predecessor, and a node it already inserted is picked when it is the true
+ * post-batch predecessor.  The guards in insert_prepare/del_prepare must read
+ * through the same view -- they do, via urcu_txn_load -- because a MIXED view
+ * (RYW descent, committed-value guard) disagrees with itself and would fail
+ * every attempt.
  */
 static inline
 struct urcu_txn_skiplist_node *urcu_txn_skiplist_search(
+		struct urcu_mcas_txn *txn,
 		struct urcu_txn_skiplist *sl, void *key,
 		struct urcu_txn_skiplist_node **update,
 		struct urcu_txn_skiplist_node **succ)
@@ -300,10 +343,11 @@ struct urcu_txn_skiplist_node *urcu_txn_skiplist_search(
 	int level;
 
 	for (level = (int) sl->head->toplevel; level >= 0; level--) {
-		cur = urcu_txn_skiplist_next_rcu(pred, (unsigned int) level);
+		cur = urcu_txn_skiplist_next_txn(txn, pred, (unsigned int) level);
 		while (cur != NULL && sl->cmp(cur, key) < 0) {
 			pred = cur;
-			cur = urcu_txn_skiplist_next_rcu(pred, (unsigned int) level);
+			cur = urcu_txn_skiplist_next_txn(txn, pred,
+					(unsigned int) level);
 		}
 		update[level] = pred;
 		if (succ != NULL)
@@ -355,7 +399,7 @@ int urcu_txn_skiplist_insert_prepare(struct urcu_mcas_txn *txn,
 	struct urcu_txn_skiplist_node *cand;
 	unsigned int level, top = newp->toplevel;
 
-	cand = urcu_txn_skiplist_search(sl, key, update, ssucc);
+	cand = urcu_txn_skiplist_search(txn, sl, key, update, ssucc);
 	if (cand != NULL && sl->cmp(cand, key) == 0)
 		return -EEXIST;
 	/*
@@ -427,7 +471,7 @@ int urcu_txn_skiplist_del_prepare(struct urcu_mcas_txn *txn,
 	 * loaded below), not search's per-level successor (which for the victim is
 	 * the victim itself, since victim.key == @key) -- so pass NULL for @succ.
 	 */
-	node = urcu_txn_skiplist_search(sl, key, update, NULL);
+	node = urcu_txn_skiplist_search(txn, sl, key, update, NULL);
 	if (node == NULL || sl->cmp(node, key) != 0)
 		return -ENOENT;			/* not present */
 	top = node->toplevel;
