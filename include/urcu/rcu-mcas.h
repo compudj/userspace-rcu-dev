@@ -475,8 +475,22 @@ int urcu_mcas_plant(struct urcu_mcas *t,
 	void *tagv = urcu_mcas_tag(r, r->proxy_tag);
 	int v;
 
-	/* Claim r's install: FREE -> BUSY (acquire). */
+	/*
+	 * Claim r's install: FREE -> BUSY (acquire), test-and-test-and-set.
+	 *
+	 * Load before the CAS.  An unconditional cmpxchg takes r->state EXCLUSIVE
+	 * even on the attempts that cannot possibly win -- it reads DONE or BUSY on
+	 * ~29% of entries at 192 writers -- and in the helping path r belongs to a
+	 * FOREIGN transaction, so that line is shared: the doomed RMW invalidates
+	 * every co-driver's copy, including the one the BUSY waiters below spin on.
+	 * The CAS still decides; the load only skips it when it provably would fail.
+	 */
 	for (;;) {
+		v = uatomic_load(&r->state, CMM_ACQUIRE);
+		if (v == URCU_MCAS_INSTALL_DONE)
+			return 2;		/* already installed: advance */
+		if (v == URCU_MCAS_INSTALL_BUSY)
+			goto wait;
 		v = uatomic_cmpxchg(&r->state, URCU_MCAS_INSTALL_FREE,
 				URCU_MCAS_INSTALL_BUSY);
 		if (v == URCU_MCAS_INSTALL_DONE)
@@ -489,6 +503,7 @@ int urcu_mcas_plant(struct urcu_mcas *t,
 		 * then re-decide.  BUSY is cooperative install progress, not a
 		 * lost-slot conflict, so it never advances the retry counter.
 		 */
+wait:
 		while (uatomic_load(&r->state, CMM_RELAXED) == URCU_MCAS_INSTALL_BUSY)
 			caa_cpu_relax();
 	}
