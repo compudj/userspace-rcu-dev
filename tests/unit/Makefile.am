@@ -39,6 +39,7 @@ noinst_PROGRAMS = \
 	test_rcu_txn_list_compose \
 	test_rcu_txn_list_replace \
 	test_rcu_txn_hlist \
+	test_rcu_txn_hlist_ryw \
 	test_rcu_txn_bitmap \
 	test_rcu_txn_skiplist \
 	test_rcu_txn_slab \
@@ -91,6 +92,7 @@ TESTS = \
 	test_rcu_txn_list_compose \
 	test_rcu_txn_list_replace \
 	test_rcu_txn_hlist \
+	test_rcu_txn_hlist_ryw \
 	test_rcu_txn_bitmap \
 	test_rcu_txn_skiplist \
 	test_rcu_txn_slab \
@@ -194,6 +196,9 @@ test_rcu_txn_list_replace_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
 
 test_rcu_txn_hlist_SOURCES = test_rcu_txn_hlist.c
 test_rcu_txn_hlist_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
+
+test_rcu_txn_hlist_ryw_SOURCES = test_rcu_txn_hlist_ryw.c
+test_rcu_txn_hlist_ryw_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
 
 test_rcu_txn_bitmap_SOURCES = test_rcu_txn_bitmap.c
 test_rcu_txn_bitmap_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)

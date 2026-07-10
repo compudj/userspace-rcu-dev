@@ -973,6 +973,71 @@ bool urcu_mcas_record(struct urcu_mcas *t, void **slot,
 }
 
 /*
+ * Find the record this descriptor already buffers for @slot, or NULL.  The
+ * write-set IS the read-your-own-writes overlay: a record's new_ptr is the value
+ * this transaction believes @slot holds.  Linear scan -- the write-set is small
+ * (a handful of edges), and the caller's hot path is the MISS (a traversal walks
+ * many slots, few of them transacted), so the scan is bounded by nr and the
+ * no-descriptor case is filtered by the caller before we are reached.
+ */
+static inline
+struct urcu_mcas_record *urcu_mcas_find(struct urcu_mcas *t, void **slot)
+{
+	unsigned int i;
+
+	for (i = 0; i < t->nr; i++) {
+		if (t->recs[i].slot == slot)
+			return &t->recs[i];
+	}
+	return NULL;
+}
+
+/*
+ * Record edge {*slot: old -> new} under READ-YOUR-OWN-WRITES semantics: the
+ * caller's @old_ptr is the value it observed through a RYW load, i.e. the
+ * record's PENDING new_ptr when one exists, not the committed value.  So a
+ * same-slot reconcile matches against new_ptr and CHAINS: the record keeps its
+ * original old_ptr (the committed value the commit will verify) and advances its
+ * new_ptr, collapsing {old -> mid} then {mid -> new} into the single {old -> new}
+ * pair an MCAS can represent.  This is exact: commit only ever verifies old_ptr
+ * against memory and installs new_ptr, and no intermediate is ever published (a
+ * parked proxy resolves to old-or-new), so composing stores functionally on a
+ * slot is indistinguishable from applying them in sequence.
+ *
+ * It also subsumes the non-RYW upgrade of a load-validate guard, which is the
+ * degenerate chain where new_ptr == old_ptr.
+ *
+ * @old_ptr matching NEITHER the pending new_ptr is a genuine torn read (the
+ * caller reached this slot with a value no longer consistent with the
+ * transaction's own view -- e.g. it kept a value read before another edge in
+ * this transaction rewrote the slot).  Poison, as urcu_mcas_record() does: the
+ * commit aborts and the caller re-reads.  Never merge, which would forge a
+ * record whose old no longer matches the intended write.
+ */
+static inline
+bool urcu_mcas_record_chain(struct urcu_mcas *t, void **slot,
+		void *old_ptr, void *new_ptr, int upgrade, uintptr_t tag)
+{
+	struct urcu_mcas_record *r = urcu_mcas_find(t, slot);
+
+	if (r != NULL) {
+		if (caa_unlikely(r->new_ptr != old_ptr)) {
+			t->poisoned = 1;	/* torn read-set: commit will abort */
+			return true;
+		}
+		/*
+		 * Chain: old_ptr stays the COMMITTED value (what commit checks),
+		 * new_ptr advances.  A load-validate (@upgrade == 0) leaves the
+		 * pending write intact, exactly as in the non-RYW path.
+		 */
+		if (upgrade)
+			r->new_ptr = new_ptr;
+		return true;
+	}
+	return urcu_mcas_add(t, slot, old_ptr, new_ptr, tag);
+}
+
+/*
  * Grow @t's record capacity (room for at least one more), returning the
  * possibly-moved descriptor, or NULL on OOM with @t left intact for the caller
  * to free.  Valid only before commit: the descriptor is not yet parked in any

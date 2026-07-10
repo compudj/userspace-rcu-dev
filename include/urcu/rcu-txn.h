@@ -92,15 +92,25 @@
  * is sticky -- the pending commit then reports -ENOMEM -- so a mutator only has
  * to test commit's result (which it already does).
  *
- * Buffered writes are INVISIBLE to the bracket's own loads: urcu_txn_load()
- * returns the slot's current logical value, never a pending new_ptr this
- * attempt buffered -- there is no read-your-own-writes.  And a transaction
- * keeps AT MOST ONE record per slot per attempt: a second store to the same
- * slot upgrades the buffered record in place (last-wins; a disagreeing old
- * poisons the attempt), it does not sequence after the first.  Composing two
- * *_prepare forms that write the same slot (e.g. two insert-after at one
- * position) thus silently collapses to the last write: run them as separate
- * transactions.
+ * Buffered writes are INVISIBLE to the bracket's own loads BY DEFAULT:
+ * urcu_txn_load() returns the slot's current logical value, never a pending
+ * new_ptr this attempt buffered.  And a transaction keeps AT MOST ONE record per
+ * slot per attempt: a second store to the same slot upgrades the buffered record
+ * in place (last-wins; a disagreeing old poisons the attempt), it does not
+ * sequence after the first.  Composing two *_prepare forms that write the same
+ * slot (e.g. two insert-after at one position) thus silently collapses to the
+ * last write: run them as separate transactions.
+ *
+ * That default is a hazard for any structure whose WRITE SITE is reached by a
+ * traversal, because a commit is a state transition, not a program: the edits in
+ * one commit are simultaneous, so a *_prepare that searches the committed
+ * structure can pick a predecessor an earlier edit of the SAME transaction has
+ * already displaced, and the two edits then collide on one slot.  With matching
+ * olds the upgrade destroys an edge silently.  urcu_txn_enable_ryw() opts a
+ * handle into read-your-own-writes plus chained same-slot stores, which is what
+ * makes such composition sound; see that function.  The one-record-per-slot
+ * invariant holds either way -- RYW changes which slot an edit names, and
+ * chaining changes how one slot's records fuse, never how many there are.
  *
  * Reserve.  A mutator that knows its edge count up front may call
  * urcu_txn_reserve() right after begin: it allocates the descriptor to
@@ -246,6 +256,13 @@ struct urcu_mcas_txn {
 	struct cds_fair_mutex_node waiter;	/* our node while awaiting the turn */
 	int in_fallback;		/* we currently hold the lock */
 	int retrying;			/* commit asked retry: keep the turn */
+	int ryw;			/* read-your-own-writes: loads see this
+					 * attempt's buffered stores, and a store
+					 * to an already-recorded slot chains onto
+					 * it.  Off by default (the historical
+					 * invisible-writes semantics).  Set with
+					 * urcu_txn_enable_ryw() before the first
+					 * begin(); never flip mid-transaction. */
 };
 
 /*
@@ -271,6 +288,40 @@ void urcu_txn_init_flavor(struct urcu_mcas_txn *txn,
 	txn->mcas = NULL;
 	txn->in_fallback = 0;
 	txn->retrying = 0;
+	txn->ryw = 0;
+}
+
+/*
+ * Opt this handle into READ-YOUR-OWN-WRITES for its whole lifetime.  Call after
+ * init and before the first begin(); do not flip it mid-transaction.
+ *
+ * With RYW, urcu_txn_load() returns a slot's pending new_ptr when this attempt
+ * has already recorded a store to it, and urcu_txn_store() to an
+ * already-recorded slot CHAINS onto that record (see urcu_mcas_record_chain)
+ * instead of requiring the committed old.  Together they let a mutator compose
+ * several edits in one transaction when a later edit's WRITE SITE depends on an
+ * earlier edit -- which is any structure whose write site is reached by a
+ * traversal, one hop or many: an ordered skiplist's pred->next[L], an hlist's
+ * *elem->pprev.  Without RYW such a later edit searches the COMMITTED structure,
+ * lands on a predecessor the transaction has already displaced, and its store
+ * collides with the earlier edit on one slot; the one-record-per-slot engine
+ * then matches olds and the upgrade silently destroys an edge.
+ *
+ * RYW does not merely reconcile such collisions -- it usually DISSOLVES them:
+ * the retargeted write often lands in a node this transaction allocated and has
+ * not published, which needs no record at all.  Chaining covers the residue,
+ * where the fused slot belongs to an already-published node.
+ *
+ * Cost is a linear scan of the write-set per load, filtered by a NULL-descriptor
+ * fast path -- so the first _prepare of a transaction pays nothing, and a
+ * traversal's overwhelmingly common MISS costs a bounded scan of a handful of
+ * records.  A structure whose write site is a pure function of the key (a fixed
+ * bucket head, a bitmap word) never needs this.
+ */
+static inline
+void urcu_txn_enable_ryw(struct urcu_mcas_txn *txn)
+{
+	txn->ryw = 1;
 }
 
 /* Initialize a handle bracketed in the compile-time-selected RCU flavor. */
@@ -460,6 +511,24 @@ int urcu_txn_reserve(struct urcu_mcas_txn *txn, unsigned int n)
 }
 
 /*
+ * Reconcile one record against the write-set under the handle's semantics: the
+ * historical invisible-writes rule (match the committed old_ptr, last store
+ * wins) or, when the handle opted into RYW, the chaining rule (match the pending
+ * new_ptr, keep the committed old_ptr, advance new_ptr).  See
+ * urcu_mcas_record() and urcu_mcas_record_chain().
+ */
+static inline
+bool urcu_txn__reconcile(struct urcu_mcas_txn *txn, struct urcu_mcas *m,
+		void **slot, void *old_ptr, void *new_ptr, int upgrade,
+		uintptr_t tag)
+{
+	if (txn->ryw)
+		return urcu_mcas_record_chain(m, slot, old_ptr, new_ptr,
+				upgrade, tag);
+	return urcu_mcas_record(m, slot, old_ptr, new_ptr, upgrade, tag);
+}
+
+/*
  * Buffer or reconcile one record (see urcu_mcas_record): lazily create
  * the descriptor, grow it if full, and keep one record per slot.  @upgrade is 1
  * for a store (advances new_ptr), or 0 for a load-validate guard (keeps any
@@ -483,7 +552,7 @@ int urcu_txn__record(struct urcu_mcas_txn *txn, void **slot,
 		}
 		txn->mcas = m;
 	}
-	if (caa_unlikely(!urcu_mcas_record(m, slot, old_ptr, new_ptr,
+	if (caa_unlikely(!urcu_txn__reconcile(txn, m, slot, old_ptr, new_ptr,
 			upgrade, tag))) {
 		/* Descriptor full: grow (may move it) and retry. */
 		m = urcu_mcas_grow(m);
@@ -493,7 +562,7 @@ int urcu_txn__record(struct urcu_mcas_txn *txn, void **slot,
 			return -ENOMEM;
 		}
 		txn->mcas = m;
-		urcu_mcas_record(m, slot, old_ptr, new_ptr, upgrade, tag);
+		urcu_txn__reconcile(txn, m, slot, old_ptr, new_ptr, upgrade, tag);
 	}
 	return 0;
 }
@@ -508,13 +577,25 @@ int urcu_txn__record(struct urcu_mcas_txn *txn, void **slot,
  * end), and it is the seam where the wait-free escalation lane would add read
  * validation: route in-bracket reads here, not through urcu_mcas_read(), so
  * that day is a one-line change.  A plain observer outside any transaction reads
- * with urcu_mcas_read() directly.  The returned value never reflects this
- * attempt's own buffered stores (no read-your-own-writes).
+ * with urcu_mcas_read() directly.
+ *
+ * By default the returned value never reflects this attempt's own buffered
+ * stores.  A handle that opted into urcu_txn_enable_ryw() instead returns the
+ * pending new_ptr of a slot it has already recorded -- read-your-own-writes --
+ * so a traversal inside the bracket observes the transaction's own edits and
+ * computes write sites against the structure as it will be, not as it was.  The
+ * NULL-descriptor test keeps the non-RYW cost at zero and makes an attempt's
+ * first loads (before any store) free even under RYW.
  */
 static inline
 void *urcu_txn_load(struct urcu_mcas_txn *txn, void **slot, uintptr_t tag)
 {
-	(void) txn;			/* no read-set today -- this is the seam */
+	if (txn->ryw && txn->mcas != NULL && txn->mcas != URCU_TXN_ENOMEM) {
+		struct urcu_mcas_record *r = urcu_mcas_find(txn->mcas, slot);
+
+		if (r != NULL)
+			return r->new_ptr;	/* this attempt's pending value */
+	}
 	return urcu_mcas_read(slot, tag);
 }
 
@@ -534,12 +615,19 @@ void *urcu_txn_load(struct urcu_mcas_txn *txn, void **slot, uintptr_t tag)
  * word.  A later store to @slot upgrades the guard to a write in place;
  * validate/read a given slot once per attempt.  Sticky on OOM like store: the
  * value is returned regardless and the pending commit reports -ENOMEM.
+ *
+ * Under RYW the value read is this attempt's pending one, so guarding a slot the
+ * transaction has already written re-affirms its own pending value rather than
+ * the committed one (the chaining reconcile keeps the record's committed old,
+ * which is what commit verifies).  In particular a guard on a slot this
+ * transaction has tombstoned observes the tombstone -- the self-conflict is
+ * visible instead of silently passing.
  */
 static inline
 void *urcu_txn_load_validate(struct urcu_mcas_txn *txn, void **slot,
 		uintptr_t tag)
 {
-	void *v = urcu_mcas_read(slot, tag);
+	void *v = urcu_txn_load(txn, slot, tag);
 
 	(void) urcu_txn__record(txn, slot, v, v, 0, tag);
 	return v;
