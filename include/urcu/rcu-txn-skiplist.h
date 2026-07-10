@@ -291,6 +291,23 @@ int urcu_txn_skiplist_empty(struct urcu_txn_skiplist *sl)
 }
 
 /*
+ * Read policy (measured; see also rcu-txn-bitmap.h and rcu-txn-hlist.h).
+ *
+ * Help iff the loaded slot belongs to this transaction's own read/write set.
+ * There, a stale value dooms the install-time CAS -- drive_install aborts on
+ * v != r->old_ptr -- so helping the UNDECIDED owner to a terminal status buys a
+ * value the plant can actually land on.  The _prepare loads below are all such
+ * slots (&pred->next[L] and &node->next[L] are stored; &succ->next[L] is folded
+ * into the read set), so they use the helping urcu_txn_load/_validate.
+ *
+ * Read optimistically for NAVIGATION -- a slot this transaction will never store
+ * nor validate.  The descent below is pure navigation: an UNDECIDED transaction
+ * has not linearized, so the slot's logical value already IS its old_ptr, and
+ * helping would make every hop of an O(log n) descent pay for a stranger's whole
+ * install.  Switching the descent alone was worth 3.05x at 192 writers; making
+ * the _prepare loads optimistic as well cost 8% back.
+ */
+/*
  * Resolved forward step at @level taken THROUGH a transaction: identical to
  * urcu_txn_skiplist_next_rcu() except that, when @txn opted into
  * read-your-own-writes, the hop observes the transaction's own buffered stores.
@@ -414,7 +431,7 @@ int urcu_txn_skiplist_insert_prepare(struct urcu_mcas_txn *txn,
 	for (level = 0; level <= top; level++) {
 		struct urcu_txn_skiplist_node *pred = update[level];
 		struct urcu_txn_skiplist_node *succ = ssucc[level];
-		void *pv = urcu_txn_load_optimistic(txn,
+		void *pv = urcu_txn_load(txn,
 				(void **) &pred->next[level],
 				URCU_TXN_SKIPLIST_TAG);
 
@@ -435,7 +452,7 @@ int urcu_txn_skiplist_insert_prepare(struct urcu_mcas_txn *txn,
 		 * point) deleted, the commit aborts and we re-search.
 		 */
 		if (succ != NULL) {
-			void *snv = urcu_txn_load_validate_optimistic(txn,
+			void *snv = urcu_txn_load_validate(txn,
 					(void **) &succ->next[level],
 					URCU_TXN_SKIPLIST_TAG);
 
@@ -486,10 +503,10 @@ int urcu_txn_skiplist_del_prepare(struct urcu_mcas_txn *txn,
 	 * and the caller re-searches.
 	 */
 	for (level = 0; level <= top; level++) {
-		void *nv = urcu_txn_load_optimistic(txn,
+		void *nv = urcu_txn_load(txn,
 				(void **) &node->next[level],
 				URCU_TXN_SKIPLIST_TAG);
-		void *pv = urcu_txn_load_optimistic(txn,
+		void *pv = urcu_txn_load(txn,
 				(void **) &update[level]->next[level],
 				URCU_TXN_SKIPLIST_TAG);
 
@@ -520,7 +537,7 @@ int urcu_txn_skiplist_del_prepare(struct urcu_mcas_txn *txn,
 		 */
 		succ = urcu_txn_skiplist_resolve(nv);
 		if (succ != NULL) {
-			void *snv = urcu_txn_load_validate_optimistic(txn,
+			void *snv = urcu_txn_load_validate(txn,
 					(void **) &succ->next[level],
 					URCU_TXN_SKIPLIST_TAG);
 
