@@ -164,6 +164,7 @@
  */
 
 #include <errno.h>
+#include <stdint.h>
 
 #include <urcu/compiler.h>
 #include <urcu/fair-mutex.h>
@@ -216,6 +217,36 @@ extern "C" {
 #ifndef URCU_TXN_RYW_DEFAULT
 #define URCU_TXN_RYW_DEFAULT	0
 #endif
+
+/*
+ * RYW read-your-own-writes lookup filter (a Bloom word, on by default under RYW).
+ * urcu_txn__load's RYW path must, for each in-bracket read, decide whether the
+ * slot is already in this attempt's write set.  The authoritative test is
+ * urcu_mcas_find() -- a linear scan of the descriptor's records at the record
+ * stride (48 bytes).  Under RYW a traversal reads many slots and transacts few,
+ * so the hot case is the MISS, and that scan is pure overhead on it.
+ *
+ * The filter is one word in the ON-STACK handle (never in struct urcu_mcas, whose
+ * size is baked into the library's descriptor slab -- enlarging it there overflows
+ * a slab block).  A store ORs the slot's bit; a load tests it.  A clear bit (the
+ * common miss) skips find entirely; a set bit falls through to find, which
+ * resolves the rare false positive -- so the filter can only ever save the scan,
+ * never change a returned value.  It is reset per attempt.  Measured ~+4% at 192
+ * writers on bench_txn_3skiplist (+3.6% at n=960, +4.4% at n=3840, size-stable,
+ * ~12x the run-to-run spread), and non-negative for narrow write-sets (a clear
+ * bit skips even the short hash scan); a dense {slot,val} array was tried instead
+ * and LOST (-2.3% .. -4.6%, worsening with size) because it stays O(nr) on the
+ * dominant miss.  Build -DURCU_TXN_RYW_NO_BLOOM to fall back to the bare find
+ * (A/B / falsification).
+ */
+static inline
+uint64_t urcu_txn__ryw_bloombit(void **slot)
+{
+	uintptr_t h = (uintptr_t) slot >> 3;	/* slots are pointer-aligned */
+
+	h *= 0x9e3779b97f4a7c15ULL;
+	return (uint64_t) 1 << (h >> 58);	/* top 6 bits -> one of 64 */
+}
 
 /*
  * Compile-time fallback for the RCU read-side bracket, used by
@@ -342,6 +373,10 @@ struct urcu_mcas_txn {
 					 * invisible-writes semantics).  Set with
 					 * urcu_txn_enable_ryw() before the first
 					 * begin(); never flip mid-transaction. */
+	uint64_t ryw_bloom;		/* RYW load filter: OR of recorded slots'
+					 * bits; cleared per attempt by begin().
+					 * Only read under txn->ryw, so a non-RYW
+					 * handle just carries the dead word. */
 #ifdef URCU_TXN_DEBUG_READ_POLICY
 	struct urcu_txn__rp_entry rp[URCU_TXN_RP_SLOTS];
 					/* kind of the most recent load of each
@@ -494,6 +529,7 @@ void urcu_txn_init_flavor(struct urcu_mcas_txn *txn,
 	txn->fb_published = 0;
 	txn->retrying = 0;
 	txn->ryw = URCU_TXN_RYW_DEFAULT;
+	txn->ryw_bloom = 0;
 #ifdef URCU_TXN_DEBUG_READ_POLICY
 	txn->rp_violations = 0;
 	txn->rp_evicted = 0;
@@ -739,6 +775,7 @@ void urcu_txn_begin(struct urcu_mcas_txn *txn)
 	else
 		urcu_txn__maybe_publish(txn);	/* joiner that starved: promote */
 	txn->mcas = NULL;		/* prior attempt's descriptor already consumed/freed */
+	txn->ryw_bloom = 0;		/* a new attempt's write set is empty */
 	urcu_txn__rp_reset(txn);	/* debug: a new attempt reloads every slot */
 	urcu_txn_read_lock(txn);
 }
@@ -849,6 +886,9 @@ int urcu_txn__record(struct urcu_mcas_txn *txn, void **slot,
 		txn->mcas = m;
 		urcu_txn__reconcile(txn, m, slot, old_ptr, new_ptr, upgrade, tag);
 	}
+#ifndef URCU_TXN_RYW_NO_BLOOM
+	txn->ryw_bloom |= urcu_txn__ryw_bloombit(slot);	/* RYW load filter */
+#endif
 	return 0;
 }
 
@@ -877,12 +917,22 @@ void *urcu_txn__load(struct urcu_mcas_txn *txn, void **slot, uintptr_t tag,
 		int optimistic)
 {
 	if (txn->ryw && txn->mcas != NULL && txn->mcas != URCU_TXN_ENOMEM) {
-		struct urcu_mcas_record *r = urcu_mcas_find(txn->mcas, slot);
+#ifndef URCU_TXN_RYW_NO_BLOOM
+		/*
+		 * The Bloom filter gates the scan: a clear bit proves the slot is
+		 * not in the write set (the common traversal miss) and skips find;
+		 * a set bit is confirmed by find, which resolves a false positive.
+		 */
+		if (txn->ryw_bloom & urcu_txn__ryw_bloombit(slot))
+#endif
+		{
+			struct urcu_mcas_record *r = urcu_mcas_find(txn->mcas, slot);
 
-		if (r != NULL)
-			return r->new_ptr;	/* this attempt's pending value:
-						 * already in the write set, no
-						 * physical read to classify */
+			if (r != NULL)
+				return r->new_ptr;	/* this attempt's pending value:
+							 * already in the write set, no
+							 * physical read to classify */
+		}
 	}
 	urcu_txn__rp_note(txn, slot, optimistic);	/* debug: read-policy */
 	return optimistic ? urcu_mcas_read_optimistic(slot, tag)
