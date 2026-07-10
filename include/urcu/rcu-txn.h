@@ -267,7 +267,8 @@ struct urcu_mcas_txn {
 	struct urcu_mcas *mcas;	/* this attempt's descriptor: NULL (none yet),
 					 * a live descriptor, or the ENOMEM marker */
 	struct cds_fair_mutex_node waiter;	/* our node while awaiting the turn */
-	int in_fallback;		/* we currently hold the lock */
+	int in_fallback;		/* we currently hold the lock (thread-private,
+					 * but relaxed-atomic: see __exit_fallback) */
 	int retrying;			/* commit asked retry: keep the turn */
 	int ryw;			/* read-your-own-writes: loads see this
 					 * attempt's buffered stores, and a store
@@ -299,7 +300,7 @@ void urcu_txn_init_flavor(struct urcu_mcas_txn *txn,
 	txn->retry = 0;
 	txn->min_alloc = 0;
 	txn->mcas = NULL;
-	txn->in_fallback = 0;
+	uatomic_store(&txn->in_fallback, 0, CMM_RELAXED);
 	txn->retrying = 0;
 	txn->ryw = URCU_TXN_RYW_DEFAULT;
 }
@@ -415,7 +416,7 @@ void urcu_txn__enter_fallback(struct urcu_mcas_txn *txn)
 	 */
 	cds_fair_mutex_lock(&txn->domain->lock, &txn->waiter);
 	uatomic_store(&txn->domain->active, 1, CMM_RELAXED);
-	txn->in_fallback = 1;
+	uatomic_store(&txn->in_fallback, 1, CMM_RELAXED);
 }
 
 /*
@@ -443,8 +444,23 @@ void urcu_txn__exit_fallback(struct urcu_mcas_txn *txn)
 	 * urcu_txn__want_fallback).
 	 */
 	uatomic_store(&txn->domain->active, 0, CMM_RELAXED);
+	/*
+	 * Drop in_fallback INSIDE the critical section, not after the unlock.
+	 * Callers read it as "we already own the lane": want_fallback()
+	 * suppresses escalation on it and urcu_txn_end() unlocks on it.  Clearing
+	 * after the unlock would leave a window claiming ownership of a lane
+	 * already released -- the direction that misleads; clearing first can at
+	 * worst deny ownership we still hold, which nothing between here and the
+	 * unlock consults.
+	 *
+	 * The field is thread-private, so no barrier is owed and CMM_RELAXED is
+	 * enough -- but it must be an atomic access, not a plain store: the
+	 * compiler can see it is unaliased and would happily sink it past the
+	 * (inlinable) unlock, or hoist the store in __enter_fallback above the
+	 * lock, undoing exactly the ordering above.
+	 */
+	uatomic_store(&txn->in_fallback, 0, CMM_RELAXED);
 	(void) cds_fair_mutex_unlock(&txn->domain->lock, &txn->waiter);
-	txn->in_fallback = 0;
 }
 
 /*
@@ -460,7 +476,7 @@ void urcu_txn__exit_fallback(struct urcu_mcas_txn *txn)
 static inline
 int urcu_txn__want_fallback(struct urcu_mcas_txn *txn)
 {
-	return txn->domain && !txn->in_fallback &&
+	return txn->domain && !uatomic_load(&txn->in_fallback, CMM_RELAXED) &&
 		(uatomic_load(&txn->domain->active, CMM_RELAXED) ||
 		 txn->retry >= URCU_TXN_FALLBACK ||
 		 txn->min_alloc >= URCU_TXN_BIG);
@@ -508,7 +524,8 @@ int urcu_txn_reserve(struct urcu_mcas_txn *txn, unsigned int n)
 	 * (see __enter_fallback): the bounded wait keeps the caller's pinned
 	 * pointers alive and cannot extend a grace period unboundedly.
 	 */
-	if (txn->domain && !txn->in_fallback && n >= URCU_TXN_BIG)
+	if (txn->domain && !uatomic_load(&txn->in_fallback, CMM_RELAXED) &&
+			n >= URCU_TXN_BIG)
 		urcu_txn__enter_fallback(txn);
 	if (caa_unlikely(txn->mcas == URCU_TXN_ENOMEM))
 		return -ENOMEM;		/* sticky: an earlier alloc already failed */
@@ -755,7 +772,7 @@ void urcu_txn_end(struct urcu_mcas_txn *txn)
 	 * bail that ends the bracket).  On a retry (commit returned 0 ->
 	 * retrying) keep the turn and re-attempt as the same head.
 	 */
-	if (txn->in_fallback && !txn->retrying)
+	if (uatomic_load(&txn->in_fallback, CMM_RELAXED) && !txn->retrying)
 		urcu_txn__exit_fallback(txn);
 }
 
