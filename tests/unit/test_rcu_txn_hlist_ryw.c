@@ -31,6 +31,16 @@
  * and the subsequent store CHAINS onto del(A)'s record ({A -> B} becomes
  * {A -> C}).  Both nodes end marked, both unlinked, C correctly renamed.
  *
+ * An INSERT composed with a delete aliases too, and shows that the trigger is
+ * slot coincidence rather than the insertion end.  insert_head always stores
+ * &head->first; del(X) stores *X->pprev, which IS &head->first exactly when X is
+ * the bucket's first node.  Compose them and the insert's successor load reads
+ * memory, never seeing this txn's pending unlink of X, so both stores present
+ * the same old and the upgrade leaves X MARK-ed yet still linked -- its delete
+ * lost, and the caller reclaims it.  The victim-position tests below pin that
+ * down: FIRST corrupts, MIDDLE and LAST are correct even without RYW.  Inserting
+ * at the tail would not cure it; the trigger would move to "victim is last".
+ *
  * This is the evidence for the claim that RYW + chaining is a GENERIC engine
  * feature rather than a skiplist repair.  See test_rcu_txn_skiplist_ryw.c.
  */
@@ -51,7 +61,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS	5
+#define NR_TESTS	9
 #define SPIN_LIMIT	100000
 
 struct node {
@@ -265,6 +275,95 @@ static void test_negative_no_ryw(void)
 	free(n[0]); free(n[1]); free(n[2]); free(n[3]);
 }
 
+/* --------------------------------------------------------------------- */
+/* 6-9. An insert COMPOSED WITH a delete: the trigger is slot coincidence, */
+/*      not the insertion end.                                             */
+/* --------------------------------------------------------------------- */
+
+/*
+ * insert_head always stores &head->first.  del(X) stores *X->pprev, which IS
+ * &head->first exactly when X is the bucket's first node.  So composing the two
+ * collides only for that victim -- and it collides destructively, because the
+ * insert's successor load reads memory and never sees this txn's pending unlink
+ * of X, so both stores present the same old.  Inserting at the tail would not
+ * cure it; the trigger would move to "victim is last".
+ *
+ * Returns 1 if @victim survived its own delete (still reachable) -- the
+ * corruption.  build() head-inserts 1,2,3,4, so the chain is 4,3,2,1 and
+ * @victim_idx into n[] means: 3 = FIRST (key 4), 1 = MIDDLE (key 2),
+ * 0 = LAST (key 1).
+ */
+static int del_plus_insert_head(int victim_idx, int ryw, unsigned long *chain,
+		int *chain_len)
+{
+	struct urcu_txn_hlist_head head;
+	struct urcu_mcas_txn txn;
+	struct node *n[4], *ins;
+	unsigned long victim_key;
+	int survived;
+
+	build(&head, n);			/* chain: 4,3,2,1 */
+	victim_key = n[victim_idx]->key;
+	ins = node_alloc(9);
+
+	urcu_txn_init(&txn, &g_dom);
+	urcu_txn_set_ryw(&txn, ryw);
+	for (;;) {
+		int p1, p2;
+		enum urcu_txn_status st;
+
+		urcu_txn_begin(&txn);
+		p1 = urcu_txn_hlist_del_prepare(&txn, &n[victim_idx]->h);
+		p2 = p1 ? 0 : urcu_txn_hlist_insert_head_prepare(&txn, &ins->h, &head);
+		if (p1 == -EAGAIN || p2 == -EAGAIN) {
+			urcu_txn_conflict(&txn);
+			urcu_txn_end(&txn);
+			continue;
+		}
+		if (p1 || p2)
+			abort();
+		st = urcu_txn_commit(&txn);
+		urcu_txn_end(&txn);
+		if (st == URCU_TXN_STATUS_OK)
+			break;
+		if (st == URCU_TXN_STATUS_ABORT)
+			continue;
+		abort();
+	}
+
+	*chain_len = collect(&head, chain, 16);
+	survived = present(&head, victim_key);
+
+	free(n[0]); free(n[1]); free(n[2]); free(n[3]); free(ins);
+	return survived;
+}
+
+static void test_victim_position(void)
+{
+	unsigned long chain[16];
+	int len, first_bad, middle_ok, last_ok, ryw_ok;
+
+	/* Chain is 4,3,2,1.  Victim FIRST = key 4 = n[3]: aliases &head->first. */
+	first_bad = del_plus_insert_head(3, 0, chain, &len) && len == 5;
+	ok(first_bad,
+			"no-ryw hlist: del(FIRST) + insert_head -- victim survives its own delete");
+
+	/* Victim MIDDLE (key 2 = n[1]) and LAST (key 1 = n[0]): disjoint slots. */
+	middle_ok = !del_plus_insert_head(1, 0, chain, &len) && len == 4;
+	ok(middle_ok,
+			"no-ryw hlist: del(MIDDLE) + insert_head is CORRECT -- head/tail is not the cause");
+
+	last_ok = !del_plus_insert_head(0, 0, chain, &len) && len == 4;
+	ok(last_ok,
+			"no-ryw hlist: del(LAST) + insert_head is CORRECT -- only the head slot aliases");
+
+	/* Same composition, RYW on: the insert's succ load sees the pending unlink. */
+	ryw_ok = !del_plus_insert_head(3, 1, chain, &len) && len == 4 &&
+			chain[0] == 9 && chain[1] == 3 && chain[2] == 2 && chain[3] == 1;
+	ok(ryw_ok,
+			"ryw hlist: del(FIRST) + insert_head yields the correct chain {9,3,2,1}");
+}
+
 int main(void)
 {
 	plan_tests(NR_TESTS);
@@ -274,6 +373,7 @@ int main(void)
 	test_ryw_adjacent_deletes();	/* 1, 2, 3 */
 	test_ryw_whitebox_chain();	/* 4 */
 	test_negative_no_ryw();		/* 5 */
+	test_victim_position();		/* 6, 7, 8, 9 */
 
 	rcu_thread_offline();
 	rcu_barrier();
