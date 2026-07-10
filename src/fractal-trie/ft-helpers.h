@@ -732,10 +732,74 @@ unsigned int ft_meta_parent_slot_offset_load(const struct cds_ft_metadata *meta)
  */
 #define ft_parent_depth_span(p, c)	((void)(p), (void)(c), 1U)
 
+/*
+ * Flip-proxy tag (see the full encoding note above ft_node_flip_proxy's original
+ * home, further down).  Hoisted here because the tag-stripping helpers below
+ * must be able to assert against it.
+ */
+#define FT_FLIP_PROXY_TYPE	7U
+#define FT_FLIP_PROXY_TAG	(FT_INTERNAL_MASK | (FT_FLIP_PROXY_TYPE << FT_INTERNAL_BITS))
+
+static inline_lookup
+bool ft_node_flip_proxy(struct cds_ft_inode_flag *node)
+{
+	return ((unsigned long) node & (FT_INTERNAL_MASK | FT_TYPE_MASK))
+		== FT_FLIP_PROXY_TAG;
+}
+
+/*
+ * RESOLVED-POINTER CONTRACT.
+ *
+ * A slot under an in-flight commit does not hold a node: it holds a pointer to
+ * the transaction's MCAS record, tagged FT_FLIP_PROXY_TAG (low nibble 0xF).
+ * Every structural predicate MISREADS such a flag rather than rejecting it --
+ *
+ *	ft_node_external(proxy)   -> (0xF & 0b11) == 0b00  -> false
+ *	ft_node_compressed(proxy) -> (0xF & 0b11) == 0b10  -> false
+ *
+ * -- so a proxy silently dispatches as "an internal node of type 7", and the
+ * tag-stripping helpers below then mint a wild node pointer out of the record's
+ * address.  The fault surfaces frames later, in cds_ft_item_to_metadata(), as a
+ * segfault on a garbage range -- with no trace of who failed to resolve.
+ *
+ * The contract is therefore: RESOLVE FIRST (ft_resolve_flip_proxy), THEN
+ * dispatch on kind.  ft_assert_resolved() traps a violation at its first use,
+ * where the culprit is still on the stack.  Build with -DFT_DEBUG_PROXY_ASSERT;
+ * it compiles to nothing otherwise.
+ *
+ * Deliberately NOT asserted: _ft_node_mask_ptr() and ft_flip_proxy_ptr(), which
+ * exist precisely to strip a proxy's tag, and ft_node_flip_proxy() itself.
+ */
+#ifdef FT_DEBUG_PROXY_ASSERT
+#include <stdio.h>
+#include <stdlib.h>
+
+__attribute__((noinline, cold))
+static void ft_proxy_assert_fail(const char *fn, const void *p)
+{
+	fprintf(stderr, "FT_PROXY_ASSERT: %s() got a parked flip proxy %p\n",
+		fn, p);
+	fflush(stderr);
+	abort();
+}
+
+# define ft_assert_resolved(node)					\
+	do {								\
+		if (caa_unlikely(ft_node_flip_proxy(			\
+				(struct cds_ft_inode_flag *) (node))))	\
+			ft_proxy_assert_fail(__func__,			\
+				(const void *) (node));			\
+	} while (0)
+#else
+# define ft_assert_resolved(node)	((void) 0)
+#endif
+
 static inline_lookup
 struct cds_ft_inode *ft_node_ptr(struct cds_ft_inode_flag *node)
 {
 	unsigned long v = (unsigned long) node;
+
+	ft_assert_resolved(node);
 
 	/*
 	 * Compute mask from the original pointer: the skip-compressed
@@ -753,6 +817,28 @@ struct cds_ft_inode *ft_node_ptr(struct cds_ft_inode_flag *node)
 	 * this a single 1-cycle AND that runs in parallel with the
 	 * mask chain above.
 	 */
+	v &= FT_ADDR_MASK;
+#endif
+
+	return (struct cds_ft_inode *) (v & mask);
+}
+
+/*
+ * Identity-only variant: mask a RAW slot value to a comparable address WITHOUT
+ * asserting it is resolved.  A slot under an in-flight commit legitimately holds
+ * a parked flip proxy, and a conflict check that only compares the masked value
+ * against a descent-captured node (proxy != captured -> retry) never
+ * dereferences it.  Use this at those sites, and ft_node_ptr() -- which asserts
+ * -- everywhere the result is dereferenced.  Never dereference this result.
+ */
+static inline_lookup
+struct cds_ft_inode *ft_node_ptr_raw(struct cds_ft_inode_flag *node)
+{
+	unsigned long v = (unsigned long) node;
+	unsigned long mask_internal = (~15UL) << ((v >> 1) & 7);
+	unsigned long mask = (v & 1) ? mask_internal : ~7UL;
+
+#ifdef FEATURE_FT_SKIP_COMPRESSED
 	v &= FT_ADDR_MASK;
 #endif
 
@@ -803,6 +889,8 @@ unsigned long ft_node_type(struct cds_ft_inode_flag *node)
 {
 	unsigned long type;
 
+	ft_assert_resolved(node);
+
 	if (_ft_node_mask_ptr(node) == NULL) {
 		return NODE_INDEX_NULL;
 	}
@@ -834,15 +922,8 @@ unsigned long ft_node_type(struct cds_ft_inode_flag *node)
  * both forward child slots and parent slots, since both resolve a flag
  * through this dispatch.
  */
-#define FT_FLIP_PROXY_TYPE	7U
-#define FT_FLIP_PROXY_TAG	(FT_INTERNAL_MASK | (FT_FLIP_PROXY_TYPE << FT_INTERNAL_BITS))
-
-static inline_lookup
-bool ft_node_flip_proxy(struct cds_ft_inode_flag *node)
-{
-	return ((unsigned long) node & (FT_INTERNAL_MASK | FT_TYPE_MASK))
-		== FT_FLIP_PROXY_TAG;
-}
+/* FT_FLIP_PROXY_TYPE / FT_FLIP_PROXY_TAG / ft_node_flip_proxy(): hoisted above
+ * ft_node_ptr(), so the tag-stripping helpers can assert against the tag. */
 
 static inline_lookup
 struct urcu_mcas_record *ft_flip_proxy_ptr(struct cds_ft_inode_flag *node)
@@ -1283,6 +1364,7 @@ static inline_lookup
 struct cds_ft_compressed_node *ft_compressed_node_ptr(
 		struct cds_ft_inode_flag *node)
 {
+	ft_assert_resolved(node);
 	return (struct cds_ft_compressed_node *)
 		(((unsigned long) node) & ~(unsigned long) FT_TAG_MASK);
 }
@@ -1370,6 +1452,7 @@ unsigned int ft_skip_len(struct cds_ft_inode_flag *node)
 static inline
 struct cds_ft_inode_flag *ft_skip_child_ptr(struct cds_ft_inode_flag *node)
 {
+	ft_assert_resolved(node);
 	return (struct cds_ft_inode_flag *) ((unsigned long) node & FT_ADDR_MASK);
 }
 

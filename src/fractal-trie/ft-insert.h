@@ -1415,9 +1415,9 @@ int ft_attach_node(struct cds_ft *ft,
 	 * would surface the same conflict as ABORT; failing fast here just skips a
 	 * doomed build.  No-op under retained exclusion.
 	 */
-	if ((old_node_flag_ptr && ft_node_ptr(*old_node_flag_ptr) && !external_nodes) ||
-			(attach_node_flag_ptr && ft_node_ptr(*attach_node_flag_ptr) !=
-				ft_node_ptr(attach_node_flag))) {
+	if ((old_node_flag_ptr && ft_node_ptr_raw(*old_node_flag_ptr) && !external_nodes) ||
+			(attach_node_flag_ptr && ft_node_ptr_raw(*attach_node_flag_ptr) !=
+				ft_node_ptr_raw(attach_node_flag))) {
 		ret = -EAGAIN;
 		goto check_error;
 	}
