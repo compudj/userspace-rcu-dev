@@ -304,7 +304,7 @@ struct urcu_txn_skiplist_node *urcu_txn_skiplist_next_txn(
 		struct urcu_mcas_txn *txn,
 		struct urcu_txn_skiplist_node *node, unsigned int level)
 {
-	return urcu_txn_skiplist_resolve(urcu_txn_load(txn,
+	return urcu_txn_skiplist_resolve(urcu_txn_load_optimistic(txn,
 			(void **) &node->next[level], URCU_TXN_SKIPLIST_TAG));
 }
 
@@ -414,7 +414,8 @@ int urcu_txn_skiplist_insert_prepare(struct urcu_mcas_txn *txn,
 	for (level = 0; level <= top; level++) {
 		struct urcu_txn_skiplist_node *pred = update[level];
 		struct urcu_txn_skiplist_node *succ = ssucc[level];
-		void *pv = urcu_txn_load(txn, (void **) &pred->next[level],
+		void *pv = urcu_txn_load_optimistic(txn,
+				(void **) &pred->next[level],
 				URCU_TXN_SKIPLIST_TAG);
 
 		/*
@@ -434,7 +435,7 @@ int urcu_txn_skiplist_insert_prepare(struct urcu_mcas_txn *txn,
 		 * point) deleted, the commit aborts and we re-search.
 		 */
 		if (succ != NULL) {
-			void *snv = urcu_txn_load_validate(txn,
+			void *snv = urcu_txn_load_validate_optimistic(txn,
 					(void **) &succ->next[level],
 					URCU_TXN_SKIPLIST_TAG);
 
@@ -485,9 +486,10 @@ int urcu_txn_skiplist_del_prepare(struct urcu_mcas_txn *txn,
 	 * and the caller re-searches.
 	 */
 	for (level = 0; level <= top; level++) {
-		void *nv = urcu_txn_load(txn, (void **) &node->next[level],
+		void *nv = urcu_txn_load_optimistic(txn,
+				(void **) &node->next[level],
 				URCU_TXN_SKIPLIST_TAG);
-		void *pv = urcu_txn_load(txn,
+		void *pv = urcu_txn_load_optimistic(txn,
 				(void **) &update[level]->next[level],
 				URCU_TXN_SKIPLIST_TAG);
 
@@ -518,7 +520,7 @@ int urcu_txn_skiplist_del_prepare(struct urcu_mcas_txn *txn,
 		 */
 		succ = urcu_txn_skiplist_resolve(nv);
 		if (succ != NULL) {
-			void *snv = urcu_txn_load_validate(txn,
+			void *snv = urcu_txn_load_validate_optimistic(txn,
 					(void **) &succ->next[level],
 					URCU_TXN_SKIPLIST_TAG);
 
