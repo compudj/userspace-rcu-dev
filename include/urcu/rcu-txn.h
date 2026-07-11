@@ -8,14 +8,14 @@
 /*
  * Transaction front-end for the RCU MCAS engine (<urcu/rcu-mcas.h>).
  *
- * <urcu/rcu-mcas.h> is the multi-word CAS engine
- * (urcu_mcas_*): a set of {slot, old, new} records committed atomically.
- * This header wraps it in a begin / store / commit / end transaction whose state
- * is a small on-stack handle, so a mutator reads and buffers writes imperatively
- * while the engine handles the retry bookkeeping.  Loads inside the bracket go
- * through urcu_txn_load(): it forwards to urcu_mcas_read() (there is
- * no read-set) but keeps in-bracket reads routed through the handle.  begin/end
- * mark the scope, and only writes are buffered:
+ * <urcu/rcu-mcas.h> is the multi-word CAS engine (urcu_mcas_*): a set of {slot,
+ * old, new} records committed atomically.  This header wraps it in a begin /
+ * store / commit / end transaction whose state is a small on-stack handle, so a
+ * mutator reads and buffers writes imperatively while the engine handles the
+ * retry bookkeeping.  Loads inside the bracket go through urcu_txn_load(): it
+ * forwards to urcu_mcas_read() (there is no read-set) but keeps in-bracket
+ * reads routed through the handle.  begin/end mark the scope, and only writes
+ * are buffered:
  *
  *     struct urcu_txn_domain domain;   // once, shared per structure
  *     urcu_txn_domain_init(&domain);
@@ -42,28 +42,30 @@
  * -----------------
  * A committed transaction is linearizable, and its linearization point is the
  * single status-word commit (UNDECIDED -> SUCCEEDED): every record it parked
- * resolves to its OLD value before that CAS and to its NEW value after it, so one
- * store switches the whole frozen record set at once.  Install (proxies parked,
- * still OLD-visible) and settle (proxies rewritten to plain NEW, already
- * NEW-visible) change no observable value, so neither is a linearization point.
+ * resolves to its OLD value before that CAS and to its NEW value after it, so
+ * one store switches the whole frozen record set at once.  Install (proxies
+ * parked, still OLD-visible) and settle (proxies rewritten to plain NEW,
+ * already NEW-visible) change no observable value, so neither is a
+ * linearization point.
  *
  * Because the record set may span data structures, that one commit is a single
- * linearization point ACROSS ALL of them: everything folded into one transaction
- * (via the *_prepare forms -- e.g. publish a node into a trie AND splice it into
- * a list) becomes visible together.  This is strictly stronger than composing
- * independent RCU structures, where a node can be reachable in A before it is
- * reachable in B.  The unit of cross-structure atomicity is exactly "one
- * transaction": two separate commits to A and B are two linearization points,
- * the same as two unrelated RCU structures.
+ * linearization point ACROSS ALL of them: everything folded into one
+ * transaction (via the *_prepare forms -- e.g. publish a node into a trie AND
+ * splice it into a list) becomes visible together.  This is strictly stronger
+ * than composing independent RCU structures, where a node can be reachable in A
+ * before it is reachable in B.  The unit of cross-structure atomicity is
+ * exactly "one transaction": two separate commits to A and B are two
+ * linearization points, the same as two unrelated RCU structures.
  *
  * This linearizes the WRITE.  A reader is NOT a transaction -- it is a sequence
- * of single-slot reads, each linearizing at its own access -- so a long traversal
- * may straddle a commit: it can observe the transaction in a slot it reads after
- * the commit and not in one it read before.  No slot and no instant is ever torn
- * (that is the guarantee); a reader's several reads simply are not a mutual
- * snapshot.  This is deliberately weaker than STM opacity: readers are plain RCU
- * readers that pay no per-read barrier.  An embedder needing a multi-read
- * snapshot layers its own versioning on top, as with any value-based MCAS.
+ * of single-slot reads, each linearizing at its own access -- so a long
+ * traversal may straddle a commit: it can observe the transaction in a slot it
+ * reads after the commit and not in one it read before.  No slot and no instant
+ * is ever torn (that is the guarantee); a reader's several reads simply are not
+ * a mutual snapshot.  This is deliberately weaker than STM opacity: readers are
+ * plain RCU readers that pay no per-read barrier.  An embedder needing a
+ * multi-read snapshot layers its own versioning on top, as with any value-based
+ * MCAS.
  *
  * Preconditions for all of the above:
  *   - every write to a transacted slot goes through this layer (the engine owns
@@ -84,26 +86,26 @@
  * abort and threaded into the descriptor as the aging priority, so a starved
  * transaction climbs in priority without the caller threading anything.
  *
- * Writes.  urcu_txn_store() buffers a write whose old the caller
- * supplies.  Only writes are committed and validated: the MCAS install checks
- * each slot == old, which covers every read that became a write-old (read
- * subset of write for structural mutations).  There is no read-set.  A store can
- * fail to allocate; rather than make the caller check every store, the failure
- * is sticky -- the pending commit then reports -ENOMEM -- so a mutator only has
- * to test commit's result (which it already does).
+ * Writes.  urcu_txn_store() buffers a write whose old the caller supplies.
+ * Only writes are committed and validated: the MCAS install checks each slot ==
+ * old, which covers every read that became a write-old (read subset of write
+ * for structural mutations).  There is no read-set.  A store can fail to
+ * allocate; rather than make the caller check every store, the failure is
+ * sticky -- the pending commit then reports -ENOMEM -- so a mutator only has to
+ * test commit's result (which it already does).
  *
  * Buffered writes are INVISIBLE to the bracket's own loads BY DEFAULT:
  * urcu_txn_load() returns the slot's current logical value, never a pending
- * new_ptr this attempt buffered.  And a transaction keeps AT MOST ONE record per
- * slot per attempt: a second store to the same slot upgrades the buffered record
- * in place (last-wins; a disagreeing old poisons the attempt), it does not
- * sequence after the first.  Composing two *_prepare forms that write the same
- * slot (e.g. two insert-after at one position) thus silently collapses to the
- * last write: run them as separate transactions.
+ * new_ptr this attempt buffered.  And a transaction keeps AT MOST ONE record
+ * per slot per attempt: a second store to the same slot upgrades the buffered
+ * record in place (last-wins; a disagreeing old poisons the attempt), it does
+ * not sequence after the first.  Composing two *_prepare forms that write the
+ * same slot (e.g. two insert-after at one position) thus silently collapses to
+ * the last write: run them as separate transactions.
  *
  * That default is a hazard for any structure whose WRITE SITE is reached by a
- * traversal, because a commit is a state transition, not a program: the edits in
- * one commit are simultaneous, so a *_prepare that searches the committed
+ * traversal, because a commit is a state transition, not a program: the edits
+ * in one commit are simultaneous, so a *_prepare that searches the committed
  * structure can pick a predecessor an earlier edit of the SAME transaction has
  * already displaced, and the two edits then collide on one slot.  With matching
  * olds the upgrade destroys an edge silently.  urcu_txn_enable_ryw() opts a
@@ -113,26 +115,26 @@
  * chaining changes how one slot's records fuse, never how many there are.
  *
  * Reserve.  A mutator that knows its edge count up front may call
- * urcu_txn_reserve() right after begin: it allocates the descriptor to
- * that floor, so an OOM is reported before the mutator builds any nodes, and
- * later attempts start pre-sized rather than growing into it.  Optional -- store()
+ * urcu_txn_reserve() right after begin: it allocates the descriptor to that
+ * floor, so an OOM is reported before the mutator builds any nodes, and later
+ * attempts start pre-sized rather than growing into it.  Optional -- store()
  * allocates lazily and grows on its own without it.
  *
  * Escalation fallback.  The optimistic retry above is bounded-blocking but not
  * starvation-free: a large or repeatedly-bypassed transaction can be defeated
  * by a stream of smaller ones (the single-edge fast path and the read->install
- * window let a committer change a footprint slot between this op's read and
- * its install).  When a handle crosses a threshold it escalates into a
- * per-domain fair mutex (urcu/fair-mutex.h) -- an MCS-style lock -- and
- * publishes domain->active so every *future* transaction funnels through the
- * same lane.  That closes the optimistic-writer set: the escalated op then
- * contends only with the finite in-flight set (bounded by thread count) and
- * commits within a bounded number of retries while holding its turn --
- * progress is guaranteed with no quiescence (no synchronize_rcu).  The lane
- * only serializes *who pushes with top priority*; commits still go through the
- * concurrency-safe MCAS path, so the residual in-flight optimistic writers
- * stay correct.  Two triggers escalate a handle (both gated on a non-NULL
- * domain -- NULL never escalates):
+ * window let a committer change a footprint slot between this op's read and its
+ * install).  When a handle crosses a threshold it escalates into a per-domain
+ * fair mutex (urcu/fair-mutex.h) -- an MCS-style lock -- and publishes
+ * domain->active so every *future* transaction funnels through the same lane.
+ * That closes the optimistic-writer set: the escalated op then contends only
+ * with the finite in-flight set (bounded by thread count) and commits within a
+ * bounded number of retries while holding its turn -- progress is guaranteed
+ * with no quiescence (no synchronize_rcu).  The lane only serializes *who
+ * pushes with top priority*; commits still go through the concurrency-safe MCAS
+ * path, so the residual in-flight optimistic writers stay correct.  Two
+ * triggers escalate a handle (both gated on a non-NULL domain -- NULL never
+ * escalates):
  *   - retry >= URCU_TXN_FALLBACK : a starved op, reactively;
  *   - size  >= URCU_TXN_BIG      : a large op, proactively -- a
  *     reserve(n >= BIG) escalates immediately, before building any nodes,
@@ -189,14 +191,14 @@ extern "C" {
 
 /*
  * Escalation thresholds (override before include).  A handle escalates into the
- * domain's lock when its retry count reaches URCU_TXN_FALLBACK
- * (reactive: a starved op) or its write-set size reaches URCU_TXN_BIG
- * (proactive: a large op, e.g. a wide merge).  FALLBACK sits well above the
- * engine's single-edge URCU_MCAS_ESCALATE (16) so ordinary contention rides the
- * optimistic path: escalating too early funnels every contending writer into the
- * one serial lane, which under a shared hot domain collapses both throughput and
- * latency far worse than leaving the optimistic priority protocol to resolve it.
- * BIG should sit above typical small-mutation edge counts so only genuinely large
+ * domain's lock when its retry count reaches URCU_TXN_FALLBACK (reactive: a
+ * starved op) or its write-set size reaches URCU_TXN_BIG (proactive: a large
+ * op, e.g. a wide merge).  FALLBACK sits well above the engine's single-edge
+ * URCU_MCAS_ESCALATE (16) so ordinary contention rides the optimistic path:
+ * escalating too early funnels every contending writer into the one serial
+ * lane, which under a shared hot domain collapses both throughput and latency
+ * far worse than leaving the optimistic priority protocol to resolve it.  BIG
+ * should sit above typical small-mutation edge counts so only genuinely large
  * transactions take the lane up front.
  */
 #ifndef URCU_TXN_FALLBACK
@@ -208,62 +210,64 @@ extern "C" {
 
 /*
  * Value urcu_txn_init() gives a fresh handle's read-your-own-writes mode (see
- * urcu_txn_enable_ryw).  0 -- the historical invisible-writes semantics -- unless
- * overridden before include.  Building a whole embedder (or the test suite) with
- * -DURCU_TXN_RYW_DEFAULT=1 turns RYW on for every transaction that does not set
- * the mode explicitly, which is how a structure is AUDITED under it: RYW must
- * only ever make a mutator see MORE of its own transaction, never less, so a
- * correct structure passes either way.
+ * urcu_txn_enable_ryw).  0 -- the historical invisible-writes semantics --
+ * unless overridden before include.  Building a whole embedder (or the test
+ * suite) with -DURCU_TXN_RYW_DEFAULT=1 turns RYW on for every transaction that
+ * does not set the mode explicitly, which is how a structure is AUDITED under
+ * it: RYW must only ever make a mutator see MORE of its own transaction, never
+ * less, so a correct structure passes either way.
  */
 #ifndef URCU_TXN_RYW_DEFAULT
 #define URCU_TXN_RYW_DEFAULT	0
 #endif
 
 /*
- * RYW read-your-own-writes lookup filter (a Bloom word, on by default under RYW).
- * urcu_txn__load's RYW path must, for each in-bracket read, decide whether the
- * slot is already in this attempt's write set.  The authoritative test is
- * urcu_mcas_find() -- a linear scan of the descriptor's records at the record
- * stride (48 bytes).  Under RYW a traversal reads many slots and transacts few,
- * so the hot case is the MISS, and that scan is pure overhead on it.
+ * RYW read-your-own-writes lookup filter (a Bloom word, on by default under
+ * RYW).  urcu_txn__load's RYW path must, for each in-bracket read, decide
+ * whether the slot is already in this attempt's write set.  The authoritative
+ * test is urcu_mcas_find() -- a linear scan of the descriptor's records at the
+ * record stride (48 bytes).  Under RYW a traversal reads many slots and
+ * transacts few, so the hot case is the MISS, and that scan is pure overhead on
+ * it.
  *
- * The filter is one word in the ON-STACK handle (never in struct urcu_mcas, whose
- * size is baked into the library's descriptor slab -- enlarging it there overflows
- * a slab block).  A store ORs the slot's bit; a load tests it.  A clear bit (the
- * common miss) skips find entirely; a set bit falls through to find, which
- * resolves the rare false positive -- so the filter can only ever save the scan,
- * never change a returned value.  It is reset per attempt.  Measured ~+4% at 192
- * writers on bench_txn_3skiplist (+3.6% at n=960, +4.4% at n=3840, size-stable,
- * ~12x the run-to-run spread), and non-negative for narrow write-sets (a clear
- * bit skips even the short hash scan); a dense {slot,val} array was tried instead
- * and LOST (-2.3% .. -4.6%, worsening with size) because it stays O(nr) on the
- * dominant miss.  Build -DURCU_TXN_RYW_NO_BLOOM to fall back to the bare find
- * (A/B / falsification).
+ * The filter is one word in the ON-STACK handle (never in struct urcu_mcas,
+ * whose size is baked into the library's descriptor slab -- enlarging it there
+ * overflows a slab block).  A store ORs the slot's bit; a load tests it.  A
+ * clear bit (the common miss) skips find entirely; a set bit falls through to
+ * find, which resolves the rare false positive -- so the filter can only ever
+ * save the scan, never change a returned value.  It is reset per attempt.
+ * Measured ~+4% at 192 writers on bench_txn_3skiplist (+3.6% at n=960, +4.4% at
+ * n=3840, size-stable, ~12x the run-to-run spread), and non-negative for narrow
+ * write-sets (a clear bit skips even the short hash scan); a dense {slot,val}
+ * array was tried instead and LOST (-2.3% .. -4.6%, worsening with size)
+ * because it stays O(nr) on the dominant miss.  Build -DURCU_TXN_RYW_NO_BLOOM
+ * to fall back to the bare find (A/B / falsification).
  *
  * URCU_TXN_BLOOM_WORDS sets the filter width (64 bits each; default 16 = 1024
- * bits).  Widening it lowers the false-positive rate ~linearly (FP ~= k*records /
- * (64*WORDS)); the age-0/age-1 escalation study used it to separate genuine RYW
- * from filter FP.
+ * bits).  Widening it lowers the false-positive rate ~linearly (FP ~= k*records
+ * / (64*WORDS)); the age-0/age-1 escalation study used it to separate genuine
+ * RYW from filter FP.
  *
  * Both width and k are compile-time tunables that only ever trade filter cost
  * against the false-positive rate: correctness never depends on either, since a
  * false positive only ever costs a find (baseline) or an extra attempt (age 0).
- * The 16-word / k=3 default sits at the false-positive knee and wins across every
- * measured workload; escalation itself is tuned per-transaction at runtime via
- * urcu_txn_declare_disjoint() / urcu_txn_expect_conflict().
+ * The 16-word / k=3 default sits at the false-positive knee and wins across
+ * every measured workload; escalation itself is tuned per-transaction at
+ * runtime via urcu_txn_declare_disjoint() / urcu_txn_expect_conflict().
  */
 #ifndef URCU_TXN_BLOOM_WORDS
 # define URCU_TXN_BLOOM_WORDS	16
 #endif
 /*
- * URCU_TXN_BLOOM_K sets the number of hash BITS a slot maps to (default 3).  With
- * k bits over m = 64*WORDS bits and n recorded slots the false-positive rate is
- * ~(1 - e^{-kn/m})^k, which for a sparse filter falls off as (kn/m)^k -- so
- * raising k cuts false positives super-linearly where widening WORDS only helps
- * linearly.  The filter is a double-hashed k-bit filter built from two INDEPENDENT
- * avalanche hashes h1,h2 (position i = h1 + i*h2); the age-0/age-1 study used k as
- * the lever to drive the filter-FP escalation component toward zero and isolate
- * the genuine-RYW rate.  A degenerate k=1 is valid too (one position).
+ * URCU_TXN_BLOOM_K sets the number of hash BITS a slot maps to (default 3).
+ * With k bits over m = 64*WORDS bits and n recorded slots the false-positive
+ * rate is ~(1 - e^{-kn/m})^k, which for a sparse filter falls off as (kn/m)^k
+ * -- so raising k cuts false positives super-linearly where widening WORDS only
+ * helps linearly.  The filter is a double-hashed k-bit filter built from two
+ * INDEPENDENT avalanche hashes h1,h2 (position i = h1 + i*h2); the age-0/age-1
+ * study used k as the lever to drive the filter-FP escalation component toward
+ * zero and isolate the genuine-RYW rate.  A degenerate k=1 is valid too (one
+ * position).
  */
 #ifndef URCU_TXN_BLOOM_K
 # define URCU_TXN_BLOOM_K	3
@@ -272,12 +276,13 @@ extern "C" {
 #define URCU_TXN_BLOOM_BITS	(64ULL * URCU_TXN_BLOOM_WORDS)
 /*
  * Two INDEPENDENT hashes of the slot.  A single multiply leaves the k derived
- * positions correlated (slot addresses are aligned and clustered).  Minimal-cost
- * Kirsch-Mitzenmacher: run ONE SplitMix64 avalanche (two multiplies) and split
- * its fully-mixed 64 bits into two independent 32-bit lanes -- one hash yields
- * both h1,h2, half the cost of two separate hashes and far cheaper than a
- * multiply-free chain (Thomas Wang) whose long dependency chain is slower in
- * practice.  h2 is forced odd so the progression h1 + i*h2 visits k distinct bits.
+ * positions correlated (slot addresses are aligned and clustered).
+ * Minimal-cost Kirsch-Mitzenmacher: run ONE SplitMix64 avalanche (two
+ * multiplies) and split its fully-mixed 64 bits into two independent 32-bit
+ * lanes -- one hash yields both h1,h2, half the cost of two separate hashes and
+ * far cheaper than a multiply-free chain (Thomas Wang) whose long dependency
+ * chain is slower in practice.  h2 is forced odd so the progression h1 + i*h2
+ * visits k distinct bits.
  */
 static inline
 void urcu_txn__ryw_bloom_h1h2(void **slot, uint64_t *h1, uint64_t *h2)
@@ -342,31 +347,32 @@ int urcu_txn__ryw_bloom_test_and_set(uint64_t *bloom, void **slot)
  * Age-0/age-1 optimistic RYW escalation.
  *
  * The premise: read-your-own-writes only bites when an attempt reads a slot it
- * has already written, which for a sparse or low-batch write-set is rare -- yet a
- * naive RYW path pays the Bloom test (and, on a hit, the find scan) on every
+ * has already written, which for a sparse or low-batch write-set is rare -- yet
+ * a naive RYW path pays the Bloom test (and, on a hit, the find scan) on every
  * in-bracket load regardless.
  *
- * So the FIRST attempt of an operation (retry == 0, "age 0") runs a stripped RYW
- * path: it maintains the Bloom filter as usual but NEVER calls find.  A load or
- * store whose slot is already in the filter -- a possible read-after-write or
- * write-after-write, true or a filter false positive -- sets esc_pending instead
- * of resolving it.  The optimistic value a colliding load returns may be stale,
- * but esc_pending forces commit to ABORT, so an age-0 attempt that saw ANY
- * coincidence never installs: it is discarded unpublished and re-run at retry >= 1
- * ("age 1+"), where the full path (Bloom + find, chaining) resolves RYW correctly.
- * An age-0 attempt that saw NO coincidence has a write-set with no same-slot
- * records and no stale reads, so it is exactly a baseline commit and installs
- * directly.
+ * So the FIRST attempt of an operation (retry == 0, "age 0") runs a stripped
+ * RYW path: it maintains the Bloom filter as usual but NEVER calls find.  A
+ * load or store whose slot is already in the filter -- a possible
+ * read-after-write or write-after-write, true or a filter false positive --
+ * sets esc_pending instead of resolving it.  The optimistic value a colliding
+ * load returns may be stale, but esc_pending forces commit to ABORT, so an
+ * age-0 attempt that saw ANY coincidence never installs: it is discarded
+ * unpublished and re-run at retry >= 1 ("age 1+"), where the full path (Bloom +
+ * find, chaining) resolves RYW correctly.  An age-0 attempt that saw NO
+ * coincidence has a write-set with no same-slot records and no stale reads, so
+ * it is exactly a baseline commit and installs directly.
  *
  * The trade: age 0 never runs find, at the price of a whole extra attempt
- * whenever it guesses wrong.  So the win is bounded by the ESCALATION RATE -- how
- * often an operation hits a coincidence (genuine RYW) or a Bloom false positive --
- * and is therefore WORKLOAD-DEPENDENT: it pays off for disjoint/low-RYW write-sets
- * (e.g. the hash key-move) and loses for dense-RYW batched descents (e.g. the
- * skiplist), which opt out per-transaction with urcu_txn_expect_conflict() so
- * their first attempt goes straight to the find path.  Widening URCU_TXN_BLOOM_WORDS
- * shrinks the false-positive component; correctness never depends on the filter
- * width, since a false positive only ever spends an extra attempt.
+ * whenever it guesses wrong.  So the win is bounded by the ESCALATION RATE --
+ * how often an operation hits a coincidence (genuine RYW) or a Bloom false
+ * positive -- and is therefore WORKLOAD-DEPENDENT: it pays off for
+ * disjoint/low-RYW write-sets (e.g. the hash key-move) and loses for dense-RYW
+ * batched descents (e.g. the skiplist), which opt out per-transaction with
+ * urcu_txn_expect_conflict() so their first attempt goes straight to the find
+ * path.  Widening URCU_TXN_BLOOM_WORDS shrinks the false-positive component;
+ * correctness never depends on the filter width, since a false positive only
+ * ever spends an extra attempt.
  */
 
 /*
@@ -375,9 +381,9 @@ int urcu_txn__ryw_bloom_test_and_set(uint64_t *bloom, void **slot)
  * handle binds no flavor (urcu_txn_init's NULL).  Defaults to the
  * compile-time-selected flavor's rcu_read_lock / rcu_read_unlock -- hence the
  * "include after an RCU flavor header" rule -- and may be overridden before
- * include.  The PREFERRED path for a FLAVOR-AGNOSTIC embedder (one selecting its
- * RCU flavor at runtime) is to bind that flavor with urcu_txn_init_flavor() so
- * the bracket opens in it directly; this macro then never fires.
+ * include.  The PREFERRED path for a FLAVOR-AGNOSTIC embedder (one selecting
+ * its RCU flavor at runtime) is to bind that flavor with urcu_txn_init_flavor()
+ * so the bracket opens in it directly; this macro then never fires.
  */
 #ifndef URCU_TXN_RCU_READ_LOCK
 #define URCU_TXN_RCU_READ_LOCK()	rcu_read_lock()
@@ -398,20 +404,21 @@ int urcu_txn__ryw_bloom_test_and_set(uint64_t *bloom, void **slot)
  * read/write set; read optimistically ONLY to navigate.
  *
  * urcu_txn_load_optimistic() resolves an undecided parker to its logical old --
- * the value the slot takes if the parker aborts -- without driving the parker to
- * a decision.  For a slot the transaction then stores (or load-validates), that
- * value is stale by construction whenever the parker goes on to commit, so the
- * record's old_ptr cannot match at install and the plant CAS is DOOMED: the
+ * the value the slot takes if the parker aborts -- without driving the parker
+ * to a decision.  For a slot the transaction then stores (or load-validates),
+ * that value is stale by construction whenever the parker goes on to commit, so
+ * the record's old_ptr cannot match at install and the plant CAS is DOOMED: the
  * attempt is guaranteed to abort.  A helping load instead pays the parker's
  * install once and returns the decided value, which commits either way.  The
  * saving is real only for a load whose value nothing later depends on: a
  * traversal hop that merely points at the next node.
  *
- * Measured both directions.  Making rcu-txn-hlist.h's *_prepare loads optimistic
- * cost 30% at 64 buckets / 192 writers (abort:commit 0.61 -> 0.86) and was
- * invisible at the 4096 buckets the published benchmark used, where nothing
- * aborts at all.  The converse -- rcu-txn-skiplist.h helping its five _prepare
- * loads while its descent stays optimistic -- gained 8.2% at 192 writers.
+ * Measured both directions.  Making rcu-txn-hlist.h's *_prepare loads
+ * optimistic cost 30% at 64 buckets / 192 writers (abort:commit 0.61 -> 0.86)
+ * and was invisible at the 4096 buckets the published benchmark used, where
+ * nothing aborts at all.  The converse -- rcu-txn-skiplist.h helping its five
+ * _prepare loads while its descent stays optimistic -- gained 8.2% at 192
+ * writers.
  *
  * The policy is a property of the CALL SEQUENCE, not of contention, so it is
  * checkable single-threaded: for every slot entering the read/write set, the
@@ -425,23 +432,23 @@ int urcu_txn__ryw_bloom_test_and_set(uint64_t *bloom, void **slot)
  * The check costs a hash-table probe per load and per record, and grows the
  * on-stack handle by URCU_TXN_RP_SLOTS entries.  Debug builds only.
  *
- * A slot never loaded in this attempt is not a violation: a blind store (a fresh
- * node's own field, a head whose old value the caller already holds) has no
- * read to speak of.  Note that urcu_txn_load_validate_optimistic() is a read-set
- * read that does not help, so it violates the policy BY CONSTRUCTION -- it has no
- * callers, and this is why.
+ * A slot never loaded in this attempt is not a violation: a blind store (a
+ * fresh node's own field, a head whose old value the caller already holds) has
+ * no read to speak of.  Note that urcu_txn_load_validate_optimistic() is a
+ * read-set read that does not help, so it violates the policy BY CONSTRUCTION
+ * -- it has no callers, and this is why.
  */
 #ifdef URCU_TXN_DEBUG_READ_POLICY
 # include <stdio.h>
 # include <stdlib.h>
 # include <string.h>
 # ifndef URCU_TXN_RP_SLOTS
-#  define URCU_TXN_RP_SLOTS	256		/* power of two */
+#  define URCU_TXN_RP_SLOTS	256	/* Power of two. */
 # endif
-# define URCU_TXN_RP_PROBE	8		/* linear probe before evicting */
+# define URCU_TXN_RP_PROBE	8	/* Linear probe before evicting. */
 struct urcu_txn__rp_entry {
 	void **slot;		/* NULL: empty */
-	int optimistic;		/* kind of the most recent load of @slot */
+	int optimistic;		/* Kind of the most recent load of @slot. */
 };
 #endif
 
@@ -451,8 +458,8 @@ struct urcu_txn__rp_entry {
  * disable the fallback (pure optimistic retry).
  */
 struct urcu_txn_domain {
-	struct cds_fair_mutex lock;	/* the fair escalation lane */
-	unsigned long active;		/* a fallback episode is in progress */
+	struct cds_fair_mutex lock;	/* The fair escalation lane. */
+	unsigned long active;		/* A fallback episode is in progress. */
 };
 
 static inline
@@ -463,69 +470,112 @@ void urcu_txn_domain_init(struct urcu_txn_domain *d)
 }
 
 struct urcu_mcas_txn {
-	struct urcu_txn_domain *domain;	/* escalation domain, or NULL */
-	const struct rcu_flavor_struct *flavor;	/* RCU flavor for the read-side
+	struct urcu_txn_domain *domain;	/* Escalation domain, or NULL */
+	const struct rcu_flavor_struct *flavor;	/*
+						 * RCU flavor for the read-side
 						 * bracket, or NULL to use the
 						 * compile-time-selected flavor
-						 * (URCU_TXN_RCU_READ_LOCK).  Set at
-						 * create by urcu_txn_init_flavor();
-						 * lets a FLAVOR-AGNOSTIC embedder
+						 * (URCU_TXN_RCU_READ_LOCK).
+						 * Set at create by
+						 * urcu_txn_init_flavor(); lets
+						 * a FLAVOR-AGNOSTIC embedder
 						 * (one selecting its flavor at
-						 * runtime, e.g. the fractal trie)
-						 * bracket the txn in its own flavor's
-						 * read-side section. */
-	unsigned long retry;		/* attempts so far; aging priority for the MCAS */
-	unsigned int min_alloc;		/* floor for the attempt's initial descriptor
-					 * capacity, grown past if exceeded (0 -> INIT
-					 * default).  Set via reserve(); refreshed to the
-					 * realized size at commit so retries don't re-grow. */
-	struct urcu_mcas *mcas;	/* this attempt's descriptor: NULL (none yet),
-					 * a live descriptor, or the ENOMEM marker */
+						 * runtime, e.g. the fractal
+						 * trie) bracket the txn in its
+						 * own flavor's read-side
+						 * section.
+						 */
+	unsigned long retry;		/*
+					 * Attempts so far; aging priority for
+					 * the MCAS.
+					 */
+	unsigned int min_alloc;		/*
+					 * floor for the attempt's initial
+					 * descriptor capacity, grown past if
+					 * exceeded (0 -> INIT default).  Set
+					 * via reserve(); refreshed to the
+					 * realized size at commit so retries
+					 * don't re-grow.
+					 */
+	struct urcu_mcas *mcas;		/*
+					 * this attempt's descriptor: NULL (none
+					 * yet), a live descriptor, or the
+					 * ENOMEM marker.
+					 */
 	struct cds_fair_mutex_node waiter;	/* our node while awaiting the turn */
-	int in_fallback;		/* we currently hold the lock (thread-private,
-					 * but relaxed-atomic: see __exit_fallback) */
-	int fb_published;		/* we raised domain->active and owe the clear:
-					 * set only for an initiator, never a joiner */
-	int retrying;			/* commit asked retry: keep the turn */
-	int ryw;			/* read-your-own-writes: loads see this
-					 * attempt's buffered stores, and a store
-					 * to an already-recorded slot chains onto
-					 * it.  Off by default (the historical
-					 * invisible-writes semantics).  Set with
-					 * urcu_txn_enable_ryw() before the first
-					 * begin(); never flip mid-transaction. */
+	int in_fallback;		/*
+					 * We currently hold the lock
+					 * (thread-private, but relaxed-atomic:
+					 * see __exit_fallback).
+					 */
+	int fb_published;		/*
+					 * We raised domain->active and owe the
+					 * clear: set only for an initiator,
+					 * never a joiner.
+					 */
+	int retrying;			/* Commit asked retry: keep the turn. */
+	int ryw;			/*
+					 * Read-your-own-writes: loads see this
+					 * attempt's buffered stores, and a
+					 * store to an already-recorded slot
+					 * chains onto it.  Off by default (the
+					 * historical invisible-writes
+					 * semantics).  Set with
+					 * urcu_txn_enable_ryw() before the
+					 * first begin(); never flip
+					 * mid-transaction.
+					 */
 	uint64_t ryw_bloom[URCU_TXN_BLOOM_WORDS];
-					/* RYW load filter: OR of recorded slots'
-					 * bits; cleared per attempt by begin().
-					 * Only read under txn->ryw, so a non-RYW
-					 * handle just carries the dead word(s). */
-	int disjoint;			/* caller asserts this txn's write set
-					 * touches DISTINCT slots (no write-after-
-					 * write): e.g. a hash add/remove over
-					 * distinct buckets.  Lets age 0 blind-append
-					 * WITHOUT the RYW Bloom -- no filter
-					 * maintenance, no load-side test -- since
-					 * there is no coincidence to catch.  Set with
-					 * urcu_txn_declare_disjoint() before begin();
-					 * a violation corrupts (adds a duplicate
-					 * record) unless URCU_TXN_DEBUG_DISJOINT traps
-					 * it.  Independent of txn->ryw. */
-	int expect_conflict;		/* caller expects this txn to conflict -- the
-					 * negative dual of disjoint.  Two shapes: dense
-					 * read-your-own-writes by construction (batched
-					 * adjacent edits on an ordered structure, whose
-					 * consecutive keys share a predecessor slot so the
-					 * composed edits always alias -- a skiplist range
-					 * move), or contention heavy enough that the non-
-					 * blocking age-0 install fail-fasts more than it
-					 * commits.  Makes age 0 skip the optimistic path
-					 * (skip-find/blind-append AND skip-sort/try-latch
-					 * install) so a doomed attempt is never spent; runs
-					 * the sorted, blocking path from the first attempt.
-					 * Set with urcu_txn_expect_conflict() before begin(). */
-	int esc_pending;		/* the age-0 optimistic attempt saw a same-slot
-					 * coincidence (RAW/WAW, or a Bloom FP) and must
-					 * abort to re-run at age 1+; reset per attempt */
+					/*
+					 * RYW load filter: OR of recorded
+					 * slots' bits; cleared per attempt by
+					 * begin().  Only read under txn->ryw,
+					 * so a non-RYW handle just carries the
+					 * dead word(s).
+					 */
+	int disjoint;			/*
+					 * Caller asserts this txn's write set
+					 * touches DISTINCT slots (no
+					 * write-after- write): e.g. a hash
+					 * add/remove over distinct buckets.
+					 * Lets age 0 blind-append WITHOUT the
+					 * RYW Bloom -- no filter maintenance,
+					 * no load-side test -- since there is
+					 * no coincidence to catch.  Set with
+					 * urcu_txn_declare_disjoint() before
+					 * begin(); a violation corrupts (adds a
+					 * duplicate record) unless
+					 * URCU_TXN_DEBUG_DISJOINT traps it.
+					 * Independent of txn->ryw.
+					 */
+	int expect_conflict;		/*
+					 * Caller expects this txn to conflict
+					 * -- the negative dual of disjoint.
+					 * Two shapes: dense
+					 * read-your-own-writes by construction
+					 * (batched adjacent edits on an ordered
+					 * structure, whose consecutive keys
+					 * share a predecessor slot so the
+					 * composed edits always alias -- a
+					 * skiplist range move), or contention
+					 * heavy enough that the non- blocking
+					 * age-0 install fail-fasts more than it
+					 * commits.  Makes age 0 skip the
+					 * optimistic path
+					 * (skip-find/blind-append AND
+					 * skip-sort/try-latch install) so a
+					 * doomed attempt is never spent; runs
+					 * the sorted, blocking path from the
+					 * first attempt.  Set with
+					 * urcu_txn_expect_conflict() before
+					 * begin().
+					 */
+	int esc_pending;		/*
+					 * The age-0 optimistic attempt saw a
+					 * same-slot coincidence (RAW/WAW, or a
+					 * Bloom FP) and must abort to re-run at
+					 * age 1+; reset per attempt.
+					 */
 #ifdef URCU_TXN_ESCALATION_STATS
 	/*
 	 * Would-this-attempt-escalate instrumentation for the age-0/age-1 study
@@ -533,22 +583,36 @@ struct urcu_mcas_txn {
 	 * coincidences that would bounce an optimistic age-0 attempt to age 1.
 	 * Reset per attempt by begin().
 	 */
-	unsigned int esc_raw;		/* RYW loads that hit a recorded slot
-					 * (true read-after-write) */
-	unsigned int esc_waw;		/* stores onto an already-recorded slot
-					 * (true write-after-write) */
-	unsigned int esc_bloom;		/* accesses whose 64-bit bloom bit was
-					 * already set (RAW/WAW + false positives) */
+	unsigned int esc_raw;		/*
+					 * RYW loads that hit a recorded slot
+					 * (true read-after-write).
+					 */
+	unsigned int esc_waw;		/*
+					 * Stores onto an already-recorded slot
+					 * (true write-after-write).
+					 */
+	unsigned int esc_bloom;		/*
+					 * Accesses whose 64-bit bloom bit was
+					 * already set (RAW/WAW + false
+					 * positives). */
 #endif
 #ifdef URCU_TXN_DEBUG_READ_POLICY
 	struct urcu_txn__rp_entry rp[URCU_TXN_RP_SLOTS];
-					/* kind of the most recent load of each
-					 * slot THIS attempt; cleared by begin() */
-	unsigned long rp_violations;	/* records made on a slot whose last load
-					 * was optimistic; sums over the attempts
-					 * of one transaction */
-	unsigned long rp_evicted;	/* table overflowed: a mark was dropped, so
-					 * a zero violation count is NOT a proof */
+					/*
+					 * Kind of the most recent load of each
+					 * slot THIS attempt; cleared by
+					 * begin().
+					 */
+	unsigned long rp_violations;	/*
+					 * Records made on a slot whose last
+					 * load was optimistic; sums over the
+					 * attempts of one transaction.
+					 */
+	unsigned long rp_evicted;	/*
+					 * Table overflowed: a mark was dropped,
+					 * so a zero violation count is NOT a
+					 * proof.
+					 */
 #endif
 };
 
@@ -592,10 +656,11 @@ void urcu_txn__rp_note(struct urcu_mcas_txn *txn, void **slot, int optimistic)
 }
 
 /*
- * @slot is entering the read/write set.  Its last load must have helped.  A slot
- * with no mark was never loaded here (a blind store): nothing to check.  Once
- * checked, the slot is settled -- a later store chains onto the record rather
- * than off a fresh physical read -- so clear the mark rather than report twice.
+ * @slot is entering the read/write set.  Its last load must have helped.  A
+ * slot with no mark was never loaded here (a blind store): nothing to check.
+ * Once checked, the slot is settled -- a later store chains onto the record
+ * rather than off a fresh physical read -- so clear the mark rather than report
+ * twice.
  */
 static inline
 void urcu_txn__rp_check(struct urcu_mcas_txn *txn, void **slot)
@@ -669,14 +734,14 @@ unsigned long urcu_txn_read_policy_evicted(const struct urcu_mcas_txn *txn)
 
 /*
  * Initialize a handle before its retry loop (retry := 0, no reservation),
- * bracketing the txn's RCU read-side section in @flavor's read_lock/read_unlock.
- * Pass @flavor NULL to use the compile-time-selected flavor (the
- * URCU_TXN_RCU_READ_LOCK default) -- the plain urcu_txn_init() does exactly
- * this.  A flavor-agnostic embedder (one selecting its RCU flavor at runtime
- * through a rcu_flavor_struct vtable, e.g. the fractal trie) passes that flavor
- * here so begin()/end() -- and the standalone urcu_txn_read_lock() /
- * urcu_txn_read_unlock() bracket -- open the read-side section in it, the same
- * way commit_flavor() defers reclaim through flavor->update_call_rcu.
+ * bracketing the txn's RCU read-side section in @flavor's
+ * read_lock/read_unlock.  Pass @flavor NULL to use the compile-time-selected
+ * flavor (the URCU_TXN_RCU_READ_LOCK default) -- the plain urcu_txn_init() does
+ * exactly this.  A flavor-agnostic embedder (one selecting its RCU flavor at
+ * runtime through a rcu_flavor_struct vtable, e.g. the fractal trie) passes
+ * that flavor here so begin()/end() -- and the standalone urcu_txn_read_lock()
+ * / urcu_txn_read_unlock() bracket -- open the read-side section in it, the
+ * same way commit_flavor() defers reclaim through flavor->update_call_rcu.
  */
 static inline
 void urcu_txn_init_flavor(struct urcu_mcas_txn *txn,
@@ -739,21 +804,21 @@ void urcu_txn_set_ryw(struct urcu_mcas_txn *txn, int on)
  * several edits in one transaction when a later edit's WRITE SITE depends on an
  * earlier edit -- which is any structure whose write site is reached by a
  * traversal, one hop or many: an ordered skiplist's pred->next[L], an hlist's
- * *elem->pprev.  Without RYW such a later edit searches the COMMITTED structure,
- * lands on a predecessor the transaction has already displaced, and its store
- * collides with the earlier edit on one slot; the one-record-per-slot engine
- * then matches olds and the upgrade silently destroys an edge.
+ * *elem->pprev.  Without RYW such a later edit searches the COMMITTED
+ * structure, lands on a predecessor the transaction has already displaced, and
+ * its store collides with the earlier edit on one slot; the one-record-per-slot
+ * engine then matches olds and the upgrade silently destroys an edge.
  *
  * RYW does not merely reconcile such collisions -- it usually DISSOLVES them:
  * the retargeted write often lands in a node this transaction allocated and has
  * not published, which needs no record at all.  Chaining covers the residue,
  * where the fused slot belongs to an already-published node.
  *
- * Cost is a linear scan of the write-set per load, filtered by a NULL-descriptor
- * fast path -- so the first _prepare of a transaction pays nothing, and a
- * traversal's overwhelmingly common MISS costs a bounded scan of a handful of
- * records.  A structure whose write site is a pure function of the key (a fixed
- * bucket head, a bitmap word) never needs this.
+ * Cost is a linear scan of the write-set per load, filtered by a
+ * NULL-descriptor fast path -- so the first _prepare of a transaction pays
+ * nothing, and a traversal's overwhelmingly common MISS costs a bounded scan of
+ * a handful of records.  A structure whose write site is a pure function of the
+ * key (a fixed bucket head, a bitmap word) never needs this.
  */
 static inline
 void urcu_txn_enable_ryw(struct urcu_mcas_txn *txn)
@@ -769,12 +834,12 @@ void urcu_txn_enable_ryw(struct urcu_mcas_txn *txn)
  * add/remove across distinct buckets, a bitmap word per distinct index.
  *
  * Given the guarantee, age 0 blind-appends each store -- skipping the O(nr)
- * reconcile find -- WITHOUT enabling read-your-own-writes, so NO Bloom filter is
- * maintained (no per-store hash-and-set, no per-load test) and the handle pays
- * none of the RYW cost.  This is the RYW-free way to get the age-0 fast path for
- * a disjoint mutator; enable_ryw() is for mutators whose composed edits CAN
- * alias a slot (a traversal-reached write site), which need the filter to catch
- * and reconcile the coincidence.
+ * reconcile find -- WITHOUT enabling read-your-own-writes, so NO Bloom filter
+ * is maintained (no per-store hash-and-set, no per-load test) and the handle
+ * pays none of the RYW cost.  This is the RYW-free way to get the age-0 fast
+ * path for a disjoint mutator; enable_ryw() is for mutators whose composed
+ * edits CAN alias a slot (a traversal-reached write site), which need the
+ * filter to catch and reconcile the coincidence.
  *
  * Contract: if a store DOES hit a recorded slot, the blind append inserts a
  * duplicate record and the commit corrupts (installs both, destroying an edge).
@@ -789,21 +854,22 @@ void urcu_txn_declare_disjoint(struct urcu_mcas_txn *txn)
 }
 
 /*
- * The negative dual of declare_disjoint(): assert that this handle's transactions
- * are EXPECTED to conflict, so the optimistic age-0 attempt is not worth trying.
- * Two shapes want this.  (1) A txn whose own read-your-own-writes is dense by
- * construction -- batched adjacent edits on an ordered structure, where the
- * rotation maps one edit's destination onto the next's source so consecutive keys
- * always share a predecessor slot (a skiplist range move): age 0 then reads its
- * own pending write, sets esc_pending, and aborts in the descent every time.  (2)
- * A txn run under contention heavy enough that the non-blocking age-0 install
- * fail-fasts more often than it commits.  In both, the age-0 attempt is spent only
- * to abort; expect_conflict skips it and runs the sorted, find-resolved, blocking
- * path from the first attempt.
+ * The negative dual of declare_disjoint(): assert that this handle's
+ * transactions are EXPECTED to conflict, so the optimistic age-0 attempt is not
+ * worth trying.  Two shapes want this.  (1) A txn whose own
+ * read-your-own-writes is dense by construction -- batched adjacent edits on an
+ * ordered structure, where the rotation maps one edit's destination onto the
+ * next's source so consecutive keys always share a predecessor slot (a skiplist
+ * range move): age 0 then reads its own pending write, sets esc_pending, and
+ * aborts in the descent every time.  (2) A txn run under contention heavy
+ * enough that the non-blocking age-0 install fail-fasts more often than it
+ * commits.  In both, the age-0 attempt is spent only to abort; expect_conflict
+ * skips it and runs the sorted, find-resolved, blocking path from the first
+ * attempt.
  *
  * Call after init and before the first begin(); do not flip mid-transaction.
- * Typically accompanies enable_ryw() (which resolves the aliasing at commit), and
- * is mutually exclusive in intent with declare_disjoint().
+ * Typically accompanies enable_ryw() (which resolves the aliasing at commit),
+ * and is mutually exclusive in intent with declare_disjoint().
  */
 static inline
 void urcu_txn_expect_conflict(struct urcu_mcas_txn *txn)
@@ -815,9 +881,9 @@ void urcu_txn_expect_conflict(struct urcu_mcas_txn *txn)
  * Effective attempt age.  Normally the retry count; but a handle that declared
  * expect_conflict() reports >= 1 even on its first attempt.  Both the txn layer
  * (skip-find/blind-append/esc_pending, keyed on this) and the mcas layer (skip-
- * sort/try-latch install, keyed on the descriptor's retry, which is created from
- * this) then bypass the age-0 optimistic path and run the sorted, blocking path
- * from the start.
+ * sort/try-latch install, keyed on the descriptor's retry, which is created
+ * from this) then bypass the age-0 optimistic path and run the sorted, blocking
+ * path from the start.
  */
 static inline
 unsigned long urcu_txn__eff_retry(const struct urcu_mcas_txn *txn)
@@ -893,21 +959,21 @@ void urcu_txn__enter_fallback(struct urcu_mcas_txn *txn)
 	 * caller's RCU read-side section across that wait rather than going
 	 * RCU-offline: that section is what keeps the caller's input pointers
 	 * (e.g. a list anchor reached by key) alive for the whole transaction,
-	 * and dropping it would let a concurrent grace period free them out from
-	 * under us.  (Going offline is a QSBR-only move anyway -- the bracketing
-	 * flavors hold a nested read-side lock the callee cannot release.)  This
-	 * is safe because the wait is bounded: the FIFO turn is short and the
-	 * lane owner's commit is a bounded MCAS that defers reclaim through
-	 * call_rcu and never itself waits on a grace period, so holding the
-	 * section across it cannot extend a grace period unboundedly.  That "the
-	 * lane owner never blocks on a GP while holding the mutex" is the one
-	 * invariant this relies on.
+	 * and dropping it would let a concurrent grace period free them out
+	 * from under us.  (Going offline is a QSBR-only move anyway -- the
+	 * bracketing flavors hold a nested read-side lock the callee cannot
+	 * release.)  This is safe because the wait is bounded: the FIFO turn is
+	 * short and the lane owner's commit is a bounded MCAS that defers
+	 * reclaim through call_rcu and never itself waits on a grace period, so
+	 * holding the section across it cannot extend a grace period
+	 * unboundedly.  That "the lane owner never blocks on a GP while holding
+	 * the mutex" is the one invariant this relies on.
 	 */
 	cds_fair_mutex_lock(&txn->domain->lock, &txn->waiter);
 	/*
 	 * Advertise the episode only if we met a trigger ourselves; a joiner
-	 * publishes nothing, so it cannot outlive the initiator that captured it
-	 * (see the escalation-fallback paragraph at the top of this header).
+	 * publishes nothing, so it cannot outlive the initiator that captured
+	 * it (see the escalation-fallback paragraph at the top of this header).
 	 */
 	if (urcu_txn__self_qualifies(txn)) {
 		uatomic_store(&txn->domain->active, 1, CMM_RELAXED);
@@ -928,18 +994,19 @@ void urcu_txn__exit_fallback(struct urcu_mcas_txn *txn)
 	/*
 	 * Clear the episode flag BEFORE releasing the lock.  Clearing after --
 	 * even gated on the unlock's "last holder" return -- races the next
-	 * INITIATOR: the actual lock release is the dequeue's tail-reset cmpxchg
-	 * INSIDE cds_fair_mutex_unlock(), so by the time it returns "last", a
-	 * new thread may have acquired the freed lock and stored active = 1;
-	 * our late 0 would then overwrite the new episode's advertisement, and
-	 * that whole episode would run unfunnelled -- no future transaction
-	 * takes the lane, so "closes the optimistic-writer set" silently fails
-	 * in exactly the starved case the lane exists for.
+	 * INITIATOR: the actual lock release is the dequeue's tail-reset
+	 * cmpxchg INSIDE cds_fair_mutex_unlock(), so by the time it returns
+	 * "last", a new thread may have acquired the freed lock and stored
+	 * active = 1; our late 0 would then overwrite the new episode's
+	 * advertisement, and that whole episode would run unfunnelled -- no
+	 * future transaction takes the lane, so "closes the optimistic-writer
+	 * set" silently fails in exactly the starved case the lane exists for.
 	 *
 	 * Only a publisher clears, and only its own advertisement: at most one
-	 * handle has fb_published set at a time, because a handle publishes only
-	 * while it is the lock holder (on acquiring, or on being promoted mid-
-	 * episode by begin()).  So the store below cannot erase a peer's flag.
+	 * handle has fb_published set at a time, because a handle publishes
+	 * only while it is the lock holder (on acquiring, or on being promoted
+	 * mid- episode by begin()).  So the store below cannot erase a peer's
+	 * flag.
 	 */
 	if (txn->fb_published) {
 		uatomic_store(&txn->domain->active, 0, CMM_RELAXED);
@@ -948,11 +1015,11 @@ void urcu_txn__exit_fallback(struct urcu_mcas_txn *txn)
 	/*
 	 * Drop in_fallback INSIDE the critical section, not after the unlock.
 	 * Callers read it as "we already own the lane": want_fallback()
-	 * suppresses escalation on it and urcu_txn_end() unlocks on it.  Clearing
-	 * after the unlock would leave a window claiming ownership of a lane
-	 * already released -- the direction that misleads; clearing first can at
-	 * worst deny ownership we still hold, which nothing between here and the
-	 * unlock consults.
+	 * suppresses escalation on it and urcu_txn_end() unlocks on it.
+	 * Clearing after the unlock would leave a window claiming ownership of
+	 * a lane already released -- the direction that misleads; clearing
+	 * first can at worst deny ownership we still hold, which nothing
+	 * between here and the unlock consults.
 	 *
 	 * The field is thread-private, so no barrier is owed and CMM_RELAXED is
 	 * enough -- but it must be an atomic access, not a plain store: the
@@ -965,14 +1032,14 @@ void urcu_txn__exit_fallback(struct urcu_mcas_txn *txn)
 }
 
 /*
- * Whether this attempt should escalate into the lock before opening: a
- * starved (retry) or already-known large (min_alloc) handle initiates an
- * episode, and domain->active funnels every other handle into the same lane
- * for the episode's duration -- that funnelling is what closes the optimistic-
- * writer set and bounds the escalated op's progress.  domain->active is
- * advisory: a stale read only mis-routes one bounded attempt (the MCAS commit
- * is correct under the resulting concurrency), so it needs no acquire/release,
- * only atomicity.
+ * Whether this attempt should escalate into the lock before opening: a starved
+ * (retry) or already-known large (min_alloc) handle initiates an episode, and
+ * domain->active funnels every other handle into the same lane for the
+ * episode's duration -- that funnelling is what closes the optimistic- writer
+ * set and bounds the escalated op's progress.  domain->active is advisory: a
+ * stale read only mis-routes one bounded attempt (the MCAS commit is correct
+ * under the resulting concurrency), so it needs no acquire/release, only
+ * atomicity.
  */
 static inline
 int urcu_txn__want_fallback(struct urcu_mcas_txn *txn)
@@ -1019,11 +1086,11 @@ void urcu_txn_begin(struct urcu_mcas_txn *txn)
 		urcu_txn__maybe_publish(txn);	/* joiner that starved: promote */
 	txn->mcas = NULL;		/* prior attempt's descriptor already consumed/freed */
 	/*
-	 * The RYW Bloom is consumed only under txn->ryw -- both the load-side test
-	 * and the store-side set are ryw-gated -- so a non-RYW handle (including one
-	 * that declared its write set disjoint) needs no per-attempt zeroing.  Under
-	 * ESCALATION_STATS the study probes the filter unconditionally, so keep it
-	 * clean there.
+	 * The RYW Bloom is consumed only under txn->ryw -- both the load-side
+	 * test and the store-side set are ryw-gated -- so a non-RYW handle
+	 * (including one that declared its write set disjoint) needs no
+	 * per-attempt zeroing.  Under ESCALATION_STATS the study probes the
+	 * filter unconditionally, so keep it clean there.
 	 */
 #ifdef URCU_TXN_ESCALATION_STATS
 	memset(txn->ryw_bloom, 0, sizeof(txn->ryw_bloom));
@@ -1041,13 +1108,14 @@ void urcu_txn_begin(struct urcu_mcas_txn *txn)
 
 /*
  * Pre-reserve room for @n writes this attempt and record @n as the min_alloc
- * floor.  Allocates the descriptor up front, so an algorithm that knows its edge
- * count can fail early with -ENOMEM -- before building the nodes it meant to
- * link -- rather than discovering the failure partway through its stores.  The
- * floor also sizes every later attempt's initial descriptor, so retries start at
- * @n instead of growing into it.  Returns 0, or -ENOMEM (sticky: the pending
- * commit then also returns -ENOMEM).  Optional; call after begin, before the
- * first store.  store() still grows the descriptor should the write-set exceed @n.
+ * floor.  Allocates the descriptor up front, so an algorithm that knows its
+ * edge count can fail early with -ENOMEM -- before building the nodes it meant
+ * to link -- rather than discovering the failure partway through its stores.
+ * The floor also sizes every later attempt's initial descriptor, so retries
+ * start at @n instead of growing into it.  Returns 0, or -ENOMEM (sticky: the
+ * pending commit then also returns -ENOMEM).  Optional; call after begin,
+ * before the first store.  store() still grows the descriptor should the
+ * write-set exceed @n.
  */
 static inline
 int urcu_txn_reserve(struct urcu_mcas_txn *txn, unsigned int n)
@@ -1058,9 +1126,9 @@ int urcu_txn_reserve(struct urcu_mcas_txn *txn, unsigned int n)
 	/*
 	 * A large op declares its size here: escalate immediately, before
 	 * building any nodes, so it never runs a disruptive optimistic attempt.
-	 * We hold the read-side section across the (possibly blocking) FIFO enter
-	 * (see __enter_fallback): the bounded wait keeps the caller's pinned
-	 * pointers alive and cannot extend a grace period unboundedly.
+	 * We hold the read-side section across the (possibly blocking) FIFO
+	 * enter (see __enter_fallback): the bounded wait keeps the caller's
+	 * pinned pointers alive and cannot extend a grace period unboundedly.
 	 */
 	if (txn->domain && !uatomic_load(&txn->in_fallback, CMM_RELAXED) &&
 			n >= URCU_TXN_BIG)
@@ -1093,8 +1161,8 @@ int urcu_txn_reserve(struct urcu_mcas_txn *txn, unsigned int n)
 /*
  * Reconcile one record against the write-set under the handle's semantics: the
  * historical invisible-writes rule (match the committed old_ptr, last store
- * wins) or, when the handle opted into RYW, the chaining rule (match the pending
- * new_ptr, keep the committed old_ptr, advance new_ptr).  See
+ * wins) or, when the handle opted into RYW, the chaining rule (match the
+ * pending new_ptr, keep the committed old_ptr, advance new_ptr).  See
  * urcu_mcas_record() and urcu_mcas_record_chain().
  */
 static inline
@@ -1138,20 +1206,22 @@ int urcu_txn__record(struct urcu_mcas_txn *txn, void **slot,
 	 * Bloom false positive) escalates to age 1+ rather than chaining here.
 	 * One hash: fuse the pre-store test with setting the slot's bit (the
 	 * filter add the baseline does at the tail below), so an RYW store path
-	 * hashes the slot exactly once.  The test reads the state BEFORE the OR,
-	 * so it still sees "already present".
+	 * hashes the slot exactly once.  The test reads the state BEFORE the
+	 * OR, so it still sees "already present".
 	 *
-	 * The bit's only consumer is a later same-txn RYW load, so gate the whole
-	 * hash-and-set on txn->ryw: a txn whose write set is disjoint by
-	 * construction (a hash table add/remove touching distinct buckets) leaves
-	 * RYW off and pays no filter maintenance at all.  txn->ryw is fixed before
-	 * begin(), so the guard is a per-handle-constant, well-predicted branch.
+	 * The bit's only consumer is a later same-txn RYW load, so gate the
+	 * whole hash-and-set on txn->ryw: a txn whose write set is disjoint by
+	 * construction (a hash table add/remove touching distinct buckets)
+	 * leaves RYW off and pays no filter maintenance at all.  txn->ryw is
+	 * fixed before begin(), so the guard is a per-handle-constant,
+	 * well-predicted branch.
 	 */
 	if (txn->ryw && urcu_txn__ryw_bloom_test_and_set(txn->ryw_bloom, slot)
 			&& urcu_txn__eff_retry(txn) == 0)
 		txn->esc_pending = 1;
 #ifdef URCU_TXN_ESCALATION_STATS
-	/* Test coincidence against the write set as it stands BEFORE this store. */
+	/* Test coincidence against the write set as it stands BEFORE this
+	 * store. */
 	if (urcu_txn__ryw_bloom_test(txn->ryw_bloom, slot))
 		txn->esc_bloom++;		/* age-0 would escalate this store */
 	if (urcu_mcas_find(m, slot) != NULL)
@@ -1161,20 +1231,22 @@ int urcu_txn__record(struct urcu_mcas_txn *txn, void **slot,
 		bool recorded;
 
 		/*
-		 * Age 0: append blind, skipping the reconcile find (an O(nr) scan
-		 * of the write set, run on every store) -- the store-path twin of the
-		 * skip-find the age-0 load path above already does.  Two callers reach
-		 * it:
-		 *  - RYW: the Bloom test_and_set above already flagged any same-slot
-		 *    coincidence (real WAW or a false positive) with esc_pending, and
-		 *    commit then DISCARDS this descriptor before install -- so a
-		 *    transient duplicate record never publishes.  On a Bloom miss (the
-		 *    disjoint case age 0 targets) find would miss anyway, so add is the
-		 *    identical result minus the scan.  Age 1+ reconciles below.
-		 *  - DISJOINT: the caller asserts distinct slots (no WAW), so there is
-		 *    no coincidence to catch and no Bloom is maintained -- the find is
-		 *    unconditionally redundant.  A violated assertion corrupts (adds a
-		 *    duplicate record); URCU_TXN_DEBUG_DISJOINT traps it here.
+		 * Age 0: append blind, skipping the reconcile find (an O(nr)
+		 * scan of the write set, run on every store) -- the store-path
+		 * twin of the skip-find the age-0 load path above already does.
+		 * Two callers reach it:
+		 *  - RYW: the Bloom test_and_set above already flagged any
+		 *    same-slot coincidence (real WAW or a false positive) with
+		 *    esc_pending, and commit then DISCARDS this descriptor
+		 *    before install -- so a transient duplicate record never
+		 *    publishes.  On a Bloom miss (the disjoint case age 0
+		 *    targets) find would miss anyway, so add is the identical
+		 *    result minus the scan.  Age 1+ reconciles below.
+		 *  - DISJOINT: the caller asserts distinct slots (no WAW), so
+		 *    there is no coincidence to catch and no Bloom is
+		 *    maintained -- the find is unconditionally redundant.  A
+		 *    violated assertion corrupts (adds a duplicate record);
+		 *    URCU_TXN_DEBUG_DISJOINT traps it here.
 		 */
 		if (urcu_txn__eff_retry(txn) == 0 && (txn->ryw || txn->disjoint)) {
 #ifdef URCU_TXN_DEBUG_DISJOINT
@@ -1221,8 +1293,8 @@ int urcu_txn__record(struct urcu_mcas_txn *txn, void **slot,
  * read-side section structurally (a live handle exists only between begin and
  * end), and it is the seam where the wait-free escalation lane would add read
  * validation: route in-bracket reads here, not through urcu_mcas_read(), so
- * that day is a one-line change.  A plain observer outside any transaction reads
- * with urcu_mcas_read() directly.
+ * that day is a one-line change.  A plain observer outside any transaction
+ * reads with urcu_mcas_read() directly.
  *
  * By default the returned value never reflects this attempt's own buffered
  * stores.  A handle that opted into urcu_txn_enable_ryw() instead returns the
@@ -1241,10 +1313,10 @@ void *urcu_txn__load(struct urcu_mcas_txn *txn, void **slot, uintptr_t tag,
 			/*
 			 * Age 0 (optimistic): a Bloom hit is a possible
 			 * read-after-write.  Flag it to escalate (commit aborts
-			 * -> age 1+) and skip find entirely.  The value returned
-			 * below is optimistic and may be stale, but esc_pending
-			 * guarantees this attempt aborts, so age 1 re-reads it
-			 * with the resolved path.
+			 * -> age 1+) and skip find entirely.  The value
+			 * returned below is optimistic and may be stale, but
+			 * esc_pending guarantees this attempt aborts, so age 1
+			 * re-reads it with the resolved path.
 			 */
 			if (urcu_txn__ryw_bloom_test(txn->ryw_bloom, slot))
 				txn->esc_pending = 1;
@@ -1255,9 +1327,10 @@ void *urcu_txn__load(struct urcu_mcas_txn *txn, void **slot, uintptr_t tag,
 #endif
 #ifndef URCU_TXN_RYW_NO_BLOOM
 		/*
-		 * The Bloom filter gates the scan: a clear bit proves the slot is
-		 * not in the write set (the common traversal miss) and skips find;
-		 * a set bit is confirmed by find, which resolves a false positive.
+		 * The Bloom filter gates the scan: a clear bit proves the slot
+		 * is not in the write set (the common traversal miss) and skips
+		 * find; a set bit is confirmed by find, which resolves a false
+		 * positive.
 		 */
 		if (urcu_txn__ryw_bloom_test(txn->ryw_bloom, slot))
 #endif
@@ -1288,16 +1361,16 @@ void *urcu_txn_load(struct urcu_mcas_txn *txn, void **slot, uintptr_t tag)
 
 /*
  * urcu_txn_load without helping an undecided transaction decide: forwards to
- * urcu_mcas_read_optimistic() (see it for why this is safe for a read set).  The
- * value is the slot's logical value at the moment of the read, and commit()
+ * urcu_mcas_read_optimistic() (see it for why this is safe for a read set).
+ * The value is the slot's logical value at the moment of the read, and commit()
  * reconciles it against the install-time physical value exactly as for
  * urcu_txn_load -- a value that moved aborts.  A stale read costs an abort, not
  * correctness, so this trades a rare extra retry for not dragging every reader
  * of a contended slot through the parking transaction's whole install.
  *
  * Route TRAVERSAL through here: reads that locate a write site and are checked
- * at commit anyway.  Keep urcu_txn_load() for a value the op must see settled at
- * the point it reads it.  RYW is honoured identically.
+ * at commit anyway.  Keep urcu_txn_load() for a value the op must see settled
+ * at the point it reads it.  RYW is honoured identically.
  */
 static inline
 void *urcu_txn_load_optimistic(struct urcu_mcas_txn *txn, void **slot,
@@ -1307,26 +1380,27 @@ void *urcu_txn_load_optimistic(struct urcu_mcas_txn *txn, void **slot,
 }
 
 /*
- * Read @slot like urcu_txn_load AND pin it: besides returning its
- * current logical value, record a load-only guard so the commit succeeds only
- * if @slot still resolves to that value at the install point (records {v -> v})
- * -- a TM read-set entry folding a read into the commit's conflict set, for a
- * word the op depends on but does not rewrite (e.g. a tombstone an insert must
- * find clear).  This is value-CAS semantics: the guard checks that @slot resolves
- * to that value AT the linearization point, not that it stayed unchanged
+ * Read @slot like urcu_txn_load AND pin it: besides returning its current
+ * logical value, record a load-only guard so the commit succeeds only if @slot
+ * still resolves to that value at the install point (records {v -> v}) -- a TM
+ * read-set entry folding a read into the commit's conflict set, for a word the
+ * op depends on but does not rewrite (e.g. a tombstone an insert must find
+ * clear).  This is value-CAS semantics: the guard checks that @slot resolves to
+ * that value AT the linearization point, not that it stayed unchanged
  * throughout.  The engine is A-B-A-safe (the install latch tolerates any
- * slot-value recurrence -- no use-after-free), so a value that recurs benignly is
- * fine; but if the op's correctness needs to DETECT an intervening change (a true
- * A-B-A where the "B" matters -- the slot toggled away and back), the guard alone
- * will not see it, and the embedder must carry its own version/generation in the
- * word.  A later store to @slot upgrades the guard to a write in place;
- * validate/read a given slot once per attempt.  Sticky on OOM like store: the
- * value is returned regardless and the pending commit reports -ENOMEM.
+ * slot-value recurrence -- no use-after-free), so a value that recurs benignly
+ * is fine; but if the op's correctness needs to DETECT an intervening change (a
+ * true A-B-A where the "B" matters -- the slot toggled away and back), the
+ * guard alone will not see it, and the embedder must carry its own
+ * version/generation in the word.  A later store to @slot upgrades the guard to
+ * a write in place; validate/read a given slot once per attempt.  Sticky on OOM
+ * like store: the value is returned regardless and the pending commit reports
+ * -ENOMEM.
  *
- * Under RYW the value read is this attempt's pending one, so guarding a slot the
- * transaction has already written re-affirms its own pending value rather than
- * the committed one (the chaining reconcile keeps the record's committed old,
- * which is what commit verifies).  In particular a guard on a slot this
+ * Under RYW the value read is this attempt's pending one, so guarding a slot
+ * the transaction has already written re-affirms its own pending value rather
+ * than the committed one (the chaining reconcile keeps the record's committed
+ * old, which is what commit verifies).  In particular a guard on a slot this
  * transaction has tombstoned observes the tombstone -- the self-conflict is
  * visible instead of silently passing.
  */
@@ -1344,9 +1418,9 @@ void *urcu_txn_load_validate(struct urcu_mcas_txn *txn, void **slot,
  * urcu_txn_load_validate that reads optimistically (urcu_txn_load_optimistic).
  * The guard is unchanged -- the commit still requires @slot to resolve to the
  * value returned here -- so an undecided parker observed as its logical old is
- * simply a guard on that old: it holds if the parker aborts, and aborts us if it
- * commits.  Exactly the outcome the helping read would have reached, one attempt
- * later.
+ * simply a guard on that old: it holds if the parker aborts, and aborts us if
+ * it commits.  Exactly the outcome the helping read would have reached, one
+ * attempt later.
  */
 static inline
 void *urcu_txn_load_validate_optimistic(struct urcu_mcas_txn *txn, void **slot,
@@ -1377,13 +1451,14 @@ int urcu_txn_store(struct urcu_mcas_txn *txn, void **slot,
  * Commit the buffered write-set through the MCAS, deferring reclaim through
  * @call_rcu_fn.  Returns enum urcu_txn_status: OK on commit, ABORT on a
  * contention abort (the caller re-runs begin..commit; the retry count is
- * advanced internally), or MEMORY_ERROR on allocation failure (including a store
- * that could not allocate).  @call_rcu_fn has the flavor call_rcu signature, so
- * a flavor-agnostic embedder passes its RCU flavor's call_rcu directly (e.g.
- * flavor->update_call_rcu) -- the same parametric-reclaim contract as
- * <urcu/rcu-txn-sw.h>, so an embedder migrating from the single-updater
- * front-end keeps its reclaim wiring.  The convenience wrapper urcu_txn_commit()
- * passes the compile-time-selected call_rcu.  Call between begin and end.
+ * advanced internally), or MEMORY_ERROR on allocation failure (including a
+ * store that could not allocate).  @call_rcu_fn has the flavor call_rcu
+ * signature, so a flavor-agnostic embedder passes its RCU flavor's call_rcu
+ * directly (e.g.  flavor->update_call_rcu) -- the same parametric-reclaim
+ * contract as <urcu/rcu-txn-sw.h>, so an embedder migrating from the
+ * single-updater front-end keeps its reclaim wiring.  The convenience wrapper
+ * urcu_txn_commit() passes the compile-time-selected call_rcu.  Call between
+ * begin and end.
  */
 static inline
 enum urcu_txn_status urcu_txn_commit_flavor(struct urcu_mcas_txn *txn,
@@ -1423,8 +1498,8 @@ enum urcu_txn_status urcu_txn_commit_flavor(struct urcu_mcas_txn *txn,
 
 /*
  * Commit deferring reclaim through the compile-time-selected RCU flavor's
- * call_rcu (so this header must be included after an RCU flavor header).  A thin
- * wrapper over urcu_txn_commit_flavor(); see it for the full contract.
+ * call_rcu (so this header must be included after an RCU flavor header).  A
+ * thin wrapper over urcu_txn_commit_flavor(); see it for the full contract.
  */
 static inline
 enum urcu_txn_status urcu_txn_commit(struct urcu_mcas_txn *txn)
@@ -1435,11 +1510,12 @@ enum urcu_txn_status urcu_txn_commit(struct urcu_mcas_txn *txn)
 /*
  * Note a contention retry that abandons the attempt BEFORE commit -- e.g. a
  * load-validate guard observed a neighbour mid-deletion and the mutator must
- * re-read rather than commit.  Advances aging and keeps the FIFO turn exactly as
- * a commit ABORT does, so such a guard-driven retry escalates into the fallback
- * lane instead of spinning: without this, an op that keeps hitting the guard on a
- * hot slot never reaches commit, so txn->retry never advances and it can livelock.
- * Call after the guard fires and before end(), then end()+begin() and re-attempt.
+ * re-read rather than commit.  Advances aging and keeps the FIFO turn exactly
+ * as a commit ABORT does, so such a guard-driven retry escalates into the
+ * fallback lane instead of spinning: without this, an op that keeps hitting the
+ * guard on a hot slot never reaches commit, so txn->retry never advances and it
+ * can livelock.  Call after the guard fires and before end(), then
+ * end()+begin() and re-attempt.
  */
 static inline
 void urcu_txn_conflict(struct urcu_mcas_txn *txn)
