@@ -165,6 +165,7 @@
 
 #include <errno.h>
 #include <stdint.h>
+#include <string.h>
 
 #include <urcu/compiler.h>
 #include <urcu/fair-mutex.h>
@@ -238,15 +239,177 @@ extern "C" {
  * and LOST (-2.3% .. -4.6%, worsening with size) because it stays O(nr) on the
  * dominant miss.  Build -DURCU_TXN_RYW_NO_BLOOM to fall back to the bare find
  * (A/B / falsification).
+ *
+ * URCU_TXN_BLOOM_WORDS sets the filter width (64 bits each; default 1, which is
+ * byte-identical to the single-word original).  Widening it lowers the
+ * false-positive rate ~linearly (k=1 hash, FP ~= records / (64*WORDS)); used by
+ * the age-0/age-1 escalation study to separate genuine RYW from filter FP.
  */
+#ifndef URCU_TXN_BLOOM_WORDS
+#define URCU_TXN_BLOOM_WORDS	1
+#endif
+/*
+ * URCU_TXN_BLOOM_K sets the number of hash BITS a slot maps to (default 1).  With
+ * k bits over m = 64*WORDS bits and n recorded slots the false-positive rate is
+ * ~(1 - e^{-kn/m})^k, which for a sparse filter falls off as (kn/m)^k -- so
+ * raising k cuts false positives super-linearly where widening WORDS only helps
+ * linearly.  k=1 keeps the original one-multiply single-bit filter (the committed
+ * default) byte-for-byte; k>1 switches to a double-hashed filter built from two
+ * INDEPENDENT avalanche hashes h1,h2 (position i = h1 + i*h2), the lever the
+ * age-0/age-1 study uses to drive the filter-FP escalation component toward zero
+ * and isolate the genuine-RYW rate.  Correctness never depends on k or WORDS: a
+ * false positive only ever costs a find (baseline) or an extra attempt (age 0).
+ */
+#ifndef URCU_TXN_BLOOM_K
+#define URCU_TXN_BLOOM_K	1
+#endif
+
+#if URCU_TXN_BLOOM_K == 1
 static inline
-uint64_t urcu_txn__ryw_bloombit(void **slot)
+void urcu_txn__ryw_bloom_loc(void **slot, unsigned int *word, uint64_t *mask)
 {
 	uintptr_t h = (uintptr_t) slot >> 3;	/* slots are pointer-aligned */
 
 	h *= 0x9e3779b97f4a7c15ULL;
-	return (uint64_t) 1 << (h >> 58);	/* top 6 bits -> one of 64 */
+	*mask = (uint64_t) 1 << ((h >> 58) & 63);		/* bits 58-63: bit-in-word */
+	*word = (unsigned int) ((h >> 40) & 0x3ffff) % URCU_TXN_BLOOM_WORDS;
+							/* bits 40-57: word (disjoint) */
 }
+static inline
+int urcu_txn__ryw_bloom_test(const uint64_t *bloom, void **slot)
+{
+	unsigned int w;
+	uint64_t m;
+
+	urcu_txn__ryw_bloom_loc(slot, &w, &m);
+	return (bloom[w] & m) != 0;
+}
+static inline
+void urcu_txn__ryw_bloom_set(uint64_t *bloom, void **slot)
+{
+	unsigned int w;
+	uint64_t m;
+
+	urcu_txn__ryw_bloom_loc(slot, &w, &m);
+	bloom[w] |= m;
+}
+/*
+ * Test whether @slot is already in the filter AND add it, hashing the slot ONCE.
+ * The store path needs both (was this a coincidence? then mark the slot), so a
+ * fused test-and-set spares it a second urcu_txn__ryw_bloom_loc() multiply.
+ */
+static inline
+int urcu_txn__ryw_bloom_test_and_set(uint64_t *bloom, void **slot)
+{
+	unsigned int w;
+	uint64_t m;
+	int was_set;
+
+	urcu_txn__ryw_bloom_loc(slot, &w, &m);
+	was_set = (bloom[w] & m) != 0;
+	bloom[w] |= m;
+	return was_set;
+}
+#else	/* URCU_TXN_BLOOM_K > 1: double-hashed k-bit filter */
+#define URCU_TXN_BLOOM_BITS	(64ULL * URCU_TXN_BLOOM_WORDS)
+/*
+ * Two INDEPENDENT hashes of the slot.  A single multiply leaves the k derived
+ * positions correlated (slot addresses are aligned and clustered).  Minimal-cost
+ * Kirsch-Mitzenmacher: run ONE SplitMix64 avalanche (two multiplies) and split
+ * its fully-mixed 64 bits into two independent 32-bit lanes -- one hash yields
+ * both h1,h2, half the cost of two separate hashes and far cheaper than a
+ * multiply-free chain (Thomas Wang) whose long dependency chain is slower in
+ * practice.  h2 is forced odd so the progression h1 + i*h2 visits k distinct bits.
+ */
+static inline
+void urcu_txn__ryw_bloom_h1h2(void **slot, uint64_t *h1, uint64_t *h2)
+{
+	uint64_t x = (uint64_t) (uintptr_t) slot >> 3;	/* slots are pointer-aligned */
+
+	x ^= x >> 30; x *= 0xbf58476d1ce4e5b9ULL;
+	x ^= x >> 27; x *= 0x94d049bb133111ebULL;
+	x ^= x >> 31;
+	*h1 = x & 0xffffffffULL;		/* low lane */
+	*h2 = (x >> 32) | 1;		/* high lane, odd stride */
+}
+static inline
+int urcu_txn__ryw_bloom_test(const uint64_t *bloom, void **slot)
+{
+	uint64_t h1, h2;
+	unsigned int i;
+
+	urcu_txn__ryw_bloom_h1h2(slot, &h1, &h2);
+	for (i = 0; i < URCU_TXN_BLOOM_K; i++) {
+		uint64_t idx = (h1 + (uint64_t) i * h2) % URCU_TXN_BLOOM_BITS;
+
+		if (!(bloom[idx >> 6] & ((uint64_t) 1 << (idx & 63))))
+			return 0;	/* a clear bit: the slot is definitely absent */
+	}
+	return 1;			/* all k bits set: present (or a false positive) */
+}
+static inline
+void urcu_txn__ryw_bloom_set(uint64_t *bloom, void **slot)
+{
+	uint64_t h1, h2;
+	unsigned int i;
+
+	urcu_txn__ryw_bloom_h1h2(slot, &h1, &h2);
+	for (i = 0; i < URCU_TXN_BLOOM_K; i++) {
+		uint64_t idx = (h1 + (uint64_t) i * h2) % URCU_TXN_BLOOM_BITS;
+
+		bloom[idx >> 6] |= (uint64_t) 1 << (idx & 63);
+	}
+}
+static inline
+int urcu_txn__ryw_bloom_test_and_set(uint64_t *bloom, void **slot)
+{
+	uint64_t h1, h2;
+	unsigned int i;
+	int was_set = 1;
+
+	urcu_txn__ryw_bloom_h1h2(slot, &h1, &h2);
+	for (i = 0; i < URCU_TXN_BLOOM_K; i++) {
+		uint64_t idx = (h1 + (uint64_t) i * h2) % URCU_TXN_BLOOM_BITS;
+		unsigned int w = (unsigned int) (idx >> 6);
+		uint64_t bit = (uint64_t) 1 << (idx & 63);
+
+		if (!(bloom[w] & bit))
+			was_set = 0;
+		bloom[w] |= bit;
+	}
+	return was_set;
+}
+#endif	/* URCU_TXN_BLOOM_K */
+
+/*
+ * Age-0/age-1 optimistic RYW escalation (off by default; -DURCU_TXN_AGE_ESCALATE).
+ *
+ * A STUDY variant of the RYW load path.  The premise: read-your-own-writes only
+ * bites when an attempt reads a slot it has already written, which for a sparse
+ * or low-batch write-set is rare -- yet the baseline pays the Bloom test (and, on
+ * a hit, the find scan) on every in-bracket load regardless.
+ *
+ * With this on, the FIRST attempt of an operation (retry == 0, "age 0") runs a
+ * stripped RYW path: it maintains the Bloom filter as usual but NEVER calls find.
+ * A load or store whose slot is already in the filter -- a possible
+ * read-after-write or write-after-write, true or a filter false positive -- sets
+ * esc_pending instead of resolving it.  The optimistic value a colliding load
+ * returns may be stale, but esc_pending forces commit to ABORT, so an age-0
+ * attempt that saw ANY coincidence never installs: it is discarded unpublished
+ * and re-run at retry >= 1 ("age 1+"), where the full baseline path (Bloom +
+ * find, chaining) resolves RYW correctly.  An age-0 attempt that saw NO
+ * coincidence has a write-set with no same-slot records and no stale reads, so it
+ * is exactly a baseline commit and installs directly.
+ *
+ * The trade: age 0 never runs find, at the price of a whole extra attempt
+ * whenever it guesses wrong.  So the win is bounded by the ESCALATION RATE -- how
+ * often an operation hits a coincidence (genuine RYW) or a Bloom false positive.
+ * Widen URCU_TXN_BLOOM_WORDS to drive the false-positive component toward zero
+ * and isolate the genuine-RYW rate.  Correctness never depends on the filter
+ * width: a false positive only ever spends an extra attempt.  This is a
+ * measurement lever, not a claimed speedup; it costs one branch on the age-1+
+ * path when built in, and nothing when built out.
+ */
 
 /*
  * Compile-time fallback for the RCU read-side bracket, used by
@@ -373,10 +536,30 @@ struct urcu_mcas_txn {
 					 * invisible-writes semantics).  Set with
 					 * urcu_txn_enable_ryw() before the first
 					 * begin(); never flip mid-transaction. */
-	uint64_t ryw_bloom;		/* RYW load filter: OR of recorded slots'
+	uint64_t ryw_bloom[URCU_TXN_BLOOM_WORDS];
+					/* RYW load filter: OR of recorded slots'
 					 * bits; cleared per attempt by begin().
 					 * Only read under txn->ryw, so a non-RYW
-					 * handle just carries the dead word. */
+					 * handle just carries the dead word(s). */
+#ifdef URCU_TXN_AGE_ESCALATE
+	int esc_pending;		/* the age-0 optimistic attempt saw a same-slot
+					 * coincidence (RAW/WAW, or a Bloom FP) and must
+					 * abort to re-run at age 1+; reset per attempt */
+#endif
+#ifdef URCU_TXN_ESCALATION_STATS
+	/*
+	 * Would-this-attempt-escalate instrumentation for the age-0/age-1 study
+	 * (measurement only; not part of the engine).  Counts the same-slot
+	 * coincidences that would bounce an optimistic age-0 attempt to age 1.
+	 * Reset per attempt by begin().
+	 */
+	unsigned int esc_raw;		/* RYW loads that hit a recorded slot
+					 * (true read-after-write) */
+	unsigned int esc_waw;		/* stores onto an already-recorded slot
+					 * (true write-after-write) */
+	unsigned int esc_bloom;		/* accesses whose 64-bit bloom bit was
+					 * already set (RAW/WAW + false positives) */
+#endif
 #ifdef URCU_TXN_DEBUG_READ_POLICY
 	struct urcu_txn__rp_entry rp[URCU_TXN_RP_SLOTS];
 					/* kind of the most recent load of each
@@ -529,13 +712,28 @@ void urcu_txn_init_flavor(struct urcu_mcas_txn *txn,
 	txn->fb_published = 0;
 	txn->retrying = 0;
 	txn->ryw = URCU_TXN_RYW_DEFAULT;
-	txn->ryw_bloom = 0;
+	memset(txn->ryw_bloom, 0, sizeof(txn->ryw_bloom));
+#ifdef URCU_TXN_AGE_ESCALATE
+	txn->esc_pending = 0;
+#endif
+#ifdef URCU_TXN_ESCALATION_STATS
+	txn->esc_raw = txn->esc_waw = txn->esc_bloom = 0;
+#endif
 #ifdef URCU_TXN_DEBUG_READ_POLICY
 	txn->rp_violations = 0;
 	txn->rp_evicted = 0;
 	urcu_txn__rp_reset(txn);
 #endif
 }
+
+#ifdef URCU_TXN_ESCALATION_STATS
+static inline
+unsigned int urcu_txn_esc_raw(const struct urcu_mcas_txn *txn) { return txn->esc_raw; }
+static inline
+unsigned int urcu_txn_esc_waw(const struct urcu_mcas_txn *txn) { return txn->esc_waw; }
+static inline
+unsigned int urcu_txn_esc_bloom(const struct urcu_mcas_txn *txn) { return txn->esc_bloom; }
+#endif
 
 /*
  * Set this handle's read-your-own-writes mode explicitly, overriding
@@ -775,7 +973,13 @@ void urcu_txn_begin(struct urcu_mcas_txn *txn)
 	else
 		urcu_txn__maybe_publish(txn);	/* joiner that starved: promote */
 	txn->mcas = NULL;		/* prior attempt's descriptor already consumed/freed */
-	txn->ryw_bloom = 0;		/* a new attempt's write set is empty */
+	memset(txn->ryw_bloom, 0, sizeof(txn->ryw_bloom));	/* write set is empty */
+#ifdef URCU_TXN_AGE_ESCALATE
+	txn->esc_pending = 0;		/* fresh attempt: no coincidence seen yet */
+#endif
+#ifdef URCU_TXN_ESCALATION_STATS
+	txn->esc_raw = txn->esc_waw = txn->esc_bloom = 0;
+#endif
 	urcu_txn__rp_reset(txn);	/* debug: a new attempt reloads every slot */
 	urcu_txn_read_lock(txn);
 }
@@ -874,6 +1078,26 @@ int urcu_txn__record(struct urcu_mcas_txn *txn, void **slot,
 		}
 		txn->mcas = m;
 	}
+#ifdef URCU_TXN_AGE_ESCALATE
+	/*
+	 * Age 0: a store onto an already-recorded slot (write-after-write, or a
+	 * Bloom false positive) escalates to age 1+ rather than chaining here.
+	 * One hash: fuse the pre-store test with setting the slot's bit (the
+	 * filter add the baseline does at the tail below), so the store path
+	 * hashes the slot exactly once whether or not this build escalates.  The
+	 * test reads the state BEFORE the OR, so it still sees "already present".
+	 */
+	if (urcu_txn__ryw_bloom_test_and_set(txn->ryw_bloom, slot)
+			&& txn->ryw && txn->retry == 0)
+		txn->esc_pending = 1;
+#endif
+#ifdef URCU_TXN_ESCALATION_STATS
+	/* Test coincidence against the write set as it stands BEFORE this store. */
+	if (urcu_txn__ryw_bloom_test(txn->ryw_bloom, slot))
+		txn->esc_bloom++;		/* age-0 would escalate this store */
+	if (urcu_mcas_find(m, slot) != NULL)
+		txn->esc_waw++;			/* true write-after-write */
+#endif
 	if (caa_unlikely(!urcu_txn__reconcile(txn, m, slot, old_ptr, new_ptr,
 			upgrade, tag))) {
 		/* Descriptor full: grow (may move it) and retry. */
@@ -886,9 +1110,9 @@ int urcu_txn__record(struct urcu_mcas_txn *txn, void **slot,
 		txn->mcas = m;
 		urcu_txn__reconcile(txn, m, slot, old_ptr, new_ptr, upgrade, tag);
 	}
-#ifndef URCU_TXN_RYW_NO_BLOOM
-	txn->ryw_bloom |= urcu_txn__ryw_bloombit(slot);	/* RYW load filter */
-#endif
+#if !defined(URCU_TXN_AGE_ESCALATE) && !defined(URCU_TXN_RYW_NO_BLOOM)
+	urcu_txn__ryw_bloom_set(txn->ryw_bloom, slot);	/* RYW load filter */
+#endif						/* AGE_ESCALATE set it via test_and_set above */
 	return 0;
 }
 
@@ -917,21 +1141,45 @@ void *urcu_txn__load(struct urcu_mcas_txn *txn, void **slot, uintptr_t tag,
 		int optimistic)
 {
 	if (txn->ryw && txn->mcas != NULL && txn->mcas != URCU_TXN_ENOMEM) {
+#ifdef URCU_TXN_AGE_ESCALATE
+		if (txn->retry == 0) {
+			/*
+			 * Age 0 (optimistic): a Bloom hit is a possible
+			 * read-after-write.  Flag it to escalate (commit aborts
+			 * -> age 1+) and skip find entirely.  The value returned
+			 * below is optimistic and may be stale, but esc_pending
+			 * guarantees this attempt aborts, so age 1 re-reads it
+			 * with the resolved path.
+			 */
+			if (urcu_txn__ryw_bloom_test(txn->ryw_bloom, slot))
+				txn->esc_pending = 1;
+		} else
+#endif
+		{
+#ifdef URCU_TXN_ESCALATION_STATS
+		if (urcu_txn__ryw_bloom_test(txn->ryw_bloom, slot))
+			txn->esc_bloom++;	/* age-0 would escalate this read */
+#endif
 #ifndef URCU_TXN_RYW_NO_BLOOM
 		/*
 		 * The Bloom filter gates the scan: a clear bit proves the slot is
 		 * not in the write set (the common traversal miss) and skips find;
 		 * a set bit is confirmed by find, which resolves a false positive.
 		 */
-		if (txn->ryw_bloom & urcu_txn__ryw_bloombit(slot))
+		if (urcu_txn__ryw_bloom_test(txn->ryw_bloom, slot))
 #endif
 		{
 			struct urcu_mcas_record *r = urcu_mcas_find(txn->mcas, slot);
 
-			if (r != NULL)
+			if (r != NULL) {
+#ifdef URCU_TXN_ESCALATION_STATS
+				txn->esc_raw++;		/* true read-after-write */
+#endif
 				return r->new_ptr;	/* this attempt's pending value:
 							 * already in the write set, no
 							 * physical read to classify */
+			}
+		}
 		}
 	}
 	urcu_txn__rp_note(txn, slot, optimistic);	/* debug: read-policy */
@@ -1057,6 +1305,22 @@ enum urcu_txn_status urcu_txn_commit_flavor(struct urcu_mcas_txn *txn,
 	}
 	if (!m)
 		return URCU_TXN_STATUS_OK;	/* empty write-set: trivially committed */
+#ifdef URCU_TXN_AGE_ESCALATE
+	if (caa_unlikely(txn->esc_pending)) {
+		/*
+		 * Age-0 optimistic attempt saw a same-slot coincidence: its
+		 * write-set was built against unresolved reads, so discard it
+		 * (never published) and re-run at age 1+, where Bloom+find
+		 * resolves RYW.  esc_pending is cleared by the next begin().
+		 */
+		txn->min_alloc = m->nr;
+		urcu_mcas_destroy(m);		/* unpublished: synchronous free */
+		txn->mcas = NULL;
+		txn->retry++;			/* -> age 1 */
+		txn->retrying = 1;		/* keep the turn across the retry */
+		return URCU_TXN_STATUS_ABORT;
+	}
+#endif
 	txn->min_alloc = m->nr;		/* learn the realized size: a retry won't re-grow */
 	txn->mcas = NULL;		/* mcas_commit consumes the descriptor */
 	if (urcu_mcas_commit(m, call_rcu_fn))

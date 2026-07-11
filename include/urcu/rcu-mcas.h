@@ -655,6 +655,21 @@ void urcu_mcas_drive_install_depth(struct urcu_mcas *t, unsigned int depth)
 
 				if (e == t)
 					break;	/* own proxy (distinct-slot inv.) */
+#ifdef URCU_MCAS_AGE0_TRYLATCH
+				if (t->retry == 0) {
+					/*
+					 * Age-0 try-latch: a foreign proxy is
+					 * contention.  Never wait / help / steal --
+					 * fail fast and let the caller escalate to
+					 * age 1 (sorted, blocking install).  Because
+					 * age 0 never waits on a foreign proxy there
+					 * is no hold-and-wait, so its records need no
+					 * slot-address sort to stay deadlock-free.
+					 */
+					urcu_mcas_decide(t, URCU_MCAS_FAILED);
+					return;
+				}
+#endif
 #ifdef URCU_MCAS_NO_STEAL
 				/*
 				 * No-steal: never displace E's proxy.  Wait for
@@ -1387,7 +1402,17 @@ bool urcu_mcas_commit(struct urcu_mcas *t,
 	}
 	if (t->nr == 1)
 		URCU_MCAS_STAT(escalate);	/* single edge, retried past the threshold */
+#ifdef URCU_MCAS_AGE0_TRYLATCH
+	/*
+	 * Age 0 installs optimistically with a try-latch (see drive_install): it
+	 * never waits on a foreign proxy, so its records need no slot-address sort
+	 * to be deadlock-free.  Age 1+ sorts and installs under the blocking rule.
+	 */
+	if (t->retry != 0)
+		urcu_mcas_sort(t);
+#else
 	urcu_mcas_sort(t);
+#endif
 	/*
 	 * Engine precondition: a transaction's records must target pairwise-
 	 * distinct slots (the install/steal protocol's "own proxy"
