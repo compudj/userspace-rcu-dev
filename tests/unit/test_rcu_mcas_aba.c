@@ -116,8 +116,7 @@ static void preinstall_hook(struct urcu_mcas *t,
 	(void) uatomic_cmpxchg(&g_V->status, URCU_MCAS_UNDECIDED,
 			URCU_MCAS_SUCCEEDED);
 	/* (c) T steals S from the terminal V, commits, settles S = B */
-	urcu_mcas_drive_install(g_T);
-	urcu_mcas_settle(g_T);
+	urcu_mcas_settle(g_T, urcu_mcas_drive_install(g_T));
 }
 
 static struct urcu_mcas *make_txn(void **slot_a, void *a_old, void *a_new,
@@ -164,8 +163,7 @@ int main(void)
 	 * attempt.  The install-once flag must make it a no-op, so settle(V) cannot
 	 * resurrect X.
 	 */
-	urcu_mcas_drive_install(g_V);
-	urcu_mcas_settle(g_V);
+	urcu_mcas_settle(g_V, urcu_mcas_drive_install(g_V));
 	rcu_read_unlock();
 
 	ok(g_fired, "the A-B-A interleaving hook actually fired");

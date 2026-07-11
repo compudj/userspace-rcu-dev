@@ -117,8 +117,10 @@ static void preinstall_hook(struct urcu_mcas *t,
 	/* (a) a higher-priority contender evicts V */
 	(void) uatomic_cmpxchg(&g_V->status, URCU_MCAS_UNDECIDED,
 			URCU_MCAS_FAILED);
-	/* (b) V's owner settles (AUX -> old; S never parked) and retires V */
-	urcu_mcas_settle(g_V);
+	/* (b) V's owner settles (AUX -> old; S never parked) and retires V.
+	 * Help/steal build: settle load-tests each slot, so the planted count is
+	 * unused here (S is skipped because it holds no proxy of V's). */
+	urcu_mcas_settle(g_V, g_V->nr);
 	g_state_after_settle = uatomic_load(&r->state, CMM_ACQUIRE);
 	/* (c) the helper's stale resumed plant -- past the retire point */
 	g_stale_plant_ret = urcu_mcas_plant(g_V, r, r->old_ptr);

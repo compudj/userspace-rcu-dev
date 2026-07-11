@@ -614,7 +614,8 @@ void urcu_mcas_decide(struct urcu_mcas *t, unsigned long to)
 }
 
 static inline
-void urcu_mcas_drive_install_depth(struct urcu_mcas *t, unsigned int depth)
+void urcu_mcas_drive_install_depth(struct urcu_mcas *t, unsigned int depth,
+		unsigned int *plantedp)
 {
 	unsigned long st = urcu_mcas_status(t);
 	unsigned int i;
@@ -622,6 +623,19 @@ void urcu_mcas_drive_install_depth(struct urcu_mcas *t, unsigned int depth)
 	URCU_MCAS_STAT(drive);
 #ifdef URCU_MCAS_NO_STEAL
 	(void) depth;			/* no help recursion under no-steal */
+#endif
+#if defined(URCU_MCAS_NO_HELP) && defined(URCU_MCAS_NO_STEAL)
+	/*
+	 * Sole driver (NO_HELP + NO_STEAL): record how far we plant so the owner's
+	 * settle converts exactly [0..*plantedp) with a plain store and never touches
+	 * the un-planted tail (a FAILED drive stops at a foreign proxy).  *plantedp is
+	 * always valid -- the wrapper passes a local (readers ignore its result); a
+	 * commit passes settle the same value, and since drive+settle run on one
+	 * thread with nothing driving @t in between, no persistent field is needed.
+	 */
+	*plantedp = 0;
+#else
+	(void) plantedp;		/* helpers/steals: settle keeps the load-test */
 #endif
 
 	if (st != URCU_MCAS_UNDECIDED)
@@ -765,7 +779,7 @@ void urcu_mcas_drive_install_depth(struct urcu_mcas *t, unsigned int depth)
 							return;
 						}
 						urcu_mcas_drive_install_depth(e,
-							depth + 1);
+							depth + 1, plantedp);
 						continue;
 #endif
 					} else {
@@ -827,6 +841,14 @@ void urcu_mcas_drive_install_depth(struct urcu_mcas *t, unsigned int depth)
 				break;		/* installed (or already) */
 			/* raced: slot changed under us -> re-evaluate */
 		}
+#if defined(URCU_MCAS_NO_HELP) && defined(URCU_MCAS_NO_STEAL)
+		/*
+		 * Record i now holds our proxy.  A FAILED return leaves this at the
+		 * last-planted count = the failing index (records [0..i-1] done); on
+		 * SUCCESS it reaches t->nr, so settle can loop [0..*plantedp) either way.
+		 */
+		*plantedp = i + 1;
+#endif
 	}
 	/* every record installed -> commit */
 	urcu_mcas_decide(t, URCU_MCAS_SUCCEEDED);
@@ -836,11 +858,18 @@ void urcu_mcas_drive_install_depth(struct urcu_mcas *t, unsigned int depth)
  * Owner/reader entry point: drive @t to a terminal status, starting a fresh
  * help-recursion budget (depth 0).  Callers outside the engine use this; the
  * recursive helping path re-enters urcu_mcas_drive_install_depth() directly.
+ *
+ * Returns the number of records this drive planted (sole-driver only, for the
+ * owner's settle -- see urcu_mcas_settle()); readers ignore it.  Under any engine
+ * with helpers or steals the count is not meaningful and settle does not use it.
  */
 static inline
-void urcu_mcas_drive_install(struct urcu_mcas *t)
+unsigned int urcu_mcas_drive_install(struct urcu_mcas *t)
 {
-	urcu_mcas_drive_install_depth(t, 0);
+	unsigned int planted = 0;
+
+	urcu_mcas_drive_install_depth(t, 0, &planted);
+	return planted;
 }
 
 /*
@@ -877,11 +906,31 @@ void urcu_mcas_drive_install(struct urcu_mcas *t)
  * never waits while holding a latch (the claim IS the terminal state).
  */
 static inline
-void urcu_mcas_settle(struct urcu_mcas *t)
+void urcu_mcas_settle(struct urcu_mcas *t, unsigned int planted)
 {
 	unsigned long st = urcu_mcas_status(t);
 	unsigned int i;
 
+#if defined(URCU_MCAS_NO_HELP) && defined(URCU_MCAS_NO_STEAL)
+	/*
+	 * Sole driver (NO_HELP + NO_STEAL): the drive told us it planted exactly
+	 * [0..@planted) -- @planted == t->nr on SUCCESS, the failing index on a
+	 * partial FAILED drive.  Every one of those slots still holds OUR proxy:
+	 * nothing helps or steals, and no plant self-settles while @t stays
+	 * UNDECIDED through the whole drive.  So convert each with a plain RELEASE
+	 * store -- no load-test, no CAS.  The un-planted tail [@planted..nr) (a
+	 * foreign proxy where the drive stopped, or a slot we never reached) is
+	 * simply not visited, so nothing there is clobbered, and no proxy of @t
+	 * lingers past settle -- the reclaim contract holds because we planted none.
+	 */
+	for (i = 0; i < planted; i++) {
+		struct urcu_mcas_record *r = &t->recs[i];
+		void *want = (st == URCU_MCAS_SUCCEEDED) ? r->new_ptr : r->old_ptr;
+
+		uatomic_store(r->slot, want, CMM_RELEASE);
+	}
+#else
+	(void) planted;			/* helpers/steals: re-derive per slot below */
 	for (i = 0; i < t->nr; i++) {
 		struct urcu_mcas_record *r = &t->recs[i];
 		void *want = (st == URCU_MCAS_SUCCEEDED) ? r->new_ptr : r->old_ptr;
@@ -907,13 +956,9 @@ void urcu_mcas_settle(struct urcu_mcas *t)
 #endif
 #ifdef URCU_MCAS_NO_STEAL
 		/*
-		 * No-steal: no thief ever displaces our proxy, and no-help means
-		 * we are the sole driver, so once we are here nothing but us can
-		 * touch a slot that still holds our proxy.  The CAS collapses to a
-		 * load + conditional plain STORE -- the proxy is a spinlatch and
-		 * this is its release.  A slot that does NOT hold our proxy (a
-		 * record we never planted because the drive aborted early) is left
-		 * untouched, exactly as the CAS's mismatch would.
+		 * No-steal but help on: no thief displaces our proxy, but a helper
+		 * may have planted records we did not, so we cannot trust a planted
+		 * count -- load-test each slot and release only our own proxy.
 		 */
 		if (uatomic_load(r->slot, CMM_RELAXED) == tagv)
 			uatomic_store(r->slot, want, CMM_RELEASE);
@@ -921,6 +966,7 @@ void urcu_mcas_settle(struct urcu_mcas *t)
 		(void) uatomic_cmpxchg(r->slot, tagv, want);
 #endif
 	}
+#endif
 }
 
 /*
@@ -1370,7 +1416,7 @@ bool urcu_mcas_commit(struct urcu_mcas *t,
 			void (*)(struct rcu_head *)))
 {
 	bool committed;
-	unsigned int i;
+	unsigned int i, planted;
 
 	if (caa_unlikely(t->poisoned)) {
 		/*
@@ -1437,8 +1483,13 @@ bool urcu_mcas_commit(struct urcu_mcas *t,
 		t->recs[i].mcas = t;
 		urcu_mcas_latch_init(&t->recs[i]);
 	}
-	urcu_mcas_drive_install(t);		/* install to a decision (helpers help) */
-	urcu_mcas_settle(t);			/* owner-only: make our own slots plain */
+	/*
+	 * @planted is how far the drive got (sole-driver only) so settle can convert
+	 * exactly our planted prefix with a plain store; the load-test settle ignores
+	 * it.  Both are static inline, so the value is threaded for free.
+	 */
+	planted = urcu_mcas_drive_install(t);	/* install to a decision (helpers help) */
+	urcu_mcas_settle(t, planted);		/* owner-only: make our own slots plain */
 	committed = urcu_mcas_status(t) == URCU_MCAS_SUCCEEDED;
 	call_rcu_fn(&t->rcu_head, urcu_mcas_free_rcu);
 	return committed;
