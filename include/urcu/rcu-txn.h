@@ -240,13 +240,31 @@ extern "C" {
  * dominant miss.  Build -DURCU_TXN_RYW_NO_BLOOM to fall back to the bare find
  * (A/B / falsification).
  *
- * URCU_TXN_BLOOM_WORDS sets the filter width (64 bits each; default 1, which is
- * byte-identical to the single-word original).  Widening it lowers the
- * false-positive rate ~linearly (k=1 hash, FP ~= records / (64*WORDS)); used by
- * the age-0/age-1 escalation study to separate genuine RYW from filter FP.
+ * URCU_TXN_BLOOM_WORDS sets the filter width (64 bits each; default 16 = 1024
+ * bits, or 1 under URCU_MCAS_STOCK -- byte-identical to the single-word original).
+ * Widening it lowers the false-positive rate ~linearly (k=1 hash, FP ~= records /
+ * (64*WORDS)); used by the age-0/age-1 escalation study to separate genuine RYW
+ * from filter FP.
+ *
+ * Shipping txn engine configuration, keyed on the same URCU_MCAS_STOCK the mcas
+ * layer uses (see <urcu/rcu-mcas.h>): age-0/age-1 optimistic escalation on, and
+ * the Bloom widened from the historical 64-bit k=1 filter to the k=3 / 1024-bit
+ * double-hashed filter that sits at the false-positive knee.  Default because they
+ * win across every measured workload; escalation is tuned per-transaction at
+ * runtime via urcu_txn_declare_disjoint() / urcu_txn_expect_conflict().  Each
+ * value is still individually definable; the guards only fill in a default.
  */
+#ifndef URCU_MCAS_STOCK
+# ifndef URCU_TXN_AGE_ESCALATE
+#  define URCU_TXN_AGE_ESCALATE
+# endif
+#endif
 #ifndef URCU_TXN_BLOOM_WORDS
-#define URCU_TXN_BLOOM_WORDS	1
+# ifdef URCU_MCAS_STOCK
+#  define URCU_TXN_BLOOM_WORDS	1
+# else
+#  define URCU_TXN_BLOOM_WORDS	16
+# endif
 #endif
 /*
  * URCU_TXN_BLOOM_K sets the number of hash BITS a slot maps to (default 1).  With
@@ -259,9 +277,15 @@ extern "C" {
  * age-0/age-1 study uses to drive the filter-FP escalation component toward zero
  * and isolate the genuine-RYW rate.  Correctness never depends on k or WORDS: a
  * false positive only ever costs a find (baseline) or an extra attempt (age 0).
+ * Default 3 (the double-hashed filter), or 1 under URCU_MCAS_STOCK (the original
+ * single-bit filter, byte-for-byte).
  */
 #ifndef URCU_TXN_BLOOM_K
-#define URCU_TXN_BLOOM_K	1
+# ifdef URCU_MCAS_STOCK
+#  define URCU_TXN_BLOOM_K	1
+# else
+#  define URCU_TXN_BLOOM_K	3
+# endif
 #endif
 
 #if URCU_TXN_BLOOM_K == 1
@@ -382,7 +406,7 @@ int urcu_txn__ryw_bloom_test_and_set(uint64_t *bloom, void **slot)
 #endif	/* URCU_TXN_BLOOM_K */
 
 /*
- * Age-0/age-1 optimistic RYW escalation (off by default; -DURCU_TXN_AGE_ESCALATE).
+ * Age-0/age-1 optimistic RYW escalation (on by default; -DURCU_MCAS_STOCK disables).
  *
  * A STUDY variant of the RYW load path.  The premise: read-your-own-writes only
  * bites when an attempt reads a slot it has already written, which for a sparse

@@ -148,6 +148,34 @@ extern "C" {
 #endif
 
 /*
+ * Shipping install configuration.  The library defaults to the single-driver
+ * spinlatch install: NO_HELP + NO_STEAL (no thread drives or steals a foreign
+ * transaction's records, so decide/settle collapse to release stores) with age-0
+ * optimism (AGE0_TRYLATCH, which derives the FLAT age-0 install below).  These
+ * were opt-in study flags while the design settled; they are the default now
+ * because they win across every measured workload.  It is still a per-record
+ * bounded-blocking spinlatch -- just without the helping/stealing the model
+ * comment above describes, which the sole-driver regime makes dead code.
+ *
+ * Define URCU_MCAS_STOCK to revert to that historical helping/stealing install
+ * for a regression A/B; a later cleanup will retire it.  The txn layer keys its
+ * own defaults (age escalation, the k=3/1024-bit Bloom) on the same
+ * URCU_MCAS_STOCK -- see <urcu/rcu-txn.h>.  Each flag is still individually
+ * definable; the guards only fill in a default, so an explicit -D is honoured.
+ */
+#ifndef URCU_MCAS_STOCK
+# ifndef URCU_MCAS_NO_HELP
+#  define URCU_MCAS_NO_HELP
+# endif
+# ifndef URCU_MCAS_NO_STEAL
+#  define URCU_MCAS_NO_STEAL
+# endif
+# ifndef URCU_MCAS_AGE0_TRYLATCH
+#  define URCU_MCAS_AGE0_TRYLATCH
+# endif
+#endif
+
+/*
  * Optional instrumentation hook.  Compiles to nothing unless the embedder
  * defines URCU_MCAS_STAT(counter) before including this header (the fairness
  * falsifier uses it to count helping/eviction/steal work).  Not part of the
