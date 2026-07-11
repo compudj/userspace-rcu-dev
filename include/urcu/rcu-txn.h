@@ -1083,12 +1083,18 @@ int urcu_txn__record(struct urcu_mcas_txn *txn, void **slot,
 	 * Age 0: a store onto an already-recorded slot (write-after-write, or a
 	 * Bloom false positive) escalates to age 1+ rather than chaining here.
 	 * One hash: fuse the pre-store test with setting the slot's bit (the
-	 * filter add the baseline does at the tail below), so the store path
+	 * filter add the baseline does at the tail below), so an RYW store path
 	 * hashes the slot exactly once whether or not this build escalates.  The
 	 * test reads the state BEFORE the OR, so it still sees "already present".
+	 *
+	 * The bit's only consumer is a later same-txn RYW load, so gate the whole
+	 * hash-and-set on txn->ryw: a txn whose write set is disjoint by
+	 * construction (a hash table add/remove touching distinct buckets) leaves
+	 * RYW off and pays no filter maintenance at all.  txn->ryw is fixed before
+	 * begin(), so the guard is a per-handle-constant, well-predicted branch.
 	 */
-	if (urcu_txn__ryw_bloom_test_and_set(txn->ryw_bloom, slot)
-			&& txn->ryw && txn->retry == 0)
+	if (txn->ryw && urcu_txn__ryw_bloom_test_and_set(txn->ryw_bloom, slot)
+			&& txn->retry == 0)
 		txn->esc_pending = 1;
 #endif
 #ifdef URCU_TXN_ESCALATION_STATS
@@ -1139,7 +1145,8 @@ int urcu_txn__record(struct urcu_mcas_txn *txn, void **slot,
 		}
 	}
 #if !defined(URCU_TXN_AGE_ESCALATE) && !defined(URCU_TXN_RYW_NO_BLOOM)
-	urcu_txn__ryw_bloom_set(txn->ryw_bloom, slot);	/* RYW load filter */
+	if (txn->ryw)
+		urcu_txn__ryw_bloom_set(txn->ryw_bloom, slot);	/* RYW load filter */
 #endif						/* AGE_ESCALATE set it via test_and_set above */
 	return 0;
 }
