@@ -383,6 +383,25 @@ int urcu_mcas_is_proxy(void *v, uintptr_t tag)
 	return ((uintptr_t) v & tag) == tag;
 }
 
+/*
+ * A true try-CAS: swap @*slot from @expect to @desired, returning 1 on success
+ * (the slot held @expect) and 0 on failure, WITHOUT the caller re-comparing an
+ * old value.  uatomic_cmpxchg returns the prior value, so extracting a success
+ * bit costs a compare-and-branch per call; the compiler's
+ * __atomic_compare_exchange_n reports success directly (x86: the ZF of a single
+ * `lock cmpxchg`), which lets the flat install accumulate outcomes with a bitwise
+ * OR instead of a per-result branch.  This is the primitive uatomic lacks; a future
+ * uatomic_try_cmpxchg_mo would replace this shim verbatim.  Strong (no spurious
+ * failure); ACQ_REL on success, ACQUIRE on failure -- on x86 both lower to the
+ * same barrier-free `lock cmpxchg`, so the memory-order choice is free here.
+ */
+static inline
+int urcu_mcas_try_cas(void **slot, void *expect, void *desired)
+{
+	return __atomic_compare_exchange_n(slot, &expect, desired,
+			/*weak=*/0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+}
+
 static inline
 unsigned long urcu_mcas_status(struct urcu_mcas *t)
 {
@@ -612,6 +631,89 @@ void urcu_mcas_decide(struct urcu_mcas *t, unsigned long to)
 	(void) uatomic_cmpxchg(&t->status, URCU_MCAS_UNDECIDED, to);
 #endif
 }
+
+/*
+ * The age-0 sole-driver install is FLAT AUTOMATICALLY under the spinlatch
+ * (NO_HELP + NO_STEAL) with age-0 optimism (AGE0_TRYLATCH): it is the install
+ * implementation of that regime, not a separate knob.  Derived here so no build
+ * needs to opt in; the guard below still catches a manual -DURCU_MCAS_AGE0_FLAT
+ * without the spinlatch.
+ */
+#if defined(URCU_MCAS_NO_HELP) && defined(URCU_MCAS_NO_STEAL) && \
+	defined(URCU_MCAS_AGE0_TRYLATCH)
+# ifndef URCU_MCAS_AGE0_FLAT
+#  define URCU_MCAS_AGE0_FLAT
+# endif
+#endif
+#if defined(URCU_MCAS_AGE0_FLAT) && \
+	!(defined(URCU_MCAS_NO_HELP) && defined(URCU_MCAS_NO_STEAL))
+# error "URCU_MCAS_AGE0_FLAT requires NO_HELP + NO_STEAL (sole driver): the install latch and self-settle it drops are only dead code when no helper or thief can touch a record"
+#endif
+
+#ifdef URCU_MCAS_AGE0_FLAT
+/*
+ * Age-0 sole-driver install, FLAT over the records: no per-record install latch,
+ * no state machine, no self-settle, no pre-CAS slot load.  Preconditions: NO_HELP
+ * + NO_STEAL (asserted above) and retry == 0 (the caller dispatches).
+ *
+ * Plant each record with ONE strong try-CAS (slot: old_ptr -> our proxy), OR the
+ * outcome into @fail, and bail at the FIRST conflict.  The goal is not "no
+ * branches" but "no MISPREDICTED branches": the latched install's per-record
+ * tests (is-this-a-foreign-proxy?, does-the-slot-still-hold-old?) are
+ * data-dependent on a freshly loaded slot value, so they mispredict exactly WHEN
+ * a slot is contended -- the costly case.  Here the try-CAS is itself the
+ * contention check (it fails iff the slot is not old_ptr -- a foreign proxy, or a
+ * value a concurrent transaction changed), its outcome is OR-accumulated rather
+ * than branched on, and the only branch left -- the early break -- is a register
+ * test on @fail AFTER the CAS (so it never gates the CAS) that is not-taken on
+ * every iteration of a committing txn (so it does not mispredict).  We also drop
+ * the pre-CAS load, which would pull the slot line Shared only for the CAS to
+ * upgrade it to Exclusive.
+ *
+ * Correct and deadlock-free precisely because we are the SOLE driver:
+ *
+ *   - The install latch / install-once gate and the self-settle exist only to
+ *     make a FOREIGN driver's stale re-plant or late first install inert (see
+ *     urcu_mcas_plant).  Under NO_HELP + NO_STEAL no foreign thread ever plants,
+ *     steals, or settles our records, so none of those hazards can arise and the
+ *     word is dead -- a bare value-CAS suffices.
+ *   - We never WAIT on a foreign proxy (the CAS fails and we bail), so there is
+ *     no hold-and-wait and the records need no slot-address sort.
+ *   - @t stays UNDECIDED until the single store below, so no plant completes
+ *     "after linearization" -- the self-settle it would otherwise need is moot.
+ *
+ * Bailing at the first conflict (rather than planting the whole write-set past
+ * it) keeps the plant a contiguous PREFIX [0..i): it parks fewer transient
+ * proxies -- planting past a conflict amplifies aborts, since each parked proxy
+ * fail-fasts other age-0 txns -- and it makes @i the exact planted count for a
+ * load-free settle (SUCCEEDED: i == nr; FAILED: i == the failing index), at no
+ * fast-path cost since @i is the loop induction variable already in a register.
+ *
+ * Commit point (arithmetic, no branch): SUCCEEDED == 1 and FAILED == 2, and
+ * @fail is 0 iff every CAS won, so the terminal status is SUCCEEDED + (fail != 0).
+ * RELEASE so the planted proxies publish before a reader can observe the status.
+ */
+static inline
+unsigned int urcu_mcas_drive_install_age0_flat(struct urcu_mcas *t)
+{
+	unsigned long fail = 0;
+	unsigned int i;
+
+	URCU_MCAS_STAT(drive);
+	for (i = 0; i < t->nr; i++) {
+		struct urcu_mcas_record *r = &t->recs[i];
+
+		fail |= (unsigned long) !urcu_mcas_try_cas(r->slot, r->old_ptr,
+				urcu_mcas_tag(r, r->proxy_tag));
+		if (caa_unlikely(fail))
+			break;		/* first conflict: prefix [0..i) planted */
+	}
+	urcu_assert_debug(urcu_mcas_status(t) == URCU_MCAS_UNDECIDED);
+	uatomic_store(&t->status, URCU_MCAS_SUCCEEDED + (fail != 0),
+			CMM_RELEASE);
+	return i;			/* planted count: nr on success, fail index on abort */
+}
+#endif	/* URCU_MCAS_AGE0_FLAT */
 
 static inline
 void urcu_mcas_drive_install_depth(struct urcu_mcas *t, unsigned int depth,
@@ -1488,7 +1590,20 @@ bool urcu_mcas_commit(struct urcu_mcas *t,
 	 * exactly our planted prefix with a plain store; the load-test settle ignores
 	 * it.  Both are static inline, so the value is threaded for free.
 	 */
+#ifdef URCU_MCAS_AGE0_FLAT
+	/*
+	 * Age 0 (sole driver): flat install -- one try-CAS per record, bail at the
+	 * first conflict, decide arithmetically.  It returns its planted prefix length
+	 * @i directly (the loop index), so the load-free settle works exactly as for
+	 * the age-1 sorted install.  Age 1+ keeps the latched blocking install.
+	 */
+	if (t->retry == 0)
+		planted = urcu_mcas_drive_install_age0_flat(t);
+	else
+		planted = urcu_mcas_drive_install(t);
+#else
 	planted = urcu_mcas_drive_install(t);	/* install to a decision (helpers help) */
+#endif
 	urcu_mcas_settle(t, planted);		/* owner-only: make our own slots plain */
 	committed = urcu_mcas_status(t) == URCU_MCAS_SUCCEEDED;
 	call_rcu_fn(&t->rcu_head, urcu_mcas_free_rcu);
