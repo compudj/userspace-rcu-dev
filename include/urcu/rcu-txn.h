@@ -241,100 +241,34 @@ extern "C" {
  * (A/B / falsification).
  *
  * URCU_TXN_BLOOM_WORDS sets the filter width (64 bits each; default 16 = 1024
- * bits, or 1 under URCU_MCAS_STOCK -- byte-identical to the single-word original).
- * Widening it lowers the false-positive rate ~linearly (k=1 hash, FP ~= records /
- * (64*WORDS)); used by the age-0/age-1 escalation study to separate genuine RYW
+ * bits).  Widening it lowers the false-positive rate ~linearly (FP ~= k*records /
+ * (64*WORDS)); the age-0/age-1 escalation study used it to separate genuine RYW
  * from filter FP.
  *
- * Shipping txn engine configuration, keyed on the same URCU_MCAS_STOCK the mcas
- * layer uses (see <urcu/rcu-mcas.h>): age-0/age-1 optimistic escalation on, and
- * the Bloom widened from the historical 64-bit k=1 filter to the k=3 / 1024-bit
- * double-hashed filter that sits at the false-positive knee.  Default because they
- * win across every measured workload; escalation is tuned per-transaction at
- * runtime via urcu_txn_declare_disjoint() / urcu_txn_expect_conflict().  Each
- * value is still individually definable; the guards only fill in a default.
+ * Both width and k are compile-time tunables that only ever trade filter cost
+ * against the false-positive rate: correctness never depends on either, since a
+ * false positive only ever costs a find (baseline) or an extra attempt (age 0).
+ * The 16-word / k=3 default sits at the false-positive knee and wins across every
+ * measured workload; escalation itself is tuned per-transaction at runtime via
+ * urcu_txn_declare_disjoint() / urcu_txn_expect_conflict().
  */
-#ifndef URCU_MCAS_STOCK
-# ifndef URCU_TXN_AGE_ESCALATE
-#  define URCU_TXN_AGE_ESCALATE
-# endif
-#endif
 #ifndef URCU_TXN_BLOOM_WORDS
-# ifdef URCU_MCAS_STOCK
-#  define URCU_TXN_BLOOM_WORDS	1
-# else
-#  define URCU_TXN_BLOOM_WORDS	16
-# endif
+# define URCU_TXN_BLOOM_WORDS	16
 #endif
 /*
- * URCU_TXN_BLOOM_K sets the number of hash BITS a slot maps to (default 1).  With
+ * URCU_TXN_BLOOM_K sets the number of hash BITS a slot maps to (default 3).  With
  * k bits over m = 64*WORDS bits and n recorded slots the false-positive rate is
  * ~(1 - e^{-kn/m})^k, which for a sparse filter falls off as (kn/m)^k -- so
  * raising k cuts false positives super-linearly where widening WORDS only helps
- * linearly.  k=1 keeps the original one-multiply single-bit filter (the committed
- * default) byte-for-byte; k>1 switches to a double-hashed filter built from two
- * INDEPENDENT avalanche hashes h1,h2 (position i = h1 + i*h2), the lever the
- * age-0/age-1 study uses to drive the filter-FP escalation component toward zero
- * and isolate the genuine-RYW rate.  Correctness never depends on k or WORDS: a
- * false positive only ever costs a find (baseline) or an extra attempt (age 0).
- * Default 3 (the double-hashed filter), or 1 under URCU_MCAS_STOCK (the original
- * single-bit filter, byte-for-byte).
+ * linearly.  The filter is a double-hashed k-bit filter built from two INDEPENDENT
+ * avalanche hashes h1,h2 (position i = h1 + i*h2); the age-0/age-1 study used k as
+ * the lever to drive the filter-FP escalation component toward zero and isolate
+ * the genuine-RYW rate.  A degenerate k=1 is valid too (one position).
  */
 #ifndef URCU_TXN_BLOOM_K
-# ifdef URCU_MCAS_STOCK
-#  define URCU_TXN_BLOOM_K	1
-# else
-#  define URCU_TXN_BLOOM_K	3
-# endif
+# define URCU_TXN_BLOOM_K	3
 #endif
 
-#if URCU_TXN_BLOOM_K == 1
-static inline
-void urcu_txn__ryw_bloom_loc(void **slot, unsigned int *word, uint64_t *mask)
-{
-	uintptr_t h = (uintptr_t) slot >> 3;	/* slots are pointer-aligned */
-
-	h *= 0x9e3779b97f4a7c15ULL;
-	*mask = (uint64_t) 1 << ((h >> 58) & 63);		/* bits 58-63: bit-in-word */
-	*word = (unsigned int) ((h >> 40) & 0x3ffff) % URCU_TXN_BLOOM_WORDS;
-							/* bits 40-57: word (disjoint) */
-}
-static inline
-int urcu_txn__ryw_bloom_test(const uint64_t *bloom, void **slot)
-{
-	unsigned int w;
-	uint64_t m;
-
-	urcu_txn__ryw_bloom_loc(slot, &w, &m);
-	return (bloom[w] & m) != 0;
-}
-static inline
-void urcu_txn__ryw_bloom_set(uint64_t *bloom, void **slot)
-{
-	unsigned int w;
-	uint64_t m;
-
-	urcu_txn__ryw_bloom_loc(slot, &w, &m);
-	bloom[w] |= m;
-}
-/*
- * Test whether @slot is already in the filter AND add it, hashing the slot ONCE.
- * The store path needs both (was this a coincidence? then mark the slot), so a
- * fused test-and-set spares it a second urcu_txn__ryw_bloom_loc() multiply.
- */
-static inline
-int urcu_txn__ryw_bloom_test_and_set(uint64_t *bloom, void **slot)
-{
-	unsigned int w;
-	uint64_t m;
-	int was_set;
-
-	urcu_txn__ryw_bloom_loc(slot, &w, &m);
-	was_set = (bloom[w] & m) != 0;
-	bloom[w] |= m;
-	return was_set;
-}
-#else	/* URCU_TXN_BLOOM_K > 1: double-hashed k-bit filter */
 #define URCU_TXN_BLOOM_BITS	(64ULL * URCU_TXN_BLOOM_WORDS)
 /*
  * Two INDEPENDENT hashes of the slot.  A single multiply leaves the k derived
@@ -403,36 +337,36 @@ int urcu_txn__ryw_bloom_test_and_set(uint64_t *bloom, void **slot)
 	}
 	return was_set;
 }
-#endif	/* URCU_TXN_BLOOM_K */
 
 /*
- * Age-0/age-1 optimistic RYW escalation (on by default; -DURCU_MCAS_STOCK disables).
+ * Age-0/age-1 optimistic RYW escalation.
  *
- * A STUDY variant of the RYW load path.  The premise: read-your-own-writes only
- * bites when an attempt reads a slot it has already written, which for a sparse
- * or low-batch write-set is rare -- yet the baseline pays the Bloom test (and, on
- * a hit, the find scan) on every in-bracket load regardless.
+ * The premise: read-your-own-writes only bites when an attempt reads a slot it
+ * has already written, which for a sparse or low-batch write-set is rare -- yet a
+ * naive RYW path pays the Bloom test (and, on a hit, the find scan) on every
+ * in-bracket load regardless.
  *
- * With this on, the FIRST attempt of an operation (retry == 0, "age 0") runs a
- * stripped RYW path: it maintains the Bloom filter as usual but NEVER calls find.
- * A load or store whose slot is already in the filter -- a possible
- * read-after-write or write-after-write, true or a filter false positive -- sets
- * esc_pending instead of resolving it.  The optimistic value a colliding load
- * returns may be stale, but esc_pending forces commit to ABORT, so an age-0
- * attempt that saw ANY coincidence never installs: it is discarded unpublished
- * and re-run at retry >= 1 ("age 1+"), where the full baseline path (Bloom +
- * find, chaining) resolves RYW correctly.  An age-0 attempt that saw NO
- * coincidence has a write-set with no same-slot records and no stale reads, so it
- * is exactly a baseline commit and installs directly.
+ * So the FIRST attempt of an operation (retry == 0, "age 0") runs a stripped RYW
+ * path: it maintains the Bloom filter as usual but NEVER calls find.  A load or
+ * store whose slot is already in the filter -- a possible read-after-write or
+ * write-after-write, true or a filter false positive -- sets esc_pending instead
+ * of resolving it.  The optimistic value a colliding load returns may be stale,
+ * but esc_pending forces commit to ABORT, so an age-0 attempt that saw ANY
+ * coincidence never installs: it is discarded unpublished and re-run at retry >= 1
+ * ("age 1+"), where the full path (Bloom + find, chaining) resolves RYW correctly.
+ * An age-0 attempt that saw NO coincidence has a write-set with no same-slot
+ * records and no stale reads, so it is exactly a baseline commit and installs
+ * directly.
  *
  * The trade: age 0 never runs find, at the price of a whole extra attempt
  * whenever it guesses wrong.  So the win is bounded by the ESCALATION RATE -- how
- * often an operation hits a coincidence (genuine RYW) or a Bloom false positive.
- * Widen URCU_TXN_BLOOM_WORDS to drive the false-positive component toward zero
- * and isolate the genuine-RYW rate.  Correctness never depends on the filter
- * width: a false positive only ever spends an extra attempt.  This is a
- * measurement lever, not a claimed speedup; it costs one branch on the age-1+
- * path when built in, and nothing when built out.
+ * often an operation hits a coincidence (genuine RYW) or a Bloom false positive --
+ * and is therefore WORKLOAD-DEPENDENT: it pays off for disjoint/low-RYW write-sets
+ * (e.g. the hash key-move) and loses for dense-RYW batched descents (e.g. the
+ * skiplist), which opt out per-transaction with urcu_txn_expect_conflict() so
+ * their first attempt goes straight to the find path.  Widening URCU_TXN_BLOOM_WORDS
+ * shrinks the false-positive component; correctness never depends on the filter
+ * width, since a false positive only ever spends an extra attempt.
  */
 
 /*
@@ -588,13 +522,10 @@ struct urcu_mcas_txn {
 					 * (skip-find/blind-append AND skip-sort/try-latch
 					 * install) so a doomed attempt is never spent; runs
 					 * the sorted, blocking path from the first attempt.
-					 * Set with urcu_txn_expect_conflict() before begin();
-					 * a no-op outside AGE_ESCALATE. */
-#ifdef URCU_TXN_AGE_ESCALATE
+					 * Set with urcu_txn_expect_conflict() before begin(). */
 	int esc_pending;		/* the age-0 optimistic attempt saw a same-slot
 					 * coincidence (RAW/WAW, or a Bloom FP) and must
 					 * abort to re-run at age 1+; reset per attempt */
-#endif
 #ifdef URCU_TXN_ESCALATION_STATS
 	/*
 	 * Would-this-attempt-escalate instrumentation for the age-0/age-1 study
@@ -765,9 +696,7 @@ void urcu_txn_init_flavor(struct urcu_mcas_txn *txn,
 	txn->expect_conflict = 0;
 	/* ryw_bloom is (re)zeroed by begin() when ryw is on; a non-RYW handle
 	 * never reads it, so init leaves it untouched. */
-#ifdef URCU_TXN_AGE_ESCALATE
 	txn->esc_pending = 0;
-#endif
 #ifdef URCU_TXN_ESCALATION_STATS
 	txn->esc_raw = txn->esc_waw = txn->esc_bloom = 0;
 #endif
@@ -851,8 +780,7 @@ void urcu_txn_enable_ryw(struct urcu_mcas_txn *txn)
  * duplicate record and the commit corrupts (installs both, destroying an edge).
  * Build with -DURCU_TXN_DEBUG_DISJOINT to trap a violation at the offending
  * store instead.  Call after init and before the first begin(); do not flip
- * mid-transaction.  Only accelerates URCU_TXN_AGE_ESCALATE builds; a no-op hint
- * elsewhere.
+ * mid-transaction.
  */
 static inline
 void urcu_txn_declare_disjoint(struct urcu_mcas_txn *txn)
@@ -874,9 +802,8 @@ void urcu_txn_declare_disjoint(struct urcu_mcas_txn *txn)
  * path from the first attempt.
  *
  * Call after init and before the first begin(); do not flip mid-transaction.
- * Only affects URCU_TXN_AGE_ESCALATE builds; a no-op hint elsewhere.  Typically
- * accompanies enable_ryw() (which resolves the aliasing at commit), and is
- * mutually exclusive in intent with declare_disjoint().
+ * Typically accompanies enable_ryw() (which resolves the aliasing at commit), and
+ * is mutually exclusive in intent with declare_disjoint().
  */
 static inline
 void urcu_txn_expect_conflict(struct urcu_mcas_txn *txn)
@@ -890,18 +817,12 @@ void urcu_txn_expect_conflict(struct urcu_mcas_txn *txn)
  * (skip-find/blind-append/esc_pending, keyed on this) and the mcas layer (skip-
  * sort/try-latch install, keyed on the descriptor's retry, which is created from
  * this) then bypass the age-0 optimistic path and run the sorted, blocking path
- * from the start.  Only diverges from retry under an age-escalate build; the
- * comparator that also reads a descriptor's retry (aging priority) sees the raw
- * retry in a stock build, so expect_conflict stays strictly inert there.
+ * from the start.
  */
 static inline
 unsigned long urcu_txn__eff_retry(const struct urcu_mcas_txn *txn)
 {
-#if defined(URCU_TXN_AGE_ESCALATE) || defined(URCU_MCAS_AGE0_TRYLATCH)
 	return (txn->expect_conflict && txn->retry == 0) ? 1UL : txn->retry;
-#else
-	return txn->retry;
-#endif
 }
 
 /* Initialize a handle bracketed in the compile-time-selected RCU flavor. */
@@ -1110,9 +1031,7 @@ void urcu_txn_begin(struct urcu_mcas_txn *txn)
 	if (txn->ryw)
 		memset(txn->ryw_bloom, 0, sizeof(txn->ryw_bloom));	/* write set is empty */
 #endif
-#ifdef URCU_TXN_AGE_ESCALATE
 	txn->esc_pending = 0;		/* fresh attempt: no coincidence seen yet */
-#endif
 #ifdef URCU_TXN_ESCALATION_STATS
 	txn->esc_raw = txn->esc_waw = txn->esc_bloom = 0;
 #endif
@@ -1214,14 +1133,13 @@ int urcu_txn__record(struct urcu_mcas_txn *txn, void **slot,
 		}
 		txn->mcas = m;
 	}
-#ifdef URCU_TXN_AGE_ESCALATE
 	/*
 	 * Age 0: a store onto an already-recorded slot (write-after-write, or a
 	 * Bloom false positive) escalates to age 1+ rather than chaining here.
 	 * One hash: fuse the pre-store test with setting the slot's bit (the
 	 * filter add the baseline does at the tail below), so an RYW store path
-	 * hashes the slot exactly once whether or not this build escalates.  The
-	 * test reads the state BEFORE the OR, so it still sees "already present".
+	 * hashes the slot exactly once.  The test reads the state BEFORE the OR,
+	 * so it still sees "already present".
 	 *
 	 * The bit's only consumer is a later same-txn RYW load, so gate the whole
 	 * hash-and-set on txn->ryw: a txn whose write set is disjoint by
@@ -1232,7 +1150,6 @@ int urcu_txn__record(struct urcu_mcas_txn *txn, void **slot,
 	if (txn->ryw && urcu_txn__ryw_bloom_test_and_set(txn->ryw_bloom, slot)
 			&& urcu_txn__eff_retry(txn) == 0)
 		txn->esc_pending = 1;
-#endif
 #ifdef URCU_TXN_ESCALATION_STATS
 	/* Test coincidence against the write set as it stands BEFORE this store. */
 	if (urcu_txn__ryw_bloom_test(txn->ryw_bloom, slot))
@@ -1243,7 +1160,6 @@ int urcu_txn__record(struct urcu_mcas_txn *txn, void **slot,
 	{
 		bool recorded;
 
-#ifdef URCU_TXN_AGE_ESCALATE
 		/*
 		 * Age 0: append blind, skipping the reconcile find (an O(nr) scan
 		 * of the write set, run on every store) -- the store-path twin of the
@@ -1275,7 +1191,6 @@ int urcu_txn__record(struct urcu_mcas_txn *txn, void **slot,
 #endif
 			recorded = urcu_mcas_add(m, slot, old_ptr, new_ptr, tag);
 		} else
-#endif
 			recorded = urcu_txn__reconcile(txn, m, slot, old_ptr,
 					new_ptr, upgrade, tag);
 		if (caa_unlikely(!recorded)) {
@@ -1287,19 +1202,13 @@ int urcu_txn__record(struct urcu_mcas_txn *txn, void **slot,
 				return -ENOMEM;
 			}
 			txn->mcas = m;
-#ifdef URCU_TXN_AGE_ESCALATE
 			if (urcu_txn__eff_retry(txn) == 0 && (txn->ryw || txn->disjoint))
 				urcu_mcas_add(m, slot, old_ptr, new_ptr, tag);
 			else
-#endif
 				urcu_txn__reconcile(txn, m, slot, old_ptr,
 						new_ptr, upgrade, tag);
 		}
 	}
-#if !defined(URCU_TXN_AGE_ESCALATE) && !defined(URCU_TXN_RYW_NO_BLOOM)
-	if (txn->ryw)
-		urcu_txn__ryw_bloom_set(txn->ryw_bloom, slot);	/* RYW load filter */
-#endif						/* AGE_ESCALATE set it via test_and_set above */
 	return 0;
 }
 
@@ -1328,7 +1237,6 @@ void *urcu_txn__load(struct urcu_mcas_txn *txn, void **slot, uintptr_t tag,
 		int optimistic)
 {
 	if (txn->ryw && txn->mcas != NULL && txn->mcas != URCU_TXN_ENOMEM) {
-#ifdef URCU_TXN_AGE_ESCALATE
 		if (urcu_txn__eff_retry(txn) == 0) {
 			/*
 			 * Age 0 (optimistic): a Bloom hit is a possible
@@ -1340,9 +1248,7 @@ void *urcu_txn__load(struct urcu_mcas_txn *txn, void **slot, uintptr_t tag,
 			 */
 			if (urcu_txn__ryw_bloom_test(txn->ryw_bloom, slot))
 				txn->esc_pending = 1;
-		} else
-#endif
-		{
+		} else {
 #ifdef URCU_TXN_ESCALATION_STATS
 		if (urcu_txn__ryw_bloom_test(txn->ryw_bloom, slot))
 			txn->esc_bloom++;	/* age-0 would escalate this read */
@@ -1492,7 +1398,6 @@ enum urcu_txn_status urcu_txn_commit_flavor(struct urcu_mcas_txn *txn,
 	}
 	if (!m)
 		return URCU_TXN_STATUS_OK;	/* empty write-set: trivially committed */
-#ifdef URCU_TXN_AGE_ESCALATE
 	if (caa_unlikely(txn->esc_pending)) {
 		/*
 		 * Age-0 optimistic attempt saw a same-slot coincidence: its
@@ -1507,7 +1412,6 @@ enum urcu_txn_status urcu_txn_commit_flavor(struct urcu_mcas_txn *txn,
 		txn->retrying = 1;		/* keep the turn across the retry */
 		return URCU_TXN_STATUS_ABORT;
 	}
-#endif
 	txn->min_alloc = m->nr;		/* learn the realized size: a retry won't re-grow */
 	txn->mcas = NULL;		/* mcas_commit consumes the descriptor */
 	if (urcu_mcas_commit(m, call_rcu_fn))
