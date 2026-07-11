@@ -724,7 +724,8 @@ void urcu_txn_init_flavor(struct urcu_mcas_txn *txn,
 	txn->retrying = 0;
 	txn->ryw = URCU_TXN_RYW_DEFAULT;
 	txn->disjoint = 0;
-	memset(txn->ryw_bloom, 0, sizeof(txn->ryw_bloom));
+	/* ryw_bloom is (re)zeroed by begin() when ryw is on; a non-RYW handle
+	 * never reads it, so init leaves it untouched. */
 #ifdef URCU_TXN_AGE_ESCALATE
 	txn->esc_pending = 0;
 #endif
@@ -1013,7 +1014,19 @@ void urcu_txn_begin(struct urcu_mcas_txn *txn)
 	else
 		urcu_txn__maybe_publish(txn);	/* joiner that starved: promote */
 	txn->mcas = NULL;		/* prior attempt's descriptor already consumed/freed */
-	memset(txn->ryw_bloom, 0, sizeof(txn->ryw_bloom));	/* write set is empty */
+	/*
+	 * The RYW Bloom is consumed only under txn->ryw -- both the load-side test
+	 * and the store-side set are ryw-gated -- so a non-RYW handle (including one
+	 * that declared its write set disjoint) needs no per-attempt zeroing.  Under
+	 * ESCALATION_STATS the study probes the filter unconditionally, so keep it
+	 * clean there.
+	 */
+#ifdef URCU_TXN_ESCALATION_STATS
+	memset(txn->ryw_bloom, 0, sizeof(txn->ryw_bloom));
+#else
+	if (txn->ryw)
+		memset(txn->ryw_bloom, 0, sizeof(txn->ryw_bloom));	/* write set is empty */
+#endif
 #ifdef URCU_TXN_AGE_ESCALATE
 	txn->esc_pending = 0;		/* fresh attempt: no coincidence seen yet */
 #endif
