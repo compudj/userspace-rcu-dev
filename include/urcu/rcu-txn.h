@@ -1098,17 +1098,45 @@ int urcu_txn__record(struct urcu_mcas_txn *txn, void **slot,
 	if (urcu_mcas_find(m, slot) != NULL)
 		txn->esc_waw++;			/* true write-after-write */
 #endif
-	if (caa_unlikely(!urcu_txn__reconcile(txn, m, slot, old_ptr, new_ptr,
-			upgrade, tag))) {
-		/* Descriptor full: grow (may move it) and retry. */
-		m = urcu_mcas_grow(m);
-		if (caa_unlikely(!m)) {
-			urcu_mcas_destroy(txn->mcas);	/* unpublished: sync free */
-			txn->mcas = URCU_TXN_ENOMEM;
-			return -ENOMEM;
+	{
+		bool recorded;
+
+#ifdef URCU_TXN_AGE_ESCALATE
+		/*
+		 * Age 0: append blind, skipping the reconcile find (an O(nr) scan
+		 * of the write set, run on every store) -- the store-path twin of the
+		 * skip-find the age-0 load path above already does.  It is redundant
+		 * here: the Bloom test_and_set above already flagged any same-slot
+		 * coincidence (real WAW or a false positive) with esc_pending, and
+		 * commit then DISCARDS this descriptor before install -- so a transient
+		 * duplicate record never publishes.  On a Bloom miss (the disjoint
+		 * common case age 0 targets) find would miss anyway, so add is the
+		 * identical result minus the scan.  Age 1+ takes the full reconcile
+		 * path below, where find+chain resolves RYW exactly.
+		 */
+		if (txn->retry == 0 && txn->ryw)
+			recorded = urcu_mcas_add(m, slot, old_ptr, new_ptr, tag);
+		else
+#endif
+			recorded = urcu_txn__reconcile(txn, m, slot, old_ptr,
+					new_ptr, upgrade, tag);
+		if (caa_unlikely(!recorded)) {
+			/* Descriptor full: grow (may move it) and retry. */
+			m = urcu_mcas_grow(m);
+			if (caa_unlikely(!m)) {
+				urcu_mcas_destroy(txn->mcas);	/* unpublished: sync free */
+				txn->mcas = URCU_TXN_ENOMEM;
+				return -ENOMEM;
+			}
+			txn->mcas = m;
+#ifdef URCU_TXN_AGE_ESCALATE
+			if (txn->retry == 0 && txn->ryw)
+				urcu_mcas_add(m, slot, old_ptr, new_ptr, tag);
+			else
+#endif
+				urcu_txn__reconcile(txn, m, slot, old_ptr,
+						new_ptr, upgrade, tag);
 		}
-		txn->mcas = m;
-		urcu_txn__reconcile(txn, m, slot, old_ptr, new_ptr, upgrade, tag);
 	}
 #if !defined(URCU_TXN_AGE_ESCALATE) && !defined(URCU_TXN_RYW_NO_BLOOM)
 	urcu_txn__ryw_bloom_set(txn->ryw_bloom, slot);	/* RYW load filter */
