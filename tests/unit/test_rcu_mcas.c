@@ -30,6 +30,13 @@
  * tag.  The versioning models the real target: slots holding RCU-managed
  * pointers cannot ABA.  QSBR flavor; every worker is an RCU reader so descriptors
  * stay alive while other writers wait on their proxies.
+ *
+ * A-B-A tolerance: a final phase drops the version (g_aba_mode) so slot bit
+ * patterns recur, deliberately reintroducing slot-value A-B-A, and checks the sum
+ * invariant still holds.  This is the affirmative coverage for the single-driver
+ * bare-CAS install: since the owner plants each record once while its transaction
+ * is UNDECIDED and no foreign thread re-plants it, a value cycling back to a stale
+ * read is inert -- the property that let the per-record install latch be retired.
  */
 
 #ifndef _GNU_SOURCE
@@ -75,13 +82,15 @@ static __thread struct lf_stat t_stat;
 
 #include "tap.h"
 
-#define NR_TESTS	9
+#define NR_TESTS	11
 #define NR_WORKERS	8
 
 #define MILD_WORDS	16		/* moderate contention: atomicity focus */
 #define MILD_OPS	60000
 #define HOT_WORDS	4		/* heavy contention: fairness focus */
 #define HOT_OPS		20000
+#define ABA_WORDS	3		/* tiny set: slot values recur -> A-B-A */
+#define ABA_OPS		20000
 
 /*
  * Mixed phase: a few workers run single-edge +1 ops on a tiny hot set while the
@@ -104,6 +113,14 @@ static __thread struct lf_stat t_stat;
 #define HOT_RETRY_BOUND	512
 
 static void *g_word[MILD_WORDS];	/* all start at (void *) 0 */
+
+/*
+ * A-B-A test mode: when set, lf_bump() stops packing a per-word version, so a
+ * word's bit pattern recurs whenever its value does -- deliberately reintroducing
+ * the slot-value A-B-A the versioning otherwise models away.  Set before a phase's
+ * workers are spawned and cleared after they join, so it is read-only concurrently.
+ */
+static int g_aba_mode;
 
 struct worker_arg {
 	unsigned int seed;
@@ -131,8 +148,14 @@ static unsigned int xs(unsigned int x)
  * bit pattern.  This models the real target, where slots hold RCU-managed
  * pointers that cannot ABA (a freed node is not reused within a read-side
  * section, and a removed node is not re-linked before its grace period).  Plain
- * integer values, by contrast, ABA freely -- which is NOT representative of an
- * RCU-protected structure and is what an earlier version of this test hit.
+ * integer values, by contrast, ABA freely.
+ *
+ * The A-B-A phase (g_aba_mode) drops the version deliberately, so a word's bit
+ * pattern recurs with its value.  Under the single-driver engine that is safe --
+ * the owner plants each record once with a bare CAS while its transaction is
+ * UNDECIDED and no foreign thread re-plants it, so a slot value cycling back to a
+ * stale read's value cannot resurrect a retired install -- and that phase's
+ * conservation check is what affirms it.
  */
 static intptr_t lf_val(uintptr_t w)
 {
@@ -142,7 +165,8 @@ static intptr_t lf_val(uintptr_t w)
 static uintptr_t lf_bump(uintptr_t w, intptr_t delta)
 {
 	intptr_t val = lf_val(w) + delta;
-	unsigned int ver = (unsigned int) ((w >> 1) & 0x7fffffffu) + 1;
+	unsigned int ver = g_aba_mode ? 0u :
+		(unsigned int) ((w >> 1) & 0x7fffffffu) + 1;
 
 	return ((uintptr_t) (uint32_t) (int32_t) val << 32)
 		| ((uintptr_t) (ver & 0x7fffffffu) << 1);
@@ -422,6 +446,18 @@ int main(void)
 		ok(escalate > 0,
 			"mix: single-edge ops actually escalated (mechanism exercised)");
 	}
+
+	/* --- Phase 4: single-driver A-B-A tolerance (bare-CAS install). --- */
+	g_aba_mode = 1;		/* words carry no version -> bit patterns recur */
+	sum = run_phase(ABA_WORDS, ABA_OPS, &committed, &max_retry, &st, &attempts);
+	g_aba_mode = 0;
+	diag("aba:  %d workers x %d ops over %d unversioned words = %ld committed; sum = %"
+		PRIdPTR "; max single-op retry = %lu",
+		NR_WORKERS, ABA_OPS, ABA_WORDS, committed, sum, max_retry);
+	ok(sum == 0,
+		"aba: k-CAS stayed atomic with slot values recurring (single-driver bare-CAS is A-B-A tolerant)");
+	ok(committed == (long) NR_WORKERS * ABA_OPS,
+		"aba: every transaction committed under value reuse (no lost progress)");
 
 	rcu_barrier();
 	rcu_unregister_thread();
