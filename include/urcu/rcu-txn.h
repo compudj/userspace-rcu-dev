@@ -541,6 +541,17 @@ struct urcu_mcas_txn {
 					 * bits; cleared per attempt by begin().
 					 * Only read under txn->ryw, so a non-RYW
 					 * handle just carries the dead word(s). */
+	int disjoint;			/* caller asserts this txn's write set
+					 * touches DISTINCT slots (no write-after-
+					 * write): e.g. a hash add/remove over
+					 * distinct buckets.  Lets age 0 blind-append
+					 * WITHOUT the RYW Bloom -- no filter
+					 * maintenance, no load-side test -- since
+					 * there is no coincidence to catch.  Set with
+					 * urcu_txn_declare_disjoint() before begin();
+					 * a violation corrupts (adds a duplicate
+					 * record) unless URCU_TXN_DEBUG_DISJOINT traps
+					 * it.  Independent of txn->ryw. */
 #ifdef URCU_TXN_AGE_ESCALATE
 	int esc_pending;		/* the age-0 optimistic attempt saw a same-slot
 					 * coincidence (RAW/WAW, or a Bloom FP) and must
@@ -712,6 +723,7 @@ void urcu_txn_init_flavor(struct urcu_mcas_txn *txn,
 	txn->fb_published = 0;
 	txn->retrying = 0;
 	txn->ryw = URCU_TXN_RYW_DEFAULT;
+	txn->disjoint = 0;
 	memset(txn->ryw_bloom, 0, sizeof(txn->ryw_bloom));
 #ifdef URCU_TXN_AGE_ESCALATE
 	txn->esc_pending = 0;
@@ -778,6 +790,34 @@ static inline
 void urcu_txn_enable_ryw(struct urcu_mcas_txn *txn)
 {
 	urcu_txn_set_ryw(txn, 1);
+}
+
+/*
+ * Assert that this handle's transactions touch DISTINCT slots -- no store ever
+ * lands on a slot already recorded in the same commit (no write-after-write and
+ * no read-of-own-write).  This is the common shape of a keyed structure whose
+ * write site is a pure function of the key over distinct keys: a hash table
+ * add/remove across distinct buckets, a bitmap word per distinct index.
+ *
+ * Given the guarantee, age 0 blind-appends each store -- skipping the O(nr)
+ * reconcile find -- WITHOUT enabling read-your-own-writes, so NO Bloom filter is
+ * maintained (no per-store hash-and-set, no per-load test) and the handle pays
+ * none of the RYW cost.  This is the RYW-free way to get the age-0 fast path for
+ * a disjoint mutator; enable_ryw() is for mutators whose composed edits CAN
+ * alias a slot (a traversal-reached write site), which need the filter to catch
+ * and reconcile the coincidence.
+ *
+ * Contract: if a store DOES hit a recorded slot, the blind append inserts a
+ * duplicate record and the commit corrupts (installs both, destroying an edge).
+ * Build with -DURCU_TXN_DEBUG_DISJOINT to trap a violation at the offending
+ * store instead.  Call after init and before the first begin(); do not flip
+ * mid-transaction.  Only accelerates URCU_TXN_AGE_ESCALATE builds; a no-op hint
+ * elsewhere.
+ */
+static inline
+void urcu_txn_declare_disjoint(struct urcu_mcas_txn *txn)
+{
+	txn->disjoint = 1;
 }
 
 /* Initialize a handle bracketed in the compile-time-selected RCU flavor. */
@@ -1111,18 +1151,34 @@ int urcu_txn__record(struct urcu_mcas_txn *txn, void **slot,
 		/*
 		 * Age 0: append blind, skipping the reconcile find (an O(nr) scan
 		 * of the write set, run on every store) -- the store-path twin of the
-		 * skip-find the age-0 load path above already does.  It is redundant
-		 * here: the Bloom test_and_set above already flagged any same-slot
-		 * coincidence (real WAW or a false positive) with esc_pending, and
-		 * commit then DISCARDS this descriptor before install -- so a transient
-		 * duplicate record never publishes.  On a Bloom miss (the disjoint
-		 * common case age 0 targets) find would miss anyway, so add is the
-		 * identical result minus the scan.  Age 1+ takes the full reconcile
-		 * path below, where find+chain resolves RYW exactly.
+		 * skip-find the age-0 load path above already does.  Two callers reach
+		 * it:
+		 *  - RYW: the Bloom test_and_set above already flagged any same-slot
+		 *    coincidence (real WAW or a false positive) with esc_pending, and
+		 *    commit then DISCARDS this descriptor before install -- so a
+		 *    transient duplicate record never publishes.  On a Bloom miss (the
+		 *    disjoint case age 0 targets) find would miss anyway, so add is the
+		 *    identical result minus the scan.  Age 1+ reconciles below.
+		 *  - DISJOINT: the caller asserts distinct slots (no WAW), so there is
+		 *    no coincidence to catch and no Bloom is maintained -- the find is
+		 *    unconditionally redundant.  A violated assertion corrupts (adds a
+		 *    duplicate record); URCU_TXN_DEBUG_DISJOINT traps it here.
 		 */
-		if (txn->retry == 0 && txn->ryw)
+		if (txn->retry == 0 && (txn->ryw || txn->disjoint)) {
+#ifdef URCU_TXN_DEBUG_DISJOINT
+			if (txn->disjoint && urcu_mcas_find(m, slot) != NULL) {
+				fprintf(stderr, "urcu-txn: disjoint-contract violation: "
+					"slot %p is already recorded in this commit, but the "
+					"handle declared its write set disjoint via "
+					"urcu_txn_declare_disjoint().  The blind append would "
+					"insert a duplicate record and corrupt the commit.  Use "
+					"urcu_txn_enable_ryw() for a mutator whose composed edits "
+					"can alias a slot.\n", (void *) slot);
+				abort();
+			}
+#endif
 			recorded = urcu_mcas_add(m, slot, old_ptr, new_ptr, tag);
-		else
+		} else
 #endif
 			recorded = urcu_txn__reconcile(txn, m, slot, old_ptr,
 					new_ptr, upgrade, tag);
@@ -1136,7 +1192,7 @@ int urcu_txn__record(struct urcu_mcas_txn *txn, void **slot,
 			}
 			txn->mcas = m;
 #ifdef URCU_TXN_AGE_ESCALATE
-			if (txn->retry == 0 && txn->ryw)
+			if (txn->retry == 0 && (txn->ryw || txn->disjoint))
 				urcu_mcas_add(m, slot, old_ptr, new_ptr, tag);
 			else
 #endif
