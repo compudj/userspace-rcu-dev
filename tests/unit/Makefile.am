@@ -25,9 +25,7 @@ noinst_PROGRAMS = \
 	test_uatomic_cxx \
 	test_rcu_txn_sw \
 	test_rcu_mcas \
-	test_rcu_mcas_aba \
 	test_rcu_mcas_linger \
-	test_rcu_mcas_republish \
 	test_rcu_txn \
 	test_rcu_txn_grow \
 	test_rcu_txn_fallback \
@@ -81,9 +79,7 @@ TESTS = \
 	test_uatomic_cxx \
 	test_rcu_txn_sw \
 	test_rcu_mcas \
-	test_rcu_mcas_aba \
 	test_rcu_mcas_linger \
-	test_rcu_mcas_republish \
 	test_rcu_txn \
 	test_rcu_txn_grow \
 	test_rcu_txn_fallback \
@@ -161,14 +157,8 @@ test_rcu_txn_sw_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
 test_rcu_mcas_SOURCES = test_rcu_mcas.c
 test_rcu_mcas_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
 
-test_rcu_mcas_aba_SOURCES = test_rcu_mcas_aba.c
-test_rcu_mcas_aba_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
-
 test_rcu_mcas_linger_SOURCES = test_rcu_mcas_linger.c
 test_rcu_mcas_linger_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
-
-test_rcu_mcas_republish_SOURCES = test_rcu_mcas_republish.c
-test_rcu_mcas_republish_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
 
 test_rcu_txn_SOURCES = test_rcu_txn.c
 test_rcu_txn_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)

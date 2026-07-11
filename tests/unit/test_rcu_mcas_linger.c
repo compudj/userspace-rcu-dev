@@ -3,21 +3,27 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
 /*
- * Deterministic regression test for the RCU MCAS engine's OTHER A-B-A
- * hazard: a late FIRST install that lingers past reclaim.  The companion test
- * test_rcu_mcas_aba.c covers the re-plant of an already-installed record
- * (closed by the install-once flag); this one covers the install-vs-settle
- * ordering hole (closed by the installer-self-settle).
+ * Deterministic regression test for the RCU MCAS engine's install-vs-settle
+ * A-B-A hazard: a late FIRST install that lingers past reclaim, closed by the
+ * installer-self-settle and the settle-time install-word claim.
  *
- * The hazard: a transaction V is being driven by a HELPER (a thread other than
- * the owner).  The helper installs V's lower-slot record, then -- having just
- * read V UNDECIDED -- is about to install V's last record on slot S.  Before it
- * does, V is EVICTED by a higher-priority contender (V -> FAILED), and V's OWNER
- * runs its settle and reclaims the descriptor.  The owner's settle cannot convert
- * the S record: it is not installed yet.  The helper then plants S anyway (a late
- * FIRST install, after the owner already settled and freed V).  That proxy now
- * names a reclaimed descriptor: any reader resolving S dereferences freed memory
- * -> use-after-free, and the slot never decays to a plain value.
+ * NOTE ON SCOPE: the shipping engine is single-driver -- no thread ever drives,
+ * helps, or evicts a foreign transaction -- so the interleaving below cannot
+ * arise in production.  This test MODELS it by hand (one thread calling
+ * urcu_mcas_drive_install() as if it were a foreign helper) to keep the retained
+ * self-settle / settle-claim machinery covered until the deferred plant
+ * simplification removes both the machinery and this test.  See the VESTIGIAL
+ * note on struct urcu_mcas_record in the engine header.
+ *
+ * The modelled hazard: a transaction V is driven by a HELPER (a thread other
+ * than the owner).  The helper installs V's lower-slot record, then -- having
+ * just read V UNDECIDED -- is about to install V's last record on slot S.  Before
+ * it does, V is EVICTED (V -> FAILED) and V's OWNER runs its settle and reclaims
+ * the descriptor.  The owner's settle cannot convert the S record: it is not
+ * installed yet.  The helper then plants S anyway (a late FIRST install, after
+ * the owner already settled and freed V).  That proxy now names a reclaimed
+ * descriptor: any reader resolving S dereferences freed memory -> use-after-free,
+ * and the slot never decays to a plain value.
  *
  * The fix is the installer-self-settle in urcu_mcas_plant(): a driver that
  * plants a record reads V's status AFTER the plant (under the install latch); if
@@ -26,19 +32,15 @@
  * owner settle for the still-UNDECIDED case -- see the engine header.)
  *
  * This drives that interleaving deterministically with one thread.  The helper is
- * urcu_mcas_drive_install(V) with NO settle (helpers never settle); the
- * URCU_MCAS_PREINSTALL hook, firing just before the helper plants S, runs the
- * eviction and the owner's settle.  After the helper returns, slot S must hold a
- * PLAIN value (no lingering proxy).
+ * urcu_mcas_drive_install(V) with NO settle; the URCU_MCAS_PREINSTALL hook,
+ * firing just before the helper plants S, runs the eviction and the owner's
+ * settle.  After the helper returns, slot S must hold a PLAIN value (no lingering
+ * proxy).
  *
- * Build -DURCU_MCAS_NO_ABA_FIX to drop the self-settle (and the install-once
- * gate) and watch S retain a dangling proxy -- the regression this catches.
- *
- * Note: since urcu_mcas_settle() learned to CLAIM each record's install word,
- * this scenario's late plant is refused outright (word already DONE), which
- * satisfies the "no lingering proxy" assertion a fortiori; the self-settle
- * still covers a plant that completes before settle reaches its record.  The
- * companion test_rcu_mcas_republish.c asserts the claim itself.
+ * Because urcu_mcas_settle() CLAIMS each record's install word (FREE->DONE), this
+ * scenario's late plant is refused outright (word already DONE), which satisfies
+ * the "no lingering proxy" assertion a fortiori; the self-settle still covers a
+ * plant that completes before settle reaches its record.
  */
 
 #ifndef _GNU_SOURCE
@@ -105,8 +107,8 @@ static void preinstall_hook(struct urcu_mcas *t,
 	(void) uatomic_cmpxchg(&g_V->status, URCU_MCAS_UNDECIDED,
 			URCU_MCAS_FAILED);
 	/* (b) V's owner settles (AUX -> old; S not installed, so no-op) and reclaims.
-	 * Help/steal build: settle load-tests each slot, so the planted count is
-	 * unused here (S is skipped because it holds no proxy of V's). */
+	 * Settle claims each record's install word, so when the helper reaches S its
+	 * plant is refused (word already DONE) and S is left plain. */
 	urcu_mcas_settle(g_V, g_V->nr);
 }
 

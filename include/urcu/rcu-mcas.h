@@ -11,10 +11,11 @@
  * This is the concurrent-writer sibling of <urcu/rcu-txn-sw.h>.  It switches
  * a *set* of words from their old values to new ones atomically, as observed
  * by both concurrent RCU readers AND concurrent writers.  Progress is
- * bounded-blocking: a thread that trips over an in-flight transaction helps
- * drive its install forward rather than waiting on it, and the only blocking
- * is a short per-record install word (a tri-state try-lock, below), held only
- * across a bounded, non-blocking section -- no unbounded waiting, no deadlock.
+ * bounded-blocking and single-driver: a transaction is driven only by its owner,
+ * and a thread that trips over an in-flight transaction's proxy waits a bounded
+ * spin for that proxy's owner to settle the slot, then escalates (aborts and
+ * retries at a rising aging priority, ultimately through the front-end's
+ * fair-mutex fallback) -- no helping, no stealing, no deadlock.
  *
  * Model (a "practical MCAS", Harris-style, linearized by a status flip)
  * ----------------------------------------------------------------------
@@ -33,10 +34,11 @@
  * transition is a descriptor-naming CAS: a parked slot names a descriptor, and
  * resolution goes through that descriptor's status word, so the slot's plain
  * value alone is never load-bearing (one txn's new is the next txn's old -- only
- * the descriptor identity disambiguates).  Combined with the per-record install
- * latch (below), this makes the engine indifferent to slot-value A-B-A: a
- * straggler can never drag a slot backward by re-planting a descriptor after it
- * linearized, no matter how the slot value recurred.
+ * the descriptor identity disambiguates).  With a single driver per transaction
+ * this makes the engine indifferent to slot-value A-B-A: no straggler can drag a
+ * slot backward by re-planting a descriptor after it linearized, because the only
+ * thread that plants a transaction's records is its owner (see "Slot-value A-B-A"
+ * below).
  *
  * Resolution.  A reader (or a writer traversing) that loads a slot holding
  * flip(r) reads r->mcas->status: SUCCEEDED resolves to r->new_ptr, UNDECIDED or
@@ -44,48 +46,34 @@
  * a terminal descriptor in a slot is *correct*, not a bug -- which is why no
  * RDCSS is needed.
  *
- * Settle is owner-driven, with one exception.  A helper drives a foreign
- * transaction's *install* forward (so a stalled writer never blocks others); the
- * bulk settle that rewrites a transaction's parked records back to plain values
- * is the owner's, in commit().  The owner's settle also CLAIMS each record's
- * install word (FREE -> DONE) before converting its slot, so once settle returns
- * no plant can begin at all -- that claim, not the plant-side checks, is what
- * makes the post-settle reclaim safe against a stale FIRST install of a record
- * nobody had planted yet (see urcu_mcas_settle()).  The one exception to
- * owner-driven settling is the INSTALLER-SELF-SETTLE (urcu_mcas_plant()): a
- * driver that has just planted a record under its install latch, and reads the
- * transaction already terminal, converts THAT one proxy immediately -- before
- * releasing the latch to DONE -- so the owner's settle, spinning out the BUSY
- * window, finds the slot already plain and a post-decision plant never outlives
- * it.  This is still a settle of the planter's own (just-installed) record,
- * never of a foreign one, and it only fires once the
- * transaction is terminal.  A terminal descriptor otherwise lingers in its slots
- * until the owner reclaims it; readers and contenders resolve it through the
- * status word in the meantime.
+ * Settle is owner-only.  A transaction is installed and settled by its owner
+ * alone, in commit(), sequential with its own settle(): no thread ever drives,
+ * evicts, or steals a foreign transaction's records.  The owner's settle rewrites
+ * its parked records back to plain values (its new on SUCCEEDED, its old on
+ * FAILED), converting exactly the prefix the install planted; since nothing
+ * foreign ever plants into those records, once settle returns no proxy of the
+ * transaction names any slot -- which is what makes the post-settle reclaim safe.
  *
  * A contended slot never reverts to plain while its transaction is still
- * UNDECIDED -- only a terminal transaction's slots decay to plain (by settle or
- * self-settle), and a higher-priority contender takes a slot it wants by STEAL
- * (one CAS replacing the proxy directly) rather than waiting for plain, so the
- * slot is handed owner-to-owner rather than momentarily up for grabs.  The cost
- * is that readers may resolve a lingering proxy rather than load a settled value;
- * an aborted transaction settles right after, so the window is short.
+ * UNDECIDED -- only a terminal transaction's slots decay to plain, by the owner's
+ * settle.  A committer that needs a slot another transaction holds UNDECIDED spins
+ * a bounded wait for that owner to settle it plain, then acquires it -- the proxy
+ * is a pure spinlatch.  The cost is that readers may resolve a lingering proxy
+ * rather than load a settled value; an aborted transaction settles right after,
+ * so the window is short.
  *
- * Liveness.  Records install in one global order (sorted by slot address), so
- * two conflicting transactions always meet at their lowest shared slot.  There
- * a strict per-transaction priority picks the winner -- the transaction that
- * has retried more, ties broken by descriptor address (urcu_mcas_outranks());
- * a starved transaction's priority climbs until it can no longer be bypassed
- * (bounded bypass).  The lower-priority transaction is aborted and the winner
- * STEALS the slot in a single CAS -- its parked record replaces the loser's
- * directly, rather than the slot first reverting to a plain value a newcomer
- * could grab.  Because the priority order is total and both parties compute it
- * identically, the two never abort each other, so eviction cannot livelock.
- * The engine is bounded-blocking (the per-record install latch), not lock-free.
+ * Liveness.  Records install in one global order (sorted by slot address at
+ * age 1+; age 0 installs flat and bails at the first foreign proxy), so a
+ * committer holds only lower slots while waiting on a shared one and cannot
+ * deadlock: the owner it waits on, having reached that slot, already passed every
+ * lower one.  The wait is bounded; on cap-out the committer aborts and retries at
+ * a rising aging priority, and the transaction front-end's fair-mutex fallback
+ * forces progress even against a preempted owner.  The engine is
+ * bounded-BLOCKING, not lock-free.
  *
  * Existence.  Mutators run as RCU readers (rcu_read_lock around the whole
- * operation).  Any descriptor a helper reaches through a slot stays alive
- * until the helper leaves its read-side section; the owner call_rcu()s the
+ * operation).  A descriptor reachable through a slot stays alive until every
+ * reader that reached it leaves its read-side section; the owner call_rcu()s the
  * descriptor once it is terminal and fully settled.  No refcount.
  *
  * Constraints (vs the single-writer <urcu/rcu-txn-sw.h>):
@@ -93,41 +81,36 @@
  *     must be at least 2-byte aligned (bit 0 clear) -- true for any pointer,
  *     or store small integers shifted left by 1;
  *   - the record set is frozen at commit: no record may be added after the
- *     first install (helpers walk the immutable, sorted record list);
+ *     first install;
  *   - a transaction's records must target pairwise-distinct slots.
  *
- * Slot-value A-B-A -- TOLERATED.  The engine omits RDCSS: it installs a
- * descriptor with a plain CAS conditioned on the word holding its expected old.
- * Were that the whole story it would be safe ONLY if a word could not cycle back
- * to a prior value between a thread reading that value and installing -- a delayed
- * (stale) install of an already-decided descriptor would otherwise pass its CAS
- * on the recurred old and re-plant the descriptor's proxy AFTER the transaction
- * linearized, resurrecting a stale value -> use-after-free.  Such recurrence is
- * real even under RCU, which prevents ADDRESS reuse but not VALUE recurrence: a
- * doubly-linked list's next-pointer cycles B -> X -> B (insert then delete of X)
- * with B a live successor RCU never frees.
+ * Slot-value A-B-A -- SAFE.  The engine omits RDCSS: it installs a descriptor
+ * with a plain CAS conditioned on the word holding its expected old.  With a
+ * single driver per transaction that suffices.  The only way a plain install CAS
+ * could resurrect a stale value is a delayed SECOND install of an already-decided
+ * descriptor passing its CAS on a value that recurred to the old -- and that needs
+ * a second, stalled driver of the same transaction.  No such driver exists here:
+ * the owner plants its whole prefix before it decides, and no foreign thread ever
+ * plants, drives, or steals its records.  So ANY slot-value A-B-A is inert,
+ * whatever recurs the value -- a doubly-linked next-pointer cycling B -> X -> B
+ * (RCU prevents ADDRESS reuse but not VALUE recurrence, with B a live successor it
+ * never frees), a counter revisiting a number, an embedder's own reuse.  What the
+ * engine DOES require is unrelated to slot values: tag bit 0 free, pairwise-
+ * distinct slots per txn, and -- the EXISTENCE model -- that a descriptor
+ * reachable through a slot is reclaimed only after a grace period (a reader may
+ * dereference it).  Note this is value-CAS atomicity: a record is validated to
+ * hold its old at the LINEARIZATION point, not to have been stable throughout; an
+ * embedder needing the latter (snapshot/version semantics) layers its own
+ * versioning on top, as with any value-based MCAS -- but that is a stronger
+ * guarantee than memory safety, which holds unconditionally here.
  *
- * The PER-RECORD INSTALL WORD (struct urcu_mcas_record::state -- a tri-state
- * FREE/BUSY/DONE try-lock) closes that directly, so the engine no longer requires slots to be
- * non-ABA-able at all -- ANY slot-value A-B-A is safe, whatever recurs the value
- * (live-successor recurrence, a counter revisiting a number, an embedder's own
- * reuse).  Every plant -- plain install and steal alike -- runs through
- * urcu_mcas_plant(), which claims the word (FREE->BUSY) so {install-once, plant
- * CAS, self-settle} are atomic in one word.  A stale second install is
- * gated by the DONE state, not by the slot value, so the recurred value is
- * irrelevant; and the owner's settle claims every record's install word
- * (FREE->DONE) before the descriptor is reclaimed, so a stale FIRST install of a
- * never-planted record is gated the same way -- after settle, no plant of any
- * kind can republish the descriptor (see urcu_mcas_settle()); the self-settle
- * keeps a post-decision plant from lingering until settle reaches it.  What the
- * engine DOES still require is unrelated to slot values: tag bit 0
- * free, pairwise-distinct slots per txn, and -- the EXISTENCE model -- that a
- * descriptor reachable through a slot is reclaimed only after a grace period (a
- * helper/reader may dereference it).  Note this is value-CAS atomicity: a record
- * is validated to hold its old at the LINEARIZATION point, not to have been stable
- * throughout; an embedder needing the latter (snapshot/version semantics) layers
- * its own versioning on top, as with any value-based MCAS -- but that is a
- * stronger guarantee than memory safety, which holds unconditionally here.
+ * (The per-record install word -- struct urcu_mcas_record::state, a tri-state
+ * FREE/BUSY/DONE try-lock exercised by the age-1+ latched install and the
+ * self-settle in urcu_mcas_plant() -- is retained but now VESTIGIAL: with one
+ * driver its transitions are uncontended and the stale-re-plant hazards it once
+ * guarded against a foreign driver can no longer arise.  A follow-up retires it
+ * for a bare-CAS plant; it is kept here only to keep that change isolated and
+ * separately testable.)
  */
 
 #include <stdbool.h>
@@ -148,37 +131,18 @@ extern "C" {
 #endif
 
 /*
- * Shipping install configuration.  The library defaults to the single-driver
- * spinlatch install: NO_HELP + NO_STEAL (no thread drives or steals a foreign
- * transaction's records, so decide/settle collapse to release stores) with age-0
- * optimism (AGE0_TRYLATCH, which derives the FLAT age-0 install below).  These
- * were opt-in study flags while the design settled; they are the default now
- * because they win across every measured workload.  It is still a per-record
- * bounded-blocking spinlatch -- just without the helping/stealing the model
- * comment above describes, which the sole-driver regime makes dead code.
- *
- * Define URCU_MCAS_STOCK to revert to that historical helping/stealing install
- * for a regression A/B; a later cleanup will retire it.  The txn layer keys its
- * own defaults (age escalation, the k=3/1024-bit Bloom) on the same
- * URCU_MCAS_STOCK -- see <urcu/rcu-txn.h>.  Each flag is still individually
- * definable; the guards only fill in a default, so an explicit -D is honoured.
+ * The single-driver spinlatch above is the only install now.  The historical
+ * helping/stealing install and its URCU_MCAS_STOCK A/B switch (which toggled the
+ * former NO_HELP / NO_STEAL / AGE0_TRYLATCH study flags) have been retired -- the
+ * sole-driver regime won across every measured workload.  The txn layer's
+ * matching defaults (age escalation, the k=3/1024-bit Bloom) are likewise
+ * unconditional now -- see <urcu/rcu-txn.h>.
  */
-#ifndef URCU_MCAS_STOCK
-# ifndef URCU_MCAS_NO_HELP
-#  define URCU_MCAS_NO_HELP
-# endif
-# ifndef URCU_MCAS_NO_STEAL
-#  define URCU_MCAS_NO_STEAL
-# endif
-# ifndef URCU_MCAS_AGE0_TRYLATCH
-#  define URCU_MCAS_AGE0_TRYLATCH
-# endif
-#endif
 
 /*
  * Optional instrumentation hook.  Compiles to nothing unless the embedder
- * defines URCU_MCAS_STAT(counter) before including this header (the fairness
- * falsifier uses it to count helping/eviction/steal work).  Not part of the
+ * defines URCU_MCAS_STAT(counter) before including this header (the unit tests
+ * use it to count install-driver and escalation work).  Not part of the
  * engine contract.
  */
 #ifndef URCU_MCAS_STAT
@@ -187,14 +151,14 @@ extern "C" {
 
 /*
  * Single-edge escalation threshold.  A one-record transaction normally commits
- * with a bare CAS and no descriptor (cheap, but invisible to the priority /
- * steal protocol, so it can only win when the slot is plain -- it accrues no
- * priority and cannot break into a slot a multi-edge transaction keeps proxied).
+ * with a bare CAS and no descriptor (cheap, but it installs no proxy, so it can
+ * only win when the slot is already plain -- it cannot break into a slot a
+ * multi-edge transaction keeps proxied under its spinlatch).
  * Once such an op has retried this many times it stops taking the fast path and
  * commits through the full descriptor protocol instead, so it installs a real
- * proxy and contends on the same priority-ordered footing as everyone else (at
- * the cost of a descriptor and one grace period).  This lifts a *lockout*; it
- * does not make the op wait-free -- the engine is bounded-blocking, not wait-free.  The
+ * proxy and can hold the slot latched against contenders (at the cost of a
+ * descriptor and one grace period).  This lifts a *lockout*; it does not make
+ * the op wait-free -- the engine is bounded-blocking, not wait-free.  The
  * retry count the caller threads into urcu_mcas_create() drives this.
  */
 #ifndef URCU_MCAS_ESCALATE
@@ -202,63 +166,21 @@ extern "C" {
 #endif
 
 /*
- * Help-recursion depth cap.  drive_install() recurses to push a higher-priority
- * blocking transaction forward (see urcu_mcas_drive_install_depth()).  That
- * recursion is acyclic -- it follows the strict total priority order, so it can
- * only descend into a strictly-higher-priority transaction -- and is therefore
- * bounded by the number of concurrently-conflicting transactions; but that bound
- * is realized as real C-stack frames and scales with the writer count.
- *
- * Past this depth a helper does NOT spin on the blocker.  Spinning here would be
- * an unbounded wait on the blocker's *entire* transaction (arbitrary record
- * count, across arbitrarily many preemptions of its owner) -- categorically
- * unlike the install-latch spin, whose few-instruction window rseq time-slice
- * extension can cover; TSE does nothing for a whole-transaction-length wait.
- * Instead the capped helper ESCALATES: it CASes FAILED on the transaction it is
- * currently driving -- its own at depth 0; at deeper levels the intermediate
- * FOREIGN transaction it was helping (whose owner simply retries).  The abort
- * unwinds the descent, and an aborted own transaction retries with a higher
- * aging-priority; once the retrying
- * transaction out-retries the blocker it outranks it and evicts rather than helps,
- * so progress comes from the transaction's own escalation -- never from the
- * blocker's owner being scheduled.  Sound because the globally highest-priority
- * transaction never recurses (it always evicts), and ANY UNDECIDED transaction may
- * spuriously abort; helping is a latency optimization, not a progress requirement.
+ * Single-driver spinlatch: a transaction is driven only by its owner.  A
+ * committer that meets a FOREIGN proxy in one of its own record slots -- and a
+ * reader (urcu_mcas_read) that lands on an undecided proxy -- never drives,
+ * evicts, or steals it: the committer waits a bounded spin for the proxy's owner
+ * to settle the slot plain, then acquires it (the proxy is a pure spinlatch),
+ * and ESCALATES if the wait caps out -- aborts the transaction it is committing
+ * so it retries with a higher aging priority and, via the transaction
+ * front-end's fair-mutex fallback, eventually makes progress even against a
+ * preempted owner.  So there is exactly ONE driver per transaction: its owner,
+ * in commit(), sequential with its own settle().  The engine is therefore
+ * bounded-BLOCKING, not lock-free (a preempted owner blocks waiters until
+ * aging/fallback resolves it), which the measurements show wins anyway.
  */
-#ifndef URCU_MCAS_HELP_MAX_DEPTH
-#define URCU_MCAS_HELP_MAX_DEPTH 8
-#endif
-
-/*
- * -DURCU_MCAS_NO_HELP (prototype): never drive a FOREIGN transaction to a
- * decision -- neither a committer meeting a lower-priority proxy in one of its
- * own record slots, nor a reader (urcu_mcas_read) that lands on an undecided
- * proxy.  A thread that outranks the blocker still EVICTS it (status CAS) and
- * steals; a thread the blocker outranks WAITS on the blocker's status for a
- * bounded spin and then, if still undecided, ESCALATES exactly as the depth cap
- * does -- aborts the transaction it is committing so it retries with a higher
- * aging priority and eventually outranks and evicts the blocker.  So there is
- * exactly ONE driver per transaction: its owner, in commit(), sequential with
- * its own settle().
- *
- * That single-planter invariant is what the per-record install word
- * (FREE/BUSY/DONE) exists to enforce across MULTIPLE drivers; with one driver it
- * is unnecessary, and -DURCU_MCAS_NO_HELP is meant to be built together with
- * -DURCU_MCAS_NO_ABA_FIX (which drops both r->state CASes) to realize the cheap
- * install SAFELY -- the A-B-A / stale-first-install re-park the install word
- * guards against can only be produced by a second, stalled driver, which no-help
- * removes.  Progress is unaffected: the engine already treats helping as a
- * latency optimization, not a progress requirement (see the escalation note
- * above).  What changes is the guarantee: the engine becomes bounded-BLOCKING
- * (a preempted owner blocks waiters until aging lets one evict it), leaning on
- * that aging escalation and the transaction front-end's fair-mutex fallback
- * rather than on lock-free helping.  A stepping stone toward a no-steal,
- * plain-store install (the proxy as a pure spinlatch).
- */
-#if defined(URCU_MCAS_NO_HELP) || defined(URCU_MCAS_NO_STEAL)
-# ifndef URCU_MCAS_WAIT_PATIENCE
-#  define URCU_MCAS_WAIT_PATIENCE 8192	/* spins on a blocker's status before escalating */
-# endif
+#ifndef URCU_MCAS_WAIT_PATIENCE
+#define URCU_MCAS_WAIT_PATIENCE 8192	/* spins on a blocker's status before escalating */
 #endif
 
 enum urcu_mcas_status {
@@ -290,6 +212,14 @@ struct urcu_mcas_record {
 	 *
 	 *     FREE --(try-CAS)--> BUSY --(plant)--> DONE
 	 *     FREE --(settle claim)--------------> DONE
+	 *
+	 * VESTIGIAL under the single-driver engine: nothing helps, steals, or evicts
+	 * a foreign transaction, so no thread but the owner ever touches these words
+	 * and the state machine collapses to a bare value-CAS.  It is retained (and
+	 * still described below in its original multi-driver terms) pending the
+	 * deferred plant simplification; the age-0 fast path already skips it (see
+	 * urcu_mcas_drive_install_age0_flat).  The rest of this comment documents the
+	 * mechanism as designed, for that follow-up.
 	 *
 	 * The FREE->BUSY CAS is the install lock; DONE is the install-once gate.  It
 	 * guards EXACTLY this record's install, NOT the slot: the ops that REMOVE or
@@ -385,7 +315,7 @@ urcu_static_assert(!(__alignof__(struct urcu_mcas) % 16),
  * engine never mistakes a live value for one of its records.
  *
  * urcu_mcas_tag()/untag() take @tag explicitly; the installer passes the record's
- * own r->proxy_tag, and a reader/helper passes the (agreed) tag of the slot it is
+ * own r->proxy_tag, and a reader passes the (agreed) tag of the slot it is
  * resolving.
  */
 static inline
@@ -434,24 +364,6 @@ static inline
 unsigned long urcu_mcas_status(struct urcu_mcas *t)
 {
 	return uatomic_load(&t->status, CMM_ACQUIRE);
-}
-
-/*
- * Strict total priority order over two distinct transactions: the one that has
- * retried more wins; ties break by descriptor address (lower wins).  Both
- * fields are immutable for a descriptor's life, so the two parties to a slot
- * conflict compute the identical verdict -- the order is antisymmetric, so they
- * never each abort the other (which would livelock).  Returns true if @a
- * outranks @b.  @a and @b must differ (a txn never conflicts with itself: its
- * records target pairwise-distinct slots).
- */
-static inline
-bool urcu_mcas_outranks(const struct urcu_mcas *a,
-		const struct urcu_mcas *b)
-{
-	if (a->retry != b->retry)
-		return a->retry > b->retry;
-	return (uintptr_t) a < (uintptr_t) b;
 }
 
 /*
@@ -523,30 +435,11 @@ void *urcu_mcas_resolve(void *v, uintptr_t tag)
  *      after the full-barrier plant makes the owner's unconditional settle in
  *      commit() the backstop for the UNDECIDED case.
  *
- * Returns:
- *   1 -- we planted the proxy (caller advances; the steal site bumps its counter);
- *   2 -- @r was already installed (caller advances; no steal counted);
+ * Returns (nonzero -- advance; zero -- retry):
+ *   1 -- we planted the proxy;
+ *   2 -- @r was already installed;
  *   0 -- the CAS raced the slot away (caller re-reads and retries).
  */
-#ifdef URCU_MCAS_NO_ABA_FIX
-static inline
-int urcu_mcas_plant(struct urcu_mcas *t,
-		struct urcu_mcas_record *r, void *expect)
-{
-	void *tagv = urcu_mcas_tag(r, r->proxy_tag);
-
-	/*
-	 * Test knob: a bare value-CAS with no install-once gate, no self-settle,
-	 * and no settle-time claim (urcu_mcas_settle) -- the original A-B-A-unsafe
-	 * behaviour the install word closes.  For the
-	 * regression tests (build -DURCU_MCAS_NO_ABA_FIX); never in production.
-	 */
-	(void) t;
-	if (uatomic_cmpxchg(r->slot, expect, tagv) == expect)
-		return 1;
-	return 0;
-}
-#else
 static inline
 int urcu_mcas_plant(struct urcu_mcas *t,
 		struct urcu_mcas_record *r, void *expect)
@@ -607,82 +500,45 @@ wait:
 	uatomic_store(&r->state, URCU_MCAS_INSTALL_FREE, CMM_RELEASE);
 	return 0;				/* slot raced; r still un-installed */
 }
-#endif
 
 /*
  * Install phase: drive transaction @t to a terminal status (SUCCEEDED or
- * FAILED) by installing its records in slot-address order.  Each plant (plain
- * install or steal) goes through urcu_mcas_plant() under the record's install
- * latch (install-once); a plant that finds @t already terminal self-settles that
- * one record, but the bulk settle is left to the owner (urcu_mcas_settle), so
- * a terminal proxy may otherwise linger in a slot until its owner reclaims it;
- * readers and contenders resolve it through the status word rather than waiting
- * for a plain value.  Safe to call on one's own transaction or on any foreign one
- * met in a slot (helping its install forward, never bulk-settling it).  Idempotent
- * and re-entrant under the global install order: helping follows strictly
- * increasing slot addresses, so recursion is bounded by the number of
- * concurrently-conflicting transactions; a thread holds at most one record latch
- * at a time (helping/resolving runs outside the latch), so there is no
- * hold-and-wait.  That bound is still O(writers) of real stack, so the recursive
- * descent is additionally capped at URCU_MCAS_HELP_MAX_DEPTH (see the note there);
- * @depth is the current help-recursion depth (0 at the owner/reader entry).
+ * FAILED) by installing its records in slot-address order.  Each install goes
+ * through urcu_mcas_plant() under the record's install latch (install-once).  The
+ * owner is the sole driver -- no helping, no stealing -- so a foreign proxy met
+ * in a slot is a spinlatch it waits out (bounded) or escalates past, never one it
+ * drives.  The owner's own settle (urcu_mcas_settle) converts its planted proxies
+ * to plain values; until then a terminal proxy is resolved by readers and
+ * contenders through the status word rather than waited on.
  */
 /*
  * Drive @t to a terminal status (SUCCEEDED or FAILED): @t's OWN decision, taken
- * by its driver.  With help and stealing present this races other drivers
- * (helpers deciding, evictors failing @t), so it is a CAS off UNDECIDED --
- * whoever wins publishes the decision.  Under -DURCU_MCAS_NO_STEAL AND
- * -DURCU_MCAS_NO_HELP the owner is the SOLE writer of its status (no evictor, no
- * helper) and writes it at most once per drive, so the CAS collapses to a plain
- * RELEASE store -- the commit point, like existence's group-word flip.  RELEASE
- * so the planted proxies and committed values publish before a reader can
- * observe the terminal status.  Used only for @t's own status; a foreign
- * eviction (&e->status) stays an explicit CAS, and is compiled out under
- * no-steal anyway.
+ * by its owner.  With no helper and no evictor the owner is the SOLE writer of
+ * its status and writes it at most once per drive, so this is a plain RELEASE
+ * store -- the commit point, like existence's group-word flip.  RELEASE so the
+ * planted proxies and committed values publish before a reader can observe the
+ * terminal status.
  */
 static inline
 void urcu_mcas_decide(struct urcu_mcas *t, unsigned long to)
 {
-#if defined(URCU_MCAS_NO_STEAL) && defined(URCU_MCAS_NO_HELP)
 	/*
 	 * Sole-writer invariant: @t is written only by its owner, at most once
 	 * per drive (every FAILED site returns immediately; SUCCEEDED is only
 	 * reached once, after the record loop).  So the status MUST be UNDECIDED
 	 * here -- a plain store would otherwise clobber an already-published
-	 * decision, exactly the case the CAS's UNDECIDED guard makes a no-op.
-	 * Assert it (debug-only) so any future path that breaks single-writer --
-	 * or reaches a decision twice -- trips instead of silently overwriting.
+	 * decision.  Assert it (debug-only) so any future path that breaks
+	 * single-writer -- or reaches a decision twice -- trips instead of
+	 * silently overwriting.
 	 */
 	urcu_assert_debug(urcu_mcas_status(t) == URCU_MCAS_UNDECIDED);
 	uatomic_store(&t->status, to, CMM_RELEASE);
-#else
-	(void) uatomic_cmpxchg(&t->status, URCU_MCAS_UNDECIDED, to);
-#endif
 }
 
 /*
- * The age-0 sole-driver install is FLAT AUTOMATICALLY under the spinlatch
- * (NO_HELP + NO_STEAL) with age-0 optimism (AGE0_TRYLATCH): it is the install
- * implementation of that regime, not a separate knob.  Derived here so no build
- * needs to opt in; the guard below still catches a manual -DURCU_MCAS_AGE0_FLAT
- * without the spinlatch.
- */
-#if defined(URCU_MCAS_NO_HELP) && defined(URCU_MCAS_NO_STEAL) && \
-	defined(URCU_MCAS_AGE0_TRYLATCH)
-# ifndef URCU_MCAS_AGE0_FLAT
-#  define URCU_MCAS_AGE0_FLAT
-# endif
-#endif
-#if defined(URCU_MCAS_AGE0_FLAT) && \
-	!(defined(URCU_MCAS_NO_HELP) && defined(URCU_MCAS_NO_STEAL))
-# error "URCU_MCAS_AGE0_FLAT requires NO_HELP + NO_STEAL (sole driver): the install latch and self-settle it drops are only dead code when no helper or thief can touch a record"
-#endif
-
-#ifdef URCU_MCAS_AGE0_FLAT
-/*
  * Age-0 sole-driver install, FLAT over the records: no per-record install latch,
- * no state machine, no self-settle, no pre-CAS slot load.  Preconditions: NO_HELP
- * + NO_STEAL (asserted above) and retry == 0 (the caller dispatches).
+ * no state machine, no self-settle, no pre-CAS slot load.  Precondition:
+ * retry == 0 (the caller dispatches).
  *
  * Plant each record with ONE strong try-CAS (slot: old_ptr -> our proxy), OR the
  * outcome into @fail, and bail at the FIRST conflict.  The goal is not "no
@@ -702,8 +558,8 @@ void urcu_mcas_decide(struct urcu_mcas *t, unsigned long to)
  *
  *   - The install latch / install-once gate and the self-settle exist only to
  *     make a FOREIGN driver's stale re-plant or late first install inert (see
- *     urcu_mcas_plant).  Under NO_HELP + NO_STEAL no foreign thread ever plants,
- *     steals, or settles our records, so none of those hazards can arise and the
+ *     urcu_mcas_plant).  Under single-driver no foreign thread ever plants,
+ *     drives, or settles our records, so none of those hazards can arise and the
  *     word is dead -- a bare value-CAS suffices.
  *   - We never WAIT on a foreign proxy (the CAS fails and we bail), so there is
  *     no hold-and-wait and the records need no slot-address sort.
@@ -741,32 +597,23 @@ unsigned int urcu_mcas_drive_install_age0_flat(struct urcu_mcas *t)
 			CMM_RELEASE);
 	return i;			/* planted count: nr on success, fail index on abort */
 }
-#endif	/* URCU_MCAS_AGE0_FLAT */
 
 static inline
-void urcu_mcas_drive_install_depth(struct urcu_mcas *t, unsigned int depth,
-		unsigned int *plantedp)
+void urcu_mcas_drive_install_depth(struct urcu_mcas *t, unsigned int *plantedp)
 {
 	unsigned long st = urcu_mcas_status(t);
 	unsigned int i;
 
 	URCU_MCAS_STAT(drive);
-#ifdef URCU_MCAS_NO_STEAL
-	(void) depth;			/* no help recursion under no-steal */
-#endif
-#if defined(URCU_MCAS_NO_HELP) && defined(URCU_MCAS_NO_STEAL)
 	/*
-	 * Sole driver (NO_HELP + NO_STEAL): record how far we plant so the owner's
-	 * settle converts exactly [0..*plantedp) with a plain store and never touches
-	 * the un-planted tail (a FAILED drive stops at a foreign proxy).  *plantedp is
-	 * always valid -- the wrapper passes a local (readers ignore its result); a
-	 * commit passes settle the same value, and since drive+settle run on one
-	 * thread with nothing driving @t in between, no persistent field is needed.
+	 * Sole driver: record how far we plant so the owner's settle converts
+	 * exactly [0..*plantedp) with a plain store and never touches the un-planted
+	 * tail (a FAILED drive stops at a foreign proxy).  *plantedp is always valid
+	 * -- the wrapper passes a local (readers ignore its result); a commit passes
+	 * settle the same value, and since drive+settle run on one thread with nothing
+	 * driving @t in between, no persistent field is needed.
 	 */
 	*plantedp = 0;
-#else
-	(void) plantedp;		/* helpers/steals: settle keeps the load-test */
-#endif
 
 	if (st != URCU_MCAS_UNDECIDED)
 		return;			/* already terminal */
@@ -780,7 +627,7 @@ void urcu_mcas_drive_install_depth(struct urcu_mcas *t, unsigned int depth,
 
 			st = urcu_mcas_status(t);
 			if (st != URCU_MCAS_UNDECIDED)
-				return;		/* decided by a helper/evictor */
+				return;		/* defensive: owner is the sole decider */
 			v = uatomic_load(r->slot, CMM_ACQUIRE);
 			if (v == tagv)
 				break;		/* already installed */
@@ -792,31 +639,24 @@ void urcu_mcas_drive_install_depth(struct urcu_mcas *t, unsigned int depth,
 				struct urcu_mcas_record *fr =
 					urcu_mcas_untag(v, r->proxy_tag);
 				struct urcu_mcas *e = fr->mcas;
-#ifndef URCU_MCAS_NO_STEAL
-				unsigned long est;
-				void *resolved;
-#endif
 
 				if (e == t)
 					break;	/* own proxy (distinct-slot inv.) */
-#ifdef URCU_MCAS_AGE0_TRYLATCH
 				if (t->retry == 0) {
 					/*
 					 * Age-0 try-latch: a foreign proxy is
-					 * contention.  Never wait / help / steal --
-					 * fail fast and let the caller escalate to
-					 * age 1 (sorted, blocking install).  Because
-					 * age 0 never waits on a foreign proxy there
-					 * is no hold-and-wait, so its records need no
+					 * contention.  Never wait -- fail fast and
+					 * let the caller escalate to age 1 (sorted,
+					 * blocking install).  Because age 0 never
+					 * waits on a foreign proxy there is no
+					 * hold-and-wait, so its records need no
 					 * slot-address sort to stay deadlock-free.
 					 */
 					urcu_mcas_decide(t, URCU_MCAS_FAILED);
 					return;
 				}
-#endif
-#ifdef URCU_MCAS_NO_STEAL
 				/*
-				 * No-steal: never displace E's proxy.  Wait for
+				 * Never displace E's proxy.  Wait for
 				 * E's owner to SETTLE this slot to a plain value,
 				 * then re-read and acquire it plainly -- the proxy
 				 * is a pure spinlatch.  Records are installed in
@@ -840,7 +680,7 @@ void urcu_mcas_drive_install_depth(struct urcu_mcas *t, unsigned int depth,
 								URCU_MCAS_UNDECIDED)
 							return;
 						if (patience-- == 0) {
-							URCU_MCAS_STAT(help_capped);
+							URCU_MCAS_STAT(wait_capped);
 							urcu_mcas_decide(t,
 								URCU_MCAS_FAILED);
 							return;
@@ -849,111 +689,6 @@ void urcu_mcas_drive_install_depth(struct urcu_mcas *t, unsigned int depth,
 					}
 					continue;	/* slot plain now: re-read + acquire */
 				}
-#else
-				est = urcu_mcas_status(e);
-				if (est == URCU_MCAS_UNDECIDED) {
-					if (!urcu_mcas_outranks(t, e)) {
-#ifdef URCU_MCAS_NO_HELP
-						/*
-						 * No-help: do NOT drive E.  Wait a
-						 * bounded spin for E's own owner to
-						 * decide it, then fall through to resolve
-						 * -- and if it stays undecided past the
-						 * cap (its owner is stalled), escalate
-						 * exactly as the help cap does: abort T so
-						 * it retries higher-ranked and later
-						 * outranks and evicts E.  Single driver
-						 * per transaction; see URCU_MCAS_NO_HELP.
-						 */
-						unsigned int patience =
-							URCU_MCAS_WAIT_PATIENCE;
-
-						while ((est = urcu_mcas_status(e)) ==
-								URCU_MCAS_UNDECIDED) {
-							if (patience-- == 0) {
-								/*
-								 * Multi-driver path (eviction still
-								 * live here): a racing evictor may
-								 * have failed @t already, so this
-								 * must stay a CAS, not urcu_mcas_decide.
-								 */
-								URCU_MCAS_STAT(help_capped);
-								uatomic_cmpxchg(&t->status,
-									URCU_MCAS_UNDECIDED,
-									URCU_MCAS_FAILED);
-								return;
-							}
-							caa_cpu_relax();
-						}
-						/* est terminal: fall through to resolve. */
-#else
-						/*
-						 * E outranks us: help it decide
-						 * (install only), then re-read -- but
-						 * cap the C-stack descent.  Past the cap
-						 * we do NOT spin on E: that is an
-						 * unbounded wait on E's whole transaction,
-						 * not a TSE-coverable few-insn window like
-						 * the install latch.  Escalate instead --
-						 * abort T (FAILED) so the caller retries
-						 * with a higher aging-priority; once T
-						 * out-retries E it outranks and evicts E,
-						 * so progress never hinges on E's owner
-						 * being scheduled.
-						 */
-						if (depth >= URCU_MCAS_HELP_MAX_DEPTH) {
-							URCU_MCAS_STAT(help_capped);
-							uatomic_cmpxchg(&t->status,
-								URCU_MCAS_UNDECIDED,
-								URCU_MCAS_FAILED);
-							return;
-						}
-						urcu_mcas_drive_install_depth(e,
-							depth + 1, plantedp);
-						continue;
-#endif
-					} else {
-						/* We outrank E: evict the lower priority. */
-						URCU_MCAS_STAT(evict);
-						uatomic_cmpxchg(&e->status,
-							URCU_MCAS_UNDECIDED,
-							URCU_MCAS_FAILED);
-						est = urcu_mcas_status(e);
-					}
-				}
-				/*
-				 * E is terminal now (possibly still unsettled --
-				 * owner-only settle).  It resolves this slot to its
-				 * new (SUCCEEDED) or old (FAILED).
-				 */
-				resolved = (est == URCU_MCAS_SUCCEEDED) ?
-						fr->new_ptr : fr->old_ptr;
-				if (resolved != r->old_ptr) {
-					/* read-set invalid -> abort this txn */
-					uatomic_cmpxchg(&t->status,
-						URCU_MCAS_UNDECIDED,
-						URCU_MCAS_FAILED);
-					return;
-				}
-				/*
-				 * Steal E's terminal proxy: our parked record
-				 * replaces it directly, never through a plain value
-				 * a newcomer could grab.  Sound because the slot's
-				 * logical value (resolved == r->old_ptr) is unchanged
-				 * by the handoff.  Under r's install latch (NOT E's --
-				 * displacing E's proxy is a lock-free CAS that races
-				 * E's owner-only settle harmlessly), with install-once
-				 * so a stale re-steal after @t linearizes is inert.
-				 */
-				URCU_MCAS_PREINSTALL(t, r);
-				planted = urcu_mcas_plant(t, r, v);
-				if (planted) {
-					if (planted == 1)
-						URCU_MCAS_STAT(steal);
-					break;	/* installed (or already) */
-				}
-				continue;	/* raced (settled / stolen): re-read */
-#endif	/* URCU_MCAS_NO_STEAL */
 			}
 			if (v != r->old_ptr) {
 				/* read-set invalid -> abort this txn */
@@ -971,34 +706,28 @@ void urcu_mcas_drive_install_depth(struct urcu_mcas *t, unsigned int depth,
 				break;		/* installed (or already) */
 			/* raced: slot changed under us -> re-evaluate */
 		}
-#if defined(URCU_MCAS_NO_HELP) && defined(URCU_MCAS_NO_STEAL)
 		/*
 		 * Record i now holds our proxy.  A FAILED return leaves this at the
 		 * last-planted count = the failing index (records [0..i-1] done); on
 		 * SUCCESS it reaches t->nr, so settle can loop [0..*plantedp) either way.
 		 */
 		*plantedp = i + 1;
-#endif
 	}
 	/* every record installed -> commit */
 	urcu_mcas_decide(t, URCU_MCAS_SUCCEEDED);
 }
 
 /*
- * Owner/reader entry point: drive @t to a terminal status, starting a fresh
- * help-recursion budget (depth 0).  Callers outside the engine use this; the
- * recursive helping path re-enters urcu_mcas_drive_install_depth() directly.
- *
- * Returns the number of records this drive planted (sole-driver only, for the
- * owner's settle -- see urcu_mcas_settle()); readers ignore it.  Under any engine
- * with helpers or steals the count is not meaningful and settle does not use it.
+ * Owner/reader entry point: drive @t to a terminal status.  Returns the number
+ * of records this drive planted, for the owner's settle (see urcu_mcas_settle());
+ * readers ignore it.
  */
 static inline
 unsigned int urcu_mcas_drive_install(struct urcu_mcas *t)
 {
 	unsigned int planted = 0;
 
-	urcu_mcas_drive_install_depth(t, 0, &planted);
+	urcu_mcas_drive_install_depth(t, &planted);
 	return planted;
 }
 
@@ -1006,34 +735,13 @@ unsigned int urcu_mcas_drive_install(struct urcu_mcas *t)
  * Settle phase (owner, in commit()): make @t's own slots plain -- its new value
  * on SUCCEEDED, its old on FAILED.  Called once @t is terminal.
  *
- * Per record, settle first CLAIMS the install word (FREE -> DONE), then converts
- * the slot.  The claim is what makes the reclaim contract unconditional: after
- * settle returns, every record's install word is DONE, so NO plant can begin --
- * in particular a stale FIRST install by a driver that read @t UNDECIDED, loaded
- * the slot, stalled, and resumed after @t was evicted and settled.  Such a plant
- * fails its FREE->BUSY CAS against DONE and returns "already installed" without
- * touching the slot.  Without the claim, that stale plant would transiently
- * REPUBLISH a proxy of the already-retired @t (its self-settle removes it again,
- * but not atomically with the plant), and a reader whose read-side section began
- * after the owner's call_rcu() -- one the grace period does not wait for --
- * could resolve that proxy and dereference @t after the GP ends: use-after-free.
- * The install-once gate alone cannot close this: it stops a stale SECOND install
- * of a planted record, but a never-planted record's word is still FREE.  The
- * claim turns "no proxy lingers" into "no proxy can appear at all", which is
- * what reclaim needs -- once settle returns, no slot names a record of @t and
- * none ever will again, so the descriptor can be reclaimed.
- *
- * A record caught BUSY (a planter between its FREE->BUSY and its DONE store) is
- * spun out -- the same bounded few-instruction window the install latch already
- * tolerates in urcu_mcas_plant().  That planter either fails its slot CAS and
- * releases FREE (settle then claims it), or plants and -- @t being terminal --
- * self-settles before storing DONE, so the slot is already plain when settle's
- * own slot CAS runs (it just fails, ignored).  A slot a higher-priority
- * transaction already stole holds that thief's proxy; that CAS fails and is
- * ignored too.  Claiming FREE->DONE cannot forge a bogus commit: the final
- * UNDECIDED->SUCCEEDED CAS in drive_install fails because @t is already
- * terminal whenever settle runs.  Settle is idempotent and owner-only; it
- * never waits while holding a latch (the claim IS the terminal state).
+ * As the sole driver of @t we planted exactly [0..@planted) (drive_install
+ * returned the count) and nothing helps, steals, or self-settles our records, so
+ * settle just converts that prefix with plain RELEASE stores.  The reclaim
+ * contract -- no proxy of @t names a slot once settle returns -- holds because we
+ * planted only that prefix and convert all of it; the un-planted tail is a
+ * foreign proxy (or a slot we never reached) and is left untouched.  Settle is
+ * owner-only and never waits.
  */
 static inline
 void urcu_mcas_settle(struct urcu_mcas *t, unsigned int planted)
@@ -1041,17 +749,16 @@ void urcu_mcas_settle(struct urcu_mcas *t, unsigned int planted)
 	unsigned long st = urcu_mcas_status(t);
 	unsigned int i;
 
-#if defined(URCU_MCAS_NO_HELP) && defined(URCU_MCAS_NO_STEAL)
 	/*
-	 * Sole driver (NO_HELP + NO_STEAL): the drive told us it planted exactly
-	 * [0..@planted) -- @planted == t->nr on SUCCESS, the failing index on a
-	 * partial FAILED drive.  Every one of those slots still holds OUR proxy:
-	 * nothing helps or steals, and no plant self-settles while @t stays
-	 * UNDECIDED through the whole drive.  So convert each with a plain RELEASE
-	 * store -- no load-test, no CAS.  The un-planted tail [@planted..nr) (a
-	 * foreign proxy where the drive stopped, or a slot we never reached) is
-	 * simply not visited, so nothing there is clobbered, and no proxy of @t
-	 * lingers past settle -- the reclaim contract holds because we planted none.
+	 * Sole driver: the drive told us it planted exactly [0..@planted) --
+	 * @planted == t->nr on SUCCESS, the failing index on a partial FAILED
+	 * drive.  Every one of those slots still holds OUR proxy: nothing helps or
+	 * steals, and no plant self-settles while @t stays UNDECIDED through the
+	 * whole drive.  So convert each with a plain RELEASE store -- no load-test,
+	 * no CAS.  The un-planted tail [@planted..nr) (a foreign proxy where the
+	 * drive stopped, or a slot we never reached) is simply not visited, so
+	 * nothing there is clobbered, and no proxy of @t lingers past settle -- the
+	 * reclaim contract holds because we planted none.
 	 */
 	for (i = 0; i < planted; i++) {
 		struct urcu_mcas_record *r = &t->recs[i];
@@ -1059,52 +766,14 @@ void urcu_mcas_settle(struct urcu_mcas *t, unsigned int planted)
 
 		uatomic_store(r->slot, want, CMM_RELEASE);
 	}
-#else
-	(void) planted;			/* helpers/steals: re-derive per slot below */
-	for (i = 0; i < t->nr; i++) {
-		struct urcu_mcas_record *r = &t->recs[i];
-		void *want = (st == URCU_MCAS_SUCCEEDED) ? r->new_ptr : r->old_ptr;
-		void *tagv = urcu_mcas_tag(r, r->proxy_tag);
-
-#if !defined(URCU_MCAS_NO_ABA_FIX) && !defined(URCU_MCAS_NO_STEAL)
-		/*
-		 * Claim r's install word (FREE -> DONE) so no plant can begin
-		 * once settle returns (see above), spinning out a planter's
-		 * bounded BUSY window.
-		 */
-		for (;;) {
-			int v = uatomic_cmpxchg(&r->state,
-					URCU_MCAS_INSTALL_FREE,
-					URCU_MCAS_INSTALL_DONE);
-
-			if (v != URCU_MCAS_INSTALL_BUSY)
-				break;		/* claimed FREE, or already DONE */
-			while (uatomic_load(&r->state, CMM_RELAXED) ==
-					URCU_MCAS_INSTALL_BUSY)
-				caa_cpu_relax();
-		}
-#endif
-#ifdef URCU_MCAS_NO_STEAL
-		/*
-		 * No-steal but help on: no thief displaces our proxy, but a helper
-		 * may have planted records we did not, so we cannot trust a planted
-		 * count -- load-test each slot and release only our own proxy.
-		 */
-		if (uatomic_load(r->slot, CMM_RELAXED) == tagv)
-			uatomic_store(r->slot, want, CMM_RELEASE);
-#else
-		(void) uatomic_cmpxchg(r->slot, tagv, want);
-#endif
-	}
-#endif
 }
 
 /*
  * Load @slot and return the value it currently denotes: a plain value as-is, or,
  * for a parked record, the value resolved through its transaction's status.  If
- * that transaction is still UNDECIDED, help drive its install to a decision
- * first (so the returned value is stable), but never settle it -- the proxy is
- * left in place (owner-only settle) and the value returned is the *logical* one.
+ * that transaction is still UNDECIDED, wait a bounded spin for its owner to
+ * decide it (so the returned value is stable), but never drive or settle it --
+ * the proxy is owner-only, and the value returned is the *logical* one.
  * Use this to read the current value of a word you intend to transact (its old);
  * commit() then reconciles that logical old against whatever physical value --
  * plain or a foreign proxy -- the slot holds at install time.  Call within an
@@ -1122,15 +791,14 @@ void *urcu_mcas_read(void **slot, uintptr_t tag)
 		e = urcu_mcas_untag(v, tag)->mcas;
 		if (urcu_mcas_status(e) != URCU_MCAS_UNDECIDED)
 			return urcu_mcas_resolve(v, tag);	/* terminal: logical value */
-#ifdef URCU_MCAS_NO_HELP
 		{
 			/*
-			 * No-help: never drive E.  Wait a bounded spin for E's
-			 * owner to decide it, then loop to re-read (the freshest
-			 * value); if it stays undecided past the cap, return its
-			 * logical value (E's old) -- for a read-set caller that is
-			 * an optimistic old, reconciled at commit exactly like
-			 * urcu_mcas_read_optimistic().  See URCU_MCAS_NO_HELP.
+			 * Never drive E.  Wait a bounded spin for E's owner to
+			 * decide it, then loop to re-read (the freshest value); if
+			 * it stays undecided past the cap, return its logical value
+			 * (E's old) -- for a read-set caller that is an optimistic
+			 * old, reconciled at commit exactly like
+			 * urcu_mcas_read_optimistic().
 			 */
 			unsigned int patience = URCU_MCAS_WAIT_PATIENCE;
 
@@ -1141,42 +809,36 @@ void *urcu_mcas_read(void **slot, uintptr_t tag)
 			}
 			continue;	/* E decided: re-read for the freshest value */
 		}
-#else
-		urcu_mcas_drive_install(e);		/* help decide, then re-read */
-#endif
 	}
 }
 
 /*
- * Load @slot and return the value it currently denotes, WITHOUT helping an
- * undecided transaction to a decision: the non-blocking counterpart of
- * urcu_mcas_read().
+ * Load @slot and return the value it currently denotes, WITHOUT waiting on an
+ * undecided transaction: the non-blocking counterpart of urcu_mcas_read().
  *
- * An UNDECIDED transaction has not linearized, so a slot parked with its proxy
- * still logically holds that record's old_ptr -- exactly what urcu_mcas_resolve()
- * returns.  The caller therefore linearizes ahead of E's commit and moves on,
- * rather than driving E's whole install (every record, every latch) just to read
- * one word.  Under N-way contention on a shared slot that helping is quadratic:
- * each arrival drags itself through the victim's entire transaction.
+ * A slot parked with an UNDECIDED transaction's proxy still logically holds that
+ * record's old_ptr -- exactly what urcu_mcas_resolve() returns.  This reader
+ * takes that logical old and moves on immediately, where urcu_mcas_read() would
+ * first spin a bounded number of times for the owner to settle the slot plain.
  *
  * What this gives up against urcu_mcas_read() is only STABILITY of the returned
  * value, never safety:
  *
  *   - It is not weaker for observers.  A plain reader already resolves each slot
  *     against E's status at the moment it looks, so a walk spanning two of E's
- *     slots across E's commit could always straddle it.  urcu_mcas_read() does
- *     not fix that either: it helps E decide, but a *later* slot may be parked by
+ *     slots across E's commit could always straddle it.  The bounded wait in
+ *     urcu_mcas_read() does not fix that either: a *later* slot may be parked by
  *     a different transaction that commits in between.
  *
  *   - It is safe for a transaction's read set.  The logical old returned here is
  *     reconciled at install: commit() re-reads the slot, resolves whatever proxy
  *     it finds, and compares against the recorded old_ptr -- a value that has
- *     since changed aborts, one that has not is stolen.  A stale optimistic read
+ *     since changed aborts, one that has not is taken.  A stale optimistic read
  *     is therefore an extra abort, never a wrong commit.
  *
- *   - Progress is unaffected.  urcu_mcas_drive_install() still helps at INSTALL
- *     time, so a descheduled owner's proxies are still driven to a decision by
- *     whoever needs the slot; only the read stops paying for it.
+ *   - Progress is unaffected.  A descheduled owner's proxy is resolved to its
+ *     logical value on sight rather than blocking the reader at all; only the
+ *     stability spin is skipped.
  *
  * Prefer this for traversal -- reads whose value feeds a search and will be
  * validated at commit.  Prefer urcu_mcas_read() when the caller needs the value
@@ -1310,10 +972,13 @@ void urcu_mcas_free(struct urcu_mcas *t)
 
 /*
  * Create a transaction with room for @cap records.  @retry is the caller's
- * aging-priority: the number of times this logical operation has already retried
- * (0 on the first attempt, incremented and passed back in on each retry).  A
- * higher value wins contended slots, so a starved operation eventually cannot be
- * bypassed -- see urcu_mcas_outranks().
+ * aging count: the number of times this logical operation has already retried
+ * (0 on the first attempt, incremented and passed back in on each retry).  It
+ * selects the install strategy -- retry 0 takes the flat fail-fast install
+ * (never waits on a foreign proxy), retry >= 1 takes the sorted blocking install
+ * that waits out a foreign proxy's owner -- and drives the single-edge escalation
+ * threshold (URCU_MCAS_ESCALATE), so a starved single-record op eventually stops
+ * taking the bare-CAS fast path and commits through a real proxy instead.
  */
 static inline
 struct urcu_mcas *urcu_mcas_create(unsigned int cap,
@@ -1533,12 +1198,13 @@ void urcu_mcas_sort(struct urcu_mcas *t)
  * through @call_rcu_fn (the flavor's call_rcu); an un-escalated single-edge
  * transaction commits with a bare CAS and frees immediately (no proxy, no grace
  * period).  A single-edge op that has retried past URCU_MCAS_ESCALATE falls
- * through to the full descriptor path so it installs a real proxy and contends
- * on the same priority-ordered footing as everyone else, instead of being shut
- * out of a slot a multi-edge op keeps proxied.  (This lifts a lockout; like any
- * transaction here it remains bounded-blocking, not wait-free.)
+ * through to the full descriptor path so it installs a real proxy and can hold
+ * the slot latched against contenders, instead of being shut out of a slot a
+ * multi-edge op keeps proxied.  (This lifts a lockout; like any transaction
+ * here it remains bounded-blocking, not wait-free.)
  *
- * Call within an RCU read-side section (descriptor existence for helpers).
+ * Call within an RCU read-side section (descriptor existence for concurrent
+ * readers).
  */
 static inline
 bool urcu_mcas_commit(struct urcu_mcas *t,
@@ -1578,20 +1244,16 @@ bool urcu_mcas_commit(struct urcu_mcas *t,
 	}
 	if (t->nr == 1)
 		URCU_MCAS_STAT(escalate);	/* single edge, retried past the threshold */
-#ifdef URCU_MCAS_AGE0_TRYLATCH
 	/*
-	 * Age 0 installs optimistically with a try-latch (see drive_install): it
-	 * never waits on a foreign proxy, so its records need no slot-address sort
-	 * to be deadlock-free.  Age 1+ sorts and installs under the blocking rule.
+	 * Age 0 installs optimistically (see drive_install): it never waits on a
+	 * foreign proxy, so its records need no slot-address sort to be
+	 * deadlock-free.  Age 1+ sorts and installs under the blocking rule.
 	 */
 	if (t->retry != 0)
 		urcu_mcas_sort(t);
-#else
-	urcu_mcas_sort(t);
-#endif
 	/*
 	 * Engine precondition: a transaction's records must target pairwise-
-	 * distinct slots (the install/steal protocol's "own proxy"
+	 * distinct slots (the install protocol's "own proxy"
 	 * short-circuit and the read-set checks assume it).  After the
 	 * slot-address sort a duplicate shows up as an adjacent equal slot, so
 	 * a single linear pass catches an embedder that buffered the same slot
@@ -1618,7 +1280,6 @@ bool urcu_mcas_commit(struct urcu_mcas *t,
 	 * exactly our planted prefix with a plain store; the load-test settle ignores
 	 * it.  Both are static inline, so the value is threaded for free.
 	 */
-#ifdef URCU_MCAS_AGE0_FLAT
 	/*
 	 * Age 0 (sole driver): flat install -- one try-CAS per record, bail at the
 	 * first conflict, decide arithmetically.  It returns its planted prefix length
@@ -1629,9 +1290,6 @@ bool urcu_mcas_commit(struct urcu_mcas *t,
 		planted = urcu_mcas_drive_install_age0_flat(t);
 	else
 		planted = urcu_mcas_drive_install(t);
-#else
-	planted = urcu_mcas_drive_install(t);	/* install to a decision (helpers help) */
-#endif
 	urcu_mcas_settle(t, planted);		/* owner-only: make our own slots plain */
 	committed = urcu_mcas_status(t) == URCU_MCAS_SUCCEEDED;
 	call_rcu_fn(&t->rcu_head, urcu_mcas_free_rcu);
