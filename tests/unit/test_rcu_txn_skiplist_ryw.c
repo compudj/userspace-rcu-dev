@@ -359,6 +359,13 @@ static void test_whitebox_chain(void)
 
 	urcu_txn_init(&txn, &g_dom);
 	urcu_txn_enable_ryw(&txn);
+	/*
+	 * A deliberate same-slot chaining txn is an expect-conflict txn: under an
+	 * AGE_ESCALATE build age 0 would optimistically escalate instead of chaining,
+	 * so declare the conflict to exercise the age-1 chaining path this whitebox
+	 * asserts.  Inert (a no-op) in a stock build.
+	 */
+	urcu_txn_expect_conflict(&txn);
 	urcu_txn_begin(&txn);
 	/* Delete first, then insert immediately before the deleted node. */
 	if (urcu_txn_skiplist_del_prepare(&txn, &sl, &k1, &removed))
@@ -410,6 +417,7 @@ static void test_whitebox_retarget(void)
 
 	urcu_txn_init(&txn, &g_dom);
 	urcu_txn_enable_ryw(&txn);
+	urcu_txn_expect_conflict(&txn);	/* same-slot chaining: force the age-1 path (see whitebox_chain) */
 	urcu_txn_begin(&txn);
 	if (urcu_txn_skiplist_insert_prepare(&txn, &sl, &new0->sl, &new0->key))
 		abort();

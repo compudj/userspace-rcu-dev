@@ -145,6 +145,13 @@ int main(void)
 	g_w = VX;
 	urcu_txn_init(&tx, NULL);
 	urcu_txn_set_ryw(&tx, 1);
+	/*
+	 * Same-slot store+validate is a deliberate self-conflict: under an
+	 * AGE_ESCALATE build age 0 would escalate on the coincidence rather than
+	 * chain into one record, so declare it to exercise the age-1 chaining path
+	 * this asserts.  Inert (a no-op) in a stock build.
+	 */
+	urcu_txn_expect_conflict(&tx);
 	urcu_txn_begin(&tx);
 	urcu_txn_store(&tx, &g_w, VX, VZ, URCU_MCAS_TAG);
 	vv = urcu_txn_load_validate(&tx, &g_w, URCU_MCAS_TAG);

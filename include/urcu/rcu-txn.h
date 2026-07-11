@@ -552,6 +552,20 @@ struct urcu_mcas_txn {
 					 * a violation corrupts (adds a duplicate
 					 * record) unless URCU_TXN_DEBUG_DISJOINT traps
 					 * it.  Independent of txn->ryw. */
+	int expect_conflict;		/* caller expects this txn to conflict -- the
+					 * negative dual of disjoint.  Two shapes: dense
+					 * read-your-own-writes by construction (batched
+					 * adjacent edits on an ordered structure, whose
+					 * consecutive keys share a predecessor slot so the
+					 * composed edits always alias -- a skiplist range
+					 * move), or contention heavy enough that the non-
+					 * blocking age-0 install fail-fasts more than it
+					 * commits.  Makes age 0 skip the optimistic path
+					 * (skip-find/blind-append AND skip-sort/try-latch
+					 * install) so a doomed attempt is never spent; runs
+					 * the sorted, blocking path from the first attempt.
+					 * Set with urcu_txn_expect_conflict() before begin();
+					 * a no-op outside AGE_ESCALATE. */
 #ifdef URCU_TXN_AGE_ESCALATE
 	int esc_pending;		/* the age-0 optimistic attempt saw a same-slot
 					 * coincidence (RAW/WAW, or a Bloom FP) and must
@@ -724,6 +738,7 @@ void urcu_txn_init_flavor(struct urcu_mcas_txn *txn,
 	txn->retrying = 0;
 	txn->ryw = URCU_TXN_RYW_DEFAULT;
 	txn->disjoint = 0;
+	txn->expect_conflict = 0;
 	/* ryw_bloom is (re)zeroed by begin() when ryw is on; a non-RYW handle
 	 * never reads it, so init leaves it untouched. */
 #ifdef URCU_TXN_AGE_ESCALATE
@@ -819,6 +834,50 @@ static inline
 void urcu_txn_declare_disjoint(struct urcu_mcas_txn *txn)
 {
 	txn->disjoint = 1;
+}
+
+/*
+ * The negative dual of declare_disjoint(): assert that this handle's transactions
+ * are EXPECTED to conflict, so the optimistic age-0 attempt is not worth trying.
+ * Two shapes want this.  (1) A txn whose own read-your-own-writes is dense by
+ * construction -- batched adjacent edits on an ordered structure, where the
+ * rotation maps one edit's destination onto the next's source so consecutive keys
+ * always share a predecessor slot (a skiplist range move): age 0 then reads its
+ * own pending write, sets esc_pending, and aborts in the descent every time.  (2)
+ * A txn run under contention heavy enough that the non-blocking age-0 install
+ * fail-fasts more often than it commits.  In both, the age-0 attempt is spent only
+ * to abort; expect_conflict skips it and runs the sorted, find-resolved, blocking
+ * path from the first attempt.
+ *
+ * Call after init and before the first begin(); do not flip mid-transaction.
+ * Only affects URCU_TXN_AGE_ESCALATE builds; a no-op hint elsewhere.  Typically
+ * accompanies enable_ryw() (which resolves the aliasing at commit), and is
+ * mutually exclusive in intent with declare_disjoint().
+ */
+static inline
+void urcu_txn_expect_conflict(struct urcu_mcas_txn *txn)
+{
+	txn->expect_conflict = 1;
+}
+
+/*
+ * Effective attempt age.  Normally the retry count; but a handle that declared
+ * expect_conflict() reports >= 1 even on its first attempt.  Both the txn layer
+ * (skip-find/blind-append/esc_pending, keyed on this) and the mcas layer (skip-
+ * sort/try-latch install, keyed on the descriptor's retry, which is created from
+ * this) then bypass the age-0 optimistic path and run the sorted, blocking path
+ * from the start.  Only diverges from retry under an age-escalate build; the
+ * comparator that also reads a descriptor's retry (aging priority) sees the raw
+ * retry in a stock build, so expect_conflict stays strictly inert there.
+ */
+static inline
+unsigned long urcu_txn__eff_retry(const struct urcu_mcas_txn *txn)
+{
+#if defined(URCU_TXN_AGE_ESCALATE) || defined(URCU_MCAS_AGE0_TRYLATCH)
+	return (txn->expect_conflict && txn->retry == 0) ? 1UL : txn->retry;
+#else
+	return txn->retry;
+#endif
 }
 
 /* Initialize a handle bracketed in the compile-time-selected RCU flavor. */
@@ -1124,7 +1183,7 @@ int urcu_txn__record(struct urcu_mcas_txn *txn, void **slot,
 		return -ENOMEM;		/* sticky: an earlier record already failed */
 	if (!m) {
 		m = urcu_mcas_create(txn->min_alloc ? txn->min_alloc :
-				URCU_TXN_INIT, txn->retry);
+				URCU_TXN_INIT, urcu_txn__eff_retry(txn));
 		if (caa_unlikely(!m)) {
 			txn->mcas = URCU_TXN_ENOMEM;
 			return -ENOMEM;
@@ -1147,7 +1206,7 @@ int urcu_txn__record(struct urcu_mcas_txn *txn, void **slot,
 	 * begin(), so the guard is a per-handle-constant, well-predicted branch.
 	 */
 	if (txn->ryw && urcu_txn__ryw_bloom_test_and_set(txn->ryw_bloom, slot)
-			&& txn->retry == 0)
+			&& urcu_txn__eff_retry(txn) == 0)
 		txn->esc_pending = 1;
 #endif
 #ifdef URCU_TXN_ESCALATION_STATS
@@ -1177,7 +1236,7 @@ int urcu_txn__record(struct urcu_mcas_txn *txn, void **slot,
 		 *    unconditionally redundant.  A violated assertion corrupts (adds a
 		 *    duplicate record); URCU_TXN_DEBUG_DISJOINT traps it here.
 		 */
-		if (txn->retry == 0 && (txn->ryw || txn->disjoint)) {
+		if (urcu_txn__eff_retry(txn) == 0 && (txn->ryw || txn->disjoint)) {
 #ifdef URCU_TXN_DEBUG_DISJOINT
 			if (txn->disjoint && urcu_mcas_find(m, slot) != NULL) {
 				fprintf(stderr, "urcu-txn: disjoint-contract violation: "
@@ -1205,7 +1264,7 @@ int urcu_txn__record(struct urcu_mcas_txn *txn, void **slot,
 			}
 			txn->mcas = m;
 #ifdef URCU_TXN_AGE_ESCALATE
-			if (txn->retry == 0 && (txn->ryw || txn->disjoint))
+			if (urcu_txn__eff_retry(txn) == 0 && (txn->ryw || txn->disjoint))
 				urcu_mcas_add(m, slot, old_ptr, new_ptr, tag);
 			else
 #endif
@@ -1246,7 +1305,7 @@ void *urcu_txn__load(struct urcu_mcas_txn *txn, void **slot, uintptr_t tag,
 {
 	if (txn->ryw && txn->mcas != NULL && txn->mcas != URCU_TXN_ENOMEM) {
 #ifdef URCU_TXN_AGE_ESCALATE
-		if (txn->retry == 0) {
+		if (urcu_txn__eff_retry(txn) == 0) {
 			/*
 			 * Age 0 (optimistic): a Bloom hit is a possible
 			 * read-after-write.  Flag it to escalate (commit aborts

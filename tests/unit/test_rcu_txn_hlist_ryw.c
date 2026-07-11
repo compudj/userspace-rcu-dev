@@ -227,6 +227,13 @@ static void test_ryw_whitebox_chain(void)
 
 	urcu_txn_init(&txn, &g_dom);
 	urcu_txn_enable_ryw(&txn);
+	/*
+	 * A deliberate same-slot chaining txn is an expect-conflict txn: under an
+	 * AGE_ESCALATE build age 0 would optimistically escalate instead of chaining,
+	 * so declare the conflict to exercise the age-1 chaining path this whitebox
+	 * asserts.  Inert (a no-op) in a stock build.
+	 */
+	urcu_txn_expect_conflict(&txn);
 	urcu_txn_begin(&txn);
 	if (urcu_txn_hlist_del_prepare(&txn, &n[2]->h))	/* key 3 */
 		abort();

@@ -150,6 +150,19 @@ int main(void)
 	void *final_s;
 
 	plan_tests(NR_TESTS);
+#if defined(URCU_MCAS_NO_HELP) || defined(URCU_MCAS_NO_STEAL)
+	/*
+	 * The hazard needs a HELPER to drive a foreign txn and stall mid-install,
+	 * and an EVICTION (a higher-priority contender) to retire it underneath.
+	 * The single-driver spinlatch (NO_HELP + NO_STEAL) has neither, so the
+	 * settle-time install-word claim this exercises is dead code and the
+	 * interleaving is unreachable (see the engine's URCU_MCAS_AGE0_FLAT #error).
+	 * Skip so the suite stays green on the shipping engine.
+	 */
+	skip(NR_TESTS, "no helper/eviction under the single-driver spinlatch: "
+			"the settle-time republish hazard is unreachable");
+	return exit_status();
+#endif
 	rcu_register_thread();
 
 	/* Initial slot state. */
