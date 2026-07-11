@@ -570,6 +570,7 @@ int urcu_txn_skiplist_add_rcu(struct urcu_txn_skiplist *sl,
 	int ret, prep;
 
 	urcu_txn_init(&txn, domain);
+	urcu_txn_declare_disjoint(&txn);	/* single-op commit: distinct per-level slots, no same-slot WAW */
 	for (;;) {
 		urcu_txn_begin(&txn);
 		prep = urcu_txn_skiplist_insert_prepare(&txn, sl, newp, key);
@@ -608,6 +609,7 @@ int urcu_txn_skiplist_del_rcu(struct urcu_txn_skiplist *sl, void *key,
 	if (removed != NULL)
 		*removed = NULL;
 	urcu_txn_init(&txn, domain);
+	urcu_txn_declare_disjoint(&txn);	/* single-op commit: distinct per-level slots, no same-slot WAW */
 	for (;;) {
 		urcu_txn_begin(&txn);
 		prep = urcu_txn_skiplist_del_prepare(&txn, sl, key, &node);

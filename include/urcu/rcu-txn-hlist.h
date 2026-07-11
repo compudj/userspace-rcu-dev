@@ -343,6 +343,7 @@ int urcu_txn_hlist_add_rcu(struct urcu_txn_hlist_node *newp,
 	int ret, prep;
 
 	urcu_txn_init(&txn, domain);
+	urcu_txn_declare_disjoint(&txn);	/* single-op commit: distinct slots, no same-slot WAW */
 	for (;;) {
 		urcu_txn_begin(&txn);
 		prep = urcu_txn_hlist_insert_head_prepare(&txn, newp, head);
@@ -373,6 +374,7 @@ int urcu_txn_hlist_insert_after_rcu(struct urcu_txn_hlist_node *newp,
 	int ret, prep;
 
 	urcu_txn_init(&txn, domain);
+	urcu_txn_declare_disjoint(&txn);	/* single-op commit: distinct slots, no same-slot WAW */
 	for (;;) {
 		urcu_txn_begin(&txn);
 		prep = urcu_txn_hlist_insert_after_prepare(&txn, newp, pos);
@@ -444,6 +446,7 @@ int urcu_txn_hlist_insert_before_rcu(struct urcu_txn_hlist_node *newp,
 	int ret, prep;
 
 	urcu_txn_init(&txn, domain);
+	urcu_txn_declare_disjoint(&txn);	/* single-op commit: distinct slots, no same-slot WAW */
 	do {
 		urcu_txn_begin(&txn);
 		prep = urcu_txn_hlist_insert_before_prepare(&txn, newp, pos);
@@ -533,6 +536,7 @@ int urcu_txn_hlist_del_rcu(struct urcu_txn_hlist_node *elem,
 	int ret, prep;
 
 	urcu_txn_init(&txn, domain);
+	urcu_txn_declare_disjoint(&txn);	/* single-op commit: distinct slots, no same-slot WAW */
 	for (;;) {
 		urcu_txn_begin(&txn);
 		prep = urcu_txn_hlist_del_prepare(&txn, elem);
@@ -612,6 +616,7 @@ int urcu_txn_hlist_replace_rcu(struct urcu_txn_hlist_node *old,
 	int ret, prep;
 
 	urcu_txn_init(&txn, domain);
+	urcu_txn_declare_disjoint(&txn);	/* single-op commit: distinct slots, no same-slot WAW */
 	for (;;) {
 		urcu_txn_begin(&txn);
 		prep = urcu_txn_hlist_replace_prepare(&txn, old, newp);

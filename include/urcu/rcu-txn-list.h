@@ -256,7 +256,15 @@ int urcu_txn_list_insert_after_prepare(struct urcu_mcas_txn *txn,
 	 * marks -- into the write-set, so the prev side serializes against
 	 * del(succ) exactly as the next side does; a marked succ aborts here.
 	 */
-	if (urcu_txn_list_is_marked(urcu_txn_load_validate(txn,
+	/*
+	 * Skip the guard when succ == pos (inserting after a self-looping node --
+	 * the empty list's sentinel): &succ->next is then &pos->next, the slot the
+	 * forward store below already writes and serializes.  A second record on it
+	 * is harmless under reconcile but a duplicate under a disjoint blind-append,
+	 * and the sentinel is never deleted so the guard is moot.  Mirrors
+	 * del_prepare's next == prev skip; keeps the write set disjoint.
+	 */
+	if (succ != pos && urcu_txn_list_is_marked(urcu_txn_load_validate(txn,
 			(void **) &succ->next, URCU_MCAS_TAG)))
 		return -EAGAIN;				/* succ (a neighbour) deleted: retry */
 
@@ -294,6 +302,7 @@ int urcu_txn_list_insert_after_rcu(struct urcu_txn_list_node *newp,
 	int ret, prep;
 
 	urcu_txn_init(&txn, domain);
+	urcu_txn_declare_disjoint(&txn);	/* single-op commit: distinct slots, no same-slot WAW */
 	for (;;) {
 		urcu_txn_begin(&txn);
 		prep = urcu_txn_list_insert_after_prepare(&txn, newp, pos);
@@ -339,6 +348,7 @@ int urcu_txn_list_insert_after_guarded_rcu(
 	int ret;
 
 	urcu_txn_init(&txn, domain);
+	urcu_txn_declare_disjoint(&txn);	/* single-op commit: distinct slots, no same-slot WAW */
 	for (;;) {
 		void *pn;
 		struct urcu_txn_list_node *succ;
@@ -367,8 +377,8 @@ int urcu_txn_list_insert_after_guarded_rcu(
 		 * install may reach &succ->prev before &pos->next.  See
 		 * insert_after_prepare.  A marked succ moved: retry.
 		 */
-		if (urcu_txn_list_is_marked(urcu_txn_load_validate(
-				&txn, (void **) &succ->next, URCU_MCAS_TAG))) {
+		if (succ != pos && urcu_txn_list_is_marked(urcu_txn_load_validate(
+				&txn, (void **) &succ->next, URCU_MCAS_TAG))) {	/* succ==pos: guard moot, see insert_after_prepare */
 			urcu_txn_conflict(&txn);	/* age so a hot slot escalates */
 			urcu_txn_end(&txn);
 			continue;
@@ -401,14 +411,22 @@ int urcu_txn_list_insert_before_prepare(struct urcu_mcas_txn *txn,
 	 * is the anchor whose prev we move) so the prev-side store serializes
 	 * against del(pos) atomically even when the slot-sorted install reaches
 	 * &pos->prev first.  A marked pos => the anchor is gone (-ENOENT).
+	 *
+	 * Load @prev first so we can skip the VALIDATE (a plain load still checks
+	 * the mark) when prev == pos -- inserting before a self-looping node, the
+	 * empty list's sentinel: &prev->next is then &pos->next, the slot the
+	 * forward store below already writes and serializes, so a validate record
+	 * would duplicate it under a disjoint blind-append.  The sentinel is never
+	 * deleted, so the guard is moot.  Mirrors del_prepare's next == prev skip.
 	 */
-	void *pn = urcu_txn_load_validate(txn, (void **) &pos->next, URCU_MCAS_TAG);
-	struct urcu_txn_list_node *prev;
+	struct urcu_txn_list_node *prev = urcu_txn_list_unmark(
+			urcu_txn_load(txn, (void **) &pos->prev, URCU_MCAS_TAG));
+	void *pn = prev != pos
+			? urcu_txn_load_validate(txn, (void **) &pos->next, URCU_MCAS_TAG)
+			: urcu_txn_load(txn, (void **) &pos->next, URCU_MCAS_TAG);
 
 	if (urcu_txn_list_is_marked(pn))
 		return -ENOENT;			/* @pos was deleted */
-	prev = urcu_txn_list_unmark(
-			urcu_txn_load(txn, (void **) &pos->prev, URCU_MCAS_TAG));
 
 	newp->next = pos;
 	newp->prev = prev;
@@ -439,6 +457,7 @@ int urcu_txn_list_insert_before_rcu(struct urcu_txn_list_node *newp,
 	int ret, prep;
 
 	urcu_txn_init(&txn, domain);
+	urcu_txn_declare_disjoint(&txn);	/* single-op commit: distinct slots, no same-slot WAW */
 	do {
 		urcu_txn_begin(&txn);
 		prep = urcu_txn_list_insert_before_prepare(&txn, newp, pos);
@@ -553,6 +572,7 @@ int urcu_txn_list_del_rcu(struct urcu_txn_list_node *elem,
 	int ret, prep;
 
 	urcu_txn_init(&txn, domain);
+	urcu_txn_declare_disjoint(&txn);	/* single-op commit: distinct slots, no same-slot WAW */
 	for (;;) {
 		urcu_txn_begin(&txn);
 		prep = urcu_txn_list_del_prepare(&txn, elem);
@@ -654,6 +674,7 @@ int urcu_txn_list_replace_rcu(struct urcu_txn_list_node *old,
 	int ret, prep;
 
 	urcu_txn_init(&txn, domain);
+	urcu_txn_declare_disjoint(&txn);	/* single-op commit: distinct slots, no same-slot WAW */
 	for (;;) {
 		urcu_txn_begin(&txn);
 		prep = urcu_txn_list_replace_prepare(&txn, old, newp);

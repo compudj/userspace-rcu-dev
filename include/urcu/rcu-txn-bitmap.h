@@ -318,6 +318,7 @@ enum urcu_txn_status urcu_txn_bitmap_set_rcu(struct urcu_txn_domain *domain,
 	enum urcu_txn_status st;
 
 	urcu_txn_init(&txn, domain);
+	urcu_txn_declare_disjoint(&txn);	/* single-op commit: one word, no same-slot WAW */
 	do {
 		urcu_txn_begin(&txn);
 		(void) urcu_txn_bitmap_set_prepare(&txn, words, bit);
@@ -335,6 +336,7 @@ enum urcu_txn_status urcu_txn_bitmap_clear_rcu(struct urcu_txn_domain *domain,
 	enum urcu_txn_status st;
 
 	urcu_txn_init(&txn, domain);
+	urcu_txn_declare_disjoint(&txn);	/* single-op commit: one word, no same-slot WAW */
 	do {
 		urcu_txn_begin(&txn);
 		(void) urcu_txn_bitmap_clear_prepare(&txn, words, bit);
