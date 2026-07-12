@@ -41,6 +41,7 @@ tests/unit/test_get_possible_cpus_array_len_cxx
 tests/utils/libtap.a
 tests/utils/env.sh
 
+tests/regression/test_rcu_txn_starve
 tests/regression/rcutorture_urcu_bp
 tests/regression/rcutorture_urcu_bp_cxx
 tests/regression/rcutorture_urcu_mb

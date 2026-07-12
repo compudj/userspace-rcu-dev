@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+#
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# SPDX-FileCopyrightText: 2026 Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+#
+
+if [ "x${URCU_TESTS_SRCDIR:-}" != "x" ]; then
+	UTILSSH="$URCU_TESTS_SRCDIR/utils/utils.sh"
+else
+	UTILSSH="$(dirname "$0")/../utils/utils.sh"
+fi
+
+# shellcheck source=../utils/utils.sh
+source "$UTILSSH"
+
+NPROC=$(urcu_nproc)
+
+# Enough of a small-writer stream to defeat the wide transactions.  Oversubscribing
+# is fine, and helps: a preempted wide op is a wider read->install window.
+NSMALL=$(( NPROC > 8 ? NPROC : 8 ))
+
+# At least two, so a joiner can go on starving after the initiator departs and be
+# PROMOTED -- otherwise that branch of the funnel never runs.
+NWIDE=$(( NPROC / 8 ))
+if [ "$NWIDE" -lt 2 ]; then
+	NWIDE=2
+fi
+
+# The wide txn takes every slot, so ANY small commit defeats it.  32 stays well
+# below URCU_TXN_BIG (128): reaching BIG would escalate proactively on size and
+# bypass the retry >= URCU_TXN_FALLBACK trigger this test exists to exercise.
+NSLOTS=32
+
+# Starving past URCU_TXN_FALLBACK (256) organically takes time -- this is a long
+# regression test, not a unit test.
+DURATION_MS=10000
+
+"${URCU_TESTS_BUILDDIR}/regression/test_rcu_txn_starve" \
+	--nslots "$NSLOTS" \
+	--nsmall "$NSMALL" \
+	--nwide "$NWIDE" \
+	--duration "$DURATION_MS"

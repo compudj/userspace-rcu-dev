@@ -14,6 +14,7 @@ TAP_LOG_DRIVER = env AM_TAP_AWK='$(AWK)' \
 noinst_PROGRAMS = \
 	test_urcu_fork.tap \
 	test_urcu_fork_cxx.tap \
+	test_rcu_txn_starve \
 	rcutorture_urcu_membarrier \
 	rcutorture_urcu_membarrier_cxx \
 	rcutorture_urcu_mb \
@@ -38,6 +39,9 @@ test_urcu_fork_tap_LDADD = $(URCU_LIB) $(TAP_LIB)
 
 test_urcu_fork_cxx_tap_SOURCES = test_urcu_fork_cxx.cpp
 test_urcu_fork_cxx_tap_LDADD = $(URCU_LIB) $(TAP_LIB)
+
+test_rcu_txn_starve_SOURCES = test_rcu_txn_starve.c
+test_rcu_txn_starve_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
 
 rcutorture_urcu_membarrier_SOURCES = urcutorture.c
 rcutorture_urcu_membarrier_CFLAGS = -DRCU_MEMBARRIER $(AM_CFLAGS)
@@ -74,6 +78,7 @@ rcutorture_urcu_bp_cxx_LDADD = $(URCU_BP_LIB) $(TAP_LIB)
 urcutorture.c: ../common/api.h
 
 dist_check_SCRIPTS = \
+	test_rcu_txn_starve.tap \
 	test_rcutorture_urcu_bp_perf_global.tap \
 	test_rcutorture_urcu_bp_perf_global_cxx.tap \
 	test_rcutorture_urcu_bp_perf_percpu.tap \
@@ -180,6 +185,7 @@ TESTS =
 REGTEST_TESTS = \
 	test_urcu_fork.tap \
 	test_urcu_fork_cxx.tap \
+	test_rcu_txn_starve.tap \
 	test_rcutorture_urcu_bp_perf_global.tap \
 	test_rcutorture_urcu_bp_perf_global_cxx.tap \
 	test_rcutorture_urcu_bp_perf_percpu.tap \
