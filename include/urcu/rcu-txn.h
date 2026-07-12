@@ -261,15 +261,26 @@ extern "C" {
 /*
  * Floor under the scaled budget.  It is what keeps a CHEAP transaction on a HOT
  * domain off the lane.  Cost measures what the ESCALATING op costs to
- * serialize; it says nothing about what the lane's OTHER traffic costs, and
- * those are not
- * the same thing.  A bidir-list delete costs about 2 slots, so scaling alone
- * hands it a budget of 5 retries -- below its own natural retry tail -- and it
- * starts escalating on ordinary contention, serializing a domain that runs at
- * 225 Mops/s: a 17% loss on the list churn panel, all of it policy rather than
- * accounting overhead.  Until a handle has spent a floor of optimistic retries
- * the domain is presumed healthy and it stays off the lane; 64 is ~8x that
- * tail, and the 3-skiplist's measured 99.99th-percentile retry count.
+ * serialize; it says NOTHING about what the lane's other traffic costs, and
+ * those are not the same thing -- escalating publishes domain->active, which
+ * funnels every writer in the domain, however cheap the escalating op was.
+ *
+ * A bidir-list delete measures cost 6 (max 7), so scaling alone gives it a
+ * budget of ~16 retries.  Its natural retry tail runs past that: over 562M
+ * commits at 192 writers, 98.6% commit with no retry at all and 99.9999% within
+ * 3 retries, but a thin tail reaches into 16..63.  Those few are enough --
+ * every one of them funnels a domain running at 225 Mops/s into the serial
+ * lane -- and
+ * unfloored the churn panel loses 17%, all of it policy rather than accounting
+ * overhead (the load counter itself measures 0.6%).  A floor of 64 puts the
+ * budget above that tail: only 6 commits in 562M ever reach it.  The other
+ * cheap-and-hot workload agrees -- a transacted hlist under the same contention
+ * commits 99.9999% within 7 retries and never exceeds 15.
+ *
+ * Raising the floor further only erodes the starvation rescue (it is the CHEAP
+ * ops escalating that pull a starved neighbour into the lane behind them), so
+ * it wants to sit just above the natural tail of the domain's healthy traffic
+ * and no higher.
  */
 #ifndef URCU_TXN_FALLBACK_MIN
 #define URCU_TXN_FALLBACK_MIN		64
