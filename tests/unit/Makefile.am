@@ -45,6 +45,7 @@ noinst_PROGRAMS = \
 	test_rcu_txn_read_policy \
 	test_rcu_txn_beginless \
 	test_rcu_txn_guards \
+	test_rcu_txn_sw_excl \
 	test_fair_mutex \
 	test_urcu_multiflavor \
 	test_urcu_multiflavor_cxx \
@@ -100,6 +101,7 @@ TESTS = \
 	test_rcu_txn_read_policy \
 	test_rcu_txn_beginless \
 	test_rcu_txn_guards \
+	test_rcu_txn_sw_excl \
 	test_fair_mutex \
 	test_urcu_multiflavor \
 	test_urcu_multiflavor_cxx \
@@ -236,6 +238,13 @@ test_rcu_txn_guards_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
 # cases are urcu_posix_assert: present unless NDEBUG, under which the test skips
 # itself entirely.)
 test_rcu_txn_guards_CPPFLAGS = $(AM_CPPFLAGS) -DDEBUG_RCU
+
+test_rcu_txn_sw_excl_SOURCES = test_rcu_txn_sw_excl.c
+test_rcu_txn_sw_excl_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
+# The sw single-updater validator is opt-in (zero overhead by default), so the
+# test that provokes it has to turn it on.  It forks a child per case and
+# asserts the child dies by SIGABRT.
+test_rcu_txn_sw_excl_CPPFLAGS = $(AM_CPPFLAGS) -DURCU_TXN_SW_EXCL_VALIDATE
 
 test_fair_mutex_SOURCES = test_fair_mutex.c
 test_fair_mutex_LDADD = $(URCU_COMMON_LIB) $(TAP_LIB)

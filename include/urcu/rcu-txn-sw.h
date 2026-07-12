@@ -325,9 +325,141 @@ struct urcu_txn_sw_txn {
 	unsigned int nr;
 	unsigned int cap;
 	bool latches_inline;			/* @latches is caller storage: never realloc'd, never freed */
+#ifdef URCU_TXN_SW_EXCL_VALIDATE
+	unsigned long excl_owner;		/*
+						 * pthread_self() of the thread
+						 * that init'd this handle; the
+						 * handle must be driven end to
+						 * end by it.  See the validator
+						 * below.
+						 */
+#endif
 };
 
 #define URCU_TXN_SW_CAP	8	/* initial record-array capacity */
+
+/*
+ * URCU_TXN_SW_EXCL_VALIDATE: runtime validation of the SINGLE-UPDATER contract.
+ *
+ * This engine requires writer mutual exclusion -- it has no install-time CAS,
+ * no conflict detection and no abort, so two writers racing on one slot simply
+ * corrupt it, and nothing in a default build says so.  Enable with
+ * -DURCU_TXN_SW_EXCL_VALIDATE to have a violation abort the process with a
+ * report naming the slot and the threads.  Off by default (zero overhead: no
+ * checks, and the handle does not even carry the owner field).
+ *
+ * There is no per-structure object to claim an owner on, as <urcu/rcu-txn.h>'s
+ * concurrent front-end has in its escalation domain: the sw mutators take a
+ * node (urcu_txn_sw_list_del_rcu(elem)), never a head, and an hlist head is one
+ * bare pointer by design.  So the validator claims the two things that DO
+ * exist:
+ *
+ *   - the HANDLE.  Its owner is the thread that init'd it, and reserve / record
+ *     / install / commit must all run on that thread.  Catches a transaction
+ *     handed between threads mid-flight.
+ *
+ *   - the SLOT, which is what two racing writers actually share, and so is
+ *     where the real violation is visible.  In a correct single-updater
+ *     program a slot being recorded or parked CANNOT already hold a parked
+ *     proxy: this transaction parks nothing before install, its record set is
+ *     frozen after, and any earlier transaction of the same (sole) writer
+ *     settled its slots back to plain values before returning.  A proxy
+ *     sitting there therefore means another writer is mid-transaction on that
+ *     very slot right now.  Symmetrically, at settle each slot must still hold
+ *     OUR proxy; anything else means a concurrent writer overwrote it.
+ *
+ * Like the fractal trie's FEATURE_FT_EXCL_VALIDATE, this catches the
+ * deterministic case where the bad interleaving actually happens in this run.
+ * Two writers that overlap but never observe each other's parked proxy -- one
+ * settles before the other records -- still corrupt, and are still invisible
+ * here.  A clean run is evidence, not proof.
+ */
+#ifdef URCU_TXN_SW_EXCL_VALIDATE
+
+#include <pthread.h>
+#include <stdio.h>
+
+#define urcu_txn_sw__excl_abort(...)					\
+	do {								\
+		fprintf(stderr, "urcu-txn-sw single-updater violation: "	\
+			__VA_ARGS__);					\
+		fflush(stderr);						\
+		abort();						\
+	} while (0)
+
+/*
+ * Does @v carry all of @tag's bits -- i.e. is it a parked proxy rather than a
+ * live value?  The engine's tag contract (see urcu_txn_sw_record) is that no
+ * live value an embedder stores in a transacted slot may do so.
+ */
+static inline
+int urcu_txn_sw__is_proxy(const void *v, uintptr_t tag)
+{
+	return tag != 0 && ((uintptr_t) v & tag) == tag;
+}
+
+static inline
+void urcu_txn_sw__excl_claim(struct urcu_txn_sw_txn *t)
+{
+	t->excl_owner = (unsigned long) pthread_self();
+}
+
+static inline
+void urcu_txn_sw__excl_owner(const struct urcu_txn_sw_txn *t, const char *what)
+{
+	unsigned long self = (unsigned long) pthread_self();
+
+	if (t->excl_owner != self)
+		urcu_txn_sw__excl_abort("txn=%p: %s on thread 0x%lx, but the handle was initialized by thread 0x%lx -- one transaction is driven end to end by one thread\n",
+			(const void *) t, what, self, t->excl_owner);
+}
+
+/* @slot must not already be parked by somebody else. */
+static inline
+void urcu_txn_sw__excl_slot_free(void **slot, uintptr_t tag, const char *what)
+{
+	void *v = uatomic_load(slot, CMM_RELAXED);
+
+	if (urcu_txn_sw__is_proxy(v, tag))
+		urcu_txn_sw__excl_abort("slot=%p already holds a parked proxy (%p) at %s: another writer is mid-transaction on it\n",
+			(void *) slot, v, what);
+}
+
+/* At settle, @l's slot must still hold the proxy WE parked in it. */
+static inline
+void urcu_txn_sw__excl_slot_ours(struct urcu_txn_sw_latch *l)
+{
+	void *want = (void *) ((uintptr_t) &l->proxy | l->tag);
+	void *v = uatomic_load(l->slot, CMM_RELAXED);
+
+	if (v != want)
+		urcu_txn_sw__excl_abort("slot=%p holds %p at settle, expected our parked proxy %p: a concurrent writer overwrote it\n",
+			(void *) l->slot, v, want);
+}
+
+/*
+ * The single-edge commit stores blind (no proxy is ever parked), so its only
+ * witness is the value: @l's slot must still hold the recorded old.
+ */
+static inline
+void urcu_txn_sw__excl_slot_unchanged(struct urcu_txn_sw_latch *l)
+{
+	void *v = uatomic_load(l->slot, CMM_RELAXED);
+
+	if (v != l->proxy.ptr[0])
+		urcu_txn_sw__excl_abort("slot=%p holds %p at the single-edge commit, but %p was recorded as its old: a concurrent writer changed it\n",
+			(void *) l->slot, v, l->proxy.ptr[0]);
+}
+
+#else	/* !URCU_TXN_SW_EXCL_VALIDATE */
+
+# define urcu_txn_sw__excl_claim(t)			do { } while (0)
+# define urcu_txn_sw__excl_owner(t, what)		do { } while (0)
+# define urcu_txn_sw__excl_slot_free(slot, tag, what)	do { } while (0)
+# define urcu_txn_sw__excl_slot_ours(l)			do { } while (0)
+# define urcu_txn_sw__excl_slot_unchanged(l)		do { } while (0)
+
+#endif	/* URCU_TXN_SW_EXCL_VALIDATE */
 
 /*
  * Initialize an on-stack transaction handle.  No allocation, so this cannot
@@ -344,6 +476,7 @@ void urcu_txn_sw_init(struct urcu_txn_sw_txn *t)
 	t->nr = 0;
 	t->cap = 0;
 	t->latches_inline = false;
+	urcu_txn_sw__excl_claim(t);
 }
 
 /*
@@ -371,6 +504,7 @@ void urcu_txn_sw_init_inline(struct urcu_txn_sw_txn *t,
 	t->nr = 0;
 	t->cap = cap;
 	t->latches_inline = true;
+	urcu_txn_sw__excl_claim(t);
 }
 
 #define urcu_txn_sw_blocksize(cap)	\
@@ -494,6 +628,7 @@ bool urcu_txn_sw_reserve(struct urcu_txn_sw_txn *t, unsigned int cap)
 	 * is frozen once installed.
 	 */
 	urcu_posix_assert(t->state == URCU_TXN_SW_PREPARE);
+	urcu_txn_sw__excl_owner(t, "reserve()");
 	if (t->latches) {
 		if (cap <= t->cap)
 			return true;		/* already sized (heap block or inline buf) */
@@ -605,6 +740,8 @@ bool urcu_txn_sw_record(struct urcu_txn_sw_txn *t, void **slot,
 	if (caa_unlikely(t->state == URCU_TXN_SW_OOM))
 		return false;			/* sticky: an earlier alloc failed */
 	urcu_posix_assert(t->state == URCU_TXN_SW_PREPARE);
+	urcu_txn_sw__excl_owner(t, "record()");
+	urcu_txn_sw__excl_slot_free(slot, tag, "record()");
 	if (t->nr == t->cap) {
 		unsigned int newcap = t->cap ? t->cap * 2 : URCU_TXN_SW_CAP;
 
@@ -662,6 +799,7 @@ void urcu_txn_sw_install(struct urcu_txn_sw_txn *t)
 {
 	unsigned int i;
 
+	urcu_txn_sw__excl_owner(t, "install()");
 	/*
 	 * Contract (see urcu_txn_sw_init_inline): a CALLER-storage handle must
 	 * never park proxies -- its records do not outlive the call, and it
@@ -708,8 +846,11 @@ void urcu_txn_sw_install(struct urcu_txn_sw_txn *t)
 			urcu_assert_debug(t->latches[i].slot != t->latches[j].slot);
 	}
 	t->state = URCU_TXN_SW_INSTALLED;
-	for (i = 0; i < t->nr; i++)
+	for (i = 0; i < t->nr; i++) {
+		urcu_txn_sw__excl_slot_free(t->latches[i].slot,
+				t->latches[i].tag, "install (park)");
 		urcu_txn_sw_latch_install(t, &t->latches[i]);
+	}
 }
 
 /*
@@ -764,6 +905,7 @@ enum urcu_txn_status urcu_txn_sw_commit_flavor(struct urcu_txn_sw_txn *t,
 	struct urcu_txn_sw_block *blk;
 	unsigned int i;
 
+	urcu_txn_sw__excl_owner(t, "commit()");
 	if (caa_unlikely(t->state == URCU_TXN_SW_OOM)) {
 		urcu_txn_sw__free_records(t);
 		return URCU_TXN_STATUS_MEMORY_ERROR;
@@ -773,6 +915,7 @@ enum urcu_txn_status urcu_txn_sw_commit_flavor(struct urcu_txn_sw_txn *t,
 			if (t->nr == 1) {
 				struct urcu_txn_sw_latch *l = &t->latches[0];
 
+				urcu_txn_sw__excl_slot_unchanged(l);
 				uatomic_store(l->slot, l->proxy.ptr[1],
 						CMM_RELEASE);
 			}
@@ -800,6 +943,7 @@ enum urcu_txn_status urcu_txn_sw_commit_flavor(struct urcu_txn_sw_txn *t,
 	for (i = 0; i < t->nr; i++) {
 		struct urcu_txn_sw_latch *l = &blk->latches[i];
 
+		urcu_txn_sw__excl_slot_ours(l);
 		uatomic_store(l->slot, l->proxy.ptr[1], CMM_RELEASE);
 	}
 	call_rcu_fn(&blk->rcu_head, urcu_txn_sw_free_rcu);	/* a reader may hold a proxy */
