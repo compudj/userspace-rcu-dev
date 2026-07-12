@@ -4,17 +4,19 @@
 
 /*
  * Composing several skiplist _prepare forms that touch the SAME skiplist within
- * one transaction, under read-your-own-writes + chained same-slot stores
- * (urcu_txn_enable_ryw).
+ * one transaction, under read-your-own-writes + chained same-slot stores -- the
+ * engine's default.
  *
- * Without RYW this composition is unsound: each _prepare searches the COMMITTED
- * structure, blind to the transaction's other pending edits, so a later edit
- * lands on a predecessor an earlier edit has already displaced and both stores
- * name the same pred->next[L] slot.  The olds then agree (precisely because both
- * reads were stale), the engine's one-record-per-slot upgrade overwrites new_ptr,
- * and one edge is destroyed.  Test 9 pins that down as a negative control.
+ * Were writes invisible (the retired pre-RYW mode) this composition would be
+ * unsound: each _prepare would search the COMMITTED structure, blind to the
+ * transaction's other pending edits, so a later edit would land on a predecessor
+ * an earlier edit has already displaced and both stores would name the same
+ * pred->next[L] slot.  The olds would then agree (precisely because both reads
+ * were stale), the engine's one-record-per-slot upgrade would overwrite new_ptr,
+ * and one edge would be destroyed.
  *
- * With RYW the descent observes the transaction's own edits, so:
+ * Read-your-own-writes is why the composition is sound: the descent observes the
+ * transaction's own edits, so:
  *   - a later edit whose true predecessor is a node this txn allocated retargets
  *     its store into that PRIVATE node -- the slot collision never forms;
  *   - where the fused slot belongs to a PUBLISHED node, the two edits chain into
@@ -47,7 +49,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS	12
+#define NR_TESTS	11
 
 /* Bound every retry loop so a livelock FAILS the test instead of hanging it. */
 #define SPIN_LIMIT	100000
@@ -225,12 +227,11 @@ struct op {
 };
 
 /*
- * Run @ops as one transaction.  @ryw opts the handle into read-your-own-writes.
- * Returns 0, a negative errno from a _prepare, or -ETIMEDOUT if the attempt loop
- * exceeded SPIN_LIMIT (a livelock -- which is exactly what composing on one
- * skiplist without RYW deterministically produces).
+ * Run @ops as one transaction under the default read-your-own-writes.  Returns
+ * 0, a negative errno from a _prepare, or -ETIMEDOUT if the attempt loop
+ * exceeded SPIN_LIMIT (a livelock).
  */
-static int batch_commit(struct op *ops, int n, int ryw)
+static int batch_commit(struct op *ops, int n)
 {
 	struct urcu_mcas_txn txn;
 	long spins = 0;
@@ -238,7 +239,6 @@ static int batch_commit(struct op *ops, int n, int ryw)
 	enum urcu_txn_status st;
 
 	urcu_txn_init(&txn, &g_dom);
-	urcu_txn_set_ryw(&txn, ryw);	/* explicit: ignore URCU_TXN_RYW_DEFAULT */
 	for (;;) {
 		int retry = 0, err = 0;
 
@@ -282,7 +282,7 @@ static void seed_insert(struct urcu_txn_skiplist *sl, unsigned long key,
 {
 	struct op op = { .kind = OP_INS, .sl = sl, .newn = node_alloc(key, toplevel) };
 
-	if (batch_commit(&op, 1, 0))
+	if (batch_commit(&op, 1))
 		abort();
 }
 
@@ -329,7 +329,7 @@ static void test_insert_then_delete(void)
 	ops[0] = (struct op){ .kind = OP_INS, .sl = &sl, .newn = node_alloc(0, 3) };
 	ops[1] = (struct op){ .kind = OP_DEL, .sl = &sl, .key = 1 };
 
-	ok(batch_commit(ops, 2, 1) == 0, "ryw: insert(0)+del(1) on one skiplist commits");
+	ok(batch_commit(ops, 2) == 0, "ryw: insert(0)+del(1) on one skiplist commits");
 	ok(keys_equal(&sl, want, 5),
 			"ryw: insert-then-delete leaves {0,4,7,10,13}, tower intact");
 
@@ -358,7 +358,6 @@ static void test_whitebox_chain(void)
 	new0 = node_alloc(0, 0);
 
 	urcu_txn_init(&txn, &g_dom);
-	urcu_txn_enable_ryw(&txn);
 	/*
 	 * A deliberate same-slot chaining txn is an expect-conflict txn: under an
 	 * AGE_ESCALATE build age 0 would optimistically escalate instead of chaining,
@@ -416,7 +415,6 @@ static void test_whitebox_retarget(void)
 	new0 = node_alloc(0, 0);
 
 	urcu_txn_init(&txn, &g_dom);
-	urcu_txn_enable_ryw(&txn);
 	urcu_txn_expect_conflict(&txn);	/* same-slot chaining: force the age-1 path (see whitebox_chain) */
 	urcu_txn_begin(&txn);
 	if (urcu_txn_skiplist_insert_prepare(&txn, &sl, &new0->sl, &new0->key))
@@ -461,7 +459,7 @@ static void test_delete_then_insert(void)
 	ops[0] = (struct op){ .kind = OP_DEL, .sl = &sl, .key = 1 };
 	ops[1] = (struct op){ .kind = OP_INS, .sl = &sl, .newn = node_alloc(0, 3) };
 
-	if (batch_commit(ops, 2, 1))
+	if (batch_commit(ops, 2))
 		abort();
 	ok(keys_equal(&sl, want, 5),
 			"ryw: delete-then-insert leaves {0,4,7,10,13}, victim not left linked");
@@ -486,7 +484,7 @@ static void test_adjacent_deletes(void)
 	ops[0] = (struct op){ .kind = OP_DEL, .sl = &sl, .key = 4 };
 	ops[1] = (struct op){ .kind = OP_DEL, .sl = &sl, .key = 7 };
 
-	if (batch_commit(ops, 2, 1))
+	if (batch_commit(ops, 2))
 		abort();
 	ok(keys_equal(&sl, want, 2),
 			"ryw: two adjacent deletes in one txn chain on the shared pred slot");
@@ -508,7 +506,7 @@ static void test_adjacent_inserts(void)
 	ops[0] = (struct op){ .kind = OP_INS, .sl = &sl, .newn = node_alloc(2, 1) };
 	ops[1] = (struct op){ .kind = OP_INS, .sl = &sl, .newn = node_alloc(3, 0) };
 
-	if (batch_commit(ops, 2, 1))
+	if (batch_commit(ops, 2))
 		abort();
 	ok(keys_equal(&sl, want, 4),
 			"ryw: two adjacent inserts in one txn both land, in order");
@@ -531,7 +529,7 @@ static void test_del_plus_insert_published_pred(void)
 	ops[0] = (struct op){ .kind = OP_DEL, .sl = &sl, .key = 0 };
 	ops[1] = (struct op){ .kind = OP_INS, .sl = &sl, .newn = node_alloc(2, 2) };
 
-	if (batch_commit(ops, 2, 1))
+	if (batch_commit(ops, 2))
 		abort();
 	ok(keys_equal(&sl, want, 3),
 			"ryw: del(0)+ins(2) sharing the head slot chain to {2,3,6}");
@@ -541,41 +539,7 @@ static void test_del_plus_insert_published_pred(void)
 }
 
 /* --------------------------------------------------------------------- */
-/* 9. Negative control: WITHOUT ryw the same batch silently loses a key.   */
-/* --------------------------------------------------------------------- */
-
-static void test_negative_no_ryw(void)
-{
-	static const unsigned long seed[] = { 1, 4, 7, 10, 13 };
-	static const unsigned long lost[] = { 4, 7, 10, 13 };	/* key 0 destroyed */
-	struct urcu_txn_skiplist sl;
-	struct op ops[2];
-	int rc, silent_loss;
-
-	/*
-	 * Flat towers, and a level-0 new node: the coalesce then destroys exactly
-	 * the insert's single edge, leaving a consistent-but-wrong structure we
-	 * can safely inspect.  (With a taller new node the same coalesce tears the
-	 * tower and leaves next[0] aimed at a reclaimed node -- correct to expect,
-	 * unsafe to walk, so this control does not provoke it.)
-	 */
-	sl_seed(&sl, seed, 5, 0);
-
-	ops[0] = (struct op){ .kind = OP_INS, .sl = &sl, .newn = node_alloc(0, 0) };
-	ops[1] = (struct op){ .kind = OP_DEL, .sl = &sl, .key = 1 };
-
-	rc = batch_commit(ops, 2, 0);		/* RYW OFF */
-	silent_loss = (rc == 0) && keys_equal(&sl, lost, 4);
-	ok(silent_loss,
-			"no-ryw control: the same batch commits OK yet silently drops key 0");
-
-	free(ops[0].newn);			/* never linked: the destroyed edge */
-	free(caa_container_of(ops[1].removed, struct node, sl));
-	sl_drain(&sl);
-}
-
-/* --------------------------------------------------------------------- */
-/* 10-11. Whole 3-skiplist rotations, batched (the bench workload).        */
+/* 9-10. Whole 3-skiplist rotations, batched (the bench workload).         */
 /* --------------------------------------------------------------------- */
 
 /*
@@ -607,7 +571,7 @@ static int rotate(struct urcu_txn_skiplist *sls, struct node **cur, int *curtab,
 					.newn = node_alloc(cur[j]->key, lvl) };
 				n++; j++;
 			}
-			if (batch_commit(ops, 2 * n, 1))
+			if (batch_commit(ops, 2 * n))
 				return -1;
 			for (k = 0; k < n; k++) {
 				int idx = base + k;
@@ -679,7 +643,7 @@ static void test_rotation(int movesper)
 }
 
 /* --------------------------------------------------------------------- */
-/* 12. Concurrent batched rotations over disjoint key ranges.             */
+/* 11. Concurrent batched rotations over disjoint key ranges.             */
 /* --------------------------------------------------------------------- */
 
 static struct urcu_txn_skiplist g_sls[3];
@@ -771,10 +735,9 @@ int main(void)
 	test_adjacent_deletes();		/* 6 */
 	test_adjacent_inserts();		/* 7 */
 	test_del_plus_insert_published_pred();	/* 8 */
-	test_negative_no_ryw();			/* 9 */
-	test_rotation(2);			/* 10 */
-	test_rotation(3);			/* 11 */
-	test_concurrent_rotation();		/* 12 */
+	test_rotation(2);			/* 9 */
+	test_rotation(3);			/* 10 */
+	test_concurrent_rotation();		/* 11 */
 
 	/*
 	 * Drain the deferred reclaim queue before exiting, so a leak report is

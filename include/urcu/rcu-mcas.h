@@ -920,50 +920,6 @@ bool urcu_mcas_add(struct urcu_mcas *t, void **slot,
 }
 
 /*
- * Record edge {*slot: old -> new} keeping at most one record per @slot, so the
- * engine's distinct-slot precondition holds by construction.  If a record
- * already targets @slot (a prior store, or a load-validate guard), reconcile it
- * rather than append a duplicate: @old_ptr must equal the record's old_ptr
- * (else the caller read @slot twice and saw it move -- an inconsistent,
- * torn-read txn).  A disagreement is NOT silently merged: it POISONS the
- * descriptor so commit() aborts the attempt (the caller re-reads consistently
- * and retries) -- merging would otherwise forge a record whose old no longer
- * matches the intended write and commit a corrupt edge.  Note the disagreement
- * is a LEGAL race, not an embedder bug: a peer may commit between two reads of
- * the same slot in one attempt, so poison-and-retry is the only correct
- * response (no assert).  @upgrade picks new_ptr -- a store advances it to
- * @new_ptr, a load-validate leaves a pending write intact.  Returns false only
- * when a new record is needed and the descriptor is full; the caller grows and
- * retries.
- */
-static inline
-bool urcu_mcas_record(struct urcu_mcas *t, void **slot,
-		void *old_ptr, void *new_ptr, int upgrade, uintptr_t tag)
-{
-	unsigned int i;
-
-	for (i = 0; i < t->nr; i++) {
-		if (t->recs[i].slot != slot)
-			continue;
-		if (caa_unlikely(t->recs[i].old_ptr != old_ptr)) {
-			/*
-			 * Legal race (a peer committed between two reads of
-			 * this slot), so no assert: aborting the process on a
-			 * nondeterministic interleaving would make a
-			 * survivable conflict fatal.
-			 */
-			t->poisoned = 1;	/* torn read-set: commit will abort */
-			return true;
-		}
-		/* Same slot -> same (agreed) tag; reconcile keeps the record's. */
-		if (upgrade)
-			t->recs[i].new_ptr = new_ptr;
-		return true;
-	}
-	return urcu_mcas_add(t, slot, old_ptr, new_ptr, tag);
-}
-
-/*
  * Find the record this descriptor already buffers for @slot, or NULL.  The
  * write-set IS the read-your-own-writes overlay: a record's new_ptr is the
  * value this transaction believes @slot holds.  Linear scan -- the write-set is
@@ -996,13 +952,14 @@ struct urcu_mcas_record *urcu_mcas_find(struct urcu_mcas *t, void **slot)
  * published (a parked proxy resolves to old-or-new), so composing stores
  * functionally on a slot is indistinguishable from applying them in sequence.
  *
- * It also subsumes the non-RYW upgrade of a load-validate guard, which is the
- * degenerate chain where new_ptr == old_ptr.
+ * It also subsumes a load-validate guard's upgrade, the degenerate chain where
+ * new_ptr == old_ptr.
  *
  * @old_ptr matching NEITHER the pending new_ptr is a genuine torn read (the
  * caller reached this slot with a value no longer consistent with the
  * transaction's own view -- e.g. it kept a value read before another edge in
- * this transaction rewrote the slot).  Poison, as urcu_mcas_record() does: the
+ * this transaction rewrote the slot).  Poison it (a LEGAL race, not an embedder
+ * bug -- a peer may commit between two reads of the same slot -- so no assert):
  * commit aborts and the caller re-reads.  Never merge, which would forge a
  * record whose old no longer matches the intended write.
  */
@@ -1020,8 +977,7 @@ bool urcu_mcas_record_chain(struct urcu_mcas *t, void **slot,
 		/*
 		 * Chain: old_ptr stays the COMMITTED value (what commit
 		 * checks), new_ptr advances.  A load-validate (@upgrade == 0)
-		 * leaves the pending write intact, exactly as in the non-RYW
-		 * path.
+		 * leaves the pending write intact.
 		 */
 		if (upgrade)
 			r->new_ptr = new_ptr;

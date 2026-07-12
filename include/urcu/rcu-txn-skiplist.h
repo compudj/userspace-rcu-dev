@@ -110,22 +110,25 @@
  * Composing several prepares that touch the SAME skiplist
  * ---------------------------------------------------------
  * The _prepare forms search THROUGH the txn (urcu_txn_skiplist_search takes it),
- * so what they see depends on the handle's semantics:
+ * so under the default read-your-own-writes the descent observes the txn's own
+ * pending edits: each prepare lands on its true post-batch predecessor -- often a
+ * node this txn allocated and has not published, whose slots need no record at
+ * all -- and where a published slot genuinely takes two edits, the chained store
+ * fuses them into one record.  Composing several prepares on ONE skiplist in ONE
+ * txn is therefore supported.
  *
- *   - default (invisible buffered writes): a second prepare on the same skiplist
- *     searches the COMMITTED structure, blind to the first's pending edits.  It
- *     can pick a predecessor the first prepare has already displaced, and the two
- *     stores then collide on that one pred->next[L] slot.  Both present the same
- *     old, the engine's one-record-per-slot upgrade overwrites new_ptr, and an
- *     edge is silently destroyed -- a torn tower, not merely a lost key.  So:
- *     compose only across DISTINCT skiplists (as a move / rotation does).
+ * Were the buffered writes invisible instead (the retired pre-RYW mode), a
+ * second prepare on the same skiplist would search the COMMITTED structure,
+ * blind to the first's pending edits.  It could pick a predecessor the first
+ * prepare has already displaced, and the two stores would then collide on that
+ * one pred->next[L] slot: both presenting the same old, the one-record-per-slot
+ * upgrade would overwrite new_ptr and silently destroy an edge -- a torn tower,
+ * not merely a lost key.  Read-your-own-writes is what makes the on-one-skiplist
+ * composition above sound.
  *
- *   - urcu_txn_enable_ryw() (see <urcu/rcu-txn.h>): the descent observes the
- *     txn's own pending edits, so each prepare lands on its true post-batch
- *     predecessor -- often a node this txn allocated and has not published, whose
- *     slots need no record at all -- and where a published slot genuinely takes
- *     two edits, the chained store fuses them into one record.  Composing several
- *     prepares on ONE skiplist in ONE txn is then supported.
+ * A move / rotation composed across DISTINCT skiplists touches disjoint slots by
+ * construction; it may declare that -- urcu_txn_declare_disjoint() (see
+ * <urcu/rcu-txn.h>) -- to skip the per-store reconcile find.
  */
 
 #include <errno.h>
@@ -339,14 +342,13 @@ struct urcu_txn_skiplist_node *urcu_txn_skiplist_next_txn(
  * predecessor/successor made stale by a racing update just fails that check and
  * the caller retries.  Call within an RCU read-side section.
  *
- * The descent hops through @txn, so a RYW handle sees the transaction's OWN
- * pending edits (see urcu_txn_enable_ryw): a node this transaction already
- * deleted is already unlinked in that view and can never be picked as a
- * predecessor, and a node it already inserted is picked when it is the true
- * post-batch predecessor.  The guards in insert_prepare/del_prepare must read
- * through the same view -- they do, via urcu_txn_load -- because a MIXED view
- * (RYW descent, committed-value guard) disagrees with itself and would fail
- * every attempt.
+ * The descent hops through @txn, so it sees the transaction's OWN pending edits
+ * (read-your-own-writes, the default): a node this transaction already deleted is
+ * already unlinked in that view and can never be picked as a predecessor, and a
+ * node it already inserted is picked when it is the true post-batch predecessor.
+ * The guards in insert_prepare/del_prepare must read through the same view --
+ * they do, via urcu_txn_load -- because a MIXED view (RYW descent, committed-value
+ * guard) disagrees with itself and would fail every attempt.
  */
 static inline
 struct urcu_txn_skiplist_node *urcu_txn_skiplist_search(

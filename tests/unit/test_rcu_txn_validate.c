@@ -17,14 +17,13 @@
  *   1. guard holds            -> commit OK, write applied, guarded word intact;
  *   2. guard fails mid-flight -> commit ABORT, write NOT applied;
  *   3. validate-then-store same slot -> one record, commits as the write;
- *   4. store-then-validate same slot -> write preserved (validate never
- *      downgrades a pending write), one record, and without RYW the validate
- *      reads the slot's COMMITTED value;
+ *   4. urcu_txn_load_committed() past a pending store -> reads the slot's
+ *      COMMITTED value, ignoring this attempt's pending write; records nothing,
+ *      and the store still stands at commit;
  *   5. pure guard, unchanged  -> commit OK, slot untouched;
- *   6. store-then-validate under urcu_txn_enable_ryw() -> the validate reads
- *      this transaction's PENDING value instead, its record chains rather than
- *      poisoning, and the record set and committed effect are unchanged.  Only
- *      the value returned to the caller differs between the two modes.
+ *   6. store-then-validate same slot -> the validate reads this transaction's
+ *      own PENDING value (read-your-own-writes, the default), its record chains
+ *      rather than poisoning, one record, write stands.
  *
  * QSBR flavor (the commit defers descriptor reclaim through call_rcu).
  */
@@ -98,9 +97,13 @@ int main(void)
 		"guard fails -> commit aborts and the write is not applied");
 
 	/* 3. validate-then-store same slot: the store upgrades the guard in
-	 * place (one record), and commits as the write. */
+	 * place (one record), and commits as the write.  Like case 6 this is a
+	 * deliberate same-slot self-conflict, so declare it -- otherwise an
+	 * AGE_ESCALATE build would escalate on the age-0 coincidence rather than
+	 * chain into the one record this asserts.  Inert in a stock build. */
 	g_w = VX;
 	urcu_txn_init(&tx, NULL);
+	urcu_txn_expect_conflict(&tx);
 	urcu_txn_begin(&tx);
 	vv = urcu_txn_load_validate(&tx, &g_w, URCU_MCAS_TAG);
 	urcu_txn_store(&tx, &g_w, VX, VZ, URCU_MCAS_TAG);
@@ -110,22 +113,21 @@ int main(void)
 	ok(vv == VX && nr1 == 1 && st == URCU_TXN_STATUS_OK && g_w == VZ,
 		"validate-then-store on one slot -> one record, commits the write");
 
-	/* 4. store-then-validate same slot: the validate must NOT downgrade the
-	 * pending write; still one record; the write stands.  The VALUE the
-	 * validate returns is mode-dependent, so pin the mode: without RYW a load
-	 * never sees the bracket's own buffered store, and returns the slot's
-	 * committed value. */
+	/* 4. urcu_txn_load_committed() is the scoped escape hatch from RYW: after
+	 * buffering a store, it reads past the transaction's own pending write and
+	 * returns the slot's COMMITTED value.  It is a read-only decision helper --
+	 * it records nothing (nr unchanged from the lone store) and does not disturb
+	 * the write, which still commits. */
 	g_w = VX;
 	urcu_txn_init(&tx, NULL);
-	urcu_txn_set_ryw(&tx, 0);	/* explicit: ignore URCU_TXN_RYW_DEFAULT */
 	urcu_txn_begin(&tx);
 	urcu_txn_store(&tx, &g_w, VX, VZ, URCU_MCAS_TAG);
-	vv = urcu_txn_load_validate(&tx, &g_w, URCU_MCAS_TAG);
+	vv = urcu_txn_load_committed(&tx, &g_w, URCU_MCAS_TAG);
 	nr2 = tx.mcas->nr;
 	st = urcu_txn_commit(&tx);
 	urcu_txn_end(&tx);
 	ok(vv == VX && nr2 == 1 && st == URCU_TXN_STATUS_OK && g_w == VZ,
-		"store-then-validate, no RYW -> reads the committed value, write preserved");
+		"load_committed past a pending store -> reads committed value, write preserved");
 
 	/* 5. Pure guard over an unchanged word: commit OK, no modification. */
 	g_w = VX;
@@ -137,14 +139,12 @@ int main(void)
 	ok(vv == VX && st == URCU_TXN_STATUS_OK && g_w == VX,
 		"pure guard over an unchanged word commits without modifying it");
 
-	/* 6. The same shape under read-your-own-writes: the validate observes this
-	 * transaction's PENDING value instead of the committed one, and its record
-	 * chains rather than poisoning (the old it presents is the pending new).
-	 * The record set and the committed effect are identical either way -- only
-	 * the value handed back to the caller differs. */
+	/* 6. store-then-validate on one slot: under the default read-your-own-writes
+	 * the validate observes this transaction's PENDING value (not the committed
+	 * one), and its record chains rather than poisoning (the old it presents is
+	 * the pending new).  One record; the write stands. */
 	g_w = VX;
 	urcu_txn_init(&tx, NULL);
-	urcu_txn_set_ryw(&tx, 1);
 	/*
 	 * Same-slot store+validate is a deliberate self-conflict: under an
 	 * AGE_ESCALATE build age 0 would escalate on the coincidence rather than
