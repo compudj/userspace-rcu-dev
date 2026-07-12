@@ -126,6 +126,13 @@
  * attempts start pre-sized rather than growing into it.  Optional -- store()
  * allocates lazily and grows on its own without it.
  *
+ * Guards.  urcu_txn_load_validate() folds a READ into the commit's conflict set
+ * -- the commit succeeds only if the slot still holds the value it returned.
+ * urcu_txn_validate() is the same guard with a CALLER-SUPPLIED expected value,
+ * for a word whose expected image the mutator computes rather than reads.  Both
+ * park a proxy at plant, so a guard also serializes against a concurrent writer
+ * of the guarded word.
+ *
  * Escalation fallback.  The optimistic retry above is bounded-blocking but not
  * starvation-free: a large or repeatedly-bypassed transaction can be defeated
  * by a stream of smaller ones (the single-edge fast path and the read->install
@@ -1620,6 +1627,42 @@ void *urcu_txn_load_validate_optimistic(struct urcu_mcas_txn *txn, void **slot,
 
 	(void) urcu_txn__record(txn, slot, v, v, 0, tag);
 	return v;
+}
+
+/*
+ * Record a pure guard {@expected -> @expected} on @slot: the commit succeeds
+ * only if @slot still holds @expected at the install point, and aborts
+ * otherwise.  Like every record it PARKS A PROXY on @slot at plant time, so it
+ * serializes against a concurrent writer of that word: whoever plants first
+ * wins and the loser's plant CAS fails.
+ *
+ * The difference from urcu_txn_load_validate() is where the expected value
+ * comes from: that one guards the value it READ, this one guards a value the
+ * CALLER supplies.  So the guard can name a COMPUTED image of the word -- a
+ * control word the consumer expects to find in a particular state, an image it
+ * derived from other state, or a value it read outside the bracket -- which no
+ * read-derived guard can express.  Everything else follows the record rules:
+ *
+ *   - Exact match, not a mask.  The install CAS compares the whole word, so
+ *     @expected is the word the consumer predicts, subfields included; folding a
+ *     status or marker bit into it is how one guards "the stable bits, with the
+ *     marker in the state I expect".  A word that differs anywhere aborts.
+ *   - Value-CAS semantics (as everywhere here): @slot is checked to HOLD
+ *     @expected at the linearization point, not to have been stable throughout.
+ *     An op whose correctness needs to DETECT an away-and-back change must carry
+ *     its own version in the word.
+ *   - Read-your-own-writes: on a slot this attempt has already recorded, the
+ *     guard reconciles by CHAINING, so @expected must equal the record's PENDING
+ *     new value, not the committed one.  A mismatch is a torn read-set: the
+ *     attempt is poisoned and the commit aborts (a legal race, not a bug).
+ *
+ * Sticky on OOM like store: the pending commit reports -ENOMEM.
+ */
+static inline
+void urcu_txn_validate(struct urcu_mcas_txn *txn, void **slot,
+		void *expected, uintptr_t tag)
+{
+	(void) urcu_txn__record(txn, slot, expected, expected, 0, tag);
 }
 
 /*
