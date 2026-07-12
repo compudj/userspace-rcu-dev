@@ -129,23 +129,21 @@
  * Escalation fallback.  The optimistic retry above is bounded-blocking but not
  * starvation-free: a large or repeatedly-bypassed transaction can be defeated
  * by a stream of smaller ones (the single-edge fast path and the read->install
- * window let a committer change a footprint slot between this op's read and its
- * install).  When a handle crosses a threshold it escalates into a per-domain
- * fair mutex (urcu/fair-mutex.h) -- an MCS-style lock -- and publishes
- * domain->active so every *future* transaction funnels through the same lane.
- * That closes the optimistic-writer set: the escalated op then contends only
- * with the finite in-flight set (bounded by thread count) and commits within a
- * bounded number of retries while holding its turn -- progress is guaranteed
- * with no quiescence (no synchronize_rcu).  The lane only serializes *who
- * pushes with top priority*; commits still go through the concurrency-safe MCAS
- * path, so the residual in-flight optimistic writers stay correct.  Two
- * triggers escalate a handle (both gated on a non-NULL domain -- NULL never
- * escalates):
- *   - retry >= URCU_TXN_FALLBACK : a starved op, reactively;
- *   - size  >= URCU_TXN_BIG      : a large op, proactively -- a
- *     reserve(n >= BIG) escalates immediately, before building any nodes,
- *     and a handle whose realized write-set reached BIG escalates on its
- *     next attempt.
+ * window let a committer change a footprint slot between this op's read and
+ * its install).  When a handle crosses a threshold it escalates into a
+ * per-domain fair mutex (urcu/fair-mutex.h) -- an MCS-style lock -- and
+ * publishes domain->active so every *future* transaction funnels through the
+ * same lane. That closes the optimistic-writer set: the escalated op then
+ * contends only with the finite in-flight set (bounded by thread count) and
+ * commits within a bounded number of retries while holding its turn --
+ * progress is guaranteed with no quiescence (no synchronize_rcu).  The lane
+ * only serializes *who pushes with top priority*; commits still go through the
+ * concurrency-safe MCAS path, so the residual in-flight optimistic writers
+ * stay correct.  One trigger escalates a handle (gated on a non-NULL domain --
+ * NULL never escalates): it has RETRIED past the budget its own cost earns it
+ * (see URCU_TXN_FALLBACK_PER_COST_NUM).  Escalation is purely reactive: a
+ * handle takes the lane because it is losing, never merely because it is
+ * large.
  *
  * Only a handle that met a trigger ITSELF -- an INITIATOR -- publishes
  * domain->active.  A handle that escalates merely because it read the flag is a
@@ -202,22 +200,82 @@ extern "C" {
 #endif
 
 /*
- * Escalation thresholds (override before include).  A handle escalates into the
- * domain's lock when its retry count reaches URCU_TXN_FALLBACK (reactive: a
- * starved op) or its write-set size reaches URCU_TXN_BIG (proactive: a large
- * op, e.g. a wide merge).  FALLBACK sits well above the engine's single-edge
- * URCU_MCAS_ESCALATE (16) so ordinary contention rides the optimistic path:
- * escalating too early funnels every contending writer into the one serial
- * lane, which under a shared hot domain collapses both throughput and latency
- * far worse than leaving the optimistic priority protocol to resolve it.  BIG
- * should sit above typical small-mutation edge counts so only genuinely large
- * transactions take the lane up front.
+ * Reactive escalation threshold.  A handle escalates into the domain's lane
+ * when it has RETRIED past the budget its own cost earns it:
+ *
+ *     budget = PER_COST * cost,   capped at URCU_TXN_FALLBACK_MAX
+ *
+ * where cost is the transaction's LOADS PLUS ITS WRITE-SET RECORDS -- the
+ * whole bracket, not just the edges it commits.
+ *
+ * Why the budget scales with cost.  Escalating funnels EVERY writer in the
+ * domain through one serial lane, so what an escalation costs is the length of
+ * the critical section it serializes.  A single-edge op commits with a bare
+ * CAS: serializing it is nearly free, the lane is just queueing, and escalating
+ * early turns wasted CAS collisions into orderly turns.  A traversal mutator is
+ * the opposite: funnelling those destroys N-way parallelism, and the optimistic
+ * path (which aborts far MORE but retries in PARALLEL) beats the serialized
+ * lane by a factor of 2.6 on a 3-skiplist move.  Retries are cheap and
+ * parallel; the lane is not.  So the more a transaction costs, the longer it
+ * should stay optimistic.
+ *
+ * (This is the opposite of a wasted-work rule, which would escalate an
+ * expensive op SOONER because each failed attempt throws away more.
+ * Measurement says wasted work is not the binding cost -- the serialization
+ * is.)
+ *
+ * Why cost counts the LOADS.  Sizing the budget on the write set alone prices
+ * the DESCENT at zero, and the descent is most of what the lane would
+ * serialize: a 3-skiplist move commits ~25 records but reads ~145 slots to
+ * find them.  By write set that move is indistinguishable from a 32-edge blind
+ * update (24.5 vs 32 records) even though the two want budgets an order of
+ * magnitude apart -- so no function of the write-set size can serve both.  By
+ * cost they are 168 vs 64, and one constant does.
+ *
+ * 11/4 (2.75) is where the 3-skiplist peaks -- it falls off on BOTH sides
+ * (2.25 -> 18.5, 2.75 -> 19.5, 4.0 -> 18.8 Mmoves/s at 192 cores).  Measured
+ * against a flat 256 budget, WITH the floor below in place: 3-skiplist +11%,
+ * 3-hash unchanged, bidir list unchanged, and a starved transaction's p99 ~7%
+ * better.  (Without the floor the starved transaction does far better still --
+ * p99 -40%, ~2x throughput -- but that costs the hot list domain 17%, which is
+ * exactly what the floor buys back.)
  */
-#ifndef URCU_TXN_FALLBACK
-#define URCU_TXN_FALLBACK	256
+/*
+ * The scale factor is a RATIONAL, kept in integer arithmetic:
+ *
+ *     budget = (PER_COST_NUM * cost) / PER_COST_DEN
+ *
+ * because the useful range turned out to be finer than one retry per unit of
+ * cost.  Set PER_COST_NUM to 0 to select a flat URCU_TXN_FALLBACK budget
+ * instead (the cost accounting then compiles out entirely).
+ */
+#ifndef URCU_TXN_FALLBACK_PER_COST_NUM
+#define URCU_TXN_FALLBACK_PER_COST_NUM	11	/* 11/4 = 2.75 */
 #endif
-#ifndef URCU_TXN_BIG
-#define URCU_TXN_BIG		128
+#ifndef URCU_TXN_FALLBACK_PER_COST_DEN
+#define URCU_TXN_FALLBACK_PER_COST_DEN	4
+#endif
+#ifndef URCU_TXN_FALLBACK		/* only consulted when PER_COST_NUM == 0 */
+#define URCU_TXN_FALLBACK		256
+#endif
+/*
+ * Floor under the scaled budget.  It is what keeps a CHEAP transaction on a HOT
+ * domain off the lane.  Cost measures what the ESCALATING op costs to
+ * serialize; it says nothing about what the lane's OTHER traffic costs, and
+ * those are not
+ * the same thing.  A bidir-list delete costs about 2 slots, so scaling alone
+ * hands it a budget of 5 retries -- below its own natural retry tail -- and it
+ * starts escalating on ordinary contention, serializing a domain that runs at
+ * 225 Mops/s: a 17% loss on the list churn panel, all of it policy rather than
+ * accounting overhead.  Until a handle has spent a floor of optimistic retries
+ * the domain is presumed healthy and it stays off the lane; 64 is ~8x that
+ * tail, and the 3-skiplist's measured 99.99th-percentile retry count.
+ */
+#ifndef URCU_TXN_FALLBACK_MIN
+#define URCU_TXN_FALLBACK_MIN		64
+#endif
+#ifndef URCU_TXN_FALLBACK_MAX
+#define URCU_TXN_FALLBACK_MAX		4096
 #endif
 
 /*
@@ -535,6 +593,24 @@ struct urcu_mcas_txn {
 					 * duplicate record) unless
 					 * URCU_TXN_DEBUG_DISJOINT traps it.
 					 */
+	unsigned int nload;		/*
+					 * Loads issued by the CURRENT attempt
+					 * (reset by begin()).  The read side
+					 * of the attempt's cost: a
+					 * traversal-driven mutator reads far
+					 * more slots than it writes, and that
+					 * descent sits INSIDE the bracket, so
+					 * the fallback lane serializes it too.
+					 * min_alloc alone (the write set)
+					 * badly understates what escalating
+					 * such a handle costs.
+					 */
+	unsigned int last_cost;		/*
+					 * Cost of the last completed attempt:
+					 * nload + write-set size, learned at
+					 * commit exactly as min_alloc is.  0
+					 * before the first commit attempt.
+					 */
 	int expect_conflict;		/*
 					 * Caller expects this txn to conflict
 					 * -- the negative dual of disjoint.
@@ -763,6 +839,8 @@ void urcu_txn_init_flavor(struct urcu_mcas_txn *txn,
 	txn->flavor = flavor;
 	txn->retry = 0;
 	txn->min_alloc = 0;
+	txn->nload = 0;
+	txn->last_cost = 0;
 	txn->mcas = NULL;
 	uatomic_store(&txn->in_fallback, 0, CMM_RELAXED);
 	txn->fb_published = 0;
@@ -938,11 +1016,78 @@ void urcu_txn_read_unlock(struct urcu_mcas_txn *txn)
  * escalates only because domain->active was up is a joiner and advertises
  * nothing.  The distinction is what makes an episode terminate.
  */
+/*
+ * What the CURRENT attempt has cost so far: the slots it read plus the edges
+ * it has buffered.  Sampled wherever an attempt ends -- commit AND the
+ * guard-driven urcu_txn_conflict() path, which never reaches commit at all.
+ * Missing the latter would leave a traversal mutator that keeps hitting a
+ * guard with a cost of 0 forever, and a cost-scaled threshold would then
+ * escalate it immediately -- exactly the handle that can least afford to be
+ * serialized.
+ */
+static inline
+unsigned int urcu_txn__attempt_cost(const struct urcu_mcas_txn *txn)
+{
+	const struct urcu_mcas *m = txn->mcas;
+	unsigned int w = (m && m != URCU_TXN_ENOMEM) ? m->nr : 0;
+
+	return txn->nload + w;
+}
+
+/*
+ * Learn this operation's cost as a HIGH-WATER MARK, not as the last sample.
+ * An attempt that aborts early in its descent is CHEAP -- it never got to the
+ * far end of the traversal -- so taking the last sample would let a handle
+ * that keeps failing mid-descent shrink its own threshold, escalating
+ * precisely the mutator whose full bracket is most expensive to serialize.
+ * The high-water mark is what this operation costs when it RUNS, which is what
+ * the lane would serialize.
+ */
+static inline
+void urcu_txn__learn_cost(struct urcu_mcas_txn *txn)
+{
+#if URCU_TXN_FALLBACK_PER_COST_NUM
+	unsigned int c = urcu_txn__attempt_cost(txn);
+
+	if (c > txn->last_cost)
+		txn->last_cost = c;
+#else
+	(void) txn;			/* flat threshold: cost is never consulted */
+#endif
+}
+
+/*
+ * Retries this handle may spend on the optimistic path before it earns the
+ * lane. With URCU_TXN_FALLBACK_PER_COST_NUM == 0 this is the flat
+ * URCU_TXN_FALLBACK. Otherwise it scales with the realized write-set size
+ * (min_alloc, learned at the first commit -- 0 on the very first attempt,
+ * which cannot have retried anyway), so a cheap-to-serialize op escalates
+ * early and an expensive one does not.  See the URCU_TXN_FALLBACK_PER_COST_NUM
+ * comment above.
+ */
+static inline
+unsigned long urcu_txn__fallback_at(const struct urcu_mcas_txn *txn)
+{
+	unsigned long n, t;
+
+	if (!URCU_TXN_FALLBACK_PER_COST_NUM)
+		return URCU_TXN_FALLBACK;
+	/*
+	 * 1 until the first attempt has been costed: a handle that has not run
+	 * yet has not retried either, so the budget it gets cannot matter.
+	 */
+	n = txn->last_cost ? txn->last_cost : 1;
+	t = ((unsigned long) URCU_TXN_FALLBACK_PER_COST_NUM * n) /
+		URCU_TXN_FALLBACK_PER_COST_DEN;
+	if (t < URCU_TXN_FALLBACK_MIN)
+		t = URCU_TXN_FALLBACK_MIN;	/* also rules out a zero budget */
+	return t > URCU_TXN_FALLBACK_MAX ? URCU_TXN_FALLBACK_MAX : t;
+}
+
 static inline
 int urcu_txn__self_qualifies(const struct urcu_mcas_txn *txn)
 {
-	return txn->retry >= URCU_TXN_FALLBACK ||
-		txn->min_alloc >= URCU_TXN_BIG;
+	return txn->retry >= urcu_txn__fallback_at(txn);
 }
 
 static inline
@@ -1066,6 +1211,7 @@ static inline
 void urcu_txn_begin(struct urcu_mcas_txn *txn)
 {
 	txn->retrying = 0;
+	txn->nload = 0;		/* attempt cost is per-attempt */
 	/*
 	 * Escalate before opening the attempt: a starved (retry) or
 	 * already-known large (min_alloc) handle takes its FIFO turn here.
@@ -1112,16 +1258,6 @@ int urcu_txn_reserve(struct urcu_mcas_txn *txn, unsigned int n)
 	struct urcu_mcas *m;
 
 	txn->min_alloc = n;
-	/*
-	 * A large op declares its size here: escalate immediately, before
-	 * building any nodes, so it never runs a disruptive optimistic attempt.
-	 * We hold the read-side section across the (possibly blocking) FIFO
-	 * enter (see __enter_fallback): the bounded wait keeps the caller's
-	 * pinned pointers alive and cannot extend a grace period unboundedly.
-	 */
-	if (txn->domain && !uatomic_load(&txn->in_fallback, CMM_RELAXED) &&
-			n >= URCU_TXN_BIG)
-		urcu_txn__enter_fallback(txn);
 	if (caa_unlikely(txn->mcas == URCU_TXN_ENOMEM))
 		return -ENOMEM;		/* sticky: an earlier alloc already failed */
 	if (!n)
@@ -1320,6 +1456,9 @@ static inline
 void *urcu_txn__load(struct urcu_mcas_txn *txn, void **slot, uintptr_t tag,
 		int optimistic, int committed)
 {
+#if URCU_TXN_FALLBACK_PER_COST_NUM
+	txn->nload++;			/* attempt cost: the bracket's READ side */
+#endif
 	if (!committed && !txn->disjoint && txn->mcas != NULL
 			&& txn->mcas != URCU_TXN_ENOMEM) {
 		if (urcu_txn__eff_retry(txn) == 0) {
@@ -1528,6 +1667,7 @@ enum urcu_txn_status urcu_txn_commit_flavor(struct urcu_mcas_txn *txn,
 		 */
 		txn->esc_pending = 0;
 		txn->min_alloc = m->nr;
+		urcu_txn__learn_cost(txn);
 		urcu_mcas_destroy(m);		/* unpublished: synchronous free */
 		txn->mcas = NULL;
 		txn->retry++;			/* -> age 1 */
@@ -1535,6 +1675,14 @@ enum urcu_txn_status urcu_txn_commit_flavor(struct urcu_mcas_txn *txn,
 		return URCU_TXN_STATUS_ABORT;
 	}
 	txn->min_alloc = m->nr;		/* learn the realized size: a retry won't re-grow */
+	/*
+	 * Learn what this attempt COST: its reads plus its writes.  The write
+	 * set alone understates a traversal-driven mutator badly -- a skiplist
+	 * move commits ~25 records but descends over an order of magnitude
+	 * more slots, and that descent is inside the bracket, so escalating
+	 * serializes it too.
+	 */
+	urcu_txn__learn_cost(txn);
 	txn->mcas = NULL;		/* mcas_commit consumes the descriptor */
 	if (urcu_mcas_commit(m, call_rcu_fn))
 		return URCU_TXN_STATUS_OK;
@@ -1569,6 +1717,7 @@ enum urcu_txn_status urcu_txn_commit(struct urcu_mcas_txn *txn)
 static inline
 void urcu_txn_conflict(struct urcu_mcas_txn *txn)
 {
+	urcu_txn__learn_cost(txn);	/* the descent counts */
 	txn->retry++;			/* aged: a guard storm now escalates */
 	txn->retrying = 1;		/* keep the FIFO turn across the retry */
 }
@@ -1587,6 +1736,13 @@ void urcu_txn_conflict(struct urcu_mcas_txn *txn)
  * make that end() terminal.  Harmless on a handle that never escalated, or
  * never aborted.
  */
+/* Cost of the last completed attempt: loads + write-set records. */
+static inline
+unsigned int urcu_txn_last_cost(const struct urcu_mcas_txn *txn)
+{
+	return txn->last_cost;
+}
+
 static inline
 void urcu_txn_abandon(struct urcu_mcas_txn *txn)
 {

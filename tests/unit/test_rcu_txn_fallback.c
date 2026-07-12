@@ -31,9 +31,14 @@
 #define _LGPL_SOURCE
 #endif
 
-/* Lower the thresholds before the include so the lane actually fires. */
-#define URCU_TXN_FALLBACK	8
-#define URCU_TXN_BIG		6
+/*
+ * Lower the threshold before the include so the lane actually fires.
+ * PER_COST_NUM 0 selects the FLAT budget: this test drives the retry count
+ * directly, so it wants a trigger that does not depend on what an attempt
+ * happened to cost.
+ */
+#define URCU_TXN_FALLBACK_PER_COST_NUM	0
+#define URCU_TXN_FALLBACK		8
 
 #include <inttypes.h>
 #include <pthread.h>

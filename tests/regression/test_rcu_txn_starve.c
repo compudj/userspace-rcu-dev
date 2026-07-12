@@ -36,10 +36,11 @@
  *     @nslots, so it touches EVERY slot: any small commit at all, anywhere,
  *     between its loads and its install invalidates the attempt.  It starves.
  *
- * @width is deliberately held BELOW URCU_TXN_BIG.  A write set that reaches
- * BIG escalates PROACTIVELY on size, which would bypass the very trigger under
- * test; staying under it means the only way into the lane is retry >=
- * URCU_TXN_FALLBACK.  A width that would cheat is rejected.
+ * The lane is earned by RETRIES ALONE, and the budget of retries a handle gets
+ * is its own: PER_COST * cost, where cost is the loads plus the write-set
+ * records of one attempt.  The wide op loads and stores every slot, so its
+ * cost is 2 * @width and its budget is PER_COST * 2 * @width -- which is what
+ * this test asserts it starves past.
  *
  * What is checked.  The escalation state lives in the caller-owned on-stack
  * handle, so a writer samples it directly after each urcu_txn_begin():
@@ -84,7 +85,7 @@
 static int  nslots      = 32;	/* transacted words the writers fight over */
 static int  nsmall      = 32;	/* single-edge writers (the starving stream) */
 static int  nwide       = 4;	/* wide writers (the victims) */
-static int  width;		/* edges per wide txn; 0 => nslots.  < URCU_TXN_BIG */
+static int  width;		/* edges per wide txn; 0 => nslots */
 static long duration_ms = 5000;
 static int  use_disjoint = 1;	/* the wide write set IS pairwise distinct */
 /*
@@ -123,6 +124,26 @@ struct arg {
 	int id;
 	struct stats st;
 };
+
+/*
+ * The wide op's escalation budget.  One attempt loads @width slots and records
+ * @width edges, so its cost is 2 * @width and its retry budget is that scaled
+ * by PER_COST_NUM/PER_COST_DEN (capped).  With a flat budget (PER_COST_NUM ==
+ * 0) it is simply URCU_TXN_FALLBACK.  This is the threshold the wide op must
+ * starve past.
+ */
+static unsigned long wide_budget(void)
+{
+	unsigned long t;
+
+	if (!URCU_TXN_FALLBACK_PER_COST_NUM)
+		return URCU_TXN_FALLBACK;
+	t = ((unsigned long) URCU_TXN_FALLBACK_PER_COST_NUM * 2UL *
+			(unsigned long) width) / URCU_TXN_FALLBACK_PER_COST_DEN;
+	if (!t)
+		t = 1;
+	return t > URCU_TXN_FALLBACK_MAX ? URCU_TXN_FALLBACK_MAX : t;
+}
 
 /* xorshift64 per-thread RNG (no shared rand() lock). */
 static inline unsigned long xrand(unsigned long *s)
@@ -308,12 +329,9 @@ static void usage(char *argv[])
 {
 	diag("Usage: %s [--nslots N] [--nsmall N] [--nwide N] [--width N]", argv[0]);
 	diag("          [--duration MS] [--disjoint 0|1] [--domain 0|1]");
-	diag("  --width N   edges per wide txn (default: --nslots).  MUST be <");
-	diag("              URCU_TXN_BIG (%d), or the handle escalates PROACTIVELY",
-		URCU_TXN_BIG);
-	diag("              on size and the reactive retry >= URCU_TXN_FALLBACK (%d)",
-		URCU_TXN_FALLBACK);
-	diag("              trigger under test is bypassed.");
+	diag("  --width N   edges per wide txn (default: --nslots).  Sets the wide");
+	diag("              op's escalation budget: cost 2*width, budget %lu retries.",
+		wide_budget());
 	diag("  --domain 0  disable the escalation lane (the control): the wide");
 	diag("              transactions then never finish.");
 	exit(1);
@@ -352,14 +370,6 @@ int main(int argc, char *argv[])
 
 	if (nslots < 2 || nsmall < 1 || nwide < 1 || width < 2 || width > nslots)
 		usage(argv);
-	if (width >= URCU_TXN_BIG) {
-		diag("refusing --width %d: >= URCU_TXN_BIG (%d) escalates PROACTIVELY on size,",
-			width, URCU_TXN_BIG);
-		diag("which bypasses the reactive retry >= URCU_TXN_FALLBACK (%d) trigger",
-			URCU_TXN_FALLBACK);
-		diag("this test exists to exercise.");
-		usage(argv);
-	}
 
 	slot = calloc((size_t) nslots, sizeof(*slot));
 	sa = calloc((size_t) nsmall, sizeof(*sa));
@@ -377,8 +387,10 @@ int main(int argc, char *argv[])
 	diag("slots: %d  small: %d  wide: %d  width: %d  disjoint: %s  domain: %s",
 		nslots, nsmall, nwide, width, use_disjoint ? "on" : "off",
 		use_domain ? "on" : "OFF (control)");
-	diag("URCU_TXN_FALLBACK=%d (reactive, under test)  URCU_TXN_BIG=%d (proactive, avoided)  URCU_MCAS_ESCALATE=%d",
-		URCU_TXN_FALLBACK, URCU_TXN_BIG, URCU_MCAS_ESCALATE);
+	diag("escalation is REACTIVE ONLY: budget = cost * %d/%d",
+		URCU_TXN_FALLBACK_PER_COST_NUM, URCU_TXN_FALLBACK_PER_COST_DEN);
+	diag("wide op: cost %d (loads %d + records %d) => budget %lu retries  |  URCU_MCAS_ESCALATE=%d",
+		2 * width, width, width, wide_budget(), URCU_MCAS_ESCALATE);
 
 	rcu_register_thread();
 	rcu_thread_offline();
@@ -468,9 +480,9 @@ int main(int argc, char *argv[])
 	 * threshold and escalated on its own merits -- the reactive trigger,
 	 * which no forced-threshold unit test can reach.
 	 */
-	ok(W.max_retry >= URCU_TXN_FALLBACK && W.as_initiator > 0,
-		"reactive escalation FIRED: a wide txn starved past URCU_TXN_FALLBACK (max retry %lu >= %d) and initiated %lld episode(s)",
-		W.max_retry, URCU_TXN_FALLBACK, W.as_initiator);
+	ok(W.max_retry >= wide_budget() && W.as_initiator > 0,
+		"reactive escalation FIRED: a wide txn starved past its cost-scaled budget (max retry %lu >= %lu) and initiated %lld episode(s)",
+		W.max_retry, wide_budget(), W.as_initiator);
 
 	/*
 	 * And the episode funnelled the others: that is what closes the

@@ -6,10 +6,9 @@
  * Who publishes domain->active, and therefore when a fallback episode ENDS.
  *
  * The escalation lane is entered by two kinds of handle.  An INITIATOR met a
- * trigger itself (retry >= URCU_TXN_FALLBACK, or min_alloc >= URCU_TXN_BIG); a
- * JOINER escalated only because it sampled domain->active.  Only an initiator
- * advertises, so the episode outlives neither its initiator nor a joiner it
- * promoted.
+ * trigger itself (it retried past its escalation budget); a JOINER escalated
+ * only because it sampled domain->active.  Only an initiator advertises, so
+ * the episode outlives neither its initiator nor a joiner it promoted.
  *
  * If every holder re-asserted the flag, the episode would sustain itself: the
  * flag is up whenever anyone holds the lane, each arrival that samples it
@@ -31,9 +30,13 @@
 #define _LGPL_SOURCE
 #endif
 
-/* Low thresholds so the lane fires on purpose, not by accident. */
-#define URCU_TXN_BIG		4
-#define URCU_TXN_FALLBACK	8
+/*
+ * Low threshold so the lane fires on purpose, not by accident.  PER_COST_NUM 0
+ * selects the FLAT budget: this test is about WHO PUBLISHES, so it wants a
+ * trigger that does not depend on what an attempt happened to cost.
+ */
+#define URCU_TXN_FALLBACK_PER_COST_NUM	0
+#define URCU_TXN_FALLBACK		8
 
 #include <poll.h>
 #include <pthread.h>
@@ -71,18 +74,17 @@ static void spin_until(int *p, int v)
 /* ------------------------------------------------------------------ */
 /* 1-4: an initiator publishes, and its exit ends the episode.        */
 
-static void test_initiator_by_size(void)
+static void test_initiator_commit_ends_episode(void)
 {
 	struct urcu_mcas_txn tx;
 
 	g_wa = V0;
 	urcu_txn_init(&tx, &g_dom);
+	tx.retry = URCU_TXN_FALLBACK;		/* white-box: a starved handle */
 	urcu_txn_begin(&tx);
-	if (urcu_txn_reserve(&tx, URCU_TXN_BIG))	/* >= BIG: escalate now */
-		abort();
 	ok(tx.in_fallback && tx.fb_published &&
 			uatomic_read(&g_dom.active) == 1,
-		"reserve(>= BIG) escalates, and the initiator publishes the episode");
+		"a starved handle escalates, and the initiator publishes the episode");
 
 	urcu_txn_store(&tx, &g_wa, V0, V1, URCU_MCAS_TAG);
 	if (urcu_txn_commit(&tx) != URCU_TXN_STATUS_OK)
@@ -199,9 +201,8 @@ static void test_joiner_does_not_sustain_episode(void)
 
 	/* A becomes the initiator and holds the lane. */
 	urcu_txn_init(&ta, &g_dom);
+	ta.retry = URCU_TXN_FALLBACK;		/* white-box: a starved handle */
 	urcu_txn_begin(&ta);
-	if (urcu_txn_reserve(&ta, URCU_TXN_BIG))
-		abort();
 	if (!ta.fb_published)
 		abort();
 
@@ -241,7 +242,7 @@ int main(void)
 	rcu_register_thread();
 	urcu_txn_domain_init(&g_dom);
 
-	test_initiator_by_size();		/* 1, 2 */
+	test_initiator_commit_ends_episode();	/* 1, 2 */
 	test_initiator_by_retry();		/* 3, 4 */
 	test_joiner_does_not_publish();		/* 5, 6 */
 	test_joiner_promoted_on_starvation();	/* 7, 8 */
