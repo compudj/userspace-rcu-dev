@@ -61,6 +61,20 @@
  * latch *before* the forward edge, so a reader -- which descends before it
  * walks back up -- can only ever progress old->new, never regress).
  *
+ * SCOPE of "never new-then-old".  Monotonicity of the SELECTOR is unconditional
+ * -- it is one word, stored once.  What a reader's SEQUENCE of resolutions
+ * inherits from it depends on how the reader got from one slot to the next.  A
+ * DEPENDENCY-CHAINED traversal (each hop's address derived from the value the
+ * previous hop loaded) carries the order for free on every architecture urcu
+ * supports, and so does any build using the default C11 dereference.  A reader
+ * that hops WITHOUT that chain -- re-reading a pointer it cached earlier, or
+ * walking prev-then-next between two independently-reached slots -- has no such
+ * edge: under -DURCU_DEREFERENCE_USE_VOLATILE on weakly-ordered hardware its
+ * two loads may be reordered, and it can observe the new selector's effect on
+ * the later slot and the old on the earlier one.  Such a reader owes itself an
+ * explicit acquire (or a dependency).  The fixed-read-order idiom above is
+ * exactly a dependency-chained descent, which is why it is safe as stated.
+ *
  * Two layers
  * ----------
  * This header provides two layers:
@@ -471,6 +485,15 @@ bool urcu_txn_sw_reserve(struct urcu_txn_sw_txn *t, unsigned int cap)
 
 	if (caa_unlikely(t->state == URCU_TXN_SW_OOM))
 		return false;			/* sticky: an earlier alloc failed */
+	/*
+	 * PREPARE only, exactly like record().  install() is a documented
+	 * public entry, so a white-box caller can reach reserve() with proxies
+	 * already parked -- and the grow path below would then memcpy the
+	 * latches to a fresh block and FREE the old one while live slots still
+	 * point into it: a reader dereferences a freed proxy.  The record set
+	 * is frozen once installed.
+	 */
+	urcu_posix_assert(t->state == URCU_TXN_SW_PREPARE);
 	if (t->latches) {
 		if (cap <= t->cap)
 			return true;		/* already sized (heap block or inline buf) */
@@ -609,6 +632,18 @@ bool urcu_txn_sw_record(struct urcu_txn_sw_txn *t, void **slot,
 		t->block = nb;
 		t->latches = nb->latches;
 		t->cap = nb->cap;
+		/*
+		 * The storage is now the ENGINE's, so drop the inline flag.  It
+		 * can still be set here: the assert above compiles out under
+		 * NDEBUG, and an oversized caller-storage handle then reaches
+		 * this grow and MIGRATES to engine-owned heap (its records
+		 * copied; the caller's buffer left untouched and, as promised,
+		 * never freed).  Leaving the flag set would make
+		 * __free_records() skip the free of the block we just adopted
+		 * -- a leak -- and would trip commit()'s inline assert on a
+		 * handle that is no longer inline.
+		 */
+		t->latches_inline = false;
 	}
 	l = &t->latches[t->nr++];
 	urcu_txn_sw_latch_set(l, slot, old_ptr, new_ptr, tag);
@@ -627,7 +662,28 @@ void urcu_txn_sw_install(struct urcu_txn_sw_txn *t)
 {
 	unsigned int i;
 
+	/*
+	 * Contract (see urcu_txn_sw_init_inline): a CALLER-storage handle must
+	 * never park proxies -- its records do not outlive the call, and it
+	 * owns no block to hang the proxies' group off.  Enforce it HERE.  The
+	 * header claims "the engine asserts an inline buffer never reaches that
+	 * path", but neither existing assert covers it: record()'s fires only
+	 * on a grow (nr == cap), and commit()'s runs AFTER install has already
+	 * stored.  Without this guard an inline handle with 2..cap records
+	 * walks into the branch below -- !t->block is ALSO the normal state of
+	 * every inline handle -- which repoints t->latches at a fresh block,
+	 * DISCARDING the caller's records, and the park loop then
+	 * release-stores tagged proxies through that block's UNINITIALIZED
+	 * l->slot pointers: wild stores to garbage addresses.
+	 */
+	urcu_posix_assert(!t->latches_inline);
 	if (caa_unlikely(!t->block)) {		/* white-box install with no record */
+		/*
+		 * The only way to be block-less on a heap handle: nothing was
+		 * ever recorded or reserved.  Anything else would strand the
+		 * records buffered in the array we are about to replace.
+		 */
+		urcu_posix_assert(!t->nr);
 		t->block = urcu_txn_sw__block_alloc(URCU_TXN_SW_CAP);
 		if (caa_unlikely(!t->block)) {
 			t->state = URCU_TXN_SW_OOM;	/* sticky; nothing parked */

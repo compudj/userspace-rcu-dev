@@ -43,6 +43,8 @@ noinst_PROGRAMS = \
 	test_rcu_txn_skiplist_ryw \
 	test_rcu_txn_slab \
 	test_rcu_txn_read_policy \
+	test_rcu_txn_beginless \
+	test_rcu_txn_guards \
 	test_fair_mutex \
 	test_urcu_multiflavor \
 	test_urcu_multiflavor_cxx \
@@ -96,6 +98,8 @@ TESTS = \
 	test_rcu_txn_skiplist_ryw \
 	test_rcu_txn_slab \
 	test_rcu_txn_read_policy \
+	test_rcu_txn_beginless \
+	test_rcu_txn_guards \
 	test_fair_mutex \
 	test_urcu_multiflavor \
 	test_urcu_multiflavor_cxx \
@@ -219,6 +223,19 @@ test_rcu_txn_read_policy_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
 # check exist at all -- see the header block above URCU_TXN_ENOMEM in rcu-txn.h.
 test_rcu_txn_read_policy_CPPFLAGS = $(AM_CPPFLAGS) \
 	-DURCU_TXN_DEBUG_READ_POLICY -DURCU_TXN_DEBUG_READ_POLICY_SOFT
+
+test_rcu_txn_beginless_SOURCES = test_rcu_txn_beginless.c
+test_rcu_txn_beginless_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
+
+test_rcu_txn_guards_SOURCES = test_rcu_txn_guards.c
+test_rcu_txn_guards_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
+# The contract guards this test provokes are urcu_assert_debug(), which exists
+# only under DEBUG_RCU.  Build the test with it so the guards are there whatever
+# the tree's build flags -- the test forks a child per case and asserts it dies
+# by SIGABRT, so a compiled-out guard would silently pass otherwise.  (The sw
+# cases are urcu_posix_assert: present unless NDEBUG, under which the test skips
+# itself entirely.)
+test_rcu_txn_guards_CPPFLAGS = $(AM_CPPFLAGS) -DDEBUG_RCU
 
 test_fair_mutex_SOURCES = test_fair_mutex.c
 test_fair_mutex_LDADD = $(URCU_COMMON_LIB) $(TAP_LIB)

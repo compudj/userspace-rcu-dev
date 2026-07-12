@@ -161,6 +161,21 @@ extern "C" {
 #define URCU_TXN_HLIST_MARK	2UL
 #endif
 
+/*
+ * The non-aliasing contract between the two, stated in the header intro, is
+ * what keeps a ghost's marked "next" from reading as an engine proxy.  Should
+ * an override make MARK set all of TAG's bits, every marked next would satisfy
+ * urcu_mcas_is_proxy() and a reader would fabricate a record pointer out of a
+ * plain node address -- a wild dereference on the read side, in a build that
+ * still compiles.  It is a pure compile-time property of two macros: check it
+ * at compile time.
+ */
+urcu_static_assert((URCU_TXN_HLIST_MARK & URCU_TXN_HLIST_TAG) !=
+			URCU_TXN_HLIST_TAG,
+		"URCU_TXN_HLIST_MARK must not set all of URCU_TXN_HLIST_TAG's bits: "
+		"a marked next would resolve as an engine proxy",
+		URCU_TXN_HLIST_MARK_aliases_TAG);
+
 struct urcu_txn_hlist_node {
 	struct urcu_txn_hlist_node *next;	/* node ptr; transacted; MARK-able */
 	struct urcu_txn_hlist_node **pprev;	/* slot ptr (&prev->next or
@@ -241,6 +256,12 @@ struct urcu_txn_hlist_node *urcu_txn_hlist_next_rcu(
 	return urcu_txn_hlist_resolve((void *) rcu_dereference(node->next));
 }
 
+/*
+ * Whether bucket @head is empty.  A reader accessor like the rest: call within
+ * an RCU read-side section -- the head slot it reads may hold a proxy, and
+ * resolving one dereferences a descriptor that a grace period would otherwise
+ * reclaim.
+ */
 static inline
 int urcu_txn_hlist_empty(struct urcu_txn_hlist_head *head)
 {
@@ -257,6 +278,18 @@ int urcu_txn_hlist_empty(struct urcu_txn_hlist_head *head)
  * any concurrent insert/delete that rewrites @slot fails this commit's old-value
  * check.  Returns 0, or -EAGAIN if @succ is a neighbour mid-deletion (retry);
  * OOM is sticky to the commit.
+ *
+ * COMPOSE ON A DEFAULT HANDLE.  The self-contained wrappers below declare their
+ * write set disjoint -- sound because a SINGLE-op commit provably touches
+ * distinct slots -- but that line must NOT be copied into a composed bracket
+ * unless the COMBINED write set is provably distinct too.  Two edits of one
+ * bucket share a slot as soon as their nodes land adjacent (both name the
+ * shared neighbour's "next", or &head->first): data-dependent, not knowable up
+ * front.  On a disjoint handle the second prepare's loads then silently return
+ * committed values and its stores blind-append a duplicate record -- silent
+ * corruption.  The default read-your-own-writes handle sees the txn's own
+ * pending edits and chains the collision into one record.  See
+ * urcu_txn_declare_disjoint() in <urcu/rcu-txn.h>.
  */
 static inline
 int urcu_txn_hlist_insert_at_slot_prepare(struct urcu_mcas_txn *txn,
@@ -314,8 +347,9 @@ int urcu_txn_hlist_insert_after_prepare(struct urcu_mcas_txn *txn,
 /*
  * urcu_txn_hlist_insert_head_prepare: record an insert of @newp at the head of
  * @head (making it the bucket's first node), WITHOUT committing.  The head slot
- * is immortal (never marked in the base hlist), so this never observes a deleted
- * anchor.  Returns 0, or -EAGAIN if the old first node is mid-deletion (retry).
+ * is immortal in the BASE hlist -- nothing ever marks it -- so this normally
+ * never observes a deleted anchor.  Returns 0, -EAGAIN if the old first node is
+ * mid-deletion (retry), or -ENOENT if the head slot itself carries a mark.
  */
 static inline
 int urcu_txn_hlist_insert_head_prepare(struct urcu_mcas_txn *txn,
@@ -324,15 +358,32 @@ int urcu_txn_hlist_insert_head_prepare(struct urcu_mcas_txn *txn,
 {
 	void *fn = urcu_txn_load(txn, (void **) &head->first, URCU_TXN_HLIST_TAG);
 
+	/*
+	 * Fail on a marked head rather than stripping the mark, which is what
+	 * unmark() alone would do.  No base-hlist operation can set it, so this
+	 * costs one predicted branch and is dead today -- but a MARKED HEAD IS
+	 * EXACTLY the sealing primitive the incremental-rehash design reserves
+	 * (seal the bucket, migrate it, retire it).  Under a stripping insert
+	 * that seal is invisible: the insert records {&head->first: first ->
+	 * newp} against a slot whose committed value carries the mark, the
+	 * old-value check fails at every install, and the mutator loops
+	 * ABORT-forever -- past URCU_TXN_FALLBACK holding the domain's lane
+	 * while it does.  Reporting -ENOENT (an anchor that is gone, the same
+	 * convention insert_after_prepare uses for a deleted @pos) makes the
+	 * caller retire the bucket instead.
+	 */
+	if (urcu_txn_hlist_is_marked(fn))
+		return -ENOENT;			/* head sealed: the bucket is gone */
 	return urcu_txn_hlist_insert_at_slot_prepare(txn, newp,
-			&head->first, urcu_txn_hlist_unmark(fn));
+			&head->first, (struct urcu_txn_hlist_node *) fn);
 }
 
 /*
  * Add @newp at the head of bucket @head, transacting through @domain's
- * escalation lane.  Returns 0 on success, or -ENOMEM on descriptor OOM (never
- * -ENOENT: the head is immortal).  Self-contained bracket around
- * urcu_txn_hlist_insert_head_prepare().
+ * escalation lane.  Returns 0 on success, -ENOMEM on descriptor OOM, or -ENOENT
+ * if the head slot has been SEALED -- unreachable in the base hlist, whose head
+ * is immortal, but see urcu_txn_hlist_insert_head_prepare().  Self-contained
+ * bracket around it.
  */
 static inline
 int urcu_txn_hlist_add_rcu(struct urcu_txn_hlist_node *newp,
@@ -351,6 +402,10 @@ int urcu_txn_hlist_add_rcu(struct urcu_txn_hlist_node *newp,
 			urcu_txn_conflict(&txn);
 			urcu_txn_end(&txn);
 			continue;
+		}
+		if (prep) {				/* -ENOENT: head sealed */
+			urcu_txn_end(&txn);
+			return prep;		/* nothing recorded: do not commit */
 		}
 		ret = urcu_txn_commit(&txn);
 		urcu_txn_end(&txn);

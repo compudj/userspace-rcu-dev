@@ -91,8 +91,13 @@
  *   del(key)          -- node's toplevel+1 levels, each: MARK node->next[L], and
  *                        pred[L]->next[L]: node -> node->next[L].  2 edges/level.
  *   move              -- del(key) in list A composed with insert(new, key) in
- *                        list B in ONE txn (see the _prepare forms): a reader
- *                        sees the key in exactly one of A / B, never both/neither.
+ *                        list B in ONE txn (see the _prepare forms).  The
+ *                        commit is a single state transition, so no COMMITTED
+ *                        state ever has the key in both A and B, or in
+ *                        neither.  A reader is not a transaction, though: one
+ *                        that walks A and then B can straddle the commit and
+ *                        find the key in neither.  See the consistency model
+ *                        in <urcu/rcu-txn.h>.
  *
  * Reclaim, read/write contract, escalation
  * ----------------------------------------
@@ -126,9 +131,40 @@
  * not merely a lost key.  Read-your-own-writes is what makes the on-one-skiplist
  * composition above sound.
  *
- * A move / rotation composed across DISTINCT skiplists touches disjoint slots by
- * construction; it may declare that -- urcu_txn_declare_disjoint() (see
- * <urcu/rcu-txn.h>) -- to skip the per-store reconcile find.
+ * One caveat on the FIRST attempt.  A default handle's age-0 attempt runs the
+ * stripped read-your-own-writes path: it maintains the Bloom filter but never
+ * consults the write set.  A same-skiplist batch, whose prepares alias by
+ * construction, therefore flags the coincidence and ABORTS by design,
+ * re-running at age 1+ where find resolves it.  The batch is correct either
+ * way, but that first attempt is guaranteed wasted --
+ * urcu_txn_expect_conflict() (<urcu/rcu-txn.h>) skips it.
+ *
+ * Declaring the write set disjoint
+ * --------------------------------
+ * A one-way MOVE composed across DISTINCT skiplists -- del(key) from A, insert
+ * of the same key into B -- touches disjoint slots by construction: every slot
+ * it records lives in A or in B, and no slot is in both.  Such a handle may
+ * declare that with urcu_txn_declare_disjoint() (see <urcu/rcu-txn.h>) and skip
+ * the per-store reconcile find.
+ *
+ * A ROTATION IS NOT SUCH A MOVE.  Rotating k1: A->B, k2: B->C, k3: C->A hands
+ * EVERY list both a del and an insert, of different keys -- and when the
+ * incoming key lands adjacent to the outgoing node, the two prepares coincide
+ * on one pred->next[L] slot.  That is data-dependent; the keys alone do not
+ * tell you.  Declaring disjoint there suppresses the RYW consult at EVERY age,
+ * so the insert's descent still sees the deleted node linked, picks it as
+ * pred/succ, and records a slot the del already recorded.  At age 0 the
+ * duplicate blind-appends and the commit tears the tower.  At age 1+ the
+ * reconcile sees a disagreeing old (the del's pending MARK) and poisons the
+ * attempt -- and a disjoint handle stays RYW-blind on every retry, so it
+ * poisons again, forever.  Past URCU_TXN_FALLBACK that livelock holds the
+ * domain's fair-mutex lane and stalls every writer in the domain.
+ *
+ * So declare disjoint only for a move that is a SINGLE op per list.  For a
+ * rotation, a batch, or a range move, keep the default (RYW) handle -- and
+ * since those alias by construction rather than by luck, add
+ * urcu_txn_expect_conflict() so the guaranteed-doomed age-0 attempt is never
+ * spent.
  */
 
 #include <errno.h>
@@ -287,6 +323,12 @@ void urcu_txn_skiplist_destroy(struct urcu_txn_skiplist *sl)
 	sl->head = NULL;
 }
 
+/*
+ * Whether @sl holds no key.  A reader accessor like the rest: call within an
+ * RCU read-side section -- the level-0 slot it reads may hold a proxy, and
+ * resolving one dereferences a descriptor that a grace period would otherwise
+ * reclaim.
+ */
 static inline
 int urcu_txn_skiplist_empty(struct urcu_txn_skiplist *sl)
 {
@@ -312,11 +354,12 @@ int urcu_txn_skiplist_empty(struct urcu_txn_skiplist *sl)
  */
 /*
  * Resolved forward step at @level taken THROUGH a transaction: identical to
- * urcu_txn_skiplist_next_rcu() except that, when @txn opted into
- * read-your-own-writes, the hop observes the transaction's own buffered stores.
- * That is what lets a later edit in a batch traverse the structure as the commit
- * will leave it rather than as it is, so it computes its write site against the
- * batch's pending edits.  With RYW off (the default) this is exactly the plain
+ * urcu_txn_skiplist_next_rcu() except that the hop observes the transaction's
+ * own buffered stores (read-your-own-writes, the engine's default).  That is
+ * what lets a later edit in a batch traverse the structure as the commit will
+ * leave it rather than as it is, so it computes its write site against the
+ * batch's pending edits.  On a handle that declared its write set DISJOINT --
+ * which by contract never reads its own writes -- this degenerates to the plain
  * resolved read.  Call within the txn's RCU read-side section.
  */
 static inline
@@ -418,6 +461,14 @@ int urcu_txn_skiplist_insert_prepare(struct urcu_mcas_txn *txn,
 	struct urcu_txn_skiplist_node *cand;
 	unsigned int level, top = newp->toplevel;
 
+	/*
+	 * @newp->toplevel is the CALLER's (urcu_txn_skiplist_random_level()
+	 * clamps, but a hand-built tower need not have come from it).  An
+	 * over-tall one indexes update[]/ssucc[] past their end -- reading
+	 * whatever the stack holds and transacting the wild addresses it finds
+	 * there.  Debug builds only.
+	 */
+	urcu_assert_debug(top < URCU_TXN_SKIPLIST_MAX_LEVELS);
 	cand = urcu_txn_skiplist_search(txn, sl, key, update, ssucc);
 	if (cand != NULL && sl->cmp(cand, key) == 0)
 		return -EEXIST;

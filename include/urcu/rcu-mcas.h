@@ -543,6 +543,18 @@ void urcu_mcas_drive_install_depth(struct urcu_mcas *t, unsigned int *plantedp)
 					 * there is no hold-and-wait, so its
 					 * records need no slot-address sort to
 					 * stay deadlock-free.
+					 *
+					 * Unreachable from commit(), which
+					 * dispatches retry == 0 to the flat
+					 * install instead -- but it MUST stay.
+					 * It is what keeps this blocking path
+					 * safe for an UNSORTED descriptor: the
+					 * deadlock-freedom of the bounded wait
+					 * below rests on records being
+					 * installed in slot-address order, and
+					 * only age 1+ is sorted.  Anything that
+					 * ever routes an age-0 descriptor here
+					 * has to fail fast rather than wait.
 					 */
 					urcu_mcas_decide(t, URCU_MCAS_FAILED);
 					return;
@@ -909,6 +921,17 @@ bool urcu_mcas_add(struct urcu_mcas *t, void **slot,
 {
 	struct urcu_mcas_record *r;
 
+	/*
+	 * The tag contract (see the proxy tag scheme above): NO value the
+	 * embedder stores in a transacted slot may carry all of @tag's bits, or
+	 * the engine mistakes a live value for one of its parked records and a
+	 * resolver fabricates a record pointer out of it.  Catch a violation at
+	 * the store that introduces it, where the offending value is still in
+	 * hand -- otherwise it surfaces as a wild dereference in some later
+	 * resolve, arbitrarily far away.  Debug builds only.
+	 */
+	urcu_assert_debug(!urcu_mcas_is_proxy(old_ptr, tag));
+	urcu_assert_debug(!urcu_mcas_is_proxy(new_ptr, tag));
 	if (t->nr == t->cap)
 		return false;
 	r = &t->recs[t->nr++];
@@ -1111,14 +1134,28 @@ bool urcu_mcas_commit(struct urcu_mcas *t,
 		urcu_mcas_sort(t);
 	/*
 	 * Engine precondition: a transaction's records must target pairwise-
-	 * distinct slots (the install protocol's "own proxy"
-	 * short-circuit and the read-set checks assume it).  After the
-	 * slot-address sort a duplicate shows up as an adjacent equal slot, so
-	 * a single linear pass catches an embedder that buffered the same slot
-	 * twice.  Debug-only: no cost under NDEBUG.
+	 * distinct slots (the install protocol's "own proxy" short-circuit and
+	 * the read-set checks assume it).  A duplicate can only come from an
+	 * embedder that violated urcu_txn_declare_disjoint()'s contract: the
+	 * default read-your-own-writes path reconciles a same-slot store into
+	 * the record already there, and an age-0 RYW coincidence is discarded
+	 * unpublished (esc_pending) before it ever reaches here.
+	 *
+	 * Compare PAIRWISE, not against the neighbour.  A same-slot pair is
+	 * adjacent only in the sorted age-1+ write set; an age-0 commit
+	 * installs flat and UNSORTED (see above), so its duplicates sit
+	 * anywhere and an adjacency scan walks straight past them.  Debug
+	 * builds only: the write-set is a handful of edges, and no code at all
+	 * is emitted otherwise.
 	 */
-	for (i = 1; i < t->nr; i++)
-		urcu_assert_debug(t->recs[i].slot != t->recs[i - 1].slot);
+#if defined(DEBUG_RCU) || defined(CONFIG_RCU_DEBUG)
+	for (i = 1; i < t->nr; i++) {
+		unsigned int j;
+
+		for (j = 0; j < i; j++)
+			urcu_assert_debug(t->recs[i].slot != t->recs[j].slot);
+	}
+#endif
 	/*
 	 * Set the record back-pointers now, deferred from add time.  The
 	 * write-set may have been grown (realloc'd, hence moved) while it was

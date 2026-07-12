@@ -51,6 +51,16 @@
  * walk.  What is guaranteed is that whatever it observes is internally
  * coherent in both directions at each step.
  *
+ * "At each step" is the precise scope: coherence is a property of a single
+ * resolution, and carrying it ACROSS two resolutions needs an ordering edge
+ * between them.  A dependency-chained walk (next-then-next, or a prev hop taken
+ * FROM the node the previous load returned) has one on every supported
+ * architecture, as does any build using the default C11 dereference.  A reader
+ * comparing two independently-reached slots -- a cached pointer, or prev and
+ * next read from nodes it did not chain between -- must supply its own acquire
+ * under -DURCU_DEREFERENCE_USE_VOLATILE on weakly-ordered hardware.  See the
+ * ordering/monotonicity note in <urcu/rcu-txn-sw.h>.
+ *
  * Removed nodes are one-way ghosts (standard RCU): a deleted node keeps its
  * own next/prev pointing at its former live neighbours, so a reader sitting
  * on it can still escape into the live list in either direction, but the
@@ -222,11 +232,35 @@ int urcu_txn_sw_list_flip2(
  * composable form: the caller owns the bracket (init .. commit) and may fold
  * these records together with records from other structures into ONE flip --
  * e.g. publish a node into a trie and splice it into this list atomically.
- * Mirrors urcu_txn_list_insert_after_prepare(); under a single updater
- * there is no concurrent deletion, so it always succeeds (returns 0).  The int
- * return matches the concurrent variant so callers share one shape across the
- * single-updater -> concurrent transition.  Each recorded edge is tagged with
- * URCU_TXN_SW_LIST_PROXY_TAG so the list's reader accessors resolve the proxy.
+ * Under a single updater there is no concurrent deletion, so it always succeeds
+ * (returns 0); the int return matches the concurrent variant so callers share
+ * one shape across the single-updater -> concurrent transition.  Each recorded
+ * edge is tagged with URCU_TXN_SW_LIST_PROXY_TAG so the list's reader accessors
+ * resolve the proxy.
+ *
+ * ONLY SLOT-DISJOINT COMPOSITION IS LEGAL, and this is exactly where the parity
+ * with urcu_txn_list_insert_after_prepare() STOPS.  The sw engine has no
+ * transactional loads and no same-slot reconcile (see urcu_txn_sw_record):
+ * every _prepare reads its neighbour slots RAW, so a second prepare in the
+ * same bracket sees the PRE-transaction values, never this transaction's own
+ * pending edits.  Composing two edits whose neighbourhoods touch therefore
+ * builds the write set out of stale pointers.
+ *
+ * Adjacent deletes are the canonical trap.  P -> E1 -> E2 -> N, deleting E1 and
+ * E2 in one flip, records {&P->next: E1 -> E2}, {&E2->prev: E1 -> P},
+ * {&E1->next: E2 -> N}, {&N->prev: E2 -> E1}: four PAIRWISE-DISTINCT slots, so
+ * even install's debug duplicate scan passes -- and the commit publishes
+ * P->next == E2 and N->prev == E1, both of them deleted nodes.  The mw twin
+ * survives the identical call pattern because read-your-own-writes chains the
+ * second del through the first's pending values.  sw also PUBLISHES a stale
+ * recorded old to readers across the install -> flip window (proxies resolve to
+ * ptr[0]), where the mw engine's install CAS would simply have aborted.
+ *
+ * So compose across DISTINCT structures, or over same-structure edits whose
+ * neighbourhoods are provably disjoint.  For anything else -- batched adjacent
+ * edits on one list, a range move -- use the concurrent front-end
+ * (<urcu/rcu-txn-list.h>) even under a single updater: its RYW chaining is what
+ * makes those sound, and sw has no equivalent.
  */
 static inline
 int urcu_txn_sw_list_add_after_prepare(struct urcu_txn_sw_txn *txn,

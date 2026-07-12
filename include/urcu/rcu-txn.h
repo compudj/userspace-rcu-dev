@@ -111,11 +111,14 @@
  * traversal: an ordered skiplist's pred->next[L], an hlist's *elem->pprev.
  *
  * Two opt-outs.  urcu_txn_declare_disjoint() asserts the write set touches
- * DISTINCT slots (a keyed structure over distinct keys -- a hash add/remove
- * across buckets, a bitmap word per index); it then blind-appends and maintains
- * no filter -- the fast path -- since read-your-own-writes is vacuous when no
- * slot is re-touched.  urcu_txn_load_committed() is the per-read escape hatch,
- * returning a slot's committed value even for one this attempt has written.
+ * DISTINCT SLOTS (a keyed structure whose write site is a pure function of the
+ * key, over distinct keys -- a hash add/remove across distinct buckets); it
+ * then blind-appends and maintains no filter -- the fast path -- since
+ * read-your-own-writes is vacuous when no slot is re-touched.  Distinctness is
+ * a property of the SLOT ADDRESS, not of the key: a bitmap packs 63 logical
+ * bits into one physical word, so distinct bit indexes are NOT distinct slots.
+ * urcu_txn_load_committed() is the per-read escape hatch, returning a slot's
+ * committed value even for one this attempt has written.
  *
  * Reserve.  A mutator that knows its edge count up front may call
  * urcu_txn_reserve() right after begin: it allocates the descriptor to that
@@ -157,10 +160,16 @@
  * as some transaction still needs it.
  *
  * A handle keeps its turn across aborts (retry in place -- releasing would
- * forfeit the guaranteed turn) and releases it only on a terminal outcome
- * (commit, error, or a bail that ends the bracket); a departing initiator
- * clears domain->active just before its unlock, ending the episode, and the
- * domain reverts to the optimistic regime once the remaining joiners drain.
+ * forfeit the guaranteed turn) and releases it only on a terminal outcome: a
+ * commit, an error, or a bail that ends the bracket with no retry pending.  An
+ * ABORT is NOT terminal -- end() deliberately keeps the turn so the next
+ * attempt re-enters as the same head -- so a caller that ABANDONS the operation
+ * after an ABORT (end() with no further begin..commit) holds the domain's lane
+ * forever and stalls every writer in the domain.  Running the bracket to a
+ * terminal outcome is the required discipline; a caller that must give up after
+ * an ABORT calls urcu_txn_abandon() before end().  A departing initiator clears
+ * domain->active just before its unlock, ending the episode, and the domain
+ * reverts to the optimistic regime once the remaining joiners drain.
  *
  * RCU.  The bracket opens an RCU read-side section per attempt, and commit
  * uses the flavor's call_rcu, so include this header AFTER an RCU flavor
@@ -711,6 +720,30 @@ unsigned long urcu_txn_read_policy_evicted(const struct urcu_mcas_txn *txn)
 #endif	/* URCU_TXN_DEBUG_READ_POLICY */
 
 /*
+ * Empty this attempt's read-your-own-writes filter.  Called at the ONE point an
+ * attempt's descriptor goes from "none" to "live" (urcu_txn_reserve,
+ * urcu_txn__record) -- which is strictly before the filter can be consulted,
+ * since urcu_txn__load and urcu_txn__record both test it only once txn->mcas is
+ * a live descriptor, and every fresh attempt starts from txn->mcas == NULL
+ * (begin(), and the commit paths, which consume the descriptor).
+ *
+ * Zeroing HERE rather than in begin() is what keeps the filter off the DISJOINT
+ * fast path: such a handle consults no filter, so it must not pay to clear one
+ * (a measurable ~1% on the disjoint hash key-move benchmark).  It also spares
+ * an attempt that reads and bails without ever storing.  And it is what makes
+ * the documented begin-less driving mode (init -> read_lock -> store ->
+ * commit_flavor; see urcu_txn_read_lock) sound: that mode has no begin() to
+ * clear the filter, and would otherwise test indeterminate stack bytes, whose
+ * set bits flag a phantom coincidence on the very first load.
+ */
+static inline
+void urcu_txn__bloom_reset(struct urcu_mcas_txn *txn)
+{
+	if (!txn->disjoint)
+		memset(txn->ryw_bloom, 0, sizeof(txn->ryw_bloom));
+}
+
+/*
  * Initialize a handle before its retry loop (retry := 0, no reservation),
  * bracketing the txn's RCU read-side section in @flavor's
  * read_lock/read_unlock.  Pass @flavor NULL to use the compile-time-selected
@@ -736,8 +769,13 @@ void urcu_txn_init_flavor(struct urcu_mcas_txn *txn,
 	txn->retrying = 0;
 	txn->disjoint = 0;
 	txn->expect_conflict = 0;
-	/* ryw_bloom is (re)zeroed by begin() unless the handle declared its
-	 * write set disjoint, so init leaves it untouched. */
+	/*
+	 * ryw_bloom is deliberately NOT zeroed here.  It is zeroed by
+	 * urcu_txn__bloom_reset() at the point the attempt's descriptor is
+	 * first allocated -- which is strictly before the filter can be
+	 * consulted, and which a disjoint handle skips entirely.  Zeroing it at
+	 * init would tax every disjoint handle for a filter it never reads.
+	 */
 	txn->esc_pending = 0;
 #ifdef URCU_TXN_ESCALATION_STATS
 	txn->esc_raw = txn->esc_waw = txn->esc_bloom = 0;
@@ -759,11 +797,29 @@ unsigned int urcu_txn_esc_bloom(const struct urcu_mcas_txn *txn) { return txn->e
 #endif
 
 /*
- * Assert that this handle's transactions touch DISTINCT slots -- no store ever
+ * Assert that this handle's transactions touch DISTINCT SLOTS -- no store ever
  * lands on a slot already recorded in the same commit (no write-after-write and
  * no read-of-own-write).  This is the common shape of a keyed structure whose
- * write site is a pure function of the key over distinct keys: a hash table
- * add/remove across distinct buckets, a bitmap word per distinct index.
+ * write site is a pure function of the key, over distinct keys: a hash table
+ * add/remove across distinct buckets.
+ *
+ * Distinctness is a property of the SLOT ADDRESS, not of the key.  Two shapes
+ * that look keyed and distinct but are NOT:
+ *
+ *   - a structure that PACKS several logical keys into one word.  A bitmap word
+ *     holds 63 logical bits (<urcu/rcu-txn-bitmap.h>), so two composed flips of
+ *     DISTINCT bit indexes can record the SAME slot.
+ *   - a write site reached by a TRAVERSAL, whose slot is data-dependent rather
+ *     than a function of the key.  Composed edits on ONE ordered structure (a
+ *     skiplist range move or rotation, adjacent list/hlist deletes) share a
+ *     predecessor slot as soon as the keys land adjacent -- which the keys
+ *     alone do not tell you.
+ *
+ * Both want the DEFAULT (read-your-own-writes) handle, which catches the
+ * coincidence and chains the two edits into one record; and because they alias
+ * by construction rather than by luck, both want urcu_txn_expect_conflict() so
+ * the doomed age-0 attempt is skipped.  Reserve declare_disjoint() for a write
+ * set whose slots are provably pairwise distinct.
  *
  * Given the guarantee, age 0 blind-appends each store -- skipping the O(nr)
  * reconcile find -- AND maintains no read-your-own-writes Bloom filter (no
@@ -774,10 +830,16 @@ unsigned int urcu_txn_esc_bloom(const struct urcu_mcas_txn *txn) { return txn->e
  * the coincidence.
  *
  * Contract: if a store DOES hit a recorded slot, the blind append inserts a
- * duplicate record and the commit corrupts (installs both, destroying an edge).
- * Build with -DURCU_TXN_DEBUG_DISJOINT to trap a violation at the offending
- * store instead.  Call after init and before the first begin(); do not flip
- * mid-transaction.
+ * duplicate record and the commit corrupts.  The sorted install plants the
+ * first record's proxy and then takes the "own proxy" short-circuit for the
+ * second (the distinct-slot invariant it rests on is exactly what was
+ * violated), decides SUCCEEDED, and settle stores both new values to the one
+ * slot in record order: the EARLIER edit is silently lost in a commit that
+ * reports OK.  Build with -DURCU_TXN_DEBUG_DISJOINT to trap a violation at the
+ * offending store instead -- but note it traps only the STORE side: a
+ * read-of-own-write on a disjoint handle skips the write-set consult entirely
+ * and silently returns the slot's COMMITTED value, which no debug build sees.
+ * Call after init and before the first begin(); do not flip mid-transaction.
  */
 static inline
 void urcu_txn_declare_disjoint(struct urcu_mcas_txn *txn)
@@ -1018,18 +1080,13 @@ void urcu_txn_begin(struct urcu_mcas_txn *txn)
 		urcu_txn__maybe_publish(txn);	/* joiner that starved: promote */
 	txn->mcas = NULL;		/* prior attempt's descriptor already consumed/freed */
 	/*
-	 * The RYW Bloom is consumed for every handle except a disjoint one --
-	 * both the load-side test and the store-side set are skipped under
-	 * disjoint -- so a disjoint handle needs no per-attempt zeroing.  Under
-	 * ESCALATION_STATS the study probes the filter unconditionally, so keep
-	 * it clean there.
+	 * The RYW Bloom is NOT cleared here.  Setting mcas = NULL above is what
+	 * opens the fresh attempt, and the filter is emptied by
+	 * urcu_txn__bloom_reset() when the next store (or reserve) allocates
+	 * the descriptor -- strictly before anything can consult it.  See it
+	 * for why that placement, and not this one, is what keeps a disjoint
+	 * handle free of the filter entirely.
 	 */
-#ifdef URCU_TXN_ESCALATION_STATS
-	memset(txn->ryw_bloom, 0, sizeof(txn->ryw_bloom));
-#else
-	if (!txn->disjoint)
-		memset(txn->ryw_bloom, 0, sizeof(txn->ryw_bloom));	/* write set is empty */
-#endif
 	txn->esc_pending = 0;		/* fresh attempt: no coincidence seen yet */
 #ifdef URCU_TXN_ESCALATION_STATS
 	txn->esc_raw = txn->esc_waw = txn->esc_bloom = 0;
@@ -1070,11 +1127,19 @@ int urcu_txn_reserve(struct urcu_mcas_txn *txn, unsigned int n)
 	if (!n)
 		return 0;		/* no reservation; the INIT default applies */
 	if (!txn->mcas) {
-		m = urcu_mcas_create(n, txn->retry);
+		/*
+		 * The descriptor's retry is the age the MCAS install dispatches
+		 * on, so create it at the EFFECTIVE age: an expect_conflict()
+		 * handle that reserves before its first store must still get
+		 * the sorted, blocking install on attempt 0 -- txn->retry alone
+		 * would hand it the age-0 flat install it asked to skip.
+		 */
+		m = urcu_mcas_create(n, urcu_txn__eff_retry(txn));
 		if (caa_unlikely(!m)) {
 			txn->mcas = URCU_TXN_ENOMEM;
 			return -ENOMEM;
 		}
+		urcu_txn__bloom_reset(txn);	/* the attempt's write set opens empty */
 		txn->mcas = m;
 		return 0;
 	}
@@ -1127,6 +1192,7 @@ int urcu_txn__record(struct urcu_mcas_txn *txn, void **slot,
 			txn->mcas = URCU_TXN_ENOMEM;
 			return -ENOMEM;
 		}
+		urcu_txn__bloom_reset(txn);	/* the attempt's write set opens empty */
 		txn->mcas = m;
 	}
 	/*
@@ -1144,14 +1210,24 @@ int urcu_txn__record(struct urcu_mcas_txn *txn, void **slot,
 	 * begin(), so the guard is a per-handle-constant, well-predicted
 	 * branch.
 	 */
-	if (!txn->disjoint && urcu_txn__ryw_bloom_test_and_set(txn->ryw_bloom, slot)
-			&& urcu_txn__eff_retry(txn) == 0)
-		txn->esc_pending = 1;
+	if (!txn->disjoint) {
+		/*
+		 * The return is the filter's state BEFORE this store's bits
+		 * were OR'd in -- the only chance to see it, since the set has
+		 * already happened.  Re-probing here would report "present" for
+		 * every store.
+		 */
+		int coincide = urcu_txn__ryw_bloom_test_and_set(txn->ryw_bloom,
+				slot);
+
+		if (coincide && urcu_txn__eff_retry(txn) == 0)
+			txn->esc_pending = 1;
 #ifdef URCU_TXN_ESCALATION_STATS
-	/* Test coincidence against the write set as it stands BEFORE this
-	 * store. */
-	if (urcu_txn__ryw_bloom_test(txn->ryw_bloom, slot))
-		txn->esc_bloom++;		/* age-0 would escalate this store */
+		if (coincide)
+			txn->esc_bloom++;	/* age-0 would escalate this store */
+#endif
+	}
+#ifdef URCU_TXN_ESCALATION_STATS
 	if (urcu_mcas_find(m, slot) != NULL)
 		txn->esc_waw++;			/* true write-after-write */
 #endif
@@ -1230,6 +1306,15 @@ int urcu_txn__record(struct urcu_mcas_txn *txn, void **slot,
  * disjoint never reads its own writes; both skip the write-set consult.  The
  * NULL-descriptor test keeps the miss free and makes an attempt's first loads
  * (before any store) free.
+ *
+ * One more state skips the consult: once ANY store has failed to allocate, the
+ * descriptor is the sticky ENOMEM marker and no write set is left to read, so a
+ * later in-bracket load silently returns @slot's COMMITTED value even though
+ * this attempt "wrote" it.  A caller that commits is safe -- the commit reports
+ * MEMORY_ERROR, so the stale reads are never acted on.  A caller that BAILS OUT
+ * of the bracket without committing must not derive its return value (say
+ * -EEXIST from a tombstone read) from a load issued after a store whose return
+ * it did not check: that load may have missed its own pending write.
  */
 static inline
 void *urcu_txn__load(struct urcu_mcas_txn *txn, void **slot, uintptr_t tag,
@@ -1433,8 +1518,15 @@ enum urcu_txn_status urcu_txn_commit_flavor(struct urcu_mcas_txn *txn,
 		 * Age-0 optimistic attempt saw a same-slot coincidence: its
 		 * write-set was built against unresolved reads, so discard it
 		 * (never published) and re-run at age 1+, where Bloom+find
-		 * resolves RYW.  esc_pending is cleared by the next begin().
+		 * resolves RYW.
+		 *
+		 * Consume the flag here rather than leaving it to the next
+		 * begin(): an embedder driving the engine WITHOUT begin()/end()
+		 * (see urcu_txn_read_lock) has no begin() to clear it, and a
+		 * flag that survives its own abort turns every later attempt --
+		 * at any age -- into an unconditional abort.
 		 */
+		txn->esc_pending = 0;
 		txn->min_alloc = m->nr;
 		urcu_mcas_destroy(m);		/* unpublished: synchronous free */
 		txn->mcas = NULL;
@@ -1470,13 +1562,35 @@ enum urcu_txn_status urcu_txn_commit(struct urcu_mcas_txn *txn)
  * fallback lane instead of spinning: without this, an op that keeps hitting the
  * guard on a hot slot never reaches commit, so txn->retry never advances and it
  * can livelock.  Call after the guard fires and before end(), then
- * end()+begin() and re-attempt.
+ * end()+begin() and re-attempt.  Like a commit ABORT this keeps the FIFO turn,
+ * so a caller that gives up rather than re-attempting must call
+ * urcu_txn_abandon() before end() -- see it.
  */
 static inline
 void urcu_txn_conflict(struct urcu_mcas_txn *txn)
 {
 	txn->retry++;			/* aged: a guard storm now escalates */
 	txn->retrying = 1;		/* keep the FIFO turn across the retry */
+}
+
+/*
+ * Give up on the transaction instead of re-attempting it: the caller has taken
+ * an ABORT (from commit, or from urcu_txn_conflict()) and will NOT run another
+ * begin..commit -- it is walking away from the operation entirely.
+ *
+ * An ABORT is not a terminal outcome: it leaves retrying = 1 so that end()
+ * KEEPS the handle's turn in the escalation lane and the next attempt re-enters
+ * as the same head, which is what makes a starved transaction's progress
+ * bounded.  A caller that just end()s and walks away after an ABORT therefore
+ * never releases the domain's fair mutex -- the lane is held forever and every
+ * writer in the domain stalls.  Call this before end() to forfeit the turn and
+ * make that end() terminal.  Harmless on a handle that never escalated, or
+ * never aborted.
+ */
+static inline
+void urcu_txn_abandon(struct urcu_mcas_txn *txn)
+{
+	txn->retrying = 0;		/* forfeit the turn: end() releases it */
 }
 
 /* End the attempt: close the RCU read-side section.  Always pair with begin. */

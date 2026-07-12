@@ -80,6 +80,16 @@
  * call_rcu()s the node), the other gets 0.  As with cds_list_del_rcu(), the node
  * itself is the caller's to reclaim after a grace period.
  *
+ * A deleted node must not be RE-LINKED (re-inserted, or recycled into a fresh
+ * node) until a grace period has elapsed either -- reclaiming it is not the
+ * only thing that has to wait.  An insert builds its node's next/prev with
+ * PLAIN stores, the node being private until the commit publishes it; but the
+ * deleting transaction may still hold a parked proxy in that node's next slot,
+ * awaiting its settle.  A plain store into a proxied slot is then overwritten
+ * when that settle converts the proxy, and the write is silently lost -- a
+ * permanently incoherent edge.  Wait out the grace period the reclaim itself
+ * would have waited.
+ *
  * Read / write contract
  * ---------------------
  * Include this header AFTER an RCU flavor (e.g. <urcu-qsbr.h>): the mutators
@@ -93,8 +103,12 @@
  * mutator's section.  Readers likewise run within an RCU read-side section,
  * and read next/prev only through the accessors below (they resolve the proxy
  * and strip the mark); never touch the raw fields.  Mutators loop internally
- * until they commit or definitively fail; they return 0 / 1 on success,
- * -ENOENT if the anchor was deleted, -ENOMEM on descriptor OOM.  Each transacts
+ * until they commit or definitively fail; their returns differ, so read each
+ * one's contract -- an insert returns 0, or -ENOENT if its ANCHOR was deleted,
+ * while del_rcu() returns 1 if THIS call removed the node and 0 if a peer had
+ * already deleted it (never -ENOENT).  All return -ENOMEM on descriptor OOM.
+ * The composable *_prepare forms additionally return -EAGAIN (a NEIGHBOUR is
+ * mid-deletion: re-attempt, do not bail) -- see each.  Each transacts
  * through the caller-supplied escalation domain (a struct urcu_txn_domain *, one
  * per logical structure -- see the head comment below), so a mutator repeatedly
  * bypassed on the optimistic path escalates into that domain's fair lane and
@@ -228,11 +242,35 @@ int urcu_txn_list_empty(struct urcu_txn_list_head *head)
  * escalation domain (whichever @txn was init'd with), and the retry loop, and
  * may fold these records together with records from other structures into a
  * single MCAS commit -- e.g. publish a node into a trie and splice it into this
- * list atomically.  Call between urcu_txn_begin() and
- * urcu_txn_commit().  Returns 0 on success, or -ENOENT if @pos has been
- * deleted (the caller ends the bracket and bails the logical op); a descriptor
- * OOM is sticky and surfaces at the caller's commit.  @pos must be kept alive
- * by the caller's RCU read-side section (see the contract above).
+ * list atomically.  Call between urcu_txn_begin() and urcu_txn_commit().
+ *
+ * COMPOSE ON A DEFAULT HANDLE.  The self-contained wrappers below declare their
+ * write set disjoint, which is sound because a SINGLE-op commit provably
+ * touches distinct slots -- do not copy that line into a composed bracket
+ * unless the COMBINED write set is provably distinct too.  Two edits of this
+ * list can share a slot the moment their nodes land adjacent (both name the
+ * shared neighbour's "next"), and that is data-dependent -- not knowable from
+ * the keys.  On a disjoint handle the second prepare's loads then silently
+ * return committed values (a stale neighbour) and its stores blind-append a
+ * duplicate record: silent corruption.  The default read-your-own-writes handle
+ * instead lets the prepare see the transaction's own pending edits and chains
+ * the collision into one record.  See urcu_txn_declare_disjoint() in
+ * <urcu/rcu-txn.h>.
+ *
+ * Returns:
+ *   0        the edges are recorded;
+ *   -ENOENT  @pos ITSELF has been deleted -- the anchor is gone.  Terminal:
+ *            end the bracket and bail the logical op;
+ *   -EAGAIN  a NEIGHBOUR (the successor) is mid-deletion; its tombstone guard
+ *            fired.  Transient, NOT terminal: the anchor is fine and the
+ *            insert must be re-attempted.  Run the retry protocol --
+ *            urcu_txn_conflict() (so a hot slot ages into the escalation
+ *            lane), urcu_txn_end(), urcu_txn_begin(), prepare again.
+ *
+ * Misreading -EAGAIN as -ENOENT abandons an insert that merely raced a
+ * neighbour's delete.  A descriptor OOM is sticky and surfaces at the caller's
+ * commit.  @pos must be kept alive by the caller's RCU read-side section (see
+ * the contract above).
  */
 static inline
 int urcu_txn_list_insert_after_prepare(struct urcu_mcas_txn *txn,
@@ -330,12 +368,23 @@ int urcu_txn_list_insert_after_rcu(struct urcu_txn_list_node *newp,
  * depends on a word the list does not otherwise touch: a per-node "live" /
  * generation marker the embedder keeps beside its node, a container-freeze
  * flag, etc.  @guard_slot must be engine-transacted (every writer of it goes
- * through the MCAS).  The guard has value-CAS semantics: it checks @guard_slot
- * resolves to @guard_expected AT the linearization point, not that it stayed so
- * throughout -- the engine itself is A-B-A-safe, but if a benign recurrence of
- * @guard_expected would be the wrong answer for your insert, put a
- * version/generation in the guarded word.  Returns 0; -ENOENT if @pos was deleted
- * or @guard_slot no longer holds @guard_expected; -ENOMEM on descriptor OOM.
+ * through the MCAS).
+ *
+ * @guard_slot MUST NOT alias a slot this insert itself transacts -- &pos->next,
+ * &succ->prev, or &succ->next (the successor's tombstone guard).  "A word the
+ * list does not otherwise touch" is a hard requirement, not a description of
+ * the intended use: this handle declares its write set disjoint, so an aliasing
+ * guard does not fail cleanly.  It blind-appends a second record on a slot
+ * already recorded, and the commit CORRUPTS -- both records install, and the
+ * later one's value wins, silently dropping the other edit.
+ *
+ * The guard has value-CAS semantics: it checks @guard_slot resolves to
+ * @guard_expected AT the linearization point, not that it stayed so
+ * throughout -- the engine itself is A-B-A-safe, but if a benign recurrence
+ * of @guard_expected would be the wrong answer for your insert, put a
+ * version/generation in the guarded word.  Returns 0; -ENOENT if @pos was
+ * deleted or @guard_slot no longer holds @guard_expected; -ENOMEM on
+ * descriptor OOM.
  */
 static inline
 int urcu_txn_list_insert_after_guarded_rcu(
@@ -499,13 +548,29 @@ int urcu_txn_list_add_tail_rcu(struct urcu_txn_list_node *newp,
 }
 
 /*
- * urcu_txn_list_del_prepare: record the unlink of @elem into the
- * caller-owned transaction @txn, WITHOUT committing.  Composable form of del
- * (see insert_after_prepare for the contract).  Returns 0 if the unlink was
- * recorded (when the caller's commit then returns OK, THIS call removed @elem
- * and the caller reclaims it after a grace period), or -ENOENT if @elem was
- * already deleted by a peer (nothing recorded; the caller must NOT reclaim).
- * OOM is sticky to the commit.
+ * urcu_txn_list_del_prepare: record the unlink of @elem into the caller-owned
+ * transaction @txn, WITHOUT committing.  Composable form of del -- see
+ * insert_after_prepare for the contract, INCLUDING the compose-on-a-default-
+ * handle rule (adjacent deletes folded into one commit share the shared
+ * neighbour's "next" slot, so a disjoint handle corrupts).
+ *
+ * Returns:
+ *   0        the unlink is recorded.  When the caller's commit then returns OK,
+ *            THIS call removed @elem and the caller reclaims it after a grace
+ *            period;
+ *   -ENOENT  @elem was already deleted by a peer.  Terminal: nothing was
+ *            recorded, @elem is not ours, and the caller must NOT reclaim it;
+ *   -EAGAIN  @elem's SUCCESSOR is mid-deletion; its tombstone guard fired.
+ *            Transient, NOT terminal: @elem is still fully linked and still
+ *            ours to delete.  Re-attempt via the retry protocol
+ *            (urcu_txn_conflict(), end, begin, prepare again).
+ *
+ * Do NOT collapse -EAGAIN into -ENOENT.  Concluding "a peer deleted it, don't
+ * reclaim" about a node that is still fully linked loses the deletion outright.
+ * Note also that the -EAGAIN path HAS already appended a {v -> v} validate
+ * record for the successor's next slot -- harmless only because the protocol
+ * ends the bracket, discarding the descriptor unpublished, rather than
+ * committing it.  OOM is sticky to the commit.
  */
 static inline
 int urcu_txn_list_del_prepare(struct urcu_mcas_txn *txn,

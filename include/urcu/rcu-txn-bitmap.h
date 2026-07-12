@@ -49,6 +49,18 @@
  * shift/tail edges already do (a lower bit's insert shifts the very slot the
  * higher bit's insert claims).  rank() is otherwise an optimistic read: the
  * word's value-CAS at commit re-validates the bits within that word.
+ *
+ * COMPOSITION / the transacted slot is the WORD, not the bit.  Composing
+ * several _prepare flips in one transaction REQUIRES the default
+ * (read-your-own-writes) handle.  63 logical bits share one physical word, so
+ * flips of DISTINCT bit indexes routinely land on the SAME slot -- which means
+ * a handle that declared its write set disjoint (urcu_txn_declare_disjoint(),
+ * <urcu/rcu-txn.h>) is WRONG here even though every bit index is distinct: it
+ * blind-appends a second record on that word, and the commit installs both and
+ * settles them in record order, silently losing the earlier flip while
+ * reporting OK.  On the default handle the second flip instead reads the word's
+ * PENDING value and chains onto the existing record, fusing same-word flips
+ * into one.  Use the range forms for a contiguous run.
  */
 
 #include <stddef.h>			/* size_t */
@@ -227,6 +239,10 @@ long urcu_txn_bitmap_select_rcu(const uintptr_t *words, size_t nbits, size_t i)
  * Composable writers: append the edge to caller-owned @txn (already begun),
  * WITHOUT committing.  Fold together with the accompanying mutation's edges and
  * commit once.  Returns 0, or -ENOMEM (sticky; also surfaces at commit).
+ *
+ * @txn must be a DEFAULT handle, never one that declared its write set
+ * disjoint:  the slot is the 63-bit WORD, so two flips of distinct bit indexes
+ * can record the same slot.  See the composition note in the header intro.
  */
 static inline
 int urcu_txn_bitmap_set_prepare(struct urcu_mcas_txn *txn, uintptr_t *words,

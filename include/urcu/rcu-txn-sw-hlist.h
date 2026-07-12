@@ -31,6 +31,15 @@
  * composes into a larger cross-structure flip via the _prepare forms -- exactly
  * as the bidir sw-list records its two edges.
  *
+ * Composition is limited to SLOT-DISJOINT edits: the sw engine has no
+ * transactional loads and no same-slot reconcile, so each _prepare reads its
+ * neighbour slots raw and cannot see a pending edit made earlier in the SAME
+ * bracket.  Cross-structure composition (the intended use) is disjoint by
+ * construction; two edits on ONE hlist whose neighbourhoods touch -- adjacent
+ * deletes, say -- silently commit stale pointers.  See the trap worked out in
+ * urcu_txn_sw_list_add_after_prepare(); use the concurrent front-end
+ * (<urcu/rcu-txn-hlist.h>), whose read-your-own-writes chains them, for those.
+ *
  * Configurable proxy tag (a compile-time define, never stored in the head)
  * ----------------------------------------------------------------------
  * Every slot of the hlist is transacted under URCU_TXN_SW_HLIST_TAG, the flip
@@ -159,6 +168,10 @@ int urcu_txn_sw_hlist_empty(struct urcu_txn_sw_hlist_head *head)
  * for insert-after.  Records the reader-visible *slot edge and, when @succ is
  * non-NULL, the writer-only &succ->pprev edge.  Always returns 0 (single
  * updater); the int return matches the concurrent variant for transition parity.
+ *
+ * Compose only over SLOT-DISJOINT edits -- @succ is read raw by the caller, so
+ * it cannot reflect a pending edit made earlier in the same bracket.  See the
+ * header intro and urcu_txn_sw_list_add_after_prepare().
  */
 static inline
 int urcu_txn_sw_hlist_insert_at_slot_prepare(struct urcu_txn_sw_txn *txn,

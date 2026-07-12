@@ -16,12 +16,21 @@
  * One arena per (size class, cpu): a wfstack freelist plus a bump pointer into
  * RANGE-aligned mmap'd superblocks.  free() finds a block's ORIGIN arena from
  * the superblock header (RANGE-aligned, so header = ptr & ~(RANGE-1)), so a
- * block allocated on cpu X and freed by the reclaim worker -- on whatever cpu it
- * runs -- returns to arena X.  MP-producer (workers free) / single-consumer (the
- * pinned writer allocs): push is wait-free (never blocks the writer), pop is
- * under the wfstack pop lock (uncontended for one writer/arena; also serializes
- * the cold carve).  Growth is capped by construction: alloc reuses a freed block
- * before carving, so the mapped footprint never exceeds peak live descriptors.
+ * block allocated on cpu X and freed by the reclaim worker -- on whatever cpu
+ * it runs -- returns to arena X.  MP-producer (workers free) / single-consumer
+ * (the pinned writer allocs): push never blocks the writer, pop is under the
+ * wfstack pop lock (uncontended for one writer/arena; also serializes the cold
+ * carve).  The push is wait-free in the sense the wfstack means it -- the
+ * PRODUCER always completes -- but one caught between its xchg and its link
+ * store leaves the chain momentarily broken, and a concurrent pop busy-waits
+ * for it: the CONSUMER is bounded-blocking, the same progress class as the
+ * engine itself.
+ *
+ * Growth is capped by construction: alloc reuses a freed block before carving,
+ * so the mapped footprint never exceeds peak live descriptors -- PER (class,
+ * cpu) ARENA, not globally.  A writer that migrates carves on its new cpu while
+ * the blocks it freed strand in their origin arena, so the process-wide
+ * footprint tracks the SUM of the per-arena peaks: bounded, not minimal.
  *
  * Superblocks are left demand-paged (no MADV_HUGEPAGE: a partial superblock then
  * stays resident only for touched pages).  URCU_TXN_NO_CACHE (environment,
@@ -56,6 +65,16 @@ extern "C" {
 #define URCU_SLAB_RANGE		(1UL << 21)	/* 2 MiB superblocks (1 THP) */
 #endif
 #define URCU_SLAB_RANGE_MASK	(URCU_SLAB_RANGE - 1)
+
+/*
+ * free() recovers a block's superblock header by masking the block address with
+ * ~RANGE_MASK.  That identity holds only for a power-of-two RANGE; anything
+ * else silently derives a garbage header (hence a garbage sb->owner arena).
+ */
+urcu_static_assert(!(URCU_SLAB_RANGE & URCU_SLAB_RANGE_MASK),
+		"URCU_SLAB_RANGE must be a power of two: free() masks with it "
+		"to find a block's superblock header",
+		URCU_SLAB_RANGE_not_a_power_of_two);
 
 struct urcu_slab_arena;
 struct urcu_slab_sb {			/* header at the RANGE-aligned superblock base */
@@ -132,13 +151,19 @@ int urcu_slab_enabled(const struct urcu_slab *s)
 
 /*
  * Initialize @s with @nclass ascending byte size-classes (the array must stay
- * live -- pass a static const).  URCU_TXN_NO_CACHE or OOM leaves it disabled.
- * Call once, from the engine's constructor, before any alloc.
+ * live -- pass a static const).  URCU_TXN_NO_CACHE, an invalid class table, or
+ * OOM leaves it disabled (the engine falls back to malloc).  Call once, from
+ * the engine's constructor, before any alloc.
+ *
+ * The class table must satisfy: sizes ASCENDING, each a multiple of 16, and
+ * each one small enough to fit a superblock past its header.  All three are
+ * checked here.
  */
 static inline
 void urcu_slab_init(struct urcu_slab *s, const size_t *class_size, int nclass,
 		const char *name)
 {
+	size_t hdr;
 	long n;
 	int cl, c;
 
@@ -150,6 +175,32 @@ void urcu_slab_init(struct urcu_slab *s, const size_t *class_size, int nclass,
 	s->st_reuse = s->st_carve = s->st_sbs = 0;
 	if (getenv("URCU_TXN_NO_CACHE"))
 		return;
+	/*
+	 * Validate the table BEFORE enabling anything.  Each precondition below
+	 * is silently catastrophic if violated and costs one check, once; a bad
+	 * table leaves the slab disabled -- degraded, never corrupt -- exactly
+	 * like the OOM path just below.
+	 *
+	 *  - FITS a superblock past the header.  Otherwise carve returns a
+	 *    block extending past the RANGE mapping (SIGSEGV on touch), and
+	 *    free()'s mask then derives sb->owner from the NEXT window: a
+	 *    garbage arena.
+	 *  - MULTIPLE OF 16.  The first block starts 16-aligned and carve bumps
+	 *    by exactly obj, so this is what keeps every later block in the
+	 *    superblock 16-aligned -- which is what leaves a descriptor's low 4
+	 *    bits free for the engine's proxy tag.
+	 *  - ASCENDING, so urcu_slab_class()'s first-fit scan returns the
+	 *    SMALLEST class that fits rather than an arbitrary one.
+	 */
+	hdr = (sizeof(struct urcu_slab_sb) + 15) & ~(size_t) 15;
+	for (cl = 0; cl < nclass; cl++) {
+		if (!class_size[cl] || class_size[cl] % 16)
+			return;			/* not a 16-byte multiple */
+		if (class_size[cl] > URCU_SLAB_RANGE - hdr)
+			return;			/* would carve past the superblock */
+		if (cl && class_size[cl] <= class_size[cl - 1])
+			return;			/* not ascending */
+	}
 	n = sysconf(_SC_NPROCESSORS_CONF);
 	if (n < 1)
 		n = 1;
@@ -199,7 +250,12 @@ struct urcu_slab_sb *urcu_slab_sb_new(struct urcu_slab *s, struct urcu_slab_aren
 	return sb;
 }
 
-/* Allocate one block of size class @cl from the current CPU's arena, or NULL. */
+/*
+ * Allocate one block of size class @cl from the current CPU's arena, or NULL.
+ * @s MUST be enabled (urcu_slab_enabled()) and @cl a valid class index: a
+ * disabled slab has arenas == NULL and this dereferences it.  Every in-tree
+ * caller gates on urcu_slab_enabled() and falls back to malloc.
+ */
 static inline
 void *urcu_slab_alloc(struct urcu_slab *s, int cl)
 {
