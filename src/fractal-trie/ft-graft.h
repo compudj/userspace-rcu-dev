@@ -1870,11 +1870,24 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 				 */
 				ft_nr_keys_store(swap_ft, merged_meta,
 					swap_count, CMM_RELAXED);
-				merged_meta->parent = pcn_meta->parent;
-				pub_parent = pcn_meta->parent;
-				pub_slot = ft_get_parent_slot(pcn_meta, dst_ft);
-				ft_set_parent_slot(merged_meta,
-					merged_meta->parent, pub_slot);
+				/*
+				 * Resolve pcn's grandparent slot COHERENTLY (parent +
+				 * offset from one snapshot) rather than reading
+				 * pcn_meta->parent raw and fetching the slot separately: a
+				 * peer that recompacts pcn's grandparent to a larger node
+				 * type (or Phase-4.3 re-homes pcn) between the two reads
+				 * would leave pub_parent naming the OLD grandparent while
+				 * pub_slot indexes the NEW body, so ft_set_parent_slot ->
+				 * ft_slot_to_byte indexes the wrong body out of bounds and
+				 * bakes a wild offset into the build-invisible @merged.
+				 * The forward publish below (ft_glue_set_publish) reuses
+				 * the same coherent (pub_parent, pub_slot) and the commit
+				 * guard_parent ratifies pub_parent at the flip.
+				 */
+				pub_slot = ft_resolve_parent_slot(pcn_meta, dst_ft,
+					&pub_parent);
+				merged_meta->parent = pub_parent;
+				ft_set_parent_slot(merged_meta, pub_parent, pub_slot);
 				merged_flag = ft_compressed_node_flag(merged);
 				ft_glue_track(&glue_insert, merged_flag);
 				ft_glue_defer_edge(dst_ft, &glue_insert, ccn->child,
