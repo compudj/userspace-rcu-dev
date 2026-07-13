@@ -1991,6 +1991,21 @@ int ft_insert_compressed_past_child(struct cds_ft *ft,
 		return ret;	/* nothing built yet */
 
 	/*
+	 * ONE resolved snapshot of the live external child, consumed by both
+	 * the branch's external_nodes wiring and the parked live re-parent
+	 * below.  The dispatcher classified cn->child external, but a peer may
+	 * park a flip-proxy on it (re-parenting that external head) before these
+	 * reads: a RAW read would publish the proxy as the branch's external
+	 * head / @ic->live_child and ft_park_live_parent_edge would dereference
+	 * the latch memory at commit.  Resolve once, like the sibling split
+	 * builders (ft_split_compressed_diverge / _key_shorter); a post-snapshot
+	 * peer commit is caught by the §4.B guard on @d->nf that
+	 * ft_insert_publish_or_park records (ABORT -> re-descend).
+	 */
+	struct cds_ft_inode_flag *old_child_flag =
+		ft_cn_child_dereference_acquire_prefetch(cn);
+
+	/*
 	 * Case 1 (external at END of compressed path): build a
 	 * branch for the continuing key, with an internal node at
 	 * d->depth + cn->len that holds the old external child as
@@ -2032,7 +2047,7 @@ int ft_insert_compressed_past_child(struct cds_ft *ft,
 		 */
 		ft_set_parent(ft, branch, d->nf, &cn->child);
 		ft_metadata_set_external_nodes(branch, br_meta,
-			(struct cds_ft_node *) cn->child);
+			(struct cds_ft_node *) old_child_flag);
 		/*
 		 * I5 count fold: build the branch with its FULL post-commit
 		 * count -- the pre-existing key (old external from the
@@ -2053,7 +2068,7 @@ int ft_insert_compressed_past_child(struct cds_ft *ft,
 	 * commit replays it via ft_park_live_parent_edge (which resolves the
 	 * external head's cell->parent / prev).
 	 */
-	ic->live_child = (struct cds_ft_inode_flag *) cn->child;
+	ic->live_child = old_child_flag;
 	ic->live_parent = branch;
 	ic->live_slot = NULL;
 	/* &cn->child's plan-snapshot old is the displaced child == ic->live_child. */
