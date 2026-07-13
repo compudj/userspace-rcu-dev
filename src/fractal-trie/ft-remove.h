@@ -1099,6 +1099,21 @@ int ft_detach_node(struct cds_ft *ft,
 
 	iter_node_flag = *detach_parent_flag_ptr;
 	elevated_old_child = *detach_node_flag_ptr;
+	/*
+	 * F1 / RESOLVED-POINTER CONTRACT (ft-helpers.h): a peer mid-commit
+	 * recompacting or re-homing the boundary (or the detach target) parks a
+	 * flip-proxy on its slot.  Left raw, that proxy is silently misclassified
+	 * as a type-7 internal node below (ft_node_compressed / the phase-2 free
+	 * walk / the shape-D ft_node_ptr) and its tag stripped into a wild
+	 * pointer, faulting frames later in cds_ft_item_to_metadata.  Do NOT
+	 * classify or embed a parked proxy: bail so the wrapper re-descends and
+	 * re-derives the slot once the peer's commit settles.  Resolving in place
+	 * would be wrong -- a recompaction relocates the boundary and retires its
+	 * old parent body, so detach_parent_flag_ptr can point into freed memory.
+	 */
+	if (caa_unlikely(ft_node_flip_proxy(iter_node_flag) ||
+			ft_node_flip_proxy(elevated_old_child)))
+		return -EAGAIN;
 	/* Plan-snapshot the holder slot before any recompaction overwrite. */
 	holder_old_flag = iter_node_flag;
 
