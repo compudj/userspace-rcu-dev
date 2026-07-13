@@ -80,6 +80,16 @@
  * call_rcu()s the node), the other gets 0.  As with cds_list_del_rcu(), the node
  * itself is the caller's to reclaim after a grace period.
  *
+ * A deleted node must not be RE-LINKED (re-inserted, or recycled into a fresh
+ * node) until a grace period has elapsed either -- reclaiming it is not the
+ * only thing that has to wait.  An insert builds its node's next/prev with
+ * PLAIN stores, the node being private until the commit publishes it; but the
+ * deleting transaction may still hold a parked proxy in that node's next slot,
+ * awaiting its settle.  A plain store into a proxied slot is then overwritten
+ * when that settle converts the proxy, and the write is silently lost -- a
+ * permanently incoherent edge.  Wait out the grace period the reclaim itself
+ * would have waited.
+ *
  * Read / write contract
  * ---------------------
  * Include this header AFTER an RCU flavor (e.g. <urcu-qsbr.h>): the mutators
@@ -93,12 +103,17 @@
  * mutator's section.  Readers likewise run within an RCU read-side section,
  * and read next/prev only through the accessors below (they resolve the proxy
  * and strip the mark); never touch the raw fields.  Mutators loop internally
- * until they commit or definitively fail; they return 0 / 1 on success,
- * -ENOENT if the anchor was deleted, -ENOMEM on descriptor OOM.  Each transacts
- * through the list head's escalation domain, so a mutator repeatedly bypassed
- * on the optimistic path escalates into the domain's fair lane and commits
- * within a bounded number of retries -- the list is starvation-resistant, not
- * merely livelock-free.
+ * until they commit or definitively fail; their returns differ, so read each
+ * one's contract -- an insert returns 0, or -ENOENT if its ANCHOR was deleted,
+ * while del_rcu() returns 1 if THIS call removed the node and 0 if a peer had
+ * already deleted it (never -ENOENT).  All return -ENOMEM on descriptor OOM.
+ * The composable *_prepare forms additionally return -EAGAIN (a NEIGHBOUR is
+ * mid-deletion: re-attempt, do not bail) -- see each.  Each transacts
+ * through the caller-supplied escalation domain (a struct urcu_txn_domain *, one
+ * per logical structure -- see the head comment below), so a mutator repeatedly
+ * bypassed on the optimistic path escalates into that domain's fair lane and
+ * commits within a bounded number of retries -- the list is
+ * starvation-resistant, not merely livelock-free.
  */
 
 #include <errno.h>
@@ -122,28 +137,38 @@ struct urcu_txn_list_node {
 };
 
 /*
- * A list is its circular sentinel node plus the per-list escalation domain that
- * the concurrent transaction front-end funnels starved or oversized mutators
- * through (see <urcu/rcu-txn.h>).  The domain lives here, once
- * per list, which is why the mutators below take the head: an element is
- * reached only via its list, and a mutator needs that list's domain to stay
+ * A list is just its circular sentinel node.  The escalation DOMAIN -- the fair
+ * lane the concurrent transaction front-end funnels starved or oversized
+ * mutators through (see <urcu/rcu-txn.h>) -- is NOT embedded here: the mutators
+ * below take a struct urcu_txn_domain * explicitly, so a whole set of lists that
+ * form one logical structure shares ONE domain (or a small striped set), rather
+ * than paying a fair-mutex per list.  This matches <urcu/rcu-txn-hlist.h>, whose
+ * bucket heads likewise carry no domain.  The domain init'd for a list must
+ * outlive every mutator transacting through it, and every mutator on a given
+ * structure should be handed the same domain for that structure to stay
  * starvation-resistant under adversarial contention.
  *
- * The domain wraps a fair mutex with no static initializer, so a head must be
- * initialized at runtime with urcu_txn_list_init() -- there is no static
- * HEAD_INIT form.
+ * The head is domain-free, so -- unlike the concurrent hlist's single pointer,
+ * but like the single-writer <urcu/rcu-txn-sw-list.h> -- it has a static
+ * initializer: URCU_TXN_LIST_HEAD_INIT(name) / URCU_TXN_LIST_HEAD(name), or
+ * urcu_txn_list_init() at runtime.  The domain is init'd separately with
+ * urcu_txn_domain_init().
  */
 struct urcu_txn_list_head {
 	struct urcu_txn_list_node node;	/* circular sentinel */
-	struct urcu_txn_domain domain;	/* shared escalation domain */
 };
+
+#define URCU_TXN_LIST_HEAD_INIT(name) \
+	{ .node = { .next = &(name).node, .prev = &(name).node } }
+
+#define URCU_TXN_LIST_HEAD(name) \
+	struct urcu_txn_list_head name = URCU_TXN_LIST_HEAD_INIT(name)
 
 static inline
 void urcu_txn_list_init(struct urcu_txn_list_head *head)
 {
 	head->node.next = &head->node;
 	head->node.prev = &head->node;
-	urcu_txn_domain_init(&head->domain);
 }
 
 /* Logical-deletion mark: bit 1 of a node's next pointer. */
@@ -217,18 +242,36 @@ int urcu_txn_list_empty(struct urcu_txn_list_head *head)
  * escalation domain (whichever @txn was init'd with), and the retry loop, and
  * may fold these records together with records from other structures into a
  * single MCAS commit -- e.g. publish a node into a trie and splice it into this
- * list atomically.  Call between urcu_txn_begin() and
- * urcu_txn_commit().  Returns 0 on success, or -ENOENT if @pos has been
- * deleted (the caller ends the bracket and bails the logical op); a descriptor
- * OOM is sticky and surfaces at the caller's commit.  @pos must be kept alive
- * by the caller's RCU read-side section (see the contract above).
+ * list atomically.  Call between urcu_txn_begin() and urcu_txn_commit().
+ *
+ * COMPOSE ON A DEFAULT HANDLE.  The self-contained wrappers below declare their
+ * write set disjoint, which is sound because a SINGLE-op commit provably
+ * touches distinct slots -- do not copy that line into a composed bracket
+ * unless the COMBINED write set is provably distinct too.  Two edits of this
+ * list can share a slot the moment their nodes land adjacent (both name the
+ * shared neighbour's "next"), and that is data-dependent -- not knowable from
+ * the keys.  On a disjoint handle the second prepare's loads then silently
+ * return committed values (a stale neighbour) and its stores blind-append a
+ * duplicate record: silent corruption.  The default read-your-own-writes handle
+ * instead lets the prepare see the transaction's own pending edits and chains
+ * the collision into one record.  See urcu_txn_declare_disjoint() in
+ * <urcu/rcu-txn.h>.
+ *
+ * Returns:
+ *   0        the edges are recorded;
+ *   -ENOENT  @pos ITSELF has been deleted -- the anchor is gone.  Terminal:
+ *            end the bracket and bail the logical op;
+ *   -EAGAIN  a NEIGHBOUR (the successor) is mid-deletion; its tombstone guard
+ *            fired.  Transient, NOT terminal: the anchor is fine and the
+ *            insert must be re-attempted.  Run the retry protocol --
+ *            urcu_txn_conflict() (so a hot slot ages into the escalation
+ *            lane), urcu_txn_end(), urcu_txn_begin(), prepare again.
+ *
+ * Misreading -EAGAIN as -ENOENT abandons an insert that merely raced a
+ * neighbour's delete.  A descriptor OOM is sticky and surfaces at the caller's
+ * commit.  @pos must be kept alive by the caller's RCU read-side section (see
+ * the contract above).
  */
-static inline
-int urcu_txn_list__insert_prepare(struct urcu_mcas_txn *txn,
-		struct urcu_txn_list_node *newp,
-		struct urcu_txn_list_node *pos,
-		struct urcu_txn_list_node *succ);
-
 static inline
 int urcu_txn_list_insert_after_prepare(struct urcu_mcas_txn *txn,
 		struct urcu_txn_list_node *newp,
@@ -240,45 +283,6 @@ int urcu_txn_list_insert_after_prepare(struct urcu_mcas_txn *txn,
 	if (urcu_txn_list_is_marked(pn))
 		return -ENOENT;				/* @pos was deleted */
 	succ = (struct urcu_txn_list_node *) pn;	/* unmarked successor */
-	return urcu_txn_list__insert_prepare(txn, newp, pos, succ);
-}
-
-/*
- * urcu_txn_list_insert_between_prepare: insert_after_prepare with the caller's
- * ORDER INTENT pinned.  insert_after derives the successor FRESH from
- * @pos->next at prepare time -- it inserts after @pos wherever @pos's
- * neighbourhood has moved to -- which is correct for positional lists but NOT
- * for a caller that decided "@newp belongs between @pos and @succ_expected" by
- * some external ordering (keys): a peer's insert-after(@pos) committed between
- * that decision and this prepare would silently land @newp BEFORE the peer's
- * node.  This variant refuses (-EAGAIN) when @pos->next no longer equals
- * @succ_expected, and records @succ_expected as the &pos->next expected old --
- * so any later interposition fails the commit's value CAS instead of being
- * adopted.  -ENOENT as insert_after (@pos deleted).  The caller re-derives its
- * position on either failure.
- */
-static inline
-int urcu_txn_list_insert_between_prepare(struct urcu_mcas_txn *txn,
-		struct urcu_txn_list_node *newp,
-		struct urcu_txn_list_node *pos,
-		struct urcu_txn_list_node *succ_expected)
-{
-	void *pn = urcu_txn_load(txn, (void **) &pos->next, URCU_MCAS_TAG);
-
-	if (urcu_txn_list_is_marked(pn))
-		return -ENOENT;				/* @pos was deleted */
-	if ((struct urcu_txn_list_node *) pn != succ_expected)
-		return -EAGAIN;				/* order intent stale: re-derive */
-	return urcu_txn_list__insert_prepare(txn, newp, pos, succ_expected);
-}
-
-/* Common tail of the insert prepares: @succ is @pos's validated successor. */
-static inline
-int urcu_txn_list__insert_prepare(struct urcu_mcas_txn *txn,
-		struct urcu_txn_list_node *newp,
-		struct urcu_txn_list_node *pos,
-		struct urcu_txn_list_node *succ)
-{
 
 	/*
 	 * We write &succ->prev but NOT &succ->next.  The next slot that serializes
@@ -290,7 +294,15 @@ int urcu_txn_list__insert_prepare(struct urcu_mcas_txn *txn,
 	 * marks -- into the write-set, so the prev side serializes against
 	 * del(succ) exactly as the next side does; a marked succ aborts here.
 	 */
-	if (urcu_txn_list_is_marked(urcu_txn_load_validate(txn,
+	/*
+	 * Skip the guard when succ == pos (inserting after a self-looping node --
+	 * the empty list's sentinel): &succ->next is then &pos->next, the slot the
+	 * forward store below already writes and serializes.  A second record on it
+	 * is harmless under reconcile but a duplicate under a disjoint blind-append,
+	 * and the sentinel is never deleted so the guard is moot.  Mirrors
+	 * del_prepare's next == prev skip; keeps the write set disjoint.
+	 */
+	if (succ != pos && urcu_txn_list_is_marked(urcu_txn_load_validate(txn,
 			(void **) &succ->next, URCU_MCAS_TAG)))
 		return -EAGAIN;				/* succ (a neighbour) deleted: retry */
 
@@ -312,21 +324,23 @@ int urcu_txn_list__insert_prepare(struct urcu_mcas_txn *txn,
 }
 
 /*
- * Insert @newp immediately after @pos in list @head.  Returns 0 on success,
- * -ENOENT if @pos has been deleted, -ENOMEM on descriptor allocation failure.
- * @head supplies the list's escalation domain (see the contract above).  This
- * is the self-contained convenience form: a thin bracket around
+ * Insert @newp immediately after @pos, transacting through @domain's escalation
+ * lane.  Returns 0 on success, -ENOENT if @pos has been deleted, -ENOMEM on
+ * descriptor allocation failure.  @domain is the escalation domain shared across
+ * the structure @pos belongs to (see the contract above).  This is the
+ * self-contained convenience form: a thin bracket around
  * urcu_txn_list_insert_after_prepare().
  */
 static inline
 int urcu_txn_list_insert_after_rcu(struct urcu_txn_list_node *newp,
 		struct urcu_txn_list_node *pos,
-		struct urcu_txn_list_head *head)
+		struct urcu_txn_domain *domain)
 {
 	struct urcu_mcas_txn txn;
 	int ret, prep;
 
-	urcu_txn_init(&txn, &head->domain);
+	urcu_txn_init(&txn, domain);
+	urcu_txn_declare_disjoint(&txn);	/* single-op commit: distinct slots, no same-slot WAW */
 	for (;;) {
 		urcu_txn_begin(&txn);
 		prep = urcu_txn_list_insert_after_prepare(&txn, newp, pos);
@@ -348,30 +362,42 @@ int urcu_txn_list_insert_after_rcu(struct urcu_txn_list_node *newp,
 }
 
 /*
- * Insert @newp after @pos in list @head, but only if @guard_slot still holds
- * @guard_expected at the commit -- the structural insert and that check
- * linearize as ONE MCAS (a load-validate guard).  Use it when the insert
+ * Insert @newp after @pos, transacting through @domain, but only if @guard_slot
+ * still holds @guard_expected at the commit -- the structural insert and that
+ * check linearize as ONE MCAS (a load-validate guard).  Use it when the insert
  * depends on a word the list does not otherwise touch: a per-node "live" /
  * generation marker the embedder keeps beside its node, a container-freeze
  * flag, etc.  @guard_slot must be engine-transacted (every writer of it goes
- * through the MCAS).  The guard has value-CAS semantics: it checks @guard_slot
- * resolves to @guard_expected AT the linearization point, not that it stayed so
- * throughout -- the engine itself is A-B-A-safe, but if a benign recurrence of
- * @guard_expected would be the wrong answer for your insert, put a
- * version/generation in the guarded word.  Returns 0; -ENOENT if @pos was deleted
- * or @guard_slot no longer holds @guard_expected; -ENOMEM on descriptor OOM.
+ * through the MCAS).
+ *
+ * @guard_slot MUST NOT alias a slot this insert itself transacts -- &pos->next,
+ * &succ->prev, or &succ->next (the successor's tombstone guard).  "A word the
+ * list does not otherwise touch" is a hard requirement, not a description of
+ * the intended use: this handle declares its write set disjoint, so an aliasing
+ * guard does not fail cleanly.  It blind-appends a second record on a slot
+ * already recorded, and the commit CORRUPTS -- both records install, and the
+ * later one's value wins, silently dropping the other edit.
+ *
+ * The guard has value-CAS semantics: it checks @guard_slot resolves to
+ * @guard_expected AT the linearization point, not that it stayed so
+ * throughout -- the engine itself is A-B-A-safe, but if a benign recurrence
+ * of @guard_expected would be the wrong answer for your insert, put a
+ * version/generation in the guarded word.  Returns 0; -ENOENT if @pos was
+ * deleted or @guard_slot no longer holds @guard_expected; -ENOMEM on
+ * descriptor OOM.
  */
 static inline
 int urcu_txn_list_insert_after_guarded_rcu(
 		struct urcu_txn_list_node *newp,
 		struct urcu_txn_list_node *pos,
-		struct urcu_txn_list_head *head,
+		struct urcu_txn_domain *domain,
 		void **guard_slot, void *guard_expected)
 {
 	struct urcu_mcas_txn txn;
 	int ret;
 
-	urcu_txn_init(&txn, &head->domain);
+	urcu_txn_init(&txn, domain);
+	urcu_txn_declare_disjoint(&txn);	/* single-op commit: distinct slots, no same-slot WAW */
 	for (;;) {
 		void *pn;
 		struct urcu_txn_list_node *succ;
@@ -400,8 +426,8 @@ int urcu_txn_list_insert_after_guarded_rcu(
 		 * install may reach &succ->prev before &pos->next.  See
 		 * insert_after_prepare.  A marked succ moved: retry.
 		 */
-		if (urcu_txn_list_is_marked(urcu_txn_load_validate(
-				&txn, (void **) &succ->next, URCU_MCAS_TAG))) {
+		if (succ != pos && urcu_txn_list_is_marked(urcu_txn_load_validate(
+				&txn, (void **) &succ->next, URCU_MCAS_TAG))) {	/* succ==pos: guard moot, see insert_after_prepare */
 			urcu_txn_conflict(&txn);	/* age so a hot slot escalates */
 			urcu_txn_end(&txn);
 			continue;
@@ -434,14 +460,22 @@ int urcu_txn_list_insert_before_prepare(struct urcu_mcas_txn *txn,
 	 * is the anchor whose prev we move) so the prev-side store serializes
 	 * against del(pos) atomically even when the slot-sorted install reaches
 	 * &pos->prev first.  A marked pos => the anchor is gone (-ENOENT).
+	 *
+	 * Load @prev first so we can skip the VALIDATE (a plain load still checks
+	 * the mark) when prev == pos -- inserting before a self-looping node, the
+	 * empty list's sentinel: &prev->next is then &pos->next, the slot the
+	 * forward store below already writes and serializes, so a validate record
+	 * would duplicate it under a disjoint blind-append.  The sentinel is never
+	 * deleted, so the guard is moot.  Mirrors del_prepare's next == prev skip.
 	 */
-	void *pn = urcu_txn_load_validate(txn, (void **) &pos->next, URCU_MCAS_TAG);
-	struct urcu_txn_list_node *prev;
+	struct urcu_txn_list_node *prev = urcu_txn_list_unmark(
+			urcu_txn_load(txn, (void **) &pos->prev, URCU_MCAS_TAG));
+	void *pn = prev != pos
+			? urcu_txn_load_validate(txn, (void **) &pos->next, URCU_MCAS_TAG)
+			: urcu_txn_load(txn, (void **) &pos->next, URCU_MCAS_TAG);
 
 	if (urcu_txn_list_is_marked(pn))
 		return -ENOENT;			/* @pos was deleted */
-	prev = urcu_txn_list_unmark(
-			urcu_txn_load(txn, (void **) &pos->prev, URCU_MCAS_TAG));
 
 	newp->next = pos;
 	newp->prev = prev;
@@ -459,19 +493,20 @@ int urcu_txn_list_insert_before_prepare(struct urcu_mcas_txn *txn,
 }
 
 /*
- * Insert @newp immediately before @pos in list @head.  Returns 0 / -ENOENT /
- * -ENOMEM as for insert_after.  Convenience bracket around
+ * Insert @newp immediately before @pos, transacting through @domain.  Returns
+ * 0 / -ENOENT / -ENOMEM as for insert_after.  Convenience bracket around
  * urcu_txn_list_insert_before_prepare().
  */
 static inline
 int urcu_txn_list_insert_before_rcu(struct urcu_txn_list_node *newp,
 		struct urcu_txn_list_node *pos,
-		struct urcu_txn_list_head *head)
+		struct urcu_txn_domain *domain)
 {
 	struct urcu_mcas_txn txn;
 	int ret, prep;
 
-	urcu_txn_init(&txn, &head->domain);
+	urcu_txn_init(&txn, domain);
+	urcu_txn_declare_disjoint(&txn);	/* single-op commit: distinct slots, no same-slot WAW */
 	do {
 		urcu_txn_begin(&txn);
 		prep = urcu_txn_list_insert_before_prepare(&txn, newp, pos);
@@ -486,36 +521,56 @@ int urcu_txn_list_insert_before_rcu(struct urcu_txn_list_node *newp,
 }
 
 /*
- * Add @newp at the head of list @head (just after the sentinel).  The sentinel
- * is immortal, so this never observes a deleted anchor: it returns 0, or
- * -ENOMEM on descriptor allocation failure (never -ENOENT).
+ * Add @newp at the head of list @head (just after the sentinel), transacting
+ * through @domain.  The sentinel is immortal, so this never observes a deleted
+ * anchor: it returns 0, or -ENOMEM on descriptor allocation failure (never
+ * -ENOENT).
  */
 static inline
 int urcu_txn_list_add_rcu(struct urcu_txn_list_node *newp,
-		struct urcu_txn_list_head *head)
+		struct urcu_txn_list_head *head,
+		struct urcu_txn_domain *domain)
 {
-	return urcu_txn_list_insert_after_rcu(newp, &head->node, head);
+	return urcu_txn_list_insert_after_rcu(newp, &head->node, domain);
 }
 
 /*
- * Add @newp at the tail of list @head (just before the sentinel).  Returns 0,
- * or -ENOMEM on descriptor allocation failure (never -ENOENT).
+ * Add @newp at the tail of list @head (just before the sentinel), transacting
+ * through @domain.  Returns 0, or -ENOMEM on descriptor allocation failure
+ * (never -ENOENT).
  */
 static inline
 int urcu_txn_list_add_tail_rcu(struct urcu_txn_list_node *newp,
-		struct urcu_txn_list_head *head)
+		struct urcu_txn_list_head *head,
+		struct urcu_txn_domain *domain)
 {
-	return urcu_txn_list_insert_before_rcu(newp, &head->node, head);
+	return urcu_txn_list_insert_before_rcu(newp, &head->node, domain);
 }
 
 /*
- * urcu_txn_list_del_prepare: record the unlink of @elem into the
- * caller-owned transaction @txn, WITHOUT committing.  Composable form of del
- * (see insert_after_prepare for the contract).  Returns 0 if the unlink was
- * recorded (when the caller's commit then returns OK, THIS call removed @elem
- * and the caller reclaims it after a grace period), or -ENOENT if @elem was
- * already deleted by a peer (nothing recorded; the caller must NOT reclaim).
- * OOM is sticky to the commit.
+ * urcu_txn_list_del_prepare: record the unlink of @elem into the caller-owned
+ * transaction @txn, WITHOUT committing.  Composable form of del -- see
+ * insert_after_prepare for the contract, INCLUDING the compose-on-a-default-
+ * handle rule (adjacent deletes folded into one commit share the shared
+ * neighbour's "next" slot, so a disjoint handle corrupts).
+ *
+ * Returns:
+ *   0        the unlink is recorded.  When the caller's commit then returns OK,
+ *            THIS call removed @elem and the caller reclaims it after a grace
+ *            period;
+ *   -ENOENT  @elem was already deleted by a peer.  Terminal: nothing was
+ *            recorded, @elem is not ours, and the caller must NOT reclaim it;
+ *   -EAGAIN  @elem's SUCCESSOR is mid-deletion; its tombstone guard fired.
+ *            Transient, NOT terminal: @elem is still fully linked and still
+ *            ours to delete.  Re-attempt via the retry protocol
+ *            (urcu_txn_conflict(), end, begin, prepare again).
+ *
+ * Do NOT collapse -EAGAIN into -ENOENT.  Concluding "a peer deleted it, don't
+ * reclaim" about a node that is still fully linked loses the deletion outright.
+ * Note also that the -EAGAIN path HAS already appended a {v -> v} validate
+ * record for the successor's next slot -- harmless only because the protocol
+ * ends the bracket, discarding the descriptor unpublished, rather than
+ * committing it.  OOM is sticky to the commit.
  */
 static inline
 int urcu_txn_list_del_prepare(struct urcu_mcas_txn *txn,
@@ -568,19 +623,21 @@ int urcu_txn_list_del_prepare(struct urcu_mcas_txn *txn,
 }
 
 /*
- * Remove @elem from list @head.  Returns 1 if THIS call removed it (the caller
- * reclaims @elem after a grace period), 0 if it was already deleted (the caller
- * must NOT reclaim), or -ENOMEM on descriptor allocation failure.  Convenience
- * bracket around urcu_txn_list_del_prepare().
+ * Remove @elem, transacting through @domain.  @elem need not name its list --
+ * only the structure's shared domain.  Returns 1 if THIS call removed it (the
+ * caller reclaims @elem after a grace period), 0 if it was already deleted (the
+ * caller must NOT reclaim), or -ENOMEM on descriptor allocation failure.
+ * Convenience bracket around urcu_txn_list_del_prepare().
  */
 static inline
 int urcu_txn_list_del_rcu(struct urcu_txn_list_node *elem,
-		struct urcu_txn_list_head *head)
+		struct urcu_txn_domain *domain)
 {
 	struct urcu_mcas_txn txn;
 	int ret, prep;
 
-	urcu_txn_init(&txn, &head->domain);
+	urcu_txn_init(&txn, domain);
+	urcu_txn_declare_disjoint(&txn);	/* single-op commit: distinct slots, no same-slot WAW */
 	for (;;) {
 		urcu_txn_begin(&txn);
 		prep = urcu_txn_list_del_prepare(&txn, elem);
@@ -667,21 +724,22 @@ int urcu_txn_list_replace_prepare(struct urcu_mcas_txn *txn,
 }
 
 /*
- * Replace @old with @newp atomically with respect to RCU readers.  Argument
- * order is (old, new), as cds_list_replace_rcu().  Returns 0 on
- * success (the caller reclaims @old after a grace period), -ENOENT if @old was
- * already deleted/replaced, or -ENOMEM on descriptor allocation failure.
- * Convenience bracket around urcu_txn_list_replace_prepare().
+ * Replace @old with @newp atomically with respect to RCU readers, transacting
+ * through @domain.  Argument order is (old, new), as cds_list_replace_rcu().
+ * Returns 0 on success (the caller reclaims @old after a grace period), -ENOENT
+ * if @old was already deleted/replaced, or -ENOMEM on descriptor allocation
+ * failure.  Convenience bracket around urcu_txn_list_replace_prepare().
  */
 static inline
 int urcu_txn_list_replace_rcu(struct urcu_txn_list_node *old,
 		struct urcu_txn_list_node *newp,
-		struct urcu_txn_list_head *head)
+		struct urcu_txn_domain *domain)
 {
 	struct urcu_mcas_txn txn;
 	int ret, prep;
 
-	urcu_txn_init(&txn, &head->domain);
+	urcu_txn_init(&txn, domain);
+	urcu_txn_declare_disjoint(&txn);	/* single-op commit: distinct slots, no same-slot WAW */
 	for (;;) {
 		urcu_txn_begin(&txn);
 		prep = urcu_txn_list_replace_prepare(&txn, old, newp);

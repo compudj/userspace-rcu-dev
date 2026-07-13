@@ -218,6 +218,12 @@ struct ft_flip_txn *ft_flip_txn_create(void)
 	urcu_txn_init(t->mtxn, NULL);	/* flavor-agnostic: the caller brackets the
 					 * RCU read side; no escalation domain
 					 * under POC exclusion */
+	/* Skip the age-0 optimistic install and its fixed-size RYW Bloom filter:
+	 * a growable FT commit (merge/graft spine folds) can accumulate a large,
+	 * dense write set that saturates the Bloom, false-positiving a same-slot
+	 * coincidence into a spurious escalate-ABORT (see the note in
+	 * ft_flip_txn_create_bounded).  The exact age-1+ reconcile has no Bloom. */
+	urcu_txn_expect_conflict(t->mtxn);
 	t->reserved = false;		/* unbounded: @mtxn grows as edges record */
 	t->nr_copying = 0;
 	return t;
@@ -260,6 +266,19 @@ struct ft_flip_txn *ft_flip_txn_create_bounded(unsigned int cap)
 		return NULL;
 	t->mtxn = &t->own;
 	urcu_txn_init(t->mtxn, NULL);	/* no escalation domain under POC exclusion */
+	/*
+	 * Skip the age-0 optimistic install.  Age 0 detects a same-slot read-
+	 * your-own-writes coincidence with a fixed-size Bloom filter and, on a
+	 * hit, sets esc_pending to force an ABORT-and-escalate to the exact
+	 * age-1+ reconcile.  A pre-reserved FT commit is a DENSE bulk write set
+	 * (a whole-chain detach reserves 100+ edges) that SATURATES that Bloom,
+	 * so a non-coinciding slot false-positives and the commit aborts -- and
+	 * these commits have no retry loop (remove_all et al.), surfacing the
+	 * abort as a spurious MEMORY_ERROR.  expect_conflict runs the sorted,
+	 * exact-reconcile install from attempt 0, which has no Bloom and no
+	 * false positive; it is also the right lane for a contended MW commit.
+	 */
+	urcu_txn_expect_conflict(t->mtxn);
 	if (urcu_txn_reserve(t->mtxn, cap) < 0) {
 		if (t->mtxn->mcas && t->mtxn->mcas != URCU_TXN_ENOMEM)
 			urcu_mcas_destroy(t->mtxn->mcas);
@@ -584,6 +603,82 @@ void ft_flip_txn_record_reserved(struct ft_flip_txn *t, void **slot,
 	ft_flip_txn_record_tag(t, slot, old_ptr, new_ptr, FT_FLIP_PROXY_TAG);
 }
 
+/*
+ * FT-local order-pinned insert-between (was the engine's
+ * urcu_txn_list_insert_between_prepare, dropped when the transaction engine was
+ * adopted wholesale -- it only calls class-A primitives, so it lives here now).
+ * insert_after_prepare derives the successor FRESH from @pos->next, so a peer
+ * insert-after(@pos) that committed since the caller decided "@newp belongs
+ * between @pos and @succ_expected" (by key order) would silently land @newp
+ * BEFORE the peer's node.  This variant refuses (-EAGAIN) unless @pos->next
+ * still equals @succ_expected, and records @succ_expected as the &pos->next
+ * expected old -- so a later interposition fails the commit's value CAS instead
+ * of being adopted.  -ENOENT when @pos itself was deleted.  Mirrors the new
+ * insert_after_prepare edge recording, including its succ == pos self-loop guard
+ * skip; compose on a DEFAULT (read-your-own-writes) handle.
+ */
+static inline
+int ft_txn_list_insert_between_prepare(struct urcu_mcas_txn *txn,
+		struct urcu_txn_list_node *newp,
+		struct urcu_txn_list_node *pos,
+		struct urcu_txn_list_node *succ_expected)
+{
+	void *pn = urcu_txn_load(txn, (void **) &pos->next, URCU_MCAS_TAG);
+
+	if (urcu_txn_list_is_marked(pn))
+		return -ENOENT;				/* @pos was deleted */
+	if ((struct urcu_txn_list_node *) pn != succ_expected)
+		return -EAGAIN;				/* order intent stale: re-derive */
+	/*
+	 * Guard succ_expected->next (the slot del(succ) marks) so the &succ->prev
+	 * store serializes against del(succ) exactly as &pos->next does; skip it
+	 * when succ == pos (self-looping sentinel), whose next IS &pos->next, the
+	 * forward store's own slot.
+	 */
+	if (succ_expected != pos && urcu_txn_list_is_marked(urcu_txn_load_validate(
+			txn, (void **) &succ_expected->next, URCU_MCAS_TAG)))
+		return -EAGAIN;				/* succ (a neighbour) deleted: retry */
+
+	/* Build the fresh node invisibly, then record the two forward edges. */
+	newp->next = succ_expected;
+	newp->prev = pos;
+	urcu_txn_store(txn, (void **) &pos->next, succ_expected, newp, URCU_MCAS_TAG);
+	urcu_txn_store(txn, (void **) &succ_expected->prev, pos, newp, URCU_MCAS_TAG);
+	return 0;
+}
+
+/*
+ * Resolve @src (a live child slot of the node under recompaction) to the
+ * definite child it currently denotes.  The retire is fenced first
+ * (ft_meta_copying_mark set FT_STATE_COPYING in the node's state word before
+ * this loop), so no peer can newly republish @src -- its §4.B clean-LIVE guard
+ * fails against the COPYING bit -- and the only proxy this can meet is a peer
+ * child-recompact that parked BEFORE the fence and is now doomed to abort.
+ * urcu_mcas_read reads @src's COMMITTED logical value, resolving a proxy to the
+ * value it will settle to (helping a doomed peer to its terminal status), so the
+ * copy builds against a definite child.  COMMITTED, not read-your-own-writes:
+ * this reproduces the old urcu_txn_resolve_prio, which read the raw slot and
+ * never consulted this attempt's own buffered records.  It is load-bearing --
+ * during the BUILD phase a bulk op's pending edits live in the descriptor, not
+ * in the slot, so a txn-level urcu_txn_load would return the PENDING value (e.g.
+ * NULL for a source child the op has buffered a detach for) and drop a child the
+ * copy must preserve; the removal a DEL recompact intends is applied separately,
+ * by the by-IDENTITY skip of nullify_node_flag_ptr above, not by reading a
+ * pending NULL here.  Bypassing the txn read set also avoids entering @src into
+ * this attempt's read set, which would add a spurious commit-time validate.  The
+ * old priority-eviction (urcu_mcas_outranks) is retired: single-driver liveness
+ * comes from age-escalation, and the node-level COPYING fence -- not a per-slot
+ * freeze -- keeps @src from going stale against PEERS between here and the
+ * commit.  Always resolves (returns 1); the vestigial int return keeps the call
+ * sites' abandon path, now dead, as documentation.  FT proxy tag.
+ */
+static inline
+int ft_flip_txn_resolve_prio(struct ft_flip_txn *t, void **src, void **out)
+{
+	*out = urcu_mcas_read(src, FT_FLIP_PROXY_TAG);
+	return 1;
+}
+
 #ifdef FT_ENABLE_TRACING
 #include <stdio.h>
 #include <stdlib.h>
@@ -600,7 +695,7 @@ void ft_flip_txn_record_reserved(struct ft_flip_txn *t, void **slot,
  * the flight-recorder ring, abort -- the last events before the abort walk
  * to whoever published the edge (skill: lttng-tracing-root-cause-analysis).
  */
-static
+static __attribute__((unused))
 void ft_trace_miswire_check(struct cds_ft *ft,
 		struct cds_ft_inode_flag *edge, unsigned int site)
 {
@@ -660,7 +755,14 @@ void ft_trace_miswire_check(struct cds_ft *ft,
 	(void) system("lttng snapshot record 1>&2");
 	abort();
 }
+#ifndef FT_LIGHT_TRACING	/* -DFT_LIGHT_TRACING: keep tracepoints, drop the
+				 * per-descent round-trip detector (its overhead
+				 * widens the MW race window and suppresses the
+				 * mis-wire -- snapshot on the natural SIGSEGV instead). */
 #define FT_TRACE_MISWIRE(ft, edge, site) ft_trace_miswire_check(ft, edge, site)
+#else
+#define FT_TRACE_MISWIRE(ft, edge, site) do { (void) (ft); (void) (edge); (void) (site); } while (0)
+#endif
 #else
 #define FT_TRACE_MISWIRE(ft, edge, site) do { } while (0)
 #endif	/* FT_ENABLE_TRACING */
@@ -1101,7 +1203,22 @@ static inline
 void ft_flip_txn_record_tombstone(struct ft_flip_txn *t,
 		struct cds_ft_metadata *meta)
 {
-	uintptr_t old = meta->state;
+	/*
+	 * READ-YOUR-OWN-WRITES: the expected old is this txn's own PENDING view
+	 * of the state word (urcu_txn_load), not a raw meta->state read.  The
+	 * word is in this record's WRITE set, so per the engine's read policy it
+	 * must be read through the txn -- a raw committed read is a torn read-set
+	 * the moment another edge in the SAME txn already rewrote the word, which
+	 * the engine POISONS (commit aborts).  This happens on a retire that
+	 * fuses with a recompaction: ft_node_recompact already recorded the old
+	 * node's fenced {COPYING|s -> TOMBSTONE|s} edge into @t, so a plain
+	 * tombstone reading the COMMITTED old disagrees with that pending new.
+	 * The RYW load returns TOMBSTONE-already-set there, chaining to a no-op
+	 * upgrade; with no prior edge it returns the committed value, so every
+	 * other call site is behaviour-identical.
+	 */
+	uintptr_t old = (uintptr_t) urcu_txn_load(t->mtxn,
+			(void **) &meta->state, FT_STATE_PROXY);
 
 	ft_flip_txn_record_tag(t, (void **) &meta->state,
 			(void *) old, (void *) (old | FT_STATE_TOMBSTONE),

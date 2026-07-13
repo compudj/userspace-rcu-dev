@@ -609,6 +609,49 @@ LTTNG_UST_TRACEPOINT_EVENT(cds_ft, edge_lone,
 	)
 )
 
+/*
+ * Pass-4 torn-navigation campaign: bracket the one-commit predecessor search
+ * (the seeded LT).  @phase 0 = first search, 1 = confirm search; @pred_cell /
+ * @pred_head are the result (0 = new minimum); @key0 = first 8 key bytes
+ * big-endian, for correlation with the oracle's u64 keys.  Low rate (2 per
+ * list-on insert).  The pair timestamps the search window so the surrounding
+ * edge_record / txn_commit breadcrumbs show exactly which peer commits
+ * interleaved it.
+ */
+LTTNG_UST_TRACEPOINT_EVENT(cds_ft, pred_search,
+	LTTNG_UST_TP_ARGS(
+		uint64_t, key0,
+		int, phase,
+		int, from_root,
+		const void *, pred_cell,
+		const void *, pred_head
+	),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_integer_hex(uint64_t, key0, key0)
+		lttng_ust_field_integer(int, phase, phase)
+		lttng_ust_field_integer(int, from_root, from_root)
+		lttng_ust_field_integer_hex(uintptr_t, pred_cell, (uintptr_t) pred_cell)
+		lttng_ust_field_integer_hex(uintptr_t, pred_head, (uintptr_t) pred_head)
+	)
+)
+
+/*
+ * Pass-4 campaign: point-remove outcome, keyed by the head NODE pointer (the
+ * same currency as pred_search's pred_head), so writer self-removes become
+ * visible in the window -- without it a search result can look stale when the
+ * key was in fact legally removed moments earlier.
+ */
+LTTNG_UST_TRACEPOINT_EVENT(cds_ft, remove_head_exit,
+	LTTNG_UST_TP_ARGS(
+		const void *, head,
+		int, status
+	),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_integer_hex(uintptr_t, head, (uintptr_t) head)
+		lttng_ust_field_integer(int, status, status)
+	)
+)
+
 /* Commit outcome: the recorded edges of @txn installed iff status == 0. */
 LTTNG_UST_TRACEPOINT_EVENT(cds_ft, txn_commit,
 	LTTNG_UST_TP_ARGS(
@@ -662,6 +705,22 @@ LTTNG_UST_TRACEPOINT_EVENT(cds_ft, item_free,
 	LTTNG_UST_TP_FIELDS(
 		lttng_ust_field_integer_hex(uintptr_t, item, (uintptr_t) item)
 		lttng_ust_field_integer(unsigned int, kind, kind)
+	)
+)
+
+/*
+ * TEMPORARY (MW firing-path attribution): the call_rcu RETIRE of a published
+ * internal node, tagged with free_cds_ft_node's caller return address so the
+ * exact retiring site (addr2line) can be read from the snapshot.
+ */
+LTTNG_UST_TRACEPOINT_EVENT(cds_ft, item_retire,
+	LTTNG_UST_TP_ARGS(
+		const void *, item,
+		const void *, caller
+	),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_integer_hex(uintptr_t, item, (uintptr_t) item)
+		lttng_ust_field_integer_hex(uintptr_t, caller, (uintptr_t) caller)
 	)
 )
 

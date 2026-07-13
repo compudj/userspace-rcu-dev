@@ -6,9 +6,9 @@
 #define _URCU_RCU_TXN_SW_H
 
 /*
- * Single-updater transaction: atomically switch a *set* of pointers from an "old" value
- * to a "new" value with a single store, as observed by concurrent RCU
- * readers.
+ * Single-updater transaction: atomically switch a *set* of pointers from an
+ * "old" value to a "new" value with a single store, as observed by concurrent
+ * RCU readers.
  *
  * Motivation
  * ----------
@@ -61,14 +61,28 @@
  * latch *before* the forward edge, so a reader -- which descends before it
  * walks back up -- can only ever progress old->new, never regress).
  *
+ * SCOPE of "never new-then-old".  Monotonicity of the SELECTOR is unconditional
+ * -- it is one word, stored once.  What a reader's SEQUENCE of resolutions
+ * inherits from it depends on how the reader got from one slot to the next.  A
+ * DEPENDENCY-CHAINED traversal (each hop's address derived from the value the
+ * previous hop loaded) carries the order for free on every architecture urcu
+ * supports, and so does any build using the default C11 dereference.  A reader
+ * that hops WITHOUT that chain -- re-reading a pointer it cached earlier, or
+ * walking prev-then-next between two independently-reached slots -- has no such
+ * edge: under -DURCU_DEREFERENCE_USE_VOLATILE on weakly-ordered hardware its
+ * two loads may be reordered, and it can observe the new selector's effect on
+ * the later slot and the old on the earlier one.  Such a reader owes itself an
+ * explicit acquire (or a dependency).  The fixed-read-order idiom above is
+ * exactly a dependency-chained descent, which is why it is safe as stated.
+ *
  * Two layers
  * ----------
  * This header provides two layers:
  *
  *   1. The low-level flip group / proxy primitive above (urcu_txn_sw_group,
- *      urcu_txn_sw_proxy, urcu_txn_sw_proxy_get, urcu_txn_sw_commit).  The embedder
- *      allocates and reclaims the proxies, tags them, and routes resolution --
- *      as in the four-step lifecycle described above.
+ *      urcu_txn_sw_proxy, urcu_txn_sw_proxy_get, urcu_txn_sw_commit).  The
+ *      embedder allocates and reclaims the proxies, tags them, and routes
+ *      resolution -- as in the four-step lifecycle described above.
  *
  *   2. A growable multi-edge transaction, urcu_txn_sw_txn, built on that
  *      primitive (defined lower in this file).  It owns proxy allocation,
@@ -79,16 +93,17 @@
  *        init -> PREPARE --record--> ... --commit--> committed
  *
  *      record() appends an edge {slot, old, new} into the (realloc-grown)
- *      record array but installs nothing; the record set is FROZEN once commit()
- *      parks the proxies, matching the concurrent engine's contract (no edge may
- *      be added once a proxy is parked), so an embedder written against this
- *      transaction can migrate to <urcu/rcu-mcas.h> mechanically.
+ *      record array but installs nothing; the record set is FROZEN once
+ *      commit() parks the proxies, matching the concurrent engine's contract
+ *      (no edge may be added once a proxy is parked), so an embedder written
+ *      against this transaction can migrate to <urcu/rcu-mcas.h> mechanically.
  *      commit() parks every recorded proxy, flips the group and settles to new,
  *      then OWNS reclaim: it defers the txn through call_rcu() when it parked
- *      proxies, or frees it at once on the single-edge / empty / OOM paths.  Each
- *      recorded edge carries its own tag (the bits OR'd into that slot's parked
- *      proxy value), so one transaction can mix slots with different tags; the
- *      embedder only checks commit()'s status.  See the urcu_txn_sw_txn block.
+ *      proxies, or frees it at once on the single-edge / empty / OOM paths.
+ *      Each recorded edge carries its own tag (the bits OR'd into that slot's
+ *      parked proxy value), so one transaction can mix slots with different
+ *      tags; the embedder only checks commit()'s status.  See the
+ *      urcu_txn_sw_txn block.
  *
  * RCU flavor
  * ----------
@@ -151,12 +166,12 @@ void urcu_txn_sw_proxy_init(struct urcu_txn_sw_proxy *proxy,
 /*
  * Resolve a proxy to its current target.
  *
- * @proxy must have been obtained by dereferencing (rcu_dereference) the
- * slot that holds the tagged proxy pointer, so the dependency chain makes
- * the proxy's immutable fields (old_ptr, new_ptr, group) visible.  The
- * selector is the only mutable field: load it with acquire so the new
- * target's contents -- published before urcu_txn_sw_group_commit()'s release store
- * -- are visible whenever selector == 1 is observed.
+ * @proxy must have been obtained by dereferencing (rcu_dereference) the slot
+ * that holds the tagged proxy pointer, so the dependency chain makes the
+ * proxy's immutable fields (old_ptr, new_ptr, group) visible.  The selector is
+ * the only mutable field: load it with acquire so the new target's contents --
+ * published before urcu_txn_sw_group_commit()'s release store -- are visible
+ * whenever selector == 1 is observed.
  *
  * The selector indexes proxy->ptr[] directly, so resolution is a pure data
  * dependency rather than a conditional branch.
@@ -212,9 +227,9 @@ void urcu_txn_sw_group_commit(struct urcu_txn_sw_group *group)
  * tagged proxy (readers still resolve to old; selector == 0), flips the group
  * with one release store (every proxy resolves to new at once), then settles
  * each slot to its direct new value.  commit() OWNS reclaim:
- *   - nr >= 2 (proxies parked): a reader may hold a proxy, whose old/new targets
- *     and selector live in the record array and the group block; both are
- *     deferred through one call_rcu(urcu_txn_sw_free_rcu) and reclaimed
+ *   - nr >= 2 (proxies parked): a reader may hold a proxy, whose old/new
+ *     targets and selector live in the record array and the group block; both
+ *     are deferred through one call_rcu(urcu_txn_sw_free_rcu) and reclaimed
  *     together after a grace period.
  *   - nr <= 1 / sticky OOM (no proxy ever published): the record array is freed
  *     at once and no group block is ever allocated.
@@ -246,36 +261,44 @@ enum urcu_txn_sw_state {
 struct urcu_txn_sw_latch {
 	struct urcu_txn_sw_proxy proxy;	/* ptr[0]=old, ptr[1]=new, group */
 	void **slot;			/* install / settle target */
-	uintptr_t tag;			/* embedder tag bits OR'd into THIS slot's parked
-					 * proxy value at install (see urcu_txn_sw_record).
-					 * Per-record so heterogeneous slots -- e.g. a
-					 * 0xF-tagged structural edge and a bit-0 list edge --
-					 * can share one transaction. */
+	uintptr_t tag;			/*
+					 * Embedder tag bits OR'd into THIS
+					 * slot's parked proxy value at install
+					 * (see urcu_txn_sw_record).  Per-record
+					 * so heterogeneous slots -- e.g. a
+					 * 0xF-tagged structural edge and a
+					 * bit-0 list edge -- can share one
+					 * transaction.
+					 */
 } __attribute__((aligned(16)));
 
 /*
  * Transaction block (HEAP path): the single allocation that carries a committed
  * transaction across its grace period, mirroring the concurrent engine's struct
- * urcu_mcas (one block = header + inline records).  It holds the flip group every
- * parked proxy reads (&block->group, a plain pointer -- never tagged -- so it
- * needs no alignment of its own), the rcu_head that defers reclaim, and the
- * record array INLINE (the proxies themselves live there).  Allocated on the
- * first record()/reserve() from the shared per-CPU slab and grown in PREPARE (no
- * proxy is live yet, so it may move); ONE free -- record array and all --
- * reclaims it.  The 32-byte header keeps latches[] 16-byte aligned so each tagged
- * proxy has its low 4 bits free.  @cap is the physical capacity; @slab (stamped
- * at alloc) tells free the block's origin -- self-describing, so a block
- * allocated before the slab constructor ran or while it was disabled is freed
- * on the right path even if the slab enables in between.
- * The INLINE path (urcu_txn_sw_init_inline, nr <= 1) never allocates a block.
+ * urcu_mcas (one block = header + inline records).  It holds the flip group
+ * every parked proxy reads (&block->group, a plain pointer -- never tagged --
+ * so it needs no alignment of its own), the rcu_head that defers reclaim, and
+ * the record array INLINE (the proxies themselves live there).  Allocated on
+ * the first record()/reserve() from the shared per-CPU slab and grown in
+ * PREPARE (no proxy is live yet, so it may move); ONE free -- record array and
+ * all -- reclaims it.  The 32-byte header keeps latches[] 16-byte aligned so
+ * each tagged proxy has its low 4 bits free.  @cap is the physical capacity;
+ * @slab (stamped at alloc) tells free the block's origin -- self-describing, so
+ * a block allocated before the slab constructor ran or while it was disabled is
+ * freed on the right path even if the slab enables in between.  The INLINE path
+ * (urcu_txn_sw_init_inline, nr <= 1) never allocates a block.
  */
 struct urcu_txn_sw_block {
 	struct urcu_txn_sw_group group;		/* selector; parked proxies read &block->group */
 	struct rcu_head rcu_head;		/* deferred-free handle */
 	unsigned int cap;			/* physical capacity */
-	unsigned int slab;			/* block origin: slab (1) / exact malloc (0); the
-						 * free discriminator, doubling as the pad that
-						 * keeps latches[] 16-byte aligned */
+	unsigned int slab;			/*
+						 * Block origin: slab (1) /
+						 * exact malloc (0); the free
+						 * discriminator, doubling as
+						 * the pad that keeps latches[]
+						 * 16-byte aligned.
+						 */
 	struct urcu_txn_sw_latch latches[];	/* INLINE record array (frozen at install) */
 };
 
@@ -291,10 +314,9 @@ urcu_static_assert(!(offsetof(struct urcu_txn_sw_block, latches) % 16),
  * proxies are parked); commit() hands @latches to it so a held proxy and its
  * selector are reclaimed together after a grace period.  The tag room that
  * matters is on the tagged proxies stored in slots; those live in @latches,
- * allocated 16-byte aligned (posix_memalign) so each latch -- hence each
- * tagged proxy -- keeps its low 4 bits free, letting a low-4-bit
- * pointer-tagging embedder (e.g. the fractal trie) route its slots through
- * this engine.
+ * allocated 16-byte aligned (posix_memalign) so each latch -- hence each tagged
+ * proxy -- keeps its low 4 bits free, letting a low-4-bit pointer-tagging
+ * embedder (e.g. the fractal trie) route its slots through this engine.
  */
 struct urcu_txn_sw_txn {
 	enum urcu_txn_sw_state state;
@@ -303,9 +325,141 @@ struct urcu_txn_sw_txn {
 	unsigned int nr;
 	unsigned int cap;
 	bool latches_inline;			/* @latches is caller storage: never realloc'd, never freed */
+#ifdef URCU_TXN_SW_EXCL_VALIDATE
+	unsigned long excl_owner;		/*
+						 * pthread_self() of the thread
+						 * that init'd this handle; the
+						 * handle must be driven end to
+						 * end by it.  See the validator
+						 * below.
+						 */
+#endif
 };
 
 #define URCU_TXN_SW_CAP	8	/* initial record-array capacity */
+
+/*
+ * URCU_TXN_SW_EXCL_VALIDATE: runtime validation of the SINGLE-UPDATER contract.
+ *
+ * This engine requires writer mutual exclusion -- it has no install-time CAS,
+ * no conflict detection and no abort, so two writers racing on one slot simply
+ * corrupt it, and nothing in a default build says so.  Enable with
+ * -DURCU_TXN_SW_EXCL_VALIDATE to have a violation abort the process with a
+ * report naming the slot and the threads.  Off by default (zero overhead: no
+ * checks, and the handle does not even carry the owner field).
+ *
+ * There is no per-structure object to claim an owner on, as <urcu/rcu-txn.h>'s
+ * concurrent front-end has in its escalation domain: the sw mutators take a
+ * node (urcu_txn_sw_list_del_rcu(elem)), never a head, and an hlist head is one
+ * bare pointer by design.  So the validator claims the two things that DO
+ * exist:
+ *
+ *   - the HANDLE.  Its owner is the thread that init'd it, and reserve / record
+ *     / install / commit must all run on that thread.  Catches a transaction
+ *     handed between threads mid-flight.
+ *
+ *   - the SLOT, which is what two racing writers actually share, and so is
+ *     where the real violation is visible.  In a correct single-updater
+ *     program a slot being recorded or parked CANNOT already hold a parked
+ *     proxy: this transaction parks nothing before install, its record set is
+ *     frozen after, and any earlier transaction of the same (sole) writer
+ *     settled its slots back to plain values before returning.  A proxy
+ *     sitting there therefore means another writer is mid-transaction on that
+ *     very slot right now.  Symmetrically, at settle each slot must still hold
+ *     OUR proxy; anything else means a concurrent writer overwrote it.
+ *
+ * Like the fractal trie's FEATURE_FT_EXCL_VALIDATE, this catches the
+ * deterministic case where the bad interleaving actually happens in this run.
+ * Two writers that overlap but never observe each other's parked proxy -- one
+ * settles before the other records -- still corrupt, and are still invisible
+ * here.  A clean run is evidence, not proof.
+ */
+#ifdef URCU_TXN_SW_EXCL_VALIDATE
+
+#include <pthread.h>
+#include <stdio.h>
+
+#define urcu_txn_sw__excl_abort(...)					\
+	do {								\
+		fprintf(stderr, "urcu-txn-sw single-updater violation: "	\
+			__VA_ARGS__);					\
+		fflush(stderr);						\
+		abort();						\
+	} while (0)
+
+/*
+ * Does @v carry all of @tag's bits -- i.e. is it a parked proxy rather than a
+ * live value?  The engine's tag contract (see urcu_txn_sw_record) is that no
+ * live value an embedder stores in a transacted slot may do so.
+ */
+static inline
+int urcu_txn_sw__is_proxy(const void *v, uintptr_t tag)
+{
+	return tag != 0 && ((uintptr_t) v & tag) == tag;
+}
+
+static inline
+void urcu_txn_sw__excl_claim(struct urcu_txn_sw_txn *t)
+{
+	t->excl_owner = (unsigned long) pthread_self();
+}
+
+static inline
+void urcu_txn_sw__excl_owner(const struct urcu_txn_sw_txn *t, const char *what)
+{
+	unsigned long self = (unsigned long) pthread_self();
+
+	if (t->excl_owner != self)
+		urcu_txn_sw__excl_abort("txn=%p: %s on thread 0x%lx, but the handle was initialized by thread 0x%lx -- one transaction is driven end to end by one thread\n",
+			(const void *) t, what, self, t->excl_owner);
+}
+
+/* @slot must not already be parked by somebody else. */
+static inline
+void urcu_txn_sw__excl_slot_free(void **slot, uintptr_t tag, const char *what)
+{
+	void *v = uatomic_load(slot, CMM_RELAXED);
+
+	if (urcu_txn_sw__is_proxy(v, tag))
+		urcu_txn_sw__excl_abort("slot=%p already holds a parked proxy (%p) at %s: another writer is mid-transaction on it\n",
+			(void *) slot, v, what);
+}
+
+/* At settle, @l's slot must still hold the proxy WE parked in it. */
+static inline
+void urcu_txn_sw__excl_slot_ours(struct urcu_txn_sw_latch *l)
+{
+	void *want = (void *) ((uintptr_t) &l->proxy | l->tag);
+	void *v = uatomic_load(l->slot, CMM_RELAXED);
+
+	if (v != want)
+		urcu_txn_sw__excl_abort("slot=%p holds %p at settle, expected our parked proxy %p: a concurrent writer overwrote it\n",
+			(void *) l->slot, v, want);
+}
+
+/*
+ * The single-edge commit stores blind (no proxy is ever parked), so its only
+ * witness is the value: @l's slot must still hold the recorded old.
+ */
+static inline
+void urcu_txn_sw__excl_slot_unchanged(struct urcu_txn_sw_latch *l)
+{
+	void *v = uatomic_load(l->slot, CMM_RELAXED);
+
+	if (v != l->proxy.ptr[0])
+		urcu_txn_sw__excl_abort("slot=%p holds %p at the single-edge commit, but %p was recorded as its old: a concurrent writer changed it\n",
+			(void *) l->slot, v, l->proxy.ptr[0]);
+}
+
+#else	/* !URCU_TXN_SW_EXCL_VALIDATE */
+
+# define urcu_txn_sw__excl_claim(t)			do { } while (0)
+# define urcu_txn_sw__excl_owner(t, what)		do { } while (0)
+# define urcu_txn_sw__excl_slot_free(slot, tag, what)	do { } while (0)
+# define urcu_txn_sw__excl_slot_ours(l)			do { } while (0)
+# define urcu_txn_sw__excl_slot_unchanged(l)		do { } while (0)
+
+#endif	/* URCU_TXN_SW_EXCL_VALIDATE */
 
 /*
  * Initialize an on-stack transaction handle.  No allocation, so this cannot
@@ -322,6 +476,7 @@ void urcu_txn_sw_init(struct urcu_txn_sw_txn *t)
 	t->nr = 0;
 	t->cap = 0;
 	t->latches_inline = false;
+	urcu_txn_sw__excl_claim(t);
 }
 
 /*
@@ -329,15 +484,15 @@ void urcu_txn_sw_init(struct urcu_txn_sw_txn *t)
  * holding @cap latches (e.g. a 16-byte-aligned on-stack array -- struct
  * urcu_txn_sw_latch is aligned(16), so an array of it is, keeping each tagged
  * proxy's low 4 bits free).  No allocation, so it cannot fail; record() never
- * realloc-grows the inline array (overflow past @cap is an embedder sizing bug),
- * and commit() never frees it.  Use ONLY where the transaction need not outlive
- * the call: a lone-edge (or empty) commit parks no proxy and owes no grace
- * period, so nothing references the txn -- or its inline storage -- once commit
- * returns.  A txn that would park proxies (nr >= 2) MUST own heap storage
- * (urcu_txn_sw_init + record/reserve), since the parked record array has to
- * survive until a grace period; the engine asserts an inline buffer never
- * reaches that path.  This is the public analog of the bounded on-stack flip
- * that the fractal trie uses for its single-pointer publishes.
+ * realloc-grows the inline array (overflow past @cap is an embedder sizing
+ * bug), and commit() never frees it.  Use ONLY where the transaction need not
+ * outlive the call: a lone-edge (or empty) commit parks no proxy and owes no
+ * grace period, so nothing references the txn -- or its inline storage -- once
+ * commit returns.  A txn that would park proxies (nr >= 2) MUST own heap
+ * storage (urcu_txn_sw_init + record/reserve), since the parked record array
+ * has to survive until a grace period; the engine asserts an inline buffer
+ * never reaches that path.  This is the public analog of the bounded on-stack
+ * flip that the fractal trie uses for its single-pointer publishes.
  */
 static inline
 void urcu_txn_sw_init_inline(struct urcu_txn_sw_txn *t,
@@ -349,18 +504,19 @@ void urcu_txn_sw_init_inline(struct urcu_txn_sw_txn *t,
 	t->nr = 0;
 	t->cap = cap;
 	t->latches_inline = true;
+	urcu_txn_sw__excl_claim(t);
 }
 
 #define urcu_txn_sw_blocksize(cap)	\
 	(sizeof(struct urcu_txn_sw_block) + (size_t) (cap) * sizeof(struct urcu_txn_sw_latch))
 
 /*
- * The heap-path transaction block is served from the shared per-CPU size-classed
- * slab in <urcu/rcu-txn-slab.h> (same machinery as the concurrent engine).
- * Latch-count classes {4,8,16,32,64,128} map to byte sizes; a request over the
- * top class is an exact, uncached posix_memalign.  Each block is stamped with
- * its origin (urcu_txn_sw_block.slab), which free consults.  URCU_TXN_NO_CACHE
- * disables the slab.
+ * The heap-path transaction block is served from the shared per-CPU
+ * size-classed slab in <urcu/rcu-txn-slab.h> (same machinery as the concurrent
+ * engine).  Latch-count classes {4,8,16,32,64,128} map to byte sizes; a request
+ * over the top class is an exact, uncached posix_memalign.  Each block is
+ * stamped with its origin (urcu_txn_sw_block.slab), which free consults.
+ * URCU_TXN_NO_CACHE disables the slab.
  */
 static const unsigned int urcu_txn_sw_slab_rc[] = { 4u, 8u, 16u, 32u, 64u, 128u };
 #define URCU_TXN_SW_SLAB_NCLASS	\
@@ -444,17 +600,17 @@ void urcu_txn_sw__block_free(struct urcu_txn_sw_block *blk)
  * which is the general (unbounded) model.  But an embedder whose edge count is
  * bounded by construction can reserve that bound once, up front, where failure
  * is clean -- then every subsequent record() appends without reallocating and
- * so cannot fail.  This trades the design's "fail-and-destroy replaces the count
- * pass" for a single up-front alloc, which is the right call for a bounded txn
- * whose records are interleaved through a build that does not otherwise thread
- * an OOM return.  Call after init, before any install; a handle already
- * buffering (an earlier reserve or record) grows to fit @cap, mirroring the
- * concurrent front-end's urcu_txn_reserve().  Returns
- * false on OOM; the failure is sticky (URCU_TXN_SW_OOM), so the caller may
- * ignore this return and let commit() report MEMORY_ERROR.  The one non-OOM,
- * NON-sticky false: asking a caller-storage (init_inline) handle for more than
- * its fixed buffer -- that is an embedder sizing bug, not a memory failure, and
- * caller storage can neither grow nor be adopted by the engine.
+ * so cannot fail.  This trades the design's "fail-and-destroy replaces the
+ * count pass" for a single up-front alloc, which is the right call for a
+ * bounded txn whose records are interleaved through a build that does not
+ * otherwise thread an OOM return.  Call after init, before any install; a
+ * handle already buffering (an earlier reserve or record) grows to fit @cap,
+ * mirroring the concurrent front-end's urcu_txn_reserve().  Returns false on
+ * OOM; the failure is sticky (URCU_TXN_SW_OOM), so the caller may ignore this
+ * return and let commit() report MEMORY_ERROR.  The one non-OOM, NON-sticky
+ * false: asking a caller-storage (init_inline) handle for more than its fixed
+ * buffer -- that is an embedder sizing bug, not a memory failure, and caller
+ * storage can neither grow nor be adopted by the engine.
  */
 static inline
 bool urcu_txn_sw_reserve(struct urcu_txn_sw_txn *t, unsigned int cap)
@@ -463,6 +619,16 @@ bool urcu_txn_sw_reserve(struct urcu_txn_sw_txn *t, unsigned int cap)
 
 	if (caa_unlikely(t->state == URCU_TXN_SW_OOM))
 		return false;			/* sticky: an earlier alloc failed */
+	/*
+	 * PREPARE only, exactly like record().  install() is a documented
+	 * public entry, so a white-box caller can reach reserve() with proxies
+	 * already parked -- and the grow path below would then memcpy the
+	 * latches to a fresh block and FREE the old one while live slots still
+	 * point into it: a reader dereferences a freed proxy.  The record set
+	 * is frozen once installed.
+	 */
+	urcu_posix_assert(t->state == URCU_TXN_SW_PREPARE);
+	urcu_txn_sw__excl_owner(t, "reserve()");
 	if (t->latches) {
 		if (cap <= t->cap)
 			return true;		/* already sized (heap block or inline buf) */
@@ -502,8 +668,8 @@ bool urcu_txn_sw_reserve(struct urcu_txn_sw_txn *t, unsigned int cap)
 	return true;
 }
 
-/* Free the record array of a handle that never parked proxies (no grace period).
- * Caller-owned (inline) storage is never freed by the engine. */
+/* Free the record array of a handle that never parked proxies (no grace
+ * period).  Caller-owned (inline) storage is never freed by the engine. */
 static inline
 void urcu_txn_sw__free_records(struct urcu_txn_sw_txn *t)
 {
@@ -527,7 +693,8 @@ void urcu_txn_sw_free_rcu(struct rcu_head *head)
 	urcu_txn_sw__block_free(blk);		/* record array is inline -- one free */
 }
 
-/* Record a latch's {old, new, slot, tag}; its proxy->group is bound at install. */
+/* Record a latch's {old, new, slot, tag}; its proxy->group is bound at
+ * install. */
 static inline
 void urcu_txn_sw_latch_set(struct urcu_txn_sw_latch *l,
 		void **slot, void *old_ptr, void *new_ptr, uintptr_t tag)
@@ -553,17 +720,16 @@ void urcu_txn_sw_latch_install(struct urcu_txn_sw_txn *t, struct urcu_txn_sw_lat
  * Record one edge {*slot: old -> new} tagged with @tag (the bits OR'd into the
  * parked proxy value installed in *slot, so that slot's readers recognise the
  * proxy and route resolution -- e.g. the fractal trie's 0xF type code or a
- * list's bit-0).  PREPARE only -- the record set is frozen
- * once proxies are installed, so this must run before commit() (record() after a
- * commit/install is a usage error).  Records must target pairwise-distinct
- * slots: record() appends blindly -- no same-slot reconcile -- so recording one
- * slot twice parks two proxies on it and settles both in record order,
- * silently last-wins (install asserts against it in a debug build).  Returns
- * false on OOM (the only failure);
- * the failure is sticky (URCU_TXN_SW_OOM), so the caller may ignore this
- * return and let commit() report MEMORY_ERROR.  The record array realloc-grows
- * on demand and nothing is installed here (no proxy address is live until commit
- * parks them).
+ * list's bit-0).  PREPARE only -- the record set is frozen once proxies are
+ * installed, so this must run before commit() (record() after a commit/install
+ * is a usage error).  Records must target pairwise-distinct slots: record()
+ * appends blindly -- no same-slot reconcile -- so recording one slot twice
+ * parks two proxies on it and settles both in record order, silently last-wins
+ * (install asserts against it in a debug build).  Returns false on OOM (the
+ * only failure); the failure is sticky (URCU_TXN_SW_OOM), so the caller may
+ * ignore this return and let commit() report MEMORY_ERROR.  The record array
+ * realloc-grows on demand and nothing is installed here (no proxy address is
+ * live until commit parks them).
  */
 static inline
 bool urcu_txn_sw_record(struct urcu_txn_sw_txn *t, void **slot,
@@ -574,13 +740,16 @@ bool urcu_txn_sw_record(struct urcu_txn_sw_txn *t, void **slot,
 	if (caa_unlikely(t->state == URCU_TXN_SW_OOM))
 		return false;			/* sticky: an earlier alloc failed */
 	urcu_posix_assert(t->state == URCU_TXN_SW_PREPARE);
+	urcu_txn_sw__excl_owner(t, "record()");
+	urcu_txn_sw__excl_slot_free(slot, tag, "record()");
 	if (t->nr == t->cap) {
 		unsigned int newcap = t->cap ? t->cap * 2 : URCU_TXN_SW_CAP;
 
 		/*
 		 * Caller-owned (inline) storage is sized to the embedder's edge
 		 * bound and must never grow -- realloc-ing it would move caller
-		 * (e.g. on-stack) memory.  Overflow here is an embedder sizing bug.
+		 * (e.g. on-stack) memory.  Overflow here is an embedder sizing
+		 * bug.
 		 */
 		urcu_posix_assert(!t->latches_inline);
 		/*
@@ -600,6 +769,18 @@ bool urcu_txn_sw_record(struct urcu_txn_sw_txn *t, void **slot,
 		t->block = nb;
 		t->latches = nb->latches;
 		t->cap = nb->cap;
+		/*
+		 * The storage is now the ENGINE's, so drop the inline flag.  It
+		 * can still be set here: the assert above compiles out under
+		 * NDEBUG, and an oversized caller-storage handle then reaches
+		 * this grow and MIGRATES to engine-owned heap (its records
+		 * copied; the caller's buffer left untouched and, as promised,
+		 * never freed).  Leaving the flag set would make
+		 * __free_records() skip the free of the block we just adopted
+		 * -- a leak -- and would trip commit()'s inline assert on a
+		 * handle that is no longer inline.
+		 */
+		t->latches_inline = false;
 	}
 	l = &t->latches[t->nr++];
 	urcu_txn_sw_latch_set(l, slot, old_ptr, new_ptr, tag);
@@ -618,7 +799,29 @@ void urcu_txn_sw_install(struct urcu_txn_sw_txn *t)
 {
 	unsigned int i;
 
+	urcu_txn_sw__excl_owner(t, "install()");
+	/*
+	 * Contract (see urcu_txn_sw_init_inline): a CALLER-storage handle must
+	 * never park proxies -- its records do not outlive the call, and it
+	 * owns no block to hang the proxies' group off.  Enforce it HERE.  The
+	 * header claims "the engine asserts an inline buffer never reaches that
+	 * path", but neither existing assert covers it: record()'s fires only
+	 * on a grow (nr == cap), and commit()'s runs AFTER install has already
+	 * stored.  Without this guard an inline handle with 2..cap records
+	 * walks into the branch below -- !t->block is ALSO the normal state of
+	 * every inline handle -- which repoints t->latches at a fresh block,
+	 * DISCARDING the caller's records, and the park loop then
+	 * release-stores tagged proxies through that block's UNINITIALIZED
+	 * l->slot pointers: wild stores to garbage addresses.
+	 */
+	urcu_posix_assert(!t->latches_inline);
 	if (caa_unlikely(!t->block)) {		/* white-box install with no record */
+		/*
+		 * The only way to be block-less on a heap handle: nothing was
+		 * ever recorded or reserved.  Anything else would strand the
+		 * records buffered in the array we are about to replace.
+		 */
+		urcu_posix_assert(!t->nr);
 		t->block = urcu_txn_sw__block_alloc(URCU_TXN_SW_CAP);
 		if (caa_unlikely(!t->block)) {
 			t->state = URCU_TXN_SW_OOM;	/* sticky; nothing parked */
@@ -628,12 +831,13 @@ void urcu_txn_sw_install(struct urcu_txn_sw_txn *t)
 		t->cap = t->block->cap;
 	}
 	/*
-	 * Engine precondition: records target pairwise-distinct slots.  record()
-	 * has no same-slot reconcile, so a duplicate parks two proxies on one
-	 * slot and settles both in record order -- silently last-wins.  The
-	 * record array is unsorted (record order is the embedder's), so pair-scan
-	 * mirroring the concurrent engine's adjacent check after its sort.
-	 * Debug-only: no cost under NDEBUG, and sw transactions are small.
+	 * Engine precondition: records target pairwise-distinct slots.
+	 * record() has no same-slot reconcile, so a duplicate parks two proxies
+	 * on one slot and settles both in record order -- silently last-wins.
+	 * The record array is unsorted (record order is the embedder's), so
+	 * pair-scan mirroring the concurrent engine's adjacent check after its
+	 * sort.  Debug-only: no cost under NDEBUG, and sw transactions are
+	 * small.
 	 */
 	for (i = 1; i < t->nr; i++) {
 		unsigned int j;
@@ -642,8 +846,11 @@ void urcu_txn_sw_install(struct urcu_txn_sw_txn *t)
 			urcu_assert_debug(t->latches[i].slot != t->latches[j].slot);
 	}
 	t->state = URCU_TXN_SW_INSTALLED;
-	for (i = 0; i < t->nr; i++)
+	for (i = 0; i < t->nr; i++) {
+		urcu_txn_sw__excl_slot_free(t->latches[i].slot,
+				t->latches[i].tag, "install (park)");
 		urcu_txn_sw_latch_install(t, &t->latches[i]);
+	}
 }
 
 /*
@@ -678,17 +885,17 @@ void urcu_txn_sw_install(struct urcu_txn_sw_txn *t)
  * urcu_txn_sw_install():
  *
  *   - Single edge (nr == 1): one recorded edge has no cross-edge atomicity to
- *     provide -- a lone release store to its slot IS already an atomic commit --
- *     so no proxy is installed and no group block is allocated.  A reader of that
- *     slot observes the old or the new target directly, never a proxy, so none
- *     can be held: no grace period is owed and the record array is freed at once.
- *     This makes the common one-pointer publish as cheap as a bare
+ *     provide -- a lone release store to its slot IS already an atomic commit
+ *     -- so no proxy is installed and no group block is allocated.  A reader of
+ *     that slot observes the old or the new target directly, never a proxy, so
+ *     none can be held: no grace period is owed and the record array is freed
+ *     at once.  This makes the common one-pointer publish as cheap as a bare
  *     rcu_assign_pointer, with no proxy alloc / install / settle / GP reclaim.
  *
- *   - Multi-edge (nr >= 2): auto-install -- allocate the group block, park every
- *     proxy, then flip.  (A white-box caller that needs work BETWEEN install and
- *     the flip can call urcu_txn_sw_install() itself; commit then reuses the
- *     block it allocated and takes the call_rcu_fn reclaim path.)
+ *   - Multi-edge (nr >= 2): auto-install -- allocate the group block, park
+ *     every proxy, then flip.  (A white-box caller that needs work BETWEEN
+ *     install and the flip can call urcu_txn_sw_install() itself; commit then
+ *     reuses the block it allocated and takes the call_rcu_fn reclaim path.)
  */
 static inline
 enum urcu_txn_status urcu_txn_sw_commit_flavor(struct urcu_txn_sw_txn *t,
@@ -698,6 +905,7 @@ enum urcu_txn_status urcu_txn_sw_commit_flavor(struct urcu_txn_sw_txn *t,
 	struct urcu_txn_sw_block *blk;
 	unsigned int i;
 
+	urcu_txn_sw__excl_owner(t, "commit()");
 	if (caa_unlikely(t->state == URCU_TXN_SW_OOM)) {
 		urcu_txn_sw__free_records(t);
 		return URCU_TXN_STATUS_MEMORY_ERROR;
@@ -707,6 +915,7 @@ enum urcu_txn_status urcu_txn_sw_commit_flavor(struct urcu_txn_sw_txn *t,
 			if (t->nr == 1) {
 				struct urcu_txn_sw_latch *l = &t->latches[0];
 
+				urcu_txn_sw__excl_slot_unchanged(l);
 				uatomic_store(l->slot, l->proxy.ptr[1],
 						CMM_RELEASE);
 			}
@@ -722,10 +931,11 @@ enum urcu_txn_status urcu_txn_sw_commit_flavor(struct urcu_txn_sw_txn *t,
 	}
 
 	/*
-	 * INSTALLED: proxies parked in the block, which carries the record array
-	 * inline.  The GP free reclaims it, so it must be heap-owned: an inline
-	 * (caller-storage) txn never parks proxies (record() asserts it cannot
-	 * grow past its lone-edge bound), so nr >= 2 here implies a heap block.
+	 * INSTALLED: proxies parked in the block, which carries the record
+	 * array inline.  The GP free reclaims it, so it must be heap-owned: an
+	 * inline (caller-storage) txn never parks proxies (record() asserts it
+	 * cannot grow past its lone-edge bound), so nr >= 2 here implies a heap
+	 * block.
 	 */
 	urcu_posix_assert(!t->latches_inline);
 	blk = t->block;
@@ -733,6 +943,7 @@ enum urcu_txn_status urcu_txn_sw_commit_flavor(struct urcu_txn_sw_txn *t,
 	for (i = 0; i < t->nr; i++) {
 		struct urcu_txn_sw_latch *l = &blk->latches[i];
 
+		urcu_txn_sw__excl_slot_ours(l);
 		uatomic_store(l->slot, l->proxy.ptr[1], CMM_RELEASE);
 	}
 	call_rcu_fn(&blk->rcu_head, urcu_txn_sw_free_rcu);	/* a reader may hold a proxy */
@@ -743,8 +954,8 @@ enum urcu_txn_status urcu_txn_sw_commit_flavor(struct urcu_txn_sw_txn *t,
 
 /*
  * Commit deferring reclaim through the compile-time-selected RCU flavor's
- * call_rcu (so this header must be included after an RCU flavor header).  A thin
- * wrapper over urcu_txn_sw_commit_flavor(); see it for the full contract.
+ * call_rcu (so this header must be included after an RCU flavor header).  A
+ * thin wrapper over urcu_txn_sw_commit_flavor(); see it for the full contract.
  */
 static inline
 enum urcu_txn_status urcu_txn_sw_commit(struct urcu_txn_sw_txn *t)

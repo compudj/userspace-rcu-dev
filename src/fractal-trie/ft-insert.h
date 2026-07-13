@@ -328,7 +328,7 @@ enum urcu_txn_status ft_insert_one_commit(struct cds_ft *ft, const uint8_t *key,
 		 * commit ABORT ages it.
 		 */
 		if (pred2 == pred &&
-		    urcu_txn_list_insert_between_prepare(ft_flip_txn_handle(ic->txn),
+		    ft_txn_list_insert_between_prepare(ft_flip_txn_handle(ic->txn),
 				ft_ord_cell_lnode(cell), pred_lnode,
 				ft_ord_cell_lnode(succ0)) >= 0)
 			goto spliced;
@@ -413,10 +413,21 @@ spliced:;
 	 * publish decision.  @ic outlives the commit (the caller's retry frame).
 	 */
 	ic->ft = ft;
-	urcu_txn_defer_on_commit(ft_flip_txn_handle(ic->txn), ft_insert_finalize_cb, ic);
-	urcu_txn_defer_on_abort(ft_flip_txn_handle(ic->txn), ft_insert_abort_cb, ic);
 	st = ft_flip_txn_commit(ft, ic->txn);
 	ic->txn = NULL;
+	/*
+	 * Dispatch the commit-outcome cleanup inline (the engine has no
+	 * defer-on-commit/abort mechanism): on OK the retired free_old_* nodes
+	 * are now unreachable, so finalize queues their grace-period-deferred
+	 * free; on ABORT or MEMORY_ERROR nothing was installed, so the rollback
+	 * frees the fresh unpublished cluster.  Both callbacks only touch memory
+	 * whose reachability the commit outcome has already settled, so running
+	 * them here rather than inside the commit is equivalent.
+	 */
+	if (st == URCU_TXN_STATUS_OK)
+		ft_insert_finalize_cb(ic);
+	else
+		ft_insert_abort_cb(ic);
 	return st;
 }
 

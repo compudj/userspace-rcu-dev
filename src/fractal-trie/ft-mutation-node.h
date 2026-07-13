@@ -976,6 +976,15 @@ int ft_node_recompact(enum ft_recompact mode,
 	struct cds_ft_metadata *new_metadata;
 	const struct cds_ft_type *new_type;
 	struct cds_ft_inode_flag *new_node_flag = NULL;
+	/*
+	 * old_node's flag (type tag encoded) for a live retire: lets the copy
+	 * loop / reparent sweep address old_node's source child slots via
+	 * ft_node_get_nth_skip, to resolve each to a definite child and freeze it
+	 * as a COPY_SLOT.  Stays NULL on the build-invisible / cluster-leaf /
+	 * no-txn arms, which copy nodes no peer publishes into (raw read, no
+	 * freeze).  Assigned once the copy path is reached (old_node non-NULL).
+	 */
+	struct cds_ft_inode_flag *old_node_flag = NULL;
 	int ret;
 	/*
 	 * Track whether new_node has received its first child via
@@ -1083,18 +1092,21 @@ int ft_node_recompact(enum ft_recompact mode,
 		 * Phase 4.3 atomic re-home: when this recompact retires a LIVE
 		 * published node whose children stay reader-reachable (retire_txn
 		 * set = the unlink/forward-publish commit; not a build-invisible
-		 * cluster leaf), the reparent sweep below records each child's
-		 * (parent, offset) as a co-committed pair INTO @retire_txn so it
-		 * flips atomically with the publish -- not two plain stores a peer
-		 * reads torn.  Widen the txn for the <=2 edges per child up front
-		 * (<= old nr_child + 1), +1 for the external head's back-channel
-		 * edge below; an OOM here aborts cleanly, nothing allocated yet --
-		 * a single-commit insert may fail its widen (unlike a graft/merge
-		 * second commit, which pre-reserves).
+		 * cluster leaf), the copy loop records each surviving child slot as
+		 * a COPY_SLOT (freeze old.child[b] at the resolved child, publish it
+		 * into the fresh node's slot) and the reparent sweep records each
+		 * child's (parent, offset) as a co-committed pair INTO @retire_txn,
+		 * so the whole rebuild flips atomically with the publish -- not
+		 * stores a peer reads torn.  Widen the txn for the <=3 edges per
+		 * child up front (1 COPY_SLOT + <=2 reparent, <= old nr_child + 1),
+		 * +1 for the external head's back-channel edge below; an OOM here
+		 * aborts cleanly, nothing allocated yet -- a single-commit insert
+		 * may fail its widen (unlike a graft/merge second commit, which
+		 * pre-reserves).
 		 */
 		if (retire_txn && !cluster_leaf && metadata &&
 				!ft_flip_txn_reserve_extra(retire_txn,
-					2 * (ft_meta_nr_child_load(metadata) + 1)
+					3 * (ft_meta_nr_child_load(metadata) + 1)
 					+ 1)) {
 			if (fenced)
 				ft_meta_copying_clear(metadata);
@@ -1235,6 +1247,10 @@ int ft_node_recompact(enum ft_recompact mode,
 	if (new_type_index == NODE_INDEX_NULL)
 		goto skip_copy;
 
+	/* Live retire: enable COPY_SLOT freeze of old_node's source slots. */
+	if (retire_txn && !cluster_leaf && old_node)
+		old_node_flag = ft_node_flag(old_node, old_type_index);
+
 /*
  * Derive is_init for a set_nth call into the freshly-allocated
  * new_node.  Updates init-done state so the next call returns false.
@@ -1262,17 +1278,47 @@ int ft_node_recompact(enum ft_recompact mode,
 			ft_popcount_node_get_ith_pos(old_type, old_node, i, &v, &iter);
 			if (!iter)
 				continue;
-			/*
-			 * A peer's parked flip proxy (type-7 latch) must not be
-			 * copied into the fresh body: the peer's settle CASes
-			 * only the ORIGINAL slot, so an embedded copy dangles
-			 * into the peer's reclaimed MCAS descriptor after its
-			 * grace period -- a permanent wild edge (and the
-			 * reparent sweep below would skip the child, leaving
-			 * its back-pointer on the retired node).  Abandon the
-			 * copy and retry after the peer settles.
-			 */
-			if (caa_unlikely(ft_node_flip_proxy(iter))) {
+			if (old_node_flag) {
+				/*
+				 * Live retire: RESOLVE this source slot to a
+				 * definite child by aging priority (help a peer
+				 * child-recompact forward, evict a lower-priority
+				 * one) instead of copying its parked flip proxy --
+				 * an embedded copy would dangle into the peer's
+				 * reclaimed descriptor after its grace period (a
+				 * permanent wild edge, and the reparent sweep would
+				 * skip the proxy child, orphaning its back-pointer)
+				 * -- and instead of bailing, which livelocks under
+				 * a stream of peer latches.  The slot is frozen as a
+				 * COPY_SLOT in the reparent sweep below (read-set
+				 * src == resolved catches a later republish).  DEL
+				 * skips the to-remove slot by IDENTITY: a resolved-
+				 * value compare would miss a peer recompacting the
+				 * target out from under us.
+				 */
+				struct cds_ft_inode_flag **src_slot;
+				void *resolved;
+
+				ft_node_get_nth_skip(old_node_flag, &src_slot, v,
+						FT_PF_NONE);
+				if (mode == FT_RECOMPACT_DEL &&
+						src_slot == nullify_node_flag_ptr)
+					continue;
+				if (!ft_flip_txn_resolve_prio(retire_txn,
+						(void **) src_slot, &resolved)) {
+					ret = -EAGAIN;	/* CAP: retry higher-priority */
+					goto abandon_fresh;
+				}
+				iter = (struct cds_ft_inode_flag *) resolved;
+				if (!iter)
+					continue;	/* peer removed the child */
+			} else if (caa_unlikely(ft_node_flip_proxy(iter))) {
+				/*
+				 * Build-invisible / no-txn arm: no peer publishes
+				 * into this unpublished node, so a proxy is
+				 * unexpected -- bail defensively (the live-retire
+				 * arm above documents the copy-a-latch hazard).
+				 */
 				ret = -EAGAIN;
 				goto abandon_fresh;
 			}
@@ -1342,8 +1388,31 @@ int ft_node_recompact(enum ft_recompact mode,
 			iter = ft_pigeon_node_get_ith_pos(old_type, old_node, i);
 			if (!iter)
 				continue;
-			/* Copied-slot latch: see the popcount loop above. */
-			if (caa_unlikely(ft_node_flip_proxy(iter))) {
+			if (old_node_flag) {
+				/*
+				 * Live retire: resolve this source slot to a
+				 * definite child by aging priority + freeze it as a
+				 * COPY_SLOT below; DEL skips the to-remove slot by
+				 * identity.  See the popcount loop for the rationale.
+				 */
+				struct cds_ft_inode_flag **src_slot;
+				void *resolved;
+
+				ft_node_get_nth_skip(old_node_flag, &src_slot,
+						(uint8_t) i, FT_PF_NONE);
+				if (mode == FT_RECOMPACT_DEL &&
+						src_slot == nullify_node_flag_ptr)
+					continue;
+				if (!ft_flip_txn_resolve_prio(retire_txn,
+						(void **) src_slot, &resolved)) {
+					ret = -EAGAIN;
+					goto abandon_fresh;
+				}
+				iter = (struct cds_ft_inode_flag *) resolved;
+				if (!iter)
+					continue;
+			} else if (caa_unlikely(ft_node_flip_proxy(iter))) {
+				/* Copied-slot latch (unpublished arm): see popcount. */
 				ret = -EAGAIN;
 				goto abandon_fresh;
 			}
@@ -1572,10 +1641,20 @@ skip_copy:
 					continue;
 				ft_node_get_nth_skip(new_node_flag,
 						&slot, v, FT_PF_NONE);
-				if (retire_txn)
+				if (retire_txn) {
+					/*
+					 * No per-slot COPY_SLOT freeze: the node-level
+					 * COPYING fence (ft_meta_copying_mark, set before
+					 * the copy loop) already froze every source slot
+					 * of the retiring node against a peer republish --
+					 * a peer's §4.B clean-LIVE guard fails against the
+					 * COPYING bit -- and the child value was copied
+					 * into @new_node above.  Only the live re-parent
+					 * edge remains to record.
+					 */
 					ft_reparent_record(ft, retire_txn, iter,
 							new_node_flag, slot);
-				else
+				} else
 					ft_set_parent(ft, iter, new_node_flag,
 							slot);
 			}
@@ -1595,10 +1674,13 @@ skip_copy:
 					continue;
 				ft_node_get_nth_skip(new_node_flag,
 						&slot, i, FT_PF_NONE);
-				if (retire_txn)
+				if (retire_txn) {
+					/* No per-slot freeze: the node-level COPYING
+					 * fence covers every source slot.  See the
+					 * popcount sweep above. */
 					ft_reparent_record(ft, retire_txn, iter,
 							new_node_flag, slot);
-				else
+				} else
 					ft_set_parent(ft, iter, new_node_flag,
 							slot);
 			}

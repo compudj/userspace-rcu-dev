@@ -1913,7 +1913,7 @@ struct cds_ft_inode_flag **ft_get_parent_slot(const struct cds_ft_metadata *meta
  * back-pointer FIELDS legitimately hold plain cn flags (a child's
  * meta->parent naming its fresh cn parent) and would false-fire there.
  */
-static
+static __attribute__((unused))
 void ft_trace_pub_check(struct cds_ft *ft,
 		struct cds_ft_inode_flag **slot, struct cds_ft_inode_flag *nf,
 		unsigned int site)
@@ -1946,8 +1946,13 @@ void ft_trace_pub_check(struct cds_ft *ft,
 	(void) system("lttng snapshot record 1>&2");
 	abort();
 }
+#ifndef FT_LIGHT_TRACING	/* see FT_TRACE_MISWIRE: drop the per-publish
+				 * round-trip validator, keep the tracepoints. */
 #define FT_TRACE_PUB_CHECK(ft, slot, nf, site) \
 	ft_trace_pub_check(ft, slot, nf, site)
+#else
+#define FT_TRACE_PUB_CHECK(ft, slot, nf, site) do { (void) (ft); (void) (slot); (void) (nf); (void) (site); } while (0)
+#endif
 #else
 #define FT_TRACE_PUB_CHECK(ft, slot, nf, site) do { } while (0)
 #endif	/* FT_ENABLE_TRACING */
@@ -2606,6 +2611,7 @@ void free_cds_ft_node(struct cds_ft *ft, struct cds_ft_inode *node)
 	struct cds_ft_metadata *metadata = cds_ft_item_to_metadata(node);
 
 	FT_TP(item_free, (const void *) node, 0);
+	FT_TP(item_retire, (const void *) node, __builtin_return_address(0));
 
 #ifdef FT_DEBUG_TOMBSTONE_AUDIT
 	/*

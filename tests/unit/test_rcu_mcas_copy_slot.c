@@ -15,15 +15,46 @@
  *
  * Destination lifetime (mirrors the recompaction reclamation contract).
  * -------------------------------------------------------------------------
- * @dst is a transacted output word, and the engine's slot-lifetime precondition
- * (rcu-txn.h) applies to it exactly as to @slot: the *dst = V publish is run by
- * ANY driver, including a helper that read the transaction UNDECIDED and then
- * stalled -- so its store can land AFTER the owner has returned from commit.  If
- * @dst pointed into the owner's stack (reused by the next op), that late store
- * would corrupt a later op's destination.  So the destination is a heap "fresh
- * node", allocated FRESH PER ATTEMPT and reclaimed through call_rcu (committed
- * AND aborted), so a lagging helper's late copy always lands in still-live,
- * grace-period-protected memory -- exactly what recompaction must do with N'.
+ * Unlike @slot, @dst is NOT reader-reachable: the edge that publishes the fresh
+ * node is another record of the SAME transaction, so nothing names that node
+ * until the transaction linearizes -- and on abort nothing ever does.  The
+ * lifetime hazard here is therefore writer-vs-writer (a driver's *dst = V store
+ * racing the owner's free of the node), not reader-vs-free, and a grace period
+ * is not what closes it.
+ *
+ * What closes it is the record's install latch.  Only the PLANTER stores @dst,
+ * and it does so under the latch, before release-storing DONE; the owner's
+ * urcu_mcas_settle() claims every record's install word -- spinning out a BUSY
+ * planter, and ACQUIRING that release -- before urcu_txn_commit() returns.  So
+ * once commit returns, every *dst store has both completed and become visible,
+ * and the owner may free the fresh node IMMEDIATELY, with no grace period.  That
+ * is exactly what recompaction does with N' on its abort path.
+ *
+ * So this test FREES THE DESTINATION IMMEDIATELY (free_fresh() below), on both
+ * outcomes, deliberately: that is the contract recompaction depends on, and under
+ * -fsanitize=address this test is its regression detector.  Unlatch the dst publish,
+ * or stop urcu_mcas_settle() from claiming each install word and spinning out a BUSY
+ * planter, and a lagging helper's store lands in freed memory -- ASAN reports a
+ * heap-use-after-free (WRITE of size 8) from urcu_mcas_plant().  A grace-period
+ * defer here would hide exactly that regression, which is why there is none.
+ *
+ * What this does NOT catch is the loss of the ACQUIRE with which settle() and
+ * plant() read DONE.  That one is a VISIBILITY bug, not a sequencing bug: the
+ * planter's store has completed either way, and on x86 uatomic_cmpxchg_mo() discards
+ * both memory orders (lock cmpxchg is a full barrier), so removing the acquire is
+ * byte-identical machine code here and this test stays green.  It bites only on the
+ * compiler-builtins backend (--enable-compiler-atomic-builtins) and on weakly-ordered
+ * targets.  Reach for TSAN or an ARM/POWER box for that half; ASAN cannot see it.
+ *
+ * The one exception is -DURCU_MCAS_NO_ABA_FIX, which compiles out both the install
+ * latch and settle's claim.  The pre-latch rule then applies again -- *dst is
+ * stored unlatched by ANY driver, including a helper that read the transaction
+ * UNDECIDED and then stalled -- so free_fresh() call_rcu()s instead.  That knob is
+ * ABA-unsafe by construction and is not expected to PASS (property 3 fails,
+ * intermittently); deferring only keeps its failure from being heap corruption.
+ *
+ * The destination is allocated FRESH PER ATTEMPT in both modes: never a reused
+ * stack slot, which a late store would corrupt under the unlatched engine.
  *
  * Three properties are checked:
  *
@@ -81,18 +112,50 @@ static void *g_src[2];
 
 /*
  * The recompaction "fresh node" analog: a heap-allocated destination whose slots
- * receive the COPY_SLOT publishes.  Reclaimed through call_rcu so a lagging
- * helper's late *dst = V store never touches freed memory.
+ * receive the COPY_SLOT publishes.
  */
 struct fresh_node {
 	void *slot[2];
 	struct rcu_head rcu;
 };
 
+/*
+ * Reclaim the destination, per engine mode -- see "Destination lifetime" above.
+ *
+ * Latched engine (default): once urcu_txn_commit() has returned, urcu_mcas_settle()
+ * has claimed every record's install word -- spinning out a BUSY planter and
+ * ACQUIRING its release of DONE -- so no driver can still be storing *dst.  Free
+ * IMMEDIATELY, exactly as the fractal trie's on-abort rollback does.  Running this
+ * test under -fsanitize=address then REGRESSION-TESTS the SEQUENCING half of that
+ * contract: delete settle's claim loop, or unlatch the dst publish, and a helper's
+ * late store lands in freed memory (observed: heap-use-after-free, WRITE of size 8
+ * from urcu_mcas_plant() via urcu_mcas_engage_foreign / urcu_mcas_drive_install).
+ * Do not "simplify" this back to an unconditional defer: the defer is what would
+ * HIDE such a regression.  (The VISIBILITY half -- the acquire -- is invisible to
+ * ASAN on x86; see the header comment.)
+ *
+ * -DURCU_MCAS_NO_ABA_FIX: the install latch and settle's claim are compiled out,
+ * *dst is stored unlatched by ANY driver, and a stalled helper's store can land
+ * after the owner returned from commit.  Defer through a grace period there -- that
+ * knob is ABA-unsafe by construction and is not expected to pass (property 3 fails,
+ * intermittently); the defer merely keeps its failure from being heap corruption.
+ */
+#ifdef URCU_MCAS_NO_ABA_FIX
 static void free_fresh_rcu(struct rcu_head *h)
 {
 	free(caa_container_of(h, struct fresh_node, rcu));
 }
+
+static void free_fresh(struct fresh_node *fn)
+{
+	call_rcu(&fn->rcu, free_fresh_rcu);
+}
+#else
+static void free_fresh(struct fresh_node *fn)
+{
+	free(fn);
+}
+#endif
 
 struct worker_arg {
 	long committed;
@@ -164,9 +227,12 @@ static void *copier(void *arg)
 			void *v0, *v1;
 
 			/*
-			 * Fresh destination per ATTEMPT: an aborted attempt's node
-			 * may still be written by a lagging helper, so it is never
-			 * reused -- it is call_rcu'd below and a new one allocated.
+			 * Fresh destination per ATTEMPT.  With the install latch
+			 * compiled in, an aborted attempt's node is quiescent once
+			 * commit returns and could be reused; under
+			 * -DURCU_MCAS_NO_ABA_FIX a lagging helper may still write
+			 * it.  Never reused: it is call_rcu'd below and a new one
+			 * allocated.
 			 */
 			fn = malloc(sizeof(*fn));
 			if (!fn)
@@ -186,8 +252,13 @@ static void *copier(void *arg)
 			if (ret < 0)
 				abort();	/* MEMORY_ERROR */
 			if (ret == URCU_TXN_STATUS_ABORT) {
-				/* Aborted: GP-defer -- a helper may still write it. */
-				call_rcu(&fn->rcu, free_fresh_rcu);
+				/*
+				 * Aborted: settle left this node quiescent, so the
+				 * latched engine frees it immediately -- the same
+				 * thing recompaction's on-abort rollback does, and
+				 * the case a sanitizer must find clean.
+				 */
+				free_fresh(fn);
 				fn = NULL;
 			}
 		} while (ret == URCU_TXN_STATUS_ABORT);
@@ -197,7 +268,8 @@ static void *copier(void *arg)
 		d1 = uatomic_load(&fn->slot[1], CMM_ACQUIRE);
 		if (lf_val((uintptr_t) d0) + lf_val((uintptr_t) d1) != 0)
 			wa->violations++;
-		call_rcu(&fn->rcu, free_fresh_rcu);	/* lagging helpers may re-write */
+		/* Committed: quiescent once commit returned -- same reclaim rule. */
+		free_fresh(fn);
 
 		if (tx.retry > wa->max_retry)
 			wa->max_retry = tx.retry;
