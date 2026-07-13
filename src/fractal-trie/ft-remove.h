@@ -404,7 +404,6 @@ static
 int ft_chain_compress_fused(struct cds_ft *ft,
 		struct cds_ft_inode_flag *iter_node_flag,
 		struct cds_ft_metadata *iter_meta,
-		struct cds_ft_inode_flag **slot_ptr,
 		struct cds_ft_inode_flag *surviving_child,
 		uint8_t surviving_byte,
 		unsigned int plan_nr_child,
@@ -592,10 +591,31 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 			&publish_parent);
 		new_cn_meta->parent = publish_parent;
 	} else {
-		/* The boundary's own latch-checked parent snapshot above. */
+		/*
+		 * Replace the boundary at its own slot in iter_parent.  Resolve
+		 * that slot COHERENTLY from iter_meta (Phase 4.3 atomic re-home),
+		 * exactly as the parent_cn arm resolves parent_cn_meta -- never
+		 * reuse a slot the caller precomputed with ft_get_parent_slot
+		 * before this op's fence.  A peer that recompacts the boundary's
+		 * parent (growing it to a larger node type) or re-homes it between
+		 * that snapshot and here leaves the precomputed slot pointing into
+		 * the OLD, now-replaced parent body, while iter_meta->parent
+		 * already names the NEW parent: pairing the stale slot with the
+		 * fresh parent indexes the new parent's bitmap with an
+		 * out-of-bounds rank (ft_slot_to_byte OOB).  Require the resolved
+		 * parent to still be the latch-checked iter_parent the plan above
+		 * was validated against; a re-home that changed it lands us on an
+		 * unvalidated parent -- reclaim the unpublished merged node and
+		 * retry.
+		 */
+		publish_slot = ft_resolve_parent_slot(iter_meta, ft,
+			&publish_parent);
+		if (caa_unlikely(publish_parent != iter_parent)) {
+			free_compressed_node_unpublished(ft, new_cn);
+			ft_flip_txn_destroy(txn);
+			return -EAGAIN;
+		}
 		new_cn_meta->parent = iter_parent;
-		publish_parent = iter_parent;
-		publish_slot = slot_ptr;
 	}
 	ft_set_parent_slot(new_cn_meta, new_cn_meta->parent, publish_slot);
 
@@ -711,8 +731,7 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 static
 void ft_canonicalize_chain_compress(struct cds_ft *ft,
 		struct cds_ft_inode_flag *iter_node_flag,
-		struct cds_ft_metadata *iter_meta,
-		struct cds_ft_inode_flag **slot_ptr)
+		struct cds_ft_metadata *iter_meta)
 {
 	uint8_t surviving_byte = 0;
 	struct cds_ft_inode_flag *surviving_child;
@@ -723,7 +742,7 @@ void ft_canonicalize_chain_compress(struct cds_ft *ft,
 	if (!surviving_child)
 		return;
 	(void) ft_chain_compress_fused(ft, iter_node_flag, iter_meta,
-		slot_ptr, surviving_child, surviving_byte,
+		surviving_child, surviving_byte,
 		1 /* already-committed 1-child boundary */, NULL, NULL,
 		NULL, 0, NULL, NULL, 0 /* count-neutral canonicalize */, 0);
 }
@@ -1475,7 +1494,6 @@ int ft_detach_node(struct cds_ft *ft,
 					 */
 					int cret = ft_chain_compress_fused(ft,
 						iter_node_flag, bmeta,
-						detach_parent_flag_ptr,
 						s_child, s_byte,
 						2 /* shape-D: survivor + the child this commit detaches */,
 						fuse_cell, run,
@@ -1932,7 +1950,7 @@ int ft_detach_node(struct cds_ft *ft,
 		    !iter_meta->external_nodes &&
 		    iter_meta->parent != NULL) {
 			ft_canonicalize_chain_compress(ft, iter_node_flag,
-				iter_meta, detach_parent_flag_ptr);
+				iter_meta);
 		}
 #endif
 	}
@@ -2571,7 +2589,6 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 				 */
 				cret = ft_chain_compress_fused(ft,
 					holder_flag, holder_meta,
-					ft_get_parent_slot(holder_meta, ft),
 					s_child, s_byte,
 					1 /* sole body child; the removed entry is external */,
 					fuse_cell, NULL,
@@ -2667,7 +2684,7 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 				    ft_meta_nr_child(holder_meta) == 1 &&
 				    holder_meta->parent != NULL) {
 					ft_canonicalize_chain_compress(ft, holder_flag,
-						holder_meta, ft_get_parent_slot(holder_meta, ft));
+						holder_meta);
 				}
 #endif
 			}
@@ -3118,7 +3135,6 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 				 */
 				cret = ft_chain_compress_fused(ft,
 					holder_flag, holder_meta,
-					ft_get_parent_slot(holder_meta, ft),
 					s_child, s_byte,
 					1 /* sole body child; the removed entry is external */,
 					ft->ordered_list ? dead_cell : NULL,
@@ -3196,7 +3212,7 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 					    ft_meta_nr_child(holder_meta) == 1 &&
 					    holder_meta->parent != NULL) {
 						ft_canonicalize_chain_compress(ft, holder_flag,
-							holder_meta, ft_get_parent_slot(holder_meta, ft));
+							holder_meta);
 					}
 #endif
 				}
