@@ -930,7 +930,7 @@ int ft_merge_unlink_src_subtree(struct cds_ft *src_ft,
 			struct cds_ft_compressed_node *cn =
 				ft_compressed_node_ptr(d.nf);
 
-			ft_descent_traverse_compressed(&d, cn, &ik);
+			ft_descent_traverse_compressed(src_ft, &d, cn, &ik);
 			continue;
 		}
 		kv = *(ik++);

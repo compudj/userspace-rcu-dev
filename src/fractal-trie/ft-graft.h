@@ -793,7 +793,7 @@ enum ft_graft_prep ft_graft_build(struct cds_ft *ft,
 			int j = ft_match_compressed_key(ik, cn, cmp);
 
 			if (j == cmp && cn->len <= remaining) {
-				ft_descent_traverse_compressed(d, cn, &ik);
+				ft_descent_traverse_compressed(ft, d, cn, &ik);
 				continue;
 			}
 			if (j < cmp) {
@@ -1521,7 +1521,7 @@ enum ft_graft_swap_case ft_graft_swap_descend(struct cds_ft *ft,
 			if (j < cmp)
 				return FT_GRAFT_SWAP_DELEGATE;	/* diverge */
 			if (cn->len <= remaining) {
-				ft_descent_traverse_compressed(d, cn, &ik);
+				ft_descent_traverse_compressed(ft, d, cn, &ik);
 				continue;
 			}
 			/* j == cmp == remaining < cn->len: key ends inside cn. */

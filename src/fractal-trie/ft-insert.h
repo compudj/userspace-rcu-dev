@@ -2350,7 +2350,7 @@ enum ft_descent_action ft_insert_compressed(struct cds_ft *ft,
 		     ft_node_compressed(cn->child))) {
 			ft_snapshot_push(snapshot, snapshot_depth,
 				*nr_snapshot_p, d->nf, d->depth);
-			ft_descent_traverse_compressed(d, cn, iter_key_p);
+			ft_descent_traverse_compressed(ft, d, cn, iter_key_p);
 			return FT_DESCENT_CONTINUE;
 		}
 		if (!cn->child) {
@@ -2364,7 +2364,7 @@ enum ft_descent_action ft_insert_compressed(struct cds_ft *ft,
 			/* Key ends at external child: duplicate. */
 			ft_snapshot_push(snapshot, snapshot_depth,
 				*nr_snapshot_p, d->nf, d->depth);
-			ft_descent_traverse_compressed(d, cn, iter_key_p);
+			ft_descent_traverse_compressed(ft, d, cn, iter_key_p);
 			return FT_DESCENT_BREAK;
 		}
 		/* Key continues past external child: build branch. */
@@ -2492,6 +2492,17 @@ restart_attempt:
 	for (; d.depth < key_depth - 1; ) {
 		uint8_t key_value;
 
+		/*
+		 * The last reanchoring step landed shallower (rewind > 0: a peer
+		 * chain-merge moved the encoded position up), so the captured
+		 * publish slot d.nfp is at the wrong level -- re-descend against
+		 * the now-current tree.  Shared read/write skip concurrency: the
+		 * step detects the shift, the mutator reacts (a reader rewinds).
+		 */
+		if (caa_unlikely(d.skip_conflict)) {
+			ret = -EAGAIN;
+			goto insert_done;
+		}
 		if (!d.nf)
 			break;
 		/*
@@ -2531,6 +2542,14 @@ restart_attempt:
 		ft_descent_step(ft, &d, key_value);
 	}
 
+	/*
+	 * A final reanchoring step that reached key_depth - 1 exited the loop
+	 * without re-entering its top: honour a rewind > 0 conflict here too.
+	 */
+	if (caa_unlikely(d.skip_conflict)) {
+		ret = -EAGAIN;
+		goto insert_done;
+	}
 	/*
 	 * Resolve any skip-compressed pointer left in d.nf by the descent
 	 * loop's final step (e.g., ft_descent_traverse_compressed sets d.nf

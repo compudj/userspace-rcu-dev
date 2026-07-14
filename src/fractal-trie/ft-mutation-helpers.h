@@ -41,6 +41,17 @@ struct ft_descent {
 	struct cds_ft_inode_flag **pnfp;	/* Slot that holds @pnf. */
 	struct cds_ft_inode_flag *ppnf;		/* Grandparent node-flag value. */
 	struct cds_ft_inode_flag **ppnfp;	/* Slot that holds @ppnf. */
+	/*
+	 * A reanchoring descent step (ft_descent_step) landed the live node
+	 * SHALLOWER than the dispatched child (ft_skip_reanchor rewind > 0: a
+	 * peer chain-merge moved the encoded position up), so the captured
+	 * publish slot @nfp is at the wrong level.  A mutating caller must
+	 * re-descend against the now-current tree; a caller that ignores it
+	 * still navigates a LIVE node (no torn read) and its txn commit aborts
+	 * any incoherent publish.  Set only, never cleared mid-descent -- the
+	 * first mutator that observes it bails.
+	 */
+	bool skip_conflict;			/* Reanchor moved the slot's level. */
 };
 
 static
@@ -63,6 +74,7 @@ void ft_descent_init(struct ft_descent *d, struct cds_ft *ft)
 	d->pnfp = NULL;
 	d->ppnf = NULL;
 	d->ppnfp = NULL;
+	d->skip_conflict = false;
 }
 
 /*
@@ -72,24 +84,34 @@ void ft_descent_init(struct ft_descent *d, struct cds_ft *ft)
  * calling this helper.
  */
 static inline_lookup
-void ft_descent_traverse_compressed(struct ft_descent *d,
+void ft_descent_traverse_compressed(struct cds_ft *ft, struct ft_descent *d,
 		struct cds_ft_compressed_node *cn,
 		const uint8_t **iter_key)
 {
+	unsigned int rewind;
+
 	d->ppnf  = d->pnf;
 	d->ppnfp = d->pnfp;
 	d->pnf   = d->nf;
 	d->pnfp  = d->nfp;
+	d->nfp   = &cn->child;
 	/*
 	 * Resolve a transient type-7 flip proxy a peer parked on cn->child
-	 * (Phase 4.3) to its committed-or-old target BEFORE it becomes the
-	 * descent cursor: the next ft_descent_step reads d->pnf as a node, so an
-	 * unresolved proxy (low nibble 0xF reads as internal type 7) would drive
-	 * a get_nth off a garbage type -> SIGILL.  d->nfp still names the raw
-	 * slot; only the snapshot d->nf is resolved (mirrors ft_node_get_nth).
+	 * (Phase 4.3), then reanchor a skip-compressed child through the shared
+	 * read-side primitive (ft_reanchor_flag) BEFORE it becomes the descent
+	 * cursor -- the same MW convergence as ft_descent_step.  A peer split/
+	 * merge below cn can leave cn->child a torn skip pointer whose one-hop
+	 * recovery is internal memory (type confusion) or stale-length (mis-file);
+	 * the reanchor walks cn->child's live parent chain instead.  An unresolved
+	 * proxy (low nibble 0xF reads as internal type 7) would also drive the
+	 * next get_nth off a garbage type -> SIGILL, hence resolve-then-reanchor.
+	 * d->nfp names the raw skip slot (the publish target); on a rewind > 0
+	 * (peer chain-merge moved the position shallower) that slot is at the
+	 * wrong level -- flagged so a mutating caller re-descends.
 	 */
-	d->nf    = ft_resolve_flip_proxy(cn->child);
-	d->nfp   = &cn->child;
+	d->nf    = ft_reanchor_flag(ft, ft_resolve_flip_proxy(cn->child), &rewind);
+	if (caa_unlikely(rewind != 0))
+		d->skip_conflict = true;
 	d->depth += cn->len;
 	*iter_key += cn->len;
 }
@@ -104,11 +126,26 @@ static inline
 struct cds_ft_inode_flag *ft_descent_step(struct cds_ft *ft, struct ft_descent *d,
 		uint8_t key_value)
 {
+	unsigned int rewind;
+
 	d->ppnf  = d->pnf;
 	d->ppnfp = d->pnfp;
 	d->pnf   = d->nf;
 	d->pnfp  = d->nfp;
-	d->nf    = ft_node_get_nth(ft, d->pnf, &d->nfp, key_value, FT_PF_NONE);
+	/*
+	 * Navigate through the read side's robust reanchor primitive rather
+	 * than the pre-MW unvalidated one-hop skip resolve (ft_node_get_nth):
+	 * under MW a peer writer can split/merge the trie under this descent,
+	 * exactly the concurrent structural change the read side already
+	 * tolerates.  We additionally capture the raw publish slot (&d->nfp).
+	 * A reanchor that lands shallower (rewind > 0, a concurrent
+	 * chain-merge) leaves d->nfp at the wrong level -- flag it so a
+	 * mutating caller re-descends (see struct ft_descent.skip_conflict).
+	 */
+	d->nf    = ft_node_get_nth_reanchor_slot(ft, d->pnf, &d->nfp,
+			key_value, FT_PF_NONE, &rewind);
+	if (caa_unlikely(rewind != 0))
+		d->skip_conflict = true;
 	d->depth++;
 	return d->nf;
 }

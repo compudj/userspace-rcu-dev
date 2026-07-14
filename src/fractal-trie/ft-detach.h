@@ -249,7 +249,7 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 				struct cds_ft_compressed_node *cn =
 					ft_compressed_node_ptr(d.nf);
 
-				ft_descent_traverse_compressed(&d, cn, &ik);
+				ft_descent_traverse_compressed(ft, &d, cn, &ik);
 				continue;
 			}
 			kv = *(ik++);
