@@ -66,7 +66,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS	58
+#define NR_TESTS	59
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -1010,6 +1010,194 @@ static int inv_concurrent_writers_disjoint(void)
 
 	fprintf(stderr, "# inv_concurrent_writers_disjoint: %d writers, %lu ops, "
 		"%lu live keys\n", MW_NR_WRITERS, total_ops, live);
+
+	free(w);
+	if (drain_and_destroy(ft, group) < 0)
+		ret = -1;
+	if (leak_check() < 0)
+		ret = -1;
+	return ret;
+}
+
+/*
+ * Companion to inv_concurrent_writers_disjoint: ALL writers contend the SAME
+ * key range [0, MW_SHARED_RANGE), so two writers routinely insert/remove the
+ * SAME key and mutate ADJACENT keys sharing one leaf -- the write/write and
+ * torn-publish races the disjoint oracle deliberately excludes (insert-replace /
+ * hole-refill resurrect on a live child slot, remove chain-leaf freeze racing a
+ * re-insert).  Same total keyspace as the disjoint oracle (MW_NR_WRITERS *
+ * MW_RANGE), but fully shared instead of partitioned.
+ *
+ * Self-arbitrating node lifecycle (no per-writer shadow is possible once keys
+ * are shared): a writer allocates a fresh node per insert; the writer whose
+ * cds_ft_remove returns OK owns the RCU-deferred free (a peer standing on the
+ * node in its own read section keeps it live to its grace period, §11); a losing
+ * remover and a duplicate insert reclaim only what they privately hold.  A broken
+ * concurrent remove that returns OK twice double-frees -> leak_check / 0xfe
+ * poison fault.
+ *
+ * Oracles:
+ *  - in-line: a non-NULL lookup for key K must resolve to a node whose shadow
+ *    key is K.  A torn structural publish that redirects K's slot to another
+ *    node -- or to wild memory -- trips this (or faults on the deref): the
+ *    Group-B/C torn-publish detector the disjoint oracle cannot see.
+ *  - final (quiescent): cds_ft_count_keys equals the exact present count, every
+ *    present key resolves to a key-consistent node, cds_ft_verify passes.
+ *  - leak_check: every allocated node freed exactly once.
+ */
+#define MW_SHARED_RANGE	(MW_NR_WRITERS * MW_RANGE)
+
+struct mw_shared_arg {
+	struct cds_ft *ft;
+	unsigned int seed0;
+	unsigned long ops;
+	int failed;
+};
+
+static void *mw_shared_writer(void *arg)
+{
+	struct mw_shared_arg *w = (struct mw_shared_arg *) arg;
+	struct cds_ft_iter *iter;
+	unsigned int seed = w->seed0;
+
+	rcu_register_thread();
+	if (cds_ft_iter_create(w->ft, &iter) < 0)
+		abort();
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	while (!test_stop) {
+		uint64_t key = (uint64_t)(rand_r(&seed) % MW_SHARED_RANGE);
+		struct cds_ft_node *found;
+		uint8_t k[8];
+
+		cds_ft_u64_to_key(w->ft, key, k, CDS_FT_LEN_DEFAULT);
+		rcu_read_lock();
+		cds_ft_iter_set_key(iter, k, CDS_FT_LEN_DEFAULT);
+		cds_ft_lookup(w->ft, iter);
+		found = cds_ft_iter_node(iter);
+		if (found) {
+			/*
+			 * Torn-resolve oracle: K must map to a node keyed K.  A
+			 * concurrent restructure that redirected K's slot returns
+			 * the wrong node here; a torn child pointer returns wild
+			 * memory (the ->key deref faults).  The lookup reference is
+			 * valid only under this read section, and cds_ft_remove
+			 * consumes it, so both stay inside one bracket (§11).
+			 */
+			if (to_test_node(found)->key != key) {
+				fprintf(stderr, "MW shared: key %llu resolved to "
+					"node keyed %llu (%p)\n",
+					(unsigned long long) key,
+					(unsigned long long) to_test_node(found)->key,
+					(void *) found);
+				w->failed = 1;
+				rcu_read_unlock();
+				mw_violation_snapshot();
+				break;
+			}
+			if (cds_ft_remove(w->ft, iter, found) == CDS_FT_STATUS_OK)
+				node_free_rcu(to_test_node(found));
+			rcu_read_unlock();
+		} else {
+			struct ft_test_node *n;
+
+			rcu_read_unlock();
+			n = node_alloc(key);
+			if (insert_u64(w->ft, key, n) != CDS_FT_STATUS_OK)
+				node_free(n);	/* duplicate: a peer owns K */
+		}
+		w->ops++;
+		if ((seed & 0x3f) == 0)
+			rcu_quiescent_state();
+	}
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static int inv_concurrent_writers_shared(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	struct mw_shared_arg *w;
+	pthread_t writers[MW_NR_WRITERS];
+	struct timespec t0;
+	unsigned long total_ops = 0, present = 0;
+	uint64_t key;
+	int i, ret = 0;
+
+	if (!getenv("FT_INV_MW")) {
+		fprintf(stderr, "# inv_concurrent_writers_shared: skipped "
+			"(set FT_INV_MW=1 to run the shared-key writer oracle)\n");
+		return 0;
+	}
+	mw_install_fatal_handler();
+	ft = create_fixed_ft(8, &group);
+	cds_ft_make_concurrent(ft);
+	leak_reset();
+
+	w = (struct mw_shared_arg *) calloc(MW_NR_WRITERS, sizeof(*w));
+	if (!w)
+		abort();
+	for (i = 0; i < MW_NR_WRITERS; i++) {
+		w[i].ft = ft;
+		w[i].seed0 = (unsigned int)(i * 2654435761u + 1u);
+	}
+
+	test_go = 0;
+	test_stop = 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < MW_NR_WRITERS; i++)
+		pthread_create(&writers[i], NULL, mw_shared_writer, &w[i]);
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	test_go = 1;
+
+	rcu_thread_offline();
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
+		usleep(1000);
+	test_stop = 1;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < MW_NR_WRITERS; i++)
+		pthread_join(writers[i], NULL);
+	rcu_thread_online();
+
+	/* Quiescent: the present set is whatever survived; verify it. */
+	synchronize_rcu();
+	rcu_read_lock();
+	for (i = 0; i < MW_NR_WRITERS; i++) {
+		total_ops += w[i].ops;
+		if (w[i].failed)
+			ret = -1;
+	}
+	for (key = 0; key < MW_SHARED_RANGE; key++) {
+		struct cds_ft_node *found = NULL;
+
+		if (lookup_u64(ft, key, &found) != CDS_FT_STATUS_OK || !found)
+			continue;
+		present++;
+		if (to_test_node(found)->key != key) {
+			fprintf(stderr, "MW shared final: key %llu resolved to "
+				"node keyed %llu\n", (unsigned long long) key,
+				(unsigned long long) to_test_node(found)->key);
+			ret = -1;
+		}
+	}
+	if (cds_ft_count_keys(ft) != present) {
+		fprintf(stderr, "MW shared final: count_keys %lu != present %lu\n",
+			cds_ft_count_keys(ft), present);
+		ret = -1;
+	}
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "MW shared final: cds_ft_verify failed\n");
+		ret = -1;
+	}
+	rcu_read_unlock();
+
+	fprintf(stderr, "# inv_concurrent_writers_shared: %d writers, %lu ops, "
+		"%lu present keys\n", MW_NR_WRITERS, total_ops, present);
 
 	free(w);
 	if (drain_and_destroy(ft, group) < 0)
@@ -10823,6 +11011,7 @@ int main(int argc, char **argv)
 	diag("1. Iteration ordering");
 	RUN_TEST(inv_iteration_order);
 	RUN_TEST(inv_concurrent_writers_disjoint);
+	RUN_TEST(inv_concurrent_writers_shared);
 	RUN_TEST(inv_bind_resume_order);
 	RUN_TEST(inv_ordered_bulk_consistency);
 	RUN_TEST(inv_compact_keycopy_terminates);
