@@ -49,6 +49,7 @@ struct lnode {
 };
 
 static struct urcu_txn_list_head g_head;
+static struct urcu_txn_domain g_dom;	/* shared escalation domain */
 static struct lnode A, B, C, E;
 
 /* Kill a live marker LIVE -> DEAD through the engine (single-edge MCAS). */
@@ -57,7 +58,7 @@ static void kill_live(void **live_slot)
 	struct urcu_mcas_txn tx;
 	enum urcu_txn_status st;
 
-	urcu_txn_init(&tx, &g_head.domain);
+	urcu_txn_init(&tx, &g_dom);
 	do {
 		urcu_txn_begin(&tx);
 		urcu_txn_store(&tx, live_slot, LIVE, DEAD, URCU_MCAS_TAG);
@@ -90,30 +91,31 @@ int main(void)
 	plan_tests(NR_TESTS);
 	rcu_register_thread();
 	urcu_txn_list_init(&g_head);
+	urcu_txn_domain_init(&g_dom);
 
 	A.live = LIVE;
 	B.live = LIVE;
 	C.live = LIVE;
 	E.live = LIVE;
-	urcu_txn_list_add_rcu(&A.node, &g_head);		/* head <-> A */
+	urcu_txn_list_add_rcu(&A.node, &g_head, &g_dom);	/* head <-> A */
 
 	/* 1. Anchor live: the guarded insert links B after A. */
 	r = urcu_txn_list_insert_after_guarded_rcu(&B.node, &A.node,
-			&g_head, &A.live, LIVE);
+			&g_dom, &A.live, LIVE);
 	ok(r == 0 && in_list(&B.node),
 		"guard holds -> guarded insert links the node after a live anchor");
 
 	/* 2. Anchor killed: the guard no longer holds -> refuse, C not linked. */
 	kill_live(&A.live);
 	r = urcu_txn_list_insert_after_guarded_rcu(&C.node, &A.node,
-			&g_head, &A.live, LIVE);
+			&g_dom, &A.live, LIVE);
 	ok(r == -ENOENT && !in_list(&C.node),
 		"guard fails -> guarded insert refuses, node not linked");
 
 	/* 3. Anchor deleted: caught on the mark before the guard -> -ENOENT. */
-	(void) urcu_txn_list_del_rcu(&A.node, &g_head);
+	(void) urcu_txn_list_del_rcu(&A.node, &g_dom);
 	r = urcu_txn_list_insert_after_guarded_rcu(&E.node, &A.node,
-			&g_head, &B.live, LIVE);
+			&g_dom, &B.live, LIVE);
 	ok(r == -ENOENT && !in_list(&E.node),
 		"deleted anchor -> guarded insert returns -ENOENT");
 

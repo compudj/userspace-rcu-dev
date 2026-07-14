@@ -10,27 +10,33 @@
  * transaction is a "transfer" that adds and subtracts equal amounts across 2 or
  * 3 distinct words, so the total sum is invariantly 0.  A torn k-CAS (one word
  * updated, another not) would leave a non-zero sum.  With a small array and many
- * threads, transactions collide constantly, exercising the install/help/settle
- * paths and the cyclic-helping resolution hard.
+ * threads, transactions collide constantly, exercising the install/settle paths
+ * and the foreign-proxy wait/escalate resolution hard.
  *
  * Invariant (progress): every thread completes its full op count.  A livelock or
- * deadlock in the helping protocol would hang the test (caught as a timeout),
+ * deadlock in the install protocol would hang the test (caught as a timeout),
  * and the committed-op total must equal the attempts.
  *
- * Fairness (the priority + steal engine): a second, deliberately hot phase
- * (few words, many writers) measures the worst single-operation bypass, i.e.
- * the highest retry count any one operation reached before committing.  With the
- * aging-priority contention manager this stays bounded (a starved op's priority
- * climbs until it can no longer be bypassed); without it a writer could be
- * starved unboundedly.  The phase also reports helping work -- drive() passes
- * beyond each op's own owner-drive -- which is the evidence for or against a
- * per-slot waiter queue (combining) as a follow-up.
+ * Fairness (aging + escalation): a second, deliberately hot phase (few words,
+ * many writers) measures the worst single-operation bypass, i.e. the highest
+ * retry count any one operation reached before committing.  Retries age the op
+ * (retry 0 fail-fast install, retry >= 1 blocking install, single-edge ops
+ * eventually escalate to a real proxy), so a starved writer keeps this bounded.
+ * The phase also confirms the single-driver invariant drive == attempts (no op
+ * drives a foreign transaction).
  *
  * Each slot packs a per-word monotonic version (see lf_bump below) so a stored
  * word never repeats a bit pattern, and bit 0 stays free for the engine's record
  * tag.  The versioning models the real target: slots holding RCU-managed
  * pointers cannot ABA.  QSBR flavor; every worker is an RCU reader so descriptors
- * stay alive while helpers drive them.
+ * stay alive while other writers wait on their proxies.
+ *
+ * A-B-A tolerance: a final phase drops the version (g_aba_mode) so slot bit
+ * patterns recur, deliberately reintroducing slot-value A-B-A, and checks the sum
+ * invariant still holds.  This is the affirmative coverage for the single-driver
+ * bare-CAS install: since the owner plants each record once while its transaction
+ * is UNDECIDED and no foreign thread re-plants it, a value cycling back to a stale
+ * read is inert -- the property that let the per-record install latch be retired.
  */
 
 #ifndef _GNU_SOURCE
@@ -53,16 +59,14 @@
 #include <urcu-call-rcu.h>
 
 /*
- * Engine instrumentation hook: count helping (drive), eviction and steal events
- * per thread.  Must be defined before the header so its inline functions pick it
- * up; compiles to nothing in any other translation unit.
+ * Engine instrumentation hook: count install-driver and escalation events per
+ * thread.  Must be defined before the header so its inline functions pick it up;
+ * compiles to nothing in any other translation unit.
  */
 struct lf_stat {
-	unsigned long drive;	/* drive() entries: owner-drives + helping */
-	unsigned long evict;	/* foreign txns aborted by priority */
-	unsigned long steal;	/* slots stolen proxy->proxy */
+	unsigned long drive;	/* drive() entries -- one per commit attempt (single driver) */
 	unsigned long escalate;	/* single-edge ops promoted to the descriptor path */
-	unsigned long help_capped;	/* help-recursion hit URCU_MCAS_HELP_MAX_DEPTH */
+	unsigned long wait_capped;	/* foreign-proxy wait hit URCU_MCAS_WAIT_PATIENCE -> abort+escalate */
 };
 static __thread struct lf_stat t_stat;
 #define URCU_MCAS_STAT(counter)	(t_stat.counter++)
@@ -78,13 +82,15 @@ static __thread struct lf_stat t_stat;
 
 #include "tap.h"
 
-#define NR_TESTS	9
+#define NR_TESTS	11
 #define NR_WORKERS	8
 
 #define MILD_WORDS	16		/* moderate contention: atomicity focus */
 #define MILD_OPS	60000
 #define HOT_WORDS	4		/* heavy contention: fairness focus */
 #define HOT_OPS		20000
+#define ABA_WORDS	3		/* tiny set: slot values recur -> A-B-A */
+#define ABA_OPS		20000
 
 /*
  * Mixed phase: a few workers run single-edge +1 ops on a tiny hot set while the
@@ -98,14 +104,23 @@ static __thread struct lf_stat t_stat;
 #define MIX_SINGLE	2		/* single-edge workers; the rest are multi-edge */
 
 /*
- * Worst tolerated single-op bypass in the hot phase.  Generous: under the aging
- * priority a starved op is bypassed at most O(concurrency) before its retry
- * count dominates; a regression (raw-race arbitration / broken aging) blows past
- * this.  Calibrated from observed runs (typ. low tens) with wide headroom.
+ * Worst tolerated single-op bypass in the hot phase.  Generous: aging bounds it
+ * (retry 0 fail-fast install, retry >= 1 blocking install, and single-edge
+ * escalation to a real proxy), so a starved op is bypassed at most O(concurrency)
+ * before it holds the slot; a regression (raw-race arbitration / broken aging)
+ * blows past this.  Calibrated from observed runs (typ. low tens) with headroom.
  */
 #define HOT_RETRY_BOUND	512
 
 static void *g_word[MILD_WORDS];	/* all start at (void *) 0 */
+
+/*
+ * A-B-A test mode: when set, lf_bump() stops packing a per-word version, so a
+ * word's bit pattern recurs whenever its value does -- deliberately reintroducing
+ * the slot-value A-B-A the versioning otherwise models away.  Set before a phase's
+ * workers are spawned and cleared after they join, so it is read-only concurrently.
+ */
+static int g_aba_mode;
 
 struct worker_arg {
 	unsigned int seed;
@@ -133,8 +148,14 @@ static unsigned int xs(unsigned int x)
  * bit pattern.  This models the real target, where slots hold RCU-managed
  * pointers that cannot ABA (a freed node is not reused within a read-side
  * section, and a removed node is not re-linked before its grace period).  Plain
- * integer values, by contrast, ABA freely -- which is NOT representative of an
- * RCU-protected structure and is what an earlier version of this test hit.
+ * integer values, by contrast, ABA freely.
+ *
+ * The A-B-A phase (g_aba_mode) drops the version deliberately, so a word's bit
+ * pattern recurs with its value.  Under the single-driver engine that is safe --
+ * the owner plants each record once with a bare CAS while its transaction is
+ * UNDECIDED and no foreign thread re-plants it, so a slot value cycling back to a
+ * stale read's value cannot resurrect a retired install -- and that phase's
+ * conservation check is what affirms it.
  */
 static intptr_t lf_val(uintptr_t w)
 {
@@ -144,7 +165,8 @@ static intptr_t lf_val(uintptr_t w)
 static uintptr_t lf_bump(uintptr_t w, intptr_t delta)
 {
 	intptr_t val = lf_val(w) + delta;
-	unsigned int ver = (unsigned int) ((w >> 1) & 0x7fffffffu) + 1;
+	unsigned int ver = g_aba_mode ? 0u :
+		(unsigned int) ((w >> 1) & 0x7fffffffu) + 1;
 
 	return ((uintptr_t) (uint32_t) (int32_t) val << 32)
 		| ((uintptr_t) (ver & 0x7fffffffu) << 1);
@@ -211,8 +233,8 @@ static void *worker(void *arg)
 				/*
 				 * The updater is an RCU reader: this critical
 				 * section keeps a descriptor alive while peers
-				 * help drive it.  A no-op in QSBR, required for
-				 * the memb/mb flavors.
+				 * resolve proxies that point at it.  A no-op in
+				 * QSBR, required for the memb/mb flavors.
 				 */
 				rcu_read_lock();
 				t = urcu_mcas_create(3, retry);
@@ -253,7 +275,7 @@ static void *worker(void *arg)
 /*
  * Run one phase: @nwords shared words, @ops per worker.  Returns the final sum
  * (0 iff atomic); fills *@out_committed, *@out_max_retry and the aggregate
- * drive/evict/steal/attempt counters.
+ * drive/wait-cap/attempt counters.
  */
 static intptr_t run_phase(unsigned int nwords, long ops,
 		long *out_committed, unsigned long *out_max_retry,
@@ -263,7 +285,7 @@ static intptr_t run_phase(unsigned int nwords, long ops,
 	struct worker_arg args[NR_WORKERS];
 	long committed = 0;
 	unsigned long max_retry = 0, attempts = 0;
-	struct lf_stat st = { 0, 0, 0, 0, 0 };
+	struct lf_stat st = { 0, 0, 0 };
 	intptr_t sum = 0;
 	unsigned int i;
 
@@ -289,9 +311,7 @@ static intptr_t run_phase(unsigned int nwords, long ops,
 		if (args[i].max_op_retry > max_retry)
 			max_retry = args[i].max_op_retry;
 		st.drive += args[i].st.drive;
-		st.evict += args[i].st.evict;
-		st.steal += args[i].st.steal;
-		st.help_capped += args[i].st.help_capped;
+		st.wait_capped += args[i].st.wait_capped;
 	}
 	rcu_thread_online();
 
@@ -319,7 +339,7 @@ static intptr_t run_mixed_phase(unsigned int nwords, long ops, unsigned int nsin
 	struct worker_arg args[NR_WORKERS];
 	long single_committed = 0, total_committed = 0;
 	unsigned long single_max_retry = 0, escalate = 0;
-	struct lf_stat zero = { 0, 0, 0, 0, 0 };
+	struct lf_stat zero = { 0, 0, 0 };
 	intptr_t sum = 0;
 	unsigned int i;
 
@@ -380,29 +400,29 @@ int main(void)
 	ok(committed == (long) NR_WORKERS * MILD_OPS,
 		"mild: every transaction eventually committed (bounded-blocking progress)");
 
-	/* --- Phase 2: heavy contention -- fairness + helping cost. --- */
+	/* --- Phase 2: heavy contention -- fairness + retry cost. --- */
 	sum = run_phase(HOT_WORDS, HOT_OPS, &committed, &max_retry, &st, &attempts);
 	{
 		/*
-		 * owner-drives = one drive() per attempt (every commit of a
-		 * >=2-edge txn drives once); the rest is helping foreign txns.
+		 * Single driver: exactly one drive() per commit attempt (each op
+		 * drives only its own txn -- nothing helps a foreign one), so
+		 * drive == attempts is an invariant, not a measured cost.
 		 */
 		double dpc = (double) st.drive / (double) committed;
-		double helppc = (double) (st.drive - attempts) / (double) committed;
 
 		diag("hot:  %d workers x %d ops over %d words = %ld committed; sum = %"
 			PRIdPTR, NR_WORKERS, HOT_OPS, HOT_WORDS, committed, sum);
 		diag("hot:  max single-op retry = %lu (bound %d); attempts = %lu",
 			max_retry, HOT_RETRY_BOUND, attempts);
-		diag("hot:  drive=%lu (%.2f/commit) help=%.2f/commit evict=%lu steal=%lu help_capped=%lu",
-			st.drive, dpc, helppc, st.evict, st.steal, st.help_capped);
+		diag("hot:  drive=%lu (%.2f/commit, == attempts) wait_capped=%lu",
+			st.drive, dpc, st.wait_capped);
 	}
 	ok(sum == 0,
 		"hot: k-CAS stayed atomic under heavy contention (sum invariant)");
 	ok(committed == (long) NR_WORKERS * HOT_OPS,
 		"hot: every transaction eventually committed (bounded-blocking progress)");
 	ok(max_retry < HOT_RETRY_BOUND,
-		"hot: worst single-op bypass stayed bounded (priority fairness)");
+		"hot: worst single-op bypass stayed bounded (aging fairness)");
 
 	/* --- Phase 3: single-edge ops vs. proxy-holding multi-edge ops. --- */
 	{
@@ -426,6 +446,18 @@ int main(void)
 		ok(escalate > 0,
 			"mix: single-edge ops actually escalated (mechanism exercised)");
 	}
+
+	/* --- Phase 4: single-driver A-B-A tolerance (bare-CAS install). --- */
+	g_aba_mode = 1;		/* words carry no version -> bit patterns recur */
+	sum = run_phase(ABA_WORDS, ABA_OPS, &committed, &max_retry, &st, &attempts);
+	g_aba_mode = 0;
+	diag("aba:  %d workers x %d ops over %d unversioned words = %ld committed; sum = %"
+		PRIdPTR "; max single-op retry = %lu",
+		NR_WORKERS, ABA_OPS, ABA_WORDS, committed, sum, max_retry);
+	ok(sum == 0,
+		"aba: k-CAS stayed atomic with slot values recurring (single-driver bare-CAS is A-B-A tolerant)");
+	ok(committed == (long) NR_WORKERS * ABA_OPS,
+		"aba: every transaction committed under value reuse (no lost progress)");
 
 	rcu_barrier();
 	rcu_unregister_thread();
