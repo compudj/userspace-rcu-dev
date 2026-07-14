@@ -794,7 +794,10 @@ struct ft_pub_rec {
 /*
  * Per-node MCAS state word (struct cds_ft_metadata.state) bit layout.
  * bit 0 = proxy (in-band flip marker), bit 1 = tombstone (LIVE->DEAD),
- * bits 2+ = nr_child.  See doc/design/mcas-multiwriter-readiness.md §4.2.
+ * bits 2-10 = nr_child, bits 11-18 = parent_slot_offset, bit 19 = COPYING
+ * (the reversible per-node lock), bit 20 = node-reclaim (RESERVED, MW lock-mode).
+ * See doc/design/mcas-multiwriter-readiness.md §4.2 and, for bits 19-20,
+ * doc/design/mw-writer-lock-escalation-model.md §0/§2.
  */
 #define FT_STATE_PROXY			((uintptr_t) 1 << 0)
 #define FT_STATE_TOMBSTONE		((uintptr_t) 1 << 1)
@@ -832,6 +835,21 @@ struct ft_pub_rec {
  */
 #define FT_STATE_COPYING		((uintptr_t) 1 << \
 					(FT_STATE_PSO_SHIFT + FT_STATE_PSO_BITS))
+/*
+ * FT_STATE_NODE_RECLAIM (bit 20, above FT_STATE_COPYING): RESERVED for the MW
+ * lock-escalation model's tombstone split (doc/design/mw-writer-lock-escalation-model.md
+ * §2).  Splits today's overloaded COPYING->TOMBSTONE commit into two independent
+ * meanings: node-reclaim is the reader-INVISIBLE "owned + being reclaimed" latch
+ * (MW half), stamped when a structural rewrite retires a node whose keys have
+ * moved elsewhere; node-deleted stays FT_STATE_TOMBSTONE, the reader-VISIBLE
+ * semantic delete (SW half).  A recompaction then stamps node-reclaim ONLY, so a
+ * straggler reader never observes a copied-away node as deleted -- dissolving the
+ * double-tombstone poison at its root.  NOT yet consumed by any op (lock-mode is
+ * unimplemented); the bit is reserved here so the state-word layout is fixed
+ * before the per-op conversions land (§11.3).
+ */
+#define FT_STATE_NODE_RECLAIM		((uintptr_t) 1 << \
+					(FT_STATE_PSO_SHIFT + FT_STATE_PSO_BITS + 1))
 #define FT_STATE_TAG_MASK		(FT_STATE_PROXY | FT_STATE_TOMBSTONE)
 
 struct cds_ft_metadata {
