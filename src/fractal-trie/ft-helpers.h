@@ -2000,6 +2000,45 @@ struct cds_ft_inode_flag *ft_resolve_skip_compressed(const struct cds_ft *ft,
 	return nf;
 }
 
+/*
+ * ft_reanchor_flag: resolve an (already flip-proxy-resolved) child flag that may
+ * be skip-compressed to a LIVE node, via the read side's ft_skip_reanchor --
+ * which walks the skip child's live parent chain to the trie position skip_len
+ * encodes -- instead of the unvalidated one-hop ft_skip_to_compressed.
+ *
+ * This is the MW-safe replacement for ft_resolve_skip_compressed on the WRITE
+ * path.  Under mutual exclusion a writer could trust the one-hop back-pointer
+ * (no peer could move the structure under its own descent); under MW a peer
+ * split/merge can tear that back-pointer into internal memory (type confusion:
+ * cn->len reads a bitmap byte) or a stale-length node (mis-file) -- exactly what
+ * the read side already tolerates by re-anchoring.  The update side converges on
+ * that same mechanism here.
+ *
+ * @*rewind_ret is set > 0 iff a concurrent chain-merge moved the encoded
+ * position shallower than the dispatched child (a caller that captured the raw
+ * slot then finds it at the wrong level, and re-descends).  Non-skip @child
+ * returns unchanged with rewind 0.  ft_skip_reanchor never returns NULL on a
+ * well-formed trie; the result is asserted non-NULL.  RCU-read-side safe.
+ */
+static inline
+struct cds_ft_inode_flag *ft_reanchor_flag(struct cds_ft *ft,
+		struct cds_ft_inode_flag *child, unsigned int *rewind_ret)
+{
+	*rewind_ret = 0;
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+	if (caa_unlikely(child && ft_node_skip_compressed(child))) {
+		struct cds_ft_inode_flag *at_pos, *anchor;
+
+		anchor = ft_skip_reanchor(ft, child, rewind_ret, &at_pos);
+		assert(anchor != NULL);
+		return at_pos;
+	}
+#else
+	(void) ft;
+#endif
+	return child;
+}
+
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 /*
  * ft_skip_to_compressed_meta: shorthand to get the compressed node's

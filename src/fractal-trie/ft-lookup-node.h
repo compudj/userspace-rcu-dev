@@ -1748,29 +1748,47 @@ struct cds_ft_inode_flag *ft_node_get_nth(const struct cds_ft *ft, struct cds_ft
 }
 
 /*
- * Surgical reader descent step: fetch @node_flag's child at byte @n, resolving
- * a skip-compressed slot mismatch via the live skip-child parent chain instead
- * of spinning on a (possibly frozen) slot like ft_node_get_nth's validate path.
- * On a mismatch ft_skip_reanchor locates the live position; *@rewind_ret is how
- * many byte-depths the resolved node lies ABOVE the dispatched child (0 in the
- * common split / recompaction case; > 0 only when a concurrent chain-merge
- * moved the encoded position shallower -- the caller backs its descent cursor
- * up by that much, or re-descends).  ft_skip_reanchor never returns NULL on a
- * well-formed trie (the writer wires every fresh cluster's parent before the
- * cluster becomes reachable, so the up-walk never observes a NULL parent);
- * the result is asserted non-NULL.  Returns the resolved child flag
- * (compressed/internal/external), or NULL for an empty slot.
+ * ft_node_get_nth_reanchor_slot: the shared robust child-resolution step for
+ * BOTH the read side and the MW update side.  Fetches @node_flag's child at
+ * byte @n and resolves a skip-compressed slot via the live skip-child parent
+ * chain (ft_skip_reanchor) -- the single concurrency-handling mechanism --
+ * rather than the unvalidated one-hop back-pointer.
+ *
+ * Under mutual exclusion the update side could descend with the simpler
+ * one-hop resolve (a peer writer could not change the structure under its own
+ * descent).  MW removes that exemption: the writer descent now faces the same
+ * concurrent split/merge the read side always did, so it navigates through
+ * THIS primitive instead of a bespoke writer resolver.  The update side differs
+ * from a reader only in capturing the mutable publish slot via @slot_ret.
+ *
+ * @slot_ret:   out (may be NULL) -- the RAW slot the child sits in (the skip
+ *              slot itself under skip-compression, unresolved: the update
+ *              side's publish target, the value ft_split_compressed_insert's
+ *              forward CAS matches).  Readers pass NULL.
+ * @rewind_ret: out -- byte-depths the resolved node lies ABOVE the dispatched
+ *              child (0 in the split / recompaction case; > 0 only when a
+ *              concurrent chain-merge moved the encoded position shallower --
+ *              a reader backs its descent cursor up by that much, while the
+ *              update side's @slot_ret is then at the wrong level so a mutator
+ *              re-descends).
+ *
+ * Returns the resolved child flag -- a LIVE compressed/internal/external node,
+ * never skip-encoded, never a torn back-pointer's content -- or NULL for an
+ * empty slot.  ft_skip_reanchor never returns NULL on a well-formed trie (the
+ * writer wires every fresh cluster's parent before the cluster becomes
+ * reachable, so the up-walk never observes a NULL parent); the result is
+ * asserted non-NULL.
  */
 static inline_lookup
-struct cds_ft_inode_flag *ft_node_get_nth_reanchor(struct cds_ft *ft,
-		struct cds_ft_inode_flag *node_flag, uint8_t n,
+struct cds_ft_inode_flag *ft_node_get_nth_reanchor_slot(struct cds_ft *ft,
+		struct cds_ft_inode_flag *node_flag,
+		struct cds_ft_inode_flag ***slot_ret,
+		uint8_t n, enum ft_pf_target pf_hint,
 		unsigned int *rewind_ret)
 {
 	struct cds_ft_inode_flag *child =
-		ft_node_get_nth_skip(node_flag, NULL, n, FT_PF_NONE);
+		ft_node_get_nth_skip(node_flag, slot_ret, n, pf_hint);
 
-	(void) ft;
-	*rewind_ret = 0;
 	/*
 	 * Resolve a type-7 flip proxy transiently occupying the slot (a
 	 * cds_ft_merge_at flip, or an ordered-list insert's one-commit
@@ -1781,16 +1799,29 @@ struct cds_ft_inode_flag *ft_node_get_nth_reanchor(struct cds_ft *ft,
 	 * skip-encoded, hence resolve-then-skip order.
 	 */
 	child = ft_resolve_flip_proxy(child);
-#ifdef FEATURE_FT_SKIP_COMPRESSED
-	if (caa_unlikely(child && ft_node_skip_compressed(child))) {
-		struct cds_ft_inode_flag *at_pos, *anchor;
+	return ft_reanchor_flag(ft, child, rewind_ret);
+}
 
-		anchor = ft_skip_reanchor(ft, child, rewind_ret, &at_pos);
-		assert(anchor != NULL);
-		return at_pos;
-	}
-#endif
-	return child;
+/*
+ * Surgical reader descent step: fetch @node_flag's child at byte @n, resolving
+ * a skip-compressed slot mismatch via the live skip-child parent chain instead
+ * of spinning on a (possibly frozen) slot like ft_node_get_nth's validate path.
+ * A thin reader wrapper over ft_node_get_nth_reanchor_slot (no publish slot).
+ * On a mismatch ft_skip_reanchor locates the live position; *@rewind_ret is how
+ * many byte-depths the resolved node lies ABOVE the dispatched child (0 in the
+ * common split / recompaction case; > 0 only when a concurrent chain-merge
+ * moved the encoded position shallower -- the caller backs its descent cursor
+ * up by that much, or re-descends).  ft_skip_reanchor never returns NULL on a
+ * well-formed trie; the result is asserted non-NULL.  Returns the resolved
+ * child flag (compressed/internal/external), or NULL for an empty slot.
+ */
+static inline_lookup
+struct cds_ft_inode_flag *ft_node_get_nth_reanchor(struct cds_ft *ft,
+		struct cds_ft_inode_flag *node_flag, uint8_t n,
+		unsigned int *rewind_ret)
+{
+	return ft_node_get_nth_reanchor_slot(ft, node_flag, NULL, n,
+			FT_PF_NONE, rewind_ret);
 }
 
 /*
