@@ -66,7 +66,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS	59
+#define NR_TESTS	60
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -378,6 +378,37 @@ static struct cds_ft *create_fixed_rankstats_ft(size_t klen,
 			cds_ft_group_attr_set_ordered_list(attr, false) < 0)
 		abort();
 	if (cds_ft_group_attr_set_rank_stats(attr, true) < 0)
+		abort();
+	if (cds_ft_group_create(attr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &ft) < 0)
+		abort();
+	*group_out = group;
+	return ft;
+}
+
+/*
+ * Coarse MW lock-mode trie (CDS_FT_WRITER_LOCK_COARSE): every mutator serializes
+ * under the single FT-wide writer lock; readers wait-free.  rank_stats ON (the
+ * coarse target build, §10.5), EAGER (no speculative offset -- the MW oracle
+ * does exact lookups only).  Used by inv_concurrent_writers_coarse_lock.
+ */
+static struct cds_ft *create_fixed_coarse_lock_ft(size_t klen,
+		struct cds_ft_group **group_out)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+
+	if (cds_ft_group_attr_create(&attr) < 0)
+		abort();
+	if (cds_ft_group_attr_set_key_len(attr, klen) < 0)
+		abort();
+	if (cds_ft_group_attr_set_rank_stats(attr, true) < 0)
+		abort();
+	if (cds_ft_group_attr_set_writer_strategy(attr,
+			CDS_FT_WRITER_LOCK_COARSE) < 0)
 		abort();
 	if (cds_ft_group_create(attr, &group) < 0)
 		abort();
@@ -1198,6 +1229,118 @@ static int inv_concurrent_writers_shared(void)
 
 	fprintf(stderr, "# inv_concurrent_writers_shared: %d writers, %lu ops, "
 		"%lu present keys\n", MW_NR_WRITERS, total_ops, present);
+
+	free(w);
+	if (drain_and_destroy(ft, group) < 0)
+		ret = -1;
+	if (leak_check() < 0)
+		ret = -1;
+	return ret;
+}
+
+#define MW_COARSE_NR_WRITERS	16
+
+/*
+ * Concurrent-writer soak for CDS_FT_WRITER_LOCK_COARSE (step 2 acceptance,
+ * §11.4).  MW_COARSE_NR_WRITERS threads each churn insert/remove over a DISJOINT
+ * key range on ONE coarse lock-mode trie.  Unlike the optimistic oracle
+ * (inv_concurrent_writers_disjoint, which has known structural races until the
+ * per-node locks land), the FT-wide writer lock SERIALIZES every mutation, so
+ * this must be violation-free -- it proves the acquire / escalate / release
+ * plumbing under real contention through ft->txn_domain, and that a coarse
+ * lock-mode trie stays coherent under 16 writers (no lost key, count == live,
+ * cds_ft_verify passes).  Reuses the mw_writer thread body (its lost-key oracle
+ * and reference-lifetime discipline are strategy-agnostic).  Opt-in
+ * (FT_INV_MW=1) -- it runs for DEFAULT_DURATION_MS.
+ */
+static int inv_concurrent_writers_coarse_lock(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	struct mw_writer_arg *w;
+	pthread_t writers[MW_COARSE_NR_WRITERS];
+	struct timespec t0;
+	unsigned long total_ops = 0, live = 0;
+	int i, ret = 0;
+
+	if (!getenv("FT_INV_MW")) {
+		fprintf(stderr, "# inv_concurrent_writers_coarse_lock: skipped "
+			"(set FT_INV_MW=1 to run the coarse lock-mode soak)\n");
+		return 0;
+	}
+	mw_install_fatal_handler();
+	ft = create_fixed_coarse_lock_ft(8, &group);
+	/* Concurrent mode: deferred reclaim keeps a peer's touched nodes live. */
+	cds_ft_make_concurrent(ft);
+
+	leak_reset();
+
+	w = (struct mw_writer_arg *) calloc(MW_COARSE_NR_WRITERS, sizeof(*w));
+	if (!w)
+		abort();
+	for (i = 0; i < MW_COARSE_NR_WRITERS; i++) {
+		w[i].ft = ft;
+		w[i].base = (uint64_t) i * MW_RANGE;
+	}
+
+	test_go = 0;
+	test_stop = 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < MW_COARSE_NR_WRITERS; i++)
+		pthread_create(&writers[i], NULL, mw_writer, &w[i]);
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	test_go = 1;
+
+	rcu_thread_offline();
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
+		usleep(1000);
+	test_stop = 1;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < MW_COARSE_NR_WRITERS; i++)
+		pthread_join(writers[i], NULL);
+	rcu_thread_online();
+
+	/* Quiescent: verify the final trie against every writer's shadow. */
+	synchronize_rcu();
+	rcu_read_lock();
+	for (i = 0; i < MW_COARSE_NR_WRITERS; i++) {
+		unsigned int off;
+
+		total_ops += w[i].ops;
+		if (w[i].failed)
+			ret = -1;
+		for (off = 0; off < MW_RANGE; off++) {
+			struct cds_ft_node *found = NULL;
+
+			if (!w[i].present[off])
+				continue;
+			live++;
+			if (lookup_u64(ft, w[i].base + off, &found)
+					!= CDS_FT_STATUS_OK ||
+			    found != &w[i].node[off]->node) {
+				fprintf(stderr, "coarse-lock final: writer %d key %llu "
+					"lost (found %p != %p)\n", i,
+					(unsigned long long)(w[i].base + off),
+					(void *) found,
+					(void *) &w[i].node[off]->node);
+				ret = -1;
+			}
+		}
+	}
+	if (cds_ft_count_keys(ft) != live) {
+		fprintf(stderr, "coarse-lock final: count_keys %lu != live %lu\n",
+			cds_ft_count_keys(ft), live);
+		ret = -1;
+	}
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "coarse-lock final: cds_ft_verify failed\n");
+		ret = -1;
+	}
+	rcu_read_unlock();
+
+	fprintf(stderr, "# inv_concurrent_writers_coarse_lock: %d writers, %lu ops, "
+		"%lu live keys\n", MW_COARSE_NR_WRITERS, total_ops, live);
 
 	free(w);
 	if (drain_and_destroy(ft, group) < 0)
@@ -11012,6 +11155,7 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_iteration_order);
 	RUN_TEST(inv_concurrent_writers_disjoint);
 	RUN_TEST(inv_concurrent_writers_shared);
+	RUN_TEST(inv_concurrent_writers_coarse_lock);
 	RUN_TEST(inv_bind_resume_order);
 	RUN_TEST(inv_ordered_bulk_consistency);
 	RUN_TEST(inv_compact_keycopy_terminates);
