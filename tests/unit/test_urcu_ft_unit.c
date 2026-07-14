@@ -49,9 +49,9 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 317
+#define NR_TESTS 318
 #else
-#define NR_TESTS 276
+#define NR_TESTS 277
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -251,6 +251,37 @@ static struct cds_ft *create_fixed_rankstats_ft(size_t klen,
 	return ft;
 }
 
+/*
+ * Fixed-length trie in MW COARSE lock-mode (CDS_FT_WRITER_LOCK_COARSE): every
+ * mutation serializes under the single FT-wide writer lock via the writer-scope
+ * hook; readers stay wait-free.  rank_stats ON, matching the step-2 target
+ * build (doc/design/mw-writer-lock-escalation-model.md §10.5).
+ */
+static struct cds_ft *create_fixed_coarse_lock_ft(size_t klen,
+		struct cds_ft_group **group_out)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+
+	if (cds_ft_group_attr_create(&attr) < 0)
+		abort();
+	if (cds_ft_group_attr_set_key_len(attr, klen) < 0)
+		abort();
+	if (cds_ft_group_attr_set_rank_stats(attr, true) < 0)
+		abort();
+	if (cds_ft_group_attr_set_writer_strategy(attr,
+			CDS_FT_WRITER_LOCK_COARSE) < 0)
+		abort();
+	if (cds_ft_group_create(attr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &ft) < 0)
+		abort();
+	*group_out = group;
+	return ft;
+}
+
 /* Create a variable-length trie (default attributes). */
 static struct cds_ft *create_varlen_ft(struct cds_ft_group **group_out)
 {
@@ -316,6 +347,67 @@ static int ft_test_has_key(struct cds_ft *ft, const char *k)
 
 	return cds_ft_eager_lookup_key(ft, (const uint8_t *) k, len, 0,
 			&out) == CDS_FT_STATUS_OK;
+}
+
+/*
+ * MW COARSE lock-mode smoke: on a CDS_FT_WRITER_LOCK_COARSE trie every mutation
+ * takes the FT-wide writer lock through the writer-scope choke point (acquire
+ * at the outermost scope enter, release at exit), while readers stay wait-free.
+ * Drive insert / lookup / remove and confirm results are identical to the
+ * optimistic strategy.  The removes run through drain_and_destroy, which also
+ * transits the hook per entry.
+ */
+static int test_writer_lock_mode_coarse(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_coarse_lock_ft(4, &group);
+	struct ft_test_node *n[64];
+	unsigned long cnt;
+	int i;
+
+	for (i = 0; i < 64; i++)
+		n[i] = node_alloc((uint64_t) i);
+
+	/* Insert 64 distinct keys, each mutation acquiring/releasing the lock. */
+	rcu_read_lock();
+	for (i = 0; i < 64; i++) {
+		if (insert_u64(ft, (uint64_t) i, n[i]) != CDS_FT_STATUS_OK) {
+			rcu_read_unlock();
+			fprintf(stderr, "coarse lock-mode: insert %d failed\n", i);
+			drain_and_destroy(ft, group);
+			return -1;
+		}
+	}
+	cnt = cds_ft_count_entries(ft);
+	rcu_read_unlock();
+	if (cnt != 64) {
+		fprintf(stderr, "coarse lock-mode: count %lu != 64 after inserts\n",
+			cnt);
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+
+	/* Every key resolvable on the lock-mode trie. */
+	rcu_read_lock();
+	for (i = 0; i < 64; i++) {
+		struct cds_ft_node *found = NULL;
+
+		if (lookup_u64(ft, (uint64_t) i, &found) != CDS_FT_STATUS_OK
+				|| found != &n[i]->node) {
+			rcu_read_unlock();
+			fprintf(stderr, "coarse lock-mode: lookup %d failed\n", i);
+			drain_and_destroy(ft, group);
+			return -1;
+		}
+	}
+	rcu_read_unlock();
+
+	/*
+	 * drain_and_destroy removes every entry -- each remove also transiting
+	 * the writer-scope hook -- frees the nodes, and tears the trie / group
+	 * down.
+	 */
+	return drain_and_destroy(ft, group);
 }
 
 /* ------------------------------------------------------------------ */
@@ -25692,6 +25784,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_remove_compressed_no_leak);
 	RUN_TEST(test_remove_prefix_external_promote);
 	RUN_TEST(test_compact_dense_full_node);
+	RUN_TEST(test_writer_lock_mode_coarse);
 #ifdef FEATURE_FT_FAULT_INJECT
 	RUN_TEST(test_split_oom_backpointer);
 	RUN_TEST(test_split_oom_key_shorter_arm);

@@ -293,6 +293,20 @@ enum cds_ft_status cds_ft_group_attr_set_optimize(
 	return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
 }
 
+enum cds_ft_status cds_ft_group_attr_set_writer_strategy(
+		struct cds_ft_group_attr *attr,
+		enum cds_ft_writer_strategy strategy)
+{
+	switch (strategy) {
+	case CDS_FT_WRITER_OPTIMISTIC:
+	case CDS_FT_WRITER_LOCK_COARSE:
+	case CDS_FT_WRITER_LOCK_FINE:
+		attr->writer_strategy = strategy;
+		return CDS_FT_STATUS_OK;
+	}
+	return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+}
+
 enum cds_ft_status cds_ft_attr_create(struct cds_ft_attr **result)
 {
 	struct cds_ft_attr *attr = calloc(1, sizeof(struct cds_ft_attr));
@@ -336,7 +350,7 @@ void cds_ft_make_exclusive(struct cds_ft *ft)
 	CDS_FT_SCOPED_WRITER(ft);
 	if (ft->exclusive)
 		return;
-	ft->group->flavor->update_synchronize_rcu();
+	ft_writer_lock_gp_wait(ft);
 	ft->exclusive = true;
 }
 
@@ -474,6 +488,7 @@ enum cds_ft_status _cds_ft_group_create(const struct cds_ft_group_attr *attr,
 		ft_group->rank_stats_set = attr->rank_stats_set;
 		ft_group->numa_policy = attr->numa_policy;
 		ft_group->optimize = attr->optimize;
+		ft_group->writer_strategy = attr->writer_strategy;
 	} else {
 		/*
 		 * NULL attr: mirror the defaults set by
@@ -711,6 +726,15 @@ enum cds_ft_status cds_ft_create(struct cds_ft_group *ft_group,
 #endif
 	if (attr)
 		ft->exclusive = attr->exclusive;
+	/*
+	 * MW lock-mode gate: a lock-strategy group's tries (COARSE or FINE)
+	 * take the FT-wide writer lock at every mutation (writer-scope hook).
+	 * FINE currently falls back to the coarse FT-wide lock until the
+	 * per-node lock-sets land.  Hot-path mirror of the group strategy so
+	 * the hook reads one trie field.
+	 */
+	ft->lock_mode = (ft_group->writer_strategy != CDS_FT_WRITER_OPTIMISTIC);
+	cds_fair_mutex_init(&ft->writer_lock);
 	/*
 	 * Writer-contention escalation domain for the concurrent-mode ops'
 	 * persistent txn handles (ft_txn_op_init, doc §11).

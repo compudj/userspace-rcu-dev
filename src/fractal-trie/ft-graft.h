@@ -848,6 +848,7 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 	size_t src_max;
 	enum cds_ft_status status;
 
+	ft_crosstrie_lock_mode_guard(dst_ft, src_ft);
 	CDS_FT_SCOPED_WRITER(dst_ft);
 	CDS_FT_SCOPED_WRITER(src_ft);
 
@@ -993,7 +994,7 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		 */
 		if (dst_ft->group->ordered_list_set) {
 			if (!src_ft->exclusive)
-				src_ft->group->flavor->update_synchronize_rcu();
+				ft_writer_lock_gp_wait(src_ft);
 			ft_ord_finalize_circular(dst_ft);
 		}
 		free_cds_ft_node(dst_ft, old_dst_root);
@@ -1324,7 +1325,7 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		}
 
 		if (!src_ft->exclusive)
-			src_ft->group->flavor->update_synchronize_rcu();
+			ft_writer_lock_gp_wait(src_ft);
 
 		if (prep == FT_GRAFT_PREP_GLUE) {
 			/*
@@ -1552,6 +1553,7 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
 	}
 
+	ft_crosstrie_lock_mode_guard(dst_ft, swap_ft);
 	CDS_FT_SCOPED_WRITER(dst_ft);
 	CDS_FT_SCOPED_WRITER(swap_ft);
 
@@ -1673,7 +1675,7 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		 * preserves the original drain condition.
 		 */
 		if (!swap_ft->exclusive || !dst_ft->exclusive)
-			dst_ft->group->flavor->update_synchronize_rcu();
+			ft_writer_lock_gp_wait(dst_ft);
 		if (dst_ft->group->ordered_list_set) {
 			ft_ord_finalize_circular(dst_ft);
 			ft_ord_finalize_circular(swap_ft);
@@ -2160,7 +2162,7 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 			FT_TP(root_publish, (const void *) swap_ft,
 				(const void *) swap_ft->root);
 			if (!swap_ft->exclusive)
-				swap_ft->group->flavor->update_synchronize_rcu();
+				ft_writer_lock_gp_wait(swap_ft);
 		}
 
 		/*
@@ -2307,7 +2309,7 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		 * skipped in that case.
 		 */
 		if (!dst_ft->exclusive)
-			dst_ft->group->flavor->update_synchronize_rcu();
+			ft_writer_lock_gp_wait(dst_ft);
 
 		/*
 		 * Extract side: wire cluster B's deferred back-pointer, then install

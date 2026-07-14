@@ -2620,6 +2620,40 @@ enum cds_ft_status cds_ft_group_attr_set_optimize(
 		enum cds_ft_optimize opt);
 
 /*
+ * The group's structural-writer concurrency strategy (MW lock-escalation
+ * model, doc/design/mw-writer-lock-escalation-model.md).  Readers are wait-free
+ * under every strategy; this selects only how concurrent structural WRITERS
+ * coordinate.
+ *
+ * CDS_FT_WRITER_OPTIMISTIC (default): writers coordinate optimistically through
+ *   the MCAS engine, escalating to a per-FT FIFO fair mutex only under sustained
+ *   contention.  This is the current implementation, slated for deprecation once
+ *   the lock strategies below fully replace it.
+ * CDS_FT_WRITER_LOCK_COARSE: writers serialize under one FT-wide writer lock per
+ *   trie (classic RCU single-writer).
+ * CDS_FT_WRITER_LOCK_FINE: writers serialize under fine-grained per-node
+ *   lock-sets, so writers on disjoint subtrees proceed in parallel and only
+ *   structural collisions serialize.  UNDER CONSTRUCTION: currently falls back
+ *   to CDS_FT_WRITER_LOCK_COARSE (one FT-wide lock) until the per-node lock-sets
+ *   land op-domain by op-domain.
+ */
+enum cds_ft_writer_strategy {
+	CDS_FT_WRITER_OPTIMISTIC = 0,
+	CDS_FT_WRITER_LOCK_COARSE = 1,
+	CDS_FT_WRITER_LOCK_FINE = 2,
+};
+
+/*
+ * cds_ft_group_attr_set_writer_strategy - Select the group's structural-writer
+ *   concurrency strategy (enum cds_ft_writer_strategy); the default is
+ *   CDS_FT_WRITER_OPTIMISTIC.  Returns CDS_FT_STATUS_OK, or
+ *   CDS_FT_STATUS_INVALID_ARGUMENT_ERROR for an unknown @strategy.
+ */
+enum cds_ft_status cds_ft_group_attr_set_writer_strategy(
+		struct cds_ft_group_attr *attr,
+		enum cds_ft_writer_strategy strategy);
+
+/*
  * cds_ft_attr_create - Create a per-instance Fractal Trie attribute
  *                      structure.
  * @result: Attribute output. Set to the newly created attribute

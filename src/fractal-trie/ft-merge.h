@@ -1641,7 +1641,7 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	if (src_side_txn)
 		ft_flip_txn_destroy(src_side_txn);
 	if (!src_ft->exclusive)
-		src_ft->group->flavor->update_synchronize_rcu();
+		ft_writer_lock_gp_wait(src_ft);
 
 	/*
 	 * 2. Re-parent the SRC-origin referenced subtrees directly: the src
@@ -2008,7 +2008,7 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 		ft_flip_txn_destroy(run_unlink_txn);
 
 	if (!src_ft->exclusive)
-		src_ft->group->flavor->update_synchronize_rcu();
+		ft_writer_lock_gp_wait(src_ft);
 
 	/*
 	 * An EXTERNAL payload is re-parented directly under a new internal slot, so
@@ -2216,6 +2216,7 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 	 * calls update_synchronize_rcu, which would deadlock inside a
 	 * read-side critical section.
 	 */
+	ft_crosstrie_lock_mode_guard(dst_ft, src_ft);
 	CDS_FT_SCOPED_WRITER(dst_ft);
 	CDS_FT_SCOPED_WRITER(src_ft);
 

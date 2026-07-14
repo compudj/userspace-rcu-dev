@@ -107,6 +107,7 @@
  */
 #define URCU_TXN_RCU_READ_LOCK()	do { } while (0)
 #define URCU_TXN_RCU_READ_UNLOCK()	do { } while (0)
+#include <urcu/fair-mutex.h>	/* MW coarse lock-mode FT-wide writer lock */
 #include <urcu/rcu-txn.h>
 #include <urcu/rcu-txn-list.h>
 #include <urcu/rculfhash.h>
@@ -1193,12 +1194,19 @@ struct cds_ft_group {
 	/*
 	 * Concurrent-engine escalation domain for the group's structural
 	 * transactions (urcu_txn_*).  Shared by every trie in the group: a
-	 * writer that keeps losing the lock-free race escalates to the
+	 * writer that keeps losing the optimistic race escalates to the
 	 * domain's fair lock so progress is bounded.  Currently exercised
 	 * under retained caller exclusion (no contention), so the fast path
 	 * never escalates.
 	 */
 	struct urcu_txn_domain domain;
+	/*
+	 * Structural-writer concurrency strategy for the group's tries (MW
+	 * lock-escalation model).  Copied to each trie at create; a locking
+	 * strategy (COARSE or FINE) makes the trie take the FT-wide writer lock
+	 * at every mutation.  Default CDS_FT_WRITER_OPTIMISTIC (calloc-zero).
+	 */
+	enum cds_ft_writer_strategy writer_strategy;
 	/* Allocation arenas. */
 	struct cds_ft_alloc_arena *arena_order[FT_ALLOC_ORDER_MAX + 1];
 	/*
@@ -1486,6 +1494,40 @@ struct cds_ft {
 	 */
 	struct urcu_txn_domain txn_domain;
 
+	/*
+	 * MW COARSE lock-mode FT-wide writer lock (doc/design/
+	 * mw-writer-lock-escalation-model.md §10.5 / §11.3 step 2): ONE lock per
+	 * trie, taken by every mutator on a lock-mode trie; readers never take it
+	 * (classic RCU single-writer).
+	 *
+	 * A PLAIN FIFO-fair mutex (<urcu/fair-mutex.h>), deliberately NOT a
+	 * transacted word driven through the txn engine.  A lock acquire cannot
+	 * ride the MCAS/escalation engine: that engine's progress proof assumes a
+	 * transaction AT THE LANE HEAD WILL SUCCEED (nothing behind it can
+	 * invalidate it), but an acquire cannot succeed until an EXTERNAL event --
+	 * the holder's release.  An escalated acquirer would hold its FIFO turn
+	 * while spinning, and domain->active then funnels every txn on the domain,
+	 * INCLUDING THE HOLDER'S OWN commit and release, into the lane behind its
+	 * own waiter: circular wait, plus a fresh MCAS descriptor allocated per
+	 * retry (unbounded slab growth).  Both were observed.  A mutex is a mutex.
+	 *
+	 * GRACE-PERIOD RULE (the invariant rcu-txn.h:1126 also relies on): a
+	 * holder must NEVER wait on a grace period while holding this lock -- the
+	 * writers parked on it are RCU-online and non-quiescent, so they are
+	 * exactly what prevents that grace period from completing (deadlock).  Ops
+	 * that synchronize_rcu mid-flight drop and retake the lock across the wait
+	 * via ft_writer_lock_gp_wait(); the GP always sits at a seam BETWEEN two
+	 * distinct commits, so releasing there costs no atomicity.
+	 */
+	struct cds_fair_mutex writer_lock;
+	/*
+	 * Hot-path gate: writer_strategy != CDS_FT_WRITER_OPTIMISTIC (a COARSE
+	 * or FINE locking strategy).  Copied from the group at create so the
+	 * writer-scope hook branches on one trie field.  false (calloc-zero) =
+	 * optimistic = the hook is a no-op.
+	 */
+	bool lock_mode;
+
 
 	/*
 	 * Per-trie circular sentinel of the ordinal-cell list.  The list is a
@@ -1557,6 +1599,103 @@ struct cds_ft {
  * the compiler inlines them away.
  */
 
+/*
+ * MW COARSE lock-mode: per-thread FT-wide writer-lock state.
+ *
+ * @ft_wlock_waiter is this thread's FIFO queue node.  It lives in TLS because
+ * cds_fair_mutex_lock() enqueues the node BY ADDRESS and the address must stay
+ * stable from lock to unlock -- which happen in two different functions (the
+ * writer-scope enter and its cleanup).  @ft_wlock_held names the trie whose lock
+ * this thread holds (NULL = none) and doubles as the reentrancy test; a thread
+ * holds AT MOST ONE FT-wide lock, which ft_crosstrie_lock_mode_guard enforces by
+ * rejecting the only ops that could nest two (cross-trie graft / merge /
+ * graft_swap).  @ft_wlock_depth counts reentrant writer scopes on that one trie
+ * (a same-thread nest such as graft_swap -> graft) so the lock is taken once at
+ * the outermost enter and released once at the outermost exit.
+ */
+static __thread struct cds_fair_mutex_node ft_wlock_waiter;
+static __thread struct cds_ft *ft_wlock_held;
+static __thread unsigned long ft_wlock_depth;
+
+/*
+ * Take the FT-wide writer lock at the OUTERMOST writer scope of a lock-mode
+ * trie; reentrant no-op on a nested scope for the same trie.  No-op on an
+ * optimistic trie (the common path -- one predictable branch).
+ */
+static inline
+void ft_writer_lock_scope_enter(struct cds_ft *ft)
+{
+	if (caa_likely(!ft->lock_mode))
+		return;
+	if (ft_wlock_held == ft) {
+		ft_wlock_depth++;		/* reentry on the trie we hold */
+		return;
+	}
+	if (caa_unlikely(ft_wlock_held != NULL)) {
+		/*
+		 * Two FT-wide locks at once: only a cross-trie op could nest
+		 * them, and those are rejected on a lock-mode trie, so reaching
+		 * here means that guard was bypassed.  Fail loudly rather than
+		 * deadlock (thread 1 holds A wants B; thread 2 holds B wants A).
+		 */
+		fprintf(stderr, "cds_ft: thread already holds the FT-wide writer "
+			"lock of cds_ft=%p while entering cds_ft=%p\n",
+			(void *) ft_wlock_held, (void *) ft);
+		fflush(stderr);
+		abort();
+	}
+	cds_fair_mutex_lock(&ft->writer_lock, &ft_wlock_waiter);
+	ft_wlock_held = ft;
+	ft_wlock_depth = 1;
+}
+
+/* Release at the OUTERMOST scope only; a nested exit just unwinds the depth. */
+static inline
+void ft_writer_lock_scope_exit(struct cds_ft *ft)
+{
+	if (caa_likely(!ft->lock_mode))
+		return;
+	if (--ft_wlock_depth != 0)
+		return;			/* nested scope: keep the lock held */
+	ft_wlock_held = NULL;
+	(void) cds_fair_mutex_unlock(&ft->writer_lock, &ft_wlock_waiter);
+}
+
+/*
+ * Wait for a grace period from inside a writer scope, DROPPING the FT-wide lock
+ * across the wait and retaking it after.
+ *
+ * This is mandatory, not an optimization: writers parked on the lock are
+ * RCU-online and non-quiescent, so they are precisely what stops this grace
+ * period from ever completing -- a holder that waits on a GP while holding the
+ * lock deadlocks against its own waiters.  (Same invariant rcu-txn.h:1126 leans
+ * on: "the lane owner never blocks on a GP while holding the mutex.")
+ *
+ * Dropping here costs no atomicity: every mid-op grace period in this codebase
+ * sits at a seam BETWEEN two distinct commits, with the structure already
+ * published-consistent and the subtree being drained already unreachable, so a
+ * peer that mutates while we wait sees a coherent trie.  On an optimistic trie
+ * (or outside any writer scope) this is a plain synchronize_rcu.
+ */
+static inline
+void ft_writer_lock_gp_wait(struct cds_ft *ft)
+{
+	struct cds_ft *held = ft_wlock_held;
+	unsigned long depth = ft_wlock_depth;
+
+	if (held) {
+		ft_wlock_held = NULL;
+		ft_wlock_depth = 0;
+		(void) cds_fair_mutex_unlock(&held->writer_lock, &ft_wlock_waiter);
+	}
+	ft->group->flavor->update_synchronize_rcu();
+	if (held) {
+		cds_fair_mutex_lock(&held->writer_lock, &ft_wlock_waiter);
+		ft_wlock_held = held;
+		ft_wlock_depth = depth;
+	}
+}
+
 struct ft_excl_reader_scope {
 	struct cds_ft *ft;
 #ifdef FEATURE_FT_EXCL_VALIDATE
@@ -1585,6 +1724,12 @@ void ft_excl_writer_enter(struct cds_ft *ft)
 	unsigned long self = (unsigned long) pthread_self();
 	unsigned long prev, nr;
 
+	/*
+	 * MW lock-mode: take the FT-wide writer lock at the outermost scope
+	 * before the discipline checks, so they run single-writer.  No-op on an
+	 * optimistic trie.
+	 */
+	ft_writer_lock_scope_enter(ft);
 	prev = uatomic_cmpxchg(&ft->excl_owner, 0, self);
 	if (prev != 0) {
 		if (prev == self) {
@@ -1655,7 +1800,11 @@ void ft_excl_reader_exit_scope(const struct ft_excl_reader_scope *scope)
 
 #else /* !FEATURE_FT_EXCL_VALIDATE */
 
-static inline void ft_excl_writer_enter(struct cds_ft *ft) { (void) ft; }
+static inline void ft_excl_writer_enter(struct cds_ft *ft)
+{
+	/* MW lock-mode FT-wide lock; no-op on an optimistic trie. */
+	ft_writer_lock_scope_enter(ft);
+}
 static inline void ft_excl_writer_exit(struct cds_ft *ft)  { (void) ft; }
 static inline
 struct ft_excl_reader_scope ft_excl_reader_enter(struct cds_ft *ft)
@@ -1678,11 +1827,18 @@ void ft_excl_writer_scope_exit(struct cds_ft **ft)
 #ifdef FEATURE_FT_VERIFY_AT_MUTATION
 	/*
 	 * Verify before releasing the writer claim so a concurrent
-	 * writer cannot start mutating while we walk the trie.
+	 * writer cannot start mutating while we walk the trie.  Runs under
+	 * the FT-wide lock (released last, below).
 	 */
 	ft_writer_scope_verify(*ft);
 #endif
 	ft_excl_writer_exit(*ft);
+	/*
+	 * MW lock-mode: release the FT-wide writer lock at the outermost
+	 * scope, after the discipline checks / verify walked the trie under
+	 * it.  No-op on an optimistic trie.
+	 */
+	ft_writer_lock_scope_exit(*ft);
 }
 static inline
 void ft_excl_reader_scope_exit(struct ft_excl_reader_scope *scope)
@@ -1710,6 +1866,30 @@ void ft_excl_reader_scope_exit(struct ft_excl_reader_scope *scope)
 		__attribute__((unused,					\
 			cleanup(ft_excl_reader_scope_exit))) =		\
 		ft_excl_reader_enter(ft)
+
+/*
+ * MW lock-mode: hard guard at a CROSS-trie op entry (graft / merge / graft_swap
+ * between DISTINCT tries @a and @b, both taken before their two per-ft writer
+ * scopes).  Such an op is not yet converted to lock-mode: each scope takes that
+ * trie's own FT-wide lock, so two lock-mode tries would take two locks and
+ * could deadlock (thread 1 grafts a->b while thread 2 grafts b->a).  §11.2
+ * mandates a HARD ASSERT on an unconverted op touching a lock-mode trie, never
+ * a silent fallback; cross-trie lock-mode arrives at step 6 (decomposed into
+ * sequential single-domain commits).  A SAME-trie merge (@a == @b) takes one
+ * lock reentrantly and is allowed, so this fires only on distinct tries.
+ */
+static inline
+void ft_crosstrie_lock_mode_guard(const struct cds_ft *a, const struct cds_ft *b)
+{
+	if (caa_unlikely(a != b && (a->lock_mode || b->lock_mode))) {
+		fprintf(stderr,
+			"cds_ft: cross-trie op on a lock-mode trie is not yet "
+			"supported (cds_ft=%p / %p); cross-trie lock-mode lands "
+			"at step 6\n", (const void *) a, (const void *) b);
+		fflush(stderr);
+		abort();
+	}
+}
 
 /*
  * Allocator layout (see fractal-trie-alloc.c for the full picture).
@@ -2222,6 +2402,12 @@ struct cds_ft_group_attr {
 	bool rank_stats_set;
 	enum cds_ft_numa_policy numa_policy;	/* See cds_ft_group_attr_set_numa_policy. */
 	enum cds_ft_optimize optimize;		/* See cds_ft_group_attr_set_optimize. */
+	/*
+	 * Structural-writer concurrency strategy (MW lock-escalation model).
+	 * Default CDS_FT_WRITER_OPTIMISTIC (calloc-zero).  See
+	 * cds_ft_group_attr_set_writer_strategy.
+	 */
+	enum cds_ft_writer_strategy writer_strategy;
 };
 
 struct cds_ft_attr {

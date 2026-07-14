@@ -210,7 +210,7 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 		 * which carry no RCU readers by construction.
 		 */
 		if (!ft->exclusive)
-			ft->group->flavor->update_synchronize_rcu();
+			ft_writer_lock_gp_wait(ft);
 
 		/*
 		 * Drain done: restore @detached's list to circular form (the moved run's
@@ -476,7 +476,7 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 				 * period.
 				 */
 				if (!ft->exclusive)
-					ft->group->flavor->update_synchronize_rcu();
+					ft_writer_lock_gp_wait(ft);
 				/*
 				 * COMMIT (failure-free): the internal root was
 				 * materialized build-invisibly BEFORE the
@@ -540,7 +540,7 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 				 * construction).
 				 */
 				if (!ft->exclusive)
-					ft->group->flavor->update_synchronize_rcu();
+					ft_writer_lock_gp_wait(ft);
 				ft_metadata_set_external_nodes(detached->root, dmeta,
 					(struct cds_ft_node *)
 					ft_node_ptr(child));
