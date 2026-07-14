@@ -83,6 +83,25 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 	 * ft_ord_cell_flip_into (infallible).  On any failure below the caller
 	 * destroys @txn.
 	 */
+	/*
+	 * Resolve the retired compressed node ONCE via the shared read-side
+	 * reanchor (MW convergence): @iter_node_flag is a raw slot value that may
+	 * be SKIP-compressed, and ft_compressed_node_ptr does NOT strip the skip
+	 * high bits -- a raw ft_compressed_node_ptr(iter_node_flag) fed to
+	 * cds_ft_item_to_metadata() faults on the skip_len bits (the ft-remove.h
+	 * detach segv).  @src_cn is the LIVE compressed node the deref sites
+	 * (src_meta, the tombstone freeze, the free) must use; the raw
+	 * @iter_node_flag is kept only for the forward CAS expected-old (it must
+	 * match the SKIP_X stored in the grandparent slot).  A rewind > 0 (a peer
+	 * chain-merge moved the encoded position shallower) means the detach
+	 * premise is stale -- bail before any build so the caller re-descends.
+	 */
+	unsigned int iter_rewind;
+	struct cds_ft_compressed_node *src_cn = ft_compressed_node_ptr(
+		ft_reanchor_flag(ft, iter_node_flag, &iter_rewind));
+
+	if (caa_unlikely(iter_rewind))
+		return -EAGAIN;
 	if (topmost_external_nodes) {
 		/*
 		 * Keep the compressed node -- its path is needed for
@@ -93,12 +112,7 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 		 * (cn->child pointing to an external node) but must
 		 * NOT have metadata->external_nodes set.
 		 */
-		struct cds_ft_compressed_node *cn;
-
-		if (ft_node_skip_compressed(iter_node_flag))
-			cn = ft_skip_to_compressed(ft, iter_node_flag);
-		else
-			cn = ft_compressed_node_ptr(iter_node_flag);
+		struct cds_ft_compressed_node *cn = src_cn;
 		/*
 		 * Fold the external head's back-edge -- cell->parent (list on) or
 		 * its prev (list off) -- INTO @txn so it commits ATOMICALLY with
@@ -198,9 +212,26 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 		if (!fresh)
 			return -ENOMEM;	/* nothing published: caller destroys @txn */
 		src_meta = cds_ft_item_to_metadata(
-			(struct cds_ft_inode *) ft_compressed_node_ptr(
-				iter_node_flag));
-		fresh_meta->parent = src_meta->parent;
+			(struct cds_ft_inode *) src_cn);
+		/*
+		 * Recover the grandparent (parent, slot) as ONE coherent snapshot
+		 * from src_meta, exactly as the chain-compress publishes do -- never
+		 * pair the descent-captured @detach_parent_flag_ptr with a fresh
+		 * src_meta->parent.  A peer that recompacts the grandparent to a larger
+		 * node type (or re-homes it, Phase 4.3) between the descent and here
+		 * leaves the captured slot pointing into the OLD, now-replaced parent
+		 * body while src_meta->parent already names the NEW one; pairing the
+		 * stale slot with the fresh parent indexes the new parent's bitmap out
+		 * of bounds (ft_slot_to_byte OOB assert).  ft_resolve_parent_slot
+		 * computes the slot as parent_body + offset, so it is in-bounds by
+		 * construction; the txn guard + forward CAS + tombstone freeze below
+		 * abort a commit if the grandparent or src_cn raced after this snapshot.
+		 */
+		struct cds_ft_inode_flag *pub_parent;
+		struct cds_ft_inode_flag **pub_slot =
+			ft_resolve_parent_slot(src_meta, ft, &pub_parent);
+
+		fresh_meta->parent = pub_parent;
 		/*
 		 * nr_keys fold (LEAF Increment 2): the fresh internal REPLACES the
 		 * retired compressed node, so it carries the retired node's
@@ -226,12 +257,12 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			 * through the op flip-txn so they flip atomically; lone edge
 			 * stays a single release store.
 			 */
-			/* VALIDATE (§4.B): guard the LIVE grandparent src_meta->parent. */
-			ft_flip_txn_guard_parent(ft, txn, src_meta->parent);
-			_ft_publish_to_parent(ft, src_meta->parent,
-				detach_parent_flag_ptr,
+			/* VALIDATE (§4.B): guard the coherently-resolved grandparent. */
+			ft_flip_txn_guard_parent(ft, txn, pub_parent);
+			_ft_publish_to_parent(ft, pub_parent,
+				pub_slot,
 				ft_node_flag(fresh, 0),
-				iter_node_flag, &rec);
+				*pub_slot, &rec);
 			/*
 			 * Freeze the retired compressed node dead (§4.B freeze-on-
 			 * free): this compressed->fresh-internal recompaction retires
@@ -243,8 +274,7 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			 * list modes), so the freeze-on-free audit never exercises it.
 			 */
 			ft_flip_txn_record_tombstone(txn, cds_ft_item_to_metadata(
-				(struct cds_ft_inode *) ft_compressed_node_ptr(
-					iter_node_flag)));
+				(struct cds_ft_inode *) src_cn));
 			/*
 			 * nr_keys fold (LEAF Increment 2): the removed leaf's -1
 			 * walk from the fresh node's stable parent up to root rides
@@ -255,7 +285,7 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			 */
 			if (count_delta)
 				ft_flip_txn_record_count_parent(ft, txn,
-					src_meta->parent, count_delta);
+					pub_parent, count_delta);
 			if (ft_remove_commit_rec(ft, &rec, NULL, NULL, txn) > 0) {
 				/*
 				 * Peer won: the fresh internal never published;
@@ -267,8 +297,7 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 				return -EAGAIN;
 			}
 		}
-		free_compressed_node(ft,
-			ft_compressed_node_ptr(iter_node_flag));
+		free_compressed_node(ft, src_cn);
 	}
 	return 0;
 }
@@ -941,9 +970,24 @@ int ft_detach_node(struct cds_ft *ft,
 	 *    child)); ft_node_ptr does not strip the skip high bits, so resolve
 	 *    to the plain compressed flag.  No-op for a plain (descent) slot.
 	 */
-	cur = ft_resolve_skip_compressed(ft,
-		ft_resolve_flip_proxy(
-			(struct cds_ft_inode_flag *) rcu_dereference(*detach_parent_flag_ptr)));
+	{
+		/*
+		 * Reanchor a skip-compressed initial slot through the shared
+		 * read-side primitive (MW convergence) rather than the unvalidated
+		 * one-hop ft_resolve_skip_compressed: a peer split can tear the
+		 * one-hop recovery to a node whose ft_meta_nr_child reads a bitmap
+		 * byte (the skip-gated ft-remove.h prune-climb 0-child assert).  @cur
+		 * is only ever dereferenced (never a CAS expected-old), so using the
+		 * reanchored LIVE node is sound; a rewind is tolerated (the climb
+		 * self-corrects / the commit guards it).
+		 */
+		unsigned int cur_rewind;
+
+		cur = ft_reanchor_flag(ft,
+			ft_resolve_flip_proxy(
+				(struct cds_ft_inode_flag *) rcu_dereference(*detach_parent_flag_ptr)),
+			&cur_rewind);
+	}
 	cur_depth = detach_depth - ft_parent_depth_span(cur, *detach_node_flag_ptr);
 
 	/*
@@ -978,7 +1022,18 @@ int ft_detach_node(struct cds_ft *ft,
 			(struct cds_ft_inode_flag *) rcu_dereference(metadata->parent));
 		is_root = (resolved_parent == NULL);
 
-		assert(ft_meta_nr_child(metadata) > 0);
+		/*
+		 * A climbed ancestor with nr_child == 0 means a peer is concurrently
+		 * recompacting / emptying a shared spine node (skip-compression drives
+		 * this churn, hence skip-gated): our prune plan is racing that peer.
+		 * Bail before any build and re-descend against the settled tree,
+		 * exactly as the flip-proxy holder bail below.  Under mutual exclusion
+		 * this is impossible -- a climbed ancestor always still holds the child
+		 * we came up from (nr_child >= 1) -- so the pre-MW invariant assert
+		 * becomes an MW retry point, not a fatal abort.
+		 */
+		if (caa_unlikely(ft_meta_nr_child(metadata) == 0))
+			return -EAGAIN;
 		if (!prev_external_nodes_found && (ft_meta_nr_child(metadata) == 1 && !metadata->external_nodes && !is_root)) {
 			nr_clear++;
 		}
