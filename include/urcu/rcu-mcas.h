@@ -391,13 +391,11 @@ int urcu_mcas_plant(struct urcu_mcas_record *r)
 }
 
 /*
- * Install phase: plant transaction @t's records in slot-address order.  Each
- * install is a bare value-CAS (urcu_mcas_plant) -- the owner is the sole driver
- * -- so a foreign proxy met in a slot is a spinlatch it waits out (bounded) or
- * escalates past, never one it drives.  A conflict decides FAILED inline; the
- * SUCCEEDED release is taken by the caller (urcu_mcas_commit), so that the
- * all-planted-not-yet-decided window stays open for the pre-commit callback --
- * see urcu_mcas_drive_install_depth()'s tail.  The owner's own settle
+ * Install phase: drive transaction @t to a terminal status (SUCCEEDED or
+ * FAILED) by installing its records in slot-address order.  Each install is a
+ * bare value-CAS (urcu_mcas_plant) -- the owner is the sole driver -- so a
+ * foreign proxy met in a slot is a spinlatch it waits out (bounded) or
+ * escalates past, never one it drives.  The owner's own settle
  * (urcu_mcas_settle) converts its planted proxies to plain values; until then a
  * terminal proxy is resolved by readers and contenders through the status word
  * rather than waited on.
@@ -468,11 +466,6 @@ void urcu_mcas_decide(struct urcu_mcas *t, unsigned long to)
  * @fail is 0 iff every CAS won, so the terminal status is SUCCEEDED + (fail !=
  * 0).  RELEASE so the planted proxies publish before a reader can observe the
  * status.
- *
- * Fusing the plant and the decision this way leaves NO window between "all
- * planted" and "released", which is exactly the window a pre-commit callback
- * needs -- so a transaction carrying one is dispatched away from this path (to
- * the general install below), and this path never has a callback to run.
  */
 static inline
 unsigned int urcu_mcas_drive_install_age0_flat(struct urcu_mcas *t)
@@ -551,23 +544,17 @@ void urcu_mcas_drive_install_depth(struct urcu_mcas *t, unsigned int *plantedp)
 					 * records need no slot-address sort to
 					 * stay deadlock-free.
 					 *
-					 * This is what keeps this blocking path
+					 * Unreachable from commit(), which
+					 * dispatches retry == 0 to the flat
+					 * install instead -- but it MUST stay.
+					 * It is what keeps this blocking path
 					 * safe for an UNSORTED descriptor: the
 					 * deadlock-freedom of the bounded wait
 					 * below rests on records being
 					 * installed in slot-address order, and
 					 * only age 1+ is sorted.  Anything that
-					 * routes an age-0 descriptor here has
-					 * to fail fast rather than wait -- and
-					 * commit() does route one: a
-					 * transaction carrying a pre-commit
-					 * callback comes here at ANY age,
-					 * because the flat install fuses its
-					 * decision into the plant and leaves no
-					 * window to run the callback in.  Such
-					 * a descriptor is unsorted at age 0
-					 * exactly like any other, and fails
-					 * fast here exactly like any other.
+					 * ever routes an age-0 descriptor here
+					 * has to fail fast rather than wait.
 					 */
 					urcu_mcas_decide(t, URCU_MCAS_FAILED);
 					return;
@@ -633,30 +620,14 @@ void urcu_mcas_drive_install_depth(struct urcu_mcas *t, unsigned int *plantedp)
 		 */
 		*plantedp = i + 1;
 	}
-	/*
-	 * Every record is planted and nothing decided us FAILED, so @t is
-	 * SUCCEEDED-BOUND -- and the terminal RELEASE is deliberately NOT
-	 * written here.  urcu_mcas_commit() owns it, because the gap between
-	 * "all planted" and "status released" is the one owner-exclusive
-	 * PRE-COMMIT window in the protocol: every slot @t stores or guards
-	 * holds @t's proxy, so every peer that stores or guards one of them has
-	 * already lost its plant CAS and is bound to abort, while nothing @t
-	 * writes is visible yet.  A consumer's callback runs there (see
-	 * urcu_mcas_commit's @precommit), and its plain stores publish on the
-	 * very RELEASE that publishes the write set.
-	 *
-	 * So this returns with @t UNDECIDED iff *plantedp == t->nr; every
-	 * failure path above decided FAILED inline (the callback is a
-	 * success-only hook, so those releases can stay where they are).
-	 */
+	/* every record installed -> commit */
+	urcu_mcas_decide(t, URCU_MCAS_SUCCEEDED);
 }
 
 /*
- * Owner entry point: plant @t's records.  Returns the number this drive planted
- * -- t->nr iff it planted them all, in which case @t is left UNDECIDED for the
- * caller to release SUCCEEDED (see the tail of drive_install_depth); a smaller
- * count means a conflict already decided @t FAILED.  The count is what the
- * owner's settle converts (see urcu_mcas_settle()).
+ * Owner/reader entry point: drive @t to a terminal status.  Returns the number
+ * of records this drive planted, for the owner's settle (see
+ * urcu_mcas_settle()); readers ignore it.
  */
 static inline
 unsigned int urcu_mcas_drive_install(struct urcu_mcas *t)
@@ -1111,49 +1082,13 @@ void urcu_mcas_sort(struct urcu_mcas *t)
  * multi-edge op keeps proxied.  (This lifts a lockout; like any transaction
  * here it remains bounded-blocking, not wait-free.)
  *
- * @precommit (NULL for none) is a callback run in @t's PRE-COMMIT WINDOW: after
- * the install has planted EVERY record and before the SUCCEEDED release.  It
- * runs on the owner thread, exactly once, and only on the success path -- a
- * plant conflict decides FAILED inside the install and never reaches it.  What
- * the window gives the callback:
- *
- *   - FROZEN SLOTS.  Every slot @t stores or guards holds @t's proxy, so any
- *     peer that stores or guards one of them has already lost its plant CAS
- *     against that proxy and is bound to abort.  The callback may treat those
- *     slots as stable -- but it must read them with urcu_mcas_read(), never a
- *     plain load: a losing peer's proxy can still be parked in a slot the
- *     callback reaches through them, and only urcu_mcas_read() resolves it to
- *     the value it will settle back to.
- *   - PUBLICATION.  The callback's plain stores are published by the subsequent
- *     terminal-status RELEASE, together with the write set; it owes no release
- *     fence of its own.  It therefore has somewhere to publish TO only if @t
- *     actually has records -- which is why a callback on an empty write set is a
- *     caller error (asserted below), not a no-op.
- *   - The price: contenders and readers that meet @t's still-UNDECIDED proxies
- *     wait on the status word for the callback's duration, so it must be
- *     wait-free and O(write-set).
- *
- * The window is scoped to @t's OWN slots.  A callback that reads or copies some
- * memory M safely needs, additionally, that every writer able to mutate M
- * serializes on a slot @t plants (in practice: M is reachable only through such
- * a slot) -- so that once @t is planted, every such writer has lost and is
- * aborting.  That is a property of the consumer's own guarding discipline; the
- * engine cannot check it.
- *
- * A transaction carrying a callback skips both shortcuts that have no window to
- * run it in: the single-edge bare CAS (which IS its own commit point) and the
- * age-0 flat install (which fuses the decision into the plant).  It takes the
- * general install at every age, and pays a descriptor plus a grace period even
- * for one edge.
- *
  * Call within an RCU read-side section (descriptor existence for concurrent
  * readers).
  */
 static inline
-bool urcu_mcas_commit_precommit(struct urcu_mcas *t,
+bool urcu_mcas_commit(struct urcu_mcas *t,
 		void (*call_rcu_fn)(struct rcu_head *,
-			void (*)(struct rcu_head *)),
-		void (*precommit)(void *arg), void *precommit_arg)
+			void (*)(struct rcu_head *)))
 {
 	bool committed;
 	unsigned int i, planted;
@@ -1171,31 +1106,16 @@ bool urcu_mcas_commit_precommit(struct urcu_mcas *t,
 		return false;
 	}
 	if (t->nr == 0) {
-		/*
-		 * Nothing to plant, so there is no pre-commit window and no
-		 * RELEASE to publish a callback's stores: a callback here would
-		 * have nowhere to write TO.  A consumer that registered one on
-		 * a transaction that commits nothing has lost its write set
-		 * somewhere upstream -- trap it rather than silently skip the
-		 * work it meant to do.
-		 */
-		urcu_assert_debug(precommit == NULL);
 		urcu_mcas_destroy(t);
 		return true;
 	}
-	if (t->nr == 1 && t->retry < URCU_MCAS_ESCALATE && precommit == NULL) {
+	if (t->nr == 1 && t->retry < URCU_MCAS_ESCALATE) {
 		/*
 		 * Single edge, not yet starved: the CAS itself is the atomic
 		 * commit.  Fast and -- while the slot is plain -- fair; once it
 		 * has retried enough to suspect a proxy is locking it out, the
 		 * escalation below makes it a real, visible transaction
 		 * instead.
-		 *
-		 * A pre-commit callback rules this path out at any age: the CAS
-		 * is simultaneously the plant and the publish, so it has no
-		 * window between them -- nor any UNDECIDED proxy to freeze the
-		 * slot with.  Such a transaction takes the descriptor path
-		 * below, paying a proxy and a grace period for its one edge.
 		 */
 		struct urcu_mcas_record *r = &t->recs[0];
 
@@ -1257,52 +1177,15 @@ bool urcu_mcas_commit_precommit(struct urcu_mcas *t,
 	 * works exactly as for the age-1 sorted install.  Age 1+ is the sorted,
 	 * blocking install (it waits a bounded spin on a foreign proxy instead
 	 * of failing fast); both plant with a bare CAS.
-	 *
-	 * A pre-commit callback takes the general install at EVERY age: the
-	 * flat one's decision is fused into its plant loop (an arithmetic
-	 * RELEASE), so it has no all-planted-not-yet-decided window to run a
-	 * callback in.  At age 0 the general install is therefore reached with
-	 * an UNSORTED descriptor -- which is safe because at age 0 it never
-	 * WAITS on a foreign proxy (it fails fast, as the flat install would
-	 * have), and the sort exists only to make waiting deadlock-free.
 	 */
-	if (t->retry == 0 && precommit == NULL) {
+	if (t->retry == 0)
 		planted = urcu_mcas_drive_install_age0_flat(t);
-	} else {
+	else
 		planted = urcu_mcas_drive_install(t);
-		/*
-		 * The general install plants but does not release SUCCEEDED:
-		 * @t is UNDECIDED here iff it planted every record (a conflict
-		 * decided FAILED inline and planted fewer).  So this is the
-		 * pre-commit window -- write set frozen in the slots, outcome
-		 * bound, nothing published -- and the decide below is the
-		 * publish point that closes it, ordering the callback's plain
-		 * stores with the write set's under one RELEASE.
-		 */
-		if (planted == t->nr) {
-			if (caa_unlikely(precommit != NULL))
-				precommit(precommit_arg);
-			urcu_mcas_decide(t, URCU_MCAS_SUCCEEDED);
-		}
-	}
 	urcu_mcas_settle(t, planted);		/* owner-only: make our own slots plain */
 	committed = urcu_mcas_status(t) == URCU_MCAS_SUCCEEDED;
 	call_rcu_fn(&t->rcu_head, urcu_mcas_free_rcu);
 	return committed;
-}
-
-/*
- * Commit @t with no pre-commit callback: the ordinary entry point.  See
- * urcu_mcas_commit_precommit() for the contract; passing no callback restores
- * both shortcuts (the single-edge bare CAS and the age-0 flat install), so this
- * is the same code the engine always ran.
- */
-static inline
-bool urcu_mcas_commit(struct urcu_mcas *t,
-		void (*call_rcu_fn)(struct rcu_head *,
-			void (*)(struct rcu_head *)))
-{
-	return urcu_mcas_commit_precommit(t, call_rcu_fn, NULL, NULL);
 }
 
 #ifdef __cplusplus

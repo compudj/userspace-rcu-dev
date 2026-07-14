@@ -133,16 +133,6 @@
  * park a proxy at plant, so a guard also serializes against a concurrent writer
  * of the guarded word.
  *
- * Pre-commit callback.  Because the owner is the sole driver of its own
- * install, there is one phase that is both owner-exclusive and unpublished:
- * every record planted, outcome SUCCEEDED-bound, terminal status not yet
- * released.  urcu_txn_on_precommit() runs a callback there.  Every slot the
- * transaction stores or guards is frozen (a peer touching one has already lost
- * its plant CAS), and the callback's plain stores publish on the same RELEASE
- * as the write set -- so a mutator can, for instance, fill in a fresh node that
- * one of its own edges is about to make reachable, as ordinary owner code
- * inside the commit rather than as an install-time side effect.
- *
  * Escalation fallback.  The optimistic retry above is bounded-blocking but not
  * starvation-free: a large or repeatedly-bypassed transaction can be defeated
  * by a stream of smaller ones (the single-edge fast path and the read->install
@@ -667,19 +657,6 @@ struct urcu_mcas_txn {
 					 * Bloom FP) and must abort to re-run at
 					 * age 1+; reset per attempt.
 					 */
-	void (*precommit)(void *arg);	/*
-					 * Callback for THIS attempt's pre-commit
-					 * window (all records planted, outcome
-					 * SUCCEEDED-bound, terminal status not
-					 * yet released), or NULL.  Set with
-					 * urcu_txn_on_precommit(); cleared per
-					 * attempt by begin(), so a retry that
-					 * still wants one re-registers it --
-					 * which is what a consumer whose @arg
-					 * points at nodes it re-allocates per
-					 * attempt has to do anyway.
-					 */
-	void *precommit_arg;		/* Opaque argument for @precommit. */
 #ifdef URCU_TXN_ESCALATION_STATS
 	/*
 	 * Would-this-attempt-escalate instrumentation for the age-0/age-1 study
@@ -896,14 +873,6 @@ void urcu_txn_init_flavor(struct urcu_mcas_txn *txn,
 	 * init would tax every disjoint handle for a filter it never reads.
 	 */
 	txn->esc_pending = 0;
-	txn->precommit = NULL;		/*
-					 * Also cleared per attempt by begin();
-					 * cleared HERE as well for the
-					 * begin-less driving mode (see
-					 * urcu_txn_read_lock), whose only reset
-					 * point this is.
-					 */
-	txn->precommit_arg = NULL;
 #ifdef URCU_TXN_ESCALATION_STATS
 	txn->esc_raw = txn->esc_waw = txn->esc_bloom = 0;
 #endif
@@ -1283,18 +1252,6 @@ void urcu_txn_begin(struct urcu_mcas_txn *txn)
 	 * handle free of the filter entirely.
 	 */
 	txn->esc_pending = 0;		/* fresh attempt: no coincidence seen yet */
-	/*
-	 * The pre-commit callback is per ATTEMPT, not per transaction.  Its
-	 * @arg is the attempt's own state -- for the motivating consumer, the
-	 * fresh node whose slots the callback fills in, which an aborted
-	 * attempt frees and the next one re-allocates -- so carrying a
-	 * registration across a retry would fire it on freed memory.  Dropping
-	 * it here makes the retry re-register (or not run the callback at all);
-	 * silently running it against the previous attempt's @arg is not an
-	 * option.
-	 */
-	txn->precommit = NULL;
-	txn->precommit_arg = NULL;
 #ifdef URCU_TXN_ESCALATION_STATS
 	txn->esc_raw = txn->esc_waw = txn->esc_bloom = 0;
 #endif
@@ -1676,9 +1633,8 @@ void *urcu_txn_load_validate_optimistic(struct urcu_mcas_txn *txn, void **slot,
  * Record a pure guard {@expected -> @expected} on @slot: the commit succeeds
  * only if @slot still holds @expected at the install point, and aborts
  * otherwise.  Like every record it PARKS A PROXY on @slot at plant time, so it
- * serializes against a concurrent writer of that word -- whoever plants first
- * wins and the loser's plant CAS fails -- and the guarded slot is frozen for
- * the duration of the pre-commit window (see urcu_txn_on_precommit).
+ * serializes against a concurrent writer of that word: whoever plants first
+ * wins and the loser's plant CAS fails.
  *
  * The difference from urcu_txn_load_validate() is where the expected value
  * comes from: that one guards the value it READ, this one guards a value the
@@ -1725,61 +1681,6 @@ int urcu_txn_store(struct urcu_mcas_txn *txn, void **slot,
 }
 
 /*
- * Register @fn to run in THIS ATTEMPT's pre-commit window: after the commit has
- * planted every record of the write set (every slot this transaction stores or
- * guards holds its proxy) and the outcome is SUCCEEDED-bound, but BEFORE the
- * terminal status is released.  It runs on the owner thread, exactly once, and
- * only if the commit succeeds -- a plant conflict decides FAILED without ever
- * reaching it, as does an attempt discarded before install (a poisoned write
- * set, an age-0 same-slot coincidence, an allocation failure).
- *
- * The point of the window is that it is the one phase that is BOTH
- * owner-exclusive AND unpublished, so a consumer can do plain, un-synchronized
- * work on state its own records have already frozen, and have that work
- * published atomically with them:
- *
- *   - Every slot this transaction stores or guards holds its proxy, so every
- *     peer that stores or guards one of them has already lost its plant CAS and
- *     is bound to abort.  Such a slot is stable for the callback's duration.
- *   - The callback's plain stores are published by the terminal-status RELEASE
- *     that ends the window, together with the write set -- one publish, no
- *     fence of the callback's own.  The canonical use is filling in memory that
- *     this transaction's records are about to make reachable (a fresh node
- *     published by one of its edges), which is the build-then-publish rule of
- *     any RCU mutation, moved inside the commit.
- *   - The engine's frozen-slot guarantee covers THIS transaction's slots and
- *     nothing else.  A callback that reads memory M is safe only if every writer
- *     that could mutate M serializes on a slot this transaction plants -- in
- *     practice, M reachable only through such a slot.  That is the consumer's
- *     own guarding discipline; the engine cannot check it.  Read such slots with
- *     urcu_txn_load()/urcu_mcas_read(), never a plain load: a losing peer's
- *     proxy may still be parked there, and only the resolver turns it back into
- *     the value it will settle to.
- *   - Contenders and readers that meet this transaction's undecided proxies wait
- *     on the status word while the callback runs, so it must be wait-free and
- *     O(write-set) -- it is inside everyone else's critical path.
- *
- * The registration is per ATTEMPT (begin() drops it), because the state a
- * callback works on is the attempt's own.  A retry that still wants the callback
- * re-registers it.  Registration order does not matter: call it anywhere between
- * begin() and commit().
- *
- * Cost: a transaction carrying a callback gives up the two commit shortcuts that
- * have no window to run it in -- the single-edge bare CAS and the age-0 flat
- * install -- so even a one-edge commit pays a descriptor and a grace period.
- * The write set must not be empty: with no record there is no frozen slot and no
- * terminal RELEASE to publish the callback's stores, so registering one on a
- * transaction that commits nothing is a caller error (debug-asserted at commit).
- */
-static inline
-void urcu_txn_on_precommit(struct urcu_mcas_txn *txn,
-		void (*fn)(void *arg), void *arg)
-{
-	txn->precommit = fn;
-	txn->precommit_arg = arg;
-}
-
-/*
  * Commit the buffered write-set through the MCAS, deferring reclaim through
  * @call_rcu_fn.  Returns enum urcu_txn_status: OK on commit, ABORT on a
  * contention abort (the caller re-runs begin..commit; the retry count is
@@ -1803,19 +1704,8 @@ enum urcu_txn_status urcu_txn_commit_flavor(struct urcu_mcas_txn *txn,
 		txn->mcas = NULL;
 		return URCU_TXN_STATUS_MEMORY_ERROR;
 	}
-	if (!m) {
-		/*
-		 * Empty write set: trivially committed.  A pre-commit callback
-		 * registered on such a transaction never runs -- there is no
-		 * frozen slot for it to work behind and no terminal RELEASE to
-		 * publish its stores -- so it is a caller error, not a no-op
-		 * (see urcu_txn_on_precommit).  The engine's own assert only
-		 * covers a descriptor that exists; this one covers the
-		 * attempt that never stored at all.
-		 */
-		urcu_assert_debug(txn->precommit == NULL);
-		return URCU_TXN_STATUS_OK;
-	}
+	if (!m)
+		return URCU_TXN_STATUS_OK;	/* empty write-set: trivially committed */
 	if (caa_unlikely(txn->esc_pending)) {
 		/*
 		 * Age-0 optimistic attempt saw a same-slot coincidence: its
@@ -1848,14 +1738,7 @@ enum urcu_txn_status urcu_txn_commit_flavor(struct urcu_mcas_txn *txn,
 	 */
 	urcu_txn__learn_cost(txn);
 	txn->mcas = NULL;		/* mcas_commit consumes the descriptor */
-	/*
-	 * The pre-commit callback (NULL for almost every transaction) rides
-	 * into the engine here rather than living in the descriptor: the
-	 * descriptor's size is baked into the library's slab block classes, and
-	 * this is per-attempt state, which is what the on-stack handle is for.
-	 */
-	if (urcu_mcas_commit_precommit(m, call_rcu_fn, txn->precommit,
-			txn->precommit_arg))
+	if (urcu_mcas_commit(m, call_rcu_fn))
 		return URCU_TXN_STATUS_OK;
 	txn->retry++;			/* aged for the next attempt */
 	txn->retrying = 1;		/* keep the turn across the retry */
