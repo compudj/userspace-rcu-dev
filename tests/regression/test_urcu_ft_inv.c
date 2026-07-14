@@ -441,6 +441,22 @@ static unsigned long long elapsed_ms(struct timespec *start)
  */
 static atomic_ulong violation_count;
 
+/*
+ * Record an LTTng flight-recorder snapshot, PID-tagging the snapshot name so a
+ * concurrent soak (many processes) can correlate each snapshot to the process
+ * that dumped its core.  Called from the violation reporters and the
+ * fatal-signal handlers below: system()/snprintf() are not async-signal-safe,
+ * but this is accepted crash-time scaffolding (getpid() is async-signal-safe).
+ */
+static void ft_snapshot_record(void)
+{
+	char cmd[160];
+
+	(void) snprintf(cmd, sizeof(cmd),
+		"lttng snapshot record -n pid%ld 1>&2", (long) getpid());
+	(void) system(cmd);
+}
+
 static void report_violation(const char *test, const char *fmt, ...)
 	__attribute__((format(printf, 2, 3)));
 
@@ -462,7 +478,7 @@ static void report_violation(const char *test, const char *fmt, ...)
 	 */
 	if (getenv("FT_INV_ABORT_ON_VIOLATION")) {
 		/* XXX temporary: capture the flight-recorder ring before dying. */
-		(void) system("lttng snapshot record 1>&2");
+		ft_snapshot_record();
 		abort();
 	}
 }
@@ -720,7 +736,7 @@ static void mw_violation_snapshot(void)
 {
 	if (!getenv("FT_INV_ABORT_ON_VIOLATION"))
 		return;
-	(void) system("lttng snapshot record 1>&2");
+	ft_snapshot_record();
 	abort();
 }
 
@@ -746,7 +762,7 @@ static void mw_fatal_action(int sig, siginfo_t *si, void *uctx)
 		fprintf(stderr, "FATAL sig %d addr %p ip %p\n", sig,
 			si ? si->si_addr : NULL, ip);
 	}
-	(void) system("lttng snapshot record 1>&2");
+	ft_snapshot_record();
 	signal(sig, SIG_DFL);
 	raise(sig);
 }
@@ -10316,7 +10332,7 @@ static void ft_segv_snapshot_handler(int sig, siginfo_t *si, void *uc)
 		ssize_t w = write(STDERR_FILENO, buf, (size_t) n);
 		(void) w;
 	}
-	(void) system("lttng snapshot record 1>&2");
+	ft_snapshot_record();
 	signal(sig, SIG_DFL);
 	raise(sig);
 }
