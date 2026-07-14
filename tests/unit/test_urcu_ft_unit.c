@@ -49,9 +49,9 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 316
+#define NR_TESTS 317
 #else
-#define NR_TESTS 275
+#define NR_TESTS 276
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -8060,6 +8060,61 @@ out:
 	rcu_read_unlock();
 	drain_trie(ft);
 	rcu_barrier();
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
+ * Same-trie rekey is REJECTED on a trie with speculative leaf keys active: the
+ * move re-parents each leaf under the new prefix but cannot rewrite its
+ * app-owned stored key, so every moved leaf would be mis-stamped for its new
+ * position (ft_verify_speculative_key / ft-merge.h).  The gate is an
+ * argument/attribute check that fires before any descent, so an EMPTY trie
+ * exercises it: the same ft_rekey succeeds as a no-op on a non-speculative trie
+ * (see test_merge_rekey_same_trie) but must return INVALID_ARGUMENT here.  Only
+ * same-trie is gated -- a cross-trie rekey re-stamps through the EAGER detach
+ * result.
+ */
+static int test_merge_rekey_same_trie_speculative_rejected(void)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *ft = NULL;
+	enum cds_ft_status s;
+	int ret = -1;
+
+	if (cds_ft_group_attr_create(&attr) < 0)
+		return -1;
+	cds_ft_group_attr_set_key_len(attr, CDS_FT_LEN_VARIABLE);
+	/* In-leaf key storage => speculative_key_offset_active on the trie. */
+	if (cds_ft_group_attr_set_speculative_key_offset(attr,
+			offsetof(struct ft_test_node, key)) != CDS_FT_STATUS_OK) {
+		cds_ft_group_attr_destroy(attr);
+		return -1;
+	}
+	if (cds_ft_group_create(attr, &group) < 0) {
+		cds_ft_group_attr_destroy(attr);
+		return -1;
+	}
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &ft) < 0) {
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	rcu_read_lock();
+	/* Disjoint keys: a non-speculative trie would no-op; the gate rejects. */
+	s = ft_rekey(ft, "az", "ax");
+	rcu_read_unlock();
+	if (s != CDS_FT_STATUS_INVALID_ARGUMENT_ERROR) {
+		fprintf(stderr,
+			"rekey: same-trie move on a speculative trie not rejected (%s)\n",
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+	ret = 0;
+out:
 	cds_ft_destroy(ft);
 	cds_ft_group_destroy(group);
 	return ret;
@@ -25424,6 +25479,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_merge_rerooted_nosplit_ordered_atnode);
 	RUN_TEST(test_merge_rerooted_nosplit_ordered_branch);
 	RUN_TEST(test_merge_rekey_same_trie);
+	RUN_TEST(test_merge_rekey_same_trie_speculative_rejected);
 	RUN_TEST(test_merge_rekey_same_trie_ordered);
 	RUN_TEST(test_merge_rekey_same_trie_listoff_collision);
 	RUN_TEST(test_nonidentity_bulk_ops);

@@ -1914,14 +1914,26 @@ enum cds_ft_status cds_ft_merge(struct cds_ft *dst_ft,
  * nor yet at @dst_key) -- it never observes a corrupt or out-of-namespace
  * key, and the per-key dst publish is itself atomic.  It never leaks.
  *
+ * A same-trie rekey is REJECTED with CDS_FT_STATUS_INVALID_ARGUMENT_ERROR
+ * when @dst_ft reads leaf-stored keys for result capture (created without
+ * cds_ft_attr_set_speculative_keys(attr, false) in a speculative-key group):
+ * the move re-parents each leaf under @dst_key but cannot rewrite its
+ * app-owned stored key, leaving every moved leaf mis-stamped for its new
+ * position.  A cross-trie rekey has a staging seam for the app to re-stamp
+ * (the detached source is returned EAGER); a same-trie move does not, so it
+ * is refused rather than silently corrupting speculative lookups.  Move
+ * within an EAGER trie (speculative keys disabled), which reconstructs each
+ * key from structure and never reads the stored field.
+ *
  * Returns the same statuses as cds_ft_merge.  In addition,
  * CDS_FT_STATUS_INVALID_ARGUMENT_ERROR is returned if either
  * @src_key_len or @dst_key_len exceeds the group's maximum key
  * length; if -- for a fixed-length key group -- @dst_key_len !=
  * @src_key_len (a fixed-length group accepts only keys of its fixed
  * length, so the moved keys keep that length only when the source and
- * destination prefixes are equally long); or if @src_ft == @dst_ft and
- * the two keys overlap (one is a prefix of the other).
+ * destination prefixes are equally long); if @src_ft == @dst_ft and
+ * the two keys overlap (one is a prefix of the other); or if
+ * @src_ft == @dst_ft and @dst_ft has speculative leaf keys active.
  */
 enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
 		const uint8_t *dst_key, size_t dst_key_len,

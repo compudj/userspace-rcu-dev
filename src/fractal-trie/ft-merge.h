@@ -2167,6 +2167,28 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
 	}
 	/*
+	 * Same-trie rekey (src_ft == dst_ft) is rejected when this trie reads
+	 * leaf-stored keys for result capture (speculative_key_offset_active):
+	 * the move re-parents each leaf under @dst_key WITHOUT rewriting its
+	 * app-owned stored key -- the library never writes that field -- so every
+	 * moved leaf would carry a key that no longer matches its structural
+	 * position, and a speculative lookup would then return the wrong key
+	 * (ft_verify_speculative_key catches this only under
+	 * FEATURE_FT_VERIFY_AT_MUTATION).  A CROSS-trie rekey routes the moved
+	 * leaves through a detach result that is forced EAGER (ft-detach.h), so
+	 * the app can re-stamp each leaf with its destination key before the data
+	 * is looked up speculatively; a same-trie move has no such staging seam --
+	 * one trie carries one speculative mode, and the moved leaves stay
+	 * reader-visible throughout -- so it cannot be made coherent and is
+	 * refused here rather than silently mis-stamped.  EAGER tries reconstruct
+	 * the key from structure and never read the stored field, so they are
+	 * unaffected.
+	 */
+	if (src_ft == dst_ft && dst_ft->speculative_key_offset_active) {
+		FT_TP(merge_exit, (int) CDS_FT_STATUS_INVALID_ARGUMENT_ERROR);
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	}
+	/*
 	 * Combined-length overflow validation (mirrors cds_ft_graft): a moved
 	 * key K becomes dst_key || (K - src_key prefix), of length
 	 * dst_key_len + len(K) - src_key_len.  Bound len(K) by the source's
