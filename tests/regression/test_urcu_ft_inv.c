@@ -66,7 +66,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS	60
+#define NR_TESTS	61
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -409,6 +409,41 @@ static struct cds_ft *create_fixed_coarse_lock_ft(size_t klen,
 		abort();
 	if (cds_ft_group_attr_set_writer_strategy(attr,
 			CDS_FT_WRITER_LOCK_COARSE) < 0)
+		abort();
+	if (cds_ft_group_create(attr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &ft) < 0)
+		abort();
+	*group_out = group;
+	return ft;
+}
+
+/*
+ * Fine-grained MW lock-mode trie (CDS_FT_WRITER_LOCK_FINE): the op-domains
+ * converted so far (§11.3 step 3: recompact) acquire their per-node lock-set
+ * {C, P} (+ {GP}) instead of §4.B-guarding the parent, and release the surviving
+ * members through the {COPYING|s -> s} terminal at the commit.  Until every
+ * domain is converted the trie ALSO takes the FT-wide writer lock, so the
+ * per-node locks are exercised under serialization rather than contended (the
+ * §11.1 coexistence hazard forbids racing a converted op with an unconverted
+ * one).  rank_stats OFF: the §9 lock-sets are derived for the default build --
+ * a rank_stats-ON trie is the coarse single-lock target instead (§10.5).
+ * Used by inv_concurrent_writers_fine_lock.
+ */
+static struct cds_ft *create_fixed_fine_lock_ft(size_t klen,
+		struct cds_ft_group **group_out)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+
+	if (cds_ft_group_attr_create(&attr) < 0)
+		abort();
+	if (cds_ft_group_attr_set_key_len(attr, klen) < 0)
+		abort();
+	if (cds_ft_group_attr_set_writer_strategy(attr,
+			CDS_FT_WRITER_LOCK_FINE) < 0)
 		abort();
 	if (cds_ft_group_create(attr, &group) < 0)
 		abort();
@@ -1239,6 +1274,7 @@ static int inv_concurrent_writers_shared(void)
 }
 
 #define MW_COARSE_NR_WRITERS	16
+#define MW_FINE_NR_WRITERS	16
 
 /*
  * Concurrent-writer soak for CDS_FT_WRITER_LOCK_COARSE (step 2 acceptance,
@@ -1341,6 +1377,120 @@ static int inv_concurrent_writers_coarse_lock(void)
 
 	fprintf(stderr, "# inv_concurrent_writers_coarse_lock: %d writers, %lu ops, "
 		"%lu live keys\n", MW_COARSE_NR_WRITERS, total_ops, live);
+
+	free(w);
+	if (drain_and_destroy(ft, group) < 0)
+		ret = -1;
+	if (leak_check() < 0)
+		ret = -1;
+	return ret;
+}
+
+/*
+ * INVARIANT (MW, §11.3 step 3): a CDS_FT_WRITER_LOCK_FINE trie loses no key.
+ *
+ * Same disjoint-range lost-key oracle as inv_concurrent_writers_coarse_lock, on
+ * a trie whose recompacts acquire the per-node lock-set {C, P} (+ {GP} when P is
+ * compressed) and resolve P/GP through the RELEASE terminal {COPYING|s -> s}.
+ * 16 writers insert/remove over disjoint key ranges; every writer's shadow set
+ * must match the final trie exactly.
+ *
+ * What this is actually gating, given the FT-wide lock still serializes writers
+ * here (§11.1): that the release terminal COMMITS -- that a locked-but-surviving
+ * node comes out of the commit LIVE and UNLOCKED.  A release that failed to
+ * commit, or a bail path that forgot to unlock a member, leaves FT_STATE_COPYING
+ * set at rest -- which wedges every later publish into that node, and which
+ * cds_ft_verify reports as a leaked copy fence.  Both endpoints are checked
+ * below, and 100k+ recompacts run through them.
+ */
+static int inv_concurrent_writers_fine_lock(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	struct mw_writer_arg *w;
+	pthread_t writers[MW_FINE_NR_WRITERS];
+	struct timespec t0;
+	unsigned long total_ops = 0, live = 0;
+	int i, ret = 0;
+
+	if (!getenv("FT_INV_MW")) {
+		fprintf(stderr, "# inv_concurrent_writers_fine_lock: skipped "
+			"(set FT_INV_MW=1 to run the fine lock-mode soak)\n");
+		return 0;
+	}
+	mw_install_fatal_handler();
+	ft = create_fixed_fine_lock_ft(8, &group);
+	/* Concurrent mode: deferred reclaim keeps a peer's touched nodes live. */
+	cds_ft_make_concurrent(ft);
+
+	leak_reset();
+
+	w = (struct mw_writer_arg *) calloc(MW_FINE_NR_WRITERS, sizeof(*w));
+	if (!w)
+		abort();
+	for (i = 0; i < MW_FINE_NR_WRITERS; i++) {
+		w[i].ft = ft;
+		w[i].base = (uint64_t) i * MW_RANGE;
+	}
+
+	test_go = 0;
+	test_stop = 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < MW_FINE_NR_WRITERS; i++)
+		pthread_create(&writers[i], NULL, mw_writer, &w[i]);
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	test_go = 1;
+
+	rcu_thread_offline();
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
+		usleep(1000);
+	test_stop = 1;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < MW_FINE_NR_WRITERS; i++)
+		pthread_join(writers[i], NULL);
+	rcu_thread_online();
+
+	/* Quiescent: verify the final trie against every writer's shadow. */
+	synchronize_rcu();
+	rcu_read_lock();
+	for (i = 0; i < MW_FINE_NR_WRITERS; i++) {
+		unsigned int off;
+
+		total_ops += w[i].ops;
+		if (w[i].failed)
+			ret = -1;
+		for (off = 0; off < MW_RANGE; off++) {
+			struct cds_ft_node *found = NULL;
+
+			if (!w[i].present[off])
+				continue;
+			live++;
+			if (lookup_u64(ft, w[i].base + off, &found)
+					!= CDS_FT_STATUS_OK ||
+			    found != &w[i].node[off]->node) {
+				fprintf(stderr, "fine-lock final: writer %d key %llu "
+					"lost (found %p != %p)\n", i,
+					(unsigned long long)(w[i].base + off),
+					(void *) found,
+					(void *) &w[i].node[off]->node);
+				ret = -1;
+			}
+		}
+	}
+	if (cds_ft_count_keys(ft) != live) {
+		fprintf(stderr, "fine-lock final: count_keys %lu != live %lu\n",
+			cds_ft_count_keys(ft), live);
+		ret = -1;
+	}
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "fine-lock final: cds_ft_verify failed\n");
+		ret = -1;
+	}
+	rcu_read_unlock();
+
+	fprintf(stderr, "# inv_concurrent_writers_fine_lock: %d writers, %lu ops, "
+		"%lu live keys\n", MW_FINE_NR_WRITERS, total_ops, live);
 
 	free(w);
 	if (drain_and_destroy(ft, group) < 0)
@@ -11156,6 +11306,7 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_concurrent_writers_disjoint);
 	RUN_TEST(inv_concurrent_writers_shared);
 	RUN_TEST(inv_concurrent_writers_coarse_lock);
+	RUN_TEST(inv_concurrent_writers_fine_lock);
 	RUN_TEST(inv_bind_resume_order);
 	RUN_TEST(inv_ordered_bulk_consistency);
 	RUN_TEST(inv_compact_keycopy_terminates);

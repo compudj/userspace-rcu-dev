@@ -179,11 +179,12 @@ struct cds_ft_inode_flag *ft_descent_step(struct cds_ft *ft, struct ft_descent *
  * the commit returns a clean MEMORY_ERROR with nothing parked.
  */
 /*
- * Upper bound of FT_STATE_COPYING fences one commit can hold: a recompact
- * retire fences ONE node; the chain-compress fused merge fences the collapsed
- * chain (boundary + old parent cn + old child cn = 3).
+ * Upper bound of FT_STATE_COPYING locks one commit can hold: the chain-compress
+ * fused merge fences the collapsed chain (boundary + old parent cn + old child
+ * cn = 3); a LOCK_FINE recompact holds its whole {C, P} lock-set, plus {GP} when
+ * P is a compressed node whose SKIP_X dual it re-encodes (§9.3) = 3.
  */
-#define FT_FLIP_TXN_MAX_COPYING	4
+#define FT_FLIP_TXN_MAX_COPYING	8
 
 struct ft_flip_txn {
 	struct urcu_mcas_txn *mtxn;	/* the concurrent commit engine handle:
@@ -196,15 +197,17 @@ struct ft_flip_txn {
 	struct urcu_mcas_txn own;	/* backing handle for standalone txns */
 	bool reserved;			/* @mtxn pre-reserved (bounded) => infallible commit */
 	/*
-	 * FT_STATE_COPYING fence registry (MW F2, CORE_682870 fix plan): the
-	 * nodes this commit's op MARKED with the reversible copy fence.  On
-	 * commit OK the fence is consumed by the recorded state transition
-	 * {COPYING|s -> TOMBSTONE|s}; on EVERY other terminal outcome of the
-	 * wrapper -- commit ABORT / MEMORY_ERROR (ft_flip_txn_commit) or a
-	 * pre-commit bail (ft_flip_txn_destroy) -- the fence must be CLEARED
-	 * or every later peer publish into the node aborts forever.  The two
+	 * FT_STATE_COPYING lock registry (MW F2, CORE_682870 fix plan): the
+	 * nodes this commit's op MARKED with the reversible per-node lock.  On
+	 * commit OK the lock is consumed by whichever state transition the op
+	 * RECORDED on the node -- {COPYING|s -> TOMBSTONE|s} (retire) or
+	 * {COPYING|s -> s} (release, the node survives) -- so the registry does
+	 * not care which terminal was chosen.  On EVERY other terminal outcome
+	 * of the wrapper -- commit ABORT / MEMORY_ERROR (ft_flip_txn_commit) or
+	 * a pre-commit bail (ft_flip_txn_destroy) -- the lock must be CLEARED or
+	 * every later peer publish into the node aborts forever.  The two
 	 * terminal paths drain this registry so no caller unwind can leak a
-	 * fence.
+	 * lock.
 	 */
 	struct cds_ft_metadata *copying[FT_FLIP_TXN_MAX_COPYING];
 	unsigned int nr_copying;
@@ -532,6 +535,64 @@ void ft_flip_txn_copying_register(struct ft_flip_txn *t,
 	t->copying[t->nr_copying++] = meta;
 }
 
+/*
+ * Acquire the per-node lock of a RELEASE-terminal lock-set member -- a node the
+ * op must exclude peers from but does NOT retire (recompact's {P} / {GP}, §9.3).
+ * Same acquire as the retire half (ft_meta_copying_mark: -EAGAIN on a dirty word
+ * = "could not acquire, re-descend"); the halves diverge only at the commit,
+ * where this one records {COPYING|s -> s} instead of the tombstone.
+ *
+ * The clean snapshot is stashed alongside the member so the commit can plant
+ * that record and a bail can drop the lock again.  Members are held in a small
+ * fixed array (the lock-set is bounded and known up front, §5: no growing a
+ * lock-set in place), so an acquire failure just unwinds the ones already held.
+ */
+#ifdef FEATURE_FT_FAULT_INJECT
+extern long cds_ft_fault_lock_countdown;
+#endif
+static inline
+int ft_copying_lock_member(struct cds_ft_metadata *meta,
+		struct cds_ft_metadata **set, uintptr_t *snap, unsigned int *n)
+{
+	int ret;
+
+#ifdef FEATURE_FT_FAULT_INJECT
+	/*
+	 * Test-only: fail this acquire exactly as a peer holding the lock would
+	 * (see cds_ft_fault_lock_countdown).  Drives the caller's unwind --
+	 * unlock the members already held, discard the build-invisible copy,
+	 * re-descend -- which the FT-wide lock otherwise makes unreachable.
+	 */
+	if (cds_ft_fault_lock_countdown >= 0) {
+		if (cds_ft_fault_lock_countdown == 0) {
+			cds_ft_fault_lock_countdown = -1;
+			return -EAGAIN;
+		}
+		cds_ft_fault_lock_countdown--;
+	}
+#endif
+	ret = ft_meta_copying_mark(meta, &snap[*n]);
+	if (ret)
+		return ret;
+	set[(*n)++] = meta;
+	return 0;
+}
+
+/*
+ * Drop every RELEASE-terminal lock the op holds, leaving the nodes LIVE: the
+ * bail path of the above, for a member set not yet handed to a txn.  Once the
+ * members ARE registered (ft_flip_txn_copying_register, on the success path),
+ * the txn's registry owns the unlock instead and this must not run.
+ */
+static inline
+void ft_copying_unlock_members(struct cds_ft_metadata **set, unsigned int n)
+{
+	unsigned int i;
+
+	for (i = 0; i < n; i++)
+		ft_meta_copying_clear(set[i]);
+}
+
 static inline
 void ft_flip_txn_copying_clear_all(struct ft_flip_txn *t)
 {
@@ -599,12 +660,13 @@ enum urcu_txn_status ft_flip_txn_commit(struct cds_ft *ft,
 	st = urcu_txn_commit_flavor(t->mtxn, reclaim);
 	FT_TP(txn_commit, (const void *) t->mtxn, (int) st);
 	/*
-	 * COPYING fences: a committed txn transitioned each registered node
-	 * {COPYING|s -> TOMBSTONE|s} (the fence is consumed by the retire);
-	 * ABORT settled the state record back to its old value -- fence still
-	 * set -- and MEMORY_ERROR parked nothing, so both must clear the
-	 * reversible bit or the still-live nodes would fail every later peer
-	 * guard forever.
+	 * COPYING locks: a committed txn transitioned each registered node
+	 * through the terminal its op recorded -- {COPYING|s -> TOMBSTONE|s}
+	 * (retire) or {COPYING|s -> s} (release) -- so the lock is already
+	 * consumed and the registry is not drained.  ABORT settled the state
+	 * record back to its old value -- lock still set -- and MEMORY_ERROR
+	 * parked nothing, so both must clear the reversible bit or the still-live
+	 * nodes would fail every later peer guard forever.
 	 */
 	if (caa_unlikely(st != URCU_TXN_STATUS_OK))
 		ft_flip_txn_copying_clear_all(t);
@@ -1282,6 +1344,58 @@ void ft_flip_txn_record_tombstone_copying(struct ft_flip_txn *t,
 	ft_flip_txn_record_tag(t, (void **) &meta->state,
 			(void *) (state_snapshot | FT_STATE_COPYING),
 			(void *) (state_snapshot | FT_STATE_TOMBSTONE),
+			FT_STATE_PROXY);
+}
+
+/*
+ * The OTHER terminal of a FT_STATE_COPYING lock (MW lock-escalation model §9.3):
+ * the holder needed EXCLUSION, not a retire -- the node is edited (or merely
+ * protected) and SURVIVES the commit.  {COPYING|s -> s}: drop the lock, keep the
+ * node live, atomically with the rest of the op's edge set.
+ *
+ * Same expected-old contract as the retire twin above -- the mark's CLEAN
+ * snapshot, never a fresh read -- so it carries the same guarantee: any peer
+ * state change on the locked node between the mark and the commit (a re-home's
+ * PSO pair, a fused count, a foreign tombstone) mismatches this record's
+ * expected old and ABORTS the holder, whose lock the registry then clears.
+ * That is why a locked node needs NO separate ft_flip_txn_guard_parent: the
+ * release record IS the guard (same word, same abort on a peer state change),
+ * and it is strictly stronger -- the guard only makes US abort after the fact,
+ * while the lock makes PEERS abort up front.  A converted site therefore
+ * REPLACES its guard rather than adding to it.
+ *
+ * ORDERING RULE, load-bearing -- a guard and a release on ONE word are safe in
+ * exactly ONE order:
+ *
+ *   release THEN guard  = harmless no-op.  urcu_txn_load is read-your-writes
+ *       (rcu-txn.h), so the guard reads this record's PENDING value -- the clean
+ *       word -- masks nothing, and validates {s -> s} against it; record_chain
+ *       finds r->new_ptr == old_ptr and chains without upgrading (rcu-mcas.h).
+ *       Redundant, not wrong.  (This is the order the converted sites are in, so
+ *       skipping their guard is an economy and a clarification, NOT a bug fix.)
+ *
+ *   guard THEN release  = POISON, permanently.  The guard reads the COMMITTED
+ *       word (s|COPYING), masks the lock out, and adds {s -> s}.  The release
+ *       then arrives with expected old s|COPYING != r->new_ptr == s, so
+ *       record_chain sets t->poisoned: every commit of this txn aborts, and each
+ *       retry rebuilds the same poisoned shape.  So NEVER plant a §4.B guard on
+ *       a word BEFORE a recompact records its release on it in the same txn.
+ *       No site does today (each op arms its txn, then recompacts, then
+ *       publishes), and each conversion must keep it that way.
+ *
+ * Registered in the txn's copying[] registry exactly like a retire, so the two
+ * non-commit terminals (ABORT / MEMORY_ERROR in ft_flip_txn_commit, a
+ * pre-commit bail in ft_flip_txn_destroy) CAS-clear the lock and leave the node
+ * live -- the same word this record would have committed.  The registry itself
+ * therefore needs NO knowledge of which terminal an op chose.
+ */
+static inline
+void ft_flip_txn_record_release_copying(struct ft_flip_txn *t,
+		struct cds_ft_metadata *meta, uintptr_t state_snapshot)
+{
+	ft_flip_txn_record_tag(t, (void **) &meta->state,
+			(void *) (state_snapshot | FT_STATE_COPYING),
+			(void *) state_snapshot,
 			FT_STATE_PROXY);
 }
 

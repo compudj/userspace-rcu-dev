@@ -69,29 +69,66 @@ words.
 
 ---
 
-## 2. The tombstone split (two words, not one)
+## 2. The lock's two terminals (REVISED at implementation — the tombstone does NOT split)
 
-The single reader-visible tombstone that carried the double-tombstone-poison bug
-(`project_ft_txn_double_tombstone_poison`) is split into two distinct words with
-distinct audiences:
+**This section originally proposed splitting the tombstone into `node-reclaim` (MW,
+reader-invisible) and `node-deleted` (SW, reader-visible), and reserved bit 20 for it.
+Implementing step 3 showed the split buys nothing, and its stated justification does
+not hold in this tree. It is WITHDRAWN (Mathieu, 2026-07-14); bit 20 is un-reserved.**
 
-- **`node-reclaim` (MW, reader-invisible):** "I own this node and I am retiring it."
-  Co-atomic with the lock in the acquisition MCAS. Purely writer↔writer. Readers
-  never observe it.
+Why it was withdrawn — three independent reasons, each sufficient:
 
-- **`node-deleted` (SW, reader-visible):** semantic deletion. Published through the
-  SW-txn so readers linearize against it.
+- **The premise is false: `FT_STATE_TOMBSTONE` is not reader-visible.** No reader
+  reads it — zero references across every lookup / descent / iterator /
+  ordered-query / inequality header. Reader-visible deletion is expressed by the
+  structural unlink plus `CDS_FT_NODE_REMOVED_FLAG` on `cds_ft_node.next`: a
+  different mark, on a different word. The bit is purely writer-side, so
+  "reader-invisible reclaim vs reader-visible delete" is a distinction with no
+  reader to draw it.
+- **No writer consumer distinguishes the two meanings either.** All four treat any
+  tombstone identically: the lock's own dirty check (`ft_meta_copying_mark`) bails on
+  it, `ft_flip_txn_guard_parent` masks it into an abort, the recompact reparent sweep
+  masks it (the UAF guard), and the freeze-on-free audit accepts it as free-eligible.
+  A writer already knows at the call site whether it is retiring keys or deleting
+  them; it never needs to *read back* which kind of death a node died.
+- **It would not have dissolved the double-tombstone poison.** The poison was two
+  records on the SAME WORD with a stale expected-old; splitting the bits leaves both
+  records on that same word (`{s|COPYING → s|RECLAIM}` then `{s → s|DELETED}` has
+  exactly the same stale expected-old). What actually fixed it is the read-your-writes
+  load in `ft_flip_txn_record_tombstone` (`47a1a612`,
+  `project_ft_txn_double_tombstone_poison`).
 
-**This dissolves a bug class instead of patching it.** Recompaction stamps *only*
-`node-reclaim`, never `node-deleted`, so a reader can never lose a key just because
-its node is being copied — recompaction is semantically a no-op (same keys, new
-layout). Remove stamps `node-deleted` through the SW publish. The two meanings no
-longer share a word, so the torn-read-set poison has nowhere to live.
+**What the lock model actually needed was the other thing this section was reaching
+for: a lock that can UNLOCK.** Today `FT_STATE_COPYING`'s only commit-OK terminal is
+`→ TOMBSTONE`, because the only thing that ever takes it is a copier that retires the
+node. The moment a lock-set contains a member that is *edited but survives* —
+recompact's parent `P` (§9.3) — the lock needs a second terminal. So the lock has
+exactly two, both recorded as an MCAS edge on the state word whose expected old is the
+mark's clean snapshot:
 
-**Reader contract shrinks.** Readers now: resolve proxies + honor `node-deleted`, and
-**never observe the lock**. That is a real deletion from the reader path and tightens
-reader wait-freedom relative to `d48ed267`, where COPYING is entangled in proxy
-resolution.
+| terminal | transition | who |
+|---|---|---|
+| **retire** | `{COPYING\|s → TOMBSTONE\|s}` | the node is copied away and dies (`C`) |
+| **release** | `{COPYING\|s → s}` | the node is edited/protected and lives (`P`, `GP`) |
+
+Plus the pre-existing non-commit terminal: ABORT / MEMORY_ERROR / a pre-commit bail
+CAS-clear the bit through the txn's `copying[]` registry, leaving the node live — the
+same resulting word as *release*, differing only in who writes it (a bare CAS vs the
+atomic commit). **The registry therefore needs no knowledge of which terminal an op
+chose**, which is why adding *release* touched neither the drain nor the CORE_682870
+expected-old contract.
+
+**Corollary — the release record IS the guard.** A locked member needs no
+`ft_flip_txn_guard_parent`: both are one record on the same word, and the lock is
+strictly stronger (the guard only makes *us* abort after the fact; the lock makes
+*peers* abort up front). Planting both is a bug, not belt-and-braces — the guard
+expects the clean word and the release expects it fenced, and two records with
+different expected olds poison the descriptor. Every §9 conversion therefore
+*replaces* a guard site rather than adding to it, which is the mechanical form of
+"the guard sites ARE the lock-set" (§9).
+
+**Reader contract still shrinks**, just for a simpler reason than the split: readers
+resolve proxies and **never observe the lock**.
 
 ---
 
@@ -380,14 +417,27 @@ incoming_byte}` into their own word adjacent to `parent`, all under `P`'s lock;
 - Re-home drops the "one atomic MCAS state edge" packing rationale — `parent`,
   `parent_slot_offset`, `incoming_byte` become coherent stores under `P`'s lock.
 
-STATUS of this split: **APPROVED (Mathieu, 2026-07-14).** Sequencing constraint: it
-must land *with* the pivot's lock + re-home rewrite, **not** standalone on the current
-lock-free tree. Moving `parent_slot_offset` out of `state` removes the atomic
-MCAS-state-edge property that today's lock-free re-home depends on (the state-word MCAS
-carries the new offset coherently with the flip); the replacement — coherent stores
-under `P`'s lock — exists only once `P`'s lock does. Landing it early would regress the
-`0/1600 @16w` baseline. So: approved, deferred to the lock-machinery change that
-consumes it.
+STATUS of this split: **APPROVED (Mathieu, 2026-07-14), and DEFERRED PAST STEP 3
+(2026-07-14, at implementation).** Sequencing constraint: it must land *with* the
+pivot's lock + re-home rewrite, **not** standalone on the current optimistic tree.
+Moving `parent_slot_offset` out of `state` removes the atomic MCAS-state-edge property
+that today's optimistic re-home depends on (the state-word MCAS carries the new offset
+coherently with the flip); the replacement — coherent stores under `P`'s lock — exists
+only once `P`'s lock does. Landing it early would regress the `0/1600 @16w` baseline.
+
+**Step 3 clarified WHEN "with the lock rewrite" actually is: not at step 3 — at the
+END, when OPTIMISTIC is retired.** The lost update this section warns about does not
+occur while the writers remain CAS loops, and they are:
+`ft_meta_parent_slot_offset_set` CASes `state` (`7045681c`) and `nr_child` uses the
+Phase-4.3 latch-honoring CAS-retry, so a cross-lock write to the shared word costs a
+**spurious abort, never a lost update** (the MCAS record validates its expected old and
+one side loses). Word-sharing is therefore a *contention* defect under locks, not a
+*correctness* one. The split's payoff — dropping those CAS loops to plain stores — only
+materializes once the optimistic re-home that needs them is gone. Landing it at step 3
+would take the stated `0/1600` risk to buy nothing yet.
+
+So: approved, still welded to the re-home rewrite, but that rewrite is the last step of
+the transition, not this one.
 
 ---
 
@@ -948,16 +998,15 @@ its `0/1600 @16w` is preserved trivially until the very end.
 Foundational bricks first — the substrate every op conversion consumes ("first
 regardless of op order"):
 
-1. **Engine + words.** — *PARTIALLY LANDED (`4e943653`).* Optimistic-acquire / per-FT
-   FIFO-lane engine with the **(a)/(b) seam assertion** (§3.1); the **two-word tombstone
-   split** `node-reclaim` (MW) vs `node-deleted` (SW) (§2) laid into `state` per §8.2; the
-   **abort-boundary gate** (§5: byte-for-byte, un-stamp reclaim, free reserved) wired as
-   the acquire/edit failure path. *Landed so far: the `node-reclaim` bit is reserved in
-   the state word. The rest — splitting the single `{COPYING → TOMBSTONE}` terminal into
-   three (`release` / `reclaim` / `delete`), which touches the `copying[]` fence-registry
-   drain in `ft_flip_txn_commit` / `ft_flip_txn_destroy` — is deferred to step 3, where
-   the first consumer (recompact) actually needs it: coarse mode's dedicated lock only
-   ever* releases.
+1. **Engine + words.** — *LANDED, and smaller than planned.* Optimistic-acquire / per-FT
+   FIFO-lane engine with the **(a)/(b) seam assertion** (§3.1); the state-word terminals
+   (§2) per §8.2; the **abort-boundary gate** (§5: byte-for-byte, free reserved) wired as
+   the acquire/edit failure path. *The `node-reclaim` bit reserved in `4e943653` was
+   UN-reserved at step 3: the tombstone split is withdrawn (§2). What the words actually
+   needed was one added terminal — RELEASE `{COPYING|s → s}` — and because a terminal is
+   just the MCAS record an op plants, the `copying[]` registry and its drain in
+   `ft_flip_txn_commit` / `ft_flip_txn_destroy` were NOT touched at all. The abort-boundary
+   gate was already built for the fence and carries the lock unchanged.*
 2. **`rank_stats`-ON = one FT-wide lock (§10.5).** — *LANDED (`14545ebb`), as
    `CDS_FT_WRITER_LOCK_COARSE`.* The *simplest* `lock`-mode: single lock, no lock-set
    derivation, classic RCU single-writer. Land it first to exercise the acquire / hold /
@@ -973,11 +1022,23 @@ regardless of op order"):
 Then the fine-grained (`rank_stats`-OFF) op-domains, smallest / most-local lock-set first
 (the §9 order):
 
-3. **recompact `{C, P}` (§9.3).** Convert first — `FT_STATE_COPYING` *already is* this
-   lock (§0), so it is the smallest conceptual delta and it validates the seed directly.
-   It is also the shared boundary-copy atom behind insert-grow, remove-shrink and the
-   compactor, so converting it has leverage. **The §8.3 layout split lands here**, welded
-   to this re-home rewrite (it must not land earlier — §8.3).
+3. **recompact `{C, P}` (§9.3).** — *LANDED.* Convert first — `FT_STATE_COPYING`
+   *already is* this lock (§0), so it is the smallest conceptual delta and it validates
+   the seed directly. It is also the shared boundary-copy atom behind insert-grow,
+   remove-shrink and the compactor, so converting it has leverage. *As landed: under
+   `LOCK_FINE`, `ft_node_recompact` acquires `{C, P}` (+ `{GP}` when `P` is a compressed
+   node whose SKIP_X dual it re-encodes) and resolves the surviving members through the
+   new RELEASE terminal (§2); the three §4.B guard sites that guarded `P` are REPLACED
+   by that lock (insert's relocation republish, remove's two detach republish arms —
+   the second only when a recompact actually ran, since its external-promote sub-case
+   reaches the same publish with no recompact and no lock).*
+   **Two things this step was expected to carry, and does not:**
+   *(a) the tombstone split is WITHDRAWN — see §2; what was needed was the release
+   terminal, which touches neither the `copying[]` drain nor the CORE_682870
+   expected-old contract. (b) the §8.3 layout split is DEFERRED to the end of the
+   transition — see §8.3: with the writers still CAS loops, word-sharing costs a
+   spurious abort, not a lost update, so the split buys nothing until OPTIMISTIC's
+   re-home is retired.*
 4. **insert (§9.1)** — leaf-local `{P}` / `{P, CN}`; the grow case now calls the converted
    recompact.
 5. **remove (§9.2)** — introduces the plan → all-or-none acquire → edit → commit **climb

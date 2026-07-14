@@ -49,9 +49,9 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 318
+#define NR_TESTS 321
 #else
-#define NR_TESTS 277
+#define NR_TESTS 278
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -319,6 +319,35 @@ static struct cds_ft *create_varlen_rankstats_list_ft(bool ordered_list,
 	return ft;
 }
 
+/*
+ * Fine-grained lock-mode trie.  rank_stats stays OFF: the §9 per-op lock-sets
+ * are derived for the rank_stats-OFF (default) build -- a rank_stats-ON trie
+ * serializes on one FT-wide mutation lock instead (§10.5), which is exactly what
+ * create_fixed_coarse_lock_ft above models.
+ */
+static struct cds_ft *create_fixed_fine_lock_ft(size_t klen,
+		struct cds_ft_group **group_out)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+
+	if (cds_ft_group_attr_create(&attr) < 0)
+		abort();
+	if (cds_ft_group_attr_set_key_len(attr, klen) < 0)
+		abort();
+	if (cds_ft_group_attr_set_writer_strategy(attr,
+			CDS_FT_WRITER_LOCK_FINE) < 0)
+		abort();
+	if (cds_ft_group_create(attr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &ft) < 0)
+		abort();
+	*group_out = group;
+	return ft;
+}
+
 /* Insert helper for fixed-length integer keys. */
 static enum cds_ft_status
 insert_u64(struct cds_ft *ft, uint64_t v, struct ft_test_node *n)
@@ -407,6 +436,74 @@ static int test_writer_lock_mode_coarse(void)
 	 * the writer-scope hook -- frees the nodes, and tears the trie / group
 	 * down.
 	 */
+	return drain_and_destroy(ft, group);
+}
+
+/*
+ * MW FINE lock-mode smoke (§11.3 step 3): on a CDS_FT_WRITER_LOCK_FINE trie the
+ * converted op-domain -- recompact -- acquires its per-node lock-set {C, P}
+ * (+ {GP} when P is a compressed node carrying a SKIP_X dual) instead of merely
+ * §4.B-guarding P, and resolves the surviving members through the RELEASE
+ * terminal {COPYING|s -> s} at the commit.
+ *
+ * Drive both recompact directions: 256 dense inserts promote nodes through the
+ * layout tiers (FT_RECOMPACT_ADD_NEXT / ADD_SAME), and the drain removes every
+ * key (FT_RECOMPACT_DEL).  The load-bearing assertion is cds_ft_verify(), which
+ * reports a COPYING bit set AT REST as a leaked copy fence: a release terminal
+ * that failed to commit -- or a bail path that forgot to unlock a member -- can
+ * only end as a leaked lock, and would wedge every later publish into that node.
+ */
+static int test_writer_lock_mode_fine(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_fine_lock_ft(4, &group);
+	struct ft_test_node *n[256];
+	unsigned long cnt;
+	int i;
+
+	for (i = 0; i < 256; i++)
+		n[i] = node_alloc((uint64_t) i);
+
+	rcu_read_lock();
+	for (i = 0; i < 256; i++) {
+		if (insert_u64(ft, (uint64_t) i, n[i]) != CDS_FT_STATUS_OK) {
+			rcu_read_unlock();
+			fprintf(stderr, "fine lock-mode: insert %d failed\n", i);
+			drain_and_destroy(ft, group);
+			return -1;
+		}
+	}
+	cnt = cds_ft_count_entries(ft);
+	rcu_read_unlock();
+	if (cnt != 256) {
+		fprintf(stderr, "fine lock-mode: count %lu != 256 after inserts\n",
+			cnt);
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+
+	/* No lock left set at rest, and the grown structure is coherent. */
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "fine lock-mode: verify failed after inserts\n");
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+
+	rcu_read_lock();
+	for (i = 0; i < 256; i++) {
+		struct cds_ft_node *found = NULL;
+
+		if (lookup_u64(ft, (uint64_t) i, &found) != CDS_FT_STATUS_OK
+				|| found != &n[i]->node) {
+			rcu_read_unlock();
+			fprintf(stderr, "fine lock-mode: lookup %d failed\n", i);
+			drain_and_destroy(ft, group);
+			return -1;
+		}
+	}
+	rcu_read_unlock();
+
+	/* The drain drives the DEL recompacts, and verifies as it shrinks. */
 	return drain_and_destroy(ft, group);
 }
 
@@ -21325,6 +21422,7 @@ out:
 #ifdef FEATURE_FT_FAULT_INJECT
 extern long cds_ft_fault_alloc_countdown;
 extern long cds_ft_fault_flip_countdown;
+extern long cds_ft_fault_lock_countdown;
 
 /*
  * Drive a compressed-split insert through each of its allocation-failure
@@ -25164,6 +25262,100 @@ static int test_detach_oom_atomicity(void)
 }
 
 /*
+ * MW LOCK_FINE lock-acquisition fault (§9.3, the abort boundary).
+ *
+ * A LOCK_FINE trie still serializes every writer behind the FT-wide lock until
+ * the op-domains finish converting (§11.1), so no peer can hold a per-node lock
+ * and ft_copying_lock_member() can never fail in a plain soak: its whole unwind
+ * -- unlock the members already held, free the build-invisible copy, re-descend
+ * -- is dead code, and a green LOCK_FINE oracle says NOTHING about it.  (Learned
+ * the hard way: a clean MW oracle can mean "the abort path was never taken".)
+ *
+ * cds_ft_fault_lock_countdown = n fails exactly the (n+1)-th acquire with
+ * -EAGAIN, precisely as a peer holding the lock would.  Sweeping n walks the
+ * fault across every acquire of the recompact lock-set -- P, and GP when the
+ * parent is compressed (the GP case is the interesting one: its unwind must drop
+ * the P lock it is already holding) -- at many distinct points of the build.
+ *
+ * The op must SURVIVE it: -EAGAIN means "could not acquire", the mutator
+ * re-descends and retries, and the insert still reports OK.  What is asserted
+ * after each armed insert is the abort boundary itself: every key still present,
+ * and cds_ft_verify clean -- which is what catches a LEAKED LOCK, since a
+ * COPYING bit left set at rest is reported as a leaked copy fence and would wedge
+ * every later publish into that node.  A forgotten ft_copying_unlock_members on
+ * any bail path fails here.
+ */
+static int test_fine_lock_acquire_fault(void)
+{
+	const unsigned int N = 512;
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_fine_lock_ft(4, &group);
+	struct ft_test_node **n;
+	unsigned int i;
+	long fault;
+	int rc = 0;
+
+	n = (struct ft_test_node **) calloc(N, sizeof(*n));
+	if (!n)
+		abort();
+
+	/*
+	 * Sweep the fault across the acquires: each iteration inserts one more
+	 * key with the (fault+1)-th acquire of that insert forced to fail, so the
+	 * fault lands at a different point of a differently-shaped trie each time
+	 * (and lands on GP, not just P, once the parent compresses).
+	 */
+	for (i = 0; i < N && !rc; i++) {
+		fault = (long) (i % 3);		/* 1st, 2nd, 3rd acquire */
+		n[i] = node_alloc((uint64_t) i);
+
+		rcu_read_lock();
+		cds_ft_fault_lock_countdown = fault;
+		if (insert_u64(ft, (uint64_t) i, n[i]) != CDS_FT_STATUS_OK) {
+			cds_ft_fault_lock_countdown = -1;
+			rcu_read_unlock();
+			fprintf(stderr, "fine-lock fault: insert %u did not "
+				"survive a failed acquire (fault=%ld)\n", i, fault);
+			rc = -1;
+			break;
+		}
+		cds_ft_fault_lock_countdown = -1;
+		rcu_read_unlock();
+
+		/* Abort boundary: no leaked lock, structure coherent. */
+		if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "fine-lock fault: verify failed after "
+				"insert %u (fault=%ld) -- leaked lock?\n",
+				i, fault);
+			rc = -1;
+			break;
+		}
+	}
+
+	/* Every key inserted so far must still be there (nothing lost to a bail). */
+	rcu_read_lock();
+	for (i = 0; i < N && !rc; i++) {
+		struct cds_ft_node *found = NULL;
+
+		if (!n[i])
+			break;
+		if (lookup_u64(ft, (uint64_t) i, &found) != CDS_FT_STATUS_OK
+				|| found != &n[i]->node) {
+			fprintf(stderr, "fine-lock fault: key %u lost\n", i);
+			rc = -1;
+			break;
+		}
+	}
+	rcu_read_unlock();
+
+	cds_ft_fault_lock_countdown = -1;
+	free(n);
+	if (drain_and_destroy(ft, group) < 0)
+		rc = -1;
+	return rc;
+}
+
+/*
  * Compaction OOM (flip-txn allocation fault).  During cds_ft_compact on an
  * ordered-list trie the flip-txn allocations are the per-cell relocation swap
  * AND -- since the structural relocations were routed onto the flip latch -- a
@@ -25785,6 +25977,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_remove_prefix_external_promote);
 	RUN_TEST(test_compact_dense_full_node);
 	RUN_TEST(test_writer_lock_mode_coarse);
+	RUN_TEST(test_writer_lock_mode_fine);
 #ifdef FEATURE_FT_FAULT_INJECT
 	RUN_TEST(test_split_oom_backpointer);
 	RUN_TEST(test_split_oom_key_shorter_arm);
@@ -25826,6 +26019,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_remove_head_promote_oom);
 	RUN_TEST(test_insert_replace_prefix_oom);
 	RUN_TEST(test_replace_head_oom);
+	RUN_TEST(test_fine_lock_acquire_fault);
 	RUN_TEST(test_compact_ordered_list_oom);
 	RUN_TEST(test_compact_ordered_list_oom_resume);
 #endif

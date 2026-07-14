@@ -796,8 +796,8 @@ struct ft_pub_rec {
  * Per-node MCAS state word (struct cds_ft_metadata.state) bit layout.
  * bit 0 = proxy (in-band flip marker), bit 1 = tombstone (LIVE->DEAD),
  * bits 2-10 = nr_child, bits 11-18 = parent_slot_offset, bit 19 = COPYING
- * (the reversible per-node lock), bit 20 = node-reclaim (RESERVED, MW lock-mode).
- * See doc/design/mcas-multiwriter-readiness.md §4.2 and, for bits 19-20,
+ * (the reversible per-node writer lock; bits 20+ free).
+ * See doc/design/mcas-multiwriter-readiness.md §4.2 and, for bit 19,
  * doc/design/mw-writer-lock-escalation-model.md §0/§2.
  */
 #define FT_STATE_PROXY			((uintptr_t) 1 << 0)
@@ -820,37 +820,42 @@ struct ft_pub_rec {
 #define FT_STATE_PSO_VALMASK		(((uintptr_t) 1 << FT_STATE_PSO_BITS) - 1)
 #define FT_STATE_PSO_MASK		(FT_STATE_PSO_VALMASK << FT_STATE_PSO_SHIFT)
 /*
- * FT_STATE_COPYING (bit 19, above parent_slot_offset): REVERSIBLE per-node
- * copy fence (MW campaign, Option A -- doc/design + CORE_682870 fix plan F2).
- * A recompact/collapse that must read a LIVE node's whole body sets this bit
- * with a standalone CAS {clean -> |COPYING} BEFORE the body reads: every peer
- * publish into the node aborts on its §4.B guard (the guard's clean-LIVE
- * expectation masks this bit like the tombstone), so the copied body is
- * consistent without per-slot validate records.  On COMMIT the same state
- * record transitions {COPYING|s -> TOMBSTONE|s} -- the one-way tombstone
- * semantics (exactly-once retire token, freeze-on-free) are UNCHANGED and
- * still land atomically at commit.  On ABORT the copier CAS-clears ONLY this
- * bit.  Unlike the tombstone, COPYING is reversible BY DESIGN and never
- * implies death; it is never set at rest.  The mark CAS failing (bit already
- * set) = a concurrent copier or a real retire: -EAGAIN.
+ * FT_STATE_COPYING (bit 19, above parent_slot_offset): the REVERSIBLE per-node
+ * WRITER LOCK.  It began as the copy fence (MW campaign, Option A -- doc/design
+ * + CORE_682870 fix plan F2) and the MW lock-escalation model (§0) is the
+ * observation that the fence already IS a lock: CAS to acquire, held across the
+ * build/reparent plan window, -EAGAIN on contention, resolved at commit.
+ *
+ * ACQUIRE: a standalone CAS {clean -> |COPYING}, taken BEFORE the first read of
+ * the node it protects.  Every peer publish into the node then aborts on its
+ * §4.B guard (the guard's clean-LIVE expectation masks this bit like the
+ * tombstone), so the protected body cannot go stale under the holder without
+ * someone aborting.  The mark CAS failing (bit already set, a parked proxy, or a
+ * real retire) = "could not acquire" -> -EAGAIN, re-descend.
+ *
+ * TERMINALS -- exactly two on a successful commit, both expressed as a RECORDED
+ * MCAS edge on the state word whose expected old is the mark's CLEAN snapshot
+ * (never a fresh read -- the CORE_682870 defect-1 contract):
+ *
+ *   RETIRE  {COPYING|s -> TOMBSTONE|s}  ft_flip_txn_record_tombstone_copying()
+ *           The holder copied the node away; it dies at the commit.  One-way
+ *           tombstone semantics (exactly-once retire token, freeze-on-free) are
+ *           UNCHANGED.
+ *   RELEASE {COPYING|s -> s}            ft_flip_txn_record_release_copying()
+ *           The holder only needed exclusion; the node SURVIVES the commit.
+ *           This is what a lock-set member that is edited but not retired needs
+ *           (recompact's parent P, §9.3) -- a lock that unlocks.
+ *
+ * On ABORT / a pre-commit bail the bit is CAS-cleared instead (the registry
+ * drain, ft_flip_txn_copying_clear_all) and the node stays live -- so the
+ * ABORT terminal and the RELEASE terminal agree on the resulting word, they
+ * differ only in who writes it (a bare CAS vs the atomic commit).
+ *
+ * Unlike the tombstone, COPYING is reversible BY DESIGN and never implies
+ * death; it is never set at rest (ft-verify.h reports a leaked fence).
  */
 #define FT_STATE_COPYING		((uintptr_t) 1 << \
 					(FT_STATE_PSO_SHIFT + FT_STATE_PSO_BITS))
-/*
- * FT_STATE_NODE_RECLAIM (bit 20, above FT_STATE_COPYING): RESERVED for the MW
- * lock-escalation model's tombstone split (doc/design/mw-writer-lock-escalation-model.md
- * §2).  Splits today's overloaded COPYING->TOMBSTONE commit into two independent
- * meanings: node-reclaim is the reader-INVISIBLE "owned + being reclaimed" latch
- * (MW half), stamped when a structural rewrite retires a node whose keys have
- * moved elsewhere; node-deleted stays FT_STATE_TOMBSTONE, the reader-VISIBLE
- * semantic delete (SW half).  A recompaction then stamps node-reclaim ONLY, so a
- * straggler reader never observes a copied-away node as deleted -- dissolving the
- * double-tombstone poison at its root.  NOT yet consumed by any op (lock-mode is
- * unimplemented); the bit is reserved here so the state-word layout is fixed
- * before the per-op conversions land (§11.3).
- */
-#define FT_STATE_NODE_RECLAIM		((uintptr_t) 1 << \
-					(FT_STATE_PSO_SHIFT + FT_STATE_PSO_BITS + 1))
 #define FT_STATE_TAG_MASK		(FT_STATE_PROXY | FT_STATE_TOMBSTONE)
 
 struct cds_ft_metadata {
@@ -1527,6 +1532,21 @@ struct cds_ft {
 	 * optimistic = the hook is a no-op.
 	 */
 	bool lock_mode;
+	/*
+	 * Hot-path gate: writer_strategy == CDS_FT_WRITER_LOCK_FINE.  The
+	 * fine-grained (per-node lock-set) conversions read THIS, not @lock_mode:
+	 * COARSE deliberately derives no lock-set (§10.5 -- one FT-wide lock, no
+	 * per-node locks), so a per-node acquire there would be pure cost.
+	 *
+	 * A FINE trie still takes the FT-wide writer lock as well, for now: the
+	 * op-domains convert one at a time (§11.3 steps 3-6) and an unconverted op
+	 * must not race a converted one (the §11.1 coexistence hazard).  So the
+	 * per-node lock-sets acquired below FINE are, until every domain is
+	 * converted, exercised under FT-wide serialization rather than contended.
+	 * They are dropped from serialization op-domain by op-domain as the
+	 * conversions land.
+	 */
+	bool lock_fine;
 
 
 	/*

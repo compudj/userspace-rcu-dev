@@ -1714,8 +1714,20 @@ int ft_attach_node(struct cds_ft *ft,
 			 * this commit (Phase 4.3 load-bearing; no-op under exclusion).
 			 * Use the fresh copy's inherited (resolved) parent -- the same
 			 * consistent snapshot the publish slot below is verified against.
+			 *
+			 * LOCK_FINE (§9.3): this grandparent is recompact's P -- already
+			 * LOCKED by the reserve's ft_node_recompact, which recorded its
+			 * {COPYING|s -> s} release on this very word.  The release record
+			 * IS the guard (same word, same abort on a peer state change) and
+			 * is strictly stronger, so the conversion REPLACES the guard here.
+			 * Leaving it would not corrupt anything -- release-then-guard
+			 * chains as a read-your-writes no-op (see the ordering rule at
+			 * ft_flip_txn_record_release_copying) -- it would just be a vacuous
+			 * record re-validating the value the release already pins.
 			 */
-			ft_flip_txn_guard_parent(ft, ic->txn, idest_meta->parent);
+			if (!ft->lock_fine)
+				ft_flip_txn_guard_parent(ft, ic->txn,
+					idest_meta->parent);
 			_ft_publish_to_parent(ft, attach_node_flag,
 				attach_node_flag_ptr, iter_dest_node_flag,
 				attach_node_flag, &rec);

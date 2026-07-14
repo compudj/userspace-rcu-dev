@@ -1026,6 +1026,21 @@ int ft_node_recompact(enum ft_recompact mode,
 	 */
 	uintptr_t fence_state = 0;
 	bool fenced = false;
+	/*
+	 * §9.3 LOCK_FINE lock-set, RELEASE half: the members this recompact locks
+	 * that SURVIVE the commit -- P (the parent whose slot the fresh copy is
+	 * published into) and, when P is a compressed node whose SKIP_X dual this
+	 * recompact re-encodes, GP (whose slot that dual writes).  C -- the node
+	 * copied away -- is the RETIRE half (@fenced / @fence_state above); the two
+	 * halves differ only in the terminal they record at commit.
+	 *
+	 * Held only under FINE: COARSE derives no lock-set (§10.5, one FT-wide
+	 * lock), and OPTIMISTIC keeps its §4.B guards (which the release record
+	 * would poison -- see ft_flip_txn_record_release_copying).
+	 */
+	struct cds_ft_metadata *rel_meta[2];
+	uintptr_t rel_snap[2];
+	unsigned int nr_rel = 0, ri;
 
 	/*
 	 * F2 COPYING fence, MARK (doc at ft_meta_copying_mark): a live-retire
@@ -1107,7 +1122,7 @@ int ft_node_recompact(enum ft_recompact mode,
 		if (retire_txn && !cluster_leaf && metadata &&
 				!ft_flip_txn_reserve_extra(retire_txn,
 					3 * (ft_meta_nr_child_load(metadata) + 1)
-					+ 1)) {
+					+ 1 + (ft->lock_fine ? 2 : 0))) {
 			if (fenced)
 				ft_meta_copying_clear(metadata);
 			return -ENOMEM;
@@ -1153,6 +1168,35 @@ int ft_node_recompact(enum ft_recompact mode,
 				(unsigned int) ((char *) inh_slot -
 					(char *) ft_node_ptr(inh_parent))
 					/ sizeof(void *) : 0);
+			/*
+			 * §9.3 LOCK_FINE: acquire P, the second member of the
+			 * lock-set.  P's slot is the one the fresh copy is
+			 * published into, and it is a SAME-slot value swap (the
+			 * copy inherits @incoming_byte, so P's bitmap and
+			 * nr_child are untouched and P can never itself recompact
+			 * -- no cascade, and no GP beyond the compressed-parent
+			 * dual locked further down).  Acquired from the SAME
+			 * coherent (parent, offset) snapshot the publish slot is
+			 * derived from, so the lock and the slot cannot disagree
+			 * about who P is.
+			 *
+			 * A NULL @inh_parent is a publish into &ft->root: no node
+			 * to lock, auto-guarded by the root-slot CAS (identical
+			 * to ft_flip_txn_guard_parent's NULL case).
+			 *
+			 * On failure P is held by a peer: drop C's lock and
+			 * re-descend.  Nothing is published (the fresh copy is
+			 * build-invisible until the commit), so the abort boundary
+			 * is byte-for-byte clean.
+			 */
+			if (ft->lock_fine && fenced && inh_parent &&
+					ft_copying_lock_member(
+						ft_flag_to_metadata(ft, inh_parent),
+						rel_meta, rel_snap, &nr_rel)) {
+				free_cds_ft_node_unpublished(ft, new_node);
+				ft_meta_copying_clear(metadata);
+				return -EAGAIN;
+			}
 			ext_snapshot = (struct cds_ft_node *)
 				rcu_dereference(metadata->external_nodes);
 			if (caa_unlikely(ft_node_flip_proxy(
@@ -1164,6 +1208,7 @@ int ft_node_recompact(enum ft_recompact mode,
 				 * yet -- bail and retry after it settles.
 				 */
 				free_cds_ft_node_unpublished(ft, new_node);
+				ft_copying_unlock_members(rel_meta, nr_rel);
 				if (fenced)
 					ft_meta_copying_clear(metadata);
 				return -EAGAIN;
@@ -1197,6 +1242,8 @@ int ft_node_recompact(enum ft_recompact mode,
 					rcu_dereference(*bc_slot);
 				if (caa_unlikely(ft_node_flip_proxy(bc_old))) {
 					free_cds_ft_node_unpublished(ft, new_node);
+					ft_copying_unlock_members(rel_meta,
+						nr_rel);
 					if (fenced)
 						ft_meta_copying_clear(metadata);
 					return -EAGAIN;
@@ -1574,6 +1621,47 @@ skip_copy:
 			if (skip_slot &&
 			    ft_node_skip_compressed(*skip_slot)) {
 				/*
+				 * §9.3 LOCK_FINE: P is compressed and carries a
+				 * SKIP_X dual, so this recompact's publish also
+				 * re-encodes @skip_slot -- a slot in GP.  GP is
+				 * therefore the third lock-set member, in EVERY
+				 * mode: DEL does not write the dual here, but it
+				 * does not escape it either -- it defers the very
+				 * same write to ft_detach_node's republish, which
+				 * commits in THIS txn.  So the lock is taken here
+				 * (the only place that knows P is compressed) and
+				 * released by the commit either way.
+				 *
+				 * Like P, a same-slot value swap: SKIP_X(old, len)
+				 * -> SKIP_X(new, len) leaves GP's shape untouched.
+				 * A NULL GP means the dual lives in &ft->root.
+				 */
+				/*
+				 * @new_node gates the lock so that "locked" implies
+				 * "reserved": the +2 widen for these two release
+				 * records lives in the new_type_index != NULL arm
+				 * above, which is also the only arm that produces a
+				 * fresh copy.  A DEL that shrinks its node away
+				 * entirely (NULL type = prune) allocates no copy, so
+				 * it re-encodes no dual here -- there is nothing to
+				 * point GP's SKIP_X at -- and the prune's own edges
+				 * belong to the caller's lock-set (remove, step 5),
+				 * not to this atom.
+				 */
+				if (ft->lock_fine && fenced && new_node) {
+					struct cds_ft_inode_flag *gp_parent;
+
+					(void) ft_resolve_parent_slot(cn_meta,
+						ft, &gp_parent);
+					if (gp_parent &&
+					    ft_copying_lock_member(
+						ft_flag_to_metadata(ft, gp_parent),
+						rel_meta, rel_snap, &nr_rel)) {
+						ret = -EAGAIN;
+						goto abandon_fresh;
+					}
+				}
+				/*
 				 * FT_RECOMPACT_DEL relocates the rebuilt
 				 * (smaller) node into a LOCAL out-param that
 				 * ft_detach_node republishes via
@@ -1753,6 +1841,26 @@ skip_copy:
 		else
 			ft_meta_tombstone_set_flip(metadata);
 	}
+	/*
+	 * §9.3 LOCK_FINE, the RELEASE half of the lock-set: {P} (+ {GP} when P is
+	 * compressed) are EDITED, not retired, so their locks resolve through the
+	 * other terminal -- {COPYING|s -> s}, dropped atomically with the publish
+	 * that flips their slots.  Expected old is each member's MARK snapshot, so
+	 * a peer state change on a locked node between the mark and the commit
+	 * aborts this recompact rather than committing a plan derived from a world
+	 * that moved (the same contract the retire half carries).
+	 *
+	 * Registering them hands the unlock to @retire_txn exactly like the retire
+	 * half: commit OK consumes each lock through its recorded transition, and
+	 * every other terminal (ABORT / MEMORY_ERROR / a caller's pre-commit bail)
+	 * CAS-clears it through the registry.  Past this point the local bails
+	 * below must NOT unlock them -- the txn owns them.
+	 */
+	for (ri = 0; ri < nr_rel; ri++) {
+		ft_flip_txn_record_release_copying(retire_txn, rel_meta[ri],
+				rel_snap[ri]);
+		ft_flip_txn_copying_register(retire_txn, rel_meta[ri]);
+	}
 
 	ret = 0;
 end:
@@ -1765,11 +1873,13 @@ abandon_fresh:
 	 * recorded into @rec, forward slot untouched, the retire_txn arm's
 	 * back-channel edge is a RECORD discarded with the abandoned attempt,
 	 * and the plain-store arm's prev publish is deferred past this point.
-	 * Reclaim the never-escaped copy immediately and lift the copy fence
-	 * (not yet registered with @retire_txn -- registration happens only on
-	 * the success path above); -EAGAIN re-descends after the peer settles.
+	 * Reclaim the never-escaped copy immediately and lift the whole lock-set
+	 * -- the retire half (@fenced) and the release half (@rel_meta), neither
+	 * yet registered with @retire_txn (registration happens only on the
+	 * success path above); -EAGAIN re-descends after the peer settles.
 	 */
 	free_cds_ft_node_unpublished(ft, new_node);
+	ft_copying_unlock_members(rel_meta, nr_rel);
 	if (fenced)
 		ft_meta_copying_clear(metadata);
 	return ret;

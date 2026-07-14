@@ -727,13 +727,16 @@ enum cds_ft_status cds_ft_create(struct cds_ft_group *ft_group,
 	if (attr)
 		ft->exclusive = attr->exclusive;
 	/*
-	 * MW lock-mode gate: a lock-strategy group's tries (COARSE or FINE)
+	 * MW lock-mode gates: a lock-strategy group's tries (COARSE or FINE)
 	 * take the FT-wide writer lock at every mutation (writer-scope hook).
-	 * FINE currently falls back to the coarse FT-wide lock until the
-	 * per-node lock-sets land.  Hot-path mirror of the group strategy so
-	 * the hook reads one trie field.
+	 * A FINE trie ALSO acquires the per-node lock-sets of the op-domains
+	 * converted so far (§11.3 step 3 onwards: recompact {C, P}); it keeps
+	 * taking the FT-wide lock too until every domain is converted, so a
+	 * converted op never races an unconverted one (§11.1).  Hot-path mirrors
+	 * of the group strategy so the hooks read one trie field each.
 	 */
 	ft->lock_mode = (ft_group->writer_strategy != CDS_FT_WRITER_OPTIMISTIC);
+	ft->lock_fine = (ft_group->writer_strategy == CDS_FT_WRITER_LOCK_FINE);
 	cds_fair_mutex_init(&ft->writer_lock);
 	/*
 	 * Writer-contention escalation domain for the concurrent-mode ops'

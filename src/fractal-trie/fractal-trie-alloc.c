@@ -1184,6 +1184,22 @@ long cds_ft_fault_alloc_countdown = -1;
  * pre-reservation failure) without perturbing the arena-fault tests.
  */
 long cds_ft_fault_flip_countdown = -1;
+
+/*
+ * Test-only per-node LOCK-acquisition fault injection (MW LOCK_FINE, §9.3).
+ * Counts down over ft_copying_lock_member() calls and fails the (n+1)-th with
+ * -EAGAIN, exactly as a peer holding the node's FT_STATE_COPYING lock would.
+ *
+ * Why this knob has to exist: a LOCK_FINE trie still serializes every writer
+ * behind the FT-wide lock until the op-domains finish converting (§11.1), so no
+ * peer can ever be holding a per-node lock -- the acquire cannot fail, and every
+ * bail path it feeds (drop the fresh copy, unlock the members already held,
+ * re-descend) is DEAD CODE that a green soak says nothing about.  This makes the
+ * acquire fail on demand so those paths are actually executed and the abort
+ * boundary (byte-for-byte clean, no leaked lock, no leaked allocation) is
+ * tested rather than assumed.
+ */
+long cds_ft_fault_lock_countdown = -1;
 #endif
 
 static

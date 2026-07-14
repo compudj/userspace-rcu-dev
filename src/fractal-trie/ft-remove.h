@@ -1877,8 +1877,21 @@ int ft_detach_node(struct cds_ft *ft,
 				ret = -EAGAIN;
 				goto end;
 			}
-			/* VALIDATE (§4.B): guard the LIVE grandparent iter_meta->parent. */
-			ft_flip_txn_guard_parent(ft, commit_txn, iter_meta->parent);
+			/*
+			 * VALIDATE (§4.B): guard the LIVE grandparent iter_meta->parent.
+			 *
+			 * LOCK_FINE (§9.3): a recompact ran (@old_recompacted_node), so
+			 * this grandparent is its P -- already LOCKED, with a
+			 * {COPYING|s -> s} release recorded on this very word.  The release
+			 * record IS the guard (same word, same abort on a peer state
+			 * change) and is strictly stronger, so the conversion REPLACES it.
+			 * (Leaving the guard would be vacuous, not wrong: release-then-guard
+			 * chains as a read-your-writes no-op -- see the ordering rule at
+			 * ft_flip_txn_record_release_copying.)
+			 */
+			if (!(ft->lock_fine && old_recompacted_node))
+				ft_flip_txn_guard_parent(ft, commit_txn,
+					iter_meta->parent);
 			_ft_publish_to_parent(ft, iter_meta->parent,
 				detach_parent_flag_ptr, iter_node_flag,
 				holder_old_flag, &rec);
@@ -1959,8 +1972,20 @@ int ft_detach_node(struct cds_ft *ft,
 				ret = -EAGAIN;
 				goto end;
 			}
-			/* VALIDATE (§4.B): guard the LIVE grandparent iter_meta->parent. */
-			ft_flip_txn_guard_parent(ft, commit_txn, iter_meta->parent);
+			/*
+			 * VALIDATE (§4.B): guard the LIVE grandparent iter_meta->parent.
+			 *
+			 * LOCK_FINE (§9.3): skip the guard ONLY when a recompact actually
+			 * ran -- then this grandparent is its P, already locked, and its
+			 * recorded {COPYING|s -> s} release IS the guard, strictly stronger
+			 * (see the ordering rule at ft_flip_txn_record_release_copying).
+			 * The external-promote sub-case below reaches here with
+			 * @old_recompacted_node == NULL and NO recompact, hence no lock on
+			 * this parent -- it still needs the guard.
+			 */
+			if (!(ft->lock_fine && old_recompacted_node))
+				ft_flip_txn_guard_parent(ft, commit_txn,
+					iter_meta->parent);
 			_ft_publish_to_parent(ft, iter_meta->parent,
 				detach_parent_flag_ptr, iter_node_flag,
 				holder_old_flag, &rec);
