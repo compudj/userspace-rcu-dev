@@ -190,7 +190,39 @@ safety comes from *all-or-none acquire*, not from the lane's scope.
   `{lock, node-reclaim}`. The publish (parent-slot flip + `node-deleted`) is the
   **SW-txn**, done under the held locks and therefore *off* the lane. Release is a
   store to owned words. Keeps the serialized region to a single fixed-size acquisition
-  MCAS. (To confirm at implementation: no second MW-lane transit for release/publish.)
+  MCAS.
+
+- **The acquire must NOT ride the escalation lane. (PROVEN at implementation, step 2 —
+  this corrects the sketch above.)** Acquiring a lock *through* a transaction on the
+  trie's `urcu_txn_domain` deadlocks, structurally. The engine's escalation proof
+  assumes a txn that reaches the head of the lane can **complete**; a lock acquire
+  cannot — completing requires the *current holder* to release. So an escalated
+  acquirer holds its FIFO turn while it spins, and once `domain->active` is published
+  the lane funnels **every** txn in the domain — including the holder's own commit and
+  its release — in behind the waiter that is waiting on it. Circular wait. Measured:
+  16-writer soak wedged (383 threads futex-blocked in `urcu_txn_reserve`), RSS to
+  3.8 GB in 8 s (a fresh MCAS descriptor per acquire retry), `call_rcu` never draining
+  (spinners never quiesce). **A lock acquire sits BESIDE the engine, not inside it**:
+  coarse mode uses a plain `cds_fair_mutex` (FIFO-fair, futex-parking,
+  zero-allocation). The lane keeps carrying *transactions*, which is what its proof
+  covers. Fine-grained per-node locks (steps 3-6) inherit this constraint: the
+  all-or-none lock-set acquisition may be an MCAS on the state words, but it may not be
+  a txn that *waits* for a peer's release while occupying the lane.
+
+- **No blocking writer lock may be held across a grace-period wait. (PROVEN at
+  implementation, step 2.)** Under QSBR the waiters parked on the lock are RCU-online
+  and non-quiescent — they are precisely what keeps the grace period from completing —
+  so a holder that calls `synchronize_rcu()` while holding the lock deadlocks against
+  its own waiters. (Same invariant the engine states for its lane: *the lane owner
+  never blocks on a GP while holding the mutex*.) Every mid-operation GP wait on a
+  writer-scope path — detach, `make_exclusive`, graft/graft_swap, and the same-trie
+  `merge_at` — therefore **drops the lock, waits, and retakes it**
+  (`ft_writer_lock_gp_wait()`). This is sound, not a hole: the GP sits at the *seam
+  between two distinct commits*, so the structure is coherent and
+  reader-visible-consistent there, and another writer may legitimately run in the
+  window. It does mean an op that spans a GP is **not** one atomic writer critical
+  section, and never was — the pre-existing MW cross-view invariants (not the lock) are
+  what make that window safe.
 
 ---
 
@@ -916,15 +948,27 @@ its `0/1600 @16w` is preserved trivially until the very end.
 Foundational bricks first — the substrate every op conversion consumes ("first
 regardless of op order"):
 
-1. **Engine + words.** Optimistic-acquire / per-FT FIFO-lane engine with the **(a)/(b)
-   seam assertion** (§3.1); the **two-word tombstone split** `node-reclaim` (MW) vs
-   `node-deleted` (SW) (§2) laid into `state` per §8.2; the **abort-boundary gate** (§5:
-   byte-for-byte, un-stamp reclaim, free reserved) wired as the acquire/edit failure path.
-2. **`rank_stats`-ON = one FT-wide lock (§10.5).** The *simplest* `lock`-mode: single
-   lock, no lock-set derivation, classic RCU single-writer. Land it first to exercise the
-   acquire / hold / release + reader-wait-free plumbing end to end with a trivial
-   lock-set — a working `lock`-mode for the `rank_stats`-ON build immediately, and a
-   de-risked substrate for the fine-grained work.
+1. **Engine + words.** — *PARTIALLY LANDED (`4e943653`).* Optimistic-acquire / per-FT
+   FIFO-lane engine with the **(a)/(b) seam assertion** (§3.1); the **two-word tombstone
+   split** `node-reclaim` (MW) vs `node-deleted` (SW) (§2) laid into `state` per §8.2; the
+   **abort-boundary gate** (§5: byte-for-byte, un-stamp reclaim, free reserved) wired as
+   the acquire/edit failure path. *Landed so far: the `node-reclaim` bit is reserved in
+   the state word. The rest — splitting the single `{COPYING → TOMBSTONE}` terminal into
+   three (`release` / `reclaim` / `delete`), which touches the `copying[]` fence-registry
+   drain in `ft_flip_txn_commit` / `ft_flip_txn_destroy` — is deferred to step 3, where
+   the first consumer (recompact) actually needs it: coarse mode's dedicated lock only
+   ever* releases.
+2. **`rank_stats`-ON = one FT-wide lock (§10.5).** — *LANDED (`14545ebb`), as
+   `CDS_FT_WRITER_LOCK_COARSE`.* The *simplest* `lock`-mode: single lock, no lock-set
+   derivation, classic RCU single-writer. Land it first to exercise the acquire / hold /
+   release + reader-wait-free plumbing end to end with a trivial lock-set — a working
+   `lock`-mode immediately, and a de-risked substrate for the fine-grained work.
+   **Two corrections this step forced, both PROVEN, both in §5:** the lock is a plain
+   `cds_fair_mutex` and **not** a txn on the escalation lane (a lock acquire cannot ride
+   the lane — circular wait), and it is **dropped and retaken across every
+   grace-period wait** (a blocking lock held across a GP deadlocks against its own
+   non-quiescent waiters). Scope: single-trie ops; cross-trie ops on two lock-mode tries
+   hard-abort until step 6.
 
 Then the fine-grained (`rank_stats`-OFF) op-domains, smallest / most-local lock-set first
 (the §9 order):
