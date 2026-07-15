@@ -183,6 +183,7 @@
  */
 
 #include <errno.h>
+#include <limits.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -295,6 +296,16 @@ extern "C" {
 #ifndef URCU_TXN_FALLBACK_MAX
 #define URCU_TXN_FALLBACK_MAX		4096
 #endif
+
+urcu_static_assert(URCU_TXN_FALLBACK_PER_COST_NUM >= 0,
+		"URCU_TXN_FALLBACK_PER_COST_NUM must not be negative",
+		urcu_txn_fallback_per_cost_num_nonnegative);
+urcu_static_assert(URCU_TXN_FALLBACK_PER_COST_DEN > 0,
+		"URCU_TXN_FALLBACK_PER_COST_DEN must be greater than zero",
+		urcu_txn_fallback_per_cost_den_positive);
+urcu_static_assert(URCU_TXN_FALLBACK_MIN <= URCU_TXN_FALLBACK_MAX,
+		"URCU_TXN_FALLBACK_MIN must not exceed URCU_TXN_FALLBACK_MAX",
+		urcu_txn_fallback_bounds_ordered);
 
 /*
  * Read-your-own-writes lookup filter (a Bloom word), maintained for every
@@ -1086,17 +1097,28 @@ void urcu_txn__learn_cost(struct urcu_mcas_txn *txn)
 static inline
 unsigned long urcu_txn__fallback_at(const struct urcu_mcas_txn *txn)
 {
+	const unsigned long num = URCU_TXN_FALLBACK_PER_COST_NUM;
+	/* Keep the arithmetic well-formed for the flat and rejected configurations. */
+	const unsigned long scale = num ? num : 1;
+	const unsigned long den = URCU_TXN_FALLBACK_PER_COST_DEN > 0 ?
+		URCU_TXN_FALLBACK_PER_COST_DEN : 1;
 	unsigned long n, t;
 
-	if (!URCU_TXN_FALLBACK_PER_COST_NUM)
+	if (!num)
 		return URCU_TXN_FALLBACK;
 	/*
 	 * 1 until the first attempt has been costed: a handle that has not run
 	 * yet has not retried either, so the budget it gets cannot matter.
 	 */
 	n = txn->last_cost ? txn->last_cost : 1;
-	t = ((unsigned long) URCU_TXN_FALLBACK_PER_COST_NUM * n) /
-		URCU_TXN_FALLBACK_PER_COST_DEN;
+	/*
+	 * A policy override may supply a scale factor large enough for num * n
+	 * to overflow.  The result is capped anyway, so saturate before the
+	 * multiplication rather than letting wraparound select a small budget.
+	 */
+	if (n > ULONG_MAX / scale)
+		return URCU_TXN_FALLBACK_MAX;
+	t = (scale * n) / den;
 	if (t < URCU_TXN_FALLBACK_MIN)
 		t = URCU_TXN_FALLBACK_MIN;	/* also rules out a zero budget */
 	return t > URCU_TXN_FALLBACK_MAX ? URCU_TXN_FALLBACK_MAX : t;
