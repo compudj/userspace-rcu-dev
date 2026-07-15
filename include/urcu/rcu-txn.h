@@ -635,10 +635,11 @@ struct urcu_mcas_txn {
 					 * such a handle costs.
 					 */
 	unsigned int last_cost;		/*
-					 * Cost of the last completed attempt:
-					 * nload + write-set size, learned at
-					 * commit exactly as min_alloc is.  0
-					 * before the first commit attempt.
+					 * High-water mark of completed
+					 * attempts' costs: nload + write-set
+					 * size, sampled at commit or an
+					 * explicit conflict.  0 before the
+					 * first completed attempt.
 					 */
 	int expect_conflict;		/*
 					 * Caller expects this txn to conflict
@@ -1034,16 +1035,16 @@ void urcu_txn_read_unlock(struct urcu_mcas_txn *txn)
  * may block, but the wait is bounded (a FIFO turn behind holders whose commits
  * are bounded MCAS runs) and the lane owner never blocks on a grace period
  * while holding the mutex, so holding the section across the wait cannot
- * extend a grace period unboundedly.  The body comment details why reserve()
- * deliberately enters while inside the bracket; begin() enters before opening
- * it (nothing is pinned yet).
+ * extend a grace period unboundedly.  begin() enters before opening the
+ * read-side section because nothing is pinned yet.
  */
 
 /*
- * Does this handle earn the lane on its own merits -- starved, or known large?
- * Such a handle is an INITIATOR: it advertises the episode.  A handle that
- * escalates only because domain->active was up is a joiner and advertises
- * nothing.  The distinction is what makes an episode terminate.
+ * Does this handle earn the lane on its own merits by retrying to its
+ * cost-scaled budget?  Such a handle is an INITIATOR: it advertises the
+ * episode.  A handle that escalates only because domain->active was up is a
+ * joiner and advertises nothing.  The distinction is what makes an episode
+ * terminate.
  */
 /*
  * What the CURRENT attempt has cost so far: the slots it read plus the edges
@@ -1211,10 +1212,10 @@ void urcu_txn__exit_fallback(struct urcu_mcas_txn *txn)
 }
 
 /*
- * Whether this attempt should escalate into the lock before opening: a starved
- * (retry) or already-known large (min_alloc) handle initiates an episode, and
+ * Whether this attempt should escalate into the lock before opening: a handle
+ * that has retried to its cost-scaled budget initiates an episode, and
  * domain->active funnels every other handle into the same lane for the
- * episode's duration -- that funnelling is what closes the optimistic- writer
+ * episode's duration -- that funnelling is what closes the optimistic-writer
  * set and bounds the escalated op's progress.  domain->active is advisory: a
  * stale read only mis-routes one bounded attempt (the MCAS commit is correct
  * under the resulting concurrency), so it needs no acquire/release, only
@@ -1229,12 +1230,12 @@ int urcu_txn__want_fallback(struct urcu_mcas_txn *txn)
 }
 
 /*
- * A handle that starves (or grows large) while ALREADY holding its turn must be
- * promoted to initiator: it now needs the funnel that the departed initiator's
- * episode had been giving it.  want_fallback() cannot do this -- it is gated on
- * !in_fallback -- so without this a joiner would retry forever inside the lane
- * with the optimistic-writer set wide open, which is precisely the starvation
- * the lane exists to end.
+ * A handle that reaches its retry budget while ALREADY holding its turn must
+ * be promoted to initiator: it now needs the funnel that the departed
+ * initiator's episode had been giving it.  want_fallback() cannot do this -- it
+ * is gated on !in_fallback -- so without this a joiner would retry forever
+ * inside the lane with the optimistic-writer set wide open, which is precisely
+ * the starvation the lane exists to end.
  */
 static inline
 void urcu_txn__maybe_publish(struct urcu_mcas_txn *txn)
@@ -1253,12 +1254,10 @@ void urcu_txn_begin(struct urcu_mcas_txn *txn)
 	txn->retrying = 0;
 	txn->nload = 0;		/* attempt cost is per-attempt */
 	/*
-	 * Escalate before opening the attempt: a starved (retry) or
-	 * already-known large (min_alloc) handle takes its FIFO turn here.
+	 * Escalate before opening the attempt: a handle that has retried to
+	 * its cost-scaled budget takes its FIFO turn here.
 	 * cds_fair_mutex_lock may block; nothing is pinned yet, so take the
-	 * turn before opening the read-side section (holding one across the
-	 * bounded wait would also be sound -- reserve() does; see
-	 * urcu_txn__enter_fallback).
+	 * turn before opening the read-side section.
 	 */
 	if (urcu_txn__want_fallback(txn))
 		urcu_txn__enter_fallback(txn);
@@ -1812,7 +1811,7 @@ void urcu_txn_conflict(struct urcu_mcas_txn *txn)
  * make that end() terminal.  Harmless on a handle that never escalated, or
  * never aborted.
  */
-/* Cost of the last completed attempt: loads + write-set records. */
+/* High-water cost across completed attempts: loads + write-set records. */
 static inline
 unsigned int urcu_txn_last_cost(const struct urcu_mcas_txn *txn)
 {
