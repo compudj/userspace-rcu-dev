@@ -168,7 +168,8 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			struct ft_pub_rec rec = { .n = 0 };
 
 			/* VALIDATE (§4.B): guard the LIVE kept compressed node cn. */
-			ft_flip_txn_guard_parent(ft, txn, ft_compressed_node_flag(cn));
+			ft_flip_txn_lock_or_guard_parent(ft, txn,
+				ft_compressed_node_flag(cn));
 			_ft_publish_to_parent(ft, ft_compressed_node_flag(cn),
 				&cn->child,
 				(struct cds_ft_inode_flag *) topmost_external_nodes,
@@ -191,7 +192,8 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			 * free and infallible for the common plain-parent case.
 			 */
 			/* VALIDATE (§4.B): guard the LIVE kept compressed node cn. */
-			ft_flip_txn_guard_parent(ft, txn, ft_compressed_node_flag(cn));
+			ft_flip_txn_lock_or_guard_parent(ft, txn,
+				ft_compressed_node_flag(cn));
 			_ft_publish_to_parent(ft, ft_compressed_node_flag(cn),
 				&cn->child,
 				(struct cds_ft_inode_flag *) topmost_external_nodes,
@@ -257,8 +259,9 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			 * through the op flip-txn so they flip atomically; lone edge
 			 * stays a single release store.
 			 */
-			/* VALIDATE (§4.B): guard the coherently-resolved grandparent. */
-			ft_flip_txn_guard_parent(ft, txn, pub_parent);
+			/* VALIDATE (§4.B): lock (or guard-fallback) the
+			 * coherently-resolved grandparent -- value-swap target (§10.5). */
+			ft_flip_txn_lock_or_guard_parent(ft, txn, pub_parent);
 			_ft_publish_to_parent(ft, pub_parent,
 				pub_slot,
 				ft_node_flag(fresh, 0),
@@ -680,8 +683,9 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		ft_pub_rec_add_back_edge(ft, &rec, txn, new_cn->child,
 			new_cn_flag, &new_cn->child);
 		new_cn_pub = ft_publish_compressed(ft, new_cn, new_cn_flag);
-		/* VALIDATE (§4.B): guard the LIVE (great-)grandparent publish_parent. */
-		ft_flip_txn_guard_parent(ft, txn, publish_parent);
+		/* VALIDATE (§4.B): lock (or guard-fallback) the LIVE
+		 * (great-)grandparent publish_parent -- value-swap target (§10.5). */
+		ft_flip_txn_lock_or_guard_parent(ft, txn, publish_parent);
 		_ft_publish_to_parent_meta(ft, publish_parent, publish_slot,
 			new_cn_pub, pub_expected_old, new_cn_meta, NULL, &rec);
 		/*
@@ -1778,7 +1782,7 @@ int ft_detach_node(struct cds_ft *ft,
 				 * republish guard, which fires only on the pub-UNARMED path).
 				 */
 				if (commit_txn && !pub->state_meta)
-					ft_flip_txn_guard_parent(ft, commit_txn,
+					ft_flip_txn_lock_or_guard_parent(ft, commit_txn,
 						iter_node_flag);
 				ret = ft_remove_one_commit(ft, pub->slot,
 					pub->old_val, pub->new_val,
@@ -1973,18 +1977,21 @@ int ft_detach_node(struct cds_ft *ft,
 				goto end;
 			}
 			/*
-			 * VALIDATE (§4.B): guard the LIVE grandparent iter_meta->parent.
+			 * VALIDATE (§4.B): lock (or guard-fallback) the LIVE
+			 * grandparent iter_meta->parent -- value-swap target (§10.5).
 			 *
-			 * LOCK_FINE (§9.3): skip the guard ONLY when a recompact actually
+			 * LOCK_FINE (§9.3): skip entirely ONLY when a recompact actually
 			 * ran -- then this grandparent is its P, already locked, and its
 			 * recorded {COPYING|s -> s} release IS the guard, strictly stronger
 			 * (see the ordering rule at ft_flip_txn_record_release_copying).
 			 * The external-promote sub-case below reaches here with
 			 * @old_recompacted_node == NULL and NO recompact, hence no lock on
-			 * this parent -- it still needs the guard.
+			 * this parent -- lock_or_guard acquires it (or guard-falls-back).
 			 */
-			if (!(ft->lock_fine && old_recompacted_node))
-				ft_flip_txn_guard_parent(ft, commit_txn,
+			if (ft->lock_fine && old_recompacted_node)
+				; /* recompact's P already locked; release IS the guard */
+			else
+				ft_flip_txn_lock_or_guard_parent(ft, commit_txn,
 					iter_meta->parent);
 			_ft_publish_to_parent(ft, iter_meta->parent,
 				detach_parent_flag_ptr, iter_node_flag,
@@ -2254,7 +2261,7 @@ int ft_promote_head(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 		ft_flip_txn_record_reserved(txn, (void **) &next_node->prev,
 			next_node->prev, new_cell_flag);
 		/* VALIDATE (§4.B): guard the LIVE holder this head-promote publishes into. */
-		ft_flip_txn_guard_parent(ft, txn, parent_nf);
+		ft_flip_txn_lock_or_guard_parent(ft, txn, parent_nf);
 		_ft_publish_to_parent_meta(ft, parent_nf,
 			(struct cds_ft_inode_flag **) head_slot,
 			(struct cds_ft_inode_flag *) next_node,
@@ -2316,7 +2323,7 @@ int ft_promote_head(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 		ft_flip_txn_record_reserved(txn, (void **) &next_node->prev,
 			prev_save, inherit);
 		/* VALIDATE (§4.B): guard the LIVE holder this head-promote publishes into. */
-		ft_flip_txn_guard_parent(ft, txn, parent_nf);
+		ft_flip_txn_lock_or_guard_parent(ft, txn, parent_nf);
 		_ft_publish_to_parent_meta(ft, parent_nf,
 			(struct cds_ft_inode_flag **) head_slot,
 			(struct cds_ft_inode_flag *) next_node,
@@ -2419,7 +2426,7 @@ int ft_unchain_node(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 		if (!txn)
 			return -ENOMEM;
 		/* VALIDATE (§4.B): guard the LIVE holder this head-clear publishes into. */
-		ft_flip_txn_guard_parent(ft, txn, parent_nf);
+		ft_flip_txn_lock_or_guard_parent(ft, txn, parent_nf);
 		_ft_publish_to_parent(ft, parent_nf,
 			(struct cds_ft_inode_flag **) head_slot, NULL,
 			(struct cds_ft_inode_flag *) node, &rec);
@@ -2749,9 +2756,10 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 						FT_TP(remove_exit, (int) CDS_FT_STATUS_MEMORY_ERROR);
 						return CDS_FT_STATUS_MEMORY_ERROR;
 					}
-					/* VALIDATE (§4.B): guard the LIVE holder whose
-					 * external_nodes this single-node clear empties. */
-					ft_flip_txn_guard_parent(ft, txn, holder_flag);
+					/* VALIDATE (§4.B): lock (or guard-fallback) the
+					 * LIVE holder whose external_nodes this single-node
+					 * clear empties -- value-swap target (§10.5). */
+					ft_flip_txn_lock_or_guard_parent(ft, txn, holder_flag);
 					ft_flip_txn_record_count_parent(ft, txn,
 						holder_flag, -1);
 					ret = ft_remove_one_commit(ft,
@@ -3282,9 +3290,10 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 					*result_node = NULL;
 					return CDS_FT_STATUS_MEMORY_ERROR;
 				}
-				/* VALIDATE (§4.B): guard the LIVE holder whose
-				 * external_nodes this clear empties. */
-				ft_flip_txn_guard_parent(ft, txn, holder_flag);
+				/* VALIDATE (§4.B): lock (or guard-fallback) the LIVE
+				 * holder whose external_nodes this clear empties --
+				 * value-swap target (§10.5). */
+				ft_flip_txn_lock_or_guard_parent(ft, txn, holder_flag);
 				ft_flip_txn_record_count_parent(ft, txn,
 					holder_flag, -1);
 				ft_remove_one_commit(ft,

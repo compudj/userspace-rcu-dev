@@ -1473,6 +1473,75 @@ void ft_flip_txn_guard_parent(const struct cds_ft *ft, struct ft_flip_txn *t,
 			(void *) live, FT_STATE_PROXY);
 }
 
+#ifdef FEATURE_FT_FAULT_INJECT
+extern long cds_ft_fault_lock_countdown;
+#endif
+/*
+ * LOCK_FINE (§9.1/§9.2): acquire @parent_nf -- a SURVIVING, VALUE-SWAP publish
+ * target that the op's forward edge publishes into -- as a per-node RELEASE lock
+ * instead of a §4.B guard.  This is the guard-target half of the lock-set
+ * derivation rule ("guard_parent(X) becomes hold X's lock -- same node") for
+ * every insert/remove publish whose target's OWN body is not copied under the
+ * lock and whose OWN nr_child this op does not change (a value swap): its state
+ * word carries only the lock, so the RELEASE terminal {COPYING|s -> s} is clean.
+ *
+ * On an acquire MISS -- a peer already holds @parent_nf -- fall back to the plain
+ * guard.  For a value-swap target the guard is a correct, weaker representative:
+ * it aborts at commit iff the peer still holds it, else the publish is safe (the
+ * body was never copied under the lock, and the forward record_reserved's
+ * expected-old catches a peer that changed the slot).  So a miss reuses the
+ * existing guard/abort/re-descend teardown with NO new unwind path -- unlike
+ * recompact, which copies C's body under C's lock and so must re-descend on a
+ * miss.  The clean all-or-none acquire (no fallback) arrives when the op's
+ * FT-wide lock drops; under that lock the miss never happens, so normal
+ * operation always takes the release and FEATURE_FT_FAULT_INJECT exercises the
+ * fallback.
+ *
+ * Reservation is net-zero: the release and the guard are each one record on
+ * @parent_nf's state word, and the arm already reserved the guard slot.  NULL
+ * @t / NULL @parent_nf and non-lock_fine tries route straight to the guard
+ * (which no-ops on NULL) -- behaviour-identical.
+ */
+static inline
+void ft_flip_txn_lock_or_guard_parent(const struct cds_ft *ft,
+		struct ft_flip_txn *t, struct cds_ft_inode_flag *parent_nf)
+{
+	if (ft->lock_fine && t && parent_nf) {
+		struct cds_ft_metadata *pmeta = ft_flag_to_metadata(ft, parent_nf);
+		uintptr_t psnap = 0;
+		bool acquired;
+
+#ifdef FEATURE_FT_FAULT_INJECT
+		/*
+		 * Force the acquire to MISS (as a peer holding @parent_nf would),
+		 * exercising the guard fallback the FT-wide lock otherwise makes
+		 * unreachable.  Shares cds_ft_fault_lock_countdown with recompact's
+		 * ft_copying_lock_member: whichever per-node acquire the countdown
+		 * lands on faults, and the op must degrade cleanly either way.
+		 */
+		if (cds_ft_fault_lock_countdown >= 0) {
+			if (cds_ft_fault_lock_countdown == 0) {
+				cds_ft_fault_lock_countdown = -1;
+				acquired = false;
+				goto fault_miss;
+			}
+			cds_ft_fault_lock_countdown--;
+		}
+#endif
+		acquired = !ft_meta_copying_mark(pmeta, &psnap);
+#ifdef FEATURE_FT_FAULT_INJECT
+fault_miss:
+#endif
+		if (caa_likely(acquired)) {
+			ft_flip_txn_record_release_copying(t, pmeta, psnap);
+			ft_flip_txn_copying_register(t, pmeta);
+			return;
+		}
+		/* acquire miss -> guard fallback (value-swap target: safe). */
+	}
+	ft_flip_txn_guard_parent(ft, t, parent_nf);
+}
+
 /*
  * Set a duplicate-chain node's removal tombstone (CDS_FT_NODE_REMOVED_FLAG on
  * cds_ft_node.next) as a COMMITTED flip edge, at the point @node is unlinked
