@@ -1673,8 +1673,14 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 				gd.deferred[j].slot);
 		}
 		/* Forward publish: old dst subtree -> merged cluster. */
-		/* VALIDATE (§4.B): guard the LIVE dst parent above the overlap spine. */
-		ft_flip_txn_guard_parent(dst_ft, txn, pub_parent);
+		/*
+		 * VALIDATE (§4.B) / LOCK_FINE (step 6, §9.4 M-2): acquire the LIVE dst
+		 * parent above the overlap spine as a RELEASE lock.  The forward publish
+		 * is a same-slot REPLACE (nr_child invariant, §9.4 finding 1) so
+		 * pub_parent is a value-swap survivor not recompacted -- guard-fallback
+		 * on an acquire miss is correct; non-lock_fine falls to the §4.B guard.
+		 */
+		ft_flip_txn_lock_or_guard_parent(dst_ft, txn, pub_parent);
 		ft_flip_txn_record_reserved(txn, (void **) pub_slot,
 			D_old, M_slot);
 	}

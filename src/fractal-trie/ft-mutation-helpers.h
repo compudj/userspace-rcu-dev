@@ -4182,8 +4182,15 @@ void ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue *g,
 	 * dance) into @rec; replay them into the txn.  *publish_slot still holds
 	 * the old child here (nothing published yet post-drain).
 	 */
-	/* VALIDATE (§4.B): guard the LIVE dst parent this cluster publishes into. */
-	ft_flip_txn_guard_parent(ft, g->txn, g->publish_parent);
+	/*
+	 * VALIDATE (§4.B) / LOCK_FINE (step 6, §9.5): acquire the LIVE dst parent
+	 * this cluster publishes into as a per-node RELEASE lock ({COPYING|s -> s}).
+	 * publish_parent is a value-swap REPLACE target -- it SURVIVES the commit and
+	 * its body is not copied under the lock -- so a guard-fallback on an acquire
+	 * miss is a correct degradation (identical to insert's ft_insert_publish_or_park
+	 * parent_nf, §9.1); non-lock_fine / NULL parent falls straight to the §4.B guard.
+	 */
+	ft_flip_txn_lock_or_guard_parent(ft, g->txn, g->publish_parent);
 	_ft_publish_to_parent(ft, g->publish_parent, g->publish_slot, g->top,
 		*g->publish_slot /* SW graft: still holds the old child */, &rec);
 	for (j = 0; j < rec.n; j++)
@@ -4400,8 +4407,12 @@ void ft_glue_publish(struct cds_ft *ft, struct ft_flip_txn *txn,
 	 * op's failure-free section), so it commits through the caller-PRE-RESERVED
 	 * @txn (ft_ord_cell_flip_into, infallible).
 	 */
-	/* VALIDATE (§4.B): guard the LIVE dst parent this cluster publishes into. */
-	ft_flip_txn_guard_parent(ft, txn, g->publish_parent);
+	/*
+	 * VALIDATE (§4.B) / LOCK_FINE (step 6, §9.5): acquire publish_parent as a
+	 * RELEASE lock (value-swap REPLACE survivor, guard-fallback on a miss); see
+	 * ft_glue_txn_commit_edges for the full rationale.
+	 */
+	ft_flip_txn_lock_or_guard_parent(ft, txn, g->publish_parent);
 	_ft_publish_to_parent(ft, g->publish_parent, g->publish_slot, g->top,
 		*g->publish_slot /* SW graft: still holds the old child */, &rec);
 	n = ft_pub_rec_sedges(&rec, sedges);
@@ -4439,8 +4450,12 @@ void ft_glue_publish_replace(struct cds_ft *ft, struct ft_flip_txn *txn,
 		ft_glue_publish(ft, txn, g);
 		return;
 	}
-	/* VALIDATE (§4.B): guard the LIVE dst parent this cluster publishes into. */
-	ft_flip_txn_guard_parent(ft, txn, g->publish_parent);
+	/*
+	 * VALIDATE (§4.B) / LOCK_FINE (step 6, §9.5): acquire publish_parent as a
+	 * RELEASE lock (value-swap REPLACE survivor, guard-fallback on a miss); see
+	 * ft_glue_txn_commit_edges for the full rationale.
+	 */
+	ft_flip_txn_lock_or_guard_parent(ft, txn, g->publish_parent);
 	_ft_publish_to_parent(ft, g->publish_parent, g->publish_slot, g->top,
 		*g->publish_slot /* SW graft: still holds the old child */, &rec);
 	/* Order-statistics fold (BULK): see ft_glue_publish. */

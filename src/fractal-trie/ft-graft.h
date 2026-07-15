@@ -622,20 +622,21 @@ void ft_store_at_graft_point_commit(struct cds_ft *ft,
 			 * VALIDATE (§4.B): guard the LIVE grandparent this relocation
 			 * republishes into (a concurrent freeze of it aborts the commit).
 			 *
-			 * LOCK_FINE (§9.3, step 6 note): this is the SAME word the
-			 * recompact driven by ft_store_at_graft_point_prepare's
-			 * ft_node_set_nth_rec locks and records a release on -- its P --
-			 * in this same glue->txn.  Unreachable today (a lock-mode graft /
-			 * merge hard-aborts in ft_crosstrie_lock_mode_guard until step 6),
-			 * and harmless if reached: the release is recorded BEFORE this
-			 * guard, and release-then-guard chains as a read-your-writes no-op
-			 * (ordering rule at ft_flip_txn_record_release_copying).  When
-			 * graft converts, DROP this guard the way insert and remove did --
-			 * the release supersedes it -- and keep it ordered after the
-			 * recompact, never before it.
+			 * LOCK_FINE (§9.3, step 6): this is the SAME word the recompact
+			 * driven by ft_store_at_graft_point_prepare's ft_node_set_nth_rec
+			 * acquired and recorded a release on -- its P -- earlier in this
+			 * same glue->txn.  The release SUPERSEDES this guard (it makes peers
+			 * abort up front, strictly stronger), so under lock_fine we DROP the
+			 * guard exactly as insert (ft_insert_publish_or_park) and remove
+			 * (ft_detach_node's recompact arm) do.  Ordering is safe by
+			 * construction: the release was recorded first, so were the guard
+			 * kept it would chain as a read-your-writes no-op -- never the
+			 * poisoning guard-then-release order (rule at
+			 * ft_flip_txn_record_release_copying).  Non-lock_fine keeps the guard.
 			 */
-			ft_flip_txn_guard_parent(ft, st->glue->txn,
-				st->publish_pmeta->parent);
+			if (!ft->lock_fine)
+				ft_flip_txn_guard_parent(ft, st->glue->txn,
+					st->publish_pmeta->parent);
 			_ft_publish_to_parent(ft, st->dest,
 				st->pnfp, st->dest,
 				*st->pnfp /* SW graft: old dst node */,
