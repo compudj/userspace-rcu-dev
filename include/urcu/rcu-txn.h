@@ -300,6 +300,9 @@ extern "C" {
 urcu_static_assert(URCU_TXN_FALLBACK_PER_COST_NUM >= 0,
 		"URCU_TXN_FALLBACK_PER_COST_NUM must not be negative",
 		urcu_txn_fallback_per_cost_num_nonnegative);
+urcu_static_assert(URCU_TXN_FALLBACK_PER_COST_NUM <= UINT64_MAX / UINT_MAX,
+		"URCU_TXN_FALLBACK_PER_COST_NUM is too large for exact scaling",
+		urcu_txn_fallback_per_cost_num_fits_product);
 urcu_static_assert(URCU_TXN_FALLBACK_PER_COST_DEN > 0,
 		"URCU_TXN_FALLBACK_PER_COST_DEN must be greater than zero",
 		urcu_txn_fallback_per_cost_den_positive);
@@ -1098,12 +1101,11 @@ void urcu_txn__learn_cost(struct urcu_mcas_txn *txn)
 static inline
 unsigned long urcu_txn__fallback_at(const struct urcu_mcas_txn *txn)
 {
-	const unsigned long num = URCU_TXN_FALLBACK_PER_COST_NUM;
+	const uint64_t num = URCU_TXN_FALLBACK_PER_COST_NUM;
 	/* Keep the arithmetic well-formed for the flat and rejected configurations. */
-	const unsigned long scale = num ? num : 1;
-	const unsigned long den = URCU_TXN_FALLBACK_PER_COST_DEN > 0 ?
+	const uint64_t den = URCU_TXN_FALLBACK_PER_COST_DEN > 0 ?
 		URCU_TXN_FALLBACK_PER_COST_DEN : 1;
-	unsigned long n, t;
+	uint64_t n, t;
 
 	if (!num)
 		return URCU_TXN_FALLBACK;
@@ -1112,14 +1114,8 @@ unsigned long urcu_txn__fallback_at(const struct urcu_mcas_txn *txn)
 	 * yet has not retried either, so the budget it gets cannot matter.
 	 */
 	n = txn->last_cost ? txn->last_cost : 1;
-	/*
-	 * A policy override may supply a scale factor large enough for num * n
-	 * to overflow.  The result is capped anyway, so saturate before the
-	 * multiplication rather than letting wraparound select a small budget.
-	 */
-	if (n > ULONG_MAX / scale)
-		return URCU_TXN_FALLBACK_MAX;
-	t = (scale * n) / den;
+	/* The product is double-width, so division happens before any clamp. */
+	t = (num * n) / den;
 	if (t < URCU_TXN_FALLBACK_MIN)
 		t = URCU_TXN_FALLBACK_MIN;	/* also rules out a zero budget */
 	return t > URCU_TXN_FALLBACK_MAX ? URCU_TXN_FALLBACK_MAX : t;

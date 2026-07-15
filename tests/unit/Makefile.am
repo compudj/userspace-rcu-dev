@@ -28,6 +28,7 @@ noinst_PROGRAMS = \
 	test_rcu_txn \
 	test_rcu_txn_grow \
 	test_rcu_txn_fallback \
+	test_rcu_txn_fallback_policy \
 	test_rcu_txn_fallback_publish \
 	test_rcu_txn_validate \
 	test_rcu_txn_sw_list \
@@ -84,6 +85,7 @@ TESTS = \
 	test_rcu_txn \
 	test_rcu_txn_grow \
 	test_rcu_txn_fallback \
+	test_rcu_txn_fallback_policy \
 	test_rcu_txn_fallback_publish \
 	test_rcu_txn_validate \
 	test_rcu_txn_sw_list \
@@ -169,6 +171,9 @@ test_rcu_txn_grow_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
 
 test_rcu_txn_fallback_SOURCES = test_rcu_txn_fallback.c
 test_rcu_txn_fallback_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
+
+test_rcu_txn_fallback_policy_SOURCES = test_rcu_txn_fallback_policy.c
+test_rcu_txn_fallback_policy_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
 
 test_rcu_txn_fallback_publish_SOURCES = test_rcu_txn_fallback_publish.c
 test_rcu_txn_fallback_publish_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
