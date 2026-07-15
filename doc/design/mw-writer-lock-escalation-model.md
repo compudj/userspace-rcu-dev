@@ -473,7 +473,41 @@ For each: enumerate the nodes whose state OR slots are touched; prove the set is
 knowable at descent time or that abort-and-regrow converges; state the read-set that
 the acquisition MCAS validates.
 
-### 9.1 insert (default / `rank_stats`-off build) — PINNED (2026-07-14)
+### 9.1 insert (default / `rank_stats`-off build) — PINNED (2026-07-14); LANDED in part (step 4)
+
+**Landed (LOCK_FINE):** the compressed-split family (I-4a diverge / key-shorter, I-4b
+past-child) is converted at its one shared choke point, `ft_insert_publish_or_park`:
+its `parent_nf` — the publish-into node, which SURVIVES the commit and whose slot is a
+same-slot value swap (I-4a's `P` = CN's parent; I-4b's `CN` itself) — is acquired as a
+per-node RELEASE lock ({COPYING|s → s}) instead of §4.B-guarded. The body-read node
+(`CN`, split/retired) was already COPYING-locked at build entry (ins:653/2188) and
+RETIRE-terminated, so insert has no *new* body-locked node — `parent_nf` is the only
+guard→lock flip, and it is uniform across all three shapes.
+
+On an acquire miss the publish FALLS BACK to the plain guard, which is a correct
+degradation *specifically because* `parent_nf` is a value-swap target whose body is not
+copied under the lock: the guard aborts at commit iff the peer still holds it, else the
+publish is safe. (Contrast recompact, which copies `C`'s body under `C`'s lock and so
+must re-descend on a miss.) The clean all-or-none acquire, with no fallback, arrives
+when insert's FT-wide lock drops; under that lock the miss never happens, so the
+fallback is `FEATURE_FT_FAULT_INJECT`-only.
+
+**Deferred, both principled:**
+- **I-1 in-place reserve `{P}`** — the attach node whose *own* `nr_child` this op
+  increments (a direct latch-CAS, `ft_meta_nr_child_inc`, that does not honor the lock).
+  Locking that node only becomes meaningful once §8.3 moves `nr_child` under the lock
+  (a plain store), so I-1 lands with §8.3 at the end of the transition. Its guards
+  (ins:1632/1827) stay.
+- **I-4b's skip-dual `P`** — the `record_reserved`-owner half of the lock-set (the SKIP_X
+  dual writes a slot in CN's parent), which is unguarded *today* (§9.1.4's under-count).
+  Load-bearing only at the FT-wide-lock drop; deferred with it.
+- **I-3 duplicate append `{L}`** — `L` is a bare `cds_ft_node` hlist with no `state`
+  word, so it cannot take an FT_STATE_COPYING lock; `{L}` is the `last->next` value-CAS
+  in its own private txn. Nothing to convert.
+
+The original derivation follows.
+
+
 
 The lock-set is read off the conflict-guard sites the current MW code already places,
 with one correction. The precise rule is:
@@ -1040,7 +1074,13 @@ Then the fine-grained (`rank_stats`-OFF) op-domains, smallest / most-local lock-
    spurious abort, not a lost update, so the split buys nothing until OPTIMISTIC's
    re-home is retired.*
 4. **insert (§9.1)** — leaf-local `{P}` / `{P, CN}`; the grow case now calls the converted
-   recompact.
+   recompact. — *LANDED in part.* The compressed-split publish-into node (`P` for I-4a,
+   `CN` for I-4b) is converted at the shared `ft_insert_publish_or_park` choke point to a
+   RELEASE lock, guard-fallback on a miss (a value-swap target, so the guard suffices —
+   §9.1). The grow case (I-2) was already carried by step 3's recompact. Deferred with a
+   reason (§9.1): I-1 in-place reserve (its own `nr_child` mutation → §8.3) and I-4b's
+   skip-dual `P` (unguarded under-count → FT-wide-lock drop); I-3 dup-append has no state
+   word to lock.
 5. **remove (§9.2)** — introduces the plan → all-or-none acquire → edit → commit **climb
    template** (§9.2); the shared same-key case serializes on `{L}` (the `ft_promote_head`
    crash pulled into contract).

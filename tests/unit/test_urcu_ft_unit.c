@@ -49,9 +49,9 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 321
+#define NR_TESTS 322
 #else
-#define NR_TESTS 278
+#define NR_TESTS 279
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -505,6 +505,100 @@ static int test_writer_lock_mode_fine(void)
 
 	/* The drain drives the DEL recompacts, and verifies as it shrinks. */
 	return drain_and_destroy(ft, group);
+}
+
+/*
+ * Insert keys crafted to force COMPRESSED-NODE SPLITS, the shape whose forward
+ * publish goes through ft_insert_publish_or_park -- the LOCK_FINE lock-set member
+ * (§9.1, I-4) this step converts from a §4.B guard to a RELEASE lock on the
+ * publish-into (surviving, value-swap) node.  The dense sequential inserts the
+ * smoke tests use build a bushy trie and almost never split; these do, ~7 per
+ * group.
+ *
+ * Each group g: one base key [g,11,22,33,44,55,66,77] creates a single-child
+ * (compressed) chain for bytes 1..7, then seven keys diverging at each depth
+ * 1..7 (one flipped byte) each SPLIT that chain.  All keys are distinct (byte 0
+ * = g, and each diverger flips a distinct byte).  Fills @n[0..8*ng) (caller-
+ * owned, pre-allocated); returns 0, or -1 on the first failed insert.
+ */
+static int fine_split_keys_insert(struct cds_ft *ft, struct ft_test_node **n,
+		unsigned int ng)
+{
+	unsigned int g, d, idx = 0;
+
+	for (g = 0; g < ng; g++) {
+		uint64_t base = ((uint64_t) g << 56) | 0x11223344556677ULL;
+
+		if (insert_u64(ft, base, n[idx]) != CDS_FT_STATUS_OK)
+			return -1;
+		idx++;
+		for (d = 1; d <= 7; d++) {
+			uint64_t key = base ^ (0x80ULL << (8 * (7 - d)));
+
+			if (insert_u64(ft, key, n[idx]) != CDS_FT_STATUS_OK)
+				return -1;
+			idx++;
+		}
+	}
+	return 0;
+}
+
+/*
+ * MW FINE lock-mode, the compressed-split lock-set member (§11.3 step 4): a
+ * CDS_FT_WRITER_LOCK_FINE trie whose inserts force compressed-node splits, so
+ * every forward publish through ft_insert_publish_or_park acquires the
+ * publish-into node as a RELEASE lock (or, on an acquire miss, falls back to the
+ * §4.B guard).  cds_ft_verify catches a leaked lock (a COPYING bit set at rest);
+ * a full presence check catches a lost or mis-published key.
+ */
+#define FINE_SPLIT_NG	48
+static int test_writer_lock_mode_fine_split(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_fine_lock_ft(8, &group);
+	struct ft_test_node **n;
+	unsigned int total = FINE_SPLIT_NG * 8, i;
+	int rc = 0;
+
+	n = (struct ft_test_node **) calloc(total, sizeof(*n));
+	if (!n)
+		abort();
+	for (i = 0; i < total; i++) {
+		uint64_t v = ((uint64_t) (i / 8) << 56)
+			| ((i % 8) ? (0x11223344556677ULL
+				^ (0x80ULL << (8 * (7 - (i % 8)))))
+				: 0x11223344556677ULL);
+		n[i] = node_alloc(v);
+	}
+
+	rcu_read_lock();
+	if (fine_split_keys_insert(ft, n, FINE_SPLIT_NG)) {
+		rcu_read_unlock();
+		fprintf(stderr, "fine split: insert failed\n");
+		free(n);
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "fine split: verify failed -- leaked lock?\n");
+		rc = -1;
+	}
+	/* Every crafted key present (nothing lost or mis-published by a split). */
+	for (i = 0; i < total && !rc; i++) {
+		struct cds_ft_node *found = NULL;
+
+		if (lookup_u64(ft, n[i]->key, &found) != CDS_FT_STATUS_OK
+				|| found != &n[i]->node) {
+			fprintf(stderr, "fine split: key idx %u lost\n", i);
+			rc = -1;
+		}
+	}
+	rcu_read_unlock();
+
+	free(n);
+	if (drain_and_destroy(ft, group) < 0)
+		rc = -1;
+	return rc;
 }
 
 /* ------------------------------------------------------------------ */
@@ -25271,19 +25365,21 @@ static int test_detach_oom_atomicity(void)
  * -- is dead code, and a green LOCK_FINE oracle says NOTHING about it.  (Learned
  * the hard way: a clean MW oracle can mean "the abort path was never taken".)
  *
- * cds_ft_fault_lock_countdown = n fails exactly the (n+1)-th acquire with
- * -EAGAIN, precisely as a peer holding the lock would.  Sweeping n walks the
- * fault across every acquire of the recompact lock-set -- P, and GP when the
- * parent is compressed (the GP case is the interesting one: its unwind must drop
- * the P lock it is already holding) -- at many distinct points of the build.
+ * cds_ft_fault_lock_countdown = n fails exactly the (n+1)-th acquire.  Sweeping
+ * n walks the fault across every per-node acquire of the two converted domains:
+ *  - the recompact lock-set -- P, and GP when the parent is compressed (the GP
+ *    case is the interesting one: its unwind must drop the P lock it already
+ *    holds) -- which re-descends on a miss (dense phase, klen=4); and
+ *  - the compressed-split publish lock (ft_insert_publish_or_park, §11.3 step 4),
+ *    which FALLS BACK to the §4.B guard on a miss (split phase, klen=8).
  *
- * The op must SURVIVE it: -EAGAIN means "could not acquire", the mutator
- * re-descends and retries, and the insert still reports OK.  What is asserted
- * after each armed insert is the abort boundary itself: every key still present,
- * and cds_ft_verify clean -- which is what catches a LEAKED LOCK, since a
- * COPYING bit left set at rest is reported as a leaked copy fence and would wedge
- * every later publish into that node.  A forgotten ft_copying_unlock_members on
- * any bail path fails here.
+ * The op must SURVIVE either way -- re-descend/retry or guard-fallback -- and
+ * still report OK.  What is asserted after each armed insert is the abort
+ * boundary: every key still present, and cds_ft_verify clean -- which catches a
+ * LEAKED LOCK, since a COPYING bit left set at rest is reported as a leaked copy
+ * fence and would wedge every later publish into that node.  A forgotten
+ * ft_copying_unlock_members (recompact) or a mishandled fallback (publish) fails
+ * here.
  */
 static int test_fine_lock_acquire_fault(void)
 {
@@ -25352,6 +25448,72 @@ static int test_fine_lock_acquire_fault(void)
 	free(n);
 	if (drain_and_destroy(ft, group) < 0)
 		rc = -1;
+	if (rc)
+		return rc;
+
+	/*
+	 * Split phase: force the compressed-split publish acquire
+	 * (ft_insert_publish_or_park) to MISS, so the guard fallback fires.  Build
+	 * a group's compressed chain (base), then insert each diverger under the
+	 * fault so the split's forward publish takes the fallback; the insert must
+	 * still succeed (the guard passes -- the node is clean) and verify clean.
+	 */
+	{
+		struct cds_ft_group *sg;
+		struct cds_ft *sft = create_fixed_fine_lock_ft(8, &sg);
+		unsigned int total = FINE_SPLIT_NG * 8, k;
+		struct ft_test_node **sn =
+			(struct ft_test_node **) calloc(total, sizeof(*sn));
+
+		if (!sn)
+			abort();
+		for (k = 0; k < total; k++) {
+			uint64_t v = ((uint64_t) (k / 8) << 56)
+				| ((k % 8) ? (0x11223344556677ULL
+					^ (0x80ULL << (8 * (7 - (k % 8)))))
+					: 0x11223344556677ULL);
+			sn[k] = node_alloc(v);
+		}
+		for (k = 0; k < total && !rc; k++) {
+			rcu_read_lock();
+			/* Fault only the divergers (the splits); base builds clean. */
+			cds_ft_fault_lock_countdown = (k % 8) ? 0 : -1;
+			if (insert_u64(sft, sn[k]->key, sn[k])
+					!= CDS_FT_STATUS_OK) {
+				cds_ft_fault_lock_countdown = -1;
+				rcu_read_unlock();
+				fprintf(stderr, "fine-lock fault: split insert %u "
+					"did not survive the fallback\n", k);
+				rc = -1;
+				break;
+			}
+			cds_ft_fault_lock_countdown = -1;
+			rcu_read_unlock();
+			if (cds_ft_verify(sft, stderr) != CDS_FT_STATUS_OK) {
+				fprintf(stderr, "fine-lock fault: split verify "
+					"failed after %u -- leaked lock?\n", k);
+				rc = -1;
+				break;
+			}
+		}
+		rcu_read_lock();
+		for (k = 0; k < total && !rc; k++) {
+			struct cds_ft_node *found = NULL;
+
+			if (lookup_u64(sft, sn[k]->key, &found)
+					!= CDS_FT_STATUS_OK
+					|| found != &sn[k]->node) {
+				fprintf(stderr, "fine-lock fault: split key %u "
+					"lost\n", k);
+				rc = -1;
+			}
+		}
+		rcu_read_unlock();
+		cds_ft_fault_lock_countdown = -1;
+		free(sn);
+		if (drain_and_destroy(sft, sg) < 0)
+			rc = -1;
+	}
 	return rc;
 }
 
@@ -25978,6 +26140,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_compact_dense_full_node);
 	RUN_TEST(test_writer_lock_mode_coarse);
 	RUN_TEST(test_writer_lock_mode_fine);
+	RUN_TEST(test_writer_lock_mode_fine_split);
 #ifdef FEATURE_FT_FAULT_INJECT
 	RUN_TEST(test_split_oom_backpointer);
 	RUN_TEST(test_split_oom_key_shorter_arm);
