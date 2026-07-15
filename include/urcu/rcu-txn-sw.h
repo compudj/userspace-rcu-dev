@@ -318,6 +318,10 @@ urcu_static_assert(!(offsetof(struct urcu_txn_sw_block, latches) % 16),
  * proxy -- keeps its low 4 bits free, letting a low-4-bit pointer-tagging
  * embedder (e.g. the fractal trie) route its slots through this engine.
  */
+#ifdef URCU_TXN_SW_EXCL_VALIDATE
+#include <pthread.h>
+#endif
+
 struct urcu_txn_sw_txn {
 	enum urcu_txn_sw_state state;
 	struct urcu_txn_sw_latch *latches;	/* record array (realloc-grown, or caller-owned if @latches_inline) */
@@ -326,7 +330,7 @@ struct urcu_txn_sw_txn {
 	unsigned int cap;
 	bool latches_inline;			/* @latches is caller storage: never realloc'd, never freed */
 #ifdef URCU_TXN_SW_EXCL_VALIDATE
-	unsigned long excl_owner;		/*
+	pthread_t excl_owner;			/*
 						 * pthread_self() of the thread
 						 * that init'd this handle; the
 						 * handle must be driven end to
@@ -345,8 +349,8 @@ struct urcu_txn_sw_txn {
  * no conflict detection and no abort, so two writers racing on one slot simply
  * corrupt it, and nothing in a default build says so.  Enable with
  * -DURCU_TXN_SW_EXCL_VALIDATE to have a violation abort the process with a
- * report naming the slot and the threads.  Off by default (zero overhead: no
- * checks, and the handle does not even carry the owner field).
+ * report identifying the violated handle or slot.  Off by default (zero
+ * overhead: no checks, and the handle does not even carry the owner field).
  *
  * There is no per-structure object to claim an owner on, as <urcu/rcu-txn.h>'s
  * concurrent front-end has in its escalation domain: the sw mutators take a
@@ -376,7 +380,6 @@ struct urcu_txn_sw_txn {
  */
 #ifdef URCU_TXN_SW_EXCL_VALIDATE
 
-#include <pthread.h>
 #include <stdio.h>
 
 #define urcu_txn_sw__excl_abort(...)					\
@@ -401,17 +404,17 @@ int urcu_txn_sw__is_proxy(const void *v, uintptr_t tag)
 static inline
 void urcu_txn_sw__excl_claim(struct urcu_txn_sw_txn *t)
 {
-	t->excl_owner = (unsigned long) pthread_self();
+	t->excl_owner = pthread_self();
 }
 
 static inline
 void urcu_txn_sw__excl_owner(const struct urcu_txn_sw_txn *t, const char *what)
 {
-	unsigned long self = (unsigned long) pthread_self();
+	pthread_t self = pthread_self();
 
-	if (t->excl_owner != self)
-		urcu_txn_sw__excl_abort("txn=%p: %s on thread 0x%lx, but the handle was initialized by thread 0x%lx -- one transaction is driven end to end by one thread\n",
-			(const void *) t, what, self, t->excl_owner);
+	if (!pthread_equal(t->excl_owner, self))
+		urcu_txn_sw__excl_abort("txn=%p: %s on a thread other than the one that initialized the handle -- one transaction is driven end to end by one thread\n",
+			(const void *) t, what);
 }
 
 /* @slot must not already be parked by somebody else. */
