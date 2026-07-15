@@ -861,6 +861,31 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 	size_t src_max;
 	enum cds_ft_status status;
 
+	/*
+	 * MW LOCK_FINE (step 6, §9.5): a cross-trie graft CONSUMES the whole
+	 * source, so the source must be EXCLUSIVE -- no concurrent readers or
+	 * writers.  An exclusive src skips its FT-wide lock
+	 * (ft_writer_lock_scope_enter), so only dst's lock is ever taken: one
+	 * lock, no cross-trie deadlock.  Two LIVE lock-mode tries would instead
+	 * need BOTH FT-wide locks with no lock order (thread 1 grafts a->b while
+	 * thread 2 grafts b->a -> circular wait), so a live (lock-mode,
+	 * non-exclusive) source is REJECTED with BUSY before anything is touched
+	 * -- both tries are byte-for-byte unchanged.  The caller makes the source
+	 * exclusive first (cds_ft_make_exclusive), which is the zone-graft "build
+	 * private, graft" pattern.  With an exclusive src the fused body below
+	 * runs directly and is build-invisible, so a rejected graft (POPULATED /
+	 * OVERFLOW / OOM) leaves the source PRISTINE -- no residual sink needed.
+	 *
+	 * Gated on the SOURCE alone: dst may be a LIVE concurrent trie (the
+	 * supported case).  A SAME-trie op (src == dst, reachable via
+	 * cds_ft_merge_at's whole-source rekey) is excluded -- it takes one lock
+	 * reentrantly, like the crosstrie guard's a != b test.  Inert outside
+	 * lock-mode -- optimistic groups have lock_mode == false and never take
+	 * FT-wide locks for a cross-trie graft.
+	 */
+	if (src_ft != dst_ft && src_ft->lock_mode && !src_ft->exclusive)
+		return CDS_FT_STATUS_BUSY_ERROR;
+
 	ft_crosstrie_lock_mode_guard(dst_ft, src_ft);
 	CDS_FT_SCOPED_WRITER(dst_ft);
 	CDS_FT_SCOPED_WRITER(src_ft);
@@ -905,20 +930,27 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 			return CDS_FT_STATUS_MEMORY_ERROR;
 
 		/*
-		 * Pre-reserve the cross-trie dual root-swap txn while both tries
-		 * are still pristine (the swap is the op's sole reader-visible
-		 * change, so this is the abort boundary).  The dual always flips
-		 * both roots, so it is always multi-edge even list-off -- it cannot
-		 * reduce to a lone store.  +1 edge for the dst old-root freeze-on-
-		 * free tombstone fused into the same swap (atomic detach, §4.B).
-		 * OOM here aborts cleanly (free the fresh root, both tries untouched).
+		 * The cross-trie dual root-swap txn.  Take the caller's PRE-RESERVED
+		 * @pre_txn when one is supplied (cds_ft_merge_at's rekey pre-reserves a
+		 * glue txn before its own fallible steps and passes it down so this
+		 * forward root swap is node-infallible) -- else create+reserve one here
+		 * while both tries are still pristine (the swap is the op's sole
+		 * reader-visible change, so this is the abort boundary).
+		 * The dual always flips both roots, so it is always multi-edge even
+		 * list-off -- it cannot reduce to a lone store.  +1 edge for the dst
+		 * old-root freeze-on-free tombstone fused into the same swap (atomic
+		 * detach, §4.B).  A create OOM aborts cleanly (free the fresh root, both
+		 * tries untouched); a taken txn cannot fail.
 		 */
-		struct ft_flip_txn *dual_txn = ft_flip_txn_create_bounded(
-			FT_ROOT_LIST_SWAP_DUAL_MAX_EDGES + 1);
+		struct ft_flip_txn *dual_txn = ft_flip_txn_take(pre_txn);
 
 		if (!dual_txn) {
-			free_cds_ft_node_unpublished(dst_ft, fresh_root);
-			return CDS_FT_STATUS_MEMORY_ERROR;
+			dual_txn = ft_flip_txn_create_bounded(
+				FT_ROOT_LIST_SWAP_DUAL_MAX_EDGES + 1);
+			if (!dual_txn) {
+				free_cds_ft_node_unpublished(dst_ft, fresh_root);
+				return CDS_FT_STATUS_MEMORY_ERROR;
+			}
 		}
 
 		/*
@@ -1564,6 +1596,23 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 	if (dst_ft->group != swap_ft->group) {
 		FT_TP(graft_swap_exit, (int) CDS_FT_STATUS_INVALID_ARGUMENT_ERROR);
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	}
+
+	/*
+	 * MW LOCK_FINE (step 6, §9.5): @swap_ft is the consumed source of the
+	 * exchange, so like cds_ft_graft it must be EXCLUSIVE -- an exclusive
+	 * swap skips its FT-wide lock, so only dst's lock is taken (one lock, no
+	 * cross-trie deadlock), and the dual root/subtree swap runs directly and
+	 * is build-invisible (a rejected swap leaves both tries pristine).  A
+	 * LIVE (lock-mode, non-exclusive) @swap_ft is REJECTED with BUSY before
+	 * anything is touched; the caller makes it exclusive first
+	 * (cds_ft_make_exclusive).  @dst_ft may be a live concurrent trie.  Inert
+	 * outside lock-mode.  (On success @swap_ft inherits @dst_ft's access
+	 * discipline -- see the header -- so it may end up concurrent again.)
+	 */
+	if (swap_ft->lock_mode && !swap_ft->exclusive) {
+		FT_TP(graft_swap_exit, (int) CDS_FT_STATUS_BUSY_ERROR);
+		return CDS_FT_STATUS_BUSY_ERROR;
 	}
 
 	ft_crosstrie_lock_mode_guard(dst_ft, swap_ft);

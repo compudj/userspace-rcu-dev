@@ -1627,9 +1627,14 @@ struct cds_ft {
  * stable from lock to unlock -- which happen in two different functions (the
  * writer-scope enter and its cleanup).  @ft_wlock_held names the trie whose lock
  * this thread holds (NULL = none) and doubles as the reentrancy test; a thread
- * holds AT MOST ONE FT-wide lock, which ft_crosstrie_lock_mode_guard enforces by
- * rejecting the only ops that could nest two (cross-trie graft / merge /
- * graft_swap).  @ft_wlock_depth counts reentrant writer scopes on that one trie
+ * holds AT MOST ONE FT-wide lock.  Two complements keep that true for cross-trie
+ * graft / merge / graft_swap (the only ops that scope two tries):
+ * ft_crosstrie_lock_mode_guard rejects a BOTH-LIVE lock-mode pair, and step 6's
+ * exclusive-source contract requires the CONSUMED source (graft/merge src,
+ * graft_swap swap) to be EXCLUSIVE -- a live source is rejected with BUSY at the
+ * op entry, and an exclusive trie's writer scope SKIPS the lock
+ * (ft_writer_lock_scope_enter) -- so a cross-trie op holds only the live dst's
+ * lock.  @ft_wlock_depth counts reentrant writer scopes on that one trie
  * (a same-thread nest such as graft_swap -> graft) so the lock is taken once at
  * the outermost enter and released once at the outermost exit.
  */
@@ -1649,6 +1654,25 @@ void ft_writer_lock_scope_enter(struct cds_ft *ft)
 		return;
 	if (ft_wlock_held == ft) {
 		ft_wlock_depth++;		/* reentry on the trie we hold */
+		return;
+	}
+	if (ft->exclusive) {
+		/*
+		 * An exclusive trie is private / single-writer by contract
+		 * (step 6, §9.5): no concurrent writers, so no FT-wide lock
+		 * is needed.  Skipping it lets a cross-trie op hold only the
+		 * LIVE side's lock while the exclusive consumed source (the
+		 * caller's cds_ft_make_exclusive'd src, or a detach product)
+		 * rides through the fused op body -- one lock at a time, no
+		 * cross-trie deadlock.
+		 *
+		 * Checked AFTER the reentrancy test on purpose: a trie whose
+		 * lock we already hold and that then flips exclusive mid-scope
+		 * (cds_ft_make_exclusive) must keep depth-counting its nested
+		 * scopes.  And ft_writer_lock_scope_exit keys its release off
+		 * @ft_wlock_held identity -- never a re-read of @exclusive --
+		 * so a mid-scope flip of the flag cannot unbalance the lock.
+		 */
 		return;
 	}
 	if (caa_unlikely(ft_wlock_held != NULL)) {
@@ -1674,6 +1698,19 @@ static inline
 void ft_writer_lock_scope_exit(struct cds_ft *ft)
 {
 	if (caa_likely(!ft->lock_mode))
+		return;
+	/*
+	 * Unwind only the lock THIS thread actually holds for @ft.  When the
+	 * enter SKIPPED the lock (an exclusive trie) or we hold a DIFFERENT
+	 * trie's lock, @ft_wlock_held != ft and there is nothing to release.
+	 * Keying off identity (not a re-read of @ft->exclusive) means an
+	 * @exclusive flip between enter and exit -- cds_ft_make_exclusive
+	 * (false->true) or cds_ft_make_concurrent (true->false) -- can never
+	 * unbalance us: make_exclusive took the lock at enter (exclusive was
+	 * false) and releases it here (held == ft), make_concurrent skipped it
+	 * at enter (exclusive was true) and skips it here (held != ft).
+	 */
+	if (ft_wlock_held != ft)
 		return;
 	if (--ft_wlock_depth != 0)
 		return;			/* nested scope: keep the lock held */
@@ -1889,23 +1926,35 @@ void ft_excl_reader_scope_exit(struct ft_excl_reader_scope *scope)
 
 /*
  * MW lock-mode: hard guard at a CROSS-trie op entry (graft / merge / graft_swap
- * between DISTINCT tries @a and @b, both taken before their two per-ft writer
- * scopes).  Such an op is not yet converted to lock-mode: each scope takes that
- * trie's own FT-wide lock, so two lock-mode tries would take two locks and
- * could deadlock (thread 1 grafts a->b while thread 2 grafts b->a).  §11.2
- * mandates a HARD ASSERT on an unconverted op touching a lock-mode trie, never
- * a silent fallback; cross-trie lock-mode arrives at step 6 (decomposed into
- * sequential single-domain commits).  A SAME-trie merge (@a == @b) takes one
- * lock reentrantly and is allowed, so this fires only on distinct tries.
+ * between DISTINCT tries @a and @b, both scoped before their two per-ft writer
+ * scopes).  Fires only when BOTH tries are LIVE (non-exclusive) lock-mode: that
+ * is the pair whose two writer scopes would take two FT-wide locks with no lock
+ * order and could deadlock (thread 1 grafts a->b while thread 2 grafts b->a).
+ *
+ * Step 6 (§9.5) avoids that pair by CONTRACT: a cross-trie op requires its
+ * consumed source (graft/merge src, graft_swap swap) to be EXCLUSIVE, and the
+ * public entry rejects a live source with CDS_FT_STATUS_BUSY_ERROR before taking
+ * any lock.  An exclusive source's writer scope skips the lock
+ * (ft_writer_lock_scope_enter), so one lock is held and there is no deadlock.
+ * By the time an op reaches the fused body the source is always exclusive, so
+ * this guard is a defense-in-depth assert: a both-live pair reaching here means
+ * a BUSY gate was missed (a bug), and it aborts rather than deadlock.
+ *
+ * A SAME-trie merge (@a == @b) takes one lock reentrantly and is allowed, so
+ * this fires only on distinct tries.  An op touching an EXCLUSIVE side is
+ * already single-domain (only the live side's lock is taken).
  */
 static inline
 void ft_crosstrie_lock_mode_guard(const struct cds_ft *a, const struct cds_ft *b)
 {
-	if (caa_unlikely(a != b && (a->lock_mode || b->lock_mode))) {
+	if (caa_unlikely(a != b
+			&& (a->lock_mode && !a->exclusive)
+			&& (b->lock_mode && !b->exclusive))) {
 		fprintf(stderr,
-			"cds_ft: cross-trie op on a lock-mode trie is not yet "
-			"supported (cds_ft=%p / %p); cross-trie lock-mode lands "
-			"at step 6\n", (const void *) a, (const void *) b);
+			"cds_ft: both-live cross-trie op on lock-mode tries reached "
+			"the fused body (cds_ft=%p / %p); the source must be "
+			"exclusive -- a live source should have been rejected with "
+			"CDS_FT_STATUS_BUSY_ERROR\n", (const void *) a, (const void *) b);
 		fflush(stderr);
 		abort();
 	}

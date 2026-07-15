@@ -49,9 +49,9 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 323
+#define NR_TESTS 325
 #else
-#define NR_TESTS 279
+#define NR_TESTS 281
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -348,6 +348,32 @@ static struct cds_ft *create_fixed_fine_lock_ft(size_t klen,
 	return ft;
 }
 
+/*
+ * Variable-length trie in MW FINE lock-mode (CDS_FT_WRITER_LOCK_FINE).  Varlen
+ * (no set_key_len) so a sub-prefix graft is accepted, which the cross-trie graft
+ * oracle needs.  Every trie created in @group_out inherits LOCK_FINE, so a second
+ * cds_ft_create(group, ...) yields a second LIVE lock-mode trie for the pair.
+ */
+static struct cds_ft *create_varlen_fine_lock_ft(struct cds_ft_group **group_out)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+
+	if (cds_ft_group_attr_create(&attr) < 0)
+		abort();
+	if (cds_ft_group_attr_set_writer_strategy(attr,
+			CDS_FT_WRITER_LOCK_FINE) < 0)
+		abort();
+	if (cds_ft_group_create(attr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &ft) < 0)
+		abort();
+	*group_out = group;
+	return ft;
+}
+
 /* Insert helper for fixed-length integer keys. */
 static enum cds_ft_status
 insert_u64(struct cds_ft *ft, uint64_t v, struct ft_test_node *n)
@@ -598,6 +624,293 @@ static int test_writer_lock_mode_fine_split(void)
 	free(n);
 	if (drain_and_destroy(ft, group) < 0)
 		rc = -1;
+	return rc;
+}
+
+/* Defined far below (with the graft tests); used by the cross-trie oracle. */
+static int drain_trie(struct cds_ft *ft);
+
+/*
+ * MW FINE lock-mode, cross-trie graft under the exclusive-source contract
+ * (§11.3 step 6): a cds_ft_graft into a LIVE lock-mode dst requires the SOURCE
+ * to be EXCLUSIVE (cds_ft_make_exclusive) -- a live source is rejected with
+ * BUSY (see test_writer_lock_mode_fine_crosstrie_busy).  With an exclusive
+ * source only dst's FT-wide lock is taken, and the fused body is build-
+ * invisible, so a rejected graft leaves the source PRISTINE (no residual sink
+ * is needed).  Arms:
+ *  A. sub-prefix graft (key_len>0): keys move to dst, the source empties;
+ *  B. root graft (key_len==0) into an empty dst: the whole source moves;
+ *  C. POPULATED reject: the fused body fails invisibly, so the source keeps
+ *     ALL its keys (pristine) -- no key is lost or stranded.
+ * cds_ft_verify catches a COPYING lock leaked on either trie at rest.
+ */
+static int test_writer_lock_mode_fine_graft(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *dst = create_varlen_fine_lock_ft(&group);
+	struct cds_ft *src = NULL, *src2 = NULL, *dst2 = NULL;
+	struct cds_ft_node *found;
+	enum cds_ft_status s;
+	int rc = -1;
+
+	if (cds_ft_create(group, NULL, &src) < 0)
+		goto out;
+
+	/* ---- Part A: sub-prefix graft, exclusive source into a live dst. ---- */
+	{
+		struct ft_test_node *n1 = node_alloc(0);
+		struct ft_test_node *n2 = node_alloc(0);
+
+		if (cds_ft_insert(src, (const uint8_t *) "lo", 2, &n1->node) < 0)
+			goto out;
+		if (cds_ft_insert(src, (const uint8_t *) "lp", 2, &n2->node) < 0)
+			goto out;
+	}
+	cds_ft_make_exclusive(src);	/* the source must be exclusive to graft */
+	rcu_read_lock();
+	s = cds_ft_graft(dst, (const uint8_t *) "he", 2, src);
+	rcu_read_unlock();
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "fine graft A: %s\n", cds_ft_status_to_string(s));
+		goto out;
+	}
+	if (!cds_ft_empty(src)) {
+		fprintf(stderr, "fine graft A: src not empty after graft\n");
+		goto out;
+	}
+	rcu_read_lock();
+	s = cds_ft_eager_lookup_key(dst, (const uint8_t *) "helo", 4, 0, &found);
+	if (s != CDS_FT_STATUS_OK || !found) {
+		rcu_read_unlock();
+		fprintf(stderr, "fine graft A: 'helo' missing in dst\n");
+		goto out;
+	}
+	s = cds_ft_eager_lookup_key(dst, (const uint8_t *) "help", 4, 0, &found);
+	if (s != CDS_FT_STATUS_OK || !found) {
+		rcu_read_unlock();
+		fprintf(stderr, "fine graft A: 'help' missing in dst\n");
+		goto out;
+	}
+	rcu_read_unlock();
+	if (cds_ft_verify(dst, stderr) != CDS_FT_STATUS_OK
+			|| cds_ft_verify(src, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "fine graft A: verify failed -- leaked lock?\n");
+		goto out;
+	}
+
+	/* ---- Part B: root graft (key_len==0), exclusive src2 into empty dst2. ---- */
+	if (cds_ft_create(group, NULL, &dst2) < 0)
+		goto out;
+	if (cds_ft_create(group, NULL, &src2) < 0)
+		goto out;
+	{
+		struct ft_test_node *n1 = node_alloc(0);
+		struct ft_test_node *n2 = node_alloc(0);
+
+		if (cds_ft_insert(src2, (const uint8_t *) "xy", 2, &n1->node) < 0)
+			goto out;
+		if (cds_ft_insert(src2, (const uint8_t *) "xz", 2, &n2->node) < 0)
+			goto out;
+	}
+	cds_ft_make_exclusive(src2);
+	rcu_read_lock();
+	s = cds_ft_graft(dst2, NULL, 0, src2);
+	rcu_read_unlock();
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "fine graft B: %s\n", cds_ft_status_to_string(s));
+		goto out;
+	}
+	if (!cds_ft_empty(src2)) {
+		fprintf(stderr, "fine graft B: src2 not empty after root graft\n");
+		goto out;
+	}
+	rcu_read_lock();
+	s = cds_ft_eager_lookup_key(dst2, (const uint8_t *) "xy", 2, 0, &found);
+	if (s != CDS_FT_STATUS_OK || !found) {
+		rcu_read_unlock();
+		fprintf(stderr, "fine graft B: 'xy' missing in dst2\n");
+		goto out;
+	}
+	rcu_read_unlock();
+
+	/* ---- Part C: POPULATED reject leaves the exclusive source PRISTINE. ---- */
+	{
+		struct ft_test_node *nab = node_alloc(0);
+		struct ft_test_node *n1 = node_alloc(0);
+		struct ft_test_node *n2 = node_alloc(0);
+
+		/* dst gets a leaf key "ab"; grafting src AT "ab" must reject. */
+		rcu_read_lock();
+		s = cds_ft_insert(dst, (const uint8_t *) "ab", 2, &nab->node);
+		rcu_read_unlock();
+		if (s < 0)
+			goto out;
+		/* src is exclusive (emptied by Part A); refill it in place. */
+		if (cds_ft_insert(src, (const uint8_t *) "zz", 2, &n1->node) < 0)
+			goto out;
+		if (cds_ft_insert(src, (const uint8_t *) "zw", 2, &n2->node) < 0)
+			goto out;
+	}
+	rcu_read_lock();
+	s = cds_ft_graft(dst, (const uint8_t *) "ab", 2, src);
+	rcu_read_unlock();
+	if (s != CDS_FT_STATUS_POPULATED_ERROR) {
+		fprintf(stderr, "fine graft C: expected POPULATED_ERROR, got %s\n",
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+	/*
+	 * The fused body fails invisibly, so the source keeps ALL its keys
+	 * (pristine); nothing is lost or stranded, and no residual is produced.
+	 */
+	if (cds_ft_empty(src)) {
+		fprintf(stderr, "fine graft C: source emptied by a rejected graft\n");
+		goto out;
+	}
+	rcu_read_lock();
+	s = cds_ft_eager_lookup_key(src, (const uint8_t *) "zz", 2, 0, &found);
+	if (s != CDS_FT_STATUS_OK || !found) {
+		rcu_read_unlock();
+		fprintf(stderr, "fine graft C: source lost 'zz' after reject\n");
+		goto out;
+	}
+	s = cds_ft_eager_lookup_key(src, (const uint8_t *) "zw", 2, 0, &found);
+	if (s != CDS_FT_STATUS_OK || !found) {
+		rcu_read_unlock();
+		fprintf(stderr, "fine graft C: source lost 'zw' after reject\n");
+		goto out;
+	}
+	rcu_read_unlock();
+	if (cds_ft_verify(src, stderr) != CDS_FT_STATUS_OK
+			|| cds_ft_verify(dst, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "fine graft C: verify failed after reject\n");
+		goto out;
+	}
+
+	rc = 0;
+out:
+	if (src)
+		drain_trie(src);
+	if (src2)
+		drain_trie(src2);
+	if (dst2)
+		drain_trie(dst2);
+	drain_trie(dst);
+	rcu_barrier();
+	if (src)
+		cds_ft_destroy(src);
+	if (src2)
+		cds_ft_destroy(src2);
+	if (dst2)
+		cds_ft_destroy(dst2);
+	cds_ft_destroy(dst);
+	cds_ft_group_destroy(group);
+	return rc;
+}
+
+/*
+ * MW FINE lock-mode: the exclusive-source CONTRACT (§11.3 step 6).  Under
+ * CDS_FT_WRITER_LOCK_FINE a cross-trie graft / merge_at / graft_swap consumes
+ * its source, so a LIVE (concurrent, non-exclusive) source is rejected with
+ * CDS_FT_STATUS_BUSY_ERROR BEFORE any lock is taken -- both tries are left
+ * byte-for-byte unchanged.  This pins that gate for all three entry points and
+ * confirms the op SUCCEEDS once the source is made exclusive.
+ */
+static int test_writer_lock_mode_fine_crosstrie_busy(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *dst = create_varlen_fine_lock_ft(&group);
+	struct cds_ft *src = NULL;
+	struct cds_ft_node *found;
+	enum cds_ft_status s;
+	int rc = -1;
+
+	if (cds_ft_create(group, NULL, &src) < 0)
+		goto out;
+	/* src stays LIVE (lock-mode, non-exclusive). */
+	{
+		struct ft_test_node *n1 = node_alloc(0);
+		struct ft_test_node *n2 = node_alloc(0);
+
+		if (cds_ft_insert(src, (const uint8_t *) "lo", 2, &n1->node) < 0)
+			goto out;
+		if (cds_ft_insert(src, (const uint8_t *) "lp", 2, &n2->node) < 0)
+			goto out;
+	}
+
+	/* graft: live source -> BUSY. */
+	s = cds_ft_graft(dst, (const uint8_t *) "he", 2, src);
+	if (s != CDS_FT_STATUS_BUSY_ERROR) {
+		fprintf(stderr, "busy graft: expected BUSY_ERROR, got %s\n",
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+
+	/* graft_swap: live source -> BUSY. */
+	s = cds_ft_graft_swap(dst, (const uint8_t *) "he", 2, src);
+	if (s != CDS_FT_STATUS_BUSY_ERROR) {
+		fprintf(stderr, "busy graft_swap: expected BUSY_ERROR, got %s\n",
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+
+	/* merge_at: live source -> BUSY. */
+	s = cds_ft_merge_at(dst, (const uint8_t *) "he", 2, src,
+			(const uint8_t *) "l", 1);
+	if (s != CDS_FT_STATUS_BUSY_ERROR) {
+		fprintf(stderr, "busy merge_at: expected BUSY_ERROR, got %s\n",
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+
+	/* Nothing was touched: src keeps its keys, dst is still empty. */
+	if (cds_ft_empty(src)) {
+		fprintf(stderr, "busy: source emptied by a rejected op\n");
+		goto out;
+	}
+	rcu_read_lock();
+	s = cds_ft_eager_lookup_key(src, (const uint8_t *) "lo", 2, 0, &found);
+	if (s != CDS_FT_STATUS_OK || !found) {
+		rcu_read_unlock();
+		fprintf(stderr, "busy: source lost 'lo'\n");
+		goto out;
+	}
+	rcu_read_unlock();
+	if (!cds_ft_empty(dst)) {
+		fprintf(stderr, "busy: dst mutated by a rejected op\n");
+		goto out;
+	}
+	if (cds_ft_verify(src, stderr) != CDS_FT_STATUS_OK
+			|| cds_ft_verify(dst, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "busy: verify failed\n");
+		goto out;
+	}
+
+	/* Making the source exclusive lifts the gate: the same graft succeeds. */
+	cds_ft_make_exclusive(src);
+	rcu_read_lock();
+	s = cds_ft_graft(dst, (const uint8_t *) "he", 2, src);
+	rcu_read_unlock();
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "busy: graft after make_exclusive: %s\n",
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+	if (!cds_ft_empty(src)) {
+		fprintf(stderr, "busy: src not empty after the exclusive graft\n");
+		goto out;
+	}
+
+	rc = 0;
+out:
+	if (src)
+		drain_trie(src);
+	drain_trie(dst);
+	rcu_barrier();
+	if (src)
+		cds_ft_destroy(src);
+	cds_ft_destroy(dst);
+	cds_ft_group_destroy(group);
 	return rc;
 }
 
@@ -25514,6 +25827,91 @@ static int test_fine_lock_acquire_fault(void)
 		if (drain_and_destroy(sft, sg) < 0)
 			rc = -1;
 	}
+
+	/*
+	 * Cross-trie graft phase (step 6): force the forward-publish acquire --
+	 * the 6A RELEASE lock in ft_glue_publish / ft_glue_txn_commit_edges -- to
+	 * MISS, so the §4.B guard fallback fires under lock_fine.  A lock-acquire
+	 * fault only ever costs a fallback or a re-descend, never a lost key, so
+	 * every armed cross-trie graft (exclusive source into a live dst) must
+	 * still return OK, move the source, and verify clean.  A pre-inserted "hz"
+	 * makes the graft at "he" DIVERGE (GLUE), so ft_glue_publish is on the
+	 * path; sweeping the fault walks it across the op's acquires (probe-
+	 * confirmed: f=0 faults the publish acquire and the guard fallback carries
+	 * the graft).
+	 */
+	{
+		unsigned int f;
+
+		for (f = 0; f < 3 && !rc; f++) {
+			struct cds_ft_group *gg;
+			struct cds_ft *gdst = create_varlen_fine_lock_ft(&gg);
+			struct cds_ft *gsrc = NULL;
+			struct cds_ft_node *found = NULL;
+			struct ft_test_node *ga, *gb, *ghz;
+			enum cds_ft_status s = CDS_FT_STATUS_OK;
+
+			if (cds_ft_create(gg, NULL, &gsrc) < 0) {
+				drain_and_destroy(gdst, gg);
+				rc = -1;
+				break;
+			}
+			ga = node_alloc(0);
+			gb = node_alloc(0);
+			ghz = node_alloc(0);
+			rcu_read_lock();
+			if (cds_ft_insert(gdst, (const uint8_t *) "hz", 2, &ghz->node) < 0
+					|| cds_ft_insert(gsrc, (const uint8_t *) "lo", 2,
+						&ga->node) < 0
+					|| cds_ft_insert(gsrc, (const uint8_t *) "lp", 2,
+						&gb->node) < 0)
+				s = CDS_FT_STATUS_MEMORY_ERROR;
+			rcu_read_unlock();
+
+			if (s == CDS_FT_STATUS_OK) {
+				/* The source must be exclusive to graft under lock_fine. */
+				cds_ft_make_exclusive(gsrc);
+				rcu_read_lock();
+				cds_ft_fault_lock_countdown = (long) f;
+				s = cds_ft_graft(gdst, (const uint8_t *) "he", 2, gsrc);
+				cds_ft_fault_lock_countdown = -1;
+				rcu_read_unlock();
+			}
+			if (s != CDS_FT_STATUS_OK) {
+				fprintf(stderr, "fine-lock fault: cross-trie graft did not "
+					"survive an acquire miss (fault=%u): %s\n", f,
+					cds_ft_status_to_string(s));
+				rc = -1;
+			}
+			if (!rc) {
+				rcu_read_lock();
+				if (cds_ft_eager_lookup_key(gdst, (const uint8_t *) "helo",
+						4, 0, &found) != CDS_FT_STATUS_OK || !found)
+					rc = -1;
+				rcu_read_unlock();
+				if (rc)
+					fprintf(stderr, "fine-lock fault: graft lost 'helo' "
+						"(fault=%u)\n", f);
+			}
+			if (!rc && !cds_ft_empty(gsrc)) {
+				fprintf(stderr, "fine-lock fault: src not empty after graft "
+					"(fault=%u)\n", f);
+				rc = -1;
+			}
+			if (!rc && cds_ft_verify(gdst, stderr) != CDS_FT_STATUS_OK) {
+				fprintf(stderr, "fine-lock fault: graft verify failed "
+					"(fault=%u) -- leaked lock?\n", f);
+				rc = -1;
+			}
+			cds_ft_fault_lock_countdown = -1;
+			drain_trie(gsrc);
+			drain_trie(gdst);
+			rcu_barrier();
+			cds_ft_destroy(gsrc);
+			cds_ft_destroy(gdst);
+			cds_ft_group_destroy(gg);
+		}
+	}
 	return rc;
 }
 
@@ -26265,6 +26663,8 @@ int main(int argc, char **argv)
 	RUN_TEST(test_writer_lock_mode_coarse);
 	RUN_TEST(test_writer_lock_mode_fine);
 	RUN_TEST(test_writer_lock_mode_fine_split);
+	RUN_TEST(test_writer_lock_mode_fine_graft);
+	RUN_TEST(test_writer_lock_mode_fine_crosstrie_busy);
 #ifdef FEATURE_FT_FAULT_INJECT
 	RUN_TEST(test_split_oom_backpointer);
 	RUN_TEST(test_split_oom_key_shorter_arm);

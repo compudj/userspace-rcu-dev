@@ -1637,7 +1637,11 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
  *   for each (key, node) in batch:
  *       cds_ft_insert(staging, key, key_len, node);
  *
- *   // Phase 2: graft into the live trie, O(1) under lock.
+ *   // Phase 2: graft into the live trie, O(1) under lock.  Under
+ *   // fine-grained writer locking the source must be exclusive, so
+ *   // make it exclusive once population is complete (a no-op / cheap
+ *   // for optimistic groups):
+ *   cds_ft_make_exclusive(staging);
  *   lock(&writer_mutex);
  *   cds_ft_graft(live_trie, prefix, prefix_len, staging);
  *   unlock(&writer_mutex);
@@ -1691,8 +1695,12 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
  * - > 0: Explicit key length.
  * - 0: Graft at the root (NIL prefix).
  * @src_ft: Source Fractal Trie. Must be in the same group as @dst_ft.
- *          On success, @src_ft becomes empty. The caller retains
- *          ownership of the (now empty) @src_ft object.
+ *          Under fine-grained writer locking (CDS_FT_WRITER_LOCK_FINE)
+ *          @src_ft must be EXCLUSIVE (cds_ft_make_exclusive), i.e. have
+ *          no concurrent readers or writers -- a live concurrent source
+ *          is rejected with CDS_FT_STATUS_BUSY_ERROR (see below). On
+ *          success, @src_ft becomes empty. The caller retains ownership
+ *          of the (now empty) @src_ft object.
  *
  * Attaches the entire content of @src_ft at the position identified
  * by @key in @dst_ft as a single operation visible to concurrent RCU
@@ -1708,7 +1716,22 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
  * variable-length key groups. Non-root graft (@key_len > 0)
  * requires a variable-length key group (CDS_FT_LEN_VARIABLE).
  *
- * Returns CDS_FT_STATUS_OK on success.
+ * Source-exclusivity requirement (fine-grained locking).  A cross-trie
+ * graft consumes @src_ft's whole content.  Under CDS_FT_WRITER_LOCK_FINE
+ * it holds only @dst_ft's writer lock -- an exclusive @src_ft is private,
+ * so no second lock is taken and there is no cross-trie deadlock.  A LIVE
+ * (concurrent, non-exclusive) @src_ft would require a second lock with no
+ * lock order and is therefore rejected with CDS_FT_STATUS_BUSY_ERROR
+ * BEFORE anything is modified; make it exclusive first with
+ * cds_ft_make_exclusive() (the "offline staging trie" pattern above
+ * already builds @src_ft privately).  @dst_ft may be a live concurrent
+ * trie.  On ANY failure -- BUSY, POPULATED, OVERFLOW or a memory error --
+ * @src_ft is left UNCHANGED (the graft is assembled invisibly and only
+ * commits once it cannot fail), so no content is ever stranded.
+ *
+ * Returns CDS_FT_STATUS_OK on success (@src_ft left empty).
+ * Returns CDS_FT_STATUS_BUSY_ERROR if @src_ft is a live concurrent trie
+ * under fine-grained writer locking (make it exclusive first).
  * Returns CDS_FT_STATUS_POPULATED_ERROR if the graft point is already
  * populated (destination has content at or below @key).
  * Returns CDS_FT_STATUS_OVERFLOW_ERROR if the grafted keys would
@@ -1732,10 +1755,14 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
  * - > 0: Explicit key length.
  * - 0: Graft at the root (NIL prefix).
  * @swap_ft: Fractal Trie to exchange content with. Must be in the same
- *           group as @dst_ft. On entry, its content is grafted into
- *           @dst_ft at @key. On success, it receives the content that
- *           was previously at @key in @dst_ft, or is empty if the
- *           graft point had no content. The caller retains ownership.
+ *           group as @dst_ft. Under fine-grained writer locking
+ *           (CDS_FT_WRITER_LOCK_FINE) @swap_ft must be EXCLUSIVE
+ *           (cds_ft_make_exclusive), i.e. have no concurrent readers or
+ *           writers -- a live concurrent @swap_ft is rejected with
+ *           CDS_FT_STATUS_BUSY_ERROR (see below). On entry, its content is
+ *           grafted into @dst_ft at @key. On success, it receives the
+ *           content that was previously at @key in @dst_ft, or is empty if
+ *           the graft point had no content. The caller retains ownership.
  *
  * Exchanges the content at @key in @dst_ft with the content of
  * @swap_ft.  Concurrent RCU readers traversing @dst_ft observe
@@ -1750,10 +1777,20 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
  * @swap_ft locally without per-node grace periods.
  *
  * On success @swap_ft also inherits @dst_ft's access discipline: its
- * exclusive/concurrent mode is set to match @dst_ft.  This changes the
- * RCU rules the caller must follow on @swap_ft afterward (including the
- * drain above), so re-establish the desired mode with
+ * exclusive/concurrent mode is set to match @dst_ft (so an exclusive
+ * @swap_ft may end up concurrent again if @dst_ft is a live trie).  This
+ * changes the RCU rules the caller must follow on @swap_ft afterward
+ * (including the drain above), so re-establish the desired mode with
  * cds_ft_make_exclusive() / cds_ft_make_concurrent() if it matters.
+ *
+ * Source-exclusivity requirement (fine-grained locking).  @swap_ft is the
+ * consumed source of the exchange, so like cds_ft_graft it must be
+ * EXCLUSIVE under CDS_FT_WRITER_LOCK_FINE: the op then holds only
+ * @dst_ft's writer lock, with no cross-trie deadlock.  A LIVE (concurrent,
+ * non-exclusive) @swap_ft is rejected with CDS_FT_STATUS_BUSY_ERROR before
+ * anything is modified; make it exclusive first with cds_ft_make_exclusive().
+ * @dst_ft may be a live concurrent trie.  On any failure -- BUSY, OVERFLOW
+ * or a memory error -- both tries are left UNCHANGED.
  *
  * The operation validates that @key_len plus the maximum used key
  * length of @swap_ft does not exceed the group's maximum key length.
@@ -1763,6 +1800,8 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
  * requires a variable-length key group (CDS_FT_LEN_VARIABLE).
  *
  * Returns CDS_FT_STATUS_OK on success.
+ * Returns CDS_FT_STATUS_BUSY_ERROR if @swap_ft is a live concurrent trie
+ * under fine-grained writer locking (make it exclusive first).
  * Returns CDS_FT_STATUS_OVERFLOW_ERROR if the grafted keys would
  * exceed the group's maximum key length.
  * Returns CDS_FT_STATUS_INVALID_ARGUMENT_ERROR if the tries are not

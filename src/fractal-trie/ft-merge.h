@@ -2216,6 +2216,20 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 	}
 
 	/*
+	 * MW LOCK_FINE (step 6, §9.5): a CROSS-trie merge consumes @src_ft, so it
+	 * must be EXCLUSIVE -- an exclusive source skips its FT-wide lock, leaving
+	 * only dst's lock (one lock, no cross-trie deadlock).  A live (lock-mode,
+	 * non-exclusive) cross-trie source is REJECTED with BUSY before any lock is
+	 * taken; the caller makes it exclusive first (cds_ft_make_exclusive).  A
+	 * SAME-trie rekey (src == dst) is excluded -- it takes one lock reentrantly.
+	 * Inert outside lock-mode.
+	 */
+	if (src_ft != dst_ft && src_ft->lock_mode && !src_ft->exclusive) {
+		FT_TP(merge_exit, (int) CDS_FT_STATUS_BUSY_ERROR);
+		return CDS_FT_STATUS_BUSY_ERROR;
+	}
+
+	/*
 	 * merge_at is a mutator; the application provides mutual exclusion
 	 * between mutators.  Take the reentrant writer-validation scope (like
 	 * cds_ft_graft_swap), NOT a flavor read lock -- the spine-copy commit
@@ -2529,6 +2543,11 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 	 * here, exactly as the detach-then-graft path did.
 	 */
 	if (src_key_len == 0) {
+		/*
+		 * A live (non-exclusive) cross-trie source was already rejected with
+		 * BUSY at merge_at's entry, so this graft sees an exclusive source (or
+		 * a same-trie rekey); ft_graft_keylen runs its fused body directly.
+		 */
 		status = ft_graft_keylen(dst_ft, dst_key, dst_key_len, src_ft,
 				pre_txn);
 		FT_TP(merge_exit, (int) status);
