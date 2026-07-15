@@ -7,22 +7,29 @@
 
 /*
  * ft-txn-hlist: the fractal trie's duplicate chain, expressed as a small set of
- * TRANSACTIONAL link primitives on the RCU MCAS engine.  It is an FT-PRIVATE
- * adaptation of the generic concurrent <urcu/rcu-txn-hlist.h>: the serialization
- * arguments (the forward slot is the sole serializer; a "next"-only mark; the
- * neighbour-mid-deletion load-validate) are that header's, transferred verbatim.
- * What differs is that this does NOT reshape the chain into the kernel hlist
- * `**pprev' encoding -- it keeps FT's duplicate chain EXACTLY as it is and only
- * gives its link maintenance a clean abstraction.
+ * TRANSACTIONAL link primitives on the RCU MCAS engine.  It began as an
+ * FT-PRIVATE adaptation of the generic concurrent <urcu/rcu-txn-hlist.h>, but
+ * now that every chain mutation runs under the head-holder's lock (MW LOCK_FINE
+ * Step A -- one writer per chain) the multi-writer arbitration is dropped: the
+ * neighbour-mid-deletion load-validate and the marked-target -ENOENT/-EAGAIN
+ * bails in insert_after/del/replace are dead and gone.  What remains from that
+ * header is the forward slot as the sole serializer and the "next"-only mark --
+ * the mark stays because it is BOTH the reader-visible logical-delete (readers
+ * mask it) AND the freeze half the head ops fold into their structural flip-txn
+ * (ft_hlist_freeze_prepare).  The MCAS engine (proxy on bit 0) also stays: the
+ * chain edits still FOLD into the host op's flip-txn so a chain edit and the
+ * trie<->head anchor edge commit atomically.  This does NOT reshape the chain
+ * into the kernel hlist `**pprev' encoding -- it keeps FT's duplicate chain
+ * EXACTLY as it is and only gives its link maintenance a clean abstraction.
  *
  * Representation (struct cds_ft_node, unchanged, see <urcu/fractal-trie.h>):
  *   next : cds_ft_node *   forward link; reader-visible; MARK-able
  *                          (CDS_FT_NODE_REMOVED_FLAG on bit 1); the engine proxy
  *                          rides bit 0.  Transacted under FT_HLIST_TAG.
  *   prev : cds_ft_node *   back link to the PREDECESSOR NODE (an interior
- *                          duplicate's predecessor).  Transacted too, so a del's
- *                          re-read of the predecessor stays coherent under
- *                          concurrent writers.
+ *                          duplicate's predecessor).  Transacted too (the
+ *                          coherent-both-directions edge); under the single
+ *                          writer a del's re-read of the predecessor is stable.
  *
  * Why prev-as-node, not pprev (the FT-specific reason a generic reuse fails):
  * FT overloads cds_ft_node.prev.  For a chain HEAD it is the cell/parent (the
@@ -105,12 +112,6 @@ void *ft_hlist_set_mark(struct cds_ft_node *n)
 }
 
 static inline
-int ft_hlist_is_marked(void *v)
-{
-	return (int) ((uintptr_t) v & FT_HLIST_MARK);
-}
-
-static inline
 struct cds_ft_node *ft_hlist_unmark(void *v)
 {
 	return (struct cds_ft_node *) ((uintptr_t) v & ~(uintptr_t) FT_HLIST_MARK);
@@ -145,39 +146,28 @@ struct cds_ft_node *ft_hlist_next_rcu(struct cds_ft_node *node)
  * ft_hlist_insert_after_prepare: record an insert of @newp immediately after
  * @pos, WITHOUT committing.  @pos is the predecessor NODE (the head node H for a
  * first duplicate, or an interior duplicate); the forward slot &pos->next
- * transitions its current successor @succ -> @newp and is the serializing edge:
- * any concurrent insert/delete that rewrites &pos->next fails this commit's
- * old-value check.  @newp is built invisibly (next = @succ, prev = @pos).
- * Returns 0, -ENOENT if @pos was deleted, or -EAGAIN if @succ is a neighbour
- * mid-deletion (retry); OOM is sticky to the commit.
+ * transitions its current successor @succ -> @newp.  @newp is built invisibly
+ * (next = @succ, prev = @pos), and the two edges pos->next: succ -> newp and
+ * succ->prev: pos -> newp are recorded.  A tail append (@pos == the walked tail,
+ * @succ == NULL) is a 1-edge insert with no backward fixup -- FT's ft_chain_node
+ * idiom.  OOM is sticky to the commit.
  *
- * A tail append (@pos == the walked tail, @succ == NULL) is a 1-edge insert with
- * no backward fixup -- FT's ft_chain_node idiom, now guarded (CAS old = NULL).
+ * Single-writer per chain (MW LOCK_FINE Step A: every chain mutation runs under
+ * the head-holder's COPYING lock -- or, before the FT-wide lock drops, that lock;
+ * a disjoint-key optimistic writer owns its own chain), so @pos is never
+ * concurrently deleted and @succ is never a neighbour mid-deletion.  The
+ * multi-writer arbitration those cases needed -- bail -ENOENT on a marked @pos,
+ * load-validate &succ->next and retry -EAGAIN on a marked neighbour -- is dead
+ * and dropped.  Always returns 0; the int return is retained for caller-shape
+ * parity with the concurrent front-ends (mirrors urcu_txn_sw_list_*_prepare).
  */
 static inline
 int ft_hlist_insert_after_prepare(struct urcu_mcas_txn *txn,
 		struct cds_ft_node *newp,
 		struct cds_ft_node *pos)
 {
-	void *pn = urcu_txn_load(txn, (void **) &pos->next, FT_HLIST_TAG);
-	struct cds_ft_node *succ;
-
-	if (ft_hlist_is_marked(pn))
-		return -ENOENT;			/* @pos was deleted */
-	succ = (struct cds_ft_node *) pn;
-	/*
-	 * We write &succ->prev but NOT &succ->next, so the slot-sorted install
-	 * may reach &succ->prev before it reaches &pos->next -- driving the prev
-	 * store against a @succ a concurrent del(succ) is freeing.  Load-validate
-	 * succ->next (the slot del(succ) marks) into the write-set so the prev
-	 * side serializes against del(succ) exactly as &pos->next does; a marked
-	 * @succ aborts here.  (When @succ is NULL there is no backward edge and no
-	 * such window -- a 1-edge insert.)
-	 */
-	if (succ != NULL &&
-			ft_hlist_is_marked(urcu_txn_load_validate(txn,
-				(void **) &succ->next, FT_HLIST_TAG)))
-		return -EAGAIN;			/* succ (a neighbour) deleted: retry */
+	struct cds_ft_node *succ = (struct cds_ft_node *)
+			urcu_txn_load(txn, (void **) &pos->next, FT_HLIST_TAG);
 
 	/* Build the fresh node invisibly. */
 	newp->next = succ;
@@ -220,51 +210,34 @@ void ft_hlist_append_run_prepare(struct urcu_mcas_txn *txn,
 
 /*
  * ft_hlist_del_prepare: record the unlink of @elem into @txn WITHOUT committing.
- * @elem's predecessor is @elem->prev; the forward slot &pred->next transitions
- * @elem -> @next and is the serializing edge.  Returns 0 if recorded (on a
- * committed OK, THIS call removed @elem; reclaim it after a grace period),
- * -ENOENT if @elem was already deleted by a peer (nothing recorded; do NOT
- * reclaim), or -EAGAIN if the successor is mid-deletion (retry).  OOM is sticky
- * to the commit.
+ * Marks @elem (logical delete: elem->next: next -> MARK(next), the target
+ * preserved so a reader parked on @elem still follows the chain to the
+ * successor / end), unlinks it forward (pred->next: elem -> next) and backward
+ * (next->prev: elem -> pred).  On a committed OK THIS call removed @elem; reclaim
+ * it after a grace period.  OOM is sticky to the commit.
+ *
+ * Single-writer per chain (see ft_hlist_insert_after_prepare): @elem is never
+ * already deleted and @next is never a neighbour mid-deletion, so the
+ * multi-writer arbitration (-ENOENT on a marked @elem, load-validate &next->next
+ * and retry -EAGAIN on a marked successor) is dead and dropped, and @pred read
+ * this attempt is stable (no peer re-links it).  Always returns 0 (int retained
+ * for caller-shape parity).
  */
 static inline
 int ft_hlist_del_prepare(struct urcu_mcas_txn *txn, struct cds_ft_node *elem)
 {
-	void *en = urcu_txn_load(txn, (void **) &elem->next, FT_HLIST_TAG);
-	struct cds_ft_node *next, *pred;
-
-	if (ft_hlist_is_marked(en))
-		return -ENOENT;			/* already deleted by a peer */
-	next = (struct cds_ft_node *) en;
-	/*
-	 * Read the predecessor fresh this attempt.  If a peer changed which node
-	 * precedes @elem (e.g. del of @elem's predecessor rewrote elem->prev to
-	 * pred's own predecessor), this @pred is stale -- but the &pred->next store
-	 * below then fails its old-value check (the stale slot no longer holds
-	 * @elem) and the commit aborts, so a retry re-reads the fresh predecessor.
-	 */
-	pred = (struct cds_ft_node *)
+	struct cds_ft_node *next = (struct cds_ft_node *)
+			urcu_txn_load(txn, (void **) &elem->next, FT_HLIST_TAG);
+	struct cds_ft_node *pred = (struct cds_ft_node *)
 			urcu_txn_load(txn, (void **) &elem->prev, FT_HLIST_TAG);
 
 	/*
-	 * We rewrite &next->prev but not &next->next.  Load-validate next->next
-	 * (the slot del(next) marks) so the backward unlink serializes against
-	 * del(next) even when the slot-sorted install reaches &next->prev first.
-	 * A marked successor is itself being deleted: retry.
-	 */
-	if (next != NULL &&
-			ft_hlist_is_marked(urcu_txn_load_validate(
-				txn, (void **) &next->next, FT_HLIST_TAG)))
-		return -EAGAIN;			/* successor (a neighbour) deleted: retry */
-
-	/*
-	 * Mark elem (logical delete), unlink forward (pred->next: elem -> next),
-	 * and unlink backward (next->prev: elem -> pred).  pred->next (old value
-	 * elem) is the slot a racing insert-after(pred) / del(pred) shares with us,
-	 * so the MCAS serializes every adjacency; marking &elem->next is what makes
-	 * a racing insert_after(elem) / del(elem) terminate with -ENOENT.  When
-	 * next is NULL the backward edge vanishes: a 2-edge delete storing
-	 * MARK(NULL).
+	 * Mark elem (logical delete), unlink forward (pred->next: elem -> next)
+	 * and backward (next->prev: elem -> pred).  When next is NULL the backward
+	 * edge vanishes: a 2-edge delete storing MARK(NULL).  The mark on
+	 * &elem->next is retained -- readers mask it (ft_hlist_resolve) and the
+	 * head ops fold it (ft_hlist_freeze_prepare) for atomicity with the
+	 * structural anchor edge.
 	 */
 	urcu_txn_store(txn, (void **) &elem->next, next,
 			ft_hlist_set_mark(next), FT_HLIST_TAG);
@@ -278,30 +251,23 @@ int ft_hlist_del_prepare(struct urcu_mcas_txn *txn, struct cds_ft_node *elem)
  * ft_hlist_replace_prepare: record the in-place replacement of @old by @newp
  * into @txn WITHOUT committing.  @newp takes @old's position -- pred->next and
  * next->prev swing to @newp -- while @old is logically removed (its next is
- * marked exactly as del does).  Touches the SAME slots as del_prepare (only the
- * new values differ), so it inherits del's serialization.  Argument order is
- * (old, new).  Returns 0 if recorded (reclaim @old after a grace period on
- * commit), -ENOENT if @old was already deleted, or -EAGAIN if the successor is
- * mid-deletion.  OOM is sticky to the commit.  Used for a non-head duplicate
- * replace (a head replace is FT-structural: it swaps the anchor slot).
+ * marked exactly as del does).  Argument order is (old, new).  On commit reclaim
+ * @old after a grace period.  OOM is sticky to the commit.  Used for a non-head
+ * duplicate replace (a head replace is FT-structural: it swaps the anchor slot).
+ *
+ * Single-writer per chain (see ft_hlist_insert_after_prepare): the multi-writer
+ * arbitration (-ENOENT on a marked @old, load-validate &next->next and retry
+ * -EAGAIN on a marked successor) is dead and dropped.  Always returns 0 (int
+ * retained for caller-shape parity).
  */
 static inline
 int ft_hlist_replace_prepare(struct urcu_mcas_txn *txn,
 		struct cds_ft_node *old, struct cds_ft_node *newp)
 {
-	void *en = urcu_txn_load(txn, (void **) &old->next, FT_HLIST_TAG);
-	struct cds_ft_node *next, *pred;
-
-	if (ft_hlist_is_marked(en))
-		return -ENOENT;			/* @old already deleted/replaced */
-	next = (struct cds_ft_node *) en;
-	pred = (struct cds_ft_node *)
+	struct cds_ft_node *next = (struct cds_ft_node *)
+			urcu_txn_load(txn, (void **) &old->next, FT_HLIST_TAG);
+	struct cds_ft_node *pred = (struct cds_ft_node *)
 			urcu_txn_load(txn, (void **) &old->prev, FT_HLIST_TAG);
-
-	if (next != NULL &&
-			ft_hlist_is_marked(urcu_txn_load_validate(
-				txn, (void **) &next->next, FT_HLIST_TAG)))
-		return -EAGAIN;			/* successor (a neighbour) deleted: retry */
 
 	/* Build @newp's links invisibly, then swing pred->next and next->prev. */
 	newp->next = next;
@@ -322,11 +288,11 @@ int ft_hlist_replace_prepare(struct urcu_mcas_txn *txn,
  * through its FT-structural anchor edge (the parent slot re-point / clear), not a
  * predecessor->next store, so only the mark rides the hlist; folding it into the
  * head op's structural flip-txn makes the freeze and the anchor edge commit
- * atomically -- once concurrent, a racing insert_after(node) / del(node) shares
- * &node->next and terminates with -ENOENT.  The target is preserved (MARK(succ),
- * or MARK(NULL) for a head with no successor) so a reader parked on @node still
- * follows the chain to the promoted new head / end.  One recorded edge; the caller
- * reserves FT_HLIST_FREEZE_MAX_EDGES on top of the host op's footprint.
+ * atomically -- a reader is never shown @node's head anchor promoted away while
+ * @node is still unmarked.  The target is preserved (MARK(succ), or MARK(NULL)
+ * for a head with no successor) so a reader parked on @node still follows the
+ * chain to the promoted new head / end.  One recorded edge; the caller reserves
+ * FT_HLIST_FREEZE_MAX_EDGES on top of the host op's footprint.
  */
 static inline
 void ft_hlist_freeze_prepare(struct urcu_mcas_txn *txn, struct cds_ft_node *node)
