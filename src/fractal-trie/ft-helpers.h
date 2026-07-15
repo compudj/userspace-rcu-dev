@@ -1305,6 +1305,39 @@ struct cds_ft_inode_flag *ft_node_holder(struct cds_ft *ft,
 }
 
 /*
+ * ft_chain_head_holder: resolve the trie HOLDER (the head's IMMEDIATE PARENT)
+ * of @node's duplicate chain -- the single lockable state-word node every op on
+ * the chain serialises on (MW LOCK_FINE holder lock).  @node may be the head
+ * (its prev is the cell / flagged parent -> resolve directly, one iteration) or
+ * an interior duplicate (its prev is a predecessor external -> walk prev up to
+ * the head, whose prev is NOT external).  A flip proxy parked on prev mid-commit
+ * resolves at each load, as in ft_node_holder.  HOLDER-LOCK / mutex-held callers
+ * only: the prev walk is not stable under a concurrent chain relink (an interior
+ * op can only find its head's holder to lock while some coarser exclusion --
+ * today the FT-wide writer_lock -- still holds; that chicken-and-egg is resolved
+ * with the FT-wide-lock drop).  Returns NULL for a never-inserted node (prev
+ * NULL).
+ */
+static inline
+struct cds_ft_inode_flag *ft_chain_head_holder(struct cds_ft *ft,
+		struct cds_ft_node *node)
+{
+	struct cds_ft_node *cur = node;
+
+	for (;;) {
+		void *prev = (void *) ft_resolve_flip_proxy(
+			(struct cds_ft_inode_flag *)
+			rcu_dereference(cur->prev));
+
+		if (!prev)
+			return NULL;
+		if (!ft_node_external((struct cds_ft_inode_flag *) prev))
+			return ft_resolve_head_prev(ft, prev);
+		cur = (struct cds_ft_node *) prev;
+	}
+}
+
+/*
  * Record a fresh head's flagged parent.  Non-cell builds store it directly
  * into the (pre-publish) head's prev; cell builds store it into the head's
  * pre-wired cell (node->prev already carries the cell), leaving prev intact.

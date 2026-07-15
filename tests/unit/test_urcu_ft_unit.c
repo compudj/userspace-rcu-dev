@@ -49,7 +49,7 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 322
+#define NR_TESTS 323
 #else
 #define NR_TESTS 279
 #endif
@@ -25518,6 +25518,130 @@ static int test_fine_lock_acquire_fault(void)
 }
 
 /*
+ * MW LOCK_FINE Step A: prove the duplicate-CHAIN holder-lock acquire bails are
+ * live, not dead code.  test_fine_lock_acquire_fault above sweeps the
+ * recompact/split acquires but only ever inserts UNIQUE keys, so it never
+ * reaches the chain holder lock the Step A sites take before mutating a
+ * duplicate chain: the insert dup-append (ft-insert.h) and every remove chain
+ * op (ft_unchain_node -- head promote, interior detach, head-no-successor).
+ * Force THOSE acquires to miss (a peer holding the holder would look the same)
+ * and assert the op SURVIVES -- bails -EAGAIN, re-descends, retries (the FT-wide
+ * lock cleared the one-shot fault by then) -- with no key lost and no leaked
+ * COPYING fence (cds_ft_verify reports a bit left set at rest as a leaked copy
+ * fence, which would wedge every later publish into that holder).  The countdown
+ * reaching -1 after the op confirms the fault actually LANDED on an acquire: a
+ * stable holder has no recompact/split, so it lands on the chain lock -- if the
+ * site were unreachable the countdown would still read 0 and the bail dead.
+ */
+static int test_fine_lock_chain_acquire_fault(void)
+{
+	enum { CHAIN = 8 };
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_fine_lock_ft(4, &group);
+	struct cds_ft_iter *iter = NULL;
+	struct ft_test_node *n[CHAIN];
+	enum cds_ft_status s;
+	uint8_t k[4];
+	int rc = 0, i;
+
+	for (i = 0; i < CHAIN; i++)
+		n[i] = node_alloc(77);
+	cds_ft_u64_to_key(ft, 77, k, CDS_FT_LEN_DEFAULT);
+	if (cds_ft_iter_create(ft, &iter) < 0)
+		abort();
+
+	/*
+	 * Build the chain under the fault.  i==0 is the fresh head insert (no
+	 * chain lock); every later insert is a dup-append whose holder-lock
+	 * acquire is forced to miss and must retry to land the key.
+	 */
+	for (i = 0; i < CHAIN && !rc; i++) {
+		rcu_read_lock();
+		cds_ft_fault_lock_countdown = (i == 0) ? -1 : 0;
+		s = cds_ft_insert(ft, k, CDS_FT_LEN_DEFAULT, &n[i]->node);
+		if (i > 0 && cds_ft_fault_lock_countdown != -1) {
+			cds_ft_fault_lock_countdown = -1;
+			rcu_read_unlock();
+			fprintf(stderr, "chain fault: dup-append acquire %d "
+				"never reached -- bail is dead\n", i);
+			rc = -1;
+			break;
+		}
+		cds_ft_fault_lock_countdown = -1;
+		rcu_read_unlock();
+		if (s != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "chain fault: dup insert %d did not "
+				"survive a forced acquire miss: %s\n", i,
+				cds_ft_status_to_string(s));
+			rc = -1;
+			break;
+		}
+		if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "chain fault: verify after dup insert "
+				"%d -- leaked lock?\n", i);
+			rc = -1;
+		}
+	}
+
+	/*
+	 * Tear the chain down under the fault, alternating head-side and
+	 * tail-side removals so ft_unchain_node hits each chain branch through
+	 * its shared top-of-function early-mark: removing the current head with
+	 * successors PROMOTES; removing the tail while a head remains is an
+	 * INTERIOR detach (parent_nf NULL -> walk-to-head holder).  The FINAL
+	 * removal (i == CHAIN-1) empties the key: on a list-ON trie that is a leaf
+	 * detach through ft_remove_one_commit, NOT a chain op, so the chain
+	 * acquire legitimately is not reached -- fault it too (it must still
+	 * survive + verify clean) but do not assert it fired.  (The head-no-
+	 * successor ft_unchain_node branch is list-OFF only; its early-mark is the
+	 * same shared one the promote/interior removals above already fault.)
+	 */
+	for (i = 0; i < CHAIN && !rc; i++) {
+		int idx = (i & 1) ? (CHAIN - 1 - (i >> 1)) : (i >> 1);
+		bool chain_op = (i < CHAIN - 1);
+
+		cds_ft_iter_set_key(iter, k, CDS_FT_LEN_DEFAULT);
+		rcu_read_lock();
+		cds_ft_lookup(ft, iter);
+		cds_ft_fault_lock_countdown = 0;
+		s = cds_ft_remove(ft, iter, &n[idx]->node);
+		if (chain_op && cds_ft_fault_lock_countdown != -1) {
+			cds_ft_fault_lock_countdown = -1;
+			rcu_read_unlock();
+			fprintf(stderr, "chain fault: remove acquire %d (idx %d) "
+				"never reached -- bail is dead\n", i, idx);
+			rc = -1;
+			break;
+		}
+		cds_ft_fault_lock_countdown = -1;
+		rcu_read_unlock();
+		if (s != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "chain fault: remove %d (idx %d) did not "
+				"survive a forced acquire miss: %s\n", i, idx,
+				cds_ft_status_to_string(s));
+			rc = -1;
+			break;
+		}
+		if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "chain fault: verify after remove %d "
+				"(idx %d) -- leaked lock?\n", i, idx);
+			rc = -1;
+		}
+	}
+
+	cds_ft_fault_lock_countdown = -1;
+	if (iter)
+		cds_ft_iter_destroy(iter);
+	/* All CHAIN nodes were removed from the trie; reclaim them (the caller
+	 * owns a removed node -- cds_ft_remove never frees it). */
+	for (i = 0; i < CHAIN; i++)
+		call_rcu(&n[i]->head, node_free_rcu_cb);
+	if (drain_and_destroy(ft, group) < 0)
+		rc = -1;
+	return rc;
+}
+
+/*
  * Compaction OOM (flip-txn allocation fault).  During cds_ft_compact on an
  * ordered-list trie the flip-txn allocations are the per-cell relocation swap
  * AND -- since the structural relocations were routed onto the flip latch -- a
@@ -26183,6 +26307,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_insert_replace_prefix_oom);
 	RUN_TEST(test_replace_head_oom);
 	RUN_TEST(test_fine_lock_acquire_fault);
+	RUN_TEST(test_fine_lock_chain_acquire_fault);
 	RUN_TEST(test_compact_ordered_list_oom);
 	RUN_TEST(test_compact_ordered_list_oom_resume);
 #endif

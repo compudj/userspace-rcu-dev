@@ -2209,7 +2209,8 @@ end:
 static
 int ft_promote_head(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 		struct cds_ft_node **head_slot, struct cds_ft_node *node,
-		struct cds_ft_node *next_node)
+		struct cds_ft_node *next_node,
+		struct cds_ft_metadata *held_holder, uintptr_t held_snap)
 {
 	struct ft_ord_cell *old_cell = ft->ordered_list ?
 		ft_ord_cell_ptr(node->prev) : NULL;
@@ -2234,14 +2235,19 @@ int ft_promote_head(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 		struct ft_ord_cell *new_cell;
 		struct ft_flip_txn *txn;
 
-		if (!new_cell_flag)
+		if (!new_cell_flag) {
+			if (held_holder)
+				ft_meta_copying_clear(held_holder);
 			return -ENOMEM;
+		}
 		txn = ft_flip_txn_create_bounded(
 			FT_ORD_CELL_SWAP_PUBLISH_MAX_EDGES +
 			FT_HLIST_FREEZE_MAX_EDGES + 2);	/* +1 §4.B parent guard, +1 next_node->prev fold */
 		if (!txn) {
 			ft_ord_cell_free_unpublished(ft,
 				ft_ord_cell_ptr(new_cell_flag));
+			if (held_holder)
+				ft_meta_copying_clear(held_holder);
 			return -ENOMEM;
 		}
 		new_cell = ft_ord_cell_ptr(new_cell_flag);
@@ -2260,8 +2266,14 @@ int ft_promote_head(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 		 */
 		ft_flip_txn_record_reserved(txn, (void **) &next_node->prev,
 			next_node->prev, new_cell_flag);
-		/* VALIDATE (§4.B): guard the LIVE holder this head-promote publishes into. */
-		ft_flip_txn_lock_or_guard_parent(ft, txn, parent_nf);
+		/*
+		 * VALIDATE (§4.B): guard the LIVE holder this head-promote
+		 * publishes into.  Holding its fence (held_holder): record the
+		 * release so it composes with the held COPYING instead of the
+		 * masking guard-fallback that self-aborts on it.
+		 */
+		ft_flip_txn_hold_or_lock_parent(ft, txn, parent_nf,
+			held_holder, held_snap);
 		_ft_publish_to_parent_meta(ft, parent_nf,
 			(struct cds_ft_inode_flag **) head_slot,
 			(struct cds_ft_inode_flag *) next_node,
@@ -2309,8 +2321,11 @@ int ft_promote_head(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 		void *prev_save;
 		void *inherit;
 
-		if (!txn)
+		if (!txn) {
+			if (held_holder)
+				ft_meta_copying_clear(held_holder);
 			return -ENOMEM;
+		}
 		prev_save = rcu_dereference(next_node->prev);
 		inherit = rcu_dereference(node->prev);
 		if (caa_unlikely(ft_node_flip_proxy(
@@ -2318,12 +2333,19 @@ int ft_promote_head(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 				ft_node_flip_proxy(
 					(struct cds_ft_inode_flag *) inherit))) {
 			ft_flip_txn_destroy(txn);	/* PREPARE state: nothing recorded */
+			if (held_holder)
+				ft_meta_copying_clear(held_holder);
 			return -EAGAIN;
 		}
 		ft_flip_txn_record_reserved(txn, (void **) &next_node->prev,
 			prev_save, inherit);
-		/* VALIDATE (§4.B): guard the LIVE holder this head-promote publishes into. */
-		ft_flip_txn_lock_or_guard_parent(ft, txn, parent_nf);
+		/*
+		 * VALIDATE (§4.B): guard the LIVE holder this head-promote
+		 * publishes into -- release when we hold its fence (see the cell
+		 * arm above).
+		 */
+		ft_flip_txn_hold_or_lock_parent(ft, txn, parent_nf,
+			held_holder, held_snap);
 		_ft_publish_to_parent_meta(ft, parent_nf,
 			(struct cds_ft_inode_flag **) head_slot,
 			(struct cds_ft_inode_flag *) next_node,
@@ -2349,7 +2371,50 @@ static
 int ft_unchain_node(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 		struct cds_ft_node **head_slot, struct cds_ft_node *node)
 {
-	struct cds_ft_node *next_node = ft_node_next(node);
+	struct cds_ft_metadata *hmeta = NULL;	/* MW LOCK_FINE holder lock */
+	uintptr_t hsnap = 0;
+	struct cds_ft_node *next_node;
+
+	/*
+	 * MW LOCK_FINE (Step A, holder lock): serialise concurrent same-key chain
+	 * mutation on the head's IMMEDIATE PARENT -- the trie holder.  Acquire its
+	 * COPYING lock BEFORE the chain read below (a peer mid-flip parks a proxy
+	 * on node->next / relinks a neighbour's prev that this read would deref)
+	 * and hold it across the mutate+commit.  @parent_nf is the holder for a
+	 * head op; an interior detach passes NULL, so derive the head's holder by
+	 * walking prev (ft_chain_head_holder).  Released after the op: promote /
+	 * interior post-commit-clear -- their commits leave holder->state untouched
+	 * (promote is a slot swap + a COPYING-masking guard; interior relinks
+	 * neighbours), so a held fence bit composes.  Head-no-successor records the
+	 * {COPYING|s -> s} RELEASE + registers it, so it FUSES with the same-word
+	 * nr_child-- (a masking guard would disagree on expected-old and poison)
+	 * and the txn owns the clear (commit consumes it; abort/destroy auto-clears
+	 * the registered fence).  Under the FT-wide writer_lock no peer contends
+	 * -> the acquire never misses in soak; FEATURE_FT_FAULT_INJECT drives the
+	 * -EAGAIN bail (shared cds_ft_fault_lock_countdown).
+	 */
+	if (ft->lock_fine) {
+		struct cds_ft_inode_flag *lock_nf = parent_nf ? parent_nf :
+			ft_chain_head_holder(ft, node);
+
+		if (lock_nf) {
+			struct cds_ft_metadata *lm = ft_flag_to_metadata(ft, lock_nf);
+#ifdef FEATURE_FT_FAULT_INJECT
+			if (cds_ft_fault_lock_countdown >= 0) {
+				if (cds_ft_fault_lock_countdown == 0) {
+					cds_ft_fault_lock_countdown = -1;
+					return -EAGAIN;
+				}
+				cds_ft_fault_lock_countdown--;
+			}
+#endif
+			if (ft_meta_copying_mark(lm, &hsnap))
+				return -EAGAIN;
+			hmeta = lm;
+		}
+	}
+
+	next_node = ft_node_next(node);
 
 	FT_TP(unchain_node, (const void *) head_slot, (const void *) node,
 		!ft_node_external((struct cds_ft_inode_flag *) node->prev));
@@ -2371,8 +2436,11 @@ int ft_unchain_node(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 			ft_flip_txn_create_bounded(FT_HLIST_DEL_MAX_EDGES);
 		enum urcu_txn_status st;
 
-		if (!txn)
+		if (!txn) {
+			if (hmeta)
+				ft_meta_copying_clear(hmeta);
 			return -ENOMEM;
+		}
 		if (ft_hlist_del_prepare(ft_flip_txn_handle(txn), node)) {
 			/*
 			 * Peer conflict observed at prepare time (@node or a
@@ -2381,9 +2449,18 @@ int ft_unchain_node(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 			 * txn and retry from a fresh position derivation.
 			 */
 			ft_flip_txn_destroy(txn);
+			if (hmeta)
+				ft_meta_copying_clear(hmeta);
 			return -EAGAIN;
 		}
 		st = ft_flip_txn_commit(ft, txn);
+		/*
+		 * The interior relink never touches holder->state -- the held
+		 * fence is independent of this commit, so drop it directly on
+		 * every outcome.
+		 */
+		if (hmeta)
+			ft_meta_copying_clear(hmeta);
 		if (st < 0)
 			return -ENOMEM;
 		/* ABORT: peer won, nothing installed, @node fully chained. */
@@ -2398,7 +2475,16 @@ int ft_unchain_node(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 		 * (@node stays chained, not tombstoned) and the caller maps the
 		 * failure to CDS_FT_STATUS_MEMORY_ERROR.
 		 */
-		return ft_promote_head(ft, parent_nf, head_slot, node, next_node);
+		/*
+		 * Hand the held fence to ft_promote_head: it records the RELEASE
+		 * (composing with its holder guard, which a still-held COPYING
+		 * would otherwise self-abort) and OWNS the fence outcome -- commit
+		 * consumes it, an abort/destroy auto-clears the registered fence,
+		 * and every early-fail path clears it directly.  No post-commit
+		 * clear here.
+		 */
+		return ft_promote_head(ft, parent_nf, head_slot, node,
+				next_node, hmeta, hsnap);
 	} else {
 		/*
 		 * Head with no successor: the key disappears (only reached for a
@@ -2423,10 +2509,23 @@ int ft_unchain_node(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 
 		txn = ft_flip_txn_create_bounded(FT_PUB_SEDGE_MAX_EDGES +
 			FT_HLIST_FREEZE_MAX_EDGES + 1);
-		if (!txn)
+		if (!txn) {
+			/* Early fence held but not yet handed to the txn. */
+			if (hmeta)
+				ft_meta_copying_clear(hmeta);
 			return -ENOMEM;
-		/* VALIDATE (§4.B): guard the LIVE holder this head-clear publishes into. */
-		ft_flip_txn_lock_or_guard_parent(ft, txn, parent_nf);
+		}
+		/*
+		 * VALIDATE (§4.B): guard the LIVE holder this head-clear publishes
+		 * into.  Holding its lock (hmeta): record the {COPYING|s -> s}
+		 * RELEASE + register so it FUSES with the fused nr_child-- on the
+		 * same word (a masking guard would disagree on expected-old and
+		 * poison the descriptor) and the txn owns the fence outcome --
+		 * commit consumes it, an aborted/destroyed commit auto-clears the
+		 * registered fence (so the flip_into abort below needs no manual
+		 * clear).
+		 */
+		ft_flip_txn_hold_or_lock_parent(ft, txn, parent_nf, hmeta, hsnap);
 		_ft_publish_to_parent(ft, parent_nf,
 			(struct cds_ft_inode_flag **) head_slot, NULL,
 			(struct cds_ft_inode_flag *) node, &rec);

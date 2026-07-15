@@ -1200,7 +1200,16 @@ static int inv_concurrent_writers_shared(void)
 		return 0;
 	}
 	mw_install_fatal_handler();
-	ft = create_fixed_ft(8, &group);
+	/*
+	 * Same-key concurrent mutation is a LOCK-MODE feature: the duplicate
+	 * chain (ft-txn-hlist.h) is not safe for concurrent mutation, so two
+	 * writers on the SAME key must serialize (today via the FT-wide writer
+	 * lock a lock-mode trie takes; ultimately via the head-holder's per-node
+	 * COPYING lock once that FT-wide lock drops).  An OPTIMISTIC trie has
+	 * neither and cannot arbitrate same-key removers -- so this oracle runs
+	 * FINE (create_fixed_fine_lock_ft), NOT create_fixed_ft.
+	 */
+	ft = create_fixed_fine_lock_ft(8, &group);
 	cds_ft_make_concurrent(ft);
 	leak_reset();
 

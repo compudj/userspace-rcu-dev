@@ -1543,6 +1543,32 @@ fault_miss:
 }
 
 /*
+ * Holder-lock variant of ft_flip_txn_lock_or_guard_parent (MW LOCK_FINE Step A):
+ * when the op ALREADY holds @parent_nf's COPYING fence -- acquired before the
+ * chain read, @held_snap the clean pre-mark word -- record the {COPYING|s -> s}
+ * RELEASE + register it instead of re-marking.  The release EXPECTS the held
+ * COPYING (so it fuses with any same-word nr_child-- and clears the fence at
+ * commit), where the masking guard-fallback ft_flip_txn_lock_or_guard_parent
+ * would take on a re-mark MISS validates the CLEAN word and thus ABORTS on the
+ * op's OWN still-set fence -- a self-livelock.  Registering hands the fence
+ * outcome to the txn: commit consumes it, an aborted/destroyed commit
+ * auto-clears it.  @held_holder NULL routes to the ordinary acquire-or-guard
+ * (unheld op / non-lock_fine).
+ */
+static inline
+void ft_flip_txn_hold_or_lock_parent(const struct cds_ft *ft,
+		struct ft_flip_txn *t, struct cds_ft_inode_flag *parent_nf,
+		struct cds_ft_metadata *held_holder, uintptr_t held_snap)
+{
+	if (held_holder) {
+		ft_flip_txn_record_release_copying(t, held_holder, held_snap);
+		ft_flip_txn_copying_register(t, held_holder);
+		return;
+	}
+	ft_flip_txn_lock_or_guard_parent(ft, t, parent_nf);
+}
+
+/*
  * Set a duplicate-chain node's removal tombstone (CDS_FT_NODE_REMOVED_FLAG on
  * cds_ft_node.next) as a COMMITTED flip edge, at the point @node is unlinked
  * from the trie.  This is the chain-leaf analogue of ft_meta_tombstone_set_flip

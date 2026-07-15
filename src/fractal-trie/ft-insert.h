@@ -2620,11 +2620,42 @@ restart_attempt:
 			external_nodes = metadata->external_nodes;
 			if (external_nodes) {
 				struct cds_ft_node *iter_node, *last_node = NULL;
+				struct cds_ft_metadata *dup_hmeta = NULL;
+				uintptr_t dup_hsnap = 0;
 
 				if (unique_node_ret) {
 					*unique_node_ret = external_nodes;
 					ret = -EEXIST;
 					goto insert_done;
+				}
+				/*
+				 * MW LOCK_FINE (Step A, holder lock): the chain walk
+				 * + tail append serialise on @metadata (the internal
+				 * node whose external_nodes root this chain, the head's
+				 * holder).  Acquire its COPYING lock BEFORE the walk (a
+				 * peer relinking the chain would send it into freed
+				 * memory) and release after the append; ft_chain_node
+				 * touches only last_node->next, never holder->state, so
+				 * the held fence composes.  FT-wide lock makes the miss
+				 * unreachable in soak (fault injection drives the bail).
+				 */
+				if (ft->lock_fine) {
+#ifdef FEATURE_FT_FAULT_INJECT
+					if (cds_ft_fault_lock_countdown >= 0) {
+						if (cds_ft_fault_lock_countdown == 0) {
+							cds_ft_fault_lock_countdown = -1;
+							ret = -EAGAIN;
+							goto insert_done;
+						}
+						cds_ft_fault_lock_countdown--;
+					}
+#endif
+					if (ft_meta_copying_mark(metadata,
+							&dup_hsnap)) {
+						ret = -EAGAIN;
+						goto insert_done;
+					}
+					dup_hmeta = metadata;
 				}
 				/* Find last duplicate */
 				iter_node = external_nodes;
@@ -2636,6 +2667,8 @@ restart_attempt:
 
 				/* Adding duplicate at existing key: no key count change. */
 				ret = ft_chain_node(ft, last_node, node);
+				if (dup_hmeta)
+					ft_meta_copying_clear(dup_hmeta);
 				if (ret)
 					goto insert_done;
 			} else {
@@ -2680,14 +2713,52 @@ restart_attempt:
 			}
 		} else {
 			struct cds_ft_node *iter_node, *last_node = NULL;
+			struct cds_ft_node *dup_head =
+				(struct cds_ft_node *) ft_node_ptr(d.nf);
+			struct cds_ft_metadata *dup_hmeta = NULL;
+			uintptr_t dup_hsnap = 0;
 
 			if (unique_node_ret) {
-				*unique_node_ret = (struct cds_ft_node *) ft_node_ptr(d.nf);
+				*unique_node_ret = dup_head;
 				ret = -EEXIST;
 				goto insert_done;
 			}
+			/*
+			 * MW LOCK_FINE (Step A, holder lock): serialise the chain
+			 * walk + tail append on the external head's holder (its
+			 * immediate parent, resolved from the head itself via
+			 * ft_chain_head_holder -- one hop, prev is the cell /
+			 * flagged parent).  Acquire BEFORE the walk, release after
+			 * the append (ft_chain_node touches only last_node->next).
+			 * FT-wide lock makes the miss unreachable in soak (fault
+			 * injection drives the bail).
+			 */
+			if (ft->lock_fine) {
+				struct cds_ft_inode_flag *holder_flag =
+					ft_chain_head_holder(ft, dup_head);
+
+				if (holder_flag) {
+					struct cds_ft_metadata *hm =
+						ft_flag_to_metadata(ft, holder_flag);
+#ifdef FEATURE_FT_FAULT_INJECT
+					if (cds_ft_fault_lock_countdown >= 0) {
+						if (cds_ft_fault_lock_countdown == 0) {
+							cds_ft_fault_lock_countdown = -1;
+							ret = -EAGAIN;
+							goto insert_done;
+						}
+						cds_ft_fault_lock_countdown--;
+					}
+#endif
+					if (ft_meta_copying_mark(hm, &dup_hsnap)) {
+						ret = -EAGAIN;
+						goto insert_done;
+					}
+					dup_hmeta = hm;
+				}
+			}
 			/* Find last duplicate */
-			iter_node = (struct cds_ft_node *) ft_node_ptr(d.nf);
+			iter_node = dup_head;
 			cds_ft_for_each_duplicate(iter_node)
 				last_node = iter_node;
 
@@ -2696,6 +2767,8 @@ restart_attempt:
 
 			/* Adding duplicate at existing key: no key count change. */
 			ret = ft_chain_node(ft, last_node, node);
+			if (dup_hmeta)
+				ft_meta_copying_clear(dup_hmeta);
 			if (ret)
 				goto insert_done;
 		}
