@@ -1092,11 +1092,11 @@ void urcu_txn__learn_cost(struct urcu_mcas_txn *txn)
 /*
  * Retries this handle may spend on the optimistic path before it earns the
  * lane. With URCU_TXN_FALLBACK_PER_COST_NUM == 0 this is the flat
- * URCU_TXN_FALLBACK. Otherwise it scales with the realized write-set size
- * (min_alloc, learned at the first commit -- 0 on the very first attempt,
- * which cannot have retried anyway), so a cheap-to-serialize op escalates
- * early and an expensive one does not.  See the URCU_TXN_FALLBACK_PER_COST_NUM
- * comment above.
+ * URCU_TXN_FALLBACK. Otherwise it scales with the operation's high-water cost
+ * (loads plus write-set records, learned when an attempt ends -- 0 before the
+ * first completed attempt, when the handle cannot have retried anyway), so a
+ * cheap-to-serialize op escalates early and an expensive one does not.  See the
+ * URCU_TXN_FALLBACK_PER_COST_NUM comment above.
  */
 static inline
 unsigned long urcu_txn__fallback_at(const struct urcu_mcas_txn *txn)
