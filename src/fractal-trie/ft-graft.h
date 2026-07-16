@@ -1248,6 +1248,24 @@ retry_attach:
 			return CDS_FT_STATUS_POPULATED_ERROR;
 		}
 		/*
+		 * Reanchor level-move (ft_descent skip_conflict): a peer chain-merge
+		 * moved an encoded position SHALLOWER mid-descent, so the captured
+		 * publish chain (@d->pnf / @d->pnfp, and the coherent graft-point
+		 * parent @d->ppnf the recompact inherits) is at the wrong level.  A
+		 * mutating caller must re-descend against the now-current tree -- the
+		 * same bail insert takes (ft_insert.h skip_conflict).  Nothing is
+		 * reader-visible yet (the build is invisible / d is a pure descent),
+		 * so the abort boundary is byte-for-byte clean: drop the invisible
+		 * build + reserved txn + fresh root and re-descend.
+		 */
+		if (caa_unlikely(d.skip_conflict)) {
+			ft_glue_abort(dst_ft, &glue);
+			if (glue.txn)
+				ft_flip_txn_destroy(glue.txn);
+			free_cds_ft_node_unpublished(src_ft, fresh_node);
+			goto retry_attach;
+		}
+		/*
 		 * NOSPLIT graft point already occupied (the store would report this
 		 * post-swap): surface POPULATED here, BEFORE the source-root swap, so
 		 * the source stays pristine -- no rollback, no reader-observable
