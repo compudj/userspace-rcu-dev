@@ -1372,9 +1372,30 @@ retry_attach:
 		 */
 		if (prep == FT_GRAFT_PREP_NOSPLIT) {
 			enum cds_ft_status pstatus;
+			/*
+			 * Displaced-external shape: the descent broke on an
+			 * external d.nf, so the store re-parents that external
+			 * under a fresh branch published at d.pnf's CHILD slot
+			 * (ft_store_at_graft_point_prepare's displaced arm) -- it
+			 * never targets d.pnf's byte-slots.  A compressed d.pnf is
+			 * then the STABLE, expected structure (the graft key runs
+			 * through a compressed path to an external leaf), NOT a
+			 * transient race, so the store handles it as-is.
+			 */
+			bool displaced_shape = d.nf && ft_node_external(d.nf);
 
-			if (ft_node_compressed(d.pnf)
-					|| ft_node_skip_compressed(d.pnf)) {
+			/*
+			 * A compressed d.pnf at a BYTE-SLOT store (depth==key_len,
+			 * or a non-displaced diverge) means the descent raced a
+			 * concurrent chain-compress / relocation -- ft_node_set_nth_rec
+			 * cannot target a compressed node -- so re-descend.  The
+			 * displaced shape above is EXEMPT: guarding it spun forever in
+			 * single-writer (no peer to un-compress a stable compressed
+			 * parent, so the re-descend never made progress).
+			 */
+			if ((ft_node_compressed(d.pnf)
+					|| ft_node_skip_compressed(d.pnf))
+					&& !displaced_shape) {
 				pstatus = CDS_FT_STATUS_MEMORY_ERROR;
 			} else {
 				if (self_secured)
@@ -1415,47 +1436,64 @@ retry_attach:
 		}
 
 		/*
-		 * MW LOCK_FINE drop (§11, cross-trie GLUE graft): the diverge cluster
-		 * built above splices into @glue.publish_parent (== d.pnf, a LIVE dst
-		 * spine node captured at descent) with a single forward publish at the
-		 * glue commit -- AFTER the src-root swap below.  Under the FT-wide-lock
-		 * drop a concurrent peer (a sibling graft growing that spine node, a
-		 * point-remove recompacting it) can RETIRE @publish_parent between this
-		 * graft's descent and its glue commit; the commit's value-swap guard
+		 * MW LOCK_FINE drop (§11, cross-trie): a forward publish into the
+		 * captured dst spine parent @fence_parent (== d.pnf, a LIVE node from
+		 * the descent) happens at the commit -- AFTER the src-root swap below.
+		 * Under the FT-wide-lock drop a concurrent peer (a sibling graft growing
+		 * that spine node, a point-remove recompacting it) can RETIRE it between
+		 * this graft's descent and its commit; the commit's value-swap guard
 		 * passes on a dead-but-stable state word, so the forward publish stores
-		 * into a tombstoned node -- a wild store that corrupts the arena.  Lock
-		 * @publish_parent's COPYING fence HERE, before the point-of-no-return
-		 * swap, so no peer can retire it through the commit (which records the
-		 * held {COPYING|s -> s} release via @publish_parent_holder).  A miss
-		 * (@publish_parent already retired / proxied / peer-locked) is a clean
-		 * re-descend with src pristine -- ft_meta_copying_mark did NOT set the
-		 * fence, so nothing to unwind but the invisible dst build.  Mirrors the
-		 * NOSPLIT recompact's {p} lock above; gated on lock_fine so the FT-wide-
-		 * lock build is byte-identical (the mutex already serialises retires).
+		 * into a tombstoned node -- a wild store that corrupts the arena, and
+		 * (worse) if the guard instead MISMATCHES the tombstoned word the commit
+		 * ABORTS past the point of no return, silently dropping the whole
+		 * subtree.  Lock @fence_parent's COPYING fence HERE, before the swap, so
+		 * no peer can retire it through the commit (which records the held
+		 * {COPYING|s -> s} release via @publish_parent_holder, so the commit is
+		 * truly unfailable).  A miss (already retired / proxied / peer-locked)
+		 * is a clean re-descend with src pristine -- ft_meta_copying_mark did
+		 * NOT set the fence, so nothing to unwind but the invisible dst build.
+		 *
+		 * TWO shapes reach an unfenced forward publish into d.pnf: the GLUE
+		 * diverge (@glue.publish_parent set at build) and the NOSPLIT
+		 * DISPLACED-external attach (its commit publishes the fresh branch into
+		 * d.pnf's child slot, st.pnf == d.pnf; @st is valid once
+		 * @nosplit_prepared).  The in-place NOSPLIT store needs no fence here --
+		 * its ft_node_set_nth_rec recompacts + COPYING-locks {p} inside prepare
+		 * and holds it through commit.  Gated on lock_fine so the FT-wide-lock
+		 * build is byte-identical (the mutex already serialises retires).
 		 */
-		if (dst_ft->lock_fine && prep == FT_GRAFT_PREP_GLUE
-				&& glue.publish_parent) {
-			struct cds_ft_metadata *pp_meta =
-				ft_flag_to_metadata(dst_ft, glue.publish_parent);
-			uintptr_t pp_snap = 0;
+		{
+			struct cds_ft_inode_flag *fence_parent = NULL;
 
-			if (ft_meta_copying_mark(pp_meta, &pp_snap)) {
-				ft_glue_abort(dst_ft, &glue);
-				if (glue.txn)
-					ft_flip_txn_destroy(glue.txn);
-				if (src_retire_txn) {
-					ft_flip_txn_destroy(src_retire_txn);
-					src_retire_txn = NULL;
-				}
-				if (run_splice_txn) {
-					ft_flip_txn_destroy(run_splice_txn);
-					run_splice_txn = NULL;
-				}
-				free_cds_ft_node_unpublished(src_ft, fresh_node);
-				goto retry_attach;
+			if (dst_ft->lock_fine) {
+				if (prep == FT_GRAFT_PREP_GLUE)
+					fence_parent = glue.publish_parent;
+				else if (nosplit_prepared && st.displaced_shape)
+					fence_parent = st.pnf;
 			}
-			glue.publish_parent_holder = pp_meta;
-			glue.publish_parent_snap = pp_snap;
+			if (fence_parent) {
+				struct cds_ft_metadata *pp_meta =
+					ft_flag_to_metadata(dst_ft, fence_parent);
+				uintptr_t pp_snap = 0;
+
+				if (ft_meta_copying_mark(pp_meta, &pp_snap)) {
+					ft_glue_abort(dst_ft, &glue);
+					if (glue.txn)
+						ft_flip_txn_destroy(glue.txn);
+					if (src_retire_txn) {
+						ft_flip_txn_destroy(src_retire_txn);
+						src_retire_txn = NULL;
+					}
+					if (run_splice_txn) {
+						ft_flip_txn_destroy(run_splice_txn);
+						run_splice_txn = NULL;
+					}
+					free_cds_ft_node_unpublished(src_ft, fresh_node);
+					goto retry_attach;
+				}
+				glue.publish_parent_holder = pp_meta;
+				glue.publish_parent_snap = pp_snap;
+			}
 		}
 
 		/*
