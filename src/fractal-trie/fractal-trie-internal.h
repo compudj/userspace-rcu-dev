@@ -1415,18 +1415,14 @@ struct cds_ft {
 	size_t max_used_key_len;		/* Maximum key length inserted (conservative). */
 
 	/*
-	 * Active node-allocation reserve for this trie (NULL when none).  A bulk
-	 * op that must complete without an allocation failure (cds_ft_merge_at's
-	 * sub-position residual) pre-fills a reserve with the exact nodes it will
-	 * need, then activates it on every trie it allocates into: a subsequent
-	 * cds_ft_alloc_item for this trie DRAWS from the reserve (above the fault
-	 * hook) instead of touching the group arena, so the op cannot fail
-	 * mid-commit.  Per-trie, not per-group: mutual exclusion is per-trie, so
-	 * a concurrent writer on a DIFFERENT trie of the same group must not see
-	 * (and draw from) this op's reserve.  Touched only by the single writer
-	 * holding this trie's mutex, so no synchronization is needed.
+	 * The active node-allocation reserve (the bulk-op OOM-avoidance pool for
+	 * merge_at's sub-position residual / graft) is NOT stored here: it is
+	 * THREAD-LOCAL (fractal-trie-alloc.c, ft_tls_reserves[]).  A reserve is a
+	 * stack-local owned by one bulk op on one thread, so keeping its
+	 * activation state per-thread lets concurrent bulk ops on the same live
+	 * dst (post FT-wide-lock drop, §11) each own their reserve without
+	 * colliding on a shared field.  Query via cds_ft_alloc_reserve_covers().
 	 */
-	struct cds_ft_alloc_reserve *active_reserve;
 
 	/*
 	 * Access discipline. When true, access is serialized
@@ -1675,6 +1671,28 @@ void ft_writer_lock_scope_enter(struct cds_ft *ft)
 		 */
 		return;
 	}
+#ifdef FEATURE_FT_MW_LOCK_FINE_DROP
+	if (ft->lock_fine) {
+		/*
+		 * FT-WIDE-LOCK DROP (§11 drop-mechanics, MCAS-first): a FINE trie's
+		 * op-domains are ALL converted to per-node lock-sets (COPYING
+		 * try-locks) that arbitrate writers directly, so the FT-wide mutex
+		 * is redundant -- SKIP it and let the per-node locks be the sole
+		 * exclusion.  Dropped ALL-AT-ONCE for FINE (not op-domain by
+		 * op-domain): the FT-wide lock sits at the per-OP writer scope, not
+		 * a per-domain sub-scope, and one MCAS-abort-safe net covers every
+		 * domain uniformly.  Residual §11.1 under-count sites (I-1
+		 * in-place nr_child, I-4b skip-dual P, §8.3 word-sharing) stay
+		 * MCAS-abort-safe here: expected-old catches the race as a spurious
+		 * retry, not a lost update (that safety net is what the later sw
+		 * cutover removes, where full lock-set completeness becomes
+		 * mandatory).  ft_writer_lock_scope_exit no-ops (keys off
+		 * @ft_wlock_held identity, never set) and ft_writer_lock_gp_wait
+		 * degrades to a plain synchronize_rcu (held == NULL).
+		 */
+		return;
+	}
+#endif
 	if (caa_unlikely(ft_wlock_held != NULL)) {
 		/*
 		 * Two FT-wide locks at once: only a cross-trie op could nest
@@ -2158,18 +2176,24 @@ int cds_ft_alloc_reserve_add(struct cds_ft *ft, struct cds_ft_alloc_reserve *r,
 		unsigned int n);
 
 /*
- * Make @r the active reserve for @ft (this trie's writer mutex held).  A bulk
- * op allocating into several tries (e.g. merge: src, dst, and the transient
- * subtree) activates the SAME @r on each; the shared reserve is safe because
- * the op holds all their writer mutexes.
+ * Make @r the active reserve for @ft in THIS THREAD's reserve set.  A bulk op
+ * allocating into several tries (e.g. merge same-trie rekey: dst + the transient
+ * detach product) activates the SAME @r on each; the reserve is thread-local, so
+ * a concurrent bulk op on the same live dst owns its own reserve and does not
+ * collide (the FT-wide-lock drop, §11, removed the mutex this once relied on).
+ * A trie may be activated at most once at a time (asserted).
  */
 __attribute__((visibility("hidden")))
 void cds_ft_alloc_reserve_activate(struct cds_ft *ft,
 		struct cds_ft_alloc_reserve *r);
 
-/* Clear the active reserve for @ft. */
+/* Remove @ft from this thread's active reserve set. */
 __attribute__((visibility("hidden")))
 void cds_ft_alloc_reserve_deactivate(struct cds_ft *ft);
+
+/* True iff this thread has an active reserve covering @ft. */
+__attribute__((visibility("hidden")))
+bool cds_ft_alloc_reserve_covers(const struct cds_ft *ft);
 
 /* Free every item still held in @r (the op drew fewer than it reserved). */
 __attribute__((visibility("hidden")))

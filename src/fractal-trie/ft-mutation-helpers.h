@@ -3443,6 +3443,24 @@ struct ft_glue {
 	struct cds_ft_inode_flag **publish_slot;
 	struct cds_ft_inode_flag *top;
 	/*
+	 * MW LOCK_FINE drop (§11, cross-trie GLUE graft): the COPYING lock on
+	 * @publish_parent acquired BEFORE the point-of-no-return src-root swap.
+	 * Under the FT-wide-lock drop @publish_parent (a live dst spine node the
+	 * diverge cluster splices into, captured at descent) can be RETIRED by a
+	 * concurrent peer (a sibling graft growing it, a point-remove recompacting
+	 * it) between the descent and this graft's glue commit -- the commit would
+	 * then publish into a tombstoned node, a wild store that corrupts the arena
+	 * free-list.  Acquiring @publish_parent's COPYING fence pre-swap (bail +
+	 * re-descend on a miss, src pristine) makes it un-retirable through the
+	 * commit; @publish_parent is a value-swap REPLACE target (body not copied,
+	 * nr_child unchanged) so the held {COPYING|s -> s} release at commit expects
+	 * an unchanged word.  @publish_parent_holder NULL = not pre-acquired (non-
+	 * lock_fine, or a non-GLUE / root-splice publish): the commit takes the
+	 * ordinary acquire-or-guard, behaviour-identical to before.
+	 */
+	struct cds_ft_metadata *publish_parent_holder;
+	uintptr_t publish_parent_snap;
+	/*
 	 * Node whose nr_keys == the grafted payload's key count, and from
 	 * whose parent the external-count propagation starts at commit.
 	 */
@@ -3513,6 +3531,8 @@ void ft_glue_init(struct ft_glue *g)
 	g->publish_parent = NULL;
 	g->publish_slot = NULL;
 	g->top = NULL;
+	g->publish_parent_holder = NULL;
+	g->publish_parent_snap = 0;
 	g->attached_nf = NULL;
 	g->txn = NULL;
 	g->fuse_free_list = false;
@@ -4190,7 +4210,16 @@ void ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue *g,
 	 * miss is a correct degradation (identical to insert's ft_insert_publish_or_park
 	 * parent_nf, §9.1); non-lock_fine / NULL parent falls straight to the §4.B guard.
 	 */
-	ft_flip_txn_lock_or_guard_parent(ft, g->txn, g->publish_parent);
+	/*
+	 * @publish_parent_holder set (LOCK_FINE cross-trie GLUE graft): this op
+	 * already holds @publish_parent's COPYING fence, acquired pre-swap so a peer
+	 * could not retire it -- record the {COPYING|s -> s} RELEASE + register it
+	 * (the commit consumes it, an abort auto-clears) rather than re-marking (a
+	 * re-mark's masking guard would self-abort on the op's own held fence).
+	 * Holder NULL routes to the ordinary acquire-or-guard (non-lock_fine / root).
+	 */
+	ft_flip_txn_hold_or_lock_parent(ft, g->txn, g->publish_parent,
+		g->publish_parent_holder, g->publish_parent_snap);
 	_ft_publish_to_parent(ft, g->publish_parent, g->publish_slot, g->top,
 		*g->publish_slot /* SW graft: still holds the old child */, &rec);
 	for (j = 0; j < rec.n; j++)

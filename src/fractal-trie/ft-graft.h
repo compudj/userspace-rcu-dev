@@ -602,6 +602,27 @@ void ft_store_at_graft_point_commit(struct cds_ft *ft,
 		ft_glue_apply_deferred(ft, st->glue);
 		if (st->old_recompacted_node) {
 			unsigned int k;
+			/*
+			 * MW LOCK_FINE drop (§11, cross-trie): the publish slot must
+			 * come from st->dest's OWN (parent, offset) -- the COHERENT pair
+			 * the recompact locked and stored into st->dest's meta
+			 * (ft_node_recompact inh_parent / inh_slot) -- NOT the descent-
+			 * time st->pnfp.  Under the FT-wide-lock drop a peer can relocate
+			 * the graft-point grandparent between this graft's descent (which
+			 * captured st->pnfp) and the recompact that re-anchored st->dest
+			 * onto the NEW grandparent, leaving st->pnfp naming the OLD
+			 * grandparent's slot while st->dest->parent names the new one --
+			 * ft_set_parent_slot -> ft_slot_to_byte would then index the wrong
+			 * body out of bounds (the SAME coherence rule as the graft_swap
+			 * merged publish above and the remove-path PSO fix).  The
+			 * grandparent is release-locked by the recompact, so this resolve
+			 * is stable through the commit.
+			 */
+			struct cds_ft_metadata *dest_meta =
+				cds_ft_item_to_metadata(ft_node_ptr(st->dest));
+			struct cds_ft_inode_flag *pub_parent;
+			struct cds_ft_inode_flag **pub_slot =
+				ft_resolve_parent_slot(dest_meta, ft, &pub_parent);
 
 			/*
 			 * The reserve recompacted (relocated) the dst attach node.  A
@@ -636,10 +657,10 @@ void ft_store_at_graft_point_commit(struct cds_ft *ft,
 			 */
 			if (!ft->lock_fine)
 				ft_flip_txn_guard_parent(ft, st->glue->txn,
-					st->publish_pmeta->parent);
+					pub_parent);
 			_ft_publish_to_parent(ft, st->dest,
-				st->pnfp, st->dest,
-				*st->pnfp /* SW graft: old dst node */,
+				pub_slot, st->dest,
+				*pub_slot /* SW graft: old dst node */,
 				&st->reserve_rec);
 			for (k = 0; k < st->reserve_rec.n; k++)
 				ft_flip_txn_record_reserved(st->glue->txn,
@@ -663,12 +684,23 @@ void ft_store_at_graft_point_commit(struct cds_ft *ft,
 					cds_ft_item_to_metadata(ft_node_ptr(st->dest));
 				ft_nr_keys_store(ft, dm,
 					ft_nr_keys_get(dm) + count_delta, CMM_RELAXED);
-				count_base = st->publish_pmeta->parent;
+				count_base = pub_parent;
 			}
 		} else {
-			/* In-place reserve: a redundant same-value republish. */
-			ft_publish_to_parent(ft, st->publish_pmeta->parent,
-				st->pnfp, st->dest);
+			/*
+			 * In-place reserve: a redundant same-value republish.  Resolve
+			 * the grandparent slot COHERENTLY from st->dest's own (parent,
+			 * offset) rather than the stale descent st->pnfp -- same
+			 * coherence rule as the relocation arm above (a peer may have
+			 * relocated the grandparent since this graft's descent).
+			 */
+			struct cds_ft_metadata *dest_meta =
+				cds_ft_item_to_metadata(ft_node_ptr(st->dest));
+			struct cds_ft_inode_flag *pub_parent;
+			struct cds_ft_inode_flag **pub_slot =
+				ft_resolve_parent_slot(dest_meta, ft, &pub_parent);
+
+			ft_publish_to_parent(ft, pub_parent, pub_slot, st->dest);
 			/*
 			 * Order-statistics fold (BULK): @st->dest (== d->pnf, a
 			 * stable existing node) gains +count_delta; walk from it up.
@@ -707,8 +739,20 @@ void ft_store_at_graft_point_commit(struct cds_ft *ft,
 		 * and the commit that unlinks it flip atomically (atomic detach).
 		 * (Not surfaced by ft_unit; the recompact-relocation graft shape is
 		 * exercised by ft_inv.)
+		 *
+		 * LOCK_FINE (§9.3): under the FT-wide-lock drop the reserve's
+		 * ft_node_recompact ALREADY records @old_recompacted_node's retire
+		 * as its C-half {COPYING|s -> TOMBSTONE|s} terminal, registered on
+		 * THIS glue->txn (ft-mutation-node.h).  That IS the atomic-detach
+		 * tombstone; a second plain ft_flip_txn_record_tombstone here would
+		 * DOUBLE-record the same word with a conflicting expected-old (plain
+		 * current-state vs the mark snapshot) -- the double-tombstone poison
+		 * (lost key + double free).  Insert relies solely on the recompact's
+		 * retire (ft-insert.h, free_old_node, no commit-time tombstone); the
+		 * graft matches it under lock_fine and keeps the standalone tombstone
+		 * only for the non-fenced (non-lock_fine) recompact.
 		 */
-		if (st->old_recompacted_node)
+		if (st->old_recompacted_node && !ft->lock_fine)
 			ft_flip_txn_record_tombstone(st->glue->txn,
 				cds_ft_item_to_metadata(st->old_recompacted_node));
 		if (count_delta)
@@ -859,7 +903,6 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 {
 	struct cds_ft_metadata *src_rmeta;
 	size_t src_max;
-	enum cds_ft_status status;
 
 	/*
 	 * MW LOCK_FINE (step 6, §9.5): a cross-trie graft CONSUMES the whole
@@ -1060,6 +1103,15 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		struct ft_graft_run graft_run;
 		struct ft_graft_run *run_arg = NULL;
 		/*
+		 * NOSPLIT store split across the src-root swap (§11 drop): PREPARE
+		 * (the fallible recompact of the graft-point node) runs BEFORE the
+		 * swap so a concurrent {p} relocation / stale descent is a clean
+		 * -EAGAIN re-descend with src untouched; @st carries its result to
+		 * the unfailable COMMIT after the swap.
+		 */
+		struct ft_graft_store_state st;
+		bool nosplit_prepared = false;
+		/*
 		 * Self-secured NOSPLIT attach: when no caller reserve is active, this
 		 * graft reserves its own commit nodes before publishing the empty
 		 * source root, so the post-publish store cannot fail and needs no
@@ -1106,6 +1158,22 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 			(struct cds_ft_inode_flag *) ft_dereference_external(
 				src_rmeta->external_nodes) : src_ft->root;
 
+		/*
+		 * MW LOCK_FINE (§11 drop-mechanics): re-entry point for the
+		 * contention retry.  Under the FT-wide-lock drop a concurrent
+		 * writer can RELOCATE the shared graft-point-parent {p} between
+		 * this graft's reserve-fill and its store, staling the reserve
+		 * manifest -> the store fails (MEMORY_ERROR).  The store is
+		 * build-invisible (both tries untouched, graft.h:436) and the
+		 * consumed source is EXCLUSIVE (step 6, no readers), so on that
+		 * failure we roll the src-root swap back -- reader-invisible --
+		 * and retry the whole attach on a fresh descent.  @graft_payload
+		 * and @nil_key_root are attach-invariant (computed above); every
+		 * per-attempt resource is (re)acquired below and freed on the
+		 * retry path.  Progress: {p}'s COPYING lock guarantees a winner
+		 * each contention round.
+		 */
+retry_attach:
 		/*
 		 * Preallocate a fresh empty root for the source trie
 		 * before the point of no return, so we can fail cleanly
@@ -1247,7 +1315,8 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		 * caller reserve is already active (the rekey), which secures it via
 		 * that reserve + the pre-reserved txn.
 		 */
-		if (prep == FT_GRAFT_PREP_NOSPLIT && !dst_ft->active_reserve) {
+		if (prep == FT_GRAFT_PREP_NOSPLIT
+				&& !cds_ft_alloc_reserve_covers(dst_ft)) {
 			memset(&graft_reserve, 0, sizeof(graft_reserve));
 			if (ft_bulk_node_reserve_fill(dst_ft, &graft_reserve)) {
 				cds_ft_alloc_reserve_drain(dst_ft, &graft_reserve);
@@ -1261,6 +1330,114 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 				return CDS_FT_STATUS_MEMORY_ERROR;
 			}
 			self_secured = true;
+		}
+
+		/*
+		 * MW LOCK_FINE drop (§11, cross-trie): run the NOSPLIT store's
+		 * FALLIBLE half -- ft_store_at_graft_point_prepare, i.e. the
+		 * recompact of the graft-point node {p} -- BEFORE the point-of-no-
+		 * return src-root swap.  A concurrent relocation of {p}, a peer that
+		 * holds {p}'s (or the grandparent's) COPYING lock, or a stale
+		 * descent then surfaces as a clean re-descend with NOTHING on src
+		 * touched (no reader-visible src flicker, no rollback).  The
+		 * remaining commit is unfailable and runs after the swap through
+		 * @st.  The reserve (self-secured above, or the caller's) covers the
+		 * recompact copy; it is deactivated + drained here -- the copy
+		 * survives in @st, the commit allocates nothing.
+		 *
+		 * Staleness guard: a NOSPLIT graft point is an INTERNAL slot owner.
+		 * A compressed d.pnf means the descent raced a concurrent chain-
+		 * compress / relocation (ft_node_set_nth_rec cannot target a
+		 * compressed node) -- re-descend.  A tombstoned / proxied / peer-
+		 * locked {p} is caught INSIDE the recompact's COPYING mark
+		 * (ft_meta_copying_mark -> -EAGAIN -> prepare MEMORY_ERROR).
+		 */
+		if (prep == FT_GRAFT_PREP_NOSPLIT) {
+			enum cds_ft_status pstatus;
+
+			if (ft_node_compressed(d.pnf)
+					|| ft_node_skip_compressed(d.pnf)) {
+				pstatus = CDS_FT_STATUS_MEMORY_ERROR;
+			} else {
+				if (self_secured)
+					cds_ft_alloc_reserve_activate(dst_ft,
+						&graft_reserve);
+				pstatus = ft_store_at_graft_point_prepare(dst_ft,
+					key, key_len, &d, graft_payload,
+					src_count, &glue, &st);
+				if (self_secured)
+					cds_ft_alloc_reserve_deactivate(dst_ft);
+			}
+			if (self_secured) {
+				cds_ft_alloc_reserve_drain(dst_ft, &graft_reserve);
+				self_secured = false;
+			}
+			if (pstatus != CDS_FT_STATUS_OK) {
+				/*
+				 * Prepare failed BEFORE the swap: src is pristine,
+				 * only the invisible dst build + reserved txns need
+				 * unwinding.  Re-descend -- {p}'s COPYING lock
+				 * guarantees a winner each contention round.
+				 */
+				ft_glue_abort(dst_ft, &glue);
+				if (glue.txn)
+					ft_flip_txn_destroy(glue.txn);
+				if (src_retire_txn) {
+					ft_flip_txn_destroy(src_retire_txn);
+					src_retire_txn = NULL;
+				}
+				if (run_splice_txn) {
+					ft_flip_txn_destroy(run_splice_txn);
+					run_splice_txn = NULL;
+				}
+				free_cds_ft_node_unpublished(src_ft, fresh_node);
+				goto retry_attach;
+			}
+			nosplit_prepared = true;
+		}
+
+		/*
+		 * MW LOCK_FINE drop (§11, cross-trie GLUE graft): the diverge cluster
+		 * built above splices into @glue.publish_parent (== d.pnf, a LIVE dst
+		 * spine node captured at descent) with a single forward publish at the
+		 * glue commit -- AFTER the src-root swap below.  Under the FT-wide-lock
+		 * drop a concurrent peer (a sibling graft growing that spine node, a
+		 * point-remove recompacting it) can RETIRE @publish_parent between this
+		 * graft's descent and its glue commit; the commit's value-swap guard
+		 * passes on a dead-but-stable state word, so the forward publish stores
+		 * into a tombstoned node -- a wild store that corrupts the arena.  Lock
+		 * @publish_parent's COPYING fence HERE, before the point-of-no-return
+		 * swap, so no peer can retire it through the commit (which records the
+		 * held {COPYING|s -> s} release via @publish_parent_holder).  A miss
+		 * (@publish_parent already retired / proxied / peer-locked) is a clean
+		 * re-descend with src pristine -- ft_meta_copying_mark did NOT set the
+		 * fence, so nothing to unwind but the invisible dst build.  Mirrors the
+		 * NOSPLIT recompact's {p} lock above; gated on lock_fine so the FT-wide-
+		 * lock build is byte-identical (the mutex already serialises retires).
+		 */
+		if (dst_ft->lock_fine && prep == FT_GRAFT_PREP_GLUE
+				&& glue.publish_parent) {
+			struct cds_ft_metadata *pp_meta =
+				ft_flag_to_metadata(dst_ft, glue.publish_parent);
+			uintptr_t pp_snap = 0;
+
+			if (ft_meta_copying_mark(pp_meta, &pp_snap)) {
+				ft_glue_abort(dst_ft, &glue);
+				if (glue.txn)
+					ft_flip_txn_destroy(glue.txn);
+				if (src_retire_txn) {
+					ft_flip_txn_destroy(src_retire_txn);
+					src_retire_txn = NULL;
+				}
+				if (run_splice_txn) {
+					ft_flip_txn_destroy(run_splice_txn);
+					run_splice_txn = NULL;
+				}
+				free_cds_ft_node_unpublished(src_ft, fresh_node);
+				goto retry_attach;
+			}
+			glue.publish_parent_holder = pp_meta;
+			glue.publish_parent_snap = pp_snap;
 		}
 
 		/*
@@ -1410,22 +1587,19 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 			 */
 			unsigned int attached_depth = 0;
 
-			if (self_secured)
-				cds_ft_alloc_reserve_activate(dst_ft,
-					&graft_reserve);
-			status = ft_store_at_graft_point(dst_ft, key, key_len,
-							  &d, graft_payload,
-							  src_count,
-							  &attached_nf,
-							  &attached_depth,
-							  &glue, run_arg,
-							  (long) src_count);
-			if (self_secured) {
-				cds_ft_alloc_reserve_deactivate(dst_ft);
-				cds_ft_alloc_reserve_drain(dst_ft, &graft_reserve);
-			}
-			assert(status == CDS_FT_STATUS_OK);
-			(void) status;
+			/*
+			 * NOSPLIT commit: the fallible half (the recompact of the
+			 * graft-point node {p}) already ran build-invisibly BEFORE
+			 * the swap (@st / @nosplit_prepared).  The commit only
+			 * records the forward slot edge, the relocation edges, and
+			 * the ordered-list run-splice into the pre-reserved
+			 * @glue.txn and flips them -- no allocation, no fallible
+			 * step, no src rollback.
+			 */
+			assert(nosplit_prepared);
+			ft_store_at_graft_point_commit(dst_ft, &attached_nf,
+				&attached_depth, run_arg, &st,
+				(long) src_count);
 		}
 
 		/*

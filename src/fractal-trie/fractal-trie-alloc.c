@@ -1202,6 +1202,54 @@ long cds_ft_fault_flip_countdown = -1;
 long cds_ft_fault_lock_countdown = -1;
 #endif
 
+/*
+ * Per-thread active node-allocation reserve set (MW §11 drop-mechanics).
+ *
+ * The reserve is a bulk op's OOM-avoidance pool: graft / merge / graft_swap
+ * pre-fill it (while they can still fail cleanly), then ACTIVATE it so every
+ * cds_ft_alloc_item into the target trie DRAWS from the pool instead of the
+ * fallible arena -- the commit cannot fail mid-way.  It used to be a per-trie
+ * field (cds_ft::active_reserve), safe only because the FT-wide writer lock
+ * serialized bulk ops on a trie.  The FT-wide-lock drop removes that
+ * serialization, so two concurrent grafts into one live dst would both stamp
+ * the same field and collide.  A reserve is a stack-local owned by ONE op on
+ * ONE thread, so its activation state is naturally THREAD-LOCAL: each writer's
+ * bulk op owns its reserve, and a peer on the same dst has its own -- no shared
+ * field, no collision.
+ *
+ * A single op can activate ONE reserve on TWO tries (merge same-trie rekey:
+ * dst + the detach product @tmp), so this is a small array of {trie, reserve}
+ * records, not one slot.  The old per-trie single-activation invariant
+ * (assert(!ft->active_reserve) in activate) becomes: a trie is covered by at
+ * most one record at a time (asserted).  FT_TLS_RESERVE_MAX bounds concurrent
+ * activations on one thread (2 today; assert on overflow so a future nesting
+ * shape surfaces loudly instead of silently corrupting).
+ */
+#define FT_TLS_RESERVE_MAX	4
+struct ft_tls_reserve_rec {
+	const struct cds_ft *ft;
+	struct cds_ft_alloc_reserve *r;
+};
+static __thread struct ft_tls_reserve_rec ft_tls_reserves[FT_TLS_RESERVE_MAX];
+static __thread unsigned int ft_tls_reserve_nr;
+
+/* The reserve this thread has activated on @ft, or NULL. */
+static inline
+struct cds_ft_alloc_reserve *ft_tls_reserve_for(const struct cds_ft *ft)
+{
+	unsigned int i;
+
+	for (i = 0; i < ft_tls_reserve_nr; i++)
+		if (ft_tls_reserves[i].ft == ft)
+			return ft_tls_reserves[i].r;
+	return NULL;
+}
+
+bool cds_ft_alloc_reserve_covers(const struct cds_ft *ft)
+{
+	return ft_tls_reserve_for(ft) != NULL;
+}
+
 static
 struct cds_ft_metadata *cds_ft_alloc_item_from(struct cds_ft *ft,
 		struct cds_ft_alloc_arena **arena_p,
@@ -1212,32 +1260,37 @@ struct cds_ft_metadata *cds_ft_alloc_item_from(struct cds_ft *ft,
 	struct cds_ft_alloc_arena *arena;
 
 	/*
-	 * Draw from the active node-allocation reserve, ABOVE the fault hook
-	 * and the arena: a bulk op that pre-filled a reserve cannot fail here
-	 * mid-commit, and the fault hook only bites during the fill (before the
-	 * reserve is activated).  Cells are never reserved.  The reserve is
-	 * touched only by the single writer that activated it (writer mutex
-	 * held), so no synchronization is needed.
+	 * Draw from this thread's active node-allocation reserve for @ft, ABOVE
+	 * the fault hook and the arena: a bulk op that pre-filled a reserve
+	 * cannot fail here mid-commit, and the fault hook only bites during the
+	 * fill (before the reserve is activated).  Cells are never reserved.
+	 * The reserve set is thread-local, so a peer writer on @ft (or another
+	 * trie) has its own -- no synchronization is needed.  The nr guard keeps
+	 * the common no-reserve path to a single TLS load.
 	 */
-	if (kind != CDS_FT_ALLOC_KIND_CELL && ft->active_reserve) {
-		struct cds_ft_alloc_reserve *r = ft->active_reserve;
-		unsigned int *cnt = &r->count[kind][item_len_order];
+	if (kind != CDS_FT_ALLOC_KIND_CELL && ft_tls_reserve_nr) {
+		struct cds_ft_alloc_reserve *r = ft_tls_reserve_for(ft);
 
-		if (*cnt)
-			return r->items[kind][item_len_order][--(*cnt)];
-		/*
-		 * Reserve active but exhausted for this (kind, order): the op's
-		 * manifest under-counted what it allocates.  Surface it in debug
-		 * -- the op would otherwise fall through to a fallible allocation
-		 * here, defeating the reserve's no-fail guarantee.  The report
-		 * names the missing bucket so a manifest can be extended to a new
-		 * shape.  Production falls through (degrading to pre-reserve
-		 * behaviour).
-		 */
-		fprintf(stderr,
-			"ft alloc reserve underflow: kind=%d order=%zu\n",
-			(int) kind, item_len_order);
-		assert(0);
+		if (r) {
+			unsigned int *cnt = &r->count[kind][item_len_order];
+
+			if (*cnt)
+				return r->items[kind][item_len_order][--(*cnt)];
+			/*
+			 * Reserve active but exhausted for this (kind, order):
+			 * the op's manifest under-counted what it allocates.
+			 * Surface it in debug -- the op would otherwise fall
+			 * through to a fallible allocation here, defeating the
+			 * reserve's no-fail guarantee.  The report names the
+			 * missing bucket so a manifest can be extended to a new
+			 * shape.  Production falls through (degrading to
+			 * pre-reserve behaviour).
+			 */
+			fprintf(stderr,
+				"ft alloc reserve underflow: kind=%d order=%zu\n",
+				(int) kind, item_len_order);
+			assert(0);
+		}
 	}
 
 #ifdef FEATURE_FT_FAULT_INJECT
@@ -1332,7 +1385,9 @@ struct cds_ft_metadata *cds_ft_alloc_cell_item(struct cds_ft *ft)
 static
 void cds_ft_do_free_item(struct cds_ft_metadata *metadata)
 {
-	struct cds_ft_metadata_alloc *metadata_alloc =
+	struct cds_ft_metadata_alloc *metadata_alloc;
+
+	metadata_alloc =
 		caa_container_of(metadata, struct cds_ft_metadata_alloc, metadata);
 
 #ifdef FT_IMMEDIATE_FREE
@@ -1439,7 +1494,8 @@ int cds_ft_alloc_reserve_add(struct cds_ft *ft, struct cds_ft_alloc_reserve *r,
 	assert(kind == CDS_FT_ALLOC_KIND_NODE ||
 		kind == CDS_FT_ALLOC_KIND_COMPRESSED);
 	assert(item_len_order <= FT_ALLOC_ORDER_MAX);
-	assert(!ft->active_reserve);	/* fill before activate: real allocations */
+	/* Fill before activate: these are real (fallible) allocations. */
+	assert(!ft_tls_reserve_for(ft));
 	assert(r->count[kind][item_len_order] + n <= CDS_FT_ALLOC_RESERVE_CAP);
 	for (i = 0; i < n; i++) {
 		struct cds_ft_metadata *m;
@@ -1458,13 +1514,27 @@ int cds_ft_alloc_reserve_add(struct cds_ft *ft, struct cds_ft_alloc_reserve *r,
 void cds_ft_alloc_reserve_activate(struct cds_ft *ft,
 		struct cds_ft_alloc_reserve *r)
 {
-	assert(!ft->active_reserve);
-	ft->active_reserve = r;
+	assert(!ft_tls_reserve_for(ft));	/* a trie: activated at most once */
+	assert(ft_tls_reserve_nr < FT_TLS_RESERVE_MAX);
+	ft_tls_reserves[ft_tls_reserve_nr].ft = ft;
+	ft_tls_reserves[ft_tls_reserve_nr].r = r;
+	ft_tls_reserve_nr++;
 }
 
 void cds_ft_alloc_reserve_deactivate(struct cds_ft *ft)
 {
-	ft->active_reserve = NULL;
+	unsigned int i;
+
+	for (i = 0; i < ft_tls_reserve_nr; i++) {
+		if (ft_tls_reserves[i].ft == ft) {
+			/* Order-independent removal (dst/tmp deactivate in any order). */
+			ft_tls_reserves[i] = ft_tls_reserves[--ft_tls_reserve_nr];
+			ft_tls_reserves[ft_tls_reserve_nr].ft = NULL;
+			ft_tls_reserves[ft_tls_reserve_nr].r = NULL;
+			return;
+		}
+	}
+	assert(0);	/* deactivate without a matching activate */
 }
 
 void cds_ft_alloc_reserve_drain(struct cds_ft *ft,
@@ -1472,7 +1542,7 @@ void cds_ft_alloc_reserve_drain(struct cds_ft *ft,
 {
 	unsigned int k, o, i;
 
-	assert(!ft->active_reserve);	/* deactivate before drain */
+	assert(!ft_tls_reserve_for(ft));	/* deactivate before drain */
 	(void) ft;
 	for (k = 0; k < CDS_FT_ALLOC_RESERVE_NR_KIND; k++) {
 		for (o = 0; o <= FT_ALLOC_ORDER_MAX; o++) {
