@@ -31,14 +31,16 @@
  * composes into a larger cross-structure flip via the _prepare forms -- exactly
  * as the bidir sw-list records its two edges.
  *
- * Composition is limited to SLOT-DISJOINT edits: the sw engine has no
- * transactional loads and no same-slot reconcile, so each _prepare reads its
- * neighbour slots raw and cannot see a pending edit made earlier in the SAME
- * bracket.  Cross-structure composition (the intended use) is disjoint by
- * construction; two edits on ONE hlist whose neighbourhoods touch -- adjacent
- * deletes, say -- silently commit stale pointers.  See the trap worked out in
- * urcu_txn_sw_list_add_after_prepare(); use the concurrent front-end
- * (<urcu/rcu-txn-hlist.h>), whose read-your-own-writes chains them, for those.
+ * Composition covers cross-structure edits (the intended use, disjoint by
+ * construction) AND edits on ONE hlist whose neighbourhoods touch: each _prepare
+ * reads its neighbour links -- both the reader-visible "next"/first slots and
+ * the writer-only pprev slots -- through the engine's read-your-own-writes load
+ * (urcu_txn_sw_hlist_pending_next / _pending_pprev) and chains a same-slot record
+ * rather than duplicating it, so adjacent deletes and the like commit correctly.
+ * This is the same mechanism as the concurrent <urcu/rcu-txn-hlist.h>'s and the
+ * sibling <urcu/rcu-txn-sw-list.h>'s.  See urcu_txn_sw_hlist_del_prepare() for
+ * the worked trap and the one obligation left to the caller (name the nodes
+ * before editing them, not by traversing mid-bracket).
  *
  * Configurable proxy tag (a compile-time define, never stored in the head)
  * ----------------------------------------------------------------------
@@ -161,17 +163,56 @@ int urcu_txn_sw_hlist_empty(struct urcu_txn_sw_hlist_head *head)
 }
 
 /*
- * urcu_txn_sw_hlist_insert_at_slot_prepare: the core composable primitive.
- * Record the edges that make @slot name @newp, given @slot currently holds
- * @succ (the caller read it directly -- a single updater sees settled slots),
- * WITHOUT committing.  @slot is &head->first for insert-at-head or &pos->next
- * for insert-after.  Records the reader-visible *slot edge and, when @succ is
- * non-NULL, the writer-only &succ->pprev edge.  Always returns 0 (single
- * updater); the int return matches the concurrent variant for transition parity.
+ * WRITE-SIDE reads of a link slot: its value as @txn will leave it -- this
+ * transaction's pending write to the slot if it has recorded one, else the
+ * slot's committed value.  Typed wrappers over the engine's read-your-own-writes
+ * load (<urcu/rcu-txn-sw.h>): _pending_next reads a reader-visible "next"/first
+ * slot (a node pointer), _pending_pprev a writer-only pprev slot (a slot
+ * pointer).  The _prepare forms below read every neighbour link through these
+ * rather than touching ->next / ->pprev / *slot directly -- that is what lets
+ * edits COMPOSE on one bucket (see urcu_txn_sw_hlist_del_prepare()).  Writer
+ * side only -- a reader wants urcu_txn_sw_hlist_first_rcu() / _next_rcu(), which
+ * resolve against the flip selector and know nothing of a transaction's pending
+ * state.
  *
- * Compose only over SLOT-DISJOINT edits -- @succ is read raw by the caller, so
- * it cannot reflect a pending edit made earlier in the same bracket.  See the
- * header intro and urcu_txn_sw_list_add_after_prepare().
+ * The load returns the committed value when the slot is unrecorded and the
+ * pending value once it is, which is exactly what record_chain() wants as the
+ * @old_ptr in either case: a fresh record's committed old, or the pending value
+ * it asserts against on a chain.
+ */
+static inline
+struct urcu_txn_sw_hlist_node *urcu_txn_sw_hlist_pending_next(
+		struct urcu_txn_sw_txn *txn,
+		struct urcu_txn_sw_hlist_node **slot)
+{
+	return (struct urcu_txn_sw_hlist_node *) urcu_txn_sw_load(txn,
+			(void **) slot, URCU_TXN_SW_HLIST_TAG);
+}
+
+static inline
+struct urcu_txn_sw_hlist_node **urcu_txn_sw_hlist_pending_pprev(
+		struct urcu_txn_sw_txn *txn,
+		struct urcu_txn_sw_hlist_node ***slot)
+{
+	return (struct urcu_txn_sw_hlist_node **) urcu_txn_sw_load(txn,
+			(void **) slot, URCU_TXN_SW_HLIST_TAG);
+}
+
+/*
+ * urcu_txn_sw_hlist_insert_at_slot_prepare: the core composable primitive.
+ * Record the edges that make @slot name @newp, given @slot will hold @succ as
+ * this transaction leaves it, WITHOUT committing.  @slot is &head->first for
+ * insert-at-head or &pos->next for insert-after.  Records the reader-visible
+ * *slot edge and, when @succ is non-NULL, the writer-only &succ->pprev edge.
+ * Always returns 0 (single updater); the int return matches the concurrent
+ * variant for transition parity.
+ *
+ * @succ must be the value @slot will hold as this transaction leaves it, not a
+ * raw read: @newp is built pointing at it (newp->next = succ), so a stale @succ
+ * links @newp behind a node an earlier edit of the SAME bracket already
+ * displaced.  Read it with urcu_txn_sw_hlist_pending_next() when composing on
+ * one bucket -- the add_head / add_after wrappers below do.  With that, edits
+ * compose on one hlist; see urcu_txn_sw_hlist_del_prepare() for the worked trap.
  */
 static inline
 int urcu_txn_sw_hlist_insert_at_slot_prepare(struct urcu_txn_sw_txn *txn,
@@ -184,10 +225,10 @@ int urcu_txn_sw_hlist_insert_at_slot_prepare(struct urcu_txn_sw_txn *txn,
 	newp->pprev = slot;
 
 	/* *slot: succ -> newp ; succ->pprev: slot -> &newp->next. */
-	(void) urcu_txn_sw_record(txn, (void **) slot, succ, newp,
+	(void) urcu_txn_sw_record_chain(txn, (void **) slot, succ, newp,
 			URCU_TXN_SW_HLIST_TAG);
 	if (succ != NULL)
-		(void) urcu_txn_sw_record(txn, (void **) &succ->pprev, slot,
+		(void) urcu_txn_sw_record_chain(txn, (void **) &succ->pprev, slot,
 				&newp->next, URCU_TXN_SW_HLIST_TAG);
 	return 0;
 }
@@ -202,7 +243,8 @@ int urcu_txn_sw_hlist_add_head_prepare(struct urcu_txn_sw_txn *txn,
 		struct urcu_txn_sw_hlist_head *head)
 {
 	return urcu_txn_sw_hlist_insert_at_slot_prepare(txn, newp,
-			&head->first, head->first);
+			&head->first,
+			urcu_txn_sw_hlist_pending_next(txn, &head->first));
 }
 
 /*
@@ -215,7 +257,8 @@ int urcu_txn_sw_hlist_add_after_prepare(struct urcu_txn_sw_txn *txn,
 		struct urcu_txn_sw_hlist_node *pos)
 {
 	return urcu_txn_sw_hlist_insert_at_slot_prepare(txn, newp,
-			&pos->next, pos->next);
+			&pos->next,
+			urcu_txn_sw_hlist_pending_next(txn, &pos->next));
 }
 
 /*
@@ -228,15 +271,16 @@ int urcu_txn_sw_hlist_add_before_prepare(struct urcu_txn_sw_txn *txn,
 		struct urcu_txn_sw_hlist_node *newp,
 		struct urcu_txn_sw_hlist_node *pos)
 {
-	struct urcu_txn_sw_hlist_node **slot = pos->pprev;
+	struct urcu_txn_sw_hlist_node **slot =
+			urcu_txn_sw_hlist_pending_pprev(txn, &pos->pprev);
 
 	newp->next = pos;
 	newp->pprev = slot;
 
 	/* *slot: pos -> newp ; pos->pprev: slot -> &newp->next. */
-	(void) urcu_txn_sw_record(txn, (void **) slot, pos, newp,
+	(void) urcu_txn_sw_record_chain(txn, (void **) slot, pos, newp,
 			URCU_TXN_SW_HLIST_TAG);
-	(void) urcu_txn_sw_record(txn, (void **) &pos->pprev, slot,
+	(void) urcu_txn_sw_record_chain(txn, (void **) &pos->pprev, slot,
 			&newp->next, URCU_TXN_SW_HLIST_TAG);
 	return 0;
 }
@@ -246,19 +290,32 @@ int urcu_txn_sw_hlist_add_before_prepare(struct urcu_txn_sw_txn *txn,
  * *elem->pprev and next.  @elem's own next/pprev are left intact (ghost) so a
  * reader standing on it still escapes forward; the caller frees @elem after a
  * grace period (post-commit).  Always returns 0.
+ *
+ * Composition on one bucket, worked through -- delete adjacent A and B from
+ * head -> A -> B -> C in one bracket.  del(A) records {*head->first: A -> B} and
+ * {B->pprev: &A->next -> &head->first}.  del(B) then reads B->pprev through the
+ * RYW load and gets the PENDING &head->first (not the committed &A->next), so it
+ * records against &head->first -- finds it already recorded, and CHAINS:
+ * {*head->first: A -> C}, with {C->pprev: &B->next -> &head->first}.  Result:
+ * head->first == C, C->pprev == &head->first; A and B both unlinked.  Reading
+ * B->pprev RAW instead -- as this header did before the engine grew the RYW pair
+ * -- would record against the stale &A->next on a slot distinct from
+ * head->first, leaving head->first naming the deleted B.
  */
 static inline
 int urcu_txn_sw_hlist_del_prepare(struct urcu_txn_sw_txn *txn,
 		struct urcu_txn_sw_hlist_node *elem)
 {
-	struct urcu_txn_sw_hlist_node *next = elem->next;
-	struct urcu_txn_sw_hlist_node **ppv = elem->pprev;
+	struct urcu_txn_sw_hlist_node *next =
+			urcu_txn_sw_hlist_pending_next(txn, &elem->next);
+	struct urcu_txn_sw_hlist_node **ppv =
+			urcu_txn_sw_hlist_pending_pprev(txn, &elem->pprev);
 
 	/* *ppv: elem -> next ; next->pprev: &elem->next -> ppv (if next). */
-	(void) urcu_txn_sw_record(txn, (void **) ppv, elem, next,
+	(void) urcu_txn_sw_record_chain(txn, (void **) ppv, elem, next,
 			URCU_TXN_SW_HLIST_TAG);
 	if (next != NULL)
-		(void) urcu_txn_sw_record(txn, (void **) &next->pprev,
+		(void) urcu_txn_sw_record_chain(txn, (void **) &next->pprev,
 				&elem->next, ppv, URCU_TXN_SW_HLIST_TAG);
 	return 0;
 }
@@ -273,17 +330,19 @@ int urcu_txn_sw_hlist_replace_prepare(struct urcu_txn_sw_txn *txn,
 		struct urcu_txn_sw_hlist_node *old,
 		struct urcu_txn_sw_hlist_node *newp)
 {
-	struct urcu_txn_sw_hlist_node *next = old->next;
-	struct urcu_txn_sw_hlist_node **ppv = old->pprev;
+	struct urcu_txn_sw_hlist_node *next =
+			urcu_txn_sw_hlist_pending_next(txn, &old->next);
+	struct urcu_txn_sw_hlist_node **ppv =
+			urcu_txn_sw_hlist_pending_pprev(txn, &old->pprev);
 
 	newp->next = next;
 	newp->pprev = ppv;
 
 	/* *ppv: old -> newp ; next->pprev: &old->next -> &newp->next (if next). */
-	(void) urcu_txn_sw_record(txn, (void **) ppv, old, newp,
+	(void) urcu_txn_sw_record_chain(txn, (void **) ppv, old, newp,
 			URCU_TXN_SW_HLIST_TAG);
 	if (next != NULL)
-		(void) urcu_txn_sw_record(txn, (void **) &next->pprev,
+		(void) urcu_txn_sw_record_chain(txn, (void **) &next->pprev,
 				&old->next, &newp->next, URCU_TXN_SW_HLIST_TAG);
 	return 0;
 }
@@ -301,6 +360,7 @@ int urcu_txn_sw_hlist_add_head_rcu(struct urcu_txn_sw_hlist_node *newp,
 	struct urcu_txn_sw_txn txn;
 
 	urcu_txn_sw_init(&txn);
+	urcu_txn_sw_declare_disjoint(&txn);	/* single-op commit: distinct slots, no same-slot WAW */
 	(void) urcu_txn_sw_reserve(&txn, 2);
 	(void) urcu_txn_sw_hlist_add_head_prepare(&txn, newp, head);
 	return urcu_txn_sw_commit(&txn) < 0 ? -1 : 0;
@@ -313,6 +373,7 @@ int urcu_txn_sw_hlist_add_after_rcu(struct urcu_txn_sw_hlist_node *newp,
 	struct urcu_txn_sw_txn txn;
 
 	urcu_txn_sw_init(&txn);
+	urcu_txn_sw_declare_disjoint(&txn);	/* single-op commit: distinct slots, no same-slot WAW */
 	(void) urcu_txn_sw_reserve(&txn, 2);
 	(void) urcu_txn_sw_hlist_add_after_prepare(&txn, newp, pos);
 	return urcu_txn_sw_commit(&txn) < 0 ? -1 : 0;
@@ -325,6 +386,7 @@ int urcu_txn_sw_hlist_add_before_rcu(struct urcu_txn_sw_hlist_node *newp,
 	struct urcu_txn_sw_txn txn;
 
 	urcu_txn_sw_init(&txn);
+	urcu_txn_sw_declare_disjoint(&txn);	/* single-op commit: distinct slots, no same-slot WAW */
 	(void) urcu_txn_sw_reserve(&txn, 2);
 	(void) urcu_txn_sw_hlist_add_before_prepare(&txn, newp, pos);
 	return urcu_txn_sw_commit(&txn) < 0 ? -1 : 0;
@@ -336,6 +398,7 @@ int urcu_txn_sw_hlist_del_rcu(struct urcu_txn_sw_hlist_node *elem)
 	struct urcu_txn_sw_txn txn;
 
 	urcu_txn_sw_init(&txn);
+	urcu_txn_sw_declare_disjoint(&txn);	/* single-op commit: distinct slots, no same-slot WAW */
 	(void) urcu_txn_sw_reserve(&txn, 2);
 	(void) urcu_txn_sw_hlist_del_prepare(&txn, elem);
 	return urcu_txn_sw_commit(&txn) < 0 ? -1 : 0;
@@ -348,6 +411,7 @@ int urcu_txn_sw_hlist_replace_rcu(struct urcu_txn_sw_hlist_node *old,
 	struct urcu_txn_sw_txn txn;
 
 	urcu_txn_sw_init(&txn);
+	urcu_txn_sw_declare_disjoint(&txn);	/* single-op commit: distinct slots, no same-slot WAW */
 	(void) urcu_txn_sw_reserve(&txn, 2);
 	(void) urcu_txn_sw_hlist_replace_prepare(&txn, old, newp);
 	return urcu_txn_sw_commit(&txn) < 0 ? -1 : 0;
