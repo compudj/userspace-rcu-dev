@@ -161,6 +161,27 @@ struct urcu_txn_sw_list_node *urcu_txn_sw_list_resolve(struct urcu_txn_sw_list_n
 	return ptr;
 }
 
+/*
+ * WRITE-SIDE read of a link slot: its value as @txn will leave it -- this
+ * transaction's pending write to @slot if it has recorded one, else the slot's
+ * committed value.  A typed wrapper over the engine's read-your-own-writes load
+ * (<urcu/rcu-txn-sw.h>).
+ *
+ * Every _prepare below reads its neighbour links through this rather than
+ * touching ->next / ->prev directly: that is what lets edits COMPOSE on one
+ * list (see urcu_txn_sw_list_add_after_prepare()).  Writer-side only -- a
+ * reader wants urcu_txn_sw_list_next_rcu() / _prev_rcu(), which resolve against
+ * the flip selector instead and know nothing of a transaction's pending state.
+ */
+static inline
+struct urcu_txn_sw_list_node *urcu_txn_sw_list_pending(
+		struct urcu_txn_sw_txn *txn,
+		struct urcu_txn_sw_list_node **slot)
+{
+	return (struct urcu_txn_sw_list_node *) urcu_txn_sw_load(txn,
+			(void **) slot, URCU_TXN_SW_LIST_PROXY_TAG);
+}
+
 /* Resolved forward / backward step (call under rcu_read_lock()). */
 static inline
 struct urcu_txn_sw_list_node *urcu_txn_sw_list_next_rcu(
@@ -238,44 +259,47 @@ int urcu_txn_sw_list_flip2(
  * edge is tagged with URCU_TXN_SW_LIST_PROXY_TAG so the list's reader accessors
  * resolve the proxy.
  *
- * ONLY SLOT-DISJOINT COMPOSITION IS LEGAL, and this is exactly where the parity
- * with urcu_txn_list_insert_after_prepare() STOPS.  The sw engine has no
- * transactional loads and no same-slot reconcile (see urcu_txn_sw_record):
- * every _prepare reads its neighbour slots RAW, so a second prepare in the
- * same bracket sees the PRE-transaction values, never this transaction's own
- * pending edits.  Composing two edits whose neighbourhoods touch therefore
- * builds the write set out of stale pointers.
+ * SAME-LIST COMPOSITION IS LEGAL, including edits whose neighbourhoods touch.
+ * Every _prepare reads its neighbour links through urcu_txn_sw_list_pending()
+ * (the engine's read-your-own-writes load) and records through
+ * urcu_txn_sw_record_chain(), so a second prepare in the same bracket sees this
+ * transaction's own pending edits rather than the pre-transaction values, and a
+ * residual same-slot collision fuses onto the existing record instead of
+ * duplicating it.  This is the same mechanism -- and the same guarantee -- as
+ * urcu_txn_list_insert_after_prepare()'s in the concurrent twin.
  *
- * Adjacent deletes are the canonical trap.  P -> E1 -> E2 -> N, deleting E1 and
- * E2 in one flip, records {&P->next: E1 -> E2}, {&E2->prev: E1 -> P},
- * {&E1->next: E2 -> N}, {&N->prev: E2 -> E1}: four PAIRWISE-DISTINCT slots, so
- * even install's debug duplicate scan passes -- and the commit publishes
- * P->next == E2 and N->prev == E1, both of them deleted nodes.  The mw twin
- * survives the identical call pattern because read-your-own-writes chains the
- * second del through the first's pending values.  sw also PUBLISHES a stale
- * recorded old to readers across the install -> flip window (proxies resolve to
- * ptr[0]), where the mw engine's install CAS would simply have aborted.
+ * Adjacent deletes were the canonical trap, and are worth following through.
+ * P -> E1 -> E2 -> N, deleting E1 and E2 in one flip.  del(E1) records
+ * {&P->next: E1 -> E2} and {&E2->prev: E1 -> P}.  del(E2) then reads
+ * E2->prev and gets the PENDING P (not the committed E1), so it records against
+ * &P->next -- which it finds already recorded, and chains: {&P->next: E1 -> N}.
+ * With {&N->prev: E2 -> P} that leaves P <-> N linked and both victims
+ * unlinked.  Reading RAW instead -- as this header did before the engine grew
+ * the RYW pair -- produced {&E1->next: E2 -> N} and {&N->prev: E2 -> E1} on
+ * four PAIRWISE-DISTINCT slots, so install's duplicate scan passed and the
+ * commit published P->next == E2 and N->prev == E1, both deleted nodes.
  *
- * So compose across DISTINCT structures, or over same-structure edits whose
- * neighbourhoods are provably disjoint.  For anything else -- batched adjacent
- * edits on one list, a range move -- use the concurrent front-end
- * (<urcu/rcu-txn-list.h>) even under a single updater: its RYW chaining is what
- * makes those sound, and sw has no equivalent.
+ * What composition still requires of the CALLER: the nodes it names must be the
+ * ones it means.  These prepares re-read the links of the node handed to them,
+ * but they cannot re-run the caller's search -- a traversal made with the _rcu
+ * accessors sees the committed list, not this transaction's pending one, so a
+ * caller that walks and edits in the same bracket may still name a node its own
+ * earlier edit has displaced.  Identify the victims first, then edit.
  */
 static inline
 int urcu_txn_sw_list_add_after_prepare(struct urcu_txn_sw_txn *txn,
 		struct urcu_txn_sw_list_node *newp,
 		struct urcu_txn_sw_list_node *pos)
 {
-	struct urcu_txn_sw_list_node *next = pos->next;
+	struct urcu_txn_sw_list_node *next = urcu_txn_sw_list_pending(txn, &pos->next);
 
 	/* Build the fresh node's links before it becomes reachable. */
 	newp->prev = pos;
 	newp->next = next;
 
 	/* pos->next: next -> newp ; next->prev: pos -> newp */
-	(void) urcu_txn_sw_record(txn, (void **) &pos->next, next, newp, URCU_TXN_SW_LIST_PROXY_TAG);
-	(void) urcu_txn_sw_record(txn, (void **) &next->prev, pos, newp, URCU_TXN_SW_LIST_PROXY_TAG);
+	(void) urcu_txn_sw_record_chain(txn, (void **) &pos->next, next, newp, URCU_TXN_SW_LIST_PROXY_TAG);
+	(void) urcu_txn_sw_record_chain(txn, (void **) &next->prev, pos, newp, URCU_TXN_SW_LIST_PROXY_TAG);
 	return 0;
 }
 
@@ -290,6 +314,7 @@ int urcu_txn_sw_list_add_after_rcu(struct urcu_txn_sw_list_node *newp,
 	struct urcu_txn_sw_txn txn;
 
 	urcu_txn_sw_init(&txn);
+	urcu_txn_sw_declare_disjoint(&txn);	/* single-op commit: distinct slots, no same-slot WAW */
 	(void) urcu_txn_sw_reserve(&txn, 2);	/* sticky OOM -> commit reports it */
 	(void) urcu_txn_sw_list_add_after_prepare(&txn, newp, pos);
 	return urcu_txn_sw_commit(&txn) < 0 ? -1 : 0;
@@ -304,14 +329,14 @@ int urcu_txn_sw_list_add_before_prepare(struct urcu_txn_sw_txn *txn,
 		struct urcu_txn_sw_list_node *newp,
 		struct urcu_txn_sw_list_node *pos)
 {
-	struct urcu_txn_sw_list_node *prev = pos->prev;
+	struct urcu_txn_sw_list_node *prev = urcu_txn_sw_list_pending(txn, &pos->prev);
 
 	newp->next = pos;
 	newp->prev = prev;
 
 	/* prev->next: pos -> newp ; pos->prev: prev -> newp */
-	(void) urcu_txn_sw_record(txn, (void **) &prev->next, pos, newp, URCU_TXN_SW_LIST_PROXY_TAG);
-	(void) urcu_txn_sw_record(txn, (void **) &pos->prev, prev, newp, URCU_TXN_SW_LIST_PROXY_TAG);
+	(void) urcu_txn_sw_record_chain(txn, (void **) &prev->next, pos, newp, URCU_TXN_SW_LIST_PROXY_TAG);
+	(void) urcu_txn_sw_record_chain(txn, (void **) &pos->prev, prev, newp, URCU_TXN_SW_LIST_PROXY_TAG);
 	return 0;
 }
 
@@ -326,6 +351,7 @@ int urcu_txn_sw_list_add_before_rcu(struct urcu_txn_sw_list_node *newp,
 	struct urcu_txn_sw_txn txn;
 
 	urcu_txn_sw_init(&txn);
+	urcu_txn_sw_declare_disjoint(&txn);	/* single-op commit: distinct slots, no same-slot WAW */
 	(void) urcu_txn_sw_reserve(&txn, 2);	/* sticky OOM -> commit reports it */
 	(void) urcu_txn_sw_list_add_before_prepare(&txn, newp, pos);
 	return urcu_txn_sw_commit(&txn) < 0 ? -1 : 0;
@@ -360,12 +386,12 @@ static inline
 int urcu_txn_sw_list_del_prepare(struct urcu_txn_sw_txn *txn,
 		struct urcu_txn_sw_list_node *elem)
 {
-	struct urcu_txn_sw_list_node *prev = elem->prev;
-	struct urcu_txn_sw_list_node *next = elem->next;
+	struct urcu_txn_sw_list_node *prev = urcu_txn_sw_list_pending(txn, &elem->prev);
+	struct urcu_txn_sw_list_node *next = urcu_txn_sw_list_pending(txn, &elem->next);
 
 	/* prev->next: elem -> next ; next->prev: elem -> prev */
-	(void) urcu_txn_sw_record(txn, (void **) &prev->next, elem, next, URCU_TXN_SW_LIST_PROXY_TAG);
-	(void) urcu_txn_sw_record(txn, (void **) &next->prev, elem, prev, URCU_TXN_SW_LIST_PROXY_TAG);
+	(void) urcu_txn_sw_record_chain(txn, (void **) &prev->next, elem, next, URCU_TXN_SW_LIST_PROXY_TAG);
+	(void) urcu_txn_sw_record_chain(txn, (void **) &next->prev, elem, prev, URCU_TXN_SW_LIST_PROXY_TAG);
 	return 0;
 }
 
@@ -381,6 +407,7 @@ int urcu_txn_sw_list_del_rcu(struct urcu_txn_sw_list_node *elem)
 	struct urcu_txn_sw_txn txn;
 
 	urcu_txn_sw_init(&txn);
+	urcu_txn_sw_declare_disjoint(&txn);	/* single-op commit: distinct slots, no same-slot WAW */
 	(void) urcu_txn_sw_reserve(&txn, 2);	/* sticky OOM -> commit reports it */
 	(void) urcu_txn_sw_list_del_prepare(&txn, elem);
 	return urcu_txn_sw_commit(&txn) < 0 ? -1 : 0;
@@ -399,15 +426,15 @@ int urcu_txn_sw_list_replace_prepare(struct urcu_txn_sw_txn *txn,
 		struct urcu_txn_sw_list_node *old,
 		struct urcu_txn_sw_list_node *newp)
 {
-	struct urcu_txn_sw_list_node *prev = old->prev;
-	struct urcu_txn_sw_list_node *next = old->next;
+	struct urcu_txn_sw_list_node *prev = urcu_txn_sw_list_pending(txn, &old->prev);
+	struct urcu_txn_sw_list_node *next = urcu_txn_sw_list_pending(txn, &old->next);
 
 	newp->prev = prev;
 	newp->next = next;
 
 	/* prev->next: old -> newp ; next->prev: old -> newp */
-	(void) urcu_txn_sw_record(txn, (void **) &prev->next, old, newp, URCU_TXN_SW_LIST_PROXY_TAG);
-	(void) urcu_txn_sw_record(txn, (void **) &next->prev, old, newp, URCU_TXN_SW_LIST_PROXY_TAG);
+	(void) urcu_txn_sw_record_chain(txn, (void **) &prev->next, old, newp, URCU_TXN_SW_LIST_PROXY_TAG);
+	(void) urcu_txn_sw_record_chain(txn, (void **) &next->prev, old, newp, URCU_TXN_SW_LIST_PROXY_TAG);
 	return 0;
 }
 
@@ -422,6 +449,7 @@ int urcu_txn_sw_list_replace_rcu(struct urcu_txn_sw_list_node *old,
 	struct urcu_txn_sw_txn txn;
 
 	urcu_txn_sw_init(&txn);
+	urcu_txn_sw_declare_disjoint(&txn);	/* single-op commit: distinct slots, no same-slot WAW */
 	(void) urcu_txn_sw_reserve(&txn, 2);	/* sticky OOM -> commit reports it */
 	(void) urcu_txn_sw_list_replace_prepare(&txn, old, newp);
 	return urcu_txn_sw_commit(&txn) < 0 ? -1 : 0;
