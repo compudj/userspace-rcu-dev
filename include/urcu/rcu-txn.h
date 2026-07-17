@@ -191,6 +191,7 @@
 #include <urcu/fair-mutex.h>
 #include <urcu/flavor.h>		/* struct rcu_flavor_struct */
 #include <urcu/rcu-mcas.h>
+#include <urcu/rcu-txn-bloom.h>		/* shared RYW lookup filter (also used by rcu-txn-sw.h) */
 #include <urcu/rcu-txn-status.h>
 
 #ifdef __cplusplus
@@ -337,100 +338,16 @@ urcu_static_assert(URCU_TXN_FALLBACK_MIN <= URCU_TXN_FALLBACK_MAX,
  * / (64*WORDS)); the age-0/age-1 escalation study used it to separate genuine
  * RYW from filter FP.
  *
- * Both width and k are compile-time tunables that only ever trade filter cost
- * against the false-positive rate: correctness never depends on either, since a
- * false positive only ever costs a find (baseline) or an extra attempt (age 0).
- * The 16-word / k=3 default sits at the false-positive knee and wins across
- * every measured workload; escalation itself is tuned per-transaction at
- * runtime via urcu_txn_declare_disjoint() / urcu_txn_expect_conflict().
+ *
+ * The filter mechanism itself (width, k, hashing, test/set) is shared with
+ * <urcu/rcu-txn-sw.h> and lives in <urcu/rcu-txn-bloom.h>; what is stated here
+ * is this engine's POLICY for it.  Width and k are compile-time tunables that
+ * only ever trade filter cost against the false-positive rate: correctness
+ * never depends on either, since a false positive only ever costs a find
+ * (baseline) or an extra attempt (age 0).  Escalation itself is tuned
+ * per-transaction at runtime via urcu_txn_declare_disjoint() /
+ * urcu_txn_expect_conflict().
  */
-#ifndef URCU_TXN_BLOOM_WORDS
-# define URCU_TXN_BLOOM_WORDS	16
-#endif
-/*
- * URCU_TXN_BLOOM_K sets the number of hash BITS a slot maps to (default 3).
- * With k bits over m = 64*WORDS bits and n recorded slots the false-positive
- * rate is ~(1 - e^{-kn/m})^k, which for a sparse filter falls off as (kn/m)^k
- * -- so raising k cuts false positives super-linearly where widening WORDS only
- * helps linearly.  The filter is a double-hashed k-bit filter built from two
- * INDEPENDENT avalanche hashes h1,h2 (position i = h1 + i*h2); the age-0/age-1
- * study used k as the lever to drive the filter-FP escalation component toward
- * zero and isolate the genuine-RYW rate.  A degenerate k=1 is valid too (one
- * position).
- */
-#ifndef URCU_TXN_BLOOM_K
-# define URCU_TXN_BLOOM_K	3
-#endif
-
-#define URCU_TXN_BLOOM_BITS	(64ULL * URCU_TXN_BLOOM_WORDS)
-/*
- * Two INDEPENDENT hashes of the slot.  A single multiply leaves the k derived
- * positions correlated (slot addresses are aligned and clustered).
- * Minimal-cost Kirsch-Mitzenmacher: run ONE SplitMix64 avalanche (two
- * multiplies) and split its fully-mixed 64 bits into two independent 32-bit
- * lanes -- one hash yields both h1,h2, half the cost of two separate hashes and
- * far cheaper than a multiply-free chain (Thomas Wang) whose long dependency
- * chain is slower in practice.  h2 is forced odd so the progression h1 + i*h2
- * visits k distinct bits.
- */
-static inline
-void urcu_txn__ryw_bloom_h1h2(void **slot, uint64_t *h1, uint64_t *h2)
-{
-	uint64_t x = (uint64_t) (uintptr_t) slot >> 3;	/* slots are pointer-aligned */
-
-	x ^= x >> 30; x *= 0xbf58476d1ce4e5b9ULL;
-	x ^= x >> 27; x *= 0x94d049bb133111ebULL;
-	x ^= x >> 31;
-	*h1 = x & 0xffffffffULL;		/* low lane */
-	*h2 = (x >> 32) | 1;		/* high lane, odd stride */
-}
-static inline
-int urcu_txn__ryw_bloom_test(const uint64_t *bloom, void **slot)
-{
-	uint64_t h1, h2;
-	unsigned int i;
-
-	urcu_txn__ryw_bloom_h1h2(slot, &h1, &h2);
-	for (i = 0; i < URCU_TXN_BLOOM_K; i++) {
-		uint64_t idx = (h1 + (uint64_t) i * h2) % URCU_TXN_BLOOM_BITS;
-
-		if (!(bloom[idx >> 6] & ((uint64_t) 1 << (idx & 63))))
-			return 0;	/* a clear bit: the slot is definitely absent */
-	}
-	return 1;			/* all k bits set: present (or a false positive) */
-}
-static inline
-void urcu_txn__ryw_bloom_set(uint64_t *bloom, void **slot)
-{
-	uint64_t h1, h2;
-	unsigned int i;
-
-	urcu_txn__ryw_bloom_h1h2(slot, &h1, &h2);
-	for (i = 0; i < URCU_TXN_BLOOM_K; i++) {
-		uint64_t idx = (h1 + (uint64_t) i * h2) % URCU_TXN_BLOOM_BITS;
-
-		bloom[idx >> 6] |= (uint64_t) 1 << (idx & 63);
-	}
-}
-static inline
-int urcu_txn__ryw_bloom_test_and_set(uint64_t *bloom, void **slot)
-{
-	uint64_t h1, h2;
-	unsigned int i;
-	int was_set = 1;
-
-	urcu_txn__ryw_bloom_h1h2(slot, &h1, &h2);
-	for (i = 0; i < URCU_TXN_BLOOM_K; i++) {
-		uint64_t idx = (h1 + (uint64_t) i * h2) % URCU_TXN_BLOOM_BITS;
-		unsigned int w = (unsigned int) (idx >> 6);
-		uint64_t bit = (uint64_t) 1 << (idx & 63);
-
-		if (!(bloom[w] & bit))
-			was_set = 0;
-		bloom[w] |= bit;
-	}
-	return was_set;
-}
 
 /*
  * Age-0/age-1 optimistic RYW escalation.

@@ -46,6 +46,7 @@ nobase_include_HEADERS = \
 	urcu/map/urcu-memb.h \
 	urcu/map/urcu-qsbr.h \
 	urcu/pointer.h \
+	urcu/rcu-txn-bloom.h \
 	urcu/rcu-txn-sw-list.h \
 	urcu/rcu-txn-sw-hlist.h \
 	urcu/rcu-txn-list.h \
