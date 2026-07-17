@@ -61,6 +61,33 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 	/* Compressed metadata never carries external_nodes (see
 	 * ft_split_compressed_insert). */
 	assert(!cn_meta->external_nodes);
+	/*
+	 * F2 COPYING fence, split-retire (MW LOCK_FINE drop): fence @cn BEFORE
+	 * any plan read -- this build derives its WHOLE plan from @cn (the
+	 * diverge slicing over cn->key_bytes, the cn->child snapshot, the
+	 * deferred-edge captures) and RETIRES @cn, exactly as
+	 * ft_split_compressed_insert fences the node it splits.  A peer that
+	 * splits / grows / recompacts @cn, OR changes cn->child (X->X') and
+	 * releases @cn, must either hold the fence (mark fails -> -EAGAIN,
+	 * re-descend, NOTHING built) or abort at commit against the fenced
+	 * tombstone's precise expected old (ft_glue_txn_commit_edges records
+	 * {COPYING|s -> TOMBSTONE|s} from @split_cn_snap).  Marking here (not in
+	 * the caller's pre-swap fence block) closes the read-then-fence window:
+	 * the whole build runs under the fence, so a cn->child change during the
+	 * build is caught too.  Gated on a txn'd graft under the drop: the
+	 * txn-less merge-rekey (glue->txn NULL) and the FT-wide-lock / OPTIMISTIC
+	 * builds keep the prior behaviour.  On the fence-miss path nothing is
+	 * built and @cn is NOT marked (a clean re-descend); an OOM AFTER the mark
+	 * leaves @cn marked for the caller (ft_graft_keylen) to clear.
+	 */
+	if (ft->lock_fine && glue->txn && glue->fence_split_cn) {
+		uintptr_t cn_fence;
+
+		if (ft_meta_copying_mark(cn_meta, &cn_fence))
+			return -EAGAIN;	/* peer owns @cn; nothing built */
+		glue->split_cn_holder = cn_meta;
+		glue->split_cn_snap = cn_fence;
+	}
 	unsigned int suffix_len = cn->len - diverge_pos - 1;
 	uint8_t old_ordinal = cn->key_bytes[diverge_pos];
 	uint8_t new_ordinal = key[d->depth + diverge_pos];
@@ -848,6 +875,8 @@ enum ft_graft_prep {
 	FT_GRAFT_PREP_NOSPLIT,	/* graft point located in @d; legacy attach */
 	FT_GRAFT_PREP_POPULATED,/* graft point occupied; tries pristine */
 	FT_GRAFT_PREP_OOM,	/* allocation failed; caller runs glue_abort */
+	FT_GRAFT_PREP_RETRY,	/* split-retire cn fence miss; re-descend (nothing
+				 * built, cn NOT marked -- clean re-descend) */
 };
 
 /*
@@ -889,9 +918,13 @@ enum ft_graft_prep ft_graft_build(struct cds_ft *ft,
 				continue;
 			}
 			if (j < cmp) {
-				if (ft_split_compressed_graft_build(ft, d, key,
-						key_len, j, payload, src_count,
-						glue))
+				int bret = ft_split_compressed_graft_build(ft,
+					d, key, key_len, j, payload, src_count,
+					glue);
+
+				if (bret == -EAGAIN)
+					return FT_GRAFT_PREP_RETRY;
+				if (bret)
 					return FT_GRAFT_PREP_OOM;
 				return FT_GRAFT_PREP_GLUE;
 			}
@@ -1155,6 +1188,21 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		 */
 		enum urcu_txn_status store_cst = URCU_TXN_STATUS_OK;
 		/*
+		 * Post-swap store RETRY (§11 drop, doc ft-graft-abort-safe-poststore-
+		 * retry): once the source-root swap has committed (below), the payload
+		 * is detached from the EXCLUSIVE (reader-free) src and OWNED by this
+		 * writer -- src stays empty across retries with no reader-visible
+		 * flicker.  So the whole dst-side attach (re-descend -> build -> prepare
+		 * -> commit) is a self-contained, retryable operation: on a commit ABORT
+		 * we re-run ONLY the dst-side steps via @retry_attach and never touch
+		 * src again.  @already_swapped guards the one-shot src-side steps
+		 * (fresh-root alloc, the swap, the src-retire txn) so a retry skips them;
+		 * it also converts the pre-swap OOM exits (which would otherwise return
+		 * MEMORY_ERROR and orphan the payload) into re-attempts, since src is
+		 * already consumed.
+		 */
+		bool already_swapped = false;
+		/*
 		 * Self-secured NOSPLIT attach: when no caller reserve is active, this
 		 * graft reserves its own commit nodes before publishing the empty
 		 * source root, so the post-publish store cannot fail and needs no
@@ -1220,11 +1268,16 @@ retry_attach:
 		/*
 		 * Preallocate a fresh empty root for the source trie
 		 * before the point of no return, so we can fail cleanly
-		 * on memory shortage instead of calling abort().
+		 * on memory shortage instead of calling abort().  One-shot:
+		 * a post-swap retry keeps src's already-published fresh root
+		 * (@already_swapped), so @fresh_node stays NULL and every
+		 * src-side free below is skipped.
 		 */
-		fresh_node = alloc_cds_ft_node(src_ft, &ft_types[0], &fresh_meta);
-		if (!fresh_node)
-			return CDS_FT_STATUS_MEMORY_ERROR;
+		if (!already_swapped) {
+			fresh_node = alloc_cds_ft_node(src_ft, &ft_types[0], &fresh_meta);
+			if (!fresh_node)
+				return CDS_FT_STATUS_MEMORY_ERROR;
+		}
 
 		/*
 		 * PREP (dst + source pristine): build the dst-side attach.
@@ -1232,6 +1285,12 @@ retry_attach:
 		 * @glue; otherwise just locate the graft point in @d.
 		 */
 		ft_glue_init(&glue);
+		/*
+		 * Enable the split-retire @cn fence for this graft: ft_graft_keylen's
+		 * retry_attach loop handles a fence-miss (FT_GRAFT_PREP_RETRY) as a
+		 * clean re-descend.  ft_glue_init reset it, so set it each attempt.
+		 */
+		glue.fence_split_cn = true;
 		/*
 		 * Every attach shape -- GLUE diverge, displaced-external, and the
 		 * in-place NOSPLIT slot store -- commits through @glue.txn, so its
@@ -1259,6 +1318,8 @@ retry_attach:
 					+ (dst_ft->rank_stats ? (int) key_len + 1 : 0))) {
 				if (glue.txn)
 					ft_flip_txn_destroy(glue.txn);
+				if (already_swapped)
+					goto retry_attach;	/* src consumed: OOM is transient */
 				free_cds_ft_node_unpublished(src_ft, fresh_node);
 				return CDS_FT_STATUS_MEMORY_ERROR;
 			}
@@ -1278,16 +1339,58 @@ retry_attach:
 		prep = ft_graft_build(dst_ft, key, key_len, graft_payload,
 				src_count, &d, &glue);
 		if (prep == FT_GRAFT_PREP_OOM) {
+			/*
+			 * The GLUE build may have marked @cn's split-retire COPYING
+			 * fence before hitting OOM; ft_glue_abort below releases it
+			 * (single clear point), so @cn stays LIVE for the re-descend.
+			 */
 			ft_glue_abort(dst_ft, &glue);
 			if (glue.txn)
 				ft_flip_txn_destroy(glue.txn);
+			if (already_swapped)
+				goto retry_attach;	/* src consumed: OOM is transient */
 			free_cds_ft_node_unpublished(src_ft, fresh_node);
 			return CDS_FT_STATUS_MEMORY_ERROR;
 		}
-		if (prep == FT_GRAFT_PREP_POPULATED) {
+		if (prep == FT_GRAFT_PREP_RETRY) {
+			/*
+			 * Split-retire @cn fence miss (MW LOCK_FINE drop): a peer owns
+			 * @cn (splitting / growing / recompacting it, or changing
+			 * cn->child).  ft_split_compressed_graft_build built NOTHING and
+			 * did NOT mark @cn, so this is a clean re-descend -- dst is
+			 * byte-for-byte unchanged, src pristine (pre-swap) or empty +
+			 * owned by this writer (post-swap).  @cn's try-or-bail COPYING
+			 * mark guarantees a winner each contention round (no livelock).
+			 */
+			ft_glue_abort(dst_ft, &glue);
 			if (glue.txn)
 				ft_flip_txn_destroy(glue.txn);
-			free_cds_ft_node_unpublished(src_ft, fresh_node);
+			if (src_retire_txn) {
+				ft_flip_txn_destroy(src_retire_txn);
+				src_retire_txn = NULL;
+			}
+			if (run_splice_txn) {
+				ft_flip_txn_destroy(run_splice_txn);
+				run_splice_txn = NULL;
+			}
+			if (!already_swapped)
+				free_cds_ft_node_unpublished(src_ft, fresh_node);
+			goto retry_attach;
+		}
+		if (prep == FT_GRAFT_PREP_POPULATED) {
+			/*
+			 * Post-swap POPULATED is impossible for the supported contract
+			 * (an EXCLUSIVE src; a live dst whose graft key is this writer's
+			 * own -- no peer creates @key): the payload is already detached,
+			 * so there is no clean status left.  Assert rather than silently
+			 * orphan it; a general (non-disjoint) caller must move to the
+			 * fused src-retire+dst-store txn (doc, open follow-up).
+			 */
+			assert(!already_swapped);
+			if (glue.txn)
+				ft_flip_txn_destroy(glue.txn);
+			if (!already_swapped)	/* NDEBUG: @fresh_node is NULL post-swap */
+				free_cds_ft_node_unpublished(src_ft, fresh_node);
 			return CDS_FT_STATUS_POPULATED_ERROR;
 		}
 		/*
@@ -1305,7 +1408,8 @@ retry_attach:
 			ft_glue_abort(dst_ft, &glue);
 			if (glue.txn)
 				ft_flip_txn_destroy(glue.txn);
-			free_cds_ft_node_unpublished(src_ft, fresh_node);
+			if (!already_swapped)
+				free_cds_ft_node_unpublished(src_ft, fresh_node);
 			goto retry_attach;
 		}
 		/*
@@ -1316,8 +1420,10 @@ retry_attach:
 		 * d->depth == key_len.
 		 */
 		if (prep == FT_GRAFT_PREP_NOSPLIT && d.depth == key_len && d.nf) {
+			assert(!already_swapped);	/* see the PREP_POPULATED note above */
 			ft_flip_txn_destroy(glue.txn);
-			free_cds_ft_node_unpublished(src_ft, fresh_node);
+			if (!already_swapped)	/* NDEBUG: @fresh_node is NULL post-swap */
+				free_cds_ft_node_unpublished(src_ft, fresh_node);
 			return CDS_FT_STATUS_POPULATED_ERROR;
 		}
 
@@ -1331,13 +1437,30 @@ retry_attach:
 		 * a nil-key root retire fuses the orphaned wrapper's tombstone into
 		 * the retire (atomic detach, §4.B), needing a 2-edge txn even list-
 		 * off; list-on grows by +1 for that same fused tombstone.
+		 *
+		 * One-shot (src-side): the src-retire txn is consumed by the swap
+		 * below, so a post-swap retry keeps the src empty and does NOT
+		 * re-reserve it (@already_swapped -- both txns stay NULL, the fused
+		 * commit needs neither: @src_retire_txn was consumed and every attach
+		 * shape fuses the run into glue.txn, so the standalone splice that
+		 * would use @run_splice_txn is never taken).
 		 */
-		if (dst_ft->group->ordered_list_set) {
+		if (!already_swapped && dst_ft->group->ordered_list_set) {
 			src_retire_txn = ft_flip_txn_create_bounded(
 				FT_ROOT_LIST_SWAP_MAX_EDGES + 1);
 			run_splice_txn = ft_flip_txn_create_bounded(
 				FT_ORD_CELL_RUN_SPLICE_MAX_EDGES);
 			if (!src_retire_txn || !run_splice_txn) {
+				/*
+				 * Release the GLUE build's @cn split-retire fence (if
+				 * held) so @cn stays LIVE -- this OOM bail does not route
+				 * through ft_glue_abort.
+				 */
+				if (glue.split_cn_holder) {
+					ft_meta_copying_clear(glue.split_cn_holder);
+					glue.split_cn_holder = NULL;
+					glue.split_cn_snap = 0;
+				}
 				if (src_retire_txn)
 					ft_flip_txn_destroy(src_retire_txn);
 				if (run_splice_txn)
@@ -1346,9 +1469,14 @@ retry_attach:
 				free_cds_ft_node_unpublished(src_ft, fresh_node);
 				return CDS_FT_STATUS_MEMORY_ERROR;
 			}
-		} else if (nil_key_root) {
+		} else if (!already_swapped && nil_key_root) {
 			src_retire_txn = ft_flip_txn_create_bounded(2);
 			if (!src_retire_txn) {
+				if (glue.split_cn_holder) {
+					ft_meta_copying_clear(glue.split_cn_holder);
+					glue.split_cn_holder = NULL;
+					glue.split_cn_snap = 0;
+				}
 				ft_flip_txn_destroy(glue.txn);
 				free_cds_ft_node_unpublished(src_ft, fresh_node);
 				return CDS_FT_STATUS_MEMORY_ERROR;
@@ -1387,6 +1515,8 @@ retry_attach:
 					ft_flip_txn_destroy(src_retire_txn);
 				if (run_splice_txn)
 					ft_flip_txn_destroy(run_splice_txn);
+				if (already_swapped)
+					goto retry_attach;	/* src consumed: OOM is transient */
 				free_cds_ft_node_unpublished(src_ft, fresh_node);
 				return CDS_FT_STATUS_MEMORY_ERROR;
 			}
@@ -1472,7 +1602,8 @@ retry_attach:
 					ft_flip_txn_destroy(run_splice_txn);
 					run_splice_txn = NULL;
 				}
-				free_cds_ft_node_unpublished(src_ft, fresh_node);
+				if (!already_swapped)
+					free_cds_ft_node_unpublished(src_ft, fresh_node);
 				goto retry_attach;
 			}
 			nosplit_prepared = true;
@@ -1514,12 +1645,27 @@ retry_attach:
 				else if (nosplit_prepared && st.displaced_shape)
 					fence_parent = st.pnf;
 			}
+			/*
+			 * The GLUE build already fenced the compressed divergence node
+			 * @cn (== d.nf) it splits + replaces -- ft_split_compressed_graft_build
+			 * marks it BEFORE reading its plan, so the whole build runs under
+			 * the fence and glue.split_cn_holder is already set.  Here we fence
+			 * only @publish_parent (the LIVE node the forward publish stores
+			 * INTO), which @cn's fence does not cover.
+			 */
 			if (fence_parent) {
 				struct cds_ft_metadata *pp_meta =
 					ft_flag_to_metadata(dst_ft, fence_parent);
 				uintptr_t pp_snap = 0;
 
 				if (ft_meta_copying_mark(pp_meta, &pp_snap)) {
+					/*
+					 * A miss (@publish_parent already retired / proxied /
+					 * peer-locked) is a clean re-descend, src pristine.
+					 * ft_glue_abort below releases the @cn split-retire
+					 * fence held by the GLUE build (if any), so no fence
+					 * leaks (the commit never registered it).
+					 */
 					ft_glue_abort(dst_ft, &glue);
 					if (glue.txn)
 						ft_flip_txn_destroy(glue.txn);
@@ -1531,7 +1677,8 @@ retry_attach:
 						ft_flip_txn_destroy(run_splice_txn);
 						run_splice_txn = NULL;
 					}
-					free_cds_ft_node_unpublished(src_ft, fresh_node);
+					if (!already_swapped)
+						free_cds_ft_node_unpublished(src_ft, fresh_node);
 					goto retry_attach;
 				}
 				glue.publish_parent_holder = pp_meta;
@@ -1558,65 +1705,83 @@ retry_attach:
 		 * Exclusive sources carry no RCU readers, so the sync
 		 * is skipped in that case.
 		 */
-		old_src_root = src_ft->root;
-
 		/*
-		 * Freeze-on-free (doc §4.B): a NIL-key graft frees the orphaned
-		 * src-root wrapper @old_src_root below (its external chain was
-		 * grafted into dst, leaving the wrapper empty); its tombstone rides
-		 * the SAME flip as the src-root retire that unlinks it (atomic
-		 * detach), recorded into the retire txn in each arm below.  Non-NIL:
-		 * @old_src_root IS the payload, moved LIVE into dst -- it must NOT be
-		 * marked.  No fallible step between here and the retire (all returned
-		 * above).
-		 *
-		 * Ordered list: capture src's whole list (the run to graft) and,
-		 * paired with the structural src-root retire, unlink it from src
-		 * -- FUSED into ONE flip so a src reader never sees src
-		 * structurally empty while its ordered list still shows the run
-		 * (or vice versa).  The synchronize_rcu below then drains src
-		 * readers of the old content; the run is spliced into dst after
-		 * the structural publish (same commit point).  No rollback: every
-		 * failure mode (OOM / populated) returned above, before this
-		 * retire.
+		 * Point of no return -- ONE-SHOT (doc post-store retry): capture
+		 * @old_src_root + the src ordered-list run, then unlink the src root
+		 * (publish a fresh empty root).  A post-swap commit-abort retry keeps
+		 * src empty and re-runs only the dst-side attach, so this whole block
+		 * runs exactly once: @already_swapped guards it, @fresh_node is nulled
+		 * (it is now src's LIVE root -- every src-side free above is skipped),
+		 * and @src_retire_txn is consumed here + nulled so a retry's earlier
+		 * exits never re-destroy it.  @graft_run_first / _last persist across
+		 * retries (the run moved with the payload; src is now empty so the run
+		 * cannot be re-read from it).
 		 */
-		if (dst_ft->group->ordered_list_set) {
-			graft_run_first = ft_ord_first(src_ft);
-			graft_run_last = ft_ord_last(src_ft);
+		if (!already_swapped) {
+			old_src_root = src_ft->root;
+
 			/*
-			 * Just empty src's sentinel here (relink_dest NULL): the run's
-			 * cells are re-homed into dst by the run-splice below, which
-			 * repoints their outer links to dst's neighbours / sentinel.
+			 * Freeze-on-free (doc §4.B): a NIL-key graft frees the orphaned
+			 * src-root wrapper @old_src_root below (its external chain was
+			 * grafted into dst, leaving the wrapper empty); its tombstone rides
+			 * the SAME flip as the src-root retire that unlinks it (atomic
+			 * detach), recorded into the retire txn in each arm below.  Non-NIL:
+			 * @old_src_root IS the payload, moved LIVE into dst -- it must NOT be
+			 * marked.  No fallible step between here and the retire (all returned
+			 * above).
+			 *
+			 * Ordered list: capture src's whole list (the run to graft) and,
+			 * paired with the structural src-root retire, unlink it from src
+			 * -- FUSED into ONE flip so a src reader never sees src
+			 * structurally empty while its ordered list still shows the run
+			 * (or vice versa).  The synchronize_rcu below then drains src
+			 * readers of the old content; the run is spliced into dst after
+			 * the structural publish (same commit point).  No rollback: every
+			 * failure mode (OOM / populated) returned above, before this
+			 * retire.
 			 */
-			if (nil_key_root)
+			if (dst_ft->group->ordered_list_set) {
+				graft_run_first = ft_ord_first(src_ft);
+				graft_run_last = ft_ord_last(src_ft);
+				/*
+				 * Just empty src's sentinel here (relink_dest NULL): the run's
+				 * cells are re-homed into dst by the run-splice below, which
+				 * repoints their outer links to dst's neighbours / sentinel.
+				 */
+				if (nil_key_root)
+					ft_flip_txn_record_tombstone(src_retire_txn,
+						cds_ft_item_to_metadata(
+							ft_node_ptr(old_src_root)));
+				ft_root_list_swap_publish(src_ft, src_retire_txn,
+					&src_ft->root,
+					old_src_root, ft_node_flag(fresh_node, 0),
+					graft_run_first, NULL, graft_run_last, NULL,
+					NULL, false);
+			} else if (nil_key_root) {
+				/*
+				 * List off + nil-key: the lone root edge plus the orphaned
+				 * wrapper's tombstone commit as ONE 2-edge flip through the
+				 * pre-reserved txn (readers resolve the transient root proxy
+				 * exactly as on the list-on path).
+				 */
+				ft_flip_txn_record_reserved(src_retire_txn,
+					(void **) &src_ft->root,
+					(void *) old_src_root,
+					(void *) ft_node_flag(fresh_node, 0));
 				ft_flip_txn_record_tombstone(src_retire_txn,
-					cds_ft_item_to_metadata(
-						ft_node_ptr(old_src_root)));
-			ft_root_list_swap_publish(src_ft, src_retire_txn,
-				&src_ft->root,
-				old_src_root, ft_node_flag(fresh_node, 0),
-				graft_run_first, NULL, graft_run_last, NULL,
-				NULL, false);
-		} else if (nil_key_root) {
-			/*
-			 * List off + nil-key: the lone root edge plus the orphaned
-			 * wrapper's tombstone commit as ONE 2-edge flip through the
-			 * pre-reserved txn (readers resolve the transient root proxy
-			 * exactly as on the list-on path).
-			 */
-			ft_flip_txn_record_reserved(src_retire_txn,
-				(void **) &src_ft->root,
-				(void *) old_src_root,
-				(void *) ft_node_flag(fresh_node, 0));
-			ft_flip_txn_record_tombstone(src_retire_txn,
-				cds_ft_item_to_metadata(ft_node_ptr(old_src_root)));
-			ft_flip_txn_commit(src_ft, src_retire_txn);
-		} else {
-			ft_root_edge_flip(src_ft, &src_ft->root,
-				old_src_root, ft_node_flag(fresh_node, 0));
+					cds_ft_item_to_metadata(ft_node_ptr(old_src_root)));
+				ft_flip_txn_commit(src_ft, src_retire_txn);
+			} else {
+				ft_root_edge_flip(src_ft, &src_ft->root,
+					old_src_root, ft_node_flag(fresh_node, 0));
+			}
+			FT_TP(root_publish, (const void *) src_ft,
+				(const void *) src_ft->root);
+
+			already_swapped = true;
+			fresh_node = NULL;	/* now src's live root: never freed below */
+			src_retire_txn = NULL;	/* consumed by the swap above */
 		}
-		FT_TP(root_publish, (const void *) src_ft,
-			(const void *) src_ft->root);
 
 		/*
 		 * Ordered list: arm the run-splice fusion so the NOSPLIT store
@@ -1710,6 +1875,54 @@ retry_attach:
 			store_cst = ft_store_at_graft_point_commit(dst_ft,
 				&attached_nf, &attached_depth, run_arg, &st,
 				(long) src_count);
+		}
+
+		/*
+		 * Post-swap store ABORT (§11 drop, doc ft-graft-abort-safe-poststore-
+		 * retry): under the FT-wide-lock drop the attach commit can conflict
+		 * with a peer beyond the single word the pre-swap fence covers and
+		 * ABORT.  The rolled-back flip left dst byte-for-byte unchanged, every
+		 * registered COPYING fence auto-cleared (the recompact's {p} retire and
+		 * the Fix-A publish fence both back to LIVE), and glue.txn consumed.
+		 * The payload is still detached from the emptied EXCLUSIVE (reader-free)
+		 * src and OWNED by us, so RE-ATTEMPT the dst-side attach: free this
+		 * attempt's UNPUBLISHED products (the aborted txn rolled its edges back
+		 * but freed no nodes) and re-descend.  A peer committed a conflicting
+		 * flip => it made progress; {p}'s COPYING try-lock guarantees a winner
+		 * each round, so the retry terminates (the whole-op RCU pin spans it).
+		 */
+		if (store_cst != URCU_TXN_STATUS_OK) {
+			/*
+			 * Free the failed attempt's unpublished new nodes.  GLUE: the
+			 * whole diverge cluster (every fresh node ft_glue_track'd);
+			 * glue.txn is already NULL (the commit consumed it).  NOSPLIT:
+			 * the displaced branch + any glue cluster, PLUS -- if the reserve
+			 * RELOCATED {p} -- the unpublished relocated {p}' (@st.dest,
+			 * allocated directly by ft_node_recompact, NOT glue-tracked).  An
+			 * IN-PLACE recompact (old_recompacted_node == NULL) leaves
+			 * @st.dest == the LIVE d->pnf -- do NOT free it.  Never
+			 * ft_glue_free_old here: those OLD nodes stay LIVE (the abort
+			 * rolled their retire back), reclaimed by whoever finally commits.
+			 */
+			ft_glue_abort(dst_ft, &glue);
+			if (prep != FT_GRAFT_PREP_GLUE && st.old_recompacted_node)
+				free_cds_ft_node_unpublished(dst_ft,
+					ft_node_ptr(st.dest));
+			/*
+			 * Per-attempt state reset before re-descending: the NOSPLIT
+			 * prepare re-fills @st (and re-sets @nosplit_prepared) from
+			 * scratch; the run-splice fallback txn (list on) was created
+			 * one-shot but never consumed (the run fused into glue.txn), so
+			 * drop it -- a retry stays fused and needs none.  @already_swapped
+			 * / @fresh_node / @src_retire_txn are the one-shot src state, held
+			 * across the retry by the swap guard above.
+			 */
+			nosplit_prepared = false;
+			if (run_splice_txn) {
+				ft_flip_txn_destroy(run_splice_txn);
+				run_splice_txn = NULL;
+			}
+			goto retry_attach;
 		}
 
 		/*

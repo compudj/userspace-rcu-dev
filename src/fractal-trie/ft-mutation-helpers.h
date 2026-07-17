@@ -3525,6 +3525,33 @@ struct ft_glue {
 	struct cds_ft_metadata *publish_parent_holder;
 	uintptr_t publish_parent_snap;
 	/*
+	 * MW LOCK_FINE drop, split-compressed graft: the COPYING fence held on
+	 * the compressed divergence node @cn (== d->nf) that this GLUE build
+	 * SPLITS and REPLACES.  A graft that diverges inside a compressed node
+	 * builds a replacement branch from @cn's descent-time snapshot; under the
+	 * drop a concurrent peer (another graft splitting @cn, an insert growing
+	 * it) can turn @cn into a wider node between this graft's descent and its
+	 * commit, and the commit's forward publish re-reads the slot's CURRENT
+	 * occupant as expected-old -- so the CAS succeeds and the stale branch
+	 * silently drops the peer's freshly-added children.  Marking @cn COPYING
+	 * pre-swap makes it un-growable through the commit (a peer's recompact of
+	 * @cn bails); the held {COPYING|s -> TOMBSTONE|s} RETIRE at commit (@cn is
+	 * replaced, not edited) flips atomically with the forward publish.  NULL =
+	 * not pre-acquired (non-lock_fine, or a NOSPLIT / root-splice publish).
+	 */
+	struct cds_ft_metadata *split_cn_holder;
+	uintptr_t split_cn_snap;
+	/*
+	 * Enable the split-retire @cn fence (above) for THIS build.  Set only by
+	 * cds_ft_graft's ft_graft_keylen -- whose retry_attach loop handles the
+	 * fence-miss re-descend (FT_GRAFT_PREP_RETRY).  cds_ft_merge_at also
+	 * builds through ft_split_compressed_graft_build but has NO retry loop,
+	 * so it leaves this false (ft_glue_init default) and keeps its prior
+	 * behaviour -- the mark never fires there and no FT_GRAFT_PREP_RETRY can
+	 * reach its caller, which does not handle it.
+	 */
+	bool fence_split_cn;
+	/*
 	 * Node whose nr_keys == the grafted payload's key count, and from
 	 * whose parent the external-count propagation starts at commit.
 	 */
@@ -3597,6 +3624,9 @@ void ft_glue_init(struct ft_glue *g)
 	g->top = NULL;
 	g->publish_parent_holder = NULL;
 	g->publish_parent_snap = 0;
+	g->split_cn_holder = NULL;
+	g->split_cn_snap = 0;
+	g->fence_split_cn = false;
 	g->attached_nf = NULL;
 	g->txn = NULL;
 	g->fuse_free_list = false;
@@ -4115,6 +4145,21 @@ void ft_glue_abort(struct cds_ft *ft, struct ft_glue *g)
 {
 	int i;
 
+	/*
+	 * Split-retire cn fence (MW LOCK_FINE drop): a GLUE graft build that
+	 * marked the compressed divergence node @cn's COPYING fence
+	 * (ft_split_compressed_graft_build) and then aborts BEFORE the commit
+	 * registered it with g->txn must release the fence so @cn stays LIVE.
+	 * Every pre-commit graft bail routes through here, so this is the single
+	 * clear point.  Idempotent / no-op when unset (NOSPLIT, non-lock_fine,
+	 * non-graft callers -- ft_glue_init defaults it NULL -- or already
+	 * consumed by a committed retire, which does not reach ft_glue_abort).
+	 */
+	if (g->split_cn_holder) {
+		ft_meta_copying_clear(g->split_cn_holder);
+		g->split_cn_holder = NULL;
+		g->split_cn_snap = 0;
+	}
 	for (i = 0; i < g->nr_built; i++) {
 		struct cds_ft_inode_flag *nf = g->built[i];
 
@@ -4162,6 +4207,18 @@ void ft_glue_tombstone_free_list(struct ft_glue *g)
 		struct cds_ft_metadata *meta = cds_ft_item_to_metadata(
 			(struct cds_ft_inode *) g->free_list[i].node);
 
+		/*
+		 * MW LOCK_FINE drop (split-compressed graft): the fenced
+		 * divergence node @cn is retired through its held COPYING fence
+		 * -- ft_glue_txn_commit_edges records its {COPYING|s ->
+		 * TOMBSTONE|s} terminal.  A SECOND plain tombstone here would
+		 * DOUBLE-record @cn's state word (guard/retire-then-release =
+		 * permanent poison: every commit aborts), so skip it -- @cn stays
+		 * on the free list (retired) for reclaim, its LIVE->DEAD
+		 * transition owned by the fenced retire.
+		 */
+		if (g->split_cn_holder == meta)
+			continue;
 		/*
 		 * Fuse the freeze into @txn (committed with the forward publish
 		 * below) when the committer reserved for it; else a standalone
@@ -4304,6 +4361,35 @@ enum urcu_txn_status ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue 
 	for (j = 0; j < rec.n; j++)
 		ft_flip_txn_record_reserved(g->txn, (void **) rec.slot[j],
 			rec.old_val[j], rec.new_val[j]);
+	/*
+	 * MW LOCK_FINE drop (split-compressed graft): retire the compressed
+	 * divergence node @cn this GLUE build split + replaced, consuming the
+	 * COPYING fence held pre-swap (@split_cn_holder).  Records the
+	 * {COPYING|snap -> TOMBSTONE|snap} terminal into the SAME txn so @cn's
+	 * retire flips ATOMICALLY with the forward publish that unlinks it (the
+	 * commit consumes the fence; an abort CAS-clears it via the registry).
+	 * @cn is on the glue free-list, reclaimed after the commit.  Holder NULL
+	 * (non-lock_fine / NOSPLIT / root splice) records nothing, byte-identical.
+	 */
+	if (g->split_cn_holder) {
+		ft_flip_txn_record_tombstone_copying(g->txn, g->split_cn_holder,
+			g->split_cn_snap);
+		ft_flip_txn_copying_register(g->txn, g->split_cn_holder);
+		/*
+		 * OWNERSHIP TRANSFER (mirror publish_parent_holder): once
+		 * registered, the txn OWNS @cn's fence clear -- a commit consumes
+		 * it via the {COPYING|s -> TOMBSTONE|s} retire, and an ABORT
+		 * CAS-clears it back to LIVE through ft_flip_txn_copying_clear_all.
+		 * NULL the holder so the caller's post-abort ft_glue_abort does NOT
+		 * clear it a SECOND time -- a double clear asserts (clean word) in a
+		 * debug build and, under the live peers a commit-abort implies,
+		 * STEALS a peer's re-mark of @cn (fence theft -> double-free / torn
+		 * publish).  ft_glue_tombstone_free_list already ran (apply_deferred,
+		 * commit-step-1) so its split_cn skip saw the holder set.
+		 */
+		g->split_cn_holder = NULL;
+		g->split_cn_snap = 0;
+	}
 	/*
 	 * Ordered list on: also record the <=4 boundary cell edges the caller
 	 * pre-computed (a run-SPLICE for a graft, a run-REPLACE for a graft_swap;
