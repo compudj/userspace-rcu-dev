@@ -196,7 +196,9 @@ Only a **flat multi-word value read as a whole** (or a straddling field) needs i
 That is the blob's whole-struct read, and essentially nothing else in the family —
 which is why the seqcount is opt-in, **off by default**. Off: writers skip the
 bracket, readers get single-word-atomic field reads plus the tearing whole-struct
-hint. On: writers bracket, `load_consistent` becomes available.
+hint, and reads stay **wait-free**. On: writers bracket, `load_consistent` becomes
+available — but that path is no longer wait-free (see the progress-class note), so
+turning it on costs more than a hot word and a writer bracket.
 
 ## Three variants (writer model drives everything)
 
@@ -242,18 +244,20 @@ spanning each involved blob's generation, or (pure-mw) the validating txn.
 ### Fractal trie: the converging use (DLM now, seqcount deferred)
 
 The fractal trie is converging on this **hybrid / DLM** scheme (MCAS composable
-multi-lock + sw content), and — deliberately — **without the seqcount yet**,
-precisely because a generation word on the node's hot data cacheline is a
-footprint it does not want to pay. Lock and tombstone go in the node's cold
-metadata area; the data cachelines stay lean.
+multi-lock + sw content), and — deliberately — **without the seqcount yet**, for
+two reasons: a generation word on the node's hot data cacheline is a footprint it
+does not want to pay, **and** the seqcount would forfeit FT's **wait-free reads**
+(a seqcount snapshot is only obstruction-free — see the progress-class note). Lock
+and tombstone go in the node's cold metadata area; the data cachelines stay lean.
 
 The consequence is an accepted price: **recompaction.** Without a seqcount on the
 hot line, readers cannot get a cheap consistent `{occupancy-bitmap,
 popcount-compressed-array}` snapshot, so a **rank-changing** update (one that sets
 or clears an occupancy bit and thus shifts every higher entry's rank) is done by
 **COW recompaction** — build a new node cluster, publish with one store, reclaim
-the old — inherently torn-free via the single publish, at the cost of
-allocate + copy per rank change. What keeps this affordable is the split:
+the old — inherently torn-free via the single publish, and — crucially — keeping
+reads **wait-free** (one pointer resolve yields a whole consistent node), which a
+seqcount would give up. The price is allocate + copy per rank change. What keeps this affordable is the split:
 **rank-preserving** in-place updates (an existing entry's value, ≤ one word) stay
 seqcount-free single-word stores, so only rank *changes* recompact. The seqcount
 would only ever be needed for a multi-word *in-place* snapshot, which this split
@@ -293,13 +297,28 @@ read-set / seqcount, but that is opt-in, not required.
     word into a read-set linearizing on its own status CAS (the bitmap T4
     pattern). The **only** path that composes a snapshot across *other* txn
     structures. Cost: each validated word plants a proxy, so snapshot-readers
-    contend (reader-reader aborts) and perturb writers; does not scale.
+    contend (reader-reader aborts) and perturb writers; does not scale; and it is
+    **not wait-free** (abort + retry).
   - a **seqcount** — passive pure-load reads bracketed by the generation; no proxy
-    planting, no reader-reader aborts, never perturbs writers. Cost: reader may
-    retry until a quiescent window, snapshots the blob **alone** (does not
-    compose), and requires the writer to bracket (rule 3).
+    planting, no reader-reader aborts, never perturbs writers. Cost: snapshots the
+    blob **alone** (does not compose), requires the writer to bracket (rule 3),
+    and — the significant one — it is **not wait-free** (see below).
 - **A ≤ 7-byte blob is inherently torn-free** — one resolve to read, one record to
-  write, no seqcount or validating txn.
+  write, no seqcount or validating txn, and reads stay wait-free.
+
+**Progress class — the significant catch.** The family's baseline reads are
+**wait-free**: a single-word resolve, `load_rcu`, a word-contained field read, and
+a pointer-linked traversal all complete in a bounded number of their own steps
+with no retry — RCU's headline guarantee. **Both torn-free multi-word reads give
+that up.** The seqcount reader is only **obstruction-free** — it retries until it
+catches a quiescent window, so a sustained stream of writers can **starve it
+indefinitely**; the validating-txn reader likewise aborts and retries (and
+contends). For a flat multi-word value you can have wait-free *or* torn-free, not
+both — the wait-free way to snapshot many words at once is to make them reachable
+through a **single pointer (COW)**, which is exactly what FT's recompaction buys. A
+read path that must be wait-free (RT, signal/constrained context) therefore cannot
+use `load_consistent`; it stays on the single-word / `load_rcu` reads and is
+designed not to need a multi-word snapshot.
 
 Seqcount flavor by writer model: **parity** where writers are serialized (pure-sw,
 hybrid); **enter/exit** in-flight-writer count where they are concurrent
