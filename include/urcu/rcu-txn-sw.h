@@ -760,10 +760,15 @@ struct urcu_txn_sw_latch *urcu_txn_sw__find(const struct urcu_txn_sw_txn *t,
  * two.  There, find is zero-to-one pointer compares, cheaper than k hashes,
  * and zeroing the filter would be pure loss.
  *
- * So arm lazily: below the threshold pay nothing (not even the reset -- the
- * array stays untouched); at it, zero the filter and populate it from the
- * records so far, then maintain.  This buys the O(1) miss exactly where the
- * O(nr^2) actually bites, and costs one predictable compare where it does not.
+ * So arm lazily, and on first USE rather than on the record that crosses the
+ * threshold: below URCU_TXN_SW_BLOOM_MIN records pay nothing (not even the
+ * reset -- the array stays untouched).  The filter is built and armed by the
+ * first urcu_txn_sw__find_ryw() lookup that faces a write set at least that
+ * long, then maintained on every record thereafter.  Arming on the crossing
+ * record instead would make a transaction of exactly URCU_TXN_SW_BLOOM_MIN
+ * edges build and commit the filter without ever testing it (~8% measured on an
+ * 8-edge commit).  This buys the O(1) miss exactly where the O(nr^2) bites, and
+ * costs one predictable compare where it does not.
  */
 #ifndef URCU_TXN_SW_BLOOM_MIN
 # define URCU_TXN_SW_BLOOM_MIN	8
