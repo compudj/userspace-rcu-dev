@@ -4212,12 +4212,13 @@ void ft_glue_apply_deferred(struct cds_ft *ft, struct ft_glue *g)
  * freed immediately on the exclusive fast path).
  */
 static
-void ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue *g,
+enum urcu_txn_status ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue *g,
 		const struct ft_ord_cell_edge *cedges, unsigned int n_cedges)
 {
 	struct ft_pub_rec rec = { .n = 0 };
 	unsigned int j, k;
 	int i;
+	enum urcu_txn_status cst;
 
 	/*
 	 * Hidden back-pointers -- re-parents of nodes NOT reader-observable
@@ -4313,8 +4314,9 @@ void ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue *g,
 	 * nothing for the transaction machinery.  commit owns reclaim (deferred
 	 * through the FT flavor when a proxy is owed, freed in place otherwise).
 	 */
-	ft_flip_txn_commit(ft, g->txn);
+	cst = ft_flip_txn_commit(ft, g->txn);
 	g->txn = NULL;
+	return cst;
 }
 
 /*
@@ -4323,7 +4325,7 @@ void ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue *g,
  * links), arms @run, and commits via the edge core.  @run NULL => list off.
  */
 static
-void ft_glue_txn_commit(struct cds_ft *ft, struct ft_glue *g,
+enum urcu_txn_status ft_glue_txn_commit(struct cds_ft *ft, struct ft_glue *g,
 		struct ft_graft_run *run)
 {
 	struct ft_ord_cell_edge cedges[4] = { 0 };
@@ -4334,7 +4336,7 @@ void ft_glue_txn_commit(struct cds_ft *ft, struct ft_glue *g,
 			run->run_last, run->pred, run->succ, cedges, 0);
 		run->armed = true;
 	}
-	ft_glue_txn_commit_edges(ft, g, cedges, n);
+	return ft_glue_txn_commit_edges(ft, g, cedges, n);
 }
 
 /*

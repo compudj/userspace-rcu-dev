@@ -603,7 +603,7 @@ enum urcu_txn_status ft_store_at_graft_point_commit(struct cds_ft *ft,
 		 * records that +count_delta walk into the same flip.
 		 */
 		st->glue->count_delta = count_delta;
-		ft_glue_txn_commit(ft, st->glue, run);
+		cst = ft_glue_txn_commit(ft, st->glue, run);
 		if (st->tp_i >= 1)
 			FT_TP(tree_edge_set, (const void *) ft,
 				(const void *) st->pnf,
@@ -778,17 +778,32 @@ enum urcu_txn_status ft_store_at_graft_point_commit(struct cds_ft *ft,
 		if (count_delta)
 			ft_flip_txn_record_count_parent(ft, st->glue->txn,
 				count_base, count_delta);
-		ft_flip_txn_commit(ft, st->glue->txn);
+		cst = ft_flip_txn_commit(ft, st->glue->txn);
 		st->glue->txn = NULL;
 		if (run)
 			run->armed = true;
-
-		if (st->old_recompacted_node)
+		/*
+		 * Only the writer whose commit actually retired
+		 * @old_recompacted_node ({COPYING|s -> TOMBSTONE|s}) may free
+		 * it.  An aborted commit rolled the retire back (the registered
+		 * fence was cleared, the node stays LIVE); freeing it here would
+		 * double-free the still-live node against the peer that
+		 * legitimately retires it next.  The caller re-descends and
+		 * re-commits on abort (ft_graft_keylen post-swap store retry).
+		 */
+		if (st->old_recompacted_node && cst == URCU_TXN_STATUS_OK)
 			free_cds_ft_node(ft, st->old_recompacted_node);
 	}
-	ft_glue_free_old(ft, st->glue);
+	/*
+	 * @st->glue's OLD nodes (the pre-recompact copies gathered on its
+	 * free list) are equally only reclaimable when the commit committed:
+	 * an aborted commit left them LIVE.  Gate on @cst.
+	 */
+	if (cst == URCU_TXN_STATUS_OK)
+		ft_glue_free_old(ft, st->glue);
 	*attached_nf = st->attached;
 	*attached_depth = st->attached_depth;
+	return cst;
 }
 
 /*
@@ -1131,6 +1146,14 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		 */
 		struct ft_graft_store_state st;
 		bool nosplit_prepared = false;
+		/*
+		 * Post-swap store commit status (§11 drop abort-safety): under the
+		 * drop the attach commit CAN abort (its MCAS footprint conflicts with
+		 * a peer beyond the pre-swap fence's single fenced word).  Captured
+		 * from both commit arms so the OLD-node reclaim is gated on a real
+		 * retire and the store is re-attempted on abort.
+		 */
+		enum urcu_txn_status store_cst = URCU_TXN_STATUS_OK;
 		/*
 		 * Self-secured NOSPLIT attach: when no caller reserve is active, this
 		 * graft reserves its own commit nodes before publishing the empty
@@ -1646,9 +1669,20 @@ retry_attach:
 			 * walk into the same commit (a no-op when rank stats off).
 			 */
 			glue.count_delta = (long) src_count;
-			ft_glue_txn_commit(dst_ft, &glue, run_arg);
+			store_cst = ft_glue_txn_commit(dst_ft, &glue, run_arg);
 			attached_nf = glue.attached_nf;
-			ft_glue_free_old(dst_ft, &glue);
+			/*
+			 * Defect D / abort-safety: the diverge cluster's OLD nodes
+			 * (compressed graft-point node, gathered on glue's free list)
+			 * are only reclaimable when the commit committed.  Under the
+			 * drop ft_glue_txn_commit CAN abort (a peer conflicts on the
+			 * forward-publish footprint the pre-swap fence does not cover);
+			 * an aborted commit left those nodes LIVE, so freeing them here
+			 * would double-free them against the peer.  Gate on @store_cst;
+			 * the post-swap retry below re-descends and re-commits.
+			 */
+			if (store_cst == URCU_TXN_STATUS_OK)
+				ft_glue_free_old(dst_ft, &glue);
 		} else {
 			/*
 			 * Non-split attach: the payload subtrie is built into
@@ -1673,8 +1707,8 @@ retry_attach:
 			 * step, no src rollback.
 			 */
 			assert(nosplit_prepared);
-			ft_store_at_graft_point_commit(dst_ft, &attached_nf,
-				&attached_depth, run_arg, &st,
+			store_cst = ft_store_at_graft_point_commit(dst_ft,
+				&attached_nf, &attached_depth, run_arg, &st,
 				(long) src_count);
 		}
 
