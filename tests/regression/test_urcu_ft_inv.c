@@ -66,7 +66,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS	61
+#define NR_TESTS	62
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -787,7 +787,7 @@ static int inv_iteration_order(void)
  *    cds_ft_count_keys equals the exact live total, cds_ft_verify passes.
  *  - leak_check: no node leaked or double-freed across the run.
  */
-#define MW_NR_WRITERS	4
+#define MW_NR_WRITERS	16
 #define MW_RANGE	256		/* keys per writer */
 
 /*
@@ -1502,6 +1502,311 @@ static int inv_concurrent_writers_fine_lock(void)
 		"%lu live keys\n", MW_FINE_NR_WRITERS, total_ops, live);
 
 	free(w);
+	if (drain_and_destroy(ft, group) < 0)
+		ret = -1;
+	if (leak_check() < 0)
+		ret = -1;
+	return ret;
+}
+
+/* ================================================================== */
+/*                                                                    */
+/*   Concurrent CROSS-TRIE writers on a FINE trie (FT-wide-lock drop) */
+/*                                                                    */
+/* ================================================================== */
+
+/*
+ * Variable-length fine-grained lock-mode trie: like create_fixed_fine_lock_ft
+ * but with the group's default (variable) key length, so non-root graft /
+ * detach at a multi-byte prefix is legal (CDS_FT_LEN_VARIABLE).  EAGER lookup
+ * so the point verification needs no speculative key offset.  Used by
+ * inv_concurrent_crosstrie_fine_lock.
+ */
+static struct cds_ft *create_varlen_fine_lock_ft(struct cds_ft_group **group_out)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+
+	if (cds_ft_group_attr_create(&attr) < 0)
+		abort();
+	if (cds_ft_group_attr_set_lookup_optimization(attr,
+			CDS_FT_LOOKUP_OPTIMIZE_EAGER) < 0)
+		abort();
+	/* Isolate the structural attach path: no ordered-list cell splices. */
+	if (cds_ft_group_attr_set_ordered_list(attr, false) < 0)
+		abort();
+	if (cds_ft_group_attr_set_writer_strategy(attr,
+			CDS_FT_WRITER_LOCK_FINE) < 0)
+		abort();
+	if (cds_ft_group_create(attr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &ft) < 0)
+		abort();
+	*group_out = group;
+	return ft;
+}
+
+/*
+ * INVARIANT (MW, §11 drop-mechanics): concurrent cross-trie GRAFTs into one
+ * LIVE (concurrent) fine-grained lock-mode trie lose no key and corrupt no
+ * structure, with the FT-wide writer lock DROPPED.
+ *
+ * This closes the one un-soaked gap the drop's net-(A) argument otherwise
+ * covers only by inspection.  Through step 6 a cross-trie graft/merge/graft_swap
+ * takes the FT-wide lock on its LIVE dst (the exclusive source skips its own),
+ * so concurrent cross-trie ops on a live dst were serialized.  Under
+ * FEATURE_FT_MW_LOCK_FINE_DROP the dst skips that lock too, so concurrent grafts
+ * and point-removes into one live dst arbitrate SOLELY through the step-6A
+ * per-node attach RELEASE locks + MCAS.  Without the flag this runs under the
+ * FT-wide lock -- behaviour-identical, still a valid lost-key oracle.
+ *
+ * Layout MAXIMISES per-node contention: prefix = {p, w} with p shared across
+ * ALL writers and w = writer id, so every writer's graft at {p, w} attaches a
+ * child under the SAME {p} spine node -- MW_XT_NR_WRITERS writers contend each
+ * {p} node's lock / recompaction, which is exactly the arbitration the drop
+ * leans on.  Full keys are {p, w, s}; writer w owns the middle byte = w, so the
+ * per-writer shadow set stays disjoint and exactly verifiable.
+ *
+ * Each writer step picks a random prefix p: if absent, build an EXCLUSIVE
+ * source holding the S suffix keys and GRAFT it at {p, w}; if present,
+ * POINT-REMOVE all S keys {p, w, s} (the established remove + node_free_rcu free
+ * path, so no detached-trie drain is needed).  Final quiescent check: every
+ * present prefix's S keys resolve to this writer's nodes, count_keys matches
+ * the live total, and cds_ft_verify passes (a COPYING fence leaked by a dropped
+ * bail path surfaces here).
+ */
+#define MW_XT_NR_WRITERS	16
+#define MW_XT_PREFIXES		64	/* shared prefix byte p in [0, this) */
+#define MW_XT_SUFFIXES		4	/* keys grafted per prefix */
+
+struct mw_xt_arg {
+	struct cds_ft *ft;			/* the shared LIVE dst */
+	struct cds_ft_group *group;
+	unsigned int w;				/* writer id (middle key byte) */
+	uint8_t present[MW_XT_PREFIXES];	/* 1 = {p,w,*} currently grafted */
+	struct ft_test_node *node[MW_XT_PREFIXES][MW_XT_SUFFIXES];
+	unsigned long ops;
+	int failed;
+};
+
+static void *mw_xt_writer(void *arg)
+{
+	struct mw_xt_arg *x = (struct mw_xt_arg *) arg;
+	struct cds_ft_iter *iter;
+	unsigned int seed = (unsigned int)(uintptr_t) x + 0x9e3779b9u;
+
+	rcu_register_thread();
+	if (cds_ft_iter_create(x->ft, &iter) < 0)
+		abort();
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	while (!test_stop) {
+		unsigned int p = (unsigned int)(rand_r(&seed) % MW_XT_PREFIXES);
+		uint8_t prefix[2] = { (uint8_t) p, (uint8_t) x->w };
+		unsigned int s;
+
+		if (!x->present[p]) {
+			struct cds_ft *src;
+
+			/* Build a private source holding the S suffix keys. */
+			if (cds_ft_create(x->group, NULL, &src) < 0)
+				abort();
+			for (s = 0; s < MW_XT_SUFFIXES; s++) {
+				uint8_t suffix[1] = { (uint8_t) s };
+				uint8_t full[3] = { (uint8_t) p,
+					(uint8_t) x->w, (uint8_t) s };
+				struct ft_test_node *n = node_alloc(
+					((uint64_t) p << 16)
+					| ((uint64_t) x->w << 8) | s);
+
+				memcpy(n->okey, full, 3);
+				if (cds_ft_insert(src, suffix, 1, &n->node)
+						!= CDS_FT_STATUS_OK)
+					abort();
+				x->node[p][s] = n;
+			}
+			/*
+			 * The consumed source must be EXCLUSIVE (step-6
+			 * contract): a live lock-mode src is rejected with BUSY.
+			 * make_exclusive also lets its writer scope skip the
+			 * FT-wide lock so only the live dst's per-node locks
+			 * arbitrate the attach.
+			 */
+			cds_ft_make_exclusive(src);
+			if (cds_ft_graft(x->ft, prefix, 2, src)
+					!= CDS_FT_STATUS_OK) {
+				/*
+				 * {p,w} is this writer's own and was absent =>
+				 * empty => the graft MUST succeed.  A failure
+				 * here is a real drop defect (a peer's attach
+				 * leaked into a disjoint prefix, or a torn spine
+				 * from an unserialized attach).
+				 */
+				fprintf(stderr, "xt writer %u prefix p=%u: graft "
+					"failed on an empty disjoint target\n",
+					x->w, p);
+				x->failed = 1;
+				/*
+				 * This only fires on a real drop defect, and it
+				 * IS the reported violation (failed => ret = -1).
+				 * Leave @src and its nodes untouched rather than
+				 * risk a teardown UAF on the error path; the
+				 * accompanying leak_check flag is secondary to the
+				 * message above.
+				 */
+				mw_violation_snapshot();
+				break;
+			}
+			cds_ft_destroy(src);		/* emptied by the graft */
+			x->present[p] = 1;
+		} else {
+			/* Point-remove every key of this prefix, then re-arm. */
+			for (s = 0; s < MW_XT_SUFFIXES; s++) {
+				uint8_t full[3] = { (uint8_t) p,
+					(uint8_t) x->w, (uint8_t) s };
+				struct cds_ft_node *found;
+
+				rcu_read_lock();
+				cds_ft_iter_set_key(iter, full, 3);
+				cds_ft_lookup(x->ft, iter);
+				found = cds_ft_iter_node(iter);
+				if (found != &x->node[p][s]->node) {
+					fprintf(stderr, "xt writer %u key "
+						"{%u,%u,%u}: live but found %p "
+						"!= mine %p\n", x->w, p, x->w, s,
+						(void *) found,
+						(void *) &x->node[p][s]->node);
+					x->failed = 1;
+					rcu_read_unlock();
+					mw_violation_snapshot();
+					goto out;
+				}
+				if (cds_ft_remove(x->ft, iter, found)
+						== CDS_FT_STATUS_OK)
+					node_free_rcu(to_test_node(found));
+				rcu_read_unlock();
+				x->node[p][s] = NULL;
+			}
+			x->present[p] = 0;
+		}
+		x->ops++;
+		if ((seed & 0x3f) == 0)
+			rcu_quiescent_state();
+	}
+out:
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+/*
+ * See the block comment on mw_xt_writer.  Endpoints checked at quiescence: no
+ * grafted key lost (resolves to the owning writer's node), count_keys equals
+ * the live total, and cds_ft_verify reports no leaked COPYING fence.
+ */
+static int inv_concurrent_crosstrie_fine_lock(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	struct mw_xt_arg *x;
+	struct cds_ft_iter *iter;
+	pthread_t writers[MW_XT_NR_WRITERS];
+	struct timespec t0;
+	unsigned long total_ops = 0, live = 0;
+	unsigned int i, p, s;
+	int ret = 0;
+
+	if (!getenv("FT_INV_MW")) {
+		fprintf(stderr, "# inv_concurrent_crosstrie_fine_lock: skipped "
+			"(set FT_INV_MW=1 to run the cross-trie writer oracle)\n");
+		return 0;
+	}
+	mw_install_fatal_handler();
+	ft = create_varlen_fine_lock_ft(&group);
+	/* Concurrent mode: deferred reclaim keeps a peer's touched nodes live. */
+	cds_ft_make_concurrent(ft);
+
+	leak_reset();
+
+	x = (struct mw_xt_arg *) calloc(MW_XT_NR_WRITERS, sizeof(*x));
+	if (!x)
+		abort();
+	for (i = 0; i < MW_XT_NR_WRITERS; i++) {
+		x[i].ft = ft;
+		x[i].group = group;
+		x[i].w = i;
+	}
+
+	test_go = 0;
+	test_stop = 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < MW_XT_NR_WRITERS; i++)
+		pthread_create(&writers[i], NULL, mw_xt_writer, &x[i]);
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	test_go = 1;
+
+	rcu_thread_offline();
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
+		usleep(1000);
+	test_stop = 1;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < MW_XT_NR_WRITERS; i++)
+		pthread_join(writers[i], NULL);
+	rcu_thread_online();
+
+	/* Quiescent: verify the final trie against every writer's shadow. */
+	synchronize_rcu();
+	if (cds_ft_iter_create(ft, &iter) < 0)
+		abort();
+	rcu_read_lock();
+	for (i = 0; i < MW_XT_NR_WRITERS; i++) {
+		total_ops += x[i].ops;
+		if (x[i].failed)
+			ret = -1;
+		for (p = 0; p < MW_XT_PREFIXES; p++) {
+			if (!x[i].present[p])
+				continue;
+			for (s = 0; s < MW_XT_SUFFIXES; s++) {
+				uint8_t full[3] = { (uint8_t) p, (uint8_t) i,
+					(uint8_t) s };
+				struct cds_ft_node *found;
+
+				live++;
+				cds_ft_iter_set_key(iter, full, 3);
+				cds_ft_lookup(ft, iter);
+				found = cds_ft_iter_node(iter);
+				if (found != &x[i].node[p][s]->node) {
+					fprintf(stderr, "xt final: writer %u key "
+						"{%u,%u,%u} lost (found %p != "
+						"%p)\n", i, p, i, s,
+						(void *) found,
+						(void *) &x[i].node[p][s]->node);
+					ret = -1;
+				}
+			}
+		}
+	}
+	if (cds_ft_count_keys(ft) != live) {
+		fprintf(stderr, "xt final: count_keys %lu != live %lu\n",
+			cds_ft_count_keys(ft), live);
+		ret = -1;
+	}
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "xt final: cds_ft_verify failed\n");
+		ret = -1;
+	}
+	rcu_read_unlock();
+	cds_ft_iter_destroy(iter);
+
+	fprintf(stderr, "# inv_concurrent_crosstrie_fine_lock: %d writers, %lu "
+		"ops, %lu live keys\n", MW_XT_NR_WRITERS, total_ops, live);
+
+	free(x);
 	if (drain_and_destroy(ft, group) < 0)
 		ret = -1;
 	if (leak_check() < 0)
@@ -11316,6 +11621,7 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_concurrent_writers_shared);
 	RUN_TEST(inv_concurrent_writers_coarse_lock);
 	RUN_TEST(inv_concurrent_writers_fine_lock);
+	RUN_TEST(inv_concurrent_crosstrie_fine_lock);
 	RUN_TEST(inv_bind_resume_order);
 	RUN_TEST(inv_ordered_bulk_consistency);
 	RUN_TEST(inv_compact_keycopy_terminates);
