@@ -49,8 +49,10 @@ nobase_include_HEADERS = \
 	urcu/rcu-txn-bloom.h \
 	urcu/rcu-txn-sw-list.h \
 	urcu/rcu-txn-sw-hlist.h \
+	urcu/rcu-txn-sw-bitmap.h \
 	urcu/rcu-txn-list.h \
 	urcu/rcu-txn-hlist.h \
+	urcu/rcu-txn-bitmap.h \
 	urcu/rcu-txn-skiplist.h \
 	urcu/rcuhlist.h \
 	urcu/rculfhash.h \

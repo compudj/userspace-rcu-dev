@@ -33,6 +33,7 @@ noinst_PROGRAMS = \
 	test_rcu_txn_validate \
 	test_rcu_txn_sw_list \
 	test_rcu_txn_sw_list_concurrent \
+	test_rcu_txn_sw_bitmap \
 	test_rcu_txn_list \
 	test_rcu_txn_list_guarded \
 	test_rcu_txn_list_compose \
@@ -90,6 +91,7 @@ TESTS = \
 	test_rcu_txn_validate \
 	test_rcu_txn_sw_list \
 	test_rcu_txn_sw_list_concurrent \
+	test_rcu_txn_sw_bitmap \
 	test_rcu_txn_list \
 	test_rcu_txn_list_guarded \
 	test_rcu_txn_list_compose \
@@ -207,6 +209,9 @@ test_rcu_txn_hlist_ryw_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
 
 test_rcu_txn_bitmap_SOURCES = test_rcu_txn_bitmap.c
 test_rcu_txn_bitmap_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
+
+test_rcu_txn_sw_bitmap_SOURCES = test_rcu_txn_sw_bitmap.c
+test_rcu_txn_sw_bitmap_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
 
 test_rcu_txn_skiplist_SOURCES = test_rcu_txn_skiplist.c
 test_rcu_txn_skiplist_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
