@@ -2486,6 +2486,25 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 		return status;
 	}
 
+#ifdef FEATURE_FT_MW_LOCK_FINE_DROP
+	bool md_rlock = false;
+
+	/*
+	 * §11 cross-trie RCU-pinning: the spine-copy path below descends the live
+	 * dst here and COPYING-locks a descent-captured dst node (@d_dst->pnf /
+	 * ->ppnf) inside ft_merge_spine_copy.  A COPYING lock false-succeeds on a
+	 * reclaimed+recycled node (arena re-zeroes metadata), so pin the captured
+	 * nodes with the flavor read side across descent -> lock, as cds_ft_graft
+	 * does.  With an EXCLUSIVE src the spine-copy's only grace period (its src
+	 * drain) is !src_ft->exclusive-gated and skipped, so the whole
+	 * ft_merge_spine_copy runs GP-free under the read lock.  Released before
+	 * the spine-copy return and on the fall-through to the detach/graft paths.
+	 */
+	if (dst_ft->lock_fine && src_ft->exclusive) {
+		dst_ft->group->flavor->read_lock();
+		md_rlock = true;
+	}
+#endif
 	kd = ft_merge_descend(dst_ft, okey_dst, dst_key_len, &d_dst,
 			&off_dst, &cnt_dst);
 
@@ -2526,9 +2545,28 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 				uatomic_store(&dst_ft->max_used_key_len, nm,
 					CMM_RELAXED);
 		}
+#ifdef FEATURE_FT_MW_LOCK_FINE_DROP
+		if (md_rlock) {
+			dst_ft->group->flavor->read_unlock();
+			md_rlock = false;
+		}
+#endif
 		FT_TP(merge_exit, (int) status);
 		return status;
 	}
+#ifdef FEATURE_FT_MW_LOCK_FINE_DROP
+	/*
+	 * Fall-through: the spine-copy shape did not apply (whole-source move,
+	 * or an empty dst under @dst_key -> the detach graft below).  Release the
+	 * spine-copy descent pin here; the src_key_len==0 graft re-descends under
+	 * its own bracket above, and the detach-graft path re-resolves its own
+	 * (parent, slot).
+	 */
+	if (md_rlock) {
+		dst_ft->group->flavor->read_unlock();
+		md_rlock = false;
+	}
+#endif
 
 	/*
 	 * Whole-source move (src_key_len == 0): the entire @src_ft is the
@@ -2548,8 +2586,31 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 		 * BUSY at merge_at's entry, so this graft sees an exclusive source (or
 		 * a same-trie rekey); ft_graft_keylen runs its fused body directly.
 		 */
-		status = ft_graft_keylen(dst_ft, dst_key, dst_key_len, src_ft,
-				pre_txn);
+#ifdef FEATURE_FT_MW_LOCK_FINE_DROP
+		if (dst_ft->lock_fine && src_ft->exclusive) {
+			const struct rcu_flavor_struct *flavor =
+				dst_ft->group->flavor;
+
+			/*
+			 * §11 cross-trie RCU-pinning: this is the SAME live-dst
+			 * descent + COPYING-lock as cds_ft_graft, reached through
+			 * cds_ft_merge / cds_ft_merge_at, so it needs the same read-
+			 * side bracket that pins descent-captured dst spine nodes
+			 * against a peer relocate+free+recycle (see the bracket in
+			 * cds_ft_graft).  With an EXCLUSIVE src the fused body takes
+			 * no grace period (ft_writer_lock_gp_wait is !exclusive-
+			 * gated), so the whole-op read lock cannot self-deadlock --
+			 * unlike merge's spine-copy branch, which synchronizes and
+			 * therefore stays out of any read section.
+			 */
+			flavor->read_lock();
+			status = ft_graft_keylen(dst_ft, dst_key, dst_key_len,
+					src_ft, pre_txn);
+			flavor->read_unlock();
+		} else
+#endif
+			status = ft_graft_keylen(dst_ft, dst_key, dst_key_len,
+					src_ft, pre_txn);
 		FT_TP(merge_exit, (int) status);
 		return status;
 	}

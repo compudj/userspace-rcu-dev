@@ -1766,7 +1766,36 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
 		}
 	}
 
-	status = ft_graft_keylen(dst_ft, _key, key_len, src_ft, NULL);
+#ifdef FEATURE_FT_MW_LOCK_FINE_DROP
+	if (dst_ft->lock_fine) {
+		const struct rcu_flavor_struct *flavor = dst_ft->group->flavor;
+
+		/*
+		 * FT-wide-lock drop RCU-pinning (§11 cross-trie).  A FINE
+		 * cross-trie graft descends the SHARED dst WITHOUT the FT-wide
+		 * mutex and captures spine nodes (d->pnf / ppnf / pppnf) that its
+		 * recompact / Fix-A fence later COPYING-lock.  A COPYING lock
+		 * rejects a relocated-but-LIVE (tombstoned) node, but NOT a
+		 * reclaimed-and-recycled one -- the arena re-zeroes a slot's
+		 * metadata on reallocation, so ft_copying_lock_member false-
+		 * succeeds on a recycled node -> wild store into an unrelated live
+		 * node.  Nothing else pins the captured nodes: ft_graft_keylen
+		 * builds its txn with ft_flip_txn_create() (flavor NULL, "the
+		 * caller brackets the RCU read side") and ft_writer_lock_scope
+		 * no-ops under the drop.  Provide that bracket here so no grace
+		 * period can reclaim a captured node across descent->lock->commit
+		 * (the same read section insert gets from urcu_txn_begin).  Safe
+		 * to hold across the whole op: a FINE cross-trie graft REQUIRES an
+		 * exclusive src (BUSY_ERROR otherwise, ft_graft_keylen) and every
+		 * grace period in the body (ft_writer_lock_gp_wait) is
+		 * !exclusive-gated, so nothing synchronizes under the read lock.
+		 */
+		flavor->read_lock();
+		status = ft_graft_keylen(dst_ft, _key, key_len, src_ft, NULL);
+		flavor->read_unlock();
+	} else
+#endif
+		status = ft_graft_keylen(dst_ft, _key, key_len, src_ft, NULL);
 	FT_TP(graft_exit, (int) status);
 	return status;
 }
@@ -2047,12 +2076,37 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		struct cds_ft_alloc_reserve gs_reserve;
 		bool gs_reserved = false;
 		bool empty_pruned = false;
+#ifdef FEATURE_FT_MW_LOCK_FINE_DROP
+		bool gs_rlock = false;
+#endif
 
 		/*
 		 * Read-only descent: nothing is published, so the whole swap can be
 		 * assembled as a build-invisible transaction and an allocation failure
 		 * leaves both tries pristine.
 		 */
+#ifdef FEATURE_FT_MW_LOCK_FINE_DROP
+		/*
+		 * §11 cross-trie RCU-pinning: this descent captures live-dst spine
+		 * nodes (d.pnf ...) that the extract-side detach and the insert-side
+		 * publish-replace COPYING-lock below.  A COPYING lock rejects a
+		 * relocated-but-live node but NOT a reclaimed+recycled one (the arena
+		 * re-zeroes metadata on realloc -> false-success -> wild store), so
+		 * pin the captured nodes with the flavor read side across
+		 * descent->lock, exactly as cds_ft_graft does.  SCOPED, not whole-op:
+		 * graft_swap drains dst readers with ft_writer_lock_gp_wait(dst_ft)
+		 * before its extract-side root install, and a grace period under a
+		 * read section self-deadlocks -- so the section is RELEASED just
+		 * before that dst drain (every descent-captured dst node is COPYING-
+		 * locked by then).  The consumed @swap_ft is exclusive (BUSY_ERROR
+		 * otherwise), so its own ft_writer_lock_gp_wait is !exclusive-gated
+		 * and skipped, and nothing else synchronizes inside the section.
+		 */
+		if (dst_ft->lock_fine && swap_ft->exclusive) {
+			dst_ft->group->flavor->read_lock();
+			gs_rlock = true;
+		}
+#endif
 		kase = ft_graft_swap_descend(dst_ft, key, key_len, &d);
 		if (kase == FT_GRAFT_SWAP_DELEGATE) {
 			/*
@@ -2067,6 +2121,10 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 			enum cds_ft_status s = cds_ft_graft(dst_ft, _key, _key_len,
 					swap_ft);
 
+#ifdef FEATURE_FT_MW_LOCK_FINE_DROP
+			if (gs_rlock)
+				dst_ft->group->flavor->read_unlock();
+#endif
 			FT_TP(graft_swap_exit, (int) s);
 			return s;
 		}
@@ -2620,6 +2678,21 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		 * Exclusive dst carries no RCU readers, so the sync is
 		 * skipped in that case.
 		 */
+#ifdef FEATURE_FT_MW_LOCK_FINE_DROP
+		/*
+		 * Release the §11 RCU-pin BEFORE this dst grace period: every
+		 * descent-captured dst node has been COPYING-locked by the
+		 * extract/insert commits above (so it can no longer be reclaimed
+		 * out from under us), and a grace period inside a read section
+		 * would self-deadlock.  The extract-side root install below
+		 * re-parents only the already-detached displaced subtree, which
+		 * needs no descent-capture pin.
+		 */
+		if (gs_rlock) {
+			dst_ft->group->flavor->read_unlock();
+			gs_rlock = false;
+		}
+#endif
 		if (!dst_ft->exclusive)
 			ft_writer_lock_gp_wait(dst_ft);
 
@@ -2796,6 +2869,13 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		 * No deferred edge was applied and nothing was published, so dst_ft and
 		 * swap_ft are both pristine -- there is nothing to roll back.
 		 */
+#ifdef FEATURE_FT_MW_LOCK_FINE_DROP
+		/* Every build error jumps here before the dst-drain release above. */
+		if (gs_rlock) {
+			dst_ft->group->flavor->read_unlock();
+			gs_rlock = false;
+		}
+#endif
 		ft_glue_abort(dst_ft, &glue_insert);
 		ft_glue_abort(swap_ft, &glue_extract);
 		if (glue_insert.txn)
