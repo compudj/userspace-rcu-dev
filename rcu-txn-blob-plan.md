@@ -265,6 +265,54 @@ sidesteps. Placement flexibility keeps the door open: if recompaction cost ever
 dominates, add the seqcount on the data line later, without disturbing the
 lock/tombstone in metadata.
 
+**The crossover is node-size-dependent, and the two effects reinforce.**
+
+- *Recompaction cost* (paid without a seqcount) **grows** with node size: a
+  rank-changing update COW-copies the whole node — alloc + O(entries) + deferred
+  free — and large nodes also churn large blocks through the grace period and hold
+  the node's lock longer (less write concurrency on a hot large node).
+- *Seqcount cost* (paid to have it) **shrinks** with node size — and FT's
+  **two-cacheline read guarantee** is what decides it. Every lookup is bounded to
+  two CL loads regardless of node size (the occupancy/rank CL, then the target
+  `slot@rank` CL), and the consistency a reader needs — a coherent
+  `{occupancy, slot@rank}` pair across a rank-changing update — is itself
+  **size-independent** (two words on two different CLs, so no single-CL atomic
+  covers it). What differs is where the gen word lands relative to the CLs the read
+  already touches. On a **large** node the occupancy bitmap is a handful of words
+  well within one line, so the gen word **rides free on the occupancy CL** (both
+  samples hit it in-cache) and enabling the seqcount adds **zero CLs** — the read
+  stays two CLs. On a **small** node packed to live in a *single* CL, the gen word
+  eats a large fraction of that line, displacing entry capacity and tipping a
+  near-boundary node from a 1-CL to a 2-CL read. The write side agrees: the
+  in-place shift the seqcount enables moves only entries *above* the insertion
+  point — no alloc, no full copy, no reclaim — a saving that grows with size.
+
+So the curves cross: **small nodes favor COW recompaction** (cheap to rebuild,
+reads stay wait-free, and the gen word would turn a 1-CL node into a 2-CL read),
+while **large nodes favor in-place + seqcount** (avoid a big alloc+copy per rank
+change; the gen word rides free on the occupancy CL, so the read stays two CLs).
+Because the seqcount is opt-in per embedding, FT can enable it **per node size
+class**, above a crossover threshold, with no change to the small-node path.
+
+**Expose the crossover as a tunable: update-speed ↔ read-latency.** The threshold
+is a policy knob, not a fixed constant, trading the two sides directly. Toward
+**update speed**, lower it so more size classes go in-place + seqcount (writes skip
+alloc/copy/reclaim; reads pay latency — obstruction-free, retry-prone, +gen word).
+Toward **read-side latency**, raise it so more classes COW-recompact (reads
+wait-free and bounded; writes pay allocate + copy per rank change). Because the
+mechanism is a per-node *layout* property, the threshold sits best at a **size-class
+boundary**, where crossing it coincides with FT's natural node promotion — a
+growing node is rebuilt anyway, so it adopts the large-node layout (gen word
+included) for free. Per-domain / per-size-class is the right granularity; per-node
+*dynamic* switching would cost a layout conversion and is likely over-engineering.
+
+The one effect that does **not** scale with size — and that puts a hard floor under
+the tunable — is the wait-free loss: it is categorical. A per-size policy therefore gives wait-free reads on small nodes but
+only obstruction-free reads on large ones. If FT wants a *uniform* wait-free read
+guarantee, that overrides the economics and keeps COW even for large nodes (or
+motivates a bounded-copy segmented recompaction that stays wait-free — a larger
+design, deferred).
+
 ### Tombstone (just a live/dead flag)
 
 A fixed-slot blob that cannot be freed (pinned) needs a logical "dead": readers
