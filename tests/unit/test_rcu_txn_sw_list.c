@@ -18,6 +18,9 @@
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
+#ifndef _LGPL_SOURCE
+#define _LGPL_SOURCE
+#endif
 
 #include <stdlib.h>
 #include <string.h>
