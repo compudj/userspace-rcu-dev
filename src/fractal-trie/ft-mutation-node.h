@@ -969,7 +969,8 @@ int ft_node_recompact(enum ft_recompact mode,
 		unsigned int node_depth __attribute__((unused)),
 		bool cluster_leaf,
 		struct ft_pub_rec *rec,
-		struct ft_flip_txn *retire_txn)
+		struct ft_flip_txn *retire_txn,
+		const struct ft_parent_hint *inh_hint)
 {
 	unsigned int new_type_index;
 	struct cds_ft_inode *new_node;
@@ -1139,8 +1140,25 @@ int ft_node_recompact(enum ft_recompact mode,
 		dbg_printf("Recompact inherit from %p\n", metadata);
 		if (metadata) {
 			struct cds_ft_inode_flag *inh_parent;
-			struct cds_ft_inode_flag **inh_slot =
-				ft_resolve_parent_slot(metadata, ft, &inh_parent);
+			struct cds_ft_inode_flag **inh_slot;
+
+			if (inh_hint) {
+				/*
+				 * §11 cross-trie graft: the caller's reanchoring
+				 * descent captured (parent, slot) coherently at the
+				 * LIVE level (d->ppnf, d->pnfp).  Use it verbatim
+				 * instead of ft_resolve_parent_slot(@metadata), which
+				 * reads @metadata's own back-pointer -- stale, and
+				 * once a shared-spine peer frees the old parent it
+				 * dangles to a reclaimed node (Defect C).  A NULL
+				 * hint->parent is a publish into &ft->root.
+				 */
+				inh_parent = inh_hint->parent;
+				inh_slot = inh_hint->slot;
+			} else {
+				inh_slot = ft_resolve_parent_slot(metadata, ft,
+					&inh_parent);
+			}
 
 			/*
 			 * Inherit the retired node's (parent, offset) as ONE
@@ -1579,8 +1597,22 @@ skip_copy:
 		 * build-invisible nodes, into whose meta->parent no peer can park:
 		 * there the resolve is the identity.
 		 */
-		struct cds_ft_inode_flag *old_parent = ft_resolve_flip_proxy(
-			(struct cds_ft_inode_flag *)
+		/*
+		 * §11 cross-trie graft (Defect C): the SKIP_X dual re-encode
+		 * below rewrites the GRANDPARENT's skip pointer, so it must name
+		 * the SAME coherent grandparent the forward publish uses -- the
+		 * LIVE reanchored @inh_hint->parent (== d->ppnf) -- NOT
+		 * old_meta->parent, which is the very stale/dangling back-pointer
+		 * the hint exists to avoid.  Without this the SKIP_X store lands
+		 * in a relocated (or freed/reclaimed) grandparent: the wild store
+		 * merely moves from the forward slot to the dual slot.  @inh_hint
+		 * is supplied only for a LIVE-node recompact (metadata == old_meta);
+		 * the build-invisible arm parks no back-edge, so it keeps the
+		 * identity read.
+		 */
+		struct cds_ft_inode_flag *old_parent = inh_hint ?
+			inh_hint->parent :
+			ft_resolve_flip_proxy((struct cds_ft_inode_flag *)
 				rcu_dereference(old_meta->parent));
 
 		/*
@@ -1615,7 +1647,18 @@ skip_copy:
 			struct cds_ft_metadata *cn_meta =
 				cds_ft_item_to_metadata(
 					(struct cds_ft_inode *) cn);
-			struct cds_ft_inode_flag **skip_slot =
+			/*
+			 * §11 cross-trie graft (Defect C, SKIP_X level): the dual
+			 * slot is a slot in cn's parent (the great-grandparent).
+			 * ft_get_parent_slot(cn_meta) recovers it from cn's OWN raw
+			 * back-pointer, which dangles to a freed great-grandparent
+			 * once a peer relocates it (lazy reanchor).  When the caller
+			 * supplied a descent hint, use its coherent slot (d->ppnfp),
+			 * captured by navigating the CURRENT tree -- the live
+			 * relocated great-grandparent, not cn's stale back-edge.
+			 */
+			struct cds_ft_inode_flag **skip_slot = inh_hint ?
+				inh_hint->gp_slot :
 				ft_get_parent_slot(cn_meta, ft);
 
 			if (skip_slot &&
@@ -1651,8 +1694,21 @@ skip_copy:
 				if (ft->lock_fine && fenced && new_node) {
 					struct cds_ft_inode_flag *gp_parent;
 
-					(void) ft_resolve_parent_slot(cn_meta,
-						ft, &gp_parent);
+					/*
+					 * Same §11 coherence: the great-grandparent
+					 * to COPYING-lock is cn's parent.  Prefer the
+					 * hint's LIVE reanchored great-grandparent
+					 * (d->pppnf) over ft_resolve_parent_slot(cn_meta),
+					 * which reads cn's stale back-pointer and would
+					 * false-succeed the lock on a reclaimed node.
+					 * NULL @gp (cn at the root: dual lives in
+					 * &ft->root) skips the lock, as the raw NULL did.
+					 */
+					if (inh_hint)
+						gp_parent = inh_hint->gp;
+					else
+						(void) ft_resolve_parent_slot(cn_meta,
+							ft, &gp_parent);
 					if (gp_parent &&
 					    ft_copying_lock_member(
 						ft_flag_to_metadata(ft, gp_parent),
@@ -1909,7 +1965,8 @@ int ft_node_set_nth_rec(struct cds_ft *ft,
 		unsigned int node_depth,
 		bool cluster_leaf,
 		struct ft_pub_rec *rec,
-		struct ft_flip_txn *retire_txn)
+		struct ft_flip_txn *retire_txn,
+		const struct ft_parent_hint *inh_hint)
 {
 	int ret;
 	unsigned int type_index;
@@ -1971,14 +2028,14 @@ int ft_node_set_nth_rec(struct cds_ft *ft,
 		ret = ft_node_recompact(FT_RECOMPACT_ADD_NEXT, ft, type_index, type, node,
 					metadata, node_flag, n, child_node_flag, NULL,
 					old_node_ret, false, node_depth, cluster_leaf,
-					rec, retire_txn);
+					rec, retire_txn, inh_hint);
 		break;
 	case -ERANGE:
 		/* Node needs to be recompacted. */
 		ret = ft_node_recompact(FT_RECOMPACT_ADD_SAME, ft, type_index, type, node,
 					metadata, node_flag, n, child_node_flag, NULL,
 					old_node_ret, false, node_depth, cluster_leaf,
-					rec, retire_txn);
+					rec, retire_txn, inh_hint);
 		break;
 	}
 	if (ret == 0)
@@ -2007,7 +2064,7 @@ int ft_node_set_nth(struct cds_ft *ft,
 {
 	return ft_node_set_nth_rec(ft, node_flag, n, child_node_flag,
 			old_node_ret, metadata, node_depth, cluster_leaf, NULL,
-			NULL);
+			NULL, NULL);
 }
 
 /*
@@ -2044,7 +2101,7 @@ int ft_node_replace_ptr(struct cds_ft *ft,
 		ret = ft_node_recompact(FT_RECOMPACT_DEL, ft, type_index, type, node,
 				metadata, parent_node_flag_ptr, n, NULL,
 				node_flag_ptr, old_node_ret, is_root, node_depth,
-				false, NULL, retire_txn);
+				false, NULL, retire_txn, NULL);
 	}
 	if (ret == 0)
 		FT_TP(tree_edge_set, (const void *) ft,

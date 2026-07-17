@@ -460,7 +460,15 @@ enum cds_ft_status ft_store_at_graft_point_prepare(struct cds_ft *ft,
 		 */
 		ret = ft_node_set_nth_rec(ft, &dest, key[key_len - 1], NULL,
 			&st->old_recompacted_node, pmeta, d->depth - 1, false,
-			&st->reserve_rec, glue->txn);
+			&st->reserve_rec, glue->txn,
+			/* §11: recompact {p} under its LIVE reanchored parent
+			 * (d->ppnf, d->pnfp), not {p}'s stale back-pointer; and,
+			 * for the SKIP_X dual one level up, the LIVE great-
+			 * grandparent (d->pppnf) + {p}'s-parent's coherent slot
+			 * in it (d->ppnfp). */
+			&(const struct ft_parent_hint){
+				.parent = d->ppnf, .slot = d->pnfp,
+				.gp = d->pppnf, .gp_slot = d->ppnfp });
 		if (ret)
 			return CDS_FT_STATUS_MEMORY_ERROR;
 
@@ -532,7 +540,17 @@ enum cds_ft_status ft_store_at_graft_point_prepare(struct cds_ft *ft,
 			ret = ft_node_set_nth_rec(ft, &dest, key[i - 1], NULL,
 				&st->old_recompacted_node, pmeta,
 				d->depth - 1, false, &st->reserve_rec,
-				glue->txn);
+				glue->txn,
+				/* §11: recompact {p} under its LIVE reanchored
+				 * parent (d->ppnf, d->pnfp), not the stale
+				 * back-pointer; + the LIVE great-grandparent
+				 * (d->pppnf) and {p}'s-parent's coherent slot in
+				 * it (d->ppnfp) for the SKIP_X dual one level up. */
+				&(const struct ft_parent_hint){
+					.parent = d->ppnf,
+					.slot = d->pnfp,
+					.gp = d->pppnf,
+					.gp_slot = d->ppnfp });
 			if (ret)
 				return CDS_FT_STATUS_MEMORY_ERROR;
 
@@ -549,13 +567,15 @@ enum cds_ft_status ft_store_at_graft_point_prepare(struct cds_ft *ft,
 }
 
 static
-void ft_store_at_graft_point_commit(struct cds_ft *ft,
+enum urcu_txn_status ft_store_at_graft_point_commit(struct cds_ft *ft,
 		struct cds_ft_inode_flag **attached_nf,
 		unsigned int *attached_depth,
 		struct ft_graft_run *run,
 		struct ft_graft_store_state *st,
 		long count_delta)
 {
+	enum urcu_txn_status cst;
+
 	if (st->displaced_shape) {
 		/*
 		 * The displaced external is LIVE -- the dst leaf stays reachable

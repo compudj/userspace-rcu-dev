@@ -41,6 +41,8 @@ struct ft_descent {
 	struct cds_ft_inode_flag **pnfp;	/* Slot that holds @pnf. */
 	struct cds_ft_inode_flag *ppnf;		/* Grandparent node-flag value. */
 	struct cds_ft_inode_flag **ppnfp;	/* Slot that holds @ppnf. */
+	struct cds_ft_inode_flag *pppnf;	/* Great-grandparent node-flag value. */
+	struct cds_ft_inode_flag **pppnfp;	/* Slot that holds @pppnf. */
 	/*
 	 * A reanchoring descent step (ft_descent_step) landed the live node
 	 * SHALLOWER than the dispatched child (ft_skip_reanchor rewind > 0: a
@@ -52,6 +54,44 @@ struct ft_descent {
 	 * first mutator that observes it bails.
 	 */
 	bool skip_conflict;			/* Reanchor moved the slot's level. */
+};
+
+/*
+ * Optional (parent, slot) override for a recompact's inherited edge.  A
+ * cross-trie graft passes its reanchoring descent's coherent grandparent pair
+ * (d->ppnf, d->pnfp) so ft_node_recompact homes the fresh copy under the LIVE
+ * reanchored parent, NOT the recompacted node's lazily-updated back-pointer.
+ * That back-pointer dangles once a shared-spine peer FREES the old parent: the
+ * children reanchor lazily via the parked proxy, but a freed parent leaves no
+ * proxy to follow, and ft_resolve_parent_slot then recovers a reclaimed node
+ * (§11 cross-trie Defect C -- a wild store into a rank-N slot of a 0-child
+ * recycled node).  The descent pair, captured coherently in one reanchored
+ * step and RCU-pinned for the writer's read-side, names the live parent gp'
+ * (or is retired-but-tombstoned -> the recompact's COPYING mark rejects it ->
+ * -EAGAIN re-descend).  A NULL @parent degrades to a publish into &ft->root
+ * (a root-level graft point: d->ppnf == NULL, d->pnfp == &ft->root by the
+ * descent shift).
+ */
+struct ft_parent_hint {
+	struct cds_ft_inode_flag *parent;	/* d->ppnf (NULL => &ft->root). */
+	struct cds_ft_inode_flag **slot;	/* d->pnfp (a slot in @parent). */
+	/*
+	 * SKIP_X dual coherence (§11 cross-trie Defect C, one level up).  When
+	 * the recompacted node's parent @parent is a COMPRESSED node carrying a
+	 * SKIP_X dual, ft_node_recompact re-encodes that dual -- a slot in
+	 * @parent's OWN parent (the great-grandparent) -- and, under the drop,
+	 * COPYING-locks that great-grandparent.  Deriving it from @parent's raw
+	 * back-pointer (ft_get_parent_slot / ft_resolve_parent_slot on cn_meta)
+	 * has the SAME staleness the hint exists to avoid, one level higher: a
+	 * peer that relocates+frees the great-grandparent leaves cn's back-edge
+	 * dangling -> a wild SKIP_X store into a reclaimed node.  Carry the LIVE
+	 * reanchored great-grandparent (d->pppnf) and cn's coherent slot in it
+	 * (d->ppnfp) so the dual re-encode and its GP-lock stay coherent.  Both
+	 * NULL when @parent is not compressed / at the root; the recompact then
+	 * keeps its raw derivation (build-invisible / non-SKIP_X shapes).
+	 */
+	struct cds_ft_inode_flag *gp;		/* d->pppnf: @parent's parent. */
+	struct cds_ft_inode_flag **gp_slot;	/* d->ppnfp: @parent's slot in @gp. */
 };
 
 static
@@ -74,6 +114,8 @@ void ft_descent_init(struct ft_descent *d, struct cds_ft *ft)
 	d->pnfp = NULL;
 	d->ppnf = NULL;
 	d->ppnfp = NULL;
+	d->pppnf = NULL;
+	d->pppnfp = NULL;
 	d->skip_conflict = false;
 }
 
@@ -90,6 +132,8 @@ void ft_descent_traverse_compressed(struct cds_ft *ft, struct ft_descent *d,
 {
 	unsigned int rewind;
 
+	d->pppnf  = d->ppnf;
+	d->pppnfp = d->ppnfp;
 	d->ppnf  = d->pnf;
 	d->ppnfp = d->pnfp;
 	d->pnf   = d->nf;
@@ -128,6 +172,8 @@ struct cds_ft_inode_flag *ft_descent_step(struct cds_ft *ft, struct ft_descent *
 {
 	unsigned int rewind;
 
+	d->pppnf  = d->ppnf;
+	d->pppnfp = d->ppnfp;
 	d->ppnf  = d->pnf;
 	d->ppnfp = d->pnfp;
 	d->pnf   = d->nf;
