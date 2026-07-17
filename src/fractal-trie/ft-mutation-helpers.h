@@ -1345,7 +1345,7 @@ void ft_meta_tombstone_set_flip(struct cds_ft_metadata *meta)
  * is a no-op bit a reader ignores, so behaviour-identical.
  */
 static inline
-void ft_flip_txn_record_tombstone(struct ft_flip_txn *t,
+uintptr_t ft_flip_txn_record_tombstone(struct ft_flip_txn *t,
 		struct cds_ft_metadata *meta)
 {
 	/*
@@ -1368,6 +1368,14 @@ void ft_flip_txn_record_tombstone(struct ft_flip_txn *t,
 	ft_flip_txn_record_tag(t, (void **) &meta->state,
 			(void *) old, (void *) (old | FT_STATE_TOMBSTONE),
 			FT_STATE_PROXY);
+	/*
+	 * Return the RYW old so a caller retiring a set of nodes (the glue
+	 * free-list) can tell whether THIS txn performs the LIVE->TOMBSTONE
+	 * transition (old clean) or merely no-op-upgrades a word a peer already
+	 * tombstoned (old & FT_STATE_TOMBSTONE) -- the latter must not also free
+	 * the node.
+	 */
+	return old;
 }
 
 /*
@@ -3412,6 +3420,16 @@ struct ft_glue_deferred_edge {
 struct ft_glue_free_item {
 	void *node;		/* cds_ft_inode * or cds_ft_compressed_node * */
 	bool compressed;
+	/*
+	 * Set false when this commit did NOT perform the node's LIVE->TOMBSTONE
+	 * transition -- a peer already retired it (the fuse-list tombstone's RYW
+	 * old already had FT_STATE_TOMBSTONE), so THIS commit's tombstone record
+	 * was a no-op that did not conflict.  ft_glue_free_old must then leave the
+	 * free to the peer that killed it, else the node is double-freed (two
+	 * grafts absorbing the same shared node both reach the reclaim).  Default
+	 * true: the retiring committer frees it exactly once.
+	 */
+	bool retired;
 };
 
 /*
@@ -4083,6 +4101,7 @@ void ft_glue_defer_free(struct ft_glue *g,
 	assert(g->nr_free < g->cap_free);
 	g->free_list[g->nr_free].node = node;
 	g->free_list[g->nr_free].compressed = compressed;
+	g->free_list[g->nr_free].retired = true;
 	g->nr_free++;
 }
 
@@ -4149,10 +4168,23 @@ void ft_glue_tombstone_free_list(struct ft_glue *g)
 		 * lone-edge flip.  urcu_txn_store upgrades a repeat slot in place,
 		 * so a second apply_deferred pass costs no extra reservation.
 		 */
-		if (g->fuse_free_list)
-			ft_flip_txn_record_tombstone(g->txn, meta);
-		else
+		if (g->fuse_free_list) {
+			uintptr_t old = ft_flip_txn_record_tombstone(g->txn, meta);
+			/*
+			 * A peer already retired this node (RYW old already has
+			 * TOMBSTONE): our tombstone edge is a consistent no-op that
+			 * does NOT conflict, so our commit can still succeed -- but
+			 * the LIVE->TOMBSTONE transition (the retire token that owns
+			 * the free) was the peer's.  Leave the free to the peer;
+			 * freeing it in ft_glue_free_old would double-free the node
+			 * (two grafts absorbing the same shared node both reach
+			 * here).  See project_ft_barrier_uaf_is_graft_double_free.
+			 */
+			if (old & FT_STATE_TOMBSTONE)
+				g->free_list[i].retired = false;
+		} else {
 			ft_meta_tombstone_set_flip(meta);
+		}
 	}
 }
 
@@ -4552,6 +4584,15 @@ void ft_glue_free_old(struct cds_ft *ft, struct ft_glue *g)
 	int i;
 
 	for (i = 0; i < g->nr_free; i++) {
+		/*
+		 * Only the committer that performed the node's LIVE->TOMBSTONE
+		 * transition frees it (ft_glue_tombstone_free_list clears @retired
+		 * when a peer had already tombstoned it under a concurrent drop
+		 * graft).  Skipping the non-retired entries makes the reclaim
+		 * exactly-once across concurrent grafts absorbing a shared node.
+		 */
+		if (!g->free_list[i].retired)
+			continue;
 		if (g->free_list[i].compressed)
 			free_compressed_node(ft, g->free_list[i].node);
 		else
