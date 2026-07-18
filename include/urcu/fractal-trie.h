@@ -2580,6 +2580,14 @@ enum cds_ft_status cds_ft_group_attr_set_ordered_list(
  * cds_ft_count_keys_prefix is O(prefix_len), and the select / skip queries are
  * O(depth).  This costs a root-ward count propagation on every insert / remove.
  *
+ * Because every count-changing mutation updates the single root count, no two
+ * such writers are ever disjoint, so order statistics imply a COARSE writer
+ * strategy: a group that enables rank stats is silently coerced to
+ * CDS_FT_WRITER_LOCK_COARSE from ANY other strategy (both the lock-free
+ * CDS_FT_WRITER_OPTIMISTIC default and CDS_FT_WRITER_LOCK_FINE parallelize
+ * disjoint writers, of which there are none here, and both would run the
+ * root-ward count walk without the FT-wide-lock exclusion it requires).
+ *
  * When DISABLED (the default), the library maintains no count and those queries
  * stay correct but fall back to enumeration / iteration: cds_ft_count_keys and
  * cds_ft_count_keys_prefix enumerate the (sub)tree in O(size); cds_ft_lookup_nth
@@ -2687,6 +2695,13 @@ enum cds_ft_writer_strategy {
  *   concurrency strategy (enum cds_ft_writer_strategy); the default is
  *   CDS_FT_WRITER_OPTIMISTIC.  Returns CDS_FT_STATUS_OK, or
  *   CDS_FT_STATUS_INVALID_ARGUMENT_ERROR for an unknown @strategy.
+ *
+ * Any strategy combined with order statistics
+ * (cds_ft_group_attr_set_rank_stats) is coerced to CDS_FT_WRITER_LOCK_COARSE:
+ * rank stats serialize every count-changing writer on the root count, so
+ * neither fine-grained locking nor the optimistic engine buys parallelism
+ * there, and both would run the count walk without the FT-wide-lock exclusion
+ * it requires.
  */
 enum cds_ft_status cds_ft_group_attr_set_writer_strategy(
 		struct cds_ft_group_attr *attr,

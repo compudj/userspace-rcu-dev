@@ -4665,6 +4665,7 @@ static int rank_stats_merge_src_one(bool ordered_list, int scenario)
 			goto out;
 	}
 
+	cds_ft_make_exclusive(src);	/* lock-mode (rank stats -> coarse) merge needs an exclusive src */
 	s = cds_ft_merge_at(dst, (const uint8_t *) "Q", 1,
 			src, (const uint8_t *) skey, sklen);
 	if (s != CDS_FT_STATUS_OK) {
@@ -4755,6 +4756,7 @@ static int rank_stats_graft_check(bool ordered_list, const char *tag,
 			goto out;
 		}
 	}
+	cds_ft_make_exclusive(src);	/* lock-mode (rank stats -> coarse) graft needs an exclusive src */
 	s = cds_ft_graft(dst, (const uint8_t *) gkey, strlen(gkey), src);
 	if (s != CDS_FT_STATUS_OK) {
 		fprintf(stderr, "%s: graft \"%s\": %s\n", tag, gkey,
@@ -4859,6 +4861,7 @@ static int rank_stats_merge_attach_check(bool ordered_list, const char *tag,
 			goto out;
 		}
 	}
+	cds_ft_make_exclusive(src);	/* lock-mode (rank stats -> coarse) merge needs an exclusive src */
 	s = cds_ft_merge_at(dst, (const uint8_t *) dkey, strlen(dkey),
 			src, (const uint8_t *) "M", 1);
 	if (s != CDS_FT_STATUS_OK) {
@@ -4967,6 +4970,7 @@ static int rank_stats_merge_spine_run(bool ordered_list)
 		}
 	}
 	/* Non-empty dst point "PQ" -> spine-copy interleave. */
+	cds_ft_make_exclusive(src);	/* lock-mode (rank stats -> coarse) merge needs an exclusive src */
 	s = cds_ft_merge_at(dst, (const uint8_t *) "PQ", 2,
 			src, (const uint8_t *) "M", 1);
 	if (s != CDS_FT_STATUS_OK) {
@@ -5055,6 +5059,7 @@ static int rank_stats_graft_swap_one(bool ordered_list, int nswap)
 			goto out;
 		}
 	}
+	cds_ft_make_exclusive(swap);	/* lock-mode (rank stats -> coarse) graft_swap needs an exclusive swap */
 	s = cds_ft_graft_swap(dst, (const uint8_t *) "PK", 2, swap);
 	if (s != CDS_FT_STATUS_OK) {
 		fprintf(stderr, "%s(nswap=%d): graft_swap: %s\n", lm, nswap,
@@ -5134,6 +5139,7 @@ static int rank_stats_graft_swap_ks_one(bool ordered_list, int nswap)
 			goto out;
 		}
 	}
+	cds_ft_make_exclusive(swap);	/* lock-mode (rank stats -> coarse) graft_swap needs an exclusive swap */
 	s = cds_ft_graft_swap(dst, (const uint8_t *) "PK", 2, swap);
 	if (s != CDS_FT_STATUS_OK) {
 		fprintf(stderr, "%s(nswap=%d): graft_swap: %s\n", lm, nswap,
@@ -5215,6 +5221,7 @@ static int rank_stats_graft_swap_merged_one(bool ordered_list)
 			goto out;
 		}
 	}
+	cds_ft_make_exclusive(swap);	/* lock-mode (rank stats -> coarse) graft_swap needs an exclusive swap */
 	s = cds_ft_graft_swap(dst, (const uint8_t *) "PK", 2, swap);
 	if (s != CDS_FT_STATUS_OK) {
 		fprintf(stderr, "%s: graft_swap: %s\n", lm,

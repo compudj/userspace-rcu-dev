@@ -66,7 +66,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS	65
+#define NR_TESTS	67
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -1549,6 +1549,46 @@ static struct cds_ft *create_varlen_fine_lock_ft(struct cds_ft_group **group_out
 }
 
 /*
+ * As create_varlen_fine_lock_ft but with @list_on (ordered list) and/or
+ * @rank_on (per-node order statistics) enabled.  With @list_on the cross-trie
+ * graft's GLUE commit carries the extra ordered-list run-splice cell edges --
+ * the ordered-list attach path under the FT-wide-lock drop.  @rank_on requests
+ * order statistics: a rank-stats trie maintains ONE global count on the root's
+ * nr_keys word that every count-changing writer must update, so the group
+ * COERCES a FINE strategy to COARSE (§10.5; ft-lifecycle.h) -- the resulting
+ * trie keeps the FT-wide lock and never drops it, which is exactly what makes
+ * the count-parent walk correct.  So @rank_on trie == coarse regardless of the
+ * requested FINE.
+ */
+static struct cds_ft *create_varlen_fine_lock_cfg_ft(
+		struct cds_ft_group **group_out, bool list_on, bool rank_on)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+
+	if (cds_ft_group_attr_create(&attr) < 0)
+		abort();
+	if (cds_ft_group_attr_set_lookup_optimization(attr,
+			CDS_FT_LOOKUP_OPTIMIZE_EAGER) < 0)
+		abort();
+	if (cds_ft_group_attr_set_ordered_list(attr, list_on) < 0)
+		abort();
+	if (cds_ft_group_attr_set_rank_stats(attr, rank_on) < 0)
+		abort();
+	if (cds_ft_group_attr_set_writer_strategy(attr,
+			CDS_FT_WRITER_LOCK_FINE) < 0)
+		abort();
+	if (cds_ft_group_create(attr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &ft) < 0)
+		abort();
+	*group_out = group;
+	return ft;
+}
+
+/*
  * INVARIANT (MW, §11 drop-mechanics): concurrent cross-trie GRAFTs into one
  * LIVE (concurrent) fine-grained lock-mode trie lose no key and corrupt no
  * structure, with the FT-wide writer lock DROPPED.
@@ -1803,7 +1843,8 @@ out:
  * grafted key lost (resolves to the owning writer's node), count_keys equals
  * the live total, and cds_ft_verify reports no leaked COPYING fence.
  */
-static int mw_xt_oracle(const char *tname, int attach_mode)
+static int mw_xt_oracle(const char *tname, int attach_mode, bool list_on,
+		bool rank_on)
 {
 	struct cds_ft_group *group;
 	struct cds_ft *ft;
@@ -1822,7 +1863,15 @@ static int mw_xt_oracle(const char *tname, int attach_mode)
 		return 0;
 	}
 	mw_install_fatal_handler();
-	ft = create_varlen_fine_lock_ft(&group);
+	/*
+	 * @list_on selects the ordered-list + rank-stats dst (Defect D): the
+	 * graft's GLUE commit then carries run-splice + count-parent edges a peer
+	 * can conflict-abort after the src swap.  Otherwise the isolated
+	 * structural attach (list off, rank off).
+	 */
+	ft = (list_on || rank_on)
+		? create_varlen_fine_lock_cfg_ft(&group, list_on, rank_on)
+		: create_varlen_fine_lock_ft(&group);
 	/* Concurrent mode: deferred reclaim keeps a peer's touched nodes live. */
 	cds_ft_make_concurrent(ft);
 
@@ -1916,7 +1965,7 @@ static int mw_xt_oracle(const char *tname, int attach_mode)
 static int inv_concurrent_crosstrie_fine_lock(void)
 {
 	return mw_xt_oracle("inv_concurrent_crosstrie_fine_lock",
-		MW_XT_ATTACH_GRAFT);
+		MW_XT_ATTACH_GRAFT, /*list_on=*/ false, /*rank_on=*/ false);
 }
 
 /*
@@ -1928,7 +1977,7 @@ static int inv_concurrent_crosstrie_fine_lock(void)
 static int inv_concurrent_crosstrie_merge_fine_lock(void)
 {
 	return mw_xt_oracle("inv_concurrent_crosstrie_merge_fine_lock",
-		MW_XT_ATTACH_MERGE_SUBPOS);
+		MW_XT_ATTACH_MERGE_SUBPOS, /*list_on=*/ false, /*rank_on=*/ false);
 }
 
 /*
@@ -1945,7 +1994,7 @@ static int inv_concurrent_crosstrie_merge_fine_lock(void)
 static int inv_concurrent_crosstrie_graft_nilkey_fine_lock(void)
 {
 	return mw_xt_oracle("inv_concurrent_crosstrie_graft_nilkey_fine_lock",
-		MW_XT_ATTACH_GRAFT_NILKEY);
+		MW_XT_ATTACH_GRAFT_NILKEY, /*list_on=*/ false, /*rank_on=*/ false);
 }
 
 /*
@@ -1960,7 +2009,40 @@ static int inv_concurrent_crosstrie_graft_nilkey_fine_lock(void)
 static int inv_concurrent_crosstrie_merge_nilkey_fine_lock(void)
 {
 	return mw_xt_oracle("inv_concurrent_crosstrie_merge_nilkey_fine_lock",
-		MW_XT_ATTACH_MERGE_NILKEY);
+		MW_XT_ATTACH_MERGE_NILKEY, /*list_on=*/ false, /*rank_on=*/ false);
+}
+
+/*
+ * Ordered-list cross-trie graft under the FT-wide-lock drop: the shared dst has
+ * the ordered list ON (rank-stats OFF, so it stays FINE and DROPS the lock), so
+ * each graft's GLUE commit folds in the ordered-list run-splice cell edges that
+ * a concurrent {p,w'} writer can MCAS-conflict AFTER this writer's src-root
+ * swap.  The graft's retry_attach loop re-attaches the owned payload rather than
+ * losing the moved subtree.  Also exercises ordered-list point-remove under the
+ * drop.  (The rank-stats half of the original "Defect D" is a separate test:
+ * rank stats coerce to coarse, below.)
+ */
+static int inv_concurrent_crosstrie_graft_ord_fine_lock(void)
+{
+	return mw_xt_oracle("inv_concurrent_crosstrie_graft_ord_fine_lock",
+		MW_XT_ATTACH_GRAFT, /*list_on=*/ true, /*rank_on=*/ false);
+}
+
+/*
+ * Rank-stats cross-trie graft: a rank-stats trie maintains one global count on
+ * the root nr_keys word that every count-changing writer updates, so it is the
+ * §10.5 COARSE target -- the group coerces the requested FINE strategy to COARSE
+ * (ft-lifecycle.h), keeping the FT-wide lock so the count-parent walk runs under
+ * writer exclusion (correct).  Without that coercion this over-counted nr_keys
+ * under the drop (the walk climbed a stale ancestor chain, losing remove
+ * decrements).  This is the regression guard for the coercion: 16 writers graft
+ * into one rank-stats dst, and count_keys / cds_ft_verify's exact nr_keys check
+ * must hold.
+ */
+static int inv_concurrent_crosstrie_graft_rank_coarse_lock(void)
+{
+	return mw_xt_oracle("inv_concurrent_crosstrie_graft_rank_coarse_lock",
+		MW_XT_ATTACH_GRAFT, /*list_on=*/ false, /*rank_on=*/ true);
 }
 
 /* ================================================================== */
@@ -11774,6 +11856,8 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_concurrent_crosstrie_merge_fine_lock);
 	RUN_TEST(inv_concurrent_crosstrie_graft_nilkey_fine_lock);
 	RUN_TEST(inv_concurrent_crosstrie_merge_nilkey_fine_lock);
+	RUN_TEST(inv_concurrent_crosstrie_graft_ord_fine_lock);
+	RUN_TEST(inv_concurrent_crosstrie_graft_rank_coarse_lock);
 	RUN_TEST(inv_bind_resume_order);
 	RUN_TEST(inv_ordered_bulk_consistency);
 	RUN_TEST(inv_compact_keycopy_terminates);
