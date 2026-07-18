@@ -108,6 +108,53 @@
  * the bare head slot, not a node whose &next->next could coincide with a write
  * slot), so del/replace need no such guard skip.
  *
+ * Why pprev stays transacted here (the SW hlist took it out; that does not
+ * transfer)
+ * ------------------------------------------------------------------------
+ * The single-updater <urcu/rcu-txn-sw-hlist.h> writes pprev with an eager plain
+ * store, on the grounds that it is writer-only.  Do not mirror that here.  The
+ * premise splits under concurrency: with one updater "writer-only" means
+ * PRIVATE, while here it still means shared, concurrently read by peer
+ * mutators, and lifetime-critical.
+ *
+ * The prize is real and was weighed.  The load-validate of succ->next in
+ * urcu_txn_hlist_insert_at_slot_prepare() exists ONLY to guard the pprev write;
+ * drop that write and the guard goes with it, leaving *slot alone to serialize
+ * against del(succ) (same slot, same expected old).  An interior insert would
+ * fall to nr == 1 and take the engine's bare-CAS commit -- no descriptor, no
+ * proxy, no call_rcu.  Two things forbid it, and every pprev store below is on
+ * an already-PUBLISHED node (&succ->pprev, &pos->pprev, &next->pprev; the fresh
+ * node's own links are already plain stores, built invisibly), so both bite:
+ *
+ *  (1) A lost CAS is the normal protocol outcome, not a corner.  The SW header
+ *      closes its plain store against OOM with an up-front reserve(); no
+ *      reserve can close an abort.  A pre-commit plain store survives the abort
+ *      and leaves a live node naming a slot inside a node that never linked.
+ *
+ *  (2) Storing post-commit instead (winner only) dodges (1) and opens a repair
+ *      window, and in that window a stale pprev is not a slow hint but a
+ *      DANGLING POINTER: pprev holds an address INSIDE another node.  Staleness
+ *      is detectable (*pprev != elem) and repairable by a short forward walk,
+ *      but hints accumulate on one slot -- insert A at &prev->next, then B at
+ *      &prev->next, and A->pprev and B->pprev both name it while A's true slot
+ *      is &B->next.  Unboundedly many nodes' pprev can name a single slot, and
+ *      del(prev) can only fix its CURRENT successor's.  prev is freed after a
+ *      grace period and the rest dangle.  RCU does not cover this: the pointer
+ *      sits in a live node indefinitely, so no read-side section contains it.
+ *
+ * This is what the SW header's insistence on an EAGER store is really about --
+ * a plain store is instantly visible to the sole updater, so no stale window
+ * exists at all.  The MW equivalent of "eager" is "atomic with the commit",
+ * which is the transaction.  del's &next->pprev edge is harder still: &elem->next
+ * dies with elem, so it must swing before reclaim at any price.
+ *
+ * The alternative, if the bare-CAS insert is ever worth its cost: drop pprev
+ * ENTIRELY and have del take the head, walking to find the naming slot.  Insert
+ * becomes a 1-edge bare CAS, del 2 edges, and the node halves to one pointer.
+ * It costs the "@elem need not know its bucket" contract of del/replace, which
+ * for short hash buckets may well be the better trade.  Softening pprev to a
+ * hint is not on that menu -- see (2).
+ *
  * Reclaim, read/write contract, escalation
  * ----------------------------------------
  * As in <urcu/rcu-txn-list.h>: del() returns whether THIS call removed the node
