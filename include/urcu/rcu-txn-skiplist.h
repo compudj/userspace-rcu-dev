@@ -38,8 +38,8 @@
  * AND (worse, in the MCAS world) the number of transacted slots every insert and
  * delete must commit, merely to avoid a cheap read-only descent.  The scarce
  * resource here is commit width -- the slots a descriptor holds, that conflict,
- * that helpers traverse -- so the skiplist inherits the hlist's MARK but not its
- * pprev; the search replaces it.
+ * that a peer's load must wait on -- so the skiplist inherits the hlist's MARK
+ * but not its pprev; the search replaces it.
  *
  * Node / mark layout
  * ------------------
@@ -338,17 +338,19 @@ int urcu_txn_skiplist_empty(struct urcu_txn_skiplist *sl)
 /*
  * Read policy (measured; see also rcu-txn-bitmap.h and rcu-txn-hlist.h).
  *
- * Help iff the loaded slot belongs to this transaction's own read/write set.
+ * Wait iff the loaded slot belongs to this transaction's own read/write set.
  * There, a stale value dooms the install-time CAS -- drive_install aborts on
- * v != r->old_ptr -- so helping the UNDECIDED owner to a terminal status buys a
- * value the plant can actually land on.  The _prepare loads below are all such
- * slots (&pred->next[L] and &node->next[L] are stored; &succ->next[L] is folded
- * into the read set), so they use the helping urcu_txn_load/_validate.
+ * v != r->old_ptr -- so waiting for the UNDECIDED owner to reach a terminal
+ * status buys a value the plant can actually land on.  The _prepare loads below
+ * are all such slots (&pred->next[L] and &node->next[L] are stored;
+ * &succ->next[L] is folded into the read set), so they use the waiting
+ * urcu_txn_load/_validate.  (Waiting, never driving: the owner is the sole
+ * driver of its own install -- see <urcu/rcu-mcas.h>.)
  *
  * Read optimistically for NAVIGATION -- a slot this transaction will never store
  * nor validate.  The descent below is pure navigation: an UNDECIDED transaction
  * has not linearized, so the slot's logical value already IS its old_ptr, and
- * helping would make every hop of an O(log n) descent pay for a stranger's whole
+ * waiting would make every hop of an O(log n) descent block on a stranger's
  * install.  Switching the descent alone was worth 3.05x at 192 writers; making
  * the _prepare loads optimistic as well cost 8% back.
  */

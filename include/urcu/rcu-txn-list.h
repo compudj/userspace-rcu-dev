@@ -96,7 +96,8 @@
  * commit through the transaction bracket <urcu/rcu-txn.h>,
  * which opens an RCU read-side section per attempt and defers descriptor
  * reclaim through the flavor's call_rcu -- the read lock is what keeps an
- * in-flight MCAS descriptor alive while peers help drive it.  A mutator thus
+ * in-flight MCAS descriptor alive while peers OBSERVE it (they poll its status
+ * to wait it out; only its owner ever drives it).  A mutator thus
  * brackets its own section; the caller still holds a read-side section across
  * the call so the node arguments (@pos / @elem, and whatever a traversal
  * reached them through) stay alive -- this nests harmlessly inside the

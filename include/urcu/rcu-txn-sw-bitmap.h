@@ -46,9 +46,9 @@
  * transactions use (they resolve proxies, whose lifetime is the RCU grace
  * period) -- exactly like urcu_txn_sw_list_*_rcu().  A reader resolves through
  * urcu_txn_sw_proxy_get(): one acquire load of the flip selector, never
- * blocking and never helping.  The concurrent twin's read-policy question ("a
- * pure reader must not help") simply does not arise -- this engine has no
- * helping and no UNDECIDED window, so a resolved word is always the flip's
+ * blocking and never waiting on anyone.  The concurrent twin's read-policy
+ * question ("a pure reader must not wait") simply does not arise -- this engine
+ * has no UNDECIDED window at all, so a resolved word is always the flip's
  * linearized value, old before the selector store and new after.
  *
  * COMPOSITION -- and why this header composes where its sw siblings refuse to.

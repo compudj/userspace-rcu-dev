@@ -406,29 +406,42 @@ urcu_static_assert(URCU_TXN_FALLBACK_MIN <= URCU_TXN_FALLBACK_MAX,
 #define URCU_TXN_ENOMEM	((struct urcu_mcas *) -1L)
 
 /*
- * THE READ POLICY.  Help iff the loaded slot ends up in this transaction's
+ * THE READ POLICY.  Wait iff the loaded slot ends up in this transaction's
  * read/write set; read optimistically ONLY to navigate.
  *
  * urcu_txn_load_optimistic() resolves an undecided parker to its logical old --
- * the value the slot takes if the parker aborts -- without driving the parker
- * to a decision.  For a slot the transaction then stores (or load-validates),
+ * the value the slot takes if the parker aborts -- without waiting for the
+ * parker to decide.  For a slot the transaction then stores (or load-validates),
  * that value is stale by construction whenever the parker goes on to commit, so
  * the record's old_ptr cannot match at install and the plant CAS is DOOMED: the
- * attempt is guaranteed to abort.  A helping load instead pays the parker's
- * install once and returns the decided value, which commits either way.  The
- * saving is real only for a load whose value nothing later depends on: a
- * traversal hop that merely points at the next node.
+ * attempt is guaranteed to abort.  A WAITING load instead spins a bounded
+ * URCU_MCAS_WAIT_PATIENCE for the parker's OWNER to settle the slot, then
+ * re-reads the decided value, which commits either way.  It never drives that
+ * parker itself: the owner is the sole driver, and nothing helps, evicts, or
+ * steals (see the single-driver spinlatch in <urcu/rcu-mcas.h>).  The saving is
+ * real only for a load whose value nothing later depends on: a traversal hop
+ * that merely points at the next node.
+ *
+ * The wait is BOUNDED, so the policy is a bias, not a guarantee.  If the owner
+ * is still undecided at the patience cap, urcu_mcas_read() gives up and returns
+ * the logical old anyway -- precisely what the optimistic form would have
+ * returned, doomed install and all.  A read-set load that caps out is therefore
+ * reconciled at commit exactly like an optimistic one, and what ultimately gets
+ * it through against a preempted owner is the aging escalation and the front
+ * end's fair-mutex fallback, NOT the wait.  The policy buys the common case; it
+ * does not close the window.
  *
  * Measured both directions.  Making rcu-txn-hlist.h's *_prepare loads
  * optimistic cost 30% at 64 buckets / 192 writers (abort:commit 0.61 -> 0.86)
  * and was invisible at the 4096 buckets the published benchmark used, where
- * nothing aborts at all.  The converse -- rcu-txn-skiplist.h helping its five
+ * nothing aborts at all.  The converse -- rcu-txn-skiplist.h waiting on its five
  * _prepare loads while its descent stays optimistic -- gained 8.2% at 192
  * writers.
  *
  * The policy is a property of the CALL SEQUENCE, not of contention, so it is
  * checkable single-threaded: for every slot entering the read/write set, the
- * most recent load of that slot in the same attempt must have helped.  Build
+ * most recent load of that slot in the same attempt must have been a waiting
+ * load.  Build
  * with -DURCU_TXN_DEBUG_READ_POLICY to enforce it -- every urcu_txn__record()
  * (store or load-validate) is checked against the kind of the last load, and a
  * violation aborts with a diagnostic.  Add -DURCU_TXN_DEBUG_READ_POLICY_SOFT to
@@ -441,7 +454,7 @@ urcu_static_assert(URCU_TXN_FALLBACK_MIN <= URCU_TXN_FALLBACK_MAX,
  * A slot never loaded in this attempt is not a violation: a blind store (a
  * fresh node's own field, a head whose old value the caller already holds) has
  * no read to speak of.  Note that urcu_txn_load_validate_optimistic() is a
- * read-set read that does not help, so it violates the policy BY CONSTRUCTION
+ * read-set read that does not wait, so it violates the policy BY CONSTRUCTION
  * -- it has no callers, and this is why.
  */
 #ifdef URCU_TXN_DEBUG_READ_POLICY
@@ -669,7 +682,8 @@ void urcu_txn__rp_note(struct urcu_mcas_txn *txn, void **slot, int optimistic)
 }
 
 /*
- * @slot is entering the read/write set.  Its last load must have helped.  A
+ * @slot is entering the read/write set.  Its last load must have been a waiting
+ * load (urcu_txn_load / _load_validate), not an optimistic one.  A
  * slot with no mark was never loaded here (a blind store): nothing to check.
  * Once checked, the slot is settled -- a later store chains onto the record
  * rather than off a fresh physical read -- so clear the mark rather than report
@@ -927,8 +941,11 @@ void urcu_txn_init(struct urcu_mcas_txn *txn,
  * none is bound.  begin()/end() bracket with these; an embedder that drives the
  * engine WITHOUT begin()/end() (only init/reserve/store/commit_flavor) calls
  * them directly to bracket the whole mutation -- the read-side section is what
- * keeps a parked record (or a helped foreign descriptor) alive across the
- * commit.
+ * keeps a parked record alive across the commit, and with it any FOREIGN
+ * descriptor this transaction merely observes: a load or an install that meets
+ * another owner's proxy dereferences it to poll its status, and never drives it
+ * (single-driver spinlatch, <urcu/rcu-mcas.h>).  Observing is enough to require
+ * the section.
  */
 static inline
 void urcu_txn_read_lock(struct urcu_mcas_txn *txn)
@@ -1480,8 +1497,8 @@ void *urcu_txn_load_committed(struct urcu_mcas_txn *txn, void **slot,
 }
 
 /*
- * urcu_txn_load without helping an undecided transaction decide: forwards to
- * urcu_mcas_read_optimistic() (see it for why this is safe for a read set).
+ * urcu_txn_load without waiting on an undecided transaction to decide: forwards
+ * to urcu_mcas_read_optimistic() (see it for why this is safe for a read set).
  * The value is the slot's logical value at the moment of the read, and commit()
  * reconciles it against the install-time physical value exactly as for
  * urcu_txn_load -- a value that moved aborts.  A stale read costs an abort, not
@@ -1550,8 +1567,9 @@ void *urcu_txn_load_validate(struct urcu_mcas_txn *txn, void **slot,
  * The guard is unchanged -- the commit still requires @slot to resolve to the
  * value returned here -- so an undecided parker observed as its logical old is
  * simply a guard on that old: it holds if the parker aborts, and aborts us if
- * it commits.  Exactly the outcome the helping read would have reached, one
- * attempt later.
+ * it commits.  Exactly the outcome the waiting read would have reached, one
+ * attempt later -- and the very outcome it does reach anyway when its bounded
+ * wait caps out.
  */
 static inline
 void *urcu_txn_load_validate_optimistic(struct urcu_mcas_txn *txn, void **slot,
