@@ -2170,24 +2170,15 @@ static int mw_gs_oracle(void)
 		return 0;
 	}
 	/*
-	 * KNOWN DEFECT (tracked): graft_swap is NOT drop-safe.  Its swap path
-	 * asserts ft_detach_node is failure-free (ft-graft.h:2975, "reserve
-	 * guarantees no -ENOMEM"), but under FEATURE_FT_MW_LOCK_FINE_DROP a peer
-	 * relocates the shared spine and the detach's recompact returns -EAGAIN
-	 * (dret != 0) -> assert abort (7/8 deterministic); graft_swap has no retry
-	 * loop, unlike graft/merge.  The fix is a contention-tolerant re-descend
-	 * (re-fill reserve, preserve the consumed-swap canon), mirroring
-	 * ft_graft_keylen's retry_attach / ft_merge_graft_subpos_inplace's
-	 * retry_merge.  Until it lands, this oracle would abort the suite under the
-	 * drop, so gate it behind FT_INV_MW_GS=1 (it passes under the FT-wide lock,
-	 * aborts under the drop).
+	 * graft_swap IS drop-safe: cds_ft_graft_swap now re-descends on a
+	 * contention-abort under FEATURE_FT_MW_LOCK_FINE_DROP (retry_swap), for
+	 * BOTH the empty-swap prune (ft_detach_node -EAGAIN, build-invisible) and
+	 * the non-empty exchange (the swap-root retire is FUSED into the
+	 * insert-replace txn, so a relocated-parent abort rolls both sides back --
+	 * mirroring ft_graft_keylen's retry_attach and the src_swap_fused move).
+	 * Runs unconditionally in the plan now (was gated behind FT_INV_MW_GS while
+	 * the assert(dret==0) was still a known defect).
 	 */
-	if (!getenv("FT_INV_MW_GS")) {
-		fprintf(stderr, "# inv_concurrent_crosstrie_graft_swap_fine_lock: "
-			"SKIPPED -- graft_swap not drop-safe (known defect: unfailable "
-			"ft_detach_node, no retry; set FT_INV_MW_GS=1 to run)\n");
-		return 0;
-	}
 	mw_install_fatal_handler();
 	ft = create_varlen_fine_lock_ft(&group);
 	cds_ft_make_concurrent(ft);

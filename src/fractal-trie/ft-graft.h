@@ -2438,6 +2438,12 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		bool empty_pruned = false;
 #ifdef FEATURE_FT_MW_LOCK_FINE_DROP
 		bool gs_rlock = false;
+		/*
+		 * The non-empty swap-root retire was FUSED into the insert-replace
+		 * txn (exclusive swap, list off) so a drop-abort of that commit rolls
+		 * it back and the retry re-descends with swap still full.
+		 */
+		bool swap_retire_fused = false;
 #endif
 
 		/*
@@ -2466,6 +2472,37 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 			dst_ft->group->flavor->read_lock();
 			gs_rlock = true;
 		}
+#endif
+#ifdef FEATURE_FT_MW_LOCK_FINE_DROP
+retry_swap:
+		/*
+		 * MW LOCK_FINE drop: the re-descend point.  graft_swap's commit is
+		 * failure-free under the FT-wide lock, but with the lock dropped a
+		 * peer can relocate the contended dst spine between this op's descent
+		 * and its commit -- the empty-swap prune's ft_detach_node then cannot
+		 * lock the recompacting ancestor and returns -EAGAIN (build-invisible:
+		 * nothing published, dst byte-for-byte as before).  Re-plan against the
+		 * settled tree, mirroring ft_graft_keylen's retry_attach and
+		 * ft_merge_graft_subpos_inplace's retry_merge.  Reset every per-attempt
+		 * build-product handle: the declaration initializers ran once, and a
+		 * goto here does not re-run them.  The §11 RCU pin stays held across
+		 * attempts (a re-descend under the same read section re-pins).
+		 */
+		fresh = NULL;
+		fresh_meta = NULL;
+		swap_retire_txn = NULL;
+		extract_txn = NULL;
+		glue_publish_txn = NULL;
+		run_replace_txn = NULL;
+		canon = NULL;
+		top_B = NULL;
+		ks_cn = NULL;
+		old_child_external = false;
+		have_insert = false;
+		empty_pruned = false;
+		gs_reserved = false;
+		swap_retire_fused = false;
+		gs_d_first = gs_d_last = gs_s_first = gs_s_last = NULL;
 #endif
 		kase = ft_graft_swap_descend(dst_ft, key, key_len, &d);
 		if (kase == FT_GRAFT_SWAP_DELEGATE) {
@@ -2865,6 +2902,29 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		if (!swap_empty) {
 			struct cds_ft_inode_flag *empty = ft_node_flag(fresh, 0);
 
+#ifdef FEATURE_FT_MW_LOCK_FINE_DROP
+			/*
+			 * MW LOCK_FINE drop (exclusive swap, list off, insert side): FUSE
+			 * the swap-root retire INTO the insert-replace txn (recorded here,
+			 * committed at ft_glue_txn_commit_replace below) so the src unlink
+			 * and the dst attach flip ATOMICALLY.  A concurrent peer relocating
+			 * the contended dst parent aborts that commit; with the retire
+			 * fused, the abort rolls swap's root back to its full content too,
+			 * so the retry re-descends against a swap that still holds all its
+			 * content (no orphan window, no already-swapped bookkeeping).  swap
+			 * is exclusive => no readers => no drain -- so the replace's
+			 * immediate apply_deferred re-parents INTO swap (not rolled back)
+			 * are reader-invisible and overwritten by the rebuild.  (Mirrors
+			 * cds_ft_graft's src_swap_fused.)
+			 */
+			if (swap_ft->exclusive && !gs_ord && have_insert &&
+					glue_insert.txn) {
+				ft_flip_txn_record_reserved(glue_insert.txn,
+					(void **) &swap_ft->root,
+					(void *) swap_ft->root, (void *) empty);
+				swap_retire_fused = true;
+			} else
+#endif
 			/*
 			 * Retire swap's root to an empty node AND (paired) unlink run_S
 			 * from swap's ordered list, FUSED in ONE flip so a reader never
@@ -2901,6 +2961,8 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		 * content).  Empty swap publishes NULL (a remove).
 		 */
 		if (have_insert) {
+			enum urcu_txn_status ins_cst = URCU_TXN_STATUS_OK;
+
 			/*
 			 * Order-statistics (BULK): the replace swaps @old_count keys for
 			 * @swap_count, so the dst NET delta rides the replace publish
@@ -2909,8 +2971,8 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 			 */
 			glue_insert.count_delta = (long) swap_count - (long) old_count;
 			if (glue_insert.txn)
-				ft_glue_txn_commit_replace(dst_ft, &glue_insert,
-					swap_run_arg);
+				ins_cst = ft_glue_txn_commit_replace(dst_ft,
+					&glue_insert, swap_run_arg);
 			else {
 				/*
 				 * Fuse glue_insert's free-list FREEZE into the publish-replace
@@ -2931,6 +2993,49 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 				glue_publish_txn = NULL;	/* consumed */
 				glue_insert.txn = NULL;	/* the commit reclaimed it */
 			}
+#ifdef FEATURE_FT_MW_LOCK_FINE_DROP
+			/*
+			 * MW LOCK_FINE drop: a peer relocated the contended dst parent
+			 * between this op's descent and its replace commit, so the commit
+			 * aborted (ft_flip_txn_guard_parent's clean-live expectation fails
+			 * against the retired/re-homed parent word).  A flip-txn commit is
+			 * all-or-none: nothing was published, and the FUSED swap-root retire
+			 * (recorded into the SAME txn) rolled back too.  dst is byte-for-byte
+			 * as before; swap_ft still holds its full content, and though the
+			 * replace's apply_deferred already rewrote swap's interior parent
+			 * back-pointers (immediate, not rolled back) that is invisible -- swap
+			 * is exclusive, the content nodes are never freed, and the rebuild
+			 * reads forward-only and overwrites them.  Free this attempt's
+			 * build-invisible clusters + reserve + txns, then re-descend (mirrors
+			 * ft_graft_keylen's store-abort retry_attach).  Gated on
+			 * @swap_retire_fused: only the
+			 * fused arm rolls the retire back, so only it can safely re-descend;
+			 * the legacy separate-retire arms keep their pre-drop behaviour (not
+			 * yet drop-hardened -- tracked follow-up, as for cds_ft_graft).
+			 */
+			if (swap_retire_fused && ins_cst != URCU_TXN_STATUS_OK) {
+				ft_glue_abort(dst_ft, &glue_insert);
+				ft_glue_abort(swap_ft, &glue_extract);
+				if (fresh) {
+					free_cds_ft_node(swap_ft, fresh);
+					fresh = NULL;
+				}
+				if (extract_txn) {
+					ft_flip_txn_destroy(extract_txn);
+					extract_txn = NULL;
+				}
+				if (run_replace_txn) {
+					ft_flip_txn_destroy(run_replace_txn);
+					run_replace_txn = NULL;
+				}
+				if (gs_reserved) {
+					cds_ft_alloc_reserve_drain(dst_ft, &gs_reserve);
+					gs_reserved = false;
+				}
+				goto retry_swap;
+			}
+#endif
+			(void) ins_cst;
 		} else {
 			/*
 			 * Empty-swap remove (a REMOVE of @old_child at @key): route it
@@ -2972,7 +3077,48 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 					gs_ord ? &drun : NULL, NULL, NULL,
 					-(long) old_count /* fold -old_count onto the detach commit */);
 			cds_ft_alloc_reserve_deactivate(dst_ft);
+#ifdef FEATURE_FT_MW_LOCK_FINE_DROP
+			/*
+			 * MW LOCK_FINE drop: under the FT-wide lock this detach is
+			 * failure-free, but with the lock dropped it can fail two ways,
+			 * BOTH build-invisible in ft_detach_node (the failure aborts before
+			 * any reader-visible store) and this is the empty-swap REMOVE (no
+			 * swap content consumed), so both tries stay pristine:
+			 *
+			 *  - -EAGAIN: a peer relocated the contended spine and the detach's
+			 *    recompaction cannot lock its ancestor.  Free this attempt's
+			 *    build-invisible extract cluster + reserve + txns and re-descend
+			 *    (mirrors retry_attach / retry_merge).
+			 *  - -ENOMEM: the detach's commit flip-txn is a malloc NOT backed by
+			 *    the node reserve, so it can still fail under memory pressure
+			 *    (ft-remove.h, "aborts before any side-effect").  Terminal: fall
+			 *    into prep_oom (releases the §11 pin, frees every handle, returns
+			 *    MEMORY_ERROR) rather than spinning a hopeless re-descend.
+			 */
+			if (dret == -EAGAIN) {
+				ft_glue_abort(swap_ft, &glue_extract);
+				ft_glue_abort(dst_ft, &glue_insert);
+				if (extract_txn) {
+					ft_flip_txn_destroy(extract_txn);
+					extract_txn = NULL;
+				}
+				if (run_replace_txn) {
+					ft_flip_txn_destroy(run_replace_txn);
+					run_replace_txn = NULL;
+				}
+				if (gs_reserved) {
+					cds_ft_alloc_reserve_drain(dst_ft, &gs_reserve);
+					gs_reserved = false;
+				}
+				goto retry_swap;
+			}
+			if (dret != 0) {
+				assert(dret == -ENOMEM);
+				goto prep_oom;
+			}
+#else
 			assert(dret == 0);	/* reserve guarantees no -ENOMEM */
+#endif
 			(void) dret;
 			swap_run.armed = drun.armed;
 			empty_pruned = true;

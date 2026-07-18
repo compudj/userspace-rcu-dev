@@ -4464,8 +4464,8 @@ enum urcu_txn_status ft_glue_txn_commit(struct cds_ft *ft, struct ft_glue *g,
  * replace publish.  Arms @run.  @run NULL => list off.
  */
 static
-void ft_glue_txn_commit_replace(struct cds_ft *ft, struct ft_glue *g,
-		struct ft_graft_swap_run *run)
+enum urcu_txn_status ft_glue_txn_commit_replace(struct cds_ft *ft,
+		struct ft_glue *g, struct ft_graft_swap_run *run)
 {
 	struct ft_ord_cell_edge cedges[4] = { 0 };
 	unsigned int n = 0;
@@ -4475,7 +4475,13 @@ void ft_glue_txn_commit_replace(struct cds_ft *ft, struct ft_glue *g,
 			run->s_first, run->s_last, cedges, 0);
 		run->armed = true;
 	}
-	ft_glue_txn_commit_edges(ft, g, cedges, n);
+	/*
+	 * Return the commit status: under the FT-wide lock the replace is
+	 * failure-free (caller ignores it), but with the lock dropped
+	 * (FEATURE_FT_MW_LOCK_FINE_DROP) a peer relocating the contended dst
+	 * parent aborts the commit -- cds_ft_graft_swap re-descends on it.
+	 */
+	return ft_glue_txn_commit_edges(ft, g, cedges, n);
 }
 
 /*
