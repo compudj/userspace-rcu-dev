@@ -2511,14 +2511,23 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 		 *     point turns out to be, plus +1 for a recompact-relocate retire's
 		 *     tombstone fused into the commit (atomic detach, §4.B), plus
 		 *     + FT_GLUE_FLOOR_FREE for the graft's floor-bounded free-list
-		 *     tombstones -- so the take() path fuses them too (matching the
-		 *     ft_graft_keylen create-path reservation exactly).
+		 *     tombstones -- so the take() path fuses them too.  The detached
+		 *     @tmp is EXCLUSIVE, so ft_graft_keylen's src-swap-fused arm records
+		 *     its src-root retire edge (+1) AND, for a nil-key @tmp (a single
+		 *     detached external), the emptied wrapper's tombstone (+1) into THIS
+		 *     take() txn when the list is off -- so reserve both, matching the
+		 *     ft_graft_keylen create-path reservation (ft-graft.h).  List on
+		 *     retires through ft_graft_keylen's own bounded src_retire_txn, not
+		 *     this one, so no add there.
 		 */
 		{
 			unsigned int pf_cap;
 
 			if (m == 0)
-				pf_cap = FT_GLUE_FLOOR_DEFERRED + 7 + 1 /* +1 §4.B parent guard */ + FT_GLUE_FLOOR_FREE;
+				pf_cap = FT_GLUE_FLOOR_DEFERRED + 7 + 1 /* +1 §4.B parent guard */ + FT_GLUE_FLOOR_FREE
+					/* +1 fused src-root retire + +1 fused nil-key wrapper
+					 * tombstone (exclusive tmp, list off); mirrors ft-graft.h */
+					+ (dst_ft->group->ordered_list_set ? 0 : 2);
 			else if (dst_ft->group->ordered_list_set)
 				pf_cap = (unsigned int) (m + 1) +
 					(unsigned int) (2 * n + 2) +

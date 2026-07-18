@@ -1362,6 +1362,8 @@ retry_attach:
 					FT_GLUE_FLOOR_DEFERRED + 7 + 1 /* +1 §4.B parent guard */ + FT_GLUE_FLOOR_FREE
 					/* +1 fused src-root retire edge (exclusive src, follow-up b) */
 					+ (src_ft->exclusive ? 1 : 0)
+					/* +1 fused nil-key wrapper tombstone (exclusive nil-key src) */
+					+ ((src_ft->exclusive && nil_key_root) ? 1 : 0)
 					/* + count walk: the +src_count nr_keys ancestor edges (BULK fold) */
 					+ (dst_ft->rank_stats ? (int) key_len + 1 : 0))) {
 				if (glue.txn)
@@ -1482,9 +1484,12 @@ retry_attach:
 		 * point of no return and cannot abort, so it commits through this
 		 * pre-reserved txn (ft_ord_cell_flip_into).  List off retires via a
 		 * lone-edge root store, so reserve only when the list is on -- EXCEPT
-		 * a nil-key root retire fuses the orphaned wrapper's tombstone into
-		 * the retire (atomic detach, §4.B), needing a 2-edge txn even list-
-		 * off; list-on grows by +1 for that same fused tombstone.
+		 * a NON-exclusive nil-key root retire fuses the orphaned wrapper's
+		 * tombstone into the retire (atomic detach, §4.B), needing a 2-edge
+		 * txn even list-off; list-on grows by +1 for that same fused
+		 * tombstone.  An EXCLUSIVE nil-key src instead fuses BOTH edges into
+		 * @glue.txn (the src-swap-fused arm below), so it needs no separate
+		 * retire txn -- reserved for the wrapper tombstone above.
 		 *
 		 * One-shot (src-side): the src-retire txn is consumed by the swap
 		 * below, so a post-swap retry keeps the src empty and does NOT
@@ -1517,7 +1522,7 @@ retry_attach:
 				free_cds_ft_node_unpublished(src_ft, fresh_node);
 				return CDS_FT_STATUS_MEMORY_ERROR;
 			}
-		} else if (!already_swapped && nil_key_root) {
+		} else if (!already_swapped && nil_key_root && !src_ft->exclusive) {
 			src_retire_txn = ft_flip_txn_create_bounded(2);
 			if (!src_retire_txn) {
 				if (glue.split_cn_holder) {
@@ -1788,23 +1793,34 @@ retry_attach:
 			 * failure mode (OOM / populated) returned above, before this
 			 * retire.
 			 */
-			if (src_ft->exclusive && !dst_ft->group->ordered_list_set
-					&& !nil_key_root) {
+			if (src_ft->exclusive && !dst_ft->group->ordered_list_set) {
 				/*
-				 * FUSED cross-trie move (exclusive src, list off, non-nil
-				 * root): record the src-root retire INTO @glue.txn instead of
-				 * a separate flip, so the src unlink flips ATOMICALLY with the
-				 * dst attach below -- no orphan window, no drain (no readers).
-				 * @already_swapped stays FALSE until that commit succeeds (set
-				 * post-commit), so a commit abort rolls this src edge back too
-				 * and the retry re-descends with src still full (clean, like a
-				 * pre-swap failure).  Non-nil: @old_src_root IS the payload,
-				 * moved LIVE into dst -- no tombstone.
+				 * FUSED cross-trie move (exclusive src, list off): record the
+				 * src-root retire INTO @glue.txn instead of a separate flip, so
+				 * the src unlink flips ATOMICALLY with the dst attach below --
+				 * no orphan window, no drain (no readers).  @already_swapped
+				 * stays FALSE until that commit succeeds (set post-commit), so a
+				 * commit abort rolls this src edge back too and the retry
+				 * re-descends with src still full (clean, like a pre-swap
+				 * failure).
 				 */
 				ft_flip_txn_record_reserved(glue.txn,
 					(void **) &src_ft->root,
 					(void *) old_src_root,
 					(void *) ft_node_flag(fresh_node, 0));
+				/*
+				 * NIL-key src: @old_src_root is the emptied wrapper (its
+				 * external chain moved LIVE into dst); its freeze-on-free
+				 * tombstone rides the SAME fused flip (atomic detach §4.B) so
+				 * the unlink + freeze commit atomically with the attach -- an
+				 * abort rolls the tombstone back too and the wrapper is
+				 * reclaimed post-drain at the nil-key free below.  Non-nil:
+				 * @old_src_root IS the payload, moved LIVE -- no tombstone.
+				 */
+				if (nil_key_root)
+					ft_flip_txn_record_tombstone(glue.txn,
+						cds_ft_item_to_metadata(
+							ft_node_ptr(old_src_root)));
 				src_swap_fused = true;
 			} else if (dst_ft->group->ordered_list_set) {
 				graft_run_first = ft_ord_first(src_ft);
