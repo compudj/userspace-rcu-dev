@@ -66,7 +66,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS	63
+#define NR_TESTS	65
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -1587,10 +1587,27 @@ static struct cds_ft *create_varlen_fine_lock_ft(struct cds_ft_group **group_out
  *   MW_XT_ATTACH_MERGE_SUBPOS  cds_ft_merge_at moving a src SUB-position
  *     (src keys {0,s}, src_key {0}) to {p,w} -- exercises the unfenced
  *     ft_merge_graft_subpos_inplace path under the LOCK_FINE drop.
- * Both yield the same dst keys {p,w,s}, so the verification is identical.
+ *   MW_XT_ATTACH_GRAFT_NILKEY  cds_ft_graft of a NIL-key source (a single
+ *     empty key, the root's childless-internal external_nodes wrapper) at
+ *     {p,w} -- the source's external chain head is placed DIRECTLY, so the
+ *     one landed key is {p,w} (2 bytes, no suffix) and the emptied wrapper is
+ *     freeze-on-free tombstoned; exercises the exclusive nil-key src-swap-
+ *     fused arm (retire edge + wrapper tombstone fused into glue.txn) under
+ *     the drop.
+ *   MW_XT_ATTACH_MERGE_NILKEY  cds_ft_merge_at moving a single {0} leaf
+ *     (src_key {0}) to {p,w}: ft_detach excises the lone external into an
+ *     exclusive nil-key wrapper tmp, so the same fused nil-key arm runs on
+ *     the take() path (retire + tombstone into the merge's pre-reserved
+ *     pf_txn) -- exercises the ft-merge.h pf_cap reservation the create-path
+ *     graft does not.
+ * GRAFT / MERGE_SUBPOS yield dst keys {p,w,s}; the nil modes a single {p,w}.
+ * mw_xt_nsuffix / mw_xt_landed_key fold that per-mode shape difference so the
+ * build / remove / verify loops stay shared.
  */
 #define MW_XT_ATTACH_GRAFT		0
 #define MW_XT_ATTACH_MERGE_SUBPOS	2
+#define MW_XT_ATTACH_GRAFT_NILKEY	3
+#define MW_XT_ATTACH_MERGE_NILKEY	4
 struct mw_xt_arg {
 	struct cds_ft *ft;			/* the shared LIVE dst */
 	struct cds_ft_group *group;
@@ -1601,6 +1618,35 @@ struct mw_xt_arg {
 	unsigned long ops;
 	int failed;
 };
+
+/* A nil-key mode attaches a single-key source (empty key / single leaf). */
+static bool mw_xt_is_nilkey(int attach_mode)
+{
+	return attach_mode == MW_XT_ATTACH_GRAFT_NILKEY
+		|| attach_mode == MW_XT_ATTACH_MERGE_NILKEY;
+}
+
+/* Landed keys per prefix: S for GRAFT / MERGE_SUBPOS, 1 for a nil-key src. */
+static unsigned int mw_xt_nsuffix(int attach_mode)
+{
+	return mw_xt_is_nilkey(attach_mode) ? 1 : MW_XT_SUFFIXES;
+}
+
+/*
+ * The dst key that writer @w's suffix @s lands at for @attach_mode: {p,w,s}
+ * for GRAFT / MERGE_SUBPOS, {p,w} for a single nil-key attach.  Fills @buf and
+ * returns the length.
+ */
+static size_t mw_xt_landed_key(int attach_mode, unsigned int p, unsigned int w,
+		unsigned int s, uint8_t *buf)
+{
+	buf[0] = (uint8_t) p;
+	buf[1] = (uint8_t) w;
+	if (mw_xt_is_nilkey(attach_mode))
+		return 2;
+	buf[2] = (uint8_t) s;
+	return 3;
+}
 
 static void *mw_xt_writer(void *arg)
 {
@@ -1625,17 +1671,26 @@ static void *mw_xt_writer(void *arg)
 
 			bool subpos =
 				x->attach_mode == MW_XT_ATTACH_MERGE_SUBPOS;
+			bool nilgraft =
+				x->attach_mode == MW_XT_ATTACH_GRAFT_NILKEY;
+			bool nilmerge =
+				x->attach_mode == MW_XT_ATTACH_MERGE_NILKEY;
+			/* merge_at (src_key {0}): the sub-position and nil-key-leaf moves. */
+			bool is_merge = subpos || nilmerge;
 			enum cds_ft_status attach_st;
 
 			/*
 			 * Build a private source.  GRAFT: 1-byte keys {s} moved
 			 * wholesale.  MERGE_SUBPOS: 2-byte keys {0,s} so the merge
-			 * moves the {0} SUB-position (src_key {0}) -- both land as
-			 * {p,w,s} in dst.
+			 * moves the {0} SUB-position (src_key {0}).  GRAFT_NILKEY: the
+			 * single EMPTY key (nil-key wrapper).  MERGE_NILKEY: a single
+			 * 1-byte {0} leaf so merge_at src_key {0} detaches it to a
+			 * nil-key wrapper tmp (the fused take-path).  GRAFT / SUBPOS land
+			 * {p,w,s}; the nil modes land the lone {p,w}.
 			 */
 			if (cds_ft_create(x->group, NULL, &src) < 0)
 				abort();
-			for (s = 0; s < MW_XT_SUFFIXES; s++) {
+			for (s = 0; s < mw_xt_nsuffix(x->attach_mode); s++) {
 				uint8_t suffix[1] = { (uint8_t) s };
 				uint8_t sub_suffix[2] = { 0, (uint8_t) s };
 				uint8_t full[3] = { (uint8_t) p,
@@ -1645,9 +1700,18 @@ static void *mw_xt_writer(void *arg)
 					| ((uint64_t) x->w << 8) | s);
 
 				memcpy(n->okey, full, 3);
+				/*
+				 * GRAFT_NILKEY: insert the EMPTY key (the src root's
+				 * nil-key wrapper); the graft at {p,w} places its
+				 * external head directly there.  Else a 1-byte {s}
+				 * (graft / MERGE_NILKEY's lone {0} leaf) or 2-byte
+				 * {0,s} (merge sub-position) key.
+				 */
 				if (cds_ft_insert(src,
+						nilgraft ? (const uint8_t *) "" :
 						subpos ? sub_suffix : suffix,
-						subpos ? 2 : 1, &n->node)
+						nilgraft ? 0 : subpos ? 2 : 1,
+						&n->node)
 						!= CDS_FT_STATUS_OK)
 					abort();
 				x->node[p][s] = n;
@@ -1660,7 +1724,7 @@ static void *mw_xt_writer(void *arg)
 			 * arbitrate the attach.
 			 */
 			cds_ft_make_exclusive(src);
-			if (subpos) {
+			if (is_merge) {
 				uint8_t src_sub[1] = { 0 };
 
 				attach_st = cds_ft_merge_at(x->ft, prefix, 2,
@@ -1695,13 +1759,14 @@ static void *mw_xt_writer(void *arg)
 			x->present[p] = 1;
 		} else {
 			/* Point-remove every key of this prefix, then re-arm. */
-			for (s = 0; s < MW_XT_SUFFIXES; s++) {
-				uint8_t full[3] = { (uint8_t) p,
-					(uint8_t) x->w, (uint8_t) s };
+			for (s = 0; s < mw_xt_nsuffix(x->attach_mode); s++) {
+				uint8_t full[3];
+				size_t full_len = mw_xt_landed_key(
+					x->attach_mode, p, x->w, s, full);
 				struct cds_ft_node *found;
 
 				rcu_read_lock();
-				cds_ft_iter_set_key(iter, full, 3);
+				cds_ft_iter_set_key(iter, full, full_len);
 				cds_ft_lookup(x->ft, iter);
 				found = cds_ft_iter_node(iter);
 				if (found != &x->node[p][s]->node) {
@@ -1803,13 +1868,14 @@ static int mw_xt_oracle(const char *tname, int attach_mode)
 		for (p = 0; p < MW_XT_PREFIXES; p++) {
 			if (!x[i].present[p])
 				continue;
-			for (s = 0; s < MW_XT_SUFFIXES; s++) {
-				uint8_t full[3] = { (uint8_t) p, (uint8_t) i,
-					(uint8_t) s };
+			for (s = 0; s < mw_xt_nsuffix(attach_mode); s++) {
+				uint8_t full[3];
+				size_t full_len = mw_xt_landed_key(
+					attach_mode, p, i, s, full);
 				struct cds_ft_node *found;
 
 				live++;
-				cds_ft_iter_set_key(iter, full, 3);
+				cds_ft_iter_set_key(iter, full, full_len);
 				cds_ft_lookup(ft, iter);
 				found = cds_ft_iter_node(iter);
 				if (found != &x[i].node[p][s]->node) {
@@ -1863,6 +1929,38 @@ static int inv_concurrent_crosstrie_merge_fine_lock(void)
 {
 	return mw_xt_oracle("inv_concurrent_crosstrie_merge_fine_lock",
 		MW_XT_ATTACH_MERGE_SUBPOS);
+}
+
+/*
+ * As inv_concurrent_crosstrie_fine_lock but each attach grafts a NIL-key
+ * source (a single empty key) at {p,w}: the source root is a childless
+ * internal whose external_nodes hold the lone key, so the graft places the
+ * external head DIRECTLY and freeze-on-free tombstones the emptied wrapper.
+ * With an EXCLUSIVE list-off src that retire edge AND the wrapper tombstone
+ * both fuse into the dst attach's glue.txn (src-swap-fused), so the whole
+ * move -- src unlink + wrapper freeze + dst attach -- is ONE flip.  Exercises
+ * that fused nil-key arm (and its commit-abort rollback) under the drop, which
+ * neither the non-nil graft nor the merge sub-position covers.
+ */
+static int inv_concurrent_crosstrie_graft_nilkey_fine_lock(void)
+{
+	return mw_xt_oracle("inv_concurrent_crosstrie_graft_nilkey_fine_lock",
+		MW_XT_ATTACH_GRAFT_NILKEY);
+}
+
+/*
+ * As above but via cds_ft_merge_at moving a single {0} leaf (src_key {0}):
+ * ft_detach excises that lone external into an EXCLUSIVE nil-key wrapper tmp,
+ * which ft_graft_keylen then grafts through the take() path (pre_txn = the
+ * merge's pf_txn).  Exercises the fused nil-key retire + wrapper tombstone
+ * riding the merge's PRE-RESERVED pf_txn -- the reserve-sufficiency the
+ * ft-merge.h m==0 pf_cap bump covers -- which the create-path nil-key graft
+ * (its own reserve) does not.
+ */
+static int inv_concurrent_crosstrie_merge_nilkey_fine_lock(void)
+{
+	return mw_xt_oracle("inv_concurrent_crosstrie_merge_nilkey_fine_lock",
+		MW_XT_ATTACH_MERGE_NILKEY);
 }
 
 /* ================================================================== */
@@ -11674,6 +11772,8 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_concurrent_writers_fine_lock);
 	RUN_TEST(inv_concurrent_crosstrie_fine_lock);
 	RUN_TEST(inv_concurrent_crosstrie_merge_fine_lock);
+	RUN_TEST(inv_concurrent_crosstrie_graft_nilkey_fine_lock);
+	RUN_TEST(inv_concurrent_crosstrie_merge_nilkey_fine_lock);
 	RUN_TEST(inv_bind_resume_order);
 	RUN_TEST(inv_ordered_bulk_consistency);
 	RUN_TEST(inv_compact_keycopy_terminates);
