@@ -306,12 +306,149 @@ growing node is rebuilt anyway, so it adopts the large-node layout (gen word
 included) for free. Per-domain / per-size-class is the right granularity; per-node
 *dynamic* switching would cost a layout conversion and is likely over-engineering.
 
-The one effect that does **not** scale with size — and that puts a hard floor under
-the tunable — is the wait-free loss: it is categorical. A per-size policy therefore gives wait-free reads on small nodes but
-only obstruction-free reads on large ones. If FT wants a *uniform* wait-free read
-guarantee, that overrides the economics and keeps COW even for large nodes (or
-motivates a bounded-copy segmented recompaction that stays wait-free — a larger
-design, deferred).
+The wait-free loss *looks* categorical here — a per-size policy would give wait-free
+reads on small nodes but only obstruction-free reads on large ones — but the
+**single-bit GP-gated latch** (below) dissolves it, recovering wait-free reads even
+for in-place updates, at the cost of gating in-place writes to ≤ 1 per GP per node.
+So the "hard floor" is lifted wherever a recompaction fallback exists; only a truly
+fixed-address blob (no COW) is left with the categorical loss.
+
+### Shrinking the seqcount, and aliasing it with data
+
+Two levers cut the seqcount's footprint, and together they nearly erase it — which
+reshapes the crossover above.
+
+**A seqcount needs very few bits.** Wraparound fools a reader only if the counter
+advances a full period *within one read window* (sample, two CL loads, re-sample).
+A node write (lock + shift + release) is far slower than that window, so a byte —
+even a few bits — never wraps in time. A full generation word was always overkill.
+
+**Better: alias the version onto the occupancy bitmap.** A rank-changing update *by
+definition* flips an occupancy bit, so the occupancy word — already loaded to
+compute rank — **is** a version for rank changes: sample occ, read `slot@rank`,
+re-sample occ; unchanged ⇒ no rank change straddled the read ⇒ consistent. No
+dedicated version bits. One spare bit in the occupancy word's padding carries an
+**in-progress** flag for the torn window of an in-flight update (set before the
+shift, cleared after; retry if set at either sample).
+
+Two conditions make this exact:
+- **Single-word entries.** Occ-as-version catches every rank *change*; a
+  rank-*preserving* multi-word value update leaves occ unchanged and could slip
+  entirely between the two samples (in-progress clear at both) — undetected. FT
+  entries are pointers (≤ 1 word), so rank-preserving updates are single-word
+  atomic and never tear, and occ + the in-progress bit is a *complete* version. A
+  structure with multi-word in-place values would still need a few real generation
+  bits to catch a completed-within-window update.
+- **Serialized writers.** A single in-progress bit assumes one writer at a time
+  (sw / hybrid — FT's case). Lock-free concurrent writers (pure-mw) need an
+  enter/exit count instead.
+
+**Consequence: the footprint axis of the crossover collapses.** Aliased onto
+occupancy the seqcount costs ~one padding bit on a CL already loaded — negligible
+for *small* nodes too, not just large. What remains is the **categorical** cost:
+aliased or not, the retry makes reads obstruction-free, not wait-free. So the
+tunable sharpens to almost purely **wait-free reads (COW) vs faster updates +
+obstruction-free reads (near-free aliased version)** — footprint mostly drops out.
+
+(Minor: occ-as-version over-retries — a concurrent rank change elsewhere in the
+node, even of a higher key that does not move `slot@rank`, changes occ and forces a
+retry. Masking to the below-key occ bits the reader already computes for rank trims
+most of these; the node-global in-progress bit still forces a retry on any in-flight
+update. Finer-grained versioning costs storage — itself a knob.)
+
+### GP-bounded 8-bit version (overflow → recompaction)
+
+A sharper way to shrink the version, and one that drops the single-word-entry
+condition: bound the version's *exposure* with the grace period, so a small counter
+suffices, and use recompaction as the overflow safety valve. An RCU reader cannot
+outlive the grace period, so the writes a live reader can straddle are bounded by
+the writes in its (≤ 2-GP) lifetime — **not** by total write volume.
+
+- **Reader (hot path): compares only the 8 bits.** Sample, read
+  `{occupancy, slot@rank}`, re-sample; accept iff the 8 bits are equal and not
+  in-progress. The 8 bits ride in the occupancy padding (previous section), so
+  placement stays ~free.
+- **Writer (cold path): overflow detection.** Snapshot the version at each GP
+  transition (a per-node value on the metadata CL, plus the global GP epoch polled
+  per update). Before an in-place update, check whether the version could advance a
+  full period (`2^gen_bits`, less the in-progress bit) within the live-reader
+  window; if so, **fall back to recompaction (COW)** for that update instead of
+  incrementing in place.
+- **Recompaction both fixes and resets.** COW is version-independent (whole node
+  through one pointer, unconditionally safe) and starts a fresh node with a zeroed
+  counter, while the old node freezes and its readers drain on the grace period. So
+  the version's exposure resets at every fallback.
+
+Stronger than occupancy-as-version: it is a real incrementing counter, so it
+catches a completed-within-window **multi-word rank-preserving** update too — the
+single-word-entry condition disappears — while placement still aliases it into
+occupancy padding for near-zero footprint.
+
+Properties:
+- **Rare, benign fallback.** With writes-per-node-per-GP well under `2^gen_bits` the
+  fallback never fires; only a node hammered a couple hundred times within one grace
+  period recompacts, and that node was write-hot anyway.
+- **Bounded reader retries — the real prize.** A plain seqcount reader is starvable
+  *indefinitely* by a write stream. Here the forced COW freezes the very node a
+  reader is on within ≤ `2^gen_bits` writes; once frozen, the reader's version stops
+  moving and it completes on the next attempt. So retries are **bounded by the
+  overflow threshold** — the GP + recompaction machinery, introduced for wraparound
+  safety, incidentally upgrades reads from "obstruction-free, starvable" to
+  "bounded-retry." Strictly better than any plain seqcount.
+- **Version width is a knob.** Fewer bits → smaller reader footprint but a lower
+  overflow threshold → more frequent recompaction *and* a tighter retry bound; more
+  bits, the reverse. Another point on the update-speed ↔ read-footprint curve.
+
+Cost: writer-side GP-epoch polling and a per-node GP-transition snapshot on the cold
+CL, plus a dependency on the RCU flavor exposing a readable GP epoch (urcu
+QSBR/memb do). The recompaction path already exists (small-node / read-latency
+mode); this only adds a new trigger. Correctness hinges on a **conservative** window
+bound — recompact before the version *could* alias for any live reader, accounting
+exactly for the ≤ 2-GP span and the in-progress bit.
+
+### Single-bit latch: wait-free reads for real
+
+Push the version to its floor — **one bit** — and the retry bound (flips-in-window
++ 1) collapses to its minimum. Gate the flips so a reader's window holds **at most
+one**: after flipping the latch, the next in-place flip is allowed only once the
+grace period *following* the previous flip has completed (every reader live during
+that flip has drained) — otherwise recompact. Then no reader spans two flips:
+
+- read latch `b1`, read `{occupancy, slot@rank}`, read latch `b2`;
+- `b1 == b2` → no flip straddled the read → accept;
+- `b1 != b2` → exactly one flip → retry **once**, guaranteed to succeed (the reader
+  was live during the flip it saw, so it drains before the next flip — its second
+  window is flip-free).
+
+≤ 1 retry is a constant independent of writers, so the read is **wait-free — for
+real**, not merely bounded by a large constant. This is the tight extreme of the
+GP-bounded family: retries are `≤ 2^N` for an `N`-bit version, and `N = 1` makes the
+constant `1`. So version width is the knob between **in-place write throughput**
+(wider `N` recompacts less under bursts) and **read-retry tightness** (`N = 1` gives
+the one-retry wait-free read).
+
+**This resolves the wait-free-vs-torn-free tension.** Elsewhere this plan calls the
+wait-free loss the categorical price of any snapshot mechanism and casts COW as the
+only way to keep reads wait-free. The single-bit GP-gated latch gets **both** —
+torn-free (the latch catches the flip) *and* wait-free (≤ 1 retry) — with the cost
+moved entirely to the write side: in-place updates gated to ≤ 1 per grace period per
+node, the rest recompacting. So **recompaction stops being the price of wait-free
+reads and becomes the price of write throughput above one in-place update per GP per
+node** — the same update-speed ↔ read-latency knob, now with the read side pinned at
+wait-free, and the tunable's "hard floor" dissolved.
+
+Two caveats keep it honest:
+- **It needs a recompaction fallback to exist** — the node must be pointer-reachable
+  and replaceable (FT nodes are: swap the parent pointer). A *truly fixed-address*
+  blob (a pool slot others point *into* by raw pointer — the original "no realloc"
+  premise) has no COW escape, so the valve is unavailable and the wait-free loss
+  **stands** there. This result is for the recompactable case, not the fixed-address
+  one.
+- **The latch catches a *completed* update**; the in-progress torn window needs
+  either the content update to be atomic at the flip (the sw engine's selector — the
+  latch simply *is* that selector, resolved through proxies) or a companion
+  in-progress bit for a plain-load data path. So it is one-to-two bits, still aliased
+  into the occupancy padding.
 
 ### Tombstone (just a live/dead flag)
 
@@ -365,8 +502,15 @@ contends). For a flat multi-word value you can have wait-free *or* torn-free, no
 both — the wait-free way to snapshot many words at once is to make them reachable
 through a **single pointer (COW)**, which is exactly what FT's recompaction buys. A
 read path that must be wait-free (RT, signal/constrained context) therefore cannot
-use `load_consistent`; it stays on the single-word / `load_rcu` reads and is
+use a plain `load_consistent`; it stays on the single-word / `load_rcu` reads and is
 designed not to need a multi-word snapshot.
+
+This "not both" holds for a *plain, unbounded* seqcount and for a *truly
+fixed-address* blob. Where a **recompaction fallback exists** (pointer-reachable
+nodes, as in FT), a **GP-gated single-bit latch** recovers *both* — torn-free and
+wait-free at ≤ 1 retry — by bounding each reader to at most one latch flip; see
+"Single-bit latch" in the FT section. The tension is thus fundamental only when
+there is no COW escape.
 
 Seqcount flavor by writer model: **parity** where writers are serialized (pure-sw,
 hybrid); **enter/exit** in-flight-writer count where they are concurrent
