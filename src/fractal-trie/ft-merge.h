@@ -1846,6 +1846,23 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 	struct ft_detach_run srun = { .into = NULL, .armed = false };
 	struct ft_detach_run *srunp = NULL;
 	size_t src_max, nm, dm;
+	/*
+	 * MW LOCK_FINE drop: the "failure-free" commit below is only unfailable
+	 * under the FT-wide lock -- under the drop its MCAS commit (GLUE) or its
+	 * recompact prepare (NOSPLIT) can conflict with a peer and fail AFTER
+	 * @ft_merge_unlink_src_subtree already excised the source subtree.  That
+	 * unlink PRESERVES @payload (owned by this op, src pristine-empty), so
+	 * the whole dst-side attach (re-descend -> build -> commit) is a
+	 * retryable one-shot: @already_unlinked guards the src-side excise + the
+	 * ordered-list run capture so a retry re-runs only the dst attach, and
+	 * @glue.fence_split_cn fences the compressed divergence node (as
+	 * cds_ft_graft) so a concurrent grow of it is arbitrated (fence miss ->
+	 * FT_GRAFT_PREP_RETRY -> re-descend).  Mirrors cds_ft_graft's post-swap
+	 * store retry.
+	 */
+	bool already_unlinked = false;
+	struct ft_flip_txn *run_unlink_txn = NULL;
+	struct ft_flip_txn *run_splice_txn = NULL;
 
 	*handled = false;
 
@@ -1858,7 +1875,14 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 	 * Either way the source unlink is the single last fallible step, so an OOM
 	 * leaves both tries pristine -- no rollback, no leak.
 	 */
+retry_merge:
 	ft_glue_init(&glue);
+	/*
+	 * Fence the compressed divergence node (like cds_ft_graft), so a
+	 * concurrent grow of it is arbitrated and the build re-descends on a
+	 * miss (FT_GRAFT_PREP_RETRY); ft_glue_init reset it, so set each attempt.
+	 */
+	glue.fence_split_cn = true;
 	memset(&reserve, 0, sizeof(reserve));
 	/*
 	 * Every attach shape -- GLUE diverge and the NOSPLIT in-place store --
@@ -1877,19 +1901,38 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 		if (glue.txn)
 			ft_flip_txn_destroy(glue.txn);
 		ft_glue_fini(&glue);
+		if (already_unlinked)
+			goto retry_merge;	/* src consumed: OOM is transient */
 		return CDS_FT_STATUS_MEMORY_ERROR;
 	}
 	glue.fuse_free_list = true;	/* reserved free-list headroom above (§4.B) */
 	prep = ft_graft_build(dst_ft, okey_dst, dst_key_len, payload, cnt_src,
 			&d, &glue);
 	*handled = true;
+	if (prep == FT_GRAFT_PREP_RETRY) {
+		/*
+		 * Compressed-divergence @cn fence miss: a peer owns @cn.  Nothing
+		 * built; a clean re-descend (pre-unlink both tries pristine, post-
+		 * unlink src is empty + @payload owned).
+		 */
+		ft_glue_abort(dst_ft, &glue);
+		ft_flip_txn_destroy(glue.txn);
+		goto retry_merge;
+	}
 	if (prep == FT_GRAFT_PREP_OOM) {
 		ft_glue_abort(dst_ft, &glue);
 		ft_flip_txn_destroy(glue.txn);
+		if (already_unlinked)
+			goto retry_merge;	/* src consumed: OOM is transient */
 		return CDS_FT_STATUS_MEMORY_ERROR;	/* both tries pristine */
 	}
 	if (prep == FT_GRAFT_PREP_POPULATED) {
-		/* Defensive: cnt_dst == 0 should never yield an occupied point. */
+		/*
+		 * Defensive: cnt_dst == 0 should never yield an occupied point.
+		 * Impossible post-unlink (the payload is already excised + owned;
+		 * no clean rc remains) -- assert rather than orphan it.
+		 */
+		assert(!already_unlinked);
 		ft_flip_txn_destroy(glue.txn);
 		ft_glue_fini(&glue);
 		return CDS_FT_STATUS_POPULATED_ERROR;
@@ -1913,126 +1956,148 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 		 */
 		if (ft_bulk_node_reserve_fill(dst_ft, &reserve)) {
 			cds_ft_alloc_reserve_drain(dst_ft, &reserve);
+			ft_glue_abort(dst_ft, &glue);
 			ft_flip_txn_destroy(glue.txn);
-			ft_glue_fini(&glue);
+			if (already_unlinked)
+				goto retry_merge;	/* src consumed: transient */
 			return CDS_FT_STATUS_MEMORY_ERROR;
 		}
 	}
 	/* GLUE: cluster built invisibly.  NOSPLIT: reserve secured (+ glue.txn). */
 
 	/*
-	 * Ordered list: locate the dst splice neighbours while dst is still
-	 * payload-free, and capture the source subtree's run endpoints + cells
-	 * while the subtree is still intact in src.
+	 * Graft-parity (cds_ft_graft hoists the same test pre-swap): an exact-
+	 * depth OCCUPIED NOSPLIT point is a PERMANENT POPULATED condition.  Catch
+	 * it HERE, on the FIRST pass BEFORE the irreversible source unlink, so a
+	 * misusing (non-disjoint) caller gets a clean POPULATED_ERROR with BOTH
+	 * tries pristine -- rather than reaching the post-unlink store, asserting,
+	 * and stranding @payload.  For the supported absent/diverged dst point
+	 * (d.nf == NULL at key_len -- the only shape this helper is dispatched for)
+	 * this is dead code.  A retry (post-unlink) cannot newly occupy the point
+	 * under the disjoint exclusive-src contract, so the store's own POPULATED
+	 * discrimination (below) stays a dead assert there too.
+	 */
+	if (!already_unlinked && prep == FT_GRAFT_PREP_NOSPLIT
+			&& d.depth == dst_key_len && d.nf) {
+		cds_ft_alloc_reserve_drain(dst_ft, &reserve);
+		ft_glue_abort(dst_ft, &glue);
+		ft_flip_txn_destroy(glue.txn);
+		return CDS_FT_STATUS_POPULATED_ERROR;
+	}
+
+	/*
+	 * Ordered list: locate the dst splice neighbours (RE-FOUND each attempt --
+	 * dst may have grown across a retry) and, on the FIRST attempt only,
+	 * capture the source subtree's run endpoints + cells while the subtree is
+	 * still intact in src.  @run_first / @run_last / @s_first / @s_last persist
+	 * across retries: the run is excised ONCE by the unlink below and then
+	 * owned (out of both lists), so a retry re-splices the same owned run.
 	 */
 	if (ms_ord) {
 		ft_ord_cell_find_splice_pos(dst_ft, dst_key, dst_key_len,
 			&pred, &succ);
-		s_first = ft_subtree_minmax_head(src_ft, payload, false);
-		s_last = ft_subtree_minmax_head(src_ft, payload, true);
-		run_first = ft_ord_cell_ptr(rcu_dereference(s_first->prev));
-		run_last = ft_ord_cell_ptr(rcu_dereference(s_last->prev));
+		if (!already_unlinked) {
+			s_first = ft_subtree_minmax_head(src_ft, payload, false);
+			s_last = ft_subtree_minmax_head(src_ft, payload, true);
+			run_first = ft_ord_cell_ptr(rcu_dereference(s_first->prev));
+			run_last = ft_ord_cell_ptr(rcu_dereference(s_last->prev));
+			/* Src side: EXCISE-ONLY run so the structural unlink and the
+			 * run's removal from src's ordered list commit in ONE flip
+			 * (the disappear-side cross-view fix). */
+			srun.rfirst = s_first;
+			srun.rlast = s_last;
+			srunp = &srun;
+		}
 		mrun.run_first = run_first;
 		mrun.run_last = run_last;
 		mrun.pred = pred;
 		mrun.succ = succ;
 		mrun.armed = false;
 		run_arg = &mrun;
-		/* Src side: EXCISE-ONLY run so the structural unlink and the run's
-		 * removal from src's ordered list commit in ONE flip (the
-		 * disappear-side cross-view fix). */
-		srun.rfirst = s_first;
-		srun.rlast = s_last;
-		srunp = &srun;
 	}
 
 	/*
-	 * Pre-reserve the standalone run-unlink txn before the fallible unlink:
-	 * the rare unfused shape removes the src run from src's list AFTER the
-	 * structural unlink is public (un-abortable).  OOM here aborts the still-
-	 * invisible build (both tries pristine).  Reserve only when ms_ord.
+	 * Source-side excise (ONE-SHOT, @already_unlinked): reserve the run txns,
+	 * unlink the source subtree in place (preserving @payload), remove the run
+	 * from src's list, drain src readers, and stamp an external payload's edge
+	 * byte.  A retry after a post-unlink commit abort skips all of this -- src
+	 * is already empty and @payload is owned -- and re-runs only the dst attach.
 	 */
-	struct ft_flip_txn *run_unlink_txn = NULL;
-	/*
-	 * Pre-reserve the standalone dst run-splice txn too: the rare unfused
-	 * attach shape splices the moved run into dst's list AFTER the structural
-	 * attach is public (un-abortable).  Reserved only when ms_ord; consumed by
-	 * the standalone splice or freed-unused when fused (the common case).
-	 */
-	struct ft_flip_txn *run_splice_txn = NULL;
+	if (!already_unlinked) {
+		if (ms_ord) {
+			/*
+			 * Pre-reserve the standalone run-unlink + run-splice txns (the
+			 * rare unfused shapes touch src's / dst's list AFTER the
+			 * structural flip is public, un-abortable).  OOM here aborts the
+			 * still-invisible build (both tries pristine).
+			 */
+			run_unlink_txn = ft_flip_txn_create_bounded(
+				FT_ORD_CELL_RUN_UNLINK_MAX_EDGES);
+			run_splice_txn = ft_flip_txn_create_bounded(
+				FT_ORD_CELL_RUN_SPLICE_MAX_EDGES);
+			if (!run_unlink_txn || !run_splice_txn) {
+				if (run_unlink_txn)
+					ft_flip_txn_destroy(run_unlink_txn);
+				if (run_splice_txn)
+					ft_flip_txn_destroy(run_splice_txn);
+				run_unlink_txn = run_splice_txn = NULL;
+				cds_ft_alloc_reserve_drain(dst_ft, &reserve);
+				ft_glue_abort(dst_ft, &glue);
+				ft_flip_txn_destroy(glue.txn);
+				return CDS_FT_STATUS_MEMORY_ERROR;
+			}
+		}
 
-	if (ms_ord) {
-		run_unlink_txn = ft_flip_txn_create_bounded(
-			FT_ORD_CELL_RUN_UNLINK_MAX_EDGES);
-		run_splice_txn = ft_flip_txn_create_bounded(
-			FT_ORD_CELL_RUN_SPLICE_MAX_EDGES);
-		if (!run_unlink_txn || !run_splice_txn) {
+		/*
+		 * Last fallible SRC step: unlink the source subtree in place,
+		 * preserving @payload.  On OOM the unlink self-undoes (src pristine)
+		 * and the still-invisible cluster / reserve is released -- no rollback.
+		 */
+		if (ft_merge_unlink_src_subtree(src_ft, okey_src, src_key_len,
+				cnt_src, srunp, /*retire_glue=*/ NULL) < 0) {
 			if (run_unlink_txn)
 				ft_flip_txn_destroy(run_unlink_txn);
 			if (run_splice_txn)
 				ft_flip_txn_destroy(run_splice_txn);
+			run_unlink_txn = run_splice_txn = NULL;
 			cds_ft_alloc_reserve_drain(dst_ft, &reserve);
 			ft_glue_abort(dst_ft, &glue);
 			ft_flip_txn_destroy(glue.txn);
 			return CDS_FT_STATUS_MEMORY_ERROR;
 		}
-	}
+		already_unlinked = true;	/* POINT OF NO RETURN: @payload owned */
 
-	/*
-	 * Last fallible step: unlink the source subtree in place, preserving
-	 * @payload.  On OOM the unlink self-undoes (src pristine) and the still-
-	 * invisible cluster / reserve is released (dst pristine) -- no rollback.
-	 */
-	if (ft_merge_unlink_src_subtree(src_ft, okey_src, src_key_len,
-			cnt_src, srunp, /*retire_glue=*/ NULL) < 0) {
-		if (run_unlink_txn)
+		/*
+		 * Remove the source run from src's ordered list (cells keep their
+		 * internal links for the dst splice) -- BEFORE the drain, so sync
+		 * drains src ord-readers of the run too.  The structural unlink FUSED
+		 * this into its flip (@srun.armed); the standalone remains a fallback.
+		 */
+		if (ms_ord && !srun.armed) {
+			ft_ord_cell_run_unlink(src_ft, run_unlink_txn, s_first,
+				s_last);
+			run_unlink_txn = NULL;	/* consumed */
+		}
+		if (run_unlink_txn) {
 			ft_flip_txn_destroy(run_unlink_txn);
-		if (run_splice_txn)
-			ft_flip_txn_destroy(run_splice_txn);
-		cds_ft_alloc_reserve_drain(dst_ft, &reserve);
-		ft_glue_abort(dst_ft, &glue);
-		ft_flip_txn_destroy(glue.txn);
-		return CDS_FT_STATUS_MEMORY_ERROR;
+			run_unlink_txn = NULL;
+		}
+
+		if (!src_ft->exclusive)
+			ft_writer_lock_gp_wait(src_ft);
+
+		/*
+		 * An EXTERNAL payload's edge byte changes (src_key's last byte ->
+		 * dst_key's); stamp it in the head's CELL metadata now -- the cell is
+		 * in NEITHER list and structurally invisible, so no reader rebuilds a
+		 * key from it (stamping while still in src's list would let a src
+		 * reader rematerialize an out-of-namespace key).  Internal/compressed
+		 * payloads keep every leaf's edge byte (the subtree moves wholesale).
+		 */
+		if (ms_ord && ft_node_external(payload))
+			cds_ft_item_to_metadata(run_first)->incoming_byte =
+				okey_dst[dst_key_len - 1];
 	}
-
-	/* ===== Everything from here on is failure-free. ===== */
-
-	/*
-	 * Remove the source run from src's ordered list (the cells keep their
-	 * internal links for the splice into dst below) -- BEFORE the drain, so sync
-	 * drains src ord-readers of the run too.  The structural unlink above FUSED
-	 * this into its flip (@srun.armed), so a src reader never sees the run gone
-	 * from the structure but still in the list; the standalone two-commit unlink
-	 * remains as a defensive fallback for any unfused unlink shape.
-	 */
-	if (ms_ord && !srun.armed) {
-		ft_ord_cell_run_unlink(src_ft, run_unlink_txn, s_first, s_last);
-		run_unlink_txn = NULL;	/* consumed */
-	}
-	/* Reserved but unused: the structural unlink already fused the run. */
-	if (run_unlink_txn)
-		ft_flip_txn_destroy(run_unlink_txn);
-
-	if (!src_ft->exclusive)
-		ft_writer_lock_gp_wait(src_ft);
-
-	/*
-	 * An EXTERNAL payload is re-parented directly under a new internal slot, so
-	 * its edge byte changes (src_key's last byte -> dst_key's).  That byte lives
-	 * in the head's CELL metadata (ft_rebuild_key_upwalk reads it for the
-	 * ordered key rebuild) and ft_set_parent does NOT maintain it for externals.
-	 * Stamp it HERE -- AFTER the run leaves src's list (run_unlink) and the sync
-	 * drains any src reader mid-run, but BEFORE the store FUSES the run-splice
-	 * and publishes the cell into dst: the cell is in NEITHER list and
-	 * structurally invisible, so no reader rebuilds a key from it during the
-	 * stamp.  Stamping it at capture (while still in src's list) would let a src
-	 * reader rematerialize an out-of-namespace key -- a cross-view escape.  An
-	 * internal / compressed payload keeps every leaf's edge byte (the subtree
-	 * moves wholesale), so no per-leaf fix-up is needed.
-	 */
-	if (ms_ord && ft_node_external(payload))
-		cds_ft_item_to_metadata(run_first)->incoming_byte =
-			okey_dst[dst_key_len - 1];
 
 	if (prep == FT_GRAFT_PREP_GLUE) {
 		/*
@@ -2049,17 +2114,36 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 		 * @glue.publish_parent's subtree by +cnt_src; record that walk
 		 * into the same commit (a no-op when rank stats off).
 		 */
+		enum urcu_txn_status cst;
+
 		glue.count_delta = (long) cnt_src;
-		ft_glue_txn_commit(dst_ft, &glue, run_arg);
+		cst = ft_glue_txn_commit(dst_ft, &glue, run_arg);
+		if (cst != URCU_TXN_STATUS_OK) {
+			/*
+			 * MW LOCK_FINE drop: the GLUE commit's MCAS footprint (the
+			 * forward publish + fused run-splice + fenced retires) can
+			 * conflict with a peer and ABORT even though it allocates
+			 * nothing.  The flip rolled back (dst byte-for-byte unchanged,
+			 * the run-splice not applied); ft_glue_txn_commit consumed
+			 * glue.txn.  Free the failed attempt's invisible cluster and
+			 * re-attach the owned @payload via the retry.  @run_splice_txn
+			 * / @run_first / @run_last persist (src already excised).
+			 */
+			ft_glue_abort(dst_ft, &glue);
+			goto retry_merge;
+		}
 		attached_nf = glue.attached_nf;
 		ft_glue_free_old(dst_ft, &glue);
 		ft_glue_fini(&glue);
 	} else {
 		/*
-		 * NOSPLIT: graft the in-place payload at @d.  Every node allocation
-		 * draws from the reserve and the slot proxy + run-splice edges draw
-		 * from the pre-reserved @glue.txn, so the store has no fallible step
-		 * left -- it cannot fail.
+		 * NOSPLIT: graft the in-place payload at @d.  Node allocations draw
+		 * from the reserve and the slot proxy + run-splice edges from the
+		 * pre-reserved @glue.txn.  Under the drop the store's recompact of
+		 * the (contended) spine can still FAIL its prepare -- ft_store_at_
+		 * graft_point returns -EAGAIN / MEMORY_ERROR (not the FT-wide-lock
+		 * "cannot fail") -- after the source is already excised; re-attach
+		 * the owned @payload via the retry.
 		 */
 		unsigned int adepth = 0;
 		enum cds_ft_status st;
@@ -2070,9 +2154,31 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 				run_arg,
 				(long) cnt_src);
 		cds_ft_alloc_reserve_deactivate(dst_ft);
-		assert(st == CDS_FT_STATUS_OK);
-		(void) st;
 		cds_ft_alloc_reserve_drain(dst_ft, &reserve);
+		if (st != CDS_FT_STATUS_OK) {
+			/*
+			 * ft_store_at_graft_point already freed its invisible build +
+			 * txn (and, on a commit abort, the relocated copy) and cleaned
+			 * up @glue.  Discriminate the failure class:
+			 *
+			 * - POPULATED is a PERMANENT occupied-point condition, NOT a
+			 *   transient conflict -- retrying it would LIVELOCK and strand
+			 *   the owned @payload.  Post-unlink it is impossible for the
+			 *   supported disjoint exclusive-src contract (no peer creates
+			 *   the moved key), so assert as the pre-unlink PREP_POPULATED
+			 *   arm and the graft post-swap store both do; a general
+			 *   (non-disjoint) caller needs the fused src-retire+dst-store
+			 *   txn (the same open limitation as cds_ft_graft).
+			 * - Everything else (MEMORY_ERROR / -EAGAIN: the drop's
+			 *   recompact-can't-lock or MCAS commit-abort) is transient --
+			 *   re-descend and re-attach the owned @payload.
+			 */
+			if (st == CDS_FT_STATUS_POPULATED_ERROR) {
+				assert(!already_unlinked);
+				return CDS_FT_STATUS_POPULATED_ERROR;
+			}
+			goto retry_merge;
+		}
 		ft_glue_fini(&glue);
 	}
 

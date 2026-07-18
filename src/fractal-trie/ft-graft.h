@@ -857,13 +857,45 @@ enum cds_ft_status ft_store_at_graft_point(struct cds_ft *ft,
 {
 	struct ft_graft_store_state st;
 	enum cds_ft_status status;
+	enum urcu_txn_status cst;
 
 	status = ft_store_at_graft_point_prepare(ft, key, key_len, d,
 			graft_payload, graft_external_count, glue, &st);
-	if (status != CDS_FT_STATUS_OK)
+	if (status != CDS_FT_STATUS_OK) {
+		/*
+		 * MW LOCK_FINE drop: prepare can FAIL (the recompact of the
+		 * contended spine could not lock/reserve -- -EAGAIN / MEMORY_ERROR),
+		 * unlike the FT-wide-lock "cannot fail".  Nothing is committed and
+		 * @glue->txn is still alive; free the invisible build + txn so the
+		 * caller (cds_ft_merge_at's post-unlink retry) only needs to
+		 * re-descend.  (cds_ft_graft drives prepare / commit separately and
+		 * does its own cleanup; only cds_ft_merge_at calls this combined
+		 * wrapper.)
+		 */
+		ft_glue_abort(ft, glue);
+		if (glue->txn)
+			ft_flip_txn_destroy(glue->txn);
 		return status;
-	ft_store_at_graft_point_commit(ft, attached_nf, attached_depth, run,
-			&st, count_delta);
+	}
+	cst = ft_store_at_graft_point_commit(ft, attached_nf, attached_depth,
+			run, &st, count_delta);
+	if (cst != URCU_TXN_STATUS_OK) {
+		/*
+		 * Drop: the store commit's MCAS footprint conflicted with a peer and
+		 * ABORTED (@glue->txn consumed by the commit; the retire rolled back,
+		 * the OLD nodes stay LIVE -- reclaimed by whoever finally commits).
+		 * Free this attempt's UNPUBLISHED new nodes: the glue cluster (every
+		 * fresh node ft_glue_track'd) plus -- if the reserve RELOCATED the
+		 * attach node -- the unpublished relocated copy @st.dest (allocated
+		 * directly by ft_node_recompact, NOT glue-tracked; an in-place
+		 * recompact leaves @st.dest == the LIVE d->pnf, do NOT free).  Signal
+		 * the caller to re-descend + retry.
+		 */
+		ft_glue_abort(ft, glue);
+		if (st.old_recompacted_node)
+			free_cds_ft_node_unpublished(ft, ft_node_ptr(st.dest));
+		return CDS_FT_STATUS_MEMORY_ERROR;
+	}
 	return CDS_FT_STATUS_OK;
 }
 
