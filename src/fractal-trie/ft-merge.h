@@ -2166,9 +2166,17 @@ retry_merge:
 			 *   the owned @payload.  Post-unlink it is impossible for the
 			 *   supported disjoint exclusive-src contract (no peer creates
 			 *   the moved key), so assert as the pre-unlink PREP_POPULATED
-			 *   arm and the graft post-swap store both do; a general
-			 *   (non-disjoint) caller needs the fused src-retire+dst-store
-			 *   txn (the same open limitation as cds_ft_graft).
+			 *   arm does.  A general (non-disjoint) caller -- a peer racing
+			 *   the moved key into the target during the owned-but-unattached
+			 *   window -- would still orphan @payload here: this retry-based
+			 *   recovery excises the source BEFORE the dst attach, so the
+			 *   window exists.  cds_ft_graft no longer has it: its exclusive
+			 *   src-swap-fused arm lands the src retire ATOMICALLY with the
+			 *   attach (only on commit success), so the same race MCAS-aborts,
+			 *   retries, and re-detects POPULATED pre-commit with the source
+			 *   never swapped.  Closing this gap for the sub-position move --
+			 *   fusing ft_merge_unlink_src_subtree into the attach flip -- is a
+			 *   deferred parity follow-up (not needed for any disjoint use).
 			 * - Everything else (MEMORY_ERROR / -EAGAIN: the drop's
 			 *   recompact-can't-lock or MCAS commit-abort) is transient --
 			 *   re-descend and re-attach the owned @payload.
