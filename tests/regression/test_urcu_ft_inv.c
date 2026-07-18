@@ -66,7 +66,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS	62
+#define NR_TESTS	63
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -1581,10 +1581,21 @@ static struct cds_ft *create_varlen_fine_lock_ft(struct cds_ft_group **group_out
 #define MW_XT_PREFIXES		64	/* shared prefix byte p in [0, this) */
 #define MW_XT_SUFFIXES		4	/* keys grafted per prefix */
 
+/*
+ * @attach_mode selects how each {p,w} subtree is attached into the shared dst:
+ *   MW_XT_ATTACH_GRAFT  cds_ft_graft (whole exclusive src at {p,w});
+ *   MW_XT_ATTACH_MERGE_SUBPOS  cds_ft_merge_at moving a src SUB-position
+ *     (src keys {0,s}, src_key {0}) to {p,w} -- exercises the unfenced
+ *     ft_merge_graft_subpos_inplace path under the LOCK_FINE drop.
+ * Both yield the same dst keys {p,w,s}, so the verification is identical.
+ */
+#define MW_XT_ATTACH_GRAFT		0
+#define MW_XT_ATTACH_MERGE_SUBPOS	2
 struct mw_xt_arg {
 	struct cds_ft *ft;			/* the shared LIVE dst */
 	struct cds_ft_group *group;
 	unsigned int w;				/* writer id (middle key byte) */
+	int attach_mode;			/* MW_XT_ATTACH_* */
 	uint8_t present[MW_XT_PREFIXES];	/* 1 = {p,w,*} currently grafted */
 	struct ft_test_node *node[MW_XT_PREFIXES][MW_XT_SUFFIXES];
 	unsigned long ops;
@@ -1612,11 +1623,21 @@ static void *mw_xt_writer(void *arg)
 		if (!x->present[p]) {
 			struct cds_ft *src;
 
-			/* Build a private source holding the S suffix keys. */
+			bool subpos =
+				x->attach_mode == MW_XT_ATTACH_MERGE_SUBPOS;
+			enum cds_ft_status attach_st;
+
+			/*
+			 * Build a private source.  GRAFT: 1-byte keys {s} moved
+			 * wholesale.  MERGE_SUBPOS: 2-byte keys {0,s} so the merge
+			 * moves the {0} SUB-position (src_key {0}) -- both land as
+			 * {p,w,s} in dst.
+			 */
 			if (cds_ft_create(x->group, NULL, &src) < 0)
 				abort();
 			for (s = 0; s < MW_XT_SUFFIXES; s++) {
 				uint8_t suffix[1] = { (uint8_t) s };
+				uint8_t sub_suffix[2] = { 0, (uint8_t) s };
 				uint8_t full[3] = { (uint8_t) p,
 					(uint8_t) x->w, (uint8_t) s };
 				struct ft_test_node *n = node_alloc(
@@ -1624,7 +1645,9 @@ static void *mw_xt_writer(void *arg)
 					| ((uint64_t) x->w << 8) | s);
 
 				memcpy(n->okey, full, 3);
-				if (cds_ft_insert(src, suffix, 1, &n->node)
+				if (cds_ft_insert(src,
+						subpos ? sub_suffix : suffix,
+						subpos ? 2 : 1, &n->node)
 						!= CDS_FT_STATUS_OK)
 					abort();
 				x->node[p][s] = n;
@@ -1637,8 +1660,15 @@ static void *mw_xt_writer(void *arg)
 			 * arbitrate the attach.
 			 */
 			cds_ft_make_exclusive(src);
-			if (cds_ft_graft(x->ft, prefix, 2, src)
-					!= CDS_FT_STATUS_OK) {
+			if (subpos) {
+				uint8_t src_sub[1] = { 0 };
+
+				attach_st = cds_ft_merge_at(x->ft, prefix, 2,
+					src, src_sub, 1);
+			} else {
+				attach_st = cds_ft_graft(x->ft, prefix, 2, src);
+			}
+			if (attach_st != CDS_FT_STATUS_OK) {
 				/*
 				 * {p,w} is this writer's own and was absent =>
 				 * empty => the graft MUST succeed.  A failure
@@ -1708,7 +1738,7 @@ out:
  * grafted key lost (resolves to the owning writer's node), count_keys equals
  * the live total, and cds_ft_verify reports no leaked COPYING fence.
  */
-static int inv_concurrent_crosstrie_fine_lock(void)
+static int mw_xt_oracle(const char *tname, int attach_mode)
 {
 	struct cds_ft_group *group;
 	struct cds_ft *ft;
@@ -1721,8 +1751,9 @@ static int inv_concurrent_crosstrie_fine_lock(void)
 	int ret = 0;
 
 	if (!getenv("FT_INV_MW")) {
-		fprintf(stderr, "# inv_concurrent_crosstrie_fine_lock: skipped "
-			"(set FT_INV_MW=1 to run the cross-trie writer oracle)\n");
+		fprintf(stderr, "# %s: skipped "
+			"(set FT_INV_MW=1 to run the cross-trie writer oracle)\n",
+			tname);
 		return 0;
 	}
 	mw_install_fatal_handler();
@@ -1739,6 +1770,7 @@ static int inv_concurrent_crosstrie_fine_lock(void)
 		x[i].ft = ft;
 		x[i].group = group;
 		x[i].w = i;
+		x[i].attach_mode = attach_mode;
 	}
 
 	test_go = 0;
@@ -1803,8 +1835,8 @@ static int inv_concurrent_crosstrie_fine_lock(void)
 	rcu_read_unlock();
 	cds_ft_iter_destroy(iter);
 
-	fprintf(stderr, "# inv_concurrent_crosstrie_fine_lock: %d writers, %lu "
-		"ops, %lu live keys\n", MW_XT_NR_WRITERS, total_ops, live);
+	fprintf(stderr, "# %s: %d writers, %lu ops, %lu live keys\n",
+		tname, MW_XT_NR_WRITERS, total_ops, live);
 
 	free(x);
 	if (drain_and_destroy(ft, group) < 0)
@@ -1812,6 +1844,25 @@ static int inv_concurrent_crosstrie_fine_lock(void)
 	if (leak_check() < 0)
 		ret = -1;
 	return ret;
+}
+
+/* 16 writers graft an exclusive src into one shared live dst at {p,w}. */
+static int inv_concurrent_crosstrie_fine_lock(void)
+{
+	return mw_xt_oracle("inv_concurrent_crosstrie_fine_lock",
+		MW_XT_ATTACH_GRAFT);
+}
+
+/*
+ * As above but the attach is a cds_ft_merge_at moving a src SUB-position
+ * (src_key {0}) -- the ft_merge_graft_subpos_inplace path -- so it exercises
+ * the merge build -> unlink -> commit under the LOCK_FINE drop (fence cn +
+ * commit-abort retry), which cds_ft_graft's whole-source delegate does not.
+ */
+static int inv_concurrent_crosstrie_merge_fine_lock(void)
+{
+	return mw_xt_oracle("inv_concurrent_crosstrie_merge_fine_lock",
+		MW_XT_ATTACH_MERGE_SUBPOS);
 }
 
 /* ================================================================== */
@@ -11622,6 +11673,7 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_concurrent_writers_coarse_lock);
 	RUN_TEST(inv_concurrent_writers_fine_lock);
 	RUN_TEST(inv_concurrent_crosstrie_fine_lock);
+	RUN_TEST(inv_concurrent_crosstrie_merge_fine_lock);
 	RUN_TEST(inv_bind_resume_order);
 	RUN_TEST(inv_ordered_bulk_consistency);
 	RUN_TEST(inv_compact_keycopy_terminates);
