@@ -1235,6 +1235,20 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		 */
 		bool already_swapped = false;
 		/*
+		 * MW LOCK_FINE drop, FUSED cross-trie move (doc follow-up b): for an
+		 * EXCLUSIVE src (no readers -> no jump-out drain), the src-root retire
+		 * is recorded INTO @glue.txn instead of a separate pre-commit flip, so
+		 * the src unlink AND the dst attach commit as ONE atomic flip -- no
+		 * orphan window, and a commit ABORT rolls BOTH back (src still full),
+		 * making the retry a clean whole-op re-descend (identical to a pre-swap
+		 * failure) with no owned-payload bookkeeping.  @already_swapped is left
+		 * FALSE until that fused commit SUCCEEDS (set post-commit), so the
+		 * existing @already_swapped-guarded cleanup handles the abort.  A
+		 * non-exclusive src still needs the unlink -> drain -> attach ordering,
+		 * so it keeps the separate swap (@already_swapped set at the swap).
+		 */
+		bool src_swap_fused = false;
+		/*
 		 * Self-secured NOSPLIT attach: when no caller reserve is active, this
 		 * graft reserves its own commit nodes before publishing the empty
 		 * source root, so the post-publish store cannot fail and needs no
@@ -1346,6 +1360,8 @@ retry_attach:
 			if (!glue.txn || !ft_flip_txn_reserve(glue.txn,
 					/* + FLOOR_FREE: fused free-list tombstones (§4.B) */
 					FT_GLUE_FLOOR_DEFERRED + 7 + 1 /* +1 §4.B parent guard */ + FT_GLUE_FLOOR_FREE
+					/* +1 fused src-root retire edge (exclusive src, follow-up b) */
+					+ (src_ft->exclusive ? 1 : 0)
 					/* + count walk: the +src_count nr_keys ancestor edges (BULK fold) */
 					+ (dst_ft->rank_stats ? (int) key_len + 1 : 0))) {
 				if (glue.txn)
@@ -1772,7 +1788,25 @@ retry_attach:
 			 * failure mode (OOM / populated) returned above, before this
 			 * retire.
 			 */
-			if (dst_ft->group->ordered_list_set) {
+			if (src_ft->exclusive && !dst_ft->group->ordered_list_set
+					&& !nil_key_root) {
+				/*
+				 * FUSED cross-trie move (exclusive src, list off, non-nil
+				 * root): record the src-root retire INTO @glue.txn instead of
+				 * a separate flip, so the src unlink flips ATOMICALLY with the
+				 * dst attach below -- no orphan window, no drain (no readers).
+				 * @already_swapped stays FALSE until that commit succeeds (set
+				 * post-commit), so a commit abort rolls this src edge back too
+				 * and the retry re-descends with src still full (clean, like a
+				 * pre-swap failure).  Non-nil: @old_src_root IS the payload,
+				 * moved LIVE into dst -- no tombstone.
+				 */
+				ft_flip_txn_record_reserved(glue.txn,
+					(void **) &src_ft->root,
+					(void *) old_src_root,
+					(void *) ft_node_flag(fresh_node, 0));
+				src_swap_fused = true;
+			} else if (dst_ft->group->ordered_list_set) {
 				graft_run_first = ft_ord_first(src_ft);
 				graft_run_last = ft_ord_last(src_ft);
 				/*
@@ -1807,12 +1841,19 @@ retry_attach:
 				ft_root_edge_flip(src_ft, &src_ft->root,
 					old_src_root, ft_node_flag(fresh_node, 0));
 			}
-			FT_TP(root_publish, (const void *) src_ft,
-				(const void *) src_ft->root);
-
-			already_swapped = true;
-			fresh_node = NULL;	/* now src's live root: never freed below */
-			src_retire_txn = NULL;	/* consumed by the swap above */
+			if (!src_swap_fused) {
+				/*
+				 * Separate swap committed: src is now empty + the payload
+				 * owned.  The FUSED arm defers all of this to its atomic
+				 * commit (below) -- src->root is unchanged here, so it keeps
+				 * @already_swapped false and @fresh_node live until then.
+				 */
+				FT_TP(root_publish, (const void *) src_ft,
+					(const void *) src_ft->root);
+				already_swapped = true;
+				fresh_node = NULL;	/* now src's live root: never freed below */
+				src_retire_txn = NULL;	/* consumed by the swap above */
+			}
 		}
 
 		/*
@@ -1910,6 +1951,23 @@ retry_attach:
 		}
 
 		/*
+		 * FUSED cross-trie move: the src-root retire rode @glue.txn, so a
+		 * SUCCESSFUL commit atomically emptied src (its new root is @fresh_node)
+		 * AND published the payload into dst -- no orphan window.  Only NOW is
+		 * the swap done: mark it so the abort handling and any teardown treat
+		 * src as consumed, and stop guarding @fresh_node (it is src's LIVE
+		 * root).  A FAILED commit rolled the src-root edge back too, so
+		 * @already_swapped stays false and the store-abort retry below
+		 * re-descends with src still full -- a clean pre-swap-style re-attempt.
+		 */
+		if (store_cst == URCU_TXN_STATUS_OK && src_swap_fused) {
+			already_swapped = true;
+			fresh_node = NULL;
+			FT_TP(root_publish, (const void *) src_ft,
+				(const void *) src_ft->root);
+		}
+
+		/*
 		 * Post-swap store ABORT (§11 drop, doc ft-graft-abort-safe-poststore-
 		 * retry): under the FT-wide-lock drop the attach commit can conflict
 		 * with a peer beyond the single word the pre-swap fence covers and
@@ -1945,15 +2003,22 @@ retry_attach:
 			 * prepare re-fills @st (and re-sets @nosplit_prepared) from
 			 * scratch; the run-splice fallback txn (list on) was created
 			 * one-shot but never consumed (the run fused into glue.txn), so
-			 * drop it -- a retry stays fused and needs none.  @already_swapped
-			 * / @fresh_node / @src_retire_txn are the one-shot src state, held
-			 * across the retry by the swap guard above.
+			 * drop it -- a retry stays fused and needs none.  For the SEPARATE
+			 * swap (@already_swapped) @fresh_node / @src_retire_txn are the
+			 * one-shot src state, held across the retry by the swap guard.
+			 * For the FUSED move the abort rolled the src-root edge back too,
+			 * so @already_swapped stayed FALSE and @fresh_node is this
+			 * attempt's UNPUBLISHED empty root -- free it (the retry re-allocs
+			 * a fresh one at the loop top), exactly as the fallible-prefix
+			 * retries do; otherwise it leaks one arena node per aborted round.
 			 */
 			nosplit_prepared = false;
 			if (run_splice_txn) {
 				ft_flip_txn_destroy(run_splice_txn);
 				run_splice_txn = NULL;
 			}
+			if (!already_swapped)
+				free_cds_ft_node_unpublished(src_ft, fresh_node);
 			goto retry_attach;
 		}
 
