@@ -681,6 +681,27 @@ bool urcu_txn_sw_reserve(struct urcu_txn_sw_txn *t, unsigned int cap)
 	return true;
 }
 
+/*
+ * True when the NEXT record() on @t appends into capacity the handle already
+ * owns, and so cannot fail: no realloc, no group-block alloc, no path to
+ * URCU_TXN_SW_OOM.  A reserve() that covered the bracket's edge bound is the
+ * deliberate way to make this hold, but it is not the only one -- record()
+ * grows on demand to URCU_TXN_SW_CAP, so an unreserved handle satisfies this
+ * too until that first capacity is used up.  Capacity is what matters, not
+ * which call supplied it.
+ *
+ * Sized for embedders that mutate state OUTSIDE the transaction as they record
+ * (e.g. <urcu/rcu-txn-sw-hlist.h>'s writer-only pprev, a plain store that no
+ * rollback can undo).  Such an embedder is only safe while a later record in
+ * the same bracket cannot fail behind it, and this is that question.  A handle
+ * already in URCU_TXN_SW_OOM answers false: it has no capacity to promise.
+ */
+static inline
+bool urcu_txn_sw_append_is_infallible(const struct urcu_txn_sw_txn *t)
+{
+	return t->state == URCU_TXN_SW_PREPARE && t->nr < t->cap;
+}
+
 /* Free the record array of a handle that never parked proxies (no grace
  * period).  Caller-owned (inline) storage is never freed by the engine. */
 static inline

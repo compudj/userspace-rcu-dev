@@ -12,9 +12,12 @@
  *     every structural op depends on;
  *   - edits COMPOSE on one bucket: adjacent deletes, a delete folded with an
  *     insert into the same gap, and a run of deletes all commit correctly in a
- *     single flip.  This is the read-your-own-writes path the _prepare forms
- *     gained; recording from raw neighbour reads instead publishes deleted
- *     nodes (see urcu_txn_sw_hlist_del_prepare()).
+ *     single flip.  Two mechanisms carry this, and check_pprev() is what would
+ *     catch either regressing: the forward slots are read through the engine's
+ *     read-your-own-writes load and chained, while pprev is plain-stored EAGERLY
+ *     so a later _prepare's raw read of it already sees the earlier edit.  Defer
+ *     that store and a composed delete re-points a slot inside an
+ *     already-unlinked node (see urcu_txn_sw_hlist_del_prepare()).
  *
  * QSBR flavor, single threaded, so the outcome is fully deterministic.
  */
@@ -36,7 +39,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS	18
+#define NR_TESTS	22
 
 struct hn {
 	struct urcu_txn_sw_hlist_node node;
@@ -271,9 +274,10 @@ static void test_compose_adjacent_del(void)
 	n3 = caa_container_of(e3, struct hn, node);
 
 	urcu_txn_sw_init(&t);
+	st = urcu_txn_sw_reserve(&t, 2);	/* up front: pprev stores do not roll back */
 	(void) urcu_txn_sw_hlist_del_prepare(&t, e2);
 	(void) urcu_txn_sw_hlist_del_prepare(&t, e3);	/* neighbour of e2 */
-	st = urcu_txn_sw_commit(&t) == URCU_TXN_STATUS_OK;
+	st = st && urcu_txn_sw_commit(&t) == URCU_TXN_STATUS_OK;
 	call_rcu(&n2->rcu_head, hn_free);
 	call_rcu(&n3->rcu_head, hn_free);
 
@@ -301,9 +305,10 @@ static void test_compose_del_and_add(void)
 	n2 = caa_container_of(e2, struct hn, node);
 
 	urcu_txn_sw_init(&t);
+	st = urcu_txn_sw_reserve(&t, 2);	/* up front: pprev stores do not roll back */
 	(void) urcu_txn_sw_hlist_del_prepare(&t, e2);
 	(void) urcu_txn_sw_hlist_add_after_prepare(&t, &hn_new(9)->node, e1);
-	st = urcu_txn_sw_commit(&t) == URCU_TXN_STATUS_OK;
+	st = st && urcu_txn_sw_commit(&t) == URCU_TXN_STATUS_OK;
 	call_rcu(&n2->rcu_head, hn_free);
 
 	n = collect_forward(&head, fwd, 3);
@@ -331,9 +336,10 @@ static void test_compose_triple_del(void)
 	}
 
 	urcu_txn_sw_init(&t);
+	st = urcu_txn_sw_reserve(&t, 3);	/* up front: pprev stores do not roll back */
 	for (i = 0; i < 3; i++)
 		(void) urcu_txn_sw_hlist_del_prepare(&t, e[i]);
-	st = urcu_txn_sw_commit(&t) == URCU_TXN_STATUS_OK;
+	st = st && urcu_txn_sw_commit(&t) == URCU_TXN_STATUS_OK;
 	for (i = 0; i < 3; i++)
 		call_rcu(&nn[i]->rcu_head, hn_free);
 
@@ -341,6 +347,82 @@ static void test_compose_triple_del(void)
 	ok(st && n == 2 && arr_eq(fwd, want, 2),
 		"compose triple del: forward is 1,5");
 	ok(check_pprev(&head), "compose triple del: pprev coherent");
+	destroy(&head);
+}
+
+/*
+ * Insert 9 after 1, then delete 1 -- in that ORDER, so the fresh node inherits
+ * &1->next as its naming slot and the very next op ghosts the node that slot
+ * lives in.  add_after must have plain-stored 2->pprev to &9->next (NOT left it
+ * at the doomed &1->next), and del(1) must then re-point head->first to the
+ * PENDING 9 rather than the committed 2.
+ *
+ * Note the division of labour between the two assertions: mis-storing 2->pprev
+ * leaves this bracket's FORWARD order intact (verified by injecting exactly that
+ * bug), so it is check_pprev() alone that catches it here.  The damage would
+ * otherwise stay latent until a later structural op followed the stale pprev
+ * into the ghosted node -- which is the whole reason the backward chain is
+ * asserted separately rather than inferred from a correct-looking walk.
+ */
+static void test_compose_add_then_del_host(void)
+{
+	struct urcu_txn_sw_hlist_head head = URCU_TXN_SW_HLIST_HEAD_INIT;
+	const int keys[3] = { 1, 2, 3 };
+	const int want[3] = { 9, 2, 3 };
+	struct urcu_txn_sw_hlist_node *e1;
+	struct hn *n1;
+	struct urcu_txn_sw_txn t;
+	int fwd[3], n, st;
+
+	build_seq(&head, keys, 3);
+	e1 = find_key(&head, 1);
+	n1 = caa_container_of(e1, struct hn, node);
+
+	urcu_txn_sw_init(&t);
+	st = urcu_txn_sw_reserve(&t, 2);	/* up front: pprev stores do not roll back */
+	(void) urcu_txn_sw_hlist_add_after_prepare(&t, &hn_new(9)->node, e1);
+	(void) urcu_txn_sw_hlist_del_prepare(&t, e1);	/* ghosts 9's naming slot's host */
+	st = st && urcu_txn_sw_commit(&t) == URCU_TXN_STATUS_OK;
+	call_rcu(&n1->rcu_head, hn_free);
+
+	n = collect_forward(&head, fwd, 3);
+	ok(st && n == 3 && arr_eq(fwd, want, 3),
+		"compose add_after then del its host: forward is 9,2,3");
+	ok(check_pprev(&head), "compose add_after then del its host: pprev coherent");
+	destroy(&head);
+}
+
+/*
+ * Delete the first node, then insert before its successor -- add_before reads
+ * 2->pprev RAW, so it sees &head->first only because del(1) eagerly stored it
+ * there.  A deferred store would leave &1->next and publish head->first == 1.
+ */
+static void test_compose_del_then_add_before(void)
+{
+	struct urcu_txn_sw_hlist_head head = URCU_TXN_SW_HLIST_HEAD_INIT;
+	const int keys[3] = { 1, 2, 3 };
+	const int want[3] = { 9, 2, 3 };
+	struct urcu_txn_sw_hlist_node *e1, *e2;
+	struct hn *n1;
+	struct urcu_txn_sw_txn t;
+	int fwd[3], n, st;
+
+	build_seq(&head, keys, 3);
+	e1 = find_key(&head, 1);
+	e2 = find_key(&head, 2);
+	n1 = caa_container_of(e1, struct hn, node);
+
+	urcu_txn_sw_init(&t);
+	st = urcu_txn_sw_reserve(&t, 2);	/* up front: pprev stores do not roll back */
+	(void) urcu_txn_sw_hlist_del_prepare(&t, e1);
+	(void) urcu_txn_sw_hlist_add_before_prepare(&t, &hn_new(9)->node, e2);
+	st = st && urcu_txn_sw_commit(&t) == URCU_TXN_STATUS_OK;
+	call_rcu(&n1->rcu_head, hn_free);
+
+	n = collect_forward(&head, fwd, 3);
+	ok(st && n == 3 && arr_eq(fwd, want, 3),
+		"compose del then add_before its successor: forward is 9,2,3");
+	ok(check_pprev(&head), "compose del then add_before its successor: pprev coherent");
 	destroy(&head);
 }
 
@@ -364,6 +446,8 @@ int main(void)
 	test_compose_adjacent_del();
 	test_compose_del_and_add();
 	test_compose_triple_del();
+	test_compose_add_then_del_host();
+	test_compose_del_then_add_before();
 
 	rcu_barrier();			/* drain proxy + node reclaim callbacks */
 	rcu_unregister_thread();
