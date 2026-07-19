@@ -1056,6 +1056,83 @@ int ft_node_recompact(enum ft_recompact mode,
 	 * peer publishes into (unpublished cluster / retained exclusion), so
 	 * they stay unfenced.
 	 */
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+	/*
+	 * DLM Step 1 (ft-step1-dlm-acquire.md): acquire the WHOLE lock-set
+	 * {C, P, (GP)} in ONE all-or-none MCAS up front, replacing the incremental
+	 * marks (C here, P at the inherit, GP at the skip-dual).  §9.3: P is resolved
+	 * from C and validated -- the read-set guard C.parent==P (and P.parent==GP)
+	 * rides the SAME commit, so a re-home between the racy plan read and the
+	 * acquire aborts it -> re-plan.  Populates the same @fenced / @fence_state /
+	 * @rel_meta / @rel_snap / @nr_rel the incremental scheme does, so the build,
+	 * the commit terminals (retire C via @fence_state, release P/GP via
+	 * @rel_snap), and the abandon_fresh unwind are all unchanged below.  Only the
+	 * LOCK_FINE retire arm hoists; the universal F2 copy fence (non-lock_fine /
+	 * flag-off) keeps its single mark.
+	 */
+	if (ft->lock_fine && retire_txn && !cluster_leaf && metadata && old_node) {
+		struct cds_ft_inode_flag *pf_p = NULL, *pf_gp = NULL;
+		struct cds_ft_metadata *p_meta = NULL, *gp_meta = NULL;
+		uintptr_t snap_c, snap_p = 0, snap_gp = 0;
+		struct ft_flip_txn *acq;
+		int dret;
+
+		/* PLAN (read-only, racy): resolve P (+GP iff P compressed). */
+		if (inh_hint)
+			pf_p = inh_hint->parent;
+		else
+			(void) ft_resolve_parent_slot(metadata, ft, &pf_p);
+		if (pf_p) {
+			p_meta = ft_flag_to_metadata(ft, pf_p);
+			if (ft_node_compressed(pf_p) ||
+					ft_node_skip_compressed(pf_p)) {
+				if (inh_hint)
+					pf_gp = inh_hint->gp;
+				else
+					(void) ft_resolve_parent_slot(p_meta,
+						ft, &pf_gp);
+				if (pf_gp)
+					gp_meta = ft_flag_to_metadata(ft, pf_gp);
+			}
+		}
+
+		/* ACQUIRE {C, P, (GP)} + read-set guards in one MCAS. */
+		acq = ft_flip_txn_create_bounded(3 /*locks*/ + 2 /*guards*/);
+		if (!acq)
+			return -ENOMEM;
+		dret = ft_dlm_lock(acq, metadata, &snap_c);
+		if (!dret && p_meta) {
+			if (!inh_hint)
+				ft_dlm_guard_parent(acq, metadata, pf_p);
+			dret = ft_dlm_lock(acq, p_meta, &snap_p);
+			if (!dret && gp_meta) {
+				if (!inh_hint)
+					ft_dlm_guard_parent(acq, p_meta, pf_gp);
+				dret = ft_dlm_lock(acq, gp_meta, &snap_gp);
+			}
+		}
+		if (dret) {
+			ft_flip_txn_destroy(acq);
+			return -EAGAIN;
+		}
+		if (ft_flip_txn_commit(ft, acq) != URCU_TXN_STATUS_OK)
+			return -EAGAIN;	/* commit freed @acq; nothing acquired */
+
+		/* Populate the lock-set state -- build/commit/unwind unchanged. */
+		fenced = true;
+		fence_state = snap_c;
+		if (p_meta) {
+			rel_meta[nr_rel] = p_meta;
+			rel_snap[nr_rel] = snap_p;
+			nr_rel++;
+		}
+		if (gp_meta) {
+			rel_meta[nr_rel] = gp_meta;
+			rel_snap[nr_rel] = snap_gp;
+			nr_rel++;
+		}
+	} else
+#endif
 	if (retire_txn && !cluster_leaf && metadata && old_node) {
 		ret = ft_meta_copying_mark(metadata, &fence_state);
 		if (ret)
@@ -1207,6 +1284,7 @@ int ft_node_recompact(enum ft_recompact mode,
 			 * build-invisible until the commit), so the abort boundary
 			 * is byte-for-byte clean.
 			 */
+#ifndef FEATURE_FT_MW_DLM_ACQUIRE
 			if (ft->lock_fine && fenced && inh_parent &&
 					ft_copying_lock_member(
 						ft_flag_to_metadata(ft, inh_parent),
@@ -1215,6 +1293,10 @@ int ft_node_recompact(enum ft_recompact mode,
 				ft_meta_copying_clear(metadata);
 				return -EAGAIN;
 			}
+#else
+			/* DLM: {C,P,(GP)} were acquired up front (see the block at
+			 * function entry); P is already held here. */
+#endif
 			ext_snapshot = (struct cds_ft_node *)
 				rcu_dereference(metadata->external_nodes);
 			if (caa_unlikely(ft_node_flip_proxy(
@@ -1709,6 +1791,7 @@ skip_copy:
 					else
 						(void) ft_resolve_parent_slot(cn_meta,
 							ft, &gp_parent);
+#ifndef FEATURE_FT_MW_DLM_ACQUIRE
 					if (gp_parent &&
 					    ft_copying_lock_member(
 						ft_flag_to_metadata(ft, gp_parent),
@@ -1716,6 +1799,11 @@ skip_copy:
 						ret = -EAGAIN;
 						goto abandon_fresh;
 					}
+#else
+					/* DLM: GP was acquired up front (whenever
+					 * P is compressed) -- already held. */
+					(void) gp_parent;
+#endif
 				}
 				/*
 				 * FT_RECOMPACT_DEL relocates the rebuilt
