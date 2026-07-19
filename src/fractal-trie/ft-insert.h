@@ -108,6 +108,22 @@ struct ft_insert_commit {
 	struct cds_ft *ft;
 	struct cds_ft_inode_flag *created[FT_MAX_DEPTH];
 	int nr_created;
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+	/*
+	 * DLM Step 1 (ft-step1-dlm-acquire.md) compressed-split acquire: when a
+	 * split builder pre-acquired CN's parent P (the value-swap forward-publish
+	 * target) as part of its one-commit lock-set {CN, P}, @parent_locked_holder
+	 * is P's metadata and @parent_locked_snap the clean state word captured at
+	 * the acquire.  ft_insert_publish_or_park then records P's RELEASE terminal
+	 * ({COPYING|snap -> snap}) from that held snap via
+	 * ft_flip_txn_hold_or_lock_parent -- instead of re-marking P -- and registers
+	 * it into @txn (whose commit/abort then owns P's fence).  NULL: no pre-
+	 * acquire (past-child {CN}, non-split shapes) -> publish_or_park takes the
+	 * incremental lock_or_guard.  A pre-publish bail releases it explicitly.
+	 */
+	struct cds_ft_metadata *parent_locked_holder;
+	uintptr_t parent_locked_snap;
+#endif
 };
 
 static void ft_free_unpublished_split_cluster(struct cds_ft *ft,
@@ -475,8 +491,20 @@ void ft_insert_publish_or_park(struct cds_ft *ft,
 	 * miss.  All shapes are mutually exclusive with the ft_attach_node relocation
 	 * guard, so the one reserved guard/release slot in ic->txn covers whichever
 	 * fires.
+	 *
+	 * DLM Step 1: when a split builder pre-acquired @parent_nf as P in its one-
+	 * commit lock-set (ic->parent_locked_holder set), record P's RELEASE from the
+	 * held snap instead of re-marking it -- a re-mark would MISS on the op's OWN
+	 * still-set fence and self-abort via the guard fallback.  A NULL holder
+	 * (past-child {CN}, non-split shapes) routes to the incremental lock_or_guard,
+	 * behaviour-identical to non-DLM.
 	 */
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+	ft_flip_txn_hold_or_lock_parent(ft, ic->txn, parent_nf,
+		ic->parent_locked_holder, ic->parent_locked_snap);
+#else
 	ft_flip_txn_lock_or_guard_parent(ft, ic->txn, parent_nf);
+#endif
 	_ft_publish_to_parent(ft, parent_nf, slot, new_top, expected_old, &rec);
 	for (k = 0; k < rec.n; k++)
 		ft_flip_txn_record_reserved(ic->txn,
@@ -486,6 +514,82 @@ void ft_insert_publish_or_park(struct cds_ft *ft,
 	ic->slot = slot;	/* sentinel: one-commit forward recorded */
 	ic->publish_to_parent = true;
 }
+
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+/*
+ * DLM Step 1 (ft-step1-dlm-acquire.md): acquire the compressed-split lock-set
+ * {CN, P} in ONE all-or-none MCAS up front, replacing the incremental CN
+ * copying-mark here plus the P lock_or_guard inside ft_insert_publish_or_park.
+ * Mirrors the recompact hoist ({C,P}): P is CN's parent (the value-swap forward-
+ * publish target), resolved racy and validated by the read-set guard
+ * CN.parent==P in the SAME commit, so a peer re-homing CN between the plan read
+ * and the acquire aborts it -> re-plan.
+ *
+ * On OK: @*cn_fence captures CN's clean word (the caller stores it into
+ * ic->free_old_cn_fence exactly as ft_meta_copying_mark did -- the retire
+ * terminal {COPYING|cn_fence -> TOMBSTONE|cn_fence} is byte-unchanged); and
+ * ic->parent_locked_holder/_snap carry P's held release so
+ * ft_insert_publish_or_park records it (ft_flip_txn_hold_or_lock_parent) instead
+ * of re-marking.  P == NULL (CN at the root) => the lock-set is {CN} only, no
+ * guard; publish_or_park's NULL @parent_nf then no-ops as today.
+ *
+ * Returns 0 (whole set acquired), -EAGAIN (a member is held / a re-home aborted
+ * the commit -- NOTHING acquired, abort-and-regrow), or -ENOMEM.
+ */
+static inline
+int ft_insert_dlm_acquire_split(struct cds_ft *ft,
+		struct cds_ft_metadata *cn_meta, uintptr_t *cn_fence,
+		struct ft_insert_commit *ic)
+{
+	struct cds_ft_inode_flag *pf_p = NULL;
+	struct cds_ft_metadata *p_meta = NULL;
+	uintptr_t snap_p = 0;
+	struct ft_flip_txn *acq;
+	int dret;
+
+	/* PLAN (read-only, racy): resolve CN's parent P. */
+	(void) ft_resolve_parent_slot(cn_meta, ft, &pf_p);
+	if (pf_p)
+		p_meta = ft_flag_to_metadata(ft, pf_p);
+
+	/* ACQUIRE {CN, P} + the read-set guard CN.parent==P in one MCAS. */
+	acq = ft_flip_txn_create_bounded(2 /*locks*/ + 1 /*guard*/);
+	if (!acq)
+		return -ENOMEM;
+	dret = ft_dlm_lock(acq, cn_meta, cn_fence);
+	if (!dret && p_meta) {
+		ft_dlm_guard_parent(acq, cn_meta, pf_p);
+		dret = ft_dlm_lock(acq, p_meta, &snap_p);
+	}
+	if (dret) {
+		ft_flip_txn_destroy(acq);
+		return -EAGAIN;
+	}
+	if (ft_flip_txn_commit(ft, acq) != URCU_TXN_STATUS_OK)
+		return -EAGAIN;	/* commit freed @acq; nothing acquired */
+
+	/* P's held release, threaded to ft_insert_publish_or_park. */
+	ic->parent_locked_holder = p_meta;
+	ic->parent_locked_snap = snap_p;
+	return 0;
+}
+
+/*
+ * Release a compressed-split lock-set acquired by ft_insert_dlm_acquire_split on
+ * a PRE-PUBLISH bail (CN's parent P is held but not yet registered into ic->txn
+ * -- publish_or_park registers it).  The CN fence is cleared by the caller's own
+ * ft_meta_copying_clear(cn_meta) / ic->txn drain, exactly as the incremental
+ * scheme did; this only lifts the extra P the DLM hoist acquired up front.
+ */
+static inline
+void ft_insert_dlm_release_parent(struct ft_insert_commit *ic)
+{
+	if (ic->parent_locked_holder) {
+		ft_meta_copying_clear(ic->parent_locked_holder);
+		ic->parent_locked_holder = NULL;
+	}
+}
+#endif /* FEATURE_FT_MW_DLM_ACQUIRE */
 
 /*
  * Arm the one-commit txn just before a fresh-head publish (fallible; the
@@ -655,11 +759,25 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 	 * path then owns the outcome).
 	 */
 	uintptr_t cn_fence;
-	int fret = ft_meta_copying_mark(cn_meta, &cn_fence);
+	int fret;
 	struct cds_ft_inode_flag *fwd_expected_old;	/* set post-fence */
 
+	/*
+	 * DLM Step 1: under LOCK_FINE, acquire the whole split lock-set {CN, P} in
+	 * one all-or-none MCAS up front (P = CN's parent, the value-swap publish
+	 * target ft_insert_publish_or_park writes into below), replacing the
+	 * incremental CN mark here + the P lock inside publish_or_park.  Non-DLM /
+	 * non-lock_fine keeps the single CN copying-mark (byte-identical).
+	 */
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+	if (ft->lock_fine)
+		fret = ft_insert_dlm_acquire_split(ft, cn_meta, &cn_fence, ic);
+	else
+#endif
+		fret = ft_meta_copying_mark(cn_meta, &cn_fence);
+
 	if (fret)
-		return fret;	/* -EAGAIN: peer owns @cn; nothing built */
+		return fret;	/* -EAGAIN: peer owns @cn/P; nothing built */
 
 	/*
 	 * Plan-snapshot the raw grandparent slot NOW (post-fence, pre-build):
@@ -967,6 +1085,9 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 	if (ft_resolve_parent_slot(cn_meta, ft, &cur_parent) != parent_slot) {
 		ft_free_unpublished_split_cluster(ft, created, nr_created);
 		ft_meta_copying_clear(cn_meta);
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+		ft_insert_dlm_release_parent(ic);	/* release P held up front */
+#endif
 		return -EAGAIN;
 	}
 	/*
@@ -1032,9 +1153,14 @@ error:
 	 * Reached only BEFORE the post-arm registration (build allocation
 	 * failures, or the arm itself failing with @ic->txn never created), so
 	 * the fence is still locally owned: lift it with the cluster teardown.
+	 * The DLM hoist also holds P up front (publish_or_park not reached here),
+	 * so release it too.
 	 */
 	ft_free_unpublished_split_cluster(ft, created, nr_created);
 	ft_meta_copying_clear(cn_meta);
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+	ft_insert_dlm_release_parent(ic);
+#endif
 	return -ENOMEM;
 }
 
@@ -2191,9 +2317,20 @@ int ft_insert_compressed_key_shorter(struct cds_ft *ft,
 	 * plans from its body + child, so fence it before the builder's first
 	 * read.  ft_insert_one_commit records the retire from @cn_fence.
 	 */
-	sret = ft_meta_copying_mark(cn_meta, &cn_fence);
+	/*
+	 * DLM Step 1: under LOCK_FINE, acquire the whole split lock-set {CN, P} in
+	 * one all-or-none MCAS up front (P = CN's parent @d->pnf, the value-swap
+	 * publish target below), mirroring the diverge builder.  Non-DLM /
+	 * non-lock_fine keeps the single CN copying-mark (byte-identical).
+	 */
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+	if (ft->lock_fine)
+		sret = ft_insert_dlm_acquire_split(ft, cn_meta, &cn_fence, ic);
+	else
+#endif
+		sret = ft_meta_copying_mark(cn_meta, &cn_fence);
 	if (sret)
-		return sret;	/* -EAGAIN: peer owns the cn; nothing built */
+		return sret;	/* -EAGAIN: peer owns the cn/P; nothing built */
 
 	/*
 	 * Plan-snapshot the raw parent slot NOW (post-fence, pre-build): the
@@ -2211,6 +2348,9 @@ int ft_insert_compressed_key_shorter(struct cds_ft *ft,
 		split_created, &split_nr_created);
 	if (sret) {
 		ft_meta_copying_clear(cn_meta);
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+		ft_insert_dlm_release_parent(ic);	/* release P held up front */
+#endif
 		return sret;
 	}
 	jct_meta = cds_ft_item_to_metadata(ft_node_ptr(jct_flag));
@@ -2257,6 +2397,9 @@ int ft_insert_compressed_key_shorter(struct cds_ft *ft,
 		ft_free_unpublished_split_cluster(ft, split_created,
 			split_nr_created);
 		ft_meta_copying_clear(cn_meta);
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+		ft_insert_dlm_release_parent(ic);	/* release P held up front */
+#endif
 		return sret;
 	}
 	/*
@@ -2281,9 +2424,13 @@ int ft_insert_compressed_key_shorter(struct cds_ft *ft,
 		node->next = NULL;
 		ft_free_unpublished_split_cluster(ft, split_created,
 			split_nr_created);
-		/* Registered above: the txn owns the fence; discard both. */
+		/* Registered above: the txn owns CN's fence; discard both. */
 		ft_flip_txn_destroy(ic->txn);
 		ic->txn = NULL;
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+		/* P was held up front, not yet registered (publish not reached). */
+		ft_insert_dlm_release_parent(ic);
+#endif
 		return -EAGAIN;
 	}
 	/*
