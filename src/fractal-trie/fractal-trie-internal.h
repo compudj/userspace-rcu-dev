@@ -118,6 +118,27 @@
 #include <assert.h>
 
 /*
+ * FT-wide-lock DROP is the DEFAULT for a FINE-locking trie (§11 rollout,
+ * 2026-07-19).  A FINE trie skips the FT-wide writer mutex and relies solely
+ * on its per-node COPYING lock-sets + MCAS arbitration for writer exclusion --
+ * so disjoint writers run in parallel instead of serialising on one mutex
+ * (doc/design/ft-wide-lock-drop-mechanics.md; certified by the §11.4 point-op
+ * 1600/1600 gate and the cross-trie oracles).  COARSE / OPTIMISTIC tries are
+ * unaffected (COARSE keeps the mutex; OPTIMISTIC never took it).
+ *
+ * Build with -DFEATURE_FT_MW_LOCK_FINE_KEEP to OPT OUT (retain the FT-wide
+ * mutex under FINE) -- reversible, for bisecting a regression to the drop.
+ * An explicit -DFEATURE_FT_MW_LOCK_FINE_DROP is still honoured (idempotent).
+ * This header is included first in the TU (before the impl headers), so the
+ * definition reaches every `#ifdef FEATURE_FT_MW_LOCK_FINE_DROP` use site.
+ */
+#ifndef FEATURE_FT_MW_LOCK_FINE_KEEP
+# ifndef FEATURE_FT_MW_LOCK_FINE_DROP
+#  define FEATURE_FT_MW_LOCK_FINE_DROP 1
+# endif
+#endif
+
+/*
  * Internal sentinel returned by ft_key_len() when a key-length argument
  * cannot be resolved (e.g. CDS_FT_LEN_DEFAULT passed to a variable-length
  * group).  Numerically equal to the public CDS_FT_LEN_DEFAULT /

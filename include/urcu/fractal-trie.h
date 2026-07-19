@@ -2678,11 +2678,12 @@ enum cds_ft_status cds_ft_group_attr_set_optimize(
  *   the lock strategies below fully replace it.
  * CDS_FT_WRITER_LOCK_COARSE: writers serialize under one FT-wide writer lock per
  *   trie (classic RCU single-writer).
- * CDS_FT_WRITER_LOCK_FINE: writers serialize under fine-grained per-node
+ * CDS_FT_WRITER_LOCK_FINE: writers coordinate through fine-grained per-node
  *   lock-sets, so writers on disjoint subtrees proceed in parallel and only
- *   structural collisions serialize.  UNDER CONSTRUCTION: currently falls back
- *   to CDS_FT_WRITER_LOCK_COARSE (one FT-wide lock) until the per-node lock-sets
- *   land op-domain by op-domain.
+ *   structural collisions serialize -- no FT-wide writer mutex.  A trie that
+ *   also maintains order statistics is coerced to CDS_FT_WRITER_LOCK_COARSE
+ *   (every count-changing writer updates the shared root, so there are no
+ *   disjoint writers for fine locking to parallelize).
  */
 enum cds_ft_writer_strategy {
 	CDS_FT_WRITER_OPTIMISTIC = 0,
