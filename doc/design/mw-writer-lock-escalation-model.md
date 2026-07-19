@@ -978,6 +978,14 @@ are never armed — so the spine never enters a fine-grained lock-set.
 
 ## 11. Migration posture (PROPOSED 2026-07-14 — for sign-off)
 
+> **STATUS UPDATE (2026-07-18):** the FT-wide-lock DROP this section proposes is
+> LANDED and soaked — point-ops (§11.4 gate 1600/1600 @16w) AND cross-trie
+> (graft/merge/graft_swap, drop-safe under shared-spine contention; rank-stats
+> coerced to COARSE). The mechanics + the full cross-trie resolution are in the
+> companion note `ft-wide-lock-drop-mechanics.md` (§9). Remaining to flip the
+> default FINE→drop: re-run the §11.4 point-op soak on current HEAD. Then the sw
+> cutover (net B / §11.6).
+
 The tree on `ft-txn-integ` carries the lock-free-MW machinery this pivot replaces
 (the reanchor / skip-resolver / PSO campaigns, baseline `0/1600 @16w`).
 
