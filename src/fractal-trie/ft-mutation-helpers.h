@@ -566,6 +566,41 @@ void ft_meta_copying_clear(struct cds_ft_metadata *meta)
 }
 
 /*
+ * CLEAR-IF-HELD: drop the reversible COPYING fence ONLY if the word still holds
+ * it, otherwise return silently.  This is the cleanup twin used when the op does
+ * NOT know at the cleanup point whether its own commit already consumed the
+ * fence (a fenced {COPYING|s -> TOMBSTONE|s} tombstone that committed leaves the
+ * word TOMBSTONE, COPYING dropped) or whether it must still be released (any
+ * abort / pre-commit bail leaves the word {COPYING|s}).  Because the fence is
+ * owner-exclusive -- only WE set it (CAS clean->COPYING), and no peer clears or
+ * re-sets it while we hold it -- the settled word is deterministically either
+ * {COPYING|s} (release it) or {...|TOMBSTONE} without COPYING (our commit took
+ * it; leave it).  A doomed peer guard may transiently park an FT_STATE_PROXY on
+ * the word (Dekker note at ft_meta_copying_mark); wait it out as the plain clear
+ * does.  This lets a caller that owns MORE marks than FT_FLIP_TXN_MAX_COPYING
+ * (the orphan chain, up to FT_MAX_DEPTH) clear them from its own array with ONE
+ * unconditional post-op sweep instead of registering them or tracking per-commit
+ * which ones a success consumed.
+ */
+static inline
+void ft_meta_copying_clear_if_held(struct cds_ft_metadata *meta)
+{
+	for (;;) {
+		uintptr_t s = CMM_LOAD_SHARED(meta->state);
+
+		if (caa_unlikely(s & FT_STATE_PROXY)) {
+			caa_cpu_relax();
+			continue;
+		}
+		if (!(s & FT_STATE_COPYING))
+			return;	/* our commit already consumed it (TOMBSTONE) */
+		if (caa_likely(uatomic_cmpxchg(&meta->state, s,
+				s & ~FT_STATE_COPYING) == s))
+			return;
+	}
+}
+
+/*
  * Register a marked fence with the commit wrapper that owns its outcome: the
  * two terminal paths (ft_flip_txn_commit on ABORT / MEMORY_ERROR,
  * ft_flip_txn_destroy on a pre-commit bail) clear every registered fence, and

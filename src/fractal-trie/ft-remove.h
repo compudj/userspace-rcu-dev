@@ -466,11 +466,22 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
  * falls back to a standalone lone-edge flip (the list-off pub-less lone-store
  * path, whose unlink is not a txn commit -- a no-op under one writer).  Node
  * resolution mirrors the branch-2 free loop.
+ *
+ * DLM plan-lock (FEATURE_FT_MW_DLM_ACQUIRE + lock_fine): @snaps non-NULL means
+ * the caller COPYING-marked each orphan at collection (parallel to @orphans, and
+ * @trailing_snap for the trailing skip-target) so the collapse decision was made
+ * on a frozen state word.  Record the FENCED {COPYING|s -> TOMBSTONE|s} terminal
+ * from that snapshot instead of the plain RYW tombstone: a peer that grew the
+ * orphan (nr_child_inc ignores COPYING) tears the fenced expected-old and ABORTS
+ * this commit (§9.2 orphan-chain coherence).  @snaps NULL keeps the plain path
+ * byte-identical.  Under DLM @txn is always non-NULL (commit_txn is FORCE-TXN and
+ * pub is never NULL), so the fenced arm never needs the standalone fallback.
  */
 static
 void ft_detach_freeze_orphans(struct cds_ft *ft, struct ft_flip_txn *txn,
 		struct cds_ft_inode_flag **orphans, int nr_orphans,
-		struct cds_ft_inode_flag *trailing_skip_cn_flag)
+		struct cds_ft_inode_flag *trailing_skip_cn_flag,
+		const uintptr_t *snaps, uintptr_t trailing_snap)
 {
 	int i;
 
@@ -480,7 +491,9 @@ void ft_detach_freeze_orphans(struct cds_ft *ft, struct ft_flip_txn *txn,
 				ft_compressed_node_ptr(orphans[i]))
 			: cds_ft_item_to_metadata(ft_node_ptr(orphans[i]));
 
-		if (txn)
+		if (snaps)
+			ft_flip_txn_record_tombstone_copying(txn, m, snaps[i]);
+		else if (txn)
 			ft_flip_txn_record_tombstone(txn, m);
 		else
 			ft_meta_tombstone_set_flip(m);
@@ -490,12 +503,47 @@ void ft_detach_freeze_orphans(struct cds_ft *ft, struct ft_flip_txn *txn,
 			(struct cds_ft_inode *) ft_skip_to_compressed(ft,
 				trailing_skip_cn_flag));
 
-		if (txn)
+		if (snaps)
+			ft_flip_txn_record_tombstone_copying(txn, m, trailing_snap);
+		else if (txn)
 			ft_flip_txn_record_tombstone(txn, m);
 		else
 			ft_meta_tombstone_set_flip(m);
 	}
 }
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+/*
+ * DLM orphan plan-lock (§9.2, lock_fine): COPYING-mark orphan @m at collection
+ * and record it into ft_detach_node's fn-scope lock arrays (parallel to its
+ * to_free[]).  @require_single_child validates the marked snapshot's
+ * nr_child == 1 -- the elevated-ancestor invariant the collapse rests on -- so a
+ * peer that GREW the orphan between the plan climb and this mark forces a
+ * re-descend instead of a silent retire (a plain compressed node is structurally
+ * single-child and skips the check; a concurrent restructure of it dirties its
+ * word and fails the mark).  Returns -EAGAIN on a dirty word or a grown orphan
+ * (caller: `goto end`, whose sweep releases the marks already held); 0 stores
+ * {m, snap} at *n and advances it.  The snapshot feeds the fenced
+ * {COPYING|s -> TOMBSTONE|s} tombstone at freeze.
+ */
+static inline
+int ft_detach_orphan_planlock(struct cds_ft_metadata *m,
+		bool require_single_child,
+		struct cds_ft_metadata **locked, uintptr_t *snaps, int *n)
+{
+	uintptr_t s;
+
+	if (ft_meta_copying_mark(m, &s))
+		return -EAGAIN;
+	if (require_single_child && ft_state_nr_child(s) != 1) {
+		ft_meta_copying_clear(m);
+		return -EAGAIN;
+	}
+	locked[*n] = m;
+	snaps[*n] = s;
+	(*n)++;
+	return 0;
+}
+#endif
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 /*
  * ft_chain_compress_fused: the fused-merge primitive behind the
@@ -555,6 +603,8 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		struct cds_ft_inode_flag **orphans,
 		int nr_orphans,
 		struct cds_ft_inode_flag *trailing_orphan,
+		const uintptr_t *orphan_snaps,
+		uintptr_t trailing_orphan_snap,
 		struct cds_ft_node *freeze_leaf,
 		long count_delta,
 		unsigned int count_reserve)
@@ -916,7 +966,7 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 					(struct cds_ft_inode *) child_cn),
 				s_ccn);
 		ft_detach_freeze_orphans(ft, txn, orphans, nr_orphans,
-			trailing_orphan);
+			trailing_orphan, orphan_snaps, trailing_orphan_snap);
 		/*
 		 * The removed external leaf (a single-entry chain, so
 		 * freeze_leaf->next == NULL) freezes atomically with this same
@@ -983,7 +1033,8 @@ void ft_canonicalize_chain_compress(struct cds_ft *ft,
 	(void) ft_chain_compress_fused(ft, iter_node_flag, iter_meta,
 		surviving_child, surviving_byte,
 		1 /* already-committed 1-child boundary */, NULL, NULL,
-		NULL, 0, NULL, NULL, 0 /* count-neutral canonicalize */, 0);
+		NULL, 0, NULL, NULL, 0 /* no orphan chain */,
+		NULL, 0 /* count-neutral canonicalize */, 0);
 }
 #endif
 
@@ -1031,6 +1082,26 @@ int ft_detach_node(struct cds_ft *ft,
 	int nr_orphan_free = 0;
 	struct cds_ft_inode_flag *orphan_trailing = NULL;
 	bool free_orphans_pending = false;
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+	/*
+	 * DLM orphan plan-lock (§9.2, lock_fine): under FEATURE_FT_MW_DLM_ACQUIRE +
+	 * ft->lock_fine every collected orphan (Block A or Block B, both mutually
+	 * exclusive) is COPYING-marked at collection so the nr_child==1 collapse
+	 * decision is made on a FROZEN state word; its clean snapshot feeds the
+	 * FENCED {COPYING|s -> TOMBSTONE|s} tombstone at freeze (a peer that grows
+	 * the orphan tears the expected-old and aborts our commit).  The marks live
+	 * in these fn-scope arrays (not the txn copying[] registry -- the chain
+	 * reaches FT_MAX_DEPTH, past FT_FLIP_TXN_MAX_COPYING), so the op OWNS their
+	 * clearing: one unconditional ft_meta_copying_clear_if_held sweep at @end
+	 * releases every held mark and no-ops on the ones a successful commit already
+	 * consumed (TOMBSTONE), needing no per-commit "consumed" bookkeeping.
+	 */
+	struct cds_ft_metadata *orphan_locked_meta[FT_MAX_DEPTH];
+	uintptr_t orphan_snap[FT_MAX_DEPTH];
+	int nr_orphan_locked = 0;
+	struct cds_ft_metadata *orphan_trailing_meta = NULL;
+	uintptr_t orphan_trailing_snap = 0;
+#endif
 	bool retire_glue_fused = false;
 	bool freeze_leaf_fused = false;
 	struct cds_ft_node *topmost_external_nodes = NULL;
@@ -1435,44 +1506,76 @@ int ft_detach_node(struct cds_ft *ft,
 				struct cds_ft_inode_flag *next = NULL;
 				unsigned int nr_child;
 				struct cds_ft_node *ext_nodes;
+				struct cds_ft_metadata *ometa;
+				struct cds_ft_compressed_node *ocn = NULL;
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+				uintptr_t osnap = 0;
+#endif
 
-				if (ft_node_compressed(walk_nf)) {
-					struct cds_ft_compressed_node *cn;
-					struct cds_ft_metadata *cm;
-
-					cn = ft_compressed_node_ptr(
+				if (ft_node_compressed(walk_nf))
+					ocn = ft_compressed_node_ptr(
 						ft_skip_child_ptr(walk_nf));
-					cm = cds_ft_item_to_metadata(
-						(struct cds_ft_inode *) cn);
-					nr_child = ft_meta_nr_child(cm);
-					ext_nodes = cm->external_nodes;
-					next = cn->child;
-				} else {
-					struct cds_ft_metadata *m =
-						cds_ft_item_to_metadata(
-							ft_node_ptr(walk_nf));
+				ometa = ocn
+					? cds_ft_item_to_metadata(
+						(struct cds_ft_inode *) ocn)
+					: cds_ft_item_to_metadata(
+						ft_node_ptr(walk_nf));
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+				/*
+				 * §9.2 plan-lock: COPYING-mark the orphan BEFORE
+				 * reading its nr_child for the collapse decision, so
+				 * the "retire it" verdict is derived from a FROZEN
+				 * word and the fenced tombstone's expected-old (this
+				 * snap) is exactly that state.  nr_child_inc ignores
+				 * COPYING, so a peer that grows the orphan AFTER the
+				 * mark tears the fenced expected-old and aborts our
+				 * commit (detect); one that grew it BEFORE is reflected
+				 * in @osnap and stops the walk (nr_child > 1).  A dirty
+				 * mark (peer proxy / concurrent copier / real retire)
+				 * bails to the caller's re-descend.
+				 */
+				if (ft->lock_fine) {
+					if (ft_meta_copying_mark(ometa, &osnap)) {
+						ret = -EAGAIN;
+						goto end;
+					}
+					nr_child = ft_state_nr_child(osnap);
+				} else
+#endif
+					nr_child = ft_meta_nr_child(ometa);
+				ext_nodes = ometa->external_nodes;
+				if (ocn) {
+					next = ocn->child;
+				} else if (nr_child == 1) {
+					unsigned int key;
 
-					nr_child = ft_meta_nr_child(m);
-					ext_nodes = m->external_nodes;
-					if (nr_child == 1) {
-						unsigned int key;
-
-						for (key = 0; key < 256; key++) {
-							next = ft_node_get_nth(ft,
-								walk_nf, NULL,
-								(uint8_t) key,
-								FT_PF_NONE);
-							if (next)
-								break;
-						}
+					for (key = 0; key < 256; key++) {
+						next = ft_node_get_nth(ft,
+							walk_nf, NULL,
+							(uint8_t) key,
+							FT_PF_NONE);
+						if (next)
+							break;
 					}
 				}
 
 				if (!phase2_first &&
-				    (nr_child > 1 || ext_nodes))
+				    (nr_child > 1 || ext_nodes)) {
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+					if (ft->lock_fine)
+						ft_meta_copying_clear(ometa);
+#endif
 					break;
+				}
 				phase2_first = false;
 				to_free[nr_to_free++] = walk_nf;
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+				if (ft->lock_fine) {
+					orphan_locked_meta[nr_orphan_locked] = ometa;
+					orphan_snap[nr_orphan_locked] = osnap;
+					nr_orphan_locked++;
+				}
+#endif
 				walk_nf = next;
 			}
 			/*
@@ -1482,9 +1585,25 @@ int ft_detach_node(struct cds_ft *ft,
 			 * walk stops short of.  Free it (the external leaf stays
 			 * caller-owned).
 			 */
-			if (walk_nf && ft_node_skip_compressed(walk_nf))
+			if (walk_nf && ft_node_skip_compressed(walk_nf)) {
 				trailing_skip_cn =
 					ft_skip_to_compressed(ft, walk_nf);
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+				if (ft->lock_fine) {
+					struct cds_ft_metadata *tm =
+						cds_ft_item_to_metadata(
+							(struct cds_ft_inode *)
+							trailing_skip_cn);
+
+					if (ft_meta_copying_mark(tm,
+							&orphan_trailing_snap)) {
+						ret = -EAGAIN;
+						goto end;
+					}
+					orphan_trailing_meta = tm;
+				}
+#endif
+			}
 		}
 		/*
 		 * Atomic detach (§4.B): create the publish txn sized for the
@@ -1510,19 +1629,32 @@ int ft_detach_node(struct cds_ft *ft,
 				ret = -ENOMEM;
 				goto end;
 			}
-			for (fi = 0; fi < nr_to_free; fi++)
-				ft_flip_txn_record_tombstone(orphan_txn,
-					cds_ft_item_to_metadata(ft_node_compressed(
-						to_free[fi])
+			for (fi = 0; fi < nr_to_free; fi++) {
+				struct cds_ft_metadata *m = cds_ft_item_to_metadata(
+					ft_node_compressed(to_free[fi])
 						? (struct cds_ft_inode *)
 						  ft_compressed_node_ptr(
 							ft_skip_child_ptr(to_free[fi]))
-						: ft_node_ptr(to_free[fi])));
-			if (trailing_skip_cn)
-				ft_flip_txn_record_tombstone(orphan_txn,
-					cds_ft_item_to_metadata(
-						(struct cds_ft_inode *)
-						trailing_skip_cn));
+						: ft_node_ptr(to_free[fi]));
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+				if (ft->lock_fine)
+					ft_flip_txn_record_tombstone_copying(
+						orphan_txn, m, orphan_snap[fi]);
+				else
+#endif
+					ft_flip_txn_record_tombstone(orphan_txn, m);
+			}
+			if (trailing_skip_cn) {
+				struct cds_ft_metadata *m = cds_ft_item_to_metadata(
+					(struct cds_ft_inode *) trailing_skip_cn);
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+				if (ft->lock_fine)
+					ft_flip_txn_record_tombstone_copying(
+						orphan_txn, m, orphan_trailing_snap);
+				else
+#endif
+					ft_flip_txn_record_tombstone(orphan_txn, m);
+			}
 			/*
 			 * The removed external leaf freezes atomically with this
 			 * compressed-parent replace that unlinks its chain (doc §4.B):
@@ -1614,6 +1746,10 @@ int ft_detach_node(struct cds_ft *ft,
 			       !ft_node_external(walk_nf) &&
 			       nr_to_free < FT_MAX_DEPTH) {
 				struct cds_ft_inode_flag *next = NULL;
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+				struct cds_ft_metadata *ometa;
+				bool require_sc;
+#endif
 
 				if (ft_node_skip_compressed(walk_nf)) {
 					/*
@@ -1626,7 +1762,17 @@ int ft_detach_node(struct cds_ft *ft,
 					 */
 					struct cds_ft_compressed_node *cn =
 						ft_skip_to_compressed(ft, walk_nf);
-
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+					/* Skip-target: structurally single-child. */
+					if (ft->lock_fine && ft_detach_orphan_planlock(
+							cds_ft_item_to_metadata(
+								(struct cds_ft_inode *) cn),
+							false, orphan_locked_meta,
+							orphan_snap, &nr_orphan_locked)) {
+						ret = -EAGAIN;
+						goto end;
+					}
+#endif
 					to_free[nr_to_free++] =
 						ft_compressed_node_flag(cn);
 					walk_nf = ft_skip_child_ptr(walk_nf);
@@ -1637,6 +1783,11 @@ int ft_detach_node(struct cds_ft *ft,
 
 					cn = ft_compressed_node_ptr(walk_nf);
 					next = cn->child;
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+					ometa = cds_ft_item_to_metadata(
+						(struct cds_ft_inode *) cn);
+					require_sc = false;	/* compressed: single-child */
+#endif
 				} else {
 					unsigned int key;
 
@@ -1648,7 +1799,20 @@ int ft_detach_node(struct cds_ft *ft,
 						if (next)
 							break;
 					}
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+					ometa = cds_ft_item_to_metadata(
+						ft_node_ptr(walk_nf));
+					require_sc = true;	/* elevated internal: nr_child==1 */
+#endif
 				}
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+				if (ft->lock_fine && ft_detach_orphan_planlock(ometa,
+						require_sc, orphan_locked_meta,
+						orphan_snap, &nr_orphan_locked)) {
+					ret = -EAGAIN;
+					goto end;
+				}
+#endif
 				to_free[nr_to_free++] = walk_nf;
 				walk_nf = next;
 			}
@@ -1663,43 +1827,68 @@ int ft_detach_node(struct cds_ft *ft,
 					struct cds_ft_inode_flag *next = NULL;
 					unsigned int nr_child;
 					struct cds_ft_node *ext_nodes;
+					struct cds_ft_metadata *ometa;
+					struct cds_ft_compressed_node *ocn = NULL;
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+					uintptr_t osnap = 0;
+#endif
 
-					if (ft_node_compressed(walk_nf)) {
-						struct cds_ft_compressed_node *cn;
-						struct cds_ft_metadata *cm;
+					if (ft_node_compressed(walk_nf))
+						ocn = ft_compressed_node_ptr(walk_nf);
+					ometa = ocn
+						? cds_ft_item_to_metadata(
+							(struct cds_ft_inode *) ocn)
+						: cds_ft_item_to_metadata(
+							ft_node_ptr(walk_nf));
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+					/*
+					 * §9.2 plan-lock (mirrors Block A): MARK before
+					 * reading nr_child for the collapse decision so the
+					 * fenced tombstone's expected-old is the exact word
+					 * the "retire it" verdict rests on.
+					 */
+					if (ft->lock_fine) {
+						if (ft_meta_copying_mark(ometa, &osnap)) {
+							ret = -EAGAIN;
+							goto end;
+						}
+						nr_child = ft_state_nr_child(osnap);
+					} else
+#endif
+						nr_child = ft_meta_nr_child(ometa);
+					ext_nodes = ometa->external_nodes;
+					if (ocn) {
+						next = ocn->child;
+					} else if (nr_child == 1) {
+						unsigned int key;
 
-						cn = ft_compressed_node_ptr(walk_nf);
-						cm = cds_ft_item_to_metadata(
-							(struct cds_ft_inode *) cn);
-						nr_child = ft_meta_nr_child(cm);
-						ext_nodes = cm->external_nodes;
-						next = cn->child;
-					} else {
-						struct cds_ft_metadata *m =
-							cds_ft_item_to_metadata(
-								ft_node_ptr(walk_nf));
-
-						nr_child = ft_meta_nr_child(m);
-						ext_nodes = m->external_nodes;
-						if (nr_child == 1) {
-							unsigned int key;
-
-							for (key = 0; key < 256; key++) {
-								next = ft_node_get_nth(ft,
-									walk_nf, NULL,
-									(uint8_t) key,
-									FT_PF_NONE);
-								if (next)
-									break;
-							}
+						for (key = 0; key < 256; key++) {
+							next = ft_node_get_nth(ft,
+								walk_nf, NULL,
+								(uint8_t) key,
+								FT_PF_NONE);
+							if (next)
+								break;
 						}
 					}
 
 					if (!phase2_first &&
-					    (nr_child > 1 || ext_nodes))
+					    (nr_child > 1 || ext_nodes)) {
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+						if (ft->lock_fine)
+							ft_meta_copying_clear(ometa);
+#endif
 						break;
+					}
 					phase2_first = false;
 					to_free[nr_to_free++] = walk_nf;
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+					if (ft->lock_fine) {
+						orphan_locked_meta[nr_orphan_locked] = ometa;
+						orphan_snap[nr_orphan_locked] = osnap;
+						nr_orphan_locked++;
+					}
+#endif
 					walk_nf = next;
 				}
 				/*
@@ -1709,8 +1898,25 @@ int ft_detach_node(struct cds_ft *ft,
 				 * the external leaf is caller-owned, but that
 				 * skip-target is trie-owned and now orphaned.  Queue it.
 				 */
-				if (walk_nf && ft_node_skip_compressed(walk_nf))
+				if (walk_nf && ft_node_skip_compressed(walk_nf)) {
 					trailing_skip_cn_flag = walk_nf;
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+					if (ft->lock_fine) {
+						struct cds_ft_metadata *tm =
+							cds_ft_item_to_metadata(
+								(struct cds_ft_inode *)
+								ft_skip_to_compressed(ft,
+									walk_nf));
+
+						if (ft_meta_copying_mark(tm,
+							&orphan_trailing_snap)) {
+							ret = -EAGAIN;
+							goto end;
+						}
+						orphan_trailing_meta = tm;
+					}
+#endif
+				}
 			}
 			/*
 			 * The collected set (+ trailing skip-target) is tombstoned at
@@ -1778,7 +1984,14 @@ int ft_detach_node(struct cds_ft *ft,
 						2 /* shape-D: survivor + the child this commit detaches */,
 						fuse_cell, run,
 						to_free, nr_to_free,
-						trailing_skip_cn_flag, freeze_leaf,
+						trailing_skip_cn_flag,
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+						ft->lock_fine ? orphan_snap : NULL,
+						orphan_trailing_snap,
+#else
+						NULL, 0,
+#endif
+						freeze_leaf,
 						count_delta,
 						ft->rank_stats ? detach_depth + 1 : 0);
 
@@ -1887,7 +2100,13 @@ int ft_detach_node(struct cds_ft *ft,
 			if (!boundary_fused && (nr_to_free > 0 || trailing_skip_cn_flag))
 				ft_detach_freeze_orphans(ft,
 					(pub && commit_txn) ? commit_txn : NULL,
-					to_free, nr_to_free, trailing_skip_cn_flag);
+					to_free, nr_to_free, trailing_skip_cn_flag,
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+					ft->lock_fine ? orphan_snap : NULL,
+					orphan_trailing_snap);
+#else
+					NULL, 0);
+#endif
 			/*
 			 * A caller-supplied external retire set (@retire_glue: the
 			 * merge src-side glue's overlap-spine free-list, freed by the
@@ -2285,6 +2504,27 @@ int ft_detach_node(struct cds_ft *ft,
 		}
 	}
 end:
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+	/*
+	 * DLM orphan plan-lock cleanup (§9.2): release every orphan COPYING mark the
+	 * op still holds.  On a successful detach the consuming commit already turned
+	 * each orphan's fenced {COPYING|s -> TOMBSTONE|s} tombstone terminal (COPYING
+	 * dropped), so clear_if_held no-ops on those; on ANY abort / pre-commit bail
+	 * (including a mark-miss mid-collection, which jumps here) the fenced
+	 * tombstone never applied, so the marks are still {COPYING|s} and get
+	 * released here -- the structure returns byte-for-byte to its pre-op state.
+	 * One sweep covers both Block A and Block B (mutually exclusive) and every
+	 * commit outcome (in-place / recompaction / shape-D), no "consumed" tracking.
+	 */
+	{
+		int oi;
+
+		for (oi = 0; oi < nr_orphan_locked; oi++)
+			ft_meta_copying_clear_if_held(orphan_locked_meta[oi]);
+		if (orphan_trailing_meta)
+			ft_meta_copying_clear_if_held(orphan_trailing_meta);
+	}
+#endif
 	/*
 	 * nr_keys fold (LEAF Increment 2): no abort rollback needed.  Every
 	 * per-outcome count fold rides an UNcommitted txn on the abort path (the
@@ -2999,7 +3239,7 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 					s_child, s_byte,
 					1 /* sole body child; the removed entry is external */,
 					fuse_cell, NULL,
-					NULL, 0, NULL, node,
+					NULL, 0, NULL, NULL, 0 /* no orphan chain */, node,
 					-1, ft->rank_stats ? key_len + 1 : 0);
 
 				if (cret == 0) {
@@ -3546,7 +3786,7 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 					s_child, s_byte,
 					1 /* sole body child; the removed entry is external */,
 					ft->ordered_list ? dead_cell : NULL,
-					NULL, NULL, 0, NULL, NULL,
+					NULL, NULL, 0, NULL, NULL, 0 /* no orphan chain */, NULL,
 					-1, ft->rank_stats ? key_len + 1 : 0);
 
 				if (cret == 0) {
