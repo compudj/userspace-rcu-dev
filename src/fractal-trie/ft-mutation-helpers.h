@@ -748,6 +748,69 @@ void ft_flip_txn_record_reserved(struct ft_flip_txn *t, void **slot,
 	ft_flip_txn_record_tag(t, slot, old_ptr, new_ptr, FT_FLIP_PROXY_TAG);
 }
 
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+/*
+ * MW LOCK_FINE DLM (Step 1, doc/design ft-step1-dlm-acquire.md): the composable
+ * one-commit lock-set acquire.  An op derives its lock-set + read-set by a
+ * read-only plan (following back-edges), records both onto a DEDICATED acquire
+ * flip-txn -- NOT the content lane, since acquiring on the content txn
+ * circular-waits on the domain (escalation model §5) -- and commits it as ONE
+ * all-or-none MCAS.  Compose:
+ *
+ *   struct ft_flip_txn *acq = ft_flip_txn_create_bounded(nr_lock + nr_guard);
+ *   if (ft_dlm_lock(acq, C_meta, &snapC)) { ft_flip_txn_destroy(acq); goto replan; }
+ *   ft_dlm_guard_parent(acq, C_meta, pf_P);   // read-set: C.parent still == P
+ *   if (ft_dlm_lock(acq, P_meta, &snapP)) { ... }
+ *   if (ft_flip_txn_commit(ft, acq) != URCU_TXN_STATUS_OK) goto replan;
+ *
+ * On commit OK every locked node holds COPYING and every guarded back-edge was
+ * validated at the linearization point; the caller then registers each node in
+ * its CONTENT txn's copying[] and records the terminal (release
+ * {COPYING|snap -> snap} / retire {-> TOMBSTONE|snap}) from the captured @snap,
+ * exactly as the incremental scheme does today.  Deadlock-free: a dirty or held
+ * member, or a re-homed guarded back-edge, aborts the commit -- it never blocks,
+ * and NOTHING is acquired on failure (all-or-none -> abort-and-regrow).
+ */
+
+/*
+ * Record {clean -> COPYING} for @meta onto the acquire txn @t, capturing the
+ * clean word in @snap.  -EAGAIN if @meta is already PROXY|TOMBSTONE|COPYING
+ * (dirty): the caller destroys @t and re-plans.  The edge must be reserved
+ * (create_bounded); the actual set is atomic at the commit, not here.
+ */
+static inline
+int ft_dlm_lock(struct ft_flip_txn *t, struct cds_ft_metadata *meta,
+		uintptr_t *snap)
+{
+	uintptr_t s = CMM_LOAD_SHARED(meta->state);
+
+	if (caa_unlikely(s & (FT_STATE_PROXY | FT_STATE_TOMBSTONE |
+			FT_STATE_COPYING)))
+		return -EAGAIN;
+	*snap = s;
+	ft_flip_txn_record_tag(t, (void **) &meta->state,
+			(void *) s, (void *) (s | FT_STATE_COPYING),
+			FT_STATE_PROXY);
+	return 0;
+}
+
+/*
+ * Guard a back-edge into the SAME acquire commit: the commit aborts unless
+ * @child->parent still holds @expected_pf (the tagged parent flag the plan
+ * resolved).  This is the read-set validation -- a peer re-homing @child between
+ * the plan's racy read of its parent and the acquire's linearization point (or a
+ * flip-proxy parked mid-re-home) fails the whole-word value-CAS and aborts the
+ * acquire, so the op re-plans against the settled tree.
+ */
+static inline
+void ft_dlm_guard_parent(struct ft_flip_txn *t, struct cds_ft_metadata *child,
+		struct cds_ft_inode_flag *expected_pf)
+{
+	urcu_txn_validate(t->mtxn, (void **) &child->parent,
+			(void *) expected_pf, FT_FLIP_PROXY_TAG);
+}
+#endif /* FEATURE_FT_MW_DLM_ACQUIRE */
+
 /*
  * FT-local order-pinned insert-between (was the engine's
  * urcu_txn_list_insert_between_prepare, dropped when the transaction engine was
