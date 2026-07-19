@@ -809,6 +809,67 @@ void ft_dlm_guard_parent(struct ft_flip_txn *t, struct cds_ft_metadata *child,
 	urcu_txn_validate(t->mtxn, (void **) &child->parent,
 			(void *) expected_pf, FT_FLIP_PROXY_TAG);
 }
+
+/*
+ * One member of a DLM lock-set: the node @meta to acquire (COPYING), plus an
+ * OPTIONAL read-set guard that @guard_child's back-edge still resolves to
+ * @guard_pf (validating the racy plan read of @meta's position).  @snap
+ * receives the clean word captured at the acquire, for the caller's
+ * retire/release terminal.  @meta == NULL skips the member (an absent optional
+ * lock-set node -- e.g. a root with no parent, a compressed-parent that is not
+ * present in a given shape); the caller then treats @snap as unused.
+ */
+struct ft_dlm_member {
+	struct cds_ft_metadata *meta;
+	struct cds_ft_metadata *guard_child;
+	struct cds_ft_inode_flag *guard_pf;
+	uintptr_t snap;
+};
+
+/*
+ * Acquire a whole lock-set in ONE all-or-none MCAS on a DEDICATED acquire
+ * flip-txn (never the content lane -- the escalation model's circular-wait
+ * constraint): for each present member, record its read-set guard (if any) and
+ * its {clean -> COPYING} lock onto the acquire txn, then commit it once.  On
+ * commit OK every present member holds COPYING (member.snap = its clean word)
+ * and every guard validated at the linearization point; the caller registers
+ * each member in its CONTENT txn and records the release/retire terminal from
+ * member.snap, exactly as ft_insert_dlm_acquire_split and the recompact hoist
+ * do.  Returns 0 (whole set acquired), -EAGAIN (a member is held/dirty or a
+ * guarded back-edge re-homed -- NOTHING acquired, abort-and-regrow), or -ENOMEM.
+ * Deadlock-free: a conflict aborts the commit, never blocks.
+ */
+static inline
+int ft_dlm_acquire_set(const struct cds_ft *ft, struct ft_dlm_member *set,
+		int nr)
+{
+	struct ft_flip_txn *acq;
+	int i, nr_present = 0;
+
+	for (i = 0; i < nr; i++)
+		if (set[i].meta)
+			nr_present++;
+	if (!nr_present)
+		return 0;
+	/* Up to one guard + one lock record per present member. */
+	acq = ft_flip_txn_create_bounded(2 * nr_present);
+	if (!acq)
+		return -ENOMEM;
+	for (i = 0; i < nr; i++) {
+		if (!set[i].meta)
+			continue;
+		if (set[i].guard_child)
+			ft_dlm_guard_parent(acq, set[i].guard_child,
+				set[i].guard_pf);
+		if (ft_dlm_lock(acq, set[i].meta, &set[i].snap)) {
+			ft_flip_txn_destroy(acq);
+			return -EAGAIN;	/* nothing acquired (all-or-none) */
+		}
+	}
+	if (ft_flip_txn_commit((struct cds_ft *) ft, acq) != URCU_TXN_STATUS_OK)
+		return -EAGAIN;		/* commit freed @acq; nothing acquired */
+	return 0;
+}
 #endif /* FEATURE_FT_MW_DLM_ACQUIRE */
 
 /*

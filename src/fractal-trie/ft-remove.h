@@ -496,11 +496,134 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 	 * the surviving child and tombstoned the old copy this plan captured)
 	 * bails to the caller's retry.
 	 */
-	if (ft_meta_copying_mark(iter_meta, &s_iter)) {
-		ft_flip_txn_destroy(txn);
-		return -EAGAIN;
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+	if (ft->lock_fine) {
+		/*
+		 * Acquire the WHOLE chain-compress lock-set
+		 * {B, parent_CN, child_CN, publish_parent} in ONE all-or-none MCAS,
+		 * replacing the three incremental retire-marks + the publish_parent
+		 * lock_or_guard.  B / parent_CN / child_CN are RETIRE members (their
+		 * bodies subsume into new_cn); publish_parent is the value-swap RELEASE
+		 * target.  Guards B.parent==iter_parent and parent_CN.parent==pp ride
+		 * the same commit; child_CN needs no guard (the post-acquire
+		 * surviving_byte->surviving_child re-validation covers its position,
+		 * and a peer split retires it -> ft_dlm_lock -EAGAIN).
+		 */
+		struct cds_ft_metadata *parent_cn_meta_l, *child_cn_meta_l = NULL;
+		struct cds_ft_metadata *pp_meta = NULL;
+		struct cds_ft_inode_flag *pp_flag = NULL;
+		struct ft_dlm_member set[4];
+		int nr_set = 0, si = 0, dret;
+
+		iter_parent = (struct cds_ft_inode_flag *)
+			rcu_dereference(iter_meta->parent);
+		if (caa_unlikely(ft_node_flip_proxy(iter_parent))) {
+			ft_flip_txn_destroy(txn);
+			return -EAGAIN;
+		}
+		parent_cn = ft_node_compressed(iter_parent)
+			? ft_compressed_node_ptr(iter_parent) : NULL;
+		parent_cn_meta_l = parent_cn
+			? cds_ft_item_to_metadata((struct cds_ft_inode *) parent_cn)
+			: NULL;
+		child_cn = ft_node_compressed(surviving_child)
+			? ft_compressed_node_ptr(surviving_child) : NULL;
+		if (child_cn)
+			child_cn_meta_l = cds_ft_item_to_metadata(
+				(struct cds_ft_inode *) child_cn);
+		/* Publish grandparent = parent_CN's parent, else B's parent. */
+		if (parent_cn_meta_l)
+			(void) ft_resolve_parent_slot(parent_cn_meta_l, ft, &pp_flag);
+		else
+			pp_flag = iter_parent;
+		if (pp_flag)
+			pp_meta = ft_flag_to_metadata(ft, pp_flag);
+
+		set[nr_set++] = (struct ft_dlm_member){ .meta = iter_meta,
+			.guard_child = iter_meta, .guard_pf = iter_parent };
+		if (parent_cn_meta_l)
+			set[nr_set++] = (struct ft_dlm_member){ .meta = parent_cn_meta_l,
+				.guard_child = parent_cn_meta_l, .guard_pf = pp_flag };
+		if (child_cn_meta_l)
+			set[nr_set++] = (struct ft_dlm_member){ .meta = child_cn_meta_l };
+		if (pp_meta)
+			set[nr_set++] = (struct ft_dlm_member){ .meta = pp_meta };
+
+		dret = ft_dlm_acquire_set(ft, set, nr_set);
+		if (dret) {
+			ft_flip_txn_destroy(txn);
+			return dret;	/* -EAGAIN / -ENOMEM; nothing acquired */
+		}
+		parent_cn_meta = parent_cn_meta_l;
+		s_iter = set[si].snap;
+		ft_flip_txn_copying_register(txn, iter_meta);
+		si++;
+		if (parent_cn_meta_l) {
+			s_pcn = set[si].snap;
+			ft_flip_txn_copying_register(txn, parent_cn_meta_l);
+			si++;
+		}
+		if (child_cn_meta_l) {
+			s_ccn = set[si].snap;
+			ft_flip_txn_copying_register(txn, child_cn_meta_l);
+			si++;
+		}
+		if (pp_meta) {
+			/*
+			 * publish_parent is the value-swap RELEASE target (survives).
+			 * Record its {COPYING|s -> s} release + register it up front with
+			 * the acquire, so the publish below skips its lock_or_guard and
+			 * every pre-publish bail's ft_flip_txn_destroy drains it -- no
+			 * separate publish_parent unwind path.
+			 */
+			ft_flip_txn_record_release_copying(txn, pp_meta, set[si].snap);
+			ft_flip_txn_copying_register(txn, pp_meta);
+			si++;
+		}
+	} else
+#endif
+	{
+		if (ft_meta_copying_mark(iter_meta, &s_iter)) {
+			ft_flip_txn_destroy(txn);
+			return -EAGAIN;
+		}
+		ft_flip_txn_copying_register(txn, iter_meta);
+		/*
+		 * ONE snapshot of the boundary's parent (latch-checked): the F1
+		 * discipline -- a peer's parked flip proxy must be neither classified
+		 * nor embedded.
+		 */
+		iter_parent = (struct cds_ft_inode_flag *)
+			rcu_dereference(iter_meta->parent);
+		if (caa_unlikely(ft_node_flip_proxy(iter_parent))) {
+			ft_flip_txn_destroy(txn);
+			return -EAGAIN;
+		}
+		parent_cn = ft_node_compressed(iter_parent)
+			? ft_compressed_node_ptr(iter_parent)
+			: NULL;
+		parent_cn_meta = parent_cn
+			? cds_ft_item_to_metadata((struct cds_ft_inode *) parent_cn)
+			: NULL;
+		if (parent_cn_meta && ft_meta_copying_mark(parent_cn_meta, &s_pcn)) {
+			ft_flip_txn_destroy(txn);
+			return -EAGAIN;
+		}
+		if (parent_cn_meta)
+			ft_flip_txn_copying_register(txn, parent_cn_meta);
+		child_cn = ft_node_compressed(surviving_child)
+			? ft_compressed_node_ptr(surviving_child)
+			: NULL;
+		if (child_cn && ft_meta_copying_mark(
+				cds_ft_item_to_metadata((struct cds_ft_inode *) child_cn),
+				&s_ccn)) {
+			ft_flip_txn_destroy(txn);
+			return -EAGAIN;
+		}
+		if (child_cn)
+			ft_flip_txn_copying_register(txn,
+				cds_ft_item_to_metadata((struct cds_ft_inode *) child_cn));
 	}
-	ft_flip_txn_copying_register(txn, iter_meta);
 	/*
 	 * Re-validate the caller's PRE-fence plan under the fence: the
 	 * boundary must still have the child population the plan was derived
@@ -518,41 +641,6 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		ft_flip_txn_destroy(txn);
 		return -EAGAIN;
 	}
-	/*
-	 * ONE snapshot of the boundary's parent (latch-checked): the F1
-	 * discipline -- a peer's parked flip proxy must be neither classified
-	 * nor embedded.
-	 */
-	iter_parent = (struct cds_ft_inode_flag *)
-		rcu_dereference(iter_meta->parent);
-	if (caa_unlikely(ft_node_flip_proxy(iter_parent))) {
-		ft_flip_txn_destroy(txn);
-		return -EAGAIN;
-	}
-	parent_cn = ft_node_compressed(iter_parent)
-		? ft_compressed_node_ptr(iter_parent)
-		: NULL;
-	parent_cn_meta = parent_cn
-		? cds_ft_item_to_metadata((struct cds_ft_inode *) parent_cn)
-		: NULL;
-	if (parent_cn_meta && ft_meta_copying_mark(parent_cn_meta, &s_pcn)) {
-		ft_flip_txn_destroy(txn);
-		return -EAGAIN;
-	}
-	if (parent_cn_meta)
-		ft_flip_txn_copying_register(txn, parent_cn_meta);
-	child_cn = ft_node_compressed(surviving_child)
-		? ft_compressed_node_ptr(surviving_child)
-		: NULL;
-	if (child_cn && ft_meta_copying_mark(
-			cds_ft_item_to_metadata((struct cds_ft_inode *) child_cn),
-			&s_ccn)) {
-		ft_flip_txn_destroy(txn);
-		return -EAGAIN;
-	}
-	if (child_cn)
-		ft_flip_txn_copying_register(txn,
-			cds_ft_item_to_metadata((struct cds_ft_inode *) child_cn));
 	parent_len = parent_cn ? parent_cn->len : 0;
 	child_len = child_cn ? child_cn->len : 0;
 	merged_len = parent_len + 1 + child_len;
@@ -684,8 +772,15 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 			new_cn_flag, &new_cn->child);
 		new_cn_pub = ft_publish_compressed(ft, new_cn, new_cn_flag);
 		/* VALIDATE (§4.B): lock (or guard-fallback) the LIVE
-		 * (great-)grandparent publish_parent -- value-swap target (§10.5). */
+		 * (great-)grandparent publish_parent -- value-swap target (§10.5).
+		 * DLM: under lock_fine the whole lock-set (incl. publish_parent's
+		 * RELEASE) was acquired up front, so skip the incremental lock here. */
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+		if (!ft->lock_fine)
+			ft_flip_txn_lock_or_guard_parent(ft, txn, publish_parent);
+#else
 		ft_flip_txn_lock_or_guard_parent(ft, txn, publish_parent);
+#endif
 		_ft_publish_to_parent_meta(ft, publish_parent, publish_slot,
 			new_cn_pub, pub_expected_old, new_cn_meta, NULL, &rec);
 		/*
