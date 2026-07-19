@@ -100,8 +100,17 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 	struct cds_ft_compressed_node *src_cn = ft_compressed_node_ptr(
 		ft_reanchor_flag(ft, iter_node_flag, &iter_rewind));
 
-	if (caa_unlikely(iter_rewind))
+	if (caa_unlikely(iter_rewind)) {
+		/*
+		 * @txn is caller-owned and already holds the orphan freeze-on-free
+		 * tombstones; the caller's cleanup does NOT destroy on -EAGAIN (it
+		 * assumes a commit consumed it), so a PRE-commit -EAGAIN must destroy
+		 * it here or leak the descriptor.  (Pre-existing on this rewind bail;
+		 * the DLM acquire-miss bails below share the same contract.)
+		 */
+		ft_flip_txn_destroy(txn);
 		return -EAGAIN;
+	}
 	if (topmost_external_nodes) {
 		/*
 		 * Keep the compressed node -- its path is needed for
@@ -113,6 +122,29 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 		 * NOT have metadata->external_nodes set.
 		 */
 		struct cds_ft_compressed_node *cn = src_cn;
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+		/*
+		 * DLM Step 1: @cn is the value-swap RELEASE target this external-
+		 * promote publishes into (its child slot); acquire it (hard, no guard-
+		 * fallback) up front and record its {COPYING|s -> s} release, so both
+		 * publish arms below skip their lock_or_guard.  -EAGAIN before any edge
+		 * is recorded -> caller destroys @txn and re-descends.
+		 */
+		if (ft->lock_fine) {
+			struct cds_ft_metadata *cn_meta =
+				cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
+			uintptr_t cn_snap;
+
+			if (ft_meta_copying_mark(cn_meta, &cn_snap)) {
+				/* Pre-commit -EAGAIN: destroy the caller-owned txn
+				 * (its cleanup skips destroy on -EAGAIN). */
+				ft_flip_txn_destroy(txn);
+				return -EAGAIN;
+			}
+			ft_flip_txn_record_release_copying(txn, cn_meta, cn_snap);
+			ft_flip_txn_copying_register(txn, cn_meta);
+		}
+#endif
 		/*
 		 * Fold the external head's back-edge -- cell->parent (list on) or
 		 * its prev (list off) -- INTO @txn so it commits ATOMICALLY with
@@ -167,9 +199,17 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 		if ((fuse_cell || run) && pub && !pub->armed) {
 			struct ft_pub_rec rec = { .n = 0 };
 
-			/* VALIDATE (§4.B): guard the LIVE kept compressed node cn. */
+			/* VALIDATE (§4.B): guard the LIVE kept compressed node cn.
+			 * DLM: cn's RELEASE was acquired + recorded up front under
+			 * lock_fine, so skip the incremental lock here. */
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+			if (!ft->lock_fine)
+				ft_flip_txn_lock_or_guard_parent(ft, txn,
+					ft_compressed_node_flag(cn));
+#else
 			ft_flip_txn_lock_or_guard_parent(ft, txn,
 				ft_compressed_node_flag(cn));
+#endif
 			_ft_publish_to_parent(ft, ft_compressed_node_flag(cn),
 				&cn->child,
 				(struct cds_ft_inode_flag *) topmost_external_nodes,
@@ -191,9 +231,17 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			 * release store (ft_ord_cell_flip_one), so this stays allocation-
 			 * free and infallible for the common plain-parent case.
 			 */
-			/* VALIDATE (§4.B): guard the LIVE kept compressed node cn. */
+			/* VALIDATE (§4.B): guard the LIVE kept compressed node cn.
+			 * DLM: cn's RELEASE was acquired + recorded up front under
+			 * lock_fine, so skip the incremental lock here. */
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+			if (!ft->lock_fine)
+				ft_flip_txn_lock_or_guard_parent(ft, txn,
+					ft_compressed_node_flag(cn));
+#else
 			ft_flip_txn_lock_or_guard_parent(ft, txn,
 				ft_compressed_node_flag(cn));
+#endif
 			_ft_publish_to_parent(ft, ft_compressed_node_flag(cn),
 				&cn->child,
 				(struct cds_ft_inode_flag *) topmost_external_nodes,
@@ -234,6 +282,52 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			ft_resolve_parent_slot(src_meta, ft, &pub_parent);
 
 		fresh_meta->parent = pub_parent;
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+		/*
+		 * DLM Step 1: acquire {src_cn (RETIRE), pub_parent (RELEASE)} in ONE
+		 * MCAS up front (guard src_cn.parent==pub_parent), replacing the
+		 * pub_parent lock_or_guard + the PLAIN src_cn tombstone (a peer state
+		 * change under the fence now aborts).  This compressed->fresh-internal
+		 * sub-case is test-under-covered, so it mirrors the chain-compress
+		 * pattern exactly.  pub_parent NULL (compressed ROOT retire) => the
+		 * set is {src_cn} only.
+		 */
+		struct cds_ft_metadata *src_cn_meta_a =
+			cds_ft_item_to_metadata((struct cds_ft_inode *) src_cn);
+		uintptr_t src_snap = 0;
+		bool dlm_a2 = false;
+
+		if (ft->lock_fine) {
+			struct cds_ft_metadata *pp_meta = pub_parent
+				? ft_flag_to_metadata(ft, pub_parent) : NULL;
+			struct ft_dlm_member set[2];
+			int dret;
+
+			set[0] = (struct ft_dlm_member){ .meta = src_cn_meta_a,
+				.guard_child = src_cn_meta_a, .guard_pf = pub_parent };
+			set[1] = (struct ft_dlm_member){ .meta = pp_meta };
+			dret = ft_dlm_acquire_set(ft, set, 2);
+			if (dret) {
+				free_cds_ft_node_unpublished(ft, fresh);
+				/*
+				 * Pre-commit bail: on -EAGAIN the caller-owned txn is
+				 * NOT destroyed by the caller, so destroy it here; on
+				 * -ENOMEM the caller destroys it (its != -EAGAIN arm).
+				 */
+				if (dret == -EAGAIN)
+					ft_flip_txn_destroy(txn);
+				return dret;	/* nothing acquired (all-or-none) */
+			}
+			src_snap = set[0].snap;
+			ft_flip_txn_copying_register(txn, src_cn_meta_a);
+			if (pp_meta) {
+				ft_flip_txn_record_release_copying(txn, pp_meta,
+					set[1].snap);
+				ft_flip_txn_copying_register(txn, pp_meta);
+			}
+			dlm_a2 = true;
+		}
+#endif
 		/*
 		 * nr_keys fold (LEAF Increment 2): the fresh internal REPLACES the
 		 * retired compressed node, so it carries the retired node's
@@ -260,8 +354,14 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			 * stays a single release store.
 			 */
 			/* VALIDATE (§4.B): lock (or guard-fallback) the
-			 * coherently-resolved grandparent -- value-swap target (§10.5). */
+			 * coherently-resolved grandparent -- value-swap target (§10.5).
+			 * DLM: pub_parent's RELEASE was acquired up front under lock_fine. */
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+			if (!ft->lock_fine)
+				ft_flip_txn_lock_or_guard_parent(ft, txn, pub_parent);
+#else
 			ft_flip_txn_lock_or_guard_parent(ft, txn, pub_parent);
+#endif
 			_ft_publish_to_parent(ft, pub_parent,
 				pub_slot,
 				ft_node_flag(fresh, 0),
@@ -275,9 +375,20 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			 * detach).  This detach sub-case is not reached by the current
 			 * test suite (verified: zero hits across ft_unit + ft_inv both
 			 * list modes), so the freeze-on-free audit never exercises it.
+			 * DLM: src_cn was COPYING-acquired up front, so record the FENCED
+			 * {COPYING|s -> TOMBSTONE|s} terminal (a peer state change aborts).
 			 */
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+			if (dlm_a2)
+				ft_flip_txn_record_tombstone_copying(txn, src_cn_meta_a,
+					src_snap);
+			else
+				ft_flip_txn_record_tombstone(txn, cds_ft_item_to_metadata(
+					(struct cds_ft_inode *) src_cn));
+#else
 			ft_flip_txn_record_tombstone(txn, cds_ft_item_to_metadata(
 				(struct cds_ft_inode *) src_cn));
+#endif
 			/*
 			 * nr_keys fold (LEAF Increment 2): the removed leaf's -1
 			 * walk from the fresh node's stable parent up to root rides
