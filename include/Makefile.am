@@ -32,6 +32,8 @@ nobase_include_HEADERS = \
 	urcu/flavor.h \
 	urcu/rcu-txn-sw.h \
 	urcu/rcu-mcas.h \
+	urcu/rcu-mcas-sw-mw.h \
+	urcu/rcu-txn-sw-mw.h \
 	urcu/rcu-txn-slab.h \
 	urcu/rcu-txn-status.h \
 	urcu/rcu-txn.h \

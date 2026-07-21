@@ -35,13 +35,16 @@
 
 #include <urcu/rcu-mcas.h>
 #include <urcu/rcu-txn-sw.h>
+#include <urcu/rcu-mcas-sw-mw.h>	/* engine layer only (flavor-free) */
 
 struct urcu_slab urcu_mcas_slab;
 struct urcu_slab urcu_txn_sw_slab;
+struct urcu_slab urcu_txn_sw_mw_slab;
 
 /* Byte size per record-count class; filled at init, must outlive the slab. */
 static size_t urcu_mcas_slab_bytes[URCU_MCAS_SLAB_NCLASS];
 static size_t urcu_txn_sw_slab_bytes[URCU_TXN_SW_SLAB_NCLASS];
+static size_t urcu_txn_sw_mw_slab_bytes[URCU_TXN_SW_MW_SLAB_NCLASS];
 
 static __attribute__((constructor))
 void urcu_txn_slab_ctor(void)
@@ -57,4 +60,9 @@ void urcu_txn_slab_ctor(void)
 				urcu_txn_sw_blocksize(urcu_txn_sw_slab_rc[i]);
 	urcu_slab_init(&urcu_txn_sw_slab, urcu_txn_sw_slab_bytes,
 			URCU_TXN_SW_SLAB_NCLASS, "txn_sw");
+	for (i = 0; i < URCU_TXN_SW_MW_SLAB_NCLASS; i++)
+		urcu_txn_sw_mw_slab_bytes[i] =
+				urcu_txn_sw_mw_blocksize(urcu_txn_sw_mw_slab_rc[i]);
+	urcu_slab_init(&urcu_txn_sw_mw_slab, urcu_txn_sw_mw_slab_bytes,
+			URCU_TXN_SW_MW_SLAB_NCLASS, "txn_sw_mw");
 }

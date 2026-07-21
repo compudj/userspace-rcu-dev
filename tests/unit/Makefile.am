@@ -25,6 +25,7 @@ noinst_PROGRAMS = \
 	test_uatomic_cxx \
 	test_rcu_txn_sw \
 	test_rcu_mcas \
+	test_rcu_txn_sw_mw \
 	test_rcu_txn \
 	test_rcu_txn_grow \
 	test_rcu_txn_fallback \
@@ -84,6 +85,7 @@ TESTS = \
 	test_uatomic_cxx \
 	test_rcu_txn_sw \
 	test_rcu_mcas \
+	test_rcu_txn_sw_mw \
 	test_rcu_txn \
 	test_rcu_txn_grow \
 	test_rcu_txn_fallback \
@@ -166,6 +168,9 @@ test_rcu_txn_sw_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
 
 test_rcu_mcas_SOURCES = test_rcu_mcas.c
 test_rcu_mcas_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
+
+test_rcu_txn_sw_mw_SOURCES = test_rcu_txn_sw_mw.c
+test_rcu_txn_sw_mw_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
 
 test_rcu_txn_SOURCES = test_rcu_txn.c
 test_rcu_txn_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
