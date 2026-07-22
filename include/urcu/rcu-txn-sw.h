@@ -96,7 +96,7 @@
  *      record array but installs nothing; the record set is FROZEN once
  *      commit() parks the proxies, matching the concurrent engine's contract
  *      (no edge may be added once a proxy is parked), so an embedder written
- *      against this transaction can migrate to <urcu/rcu-mcas.h> mechanically.
+ *      against this transaction can migrate to <urcu/rcu-txn-mcas.h> mechanically.
  *      commit() parks every recorded proxy, flips the group and settles to new,
  *      then OWNS reclaim: it defers the txn through call_rcu() when it parked
  *      proxies, or frees it at once on the single-edge / empty / OOM paths.
@@ -215,7 +215,7 @@ void urcu_txn_sw_group_commit(struct urcu_txn_sw_group *group)
  * but installs NOTHING -- no proxy address is live yet, so the array grows by
  * realloc.  The record set is FROZEN once proxies are installed (which commit()
  * does internally), so record() must precede commit().  This is the same
- * frozen-set contract as the concurrent engine (<urcu/rcu-mcas.h>), so
+ * frozen-set contract as the concurrent engine (<urcu/rcu-txn-mcas.h>), so
  * a single-writer embedder can later migrate to concurrent writers without
  * restructuring its mutations.  Two more contracts shared with that engine:
  * records must target PAIRWISE-DISTINCT slots -- unlike the concurrent
@@ -538,7 +538,7 @@ static const unsigned int urcu_txn_sw_slab_rc[] = { 4u, 8u, 16u, 32u, 64u, 128u 
 /*
  * The slab INSTANCE lives once, in liburcu-common (src/urcu-txn.c), which also
  * initializes it from a library constructor -- so this header requires linking
- * liburcu-common.  See the matching note in <urcu/rcu-mcas.h> for why a
+ * liburcu-common.  See the matching note in <urcu/rcu-txn-mcas.h> for why a
  * header-static definition would be wrong (per-TU arena/superblock
  * multiplication, non-shared freelists).
  */

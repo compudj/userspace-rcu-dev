@@ -15,19 +15,18 @@
  * park (SW) -- the atomicity guarantee (a set of slots switched as one against
  * the control word) is the same either way.  The begin/load/store/commit
  * bracket with aging escalation and the fair-mutex fallback lane lives in the
- * front-end <urcu/rcu-txn.h> (which includes this header) -- the same
- * primitive/front-end split as <urcu/rcu-mcas.h> (the multi-writer-only k-CAS).
+ * front-end <urcu/rcu-txn.h> (which includes this header).
  *
  * One transaction commit can carry BOTH single-writer (SW) and multi-writer
- * (MW) records, committed atomically against ONE linearization point.  This is
- * the unification of the two sibling engines:
+ * (MW) records, committed atomically against ONE linearization point.  This
+ * unifies two install disciplines:
  *
  *   - <urcu/rcu-txn-sw.h> (SW): a group selector flipped once by the sole
  *     writer, records PARKED with a plain store (the caller holds a lock over
  *     every recorded slot, so the park cannot be raced and cannot fail).
- *   - <urcu/rcu-mcas.h> (MW): descriptors resolved through a status word,
- *     records PLANTED with a sole-driver CAS (a concurrent writer that changed
- *     the slot fails the CAS -> the whole transaction aborts).
+ *   - MW (a practical k-CAS): records resolved through a status word, PLANTED
+ *     with a sole-driver CAS -- a concurrent writer that changed the slot fails
+ *     the CAS, so the whole transaction aborts.
  *
  * A structural edit that must atomically touch a single-writer-owned slot AND a
  * multi-writer slot had no single commit spanning both in those engines; it
@@ -45,7 +44,7 @@
  * was two INCOMPATIBLE layouts at one tag; here they are one layout).  The kinds
  * differ ONLY on the writer side (install and settle), never on resolve.
  *
- * Commit is single-driver, no helping -- exactly like <urcu/rcu-mcas.h>.  The
+ * Commit is single-driver, no helping.  The
  * owner drives install / decide / settle end to end; a contended MW slot's proxy
  * is a spinlatch a peer waits out (bounded) or escalates past, never one it
  * drives.  Because no helper competes on the control word, the commit point is a
@@ -92,7 +91,7 @@
  *      {old, new, *status} -- so mixing kinds in one structure is safe by
  *      construction.
  *
- * Constraints (as <urcu/rcu-mcas.h>):
+ * Constraints:
  *   - the engine owns tag bit 0 by default, so every value stored in a
  *     transacted slot must be at least 2-byte aligned (bit 0 clear); an embedder
  *     may use a wider per-record tag (see the proxy tag scheme);
@@ -129,7 +128,7 @@ extern "C" {
  * Single-edge escalation threshold: a lone MW record commits with a bare CAS and
  * no descriptor until it has retried this many times, after which it commits
  * through the full descriptor protocol so it can hold the slot latched against
- * contenders.  Mirrors URCU_MCAS_ESCALATE.
+ * contenders.
  */
 #ifndef URCU_TXN_ESCALATE
 #define URCU_TXN_ESCALATE 16
@@ -137,7 +136,7 @@ extern "C" {
 
 /*
  * Spins on a blocker's status before an installer escalates (aborts and retries
- * at a higher aging priority).  Mirrors URCU_MCAS_WAIT_PATIENCE.
+ * at a higher aging priority).
  */
 #ifndef URCU_TXN_WAIT_PATIENCE
 #define URCU_TXN_WAIT_PATIENCE 8192
@@ -264,7 +263,7 @@ int urcu_txn_is_proxy(void *v, uintptr_t tag)
 	return ((uintptr_t) v & tag) == tag;
 }
 
-/* Strong try-CAS returning a success bit (see urcu_mcas_try_cas). */
+/* Strong try-CAS returning a success bit. */
 static inline
 int urcu_txn_try_cas(void **slot, void *expect, void *desired)
 {
@@ -317,7 +316,7 @@ void urcu_txn_decide(struct urcu_txn_desc *t, unsigned long to)
 /*
  * Plant an MW record: CAS its slot from old_ptr to the record's tagged proxy.
  * Returns 1 if planted, 0 if the CAS raced the slot away.  A bare value-CAS is
- * correct because the owner is the SOLE driver (see <urcu/rcu-mcas.h>).
+ * correct because the owner is the SOLE driver.
  */
 static inline
 int urcu_txn_plant(struct urcu_txn_record *r)
@@ -547,7 +546,7 @@ void *urcu_txn_read_optimistic(void **slot, uintptr_t tag)
 
 /*
  * ─────────────────────────────────────────────────────────────────────────
- * Descriptor allocation: one per-CPU size-classed slab (mirrors rcu-mcas.h).
+ * Descriptor allocation: one per-CPU size-classed slab.
  * The mixed descriptor header and record stride equal the MW engine's, so the
  * class byte-sizes coincide; a dedicated instance keeps the engines decoupled.
  * ─────────────────────────────────────────────────────────────────────────
@@ -660,6 +659,22 @@ bool urcu_txn_add(struct urcu_txn_desc *t, void **slot,
 	if (kind == URCU_TXN_KIND_MW)
 		t->nr_mw++;
 	return true;
+}
+
+/* Append a MULTI-WRITER edge (CAS-old install).  Convenience over urcu_txn_add. */
+static inline
+bool urcu_txn_add_mw(struct urcu_txn_desc *t, void **slot,
+		void *old_ptr, void *new_ptr, uintptr_t tag)
+{
+	return urcu_txn_add(t, slot, old_ptr, new_ptr, tag, URCU_TXN_KIND_MW);
+}
+
+/* Append a SINGLE-WRITER edge (caller-exclusive plain park).  Convenience. */
+static inline
+bool urcu_txn_add_sw(struct urcu_txn_desc *t, void **slot,
+		void *old_ptr, void *new_ptr, uintptr_t tag)
+{
+	return urcu_txn_add(t, slot, old_ptr, new_ptr, tag, URCU_TXN_KIND_SW);
 }
 
 static inline

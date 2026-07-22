@@ -17,7 +17,7 @@
  *
  * ENCODING -- identical to the concurrent twin, deliberately.  The engine owns
  * tag bit 0 of every transacted slot: a settled literal must have
- * (value & URCU_MCAS_TAG) != URCU_MCAS_TAG, i.e. bit 0 clear, or it is mistaken
+ * (value & URCU_TXN_SW_BITMAP_TAG) != URCU_TXN_SW_BITMAP_TAG, i.e. bit 0 clear, or it is mistaken
  * for a parked proxy.  A bitmap word is all data, so we spend bit 0 as the tag
  * and keep 63 data bits per word (CAA_BITS_PER_LONG - 1): logical bit i lives
  * at PHYSICAL bit i+1, and a settled word always has bit 0 == 0.
@@ -122,9 +122,17 @@
 
 #include <urcu/compiler.h>		/* CAA_BITS_PER_LONG, caa_unlikely */
 #include <urcu/uatomic.h>
-#include <urcu/rcu-mcas.h>		/* URCU_MCAS_TAG */
 #include <urcu/rcu-txn-status.h>	/* enum urcu_txn_status */
 #include <urcu/rcu-txn-sw.h>		/* urcu_txn_sw_load/record_chain/commit/... */
+
+/*
+ * Proxy tag for every bitmap slot.  Override before include to drive the words
+ * under an embedder's own tag; must satisfy (value & TAG) != TAG for every live
+ * value a word holds (bit 0 clear -- every packed count is stored << 1).
+ */
+#ifndef URCU_TXN_SW_BITMAP_TAG
+#define URCU_TXN_SW_BITMAP_TAG	1UL
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -160,9 +168,9 @@ uintptr_t urcu_txn_sw_bitmap_word_rcu(const uintptr_t *words, size_t w)
 	uintptr_t v = (uintptr_t) uatomic_load(&((uintptr_t *) words)[w],
 			CMM_ACQUIRE);
 
-	if (caa_unlikely((v & URCU_MCAS_TAG) == URCU_MCAS_TAG)) {
+	if (caa_unlikely((v & URCU_TXN_SW_BITMAP_TAG) == URCU_TXN_SW_BITMAP_TAG)) {
 		struct urcu_txn_sw_proxy *proxy = (struct urcu_txn_sw_proxy *)
-				(v & ~(uintptr_t) URCU_MCAS_TAG);
+				(v & ~(uintptr_t) URCU_TXN_SW_BITMAP_TAG);
 
 		return (uintptr_t) urcu_txn_sw_proxy_get(proxy);
 	}
@@ -290,10 +298,10 @@ int urcu_txn_sw_bitmap__word_edit(struct urcu_txn_sw_txn *txn, uintptr_t *words,
 	void **slot = (void **) &words[w];
 	uintptr_t old;
 
-	old = (uintptr_t) urcu_txn_sw_load(txn, slot, URCU_MCAS_TAG);
+	old = (uintptr_t) urcu_txn_sw_load(txn, slot, URCU_TXN_SW_BITMAP_TAG);
 	return urcu_txn_sw_record_chain(txn, slot, (void *) old,
 			(void *) (set ? (old | mask) : (old & ~mask)),
-			URCU_MCAS_TAG) ? 0 : -ENOMEM;
+			URCU_TXN_SW_BITMAP_TAG) ? 0 : -ENOMEM;
 }
 
 /*

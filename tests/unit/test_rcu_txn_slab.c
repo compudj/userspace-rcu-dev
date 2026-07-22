@@ -5,7 +5,7 @@
 /*
  * Unit test for <urcu/rcu-txn-slab.h>, the generic per-CPU size-classed
  * superblock slab that supplies MCAS transaction descriptors to both engines
- * (rcu-mcas.h "mcas" instance, rcu-txn-sw.h "txn_sw" instance).  The engine
+ * (rcu-txn-mcas.h "mcas" instance, rcu-txn-sw.h "txn_sw" instance).  The engine
  * unit tests exercise the slab only IMPLICITLY (every commit allocates a
  * descriptor through it), so a gross defect surfaces as a crash/leak/corruption
  * there -- but the slab's own invariants are never directly asserted.  This test

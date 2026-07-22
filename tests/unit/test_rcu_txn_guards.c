@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
 /*
- * Test the ENGINE CONTRACT GUARDS of <urcu/rcu-mcas.h> and <urcu/rcu-txn-sw.h>:
+ * Test the ENGINE CONTRACT GUARDS of <urcu/rcu-txn-mcas.h> and <urcu/rcu-txn-sw.h>:
  * the debug assertions that turn a violated precondition into an immediate,
  * localized abort instead of silent corruption far away.
  *
@@ -74,7 +74,6 @@
 #include <urcu/compiler.h>
 #include <urcu-qsbr.h>
 #include <urcu-call-rcu.h>
-#include <urcu/rcu-mcas.h>
 #include <urcu/rcu-txn.h>
 #include <urcu/rcu-txn-sw.h>
 

@@ -25,7 +25,7 @@ lib_LTLIBRARIES = liburcu-common.la \
 # liburcu-common contains wait-free queues (needed by call_rcu) as well
 # as futex fallbacks.  urcu-txn.c holds the transaction engines' shared
 # state (the single strong definition of the per-CPU descriptor slabs the
-# header-inline engines in <urcu/rcu-mcas.h> / <urcu/rcu-txn-sw.h> use).
+# header-inline engines in <urcu/rcu-txn-mcas.h> / <urcu/rcu-txn-sw.h> use).
 #
 liburcu_common_la_SOURCES = wfqueue.c wfcqueue.c wfstack.c urcu-txn.c $(COMPAT)
 

@@ -70,21 +70,21 @@ static int tag_invariant_ok(const uintptr_t *words, size_t nwords)
 	size_t w;
 
 	for (w = 0; w < nwords; w++)
-		if (words[w] & URCU_MCAS_TAG)
+		if (words[w] & URCU_TXN_SW_BITMAP_TAG)
 			return 0;
 	return 1;
 }
 
 /*
- * Resolve a non-bitmap slot transacted under URCU_MCAS_TAG (the pointer half of
+ * Resolve a non-bitmap slot transacted under URCU_TXN_SW_BITMAP_TAG (the pointer half of
  * the composition test).  The bitmap's own words go through
  * urcu_txn_sw_bitmap_word_rcu(); this is the same two lines for a plain slot.
  */
 static void *sw_resolve(void *v)
 {
-	if ((uintptr_t) v & URCU_MCAS_TAG)
+	if ((uintptr_t) v & URCU_TXN_SW_BITMAP_TAG)
 		return urcu_txn_sw_proxy_get((struct urcu_txn_sw_proxy *)
-				((uintptr_t) v & ~(uintptr_t) URCU_MCAS_TAG));
+				((uintptr_t) v & ~(uintptr_t) URCU_TXN_SW_BITMAP_TAG));
 	return v;
 }
 
@@ -199,7 +199,7 @@ static void test_compose_single(void)
 
 	urcu_txn_sw_init(&t);				/* set bit 10 AND publish slot */
 	(void) urcu_txn_sw_bitmap_set_prepare(&t, bm, 10);
-	(void) urcu_txn_sw_record(&t, (void **) &slot, NULL, sent, URCU_MCAS_TAG);
+	(void) urcu_txn_sw_record(&t, (void **) &slot, NULL, sent, URCU_TXN_SW_BITMAP_TAG);
 	set_ok = urcu_txn_sw_commit(&t) == URCU_TXN_STATUS_OK;
 	rcu_read_lock();
 	set_ok &= urcu_txn_sw_bitmap_test_rcu(bm, 10)
@@ -209,7 +209,7 @@ static void test_compose_single(void)
 
 	urcu_txn_sw_init(&t);				/* clear bit 10 AND clear slot */
 	(void) urcu_txn_sw_bitmap_clear_prepare(&t, bm, 10);
-	(void) urcu_txn_sw_record(&t, (void **) &slot, sent, NULL, URCU_MCAS_TAG);
+	(void) urcu_txn_sw_record(&t, (void **) &slot, sent, NULL, URCU_TXN_SW_BITMAP_TAG);
 	clr_ok = urcu_txn_sw_commit(&t) == URCU_TXN_STATUS_OK;
 	rcu_read_lock();
 	clr_ok &= !urcu_txn_sw_bitmap_test_rcu(bm, 10)
@@ -342,7 +342,7 @@ static void *t4_reader(void *unused __attribute__((unused)))
 			uintptr_t raw = uatomic_load(&t4_bm[w], CMM_ACQUIRE);
 			int pop;
 
-			if ((raw & URCU_MCAS_TAG) == URCU_MCAS_TAG)
+			if ((raw & URCU_TXN_SW_BITMAP_TAG) == URCU_TXN_SW_BITMAP_TAG)
 				proxy++;	/* caught the install..settle window */
 			pop = __builtin_popcountl(
 					urcu_txn_sw_bitmap_word_rcu(t4_bm, w));

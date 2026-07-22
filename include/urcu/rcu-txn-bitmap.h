@@ -16,7 +16,7 @@
  *
  * ENCODING.  The engine owns tag bit 0 of every transacted slot: a settled
  * literal must have (value & URCU_TXN_TAG) != URCU_TXN_TAG, i.e. bit 0 clear,
- * or it is mistaken for an in-flight descriptor (rcu-mcas.h tag contract).  A
+ * or it is mistaken for an in-flight descriptor (rcu-txn-mcas.h tag contract).  A
  * bitmap word is all data, so we spend bit 0 as the tag and keep 63 data bits
  * per word (CAA_BITS_PER_LONG - 1).  This is exactly the engine's documented
  * "store small integers shifted left by 1" discipline: logical bit i lives at

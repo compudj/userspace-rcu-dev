@@ -5,7 +5,7 @@
 /*
  * Generic per-CPU size-classed superblock slab (transaction descriptors).
  *
- * Both the concurrent (rcu-mcas.h) and single-writer (rcu-txn-sw.h) engines
+ * Both the concurrent (rcu-txn-mcas.h) and single-writer (rcu-txn-sw.h) engines
  * allocate one variable-size descriptor block per attempt and free it, cross
  * thread, from the reclaim worker.  A per-thread malloc cache cannot recycle a
  * cross-thread free, and at scale servicing every attempt from glibc serializes

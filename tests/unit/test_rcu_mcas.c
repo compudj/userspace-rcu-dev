@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
 /*
- * Direct stress test for the RCU MCAS engine <urcu/rcu-mcas.h>,
+ * Direct stress test for the RCU MCAS engine <urcu/rcu-txn-mcas.h>,
  * independent of any data structure.
  *
  * Invariant (atomicity): the shared array starts all-zero, and every
@@ -66,19 +66,19 @@
 struct lf_stat {
 	unsigned long drive;	/* drive() entries -- one per commit attempt (single driver) */
 	unsigned long escalate;	/* single-edge ops promoted to the descriptor path */
-	unsigned long wait_capped;	/* foreign-proxy wait hit URCU_MCAS_WAIT_PATIENCE -> abort+escalate */
+	unsigned long wait_capped;	/* foreign-proxy wait hit URCU_TXN_WAIT_PATIENCE -> abort+escalate */
 };
 static __thread struct lf_stat t_stat;
-#define URCU_MCAS_STAT(counter)	(t_stat.counter++)
+#define URCU_TXN_STAT(counter)	(t_stat.counter++)
 
 /*
  * Force single-edge escalation to fire promptly so the mixed phase reliably
  * exercises that path (the shipped default is higher); the mechanism is what's
  * under test, not the threshold value.
  */
-#define URCU_MCAS_ESCALATE	4
+#define URCU_TXN_ESCALATE	4
 
-#include <urcu/rcu-mcas.h>
+#include <urcu/rcu-txn-mcas.h>
 
 #include "tap.h"
 
@@ -196,17 +196,17 @@ static void *worker(void *arg)
 			rng = xs(rng);
 			w = (int) (rng % nwords);
 			do {
-				struct urcu_mcas *t;
+				struct urcu_txn_desc *t;
 				uintptr_t ow;
 
 				rcu_read_lock();
-				t = urcu_mcas_create(1, retry);
+				t = urcu_txn_create(1, retry);
 				if (!t)
 					abort();
-				ow = (uintptr_t) urcu_mcas_read(&g_word[w], URCU_MCAS_TAG);
-				urcu_mcas_add(t, &g_word[w],
-					(void *) ow, (void *) lf_bump(ow, 1), URCU_MCAS_TAG);
-				ok = urcu_mcas_commit(t, call_rcu);
+				ow = (uintptr_t) urcu_txn_read(&g_word[w], URCU_TXN_TAG);
+				urcu_txn_add_mw(t, &g_word[w],
+					(void *) ow, (void *) lf_bump(ow, 1), URCU_TXN_TAG);
+				ok = urcu_txn_desc_commit(t, call_rcu);
 				rcu_read_unlock();
 				if (!ok)
 					retry++;
@@ -227,7 +227,7 @@ static void *worker(void *arg)
 				k = (k + 1) % (int) nwords;
 
 			do {
-				struct urcu_mcas *t;
+				struct urcu_txn_desc *t;
 				uintptr_t oi, oj, ok2;
 
 				/*
@@ -237,24 +237,24 @@ static void *worker(void *arg)
 				 * QSBR, required for the memb/mb flavors.
 				 */
 				rcu_read_lock();
-				t = urcu_mcas_create(3, retry);
+				t = urcu_txn_create(3, retry);
 				if (!t)
 					abort();
-				oi = (uintptr_t) urcu_mcas_read(&g_word[i], URCU_MCAS_TAG);
-				oj = (uintptr_t) urcu_mcas_read(&g_word[j], URCU_MCAS_TAG);
-				urcu_mcas_add(t, &g_word[i],
-					(void *) oi, (void *) lf_bump(oi, 2), URCU_MCAS_TAG);
+				oi = (uintptr_t) urcu_txn_read(&g_word[i], URCU_TXN_TAG);
+				oj = (uintptr_t) urcu_txn_read(&g_word[j], URCU_TXN_TAG);
+				urcu_txn_add_mw(t, &g_word[i],
+					(void *) oi, (void *) lf_bump(oi, 2), URCU_TXN_TAG);
 				if (three) {
-					ok2 = (uintptr_t) urcu_mcas_read(&g_word[k], URCU_MCAS_TAG);
-					urcu_mcas_add(t, &g_word[j],
-						(void *) oj, (void *) lf_bump(oj, 2), URCU_MCAS_TAG);
-					urcu_mcas_add(t, &g_word[k],
-						(void *) ok2, (void *) lf_bump(ok2, -4), URCU_MCAS_TAG);
+					ok2 = (uintptr_t) urcu_txn_read(&g_word[k], URCU_TXN_TAG);
+					urcu_txn_add_mw(t, &g_word[j],
+						(void *) oj, (void *) lf_bump(oj, 2), URCU_TXN_TAG);
+					urcu_txn_add_mw(t, &g_word[k],
+						(void *) ok2, (void *) lf_bump(ok2, -4), URCU_TXN_TAG);
 				} else {
-					urcu_mcas_add(t, &g_word[j],
-						(void *) oj, (void *) lf_bump(oj, -2), URCU_MCAS_TAG);
+					urcu_txn_add_mw(t, &g_word[j],
+						(void *) oj, (void *) lf_bump(oj, -2), URCU_TXN_TAG);
 				}
-				ok = urcu_mcas_commit(t, call_rcu);
+				ok = urcu_txn_desc_commit(t, call_rcu);
 				rcu_read_unlock();
 				if (!ok)
 					retry++;

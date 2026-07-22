@@ -98,7 +98,7 @@
  * ----------------------------------------------------------------------
  * Every slot of the hlist is transacted under URCU_TXN_SW_HLIST_TAG, the flip
  * proxy tag (<urcu/rcu-txn-sw.h>).  It is a compile-time define (default
- * URCU_MCAS_TAG, bit 0) rather than a per-call argument, so the head costs no
+ * bit 0) rather than a per-call argument, so the head costs no
  * extra storage and call sites stay kernel-terse, and rather than a hard-coded
  * constant so an embedder whose head lives in a slot it already transacts under
  * its OWN tag (e.g. the fractal trie's low-nibble child-slot tag) can
@@ -140,7 +140,6 @@
 #include <urcu/compiler.h>
 #include <urcu/uatomic.h>
 #include <urcu/call-rcu.h>		/* struct rcu_head */
-#include <urcu/rcu-mcas.h>		/* URCU_MCAS_TAG default */
 #include <urcu/rcu-txn-sw.h>
 #include <urcu-pointer.h>		/* rcu_dereference / rcu_assign_pointer */
 
@@ -154,7 +153,7 @@ extern "C" {
  * satisfy (value & TAG) != TAG for every live value any slot holds.
  */
 #ifndef URCU_TXN_SW_HLIST_TAG
-#define URCU_TXN_SW_HLIST_TAG	URCU_MCAS_TAG
+#define URCU_TXN_SW_HLIST_TAG	1UL
 #endif
 
 struct urcu_txn_sw_hlist_node {
