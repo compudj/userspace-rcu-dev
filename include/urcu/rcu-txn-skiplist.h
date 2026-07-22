@@ -7,7 +7,7 @@
 
 /*
  * rcu-txn-skiplist: an ordered, concurrent-writer skiplist built on the RCU
- * MCAS engine (<urcu/rcu-mcas.h>).  It is the ordered sibling of the hash-bucket
+ * MCAS engine (<urcu/rcu-txn-engine.h>).  It is the ordered sibling of the hash-bucket
  * <urcu/rcu-txn-hlist.h>: a node is a small tower of transacted forward "next"
  * pointers, and insert/delete/move commit EVERY level of the tower in ONE MCAS,
  * so a node appears or disappears at all levels atomically.  See the design note
@@ -49,7 +49,7 @@
  * The node is embedded LAST in the caller's element (the flexible array runs
  * past it); allocate sizeof(element) + (toplevel + 1) * sizeof(void *).  Every
  * slot -- a node's next[] and the head's next[] -- is transacted under
- * URCU_TXN_SKIPLIST_TAG (the engine proxy tag, default URCU_MCAS_TAG / bit 0,
+ * URCU_TXN_SKIPLIST_TAG (the engine proxy tag, default URCU_TXN_TAG / bit 0,
  * overridable before include like the hlist tag).  A "next" value carries an
  * optional deletion MARK on bit 1 (URCU_TXN_SKIPLIST_MARK), meaning "this node
  * is logically deleted"; readers strip it per hop (urcu_txn_skiplist_resolve).
@@ -175,7 +175,7 @@
 #include <urcu/compiler.h>
 #include <urcu/uatomic.h>
 #include <urcu/call-rcu.h>
-#include <urcu/rcu-mcas.h>
+#include <urcu/rcu-txn-engine.h>
 #include <urcu/rcu-txn.h>
 #include <urcu-pointer.h>
 
@@ -192,7 +192,7 @@ extern "C" {
  * before include to drive the chain under an embedder's own tag (see the hlist
  * header).  Must satisfy (value & TAG) != TAG for every live value a slot holds. */
 #ifndef URCU_TXN_SKIPLIST_TAG
-#define URCU_TXN_SKIPLIST_TAG		URCU_MCAS_TAG
+#define URCU_TXN_SKIPLIST_TAG		URCU_TXN_TAG
 #endif
 
 /* Logical-deletion mark: bit 1 of a node's next pointer (matches
@@ -251,7 +251,7 @@ struct urcu_txn_skiplist_node *urcu_txn_skiplist_resolve(void *raw)
 
 	if (caa_unlikely(v & (URCU_TXN_SKIPLIST_TAG | URCU_TXN_SKIPLIST_MARK)))
 		return urcu_txn_skiplist_unmark(
-				urcu_mcas_resolve(raw, URCU_TXN_SKIPLIST_TAG));
+				urcu_txn_resolve(raw, URCU_TXN_SKIPLIST_TAG));
 	return (struct urcu_txn_skiplist_node *) raw;
 }
 
@@ -345,7 +345,7 @@ int urcu_txn_skiplist_empty(struct urcu_txn_skiplist *sl)
  * are all such slots (&pred->next[L] and &node->next[L] are stored;
  * &succ->next[L] is folded into the read set), so they use the waiting
  * urcu_txn_load/_validate.  (Waiting, never driving: the owner is the sole
- * driver of its own install -- see <urcu/rcu-mcas.h>.)
+ * driver of its own install -- see <urcu/rcu-txn-engine.h>.)
  *
  * Read optimistically for NAVIGATION -- a slot this transaction will never store
  * nor validate.  The descent below is pure navigation: an UNDECIDED transaction
@@ -366,7 +366,7 @@ int urcu_txn_skiplist_empty(struct urcu_txn_skiplist *sl)
  */
 static inline
 struct urcu_txn_skiplist_node *urcu_txn_skiplist_next_txn(
-		struct urcu_mcas_txn *txn,
+		struct urcu_txn *txn,
 		struct urcu_txn_skiplist_node *node, unsigned int level)
 {
 	return urcu_txn_skiplist_resolve(urcu_txn_load_optimistic(txn,
@@ -397,7 +397,7 @@ struct urcu_txn_skiplist_node *urcu_txn_skiplist_next_txn(
  */
 static inline
 struct urcu_txn_skiplist_node *urcu_txn_skiplist_search(
-		struct urcu_mcas_txn *txn,
+		struct urcu_txn *txn,
 		struct urcu_txn_skiplist *sl, void *key,
 		struct urcu_txn_skiplist_node **update,
 		struct urcu_txn_skiplist_node **succ)
@@ -454,7 +454,7 @@ struct urcu_txn_skiplist_node *urcu_txn_skiplist_lookup_rcu(
  * mid-deletion (retry).  OOM is sticky to the commit.
  */
 static inline
-int urcu_txn_skiplist_insert_prepare(struct urcu_mcas_txn *txn,
+int urcu_txn_skiplist_insert_prepare(struct urcu_txn *txn,
 		struct urcu_txn_skiplist *sl,
 		struct urcu_txn_skiplist_node *newp, void *key)
 {
@@ -515,7 +515,7 @@ int urcu_txn_skiplist_insert_prepare(struct urcu_mcas_txn *txn,
 				return -EAGAIN;
 		}
 		newp->next[level] = succ;
-		urcu_txn_store(txn, (void **) &pred->next[level], pv, newp,
+		urcu_txn_store_mw(txn, (void **) &pred->next[level], pv, newp,
 				URCU_TXN_SKIPLIST_TAG);
 	}
 	return 0;
@@ -530,7 +530,7 @@ int urcu_txn_skiplist_insert_prepare(struct urcu_mcas_txn *txn,
  * to the commit.
  */
 static inline
-int urcu_txn_skiplist_del_prepare(struct urcu_mcas_txn *txn,
+int urcu_txn_skiplist_del_prepare(struct urcu_txn *txn,
 		struct urcu_txn_skiplist *sl, void *key,
 		struct urcu_txn_skiplist_node **removed)
 {
@@ -599,11 +599,11 @@ int urcu_txn_skiplist_del_prepare(struct urcu_mcas_txn *txn,
 			if (urcu_txn_skiplist_is_marked(snv))
 				return -EAGAIN;
 		}
-		urcu_txn_store(txn, (void **) &node->next[level], nv,
+		urcu_txn_store_mw(txn, (void **) &node->next[level], nv,
 				urcu_txn_skiplist_set_mark(
 					(struct urcu_txn_skiplist_node *) nv),
 				URCU_TXN_SKIPLIST_TAG);
-		urcu_txn_store(txn, (void **) &update[level]->next[level], pv,
+		urcu_txn_store_mw(txn, (void **) &update[level]->next[level], pv,
 				(struct urcu_txn_skiplist_node *) nv,
 				URCU_TXN_SKIPLIST_TAG);
 	}
@@ -621,7 +621,7 @@ int urcu_txn_skiplist_add_rcu(struct urcu_txn_skiplist *sl,
 		struct urcu_txn_skiplist_node *newp, void *key,
 		struct urcu_txn_domain *domain)
 {
-	struct urcu_mcas_txn txn;
+	struct urcu_txn txn;
 	int ret, prep;
 
 	urcu_txn_init(&txn, domain);
@@ -658,7 +658,7 @@ int urcu_txn_skiplist_del_rcu(struct urcu_txn_skiplist *sl, void *key,
 		struct urcu_txn_skiplist_node **removed)
 {
 	struct urcu_txn_skiplist_node *node;
-	struct urcu_mcas_txn txn;
+	struct urcu_txn txn;
 	int ret, prep;
 
 	if (removed != NULL)

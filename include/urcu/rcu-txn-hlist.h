@@ -7,7 +7,7 @@
 
 /*
  * rcu-txn-hlist: a kernel-hlist-shaped, single-pointer-head RCU list with
- * concurrent writers, built on the RCU MCAS engine (<urcu/rcu-mcas.h>).  It is
+ * concurrent writers, built on the RCU MCAS engine (<urcu/rcu-txn-engine.h>).  It is
  * the hash-bucket sibling of the circular bidirectional <urcu/rcu-txn-list.h>:
  * where that list embeds a full sentinel node (16 B: next+prev) as its head,
  * an hlist head is a SINGLE pointer (8 B), so a table of buckets is half the
@@ -34,8 +34,8 @@
  * ----------------------------------------------------------------------
  * Every slot of the hlist -- the bucket head-first slot AND every node
  * next/pprev slot -- is transacted under URCU_TXN_HLIST_TAG, the engine proxy
- * tag (see <urcu/rcu-mcas.h>).  It is a compile-time define (default
- * URCU_MCAS_TAG, bit 0) rather than a per-call argument, so the head costs no
+ * tag (see <urcu/rcu-txn-engine.h>).  It is a compile-time define (default
+ * URCU_TXN_TAG, bit 0) rather than a per-call argument, so the head costs no
  * extra storage and call sites stay kernel-terse, and rather than a hard-coded
  * constant so an embedder whose head lives in a slot it already transacts under
  * its OWN tag can compile the chain under that tag: the fractal trie tags its
@@ -181,7 +181,7 @@
 #include <urcu/compiler.h>
 #include <urcu/uatomic.h>
 #include <urcu/call-rcu.h>
-#include <urcu/rcu-mcas.h>
+#include <urcu/rcu-txn-engine.h>
 #include <urcu/rcu-txn.h>
 #include <urcu-pointer.h>
 
@@ -196,7 +196,7 @@ extern "C" {
  * every live value any slot holds -- see the header contract.
  */
 #ifndef URCU_TXN_HLIST_TAG
-#define URCU_TXN_HLIST_TAG	URCU_MCAS_TAG
+#define URCU_TXN_HLIST_TAG	URCU_TXN_TAG
 #endif
 
 /*
@@ -212,7 +212,7 @@ extern "C" {
  * The non-aliasing contract between the two, stated in the header intro, is
  * what keeps a ghost's marked "next" from reading as an engine proxy.  Should
  * an override make MARK set all of TAG's bits, every marked next would satisfy
- * urcu_mcas_is_proxy() and a reader would fabricate a record pointer out of a
+ * urcu_txn_is_proxy() and a reader would fabricate a record pointer out of a
  * plain node address -- a wild dereference on the read side, in a build that
  * still compiles.  It is a pure compile-time property of two macros: check it
  * at compile time.
@@ -284,7 +284,7 @@ struct urcu_txn_hlist_node *urcu_txn_hlist_resolve(void *raw)
 
 	if (caa_unlikely(v & (URCU_TXN_HLIST_TAG | URCU_TXN_HLIST_MARK)))
 		return urcu_txn_hlist_unmark(
-				urcu_mcas_resolve(raw, URCU_TXN_HLIST_TAG));
+				urcu_txn_resolve(raw, URCU_TXN_HLIST_TAG));
 	return (struct urcu_txn_hlist_node *) raw;
 }
 
@@ -339,7 +339,7 @@ int urcu_txn_hlist_empty(struct urcu_txn_hlist_head *head)
  * urcu_txn_declare_disjoint() in <urcu/rcu-txn.h>.
  */
 static inline
-int urcu_txn_hlist_insert_at_slot_prepare(struct urcu_mcas_txn *txn,
+int urcu_txn_hlist_insert_at_slot_prepare(struct urcu_txn *txn,
 		struct urcu_txn_hlist_node *newp,
 		struct urcu_txn_hlist_node **slot,
 		struct urcu_txn_hlist_node *succ)
@@ -365,9 +365,9 @@ int urcu_txn_hlist_insert_at_slot_prepare(struct urcu_mcas_txn *txn,
 	newp->pprev = slot;
 
 	/* *slot: succ -> newp ; succ->pprev: slot -> &newp->next. */
-	urcu_txn_store(txn, (void **) slot, succ, newp, URCU_TXN_HLIST_TAG);
+	urcu_txn_store_mw(txn, (void **) slot, succ, newp, URCU_TXN_HLIST_TAG);
 	if (succ != NULL)
-		urcu_txn_store(txn, (void **) &succ->pprev, slot,
+		urcu_txn_store_mw(txn, (void **) &succ->pprev, slot,
 				&newp->next, URCU_TXN_HLIST_TAG);
 	return 0;
 }
@@ -379,7 +379,7 @@ int urcu_txn_hlist_insert_at_slot_prepare(struct urcu_mcas_txn *txn,
  * if @pos was deleted, or -EAGAIN if the successor is mid-deletion (retry).
  */
 static inline
-int urcu_txn_hlist_insert_after_prepare(struct urcu_mcas_txn *txn,
+int urcu_txn_hlist_insert_after_prepare(struct urcu_txn *txn,
 		struct urcu_txn_hlist_node *newp,
 		struct urcu_txn_hlist_node *pos)
 {
@@ -399,7 +399,7 @@ int urcu_txn_hlist_insert_after_prepare(struct urcu_mcas_txn *txn,
  * mid-deletion (retry), or -ENOENT if the head slot itself carries a mark.
  */
 static inline
-int urcu_txn_hlist_insert_head_prepare(struct urcu_mcas_txn *txn,
+int urcu_txn_hlist_insert_head_prepare(struct urcu_txn *txn,
 		struct urcu_txn_hlist_node *newp,
 		struct urcu_txn_hlist_head *head)
 {
@@ -437,7 +437,7 @@ int urcu_txn_hlist_add_rcu(struct urcu_txn_hlist_node *newp,
 		struct urcu_txn_hlist_head *head,
 		struct urcu_txn_domain *domain)
 {
-	struct urcu_mcas_txn txn;
+	struct urcu_txn txn;
 	int ret, prep;
 
 	urcu_txn_init(&txn, domain);
@@ -472,7 +472,7 @@ int urcu_txn_hlist_insert_after_rcu(struct urcu_txn_hlist_node *newp,
 		struct urcu_txn_hlist_node *pos,
 		struct urcu_txn_domain *domain)
 {
-	struct urcu_mcas_txn txn;
+	struct urcu_txn txn;
 	int ret, prep;
 
 	urcu_txn_init(&txn, domain);
@@ -505,7 +505,7 @@ int urcu_txn_hlist_insert_after_rcu(struct urcu_txn_hlist_node *newp,
  * sticky to the commit.
  */
 static inline
-int urcu_txn_hlist_insert_before_prepare(struct urcu_mcas_txn *txn,
+int urcu_txn_hlist_insert_before_prepare(struct urcu_txn *txn,
 		struct urcu_txn_hlist_node *newp,
 		struct urcu_txn_hlist_node *pos)
 {
@@ -528,8 +528,8 @@ int urcu_txn_hlist_insert_before_prepare(struct urcu_mcas_txn *txn,
 	newp->pprev = slot;
 
 	/* *slot: pos -> newp ; pos->pprev: slot -> &newp->next. */
-	urcu_txn_store(txn, (void **) slot, pos, newp, URCU_TXN_HLIST_TAG);
-	urcu_txn_store(txn, (void **) &pos->pprev, slot, &newp->next,
+	urcu_txn_store_mw(txn, (void **) slot, pos, newp, URCU_TXN_HLIST_TAG);
+	urcu_txn_store_mw(txn, (void **) &pos->pprev, slot, &newp->next,
 			URCU_TXN_HLIST_TAG);
 	return 0;
 }
@@ -544,7 +544,7 @@ int urcu_txn_hlist_insert_before_rcu(struct urcu_txn_hlist_node *newp,
 		struct urcu_txn_hlist_node *pos,
 		struct urcu_txn_domain *domain)
 {
-	struct urcu_mcas_txn txn;
+	struct urcu_txn txn;
 	int ret, prep;
 
 	urcu_txn_init(&txn, domain);
@@ -572,7 +572,7 @@ int urcu_txn_hlist_insert_before_rcu(struct urcu_txn_hlist_node *newp,
  * to the commit.
  */
 static inline
-int urcu_txn_hlist_del_prepare(struct urcu_mcas_txn *txn,
+int urcu_txn_hlist_del_prepare(struct urcu_txn *txn,
 		struct urcu_txn_hlist_node *elem)
 {
 	void *en = urcu_txn_load(txn, (void **) &elem->next, URCU_TXN_HLIST_TAG);
@@ -615,11 +615,11 @@ int urcu_txn_hlist_del_prepare(struct urcu_mcas_txn *txn,
 	 * insert_after(elem) / del(elem) terminate with -ENOENT.  When next is
 	 * NULL the backward edge vanishes: a 2-edge delete storing MARK(NULL).
 	 */
-	urcu_txn_store(txn, (void **) &elem->next, next,
+	urcu_txn_store_mw(txn, (void **) &elem->next, next,
 			urcu_txn_hlist_set_mark(next), URCU_TXN_HLIST_TAG);
-	urcu_txn_store(txn, (void **) ppv, elem, next, URCU_TXN_HLIST_TAG);
+	urcu_txn_store_mw(txn, (void **) ppv, elem, next, URCU_TXN_HLIST_TAG);
 	if (next != NULL)
-		urcu_txn_store(txn, (void **) &next->pprev,
+		urcu_txn_store_mw(txn, (void **) &next->pprev,
 				&elem->next, ppv, URCU_TXN_HLIST_TAG);
 	return 0;
 }
@@ -634,7 +634,7 @@ static inline
 int urcu_txn_hlist_del_rcu(struct urcu_txn_hlist_node *elem,
 		struct urcu_txn_domain *domain)
 {
-	struct urcu_mcas_txn txn;
+	struct urcu_txn txn;
 	int ret, prep;
 
 	urcu_txn_init(&txn, domain);
@@ -670,7 +670,7 @@ int urcu_txn_hlist_del_rcu(struct urcu_txn_hlist_node *elem,
  * -EAGAIN if the successor is mid-deletion.  OOM is sticky to the commit.
  */
 static inline
-int urcu_txn_hlist_replace_prepare(struct urcu_mcas_txn *txn,
+int urcu_txn_hlist_replace_prepare(struct urcu_txn *txn,
 		struct urcu_txn_hlist_node *old,
 		struct urcu_txn_hlist_node *newp)
 {
@@ -694,11 +694,11 @@ int urcu_txn_hlist_replace_prepare(struct urcu_mcas_txn *txn,
 	newp->next = next;
 	newp->pprev = ppv;
 
-	urcu_txn_store(txn, (void **) &old->next, next,
+	urcu_txn_store_mw(txn, (void **) &old->next, next,
 			urcu_txn_hlist_set_mark(next), URCU_TXN_HLIST_TAG);
-	urcu_txn_store(txn, (void **) ppv, old, newp, URCU_TXN_HLIST_TAG);
+	urcu_txn_store_mw(txn, (void **) ppv, old, newp, URCU_TXN_HLIST_TAG);
 	if (next != NULL)
-		urcu_txn_store(txn, (void **) &next->pprev,
+		urcu_txn_store_mw(txn, (void **) &next->pprev,
 				&old->next, &newp->next, URCU_TXN_HLIST_TAG);
 	return 0;
 }
@@ -714,7 +714,7 @@ int urcu_txn_hlist_replace_rcu(struct urcu_txn_hlist_node *old,
 		struct urcu_txn_hlist_node *newp,
 		struct urcu_txn_domain *domain)
 {
-	struct urcu_mcas_txn txn;
+	struct urcu_txn txn;
 	int ret, prep;
 
 	urcu_txn_init(&txn, domain);

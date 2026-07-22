@@ -3,13 +3,13 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 /*
- * Starvation regression test for the <urcu/rcu-txn.h> escalation fallback.
+ * Starvation regression test for the <urcu/rcu-txn-mw.h> escalation fallback.
  *
  * The optimistic retry is bounded-blocking but NOT starvation-free: a large or
  * repeatedly-bypassed transaction can be defeated by a stream of smaller ones,
  * because the single-edge fast path and the read->install window let a
  * committer change a footprint slot between this op's read and its install.
- * When a handle crosses URCU_TXN_FALLBACK retries it escalates into the
+ * When a handle crosses URCU_TXN_MW_FALLBACK retries it escalates into the
  * domain's fair mutex and publishes domain->active, funnelling every FUTURE
  * transaction through the same lane.  That closes the optimistic-writer set,
  * so the starved op then contends only with the finite in-flight set and
@@ -19,7 +19,7 @@
  * The unit tests for this (test_rcu_txn_fallback,
  * test_rcu_txn_fallback_publish) force the threshold down to 8, and one of
  * them white-box assigns txn.retry outright.  Nothing ever starved a
- * transaction ORGANICALLY, at the real default of URCU_TXN_FALLBACK.  So the
+ * transaction ORGANICALLY, at the real default of URCU_TXN_MW_FALLBACK.  So the
  * reactive trigger -- and the joiner-promotion branch of the escalation funnel
  * -- had no coverage at all outside those forced-threshold constructions.
  * This test provides it.
@@ -43,7 +43,7 @@
  * this test asserts it starves past.
  *
  * What is checked.  The escalation state lives in the caller-owned on-stack
- * handle, so a writer samples it directly after each urcu_txn_begin():
+ * handle, so a writer samples it directly after each urcu_txn_mw_begin():
  * in_fallback going 0 -> 1 is a lane entry; fb_published tells an INITIATOR
  * (met a trigger itself) from a JOINER (escalated only because it read
  * domain->active); and fb_published rising while already in the lane is a
@@ -75,7 +75,7 @@
 #include <urcu/uatomic.h>
 #include <urcu-qsbr.h>			/* generic rcu_* names => QSBR flavor */
 #include <urcu-call-rcu.h>
-#include <urcu/rcu-txn.h>		/* include AFTER the RCU flavor */
+#include <urcu/rcu-txn-mw.h>		/* include AFTER the RCU flavor */
 
 #include "tap.h"
 
@@ -90,7 +90,7 @@ static long duration_ms = 5000;
 static int  use_disjoint = 1;	/* the wide write set IS pairwise distinct */
 /*
  * --domain 0 is the CONTROL: hand every handle a NULL domain, disabling the
- * fallback entirely (pure optimistic retry -- see urcu_txn_init).  It is what
+ * fallback entirely (pure optimistic retry -- see urcu_txn_mw_init).  It is what
  * shows the lane DOES something rather than merely being entered: with no lane
  * nothing ever closes the optimistic-writer set, so the wide transactions are
  * defeated indefinitely.  Not a passing configuration -- the escalation checks
@@ -103,7 +103,7 @@ static int  use_domain  = 1;
 static void **slot;
 
 /* ONE escalation domain: every writer contends for the same fair lane. */
-static struct urcu_txn_domain g_dom;
+static struct urcu_txn_mw_domain g_dom;
 
 static int g_stop;
 
@@ -129,20 +129,20 @@ struct arg {
  * The wide op's escalation budget.  One attempt loads @width slots and records
  * @width edges, so its cost is 2 * @width and its retry budget is that scaled
  * by PER_COST_NUM/PER_COST_DEN (capped).  With a flat budget (PER_COST_NUM ==
- * 0) it is simply URCU_TXN_FALLBACK.  This is the threshold the wide op must
+ * 0) it is simply URCU_TXN_MW_FALLBACK.  This is the threshold the wide op must
  * starve past.
  */
 static unsigned long wide_budget(void)
 {
 	unsigned long t;
 
-	if (!URCU_TXN_FALLBACK_PER_COST_NUM)
-		return URCU_TXN_FALLBACK;
-	t = ((unsigned long) URCU_TXN_FALLBACK_PER_COST_NUM * 2UL *
-			(unsigned long) width) / URCU_TXN_FALLBACK_PER_COST_DEN;
+	if (!URCU_TXN_MW_FALLBACK_PER_COST_NUM)
+		return URCU_TXN_MW_FALLBACK;
+	t = ((unsigned long) URCU_TXN_MW_FALLBACK_PER_COST_NUM * 2UL *
+			(unsigned long) width) / URCU_TXN_MW_FALLBACK_PER_COST_DEN;
 	if (!t)
 		t = 1;
-	return t > URCU_TXN_FALLBACK_MAX ? URCU_TXN_FALLBACK_MAX : t;
+	return t > URCU_TXN_MW_FALLBACK_MAX ? URCU_TXN_MW_FALLBACK_MAX : t;
 }
 
 /* xorshift64 per-thread RNG (no shared rand() lock). */
@@ -161,7 +161,7 @@ static inline unsigned long xrand(unsigned long *s)
  * the previous attempt's view, so we see the 0 -> 1 EDGES rather than levels:
  * a lane entry, and (the interesting one) a joiner being promoted mid-episode.
  */
-static inline void sample_lane(struct urcu_mcas_txn *txn, struct stats *st,
+static inline void sample_lane(struct urcu_txn_mw *txn, struct stats *st,
 		int *in, int *pub)
 {
 	int now_in = uatomic_load(&txn->in_fallback, CMM_RELAXED);
@@ -186,13 +186,13 @@ static inline void sample_lane(struct urcu_mcas_txn *txn, struct stats *st,
  *
  * An ABORT is NOT terminal -- end() deliberately KEEPS the handle's fallback
  * turn so the next attempt re-enters the lane as the same head.  So a writer
- * that walks away from an aborted transaction must urcu_txn_abandon() first,
+ * that walks away from an aborted transaction must urcu_txn_mw_abandon() first,
  * or it holds the domain's lane forever and stalls every writer in the domain.
  * Which is precisely what these threads do: the stop flag lands while a wide
  * txn is mid-starvation, and without the abandon the run would hang in
  * pthread_join() behind a lane nobody will ever release.
  */
-static inline int attempt_done(struct urcu_mcas_txn *txn, struct stats *st,
+static inline int attempt_done(struct urcu_txn_mw *txn, struct stats *st,
 		enum urcu_txn_status status)
 {
 	int again = 0;
@@ -204,7 +204,7 @@ static inline int attempt_done(struct urcu_mcas_txn *txn, struct stats *st,
 		st->aborts++;
 		if (uatomic_load(&g_stop, CMM_RELAXED)) {
 			st->abandoned++;
-			urcu_txn_abandon(txn);	/* give up: forfeit the turn */
+			urcu_txn_mw_abandon(txn);	/* give up: forfeit the turn */
 		} else {
 			again = 1;
 		}
@@ -215,7 +215,7 @@ static inline int attempt_done(struct urcu_mcas_txn *txn, struct stats *st,
 	default:				/* OK */
 		break;
 	}
-	urcu_txn_end(txn);
+	urcu_txn_mw_end(txn);
 	return again;
 }
 
@@ -229,24 +229,24 @@ static void *small_writer(void *p)
 	rcu_thread_offline();			/* a writer is not a long-term reader */
 
 	while (!uatomic_load(&g_stop, CMM_RELAXED)) {
-		struct urcu_mcas_txn txn;
+		struct urcu_txn_mw txn;
 		int i = (int) (xrand(&seed) % (unsigned long) nslots);
 		int in = 0, pub = 0;
 		enum urcu_txn_status st;
 
 		rcu_thread_online();
-		urcu_txn_init(&txn, use_domain ? &g_dom : NULL);
-		urcu_txn_declare_disjoint(&txn);	/* one slot: trivially distinct */
+		urcu_txn_mw_init(&txn, use_domain ? &g_dom : NULL);
+		urcu_txn_mw_declare_disjoint(&txn);	/* one slot: trivially distinct */
 		do {
 			void *v;
 
-			urcu_txn_begin(&txn);
+			urcu_txn_mw_begin(&txn);
 			sample_lane(&txn, &me->st, &in, &pub);
-			v = urcu_txn_load(&txn, &slot[i], URCU_MCAS_TAG);
-			urcu_txn_store(&txn, &slot[i], v,
+			v = urcu_txn_mw_load(&txn, &slot[i], URCU_MCAS_TAG);
+			urcu_txn_mw_store(&txn, &slot[i], v,
 					(void *) ((uintptr_t) v + 2),
 					URCU_MCAS_TAG);
-			st = urcu_txn_commit(&txn);
+			st = urcu_txn_mw_commit(&txn);
 		} while (attempt_done(&txn, &me->st, st));
 		if (st == URCU_TXN_STATUS_OK) {
 			me->st.commits++;
@@ -281,7 +281,7 @@ static void *wide_writer(void *p)
 	rcu_thread_offline();
 
 	while (!uatomic_load(&g_stop, CMM_RELAXED)) {
-		struct urcu_mcas_txn txn;
+		struct urcu_txn_mw txn;
 		int in = 0, pub = 0;
 		enum urcu_txn_status st;
 
@@ -296,21 +296,21 @@ static void *wide_writer(void *p)
 		}
 
 		rcu_thread_online();
-		urcu_txn_init(&txn, use_domain ? &g_dom : NULL);
+		urcu_txn_mw_init(&txn, use_domain ? &g_dom : NULL);
 		if (use_disjoint)
-			urcu_txn_declare_disjoint(&txn);	/* picks are distinct */
+			urcu_txn_mw_declare_disjoint(&txn);	/* picks are distinct */
 		do {
-			urcu_txn_begin(&txn);
+			urcu_txn_mw_begin(&txn);
 			sample_lane(&txn, &me->st, &in, &pub);
 			for (k = 0; k < width; k++) {
 				void **s = &slot[pick[k]];
-				void *v = urcu_txn_load(&txn, s, URCU_MCAS_TAG);
+				void *v = urcu_txn_mw_load(&txn, s, URCU_MCAS_TAG);
 
-				urcu_txn_store(&txn, s, v,
+				urcu_txn_mw_store(&txn, s, v,
 						(void *) ((uintptr_t) v + 2),
 						URCU_MCAS_TAG);
 			}
-			st = urcu_txn_commit(&txn);
+			st = urcu_txn_mw_commit(&txn);
 		} while (attempt_done(&txn, &me->st, st));
 		if (st == URCU_TXN_STATUS_OK) {
 			me->st.commits++;
@@ -382,13 +382,13 @@ int main(int argc, char *argv[])
 	}
 	memset(&S, 0, sizeof(S));
 	memset(&W, 0, sizeof(W));
-	urcu_txn_domain_init(&g_dom);
+	urcu_txn_mw_domain_init(&g_dom);
 
 	diag("slots: %d  small: %d  wide: %d  width: %d  disjoint: %s  domain: %s",
 		nslots, nsmall, nwide, width, use_disjoint ? "on" : "off",
 		use_domain ? "on" : "OFF (control)");
 	diag("escalation is REACTIVE ONLY: budget = cost * %d/%d",
-		URCU_TXN_FALLBACK_PER_COST_NUM, URCU_TXN_FALLBACK_PER_COST_DEN);
+		URCU_TXN_MW_FALLBACK_PER_COST_NUM, URCU_TXN_MW_FALLBACK_PER_COST_DEN);
 	diag("wide op: cost %d (loads %d + records %d) => budget %lu retries  |  URCU_MCAS_ESCALATE=%d",
 		2 * width, width, width, wide_budget(), URCU_MCAS_ESCALATE);
 

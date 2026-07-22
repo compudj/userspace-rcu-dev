@@ -43,7 +43,7 @@
 #include <urcu/compiler.h>
 #include <urcu-qsbr.h>
 #include <urcu-call-rcu.h>
-#include <urcu/rcu-mcas.h>
+#include <urcu/rcu-txn-engine.h>
 #include <urcu/rcu-txn-skiplist.h>
 #include <urcu/rcu-txn.h>
 
@@ -166,7 +166,7 @@ static void assert_no_live_marks(struct urcu_txn_skiplist *sl)
 		unsigned int i;
 
 		for (i = 0; i <= n->toplevel; i++) {
-			void *v = urcu_mcas_read((void **) &n->next[i],
+			void *v = urcu_txn_read((void **) &n->next[i],
 					URCU_TXN_SKIPLIST_TAG);
 
 			assert(!urcu_txn_skiplist_is_marked(v));
@@ -233,7 +233,7 @@ struct op {
  */
 static int batch_commit(struct op *ops, int n)
 {
-	struct urcu_mcas_txn txn;
+	struct urcu_txn txn;
 	long spins = 0;
 	int i, prep;
 	enum urcu_txn_status st;
@@ -345,8 +345,8 @@ static void test_whitebox_chain(void)
 {
 	static const unsigned long seed[] = { 1, 4, 7 };
 	struct urcu_txn_skiplist sl;
-	struct urcu_mcas_txn txn;
-	struct urcu_mcas_record *r;
+	struct urcu_txn txn;
+	struct urcu_txn_record *r;
 	struct node *new0, *node1;
 	unsigned long k1 = 1;
 	struct urcu_txn_skiplist_node *removed = NULL;
@@ -378,7 +378,7 @@ static void test_whitebox_chain(void)
 	 * into one record whose old is the committed value (node1) and whose new
 	 * is the final value (new0) -- not two records, and not a lost edge.
 	 */
-	r = urcu_mcas_find(txn.mcas, (void **) &sl.head->next[0]);
+	r = urcu_txn_find(txn.desc, (void **) &sl.head->next[0]);
 	pass = r != NULL &&
 		r->old_ptr == (void *) &node1->sl &&
 		r->new_ptr == (void *) &new0->sl;
@@ -400,8 +400,8 @@ static void test_whitebox_retarget(void)
 {
 	static const unsigned long seed[] = { 1, 4, 7 };
 	struct urcu_txn_skiplist sl;
-	struct urcu_mcas_txn txn;
-	struct urcu_mcas_record *rhead, *rnew;
+	struct urcu_txn txn;
+	struct urcu_txn_record *rhead, *rnew;
 	struct node *new0, *node1, *node4;
 	unsigned long k1 = 1;
 	struct urcu_txn_skiplist_node *removed = NULL;
@@ -429,8 +429,8 @@ static void test_whitebox_retarget(void)
 	 * ONLY the insert's edge.  That is the collision dissolving rather than
 	 * being reconciled.
 	 */
-	rhead = urcu_mcas_find(txn.mcas, (void **) &sl.head->next[0]);
-	rnew = urcu_mcas_find(txn.mcas, (void **) &new0->sl.next[0]);
+	rhead = urcu_txn_find(txn.desc, (void **) &sl.head->next[0]);
+	rnew = urcu_txn_find(txn.desc, (void **) &new0->sl.next[0]);
 	pass = rhead != NULL && rhead->new_ptr == (void *) &new0->sl &&
 		rnew != NULL && rnew->new_ptr == (void *) &node4->sl;
 	ok(pass, "ryw whitebox: insert-first retargets the unlink onto the private node");

@@ -3,18 +3,18 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
 /*
- * Test the BEGIN-LESS driving mode of <urcu/rcu-txn.h>: an embedder may drive
- * the engine without urcu_txn_begin()/urcu_txn_end(), bracketing the mutation
- * itself with urcu_txn_read_lock()/urcu_txn_read_unlock() and finishing with
- * urcu_txn_commit_flavor():
+ * Test the BEGIN-LESS driving mode of <urcu/rcu-txn-mw.h>: an embedder may drive
+ * the engine without urcu_txn_mw_begin()/urcu_txn_mw_end(), bracketing the mutation
+ * itself with urcu_txn_mw_read_lock()/urcu_txn_mw_read_unlock() and finishing with
+ * urcu_txn_mw_commit_flavor():
  *
- *     urcu_txn_init(&txn, domain);
- *     urcu_txn_read_lock(&txn);
- *     ... urcu_txn_load() / urcu_txn_store() ...
- *     st = urcu_txn_commit_flavor(&txn, call_rcu);
- *     urcu_txn_read_unlock(&txn);
+ *     urcu_txn_mw_init(&txn, domain);
+ *     urcu_txn_mw_read_lock(&txn);
+ *     ... urcu_txn_mw_load() / urcu_txn_mw_store() ...
+ *     st = urcu_txn_mw_commit_flavor(&txn, call_rcu);
+ *     urcu_txn_mw_read_unlock(&txn);
  *
- * The mode is documented (see urcu_txn_read_lock) and used by an embedder that
+ * The mode is documented (see urcu_txn_mw_read_lock) and used by an embedder that
  * owns its own retry/bracket structure.  It has two dependencies that begin()
  * would otherwise have satisfied, and both were broken:
  *
@@ -22,7 +22,7 @@
  *     consulted.  begin() used to be the only thing that zeroed it, so a
  *     begin-less handle tested indeterminate stack bytes; set bits there read as
  *     a same-slot coincidence and forced an abort.  It is now emptied by
- *     urcu_txn__bloom_reset() when the attempt's descriptor is first allocated,
+ *     urcu_txn_mw__bloom_reset() when the attempt's descriptor is first allocated,
  *     which happens in this mode too (and which a disjoint handle skips, so the
  *     fix costs the disjoint fast path nothing).
  *   - esc_pending must not survive the abort it caused.  begin() used to be the
@@ -53,7 +53,7 @@
 #include <urcu/compiler.h>
 #include <urcu-qsbr.h>
 #include <urcu-call-rcu.h>
-#include <urcu/rcu-txn.h>
+#include <urcu/rcu-txn-mw.h>
 
 #include "tap.h"
 
@@ -73,28 +73,28 @@ static void *g_c;		/* read-your-own-writes subject */
  * One begin-less attempt on a deliberately dirty handle: advance both slots by
  * 2 (keeping bit 0 clear).  Returns the commit status.
  */
-static enum urcu_txn_status beginless_bump(struct urcu_txn_domain *domain)
+static enum urcu_txn_status beginless_bump(struct urcu_txn_mw_domain *domain)
 {
-	struct urcu_mcas_txn txn;
+	struct urcu_txn_mw txn;
 	void *a, *b;
 	enum urcu_txn_status st;
 
 	memset(&txn, 0xff, sizeof(txn));	/* dirty frame: no accidental zeros */
-	urcu_txn_init(&txn, domain);
-	urcu_txn_read_lock(&txn);		/* no begin() */
-	a = urcu_txn_load(&txn, &g_a, URCU_MCAS_TAG);
-	urcu_txn_store(&txn, &g_a, a, (void *) ((uintptr_t) a + 2), URCU_MCAS_TAG);
-	b = urcu_txn_load(&txn, &g_b, URCU_MCAS_TAG);
-	urcu_txn_store(&txn, &g_b, b, (void *) ((uintptr_t) b + 2), URCU_MCAS_TAG);
-	st = urcu_txn_commit_flavor(&txn, call_rcu);
-	urcu_txn_read_unlock(&txn);		/* no end() */
+	urcu_txn_mw_init(&txn, domain);
+	urcu_txn_mw_read_lock(&txn);		/* no begin() */
+	a = urcu_txn_mw_load(&txn, &g_a, URCU_MCAS_TAG);
+	urcu_txn_mw_store(&txn, &g_a, a, (void *) ((uintptr_t) a + 2), URCU_MCAS_TAG);
+	b = urcu_txn_mw_load(&txn, &g_b, URCU_MCAS_TAG);
+	urcu_txn_mw_store(&txn, &g_b, b, (void *) ((uintptr_t) b + 2), URCU_MCAS_TAG);
+	st = urcu_txn_mw_commit_flavor(&txn, call_rcu);
+	urcu_txn_mw_read_unlock(&txn);		/* no end() */
 	return st;
 }
 
 int main(void)
 {
-	struct urcu_txn_domain domain;
-	struct urcu_mcas_txn txn;
+	struct urcu_txn_mw_domain domain;
+	struct urcu_txn_mw txn;
 	enum urcu_txn_status st, first;
 	unsigned int oks = 0, aborts = 0, i;
 	void *seen;
@@ -102,7 +102,7 @@ int main(void)
 
 	plan_tests(NR_TESTS);
 	rcu_register_thread();
-	urcu_txn_domain_init(&domain);
+	urcu_txn_mw_domain_init(&domain);
 
 	/*
 	 * 1. The first begin-less attempt commits.  Pre-fix this ABORTs: the
@@ -142,19 +142,19 @@ int main(void)
 	 *    This needs age >= 1: at age 0 the RYW path is the stripped one --
 	 *    it maintains the filter but never runs find, so a coincidence sets
 	 *    esc_pending and returns the committed value instead (test 5 covers
-	 *    exactly that).  urcu_txn_expect_conflict() is the documented knob
+	 *    exactly that).  urcu_txn_mw_expect_conflict() is the documented knob
 	 *    for a handle whose RYW is dense by construction: it puts the FIRST
 	 *    attempt on the sorted, find-resolved path.
 	 */
 	memset(&txn, 0xff, sizeof(txn));
-	urcu_txn_init(&txn, &domain);
-	urcu_txn_expect_conflict(&txn);		/* age >= 1 from attempt 0: the find path */
-	urcu_txn_read_lock(&txn);
+	urcu_txn_mw_init(&txn, &domain);
+	urcu_txn_mw_expect_conflict(&txn);		/* age >= 1 from attempt 0: the find path */
+	urcu_txn_mw_read_lock(&txn);
 	g_c = V0;
-	urcu_txn_store(&txn, &g_c, V0, V1, URCU_MCAS_TAG);
-	seen = urcu_txn_load(&txn, &g_c, URCU_MCAS_TAG);
-	st = urcu_txn_commit_flavor(&txn, call_rcu);
-	urcu_txn_read_unlock(&txn);
+	urcu_txn_mw_store(&txn, &g_c, V0, V1, URCU_MCAS_TAG);
+	seen = urcu_txn_mw_load(&txn, &g_c, URCU_MCAS_TAG);
+	st = urcu_txn_mw_commit_flavor(&txn, call_rcu);
+	urcu_txn_mw_read_unlock(&txn);
 	ok(seen == V1 && st == URCU_TXN_STATUS_OK && g_c == V1,
 		"begin-less + expect_conflict: read-your-own-writes returns the pending value, commit stands");
 
@@ -168,19 +168,19 @@ int main(void)
 	 *    attempt after it: the begin-less handle wedged forever.
 	 */
 	memset(&txn, 0xff, sizeof(txn));
-	urcu_txn_init(&txn, &domain);
+	urcu_txn_mw_init(&txn, &domain);
 	g_c = V0;
-	urcu_txn_read_lock(&txn);
-	urcu_txn_store(&txn, &g_c, V0, V1, URCU_MCAS_TAG);
-	urcu_txn_store(&txn, &g_c, V1, V2, URCU_MCAS_TAG);	/* same slot: age-0 coincidence */
-	first = urcu_txn_commit_flavor(&txn, call_rcu);
-	urcu_txn_read_unlock(&txn);
+	urcu_txn_mw_read_lock(&txn);
+	urcu_txn_mw_store(&txn, &g_c, V0, V1, URCU_MCAS_TAG);
+	urcu_txn_mw_store(&txn, &g_c, V1, V2, URCU_MCAS_TAG);	/* same slot: age-0 coincidence */
+	first = urcu_txn_mw_commit_flavor(&txn, call_rcu);
+	urcu_txn_mw_read_unlock(&txn);
 
-	urcu_txn_read_lock(&txn);		/* retry: same handle, now age 1 */
-	urcu_txn_store(&txn, &g_c, V0, V1, URCU_MCAS_TAG);
-	urcu_txn_store(&txn, &g_c, V1, V2, URCU_MCAS_TAG);	/* chains onto the record */
-	st = urcu_txn_commit_flavor(&txn, call_rcu);
-	urcu_txn_read_unlock(&txn);
+	urcu_txn_mw_read_lock(&txn);		/* retry: same handle, now age 1 */
+	urcu_txn_mw_store(&txn, &g_c, V0, V1, URCU_MCAS_TAG);
+	urcu_txn_mw_store(&txn, &g_c, V1, V2, URCU_MCAS_TAG);	/* chains onto the record */
+	st = urcu_txn_mw_commit_flavor(&txn, call_rcu);
+	urcu_txn_mw_read_unlock(&txn);
 	ok(first == URCU_TXN_STATUS_ABORT && st == URCU_TXN_STATUS_OK && g_c == V2,
 		"begin-less: an age-0 coincidence aborts ONCE, then the retry commits (esc_pending is consumed)");
 
@@ -190,14 +190,14 @@ int main(void)
 	 *    reserves before storing consults a dirty one.
 	 */
 	memset(&txn, 0xff, sizeof(txn));
-	urcu_txn_init(&txn, &domain);
-	urcu_txn_read_lock(&txn);
-	ret = urcu_txn_reserve(&txn, 2);
+	urcu_txn_mw_init(&txn, &domain);
+	urcu_txn_mw_read_lock(&txn);
+	ret = urcu_txn_mw_reserve(&txn, 2);
 	g_c = V0;
-	seen = urcu_txn_load(&txn, &g_c, URCU_MCAS_TAG);	/* consults the filter */
-	urcu_txn_store(&txn, &g_c, seen, V1, URCU_MCAS_TAG);
-	st = urcu_txn_commit_flavor(&txn, call_rcu);
-	urcu_txn_read_unlock(&txn);
+	seen = urcu_txn_mw_load(&txn, &g_c, URCU_MCAS_TAG);	/* consults the filter */
+	urcu_txn_mw_store(&txn, &g_c, seen, V1, URCU_MCAS_TAG);
+	st = urcu_txn_mw_commit_flavor(&txn, call_rcu);
+	urcu_txn_mw_read_unlock(&txn);
 	ok(ret == 0 && seen == V0 && st == URCU_TXN_STATUS_OK && g_c == V1,
 		"begin-less: reserve() before the first store also empties the filter");
 

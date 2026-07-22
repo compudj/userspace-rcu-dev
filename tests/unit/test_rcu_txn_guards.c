@@ -75,7 +75,7 @@
 #include <urcu-qsbr.h>
 #include <urcu-call-rcu.h>
 #include <urcu/rcu-mcas.h>
-#include <urcu/rcu-txn.h>
+#include <urcu/rcu-txn-mw.h>
 #include <urcu/rcu-txn-sw.h>
 
 #include "tap.h"
@@ -132,40 +132,40 @@ static int aborts_in_child(void (*body)(void))
 /* 1. A disjoint handle records the same slot twice, NON-adjacently. */
 static void body_dup_slot(void)
 {
-	struct urcu_mcas_txn txn;
+	struct urcu_txn_mw txn;
 
-	urcu_txn_init(&txn, NULL);
-	urcu_txn_declare_disjoint(&txn);	/* the lie: the slots are NOT distinct */
-	urcu_txn_begin(&txn);
-	urcu_txn_store(&txn, &g_a, NULL, V0, URCU_MCAS_TAG);
-	urcu_txn_store(&txn, &g_b, NULL, V1, URCU_MCAS_TAG);
-	urcu_txn_store(&txn, &g_a, NULL, V2, URCU_MCAS_TAG);	/* duplicate of record 0 */
-	(void) urcu_txn_commit(&txn);
-	urcu_txn_end(&txn);
+	urcu_txn_mw_init(&txn, NULL);
+	urcu_txn_mw_declare_disjoint(&txn);	/* the lie: the slots are NOT distinct */
+	urcu_txn_mw_begin(&txn);
+	urcu_txn_mw_store(&txn, &g_a, NULL, V0, URCU_MCAS_TAG);
+	urcu_txn_mw_store(&txn, &g_b, NULL, V1, URCU_MCAS_TAG);
+	urcu_txn_mw_store(&txn, &g_a, NULL, V2, URCU_MCAS_TAG);	/* duplicate of record 0 */
+	(void) urcu_txn_mw_commit(&txn);
+	urcu_txn_mw_end(&txn);
 }
 
 /* 2. A stored NEW value carries the slot's proxy tag bits. */
 static void body_tagged_new(void)
 {
-	struct urcu_mcas_txn txn;
+	struct urcu_txn_mw txn;
 
-	urcu_txn_init(&txn, NULL);
-	urcu_txn_begin(&txn);
-	urcu_txn_store(&txn, &g_a, NULL, VTAGGED, URCU_MCAS_TAG);
-	(void) urcu_txn_commit(&txn);
-	urcu_txn_end(&txn);
+	urcu_txn_mw_init(&txn, NULL);
+	urcu_txn_mw_begin(&txn);
+	urcu_txn_mw_store(&txn, &g_a, NULL, VTAGGED, URCU_MCAS_TAG);
+	(void) urcu_txn_mw_commit(&txn);
+	urcu_txn_mw_end(&txn);
 }
 
 /* 3. A stored OLD value carries the slot's proxy tag bits. */
 static void body_tagged_old(void)
 {
-	struct urcu_mcas_txn txn;
+	struct urcu_txn_mw txn;
 
-	urcu_txn_init(&txn, NULL);
-	urcu_txn_begin(&txn);
-	urcu_txn_store(&txn, &g_a, VTAGGED, V0, URCU_MCAS_TAG);
-	(void) urcu_txn_commit(&txn);
-	urcu_txn_end(&txn);
+	urcu_txn_mw_init(&txn, NULL);
+	urcu_txn_mw_begin(&txn);
+	urcu_txn_mw_store(&txn, &g_a, VTAGGED, V0, URCU_MCAS_TAG);
+	(void) urcu_txn_mw_commit(&txn);
+	urcu_txn_mw_end(&txn);
 }
 
 /* 4. sw: an inline (caller-storage) handle carrying records reaches install. */
@@ -205,16 +205,16 @@ static void body_sw_reserve_after_install(void)
 /* Control: a well-formed disjoint transaction must NOT trip any guard. */
 static void body_control(void)
 {
-	struct urcu_mcas_txn txn;
+	struct urcu_txn_mw txn;
 
-	urcu_txn_init(&txn, NULL);
-	urcu_txn_declare_disjoint(&txn);	/* true here: g_a != g_b */
-	urcu_txn_begin(&txn);
-	urcu_txn_store(&txn, &g_a, NULL, V0, URCU_MCAS_TAG);
-	urcu_txn_store(&txn, &g_b, NULL, V1, URCU_MCAS_TAG);
-	if (urcu_txn_commit(&txn) != URCU_TXN_STATUS_OK)
+	urcu_txn_mw_init(&txn, NULL);
+	urcu_txn_mw_declare_disjoint(&txn);	/* true here: g_a != g_b */
+	urcu_txn_mw_begin(&txn);
+	urcu_txn_mw_store(&txn, &g_a, NULL, V0, URCU_MCAS_TAG);
+	urcu_txn_mw_store(&txn, &g_b, NULL, V1, URCU_MCAS_TAG);
+	if (urcu_txn_mw_commit(&txn) != URCU_TXN_STATUS_OK)
 		abort();		/* fail the control: an honest txn must commit */
-	urcu_txn_end(&txn);
+	urcu_txn_mw_end(&txn);
 }
 
 int main(void)

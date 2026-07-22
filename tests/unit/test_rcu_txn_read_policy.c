@@ -74,7 +74,7 @@
 # error "build with -DURCU_TXN_DEBUG_READ_POLICY_SOFT so a violation is counted, not fatal"
 #endif
 
-#define TAG	URCU_MCAS_TAG
+#define TAG	URCU_TXN_TAG
 
 /*
  * Two tag-clear (bit 0 == 0), non-proxy pointer values a plain transacted slot
@@ -86,7 +86,7 @@ static long obj_a, obj_b;
 #define B	((void *) &obj_b)
 
 /* Commit @txn and end the bracket; single-threaded, so it must succeed at once. */
-static void commit_ok(struct urcu_mcas_txn *txn)
+static void commit_ok(struct urcu_txn *txn)
 {
 	enum urcu_txn_status st = urcu_txn_commit(txn);
 
@@ -98,7 +98,7 @@ static void commit_ok(struct urcu_mcas_txn *txn)
 
 static void test_checker(void)
 {
-	struct urcu_mcas_txn txn;
+	struct urcu_txn txn;
 	void *slot;
 	void *v;
 
@@ -107,7 +107,7 @@ static void test_checker(void)
 	urcu_txn_init(&txn, NULL);
 	urcu_txn_begin(&txn);
 	v = urcu_txn_load(&txn, &slot, TAG);
-	urcu_txn_store(&txn, &slot, v, B, TAG);
+	urcu_txn_store_mw(&txn, &slot, v, B, TAG);
 	commit_ok(&txn);
 	ok(urcu_txn_read_policy_violations(&txn) == 0 &&
 	   urcu_txn_read_policy_evicted(&txn) == 0,
@@ -123,7 +123,7 @@ static void test_checker(void)
 	urcu_txn_init(&txn, NULL);
 	urcu_txn_begin(&txn);
 	v = urcu_txn_load_optimistic(&txn, &slot, TAG);
-	urcu_txn_store(&txn, &slot, v, B, TAG);
+	urcu_txn_store_mw(&txn, &slot, v, B, TAG);
 	commit_ok(&txn);
 	ok(urcu_txn_read_policy_violations(&txn) == 1 &&
 	   urcu_txn_read_policy_evicted(&txn) == 0,
@@ -163,7 +163,7 @@ static void test_checker(void)
 	slot = A;
 	urcu_txn_init(&txn, NULL);
 	urcu_txn_begin(&txn);
-	urcu_txn_store(&txn, &slot, A, B, TAG);		/* caller already holds the old */
+	urcu_txn_store_mw(&txn, &slot, A, B, TAG);		/* caller already holds the old */
 	commit_ok(&txn);
 	ok(urcu_txn_read_policy_violations(&txn) == 0,
 	   "blind store of a slot never loaded this attempt: no violation");
@@ -182,7 +182,7 @@ static void test_checker(void)
 	(void) urcu_txn_load_optimistic(&txn, &slot, TAG);
 	commit_ok(&txn);
 	urcu_txn_begin(&txn);					/* attempt 2 */
-	urcu_txn_store(&txn, &slot, A, B, TAG);
+	urcu_txn_store_mw(&txn, &slot, A, B, TAG);
 	commit_ok(&txn);
 	ok(urcu_txn_read_policy_violations(&txn) == 0,
 	   "the per-attempt probe table resets at begin(): no stale-mark misfire");
@@ -214,7 +214,7 @@ static struct hnode *hnode_alloc(int key)
 static void test_hlist_obeys(void)
 {
 	struct urcu_txn_hlist_head bkt;
-	struct urcu_mcas_txn txn;
+	struct urcu_txn txn;
 	struct hnode *n3, *n4, *n5, *n6, *n6b, *n7;
 	int prep;
 
@@ -321,7 +321,7 @@ static struct snode *snode_alloc(unsigned long key, unsigned int toplevel)
 static void test_skiplist_obeys(void)
 {
 	struct urcu_txn_skiplist a, b;
-	struct urcu_mcas_txn txn;
+	struct urcu_txn txn;
 	struct urcu_txn_skiplist_node *rem;
 	unsigned long key;
 	unsigned int i;

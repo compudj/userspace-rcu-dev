@@ -427,7 +427,7 @@ static struct urcu_txn_skiplist g_a, g_b;
 static int move_key(unsigned long key, unsigned int lvl,
 		struct urcu_txn_skiplist_node **reclaim)
 {
-	struct urcu_mcas_txn txn;
+	struct urcu_txn txn;
 	struct node *nn = node_alloc(key, lvl);
 	int result = 0;
 

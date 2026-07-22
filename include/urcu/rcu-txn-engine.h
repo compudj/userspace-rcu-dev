@@ -2,15 +2,15 @@
 //
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
-#ifndef _URCU_RCU_MCAS_SW_MW_H
-#define _URCU_RCU_MCAS_SW_MW_H
+#ifndef _URCU_RCU_TXN_ENGINE_H
+#define _URCU_RCU_TXN_ENGINE_H
 
 /*
  * RCU mixed single-writer / multi-writer transaction ENGINE.
  *
  * This is the flavor-free engine layer: the unified descriptor and its resolve /
  * install / commit.  The begin/load/store/commit bracket with aging escalation
- * and the fair-mutex fallback lane lives in the front-end <urcu/rcu-txn-sw-mw.h>
+ * and the fair-mutex fallback lane lives in the front-end <urcu/rcu-txn.h>
  * (which includes this header) -- exactly the split between <urcu/rcu-mcas.h>
  * (engine) and <urcu/rcu-txn.h> (front-end).
  *
@@ -68,10 +68,10 @@
  * transaction with NO MW records NEVER aborts -- pure single-writer edits stay
  * on the cheap, abort-free path.
  *
- * Two commit entry points.  urcu_txn_sw_mw_desc_commit() is the sw-mw-aware
+ * Two commit entry points.  urcu_txn_desc_commit() is the sw-mw-aware
  * path: it partitions MW ahead of SW, sorts and CAS-installs the MW records, and
  * handles the abort.  An embedder that KNOWS a descriptor carries no MW records
- * commits it through urcu_txn_sw_mw_desc_commit_sw() instead, which skips all of
+ * commits it through urcu_txn_desc_commit_sw() instead, which skips all of
  * that (park, flip, settle) and cannot contention-abort.  So the sw-mw-aware
  * commit is paid for only when MW records are actually present.
  *
@@ -115,10 +115,10 @@ extern "C" {
 
 /*
  * Instrumentation hook -- compiles to nothing unless the embedder defines
- * URCU_TXN_SW_MW_STAT(counter) before including this header.
+ * URCU_TXN_STAT(counter) before including this header.
  */
-#ifndef URCU_TXN_SW_MW_STAT
-#define URCU_TXN_SW_MW_STAT(counter)	do { } while (0)
+#ifndef URCU_TXN_STAT
+#define URCU_TXN_STAT(counter)	do { } while (0)
 #endif
 
 /*
@@ -127,22 +127,22 @@ extern "C" {
  * through the full descriptor protocol so it can hold the slot latched against
  * contenders.  Mirrors URCU_MCAS_ESCALATE.
  */
-#ifndef URCU_TXN_SW_MW_ESCALATE
-#define URCU_TXN_SW_MW_ESCALATE 16
+#ifndef URCU_TXN_ESCALATE
+#define URCU_TXN_ESCALATE 16
 #endif
 
 /*
  * Spins on a blocker's status before an installer escalates (aborts and retries
  * at a higher aging priority).  Mirrors URCU_MCAS_WAIT_PATIENCE.
  */
-#ifndef URCU_TXN_SW_MW_WAIT_PATIENCE
-#define URCU_TXN_SW_MW_WAIT_PATIENCE 8192
+#ifndef URCU_TXN_WAIT_PATIENCE
+#define URCU_TXN_WAIT_PATIENCE 8192
 #endif
 
-enum urcu_txn_sw_mw_status {
-	URCU_TXN_SW_MW_UNDECIDED = 0,
-	URCU_TXN_SW_MW_SUCCEEDED = 1,
-	URCU_TXN_SW_MW_FAILED    = 2,
+enum urcu_txn_desc_status {
+	URCU_TXN_DESC_UNDECIDED = 0,
+	URCU_TXN_DESC_SUCCEEDED = 1,
+	URCU_TXN_DESC_FAILED    = 2,
 };
 
 /*
@@ -150,14 +150,14 @@ enum urcu_txn_sw_mw_status {
  * exclusive store, never fails; MW = sole-driver CAS-old, may abort).  Resolve
  * is identical for both.
  */
-enum urcu_txn_sw_mw_kind {
-	URCU_TXN_SW_MW_KIND_SW = 0,
-	URCU_TXN_SW_MW_KIND_MW = 1,
+enum urcu_txn_kind {
+	URCU_TXN_KIND_SW = 0,
+	URCU_TXN_KIND_MW = 1,
 };
 
-struct urcu_txn_sw_mw_desc;
+struct urcu_txn_desc;
 
-struct urcu_txn_sw_mw_record {
+struct urcu_txn_record {
 	void **slot;			/* transacted word (bit 0 must be free) */
 	void *old_ptr;			/* expected old value (resolve: status != SUCCEEDED) */
 	void *new_ptr;			/* committed new value (resolve: status == SUCCEEDED) */
@@ -169,8 +169,8 @@ struct urcu_txn_sw_mw_record {
 					 * one engine, each resolved through its
 					 * own tag.
 					 */
-	struct urcu_txn_sw_mw_desc *desc;	/* back-pointer: shared status word */
-	unsigned int kind;		/* enum urcu_txn_sw_mw_kind (writer-side only) */
+	struct urcu_txn_desc *desc;	/* back-pointer: shared status word */
+	unsigned int kind;		/* enum urcu_txn_kind (writer-side only) */
 } __attribute__((aligned(16)));
 
 /*
@@ -181,58 +181,58 @@ struct urcu_txn_sw_mw_record {
  * is allocated with posix_memalign(16), so the 16-byte base alignment holds
  * portably.
  */
-struct urcu_txn_sw_mw_desc {
-	unsigned long status;		/* enum urcu_txn_sw_mw_status */
+struct urcu_txn_desc {
+	unsigned long status;		/* enum urcu_txn_desc_status */
 	unsigned long retry;		/* aging priority: prior retries of this op */
 	struct rcu_head rcu_head;	/* owner's deferred-free handle */
 	unsigned int nr;
 	unsigned int cap;
 	unsigned int poisoned;		/* set if a same-slot reconcile disagreed on old */
 	unsigned int slab;		/* block origin: per-CPU slab (1) or posix_memalign (0) */
-	struct urcu_txn_sw_mw_record recs[];	/* frozen at commit */
+	struct urcu_txn_record recs[];	/* frozen at commit */
 };
 
-urcu_static_assert(!(offsetof(struct urcu_txn_sw_mw_desc, recs) % 16),
-		"urcu_txn_sw_mw_desc.recs must be 16-byte aligned within the descriptor",
-		urcu_txn_sw_mw_recs_aligned);
-urcu_static_assert(!(sizeof(struct urcu_txn_sw_mw_record) % 16),
-		"urcu_txn_sw_mw_record stride must keep inline records 16-byte aligned",
-		urcu_txn_sw_mw_record_stride_aligned);
-urcu_static_assert(!(__alignof__(struct urcu_txn_sw_mw_desc) % 16),
-		"urcu_txn_sw_mw_desc must inherit 16-byte alignment from its recs[] member",
-		urcu_txn_sw_mw_desc_aligned);
+urcu_static_assert(!(offsetof(struct urcu_txn_desc, recs) % 16),
+		"urcu_txn_desc.recs must be 16-byte aligned within the descriptor",
+		urcu_txn_recs_aligned);
+urcu_static_assert(!(sizeof(struct urcu_txn_record) % 16),
+		"urcu_txn_record stride must keep inline records 16-byte aligned",
+		urcu_txn_record_stride_aligned);
+urcu_static_assert(!(__alignof__(struct urcu_txn_desc) % 16),
+		"urcu_txn_desc must inherit 16-byte alignment from its recs[] member",
+		urcu_txn_desc_aligned);
 
 /* A convenient default tag (bit 0) for an embedder that keeps bit 0 free. */
-#define URCU_TXN_SW_MW_TAG	1UL
+#define URCU_TXN_TAG	1UL
 
 static inline
-void *urcu_txn_sw_mw_tag(struct urcu_txn_sw_mw_record *r, uintptr_t tag)
+void *urcu_txn_tag(struct urcu_txn_record *r, uintptr_t tag)
 {
 	return (void *) ((uintptr_t) r | tag);
 }
 
 static inline
-struct urcu_txn_sw_mw_record *urcu_txn_sw_mw_untag(void *v, uintptr_t tag)
+struct urcu_txn_record *urcu_txn_untag(void *v, uintptr_t tag)
 {
-	return (struct urcu_txn_sw_mw_record *) ((uintptr_t) v & ~tag);
+	return (struct urcu_txn_record *) ((uintptr_t) v & ~tag);
 }
 
 static inline
-int urcu_txn_sw_mw_is_proxy(void *v, uintptr_t tag)
+int urcu_txn_is_proxy(void *v, uintptr_t tag)
 {
 	return ((uintptr_t) v & tag) == tag;
 }
 
 /* Strong try-CAS returning a success bit (see urcu_mcas_try_cas). */
 static inline
-int urcu_txn_sw_mw_try_cas(void **slot, void *expect, void *desired)
+int urcu_txn_try_cas(void **slot, void *expect, void *desired)
 {
 	return __atomic_compare_exchange_n(slot, &expect, desired,
 			/*weak=*/0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
 }
 
 static inline
-unsigned long urcu_txn_sw_mw_status(const struct urcu_txn_sw_mw_desc *t)
+unsigned long urcu_txn_desc_status(const struct urcu_txn_desc *t)
 {
 	return uatomic_load(&t->status, CMM_ACQUIRE);
 }
@@ -243,9 +243,9 @@ unsigned long urcu_txn_sw_mw_status(const struct urcu_txn_sw_mw_desc *t)
  * within an RCU read-side section.
  */
 static inline
-void *urcu_txn_sw_mw_resolve_record(struct urcu_txn_sw_mw_record *r)
+void *urcu_txn_resolve_record(struct urcu_txn_record *r)
 {
-	return urcu_txn_sw_mw_status(r->desc) == URCU_TXN_SW_MW_SUCCEEDED ?
+	return urcu_txn_desc_status(r->desc) == URCU_TXN_DESC_SUCCEEDED ?
 			r->new_ptr : r->old_ptr;
 }
 
@@ -254,11 +254,11 @@ void *urcu_txn_sw_mw_resolve_record(struct urcu_txn_sw_mw_record *r)
  * a parked record resolves through its transaction's status word.
  */
 static inline
-void *urcu_txn_sw_mw_resolve(void *v, uintptr_t tag)
+void *urcu_txn_resolve(void *v, uintptr_t tag)
 {
-	if (caa_likely(!urcu_txn_sw_mw_is_proxy(v, tag)))
+	if (caa_likely(!urcu_txn_is_proxy(v, tag)))
 		return v;
-	return urcu_txn_sw_mw_resolve_record(urcu_txn_sw_mw_untag(v, tag));
+	return urcu_txn_resolve_record(urcu_txn_untag(v, tag));
 }
 
 /*
@@ -267,9 +267,9 @@ void *urcu_txn_sw_mw_resolve(void *v, uintptr_t tag)
  * so this is a plain RELEASE store -- the commit point.
  */
 static inline
-void urcu_txn_sw_mw_decide(struct urcu_txn_sw_mw_desc *t, unsigned long to)
+void urcu_txn_decide(struct urcu_txn_desc *t, unsigned long to)
 {
-	urcu_assert_debug(urcu_txn_sw_mw_status(t) == URCU_TXN_SW_MW_UNDECIDED);
+	urcu_assert_debug(urcu_txn_desc_status(t) == URCU_TXN_DESC_UNDECIDED);
 	uatomic_store(&t->status, to, CMM_RELEASE);
 }
 
@@ -279,9 +279,9 @@ void urcu_txn_sw_mw_decide(struct urcu_txn_sw_mw_desc *t, unsigned long to)
  * correct because the owner is the SOLE driver (see <urcu/rcu-mcas.h>).
  */
 static inline
-int urcu_txn_sw_mw_plant(struct urcu_txn_sw_mw_record *r)
+int urcu_txn_plant(struct urcu_txn_record *r)
 {
-	void *tagv = urcu_txn_sw_mw_tag(r, r->proxy_tag);
+	void *tagv = urcu_txn_tag(r, r->proxy_tag);
 
 	return uatomic_cmpxchg(r->slot, r->old_ptr, tagv) == r->old_ptr;
 }
@@ -291,9 +291,9 @@ int urcu_txn_sw_mw_plant(struct urcu_txn_sw_mw_record *r)
  * a lock over the slot (single-writer), so this cannot be raced and cannot fail.
  */
 static inline
-void urcu_txn_sw_mw_park(struct urcu_txn_sw_mw_record *r)
+void urcu_txn_park(struct urcu_txn_record *r)
 {
-	uatomic_store(r->slot, urcu_txn_sw_mw_tag(r, r->proxy_tag), CMM_RELEASE);
+	uatomic_store(r->slot, urcu_txn_tag(r, r->proxy_tag), CMM_RELEASE);
 }
 
 /*
@@ -303,14 +303,14 @@ void urcu_txn_sw_mw_park(struct urcu_txn_sw_mw_record *r)
  * deadlock-freedom (SW parks never wait).  A stable partition is not required.
  */
 static inline
-unsigned int urcu_txn_sw_mw_partition(struct urcu_txn_sw_mw_desc *t)
+unsigned int urcu_txn_partition(struct urcu_txn_desc *t)
 {
 	unsigned int i, k = 0;
 
 	for (i = 0; i < t->nr; i++) {
-		if (t->recs[i].kind == URCU_TXN_SW_MW_KIND_MW) {
+		if (t->recs[i].kind == URCU_TXN_KIND_MW) {
 			if (i != k) {
-				struct urcu_txn_sw_mw_record tmp = t->recs[k];
+				struct urcu_txn_record tmp = t->recs[k];
 
 				t->recs[k] = t->recs[i];
 				t->recs[i] = tmp;
@@ -323,12 +323,12 @@ unsigned int urcu_txn_sw_mw_partition(struct urcu_txn_sw_mw_desc *t)
 
 /* Insertion-sort records [0..n) by slot address (transactions are small). */
 static inline
-void urcu_txn_sw_mw_sort(struct urcu_txn_sw_mw_desc *t, unsigned int n)
+void urcu_txn_sort(struct urcu_txn_desc *t, unsigned int n)
 {
 	unsigned int i, j;
 
 	for (i = 1; i < n; i++) {
-		struct urcu_txn_sw_mw_record key = t->recs[i];
+		struct urcu_txn_record key = t->recs[i];
 
 		for (j = i; j > 0 &&
 				(uintptr_t) t->recs[j - 1].slot >
@@ -346,18 +346,18 @@ void urcu_txn_sw_mw_sort(struct urcu_txn_sw_mw_desc *t, unsigned int n)
  * @*failed reports the outcome.
  */
 static inline
-unsigned int urcu_txn_sw_mw_install_mw_flat(struct urcu_txn_sw_mw_desc *t,
+unsigned int urcu_txn_install_mw_flat(struct urcu_txn_desc *t,
 		unsigned int nr_mw, int *failed)
 {
 	unsigned int i;
 
-	URCU_TXN_SW_MW_STAT(drive);
+	URCU_TXN_STAT(drive);
 	for (i = 0; i < nr_mw; i++) {
-		struct urcu_txn_sw_mw_record *r = &t->recs[i];
+		struct urcu_txn_record *r = &t->recs[i];
 
-		if (caa_unlikely(!urcu_txn_sw_mw_try_cas(r->slot, r->old_ptr,
-				urcu_txn_sw_mw_tag(r, r->proxy_tag)))) {
-			urcu_txn_sw_mw_decide(t, URCU_TXN_SW_MW_FAILED);
+		if (caa_unlikely(!urcu_txn_try_cas(r->slot, r->old_ptr,
+				urcu_txn_tag(r, r->proxy_tag)))) {
+			urcu_txn_decide(t, URCU_TXN_DESC_FAILED);
 			*failed = 1;
 			return i;	/* prefix [0..i) planted */
 		}
@@ -373,48 +373,48 @@ unsigned int urcu_txn_sw_mw_install_mw_flat(struct urcu_txn_sw_mw_desc *t,
  * on success leaves the status UNDECIDED and returns nr_mw.
  */
 static inline
-unsigned int urcu_txn_sw_mw_install_mw_depth(struct urcu_txn_sw_mw_desc *t,
+unsigned int urcu_txn_install_mw_depth(struct urcu_txn_desc *t,
 		unsigned int nr_mw, int *failed)
 {
 	unsigned int i;
 
-	URCU_TXN_SW_MW_STAT(drive);
+	URCU_TXN_STAT(drive);
 	for (i = 0; i < nr_mw; i++) {
-		struct urcu_txn_sw_mw_record *r = &t->recs[i];
-		void *tagv = urcu_txn_sw_mw_tag(r, r->proxy_tag);
+		struct urcu_txn_record *r = &t->recs[i];
+		void *tagv = urcu_txn_tag(r, r->proxy_tag);
 
 		for (;;) {
 			void *v;
 
-			if (urcu_txn_sw_mw_status(t) != URCU_TXN_SW_MW_UNDECIDED) {
+			if (urcu_txn_desc_status(t) != URCU_TXN_DESC_UNDECIDED) {
 				*failed = 1;
 				return i;
 			}
 			v = uatomic_load(r->slot, CMM_ACQUIRE);
 			if (v == tagv)
 				break;		/* already installed */
-			if (urcu_txn_sw_mw_is_proxy(v, r->proxy_tag)) {
-				struct urcu_txn_sw_mw_record *fr =
-					urcu_txn_sw_mw_untag(v, r->proxy_tag);
+			if (urcu_txn_is_proxy(v, r->proxy_tag)) {
+				struct urcu_txn_record *fr =
+					urcu_txn_untag(v, r->proxy_tag);
 
 				if (fr->desc == t)
 					break;	/* own proxy (distinct-slot inv.) */
 				{
 					unsigned int patience =
-						URCU_TXN_SW_MW_WAIT_PATIENCE;
+						URCU_TXN_WAIT_PATIENCE;
 
-					while (urcu_txn_sw_mw_is_proxy(
+					while (urcu_txn_is_proxy(
 						uatomic_load(r->slot, CMM_ACQUIRE),
 						r->proxy_tag)) {
-						if (urcu_txn_sw_mw_status(t) !=
-								URCU_TXN_SW_MW_UNDECIDED) {
+						if (urcu_txn_desc_status(t) !=
+								URCU_TXN_DESC_UNDECIDED) {
 							*failed = 1;
 							return i;
 						}
 						if (patience-- == 0) {
-							URCU_TXN_SW_MW_STAT(wait_capped);
-							urcu_txn_sw_mw_decide(t,
-								URCU_TXN_SW_MW_FAILED);
+							URCU_TXN_STAT(wait_capped);
+							urcu_txn_decide(t,
+								URCU_TXN_DESC_FAILED);
 							*failed = 1;
 							return i;
 						}
@@ -424,11 +424,11 @@ unsigned int urcu_txn_sw_mw_install_mw_depth(struct urcu_txn_sw_mw_desc *t,
 				}
 			}
 			if (v != r->old_ptr) {
-				urcu_txn_sw_mw_decide(t, URCU_TXN_SW_MW_FAILED);
+				urcu_txn_decide(t, URCU_TXN_DESC_FAILED);
 				*failed = 1;
 				return i;
 			}
-			if (urcu_txn_sw_mw_plant(r))
+			if (urcu_txn_plant(r))
 				break;		/* planted */
 			/* raced: slot changed under us -> re-evaluate */
 		}
@@ -444,14 +444,14 @@ unsigned int urcu_txn_sw_mw_install_mw_depth(struct urcu_txn_sw_mw_desc *t,
  * an MW slot still holds OUR proxy).
  */
 static inline
-void urcu_txn_sw_mw_settle(struct urcu_txn_sw_mw_desc *t, unsigned int planted)
+void urcu_txn_settle(struct urcu_txn_desc *t, unsigned int planted)
 {
-	unsigned long st = urcu_txn_sw_mw_status(t);
+	unsigned long st = urcu_txn_desc_status(t);
 	unsigned int i;
 
 	for (i = 0; i < planted; i++) {
-		struct urcu_txn_sw_mw_record *r = &t->recs[i];
-		void *want = (st == URCU_TXN_SW_MW_SUCCEEDED) ?
+		struct urcu_txn_record *r = &t->recs[i];
+		void *want = (st == URCU_TXN_DESC_SUCCEEDED) ?
 				r->new_ptr : r->old_ptr;
 
 		uatomic_store(r->slot, want, CMM_RELEASE);
@@ -464,23 +464,23 @@ void urcu_txn_sw_mw_settle(struct urcu_txn_sw_mw_desc *t, unsigned int planted)
  * driving it.  Use to read the current value of a word you intend to transact.
  */
 static inline
-void *urcu_txn_sw_mw_read(void **slot, uintptr_t tag)
+void *urcu_txn_read(void **slot, uintptr_t tag)
 {
 	for (;;) {
 		void *v = uatomic_load(slot, CMM_ACQUIRE);
-		struct urcu_txn_sw_mw_desc *e;
+		struct urcu_txn_desc *e;
 
-		if (caa_likely(!urcu_txn_sw_mw_is_proxy(v, tag)))
+		if (caa_likely(!urcu_txn_is_proxy(v, tag)))
 			return v;
-		e = urcu_txn_sw_mw_untag(v, tag)->desc;
-		if (urcu_txn_sw_mw_status(e) != URCU_TXN_SW_MW_UNDECIDED)
-			return urcu_txn_sw_mw_resolve(v, tag);
+		e = urcu_txn_untag(v, tag)->desc;
+		if (urcu_txn_desc_status(e) != URCU_TXN_DESC_UNDECIDED)
+			return urcu_txn_resolve(v, tag);
 		{
-			unsigned int patience = URCU_TXN_SW_MW_WAIT_PATIENCE;
+			unsigned int patience = URCU_TXN_WAIT_PATIENCE;
 
-			while (urcu_txn_sw_mw_status(e) == URCU_TXN_SW_MW_UNDECIDED) {
+			while (urcu_txn_desc_status(e) == URCU_TXN_DESC_UNDECIDED) {
 				if (patience-- == 0)
-					return urcu_txn_sw_mw_resolve(v, tag);
+					return urcu_txn_resolve(v, tag);
 				caa_cpu_relax();
 			}
 			continue;
@@ -490,18 +490,18 @@ void *urcu_txn_sw_mw_read(void **slot, uintptr_t tag)
 
 /*
  * Load @slot and return its logical value WITHOUT waiting on an undecided
- * transaction: the non-blocking counterpart of urcu_txn_sw_mw_read().  Safe for
+ * transaction: the non-blocking counterpart of urcu_txn_read().  Safe for
  * a read set -- a stale optimistic read is reconciled at install (an extra abort,
  * never a wrong commit).
  */
 static inline
-void *urcu_txn_sw_mw_read_optimistic(void **slot, uintptr_t tag)
+void *urcu_txn_read_optimistic(void **slot, uintptr_t tag)
 {
 	void *v = uatomic_load(slot, CMM_ACQUIRE);
 
-	if (caa_likely(!urcu_txn_sw_mw_is_proxy(v, tag)))
+	if (caa_likely(!urcu_txn_is_proxy(v, tag)))
 		return v;
-	return urcu_txn_sw_mw_resolve(v, tag);
+	return urcu_txn_resolve(v, tag);
 }
 
 /*
@@ -512,51 +512,51 @@ void *urcu_txn_sw_mw_read_optimistic(void **slot, uintptr_t tag)
  * ─────────────────────────────────────────────────────────────────────────
  */
 static inline
-struct urcu_txn_sw_mw_desc *urcu_txn_sw_mw_alloc(size_t size)
+struct urcu_txn_desc *urcu_txn_alloc(size_t size)
 {
 	void *p;
 
 	if (posix_memalign(&p, 16, size))
 		return NULL;
-	return (struct urcu_txn_sw_mw_desc *) p;
+	return (struct urcu_txn_desc *) p;
 }
 
-#define urcu_txn_sw_mw_blocksize(cap)	\
-	(sizeof(struct urcu_txn_sw_mw_desc) + \
-	 (size_t) (cap) * sizeof(struct urcu_txn_sw_mw_record))
+#define urcu_txn_blocksize(cap)	\
+	(sizeof(struct urcu_txn_desc) + \
+	 (size_t) (cap) * sizeof(struct urcu_txn_record))
 
-static const unsigned int urcu_txn_sw_mw_slab_rc[] = { 4u, 8u, 16u, 32u, 64u, 128u };
-#define URCU_TXN_SW_MW_SLAB_NCLASS	\
-	((int) (sizeof(urcu_txn_sw_mw_slab_rc) / sizeof(urcu_txn_sw_mw_slab_rc[0])))
+static const unsigned int urcu_txn_slab_rc[] = { 4u, 8u, 16u, 32u, 64u, 128u };
+#define URCU_TXN_SLAB_NCLASS	\
+	((int) (sizeof(urcu_txn_slab_rc) / sizeof(urcu_txn_slab_rc[0])))
 
-extern struct urcu_slab urcu_txn_sw_mw_slab;
+extern struct urcu_slab urcu_txn_slab;
 
 static inline
-int urcu_txn_sw_mw_slab_class_of(unsigned int req)
+int urcu_txn_slab_class_of(unsigned int req)
 {
 	int i;
 
-	for (i = 0; i < URCU_TXN_SW_MW_SLAB_NCLASS; i++)
-		if (req <= urcu_txn_sw_mw_slab_rc[i])
+	for (i = 0; i < URCU_TXN_SLAB_NCLASS; i++)
+		if (req <= urcu_txn_slab_rc[i])
 			return i;
 	return -1;
 }
 
 static inline
-struct urcu_txn_sw_mw_desc *urcu_txn_sw_mw_alloc_cap(unsigned int req)
+struct urcu_txn_desc *urcu_txn_alloc_cap(unsigned int req)
 {
-	struct urcu_txn_sw_mw_desc *t;
+	struct urcu_txn_desc *t;
 	int cl;
 
-	if (urcu_slab_enabled(&urcu_txn_sw_mw_slab) &&
-			(cl = urcu_txn_sw_mw_slab_class_of(req)) >= 0) {
-		t = (struct urcu_txn_sw_mw_desc *) urcu_slab_alloc(&urcu_txn_sw_mw_slab, cl);
+	if (urcu_slab_enabled(&urcu_txn_slab) &&
+			(cl = urcu_txn_slab_class_of(req)) >= 0) {
+		t = (struct urcu_txn_desc *) urcu_slab_alloc(&urcu_txn_slab, cl);
 		if (caa_likely(t != NULL)) {
-			t->cap = urcu_txn_sw_mw_slab_rc[cl];
+			t->cap = urcu_txn_slab_rc[cl];
 			t->slab = 1;
 		}
 	} else {
-		t = urcu_txn_sw_mw_alloc(urcu_txn_sw_mw_blocksize(req));
+		t = urcu_txn_alloc(urcu_txn_blocksize(req));
 		if (caa_likely(t != NULL)) {
 			t->cap = req;
 			t->slab = 0;
@@ -566,7 +566,7 @@ struct urcu_txn_sw_mw_desc *urcu_txn_sw_mw_alloc_cap(unsigned int req)
 }
 
 static inline
-void urcu_txn_sw_mw_free(struct urcu_txn_sw_mw_desc *t)
+void urcu_txn_free(struct urcu_txn_desc *t)
 {
 	if (t->slab)
 		urcu_slab_free(t);
@@ -579,15 +579,15 @@ void urcu_txn_sw_mw_free(struct urcu_txn_sw_mw_desc *t)
  * count (selects install strategy and single-edge escalation).
  */
 static inline
-struct urcu_txn_sw_mw_desc *urcu_txn_sw_mw_create(unsigned int cap,
+struct urcu_txn_desc *urcu_txn_create(unsigned int cap,
 		unsigned long retry)
 {
-	struct urcu_txn_sw_mw_desc *t;
+	struct urcu_txn_desc *t;
 
-	t = urcu_txn_sw_mw_alloc_cap(cap);
+	t = urcu_txn_alloc_cap(cap);
 	if (!t)
 		return NULL;
-	t->status = URCU_TXN_SW_MW_UNDECIDED;
+	t->status = URCU_TXN_DESC_UNDECIDED;
 	t->retry = retry;
 	t->nr = 0;
 	t->poisoned = 0;
@@ -600,13 +600,13 @@ struct urcu_txn_sw_mw_desc *urcu_txn_sw_mw_create(unsigned int cap,
  * commit, after the write-set stops growing (a grow may move the descriptor).
  */
 static inline
-bool urcu_txn_sw_mw_add(struct urcu_txn_sw_mw_desc *t, void **slot,
+bool urcu_txn_add(struct urcu_txn_desc *t, void **slot,
 		void *old_ptr, void *new_ptr, uintptr_t tag, unsigned int kind)
 {
-	struct urcu_txn_sw_mw_record *r;
+	struct urcu_txn_record *r;
 
-	urcu_assert_debug(!urcu_txn_sw_mw_is_proxy(old_ptr, tag));
-	urcu_assert_debug(!urcu_txn_sw_mw_is_proxy(new_ptr, tag));
+	urcu_assert_debug(!urcu_txn_is_proxy(old_ptr, tag));
+	urcu_assert_debug(!urcu_txn_is_proxy(new_ptr, tag));
 	if (t->nr == t->cap)
 		return false;
 	r = &t->recs[t->nr++];
@@ -619,7 +619,7 @@ bool urcu_txn_sw_mw_add(struct urcu_txn_sw_mw_desc *t, void **slot,
 }
 
 static inline
-struct urcu_txn_sw_mw_record *urcu_txn_sw_mw_find(struct urcu_txn_sw_mw_desc *t,
+struct urcu_txn_record *urcu_txn_find(struct urcu_txn_desc *t,
 		void **slot)
 {
 	unsigned int i;
@@ -639,11 +639,11 @@ struct urcu_txn_sw_mw_record *urcu_txn_sw_mw_find(struct urcu_txn_sw_mw_desc *t,
  * either SW-owned or MW-shared within a transaction).
  */
 static inline
-bool urcu_txn_sw_mw_record_chain(struct urcu_txn_sw_mw_desc *t, void **slot,
+bool urcu_txn_record_chain(struct urcu_txn_desc *t, void **slot,
 		void *old_ptr, void *new_ptr, int upgrade, uintptr_t tag,
 		unsigned int kind)
 {
-	struct urcu_txn_sw_mw_record *r = urcu_txn_sw_mw_find(t, slot);
+	struct urcu_txn_record *r = urcu_txn_find(t, slot);
 
 	if (r != NULL) {
 		urcu_assert_debug(r->kind == kind);
@@ -655,7 +655,7 @@ bool urcu_txn_sw_mw_record_chain(struct urcu_txn_sw_mw_desc *t, void **slot,
 			r->new_ptr = new_ptr;
 		return true;
 	}
-	return urcu_txn_sw_mw_add(t, slot, old_ptr, new_ptr, tag, kind);
+	return urcu_txn_add(t, slot, old_ptr, new_ptr, tag, kind);
 }
 
 /*
@@ -663,36 +663,36 @@ bool urcu_txn_sw_mw_record_chain(struct urcu_txn_sw_mw_desc *t, void **slot,
  * moved descriptor, or NULL on OOM with @t left intact.  Valid only before commit.
  */
 static inline
-struct urcu_txn_sw_mw_desc *urcu_txn_sw_mw_grow(struct urcu_txn_sw_mw_desc *t)
+struct urcu_txn_desc *urcu_txn_grow(struct urcu_txn_desc *t)
 {
 	unsigned int newcap = t->cap < 2 ? 2 : t->cap * 2;
 	unsigned int ncap, nslab;
-	struct urcu_txn_sw_mw_desc *n;
+	struct urcu_txn_desc *n;
 
-	n = urcu_txn_sw_mw_alloc_cap(newcap);
+	n = urcu_txn_alloc_cap(newcap);
 	if (!n)
 		return NULL;
 	ncap = n->cap;
 	nslab = n->slab;
 	memcpy(n, t, sizeof(*t) +
-			(size_t) t->nr * sizeof(struct urcu_txn_sw_mw_record));
+			(size_t) t->nr * sizeof(struct urcu_txn_record));
 	n->cap = ncap;
 	n->slab = nslab;
-	urcu_txn_sw_mw_free(t);
+	urcu_txn_free(t);
 	return n;
 }
 
 static inline
-void urcu_txn_sw_mw_destroy(struct urcu_txn_sw_mw_desc *t)
+void urcu_txn_destroy(struct urcu_txn_desc *t)
 {
-	urcu_txn_sw_mw_free(t);
+	urcu_txn_free(t);
 }
 
 static inline
-void urcu_txn_sw_mw_free_rcu(struct rcu_head *head)
+void urcu_txn_free_rcu(struct rcu_head *head)
 {
-	urcu_txn_sw_mw_free(caa_container_of(head,
-			struct urcu_txn_sw_mw_desc, rcu_head));
+	urcu_txn_free(caa_container_of(head,
+			struct urcu_txn_desc, rcu_head));
 }
 
 /*
@@ -702,12 +702,12 @@ void urcu_txn_sw_mw_free_rcu(struct rcu_head *head)
  * @call_rcu_fn; a lone edge commits without a proxy and frees immediately (no
  * grace period).  Call within an RCU read-side section.
  *
- * Use urcu_txn_sw_mw_desc_commit_sw() instead when the descriptor is known to
+ * Use urcu_txn_desc_commit_sw() instead when the descriptor is known to
  * carry NO MW records: it skips the partition, sort, CAS-install and abort path
  * that this one must branch through.
  */
 static inline
-bool urcu_txn_sw_mw_desc_commit(struct urcu_txn_sw_mw_desc *t,
+bool urcu_txn_desc_commit(struct urcu_txn_desc *t,
 		void (*call_rcu_fn)(struct rcu_head *,
 			void (*)(struct rcu_head *)))
 {
@@ -715,27 +715,27 @@ bool urcu_txn_sw_mw_desc_commit(struct urcu_txn_sw_mw_desc *t,
 	int failed;
 
 	if (caa_unlikely(t->poisoned)) {
-		urcu_txn_sw_mw_destroy(t);
+		urcu_txn_destroy(t);
 		return false;
 	}
 	if (t->nr == 0) {
-		urcu_txn_sw_mw_destroy(t);
+		urcu_txn_destroy(t);
 		return true;
 	}
 	if (t->nr == 1) {
-		struct urcu_txn_sw_mw_record *r = &t->recs[0];
+		struct urcu_txn_record *r = &t->recs[0];
 
-		if (r->kind == URCU_TXN_SW_MW_KIND_SW) {
+		if (r->kind == URCU_TXN_KIND_SW) {
 			/*
 			 * Lone SW edge: caller-exclusive, so a plain release
 			 * store IS the atomic commit -- no proxy, no grace
 			 * period (as <urcu/rcu-txn-sw.h>).
 			 */
 			uatomic_store(r->slot, r->new_ptr, CMM_RELEASE);
-			urcu_txn_sw_mw_destroy(t);
+			urcu_txn_destroy(t);
 			return true;
 		}
-		if (t->retry < URCU_TXN_SW_MW_ESCALATE) {
+		if (t->retry < URCU_TXN_ESCALATE) {
 			/*
 			 * Lone MW edge, not yet starved: the CAS itself is the
 			 * atomic commit -- no proxy, no grace period.
@@ -743,10 +743,10 @@ bool urcu_txn_sw_mw_desc_commit(struct urcu_txn_sw_mw_desc *t,
 			bool committed = uatomic_cmpxchg(r->slot, r->old_ptr,
 					r->new_ptr) == r->old_ptr;
 
-			urcu_txn_sw_mw_destroy(t);
+			urcu_txn_destroy(t);
 			return committed;
 		}
-		URCU_TXN_SW_MW_STAT(escalate);	/* starved single edge: full path */
+		URCU_TXN_STAT(escalate);	/* starved single edge: full path */
 	}
 	/*
 	 * Set the record back-pointers now, deferred from add time: from here the
@@ -758,7 +758,7 @@ bool urcu_txn_sw_mw_desc_commit(struct urcu_txn_sw_mw_desc *t,
 	 * MW records first (an MW abort then wastes zero SW parks); only the MW
 	 * prefix needs the slot-address sort (age 1+) for deadlock-freedom.
 	 */
-	nr_mw = urcu_txn_sw_mw_partition(t);
+	nr_mw = urcu_txn_partition(t);
 #if defined(DEBUG_RCU) || defined(CONFIG_RCU_DEBUG)
 	for (i = 1; i < t->nr; i++) {
 		unsigned int j;
@@ -768,23 +768,23 @@ bool urcu_txn_sw_mw_desc_commit(struct urcu_txn_sw_mw_desc *t,
 	}
 #endif
 	if (t->retry != 0)
-		urcu_txn_sw_mw_sort(t, nr_mw);
+		urcu_txn_sort(t, nr_mw);
 	if (t->retry == 0)
-		planted = urcu_txn_sw_mw_install_mw_flat(t, nr_mw, &failed);
+		planted = urcu_txn_install_mw_flat(t, nr_mw, &failed);
 	else
-		planted = urcu_txn_sw_mw_install_mw_depth(t, nr_mw, &failed);
+		planted = urcu_txn_install_mw_depth(t, nr_mw, &failed);
 	if (failed) {
 		/* Abort: restore the parked MW prefix to old, then reclaim. */
-		urcu_txn_sw_mw_settle(t, planted);
-		call_rcu_fn(&t->rcu_head, urcu_txn_sw_mw_free_rcu);
+		urcu_txn_settle(t, planted);
+		call_rcu_fn(&t->rcu_head, urcu_txn_free_rcu);
 		return false;
 	}
 	/* Every MW record installed; the status is still UNDECIDED. */
 	for (i = nr_mw; i < t->nr; i++)
-		urcu_txn_sw_mw_park(&t->recs[i]);	/* SW parks: plain, never fail */
-	urcu_txn_sw_mw_decide(t, URCU_TXN_SW_MW_SUCCEEDED);	/* linearization point */
-	urcu_txn_sw_mw_settle(t, t->nr);
-	call_rcu_fn(&t->rcu_head, urcu_txn_sw_mw_free_rcu);
+		urcu_txn_park(&t->recs[i]);	/* SW parks: plain, never fail */
+	urcu_txn_decide(t, URCU_TXN_DESC_SUCCEEDED);	/* linearization point */
+	urcu_txn_settle(t, t->nr);
+	call_rcu_fn(&t->rcu_head, urcu_txn_free_rcu);
 	return true;
 }
 
@@ -794,41 +794,41 @@ bool urcu_txn_sw_mw_desc_commit(struct urcu_txn_sw_mw_desc *t,
  * branch-lean path for a transaction the embedder knows carries no MW records.
  * Returns true when published; false only when the descriptor was poisoned by a
  * torn same-slot read-set (never a contention abort -- SW parks cannot fail).
- * Use urcu_txn_sw_mw_desc_commit() when MW records may be present.
+ * Use urcu_txn_desc_commit() when MW records may be present.
  */
 static inline
-bool urcu_txn_sw_mw_desc_commit_sw(struct urcu_txn_sw_mw_desc *t,
+bool urcu_txn_desc_commit_sw(struct urcu_txn_desc *t,
 		void (*call_rcu_fn)(struct rcu_head *,
 			void (*)(struct rcu_head *)))
 {
 	unsigned int i;
 
 	if (caa_unlikely(t->poisoned)) {
-		urcu_txn_sw_mw_destroy(t);
+		urcu_txn_destroy(t);
 		return false;
 	}
 	if (t->nr == 0) {
-		urcu_txn_sw_mw_destroy(t);
+		urcu_txn_destroy(t);
 		return true;
 	}
 	if (t->nr == 1) {
-		struct urcu_txn_sw_mw_record *r = &t->recs[0];
+		struct urcu_txn_record *r = &t->recs[0];
 
-		urcu_assert_debug(r->kind == URCU_TXN_SW_MW_KIND_SW);
+		urcu_assert_debug(r->kind == URCU_TXN_KIND_SW);
 		/* Lone SW edge: caller-exclusive plain store, no proxy, no GP. */
 		uatomic_store(r->slot, r->new_ptr, CMM_RELEASE);
-		urcu_txn_sw_mw_destroy(t);
+		urcu_txn_destroy(t);
 		return true;
 	}
 	for (i = 0; i < t->nr; i++) {
-		urcu_assert_debug(t->recs[i].kind == URCU_TXN_SW_MW_KIND_SW);
+		urcu_assert_debug(t->recs[i].kind == URCU_TXN_KIND_SW);
 		t->recs[i].desc = t;		/* back-pointer: readers resolve through it */
 	}
 	for (i = 0; i < t->nr; i++)
-		urcu_txn_sw_mw_park(&t->recs[i]);		/* plain stores, never fail */
-	urcu_txn_sw_mw_decide(t, URCU_TXN_SW_MW_SUCCEEDED);	/* linearization point */
-	urcu_txn_sw_mw_settle(t, t->nr);
-	call_rcu_fn(&t->rcu_head, urcu_txn_sw_mw_free_rcu);
+		urcu_txn_park(&t->recs[i]);		/* plain stores, never fail */
+	urcu_txn_decide(t, URCU_TXN_DESC_SUCCEEDED);	/* linearization point */
+	urcu_txn_settle(t, t->nr);
+	call_rcu_fn(&t->rcu_head, urcu_txn_free_rcu);
 	return true;
 }
 
@@ -836,4 +836,4 @@ bool urcu_txn_sw_mw_desc_commit_sw(struct urcu_txn_sw_mw_desc *t,
 }
 #endif
 
-#endif	/* _URCU_RCU_MCAS_SW_MW_H */
+#endif	/* _URCU_RCU_TXN_ENGINE_H */

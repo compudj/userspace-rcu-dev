@@ -4,14 +4,14 @@
 
 /*
  * Growth test for the transaction front-end
- * <urcu/rcu-txn.h>: the write-set is a heap
+ * <urcu/rcu-txn-mw.h>: the write-set is a heap
  * descriptor the handle allocates lazily and grows
  * (urcu_mcas_grow, realloc) as stores arrive, rather than a
  * fixed array.  Two things need exercising beyond
  * test_rcu_txn's 2-3 word transactions:
  *
  *  Phase 1 -- growth under writer/writer contention.  Each
- *  transaction spans PH1_TXN distinct words (> URCU_TXN_INIT,
+ *  transaction spans PH1_TXN distinct words (> URCU_TXN_MW_INIT,
  *  so the descriptor grows), many writers on a small array, half the
  *  ops pre-sizing with reserve() and half growing lazily.  Transfers
  *  are zero-sum, so a torn k-CAS shows as a non-zero total;
@@ -52,7 +52,7 @@
 #include <urcu/compiler.h>
 #include <urcu-qsbr.h>
 #include <urcu-call-rcu.h>
-#include <urcu/rcu-txn.h>
+#include <urcu/rcu-txn-mw.h>
 
 #include "tap.h"
 
@@ -100,7 +100,7 @@ static void *ph1_worker(void *arg)
 
 	rcu_register_thread();
 	for (n = 0; n < PH1_OPS; n++) {
-		struct urcu_mcas_txn tx;
+		struct urcu_txn_mw tx;
 		int idx[PH1_WORDS], i, ret;
 
 		/* Fisher-Yates prefix: PH1_TXN distinct indices. */
@@ -114,23 +114,23 @@ static void *ph1_worker(void *arg)
 			t = idx[i]; idx[i] = idx[j]; idx[j] = t;
 		}
 
-		urcu_txn_init(&tx, NULL);
+		urcu_txn_mw_init(&tx, NULL);
 		do {
-			urcu_txn_begin(&tx);
+			urcu_txn_mw_begin(&tx);
 			/* odd ops reserve(); even grow lazily */
 			if (n & 1)
-				(void) urcu_txn_reserve(&tx, PH1_TXN);
+				(void) urcu_txn_mw_reserve(&tx, PH1_TXN);
 			for (i = 0; i < PH1_TXN; i++) {
-				uintptr_t old = (uintptr_t) urcu_txn_load(
+				uintptr_t old = (uintptr_t) urcu_txn_mw_load(
 						&tx, &ph1_word[idx[i]], URCU_MCAS_TAG);
 				intptr_t delta = (i < PH1_TXN / 2) ? +3 : -3;
 
-				urcu_txn_store(&tx, &ph1_word[idx[i]],
+				urcu_txn_mw_store(&tx, &ph1_word[idx[i]],
 						(void *) old,
 						(void *) lf_bump(old, delta), URCU_MCAS_TAG);
 			}
-			ret = urcu_txn_commit(&tx);
-			urcu_txn_end(&tx);
+			ret = urcu_txn_mw_commit(&tx);
+			urcu_txn_mw_end(&tx);
 			if (ret < 0)
 				abort();		/* MEMORY_ERROR */
 		} while (ret == URCU_TXN_STATUS_ABORT);
@@ -201,7 +201,7 @@ static void *ph2_writer(void *arg)
 	(void) arg;
 	rcu_register_thread();
 	for (round = 0; round < PH2_ROUNDS; round++) {
-		struct urcu_mcas_txn tx;
+		struct urcu_txn_mw tx;
 		long i;
 		int ret;
 
@@ -211,15 +211,15 @@ static void *ph2_writer(void *arg)
 		 * must grow from INIT to PH2_N (so relocate) for this
 		 * phase to mean anything.
 		 */
-		urcu_txn_init(&tx, NULL);
+		urcu_txn_mw_init(&tx, NULL);
 		do {
-			urcu_txn_begin(&tx);
+			urcu_txn_mw_begin(&tx);
 			for (i = 0; i < PH2_N; i++)
-				urcu_txn_store(&tx, &ph2_word[i],
+				urcu_txn_mw_store(&tx, &ph2_word[i],
 						enc(i + (long) round * PH2_N),
 						enc(i + (long) (round + 1) * PH2_N), URCU_MCAS_TAG);
-			ret = urcu_txn_commit(&tx);
-			urcu_txn_end(&tx);
+			ret = urcu_txn_mw_commit(&tx);
+			urcu_txn_mw_end(&tx);
 			if (ret < 0)
 				abort();		/* MEMORY_ERROR */
 		} while (ret == URCU_TXN_STATUS_ABORT);
@@ -265,7 +265,7 @@ int main(void)
 	diag("phase 1: %d workers x %d ops, %d words/txn over %d words "
 		"(grows past INIT %d); committed=%ld sum=%" PRIdPTR,
 		PH1_WORKERS, PH1_OPS, PH1_TXN, PH1_WORDS,
-		URCU_TXN_INIT, total, sum);
+		URCU_TXN_MW_INIT, total, sum);
 	ok(sum == 0,
 		"grow under contention stayed atomic (zero-sum invariant)");
 	ok(total == (long) PH1_WORKERS * PH1_OPS,

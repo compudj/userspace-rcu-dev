@@ -13,7 +13,7 @@
  *
  *     ppv = urcu_txn_load(txn, &elem->pprev);   // the slot that names elem
  *     ...
- *     urcu_txn_store(txn, ppv, elem, next);     // store THROUGH it
+ *     urcu_txn_store_mw(txn, ppv, elem, next);     // store THROUGH it
  *
  * That is a one-hop traversal, and a one-hop traversal is still a traversal.
  * Delete two ADJACENT nodes A and B (B == A->next) in one transaction and, were
@@ -57,7 +57,7 @@
 #include <urcu/compiler.h>
 #include <urcu-qsbr.h>
 #include <urcu-call-rcu.h>
-#include <urcu/rcu-mcas.h>
+#include <urcu/rcu-txn-engine.h>
 #include <urcu/rcu-txn-hlist.h>
 #include <urcu/rcu-txn.h>
 
@@ -109,7 +109,7 @@ static void assert_chain_sane(struct urcu_txn_hlist_head *head)
 
 	for (n = urcu_txn_hlist_first_rcu(head); n != NULL;
 			n = urcu_txn_hlist_next_rcu(n)) {
-		void *v = urcu_mcas_read((void **) &n->next, URCU_TXN_HLIST_TAG);
+		void *v = urcu_txn_read((void **) &n->next, URCU_TXN_HLIST_TAG);
 
 		assert(!urcu_txn_hlist_is_marked(v));	/* live => untombstoned */
 		assert(n->pprev == expect_pprev);	/* named by its real slot */
@@ -136,7 +136,7 @@ static int present(struct urcu_txn_hlist_head *head, unsigned long key)
  */
 static int del_two(struct urcu_txn_hlist_node *a, struct urcu_txn_hlist_node *b)
 {
-	struct urcu_mcas_txn txn;
+	struct urcu_txn txn;
 	long spins = 0;
 	enum urcu_txn_status st;
 
@@ -219,8 +219,8 @@ static void test_ryw_whitebox_chain(void)
 {
 	struct urcu_txn_hlist_head head;
 	struct node *n[4];
-	struct urcu_mcas_txn txn;
-	struct urcu_mcas_record *r;
+	struct urcu_txn txn;
+	struct urcu_txn_record *r;
 	int pass;
 
 	build(&head, n);		/* 4,3,2,1 */
@@ -245,7 +245,7 @@ static void test_ryw_whitebox_chain(void)
 	 * and chains: the single record must now read {n3 -> n1}, with the
 	 * committed old preserved for the commit's check.
 	 */
-	r = urcu_mcas_find(txn.mcas, (void **) &n[3]->h.next);
+	r = urcu_txn_find(txn.desc, (void **) &n[3]->h.next);
 	pass = r != NULL && r->old_ptr == (void *) &n[2]->h &&
 			r->new_ptr == (void *) &n[0]->h;
 	ok(pass, "ryw hlist whitebox: the two unlinks chain to {n(3) -> n(1)} on one slot");
@@ -280,7 +280,7 @@ static int del_plus_insert_head(int victim_idx, unsigned long *chain,
 		int *chain_len)
 {
 	struct urcu_txn_hlist_head head;
-	struct urcu_mcas_txn txn;
+	struct urcu_txn txn;
 	struct node *n[4], *ins;
 	unsigned long victim_key;
 	int survived;

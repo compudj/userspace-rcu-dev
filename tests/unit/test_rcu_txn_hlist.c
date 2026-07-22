@@ -254,7 +254,7 @@ static void sorted_insert(int key)
 {
 	struct urcu_txn_hlist_head *bkt = &g_bkt[hash_key(key)];
 	struct hnode *n = hnode_alloc(key);
-	struct urcu_mcas_txn txn;
+	struct urcu_txn txn;
 	enum urcu_txn_status st;
 
 	urcu_txn_init(&txn, &g_dom);

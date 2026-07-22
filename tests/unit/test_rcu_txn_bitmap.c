@@ -68,7 +68,7 @@ static int tag_invariant_ok(const uintptr_t *words, size_t nwords)
 	size_t w;
 
 	for (w = 0; w < nwords; w++)
-		if (words[w] & URCU_MCAS_TAG)
+		if (words[w] & URCU_TXN_TAG)
 			return 0;
 	return 1;
 }
@@ -151,7 +151,7 @@ static void test_encoding(struct urcu_txn_domain *dom)
 
 	/* atomic multi-word range set [100,150) */
 	{
-		struct urcu_mcas_txn t;
+		struct urcu_txn t;
 		enum urcu_txn_status st;
 
 		urcu_txn_init(&t, dom);
@@ -182,7 +182,7 @@ static void test_compose_single(struct urcu_txn_domain *dom)
 	uintptr_t bm[URCU_TXN_BITMAP_NR_WORDS(64)];
 	void *slot = NULL;
 	void *sent = (void *) (uintptr_t) 0x40;		/* bit 0 clear */
-	struct urcu_mcas_txn t;
+	struct urcu_txn t;
 	enum urcu_txn_status st;
 	int set_ok, clr_ok;
 
@@ -192,26 +192,26 @@ static void test_compose_single(struct urcu_txn_domain *dom)
 	do {						/* set bit 10 AND publish slot */
 		urcu_txn_begin(&t);
 		(void) urcu_txn_bitmap_set_prepare(&t, bm, 10);
-		(void) urcu_txn_store(&t, (void **) &slot, NULL, sent, URCU_MCAS_TAG);
+		(void) urcu_txn_store_mw(&t, (void **) &slot, NULL, sent, URCU_TXN_TAG);
 		st = urcu_txn_commit(&t);
 		urcu_txn_end(&t);
 	} while (st == URCU_TXN_STATUS_ABORT);
 	rcu_read_lock();
 	set_ok = urcu_txn_bitmap_test_rcu(bm, 10)
-		&& urcu_mcas_read((void **) &slot, URCU_MCAS_TAG) == sent;
+		&& urcu_txn_read((void **) &slot, URCU_TXN_TAG) == sent;
 	rcu_read_unlock();
 	ok(set_ok, "compose: one commit sets the bit AND stores the pointer");
 
 	do {						/* clear bit 10 AND clear slot */
 		urcu_txn_begin(&t);
 		(void) urcu_txn_bitmap_clear_prepare(&t, bm, 10);
-		(void) urcu_txn_store(&t, (void **) &slot, sent, NULL, URCU_MCAS_TAG);
+		(void) urcu_txn_store_mw(&t, (void **) &slot, sent, NULL, URCU_TXN_TAG);
 		st = urcu_txn_commit(&t);
 		urcu_txn_end(&t);
 	} while (st == URCU_TXN_STATUS_ABORT);
 	rcu_read_lock();
 	clr_ok = !urcu_txn_bitmap_test_rcu(bm, 10)
-		&& urcu_mcas_read((void **) &slot, URCU_MCAS_TAG) == NULL;
+		&& urcu_txn_read((void **) &slot, URCU_TXN_TAG) == NULL;
 	rcu_read_unlock();
 	ok(clr_ok, "compose: one commit clears the bit AND nulls the pointer");
 }
@@ -325,7 +325,7 @@ static void *t4_writer(void *a)
 		/* each writer owns a disjoint residue class of k (shared bitmap
 		 * words), toggling {bit k, slot[k]} together in one commit. */
 		for (k = (size_t) id; k < T4_K; k += T4_WRITERS) {
-			struct urcu_mcas_txn t;
+			struct urcu_txn t;
 			enum urcu_txn_status st;
 
 			urcu_txn_init(&t, &t4_dom);
@@ -334,15 +334,15 @@ static void *t4_writer(void *a)
 
 				urcu_txn_begin(&t);
 				cur = urcu_txn_load(&t, (void **) &t4_slot[k],
-						URCU_MCAS_TAG);
+						URCU_TXN_TAG);
 				if (cur == NULL) {
 					(void) urcu_txn_bitmap_set_prepare(&t, t4_bm, k);
-					(void) urcu_txn_store(&t, (void **) &t4_slot[k],
-							NULL, t4_sent(k), URCU_MCAS_TAG);
+					(void) urcu_txn_store_mw(&t, (void **) &t4_slot[k],
+							NULL, t4_sent(k), URCU_TXN_TAG);
 				} else {
 					(void) urcu_txn_bitmap_clear_prepare(&t, t4_bm, k);
-					(void) urcu_txn_store(&t, (void **) &t4_slot[k],
-							t4_sent(k), NULL, URCU_MCAS_TAG);
+					(void) urcu_txn_store_mw(&t, (void **) &t4_slot[k],
+							t4_sent(k), NULL, URCU_TXN_TAG);
 				}
 				st = urcu_txn_commit(&t);
 				urcu_txn_end(&t);
@@ -362,7 +362,7 @@ static void *t4_reader(void *a)
 	while (!CMM_LOAD_SHARED(t4_stop)) {
 		size_t k, w;
 		unsigned phys;
-		struct urcu_mcas_txn t;
+		struct urcu_txn t;
 		enum urcu_txn_status st;
 		uintptr_t bword = 0;
 		void *p = NULL;
@@ -379,9 +379,9 @@ static void *t4_reader(void *a)
 		do {
 			urcu_txn_begin(&t);
 			bword = (uintptr_t) urcu_txn_load_validate(&t,
-					(void **) &t4_bm[w], URCU_MCAS_TAG);
+					(void **) &t4_bm[w], URCU_TXN_TAG);
 			p = urcu_txn_load_validate(&t,
-					(void **) &t4_slot[k], URCU_MCAS_TAG);
+					(void **) &t4_slot[k], URCU_TXN_TAG);
 			st = urcu_txn_commit(&t);
 			urcu_txn_end(&t);
 		} while (st == URCU_TXN_STATUS_ABORT);

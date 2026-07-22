@@ -15,14 +15,14 @@
  * in-place transaction.  Reads are plain RCU (resolve the proxy, mask the bit).
  *
  * ENCODING.  The engine owns tag bit 0 of every transacted slot: a settled
- * literal must have (value & URCU_MCAS_TAG) != URCU_MCAS_TAG, i.e. bit 0 clear,
+ * literal must have (value & URCU_TXN_TAG) != URCU_TXN_TAG, i.e. bit 0 clear,
  * or it is mistaken for an in-flight descriptor (rcu-mcas.h tag contract).  A
  * bitmap word is all data, so we spend bit 0 as the tag and keep 63 data bits
  * per word (CAA_BITS_PER_LONG - 1).  This is exactly the engine's documented
  * "store small integers shifted left by 1" discipline: logical bit i lives at
  * PHYSICAL bit i+1, and a settled word always has bit 0 == 0.  No engine change
  * and no sentinel carve-out are needed, and the tag stays the narrow bit-0
- * URCU_MCAS_TAG so a bitmap word can share one commit with pointer slots that
+ * URCU_TXN_TAG so a bitmap word can share one commit with pointer slots that
  * carry a wider per-record tag (the fractal trie's typed pointers).
  *
  *   word  w  = bit / BITS_PER_WORD
@@ -67,7 +67,7 @@
 #include <stdint.h>			/* uintptr_t */
 
 #include <urcu/compiler.h>		/* CAA_BITS_PER_LONG, caa_likely */
-#include <urcu/rcu-mcas.h>		/* urcu_mcas_read_optimistic, URCU_MCAS_TAG */
+#include <urcu/rcu-txn-engine.h>		/* urcu_txn_read_optimistic, URCU_TXN_TAG */
 #include <urcu/rcu-txn.h>		/* urcu_txn_load/store/begin/commit/... */
 
 #ifdef __cplusplus
@@ -100,7 +100,7 @@ uintptr_t urcu_txn_bitmap_word_rcu(const uintptr_t *words, size_t w)
 	/*
 	 * Optimistic: a pure reader never waits.  An UNDECIDED transaction has not
 	 * linearized, so this word's logical value IS its old_ptr -- exactly what
-	 * urcu_mcas_read_optimistic() returns -- and waiting would make every bitmap
+	 * urcu_txn_read_optimistic() returns -- and waiting would make every bitmap
 	 * probe spin on a stranger's install.
 	 *
 	 * The rule (measured): wait iff the loaded slot belongs to the caller's own
@@ -129,8 +129,8 @@ uintptr_t urcu_txn_bitmap_word_rcu(const uintptr_t *words, size_t w)
 	 * urcu_txn_load_validate_optimistic() records identically: "optimistic"
 	 * governs only whether the initial read waits, never the read set.)
 	 */
-	return (uintptr_t) urcu_mcas_read_optimistic(
-			(void **) &((uintptr_t *) words)[w], URCU_MCAS_TAG);
+	return (uintptr_t) urcu_txn_read_optimistic(
+			(void **) &((uintptr_t *) words)[w], URCU_TXN_TAG);
 }
 
 /* True iff logical @bit is set.  Call within an RCU read-side section. */
@@ -247,29 +247,29 @@ long urcu_txn_bitmap_select_rcu(const uintptr_t *words, size_t nbits, size_t i)
  * can record the same slot.  See the composition note in the header intro.
  */
 static inline
-int urcu_txn_bitmap_set_prepare(struct urcu_mcas_txn *txn, uintptr_t *words,
+int urcu_txn_bitmap_set_prepare(struct urcu_txn *txn, uintptr_t *words,
 		size_t bit)
 {
 	size_t w;
 	uintptr_t mask, old;
 
 	urcu_txn_bitmap__locate(bit, &w, &mask);
-	old = (uintptr_t) urcu_txn_load(txn, (void **) &words[w], URCU_MCAS_TAG);
-	return urcu_txn_store(txn, (void **) &words[w],
-			(void *) old, (void *) (old | mask), URCU_MCAS_TAG);
+	old = (uintptr_t) urcu_txn_load(txn, (void **) &words[w], URCU_TXN_TAG);
+	return urcu_txn_store_mw(txn, (void **) &words[w],
+			(void *) old, (void *) (old | mask), URCU_TXN_TAG);
 }
 
 static inline
-int urcu_txn_bitmap_clear_prepare(struct urcu_mcas_txn *txn, uintptr_t *words,
+int urcu_txn_bitmap_clear_prepare(struct urcu_txn *txn, uintptr_t *words,
 		size_t bit)
 {
 	size_t w;
 	uintptr_t mask, old;
 
 	urcu_txn_bitmap__locate(bit, &w, &mask);
-	old = (uintptr_t) urcu_txn_load(txn, (void **) &words[w], URCU_MCAS_TAG);
-	return urcu_txn_store(txn, (void **) &words[w],
-			(void *) old, (void *) (old & ~mask), URCU_MCAS_TAG);
+	old = (uintptr_t) urcu_txn_load(txn, (void **) &words[w], URCU_TXN_TAG);
+	return urcu_txn_store_mw(txn, (void **) &words[w],
+			(void *) old, (void *) (old & ~mask), URCU_TXN_TAG);
 }
 
 /*
@@ -278,7 +278,7 @@ int urcu_txn_bitmap_clear_prepare(struct urcu_mcas_txn *txn, uintptr_t *words,
  * -- the property a per-bit atomic cannot: a reader never sees a torn range.
  */
 static inline
-int urcu_txn_bitmap__range_prepare(struct urcu_mcas_txn *txn, uintptr_t *words,
+int urcu_txn_bitmap__range_prepare(struct urcu_txn *txn, uintptr_t *words,
 		size_t lo, size_t hi, int set)
 {
 	size_t bpw = URCU_TXN_BITMAP_BITS_PER_WORD;
@@ -296,10 +296,10 @@ int urcu_txn_bitmap__range_prepare(struct urcu_mcas_txn *txn, uintptr_t *words,
 		mask = (p_hi == CAA_BITS_PER_LONG - 1)
 			? ~(uintptr_t) 0 : (((uintptr_t) 1 << (p_hi + 1)) - 1);
 		mask &= ~(((uintptr_t) 1 << p_lo) - 1);
-		old = (uintptr_t) urcu_txn_load(txn, (void **) &words[w], URCU_MCAS_TAG);
-		ret = urcu_txn_store(txn, (void **) &words[w], (void *) old,
+		old = (uintptr_t) urcu_txn_load(txn, (void **) &words[w], URCU_TXN_TAG);
+		ret = urcu_txn_store_mw(txn, (void **) &words[w], (void *) old,
 				(void *) (set ? (old | mask) : (old & ~mask)),
-				URCU_MCAS_TAG);
+				URCU_TXN_TAG);
 		if (ret)
 			return ret;
 		lo = seg_hi;
@@ -308,14 +308,14 @@ int urcu_txn_bitmap__range_prepare(struct urcu_mcas_txn *txn, uintptr_t *words,
 }
 
 static inline
-int urcu_txn_bitmap_set_range_prepare(struct urcu_mcas_txn *txn,
+int urcu_txn_bitmap_set_range_prepare(struct urcu_txn *txn,
 		uintptr_t *words, size_t lo, size_t hi)
 {
 	return urcu_txn_bitmap__range_prepare(txn, words, lo, hi, 1);
 }
 
 static inline
-int urcu_txn_bitmap_clear_range_prepare(struct urcu_mcas_txn *txn,
+int urcu_txn_bitmap_clear_range_prepare(struct urcu_txn *txn,
 		uintptr_t *words, size_t lo, size_t hi)
 {
 	return urcu_txn_bitmap__range_prepare(txn, words, lo, hi, 0);
@@ -332,7 +332,7 @@ static inline
 enum urcu_txn_status urcu_txn_bitmap_set_rcu(struct urcu_txn_domain *domain,
 		uintptr_t *words, size_t bit)
 {
-	struct urcu_mcas_txn txn;
+	struct urcu_txn txn;
 	enum urcu_txn_status st;
 
 	urcu_txn_init(&txn, domain);
@@ -350,7 +350,7 @@ static inline
 enum urcu_txn_status urcu_txn_bitmap_clear_rcu(struct urcu_txn_domain *domain,
 		uintptr_t *words, size_t bit)
 {
-	struct urcu_mcas_txn txn;
+	struct urcu_txn txn;
 	enum urcu_txn_status st;
 
 	urcu_txn_init(&txn, domain);
