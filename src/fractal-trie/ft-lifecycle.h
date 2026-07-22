@@ -345,6 +345,15 @@ enum cds_ft_status cds_ft_attr_set_speculative_keys(struct cds_ft_attr *attr,
 	return CDS_FT_STATUS_OK;
 }
 
+enum cds_ft_status cds_ft_attr_set_rekey_coherence(struct cds_ft_attr *attr,
+		bool enabled)
+{
+	if (!attr)
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	attr->rekey_coherence = enabled;
+	return CDS_FT_STATUS_OK;
+}
+
 void cds_ft_make_exclusive(struct cds_ft *ft)
 {
 	CDS_FT_SCOPED_WRITER(ft);
@@ -681,15 +690,27 @@ void ft_install_lookup_ops(struct cds_ft *ft)
 		: ft_lookup_longest_match_iter_nosc;
 #ifdef FEATURE_FT_KEY_MAP
 	if (caa_unlikely(!group->key_map.identity)) {
-		ft->lookup_key_fn = ft_lookup_key_nonidentity;
+		/* REKEY-coherent exact lookup swaps in the second-walk variant. */
+		ft->lookup_key_fn = ft->rekey_coherence ?
+			ft_lookup_key_coherent_nonidentity :
+			ft_lookup_key_nonidentity;
 		ft->lookup_candidate_key_fn = ft_lookup_candidate_key_nonidentity;
 		ft->lookup_partial_key_fn = ft_lookup_partial_key_nonidentity;
 		ft->lookup_longest_match_key_fn = ft_lookup_longest_match_key_nonidentity;
 		return;
 	}
 #endif
-	ft->lookup_key_fn = sc
-		? ft_lookup_precise_sc : ft_lookup_precise_nosc;
+	/*
+	 * REKEY-coherent exact lookup (opt-in) swaps in the second-walk
+	 * re-descend variant; the plain variant is byte-identical otherwise.
+	 */
+	if (ft->rekey_coherence)
+		ft->lookup_key_fn = sc
+			? ft_lookup_precise_coherent_sc
+			: ft_lookup_precise_coherent_nosc;
+	else
+		ft->lookup_key_fn = sc
+			? ft_lookup_precise_sc : ft_lookup_precise_nosc;
 	ft->lookup_candidate_key_fn = sc
 		? ft_lookup_cand_sc : ft_lookup_cand_nosc;
 	ft->lookup_partial_key_fn = sc
@@ -734,6 +755,14 @@ enum cds_ft_status cds_ft_create(struct cds_ft_group *ft_group,
 	 */
 	ft->speculative_key_offset_active = ft_group->speculative_key_offset_set &&
 		(!attr || !attr->speculative_keys_disabled);
+	/*
+	 * REKEY coherence (opt-in): the reader's second walk rematerializes the
+	 * key via the parent-pointer up-walk, which only exists when the group
+	 * keeps an ordered list (cells carry the structural incoming bytes), so
+	 * gate the opt-in on ->ordered_list.  Set BEFORE ft_install_lookup_ops so
+	 * it selects the coherent lookup specializations.
+	 */
+	ft->rekey_coherence = ft->ordered_list && attr && attr->rekey_coherence;
 	ft_install_lookup_ops(ft);
 #ifdef FEATURE_FT_VERIFY_AT_MUTATION
 	/*

@@ -2777,6 +2777,38 @@ enum cds_ft_status cds_ft_attr_set_speculative_keys(struct cds_ft_attr *attr,
 		bool enabled);
 
 /*
+ * cds_ft_attr_set_rekey_coherence - Per-trie opt-in to in-trie rekey coherence.
+ * @attr: Fractal Trie attributes.
+ * @enabled: true -- readers on this trie tolerate a CONCURRENT in-trie rekey
+ *           (a cds_ft_merge_at that moves a live subtree to a new key within
+ *           the same trie).  false (default) -- readers do not.
+ *
+ * A rekey moves a subtree from one key prefix to another.  Without this,
+ * a reader whose descent races the move can be torn -- it can land on a leaf
+ * that no longer belongs at the key it searched for.  With it enabled, every
+ * EXACT lookup performs a second walk: it rematerializes the found leaf's key
+ * from the trie structure (the parent-pointer up-walk) and checks it against
+ * the key it descended with.  On a mismatch the descent was restructured under
+ * it, so it re-descends from the root; the result it finally returns is always
+ * coherent with respect to concurrent rekeys.
+ *
+ * The check is deterministic (one extra, cache-hot walk per lookup), NOT an
+ * unbounded retry, so it preserves the trie's bounded-latency reads -- but it
+ * does turn this trie's reads from wait-free into lock-free (a reader on a
+ * path under active rekey re-descends until the move settles).  It is therefore
+ * opt-in per-trie: tries that never rekey pay nothing.
+ *
+ * Requires an ORDERED-LIST group (cds_ft_group_attr_set_ordered_list): the
+ * up-walk rematerializer reads the structural key bytes from the ordered-list
+ * cells.  On a non-ordered-list group this attribute has no effect.
+ *
+ * Default: false.  Returns CDS_FT_STATUS_OK, or
+ * CDS_FT_STATUS_INVALID_ARGUMENT_ERROR if @attr is NULL.
+ */
+enum cds_ft_status cds_ft_attr_set_rekey_coherence(struct cds_ft_attr *attr,
+		bool enabled);
+
+/*
  * cds_ft_make_exclusive - Transition a Fractal Trie to exclusive
  *                         access discipline.
  * @ft: The Fractal Trie.

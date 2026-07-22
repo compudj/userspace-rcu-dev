@@ -49,9 +49,9 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 325
+#define NR_TESTS 327
 #else
-#define NR_TESTS 281
+#define NR_TESTS 282
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -224,6 +224,40 @@ static struct cds_ft *create_fixed_ord_ft(size_t klen,
 	cds_ft_group_attr_destroy(attr);
 	if (cds_ft_create(group, NULL, &ft) < 0)
 		abort();
+	*group_out = group;
+	return ft;
+}
+
+/*
+ * Fixed-length ordered-list trie with REKEY coherence ENABLED (per-trie attr):
+ * every exact lookup runs the second-walk re-descend
+ * (cds_ft_attr_set_rekey_coherence).  Requires the ordered list (the up-walk
+ * rematerializer's cell source).
+ */
+static struct cds_ft *create_fixed_ord_rekey_ft(size_t klen,
+		struct cds_ft_group **group_out)
+{
+	struct cds_ft_group_attr *gattr;
+	struct cds_ft_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+
+	if (cds_ft_group_attr_create(&gattr) < 0)
+		abort();
+	if (cds_ft_group_attr_set_key_len(gattr, klen) < 0)
+		abort();
+	if (cds_ft_group_attr_set_ordered_list(gattr, true) < 0)
+		abort();
+	if (cds_ft_group_create(gattr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(gattr);
+	if (cds_ft_attr_create(&attr) < 0)
+		abort();
+	if (cds_ft_attr_set_rekey_coherence(attr, true) < 0)
+		abort();
+	if (cds_ft_create(group, attr, &ft) < 0)
+		abort();
+	cds_ft_attr_destroy(attr);
 	*group_out = group;
 	return ft;
 }
@@ -1204,6 +1238,72 @@ static int test_status_to_string(void)
 /*
  * Basic insert on an empty trie and verify count/empty.
  */
+/*
+ * REKEY coherence (cds_ft_attr_set_rekey_coherence): with the opt-in ON and NO
+ * concurrent rekey, every exact lookup's second walk MATCHES (the leaf's
+ * structural key equals the descended key), so results are identical to a plain
+ * trie -- present keys found at their node, absent keys NOT_FOUND, and crucially
+ * no infinite re-descend on a valid hit.  Single-threaded correctness gate for
+ * the coherent lookup specialization; its mismatch/re-descend arm is exercised
+ * concurrently by the writer-side merge conversion.
+ */
+static int test_rekey_coherence_lookup(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ord_rekey_ft(8, &group);
+	struct ft_test_node *nodes[256];
+	enum cds_ft_status s;
+	unsigned int i;
+	int ret = 0;
+
+	for (i = 0; i < 256; i++) {
+		nodes[i] = node_alloc((uint64_t) i * 7 + 1);
+		rcu_read_lock();
+		s = insert_u64(ft, (uint64_t) i * 7 + 1, nodes[i]);
+		rcu_read_unlock();
+		if (s != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "rekey-coherence insert failed: %s\n",
+				cds_ft_status_to_string(s));
+			node_free(nodes[i]);
+			ret = -1;
+			goto out;
+		}
+	}
+	/* Present keys: found via the coherent path, at the inserted node. */
+	for (i = 0; i < 256; i++) {
+		struct cds_ft_node *out = NULL;
+
+		rcu_read_lock();
+		s = lookup_u64(ft, (uint64_t) i * 7 + 1, &out);
+		rcu_read_unlock();
+		if (s != CDS_FT_STATUS_OK || out != &nodes[i]->node) {
+			fprintf(stderr,
+				"rekey-coherence lookup mismatch at %u\n", i);
+			ret = -1;
+			goto out;
+		}
+	}
+	/* Absent keys (i*7+3 never equals any i*7+1): coherent NOT_FOUND. */
+	for (i = 0; i < 256; i++) {
+		struct cds_ft_node *out = NULL;
+
+		rcu_read_lock();
+		s = lookup_u64(ft, (uint64_t) i * 7 + 3, &out);
+		rcu_read_unlock();
+		if (s != CDS_FT_STATUS_NOT_FOUND) {
+			fprintf(stderr,
+				"rekey-coherence absent key not NOT_FOUND at %u\n",
+				i);
+			ret = -1;
+			goto out;
+		}
+	}
+out:
+	if (drain_and_destroy(ft, group) != 0)
+		ret = -1;
+	return ret;
+}
+
 static int test_insert_basic(void)
 {
 	struct cds_ft_group *group;
@@ -21837,6 +21937,54 @@ out:
 extern long cds_ft_fault_alloc_countdown;
 extern long cds_ft_fault_flip_countdown;
 extern long cds_ft_fault_lock_countdown;
+extern long cds_ft_fault_rekey_countdown;
+
+/*
+ * REKEY-coherence re-descend arm: arm cds_ft_fault_rekey_countdown so the first
+ * second-walk reports a coherence MISS, then look up a PRESENT key.  The lookup
+ * must STILL return the correct node -- the coherent wrapper re-descended once
+ * and, the fault now spent, accepted the (genuinely coherent) hit -- and the
+ * countdown must read -1, proving the forced miss actually fired so the
+ * re-descend path is exercised, not dead code.
+ */
+static int test_rekey_coherence_fault_redescend(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ord_rekey_ft(8, &group);
+	struct ft_test_node *n = node_alloc(0x1234);
+	struct cds_ft_node *out = NULL;
+	enum cds_ft_status s;
+	int ret = 0;
+
+	rcu_read_lock();
+	s = insert_u64(ft, 0x1234, n);
+	rcu_read_unlock();
+	if (s != CDS_FT_STATUS_OK) {
+		node_free(n);
+		ret = -1;
+		goto out;
+	}
+	cds_ft_fault_rekey_countdown = 0;	/* force one coherence miss */
+	rcu_read_lock();
+	s = lookup_u64(ft, 0x1234, &out);
+	rcu_read_unlock();
+	if (s != CDS_FT_STATUS_OK || out != &n->node) {
+		fprintf(stderr,
+			"rekey re-descend: wrong result after forced miss\n");
+		ret = -1;
+		goto out;
+	}
+	if (cds_ft_fault_rekey_countdown != -1) {
+		fprintf(stderr, "rekey re-descend: forced miss did not fire\n");
+		ret = -1;
+		goto out;
+	}
+out:
+	cds_ft_fault_rekey_countdown = -1;
+	if (drain_and_destroy(ft, group) != 0)
+		ret = -1;
+	return ret;
+}
 
 /*
  * Drive a compressed-split insert through each of its allocation-failure
@@ -26330,6 +26478,7 @@ int main(int argc, char **argv)
 
 	/* 2. Insert variants */
 	diag("Insert variant tests");
+	RUN_TEST(test_rekey_coherence_lookup);
 	RUN_TEST(test_insert_basic);
 	RUN_TEST(test_insert_unique);
 	RUN_TEST(test_insert_duplicate_chain);
@@ -26673,6 +26822,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_writer_lock_mode_fine_graft);
 	RUN_TEST(test_writer_lock_mode_fine_crosstrie_busy);
 #ifdef FEATURE_FT_FAULT_INJECT
+	RUN_TEST(test_rekey_coherence_fault_redescend);
 	RUN_TEST(test_split_oom_backpointer);
 	RUN_TEST(test_split_oom_key_shorter_arm);
 	RUN_TEST(test_merge_oom);

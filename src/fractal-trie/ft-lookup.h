@@ -15,6 +15,141 @@
 #error "ft-lookup.h is an implementation unit; #include it from fractal-trie.c only"
 #endif
 
+/*
+ * REKEY coherence second walk (cds_ft_attr_set_rekey_coherence): true when the
+ * descent that landed on @found is coherent with respect to a concurrent in-trie
+ * rekey -- i.e. @found's key, rematerialized from the trie STRUCTURE by the
+ * parent-pointer up-walk, still equals the ordinal key bytes @ord_key[0..key_len)
+ * the reader descended with.  A concurrent merge_at that moved @found's subtree
+ * to a different prefix while this descent was in flight leaves it landed on a
+ * leaf whose structural key now differs -> returns false, and the caller
+ * re-descends from the root.  Deliberately reads the STRUCTURAL key (the up-walk,
+ * as cds_ft_node_get_key's non-speculative branch does), never the leaf's stored
+ * speculative key: the check is about the leaf's POSITION, not its stamped bytes.
+ * Only reached when ft->rekey_coherence, which is ANDed with ft->ordered_list at
+ * create, so the cell (the up-walk source) always exists.  Must run under the
+ * same RCU read lock that produced @found (ft_rebuild_key_upwalk's contract).
+ */
+#ifdef FEATURE_FT_FAULT_INJECT
+extern long cds_ft_fault_rekey_countdown;
+#endif
+
+static inline_lookup
+bool ft_rekey_descent_coherent(const struct cds_ft *ft,
+		const struct cds_ft_node *found,
+		const uint8_t *ord_key, size_t key_len)
+{
+	const struct cds_ft_group *group = ft->group;
+	struct ft_ord_cell *cell;
+	uint8_t scratch[FT_MAX_KEY_LEN];
+	size_t max_len = group->max_key_len;
+	size_t klen;
+
+#ifdef FEATURE_FT_FAULT_INJECT
+	/* Force one coherence miss on demand to exercise the re-descend loop. */
+	if (caa_unlikely(cds_ft_fault_rekey_countdown >= 0)) {
+		if (cds_ft_fault_rekey_countdown == 0) {
+			cds_ft_fault_rekey_countdown = -1;
+			return false;
+		}
+		cds_ft_fault_rekey_countdown--;
+	}
+#endif
+	cell = ft_ord_cell_ptr(ft_dereference_prev_resolved(
+			(struct cds_ft_node *) found));
+	klen = ft_rebuild_key_upwalk(ft, cell, scratch, max_len);
+	return klen == key_len &&
+		memcmp(scratch + (max_len - klen), ord_key, key_len) == 0;
+}
+
+/*
+ * REKEY-coherent exact lookup specializations (installed on ft->lookup_key_fn in
+ * place of ft_lookup_precise_{sc,nosc} when ft->rekey_coherence).  Same descent
+ * as the plain variant, wrapped in the second-walk re-descend loop UNDER the one
+ * read lock: on a coherence miss (a peer rekey restructured the path) the whole
+ * descent is thrown away and retried from the root.  A hit whose structural key
+ * matches, or any non-OK status, returns immediately.  Not in the hot .text
+ * cluster (opt-in path); real symbols (fn-ptr targets), so not inlined.
+ */
+static
+enum cds_ft_status ft_lookup_precise_coherent_sc(struct cds_ft *ft,
+		const uint8_t *key, size_t key_len, size_t key_readable_pad,
+		struct cds_ft_node **result_node)
+{
+	enum cds_ft_status status;
+
+	key_len = ft_key_len(ft, key_len);
+	if (!valid_key_len(ft, key_len))
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	CDS_FT_SCOPED_READER(ft);
+	for (;;) {
+		status = do_cds_ft_lookup_nodc_sc(ft, key, key_len,
+				key_readable_pad, result_node, NULL,
+				FT_PREFIX_TRACK_NONE, NULL, NULL);
+		if (status != CDS_FT_STATUS_OK ||
+				ft_rekey_descent_coherent(ft, *result_node,
+					key, key_len))
+			break;
+	}
+	return status;
+}
+
+static
+enum cds_ft_status ft_lookup_precise_coherent_nosc(struct cds_ft *ft,
+		const uint8_t *key, size_t key_len, size_t key_readable_pad,
+		struct cds_ft_node **result_node)
+{
+	enum cds_ft_status status;
+
+	key_len = ft_key_len(ft, key_len);
+	if (!valid_key_len(ft, key_len))
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	CDS_FT_SCOPED_READER(ft);
+	for (;;) {
+		status = do_cds_ft_lookup_nodc_nosc(ft, key, key_len,
+				key_readable_pad, result_node, NULL,
+				FT_PREFIX_TRACK_NONE, NULL, NULL);
+		if (status != CDS_FT_STATUS_OK ||
+				ft_rekey_descent_coherent(ft, *result_node,
+					key, key_len))
+			break;
+	}
+	return status;
+}
+
+#ifdef FEATURE_FT_KEY_MAP
+/*
+ * Non-identity key_map REKEY-coherent exact lookup: remap once, then the same
+ * second-walk re-descend loop.  The up-walk rematerializes ORDINAL bytes, so the
+ * coherence compare is against @ordinals (ordinal space), not the caller key.
+ */
+static
+enum cds_ft_status ft_lookup_key_coherent_nonidentity(struct cds_ft *ft,
+		const uint8_t *key, size_t key_len, size_t key_readable_pad,
+		struct cds_ft_node **result_node)
+{
+	uint8_t ordinals[FT_MAX_KEY_LEN];
+	enum cds_ft_status status;
+
+	(void) key_readable_pad;
+	key_len = ft_key_len(ft, key_len);
+	if (!valid_key_len(ft, key_len))
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	CDS_FT_SCOPED_READER(ft);
+	ft_key_to_ordinals(ordinals, key, key_len, &ft->group->key_map);
+	for (;;) {
+		status = do_cds_ft_lookup(ft, ordinals, key_len,
+				FT_KEY_READABLE_PAD, result_node, NULL,
+				FT_PREFIX_TRACK_NONE, NULL, NULL, false);
+		if (status != CDS_FT_STATUS_OK ||
+				ft_rekey_descent_coherent(ft, *result_node,
+					ordinals, key_len))
+			break;
+	}
+	return status;
+}
+#endif /* FEATURE_FT_KEY_MAP */
+
 enum cds_ft_status cds_ft_eager_lookup_key(struct cds_ft *ft,
 		const uint8_t *key, size_t _key_len, size_t _key_readable_pad,
 		struct cds_ft_node **result_node)
