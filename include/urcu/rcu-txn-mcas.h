@@ -214,10 +214,20 @@ struct urcu_txn_record {
  */
 struct urcu_txn_desc {
 	unsigned long status;		/* enum urcu_txn_desc_status */
-	unsigned long retry;		/* aging priority: prior retries of this op */
 	struct rcu_head rcu_head;	/* owner's deferred-free handle */
 	unsigned int nr;
+	unsigned int nr_mw;		/*
+					 * MW-kind records so far, tracked at add
+					 * time.  Lets commit SKIP the partition
+					 * pass unless the write-set is genuinely
+					 * MIXED (0 < nr_mw < nr): an all-MW or
+					 * all-SW commit is already trivially
+					 * grouped, so a pure-MW commit costs
+					 * exactly what the multi-writer-only
+					 * engine does.
+					 */
 	unsigned int cap;
+	unsigned int retry;		/* aging priority: prior retries (tiny, bounded by the fallback) */
 	unsigned int poisoned;		/* set if a same-slot reconcile disagreed on old */
 	unsigned int slab;		/* block origin: per-CPU slab (1) or posix_memalign (0) */
 	struct urcu_txn_record recs[];	/* frozen at commit */
@@ -619,8 +629,9 @@ struct urcu_txn_desc *urcu_txn_create(unsigned int cap,
 	if (!t)
 		return NULL;
 	t->status = URCU_TXN_DESC_UNDECIDED;
-	t->retry = retry;
+	t->retry = (unsigned int) retry;
 	t->nr = 0;
+	t->nr_mw = 0;
 	t->poisoned = 0;
 	return t;
 }
@@ -646,6 +657,8 @@ bool urcu_txn_add(struct urcu_txn_desc *t, void **slot,
 	r->new_ptr = new_ptr;
 	r->proxy_tag = tag;
 	r->kind = kind;
+	if (kind == URCU_TXN_KIND_MW)
+		t->nr_mw++;
 	return true;
 }
 
@@ -686,8 +699,10 @@ bool urcu_txn_record_chain(struct urcu_txn_desc *t, void **slot,
 
 	if (r != NULL) {
 		urcu_assert_debug(r->kind == kind);
-		if (kind == URCU_TXN_KIND_MW)
+		if (kind == URCU_TXN_KIND_MW && r->kind != URCU_TXN_KIND_MW) {
 			r->kind = URCU_TXN_KIND_MW;	/* MW dominates: fail-safe to CAS */
+			t->nr_mw++;			/* promoted SW -> MW: now counts */
+		}
 		if (caa_unlikely(r->new_ptr != old_ptr)) {
 			t->poisoned = 1;
 			return true;
@@ -797,9 +812,19 @@ bool urcu_txn_desc_commit(struct urcu_txn_desc *t,
 		t->recs[i].desc = t;
 	/*
 	 * MW records first (an MW abort then wastes zero SW parks); only the MW
-	 * prefix needs the slot-address sort (age 1+) for deadlock-freedom.
+	 * prefix needs the slot-address sort (age 1+) for deadlock-freedom.  The
+	 * O(nr) reorder is needed only for a genuinely MIXED write-set: an all-MW
+	 * or all-SW descriptor is already trivially grouped (nr_mw is 0 or nr), so
+	 * a pure-MW commit skips the partition and costs exactly what the
+	 * multi-writer-only engine does.
 	 */
-	nr_mw = urcu_txn_partition(t);
+	nr_mw = t->nr_mw;
+	if (nr_mw != 0 && nr_mw != t->nr) {
+		unsigned int k = urcu_txn_partition(t);
+
+		urcu_assert_debug(k == nr_mw);
+		(void) k;
+	}
 #if defined(DEBUG_RCU) || defined(CONFIG_RCU_DEBUG)
 	for (i = 1; i < t->nr; i++) {
 		unsigned int j;
@@ -844,6 +869,7 @@ bool urcu_txn_desc_commit_sw(struct urcu_txn_desc *t,
 {
 	unsigned int i;
 
+	urcu_assert_debug(t->nr_mw == 0);	/* caller promised store_sw-only */
 	if (caa_unlikely(t->poisoned)) {
 		urcu_txn_destroy(t);
 		return false;
