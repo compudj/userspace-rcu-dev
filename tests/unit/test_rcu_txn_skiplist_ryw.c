@@ -43,7 +43,7 @@
 #include <urcu/compiler.h>
 #include <urcu-qsbr.h>
 #include <urcu-call-rcu.h>
-#include <urcu/rcu-txn-engine.h>
+#include <urcu/rcu-txn-mcas.h>
 #include <urcu/rcu-txn-skiplist.h>
 #include <urcu/rcu-txn.h>
 

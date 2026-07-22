@@ -8,12 +8,12 @@
 /*
  * RCU transactions -- the general single-writer / multi-writer FRONT-END.
  *
- * A begin/load/store/commit bracket over the mixed engine
- * <urcu/rcu-txn-engine.h>, with cost-scaled aging escalation and a per-domain
+ * A begin/load/store/commit bracket over the mixed MCAS
+ * <urcu/rcu-txn-mcas.h>, with cost-scaled aging escalation and a per-domain
  * fair-mutex fallback lane.  This is the canonical transaction front-end:
  * store() is split into store_mw() and store_sw() so one commit can carry both
  * single-writer-owned and multi-writer slots, atomic against one linearization
- * point.  See <urcu/rcu-txn-engine.h> for the engine mechanism (one control
+ * point.  See <urcu/rcu-txn-mcas.h> for the MCAS mechanism (one control
  * word, two record kinds, MW-only abort).  <urcu/rcu-txn-mw.h> is the
  * multi-writer-only specialization (urcu_txn_mw_*), and <urcu/rcu-txn-sw.h> the
  * single-writer-only one (urcu_txn_sw_*).
@@ -44,7 +44,7 @@
 #include <urcu/call-rcu.h>		/* struct rcu_head */
 #include <urcu/fair-mutex.h>
 #include <urcu/flavor.h>		/* struct rcu_flavor_struct */
-#include <urcu/rcu-txn-engine.h>	/* the mixed engine */
+#include <urcu/rcu-txn-mcas.h>	/* the mixed MCAS primitive */
 #include <urcu/rcu-txn-bloom.h>		/* shared RYW lookup filter */
 #include <urcu/rcu-txn-status.h>
 
@@ -751,7 +751,7 @@ int urcu_txn_store_mw(struct urcu_txn *txn, void **slot,
  * SW is a PROMISE of exclusion that must hold for @slot across EVERY writer, not
  * just this one: a slot is SW xor MW, globally.  If any other transaction may
  * store_mw() the same slot, this park races that CAS -- store_mw() it here too.
- * See enum urcu_txn_kind in <urcu/rcu-txn-engine.h>.
+ * See enum urcu_txn_kind in <urcu/rcu-txn-mcas.h>.
  */
 static inline
 int urcu_txn_store_sw(struct urcu_txn *txn, void **slot,

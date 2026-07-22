@@ -67,7 +67,7 @@
 #include <stdint.h>			/* uintptr_t */
 
 #include <urcu/compiler.h>		/* CAA_BITS_PER_LONG, caa_likely */
-#include <urcu/rcu-txn-engine.h>		/* urcu_txn_read_optimistic, URCU_TXN_TAG */
+#include <urcu/rcu-txn-mcas.h>		/* urcu_txn_read_optimistic, URCU_TXN_TAG */
 #include <urcu/rcu-txn.h>		/* urcu_txn_load/store/begin/commit/... */
 
 #ifdef __cplusplus

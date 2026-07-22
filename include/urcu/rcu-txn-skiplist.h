@@ -7,7 +7,7 @@
 
 /*
  * rcu-txn-skiplist: an ordered, concurrent-writer skiplist built on the RCU
- * MCAS engine (<urcu/rcu-txn-engine.h>).  It is the ordered sibling of the hash-bucket
+ * MCAS engine (<urcu/rcu-txn-mcas.h>).  It is the ordered sibling of the hash-bucket
  * <urcu/rcu-txn-hlist.h>: a node is a small tower of transacted forward "next"
  * pointers, and insert/delete/move commit EVERY level of the tower in ONE MCAS,
  * so a node appears or disappears at all levels atomically.  See the design note
@@ -175,7 +175,7 @@
 #include <urcu/compiler.h>
 #include <urcu/uatomic.h>
 #include <urcu/call-rcu.h>
-#include <urcu/rcu-txn-engine.h>
+#include <urcu/rcu-txn-mcas.h>
 #include <urcu/rcu-txn.h>
 #include <urcu-pointer.h>
 
@@ -345,7 +345,7 @@ int urcu_txn_skiplist_empty(struct urcu_txn_skiplist *sl)
  * are all such slots (&pred->next[L] and &node->next[L] are stored;
  * &succ->next[L] is folded into the read set), so they use the waiting
  * urcu_txn_load/_validate.  (Waiting, never driving: the owner is the sole
- * driver of its own install -- see <urcu/rcu-txn-engine.h>.)
+ * driver of its own install -- see <urcu/rcu-txn-mcas.h>.)
  *
  * Read optimistically for NAVIGATION -- a slot this transaction will never store
  * nor validate.  The descent below is pure navigation: an UNDECIDED transaction

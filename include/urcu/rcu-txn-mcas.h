@@ -2,17 +2,21 @@
 //
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
-#ifndef _URCU_RCU_TXN_ENGINE_H
-#define _URCU_RCU_TXN_ENGINE_H
+#ifndef _URCU_RCU_TXN_MCAS_H
+#define _URCU_RCU_TXN_MCAS_H
 
 /*
- * RCU mixed single-writer / multi-writer transaction ENGINE.
+ * RCU mixed single-writer / multi-writer transaction MCAS.
  *
- * This is the flavor-free engine layer: the unified descriptor and its resolve /
- * install / commit.  The begin/load/store/commit bracket with aging escalation
- * and the fair-mutex fallback lane lives in the front-end <urcu/rcu-txn.h>
- * (which includes this header) -- exactly the split between <urcu/rcu-mcas.h>
- * (engine) and <urcu/rcu-txn.h> (front-end).
+ * This is the flavor-free multi-slot atomic-commit primitive: the unified
+ * descriptor (a record set sharing one control word) and its resolve / install /
+ * commit protocol, plus the descriptor's per-CPU slab.  It is a practical MCAS
+ * generalized so a slot installs either by CAS (MW) or by a caller-exclusive
+ * park (SW) -- the atomicity guarantee (a set of slots switched as one against
+ * the control word) is the same either way.  The begin/load/store/commit
+ * bracket with aging escalation and the fair-mutex fallback lane lives in the
+ * front-end <urcu/rcu-txn.h> (which includes this header) -- the same
+ * primitive/front-end split as <urcu/rcu-mcas.h> and <urcu/rcu-txn-mw.h>.
  *
  * One transaction commit can carry BOTH single-writer (SW) and multi-writer
  * (MW) records, committed atomically against ONE linearization point.  This is
@@ -873,4 +877,4 @@ bool urcu_txn_desc_commit_sw(struct urcu_txn_desc *t,
 }
 #endif
 
-#endif	/* _URCU_RCU_TXN_ENGINE_H */
+#endif	/* _URCU_RCU_TXN_MCAS_H */

@@ -35,7 +35,7 @@
 
 #include <urcu/rcu-mcas.h>
 #include <urcu/rcu-txn-sw.h>
-#include <urcu/rcu-txn-engine.h>	/* engine layer only (flavor-free) */
+#include <urcu/rcu-txn-mcas.h>	/* engine layer only (flavor-free) */
 
 struct urcu_slab urcu_mcas_slab;
 struct urcu_slab urcu_txn_sw_slab;

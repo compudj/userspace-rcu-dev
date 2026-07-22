@@ -7,7 +7,7 @@
 
 /*
  * rcu-txn-hlist: a kernel-hlist-shaped, single-pointer-head RCU list with
- * concurrent writers, built on the RCU MCAS engine (<urcu/rcu-txn-engine.h>).  It is
+ * concurrent writers, built on the RCU MCAS engine (<urcu/rcu-txn-mcas.h>).  It is
  * the hash-bucket sibling of the circular bidirectional <urcu/rcu-txn-list.h>:
  * where that list embeds a full sentinel node (16 B: next+prev) as its head,
  * an hlist head is a SINGLE pointer (8 B), so a table of buckets is half the
@@ -34,7 +34,7 @@
  * ----------------------------------------------------------------------
  * Every slot of the hlist -- the bucket head-first slot AND every node
  * next/pprev slot -- is transacted under URCU_TXN_HLIST_TAG, the engine proxy
- * tag (see <urcu/rcu-txn-engine.h>).  It is a compile-time define (default
+ * tag (see <urcu/rcu-txn-mcas.h>).  It is a compile-time define (default
  * URCU_TXN_TAG, bit 0) rather than a per-call argument, so the head costs no
  * extra storage and call sites stay kernel-terse, and rather than a hard-coded
  * constant so an embedder whose head lives in a slot it already transacts under
@@ -181,7 +181,7 @@
 #include <urcu/compiler.h>
 #include <urcu/uatomic.h>
 #include <urcu/call-rcu.h>
-#include <urcu/rcu-txn-engine.h>
+#include <urcu/rcu-txn-mcas.h>
 #include <urcu/rcu-txn.h>
 #include <urcu-pointer.h>
 

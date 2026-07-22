@@ -7,7 +7,7 @@
 
 /*
  * rcu-txn-list: a bidirectional, coherent RCU list with concurrent writers,
- * built on the RCU MCAS engine (<urcu/rcu-txn-engine.h>).  It is the
+ * built on the RCU MCAS engine (<urcu/rcu-txn-mcas.h>).  It is the
  * concurrent-writer sibling of
  * <urcu/rcu-txn-sw-list.h> (which requires writer mutual exclusion).
  *
@@ -125,7 +125,7 @@
 #include <urcu/compiler.h>
 #include <urcu/uatomic.h>
 #include <urcu/call-rcu.h>
-#include <urcu/rcu-txn-engine.h>
+#include <urcu/rcu-txn-mcas.h>
 #include <urcu/rcu-txn.h>
 #include <urcu-pointer.h>
 
