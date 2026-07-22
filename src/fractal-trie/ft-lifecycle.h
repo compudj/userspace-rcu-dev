@@ -673,8 +673,17 @@ void ft_install_lookup_ops(struct cds_ft *ft)
 	 * case is handled at iter-set time and the lookup-time inner only
 	 * needs (skip_compressed) specialization.
 	 */
-	ft->lookup_iter_fn = sc
-		? ft_lookup_iter_precise_sc : ft_lookup_iter_precise_nosc;
+	/*
+	 * REKEY-coherent iterator exact lookup (opt-in) swaps in the second-walk
+	 * re-descend variant; identity-agnostic (iter holds ordinal bytes).
+	 */
+	if (ft->rekey_coherence)
+		ft->lookup_iter_fn = sc
+			? ft_lookup_iter_precise_coherent_sc
+			: ft_lookup_iter_precise_coherent_nosc;
+	else
+		ft->lookup_iter_fn = sc
+			? ft_lookup_iter_precise_sc : ft_lookup_iter_precise_nosc;
 	/*
 	 * Partial-match (tracking=PARTIAL) is precise descent.  Iter form
 	 * has no non-identity issue (iter holds ordinals already).

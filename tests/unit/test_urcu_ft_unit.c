@@ -1298,6 +1298,59 @@ static int test_rekey_coherence_lookup(void)
 			goto out;
 		}
 	}
+	/*
+	 * Iterator EXACT form (cds_ft_lookup): the coherent lookup_iter_fn must
+	 * return the same results -- present at the inserted node, absent NULL.
+	 */
+	{
+		struct cds_ft_iter *iter = NULL;
+
+		if (cds_ft_iter_create(ft, &iter) < 0) {
+			ret = -1;
+			goto out;
+		}
+		for (i = 0; i < 256; i++) {
+			uint8_t k[8];
+			struct cds_ft_node *found;
+
+			cds_ft_u64_to_key(ft, (uint64_t) i * 7 + 1, k,
+				CDS_FT_LEN_DEFAULT);
+			cds_ft_iter_set_key(iter, k, CDS_FT_LEN_DEFAULT);
+			rcu_read_lock();
+			cds_ft_lookup(ft, iter);
+			found = cds_ft_iter_node(iter);
+			rcu_read_unlock();
+			if (found != &nodes[i]->node) {
+				fprintf(stderr,
+					"rekey-coherence iter lookup mismatch at %u\n",
+					i);
+				cds_ft_iter_destroy(iter);
+				ret = -1;
+				goto out;
+			}
+		}
+		for (i = 0; i < 256; i++) {
+			uint8_t k[8];
+			struct cds_ft_node *found;
+
+			cds_ft_u64_to_key(ft, (uint64_t) i * 7 + 3, k,
+				CDS_FT_LEN_DEFAULT);
+			cds_ft_iter_set_key(iter, k, CDS_FT_LEN_DEFAULT);
+			rcu_read_lock();
+			cds_ft_lookup(ft, iter);
+			found = cds_ft_iter_node(iter);
+			rcu_read_unlock();
+			if (found != NULL) {
+				fprintf(stderr,
+					"rekey-coherence iter absent found at %u\n",
+					i);
+				cds_ft_iter_destroy(iter);
+				ret = -1;
+				goto out;
+			}
+		}
+		cds_ft_iter_destroy(iter);
+	}
 out:
 	if (drain_and_destroy(ft, group) != 0)
 		ret = -1;

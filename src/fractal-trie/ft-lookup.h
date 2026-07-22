@@ -217,6 +217,65 @@ enum cds_ft_status ft_lookup_iter_precise_nosc(struct cds_ft *ft,
 	return status;
 }
 
+/*
+ * REKEY-coherent iterator EXACT lookup (installed on ft->lookup_iter_fn when
+ * ft->rekey_coherence): the iter-form sibling of ft_lookup_precise_coherent_*.
+ * Same second-walk re-descend loop under the one read lock, but the search key
+ * is snapshotted first: do_cds_ft_lookup_inner's epilogue
+ * (iter_auto_invalidate_cache, UNCACHED mode) may materialize the FOUND leaf's
+ * key into iter_key(iter), so a naive retry would descend with the wrong key --
+ * descend and compare against the stable local copy instead.  The exact iter
+ * descent always top-descends from the root (no cross-call cache path, unlike
+ * the inequality descent), so re-calling it is a clean fresh descent.
+ */
+static
+enum cds_ft_status ft_lookup_iter_precise_coherent_sc(struct cds_ft *ft,
+		struct cds_ft_iter *iter)
+{
+	enum cds_ft_status status;
+	uint8_t search[FT_MAX_KEY_LEN];
+	size_t klen = iter->key_len;
+
+	CDS_FT_SCOPED_READER(ft);
+	FT_TP_ITER_KEY(lookup_enter, iter);
+	memcpy(search, iter_key(iter), klen);
+	for (;;) {
+		status = do_cds_ft_lookup_nodc_sc(ft, search, klen,
+				FT_KEY_READABLE_PAD, NULL, iter,
+				FT_PREFIX_TRACK_NONE, NULL, NULL);
+		if (status != CDS_FT_STATUS_OK ||
+				ft_rekey_descent_coherent(ft, iter->node,
+					search, klen))
+			break;
+	}
+	FT_TP(lookup_exit, (int) status);
+	return status;
+}
+
+static
+enum cds_ft_status ft_lookup_iter_precise_coherent_nosc(struct cds_ft *ft,
+		struct cds_ft_iter *iter)
+{
+	enum cds_ft_status status;
+	uint8_t search[FT_MAX_KEY_LEN];
+	size_t klen = iter->key_len;
+
+	CDS_FT_SCOPED_READER(ft);
+	FT_TP_ITER_KEY(lookup_enter, iter);
+	memcpy(search, iter_key(iter), klen);
+	for (;;) {
+		status = do_cds_ft_lookup_nodc_nosc(ft, search, klen,
+				FT_KEY_READABLE_PAD, NULL, iter,
+				FT_PREFIX_TRACK_NONE, NULL, NULL);
+		if (status != CDS_FT_STATUS_OK ||
+				ft_rekey_descent_coherent(ft, iter->node,
+					search, klen))
+			break;
+	}
+	FT_TP(lookup_exit, (int) status);
+	return status;
+}
+
 FT_LOOKUP_DISPATCH("lookup")
 enum cds_ft_status cds_ft_lookup(struct cds_ft *ft,
 		struct cds_ft_iter *iter)
