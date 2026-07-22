@@ -656,14 +656,14 @@ unsigned long ft_nr_keys_get(const struct cds_ft_metadata *m)
 
 /*
  * Reader-side count read: acquire-load and resolve a parked proxy to its
- * committed logical value.  urcu_mcas_read short-circuits to a plain acquire
+ * committed logical value.  urcu_txn_read short-circuits to a plain acquire
  * load whenever nr_keys holds no proxy (the common case, and always so under
  * writer exclusion), so the resolve costs nothing off the commit window.
  */
 static inline
 unsigned long ft_nr_keys_load(const struct cds_ft_metadata *m)
 {
-	return (unsigned long) urcu_mcas_read(
+	return (unsigned long) urcu_txn_read(
 			(void **) (uintptr_t) &m->nr_keys,
 			FT_NR_KEYS_PROXY_TAG) >> 1;
 }
@@ -689,7 +689,7 @@ void ft_nr_keys_store(const struct cds_ft *ft, struct cds_ft_metadata *m,
  * on the state word.  Once atomic detach is wired the LIVE->DEAD tombstone rides
  * an MCAS edge on state, transiently parking a proxy (a full pointer with bit 0
  * = FT_STATE_PROXY set) that would otherwise corrupt the nr_child bits for a
- * concurrent reader.  urcu_mcas_read short-circuits to a plain acquire load when
+ * concurrent reader.  urcu_txn_read short-circuits to a plain acquire load when
  * state holds no proxy (always so under writer exclusion), so it costs nothing
  * off the commit window.  The writer-owned ft_meta_nr_child (direct read) stays
  * for reads of a node the caller owns or that is quiescent.
@@ -697,7 +697,7 @@ void ft_nr_keys_store(const struct cds_ft *ft, struct cds_ft_metadata *m,
 static inline
 unsigned int ft_meta_nr_child_load(const struct cds_ft_metadata *meta)
 {
-	return (unsigned int) (((uintptr_t) urcu_mcas_read(
+	return (unsigned int) (((uintptr_t) urcu_txn_read(
 			(void **) (uintptr_t) &meta->state,
 			FT_STATE_PROXY) >> FT_STATE_NR_CHILD_SHIFT)
 			& FT_STATE_NR_CHILD_VALMASK);
@@ -710,7 +710,7 @@ unsigned int ft_meta_nr_child_load(const struct cds_ft_metadata *meta)
  * a live peer-owned node mid-commit returns the proxy pointer's bits as the
  * offset (arbitrary, up to FT_STATE_PSO_VALMASK): ft_get_parent_slot would then
  * compute ptr(parent) + garbage*8 = a WILD address and fault on deref, before any
- * commit guard runs.  urcu_mcas_read resolves the proxy to the real state word
+ * commit guard runs.  urcu_txn_read resolves the proxy to the real state word
  * first (and short-circuits to a plain load when no proxy is parked -- always so
  * under writer exclusion, so it is free off the commit window).  The direct
  * ft_meta_parent_slot_offset stays for a node the caller owns / that is quiescent.
@@ -718,7 +718,7 @@ unsigned int ft_meta_nr_child_load(const struct cds_ft_metadata *meta)
 static inline
 unsigned int ft_meta_parent_slot_offset_load(const struct cds_ft_metadata *meta)
 {
-	return (unsigned int) (((uintptr_t) urcu_mcas_read(
+	return (unsigned int) (((uintptr_t) urcu_txn_read(
 			(void **) (uintptr_t) &meta->state,
 			FT_STATE_PROXY) >> FT_STATE_PSO_SHIFT)
 			& FT_STATE_PSO_VALMASK);
@@ -926,9 +926,9 @@ unsigned long ft_node_type(struct cds_ft_inode_flag *node)
  * ft_node_ptr(), so the tag-stripping helpers can assert against the tag. */
 
 static inline_lookup
-struct urcu_mcas_record *ft_flip_proxy_ptr(struct cds_ft_inode_flag *node)
+struct urcu_txn_record *ft_flip_proxy_ptr(struct cds_ft_inode_flag *node)
 {
-	return (struct urcu_mcas_record *) _ft_node_mask_ptr(node);
+	return (struct urcu_txn_record *) _ft_node_mask_ptr(node);
 }
 
 /*
@@ -937,16 +937,16 @@ struct urcu_mcas_record *ft_flip_proxy_ptr(struct cds_ft_inode_flag *node)
  * (no mutation in flight) is a single predicted-not-taken mask-compare
  * (ft_node_flip_proxy), and the parked-record deref is reached only during a
  * commit's brief install-to-settle window.  A parked record carries FT's own
- * 0xF tag (see URCU_MCAS_PROXY_* in fractal-trie-internal.h), so this masks it
+ * 0xF tag (see URCU_TXN_PROXY_* in fractal-trie-internal.h), so this masks it
  * off and resolves the record through its MCAS status word.
  */
 static inline_lookup
 struct cds_ft_inode_flag *ft_resolve_flip_proxy(struct cds_ft_inode_flag *node)
 {
 	if (caa_unlikely(ft_node_flip_proxy(node))) {
-		struct urcu_mcas_record *r = ft_flip_proxy_ptr(node);
+		struct urcu_txn_record *r = ft_flip_proxy_ptr(node);
 
-		return (struct cds_ft_inode_flag *) urcu_mcas_resolve_record(r);
+		return (struct cds_ft_inode_flag *) urcu_txn_resolve_record(r);
 	}
 	return node;
 }
@@ -1849,7 +1849,7 @@ void ft_set_parent_slot(struct cds_ft_metadata *meta,
  * flip, read offset -> NEW -> a slot address computed off the wrong parent body
  * -> ft_slot_to_byte OOB.  So the two edges must be driven from a SINGLE status
  * snapshot: when @meta->parent carries the proxy, take its txn @t, read
- * urcu_mcas_status(t) ONCE, and resolve BOTH edges through it.  Offset changes
+ * urcu_txn_desc_status(t) ONCE, and resolve BOTH edges through it.  Offset changes
  * only as part of a re-home, so an offset proxy is always @t's (co-committed);
  * anything else (a freeze/tombstone parking the state word, which leaves the
  * offset unchanged) resolves independently.  A re-home that begins mid-snapshot
@@ -1882,21 +1882,21 @@ struct cds_ft_inode_flag **ft_resolve_parent_slot(
 			 * re-read below.
 			 */
 			parent = praw;
-			state = urcu_mcas_resolve(sraw, FT_STATE_PROXY);
+			state = urcu_txn_resolve(sraw, FT_STATE_PROXY);
 		} else {
-			struct urcu_mcas_record *rp = ft_flip_proxy_ptr(praw);
-			struct urcu_mcas *t = rp->mcas;
-			unsigned long st = urcu_mcas_status(t);
+			struct urcu_txn_record *rp = ft_flip_proxy_ptr(praw);
+			struct urcu_txn_desc *t = rp->desc;
+			unsigned long st = urcu_txn_desc_status(t);
 
 			parent = (struct cds_ft_inode_flag *)
-				(st == URCU_MCAS_SUCCEEDED ? rp->new_ptr : rp->old_ptr);
-			if (caa_likely(urcu_mcas_is_proxy(sraw, FT_STATE_PROXY))) {
-				struct urcu_mcas_record *rs =
-					urcu_mcas_untag(sraw, FT_STATE_PROXY);
+				(st == URCU_TXN_DESC_SUCCEEDED ? rp->new_ptr : rp->old_ptr);
+			if (caa_likely(urcu_txn_is_proxy(sraw, FT_STATE_PROXY))) {
+				struct urcu_txn_record *rs =
+					urcu_txn_untag(sraw, FT_STATE_PROXY);
 
-				if (caa_unlikely(rs->mcas != t))
+				if (caa_unlikely(rs->desc != t))
 					continue;	/* stale offset edge: re-snapshot */
-				state = st == URCU_MCAS_SUCCEEDED ?
+				state = st == URCU_TXN_DESC_SUCCEEDED ?
 						rs->new_ptr : rs->old_ptr;
 			} else {
 				/* Parent parked but offset already settled: re-snapshot. */
@@ -1961,7 +1961,7 @@ void ft_trace_pub_check(struct cds_ft *ft,
 		return;
 	cn = ft_compressed_node_ptr(nf);
 	meta = cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
-	state = (uintptr_t) urcu_mcas_read((void **) &meta->state,
+	state = (uintptr_t) urcu_txn_read((void **) &meta->state,
 			FT_STATE_PROXY);
 	rt_parent = ft_resolve_flip_proxy(rcu_dereference(meta->parent));
 	rt_slotp = rt_parent ? ft_get_parent_slot(meta, ft) : NULL;

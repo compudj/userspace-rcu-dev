@@ -3280,13 +3280,13 @@ retry_swap:
 				 */
 				gs_d_first->lnode.prev = &swap_ft->ord_sentinel.node;
 				gs_d_last->lnode.next = &swap_ft->ord_sentinel.node;
-				edges[n].tag = URCU_MCAS_TAG;	/* ordered-cell edge */
+				edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
 				edges[n].slot = (struct ft_ord_cell **)
 					&swap_ft->ord_sentinel.node.next;
 				edges[n].old_target = ft_ord_sentinel_cell(swap_ft);
 				edges[n].new_target = gs_d_first;
 				n++;
-				edges[n].tag = URCU_MCAS_TAG;	/* ordered-cell edge */
+				edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
 				edges[n].slot = (struct ft_ord_cell **)
 					&swap_ft->ord_sentinel.node.prev;
 				edges[n].old_target = ft_ord_sentinel_cell(swap_ft);

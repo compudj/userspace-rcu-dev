@@ -822,7 +822,7 @@ unsigned int ft_merge_ord_interleave_collect(struct cds_ft *dst,
 			 */
 			if (!prev_is_dst) {
 				prev->lnode.next = ft_ord_cell_lnode(cell);	/* survivor: invisible */
-				edges[n].tag = URCU_MCAS_TAG;	/* ordered-cell edge */
+				edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
 				edges[n].slot = (struct ft_ord_cell **) &cell->lnode.prev;
 				edges[n].old_target =
 					ft_ord_cell_resolve_ord(&cell->lnode.prev);
@@ -845,7 +845,7 @@ unsigned int ft_merge_ord_interleave_collect(struct cds_ft *dst,
 				 * flip its forward edge to the survivor.  When prev is the
 				 * sentinel this IS the old "new list minimum: flip head".
 				 */
-				edges[n].tag = URCU_MCAS_TAG;	/* ordered-cell edge */
+				edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
 				edges[n].slot = (struct ft_ord_cell **) &prev->lnode.next;
 				edges[n].old_target =
 					ft_ord_cell_resolve_ord(&prev->lnode.next);
@@ -867,7 +867,7 @@ unsigned int ft_merge_ord_interleave_collect(struct cds_ft *dst,
 	 */
 	if (!prev_is_dst) {
 		prev->lnode.next = ft_ord_cell_lnode(dst_succ);	/* survivor: invisible */
-		edges[n].tag = URCU_MCAS_TAG;	/* ordered-cell edge */
+		edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
 		edges[n].slot = (struct ft_ord_cell **) &dst_succ->lnode.prev;
 		edges[n].old_target =
 			ft_ord_cell_resolve_ord(&dst_succ->lnode.prev);

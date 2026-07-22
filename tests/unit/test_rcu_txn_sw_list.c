@@ -18,6 +18,9 @@
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
+#ifndef _LGPL_SOURCE
+#define _LGPL_SOURCE
+#endif
 
 #include <stdlib.h>
 #include <string.h>
@@ -29,7 +32,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS	22
+#define NR_TESTS	30
 
 struct bl_node {
 	struct urcu_txn_sw_list_node node;
@@ -342,6 +345,116 @@ static void test_proxy_phases(void)
 	destroy_list(&head);				/* frees B */
 }
 
+/*
+ * Composition on ONE list, with neighbourhoods that TOUCH -- the case the
+ * _prepare forms' read-your-own-writes loads exist for.  Recording these edges
+ * from raw neighbour reads (as this header did before) publishes deleted nodes:
+ * see the trap worked out in urcu_txn_sw_list_add_after_prepare().
+ */
+
+/* Delete @a and @b -- adjacent -- in ONE flip. */
+static void test_compose_adjacent_del(void)
+{
+	URCU_TXN_SW_LIST_HEAD(head);
+	const int keys[5] = { 1, 2, 3, 4, 5 };
+	const int want_fwd[3] = { 1, 4, 5 };
+	const int want_rev[3] = { 5, 4, 1 };
+	struct urcu_txn_sw_list_node *e2, *e3;
+	struct bl_node *n2, *n3;
+	struct urcu_txn_sw_txn t;
+	int i, fwd[3], rev[3], n, st;
+
+	for (i = 0; i < 5; i++)
+		urcu_txn_sw_list_add_tail_rcu(&bl_node_new(keys[i])->node, &head);
+	e2 = find_key(&head, 2);
+	e3 = find_key(&head, 3);
+	n2 = caa_container_of(e2, struct bl_node, node);
+	n3 = caa_container_of(e3, struct bl_node, node);
+
+	urcu_txn_sw_init(&t);
+	(void) urcu_txn_sw_list_del_prepare(&t, e2);
+	(void) urcu_txn_sw_list_del_prepare(&t, e3);	/* neighbour of e2 */
+	st = urcu_txn_sw_commit(&t) == URCU_TXN_STATUS_OK;
+	call_rcu(&n2->rcu_head, bl_node_free);
+	call_rcu(&n3->rcu_head, bl_node_free);
+
+	n = collect_forward(&head, fwd, 3);
+	ok(st && n == 3 && arr_eq(fwd, want_fwd, 3),
+		"compose adjacent del: forward is 1,4,5");
+	n = collect_reverse(&head, rev, 3);
+	ok(n == 3 && arr_eq(rev, want_rev, 3),
+		"compose adjacent del: reverse is 5,4,1");
+	ok(check_inverses(&head), "compose adjacent del: ring stays coherent");
+	destroy_list(&head);
+}
+
+/* Delete @b and insert a fresh node into the SAME gap, in ONE flip: both edges
+ * of the insert chain onto records the delete already made. */
+static void test_compose_del_and_add(void)
+{
+	URCU_TXN_SW_LIST_HEAD(head);
+	const int keys[3] = { 1, 2, 3 };
+	const int want_fwd[3] = { 1, 9, 3 };
+	const int want_rev[3] = { 3, 9, 1 };
+	struct urcu_txn_sw_list_node *e1, *e2;
+	struct bl_node *n2;
+	struct urcu_txn_sw_txn t;
+	int i, fwd[3], rev[3], n, st;
+
+	for (i = 0; i < 3; i++)
+		urcu_txn_sw_list_add_tail_rcu(&bl_node_new(keys[i])->node, &head);
+	e1 = find_key(&head, 1);
+	e2 = find_key(&head, 2);
+	n2 = caa_container_of(e2, struct bl_node, node);
+
+	urcu_txn_sw_init(&t);
+	(void) urcu_txn_sw_list_del_prepare(&t, e2);
+	(void) urcu_txn_sw_list_add_after_prepare(&t, &bl_node_new(9)->node, e1);
+	st = urcu_txn_sw_commit(&t) == URCU_TXN_STATUS_OK;
+	call_rcu(&n2->rcu_head, bl_node_free);
+
+	n = collect_forward(&head, fwd, 3);
+	ok(st && n == 3 && arr_eq(fwd, want_fwd, 3),
+		"compose del+add in one gap: forward is 1,9,3");
+	n = collect_reverse(&head, rev, 3);
+	ok(n == 3 && arr_eq(rev, want_rev, 3),
+		"compose del+add in one gap: reverse is 3,9,1");
+	ok(check_inverses(&head), "compose del+add in one gap: ring stays coherent");
+	destroy_list(&head);
+}
+
+/* Three consecutive deletes in one flip: &prev->next is chained twice. */
+static void test_compose_triple_del(void)
+{
+	URCU_TXN_SW_LIST_HEAD(head);
+	const int keys[5] = { 1, 2, 3, 4, 5 };
+	const int want_fwd[2] = { 1, 5 };
+	struct urcu_txn_sw_list_node *e[3];
+	struct bl_node *nn[3];
+	struct urcu_txn_sw_txn t;
+	int i, fwd[2], n, st;
+
+	for (i = 0; i < 5; i++)
+		urcu_txn_sw_list_add_tail_rcu(&bl_node_new(keys[i])->node, &head);
+	for (i = 0; i < 3; i++) {
+		e[i] = find_key(&head, i + 2);		/* 2, 3, 4 */
+		nn[i] = caa_container_of(e[i], struct bl_node, node);
+	}
+
+	urcu_txn_sw_init(&t);
+	for (i = 0; i < 3; i++)
+		(void) urcu_txn_sw_list_del_prepare(&t, e[i]);
+	st = urcu_txn_sw_commit(&t) == URCU_TXN_STATUS_OK;
+	for (i = 0; i < 3; i++)
+		call_rcu(&nn[i]->rcu_head, bl_node_free);
+
+	n = collect_forward(&head, fwd, 2);
+	ok(st && n == 2 && arr_eq(fwd, want_fwd, 2),
+		"compose triple del: forward is 1,5");
+	ok(check_inverses(&head), "compose triple del: ring stays coherent");
+	destroy_list(&head);
+}
+
 int main(void)
 {
 	int err;
@@ -361,6 +474,9 @@ int main(void)
 	test_del_ends();
 	test_replace();
 	test_proxy_phases();
+	test_compose_adjacent_del();
+	test_compose_del_and_add();
+	test_compose_triple_del();
 
 	rcu_barrier();			/* drain proxy + node reclaim callbacks */
 	rcu_unregister_thread();

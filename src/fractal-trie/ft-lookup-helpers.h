@@ -94,7 +94,7 @@ struct cds_ft_inode_flag *ft_resolve_head_prev(const struct cds_ft *ft, void *pr
  * point-op splice transiently installs a tagged flip-proxy so the two
  * directional edges flip atomically for a bidirectional ordered reader.  The
  * ordered-cell list rides <urcu/rcu-txn-list.h>, so its edges carry the
- * concurrent list's ENGINE proxy tag (URCU_MCAS_TAG, bit 0) -- NOT FT's type-7
+ * concurrent list's ENGINE proxy tag (URCU_TXN_TAG, bit 0) -- NOT FT's type-7
  * structural tag -- and a logically-deleted node carries the list deletion MARK
  * (bit 1); urcu_txn_list_resolve strips both and resolves the MCAS proxy.  Raw
  * cells are >= 8-byte aligned (bits 0-1 clear), so the resolve is unambiguous.

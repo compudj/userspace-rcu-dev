@@ -55,13 +55,13 @@ static struct lnode A, B, C, E;
 /* Kill a live marker LIVE -> DEAD through the engine (single-edge MCAS). */
 static void kill_live(void **live_slot)
 {
-	struct urcu_mcas_txn tx;
+	struct urcu_txn tx;
 	enum urcu_txn_status st;
 
 	urcu_txn_init(&tx, &g_dom);
 	do {
 		urcu_txn_begin(&tx);
-		urcu_txn_store(&tx, live_slot, LIVE, DEAD, URCU_MCAS_TAG);
+		urcu_txn_store_mw(&tx, live_slot, LIVE, DEAD, URCU_TXN_TAG);
 		st = urcu_txn_commit(&tx);
 		urcu_txn_end(&tx);
 	} while (st == URCU_TXN_STATUS_ABORT);

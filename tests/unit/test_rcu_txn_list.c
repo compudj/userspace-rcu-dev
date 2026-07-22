@@ -90,7 +90,7 @@ static unsigned int xs(unsigned int x)
 static void sorted_insert(int key)
 {
 	struct lnode *n = (struct lnode *) malloc(sizeof(*n));
-	struct urcu_mcas_txn txn;
+	struct urcu_txn txn;
 	int ret;
 
 	if (!n)
@@ -111,8 +111,8 @@ static void sorted_insert(int key)
 		n->node.next = succ;
 		n->node.prev = prev;
 		/* validates prev->next == succ and succ->prev == prev */
-		urcu_txn_store(&txn, (void **) &prev->next, succ, &n->node, URCU_MCAS_TAG);
-		urcu_txn_store(&txn, (void **) &succ->prev, prev, &n->node, URCU_MCAS_TAG);
+		urcu_txn_store_mw(&txn, (void **) &prev->next, succ, &n->node, URCU_TXN_TAG);
+		urcu_txn_store_mw(&txn, (void **) &succ->prev, prev, &n->node, URCU_TXN_TAG);
 		ret = urcu_txn_commit(&txn);
 		urcu_txn_end(&txn);
 		if (ret < 0)

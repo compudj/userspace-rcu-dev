@@ -163,6 +163,9 @@ test_rcu_txn_fallback_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
 test_rcu_txn_validate_SOURCES = test_rcu_txn_validate.c
 test_rcu_txn_validate_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
 
+
+
+
 test_rcu_txn_sw_list_SOURCES = test_rcu_txn_sw_list.c
 test_rcu_txn_sw_list_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
 

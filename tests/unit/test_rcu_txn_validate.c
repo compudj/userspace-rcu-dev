@@ -77,7 +77,7 @@ static void *g_ctrl;		/* the caller-expected guard's control word */
 
 int main(void)
 {
-	struct urcu_mcas_txn tx;
+	struct urcu_txn tx;
 	void *gv, *vv;
 	unsigned int nr1, nr2;
 	enum urcu_txn_status st;
@@ -90,8 +90,8 @@ int main(void)
 	g_payload = P0;
 	urcu_txn_init(&tx, NULL);
 	urcu_txn_begin(&tx);
-	gv = urcu_txn_load_validate(&tx, &g_gate, URCU_MCAS_TAG);
-	urcu_txn_store(&tx, &g_payload, P0, P1, URCU_MCAS_TAG);
+	gv = urcu_txn_load_validate(&tx, &g_gate, URCU_TXN_TAG);
+	urcu_txn_store_mw(&tx, &g_payload, P0, P1, URCU_TXN_TAG);
 	st = urcu_txn_commit(&tx);
 	urcu_txn_end(&tx);
 	ok(gv == CLEAR && st == URCU_TXN_STATUS_OK &&
@@ -104,8 +104,8 @@ int main(void)
 	g_payload = P0;
 	urcu_txn_init(&tx, NULL);
 	urcu_txn_begin(&tx);
-	gv = urcu_txn_load_validate(&tx, &g_gate, URCU_MCAS_TAG);
-	urcu_txn_store(&tx, &g_payload, P0, P1, URCU_MCAS_TAG);
+	gv = urcu_txn_load_validate(&tx, &g_gate, URCU_TXN_TAG);
+	urcu_txn_store_mw(&tx, &g_payload, P0, P1, URCU_TXN_TAG);
 	g_gate = SET;			/* simulated racing tombstone */
 	st = urcu_txn_commit(&tx);
 	urcu_txn_end(&tx);
@@ -121,9 +121,9 @@ int main(void)
 	urcu_txn_init(&tx, NULL);
 	urcu_txn_expect_conflict(&tx);
 	urcu_txn_begin(&tx);
-	vv = urcu_txn_load_validate(&tx, &g_w, URCU_MCAS_TAG);
-	urcu_txn_store(&tx, &g_w, VX, VZ, URCU_MCAS_TAG);
-	nr1 = tx.mcas->nr;
+	vv = urcu_txn_load_validate(&tx, &g_w, URCU_TXN_TAG);
+	urcu_txn_store_mw(&tx, &g_w, VX, VZ, URCU_TXN_TAG);
+	nr1 = tx.desc->nr;
 	st = urcu_txn_commit(&tx);
 	urcu_txn_end(&tx);
 	ok(vv == VX && nr1 == 1 && st == URCU_TXN_STATUS_OK && g_w == VZ,
@@ -137,9 +137,9 @@ int main(void)
 	g_w = VX;
 	urcu_txn_init(&tx, NULL);
 	urcu_txn_begin(&tx);
-	urcu_txn_store(&tx, &g_w, VX, VZ, URCU_MCAS_TAG);
-	vv = urcu_txn_load_committed(&tx, &g_w, URCU_MCAS_TAG);
-	nr2 = tx.mcas->nr;
+	urcu_txn_store_mw(&tx, &g_w, VX, VZ, URCU_TXN_TAG);
+	vv = urcu_txn_load_committed(&tx, &g_w, URCU_TXN_TAG);
+	nr2 = tx.desc->nr;
 	st = urcu_txn_commit(&tx);
 	urcu_txn_end(&tx);
 	ok(vv == VX && nr2 == 1 && st == URCU_TXN_STATUS_OK && g_w == VZ,
@@ -149,7 +149,7 @@ int main(void)
 	g_w = VX;
 	urcu_txn_init(&tx, NULL);
 	urcu_txn_begin(&tx);
-	vv = urcu_txn_load_validate(&tx, &g_w, URCU_MCAS_TAG);
+	vv = urcu_txn_load_validate(&tx, &g_w, URCU_TXN_TAG);
 	st = urcu_txn_commit(&tx);
 	urcu_txn_end(&tx);
 	ok(vv == VX && st == URCU_TXN_STATUS_OK && g_w == VX,
@@ -169,9 +169,9 @@ int main(void)
 	 */
 	urcu_txn_expect_conflict(&tx);
 	urcu_txn_begin(&tx);
-	urcu_txn_store(&tx, &g_w, VX, VZ, URCU_MCAS_TAG);
-	vv = urcu_txn_load_validate(&tx, &g_w, URCU_MCAS_TAG);
-	nr2 = tx.mcas->nr;
+	urcu_txn_store_mw(&tx, &g_w, VX, VZ, URCU_TXN_TAG);
+	vv = urcu_txn_load_validate(&tx, &g_w, URCU_TXN_TAG);
+	nr2 = tx.desc->nr;
 	st = urcu_txn_commit(&tx);
 	urcu_txn_end(&tx);
 	ok(vv == VZ && nr2 == 1 && st == URCU_TXN_STATUS_OK && g_w == VZ,
@@ -185,8 +185,8 @@ int main(void)
 	g_payload = P0;
 	urcu_txn_init(&tx, NULL);
 	urcu_txn_begin(&tx);
-	urcu_txn_validate(&tx, &g_ctrl, CTRL(1), URCU_MCAS_TAG);
-	urcu_txn_store(&tx, &g_payload, P0, P1, URCU_MCAS_TAG);
+	urcu_txn_validate(&tx, &g_ctrl, CTRL(1), URCU_TXN_TAG);
+	urcu_txn_store_mw(&tx, &g_payload, P0, P1, URCU_TXN_TAG);
 	st = urcu_txn_commit(&tx);
 	urcu_txn_end(&tx);
 	ok(st == URCU_TXN_STATUS_OK && g_ctrl == CTRL(1) && g_payload == P1,
@@ -199,8 +199,8 @@ int main(void)
 	g_payload = P0;
 	urcu_txn_init(&tx, NULL);
 	urcu_txn_begin(&tx);
-	urcu_txn_validate(&tx, &g_ctrl, CTRL(1), URCU_MCAS_TAG);
-	urcu_txn_store(&tx, &g_payload, P0, P1, URCU_MCAS_TAG);
+	urcu_txn_validate(&tx, &g_ctrl, CTRL(1), URCU_TXN_TAG);
+	urcu_txn_store_mw(&tx, &g_payload, P0, P1, URCU_TXN_TAG);
 	g_ctrl = VX;			/* simulated racing peer */
 	st = urcu_txn_commit(&tx);
 	urcu_txn_end(&tx);
@@ -217,8 +217,8 @@ int main(void)
 	g_payload = P0;
 	urcu_txn_init(&tx, NULL);
 	urcu_txn_begin(&tx);
-	urcu_txn_validate(&tx, &g_ctrl, CTRL(0), URCU_MCAS_TAG);
-	urcu_txn_store(&tx, &g_payload, P0, P1, URCU_MCAS_TAG);
+	urcu_txn_validate(&tx, &g_ctrl, CTRL(0), URCU_TXN_TAG);
+	urcu_txn_store_mw(&tx, &g_payload, P0, P1, URCU_TXN_TAG);
 	st = urcu_txn_commit(&tx);
 	urcu_txn_end(&tx);
 	ok(st == URCU_TXN_STATUS_ABORT && g_ctrl == CTRL(1) && g_payload == P0,

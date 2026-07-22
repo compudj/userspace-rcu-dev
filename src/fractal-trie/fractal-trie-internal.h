@@ -82,14 +82,14 @@
 #include <unistd.h>
 #include <urcu/list.h>
 /*
- * FT parks a concurrent MCAS proxy (struct urcu_mcas_record *, 16-byte
+ * FT parks a concurrent MCAS proxy (struct urcu_txn_record *, 16-byte
  * aligned -> low 4 bits free) under its own type-7 / 0xF pointer tag (see
  * FT_FLIP_PROXY_TAG in ft-helpers.h) rather than the engine's bit-0 default:
  * bit 0 alone marks an internal node here, so a bit-0 proxy would alias one,
  * whereas a 0xF low nibble is an encoding no real node, NULL or skip pointer can
  * carry.  The tag is now carried PER RECORD -- FT passes FT_FLIP_PROXY_TAG to
  * every urcu_txn_store()/load_validate() (see ft_flip_txn_commit), the engine
- * stores it in urcu_mcas_record.proxy_tag and forms the parked proxy as
+ * stores it in urcu_txn_record.proxy_tag and forms the parked proxy as
  * (record | proxy_tag), and the read hot paths recognise it with the SAME
  * ft_node_flip_proxy() low-nibble test they already run.  No per-TU macro
  * override of the engine is needed.
@@ -623,7 +623,7 @@ struct ft_ord_cell {
 	 * ft_ord_cell_lnode().  Embedding the public node lets the single-cell
 	 * splice/unsplice/replace ride the list's composable _prepare ops, folded
 	 * into the FT structural flip-txn; the cell edges carry the concurrent
-	 * list's engine proxy tag (URCU_MCAS_TAG, bit 0) and readers resolve them
+	 * list's engine proxy tag (URCU_TXN_TAG, bit 0) and readers resolve them
 	 * with urcu_txn_list_resolve (ft_ord_cell_resolve_ord).
 	 */
 	struct urcu_txn_list_node lnode;

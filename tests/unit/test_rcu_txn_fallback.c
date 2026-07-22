@@ -100,7 +100,7 @@ static void *narrow_worker(void *arg)
 
 	rcu_register_thread();
 	for (n = 0; n < NARROW_OPS; n++) {
-		struct urcu_mcas_txn tx;
+		struct urcu_txn tx;
 		int i, ret;
 
 		rng = xs(rng);
@@ -113,10 +113,10 @@ static void *narrow_worker(void *arg)
 
 			urcu_txn_begin(&tx);
 			oi = (uintptr_t) urcu_txn_load(&tx,
-					&g_word[i], URCU_MCAS_TAG);
+					&g_word[i], URCU_TXN_TAG);
 			ni = (void *) lf_bump(oi, 1);
-			urcu_txn_store(&tx, &g_word[i],
-					(void *) oi, ni, URCU_MCAS_TAG);
+			urcu_txn_store_mw(&tx, &g_word[i],
+					(void *) oi, ni, URCU_TXN_TAG);
 			ret = urcu_txn_commit(&tx);
 			urcu_txn_end(&tx);
 			if (ret < 0)
@@ -144,7 +144,7 @@ static void *wide_worker(void *arg)
 
 	rcu_register_thread();
 	for (n = 0; n < WIDE_OPS; n++) {
-		struct urcu_mcas_txn tx;
+		struct urcu_txn tx;
 		uintptr_t o[NR_WORDS];
 		int w, ret;
 
@@ -156,14 +156,14 @@ static void *wide_worker(void *arg)
 			(void) urcu_txn_reserve(&tx, NR_WORDS);
 			for (w = 0; w < NR_WORDS; w++)
 				o[w] = (uintptr_t) urcu_txn_load(
-						&tx, &g_word[w], URCU_MCAS_TAG);
+						&tx, &g_word[w], URCU_TXN_TAG);
 			nw = (void *) lf_bump(o[0], (NR_WORDS - 1) * 2);
-			urcu_txn_store(&tx, &g_word[0],
-					(void *) o[0], nw, URCU_MCAS_TAG);
+			urcu_txn_store_mw(&tx, &g_word[0],
+					(void *) o[0], nw, URCU_TXN_TAG);
 			for (w = 1; w < NR_WORDS; w++) {
 				nw = (void *) lf_bump(o[w], -2);
-				urcu_txn_store(&tx, &g_word[w],
-						(void *) o[w], nw, URCU_MCAS_TAG);
+				urcu_txn_store_mw(&tx, &g_word[w],
+						(void *) o[w], nw, URCU_TXN_TAG);
 			}
 			ret = urcu_txn_commit(&tx);
 			urcu_txn_end(&tx);

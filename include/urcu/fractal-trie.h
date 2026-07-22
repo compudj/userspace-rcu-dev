@@ -522,7 +522,7 @@ struct cds_ft_node {
 
 /*
  * Library-internal: bit 0 of cds_ft_node.next is the transactional engine's
- * in-band proxy tag (equal to URCU_MCAS_TAG; asserted in the library).  A
+ * in-band proxy tag (equal to URCU_TXN_TAG; asserted in the library).  A
  * duplicate-chain successor read observes it only while a concurrent bulk
  * commit (e.g. a merge appending a src run at this chain's tail) is in flight.
  */

@@ -94,7 +94,7 @@ static void compose_insert(struct urcu_txn_list_node *nx,
 		struct urcu_txn_list_node *ny,
 		struct urcu_txn_list_node *py)
 {
-	struct urcu_mcas_txn tx;
+	struct urcu_txn tx;
 	enum urcu_txn_status st;
 
 	urcu_txn_init(&tx, &g_domain);
@@ -119,7 +119,7 @@ static void compose_insert(struct urcu_txn_list_node *nx,
 /* Atomically unlink @lf from BOTH lists in one MCAS.  Returns 1 if removed. */
 static int compose_del(struct leaf *lf)
 {
-	struct urcu_mcas_txn tx;
+	struct urcu_txn tx;
 	enum urcu_txn_status st;
 
 	urcu_txn_init(&tx, &g_domain);
@@ -149,7 +149,7 @@ static int compose_del(struct leaf *lf)
 /* Atomically replace @old by @nw in BOTH lists in one MCAS.  Returns 1 if done. */
 static int compose_replace(struct leaf *nw, struct leaf *old)
 {
-	struct urcu_mcas_txn tx;
+	struct urcu_txn tx;
 	enum urcu_txn_status st;
 
 	urcu_txn_init(&tx, &g_domain);

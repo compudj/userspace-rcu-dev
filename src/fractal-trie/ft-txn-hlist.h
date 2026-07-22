@@ -73,7 +73,7 @@
 
 #include <urcu/compiler.h>
 #include <urcu/uatomic.h>
-#include <urcu/rcu-mcas.h>
+#include <urcu/rcu-txn-mcas.h>
 #include <urcu/rcu-txn.h>
 #include <urcu-pointer.h>
 
@@ -83,10 +83,10 @@
  * Engine proxy tag for every interior chain slot (a node next/prev).  The
  * interior chain holds only duplicate leaves (never the structural children
  * that carry FT_FLIP_PROXY_TAG), so the plain bit-0 engine tag suffices; it
- * coexists in one TU with the ordered-cell list's URCU_MCAS_TAG (the slots never
+ * coexists in one TU with the ordered-cell list's URCU_TXN_TAG (the slots never
  * overlap) and with the trie's FT_FLIP_PROXY_TAG structural edges.
  */
-#define FT_HLIST_TAG	URCU_MCAS_TAG
+#define FT_HLIST_TAG	URCU_TXN_TAG
 
 /* Logical-deletion mark: the public cds_ft_node removal tombstone (bit 1). */
 #define FT_HLIST_MARK	CDS_FT_NODE_REMOVED_FLAG
@@ -131,7 +131,7 @@ struct cds_ft_node *ft_hlist_resolve(void *raw)
 	uintptr_t v = (uintptr_t) raw;
 
 	if (caa_unlikely(v & (FT_HLIST_TAG | FT_HLIST_MARK)))
-		return ft_hlist_unmark(urcu_mcas_resolve(raw, FT_HLIST_TAG));
+		return ft_hlist_unmark(urcu_txn_resolve(raw, FT_HLIST_TAG));
 	return (struct cds_ft_node *) raw;
 }
 
@@ -162,7 +162,7 @@ struct cds_ft_node *ft_hlist_next_rcu(struct cds_ft_node *node)
  * parity with the concurrent front-ends (mirrors urcu_txn_sw_list_*_prepare).
  */
 static inline
-int ft_hlist_insert_after_prepare(struct urcu_mcas_txn *txn,
+int ft_hlist_insert_after_prepare(struct urcu_txn *txn,
 		struct cds_ft_node *newp,
 		struct cds_ft_node *pos)
 {
@@ -174,9 +174,9 @@ int ft_hlist_insert_after_prepare(struct urcu_mcas_txn *txn,
 	newp->prev = pos;
 
 	/* pos->next: succ -> newp ; succ->prev: pos -> newp. */
-	urcu_txn_store(txn, (void **) &pos->next, succ, newp, FT_HLIST_TAG);
+	urcu_txn_store_mw(txn, (void **) &pos->next, succ, newp, FT_HLIST_TAG);
 	if (succ != NULL)
-		urcu_txn_store(txn, (void **) &succ->prev, pos, newp, FT_HLIST_TAG);
+		urcu_txn_store_mw(txn, (void **) &succ->prev, pos, newp, FT_HLIST_TAG);
 	return 0;
 }
 
@@ -195,14 +195,14 @@ int ft_hlist_insert_after_prepare(struct urcu_mcas_txn *txn,
  * detaches + drains the src side before appending it).
  */
 static inline
-void ft_hlist_append_run_prepare(struct urcu_mcas_txn *txn,
+void ft_hlist_append_run_prepare(struct urcu_txn *txn,
 		struct cds_ft_node *tail,
 		struct cds_ft_node *run_head)
 {
 	int ret;
 
 	run_head->prev = tail;		/* writer-only plain store */
-	ret = urcu_txn_store(txn, (void **) &tail->next, NULL, run_head,
+	ret = urcu_txn_store_mw(txn, (void **) &tail->next, NULL, run_head,
 			FT_HLIST_TAG);
 	assert(!ret);			/* caller reserved the edge up front */
 	(void) ret;
@@ -224,7 +224,7 @@ void ft_hlist_append_run_prepare(struct urcu_mcas_txn *txn,
  * for caller-shape parity).
  */
 static inline
-int ft_hlist_del_prepare(struct urcu_mcas_txn *txn, struct cds_ft_node *elem)
+int ft_hlist_del_prepare(struct urcu_txn *txn, struct cds_ft_node *elem)
 {
 	struct cds_ft_node *next = (struct cds_ft_node *)
 			urcu_txn_load(txn, (void **) &elem->next, FT_HLIST_TAG);
@@ -239,11 +239,11 @@ int ft_hlist_del_prepare(struct urcu_mcas_txn *txn, struct cds_ft_node *elem)
 	 * head ops fold it (ft_hlist_freeze_prepare) for atomicity with the
 	 * structural anchor edge.
 	 */
-	urcu_txn_store(txn, (void **) &elem->next, next,
+	urcu_txn_store_mw(txn, (void **) &elem->next, next,
 			ft_hlist_set_mark(next), FT_HLIST_TAG);
-	urcu_txn_store(txn, (void **) &pred->next, elem, next, FT_HLIST_TAG);
+	urcu_txn_store_mw(txn, (void **) &pred->next, elem, next, FT_HLIST_TAG);
 	if (next != NULL)
-		urcu_txn_store(txn, (void **) &next->prev, elem, pred, FT_HLIST_TAG);
+		urcu_txn_store_mw(txn, (void **) &next->prev, elem, pred, FT_HLIST_TAG);
 	return 0;
 }
 
@@ -261,7 +261,7 @@ int ft_hlist_del_prepare(struct urcu_mcas_txn *txn, struct cds_ft_node *elem)
  * retained for caller-shape parity).
  */
 static inline
-int ft_hlist_replace_prepare(struct urcu_mcas_txn *txn,
+int ft_hlist_replace_prepare(struct urcu_txn *txn,
 		struct cds_ft_node *old, struct cds_ft_node *newp)
 {
 	struct cds_ft_node *next = (struct cds_ft_node *)
@@ -273,11 +273,11 @@ int ft_hlist_replace_prepare(struct urcu_mcas_txn *txn,
 	newp->next = next;
 	newp->prev = pred;
 
-	urcu_txn_store(txn, (void **) &old->next, next,
+	urcu_txn_store_mw(txn, (void **) &old->next, next,
 			ft_hlist_set_mark(next), FT_HLIST_TAG);
-	urcu_txn_store(txn, (void **) &pred->next, old, newp, FT_HLIST_TAG);
+	urcu_txn_store_mw(txn, (void **) &pred->next, old, newp, FT_HLIST_TAG);
 	if (next != NULL)
-		urcu_txn_store(txn, (void **) &next->prev, old, newp, FT_HLIST_TAG);
+		urcu_txn_store_mw(txn, (void **) &next->prev, old, newp, FT_HLIST_TAG);
 	return 0;
 }
 
@@ -295,12 +295,12 @@ int ft_hlist_replace_prepare(struct urcu_mcas_txn *txn,
  * FT_HLIST_FREEZE_MAX_EDGES on top of the host op's footprint.
  */
 static inline
-void ft_hlist_freeze_prepare(struct urcu_mcas_txn *txn, struct cds_ft_node *node)
+void ft_hlist_freeze_prepare(struct urcu_txn *txn, struct cds_ft_node *node)
 {
 	void *en = urcu_txn_load(txn, (void **) &node->next, FT_HLIST_TAG);
 	int ret;
 
-	ret = urcu_txn_store(txn, (void **) &node->next, en,
+	ret = urcu_txn_store_mw(txn, (void **) &node->next, en,
 			ft_hlist_set_mark((struct cds_ft_node *) en), FT_HLIST_TAG);
 	assert(!ret);			/* caller reserved the edge up front */
 	(void) ret;

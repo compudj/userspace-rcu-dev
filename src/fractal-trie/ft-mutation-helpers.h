@@ -207,10 +207,10 @@ struct cds_ft_inode_flag *ft_descent_step(struct cds_ft *ft, struct ft_descent *
  * concurrent engine, so no edge can be dropped between a buffer and a replay.
  *
  * Two record tag families share the ONE @mtxn (the engine carries the tag PER
- * record, urcu_mcas_record.proxy_tag): STRUCTURAL trie edges carry FT's type-7 /
+ * record, urcu_txn_record.proxy_tag): STRUCTURAL trie edges carry FT's type-7 /
  * 0xF tag (FT_FLIP_PROXY_TAG), resolved on the read hot path by
  * ft_resolve_flip_proxy; ORDERED-CELL list edges carry the concurrent list's
- * engine tag (URCU_MCAS_TAG, bit 0), resolved by urcu_txn_list_resolve.  Commit
+ * engine tag (URCU_TXN_TAG, bit 0), resolved by urcu_txn_list_resolve.  Commit
  * OWNS reclaim: the committed descriptor is deferred-freed through the FT's RCU
  * flavor (a reader may hold a parked record) -- except on the exclusive build,
  * which frees it in place.  An op that aborts before committing drops its
@@ -233,14 +233,14 @@ struct cds_ft_inode_flag *ft_descent_step(struct cds_ft *ft, struct ft_descent *
 #define FT_FLIP_TXN_MAX_COPYING	8
 
 struct ft_flip_txn {
-	struct urcu_mcas_txn *mtxn;	/* the concurrent commit engine handle:
+	struct urcu_txn *mtxn;	/* the concurrent commit engine handle:
 					 * &own (standalone txn), or the op's
 					 * PERSISTENT handle (create_bounded_on)
 					 * whose retry aging / FIFO turn / learned
 					 * size span the op's restart_attempt loop
 					 * (doc/design/mcas-multiwriter-readiness.md
 					 * §11) */
-	struct urcu_mcas_txn own;	/* backing handle for standalone txns */
+	struct urcu_txn own;	/* backing handle for standalone txns */
 	bool reserved;			/* @mtxn pre-reserved (bounded) => infallible commit */
 	/*
 	 * FT_STATE_COPYING lock registry (MW F2, CORE_682870 fix plan): the
@@ -264,7 +264,7 @@ struct ft_flip_txn {
  * that record directly into the transaction.
  */
 static inline
-struct urcu_mcas_txn *ft_flip_txn_handle(struct ft_flip_txn *t)
+struct urcu_txn *ft_flip_txn_handle(struct ft_flip_txn *t)
 {
 	return t->mtxn;
 }
@@ -285,7 +285,7 @@ struct urcu_mcas_txn *ft_flip_txn_handle(struct ft_flip_txn *t)
  * state: behavior-identical to the pre-bracket exclusive path.
  */
 static inline
-void ft_txn_op_init(struct cds_ft *ft, struct urcu_mcas_txn *op)
+void ft_txn_op_init(struct cds_ft *ft, struct urcu_txn *op)
 {
 	if (ft->exclusive)
 		urcu_txn_init_flavor(op, NULL, NULL);
@@ -366,8 +366,8 @@ struct ft_flip_txn *ft_flip_txn_create_bounded(unsigned int cap)
 	 */
 	urcu_txn_expect_conflict(t->mtxn);
 	if (urcu_txn_reserve(t->mtxn, cap) < 0) {
-		if (t->mtxn->mcas && t->mtxn->mcas != URCU_TXN_ENOMEM)
-			urcu_mcas_destroy(t->mtxn->mcas);
+		if (t->mtxn->desc && t->mtxn->desc != URCU_TXN_ENOMEM)
+			urcu_txn_destroy(t->mtxn->desc);
 		free(t);
 		return NULL;
 	}
@@ -389,7 +389,7 @@ struct ft_flip_txn *ft_flip_txn_create_bounded(unsigned int cap)
  * with -ENOMEM.  Shares the fault-injection countdown with create_bounded.
  */
 static inline
-struct ft_flip_txn *ft_flip_txn_create_bounded_on(struct urcu_mcas_txn *op,
+struct ft_flip_txn *ft_flip_txn_create_bounded_on(struct urcu_txn *op,
 		unsigned int cap)
 {
 	struct ft_flip_txn *t;
@@ -445,8 +445,8 @@ bool ft_flip_txn_reserve(struct ft_flip_txn *t, unsigned int cap)
 static inline
 bool ft_flip_txn_reserve_extra(struct ft_flip_txn *t, unsigned int extra)
 {
-	unsigned int cur = (t->mtxn->mcas && t->mtxn->mcas != URCU_TXN_ENOMEM) ?
-			t->mtxn->mcas->cap : 0;
+	unsigned int cur = (t->mtxn->desc && t->mtxn->desc != URCU_TXN_ENOMEM) ?
+			t->mtxn->desc->cap : 0;
 
 	return ft_flip_txn_reserve(t, cur + extra);
 }
@@ -695,8 +695,8 @@ static inline
 void ft_flip_txn_destroy(struct ft_flip_txn *t)
 {
 	ft_flip_txn_copying_clear_all(t);
-	if (t->mtxn->mcas && t->mtxn->mcas != URCU_TXN_ENOMEM) {
-		urcu_mcas_destroy(t->mtxn->mcas);
+	if (t->mtxn->desc && t->mtxn->desc != URCU_TXN_ENOMEM) {
+		urcu_txn_destroy(t->mtxn->desc);
 		/*
 		 * Leave a BOUND persistent handle clean for the op's next
 		 * attempt / its urcu_txn_end() (which would otherwise
@@ -705,7 +705,7 @@ void ft_flip_txn_destroy(struct ft_flip_txn *t)
 		 * an OOM already recorded on the handle still surfaces.
 		 * Harmless for a standalone txn (@own dies with the wrapper).
 		 */
-		t->mtxn->mcas = NULL;
+		t->mtxn->desc = NULL;
 	}
 	free(t);
 }
@@ -722,7 +722,7 @@ void ft_flip_txn_destroy(struct ft_flip_txn *t)
  * byte-for-byte untouched).  ABORT (a peer writer froze a guarded node, or won a
  * forward-slot expected-value CAS, between this op's descent and its commit) is
  * SURFACED to the caller, not retried in place: the commit consumes the
- * descriptor (urcu_mcas_commit reclaims it even on abort), so re-driving the same
+ * descriptor (urcu_txn_commit reclaims it even on abort), so re-driving the same
  * @mtxn would short-circuit to a spurious OK with nothing published.  A permanent
  * structural conflict is resolved by the FT op re-reading the tree and rebuilding
  * a fresh txn (re-descend), per doc/design/step4-concurrent-engine-plan.md; the
@@ -771,7 +771,7 @@ void ft_flip_txn_record_tag(struct ft_flip_txn *t, void **slot,
 
 	FT_TP(edge_record, (const void *) t->mtxn, (const void *) slot,
 		(const void *) old_ptr, (const void *) new_ptr, tag);
-	ret = urcu_txn_store(t->mtxn, slot, old_ptr, new_ptr, tag);
+	ret = urcu_txn_store_mw(t->mtxn, slot, old_ptr, new_ptr, tag);
 	assert(!ret);
 	(void) ret;	/* reserved up front -> never fails */
 }
@@ -922,12 +922,12 @@ int ft_dlm_acquire_set(const struct cds_ft *ft, struct ft_dlm_member *set,
  * skip; compose on a DEFAULT (read-your-own-writes) handle.
  */
 static inline
-int ft_txn_list_insert_between_prepare(struct urcu_mcas_txn *txn,
+int ft_txn_list_insert_between_prepare(struct urcu_txn *txn,
 		struct urcu_txn_list_node *newp,
 		struct urcu_txn_list_node *pos,
 		struct urcu_txn_list_node *succ_expected)
 {
-	void *pn = urcu_txn_load(txn, (void **) &pos->next, URCU_MCAS_TAG);
+	void *pn = urcu_txn_load(txn, (void **) &pos->next, URCU_TXN_TAG);
 
 	if (urcu_txn_list_is_marked(pn))
 		return -ENOENT;				/* @pos was deleted */
@@ -940,14 +940,14 @@ int ft_txn_list_insert_between_prepare(struct urcu_mcas_txn *txn,
 	 * forward store's own slot.
 	 */
 	if (succ_expected != pos && urcu_txn_list_is_marked(urcu_txn_load_validate(
-			txn, (void **) &succ_expected->next, URCU_MCAS_TAG)))
+			txn, (void **) &succ_expected->next, URCU_TXN_TAG)))
 		return -EAGAIN;				/* succ (a neighbour) deleted: retry */
 
 	/* Build the fresh node invisibly, then record the two forward edges. */
 	newp->next = succ_expected;
 	newp->prev = pos;
-	urcu_txn_store(txn, (void **) &pos->next, succ_expected, newp, URCU_MCAS_TAG);
-	urcu_txn_store(txn, (void **) &succ_expected->prev, pos, newp, URCU_MCAS_TAG);
+	urcu_txn_store_mw(txn, (void **) &pos->next, succ_expected, newp, URCU_TXN_TAG);
+	urcu_txn_store_mw(txn, (void **) &succ_expected->prev, pos, newp, URCU_TXN_TAG);
 	return 0;
 }
 
@@ -958,7 +958,7 @@ int ft_txn_list_insert_between_prepare(struct urcu_mcas_txn *txn,
  * this loop), so no peer can newly republish @src -- its §4.B clean-LIVE guard
  * fails against the COPYING bit -- and the only proxy this can meet is a peer
  * child-recompact that parked BEFORE the fence and is now doomed to abort.
- * urcu_mcas_read reads @src's COMMITTED logical value, resolving a proxy to the
+ * urcu_txn_read reads @src's COMMITTED logical value, resolving a proxy to the
  * value it will settle to (helping a doomed peer to its terminal status), so the
  * copy builds against a definite child.  COMMITTED, not read-your-own-writes:
  * this reproduces the old urcu_txn_resolve_prio, which read the raw slot and
@@ -979,7 +979,7 @@ int ft_txn_list_insert_between_prepare(struct urcu_mcas_txn *txn,
 static inline
 int ft_flip_txn_resolve_prio(struct ft_flip_txn *t, void **src, void **out)
 {
-	*out = urcu_mcas_read(src, FT_FLIP_PROXY_TAG);
+	*out = urcu_txn_read(src, FT_FLIP_PROXY_TAG);
 	return 1;
 }
 
@@ -1014,7 +1014,7 @@ void ft_trace_miswire_check(struct cds_ft *ft,
 		return;
 	cn = ft_compressed_node_ptr(edge);
 	meta = cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
-	state = (uintptr_t) urcu_mcas_read((void **) &meta->state,
+	state = (uintptr_t) urcu_txn_read((void **) &meta->state,
 			FT_STATE_PROXY);
 	rt_parent = ft_resolve_flip_proxy(rcu_dereference(meta->parent));
 	rt_slotp = rt_parent ? ft_get_parent_slot(meta, ft) : NULL;
@@ -1098,7 +1098,7 @@ struct ft_ord_cell_edge {
 	struct ft_ord_cell *old_target;
 	struct ft_ord_cell *new_target;
 	/*
-	 * Per-edge engine proxy tag: URCU_MCAS_TAG (bit 0) for an ORDERED-CELL
+	 * Per-edge engine proxy tag: URCU_TXN_TAG (bit 0) for an ORDERED-CELL
 	 * list edge (readers resolve via urcu_txn_list_resolve), or 0 / left
 	 * unset for a STRUCTURAL trie edge, which ft_edge_tag() normalizes to
 	 * FT_FLIP_PROXY_TAG (readers resolve via ft_resolve_flip_proxy).  Both
@@ -1242,14 +1242,14 @@ unsigned int ft_ord_sentinel_edges(struct cds_ft *ft,
 	struct ft_ord_cell *tp_new = ft_ord_or_sentinel(ft, tail_new);
 
 	if (hn_old != hn_new) {
-		edges[n].tag = URCU_MCAS_TAG;	/* ordered-cell edge */
+		edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
 		edges[n].slot = (struct ft_ord_cell **) &ft->ord_sentinel.node.next;
 		edges[n].old_target = hn_old;
 		edges[n].new_target = hn_new;
 		n++;
 	}
 	if (tp_old != tp_new) {
-		edges[n].tag = URCU_MCAS_TAG;	/* ordered-cell edge */
+		edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
 		edges[n].slot = (struct ft_ord_cell **) &ft->ord_sentinel.node.prev;
 		edges[n].old_target = tp_old;
 		edges[n].new_target = tp_new;
@@ -1265,14 +1265,14 @@ unsigned int ft_ord_sentinel_edges(struct cds_ft *ft,
 		struct ft_ord_cell *dest = ft_ord_sentinel_cell(relink_dest);
 
 		if (head_new) {
-			edges[n].tag = URCU_MCAS_TAG;	/* ordered-cell edge */
+			edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
 			edges[n].slot = (struct ft_ord_cell **) &head_new->lnode.prev;
 			edges[n].old_target = dest;
 			edges[n].new_target = self;
 			n++;
 		}
 		if (tail_new) {
-			edges[n].tag = URCU_MCAS_TAG;	/* ordered-cell edge */
+			edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
 			edges[n].slot = (struct ft_ord_cell **) &tail_new->lnode.next;
 			edges[n].old_target = dest;
 			edges[n].new_target = self;
@@ -1583,7 +1583,7 @@ void ft_flip_txn_record_tombstone_copying(struct ft_flip_txn *t,
  *   release THEN guard  = harmless no-op.  urcu_txn_load is read-your-writes
  *       (rcu-txn.h), so the guard reads this record's PENDING value -- the clean
  *       word -- masks nothing, and validates {s -> s} against it; record_chain
- *       finds r->new_ptr == old_ptr and chains without upgrading (rcu-mcas.h).
+ *       finds r->new_ptr == old_ptr and chains without upgrading (rcu-txn-mcas.h).
  *       Redundant, not wrong.  (This is the order the converted sites are in, so
  *       skipping their guard is an economy and a clarification, NOT a bug fix.)
  *
@@ -1957,13 +1957,13 @@ void ft_root_list_swap_publish_dual(struct ft_flip_txn *txn,
 		if (r->head_old) {
 			struct ft_ord_cell *self = ft_ord_sentinel_cell(r->ft);
 
-			edges[n].tag = URCU_MCAS_TAG;	/* ordered-cell edge */
+			edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
 			edges[n].slot = (struct ft_ord_cell **)
 				&r->head_old->lnode.prev;
 			edges[n].old_target = self;
 			edges[n].new_target = NULL;
 			n++;
-			edges[n].tag = URCU_MCAS_TAG;	/* ordered-cell edge */
+			edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
 			edges[n].slot = (struct ft_ord_cell **)
 				&r->tail_old->lnode.next;
 			edges[n].old_target = self;
@@ -2078,12 +2078,12 @@ unsigned int ft_ord_cell_run_detach_edges(struct cds_ft *ft,
 	 * re-homed to @into by ft_ord_cell_run_install after the flip (@into is
 	 * exclusive: plain stores).
 	 */
-	edges[n].tag = URCU_MCAS_TAG;	/* ordered-cell edge */
+	edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
 	edges[n].slot = (struct ft_ord_cell **) &pred->lnode.next;
 	edges[n].old_target = first;
 	edges[n].new_target = succ;
 	n++;
-	edges[n].tag = URCU_MCAS_TAG;	/* ordered-cell edge */
+	edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
 	edges[n].slot = (struct ft_ord_cell **) &succ->lnode.prev;
 	edges[n].old_target = last;
 	edges[n].new_target = pred;
@@ -2418,7 +2418,7 @@ int ft_ord_cell_find_pred_from_head(struct cds_ft *ft,
  * cell as pred/succ before the unsplice would otherwise commit INTO the dead
  * segment whenever the neighbour values still match (arena recycling makes the
  * match likely), producing an out-of-order or resurrected cell.  Readers
- * mask the bit (urcu_txn_list_next_rcu strips URCU_MCAS_TAG |
+ * mask the bit (urcu_txn_list_next_rcu strips URCU_TXN_TAG |
  * URCU_TXN_LIST_MARK), so a parked reader still walks off the dead cell
  * exactly as before.  Sentinel topology: @pred / @succ resolve to @ft's
  * sentinel pseudo-cell when @cell is the list first / last, so
@@ -2434,17 +2434,17 @@ unsigned int ft_ord_cell_unsplice_edges(struct cds_ft *ft,
 	struct ft_ord_cell *succ = ft_ord_cell_resolve_ord(&cell->lnode.next);
 
 	(void) ft;
-	edges[n].tag = URCU_MCAS_TAG;	/* ordered-cell edge */
+	edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
 	edges[n].slot = (struct ft_ord_cell **) &pred->lnode.next;
 	edges[n].old_target = cell;
 	edges[n].new_target = succ;
 	n++;
-	edges[n].tag = URCU_MCAS_TAG;	/* ordered-cell edge */
+	edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
 	edges[n].slot = (struct ft_ord_cell **) &succ->lnode.prev;
 	edges[n].old_target = cell;
 	edges[n].new_target = pred;
 	n++;
-	edges[n].tag = URCU_MCAS_TAG;	/* deletion mark: see the comment above */
+	edges[n].tag = URCU_TXN_TAG;	/* deletion mark: see the comment above */
 	edges[n].slot = (struct ft_ord_cell **) &cell->lnode.next;
 	edges[n].old_target = succ;
 	edges[n].new_target = (struct ft_ord_cell *)
@@ -2524,7 +2524,7 @@ int ft_ord_cell_swap(struct cds_ft *ft, struct ft_ord_cell *old_cell,
 	 * list's deletion mark on old->next and, when @old is not the sole interior
 	 * cell, a load-validate guard on next->next) into our FT flip-txn.
 	 * FT_ORD_CELL_SWAP_REC_MAX_EDGES covers that set, so the pre-reserved commit
-	 * is infallible.  The concurrent list's URCU_MCAS_TAG applies, so the
+	 * is infallible.  The concurrent list's URCU_TXN_TAG applies, so the
 	 * bidirectional ordered reader resolves the splice atomically via
 	 * urcu_txn_list_resolve.  Sentinel topology: @old_cell's neighbours are its
 	 * sentinel when it is the list first / last, so the same splice stores ARE
@@ -2564,12 +2564,12 @@ unsigned int ft_ord_cell_swap_edges(struct cds_ft *ft,
 	 * urcu_txn_list_replace_prepare, built into the fusion array so the head
 	 * swap rides the SAME flip as a second reader-visible structural edge.
 	 */
-	edges[n].tag = URCU_MCAS_TAG;	/* ordered-cell edge */
+	edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
 	edges[n].slot = (struct ft_ord_cell **) &pred->lnode.next;
 	edges[n].old_target = old_cell;
 	edges[n].new_target = new_cell;
 	n++;
-	edges[n].tag = URCU_MCAS_TAG;	/* ordered-cell edge */
+	edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
 	edges[n].slot = (struct ft_ord_cell **) &succ->lnode.prev;
 	edges[n].old_target = old_cell;
 	edges[n].new_target = new_cell;
@@ -2581,7 +2581,7 @@ unsigned int ft_ord_cell_swap_edges(struct cds_ft *ft,
 	 * bit-identical links and commit into the retired cell.  Readers mask
 	 * the bit.
 	 */
-	edges[n].tag = URCU_MCAS_TAG;
+	edges[n].tag = URCU_TXN_TAG;
 	edges[n].slot = (struct ft_ord_cell **) &old_cell->lnode.next;
 	edges[n].old_target = succ;
 	edges[n].new_target = (struct ft_ord_cell *)
@@ -2705,7 +2705,7 @@ int ft_remove_one_commit(struct cds_ft *ft,
 	 * A removed external leaf freezes atomically with this same commit that
 	 * unlinks it (doc §4.B): record its one MARK edge (freeze_leaf->next ->
 	 * MARK(next), a single-entry chain so next is NULL) beside the structural +
-	 * cell edges.  FT_HLIST_TAG (== URCU_MCAS_TAG) so a reader resolves a parked
+	 * cell edges.  FT_HLIST_TAG (== URCU_TXN_TAG) so a reader resolves a parked
 	 * proxy via cds_ft_node_next_rcu; byte-identical to ft_hlist_freeze_prepare.
 	 * On the @txn NULL path this makes n >= 2, so the infallible lone-edge
 	 * on-stack store yields to a bounded flip-txn -- the single-writer force-txn
@@ -3023,12 +3023,12 @@ unsigned int ft_ord_cell_run_splice_edges(struct cds_ft *dst,
 	/* Pre-set the run's outer links; not yet reachable via @dst's list. */
 	run_first->lnode.prev = ft_ord_cell_lnode(pred);
 	run_last->lnode.next = ft_ord_cell_lnode(succ);
-	edges[n].tag = URCU_MCAS_TAG;	/* ordered-cell edge */
+	edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
 	edges[n].slot = (struct ft_ord_cell **) &pred->lnode.next;
 	edges[n].old_target = succ;
 	edges[n].new_target = run_first;
 	n++;
-	edges[n].tag = URCU_MCAS_TAG;	/* ordered-cell edge */
+	edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
 	edges[n].slot = (struct ft_ord_cell **) &succ->lnode.prev;
 	edges[n].old_target = pred;
 	edges[n].new_target = run_last;
@@ -3122,12 +3122,12 @@ unsigned int ft_ord_cell_run_replace_edges(struct cds_ft *dst,
 	 * head / tail repair.  An empty swap (s_first NULL) closes the gap: new_first
 	 * = succ, new_last = pred (the sentinel when run_D spanned the whole list).
 	 */
-	edges[n].tag = URCU_MCAS_TAG;	/* ordered-cell edge */
+	edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
 	edges[n].slot = (struct ft_ord_cell **) &pred->lnode.next;
 	edges[n].old_target = d_first;
 	edges[n].new_target = new_first;
 	n++;
-	edges[n].tag = URCU_MCAS_TAG;	/* ordered-cell edge */
+	edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
 	edges[n].slot = (struct ft_ord_cell **) &succ->lnode.prev;
 	edges[n].old_target = d_last;
 	edges[n].new_target = new_last;
@@ -3238,12 +3238,12 @@ void ft_ord_cell_run_unlink(struct cds_ft *ft, struct ft_flip_txn *txn,
 	 * sits at @ft's head / tail (the whole-list case leaves it self-pointing =
 	 * empty).  No separate endpoint edge.
 	 */
-	edges[n].tag = URCU_MCAS_TAG;	/* ordered-cell edge */
+	edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
 	edges[n].slot = (struct ft_ord_cell **) &pred->lnode.next;
 	edges[n].old_target = first;
 	edges[n].new_target = succ;
 	n++;
-	edges[n].tag = URCU_MCAS_TAG;	/* ordered-cell edge */
+	edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
 	edges[n].slot = (struct ft_ord_cell **) &succ->lnode.prev;
 	edges[n].old_target = last;
 	edges[n].new_target = pred;

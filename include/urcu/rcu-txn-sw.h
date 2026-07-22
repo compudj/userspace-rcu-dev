@@ -96,7 +96,7 @@
  *      record array but installs nothing; the record set is FROZEN once
  *      commit() parks the proxies, matching the concurrent engine's contract
  *      (no edge may be added once a proxy is parked), so an embedder written
- *      against this transaction can migrate to <urcu/rcu-mcas.h> mechanically.
+ *      against this transaction can migrate to <urcu/rcu-txn-mcas.h> mechanically.
  *      commit() parks every recorded proxy, flips the group and settles to new,
  *      then OWNS reclaim: it defers the txn through call_rcu() when it parked
  *      proxies, or frees it at once on the single-edge / empty / OOM paths.
@@ -122,6 +122,7 @@
 #include <urcu/compiler.h>
 #include <urcu/uatomic.h>
 #include <urcu/call-rcu.h>		/* struct rcu_head + call_rcu (commit reclaim) */
+#include <urcu/rcu-txn-bloom.h>	/* shared RYW lookup filter (also used by rcu-txn.h) */
 #include <urcu/rcu-txn-status.h>	/* enum urcu_txn_status */
 #include <urcu/rcu-txn-slab.h>		/* shared per-CPU size-classed descriptor slab */
 
@@ -214,7 +215,7 @@ void urcu_txn_sw_group_commit(struct urcu_txn_sw_group *group)
  * but installs NOTHING -- no proxy address is live yet, so the array grows by
  * realloc.  The record set is FROZEN once proxies are installed (which commit()
  * does internally), so record() must precede commit().  This is the same
- * frozen-set contract as the concurrent engine (<urcu/rcu-mcas.h>), so
+ * frozen-set contract as the concurrent engine (<urcu/rcu-txn-mcas.h>), so
  * a single-writer embedder can later migrate to concurrent writers without
  * restructuring its mutations.  Two more contracts shared with that engine:
  * records must target PAIRWISE-DISTINCT slots -- unlike the concurrent
@@ -318,6 +319,10 @@ urcu_static_assert(!(offsetof(struct urcu_txn_sw_block, latches) % 16),
  * proxy -- keeps its low 4 bits free, letting a low-4-bit pointer-tagging
  * embedder (e.g. the fractal trie) route its slots through this engine.
  */
+#ifdef URCU_TXN_SW_EXCL_VALIDATE
+#include <pthread.h>
+#endif
+
 struct urcu_txn_sw_txn {
 	enum urcu_txn_sw_state state;
 	struct urcu_txn_sw_latch *latches;	/* record array (realloc-grown, or caller-owned if @latches_inline) */
@@ -325,8 +330,11 @@ struct urcu_txn_sw_txn {
 	unsigned int nr;
 	unsigned int cap;
 	bool latches_inline;			/* @latches is caller storage: never realloc'd, never freed */
+	bool disjoint;				/* write set declared slot-disjoint: skip the RYW find */
+	bool bloom_live;			/* @ryw_bloom is armed (see urcu_txn_sw__find_ryw) */
+	uint64_t ryw_bloom[URCU_TXN_BLOOM_WORDS];  /* RYW certain-miss filter */
 #ifdef URCU_TXN_SW_EXCL_VALIDATE
-	unsigned long excl_owner;		/*
+	pthread_t excl_owner;			/*
 						 * pthread_self() of the thread
 						 * that init'd this handle; the
 						 * handle must be driven end to
@@ -345,8 +353,8 @@ struct urcu_txn_sw_txn {
  * no conflict detection and no abort, so two writers racing on one slot simply
  * corrupt it, and nothing in a default build says so.  Enable with
  * -DURCU_TXN_SW_EXCL_VALIDATE to have a violation abort the process with a
- * report naming the slot and the threads.  Off by default (zero overhead: no
- * checks, and the handle does not even carry the owner field).
+ * report identifying the violated handle or slot.  Off by default (zero
+ * overhead: no checks, and the handle does not even carry the owner field).
  *
  * There is no per-structure object to claim an owner on, as <urcu/rcu-txn.h>'s
  * concurrent front-end has in its escalation domain: the sw mutators take a
@@ -374,10 +382,11 @@ struct urcu_txn_sw_txn {
  * settles before the other records -- still corrupt, and are still invisible
  * here.  A clean run is evidence, not proof.
  */
-#ifdef URCU_TXN_SW_EXCL_VALIDATE
+#if defined(URCU_TXN_SW_EXCL_VALIDATE) || defined(URCU_TXN_SW_DEBUG_DISJOINT)
+# include <stdio.h>			/* the validators' reports */
+#endif
 
-#include <pthread.h>
-#include <stdio.h>
+#ifdef URCU_TXN_SW_EXCL_VALIDATE
 
 #define urcu_txn_sw__excl_abort(...)					\
 	do {								\
@@ -401,17 +410,17 @@ int urcu_txn_sw__is_proxy(const void *v, uintptr_t tag)
 static inline
 void urcu_txn_sw__excl_claim(struct urcu_txn_sw_txn *t)
 {
-	t->excl_owner = (unsigned long) pthread_self();
+	t->excl_owner = pthread_self();
 }
 
 static inline
 void urcu_txn_sw__excl_owner(const struct urcu_txn_sw_txn *t, const char *what)
 {
-	unsigned long self = (unsigned long) pthread_self();
+	pthread_t self = pthread_self();
 
-	if (t->excl_owner != self)
-		urcu_txn_sw__excl_abort("txn=%p: %s on thread 0x%lx, but the handle was initialized by thread 0x%lx -- one transaction is driven end to end by one thread\n",
-			(const void *) t, what, self, t->excl_owner);
+	if (!pthread_equal(t->excl_owner, self))
+		urcu_txn_sw__excl_abort("txn=%p: %s on a thread other than the one that initialized the handle -- one transaction is driven end to end by one thread\n",
+			(const void *) t, what);
 }
 
 /* @slot must not already be parked by somebody else. */
@@ -476,6 +485,8 @@ void urcu_txn_sw_init(struct urcu_txn_sw_txn *t)
 	t->nr = 0;
 	t->cap = 0;
 	t->latches_inline = false;
+	t->disjoint = false;
+	t->bloom_live = false;		/* armed lazily; ryw_bloom needs no zeroing until then */
 	urcu_txn_sw__excl_claim(t);
 }
 
@@ -504,6 +515,8 @@ void urcu_txn_sw_init_inline(struct urcu_txn_sw_txn *t,
 	t->nr = 0;
 	t->cap = cap;
 	t->latches_inline = true;
+	t->disjoint = false;
+	t->bloom_live = false;		/* armed lazily; ryw_bloom needs no zeroing until then */
 	urcu_txn_sw__excl_claim(t);
 }
 
@@ -525,7 +538,7 @@ static const unsigned int urcu_txn_sw_slab_rc[] = { 4u, 8u, 16u, 32u, 64u, 128u 
 /*
  * The slab INSTANCE lives once, in liburcu-common (src/urcu-txn.c), which also
  * initializes it from a library constructor -- so this header requires linking
- * liburcu-common.  See the matching note in <urcu/rcu-mcas.h> for why a
+ * liburcu-common.  See the matching note in <urcu/rcu-txn-mcas.h> for why a
  * header-static definition would be wrong (per-TU arena/superblock
  * multiplication, non-shared freelists).
  */
@@ -668,6 +681,27 @@ bool urcu_txn_sw_reserve(struct urcu_txn_sw_txn *t, unsigned int cap)
 	return true;
 }
 
+/*
+ * True when the NEXT record() on @t appends into capacity the handle already
+ * owns, and so cannot fail: no realloc, no group-block alloc, no path to
+ * URCU_TXN_SW_OOM.  A reserve() that covered the bracket's edge bound is the
+ * deliberate way to make this hold, but it is not the only one -- record()
+ * grows on demand to URCU_TXN_SW_CAP, so an unreserved handle satisfies this
+ * too until that first capacity is used up.  Capacity is what matters, not
+ * which call supplied it.
+ *
+ * Sized for embedders that mutate state OUTSIDE the transaction as they record
+ * (e.g. <urcu/rcu-txn-sw-hlist.h>'s writer-only pprev, a plain store that no
+ * rollback can undo).  Such an embedder is only safe while a later record in
+ * the same bracket cannot fail behind it, and this is that question.  A handle
+ * already in URCU_TXN_SW_OOM answers false: it has no capacity to promise.
+ */
+static inline
+bool urcu_txn_sw_append_is_infallible(const struct urcu_txn_sw_txn *t)
+{
+	return t->state == URCU_TXN_SW_PREPARE && t->nr < t->cap;
+}
+
 /* Free the record array of a handle that never parked proxies (no grace
  * period).  Caller-owned (inline) storage is never freed by the engine. */
 static inline
@@ -714,6 +748,95 @@ void urcu_txn_sw_latch_install(struct urcu_txn_sw_txn *t, struct urcu_txn_sw_lat
 	l->proxy.group = &t->block->group;	/* bind to the now-allocated group */
 	uatomic_store(l->slot,
 			(void *) ((uintptr_t) &l->proxy | l->tag), CMM_RELEASE);
+}
+
+/* This transaction's record for @slot, or NULL.  Linear, so O(nr) per call and
+ * O(nr^2) to build a write set -- urcu_txn_sw__find_ryw() below is what keeps
+ * that off the hot path.  The returned pointer is invalidated by the next
+ * record() (a grow may move the array), so use it before recording again. */
+static inline
+struct urcu_txn_sw_latch *urcu_txn_sw__find(const struct urcu_txn_sw_txn *t,
+		void **slot)
+{
+	unsigned int i;
+
+	for (i = 0; i < t->nr; i++)
+		if (t->latches[i].slot == slot)
+			return &t->latches[i];
+	return NULL;
+}
+
+/*
+ * URCU_TXN_SW_BLOOM_MIN: the record count at which the shared RYW filter
+ * (<urcu/rcu-txn-bloom.h>) starts to pay for itself, and below which this engine
+ * does not arm it at all.
+ *
+ * The concurrent engine maintains its filter unconditionally because its
+ * transactions are preceded by a traversal that reads far more slots than it
+ * writes -- the filter's cost is noise against that, and the miss it answers is
+ * the dominant case.  This engine has no such traversal: urcu_txn_sw_load() is
+ * only ever called on a slot about to be recorded (readers use the _rcu
+ * accessors, which never consult a write set), so loads track records ~1:1 and
+ * the DOMINANT transaction is tiny -- a bitmap set_rcu is one edge, a list op
+ * two.  There, find is zero-to-one pointer compares, cheaper than k hashes,
+ * and zeroing the filter would be pure loss.
+ *
+ * So arm lazily, and on first USE rather than on the record that crosses the
+ * threshold: below URCU_TXN_SW_BLOOM_MIN records pay nothing (not even the
+ * reset -- the array stays untouched).  The filter is built and armed by the
+ * first urcu_txn_sw__find_ryw() lookup that faces a write set at least that
+ * long, then maintained on every record thereafter.  Arming on the crossing
+ * record instead would make a transaction of exactly URCU_TXN_SW_BLOOM_MIN
+ * edges build and commit the filter without ever testing it (~8% measured on an
+ * 8-edge commit).  This buys the O(1) miss exactly where the O(nr^2) bites, and
+ * costs one predictable compare where it does not.
+ */
+#ifndef URCU_TXN_SW_BLOOM_MIN
+# define URCU_TXN_SW_BLOOM_MIN	8
+#endif
+
+/*
+ * Build the filter from the records so far and arm it.  Called on the first
+ * lookup that would scan a write set long enough to be worth filtering -- see
+ * URCU_TXN_SW_BLOOM_MIN.
+ */
+static inline
+void urcu_txn_sw__bloom_arm(struct urcu_txn_sw_txn *t)
+{
+	unsigned int i;
+
+	memset(t->ryw_bloom, 0, sizeof(t->ryw_bloom));
+	for (i = 0; i < t->nr; i++)
+		urcu_txn__ryw_bloom_set(t->ryw_bloom, t->latches[i].slot);
+	t->bloom_live = true;
+}
+
+/*
+ * urcu_txn_sw__find() with the certain-miss filter in front: a clear bit means
+ * the slot is DEFINITELY not recorded, so the scan is skipped; all k bits set
+ * falls through to the authoritative find, which resolves the false positive.
+ * The filter can only ever save the scan, never change the answer.
+ */
+static inline
+struct urcu_txn_sw_latch *urcu_txn_sw__find_ryw(struct urcu_txn_sw_txn *t,
+		void **slot)
+{
+#ifndef URCU_TXN_SW_RYW_NO_BLOOM
+	if (caa_unlikely(!t->bloom_live)) {
+		/*
+		 * Arm on first USE, not on the record that crosses the
+		 * threshold: a transaction of exactly URCU_TXN_SW_BLOOM_MIN
+		 * edges would otherwise pay the build and commit without ever
+		 * testing -- measured ~8% on an 8-edge commit, pure loss.
+		 */
+		if (t->nr < URCU_TXN_SW_BLOOM_MIN)
+			return urcu_txn_sw__find(t, slot);
+		urcu_txn_sw__bloom_arm(t);
+	}
+	if (!urcu_txn__ryw_bloom_test(t->ryw_bloom, slot))
+		return NULL;			/* definitely absent */
+#endif
+	return urcu_txn_sw__find(t, slot);
 }
 
 /*
@@ -784,6 +907,158 @@ bool urcu_txn_sw_record(struct urcu_txn_sw_txn *t, void **slot,
 	}
 	l = &t->latches[t->nr++];
 	urcu_txn_sw_latch_set(l, slot, old_ptr, new_ptr, tag);
+	if (t->bloom_live)		/* armed: keep it current (disjoint never arms) */
+		urcu_txn__ryw_bloom_set(t->ryw_bloom, slot);
+	return true;
+}
+
+
+/*
+ * Read-your-own-writes pair (urcu_txn_sw_load / urcu_txn_sw_record_chain)
+ * =====================================================================
+ *
+ * urcu_txn_sw_record() appends BLINDLY and requires pairwise-distinct slots
+ * (install() debug-asserts it; an NDEBUG build silently last-wins).  That is
+ * the right default -- it keeps the common fixed-arity embedder (a list op
+ * records two known-distinct edges) free of an O(nr) scan per store, and it
+ * catches a duplicate as the embedder bug it usually is.
+ *
+ * But an embedder whose write site is COMPUTED rather than known -- a bitmap,
+ * where 63 logical bits share one transacted word, so flips of distinct bit
+ * indexes routinely land on the same slot -- needs the opposite: a same-slot
+ * store must FUSE with the pending one, not duplicate it.  This pair provides
+ * exactly that, mirroring <urcu/rcu-txn.h>'s default read-your-own-writes
+ * (urcu_txn_load / urcu_txn_store) so an embedder written against it migrates
+ * to the concurrent engine mechanically:
+ *
+ *     old = urcu_txn_sw_load(t, slot, TAG);
+ *     urcu_txn_sw_record_chain(t, slot, old, f(old), TAG);
+ *
+ * The transaction keeps AT MOST ONE record per slot, exactly as the concurrent
+ * engine does.  What this pair does NOT import is a read set: a load records
+ * nothing and is not validated (there is nothing to validate against under a
+ * single updater), so it is only ever this transaction's own pending state.
+ *
+ * SCOPE.  This fuses same-SLOT stores.  It does not make every composition
+ * sound: an embedder whose new value is a NEIGHBOUR's pointer (a list) can
+ * still build its write set from stale reads on pairwise-distinct slots unless
+ * its traversal ALSO reads through urcu_txn_sw_load().  See the trap in
+ * urcu_txn_sw_list_add_after_prepare().
+ */
+
+/*
+ * Declare this handle's write set slot-DISJOINT: the RYW pair then skips its
+ * find and behaves exactly as a raw read plus urcu_txn_sw_record() -- the fast
+ * path, since read-your-own-writes is vacuous when no slot is re-touched.  The
+ * single-updater analogue of urcu_txn_declare_disjoint() (<urcu/rcu-txn.h>),
+ * and the same contract: distinctness is a property of the SLOT ADDRESS, not of
+ * a key.  A bitmap packs 63 logical bits into one physical word, so distinct
+ * bit indexes are NOT distinct slots: two per-bit flips may only share a
+ * disjoint handle if the caller knows their bits fall in distinct WORDS.
+ *
+ * Worth declaring where the find is not free: it costs O(nr) per recorded edge,
+ * so a transaction of n edges pays O(n^2).  Measured over a bitmap range (one
+ * edge per spanned word), declaring disjoint is worth ~nothing at 2-8 edges,
+ * ~1.6x at 32, and ~18x at 800 -- so the answer tracks the edge count, not the
+ * structure.  A list op's two edges are one pointer compare: its _rcu wrappers
+ * declare disjoint for the contract, not the cycles.
+ *
+ * A LONE urcu_txn_sw_bitmap_set_range_prepare() is the case that pays: it walks
+ * word by word and touches each exactly once, so its handle may be declared
+ * disjoint even though a bitmap's per-bit forms generally may not.  Do not
+ * declare it if anything else in the same transaction can touch a word the
+ * range spans.
+ *
+ * Contract: if a store DOES hit a recorded slot, the blind append parks two
+ * proxies on it and settle stores both new values in record order -- the
+ * EARLIER edit silently lost in a commit that reports OK (install()'s duplicate
+ * scan traps it under DEBUG_RCU; a plain NDEBUG build corrupts quietly).  Build
+ * with -DURCU_TXN_SW_DEBUG_DISJOINT to trap at the offending record instead --
+ * but note it traps only the RECORD side: a load on a disjoint handle skips the
+ * find entirely and silently returns the slot's COMMITTED value, which no debug
+ * build sees.  Call after init and before the first record(); do not flip
+ * mid-transaction.
+ */
+static inline
+void urcu_txn_sw_declare_disjoint(struct urcu_txn_sw_txn *t)
+{
+	urcu_posix_assert(t->state == URCU_TXN_SW_PREPARE);
+	urcu_posix_assert(!t->nr);		/* before the first record */
+	t->disjoint = true;
+}
+
+/*
+ * Load @slot as this transaction will leave it: the pending new_ptr of its
+ * record for @slot if it has one, else the slot's current value.  @tag is the
+ * slot's proxy tag, checked (debug) against the single-updater invariant that
+ * an unrecorded slot always holds a settled literal -- this updater owns every
+ * store to it, and its own prior transactions settled each slot back to a
+ * literal before commit() returned, so no proxy can be parked here.
+ *
+ * On a handle that declared its write set disjoint this skips the find and
+ * returns the committed value: nothing is pending for a slot that, by that
+ * declaration, no earlier edge touched.
+ */
+static inline
+void *urcu_txn_sw_load(struct urcu_txn_sw_txn *t, void **slot,
+		uintptr_t tag)
+{
+	struct urcu_txn_sw_latch *l;
+	void *v;
+
+	urcu_txn_sw__excl_owner(t, "load()");
+	if (!t->disjoint && (l = urcu_txn_sw__find_ryw(t, slot)) != NULL)
+		return l->proxy.ptr[1];		/* our own pending write */
+	v = uatomic_load(slot, CMM_RELAXED);
+	urcu_assert_debug(((uintptr_t) v & tag) != tag);
+	return v;
+}
+
+/*
+ * Record edge {*slot: @old_ptr -> @new_ptr} tagged @tag, CHAINING onto this
+ * transaction's existing record for @slot if it has one -- keeping that
+ * record's committed old and advancing only its new_ptr -- instead of
+ * appending a duplicate.  The fusing counterpart of urcu_txn_sw_record(); see
+ * the pair's contract above.  Returns false on OOM (sticky; commit reports
+ * MEMORY_ERROR), as record() does.
+ *
+ * @old_ptr must be what urcu_txn_sw_load() returned for @slot: on the chain
+ * path it is the record's PENDING value, not the committed one, and a
+ * disagreeing old means the caller computed @new_ptr from a stale read (debug
+ * assert -- the concurrent engine poisons the attempt for the same reason).
+ */
+static inline
+bool urcu_txn_sw_record_chain(struct urcu_txn_sw_txn *t, void **slot,
+		void *old_ptr, void *new_ptr, uintptr_t tag)
+{
+	struct urcu_txn_sw_latch *l;
+
+	if (caa_unlikely(t->state == URCU_TXN_SW_OOM))
+		return false;			/* sticky: an earlier alloc failed */
+	urcu_posix_assert(t->state == URCU_TXN_SW_PREPARE);
+	urcu_txn_sw__excl_owner(t, "record_chain()");
+	if (t->disjoint) {			/* declared: no slot repeats, skip the find */
+#ifdef URCU_TXN_SW_DEBUG_DISJOINT
+		if (urcu_txn_sw__find(t, slot) != NULL) {
+			fprintf(stderr, "urcu-txn-sw: disjoint-contract violation: "
+				"slot %p is already recorded in this transaction, but the "
+				"handle declared its write set disjoint via "
+				"urcu_txn_sw_declare_disjoint().  The blind append would "
+				"park a second proxy on it and settle both in record order, "
+				"silently losing the earlier edit.  Use the default (do not "
+				"declare disjoint) for a mutator whose composed edges can "
+				"alias a slot.\n", (void *) slot);
+			abort();
+		}
+#endif
+		return urcu_txn_sw_record(t, slot, old_ptr, new_ptr, tag);
+	}
+	l = urcu_txn_sw__find_ryw(t, slot);
+	if (!l)
+		return urcu_txn_sw_record(t, slot, old_ptr, new_ptr, tag);
+	urcu_assert_debug(l->tag == tag);
+	urcu_assert_debug(l->proxy.ptr[1] == old_ptr);	/* caller read its own writes */
+	l->proxy.ptr[1] = new_ptr;		/* committed old preserved */
 	return true;
 }
 

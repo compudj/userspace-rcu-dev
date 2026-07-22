@@ -3475,7 +3475,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 		struct cds_ft_iter *iter,
 		struct cds_ft_node *node)
 {
-	struct urcu_mcas_txn optxn;
+	struct urcu_txn optxn;
 	enum cds_ft_status s;
 	bool need_retry;
 
@@ -3948,7 +3948,7 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 		struct cds_ft_iter *iter,
 		struct cds_ft_node **result_node)
 {
-	struct urcu_mcas_txn optxn;
+	struct urcu_txn optxn;
 	enum cds_ft_status s;
 
 	CDS_FT_SCOPED_WRITER(ft);

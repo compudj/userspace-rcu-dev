@@ -202,7 +202,7 @@
  * transactional engine (and its headers) stay opaque to API users; a
  * duplicate-chain walk is not a fast path, so the call is immaterial.
  */
-urcu_static_assert(CDS_FT_NODE_TXN_PROXY_TAG == URCU_MCAS_TAG,
+urcu_static_assert(CDS_FT_NODE_TXN_PROXY_TAG == URCU_TXN_TAG,
 		"FT public duplicate-next proxy tag must equal the engine proxy tag",
 		ft_node_next_proxy_tag_matches_engine);
 struct cds_ft_node *cds_ft_node_next_resolve(void *raw)

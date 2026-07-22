@@ -39,7 +39,7 @@ struct ft_insert_commit {
 	 * persistent handle (_cds_ft_insert_replace) -- the arm then creates a
 	 * standalone per-attempt txn as before.
 	 */
-	struct urcu_mcas_txn *op;
+	struct urcu_txn *op;
 	struct cds_ft_inode_flag **slot;	/* forward-publish sentinel (one-commit
 						 * parked) -- the txn settles the edges */
 	/*
@@ -2570,7 +2570,7 @@ int _cds_ft_insert(struct cds_ft *ft,
 	void *cell = NULL;			/* @precell's carrier; reused across retries */
 	enum urcu_txn_status cst = URCU_TXN_STATUS_OK;	/* last commit outcome */
 	struct ft_insert_commit ic = { 0 };
-	struct urcu_mcas_txn optxn;		/* persistent handle spanning the retry loop */
+	struct urcu_txn optxn;		/* persistent handle spanning the retry loop */
 
 	if (!valid_external_node(node) || !valid_key_len(ft, key_len))
 		return -EINVAL;
