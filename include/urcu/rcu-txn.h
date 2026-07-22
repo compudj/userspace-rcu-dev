@@ -14,9 +14,8 @@
  * store() is split into store_mw() and store_sw() so one commit can carry both
  * single-writer-owned and multi-writer slots, atomic against one linearization
  * point.  See <urcu/rcu-txn-mcas.h> for the MCAS mechanism (one control
- * word, two record kinds, MW-only abort).  <urcu/rcu-txn-mw.h> is the
- * multi-writer-only specialization (urcu_txn_mw_*), and <urcu/rcu-txn-sw.h> the
- * single-writer-only one (urcu_txn_sw_*).
+ * word, two record kinds, MW-only abort).  <urcu/rcu-txn-sw.h> is the
+ * single-writer-only specialization (urcu_txn_sw_*).
  *
  * Include AFTER an RCU flavor header (e.g. <urcu-qsbr.h>): the read-side bracket
  * and urcu_txn_commit() default to the compile-time-selected flavor's
@@ -56,7 +55,56 @@ extern "C" {
 #define URCU_TXN_INIT	4
 #endif
 
-/* Reactive escalation threshold; see <urcu/rcu-txn-mw.h> for the rationale. */
+/*
+ * Reactive escalation threshold.  A handle escalates into the domain's lane
+ * when it has RETRIED past the budget its own cost earns it:
+ *
+ *     budget = PER_COST * cost,   capped at URCU_TXN_FALLBACK_MAX
+ *
+ * where cost is the transaction's LOADS PLUS ITS WRITE-SET RECORDS -- the
+ * whole bracket, not just the edges it commits.
+ *
+ * Why the budget scales with cost.  Escalating funnels EVERY writer in the
+ * domain through one serial lane, so what an escalation costs is the length of
+ * the critical section it serializes.  A single-edge op commits with a bare
+ * CAS: serializing it is nearly free, the lane is just queueing, and escalating
+ * early turns wasted CAS collisions into orderly turns.  A traversal mutator is
+ * the opposite: funnelling those destroys N-way parallelism, and the optimistic
+ * path (which aborts far MORE but retries in PARALLEL) beats the serialized
+ * lane by a factor of 2.6 on a 3-skiplist move.  Retries are cheap and
+ * parallel; the lane is not.  So the more a transaction costs, the longer it
+ * should stay optimistic.
+ *
+ * (This is the opposite of a wasted-work rule, which would escalate an
+ * expensive op SOONER because each failed attempt throws away more.
+ * Measurement says wasted work is not the binding cost -- the serialization
+ * is.)
+ *
+ * Why cost counts the LOADS.  Sizing the budget on the write set alone prices
+ * the DESCENT at zero, and the descent is most of what the lane would
+ * serialize: a 3-skiplist move commits ~25 records but reads ~145 slots to
+ * find them.  By write set that move is indistinguishable from a 32-edge blind
+ * update (24.5 vs 32 records) even though the two want budgets an order of
+ * magnitude apart -- so no function of the write-set size can serve both.  By
+ * cost they are 168 vs 64, and one constant does.
+ *
+ * 11/4 (2.75) is where the 3-skiplist peaks -- it falls off on BOTH sides
+ * (2.25 -> 18.5, 2.75 -> 19.5, 4.0 -> 18.8 Mmoves/s at 192 cores).  Measured
+ * against a flat 256 budget, WITH the floor below in place: 3-skiplist +11%,
+ * 3-hash unchanged, bidir list unchanged, and a starved transaction's p99 ~7%
+ * better.  (Without the floor the starved transaction does far better still --
+ * p99 -40%, ~2x throughput -- but that costs the hot list domain 17%, which is
+ * exactly what the floor buys back.)
+ */
+/*
+ * The scale factor is a RATIONAL, kept in integer arithmetic:
+ *
+ *     budget = (PER_COST_NUM * cost) / PER_COST_DEN
+ *
+ * because the useful range turned out to be finer than one retry per unit of
+ * cost.  Set PER_COST_NUM to 0 to select a flat URCU_TXN_FALLBACK budget
+ * instead (the cost accounting then compiles out entirely).
+ */
 #ifndef URCU_TXN_FALLBACK_PER_COST_NUM
 #define URCU_TXN_FALLBACK_PER_COST_NUM	11	/* 11/4 = 2.75 */
 #endif
@@ -66,6 +114,30 @@ extern "C" {
 #ifndef URCU_TXN_FALLBACK		/* only consulted when PER_COST_NUM == 0 */
 #define URCU_TXN_FALLBACK		256
 #endif
+/*
+ * Floor under the scaled budget.  It is what keeps a CHEAP transaction on a HOT
+ * domain off the lane.  Cost measures what the ESCALATING op costs to
+ * serialize; it says NOTHING about what the lane's other traffic costs, and
+ * those are not the same thing -- escalating publishes domain->active, which
+ * funnels every writer in the domain, however cheap the escalating op was.
+ *
+ * A bidir-list delete measures cost 6 (max 7), so scaling alone gives it a
+ * budget of ~16 retries.  Its natural retry tail runs past that: over 562M
+ * commits at 192 writers, 98.6% commit with no retry at all and 99.9999% within
+ * 3 retries, but a thin tail reaches into 16..63.  Those few are enough --
+ * every one of them funnels a domain running at 225 Mops/s into the serial
+ * lane -- and
+ * unfloored the churn panel loses 17%, all of it policy rather than accounting
+ * overhead (the load counter itself measures 0.6%).  A floor of 64 puts the
+ * budget above that tail: only 6 commits in 562M ever reach it.  The other
+ * cheap-and-hot workload agrees -- a transacted hlist under the same contention
+ * commits 99.9999% within 7 retries and never exceeds 15.
+ *
+ * Raising the floor further only erodes the starvation rescue (it is the CHEAP
+ * ops escalating that pull a starved neighbour into the lane behind them), so
+ * it wants to sit just above the natural tail of the domain's healthy traffic
+ * and no higher.
+ */
 #ifndef URCU_TXN_FALLBACK_MIN
 #define URCU_TXN_FALLBACK_MIN		64
 #endif
@@ -82,6 +154,75 @@ urcu_static_assert(URCU_TXN_FALLBACK_PER_COST_DEN > 0,
 urcu_static_assert(URCU_TXN_FALLBACK_MIN <= URCU_TXN_FALLBACK_MAX,
 		"URCU_TXN_FALLBACK_MIN must not exceed URCU_TXN_FALLBACK_MAX",
 		urcu_txn_fallback_bounds_ordered);
+
+/*
+ * Read-your-own-writes lookup filter (a Bloom word), maintained for every
+ * transaction except one that declared its write set disjoint.  urcu_txn__load
+ * must, for each in-bracket read, decide whether the slot is already in this
+ * attempt's write set.  The authoritative test is urcu_txn_find() -- a linear
+ * scan of the descriptor's records at the record stride (48 bytes).  A
+ * traversal reads many slots and transacts few, so the hot case is the MISS,
+ * and that scan is pure overhead on it.
+ *
+ * The filter is one word in the ON-STACK handle (never in struct urcu_txn_desc,
+ * whose size is baked into the library's descriptor slab -- enlarging it there
+ * overflows a slab block).  A store ORs the slot's bit; a load tests it.  A
+ * clear bit (the common miss) skips find entirely; a set bit falls through to
+ * find, which resolves the rare false positive -- so the filter can only ever
+ * save the scan, never change a returned value.  It is reset per attempt.
+ * Measured ~+4% at 192 writers on bench_txn_3skiplist (+3.6% at n=960, +4.4% at
+ * n=3840, size-stable, ~12x the run-to-run spread), and non-negative for narrow
+ * write-sets (a clear bit skips even the short hash scan); a dense {slot,val}
+ * array was tried instead and LOST (-2.3% .. -4.6%, worsening with size)
+ * because it stays O(nr) on the dominant miss.  Build -DURCU_TXN_RYW_NO_BLOOM
+ * to fall back to the bare find (A/B / falsification).
+ *
+ * URCU_TXN_BLOOM_WORDS sets the filter width (64 bits each; default 16 = 1024
+ * bits).  Widening it lowers the false-positive rate ~linearly (FP ~= k*records
+ * / (64*WORDS)); the age-0/age-1 escalation study used it to separate genuine
+ * RYW from filter FP.
+ *
+ * The filter mechanism itself (width, k, hashing, test/set) is shared with
+ * <urcu/rcu-txn-sw.h> and lives in <urcu/rcu-txn-bloom.h>; what is stated here
+ * is this engine's POLICY for it.  Width and k are compile-time tunables that
+ * only ever trade filter cost against the false-positive rate: correctness
+ * never depends on either, since a false positive only ever costs a find
+ * (baseline) or an extra attempt (age 0).  Escalation itself is tuned
+ * per-transaction at runtime via urcu_txn_declare_disjoint() /
+ * urcu_txn_expect_conflict().
+ */
+
+/*
+ * Age-0/age-1 optimistic RYW escalation.
+ *
+ * The premise: read-your-own-writes only bites when an attempt reads a slot it
+ * has already written, which for a sparse or low-batch write-set is rare -- yet
+ * a naive RYW path pays the Bloom test (and, on a hit, the find scan) on every
+ * in-bracket load regardless.
+ *
+ * So the FIRST attempt of an operation (retry == 0, "age 0") runs a stripped
+ * RYW path: it maintains the Bloom filter as usual but NEVER calls find.  A
+ * load or store whose slot is already in the filter -- a possible
+ * read-after-write or write-after-write, true or a filter false positive --
+ * sets esc_pending instead of resolving it.  The optimistic value a colliding
+ * load returns may be stale, but esc_pending forces commit to ABORT, so an
+ * age-0 attempt that saw ANY coincidence never installs: it is discarded
+ * unpublished and re-run at retry >= 1 ("age 1+"), where the full path (Bloom +
+ * find, chaining) resolves RYW correctly.  An age-0 attempt that saw NO
+ * coincidence has a write-set with no same-slot records and no stale reads, so
+ * it is exactly a baseline commit and installs directly.
+ *
+ * The trade: age 0 never runs find, at the price of a whole extra attempt
+ * whenever it guesses wrong.  So the win is bounded by the ESCALATION RATE --
+ * how often an operation hits a coincidence (genuine RYW) or a Bloom false
+ * positive -- and is therefore WORKLOAD-DEPENDENT: it pays off for
+ * disjoint/low-RYW write-sets (e.g. the hash key-move) and loses for dense-RYW
+ * batched descents (e.g. the skiplist), which opt out per-transaction with
+ * urcu_txn_expect_conflict() so their first attempt goes straight to the find
+ * path.  Widening URCU_TXN_BLOOM_WORDS shrinks the false-positive component;
+ * correctness never depends on the filter width, since a false positive only
+ * ever spends an extra attempt.
+ */
 
 /*
  * Compile-time fallback for the RCU read-side bracket, used only when a handle

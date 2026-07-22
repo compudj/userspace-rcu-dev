@@ -3,16 +3,16 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
 /*
- * Test for the guards of <urcu/rcu-txn-mw.h>.
+ * Test for the guards of <urcu/rcu-txn.h>.
  *
- * urcu_txn_mw_load_validate() reads a slot AND folds a load-only {v -> v}
+ * urcu_txn_load_validate() reads a slot AND folds a load-only {v -> v}
  * record into the commit, so the transaction commits only if that slot still
  * holds the read value at the install point -- a TM read-set entry.  The model
  * scenario is a tombstone an insert must find clear: validate the tombstone,
  * write the structural edges, and the commit is atomic with "tombstone still
  * clear".
  *
- * urcu_txn_mw_validate() is the same guard with a CALLER-SUPPLIED expected value:
+ * urcu_txn_validate() is the same guard with a CALLER-SUPPLIED expected value:
  * it guards a word against an image the mutator COMPUTES rather than one it
  * read through the bracket, which is what the load-derived guard cannot express.
  *
@@ -22,7 +22,7 @@
  *   1. guard holds            -> commit OK, write applied, guarded word intact;
  *   2. guard fails mid-flight -> commit ABORT, write NOT applied;
  *   3. validate-then-store same slot -> one record, commits as the write;
- *   4. urcu_txn_mw_load_committed() past a pending store -> reads the slot's
+ *   4. urcu_txn_load_committed() past a pending store -> reads the slot's
  *      COMMITTED value, ignoring this attempt's pending write; records nothing,
  *      and the store still stands at commit;
  *   5. pure guard, unchanged  -> commit OK, slot untouched;
@@ -51,7 +51,7 @@
 #include <urcu/compiler.h>
 #include <urcu-qsbr.h>
 #include <urcu-call-rcu.h>
-#include <urcu/rcu-txn-mw.h>
+#include <urcu/rcu-txn.h>
 
 #include "tap.h"
 
@@ -77,7 +77,7 @@ static void *g_ctrl;		/* the caller-expected guard's control word */
 
 int main(void)
 {
-	struct urcu_txn_mw tx;
+	struct urcu_txn tx;
 	void *gv, *vv;
 	unsigned int nr1, nr2;
 	enum urcu_txn_status st;
@@ -88,12 +88,12 @@ int main(void)
 	/* 1. Guard holds: commit OK, payload written, gate left untouched. */
 	g_gate = CLEAR;
 	g_payload = P0;
-	urcu_txn_mw_init(&tx, NULL);
-	urcu_txn_mw_begin(&tx);
-	gv = urcu_txn_mw_load_validate(&tx, &g_gate, URCU_MCAS_TAG);
-	urcu_txn_mw_store(&tx, &g_payload, P0, P1, URCU_MCAS_TAG);
-	st = urcu_txn_mw_commit(&tx);
-	urcu_txn_mw_end(&tx);
+	urcu_txn_init(&tx, NULL);
+	urcu_txn_begin(&tx);
+	gv = urcu_txn_load_validate(&tx, &g_gate, URCU_TXN_TAG);
+	urcu_txn_store_mw(&tx, &g_payload, P0, P1, URCU_TXN_TAG);
+	st = urcu_txn_commit(&tx);
+	urcu_txn_end(&tx);
 	ok(gv == CLEAR && st == URCU_TXN_STATUS_OK &&
 			g_gate == CLEAR && g_payload == P1,
 		"guard holds -> commit applies the write, leaves the guarded word");
@@ -102,13 +102,13 @@ int main(void)
 	 * and the buffered write must NOT take effect. */
 	g_gate = CLEAR;
 	g_payload = P0;
-	urcu_txn_mw_init(&tx, NULL);
-	urcu_txn_mw_begin(&tx);
-	gv = urcu_txn_mw_load_validate(&tx, &g_gate, URCU_MCAS_TAG);
-	urcu_txn_mw_store(&tx, &g_payload, P0, P1, URCU_MCAS_TAG);
+	urcu_txn_init(&tx, NULL);
+	urcu_txn_begin(&tx);
+	gv = urcu_txn_load_validate(&tx, &g_gate, URCU_TXN_TAG);
+	urcu_txn_store_mw(&tx, &g_payload, P0, P1, URCU_TXN_TAG);
 	g_gate = SET;			/* simulated racing tombstone */
-	st = urcu_txn_mw_commit(&tx);
-	urcu_txn_mw_end(&tx);
+	st = urcu_txn_commit(&tx);
+	urcu_txn_end(&tx);
 	ok(gv == CLEAR && st == URCU_TXN_STATUS_ABORT && g_payload == P0,
 		"guard fails -> commit aborts and the write is not applied");
 
@@ -118,40 +118,40 @@ int main(void)
 	 * AGE_ESCALATE build would escalate on the age-0 coincidence rather than
 	 * chain into the one record this asserts.  Inert in a stock build. */
 	g_w = VX;
-	urcu_txn_mw_init(&tx, NULL);
-	urcu_txn_mw_expect_conflict(&tx);
-	urcu_txn_mw_begin(&tx);
-	vv = urcu_txn_mw_load_validate(&tx, &g_w, URCU_MCAS_TAG);
-	urcu_txn_mw_store(&tx, &g_w, VX, VZ, URCU_MCAS_TAG);
-	nr1 = tx.mcas->nr;
-	st = urcu_txn_mw_commit(&tx);
-	urcu_txn_mw_end(&tx);
+	urcu_txn_init(&tx, NULL);
+	urcu_txn_expect_conflict(&tx);
+	urcu_txn_begin(&tx);
+	vv = urcu_txn_load_validate(&tx, &g_w, URCU_TXN_TAG);
+	urcu_txn_store_mw(&tx, &g_w, VX, VZ, URCU_TXN_TAG);
+	nr1 = tx.desc->nr;
+	st = urcu_txn_commit(&tx);
+	urcu_txn_end(&tx);
 	ok(vv == VX && nr1 == 1 && st == URCU_TXN_STATUS_OK && g_w == VZ,
 		"validate-then-store on one slot -> one record, commits the write");
 
-	/* 4. urcu_txn_mw_load_committed() is the scoped escape hatch from RYW: after
+	/* 4. urcu_txn_load_committed() is the scoped escape hatch from RYW: after
 	 * buffering a store, it reads past the transaction's own pending write and
 	 * returns the slot's COMMITTED value.  It is a read-only decision helper --
 	 * it records nothing (nr unchanged from the lone store) and does not disturb
 	 * the write, which still commits. */
 	g_w = VX;
-	urcu_txn_mw_init(&tx, NULL);
-	urcu_txn_mw_begin(&tx);
-	urcu_txn_mw_store(&tx, &g_w, VX, VZ, URCU_MCAS_TAG);
-	vv = urcu_txn_mw_load_committed(&tx, &g_w, URCU_MCAS_TAG);
-	nr2 = tx.mcas->nr;
-	st = urcu_txn_mw_commit(&tx);
-	urcu_txn_mw_end(&tx);
+	urcu_txn_init(&tx, NULL);
+	urcu_txn_begin(&tx);
+	urcu_txn_store_mw(&tx, &g_w, VX, VZ, URCU_TXN_TAG);
+	vv = urcu_txn_load_committed(&tx, &g_w, URCU_TXN_TAG);
+	nr2 = tx.desc->nr;
+	st = urcu_txn_commit(&tx);
+	urcu_txn_end(&tx);
 	ok(vv == VX && nr2 == 1 && st == URCU_TXN_STATUS_OK && g_w == VZ,
 		"load_committed past a pending store -> reads committed value, write preserved");
 
 	/* 5. Pure guard over an unchanged word: commit OK, no modification. */
 	g_w = VX;
-	urcu_txn_mw_init(&tx, NULL);
-	urcu_txn_mw_begin(&tx);
-	vv = urcu_txn_mw_load_validate(&tx, &g_w, URCU_MCAS_TAG);
-	st = urcu_txn_mw_commit(&tx);
-	urcu_txn_mw_end(&tx);
+	urcu_txn_init(&tx, NULL);
+	urcu_txn_begin(&tx);
+	vv = urcu_txn_load_validate(&tx, &g_w, URCU_TXN_TAG);
+	st = urcu_txn_commit(&tx);
+	urcu_txn_end(&tx);
 	ok(vv == VX && st == URCU_TXN_STATUS_OK && g_w == VX,
 		"pure guard over an unchanged word commits without modifying it");
 
@@ -160,35 +160,35 @@ int main(void)
 	 * one), and its record chains rather than poisoning (the old it presents is
 	 * the pending new).  One record; the write stands. */
 	g_w = VX;
-	urcu_txn_mw_init(&tx, NULL);
+	urcu_txn_init(&tx, NULL);
 	/*
 	 * Same-slot store+validate is a deliberate self-conflict: under an
 	 * AGE_ESCALATE build age 0 would escalate on the coincidence rather than
 	 * chain into one record, so declare it to exercise the age-1 chaining path
 	 * this asserts.  Inert (a no-op) in a stock build.
 	 */
-	urcu_txn_mw_expect_conflict(&tx);
-	urcu_txn_mw_begin(&tx);
-	urcu_txn_mw_store(&tx, &g_w, VX, VZ, URCU_MCAS_TAG);
-	vv = urcu_txn_mw_load_validate(&tx, &g_w, URCU_MCAS_TAG);
-	nr2 = tx.mcas->nr;
-	st = urcu_txn_mw_commit(&tx);
-	urcu_txn_mw_end(&tx);
+	urcu_txn_expect_conflict(&tx);
+	urcu_txn_begin(&tx);
+	urcu_txn_store_mw(&tx, &g_w, VX, VZ, URCU_TXN_TAG);
+	vv = urcu_txn_load_validate(&tx, &g_w, URCU_TXN_TAG);
+	nr2 = tx.desc->nr;
+	st = urcu_txn_commit(&tx);
+	urcu_txn_end(&tx);
 	ok(vv == VZ && nr2 == 1 && st == URCU_TXN_STATUS_OK && g_w == VZ,
 		"store-then-validate, RYW -> reads its own pending write, one record, write stands");
 
-	/* 7. urcu_txn_mw_validate(): the expected image is COMPUTED, never read
-	 * through the bracket (which is what urcu_txn_mw_load_validate() cannot
+	/* 7. urcu_txn_validate(): the expected image is COMPUTED, never read
+	 * through the bracket (which is what urcu_txn_load_validate() cannot
 	 * express): the mutator knows the control word's stable bits and predicts
 	 * its marker.  It matches, so the commit stands. */
 	g_ctrl = CTRL(1);
 	g_payload = P0;
-	urcu_txn_mw_init(&tx, NULL);
-	urcu_txn_mw_begin(&tx);
-	urcu_txn_mw_validate(&tx, &g_ctrl, CTRL(1), URCU_MCAS_TAG);
-	urcu_txn_mw_store(&tx, &g_payload, P0, P1, URCU_MCAS_TAG);
-	st = urcu_txn_mw_commit(&tx);
-	urcu_txn_mw_end(&tx);
+	urcu_txn_init(&tx, NULL);
+	urcu_txn_begin(&tx);
+	urcu_txn_validate(&tx, &g_ctrl, CTRL(1), URCU_TXN_TAG);
+	urcu_txn_store_mw(&tx, &g_payload, P0, P1, URCU_TXN_TAG);
+	st = urcu_txn_commit(&tx);
+	urcu_txn_end(&tx);
 	ok(st == URCU_TXN_STATUS_OK && g_ctrl == CTRL(1) && g_payload == P1,
 		"validate against a computed expected: it holds -> commit, guarded word untouched");
 
@@ -197,13 +197,13 @@ int main(void)
 	 * take effect. */
 	g_ctrl = CTRL(1);
 	g_payload = P0;
-	urcu_txn_mw_init(&tx, NULL);
-	urcu_txn_mw_begin(&tx);
-	urcu_txn_mw_validate(&tx, &g_ctrl, CTRL(1), URCU_MCAS_TAG);
-	urcu_txn_mw_store(&tx, &g_payload, P0, P1, URCU_MCAS_TAG);
+	urcu_txn_init(&tx, NULL);
+	urcu_txn_begin(&tx);
+	urcu_txn_validate(&tx, &g_ctrl, CTRL(1), URCU_TXN_TAG);
+	urcu_txn_store_mw(&tx, &g_payload, P0, P1, URCU_TXN_TAG);
 	g_ctrl = VX;			/* simulated racing peer */
-	st = urcu_txn_mw_commit(&tx);
-	urcu_txn_mw_end(&tx);
+	st = urcu_txn_commit(&tx);
+	urcu_txn_end(&tx);
 	ok(st == URCU_TXN_STATUS_ABORT && g_payload == P0,
 		"validate against a computed expected: a peer moved the word -> commit aborts, the write is not applied");
 
@@ -215,12 +215,12 @@ int main(void)
 	 * expected" as "the engine ignores the subfield". */
 	g_ctrl = CTRL(1);
 	g_payload = P0;
-	urcu_txn_mw_init(&tx, NULL);
-	urcu_txn_mw_begin(&tx);
-	urcu_txn_mw_validate(&tx, &g_ctrl, CTRL(0), URCU_MCAS_TAG);
-	urcu_txn_mw_store(&tx, &g_payload, P0, P1, URCU_MCAS_TAG);
-	st = urcu_txn_mw_commit(&tx);
-	urcu_txn_mw_end(&tx);
+	urcu_txn_init(&tx, NULL);
+	urcu_txn_begin(&tx);
+	urcu_txn_validate(&tx, &g_ctrl, CTRL(0), URCU_TXN_TAG);
+	urcu_txn_store_mw(&tx, &g_payload, P0, P1, URCU_TXN_TAG);
+	st = urcu_txn_commit(&tx);
+	urcu_txn_end(&tx);
 	ok(st == URCU_TXN_STATUS_ABORT && g_ctrl == CTRL(1) && g_payload == P0,
 		"the guard is an exact word match, not a mask: an expected that clears a set marker aborts");
 

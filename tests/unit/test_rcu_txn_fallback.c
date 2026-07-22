@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
 /*
- * Fallback stress for <urcu/rcu-txn-mw.h>: the per-domain
+ * Fallback stress for <urcu/rcu-txn.h>: the per-domain
  * FIFO escalation lane under a starvation pattern the engine's aging
  * cannot bound.
  *
@@ -37,8 +37,8 @@
  * directly, so it wants a trigger that does not depend on what an attempt
  * happened to cost.
  */
-#define URCU_TXN_MW_FALLBACK_PER_COST_NUM	0
-#define URCU_TXN_MW_FALLBACK		8
+#define URCU_TXN_FALLBACK_PER_COST_NUM	0
+#define URCU_TXN_FALLBACK		8
 
 #include <inttypes.h>
 #include <pthread.h>
@@ -50,7 +50,7 @@
 #include <urcu/compiler.h>
 #include <urcu-qsbr.h>
 #include <urcu-call-rcu.h>
-#include <urcu/rcu-txn-mw.h>
+#include <urcu/rcu-txn.h>
 
 #include "tap.h"
 
@@ -63,7 +63,7 @@
 /* Generous: progress is the point, not a tight bound. */
 #define RETRY_BOUND	100000
 
-static struct urcu_txn_mw_domain g_domain;
+static struct urcu_txn_domain g_domain;
 static void *g_word[NR_WORDS];
 
 struct worker_arg {
@@ -100,25 +100,25 @@ static void *narrow_worker(void *arg)
 
 	rcu_register_thread();
 	for (n = 0; n < NARROW_OPS; n++) {
-		struct urcu_txn_mw tx;
+		struct urcu_txn tx;
 		int i, ret;
 
 		rng = xs(rng);
 		i = (int) (rng % NR_WORDS);
 
-		urcu_txn_mw_init(&tx, &g_domain);
+		urcu_txn_init(&tx, &g_domain);
 		do {
 			uintptr_t oi;
 			void *ni;
 
-			urcu_txn_mw_begin(&tx);
-			oi = (uintptr_t) urcu_txn_mw_load(&tx,
-					&g_word[i], URCU_MCAS_TAG);
+			urcu_txn_begin(&tx);
+			oi = (uintptr_t) urcu_txn_load(&tx,
+					&g_word[i], URCU_TXN_TAG);
 			ni = (void *) lf_bump(oi, 1);
-			urcu_txn_mw_store(&tx, &g_word[i],
-					(void *) oi, ni, URCU_MCAS_TAG);
-			ret = urcu_txn_mw_commit(&tx);
-			urcu_txn_mw_end(&tx);
+			urcu_txn_store_mw(&tx, &g_word[i],
+					(void *) oi, ni, URCU_TXN_TAG);
+			ret = urcu_txn_commit(&tx);
+			urcu_txn_end(&tx);
 			if (ret < 0)
 				abort();		/* MEMORY_ERROR */
 		} while (ret == URCU_TXN_STATUS_ABORT);
@@ -144,29 +144,29 @@ static void *wide_worker(void *arg)
 
 	rcu_register_thread();
 	for (n = 0; n < WIDE_OPS; n++) {
-		struct urcu_txn_mw tx;
+		struct urcu_txn tx;
 		uintptr_t o[NR_WORDS];
 		int w, ret;
 
-		urcu_txn_mw_init(&tx, &g_domain);
+		urcu_txn_init(&tx, &g_domain);
 		do {
 			void *nw;
 
-			urcu_txn_mw_begin(&tx);
-			(void) urcu_txn_mw_reserve(&tx, NR_WORDS);
+			urcu_txn_begin(&tx);
+			(void) urcu_txn_reserve(&tx, NR_WORDS);
 			for (w = 0; w < NR_WORDS; w++)
-				o[w] = (uintptr_t) urcu_txn_mw_load(
-						&tx, &g_word[w], URCU_MCAS_TAG);
+				o[w] = (uintptr_t) urcu_txn_load(
+						&tx, &g_word[w], URCU_TXN_TAG);
 			nw = (void *) lf_bump(o[0], (NR_WORDS - 1) * 2);
-			urcu_txn_mw_store(&tx, &g_word[0],
-					(void *) o[0], nw, URCU_MCAS_TAG);
+			urcu_txn_store_mw(&tx, &g_word[0],
+					(void *) o[0], nw, URCU_TXN_TAG);
 			for (w = 1; w < NR_WORDS; w++) {
 				nw = (void *) lf_bump(o[w], -2);
-				urcu_txn_mw_store(&tx, &g_word[w],
-						(void *) o[w], nw, URCU_MCAS_TAG);
+				urcu_txn_store_mw(&tx, &g_word[w],
+						(void *) o[w], nw, URCU_TXN_TAG);
 			}
-			ret = urcu_txn_mw_commit(&tx);
-			urcu_txn_mw_end(&tx);
+			ret = urcu_txn_commit(&tx);
+			urcu_txn_end(&tx);
 			if (ret < 0)
 				abort();		/* MEMORY_ERROR */
 		} while (ret == URCU_TXN_STATUS_ABORT);
@@ -191,7 +191,7 @@ int main(void)
 
 	plan_tests(NR_TESTS);
 	rcu_register_thread();
-	urcu_txn_mw_domain_init(&g_domain);
+	urcu_txn_domain_init(&g_domain);
 
 	for (i = 0; i < NR_NARROW; i++) {
 		narrow_a[i].seed = 0x9e3779b9u

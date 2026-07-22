@@ -16,7 +16,7 @@
  * the control word) is the same either way.  The begin/load/store/commit
  * bracket with aging escalation and the fair-mutex fallback lane lives in the
  * front-end <urcu/rcu-txn.h> (which includes this header) -- the same
- * primitive/front-end split as <urcu/rcu-mcas.h> and <urcu/rcu-txn-mw.h>.
+ * primitive/front-end split as <urcu/rcu-mcas.h> (the multi-writer-only k-CAS).
  *
  * One transaction commit can carry BOTH single-writer (SW) and multi-writer
  * (MW) records, committed atomically against ONE linearization point.  This is
