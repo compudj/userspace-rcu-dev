@@ -149,6 +149,33 @@ enum urcu_txn_desc_status {
  * Record kind: it selects the INSTALL discipline only (SW = plain caller-
  * exclusive store, never fails; MW = sole-driver CAS-old, may abort).  Resolve
  * is identical for both.
+ *
+ * Kind is a property of the SLOT, not a free per-record choice.  A slot is
+ * SW (the embedder holds a lock over it, so no writer races the plain park) XOR
+ * MW (concurrent writers, so the CAS-old serializes them) -- the two are
+ * mutually-exclusive concurrency disciplines of the slot itself.  Two facts are
+ * asymmetric:
+ *
+ *   - MW is ALWAYS SAFE: a CAS-old install is correct whether or not anyone
+ *     else touches the slot.
+ *   - SW is a PROMISE of exclusion: the plain park is correct only while the
+ *     caller's lock actually excludes every other writer of that slot.  It is
+ *     the optimization to opt into when that promise holds.
+ *
+ * So the kind of a slot must be GLOBALLY CONSISTENT: every transaction that
+ * records that slot -- across threads -- must use the same kind.  Treating one
+ * slot as SW in one txn and MW in another lets the MW writer's CAS race the SW
+ * writer's unlocked plain park (the MW path never takes the SW lock), which
+ * tears or loses a write, possibly a use-after-free.  The engine CANNOT check
+ * this: each txn sees only its own records.  It is the embedder's invariant, as
+ * "the same datum is guarded by the same lock everywhere" is.  A QUIESCENT
+ * temporal transition (a slot MW for one phase, SW for another, with a grace
+ * period / global barrier between so no two concurrent writers disagree) is
+ * fine; concurrent disagreement is not.  When in doubt, use MW.
+ *
+ * Recording BOTH kinds on one slot WITHIN one txn is the same contradiction in
+ * miniature; urcu_txn_record_chain() resolves it fail-safe (MW dominates) and
+ * debug builds trap the likely bug.
  */
 enum urcu_txn_kind {
 	URCU_TXN_KIND_SW = 0,
@@ -634,9 +661,17 @@ struct urcu_txn_record *urcu_txn_find(struct urcu_txn_desc *t,
 /*
  * Record edge {*slot: old -> new} of kind @kind under read-your-own-writes: a
  * same-slot reconcile matches against new_ptr and CHAINS (keeps the original
- * old_ptr, advances new_ptr).  A mismatch poisons the descriptor (commit aborts).
- * A kind change on an already-recorded slot is an embedder error (a slot is
- * either SW-owned or MW-shared within a transaction).
+ * old_ptr, advances new_ptr).  A value mismatch poisons the descriptor (commit
+ * aborts).
+ *
+ * Kind conflict on an already-recorded slot -- an SW record and an MW record on
+ * the SAME slot in one txn -- is a contradiction (a slot is SW xor MW; see
+ * enum urcu_txn_kind).  Resolve it FAIL-SAFE: MW DOMINATES.  Promote the record
+ * to the CAS-old install, which is correct whether or not the slot is actually
+ * shared, where keeping the plain SW park would race a concurrent MW writer and
+ * tear or lose a write.  It is still the embedder's bug, so debug builds assert
+ * it (an abort here would only livelock -- the retry re-hits the same store
+ * sequence -- so release fails safe rather than poisoning).
  */
 static inline
 bool urcu_txn_record_chain(struct urcu_txn_desc *t, void **slot,
@@ -647,6 +682,8 @@ bool urcu_txn_record_chain(struct urcu_txn_desc *t, void **slot,
 
 	if (r != NULL) {
 		urcu_assert_debug(r->kind == kind);
+		if (kind == URCU_TXN_KIND_MW)
+			r->kind = URCU_TXN_KIND_MW;	/* MW dominates: fail-safe to CAS */
 		if (caa_unlikely(r->new_ptr != old_ptr)) {
 			t->poisoned = 1;
 			return true;

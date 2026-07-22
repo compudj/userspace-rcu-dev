@@ -747,6 +747,11 @@ int urcu_txn_store_mw(struct urcu_txn *txn, void **slot,
  * @slot (no concurrent writer), so the commit parks it with a plain store that
  * never fails.  A transaction with only store_sw() records never contention-
  * aborts.  Returns 0, or -ENOMEM (sticky).
+ *
+ * SW is a PROMISE of exclusion that must hold for @slot across EVERY writer, not
+ * just this one: a slot is SW xor MW, globally.  If any other transaction may
+ * store_mw() the same slot, this park races that CAS -- store_mw() it here too.
+ * See enum urcu_txn_kind in <urcu/rcu-txn-engine.h>.
  */
 static inline
 int urcu_txn_store_sw(struct urcu_txn *txn, void **slot,

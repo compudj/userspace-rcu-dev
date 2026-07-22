@@ -62,7 +62,15 @@
 
 #include "tap.h"
 
+/*
+ * The MW-dominates check trips the debug kind-mismatch assert by design, so it
+ * only runs (and only counts) when that assert is compiled out.
+ */
+#if defined(DEBUG_RCU) || defined(CONFIG_RCU_DEBUG)
 #define NR_TESTS	12
+#else
+#define NR_TESTS	13
+#endif
 #ifndef NR_WORKERS
 #define NR_WORKERS	8
 #endif
@@ -396,6 +404,25 @@ static void functional_checks(void)
 	}
 	(void) urcu_txn_commit(&txn);
 	urcu_txn_end(&txn);
+
+#if !defined(DEBUG_RCU) && !defined(CONFIG_RCU_DEBUG)
+	/*
+	 * Kind conflict on one slot resolves fail-safe to MW (CAS install), not
+	 * the plain SW park.  store_sw then store_mw on the same slot chains to
+	 * one record that MW dominates; a "concurrent" writer then changes the
+	 * slot, so the MW install CAS-checks the old and ABORTS -- where a blind
+	 * SW park would have silently clobbered the change and committed OK.
+	 */
+	sa = (void *) 0x100;
+	urcu_txn_begin(&txn);
+	urcu_txn_store_sw(&txn, &sa, (void *) 0x100, (void *) 0x110, TAG);
+	urcu_txn_store_mw(&txn, &sa, (void *) 0x110, (void *) 0x120, TAG);
+	sa = (void *) 0x130;			/* a concurrent writer changed the slot */
+	st = urcu_txn_commit(&txn);
+	urcu_txn_end(&txn);
+	ok(st == URCU_TXN_STATUS_ABORT && sa == (void *) 0x130,
+		"kind conflict on a slot resolves to MW: the CAS install aborts, not a blind SW park");
+#endif
 }
 
 int main(void)
