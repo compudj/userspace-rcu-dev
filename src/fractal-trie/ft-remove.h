@@ -1049,7 +1049,9 @@ int ft_detach_node(struct cds_ft *ft,
 		struct ft_detach_run *run,
 		struct ft_glue *retire_glue,
 		struct cds_ft_node *freeze_leaf,
-		long count_delta)
+		long count_delta,
+		struct ft_flip_txn *shared_txn,
+		bool record_only)
 {
 	struct cds_ft_metadata *metadata_stack[FT_MAX_DEPTH];
 	struct cds_ft_inode_flag *iter_node_flag;
@@ -2061,17 +2063,35 @@ int ft_detach_node(struct cds_ft *ft,
 			 * into ONE flip.  A txn no commit consumes is freed unused at
 			 * @end; the new -ENOMEM aborts before any side-effect.
 			 */
-			commit_txn = ft_flip_txn_create_bounded(
-				FT_REMOVE_COMMIT_REC_MAX_EDGES
-				+ 1 /* §4.B parent guard (Site 1 arms excl.) */
-				+ nr_to_free
-				+ (trailing_skip_cn_flag ? 1 : 0)
-				+ (retire_glue ? retire_glue->cap_free : 0)
-				+ (ft->rank_stats ? detach_depth + 1 : 0) /* nr_keys fold walk */
-				+ (freeze_leaf ? FT_HLIST_FREEZE_MAX_EDGES : 0));
-			if (!commit_txn) {
-				ret = -ENOMEM;
-				goto end;
+			if (record_only) {
+				/*
+				 * FOLD (coherent rekey one-decide writer): the caller's
+				 * SHARED mixed txn absorbs this SIMPLE-case detach's forward-
+				 * slot clear + nr_child-- (both MW -- BP survives unlocked, a
+				 * peer conflict aborts the fold clean) so they flip atomically
+				 * with the dst-attach + S_top COW the caller records into the
+				 * same txn; the caller runs the ONE commit and owns @commit_txn
+				 * (never freed here).  The caller pre-reserved it for the whole
+				 * fold.  Simple shape ONLY: BP > min_child (no orphan collapse,
+				 * no recompaction), so nr_to_free / retire_glue / freeze_leaf /
+				 * a recompact retire are all absent -- asserted below.
+				 */
+				assert(nr_to_free == 0 && !trailing_skip_cn_flag &&
+					!retire_glue && !freeze_leaf);
+				commit_txn = shared_txn;
+			} else {
+				commit_txn = ft_flip_txn_create_bounded(
+					FT_REMOVE_COMMIT_REC_MAX_EDGES
+					+ 1 /* §4.B parent guard (Site 1 arms excl.) */
+					+ nr_to_free
+					+ (trailing_skip_cn_flag ? 1 : 0)
+					+ (retire_glue ? retire_glue->cap_free : 0)
+					+ (ft->rank_stats ? detach_depth + 1 : 0) /* nr_keys fold walk */
+					+ (freeze_leaf ? FT_HLIST_FREEZE_MAX_EDGES : 0));
+				if (!commit_txn) {
+					ret = -ENOMEM;
+					goto end;
+				}
 			}
 			ret = ft_node_replace_ptr(ft,
 				detach_node_flag_ptr,
@@ -2212,7 +2232,7 @@ int ft_detach_node(struct cds_ft *ft,
 				ret = ft_remove_one_commit(ft, pub->slot,
 					pub->old_val, pub->new_val,
 					pub->state_meta,
-					fuse_cell, run, commit_txn, NULL);
+					fuse_cell, run, commit_txn, NULL, record_only);
 				commit_txn_used = (commit_txn != NULL);
 			}
 			/*
@@ -2536,11 +2556,19 @@ end:
 	/*
 	 * Free a pre-reserved commit txn that no commit consumed (reservation
 	 * succeeded but ft_node_replace_ptr recompacted / failed, or shape-D
-	 * fused with its own txn).  PREPARE state -> no grace period.
+	 * fused with its own txn).  PREPARE state -> no grace period.  Under
+	 * record_only @commit_txn IS the caller's SHARED txn -- never freed here
+	 * (the caller owns it and, on any bail, destroys it after re-descending).
 	 */
-	if (commit_txn && !commit_txn_used)
+	if (commit_txn && !commit_txn_used && !record_only)
 		ft_flip_txn_destroy(commit_txn);
-	/* Reclaim safely after replacement. */
+	/*
+	 * Reclaim safely after replacement.  Under record_only the SIMPLE shape
+	 * never recompacts (BP > min_child), so there is no old copy to free here;
+	 * a recompacting shape would strand its old node (the caller has not
+	 * committed the unlink yet) -- assert the simple-shape precondition.
+	 */
+	assert(!record_only || !old_recompacted_node);
 	if (old_recompacted_node) {
 		if (ret == -EAGAIN)
 			/*
@@ -3173,7 +3201,8 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 			ret = ft_detach_node(ft, head_slot,
 				ft_get_parent_slot(holder_meta, ft),
 				key_len, true, fuse_cell, pubp, NULL, NULL, node,
-				-1 /* leaf key removed: detach owns the -1 */);
+				-1 /* leaf key removed: detach owns the -1 */,
+				NULL, false);
 			/* @node's freeze rode the detach commit (freeze_leaf). */
 		} else {
 			/*
@@ -3310,7 +3339,7 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 					ret = ft_remove_one_commit(ft,
 						(struct cds_ft_inode_flag **) &holder_meta->external_nodes,
 						(struct cds_ft_inode_flag *) node, NULL,
-						NULL, dead_cell, NULL, txn, node);
+						NULL, dead_cell, NULL, txn, node, false);
 					if (ret == 0 && fuse_remove)
 						pub.armed = true;
 				} else {
@@ -3371,7 +3400,8 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 			ret = ft_detach_node(ft, head_slot,
 				ft_get_parent_slot(holder_meta, ft),
 				key_len, true, fuse_cell, pubp, NULL, NULL, node,
-				-1 /* leaf key removed: detach owns the -1 */);
+				-1 /* leaf key removed: detach owns the -1 */,
+				NULL, false);
 			/* @node's freeze rode the detach commit (freeze_leaf). */
 		} else {
 			/* Removing the head, duplicates remain: key count unchanged. */
@@ -3652,7 +3682,7 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 			ft_remove_one_commit(ft,
 				(struct cds_ft_inode_flag **) &metadata->external_nodes,
 				(struct cds_ft_inode_flag *) external_nodes, NULL,
-				NULL, dead, NULL, txn, NULL);
+				NULL, dead, NULL, txn, NULL, false);
 			if (dead)
 				ft_ord_cell_free(ft, dead);
 		} else {
@@ -3844,7 +3874,7 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 				ft_remove_one_commit(ft,
 					(struct cds_ft_inode_flag **) &holder_meta->external_nodes,
 					(struct cds_ft_inode_flag *) chain_head, NULL,
-					NULL, dead_cell, NULL, txn, NULL);
+					NULL, dead_cell, NULL, txn, NULL, false);
 				if (ft->ordered_list)
 					pub.armed = true;
 				ret = 0;
@@ -3878,7 +3908,8 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 		ret = ft_detach_node(ft, head_slot,
 			ft_get_parent_slot(holder_meta, ft), key_len, true,
 			dead_cell, ft->ordered_list ? &pub : NULL, NULL, NULL,
-			NULL, -1 /* leaf key removed: detach owns the -1 */);
+			NULL, -1 /* leaf key removed: detach owns the -1 */,
+			NULL, false);
 		if (!ret)
 			ft_chain_mark_removed_flip(ft, chain_head);
 	}

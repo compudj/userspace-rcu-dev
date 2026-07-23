@@ -805,6 +805,22 @@ enum urcu_txn_status ft_store_at_graft_point_commit(struct cds_ft *ft,
 		if (count_delta)
 			ft_flip_txn_record_count_parent(ft, st->glue->txn,
 				count_base, count_delta);
+		if (st->glue->record_only) {
+			/*
+			 * FOLD (coherent rekey one-decide writer): the whole dst-attach
+			 * (slot NULL -> S_top', any recompact retire, count) is now
+			 * recorded into the caller's SHARED txn; the caller runs the ONE
+			 * commit that also carries the src-unlink + S_top COW.  Simple
+			 * shape only -- no reserve recompaction (old_recompacted_node
+			 * NULL) and the caller owns the cells (run NULL) -- so there is no
+			 * post-commit free / run-arm to hoist here; leave st->glue->txn
+			 * intact for the caller and report the recorded outputs.
+			 */
+			assert(!st->old_recompacted_node && !run);
+			*attached_nf = st->attached;
+			*attached_depth = st->attached_depth;
+			return URCU_TXN_STATUS_OK;
+		}
 		cst = ft_flip_txn_commit(ft, st->glue->txn);
 		st->glue->txn = NULL;
 		if (run)
@@ -824,9 +840,13 @@ enum urcu_txn_status ft_store_at_graft_point_commit(struct cds_ft *ft,
 	/*
 	 * @st->glue's OLD nodes (the pre-recompact copies gathered on its
 	 * free list) are equally only reclaimable when the commit committed:
-	 * an aborted commit left them LIVE.  Gate on @cst.
+	 * an aborted commit left them LIVE.  Gate on @cst.  Under record_only
+	 * (the displaced branch above returns here without committing) the OLD
+	 * nodes stay LIVE until the CALLER's commit, so defer their free to the
+	 * caller's post-commit finalize -- freeing here would reclaim a
+	 * still-reachable node.
 	 */
-	if (cst == URCU_TXN_STATUS_OK)
+	if (!st->glue->record_only && cst == URCU_TXN_STATUS_OK)
 		ft_glue_free_old(ft, st->glue);
 	*attached_nf = st->attached;
 	*attached_depth = st->attached_depth;
@@ -3075,7 +3095,8 @@ retry_swap:
 			dret = ft_detach_node(dst_ft, d.nfp, d.pnfp, d.depth,
 					false, NULL, gs_ord ? &dpub : NULL,
 					gs_ord ? &drun : NULL, NULL, NULL,
-					-(long) old_count /* fold -old_count onto the detach commit */);
+					-(long) old_count /* fold -old_count onto the detach commit */,
+					NULL, false);
 			cds_ft_alloc_reserve_deactivate(dst_ft);
 #ifdef FEATURE_FT_MW_LOCK_FINE_DROP
 			/*

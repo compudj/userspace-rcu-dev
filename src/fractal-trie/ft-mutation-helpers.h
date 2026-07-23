@@ -2307,6 +2307,43 @@ enum urcu_txn_status ft_ord_cell_flip_into(struct cds_ft *ft,
 }
 
 /*
+ * RECORD-ONLY sibling of ft_ord_cell_flip_into: append @n heterogeneous edges to
+ * the caller's SHARED mixed txn @t WITHOUT committing, so the caller runs the ONE
+ * ft_flip_txn_commit that also carries the other side of a fold (the coherent
+ * rekey one-decide writer records the src-unlink -- through here -- and the
+ * dst-attach + S_top COW into the same @t, then commits once).
+ *
+ * ALL edges are recorded MW (ft_flip_txn_record_tag_mw), regardless of @t's
+ * structural_sw mode.  The src-unlink these edges express is the SIMPLE-case
+ * detach: the src junction (BP) SURVIVES with one fewer child and is NOT
+ * DLM-locked, so its forward-slot clear + nr_child-- are validated-CAS MW parks
+ * that abort the mixed commit CLEAN on a peer conflict (a concurrent structural
+ * touch of BP), exactly as today's standalone detach commit does -- and the
+ * caller re-descends.  Parking them SW would be a plain locked store on an
+ * UNLOCKED node (the 2a clobber).  The SW side of the fold -- the COW'd S_top'
+ * children re-parents + S_top retire + the dst forward publish -- holds its DLM
+ * COPYING locks and is recorded SW by ft_rekey_cow_stop / the graft committer,
+ * NOT here.  The cell / hlist edges are inherently MW anyway (lock-free list).
+ * The mixed commit installs these MW edges first (may abort), then parks the SW
+ * side just before the flip.  @t must be pre-reserved for >= @n edges (record
+ * cannot fail).  No commit here => the run-arm (ft_ord_cell_run_install) a
+ * self-committing flip does inline must be deferred by the caller to its
+ * post-commit finalize.
+ */
+static
+void ft_ord_cell_record_into(struct ft_flip_txn *t,
+		struct ft_ord_cell_edge *edges, unsigned int n)
+{
+	unsigned int i;
+
+	for (i = 0; i < n; i++)
+		ft_flip_txn_record_tag_mw(t, (void **) edges[i].slot,
+			(void *) edges[i].old_target,
+			(void *) edges[i].new_target,
+			ft_edge_tag(&edges[i]));
+}
+
+/*
  * Fallible self-allocating flip: returns 0, -ENOMEM with NOTHING installed, or
  * -EAGAIN with NOTHING installed (concurrent-writer commit ABORT -- the caller's
  * retry loop re-descends).  For an ABORTABLE caller -- the flip is the op's
@@ -2766,7 +2803,8 @@ int ft_remove_one_commit(struct cds_ft *ft,
 		struct ft_ord_cell *dead_cell,
 		struct ft_detach_run *run,
 		struct ft_flip_txn *txn,
-		struct cds_ft_node *freeze_leaf)
+		struct cds_ft_node *freeze_leaf,
+		bool record_only)
 {
 	struct ft_ord_cell_edge edges[7] = { 0 };	/* 1 struct + state + <=4 cell/run + leaf freeze */
 	unsigned int n = 0;
@@ -2827,9 +2865,26 @@ int ft_remove_one_commit(struct cds_ft *ft,
 				old - FT_STATE_NR_CHILD_ONE);
 			n++;
 		}
+		/*
+		 * FOLD (coherent rekey one-decide writer): record the SW structural
+		 * slot + nr_child-- + cell unsplice into the caller's SHARED mixed txn
+		 * and RETURN -- the caller runs the ONE ft_flip_txn_commit that also
+		 * carries the dst-attach (a cell/count MW-conflict aborts it clean
+		 * before any SW side effect, so the caller re-descends).  The run-arm
+		 * (ft_ord_cell_run_install) must FOLLOW that flip, so it is deferred to
+		 * the caller's post-commit finalize; the record-only detach fold today
+		 * covers only the simple case (internal S_top src junction), which
+		 * carries no head run -- asserted here until run-arm defer lands.
+		 */
+		if (record_only) {
+			assert(!run);
+			ft_ord_cell_record_into(txn, edges, n);
+			return 0;
+		}
 		if (ft_ord_cell_flip_into(ft, txn, edges, n) > 0)
 			return -EAGAIN;	/* peer won: nothing installed, caller retries */
 	} else {
+		assert(!record_only);	/* record-only requires a caller-supplied txn */
 		int cret = ft_ord_cell_flip_try(ft, edges, n);
 
 		if (cret)
@@ -3834,6 +3889,18 @@ struct ft_glue {
 	 */
 	bool fuse_free_list;
 	/*
+	 * FOLD (coherent rekey one-decide writer): when set, ft_glue_txn_commit_edges
+	 * RECORDS the dst-attach (live back-edges + forward publish + fenced retires +
+	 * cells + count) into @txn but does NOT commit it -- @txn is the caller's
+	 * SHARED mixed txn and the caller runs the ONE ft_flip_txn_commit that also
+	 * carries the src-unlink + S_top COW.  @txn is left intact (the caller owns and
+	 * commits it); the COPYING registrations (publish_parent release, split_cn
+	 * retire) stay in @txn so the caller's commit consumes them (and an abort
+	 * auto-clears them).  False (ft_glue_init default) keeps the self-committing
+	 * behaviour, byte-identical for every existing glue caller.
+	 */
+	bool record_only;
+	/*
 	 * Inline floor backing.  ft_glue_init points the three arrays
 	 * here; graft / graft_swap never outgrow it.  ft_glue_reserve
 	 * repoints to a malloc'd buffer when a count would exceed its floor.
@@ -3875,6 +3942,7 @@ void ft_glue_init(struct ft_glue *g)
 	g->attached_nf = NULL;
 	g->txn = NULL;
 	g->fuse_free_list = false;
+	g->record_only = false;
 	g->count_delta = 0;
 }
 
@@ -4667,6 +4735,19 @@ enum urcu_txn_status ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue 
 	if (g->count_delta)
 		ft_flip_txn_record_count_parent(ft, g->txn, g->publish_parent,
 			g->count_delta);
+
+	/*
+	 * FOLD (coherent rekey one-decide writer): the whole dst-attach is now
+	 * recorded into the caller's SHARED @txn; return WITHOUT committing so the
+	 * caller runs the ONE ft_flip_txn_commit that also carries the src-unlink +
+	 * S_top COW.  @g->txn is left intact (the caller owns and commits it); the
+	 * COPYING registrations planted above (publish_parent release, split_cn
+	 * retire) live in @txn -> the caller's commit consumes them, its abort
+	 * auto-clears them (ft_flip_txn_copying_clear_all).  Nothing is published
+	 * yet, so report OK.
+	 */
+	if (g->record_only)
+		return URCU_TXN_STATUS_OK;
 
 	/*
 	 * Commit WITHOUT an explicit install: ft_flip_txn_commit auto-installs a
