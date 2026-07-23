@@ -48,10 +48,16 @@
 
 #include "tap.h"
 
-#ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS 327
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+#define NR_TESTS_DLM 1		/* test_cow_stop_root_inplace */
 #else
-#define NR_TESTS 283
+#define NR_TESTS_DLM 0
+#endif
+
+#ifdef FEATURE_FT_FAULT_INJECT
+#define NR_TESTS (327 + NR_TESTS_DLM)
+#else
+#define NR_TESTS (283 + NR_TESTS_DLM)
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -566,6 +572,117 @@ static int test_writer_lock_mode_fine(void)
 	/* The drain drives the DEL recompacts, and verifies as it shrinks. */
 	return drain_and_destroy(ft, group);
 }
+
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+extern void *_cds_ft_debug_root(struct cds_ft *ft);
+extern int _cds_ft_debug_cow_replace_root(struct cds_ft *ft);
+
+/*
+ * Coherent-rekey sub-step 2: the S_top COW + interior re-parent primitive
+ * (ft_rekey_cow_stop) in ISOLATION, driven on the trie ROOT via the debug hook
+ * _cds_ft_debug_cow_replace_root -- build a fresh-address copy of the root,
+ * re-parent its children onto it, retire the old root, republish, as ONE mixed
+ * SW/MW commit (structural_sw) under the honor-COPYING primitives.
+ *
+ * Keys ((i<<24)) and ((i<<24)|1) for i in 0..COW_NG give a 4-byte key whose
+ * first descent byte is i, so the root BRANCHES (a popcount/pigeon node) with
+ * COW_NG metadata-bearing (compressed) children -- exercising the per-child
+ * COPYING mark + SW re-parent, not just external-head children.  Each replace
+ * must (a) succeed, (b) leave every key present with an unchanged count, and
+ * (c) MOVE the root to a fresh address (the identity change the reader's
+ * two-descent address-witness relies on); repeated so a later COW re-clones the
+ * previous copy.
+ */
+#define COW_NG	16
+static int test_cow_stop_root_inplace(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_fine_lock_ft(4, &group);
+	struct ft_test_node *n[COW_NG * 2];
+	unsigned long cnt;
+	int i, iter;
+
+	for (i = 0; i < COW_NG; i++) {
+		n[2 * i] = node_alloc((uint64_t) i << 24);
+		n[2 * i + 1] = node_alloc(((uint64_t) i << 24) | 1);
+	}
+
+	rcu_read_lock();
+	for (i = 0; i < COW_NG; i++) {
+		if (insert_u64(ft, (uint64_t) i << 24, n[2 * i]) != CDS_FT_STATUS_OK ||
+				insert_u64(ft, ((uint64_t) i << 24) | 1,
+					n[2 * i + 1]) != CDS_FT_STATUS_OK) {
+			rcu_read_unlock();
+			fprintf(stderr, "cow-stop: insert group %d failed\n", i);
+			drain_and_destroy(ft, group);
+			return -1;
+		}
+	}
+	cnt = cds_ft_count_entries(ft);
+	rcu_read_unlock();
+	if (cnt != COW_NG * 2) {
+		fprintf(stderr, "cow-stop: count %lu != %d after inserts\n",
+			cnt, COW_NG * 2);
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+
+	for (iter = 0; iter < 3; iter++) {
+		void *root_before, *root_after;
+		int rc;
+
+		rcu_read_lock();
+		root_before = _cds_ft_debug_root(ft);
+		rc = _cds_ft_debug_cow_replace_root(ft);
+		root_after = _cds_ft_debug_root(ft);
+		rcu_read_unlock();
+
+		if (rc != 0) {
+			fprintf(stderr, "cow-stop: replace iter %d rc=%d\n",
+				iter, rc);
+			drain_and_destroy(ft, group);
+			return -1;
+		}
+		if (root_after == root_before) {
+			fprintf(stderr, "cow-stop: root identity unchanged at iter %d "
+				"(%p) -- COW did not move it\n", iter, root_after);
+			drain_and_destroy(ft, group);
+			return -1;
+		}
+		/* No lock leaked at rest; the relocated structure is coherent. */
+		if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "cow-stop: verify failed after iter %d\n", iter);
+			drain_and_destroy(ft, group);
+			return -1;
+		}
+		rcu_read_lock();
+		if (cds_ft_count_entries(ft) != COW_NG * 2) {
+			rcu_read_unlock();
+			fprintf(stderr, "cow-stop: count changed after iter %d\n", iter);
+			drain_and_destroy(ft, group);
+			return -1;
+		}
+		for (i = 0; i < COW_NG; i++) {
+			struct cds_ft_node *f0 = NULL, *f1 = NULL;
+
+			if (lookup_u64(ft, (uint64_t) i << 24, &f0) != CDS_FT_STATUS_OK
+					|| f0 != &n[2 * i]->node
+					|| lookup_u64(ft, ((uint64_t) i << 24) | 1, &f1)
+						!= CDS_FT_STATUS_OK
+					|| f1 != &n[2 * i + 1]->node) {
+				rcu_read_unlock();
+				fprintf(stderr, "cow-stop: key group %d lost after iter %d\n",
+					i, iter);
+				drain_and_destroy(ft, group);
+				return -1;
+			}
+		}
+		rcu_read_unlock();
+	}
+
+	return drain_and_destroy(ft, group);
+}
+#endif /* FEATURE_FT_MW_DLM_ACQUIRE */
 
 /*
  * Insert keys crafted to force COMPRESSED-NODE SPLITS, the shape whose forward
@@ -26953,6 +27070,9 @@ int main(int argc, char **argv)
 	RUN_TEST(test_writer_lock_mode_fine_split);
 	RUN_TEST(test_writer_lock_mode_fine_graft);
 	RUN_TEST(test_writer_lock_mode_fine_crosstrie_busy);
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+	RUN_TEST(test_cow_stop_root_inplace);
+#endif
 #ifdef FEATURE_FT_FAULT_INJECT
 	RUN_TEST(test_rekey_coherence_fault_redescend);
 	RUN_TEST(test_split_oom_backpointer);

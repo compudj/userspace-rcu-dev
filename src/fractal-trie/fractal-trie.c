@@ -209,3 +209,99 @@ struct cds_ft_node *cds_ft_node_next_resolve(void *raw)
 {
 	return ft_hlist_resolve(raw);
 }
+
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+/*
+ * TEST/DEBUG (coherent-rekey sub-step 2, NOT public API): read the trie root as
+ * an opaque address, so a test can observe a COW relocation moved its identity.
+ */
+void *_cds_ft_debug_root(struct cds_ft *ft)
+{
+	return (void *) rcu_dereference(ft->root);
+}
+
+/*
+ * TEST/DEBUG (coherent-rekey sub-step 2, NOT public API): drive ft_rekey_cow_stop
+ * on the trie ROOT as a self-contained in-place clone -- build a fresh-address
+ * copy of the root, re-parent its children onto it, retire the old root, and
+ * republish at &ft->root, all as ONE mixed SW/MW commit.  This is the smallest
+ * complete consumer of the S_top COW primitive: the root has no parent to lock
+ * (its forward slot is auto-guarded by its own CAS), so it isolates the COW +
+ * interior re-parent + retire from the rest of a rekey stitch.
+ *
+ * SINGLE-WRITER use only (no concurrent root relocation).  Returns 0 (root now at
+ * a fresh address, contents unchanged), -EINVAL if the root is not an internal
+ * POPCOUNT/PIGEON node without a co-located external list (sub-step-2 scope), or a
+ * negative errno on a bail (not expected single-threaded).
+ */
+int _cds_ft_debug_cow_replace_root(struct cds_ft *ft)
+{
+	struct cds_ft_inode_flag *root = rcu_dereference(ft->root);
+	struct cds_ft_inode_flag *root_prime;
+	struct cds_ft_metadata *old_root_meta;
+	struct ft_flip_txn *txn;
+	struct cds_ft_metadata *marks[FT_ENTRY_PER_NODE + 1];
+	uintptr_t snaps[FT_ENTRY_PER_NODE + 1];
+	unsigned int nr_marks = 0, i, ti;
+	enum urcu_txn_status st;
+	int ret;
+
+	if (!root || ft_node_flip_proxy(root))
+		return -EINVAL;
+	ti = ft_node_type(root);
+	if (ft_types[ti].type_class != FT_POPCOUNT &&
+			ft_types[ti].type_class != FT_PIGEON)
+		return -EINVAL;
+	old_root_meta = cds_ft_item_to_metadata(ft_node_ptr(root));
+	if (old_root_meta->external_nodes)
+		return -EINVAL;			/* sub-step-2 scope */
+
+	txn = ft_flip_txn_create();
+	if (!txn)
+		return -ENOMEM;
+	ft_flip_txn_set_structural_sw(txn, true);
+
+	ret = ft_rekey_cow_stop(ft, txn, root, &root_prime, marks, snaps,
+			&nr_marks);
+	if (ret) {
+		ft_flip_txn_destroy(txn);	/* pre-commit bail: destroy caller-owned txn */
+		goto sweep;
+	}
+
+	/* Forward publish ft->root: root -> root' (SW; root slot self-guarded). */
+	if (!ft_flip_txn_reserve_extra(txn, 1)) {
+		free_cds_ft_node_unpublished(ft, ft_node_ptr(root_prime));
+		ft_flip_txn_destroy(txn);
+		ret = -ENOMEM;
+		goto sweep;
+	}
+	ft_flip_txn_record_reserved(txn, (void **) &ft->root, root, root_prime);
+
+	st = ft_flip_txn_commit(ft, txn);		/* consumes txn */
+	if (st == URCU_TXN_STATUS_OK) {
+		cds_ft_free_item_deferred(ft, old_root_meta);	/* old root freed after GP */
+		ret = 0;
+	} else {
+		/*
+		 * Abort (a peer won a raced slot): the SW parks never flipped, so
+		 * root_prime stayed unpublished -- reclaim it (its shared interior
+		 * children are untouched, still owned by the live old root).
+		 * Unreachable under the single-writer, all-SW, pre-reserved contract
+		 * here (the commit is deterministically OK), but kept leak-free for a
+		 * future concurrent reuse of this path.
+		 */
+		free_cds_ft_node_unpublished(ft, ft_node_ptr(root_prime));
+		ret = -EAGAIN;
+	}
+
+sweep:
+	/*
+	 * Clear any COPYING mark a successful commit did not consume (a no-op then,
+	 * a release on every mark on a bail/abort) -- the caller-owned sweep the
+	 * primitive's contract requires, since the marks are not txn-registered.
+	 */
+	for (i = 0; i < nr_marks; i++)
+		ft_meta_copying_clear_if_held(marks[i]);
+	return ret;
+}
+#endif /* FEATURE_FT_MW_DLM_ACQUIRE */

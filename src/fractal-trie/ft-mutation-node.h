@@ -2029,6 +2029,285 @@ abandon_fresh:
 	return ret;
 }
 
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+/*
+ * The metadata whose STATE WORD carries a child's parent_slot_offset -- the word
+ * an SW re-parent pso edge parks and that ft_meta_nr_child_inc CASes.  NULL for
+ * an external head (its back-edge is a plain parent pointer with no state word)
+ * and for a flip proxy (a resolved child is never one).  Mirrors
+ * ft_reparent_record's child-kind dispatch so the mark set matches the edges.
+ */
+static
+struct cds_ft_metadata *ft_child_state_meta(struct cds_ft *ft,
+		struct cds_ft_inode_flag *child_nf)
+{
+	if (!child_nf || ft_node_flip_proxy(child_nf))
+		return NULL;
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+	if (ft_node_skip_compressed(child_nf))
+		return cds_ft_item_to_metadata((struct cds_ft_inode *)
+				ft_skip_to_compressed(ft, child_nf));
+	if (ft_node_compressed(child_nf))
+		return cds_ft_item_to_metadata((struct cds_ft_inode *)
+				ft_compressed_node_ptr(child_nf));
+#endif
+	if (ft_node_external(child_nf))
+		return NULL;
+	return cds_ft_item_to_metadata(ft_node_ptr(child_nf));
+}
+
+/*
+ * ft_rekey_cow_stop: identity-preserving COW of a LIVE published node @stop_flag
+ * (the "S_top" of a same-trie rekey) into a FRESH-address copy returned UNPUBLISHED
+ * in *@stop_prime_ret, re-parenting @stop's direct children onto the copy and
+ * RETIRING @stop -- all as records in the caller's mixed SW/MW commit @txn.  The
+ * interior below @stop is SHARED (same child addresses), so only @stop's identity
+ * moves: exactly what the coherent reader's two-descent address-witness needs to
+ * detect a move.  Mirrors ft_node_recompact's RELOCATE copy/reparent core but
+ * (a) returns the copy for the CALLER to place (a rekey publishes it at the dst
+ * junction; the isolation test at @stop's own parent slot -- a same-position
+ * in-place clone), and (b) drives the SW mixed engine: @txn has structural_sw
+ * set, so the re-parents' parent-pointer + pso edges and the retire park SW
+ * (locked, cannot fail).
+ *
+ * SW SAFETY (why the parks cannot be clobbered): the parent-pointer edge is
+ * owned by @stop's lock (no peer re-homes a child of a COPYING-held parent); the
+ * pso and retire edges live in state words that ft_meta_nr_child_inc CASes
+ * IGNORING COPYING, so each such node is COPYING-MARKED here (@stop for the
+ * retire, every metadata-bearing child for its pso) and a peer's count CAS now
+ * HONORS the mark and spins (FT_STATE_INPLACE_WAIT_MASK) until this commit
+ * settles the word.  ft_reparent_record_meta's new_state has COPYING masked out,
+ * so the pso SW edge ALSO releases each child's mark at the flip; the retire
+ * consumes @stop's.  The interior stays SHARED, so children of children need no
+ * marks.
+ *
+ * CALLER CONTRACT:
+ *  - ft->lock_fine and ft_flip_txn_set_structural_sw(@txn, true) before calling.
+ *  - @marks / @snaps: caller-owned scratch of >= FT_ENTRY_PER_NODE + 1 entries;
+ *    *@nr_marks returns the count recorded (published incrementally so a bail is
+ *    covered).  These marks are NOT txn-registered (count can exceed
+ *    FT_FLIP_TXN_MAX_COPYING), so the CALLER MUST, after committing OR aborting
+ *    @txn, sweep ft_meta_copying_clear_if_held over marks[0..*@nr_marks) -- a
+ *    no-op for the COPYING a commit consumed via the retire / pso SW edges, a
+ *    release for any still held on abort (the ft_detach_node orphan-chain
+ *    pattern).
+ *  - On success (0): *@stop_prime_ret is the fresh UNPUBLISHED copy.  The caller
+ *    wires its parent back-edge and records the forward publish (and, for a real
+ *    rekey, clears @stop's src slot) into @txn before commit, and frees the OLD
+ *    @stop via call_rcu after the grace period once the commit succeeds.
+ *  - On failure (<0: -EAGAIN re-descend / -ENOMEM): *@stop_prime_ret is NULL, the
+ *    unpublished copy (if any) is already freed, nothing is published; the caller
+ *    still sweeps @marks.
+ *
+ * SUB-STEP-2 SCOPE: @stop is an internal POPCOUNT / PIGEON node with no
+ * co-located external list.  [sub-step-3 TODO: compressed / skip / external-head
+ * S_top -- the copy loop and external back-channel need recompact's extra arms.]
+ */
+static
+int ft_rekey_cow_stop(struct cds_ft *ft, struct ft_flip_txn *txn,
+		struct cds_ft_inode_flag *stop_flag,
+		struct cds_ft_inode_flag **stop_prime_ret,
+		struct cds_ft_metadata **marks, uintptr_t *snaps,
+		unsigned int *nr_marks)
+{
+	unsigned int ti = ft_node_type(stop_flag);
+	const struct cds_ft_type *type = &ft_types[ti];
+	struct cds_ft_inode *stop_node = ft_node_ptr(stop_flag);
+	struct cds_ft_metadata *stop_meta = cds_ft_item_to_metadata(stop_node);
+	struct cds_ft_inode *new_node = NULL;
+	struct cds_ft_metadata *new_meta;
+	struct cds_ft_inode_flag *new_flag;
+	bool new_init_done = false;
+	uintptr_t stop_snap;
+	unsigned int nm = 0, i;
+	int ret;
+
+	*stop_prime_ret = NULL;
+	*nr_marks = 0;
+	assert(ft->lock_fine && txn->structural_sw);
+	assert(type->type_class == FT_POPCOUNT || type->type_class == FT_PIGEON);
+	assert(stop_meta->external_nodes == NULL);	/* sub-step-2 scope */
+
+	/* 1. Acquire @stop's retire lock -- the fence BEFORE any body read. */
+	if (ft_meta_copying_mark(stop_meta, &stop_snap))
+		return -EAGAIN;
+	marks[nm] = stop_meta;
+	snaps[nm] = stop_snap;
+	nm++;
+	*nr_marks = nm;
+
+	/* <=2 edges/child (parent + pso) + 1 retire; caller reserves its publish. */
+	if (!ft_flip_txn_reserve_extra(txn,
+			2 * ft_meta_nr_child_load(stop_meta) + 1)) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	/* 2. Fresh same-type, same-capacity copy (zeroed; body rebuilt below). */
+	new_node = alloc_cds_ft_node(ft, type, &new_meta);
+	if (!new_node) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	new_flag = ft_node_flag(new_node, ti);
+	ft_nr_keys_store(ft, new_meta, ft_nr_keys_get(stop_meta), CMM_RELAXED);
+
+	/*
+	 * 3. Copy children @stop -> @stop', each source slot RESOLVED (frozen
+	 *    under @stop's fence) so a peer's parked flip proxy is never embedded.
+	 *    Verbatim positions -> identity-preserving; interior stays shared.
+	 */
+#define COW_IS_INIT(bv) ({						\
+	bool __i = false;						\
+	if (type->type_class == FT_POPCOUNT) {				\
+		__i = !new_init_done;					\
+		new_init_done = true;					\
+	}								\
+	__i;								\
+})
+	if (type->type_class == FT_POPCOUNT) {
+		uint8_t nc = ft_popcount_node_get_nr_child(type, stop_node);
+
+		for (i = 0; i < nc; i++) {
+			struct cds_ft_inode_flag *iter, **src_slot;
+			void *resolved;
+			uint8_t v;
+
+			ft_popcount_node_get_ith_pos(type, stop_node, i, &v, &iter);
+			if (!iter)
+				continue;
+			ft_node_get_nth_skip(stop_flag, &src_slot, v, FT_PF_NONE);
+			if (!ft_flip_txn_resolve_prio(txn, (void **) src_slot,
+					&resolved)) {
+				ret = -EAGAIN;
+				goto abandon;
+			}
+			iter = (struct cds_ft_inode_flag *) resolved;
+			if (!iter)
+				continue;
+			if (type->popcount_2l)
+				ret = ft_popcount_2l_node_set_nth(type, new_node,
+						new_meta, v, iter, COW_IS_INIT(v));
+			else if (type->popcount_1l)
+				ret = ft_popcount_1l_node_set_nth(type, new_node,
+						new_meta, v, iter, COW_IS_INIT(v));
+			else
+				ret = _ft_node_set_nth(ft, type, new_node, new_flag,
+						new_meta, v, iter, COW_IS_INIT(v), true);
+			assert(!ret);
+		}
+	} else {	/* FT_PIGEON */
+		for (i = 0; i < FT_ENTRY_PER_NODE; i++) {
+			struct cds_ft_inode_flag *iter, **src_slot;
+			void *resolved;
+
+			iter = ft_pigeon_node_get_ith_pos(type, stop_node, i);
+			if (!iter)
+				continue;
+			ft_node_get_nth_skip(stop_flag, &src_slot, (uint8_t) i,
+					FT_PF_NONE);
+			if (!ft_flip_txn_resolve_prio(txn, (void **) src_slot,
+					&resolved)) {
+				ret = -EAGAIN;
+				goto abandon;
+			}
+			iter = (struct cds_ft_inode_flag *) resolved;
+			if (!iter)
+				continue;
+			if (type->popcount_2l)
+				ret = ft_popcount_2l_node_set_nth(type, new_node,
+						new_meta, (uint8_t) i, iter,
+						COW_IS_INIT((uint8_t) i));
+			else if (type->popcount_1l)
+				ret = ft_popcount_1l_node_set_nth(type, new_node,
+						new_meta, (uint8_t) i, iter,
+						COW_IS_INIT((uint8_t) i));
+			else
+				ret = _ft_node_set_nth(ft, type, new_node, new_flag,
+						new_meta, i, iter,
+						COW_IS_INIT((uint8_t) i), true);
+			assert(!ret);
+		}
+	}
+#undef COW_IS_INIT
+
+	/*
+	 * 4. MARK each metadata-bearing child + record its SW re-parent onto
+	 *    @stop'.  Iterate the FRESH node's children (post-copy).  The mark must
+	 *    precede ft_reparent_record so its pso edge's new_state (COPYING masked
+	 *    out) releases the mark at the commit flip.
+	 */
+	if (type->type_class == FT_POPCOUNT) {
+		uint8_t nc = ft_popcount_node_get_nr_child(type, new_node);
+
+		for (i = 0; i < nc; i++) {
+			struct cds_ft_inode_flag *iter, **slot = NULL;
+			struct cds_ft_metadata *cm;
+			uint8_t v;
+
+			ft_popcount_node_get_ith_pos(type, new_node, i, &v, &iter);
+			if (!iter)
+				continue;
+			ft_node_get_nth_skip(new_flag, &slot, v, FT_PF_NONE);
+			cm = ft_child_state_meta(ft, iter);
+			if (cm) {
+				uintptr_t csnap;
+
+				if (ft_meta_copying_mark(cm, &csnap)) {
+					ret = -EAGAIN;
+					goto abandon;
+				}
+				marks[nm] = cm;
+				snaps[nm] = csnap;
+				nm++;
+				*nr_marks = nm;
+			}
+			ft_reparent_record(ft, txn, iter, new_flag, slot);
+		}
+	} else {	/* FT_PIGEON */
+		for (i = 0; i < FT_ENTRY_PER_NODE; i++) {
+			struct cds_ft_inode_flag *iter, **slot = NULL;
+			struct cds_ft_metadata *cm;
+
+			iter = ft_pigeon_node_get_ith_pos(type, new_node, i);
+			if (!iter)
+				continue;
+			ft_node_get_nth_skip(new_flag, &slot, (uint8_t) i, FT_PF_NONE);
+			cm = ft_child_state_meta(ft, iter);
+			if (cm) {
+				uintptr_t csnap;
+
+				if (ft_meta_copying_mark(cm, &csnap)) {
+					ret = -EAGAIN;
+					goto abandon;
+				}
+				marks[nm] = cm;
+				snaps[nm] = csnap;
+				nm++;
+				*nr_marks = nm;
+			}
+			ft_reparent_record(ft, txn, iter, new_flag, slot);
+		}
+	}
+
+	/*
+	 * 5. Retire @stop (SW fenced tombstone {COPYING|snap -> TOMBSTONE|snap}).
+	 *    A peer's ft_meta_nr_child_inc(@stop) now honors the mark and spins, so
+	 *    the SW park is not clobbered.  Not registered -- the caller's sweep
+	 *    owns clearing (marks[0]).
+	 */
+	ft_flip_txn_record_tombstone_copying(txn, stop_meta, stop_snap);
+
+	*stop_prime_ret = new_flag;
+	return 0;
+
+abandon:
+	free_cds_ft_node_unpublished(ft, new_node);
+out:
+	return ret;	/* marks[0..*nr_marks) swept by the caller */
+}
+#endif	/* FEATURE_FT_MW_DLM_ACQUIRE */
+
 /*
  * Return 0 on success or negative error value on error.
  *
