@@ -2228,10 +2228,25 @@ retry_merge:
 }
 
 /*
+ * Same-trie rekey mode threaded into ft_merge_at_inner.  FT_REKEY_NONE is a
+ * plain CROSS-trie cds_ft_merge_at (src_ft != dst_ft enforced at entry).
+ * FT_REKEY_MERGE / FT_REKEY_GRAFT are the cds_ft_rekey_merge / cds_ft_rekey_graft
+ * entry points (src_ft == dst_ft == the trie): GRAFT additionally REQUIRES an
+ * empty destination (POPULATED_ERROR otherwise, mirroring cds_ft_graft), MERGE
+ * unions into an occupied one (mirroring cds_ft_merge_at).
+ */
+enum ft_rekey_mode {
+	FT_REKEY_NONE = 0,
+	FT_REKEY_MERGE,
+	FT_REKEY_GRAFT,
+};
+
+/*
  * @pre_txn carries a flip-txn the caller reserved before its own last fallible
  * step, so the spine-copy / graft commit below draws an unfailable txn instead
- * of allocating one.  NULL on the public path (cds_ft_merge_at), set only by the
- * same-trie rekey, which pre-reserves it (sized from the O(1) subtree key counts:
+ * of allocating one.  NULL on the public paths (cds_ft_merge_at and the outer
+ * cds_ft_rekey_* call), set only by the same-trie rekey's post-detach re-merge,
+ * which pre-reserves it (sized from the O(1) subtree key counts:
  * the structural re-parent + folded ordered-list interleave, or the graft
  * cluster floor) so its post-detach merge cannot fail -- no reader-observable
  * rollback.  The consume site NULLs the slot it takes, so the rekey frees the
@@ -2241,7 +2256,7 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 		const uint8_t *dst_key, size_t dst_key_len,
 		struct cds_ft *src_ft,
 		const uint8_t *src_key, size_t src_key_len,
-		struct ft_flip_txn **pre_txn)
+		struct ft_flip_txn **pre_txn, enum ft_rekey_mode rekey)
 {
 	struct cds_ft *subtree = NULL;
 	enum cds_ft_status status;
@@ -2287,24 +2302,26 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
 	}
 	/*
-	 * Same-trie rekey (src_ft == dst_ft) is rejected when this trie reads
-	 * leaf-stored keys for result capture (speculative_key_offset_active):
-	 * the move re-parents each leaf under @dst_key WITHOUT rewriting its
-	 * app-owned stored key -- the library never writes that field -- so every
-	 * moved leaf would carry a key that no longer matches its structural
-	 * position, and a speculative lookup would then return the wrong key
-	 * (ft_verify_speculative_key catches this only under
-	 * FEATURE_FT_VERIFY_AT_MUTATION).  A CROSS-trie rekey routes the moved
-	 * leaves through a detach result that is forced EAGER (ft-detach.h), so
-	 * the app can re-stamp each leaf with its destination key before the data
-	 * is looked up speculatively; a same-trie move has no such staging seam --
-	 * one trie carries one speculative mode, and the moved leaves stay
-	 * reader-visible throughout -- so it cannot be made coherent and is
-	 * refused here rather than silently mis-stamped.  EAGER tries reconstruct
-	 * the key from structure and never read the stored field, so they are
-	 * unaffected.
+	 * merge_at is CROSS-TRIE only.  A same-trie move (src_ft == dst_ft) is a
+	 * REKEY -- expressed by cds_ft_rekey_graft / cds_ft_rekey_merge, which reach
+	 * this worker with @rekey set.  A same-trie cds_ft_merge_at (@rekey ==
+	 * FT_REKEY_NONE) is rejected; use the dedicated rekey entry points instead.
 	 */
-	if (src_ft == dst_ft && dst_ft->speculative_key_offset_active) {
+	if (rekey == FT_REKEY_NONE && src_ft == dst_ft) {
+		FT_TP(merge_exit, (int) CDS_FT_STATUS_INVALID_ARGUMENT_ERROR);
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	}
+	/*
+	 * A rekey on a SPECULATIVE (leaf-stored-key) trie is refused: the move
+	 * re-parents each leaf under @dst_key WITHOUT rewriting its app-owned stored
+	 * key -- the library never writes that field -- so every moved leaf would
+	 * carry a key that no longer matches its structural position, and a
+	 * speculative lookup would then return the wrong key
+	 * (ft_verify_speculative_key catches this only under
+	 * FEATURE_FT_VERIFY_AT_MUTATION).  Only EAGER tries -- which reconstruct the
+	 * key from structure and never read the stored field -- may rekey.
+	 */
+	if (rekey != FT_REKEY_NONE && dst_ft->speculative_key_offset_active) {
 		FT_TP(merge_exit, (int) CDS_FT_STATUS_INVALID_ARGUMENT_ERROR);
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
 	}
@@ -2387,7 +2404,7 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 	 * ordinal space (the key map is a per-position bijection).  Cross-trie
 	 * subtrees are disjoint by construction, so the guard is same-trie only.
 	 */
-	if (src_ft == dst_ft) {
+	if (rekey != FT_REKEY_NONE) {
 		size_t m = src_key_len < dst_key_len ? src_key_len : dst_key_len;
 
 		if (m == 0 || memcmp(okey_src, okey_dst, m) == 0) {
@@ -2431,7 +2448,7 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 	 * residual cn_s bytes -- ft_detach_keylen overshoots a compressed node, so
 	 * it must be handed a boundary key, not an interior one.
 	 */
-	if (src_ft == dst_ft) {
+	if (rekey != FT_REKEY_NONE) {
 		struct cds_ft *tmp = NULL;
 		const uint8_t *det_key = src_key, *mrg_key = dst_key;
 		size_t det_len = src_key_len, mrg_len = dst_key_len;
@@ -2494,6 +2511,17 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 		 */
 		(void) ft_merge_descend(dst_ft, omrg, omrg_len, &d_mrg, &off_mrg,
 			&m);
+
+		/*
+		 * cds_ft_rekey_graft: an occupied @dst_key (m > 0 keys at or below
+		 * the merge point) is refused, mirroring cds_ft_graft.  Checked
+		 * BEFORE any reservation or the detach, so the trie is byte-for-byte
+		 * untouched on refusal (no reader-visible mutation, nothing to free).
+		 */
+		if (rekey == FT_REKEY_GRAFT && m > 0) {
+			FT_TP(merge_exit, (int) CDS_FT_STATUS_POPULATED_ERROR);
+			return CDS_FT_STATUS_POPULATED_ERROR;
+		}
 
 		/*
 		 * Pre-reserve the merge's flip-txn HERE -- before the detach, where a
@@ -2596,7 +2624,7 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 		 * re-graft was the reader-observable rollback we removed.
 		 */
 		status = ft_merge_at_inner(dst_ft, mrg_key, mrg_len, tmp, NULL, 0,
-			&pf_txn);
+			&pf_txn, FT_REKEY_NONE);
 		cds_ft_alloc_reserve_deactivate(dst_ft);
 		cds_ft_alloc_reserve_deactivate(tmp);
 		assert(status == CDS_FT_STATUS_OK);
@@ -2955,10 +2983,38 @@ enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
 {
 #ifdef FEATURE_FT_MERGE
 	return ft_merge_at_inner(dst_ft, dst_key, dst_key_len, src_ft,
-			src_key, src_key_len, NULL);
+			src_key, src_key_len, NULL, FT_REKEY_NONE);
 #else
 	(void) dst_ft; (void) dst_key; (void) dst_key_len;
 	(void) src_ft; (void) src_key; (void) src_key_len;
+	return CDS_FT_STATUS_NOT_SUPPORTED;
+#endif
+}
+
+enum cds_ft_status cds_ft_rekey_graft(struct cds_ft *ft,
+		const uint8_t *dst_key, size_t dst_key_len,
+		const uint8_t *src_key, size_t src_key_len)
+{
+#ifdef FEATURE_FT_MERGE
+	return ft_merge_at_inner(ft, dst_key, dst_key_len, ft,
+			src_key, src_key_len, NULL, FT_REKEY_GRAFT);
+#else
+	(void) ft; (void) dst_key; (void) dst_key_len;
+	(void) src_key; (void) src_key_len;
+	return CDS_FT_STATUS_NOT_SUPPORTED;
+#endif
+}
+
+enum cds_ft_status cds_ft_rekey_merge(struct cds_ft *ft,
+		const uint8_t *dst_key, size_t dst_key_len,
+		const uint8_t *src_key, size_t src_key_len)
+{
+#ifdef FEATURE_FT_MERGE
+	return ft_merge_at_inner(ft, dst_key, dst_key_len, ft,
+			src_key, src_key_len, NULL, FT_REKEY_MERGE);
+#else
+	(void) ft; (void) dst_key; (void) dst_key_len;
+	(void) src_key; (void) src_key_len;
 	return CDS_FT_STATUS_NOT_SUPPORTED;
 #endif
 }

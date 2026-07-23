@@ -51,7 +51,7 @@
 #ifdef FEATURE_FT_FAULT_INJECT
 #define NR_TESTS 327
 #else
-#define NR_TESTS 282
+#define NR_TESTS 283
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -8738,12 +8738,12 @@ static int test_merge_rerooted_nosplit_ordered_branch(void)
 	return merge_rerooted_nosplit_ordered(1);
 }
 
-/* Rekey helper: cds_ft_merge_at(ft, new, ft, old) within one trie. */
+/* Rekey helper: cds_ft_rekey_merge(ft, new, old) within one trie. */
 static enum cds_ft_status ft_rekey(struct cds_ft *ft, const char *nw,
 		const char *old)
 {
-	return cds_ft_merge_at(ft, (const uint8_t *) nw, strlen(nw),
-			ft, (const uint8_t *) old, strlen(old));
+	return cds_ft_rekey_merge(ft, (const uint8_t *) nw, strlen(nw),
+			(const uint8_t *) old, strlen(old));
 }
 
 /*
@@ -8877,6 +8877,84 @@ out:
 }
 
 /*
+ * cds_ft_rekey_graft vs cds_ft_rekey_merge (the same-trie analogs of cds_ft_graft
+ * / cds_ft_merge_at): graft REQUIRES an empty destination -- an occupied one is
+ * refused with POPULATED_ERROR, leaving the trie byte-for-byte untouched -- while
+ * merge unions into it.  Also asserts a same-trie cds_ft_merge_at is now rejected
+ * (the dedicated rekey entry points must be used for an in-trie move).
+ */
+static int test_rekey_graft_vs_merge(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	int ret = -1;
+	enum cds_ft_status s;
+
+	ft = create_varlen_ft(&group);
+	rcu_read_lock();
+
+	/* "ax" subtree {axm,axn}; "bc" subtree {bcp} (an occupied graft target). */
+	cds_ft_insert(ft, (const uint8_t *) "axm", 3, &node_alloc(1)->node);
+	cds_ft_insert(ft, (const uint8_t *) "axn", 3, &node_alloc(2)->node);
+	cds_ft_insert(ft, (const uint8_t *) "bcp", 3, &node_alloc(3)->node);
+
+	/* graft "ax" -> ABSENT "az": succeeds, keys move. */
+	s = cds_ft_rekey_graft(ft, (const uint8_t *) "az", 2,
+			(const uint8_t *) "ax", 2);
+	if (s != CDS_FT_STATUS_OK ||
+	    cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK ||
+	    !ft_test_has_key(ft, "azm") || !ft_test_has_key(ft, "azn") ||
+	    ft_test_has_key(ft, "axm") || ft_test_has_key(ft, "axn")) {
+		fprintf(stderr, "rekey_graft: absent-dst graft failed (%s)\n",
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+
+	/* graft "az" -> OCCUPIED "bc": POPULATED_ERROR, trie unchanged. */
+	s = cds_ft_rekey_graft(ft, (const uint8_t *) "bc", 2,
+			(const uint8_t *) "az", 2);
+	if (s != CDS_FT_STATUS_POPULATED_ERROR ||
+	    cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK ||
+	    !ft_test_has_key(ft, "azm") || !ft_test_has_key(ft, "azn") ||
+	    !ft_test_has_key(ft, "bcp") ||
+	    ft_test_has_key(ft, "bcm") || ft_test_has_key(ft, "bcn")) {
+		fprintf(stderr, "rekey_graft: occupied-dst not refused (%s)\n",
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+
+	/* merge "az" -> OCCUPIED "bc": unions (bcp kept, bcm/bcn added). */
+	s = cds_ft_rekey_merge(ft, (const uint8_t *) "bc", 2,
+			(const uint8_t *) "az", 2);
+	if (s != CDS_FT_STATUS_OK ||
+	    cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK ||
+	    !ft_test_has_key(ft, "bcm") || !ft_test_has_key(ft, "bcn") ||
+	    !ft_test_has_key(ft, "bcp") ||
+	    ft_test_has_key(ft, "azm") || ft_test_has_key(ft, "azn")) {
+		fprintf(stderr, "rekey_merge: occupied-dst union failed (%s)\n",
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+
+	/* A same-trie cds_ft_merge_at is rejected (disjoint keys, so the only
+	 * reason is the src==dst cross-trie-only gate). */
+	if (cds_ft_merge_at(ft, (const uint8_t *) "de", 2,
+			ft, (const uint8_t *) "bc", 2)
+			!= CDS_FT_STATUS_INVALID_ARGUMENT_ERROR) {
+		fprintf(stderr, "merge_at: same-trie not rejected\n");
+		goto out;
+	}
+	ret = 0;
+out:
+	rcu_read_unlock();
+	drain_trie(ft);
+	rcu_barrier();
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
  * Same-trie ORDERED rekey into an OCCUPIED destination: drives the spine-copy
  * merge's ordered-list interleave through the SAME-TRIE pre-reserved flip batch
  * (the combined @pf_flip path -- structural re-parent + folded interleave in one
@@ -8917,8 +8995,8 @@ static int test_merge_rekey_same_trie_ordered(void)
 	cds_ft_insert(ft, (const uint8_t *) "qx", 2, &node_alloc(4)->node);
 	cds_ft_insert(ft, (const uint8_t *) "qy", 2, &node_alloc(5)->node);
 	/* "q" subtree {qm,qx,qy} merges onto the occupied "az" {azm,azq}. */
-	s = cds_ft_merge_at(ft, (const uint8_t *) "az", 2,
-			ft, (const uint8_t *) "q", 1);
+	s = cds_ft_rekey_merge(ft, (const uint8_t *) "az", 2,
+			(const uint8_t *) "q", 1);
 	rcu_read_unlock();
 	if (s != CDS_FT_STATUS_OK) {
 		fprintf(stderr, "rekey_ord: merge: %s\n",
@@ -23670,8 +23748,8 @@ static int run_merge_oom_rekey(int nr_faults)
 
 		cds_ft_fault_alloc_countdown = n;
 		rcu_read_lock();
-		s = cds_ft_merge_at(ft, (const uint8_t *)"az", 2,
-				ft, (const uint8_t *)"ax", 2);
+		s = cds_ft_rekey_merge(ft, (const uint8_t *)"az", 2,
+				(const uint8_t *)"ax", 2);
 		rcu_read_unlock();
 		cds_ft_fault_alloc_countdown = -1;
 
@@ -26657,6 +26735,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_merge_rerooted_nosplit_ordered_branch);
 	RUN_TEST(test_merge_rekey_same_trie);
 	RUN_TEST(test_merge_rekey_same_trie_speculative_rejected);
+	RUN_TEST(test_rekey_graft_vs_merge);
 	RUN_TEST(test_merge_rekey_same_trie_ordered);
 	RUN_TEST(test_merge_rekey_same_trie_listoff_collision);
 	RUN_TEST(test_nonidentity_bulk_ops);

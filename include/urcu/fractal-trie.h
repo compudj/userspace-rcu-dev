@@ -111,6 +111,14 @@
  *   attach point, so nothing is re-keyed; a zero-length key merges
  *   two whole tries at the root.
  *
+ * - Rekey (cds_ft_rekey_graft / cds_ft_rekey_merge) moves a subtree
+ *   to a new key WITHIN one trie -- the same-trie analog of graft and
+ *   merge-at (graft requires an empty destination; merge unions into an
+ *   occupied one). The source and destination keys must be disjoint, and
+ *   the trie must be EAGER (not speculative). Same-trie moves are their
+ *   own entry points because they are made coherent for concurrent
+ *   readers; cds_ft_merge_at is cross-trie only.
+ *
  * Root-level operations (key_len 0) work with both fixed-length
  * and variable-length key groups. Non-root operations (key_len
  * > 0) require a variable-length key group
@@ -1921,8 +1929,9 @@ enum cds_ft_status cds_ft_merge(struct cds_ft *dst_ft,
  *           @dst_key_len is 0.
  * @dst_key_len: Length of @dst_key in bytes.
  * @src_ft: Source Fractal Trie.  Must belong to the same group as
- *          @dst_ft.  May EQUAL @dst_ft (rekey within a trie -- see
- *          below).  May be in either exclusive or concurrent mode.
+ *          @dst_ft and must NOT equal @dst_ft -- a same-trie move is a
+ *          REKEY (see cds_ft_rekey_graft / cds_ft_rekey_merge).  May be
+ *          in either exclusive or concurrent mode.
  * @src_key: Source-side prefix selecting which @src_ft sub-trie to
  *           move.  May be NULL if @src_key_len is 0.
  * @src_key_len: Length of @src_key in bytes.
@@ -1938,31 +1947,14 @@ enum cds_ft_status cds_ft_merge(struct cds_ft *dst_ft,
  * partition rename) that cannot be expressed via the public
  * cds_ft_detach + cds_ft_graft pair on fixed-length groups.
  *
- * Cross-trie (@src_ft != @dst_ft): same whole-operation-atomic contract
- * as cds_ft_merge, with @src_key selecting the source subtree to move and
- * @dst_key serving as both the destination attach point and the prefix
- * that replaces @src_key on each moved key.
- *
- * Rekey within a trie (@src_ft == @dst_ft): moves the subtree at @src_key
- * to @dst_key in the same trie.  @src_key and @dst_key must be DISJOINT --
- * neither a prefix of the other (else the move would be circular);
- * otherwise CDS_FT_STATUS_INVALID_ARGUMENT_ERROR.  An occupied @dst_key is
- * MERGED into, as for cross-trie.  Unlike the cross-trie case the rekey is
- * NOT a single atomic transition: it proceeds in stages, so a concurrent
- * reader may briefly observe the moved keys as ABSENT (neither at @src_key
- * nor yet at @dst_key) -- it never observes a corrupt or out-of-namespace
- * key, and the per-key dst publish is itself atomic.  It never leaks.
- *
- * A same-trie rekey is REJECTED with CDS_FT_STATUS_INVALID_ARGUMENT_ERROR
- * when @dst_ft reads leaf-stored keys for result capture (created without
- * cds_ft_attr_set_speculative_keys(attr, false) in a speculative-key group):
- * the move re-parents each leaf under @dst_key but cannot rewrite its
- * app-owned stored key, leaving every moved leaf mis-stamped for its new
- * position.  A cross-trie rekey has a staging seam for the app to re-stamp
- * (the detached source is returned EAGER); a same-trie move does not, so it
- * is refused rather than silently corrupting speculative lookups.  Move
- * within an EAGER trie (speculative keys disabled), which reconstructs each
- * key from structure and never reads the stored field.
+ * @src_ft must differ from @dst_ft (cross-trie only): the operation has the
+ * same whole-operation-atomic contract as cds_ft_merge, with @src_key
+ * selecting the source subtree to move and @dst_key serving as both the
+ * destination attach point and the prefix that replaces @src_key on each
+ * moved key.  To move a subtree to a new key WITHIN one trie, use the
+ * dedicated rekey entry points cds_ft_rekey_graft (empty destination) /
+ * cds_ft_rekey_merge (union into an occupied destination); a same-trie
+ * cds_ft_merge_at is rejected with CDS_FT_STATUS_INVALID_ARGUMENT_ERROR.
  *
  * Returns the same statuses as cds_ft_merge.  In addition,
  * CDS_FT_STATUS_INVALID_ARGUMENT_ERROR is returned if either
@@ -1970,13 +1962,62 @@ enum cds_ft_status cds_ft_merge(struct cds_ft *dst_ft,
  * length; if -- for a fixed-length key group -- @dst_key_len !=
  * @src_key_len (a fixed-length group accepts only keys of its fixed
  * length, so the moved keys keep that length only when the source and
- * destination prefixes are equally long); if @src_ft == @dst_ft and
- * the two keys overlap (one is a prefix of the other); or if
- * @src_ft == @dst_ft and @dst_ft has speculative leaf keys active.
+ * destination prefixes are equally long); or if @src_ft == @dst_ft (a
+ * same-trie move must use cds_ft_rekey_graft / cds_ft_rekey_merge).
  */
 enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
 		const uint8_t *dst_key, size_t dst_key_len,
 		struct cds_ft *src_ft,
+		const uint8_t *src_key, size_t src_key_len);
+
+/*
+ * cds_ft_rekey_graft - Move a subtree to a new, unoccupied key within one trie.
+ * @ft: Fractal Trie to rekey in place.
+ * @dst_key: Destination prefix -- the new key position.  Must be ABSENT
+ *           (no content at or below it), else CDS_FT_STATUS_POPULATED_ERROR.
+ * @dst_key_len: Length of @dst_key in bytes.
+ * @src_key: Source prefix selecting the subtree to move.
+ * @src_key_len: Length of @src_key in bytes.
+ *
+ * Moves @ft's content under @src_key to @dst_key within the SAME trie: each
+ * moved key K = @src_key || S becomes @dst_key || S.  This is the same-trie
+ * analog of cds_ft_graft (the destination must be empty) as cds_ft_merge_at is
+ * of cds_ft_merge.  @src_key and @dst_key must be DISJOINT -- neither a prefix
+ * of the other (else the move would be circular).
+ *
+ * The trie must be EAGER (not created with speculative leaf keys): a move
+ * re-parents each leaf under @dst_key but cannot rewrite its app-owned stored
+ * key, so a speculative trie is refused with CDS_FT_STATUS_INVALID_ARGUMENT_ERROR.
+ *
+ * Returns CDS_FT_STATUS_OK (including when @src_key is absent -- a no-op),
+ * CDS_FT_STATUS_POPULATED_ERROR if @dst_key is occupied, CDS_FT_STATUS_MEMORY_ERROR,
+ * or CDS_FT_STATUS_INVALID_ARGUMENT_ERROR (NULL @ft, a key length exceeding the
+ * group maximum, unequal key lengths on a fixed-length group, overlapping keys,
+ * or a speculative trie), CDS_FT_STATUS_OVERFLOW_ERROR (a moved key would exceed
+ * the group maximum length).
+ */
+enum cds_ft_status cds_ft_rekey_graft(struct cds_ft *ft,
+		const uint8_t *dst_key, size_t dst_key_len,
+		const uint8_t *src_key, size_t src_key_len);
+
+/*
+ * cds_ft_rekey_merge - Move a subtree to a new key within one trie, unioning
+ *                      into any content already at the destination.
+ * @ft: Fractal Trie to rekey in place.
+ * @dst_key: Destination prefix -- the new key position.  May already hold
+ *           content: the moved subtree is unioned into it and same-key
+ *           duplicate chains are concatenated (as cds_ft_merge_at does).
+ * @dst_key_len: Length of @dst_key in bytes.
+ * @src_key: Source prefix selecting the subtree to move.
+ * @src_key_len: Length of @src_key in bytes.
+ *
+ * The merge (occupied-destination) counterpart of cds_ft_rekey_graft, standing
+ * to it as cds_ft_merge_at stands to cds_ft_graft.  Same disjoint-key and EAGER
+ * requirements.  Returns the same statuses as cds_ft_rekey_graft except it never
+ * returns CDS_FT_STATUS_POPULATED_ERROR (an occupied @dst_key is merged into).
+ */
+enum cds_ft_status cds_ft_rekey_merge(struct cds_ft *ft,
+		const uint8_t *dst_key, size_t dst_key_len,
 		const uint8_t *src_key, size_t src_key_len);
 
 /*
@@ -2780,8 +2821,8 @@ enum cds_ft_status cds_ft_attr_set_speculative_keys(struct cds_ft_attr *attr,
  * cds_ft_attr_set_rekey_coherence - Per-trie opt-in to in-trie rekey coherence.
  * @attr: Fractal Trie attributes.
  * @enabled: true -- readers on this trie tolerate a CONCURRENT in-trie rekey
- *           (a cds_ft_merge_at that moves a live subtree to a new key within
- *           the same trie).  false (default) -- readers do not.
+ *           (a cds_ft_rekey_graft / cds_ft_rekey_merge that moves a live subtree
+ *           to a new key within the same trie).  false (default) -- readers do not.
  *
  * A rekey moves a subtree from one key prefix to another.  Without this,
  * a reader whose descent races the move can be torn -- it can land on a leaf

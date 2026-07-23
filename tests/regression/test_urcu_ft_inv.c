@@ -10211,8 +10211,8 @@ static void *inv_rekey_writer(void *arg)
 		enum cds_ft_status s;
 
 		pthread_mutex_lock(&ctx->lock);
-		s = cds_ft_merge_at(ctx->dst, (const uint8_t *) "az", 2,
-				ctx->dst, (const uint8_t *) "ax", 2);
+		s = cds_ft_rekey_graft(ctx->dst, (const uint8_t *) "az", 2,
+				(const uint8_t *) "ax", 2);
 		pthread_mutex_unlock(&ctx->lock);
 		if (s != CDS_FT_STATUS_OK) {
 			fprintf(stderr, "inv_rekey writer ax->az: %s\n",
@@ -10221,8 +10221,8 @@ static void *inv_rekey_writer(void *arg)
 		}
 		rcu_quiescent_state();
 		pthread_mutex_lock(&ctx->lock);
-		s = cds_ft_merge_at(ctx->dst, (const uint8_t *) "ax", 2,
-				ctx->dst, (const uint8_t *) "az", 2);
+		s = cds_ft_rekey_graft(ctx->dst, (const uint8_t *) "ax", 2,
+				(const uint8_t *) "az", 2);
 		pthread_mutex_unlock(&ctx->lock);
 		if (s != CDS_FT_STATUS_OK) {
 			fprintf(stderr, "inv_rekey writer az->ax: %s\n",
