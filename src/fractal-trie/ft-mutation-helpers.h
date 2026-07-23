@@ -257,6 +257,21 @@ struct ft_flip_txn {
 	 */
 	struct cds_ft_metadata *copying[FT_FLIP_TXN_MAX_COPYING];
 	unsigned int nr_copying;
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+	/*
+	 * MIXED sw/mw commit (DLM lock_fine): when true, the STRUCTURAL record
+	 * helpers (every ft_flip_txn_record_tag edge) plant SW-kind records -- a
+	 * plain locked park that CANNOT fail -- because the op holds the DLM
+	 * COPYING lock over each of those slots, so no peer mutates them.  The
+	 * genuinely-unlocked edges (the ordered-cell interleave, the duplicate-
+	 * chain splices, the rank-count propagation up unlocked ancestors) opt
+	 * back out to MW via ft_flip_txn_record_tag_mw.  The mixed commit then
+	 * installs the MW edges FIRST (they can conflict -> a clean abort with
+	 * ZERO structural parks) and parks the SW structure last, just before the
+	 * flip.  Default false keeps every non-opted-in op all-MW == byte-identical.
+	 */
+	bool structural_sw;
+#endif
 };
 
 /*
@@ -312,6 +327,9 @@ struct ft_flip_txn *ft_flip_txn_create(void)
 	urcu_txn_expect_conflict(t->mtxn);
 	t->reserved = false;		/* unbounded: @mtxn grows as edges record */
 	t->nr_copying = 0;
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+	t->structural_sw = false;	/* all-MW until a caller opts in under lock_fine */
+#endif
 	return t;
 }
 
@@ -373,6 +391,9 @@ struct ft_flip_txn *ft_flip_txn_create_bounded(unsigned int cap)
 	}
 	t->reserved = true;
 	t->nr_copying = 0;
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+	t->structural_sw = false;	/* all-MW until a caller opts in under lock_fine */
+#endif
 	return t;
 }
 
@@ -413,6 +434,9 @@ struct ft_flip_txn *ft_flip_txn_create_bounded_on(struct urcu_txn *op,
 	}
 	t->reserved = true;
 	t->nr_copying = 0;
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+	t->structural_sw = false;	/* all-MW until a caller opts in under lock_fine */
+#endif
 	return t;
 }
 
@@ -771,10 +795,59 @@ void ft_flip_txn_record_tag(struct ft_flip_txn *t, void **slot,
 
 	FT_TP(edge_record, (const void *) t->mtxn, (const void *) slot,
 		(const void *) old_ptr, (const void *) new_ptr, tag);
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+	/*
+	 * MIXED sw/mw: a STRUCTURAL edge parks SW when the op holds the DLM lock
+	 * over @slot (structural_sw set by the caller under lock_fine) -- a plain
+	 * locked park, installed after the MW edges, that cannot fail.  Otherwise
+	 * (every other op, non-lock_fine) it is MW == the all-MW behaviour.
+	 */
+	if (t->structural_sw)
+		ret = urcu_txn_store_sw(t->mtxn, slot, old_ptr, new_ptr, tag);
+	else
+#endif
+		ret = urcu_txn_store_mw(t->mtxn, slot, old_ptr, new_ptr, tag);
+	assert(!ret);
+	(void) ret;	/* reserved up front -> never fails */
+}
+
+/*
+ * Record an edge that is ALWAYS MW-kind, regardless of the txn's structural_sw
+ * mode: the genuinely-unlocked slots -- the ordered-cell interleave edges, the
+ * duplicate-chain splices, the rank-count propagation up unlocked ancestors.
+ * Under the mixed commit these install FIRST and may conflict (a clean abort);
+ * the SW structure parks only after they all succeed.  Identical to
+ * ft_flip_txn_record_tag whenever structural_sw is false, so switching a
+ * non-lock_fine site to it is byte-neutral.
+ */
+static inline
+void ft_flip_txn_record_tag_mw(struct ft_flip_txn *t, void **slot,
+		void *old_ptr, void *new_ptr, uintptr_t tag)
+{
+	int ret;
+
+	FT_TP(edge_record, (const void *) t->mtxn, (const void *) slot,
+		(const void *) old_ptr, (const void *) new_ptr, tag);
 	ret = urcu_txn_store_mw(t->mtxn, slot, old_ptr, new_ptr, tag);
 	assert(!ret);
 	(void) ret;	/* reserved up front -> never fails */
 }
+
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+/*
+ * MIXED sw/mw: opt @t's structural edges into SW-kind parks.  A caller holding
+ * the DLM COPYING locks over the slots it structurally rewrites calls this right
+ * after creating its commit txn, so the forward publish, the re-parents, the
+ * lock releases and the retires all park SW (locked, cannot fail) while the cell
+ * / count edges stay MW.  A no-op (false) leaves the txn all-MW.  Must be set
+ * BEFORE the first structural record.
+ */
+static inline
+void ft_flip_txn_set_structural_sw(struct ft_flip_txn *t, bool v)
+{
+	t->structural_sw = v;
+}
+#endif
 
 static inline
 void ft_flip_txn_record_reserved(struct ft_flip_txn *t, void **slot,
@@ -3361,7 +3434,14 @@ void ft_flip_txn_record_count_parent(struct cds_ft *ft, struct ft_flip_txn *t,
 		unsigned long old_raw = ft_nr_keys_get(m) << 1;
 		unsigned long new_raw = (ft_nr_keys_get(m) + delta) << 1;
 
-		ft_flip_txn_record_tag(t, (void **) &m->nr_keys,
+		/*
+		 * The count propagates up UNLOCKED ancestors, so a peer writer
+		 * may race a count on the same word: keep these MW so the CAS
+		 * detects it and a mixed commit aborts cleanly (re-descend), never
+		 * an SW park that would clobber the peer's delta.  Byte-identical
+		 * to record_tag while no caller has opted structural_sw in.
+		 */
+		ft_flip_txn_record_tag_mw(t, (void **) &m->nr_keys,
 			(void *) old_raw, (void *) new_raw,
 			FT_NR_KEYS_PROXY_TAG);
 		cur = m->parent;
