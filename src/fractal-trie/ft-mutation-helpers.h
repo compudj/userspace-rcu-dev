@@ -1495,17 +1495,22 @@ void ft_state_edge(struct ft_ord_cell_edge *edge, uintptr_t *state_slot,
  */
 static inline
 void ft_meta_state_transition(struct cds_ft_metadata *meta,
-		uintptr_t (*f)(uintptr_t))
+		uintptr_t (*f)(uintptr_t), uintptr_t wait_mask)
 {
 	for (;;) {
 		uintptr_t s = CMM_LOAD_SHARED(meta->state);
 
-		if (caa_unlikely(s & FT_STATE_PROXY)) {
+		if (caa_unlikely(s & wait_mask)) {
 			/*
 			 * Bounded by the latch owner's settle (owner-only; a
 			 * writer dying mid-install would wedge this, but
 			 * writer death mid-mutation is already fatal to the
-			 * trie by contract).
+			 * trie by contract).  @wait_mask is FT_STATE_PROXY for a
+			 * self-contained one-way mark (tombstone) and
+			 * FT_STATE_INPLACE_WAIT_MASK for the nr_child count edge,
+			 * which under a DLM build must also wait out a peer's
+			 * COPYING lock so its SW-parked state edge is not
+			 * clobbered (see FT_STATE_INPLACE_WAIT_MASK).
 			 */
 			caa_cpu_relax();
 			continue;
@@ -1542,7 +1547,8 @@ uintptr_t ft_state_f_tombstone(uintptr_t s)
 static
 void ft_meta_nr_child_dec_flip(struct cds_ft_metadata *meta)
 {
-	ft_meta_state_transition(meta, ft_state_f_nr_child_dec);
+	ft_meta_state_transition(meta, ft_state_f_nr_child_dec,
+			FT_STATE_INPLACE_WAIT_MASK);
 }
 
 /*
@@ -1560,7 +1566,7 @@ void ft_meta_nr_child_dec_flip(struct cds_ft_metadata *meta)
 static
 void ft_meta_tombstone_set_flip(struct cds_ft_metadata *meta)
 {
-	ft_meta_state_transition(meta, ft_state_f_tombstone);
+	ft_meta_state_transition(meta, ft_state_f_tombstone, FT_STATE_PROXY);
 }
 
 /*

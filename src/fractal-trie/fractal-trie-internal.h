@@ -879,6 +879,45 @@ struct ft_pub_rec {
 					(FT_STATE_PSO_SHIFT + FT_STATE_PSO_BITS))
 #define FT_STATE_TAG_MASK		(FT_STATE_PROXY | FT_STATE_TOMBSTONE)
 
+/*
+ * FT_STATE_INPLACE_WAIT_MASK: the state-word bits on which the standalone
+ * in-place CAS primitives (ft_meta_nr_child_inc / _dec, ft_meta_nr_child_dec_flip
+ * via ft_meta_state_transition, ft_meta_parent_slot_offset_set) must WAIT (spin
+ * + re-derive) rather than CAS blindly, because a concurrent writer is
+ * mid-operation on the word:
+ *   - FT_STATE_PROXY: an engine MCAS flip is parked here (the word holds a record
+ *     pointer, not a plain state); CASing would write f(latch-pointer) back.
+ *     Always waited out, in every build.
+ *   - FT_STATE_COPYING (DLM builds only): a peer holds the per-node writer lock
+ *     and may be SW-parking this word (a retire / lock release / re-home) in an
+ *     in-flight mixed sw/mw commit.  An SW park is a plain store that never
+ *     validates, so a racing CAS here would clobber it (<urcu/rcu-txn.h>: "if any
+ *     other transaction may store_mw() the same slot, this park races that CAS").
+ *     Waiting for the holder's commit to settle the word first, then CASing onto
+ *     the settled value, is correct: after a RELEASE the word is the pre-lock
+ *     snapshot (a legitimate +/-1 lands correctly); after a RETIRE the word is
+ *     TOMBSTONE|snap (a harmless bump on an about-to-be-freed node, and the
+ *     racing op's own §4.B guard then aborts and re-descends past the dead node).
+ *
+ * INVARIANT this relies on (exhaustively audited 2026-07-23): NO op calls these
+ * standalone primitives on a node it ITSELF holds COPYING on.  A COPYING-held
+ * node's count / offset change always rides the flip-txn as a RECORDED edge
+ * (ft_state_edge / ft_flip_txn_record_release_copying / ft_flip_txn_record_count_
+ * parent), never these primitives -- so the spin is on a PEER's lock only and
+ * cannot self-deadlock.  A future guard->lock conversion that routes a locked
+ * node's nr_child through these standalone primitives (instead of a recorded
+ * edge) would break this and must not be done.
+ *
+ * Non-DLM builds exclude COPYING so the optimistic MW path -- where COPYING is
+ * only the recompact copy fence, resolved by the MW expected-old rather than
+ * honored as a lock -- stays byte-identical.
+ */
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+#define FT_STATE_INPLACE_WAIT_MASK	(FT_STATE_PROXY | FT_STATE_COPYING)
+#else
+#define FT_STATE_INPLACE_WAIT_MASK	(FT_STATE_PROXY)
+#endif
+
 struct cds_ft_metadata {
 	/* 8-byte aligned fields. */
 	struct cds_ft_inode_flag *parent;	/*
@@ -1018,7 +1057,7 @@ void ft_meta_nr_child_inc(struct cds_ft_metadata *meta)
 	for (;;) {
 		uintptr_t s = CMM_LOAD_SHARED(meta->state);
 
-		if (caa_unlikely(s & FT_STATE_PROXY)) {
+		if (caa_unlikely(s & FT_STATE_INPLACE_WAIT_MASK)) {
 			caa_cpu_relax();
 			continue;
 		}
@@ -1034,7 +1073,7 @@ void ft_meta_nr_child_dec(struct cds_ft_metadata *meta)
 	for (;;) {
 		uintptr_t s = CMM_LOAD_SHARED(meta->state);
 
-		if (caa_unlikely(s & FT_STATE_PROXY)) {
+		if (caa_unlikely(s & FT_STATE_INPLACE_WAIT_MASK)) {
 			caa_cpu_relax();
 			continue;
 		}
@@ -1097,7 +1136,7 @@ void ft_meta_parent_slot_offset_set(struct cds_ft_metadata *meta, unsigned int o
 		uintptr_t s = CMM_LOAD_SHARED(meta->state);
 		uintptr_t n;
 
-		if (caa_unlikely(s & FT_STATE_PROXY)) {
+		if (caa_unlikely(s & FT_STATE_INPLACE_WAIT_MASK)) {
 			caa_cpu_relax();
 			continue;
 		}
