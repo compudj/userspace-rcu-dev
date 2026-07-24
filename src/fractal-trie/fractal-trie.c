@@ -304,4 +304,299 @@ sweep:
 		ft_meta_copying_clear_if_held(marks[i]);
 	return ret;
 }
+
+/*
+ * TEST/DEBUG (coherent-rekey sub-step 3, NOT public API): descend @key (converted
+ * to ordinal) and return the node flag AT that key as an opaque address, so a test
+ * can observe that a rekey moved the moved-subtree top (S_top) to a FRESH address.
+ * NULL if the key is absent or its path traverses a non-plain-internal node.
+ */
+void *_cds_ft_debug_child_at(struct cds_ft *ft, const uint8_t *key,
+		size_t key_len)
+{
+	uint8_t ord[FT_MAX_KEY_LEN];
+	struct ft_descent d;
+	const uint8_t *ik = ord;
+
+	if (key_len == 0 || key_len > FT_MAX_KEY_LEN)
+		return NULL;
+	ft_key_to_ordinals(ord, key, key_len, &ft->group->key_map);
+	ft_descent_init(&d, ft);
+	while (d.depth < key_len) {
+		if (!d.nf || ft_node_external(d.nf) || ft_node_compressed(d.nf))
+			return NULL;
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+		if (ft_node_skip_compressed(d.nf))
+			return NULL;
+#endif
+		ft_descent_step(ft, &d, *(ik++));
+	}
+	return (void *) d.nf;
+}
+
+/*
+ * TEST/DEBUG (coherent-rekey sub-step 3, NOT public API): the SIMPLEST complete
+ * one-decide rekey-graft -- move the subtree "S_top" hanging at @src_key to the
+ * ABSENT @dst_key, as ONE mixed SW/MW flip-txn: COW S_top to a fresh S_top' (SW
+ * re-parents + retire, locked), graft S_top' at the dst point (MW forward publish,
+ * dst parent unlocked), and clear the src slot (MW detach, unlocked) -- all
+ * recorded into one txn and committed once, so a reader sees the subtree at src
+ * XOR dst atomically.  This is the analog of _cds_ft_debug_cow_replace_root for
+ * the full stitch, scoped to the simplest shape so it needs no cell / GLUE / merge
+ * machinery:
+ *   - S_top is a plain internal POPCOUNT/PIGEON node with no co-located external
+ *     list (ft_rekey_cow_stop's sub-step-2 scope), hanging at @src_key.
+ *   - the SRC JUNCTION BP (= S_top's parent) and the DST PARENT SHARE A PARENT
+ *     (d_src.ppnf == d_dst.ppnf) -- the enforced precondition of the
+ *     src_parent_held reuse (see the shape gate below).  In the default,
+ *     concurrent-safe build EVERY popcount delete recompacts, so BP is rebuilt on
+ *     the removal and republished into that shared parent; the graft's dst-parent
+ *     recompaction COPYING-holds that same shared parent FIRST, so the detach's BP
+ *     recompaction REUSES the held lock instead of re-acquiring it.
+ *   - @dst_key is ABSENT and reached by a NOSPLIT graft into a spare slot with
+ *     append room (no compressed-divergence GLUE split).
+ *   - the trie's ordered list is OFF (no boundary cells to re-splice).
+ * structural_sw STAYS TRUE the whole txn: cow_stop's S_top edges, the graft's
+ * dst-parent recompaction, and the detach's BP recompaction all hold their DLM
+ * COPYING locks (BP's shared parent via src_parent_held), so every structural edge
+ * is legitimately SW; the mixed engine still sorts the (MW) count edges first.
+ *
+ * @src_key / @dst_key are APPLICATION keys (converted to ordinal internally); for
+ * a fixed-length group @src_len must equal @dst_len.
+ *
+ * SINGLE-WRITER use only.  Returns 0, or -EINVAL if the controlled shape above is
+ * not met, or a negative errno on a bail (not expected single-threaded).
+ */
+int _cds_ft_debug_rekey_graft_simple(struct cds_ft *ft,
+		const uint8_t *src_key, size_t src_len,
+		const uint8_t *dst_key, size_t dst_len)
+{
+	uint8_t src_ord[FT_MAX_KEY_LEN], dst_ord[FT_MAX_KEY_LEN];
+	struct cds_ft_inode_flag *s_top, *s_top_prime = NULL, *attached_nf = NULL;
+	struct cds_ft_metadata *s_top_meta, *bp_meta;
+	struct ft_detach_recompact_out detach_rc = { 0 };
+	struct ft_flip_txn *txn;
+	struct ft_glue glue;
+	struct ft_graft_store_state gst_st;
+	struct ft_descent d_src, d_dst;
+	struct cds_ft_alloc_reserve reserve;
+	struct ft_remove_pub pub = { .armed = false };
+	struct cds_ft_metadata *marks[FT_ENTRY_PER_NODE + 1];
+	uintptr_t snaps[FT_ENTRY_PER_NODE + 1];
+	const uint8_t *ik;
+	unsigned int nr_marks = 0, adepth = 0, i, ti;
+	enum ft_graft_prep prep;
+	enum cds_ft_status gst;
+	enum urcu_txn_status gcst = URCU_TXN_STATUS_OK, st;
+	unsigned long cnt;
+	int ret;
+
+	if (!ft->lock_fine || src_len == 0 || dst_len == 0 ||
+			src_len > FT_MAX_KEY_LEN || dst_len > FT_MAX_KEY_LEN)
+		return -EINVAL;
+	ft_key_to_ordinals(src_ord, src_key, src_len, &ft->group->key_map);
+	ft_key_to_ordinals(dst_ord, dst_key, dst_len, &ft->group->key_map);
+
+	/*
+	 * Descend src to S_top through plain internal nodes, capturing (nfp, pnfp,
+	 * depth) so ft_detach_node can bootstrap the src-slot clear + BP nr_child--.
+	 */
+	ft_descent_init(&d_src, ft);
+	ik = src_ord;
+	while (d_src.depth < src_len) {
+		if (!d_src.nf || ft_node_external(d_src.nf) ||
+				ft_node_compressed(d_src.nf))
+			return -EINVAL;
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+		if (ft_node_skip_compressed(d_src.nf))
+			return -EINVAL;
+#endif
+		ft_descent_step(ft, &d_src, *(ik++));
+	}
+	s_top = d_src.nf;
+	if (!s_top || d_src.depth != src_len || ft_node_flip_proxy(s_top) ||
+			ft_node_external(s_top) || ft_node_compressed(s_top))
+		return -EINVAL;
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+	if (ft_node_skip_compressed(s_top))
+		return -EINVAL;
+#endif
+	ti = ft_node_type(s_top);
+	if (ft_types[ti].type_class != FT_POPCOUNT &&
+			ft_types[ti].type_class != FT_PIGEON)
+		return -EINVAL;
+	s_top_meta = cds_ft_item_to_metadata(ft_node_ptr(s_top));
+	if (s_top_meta->external_nodes)
+		return -EINVAL;			/* cow_stop sub-step-2 scope */
+
+	/* BP (= S_top's parent) must be plain and stay above min_child on removal. */
+	if (!d_src.pnf || ft_node_flip_proxy(d_src.pnf) ||
+			ft_node_external(d_src.pnf) || ft_node_compressed(d_src.pnf))
+		return -EINVAL;
+	bp_meta = cds_ft_item_to_metadata(ft_node_ptr(d_src.pnf));
+	if (ft_meta_nr_child(bp_meta) < 3)
+		return -EINVAL;
+
+	cnt = ft_nr_keys_get(s_top_meta);	/* subtree key count (count edges no-op if rank off) */
+
+	txn = ft_flip_txn_create();
+	if (!txn)
+		return -ENOMEM;
+
+	/* 1. COW S_top -> S_top' (SW; records re-parents + retire, LOCKED). */
+	ft_flip_txn_set_structural_sw(txn, true);
+	ret = ft_rekey_cow_stop(ft, txn, s_top, &s_top_prime, marks, snaps,
+			&nr_marks);
+	if (ret) {
+		ft_flip_txn_destroy(txn);	/* pre-commit bail: destroy caller-owned */
+		goto sweep;
+	}
+
+	/*
+	 * 2. + 3.  structural_sw STAYS TRUE for the rest: the graft ALWAYS relocates
+	 * the dst attach node (a reserve recompaction), which ACQUIRES COPYING locks
+	 * over the dst parent + the republish grandparent and records its re-parents /
+	 * release / retire as SW under those locks -- so the graft forward publish and
+	 * recompact edges are correctly SW.  The detach's src-junction (BP) edges are
+	 * UNLOCKED, but ft_ord_cell_record_into forces them MW regardless of
+	 * structural_sw, so no toggle is needed (toggling OFF would wrongly demote the
+	 * recompact's COPYING-expecting edges to MW -> expected-old mismatch -> abort).
+	 * The mixed commit installs the MW (detach) edges first, then parks the SW
+	 * (graft + cow_stop) edges before the flip.
+	 */
+
+	/* 2. Graft-fold: record-only NOSPLIT attach of S_top' at @dst_key. */
+	ft_glue_init(&glue);
+	glue.txn = txn;
+	glue.record_only = true;
+	memset(&reserve, 0, sizeof(reserve));
+	if (ft_bulk_node_reserve_fill(ft, &reserve)) {
+		ft_flip_txn_destroy(txn);
+		ret = -ENOMEM;
+		goto sweep;
+	}
+	prep = ft_graft_build(ft, dst_ord, dst_len, s_top_prime, cnt, &d_dst, &glue);
+	/*
+	 * SHAPE GATE.  This first cut supports only:
+	 *  - an absent, append-in-place NOSPLIT dst point (no compressed-divergence
+	 *    GLUE split), and
+	 *  - the src junction BP (= d_src.pnf) and the dst parent (= d_dst.pnf)
+	 *    sharing the SAME parent (d_src.ppnf == d_dst.ppnf, both non-NULL).  That
+	 *    shared parent is what the graft's dst-parent recompaction COPYING-holds
+	 *    and what the detach's BP recompaction reuses via src_parent_held below;
+	 *    the reuse is UNSOUND if BP's parent is not the graft-held node.  A shape
+	 *    where the two junctions diverge is rejected here (the general rekey needs
+	 *    a verified / fallback acquire, not this hook's unconditional reuse).
+	 */
+	if (prep != FT_GRAFT_PREP_NOSPLIT || d_dst.depth != dst_len || d_dst.nf ||
+			!d_src.ppnf || d_src.ppnf != d_dst.ppnf) {
+		cds_ft_alloc_reserve_drain(ft, &reserve);
+		ft_glue_abort(ft, &glue);
+		free_cds_ft_node_unpublished(ft, ft_node_ptr(s_top_prime));
+		ft_flip_txn_destroy(txn);
+		ret = -EINVAL;
+		goto sweep;
+	}
+	/* Reserve the graft slot edge + the detach struct/state edges up front. */
+	if (!ft_flip_txn_reserve_extra(txn, FT_REMOVE_COMMIT_REC_MAX_EDGES + 4)) {
+		cds_ft_alloc_reserve_drain(ft, &reserve);
+		ft_glue_abort(ft, &glue);
+		free_cds_ft_node_unpublished(ft, ft_node_ptr(s_top_prime));
+		ft_flip_txn_destroy(txn);
+		ret = -ENOMEM;
+		goto sweep;
+	}
+	/*
+	 * Drive prepare + commit SEPARATELY (not the combined ft_store_at_graft_point
+	 * wrapper) so the reserve recompaction's relocated old dst-parent copy
+	 * (@gst_st.old_recompacted_node) is visible here: the graft ALWAYS relocates
+	 * the attach node for its atomic publish, and under record_only its old copy
+	 * stays LIVE until the caller's commit, so the caller frees it post-commit.
+	 */
+	cds_ft_alloc_reserve_activate(ft, &reserve);
+	gst = ft_store_at_graft_point_prepare(ft, dst_ord, dst_len, &d_dst,
+			s_top_prime, cnt, &glue, &gst_st);
+	if (gst == CDS_FT_STATUS_OK)
+		gcst = ft_store_at_graft_point_commit(ft, &attached_nf, &adepth,
+				NULL /*run*/, &gst_st, (long) cnt);
+	cds_ft_alloc_reserve_deactivate(ft);
+	cds_ft_alloc_reserve_drain(ft, &reserve);
+	if (gst != CDS_FT_STATUS_OK || gcst != URCU_TXN_STATUS_OK) {
+		/*
+		 * Not expected single-threaded with the reserve pre-filled.  Record-only
+		 * commit leaves the shared txn intact (terminal commit gated off), so the
+		 * caller owns cleanup: free S_top', abort the glue build, destroy the txn.
+		 * (prepare failure freed its own invisible build + left glue clean.)
+		 */
+		free_cds_ft_node_unpublished(ft, ft_node_ptr(s_top_prime));
+		ft_glue_abort(ft, &glue);
+		ft_flip_txn_destroy(txn);
+		ret = -EIO;
+		goto sweep;
+	}
+
+	/*
+	 * 3. Detach-fold: remove S_top from BP (clear its slot + nr_child--).  In the
+	 * default (concurrent-safe) build EVERY popcount delete recompacts BP, and
+	 * that recompaction republishes into BP's parent -- which is the SAME shared
+	 * spine ancestor the graft's dst-parent recompaction already COPYING-holds
+	 * (both BP and the dst parent are children of it in this depth-2 shape).  Pass
+	 * src_parent_held=TRUE so the detach's recompaction REUSES that held lock
+	 * instead of re-acquiring it (a second acquire would abort -EAGAIN).
+	 */
+	ret = ft_detach_node(ft, d_src.nfp, d_src.pnfp, d_src.depth,
+			false /*free_detached_subtree: S_top is retired by cow_stop*/,
+			NULL /*fuse_cell: list off*/, &pub, NULL /*run*/,
+			NULL /*retire_glue*/, NULL /*freeze_leaf*/,
+			-(long) cnt, txn /*shared_txn*/, true /*record_only*/,
+			true /*src_parent_held: shared parent held by the graft recompaction*/,
+			&detach_rc /*old + fresh BP copies, reclaimed post-commit*/);
+	if (ret) {
+		/* Pre-commit bail (not expected simple/single-threaded). */
+		free_cds_ft_node_unpublished(ft, ft_node_ptr(s_top_prime));
+		ft_glue_abort(ft, &glue);
+		ft_flip_txn_destroy(txn);
+		goto sweep;
+	}
+
+	/* 4. ONE commit of the whole stitch (consumes txn). */
+	st = ft_flip_txn_commit(ft, txn);
+	if (st == URCU_TXN_STATUS_OK) {
+		ft_glue_free_old(ft, &glue);		/* graft old copies */
+		/*
+		 * The reserve recompaction's relocated old dst-parent copy: its retire
+		 * committed with the flip (deferred past readers via the recompact's
+		 * fenced tombstone), so reclaim it now -- mirrors ft_store_at_graft_
+		 * point_commit's own post-commit free (ft-graft.h).
+		 */
+		if (gst_st.old_recompacted_node)
+			free_cds_ft_node(ft, gst_st.old_recompacted_node);
+		if (detach_rc.old_node)
+			free_cds_ft_node(ft, detach_rc.old_node);	/* old BP copy */
+		cds_ft_free_item_deferred(ft, s_top_meta);	/* old S_top after GP */
+		ret = 0;
+	} else {
+		/*
+		 * Abort (a peer won a raced MW slot): NOTHING published, so reclaim every
+		 * UNPUBLISHED fresh copy -- S_top', the graft's relocated dst-parent copy
+		 * (@gst_st.dest), and the detach's relocated BP copy (@detach_rc.new_flag)
+		 * -- and abort the glue build.  The retired old copies stay LIVE (their
+		 * tombstones rolled back), so they are NOT freed here.  Unreachable under
+		 * the single-writer contract, kept leak-free for future concurrent use.
+		 */
+		free_cds_ft_node_unpublished(ft, ft_node_ptr(s_top_prime));
+		if (gst_st.old_recompacted_node)
+			free_cds_ft_node_unpublished(ft, ft_node_ptr(gst_st.dest));
+		if (detach_rc.new_flag)
+			free_cds_ft_node_unpublished(ft, ft_node_ptr(detach_rc.new_flag));
+		ft_glue_abort(ft, &glue);
+		ret = -EAGAIN;
+	}
+	ft_glue_fini(&glue);
+
+sweep:
+	for (i = 0; i < nr_marks; i++)
+		ft_meta_copying_clear_if_held(marks[i]);
+	return ret;
+}
 #endif /* FEATURE_FT_MW_DLM_ACQUIRE */

@@ -49,7 +49,7 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_MW_DLM_ACQUIRE
-#define NR_TESTS_DLM 1		/* test_cow_stop_root_inplace */
+#define NR_TESTS_DLM 2		/* test_cow_stop_root_inplace, test_rekey_graft_simple */
 #else
 #define NR_TESTS_DLM 0
 #endif
@@ -389,6 +389,36 @@ static struct cds_ft *create_fixed_fine_lock_ft(size_t klen,
 }
 
 /*
+ * Fixed-length fine-lock trie with the ordered sibling list OFF -- so a
+ * structural move (rekey) touches no boundary cells.  Used by the coherent-rekey
+ * sub-step-3 driver test.
+ */
+static struct cds_ft *create_fixed_fine_lock_listoff_ft(size_t klen,
+		struct cds_ft_group **group_out)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+
+	if (cds_ft_group_attr_create(&attr) < 0)
+		abort();
+	if (cds_ft_group_attr_set_key_len(attr, klen) < 0)
+		abort();
+	if (cds_ft_group_attr_set_writer_strategy(attr,
+			CDS_FT_WRITER_LOCK_FINE) < 0)
+		abort();
+	if (cds_ft_group_attr_set_ordered_list(attr, false) < 0)
+		abort();
+	if (cds_ft_group_create(attr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &ft) < 0)
+		abort();
+	*group_out = group;
+	return ft;
+}
+
+/*
  * Variable-length trie in MW FINE lock-mode (CDS_FT_WRITER_LOCK_FINE).  Varlen
  * (no set_key_len) so a sub-prefix graft is accepted, which the cross-trie graft
  * oracle needs.  Every trie created in @group_out inherits LOCK_FINE, so a second
@@ -679,6 +709,183 @@ static int test_cow_stop_root_inplace(void)
 		}
 		rcu_read_unlock();
 	}
+
+	return drain_and_destroy(ft, group);
+}
+
+extern void *_cds_ft_debug_child_at(struct cds_ft *ft, const uint8_t *key,
+		size_t key_len);
+extern int _cds_ft_debug_rekey_graft_simple(struct cds_ft *ft,
+		const uint8_t *src_key, size_t src_len,
+		const uint8_t *dst_key, size_t dst_len);
+
+/*
+ * Coherent-rekey sub-step 3: the one-decide rekey-graft in its SIMPLEST complete
+ * shape, driven by _cds_ft_debug_rekey_graft_simple -- move the subtree S_top
+ * from prefix SRC to the ABSENT prefix DST as ONE mixed SW/MW commit (COW S_top ->
+ * S_top', graft S_top' at DST, clear the SRC slot).  List OFF (no boundary cells).
+ *
+ * DEPTH-2 shape so BP (S_top's parent) and the dst parent are DIFFERENT nodes
+ * (both root's children) -- a depth-1 move would make BP == dst parent == root,
+ * where a growing graft rebuilds the very node the detach edits.  Bytes:
+ *   - S_top at {SX, SY}: keys (SX,SY,i,0) i=1..4 make root.slot[SX].slot[SY] a
+ *     branching POPCOUNT internal with four children; BP = root.slot[SX] gets two
+ *     extra sibling leaves (SX,b,0,0) -> BP has 3 children, survives the removal.
+ *   - dst parent = root.slot[DX]: two leaves (DX,c,0,0) c=1,2 make it a small
+ *     2-child node; DST = {DX, DZ} with DZ appended above c -> an in-place add
+ *     (no recompaction).
+ * After the move: the four S_top keys reappear under {DX,DZ,*}, vanish under
+ * {SX,SY,*}; the four siblings/dst leaves are untouched; S_top's ADDRESS moved
+ * (the reader address-witness); cds_ft_verify passes; the total count is unchanged.
+ */
+#define RK_SX	0x10			/* BP = root.slot[0x10] */
+#define RK_SY	0x01			/* S_top = BP.slot[0x01] */
+#define RK_DX	0x20			/* dst parent = root.slot[0x20] */
+#define RK_DZ	0x03			/* append byte in the dst parent (above 1,2) */
+#define RK_NSUB	4			/* S_top's four children (byte2 = 1..4) */
+#define RK_NSIB	8			/* BP siblings -> BP has 9 children (in-place) */
+static int test_rekey_graft_simple(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_fine_lock_listoff_ft(4, &group);
+	struct ft_test_node *sub[RK_NSUB], *sib[RK_NSIB], *dstl[2];
+	uint64_t sub_key[RK_NSUB], sib_key[RK_NSIB], dstl_key[2];
+	uint8_t src_key[2] = { RK_SX, RK_SY }, dst_key[2] = { RK_DX, RK_DZ };
+	void *s_top_before, *s_top_after;
+	unsigned long cnt;
+	int i, rc;
+
+	for (i = 0; i < RK_NSUB; i++) {
+		sub_key[i] = ((uint64_t) RK_SX << 24) | ((uint64_t) RK_SY << 16) |
+			((uint64_t) (i + 1) << 8);
+		sub[i] = node_alloc(sub_key[i]);
+	}
+	/*
+	 * BP siblings (byte1 = 5..12, distinct from SY=1) so BP has 9 children.  BP
+	 * must stay above min_child on the removal so the detach is an IN-PLACE
+	 * delete: a recompaction (shrink) of BP would ft_dlm_lock BP's parent (root),
+	 * which the graft's own dst-parent recompaction already holds -> -EAGAIN.
+	 * (Coordinating that shared-ancestor lock is the general/inc5 case.)
+	 */
+	for (i = 0; i < RK_NSIB; i++) {
+		sib_key[i] = ((uint64_t) RK_SX << 24) | ((uint64_t) (i + 5) << 16);
+		sib[i] = node_alloc(sib_key[i]);
+	}
+	/* Two dst-parent leaves (byte1 = 1,2) so root.slot[DX] is a small node. */
+	dstl_key[0] = ((uint64_t) RK_DX << 24) | ((uint64_t) 0x01 << 16);
+	dstl_key[1] = ((uint64_t) RK_DX << 24) | ((uint64_t) 0x02 << 16);
+	dstl[0] = node_alloc(dstl_key[0]);
+	dstl[1] = node_alloc(dstl_key[1]);
+
+	rcu_read_lock();
+	for (i = 0; i < RK_NSUB; i++) {
+		if (insert_u64(ft, sub_key[i], sub[i]) != CDS_FT_STATUS_OK) {
+			rcu_read_unlock();
+			fprintf(stderr, "rekey-graft: insert sub %d failed\n", i);
+			drain_and_destroy(ft, group);
+			return -1;
+		}
+	}
+	for (i = 0; i < RK_NSIB; i++) {
+		if (insert_u64(ft, sib_key[i], sib[i]) != CDS_FT_STATUS_OK) {
+			rcu_read_unlock();
+			fprintf(stderr, "rekey-graft: insert sibling %d failed\n", i);
+			drain_and_destroy(ft, group);
+			return -1;
+		}
+	}
+	if (insert_u64(ft, dstl_key[0], dstl[0]) != CDS_FT_STATUS_OK ||
+			insert_u64(ft, dstl_key[1], dstl[1]) != CDS_FT_STATUS_OK) {
+		rcu_read_unlock();
+		fprintf(stderr, "rekey-graft: insert dst leaf failed\n");
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+	s_top_before = _cds_ft_debug_child_at(ft, src_key, 2);
+	rcu_read_unlock();
+	if (!s_top_before) {
+		fprintf(stderr, "rekey-graft: S_top not at src key\n");
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+
+	rcu_read_lock();
+	rc = _cds_ft_debug_rekey_graft_simple(ft, src_key, 2, dst_key, 2);
+	s_top_after = _cds_ft_debug_child_at(ft, dst_key, 2);
+	rcu_read_unlock();
+	if (rc != 0) {
+		fprintf(stderr, "rekey-graft: driver rc=%d\n", rc);
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+	/* The moved subtree top must be at a FRESH address (COW), not the old one. */
+	if (!s_top_after || s_top_after == s_top_before) {
+		fprintf(stderr, "rekey-graft: S_top address did not move "
+			"(before %p after %p)\n", s_top_before, s_top_after);
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "rekey-graft: verify failed after move\n");
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+
+	rcu_read_lock();
+	/* Total count unchanged: 4 moved subtree keys + RK_NSIB siblings + 2 dst leaves. */
+	cnt = cds_ft_count_entries(ft);
+	if (cnt != RK_NSUB + RK_NSIB + 2) {
+		rcu_read_unlock();
+		fprintf(stderr, "rekey-graft: count %lu != %d after move\n",
+			cnt, RK_NSUB + RK_NSIB + 2);
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+	/* Each moved key now lives under {DX,DZ} and is gone under {SX,SY}. */
+	for (i = 0; i < RK_NSUB; i++) {
+		uint64_t moved = ((uint64_t) RK_DX << 24) |
+			((uint64_t) RK_DZ << 16) | ((uint64_t) (i + 1) << 8);
+		struct cds_ft_node *f = NULL;
+
+		if (lookup_u64(ft, moved, &f) != CDS_FT_STATUS_OK ||
+				f != &sub[i]->node) {
+			rcu_read_unlock();
+			fprintf(stderr, "rekey-graft: moved key %d absent at DST\n", i);
+			drain_and_destroy(ft, group);
+			return -1;
+		}
+		if (lookup_u64(ft, sub_key[i], &f) == CDS_FT_STATUS_OK) {
+			rcu_read_unlock();
+			fprintf(stderr, "rekey-graft: key %d still present at SRC\n", i);
+			drain_and_destroy(ft, group);
+			return -1;
+		}
+	}
+	/* BP siblings untouched. */
+	for (i = 0; i < RK_NSIB; i++) {
+		struct cds_ft_node *fs = NULL;
+
+		if (lookup_u64(ft, sib_key[i], &fs) != CDS_FT_STATUS_OK ||
+				fs != &sib[i]->node) {
+			rcu_read_unlock();
+			fprintf(stderr, "rekey-graft: sibling %d lost\n", i);
+			drain_and_destroy(ft, group);
+			return -1;
+		}
+	}
+	/* dst-parent leaves untouched. */
+	for (i = 0; i < 2; i++) {
+		struct cds_ft_node *fd = NULL;
+
+		if (lookup_u64(ft, dstl_key[i], &fd) != CDS_FT_STATUS_OK ||
+				fd != &dstl[i]->node) {
+			rcu_read_unlock();
+			fprintf(stderr, "rekey-graft: dst leaf %d lost\n", i);
+			drain_and_destroy(ft, group);
+			return -1;
+		}
+	}
+	rcu_read_unlock();
 
 	return drain_and_destroy(ft, group);
 }
@@ -27072,6 +27279,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_writer_lock_mode_fine_crosstrie_busy);
 #ifdef FEATURE_FT_MW_DLM_ACQUIRE
 	RUN_TEST(test_cow_stop_root_inplace);
+	RUN_TEST(test_rekey_graft_simple);
 #endif
 #ifdef FEATURE_FT_FAULT_INJECT
 	RUN_TEST(test_rekey_coherence_fault_redescend);
