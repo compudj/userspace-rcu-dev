@@ -39,6 +39,7 @@
 #include <limits.h>
 #include <pthread.h>
 #include <signal.h>
+#include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -49,7 +50,7 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_MW_DLM_ACQUIRE
-#define NR_TESTS_DLM 2		/* test_cow_stop_root_inplace, test_rekey_graft_simple */
+#define NR_TESTS_DLM 3		/* cow_stop_root_inplace, rekey_graft_simple, rekey_graft_liston */
 #else
 #define NR_TESTS_DLM 0
 #endif
@@ -886,6 +887,240 @@ static int test_rekey_graft_simple(void)
 		}
 	}
 	rcu_read_unlock();
+
+	return drain_and_destroy(ft, group);
+}
+
+/*
+ * Coherent-rekey sub-step 3, LIST-ON variant: the same one-decide rekey-graft move
+ * on a trie whose ordered cell list is ENABLED, so the moved subtree's contiguous
+ * cell run must UNSPLICE from the src ordered position and RE-SPLICE at the dst
+ * position -- four MW boundary edges recorded into the same commit as the
+ * structural move.  Same DEPTH-2 shape as test_rekey_graft_simple (S_top {SX,SY}
+ * with four children, populous BP, small dst parent under a shared root), so the
+ * src_parent_held lock reuse holds.  With SX < DX and DZ above the dst leaves, the
+ * run is the ordered-list MINIMUM before the move and the MAXIMUM after, exercising
+ * both the head- and tail-sentinel splice repair.
+ *
+ * Verifies (beyond the structural checks): cds_ft_verify's ordered-cell pass
+ * (ft_verify_ord_cells: list order matches the trie, back-edges intact) AND an
+ * explicit ordered forward scan that must yield exactly all keys in strictly
+ * ascending order -- i.e. the four moved keys appear at their new dst positions and
+ * none is dropped from the list (the coherence property the run splice guarantees).
+ */
+static int test_rekey_graft_liston(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_fine_lock_ft(4, &group);	/* list ON (default) */
+	struct ft_test_node *sub[RK_NSUB], *sib[RK_NSIB], *dstl[2];
+	uint64_t sub_key[RK_NSUB], sib_key[RK_NSIB], dstl_key[2];
+	uint8_t src_key[2] = { RK_SX, RK_SY }, dst_key[2] = { RK_DX, RK_DZ };
+	const struct cds_ft_cell *buf[4];
+	const struct cds_ft_cell *cur;
+	void *s_top_before, *s_top_after;
+	uint64_t prev_key = 0;
+	unsigned long cnt, seen, moved_seen = 0;
+	size_t n, b;
+	int i;
+
+	if (!cds_ft_group_ordered_list(group)) {
+		fprintf(stderr, "rekey-graft list-on: ordered list unexpectedly off\n");
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+
+	for (i = 0; i < RK_NSUB; i++) {
+		sub_key[i] = ((uint64_t) RK_SX << 24) | ((uint64_t) RK_SY << 16) |
+			((uint64_t) (i + 1) << 8);
+		sub[i] = node_alloc(sub_key[i]);
+	}
+	for (i = 0; i < RK_NSIB; i++) {
+		sib_key[i] = ((uint64_t) RK_SX << 24) | ((uint64_t) (i + 5) << 16);
+		sib[i] = node_alloc(sib_key[i]);
+	}
+	dstl_key[0] = ((uint64_t) RK_DX << 24) | ((uint64_t) 0x01 << 16);
+	dstl_key[1] = ((uint64_t) RK_DX << 24) | ((uint64_t) 0x02 << 16);
+	dstl[0] = node_alloc(dstl_key[0]);
+	dstl[1] = node_alloc(dstl_key[1]);
+
+	rcu_read_lock();
+	for (i = 0; i < RK_NSUB; i++) {
+		if (insert_u64(ft, sub_key[i], sub[i]) != CDS_FT_STATUS_OK) {
+			rcu_read_unlock();
+			fprintf(stderr, "rekey-graft list-on: insert sub %d failed\n", i);
+			drain_and_destroy(ft, group);
+			return -1;
+		}
+	}
+	for (i = 0; i < RK_NSIB; i++) {
+		if (insert_u64(ft, sib_key[i], sib[i]) != CDS_FT_STATUS_OK) {
+			rcu_read_unlock();
+			fprintf(stderr, "rekey-graft list-on: insert sibling %d failed\n", i);
+			drain_and_destroy(ft, group);
+			return -1;
+		}
+	}
+	if (insert_u64(ft, dstl_key[0], dstl[0]) != CDS_FT_STATUS_OK ||
+			insert_u64(ft, dstl_key[1], dstl[1]) != CDS_FT_STATUS_OK) {
+		rcu_read_unlock();
+		fprintf(stderr, "rekey-graft list-on: insert dst leaf failed\n");
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+	s_top_before = _cds_ft_debug_child_at(ft, src_key, 2);
+	rcu_read_unlock();
+	if (!s_top_before) {
+		fprintf(stderr, "rekey-graft list-on: S_top not at src key\n");
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+
+	rcu_read_lock();
+	i = _cds_ft_debug_rekey_graft_simple(ft, src_key, 2, dst_key, 2);
+	s_top_after = _cds_ft_debug_child_at(ft, dst_key, 2);
+	rcu_read_unlock();
+	if (i != 0) {
+		fprintf(stderr, "rekey-graft list-on: driver rc=%d\n", i);
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+	if (!s_top_after || s_top_after == s_top_before) {
+		fprintf(stderr, "rekey-graft list-on: S_top address did not move "
+			"(before %p after %p)\n", s_top_before, s_top_after);
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+	/* Structural + ordered-cell coherence (ft_verify_ord_cells runs inside). */
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "rekey-graft list-on: verify failed after move\n");
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+
+	rcu_read_lock();
+	cnt = cds_ft_count_entries(ft);
+	if (cnt != RK_NSUB + RK_NSIB + 2) {
+		rcu_read_unlock();
+		fprintf(stderr, "rekey-graft list-on: count %lu != %d after move\n",
+			cnt, RK_NSUB + RK_NSIB + 2);
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+
+	/*
+	 * Ordered forward scan: exactly RK_NSUB+RK_NSIB+2 keys, strictly ascending,
+	 * with all four moved keys present at their new {DX,DZ,*} positions.  A dropped
+	 * or mis-spliced run would break the count, the order, or the moved-key tally.
+	 */
+	cur = NULL;
+	seen = 0;
+	do {
+		enum cds_ft_status bs = cds_ft_cell_next_batch(ft, cur, buf, 4,
+				&n, &cur);
+
+		if (bs != CDS_FT_STATUS_OK) {
+			rcu_read_unlock();
+			fprintf(stderr, "rekey-graft list-on: scan status %d\n", (int) bs);
+			drain_and_destroy(ft, group);
+			return -1;
+		}
+		for (b = 0; b < n; b++) {
+			uint8_t k[4];
+			size_t kl;
+			uint64_t kv;
+
+			if (cds_ft_cell_get_key(ft, buf[b], k, sizeof k, &kl)
+					!= CDS_FT_STATUS_OK) {
+				rcu_read_unlock();
+				fprintf(stderr, "rekey-graft list-on: get_key failed\n");
+				drain_and_destroy(ft, group);
+				return -1;
+			}
+			kv = cds_ft_key_to_u64(ft, k, 4);
+			if (seen && kv <= prev_key) {
+				rcu_read_unlock();
+				fprintf(stderr, "rekey-graft list-on: order violation "
+					"%#lx after %#lx\n",
+					(unsigned long) kv, (unsigned long) prev_key);
+				drain_and_destroy(ft, group);
+				return -1;
+			}
+			if ((kv >> 16) == (((uint64_t) RK_DX << 8) | RK_DZ))
+				moved_seen++;
+			prev_key = kv;
+			seen++;
+		}
+	} while (cur);
+	rcu_read_unlock();
+
+	if (seen != (unsigned long) (RK_NSUB + RK_NSIB + 2)) {
+		fprintf(stderr, "rekey-graft list-on: scan saw %lu of %d\n",
+			seen, RK_NSUB + RK_NSIB + 2);
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+	if (moved_seen != RK_NSUB) {
+		fprintf(stderr, "rekey-graft list-on: scan saw %lu of %d moved keys "
+			"at dst\n", moved_seen, RK_NSUB);
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+
+	/* Point-lookup parity: each moved key at dst, gone at src. */
+	rcu_read_lock();
+	for (i = 0; i < RK_NSUB; i++) {
+		uint64_t moved = ((uint64_t) RK_DX << 24) |
+			((uint64_t) RK_DZ << 16) | ((uint64_t) (i + 1) << 8);
+		struct cds_ft_node *f = NULL;
+
+		if (lookup_u64(ft, moved, &f) != CDS_FT_STATUS_OK ||
+				f != &sub[i]->node ||
+				lookup_u64(ft, sub_key[i], &f) == CDS_FT_STATUS_OK) {
+			rcu_read_unlock();
+			fprintf(stderr, "rekey-graft list-on: moved key %d not coherent\n", i);
+			drain_and_destroy(ft, group);
+			return -1;
+		}
+	}
+	rcu_read_unlock();
+
+	/*
+	 * Adjacency guard: the run now sits at the list MAXIMUM ({DX,DZ,*}).  A move to
+	 * {DX,DZ+1} would splice the run right ABOVE itself, so find_splice_pos (run at
+	 * DX,DZ, and DX,DZ+1 sorts just after it) resolves dpred to the run's own last
+	 * cell -- the duplicate-slot / self-cycle shape.  It must be REJECTED cleanly
+	 * (-EINVAL, before any mutation), leaving the trie byte-unchanged.
+	 */
+	{
+		uint8_t adj_src[2] = { RK_DX, RK_DZ };
+		uint8_t adj_dst[2] = { RK_DX, RK_DZ + 1 };
+		int arc;
+
+		rcu_read_lock();
+		arc = _cds_ft_debug_rekey_graft_simple(ft, adj_src, 2, adj_dst, 2);
+		rcu_read_unlock();
+		if (arc != -EINVAL) {
+			fprintf(stderr, "rekey-graft list-on: adjacency shape not rejected "
+				"(rc=%d)\n", arc);
+			drain_and_destroy(ft, group);
+			return -1;
+		}
+		if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "rekey-graft list-on: verify failed after adjacency "
+				"reject\n");
+			drain_and_destroy(ft, group);
+			return -1;
+		}
+		rcu_read_lock();
+		if (cds_ft_count_entries(ft) != RK_NSUB + RK_NSIB + 2) {
+			rcu_read_unlock();
+			fprintf(stderr, "rekey-graft list-on: count changed after adjacency "
+				"reject\n");
+			drain_and_destroy(ft, group);
+			return -1;
+		}
+		rcu_read_unlock();
+	}
 
 	return drain_and_destroy(ft, group);
 }
@@ -27280,6 +27515,7 @@ int main(int argc, char **argv)
 #ifdef FEATURE_FT_MW_DLM_ACQUIRE
 	RUN_TEST(test_cow_stop_root_inplace);
 	RUN_TEST(test_rekey_graft_simple);
+	RUN_TEST(test_rekey_graft_liston);
 #endif
 #ifdef FEATURE_FT_FAULT_INJECT
 	RUN_TEST(test_rekey_coherence_fault_redescend);

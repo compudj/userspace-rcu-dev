@@ -373,6 +373,8 @@ int _cds_ft_debug_rekey_graft_simple(struct cds_ft *ft,
 {
 	uint8_t src_ord[FT_MAX_KEY_LEN], dst_ord[FT_MAX_KEY_LEN];
 	struct cds_ft_inode_flag *s_top, *s_top_prime = NULL, *attached_nf = NULL;
+	struct cds_ft_node *run_rfirst = NULL, *run_rlast = NULL;
+	struct ft_ord_cell *run_dpred = NULL, *run_dsucc = NULL;
 	struct cds_ft_metadata *s_top_meta, *bp_meta;
 	struct ft_detach_recompact_out detach_rc = { 0 };
 	struct ft_flip_txn *txn;
@@ -437,6 +439,47 @@ int _cds_ft_debug_rekey_graft_simple(struct cds_ft *ft,
 	if (ft_meta_nr_child(bp_meta) < 3)
 		return -EINVAL;
 
+	/*
+	 * List on: capture the moved subtree's contiguous ordered-cell run endpoints
+	 * (the structural min/max external heads under S_top) from the still-pristine
+	 * list, so the ONE commit can unsplice the run from the src ordered position
+	 * and re-splice it at the dst position (four MW boundary edges) atomically with
+	 * the structural move -- a coherent reader never sees a moved key gone from the
+	 * structure but still in the list (or vice versa).  cow_stop SHARES S_top's
+	 * leaves (only S_top's own node relocates), so these heads stay valid across it.
+	 *
+	 * Locate the dst splice neighbours NOW, on the pristine list (find_splice_pos
+	 * needs the dst attach point empty, which it still is -- nothing is published
+	 * until the final commit), and REJECT an adjacency shape up front (before any
+	 * txn / COPYING mark / record, so the bail is a clean no-op -EINVAL): because
+	 * find_splice_pos runs while the run is STILL at src, a dst gap that abuts the
+	 * run resolves the run's own ENDPOINT cell as a splice neighbour (dsucc == run
+	 * first, or dpred == run last), which would record a duplicate-slot MW edge and
+	 * plain-store a self-cyclic run link.  This hook only supports a dst position
+	 * clear of the run's current ordered neighbourhood; a general rekey would locate
+	 * the splice against the run-removed list instead.
+	 *
+	 * Completeness of the "no run cell is a splice neighbour" guarantee is JOINT:
+	 * this guard rejects the two ENDPOINT-adjacency shapes, while the INTERIOR case
+	 * (a dst gap whose neighbour is a run cell strictly between rfc and rlc) is
+	 * excluded by the later d_src.ppnf == d_dst.ppnf shape gate -- ppnf equality
+	 * forces src_len == dst_len, so an interior dst (which needs the full src prefix
+	 * plus a longer key descending into S_top) never reaches the cell record.  A
+	 * future relaxation of that shape gate MUST re-add an interior check here.
+	 */
+	if (ft->ordered_list) {
+		struct ft_ord_cell *rfc, *rlc;
+
+		run_rfirst = ft_subtree_minmax_head(ft, s_top, false);
+		run_rlast = ft_subtree_minmax_head(ft, s_top, true);
+		rfc = ft_ord_cell_ptr(rcu_dereference(run_rfirst->prev));
+		rlc = ft_ord_cell_ptr(rcu_dereference(run_rlast->prev));
+		ft_ord_cell_find_splice_pos(ft, dst_key, dst_len, &run_dpred,
+				&run_dsucc);
+		if (run_dsucc == rfc || run_dpred == rlc)
+			return -EINVAL;
+	}
+
 	cnt = ft_nr_keys_get(s_top_meta);	/* subtree key count (count edges no-op if rank off) */
 
 	txn = ft_flip_txn_create();
@@ -497,8 +540,13 @@ int _cds_ft_debug_rekey_graft_simple(struct cds_ft *ft,
 		ret = -EINVAL;
 		goto sweep;
 	}
-	/* Reserve the graft slot edge + the detach struct/state edges up front. */
-	if (!ft_flip_txn_reserve_extra(txn, FT_REMOVE_COMMIT_REC_MAX_EDGES + 4)) {
+	/*
+	 * Reserve the graft slot edge + the detach struct/state edges, plus (list on)
+	 * the four ordered-cell run boundary edges (src unsplice + dst splice).
+	 */
+	if (!ft_flip_txn_reserve_extra(txn, FT_REMOVE_COMMIT_REC_MAX_EDGES + 4 +
+			(ft->ordered_list ? FT_ORD_CELL_RUN_DETACH_MAX_EDGES +
+				FT_ORD_CELL_RUN_SPLICE_MAX_EDGES : 0))) {
 		cds_ft_alloc_reserve_drain(ft, &reserve);
 		ft_glue_abort(ft, &glue);
 		free_cds_ft_node_unpublished(ft, ft_node_ptr(s_top_prime));
@@ -557,6 +605,45 @@ int _cds_ft_debug_rekey_graft_simple(struct cds_ft *ft,
 		ft_glue_abort(ft, &glue);
 		ft_flip_txn_destroy(txn);
 		goto sweep;
+	}
+
+	/*
+	 * 3b. Cell-fold (list on): record the four ordered-cell run boundary edges into
+	 * the SHARED txn so the run unsplices from src + re-splices at dst ATOMICALLY
+	 * with the structural move.  Driver-managed (run == NULL to the structural folds
+	 * above) rather than threaded through them, because the dst-splice PLAIN-STORES
+	 * the run's outer links (rfc->prev, rlc->next) at record time, so the src unsplice
+	 * -- which READS those links to find the src neighbours -- must record FIRST.  The
+	 * structural folds' order (the graft acquires the shared parent lock before the
+	 * detach reuses it via src_parent_held) can't provide that, so the cells are
+	 * recorded here, in the required order, on the still-pristine live list (no
+	 * structural fold above published anything).
+	 *
+	 * SINGLE-WRITER SCOPE (plan Q3, deferred to the coherence oracle sub-step): the
+	 * dst-splice's plain store of the run's two outer links is (a) visible before the
+	 * atomic boundary flip and (b) NOT rolled back if the commit aborts, so this
+	 * list-on path is single-writer-only -- matching this hook's contract -- until the
+	 * oracle decides whether those two links join the atomic MW set (or the endpoint
+	 * cells are COW'd).  Single-threaded here the commit is deterministically OK.
+	 */
+	if (ft->ordered_list) {
+		struct ft_ord_cell_edge cedges[FT_ORD_CELL_RUN_DETACH_MAX_EDGES +
+			FT_ORD_CELL_RUN_SPLICE_MAX_EDGES];
+		struct ft_ord_cell *rfc, *rlc;
+		unsigned int cn;
+
+		/* src unsplice FIRST: reads the run's pristine outer links -> src neighbours. */
+		cn = ft_ord_cell_run_detach_edges(ft, run_rfirst, run_rlast,
+				&rfc, &rlc, cedges, 0);
+		/*
+		 * dst splice into the gap located up front on the pristine list (run_dpred /
+		 * run_dsucc, adjacency-rejected there so neither is a run endpoint).  This
+		 * plain-stores the run's outer links -- safe now: the src read above is done,
+		 * and the list is still pristine (no structural fold above published).
+		 */
+		cn = ft_ord_cell_run_splice_edges(ft, rfc, rlc, run_dpred, run_dsucc,
+				cedges, cn);
+		ft_ord_cell_record_into(txn, cedges, cn);
 	}
 
 	/* 4. ONE commit of the whole stitch (consumes txn). */
