@@ -215,7 +215,7 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 				(struct cds_ft_inode_flag *) topmost_external_nodes,
 				elevated_old_child, &rec);
 			if (ft_remove_commit_rec(ft, &rec, fuse_cell, run,
-					txn) > 0)
+					txn, false) > 0)
 				/* Peer won: nothing installed (txn consumed). */
 				return -EAGAIN;
 			pub->armed = true;
@@ -246,7 +246,7 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 				&cn->child,
 				(struct cds_ft_inode_flag *) topmost_external_nodes,
 				elevated_old_child, &rec);
-			if (ft_remove_commit_rec(ft, &rec, NULL, NULL, txn) > 0)
+			if (ft_remove_commit_rec(ft, &rec, NULL, NULL, txn, false) > 0)
 				/* Peer won: nothing installed (txn consumed). */
 				return -EAGAIN;
 		}
@@ -400,7 +400,7 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			if (count_delta)
 				ft_flip_txn_record_count_parent(ft, txn,
 					pub_parent, count_delta);
-			if (ft_remove_commit_rec(ft, &rec, NULL, NULL, txn) > 0) {
+			if (ft_remove_commit_rec(ft, &rec, NULL, NULL, txn, false) > 0) {
 				/*
 				 * Peer won: the fresh internal never published;
 				 * the retired compressed node stays live and
@@ -986,7 +986,7 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		if (count_delta)
 			ft_flip_txn_record_count_parent(ft, txn, publish_parent,
 				count_delta);
-		if (ft_remove_commit_rec(ft, &rec, dead_cell, run, txn) > 0) {
+		if (ft_remove_commit_rec(ft, &rec, dead_cell, run, txn, false) > 0) {
 			/*
 			 * Peer won: NOTHING installed -- the collapsed chain
 			 * (boundary + parent_cn/child_cn) is still live and
@@ -1038,6 +1038,20 @@ void ft_canonicalize_chain_compress(struct cds_ft *ft,
 }
 #endif
 
+/*
+ * FOLD (coherent rekey one-decide writer): the record_only detach's src-junction
+ * recompaction produces two copies the CALLER must reclaim after its own commit --
+ * the OLD copy (retired by the flip, freed on commit OK) and the fresh NEW copy
+ * (republished by the flip, freed UNPUBLISHED if the caller's commit ABORTS).
+ * ft_detach_node surfaces both here (zeroed = no recompaction happened / not
+ * record_only); NULL @recompact_out means the caller does not run a record_only
+ * detach.
+ */
+struct ft_detach_recompact_out {
+	struct cds_ft_inode *old_node;		/* retired copy: free on commit OK */
+	struct cds_ft_inode_flag *new_flag;	/* fresh copy: free unpublished on abort */
+};
+
 static
 int ft_detach_node(struct cds_ft *ft,
 		struct cds_ft_inode_flag **detach_node_flag_ptr,
@@ -1051,7 +1065,9 @@ int ft_detach_node(struct cds_ft *ft,
 		struct cds_ft_node *freeze_leaf,
 		long count_delta,
 		struct ft_flip_txn *shared_txn,
-		bool record_only)
+		bool record_only,
+		bool src_parent_held,
+		struct ft_detach_recompact_out *recompact_out)
 {
 	struct cds_ft_metadata *metadata_stack[FT_MAX_DEPTH];
 	struct cds_ft_inode_flag *iter_node_flag;
@@ -2100,7 +2116,7 @@ int ft_detach_node(struct cds_ft *ft,
 				metadata_stack[nr_branch - 1],
 				n, (struct cds_ft_inode_flag *) topmost_external_nodes,
 				detach_parent_flag_ptr == &ft->root,
-				cur_depth, pub, commit_txn);
+				cur_depth, pub, commit_txn, src_parent_held);
 		}
 		if (!ret) {
 			/*
@@ -2361,7 +2377,8 @@ int ft_detach_node(struct cds_ft *ft,
 			 * fuse_cell/run) and cannot fail.
 			 */
 			if (ft_remove_commit_rec(ft, &rec, fuse_cell, run,
-					commit_txn_used ? NULL : commit_txn) > 0) {
+					commit_txn_used ? NULL : commit_txn,
+					record_only) > 0) {
 				/* Peer won: nothing installed (txn consumed). */
 				commit_txn_used = (commit_txn != NULL);
 				ret = -EAGAIN;
@@ -2456,7 +2473,8 @@ int ft_detach_node(struct cds_ft *ft,
 				count_folded = true;
 			}
 			if (ft_remove_commit_rec(ft, &rec, NULL, NULL,
-					commit_txn_used ? NULL : commit_txn) > 0) {
+					commit_txn_used ? NULL : commit_txn,
+					record_only) > 0) {
 				/* Peer won: nothing installed (txn consumed). */
 				commit_txn_used = (commit_txn != NULL);
 				ret = -EAGAIN;
@@ -2563,13 +2581,27 @@ end:
 	if (commit_txn && !commit_txn_used && !record_only)
 		ft_flip_txn_destroy(commit_txn);
 	/*
-	 * Reclaim safely after replacement.  Under record_only the SIMPLE shape
-	 * never recompacts (BP > min_child), so there is no old copy to free here;
-	 * a recompacting shape would strand its old node (the caller has not
-	 * committed the unlink yet) -- assert the simple-shape precondition.
+	 * Reclaim safely after replacement.  Under record_only the src-junction
+	 * recompaction's OLD copy stays LIVE (resolved through the parked grandparent
+	 * proxy) until the CALLER's commit publishes the fresh copy, so its free is
+	 * DEFERRED to the caller: hand it out through @old_recompacted_out on a
+	 * recorded-OK (ret == 0) path; the caller frees it (call_rcu) after its commit
+	 * succeeds.  A record_only bail (ret != 0) frees the unpublished fresh copy
+	 * here, exactly as the self-committing abort arm.
 	 */
-	assert(!record_only || !old_recompacted_node);
-	if (old_recompacted_node) {
+	if (record_only && old_recompacted_node && !ret) {
+		/*
+		 * Hand BOTH copies to the caller: the OLD copy stays LIVE (resolved
+		 * through the parked grandparent proxy) until the caller's commit
+		 * retires it -> free on commit OK; the fresh NEW copy (@iter_node_flag,
+		 * republished into the shared txn) is UNPUBLISHED until that commit ->
+		 * free unpublished if the caller's commit ABORTS.
+		 */
+		if (recompact_out) {
+			recompact_out->old_node = old_recompacted_node;
+			recompact_out->new_flag = iter_node_flag;
+		}
+	} else if (old_recompacted_node) {
 		if (ret == -EAGAIN)
 			/*
 			 * ABORTED republish: the rebuilt copy never published
@@ -3202,7 +3234,7 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 				ft_get_parent_slot(holder_meta, ft),
 				key_len, true, fuse_cell, pubp, NULL, NULL, node,
 				-1 /* leaf key removed: detach owns the -1 */,
-				NULL, false);
+				NULL, false, false, NULL);
 			/* @node's freeze rode the detach commit (freeze_leaf). */
 		} else {
 			/*
@@ -3401,7 +3433,7 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 				ft_get_parent_slot(holder_meta, ft),
 				key_len, true, fuse_cell, pubp, NULL, NULL, node,
 				-1 /* leaf key removed: detach owns the -1 */,
-				NULL, false);
+				NULL, false, false, NULL);
 			/* @node's freeze rode the detach commit (freeze_leaf). */
 		} else {
 			/* Removing the head, duplicates remain: key count unchanged. */
@@ -3909,7 +3941,7 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 			ft_get_parent_slot(holder_meta, ft), key_len, true,
 			dead_cell, ft->ordered_list ? &pub : NULL, NULL, NULL,
 			NULL, -1 /* leaf key removed: detach owns the -1 */,
-			NULL, false);
+			NULL, false, false, NULL);
 		if (!ret)
 			ft_chain_mark_removed_flip(ft, chain_head);
 	}

@@ -1096,12 +1096,21 @@ int ft_node_recompact(enum ft_recompact mode,
 			}
 		}
 
-		/* ACQUIRE {C, P, (GP)} + read-set guards in one MCAS. */
+		/*
+		 * FOLD (parent_held): P is already COPYING-held by an earlier step of
+		 * the SAME op (a same-trie rekey's graft locked the shared spine), so
+		 * do NOT re-lock it (a second ft_dlm_lock would abort -EAGAIN) and do
+		 * NOT add it to @rel_meta below (the holder owns its release).  P stays
+		 * the republish target; only C (and, if present, GP) are acquired here.
+		 */
+		bool p_held = inh_hint && inh_hint->parent_held;
+
+		/* ACQUIRE {C, (P), (GP)} + read-set guards in one MCAS. */
 		acq = ft_flip_txn_create_bounded(3 /*locks*/ + 2 /*guards*/);
 		if (!acq)
 			return -ENOMEM;
 		dret = ft_dlm_lock(acq, metadata, &snap_c);
-		if (!dret && p_meta) {
+		if (!dret && p_meta && !p_held) {
 			if (!inh_hint)
 				ft_dlm_guard_parent(acq, metadata, pf_p);
 			dret = ft_dlm_lock(acq, p_meta, &snap_p);
@@ -1121,12 +1130,12 @@ int ft_node_recompact(enum ft_recompact mode,
 		/* Populate the lock-set state -- build/commit/unwind unchanged. */
 		fenced = true;
 		fence_state = snap_c;
-		if (p_meta) {
+		if (p_meta && !p_held) {
 			rel_meta[nr_rel] = p_meta;
 			rel_snap[nr_rel] = snap_p;
 			nr_rel++;
 		}
-		if (gp_meta) {
+		if (gp_meta && !p_held) {
 			rel_meta[nr_rel] = gp_meta;
 			rel_snap[nr_rel] = snap_gp;
 			nr_rel++;
@@ -2448,7 +2457,8 @@ int ft_node_replace_ptr(struct cds_ft *ft,
 		bool is_root,
 		unsigned int node_depth,
 		struct ft_remove_pub *pub,
-		struct ft_flip_txn *retire_txn)
+		struct ft_flip_txn *retire_txn,
+		bool parent_held)
 {
 	int ret;
 	unsigned int type_index;
@@ -2463,12 +2473,35 @@ int ft_node_replace_ptr(struct cds_ft *ft,
 	type = &ft_types[type_index];
 	ret = _ft_node_replace_ptr(ft, type, node, *parent_node_flag_ptr, metadata, node_flag_ptr, n, newptr, pub);
 	if (ret == -EFBIG) {
+		/*
+		 * FOLD (parent_held): a same-trie rekey folds this delete-recompaction
+		 * of the src junction with a graft that ALREADY COPYING-holds the
+		 * shared spine parent -- pass a hint so the recompaction reuses that
+		 * held lock (republish into it SW) instead of re-acquiring it (which
+		 * would abort -EAGAIN).  @metadata is the recompacted node's own meta,
+		 * so ft_resolve_parent_slot yields its (held) parent + slot.
+		 */
+		struct ft_parent_hint held_hint;
+		const struct ft_parent_hint *hint = NULL;
+
 		assert(!newptr);
+		if (parent_held) {
+			struct cds_ft_inode_flag *pf_p = NULL;
+			struct cds_ft_inode_flag **pf_p_slot =
+				ft_resolve_parent_slot(metadata, ft, &pf_p);
+
+			held_hint = (struct ft_parent_hint){
+				.parent = pf_p, .slot = pf_p_slot,
+				.gp = NULL, .gp_slot = NULL,
+				.parent_held = true,
+			};
+			hint = &held_hint;
+		}
 		/* Should try recompaction. */
 		ret = ft_node_recompact(FT_RECOMPACT_DEL, ft, type_index, type, node,
 				metadata, parent_node_flag_ptr, n, NULL,
 				node_flag_ptr, old_node_ret, is_root, node_depth,
-				false, NULL, retire_txn, NULL);
+				false, NULL, retire_txn, hint);
 	}
 	if (ret == 0)
 		FT_TP(tree_edge_set, (const void *) ft,

@@ -966,7 +966,7 @@ int ft_merge_unlink_src_subtree(struct cds_ft *src_ft,
 				 * -detached_count rides ft_detach_node's own commit (exact
 				 * under concurrent writers; magnitude-agnostic leaf machinery).
 				 */
-				-(long) detached_count, NULL, false);
+				-(long) detached_count, NULL, false, false, NULL);
 	}
 	if (ret < 0) {
 		/*

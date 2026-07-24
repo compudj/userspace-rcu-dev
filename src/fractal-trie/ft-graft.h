@@ -808,15 +808,18 @@ enum urcu_txn_status ft_store_at_graft_point_commit(struct cds_ft *ft,
 		if (st->glue->record_only) {
 			/*
 			 * FOLD (coherent rekey one-decide writer): the whole dst-attach
-			 * (slot NULL -> S_top', any recompact retire, count) is now
-			 * recorded into the caller's SHARED txn; the caller runs the ONE
-			 * commit that also carries the src-unlink + S_top COW.  Simple
-			 * shape only -- no reserve recompaction (old_recompacted_node
-			 * NULL) and the caller owns the cells (run NULL) -- so there is no
-			 * post-commit free / run-arm to hoist here; leave st->glue->txn
-			 * intact for the caller and report the recorded outputs.
+			 * (slot NULL -> S_top', the reserve recompaction's re-parents +
+			 * fenced retire, count) is now recorded into the caller's SHARED
+			 * txn; the caller runs the ONE commit that also carries the
+			 * src-unlink + S_top COW.  A reserve recompaction relocated the dst
+			 * attach node -- its OLD copy stays LIVE (resolved through the
+			 * parked grandparent proxy) until the CALLER's commit, so its free
+			 * is DEFERRED to the caller: hand it out via @st->old_recompacted_
+			 * node (which the caller reads off its own @st).  The caller owns
+			 * the cells (run NULL here, list off).  Leave st->glue->txn intact
+			 * and report the recorded outputs.
 			 */
-			assert(!st->old_recompacted_node && !run);
+			assert(!run);
 			*attached_nf = st->attached;
 			*attached_depth = st->attached_depth;
 			return URCU_TXN_STATUS_OK;
@@ -3096,7 +3099,7 @@ retry_swap:
 					false, NULL, gs_ord ? &dpub : NULL,
 					gs_ord ? &drun : NULL, NULL, NULL,
 					-(long) old_count /* fold -old_count onto the detach commit */,
-					NULL, false);
+					NULL, false, false, NULL);
 			cds_ft_alloc_reserve_deactivate(dst_ft);
 #ifdef FEATURE_FT_MW_LOCK_FINE_DROP
 			/*

@@ -92,6 +92,17 @@ struct ft_parent_hint {
 	 */
 	struct cds_ft_inode_flag *gp;		/* d->pppnf: @parent's parent. */
 	struct cds_ft_inode_flag **gp_slot;	/* d->ppnfp: @parent's slot in @gp. */
+	/*
+	 * FOLD (coherent rekey one-decide writer): @parent is ALREADY COPYING-held
+	 * by an EARLIER step of the same op (the graft's dst-parent recompaction
+	 * locked the shared spine ancestor -- in a same-trie rekey the folded graft
+	 * and detach share @parent), so this recompaction must NOT re-acquire it (a
+	 * second ft_dlm_lock would see it held and abort -EAGAIN) and must NOT record
+	 * a second release (the holding step owns it).  It still locks the recompacted
+	 * node C and republishes into @parent as an SW edge under the held lock.
+	 * False for every ordinary recompaction (each acquires + releases @parent).
+	 */
+	bool parent_held;
 };
 
 static
@@ -2313,22 +2324,21 @@ enum urcu_txn_status ft_ord_cell_flip_into(struct cds_ft *ft,
  * rekey one-decide writer records the src-unlink -- through here -- and the
  * dst-attach + S_top COW into the same @t, then commits once).
  *
- * ALL edges are recorded MW (ft_flip_txn_record_tag_mw), regardless of @t's
- * structural_sw mode.  The src-unlink these edges express is the SIMPLE-case
- * detach: the src junction (BP) SURVIVES with one fewer child and is NOT
- * DLM-locked, so its forward-slot clear + nr_child-- are validated-CAS MW parks
- * that abort the mixed commit CLEAN on a peer conflict (a concurrent structural
- * touch of BP), exactly as today's standalone detach commit does -- and the
- * caller re-descends.  Parking them SW would be a plain locked store on an
- * UNLOCKED node (the 2a clobber).  The SW side of the fold -- the COW'd S_top'
- * children re-parents + S_top retire + the dst forward publish -- holds its DLM
- * COPYING locks and is recorded SW by ft_rekey_cow_stop / the graft committer,
- * NOT here.  The cell / hlist edges are inherently MW anyway (lock-free list).
- * The mixed commit installs these MW edges first (may abort), then parks the SW
- * side just before the flip.  @t must be pre-reserved for >= @n edges (record
- * cannot fail).  No commit here => the run-arm (ft_ord_cell_run_install) a
- * self-committing flip does inline must be deferred by the caller to its
- * post-commit finalize.
+ * Per-edge SW/MW by tag: a STRUCTURAL trie edge (tag unset -> ft_edge_tag ==
+ * FT_FLIP_PROXY_TAG) goes through ft_flip_txn_record_tag, so it parks SW when @t
+ * opted into structural_sw; a CELL / hlist edge (URCU_TXN_TAG) goes through
+ * record_tag_mw (ALWAYS MW -- the ordered list stays lock-free, a cell conflict
+ * aborts the mixed commit clean).  The src-unlink these edges express is the
+ * default-build detach, which RECOMPACTS the src junction: the recompaction holds
+ * the rebuilt node's COPYING lock AND (via the fold's parent_held coordination)
+ * the shared spine parent it republishes into, so the structural forward-publish /
+ * re-parent edges are legitimately SW.  (Byte-identical to ft_ord_cell_flip_into's
+ * record loop when structural_sw is false -- record_tag == record_tag_mw -- so the
+ * FEATURE_FT_INSERT_IN_PLACE single-writer in-place delete, which is unlocked but
+ * has no concurrent peer, is equally fine either way.)  @t must be pre-reserved
+ * for >= @n edges (record cannot fail).  No commit here => the run-arm
+ * (ft_ord_cell_run_install) a self-committing flip does inline must be deferred by
+ * the caller to its post-commit finalize.
  */
 static
 void ft_ord_cell_record_into(struct ft_flip_txn *t,
@@ -2336,11 +2346,18 @@ void ft_ord_cell_record_into(struct ft_flip_txn *t,
 {
 	unsigned int i;
 
-	for (i = 0; i < n; i++)
-		ft_flip_txn_record_tag_mw(t, (void **) edges[i].slot,
-			(void *) edges[i].old_target,
-			(void *) edges[i].new_target,
-			ft_edge_tag(&edges[i]));
+	for (i = 0; i < n; i++) {
+		uintptr_t tag = ft_edge_tag(&edges[i]);
+
+		if (tag == FT_FLIP_PROXY_TAG)
+			ft_flip_txn_record_tag(t, (void **) edges[i].slot,
+				(void *) edges[i].old_target,
+				(void *) edges[i].new_target, tag);
+		else
+			ft_flip_txn_record_tag_mw(t, (void **) edges[i].slot,
+				(void *) edges[i].old_target,
+				(void *) edges[i].new_target, tag);
+	}
 }
 
 /*
@@ -3007,7 +3024,7 @@ static
 enum urcu_txn_status ft_remove_commit_rec(struct cds_ft *ft,
 		struct ft_pub_rec *rec,
 		struct ft_ord_cell *dead_cell, struct ft_detach_run *run,
-		struct ft_flip_txn *txn)
+		struct ft_flip_txn *txn, bool record_only)
 {
 	struct ft_ord_cell_edge edges[FT_REMOVE_COMMIT_REC_MAX_EDGES] = { 0 };
 	unsigned int n = 0, i;
@@ -3023,6 +3040,21 @@ enum urcu_txn_status ft_remove_commit_rec(struct cds_ft *ft,
 			&run->first, &run->last, edges, n);
 	else if (dead_cell)
 		n = ft_ord_cell_unsplice_edges(ft, dead_cell, edges, n);
+	if (record_only) {
+		/*
+		 * FOLD (coherent rekey one-decide writer): record the recompaction's
+		 * forward republish (+ any cell edges) into the caller's SHARED txn
+		 * WITHOUT committing -- the caller runs the ONE commit that also carries
+		 * the dst-attach + S_top COW.  Structural edges park SW (the recompacted
+		 * src junction holds its own + the shared-spine parent's COPYING lock via
+		 * the fold's parent_held coordination); cells stay MW.  The run-arm is
+		 * deferred to the caller's post-commit finalize; the record-only rekey is
+		 * list-off (no run/cell) so far -- asserted.
+		 */
+		assert(!run && !dead_cell);
+		ft_ord_cell_record_into(txn, edges, n);
+		return URCU_TXN_STATUS_OK;
+	}
 	if (txn) {
 		enum urcu_txn_status st = ft_ord_cell_flip_into(ft, txn,
 				edges, n);

@@ -111,7 +111,7 @@ void ft_compact_relocate_at(struct cds_ft *ft, struct cds_ft_inode_flag **holder
 	 * becomes reader-reachable at *holder and the old copy is frozen dead.
 	 */
 	/* Compaction, not yet MW-hardened: ABORT unreachable under its exclusion. */
-	(void) ft_remove_commit_rec(ft, &rec, NULL, NULL, txn);
+	(void) ft_remove_commit_rec(ft, &rec, NULL, NULL, txn, false);
 	/*
 	 * The old node was just unpublished; concurrent readers may still
 	 * hold it, so free it after a grace period.  Its range's nr_live
