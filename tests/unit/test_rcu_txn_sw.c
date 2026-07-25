@@ -37,15 +37,12 @@
 
 static int is_proxy(void *v)
 {
-	return (unsigned long) v & 1UL;
+	return urcu_txn_sw_is_proxy(v, TEST_TAG);
 }
 
 static void *resolve(void *v)
 {
-	if (is_proxy(v))
-		return urcu_txn_sw_proxy_get(
-			(struct urcu_txn_sw_proxy *) ((unsigned long) v & ~1UL));
-	return v;
+	return urcu_txn_sw_resolve(v, TEST_TAG);
 }
 
 static unsigned long reclaim_calls;

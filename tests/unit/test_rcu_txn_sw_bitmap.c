@@ -82,10 +82,7 @@ static int tag_invariant_ok(const uintptr_t *words, size_t nwords)
  */
 static void *sw_resolve(void *v)
 {
-	if ((uintptr_t) v & URCU_TXN_SW_BITMAP_TAG)
-		return urcu_txn_sw_proxy_get((struct urcu_txn_sw_proxy *)
-				((uintptr_t) v & ~(uintptr_t) URCU_TXN_SW_BITMAP_TAG));
-	return v;
+	return urcu_txn_sw_resolve(v, URCU_TXN_SW_BITMAP_TAG);
 }
 
 /* ------------------------------------------------------------------ */

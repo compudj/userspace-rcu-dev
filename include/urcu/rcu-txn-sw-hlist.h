@@ -184,16 +184,8 @@ static inline
 struct urcu_txn_sw_hlist_node *urcu_txn_sw_hlist_resolve(
 		struct urcu_txn_sw_hlist_node *ptr)
 {
-	uintptr_t v = (uintptr_t) ptr;
-
-	if (caa_unlikely((v & URCU_TXN_SW_HLIST_TAG) == URCU_TXN_SW_HLIST_TAG)) {
-		struct urcu_txn_sw_proxy *proxy = (struct urcu_txn_sw_proxy *)
-				(v & ~(uintptr_t) URCU_TXN_SW_HLIST_TAG);
-
-		return (struct urcu_txn_sw_hlist_node *)
-				urcu_txn_sw_proxy_get(proxy);
-	}
-	return ptr;
+	return (struct urcu_txn_sw_hlist_node *)
+			urcu_txn_sw_resolve(ptr, URCU_TXN_SW_HLIST_TAG);
 }
 
 /* Resolved bucket-first / forward step (call under rcu_read_lock()). */

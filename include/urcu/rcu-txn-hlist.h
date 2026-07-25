@@ -261,6 +261,10 @@ int urcu_txn_hlist_is_marked(void *v)
 	return (int) ((uintptr_t) v & URCU_TXN_HLIST_MARK);
 }
 
+/*
+ * A MASK, not the subtraction the engine's proxy untag uses: no caller has
+ * proven the mark set here.  See urcu_txn_list_unmark() for the full rationale.
+ */
 static inline
 struct urcu_txn_hlist_node *urcu_txn_hlist_unmark(void *v)
 {

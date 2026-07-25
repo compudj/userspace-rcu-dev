@@ -168,13 +168,8 @@ uintptr_t urcu_txn_sw_bitmap_word_rcu(const uintptr_t *words, size_t w)
 	uintptr_t v = (uintptr_t) uatomic_load(&((uintptr_t *) words)[w],
 			CMM_ACQUIRE);
 
-	if (caa_unlikely((v & URCU_TXN_SW_BITMAP_TAG) == URCU_TXN_SW_BITMAP_TAG)) {
-		struct urcu_txn_sw_proxy *proxy = (struct urcu_txn_sw_proxy *)
-				(v & ~(uintptr_t) URCU_TXN_SW_BITMAP_TAG);
-
-		return (uintptr_t) urcu_txn_sw_proxy_get(proxy);
-	}
-	return v;
+	return (uintptr_t) urcu_txn_sw_resolve((void *) v,
+			URCU_TXN_SW_BITMAP_TAG);
 }
 
 /* True iff logical @bit is set.  Call within an RCU read-side section. */

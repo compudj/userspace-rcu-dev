@@ -245,22 +245,53 @@ urcu_static_assert(!(__alignof__(struct urcu_txn_desc) % 16),
 /* A convenient default tag (bit 0) for an embedder that keeps bit 0 free. */
 #define URCU_TXN_TAG	1UL
 
-static inline
-void *urcu_txn_tag(struct urcu_txn_record *r, uintptr_t tag)
-{
-	return (void *) ((uintptr_t) r | tag);
-}
-
-static inline
-struct urcu_txn_record *urcu_txn_untag(void *v, uintptr_t tag)
-{
-	return (struct urcu_txn_record *) ((uintptr_t) v & ~tag);
-}
-
+/*
+ * Does @v carry ALL of @tag's bits -- i.e. is it a parked proxy rather than a
+ * live value?  The embedder's tag contract is that no live value a transacted
+ * slot holds may do so.
+ */
 static inline
 int urcu_txn_is_proxy(void *v, uintptr_t tag)
 {
 	return ((uintptr_t) v & tag) == tag;
+}
+
+static inline
+void *urcu_txn_tag(struct urcu_txn_record *r, uintptr_t tag)
+{
+	/*
+	 * The tag bits must be FREE in the record address, or OR-ing them in
+	 * is not reversible: recs[] is 16-byte aligned with a 16-byte stride
+	 * and the tag lives in the low 4 bits.  This is the standing invariant
+	 * of the encoding, not a new one -- untag by mask needs it just as
+	 * much -- so state it once here, where the tagged value is made.
+	 */
+	urcu_assert_debug(!((uintptr_t) r & tag));
+	return (void *) ((uintptr_t) r | tag);
+}
+
+/*
+ * Recover the record address from a parked slot value.
+ *
+ * SUBTRACT the tag rather than masking it off.  The two are exactly equivalent
+ * here: untag is only ever reached once urcu_txn_is_proxy() has proven every
+ * tag bit SET in @v, and urcu_txn_tag() asserts every tag bit CLEAR in the
+ * record address, so the tag bits are precisely the difference between the two.
+ *
+ * The subtraction generates better code on the resolve path.  With a
+ * compile-time-constant @tag the compiler folds it into the DISPLACEMENT of the
+ * loads that follow -- r->desc becomes one mov at [v + (offsetof(desc) - tag)]
+ * -- so the head of the resolve's load-to-use chain issues straight off the raw
+ * tagged value.  The AND cannot fold: it is a real ALU op sitting between the
+ * slot load and the first dependent load, adding a cycle to a chain that is
+ * already three dependent loads deep (record -> desc -> status).  Same trick,
+ * same reason, as the fractal trie's FT_NODE_SUB_TAG.
+ */
+static inline
+struct urcu_txn_record *urcu_txn_untag(void *v, uintptr_t tag)
+{
+	urcu_assert_debug(urcu_txn_is_proxy(v, tag));
+	return (struct urcu_txn_record *) ((uintptr_t) v - tag);
 }
 
 /* Strong try-CAS returning a success bit. */

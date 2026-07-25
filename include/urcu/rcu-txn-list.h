@@ -187,6 +187,20 @@ int urcu_txn_list_is_marked(void *v)
 	return (int) ((uintptr_t) v & URCU_TXN_LIST_MARK);
 }
 
+/*
+ * Strips the mark with a MASK, and must: unlike the engine's proxy untag -- a
+ * subtraction, see urcu_txn_untag() -- no caller here has PROVEN the mark set.
+ * Every site strips defensively from a value that may or may not carry it (the
+ * resolve below enters its slow path when the proxy tag OR the mark is set;
+ * the writer-side prev loads strip whatever they find), so a subtraction would
+ * corrupt an unmarked pointer.
+ *
+ * Splitting the resolve so the mark-only path could subtract a proven-set bit
+ * buys nothing anyway: unlike the proxy untag, whose result immediately heads
+ * one constant-offset load (r->desc) and so folds into that load's
+ * displacement, the unmarked pointer feeds a traversal cursor with several
+ * uses.  It does not fold -- measured: one ALU op either way, identical code.
+ */
 static inline
 struct urcu_txn_list_node *urcu_txn_list_unmark(void *v)
 {

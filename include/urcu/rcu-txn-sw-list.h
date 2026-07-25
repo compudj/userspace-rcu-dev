@@ -149,16 +149,8 @@ void urcu_txn_sw_list_init(struct urcu_txn_sw_list_head *head)
 static inline
 struct urcu_txn_sw_list_node *urcu_txn_sw_list_resolve(struct urcu_txn_sw_list_node *ptr)
 {
-	uintptr_t v = (uintptr_t) ptr;
-
-	if (caa_unlikely(v & URCU_TXN_SW_LIST_PROXY_TAG)) {
-		struct urcu_txn_sw_proxy *proxy = (struct urcu_txn_sw_proxy *)
-				(v & ~(uintptr_t) URCU_TXN_SW_LIST_PROXY_TAG);
-
-		return (struct urcu_txn_sw_list_node *)
-				urcu_txn_sw_proxy_get(proxy);
-	}
-	return ptr;
+	return (struct urcu_txn_sw_list_node *)
+			urcu_txn_sw_resolve(ptr, URCU_TXN_SW_LIST_PROXY_TAG);
 }
 
 /*

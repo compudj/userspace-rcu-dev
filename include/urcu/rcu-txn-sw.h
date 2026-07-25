@@ -165,6 +165,42 @@ void urcu_txn_sw_proxy_init(struct urcu_txn_sw_proxy *proxy,
 }
 
 /*
+ * Does @v carry ALL of @tag's bits -- i.e. is it a parked proxy rather than a
+ * live value?  The engine's tag contract (see urcu_txn_sw_record) is that no
+ * live value an embedder stores in a transacted slot may do so.
+ */
+static inline
+int urcu_txn_sw_is_proxy(const void *v, uintptr_t tag)
+{
+	return ((uintptr_t) v & tag) == tag;
+}
+
+/*
+ * Recover the proxy address from a parked slot value.
+ *
+ * SUBTRACT the tag rather than masking it off.  The two are exactly equivalent
+ * here: untag is only ever reached once urcu_txn_sw_is_proxy() has proven every
+ * tag bit SET in @v, and the tag bits are CLEAR in the proxy address (latches
+ * are 16-byte aligned and the tag lives in the low 4 bits), so the tag bits are
+ * precisely the difference between the two.
+ *
+ * The subtraction generates better code.  With a compile-time-constant @tag the
+ * compiler folds it into the DISPLACEMENT of the loads that follow -- the
+ * proxy->group load becomes one mov at [v + (offsetof(group) - tag)] -- so the
+ * head of the resolve's load-to-use chain issues straight off the raw tagged
+ * value.  The AND cannot fold: it is a real ALU op sitting between the slot
+ * load and the first dependent load, adding a cycle to a chain that is already
+ * three dependent loads deep (proxy -> group -> selector -> ptr[sel]).  Same
+ * trick, same reason, as the fractal trie's FT_NODE_SUB_TAG.
+ */
+static inline
+struct urcu_txn_sw_proxy *urcu_txn_sw_untag(void *v, uintptr_t tag)
+{
+	urcu_assert_debug(urcu_txn_sw_is_proxy(v, tag));
+	return (struct urcu_txn_sw_proxy *) ((uintptr_t) v - tag);
+}
+
+/*
  * Resolve a proxy to its current target.
  *
  * @proxy must have been obtained by dereferencing (rcu_dereference) the slot
@@ -181,6 +217,20 @@ static inline
 void *urcu_txn_sw_proxy_get(const struct urcu_txn_sw_proxy *proxy)
 {
 	return proxy->ptr[uatomic_load(&proxy->group->selector, CMM_ACQUIRE)];
+}
+
+/*
+ * Resolve a value loaded from a slot transacted under @tag: a plain value
+ * passes through untouched, a parked proxy resolves through its flip selector.
+ * The typed reader accessors of the sw embedders (list, hlist, bitmap) are
+ * wrappers over this; it mirrors urcu_txn_resolve() on the MCAS side.
+ */
+static inline
+void *urcu_txn_sw_resolve(void *v, uintptr_t tag)
+{
+	if (caa_likely(!urcu_txn_sw_is_proxy(v, tag)))
+		return v;
+	return urcu_txn_sw_proxy_get(urcu_txn_sw_untag(v, tag));
 }
 
 /*
@@ -397,14 +447,14 @@ struct urcu_txn_sw_txn {
 	} while (0)
 
 /*
- * Does @v carry all of @tag's bits -- i.e. is it a parked proxy rather than a
- * live value?  The engine's tag contract (see urcu_txn_sw_record) is that no
- * live value an embedder stores in a transacted slot may do so.
+ * urcu_txn_sw_is_proxy() with tag == 0 excluded: the bare predicate is
+ * vacuously true for every value under a zero tag, which would make this
+ * validator abort on a perfectly clean slot.
  */
 static inline
 int urcu_txn_sw__is_proxy(const void *v, uintptr_t tag)
 {
-	return tag != 0 && ((uintptr_t) v & tag) == tag;
+	return tag != 0 && urcu_txn_sw_is_proxy(v, tag);
 }
 
 static inline
