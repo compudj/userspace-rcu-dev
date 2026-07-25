@@ -236,16 +236,20 @@ static struct cds_ft *create_fixed_ord_ft(size_t klen,
 }
 
 /*
- * Fixed-length ordered-list trie with REKEY coherence ENABLED (per-trie attr):
- * every exact lookup runs the second-walk re-descend
- * (cds_ft_attr_set_rekey_coherence).  Requires the ordered list (the up-walk
- * rematerializer's cell source).
+ * Fixed-length ordered-list trie: REKEY coherence needs no attribute any more --
+ * every EAGER ordered-list trie carries the coherent lookup variants and the
+ * per-trie MOVE GATE decides per call, so a test only has to hold the gate open
+ * (_cds_ft_debug_move_gate_enter) to run the coherent path.
  */
+/* Move mode gate hooks (fractal-trie.c): let a single-threaded test run the
+ * coherent reader path, which is otherwise correctly skipped with no move. */
+extern void _cds_ft_debug_move_gate_enter(struct cds_ft *ft);
+extern void _cds_ft_debug_move_gate_exit(struct cds_ft *ft);
+
 static struct cds_ft *create_fixed_ord_rekey_ft(size_t klen,
 		struct cds_ft_group **group_out)
 {
 	struct cds_ft_group_attr *gattr;
-	struct cds_ft_attr *attr;
 	struct cds_ft_group *group;
 	struct cds_ft *ft;
 
@@ -258,13 +262,8 @@ static struct cds_ft *create_fixed_ord_rekey_ft(size_t klen,
 	if (cds_ft_group_create(gattr, &group) < 0)
 		abort();
 	cds_ft_group_attr_destroy(gattr);
-	if (cds_ft_attr_create(&attr) < 0)
+	if (cds_ft_create(group, NULL, &ft) < 0)
 		abort();
-	if (cds_ft_attr_set_rekey_coherence(attr, true) < 0)
-		abort();
-	if (cds_ft_create(group, attr, &ft) < 0)
-		abort();
-	cds_ft_attr_destroy(attr);
 	*group_out = group;
 	return ft;
 }
@@ -810,8 +809,9 @@ static int test_rekey_graft_simple(void)
 		return -1;
 	}
 
-	rcu_read_lock();
+	/* The move takes the gate + a grace period: NOT from a read section. */
 	rc = _cds_ft_debug_rekey_graft_simple(ft, src_key, 2, dst_key, 2);
+	rcu_read_lock();
 	s_top_after = _cds_ft_debug_child_at(ft, dst_key, 2);
 	rcu_read_unlock();
 	if (rc != 0) {
@@ -975,8 +975,9 @@ static int test_rekey_graft_liston(void)
 		return -1;
 	}
 
-	rcu_read_lock();
+	/* The move takes the gate + a grace period: NOT from a read section. */
 	i = _cds_ft_debug_rekey_graft_simple(ft, src_key, 2, dst_key, 2);
+	rcu_read_lock();
 	s_top_after = _cds_ft_debug_child_at(ft, dst_key, 2);
 	rcu_read_unlock();
 	if (i != 0) {
@@ -1096,9 +1097,7 @@ static int test_rekey_graft_liston(void)
 		uint8_t adj_dst[2] = { RK_DX, RK_DZ + 1 };
 		int arc;
 
-		rcu_read_lock();
 		arc = _cds_ft_debug_rekey_graft_simple(ft, adj_src, 2, adj_dst, 2);
-		rcu_read_unlock();
 		if (arc != -EINVAL) {
 			fprintf(stderr, "rekey-graft list-on: adjacency shape not rejected "
 				"(rc=%d)\n", arc);
@@ -1798,13 +1797,14 @@ static int test_status_to_string(void)
  * Basic insert on an empty trie and verify count/empty.
  */
 /*
- * REKEY coherence (cds_ft_attr_set_rekey_coherence): with the opt-in ON and NO
- * concurrent rekey, every exact lookup's second walk MATCHES (the leaf's
- * structural key equals the descended key), so results are identical to a plain
- * trie -- present keys found at their node, absent keys NOT_FOUND, and crucially
- * no infinite re-descend on a valid hit.  Single-threaded correctness gate for
- * the coherent lookup specialization; its mismatch/re-descend arm is exercised
- * concurrently by the writer-side merge conversion.
+ * REKEY coherence with the MOVE GATE HELD OPEN and no actual move: every exact
+ * lookup runs the witness and it MATCHES (the leaf's structural key equals the
+ * descended key), so results are identical to a plain trie -- present keys found
+ * at their node, absent keys NOT_FOUND, and crucially no infinite re-descend on a
+ * valid hit.  Single-threaded correctness gate for the coherent lookup
+ * specialization; the mismatch/re-descend arm is forced by
+ * test_rekey_coherence_fault_redescend and exercised for real by the concurrent
+ * rekey oracles.
  */
 static int test_rekey_coherence_lookup(void)
 {
@@ -1828,6 +1828,11 @@ static int test_rekey_coherence_lookup(void)
 			goto out;
 		}
 	}
+	/*
+	 * Hold the MOVE GATE open for the lookups below so they really run the
+	 * coherent path (fast path otherwise -- nothing to be coherent with).
+	 */
+	_cds_ft_debug_move_gate_enter(ft);
 	/* Present keys: found via the coherent path, at the inserted node. */
 	for (i = 0; i < 256; i++) {
 		struct cds_ft_node *out = NULL;
@@ -1911,6 +1916,7 @@ static int test_rekey_coherence_lookup(void)
 		cds_ft_iter_destroy(iter);
 	}
 out:
+	_cds_ft_debug_move_gate_exit(ft);	/* balances the enter above */
 	if (drain_and_destroy(ft, group) != 0)
 		ret = -1;
 	return ret;
@@ -22654,10 +22660,17 @@ static int test_rekey_coherence_fault_redescend(void)
 		ret = -1;
 		goto out;
 	}
+	/*
+	 * Hold the MOVE GATE open: with no move in flight the reader takes the fast
+	 * path and never consults the witness, so the forced miss would land on dead
+	 * code and this test would assert nothing.
+	 */
+	_cds_ft_debug_move_gate_enter(ft);
 	cds_ft_fault_rekey_countdown = 0;	/* force one coherence miss */
 	rcu_read_lock();
 	s = lookup_u64(ft, 0x1234, &out);
 	rcu_read_unlock();
+	_cds_ft_debug_move_gate_exit(ft);
 	if (s != CDS_FT_STATUS_OK || out != &n->node) {
 		fprintf(stderr,
 			"rekey re-descend: wrong result after forced miss\n");

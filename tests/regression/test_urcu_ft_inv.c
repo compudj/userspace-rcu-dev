@@ -1154,10 +1154,15 @@ static void *rk_writer(void *arg)
 		uint8_t dst_key[2] = { oth, w->sb };
 		int rc;
 
-		rcu_read_lock();
+		/*
+		 * NO read lock here: the move enters the per-trie MOVE GATE, which
+		 * publishes "expect move" to readers and waits a GRACE PERIOD before
+		 * the structure is touched.  Holding a read section across that would
+		 * deadlock on our own critical section; the entry takes the read lock
+		 * the body needs itself.
+		 */
 		rc = _cds_ft_debug_rekey_graft_simple(w->ft, src_key, 2,
 				dst_key, 2);
-		rcu_read_unlock();
 		if (rc == 0) {
 			w->at_dst = !w->at_dst;
 			w->ops++;
@@ -1401,8 +1406,11 @@ static struct cds_ft *create_fixed_rekey_coherent_ft(size_t klen,
 	cds_ft_group_attr_destroy(gattr);
 	if (cds_ft_attr_create(&attr) < 0)
 		abort();
-	if (cds_ft_attr_set_rekey_coherence(attr, true) < 0)
-		abort();
+	/*
+	 * Rekey coherence needs no opt-in: it is automatic on an EAGER ordered-list
+	 * trie, gated at runtime by the per-trie MOVE GATE.  EAGER is the only
+	 * requirement, so that is all this asks for.
+	 */
 	if (cds_ft_attr_set_speculative_keys(attr, false) < 0)	/* rekey needs EAGER keys */
 		abort();
 	if (cds_ft_create(group, attr, &ft) < 0)
