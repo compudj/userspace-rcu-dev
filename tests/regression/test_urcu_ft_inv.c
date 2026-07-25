@@ -68,7 +68,7 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_MW_DLM_ACQUIRE
-#define NR_TESTS_REKEY_DLM	1	/* inv_rekey_graft_disjoint */
+#define NR_TESTS_REKEY_DLM	2	/* inv_rekey_graft_disjoint, _coherent_readers */
 #else
 #define NR_TESTS_REKEY_DLM	0
 #endif
@@ -1335,6 +1335,287 @@ static int inv_rekey_graft_disjoint(void)
 		live);
 
 	free(w);
+	if (drain_and_destroy(ft, group) < 0)
+		ret = -1;
+	if (leak_check() < 0)
+		ret = -1;
+	return ret;
+}
+
+/*
+ * Coherent-rekey oracle WITH READERS: the disjoint rekey writers run against a
+ * trie whose per-trie rekey coherence is ENABLED (cds_ft_attr_set_rekey_coherence),
+ * so every exact lookup runs the landed second-walk (up-walk key rematerializer)
+ * re-descend.  This is the FIRST CONCURRENT exercise of that shipped coherent
+ * lookup (its unit tests are single-threaded), and the reader/writer memory-safety
+ * probe: a reader descending through S_top / BP races the writer COW'ing S_top and
+ * recompacting BP (fresh nodes, old freed after a grace period), so it is run under
+ * ASAN to catch any use-after-free / double-free across the move.
+ *
+ * SOUND "never absent" assertion anchored on the FIXED sibling keys: each junction's
+ * (X,1) / (X,5) sibs never move and are therefore present at ALL times, yet a
+ * reader's descent to a sib passes through BP, which is COW-recompacted on EVERY
+ * move -- so a coherent lookup of a sib that ever MISSES (or returns a wrong node)
+ * is a real atomicity / coherence failure (a descent torn across BP's recompaction
+ * that the second-walk failed to repair).  The MOVING keys (X,3,c) are checked
+ * weakly (a single atomic coherent lookup returns miss XOR the one node that key
+ * ever maps to -- never a foreign node); full linearizability of a moving key needs
+ * the deferred per-op epoch, so right-node-wrong-instant is out of scope here.
+ *
+ * EXACT lookups descend the trie + up-walk parent pointers; they do NOT traverse
+ * the ordered-list cells, so this oracle does not exercise the deferred plan-Q3 cell
+ * outer-link window (that is a relational/iteration-coherence concern, not built).
+ * Opt-in FT_INV_MW=1.
+ */
+#define RK_NR		8		/* coherent readers */
+
+struct rk_reader_arg {
+	struct cds_ft *ft;
+	struct rk_writer_arg *w;		/* the writer array (node shadow) */
+	int nw;
+	unsigned long checks;
+	int failed;
+};
+
+static struct cds_ft *create_fixed_rekey_coherent_ft(size_t klen,
+		struct cds_ft_group **group_out)
+{
+	struct cds_ft_group_attr *gattr;
+	struct cds_ft_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+
+	if (cds_ft_group_attr_create(&gattr) < 0)
+		abort();
+	if (cds_ft_group_attr_set_key_len(gattr, klen) < 0)
+		abort();
+	if (cds_ft_group_attr_set_writer_strategy(gattr,
+			CDS_FT_WRITER_LOCK_FINE) < 0)
+		abort();
+	if (cds_ft_group_attr_set_ordered_list(gattr, true) < 0)	/* up-walk cell source */
+		abort();
+	if (cds_ft_group_create(gattr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(gattr);
+	if (cds_ft_attr_create(&attr) < 0)
+		abort();
+	if (cds_ft_attr_set_rekey_coherence(attr, true) < 0)
+		abort();
+	if (cds_ft_attr_set_speculative_keys(attr, false) < 0)	/* rekey needs EAGER keys */
+		abort();
+	if (cds_ft_create(group, attr, &ft) < 0)
+		abort();
+	cds_ft_attr_destroy(attr);
+	*group_out = group;
+	return ft;
+}
+
+static void *rk_reader(void *arg)
+{
+	struct rk_reader_arg *r = (struct rk_reader_arg *) arg;
+	struct cds_ft_iter *iter;
+	unsigned int seed = (unsigned int) (uintptr_t) r;
+	unsigned long iters = 0;
+
+	rcu_register_thread();
+	if (cds_ft_iter_create(r->ft, &iter) < 0)
+		abort();
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	while (!test_stop) {
+		int wi = rand_r(&seed) % r->nw;
+		struct rk_writer_arg *w = &r->w[wi];
+		uint64_t bpk = (uint64_t) w->bp << 24, dpk = (uint64_t) w->dp << 24;
+		int pick = rand_r(&seed) & 7;
+		struct cds_ft_node *found, *expect;
+		int must_find;
+		uint64_t key;
+		uint8_t k[8];
+
+		if (pick < 4) {
+			/* FIXED sibling (X,1)/(X,5): always present -> must be found. */
+			key = ((pick < 2) ? bpk : dpk) | (((pick & 1) ? 5ULL : 1ULL) << 16);
+			expect = &w->sib[pick]->node;
+			must_find = 1;
+		} else {
+			/* MOVING leaf (X,3,c): miss XOR this leaf, never a foreign node. */
+			int c = pick & 3;
+
+			key = ((rand_r(&seed) & 1) ? dpk : bpk) | (3ULL << 16) |
+				((uint64_t) (c + 1) << 8);
+			expect = &w->top[c]->node;
+			must_find = 0;
+		}
+		cds_ft_u64_to_key(r->ft, key, k, CDS_FT_LEN_DEFAULT);
+		rcu_read_lock();
+		cds_ft_iter_set_key(iter, k, CDS_FT_LEN_DEFAULT);
+		cds_ft_lookup(r->ft, iter);
+		found = cds_ft_iter_node(iter);
+		if ((must_find && found != expect) ||
+				(!must_find && found && found != expect)) {
+			fprintf(stderr, "rk_reader: key %#llx -> %p (expect %s%p)\n",
+				(unsigned long long) key, (void *) found,
+				must_find ? "" : "miss or ", (void *) expect);
+			r->failed = 1;
+			rcu_read_unlock();
+			mw_violation_snapshot();
+			break;
+		}
+		rcu_read_unlock();
+		r->checks++;
+		if ((++iters & 0xff) == 0)
+			rcu_quiescent_state();
+	}
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static int inv_rekey_graft_coherent_readers(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	struct rk_writer_arg *w;
+	struct rk_reader_arg *r;
+	pthread_t writers[RK_NW], readers[RK_NR];
+	struct ft_test_node *guard_lo, *guard_hi;
+	struct timespec t0;
+	unsigned long total_ops = 0, total_retries = 0, total_checks = 0, live = 0;
+	int i, c, ret = 0;
+
+	if (!getenv("FT_INV_MW")) {
+		fprintf(stderr, "# inv_rekey_graft_coherent_readers: skipped "
+			"(set FT_INV_MW=1 to run the coherent-rekey reader oracle)\n");
+		return 0;
+	}
+	mw_install_fatal_handler();
+	leak_reset();
+
+	ft = create_fixed_rekey_coherent_ft(4, &group);
+	cds_ft_make_concurrent(ft);
+
+	guard_lo = node_alloc(0x00000000ULL);
+	guard_hi = node_alloc(0xff000000ULL);
+	rcu_read_lock();
+	if (insert_u64(ft, 0x00000000ULL, guard_lo) != CDS_FT_STATUS_OK ||
+			insert_u64(ft, 0xff000000ULL, guard_hi) != CDS_FT_STATUS_OK)
+		abort();
+	rcu_read_unlock();
+	live = 2;
+
+	w = (struct rk_writer_arg *) calloc(RK_NW, sizeof(*w));
+	r = (struct rk_reader_arg *) calloc(RK_NR, sizeof(*r));
+	if (!w || !r)
+		abort();
+	for (i = 0; i < RK_NW; i++) {
+		uint8_t bp = (uint8_t) (2 * i + 1), dp = (uint8_t) (2 * i + 2);
+		uint64_t bpk = (uint64_t) bp << 24, dpk = (uint64_t) dp << 24;
+		uint64_t sk[4] = {
+			bpk | (1ULL << 16), bpk | (5ULL << 16),
+			dpk | (1ULL << 16), dpk | (5ULL << 16),
+		};
+
+		w[i].ft = ft;
+		w[i].bp = bp;
+		w[i].dp = dp;
+		rcu_read_lock();
+		for (c = 0; c < 4; c++) {
+			w[i].sib[c] = node_alloc(sk[c]);
+			if (insert_u64(ft, sk[c], w[i].sib[c]) != CDS_FT_STATUS_OK)
+				abort();
+		}
+		for (c = 0; c < 4; c++) {
+			uint64_t tk = bpk | (3ULL << 16) | ((uint64_t) (c + 1) << 8);
+
+			w[i].top[c] = node_alloc(tk);
+			if (insert_u64(ft, tk, w[i].top[c]) != CDS_FT_STATUS_OK)
+				abort();
+		}
+		rcu_read_unlock();
+		live += 8;
+	}
+	for (i = 0; i < RK_NR; i++) {
+		r[i].ft = ft;
+		r[i].w = w;
+		r[i].nw = RK_NW;
+	}
+
+	test_go = 0;
+	test_stop = 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < RK_NW; i++)
+		pthread_create(&writers[i], NULL, rk_writer, &w[i]);
+	for (i = 0; i < RK_NR; i++)
+		pthread_create(&readers[i], NULL, rk_reader, &r[i]);
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	test_go = 1;
+
+	rcu_thread_offline();
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
+		usleep(1000);
+	test_stop = 1;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < RK_NW; i++)
+		pthread_join(writers[i], NULL);
+	for (i = 0; i < RK_NR; i++)
+		pthread_join(readers[i], NULL);
+	rcu_thread_online();
+
+	for (i = 0; i < RK_NW; i++) {
+		total_ops += w[i].ops;
+		total_retries += w[i].retries;
+	}
+	for (i = 0; i < RK_NR; i++) {
+		total_checks += r[i].checks;
+		if (r[i].failed)
+			ret = -1;
+	}
+
+	synchronize_rcu();
+	rcu_read_lock();
+	for (i = 0; i < RK_NW; i++) {
+		uint8_t bp = w[i].bp, dp = w[i].dp;
+		uint64_t bpk = (uint64_t) bp << 24, dpk = (uint64_t) dp << 24;
+		uint8_t X = w[i].at_dst ? dp : bp;
+		uint64_t Xk = (uint64_t) X << 24;
+		uint64_t sk[4] = {
+			bpk | (1ULL << 16), bpk | (5ULL << 16),
+			dpk | (1ULL << 16), dpk | (5ULL << 16),
+		};
+
+		for (c = 0; c < 4; c++) {
+			struct cds_ft_node *found = NULL;
+
+			if (lookup_u64(ft, sk[c], &found) != CDS_FT_STATUS_OK ||
+					found != &w[i].sib[c]->node)
+				ret = -1;
+		}
+		for (c = 0; c < 4; c++) {
+			uint64_t here = Xk | (3ULL << 16) | ((uint64_t) (c + 1) << 8);
+			struct cds_ft_node *found = NULL;
+
+			if (lookup_u64(ft, here, &found) != CDS_FT_STATUS_OK ||
+					found != &w[i].top[c]->node)
+				ret = -1;
+		}
+	}
+	if (cds_ft_count_keys(ft) != live)
+		ret = -1;
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK)
+		ret = -1;
+	rcu_read_unlock();
+
+	if (total_ops == 0)
+		ret = -1;
+	fprintf(stderr, "# inv_rekey_graft_coherent_readers: %d writers %d readers, "
+		"%lu moves, %lu retries, %lu reads, %lu live keys\n", RK_NW, RK_NR,
+		total_ops, total_retries, total_checks, live);
+
+	free(w);
+	free(r);
 	if (drain_and_destroy(ft, group) < 0)
 		ret = -1;
 	if (leak_check() < 0)
@@ -12336,6 +12617,7 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_concurrent_writers_disjoint);
 #ifdef FEATURE_FT_MW_DLM_ACQUIRE
 	RUN_TEST(inv_rekey_graft_disjoint);
+	RUN_TEST(inv_rekey_graft_coherent_readers);
 #endif
 	RUN_TEST(inv_concurrent_writers_shared);
 	RUN_TEST(inv_concurrent_writers_coarse_lock);
