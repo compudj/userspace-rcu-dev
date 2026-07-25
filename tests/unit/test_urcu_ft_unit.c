@@ -55,11 +55,14 @@
 #define NR_TESTS_DLM 0
 #endif
 
-/* 283 unconditional + 45 fault-injection-only RUN_TEST registrations. */
+/* 284 unconditional + 46 fault-injection-only RUN_TEST registrations.  (The
+ * fault total was one short before test_rekey_coherence_relational_fault: the
+ * plan said 327 where 328 tests ran, so the fault build failed its own TAP
+ * plan.) */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (328 + NR_TESTS_DLM)
+#define NR_TESTS (330 + NR_TESTS_DLM)
 #else
-#define NR_TESTS (283 + NR_TESTS_DLM)
+#define NR_TESTS (284 + NR_TESTS_DLM)
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -1926,6 +1929,224 @@ static int test_rekey_coherence_lookup(void)
 	}
 out:
 	_cds_ft_debug_move_gate_exit(ft);	/* balances the enter above */
+	if (drain_and_destroy(ft, group) != 0)
+		ret = -1;
+	return ret;
+}
+
+/* One relational probe from a BOUND key; result key (or UINT64_MAX for
+ * NOT_FOUND) into *@out.  Returns -1 on an unexpected status / key readback. */
+enum rel_mode { REL_GE, REL_GT, REL_LE, REL_LT };
+
+static int rel_probe(struct cds_ft *ft, struct cds_ft_iter *iter,
+		enum rel_mode mode, uint64_t v, uint64_t *out)
+{
+	uint8_t k[8], rk[8];
+	size_t rl;
+	enum cds_ft_status s;
+	int ret = 0;
+
+	cds_ft_u64_to_key(ft, v, k, CDS_FT_LEN_DEFAULT);
+	cds_ft_iter_set_key(iter, k, CDS_FT_LEN_DEFAULT);
+	rcu_read_lock();
+	switch (mode) {
+	case REL_GE:	s = cds_ft_lookup_ge(ft, iter); break;
+	case REL_GT:	s = cds_ft_lookup_gt(ft, iter); break;
+	case REL_LE:	s = cds_ft_lookup_le(ft, iter); break;
+	default:	s = cds_ft_lookup_lt(ft, iter); break;
+	}
+	if (s == CDS_FT_STATUS_OK) {
+		if (cds_ft_iter_get_key(iter, rk, sizeof rk, &rl) !=
+				CDS_FT_STATUS_OK || rl != 8)
+			ret = -1;
+		else
+			*out = cds_ft_key_to_u64(ft, rk, 8);
+	} else if (s == CDS_FT_STATUS_NOT_FOUND) {
+		*out = UINT64_MAX;
+	} else {
+		ret = -1;
+	}
+	rcu_read_unlock();
+	return ret;
+}
+
+/*
+ * Walk the whole trie (or the scoped prefix when @prefix_len > 0, seeded from
+ * @seed) forwards or backwards, collecting the keys.  ONE read-side critical
+ * section: the CACHED position is reused across the steps.
+ */
+static int rel_walk(struct cds_ft *ft, struct cds_ft_iter *iter, bool forward,
+		size_t prefix_len, uint64_t seed, uint64_t *out, size_t max,
+		size_t *n_out)
+{
+	enum cds_ft_status s;
+	size_t n = 0;
+	int ret = 0;
+	uint8_t k[8];
+
+	cds_ft_u64_to_key(ft, seed, k, CDS_FT_LEN_DEFAULT);
+	cds_ft_iter_set_key(iter, k, CDS_FT_LEN_DEFAULT);
+	if (cds_ft_iter_set_prefix_len(iter, prefix_len) != CDS_FT_STATUS_OK)
+		return -1;
+	rcu_read_lock();
+	s = forward ? cds_ft_lookup_first(ft, iter) : cds_ft_lookup_last(ft, iter);
+	while (s == CDS_FT_STATUS_OK) {
+		uint8_t rk[8];
+		size_t rl;
+
+		if (n == max) {
+			ret = -1;
+			break;
+		}
+		if (cds_ft_iter_get_key(iter, rk, sizeof rk, &rl) !=
+				CDS_FT_STATUS_OK || rl != 8) {
+			ret = -1;
+			break;
+		}
+		out[n++] = cds_ft_key_to_u64(ft, rk, 8);
+		s = forward ? cds_ft_next(ft, iter) : cds_ft_prev(ft, iter);
+	}
+	if (s != CDS_FT_STATUS_OK && s != CDS_FT_STATUS_NOT_FOUND)
+		ret = -1;
+	rcu_read_unlock();
+	*n_out = n;
+	return ret;
+}
+
+/*
+ * REKEY-coherent RELATIONAL lookups (le/ge/lt/gt, hence next/prev, plus the
+ * scoped endpoints) with the MOVE GATE HELD OPEN and no actual move: every call
+ * runs the two-pass, both passes agree, and the answer is EXACTLY the one the
+ * plain fast-mode path gives.  Each probe is therefore run TWICE -- gate shut,
+ * then gate open -- and the two runs compared, so what is asserted is "coherence
+ * changes no answer" rather than a hand-written expectation, and a two-pass that
+ * never converged would hang rather than pass.
+ *
+ * Covers the three input shapes the two-pass has to handle: a BOUND-key seek
+ * (cached position invalid), an UNSCOPED continuation (served by the tier-1 cell
+ * hop, whose two cells are the witness), and a SCOPED continuation (tier-2
+ * descent whose search key comes from the structural up-walk -- the pinned-key
+ * path in ft_ineq_pin_search_key).  The disagreement/retry arm is forced by
+ * test_rekey_coherence_relational_fault and exercised for real by the concurrent
+ * rekey oracles.
+ */
+#define REL_NKEYS	64
+
+static int test_rekey_coherence_relational(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ord_rekey_ft(8, &group);
+	struct ft_test_node *nodes[REL_NKEYS];
+	struct cds_ft_iter *iter = NULL;
+	uint64_t fast_seq[REL_NKEYS], slow_seq[REL_NKEYS];
+	size_t fast_n, slow_n;
+	enum cds_ft_status s;
+	unsigned int i, m;
+	int ret = 0;
+
+	for (i = 0; i < REL_NKEYS; i++) {
+		nodes[i] = node_alloc((uint64_t) i * 7 + 1);
+		rcu_read_lock();
+		s = insert_u64(ft, (uint64_t) i * 7 + 1, nodes[i]);
+		rcu_read_unlock();
+		if (s != CDS_FT_STATUS_OK) {
+			node_free(nodes[i]);
+			ret = -1;
+			goto out;
+		}
+	}
+	if (cds_ft_iter_create(ft, &iter) < 0) {
+		ret = -1;
+		goto out;
+	}
+
+	/* 1. BOUND-key seeks: every mode, on present and absent keys. */
+	for (m = REL_GE; m <= REL_LT; m++) {
+		for (i = 0; i < REL_NKEYS * 2; i++) {
+			/* even i: a present key; odd i: an absent one. */
+			uint64_t v = (i & 1) ? (uint64_t) (i / 2) * 7 + 3 :
+					(uint64_t) (i / 2) * 7 + 1;
+			uint64_t fast = 0, slow = 0;
+
+			if (rel_probe(ft, iter, (enum rel_mode) m, v, &fast)) {
+				ret = -1;
+				goto out_iter;
+			}
+			_cds_ft_debug_move_gate_enter(ft);
+			ret = rel_probe(ft, iter, (enum rel_mode) m, v, &slow);
+			_cds_ft_debug_move_gate_exit(ft);
+			if (ret) {
+				ret = -1;
+				goto out_iter;
+			}
+			if (fast != slow) {
+				fprintf(stderr,
+					"rekey-coherence relational: mode %u key %llu: fast %llu coherent %llu\n",
+					m, (unsigned long long) v,
+					(unsigned long long) fast,
+					(unsigned long long) slow);
+				ret = -1;
+				goto out_iter;
+			}
+		}
+	}
+
+	/*
+	 * 2. Full walks (unscoped: the tier-1 cell hop) and 3. scoped walks
+	 * (prefix_len 7 -> the tier-2 descent + pinned up-walk search key),
+	 * forwards and backwards.
+	 */
+	{
+		const struct { bool fwd; size_t plen; } cases[] = {
+			{ true, 0 }, { false, 0 }, { true, 7 }, { false, 7 },
+		};
+
+		for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+			size_t j;
+
+			if (rel_walk(ft, iter, cases[i].fwd, cases[i].plen, 1,
+					fast_seq, REL_NKEYS, &fast_n)) {
+				ret = -1;
+				goto out_iter;
+			}
+			_cds_ft_debug_move_gate_enter(ft);
+			ret = rel_walk(ft, iter, cases[i].fwd, cases[i].plen, 1,
+					slow_seq, REL_NKEYS, &slow_n);
+			_cds_ft_debug_move_gate_exit(ft);
+			if (ret) {
+				ret = -1;
+				goto out_iter;
+			}
+			if (fast_n == 0 || fast_n != slow_n) {
+				fprintf(stderr,
+					"rekey-coherence relational walk %u: fast %zu keys, coherent %zu\n",
+					i, fast_n, slow_n);
+				ret = -1;
+				goto out_iter;
+			}
+			for (j = 0; j < fast_n; j++) {
+				if (fast_seq[j] == slow_seq[j])
+					continue;
+				fprintf(stderr,
+					"rekey-coherence relational walk %u: key %zu fast %llu coherent %llu\n",
+					i, j,
+					(unsigned long long) fast_seq[j],
+					(unsigned long long) slow_seq[j]);
+				ret = -1;
+				goto out_iter;
+			}
+			/* The scoped walk must really be a strict subset. */
+			if (cases[i].plen != 0 && fast_n >= REL_NKEYS) {
+				fprintf(stderr,
+					"rekey-coherence relational: scoped walk not scoped\n");
+				ret = -1;
+				goto out_iter;
+			}
+		}
+	}
+out_iter:
+	cds_ft_iter_destroy(iter);
+out:
 	if (drain_and_destroy(ft, group) != 0)
 		ret = -1;
 	return ret;
@@ -22699,6 +22920,68 @@ out:
 }
 
 /*
+ * RELATIONAL two-pass RETRY arm: arm cds_ft_fault_rekey_countdown so the first
+ * coherent relational lookup reports its two passes as DISAGREEING, then do a
+ * GT.  The lookup must still return the correct successor -- the two-pass
+ * restored its input, re-ran both passes and, the fault now spent, accepted the
+ * (genuinely coherent) answer -- and the countdown must read -1, proving the
+ * retry path really executed instead of being dead code a green run says nothing
+ * about.
+ */
+static int test_rekey_coherence_relational_fault(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ord_rekey_ft(8, &group);
+	struct ft_test_node *nodes[4];
+	struct cds_ft_iter *iter = NULL;
+	uint64_t got = 0;
+	enum cds_ft_status s;
+	unsigned int i;
+	int ret = 0;
+
+	for (i = 0; i < 4; i++) {
+		nodes[i] = node_alloc((uint64_t) i * 10 + 1);
+		rcu_read_lock();
+		s = insert_u64(ft, (uint64_t) i * 10 + 1, nodes[i]);
+		rcu_read_unlock();
+		if (s != CDS_FT_STATUS_OK) {
+			node_free(nodes[i]);
+			ret = -1;
+			goto out;
+		}
+	}
+	if (cds_ft_iter_create(ft, &iter) < 0) {
+		ret = -1;
+		goto out;
+	}
+	/* Gate open: without a move in flight the relational entry tail-calls
+	 * the plain specialization and the forced disagreement lands nowhere. */
+	_cds_ft_debug_move_gate_enter(ft);
+	cds_ft_fault_rekey_countdown = 0;	/* force one two-pass disagreement */
+	ret = rel_probe(ft, iter, REL_GT, 1, &got);
+	_cds_ft_debug_move_gate_exit(ft);
+	cds_ft_iter_destroy(iter);
+	if (ret || got != 11) {
+		fprintf(stderr,
+			"rekey relational retry: wrong result after forced miss: %llu\n",
+			(unsigned long long) got);
+		ret = -1;
+		goto out;
+	}
+	if (cds_ft_fault_rekey_countdown != -1) {
+		fprintf(stderr,
+			"rekey relational retry: forced miss did not fire\n");
+		ret = -1;
+		goto out;
+	}
+out:
+	cds_ft_fault_rekey_countdown = -1;
+	if (drain_and_destroy(ft, group) != 0)
+		ret = -1;
+	return ret;
+}
+
+/*
  * Drive a compressed-split insert through each of its allocation-failure
  * points while a compressed node is live, and assert the trie stays
  * structurally consistent after every failed split (cds_ft_verify checks
@@ -27191,6 +27474,7 @@ int main(int argc, char **argv)
 	/* 2. Insert variants */
 	diag("Insert variant tests");
 	RUN_TEST(test_rekey_coherence_lookup);
+	RUN_TEST(test_rekey_coherence_relational);
 	RUN_TEST(test_insert_basic);
 	RUN_TEST(test_insert_unique);
 	RUN_TEST(test_insert_duplicate_chain);
@@ -27541,6 +27825,7 @@ int main(int argc, char **argv)
 #endif
 #ifdef FEATURE_FT_FAULT_INJECT
 	RUN_TEST(test_rekey_coherence_fault_redescend);
+	RUN_TEST(test_rekey_coherence_relational_fault);
 	RUN_TEST(test_split_oom_backpointer);
 	RUN_TEST(test_split_oom_key_shorter_arm);
 	RUN_TEST(test_merge_oom);

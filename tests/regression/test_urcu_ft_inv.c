@@ -1438,12 +1438,51 @@ static void *rk_reader(void *arg)
 		int wi = rand_r(&seed) % r->nw;
 		struct rk_writer_arg *w = &r->w[wi];
 		uint64_t bpk = (uint64_t) w->bp << 24, dpk = (uint64_t) w->dp << 24;
-		int pick = rand_r(&seed) & 7;
+		int pick = rand_r(&seed) % 12;
 		struct cds_ft_node *found, *expect;
 		int must_find;
 		uint64_t key;
 		uint8_t k[8];
 
+		if (pick >= 8) {
+			/*
+			 * RELATIONAL probe (the coherent two-pass path) on a FIXED
+			 * sibling: that key is present at every instant -- a move
+			 * relocates only the (X,sb,*) run, though it COW-recompacts
+			 * the junction this sibling hangs from on every single move
+			 * -- so ge(K) and le(K) must land EXACTLY on K.  A torn
+			 * relational traversal that stepped over it would answer
+			 * with the neighbouring key instead, which is precisely what
+			 * the two-pass exists to reject.
+			 */
+			int si = pick & 3;
+			enum cds_ft_status st;
+
+			key = ((si < 2) ? bpk : dpk) | (((si & 1) ? 5ULL : 1ULL) << 16);
+			expect = &w->sib[si]->node;
+			cds_ft_u64_to_key(r->ft, key, k, CDS_FT_LEN_DEFAULT);
+			rcu_read_lock();
+			cds_ft_iter_set_key(iter, k, CDS_FT_LEN_DEFAULT);
+			st = (rand_r(&seed) & 1) ? cds_ft_lookup_ge(r->ft, iter) :
+				cds_ft_lookup_le(r->ft, iter);
+			found = cds_ft_iter_node(iter);
+			if (st != CDS_FT_STATUS_OK || found != expect) {
+				fprintf(stderr,
+					"rk_reader: relational key %#llx -> %p (%s, expect %p)\n",
+					(unsigned long long) key, (void *) found,
+					cds_ft_status_to_string(st),
+					(void *) expect);
+				r->failed = 1;
+				rcu_read_unlock();
+				mw_violation_snapshot();
+				break;
+			}
+			rcu_read_unlock();
+			r->checks++;
+			if ((++iters & 0xff) == 0)
+				rcu_quiescent_state();
+			continue;
+		}
 		if (pick < 4) {
 			/* FIXED sibling (X,1)/(X,5): always present -> must be found. */
 			key = ((pick < 2) ? bpk : dpk) | (((pick & 1) ? 5ULL : 1ULL) << 16);
