@@ -1690,6 +1690,281 @@ FT_INEQ_SPEC(ft_ineq_gt_eager,   FT_LOOKUP_GT, false)
 #undef FT_INEQ_SPEC
 
 /*
+ * ===========================================================================
+ * REKEY-COHERENT RELATIONAL LOOKUPS (le / ge / lt / gt, hence next / prev).
+ * ===========================================================================
+ *
+ * The reader half of the in-trie-move coherence design.  A relational answer is
+ * a statement about the trie's SHAPE (the neighbour of a key), so unlike an
+ * exact lookup it cannot be validated against the key it was asked for: a
+ * traversal that STRADDLES a move's commit can return a node that is a real,
+ * live neighbour of nothing -- the trie never held that relation at any instant.
+ *
+ * The check is therefore a REPETITION, not a validation: run the whole traversal
+ * TWICE and accept only if both passes visited exactly the same nodes in the
+ * same order (struct ft_visit_witness) and landed on the same result.  Sound
+ * because a single traversal can witness a torn view only by straddling a
+ * commit, and two SEQUENTIAL traversals cannot both straddle the same commit
+ * (the second starts after the first ended) -- the antisymmetry the exact-key
+ * proof gets from descend-then-up-walk comes here from pass1-before-pass2.  This
+ * is the same primitive the rekey WRITER already uses to derive its splice
+ * position (ft_ord_cell_find_splice_pos_coherent).
+ *
+ * Comparing the visited ADDRESSES rather than just the result is what makes it
+ * work: a torn pass can land on a stable node (so results alone agree), but a
+ * move COWs the stitch points it moves (junction, subtree top, boundary cells)
+ * into FRESH addresses, so any pass that saw the neighbourhood mid-move folds a
+ * different address set.  It is also ABA-immune: RCU will not hand an address
+ * back inside a read section, so an oscillating rekey cannot forge agreement.
+ *
+ * COST: gated by struct cds_ft::move_active (ft_move_active) -- with no move in
+ * flight these entry points tail-call the ordinary specialization and the whole
+ * mechanism costs ONE load of a quiet word.  The doubled traversal (and its
+ * doubled tracepoints) is paid only inside a move window.
+ *
+ * NOT COVERED (both need design step 4's linearizability oracle, not more
+ * checking here): a walker parked ON a moving run's interior cell steps out
+ * through the new outer link and skips the keys in between; and a leaf that only
+ * changes KEY (not address, not neighbourhood) between the two passes is
+ * accepted with the pass-2 key.
+ */
+
+/* Defined below; the coherent path uses the ONE shared out-of-line descent
+ * rather than force-inlining a second copy per mode. */
+static enum cds_ft_status cds_ft_lookup_inequality_impl_shared(struct cds_ft *ft,
+		struct cds_ft_iter *iter, enum ft_lookup_inequality mode,
+		enum ft_lookup_limit limit, const bool use_keycopy,
+		const bool seed_from_node, struct ft_visit_witness *wit);
+
+/*
+ * Everything a relational lookup READS from and WRITES to the iterator.  The
+ * two passes must be fed byte-identical input, and pass 1 has already
+ * overwritten that input with its RESULT by the time pass 2 starts (the search
+ * key, the cached position, the cell cursor), so the input is snapshotted once
+ * and restored between passes.  @key covers the whole key buffer because the
+ * descent both reads its search key from it and writes its result key into it.
+ */
+struct ft_ineq_iter_state {
+	struct cds_ft_node *node;
+	struct ft_ord_cell *ord_cell;
+	struct cds_ft_node *ord_cell_node;
+	size_t key_len;
+	size_t key_off;
+	size_t path_len;
+	enum cds_ft_status status;
+	bool cache_valid;
+#ifdef URCU_FRACTAL_TRIE_DEBUG_PATH
+	struct urcu_gp_poll_state gp_state;
+	bool gp_state_valid;
+#endif
+	uint8_t key[FT_MAX_KEY_LEN];
+};
+
+static
+void ft_ineq_iter_state_save(struct cds_ft_iter *iter,
+		struct ft_ineq_iter_state *s)
+{
+	s->node = iter->node;
+	s->ord_cell = iter->ord_cell;
+	s->ord_cell_node = iter->ord_cell_node;
+	s->key_len = iter->key_len;
+	s->key_off = iter->key_off;
+	s->path_len = iter->path_len;
+	s->status = iter->status;
+	s->cache_valid = iter->cache_valid;
+#ifdef URCU_FRACTAL_TRIE_DEBUG_PATH
+	s->gp_state = iter->gp_state;
+	s->gp_state_valid = iter->gp_state_valid;
+#endif
+	memcpy(s->key, iter_key(iter), iter->ft->group->max_key_len);
+}
+
+static
+void ft_ineq_iter_state_restore(struct cds_ft_iter *iter,
+		const struct ft_ineq_iter_state *s)
+{
+	iter->node = s->node;
+	iter->ord_cell = s->ord_cell;
+	iter->ord_cell_node = s->ord_cell_node;
+	iter->key_len = s->key_len;
+	iter->key_off = s->key_off;
+	iter->path_len = s->path_len;
+	iter->status = s->status;
+	iter->cache_valid = s->cache_valid;
+#ifdef URCU_FRACTAL_TRIE_DEBUG_PATH
+	iter->gp_state = s->gp_state;
+	iter->gp_state_valid = s->gp_state_valid;
+#endif
+	memcpy(iter_key(iter), s->key, iter->ft->group->max_key_len);
+}
+
+/*
+ * Will the tier-1 ordered-cell hop serve this call?  Mirrors the gate at the top
+ * of cds_ft_lookup_inequality_impl (with seed_from_node false, which every
+ * public relational entry passes).  Only used to decide whether the search key
+ * gets read at all -- a drift from the real gate costs the hop, never
+ * correctness (the descent answers the same relational question).
+ */
+static
+bool ft_ineq_cell_hop_applies(const struct cds_ft *ft,
+		const struct cds_ft_iter *iter,
+		enum ft_lookup_inequality mode, enum ft_lookup_limit limit)
+{
+	return (mode == FT_LOOKUP_GT || mode == FT_LOOKUP_LT) &&
+		limit == FT_LOOKUP_LIMIT_NONE &&
+		iter->cache_valid && iter->node &&
+		ft_ord_cell_fastpath_ok(ft, iter);
+}
+
+/*
+ * PIN the search key of a CONTINUATION (a relational step taken from the
+ * iterator's current position rather than from a set_key bound).
+ *
+ * On a coherence-capable trie there is no in-leaf key, so ft_iter_read_key()
+ * rematerializes the current key STRUCTURALLY by walking the position's parent
+ * chain -- a long multi-read that a move can tear, and one that each pass would
+ * redo, so a torn walk would feed BOTH passes the same bogus key and they would
+ * agree on the wrong answer.  The witness cannot see it either: it folds the
+ * nodes the TRAVERSAL visits, and this walk happens before the traversal starts.
+ *
+ * So the key is derived here instead, by the same repetition argument (two
+ * sequential up-walks that agree cannot have straddled a commit), pinned as a
+ * VALUE at the front of the iterator buffer, and the cached position is cleared
+ * so the descent reads that buffer -- which also makes both passes a clean
+ * top-descent from the root, the design's uniform shape.
+ *
+ * Returns false when the two walks disagree: a move is restructuring this
+ * position's ancestry, so the caller must re-derive.  Returns true WITHOUT
+ * pinning whenever the search key is already a stable value in the buffer (a
+ * set_key bound, a LIMIT_FIRST/LAST endpoint) or is never read at all (the
+ * tier-1 cell hop) -- pinning would then cost an up-walk and, for the hop, throw
+ * away the very fast path the continuation exists for.
+ */
+static
+bool ft_ineq_pin_search_key(struct cds_ft *ft, struct cds_ft_iter *iter,
+		enum ft_lookup_inequality mode, enum ft_lookup_limit limit)
+{
+	size_t max_len = ft->group->max_key_len;
+	uint8_t first_pass[FT_MAX_KEY_LEN];
+	struct ft_ord_cell *cell;
+	size_t n1, n2;
+
+	if (limit != FT_LOOKUP_LIMIT_NONE || !iter->cache_valid || !iter->node)
+		return true;		/* key is a value in iter_key already */
+	if (ft_ineq_cell_hop_applies(ft, iter, mode, limit))
+		return true;		/* tier-1 hop: no key is read at all */
+	cell = ft_ord_cell_cursor(iter);
+	if (!cell)
+		return true;
+	n1 = ft_rebuild_key_upwalk(ft, cell, first_pass, max_len);
+	if (!n1)
+		return true;		/* ft_iter_read_key's own buffer fallback */
+	cell = ft_ord_cell_cursor(iter);
+	n2 = ft_rebuild_key_upwalk(ft, cell, iter_key(iter), max_len);
+	if (n1 != n2 || memcmp(first_pass + (max_len - n1),
+			iter_key(iter) + (max_len - n2), n1) != 0)
+		return false;		/* torn: the ancestry moved under the walk */
+	/*
+	 * Defensive: on a FIXED-length group the descent validates the search
+	 * length against the group's (ft_key_len), and ft_iter_read_key's own
+	 * fixed-length branch leaves iter->key_len alone -- so a walk that
+	 * accounted for a different number of bytes must not be pinned as the
+	 * length here.  Leave that (already ill-formed) position to the
+	 * pre-existing handling rather than turning it into an argument error.
+	 */
+	if (ft->group->key_len != CDS_FT_LEN_VARIABLE &&
+			n2 != ft->group->key_len)
+		return true;
+	/*
+	 * The up-walk fills the buffer at the TAIL; the descent reads its search
+	 * key from, and writes its result key into, the SAME buffer, which is
+	 * only safe when the search key starts at offset 0 (see
+	 * ft_iter_materialize_key).
+	 */
+	memmove(iter_key(iter), iter_key(iter) + (max_len - n2), n2);
+	iter->key_off = 0;
+	iter->key_len = n2;
+	iter->path_len = n2 + 1;
+	iter->cache_valid = false;	/* pinned: read the buffer, top-descend */
+	return true;
+}
+
+/*
+ * The two-pass relational lookup itself.  Runs under the caller's RCU read-side
+ * lock (both passes and the input snapshot must be one section: the compared
+ * addresses are only meaningful, and the pointers only valid, within it).
+ *
+ * Retries on disagreement rather than reporting an error: an incoherent
+ * derivation cannot be repaired, only re-taken.  That makes a reader LOCK-FREE
+ * (not wait-free) for as long as moves keep restructuring the neighbourhood it
+ * is reading, which is the price the design accepts inside a move window, and
+ * only there.
+ */
+static
+enum cds_ft_status ft_ineq_two_pass(struct cds_ft *ft, struct cds_ft_iter *iter,
+		enum ft_lookup_inequality mode, enum ft_lookup_limit limit)
+{
+	struct ft_ineq_iter_state in, pinned;
+	struct ft_visit_witness w1, w2;
+	struct cds_ft_node *node1;
+	enum cds_ft_status st1, st2;
+
+	CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
+	ft_ineq_iter_state_save(iter, &in);
+	for (;;) {
+		if (ft_ineq_pin_search_key(ft, iter, mode, limit)) {
+			ft_ineq_iter_state_save(iter, &pinned);
+			ft_witness_init(&w1);
+			st1 = cds_ft_lookup_inequality_impl_shared(ft, iter,
+					mode, limit, false, false, &w1);
+			node1 = iter->node;
+			ft_ineq_iter_state_restore(iter, &pinned);
+			ft_witness_init(&w2);
+			st2 = cds_ft_lookup_inequality_impl_shared(ft, iter,
+					mode, limit, false, false, &w2);
+			/*
+			 * Fault injection last: it must not consume its
+			 * countdown on a pass pair that genuinely disagreed.
+			 */
+			if (caa_likely(st1 == st2 && node1 == iter->node &&
+					ft_witness_equal(&w1, &w2) &&
+					!ft_rekey_fault_miss()))
+				return st2;
+		}
+		ft_ineq_iter_state_restore(iter, &in);
+	}
+}
+
+/*
+ * REKEY-coherent relational specializations, installed on
+ * ft->lookup_{le,ge,lt,gt}_fn in place of the ft_ineq_*_eager ones when
+ * ft->rekey_coherence (ft_install_lookup_ops).  Only the EAGER (no in-leaf key)
+ * variants have coherent siblings: rekey_coherence implies
+ * !speculative_key_offset_active, hence use_keycopy false -- a speculative trie
+ * can never host a move (the library cannot rewrite an application-stored key).
+ *
+ * The gate sample rides the CALLER's read-side critical section, the same one
+ * the traversal below runs in, which is what makes one sample per call sound
+ * (struct cds_ft::move_active).  Fast mode tail-calls the ordinary
+ * specialization so no second copy of the force-inlined descent is emitted.
+ */
+#define FT_INEQ_SPEC_COHERENT(name, fast, mode)				\
+	static enum cds_ft_status name(struct cds_ft *ft,		\
+			struct cds_ft_iter *iter)			\
+	{								\
+		if (caa_likely(!ft_move_active(ft)))			\
+			return fast(ft, iter);				\
+		CDS_FT_SCOPED_READER(ft);				\
+		return ft_ineq_two_pass(ft, iter, (mode),		\
+				FT_LOOKUP_LIMIT_NONE);			\
+	}
+FT_INEQ_SPEC_COHERENT(ft_ineq_le_coherent, ft_ineq_le_eager, FT_LOOKUP_LE)
+FT_INEQ_SPEC_COHERENT(ft_ineq_ge_coherent, ft_ineq_ge_eager, FT_LOOKUP_GE)
+FT_INEQ_SPEC_COHERENT(ft_ineq_lt_coherent, ft_ineq_lt_eager, FT_LOOKUP_LT)
+FT_INEQ_SPEC_COHERENT(ft_ineq_gt_coherent, ft_ineq_gt_eager, FT_LOOKUP_GT)
+#undef FT_INEQ_SPEC_COHERENT
+
+/*
  * Iterator-based inequality lookup public API.
  * The caller sets the key via cds_ft_iter_set_key() before calling.
  * On return the iterator holds the result key, key length, node, path,
@@ -1754,8 +2029,16 @@ enum cds_ft_status cds_ft_lookup_first(struct cds_ft *ft,
 	 * descent finds the smallest descendant.
 	 */
 	iter->key_len = iter->prefix_len;
-	status = cds_ft_lookup_inequality(ft, iter,
-			FT_LOOKUP_GE, FT_LOOKUP_LIMIT_FIRST);
+	/* Scoped endpoint: a real relational traversal, so it takes the
+	 * two-pass under a move exactly like le/ge/lt/gt.  (The unscoped O(1)
+	 * endpoint above needs none: the ordered list's head transitions
+	 * atomically with the move's flip, so a single load cannot tear.) */
+	if (caa_unlikely(ft->rekey_coherence && ft_move_active(ft)))
+		status = ft_ineq_two_pass(ft, iter, FT_LOOKUP_GE,
+				FT_LOOKUP_LIMIT_FIRST);
+	else
+		status = cds_ft_lookup_inequality(ft, iter,
+				FT_LOOKUP_GE, FT_LOOKUP_LIMIT_FIRST);
 	if (status != CDS_FT_STATUS_OK)
 		iter->key_len = saved_key_len;
 	return status;
@@ -1788,8 +2071,13 @@ enum cds_ft_status cds_ft_lookup_last(struct cds_ft *ft,
 	 * at prefix_len) then finds the greatest actual key.
 	 */
 	iter->key_len = ft->group->max_key_len;
-	status = cds_ft_lookup_inequality(ft, iter,
-			FT_LOOKUP_LE, FT_LOOKUP_LIMIT_LAST);
+	/* See cds_ft_lookup_first: the scoped endpoint takes the two-pass. */
+	if (caa_unlikely(ft->rekey_coherence && ft_move_active(ft)))
+		status = ft_ineq_two_pass(ft, iter, FT_LOOKUP_LE,
+				FT_LOOKUP_LIMIT_LAST);
+	else
+		status = cds_ft_lookup_inequality(ft, iter,
+				FT_LOOKUP_LE, FT_LOOKUP_LIMIT_LAST);
 	if (status != CDS_FT_STATUS_OK)
 		iter->key_len = saved_key_len;
 	return status;

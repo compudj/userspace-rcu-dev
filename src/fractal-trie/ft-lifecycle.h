@@ -653,10 +653,25 @@ void ft_install_lookup_ops(struct cds_ft *ft)
 	bool kc = ft->speculative_key_offset_active && group->speculative &&
 			(group->flags & CDS_FT_FLAG_SKIP_COMPRESSED);
 
-	ft->lookup_le_fn = kc ? ft_ineq_le_keycopy : ft_ineq_le_eager;
-	ft->lookup_ge_fn = kc ? ft_ineq_ge_keycopy : ft_ineq_ge_eager;
-	ft->lookup_lt_fn = kc ? ft_ineq_lt_keycopy : ft_ineq_lt_eager;
-	ft->lookup_gt_fn = kc ? ft_ineq_gt_keycopy : ft_ineq_gt_eager;
+	/*
+	 * REKEY-coherent relational entries: the two-pass (visited-node witness)
+	 * variants, which fall through to the plain specializations below
+	 * whenever no move is in flight.  @kc is necessarily false here --
+	 * rekey_coherence implies !speculative_key_offset_active -- so only the
+	 * EAGER siblings exist.
+	 */
+	if (ft->rekey_coherence) {
+		assert(!kc);
+		ft->lookup_le_fn = ft_ineq_le_coherent;
+		ft->lookup_ge_fn = ft_ineq_ge_coherent;
+		ft->lookup_lt_fn = ft_ineq_lt_coherent;
+		ft->lookup_gt_fn = ft_ineq_gt_coherent;
+	} else {
+		ft->lookup_le_fn = kc ? ft_ineq_le_keycopy : ft_ineq_le_eager;
+		ft->lookup_ge_fn = kc ? ft_ineq_ge_keycopy : ft_ineq_ge_eager;
+		ft->lookup_lt_fn = kc ? ft_ineq_lt_keycopy : ft_ineq_lt_eager;
+		ft->lookup_gt_fn = kc ? ft_ineq_gt_keycopy : ft_ineq_gt_eager;
+	}
 
 	/*
 	 * Iter-form lookup_iter_fn: iter always carries ordinals-mapped

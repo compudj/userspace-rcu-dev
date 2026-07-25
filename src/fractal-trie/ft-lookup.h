@@ -43,6 +43,29 @@
 extern long cds_ft_fault_rekey_countdown;
 #endif
 
+/*
+ * Test-only: force ONE coherence check to report a MISS, exactly as a concurrent
+ * in-trie rekey that restructured the reader's path would.  Shared by the exact
+ * lookup's second walk and the relational two-pass so a single knob
+ * (cds_ft_fault_rekey_countdown) arms whichever check runs next.  Self-clearing,
+ * so it cannot livelock the re-descend loop it exists to exercise.  Compiles to
+ * a constant false without FEATURE_FT_FAULT_INJECT.
+ */
+static inline_lookup
+bool ft_rekey_fault_miss(void)
+{
+#ifdef FEATURE_FT_FAULT_INJECT
+	if (caa_unlikely(cds_ft_fault_rekey_countdown >= 0)) {
+		if (cds_ft_fault_rekey_countdown == 0) {
+			cds_ft_fault_rekey_countdown = -1;
+			return true;
+		}
+		cds_ft_fault_rekey_countdown--;
+	}
+#endif
+	return false;
+}
+
 static inline_lookup
 bool ft_rekey_descent_coherent(const struct cds_ft *ft,
 		const struct cds_ft_node *found,
@@ -57,16 +80,9 @@ bool ft_rekey_descent_coherent(const struct cds_ft *ft,
 	if (!ft_move_active(ft))
 		return true;		/* fast mode: no move can be in flight */
 
-#ifdef FEATURE_FT_FAULT_INJECT
 	/* Force one coherence miss on demand to exercise the re-descend loop. */
-	if (caa_unlikely(cds_ft_fault_rekey_countdown >= 0)) {
-		if (cds_ft_fault_rekey_countdown == 0) {
-			cds_ft_fault_rekey_countdown = -1;
-			return false;
-		}
-		cds_ft_fault_rekey_countdown--;
-	}
-#endif
+	if (caa_unlikely(ft_rekey_fault_miss()))
+		return false;
 	cell = ft_ord_cell_ptr(ft_dereference_prev_resolved(
 			(struct cds_ft_node *) found));
 	klen = ft_rebuild_key_upwalk(ft, cell, scratch, max_len);
