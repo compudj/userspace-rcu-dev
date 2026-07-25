@@ -1995,7 +1995,7 @@ retry_merge:
 	 */
 	if (ms_ord) {
 		ft_ord_cell_find_splice_pos(dst_ft, dst_key, dst_key_len,
-			&pred, &succ);
+			&pred, &succ, NULL);
 		if (!already_unlinked) {
 			s_first = ft_subtree_minmax_head(src_ft, payload, false);
 			s_last = ft_subtree_minmax_head(src_ft, payload, true);

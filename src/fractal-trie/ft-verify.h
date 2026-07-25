@@ -1016,7 +1016,7 @@ int ft_verify_ord_cells(const struct cds_ft *cft, FILE *out)
 	iter->prefix_len = 0;
 	iter->cache_valid = false;	/* force descent oracle */
 	cds_ft_lookup_inequality_impl(ft, iter, FT_LOOKUP_GE,
-			FT_LOOKUP_LIMIT_FIRST, false, false);
+			FT_LOOKUP_LIMIT_FIRST, false, false, NULL);
 	trie_head = cds_ft_iter_node(iter);
 	/* Sentinel-or-first: walk starts at the first cell (sentinel if empty). */
 	cell = ft_ord_cell_resolve_ord(&ft->ord_sentinel.node.next);
@@ -1072,7 +1072,7 @@ int ft_verify_ord_cells(const struct cds_ft *cft, FILE *out)
 		cell = next_cell;
 		iter->cache_valid = false;	/* force descent oracle */
 		cds_ft_lookup_inequality_impl(ft, iter, FT_LOOKUP_GT,
-				FT_LOOKUP_LIMIT_NONE, false, false);
+				FT_LOOKUP_LIMIT_NONE, false, false, NULL);
 	}
 	if (!ft_ord_is_end(ft, cell)) {
 		if (out)

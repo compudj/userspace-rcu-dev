@@ -1549,31 +1549,40 @@ struct cds_ft {
 	 */
 	bool rekey_coherence;
 
-#ifdef FEATURE_FT_MW_DLM_ACQUIRE
 	/*
-	 * PER-FT MOVE COUNTER (doc/design/in-trie-move-seqcount.md), the writer half:
-	 * bumped as an MW value-CAS edge (cur -> cur + (1 << 1)) INSIDE every in-trie
-	 * MOVE commit, so two concurrent moves CONFLICT on this one word and the loser
-	 * aborts clean.  That is what makes a mover's ordered-list decisions COHERENT:
-	 * the dst splice position must be derived from a RELATIONAL descent, and
-	 * relational reads are not coherence-hardened, so a peer move committing between
-	 * the derivation and the commit can silently invalidate it (an adjacent pair at
-	 * the WRONG key position -> a list that is well-formed but no longer ordered).
-	 * With the counter in the write set, NO move can commit inside that window: the
-	 * derivation is coherent by construction rather than by validation, which no
-	 * read-only check can achieve (a validator built from the same incoherent reads
-	 * can be fooled the same way -- measured, not assumed).
+	 * MOVE MODE GATE (doc/design: the per-trie move refcount).  An in-trie MOVE
+	 * (rekey) cannot be made coherent for free on the read side, and it must not
+	 * make the STEADY-STATE reader pay: so readers run in one of two modes, and
+	 * this word is the mode.
 	 *
-	 * Stored SHIFTED LEFT BY ONE, exactly like metadata->nr_keys, so bit 0 stays
-	 * free for the engine's in-band proxy tag (FT_NR_KEYS_PROXY_TAG); read it with
-	 * ft_move_seq_load(), which resolves a proxy parked for a commit's duration.
-	 * ONLY the in-trie move path touches it, so every other op and every reader is
-	 * unaffected.  Granularity is deliberately the whole trie (the design note
-	 * accepts that in-trie moves serialize); it is also the word a future READER
-	 * bracket will sample, so sharding it is a design decision, not a local one.
+	 *   @move_active == 0  =>  no move can be in flight: readers take the FAST
+	 *                          path and perform NO coherence check at all.
+	 *   @move_active != 0  =>  readers take the COHERENT path.
+	 *
+	 * The switch is made safe by a GRACE PERIOD, not by ordering tricks: a mover
+	 * sets @move_active, then waits a GP, and only THEN mutates the structure.  A
+	 * reader therefore cannot observe move-induced incoherence while believing it
+	 * is in fast mode -- if it sampled 0, the mover's GP is still waiting for that
+	 * reader's own critical section to end before touching anything.  One sample
+	 * per read section is enough for the same reason.
+	 *
+	 * Cost is confined to move windows, and the steady state pays ONE STABLE READ
+	 * of a word nobody writes -- which is the whole point of a refcount here
+	 * rather than a per-step sequence counter: no shared-write cache-line bounce
+	 * on the read path, and no unbounded reader retry under a stream of moves.
+	 *
+	 * @move_gate_lock / @move_gate_cond / @move_gate_nr / @move_gate_gp serialize
+	 * the movers and let them PIGGYBACK: only the 0->1 transition pays a grace
+	 * period, and a mover arriving while that GP is in flight waits for it instead
+	 * of starting its own, so a burst of moves costs ~one GP in total (the batching
+	 * shape of src/urcu-call-rcu-impl.h's splice + single synchronize_rcu).  Access
+	 * only through ft_move_gate_enter / ft_move_gate_exit / ft_move_active.
 	 */
-	unsigned long move_seq;
-#endif
+	unsigned long move_active;
+	pthread_mutex_t move_gate_lock;
+	pthread_cond_t move_gate_cond;
+	unsigned long move_gate_nr;	/* movers holding the gate */
+	bool move_gate_gp;		/* the 0->1 owner is inside its GP */
 
 	/*
 	 * In-progress compaction state (cds_ft_compact_begin), or NULL.
@@ -1872,6 +1881,149 @@ void ft_writer_lock_gp_wait(struct cds_ft *ft)
 		ft_wlock_held = held;
 		ft_wlock_depth = depth;
 	}
+}
+
+/*
+ * VISITED-NODE WITNESS for the two-from-root coherence check.
+ *
+ * A traversal that runs while an in-trie move is in flight can be TORN: it can
+ * resolve one edge on the old side of the move's commit and another on the new
+ * side, and land somewhere that was never correct at any instant.  The witness is
+ * how a second traversal detects that the first one was torn: each pass
+ * accumulates the ADDRESSES of the nodes it visits, and the two passes are
+ * compared.  Two SEQUENTIAL passes cannot both straddle the same commit (the
+ * second starts after the first ended), so agreement means neither was torn.
+ *
+ * IDENTITY, not value: a move COWs its stitch points, so a moved subtree's
+ * junction and top get FRESH addresses, and RCU cannot recycle a node inside a
+ * read section -- which makes the witness immune to the away-and-back
+ * (oscillating rekey) case that fools any comparison of keys or result nodes.
+ *
+ * Accumulated as an order-dependent 64-bit hash plus a visit count rather than a
+ * stored set: constant space, no allocation on the read path, and order-sensitive
+ * (two passes over an unchanged structure visit the same nodes in the same order).
+ * A hash collision would accept a torn pass, at ~2^-64 per comparison.
+ */
+struct ft_visit_witness {
+	uint64_t h;
+	unsigned long n;
+};
+
+static inline
+void ft_witness_init(struct ft_visit_witness *w)
+{
+	w->h = 0xcbf29ce484222325ULL;	/* FNV-1a offset basis */
+	w->n = 0;
+}
+
+static inline
+void ft_witness_visit(struct ft_visit_witness *w, const void *node)
+{
+	uint64_t x = (uint64_t) (uintptr_t) node;
+
+	/*
+	 * splitmix64 finalizer before folding: node addresses are arena-strided
+	 * and share their low and high bits, so mixing first keeps the fold from
+	 * cancelling structurally-similar addresses.
+	 */
+	x += 0x9e3779b97f4a7c15ULL;
+	x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+	x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+	x ^= x >> 31;
+	w->h = (w->h ^ x) * 0x100000001b3ULL;
+	w->n++;
+}
+
+static inline
+bool ft_witness_equal(const struct ft_visit_witness *a,
+		const struct ft_visit_witness *b)
+{
+	return a->h == b->h && a->n == b->n;
+}
+
+/*
+ * Is an in-trie MOVE in flight (or about to be)?  The reader-side mode read of
+ * the move gate: 0 means fast path with no coherence check.  See
+ * struct cds_ft::move_active for why one sample per read section is sound, and
+ * why this is a plain load of a quiet word rather than a sequence counter.
+ */
+static inline
+bool ft_move_active(const struct cds_ft *ft)
+{
+	return CMM_LOAD_SHARED(ft->move_active) != 0;
+}
+
+/*
+ * Enter the move mode gate: publish "expect a move" to readers and make sure
+ * EVERY live reader has observed it before the caller mutates anything.
+ *
+ * The 0->1 mover owns the grace period; movers that arrive while that GP is in
+ * flight PIGGYBACK it (wait, do not start another), and movers that arrive after
+ * it completed proceed immediately -- @move_active has been set for at least one
+ * full GP by then, so the "all live readers see it" invariant already holds.  A
+ * burst of moves therefore costs ~one GP, not one per move.
+ *
+ * BLOCKING, and therefore NOT callable from an RCU read-side critical section:
+ * the GP would wait for the caller's own section.  A mover takes its read lock
+ * (for the descents it then does) AFTER this returns.
+ */
+static inline
+void ft_move_gate_enter(struct cds_ft *ft)
+{
+	pthread_mutex_lock(&ft->move_gate_lock);
+	if (ft->move_gate_nr++ == 0) {
+		CMM_STORE_SHARED(ft->move_active, 1);
+		ft->move_gate_gp = true;
+		pthread_mutex_unlock(&ft->move_gate_lock);
+		/*
+		 * The barrier the whole gate exists for: readers that were
+		 * already inside a critical section when the store landed may
+		 * still believe they are in fast mode, so let them finish.
+		 */
+		ft->group->flavor->update_synchronize_rcu();
+		pthread_mutex_lock(&ft->move_gate_lock);
+		ft->move_gate_gp = false;
+		pthread_cond_broadcast(&ft->move_gate_cond);
+		pthread_mutex_unlock(&ft->move_gate_lock);
+		return;
+	}
+	if (ft->move_gate_gp) {
+		/*
+		 * PIGGYBACK, and go QUIESCENT while doing it.  Under a
+		 * quiescent-state flavor (QSBR) a registered thread counts as
+		 * being inside a read section until it reports otherwise, so a
+		 * mover that simply blocked here would be a reader the owner's
+		 * grace period waits for -- while the owner waits for us and we
+		 * wait for the owner.  That is a hard deadlock, and it is what
+		 * happens (measured: the 16-writer oracle wedged) without these
+		 * two calls.  Sound because a mover holds NO read section at this
+		 * point: the gate is entered BEFORE the read lock, by contract.
+		 * A no-op on the memb / mb flavors.
+		 */
+		ft->group->flavor->thread_offline();
+		do {
+			pthread_cond_wait(&ft->move_gate_cond,
+					&ft->move_gate_lock);
+		} while (ft->move_gate_gp);
+		pthread_mutex_unlock(&ft->move_gate_lock);
+		ft->group->flavor->thread_online();
+		return;
+	}
+	pthread_mutex_unlock(&ft->move_gate_lock);
+}
+
+/*
+ * Leave the move gate; the LAST mover out returns readers to the fast path.  No
+ * grace period is needed on the way out: a reader that still sees @move_active
+ * set merely runs the coherent path once more, which is never wrong, only slower.
+ */
+static inline
+void ft_move_gate_exit(struct cds_ft *ft)
+{
+	pthread_mutex_lock(&ft->move_gate_lock);
+	if (--ft->move_gate_nr == 0)
+		CMM_STORE_SHARED(ft->move_active, 0);
+	pthread_mutex_unlock(&ft->move_gate_lock);
 }
 
 struct ft_excl_reader_scope {
@@ -2609,7 +2761,6 @@ struct cds_ft_group_attr {
 struct cds_ft_attr {
 	bool exclusive;		/* Exclusive (single-writer, no concurrent readers) vs concurrent; see cds_ft_attr_set_exclusive. */
 	bool speculative_keys_disabled;	/* This trie ignores the group's speculative_key_offset (EAGER lookups); see cds_ft_attr_set_speculative_keys.  calloc default false = inherit the group. */
-	bool rekey_coherence;	/* This trie's readers verify their descent against a concurrent in-trie rekey (move); see cds_ft_attr_set_rekey_coherence.  Requires an ordered-list group.  calloc default false = off. */
 };
 
 enum cds_ft_type_class {

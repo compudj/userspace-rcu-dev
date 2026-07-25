@@ -315,7 +315,15 @@ enum cds_ft_status ft_ineq_descend(struct cds_ft *ft,
 		enum ft_lookup_inequality mode,
 		enum ft_lookup_limit limit,
 		const bool use_keycopy,
-		const bool seed_from_node __attribute__((unused)))
+		const bool seed_from_node __attribute__((unused)),
+		/*
+		 * COHERENCE witness (NULL for every ordinary traversal, and a
+		 * compile-time NULL at those call sites, so the accumulation below
+		 * folds away entirely): when set, every node this traversal visits
+		 * is folded into @wit so a SECOND traversal can be compared against
+		 * the first and a torn read detected.  See struct ft_visit_witness.
+		 */
+		struct ft_visit_witness *wit)
 {
 	ssize_t key_depth, level;
 	struct cds_ft_inode_flag *node_flag;
@@ -572,6 +580,8 @@ slow_path:
 	for (level = 1; level < key_depth; level++) {
 		uint8_t key_value;
 
+		if (wit)			/* K-side descent */
+			ft_witness_visit(wit, ft_node_ptr(node_flag));
 		if (ft_node_compressed(node_flag)) {
 			enum ft_descent_action act;
 			ssize_t cmp_entry_level = level;
@@ -935,7 +945,11 @@ going_up:
 		 * (read by the LE/LT block, carried by the loop).
 		 */
 		while (level < up_node_lo) {
-			struct cds_ft_inode_flag *gp = ft_get_parent_rcu(ft, up_node);
+			struct cds_ft_inode_flag *gp;
+
+			if (wit)		/* the climb */
+				ft_witness_visit(wit, ft_node_ptr(up_node));
+			gp = ft_get_parent_rcu(ft, up_node);
 
 			up_node_lo -= (gp && ft_node_compressed(gp)) ?
 				(ssize_t) ft_compressed_node_ptr(gp)->len : 1;
@@ -1332,6 +1346,8 @@ descend_children:
 		assert(0);
 	}
 	for (; level < (int) ft->group->max_tree_depth; level++) {
+		if (wit)			/* the sibling descent */
+			ft_witness_visit(wit, ft_node_ptr(node_flag));
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 		/*
 		 * Skip-encoded compressed child: follow it directly without
@@ -1562,7 +1578,8 @@ enum cds_ft_status cds_ft_lookup_inequality_impl(struct cds_ft *ft,
 		enum ft_lookup_inequality mode,
 		enum ft_lookup_limit limit,
 		const bool use_keycopy,
-		const bool seed_from_node)
+		const bool seed_from_node,
+		struct ft_visit_witness *wit)	/* NULL = no coherence witness */
 {
 	CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
 
@@ -1582,6 +1599,11 @@ enum cds_ft_status cds_ft_lookup_inequality_impl(struct cds_ft *ft,
 		struct ft_ord_cell *nxt = (mode == FT_LOOKUP_GT) ?
 			ft_ord_cell_resolve_ord(&cur->lnode.next) :
 			ft_ord_cell_resolve_ord(&cur->lnode.prev);
+
+		if (wit) {			/* the cell hop's two cells */
+			ft_witness_visit(wit, cur);
+			ft_witness_visit(wit, nxt);
+		}
 
 		/* Sentinel topology: off-the-end resolves to the sentinel pseudo-cell;
 		 * map it to NULL so iter_land reports NOT_FOUND (end of list). */
@@ -1607,7 +1629,7 @@ enum cds_ft_status cds_ft_lookup_inequality_impl(struct cds_ft *ft,
 	}
 
 	return ft_ineq_descend(ft, iter, mode, limit, use_keycopy,
-			seed_from_node);
+			seed_from_node, wit);
 }
 
 /*
@@ -1634,8 +1656,10 @@ enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 {
 	if (ft->speculative_key_offset_active && ft->group->speculative &&
 			(ft->group->flags & CDS_FT_FLAG_SKIP_COMPRESSED))
-		return cds_ft_lookup_inequality_impl(ft, iter, mode, limit, true, false);
-	return cds_ft_lookup_inequality_impl(ft, iter, mode, limit, false, false);
+		return cds_ft_lookup_inequality_impl(ft, iter, mode, limit,
+				true, false, NULL);
+	return cds_ft_lookup_inequality_impl(ft, iter, mode, limit,
+			false, false, NULL);
 }
 
 /*
@@ -1652,7 +1676,8 @@ enum cds_ft_status cds_ft_lookup_inequality(struct cds_ft *ft,
 	{								\
 		CDS_FT_SCOPED_READER(ft);				\
 		return cds_ft_lookup_inequality_impl(ft, iter,		\
-				(mode), FT_LOOKUP_LIMIT_NONE, (kc), false); \
+				(mode), FT_LOOKUP_LIMIT_NONE, (kc), false, \
+				NULL);					\
 	}
 FT_INEQ_SPEC(ft_ineq_le_keycopy, FT_LOOKUP_LE, true)
 FT_INEQ_SPEC(ft_ineq_le_eager,   FT_LOOKUP_LE, false)
@@ -1784,8 +1809,8 @@ enum cds_ft_status cds_ft_lookup_last(struct cds_ft *ft,
 static enum cds_ft_status cds_ft_lookup_inequality_impl_shared(struct cds_ft *ft,
 		struct cds_ft_iter *iter, enum ft_lookup_inequality mode,
 		enum ft_lookup_limit limit, const bool use_keycopy,
-		const bool seed_from_node)
+		const bool seed_from_node, struct ft_visit_witness *wit)
 {
 	return cds_ft_lookup_inequality_impl(ft, iter, mode, limit, use_keycopy,
-			seed_from_node);
+			seed_from_node, wit);
 }

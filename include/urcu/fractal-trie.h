@@ -2818,36 +2818,28 @@ enum cds_ft_status cds_ft_attr_set_speculative_keys(struct cds_ft_attr *attr,
 		bool enabled);
 
 /*
- * cds_ft_attr_set_rekey_coherence - Per-trie opt-in to in-trie rekey coherence.
- * @attr: Fractal Trie attributes.
- * @enabled: true -- readers on this trie tolerate a CONCURRENT in-trie rekey
- *           (a cds_ft_rekey_graft / cds_ft_rekey_merge that moves a live subtree
- *           to a new key within the same trie).  false (default) -- readers do not.
+ * IN-TRIE REKEY COHERENCE is automatic; there is no attribute for it.
  *
- * A rekey moves a subtree from one key prefix to another.  Without this,
- * a reader whose descent races the move can be torn -- it can land on a leaf
- * that no longer belongs at the key it searched for.  With it enabled, every
- * EXACT lookup performs a second walk: it rematerializes the found leaf's key
- * from the trie structure (the parent-pointer up-walk) and checks it against
- * the key it descended with.  On a mismatch the descent was restructured under
- * it, so it re-descends from the root; the result it finally returns is always
- * coherent with respect to concurrent rekeys.
+ * A rekey (cds_ft_rekey_graft / cds_ft_rekey_merge) moves a live subtree from one
+ * key prefix to another WITHIN one trie, so a reader whose traversal races the
+ * move could otherwise be torn onto a position the key no longer occupies.  Every
+ * trie that can host such a move -- any trie whose group does not use speculative
+ * stored keys, since the library cannot rewrite an application-stored key when a
+ * leaf's key changes -- verifies its reads against a concurrent move.
  *
- * The check is deterministic (one extra, cache-hot walk per lookup), NOT an
- * unbounded retry, so it preserves the trie's bounded-latency reads -- but it
- * does turn this trie's reads from wait-free into lock-free (a reader on a
- * path under active rekey re-descends until the move settles).  It is therefore
- * opt-in per-trie: tries that never rekey pay nothing.
+ * The cost is confined to the move itself.  A mover first publishes a per-trie
+ * "a move is in flight" mode and waits one grace period, so that every reader has
+ * observed the mode before any structure changes; readers check that mode once per
+ * traversal.  With no move in flight, that check is a single load of a word nobody
+ * writes and the read runs exactly as it always did.  While a move IS in flight,
+ * readers on this trie verify each traversal and repeat it if the move restructured
+ * their path -- so reads on that trie are lock-free rather than wait-free for the
+ * duration of the move, and unaffected otherwise.
  *
- * Requires an ORDERED-LIST group (cds_ft_group_attr_set_ordered_list): the
- * up-walk rematerializer reads the structural key bytes from the ordered-list
- * cells.  On a non-ordered-list group this attribute has no effect.
- *
- * Default: false.  Returns CDS_FT_STATUS_OK, or
- * CDS_FT_STATUS_INVALID_ARGUMENT_ERROR if @attr is NULL.
+ * A burst of concurrent moves pays about ONE grace period between them, not one
+ * each.  A rekey therefore BLOCKS and must not be called from an RCU read-side
+ * critical section (see the rekey functions' own documentation).
  */
-enum cds_ft_status cds_ft_attr_set_rekey_coherence(struct cds_ft_attr *attr,
-		bool enabled);
 
 /*
  * cds_ft_make_exclusive - Transition a Fractal Trie to exclusive

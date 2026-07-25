@@ -668,23 +668,6 @@ unsigned long ft_nr_keys_load(const struct cds_ft_metadata *m)
 			FT_NR_KEYS_PROXY_TAG) >> 1;
 }
 
-#ifdef FEATURE_FT_MW_DLM_ACQUIRE
-/*
- * Read @ft's in-trie MOVE COUNTER (see struct cds_ft::move_seq), resolving a
- * proxy a concurrent move parked on it for its commit's duration.  Same storage
- * convention and same proxy tag as nr_keys (value << 1), so the same resolve
- * applies; the tag choice is a per-WORD reader convention, and this word's only
- * readers are movers.
- */
-static inline
-unsigned long ft_move_seq_load(const struct cds_ft *ft)
-{
-	return (unsigned long) urcu_txn_read(
-			(void **) (uintptr_t) &ft->move_seq,
-			FT_NR_KEYS_PROXY_TAG) >> 1;
-}
-#endif
-
 /*
  * Store a node's order-statistics key count -- a no-op unless the trie
  * maintains order statistics (cds_ft_group_attr_set_rank_stats).  Gating the

@@ -16,19 +16,28 @@
 #endif
 
 /*
- * REKEY coherence second walk (cds_ft_attr_set_rekey_coherence): true when the
- * descent that landed on @found is coherent with respect to a concurrent in-trie
- * rekey -- i.e. @found's key, rematerialized from the trie STRUCTURE by the
- * parent-pointer up-walk, still equals the ordinal key bytes @ord_key[0..key_len)
- * the reader descended with.  A concurrent merge_at that moved @found's subtree
+ * REKEY coherence second walk: true when the descent that landed on @found is
+ * coherent with respect to a concurrent in-trie rekey (move).
+ *
+ * FIRST, the MODE GATE (struct cds_ft::move_active): with no move in flight this
+ * returns true immediately and the reader has paid one load of a quiet word --
+ * that is the whole steady-state cost of coherence, and it is sound because a
+ * mover publishes the gate and waits a grace period BEFORE touching the
+ * structure, so a reader that samples "inactive" cannot have a move mutate under
+ * it inside its own critical section.
+ *
+ * Otherwise the witness: @found's key, rematerialized from the trie STRUCTURE by
+ * the parent-pointer up-walk, still equals the ordinal key bytes
+ * @ord_key[0..key_len) the reader descended with.  A concurrent merge_at that moved @found's subtree
  * to a different prefix while this descent was in flight leaves it landed on a
  * leaf whose structural key now differs -> returns false, and the caller
  * re-descends from the root.  Deliberately reads the STRUCTURAL key (the up-walk,
  * as cds_ft_node_get_key's non-speculative branch does), never the leaf's stored
  * speculative key: the check is about the leaf's POSITION, not its stamped bytes.
- * Only reached when ft->rekey_coherence, which is ANDed with ft->ordered_list at
- * create, so the cell (the up-walk source) always exists.  Must run under the
- * same RCU read lock that produced @found (ft_rebuild_key_upwalk's contract).
+ * Only reached when ft->rekey_coherence (every EAGER ordered-list trie under the
+ * DLM engine), which is ANDed with ft->ordered_list at create, so the cell (the
+ * up-walk source) always exists.  Must run under the same RCU read lock that
+ * produced @found (ft_rebuild_key_upwalk's contract).
  */
 #ifdef FEATURE_FT_FAULT_INJECT
 extern long cds_ft_fault_rekey_countdown;
@@ -44,6 +53,9 @@ bool ft_rekey_descent_coherent(const struct cds_ft *ft,
 	uint8_t scratch[FT_MAX_KEY_LEN];
 	size_t max_len = group->max_key_len;
 	size_t klen;
+
+	if (!ft_move_active(ft))
+		return true;		/* fast mode: no move can be in flight */
 
 #ifdef FEATURE_FT_FAULT_INJECT
 	/* Force one coherence miss on demand to exercise the re-descend loop. */

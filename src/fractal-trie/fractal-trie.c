@@ -210,6 +210,22 @@ struct cds_ft_node *cds_ft_node_next_resolve(void *raw)
 	return ft_hlist_resolve(raw);
 }
 
+/*
+ * TEST/DEBUG: hold the move mode gate open without performing a move, so a
+ * SINGLE-THREADED test can exercise the coherent reader path at all (with no
+ * mover the gate is closed and readers correctly take the fast path, which would
+ * make the coherence tests assert against dead code).  Same blocking contract as
+ * a real move: not from an RCU read-side critical section.
+ */
+void _cds_ft_debug_move_gate_enter(struct cds_ft *ft)
+{
+	ft_move_gate_enter(ft);
+}
+
+void _cds_ft_debug_move_gate_exit(struct cds_ft *ft)
+{
+	ft_move_gate_exit(ft);
+}
 #ifdef FEATURE_FT_MW_DLM_ACQUIRE
 /*
  * TEST/DEBUG (coherent-rekey sub-step 2, NOT public API): read the trie root as
@@ -446,7 +462,8 @@ bool ft_rekey_splice_pos_brackets(struct cds_ft *ft, const uint8_t *dst_ord,
  * position validation below) -- out of reach in the tested layouts, and closed
  * only by the per-FT move seqcount / relational coherence work.
  */
-int _cds_ft_debug_rekey_graft_simple(struct cds_ft *ft,
+static
+int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 		const uint8_t *src_key, size_t src_len,
 		const uint8_t *dst_key, size_t dst_len)
 {
@@ -465,7 +482,6 @@ int _cds_ft_debug_rekey_graft_simple(struct cds_ft *ft,
 	struct cds_ft_metadata *marks[FT_ENTRY_PER_NODE + 1];
 	uintptr_t snaps[FT_ENTRY_PER_NODE + 1];
 	const uint8_t *ik;
-	unsigned long move_seq;
 	unsigned int nr_marks = 0, adepth = 0, i, ti;
 	enum ft_graft_prep prep;
 	enum cds_ft_status gst;
@@ -552,21 +568,6 @@ int _cds_ft_debug_rekey_graft_simple(struct cds_ft *ft,
 	}
 
 	/*
-	 * PIN the whole decision against concurrent moves: sample the per-FT move
-	 * counter HERE, before anything is derived from a read that is not coherence-
-	 * hardened (the ordered-list splice position below comes from a RELATIONAL
-	 * descent), and record its bump into the commit at the end.  Any peer move that
-	 * commits inside that window makes this commit's CAS on the counter mismatch, so
-	 * this op aborts and re-derives instead of committing a decision that went stale.
-	 * See struct cds_ft::move_seq: for the splice position this is the ONLY sound
-	 * mechanism -- a read-only validator is built from the same incoherent reads and
-	 * can be fooled the same way (measured: mis-ordered splices still committed with
-	 * the bracket check alone).  The bracket check below stays as a cheap early
-	 * reject and as defence in depth.
-	 */
-	move_seq = ft_move_seq_load(ft);
-
-	/*
 	 * List on: capture the moved subtree's contiguous ordered-cell run endpoints
 	 * (the structural min/max external heads under S_top) from the still-pristine
 	 * list, so the ONE commit can unsplice the run from the src ordered position
@@ -625,11 +626,27 @@ int _cds_ft_debug_rekey_graft_simple(struct cds_ft *ft,
 		run_rlast = ft_subtree_minmax_head(ft, s_top, true);
 		rfc = ft_ord_cell_ptr(rcu_dereference(run_rfirst->prev));
 		rlc = ft_ord_cell_ptr(rcu_dereference(run_rlast->prev));
-		ft_ord_cell_find_splice_pos(ft, dst_key, dst_len, &run_dpred,
-				&run_dsucc);
+		/*
+		 * COHERENT derivation: two from-root traversals, compared by their
+		 * visited-node witness (ft_ord_cell_find_splice_pos_coherent).  This
+		 * is what makes the splice position trustworthy -- the single-pass
+		 * relational answer is not, and no amount of checking the ANSWER
+		 * repairs that (measured: the key-bracket check below, which is a
+		 * relational-era read itself, was fooled too).  Disagreement means a
+		 * peer move is restructuring this neighbourhood: bail and re-derive.
+		 */
+		if (!ft_ord_cell_find_splice_pos_coherent(ft, dst_key, dst_len,
+				&run_dpred, &run_dsucc))
+			return -EAGAIN;		/* torn derivation: re-descend */
+		/*
+		 * Belt and braces, and cheap: the pair must also BRACKET the dst key
+		 * range.  Adjacent + bracketing is the full correctness condition for
+		 * a splice; the two-pass agreement establishes the pair was not read
+		 * torn, this establishes it is the RIGHT pair.
+		 */
 		if (!ft_rekey_splice_pos_brackets(ft, dst_ord, dst_len, run_dpred,
 				run_dsucc))
-			return -EAGAIN;		/* incoherent relational derivation */
+			return -EAGAIN;
 		if (run_dsucc == rfc || run_dpred == rlc)
 			return -EINVAL;
 	}
@@ -699,7 +716,6 @@ int _cds_ft_debug_rekey_graft_simple(struct cds_ft *ft,
 	 * the six ordered-cell run boundary edges (src unsplice + dst splice).
 	 */
 	if (!ft_flip_txn_reserve_extra(txn, FT_REMOVE_COMMIT_REC_MAX_EDGES + 4 +
-			1 /* the move-counter pin edge (3c) */ +
 			(ft->ordered_list ? FT_ORD_CELL_RUN_DETACH_MAX_EDGES +
 				FT_ORD_CELL_RUN_RESPLICE_MAX_EDGES : 0))) {
 		cds_ft_alloc_reserve_drain(ft, &reserve);
@@ -861,15 +877,6 @@ int _cds_ft_debug_rekey_graft_simple(struct cds_ft *ft,
 		ft_ord_cell_record_into(txn, cedges, cn);
 	}
 
-	/*
-	 * 3c. PIN: bump the per-FT move counter from the value sampled before any
-	 * derivation.  A peer move that committed since then makes this MW edge's CAS
-	 * mismatch, so the whole commit backs out clean (before any SW park) and the
-	 * caller re-descends -- the coherence the relational splice-position derivation
-	 * cannot get from reads.  Reserved with the cell edges below.
-	 */
-	ft_flip_txn_record_move_seq(ft, txn, move_seq);
-
 	/* 4. ONE commit of the whole stitch (consumes txn). */
 	st = ft_flip_txn_commit(ft, txn);
 	if (st == URCU_TXN_STATUS_OK) {
@@ -908,6 +915,38 @@ int _cds_ft_debug_rekey_graft_simple(struct cds_ft *ft,
 sweep:
 	for (i = 0; i < nr_marks; i++)
 		ft_meta_copying_clear_if_held(marks[i]);
+	return ret;
+}
+
+/*
+ * The MOVE entry point: bracket the move in the mode gate, then run it under our
+ * OWN read lock.
+ *
+ * Order matters and is the gate's whole purpose: ft_move_gate_enter publishes
+ * "expect a move" to readers and waits a grace period, so every reader still in a
+ * critical section has finished before the body below mutates anything -- readers
+ * that start after it see the gate and switch to the coherent path.  A burst of
+ * concurrent moves pays ~one grace period in total (they piggyback the first).
+ *
+ * CALLER CONTRACT (new, and inherent to the gate): a move BLOCKS on a grace
+ * period, so it must NOT be called from inside an RCU read-side critical section
+ * -- the GP would wait for the caller's own section.  This entry takes the read
+ * lock the body needs itself, AFTER the gate.  The gate is entered before the
+ * shape gates run, so a rejected move also pays the GP; a production entry point
+ * would cheap-check the shape first.
+ */
+int _cds_ft_debug_rekey_graft_simple(struct cds_ft *ft,
+		const uint8_t *src_key, size_t src_len,
+		const uint8_t *dst_key, size_t dst_len)
+{
+	const struct rcu_flavor_struct *flavor = ft->group->flavor;
+	int ret;
+
+	ft_move_gate_enter(ft);
+	flavor->read_lock();
+	ret = ft_rekey_graft_simple_locked(ft, src_key, src_len, dst_key, dst_len);
+	flavor->read_unlock();
+	ft_move_gate_exit(ft);
 	return ret;
 }
 #endif /* FEATURE_FT_MW_DLM_ACQUIRE */

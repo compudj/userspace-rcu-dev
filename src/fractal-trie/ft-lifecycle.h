@@ -345,15 +345,6 @@ enum cds_ft_status cds_ft_attr_set_speculative_keys(struct cds_ft_attr *attr,
 	return CDS_FT_STATUS_OK;
 }
 
-enum cds_ft_status cds_ft_attr_set_rekey_coherence(struct cds_ft_attr *attr,
-		bool enabled)
-{
-	if (!attr)
-		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
-	attr->rekey_coherence = enabled;
-	return CDS_FT_STATUS_OK;
-}
-
 void cds_ft_make_exclusive(struct cds_ft *ft)
 {
 	CDS_FT_SCOPED_WRITER(ft);
@@ -765,13 +756,21 @@ enum cds_ft_status cds_ft_create(struct cds_ft_group *ft_group,
 	ft->speculative_key_offset_active = ft_group->speculative_key_offset_set &&
 		(!attr || !attr->speculative_keys_disabled);
 	/*
-	 * REKEY coherence (opt-in): the reader's second walk rematerializes the
-	 * key via the parent-pointer up-walk, which only exists when the group
-	 * keeps an ordered list (cells carry the structural incoming bytes), so
-	 * gate the opt-in on ->ordered_list.  Set BEFORE ft_install_lookup_ops so
-	 * it selects the coherent lookup specializations.
+	 * REKEY coherence is no longer an opt-in: the MOVE GATE
+	 * (struct cds_ft::move_active) makes it free when no move is in flight, so
+	 * every trie that CAN host an in-trie move carries the coherent lookup
+	 * variants and decides per call.  The opt-in attr is gone with it.
+	 *
+	 * Which tries can: EAGER ones only -- a move changes a leaf's key and the
+	 * library cannot rewrite an application-stored speculative key, so a
+	 * speculative trie must never host a move (and needs no coherence).  The
+	 * ->ordered_list requirement is NOT inherent; it is what the currently
+	 * installed point witness (the up-walk key rematerializer) needs, and it
+	 * goes away with the cells-free two-from-root witness.  Set BEFORE
+	 * ft_install_lookup_ops, which selects the specializations off it.
 	 */
-	ft->rekey_coherence = ft->ordered_list && attr && attr->rekey_coherence;
+	ft->rekey_coherence = ft->ordered_list &&
+		!ft->speculative_key_offset_active;
 	ft_install_lookup_ops(ft);
 #ifdef FEATURE_FT_VERIFY_AT_MUTATION
 	/*
@@ -797,6 +796,9 @@ enum cds_ft_status cds_ft_create(struct cds_ft_group *ft_group,
 	ft->lock_mode = (ft_group->writer_strategy != CDS_FT_WRITER_OPTIMISTIC);
 	ft->lock_fine = (ft_group->writer_strategy == CDS_FT_WRITER_LOCK_FINE);
 	cds_fair_mutex_init(&ft->writer_lock);
+	/* Move mode gate (struct cds_ft::move_active): movers only. */
+	pthread_mutex_init(&ft->move_gate_lock, NULL);
+	pthread_cond_init(&ft->move_gate_cond, NULL);
 	/*
 	 * Writer-contention escalation domain for the concurrent-mode ops'
 	 * persistent txn handles (ft_txn_op_init, doc §11).
@@ -843,6 +845,8 @@ void cds_ft_destroy(struct cds_ft *ft)
 {
 	const struct rcu_flavor_struct *flavor = ft->group->flavor;
 
+	assert(ft->move_gate_nr == 0);		/* no move may still hold the gate */
+
 	/*
 	 * A compaction the caller never ended would otherwise strand its
 	 * private ranges (relocated nodes in arena-untracked ranges) and leak
@@ -873,6 +877,8 @@ void cds_ft_destroy(struct cds_ft *ft)
 	 * runs in cds_ft_group_destroy, once all tries have drained.
 	 */
 	flavor->barrier();
+	pthread_cond_destroy(&ft->move_gate_cond);
+	pthread_mutex_destroy(&ft->move_gate_lock);
 	uatomic_dec(&ft->group->nr_ft_instances, CMM_RELAXED);
 	free(ft);
 }

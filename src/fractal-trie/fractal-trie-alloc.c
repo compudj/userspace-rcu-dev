@@ -1203,7 +1203,7 @@ long cds_ft_fault_lock_countdown = -1;
 
 /*
  * Test-only REKEY-coherence second-walk fault injection
- * (cds_ft_attr_set_rekey_coherence).  Counts down over ft_rekey_descent_coherent()
+ * (automatic under the move gate).  Counts down over ft_rekey_descent_coherent()
  * calls and forces the (n+1)-th to report a coherence MISS, exactly as a
  * concurrent in-trie rekey that restructured the descent's path would.
  *

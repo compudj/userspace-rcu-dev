@@ -1567,7 +1567,7 @@ retry_attach:
 		 */
 		if (dst_ft->group->ordered_list_set)
 			ft_ord_cell_find_splice_pos(dst_ft, _key, key_len,
-				&graft_pred, &graft_succ);
+				&graft_pred, &graft_succ, NULL);
 
 		/*
 		 * Self-secure the NOSPLIT store BEFORE the point of no return (the

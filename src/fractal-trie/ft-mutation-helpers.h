@@ -2426,7 +2426,8 @@ struct cds_ft_iter *ft_stack_iter_init(struct ft_stack_iter *si,
  */
 static
 struct ft_ord_cell *ft_ord_cell_find_rel(struct cds_ft *ft, const uint8_t *key,
-		size_t key_len, enum ft_lookup_inequality mode)
+		size_t key_len, enum ft_lookup_inequality mode,
+		struct ft_visit_witness *wit)
 {
 	struct ft_stack_iter si;
 	struct cds_ft_iter *it = ft_stack_iter_init(&si, ft);
@@ -2437,7 +2438,7 @@ struct ft_ord_cell *ft_ord_cell_find_rel(struct cds_ft *ft, const uint8_t *key,
 	it->prefix_len = 0;
 	it->node = NULL;
 	if (cds_ft_lookup_inequality_impl(ft, it, mode, FT_LOOKUP_LIMIT_NONE,
-			false, false) != CDS_FT_STATUS_OK)
+			false, false, wit) != CDS_FT_STATUS_OK)
 		return NULL;
 	head = cds_ft_iter_node(it);
 	if (!head)
@@ -2512,7 +2513,7 @@ int ft_ord_cell_find_pred_from_head(struct cds_ft *ft,
 		it->path_len = it->key_len + 1;
 	}
 	s = cds_ft_lookup_inequality_impl(ft, it, FT_LOOKUP_LT,
-			FT_LOOKUP_LIMIT_NONE, false, !from_root);
+			FT_LOOKUP_LIMIT_NONE, false, !from_root, NULL);
 	/*
 	 * Genuine "no predecessor" arrives as NOT_FOUND with no landed node
 	 * (every ft_ineq_descend terminal pairs status with node: OK iff a
@@ -3100,7 +3101,8 @@ enum urcu_txn_status ft_remove_commit_rec(struct cds_ft *ft,
 static
 void ft_ord_cell_find_splice_pos(struct cds_ft *dst, const uint8_t *key,
 		size_t key_len, struct ft_ord_cell **pred_out,
-		struct ft_ord_cell **succ_out)
+		struct ft_ord_cell **succ_out,
+		struct ft_visit_witness *wit)
 {
 	struct ft_ord_cell *pred, *succ;
 	size_t flen = dst->group->key_len;
@@ -3129,27 +3131,82 @@ void ft_ord_cell_find_splice_pos(struct cds_ft *dst, const uint8_t *key,
 		assert(key_len < flen && flen <= FT_MAX_KEY_LEN);
 		memcpy(pad, key, key_len);
 		memset(pad + key_len, pad_min, flen - key_len);
-		pred = ft_ord_cell_find_rel(dst, pad, flen, FT_LOOKUP_LT);
+		pred = ft_ord_cell_find_rel(dst, pad, flen, FT_LOOKUP_LT, wit);
 		if (pred) {
 			succ = ft_ord_cell_resolve_ord(&pred->lnode.next);
+			if (wit) {
+				ft_witness_visit(wit, pred);
+				ft_witness_visit(wit, succ);
+			}
 		} else {
 			memset(pad + key_len, pad_max, flen - key_len);
 			succ = ft_ord_cell_find_rel(dst, pad, flen,
-					FT_LOOKUP_GT);
+					FT_LOOKUP_GT, wit);
 		}
 		*pred_out = pred;
 		*succ_out = succ;
 		return;
 	}
 
-	pred = ft_ord_cell_find_rel(dst, key, key_len, FT_LOOKUP_LT);
-	if (pred)
+	pred = ft_ord_cell_find_rel(dst, key, key_len, FT_LOOKUP_LT, wit);
+	if (pred) {
 		succ = ft_ord_cell_resolve_ord(&pred->lnode.next);
-	else
-		succ = ft_ord_cell_find_rel(dst, key, key_len, FT_LOOKUP_GT);
+		if (wit) {
+			ft_witness_visit(wit, pred);
+			ft_witness_visit(wit, succ);
+		}
+	} else
+		succ = ft_ord_cell_find_rel(dst, key, key_len, FT_LOOKUP_GT, wit);
 	*pred_out = pred;
 	*succ_out = succ;
 }
+
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+/*
+ * COHERENT splice-position derivation: run ft_ord_cell_find_splice_pos TWICE and
+ * accept the answer only if both passes agree -- same (pred, succ) AND the same
+ * visited-node witness.
+ *
+ * Why two passes are needed at all: find_splice_pos answers a RELATIONAL question
+ * (the neighbours of a key), and a relational traversal is not coherence-hardened
+ * -- while an in-trie move is in flight it can return a pair that is genuinely
+ * ADJACENT in the list but sits at the WRONG key position, which every downstream
+ * edge then validates happily.  Why two passes are ENOUGH: a single traversal can
+ * witness such a torn view only by STRADDLING the move's commit, and two
+ * SEQUENTIAL traversals cannot both straddle the same commit (the second starts
+ * after the first ended), so agreement proves neither did.
+ *
+ * Why the WITNESS and not just the returned pair: a torn pass can land on a pair
+ * that is stable across both passes (the result is a real, unmoving cell), so
+ * comparing results alone accepts it.  The visited-node addresses differ, because
+ * a move COWs its stitch points into fresh addresses -- which is also what makes
+ * this immune to an oscillating rekey that would return an address to its old
+ * value.
+ *
+ * Returns true with *@pred_out / *@succ_out set, or false when the two passes
+ * disagreed: a move is restructuring this neighbourhood, so the caller must bail
+ * and re-derive (there is no bounded amount of re-trying that makes an incoherent
+ * derivation coherent).  Must run under one RCU read lock, like any traversal.
+ */
+static
+bool ft_ord_cell_find_splice_pos_coherent(struct cds_ft *dst, const uint8_t *key,
+		size_t key_len, struct ft_ord_cell **pred_out,
+		struct ft_ord_cell **succ_out)
+{
+	struct ft_ord_cell *pred1, *succ1, *pred2, *succ2;
+	struct ft_visit_witness w1, w2;
+
+	ft_witness_init(&w1);
+	ft_ord_cell_find_splice_pos(dst, key, key_len, &pred1, &succ1, &w1);
+	ft_witness_init(&w2);
+	ft_ord_cell_find_splice_pos(dst, key, key_len, &pred2, &succ2, &w2);
+	if (pred1 != pred2 || succ1 != succ2 || !ft_witness_equal(&w1, &w2))
+		return false;
+	*pred_out = pred1;
+	*succ_out = succ1;
+	return true;
+}
+#endif /* FEATURE_FT_MW_DLM_ACQUIRE */
 
 /*
  * Splice the contiguous ordered-list run [@run_first .. @run_last] (already
@@ -3620,30 +3677,6 @@ void ft_flip_txn_record_count_parent(struct cds_ft *ft, struct ft_flip_txn *t,
 		cur = m->parent;
 	}
 }
-
-#ifdef FEATURE_FT_MW_DLM_ACQUIRE
-/*
- * Record the in-trie MOVE COUNTER bump (@seq -> @seq + 1) into a move's commit as
- * an MW value-CAS edge, so any OTHER move that commits first makes this one's CAS
- * mismatch and abort clean.  @seq must be the value the mover read (with
- * ft_move_seq_load) BEFORE deriving anything it needs coherence for -- the whole
- * point is that the edge fails if a peer move landed inside that window.  MW (never
- * SW) even in a structural_sw txn: the word is not covered by any node lock, so it
- * needs the validating CAS, and as an MW record it installs BEFORE the SW parks and
- * backs the commit out with no side effects.  One reserved edge.
- *
- * See struct cds_ft::move_seq for why validation-by-pinning is required here and a
- * read-only check is not sufficient.
- */
-static
-void ft_flip_txn_record_move_seq(struct cds_ft *ft, struct ft_flip_txn *t,
-		unsigned long seq)
-{
-	ft_flip_txn_record_tag_mw(t, (void **) &ft->move_seq,
-			(void *) (seq << 1), (void *) ((seq + 1) << 1),
-			FT_NR_KEYS_PROXY_TAG);
-}
-#endif
 
 /*
  * Structural distinct-key count of the subtree rooted at @node_flag, used when
