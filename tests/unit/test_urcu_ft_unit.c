@@ -55,8 +55,9 @@
 #define NR_TESTS_DLM 0
 #endif
 
+/* 283 unconditional + 45 fault-injection-only RUN_TEST registrations. */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (327 + NR_TESTS_DLM)
+#define NR_TESTS (328 + NR_TESTS_DLM)
 #else
 #define NR_TESTS (283 + NR_TESTS_DLM)
 #endif
@@ -242,9 +243,17 @@ static struct cds_ft *create_fixed_ord_ft(size_t klen,
  * (_cds_ft_debug_move_gate_enter) to run the coherent path.
  */
 /* Move mode gate hooks (fractal-trie.c): let a single-threaded test run the
- * coherent reader path, which is otherwise correctly skipped with no move. */
+ * coherent reader path, which is otherwise correctly skipped with no move.
+ * C linkage: this file is compiled as C++ too (test_urcu_ft_unit_cxx), and a
+ * bare extern would then look for a mangled symbol the C library never emits. */
+#ifdef __cplusplus
+extern "C" {
+#endif
 extern void _cds_ft_debug_move_gate_enter(struct cds_ft *ft);
 extern void _cds_ft_debug_move_gate_exit(struct cds_ft *ft);
+#ifdef __cplusplus
+}
+#endif
 
 static struct cds_ft *create_fixed_ord_rekey_ft(size_t klen,
 		struct cds_ft_group **group_out)
