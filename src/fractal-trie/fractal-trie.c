@@ -335,6 +335,72 @@ void *_cds_ft_debug_child_at(struct cds_ft *ft, const uint8_t *key,
 }
 
 /*
+ * Does the located ordered-list splice pair (@pred, @succ) really BRACKET the dst
+ * key range in key order?  ft_ord_cell_find_splice_pos derives the pair from a
+ * RELATIONAL (inequality) descent, and relational reads are NOT coherent under
+ * concurrent structural mutation -- a peer rekey in flight can make that descent
+ * return a pair that is genuinely ADJACENT in the list but sits at the WRONG key
+ * position.  Every edge of the splice then validates (the pair IS adjacent) and
+ * the commit installs the run in the wrong place: an ordered list that is a
+ * well-formed doubly-linked list yet no longer key-ordered.
+ *
+ * So re-derive each neighbour's key from the STRUCTURE (the same up-walk the
+ * rekey-coherent reader uses, ordinal space, right-aligned in @scratch) and
+ * require pred < the dst range < succ.  Fixed-length groups only (the hook's
+ * scope): the dst key is a PREFIX, so the range is @dst_ord padded with the
+ * ordinal extremes.
+ *
+ * A sentinel / absent neighbour has no key, but it is NOT exempt: it ASSERTS that
+ * the run belongs at the list end, so the assertion itself is what gets checked --
+ * an absent pred means succ must really be the list MINIMUM, an absent succ means
+ * pred must really be the list MAXIMUM.  Skipping that (a first cut did) leaves the
+ * incoherent derivation a way through: a spurious "no key below the dst range"
+ * (find_splice_pos returns pred == NULL and then probes GT) paired with a succ that
+ * legitimately sorts above the range passes a key-only check, and the pair reaches
+ * the endpoint-adjacency guard as a bogus PERMANENT -EINVAL.  That was the last
+ * residual failure of the shared-junction oracle (~1 run in 70).
+ */
+static
+bool ft_rekey_splice_pos_brackets(struct cds_ft *ft, const uint8_t *dst_ord,
+		size_t dst_len, struct ft_ord_cell *pred,
+		struct ft_ord_cell *succ)
+{
+	size_t flen = ft->group->key_len, max_len = ft->group->max_key_len;
+	uint8_t lo[FT_MAX_KEY_LEN], hi[FT_MAX_KEY_LEN];
+	uint8_t scratch[FT_MAX_KEY_LEN];
+	struct ft_ord_cell *sentinel = ft_ord_sentinel_cell(ft);
+	bool pred_end = !pred || pred == sentinel;
+	bool succ_end = !succ || succ == sentinel;
+	size_t klen;
+
+	if (flen == CDS_FT_LEN_VARIABLE || dst_len > flen)
+		return true;			/* out of this hook's scope */
+	if (pred_end && succ_end)
+		return false;			/* "empty list" -- the run is IN it */
+	if (pred_end && ft_ord_first(ft) != succ)
+		return false;			/* head insert, but succ is not the min */
+	if (succ_end && ft_ord_last(ft) != pred)
+		return false;			/* tail insert, but pred is not the max */
+	memcpy(lo, dst_ord, dst_len);
+	memset(lo + dst_len, 0x00, flen - dst_len);
+	memcpy(hi, dst_ord, dst_len);
+	memset(hi + dst_len, 0xff, flen - dst_len);
+	if (pred && pred != sentinel) {
+		klen = ft_rebuild_key_upwalk(ft, pred, scratch, max_len);
+		if (klen != flen || memcmp(scratch + (max_len - klen), lo,
+				flen) >= 0)
+			return false;
+	}
+	if (succ && succ != sentinel) {
+		klen = ft_rebuild_key_upwalk(ft, succ, scratch, max_len);
+		if (klen != flen || memcmp(scratch + (max_len - klen), hi,
+				flen) <= 0)
+			return false;
+	}
+	return true;
+}
+
+/*
  * TEST/DEBUG (coherent-rekey sub-step 3, NOT public API): the SIMPLEST complete
  * one-decide rekey-graft -- move the subtree "S_top" hanging at @src_key to the
  * ABSENT @dst_key, as ONE mixed SW/MW flip-txn: COW S_top to a fresh S_top' (SW
@@ -347,25 +413,38 @@ void *_cds_ft_debug_child_at(struct cds_ft *ft, const uint8_t *key,
  *   - S_top is a plain internal POPCOUNT/PIGEON node with no co-located external
  *     list (ft_rekey_cow_stop's sub-step-2 scope), hanging at @src_key.
  *   - the SRC JUNCTION BP (= S_top's parent) and the DST PARENT SHARE A PARENT
- *     (d_src.ppnf == d_dst.ppnf) -- the enforced precondition of the
- *     src_parent_held reuse (see the shape gate below).  In the default,
- *     concurrent-safe build EVERY popcount delete recompacts, so BP is rebuilt on
- *     the removal and republished into that shared parent; the graft's dst-parent
- *     recompaction COPYING-holds that same shared parent FIRST, so the detach's BP
- *     recompaction REUSES the held lock instead of re-acquiring it.
+ *     (d_src.ppnf == d_dst.ppnf) -- the enforced precondition of the held-parent
+ *     reuse (see the shape gate below).  In the default, concurrent-safe build
+ *     EVERY popcount delete recompacts, so BP is rebuilt on the removal and
+ *     republished into that shared parent; the graft's dst-parent recompaction
+ *     COPYING-holds that same shared parent FIRST, so the detach's BP recompaction
+ *     REUSES the held lock (@src_held_hint) instead of re-acquiring it.
  *   - @dst_key is ABSENT and reached by a NOSPLIT graft into a spare slot with
  *     append room (no compressed-divergence GLUE split).
- *   - the trie's ordered list is OFF (no boundary cells to re-splice).
+ *   - the trie's ordered list may be ON: the moved subtree's contiguous cell run
+ *     unsplices from the src ordered position and re-splices at the dst position
+ *     as SIX recorded cell edges in the SAME commit (all MW, so a peer's cell
+ *     conflict aborts clean).  The dst splice position must be clear of the run's
+ *     own ordered neighbourhood (adjacency guard below).
  * structural_sw STAYS TRUE the whole txn: cow_stop's S_top edges, the graft's
  * dst-parent recompaction, and the detach's BP recompaction all hold their DLM
- * COPYING locks (BP's shared parent via src_parent_held), so every structural edge
+ * COPYING locks (BP's shared parent via @src_held_hint), so every structural edge
  * is legitimately SW; the mixed engine still sorts the (MW) count edges first.
  *
  * @src_key / @dst_key are APPLICATION keys (converted to ordinal internally); for
  * a fixed-length group @src_len must equal @dst_len.
  *
- * SINGLE-WRITER use only.  Returns 0, or -EINVAL if the controlled shape above is
- * not met, or a negative errno on a bail (not expected single-threaded).
+ * CONCURRENCY.  Abort-clean and single-shot: every bail leaves the trie byte-for-
+ * byte as before, so a CONCURRENT caller retries by simply calling again (there is
+ * no internal retry loop).  Returns 0; -EINVAL when the controlled shape above is
+ * not met; or a TRANSIENT contention code to retry on -- -EIO (the graft's up-front
+ * acquire lost a race), -EAGAIN (a cow_stop / detach acquire, an incoherently
+ * derived splice position, or the final commit aborted), -ENOMEM (reserve).  The
+ * concurrent oracles (inv_rekey_graft_{disjoint,shared,coherent_readers}) exercise
+ * exactly that contract.  What is NOT yet multi-writer safe in general: a dst
+ * splice neighbour INTERIOR to a peer's concurrently-moving run (see the splice
+ * position validation below) -- out of reach in the tested layouts, and closed
+ * only by the per-FT move seqcount / relational coherence work.
  */
 int _cds_ft_debug_rekey_graft_simple(struct cds_ft *ft,
 		const uint8_t *src_key, size_t src_len,
@@ -386,6 +465,7 @@ int _cds_ft_debug_rekey_graft_simple(struct cds_ft *ft,
 	struct cds_ft_metadata *marks[FT_ENTRY_PER_NODE + 1];
 	uintptr_t snaps[FT_ENTRY_PER_NODE + 1];
 	const uint8_t *ik;
+	unsigned long move_seq;
 	unsigned int nr_marks = 0, adepth = 0, i, ti;
 	enum ft_graft_prep prep;
 	enum cds_ft_status gst;
@@ -436,14 +516,61 @@ int _cds_ft_debug_rekey_graft_simple(struct cds_ft *ft,
 			ft_node_external(d_src.pnf) || ft_node_compressed(d_src.pnf))
 		return -EINVAL;
 	bp_meta = cds_ft_item_to_metadata(ft_node_ptr(d_src.pnf));
-	if (ft_meta_nr_child(bp_meta) < 3)
+	/*
+	 * PROXY-SAFE count read: the raw ft_meta_nr_child() would decode a peer's
+	 * parked FT_STATE_PROXY as a garbage child count and reject a perfectly good
+	 * shape as PERMANENTLY invalid (measured: 10-12 spurious -EINVAL per stress
+	 * run).  ft_meta_nr_child_load resolves the proxy to the committed value.
+	 */
+	if (ft_meta_nr_child_load(bp_meta) < 3)
 		return -EINVAL;
+
+	/*
+	 * A POPULATED dst is a PERMANENT shape error, so reject it HERE.  The later shape
+	 * gate does check d_dst.nf, but only after ft_graft_build -- i.e. after the splice
+	 * position validation below, whose failure code is the TRANSIENT -EAGAIN.  A key
+	 * inside the dst range makes that validation's succ check fail first, so a caller
+	 * that (correctly) retries -EAGAIN would spin forever on a shape that can never
+	 * work.  Probe read-only and conservatively: a descent that cannot reach the dst
+	 * depth plainly proves nothing, so leave those shapes to the later gate.
+	 */
+	{
+		struct ft_descent d_probe;
+		const uint8_t *pk = dst_ord;
+
+		ft_descent_init(&d_probe, ft);
+		while (d_probe.depth < dst_len && d_probe.nf &&
+				!ft_node_external(d_probe.nf) &&
+				!ft_node_compressed(d_probe.nf)
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+				&& !ft_node_skip_compressed(d_probe.nf)
+#endif
+		      )
+			ft_descent_step(ft, &d_probe, *(pk++));
+		if (d_probe.depth == dst_len && d_probe.nf)
+			return -EINVAL;		/* dst occupied: permanent, not a race */
+	}
+
+	/*
+	 * PIN the whole decision against concurrent moves: sample the per-FT move
+	 * counter HERE, before anything is derived from a read that is not coherence-
+	 * hardened (the ordered-list splice position below comes from a RELATIONAL
+	 * descent), and record its bump into the commit at the end.  Any peer move that
+	 * commits inside that window makes this commit's CAS on the counter mismatch, so
+	 * this op aborts and re-derives instead of committing a decision that went stale.
+	 * See struct cds_ft::move_seq: for the splice position this is the ONLY sound
+	 * mechanism -- a read-only validator is built from the same incoherent reads and
+	 * can be fooled the same way (measured: mis-ordered splices still committed with
+	 * the bracket check alone).  The bracket check below stays as a cheap early
+	 * reject and as defence in depth.
+	 */
+	move_seq = ft_move_seq_load(ft);
 
 	/*
 	 * List on: capture the moved subtree's contiguous ordered-cell run endpoints
 	 * (the structural min/max external heads under S_top) from the still-pristine
 	 * list, so the ONE commit can unsplice the run from the src ordered position
-	 * and re-splice it at the dst position (four MW boundary edges) atomically with
+	 * and re-splice it at the dst position (six MW boundary edges) atomically with
 	 * the structural move -- a coherent reader never sees a moved key gone from the
 	 * structure but still in the list (or vice versa).  cow_stop SHARES S_top's
 	 * leaves (only S_top's own node relocates), so these heads stay valid across it.
@@ -466,6 +593,30 @@ int _cds_ft_debug_rekey_graft_simple(struct cds_ft *ft,
 	 * forces src_len == dst_len, so an interior dst (which needs the full src prefix
 	 * plus a longer key descending into S_top) never reaches the cell record.  A
 	 * future relaxation of that shape gate MUST re-add an interior check here.
+	 *
+	 * VALIDATE the located pair FIRST, and bail -EAGAIN (transient, re-derive) when
+	 * it does not bracket the dst key range: find_splice_pos derives the pair from a
+	 * RELATIONAL descent, which is NOT coherent under concurrent structural
+	 * mutation, so a peer rekey in flight can return a pair that is adjacent in the
+	 * list but sits at the WRONG key position.  ADJACENT + BRACKETING is the full
+	 * correctness condition for a splice, and only adjacency was checked: the
+	 * splice's own boundary edge (pred->next expect succ) validates adjacency at
+	 * commit, and ft_rekey_splice_pos_brackets validates the other half here.  The
+	 * bracket check must precede the endpoint-adjacency check so that a racy pair
+	 * involving a run endpoint surfaces as the transient -EAGAIN it is rather than
+	 * the permanent -EINVAL of the genuine (correctly-derived, abutting) shape --
+	 * a racy pred == rlc drags succ = resolve(rlc->next) along, which then sorts
+	 * BELOW the dst range and fails the bracket.
+	 *
+	 * WHAT IS STILL OPEN (general rekey, not this hook's tested shapes): a pair that
+	 * brackets and is adjacent when validated can still be invalidated afterwards if
+	 * a neighbour is INTERIOR to a peer's moving run -- the peer's move leaves an
+	 * interior cell's own links untouched, so no edge of this commit detects it, and
+	 * the run lands inside the peer's run.  Every neighbour reachable in the tested
+	 * layouts is either a never-moving key or a peer run's ENDPOINT (whose outer link
+	 * IS one of these edges, hence detected).  Closing it in general needs the
+	 * per-FT move seqcount / relational coherence (doc: in-trie-move-seqcount.md),
+	 * which would also let a rekey validate the derivation itself.
 	 */
 	if (ft->ordered_list) {
 		struct ft_ord_cell *rfc, *rlc;
@@ -476,6 +627,9 @@ int _cds_ft_debug_rekey_graft_simple(struct cds_ft *ft,
 		rlc = ft_ord_cell_ptr(rcu_dereference(run_rlast->prev));
 		ft_ord_cell_find_splice_pos(ft, dst_key, dst_len, &run_dpred,
 				&run_dsucc);
+		if (!ft_rekey_splice_pos_brackets(ft, dst_ord, dst_len, run_dpred,
+				run_dsucc))
+			return -EAGAIN;		/* incoherent relational derivation */
 		if (run_dsucc == rfc || run_dpred == rlc)
 			return -EINVAL;
 	}
@@ -542,11 +696,12 @@ int _cds_ft_debug_rekey_graft_simple(struct cds_ft *ft,
 	}
 	/*
 	 * Reserve the graft slot edge + the detach struct/state edges, plus (list on)
-	 * the four ordered-cell run boundary edges (src unsplice + dst splice).
+	 * the six ordered-cell run boundary edges (src unsplice + dst splice).
 	 */
 	if (!ft_flip_txn_reserve_extra(txn, FT_REMOVE_COMMIT_REC_MAX_EDGES + 4 +
+			1 /* the move-counter pin edge (3c) */ +
 			(ft->ordered_list ? FT_ORD_CELL_RUN_DETACH_MAX_EDGES +
-				FT_ORD_CELL_RUN_SPLICE_MAX_EDGES : 0))) {
+				FT_ORD_CELL_RUN_RESPLICE_MAX_EDGES : 0))) {
 		cds_ft_alloc_reserve_drain(ft, &reserve);
 		ft_glue_abort(ft, &glue);
 		free_cds_ft_node_unpublished(ft, ft_node_ptr(s_top_prime));
@@ -588,27 +743,52 @@ int _cds_ft_debug_rekey_graft_simple(struct cds_ft *ft,
 	 * default (concurrent-safe) build EVERY popcount delete recompacts BP, and
 	 * that recompaction republishes into BP's parent -- which is the SAME shared
 	 * spine ancestor the graft's dst-parent recompaction already COPYING-holds
-	 * (both BP and the dst parent are children of it in this depth-2 shape).  Pass
-	 * src_parent_held=TRUE so the detach's recompaction REUSES that held lock
-	 * instead of re-acquiring it (a second acquire would abort -EAGAIN).
+	 * (both BP and the dst parent are children of it in this depth-2 shape, the
+	 * d_src.ppnf == d_dst.ppnf gate).  Hand the detach that HELD NODE'S IDENTITY
+	 * (@src_held_hint) so its recompaction REUSES the held lock instead of
+	 * re-acquiring it (a second acquire would abort -EAGAIN).
+	 *
+	 * The identity is passed EXPLICITLY, and its slot with it, rather than letting
+	 * the recompaction resolve BP's current parent: that resolve is racy, and a
+	 * peer that re-homed BP since this descent would make "BP's parent" a node
+	 * this op does NOT hold -- an SW park into an unheld word.  The recompaction's
+	 * acquire commit carries a BP.parent == @parent read-set guard, so a re-home
+	 * ABORTS it (-EAGAIN, trie pristine) and the caller re-descends.
 	 */
 	ret = ft_detach_node(ft, d_src.nfp, d_src.pnfp, d_src.depth,
 			false /*free_detached_subtree: S_top is retired by cow_stop*/,
 			NULL /*fuse_cell: list off*/, &pub, NULL /*run*/,
 			NULL /*retire_glue*/, NULL /*freeze_leaf*/,
 			-(long) cnt, txn /*shared_txn*/, true /*record_only*/,
-			true /*src_parent_held: shared parent held by the graft recompaction*/,
+			&(const struct ft_parent_hint){	/* graft-held shared parent */
+				.parent = d_src.ppnf, .slot = d_src.pnfp,
+				.gp = NULL, .gp_slot = NULL,
+				.parent_held = true },
 			&detach_rc /*old + fresh BP copies, reclaimed post-commit*/);
 	if (ret) {
-		/* Pre-commit bail (not expected simple/single-threaded). */
+		/*
+		 * Pre-commit bail.  Reclaim EVERY unpublished fresh copy built so far --
+		 * S_top' AND the graft's relocated dst-parent copy (@gst_st.dest, whose
+		 * old counterpart is @gst_st.old_recompacted_node): the graft always
+		 * relocates the attach node, and under record_only nothing it built is
+		 * published until the caller's commit, so this arm owns the fresh copy
+		 * exactly as the commit-abort arm below does.  (@glue's own build is
+		 * covered by ft_glue_abort; nr_built is 0 for the NOSPLIT shape.)
+		 * REACHABLE single-threaded, deterministically: a same-junction rekey
+		 * (src and dst under the SAME junction, which every shape gate admits)
+		 * makes BP the graft's own attach node, so the graft COPYING-locks BP and
+		 * the fold's ft_dlm_lock(BP) then returns -EAGAIN right here.
+		 */
 		free_cds_ft_node_unpublished(ft, ft_node_ptr(s_top_prime));
+		if (gst_st.old_recompacted_node)
+			free_cds_ft_node_unpublished(ft, ft_node_ptr(gst_st.dest));
 		ft_glue_abort(ft, &glue);
 		ft_flip_txn_destroy(txn);
 		goto sweep;
 	}
 
 	/*
-	 * 3b. Cell-fold (list on): record the four ordered-cell run boundary edges into
+	 * 3b. Cell-fold (list on): record the six ordered-cell run boundary edges into
 	 * the SHARED txn so the run unsplices from src + re-splices at dst ATOMICALLY
 	 * with the structural move.  Driver-managed (run == NULL to the structural folds
 	 * above) rather than threaded through them, because the dst-splice PLAIN-STORES
@@ -619,32 +799,76 @@ int _cds_ft_debug_rekey_graft_simple(struct cds_ft *ft,
 	 * recorded here, in the required order, on the still-pristine live list (no
 	 * structural fold above published anything).
 	 *
-	 * SINGLE-WRITER SCOPE (plan Q3, deferred to the coherence oracle sub-step): the
-	 * dst-splice's plain store of the run's two outer links is (a) visible before the
-	 * atomic boundary flip and (b) NOT rolled back if the commit aborts, so this
-	 * list-on path is single-writer-only -- matching this hook's contract -- until the
-	 * oracle decides whether those two links join the atomic MW set (or the endpoint
-	 * cells are COW'd).  Single-threaded here the commit is deterministically OK.
+	 * All SIX edges ride the ONE commit (plan Q3): the src unsplice's two neighbour
+	 * back-edges, the dst splice's two neighbour back-edges, AND -- via the same-trie
+	 * ft_ord_cell_run_resplice_edges instead of the cross-trie
+	 * ft_ord_cell_run_splice_edges -- the run's own two OUTER links, which the
+	 * cross-trie form would PLAIN-STORE.  A plain store is wrong for a LIVE run: it
+	 * publishes the dst neighbours before the boundary flip and survives an abort,
+	 * permanently breaking the back-edges.  Cell edges are always MW, so a peer's
+	 * conflicting splice aborts this commit clean and the caller re-descends.
 	 */
 	if (ft->ordered_list) {
 		struct ft_ord_cell_edge cedges[FT_ORD_CELL_RUN_DETACH_MAX_EDGES +
-			FT_ORD_CELL_RUN_SPLICE_MAX_EDGES];
-		struct ft_ord_cell *rfc, *rlc;
+			FT_ORD_CELL_RUN_RESPLICE_MAX_EDGES];
+		struct ft_ord_cell *rfc, *rlc, *src_pred, *src_succ;
 		unsigned int cn;
+
+		/*
+		 * DISTINCT-SLOT precondition (the engine's, rcu-txn-mcas.h: a txn's records
+		 * must target pairwise-distinct slots).  Two of the six edges coincide iff a
+		 * dst neighbour IS a src neighbour: dst_pred == src_pred puts two records on
+		 * &src_pred->lnode.next, dst_succ == src_succ two on &src_succ->lnode.prev.
+		 * The endpoint-adjacency guard does NOT exclude that, because the dst pair was
+		 * derived earlier than these src reads and a peer move can have shifted the
+		 * neighbourhood in between -- MEASURED at 1.5-2% of commits before the move
+		 * counter pinned the window shut.  ft_flip_txn_create's expect_conflict makes
+		 * the engine RECONCILE rather than corrupt (it poisons -> clean abort), but
+		 * relying on that is relying on a fallback: bail explicitly instead, so the
+		 * distinctness the engine requires holds BY CONSTRUCTION.  Clean -EAGAIN: the
+		 * txn has recorded structural edges but published nothing, so the bail below
+		 * unwinds exactly like the other pre-commit bails.
+		 */
+		rfc = ft_ord_cell_ptr(rcu_dereference(run_rfirst->prev));
+		rlc = ft_ord_cell_ptr(rcu_dereference(run_rlast->prev));
+		src_pred = ft_ord_cell_resolve_ord(&rfc->lnode.prev);
+		src_succ = ft_ord_cell_resolve_ord(&rlc->lnode.next);
+		if (src_pred == ft_ord_or_sentinel(ft, run_dpred) ||
+				src_succ == ft_ord_or_sentinel(ft, run_dsucc)) {
+			free_cds_ft_node_unpublished(ft, ft_node_ptr(s_top_prime));
+			if (gst_st.old_recompacted_node)
+				free_cds_ft_node_unpublished(ft,
+					ft_node_ptr(gst_st.dest));
+			if (detach_rc.new_flag)
+				free_cds_ft_node_unpublished(ft,
+					ft_node_ptr(detach_rc.new_flag));
+			ft_glue_abort(ft, &glue);
+			ft_flip_txn_destroy(txn);
+			ret = -EAGAIN;
+			goto sweep;
+		}
 
 		/* src unsplice FIRST: reads the run's pristine outer links -> src neighbours. */
 		cn = ft_ord_cell_run_detach_edges(ft, run_rfirst, run_rlast,
 				&rfc, &rlc, cedges, 0);
 		/*
-		 * dst splice into the gap located up front on the pristine list (run_dpred /
-		 * run_dsucc, adjacency-rejected there so neither is a run endpoint).  This
-		 * plain-stores the run's outer links -- safe now: the src read above is done,
-		 * and the list is still pristine (no structural fold above published).
+		 * dst splice into the gap located up front on the pristine list.  Records the
+		 * run's outer links rather than storing them, so the whole move is atomic and
+		 * abort-clean; all six slots are distinct per the check above.
 		 */
-		cn = ft_ord_cell_run_splice_edges(ft, rfc, rlc, run_dpred, run_dsucc,
-				cedges, cn);
+		cn = ft_ord_cell_run_resplice_edges(ft, rfc, rlc, run_dpred,
+				run_dsucc, cedges, cn);
 		ft_ord_cell_record_into(txn, cedges, cn);
 	}
+
+	/*
+	 * 3c. PIN: bump the per-FT move counter from the value sampled before any
+	 * derivation.  A peer move that committed since then makes this MW edge's CAS
+	 * mismatch, so the whole commit backs out clean (before any SW park) and the
+	 * caller re-descends -- the coherence the relational splice-position derivation
+	 * cannot get from reads.  Reserved with the cell edges below.
+	 */
+	ft_flip_txn_record_move_seq(ft, txn, move_seq);
 
 	/* 4. ONE commit of the whole stitch (consumes txn). */
 	st = ft_flip_txn_commit(ft, txn);

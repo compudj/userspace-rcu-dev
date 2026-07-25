@@ -1066,7 +1066,7 @@ int ft_detach_node(struct cds_ft *ft,
 		long count_delta,
 		struct ft_flip_txn *shared_txn,
 		bool record_only,
-		bool src_parent_held,
+		const struct ft_parent_hint *src_held_hint,
 		struct ft_detach_recompact_out *recompact_out)
 {
 	struct cds_ft_metadata *metadata_stack[FT_MAX_DEPTH];
@@ -2116,7 +2116,7 @@ int ft_detach_node(struct cds_ft *ft,
 				metadata_stack[nr_branch - 1],
 				n, (struct cds_ft_inode_flag *) topmost_external_nodes,
 				detach_parent_flag_ptr == &ft->root,
-				cur_depth, pub, commit_txn, src_parent_held);
+				cur_depth, pub, commit_txn, src_held_hint);
 		}
 		if (!ret) {
 			/*
@@ -3234,7 +3234,7 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 				ft_get_parent_slot(holder_meta, ft),
 				key_len, true, fuse_cell, pubp, NULL, NULL, node,
 				-1 /* leaf key removed: detach owns the -1 */,
-				NULL, false, false, NULL);
+				NULL, false, NULL, NULL);
 			/* @node's freeze rode the detach commit (freeze_leaf). */
 		} else {
 			/*
@@ -3433,7 +3433,7 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 				ft_get_parent_slot(holder_meta, ft),
 				key_len, true, fuse_cell, pubp, NULL, NULL, node,
 				-1 /* leaf key removed: detach owns the -1 */,
-				NULL, false, false, NULL);
+				NULL, false, NULL, NULL);
 			/* @node's freeze rode the detach commit (freeze_leaf). */
 		} else {
 			/* Removing the head, duplicates remain: key count unchanged. */
@@ -3941,7 +3941,7 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 			ft_get_parent_slot(holder_meta, ft), key_len, true,
 			dead_cell, ft->ordered_list ? &pub : NULL, NULL, NULL,
 			NULL, -1 /* leaf key removed: detach owns the -1 */,
-			NULL, false, false, NULL);
+			NULL, false, NULL, NULL);
 		if (!ret)
 			ft_chain_mark_removed_flip(ft, chain_head);
 	}

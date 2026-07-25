@@ -3099,7 +3099,7 @@ retry_swap:
 					false, NULL, gs_ord ? &dpub : NULL,
 					gs_ord ? &drun : NULL, NULL, NULL,
 					-(long) old_count /* fold -old_count onto the detach commit */,
-					NULL, false, false, NULL);
+					NULL, false, NULL, NULL);
 			cds_ft_alloc_reserve_deactivate(dst_ft);
 #ifdef FEATURE_FT_MW_LOCK_FINE_DROP
 			/*

@@ -1102,14 +1102,42 @@ int ft_node_recompact(enum ft_recompact mode,
 		 * do NOT re-lock it (a second ft_dlm_lock would abort -EAGAIN) and do
 		 * NOT add it to @rel_meta below (the holder owns its release).  P stays
 		 * the republish target; only C (and, if present, GP) are acquired here.
+		 *
+		 * The guard is NOT skipped with the lock: @pf_p is then the CALLER's
+		 * held-node identity, and the reuse is only sound while C really hangs
+		 * off it, so C.parent == P rides this same acquire commit.  It makes the
+		 * fold VALIDATE at commit what it would otherwise assume from a
+		 * descent-time relationship, rather than park an SW store into a word it
+		 * does not hold.  HONEST SCOPE (measured: 0 mismatches in 5525 folds):
+		 * under the fold's OWN precondition it cannot fire -- re-homing C means
+		 * rewriting P's child set, which needs P's COPYING, which the holder has
+		 * for the whole window, and a re-home that happened EARLIER tombstoned
+		 * the old P so the holder's own ft_dlm_lock(P) aborted first.  Its value
+		 * is the shapes the precondition does not cover (a climbing detach, where
+		 * C is a higher ancestor than the hint's slot names) and any future
+		 * relaxation of the driver's shape gate -- i.e. it keeps the invariant
+		 * checked by the machine instead of by a comment.
 		 */
 		bool p_held = inh_hint && inh_hint->parent_held;
+
+		/*
+		 * A held P also SKIPS the GP lock below, but the SKIP_X dual re-encode
+		 * asserts GP was acquired whenever P is compressed -- so the fold must
+		 * never be entered with a compressed P.  The only producer (the same-trie
+		 * rekey driver) rejects compressed nodes at every descent level, and
+		 * FT_RECOMPACT_DEL defers the dual; fail the acquire rather than trust
+		 * that if a future caller breaks it.
+		 */
+		if (p_held && gp_meta)
+			return -EAGAIN;
 
 		/* ACQUIRE {C, (P), (GP)} + read-set guards in one MCAS. */
 		acq = ft_flip_txn_create_bounded(3 /*locks*/ + 2 /*guards*/);
 		if (!acq)
 			return -ENOMEM;
 		dret = ft_dlm_lock(acq, metadata, &snap_c);
+		if (!dret && p_meta && p_held)
+			ft_dlm_guard_parent(acq, metadata, pf_p);
 		if (!dret && p_meta && !p_held) {
 			if (!inh_hint)
 				ft_dlm_guard_parent(acq, metadata, pf_p);
@@ -2458,7 +2486,7 @@ int ft_node_replace_ptr(struct cds_ft *ft,
 		unsigned int node_depth,
 		struct ft_remove_pub *pub,
 		struct ft_flip_txn *retire_txn,
-		bool parent_held)
+		const struct ft_parent_hint *held_hint)
 {
 	int ret;
 	unsigned int type_index;
@@ -2474,34 +2502,28 @@ int ft_node_replace_ptr(struct cds_ft *ft,
 	ret = _ft_node_replace_ptr(ft, type, node, *parent_node_flag_ptr, metadata, node_flag_ptr, n, newptr, pub);
 	if (ret == -EFBIG) {
 		/*
-		 * FOLD (parent_held): a same-trie rekey folds this delete-recompaction
-		 * of the src junction with a graft that ALREADY COPYING-holds the
-		 * shared spine parent -- pass a hint so the recompaction reuses that
-		 * held lock (republish into it SW) instead of re-acquiring it (which
-		 * would abort -EAGAIN).  @metadata is the recompacted node's own meta,
-		 * so ft_resolve_parent_slot yields its (held) parent + slot.
+		 * FOLD (@held_hint, parent_held set): a same-trie rekey folds this
+		 * delete-recompaction of the src junction with a graft that ALREADY
+		 * COPYING-holds the shared spine parent, so the recompaction reuses
+		 * that held lock (republishing into it SW) instead of re-acquiring it
+		 * (a second ft_dlm_lock would abort -EAGAIN).  The hint carries the
+		 * CALLER's held-node IDENTITY (and the recompacted node's slot in it)
+		 * -- NOT a fresh resolve of this node's current parent, which would be
+		 * a racy read: if a peer re-homed the node since the caller's descent,
+		 * its current parent is NOT the node the caller holds, and the
+		 * recompaction would park an SW store into an UNHELD word.  The
+		 * recompaction's acquire commit validates the identity (its C.parent ==
+		 * @held_hint->parent read-set guard), so a re-home aborts -> re-descend.
+		 * NULL for every ordinary recompaction (it acquires + releases the
+		 * parent itself).
 		 */
-		struct ft_parent_hint held_hint;
-		const struct ft_parent_hint *hint = NULL;
-
 		assert(!newptr);
-		if (parent_held) {
-			struct cds_ft_inode_flag *pf_p = NULL;
-			struct cds_ft_inode_flag **pf_p_slot =
-				ft_resolve_parent_slot(metadata, ft, &pf_p);
-
-			held_hint = (struct ft_parent_hint){
-				.parent = pf_p, .slot = pf_p_slot,
-				.gp = NULL, .gp_slot = NULL,
-				.parent_held = true,
-			};
-			hint = &held_hint;
-		}
+		assert(!held_hint || held_hint->parent_held);
 		/* Should try recompaction. */
 		ret = ft_node_recompact(FT_RECOMPACT_DEL, ft, type_index, type, node,
 				metadata, parent_node_flag_ptr, n, NULL,
 				node_flag_ptr, old_node_ret, is_root, node_depth,
-				false, NULL, retire_txn, hint);
+				false, NULL, retire_txn, held_hint);
 	}
 	if (ret == 0)
 		FT_TP(tree_edge_set, (const void *) ft,

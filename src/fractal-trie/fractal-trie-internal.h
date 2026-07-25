@@ -1549,6 +1549,32 @@ struct cds_ft {
 	 */
 	bool rekey_coherence;
 
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+	/*
+	 * PER-FT MOVE COUNTER (doc/design/in-trie-move-seqcount.md), the writer half:
+	 * bumped as an MW value-CAS edge (cur -> cur + (1 << 1)) INSIDE every in-trie
+	 * MOVE commit, so two concurrent moves CONFLICT on this one word and the loser
+	 * aborts clean.  That is what makes a mover's ordered-list decisions COHERENT:
+	 * the dst splice position must be derived from a RELATIONAL descent, and
+	 * relational reads are not coherence-hardened, so a peer move committing between
+	 * the derivation and the commit can silently invalidate it (an adjacent pair at
+	 * the WRONG key position -> a list that is well-formed but no longer ordered).
+	 * With the counter in the write set, NO move can commit inside that window: the
+	 * derivation is coherent by construction rather than by validation, which no
+	 * read-only check can achieve (a validator built from the same incoherent reads
+	 * can be fooled the same way -- measured, not assumed).
+	 *
+	 * Stored SHIFTED LEFT BY ONE, exactly like metadata->nr_keys, so bit 0 stays
+	 * free for the engine's in-band proxy tag (FT_NR_KEYS_PROXY_TAG); read it with
+	 * ft_move_seq_load(), which resolves a proxy parked for a commit's duration.
+	 * ONLY the in-trie move path touches it, so every other op and every reader is
+	 * unaffected.  Granularity is deliberately the whole trie (the design note
+	 * accepts that in-trie moves serialize); it is also the word a future READER
+	 * bracket will sample, so sharding it is a design decision, not a local one.
+	 */
+	unsigned long move_seq;
+#endif
+
 	/*
 	 * In-progress compaction state (cds_ft_compact_begin), or NULL.
 	 * Set at begin, cleared at end.  Lets cds_ft_compact_begin reject a

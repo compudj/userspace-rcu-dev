@@ -410,7 +410,7 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 				ret = ft_detach_node(ft, d.nfp, d.pnfp, d.depth,
 						false, NULL, pubp, runp, NULL, NULL,
 						-(long) detached_count, NULL, false,
-						false, NULL);
+						NULL, NULL);
 				assert(ret != -ENOENT);
 				if (ret < 0) {
 					/*

@@ -3205,6 +3205,86 @@ unsigned int ft_ord_cell_run_splice_edges(struct cds_ft *dst,
 /* Max edges a run-splice commits: the two boundary back-edges. */
 #define FT_ORD_CELL_RUN_SPLICE_MAX_EDGES	2
 
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE	/* the coherent same-trie rekey's only caller */
+/*
+ * SAME-TRIE re-splice of a LIVE run (the coherent rekey's dst half), the variant
+ * ft_ord_cell_run_splice_edges cannot be: it PRE-SETS the run's two outer links
+ * with PLAIN STORES, sound only for its cross-trie shape -- an incoming run that
+ * is not yet reachable in @dst, spliced in the op's un-abortable failure-free
+ * section.  In a same-trie rekey the run is still LIVE at its src ordered position
+ * while these edges are built (the src unsplice rides the SAME commit), so a plain
+ * store would
+ *   (a) publish the DST neighbours to an ordered reader still walking the run at
+ *       src, BEFORE the boundary flip -- recording them instead makes each of the
+ *       six slots flip atomically, so no walker reads a link mid-update.  (It does
+ *       NOT make the whole move atomic for a walker that STRADDLES the commit while
+ *       parked on a run cell: the run's internal links never change, so it steps off
+ *       the run through the NEW outer link and lands in the dst neighbourhood,
+ *       skipping the keys in between.  That is inherent to moving a live run without
+ *       draining readers, not something edge atomicity can fix.)  And
+ *   (b) NOT roll back when the commit ABORTS -- leaving run_first->prev /
+ *       run_last->next pointing into the dst neighbourhood while both
+ *       neighbourhoods still point at their old targets: a PERMANENTLY broken
+ *       back-edge.  With concurrent rekey writers the final commit does abort (a
+ *       peer's boundary-cell splice conflicts), which is exactly how
+ *       inv_rekey_graft_shared broke the list ("ord-cell back-edge broken") where
+ *       the disjoint oracle -- whose serialized moves never abort the final commit
+ *       -- could not.
+ * So all FOUR edges (the run's two outer links + the two dst neighbour back-edges)
+ * ride the txn.  They are CELL edges (URCU_TXN_TAG), hence always MW: the ordered
+ * list stays lock-free and a peer's conflicting splice aborts the mixed commit
+ * CLEAN, before any SW side effect.  The run's INTERNAL links are untouched.
+ *
+ * @pred / @succ are the DST neighbours, located BEFORE anything is published (see
+ * ft_ord_cell_find_splice_pos) and ADJACENCY-CHECKED by the caller: neither may be
+ * a run endpoint, else two edges would target one slot (and the run would splice
+ * into itself).  The src-side expected-old values are read here from the run's
+ * still-pristine outer links, so this must be appended BEFORE any edge is flipped
+ * (the caller records, then commits once).
+ */
+static
+unsigned int ft_ord_cell_run_resplice_edges(struct cds_ft *dst,
+		struct ft_ord_cell *run_first, struct ft_ord_cell *run_last,
+		struct ft_ord_cell *pred, struct ft_ord_cell *succ,
+		struct ft_ord_cell_edge *edges, unsigned int n)
+{
+	struct ft_ord_cell *src_pred =
+		ft_ord_cell_resolve_ord(&run_first->lnode.prev);
+	struct ft_ord_cell *src_succ =
+		ft_ord_cell_resolve_ord(&run_last->lnode.next);
+
+	/* Sentinel topology as in ft_ord_cell_run_splice_edges. */
+	pred = ft_ord_or_sentinel(dst, pred);
+	succ = ft_ord_or_sentinel(dst, succ);
+	/* The run's OUTER links: src neighbours -> dst neighbours. */
+	edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
+	edges[n].slot = (struct ft_ord_cell **) &run_first->lnode.prev;
+	edges[n].old_target = src_pred;
+	edges[n].new_target = pred;
+	n++;
+	edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
+	edges[n].slot = (struct ft_ord_cell **) &run_last->lnode.next;
+	edges[n].old_target = src_succ;
+	edges[n].new_target = succ;
+	n++;
+	/* The dst neighbours' back-edges, as in the cross-trie form. */
+	edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
+	edges[n].slot = (struct ft_ord_cell **) &pred->lnode.next;
+	edges[n].old_target = succ;
+	edges[n].new_target = run_first;
+	n++;
+	edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
+	edges[n].slot = (struct ft_ord_cell **) &succ->lnode.prev;
+	edges[n].old_target = pred;
+	edges[n].new_target = run_last;
+	n++;
+	return n;
+}
+
+/* Max edges a same-trie run re-splice commits: 2 outer links + 2 back-edges. */
+#define FT_ORD_CELL_RUN_RESPLICE_MAX_EDGES	4
+#endif /* FEATURE_FT_MW_DLM_ACQUIRE */
+
 /*
  * Pre-sets the run's outer links (run not yet reachable in @dst), flips the
  * <=2 boundary edges atomically (for @dst's live readers), and repairs @dst
@@ -3540,6 +3620,30 @@ void ft_flip_txn_record_count_parent(struct cds_ft *ft, struct ft_flip_txn *t,
 		cur = m->parent;
 	}
 }
+
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+/*
+ * Record the in-trie MOVE COUNTER bump (@seq -> @seq + 1) into a move's commit as
+ * an MW value-CAS edge, so any OTHER move that commits first makes this one's CAS
+ * mismatch and abort clean.  @seq must be the value the mover read (with
+ * ft_move_seq_load) BEFORE deriving anything it needs coherence for -- the whole
+ * point is that the edge fails if a peer move landed inside that window.  MW (never
+ * SW) even in a structural_sw txn: the word is not covered by any node lock, so it
+ * needs the validating CAS, and as an MW record it installs BEFORE the SW parks and
+ * backs the commit out with no side effects.  One reserved edge.
+ *
+ * See struct cds_ft::move_seq for why validation-by-pinning is required here and a
+ * read-only check is not sufficient.
+ */
+static
+void ft_flip_txn_record_move_seq(struct cds_ft *ft, struct ft_flip_txn *t,
+		unsigned long seq)
+{
+	ft_flip_txn_record_tag_mw(t, (void **) &ft->move_seq,
+			(void *) (seq << 1), (void *) ((seq + 1) << 1),
+			FT_NR_KEYS_PROXY_TAG);
+}
+#endif
 
 /*
  * Structural distinct-key count of the subtree rooted at @node_flag, used when
