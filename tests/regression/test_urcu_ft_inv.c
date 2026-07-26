@@ -109,6 +109,7 @@
 struct ft_test_node {
 	struct cds_ft_node node;
 	struct rcu_head head;
+	unsigned long freed_once;	/* set when handed to call_rcu (see node_free_rcu) */
 	uint64_t key;		/* shadow copy for validation */
 	uint64_t value;
 	/*
@@ -136,6 +137,12 @@ struct ft_test_node *to_test_node(struct cds_ft_node *n)
 }
 
 static unsigned long nodes_allocated, nodes_freed;
+/*
+ * Count of nodes handed to node_free_rcu() a SECOND time -- see the comment
+ * there.  Reported by leak_check(), because the count is a real observation
+ * about the library under an out-of-contract workload, not harness noise.
+ */
+static unsigned long nodes_double_freed;
 
 static struct ft_test_node *node_alloc(uint64_t key)
 {
@@ -163,6 +170,36 @@ static void node_free_rcu_cb(struct rcu_head *head)
 
 static void node_free_rcu(struct ft_test_node *n)
 {
+	/*
+	 * ARBITRATE the deferred free, because "cds_ft_remove returned OK" does
+	 * NOT make this thread the sole owner of @n.
+	 *
+	 * The library's update contract is caller-serialized ("mutual exclusion
+	 * between updates is the caller's responsibility"), and the SAME-KEY
+	 * oracle inv_concurrent_writers_shared deliberately runs outside it: 16
+	 * writers contend one key range, so two of them can look up the SAME node
+	 * and both be told OK.  Its node lifecycle -- "remove == OK owns the
+	 * RCU-deferred free" -- then calls call_rcu TWICE on one rcu_head.
+	 *
+	 * That is not a survivable mistake: the second enqueue re-initialises a
+	 * LIVE wfcqueue node and corrupts the per-CPU call_rcu queue, so the
+	 * damage lands wherever the process reaches next -- a HANG in this test's
+	 * own post-test rcu_barrier, a glibc "double free or corruption" abort in
+	 * a later test's, or an ord-cell verify mismatch three tests on.  Every
+	 * one of those looks like a bug in an innocent test (each passes in
+	 * isolation), which is exactly how much time it costs.
+	 *
+	 * So let the first free win, and COUNT the losers: that count is the real
+	 * observation ("the library handed OK to two writers for one node, N
+	 * times") where a corrupted RCU queue is only noise.  The loser's call is
+	 * a pure no-op -- the winner's call_rcu already owns the one free, so the
+	 * node is neither leaked nor freed twice and the leak accounting stays
+	 * exactly balanced.
+	 */
+	if (__atomic_exchange_n(&n->freed_once, 1, __ATOMIC_SEQ_CST) != 0) {
+		__atomic_add_fetch(&nodes_double_freed, 1, __ATOMIC_RELAXED);
+		return;
+	}
 	call_rcu(&n->head, node_free_rcu_cb);
 }
 
@@ -219,6 +256,7 @@ static void leak_reset(void)
 {
 	__atomic_store_n(&nodes_allocated, 0, __ATOMIC_RELAXED);
 	__atomic_store_n(&nodes_freed, 0, __ATOMIC_RELAXED);
+	__atomic_store_n(&nodes_double_freed, 0, __ATOMIC_RELAXED);
 }
 
 static int leak_check(void)
@@ -226,6 +264,17 @@ static int leak_check(void)
 	rcu_barrier();
 	unsigned long na = __atomic_load_n(&nodes_allocated, __ATOMIC_RELAXED);
 	unsigned long nf = __atomic_load_n(&nodes_freed, __ATOMIC_RELAXED);
+	unsigned long nd = __atomic_load_n(&nodes_double_freed, __ATOMIC_RELAXED);
+
+	/*
+	 * Not a failure: an out-of-contract same-key oracle can legitimately see
+	 * two writers told OK for one node (node_free_rcu arbitrates).  Report it
+	 * so the observation is not lost -- silently arbitrating would hide the
+	 * only evidence that it happened.
+	 */
+	if (nd)
+		fprintf(stderr, "# NOTE: %lu node(s) freed twice (two writers "
+			"got OK for one node); second free arbitrated away\n", nd);
 	if (na != nf) {
 		fprintf(stderr, "LEAK: allocated %lu, freed %lu (delta %ld)\n",
 			na, nf, (long)(na - nf));
