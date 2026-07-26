@@ -68,7 +68,7 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_MW_DLM_ACQUIRE
-#define NR_TESTS_REKEY_DLM	3	/* inv_rekey_graft_disjoint, _coherent_readers, _shared */
+#define NR_TESTS_REKEY_DLM	4	/* inv_rekey_graft_disjoint, _coherent_readers, _shared, inv_rekey_linearizability */
 #else
 #define NR_TESTS_REKEY_DLM	0
 #endif
@@ -1934,6 +1934,414 @@ static int inv_rekey_graft_shared(void)
 		RKS_NJ, total_ops, total_retries, live);
 
 	free(w);
+	if (drain_and_destroy(ft, group) < 0)
+		ret = -1;
+	if (leak_check() < 0)
+		ret = -1;
+	return ret;
+}
+
+/*
+ * ===========================================================================
+ * RELATIONAL LINEARIZABILITY ORACLE (design step 4).
+ * ===========================================================================
+ *
+ * The other rekey oracles check STRUCTURE (verify, counts, no UAF) and EXACT
+ * lookups ("a present key is never absent").  Neither can say whether a
+ * RELATIONAL answer -- the neighbour of a key -- was ever TRUE: a traversal torn
+ * across a move can return a real, live node that is the neighbour of nothing,
+ * at no instant.  This is the oracle for that.
+ *
+ * WHY IT NEEDS NO TIMESTAMPS, VERSIONS OR WRITER INSTRUMENTATION.  Each writer's
+ * subtree is in exactly ONE of TWO places -- the run sits under its bp junction
+ * XOR its dp junction -- so for a probe inside junction X the set of answers
+ * that are correct at SOME instant is enumerable outright, and it has two
+ * elements.  Membership in that pair IS the linearizability check, at every
+ * instant, whatever the interleaving.  The writers stay completely
+ * uninstrumented: no bracket, no counter, no barrier on the path under test.
+ *
+ * ★ COMPARE NODE IDENTITY, NEVER A KEY READ BACK.  The moved leaves are the SAME
+ * nodes at both junctions -- a move re-keys them, it does not replace them -- so
+ * the legal pair is a pair of stable node ADDRESSES, and membership is
+ * insensitive to where the run currently sits.  A key comparison is NOT: on an
+ * EAGER ordered-list trie there is no stored key, and cds_ft_iter_get_key
+ * rematerializes it by walking the leaf's parent chain AT READBACK TIME, so a
+ * leaf that moved between the answer and the readback reports its NEW key.  An
+ * earlier version of this oracle compared keys and "found" ~2e-4 non-linearizable
+ * answers; every one of them had returned a LEGAL NODE.  The artifact, not the
+ * library, was the finding.
+ *
+ * TWO MODES, GRADED DIFFERENTLY:
+ *
+ *  A. BOUND-KEY probes (ge/gt/le/lt from a key, no cached position).  These MUST
+ *     be linearizable -- that is what the relational two-pass promises -- so an
+ *     answer outside the legal pair FAILS the test.
+ *
+ *  B. CONTINUATION walks (cds_ft_next from a cached position).  These carry the
+ *     KNOWN residual: a walker parked ON a moving run's cell steps out through
+ *     the run's NEW outer link and lands wherever the run went.  That is inherent
+ *     to moving a live run without draining readers, so mode B MEASURES it
+ *     (per-class counts, printed every run) rather than failing on it.
+ *
+ * WHAT MODE A DOES NOT PROVE.  Membership in the legal pair is timing-independent
+ * and therefore NECESSARY but not SUFFICIENT: it rules out an answer that was
+ * true at NO instant (the phantom class), but it accepts the answer belonging to
+ * the OTHER state even when that state did not occur during the operation.
+ * Closing that gap needs to know which state held across the interval, i.e. the
+ * writer-side timing bookkeeping this oracle deliberately does without -- and
+ * that instrumentation would put barriers on the very path under test.  The
+ * phantom class is the one the two-pass exists to prevent, so it is the one
+ * gated here.
+ *
+ * Opt-in FT_INV_MW=1, like the other rekey oracles.
+ */
+#define RKL_NR		8	/* linearizability readers */
+#define RKL_WALK_MAX	8	/* steps before abandoning a walk */
+#define RKL_MAX_REPORT	3	/* violations narrated per reader; the rest counted */
+
+struct rkl_reader_arg {
+	struct cds_ft *ft;
+	struct rk_writer_arg *w;
+	int nw;
+	unsigned long probes;		/* mode A: bound-key relational reads */
+	unsigned long probe_bad;	/* mode A: answers outside the legal pair */
+	unsigned long walks, walk_steps;
+	unsigned long walk_alien;	/* stepped onto ANOTHER junction's node */
+	unsigned long walk_back;	/* stepped backwards within this junction */
+	unsigned long walk_inner;	/* skipped a node inside this junction */
+	unsigned long walk_end;		/* walk ended before reaching (X,5) */
+	int failed;
+};
+
+/*
+ * Position of @n in junction @X's key order, by IDENTITY:
+ *   0 = the (X,1) sibling, 1..4 = the run's leaves, 5 = the (X,5) sibling.
+ * -1 when @n is none of them.  w->sib[] is {(bp,1),(bp,5),(dp,1),(dp,5)}.
+ */
+static int rkl_node_index(const struct rk_writer_arg *w, uint8_t X,
+		const struct cds_ft_node *n)
+{
+	int lo = (X == w->bp) ? 0 : 2;
+	int c;
+
+	if (!n)
+		return -1;
+	if (n == &w->sib[lo]->node)
+		return 0;
+	if (n == &w->sib[lo + 1]->node)
+		return 5;
+	for (c = 0; c < 4; c++) {
+		if (n == &w->top[c]->node)
+			return 1 + c;
+	}
+	return -1;
+}
+
+/* One relational read from a bound key; the answer is the iterator's NODE. */
+static enum cds_ft_status rkl_probe(struct cds_ft *ft, struct cds_ft_iter *iter,
+		int mode, uint64_t key, struct cds_ft_node **out)
+{
+	uint8_t k[8];
+	enum cds_ft_status st;
+
+	cds_ft_u64_to_key(ft, key, k, CDS_FT_LEN_DEFAULT);
+	cds_ft_iter_set_key(iter, k, CDS_FT_LEN_DEFAULT);
+	switch (mode) {
+	case 0:	st = cds_ft_lookup_ge(ft, iter); break;
+	case 1:	st = cds_ft_lookup_gt(ft, iter); break;
+	case 2:	st = cds_ft_lookup_le(ft, iter); break;
+	default: st = cds_ft_lookup_lt(ft, iter); break;
+	}
+	*out = (st == CDS_FT_STATUS_OK) ? cds_ft_iter_node(iter) : NULL;
+	return st;
+}
+
+static void *rkl_reader(void *arg)
+{
+	struct rkl_reader_arg *r = (struct rkl_reader_arg *) arg;
+	struct cds_ft_iter *iter;
+	unsigned int seed = (unsigned int) (uintptr_t) r;
+	unsigned long iters = 0;
+
+	rcu_register_thread();
+	if (cds_ft_iter_create(r->ft, &iter) < 0)
+		abort();
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	while (!test_stop) {
+		struct rk_writer_arg *w = &r->w[rand_r(&seed) % r->nw];
+		uint8_t X = (rand_r(&seed) & 1) ? w->dp : w->bp;
+		uint64_t Xk = (uint64_t) X << 24;
+		uint64_t sb = (uint64_t) w->sb << 16;
+		int lo_sib = (X == w->bp) ? 0 : 2;
+		struct cds_ft_node *sib_lo = &w->sib[lo_sib]->node;
+		struct cds_ft_node *sib_hi = &w->sib[lo_sib + 1]->node;
+		enum cds_ft_status st;
+		struct cds_ft_node *got = NULL;
+
+		if ((rand_r(&seed) & 3) != 0) {
+			/*
+			 * MODE A.  Both members of each legal pair exist at all
+			 * times (the run's leaves are the same nodes wherever the
+			 * run sits), so a miss is a failure too.
+			 */
+			int pick = rand_r(&seed) & 3;
+			struct cds_ft_node *a, *b;
+			uint64_t probe;
+
+			switch (pick) {
+			case 0:	probe = Xk | (2ULL << 16);
+				a = &w->top[0]->node; b = sib_hi; break;
+			case 1:	probe = Xk | sb;
+				a = &w->top[0]->node; b = sib_hi; break;
+			case 2:	probe = Xk | (4ULL << 16);
+				a = &w->top[3]->node; b = sib_lo; break;
+			default: probe = Xk | sb | 0xff00ULL;
+				a = &w->top[3]->node; b = sib_lo; break;
+			}
+			rcu_read_lock();
+			st = rkl_probe(r->ft, iter, pick, probe, &got);
+			rcu_read_unlock();
+			r->probes++;
+			if (caa_unlikely(st != CDS_FT_STATUS_OK ||
+					(got != a && got != b))) {
+				r->probe_bad++;
+				r->failed = 1;
+				if (r->probe_bad <= RKL_MAX_REPORT)
+					fprintf(stderr,
+						"rkl: %s(%#llx) -> node %p (%s); legal only %p or %p\n",
+						pick == 0 ? "ge" : pick == 1 ? "gt" :
+							pick == 2 ? "le" : "lt",
+						(unsigned long long) probe,
+						(void *) got,
+						cds_ft_status_to_string(st),
+						(void *) a, (void *) b);
+				mw_violation_snapshot();
+			}
+		} else {
+			/*
+			 * MODE B: walk (X,1) -> (X,5) with cds_ft_next, checking
+			 * each step against the pair the current POSITION allows,
+			 * by node identity.
+			 */
+			int idx, steps = 0;
+
+			rcu_read_lock();
+			st = rkl_probe(r->ft, iter, 0, Xk | (1ULL << 16), &got);
+			if (st != CDS_FT_STATUS_OK || got != sib_lo) {
+				/* (X,1) never moves: GE must land on it. */
+				rcu_read_unlock();
+				r->probe_bad++;
+				r->failed = 1;
+				if (r->probe_bad <= RKL_MAX_REPORT)
+					fprintf(stderr,
+						"rkl: ge on the fixed sib of junction %u -> node %p (%s)\n",
+						X, (void *) got,
+						cds_ft_status_to_string(st));
+				mw_violation_snapshot();
+				continue;
+			}
+			r->walks++;
+			idx = 0;
+			while (idx != 5 && steps++ < RKL_WALK_MAX) {
+				int nidx, want;
+
+				/* legal: the next node in this junction's order,
+				 * or the (X,5) sibling if the run left. */
+				want = (idx == 4) ? 5 : idx + 1;
+				st = cds_ft_next(r->ft, iter);
+				r->walk_steps++;
+				if (st != CDS_FT_STATUS_OK) {
+					r->walk_end++;
+					break;
+				}
+				got = cds_ft_iter_node(iter);
+				nidx = rkl_node_index(w, X, got);
+				if (nidx == want || nidx == 5) {
+					idx = nidx;
+					continue;
+				}
+				/* Off the rails: classify (mode B measures). */
+				if (nidx < 0) {
+					uint8_t other = (X == w->bp) ? w->dp : w->bp;
+
+					if (rkl_node_index(w, other, got) >= 0)
+						r->walk_alien++;
+					else
+						r->walk_inner++;
+				} else if (nidx <= idx)
+					r->walk_back++;
+				else
+					r->walk_inner++;
+				break;
+			}
+			rcu_read_unlock();
+		}
+		if ((++iters & 0xff) == 0)
+			rcu_quiescent_state();
+	}
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static int inv_rekey_linearizability(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	struct rk_writer_arg *w;
+	struct rkl_reader_arg *r;
+	pthread_t writers[RK_NW], readers[RKL_NR];
+	struct ft_test_node *guard_lo, *guard_hi;
+	struct timespec t0;
+	unsigned long total_ops = 0, total_retries = 0, live = 0;
+	unsigned long probes = 0, probe_bad = 0, walks = 0, walk_steps = 0;
+	unsigned long alien = 0, back = 0, inner = 0, wend = 0;
+	int i, c, ret = 0;
+
+	if (!getenv("FT_INV_MW")) {
+		fprintf(stderr, "# inv_rekey_linearizability: skipped "
+			"(set FT_INV_MW=1 to run the relational linearizability oracle)\n");
+		return 0;
+	}
+	mw_install_fatal_handler();
+	leak_reset();
+
+	ft = create_fixed_rekey_coherent_ft(4, &group);	/* EAGER + ordered list */
+	cds_ft_make_concurrent(ft);
+
+	guard_lo = node_alloc(0x00000000ULL);
+	guard_hi = node_alloc(0xff000000ULL);
+	rcu_read_lock();
+	if (insert_u64(ft, 0x00000000ULL, guard_lo) != CDS_FT_STATUS_OK ||
+			insert_u64(ft, 0xff000000ULL, guard_hi) != CDS_FT_STATUS_OK)
+		abort();
+	rcu_read_unlock();
+	live = 2;
+
+	w = (struct rk_writer_arg *) calloc(RK_NW, sizeof(*w));
+	r = (struct rkl_reader_arg *) calloc(RKL_NR, sizeof(*r));
+	if (!w || !r)
+		abort();
+	for (i = 0; i < RK_NW; i++) {
+		/*
+		 * DELIBERATELY NON-ADJACENT junctions (i+1 and i+1+RK_NW): with
+		 * the usual (2i+1, 2i+2) pairing, "the numerically adjacent
+		 * junction" and "the other junction of the same writer" are the
+		 * same byte, and a wrong answer cannot tell a slot/rank mistake
+		 * apart from a same-commit mix-up.
+		 */
+		uint8_t bp = (uint8_t) (i + 1), dp = (uint8_t) (i + 1 + RK_NW);
+		uint64_t bpk = (uint64_t) bp << 24, dpk = (uint64_t) dp << 24;
+		uint64_t sk[4] = {
+			bpk | (1ULL << 16), bpk | (5ULL << 16),
+			dpk | (1ULL << 16), dpk | (5ULL << 16),
+		};
+
+		w[i].ft = ft;
+		w[i].bp = bp;
+		w[i].dp = dp;
+		w[i].sb = 3;
+		rcu_read_lock();
+		for (c = 0; c < 4; c++) {
+			w[i].sib[c] = node_alloc(sk[c]);
+			if (insert_u64(ft, sk[c], w[i].sib[c]) != CDS_FT_STATUS_OK)
+				abort();
+		}
+		for (c = 0; c < 4; c++) {
+			uint64_t tk = bpk | (3ULL << 16) | ((uint64_t) (c + 1) << 8);
+
+			w[i].top[c] = node_alloc(tk);
+			if (insert_u64(ft, tk, w[i].top[c]) != CDS_FT_STATUS_OK)
+				abort();
+		}
+		rcu_read_unlock();
+		live += 8;
+	}
+	for (i = 0; i < RKL_NR; i++) {
+		r[i].ft = ft;
+		r[i].w = w;
+		r[i].nw = RK_NW;
+	}
+
+	test_go = 0;
+	test_stop = 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < RK_NW; i++)
+		pthread_create(&writers[i], NULL, rk_writer, &w[i]);
+	for (i = 0; i < RKL_NR; i++)
+		pthread_create(&readers[i], NULL, rkl_reader, &r[i]);
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	test_go = 1;
+
+	rcu_thread_offline();
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
+		usleep(1000);
+	test_stop = 1;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < RK_NW; i++)
+		pthread_join(writers[i], NULL);
+	for (i = 0; i < RKL_NR; i++)
+		pthread_join(readers[i], NULL);
+	rcu_thread_online();
+
+	for (i = 0; i < RK_NW; i++) {
+		total_ops += w[i].ops;
+		total_retries += w[i].retries;
+		if (w[i].failed)
+			ret = -1;
+	}
+	for (i = 0; i < RKL_NR; i++) {
+		probes += r[i].probes;
+		probe_bad += r[i].probe_bad;
+		walks += r[i].walks;
+		walk_steps += r[i].walk_steps;
+		alien += r[i].walk_alien;
+		back += r[i].walk_back;
+		inner += r[i].walk_inner;
+		wend += r[i].walk_end;
+		if (r[i].failed)
+			ret = -1;
+	}
+
+	synchronize_rcu();
+	rcu_read_lock();
+	if (cds_ft_count_keys(ft) != live) {
+		fprintf(stderr, "rekey linearizability: count_keys %lu != live %lu\n",
+			cds_ft_count_keys(ft), live);
+		ret = -1;
+	}
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "rekey linearizability: cds_ft_verify failed\n");
+		ret = -1;
+	}
+	rcu_read_unlock();
+
+	if (total_ops == 0) {
+		fprintf(stderr, "rekey linearizability: no successful moves (livelock?)\n");
+		ret = -1;
+	}
+	if (probes == 0 || walk_steps == 0) {
+		fprintf(stderr, "rekey linearizability: readers made no progress\n");
+		ret = -1;
+	}
+	/*
+	 * Mode A is the gate; mode B is a MEASUREMENT of the known parked-walker
+	 * residual, printed so it is a number in the record rather than an
+	 * assumption either way (zero would mean it was not exercised, not that
+	 * it is gone).
+	 */
+	fprintf(stderr, "# inv_rekey_linearizability: %d writers %d readers, "
+		"%lu moves, %lu retries, %lu bound-key probes (%lu illegal), "
+		"%lu walks / %lu steps: %lu alien %lu back %lu inner %lu early-end\n",
+		RK_NW, RKL_NR, total_ops, total_retries, probes, probe_bad,
+		walks, walk_steps, alien, back, inner, wend);
+
+	free(w);
+	free(r);
 	if (drain_and_destroy(ft, group) < 0)
 		ret = -1;
 	if (leak_check() < 0)
@@ -12937,6 +13345,7 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_rekey_graft_disjoint);
 	RUN_TEST(inv_rekey_graft_coherent_readers);
 	RUN_TEST(inv_rekey_graft_shared);
+	RUN_TEST(inv_rekey_linearizability);
 #endif
 	RUN_TEST(inv_concurrent_writers_shared);
 	RUN_TEST(inv_concurrent_writers_coarse_lock);
