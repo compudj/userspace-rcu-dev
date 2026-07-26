@@ -50,7 +50,7 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_MW_DLM_ACQUIRE
-#define NR_TESTS_DLM 4		/* cow_stop_root_inplace, rekey_graft_{simple,liston,cross_junction} */
+#define NR_TESTS_DLM 5		/* cow_stop_root_inplace, rekey_graft_{simple,liston,cross_junction,glue_dst} */
 #else
 #define NR_TESTS_DLM 0
 #endif
@@ -1376,6 +1376,210 @@ static int test_rekey_graft_cross_junction(void)
 	}
 
 	return drain_and_destroy(ft, group);
+}
+
+/*
+ * Shared checker for the rekey tests below: @expect must be exactly the trie's
+ * key set, cds_ft_verify (structure + ordered cells) must pass, and an ordered
+ * forward scan must yield exactly @n keys in strictly ascending order.
+ */
+static int rk_verify_keys(struct cds_ft *ft, const uint64_t *expect, int n,
+		const char *what)
+{
+	const struct cds_ft_cell *buf[4];
+	const struct cds_ft_cell *cur;
+	unsigned long seen = 0;
+	uint64_t prev = 0;
+	size_t cnt, b;
+	int i, ret = -1;
+
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "rekey %s: verify failed\n", what);
+		return -1;
+	}
+	rcu_read_lock();
+	if (cds_ft_count_entries(ft) != (unsigned long) n) {
+		fprintf(stderr, "rekey %s: count %lu != %d\n",
+			cds_ft_count_entries(ft), n);
+		goto end;
+	}
+	for (i = 0; i < n; i++) {
+		struct cds_ft_node *f = NULL;
+
+		if (lookup_u64(ft, expect[i], &f) != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "rekey %s: key %#lx absent\n", what,
+				(unsigned long) expect[i]);
+			goto end;
+		}
+	}
+	cur = NULL;
+	do {
+		if (cds_ft_cell_next_batch(ft, cur, buf, 4, &cnt, &cur) !=
+				CDS_FT_STATUS_OK) {
+			fprintf(stderr, "rekey %s: scan failed\n", what);
+			goto end;
+		}
+		for (b = 0; b < cnt; b++) {
+			uint8_t k[5];
+			size_t kl;
+			uint64_t kv;
+
+			if (cds_ft_cell_get_key(ft, buf[b], k, sizeof k, &kl) !=
+					CDS_FT_STATUS_OK) {
+				fprintf(stderr, "rekey %s: get_key failed\n", what);
+				goto end;
+			}
+			kv = cds_ft_key_to_u64(ft, k, 5);
+			if (seen && kv <= prev) {
+				fprintf(stderr, "rekey %s: order violation %#lx "
+					"after %#lx\n", what, (unsigned long) kv,
+					(unsigned long) prev);
+				goto end;
+			}
+			prev = kv;
+			seen++;
+		}
+	} while (cur);
+	if (seen != (unsigned long) n) {
+		fprintf(stderr, "rekey %s: scan saw %lu of %d\n", what, seen, n);
+		goto end;
+	}
+	ret = 0;
+end:
+	rcu_read_unlock();
+	return ret;
+}
+
+/*
+ * Coherent-rekey: the dst point DIVERGES INSIDE A COMPRESSED NODE, so the graft
+ * cannot append in place -- ft_graft_build assembles the whole split cluster
+ * invisibly (FT_GRAFT_PREP_GLUE) and the fold records ITS publish, not a NOSPLIT
+ * store, into the one commit.  That changes which two nodes the graft holds: the
+ * split compressed node @cn (fenced by the build, retired by the commit) and the
+ * live publish parent whose slot the forward edge replaces (fenced by the driver
+ * -- a guard fallback would leave the SW park unheld).
+ *
+ * Both sub-cases run, because they differ in what the folded detach does with the
+ * graft's lock:
+ *   (a) CROSS-PARENT: the compressed node hangs under the ROOT node, so the
+ *       publish parent is not BP's parent -- the detach acquires its own.
+ *   (b) SHARED: the compressed node hangs under {A}, which IS BP's parent -- the
+ *       detach REUSES the fence the driver took.
+ * Each runs on a fresh trie: the split rewrites the dst neighbourhood, so a
+ * second move from the result would be a different shape (and a 2-child junction
+ * the min_child gate refuses).
+ *
+ * 5-byte keys.  A lone deep key under a prefix is what path-compresses it, which
+ * is exactly the shape needed: the dst key shares the compressed node's first
+ * byte and diverges at the next one.
+ */
+#define RKG_A		0x10
+#define RKG_B		0x20
+static int test_rekey_graft_glue_dst(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	uint8_t src_key[3] = { RKG_A, 0x01, 0x03 };
+	uint8_t dst_far[3] = { RKG_B, 0x01, 0x03 };	/* diverges in cn under root */
+	uint8_t dst_near[3] = { RKG_A, 0x07, 0x03 };	/* diverges in cn under {A} */
+	/* The fixed part of the layout: src junction, its sibs, the level-1 filler. */
+	uint64_t base[4] = {
+		RKX_KEY(RKG_A, 0x01, 0x01, 0, 0),
+		RKX_KEY(RKG_A, 0x01, 0x05, 0, 0),
+		RKX_KEY(RKG_A, 0x09, 0, 0, 0),
+		0,					/* the compressed lone key */
+	};
+	uint64_t keys[8], expect[8];
+	void *before, *after;
+	int pass, i, rc;
+
+	for (pass = 0; pass < 2; pass++) {
+		bool far = pass == 0;
+		const uint8_t *dst = far ? dst_far : dst_near;
+		uint64_t lone = far ? RKX_KEY(RKG_B, 0x01, 0x07, 0x07, 0x07) :
+			RKX_KEY(RKG_A, 0x07, 0x07, 0x07, 0x07);
+		const char *what = far ? "glue-dst cross-parent" : "glue-dst shared";
+
+		ft = create_fixed_fine_lock_ft(5, &group);	/* list ON */
+		base[3] = lone;
+		for (i = 0; i < 4; i++)
+			keys[i] = base[i];
+		for (i = 0; i < 4; i++)			/* S_top's four leaves */
+			keys[4 + i] = RKX_KEY(RKG_A, 0x01, 0x03, i + 1, 0);
+
+		rcu_read_lock();
+		for (i = 0; i < 8; i++) {
+			if (insert_u64(ft, keys[i], node_alloc(keys[i])) !=
+					CDS_FT_STATUS_OK) {
+				rcu_read_unlock();
+				fprintf(stderr, "rekey %s: insert %d failed\n", what, i);
+				drain_and_destroy(ft, group);
+				return -1;
+			}
+		}
+		before = _cds_ft_debug_child_at(ft, src_key, 3);
+		rcu_read_unlock();
+		if (!before) {
+			fprintf(stderr, "rekey %s: S_top not at src\n", what);
+			drain_and_destroy(ft, group);
+			return -1;
+		}
+		for (i = 0; i < 8; i++)
+			expect[i] = keys[i];
+		if (rk_verify_keys(ft, expect, 8, what)) {
+			drain_and_destroy(ft, group);
+			return -1;
+		}
+
+		rc = _cds_ft_debug_rekey_graft_simple(ft, src_key, 3, dst, 3);
+		if (rc != 0) {
+			fprintf(stderr, "rekey %s: driver rc=%d\n", what, rc);
+			drain_and_destroy(ft, group);
+			return -1;
+		}
+		/*
+		 * The src position must be GONE.  Its dst counterpart is not probed
+		 * by address here: the split leaves a COMPRESSED prefix above the new
+		 * branch, which _cds_ft_debug_child_at (plain-internal descent only)
+		 * declines to traverse -- the S_top-moved-to-a-fresh-address witness
+		 * is the NOSPLIT tests' job, and cow_stop allocates unconditionally.
+		 */
+		rcu_read_lock();
+		after = _cds_ft_debug_child_at(ft, src_key, 3);
+		rcu_read_unlock();
+		if (after) {
+			fprintf(stderr, "rekey %s: S_top still at src (%p)\n", what,
+				after);
+			drain_and_destroy(ft, group);
+			return -1;
+		}
+		/* The four moved keys now hang under the split's new direction. */
+		for (i = 0; i < 4; i++)
+			expect[4 + i] = far ?
+				RKX_KEY(RKG_B, 0x01, 0x03, i + 1, 0) :
+				RKX_KEY(RKG_A, 0x07, 0x03, i + 1, 0);
+		if (rk_verify_keys(ft, expect, 8, what)) {
+			drain_and_destroy(ft, group);
+			return -1;
+		}
+		/* The split's OLD direction -- the lone compressed key -- survives. */
+		rcu_read_lock();
+		for (i = 0; i < 4; i++) {
+			struct cds_ft_node *f = NULL;
+
+			if (lookup_u64(ft, keys[4 + i], &f) == CDS_FT_STATUS_OK) {
+				rcu_read_unlock();
+				fprintf(stderr, "rekey %s: moved key %d still at "
+					"src\n", what, i);
+				drain_and_destroy(ft, group);
+				return -1;
+			}
+		}
+		rcu_read_unlock();
+		if (drain_and_destroy(ft, group) < 0)
+			return -1;
+	}
+	return 0;
 }
 #endif /* FEATURE_FT_MW_DLM_ACQUIRE */
 
@@ -28235,6 +28439,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_rekey_graft_simple);
 	RUN_TEST(test_rekey_graft_liston);
 	RUN_TEST(test_rekey_graft_cross_junction);
+	RUN_TEST(test_rekey_graft_glue_dst);
 #endif
 #ifdef FEATURE_FT_FAULT_INJECT
 	RUN_TEST(test_rekey_coherence_fault_redescend);

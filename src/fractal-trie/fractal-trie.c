@@ -478,12 +478,24 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 	struct ft_detach_recompact_out detach_rc = { 0 };
 	struct ft_flip_txn *txn;
 	struct ft_glue glue;
-	struct ft_graft_store_state gst_st;
+	struct ft_graft_store_state gst_st = { 0 };	/* GLUE never runs prepare */
 	struct ft_descent d_src, d_dst;
 	struct cds_ft_alloc_reserve reserve;
 	struct ft_remove_pub pub = { .armed = false };
-	struct cds_ft_metadata *marks[FT_ENTRY_PER_NODE + 1];
-	uintptr_t snaps[FT_ENTRY_PER_NODE + 1];
+	/*
+	 * The two nodes the graft's own step locks, whichever dst shape it took:
+	 * NOSPLIT {dst parent, its parent}, GLUE {split compressed node, publish
+	 * parent}.  @graft_c is the one it retires, @graft_p the one it releases.
+	 */
+	struct cds_ft_inode_flag *graft_c = NULL, *graft_p = NULL, *cn_flag = NULL;
+	struct cds_ft_metadata *pp_meta = NULL;	/* GLUE publish-parent fence WE own */
+	uintptr_t pp_snap = 0;
+	/*
+	 * +2, not +1: cow_stop can fill S_top plus all FT_ENTRY_PER_NODE of its
+	 * children, and the GLUE shape adds the split cluster's one displaced child.
+	 */
+	struct cds_ft_metadata *marks[FT_ENTRY_PER_NODE + 2];
+	uintptr_t snaps[FT_ENTRY_PER_NODE + 2];
 	const uint8_t *ik;
 	unsigned int nr_marks = 0, adepth = 0, i, ti;
 	bool src_parent_held;
@@ -718,10 +730,18 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 	 * (graft + cow_stop) edges before the flip.
 	 */
 
-	/* 2. Graft-fold: record-only NOSPLIT attach of S_top' at @dst_key. */
+	/* 2. Graft-fold: record-only attach of S_top' at @dst_key. */
 	ft_glue_init(&glue);
 	glue.txn = txn;
 	glue.record_only = true;
+	/*
+	 * GLUE (compressed-divergence) shape: have the build FENCE the compressed
+	 * node it splits before it reads its plan, so the whole build runs under
+	 * that fence and its retire rides our commit (ft_split_compressed_graft_build).
+	 * The fence is @glue's until the commit registers it; ft_glue_abort is the
+	 * single release point, and every bail below routes through it.
+	 */
+	glue.fence_split_cn = true;
 	memset(&reserve, 0, sizeof(reserve));
 	if (ft_bulk_node_reserve_fill(ft, &reserve)) {
 		ft_flip_txn_destroy(txn);
@@ -730,90 +750,200 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 	}
 	prep = ft_graft_build(ft, dst_ord, dst_len, s_top_prime, cnt, &d_dst, &glue);
 	/*
-	 * SHAPE GATE.  This cut supports:
-	 *  - an absent, append-in-place NOSPLIT dst point (no compressed-divergence
-	 *    GLUE split), and
-	 *  - a src junction BP (= d_src.pnf) that does not ALIAS the graft's own
-	 *    lock set.  That set is exactly TWO nodes: the dst parent d_dst.pnf,
-	 *    which the reserve recompaction retires and RELOCATES, and its parent
-	 *    d_dst.ppnf, which it holds and releases at the flip.  (Its optional
-	 *    third member, the SKIP_X great-grandparent, is excluded by requiring a
-	 *    PLAIN d_dst.ppnf -- which the old gate got for free from the src
-	 *    descent's own plainness checks, ppnf being shared.)  The detach's BP
-	 *    recompaction needs {BP, BP's parent}, so:
-	 *     - BP's parent IS the graft-held d_dst.ppnf: REUSE the held lock
-	 *       (@src_parent_held).  This is the shape the hook started with.
-	 *     - BP's parent is any other node: the detach ACQUIRES it itself,
-	 *       guarded (@parent_guard).  Deadlock-free -- both acquires are
-	 *       try-locks that abort rather than block.
-	 *     - BP, or BP's parent, IS one of the graft's two nodes: rejected here,
-	 *       PERMANENTLY.  Re-locking a held node aborts -EAGAIN every time, so
-	 *       a caller retrying that transient code would spin forever; and the
-	 *       same-junction shape (BP == the dst parent) is worse than unlockable
-	 *       -- the graft RELOCATES that node, so the detach would edit the copy
-	 *       the flip retires.  (Cross-depth aliases are unreachable while the
-	 *       scope keeps src_len == dst_len, which puts both junctions on the
-	 *       same level; they are rejected rather than asserted so that a later
-	 *       relaxation of the length rule cannot silently reach them.)
-	 *  - both junctions BELOW the root (d_src.ppnf / d_dst.ppnf non-NULL): a
-	 *    root-level junction republishes into &ft->root, a slot with no node
-	 *    word to lock, so its SW park would be an unguarded plain store.
+	 * Non-buildable outcomes, mapped to the driver's contract.  A build that
+	 * reports OOM or a lost split-fence race has published NOTHING (and, on the
+	 * RETRY arm, has not even marked the compressed node), so each is the clean
+	 * transient the caller re-descends on; an occupied graft point is the
+	 * permanent shape error the up-front dst probe already rejects for the
+	 * shapes it can prove, and this is the same answer for the rest.
 	 */
-	src_parent_held = d_src.ppnf == d_dst.ppnf;
-	if (prep != FT_GRAFT_PREP_NOSPLIT || d_dst.depth != dst_len || d_dst.nf ||
-			!d_src.ppnf || !d_dst.ppnf ||
-			ft_node_compressed(d_dst.ppnf) ||
-			ft_node_skip_compressed(d_dst.ppnf) ||
-			d_src.pnf == d_dst.pnf || d_src.pnf == d_dst.ppnf ||
-			d_src.ppnf == d_dst.pnf) {
-		cds_ft_alloc_reserve_drain(ft, &reserve);
-		ft_glue_abort(ft, &glue);
-		free_cds_ft_node_unpublished(ft, ft_node_ptr(s_top_prime));
-		ft_flip_txn_destroy(txn);
+	if (prep == FT_GRAFT_PREP_OOM) {
+		ret = -ENOMEM;
+		goto bail_build;
+	}
+	if (prep == FT_GRAFT_PREP_RETRY) {
+		ret = -EAGAIN;
+		goto bail_build;
+	}
+	if (prep == FT_GRAFT_PREP_POPULATED) {
 		ret = -EINVAL;
-		goto sweep;
+		goto bail_build;
+	}
+	/*
+	 * A reanchoring descent step landed a live node SHALLOWER than the
+	 * dispatched child, so the captured publish chain names the wrong level --
+	 * the same bail the graft and insert take.  Nothing is reader-visible yet.
+	 */
+	if (caa_unlikely(d_dst.skip_conflict)) {
+		ret = -EAGAIN;
+		goto bail_build;
+	}
+	/*
+	 * SHAPE GATE.  Two dst shapes are supported, and what distinguishes them is
+	 * only WHICH TWO NODES the graft locks:
+	 *
+	 *  - NOSPLIT: an absent, append-in-place dst point.  The reserve
+	 *    recompaction retires and RELOCATES the dst parent d_dst.pnf, holding
+	 *    its parent d_dst.ppnf and releasing it at the flip.  (Its optional
+	 *    third member, the SKIP_X great-grandparent, is excluded by requiring a
+	 *    PLAIN d_dst.ppnf -- which the pre-lift gate got for free from the src
+	 *    descent's own plainness checks, ppnf being shared.)
+	 *  - GLUE: the dst key diverges INSIDE a compressed node, so the build
+	 *    assembled the whole split cluster invisibly.  It holds the split node
+	 *    @cn (fenced by the build, retired by our commit) and -- fenced just
+	 *    below -- @glue.publish_parent, the live node whose slot the forward
+	 *    publish replaces.  A COMPRESSED publish_parent is refused: the publish
+	 *    would then also rewrite the SKIP_X dual, a slot in a THIRD node this
+	 *    op does not hold.
+	 *
+	 * Against that pair, the src junction BP (= d_src.pnf) and its parent:
+	 *   - BP's parent IS the graft-held node: REUSE the held lock
+	 *     (@src_parent_held).  This is the shape the hook started with.
+	 *   - BP's parent is any other node: the detach ACQUIRES it itself, guarded
+	 *     (@parent_guard).  Deadlock-free -- both acquires are try-locks that
+	 *     abort rather than block.
+	 *   - BP, or BP's parent, IS one of the graft's two nodes: rejected here,
+	 *     PERMANENTLY.  Re-locking a held node aborts -EAGAIN every time, so a
+	 *     caller retrying that transient code would spin forever; and the
+	 *     same-junction shape (BP == the node the graft relocates or retires) is
+	 *     worse than unlockable -- the detach would edit the copy the flip
+	 *     retires.  (Cross-depth aliases are unreachable while the scope keeps
+	 *     src_len == dst_len, which puts both junctions on the same level; they
+	 *     are rejected rather than asserted so that a later relaxation of the
+	 *     length rule cannot silently reach them.)
+	 *
+	 * Plus, for both: the junctions must be BELOW the root (d_src.ppnf and the
+	 * graft's own publish target non-NULL) -- a root-level junction republishes
+	 * into &ft->root, a slot with no node word to lock, so its SW park would be
+	 * an unguarded plain store.
+	 */
+	if (prep == FT_GRAFT_PREP_GLUE) {
+		cn_flag = d_dst.nf;		/* the compressed node the build split */
+		graft_c = cn_flag;
+		graft_p = glue.publish_parent;
+	} else {
+		graft_c = d_dst.pnf;
+		graft_p = d_dst.ppnf;
+		if (d_dst.depth != dst_len || d_dst.nf) {
+			ret = -EINVAL;		/* occupied / short NOSPLIT point */
+			goto bail_build;
+		}
+	}
+	src_parent_held = d_src.ppnf == graft_p;
+	if (!d_src.ppnf || !graft_p || !graft_c ||
+			ft_node_compressed(graft_p) ||
+			ft_node_skip_compressed(graft_p) ||
+			d_src.pnf == graft_c || d_src.pnf == graft_p ||
+			d_src.ppnf == graft_c) {
+		ret = -EINVAL;
+		goto bail_build;
 	}
 	/*
 	 * Reserve the graft slot edge + the detach struct/state edges, plus (list on)
-	 * the six ordered-cell run boundary edges (src unsplice + dst splice).
+	 * the six ordered-cell run boundary edges (src unsplice + dst splice), plus
+	 * -- for the GLUE shape -- the split cluster's own bound: its deferred
+	 * back-edges, forward publish, split retire and free-list tombstones, the
+	 * same floor ft_graft_keylen reserves its standalone txn to.  The count walk
+	 * is depth-bounded and only exists when the trie keeps rank stats.
 	 */
 	if (!ft_flip_txn_reserve_extra(txn, FT_REMOVE_COMMIT_REC_MAX_EDGES + 4 +
 			(ft->ordered_list ? FT_ORD_CELL_RUN_DETACH_MAX_EDGES +
-				FT_ORD_CELL_RUN_RESPLICE_MAX_EDGES : 0))) {
-		cds_ft_alloc_reserve_drain(ft, &reserve);
-		ft_glue_abort(ft, &glue);
-		free_cds_ft_node_unpublished(ft, ft_node_ptr(s_top_prime));
-		ft_flip_txn_destroy(txn);
+				FT_ORD_CELL_RUN_RESPLICE_MAX_EDGES : 0) +
+			(prep == FT_GRAFT_PREP_GLUE ?
+				FT_GLUE_FLOOR_DEFERRED + 7 + 1 + FT_GLUE_FLOOR_FREE +
+				(ft->rank_stats ? (unsigned int) dst_len + 1 : 0) : 0))) {
 		ret = -ENOMEM;
-		goto sweep;
+		goto bail_build;
 	}
-	/*
-	 * Drive prepare + commit SEPARATELY (not the combined ft_store_at_graft_point
-	 * wrapper) so the reserve recompaction's relocated old dst-parent copy
-	 * (@gst_st.old_recompacted_node) is visible here: the graft ALWAYS relocates
-	 * the attach node for its atomic publish, and under record_only its old copy
-	 * stays LIVE until the caller's commit, so the caller frees it post-commit.
-	 */
-	cds_ft_alloc_reserve_activate(ft, &reserve);
-	gst = ft_store_at_graft_point_prepare(ft, dst_ord, dst_len, &d_dst,
-			s_top_prime, cnt, &glue, &gst_st);
-	if (gst == CDS_FT_STATUS_OK)
-		gcst = ft_store_at_graft_point_commit(ft, &attached_nf, &adepth,
-				NULL /*run*/, &gst_st, (long) cnt);
-	cds_ft_alloc_reserve_deactivate(ft);
-	cds_ft_alloc_reserve_drain(ft, &reserve);
-	if (gst != CDS_FT_STATUS_OK || gcst != URCU_TXN_STATUS_OK) {
+	if (prep == FT_GRAFT_PREP_GLUE) {
 		/*
-		 * Not expected single-threaded with the reserve pre-filled.  Record-only
-		 * commit leaves the shared txn intact (terminal commit gated off), so the
-		 * caller owns cleanup: free S_top', abort the glue build, destroy the txn.
-		 * (prepare failure freed its own invisible build + left glue clean.)
+		 * FENCE the publish parent OURSELVES, and fail the move on a miss.
+		 * ft_glue_txn_commit_edges would otherwise route an unheld parent
+		 * through ft_flip_txn_lock_or_guard_parent, which DEGRADES an acquire
+		 * miss to a §4.B guard -- correct for the cross-trie graft, wrong here:
+		 * this txn is structural_sw, so the forward publish PARKS a plain store
+		 * into that node's slot, and the fold's rule is SW iff the op holds the
+		 * slot's lock.  A miss (retired / proxied / peer-locked) is the clean
+		 * transient: nothing is published, and ft_meta_copying_mark did not set
+		 * the fence.  Mirrors ft_graft_keylen's own pre-swap fence.
 		 */
-		free_cds_ft_node_unpublished(ft, ft_node_ptr(s_top_prime));
-		ft_glue_abort(ft, &glue);
-		ft_flip_txn_destroy(txn);
-		ret = -EIO;
-		goto sweep;
+		pp_meta = ft_flag_to_metadata(ft, glue.publish_parent);
+		if (ft_meta_copying_mark(pp_meta, &pp_snap)) {
+			pp_meta = NULL;
+			ret = -EAGAIN;
+			goto bail_build;
+		}
+		glue.publish_parent_holder = pp_meta;
+		glue.publish_parent_snap = pp_snap;
+		/*
+		 * The one LIVE node the split cluster re-parents: @cn's displaced
+		 * child, which moves onto the fresh suffix (or straight under the fresh
+		 * branch when there is no suffix).  Its (parent, offset) pair parks SW,
+		 * and the offset lives in the state word ft_meta_nr_child_inc CASes
+		 * from an insert BELOW it -- which @cn's fence does not exclude -- so
+		 * MARK it, exactly as ft_rekey_cow_stop marks the children whose state
+		 * words it parks into.  The mark rides the caller's @marks sweep: the
+		 * commit's own pso edge clears it (new_state masks COPYING out), and
+		 * every bail path releases it.  An external child has no state word and
+		 * no metadata, so there is nothing to mark and nothing to clobber.
+		 */
+		{
+			struct cds_ft_compressed_node *cn =
+				ft_compressed_node_ptr(cn_flag);
+			struct cds_ft_metadata *cm =
+				ft_child_state_meta(ft, cn->child);
+
+			if (cm) {
+				uintptr_t csnap;
+
+				if (ft_meta_copying_mark(cm, &csnap)) {
+					ret = -EAGAIN;
+					goto bail_build;
+				}
+				marks[nr_marks] = cm;
+				snaps[nr_marks] = csnap;
+				nr_marks++;
+			}
+		}
+		/*
+		 * The NOSPLIT path passes the moved subtree's key count through
+		 * ft_store_at_graft_point_commit; the GLUE publish takes it here, and
+		 * ft_glue_txn_commit_edges records the +count walk from the stable
+		 * publish parent into the same commit.
+		 */
+		glue.count_delta = (long) cnt;
+		cds_ft_alloc_reserve_drain(ft, &reserve);	/* GLUE builds its own cluster */
+	} else {
+		/*
+		 * Drive prepare + commit SEPARATELY (not the combined
+		 * ft_store_at_graft_point wrapper) so the reserve recompaction's
+		 * relocated old dst-parent copy (@gst_st.old_recompacted_node) is
+		 * visible here: the graft ALWAYS relocates the attach node for its
+		 * atomic publish, and under record_only its old copy stays LIVE until
+		 * the caller's commit, so the caller frees it post-commit.
+		 */
+		cds_ft_alloc_reserve_activate(ft, &reserve);
+		gst = ft_store_at_graft_point_prepare(ft, dst_ord, dst_len, &d_dst,
+				s_top_prime, cnt, &glue, &gst_st);
+		if (gst == CDS_FT_STATUS_OK)
+			gcst = ft_store_at_graft_point_commit(ft, &attached_nf, &adepth,
+					NULL /*run*/, &gst_st, (long) cnt);
+		cds_ft_alloc_reserve_deactivate(ft);
+		cds_ft_alloc_reserve_drain(ft, &reserve);
+		if (gst != CDS_FT_STATUS_OK || gcst != URCU_TXN_STATUS_OK) {
+			/*
+			 * Not expected single-threaded with the reserve pre-filled.
+			 * Record-only commit leaves the shared txn intact (terminal commit
+			 * gated off), so the caller owns cleanup: free S_top', abort the
+			 * glue build, destroy the txn.  (prepare failure freed its own
+			 * invisible build + left glue clean.)
+			 */
+			free_cds_ft_node_unpublished(ft, ft_node_ptr(s_top_prime));
+			ft_glue_abort(ft, &glue);
+			ft_flip_txn_destroy(txn);
+			ret = -EIO;
+			goto sweep;
+		}
 	}
 
 	/*
@@ -865,6 +995,8 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 		 * graft's own attach node, hence already COPYING-held); the shape gate
 		 * now rejects that permanently, up front, before any of this is built.
 		 */
+		if (pp_meta)
+			ft_meta_copying_clear(pp_meta);	/* GLUE: still ours here */
 		free_cds_ft_node_unpublished(ft, ft_node_ptr(s_top_prime));
 		if (gst_st.old_recompacted_node)
 			free_cds_ft_node_unpublished(ft, ft_node_ptr(gst_st.dest));
@@ -921,6 +1053,8 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 		src_succ = ft_ord_cell_resolve_ord(&rlc->lnode.next);
 		if (src_pred == ft_ord_or_sentinel(ft, run_dpred) ||
 				src_succ == ft_ord_or_sentinel(ft, run_dsucc)) {
+			if (pp_meta)
+				ft_meta_copying_clear(pp_meta);	/* GLUE: still ours */
 			free_cds_ft_node_unpublished(ft, ft_node_ptr(s_top_prime));
 			if (gst_st.old_recompacted_node)
 				free_cds_ft_node_unpublished(ft,
@@ -945,6 +1079,25 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 		cn = ft_ord_cell_run_resplice_edges(ft, rfc, rlc, run_dpred,
 				run_dsucc, cedges, cn);
 		ft_ord_cell_record_into(txn, cedges, cn);
+	}
+
+	/*
+	 * 3c. GLUE shape only: record the split cluster's publish -- its hidden
+	 * back-pointers (plain stores on unpublished nodes), the displaced child's
+	 * live re-parent, the forward edge into the fenced publish parent, @cn's
+	 * retire and the count walk -- into the SAME txn.  It runs LAST, after the
+	 * detach and cell folds, because it is the step that does live bookkeeping
+	 * and is specified to be called where abort is impossible; every arm that
+	 * can still bail is above it.  (The NOSPLIT shape is the other way round --
+	 * its prepare/commit is where its recompaction ACQUIRES the lock set the
+	 * detach then reuses, so it has to run first.)  Under record_only this
+	 * records and returns OK without committing; the caller's one commit below
+	 * publishes it, and from here the txn registry -- not this function -- owns
+	 * the publish parent's fence.
+	 */
+	if (prep == FT_GRAFT_PREP_GLUE) {
+		(void) ft_glue_txn_commit_edges(ft, &glue, NULL, 0);
+		pp_meta = NULL;		/* ownership transferred to @txn */
 	}
 
 	/* 4. ONE commit of the whole stitch (consumes txn). */
@@ -981,6 +1134,25 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 		ret = -EAGAIN;
 	}
 	ft_glue_fini(&glue);
+	goto sweep;
+
+bail_build:
+	/*
+	 * Common unwind for every bail between the graft build and the point where
+	 * the graft's own step has committed its records: the build published
+	 * nothing, so drop the (possibly filled) node reserve, release the publish
+	 * parent's fence if this function still owns it -- once
+	 * ft_glue_txn_commit_edges has run, the txn registry owns it and clearing
+	 * here would race a peer's re-mark -- free the unpublished S_top' copy, and
+	 * let ft_glue_abort free the invisible cluster and release the split node's
+	 * fence (its single clear point).  @marks is swept below, as on every path.
+	 */
+	cds_ft_alloc_reserve_drain(ft, &reserve);
+	if (pp_meta)
+		ft_meta_copying_clear(pp_meta);
+	free_cds_ft_node_unpublished(ft, ft_node_ptr(s_top_prime));
+	ft_glue_abort(ft, &glue);
+	ft_flip_txn_destroy(txn);
 
 sweep:
 	for (i = 0; i < nr_marks; i++)

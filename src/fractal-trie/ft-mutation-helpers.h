@@ -4827,6 +4827,28 @@ enum urcu_txn_status ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue 
 	for (i = 0; i < g->nr_deferred; i++) {
 		if (!g->deferred[i].dst_origin)
 			continue;
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+		/*
+		 * FOLD (coherent rekey one-decide writer): under structural_sw the
+		 * records below PARK -- plain stores that never validate -- so a live
+		 * child's re-home must be the co-committed (parent, offset) PAIR, not
+		 * ft_glue_record_back_edge's parent edge beside a plain
+		 * ft_set_parent_slot.  That plain store lands in the STATE word, which
+		 * ft_meta_nr_child_inc CASes from an insert BELOW the child (a peer
+		 * that neither this op's locks nor the graft's exclude), so it would
+		 * clobber or be clobbered.  ft_reparent_record records both words;
+		 * its offset edge carries new_state with COPYING masked out, so it
+		 * ALSO RELEASES the mark the fold took on that child (the ft_rekey_cow_stop
+		 * discipline: mark every metadata-bearing child whose state word an SW
+		 * edge parks into).  Every non-fold caller keeps structural_sw false and
+		 * is byte-identical.
+		 */
+		if (g->txn->structural_sw) {
+			ft_reparent_record(ft, g->txn, g->deferred[i].child,
+				g->deferred[i].parent, g->deferred[i].slot);
+			continue;
+		}
+#endif
 		ft_glue_record_back_edge(ft, g->txn, g->deferred[i].child,
 			g->deferred[i].parent, g->deferred[i].slot);
 	}

@@ -68,7 +68,7 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_MW_DLM_ACQUIRE
-#define NR_TESTS_REKEY_DLM	5	/* inv_rekey_graft_{disjoint,cross_junction,coherent_readers,shared}, inv_rekey_linearizability */
+#define NR_TESTS_REKEY_DLM	6	/* inv_rekey_graft_{disjoint,cross_junction,glue_dst,coherent_readers,shared}, inv_rekey_linearizability */
 #else
 #define NR_TESTS_REKEY_DLM	0
 #endif
@@ -1640,6 +1640,316 @@ static int inv_rekey_graft_cross_junction(void)
 		"%lu retries, %lu live keys\n", RKX_NW, total_ops, total_retries,
 		live);
 
+	free(w);
+	if (drain_and_destroy(ft, group) < 0)
+		ret = -1;
+	if (leak_check() < 0)
+		ret = -1;
+	return ret;
+}
+
+/*
+ * Coherent-rekey concurrent-writer oracle, GLUE dst: every move lands its subtree
+ * INSIDE a compressed node, so the graft cannot append in place -- it splits the
+ * node and the fold records the whole invisible cluster's publish into the one
+ * commit.  This is the only concurrent exercise of that shape, and it is aimed at
+ * the two fences the shape adds: the split node's (taken by the build) and the
+ * PUBLISH PARENT's (taken by the driver, because a guard fallback would leave the
+ * forward SW park unheld).
+ *
+ * Contention is deliberate and on the publish parent: each writer's compressed
+ * node hangs directly under a root child, so `publish_parent` is the ROOT NODE for
+ * ALL of them -- they serialize on one fence exactly as the disjoint oracle's
+ * writers do, which is what makes the abort-and-retry arms run.  Key ownership
+ * stays disjoint, so an -EINVAL is still a real failure.
+ *
+ * A GLUE move CANNOT oscillate the way the other rekey oracles do: the split
+ * consumes the compressed node and leaves a 2-child branch, which the src-junction
+ * min_child gate refuses as a source.  So each iteration RESTORES the shape --
+ * remove the four moved keys from the dst side (the branch drops to one child and
+ * chain-compresses back) and re-insert them at the source.  The loop only tests
+ * test_stop at an iteration boundary, so the trie is always in its base state at
+ * join time.  Ordinary insert/remove concurrency rides along for free.
+ *
+ * Per writer w: root children w1 = 2w+1 (source side) and w2 = 2w+2 (dst side).
+ *   w1 -> { 1 -> {1, [3 = S_top -> {1,2,3,4}], 5},  9 }
+ *   w2 -> compressed[1,7,7,7] -> one leaf          <- the dst key {w2,1,3} diverges
+ *                                                     at its SECOND byte
+ * Opt-in FT_INV_MW=1.
+ */
+#define RKGL_NW		8		/* GLUE rekey writers, all contending root */
+#define RKGL_NSUB	4
+
+struct rkgl_writer_arg {
+	struct cds_ft *ft;
+	uint8_t w1, w2;			/* source-side / dst-side root children */
+	struct ft_test_node *fill;	/* (w1,9,0,0,0) */
+	struct ft_test_node *sib[2];	/* (w1,1,1,0,0) / (w1,1,5,0,0) */
+	struct ft_test_node *lone;	/* (w2,1,7,7,7): the compressed node's key */
+	/*
+	 * TWO generations of the moved leaves, rotated instead of re-allocated.
+	 * The restore below removes the live generation and re-inserts the other
+	 * one, which was removed a full iteration ago -- and every iteration
+	 * starts with a move, whose gate waits a GRACE PERIOD, so the generation
+	 * being re-inserted has provably been unreachable across one.  That keeps
+	 * the oracle allocation-free and, more importantly, keeps it from pushing
+	 * ~14k call_rcu callbacks per run through the shared queues, where the
+	 * only thing it measures is other tests' tolerance for a busy reclaimer.
+	 */
+	struct ft_test_node *top[2][RKGL_NSUB];
+	int gen;			/* which generation is currently live */
+	unsigned long ops, retries;
+	int failed;
+};
+
+static void *rkgl_writer(void *arg)
+{
+	struct rkgl_writer_arg *w = (struct rkgl_writer_arg *) arg;
+	uint8_t src_key[3], dst_key[3];
+	struct cds_ft_iter *iter;
+	unsigned long iters = 0;
+
+	src_key[0] = w->w1; src_key[1] = 1; src_key[2] = 3;
+	dst_key[0] = w->w2; dst_key[1] = 1; dst_key[2] = 3;
+
+	rcu_register_thread();
+	if (cds_ft_iter_create(w->ft, &iter) < 0)
+		abort();
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	while (!test_stop) {
+		int rc, c;
+
+		/* No read lock: the move enters the gate, which waits a GP. */
+		rc = _cds_ft_debug_rekey_graft_simple(w->ft, src_key, 3, dst_key, 3);
+		if (rc == -EAGAIN || rc == -EIO || rc == -ENOMEM) {
+			w->retries++;	/* transient: trie pristine, re-descend */
+			continue;
+		}
+		if (rc != 0) {
+			fprintf(stderr, "rkgl_writer w1=%u w2=%u: move failed "
+				"rc=%d\n", w->w1, w->w2, rc);
+			w->failed = 1;
+			mw_violation_snapshot();
+			break;
+		}
+		w->ops++;
+		/*
+		 * RESTORE, so the next iteration faces the same shape: pull the four
+		 * moved keys back out of the split's new direction and re-insert them
+		 * at the source.  Fresh nodes for the re-insert (a removed node is
+		 * marked and RCU-owned), and the removal drops the branch to its one
+		 * surviving child, which chain-compresses back into a compressed node.
+		 */
+		for (c = 0; c < RKGL_NSUB; c++) {
+			uint64_t moved = RKX_KEY(w->w2, 1, 3, c + 1, 0);
+			struct cds_ft_node *found;
+			uint8_t k[8];
+
+			cds_ft_u64_to_key(w->ft, moved, k, CDS_FT_LEN_DEFAULT);
+			rcu_read_lock();
+			cds_ft_iter_set_key(iter, k, CDS_FT_LEN_DEFAULT);
+			cds_ft_lookup(w->ft, iter);
+			found = cds_ft_iter_node(iter);
+			if (found != &w->top[w->gen][c]->node) {
+				rcu_read_unlock();
+				fprintf(stderr, "rkgl_writer w1=%u: moved key %d "
+					"not at dst after a committed move\n",
+					w->w1, c);
+				w->failed = 1;
+				mw_violation_snapshot();
+				goto out;
+			}
+			if (cds_ft_remove(w->ft, iter, found) != CDS_FT_STATUS_OK) {
+				rcu_read_unlock();
+				fprintf(stderr, "rkgl_writer w1=%u: remove %d failed\n",
+					w->w1, c);
+				w->failed = 1;
+				goto out;
+			}
+			rcu_read_unlock();
+		}
+		for (c = 0; c < RKGL_NSUB; c++) {
+			uint64_t home = RKX_KEY(w->w1, 1, 3, c + 1, 0);
+			struct ft_test_node *n = w->top[!w->gen][c];
+
+			ft_test_node_init(n, home);	/* clears the removal mark */
+			if (insert_u64(w->ft, home, n) != CDS_FT_STATUS_OK) {
+				fprintf(stderr, "rkgl_writer w1=%u: re-insert %d "
+					"failed\n", w->w1, c);
+				w->failed = 1;
+				goto out;
+			}
+		}
+		w->gen = !w->gen;
+		if ((++iters & 0x1f) == 0)
+			rcu_quiescent_state();
+	}
+out:
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static int inv_rekey_graft_glue_dst(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	struct rkgl_writer_arg *w;
+	pthread_t writers[RKGL_NW];
+	struct ft_test_node *guard_lo, *guard_hi;
+	struct timespec t0;
+	unsigned long total_ops = 0, total_retries = 0, live = 0;
+	int i, c, ret = 0;
+
+	if (!getenv("FT_INV_MW")) {
+		fprintf(stderr, "# inv_rekey_graft_glue_dst: skipped "
+			"(set FT_INV_MW=1 to run the coherent-rekey writer oracle)\n");
+		return 0;
+	}
+	mw_install_fatal_handler();
+	leak_reset();
+
+	ft = create_fixed_fine_lock_ft(5, &group);	/* list ON (default) */
+	cds_ft_make_concurrent(ft);
+
+	guard_lo = node_alloc(RKX_KEY(0x00, 0, 0, 0, 0));
+	guard_hi = node_alloc(RKX_KEY(0xff, 0, 0, 0, 0));
+	rcu_read_lock();
+	if (insert_u64(ft, RKX_KEY(0x00, 0, 0, 0, 0), guard_lo) != CDS_FT_STATUS_OK ||
+			insert_u64(ft, RKX_KEY(0xff, 0, 0, 0, 0), guard_hi) !=
+			CDS_FT_STATUS_OK)
+		abort();
+	rcu_read_unlock();
+	live = 2;
+
+	w = (struct rkgl_writer_arg *) calloc(RKGL_NW, sizeof(*w));
+	if (!w)
+		abort();
+	for (i = 0; i < RKGL_NW; i++) {
+		uint64_t s1, s5, fk, lk;
+
+		w[i].ft = ft;
+		w[i].w1 = (uint8_t) (2 * i + 1);
+		w[i].w2 = (uint8_t) (2 * i + 2);
+		s1 = RKX_KEY(w[i].w1, 1, 1, 0, 0);
+		s5 = RKX_KEY(w[i].w1, 1, 5, 0, 0);
+		fk = RKX_KEY(w[i].w1, 9, 0, 0, 0);
+		lk = RKX_KEY(w[i].w2, 1, 7, 7, 7);
+		w[i].sib[0] = node_alloc(s1);
+		w[i].sib[1] = node_alloc(s5);
+		w[i].fill = node_alloc(fk);
+		w[i].lone = node_alloc(lk);
+		rcu_read_lock();
+		if (insert_u64(ft, s1, w[i].sib[0]) != CDS_FT_STATUS_OK ||
+				insert_u64(ft, s5, w[i].sib[1]) != CDS_FT_STATUS_OK ||
+				insert_u64(ft, fk, w[i].fill) != CDS_FT_STATUS_OK ||
+				insert_u64(ft, lk, w[i].lone) != CDS_FT_STATUS_OK)
+			abort();
+		for (c = 0; c < RKGL_NSUB; c++) {
+			uint64_t tk = RKX_KEY(w[i].w1, 1, 3, c + 1, 0);
+
+			w[i].top[0][c] = node_alloc(tk);
+			w[i].top[1][c] = node_alloc(tk);	/* spare generation */
+			if (insert_u64(ft, tk, w[i].top[0][c]) != CDS_FT_STATUS_OK)
+				abort();
+		}
+		rcu_read_unlock();
+		live += 4 + RKGL_NSUB;
+	}
+
+	test_go = 0;
+	test_stop = 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < RKGL_NW; i++)
+		pthread_create(&writers[i], NULL, rkgl_writer, &w[i]);
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	test_go = 1;
+
+	rcu_thread_offline();
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
+		usleep(1000);
+	test_stop = 1;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < RKGL_NW; i++)
+		pthread_join(writers[i], NULL);
+	rcu_thread_online();
+
+	/*
+	 * Quiescent, and every writer stopped at an iteration boundary, so the trie
+	 * must be back in its base state: the moved keys home, the split's old
+	 * direction (the lone compressed key) intact, nothing left at the dst.
+	 */
+	synchronize_rcu();
+	rcu_read_lock();
+	for (i = 0; i < RKGL_NW; i++) {
+		struct cds_ft_node *found = NULL;
+
+		total_ops += w[i].ops;
+		total_retries += w[i].retries;
+		if (w[i].failed)
+			ret = -1;
+		if (lookup_u64(ft, RKX_KEY(w[i].w2, 1, 7, 7, 7), &found) !=
+				CDS_FT_STATUS_OK || found != &w[i].lone->node) {
+			fprintf(stderr, "rekey glue: writer %d lost the compressed "
+				"key\n", i);
+			ret = -1;
+		}
+		if (lookup_u64(ft, RKX_KEY(w[i].w1, 1, 1, 0, 0), &found) !=
+				CDS_FT_STATUS_OK || found != &w[i].sib[0]->node ||
+				lookup_u64(ft, RKX_KEY(w[i].w1, 1, 5, 0, 0), &found) !=
+				CDS_FT_STATUS_OK || found != &w[i].sib[1]->node ||
+				lookup_u64(ft, RKX_KEY(w[i].w1, 9, 0, 0, 0), &found) !=
+				CDS_FT_STATUS_OK || found != &w[i].fill->node) {
+			fprintf(stderr, "rekey glue: writer %d lost a fixed key\n", i);
+			ret = -1;
+		}
+		for (c = 0; c < RKGL_NSUB; c++) {
+			if (lookup_u64(ft, RKX_KEY(w[i].w1, 1, 3, c + 1, 0), &found) !=
+					CDS_FT_STATUS_OK ||
+					found != &w[i].top[w[i].gen][c]->node) {
+				fprintf(stderr, "rekey glue: writer %d key %d not "
+					"home\n", i, c);
+				ret = -1;
+			}
+			if (lookup_u64(ft, RKX_KEY(w[i].w2, 1, 3, c + 1, 0), &found) ==
+					CDS_FT_STATUS_OK) {
+				fprintf(stderr, "rekey glue: writer %d key %d still at "
+					"dst\n", i, c);
+				ret = -1;
+			}
+		}
+	}
+	if (cds_ft_count_keys(ft) != live) {
+		fprintf(stderr, "rekey glue: count_keys %lu != live %lu\n",
+			cds_ft_count_keys(ft), live);
+		ret = -1;
+	}
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "rekey glue: cds_ft_verify failed\n");
+		ret = -1;
+	}
+	rcu_read_unlock();
+
+	if (total_ops == 0) {
+		fprintf(stderr, "rekey glue: no successful moves (livelock?)\n");
+		ret = -1;
+	}
+	fprintf(stderr, "# inv_rekey_graft_glue_dst: %d writers, %lu moves, "
+		"%lu retries, %lu live keys\n", RKGL_NW, total_ops, total_retries,
+		live);
+
+	/*
+	 * The spare generation is not in the trie, so the drain below cannot free
+	 * it.  The writers are joined and a grace period has passed, so a direct
+	 * free is safe.
+	 */
+	for (i = 0; i < RKGL_NW; i++)
+		for (c = 0; c < RKGL_NSUB; c++)
+			node_free(w[i].top[!w[i].gen][c]);
 	free(w);
 	if (drain_and_destroy(ft, group) < 0)
 		ret = -1;
@@ -13643,6 +13953,7 @@ int main(int argc, char **argv)
 #ifdef FEATURE_FT_MW_DLM_ACQUIRE
 	RUN_TEST(inv_rekey_graft_disjoint);
 	RUN_TEST(inv_rekey_graft_cross_junction);
+	RUN_TEST(inv_rekey_graft_glue_dst);
 	RUN_TEST(inv_rekey_graft_coherent_readers);
 	RUN_TEST(inv_rekey_graft_shared);
 	RUN_TEST(inv_rekey_linearizability);
