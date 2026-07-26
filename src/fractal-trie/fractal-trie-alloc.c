@@ -1203,12 +1203,13 @@ long cds_ft_fault_lock_countdown = -1;
 
 /*
  * Test-only REKEY-coherence second-walk fault injection
- * (automatic under the move gate).  Counts down over ft_rekey_descent_coherent()
- * calls and forces the (n+1)-th to report a coherence MISS, exactly as a
- * concurrent in-trie rekey that restructured the descent's path would.
+ * (automatic under the move gate).  Counts down over coherence checks -- the
+ * point lookup's two descents and the relational two-pass, via
+ * ft_rekey_fault_miss() -- and forces the (n+1)-th to report a MISS, exactly as a
+ * concurrent in-trie rekey that restructured the reader's path would.
  *
- * Why this knob has to exist: with no concurrent rekey the second walk always
- * MATCHES, so the coherent lookup's mismatch/re-descend arm is DEAD CODE a green
+ * Why this knob has to exist: with no concurrent rekey the two passes always
+ * AGREE, so the coherent lookup's mismatch/retry arm is DEAD CODE a green
  * single-threaded soak says nothing about.  This forces one miss on demand so
  * the re-descend loop is actually executed and shown to still return the correct
  * (coherent) result -- rather than assumed.  The forced miss is self-clearing

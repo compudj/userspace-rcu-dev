@@ -55,14 +55,14 @@
 #define NR_TESTS_DLM 0
 #endif
 
-/* 284 unconditional + 46 fault-injection-only RUN_TEST registrations.  (The
+/* 285 unconditional + 46 fault-injection-only RUN_TEST registrations.  (The
  * fault total was one short before test_rekey_coherence_relational_fault: the
  * plan said 327 where 328 tests ran, so the fault build failed its own TAP
  * plan.) */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (330 + NR_TESTS_DLM)
+#define NR_TESTS (331 + NR_TESTS_DLM)
 #else
-#define NR_TESTS (284 + NR_TESTS_DLM)
+#define NR_TESTS (285 + NR_TESTS_DLM)
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -1929,6 +1929,84 @@ static int test_rekey_coherence_lookup(void)
 	}
 out:
 	_cds_ft_debug_move_gate_exit(ft);	/* balances the enter above */
+	if (drain_and_destroy(ft, group) != 0)
+		ret = -1;
+	return ret;
+}
+
+/*
+ * REKEY coherence on a LIST-OFF trie.  The point witness is two forward descents
+ * and a continuation rides the carried key, so neither needs an ordered-list
+ * cell -- which is what the old up-walk key rematerializer needed and why
+ * coherence used to be gated on ->ordered_list.  This is the test for that gate
+ * being gone: with the MOVE GATE HELD OPEN on a trie that has NO cell list at
+ * all, exact lookups must still be right (present found at their node, absent
+ * NOT_FOUND) and must not spin.
+ */
+static int test_rekey_coherence_listoff(void)
+{
+	struct cds_ft_group_attr *gattr;
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	struct ft_test_node *nodes[64];
+	enum cds_ft_status s;
+	unsigned int i;
+	int ret = 0;
+
+	if (cds_ft_group_attr_create(&gattr) < 0)
+		return -1;
+	if (cds_ft_group_attr_set_key_len(gattr, 8) < 0 ||
+			cds_ft_group_attr_set_ordered_list(gattr, false) < 0) {
+		cds_ft_group_attr_destroy(gattr);
+		return -1;
+	}
+	if (cds_ft_group_create(gattr, &group) < 0) {
+		cds_ft_group_attr_destroy(gattr);
+		return -1;
+	}
+	cds_ft_group_attr_destroy(gattr);
+	if (cds_ft_create(group, NULL, &ft) < 0) {
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	for (i = 0; i < 64; i++) {
+		nodes[i] = node_alloc((uint64_t) i * 7 + 1);
+		rcu_read_lock();
+		s = insert_u64(ft, (uint64_t) i * 7 + 1, nodes[i]);
+		rcu_read_unlock();
+		if (s != CDS_FT_STATUS_OK) {
+			node_free(nodes[i]);
+			ret = -1;
+			goto out;
+		}
+	}
+	_cds_ft_debug_move_gate_enter(ft);	/* really run the coherent path */
+	for (i = 0; i < 64; i++) {
+		struct cds_ft_node *out = NULL;
+
+		rcu_read_lock();
+		s = lookup_u64(ft, (uint64_t) i * 7 + 1, &out);
+		rcu_read_unlock();
+		if (s != CDS_FT_STATUS_OK || out != &nodes[i]->node) {
+			fprintf(stderr,
+				"rekey-coherence list-off: lookup mismatch at %u\n",
+				i);
+			ret = -1;
+			break;
+		}
+		rcu_read_lock();
+		s = lookup_u64(ft, (uint64_t) i * 7 + 3, &out);
+		rcu_read_unlock();
+		if (s != CDS_FT_STATUS_NOT_FOUND) {
+			fprintf(stderr,
+				"rekey-coherence list-off: absent key found at %u\n",
+				i);
+			ret = -1;
+			break;
+		}
+	}
+	_cds_ft_debug_move_gate_exit(ft);
+out:
 	if (drain_and_destroy(ft, group) != 0)
 		ret = -1;
 	return ret;
@@ -27475,6 +27553,7 @@ int main(int argc, char **argv)
 	diag("Insert variant tests");
 	RUN_TEST(test_rekey_coherence_lookup);
 	RUN_TEST(test_rekey_coherence_relational);
+	RUN_TEST(test_rekey_coherence_listoff);
 	RUN_TEST(test_insert_basic);
 	RUN_TEST(test_insert_unique);
 	RUN_TEST(test_insert_duplicate_chain);

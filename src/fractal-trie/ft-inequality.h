@@ -1832,6 +1832,14 @@ bool ft_ineq_upwalk_key_twice(struct cds_ft *ft, struct cds_ft_iter *iter,
 	size_t n1, n2;
 
 	*torn = false;
+	/*
+	 * Cell-sourced: on a list-off trie a head's ->prev is its HOLDER, not a
+	 * cell, so there is nothing to walk from here.  Nothing is lost -- a
+	 * list-off continuation's search key is already a VALUE in iter_key (the
+	 * previous descent wrote it there), which is the carried key.
+	 */
+	if (!ft->ordered_list)
+		return false;
 	cell = ft_ord_cell_cursor(iter);
 	if (!cell)
 		return false;

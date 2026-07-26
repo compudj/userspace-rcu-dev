@@ -177,6 +177,16 @@ enum cds_ft_status do_cds_ft_lookup_inner(struct cds_ft *ft,
 		enum ft_prefix_tracking tracking,
 		size_t *tracking_match_len,
 		struct cds_ft_node **tracking_match_node,
+		/*
+		 * COHERENCE witness (NULL -- and a compile-time NULL -- at every
+		 * ordinary call site, so the folds below vanish): when set, every
+		 * node this descent dispatches from, plus the node it lands on,
+		 * is folded in, so a SECOND descent can be compared against the
+		 * first and a view torn across an in-trie move detected.  A MISS
+		 * is covered as well as a hit -- the path is the witness, not the
+		 * result.  See struct ft_visit_witness.
+		 */
+		struct ft_visit_witness *wit,
 		bool descend_cand,
 		bool skip_compressed)
 {
@@ -296,6 +306,8 @@ descend_loop:
 		 * iterations land here only on the internal fall-through path of the
 		 * post-step merged handler.  No tag-bit branch before dispatch.
 		 */
+		if (wit)		/* the descent path */
+			ft_witness_visit(wit, ft_node_ptr(node_flag));
 		iter_key = *(key++);
 		/*
 		 * Dispatch returns the slot value as-is, including any
@@ -567,6 +579,8 @@ terminal:
 	}
 
 end:
+	if (wit)			/* the terminal (NULL on a miss) */
+		ft_witness_visit(wit, found);
 	/* Bring @iter back into a register for the epilogue writes. */
 	FT_RELOAD_FROM_STACK(iter);
 	if (result_node)
@@ -613,7 +627,7 @@ enum cds_ft_status do_cds_ft_lookup_dc_sc(struct cds_ft *ft,
 	return do_cds_ft_lookup_inner(ft, key, _key_len, _key_readable_pad,
 			result_node, iter,
 			tracking, tracking_match_len, tracking_match_node,
-			true, true);
+			NULL, true, true);
 }
 
 static inline_lookup
@@ -628,7 +642,7 @@ enum cds_ft_status do_cds_ft_lookup_dc_nosc(struct cds_ft *ft,
 	return do_cds_ft_lookup_inner(ft, key, _key_len, _key_readable_pad,
 			result_node, iter,
 			tracking, tracking_match_len, tracking_match_node,
-			true, false);
+			NULL, true, false);
 }
 
 static inline_lookup
@@ -643,7 +657,7 @@ enum cds_ft_status do_cds_ft_lookup_nodc_sc(struct cds_ft *ft,
 	return do_cds_ft_lookup_inner(ft, key, _key_len, _key_readable_pad,
 			result_node, iter,
 			tracking, tracking_match_len, tracking_match_node,
-			false, true);
+			NULL, false, true);
 }
 
 static inline_lookup
@@ -658,7 +672,27 @@ enum cds_ft_status do_cds_ft_lookup_nodc_nosc(struct cds_ft *ft,
 	return do_cds_ft_lookup_inner(ft, key, _key_len, _key_readable_pad,
 			result_node, iter,
 			tracking, tracking_match_len, tracking_match_node,
-			false, false);
+			NULL, false, false);
+}
+
+/*
+ * WITNESS-CARRYING precise descent, for the rekey-coherent point lookup ONLY:
+ * one out-of-line copy with a RUNTIME skip_compressed, so the two coherent
+ * specializations share it rather than each inlining a second descent.  The hot
+ * paths keep the force-inlined, compile-time-specialized wrappers above.
+ */
+static
+enum cds_ft_status do_cds_ft_lookup_precise_wit(struct cds_ft *ft,
+		const uint8_t *key, size_t _key_len, size_t _key_readable_pad,
+		struct cds_ft_node **result_node,
+		struct cds_ft_iter *iter,
+		struct ft_visit_witness *wit,
+		bool skip_compressed)
+{
+	return do_cds_ft_lookup_inner(ft, key, _key_len, _key_readable_pad,
+			result_node, iter,
+			FT_PREFIX_TRACK_NONE, NULL, NULL,
+			wit, false, skip_compressed);
 }
 
 /*

@@ -779,13 +779,13 @@ enum cds_ft_status cds_ft_create(struct cds_ft_group *ft_group,
 	 * Which tries can: EAGER ones only -- a move changes a leaf's key and the
 	 * library cannot rewrite an application-stored speculative key, so a
 	 * speculative trie must never host a move (and needs no coherence).  The
-	 * ->ordered_list requirement is NOT inherent; it is what the currently
-	 * installed point witness (the up-walk key rematerializer) needs, and it
-	 * goes away with the cells-free two-from-root witness.  Set BEFORE
+	 * ordered list is NOT required: the point witness is two forward descents
+	 * and the continuation rides the carried key, neither of which needs a
+	 * cell (the earlier up-walk key rematerializer did, which is what the
+	 * ->ordered_list gate here used to be for).  Set BEFORE
 	 * ft_install_lookup_ops, which selects the specializations off it.
 	 */
-	ft->rekey_coherence = ft->ordered_list &&
-		!ft->speculative_key_offset_active;
+	ft->rekey_coherence = !ft->speculative_key_offset_active;
 	ft_install_lookup_ops(ft);
 #ifdef FEATURE_FT_VERIFY_AT_MUTATION
 	/*
