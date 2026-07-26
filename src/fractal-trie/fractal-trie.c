@@ -428,13 +428,14 @@ bool ft_rekey_splice_pos_brackets(struct cds_ft *ft, const uint8_t *dst_ord,
  * machinery:
  *   - S_top is a plain internal POPCOUNT/PIGEON node with no co-located external
  *     list (ft_rekey_cow_stop's sub-step-2 scope), hanging at @src_key.
- *   - the SRC JUNCTION BP (= S_top's parent) and the DST PARENT SHARE A PARENT
- *     (d_src.ppnf == d_dst.ppnf) -- the enforced precondition of the held-parent
- *     reuse (see the shape gate below).  In the default, concurrent-safe build
- *     EVERY popcount delete recompacts, so BP is rebuilt on the removal and
- *     republished into that shared parent; the graft's dst-parent recompaction
- *     COPYING-holds that same shared parent FIRST, so the detach's BP recompaction
- *     REUSES the held lock (@src_held_hint) instead of re-acquiring it.
+ *   - the SRC JUNCTION BP (= S_top's parent) and the DST PARENT are DISTINCT and
+ *     do not alias each other's parent (the shape gate below).  They MAY share a
+ *     parent or not: in the default, concurrent-safe build EVERY popcount delete
+ *     recompacts, so BP is rebuilt on the removal and republished into its parent,
+ *     and that parent is either the node the graft's dst-parent recompaction
+ *     already COPYING-holds -- REUSED via @src_held_hint rather than re-acquired --
+ *     or a node this detach acquires itself, guarded.  Both are try-locks that
+ *     abort rather than block, so their order is deadlock-free.
  *   - @dst_key is ABSENT and reached by a NOSPLIT graft into a spare slot with
  *     append room (no compressed-divergence GLUE split).
  *   - the trie's ordered list may be ON: the moved subtree's contiguous cell run
@@ -444,11 +445,13 @@ bool ft_rekey_splice_pos_brackets(struct cds_ft *ft, const uint8_t *dst_ord,
  *     own ordered neighbourhood (adjacency guard below).
  * structural_sw STAYS TRUE the whole txn: cow_stop's S_top edges, the graft's
  * dst-parent recompaction, and the detach's BP recompaction all hold their DLM
- * COPYING locks (BP's shared parent via @src_held_hint), so every structural edge
- * is legitimately SW; the mixed engine still sorts the (MW) count edges first.
+ * COPYING locks (BP's parent held by the graft via @src_held_hint, or acquired
+ * here), so every structural edge is legitimately SW; the mixed engine still
+ * sorts the (MW) count edges first.
  *
- * @src_key / @dst_key are APPLICATION keys (converted to ordinal internally); for
- * a fixed-length group @src_len must equal @dst_len.
+ * @src_key / @dst_key are APPLICATION keys (converted to ordinal internally),
+ * DISJOINT (neither a prefix of the other), of EQUAL length, on a FIXED-length
+ * group -- see the scope checks at the top of the body for why each is required.
  *
  * CONCURRENCY.  Abort-clean and single-shot: every bail leaves the trie byte-for-
  * byte as before, so a CONCURRENT caller retries by simply calling again (there is
@@ -483,6 +486,7 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 	uintptr_t snaps[FT_ENTRY_PER_NODE + 1];
 	const uint8_t *ik;
 	unsigned int nr_marks = 0, adepth = 0, i, ti;
+	bool src_parent_held;
 	enum ft_graft_prep prep;
 	enum cds_ft_status gst;
 	enum urcu_txn_status gcst = URCU_TXN_STATUS_OK, st;
@@ -492,8 +496,41 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 	if (!ft->lock_fine || src_len == 0 || dst_len == 0 ||
 			src_len > FT_MAX_KEY_LEN || dst_len > FT_MAX_KEY_LEN)
 		return -EINVAL;
+	/*
+	 * SCOPE, both permanent (-EINVAL), both stated HERE now that the
+	 * shared-parent shape gate below no longer stands in for them:
+	 *  - FIXED-length group.  ft_rekey_splice_pos_brackets, the check that
+	 *    makes an incoherently derived splice position detectable, is
+	 *    fixed-length only (it pads @dst_ord with the ordinal extremes to
+	 *    bound the dst key range); on a variable-length group it returns true
+	 *    for everything, so such a trie was running the cell splice with HALF
+	 *    its validation.  Refuse it rather than degrade silently.
+	 *  - EQUAL lengths (which ppnf equality used to force).  A shorter or
+	 *    longer @dst_key rewrites every moved key's LENGTH -- which a
+	 *    fixed-length group cannot express at all, and which a variable-length
+	 *    one would need the max_used_key_len fold for.
+	 */
+	if (ft->group->key_len == CDS_FT_LEN_VARIABLE || src_len != dst_len)
+		return -EINVAL;
 	ft_key_to_ordinals(src_ord, src_key, src_len, &ft->group->key_map);
 	ft_key_to_ordinals(dst_ord, dst_key, dst_len, &ft->group->key_map);
+	/*
+	 * DISJOINT keys: neither may be a prefix of the other (equal keys being
+	 * the degenerate case).  A prefix relationship puts one key inside the
+	 * other's subtree, so the move is circular -- and it is ALSO what keeps
+	 * the ordered-list splice sound now that the shape gate no longer forces
+	 * src_len == dst_len by construction.  The run this move re-splices is
+	 * exactly the keys under @src_key, an ordinally CONTIGUOUS range, so a
+	 * splice neighbour strictly INTERIOR to that run would have to be
+	 * bracketed by two run keys -- which puts @dst_key inside the run's own
+	 * range, i.e. makes @src_key a prefix of it.  Rejecting that here leaves
+	 * only the two ENDPOINT-adjacency shapes for the guard below to catch, so
+	 * "no cell of the moved run is a splice neighbour" holds by construction.
+	 * (A neighbour interior to a PEER's concurrently-moving run is a
+	 * different, still-open question -- see the splice validation below.)
+	 */
+	if (memcmp(src_ord, dst_ord, src_len < dst_len ? src_len : dst_len) == 0)
+		return -EINVAL;
 
 	/*
 	 * Descend src to S_top through plain internal nodes, capturing (nfp, pnfp,
@@ -590,10 +627,12 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 	 * Completeness of the "no run cell is a splice neighbour" guarantee is JOINT:
 	 * this guard rejects the two ENDPOINT-adjacency shapes, while the INTERIOR case
 	 * (a dst gap whose neighbour is a run cell strictly between rfc and rlc) is
-	 * excluded by the later d_src.ppnf == d_dst.ppnf shape gate -- ppnf equality
-	 * forces src_len == dst_len, so an interior dst (which needs the full src prefix
-	 * plus a longer key descending into S_top) never reaches the cell record.  A
-	 * future relaxation of that shape gate MUST re-add an interior check here.
+	 * excluded by the DISJOINT-key rule at the top of this function -- an interior
+	 * neighbour would have to be bracketed by two run keys, which puts @dst_key
+	 * inside the run's own contiguous ordinal range and so makes @src_key a prefix
+	 * of it.  (That argument used to be carried by the d_src.ppnf == d_dst.ppnf
+	 * shape gate, via the src_len == dst_len it forced; the gate no longer forces
+	 * it, so the rule is stated where it belongs.)
 	 *
 	 * VALIDATE the located pair FIRST, and bail -EAGAIN (transient, re-derive) when
 	 * it does not bracket the dst key range: find_splice_pos derives the pair from a
@@ -691,19 +730,42 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 	}
 	prep = ft_graft_build(ft, dst_ord, dst_len, s_top_prime, cnt, &d_dst, &glue);
 	/*
-	 * SHAPE GATE.  This first cut supports only:
+	 * SHAPE GATE.  This cut supports:
 	 *  - an absent, append-in-place NOSPLIT dst point (no compressed-divergence
 	 *    GLUE split), and
-	 *  - the src junction BP (= d_src.pnf) and the dst parent (= d_dst.pnf)
-	 *    sharing the SAME parent (d_src.ppnf == d_dst.ppnf, both non-NULL).  That
-	 *    shared parent is what the graft's dst-parent recompaction COPYING-holds
-	 *    and what the detach's BP recompaction reuses via src_parent_held below;
-	 *    the reuse is UNSOUND if BP's parent is not the graft-held node.  A shape
-	 *    where the two junctions diverge is rejected here (the general rekey needs
-	 *    a verified / fallback acquire, not this hook's unconditional reuse).
+	 *  - a src junction BP (= d_src.pnf) that does not ALIAS the graft's own
+	 *    lock set.  That set is exactly TWO nodes: the dst parent d_dst.pnf,
+	 *    which the reserve recompaction retires and RELOCATES, and its parent
+	 *    d_dst.ppnf, which it holds and releases at the flip.  (Its optional
+	 *    third member, the SKIP_X great-grandparent, is excluded by requiring a
+	 *    PLAIN d_dst.ppnf -- which the old gate got for free from the src
+	 *    descent's own plainness checks, ppnf being shared.)  The detach's BP
+	 *    recompaction needs {BP, BP's parent}, so:
+	 *     - BP's parent IS the graft-held d_dst.ppnf: REUSE the held lock
+	 *       (@src_parent_held).  This is the shape the hook started with.
+	 *     - BP's parent is any other node: the detach ACQUIRES it itself,
+	 *       guarded (@parent_guard).  Deadlock-free -- both acquires are
+	 *       try-locks that abort rather than block.
+	 *     - BP, or BP's parent, IS one of the graft's two nodes: rejected here,
+	 *       PERMANENTLY.  Re-locking a held node aborts -EAGAIN every time, so
+	 *       a caller retrying that transient code would spin forever; and the
+	 *       same-junction shape (BP == the dst parent) is worse than unlockable
+	 *       -- the graft RELOCATES that node, so the detach would edit the copy
+	 *       the flip retires.  (Cross-depth aliases are unreachable while the
+	 *       scope keeps src_len == dst_len, which puts both junctions on the
+	 *       same level; they are rejected rather than asserted so that a later
+	 *       relaxation of the length rule cannot silently reach them.)
+	 *  - both junctions BELOW the root (d_src.ppnf / d_dst.ppnf non-NULL): a
+	 *    root-level junction republishes into &ft->root, a slot with no node
+	 *    word to lock, so its SW park would be an unguarded plain store.
 	 */
+	src_parent_held = d_src.ppnf == d_dst.ppnf;
 	if (prep != FT_GRAFT_PREP_NOSPLIT || d_dst.depth != dst_len || d_dst.nf ||
-			!d_src.ppnf || d_src.ppnf != d_dst.ppnf) {
+			!d_src.ppnf || !d_dst.ppnf ||
+			ft_node_compressed(d_dst.ppnf) ||
+			ft_node_skip_compressed(d_dst.ppnf) ||
+			d_src.pnf == d_dst.pnf || d_src.pnf == d_dst.ppnf ||
+			d_src.ppnf == d_dst.pnf) {
 		cds_ft_alloc_reserve_drain(ft, &reserve);
 		ft_glue_abort(ft, &glue);
 		free_cds_ft_node_unpublished(ft, ft_node_ptr(s_top_prime));
@@ -757,29 +819,34 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 	/*
 	 * 3. Detach-fold: remove S_top from BP (clear its slot + nr_child--).  In the
 	 * default (concurrent-safe) build EVERY popcount delete recompacts BP, and
-	 * that recompaction republishes into BP's parent -- which is the SAME shared
-	 * spine ancestor the graft's dst-parent recompaction already COPYING-holds
-	 * (both BP and the dst parent are children of it in this depth-2 shape, the
-	 * d_src.ppnf == d_dst.ppnf gate).  Hand the detach that HELD NODE'S IDENTITY
-	 * (@src_held_hint) so its recompaction REUSES the held lock instead of
-	 * re-acquiring it (a second acquire would abort -EAGAIN).
-	 *
-	 * The identity is passed EXPLICITLY, and its slot with it, rather than letting
-	 * the recompaction resolve BP's current parent: that resolve is racy, and a
-	 * peer that re-homed BP since this descent would make "BP's parent" a node
-	 * this op does NOT hold -- an SW park into an unheld word.  The recompaction's
-	 * acquire commit carries a BP.parent == @parent read-set guard, so a re-home
-	 * ABORTS it (-EAGAIN, trie pristine) and the caller re-descends.
+	 * that recompaction republishes into BP's parent.  Two shapes, decided by the
+	 * gate above and carried by @src_parent_held:
+	 *   - BP's parent IS the spine ancestor the graft's dst-parent recompaction
+	 *     already COPYING-holds (both junctions are its children).  REUSE the held
+	 *     lock; re-acquiring it would abort -EAGAIN.
+	 *   - BP's parent is a node this op holds nothing on.  The recompaction
+	 *     acquires and releases it itself, in its own up-front lock-set commit.
+	 * Either way the identity is passed EXPLICITLY, and its slot with it, rather
+	 * than letting the recompaction resolve BP's current parent: that resolve is
+	 * racy, and a peer that re-homed BP since this descent would make "BP's
+	 * parent" a node this op does NOT hold -- an SW park into a slot that no
+	 * longer holds BP.  @parent_guard puts the BP.parent == @parent read-set
+	 * guard on the acquire commit in BOTH shapes (the held arm guards
+	 * unconditionally), so a re-home ABORTS it (-EAGAIN, trie pristine) and the
+	 * caller re-descends.  BP's parent is never compressed (the src descent
+	 * rejects compressed nodes at every level it walks), so no SKIP_X dual and no
+	 * @gp member.
 	 */
 	ret = ft_detach_node(ft, d_src.nfp, d_src.pnfp, d_src.depth,
 			false /*free_detached_subtree: S_top is retired by cow_stop*/,
 			NULL /*fuse_cell: list off*/, &pub, NULL /*run*/,
 			NULL /*retire_glue*/, NULL /*freeze_leaf*/,
 			-(long) cnt, txn /*shared_txn*/, true /*record_only*/,
-			&(const struct ft_parent_hint){	/* graft-held shared parent */
+			&(const struct ft_parent_hint){	/* BP's parent: held or acquired */
 				.parent = d_src.ppnf, .slot = d_src.pnfp,
 				.gp = NULL, .gp_slot = NULL,
-				.parent_held = true },
+				.parent_held = src_parent_held,
+				.parent_guard = true },
 			&detach_rc /*old + fresh BP copies, reclaimed post-commit*/);
 	if (ret) {
 		/*
@@ -790,10 +857,13 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 		 * published until the caller's commit, so this arm owns the fresh copy
 		 * exactly as the commit-abort arm below does.  (@glue's own build is
 		 * covered by ft_glue_abort; nr_built is 0 for the NOSPLIT shape.)
-		 * REACHABLE single-threaded, deterministically: a same-junction rekey
-		 * (src and dst under the SAME junction, which every shape gate admits)
-		 * makes BP the graft's own attach node, so the graft COPYING-locks BP and
-		 * the fold's ft_dlm_lock(BP) then returns -EAGAIN right here.
+		 * REACHABLE: a peer holding BP -- or, in the non-shared-parent shape,
+		 * BP's own parent -- makes the detach's up-front lock-set acquire abort
+		 * -EAGAIN right here, as does a peer that re-homed BP since this
+		 * descent (the @parent_guard read-set validation).  It used to be
+		 * reachable single-threaded too, via a same-junction move (BP == the
+		 * graft's own attach node, hence already COPYING-held); the shape gate
+		 * now rejects that permanently, up front, before any of this is built.
 		 */
 		free_cds_ft_node_unpublished(ft, ft_node_ptr(s_top_prime));
 		if (gst_st.old_recompacted_node)
@@ -810,8 +880,8 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 	 * above) rather than threaded through them, because the dst-splice PLAIN-STORES
 	 * the run's outer links (rfc->prev, rlc->next) at record time, so the src unsplice
 	 * -- which READS those links to find the src neighbours -- must record FIRST.  The
-	 * structural folds' order (the graft acquires the shared parent lock before the
-	 * detach reuses it via src_parent_held) can't provide that, so the cells are
+	 * structural folds' order (the graft acquires its lock set before the detach
+	 * reuses or acquires BP's parent) can't provide that, so the cells are
 	 * recorded here, in the required order, on the still-pristine live list (no
 	 * structural fold above published anything).
 	 *

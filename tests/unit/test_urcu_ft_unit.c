@@ -50,7 +50,7 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_MW_DLM_ACQUIRE
-#define NR_TESTS_DLM 3		/* cow_stop_root_inplace, rekey_graft_simple, rekey_graft_liston */
+#define NR_TESTS_DLM 4		/* cow_stop_root_inplace, rekey_graft_{simple,liston,cross_junction} */
 #else
 #define NR_TESTS_DLM 0
 #endif
@@ -1131,6 +1131,248 @@ static int test_rekey_graft_liston(void)
 			return -1;
 		}
 		rcu_read_unlock();
+	}
+
+	return drain_and_destroy(ft, group);
+}
+
+/*
+ * Coherent-rekey: the one-decide rekey-graft across junctions that do NOT SHARE A
+ * PARENT -- the shape the hook's original gate (d_src.ppnf == d_dst.ppnf) refused.
+ * The graft's dst-parent recompaction COPYING-holds the dst junction's parent; the
+ * folded detach's src-junction recompaction can no longer REUSE that lock, so it
+ * acquires (and releases) the src junction's own parent itself, guarded by a
+ * BP.parent == @parent read-set validation riding the same acquire commit.
+ *
+ * DEPTH-3 junctions under DIFFERENT root children, on 5-byte keys so S_top's
+ * children stay one level ABOVE the terminal externals (as in the depth-2 tests):
+ *
+ *   root ->  A -> {1 -> {1, 3 = S_top -> {1,2,3,4}, 5},  9}      <- src side
+ *         -> B -> {1 -> {1,          5},                 9}      <- dst side
+ *
+ * The byte-9 fillers are what make the depth-1 nodes BRANCHING (a single child
+ * would be path-compressed, and the driver's descent refuses compressed nodes);
+ * the byte-{1,5} leaves make BP a 3-child junction that survives losing S_top and
+ * give the dst gap neighbours that are not the run's own endpoints.
+ *
+ * List ON, so the same commit also re-splices the moved run's four cells.  The
+ * move runs BOTH ways (the layout is symmetric), and then the SAME-JUNCTION shape
+ * -- move {A,1,3} to the free slot {A,1,7}, where the graft would relocate the very
+ * node the detach edits -- must be refused PERMANENTLY (-EINVAL) with the trie
+ * byte-for-byte unchanged, rather than aborting -EAGAIN as if it were contention.
+ */
+#define RKX_A		0x10		/* src-side root child */
+#define RKX_B		0x20		/* dst-side root child */
+#define RKX_J		0x01		/* junction byte (level 1) on both sides */
+#define RKX_S		0x03		/* S_top's slot byte (level 2) on both sides */
+#define RKX_FILL	0x09		/* level-1 filler: forces a branching depth-1 node */
+#define RKX_SAME	0x07		/* free slot in BP: the same-junction dst */
+#define RKX_NSUB	4		/* S_top's four children */
+#define RKX_NKEYS	10		/* 4 moved + 2 src sibs + 2 dst leaves + 2 fillers */
+#define RKX_KEY(b0, b1, b2, b3, b4)					\
+	(((uint64_t) (b0) << 32) | ((uint64_t) (b1) << 24) |		\
+	 ((uint64_t) (b2) << 16) | ((uint64_t) (b3) << 8) | (uint64_t) (b4))
+
+/* The RKX_NKEYS keys of the layout above, with S_top's run under @top. */
+static void rkx_keys(uint8_t top, uint64_t *k)
+{
+	int i;
+
+	for (i = 0; i < RKX_NSUB; i++)
+		k[i] = RKX_KEY(top, RKX_J, RKX_S, i + 1, 0);
+	k[4] = RKX_KEY(RKX_A, RKX_J, 0x01, 0, 0);
+	k[5] = RKX_KEY(RKX_A, RKX_J, 0x05, 0, 0);
+	k[6] = RKX_KEY(RKX_B, RKX_J, 0x01, 0, 0);
+	k[7] = RKX_KEY(RKX_B, RKX_J, 0x05, 0, 0);
+	k[8] = RKX_KEY(RKX_A, RKX_FILL, 0, 0, 0);
+	k[9] = RKX_KEY(RKX_B, RKX_FILL, 0, 0, 0);
+}
+
+/*
+ * Every key present exactly once, the ordered list strictly ascending and holding
+ * exactly RKX_NKEYS keys, and cds_ft_verify (structure + ordered cells) clean.
+ * @top says which root child the moved run must now hang under.
+ */
+static int rkx_check(struct cds_ft *ft, uint8_t top, const char *what)
+{
+	uint64_t expect[RKX_NKEYS], prev = 0;
+	const struct cds_ft_cell *buf[4];
+	const struct cds_ft_cell *cur;
+	unsigned long seen = 0;
+	size_t n, b;
+	int i, ret = -1;
+
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "rekey-graft cross-junction: verify failed (%s)\n",
+			what);
+		return -1;
+	}
+	rkx_keys(top, expect);
+	rcu_read_lock();
+	if (cds_ft_count_entries(ft) != RKX_NKEYS) {
+		fprintf(stderr, "rekey-graft cross-junction: count %lu != %d (%s)\n",
+			cds_ft_count_entries(ft), RKX_NKEYS, what);
+		goto end;
+	}
+	for (i = 0; i < RKX_NKEYS; i++) {
+		struct cds_ft_node *f = NULL;
+
+		if (lookup_u64(ft, expect[i], &f) != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "rekey-graft cross-junction: key %#lx absent "
+				"(%s)\n", (unsigned long) expect[i], what);
+			goto end;
+		}
+	}
+	cur = NULL;
+	do {
+		if (cds_ft_cell_next_batch(ft, cur, buf, 4, &n, &cur) !=
+				CDS_FT_STATUS_OK) {
+			fprintf(stderr, "rekey-graft cross-junction: scan failed "
+				"(%s)\n", what);
+			goto end;
+		}
+		for (b = 0; b < n; b++) {
+			uint8_t k[5];
+			size_t kl;
+			uint64_t kv;
+
+			if (cds_ft_cell_get_key(ft, buf[b], k, sizeof k, &kl) !=
+					CDS_FT_STATUS_OK) {
+				fprintf(stderr, "rekey-graft cross-junction: get_key "
+					"failed (%s)\n", what);
+				goto end;
+			}
+			kv = cds_ft_key_to_u64(ft, k, 5);
+			if (seen && kv <= prev) {
+				fprintf(stderr, "rekey-graft cross-junction: order "
+					"violation %#lx after %#lx (%s)\n",
+					(unsigned long) kv, (unsigned long) prev, what);
+				goto end;
+			}
+			prev = kv;
+			seen++;
+		}
+	} while (cur);
+	if (seen != RKX_NKEYS) {
+		fprintf(stderr, "rekey-graft cross-junction: scan saw %lu of %d (%s)\n",
+			seen, RKX_NKEYS, what);
+		goto end;
+	}
+	ret = 0;
+end:
+	rcu_read_unlock();
+	return ret;
+}
+
+static int test_rekey_graft_cross_junction(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_fine_lock_ft(5, &group);	/* list ON */
+	uint8_t a_key[3] = { RKX_A, RKX_J, RKX_S };
+	uint8_t b_key[3] = { RKX_B, RKX_J, RKX_S };
+	uint8_t same_key[3] = { RKX_A, RKX_J, RKX_SAME };
+	uint64_t k[RKX_NKEYS];
+	void *before, *after;
+	int i, rc;
+
+	rkx_keys(RKX_A, k);
+	rcu_read_lock();
+	for (i = 0; i < RKX_NKEYS; i++) {
+		if (insert_u64(ft, k[i], node_alloc(k[i])) != CDS_FT_STATUS_OK) {
+			rcu_read_unlock();
+			fprintf(stderr, "rekey-graft cross-junction: insert %d failed\n",
+				i);
+			drain_and_destroy(ft, group);
+			return -1;
+		}
+	}
+	before = _cds_ft_debug_child_at(ft, a_key, 3);
+	rcu_read_unlock();
+	if (!before) {
+		fprintf(stderr, "rekey-graft cross-junction: S_top not at src\n");
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+	if (rkx_check(ft, RKX_A, "before")) {
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+
+	/* A -> B: the junctions' parents are the DISTINCT nodes {A} and {B}. */
+	rc = _cds_ft_debug_rekey_graft_simple(ft, a_key, 3, b_key, 3);
+	if (rc != 0) {
+		fprintf(stderr, "rekey-graft cross-junction: A->B rc=%d\n", rc);
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+	rcu_read_lock();
+	after = _cds_ft_debug_child_at(ft, b_key, 3);
+	rcu_read_unlock();
+	if (!after || after == before) {
+		fprintf(stderr, "rekey-graft cross-junction: S_top address did not "
+			"move (before %p after %p)\n", before, after);
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+	if (rkx_check(ft, RKX_B, "after A->B")) {
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+
+	/* B -> A: the mirror direction, which rebuilds the src side. */
+	rc = _cds_ft_debug_rekey_graft_simple(ft, b_key, 3, a_key, 3);
+	if (rc != 0) {
+		fprintf(stderr, "rekey-graft cross-junction: B->A rc=%d\n", rc);
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+	rcu_read_lock();
+	before = _cds_ft_debug_child_at(ft, a_key, 3);
+	rcu_read_unlock();
+	if (!before || before == after) {
+		fprintf(stderr, "rekey-graft cross-junction: S_top address did not "
+			"move back (was %p now %p)\n", after, before);
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+	if (rkx_check(ft, RKX_A, "after B->A")) {
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+
+	/*
+	 * SAME JUNCTION: {A,1,3} -> the free slot {A,1,7}.  The dst gap is clear of
+	 * the run's own neighbourhood (it sorts above the byte-5 sibling), so the
+	 * cell adjacency guard does NOT fire and the shape reaches the junction
+	 * gate, which must refuse it permanently.
+	 */
+	rc = _cds_ft_debug_rekey_graft_simple(ft, a_key, 3, same_key, 3);
+	if (rc != -EINVAL) {
+		fprintf(stderr, "rekey-graft cross-junction: same-junction shape not "
+			"refused (rc=%d)\n", rc);
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+	if (rkx_check(ft, RKX_A, "after same-junction refusal")) {
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+
+	/* A prefix relationship is refused the same way, and just as cleanly. */
+	{
+		uint8_t inner[4] = { RKX_A, RKX_J, RKX_S, 0x01 };
+
+		rc = _cds_ft_debug_rekey_graft_simple(ft, a_key, 3, inner, 4);
+		if (rc != -EINVAL) {
+			fprintf(stderr, "rekey-graft cross-junction: prefix shape not "
+				"refused (rc=%d)\n", rc);
+			drain_and_destroy(ft, group);
+			return -1;
+		}
+		if (rkx_check(ft, RKX_A, "after prefix refusal")) {
+			drain_and_destroy(ft, group);
+			return -1;
+		}
 	}
 
 	return drain_and_destroy(ft, group);
@@ -27992,6 +28234,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_cow_stop_root_inplace);
 	RUN_TEST(test_rekey_graft_simple);
 	RUN_TEST(test_rekey_graft_liston);
+	RUN_TEST(test_rekey_graft_cross_junction);
 #endif
 #ifdef FEATURE_FT_FAULT_INJECT
 	RUN_TEST(test_rekey_coherence_fault_redescend);

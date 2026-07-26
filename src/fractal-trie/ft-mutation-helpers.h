@@ -103,6 +103,24 @@ struct ft_parent_hint {
 	 * False for every ordinary recompaction (each acquires + releases @parent).
 	 */
 	bool parent_held;
+	/*
+	 * FOLD (coherent rekey one-decide writer, the NON-held shape): @parent is
+	 * NOT held by an earlier step -- this recompaction acquires it itself --
+	 * but the hinted identity must still be VALIDATED, so record the read-set
+	 * guard C.parent == @parent into the acquire commit.  An ordinary hint
+	 * user (the cross-trie graft) deliberately does NOT: its hint exists
+	 * precisely because C's own back-pointer is LAZILY updated and may name a
+	 * superseded parent copy, so guarding against it would abort valid ops.
+	 * The rekey fold is the other way round -- it PARKS the republish SW (a
+	 * plain store into @parent's slot), so a peer that re-homed C between the
+	 * driver's descent and this acquire would have it store into a slot that
+	 * no longer holds C.  Guarding closes exactly that window: the lock and
+	 * the validation linearize together, and once C's parent is held no peer
+	 * can re-home C (that needs @parent's COPYING).  A failure is the
+	 * transient -EAGAIN the driver re-descends on.  Ignored when @parent_held
+	 * is set (that arm guards unconditionally).
+	 */
+	bool parent_guard;
 };
 
 static

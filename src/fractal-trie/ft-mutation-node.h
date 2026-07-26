@@ -1139,7 +1139,16 @@ int ft_node_recompact(enum ft_recompact mode,
 		if (!dret && p_meta && p_held)
 			ft_dlm_guard_parent(acq, metadata, pf_p);
 		if (!dret && p_meta && !p_held) {
-			if (!inh_hint)
+			/*
+			 * No hint: the plan resolved P from C's own back-pointer, so
+			 * the guard validates that racy read.  With a hint the parent
+			 * identity is the caller's, and an ordinary hint user does NOT
+			 * want it validated against C's lazily-updated back-pointer
+			 * (see ft_parent_hint) -- only a caller that asks for it
+			 * (@parent_guard: the rekey fold's non-held src junction, whose
+			 * republish parks SW into @parent's slot) gets the guard.
+			 */
+			if (!inh_hint || inh_hint->parent_guard)
 				ft_dlm_guard_parent(acq, metadata, pf_p);
 			dret = ft_dlm_lock(acq, p_meta, &snap_p);
 			if (!dret && gp_meta) {
@@ -2515,23 +2524,29 @@ int ft_node_replace_ptr(struct cds_ft *ft,
 	ret = _ft_node_replace_ptr(ft, type, node, *parent_node_flag_ptr, metadata, node_flag_ptr, n, newptr, pub);
 	if (ret == -EFBIG) {
 		/*
-		 * FOLD (@held_hint, parent_held set): a same-trie rekey folds this
-		 * delete-recompaction of the src junction with a graft that ALREADY
-		 * COPYING-holds the shared spine parent, so the recompaction reuses
-		 * that held lock (republishing into it SW) instead of re-acquiring it
-		 * (a second ft_dlm_lock would abort -EAGAIN).  The hint carries the
-		 * CALLER's held-node IDENTITY (and the recompacted node's slot in it)
-		 * -- NOT a fresh resolve of this node's current parent, which would be
-		 * a racy read: if a peer re-homed the node since the caller's descent,
-		 * its current parent is NOT the node the caller holds, and the
-		 * recompaction would park an SW store into an UNHELD word.  The
-		 * recompaction's acquire commit validates the identity (its C.parent ==
-		 * @held_hint->parent read-set guard), so a re-home aborts -> re-descend.
+		 * FOLD (@held_hint): a same-trie rekey folds this delete-recompaction
+		 * of the src junction into a commit the folded graft also records
+		 * into.  The hint carries the CALLER's junction-parent IDENTITY (and
+		 * the recompacted node's slot in it) -- NOT a fresh resolve of this
+		 * node's current parent, which would be a racy read: if a peer
+		 * re-homed the node since the caller's descent, its current parent is
+		 * NOT the node the caller planned against, and the recompaction would
+		 * park an SW store into a slot that no longer holds it.  Either way
+		 * the identity is VALIDATED by a C.parent == @held_hint->parent
+		 * read-set guard riding the recompaction's own acquire commit, so a
+		 * re-home aborts -> re-descend.  Two shapes:
+		 *  - @parent_held: the graft already COPYING-holds that parent (the
+		 *    two junctions share it), so this recompaction must REUSE the held
+		 *    lock -- a second ft_dlm_lock would abort -EAGAIN -- and must not
+		 *    record a second release.
+		 *  - @parent_guard: the junctions do NOT share a parent, so this
+		 *    recompaction acquires (and releases) it itself, guarded.
 		 * NULL for every ordinary recompaction (it acquires + releases the
-		 * parent itself).
+		 * parent itself and resolves it from the back-pointer).
 		 */
 		assert(!newptr);
-		assert(!held_hint || held_hint->parent_held);
+		assert(!held_hint || held_hint->parent_held ||
+			held_hint->parent_guard);
 		/* Should try recompaction. */
 		ret = ft_node_recompact(FT_RECOMPACT_DEL, ft, type_index, type, node,
 				metadata, parent_node_flag_ptr, n, NULL,
