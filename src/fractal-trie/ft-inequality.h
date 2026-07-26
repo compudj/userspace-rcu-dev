@@ -1817,6 +1817,54 @@ bool ft_ineq_cell_hop_applies(const struct cds_ft *ft,
 }
 
 /*
+ * Derive the CURRENT position's key from the structure, twice, accepting it only
+ * if both walks agree -- the repetition argument applied to the up-walk.  On
+ * success @out[0 .. *@out_len) holds the key, moved to the front.  @torn
+ * separates "the walks disagreed" (re-derive) from "no key to derive here".
+ */
+static
+bool ft_ineq_upwalk_key_twice(struct cds_ft *ft, struct cds_ft_iter *iter,
+		uint8_t *out, size_t *out_len, bool *torn)
+{
+	size_t max_len = ft->group->max_key_len;
+	uint8_t first_pass[FT_MAX_KEY_LEN];
+	struct ft_ord_cell *cell;
+	size_t n1, n2;
+
+	*torn = false;
+	cell = ft_ord_cell_cursor(iter);
+	if (!cell)
+		return false;
+	n1 = ft_rebuild_key_upwalk(ft, cell, first_pass, max_len);
+	if (!n1)
+		return false;
+	cell = ft_ord_cell_cursor(iter);
+	n2 = ft_rebuild_key_upwalk(ft, cell, out, max_len);
+	if (n1 != n2 || memcmp(first_pass + (max_len - n1),
+			out + (max_len - n2), n1) != 0) {
+		*torn = true;
+		return false;
+	}
+	memmove(out, out + (max_len - n2), n2);
+	*out_len = n2;
+	return true;
+}
+
+/*
+ * CONFIRM the position a traversal just returned, so the next continuation step
+ * has a baseline.  Free and drift-free: an EAGER traversal already wrote the
+ * answer's key into iter_key as it walked it, so the key the answer was FOUND
+ * UNDER is right there -- no up-walk, and therefore no chance of carrying a key
+ * the leaf only acquired after the answer.
+ */
+static
+void ft_ineq_carry_traversed_key(struct cds_ft_iter *iter)
+{
+	iter->pos_key_node = (iter->cache_valid && iter->node) ?
+		iter->node : NULL;
+}
+
+/*
  * PIN the search key of a CONTINUATION (a relational step taken from the
  * iterator's current position rather than from a set_key bound).
  *
@@ -1836,55 +1884,36 @@ bool ft_ineq_cell_hop_applies(const struct cds_ft *ft,
  * Returns false when the two walks disagree: a move is restructuring this
  * position's ancestry, so the caller must re-derive.  Returns true WITHOUT
  * pinning whenever the search key is already a stable value in the buffer (a
- * set_key bound, a LIMIT_FIRST/LAST endpoint) or is never read at all (the
- * tier-1 cell hop) -- pinning would then cost an up-walk and, for the hop, throw
- * away the very fast path the continuation exists for.
+ * set_key bound, a LIMIT_FIRST/LAST endpoint).  A continuation that HAS a
+ * carried key never reaches here (the caller turns it into a descent from that
+ * key); this derives one for a position that does not, which is why it must be
+ * the two-walk form and not a single materialize.
  */
 static
 bool ft_ineq_pin_search_key(struct cds_ft *ft, struct cds_ft_iter *iter,
 		enum ft_lookup_inequality mode, enum ft_lookup_limit limit)
 {
-	size_t max_len = ft->group->max_key_len;
-	uint8_t first_pass[FT_MAX_KEY_LEN];
-	struct ft_ord_cell *cell;
-	size_t n1, n2;
+	size_t n;
+	bool torn;
 
+	(void) mode;
 	if (limit != FT_LOOKUP_LIMIT_NONE || !iter->cache_valid || !iter->node)
 		return true;		/* key is a value in iter_key already */
-	if (ft_ineq_cell_hop_applies(ft, iter, mode, limit))
-		return true;		/* tier-1 hop: no key is read at all */
-	cell = ft_ord_cell_cursor(iter);
-	if (!cell)
-		return true;
-	n1 = ft_rebuild_key_upwalk(ft, cell, first_pass, max_len);
-	if (!n1)
-		return true;		/* ft_iter_read_key's own buffer fallback */
-	cell = ft_ord_cell_cursor(iter);
-	n2 = ft_rebuild_key_upwalk(ft, cell, iter_key(iter), max_len);
-	if (n1 != n2 || memcmp(first_pass + (max_len - n1),
-			iter_key(iter) + (max_len - n2), n1) != 0)
-		return false;		/* torn: the ancestry moved under the walk */
+	if (!ft_ineq_upwalk_key_twice(ft, iter, iter_key(iter), &n, &torn))
+		return !torn;		/* torn -> re-derive; else nothing to pin */
 	/*
 	 * Defensive: on a FIXED-length group the descent validates the search
 	 * length against the group's (ft_key_len), and ft_iter_read_key's own
 	 * fixed-length branch leaves iter->key_len alone -- so a walk that
 	 * accounted for a different number of bytes must not be pinned as the
-	 * length here.  Leave that (already ill-formed) position to the
-	 * pre-existing handling rather than turning it into an argument error.
+	 * length here.
 	 */
 	if (ft->group->key_len != CDS_FT_LEN_VARIABLE &&
-			n2 != ft->group->key_len)
+			n != ft->group->key_len)
 		return true;
-	/*
-	 * The up-walk fills the buffer at the TAIL; the descent reads its search
-	 * key from, and writes its result key into, the SAME buffer, which is
-	 * only safe when the search key starts at offset 0 (see
-	 * ft_iter_materialize_key).
-	 */
-	memmove(iter_key(iter), iter_key(iter) + (max_len - n2), n2);
-	iter->key_off = 0;
-	iter->key_len = n2;
-	iter->path_len = n2 + 1;
+	iter->key_off = 0;		/* the walk moved it to the front */
+	iter->key_len = n;
+	iter->path_len = n + 1;
 	iter->cache_valid = false;	/* pinned: read the buffer, top-descend */
 	return true;
 }
@@ -1911,6 +1940,40 @@ enum cds_ft_status ft_ineq_two_pass(struct cds_ft *ft, struct cds_ft_iter *iter,
 
 	CDS_FT_ASSERT_RCU_READ_LOCKED(ft);
 	ft_ineq_iter_state_save(iter, &in);
+	/*
+	 * AGREED DESIGN (with Mathieu, 2026-07-25): A CONTINUATION DOES NOT HOP
+	 * THE ORDERED-LIST CELLS WHILE A MOVE IS IN FLIGHT -- it re-descends from
+	 * the key the last confirmed step produced.
+	 *
+	 * The move is made detectable by the COW of the moved subtree's TOP, and
+	 * that is ALL the COW that is needed.  But detectability only reaches
+	 * traversals that read the TREE: the cell hop deliberately bypasses it
+	 * (that is its whole point), and the link it reads is one the move rewrites
+	 * IN PLACE on a cell the graft SHARES rather than replaces.  So a walker
+	 * parked on the moved run's last cell hops into the run's new
+	 * neighbourhood and skips every key in between -- and no reader can detect
+	 * that, at any number of passes, because nothing it observed changed
+	 * address.  Re-descending puts the step back on the path where the COW is
+	 * visible, and the two-pass then covers it like any other descent.
+	 *
+	 * REJECTED on the way here (do not re-attempt): COWing the cells instead.
+	 * Boundary-only cell COW does not work -- giving the run's last cell an old
+	 * copy forces its predecessor's link to be rewritten in place, so the
+	 * escape point just moves inward, and induction takes it to the whole run.
+	 * Full-run cell COW would work but makes a move O(n) in the moved subtree's
+	 * keys, which is the property rekey exists to avoid.  Measured: a
+	 * reader-side hop validation does NOT substitute (residual unchanged per
+	 * step, at 2x reader cost).
+	 *
+	 * The hop remains the steady-state path: with no move in flight the gate
+	 * keeps this whole branch unreachable and next/prev stays one dependent
+	 * load.
+	 */
+	if (limit == FT_LOOKUP_LIMIT_NONE && iter->cache_valid && iter->node &&
+			iter->pos_key_node == iter->node) {
+		in.cache_valid = false;		/* carried key = the search key */
+		ft_ineq_iter_state_restore(iter, &in);
+	}
 	for (;;) {
 		if (ft_ineq_pin_search_key(ft, iter, mode, limit)) {
 			ft_ineq_iter_state_save(iter, &pinned);
@@ -1928,8 +1991,10 @@ enum cds_ft_status ft_ineq_two_pass(struct cds_ft *ft, struct cds_ft_iter *iter,
 			 */
 			if (caa_likely(st1 == st2 && node1 == iter->node &&
 					ft_witness_equal(&w1, &w2) &&
-					!ft_rekey_fault_miss()))
+					!ft_rekey_fault_miss())) {
+				ft_ineq_carry_traversed_key(iter);
 				return st2;
+			}
 		}
 		ft_ineq_iter_state_restore(iter, &in);
 	}

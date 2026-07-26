@@ -159,6 +159,25 @@ struct cds_ft_iter {
 	struct ft_ord_cell *ord_cell;
 	struct cds_ft_node *ord_cell_node;
 
+	/*
+	 * CARRIED POSITION KEY (in-trie move coherence).  When @pos_key_node ==
+	 * @node, iter_key() holds -- at offset 0, length @key_len -- the key this
+	 * position had when the last coherent step CONFIRMED it, as that step's
+	 * own traversal spelled it.
+	 *
+	 * A continuation step taken while a move is in flight is defined against
+	 * that KEY and re-descends from it, instead of hopping the ordered-list
+	 * cells: a move rewrites the moved run's outer cell links IN PLACE, so a
+	 * walker parked on one hops into the run's new neighbourhood and skips
+	 * every key in between -- and no reader can detect that, because nothing
+	 * it can observe changed address.  The tree path CAN be detected (the move
+	 * COWs the moved subtree's top), which is what the two-pass rests on.
+	 *
+	 * The node pointer makes the carried key SELF-VALIDATING (usable only
+	 * while it still describes @node), so no other path has to clear it.
+	 */
+	struct cds_ft_node *pos_key_node;
+
 #ifdef URCU_FRACTAL_TRIE_DEBUG_PATH
 	struct urcu_gp_poll_state gp_state;	/* GP snapshot when path was populated. */
 	bool gp_state_valid;			/* Whether gp_state holds a meaningful value. */
