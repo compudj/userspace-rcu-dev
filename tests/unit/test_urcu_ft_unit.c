@@ -55,12 +55,12 @@
 #define NR_TESTS_DLM 0
 #endif
 
-/* 285 unconditional + 46 fault-injection-only RUN_TEST registrations.  (The
+/* 285 unconditional + 47 fault-injection-only RUN_TEST registrations.  (The
  * fault total was one short before test_rekey_coherence_relational_fault: the
  * plan said 327 where 328 tests ran, so the fault build failed its own TAP
  * plan.) */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (331 + NR_TESTS_DLM)
+#define NR_TESTS (332 + NR_TESTS_DLM)
 #else
 #define NR_TESTS (285 + NR_TESTS_DLM)
 #endif
@@ -23060,6 +23060,97 @@ out:
 }
 
 /*
+ * RECOMPACT allocation-failure lock release.  On a FINE-lock trie a node
+ * recompaction acquires the lock SET {C, P, (GP)} up front; two of its bails --
+ * the txn widen and the fresh-node allocation -- used to clear only C, leaving P
+ * (and GP) COPYING for good, so every later operation touching them aborted
+ * forever.  Structure verification cannot see that: the trie is byte-for-byte
+ * intact, it is the LOCKS that leaked.
+ *
+ * So this sweeps the allocation-failure points of an insert that grows (hence
+ * recompacts) a populated node, and after each forced failure asserts the trie is
+ * still MUTABLE -- a further insert must succeed.  That is the assertion a leaked
+ * member lock breaks, and it is why the check is a mutation rather than a verify.
+ */
+static int test_recompact_oom_lock_release(void)
+{
+	int n, rc = 0;
+
+	for (n = 0; n < 12; n++) {
+		struct cds_ft_group *group;
+		struct cds_ft *ft = create_fixed_fine_lock_ft(4, &group);
+		struct ft_test_node *probe;
+		enum cds_ft_status s;
+		unsigned int i;
+		int verified;
+
+		/*
+		 * Two branching levels, so the node the probe grows has a real
+		 * INTERNAL parent for the acquire to lock -- with every key under
+		 * one node the recompaction has no P and the leak cannot show.
+		 */
+		rcu_read_lock();
+		for (i = 0; i < 4 * 24; i++) {
+			uint64_t k = ((uint64_t) (i / 24) << 8) | (i % 24);
+			struct ft_test_node *nd = node_alloc(k);
+
+			if (insert_u64(ft, k, nd) != CDS_FT_STATUS_OK) {
+				rcu_read_unlock();
+				fprintf(stderr, "recompact_oom: build failed\n");
+				node_free(nd);
+				drain_and_destroy(ft, group);
+				return -1;
+			}
+		}
+		rcu_read_unlock();
+
+		/* Fail the (n+1)-th allocation of the growing insert. */
+		probe = node_alloc(0x00fe);
+		cds_ft_fault_alloc_countdown = n;
+		rcu_read_lock();
+		s = insert_u64(ft, 0x00fe, probe);
+		rcu_read_unlock();
+		cds_ft_fault_alloc_countdown = -1;
+		if (s != CDS_FT_STATUS_OK)
+			node_free(probe);
+
+		rcu_read_lock();
+		verified = (cds_ft_verify(ft, stderr) == CDS_FT_STATUS_OK);
+		rcu_read_unlock();
+		if (!verified) {
+			fprintf(stderr,
+				"recompact_oom: verify FAILED after fault n=%d (insert=%s)\n",
+				n, cds_ft_status_to_string(s));
+			return -1;	/* corrupt: draining could livelock */
+		}
+
+		/*
+		 * THE POINT: the trie must still take a mutation.  With a member
+		 * lock leaked by the failed recompaction, this insert can never
+		 * acquire it again.
+		 */
+		{
+			struct ft_test_node *after = node_alloc(0x00ff);
+
+			rcu_read_lock();
+			s = insert_u64(ft, 0x00ff, after);
+			rcu_read_unlock();
+			if (s != CDS_FT_STATUS_OK) {
+				fprintf(stderr,
+					"recompact_oom: trie NOT mutable after fault n=%d: %s "
+					"(a lock leaked by the failed recompaction?)\n",
+					n, cds_ft_status_to_string(s));
+				node_free(after);
+				rc = -1;
+			}
+		}
+		if (drain_and_destroy(ft, group) < 0)
+			rc = -1;
+	}
+	return rc;
+}
+
+/*
  * Drive a compressed-split insert through each of its allocation-failure
  * points while a compressed node is live, and assert the trie stays
  * structurally consistent after every failed split (cds_ft_verify checks
@@ -27905,6 +27996,7 @@ int main(int argc, char **argv)
 #ifdef FEATURE_FT_FAULT_INJECT
 	RUN_TEST(test_rekey_coherence_fault_redescend);
 	RUN_TEST(test_rekey_coherence_relational_fault);
+	RUN_TEST(test_recompact_oom_lock_release);
 	RUN_TEST(test_split_oom_backpointer);
 	RUN_TEST(test_split_oom_key_shorter_arm);
 	RUN_TEST(test_merge_oom);

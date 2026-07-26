@@ -1238,12 +1238,21 @@ int ft_node_recompact(enum ft_recompact mode,
 				!ft_flip_txn_reserve_extra(retire_txn,
 					3 * (ft_meta_nr_child_load(metadata) + 1)
 					+ 1 + (ft->lock_fine ? 2 : 0))) {
+			/* Release the WHOLE lock set, not just C: the up-front
+			 * acquire took P (and GP) into @rel_meta, and this bail is
+			 * before the txn registry takes ownership of them, so they
+			 * are still ours to clear.  Missing this left P/GP COPYING
+			 * for good -- structurally invisible (the trie is
+			 * byte-for-byte intact) and fatal to every later op that
+			 * needs them. */
+			ft_copying_unlock_members(rel_meta, nr_rel);
 			if (fenced)
 				ft_meta_copying_clear(metadata);
 			return -ENOMEM;
 		}
 		new_node = alloc_cds_ft_node(ft, new_type, &new_metadata);
 		if (!new_node) {
+			ft_copying_unlock_members(rel_meta, nr_rel);
 			if (fenced)
 				ft_meta_copying_clear(metadata);
 			return -ENOMEM;
@@ -1327,6 +1336,10 @@ int ft_node_recompact(enum ft_recompact mode,
 						ft_flag_to_metadata(ft, inh_parent),
 						rel_meta, rel_snap, &nr_rel)) {
 				free_cds_ft_node_unpublished(ft, new_node);
+				/* Members locked by EARLIER incremental steps are
+				 * still held when this one fails -- release them
+				 * too, like every other bail below. */
+				ft_copying_unlock_members(rel_meta, nr_rel);
 				ft_meta_copying_clear(metadata);
 				return -EAGAIN;
 			}
