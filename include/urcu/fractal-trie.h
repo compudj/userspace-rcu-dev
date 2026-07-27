@@ -1880,8 +1880,9 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
  *          (cds_ft_make_exclusive), exactly as for cds_ft_merge_at and
  *          cds_ft_graft -- a live concurrent source would need a second
  *          trie's writer lock with no lock order, and is rejected with
- *          CDS_FT_STATUS_BUSY_ERROR.  Only under CDS_FT_WRITER_OPTIMISTIC
- *          are concurrent readers on @src_ft tolerated.
+ *          CDS_FT_STATUS_BUSY_ERROR.  Detach the region first if the source
+ *          must stay live to its readers: cds_ft_detach returns the detached
+ *          trie exclusive, so detach-then-merge is the supported idiom.
  *
  * Moves @src_ft's content under prefix @key into @dst_ft at the
  * same prefix, preserving original key bytes.  @src_ft keys that
@@ -2629,7 +2630,7 @@ enum cds_ft_status cds_ft_group_attr_set_ordered_list(
  * such writers are ever disjoint, so order statistics imply a COARSE writer
  * strategy: a group that enables rank stats is silently coerced to
  * CDS_FT_WRITER_LOCK_COARSE from ANY other strategy (both the lock-free
- * CDS_FT_WRITER_OPTIMISTIC default and CDS_FT_WRITER_LOCK_FINE parallelize
+ * CDS_FT_WRITER_LOCK_FINE parallelizes
  * disjoint writers, of which there are none here, and both would run the
  * root-ward count walk without the FT-wide-lock exclusion it requires).
  *
@@ -2717,24 +2718,23 @@ enum cds_ft_status cds_ft_group_attr_set_optimize(
  * under every strategy; this selects only how concurrent structural WRITERS
  * coordinate.
  *
- * CDS_FT_WRITER_OPTIMISTIC (default): writers coordinate optimistically through
- *   the MCAS engine, escalating to a per-FT FIFO fair mutex only under sustained
- *   contention.  This is the current implementation, slated for deprecation once
- *   the lock strategies below fully replace it.
+ * The optimistic (lock-free MCAS) strategy that used to be the default has been
+ * REMOVED: its per-slot CAS granularity was a poor speed-versus-granularity
+ * trade against the per-node lock-sets below.
+ *
  * CDS_FT_WRITER_LOCK_COARSE: writers serialize under one FT-wide writer lock per
- *   trie (classic RCU single-writer).
+ *   trie (classic RCU single-writer).  This is the single-writer opt-in.
  * CDS_FT_WRITER_LOCK_FINE (the DEFAULT): writers coordinate through
  *   fine-grained per-node lock-sets, so writers on disjoint subtrees proceed in
  *   parallel and only structural collisions serialize -- no FT-wide writer
  *   mutex.  Note this is the mode under which a CROSS-TRIE graft / graft_swap /
  *   merge_at requires an EXCLUSIVE source (see those functions): being the
- *   default, that requirement now applies unless a group opts out.  A trie that
+ *   default, that requirement applies unless a group opts out to COARSE.  A trie that
  *   also maintains order statistics is coerced to CDS_FT_WRITER_LOCK_COARSE
  *   (every count-changing writer updates the shared root, so there are no
  *   disjoint writers for fine locking to parallelize).
  */
 enum cds_ft_writer_strategy {
-	CDS_FT_WRITER_OPTIMISTIC = 0,
 	CDS_FT_WRITER_LOCK_COARSE = 1,
 	CDS_FT_WRITER_LOCK_FINE = 2,
 };

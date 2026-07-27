@@ -1117,7 +1117,7 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 	 * lock-mode -- optimistic groups have lock_mode == false and never take
 	 * FT-wide locks for a cross-trie graft.
 	 */
-	if (src_ft != dst_ft && src_ft->lock_mode && !src_ft->exclusive)
+	if (src_ft != dst_ft && !src_ft->exclusive)
 		return CDS_FT_STATUS_BUSY_ERROR;
 
 	ft_crosstrie_lock_mode_guard(dst_ft, src_ft);
@@ -2340,7 +2340,7 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 	 * outside lock-mode.  (On success @swap_ft inherits @dst_ft's access
 	 * discipline -- see the header -- so it may end up concurrent again.)
 	 */
-	if (swap_ft->lock_mode && !swap_ft->exclusive) {
+	if (!swap_ft->exclusive) {
 		FT_TP(graft_swap_exit, (int) CDS_FT_STATUS_BUSY_ERROR);
 		return CDS_FT_STATUS_BUSY_ERROR;
 	}

@@ -2358,7 +2358,7 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 	 * SAME-trie rekey (src == dst) is excluded -- it takes one lock reentrantly.
 	 * Inert outside lock-mode.
 	 */
-	if (src_ft != dst_ft && src_ft->lock_mode && !src_ft->exclusive) {
+	if (src_ft != dst_ft && !src_ft->exclusive) {
 		FT_TP(merge_exit, (int) CDS_FT_STATUS_BUSY_ERROR);
 		return CDS_FT_STATUS_BUSY_ERROR;
 	}

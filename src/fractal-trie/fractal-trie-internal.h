@@ -1269,9 +1269,8 @@ struct cds_ft_group {
 	 * Structural-writer concurrency strategy for the group's tries (MW
 	 * lock-escalation model).  Copied to each trie at create; a locking
 	 * strategy (COARSE or FINE) makes the trie take the FT-wide writer lock
-	 * at every mutation.  Default CDS_FT_WRITER_LOCK_FINE (DLM) -- resolved
-	 * at group create from @writer_strategy_set, since calloc-zero is the
-	 * OPTIMISTIC enumerator and no longer the default.
+	 * at every mutation.  Default CDS_FT_WRITER_LOCK_FINE (DLM), resolved at
+	 * group create from @writer_strategy_set.
 	 */
 	enum cds_ft_writer_strategy writer_strategy;
 	/* Allocation arenas. */
@@ -1636,15 +1635,8 @@ struct cds_ft {
 	 */
 	struct cds_fair_mutex writer_lock;
 	/*
-	 * Hot-path gate: writer_strategy != CDS_FT_WRITER_OPTIMISTIC (a COARSE
-	 * or FINE locking strategy).  Copied from the group at create so the
-	 * writer-scope hook branches on one trie field.  false (calloc-zero) =
-	 * optimistic = the hook is a no-op.
-	 */
-	bool lock_mode;
-	/*
 	 * Hot-path gate: writer_strategy == CDS_FT_WRITER_LOCK_FINE.  The
-	 * fine-grained (per-node lock-set) conversions read THIS, not @lock_mode:
+	 * fine-grained (per-node lock-set) conversions read THIS:
 	 * COARSE deliberately derives no lock-set (§10.5 -- one FT-wide lock, no
 	 * per-node locks), so a per-node acquire there would be pure cost.
 	 *
@@ -1753,15 +1745,14 @@ static __thread struct cds_ft *ft_wlock_held;
 static __thread unsigned long ft_wlock_depth;
 
 /*
- * Take the FT-wide writer lock at the OUTERMOST writer scope of a lock-mode
- * trie; reentrant no-op on a nested scope for the same trie.  No-op on an
- * optimistic trie (the common path -- one predictable branch).
+ * Take the FT-wide writer lock at the OUTERMOST writer scope; reentrant no-op
+ * on a nested scope for the same trie.  Every trie is lock-mode now (COARSE or
+ * FINE), so there is no optimistic early-out; a FINE trie skips the FT-wide
+ * lock further down, under the lock-set drop.
  */
 static inline
 void ft_writer_lock_scope_enter(struct cds_ft *ft)
 {
-	if (caa_likely(!ft->lock_mode))
-		return;
 	if (ft_wlock_held == ft) {
 		ft_wlock_depth++;		/* reentry on the trie we hold */
 		return;
@@ -1829,8 +1820,6 @@ void ft_writer_lock_scope_enter(struct cds_ft *ft)
 static inline
 void ft_writer_lock_scope_exit(struct cds_ft *ft)
 {
-	if (caa_likely(!ft->lock_mode))
-		return;
 	/*
 	 * Unwind only the lock THIS thread actually holds for @ft.  When the
 	 * enter SKIPPED the lock (an exclusive trie) or we hold a DIFFERENT
@@ -2222,9 +2211,7 @@ void ft_excl_reader_scope_exit(struct ft_excl_reader_scope *scope)
 static inline
 void ft_crosstrie_lock_mode_guard(const struct cds_ft *a, const struct cds_ft *b)
 {
-	if (caa_unlikely(a != b
-			&& (a->lock_mode && !a->exclusive)
-			&& (b->lock_mode && !b->exclusive))) {
+	if (caa_unlikely(a != b && !a->exclusive && !b->exclusive)) {
 		fprintf(stderr,
 			"cds_ft: both-live cross-trie op on lock-mode tries reached "
 			"the fused body (cds_ft=%p / %p); the source must be "
@@ -2752,15 +2739,16 @@ struct cds_ft_group_attr {
 	bool rank_stats_set;
 	/*
 	 * Distinguishes "the caller never chose a strategy" from "the caller
-	 * explicitly chose CDS_FT_WRITER_OPTIMISTIC", which calloc-zero alone
-	 * cannot: unset now resolves to the DLM default, not to the enum's 0.
+	 * explicitly chose a strategy", which calloc-zero alone cannot: unset
+	 * resolves to the DLM default.
 	 */
 	bool writer_strategy_set;
 	enum cds_ft_numa_policy numa_policy;	/* See cds_ft_group_attr_set_numa_policy. */
 	enum cds_ft_optimize optimize;		/* See cds_ft_group_attr_set_optimize. */
 	/*
 	 * Structural-writer concurrency strategy (MW lock-escalation model).
-	 * Default CDS_FT_WRITER_OPTIMISTIC (calloc-zero).  See
+	 * Meaningful only when @writer_strategy_set; otherwise the group takes
+	 * the CDS_FT_WRITER_LOCK_FINE default.  See
 	 * cds_ft_group_attr_set_writer_strategy.
 	 */
 	enum cds_ft_writer_strategy writer_strategy;
