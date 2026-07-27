@@ -3263,6 +3263,30 @@ void ft_dbg_splice_pos_check(struct cds_ft *dst, const uint8_t *key,
  * (find_rel remaps).  Since the attach point is empty, @pred = last @dst key <
  * @key and @succ = first @dst key > @key (nothing of @dst's lies in the run's
  * range in between).
+ *
+ * ★ BOTH ENDPOINTS ARE DERIVED BY KEY ORDER.  @succ used to be READ OFF
+ * @pred->next, which made the pair adjacent BY CONSTRUCTION and every downstream
+ * expected-old CAS vacuous: {pred->next expect succ} cannot fail when @succ was
+ * defined as @pred->next.  The window that opens is not the commit's -- it is
+ * between the DESCENT that produced @pred (T0) and the @pred->next read (T1): a
+ * peer graft committing a run into that gap is READ BACK as our successor, so we
+ * splice ahead of a run that belongs before us and the list goes out of order.
+ * (Measured: FT_DEBUG_SPLICE_POS_BRACKET, 8/8 firings had @pred correct, @succ a
+ * peer run's FIRST cell.  The CAS covers [T1, commit]; the tear is in [T0, T1].)
+ *
+ * Deriving @succ INDEPENDENTLY (its own GT descent) makes the recorded
+ * {pred->next expect succ} a REAL check: it now asserts that the interval
+ * between two separately key-ordered endpoints is EMPTY, so a peer that
+ * interposed anywhere in that interval fails the value CAS and the caller's
+ * retry re-derives.  ADJACENT + BRACKETING, which adjacency alone never was.
+ *
+ * This is the order-pinned discipline the POINT insert already runs
+ * (ft_txn_list_insert_between_prepare: "refuses unless @pos->next still equals
+ * @succ_expected ... so a later interposition fails the commit's value CAS
+ * instead of being adopted"), whose own comment records that splicing anyway
+ * "produced the resurrected / out-of-order cell class the ord-verify catches at
+ * rest".  The BULK run splice simply never got it.  Costs one extra relational
+ * descent per bulk splice, on a path that already descends and allocates.
  */
 static
 void ft_ord_cell_find_splice_pos(struct cds_ft *dst, const uint8_t *key,
@@ -3306,16 +3330,18 @@ void ft_ord_cell_find_splice_pos(struct cds_ft *dst, const uint8_t *key,
 		memset(pad + key_len, pad_min, flen - key_len);
 		pred = ft_ord_cell_find_rel(dst, pad, flen, FT_LOOKUP_LT, wit,
 				ph);
-		if (pred) {
-			succ = ft_ord_cell_resolve_ord(&pred->lnode.next);
-			if (wit) {
-				ft_witness_visit(wit, pred);
-				ft_witness_visit(wit, succ);
-			}
-		} else {
-			memset(pad + key_len, pad_max, flen - key_len);
-			succ = ft_ord_cell_find_rel(dst, pad, flen,
-					FT_LOOKUP_GT, wit, sh);
+		/*
+		 * @succ from its OWN GT descent over the max-padded probe -- never
+		 * off @pred->next (see the header).  LT(key . min..min) is the last
+		 * @dst key below the prefix range; GT(key . max..max) is the first
+		 * above it.
+		 */
+		memset(pad + key_len, pad_max, flen - key_len);
+		succ = ft_ord_cell_find_rel(dst, pad, flen, FT_LOOKUP_GT, wit,
+				sh);
+		if (wit) {
+			ft_witness_visit(wit, pred);
+			ft_witness_visit(wit, succ);
 		}
 		*pred_out = pred;
 		*succ_out = succ;
@@ -3333,15 +3359,12 @@ void ft_ord_cell_find_splice_pos(struct cds_ft *dst, const uint8_t *key,
 	}
 
 	pred = ft_ord_cell_find_rel(dst, key, key_len, FT_LOOKUP_LT, wit, ph);
-	if (pred) {
-		succ = ft_ord_cell_resolve_ord(&pred->lnode.next);
-		if (wit) {
-			ft_witness_visit(wit, pred);
-			ft_witness_visit(wit, succ);
-		}
-	} else
-		succ = ft_ord_cell_find_rel(dst, key, key_len, FT_LOOKUP_GT,
-				wit, sh);
+	/* @succ from its OWN GT descent -- never off @pred->next (see header). */
+	succ = ft_ord_cell_find_rel(dst, key, key_len, FT_LOOKUP_GT, wit, sh);
+	if (wit) {
+		ft_witness_visit(wit, pred);
+		ft_witness_visit(wit, succ);
+	}
 	*pred_out = pred;
 	*succ_out = succ;
 #ifdef FT_DEBUG_SPLICE_POS_BRACKET
