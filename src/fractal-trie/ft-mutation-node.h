@@ -120,8 +120,7 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 				qp_ptr_idx = (unsigned int) __builtin_popcountll(
 						qp_bms & ((1ULL << qp_p) - 1ULL));
 				if (qp_pointers[qp_ptr_idx]) {
-					if (_replace_old_ptr)
-/*
+					/*
 					 * CONTRACT (audited 2026-07-27): a
 					 * REPLACE at an already-occupied slot
 					 * stores straight into the LIVE pointer
@@ -145,6 +144,7 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 					 * recompact-on-insert exists to remove.
 					 */
 					assert(defer_parent);
+					if (_replace_old_ptr)
 						*_replace_old_ptr = true;
 				} else {
 #ifndef FEATURE_FT_INSERT_IN_PLACE
@@ -268,8 +268,7 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 				qp_ptr_idx = (unsigned int) __builtin_popcountll(
 						qp_bms & ((1ULL << qp_p) - 1ULL));
 				if (qp_pointers[qp_ptr_idx]) {
-					if (_replace_old_ptr)
-/*
+					/*
 					 * CONTRACT (audited 2026-07-27): a
 					 * REPLACE at an already-occupied slot
 					 * stores straight into the LIVE pointer
@@ -293,6 +292,7 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 					 * recompact-on-insert exists to remove.
 					 */
 					assert(defer_parent);
+					if (_replace_old_ptr)
 						*_replace_old_ptr = true;
 				} else {
 #ifndef FEATURE_FT_INSERT_IN_PLACE
@@ -433,8 +433,7 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 						& ((1U << qp_lo) - 1U));
 				qp_ptr_idx = (unsigned int) subs_below;
 				if (qp_pointers[qp_ptr_idx]) {
-					if (_replace_old_ptr)
-/*
+					/*
 					 * CONTRACT (audited 2026-07-27): a
 					 * REPLACE at an already-occupied slot
 					 * stores straight into the LIVE pointer
@@ -458,6 +457,7 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 					 * recompact-on-insert exists to remove.
 					 */
 					assert(defer_parent);
+					if (_replace_old_ptr)
 						*_replace_old_ptr = true;
 				} else {
 #ifndef FEATURE_FT_INSERT_IN_PLACE
@@ -578,12 +578,12 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 			ptr_idx += (unsigned int) __builtin_popcountll(
 					word & (bit - 1ULL));
 			if (bp_pointers[ptr_idx]) {
+				/* Same checked contract as the other Case-1 arms: an
+				 * occupied-slot replace stores into the LIVE pointer array
+				 * with no lock and no txn, so it is sound only on a
+				 * build-invisible node.  See the long note above. */
+				assert(defer_parent);
 				if (_replace_old_ptr)
-					/* Same checked contract as the other Case-1 arms: an
-					 * occupied-slot replace stores into the LIVE pointer array
-					 * with no lock and no txn, so it is sound only on a
-					 * build-invisible node.  See the long note above. */
-					assert(defer_parent);
 					*_replace_old_ptr = true;
 			} else {
 #ifndef FEATURE_FT_INSERT_IN_PLACE
