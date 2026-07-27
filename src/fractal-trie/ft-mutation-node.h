@@ -121,6 +121,30 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 						qp_bms & ((1ULL << qp_p) - 1ULL));
 				if (qp_pointers[qp_ptr_idx]) {
 					if (_replace_old_ptr)
+/*
+					 * CONTRACT (audited 2026-07-27): a
+					 * REPLACE at an already-occupied slot
+					 * stores straight into the LIVE pointer
+					 * array -- no COPYING lock, no txn
+					 * record.  That is sound only on a
+					 * build-invisible node, which is the
+					 * only way this arm is reachable today:
+					 * every internal caller is
+					 * ft_node_recompact building @new_node
+					 * (@defer_parent true), and every
+					 * external caller passes a NULL child
+					 * for an UNOCCUPIED slot -- insert
+					 * guards it with `if (!old_node_flag)`
+					 * precisely because a NULL store here
+					 * would drop a live external before the
+					 * commit.  Assert it so the convention
+					 * is a checked contract: a future caller
+					 * reaching this arm on a reachable node
+					 * would get an untransacted live-node
+					 * store, the exact class
+					 * recompact-on-insert exists to remove.
+					 */
+					assert(defer_parent);
 						*_replace_old_ptr = true;
 				} else {
 #ifndef FEATURE_FT_INSERT_IN_PLACE
@@ -245,6 +269,30 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 						qp_bms & ((1ULL << qp_p) - 1ULL));
 				if (qp_pointers[qp_ptr_idx]) {
 					if (_replace_old_ptr)
+/*
+					 * CONTRACT (audited 2026-07-27): a
+					 * REPLACE at an already-occupied slot
+					 * stores straight into the LIVE pointer
+					 * array -- no COPYING lock, no txn
+					 * record.  That is sound only on a
+					 * build-invisible node, which is the
+					 * only way this arm is reachable today:
+					 * every internal caller is
+					 * ft_node_recompact building @new_node
+					 * (@defer_parent true), and every
+					 * external caller passes a NULL child
+					 * for an UNOCCUPIED slot -- insert
+					 * guards it with `if (!old_node_flag)`
+					 * precisely because a NULL store here
+					 * would drop a live external before the
+					 * commit.  Assert it so the convention
+					 * is a checked contract: a future caller
+					 * reaching this arm on a reachable node
+					 * would get an untransacted live-node
+					 * store, the exact class
+					 * recompact-on-insert exists to remove.
+					 */
+					assert(defer_parent);
 						*_replace_old_ptr = true;
 				} else {
 #ifndef FEATURE_FT_INSERT_IN_PLACE
@@ -386,6 +434,30 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 				qp_ptr_idx = (unsigned int) subs_below;
 				if (qp_pointers[qp_ptr_idx]) {
 					if (_replace_old_ptr)
+/*
+					 * CONTRACT (audited 2026-07-27): a
+					 * REPLACE at an already-occupied slot
+					 * stores straight into the LIVE pointer
+					 * array -- no COPYING lock, no txn
+					 * record.  That is sound only on a
+					 * build-invisible node, which is the
+					 * only way this arm is reachable today:
+					 * every internal caller is
+					 * ft_node_recompact building @new_node
+					 * (@defer_parent true), and every
+					 * external caller passes a NULL child
+					 * for an UNOCCUPIED slot -- insert
+					 * guards it with `if (!old_node_flag)`
+					 * precisely because a NULL store here
+					 * would drop a live external before the
+					 * commit.  Assert it so the convention
+					 * is a checked contract: a future caller
+					 * reaching this arm on a reachable node
+					 * would get an untransacted live-node
+					 * store, the exact class
+					 * recompact-on-insert exists to remove.
+					 */
+					assert(defer_parent);
 						*_replace_old_ptr = true;
 				} else {
 #ifndef FEATURE_FT_INSERT_IN_PLACE
@@ -507,6 +579,11 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 					word & (bit - 1ULL));
 			if (bp_pointers[ptr_idx]) {
 				if (_replace_old_ptr)
+					/* Same checked contract as the other Case-1 arms: an
+					 * occupied-slot replace stores into the LIVE pointer array
+					 * with no lock and no txn, so it is sound only on a
+					 * build-invisible node.  See the long note above. */
+					assert(defer_parent);
 					*_replace_old_ptr = true;
 			} else {
 #ifndef FEATURE_FT_INSERT_IN_PLACE
