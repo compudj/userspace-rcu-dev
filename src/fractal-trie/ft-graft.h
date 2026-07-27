@@ -400,6 +400,15 @@ struct ft_graft_store_state {
 	 * ATOMICALLY in glue->txn.
 	 */
 	struct ft_pub_rec reserve_rec;
+	/*
+	 * Set iff the reserve added its byte's occupancy IN PLACE on the LIVE
+	 * @dest, i.e. this graft still owes @dest an nr_child++ -- recorded into
+	 * glue->txn by the commit's in-place arm so the count goes live with the
+	 * publish and is dropped with an aborted attempt.  A reserve that
+	 * RELOCATED built the count into its fresh copy and leaves this false.
+	 * See ft_flip_txn_record_nr_child_inc.
+	 */
+	bool count_deferred;
 	struct cds_ft_metadata *publish_pmeta;
 	struct cds_ft_inode_flag **pnfp;
 	struct cds_ft_inode_flag *slot_value;
@@ -495,7 +504,8 @@ enum cds_ft_status ft_store_at_graft_point_prepare(struct cds_ft *ft,
 			 * in it (d->ppnfp). */
 			&(const struct ft_parent_hint){
 				.parent = d->ppnf, .slot = d->pnfp,
-				.gp = d->pppnf, .gp_slot = d->ppnfp });
+				.gp = d->pppnf, .gp_slot = d->ppnfp },
+			&st->count_deferred);
 		/*
 		 * -EAGAIN is a TRANSIENT peer conflict (the reserve found its
 		 * byte filled under it), not an allocation failure: report it
@@ -588,7 +598,8 @@ enum cds_ft_status ft_store_at_graft_point_prepare(struct cds_ft *ft,
 					.parent = d->ppnf,
 					.slot = d->pnfp,
 					.gp = d->pppnf,
-					.gp_slot = d->ppnfp });
+					.gp_slot = d->ppnfp },
+				&st->count_deferred);
 			/* Transient peer conflict, not OOM: see the
 			 * depth == key_len arm above. */
 			if (ret)
@@ -763,6 +774,21 @@ enum urcu_txn_status ft_store_at_graft_point_commit(struct cds_ft *ft,
 				ft_resolve_parent_slot(dest_meta, ft, &pub_parent);
 
 			ft_publish_to_parent(ft, pub_parent, pub_slot, st->dest);
+			/*
+			 * The in-place reserve owes @st->dest its nr_child++:
+			 * record it as an edge in glue->txn so the count goes
+			 * live with the slot edge below and is discarded with an
+			 * aborted attempt -- reserve-then-ABORT must be
+			 * idempotent, or a re-descend reserves the byte a second
+			 * time and double-counts it (see
+			 * ft_flip_txn_record_nr_child_inc).  Reservation is
+			 * net-zero: this arm records no §4.B parent guard (only
+			 * the relocation arm above does), so it consumes that
+			 * arm's already-reserved guard record.
+			 */
+			if (st->count_deferred)
+				ft_flip_txn_record_nr_child_inc(st->glue->txn,
+					dest_meta);
 			/*
 			 * Order-statistics fold (BULK): @st->dest (== d->pnf, a
 			 * stable existing node) gains +count_delta; walk from it up.

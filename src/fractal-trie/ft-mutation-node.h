@@ -51,6 +51,34 @@
  *
  *   - otherwise: -ERANGE, forcing the caller to recompact.
  */
+/*
+ * Apply the nr_child++ that an OCCUPANCY-ADDING set_nth owes, either in place or
+ * by handing it to the caller's commit.
+ *
+ * @deferred_count NULL (every build-path caller): increment in place.  On a
+ * build-invisible node that is correct by construction -- the count is part of
+ * the node's initial image and publishes wholesale with it.
+ *
+ * @deferred_count non-NULL: the caller opted in to PUBLISHING the increment
+ * itself, as an edge in the same commit as the structural publish
+ * (ft_flip_txn_record_nr_child_inc, which carries the full rationale).  Only a
+ * LIVE-node store needs that -- a build-invisible one (@defer_parent) is rolled
+ * back wholesale with its fresh node -- so the deferral is keyed on the node
+ * being live, and the flag reports back that the caller now owes the edge.
+ * Never cleared here: the caller inits it false, and an -ERANGE/-ENOSPC retry
+ * through ft_node_recompact builds its count on the FRESH copy, leaving it false.
+ */
+static inline
+void ft_node_count_add(struct cds_ft_metadata *metadata, bool defer_parent,
+		bool *deferred_count)
+{
+	if (deferred_count && !defer_parent) {
+		*deferred_count = true;
+		return;
+	}
+	ft_meta_nr_child_inc(metadata);
+}
+
 static
 int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 		struct cds_ft_inode *node,
@@ -60,7 +88,8 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 		struct cds_ft_inode_flag *child_node_flag,
 		bool *_replace_old_ptr,
 		bool is_init,
-		bool defer_parent)
+		bool defer_parent,
+		bool *deferred_count)
 {
 	assert(ft_type_is_popcount(type->type_class));
 
@@ -184,7 +213,8 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 #endif
 					if (_replace_old_ptr)
 						*_replace_old_ptr = false;
-					ft_meta_nr_child_inc(metadata);
+					ft_node_count_add(metadata, defer_parent,
+							deferred_count);
 				}
 				rcu_assign_pointer(qp_pointers[qp_ptr_idx],
 						child_node_flag);
@@ -216,7 +246,8 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 			uatomic_store((uint64_t *) &node->data[4],
 				qp_bms | (((uint64_t)(1U << qp_lo)) << (qp_slot1 * 8)),
 				CMM_RELAXED);
-			ft_meta_nr_child_inc(metadata);
+			ft_node_count_add(metadata, defer_parent,
+					deferred_count);
 			if (_replace_old_ptr)
 				*_replace_old_ptr = false;
 			return 0;
@@ -242,7 +273,8 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 		rcu_assign_pointer(qp_pointers[qp_ptr_idx], child_node_flag);
 		uatomic_store((uint32_t *) &node->data[0],
 			qp_root | (1U << qp_hi), CMM_RELAXED);
-		ft_meta_nr_child_inc(metadata);
+		ft_node_count_add(metadata, defer_parent,
+				deferred_count);
 		if (_replace_old_ptr)
 			*_replace_old_ptr = false;
 		return 0;
@@ -353,7 +385,8 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 #endif
 					if (_replace_old_ptr)
 						*_replace_old_ptr = false;
-					ft_meta_nr_child_inc(metadata);
+					ft_node_count_add(metadata, defer_parent,
+							deferred_count);
 				}
 				rcu_assign_pointer(qp_pointers[qp_ptr_idx],
 						child_node_flag);
@@ -385,7 +418,8 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 			uatomic_store((uint64_t *) &node->data[8],
 				qp_bms | (((uint64_t)(1U << qp_lo)) << (qp_slot1 * 4)),
 				CMM_RELAXED);
-			ft_meta_nr_child_inc(metadata);
+			ft_node_count_add(metadata, defer_parent,
+					deferred_count);
 			if (_replace_old_ptr)
 				*_replace_old_ptr = false;
 			return 0;
@@ -412,7 +446,8 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 		rcu_assign_pointer(qp_pointers[qp_ptr_idx], child_node_flag);
 		uatomic_store((uint64_t *) &node->data[0],
 			qp_root | (1ULL << qp_hi), CMM_RELAXED);
-		ft_meta_nr_child_inc(metadata);
+		ft_node_count_add(metadata, defer_parent,
+				deferred_count);
 		if (_replace_old_ptr)
 			*_replace_old_ptr = false;
 		return 0;
@@ -539,7 +574,8 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 #endif
 					if (_replace_old_ptr)
 						*_replace_old_ptr = false;
-					ft_meta_nr_child_inc(metadata);
+					ft_node_count_add(metadata, defer_parent,
+							deferred_count);
 				}
 				rcu_assign_pointer(qp_pointers[qp_ptr_idx],
 						child_node_flag);
@@ -570,7 +606,8 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 					qp_max_lc, qp_slot1),
 					(uint16_t) (qp_sub | (1U << qp_lo)),
 					CMM_RELAXED);
-			ft_meta_nr_child_inc(metadata);
+			ft_node_count_add(metadata, defer_parent,
+					deferred_count);
 			if (_replace_old_ptr)
 				*_replace_old_ptr = false;
 			return 0;
@@ -598,7 +635,8 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 		uatomic_store(ft_popcount_2l_root_bm_addr(node, qp_max_lc),
 				(uint16_t) (qp_root | (1U << qp_hi)),
 				CMM_RELAXED);
-		ft_meta_nr_child_inc(metadata);
+		ft_node_count_add(metadata, defer_parent,
+				deferred_count);
 		if (_replace_old_ptr)
 			*_replace_old_ptr = false;
 		return 0;
@@ -673,7 +711,8 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 #endif
 				if (_replace_old_ptr)
 					*_replace_old_ptr = false;
-				ft_meta_nr_child_inc(metadata);
+				ft_node_count_add(metadata, defer_parent,
+						deferred_count);
 			}
 			rcu_assign_pointer(bp_pointers[ptr_idx], child_node_flag);
 			return 0;
@@ -720,7 +759,8 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 		 */
 		rcu_assign_pointer(bp_pointers[ptr_idx], child_node_flag);
 		uatomic_store(&bm[word_idx], word | bit, CMM_RELAXED);
-		ft_meta_nr_child_inc(metadata);
+		ft_node_count_add(metadata, defer_parent,
+				deferred_count);
 		if (_replace_old_ptr)
 			*_replace_old_ptr = false;
 		return 0;
@@ -734,7 +774,8 @@ int ft_pigeon_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 		struct cds_ft_metadata *metadata,
 		uint8_t n,
 		struct cds_ft_inode_flag *child_node_flag,
-		bool defer_parent)
+		bool defer_parent,
+		bool *deferred_count)
 {
 	struct cds_ft_inode_flag **ptr;
 	bool replace_old_ptr = false;
@@ -778,7 +819,8 @@ int ft_pigeon_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 
 		/* Set n in bitmap. */
 		cds_set_bit_relaxed(bitmap->bitmap, n);
-		ft_meta_nr_child_inc(metadata);
+		ft_node_count_add(metadata, defer_parent,
+				deferred_count);
 	}
 	return 0;
 }
@@ -813,16 +855,17 @@ int _ft_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 		uint8_t n,
 		struct cds_ft_inode_flag *child_node_flag,
 		bool is_init,
-		bool defer_parent)
+		bool defer_parent,
+		bool *deferred_count)
 {
 	int ret;
 
 	switch (type->type_class) {
 	case FT_POPCOUNT:
-		ret = ft_popcount_node_set_nth(ft, type, node, node_flag, metadata, n, child_node_flag, NULL, is_init, defer_parent);
+		ret = ft_popcount_node_set_nth(ft, type, node, node_flag, metadata, n, child_node_flag, NULL, is_init, defer_parent, deferred_count);
 		break;
 	case FT_PIGEON:
-		ret = ft_pigeon_node_set_nth(ft, type, node, node_flag, metadata, n, child_node_flag, defer_parent);
+		ret = ft_pigeon_node_set_nth(ft, type, node, node_flag, metadata, n, child_node_flag, defer_parent, deferred_count);
 		break;
 	case FT_NULL:
 		return -ENOSPC;
@@ -1709,7 +1752,7 @@ int ft_node_recompact(enum ft_recompact mode,
 			else
 			ret = _ft_node_set_nth(ft, new_type, new_node, new_node_flag,
 					new_metadata, v, iter,
-					RECOMPACT_IS_INIT(v), true);
+					RECOMPACT_IS_INIT(v), true, NULL);
 			assert(!ret);
 		}
 		break;
@@ -1792,7 +1835,7 @@ int ft_node_recompact(enum ft_recompact mode,
 			else
 			ret = _ft_node_set_nth(ft, new_type, new_node, new_node_flag,
 					new_metadata, i, iter,
-					RECOMPACT_IS_INIT((uint8_t)i), true);
+					RECOMPACT_IS_INIT((uint8_t)i), true, NULL);
 			assert(!ret);
 		}
 		break;
@@ -1824,7 +1867,7 @@ skip_copy:
 		else
 		ret = _ft_node_set_nth(ft, new_type, new_node, new_node_flag,
 				new_metadata, n, child_node_flag,
-				RECOMPACT_IS_INIT(n), true);
+				RECOMPACT_IS_INIT(n), true, NULL);
 		assert(!ret);
 	}
 
@@ -2401,7 +2444,8 @@ int ft_rekey_cow_stop(struct cds_ft *ft, struct ft_flip_txn *txn,
 						new_meta, v, iter, COW_IS_INIT(v));
 			else
 				ret = _ft_node_set_nth(ft, type, new_node, new_flag,
-						new_meta, v, iter, COW_IS_INIT(v), true);
+						new_meta, v, iter, COW_IS_INIT(v),
+						true, NULL);
 			assert(!ret);
 		}
 	} else {	/* FT_PIGEON */
@@ -2433,7 +2477,7 @@ int ft_rekey_cow_stop(struct cds_ft *ft, struct ft_flip_txn *txn,
 			else
 				ret = _ft_node_set_nth(ft, type, new_node, new_flag,
 						new_meta, i, iter,
-						COW_IS_INIT((uint8_t) i), true);
+						COW_IS_INIT((uint8_t) i), true, NULL);
 			assert(!ret);
 		}
 	}
@@ -2541,7 +2585,8 @@ int ft_node_set_nth_rec(struct cds_ft *ft,
 		bool cluster_leaf,
 		struct ft_pub_rec *rec,
 		struct ft_flip_txn *retire_txn,
-		const struct ft_parent_hint *inh_hint)
+		const struct ft_parent_hint *inh_hint,
+		bool *deferred_count)
 {
 	int ret;
 	unsigned int type_index;
@@ -2561,7 +2606,7 @@ int ft_node_set_nth_rec(struct cds_ft *ft,
 	 * ft_node_recompact, which uses is_init internally.
 	 */
 	ret = _ft_node_set_nth(ft, type, node, *node_flag, metadata, n,
-			child_node_flag, false, cluster_leaf);
+			child_node_flag, false, cluster_leaf, deferred_count);
 	switch (ret) {
 	case 0:
 	{
@@ -2639,7 +2684,7 @@ int ft_node_set_nth(struct cds_ft *ft,
 {
 	return ft_node_set_nth_rec(ft, node_flag, n, child_node_flag,
 			old_node_ret, metadata, node_depth, cluster_leaf, NULL,
-			NULL, NULL);
+			NULL, NULL, NULL);
 }
 
 /*

@@ -1701,6 +1701,14 @@ int ft_attach_node(struct cds_ft *ft,
 		assert(ic && ic->txn);
 		{
 			struct cds_ft_inode_flag **slot_ptr = NULL;
+			/*
+			 * Set by the reserve below iff it added the byte's
+			 * occupancy IN PLACE on the LIVE attach node, i.e. this
+			 * op still owes that node an nr_child++.  A reserve that
+			 * RELOCATED (recompact) built the count into its fresh
+			 * copy instead and leaves this false.
+			 */
+			bool count_deferred = false;
 
 			/*
 			 * One-commit insert (reserved-byte model): occupy
@@ -1713,11 +1721,16 @@ int ft_attach_node(struct cds_ft *ft,
 			 * value (NULL for a new byte, or the displaced external).
 			 *
 			 *  - new byte (old_node_flag == NULL): RESERVE it via a
-			 *    set_nth with a NULL child -- sets the bitmap bit and
-			 *    bumps nr_child, leaving a bit-set+NULL slot that
-			 *    reads as not-present, and may recompact + relocate
-			 *    the node (the reserved byte rides along; the edge is
-			 *    recorded against the FINAL slot below).
+			 *    set_nth with a NULL child -- sets the bitmap bit,
+			 *    leaving a bit-set+NULL slot that reads as
+			 *    not-present, and may recompact + relocate the node
+			 *    (the reserved byte rides along; the edge is
+			 *    recorded against the FINAL slot below).  Its
+			 *    nr_child++ is NOT applied in place: an in-place
+			 *    reserve hands it back via @count_deferred and it is
+			 *    recorded into ic->txn below, so it goes live with
+			 *    the publish and is discarded with an aborted
+			 *    attempt (see ft_flip_txn_record_nr_child_inc).
 			 *  - displaced external (old_node_flag != NULL): the slot
 			 *    already holds it; no set_nth (a NULL store would drop
 			 *    the live external before the commit).
@@ -1731,12 +1744,26 @@ int ft_attach_node(struct cds_ft *ft,
 				ret = ft_node_set_nth_rec(ft, &iter_dest_node_flag,
 					key_value, NULL, &old_recompacted_node,
 					metadata, level - 1, false, &rec, ic->txn,
-					NULL);
+					NULL, &count_deferred);
 				if (ret) {
 					dbg_printf("branch publish error %d\n", ret);
 					goto check_error;
 				}
 			}
+			/*
+			 * The in-place reserve owes @metadata (the LIVE attach
+			 * node) its nr_child++: record it as an edge in ic->txn,
+			 * immediately before -- and on the SAME state word as --
+			 * the §4.B guard below, so the two chain into ONE record
+			 * that the arm's guard reservation already covers.
+			 * Deferring is what makes reserve-then-ABORT idempotent:
+			 * the count is dropped with the attempt instead of
+			 * leaking a phantom child that the retry double-counts.
+			 */
+			assert(!count_deferred ||
+				iter_dest_node_flag == attach_node_flag);
+			if (count_deferred)
+				ft_flip_txn_record_nr_child_inc(ic->txn, metadata);
 			ft_node_get_nth_skip(iter_dest_node_flag, &slot_ptr,
 				key_value, FT_PF_NONE);
 			assert(slot_ptr);

@@ -1646,6 +1646,55 @@ uintptr_t ft_flip_txn_record_tombstone(struct ft_flip_txn *t,
 }
 
 /*
+ * Record a LIVE node's nr_child++ as an edge in the op's flip-txn @t, so the
+ * count goes live ATOMICALLY with the structural publish that makes the counted
+ * child reachable -- the insert-side mirror of the remove path's fused
+ * nr_child-- (ft_ord_cell_unsplice_commit's @state_meta edge).
+ *
+ * WHY THE COUNT CANNOT BE APPLIED IN PLACE.  The one-commit insert/graft
+ * RESERVE occupies its byte with a bit-set + NULL slot that reads as
+ * not-present, and settles the real child at commit.  Bumping nr_child in place
+ * mutates a PUBLISHED node OUTSIDE @t, and nothing rolls that back: on a commit
+ * ABORT the op re-descends, finds the byte still absent (the reserved slot is
+ * still NULL), reserves AGAIN and increments a SECOND time -- a permanent
+ * stored == counted + 1 divergence that cds_ft_verify reports as an nr_child
+ * mismatch (and, on a full pigeon node, as nr_child 257 > max_child 256).
+ * Recorded as an edge instead, the increment is discarded with the aborted
+ * attempt and re-derived by the retry, so reserve-then-abort is idempotent.
+ *
+ * The edge also makes the count coherent for READERS, which the in-place bump
+ * never was: between the reserve and the commit the counted child is invisible
+ * (NULL slot), so an eager nr_child counts a child no reader can reach.
+ *
+ * ORDERING / RESERVATION.  Callers record this at the same point they plant the
+ * publish target's §4.B guard (ft_flip_txn_guard_parent) -- the same word, so
+ * the two CHAIN into ONE record and the arm's existing guard reservation covers
+ * it (net-zero, exactly as ft_flip_txn_lock_or_guard_parent's release/guard
+ * swap).  That position is also what keeps it on the safe side of the
+ * release-then-guard rule at ft_flip_txn_record_release_copying: a lock release
+ * on this word is recorded by the reserve's recompact EARLIER in the same txn,
+ * so this edge chains onto it ({COPYING|s -> s} then {s -> s+1} = release AND
+ * increment in one atomic record) rather than poisoning it.
+ *
+ * READ-YOUR-OWN-WRITES: expected-old comes from urcu_txn_load, not a raw read,
+ * for the reason spelled out on ft_flip_txn_record_tombstone -- the word is in
+ * this txn's own write set whenever a release/tombstone/guard already touched
+ * it, and a raw committed read would be a torn read-set the engine poisons.
+ */
+static inline
+void ft_flip_txn_record_nr_child_inc(struct ft_flip_txn *t,
+		struct cds_ft_metadata *meta)
+{
+	uintptr_t old = (uintptr_t) urcu_txn_load(t->mtxn,
+			(void **) &meta->state, FT_STATE_PROXY);
+
+	assert(ft_state_nr_child(old) < FT_STATE_NR_CHILD_VALMASK);
+	ft_flip_txn_record_tag(t, (void **) &meta->state,
+			(void *) old, (void *) (old + FT_STATE_NR_CHILD_ONE),
+			FT_STATE_PROXY);
+}
+
+/*
  * The FENCED variant for a node the op marked with ft_meta_copying_mark: the
  * expected old is the mark's CLEAN snapshot with the fence bit -- NOT a fresh
  * raw read -- so the commit ratifies exactly the world the copy plan was
