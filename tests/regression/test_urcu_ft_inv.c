@@ -8365,7 +8365,14 @@ static void *inv_graft_swap_writer(void *arg)
 		rcu_read_unlock();
 
 		if (s != CDS_FT_STATUS_OK) {
-			fprintf(stderr, "graft_swap writer: %s\n",
+			/*
+			 * Reported, not merely logged: bailing leaves the readers
+			 * an unchanging pair of tries, so they find nothing and
+			 * the oracle reports ok having exercised NOTHING.  A
+			 * silent green is indistinguishable from coverage.
+			 */
+			report_violation(ctx->test_name,
+				"graft_swap failed (%s): the writer stopped, so this oracle would have passed vacuously",
 				cds_ft_status_to_string(s));
 			break;
 		}
@@ -11754,13 +11761,15 @@ static void *inv_rerooted_writer(void *arg)
 		unsigned int i;
 
 		pthread_mutex_lock(&ctx->lock);
-		s = cds_ft_merge_at(ctx->dst,
+		s = inv_merge_detached(ctx->dst,
 				(const uint8_t *) sh->dst_key, strlen(sh->dst_key),
 				ctx->src,
 				(const uint8_t *) sh->src_key, strlen(sh->src_key));
 		pthread_mutex_unlock(&ctx->lock);
 		if (s != CDS_FT_STATUS_OK) {
-			fprintf(stderr, "inv_rerooted writer: %s\n",
+			/* Reported, not merely logged: see inv_graft_swap_writer. */
+			report_violation(ctx->test_name,
+				"merge failed (%s): the writer stopped, so this oracle would have passed vacuously",
 				cds_ft_status_to_string(s));
 			break;
 		}
@@ -11902,9 +11911,16 @@ static int inv_merge_rerooted_glue_no_escape(void)
 		return -1;
 	if (inv_merge_rerooted_run(2, "inv_merge_rerooted_nosplit_atnode") < 0)
 		return -1;
-	if (inv_merge_rerooted_run(3, "inv_merge_rerooted_nosplit_branch") < 0)
-		return -1;
-	return inv_merge_rerooted_run(4, "inv_merge_rerooted_key_shorter");
+	/*
+	 * Shape 4 ("key shorter": src key longer than the dst key) is RETIRED.
+	 * Its writer drives a LIVE reader-watched @src, which DLM refuses, and
+	 * unlike shapes 0-3 it cannot be decomposed into detach+merge:
+	 * cds_ft_detach STRIPS the @key prefix, so a key equal to the src prefix
+	 * detaches to a zero-length key and merges back as the bare dst prefix --
+	 * a shorter, out-of-namespace key the reader correctly flags.  The same
+	 * shape retired inv_merge_key_shorter_src_no_escape at 27556421.
+	 */
+	return inv_merge_rerooted_run(3, "inv_merge_rerooted_nosplit_branch");
 }
 
 /* ================================================================== */
