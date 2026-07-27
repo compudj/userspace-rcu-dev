@@ -2360,7 +2360,7 @@ enum urcu_txn_status ft_ord_cell_flip_into(struct cds_ft *ft,
  */
 static
 void ft_ord_cell_record_into(struct ft_flip_txn *t,
-		struct ft_ord_cell_edge *edges, unsigned int n)
+		const struct ft_ord_cell_edge *edges, unsigned int n)
 {
 	unsigned int i;
 
@@ -3239,13 +3239,32 @@ bool ft_ord_cell_find_splice_pos_coherent(struct cds_ft *dst, const uint8_t *key
  * as the boundary.  @pred / @succ are @dst-original cells, which graft never
  * moves, so they stay valid until this splice.
  *
- * Pre-sets the run's outer links (run not yet reachable in @dst) and APPENDS
- * the <=2 neighbour edges plus any @dst head/tail repair to @edges, leaving the
- * caller to flip them.  Split out (the appear-side dual of
- * ft_ord_cell_run_detach_edges) so a bulk graft can FUSE these edges with its
- * structural attach publish in ONE flip (ft_store_at_graft_point's batch),
- * closing the appear-side cross-view window; ft_ord_cell_run_splice is the
- * standalone (two-commit) wrapper.
+ * APPENDS the <=4 edges -- the run's two OUTER links plus the two @dst
+ * neighbour back-edges (which double as the @dst head/tail repair under the
+ * sentinel topology) -- to @edges, leaving the caller to flip them.  Split out
+ * (the appear-side dual of ft_ord_cell_run_detach_edges) so a bulk graft can
+ * FUSE these edges with its structural attach publish in ONE flip
+ * (ft_store_at_graft_point's batch), closing the appear-side cross-view window;
+ * ft_ord_cell_run_splice is the standalone (two-commit) wrapper.
+ *
+ * WHY THE OUTER LINKS ARE RECORDED, not plain-stored.  They used to be two
+ * plain stores ("the run is not reachable in @dst yet, and this runs in the op's
+ * UN-ABORTABLE failure-free section").  The second half of that premise died
+ * with the FT-wide-lock drop: cell edges are ALWAYS MW, so a peer's conflicting
+ * boundary splice now aborts this commit, and a plain store does NOT roll back.
+ * That leaves run_first->prev / run_last->next pointing into @dst's
+ * neighbourhood while both neighbourhoods still point at their old targets --
+ * the "PERMANENTLY broken back-edge" that broke inv_rekey_graft_shared and made
+ * ft_ord_cell_run_resplice_edges record all four (see its comment).  The
+ * cross-trie shape kept the plain stores and the drop made it abortable too, so
+ * it now records them the same way: the whole splice is atomic and rolls back
+ * clean.  Expected-old comes from the run's still-pristine outer links (the
+ * SOURCE-side neighbours ft_ord_cell_run_install left in place), so this must be
+ * appended BEFORE any edge of the set is flipped.
+ *
+ * NOTE: structurally identical to ft_ord_cell_run_resplice_edges (same four
+ * edges, same order) -- they differ only in their documented preconditions
+ * (cross-trie incoming run vs same-trie LIVE run).  Keep them in sync.
  */
 static
 unsigned int ft_ord_cell_run_splice_edges(struct cds_ft *dst,
@@ -3253,6 +3272,11 @@ unsigned int ft_ord_cell_run_splice_edges(struct cds_ft *dst,
 		struct ft_ord_cell *pred, struct ft_ord_cell *succ,
 		struct ft_ord_cell_edge *edges, unsigned int n)
 {
+	struct ft_ord_cell *src_pred =
+		ft_ord_cell_resolve_ord(&run_first->lnode.prev);
+	struct ft_ord_cell *src_succ =
+		ft_ord_cell_resolve_ord(&run_last->lnode.next);
+
 	/*
 	 * Sentinel topology: a NULL boundary neighbour (run at @dst's head / tail)
 	 * IS @dst's sentinel, so the run's outer link and the back-edge land on
@@ -3261,9 +3285,17 @@ unsigned int ft_ord_cell_run_splice_edges(struct cds_ft *dst,
 	 */
 	pred = ft_ord_or_sentinel(dst, pred);
 	succ = ft_ord_or_sentinel(dst, succ);
-	/* Pre-set the run's outer links; not yet reachable via @dst's list. */
-	run_first->lnode.prev = ft_ord_cell_lnode(pred);
-	run_last->lnode.next = ft_ord_cell_lnode(succ);
+	/* The run's OUTER links: src neighbours -> dst neighbours. */
+	edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
+	edges[n].slot = (struct ft_ord_cell **) &run_first->lnode.prev;
+	edges[n].old_target = src_pred;
+	edges[n].new_target = pred;
+	n++;
+	edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
+	edges[n].slot = (struct ft_ord_cell **) &run_last->lnode.next;
+	edges[n].old_target = src_succ;
+	edges[n].new_target = succ;
+	n++;
 	edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
 	edges[n].slot = (struct ft_ord_cell **) &pred->lnode.next;
 	edges[n].old_target = succ;
@@ -3277,8 +3309,8 @@ unsigned int ft_ord_cell_run_splice_edges(struct cds_ft *dst,
 	return n;
 }
 
-/* Max edges a run-splice commits: the two boundary back-edges. */
-#define FT_ORD_CELL_RUN_SPLICE_MAX_EDGES	2
+/* Max edges a run-splice commits: 2 outer links + 2 boundary back-edges. */
+#define FT_ORD_CELL_RUN_SPLICE_MAX_EDGES	4
 
 #ifdef FEATURE_FT_MW_DLM_ACQUIRE	/* the coherent same-trie rekey's only caller */
 /*
@@ -3433,9 +3465,29 @@ unsigned int ft_ord_cell_run_replace_edges(struct cds_ft *dst,
 
 	(void) dst;
 	if (s_first) {
-		/* Pre-set run_S's outer links; not yet reachable via @dst. */
-		s_first->lnode.prev = ft_ord_cell_lnode(pred);
-		s_last->lnode.next = ft_ord_cell_lnode(succ);
+		/*
+		 * run_S's OUTER links: RECORDED, not plain-stored -- same reason as
+		 * ft_ord_cell_run_splice_edges (a plain store does not roll back when
+		 * a peer's cell conflict aborts this commit, leaving run_S's back-edge
+		 * pointing into @dst permanently).  Expected-old is run_S's pristine
+		 * swap-trie boundary, read before anything is flipped.  run_D's own
+		 * links are deliberately LEFT alone: parked readers walk off them.
+		 */
+		struct ft_ord_cell *s_pred =
+			ft_ord_cell_resolve_ord(&s_first->lnode.prev);
+		struct ft_ord_cell *s_succ =
+			ft_ord_cell_resolve_ord(&s_last->lnode.next);
+
+		edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
+		edges[n].slot = (struct ft_ord_cell **) &s_first->lnode.prev;
+		edges[n].old_target = s_pred;
+		edges[n].new_target = pred;
+		n++;
+		edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
+		edges[n].slot = (struct ft_ord_cell **) &s_last->lnode.next;
+		edges[n].old_target = s_succ;
+		edges[n].new_target = succ;
+		n++;
 	}
 	/*
 	 * Sentinel topology: @pred / @succ resolve to @dst's sentinel when run_D is
@@ -3456,8 +3508,8 @@ unsigned int ft_ord_cell_run_replace_edges(struct cds_ft *dst,
 	return n;
 }
 
-/* Max edges a run-replace commits: the two boundary back-edges. */
-#define FT_ORD_CELL_RUN_REPLACE_MAX_EDGES	2
+/* Max edges a run-replace commits: run_S's 2 outer links + 2 back-edges. */
+#define FT_ORD_CELL_RUN_REPLACE_MAX_EDGES	4
 
 /*
  * Standalone (two-commit) run-replace: swap run_D out for run_S at run_D's
@@ -3495,8 +3547,16 @@ struct ft_graft_swap_run {
 	bool armed;
 };
 
-/* Max edges a glue-path publish-replace commits: <=2 structural + <=4 replace. */
-#define FT_GLUE_PUBLISH_REPLACE_MAX_EDGES	6
+/*
+ * Max edges a glue-path publish-replace commits: the recorded structural
+ * publish stores (struct ft_pub_rec, bounded at 3 by its arrays -- the forward
+ * parent slot plus a compressed parent's SKIP_X dual) + the WHOLE run-replace
+ * boundary set.  DERIVED from FT_ORD_CELL_RUN_REPLACE_MAX_EDGES rather than
+ * spelled out, so it tracks that set automatically: it grew from 2 to 4 when
+ * run_S's outer links stopped being plain stores and became recorded edges.
+ */
+#define FT_GLUE_PUBLISH_REPLACE_MAX_EDGES	\
+	(3 + FT_ORD_CELL_RUN_REPLACE_MAX_EDGES)
 
 /*
  * Commit a graft_swap's RECORDED structural publish edges (@rec: the forward
@@ -4805,7 +4865,7 @@ enum urcu_txn_status ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue 
 		const struct ft_ord_cell_edge *cedges, unsigned int n_cedges)
 {
 	struct ft_pub_rec rec = { .n = 0 };
-	unsigned int j, k;
+	unsigned int j;
 	int i;
 	enum urcu_txn_status cst;
 
@@ -4923,14 +4983,18 @@ enum urcu_txn_status ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue 
 	 * slots carry the
 	 * same type-7 proxy tag as structural slots, so the txn's install parks a
 	 * proxy a cell reader resolves through ft_ord_cell_resolve_ord.  The
-	 * _edges helper already pre-set the run's own outer links (plain stores;
-	 * the run is not ord-reachable in dst until the flip) and the wrapper
-	 * armed the run descriptor so the caller skips the standalone splice.
+	 * _edges helper computed the run's own outer links as EDGES too (never
+	 * plain stores -- they must roll back with the rest when a peer's cell
+	 * conflict aborts this commit), and the wrapper arms the run descriptor
+	 * on success so the caller skips the standalone splice.
+	 *
+	 * Recorded through the tag-dispatching helper, NOT a raw
+	 * ft_flip_txn_record_tag loop: a CELL edge must be MW whatever @g->txn's
+	 * structural_sw mode is -- the ordered list is lock-free and no cell
+	 * carries a COPYING lock to park an SW store under -- while record_tag
+	 * keys off structural_sw alone and would demote them.
 	 */
-	for (k = 0; k < n_cedges; k++)
-		ft_flip_txn_record_tag(g->txn, (void **) cedges[k].slot,
-			cedges[k].old_target, cedges[k].new_target,
-			ft_edge_tag(&cedges[k]));
+	ft_ord_cell_record_into(g->txn, cedges, n_cedges);
 
 	/*
 	 * Order-statistics fold (BULK): record the +count_delta nr_keys walk from
@@ -4981,15 +5045,25 @@ static
 enum urcu_txn_status ft_glue_txn_commit(struct cds_ft *ft, struct ft_glue *g,
 		struct ft_graft_run *run)
 {
-	struct ft_ord_cell_edge cedges[4] = { 0 };
+	struct ft_ord_cell_edge cedges[FT_ORD_CELL_RUN_SPLICE_MAX_EDGES] = { 0 };
 	unsigned int n = 0;
+	enum urcu_txn_status cst;
 
-	if (run) {
+	if (run)
 		n = ft_ord_cell_run_splice_edges(ft, run->run_first,
 			run->run_last, run->pred, run->succ, cedges, 0);
+	cst = ft_glue_txn_commit_edges(ft, g, cedges, n);
+	/*
+	 * ARM ONLY when the edges took effect: on a COMMITTED flip, or under
+	 * @g->record_only (nothing committed yet, but the edges are now in the
+	 * CALLER's txn and its single commit carries them).  An ABORT rolled the
+	 * splice back, so the run is NOT in the list and the caller's standalone
+	 * fallback must still run -- arming there strands the run out of the
+	 * ordered list.
+	 */
+	if (run && cst == URCU_TXN_STATUS_OK)
 		run->armed = true;
-	}
-	return ft_glue_txn_commit_edges(ft, g, cedges, n);
+	return cst;
 }
 
 /*
@@ -5002,21 +5076,24 @@ static
 enum urcu_txn_status ft_glue_txn_commit_replace(struct cds_ft *ft,
 		struct ft_glue *g, struct ft_graft_swap_run *run)
 {
-	struct ft_ord_cell_edge cedges[4] = { 0 };
+	struct ft_ord_cell_edge cedges[FT_ORD_CELL_RUN_REPLACE_MAX_EDGES] = { 0 };
 	unsigned int n = 0;
+	enum urcu_txn_status cst;
 
-	if (run) {
+	if (run)
 		n = ft_ord_cell_run_replace_edges(ft, run->d_first, run->d_last,
 			run->s_first, run->s_last, cedges, 0);
-		run->armed = true;
-	}
 	/*
 	 * Return the commit status: under the FT-wide lock the replace is
 	 * failure-free (caller ignores it), but with the lock dropped
 	 * (FEATURE_FT_MW_LOCK_FINE_DROP) a peer relocating the contended dst
 	 * parent aborts the commit -- cds_ft_graft_swap re-descends on it.
 	 */
-	return ft_glue_txn_commit_edges(ft, g, cedges, n);
+	cst = ft_glue_txn_commit_edges(ft, g, cedges, n);
+	/* Arm only when the edges took effect (see ft_glue_txn_commit). */
+	if (run && cst == URCU_TXN_STATUS_OK)
+		run->armed = true;
+	return cst;
 }
 
 /*

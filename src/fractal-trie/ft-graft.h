@@ -639,9 +639,9 @@ enum urcu_txn_status ft_store_at_graft_point_commit(struct cds_ft *ft,
 				(const void *) st->attached);
 	} else {
 		struct cds_ft_inode_flag **slot = NULL;
-		struct ft_ord_cell_edge redges[4];
+		struct ft_ord_cell_edge redges[FT_ORD_CELL_RUN_SPLICE_MAX_EDGES];
 		struct cds_ft_inode_flag *count_base = NULL;
-		unsigned int rn = 0, i;
+		unsigned int rn = 0;
 
 		ft_node_get_nth_skip(st->dest, &slot, st->slot_byte, FT_PF_NONE);
 		assert(slot);
@@ -771,12 +771,16 @@ enum urcu_txn_status ft_store_at_graft_point_commit(struct cds_ft *ft,
 		if (run) {
 			rn = ft_ord_cell_run_splice_edges(ft, run->run_first,
 				run->run_last, run->pred, run->succ, redges, 0);
-			for (i = 0; i < rn; i++)
-				ft_flip_txn_record_tag(st->glue->txn,
-					(void **) redges[i].slot,
-					redges[i].old_target,
-					redges[i].new_target,
-					ft_edge_tag(&redges[i]));
+			/*
+			 * Through the tag-dispatching recorder, NOT a raw
+			 * ft_flip_txn_record_tag loop: a CELL edge must be MW
+			 * whatever this txn's structural_sw mode is (the ordered
+			 * list is lock-free -- no cell carries a COPYING lock to
+			 * park an SW store under), and a raw record_tag keys off
+			 * structural_sw alone, so it would silently demote these
+			 * to an unvalidated SW park under a caller that opted in.
+			 */
+			ft_ord_cell_record_into(st->glue->txn, redges, rn);
 		}
 		/*
 		 * Freeze-on-free (doc §4.B): a reserve recompaction relocated the
@@ -826,7 +830,17 @@ enum urcu_txn_status ft_store_at_graft_point_commit(struct cds_ft *ft,
 		}
 		cst = ft_flip_txn_commit(ft, st->glue->txn);
 		st->glue->txn = NULL;
-		if (run)
+		/*
+		 * ARM ONLY ON A COMMITTED FLIP.  The run-splice edges rode this
+		 * txn, so an ABORT rolled them back with everything else: the run
+		 * is NOT in @dst's ordered list.  @armed is what makes the caller
+		 * skip its standalone ft_ord_cell_run_splice fallback, so arming
+		 * unconditionally would strand the run OUT of the list -- keys
+		 * present in the structure, invisible to ordered iteration (and a
+		 * cds_ft_verify ord-cell mismatch).  The same gate the retire /
+		 * glue_free_old reclaims below already use.
+		 */
+		if (run && cst == URCU_TXN_STATUS_OK)
 			run->armed = true;
 		/*
 		 * Only the writer whose commit actually retired
