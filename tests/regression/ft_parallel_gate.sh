@@ -140,26 +140,53 @@ run_one() {	# $1=name $2=tests -- build lib+tests, run the TAP suites
 		return
 	fi
 	echo "$name: build ok" >> "$out"
-	local t o ok notok abrt lbl
+	local t o ok notok abrt lbl rc plan ran
 	for t in $tests; do
 		case $t in
-		u)    o=$(LD_LIBRARY_PATH=$LIB timeout 900 "$U" 2>&1)
+		u)    o=$(LD_LIBRARY_PATH=$LIB timeout 900 "$U" 2>&1); rc=$?
 		      lbl="ft_unit   ";;
-		ion)  o=$(LD_LIBRARY_PATH=$LIB timeout 300 "$I" 2>&1)
+		ion)  o=$(LD_LIBRARY_PATH=$LIB timeout 300 "$I" 2>&1); rc=$?
 		      lbl="ft_inv on ";;
-		ioff) o=$(LD_LIBRARY_PATH=$LIB FT_INV_NO_ORDERED_LIST=1 timeout 300 "$I" 2>&1)
+		ioff) o=$(LD_LIBRARY_PATH=$LIB FT_INV_NO_ORDERED_LIST=1 timeout 300 "$I" 2>&1); rc=$?
 		      lbl="ft_inv off";;
 		# The concurrent-writer oracles (MW writers, coherent rekey) all
 		# gate on FT_INV_MW at runtime and are otherwise skipped, so ion
 		# / ioff never exercise them.  They are the long leg -- hence the
 		# larger timeout.
-		imw)  o=$(LD_LIBRARY_PATH=$LIB FT_INV_MW=1 timeout 1800 "$I" 2>&1)
+		imw)  o=$(LD_LIBRARY_PATH=$LIB FT_INV_MW=1 timeout 1800 "$I" 2>&1); rc=$?
 		      lbl="ft_inv mw ";;
 		esac
 		ok=$(printf '%s' "$o" | grep -c '^ok ')
 		notok=$(printf '%s' "$o" | grep -c '^not ok ')
 		abrt=$(printf '%s' "$o" | grep -c -i 'assert')
 		printf '  [%-11s] %s ok=%s notok=%s abrt=%s\n' "$name" "$lbl" "$ok" "$notok" "$abrt" >> "$out"
+		# A HUNG suite used to score GREEN.  The run is killed, its PARTIAL
+		# ok-count is reported, and with no 'not ok ' line and no abort the
+		# config passed -- so a single-threaded DLM self-deadlock rode in on
+		# a "GATE PASS" while dlm's ft_unit silently fell from 290 tests to
+		# 36.  The count drop was the only signal and nothing checked it.
+		# Two independent checks now, because each catches what the other
+		# misses: a non-zero exit (124 == timeout kill, or a crash after the
+		# last emitted line), and a run that never reached its TAP plan
+		# (self-maintaining -- the plan is the suite's own test count, so
+		# adding tests needs no gate update).
+		# Most-specific diagnosis first: a timeout and a plan shortfall have
+		# very different causes (hang vs retired-but-still-planned test), and
+		# libtap's exit_status() is planned-minus-run, so a bare "exit 3"
+		# would report the shortfall in its least legible form.
+		plan=$(printf '%s' "$o" | sed -n 's/^1\.\.\([0-9]\{1,\}\)$/\1/p' | head -1)
+		ran=$((ok + notok))
+		if [ "$rc" -eq 124 ]; then
+			echo "$name: $lbl INCOMPLETE (TIMEOUT/hang after $ran tests)" >> "$out"
+		elif [ "$rc" -gt 128 ]; then
+			echo "$name: $lbl INCOMPLETE (killed by signal $((rc - 128)) after $ran tests)" >> "$out"
+		elif [ -z "$plan" ]; then
+			echo "$name: $lbl NO TAP PLAN (completeness unverifiable)" >> "$out"
+		elif [ "$ran" -ne "$plan" ]; then
+			echo "$name: $lbl INCOMPLETE (ran $ran of $plan planned)" >> "$out"
+		elif [ "$rc" -ne 0 ]; then
+			echo "$name: $lbl NONZERO EXIT ($rc) with a complete run" >> "$out"
+		fi
 	done
 }
 
@@ -184,7 +211,7 @@ for c in "${CONFIGS[@]}"; do
 	# but never ran (missing/unlinked binary, e.g. tests/utils not built) --
 	# notok/abrt alone would let that pass as a false GREEN.
 	if ! grep -q 'build ok' "$GATE/$n.result" || \
-	   grep -qE 'BUILD FAIL|notok=[1-9]|abrt=[1-9]|ok=0 notok=' "$GATE/$n.result"; then
+	   grep -qE 'BUILD FAIL|notok=[1-9]|abrt=[1-9]|ok=0 notok=|INCOMPLETE|NO TAP PLAN' "$GATE/$n.result"; then
 		rc=1
 	fi
 done
