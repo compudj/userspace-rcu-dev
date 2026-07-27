@@ -2445,12 +2445,14 @@ struct cds_ft_iter *ft_stack_iter_init(struct ft_stack_iter *si,
 static
 struct ft_ord_cell *ft_ord_cell_find_rel(struct cds_ft *ft, const uint8_t *key,
 		size_t key_len, enum ft_lookup_inequality mode,
-		struct ft_visit_witness *wit)
+		struct ft_visit_witness *wit, struct cds_ft_node **head_out)
 {
 	struct ft_stack_iter si;
 	struct cds_ft_iter *it = ft_stack_iter_init(&si, ft);
 	struct cds_ft_node *head;
 
+	if (head_out)
+		*head_out = NULL;
 	if (cds_ft_iter_set_key(it, key, key_len) != CDS_FT_STATUS_OK)
 		return NULL;
 	it->prefix_len = 0;
@@ -2461,6 +2463,16 @@ struct ft_ord_cell *ft_ord_cell_find_rel(struct cds_ft *ft, const uint8_t *key,
 	head = cds_ft_iter_node(it);
 	if (!head)
 		return NULL;
+	/*
+	 * @head_out hands the descent's ANSWER NODE back alongside the cell it
+	 * maps to.  Only the FT_DEBUG_SPLICE_POS_BRACKET probe wants it, and it
+	 * wants it to tell two failure mechanisms apart: a descent that returned
+	 * the WRONG HEAD (then cell->node == head, mapping consistent) from a
+	 * RIGHT head mapped to the wrong cell through a stale head->prev (then
+	 * cell->node != head).  Every production caller passes NULL.
+	 */
+	if (head_out)
+		*head_out = head;
 	return ft_ord_cell_ptr(rcu_dereference(head->prev));
 }
 
@@ -3107,6 +3119,142 @@ enum urcu_txn_status ft_remove_commit_rec(struct cds_ft *ft,
 	return URCU_TXN_STATUS_OK;
 }
 
+#ifdef FT_DEBUG_SPLICE_POS_BRACKET
+/*
+ * =====================================================================
+ * DIAGNOSTIC PROBE (opt-in: -DFT_DEBUG_SPLICE_POS_BRACKET).  NOT a fix.
+ * =====================================================================
+ *
+ * ft_ord_cell_find_splice_pos derives (@pred, @succ) with an unlocked relational
+ * descent, and the only thing validated downstream is the ADJACENCY of the pair
+ * -- which a wrong-but-adjacent pair satisfies by construction, since @succ is
+ * READ OFF @pred->next.  ADJACENT + BRACKETING is the full condition and
+ * bracketing is never checked, so a far-wrong @pred commits with a fully
+ * "successful" CAS and parks a whole run at the wrong list position.
+ *
+ * This probe validates the BRACKET at the derivation site and ABORTS with a dump
+ * on the first violation.  It deliberately does NOT retry: a previous attempt
+ * that bailed to the graft's retry_attach on a failed bracket LIVELOCKED 38/38
+ * (it rejected valid pairs, so the graft re-derived forever) and told us nothing.
+ * A validation that is not yet trusted must be DIAGNOSTIC before it is
+ * load-bearing.  Hence the discipline here:
+ *
+ *   - SKIP (silently, never abort) anything it cannot evaluate: an up-walk that
+ *     returns 0 bytes, a sentinel neighbour, an over-long key.  A rebuild that
+ *     legitimately yields nothing must not be read as a violation -- that was
+ *     one of the three named suspects for the livelock.
+ *   - Compare in ORDINAL space.  ft_rebuild_key_upwalk yields the ORDINAL key
+ *     while @key is APPLICATION form, so the query is mapped through
+ *     key_to_ordinal (the identity in the oracles, but not in general).
+ *   - Respect the RIGHT-ALIGNED rebuild: the key occupies buf[max_len - n .. )
+ *     and n is the length.  Mis-slicing that was the second named suspect.
+ *
+ * What the dump discriminates (the open question from the handoff, §18):
+ *   cell->node == head  =>  the DESCENT returned a far-wrong head.
+ *   cell->node != head  =>  a RIGHT head was mapped to a WRONG cell through a
+ *                           stale head->prev (a peer promoting a duplicate-chain
+ *                           head, or a graft re-parenting one).
+ * Prediction under test: the bad @pred's key equals the query with byte 0
+ * incremented by one (the observed {0f,02} -> max of {10,02}).
+ */
+static
+int ft_dbg_ord_key_cmp(const uint8_t *a, size_t alen,
+		const uint8_t *b, size_t blen)
+{
+	size_t n = alen < blen ? alen : blen;
+	int c = n ? memcmp(a, b, n) : 0;
+
+	if (c)
+		return c;
+	return alen < blen ? -1 : (alen > blen ? 1 : 0);
+}
+
+static
+void ft_dbg_key_print(const char *tag, const uint8_t *k, size_t n)
+{
+	size_t i;
+
+	fprintf(stderr, "  %s (len %zu):", tag, n);
+	for (i = 0; i < n; i++)
+		fprintf(stderr, " %02x", k[i]);
+	fprintf(stderr, "\n");
+}
+
+static
+void ft_dbg_splice_pos_check(struct cds_ft *dst, const uint8_t *key,
+		size_t key_len, struct ft_ord_cell *pred,
+		struct cds_ft_node *pred_head, struct ft_ord_cell *succ,
+		struct cds_ft_node *succ_head)
+{
+	const struct cds_ft_key_map *km = &dst->group->key_map;
+	struct ft_ord_cell *sentinel = ft_ord_sentinel_cell(dst);
+	size_t max_len = dst->group->max_key_len;
+	uint8_t qord[FT_MAX_KEY_LEN];
+	uint8_t pbuf[FT_MAX_KEY_LEN], sbuf[FT_MAX_KEY_LEN];
+	size_t pn = 0, sn = 0, i;
+	bool pbad = false, sbad = false;
+
+	if (!key_len || key_len > max_len || max_len > FT_MAX_KEY_LEN)
+		return;				/* cannot evaluate -- SKIP */
+	for (i = 0; i < key_len; i++)
+		qord[i] = km->identity ? key[i] : km->key_to_ordinal[key[i]];
+
+	/* @pred must sort STRICTLY BELOW the query. */
+	if (pred && pred != sentinel) {
+		pn = ft_rebuild_key_upwalk(dst, pred, pbuf, max_len);
+		if (pn)
+			pbad = ft_dbg_ord_key_cmp(pbuf + (max_len - pn), pn,
+					qord, key_len) >= 0;
+	}
+	/* @succ must sort STRICTLY ABOVE it. */
+	if (succ && succ != sentinel) {
+		sn = ft_rebuild_key_upwalk(dst, succ, sbuf, max_len);
+		if (sn)
+			sbad = ft_dbg_ord_key_cmp(sbuf + (max_len - sn), sn,
+					qord, key_len) <= 0;
+	}
+	if (!pbad && !sbad)
+		return;
+
+	fprintf(stderr, "\n=== FT SPLICE-POS BRACKET VIOLATION ===\n");
+	fprintf(stderr, "ft %p  pred %s  succ %s\n", (void *) dst,
+		pbad ? "BAD" : "ok", sbad ? "BAD" : "ok");
+	ft_dbg_key_print("query    (app)", key, key_len);
+	ft_dbg_key_print("query    (ord)", qord, key_len);
+	if (pred) {
+		fprintf(stderr, "  pred cell %p node %p  descent head %p  "
+			"mapping %s\n", (void *) pred, (void *) pred->node,
+			(void *) pred_head,
+			(!pred_head || pred->node == pred_head)
+				? "CONSISTENT (cell->node == head)"
+				: "STALE (cell->node != head)");
+		if (pn)
+			ft_dbg_key_print("pred key (ord)",
+				pbuf + (max_len - pn), pn);
+		else
+			fprintf(stderr, "  pred key: up-walk yielded nothing\n");
+	} else {
+		fprintf(stderr, "  pred NULL (query claimed to be new minimum)\n");
+	}
+	if (succ && succ != sentinel) {
+		fprintf(stderr, "  succ cell %p node %p  descent head %p  "
+			"mapping %s\n", (void *) succ, (void *) succ->node,
+			(void *) succ_head,
+			(!succ_head || succ->node == succ_head)
+				? "CONSISTENT (cell->node == head)"
+				: "STALE (cell->node != head)");
+		if (sn)
+			ft_dbg_key_print("succ key (ord)",
+				sbuf + (max_len - sn), sn);
+	} else {
+		fprintf(stderr, "  succ is the sentinel / NULL (list tail)\n");
+	}
+	fprintf(stderr, "=== aborting for a core ===\n");
+	fflush(stderr);
+	abort();
+}
+#endif /* FT_DEBUG_SPLICE_POS_BRACKET */
+
 /*
  * Locate the ordered-list neighbours (@pred, @succ) that a run grafted at @key
  * will splice between.  MUST be called while @dst is still payload-free (before
@@ -3124,6 +3272,13 @@ void ft_ord_cell_find_splice_pos(struct cds_ft *dst, const uint8_t *key,
 {
 	struct ft_ord_cell *pred, *succ;
 	size_t flen = dst->group->key_len;
+#ifdef FT_DEBUG_SPLICE_POS_BRACKET
+	struct cds_ft_node *pred_head = NULL, *succ_head = NULL;
+	struct cds_ft_node **ph = &pred_head, **sh = &succ_head;
+#else
+	/* Production: no head is wanted, so find_rel skips the store. */
+	struct cds_ft_node **ph = NULL, **sh = NULL;
+#endif
 
 	if (flen != CDS_FT_LEN_VARIABLE && key_len != flen) {
 		/*
@@ -3149,7 +3304,8 @@ void ft_ord_cell_find_splice_pos(struct cds_ft *dst, const uint8_t *key,
 		assert(key_len < flen && flen <= FT_MAX_KEY_LEN);
 		memcpy(pad, key, key_len);
 		memset(pad + key_len, pad_min, flen - key_len);
-		pred = ft_ord_cell_find_rel(dst, pad, flen, FT_LOOKUP_LT, wit);
+		pred = ft_ord_cell_find_rel(dst, pad, flen, FT_LOOKUP_LT, wit,
+				ph);
 		if (pred) {
 			succ = ft_ord_cell_resolve_ord(&pred->lnode.next);
 			if (wit) {
@@ -3159,14 +3315,24 @@ void ft_ord_cell_find_splice_pos(struct cds_ft *dst, const uint8_t *key,
 		} else {
 			memset(pad + key_len, pad_max, flen - key_len);
 			succ = ft_ord_cell_find_rel(dst, pad, flen,
-					FT_LOOKUP_GT, wit);
+					FT_LOOKUP_GT, wit, sh);
 		}
 		*pred_out = pred;
 		*succ_out = succ;
+#ifdef FT_DEBUG_SPLICE_POS_BRACKET
+		/*
+		 * Checked against the BARE PREFIX, not @pad: the attach point is
+		 * empty, so no @dst key starts with @key, and a prefix sorts below
+		 * every extension of itself.  "pred < prefix" and "succ > prefix"
+		 * is therefore the exact bracket for the whole padded range.
+		 */
+		ft_dbg_splice_pos_check(dst, key, key_len, pred, pred_head,
+			succ, succ_head);
+#endif
 		return;
 	}
 
-	pred = ft_ord_cell_find_rel(dst, key, key_len, FT_LOOKUP_LT, wit);
+	pred = ft_ord_cell_find_rel(dst, key, key_len, FT_LOOKUP_LT, wit, ph);
 	if (pred) {
 		succ = ft_ord_cell_resolve_ord(&pred->lnode.next);
 		if (wit) {
@@ -3174,9 +3340,14 @@ void ft_ord_cell_find_splice_pos(struct cds_ft *dst, const uint8_t *key,
 			ft_witness_visit(wit, succ);
 		}
 	} else
-		succ = ft_ord_cell_find_rel(dst, key, key_len, FT_LOOKUP_GT, wit);
+		succ = ft_ord_cell_find_rel(dst, key, key_len, FT_LOOKUP_GT,
+				wit, sh);
 	*pred_out = pred;
 	*succ_out = succ;
+#ifdef FT_DEBUG_SPLICE_POS_BRACKET
+	ft_dbg_splice_pos_check(dst, key, key_len, pred, pred_head,
+		succ, succ_head);
+#endif
 }
 
 #ifdef FEATURE_FT_MW_DLM_ACQUIRE
