@@ -52,7 +52,8 @@ if [ ! -x "$ROOT/configure" ]; then
 	exit 2
 fi
 
-# name | configure-time CPPFLAGS | tests (u=ft_unit ion=ft_inv-on ioff=ft_inv-off)
+# name | configure-time CPPFLAGS | tests
+#   u=ft_unit  ion=ft_inv-on  ioff=ft_inv-off  imw=ft_inv-on + FT_INV_MW=1
 ALL_CONFIGS=(
 	"default||u ion ioff"
 	"fault-audit|-DFEATURE_FT_FAULT_INJECT -DFT_DEBUG_TOMBSTONE_AUDIT|u ioff"
@@ -61,6 +62,16 @@ ALL_CONFIGS=(
 	"noskip|-DNO_FEATURE_FT_SKIP_COMPRESSED|u ioff"
 	"nocompress|-DNO_FEATURE_FT_COMPRESS|u ioff"
 	"in-place|-DFEATURE_FT_INSERT_IN_PLACE|u"
+	# The DLM (per-node lock-set) build.  Until this config existed, NOTHING
+	# in the gate defined FEATURE_FT_MW_DLM_ACQUIRE -- unlike
+	# FEATURE_FT_MW_LOCK_FINE_DROP it does not self-enable -- so the whole
+	# mixed sw/mw subsystem (structural_sw, ft_flip_txn_record_tag's SW
+	# branch, ft_flip_txn_record_tag_mw) and the six rekey-graft oracles
+	# gated on it in ft_inv's main() were compiled out of every gate run.
+	# It carries imw because those oracles ALSO gate on FT_INV_MW at
+	# runtime: without it they would compile in and then skip, which reads
+	# as coverage and is not.
+	"dlm|-DFEATURE_FT_MW_DLM_ACQUIRE|u ion ioff imw"
 )
 
 # Optional positional filter: run only the named configs.
@@ -124,6 +135,12 @@ run_one() {	# $1=name $2=tests -- build lib+tests, run the TAP suites
 		      lbl="ft_inv on ";;
 		ioff) o=$(LD_LIBRARY_PATH=$LIB FT_INV_NO_ORDERED_LIST=1 timeout 300 "$I" 2>&1)
 		      lbl="ft_inv off";;
+		# The concurrent-writer oracles (MW writers, coherent rekey) all
+		# gate on FT_INV_MW at runtime and are otherwise skipped, so ion
+		# / ioff never exercise them.  They are the long leg -- hence the
+		# larger timeout.
+		imw)  o=$(LD_LIBRARY_PATH=$LIB FT_INV_MW=1 timeout 1800 "$I" 2>&1)
+		      lbl="ft_inv mw ";;
 		esac
 		ok=$(printf '%s' "$o" | grep -c '^ok ')
 		notok=$(printf '%s' "$o" | grep -c '^not ok ')
