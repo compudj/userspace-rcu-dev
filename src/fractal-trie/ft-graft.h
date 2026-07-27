@@ -972,7 +972,20 @@ enum cds_ft_status ft_store_at_graft_point(struct cds_ft *ft,
 		ft_glue_abort(ft, glue);
 		if (st.old_recompacted_node)
 			free_cds_ft_node_unpublished(ft, ft_node_ptr(st.dest));
-		return CDS_FT_STATUS_MEMORY_ERROR;
+		/*
+		 * Keep the engine's two outcome spaces apart instead of collapsing
+		 * both into "out of memory": URCU_TXN_STATUS_ABORT is contention --
+		 * "NOT an error", as rcu-txn-status.h puts it -- and nothing was
+		 * published, so it is BUSY; only a genuine
+		 * URCU_TXN_STATUS_MEMORY_ERROR is an allocation failure.  Both are
+		 * transient here and both callers already retry on either, so this
+		 * changes only what the wrapper REPORTS -- but a conflict surfacing
+		 * as ENOMEM is exactly the kind of misreport that sends a future
+		 * reader hunting an allocator bug that never existed.
+		 */
+		return cst == URCU_TXN_STATUS_ABORT ?
+			CDS_FT_STATUS_BUSY_ERROR :
+			CDS_FT_STATUS_MEMORY_ERROR;
 	}
 	return CDS_FT_STATUS_OK;
 }

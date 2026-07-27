@@ -2178,10 +2178,11 @@ retry_merge:
 			 *   fusing ft_merge_unlink_src_subtree into the attach flip -- is a
 			 *   deferred parity follow-up (not needed for any disjoint use).
 			 * - Everything else is transient -- re-descend and re-attach
-			 *   the owned @payload: BUSY_ERROR (a peer filled the
-			 *   reserve's byte, or a recompact could not lock) and
-			 *   MEMORY_ERROR (a real OOM, or the MCAS commit-abort the
-			 *   store wrapper still reports that way).
+			 *   the owned @payload: BUSY_ERROR is contention (a peer
+			 *   filled the reserve's byte, a recompact could not lock, or
+			 *   the store's MCAS commit ABORTed), MEMORY_ERROR is a real
+			 *   allocation failure.  Both retry; they are kept distinct so
+			 *   a conflict never has to be read as an OOM.
 			 */
 			if (st == CDS_FT_STATUS_POPULATED_ERROR) {
 				assert(!already_unlinked);
