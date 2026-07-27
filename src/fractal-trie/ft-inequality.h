@@ -330,6 +330,17 @@ enum cds_ft_status ft_ineq_descend(struct cds_ft *ft,
 	struct cds_ft_node *ret_node;
 	uint8_t ordinal_key[FT_MAX_KEY_LEN];
 	/*
+	 * Empty-subtree retry origin (see the going-up scan and the "transiently
+	 * empty internal node" bail).  @retry_from_level < 0 = inactive; when it
+	 * matches the scan's current level, the sibling search starts from
+	 * @retry_from_byte -- the child just found empty -- instead of the
+	 * immutable search key, so the scan cannot re-derive it.  Declared at the
+	 * top of the function: every `goto` into going_up / descend_children is
+	 * backward or forward past this point, so no jump skips the init.
+	 */
+	ssize_t retry_from_level = -1;
+	uint8_t retry_from_byte = 0;
+	/*
 	 * @keep_ordinal: compile-time true for every instantiation EXCEPT
 	 * (use_keycopy && limit == LIMIT_NONE).  In that one case the matched leaf
 	 * is the sole result-key source (ft_speculative_keycopy_unconditional) and
@@ -1053,6 +1064,19 @@ going_up:
 				break;
 			}
 			/*
+			 * EMPTY-SUBTREE RETRY: this level's previous candidate was
+			 * descended into and its subtree read empty, so scan from IT
+			 * rather than from the search key -- the search key is
+			 * immutable and would hand back the same candidate forever
+			 * (the traced stall).  One-shot: cleared here so a later
+			 * arrival at this level, with a genuinely different cursor,
+			 * uses the normal origin again.
+			 */
+			if (caa_unlikely(retry_from_level == level)) {
+				key_value = retry_from_byte;
+				retry_from_level = -1;
+			}
+			/*
 			 * Standard sibling lookup. Parent is level - 1. We are
 			 * looking for sibling of the byte at ordinal_key[level - 1].
 			 * Skip levels where the path entry is not an internal node
@@ -1502,6 +1526,29 @@ descend_children:
 		 */
 		if (caa_unlikely(!node_flag)) {
 			level--;
+			/*
+			 * ...and EXCLUDE the child we just found empty, or the
+			 * going-up scan re-derives it forever.  Its origin is
+			 * key_value == input_key[level - 1] -- the IMMUTABLE search
+			 * key -- so without this the next pass asks the same parent
+			 * the same question, gets the same sibling, descends into
+			 * the same empty subtree, and lands right back here.  That
+			 * is the cross-trie oracle's long-standing STALL: LTTng
+			 * caught 100001 byte-identical going_up steps (same level,
+			 * same parent, same ord_key, found_sibling=1) with no peer
+			 * event interleaved -- a self-contained infinite loop, not a
+			 * contention livelock.  The comment above assumes going_up
+			 * "find[s] the NEXT sibling", which holds only if the scan
+			 * starts PAST this byte.  ft_node_get_leftright is strictly
+			 * ordered (smallest v > n for RIGHT), so seeding the origin
+			 * with the failed byte returns the next populated slot and
+			 * the scan always advances.
+			 */
+			if (caa_likely(level >= 1)) {
+				retry_from_byte = keep_ordinal
+					? ordinal_key[level - 1] : ord_scratch;
+				retry_from_level = level;
+			}
 			going_up = true;
 			goto going_up;
 		}
