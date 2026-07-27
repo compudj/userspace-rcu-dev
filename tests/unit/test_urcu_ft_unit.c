@@ -24864,12 +24864,11 @@ static int run_merge_oom_rerooted_glue(int nr_faults, int shape)
 
 		cds_ft_fault_alloc_countdown = n;
 		rcu_read_lock();
+		cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 		if (shape == 0)
-			cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 			s = cds_ft_merge_at(dst, (const uint8_t *)"mb", 2,
 					src, (const uint8_t *)"a", 1);
 		else
-			cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 			s = cds_ft_merge_at(dst, (const uint8_t *)"mb", 2,
 					src, (const uint8_t *)"x", 1);
 		rcu_read_unlock();
