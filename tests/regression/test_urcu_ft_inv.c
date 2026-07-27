@@ -6342,6 +6342,7 @@ static int inv_graft_cross_view(void)
 				abort();
 		}
 		rcu_read_unlock();
+cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 
 		if (cds_ft_graft(ft, prefix, 2, src) != CDS_FT_STATUS_OK)
 			abort();
@@ -6635,6 +6636,7 @@ static int inv_graft_no_list_diverge(void)
 				abort();
 		}
 		rcu_read_unlock();
+cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 
 		/* Split: diverge inside STABLE's compressed path (GLUE flip-txn). */
 		if (cds_ft_graft(ft, NOLIST_GRAFT_P, 2, src) != CDS_FT_STATUS_OK)
@@ -6760,6 +6762,7 @@ static int inv_graft_displaced_external(void)
 				abort();
 		}
 		rcu_read_unlock();
+cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 
 		/* Graft the longer key over DISPEXT_STABLE -> NOSPLIT displaced ext. */
 		if (cds_ft_graft(ft, DISPEXT_GRAFT, sizeof(DISPEXT_GRAFT), src)
@@ -6950,6 +6953,7 @@ static int inv_graft_root_swap_cross_view(void)
 		pool[k] = dst;
 		ngrafts = k + 1;
 		rcu_assign_pointer(ctx.cur, dst);
+		cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 		if (cds_ft_graft(dst, (const uint8_t *) "", 0, src)
 				!= CDS_FT_STATUS_OK)
 			abort();
@@ -7078,6 +7082,7 @@ static int inv_merge_root_swap_cross_view(void)
 		pool[k] = dst;
 		nmerges = k + 1;
 		rcu_assign_pointer(ctx.cur, dst);
+		cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 		if (cds_ft_merge_at(dst, (const uint8_t *) "", 0, src, SRC_PREFIX, 1)
 				!= CDS_FT_STATUS_OK)
 			abort();
@@ -7371,6 +7376,7 @@ static int inv_merge_cross_view(void)
 				abort();
 		}
 		rcu_read_unlock();
+cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 
 		if (cds_ft_merge_at(ft, prefix, 2, src, SRCK, 1) != CDS_FT_STATUS_OK)
 			abort();
@@ -7472,6 +7478,7 @@ static int inv_merge_spinecopy_cross_view(void)
 				abort();
 		}
 		rcu_read_unlock();
+cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 
 		if (cds_ft_merge_at(ft, prefix, 2, src, SRCK, 1) != CDS_FT_STATUS_OK)
 			abort();
@@ -7644,6 +7651,7 @@ static int inv_detach_root_cross_view(void)
 			ret = -1;
 			break;
 		}
+		cds_ft_make_exclusive(detached);	/* DLM: cross-trie src must be exclusive */
 		/* @ft is now empty; graft the whole detached trie back at root. */
 		if (cds_ft_graft(ft, NULL, 0, detached) != CDS_FT_STATUS_OK) {
 			fprintf(stderr, "inv_detach_root_cross_view: graft-back failed\n");
@@ -8407,6 +8415,7 @@ static void *inv_graft_swap_writer(void *arg)
 		 */
 		rcu_read_lock();
 		pthread_mutex_lock(&ctx->lock);
+		cds_ft_make_exclusive(swap);	/* DLM: cross-trie src must be exclusive */
 		s = cds_ft_graft_swap(ctx->live, NULL, 0, swap);
 		pthread_mutex_unlock(&ctx->lock);
 		rcu_read_unlock();
@@ -8618,6 +8627,7 @@ static void *inv_graft_swap_xview_writer(void *arg)
 	 * swap moves it straight back -- no drain/repopulate, far more windows. */
 	while (!test_stop) {
 		pthread_mutex_lock(&ctx->lock);
+		cds_ft_make_exclusive(swap);	/* DLM: cross-trie src must be exclusive */
 		if (cds_ft_graft_swap(ctx->live, NULL, 0, swap) != CDS_FT_STATUS_OK)
 			abort();
 		pthread_mutex_unlock(&ctx->lock);
@@ -8933,6 +8943,7 @@ static void *inv_graft_swap_sub_xview_writer(void *arg)
 	 * the next swap moves it back -- no drain, far more windows. */
 	while (!test_stop) {
 		pthread_mutex_lock(&ctx->lock);
+		cds_ft_make_exclusive(swap);	/* DLM: cross-trie src must be exclusive */
 		if (cds_ft_graft_swap(ctx->live, AT, 1, swap) != CDS_FT_STATUS_OK)
 			abort();
 		pthread_mutex_unlock(&ctx->lock);
@@ -9091,6 +9102,7 @@ static int inv_graft_swap_empty_cross_view(void)
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	for (p = 0; p < GRAFT_SWAP_EMPTY_PREFIXES; p++) {
 		uint8_t prefix[2] = { (uint8_t)(p >> 8), (uint8_t)(p & 0xff) };
+cds_ft_make_exclusive(swap);	/* DLM: cross-trie src must be exclusive */
 
 		if (cds_ft_graft_swap(live, prefix, 2, swap) != CDS_FT_STATUS_OK)
 			abort();
@@ -11140,6 +11152,7 @@ static void *inv_no_escape_writer(void *arg)
 		pthread_mutex_lock(&ctx->lock);
 		s = cds_ft_detach(ctx->T, (const uint8_t *)"T", 1, &D);
 		if (s == CDS_FT_STATUS_OK) {
+			cds_ft_make_exclusive(D);	/* DLM: cross-trie src must be exclusive */
 			enum cds_ft_status gs =
 				cds_ft_graft(ctx->S, (const uint8_t *)"X", 1, D);
 			if (gs == CDS_FT_STATUS_OK) {
@@ -11163,6 +11176,7 @@ static void *inv_no_escape_writer(void *arg)
 		pthread_mutex_lock(&ctx->lock);
 		s = cds_ft_detach(ctx->S, (const uint8_t *)"X", 1, &D);
 		if (s == CDS_FT_STATUS_OK) {
+			cds_ft_make_exclusive(D);	/* DLM: cross-trie src must be exclusive */
 			enum cds_ft_status gs =
 				cds_ft_graft(ctx->T, (const uint8_t *)"T", 1, D);
 			if (gs == CDS_FT_STATUS_OK) {
@@ -13204,6 +13218,7 @@ static int inv_merge_atomic_completeness(void)
 		__atomic_thread_fence(__ATOMIC_SEQ_CST);
 		ctx.go = 1;
 		usleep(300);	/* readers stream pre-flip (A-only) traversals */
+cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 
 		s = cds_ft_merge_at(dst, (const uint8_t *) "AA", 2, src, NULL, 0);
 
@@ -13397,6 +13412,7 @@ static int inv_merge_atomic_completeness_deep(void)
 		__atomic_thread_fence(__ATOMIC_SEQ_CST);
 		ctx.go = 1;
 		usleep(300);	/* readers stream pre-flip (A-only) traversals */
+cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 
 		s = cds_ft_merge_at(dst, (const uint8_t *) "AA", 2, src, NULL, 0);
 
@@ -13740,6 +13756,7 @@ static void *bulk_writer(void *arg)
 			pthread_mutex_lock(&ctx->lock);
 			if (cds_ft_detach(ctx->A, &P, 1, &D) == CDS_FT_STATUS_OK
 					&& D) {
+				cds_ft_make_exclusive(D);	/* DLM: cross-trie src must be exclusive */
 				cds_ft_graft(ctx->A, &P, 1, D);
 				cds_ft_destroy(D);
 			}
@@ -13766,7 +13783,9 @@ static void *bulk_writer(void *arg)
 				bulk_insert_len(B, kb, 3);
 			}
 			pthread_mutex_lock(&ctx->lock);
+			cds_ft_make_exclusive(B);	/* DLM: cross-trie src must be exclusive */
 			cds_ft_graft_swap(ctx->A, &P, 1, B);	/* A@0x50 <-> B */
+			cds_ft_make_exclusive(B);	/* DLM: cross-trie src must be exclusive */
 			cds_ft_graft_swap(ctx->A, &P, 1, B);	/* back */
 			pthread_mutex_unlock(&ctx->lock);
 			rcu_quiescent_state();
@@ -13785,6 +13804,7 @@ static void *bulk_writer(void *arg)
 				bulk_insert4(C, ((uint32_t) BULK_MERGE_PFX << 24)
 					| (2 * i + 1));
 			pthread_mutex_lock(&ctx->lock);
+			cds_ft_make_exclusive(C);	/* DLM: cross-trie src must be exclusive */
 			cds_ft_merge(ctx->A, NULL, 0, C);	/* C -> A, C empty */
 			pthread_mutex_unlock(&ctx->lock);
 			rcu_quiescent_state();

@@ -1802,6 +1802,7 @@ static int test_writer_lock_mode_fine_graft(void)
 			goto out;
 	}
 	rcu_read_lock();
+	cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 	s = cds_ft_graft(dst, (const uint8_t *) "ab", 2, src);
 	rcu_read_unlock();
 	if (s != CDS_FT_STATUS_POPULATED_ERROR) {
@@ -3488,6 +3489,7 @@ static int test_count_keys_graft_detach(void)
 
 	/* Graft staging into live at prefix "p". */
 	rcu_read_lock();
+	cds_ft_make_exclusive(staging);	/* DLM: cross-trie src must be exclusive */
 	s = cds_ft_graft(live, (const uint8_t *)"p", 1, staging);
 	rcu_read_unlock();
 	if (s != CDS_FT_STATUS_OK) {
@@ -9657,6 +9659,7 @@ static int test_merge_ordered_fixed_root(void)
 		if (s < 0) goto out;
 	}
 	rcu_read_lock();
+	cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 	s = cds_ft_merge(dst, NULL, 0, src);
 	rcu_read_unlock();
 	if (s != CDS_FT_STATUS_OK) {
@@ -9726,6 +9729,7 @@ static int merge_rerooted_glue_ordered(int shape)
 			rcu_read_unlock();
 			goto out;
 		}
+		cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 		s = cds_ft_merge_at(dst, (const uint8_t *) "mb", 2, src,
 				(const uint8_t *) "a", 1);
 	} else if (shape == 1) {
@@ -9734,6 +9738,7 @@ static int merge_rerooted_glue_ordered(int shape)
 			rcu_read_unlock();
 			goto out;
 		}
+		cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 		s = cds_ft_merge_at(dst, (const uint8_t *) "mb", 2, src,
 				(const uint8_t *) "x", 1);
 	} else {
@@ -9743,6 +9748,7 @@ static int merge_rerooted_glue_ordered(int shape)
 			rcu_read_unlock();
 			goto out;
 		}
+		cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 		s = cds_ft_merge_at(dst, (const uint8_t *) "mb", 2, src,
 				(const uint8_t *) "ca", 2);
 	}
@@ -9884,6 +9890,7 @@ static int test_merge_subpos_branch_reserve(void)
 		}
 	}
 	/* Aborted here before the reserve fix (underflow on the range recompact). */
+	cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 	s = cds_ft_merge_at(dst, dk, 2, src, sk, 1);
 	rcu_read_unlock();
 	if (s != CDS_FT_STATUS_OK) {
@@ -9976,6 +9983,7 @@ static int merge_rerooted_nosplit_ordered(int shape)
 			rcu_read_unlock();
 			goto out;
 		}
+		cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 		s = cds_ft_merge_at(dst, (const uint8_t *) "zc", 2, src,
 				(const uint8_t *) "a", 1);
 		exp_dst[0] = "za"; exp_dst[1] = "zb"; exp_dst[2] = "zc";
@@ -9989,6 +9997,7 @@ static int merge_rerooted_nosplit_ordered(int shape)
 			rcu_read_unlock();
 			goto out;
 		}
+		cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 		s = cds_ft_merge_at(dst, (const uint8_t *) "mxyz", 4, src,
 				(const uint8_t *) "x", 1);
 		exp_dst[0] = "m"; exp_dst[1] = "mxyzabc"; exp_dst[2] = "mxyzabd";
@@ -10515,6 +10524,7 @@ static int test_nonidentity_bulk_ops(void)
 
 	/* merge_at through the spine path (dst non-empty under "xy"). */
 	rcu_read_lock();
+	cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 	s = cds_ft_merge_at(dst, (const uint8_t *) "xy", 2,
 			src, (const uint8_t *) "ab", 2);
 	rcu_read_unlock();
@@ -10552,6 +10562,7 @@ static int test_nonidentity_bulk_ops(void)
 
 	/* graft_swap DELEGATE: no content at "pq" in dst -> reduces to graft. */
 	rcu_read_lock();
+	cds_ft_make_exclusive(swap);	/* DLM: cross-trie src must be exclusive */
 	s = cds_ft_graft_swap(dst, (const uint8_t *) "pq", 2, swap);
 	rcu_read_unlock();
 	if (s != CDS_FT_STATUS_OK) {
@@ -10634,6 +10645,7 @@ static int test_merge_at_overflow(void)
 
 	/* 6 + (5-1) = 10 > max 8: must be rejected up front. */
 	rcu_read_lock();
+	cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 	s = cds_ft_merge_at(dst, (const uint8_t *) "zzzzzz", 6,
 			src, (const uint8_t *) "a", 1);
 	rcu_read_unlock();
@@ -10649,6 +10661,7 @@ static int test_merge_at_overflow(void)
 
 	/* 3 + (5-1) = 7 <= 8: succeeds and raises dst's max_used_key_len. */
 	rcu_read_lock();
+	cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 	s = cds_ft_merge_at(dst, (const uint8_t *) "zzz", 3,
 			src, (const uint8_t *) "a", 1);
 	rcu_read_unlock();
@@ -10750,6 +10763,7 @@ static int test_merge_at_fixed_ordered_splice(void)
 			if (s < 0) goto out;
 		}
 		rcu_read_lock();
+		cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 		s = cds_ft_merge_at(dst, (const uint8_t *) "ab", 2,
 				src, (const uint8_t *) "ab", 2);
 		rcu_read_unlock();
@@ -10883,6 +10897,7 @@ static int test_graft_basic(void)
 
 	/* Phase 2: graft staging into live at prefix "he". */
 	rcu_read_lock();
+	cds_ft_make_exclusive(staging);	/* DLM: cross-trie src must be exclusive */
 	s = cds_ft_graft(live, (const uint8_t *)"he", 2, staging);
 	rcu_read_unlock();
 	if (s != CDS_FT_STATUS_OK) {
@@ -10980,6 +10995,7 @@ static int test_graft_displaced_external_compressed(void)
 	 * compressed-branch path.
 	 */
 	rcu_read_lock();
+	cds_ft_make_exclusive(staging);	/* DLM: cross-trie src must be exclusive */
 	s = cds_ft_graft(live, (const uint8_t *)"abcd", 4, staging);
 	rcu_read_unlock();
 	if (s != CDS_FT_STATUS_OK) {
@@ -11099,6 +11115,7 @@ static int test_graft_skipx_reloc(void)
 	{
 		uint8_t gkey[4] = { 'P', 'P', 'P', 0x7e };
 		rcu_read_lock();
+		cds_ft_make_exclusive(staging);	/* DLM: cross-trie src must be exclusive */
 		s = cds_ft_graft(live, gkey, 4, staging);
 		rcu_read_unlock();
 		if (s != CDS_FT_STATUS_OK) {
@@ -11170,6 +11187,7 @@ static int test_graft_propagate_through_compressed(void)
 	 * existing external "hello", d.pnf is the cn for "ello" with
 	 * the displaced external). */
 	rcu_read_lock();
+	cds_ft_make_exclusive(staging);	/* DLM: cross-trie src must be exclusive */
 	s = cds_ft_graft(live, (const uint8_t *)"helloX", 6, staging);
 	rcu_read_unlock();
 	if (s != CDS_FT_STATUS_OK) {
@@ -11253,6 +11271,7 @@ static int test_graft_canonicalize_at_intermediate_depth(void)
 	/* Graft staging at "he" (descent stops at empty d.nf, depth 1
 	 * < key_len 2). */
 	rcu_read_lock();
+	cds_ft_make_exclusive(staging);	/* DLM: cross-trie src must be exclusive */
 	s = cds_ft_graft(live, (const uint8_t *)"he", 2, staging);
 	rcu_read_unlock();
 	if (s != CDS_FT_STATUS_OK) {
@@ -11344,6 +11363,7 @@ static int test_graft_diverge_no_list(void)
 
 	/* Graft at "help": diverges inside the compressed "ello" -> GLUE. */
 	rcu_read_lock();
+	cds_ft_make_exclusive(staging);	/* DLM: cross-trie src must be exclusive */
 	s = cds_ft_graft(live, (const uint8_t *)"help", 4, staging);
 	rcu_read_unlock();
 	if (s != CDS_FT_STATUS_OK) {
@@ -11414,6 +11434,7 @@ static int test_graft_at_root(void)
 	}
 
 	rcu_read_lock();
+	cds_ft_make_exclusive(staging);	/* DLM: cross-trie src must be exclusive */
 	s = cds_ft_graft(live, NULL, 0, staging);
 	rcu_read_unlock();
 	if (s != CDS_FT_STATUS_OK) {
@@ -11485,6 +11506,7 @@ static int test_graft_populated_error(void)
 
 	/* Graft staging at "ab" should fail — "ab" is already populated. */
 	rcu_read_lock();
+	cds_ft_make_exclusive(staging);	/* DLM: cross-trie src must be exclusive */
 	s = cds_ft_graft(live, (const uint8_t *)"ab", 2, staging);
 	rcu_read_unlock();
 	if (s != CDS_FT_STATUS_POPULATED_ERROR) {
@@ -11530,6 +11552,7 @@ static int test_graft_different_group_error(void)
 	ft2 = create_varlen_ft(&group2);
 
 	rcu_read_lock();
+	cds_ft_make_exclusive(ft2);	/* DLM: cross-trie src must be exclusive */
 	s = cds_ft_graft(ft1, NULL, 0, ft2);
 	rcu_read_unlock();
 
@@ -11628,6 +11651,7 @@ static int test_graft_overflow_error(void)
 	 * which exceeds max_key_len = 4.
 	 */
 	rcu_read_lock();
+	cds_ft_make_exclusive(staging);	/* DLM: cross-trie src must be exclusive */
 	s = cds_ft_graft(live, (const uint8_t *)"XY", 2, staging);
 	rcu_read_unlock();
 
@@ -11717,6 +11741,7 @@ static int test_graft_swap_basic(void)
 
 	/* Swap at prefix "ab". */
 	rcu_read_lock();
+	cds_ft_make_exclusive(swap);	/* DLM: cross-trie src must be exclusive */
 	s = cds_ft_graft_swap(live, (const uint8_t *)"ab", 2, swap);
 	rcu_read_unlock();
 	if (s != CDS_FT_STATUS_OK) {
@@ -11809,6 +11834,7 @@ static int test_graft_swap_into_empty(void)
 
 	/* Swap at prefix "ab" where live is empty. */
 	rcu_read_lock();
+	cds_ft_make_exclusive(swap);	/* DLM: cross-trie src must be exclusive */
 	s = cds_ft_graft_swap(live, (const uint8_t *)"ab", 2, swap);
 	rcu_read_unlock();
 	if (s != CDS_FT_STATUS_OK) {
@@ -11910,6 +11936,7 @@ static int test_graft_swap_extract_empty_compressed_parent(void)
 		/* Extract the whole "ABCDEF" subtree into the empty swap: the graft
 		 * point is the compressed node's sole child. */
 		rcu_read_lock();
+		cds_ft_make_exclusive(swap);	/* DLM: cross-trie src must be exclusive */
 		s = cds_ft_graft_swap(live, (const uint8_t *) "ABCDEF", 6, swap);
 		rcu_read_unlock();
 		if (s != CDS_FT_STATUS_OK) {
@@ -11923,6 +11950,7 @@ static int test_graft_swap_extract_empty_compressed_parent(void)
 		rcu_read_unlock();
 		/* Graft it back. */
 		rcu_read_lock();
+		cds_ft_make_exclusive(swap);	/* DLM: cross-trie src must be exclusive */
 		s = cds_ft_graft_swap(live, (const uint8_t *) "ABCDEF", 6, swap);
 		rcu_read_unlock();
 		if (s != CDS_FT_STATUS_OK) {
@@ -11986,6 +12014,7 @@ static int test_graft_swap_at_root(void)
 
 	/* Swap at root. */
 	rcu_read_lock();
+	cds_ft_make_exclusive(swap);	/* DLM: cross-trie src must be exclusive */
 	s = cds_ft_graft_swap(live, NULL, 0, swap);
 	rcu_read_unlock();
 	if (s != CDS_FT_STATUS_OK) {
@@ -12073,6 +12102,7 @@ static int test_graft_swap_different_group_error(void)
 	ft2 = create_varlen_ft(&group2);
 
 	rcu_read_lock();
+	cds_ft_make_exclusive(ft2);	/* DLM: cross-trie src must be exclusive */
 	s = cds_ft_graft_swap(ft1, NULL, 0, ft2);
 	rcu_read_unlock();
 
@@ -12365,6 +12395,7 @@ static int test_detach_then_graft(void)
 
 	/* Graft detached content at new prefix "zz". */
 	rcu_read_lock();
+	cds_ft_make_exclusive(detached);	/* DLM: cross-trie src must be exclusive */
 	s = cds_ft_graft(ft, (const uint8_t *)"zz", 2, detached);
 	rcu_read_unlock();
 	if (s != CDS_FT_STATUS_OK) {
@@ -12528,6 +12559,7 @@ static int test_graft_swap_fixed_key(void)
 
 	/* Swap at root — exchange everything. */
 	rcu_read_lock();
+	cds_ft_make_exclusive(swap);	/* DLM: cross-trie src must be exclusive */
 	s = cds_ft_graft_swap(live, NULL, 0, swap);
 	rcu_read_unlock();
 	if (s != CDS_FT_STATUS_OK) {
@@ -12630,6 +12662,7 @@ static int test_fixed_graft_at_root(void)
 
 	/* Graft staging into live at root. */
 	rcu_read_lock();
+	cds_ft_make_exclusive(staging);	/* DLM: cross-trie src must be exclusive */
 	s = cds_ft_graft(live, NULL, 0, staging);
 	rcu_read_unlock();
 	if (s != CDS_FT_STATUS_OK) {
@@ -12732,6 +12765,7 @@ static int test_fixed_graft_nonroot_error(void)
 
 	/* Attempt a non-root graft (key_len=2 < fixed klen=4). */
 	rcu_read_lock();
+	cds_ft_make_exclusive(staging);	/* DLM: cross-trie src must be exclusive */
 	s = cds_ft_graft(live, (const uint8_t *)"\x00\x01", 2, staging);
 	rcu_read_unlock();
 	if (s != CDS_FT_STATUS_INVALID_ARGUMENT_ERROR) {
@@ -12834,6 +12868,7 @@ static int test_fixed_graft_swap_at_root(void)
 
 	/* Root-level swap: exchange everything. */
 	rcu_read_lock();
+	cds_ft_make_exclusive(swap);	/* DLM: cross-trie src must be exclusive */
 	s = cds_ft_graft_swap(live, NULL, 0, swap);
 	rcu_read_unlock();
 	if (s != CDS_FT_STATUS_OK) {
@@ -12962,6 +12997,7 @@ static int test_fixed_graft_swap_nonroot_error(void)
 
 	/* Attempt non-root graft_swap (key_len=2 < fixed klen=4). */
 	rcu_read_lock();
+	cds_ft_make_exclusive(swap);	/* DLM: cross-trie src must be exclusive */
 	s = cds_ft_graft_swap(live, (const uint8_t *)"\x01\x02", 2, swap);
 	rcu_read_unlock();
 	if (s != CDS_FT_STATUS_INVALID_ARGUMENT_ERROR) {
@@ -13735,6 +13771,7 @@ static int test_graft_swap_overflow_error(void)
 	 * exceeding max_key_len = 4.
 	 */
 	rcu_read_lock();
+	cds_ft_make_exclusive(swap);	/* DLM: cross-trie src must be exclusive */
 	s = cds_ft_graft_swap(live, (const uint8_t *)"XY", 2, swap);
 	rcu_read_unlock();
 
@@ -14022,6 +14059,7 @@ static int test_graft_detach_len_default(void)
 
 	/* graft with CDS_FT_LEN_DEFAULT → non-root → INVALID_ARGUMENT_ERROR. */
 	rcu_read_lock();
+	cds_ft_make_exclusive(other);	/* DLM: cross-trie src must be exclusive */
 	s = cds_ft_graft(ft, k, CDS_FT_LEN_DEFAULT, other);
 	rcu_read_unlock();
 	if (s != CDS_FT_STATUS_INVALID_ARGUMENT_ERROR) {
@@ -14042,6 +14080,7 @@ static int test_graft_detach_len_default(void)
 
 	/* graft_swap with CDS_FT_LEN_DEFAULT → same. */
 	rcu_read_lock();
+	cds_ft_make_exclusive(other);	/* DLM: cross-trie src must be exclusive */
 	s = cds_ft_graft_swap(ft, k, CDS_FT_LEN_DEFAULT, other);
 	rcu_read_unlock();
 	if (s != CDS_FT_STATUS_INVALID_ARGUMENT_ERROR) {
@@ -14099,6 +14138,7 @@ static int test_graft_empty_source(void)
 
 	/* Graft empty_src at "aa" (destination is empty there). */
 	rcu_read_lock();
+	cds_ft_make_exclusive(empty_src);	/* DLM: cross-trie src must be exclusive */
 	s = cds_ft_graft(live, (const uint8_t *)"aa", 2, empty_src);
 	rcu_read_unlock();
 
@@ -14166,6 +14206,7 @@ static int test_graft_reuse_after_drain(void)
 		if (s < 0) goto fail;
 	}
 	rcu_read_lock();
+	cds_ft_make_exclusive(staging);	/* DLM: cross-trie src must be exclusive */
 	s = cds_ft_graft(live, (const uint8_t *)"ab", 2, staging);
 	rcu_read_unlock();
 	if (s != CDS_FT_STATUS_OK) {
@@ -14198,6 +14239,7 @@ static int test_graft_reuse_after_drain(void)
 		if (s < 0) goto fail;
 	}
 	rcu_read_lock();
+	cds_ft_make_exclusive(staging);	/* DLM: cross-trie src must be exclusive */
 	s = cds_ft_graft(live, (const uint8_t *)"ab", 2, staging);
 	rcu_read_unlock();
 	if (s != CDS_FT_STATUS_OK) {
@@ -17164,6 +17206,7 @@ static int test_compress_graft_diverge(void)
 	cds_ft_insert(src, k_src, 2, &node_alloc(1)->node);
 
 	/* Graft source at "abx" — diverges at byte 2 of "abcdef" path. */
+	cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 	s = cds_ft_graft(ft, k_graft, 3, src);
 	if (s != CDS_FT_STATUS_OK) {
 		fprintf(stderr, "compress_graft_diverge: graft failed: %s\n",
@@ -17765,6 +17808,7 @@ static int test_compress_graft_swap_key_shorter(void)
 	cds_ft_insert(swap, k_src, 2, &node_alloc(2)->node);
 
 	/* Graft_swap at "ab" — shorter than compressed path "bcdef". */
+	cds_ft_make_exclusive(swap);	/* DLM: cross-trie src must be exclusive */
 	if (cds_ft_graft_swap(ft, (const uint8_t *)"ab", 2, swap) != CDS_FT_STATUS_OK) {
 		fprintf(stderr, "compress_graft_swap_shorter: swap failed\n");
 		rcu_read_unlock();
@@ -18859,6 +18903,7 @@ static int test_verify_graft_detach(void)
 	}
 
 	/* Graft staging into live at prefix "x". */
+	cds_ft_make_exclusive(staging);	/* DLM: cross-trie src must be exclusive */
 	s = cds_ft_graft(live, (const uint8_t *)"x", 1, staging);
 	if (s != CDS_FT_STATUS_OK) {
 		fprintf(stderr, "verify_graft_detach: graft failed: %s\n",
@@ -19251,6 +19296,7 @@ static int test_density_graft_swap(void)
 	 * into an empty slot, because graft_swap assumes the slot
 	 * already exists in the parent node.
 	 */
+	cds_ft_make_exclusive(swap);	/* DLM: cross-trie src must be exclusive */
 	s = cds_ft_graft(live, (const uint8_t *)"x", 1, swap);
 	if (s != CDS_FT_STATUS_OK) {
 		fprintf(stderr, "density_graft_swap: phase 1 swap failed: %s\n",
@@ -19278,6 +19324,7 @@ static int test_density_graft_swap(void)
 	}
 	rcu_read_unlock();
 
+	cds_ft_make_exclusive(swap);	/* DLM: cross-trie src must be exclusive */
 	s = cds_ft_graft_swap(live, (const uint8_t *)"x", 1, swap);
 	if (s != CDS_FT_STATUS_OK) {
 		fprintf(stderr, "density_graft_swap: phase 2 swap failed: %s\n",
@@ -19295,6 +19342,7 @@ static int test_density_graft_swap(void)
 	 * Phase 3: root-level graft-swap.  Exchange entire live trie
 	 * content with swap trie content.
 	 */
+	cds_ft_make_exclusive(swap);	/* DLM: cross-trie src must be exclusive */
 	s = cds_ft_graft_swap(live, NULL, 0, swap);
 	if (s != CDS_FT_STATUS_OK) {
 		fprintf(stderr, "density_graft_swap: phase 3 root swap failed: %s\n",
@@ -19709,6 +19757,7 @@ static int test_exclusive_graft_from_exclusive(void)
 	if (s < 0) { node_free(n2); goto out_both; }
 
 	rcu_read_lock();
+	cds_ft_make_exclusive(staging);	/* DLM: cross-trie src must be exclusive */
 	s = cds_ft_graft(live, (const uint8_t *)"he", 2, staging);
 	rcu_read_unlock();
 	if (s != CDS_FT_STATUS_OK)
@@ -19767,6 +19816,7 @@ static int test_exclusive_graft_swap_inherit_root(void)
 		if (s < 0) { node_free(n); goto out_case1; }
 	}
 	rcu_read_lock();
+	cds_ft_make_exclusive(swp);	/* DLM: cross-trie src must be exclusive */
 	s = cds_ft_graft_swap(dst, NULL, 0, swp);
 	rcu_read_unlock();
 	if (s != CDS_FT_STATUS_OK)
@@ -19802,6 +19852,7 @@ out_case1_dst_only:
 		if (s < 0) { node_free(n); goto out_case2; }
 	}
 	rcu_read_lock();
+	cds_ft_make_exclusive(swp);	/* DLM: cross-trie src must be exclusive */
 	s = cds_ft_graft_swap(dst, NULL, 0, swp);
 	rcu_read_unlock();
 	if (s != CDS_FT_STATUS_OK)
@@ -19857,6 +19908,7 @@ static int test_exclusive_graft_swap_inherit_non_root(void)
 	if (s < 0) { node_free(n); goto out_both; }
 
 	rcu_read_lock();
+	cds_ft_make_exclusive(swp);	/* DLM: cross-trie src must be exclusive */
 	s = cds_ft_graft_swap(dst, (const uint8_t *)"he", 2, swp);
 	rcu_read_unlock();
 	if (s != CDS_FT_STATUS_OK)
@@ -20346,6 +20398,7 @@ static int test_merge_compressed_overlap(void)
 		if (s != CDS_FT_STATUS_OK) { node_free(n); goto out; }
 	}
 
+	cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 	s = cds_ft_merge(dst, NULL, 0, src);
 	if (s != CDS_FT_STATUS_OK) {
 		fprintf(stderr, "merge_compressed_overlap: %s\n",
@@ -20591,12 +20644,14 @@ static int test_merge_invalid_arguments(void)
 		goto out_ft1a;
 	ft2 = create_varlen_ft(&group2);
 
+	cds_ft_make_exclusive(ft1b);	/* DLM: cross-trie src must be exclusive */
 	s = cds_ft_merge(NULL, NULL, 0, ft1b);
 	if (s != CDS_FT_STATUS_INVALID_ARGUMENT_ERROR) goto out;
 	s = cds_ft_merge(ft1a, NULL, 0, NULL);
 	if (s != CDS_FT_STATUS_INVALID_ARGUMENT_ERROR) goto out;
 	s = cds_ft_merge(ft1a, NULL, 0, ft1a);
 	if (s != CDS_FT_STATUS_INVALID_ARGUMENT_ERROR) goto out;
+	cds_ft_make_exclusive(ft2);	/* DLM: cross-trie src must be exclusive */
 	s = cds_ft_merge(ft1a, NULL, 0, ft2);
 	if (s != CDS_FT_STATUS_INVALID_ARGUMENT_ERROR) goto out;
 
@@ -20644,6 +20699,7 @@ static int test_merge_concurrent_source(void)
 		goto out;
 	}
 
+	cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 	s = cds_ft_merge(dst, NULL, 0, src);
 	if (s != CDS_FT_STATUS_OK) {
 		fprintf(stderr, "merge_concurrent_source: %s\n",
@@ -20907,6 +20963,7 @@ static int test_merge_at_varlen_rekey(void)
 		if (s != CDS_FT_STATUS_OK) { node_free(n); goto out; }
 	}
 
+	cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 	s = cds_ft_merge_at(dst,
 			(const uint8_t *)"dst/", 4,
 			src,
@@ -20961,6 +21018,7 @@ static int test_merge_at_fixed_rekey(void)
 		if (s != CDS_FT_STATUS_OK) { node_free(n); goto out; }
 	}
 
+	cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 	s = cds_ft_merge_at(dst,
 			&dst_prefix, 1,
 			src,
@@ -21037,6 +21095,7 @@ static int test_merge_at_overlap(void)
 		if (s != CDS_FT_STATUS_OK) { node_free(n); goto out; }
 	}
 
+	cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 	s = cds_ft_merge_at(dst,
 			(const uint8_t *)"dst/", 4,
 			src,
@@ -21109,6 +21168,7 @@ static int test_merge_at_nonroot_src(void)
 		if (s != CDS_FT_STATUS_OK) { node_free(n); goto out; }
 	}
 
+	cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 	s = cds_ft_merge_at(dst, NULL, 0, src, (const uint8_t *) "S", 1);
 	if (s != CDS_FT_STATUS_OK) {
 		fprintf(stderr, "merge_at_nonroot_src: %s\n",
@@ -21217,6 +21277,7 @@ static int test_merge_at_nonroot_dst(void)
 		if (s != CDS_FT_STATUS_OK) { node_free(n); goto out; }
 	}
 
+	cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 	s = cds_ft_merge_at(dst, (const uint8_t *) "P", 1, src, NULL, 0);
 	if (s != CDS_FT_STATUS_OK) {
 		fprintf(stderr, "merge_at_nonroot_dst: %s\n",
@@ -21314,6 +21375,7 @@ static int test_merge_at_external_dst(void)
 		if (s != CDS_FT_STATUS_OK) { node_free(n); goto out; }
 	}
 
+	cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 	s = cds_ft_merge_at(dst, (const uint8_t *) "P", 1, src, NULL, 0);
 	if (s != CDS_FT_STATUS_OK) {
 		fprintf(stderr, "merge_at_external_dst: %s\n",
@@ -21402,6 +21464,7 @@ static int test_merge_at_external_dst_splice(void)
 	}
 
 	/* src@"Q" (single leaf) re-keyed under dst@"P" -> "P" gets a 2nd entry. */
+	cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 	s = cds_ft_merge_at(dst, (const uint8_t *) "P", 1,
 			src, (const uint8_t *) "Q", 1);
 	if (s != CDS_FT_STATUS_OK) {
@@ -21484,6 +21547,7 @@ static int test_merge_at_compressed_dst_internal(void)
 		if (s != CDS_FT_STATUS_OK) { node_free(n); goto out; }
 	}
 
+	cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 	s = cds_ft_merge_at(dst, (const uint8_t *) "P", 1, src, NULL, 0);
 	if (s != CDS_FT_STATUS_OK) {
 		fprintf(stderr, "merge_at_compressed_dst_internal: %s\n",
@@ -21568,6 +21632,7 @@ static int test_merge_at_compressed_dst_compressed(void)
 			goto out;
 	}
 
+	cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 	s = cds_ft_merge_at(dst, (const uint8_t *) "P", 1,
 			src, (const uint8_t *) "Q", 1);
 	if (s != CDS_FT_STATUS_OK) {
@@ -21662,6 +21727,7 @@ static int test_merge_at_key_shorter_dst_internal(void)
 		if (s != CDS_FT_STATUS_OK) { node_free(n); goto out; }
 	}
 
+	cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 	s = cds_ft_merge_at(dst, (const uint8_t *) "ab", 2, src, NULL, 0);
 	if (s != CDS_FT_STATUS_OK) {
 		fprintf(stderr, "merge_at_key_shorter_dst_internal: %s\n",
@@ -21744,6 +21810,7 @@ static int test_merge_at_key_shorter_dst_splice(void)
 			goto out;
 	}
 
+	cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 	s = cds_ft_merge_at(dst, (const uint8_t *) "PQ", 2,
 			src, (const uint8_t *) "X", 1);
 	if (s != CDS_FT_STATUS_OK) {
@@ -21826,6 +21893,7 @@ static int test_merge_at_key_shorter_src(void)
 			goto out;
 	}
 
+	cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 	s = cds_ft_merge_at(dst, (const uint8_t *) "Q", 1,
 			src, (const uint8_t *) "XY", 2);
 	if (s != CDS_FT_STATUS_OK) {
@@ -21909,6 +21977,7 @@ static int test_merge_at_key_shorter_src_both(void)
 			goto out;
 	}
 
+	cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 	s = cds_ft_merge_at(dst, (const uint8_t *) "Qa", 2,
 			src, (const uint8_t *) "XY", 2);
 	if (s != CDS_FT_STATUS_OK) {
@@ -22000,6 +22069,7 @@ static int test_merge_at_compressed_parent_internal(void)
 		if (s != CDS_FT_STATUS_OK) { node_free(n); goto out; }
 	}
 
+	cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 	s = cds_ft_merge_at(dst, (const uint8_t *) "aXY", 3, src, NULL, 0);
 	if (s != CDS_FT_STATUS_OK) {
 		fprintf(stderr, "merge_at_compressed_parent_internal: %s\n",
@@ -22087,6 +22157,7 @@ static int test_merge_at_compressed_parent_splice(void)
 		}
 	}
 
+	cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 	s = cds_ft_merge_at(dst, (const uint8_t *) "aXY", 3, src, NULL, 0);
 	if (s != CDS_FT_STATUS_OK) {
 		fprintf(stderr, "merge_at_compressed_parent_splice: %s\n",
@@ -22149,6 +22220,7 @@ static int test_merge_at_fixed_unequal_keylen(void)
 	if (cds_ft_create(group, NULL, &src) < 0)
 		goto out_dst;
 
+	cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 	s = cds_ft_merge_at(dst, b, 2, src, &a, 1);
 	if (s != CDS_FT_STATUS_INVALID_ARGUMENT_ERROR) {
 		fprintf(stderr, "merge_at_fixed_unequal_keylen: expected INVALID, got %s\n",
@@ -23705,6 +23777,7 @@ static int run_split_oom_graft(const char *label,
 		/* Fail the (n+1)-th allocation performed by the graft. */
 		cds_ft_fault_alloc_countdown = n;
 		rcu_read_lock();
+		cds_ft_make_exclusive(staging);	/* DLM: cross-trie src must be exclusive */
 		s = cds_ft_graft(live, gkey, glen, staging);
 		rcu_read_unlock();
 		cds_ft_fault_alloc_countdown = -1;
@@ -23790,6 +23863,7 @@ static int run_graft_oom_nosplit(int nr_faults)
 
 		cds_ft_fault_alloc_countdown = n;
 		rcu_read_lock();
+		cds_ft_make_exclusive(staging);	/* DLM: cross-trie src must be exclusive */
 		s = cds_ft_graft(live, (const uint8_t *)"az", 2, staging);
 		rcu_read_unlock();
 		cds_ft_fault_alloc_countdown = -1;
@@ -23892,6 +23966,7 @@ static int run_split_oom_graft_swap(const char *label,
 		/* Fail the (n+1)-th allocation performed by the swap. */
 		cds_ft_fault_alloc_countdown = n;
 		rcu_read_lock();
+		cds_ft_make_exclusive(swap);	/* DLM: cross-trie src must be exclusive */
 		s = cds_ft_graft_swap(live, gkey, glen, swap);
 		rcu_read_unlock();
 		cds_ft_fault_alloc_countdown = -1;
@@ -24191,6 +24266,7 @@ static int run_merge_oom(int nr_faults)
 		/* Fail the (n+1)-th allocation performed by the merge. */
 		cds_ft_fault_alloc_countdown = n;
 		rcu_read_lock();
+		cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 		s = cds_ft_merge(dst, NULL, 0, src);
 		rcu_read_unlock();
 		cds_ft_fault_alloc_countdown = -1;
@@ -24290,6 +24366,7 @@ static int run_merge_oom_empty_dst(int nr_faults)
 			/* Fail the (n+1)-th allocation performed by the merge. */
 			cds_ft_fault_alloc_countdown = n;
 			rcu_read_lock();
+			cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 			s = cds_ft_merge_at(dst, NULL, 0, src, src_key,
 					src_key_len);
 			rcu_read_unlock();
@@ -24403,6 +24480,7 @@ static int run_merge_oom_diverged_dst(int nr_faults)
 
 			cds_ft_fault_alloc_countdown = n;
 			rcu_read_lock();
+			cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 			s = cds_ft_merge_at(dst, (const uint8_t *) mkey, mklen,
 					src, NULL, 0);
 			rcu_read_unlock();
@@ -24506,6 +24584,7 @@ static int run_merge_oom_subpos_residual(int nr_faults)
 		/* Fail the (n+1)-th allocation performed by the merge. */
 		cds_ft_fault_alloc_countdown = n;
 		rcu_read_lock();
+		cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 		s = cds_ft_merge_at(dst, (const uint8_t *)"zc", 2,
 				src, (const uint8_t *)"ca", 2);
 		rcu_read_unlock();
@@ -24598,6 +24677,7 @@ static int run_merge_oom_subpos_glue(int nr_faults)
 
 		cds_ft_fault_alloc_countdown = n;
 		rcu_read_lock();
+		cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 		s = cds_ft_merge_at(dst, (const uint8_t *)"mb", 2,
 				src, (const uint8_t *)"ca", 2);
 		rcu_read_unlock();
@@ -24687,6 +24767,7 @@ static int run_merge_oom_subpos_branch(int nr_faults)
 
 		cds_ft_fault_alloc_countdown = n;
 		rcu_read_lock();
+		cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 		s = cds_ft_merge_at(dst, (const uint8_t *)"mxyz", 4,
 				src, (const uint8_t *)"ca", 2);
 		rcu_read_unlock();
@@ -24784,9 +24865,11 @@ static int run_merge_oom_rerooted_glue(int nr_faults, int shape)
 		cds_ft_fault_alloc_countdown = n;
 		rcu_read_lock();
 		if (shape == 0)
+			cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 			s = cds_ft_merge_at(dst, (const uint8_t *)"mb", 2,
 					src, (const uint8_t *)"a", 1);
 		else
+			cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 			s = cds_ft_merge_at(dst, (const uint8_t *)"mb", 2,
 					src, (const uint8_t *)"x", 1);
 		rcu_read_unlock();
@@ -24916,6 +24999,7 @@ static int run_merge_oom_rerooted_nosplit(int nr_faults, int src_shape,
 
 		cds_ft_fault_alloc_countdown = n;
 		rcu_read_lock();
+		cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 		s = cds_ft_merge_at(dst, (const uint8_t *)dst_key, dst_key_len,
 				src, (const uint8_t *)src_key, strlen(src_key));
 		rcu_read_unlock();
@@ -25045,6 +25129,7 @@ static int run_merge_oom_key_shorter_diverged(int nr_faults, int pshape,
 
 		cds_ft_fault_alloc_countdown = n;
 		rcu_read_lock();
+		cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 		s = cds_ft_merge_at(dst, (const uint8_t *)dst_key, strlen(dst_key),
 				src, (const uint8_t *)src_key, strlen(src_key));
 		rcu_read_unlock();
@@ -25148,6 +25233,7 @@ static int run_merge_oom_subpos_external_nodes(int nr_faults)
 
 		cds_ft_fault_alloc_countdown = n;
 		rcu_read_lock();
+		cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 		s = cds_ft_merge_at(dst, (const uint8_t *)"zc", 2,
 				src, (const uint8_t *)"ca", 2);
 		rcu_read_unlock();
@@ -25318,6 +25404,7 @@ static int run_merge_oom_overlap(int nr_faults)
 
 		cds_ft_fault_alloc_countdown = n;
 		rcu_read_lock();
+		cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 		s = cds_ft_merge(dst, NULL, 0, src);
 		rcu_read_unlock();
 		cds_ft_fault_alloc_countdown = -1;
@@ -25418,6 +25505,7 @@ static int run_merge_oom_compressed(int nr_faults)
 
 		cds_ft_fault_alloc_countdown = n;
 		rcu_read_lock();
+		cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 		s = cds_ft_merge(dst, NULL, 0, src);
 		rcu_read_unlock();
 		cds_ft_fault_alloc_countdown = -1;
@@ -25515,6 +25603,7 @@ static int run_merge_oom_nonroot_src(int nr_faults)
 
 		cds_ft_fault_alloc_countdown = n;
 		rcu_read_lock();
+		cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 		s = cds_ft_merge_at(dst, NULL, 0, src, (const uint8_t *) "S", 1);
 		rcu_read_unlock();
 		cds_ft_fault_alloc_countdown = -1;
@@ -25653,6 +25742,7 @@ static int run_merge_oom_ordered_src(int nr_faults)
 
 		cds_ft_fault_alloc_countdown = n;
 		rcu_read_lock();
+		cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 		s = cds_ft_merge_at(dst, (const uint8_t *) "Q", 1,
 				src, (const uint8_t *) "XY", 2);
 		rcu_read_unlock();
@@ -25745,6 +25835,7 @@ static int run_merge_oom_nonroot_dst(int nr_faults)
 
 		cds_ft_fault_alloc_countdown = n;
 		rcu_read_lock();
+		cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 		s = cds_ft_merge_at(dst, (const uint8_t *) "P", 1, src, NULL, 0);
 		rcu_read_unlock();
 		cds_ft_fault_alloc_countdown = -1;
@@ -25840,6 +25931,7 @@ static int run_merge_oom_external_dst(int nr_faults)
 
 		cds_ft_fault_alloc_countdown = n;
 		rcu_read_lock();
+		cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 		s = cds_ft_merge_at(dst, (const uint8_t *) "P", 1, src, NULL, 0);
 		rcu_read_unlock();
 		cds_ft_fault_alloc_countdown = -1;
@@ -25924,6 +26016,7 @@ static int run_merge_oom_compressed_dst(int nr_faults)
 
 		cds_ft_fault_alloc_countdown = n;
 		rcu_read_lock();
+		cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 		s = cds_ft_merge_at(dst, (const uint8_t *) "P", 1,
 				src, (const uint8_t *) "Q", 1);
 		rcu_read_unlock();
@@ -26005,6 +26098,7 @@ static int run_merge_oom_key_shorter_dst(int nr_faults)
 
 		cds_ft_fault_alloc_countdown = n;
 		rcu_read_lock();
+		cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 		s = cds_ft_merge_at(dst, (const uint8_t *) "ab", 2, src, NULL, 0);
 		rcu_read_unlock();
 		cds_ft_fault_alloc_countdown = -1;
@@ -26083,6 +26177,7 @@ static int run_merge_oom_key_shorter_src(int nr_faults)
 
 		cds_ft_fault_alloc_countdown = n;
 		rcu_read_lock();
+		cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 		s = cds_ft_merge_at(dst, (const uint8_t *) "Q", 1,
 				src, (const uint8_t *) "XY", 2);
 		rcu_read_unlock();
@@ -26163,6 +26258,7 @@ static int run_merge_oom_compressed_parent_dst(int nr_faults)
 
 		cds_ft_fault_alloc_countdown = n;
 		rcu_read_lock();
+		cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
 		s = cds_ft_merge_at(dst, (const uint8_t *) "aXY", 3, src, NULL, 0);
 		rcu_read_unlock();
 		cds_ft_fault_alloc_countdown = -1;
