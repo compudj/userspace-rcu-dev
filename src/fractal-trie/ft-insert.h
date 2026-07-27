@@ -1762,8 +1762,6 @@ int ft_attach_node(struct cds_ft *ft,
 			 */
 			assert(!count_deferred ||
 				iter_dest_node_flag == attach_node_flag);
-			if (count_deferred)
-				ft_flip_txn_record_nr_child_inc(ic->txn, metadata);
 			ft_node_get_nth_skip(iter_dest_node_flag, &slot_ptr,
 				key_value, FT_PF_NONE);
 			assert(slot_ptr);
@@ -1788,21 +1786,35 @@ int ft_attach_node(struct cds_ft *ft,
 			 * (iter_dest != attach), so it needs no guard here.
 			 */
 			/*
-			 * @count_deferred already recorded a CLEAN-LIVE edge on
-			 * this very state word (the nr_child++ above), which IS
-			 * this guard and is strictly stronger -- so REPLACE the
-			 * guard rather than adding to it, per the rule at
-			 * ft_flip_txn_record_release_copying.  Keeping both is
-			 * not merely redundant: two touches of one slot is the
-			 * same-slot coincidence the engine's age-0 fast path
-			 * refuses to resolve, forcing every such insert to abort
-			 * unpublished and re-run (measured 278x more age-0
-			 * aborts).  See ft_flip_txn_record_nr_child_inc.
+			 * I-1, closed: @slot_ptr lives INSIDE the attach node, so
+			 * the attach node is this op's lock-set member and a plain
+			 * guard left it merely validated, never held -- the gap the
+			 * lock-set completeness audit quantified (3 slot writes, 0
+			 * acquires).  ACQUIRE it: under lock_fine that records the
+			 * {COPYING|s -> s} release, and since f7cc59f9 a miss is
+			 * all-or-none (abort + re-descend) rather than a silent
+			 * degrade to the guard.  Non-lock_fine still lands on the
+			 * guard, unchanged.
+			 *
+			 * ORDER IS LOAD-BEARING: the acquire's release must be
+			 * recorded BEFORE @count_deferred's nr_child++ edge, since
+			 * both target this one state word.  release-then-count
+			 * chains to a single {COPYING|s -> s+1} -- release AND
+			 * increment in one record; count-then-release would arrive
+			 * with expected old COPYING|s against a pending s+1 and
+			 * POISON the descriptor (the ordering rule spelled out at
+			 * ft_flip_txn_record_release_copying).  Hence the count
+			 * edge moved down here from just after the reserve.
+			 *
+			 * The RELOCATION arm needs nothing: the reserve's recompact
+			 * already locked the grandparent it republishes into and
+			 * recorded its release (see the !ft->lock_fine guard below).
 			 */
-			if (iter_dest_node_flag == attach_node_flag &&
-					!count_deferred)
-				ft_flip_txn_guard_parent(ft, ic->txn,
+			if (iter_dest_node_flag == attach_node_flag)
+				ft_flip_txn_lock_or_guard_parent(ft, ic->txn,
 					iter_dest_node_flag);
+			if (count_deferred)
+				ft_flip_txn_record_nr_child_inc(ic->txn, metadata);
 			ft_flip_txn_record_reserved(ic->txn, (void **) slot_ptr,
 				(void *) old_node_flag,
 				(void *) iter_node_flag);
@@ -1996,7 +2008,18 @@ int ft_attach_node(struct cds_ft *ft,
 				ret = -EAGAIN;
 				goto check_error;
 			}
-			ft_flip_txn_guard_parent(ft, ic->txn,
+			/*
+			 * The edges below write @attach_node_flag_ptr, a slot in
+			 * the GRANDPARENT, so the grandparent is a lock-set member
+			 * -- ACQUIRE it rather than merely guarding it (I-1's
+			 * second half).  It is a value-swap target: the op does not
+			 * change its nr_child and never copies its body under the
+			 * lock, so the release terminal is clean and no count edge
+			 * shares the word.  A miss aborts and re-descends
+			 * (f7cc59f9), which is what the ft_get_parent_slot
+			 * mismatch just above already does for the stale-slot case.
+			 */
+			ft_flip_txn_lock_or_guard_parent(ft, ic->txn,
 				attach_meta->parent);
 			_ft_publish_to_parent(ft, attach_node_flag,
 				attach_node_flag_ptr, iter_dest_node_flag,
