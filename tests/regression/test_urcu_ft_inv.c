@@ -6101,9 +6101,24 @@ static void *inv_root_internal_writer(void *arg)
 		pthread_mutex_lock(&ctx->lock);
 		/* KEY_SHORTER graft_swap: "AB" splits the compressed "ABCDEFG"
 		 * prefix; the displaced subtree builds @swap's new root.  Twice =
-		 * round-trip (content returns to @live). */
-		cds_ft_graft_swap(ctx->live, (const uint8_t *) "A", 1, ctx->swap);
-		cds_ft_graft_swap(ctx->live, (const uint8_t *) "A", 1, ctx->swap);
+		 * round-trip (content returns to @live).
+		 *
+		 * The status is CHECKED, not discarded: these two calls used to be
+		 * bare, so a build where the swap is refused (CDS_FT_WRITER_LOCK_FINE
+		 * rejects a non-exclusive cross-trie source with BUSY_ERROR, and
+		 * @swap is reader-watched here on purpose) mutated NOTHING while the
+		 * "root is always internal" invariant held trivially -- the oracle
+		 * reported ok having tested nothing.  A silent green is worse than a
+		 * failure: fail loudly instead. */
+		if (cds_ft_graft_swap(ctx->live, (const uint8_t *) "A", 1,
+				ctx->swap) != CDS_FT_STATUS_OK ||
+		    cds_ft_graft_swap(ctx->live, (const uint8_t *) "A", 1,
+				ctx->swap) != CDS_FT_STATUS_OK) {
+			report_violation(ctx->test_name,
+				"graft_swap failed: the round-trip never ran, so this oracle would have passed vacuously");
+			pthread_mutex_unlock(&ctx->lock);
+			break;
+		}
 		pthread_mutex_unlock(&ctx->lock);
 		rcu_quiescent_state();
 	}
@@ -11470,6 +11485,37 @@ static void inv_merge_remove_key(struct cds_ft *ft, struct cds_ft_iter *iter,
 		node_free_rcu(to_test_node(head));
 }
 
+/*
+ * DLM: a cross-trie merge needs an EXCLUSIVE source, but these oracles' @src is
+ * LIVE and reader-watched on purpose (rargs[i].trie = is_src ? src : dst), so
+ * cds_ft_make_exclusive would be a promise the oracle exists to break.  Detach
+ * the moved region first: cds_ft_detach returns the detached trie exclusive by
+ * construction ("no external handle to @detached existed before this call"), so
+ * the merge half is DLM-legal and skips its own grace period.  Design note
+ * decision (C): a cross-trie op is two sequential single-domain commits.
+ *
+ * The oracles' invariant is unaffected because it is PER-TRIE -- an ordered
+ * traversal of src (or dst) never escapes that trie's key namespace and never
+ * loops.  Detaching empties src, which readers of src may legitimately observe;
+ * it never shows them a key outside the namespace.
+ */
+static enum cds_ft_status inv_merge_detached(struct cds_ft *dst,
+		const uint8_t *dkey, size_t dlen,
+		struct cds_ft *src, const uint8_t *skey, size_t slen)
+{
+	struct cds_ft *moved = NULL;
+	enum cds_ft_status s;
+
+	s = cds_ft_detach(src, skey, slen, &moved);
+	if (s != CDS_FT_STATUS_OK)
+		return s;
+	if (!moved)
+		return CDS_FT_STATUS_OK;	/* nothing matched the prefix */
+	s = cds_ft_merge_at(dst, dkey, dlen, moved, NULL, 0);
+	cds_ft_destroy(moved);			/* emptied by the merge */
+	return s;
+}
+
 static void *inv_merge_no_escape_writer(void *arg)
 {
 	struct inv_merge_ctx *ctx = (struct inv_merge_ctx *) arg;
@@ -11502,7 +11548,7 @@ static void *inv_merge_no_escape_writer(void *arg)
 		 * The application mutex (ctx->lock) provides writer exclusion.
 		 */
 		pthread_mutex_lock(&ctx->lock);
-		s = cds_ft_merge(ctx->dst, NULL, 0, ctx->src);
+		s = inv_merge_detached(ctx->dst, NULL, 0, ctx->src, NULL, 0);
 		pthread_mutex_unlock(&ctx->lock);
 		if (s != CDS_FT_STATUS_OK) {
 			fprintf(stderr, "inv_merge writer: %s\n",
@@ -11690,7 +11736,7 @@ static void *inv_merge_nonroot_dst_writer(void *arg)
 
 		/* Merge the root source into dst at the interior key "T". */
 		pthread_mutex_lock(&ctx->lock);
-		s = cds_ft_merge_at(ctx->dst, (const uint8_t *) "T", 1,
+		s = inv_merge_detached(ctx->dst, (const uint8_t *) "T", 1,
 				ctx->src, NULL, 0);
 		pthread_mutex_unlock(&ctx->lock);
 		if (s != CDS_FT_STATUS_OK) {
@@ -12361,7 +12407,7 @@ static void *inv_merge_compressed_dst_writer(void *arg)
 		struct ft_test_node *n;
 
 		pthread_mutex_lock(&ctx->lock);
-		s = cds_ft_merge_at(ctx->dst, (const uint8_t *) "T", 1,
+		s = inv_merge_detached(ctx->dst, (const uint8_t *) "T", 1,
 				ctx->src, NULL, 0);
 		pthread_mutex_unlock(&ctx->lock);
 		if (s != CDS_FT_STATUS_OK) {
@@ -12569,7 +12615,7 @@ static void *inv_merge_key_shorter_dst_writer(void *arg)
 		struct ft_test_node *n;
 
 		pthread_mutex_lock(&ctx->lock);
-		s = cds_ft_merge_at(ctx->dst, (const uint8_t *) "Ta", 2,
+		s = inv_merge_detached(ctx->dst, (const uint8_t *) "Ta", 2,
 				ctx->src, NULL, 0);
 		pthread_mutex_unlock(&ctx->lock);
 		if (s != CDS_FT_STATUS_OK) {
@@ -12783,7 +12829,21 @@ static void *inv_merge_key_shorter_src_writer(void *arg)
 				ctx->src, (const uint8_t *) "XY", 2);
 		pthread_mutex_unlock(&ctx->lock);
 		if (s != CDS_FT_STATUS_OK) {
-			fprintf(stderr, "inv_merge_key_shorter_src writer: %s\n",
+			/*
+			 * Not merely logged: bailing here leaves the readers
+			 * with nothing to observe, so the oracle would report
+			 * ok having exercised NOTHING -- which is exactly what
+			 * happens under CDS_FT_WRITER_LOCK_FINE, where this
+			 * live cross-trie @src is refused with BUSY_ERROR.
+			 * Unlike its siblings this one cannot be decomposed
+			 * into detach+merge: cds_ft_detach STRIPS the @key
+			 * prefix, so an exact-"XY" key detaches to a zero-length
+			 * key and merges back as a bare "Q" -- an out-of-
+			 * namespace key the reader rightly flags.  Fail loudly
+			 * until the shape is resolved.
+			 */
+			report_violation(ctx->test_name,
+				"merge refused (%s): the writer never ran, so this oracle would have passed vacuously",
 				cds_ft_status_to_string(s));
 			break;
 		}
@@ -12988,7 +13048,7 @@ static void *inv_merge_compressed_parent_dst_writer(void *arg)
 		struct ft_test_node *n;
 
 		pthread_mutex_lock(&ctx->lock);
-		s = cds_ft_merge_at(ctx->dst, (const uint8_t *) "aXY", 3,
+		s = inv_merge_detached(ctx->dst, (const uint8_t *) "aXY", 3,
 				ctx->src, NULL, 0);
 		pthread_mutex_unlock(&ctx->lock);
 		if (s != CDS_FT_STATUS_OK) {
