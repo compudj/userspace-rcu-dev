@@ -27626,10 +27626,18 @@ static int test_fine_lock_acquire_fault(void)
 
 	/*
 	 * Split phase: force the compressed-split publish acquire
-	 * (ft_insert_publish_or_park) to MISS, so the guard fallback fires.  Build
-	 * a group's compressed chain (base), then insert each diverger under the
-	 * fault so the split's forward publish takes the fallback; the insert must
-	 * still succeed (the guard passes -- the node is clean) and verify clean.
+	 * (ft_insert_publish_or_park) to MISS.  Build a group's compressed chain
+	 * (base), then insert each diverger under the fault so the split's
+	 * forward publish hits the miss; the insert must still succeed and verify
+	 * clean.
+	 *
+	 * It succeeds by RE-DESCENDING, not by degrading.  The acquire used to
+	 * fall back to a plain guard and carry on; it is now all-or-none -- a miss
+	 * records ft_flip_txn::acquire_miss and the commit ABORTs unpublished, so
+	 * the op retries.  The countdown is one-shot, so the retry acquires and
+	 * the insert lands.  What this phase asserts is therefore unchanged (the
+	 * insert succeeds, the trie verifies) while the mechanism underneath it
+	 * is the stronger one the sw cutover needs.
 	 */
 	{
 		struct cds_ft_group *sg;

@@ -286,6 +286,13 @@ struct ft_flip_txn {
 	 */
 	struct cds_ft_metadata *copying[FT_FLIP_TXN_MAX_COPYING];
 	unsigned int nr_copying;
+	/*
+	 * Set when a per-node lock acquire MISSED (see
+	 * ft_flip_txn_lock_or_guard_parent).  The op then structurally writes a
+	 * slot whose owner it does not hold, so the commit must ABORT rather
+	 * than publish: an all-or-none lock-set, with the miss re-descending.
+	 */
+	bool acquire_miss;
 #ifdef FEATURE_FT_MW_DLM_ACQUIRE
 	/*
 	 * MIXED sw/mw commit (DLM lock_fine): when true, the STRUCTURAL record
@@ -356,6 +363,7 @@ struct ft_flip_txn *ft_flip_txn_create(void)
 	urcu_txn_expect_conflict(t->mtxn);
 	t->reserved = false;		/* unbounded: @mtxn grows as edges record */
 	t->nr_copying = 0;
+	t->acquire_miss = false;
 #ifdef FEATURE_FT_MW_DLM_ACQUIRE
 	t->structural_sw = false;	/* all-MW until a caller opts in under lock_fine */
 #endif
@@ -420,6 +428,7 @@ struct ft_flip_txn *ft_flip_txn_create_bounded(unsigned int cap)
 	}
 	t->reserved = true;
 	t->nr_copying = 0;
+	t->acquire_miss = false;
 #ifdef FEATURE_FT_MW_DLM_ACQUIRE
 	t->structural_sw = false;	/* all-MW until a caller opts in under lock_fine */
 #endif
@@ -463,6 +472,7 @@ struct ft_flip_txn *ft_flip_txn_create_bounded_on(struct urcu_txn *op,
 	}
 	t->reserved = true;
 	t->nr_copying = 0;
+	t->acquire_miss = false;
 #ifdef FEATURE_FT_MW_DLM_ACQUIRE
 	t->structural_sw = false;	/* all-MW until a caller opts in under lock_fine */
 #endif
@@ -791,6 +801,22 @@ enum urcu_txn_status ft_flip_txn_commit(struct cds_ft *ft,
 				ft->group->flavor->update_call_rcu;
 	enum urcu_txn_status st;
 
+	if (caa_unlikely(t->acquire_miss)) {
+		/*
+		 * A lock-set member was not acquired, so this attempt writes a
+		 * slot it does not own: discard it unpublished and report ABORT,
+		 * which every caller already routes to a re-descend.  Age the
+		 * handle first, exactly as a real contention abort does inside
+		 * urcu_txn_commit_flavor -- without it the op never advances
+		 * txn->retry, never escalates to the FIFO lane, and a contended
+		 * node could starve it indefinitely.
+		 */
+		urcu_txn_conflict(t->mtxn);
+		FT_TP(txn_commit, (const void *) t->mtxn,
+			(int) URCU_TXN_STATUS_ABORT);
+		ft_flip_txn_destroy(t);
+		return URCU_TXN_STATUS_ABORT;
+	}
 	st = urcu_txn_commit_flavor(t->mtxn, reclaim);
 	FT_TP(txn_commit, (const void *) t->mtxn, (int) st);
 	/*
@@ -1930,7 +1956,24 @@ fault_miss:
 			ft_flip_txn_copying_register(t, pmeta);
 			return;
 		}
-		/* acquire miss -> guard fallback (value-swap target: safe). */
+		/*
+		 * ALL-OR-NONE.  A miss used to degrade to the plain guard below
+		 * and carry on.  That is sound only while every structural edge
+		 * installs by CAS: the guard aborts iff the peer STILL holds the
+		 * node at commit, so a peer that releases in between leaves us
+		 * publishing into a slot we never locked.  Under MW the record's
+		 * expected-old still arbitrates that, which is why the fallback
+		 * was safe; under the SW cutover the park cannot fail, and the
+		 * same window becomes a LOST UPDATE.
+		 *
+		 * So record the miss and let the commit ABORT.  Deliberately not
+		 * a spin: waiting for the holder's release while occupying a
+		 * lane turn is the circular wait that deadlocked step 2 (see the
+		 * escalation-lane note at ft_writer_lock_scope_enter).  The
+		 * guard is still planted -- harmless, and it keeps the record
+		 * shape identical between the hit and miss paths.
+		 */
+		t->acquire_miss = true;
 	}
 	ft_flip_txn_guard_parent(ft, t, parent_nf);
 }
