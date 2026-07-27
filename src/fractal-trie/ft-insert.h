@@ -1787,7 +1787,20 @@ int ft_attach_node(struct cds_ft *ft,
 			 * invisible fresh copy, guarded at its grandparent slot below
 			 * (iter_dest != attach), so it needs no guard here.
 			 */
-			if (iter_dest_node_flag == attach_node_flag)
+			/*
+			 * @count_deferred already recorded a CLEAN-LIVE edge on
+			 * this very state word (the nr_child++ above), which IS
+			 * this guard and is strictly stronger -- so REPLACE the
+			 * guard rather than adding to it, per the rule at
+			 * ft_flip_txn_record_release_copying.  Keeping both is
+			 * not merely redundant: two touches of one slot is the
+			 * same-slot coincidence the engine's age-0 fast path
+			 * refuses to resolve, forcing every such insert to abort
+			 * unpublished and re-run (measured 278x more age-0
+			 * aborts).  See ft_flip_txn_record_nr_child_inc.
+			 */
+			if (iter_dest_node_flag == attach_node_flag &&
+					!count_deferred)
 				ft_flip_txn_guard_parent(ft, ic->txn,
 					iter_dest_node_flag);
 			ft_flip_txn_record_reserved(ic->txn, (void **) slot_ptr,

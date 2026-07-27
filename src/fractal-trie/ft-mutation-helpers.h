@@ -1666,20 +1666,42 @@ uintptr_t ft_flip_txn_record_tombstone(struct ft_flip_txn *t,
  * never was: between the reserve and the commit the counted child is invisible
  * (NULL slot), so an eager nr_child counts a child no reader can reach.
  *
- * ORDERING / RESERVATION.  Callers record this at the same point they plant the
- * publish target's §4.B guard (ft_flip_txn_guard_parent) -- the same word, so
- * the two CHAIN into ONE record and the arm's existing guard reservation covers
- * it (net-zero, exactly as ft_flip_txn_lock_or_guard_parent's release/guard
- * swap).  That position is also what keeps it on the safe side of the
- * release-then-guard rule at ft_flip_txn_record_release_copying: a lock release
- * on this word is recorded by the reserve's recompact EARLIER in the same txn,
- * so this edge chains onto it ({COPYING|s -> s} then {s -> s+1} = release AND
- * increment in one atomic record) rather than poisoning it.
+ * THIS EDGE *IS* THE §4.B GUARD -- do not plant one beside it.  The expected
+ * old is the CLEAN-LIVE value (tombstone and copy-fence masked off), exactly
+ * what ft_flip_txn_guard_parent validates, so a peer that freezes, retires or
+ * copy-fences the holder between here and the commit fails this record's CAS
+ * just as it would have failed the guard; and a holder already DEAD at record
+ * time cannot match a clean-live expectation, so the publish can never settle
+ * into a retired copy.  It is the guard plus the increment in ONE record --
+ * the same "the release record IS the guard, and it is strictly stronger, so a
+ * converted site REPLACES its guard rather than adding to it" rule stated at
+ * ft_flip_txn_record_release_copying.
+ *
+ * ★ WHY THAT MATTERS FOR SPEED, not just tidiness.  A guard recorded BESIDE
+ * this edge lands on the SAME state word, and a second touch of a slot the
+ * transaction has already touched is precisely what the engine's age-0 fast
+ * path refuses to resolve: it keeps a Bloom filter but never calls find, so any
+ * same-slot coincidence sets esc_pending and FORCES the commit to ABORT
+ * unpublished, to be re-run at age 1+ where the full chaining path runs
+ * (rcu-txn.h, "the trade: age 0 never runs find, at the price of a whole extra
+ * attempt").  Keeping both records therefore costs EVERY such insert a second
+ * commit attempt -- measured at 650460 age-0 aborts over one in-place ft_unit
+ * run versus 2256 with the single fused record, a 278x difference.  Same-slot
+ * chaining is CORRECT, but on this path it is never free.
+ *
+ * ORDERING / RESERVATION.  Recorded where the guard used to be, so it inherits
+ * the arm's existing guard reservation (net-zero) and stays on the safe side of
+ * the release-then-guard rule: a lock release on this word is recorded by the
+ * reserve's recompact EARLIER in the same txn, so this edge chains onto it
+ * ({COPYING|s -> s} then {s -> s+1} = release AND increment in one record)
+ * rather than poisoning it.
  *
  * READ-YOUR-OWN-WRITES: expected-old comes from urcu_txn_load, not a raw read,
  * for the reason spelled out on ft_flip_txn_record_tombstone -- the word is in
- * this txn's own write set whenever a release/tombstone/guard already touched
- * it, and a raw committed read would be a torn read-set the engine poisons.
+ * this txn's own write set whenever a release/tombstone already touched it, and
+ * a raw committed read would be a torn read-set the engine poisons.  A release
+ * recorded earlier makes the RYW value ALREADY clean, so the mask is a no-op
+ * there and the chain is exact.
  */
 static inline
 void ft_flip_txn_record_nr_child_inc(struct ft_flip_txn *t,
@@ -1687,10 +1709,11 @@ void ft_flip_txn_record_nr_child_inc(struct ft_flip_txn *t,
 {
 	uintptr_t old = (uintptr_t) urcu_txn_load(t->mtxn,
 			(void **) &meta->state, FT_STATE_PROXY);
+	uintptr_t live = old & ~(uintptr_t) (FT_STATE_TOMBSTONE | FT_STATE_COPYING);
 
-	assert(ft_state_nr_child(old) < FT_STATE_NR_CHILD_VALMASK);
+	assert(ft_state_nr_child(live) < FT_STATE_NR_CHILD_VALMASK);
 	ft_flip_txn_record_tag(t, (void **) &meta->state,
-			(void *) old, (void *) (old + FT_STATE_NR_CHILD_ONE),
+			(void *) live, (void *) (live + FT_STATE_NR_CHILD_ONE),
 			FT_STATE_PROXY);
 }
 
