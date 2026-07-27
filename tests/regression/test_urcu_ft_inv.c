@@ -73,7 +73,16 @@
 #define NR_TESTS_REKEY_DLM	0
 #endif
 
-#define NR_TESTS	(68 + NR_TESTS_REKEY_DLM)
+/*
+ * Base count = the RUN_TEST invocations in main() outside the DLM #ifdef.
+ * Keep it EXACT: libtap's exit_status() returns planned-minus-run, so an
+ * over-declared plan is a silent nonzero exit that nothing reads -- the gate
+ * counted "ok "/"not ok " lines only, so 65 tests against a plan of 68 scored
+ * green for as long as the constant was stale.  ft_parallel_gate.sh now
+ * compares the run count against this plan, so retiring a test means
+ * decrementing here in the same commit.
+ */
+#define NR_TESTS	(65 + NR_TESTS_REKEY_DLM)
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
