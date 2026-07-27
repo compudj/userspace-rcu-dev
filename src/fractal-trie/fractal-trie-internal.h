@@ -829,17 +829,30 @@ struct ft_pub_rec {
 #define FT_STATE_NR_CHILD_MASK		(FT_STATE_NR_CHILD_VALMASK << FT_STATE_NR_CHILD_SHIFT)
 #define FT_STATE_NR_CHILD_ONE		((uintptr_t) 1 << FT_STATE_NR_CHILD_SHIFT)
 /*
- * parent_slot_offset (0..255): the pointer-stride offset of this node's slot in
- * its parent, packed ABOVE nr_child so that a re-home -- which changes both the
- * parent pointer and the slot offset -- commits parent-edge + offset as ONE
- * atomic MCAS state edge (a concurrent backtracker never straddles a
- * new-parent/old-offset window).  Access ONLY via the ft_meta_parent_slot_offset*
- * helpers (they mask/preserve the tag + nr_child bits).
+ * Bits 11-18 are FREE.  They used to hold parent_slot_offset, which now lives in
+ * its own word (cds_ft_metadata::parent_slot_offset, FT_PSO_* below).  The old
+ * packing existed so a re-home committed the parent edge and the offset "as ONE
+ * atomic MCAS state edge" -- but @parent was ALWAYS a separate word, so that
+ * pairing never came from the packing: it comes from both edges riding one
+ * flip-txn (ft_reparent_record_meta records &meta->parent and the offset word
+ * into the same commit), and ft_get_parent_slot's reader-side coherence loop
+ * validates the pair explicitly (same-descriptor check + a parent re-read).
+ * Splitting therefore preserves the guarantee while ending the CROSS-LOCK RMW
+ * that sharing forced: nr_child is NODE-owned, parent_slot_offset is
+ * PARENT-owned per the edge principle (doc §8.3), and one word cannot be owned
+ * by two locks.  It also removes a SELF-DEADLOCK: the offset setter had to spin
+ * on FT_STATE_INPLACE_WAIT_MASK, which includes FT_STATE_COPYING under
+ * FEATURE_FT_MW_DLM_ACQUIRE, so an op holding that node's own lock waited on
+ * itself (see the reverted b20c471e).  The offset word carries no COPYING bit,
+ * so its wait is over the engine proxy alone.
  */
-#define FT_STATE_PSO_SHIFT		(FT_STATE_NR_CHILD_SHIFT + FT_STATE_NR_CHILD_BITS)
-#define FT_STATE_PSO_BITS		8
-#define FT_STATE_PSO_VALMASK		(((uintptr_t) 1 << FT_STATE_PSO_BITS) - 1)
-#define FT_STATE_PSO_MASK		(FT_STATE_PSO_VALMASK << FT_STATE_PSO_SHIFT)
+#define FT_PSO_SHIFT			1	/* bit 0 stays clear: engine proxy tag */
+#define FT_PSO_BITS			8
+#define FT_PSO_VALMASK			(((uintptr_t) 1 << FT_PSO_BITS) - 1)
+#define FT_PSO_ENCODE(off)		(((uintptr_t) (off) & FT_PSO_VALMASK) \
+						<< FT_PSO_SHIFT)
+#define FT_PSO_DECODE(word)		((unsigned int) (((uintptr_t) (word) \
+						>> FT_PSO_SHIFT) & FT_PSO_VALMASK))
 /*
  * FT_STATE_COPYING (bit 19, above parent_slot_offset): the REVERSIBLE per-node
  * WRITER LOCK.  It began as the copy fence (MW campaign, Option A -- doc/design
@@ -875,8 +888,15 @@ struct ft_pub_rec {
  * Unlike the tombstone, COPYING is reversible BY DESIGN and never implies
  * death; it is never set at rest (ft-verify.h reports a leaked fence).
  */
-#define FT_STATE_COPYING		((uintptr_t) 1 << \
-					(FT_STATE_PSO_SHIFT + FT_STATE_PSO_BITS))
+/*
+ * Bit 19, unchanged by the §8.3 offset split.  It used to be derived as
+ * (FT_STATE_PSO_SHIFT + FT_STATE_PSO_BITS); now that parent_slot_offset has its
+ * own word the derivation is gone, and the bit is pinned LITERALLY rather than
+ * re-derived from nr_child -- moving the writer lock to bit 11 would be an
+ * invisible, silently-compiling change to the meaning of every state word.
+ * Bits 11-18 stay free (see the free-bits note above).
+ */
+#define FT_STATE_COPYING		((uintptr_t) 1 << 19)
 #define FT_STATE_TAG_MASK		(FT_STATE_PROXY | FT_STATE_TOMBSTONE)
 
 /*
@@ -936,6 +956,19 @@ struct cds_ft_metadata {
 						 * via rcu_dereference.
 						 */
 	struct cds_ft_node *external_nodes;	/* List of external nodes at this trie location. */
+
+	/*
+	 * parent_slot_offset (0..255): the pointer-stride offset of this node's
+	 * slot in its parent, PARENT-owned per the edge principle.  Its own word
+	 * since the §8.3 split -- see the FT_PSO_* block above @state for why it
+	 * left the state word.  TRANSACTED: a re-home records it into the same
+	 * flip-txn as &meta->parent (ft_reparent_record_meta), so the slot can
+	 * hold a parked FT_STATE_PROXY and every access must go through the
+	 * ft_meta_parent_slot_offset* helpers -- never a raw load or store.  The
+	 * value is stored SHIFTED (FT_PSO_SHIFT) to keep bit 0 clear for the
+	 * engine's in-band proxy tag, as the engine requires of every live value.
+	 */
+	uintptr_t parent_slot_offset;
 
 	/*
 	 * Total unique keys in subtree.
@@ -1095,57 +1128,50 @@ void ft_meta_nr_child_dec(struct cds_ft_metadata *meta)
 static inline
 unsigned int ft_meta_parent_slot_offset(const struct cds_ft_metadata *meta)
 {
-	return (unsigned int) ((meta->state >> FT_STATE_PSO_SHIFT)
-			& FT_STATE_PSO_VALMASK);
+	return FT_PSO_DECODE(meta->parent_slot_offset);
 }
 
 /*
- * The setter replaces only the offset field and preserves nr_child + the tag
- * bits.  It CASes for the two reasons ft_meta_nr_child_inc above documents:
- * @state is shared with nr_child, TOMBSTONE and COPYING, which peers update by
- * cmpxchg, so a plain read-modify-write would LOSE a peer's concurrent update;
- * and when a peer has parked an FT_STATE_PROXY the word holds a PROXY POINTER,
- * so masking an offset into it would mint a corrupted near-pointer that a
- * resolver later chases.
+ * The setter owns the whole word now, so it no longer has to preserve nr_child
+ * or the state tag bits -- the §8.3 split moved the offset out of @state.  What
+ * it still must respect is the ENGINE: this slot is transacted, so a peer can
+ * have an FT_STATE_PROXY parked here, and a blind store over a proxy pointer
+ * would drop a live descriptor a resolver is about to chase.  Wait the proxy out
+ * rather than skipping it -- the offset must land on the SETTLED word, and the
+ * wait is bounded by the owner's settle.
  *
- * Both hazards are REACHABLE TODAY on the concurrent point-op path: the
- * in-place reserve insert republishes the LIVE attach node at its own slot
- * (ft-insert.h, "In-place reserve (dest == attach node)"), reaching this setter
- * via _ft_publish_to_parent_meta on a node peers are mutating.  A peer
- * reserving a different byte in that same node CASes its nr_child
- * (_ft_node_set_nth -> ft_meta_nr_child_inc), and a peer re-homing it parks an
- * FT_STATE_PROXY on its state (ft_reparent_record_meta).  The node is not
- * COPYING-fenced there, and the op guards its GRANDparent, not it.
+ * ★ The wait is over FT_STATE_PROXY ALONE, deliberately, NOT
+ * FT_STATE_INPLACE_WAIT_MASK.  That mask includes FT_STATE_COPYING under
+ * FEATURE_FT_MW_DLM_ACQUIRE, and while the offset shared @state an op holding
+ * this node's own COPYING lock spun on itself forever -- the self-deadlock that
+ * reverted b20c471e (single-threaded, ft_unit test_lookup_nth_varlen: a prefix
+ * insert builds a glue node and re-parents a node the op has locked).  The
+ * offset word has no COPYING bit to wait on, which is the whole point of the
+ * split, so DO NOT reintroduce that mask here.
  *
- * The remaining LIVE-node callers -- ft_glue_record_back_edge and the whole-trie
- * detach root -- are safe only because merge / graft / compaction still run
- * under the application's mutual exclusion between mutators, and are not yet
- * MW-hardened.  Making this word CAS-only removes its last plain RMW, which is
- * also the precondition for letting those bulk ops run concurrently.
- *
- * Wait out a parked proxy rather than skipping it: the offset must land on the
- * settled word, and the wait is bounded by the owner's settle.  Skip the CAS
- * entirely when the offset is unchanged -- the in-place reserve's same-value
- * republish is the hot case.  A fresh single-owner node pays one uncontended
- * CAS.
+ * A LIVE, reader-reachable node must not come through here at all: its re-home
+ * records the offset into the same flip-txn as &meta->parent
+ * (ft_reparent_record_meta), so the pair flips atomically.  This setter is for
+ * fresh/invisible nodes and for the bulk-op roots that still run under the
+ * application's mutual exclusion between mutators (detach root, graft branch
+ * re-root).  Skip the store when the offset is unchanged -- the in-place
+ * reserve's same-value republish is the hot case.
  */
 static inline
 void ft_meta_parent_slot_offset_set(struct cds_ft_metadata *meta, unsigned int off)
 {
-	for (;;) {
-		uintptr_t s = CMM_LOAD_SHARED(meta->state);
-		uintptr_t n;
+	uintptr_t n = FT_PSO_ENCODE(off);
 
-		if (caa_unlikely(s & FT_STATE_INPLACE_WAIT_MASK)) {
+	for (;;) {
+		uintptr_t s = CMM_LOAD_SHARED(meta->parent_slot_offset);
+
+		if (caa_unlikely(s & FT_STATE_PROXY)) {
 			caa_cpu_relax();
 			continue;
 		}
-		n = (s & ~FT_STATE_PSO_MASK)
-			| (((uintptr_t) off & FT_STATE_PSO_VALMASK)
-				<< FT_STATE_PSO_SHIFT);
 		if (n == s)
 			return;		/* same-value republish: nothing to do */
-		if (caa_likely(uatomic_cmpxchg(&meta->state, s, n) == s))
+		if (caa_likely(uatomic_cmpxchg(&meta->parent_slot_offset, s, n) == s))
 			return;
 	}
 }

@@ -737,10 +737,9 @@ unsigned int ft_meta_nr_child_load(const struct cds_ft_metadata *meta)
 static inline
 unsigned int ft_meta_parent_slot_offset_load(const struct cds_ft_metadata *meta)
 {
-	return (unsigned int) (((uintptr_t) urcu_txn_read(
-			(void **) (uintptr_t) &meta->state,
-			FT_STATE_PROXY) >> FT_STATE_PSO_SHIFT)
-			& FT_STATE_PSO_VALMASK);
+	return FT_PSO_DECODE(urcu_txn_read(
+			(void **) (uintptr_t) &meta->parent_slot_offset,
+			FT_STATE_PROXY));
 }
 
 /*
@@ -1862,17 +1861,23 @@ void ft_set_parent_slot(struct cds_ft_metadata *meta,
  * ft_resolve_parent_slot: recover a node's parent AND its parent-slot address as
  * a CONSISTENT snapshot, tolerating a mid-commit atomic re-home (Phase 4.3).
  *
- * A re-home commits @meta->parent (a type-7 flip-proxy) and the state-word offset
- * (FT_STATE_PROXY) as ONE 2-edge MCAS txn.  Resolving each field with a SEPARATE
- * status load can tear across the commit's status flip -- read parent -> OLD,
- * flip, read offset -> NEW -> a slot address computed off the wrong parent body
- * -> ft_slot_to_byte OOB.  So the two edges must be driven from a SINGLE status
- * snapshot: when @meta->parent carries the proxy, take its txn @t, read
- * urcu_txn_desc_status(t) ONCE, and resolve BOTH edges through it.  Offset changes
- * only as part of a re-home, so an offset proxy is always @t's (co-committed);
- * anything else (a freeze/tombstone parking the state word, which leaves the
- * offset unchanged) resolves independently.  A re-home that begins mid-snapshot
- * is caught by the coherence re-read of @meta->parent and retried.
+ * A re-home commits @meta->parent (a type-7 flip-proxy) and @meta->parent_slot_
+ * offset (FT_STATE_PROXY) as ONE 2-edge MCAS txn.  Resolving each field with a
+ * SEPARATE status load can tear across the commit's status flip -- read parent ->
+ * OLD, flip, read offset -> NEW -> a slot address computed off the wrong parent
+ * body -> ft_slot_to_byte OOB.  So the two edges must be driven from a SINGLE
+ * status snapshot: when @meta->parent carries the proxy, take its txn @t, read
+ * urcu_txn_desc_status(t) ONCE, and resolve BOTH edges through it.  A re-home
+ * that begins mid-snapshot is caught by the coherence re-read of @meta->parent
+ * and retried.
+ *
+ * The §8.3 split SHARPENED this: the offset now has its own word, written ONLY
+ * by a re-home, so a proxy parked there is unambiguously @t's.  While the offset
+ * shared @state, that word was also parked by freezes and tombstones -- edges
+ * that leave the offset untouched -- so the resolver had to tell a co-committed
+ * offset edge apart from an unrelated state edge.  The same-descriptor check
+ * below still earns its keep against a re-home racing the snapshot, but it no
+ * longer has to disambiguate two different KINDS of parker.
  *
  * No re-home in flight (single writer, or between commits) => the fast path is a
  * plain parent load + a proxy-tolerant offset load, behaviour-identical to the
@@ -1889,7 +1894,8 @@ struct cds_ft_inode_flag **ft_resolve_parent_slot(
 
 	for (;;) {
 		struct cds_ft_inode_flag *praw = rcu_dereference(meta->parent);
-		void *sraw = uatomic_load((void **) (uintptr_t) &meta->state,
+		void *sraw = uatomic_load(
+				(void **) (uintptr_t) &meta->parent_slot_offset,
 				CMM_ACQUIRE);
 
 		if (caa_likely(!ft_node_flip_proxy(praw))) {
@@ -1937,8 +1943,7 @@ struct cds_ft_inode_flag **ft_resolve_parent_slot(
 		return &ft->root;
 	return (struct cds_ft_inode_flag **)
 		((char *) ft_node_ptr(parent) +
-		 (((uintptr_t) state >> FT_STATE_PSO_SHIFT) & FT_STATE_PSO_VALMASK)
-		 * sizeof(void *));
+		 FT_PSO_DECODE(state) * sizeof(void *));
 }
 
 static inline

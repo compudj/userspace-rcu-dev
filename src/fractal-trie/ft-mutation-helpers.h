@@ -4841,15 +4841,37 @@ void ft_reparent_record_meta(struct ft_flip_txn *txn,
 	 * this is a no-op for it.
 	 */
 	uintptr_t live_state = old_state & ~(FT_STATE_TOMBSTONE | FT_STATE_COPYING);
-	uintptr_t new_state = live_state;
+	bool record_pso = false;
+	uintptr_t old_pso = 0, new_pso = 0;
 
 	if (slot) {
 		unsigned int off = parent_nf ? (unsigned int) ((char *) slot -
 			(char *) ft_node_ptr(parent_nf)) / sizeof(void *) : 0;
 
-		new_state = (live_state & ~FT_STATE_PSO_MASK)
-			| (((uintptr_t) off & FT_STATE_PSO_VALMASK)
-				<< FT_STATE_PSO_SHIFT);
+		/*
+		 * §8.3 split: the offset is its own transacted word, so it is a
+		 * SEPARATE recorded edge instead of bits folded into the state
+		 * edge.  It still commits in THIS txn alongside &meta->parent, so
+		 * the (parent, offset) pair a backtracker recovers remains atomic
+		 * -- that pairing always came from the shared commit, never from
+		 * the shared word (ft_resolve_parent_slot).  Recorded only when it
+		 * actually changes: a same-value edge would be a second touch of a
+		 * slot for no reason, and the engine's age-0 fast path refuses to
+		 * resolve same-slot coincidence.
+		 */
+		/*
+		 * WAITING load, not a raw one: this slot ends up in THIS txn's
+		 * write set, and the read-policy rule is that such a load must
+		 * wait out an undecided parker.  A raw read would bake a peer's
+		 * parked FT_STATE_PROXY -- a descriptor POINTER -- into the
+		 * expected-old, so the install CAS could never match and the
+		 * attempt would be a guaranteed abort (or worse, mint a bogus
+		 * offset from pointer bits).  urcu_txn_load settles it first.
+		 */
+		old_pso = (uintptr_t) urcu_txn_load(txn->mtxn,
+			(void **) &meta->parent_slot_offset, FT_STATE_PROXY);
+		new_pso = FT_PSO_ENCODE(off);
+		record_pso = (old_pso != new_pso);
 		if (parent_nf && !ft_node_compressed(parent_nf)
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 				&& !ft_node_skip_compressed(parent_nf)
@@ -4861,8 +4883,17 @@ void ft_reparent_record_meta(struct ft_flip_txn *txn,
 	}
 	ft_flip_txn_record_reserved(txn, (void **) &meta->parent,
 		meta->parent, parent_nf);
+	/*
+	 * The state edge is now a pure {live_state -> live_state} GUARD: it no
+	 * longer carries the offset, so its whole job is the §4.B validate the
+	 * comment above describes -- expect the re-homed child CLEAN-LIVE at
+	 * commit, so a child a peer FROZE mid-recompact MISMATCHES and aborts.
+	 */
 	ft_flip_txn_record_tag(txn, (void **) &meta->state,
-		(void *) live_state, (void *) new_state, FT_STATE_PROXY);
+		(void *) live_state, (void *) live_state, FT_STATE_PROXY);
+	if (record_pso)
+		ft_flip_txn_record_tag(txn, (void **) &meta->parent_slot_offset,
+			(void *) old_pso, (void *) new_pso, FT_STATE_PROXY);
 }
 
 /*
