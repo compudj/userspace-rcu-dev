@@ -121,6 +121,27 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 						qp_bms & ((1ULL << qp_p) - 1ULL));
 				if (qp_pointers[qp_ptr_idx]) {
 					/*
+					 * FENCED ADD, in-place mirror (see the
+					 * same check in ft_node_recompact): a
+					 * LIVE-node RESERVE (@child_node_flag
+					 * NULL) whose byte is no longer free.  A
+					 * peer COMMITTED a child at @n between
+					 * this op's descent -- which read the byte
+					 * as absent, or the caller would not be
+					 * reserving it -- and this store.  The
+					 * blind store below would not replace a
+					 * pointer, it would CLEAR that live child
+					 * and orphan its whole subtree.  Bail
+					 * -EAGAIN so the op re-descends and dives
+					 * into the peer's child instead; the
+					 * insert's pre-commit conflict path
+					 * already routes -EAGAIN to
+					 * restart_attempt.  Never fires under a
+					 * single writer (the descent's read holds).
+					 */
+					if (!defer_parent && !child_node_flag)
+						return -EAGAIN;
+					/*
 					 * CONTRACT (audited 2026-07-27): a
 					 * REPLACE at an already-occupied slot
 					 * stores straight into the LIVE pointer
@@ -268,6 +289,27 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 				qp_ptr_idx = (unsigned int) __builtin_popcountll(
 						qp_bms & ((1ULL << qp_p) - 1ULL));
 				if (qp_pointers[qp_ptr_idx]) {
+					/*
+					 * FENCED ADD, in-place mirror (see the
+					 * same check in ft_node_recompact): a
+					 * LIVE-node RESERVE (@child_node_flag
+					 * NULL) whose byte is no longer free.  A
+					 * peer COMMITTED a child at @n between
+					 * this op's descent -- which read the byte
+					 * as absent, or the caller would not be
+					 * reserving it -- and this store.  The
+					 * blind store below would not replace a
+					 * pointer, it would CLEAR that live child
+					 * and orphan its whole subtree.  Bail
+					 * -EAGAIN so the op re-descends and dives
+					 * into the peer's child instead; the
+					 * insert's pre-commit conflict path
+					 * already routes -EAGAIN to
+					 * restart_attempt.  Never fires under a
+					 * single writer (the descent's read holds).
+					 */
+					if (!defer_parent && !child_node_flag)
+						return -EAGAIN;
 					/*
 					 * CONTRACT (audited 2026-07-27): a
 					 * REPLACE at an already-occupied slot
@@ -434,6 +476,27 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 				qp_ptr_idx = (unsigned int) subs_below;
 				if (qp_pointers[qp_ptr_idx]) {
 					/*
+					 * FENCED ADD, in-place mirror (see the
+					 * same check in ft_node_recompact): a
+					 * LIVE-node RESERVE (@child_node_flag
+					 * NULL) whose byte is no longer free.  A
+					 * peer COMMITTED a child at @n between
+					 * this op's descent -- which read the byte
+					 * as absent, or the caller would not be
+					 * reserving it -- and this store.  The
+					 * blind store below would not replace a
+					 * pointer, it would CLEAR that live child
+					 * and orphan its whole subtree.  Bail
+					 * -EAGAIN so the op re-descends and dives
+					 * into the peer's child instead; the
+					 * insert's pre-commit conflict path
+					 * already routes -EAGAIN to
+					 * restart_attempt.  Never fires under a
+					 * single writer (the descent's read holds).
+					 */
+					if (!defer_parent && !child_node_flag)
+						return -EAGAIN;
+					/*
 					 * CONTRACT (audited 2026-07-27): a
 					 * REPLACE at an already-occupied slot
 					 * stores straight into the LIVE pointer
@@ -578,6 +641,15 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 			ptr_idx += (unsigned int) __builtin_popcountll(
 					word & (bit - 1ULL));
 			if (bp_pointers[ptr_idx]) {
+				/*
+				 * FENCED ADD, in-place mirror: a LIVE-node RESERVE
+				 * (NULL child) whose byte a peer filled between this
+				 * op's descent and this store -- the blind store would
+				 * CLEAR the peer's live child.  Bail -EAGAIN to
+				 * re-descend.  See the long note on the 2L arms.
+				 */
+				if (!defer_parent && !child_node_flag)
+					return -EAGAIN;
 				/* Same checked contract as the other Case-1 arms: an
 				 * occupied-slot replace stores into the LIVE pointer array
 				 * with no lock and no txn, so it is sound only on a

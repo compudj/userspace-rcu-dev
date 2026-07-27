@@ -2177,9 +2177,11 @@ retry_merge:
 			 *   never swapped.  Closing this gap for the sub-position move --
 			 *   fusing ft_merge_unlink_src_subtree into the attach flip -- is a
 			 *   deferred parity follow-up (not needed for any disjoint use).
-			 * - Everything else (MEMORY_ERROR / -EAGAIN: the drop's
-			 *   recompact-can't-lock or MCAS commit-abort) is transient --
-			 *   re-descend and re-attach the owned @payload.
+			 * - Everything else is transient -- re-descend and re-attach
+			 *   the owned @payload: BUSY_ERROR (a peer filled the
+			 *   reserve's byte, or a recompact could not lock) and
+			 *   MEMORY_ERROR (a real OOM, or the MCAS commit-abort the
+			 *   store wrapper still reports that way).
 			 */
 			if (st == CDS_FT_STATUS_POPULATED_ERROR) {
 				assert(!already_unlinked);

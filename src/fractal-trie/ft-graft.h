@@ -496,8 +496,19 @@ enum cds_ft_status ft_store_at_graft_point_prepare(struct cds_ft *ft,
 			&(const struct ft_parent_hint){
 				.parent = d->ppnf, .slot = d->pnfp,
 				.gp = d->pppnf, .gp_slot = d->ppnfp });
+		/*
+		 * -EAGAIN is a TRANSIENT peer conflict (the reserve found its
+		 * byte filled under it), not an allocation failure: report it
+		 * as BUSY so a retry-driving caller need not read "out of
+		 * memory" to mean "re-descend".  Both callers already retry
+		 * every non-OK status but POPULATED (cds_ft_merge_at's
+		 * retry_merge, cds_ft_graft's retry_attach), so this is a
+		 * truthfulness fix, not a control-flow change.
+		 */
 		if (ret)
-			return CDS_FT_STATUS_MEMORY_ERROR;
+			return ret == -EAGAIN ?
+				CDS_FT_STATUS_BUSY_ERROR :
+				CDS_FT_STATUS_MEMORY_ERROR;
 
 		st->attached = graft_payload;
 		st->attached_depth = (unsigned int) key_len;
@@ -578,8 +589,12 @@ enum cds_ft_status ft_store_at_graft_point_prepare(struct cds_ft *ft,
 					.slot = d->pnfp,
 					.gp = d->pppnf,
 					.gp_slot = d->ppnfp });
+			/* Transient peer conflict, not OOM: see the
+			 * depth == key_len arm above. */
 			if (ret)
-				return CDS_FT_STATUS_MEMORY_ERROR;
+				return ret == -EAGAIN ?
+					CDS_FT_STATUS_BUSY_ERROR :
+					CDS_FT_STATUS_MEMORY_ERROR;
 
 			st->attached = branch;
 			st->attached_depth = d->depth;
