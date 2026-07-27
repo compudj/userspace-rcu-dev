@@ -1269,7 +1269,9 @@ struct cds_ft_group {
 	 * Structural-writer concurrency strategy for the group's tries (MW
 	 * lock-escalation model).  Copied to each trie at create; a locking
 	 * strategy (COARSE or FINE) makes the trie take the FT-wide writer lock
-	 * at every mutation.  Default CDS_FT_WRITER_OPTIMISTIC (calloc-zero).
+	 * at every mutation.  Default CDS_FT_WRITER_LOCK_FINE (DLM) -- resolved
+	 * at group create from @writer_strategy_set, since calloc-zero is the
+	 * OPTIMISTIC enumerator and no longer the default.
 	 */
 	enum cds_ft_writer_strategy writer_strategy;
 	/* Allocation arenas. */
@@ -2748,6 +2750,12 @@ struct cds_ft_group_attr {
 	 * skip).  See cds_ft_group_attr_set_rank_stats.
 	 */
 	bool rank_stats_set;
+	/*
+	 * Distinguishes "the caller never chose a strategy" from "the caller
+	 * explicitly chose CDS_FT_WRITER_OPTIMISTIC", which calloc-zero alone
+	 * cannot: unset now resolves to the DLM default, not to the enum's 0.
+	 */
+	bool writer_strategy_set;
 	enum cds_ft_numa_policy numa_policy;	/* See cds_ft_group_attr_set_numa_policy. */
 	enum cds_ft_optimize optimize;		/* See cds_ft_group_attr_set_optimize. */
 	/*

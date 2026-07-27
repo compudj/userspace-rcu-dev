@@ -5569,7 +5569,13 @@ static int inv_remove_cross_view_compressed(void)
  * node's child slot.  The test node carries the key bytes in @okey and the
  * length in @value (the eager trie never writes @okey -- no speculative offset).
  */
-static struct cds_ft *create_varlen_ord_ft(struct cds_ft_group **group_out)
+/*
+ * @ws: NULL to inherit the group default (DLM), or a strategy to pin.  Pinning
+ * exists for the oracles that drive a LIVE-to-LIVE cross-trie op, which only
+ * CDS_FT_WRITER_OPTIMISTIC allows; they retire with it.
+ */
+static struct cds_ft *create_varlen_ord_ft_ws(struct cds_ft_group **group_out,
+		const enum cds_ft_writer_strategy *ws)
 {
 	struct cds_ft_group_attr *attr;
 	struct cds_ft_group *group;
@@ -5585,6 +5591,8 @@ static struct cds_ft *create_varlen_ord_ft(struct cds_ft_group **group_out)
 		abort();
 	if (cds_ft_group_attr_set_ordered_list(attr, true) < 0)
 		abort();
+	if (ws && cds_ft_group_attr_set_writer_strategy(attr, *ws) < 0)
+		abort();
 	if (cds_ft_group_create(attr, &group) < 0)
 		abort();
 	cds_ft_group_attr_destroy(attr);
@@ -5592,6 +5600,11 @@ static struct cds_ft *create_varlen_ord_ft(struct cds_ft_group **group_out)
 		abort();
 	*group_out = group;
 	return ft;
+}
+
+static struct cds_ft *create_varlen_ord_ft(struct cds_ft_group **group_out)
+{
+	return create_varlen_ord_ft_ws(group_out, NULL);
 }
 
 /*
@@ -6129,7 +6142,10 @@ static void *inv_root_internal_writer(void *arg)
 static int inv_root_always_internal(void)
 {
 	struct cds_ft_group *group;
-	struct cds_ft *live = create_varlen_ord_ft(&group);
+	/* live-to-live graft_swap: only OPTIMISTIC permits it; see the writer. */
+	static const enum cds_ft_writer_strategy ws_optimistic =
+		CDS_FT_WRITER_OPTIMISTIC;
+	struct cds_ft *live = create_varlen_ord_ft_ws(&group, &ws_optimistic);
 	struct cds_ft *swap;
 	struct inv_root_ctx ctx;
 	pthread_t readers[NR_READERS_DEFAULT], writer;
@@ -8895,6 +8911,19 @@ static int inv_graft_swap_root_cross_trie(void)
 
 	if (cds_ft_group_attr_create(&attr) < 0)
 		return -1;
+		/*
+		 * This oracle drives a LIVE-to-LIVE cross-trie op on purpose: its
+		 * readers watch the SOURCE.  CDS_FT_WRITER_LOCK_FINE (now the
+		 * default) refuses that -- a cross-trie source must be exclusive --
+		 * so pin the group to OPTIMISTIC, the only mode that offers the
+		 * guarantee being tested.  Mathieu, 2026-07-27: live-to-live
+		 * graft_swap is no longer a supportable use case; this oracle
+		 * therefore retires WITH CDS_FT_WRITER_OPTIMISTIC rather than being
+		 * reformulated.
+		 */
+	if (cds_ft_group_attr_set_writer_strategy(attr,
+			CDS_FT_WRITER_OPTIMISTIC) < 0)
+		abort();
 	if (cds_ft_group_attr_set_max_key_len(attr, 4) < 0) {
 		cds_ft_group_attr_destroy(attr);
 		return -1;
@@ -12879,6 +12908,19 @@ static int inv_merge_key_shorter_src_no_escape(void)
 
 	if (cds_ft_group_attr_create(&gattr) < 0)
 		return -1;
+		/*
+		 * This oracle drives a LIVE-to-LIVE cross-trie op on purpose: its
+		 * readers watch the SOURCE.  CDS_FT_WRITER_LOCK_FINE (now the
+		 * default) refuses that -- a cross-trie source must be exclusive --
+		 * so pin the group to OPTIMISTIC, the only mode that offers the
+		 * guarantee being tested.  Mathieu, 2026-07-27: live-to-live
+		 * graft_swap is no longer a supportable use case; this oracle
+		 * therefore retires WITH CDS_FT_WRITER_OPTIMISTIC rather than being
+		 * reformulated.
+		 */
+	if (cds_ft_group_attr_set_writer_strategy(gattr,
+			CDS_FT_WRITER_OPTIMISTIC) < 0)
+		abort();
 	if (cds_ft_group_attr_set_max_key_len(gattr, 16) < 0) {
 		cds_ft_group_attr_destroy(gattr);
 		return -1;

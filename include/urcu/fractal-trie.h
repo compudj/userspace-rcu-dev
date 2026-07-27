@@ -1875,9 +1875,13 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
  * @key_len: Length of @key in bytes.  Use 0 to merge every key in
  *           @src_ft into @dst_ft (whole-trie merge).
  * @src_ft: Source Fractal Trie.  Must belong to the same group as
- *          @dst_ft and must not equal @dst_ft.  May be in either
- *          exclusive or concurrent mode; concurrent readers on
- *          @src_ft are tolerated.
+ *          @dst_ft and must not equal @dst_ft.  Under the default
+ *          CDS_FT_WRITER_LOCK_FINE it must be EXCLUSIVE
+ *          (cds_ft_make_exclusive), exactly as for cds_ft_merge_at and
+ *          cds_ft_graft -- a live concurrent source would need a second
+ *          trie's writer lock with no lock order, and is rejected with
+ *          CDS_FT_STATUS_BUSY_ERROR.  Only under CDS_FT_WRITER_OPTIMISTIC
+ *          are concurrent readers on @src_ft tolerated.
  *
  * Moves @src_ft's content under prefix @key into @dst_ft at the
  * same prefix, preserving original key bytes.  @src_ft keys that
@@ -2719,9 +2723,12 @@ enum cds_ft_status cds_ft_group_attr_set_optimize(
  *   the lock strategies below fully replace it.
  * CDS_FT_WRITER_LOCK_COARSE: writers serialize under one FT-wide writer lock per
  *   trie (classic RCU single-writer).
- * CDS_FT_WRITER_LOCK_FINE: writers coordinate through fine-grained per-node
- *   lock-sets, so writers on disjoint subtrees proceed in parallel and only
- *   structural collisions serialize -- no FT-wide writer mutex.  A trie that
+ * CDS_FT_WRITER_LOCK_FINE (the DEFAULT): writers coordinate through
+ *   fine-grained per-node lock-sets, so writers on disjoint subtrees proceed in
+ *   parallel and only structural collisions serialize -- no FT-wide writer
+ *   mutex.  Note this is the mode under which a CROSS-TRIE graft / graft_swap /
+ *   merge_at requires an EXCLUSIVE source (see those functions): being the
+ *   default, that requirement now applies unless a group opts out.  A trie that
  *   also maintains order statistics is coerced to CDS_FT_WRITER_LOCK_COARSE
  *   (every count-changing writer updates the shared root, so there are no
  *   disjoint writers for fine locking to parallelize).
@@ -2735,7 +2742,7 @@ enum cds_ft_writer_strategy {
 /*
  * cds_ft_group_attr_set_writer_strategy - Select the group's structural-writer
  *   concurrency strategy (enum cds_ft_writer_strategy); the default is
- *   CDS_FT_WRITER_OPTIMISTIC.  Returns CDS_FT_STATUS_OK, or
+ *   CDS_FT_WRITER_LOCK_FINE.  Returns CDS_FT_STATUS_OK, or
  *   CDS_FT_STATUS_INVALID_ARGUMENT_ERROR for an unknown @strategy.
  *
  * Any strategy combined with order statistics

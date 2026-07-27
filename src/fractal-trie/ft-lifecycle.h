@@ -302,6 +302,7 @@ enum cds_ft_status cds_ft_group_attr_set_writer_strategy(
 	case CDS_FT_WRITER_LOCK_COARSE:
 	case CDS_FT_WRITER_LOCK_FINE:
 		attr->writer_strategy = strategy;
+		attr->writer_strategy_set = true;
 		return CDS_FT_STATUS_OK;
 	}
 	return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
@@ -488,7 +489,15 @@ enum cds_ft_status _cds_ft_group_create(const struct cds_ft_group_attr *attr,
 		ft_group->rank_stats_set = attr->rank_stats_set;
 		ft_group->numa_policy = attr->numa_policy;
 		ft_group->optimize = attr->optimize;
-		ft_group->writer_strategy = attr->writer_strategy;
+		/*
+		 * DLM (per-node lock-sets) is the default.  The enum's 0 is
+		 * CDS_FT_WRITER_OPTIMISTIC, so calloc-zero cannot express it --
+		 * hence @writer_strategy_set: unset means "no choice made",
+		 * which resolves to LOCK_FINE, while an explicit OPTIMISTIC is
+		 * still honoured (it is retired separately).
+		 */
+		ft_group->writer_strategy = attr->writer_strategy_set ?
+			attr->writer_strategy : CDS_FT_WRITER_LOCK_FINE;
 		/*
 		 * Order statistics maintain ONE global count on the root's nr_keys
 		 * word, which EVERY count-changing mutation walks up to and updates
@@ -528,6 +537,7 @@ enum cds_ft_status _cds_ft_group_create(const struct cds_ft_group_attr *attr,
 		ft_group->ordered_list_set = true;	/* on by default; see attr_create */
 		ft_group->numa_policy = CDS_FT_NUMA_DEFAULT;
 		ft_group->optimize = CDS_FT_OPTIMIZE_THROUGHPUT;
+		ft_group->writer_strategy = CDS_FT_WRITER_LOCK_FINE;	/* DLM default */
 	}
 	*result_ft_group = ft_group;
 	FT_TP(group_create, (const void *) ft_group);
