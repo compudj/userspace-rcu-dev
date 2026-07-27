@@ -123,8 +123,22 @@ run_one() {	# $1=name $2=tests -- build lib+tests, run the TAP suites
 	# silently and every suite reports ok=0 (a false PASS -- see the ok=0
 	# gate below).
 	make -C "$dir/tests/utils"      -j"$J" >>"$GATE/$name.build" 2>&1
-	make -C "$dir/tests/unit"       test_urcu_ft_unit -j"$J" >>"$GATE/$name.build" 2>&1
-	make -C "$dir/tests/regression" test_urcu_ft_inv  -j"$J" >>"$GATE/$name.build" 2>&1
+	# The TEST binaries' build status is checked, not just the library's: a
+	# test source that fails to compile ONLY in this config (an #ifdef'd
+	# region the default build never sees) would otherwise leave the previous
+	# run's binary in place, and the suite would report that STALE binary's
+	# results as if they were this config's -- a false PASS, or a false FAIL
+	# attributed to the wrong change.  Both happened before this check.
+	if ! make -C "$dir/tests/unit" test_urcu_ft_unit -j"$J" \
+			>>"$GATE/$name.build" 2>&1; then
+		echo "$name: TEST BUILD FAIL (ft_unit; see $GATE/$name.build)" >> "$out"
+		return
+	fi
+	if ! make -C "$dir/tests/regression" test_urcu_ft_inv -j"$J" \
+			>>"$GATE/$name.build" 2>&1; then
+		echo "$name: TEST BUILD FAIL (ft_inv; see $GATE/$name.build)" >> "$out"
+		return
+	fi
 	echo "$name: build ok" >> "$out"
 	local t o ok notok abrt lbl
 	for t in $tests; do
