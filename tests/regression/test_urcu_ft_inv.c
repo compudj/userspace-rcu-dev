@@ -7271,8 +7271,27 @@ static int inv_merge_root_src_cross_view(void)
 		pool[k] = src;
 		nmerges = k + 1;
 		rcu_assign_pointer(ctx.cur, src);
-		if (cds_ft_merge_at(dst, AT, 1, src, NULL, 0) != CDS_FT_STATUS_OK)
-			abort();
+		/*
+		 * DECOMPOSED, same reason as the prefix oracles above: under
+		 * LOCK_FINE a cross-trie source must be exclusive, and @src is
+		 * what the readers watch.  The ROOT detach IS this oracle's
+		 * subject -- @src goes full -> empty, and its structure and its
+		 * ordered list must never disagree while it does -- and the merge
+		 * then runs against an EXCLUSIVE trie.  Still a merge: dst@{AT}
+		 * is occupied on purpose (the spine-copy root_src path), which a
+		 * graft rejects with POPULATED_ERROR.
+		 */
+		{
+			struct cds_ft *whole = NULL;
+
+			if (cds_ft_detach(src, NULL, 0, &whole) != CDS_FT_STATUS_OK ||
+			    !whole)
+				abort();
+			if (cds_ft_merge_at(dst, AT, 1, whole, NULL, 0) !=
+					CDS_FT_STATUS_OK)
+				abort();
+			cds_ft_destroy(whole);	/* emptied by the merge */
+		}
 
 		if (elapsed_ms(&t0) >= DEFAULT_DURATION_MS)
 			break;
@@ -7740,8 +7759,28 @@ static int inv_merge_src_cross_view(void)
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	for (p = 0; p < MERGE_SRC_XVIEW_PREFIXES; p++) {
 		uint8_t prefix[2] = { (uint8_t)(p >> 8), (uint8_t)(p & 0xff) };
+		struct cds_ft *detached = NULL;
 
-		(void) cds_ft_merge_at(dst, prefix, 2, src, prefix, 2);
+		/*
+		 * DECOMPOSED (was one cds_ft_merge_at with a LIVE @src).  Under
+		 * CDS_FT_WRITER_LOCK_FINE a cross-trie source must be exclusive,
+		 * and @src is exactly what the readers watch, so it cannot be.
+		 * Detach-then-merge is the supported decomposition (design note
+		 * decision (C): two sequential single-domain commits) and keeps
+		 * this oracle's subject intact -- the reader-visible half is @src
+		 * SHEDDING the subtree, i.e. the detach, unchanged.  The attach
+		 * half then runs against the trie cds_ft_detach returns
+		 * EXCLUSIVE by construction, so it is DLM-legal and skips its own
+		 * grace period.  It stays a merge, not a graft: @dst is
+		 * deliberately populated here, which a graft rejects with
+		 * POPULATED_ERROR.  @detached's ROOT holds the subtree, hence the
+		 * NULL/0 source key.
+		 */
+		if (cds_ft_detach(src, prefix, 2, &detached) == CDS_FT_STATUS_OK &&
+		    detached) {
+			(void) cds_ft_merge_at(dst, prefix, 2, detached, NULL, 0);
+			cds_ft_destroy(detached);
+		}
 		if (elapsed_ms(&t0) >= DEFAULT_DURATION_MS)
 			break;
 	}
@@ -7840,8 +7879,28 @@ static int inv_merge_src_spinecopy_cross_view(void)
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	for (p = 0; p < MERGE_SRC_XVIEW_PREFIXES; p++) {
 		uint8_t prefix[2] = { (uint8_t)(p >> 8), (uint8_t)(p & 0xff) };
+		struct cds_ft *detached = NULL;
 
-		(void) cds_ft_merge_at(dst, prefix, 2, src, prefix, 2);
+		/*
+		 * DECOMPOSED (was one cds_ft_merge_at with a LIVE @src).  Under
+		 * CDS_FT_WRITER_LOCK_FINE a cross-trie source must be exclusive,
+		 * and @src is exactly what the readers watch, so it cannot be.
+		 * Detach-then-merge is the supported decomposition (design note
+		 * decision (C): two sequential single-domain commits) and keeps
+		 * this oracle's subject intact -- the reader-visible half is @src
+		 * SHEDDING the subtree, i.e. the detach, unchanged.  The attach
+		 * half then runs against the trie cds_ft_detach returns
+		 * EXCLUSIVE by construction, so it is DLM-legal and skips its own
+		 * grace period.  It stays a merge, not a graft: @dst is
+		 * deliberately populated here, which a graft rejects with
+		 * POPULATED_ERROR.  @detached's ROOT holds the subtree, hence the
+		 * NULL/0 source key.
+		 */
+		if (cds_ft_detach(src, prefix, 2, &detached) == CDS_FT_STATUS_OK &&
+		    detached) {
+			(void) cds_ft_merge_at(dst, prefix, 2, detached, NULL, 0);
+			cds_ft_destroy(detached);
+		}
 		if (elapsed_ms(&t0) >= DEFAULT_DURATION_MS)
 			break;
 	}
