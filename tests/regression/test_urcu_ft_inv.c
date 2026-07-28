@@ -68,7 +68,7 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_MW_DLM_ACQUIRE
-#define NR_TESTS_REKEY_DLM	7	/* inv_rekey_graft_{disjoint,cross_junction,glue_dst,coherent_readers,shared}, inv_rekey_linearizability, inv_rekey_merge_occupied_dst */
+#define NR_TESTS_REKEY_DLM	8	/* inv_rekey_graft_{disjoint,cross_junction,glue_dst,coherent_readers,shared}, inv_rekey_linearizability, inv_rekey_merge_{occupied,shared}_dst */
 #else
 #define NR_TESTS_REKEY_DLM	0
 #endif
@@ -1839,6 +1839,324 @@ static int inv_rekey_merge_occupied_dst(void)
 	fprintf(stderr, "# inv_rekey_merge_occupied_dst: %d writers, %lu merges, "
 		"%lu retries, %lu live keys\n", RKM_NW, total_ops, total_retries,
 		live);
+
+	free(w);
+	if (drain_and_destroy(ft, group) < 0)
+		ret = -1;
+	if (leak_check() < 0)
+		ret = -1;
+	return ret;
+}
+
+/*
+ * SHARED-DESTINATION merge oracle -- the companion inv_rekey_merge_occupied_dst
+ * cannot be, and the reason is the whole point.
+ *
+ * That oracle gives every writer its own junctions.  Writers then contend only
+ * ROOT, which the DETACH acquires -- so every node the MERGE BRANCH acquires
+ * (the publish parent, the dst overlap spine, the dup-chain holders) stays
+ * writer-PRIVATE and its bail is structurally unreachable.  Measured: 0 of the
+ * fold's 7 bail sites taken across 4187 merges, while the same run logged 3189
+ * retries.  Retries are not coverage; an oracle exercises only the acquires
+ * whose nodes its writers SHARE.
+ *
+ * So here the DESTINATION is shared.  Writer w keeps a PRIVATE source junction
+ * bp=0x20+w (so seeding never collides) and merges into one of RKMS_NJ SHARED
+ * destinations J[w % RKMS_NJ].  Several writers therefore aim the same publish
+ * parent, retire the same overlap node, and append to the same chain, which is
+ * exactly the contention the disjoint layout cannot produce.
+ *
+ * Per shared junction J: RESIDENTS at (J,3,1) and (J,3,2), permanent, so the
+ * destination is always OCCUPIED (a merge, never a graft) and the node is always
+ * a >=2-child branch (never path-compressed).
+ * Per writer w: ONE mover at (bp,3,0x10+w), PRIVATE, so cleanup can never touch
+ * a peer's key.
+ *
+ * NO COLLISION HERE.  A colliding mover would land on a chain several writers
+ * append to at once, and taking one's own entry back off it removes a NON-HEAD
+ * duplicate while peers restructure the same chain -- a second variable, and
+ * this oracle already has one job: contending the merge branch's own acquires,
+ * which needs no collision.  Collisions live in inv_rekey_merge_occupied_dst.
+ *
+ * ★ That separation was FIRST made for a reason that turned out to be WRONG, so
+ * do not reuse the reasoning: while this oracle was being built it aborted in
+ * ft_node_recompact, and dropping collisions was tried as the fix on the theory
+ * that the cleanup above was a harness race.  It was not -- the abort persisted
+ * without collisions, and the cause was ft_detach_node's up-walk reading a child
+ * count off a peer's parked state word.  Re-adding collisions here is a
+ * legitimate future extension, not a known hazard.
+ *
+ * ORACLE, per move and not only at rest: this writer's private moved key is
+ * present and BOTH residents survive.  A merge that dropped the destination's
+ * own keys leaves a verifiable trie, so only an in-loop check sees it.
+ * -EINVAL is fatal; liveness is per writer.
+ */
+#define RKMS_NW		8		/* writers */
+#define RKMS_NJ		2		/* SHARED destination junctions */
+#define RKMS_SB		3		/* S_top slot byte inside every junction */
+#define RKMS_GUARD_BASE	0x40		/* 2nd child byte base: keeps S_top a branch */
+
+struct rkms_writer_arg {
+	struct cds_ft *ft;
+	uint8_t bp;			/* PRIVATE source junction */
+	uint8_t dp;			/* SHARED destination junction */
+	uint8_t mine;			/* this writer's private mover byte */
+	uint8_t guard;			/* and its private 2nd-child byte */
+	struct ft_test_node *sib[2];	/* (bp,1) (bp,5): keep BP >= 3 children */
+	struct ft_test_node *seed_priv;	/* the node seeded at (bp,3,mine) */
+	struct ft_test_node *seed_guard;/* second child so S_top is a branch */
+	int seeded;
+	unsigned long ops, retries;
+	int failed;
+};
+
+/* Remove the node @n stored at key @v, by IDENTITY -- see the header. */
+static enum cds_ft_status rkms_remove_node(struct cds_ft *ft, uint64_t v,
+		struct ft_test_node *n)
+{
+	struct cds_ft_iter *iter = NULL;
+	enum cds_ft_status st = CDS_FT_STATUS_NOT_FOUND;
+	uint8_t k[8] = { 0 };
+
+	if (cds_ft_iter_create(ft, &iter) < 0)
+		abort();
+	rcu_read_lock();
+	cds_ft_u64_to_key(ft, v, k, CDS_FT_LEN_DEFAULT);
+	cds_ft_iter_set_key(iter, k, CDS_FT_LEN_DEFAULT);
+	cds_ft_lookup(ft, iter);
+	if (cds_ft_iter_node(iter)) {
+		st = cds_ft_remove(ft, iter, &n->node);
+		if (st == CDS_FT_STATUS_OK)
+			node_free_rcu(n);
+	}
+	rcu_read_unlock();
+	cds_ft_iter_destroy(iter);
+	return st;
+}
+
+static void *rkms_writer(void *arg)
+{
+	struct rkms_writer_arg *w = (struct rkms_writer_arg *) arg;
+	uint8_t src_key[2], dst_key[2];
+	unsigned long iters = 0;
+
+	src_key[0] = w->bp; src_key[1] = RKMS_SB;
+	dst_key[0] = w->dp; dst_key[1] = RKMS_SB;
+
+	rcu_register_thread();
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	while (!test_stop) {
+		uint64_t kp = rkm_key(w->bp, RKMS_SB, w->mine);
+		uint64_t kg = rkm_key(w->bp, RKMS_SB, w->guard);
+		uint64_t dp_priv = rkm_key(w->dp, RKMS_SB, w->mine);
+		struct cds_ft_node *f = NULL;
+		int rc;
+
+		if (!w->seeded) {
+			rcu_read_lock();
+			/*
+			 * TWO keys under (bp,3): the mover plus a per-writer guard
+			 * at a private byte, so S_top is a >=2-child BRANCH rather
+			 * than a path-compressed node the shape gate refuses.  Both
+			 * are lone deep keys, hence compressed children -- the
+			 * skip-compressed re-parents this path is about.
+			 */
+			w->seed_priv = node_alloc(kp);
+			w->seed_guard = node_alloc(kg);
+			if (insert_u64(w->ft, kp, w->seed_priv) != CDS_FT_STATUS_OK ||
+					insert_u64(w->ft, kg, w->seed_guard) !=
+						CDS_FT_STATUS_OK) {
+				rcu_read_unlock();
+				fprintf(stderr, "rkms bp=%u: seed failed\n", w->bp);
+				w->failed = 1;
+				goto out;
+			}
+			rcu_read_unlock();
+			w->seeded = 1;
+		}
+
+		/* No read lock: the move takes the gate, which waits a grace period. */
+		rc = _cds_ft_debug_rekey_graft_simple(w->ft, src_key, 2, dst_key, 2);
+		if (rc == 0) {
+			w->ops++;
+			rcu_read_lock();
+			/* my PRIVATE moved key */
+			if (lookup_u64(w->ft, dp_priv, &f) != CDS_FT_STATUS_OK ||
+					f != &w->seed_priv->node) {
+				rcu_read_unlock();
+				fprintf(stderr, "rkms bp=%u dp=%u: private moved key "
+					"absent after merge\n", w->bp, w->dp);
+				w->failed = 1;
+				mw_violation_snapshot();
+				goto out;
+			}
+			rcu_read_unlock();
+			if (rkms_remove_node(w->ft, dp_priv, w->seed_priv) !=
+						CDS_FT_STATUS_OK ||
+					rkms_remove_node(w->ft,
+						rkm_key(w->dp, RKMS_SB, w->guard),
+						w->seed_guard) != CDS_FT_STATUS_OK) {
+				fprintf(stderr, "rkms bp=%u: cleanup failed\n", w->bp);
+				w->failed = 1;
+				goto out;
+			}
+			w->seeded = 0;
+		} else if (rc == -EAGAIN || rc == -EIO || rc == -ENOMEM) {
+			w->retries++;
+		} else {
+			fprintf(stderr, "rkms bp=%u dp=%u: merge failed rc=%d\n",
+				w->bp, w->dp, rc);
+			w->failed = 1;
+			mw_violation_snapshot();
+			goto out;
+		}
+		if ((++iters & 0xff) == 0)
+			rcu_quiescent_state();
+	}
+out:
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static int inv_rekey_merge_shared_dst(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	struct rkms_writer_arg *w;
+	struct ft_test_node *res[RKMS_NJ][2];
+	pthread_t writers[RKMS_NW];
+	struct timespec t0;
+	unsigned long total_ops = 0, total_retries = 0, live = 0;
+	int i, c, ret = 0;
+	static const uint8_t J[RKMS_NJ] = { 0x10, 0x11 };
+
+	if (!getenv("FT_INV_MW")) {
+		fprintf(stderr, "# inv_rekey_merge_shared_dst: skipped "
+			"(set FT_INV_MW=1 to run the shared-destination merge oracle)\n");
+		return 0;
+	}
+	mw_install_fatal_handler();
+	leak_reset();
+
+	ft = create_fixed_fine_lock_listoff_ft(4, &group);	/* LIST OFF */
+	cds_ft_make_concurrent(ft);
+
+	rcu_read_lock();
+	for (i = 0; i < RKMS_NJ; i++) {
+		/* Sibs so the shared junction node is a stable multi-child branch. */
+		for (c = 0; c < 2; c++) {
+			uint64_t sk = rkm_key(J[i], c == 0 ? 1 : 5, 0);
+
+			if (insert_u64(ft, sk, node_alloc(sk)) != CDS_FT_STATUS_OK)
+				abort();
+			live++;
+		}
+		for (c = 0; c < 2; c++) {	/* RESIDENTS: dst always occupied */
+			uint64_t rk = rkm_key(J[i], RKMS_SB, (uint8_t) (c + 1));
+
+			res[i][c] = node_alloc(rk);
+			if (insert_u64(ft, rk, res[i][c]) != CDS_FT_STATUS_OK)
+				abort();
+			live++;
+		}
+	}
+	rcu_read_unlock();
+
+	w = (struct rkms_writer_arg *) calloc(RKMS_NW, sizeof(*w));
+	if (!w)
+		abort();
+	for (i = 0; i < RKMS_NW; i++) {
+		uint8_t bp = (uint8_t) (0x20 + i);
+
+		w[i].ft = ft;
+		w[i].bp = bp;
+		w[i].dp = J[i % RKMS_NJ];
+		w[i].mine = (uint8_t) (0x10 + i);
+		w[i].guard = (uint8_t) (RKMS_GUARD_BASE + i);
+		rcu_read_lock();
+		for (c = 0; c < 2; c++) {	/* BP >= 3 children on removal */
+			uint64_t sk = rkm_key(bp, c == 0 ? 1 : 5, 0);
+
+			w[i].sib[c] = node_alloc(sk);
+			if (insert_u64(ft, sk, w[i].sib[c]) != CDS_FT_STATUS_OK)
+				abort();
+			live++;
+		}
+		rcu_read_unlock();
+	}
+
+	test_go = 0;
+	test_stop = 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < RKMS_NW; i++)
+		pthread_create(&writers[i], NULL, rkms_writer, &w[i]);
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	test_go = 1;
+
+	rcu_thread_offline();
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
+		usleep(1000);
+	test_stop = 1;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < RKMS_NW; i++)
+		pthread_join(writers[i], NULL);
+	rcu_thread_online();
+
+	/* Drop whatever the last iteration left seeded at the private sources. */
+	synchronize_rcu();
+	for (i = 0; i < RKMS_NW; i++) {
+		if (!w[i].seeded)
+			continue;
+		(void) rkms_remove_node(ft, rkm_key(w[i].bp, RKMS_SB, w[i].mine),
+				w[i].seed_priv);
+		(void) rkms_remove_node(ft, rkm_key(w[i].bp, RKMS_SB, w[i].guard),
+				w[i].seed_guard);
+		w[i].seeded = 0;
+	}
+
+	synchronize_rcu();
+	rcu_read_lock();
+	for (i = 0; i < RKMS_NW; i++) {
+		total_ops += w[i].ops;
+		total_retries += w[i].retries;
+		if (w[i].failed)
+			ret = -1;
+		if (w[i].ops == 0) {	/* per-writer: a global check hides starvation */
+			fprintf(stderr, "rekey merge shared: writer %d made NO move\n", i);
+			ret = -1;
+		}
+	}
+	for (i = 0; i < RKMS_NJ; i++) {
+		for (c = 0; c < 2; c++) {
+			struct cds_ft_node *f = NULL;
+			uint64_t rk = rkm_key(J[i], RKMS_SB, (uint8_t) (c + 1));
+
+			if (lookup_u64(ft, rk, &f) != CDS_FT_STATUS_OK ||
+					f != &res[i][c]->node) {
+				fprintf(stderr, "rekey merge shared: resident %d/%d lost "
+					"to a union\n", i, c);
+				ret = -1;
+			}
+		}
+	}
+	if (cds_ft_count_entries(ft) != live) {
+		fprintf(stderr, "rekey merge shared: entries %lu != live %lu\n",
+			cds_ft_count_entries(ft), live);
+		ret = -1;
+	}
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "rekey merge shared: cds_ft_verify failed\n");
+		ret = -1;
+	}
+	rcu_read_unlock();
+
+	fprintf(stderr, "# inv_rekey_merge_shared_dst: %d writers over %d shared "
+		"destinations, %lu merges, %lu retries, %lu live keys\n",
+		RKMS_NW, RKMS_NJ, total_ops, total_retries, live);
 
 	free(w);
 	if (drain_and_destroy(ft, group) < 0)
@@ -14081,6 +14399,7 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_rekey_graft_shared);
 	RUN_TEST(inv_rekey_linearizability);
 	RUN_TEST(inv_rekey_merge_occupied_dst);
+	RUN_TEST(inv_rekey_merge_shared_dst);
 #endif
 	RUN_TEST(inv_concurrent_writers_shared);
 	RUN_TEST(inv_concurrent_writers_coarse_lock);
