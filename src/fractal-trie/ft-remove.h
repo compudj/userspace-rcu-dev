@@ -1299,6 +1299,7 @@ int ft_detach_node(struct cds_ft *ft,
 	while (cur) {
 		struct cds_ft_metadata *metadata;
 		struct cds_ft_inode_flag *resolved_parent;
+		unsigned int nr_child;
 		bool is_root;
 
 		metadata = cds_ft_item_to_metadata(ft_node_ptr(cur));
@@ -1320,6 +1321,31 @@ int ft_detach_node(struct cds_ft *ft,
 		resolved_parent = ft_resolve_flip_proxy(
 			(struct cds_ft_inode_flag *) rcu_dereference(metadata->parent));
 		is_root = (resolved_parent == NULL);
+		/*
+		 * ONE proxy-resolved snapshot of this ancestor's child count, for
+		 * exactly the same two reasons as @resolved_parent just above --
+		 * and &metadata->state is the SAME kind of parked slot.
+		 *
+		 * RESOLVED: a peer's in-flight commit parks an engine record
+		 * POINTER in the state word (FT_STATE_PROXY, bit 0).  A raw
+		 * ft_meta_nr_child() then decodes bits 2-10 of that pointer as the
+		 * count -- an arbitrary value, almost always > 1, which answers
+		 * "this ancestor is a surviving multi-child boundary" YES for a
+		 * node that in truth holds only the child we came up from.  The
+		 * prune then stops one level too low and ft_node_replace_ptr
+		 * DELs the boundary's last child, the case ft_node_recompact's
+		 * NODE_INDEX_NULL assert catches at the dereference site.
+		 *
+		 * ONCE: the three tests below (the emptied-ancestor bail, the
+		 * nr_clear tally and the boundary stop) must agree on one value.
+		 * Three separate loads of a word peers mutate can disagree, and a
+		 * plan built from two different counts is incoherent even when
+		 * each load is individually resolved.
+		 *
+		 * Off the commit window urcu_txn_read short-circuits to a plain
+		 * load, so single-writer is unchanged.
+		 */
+		nr_child = ft_meta_nr_child_load(metadata);
 
 		/*
 		 * A climbed ancestor with nr_child == 0 means a peer is concurrently
@@ -1331,9 +1357,9 @@ int ft_detach_node(struct cds_ft *ft,
 		 * we came up from (nr_child >= 1) -- so the pre-MW invariant assert
 		 * becomes an MW retry point, not a fatal abort.
 		 */
-		if (caa_unlikely(ft_meta_nr_child(metadata) == 0))
+		if (caa_unlikely(nr_child == 0))
 			return -EAGAIN;
-		if (!prev_external_nodes_found && (ft_meta_nr_child(metadata) == 1 && !metadata->external_nodes && !is_root)) {
+		if (!prev_external_nodes_found && (nr_child == 1 && !metadata->external_nodes && !is_root)) {
 			nr_clear++;
 		}
 		nr_branch++;
@@ -1352,7 +1378,7 @@ int ft_detach_node(struct cds_ft *ft,
 		 * being promoted and a further external ancestor is a genuine
 		 * boundary -- hence the `&& topmost_external_nodes` guard.
 		 */
-		if (prev_external_nodes_found || ft_meta_nr_child(metadata) > 1 ||
+		if (prev_external_nodes_found || nr_child > 1 ||
 		    (metadata->external_nodes && topmost_external_nodes) ||
 		    is_root) {
 			if (!is_root) {
@@ -1965,9 +1991,23 @@ int ft_detach_node(struct cds_ft *ft,
 			struct cds_ft_metadata *bmeta =
 				cds_ft_item_to_metadata(ft_node_ptr(iter_node_flag));
 
+			/*
+			 * Proxy-resolved, for the reason spelled out at the
+			 * up-walk's own snapshot: @bmeta IS that boundary node,
+			 * so this is a SECOND raw read of the very word the climb
+			 * just had to resolve.  Measured on the shared-destination
+			 * merge oracle's plan: 711 of 749873 reads here land on a
+			 * peer's parked state word.  The failure is worse than the
+			 * climb's, because it is silent -- a garbage count that
+			 * happens to decode as 2 enters the shape-D fusion, whose
+			 * scan below takes the FIRST surviving child and builds a
+			 * merged compressed node to REPLACE the boundary, dropping
+			 * every other child the node really had.  No assert stands
+			 * between that and a published trie.
+			 */
 			if (ft_group_skip_compressed(ft->group) &&
 			    !topmost_external_nodes &&
-			    ft_meta_nr_child(bmeta) == 2 &&
+			    ft_meta_nr_child_load(bmeta) == 2 &&
 			    !bmeta->external_nodes &&
 			    bmeta->parent != NULL) {
 				struct cds_ft_inode_flag *s_child = NULL;
