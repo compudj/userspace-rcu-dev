@@ -5145,6 +5145,28 @@ bool ft_glue_fence_holds(const struct ft_glue *g,
 	return false;
 }
 
+/*
+ * Renounce the free of every fenced overlap node: call when the commit did NOT
+ * report OK.  A fenced retire's LIVE->TOMBSTONE transition is atomic with the
+ * flip, so if the flip did not happen this op performed no retire and owns no
+ * free -- and something else may: the dominant reason a fenced terminal aborts
+ * is that a PEER retired the node under our fence (the retire primitives do not
+ * honour COPYING), and that peer owns the reclaim.  Freeing here would be a
+ * double free.
+ *
+ * Separate from ft_glue_clear_fenced, which releases the FENCE; this releases
+ * the claim on the MEMORY.  Both run on the aborting path.
+ */
+static
+void ft_glue_fenced_renounce_free(struct ft_glue *g)
+{
+	int i;
+
+	for (i = 0; i < g->nr_free; i++)
+		if (g->free_list[i].fenced)
+			g->free_list[i].retired = false;
+}
+
 static
 void ft_glue_clear_fenced(struct ft_glue *g)
 {
@@ -5334,14 +5356,39 @@ void ft_glue_tombstone_free_list(struct ft_glue *g)
 		 * the word fresh at commit and so cannot tell "unchanged" from
 		 * "changed and changed back into a shape that happens to match".
 		 *
-		 * The peer-already-tombstoned arm below does not apply: a successful
-		 * mark PROVES the word was clean-LIVE (ft_meta_copying_mark refuses
-		 * TOMBSTONE), and no peer can retire it while we hold the fence -- so
-		 * this commit always owns the LIVE->TOMBSTONE transition and @retired
-		 * stays true.
+		 * ★ THE FENCE DOES NOT STOP A PEER RETIRE, so the
+		 * peer-already-tombstoned arm below applies HERE TOO.  Neither retire
+		 * primitive honours COPYING: ft_meta_tombstone_set_flip waits on
+		 * FT_STATE_PROXY only (documented as deliberate at the mask's
+		 * definition -- a tombstone is a self-contained one-way mark), and
+		 * ft_flip_txn_record_tombstone takes its expected-old from the
+		 * COMMITTED word, our COPYING bit included, so its CAS matches and
+		 * lands {s|COPYING -> s|COPYING|TOMBSTONE}.  The fence excludes
+		 * COPYING-respecting peers; it does not exclude these.
+		 *
+		 * So keep the double-free guard.  Without it the sequence is: peer
+		 * retires under our fence and takes ownership of the free; our fenced
+		 * terminal's expected-old mismatches, so the commit ABORTS; and we
+		 * free the node anyway because @retired was left true -- a double free
+		 * on top of a lost merge.  (Measured: the plain path absorbs the peer
+		 * tombstone as a no-op upgrade and correctly declines the free, which
+		 * is the protection project_ft_barrier_uaf_is_graft_double_free
+		 * installed.  The fenced path must not lose it.)
+		 *
+		 * The RYW load only closes the window up to THIS point; the abort path
+		 * below covers a peer that retires between here and the commit, by
+		 * declining the free for every fenced entry when the commit does not
+		 * report OK -- if the flip did not happen, this op did not perform the
+		 * LIVE->TOMBSTONE transition and owns no free.
 		 */
 		if (g->free_list[i].fenced) {
+			uintptr_t cur;
+
 			assert(g->fuse_free_list);
+			cur = (uintptr_t) urcu_txn_load(g->txn->mtxn,
+				(void **) &meta->state, FT_STATE_PROXY);
+			if (cur & FT_STATE_TOMBSTONE)
+				g->free_list[i].retired = false;
 			ft_flip_txn_record_tombstone_copying(g->txn, meta,
 				g->free_list[i].snap);
 			continue;

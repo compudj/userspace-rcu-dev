@@ -1996,7 +1996,29 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	 *    progresses old->merged; and the ordered-list front advances in the same
 	 *    instant the merged minimum becomes reachable.
 	 */
-	ft_flip_txn_commit(dst_ft, txn);
+	{
+		enum urcu_txn_status mst = ft_flip_txn_commit(dst_ft, txn);
+
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+		/*
+		 * The flip did not happen, so no fenced retire took effect and this
+		 * op owns none of those frees -- renounce them before the step-7
+		 * reclaim.  The dominant reason a fenced terminal aborts is a PEER
+		 * retiring the node under our fence (the retire primitives do not
+		 * honour COPYING), and that peer owns the reclaim: freeing here
+		 * would be a double free on top of an already-lost merge.
+		 *
+		 * The merge itself still cannot recover -- the src is unlinked by
+		 * now, which is the pre-existing abort-after-point-of-no-return
+		 * exposure this shares with the unlocked pub_parent publish -- but
+		 * it must not corrupt the arena on the way out.
+		 */
+		if (mst != URCU_TXN_STATUS_OK)
+			ft_glue_fenced_renounce_free(&gd);
+#else
+		(void) mst;
+#endif
+	}
 
 	/*
 	 * 5. Drop the dup-chain holder locks: the appends are installed, so peers
