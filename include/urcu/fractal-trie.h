@@ -1689,20 +1689,23 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
  *   for each (key, node) in batch:
  *       cds_ft_insert(staging, key, key_len, node);
  *
- *   // Phase 2: graft into the live trie, O(1) under lock.  Under
- *   // fine-grained writer locking the source must be exclusive, so
- *   // make it exclusive once population is complete (a no-op / cheap
- *   // for optimistic groups):
+ *   // Phase 2: graft into the live trie, O(1).  Under fine-grained
+ *   // writer locking the source must be exclusive, so make it
+ *   // exclusive once population is complete:
  *   cds_ft_make_exclusive(staging);
- *   lock(&writer_mutex);
+ *   // No writer mutex needed under CDS_FT_WRITER_LOCK_FINE (the
+ *   // default): concurrent grafts into one live destination are
+ *   // supported, and serializing them here would discard exactly the
+ *   // parallelism fine-grained locking exists to provide.  Under
+ *   // CDS_FT_WRITER_LOCK_COARSE the library serializes writers itself.
  *   cds_ft_graft(live_trie, prefix, prefix_len, staging);
- *   unlock(&writer_mutex);
  *   // staging is now empty but still valid; it can be reused
  *   // for the next batch or destroyed with cds_ft_destroy().
  *
  * Both source and destination tries must belong to the same group.
- * Mutual exclusion between writers on all affected tries is the
- * caller's responsibility. Do NOT call these operations from within
+ * Update concurrency is documented per operation below and depends on
+ * the group's writer strategy (cds_ft_group_attr_set_writer_strategy).
+ * Do NOT call these operations from within
  * an RCU read-side critical section: they can block internally on
  * synchronize_rcu() to drain readers, which deadlocks (or never
  * completes) inside a read-side critical section. No RCU read-side lock
@@ -1792,8 +1795,20 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
  * in the same group, or if @src_ft is the same object as @dst_ft.
  * Returns a negative cds_ft_status on other errors.
  *
- * Mutual exclusion between writers on both @dst_ft and @src_ft is
- * the caller's responsibility.
+ * Update concurrency depends on the group's writer strategy
+ * (cds_ft_group_attr_set_writer_strategy):
+ *
+ *   CDS_FT_WRITER_LOCK_FINE (the default): the DESTINATION may be a live
+ *   trie carrying concurrent writers -- several cross-trie attaches
+ *   (cds_ft_graft, cds_ft_graft_swap, cds_ft_merge_at) may run
+ *   concurrently on the same destination.  The SOURCE must be EXCLUSIVE,
+ *   which is what removes the need to exclude writers on it.  Exclusion
+ *   against the point-update operations remains the caller's
+ *   responsibility.
+ *
+ *   CDS_FT_WRITER_LOCK_COARSE: writers serialize on one FT-wide writer
+ *   lock per trie, so any mix of update operations may be called
+ *   concurrently.
  */
 enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
 		const uint8_t *key, size_t key_len,
@@ -1860,8 +1875,20 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
  * in the same group, or if @swap_ft is the same object as @dst_ft.
  * Returns a negative cds_ft_status on other errors.
  *
- * Mutual exclusion between writers on both @dst_ft and @swap_ft is
- * the caller's responsibility.
+ * Update concurrency depends on the group's writer strategy
+ * (cds_ft_group_attr_set_writer_strategy):
+ *
+ *   CDS_FT_WRITER_LOCK_FINE (the default): the DESTINATION may be a live
+ *   trie carrying concurrent writers -- several cross-trie attaches
+ *   (cds_ft_graft, cds_ft_graft_swap, cds_ft_merge_at) may run
+ *   concurrently on the same destination.  The SOURCE must be EXCLUSIVE,
+ *   which is what removes the need to exclude writers on it.  Exclusion
+ *   against the point-update operations remains the caller's
+ *   responsibility.
+ *
+ *   CDS_FT_WRITER_LOCK_COARSE: writers serialize on one FT-wide writer
+ *   lock per trie, so any mix of update operations may be called
+ *   concurrently.
  */
 enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		const uint8_t *key, size_t key_len,
@@ -1904,8 +1931,16 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
  * Returns a negative cds_ft_status on error (including memory
  * allocation failure for the result trie).
  *
- * Mutual exclusion between writers on @ft is the caller's
- * responsibility.
+ * Update concurrency depends on the group's writer strategy
+ * (cds_ft_group_attr_set_writer_strategy):
+ *
+ *   CDS_FT_WRITER_LOCK_FINE (the default): NOT concurrency-safe.  Mutual
+ *   exclusion against every other update operation on the affected tries
+ *   is the caller's responsibility.
+ *
+ *   CDS_FT_WRITER_LOCK_COARSE: writers serialize on one FT-wide writer
+ *   lock per trie, so any mix of update operations may be called
+ *   concurrently.
  */
 enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 		const uint8_t *key, size_t key_len,
@@ -1964,8 +1999,16 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
  * fallible step and any allocation shortfall rolls the whole operation back
  * cleanly: the merge never leaks.
  *
- * Mutual exclusion between writers on both @dst_ft and @src_ft is
- * the caller's responsibility.
+ * Update concurrency depends on the group's writer strategy
+ * (cds_ft_group_attr_set_writer_strategy):
+ *
+ *   CDS_FT_WRITER_LOCK_FINE (the default): NOT concurrency-safe.  Mutual
+ *   exclusion against every other update operation on the affected tries
+ *   is the caller's responsibility.
+ *
+ *   CDS_FT_WRITER_LOCK_COARSE: writers serialize on one FT-wide writer
+ *   lock per trie, so any mix of update operations may be called
+ *   concurrently.
  */
 enum cds_ft_status cds_ft_merge(struct cds_ft *dst_ft,
 		const uint8_t *key, size_t key_len,
@@ -2013,6 +2056,21 @@ enum cds_ft_status cds_ft_merge(struct cds_ft *dst_ft,
  * length, so the moved keys keep that length only when the source and
  * destination prefixes are equally long); or if @src_ft == @dst_ft (a
  * same-trie move must use cds_ft_rekey_graft / cds_ft_rekey_merge).
+ *
+ * Update concurrency depends on the group's writer strategy
+ * (cds_ft_group_attr_set_writer_strategy):
+ *
+ *   CDS_FT_WRITER_LOCK_FINE (the default): the DESTINATION may be a live
+ *   trie carrying concurrent writers -- several cross-trie attaches
+ *   (cds_ft_graft, cds_ft_graft_swap, cds_ft_merge_at) may run
+ *   concurrently on the same destination.  The SOURCE must be EXCLUSIVE,
+ *   which is what removes the need to exclude writers on it.  Exclusion
+ *   against the point-update operations remains the caller's
+ *   responsibility.
+ *
+ *   CDS_FT_WRITER_LOCK_COARSE: writers serialize on one FT-wide writer
+ *   lock per trie, so any mix of update operations may be called
+ *   concurrently.
  */
 enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
 		const uint8_t *dst_key, size_t dst_key_len,
