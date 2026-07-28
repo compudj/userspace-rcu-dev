@@ -5521,19 +5521,39 @@ enum urcu_txn_status ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue 
 			continue;
 #ifdef FEATURE_FT_MW_DLM_ACQUIRE
 		/*
-		 * FOLD (coherent rekey one-decide writer): under structural_sw the
-		 * records below PARK -- plain stores that never validate -- so a live
-		 * child's re-home must be the co-committed (parent, offset) PAIR, not
-		 * ft_glue_record_back_edge's parent edge beside a plain
-		 * ft_set_parent_slot.  That plain store lands in the STATE word, which
-		 * ft_meta_nr_child_inc CASes from an insert BELOW the child (a peer
-		 * that neither this op's locks nor the graft's exclude), so it would
-		 * clobber or be clobbered.  ft_reparent_record records both words;
-		 * its offset edge carries new_state with COPYING masked out, so it
-		 * ALSO RELEASES the mark the fold took on that child (the ft_rekey_cow_stop
-		 * discipline: mark every metadata-bearing child whose state word an SW
-		 * edge parks into).  Every non-fold caller keeps structural_sw false and
-		 * is byte-identical.
+		 * FOLD (coherent rekey one-decide writer): a live child's re-home must
+		 * be the co-committed (parent, offset) PAIR, not
+		 * ft_glue_record_back_edge's parent edge beside an EARLY plain
+		 * ft_set_parent_slot.  That store is unobservable in the ordinary graft
+		 * window (its header says so, and it is right there), but the fold
+		 * re-parents children that stay READER-REACHABLE through the old spine
+		 * until the flip -- so a concurrent backtracker would read the new
+		 * offset against the still-old meta->parent: the torn (parent, slot)
+		 * pair ft_reparent_record_meta exists to prevent.
+		 *
+		 * ★ AND THE MARK.  Under structural_sw these records PARK -- plain
+		 * stores that never validate.  ft_reparent_record_meta parks the
+		 * child's STATE word too (its unconditional {live_state -> live_state}
+		 * §4.B guard), and THAT is the word ft_meta_nr_child_inc CASes from an
+		 * insert BELOW the child -- a peer neither this op's locks nor the
+		 * graft's exclude.  So every metadata-bearing child re-homed here MUST
+		 * carry this op's COPYING mark, which is what makes that peer honor
+		 * FT_STATE_INPLACE_WAIT_MASK and spin instead of clobbering the park.
+		 * The same guard edge, whose new_state has COPYING masked out, is what
+		 * RELEASES the mark at the flip.
+		 *
+		 * ☠ RELEASE ATTRIBUTION -- do not re-derive, and do not believe the
+		 * pre-§8.3 story: the release is that STATE edge, recorded
+		 * UNCONDITIONALLY, NOT the offset edge.  Since @118245b0 the offset is
+		 * its own word and its edge is recorded only `if (record_pso)` -- so
+		 * marking children on the strength of the offset edge would leak a
+		 * PERMANENT COPYING on every child whose slot index happens to be
+		 * unchanged across the re-home, which a merge produces routinely.
+		 *
+		 * An EXTERNAL head takes ft_reparent_record's own arm: no state word,
+		 * hence no mark to take and none to release.
+		 *
+		 * Every non-fold caller keeps structural_sw false and is byte-identical.
 		 */
 		if (g->txn->structural_sw) {
 			ft_reparent_record(ft, g->txn, g->deferred[i].child,

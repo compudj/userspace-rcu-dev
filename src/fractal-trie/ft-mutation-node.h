@@ -2322,15 +2322,22 @@ struct cds_ft_metadata *ft_child_state_meta(struct cds_ft *ft,
  * (locked, cannot fail).
  *
  * SW SAFETY (why the parks cannot be clobbered): the parent-pointer edge is
- * owned by @stop's lock (no peer re-homes a child of a COPYING-held parent); the
- * pso and retire edges live in state words that ft_meta_nr_child_inc CASes
- * IGNORING COPYING, so each such node is COPYING-MARKED here (@stop for the
- * retire, every metadata-bearing child for its pso) and a peer's count CAS now
- * HONORS the mark and spins (FT_STATE_INPLACE_WAIT_MASK) until this commit
- * settles the word.  ft_reparent_record_meta's new_state has COPYING masked out,
- * so the pso SW edge ALSO releases each child's mark at the flip; the retire
- * consumes @stop's.  The interior stays SHARED, so children of children need no
- * marks.
+ * owned by @stop's lock (no peer re-homes a child of a COPYING-held parent).
+ * The re-parent's §4.B guard edge and the retire both park the STATE word, which
+ * ft_meta_nr_child_inc CASes IGNORING COPYING, so each such node is
+ * COPYING-MARKED here (@stop for the retire, every metadata-bearing child for
+ * its guard) and a peer's count CAS now HONORS the mark and spins
+ * (FT_STATE_INPLACE_WAIT_MASK) until this commit settles the word.  The interior
+ * stays SHARED, so children of children need no marks.
+ *
+ * ☠ RELEASE ATTRIBUTION -- do not re-derive.  Each child's mark is released by
+ * ft_reparent_record_meta's {live_state -> live_state} STATE edge, whose
+ * live_state has COPYING masked out and which is recorded UNCONDITIONALLY; the
+ * retire consumes @stop's.  It is NOT the pso edge: since @118245b0 the pso is
+ * its own word and its edge is recorded only when the slot index CHANGES, so
+ * resting the release on it would leak a permanent COPYING on every child that
+ * lands at the same index.  The pre-§8.3 story (pso rode the state word, the pso
+ * edge did the masking) reads plausibly and is wrong.
  *
  * CALLER CONTRACT:
  *  - ft->lock_fine and ft_flip_txn_set_structural_sw(@txn, true) before calling.
