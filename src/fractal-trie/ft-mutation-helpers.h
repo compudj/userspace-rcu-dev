@@ -5287,6 +5287,23 @@ void ft_glue_abort(struct cds_ft *ft, struct ft_glue *g)
 		g->split_cn_holder = NULL;
 		g->split_cn_snap = 0;
 	}
+	/*
+	 * Publish-target fence (merge: pre-acquired BEFORE the src unlink so the
+	 * forward publish can never miss and abort a commit past the point of no
+	 * return).  Bails AFTER that acquire exist -- the src unlink's own OOM is
+	 * one -- so the release belongs at this choke point, not at the call sites
+	 * that happen to be visible when the acquire is written.
+	 *
+	 * clear_IF_HELD, and NULL it: a caller that already released the fence
+	 * itself (ft_graft_keylen clears pp_meta on its retry_attach path) or that
+	 * handed ownership to its txn (which NULLs the field) must not be
+	 * double-cleared -- ft_meta_copying_clear asserts the bit is still set.
+	 */
+	if (g->publish_parent_holder) {
+		ft_meta_copying_clear_if_held(g->publish_parent_holder);
+		g->publish_parent_holder = NULL;
+		g->publish_parent_snap = 0;
+	}
 	for (i = 0; i < g->nr_built; i++) {
 		struct cds_ft_inode_flag *nf = g->built[i];
 

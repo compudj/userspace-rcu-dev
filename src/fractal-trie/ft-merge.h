@@ -1750,6 +1750,52 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		return CDS_FT_STATUS_MEMORY_ERROR;
 	}
 
+	/*
+	 * PRE-ACQUIRE THE PUBLISH TARGET, here, for the same reason: this is the
+	 * last point at which failing to get it is free.
+	 *
+	 * The forward publish used to acquire @pub_parent at step 3 -- AFTER the src
+	 * unlink -- through ft_flip_txn_lock_or_guard_parent, whose miss is not a
+	 * failure it can report: it sets @acquire_miss, and the commit then ABORTS.
+	 * By then the src subtree is unlinked and the merged cluster is unpublished,
+	 * so the keys exist in NEITHER trie, and the ignored commit status let this
+	 * function return CDS_FT_STATUS_OK on top of it.  Silent data loss with a
+	 * success code, measured across most merge shapes.
+	 *
+	 * @pub_parent is above the overlap spine, so it is never in the fenced set;
+	 * it CAN be a dup-chain holder we just locked (an external dst merge point),
+	 * so take that fence over rather than re-marking our own word -- the
+	 * self-deadlock this file has now hit twice.  Either way the holder rides
+	 * @gd to the publish, which records the {COPYING|s -> s} release directly
+	 * and so never consults lock_or_guard.  With no acquire left to miss, that
+	 * abort cause is gone rather than merely less likely.
+	 *
+	 * A miss here bails exactly like the splice acquire above: both tries
+	 * pristine, contention reported, caller re-descends.
+	 */
+	if (!unfailable && dst_ft->lock_fine && pub_parent) {
+		struct cds_ft_metadata *pm = ft_flag_to_metadata(dst_ft, pub_parent);
+		uintptr_t psnap = 0;
+
+		if (!ft_glue_splice_holder_take(&gd, pm, &psnap) &&
+				ft_meta_copying_mark(pm, &psnap)) {
+			free(ms_src_pool);
+			free(ms_src_caps);
+			free(ms_edges);
+			ft_flip_txn_destroy(txn);
+			if (src_side_txn)
+				ft_flip_txn_destroy(src_side_txn);
+			if (fresh_root)
+				free_cds_ft_node_unpublished(src_ft, fresh_root);
+			ft_glue_abort(dst_ft, &gd);
+			ft_glue_abort(src_ft, &gs);
+			*contended = true;
+			return CDS_FT_STATUS_MEMORY_ERROR;
+		}
+		gd.publish_parent_holder = pm;
+		gd.publish_parent_snap = psnap;
+	}
+
 	if (root_src) {
 		/*
 		 * A root src moves the WHOLE source, so its run is the whole src
@@ -1901,17 +1947,26 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		 * release, the guard's strictly stronger twin, and the txn owns the
 		 * unlock from here (so the take clears our entry).
 		 */
-		{
-			struct cds_ft_metadata *pp_held = NULL;
-			uintptr_t pp_snap = 0;
-
-			if (pub_parent && ft_glue_splice_holder_take(&gd,
-					ft_flag_to_metadata(dst_ft, pub_parent),
-					&pp_snap))
-				pp_held = ft_flag_to_metadata(dst_ft, pub_parent);
-			ft_flip_txn_hold_or_lock_parent(dst_ft, txn, pub_parent,
-				pp_held, pp_snap);
-		}
+		/*
+		 * The holder was acquired BEFORE the src unlink (see the pre-acquire
+		 * above), whether by marking @pub_parent here or by taking over the
+		 * dup-chain fence when the two coincide.  Recording its release
+		 * directly is what keeps this publish off lock_or_guard, whose miss
+		 * would abort a commit that has no way left to fail safely.  NULL
+		 * holder = non-lock_fine or the unfailable caller, which routes to the
+		 * ordinary acquire-or-guard exactly as before.
+		 */
+		ft_flip_txn_hold_or_lock_parent(dst_ft, txn, pub_parent,
+			gd.publish_parent_holder, gd.publish_parent_snap);
+		/*
+		 * OWNERSHIP TRANSFER (mirrors the graft): @txn's registry now owns
+		 * this fence -- a commit consumes it through the recorded release, an
+		 * abort clears it -- so drop the glue's claim.  There is no bail left
+		 * between here and the commit, but leaving a stale holder behind is
+		 * the foot-gun that makes the NEXT bail added here a double clear.
+		 */
+		gd.publish_parent_holder = NULL;
+		gd.publish_parent_snap = 0;
 		ft_flip_txn_record_reserved(txn, (void **) pub_slot,
 			D_old, M_slot);
 	}
