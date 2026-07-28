@@ -3722,10 +3722,12 @@ enum cds_ft_status cds_ft_insert_replace(struct cds_ft *ft,
 	return CDS_FT_STATUS_OK;
 }
 
-enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
+static
+enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 		struct cds_ft_iter *iter,
 		struct cds_ft_node *old_node,
-		struct cds_ft_node *new_node)
+		struct cds_ft_node *new_node,
+		bool *need_retry)
 {
 	struct cds_ft_inode_flag *holder_flag;
 	struct cds_ft_inode_flag **pub_slot;
@@ -3734,7 +3736,6 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 	size_t key_len = ft_key_len(ft, ft_iter_resolve_key_len(iter));
 	enum cds_ft_status s;
 
-	CDS_FT_SCOPED_WRITER(ft);
 	FT_TP_ITER_KEY(replace_enter, iter);
 
 	/*
@@ -3880,11 +3881,50 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 			 * on a txn-alloc OOM nothing is published and @old_node /
 			 * @new_node are intact.
 			 */
-			struct ft_flip_txn *txn =
-				ft_flip_txn_create_bounded(
-					FT_HLIST_REPLACE_MAX_EDGES);
+			struct cds_ft_inode_flag *lock_nf;
+			struct cds_ft_metadata *hm = NULL;
+			uintptr_t hsnap = 0;
+			struct ft_flip_txn *txn;
+			enum urcu_txn_status cst;
 
+			/*
+			 * {L}: a duplicate chain is owned by its HEAD-HOLDER's
+			 * COPYING lock -- ft_hlist_replace_prepare states that
+			 * contract and DROPPED its multi-writer arbitration on the
+			 * strength of it, so acquire the holder here exactly as the
+			 * duplicate append does (ft_chain_node's caller) and as the
+			 * interior unchain does (ft_unchain_node).  Released after
+			 * the commit: this txn writes only hlist links, never the
+			 * holder's state word, so a plain clear composes.
+			 */
+			/*
+			 * The holder must be DERIVED, not taken from @parent_nf:
+			 * for a NON-head duplicate @parent_nf does not name the
+			 * chain's anchor (it can be an entry with no metadata at
+			 * all, which is a straight SIGSEGV in
+			 * cds_ft_item_to_metadata).  Walk prev to the head's holder
+			 * exactly as the interior unchain does -- ft_unchain_node is
+			 * called with a NULL holder for this same case and derives
+			 * it the same way.  A NULL result means no lockable anchor;
+			 * proceed unlocked, as remove does.
+			 */
+			lock_nf = ft->lock_fine ?
+				ft_chain_head_holder(ft, old_node) : NULL;
+			if (lock_nf) {
+				hm = ft_flag_to_metadata(ft, lock_nf);
+				if (ft_meta_copying_mark(hm, &hsnap)) {
+					new_node->next = NULL;
+					*need_retry = true;
+					s = CDS_FT_STATUS_OK;	/* discarded by the retry loop */
+					FT_TP(replace_exit, (int) s);
+					return s;
+				}
+			}
+			txn = ft_flip_txn_create_bounded(
+					FT_HLIST_REPLACE_MAX_EDGES);
 			if (!txn) {
+				if (hm)
+					ft_meta_copying_clear(hm);
 				new_node->next = NULL;
 				s = CDS_FT_STATUS_MEMORY_ERROR;
 				FT_TP(replace_exit, (int) s);
@@ -3892,9 +3932,37 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 			}
 			(void) ft_hlist_replace_prepare(ft_flip_txn_handle(txn),
 				old_node, new_node);
-			if (ft_flip_txn_commit(ft, txn) < 0) {
+			cst = ft_flip_txn_commit(ft, txn);
+			if (hm)
+				ft_meta_copying_clear(hm);
+			if (cst < 0) {
 				new_node->next = NULL;
 				s = CDS_FT_STATUS_MEMORY_ERROR;
+				FT_TP(replace_exit, (int) s);
+				return s;
+			}
+			if (cst > 0) {
+				/*
+				 * Contention ABORT: NOTHING was installed.  This
+				 * used to fall through as SUCCESS -- the test was
+				 * "< 0", which catches only MEMORY_ERROR -- so a
+				 * lost replace was silently reported as OK.  It
+				 * was unreachable while the op required caller
+				 * exclusion; making the op concurrent makes it
+				 * live, so it must re-derive and re-attempt.
+				 *
+				 * BOTH links must be reset, not just next:
+				 * ft_hlist_replace_prepare already stored
+				 * @new_node->prev = pred as a plain build store
+				 * on the (still invisible) fresh node, so leaving
+				 * it set would make the next attempt fail entry
+				 * validation with INVALID_ARGUMENT_ERROR rather
+				 * than retry.
+				 */
+				new_node->next = NULL;
+				new_node->prev = NULL;
+				*need_retry = true;
+				s = CDS_FT_STATUS_OK;	/* discarded by the retry loop */
 				FT_TP(replace_exit, (int) s);
 				return s;
 			}
@@ -3992,5 +4060,50 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 	iter_auto_invalidate_cache(iter);
 	s = CDS_FT_STATUS_OK;
 	FT_TP(replace_exit, (int) s);
+	return s;
+}
+
+/*
+ * Public entry: FT-owned per-op read-side bracket + retry identity, mirroring
+ * cds_ft_remove -- its structural twin (both take the target node explicitly and
+ * derive position from node->prev with NO re-descent).  The two were asymmetric:
+ * remove absorbed contention internally while replace had no retry path at all,
+ * so a caller could not write the same loop around both.
+ *
+ * RETRY: an attempt that loses the chain's holder lock, or whose commit returns
+ * ABORT, publishes NOTHING and signals @need_retry; the loop re-derives from
+ * node->prev against the current tree and re-attempts.  Aging is carried on the
+ * PERSISTENT @optxn via urcu_txn_conflict: after URCU_TXN_FALLBACK conflicts the
+ * domain escalates this writer into the per-trie FIFO fair-mutex lane, which
+ * drains the contention so the retry TERMINATES (no livelock).  An exclusive
+ * trie opens nothing and never conflicts.
+ *
+ * Every retrying path resets @new_node->next before returning, because the entry
+ * validation rejects a @new_node whose links are non-NULL -- without that reset
+ * the second attempt would fail with INVALID_ARGUMENT_ERROR instead of retrying.
+ */
+enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
+		struct cds_ft_iter *iter,
+		struct cds_ft_node *old_node,
+		struct cds_ft_node *new_node)
+{
+	struct urcu_txn optxn;
+	enum cds_ft_status s;
+	bool need_retry;
+
+	CDS_FT_SCOPED_WRITER(ft);
+	ft_txn_op_init(ft, &optxn);
+	for (;;) {
+		need_retry = false;
+		urcu_txn_begin(&optxn);
+		s = _cds_ft_replace_locked(ft, iter, old_node, new_node,
+				&need_retry);
+		if (!need_retry)
+			break;
+		/* Age the conflict, keep the FIFO turn, close the attempt. */
+		urcu_txn_conflict(&optxn);
+		urcu_txn_end(&optxn);
+	}
+	urcu_txn_end(&optxn);
 	return s;
 }

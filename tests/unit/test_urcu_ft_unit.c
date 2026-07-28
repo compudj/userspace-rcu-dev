@@ -60,9 +60,9 @@
  * plan said 327 where 328 tests ran, so the fault build failed its own TAP
  * plan.) */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (332 + NR_TESTS_DLM)
+#define NR_TESTS (333 + NR_TESTS_DLM)
 #else
-#define NR_TESTS (285 + NR_TESTS_DLM)
+#define NR_TESTS (286 + NR_TESTS_DLM)
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -7850,6 +7850,97 @@ static int test_iter_reset(void)
 /*
  * cds_ft_replace: swap a node in-place within a duplicate chain.
  */
+/*
+ * Replace a NON-HEAD duplicate.  test_replace_node covers only the HEAD arm (a
+ * lone node at a key IS the head), so ft_hlist_replace_prepare -- and the chain
+ * head-holder lock acquired beside it -- had NO coverage at all: an instrumented
+ * run showed that arm executing ZERO times across the whole suite, which is why
+ * a green suite said nothing about it.
+ */
+static int test_replace_duplicate_interior(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ft(4, &group);
+	struct cds_ft_iter *iter;
+	struct ft_test_node *n1 = node_alloc(77);
+	struct ft_test_node *n2 = node_alloc(77);
+	struct ft_test_node *n3 = node_alloc(77);
+	struct ft_test_node *n_new = node_alloc(77);
+	struct cds_ft_node *head, *pos;
+	enum cds_ft_status s;
+	uint8_t k[4];
+	int count = 0, saw_new = 0, saw_old = 0;
+
+	n1->value = 1; n2->value = 2; n3->value = 3; n_new->value = 222;
+
+	if (cds_ft_iter_create(ft, &iter) < 0) {
+		node_free(n1); node_free(n2); node_free(n3); node_free(n_new);
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	cds_ft_u64_to_key(ft, 77, k, CDS_FT_LEN_DEFAULT);
+
+	rcu_read_lock();
+	/* Three duplicates at one key: head + two interior/tail entries. */
+	if (cds_ft_insert(ft, k, CDS_FT_LEN_DEFAULT, &n1->node) < 0) goto fail;
+	if (cds_ft_insert(ft, k, CDS_FT_LEN_DEFAULT, &n2->node) < 0) goto fail;
+	if (cds_ft_insert(ft, k, CDS_FT_LEN_DEFAULT, &n3->node) < 0) goto fail;
+
+	if (lookup_u64(ft, 77, &head) != CDS_FT_STATUS_OK || !head) goto fail;
+	/* The SECOND chain element: a non-head duplicate, the arm under test. */
+	pos = cds_ft_node_next_rcu(head);
+	if (!pos) {
+		fprintf(stderr, "replace_dup: chain shorter than 2\n");
+		goto fail;
+	}
+	if (pos == head) {
+		fprintf(stderr, "replace_dup: next returned the head\n");
+		goto fail;
+	}
+
+	cds_ft_iter_set_key(iter, k, CDS_FT_LEN_DEFAULT);
+	if (cds_ft_lookup(ft, iter) != CDS_FT_STATUS_OK) goto fail;
+	s = cds_ft_replace(ft, iter, pos, &n_new->node);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "replace_dup failed: %s\n",
+			cds_ft_status_to_string(s));
+		goto fail;
+	}
+
+	/* Chain must still hold three, with @pos swapped out for @n_new. */
+	if (lookup_u64(ft, 77, &head) != CDS_FT_STATUS_OK || !head) goto fail;
+	{
+		struct cds_ft_node *it = head;
+
+		cds_ft_for_each_duplicate_rcu(it) {
+			count++;
+			if (it == &n_new->node) saw_new = 1;
+			if (it == pos) saw_old = 1;
+		}
+	}
+	rcu_read_unlock();
+
+	/* @pos left the trie: reclaim it, or leak_check fails the test. */
+	node_free_rcu(caa_container_of(pos, struct ft_test_node, node));
+
+	if (count != 3 || !saw_new || saw_old) {
+		fprintf(stderr, "replace_dup: chain len %d (want 3), new %d, "
+			"old still present %d\n", count, saw_new, saw_old);
+		cds_ft_iter_destroy(iter);
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+	cds_ft_iter_destroy(iter);
+	return drain_and_destroy(ft, group);
+
+fail:
+	rcu_read_unlock();
+	cds_ft_iter_destroy(iter);
+	drain_and_destroy(ft, group);
+	return -1;
+}
+
 static int test_replace_node(void)
 {
 	struct cds_ft_group *group;
@@ -28277,6 +28368,7 @@ int main(int argc, char **argv)
 	/* 5. Replace & remove_all */
 	diag("Replace & remove_all tests");
 	RUN_TEST(test_replace_node);
+	RUN_TEST(test_replace_duplicate_interior);
 	RUN_TEST(test_remove_all);
 	RUN_TEST(test_remove_middle_of_chain);
 
