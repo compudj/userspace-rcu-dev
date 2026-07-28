@@ -50,7 +50,7 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_MW_DLM_ACQUIRE
-#define NR_TESTS_DLM 7		/* cow_stop_root_inplace, rekey_graft_{simple,liston,cross_junction,glue_dst}, rekey_merge_{occupied,collide}_dst */
+#define NR_TESTS_DLM 8		/* cow_stop_root_inplace, rekey_graft_{simple,liston,cross_junction,glue_dst,glue_dst_branch_child}, rekey_merge_{occupied,collide}_dst */
 #else
 #define NR_TESTS_DLM 0
 #endif
@@ -1750,6 +1750,93 @@ end:
  */
 #define RKG_A		0x10
 #define RKG_B		0x20
+/*
+ * GLUE dst whose split compressed node's DISPLACED CHILD IS INTERNAL.
+ *
+ * Every other GLUE fixture puts a LONE deep key under the dst prefix, so the
+ * compressed tail's child is an EXTERNAL leaf -- which has no metadata, so
+ * ft_child_state_meta returns NULL and the driver takes no mark on it.  That is
+ * why nothing in the suite has ever built the shape below.
+ *
+ * TWO keys under that tail (sharing all but the last byte) make the compressed
+ * node's child a BRANCH instead, which DOES carry a state word.  The driver then
+ * marks it (fractal-trie.c, the FT_GRAFT_PREP_GLUE arm) while
+ * ft_split_compressed_graft_build ALSO defers the same node -- and
+ * ft_glue_acquire_reparent_marks marks every deferred entry, reconciling only
+ * against ft_glue_op_holds, which does not know about the driver's marks[].
+ *
+ * The RETRY loop is the point: -EAGAIN matters only if it is PERMANENT.  This
+ * is single-threaded, so every attempt rebuilds the identical shape -- measured
+ * 9 attempts, all -EAGAIN, before the reconciliation landed.
+ */
+static int test_rekey_graft_glue_dst_branch_child(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	uint8_t src_key[3] = { RKG_A, 0x01, 0x03 };
+	uint8_t dst[3] = { RKG_B, 0x01, 0x03 };	/* diverges INSIDE the cn */
+	uint64_t keys[9];
+	int i, rc, ret = -1;
+
+	ft = create_fixed_fine_lock_ft(5, &group);
+	keys[0] = RKX_KEY(RKG_A, 0x01, 0x01, 0, 0);
+	keys[1] = RKX_KEY(RKG_A, 0x01, 0x05, 0, 0);
+	keys[2] = RKX_KEY(RKG_A, 0x09, 0, 0, 0);
+	/* The pair: compressed tail [01,07,07] with a 2-way branch under it. */
+	keys[3] = RKX_KEY(RKG_B, 0x01, 0x07, 0x07, 0x07);
+	keys[4] = RKX_KEY(RKG_B, 0x01, 0x07, 0x07, 0x09);
+	for (i = 0; i < 4; i++)			/* S_top's four leaves */
+		keys[5 + i] = RKX_KEY(RKG_A, 0x01, 0x03, i + 1, 0);
+
+	rcu_read_lock();
+	for (i = 0; i < 9; i++) {
+		if (insert_u64(ft, keys[i], node_alloc(keys[i])) !=
+				CDS_FT_STATUS_OK) {
+			rcu_read_unlock();
+			fprintf(stderr, "glue-branch-child: insert %d failed\n", i);
+			goto end;
+		}
+	}
+	rcu_read_unlock();
+
+	{
+		int att;
+
+		/*
+		 * RETRY, because -EAGAIN only matters if it is PERMANENT.  A
+		 * transient loss to a peer is the contract; this is single-
+		 * threaded, so every attempt rebuilds the identical shape.
+		 */
+		for (att = 0; att < 8; att++) {
+			rc = _cds_ft_debug_rekey_graft_simple(ft, src_key, 3,
+					dst, 3);
+			if (rc != -EAGAIN)
+				break;
+		}
+		fprintf(stderr, "# glue-branch-child: %d attempt(s), last rc=%d\n",
+			att + 1, rc);
+	}
+	if (rc != 0) {
+		fprintf(stderr, "glue-branch-child: driver rc=%d (a PERMANENT -EAGAIN "
+			"here is the marks[]/deferred[] self-collision)\n", rc);
+		goto end;
+	}
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "glue-branch-child: verify failed\n");
+		goto end;
+	}
+	if (cds_ft_count_entries(ft) != 9) {
+		fprintf(stderr, "glue-branch-child: entries %lu != 9\n",
+			cds_ft_count_entries(ft));
+		goto end;
+	}
+	ret = 0;
+end:
+	if (drain_and_destroy(ft, group) < 0)
+		ret = -1;
+	return ret;
+}
+
 static int test_rekey_graft_glue_dst(void)
 {
 	struct cds_ft_group *group;
@@ -29481,6 +29568,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_rekey_graft_liston);
 	RUN_TEST(test_rekey_graft_cross_junction);
 	RUN_TEST(test_rekey_graft_glue_dst);
+	RUN_TEST(test_rekey_graft_glue_dst_branch_child);
 #endif
 #ifdef FEATURE_FT_FAULT_INJECT
 	RUN_TEST(test_rekey_coherence_fault_redescend);

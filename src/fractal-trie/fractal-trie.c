@@ -1142,6 +1142,15 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 				marks[nr_marks] = cm;
 				snaps[nr_marks] = csnap;
 				nr_marks++;
+				/*
+				 * Tell the glue we already hold this one.  The split
+				 * build DEFERS this same child, and
+				 * ft_glue_acquire_reparent_marks marks every deferred
+				 * entry -- without this it would fail against our own
+				 * fence and bail -EAGAIN on every attempt.  Read-only
+				 * to the glue: @marks below stays its sole release.
+				 */
+				glue.caller_holder = cm;
 			}
 		}
 		/*

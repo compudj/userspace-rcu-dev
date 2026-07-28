@@ -4472,6 +4472,23 @@ struct ft_glue {
 	 * not pre-acquired (non-lock_fine, or a NOSPLIT / root-splice publish).
 	 */
 	struct cds_ft_metadata *split_cn_holder;
+	/*
+	 * A COPYING this op holds OUTSIDE the glue, for reconciliation ONLY: the
+	 * glue reads it in ft_glue_op_holds and never clears it -- the caller that
+	 * took it owns its release (one owner per fence).
+	 *
+	 * Needed because two correct lock sets over one node self-deadlock.  The
+	 * rekey driver's FT_GRAFT_PREP_GLUE arm marks the split compressed node's
+	 * DISPLACED CHILD before the build (its state word is SW-parked, and an
+	 * insert below it CASes nr_child, which @cn's own fence does not exclude),
+	 * and ft_split_compressed_graft_build DEFERS that same node -- so
+	 * ft_glue_acquire_reparent_marks, which marks every deferred entry, would
+	 * fail against our own fence.  Deterministically: the bail returns -EAGAIN,
+	 * the retry rebuilds the identical shape, and the op never completes.
+	 * Invisible until a fixture gives that child >=2 keys, because a lone key
+	 * leaves it EXTERNAL and an external has no state word to mark.
+	 */
+	struct cds_ft_metadata *caller_holder;
 	uintptr_t split_cn_snap;
 	/*
 	 * Enable the split-retire @cn fence (above) for THIS build.  Set only by
@@ -4569,6 +4586,7 @@ void ft_glue_init(struct ft_glue *g)
 	g->publish_parent_holder = NULL;
 	g->publish_parent_snap = 0;
 	g->split_cn_holder = NULL;
+	g->caller_holder = NULL;
 	g->split_cn_snap = 0;
 	g->fence_split_cn = false;
 	g->attached_nf = NULL;
@@ -5297,7 +5315,8 @@ bool ft_glue_op_holds(const struct ft_glue *g,
 {
 	int i;
 
-	if (g->publish_parent_holder == meta || g->split_cn_holder == meta)
+	if (g->publish_parent_holder == meta || g->split_cn_holder == meta ||
+			g->caller_holder == meta)
 		return true;
 	if (ft_glue_fence_holds(g, meta))
 		return true;
