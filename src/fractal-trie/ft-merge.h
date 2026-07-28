@@ -79,6 +79,21 @@ struct ft_merge_ctx {
 	struct cds_ft *dst_ft;		/* all fresh merged nodes live here */
 	struct ft_glue *gd;	/* dst cluster: built/deferred/dst frees/splices */
 	struct ft_glue *gs;	/* src side: src-overlap frees (+ prune later) */
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+	/*
+	 * DLM overlap-spine plan-lock (§9.4 M-2): fence each DST overlap node
+	 * before reading its body, and retire it through the fenced terminal.
+	 * Set by the caller when the dst trie is lock_fine.
+	 */
+	bool fence_overlap;
+	/*
+	 * Set when a fence acquire MISSED: the build returns FT_MERGE_OOM like any
+	 * other failure (one sentinel, one caller unwind), but this distinguishes
+	 * CONTENTION from a real allocation failure so the caller can re-descend
+	 * instead of reporting MEMORY_ERROR.
+	 */
+	bool overlap_contended;
+#endif
 };
 
 /* Upper-bound counters for the read-only pre-pass that sizes the glues. */
@@ -293,6 +308,51 @@ struct cds_ft_inode_flag *ft_merge_build_run(struct ft_merge_ctx *c,
 	return plain;
 }
 
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+/*
+ * DLM overlap-spine plan-lock (§9.4 M-2): acquire a DST overlap node's COPYING
+ * fence BEFORE ft_merge_build reads its body into the merged cluster, so the copy
+ * plan and the retire that ratifies it bracket the same world.
+ *
+ * WHAT IT CLOSES.  The retire was a PLAIN {s -> s|TOMBSTONE} whose expected-old is
+ * read fresh at commit, with NO lock over the window in which the build copied the
+ * node's children.  A peer adding a child in that window is invisible: the late
+ * expected-old still matches, the commit succeeds, and the peer's child is retired
+ * along with the node.  Silent key loss, and exactly the "unlocked retire" class
+ * the escalation model separates from the lock_or_guard publish sites (which do
+ * abort on a peer touch).
+ *
+ * Returns -EAGAIN on a dirty word (a peer's parked proxy, a concurrent copier, a
+ * real retire).  That aborts the whole build: ft_merge_build returns FT_MERGE_OOM,
+ * the caller ft_glue_aborts, and ft_glue_clear_fenced releases the marks already
+ * taken.  Only DST overlap nodes are fenced -- a cross-trie merge REQUIRES its
+ * source exclusive (and the rekey's source is a detach product), so the src side
+ * has no peer to exclude and its glue keeps the plain retire.
+ */
+static inline
+int ft_merge_lock_overlap(void *node, uintptr_t *snap)
+{
+#ifdef FEATURE_FT_FAULT_INJECT
+	/*
+	 * Test-only: fail this acquire exactly as a peer holding the overlap node
+	 * would (shared cds_ft_fault_lock_countdown).  Without it the bail and the
+	 * caller's re-descend are DEAD CODE -- a single-threaded merge never misses,
+	 * and the concurrent oracles merge disjoint key sets, so nothing in the
+	 * suite drives a contended overlap fence.
+	 */
+	if (cds_ft_fault_lock_countdown >= 0) {
+		if (cds_ft_fault_lock_countdown == 0) {
+			cds_ft_fault_lock_countdown = -1;
+			return -EAGAIN;
+		}
+		cds_ft_fault_lock_countdown--;
+	}
+#endif
+	return ft_meta_copying_mark(cds_ft_item_to_metadata(
+		(struct cds_ft_inode *) node), snap);
+}
+#endif
+
 static
 struct cds_ft_inode_flag *ft_merge_build(struct ft_merge_ctx *c,
 		struct cds_ft_inode_flag *S, unsigned int off_s,
@@ -308,6 +368,10 @@ struct cds_ft_inode_flag *ft_merge_build(struct ft_merge_ctx *c,
 	unsigned long total_keys = 0;
 	bool tracked = false;
 	unsigned int b, s_fb = 0, d_fb = 0;
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+	uintptr_t d_ov_snap = 0;	/* this frame's dst overlap fence snapshot */
+	bool d_ov_fenced = false;
+#endif
 
 	S = ft_resolve_skip_compressed(ft, S);
 	D = ft_resolve_skip_compressed(ft, D);
@@ -325,8 +389,58 @@ struct cds_ft_inode_flag *ft_merge_build(struct ft_merge_ctx *c,
 	 */
 	if (S_comp && off_s == 0)
 		ft_glue_defer_free(c->gs, cn_s, true);
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+	/*
+	 * Plan-lock THIS FRAME's dst overlap node BEFORE any body read below -- the
+	 * compressed prefix scan, the Pass-1 ft_node_get_nth_skip sweep, and the
+	 * external_nodes fetch all read @D.  Acquiring here (not at the tail
+	 * defer_free, which runs after those reads) is what makes the copy plan and
+	 * the retire that ratifies it bracket the same world.
+	 *
+	 * A compressed run re-entered at off_d > 0 by the shared-run recursion was
+	 * already fenced by the frame that entered it at 0, so it must NOT be
+	 * re-marked: ft_meta_copying_mark refuses an already-COPYING word and we
+	 * would fail against our own fence.  An EXTERNAL D retires nothing here, so
+	 * it takes no lock.
+	 */
+	if (c->fence_overlap) {
+		void *dnode = NULL;
+
+		if (D_comp) {
+			if (off_d == 0)
+				dnode = cn_d;
+		} else if (!ft_node_external(D)) {
+			dnode = ft_node_ptr(D);
+		}
+		if (dnode) {
+			if (ft_merge_lock_overlap(dnode, &d_ov_snap)) {
+				c->overlap_contended = true;
+				return FT_MERGE_OOM;
+			}
+			/*
+			 * RECORD THE RETIRE IN THE SAME BREATH AS THE MARK.  The
+			 * free-list entry is what makes the fence visible to
+			 * ft_glue_clear_fenced, and this frame has failure paths
+			 * BEFORE its tail -- a child recursion returning
+			 * FT_MERGE_OOM, a set_nth failure -- that return straight
+			 * out.  Recording at the tail (where the plain retire sits)
+			 * would leave those paths holding an unrecorded fence: a
+			 * node left permanently COPYING, which no later publish into
+			 * it can ever survive.  Recording early is harmless on the
+			 * failing path, since the free list only tombstones anything
+			 * if this build reaches its commit.
+			 */
+			ft_glue_defer_free_fenced(c->gd, dnode, D_comp,
+				d_ov_snap);
+			d_ov_fenced = true;
+		}
+	}
+	if (D_comp && off_d == 0 && !d_ov_fenced)
+		ft_glue_defer_free(c->gd, cn_d, true);
+#else
 	if (D_comp && off_d == 0)
 		ft_glue_defer_free(c->gd, cn_d, true);
+#endif
 
 	/*
 	 * Both compressed and sharing a prefix from their cursors -> collapse
@@ -546,7 +660,12 @@ struct cds_ft_inode_flag *ft_merge_build(struct ft_merge_ctx *c,
 	 */
 	if (!S_ext && !S_comp)
 		ft_glue_defer_free(c->gs, ft_node_ptr(S), false);
-	if (!D_ext && !D_comp)
+	if (!D_ext && !D_comp
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+			/* Already recorded at entry, together with its fence. */
+			&& !d_ov_fenced
+#endif
+	   )
 		ft_glue_defer_free(c->gd, ft_node_ptr(D), false);
 
 	ft_nr_keys_store(ft, Mmeta, total_keys, CMM_RELAXED);
@@ -1190,12 +1309,31 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	}
 
 	/* Build the merged cluster invisibly (the only build-phase fallible step). */
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+	/*
+	 * DLM overlap-spine plan-lock (§9.4 M-2): fence each dst overlap node before
+	 * the build reads it, and retire it through the fenced terminal, so a peer
+	 * growing a node this merge is copying cannot be silently retired with it.
+	 * Skipped for the unfailable caller, which has no bail left to take.
+	 */
+	ctx.fence_overlap = dst_ft->lock_fine && !unfailable;
+#endif
 	M = ft_merge_build(&ctx, S, off_src, D, off_dst, 0, &merged_keys);
 	if (M == FT_MERGE_OOM) {
 		if (fresh_root)
 			free_cds_ft_node_unpublished(src_ft, fresh_root);
 		ft_glue_abort(dst_ft, &gd);
 		ft_glue_abort(src_ft, &gs);
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+		/*
+		 * A missed overlap fence shares FT_MERGE_OOM's unwind but is
+		 * CONTENTION, not memory: both tries are pristine (the build published
+		 * nothing and ft_glue_abort released every fence it took), so report it
+		 * on the retry channel and let the caller re-descend.
+		 */
+		if (ctx.overlap_contended)
+			*contended = true;
+#endif
 		return CDS_FT_STATUS_MEMORY_ERROR;
 	}
 	/*
@@ -1871,6 +2009,17 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	 *    was handed to @txn above and is already released by its flip.)
 	 */
 	ft_glue_release_splice_holders(&gd);
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+	/*
+	 *    Same for the overlap-spine plan-locks: a COMMITTED fenced retire
+	 *    consumed each fence into TOMBSTONE (clear_if_held no-ops), while an
+	 *    ABORTED commit left {COPYING|s} that must come off or every later peer
+	 *    publish into that node fails forever.  One unconditional sweep covers
+	 *    both, which is why no per-outcome bookkeeping is kept.  Before the
+	 *    step-7 reclaim, while the nodes are still addressable.
+	 */
+	ft_glue_clear_fenced(&gd);
+#endif
 
 	/*
 	 * 6. The dst net key-count delta (merged_keys - cnt_dst) is FOLDED into

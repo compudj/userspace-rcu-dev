@@ -55,14 +55,25 @@
 #define NR_TESTS_DLM 0
 #endif
 
+/*
+ * Tests needing DLM *and* fault injection in one build: the merge overlap-spine
+ * fence bail, whose acquire only exists under DLM and only MISSES when the fault
+ * hook forces it.  Only the gate's dlm-fault config defines both.
+ */
+#if defined(FEATURE_FT_MW_DLM_ACQUIRE) && defined(FEATURE_FT_FAULT_INJECT)
+#define NR_TESTS_DLM_FAULT 1	/* test_fine_lock_merge_overlap_fence */
+#else
+#define NR_TESTS_DLM_FAULT 0
+#endif
+
 /* 285 unconditional + 48 fault-injection-only RUN_TEST registrations.  (The
  * fault total was one short before test_rekey_coherence_relational_fault: the
  * plan said 327 where 328 tests ran, so the fault build failed its own TAP
  * plan.) */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (334 + NR_TESTS_DLM)
+#define NR_TESTS (334 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (286 + NR_TESTS_DLM)
+#define NR_TESTS (286 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -28015,6 +28026,13 @@ static int test_fine_lock_chain_acquire_fault(void)
  * COPYING bit left set at rest is reported as a leaked copy fence and would wedge
  * every later publish into that holder.
  *
+ * NOTE for a build with DLM ALSO on: the merge overlap-spine fence runs BEFORE
+ * this acquire, so it swallows the armed countdown and the splice bail is not
+ * what gets exercised there.  The splice bail's coverage comes from the gate's
+ * fault-audit config (fault injection, no DLM), where no overlap fence exists;
+ * dlm-fault covers the overlap bail instead (test_fine_lock_merge_overlap_fence).
+ * The two configs are what make both bails live.
+ *
  * Phase 2 asserts the BAIL is live, not dead code.  cds_ft_fault_lock_countdown
  * fails one acquire exactly as a peer holding the holder would, which is what the
  * merge cannot tolerate silently: the acquire sits at the LAST point where a miss
@@ -28137,6 +28155,132 @@ static int test_fine_lock_merge_splice_acquire(void)
 		return -1;
 	return fine_lock_merge_splice_run(/*fault=*/ true);
 }
+
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+/*
+ * MW LOCK_FINE + DLM: the merge OVERLAP-SPINE plan-lock, and specifically its
+ * BAIL.  ft_merge_build fences every dst overlap node before copying its body
+ * into the merged cluster, so the copy plan and the {COPYING|s -> TOMBSTONE|s}
+ * retire that ratifies it bracket the same world -- closing the "unlocked
+ * retire" hole where a peer grows a node this merge is about to retire and the
+ * peer's child goes with it.
+ *
+ * The acquire itself runs in ordinary merges (measured: 26 fences across a dlm
+ * ft_unit).  Its MISS does not: a single-threaded merge never loses the mark,
+ * and the concurrent cross-trie oracles merge DISJOINT key sets, so no test in
+ * the suite contends an overlap node.  cds_ft_fault_lock_countdown is therefore
+ * the only driver, and this is the only place the bail runs.
+ *
+ * The merge must SURVIVE the forced miss: the fence is taken before the src
+ * unlink, so the bail unwinds a fully-built cluster with both tries pristine and
+ * the caller re-descends and rebuilds.  Asserted after: the merge reports OK, all
+ * keys from both sides are present, and cds_ft_verify is clean -- which is what
+ * catches a fence left set at rest (reported as a leaked copy fence, and it would
+ * wedge every later publish into that node).  The countdown reading -1 proves the
+ * fault LANDED; if the site were unreachable it would still read 0 and the bail
+ * would be dead.
+ */
+static int fine_lock_merge_overlap_fence_run(bool fault)
+{
+	struct cds_ft_group *group = NULL;
+	struct cds_ft *dst = create_varlen_fine_lock_ft(&group);
+	struct cds_ft *src = NULL;
+	const char *tag = fault ? "overlap fault" : "overlap plain";
+	/* DISJOINT suffixes: this exercises the overlap fence, not the splice. */
+	const char *dsfx = "ae", *ssfx = "bc";
+	enum cds_ft_status s;
+	int i, rc = -1;
+
+	if (cds_ft_create(group, NULL, &src) < 0) {
+		drain_and_destroy(dst, group);
+		return -1;
+	}
+	rcu_read_lock();
+	/*
+	 * dst "PQ" holds {PQa,PQe} under a P that also holds "PZ", so the merge
+	 * point is a live INTERNAL dst node with a surviving parent -- i.e. a dst
+	 * overlap node ft_merge_build copies and retires, which is exactly what
+	 * takes the fence.  src "M" holds {Mb,Mc}: merged at "PQ" the suffixes
+	 * interleave, no full key collides.
+	 */
+	for (i = 0; i < 2; i++) {
+		char dk[3] = { 'P', 'Q', dsfx[i] };
+		char sk[2] = { 'M', ssfx[i] };
+		struct ft_test_node *dn = node_alloc((uint64_t) i);
+		struct ft_test_node *sn = node_alloc((uint64_t) (i + 100));
+
+		if (cds_ft_insert(dst, (const uint8_t *) dk, 3, &dn->node)
+				!= CDS_FT_STATUS_OK ||
+		    cds_ft_insert(src, (const uint8_t *) sk, 2, &sn->node)
+				!= CDS_FT_STATUS_OK)
+			goto out;
+	}
+	{
+		struct ft_test_node *zn = node_alloc(42);
+
+		if (cds_ft_insert(dst, (const uint8_t *) "PZ", 2, &zn->node)
+				!= CDS_FT_STATUS_OK)
+			goto out;
+	}
+
+	cds_ft_make_exclusive(src);
+	if (fault)
+		cds_ft_fault_lock_countdown = 0;
+	s = cds_ft_merge_at(dst, (const uint8_t *) "PQ", 2,
+			src, (const uint8_t *) "M", 1);
+	if (fault && cds_ft_fault_lock_countdown != -1) {
+		fprintf(stderr, "%s: overlap fence never reached -- bail is dead\n",
+			tag);
+		goto out;
+	}
+	cds_ft_fault_lock_countdown = -1;
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "%s: merge_at did not survive a forced fence "
+			"miss: %s\n", tag, cds_ft_status_to_string(s));
+		goto out;
+	}
+
+	/* Both sides landed: nothing was retired with the overlap node. */
+	if (!ft_test_has_key(dst, "PQa") || !ft_test_has_key(dst, "PQb") ||
+	    !ft_test_has_key(dst, "PQc") || !ft_test_has_key(dst, "PQe") ||
+	    !ft_test_has_key(dst, "PZ")) {
+		fprintf(stderr, "%s: key lost across the merge\n", tag);
+		goto out;
+	}
+	if (cds_ft_count_keys(dst) != 5) {
+		fprintf(stderr, "%s: count %lu != 5\n", tag,
+			cds_ft_count_keys(dst));
+		goto out;
+	}
+	if (cds_ft_verify(dst, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "%s: verify failed -- leaked overlap fence?\n", tag);
+		goto out;
+	}
+	if (!cds_ft_empty(src)) {
+		fprintf(stderr, "%s: src not empty after merge\n", tag);
+		goto out;
+	}
+	rc = 0;
+out:
+	cds_ft_fault_lock_countdown = -1;
+	rcu_read_unlock();
+	if (src) {
+		drain_trie(src);
+		rcu_barrier();
+		cds_ft_destroy(src);
+	}
+	if (drain_and_destroy(dst, group) < 0)
+		rc = -1;
+	return rc;
+}
+
+static int test_fine_lock_merge_overlap_fence(void)
+{
+	if (fine_lock_merge_overlap_fence_run(/*fault=*/ false) < 0)
+		return -1;
+	return fine_lock_merge_overlap_fence_run(/*fault=*/ true);
+}
+#endif /* FEATURE_FT_MW_DLM_ACQUIRE */
 
 /*
  * Compaction OOM (flip-txn allocation fault).  During cds_ft_compact on an
@@ -28823,6 +28967,9 @@ int main(int argc, char **argv)
 	RUN_TEST(test_fine_lock_acquire_fault);
 	RUN_TEST(test_fine_lock_chain_acquire_fault);
 	RUN_TEST(test_fine_lock_merge_splice_acquire);
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+	RUN_TEST(test_fine_lock_merge_overlap_fence);
+#endif
 	RUN_TEST(test_compact_ordered_list_oom);
 	RUN_TEST(test_compact_ordered_list_oom_resume);
 #endif

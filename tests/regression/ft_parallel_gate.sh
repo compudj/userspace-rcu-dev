@@ -72,6 +72,14 @@ ALL_CONFIGS=(
 	# runtime: without it they would compile in and then skip, which reads
 	# as coverage and is not.
 	"dlm|-DFEATURE_FT_MW_DLM_ACQUIRE|u ion ioff imw"
+	# DLM *and* fault injection in ONE build.  Neither existing config gives
+	# this: "dlm" has no fault hook, "fault-audit" has no DLM.  So every test
+	# that arms cds_ft_fault_lock_countdown against a DLM-only acquire -- the
+	# merge overlap-spine fence, the recompact lock-set release -- compiled
+	# out of the whole gate and read as covered.  Those acquires never miss
+	# single-threaded and the concurrent oracles merge DISJOINT key sets, so
+	# fault injection is the only thing that drives their bail + re-descend.
+	"dlm-fault|-DFEATURE_FT_MW_DLM_ACQUIRE -DFEATURE_FT_FAULT_INJECT|u"
 )
 
 # Optional positional filter: run only the named configs.

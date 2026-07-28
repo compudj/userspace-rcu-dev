@@ -4286,6 +4286,23 @@ struct ft_glue_free_item {
 	 * true: the retiring committer frees it exactly once.
 	 */
 	bool retired;
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+	/*
+	 * DLM overlap-spine plan-lock (§9.4 M-2): this op holds the node's COPYING
+	 * fence, acquired BEFORE its body was read into the merged cluster, and
+	 * @snap is the mark's CLEAN pre-mark word.  The freeze then records the
+	 * FENCED {COPYING|s -> TOMBSTONE|s} terminal, whose expected-old is exactly
+	 * the world the copy plan was derived from -- so any peer state change under
+	 * the fence (a fused count, a re-home's pso pair, a foreign tombstone)
+	 * mismatches and ABORTS this commit, instead of the plain
+	 * {s -> s|TOMBSTONE} upgrade silently retiring a node the peer just grew.
+	 *
+	 * False = the ordinary unlocked retire (src-side glue, graft until
+	 * converted, non-lock_fine): behaviour unchanged.
+	 */
+	bool fenced;
+	uintptr_t snap;
+#endif
 };
 
 /*
@@ -5051,8 +5068,97 @@ void ft_glue_defer_free(struct ft_glue *g,
 	g->free_list[g->nr_free].node = node;
 	g->free_list[g->nr_free].compressed = compressed;
 	g->free_list[g->nr_free].retired = true;
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+	g->free_list[g->nr_free].fenced = false;
+	g->free_list[g->nr_free].snap = 0;
+#endif
 	g->nr_free++;
 }
+
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+/*
+ * DLM overlap-spine plan-lock (§9.4 M-2): record a replaced node whose COPYING
+ * fence the caller ALREADY acquired -- before copying its content into the merged
+ * cluster -- stashing the mark's clean @snap so the freeze can record the fenced
+ * {COPYING|s -> TOMBSTONE|s} terminal.  The mark is owned by the op and released
+ * by ft_glue_clear_fenced on any non-committing exit.
+ *
+ * WHY THIS EXISTS.  The plain retire (above) records {s -> s|TOMBSTONE} with an
+ * expected-old read fresh at commit time, and takes NO lock over the window in
+ * which the merge READ the node's body into the fresh cluster.  A peer that adds
+ * a child in that window is not detected: the late expected-old matches, the
+ * commit succeeds, and the peer's child is retired with the node -- silent key
+ * loss.  This is the "unlocked retire" gap, distinct from the lock_or_guard
+ * publish sites, which already abort on a peer touch.
+ */
+static
+void ft_glue_defer_free_fenced(struct ft_glue *g,
+		void *node, bool compressed, uintptr_t snap)
+{
+	assert(g->nr_free < g->cap_free);
+	g->free_list[g->nr_free].node = node;
+	g->free_list[g->nr_free].compressed = compressed;
+	g->free_list[g->nr_free].retired = true;
+	g->free_list[g->nr_free].fenced = true;
+	g->free_list[g->nr_free].snap = snap;
+	g->nr_free++;
+}
+
+/*
+ * Release every COPYING fence this glue's overlap-spine plan-lock still holds.
+ * Call at the op's terminal on BOTH the committing and the aborting path:
+ * ft_meta_copying_clear_if_held no-ops on an entry whose fenced retire the commit
+ * already turned TOMBSTONE, and releases one left {COPYING|s} by an abort -- so no
+ * per-outcome bookkeeping is needed, which is the same reason the detach's orphan
+ * chain sweeps unconditionally.
+ *
+ * The nodes are still addressable at both call points: on success they are
+ * call_rcu-deferred (the writer's own read-side section holds the grace period
+ * off), on abort they stay live and linked.  No-op for a glue that never fenced
+ * (src side, graft until converted, non-lock_fine).
+ */
+/*
+ * Does this glue's overlap-spine plan-lock ALREADY hold @meta's COPYING fence?
+ *
+ * The dup-chain splice acquire needs this: a collided key's chain hangs off a
+ * dst overlap node, which is exactly the node ft_merge_build fences before
+ * copying it.  Re-marking a word the SAME op already fenced returns -EAGAIN
+ * forever, and the caller's re-descend then rebuilds into the identical state --
+ * a self-deadlock across two individually-correct lock sets.  The fence is the
+ * stronger exclusion (it also makes the node un-retirable by a peer) and covers
+ * exactly what the chain append needs, so the splice reuses it instead of taking
+ * a second lock on the same word.
+ */
+static
+bool ft_glue_fence_holds(const struct ft_glue *g,
+		const struct cds_ft_metadata *meta)
+{
+	int i;
+
+	for (i = 0; i < g->nr_free; i++) {
+		if (!g->free_list[i].fenced)
+			continue;
+		if (cds_ft_item_to_metadata((struct cds_ft_inode *)
+				g->free_list[i].node) == meta)
+			return true;
+	}
+	return false;
+}
+
+static
+void ft_glue_clear_fenced(struct ft_glue *g)
+{
+	int i;
+
+	for (i = 0; i < g->nr_free; i++) {
+		if (!g->free_list[i].fenced)
+			continue;
+		ft_meta_copying_clear_if_held(cds_ft_item_to_metadata(
+			(struct cds_ft_inode *) g->free_list[i].node));
+		g->free_list[i].fenced = false;
+	}
+}
+#endif
 
 /*
  * Drop every dup-chain holder lock ft_glue_acquire_splice_holders still owns
@@ -5133,6 +5239,16 @@ void ft_glue_abort(struct cds_ft *ft, struct ft_glue *g)
 	 * split-retire fence below.  No-op when nothing was acquired.
 	 */
 	ft_glue_release_splice_holders(g);
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+	/*
+	 * DLM overlap-spine plan-lock (§9.4 M-2): release every COPYING fence this
+	 * aborted build took on a dst overlap node.  Every pre-commit merge bail
+	 * routes through here, so this is their single clear point -- the old nodes
+	 * stay LIVE and unmarked, the trie byte-for-byte as before.  No-op for a
+	 * glue that never fenced.
+	 */
+	ft_glue_clear_fenced(g);
+#endif
 
 	/*
 	 * Split-retire cn fence (MW LOCK_FINE drop): a GLUE graft build that
@@ -5208,6 +5324,29 @@ void ft_glue_tombstone_free_list(struct ft_glue *g)
 		 */
 		if (g->split_cn_holder == meta)
 			continue;
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+		/*
+		 * DLM overlap-spine plan-lock: this node's COPYING fence is HELD, and
+		 * its snap is the clean word the copy plan was derived from.  Record
+		 * the FENCED {COPYING|s -> TOMBSTONE|s} terminal, which ratifies
+		 * exactly that world -- a peer state change under the fence mismatches
+		 * and aborts us.  Deliberately NOT the RYW plain upgrade: that reads
+		 * the word fresh at commit and so cannot tell "unchanged" from
+		 * "changed and changed back into a shape that happens to match".
+		 *
+		 * The peer-already-tombstoned arm below does not apply: a successful
+		 * mark PROVES the word was clean-LIVE (ft_meta_copying_mark refuses
+		 * TOMBSTONE), and no peer can retire it while we hold the fence -- so
+		 * this commit always owns the LIVE->TOMBSTONE transition and @retired
+		 * stays true.
+		 */
+		if (g->free_list[i].fenced) {
+			assert(g->fuse_free_list);
+			ft_flip_txn_record_tombstone_copying(g->txn, meta,
+				g->free_list[i].snap);
+			continue;
+		}
+#endif
 		/*
 		 * Fuse the freeze into @txn (committed with the forward publish
 		 * below) when the committer reserved for it; else a standalone
@@ -5621,6 +5760,16 @@ int ft_glue_acquire_splice_holders(struct cds_ft *ft, struct ft_glue *g)
 
 		assert(hf);
 		hm = ft_flag_to_metadata(ft, hf);
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+		/*
+		 * Already fenced by the overlap-spine plan-lock: reuse it, take no
+		 * second lock, and record no holder -- ft_glue_clear_fenced owns that
+		 * fence's release.  See ft_glue_fence_holds for why re-marking it is
+		 * a self-deadlock rather than a miss.
+		 */
+		if (ft_glue_fence_holds(g, hm))
+			continue;
+#endif
 		for (j = 0; j < i; j++) {
 			if (g->splices[j].holder == hm) {
 				held = true;
