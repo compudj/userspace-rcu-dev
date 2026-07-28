@@ -71,9 +71,26 @@ extern "C" {
  * early turns wasted CAS collisions into orderly turns.  A traversal mutator is
  * the opposite: funnelling those destroys N-way parallelism, and the optimistic
  * path (which aborts far MORE but retries in PARALLEL) beats the serialized
- * lane by a factor of 2.6 on a 3-skiplist move.  Retries are cheap and
+ * lane by a margin that GROWS WITH THE WRITER COUNT.  Retries are cheap and
  * parallel; the lane is not.  So the more a transaction costs, the longer it
  * should stay optimistic.
+ *
+ * That margin is not a single number, and an earlier revision of this comment
+ * misreported it as one ("a factor of 2.6", which is about the TWO-writer
+ * point).  The lane is one global critical section, so its throughput is FLAT
+ * in the writer count while the optimistic path scales; the ratio is therefore
+ * a function of scale and means nothing without one.  Measured on the
+ * 3-skiplist move (bench_txn_3skiplist, width 3, 3840 keys/skiplist, median of
+ * 3 x 2s, 2x96-core EPYC 9654), optimistic / always-escalate:
+ *
+ *     writers    1     2     4     8    16    32    64   128   192
+ *     factor   1.0x  2.3x 25.4x 50.9x 97.6x  172x  303x  946x 1029x
+ *
+ * At one writer the two are identical (1.29 Mmoves/s either way): an uncontended
+ * lane costs nothing, which is also the check that the always-escalate build is
+ * measuring the funnel and not itself.  The always-escalate arm is
+ * PER_COST_NUM=0 with FALLBACK=0, i.e. every transaction takes the lane on its
+ * first attempt -- the limit case, not the shipped policy.
  *
  * (This is the opposite of a wasted-work rule, which would escalate an
  * expensive op SOONER because each failed attempt throws away more.
