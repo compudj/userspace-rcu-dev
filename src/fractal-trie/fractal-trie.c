@@ -1096,7 +1096,43 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 	 * the publish parent's fence.
 	 */
 	if (prep == FT_GRAFT_PREP_GLUE) {
-		(void) ft_glue_txn_commit_edges(ft, &glue, NULL, 0);
+		/*
+		 * The status is CHECKED, not discarded.  It used to be `(void)` on the
+		 * reasoning above -- everything that can bail is upstream, so this call
+		 * cannot fail -- but the fold's re-parent mark acquire now runs inside
+		 * it, before it records anything, and CAN miss on a contended child.
+		 * Discarding that would carry on to the commit below with children this
+		 * op does not hold, SW-parking their state words unexcluded: precisely
+		 * the silent-success shape (ignored commit status, op reports OK) that
+		 * cost a whole source subtree once already.
+		 *
+		 * The miss is clean: it happens before the first record and before
+		 * ft_glue_tombstone_free_list, so nothing of this cluster is in @txn and
+		 * NOTHING is published -- the txn still carries only the detach and cell
+		 * records, which this bail discards with it.  @pp_meta ownership has NOT
+		 * transferred (that happens by recording), so we still owe its release
+		 * and must not NULL it here.
+		 */
+		if (ft_glue_txn_commit_edges(ft, &glue, NULL, 0) !=
+				URCU_TXN_STATUS_OK) {
+			/*
+			 * @pp_meta is released HERE and not left to a label: this
+			 * exit is below bail_build, and sweep only walks @marks.
+			 * Reasoning "nothing else bails after this point" is what
+			 * leaked a fence the last time it was reasoned instead of
+			 * checked.
+			 */
+			ft_meta_copying_clear(pp_meta);
+			pp_meta = NULL;
+			free_cds_ft_node_unpublished(ft, ft_node_ptr(s_top_prime));
+			if (detach_rc.new_flag)
+				free_cds_ft_node_unpublished(ft,
+					ft_node_ptr(detach_rc.new_flag));
+			ft_glue_abort(ft, &glue);
+			ft_flip_txn_destroy(txn);
+			ret = -EAGAIN;
+			goto sweep;
+		}
 		pp_meta = NULL;		/* ownership transferred to @txn */
 	}
 

@@ -4271,6 +4271,16 @@ struct ft_glue_deferred_edge {
 	 * single apply_deferred call still wires every edge.
 	 */
 	bool dst_origin;
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+	/*
+	 * FOLD: this op holds @child's COPYING mark, taken by
+	 * ft_glue_acquire_reparent_marks because the commit SW-PARKS @child's
+	 * state word.  Released by the re-parent's own state guard edge at the
+	 * flip; swept by ft_glue_release_reparent_marks on every path that does
+	 * NOT reach a successful commit.  Never set outside structural_sw.
+	 */
+	bool marked;
+#endif
 };
 
 struct ft_glue_free_item {
@@ -5023,6 +5033,18 @@ void ft_glue_defer_edge_origin(struct cds_ft *ft, struct ft_glue *g,
 	g->deferred[g->nr_deferred].parent = parent;
 	g->deferred[g->nr_deferred].slot = slot;
 	g->deferred[g->nr_deferred].dst_origin = dst_origin;
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+	/*
+	 * Every field of a new entry is set HERE and nowhere else: the backing
+	 * arrays are an uninitialised inline floor (or a malloc'd grow), so an
+	 * unset @marked is garbage that ft_glue_release_reparent_marks would read
+	 * as "we hold this" and clear a fence belonging to nobody.  That is not
+	 * hypothetical -- it is what this field did before this line existed, on
+	 * EVERY glue abort in every config, because the release sweep runs whether
+	 * or not the fold ever acquired.
+	 */
+	g->deferred[g->nr_deferred].marked = false;
+#endif
 	g->nr_deferred++;
 }
 
@@ -5180,6 +5202,176 @@ void ft_glue_clear_fenced(struct ft_glue *g)
 		g->free_list[i].fenced = false;
 	}
 }
+
+/*
+ * The state-word-bearing metadata a deferred re-parent of @child_nf will PARK
+ * into, or NULL when there is none.  Mirrors ft_reparent_record's dispatch
+ * exactly -- that is the point: this decides which children get a mark, and it
+ * must agree edge-for-edge with what actually records, or a mark is taken that
+ * nothing releases (leak) or an edge parks unmarked (clobber).
+ *
+ * NULL for an EXTERNAL head (ft_reparent_record records only its parent edge --
+ * no state word, so nothing to exclude and nothing to release) and for a flip
+ * proxy (which ft_reparent_record skips outright).
+ */
+static
+struct cds_ft_metadata *ft_glue_reparent_park_meta(struct cds_ft *ft,
+		struct cds_ft_inode_flag *child_nf)
+{
+	if (!child_nf || ft_node_flip_proxy(child_nf) ||
+			ft_node_external(child_nf))
+		return NULL;
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+	if (ft_node_skip_compressed(child_nf))
+		return cds_ft_item_to_metadata((struct cds_ft_inode *)
+			ft_skip_to_compressed(ft, child_nf));
+	if (ft_node_compressed(child_nf))
+		return cds_ft_item_to_metadata((struct cds_ft_inode *)
+			ft_compressed_node_ptr(child_nf));
+#endif
+	(void) ft;
+	return cds_ft_item_to_metadata(ft_node_ptr(child_nf));
+}
+
+/*
+ * Does this op ALREADY hold @meta's COPYING through one of the glue's other
+ * lock sets?  Re-marking a word we hold is -EAGAIN against our own fence, and
+ * the caller's re-descend then rebuilds the identical state forever -- the
+ * self-deadlock 3a hit between the overlap fence and the dup-chain splice
+ * acquire, whose backtrace pointed at an innocent function.
+ *
+ * Every set is checked, not the ones that look reachable: the whole lesson of
+ * that bug is that two individually-correct lock sets met on a node neither
+ * author expected (a collided key's chain hangs off a dst overlap node, so they
+ * were the SAME node).  These arrays are small and this runs once per commit.
+ */
+static
+bool ft_glue_op_holds(const struct ft_glue *g,
+		const struct cds_ft_metadata *meta)
+{
+	int i;
+
+	if (g->publish_parent_holder == meta || g->split_cn_holder == meta)
+		return true;
+	if (ft_glue_fence_holds(g, meta))
+		return true;
+	for (i = 0; i < g->nr_splices; i++)
+		if (g->splices[i].holder == meta)
+			return true;
+	return false;
+}
+
+/*
+ * Acquire the COPYING mark on every LIVE child this commit will re-parent.
+ *
+ * WHY.  Under structural_sw a re-parent RECORD is an SW park -- a plain store
+ * that never validates -- and ft_reparent_record_meta parks the child's STATE
+ * word (its {live_state -> live_state} §4.B guard).  That word is CASed by
+ * ft_meta_nr_child_inc from an insert BELOW the child, a peer that neither this
+ * op's locks nor the graft's exclude.  The mark is what makes that peer honour
+ * FT_STATE_INPLACE_WAIT_MASK and spin until this commit settles the word,
+ * instead of clobbering the park.  This is ft_rekey_cow_stop's discipline,
+ * which the glue re-parent path did not have.
+ *
+ * ONLY under structural_sw.  Under MW the very same guard edge expects
+ * live_state as its expected-old and would MISMATCH our own mark -- a
+ * guaranteed abort on every commit.  Measured, and it is why this is gated
+ * rather than made unconditional.
+ *
+ * Returns -EAGAIN on a contended child; the caller aborts and re-descends, and
+ * ft_glue_abort releases whatever was taken before the miss.
+ */
+static
+int ft_glue_acquire_reparent_marks(struct cds_ft *ft, struct ft_glue *g)
+{
+	int i, j;
+
+	if (!g->txn || !g->txn->structural_sw)
+		return 0;
+	for (i = 0; i < g->nr_deferred; i++) {
+		struct cds_ft_metadata *cm =
+			ft_glue_reparent_park_meta(ft, g->deferred[i].child);
+		uintptr_t snap;
+		bool dup = false;
+
+		g->deferred[i].marked = false;
+		if (!cm || ft_glue_op_holds(g, cm))
+			continue;
+		/*
+		 * Two deferred entries can resolve to ONE metadata (a skip flag
+		 * and the plain flag of the same compressed node), and the
+		 * dedup in ft_glue_defer_edge_origin keys on the FLAG, so it
+		 * does not catch that.  A second mark on our own word is the
+		 * same self-deadlock as above.
+		 */
+		for (j = 0; j < i; j++)
+			if (g->deferred[j].marked &&
+					ft_glue_reparent_park_meta(ft,
+						g->deferred[j].child) == cm)
+				dup = true;
+		if (dup)
+			continue;
+#ifdef FEATURE_FT_FAULT_INJECT
+		/*
+		 * Test-only: miss this acquire exactly as a peer holding the child
+		 * would.  Without it the bail AND the release sweep below are DEAD
+		 * CODE -- measured 1883 marks taken and 0 released across the whole
+		 * FT_INV_MW oracle plan, because nothing in the suite contends a
+		 * re-parented child.  That dead sweep is where an uninitialised
+		 * @marked hid, so it gets its own armed test rather than inherited
+		 * confidence.  Needs FEATURE_FT_FAULT_INJECT *and*
+		 * FEATURE_FT_MW_DLM_ACQUIRE in one build: the gate's `dlm-fault`.
+		 */
+		if (cds_ft_fault_lock_countdown >= 0) {
+			if (cds_ft_fault_lock_countdown == 0) {
+				cds_ft_fault_lock_countdown = -1;
+				return -EAGAIN;
+			}
+			cds_ft_fault_lock_countdown--;
+		}
+#endif
+		if (ft_meta_copying_mark(cm, &snap))
+			return -EAGAIN;
+		g->deferred[i].marked = true;
+	}
+	return 0;
+}
+
+/*
+ * Release every re-parent mark still held.  Call ONLY on paths that did NOT
+ * reach a successful commit.
+ *
+ * ☠ NOT the unconditional post-op sweep ft_glue_clear_fenced and the orphan
+ * chain use, and the difference is load-bearing.  Those sweep RETIRED nodes: a
+ * consumed fence leaves the word TOMBSTONE, which no peer will ever re-mark, so
+ * "clear it if it is set" is unambiguous.  A re-parented child SURVIVES, and its
+ * guard edge releases it to LIVE-and-CLEAN -- immediately re-markable by a peer.
+ * Sweeping after a successful commit would therefore race a peer's fresh mark
+ * and silently clear it, breaking an exclusion this op does not own.  (The
+ * driver already reasons exactly this way about publish_parent_holder: "once
+ * ft_glue_txn_commit_edges has run, the txn registry owns it and clearing here
+ * would race a peer's re-mark.")
+ *
+ * On a commit that did not happen, no guard edge landed, so every mark is still
+ * ours and clearing is unambiguous.  Idempotent.
+ */
+static
+void ft_glue_release_reparent_marks(struct cds_ft *ft, struct ft_glue *g)
+{
+	int i;
+
+	for (i = 0; i < g->nr_deferred; i++) {
+		struct cds_ft_metadata *cm;
+
+		if (!g->deferred[i].marked)
+			continue;
+		cm = ft_glue_reparent_park_meta(ft, g->deferred[i].child);
+		if (cm) {
+			ft_meta_copying_clear(cm);
+		}
+		g->deferred[i].marked = false;
+	}
+}
 #endif
 
 /*
@@ -5270,6 +5462,16 @@ void ft_glue_abort(struct cds_ft *ft, struct ft_glue *g)
 	 * glue that never fenced.
 	 */
 	ft_glue_clear_fenced(g);
+	/*
+	 * FOLD: same argument for the re-parent marks.  This is the choke point for
+	 * every path that reaches here without a successful commit -- pre-commit
+	 * bails AND the fold driver's abort branch, which calls ft_glue_abort before
+	 * ft_glue_fini frees the array these marks are recorded in.  A commit that
+	 * SUCCEEDED must not come through here: its guard edges already released
+	 * every mark to LIVE-and-CLEAN, and re-clearing would race a peer's re-mark
+	 * (see ft_glue_release_reparent_marks).
+	 */
+	ft_glue_release_reparent_marks(ft, g);
 #endif
 
 	/*
@@ -5548,6 +5750,26 @@ enum urcu_txn_status ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue 
 	unsigned int j;
 	int i;
 	enum urcu_txn_status cst;
+
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+	/*
+	 * FOLD: take the COPYING mark on every child the records below will SW-park
+	 * into, BEFORE the first of them is recorded and before
+	 * ft_glue_tombstone_free_list runs -- nothing of this commit has landed yet,
+	 * so a contended child is a clean transient.
+	 *
+	 * Only reachable under record_only, where @txn is the caller's and the
+	 * caller's single commit is still ahead: ABORT here is a genuine bail, not a
+	 * failure past the point of no return this function is otherwise specified
+	 * to run at.  Asserted rather than assumed, because that is the property
+	 * that makes returning ABORT from here legitimate.
+	 */
+	if (g->txn && g->txn->structural_sw) {
+		assert(g->record_only);
+		if (ft_glue_acquire_reparent_marks(ft, g))
+			return URCU_TXN_STATUS_ABORT;
+	}
+#endif
 
 	/*
 	 * Hidden back-pointers -- re-parents of nodes NOT reader-observable

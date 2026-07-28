@@ -61,7 +61,7 @@
  * hook forces it.  Only the gate's dlm-fault config defines both.
  */
 #if defined(FEATURE_FT_MW_DLM_ACQUIRE) && defined(FEATURE_FT_FAULT_INJECT)
-#define NR_TESTS_DLM_FAULT 1	/* test_fine_lock_merge_overlap_fence */
+#define NR_TESTS_DLM_FAULT 2	/* merge_overlap_fence, rekey_reparent_mark_bail */
 #else
 #define NR_TESTS_DLM_FAULT 0
 #endif
@@ -28280,6 +28280,118 @@ static int test_fine_lock_merge_overlap_fence(void)
 		return -1;
 	return fine_lock_merge_overlap_fence_run(/*fault=*/ true);
 }
+
+/*
+ * FOLD: the RE-PARENT MARK acquire's BAIL and its release sweep.
+ *
+ * ft_glue_acquire_reparent_marks takes the COPYING mark on every live child the
+ * fold's commit will SW-park into.  The acquire runs constantly -- measured 1883
+ * marks taken across the FT_INV_MW oracle plan -- but its MISS never does: 0 of
+ * those 1883 were contended, so the -EAGAIN bail AND
+ * ft_glue_release_reparent_marks were both DEAD CODE (released=0 over the whole
+ * plan).  That dead sweep is exactly where an uninitialised @marked hid, clearing
+ * fences on nodes this op never held, so it gets an armed test rather than
+ * confidence inherited from the acquire's green path.
+ *
+ * Sweeping the countdown walks the fault across every lock acquire a rekey takes
+ * -- cn's split fence, the publish parent, the recompactions, and this one -- so
+ * each n exercises a different bail.  For EVERY n the demands are the same and
+ * they are what a leaked mark violates:
+ *
+ *   1. the move either succeeds or fails TRANSIENTLY; it never corrupts;
+ *   2. cds_ft_verify is clean;
+ *   3. ★ the trie still ACCEPTS A MUTATION afterwards.  This is the one that
+ *      matters.  A leaked COPYING leaves the trie byte-for-byte intact, so
+ *      verify PASSES with the lock still held -- which is why the analogous
+ *      recompact OOM leak survived so long.  Only a later publish into the
+ *      locked node exposes it, by failing forever.
+ *
+ * The keys are the test_rekey_graft_simple shape, which the driver's gates admit
+ * and which populates the glue's deferred set with real live children.
+ */
+static int rekey_reparent_mark_bail_run(long n, bool far)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_fine_lock_ft(5, &group);	/* list ON */
+	uint8_t src_key[3] = { RKG_A, 0x01, 0x03 };
+	uint8_t dst_far[3] = { RKG_B, 0x01, 0x03 };
+	uint8_t dst_near[3] = { RKG_A, 0x07, 0x03 };
+	const uint8_t *dst = far ? dst_far : dst_near;
+	uint64_t lone = far ? RKX_KEY(RKG_B, 0x01, 0x07, 0x07, 0x07) :
+		RKX_KEY(RKG_A, 0x07, 0x07, 0x07, 0x07);
+	uint64_t keys[8], post_key;
+	int i, rc = -1, drc = 0;
+
+	keys[0] = RKX_KEY(RKG_A, 0x01, 0x01, 0, 0);
+	keys[1] = RKX_KEY(RKG_A, 0x01, 0x05, 0, 0);
+	keys[2] = RKX_KEY(RKG_A, 0x09, 0, 0, 0);
+	keys[3] = lone;
+	for (i = 0; i < 4; i++)
+		keys[4 + i] = RKX_KEY(RKG_A, 0x01, 0x03, i + 1, 0);
+
+	rcu_read_lock();
+	for (i = 0; i < 8; i++) {
+		if (insert_u64(ft, keys[i], node_alloc(keys[i])) !=
+				CDS_FT_STATUS_OK) {
+			rcu_read_unlock();
+			fprintf(stderr, "reparent-mark n=%ld: setup insert failed\n", n);
+			goto out;
+		}
+	}
+	rcu_read_unlock();
+
+	/* The move takes the gate + a grace period: NOT from a read section. */
+	cds_ft_fault_lock_countdown = n;
+	drc = _cds_ft_debug_rekey_graft_simple(ft, src_key, 3, dst, 3);
+	cds_ft_fault_lock_countdown = -1;
+
+	/* 1. Success or a TRANSIENT code -- never a corrupting one. */
+	if (drc != 0 && drc != -EAGAIN && drc != -EIO && drc != -ENOMEM) {
+		fprintf(stderr, "reparent-mark n=%ld: driver rc=%d (not transient)\n",
+			n, drc);
+		goto out;
+	}
+	/* 2. Structure intact either way. */
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "reparent-mark n=%ld: verify failed (rc=%d)\n", n, drc);
+		goto out;
+	}
+	/*
+	 * 3. The trie must still take a mutation.  Insert INTO THE MOVED SUBTREE's
+	 * neighbourhood -- the children this acquire marks -- so a mark left set is
+	 * hit by this publish rather than sitting harmlessly in a corner.
+	 */
+	post_key = RKX_KEY(RKG_A, 0x01, 0x03, 0x40, 0);
+	rcu_read_lock();
+	if (insert_u64(ft, post_key, node_alloc(post_key)) != CDS_FT_STATUS_OK) {
+		rcu_read_unlock();
+		fprintf(stderr, "reparent-mark n=%ld: trie REFUSES a mutation after "
+			"the bail -- a COPYING mark leaked (rc=%d)\n", n, drc);
+		goto out;
+	}
+	rcu_read_unlock();
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "reparent-mark n=%ld: verify failed after mutation\n", n);
+		goto out;
+	}
+	rc = 0;
+out:
+	cds_ft_fault_lock_countdown = -1;
+	if (drain_and_destroy(ft, group) < 0)
+		rc = -1;
+	return rc;
+}
+
+static int test_fine_lock_rekey_reparent_mark_bail(void)
+{
+	long n;
+
+	for (n = 0; n < 24; n++)
+		if (rekey_reparent_mark_bail_run(n, /*far=*/ true) < 0 ||
+				rekey_reparent_mark_bail_run(n, /*far=*/ false) < 0)
+			return -1;
+	return 0;
+}
 #endif /* FEATURE_FT_MW_DLM_ACQUIRE */
 
 /*
@@ -28969,6 +29081,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_fine_lock_merge_splice_acquire);
 #ifdef FEATURE_FT_MW_DLM_ACQUIRE
 	RUN_TEST(test_fine_lock_merge_overlap_fence);
+	RUN_TEST(test_fine_lock_rekey_reparent_mark_bail);
 #endif
 	RUN_TEST(test_compact_ordered_list_oom);
 	RUN_TEST(test_compact_ordered_list_oom_resume);
