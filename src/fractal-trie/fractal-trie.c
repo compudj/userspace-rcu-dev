@@ -780,7 +780,14 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 	 */
 	glue.fence_split_cn = true;
 	memset(&reserve, 0, sizeof(reserve));
-	if (ft_bulk_node_reserve_fill(ft, &reserve)) {
+	/*
+	 * The node reserve exists for the GRAFT arm, whose recompaction allocates
+	 * under a no-fail contract and so activates it.  The merge arm never
+	 * activates it -- ft_merge_build allocates its cluster from the arena and is
+	 * allowed to fail, which is the whole reason the fold can still bail there --
+	 * so filling it would allocate a batch per move only to drain it untouched.
+	 */
+	if (!merge_dst && ft_bulk_node_reserve_fill(ft, &reserve)) {
 		ft_flip_txn_destroy(txn);
 		ret = -ENOMEM;
 		goto sweep;

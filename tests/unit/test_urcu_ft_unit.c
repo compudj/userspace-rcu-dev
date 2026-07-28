@@ -28668,7 +28668,7 @@ out:
  * The shape is the COLLIDING one, so the sweep also crosses the splice-holder
  * acquire and the chain append.
  */
-static int rekey_merge_bail_run(long n)
+static int rekey_merge_bail_run(long n, bool alloc_fault)
 {
 	struct cds_ft_group *group;
 	struct cds_ft *ft = create_fixed_fine_lock_listoff_ft(4, &group);
@@ -28700,9 +28700,20 @@ static int rekey_merge_bail_run(long n)
 	before = cds_ft_count_entries(ft);
 	rcu_read_unlock();
 
-	cds_ft_fault_lock_countdown = n;
+	/*
+	 * Two knobs, two families of unwind.  The LOCK knob misses an acquire --
+	 * the fold bails holding nothing it took.  The ALLOC knob fails a node
+	 * allocation INSIDE ft_merge_build, so the fold bails with a partially
+	 * built cluster plus every fence the build had already taken: a strictly
+	 * longer unwind, and the one where a leak would live.
+	 */
+	if (alloc_fault)
+		cds_ft_fault_alloc_countdown = n;
+	else
+		cds_ft_fault_lock_countdown = n;
 	drc = _cds_ft_debug_rekey_graft_simple(ft, src_key, 2, dst_key, 2);
 	cds_ft_fault_lock_countdown = -1;
+	cds_ft_fault_alloc_countdown = -1;
 
 	if (drc != 0 && drc != -EAGAIN && drc != -EIO && drc != -ENOMEM) {
 		fprintf(stderr, "merge-bail n=%ld: rc=%d (not transient)\n", n, drc);
@@ -28741,6 +28752,7 @@ out_locked:
 	fprintf(stderr, "merge-bail n=%ld: setup insert failed\n", n);
 out:
 	cds_ft_fault_lock_countdown = -1;
+	cds_ft_fault_alloc_countdown = -1;
 	if (drain_and_destroy(ft, group) < 0)
 		rc = -1;
 	return rc;
@@ -28751,7 +28763,10 @@ static int test_fine_lock_rekey_merge_bail(void)
 	long n;
 
 	for (n = 0; n < 48; n++)
-		if (rekey_merge_bail_run(n) < 0)
+		if (rekey_merge_bail_run(n, /*alloc_fault=*/ false) < 0)
+			return -1;
+	for (n = 0; n < 48; n++)
+		if (rekey_merge_bail_run(n, /*alloc_fault=*/ true) < 0)
 			return -1;
 	return 0;
 }
