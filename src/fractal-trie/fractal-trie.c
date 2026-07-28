@@ -843,6 +843,23 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 		 * otherwise degrade an acquire miss to a §4.B guard.
 		 */
 		pp_meta = ft_flag_to_metadata(ft, d_dst.pnf);
+#ifdef FEATURE_FT_FAULT_INJECT
+		/*
+		 * Test-only: miss this fence exactly as a peer holding the publish
+		 * parent would.  Without it the bail is DEAD -- measured 0 of 4187
+		 * merges in the concurrent oracle, whose disjoint layout makes every
+		 * node this branch acquires writer-PRIVATE, so no peer can contend it.
+		 */
+		if (cds_ft_fault_lock_countdown >= 0) {
+			if (cds_ft_fault_lock_countdown == 0) {
+				cds_ft_fault_lock_countdown = -1;
+				pp_meta = NULL;
+				ret = -EAGAIN;
+				goto bail_build;
+			}
+			cds_ft_fault_lock_countdown--;
+		}
+#endif
 		if (!pp_meta || ft_meta_copying_mark(pp_meta, &pp_snap)) {
 			pp_meta = NULL;
 			ret = -EAGAIN;
@@ -1202,6 +1219,7 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 		if (pp_meta)
 			ft_meta_copying_clear(pp_meta);	/* GLUE: still ours here */
 		if (s_top_prime)		/* NULL on the merge path: no COW */
+		if (s_top_prime)
 			free_cds_ft_node_unpublished(ft, ft_node_ptr(s_top_prime));
 		if (gst_st.old_recompacted_node)
 			free_cds_ft_node_unpublished(ft, ft_node_ptr(gst_st.dest));

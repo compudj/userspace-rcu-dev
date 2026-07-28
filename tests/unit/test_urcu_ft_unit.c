@@ -61,7 +61,7 @@
  * hook forces it.  Only the gate's dlm-fault config defines both.
  */
 #if defined(FEATURE_FT_MW_DLM_ACQUIRE) && defined(FEATURE_FT_FAULT_INJECT)
-#define NR_TESTS_DLM_FAULT 2	/* merge_overlap_fence, rekey_reparent_mark_bail */
+#define NR_TESTS_DLM_FAULT 3	/* merge_overlap_fence, rekey_reparent_mark_bail, rekey_merge_bail */
 #else
 #define NR_TESTS_DLM_FAULT 0
 #endif
@@ -28646,6 +28646,116 @@ out:
 	return rc;
 }
 
+/*
+ * THE MERGE FOLD'S ABORT PATHS, which the concurrent oracle cannot reach.
+ *
+ * inv_rekey_merge_occupied_dst contends ROOT, because that is what its writers
+ * share.  But every node the merge branch acquires -- the publish parent, the dst
+ * overlap spine, the dup-chain holders -- is writer-PRIVATE in a disjoint layout,
+ * so no peer can ever contend them: measured 0 of 4187 merges took ANY of the
+ * fold's seven bails.  A green oracle says nothing about them.
+ *
+ * Sweeping the countdown walks a forced miss across each acquire in turn.  For
+ * every n the demands are the same, and they are what a half-unwound merge
+ * violates:
+ *   1. transient rc, never a corrupting one;
+ *   2. cds_ft_verify clean;
+ *   3. no key lost -- ENTRIES, since a collision merges two keys into one;
+ *   4. ★ the trie still ACCEPTS A MUTATION, which is the only thing that catches
+ *      a COPYING left set: the trie is byte-for-byte intact and verifies either
+ *      way, and only a later publish into the locked node exposes it.
+ *
+ * The shape is the COLLIDING one, so the sweep also crosses the splice-holder
+ * acquire and the chain append.
+ */
+static int rekey_merge_bail_run(long n)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_fine_lock_listoff_ft(4, &group);
+	uint8_t src_key[2] = { RK_SX, RK_SY }, dst_key[2] = { RK_DX, RK_DZ };
+	uint64_t sub_key[2], sib_key[RK_NSIB], occ_key[2], dstl_key[2], post_key;
+	unsigned long before, after;
+	int i, rc = -1, drc;
+
+	sub_key[0] = ((uint64_t) RK_SX << 24) | ((uint64_t) RK_SY << 16) | (0x01ULL << 8);
+	sub_key[1] = ((uint64_t) RK_SX << 24) | ((uint64_t) RK_SY << 16) | (0x02ULL << 8);
+	occ_key[0] = ((uint64_t) RK_DX << 24) | ((uint64_t) RK_DZ << 16) | (0x01ULL << 8);
+	occ_key[1] = ((uint64_t) RK_DX << 24) | ((uint64_t) RK_DZ << 16) | (0x07ULL << 8);
+	for (i = 0; i < RK_NSIB; i++)
+		sib_key[i] = ((uint64_t) RK_SX << 24) | ((uint64_t) (i + 5) << 16);
+	dstl_key[0] = ((uint64_t) RK_DX << 24) | (0x01ULL << 16);
+	dstl_key[1] = ((uint64_t) RK_DX << 24) | (0x02ULL << 16);
+
+	rcu_read_lock();
+	for (i = 0; i < 2; i++)
+		if (insert_u64(ft, sub_key[i], node_alloc(sub_key[i])) != CDS_FT_STATUS_OK ||
+				insert_u64(ft, occ_key[i], node_alloc(occ_key[i])) != CDS_FT_STATUS_OK)
+			goto out_locked;
+	for (i = 0; i < RK_NSIB; i++)
+		if (insert_u64(ft, sib_key[i], node_alloc(sib_key[i])) != CDS_FT_STATUS_OK)
+			goto out_locked;
+	for (i = 0; i < 2; i++)
+		if (insert_u64(ft, dstl_key[i], node_alloc(dstl_key[i])) != CDS_FT_STATUS_OK)
+			goto out_locked;
+	before = cds_ft_count_entries(ft);
+	rcu_read_unlock();
+
+	cds_ft_fault_lock_countdown = n;
+	drc = _cds_ft_debug_rekey_graft_simple(ft, src_key, 2, dst_key, 2);
+	cds_ft_fault_lock_countdown = -1;
+
+	if (drc != 0 && drc != -EAGAIN && drc != -EIO && drc != -ENOMEM) {
+		fprintf(stderr, "merge-bail n=%ld: rc=%d (not transient)\n", n, drc);
+		goto out;
+	}
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "merge-bail n=%ld: verify failed (rc=%d)\n", n, drc);
+		goto out;
+	}
+	rcu_read_lock();
+	after = cds_ft_count_entries(ft);
+	rcu_read_unlock();
+	if (after != before) {
+		fprintf(stderr, "merge-bail n=%ld: entries %lu != %lu (rc=%d) -- a "
+			"half-unwound merge lost a key\n", n, after, before, drc);
+		goto out;
+	}
+	/* Mutate INTO the merged neighbourhood: a leaked COPYING is hit here. */
+	post_key = ((uint64_t) RK_DX << 24) | ((uint64_t) RK_DZ << 16) | (0x40ULL << 8);
+	rcu_read_lock();
+	if (insert_u64(ft, post_key, node_alloc(post_key)) != CDS_FT_STATUS_OK) {
+		rcu_read_unlock();
+		fprintf(stderr, "merge-bail n=%ld: trie REFUSES a mutation after the "
+			"bail -- a COPYING mark leaked (rc=%d)\n", n, drc);
+		goto out;
+	}
+	rcu_read_unlock();
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "merge-bail n=%ld: verify failed after mutation\n", n);
+		goto out;
+	}
+	rc = 0;
+	goto out;
+out_locked:
+	rcu_read_unlock();
+	fprintf(stderr, "merge-bail n=%ld: setup insert failed\n", n);
+out:
+	cds_ft_fault_lock_countdown = -1;
+	if (drain_and_destroy(ft, group) < 0)
+		rc = -1;
+	return rc;
+}
+
+static int test_fine_lock_rekey_merge_bail(void)
+{
+	long n;
+
+	for (n = 0; n < 48; n++)
+		if (rekey_merge_bail_run(n) < 0)
+			return -1;
+	return 0;
+}
+
 static int test_fine_lock_rekey_reparent_mark_bail(void)
 {
 	long n;
@@ -29348,6 +29458,7 @@ int main(int argc, char **argv)
 #ifdef FEATURE_FT_MW_DLM_ACQUIRE
 	RUN_TEST(test_fine_lock_merge_overlap_fence);
 	RUN_TEST(test_fine_lock_rekey_reparent_mark_bail);
+	RUN_TEST(test_fine_lock_rekey_merge_bail);
 #endif
 	RUN_TEST(test_compact_ordered_list_oom);
 	RUN_TEST(test_compact_ordered_list_oom_resume);
