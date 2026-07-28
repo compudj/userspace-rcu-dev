@@ -55,12 +55,12 @@
 #define NR_TESTS_DLM 0
 #endif
 
-/* 285 unconditional + 47 fault-injection-only RUN_TEST registrations.  (The
+/* 285 unconditional + 48 fault-injection-only RUN_TEST registrations.  (The
  * fault total was one short before test_rekey_coherence_relational_fault: the
  * plan said 327 where 328 tests ran, so the fault build failed its own TAP
  * plan.) */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (333 + NR_TESTS_DLM)
+#define NR_TESTS (334 + NR_TESTS_DLM)
 #else
 #define NR_TESTS (286 + NR_TESTS_DLM)
 #endif
@@ -27999,6 +27999,146 @@ static int test_fine_lock_chain_acquire_fault(void)
 }
 
 /*
+ * MW LOCK_FINE: the GLUE run-append holder lock -- the last duplicate-chain
+ * mutation that used to run UNLOCKED.  cds_ft_merge_at appends a collided src
+ * chain onto the dst chain's tail (ft_glue_record_splices), which happens only
+ * where the same FULL key terminates on BOTH sides; every merge of disjoint key
+ * sets records zero splices and never reaches the acquire.  Neither
+ * test_fine_lock_chain_acquire_fault (single-trie chain ops) nor the concurrent
+ * cross-trie oracles (writers own disjoint {p,w,s} keys, so they never collide)
+ * drive it -- measured: 0 splices across the whole ft_inv plan.  So this is the
+ * only coverage the site has.
+ *
+ * Phase 1 asserts the lock is TAKEN and released on the plain path: merge two
+ * tries sharing both full keys, then check every duplicate is reachable, the key
+ * count is unchanged (duplicates are not keys) and cds_ft_verify is clean -- a
+ * COPYING bit left set at rest is reported as a leaked copy fence and would wedge
+ * every later publish into that holder.
+ *
+ * Phase 2 asserts the BAIL is live, not dead code.  cds_ft_fault_lock_countdown
+ * fails one acquire exactly as a peer holding the holder would, which is what the
+ * merge cannot tolerate silently: the acquire sits at the LAST point where a miss
+ * is free (every allocation done, the src unlink not yet run), so the bail must
+ * unwind a fully-built cluster with both tries pristine and the caller must
+ * re-descend and rebuild.  The op must still report OK, with the same content as
+ * phase 1.  The countdown reaching -1 confirms the fault LANDED (if the site were
+ * unreachable it would still read 0 and the bail would be dead).
+ */
+static int fine_lock_merge_splice_run(bool fault)
+{
+	struct cds_ft_group *group = NULL;
+	struct cds_ft *dst = create_varlen_fine_lock_ft(&group);
+	struct cds_ft *src = NULL;
+	const char *tag = fault ? "splice fault" : "splice plain";
+	const char *sfx = "ae";		/* both keys collide: dst PQa/PQe vs src Ma/Me */
+	unsigned long keys_before;
+	enum cds_ft_status s;
+	int i, rc = -1;
+
+	if (cds_ft_create(group, NULL, &src) < 0) {
+		drain_and_destroy(dst, group);
+		return -1;
+	}
+	rcu_read_lock();
+	/*
+	 * dst "PQ" holds {PQa,PQe} under a P that also holds "PZ", so the merge
+	 * point has a surviving parent and is an internal node carrying
+	 * external_nodes -- the shape whose splice holder is a dst overlap node
+	 * this merge RETIRES.  src "M" holds {Ma,Me}: merged at "PQ" both full
+	 * keys land on an existing dst chain.
+	 */
+	for (i = 0; i < 2; i++) {
+		char dk[3] = { 'P', 'Q', sfx[i] };
+		char sk[2] = { 'M', sfx[i] };
+		struct ft_test_node *dn = node_alloc((uint64_t) i);
+		struct ft_test_node *sn = node_alloc((uint64_t) (i + 100));
+
+		if (cds_ft_insert(dst, (const uint8_t *) dk, 3, &dn->node)
+				!= CDS_FT_STATUS_OK ||
+		    cds_ft_insert(src, (const uint8_t *) sk, 2, &sn->node)
+				!= CDS_FT_STATUS_OK)
+			goto out;
+	}
+	{
+		struct ft_test_node *zn = node_alloc(42);
+
+		if (cds_ft_insert(dst, (const uint8_t *) "PZ", 2, &zn->node)
+				!= CDS_FT_STATUS_OK)
+			goto out;
+	}
+	keys_before = cds_ft_count_keys(dst);
+
+	cds_ft_make_exclusive(src);
+	if (fault)
+		cds_ft_fault_lock_countdown = 0;
+	s = cds_ft_merge_at(dst, (const uint8_t *) "PQ", 2,
+			src, (const uint8_t *) "M", 1);
+	if (fault && cds_ft_fault_lock_countdown != -1) {
+		fprintf(stderr, "%s: acquire never reached -- bail is dead\n", tag);
+		goto out;
+	}
+	cds_ft_fault_lock_countdown = -1;
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "%s: merge_at did not survive: %s\n", tag,
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+
+	/* Both sides of every collided key are on the chain, dst head first. */
+	for (i = 0; i < 2; i++) {
+		char dk[3] = { 'P', 'Q', sfx[i] };
+		struct cds_ft_node *head = NULL;
+		int count = 0;
+
+		if (cds_ft_eager_lookup_key(dst, (const uint8_t *) dk, 3, 0,
+				&head) != CDS_FT_STATUS_OK || !head) {
+			fprintf(stderr, "%s: collided key PQ%c lost\n", tag, sfx[i]);
+			goto out;
+		}
+		cds_ft_for_each_duplicate_rcu(head)
+			count++;
+		if (count != 2) {
+			fprintf(stderr, "%s: PQ%c chain length %d, expected 2 "
+				"(dst + appended src)\n", tag, sfx[i], count);
+			goto out;
+		}
+	}
+	/* A collided key adds a duplicate, not a key: the count is unchanged. */
+	if (cds_ft_count_keys(dst) != keys_before) {
+		fprintf(stderr, "%s: count %lu != %lu (a duplicate is not a key)\n",
+			tag, cds_ft_count_keys(dst), keys_before);
+		goto out;
+	}
+	if (cds_ft_verify(dst, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "%s: verify failed -- leaked holder lock?\n", tag);
+		goto out;
+	}
+	if (!cds_ft_empty(src)) {
+		fprintf(stderr, "%s: src not empty after merge\n", tag);
+		goto out;
+	}
+	rc = 0;
+out:
+	cds_ft_fault_lock_countdown = -1;
+	rcu_read_unlock();
+	if (src) {
+		drain_trie(src);
+		rcu_barrier();
+		cds_ft_destroy(src);
+	}
+	if (drain_and_destroy(dst, group) < 0)
+		rc = -1;
+	return rc;
+}
+
+static int test_fine_lock_merge_splice_acquire(void)
+{
+	if (fine_lock_merge_splice_run(/*fault=*/ false) < 0)
+		return -1;
+	return fine_lock_merge_splice_run(/*fault=*/ true);
+}
+
+/*
  * Compaction OOM (flip-txn allocation fault).  During cds_ft_compact on an
  * ordered-list trie the flip-txn allocations are the per-cell relocation swap
  * AND -- since the structural relocations were routed onto the flip latch -- a
@@ -28682,6 +28822,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_replace_head_oom);
 	RUN_TEST(test_fine_lock_acquire_fault);
 	RUN_TEST(test_fine_lock_chain_acquire_fault);
+	RUN_TEST(test_fine_lock_merge_splice_acquire);
 	RUN_TEST(test_compact_ordered_list_oom);
 	RUN_TEST(test_compact_ordered_list_oom_resume);
 #endif

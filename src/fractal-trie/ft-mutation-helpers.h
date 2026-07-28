@@ -4317,6 +4317,25 @@ struct ft_glue_splice {
 	 * the grace-period-deferred cell free.  NULL when the list is off.
 	 */
 	struct ft_ord_cell *src_cell;
+	/*
+	 * MW LOCK_FINE, the dup-chain lock-set: the COPYING lock this op holds on
+	 * @dst_head's chain HOLDER -- the head's immediate parent, the one node
+	 * every chain mutation serialises on (ft_chain_head_holder).  Acquired by
+	 * ft_glue_acquire_splice_holders before the merge's point of no return and
+	 * released only after the commit that installs the append, so the lock
+	 * spans the tail walk, the record AND the install.  @holder_snap is the
+	 * mark's clean pre-mark word, kept so the fence can be handed to the
+	 * flip-txn as a {COPYING|s -> s} release should the holder turn out to be
+	 * the op's publish target (ft_glue_splice_holder_take).
+	 *
+	 * NULL on the splices that did NOT acquire: a duplicate of an earlier
+	 * splice's holder (deduped -- one lock covers every chain under one
+	 * holder), a NULL holder, a non-lock_fine trie, or an entry whose fence
+	 * has been handed to the txn.  So exactly the non-NULL entries are the
+	 * fences ft_glue_release_splice_holders still owns.
+	 */
+	struct cds_ft_metadata *holder;
+	uintptr_t holder_snap;
 };
 
 /*
@@ -5036,6 +5055,67 @@ void ft_glue_defer_free(struct ft_glue *g,
 }
 
 /*
+ * Drop every dup-chain holder lock ft_glue_acquire_splice_holders still owns
+ * (the non-NULL @holder entries), leaving those nodes LIVE.  Idempotent: each
+ * released entry is cleared, so the pre-commit bail (ft_glue_abort) and the
+ * post-commit release cannot double-clear, and a glue that never acquired --
+ * graft, graft_swap, a non-lock_fine trie, a collision-free merge -- costs one
+ * loop over an empty splice array.
+ *
+ * The fences are NOT in the flip-txn registry (see the acquire), so nothing
+ * else can clear them and no peer can have re-taken one: ft_meta_copying_mark
+ * refuses an already-COPYING word, and the only transition the commit records
+ * on a held holder is the free-list retire's plain
+ * {COPYING|s -> COPYING|s|TOMBSTONE} upgrade, which PRESERVES the fence.  So
+ * the bit is still ours at every release point -- the clear is unambiguous, on
+ * a node that is either about to be reclaimed (retired) or still live.
+ */
+
+static
+void ft_glue_release_splice_holders(struct ft_glue *g)
+{
+	int i;
+
+	for (i = 0; i < g->nr_splices; i++) {
+		if (!g->splices[i].holder)
+			continue;
+		ft_meta_copying_clear(g->splices[i].holder);
+		g->splices[i].holder = NULL;
+		g->splices[i].holder_snap = 0;
+	}
+}
+
+/*
+ * Hand a held dup-chain holder fence to the caller when @meta is one of them,
+ * clearing the entry so ft_glue_release_splice_holders no longer owns it.
+ *
+ * The one caller is the merge's forward publish: when the dst merge point is an
+ * EXTERNAL node, the chain holder of the spliced head IS the publish target, and
+ * ft_flip_txn_lock_or_guard_parent would then re-mark a word we already hold --
+ * a MISS against our own fence, which sets acquire_miss and ABORTS a commit that
+ * has no bail path left.  Routing the held fence into
+ * ft_flip_txn_hold_or_lock_parent instead records the {COPYING|s -> s} release
+ * (the guard's strictly stronger twin) and hands the outcome to the txn, exactly
+ * as the graft's publish_parent_holder does.
+ */
+static
+bool ft_glue_splice_holder_take(struct ft_glue *g,
+		const struct cds_ft_metadata *meta, uintptr_t *snap_ret)
+{
+	int i;
+
+	for (i = 0; i < g->nr_splices; i++) {
+		if (g->splices[i].holder != meta)
+			continue;
+		*snap_ret = g->splices[i].holder_snap;
+		g->splices[i].holder = NULL;
+		g->splices[i].holder_snap = 0;
+		return true;
+	}
+	return false;
+}
+
+/*
  * Abort the build: free every freshly-built (never-observed) glue node, then
  * release the malloc'd backing.  Both tries are left pristine -- no deferred
  * edge was applied, so no live back-pointer references the glue.
@@ -5044,6 +5124,15 @@ static
 void ft_glue_abort(struct cds_ft *ft, struct ft_glue *g)
 {
 	int i;
+
+	/*
+	 * Dup-chain holder locks (MW LOCK_FINE): a merge that acquired its
+	 * splice lock-set and then bailed before the point of no return must
+	 * leave those holders LIVE and unlocked.  Every pre-commit merge bail
+	 * routes through here, so this is the single clear point, mirroring the
+	 * split-retire fence below.  No-op when nothing was acquired.
+	 */
+	ft_glue_release_splice_holders(g);
 
 	/*
 	 * Split-retire cn fence (MW LOCK_FINE drop): a GLUE graft build that
@@ -5453,7 +5542,116 @@ void ft_glue_record_splice(struct ft_glue *g,
 	g->splices[g->nr_splices].dst_head = dst_head;
 	g->splices[g->nr_splices].src_head = src_head;
 	g->splices[g->nr_splices].src_cell = NULL;
+	g->splices[g->nr_splices].holder = NULL;
+	g->splices[g->nr_splices].holder_snap = 0;
 	g->nr_splices++;
+}
+
+/*
+ * MW LOCK_FINE, the dup-chain lock-set: acquire the COPYING lock of every
+ * DISTINCT chain HOLDER the recorded splices are about to append to, so
+ * ft_glue_record_splices' tail walk and tail append run under the same per-node
+ * lock every OTHER chain mutation already takes -- insert's duplicate append,
+ * remove's interior/head unchain, ft_promote_head, cds_ft_replace's non-head
+ * replace.  The glue run-append was the last chain mutation running unlocked,
+ * and while it did, the six urcu_txn_store_mw in ft-txn-hlist.h could not
+ * become sw: a chain append that is not excluded is a LOST UPDATE the moment
+ * the store stops arbitrating by expected value.
+ *
+ * ALL-OR-NONE, and THE CALLER MUST BAIL on -EAGAIN -- a partial lock-set is
+ * precisely the race the lock exists to close.  On a miss every mark already
+ * taken is dropped here, so the caller unwinds a build with no fence held.
+ * Call BEFORE the merge's point of no return (both tries still pristine); the
+ * release belongs AFTER the single commit that installs the appends, because
+ * the lock must span the tail walk, the record and the install.
+ *
+ * THE HOLDER IS DERIVED, NEVER ASSUMED.  ft_chain_head_holder walks prev from
+ * the head; the merge's own parent pointer is NOT the chain anchor for a
+ * duplicate, and using one is a straight SIGSEGV in cds_ft_item_to_metadata.
+ * It is then RE-DERIVED after the mark and compared, because holder identity is
+ * not stable: ft_promote_head swaps a fresh cell in and a recompact rebuilds the
+ * parent, either of which would leave the lock sitting on a node nobody uses.  A
+ * mismatch bails exactly like a miss.  (The mark itself already excludes the
+ * settled forms of both: a retired holder's word carries TOMBSTONE and an
+ * in-flight peer's carries a parked proxy, and ft_meta_copying_mark refuses
+ * both.  The re-derive covers the change that completed between our read of
+ * prev and our CAS.)
+ *
+ * DEDUP IS MANDATORY FOR TERMINATION, not an optimisation.  ft_meta_copying_mark
+ * returns -EAGAIN on an already-COPYING word, so two keys colliding under ONE
+ * holder would fail against OUR OWN mark and send the caller back into the
+ * identical collision forever.  The scan is quadratic in @nr_splices, which is
+ * the same-key collision count -- 0 for the batch-staging workload, and bounded
+ * by the smaller trie's key count otherwise.
+ *
+ * A NULL holder is skipped, as insert's duplicate append skips it: it means a
+ * never-inserted head (prev NULL), whose only producers are ft-insert's unwind
+ * paths on UNPUBLISHED nodes.  Both of ft_chain_head_holder's NULL branches
+ * measured unreachable (0 in ~470k calls across three list modes).
+ *
+ * THE FENCES ARE DELIBERATELY NOT REGISTERED with the flip-txn.
+ * FT_FLIP_TXN_MAX_COPYING (8) sizes the TXN-TRACKED fences of one recompact,
+ * while the collision count is unbounded; and an unregistered fence is
+ * unambiguously still ours at every release point (see
+ * ft_glue_release_splice_holders).  The one exception is the holder that turns
+ * out to BE the publish target, which ft_glue_splice_holder_take hands to the
+ * txn as a release record.
+ *
+ * RESIDUAL, and not what this closes: @dst_head itself was captured during the
+ * build, before this lock.  A peer that removes that head between the build and
+ * this acquire is not excluded -- the same build-to-publish staleness the merge
+ * already carries for every dst-origin edge it records.
+ */
+static
+int ft_glue_acquire_splice_holders(struct cds_ft *ft, struct ft_glue *g)
+{
+	int i, j;
+
+	if (!ft->lock_fine)
+		return 0;
+	for (i = 0; i < g->nr_splices; i++) {
+		struct cds_ft_node *dst_head = g->splices[i].dst_head;
+		struct cds_ft_inode_flag *hf = ft_chain_head_holder(ft, dst_head);
+		struct cds_ft_metadata *hm;
+		bool held = false;
+
+		if (!hf)
+			continue;
+		hm = ft_flag_to_metadata(ft, hf);
+		for (j = 0; j < i; j++) {
+			if (g->splices[j].holder == hm) {
+				held = true;
+				break;
+			}
+		}
+		if (held)
+			continue;
+#ifdef FEATURE_FT_FAULT_INJECT
+		/*
+		 * Test-only: fail this acquire exactly as a peer holding the
+		 * holder would (cds_ft_fault_lock_countdown, shared with
+		 * ft_copying_lock_member and ft_flip_txn_lock_or_guard_parent).
+		 * Drives the caller's bail + re-descend, which the natural rate
+		 * of same-key collisions under contention makes rare.
+		 */
+		if (cds_ft_fault_lock_countdown >= 0) {
+			if (cds_ft_fault_lock_countdown == 0) {
+				cds_ft_fault_lock_countdown = -1;
+				goto miss;
+			}
+			cds_ft_fault_lock_countdown--;
+		}
+#endif
+		if (ft_meta_copying_mark(hm, &g->splices[i].holder_snap))
+			goto miss;
+		g->splices[i].holder = hm;
+		if (ft_chain_head_holder(ft, dst_head) != hf)
+			goto miss;	/* re-parented under us: stale lock */
+	}
+	return 0;
+miss:
+	ft_glue_release_splice_holders(g);
+	return -EAGAIN;
 }
 
 /*

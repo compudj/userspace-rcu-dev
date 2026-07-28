@@ -1082,6 +1082,24 @@ struct cds_ft_inode_flag *ft_merge_wrap_prefix(struct ft_merge_ctx *c,
  * Every (EXACT | KEY_SHORTER) src x (EXACT | KEY_SHORTER) dst shape is handled.
  *
  * Returns OK on a committed merge, or MEMORY_ERROR on OOM (both tries pristine).
+ *
+ * @contended is the CONTENTION channel, deliberately kept OUT of enum
+ * cds_ft_status.  A dup-chain holder lock this attempt could not acquire (MW
+ * LOCK_FINE) means "the tree moved, rebuild and try again" -- not one of merge's
+ * outcomes.  cds_ft_merge_at consumes an EXCLUSIVE source, so it has no
+ * transient failure to report: an attempt that bails has moved nothing and is
+ * trivially undone, and the caller just re-descends.  Merge's one public
+ * BUSY_ERROR says something else entirely -- the source is LIVE, call
+ * cds_ft_make_exclusive first -- and it is a precondition: checked before any
+ * allocation, and permanent, since retrying the identical call returns the
+ * identical answer.  Overloading it would leave a caller unable to tell "fix
+ * your source" from "just loop".
+ *
+ * So on contention @contended is set and the RETURN is MEMORY_ERROR -- the
+ * conservative surface every other bail here already uses, so a caller that
+ * forgets to check @contended still reports a no-op on two pristine tries
+ * rather than a false success.  The retry belongs to the caller, which is the
+ * only one that can re-descend.
  */
 static
 enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
@@ -1090,7 +1108,7 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		unsigned int off_src, struct ft_descent *d_dst,
 		unsigned long cnt_dst, unsigned int off_dst,
 		size_t dst_key_len,
-		struct ft_flip_txn **pre_txn)
+		struct ft_flip_txn **pre_txn, bool *contended)
 {
 	struct ft_glue gd, gs;
 	struct ft_merge_ctx ctx = { .dst_ft = dst_ft, .gd = &gd, .gs = &gs };
@@ -1115,6 +1133,15 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	unsigned long ms_nsrc = 0;			/* src run cells captured */
 	unsigned int ms_cap = 0;	/* interleave edge cap, set once merged_keys is known */
 	unsigned int ms_n = 0;		/* interleave edges collected (staged pre-commit) */
+	/*
+	 * The caller pre-reserved this op's flip-txn, i.e. it is already PAST its
+	 * own point of no return and pre-built everything so this placement cannot
+	 * fail.  Gates the dup-chain acquire below -- the only step here that can
+	 * decline.
+	 */
+	bool unfailable = (pre_txn && *pre_txn);
+
+	*contended = false;
 
 	/*
 	 * Every dst merge-point shape is handled.  The flip proxies the publish
@@ -1538,6 +1565,53 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		}
 	}
 
+	/*
+	 * Dup-chain lock-set (MW LOCK_FINE): take the COPYING lock of every
+	 * distinct holder whose chain step 3c appends a collided src run to, so
+	 * the tail walk + append run under the same per-node lock insert, remove,
+	 * promote and replace take on that chain.  HERE is the last point where a
+	 * miss is free: every fallible allocation above has succeeded and the src
+	 * unlink below is the point of no return, so an -EAGAIN unwinds a build
+	 * that is still entirely invisible.  The locks are held across the unlink,
+	 * the drain and the single commit that installs the appends, and released
+	 * just after it.
+	 *
+	 * UNDOING THE ATTEMPT IS TRIVIAL, which is what makes the bail cheap:
+	 * cds_ft_merge_at consumes an EXCLUSIVE source, so nothing is published and
+	 * nothing has moved -- discarding the fresh cluster leaves both tries
+	 * byte-for-byte as they were, and the caller just re-descends.  That is why
+	 * contention needs no place in enum cds_ft_status (see @contended).
+	 *
+	 * SKIPPED when the CALLER pre-reserved @pre_txn.  That marks a caller which
+	 * has ALREADY passed its own point of no return and pre-built everything so
+	 * this placement cannot fail -- today the staged rekey (detach -> GP ->
+	 * merge back), whose content is already out of the trie and has nowhere to
+	 * go if we bail.  A failable acquire under an unfailable placement is a
+	 * contradiction, and retrying there would re-draw a node reserve that a
+	 * discarded attempt returns to the ARENA, not to the reserve.  Same-trie
+	 * rekey gets its chain exclusion from the in-place one-decide writer's
+	 * up-front DLM lock set instead -- a single commit with reader two-pass
+	 * coherence, no detach and so no unfailable tail -- not from a retrofit
+	 * here.  So this leaves the staged rekey's appends where they are today.
+	 *
+	 * No-op on a non-lock_fine trie or a collision-free merge, which is every
+	 * merge of disjoint key sets -- the batch-staging workload pays nothing.
+	 */
+	if (!unfailable && ft_glue_acquire_splice_holders(dst_ft, &gd)) {
+		free(ms_src_pool);
+		free(ms_src_caps);
+		free(ms_edges);
+		ft_flip_txn_destroy(txn);
+		if (src_side_txn)
+			ft_flip_txn_destroy(src_side_txn);
+		if (fresh_root)
+			free_cds_ft_node_unpublished(src_ft, fresh_root);
+		ft_glue_abort(dst_ft, &gd);
+		ft_glue_abort(src_ft, &gs);
+		*contended = true;
+		return CDS_FT_STATUS_MEMORY_ERROR;
+	}
+
 	if (root_src) {
 		/*
 		 * A root src moves the WHOLE source, so its run is the whole src
@@ -1679,8 +1753,27 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		 * is a same-slot REPLACE (nr_child invariant, §9.4 finding 1) so
 		 * pub_parent is a value-swap survivor not recompacted -- guard-fallback
 		 * on an acquire miss is correct; non-lock_fine falls to the §4.B guard.
+		 *
+		 * UNLESS WE ALREADY HOLD IT.  When the dst merge point is an EXTERNAL
+		 * node, the collided head IS that node and its chain holder is its
+		 * immediate parent -- @pub_parent.  Re-marking a word this op already
+		 * fenced MISSES, and a miss now sets acquire_miss and ABORTS a commit
+		 * with no bail path left (the src is already unlinked).  Hand the held
+		 * fence to the txn instead: hold_or_lock records the {COPYING|s -> s}
+		 * release, the guard's strictly stronger twin, and the txn owns the
+		 * unlock from here (so the take clears our entry).
 		 */
-		ft_flip_txn_lock_or_guard_parent(dst_ft, txn, pub_parent);
+		{
+			struct cds_ft_metadata *pp_held = NULL;
+			uintptr_t pp_snap = 0;
+
+			if (pub_parent && ft_glue_splice_holder_take(&gd,
+					ft_flag_to_metadata(dst_ft, pub_parent),
+					&pp_snap))
+				pp_held = ft_flag_to_metadata(dst_ft, pub_parent);
+			ft_flip_txn_hold_or_lock_parent(dst_ft, txn, pub_parent,
+				pp_held, pp_snap);
+		}
 		ft_flip_txn_record_reserved(txn, (void **) pub_slot,
 			D_old, M_slot);
 	}
@@ -1727,9 +1820,17 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	 *    with the merged structure -- a collided key never momentarily shows
 	 *    only its dst duplicates (the old post-commit apply's window).  Each
 	 *    splice is one forward edge (dst tail -> src run), so only the tail
-	 *    carries a proxy; src_head->next rides along.  Splices arise only on
-	 *    this created-txn path -- the rekey take() path targets an absent dst
-	 *    key, so gd.nr_splices is 0 there.
+	 *    carries a proxy; src_head->next rides along.  The rekey take() path
+	 *    reaches this too -- cds_ft_rekey_merge unions into an OCCUPIED
+	 *    destination, so a full key present on both sides collides there like
+	 *    any other merge, which is why that path's pre-reservation budgets one
+	 *    splice edge per moved key.  (Only cds_ft_rekey_graft demands an empty
+	 *    destination, and it never reaches the spine copy.)
+	 *
+	 *    Every append here runs under the chain holder's COPYING lock, taken
+	 *    before the point of no return by ft_glue_acquire_splice_holders and
+	 *    released after the commit below -- so the walk to the tail cannot race
+	 *    a peer's append/unchain/promote on the same chain.
 	 */
 	ft_glue_record_splices(dst_ft, &gd, txn);
 
@@ -1758,6 +1859,18 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	 *    instant the merged minimum becomes reachable.
 	 */
 	ft_flip_txn_commit(dst_ft, txn);
+
+	/*
+	 * 5. Drop the dup-chain holder locks: the appends are installed, so peers
+	 *    may mutate those chains again.  BEFORE the step-7 reclaim below --
+	 *    most holders are dst overlap-spine nodes this merge retires, and the
+	 *    fence has to come off while the node is still there to clear.  (The
+	 *    fence survives the commit either way: the free-list retire records a
+	 *    plain {COPYING|s -> COPYING|s|TOMBSTONE} upgrade, and an aborted
+	 *    commit leaves {COPYING|s}.  The one holder that IS the publish target
+	 *    was handed to @txn above and is already released by its flip.)
+	 */
+	ft_glue_release_splice_holders(&gd);
 
 	/*
 	 * 6. The dst net key-count delta (merged_keys - cnt_dst) is FOLDED into
@@ -2642,17 +2755,34 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 
 #ifdef FEATURE_FT_MW_LOCK_FINE_DROP
 	bool md_rlock = false;
+#endif
+	bool md_contended;
 
+	/*
+	 * Re-entered when a spine-copy attempt could not take its dup-chain lock
+	 * set (@md_contended).  The attempt moved nothing -- an EXCLUSIVE source
+	 * means the merge is build-invisible until its one commit, so a declined
+	 * attempt is trivially undone and both tries are byte-for-byte as they
+	 * were.  Re-descend, because the whole reason the acquire declined is that
+	 * a peer is reshaping the dst spine we planned against, and rebuild.  Same
+	 * plan->commit retry shape as cds_ft_graft's retry_attach and
+	 * cds_ft_graft_swap's retry_swap.
+	 */
+merge_spine_retry:
+#ifdef FEATURE_FT_MW_LOCK_FINE_DROP
 	/*
 	 * §11 cross-trie RCU-pinning: the spine-copy path below descends the live
 	 * dst here and COPYING-locks a descent-captured dst node (@d_dst->pnf /
 	 * ->ppnf) inside ft_merge_spine_copy.  A COPYING lock false-succeeds on a
 	 * reclaimed+recycled node (arena re-zeroes metadata), so pin the captured
 	 * nodes with the flavor read side across descent -> lock, as cds_ft_graft
-	 * does.  With an EXCLUSIVE src the spine-copy's only grace period (its src
-	 * drain) is !src_ft->exclusive-gated and skipped, so the whole
-	 * ft_merge_spine_copy runs GP-free under the read lock.  Released before
-	 * the spine-copy return and on the fall-through to the detach/graft paths.
+	 * does.  The dup-chain holders the splice lock set acquires are captured
+	 * during that same window, so this pin covers them too.  With an EXCLUSIVE
+	 * src the spine-copy's only grace period (its src drain) is
+	 * !src_ft->exclusive-gated and skipped, so the whole ft_merge_spine_copy
+	 * runs GP-free under the read lock.  Released before the spine-copy return,
+	 * on the fall-through to the detach/graft paths, and before each retry
+	 * above (a retry re-descends, so it must re-pin what it re-reads).
 	 */
 	if (dst_ft->lock_fine && src_ft->exclusive) {
 		dst_ft->group->flavor->read_lock();
@@ -2676,10 +2806,21 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 			&& cnt_dst > 0
 			&& (kd == FT_GRAFT_SWAP_EXACT
 				|| kd == FT_GRAFT_SWAP_KEY_SHORTER)) {
+		md_contended = false;
 		status = ft_merge_spine_copy(dst_ft, src_ft, &d_src,
 				okey_src, src_key_len, cnt_src, off_src,
 				&d_dst, cnt_dst, off_dst, dst_key_len,
-				pre_txn);
+				pre_txn, &md_contended);
+		if (md_contended) {
+			/* Contention, nothing moved: re-pin, re-descend, rebuild. */
+#ifdef FEATURE_FT_MW_LOCK_FINE_DROP
+			if (md_rlock) {
+				dst_ft->group->flavor->read_unlock();
+				md_rlock = false;
+			}
+#endif
+			goto merge_spine_retry;
+		}
 		if (status == CDS_FT_STATUS_OK) {
 			/*
 			 * Raise dst's max_used_key_len for the moved keys
