@@ -5459,10 +5459,58 @@ void ft_glue_apply_deferred(struct cds_ft *ft, struct ft_glue *g)
 	 * its back-pointer is switched atomically (with the merge-point
 	 * forward slot) by the flip-latch, after this call.
 	 */
-	for (i = 0; i < g->nr_deferred; i++)
-		if (!g->deferred[i].dst_origin)
-			ft_set_parent(ft, g->deferred[i].child, g->deferred[i].parent,
-				g->deferred[i].slot);
+	for (i = 0; i < g->nr_deferred; i++) {
+		if (g->deferred[i].dst_origin)
+			continue;
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+		/*
+		 * FOLD (coherent rekey one-decide writer): "unreachable until the
+		 * forward flip" is what licenses the plain store, and it is FALSE
+		 * for the fold.  A same-trie rekey re-parents the moved subtree's
+		 * own children -- which stay READER-REACHABLE through the old
+		 * source spine right up to the flip -- so storing here would be a
+		 * reader-visible mutation before the commit, and one that no abort
+		 * rolls back.  Record them instead, exactly as the dst-origin arm
+		 * does, so they flip atomically with the forward publish.
+		 */
+		if (g->txn && g->txn->structural_sw) {
+			/*
+			 * ☠ ORDER-DEPENDENCE, and why this arm is narrow.  The
+			 * plain-store loop below is IN RECORDED ORDER on purpose:
+			 * ft_set_parent's skip-compressed arm resolves its target
+			 * through ft_skip_to_compressed, which reads a child
+			 * back-pointer an EARLIER edge of this same loop may have
+			 * just written.  Records do not land until the flip, so a
+			 * converted edge resolves against the PRE-loop back-pointer
+			 * -- a different node whenever that dependency is live.
+			 *
+			 * MEASURED, do not re-derive: instrumenting every src-origin
+			 * edge with its target resolved before vs. after the loop,
+			 * the divergence is EXACTLY the skip-compressed class and it
+			 * is total -- ft_unit 12 diverged of 18 skip (125 edges), the
+			 * FT_INV_MW rekey oracles 8 of 8 skip (21224 edges).  Every
+			 * non-skip edge resolves to a constant.
+			 *
+			 * Under structural_sw the class is EMPTY -- 0 skip and 0
+			 * divergent of 1879 fold re-parents across the same oracle
+			 * run -- because the rekey's shape gate admits no compressed
+			 * or skip-compressed node on the moved spine.  That is a
+			 * property of the GATE, not of the fold, so it is asserted
+			 * rather than assumed: relaxing the gate must re-measure, and
+			 * will find this assert rather than a silently mis-resolved
+			 * parent.
+			 */
+			assert(!g->deferred[i].child ||
+				ft_node_flip_proxy(g->deferred[i].child) ||
+				!ft_node_skip_compressed(g->deferred[i].child));
+			ft_reparent_record(ft, g->txn, g->deferred[i].child,
+				g->deferred[i].parent, g->deferred[i].slot);
+			continue;
+		}
+#endif
+		ft_set_parent(ft, g->deferred[i].child, g->deferred[i].parent,
+			g->deferred[i].slot);
+	}
 }
 
 /*
