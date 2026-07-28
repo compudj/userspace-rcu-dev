@@ -50,7 +50,7 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_MW_DLM_ACQUIRE
-#define NR_TESTS_DLM 5		/* cow_stop_root_inplace, rekey_graft_{simple,liston,cross_junction,glue_dst} */
+#define NR_TESTS_DLM 6		/* cow_stop_root_inplace, rekey_graft_{simple,liston,cross_junction,glue_dst}, rekey_merge_occupied_dst */
 #else
 #define NR_TESTS_DLM 0
 #endif
@@ -931,6 +931,154 @@ static int test_rekey_graft_simple(void)
  * ascending order -- i.e. the four moved keys appear at their new dst positions and
  * none is dropped from the list (the coherence property the run splice guarantees).
  */
+/*
+ * INCREMENT 3: the dst point is OCCUPIED, so the move UNIONS into it.
+ *
+ * Same layout as test_rekey_graft_simple -- a list-OFF fixed-4 fine-lock trie,
+ * depth-2 junctions -- except the dst slot already holds a subtree.  S_top's
+ * top-level bytes and the dst occupant's are DISJOINT, so ft_merge_build takes
+ * its union arm at the top frame and never recurses: the narrowest shape that
+ * is genuinely a merge.
+ *
+ * What this pins that the empty-dst tests cannot:
+ *  - the moved keys and the keys ALREADY at the dst must BOTH survive.  A merge
+ *    that dropped the occupant would still verify clean and still move the
+ *    subtree, so counting both sides is the whole test.
+ *  - the node at the dst gets a FRESH address.  That is the property increment 3
+ *    leans on to skip ft_rekey_cow_stop: the reader's two-descent witness needs
+ *    the move to change the visited-node set, and here the freshness comes from
+ *    ft_merge_build's tail rather than from a COW.  Asserting it is what keeps
+ *    that argument honest -- if merge_build ever returned a live node at the top
+ *    frame, this fails rather than silently degrading reader coherence.
+ */
+#define RKM_DOCC	0x03		/* dst occupant's byte1, distinct from RK_DZ */
+static int test_rekey_merge_occupied_dst(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_fine_lock_listoff_ft(4, &group);
+	uint8_t src_key[2] = { RK_SX, RK_SY }, dst_key[2] = { RK_DX, RK_DZ };
+	uint64_t sub_key[RK_NSUB], sib_key[RK_NSIB], occ_key[2], dstl_key[2];
+	void *before, *after;
+	unsigned long cnt_before, cnt_after;
+	int i, rc = -1;
+
+	for (i = 0; i < RK_NSUB; i++)
+		sub_key[i] = ((uint64_t) RK_SX << 24) | ((uint64_t) RK_SY << 16) |
+			((uint64_t) (i + 1) << 8);
+	for (i = 0; i < RK_NSIB; i++)
+		sib_key[i] = ((uint64_t) RK_SX << 24) | ((uint64_t) (i + 5) << 16);
+	dstl_key[0] = ((uint64_t) RK_DX << 24) | ((uint64_t) 0x01 << 16);
+	dstl_key[1] = ((uint64_t) RK_DX << 24) | ((uint64_t) 0x02 << 16);
+	/*
+	 * The OCCUPANT: two keys under {DX,DZ} itself, at byte2 values disjoint
+	 * from the moved subtree's (which uses 1..RK_NSUB).  So the dst slot holds a
+	 * real internal node and the union at the top frame has no shared byte.
+	 */
+	occ_key[0] = ((uint64_t) RK_DX << 24) | ((uint64_t) RK_DZ << 16) |
+		((uint64_t) (RKM_DOCC + 0x40) << 8);
+	occ_key[1] = ((uint64_t) RK_DX << 24) | ((uint64_t) RK_DZ << 16) |
+		((uint64_t) (RKM_DOCC + 0x41) << 8);
+
+	rcu_read_lock();
+	for (i = 0; i < RK_NSUB; i++)
+		if (insert_u64(ft, sub_key[i], node_alloc(sub_key[i])) !=
+				CDS_FT_STATUS_OK)
+			goto out_locked;
+	for (i = 0; i < RK_NSIB; i++)
+		if (insert_u64(ft, sib_key[i], node_alloc(sib_key[i])) !=
+				CDS_FT_STATUS_OK)
+			goto out_locked;
+	for (i = 0; i < 2; i++)
+		if (insert_u64(ft, dstl_key[i], node_alloc(dstl_key[i])) !=
+					CDS_FT_STATUS_OK ||
+				insert_u64(ft, occ_key[i], node_alloc(occ_key[i])) !=
+					CDS_FT_STATUS_OK)
+			goto out_locked;
+	before = _cds_ft_debug_child_at(ft, dst_key, 2);
+	cnt_before = cds_ft_count_keys(ft);
+	rcu_read_unlock();
+	if (!before) {
+		fprintf(stderr, "rekey-merge: dst is not occupied -- shape is wrong, "
+			"the test would pass through the graft path\n");
+		goto out;
+	}
+
+	/* The move takes the gate + a grace period: NOT from a read section. */
+	rc = _cds_ft_debug_rekey_graft_simple(ft, src_key, 2, dst_key, 2);
+	if (rc != 0) {
+		fprintf(stderr, "rekey-merge: driver rc=%d\n", rc);
+		rc = -1;
+		goto out;
+	}
+	rc = -1;
+
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "rekey-merge: verify failed after the union\n");
+		goto out;
+	}
+	rcu_read_lock();
+	after = _cds_ft_debug_child_at(ft, dst_key, 2);
+	cnt_after = cds_ft_count_keys(ft);
+	rcu_read_unlock();
+	/* The union's top is FRESH -- see the header: this is cow_stop's job, done
+	 * by ft_merge_build's tail instead. */
+	if (!after || after == before) {
+		fprintf(stderr, "rekey-merge: dst top did not move (before %p after "
+			"%p) -- merge_build returned a LIVE node at the top frame\n",
+			before, after);
+		goto out;
+	}
+	/* BOTH sides survive: the moved subtree AND the previous occupant. */
+	if (cnt_after != cnt_before) {
+		fprintf(stderr, "rekey-merge: key count %lu != %lu\n",
+			cnt_after, cnt_before);
+		goto out;
+	}
+	rcu_read_lock();
+	for (i = 0; i < RK_NSUB; i++) {
+		uint64_t moved = ((uint64_t) RK_DX << 24) | ((uint64_t) RK_DZ << 16) |
+			((uint64_t) (i + 1) << 8);
+
+		struct cds_ft_node *f = NULL;
+
+		if (lookup_u64(ft, moved, &f) != CDS_FT_STATUS_OK) {
+			rcu_read_unlock();
+			fprintf(stderr, "rekey-merge: moved key %d absent at dst\n", i);
+			goto out;
+		}
+	}
+	for (i = 0; i < 2; i++) {
+		struct cds_ft_node *f = NULL;
+
+		if (lookup_u64(ft, occ_key[i], &f) != CDS_FT_STATUS_OK) {
+			rcu_read_unlock();
+			fprintf(stderr, "rekey-merge: dst OCCUPANT key %d lost to the "
+				"union\n", i);
+			goto out;
+		}
+	}
+	{
+		struct cds_ft_node *f = NULL;
+
+		if (lookup_u64(ft, sub_key[0], &f) == CDS_FT_STATUS_OK) {
+			rcu_read_unlock();
+			fprintf(stderr, "rekey-merge: src key still present after the "
+				"move\n");
+			goto out;
+		}
+	}
+	rcu_read_unlock();
+	rc = 0;
+	goto out;
+out_locked:
+	rcu_read_unlock();
+	fprintf(stderr, "rekey-merge: setup insert failed\n");
+out:
+	if (drain_and_destroy(ft, group) < 0)
+		rc = -1;
+	return rc;
+}
+
 static int test_rekey_graft_liston(void)
 {
 	struct cds_ft_group *group;
@@ -29028,6 +29176,7 @@ int main(int argc, char **argv)
 #ifdef FEATURE_FT_MW_DLM_ACQUIRE
 	RUN_TEST(test_cow_stop_root_inplace);
 	RUN_TEST(test_rekey_graft_simple);
+	RUN_TEST(test_rekey_merge_occupied_dst);
 	RUN_TEST(test_rekey_graft_liston);
 	RUN_TEST(test_rekey_graft_cross_junction);
 	RUN_TEST(test_rekey_graft_glue_dst);

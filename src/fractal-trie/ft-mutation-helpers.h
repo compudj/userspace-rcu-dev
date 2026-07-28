@@ -5702,9 +5702,48 @@ void ft_glue_apply_deferred(struct cds_ft *ft, struct ft_glue *g)
 			 * will find this assert rather than a silently mis-resolved
 			 * parent.
 			 */
-			assert(!g->deferred[i].child ||
-				ft_node_flip_proxy(g->deferred[i].child) ||
-				!ft_node_skip_compressed(g->deferred[i].child));
+			/*
+			 * THE SKIP-COMPRESSED QUESTION, SETTLED BY MEASUREMENT.
+			 *
+			 * The plain-store loop below is order-dependent: ft_set_parent's
+			 * skip arm resolves through ft_skip_to_compressed, which reads a
+			 * child back-pointer an EARLIER edge of the same loop just wrote,
+			 * and the divergence is exactly that class (ft_unit 12 of 18 skip,
+			 * the rekey oracles 8 of 8).  This arm first carried a blanket
+			 * assert against skip children on the strength of that.
+			 *
+			 * That was the wrong guard, because THIS arm never stores.  Under
+			 * structural_sw every src-origin edge is RECORDED, so all of them
+			 * resolve against one pristine state and the pre-loop and in-order
+			 * answers are identical BY CONSTRUCTION.  The order-dependence is a
+			 * property of the store path, not of the resolution.
+			 *
+			 * What CAN still go wrong is a genuinely STALE flag -- one whose
+			 * encoded child was re-homed (by an immediate store earlier in the
+			 * build, or by a peer) so the recovered node no longer owns it.
+			 * That is what this checks, and it is meaningful on both paths.
+			 * Measured over the occupied-dst merge, the only shape reaching a
+			 * skip child here: 4 of 4 consistent, 0 stale.
+			 *
+			 * NOT YET COVERED: no CONCURRENT test reaches this -- 0 skip edges
+			 * across the whole FT_INV_MW plan, whose oracles all move into an
+			 * EMPTY dst.  A peer staling the flag between this resolution and
+			 * the flip is excluded only by the argument that re-homing the
+			 * compressed node's child means restructuring the node whose
+			 * COPYING this op holds.  That is an argument, not a measurement;
+			 * an occupied-dst oracle is what would close it.
+			 */
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+			if (g->deferred[i].child &&
+					!ft_node_flip_proxy(g->deferred[i].child) &&
+					ft_node_skip_compressed(g->deferred[i].child)) {
+				struct cds_ft_compressed_node *scn =
+					ft_skip_to_compressed(ft, g->deferred[i].child);
+
+				assert(scn && scn->child ==
+					ft_skip_child_ptr(g->deferred[i].child));
+			}
+#endif
 			ft_reparent_record(ft, g->txn, g->deferred[i].child,
 				g->deferred[i].parent, g->deferred[i].slot);
 			continue;

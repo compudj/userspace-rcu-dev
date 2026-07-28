@@ -491,6 +491,19 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 	struct cds_ft_metadata *pp_meta = NULL;	/* GLUE publish-parent fence WE own */
 	uintptr_t pp_snap = 0;
 	/*
+	 * INCREMENT 3: the dst point is OCCUPIED, so step 2 UNIONS into it with
+	 * ft_merge_build instead of grafting a COW'd S_top' into a spare slot.  The
+	 * merged cluster reuses @glue as its dst side (so every abort / free_old /
+	 * fini path below applies unchanged); @src_glue is the extra src side, which
+	 * carries the retire of S_top itself -- the merge does what cow_stop would.
+	 */
+	struct ft_glue src_glue;
+	struct ft_merge_ctx mctx;
+	struct ft_merge_counts mcnt = { 0, 0, 0, 0, 0 };
+	struct cds_ft_inode_flag *merged_nf = NULL;
+	unsigned long merged_keys = 0;
+	bool merge_dst = false, src_glue_live = false;
+	/*
 	 * +2, not +1: cow_stop can fill S_top plus all FT_ENTRY_PER_NODE of its
 	 * children, and the GLUE shape adds the split cluster's one displaced child.
 	 */
@@ -591,13 +604,34 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 		return -EINVAL;
 
 	/*
-	 * A POPULATED dst is a PERMANENT shape error, so reject it HERE.  The later shape
-	 * gate does check d_dst.nf, but only after ft_graft_build -- i.e. after the splice
-	 * position validation below, whose failure code is the TRANSIENT -EAGAIN.  A key
-	 * inside the dst range makes that validation's succ check fail first, so a caller
-	 * that (correctly) retries -EAGAIN would spin forever on a shape that can never
-	 * work.  Probe read-only and conservatively: a descent that cannot reach the dst
-	 * depth plainly proves nothing, so leave those shapes to the later gate.
+	 * INCREMENT 3: an OCCUPIED dst is a MERGE, not an error -- the moved subtree
+	 * unions into whatever already sits at @dst_key instead of being grafted into
+	 * a spare slot.  Probe read-only and conservatively (a descent that cannot
+	 * reach the dst depth plainly proves nothing, so those shapes are left to the
+	 * later gate) and record the answer for step 2.
+	 *
+	 * ★ WHY THE MERGE PATH DOES NOT COW S_top, and it is not an oversight.
+	 * ft_rekey_cow_stop exists to give the moved subtree's top a FRESH ADDRESS, so
+	 * the coherent reader's two-descent witness sees the move as a changed visited
+	 * -node set.  A merge already does that BY CONSTRUCTION: entered with an
+	 * internal, non-compressed S_top, ft_merge_build cannot take either of the two
+	 * exits that return a live node (the shared-run collapse needs both sides
+	 * compressed; the leaf-splice needs both external), so it falls to its tail and
+	 * returns a freshly allocated M -- and it retires S_top outright on the way.
+	 * Interposing a COW would allocate a copy for the merge to consume and free.
+	 * cow_stop's OTHER job -- marking the children whose state words the commit
+	 * parks into -- is NOT redundant, and is done by the glue's own acquire.
+	 *
+	 * SCOPE OF THIS FIRST CUT (each a PERMANENT -EINVAL, checked at the gate below,
+	 * not silently degraded):
+	 *  - LIST OFF.  With an empty dst the moved keys form one contiguous ordered
+	 *    run that re-splices as six boundary edges.  Merging into an OCCUPIED dst
+	 *    INTERLEAVES them with the keys already there, which is the per-key
+	 *    ms_edges machinery in ft_merge_spine_copy, not a run move.  A trie with
+	 *    the list on is refused rather than moved with a corrupt list.
+	 *  - a PLAIN INTERNAL node at the dst point.  Compressed / skip / external
+	 *    merge points bring the KEY_SHORTER wrap and Edge-D shapes, which are
+	 *    ft_merge_spine_copy's job.
 	 */
 	{
 		struct ft_descent d_probe;
@@ -612,8 +646,9 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 #endif
 		      )
 			ft_descent_step(ft, &d_probe, *(pk++));
-		if (d_probe.depth == dst_len && d_probe.nf)
-			return -EINVAL;		/* dst occupied: permanent, not a race */
+		merge_dst = (d_probe.depth == dst_len && d_probe.nf != NULL);
+		if (merge_dst && ft->ordered_list)
+			return -EINVAL;		/* interleave: not this cut */
 	}
 
 	/*
@@ -710,11 +745,13 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 
 	/* 1. COW S_top -> S_top' (SW; records re-parents + retire, LOCKED). */
 	ft_flip_txn_set_structural_sw(txn, true);
-	ret = ft_rekey_cow_stop(ft, txn, s_top, &s_top_prime, marks, snaps,
-			&nr_marks);
-	if (ret) {
-		ft_flip_txn_destroy(txn);	/* pre-commit bail: destroy caller-owned */
-		goto sweep;
+	if (!merge_dst) {
+		ret = ft_rekey_cow_stop(ft, txn, s_top, &s_top_prime, marks, snaps,
+				&nr_marks);
+		if (ret) {
+			ft_flip_txn_destroy(txn);	/* pre-commit bail: destroy caller-owned */
+			goto sweep;
+		}
 	}
 
 	/*
@@ -748,6 +785,123 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 		ret = -ENOMEM;
 		goto sweep;
 	}
+	if (merge_dst) {
+		/*
+		 * INCREMENT 3, step 2': UNION S_top into the occupied dst.
+		 *
+		 * Descend the dst ourselves -- ft_graft_build would report POPULATED and
+		 * hand back nothing to publish into.  Plain internal nodes only, the same
+		 * restriction the src descent above makes, so d_dst names {D, publish
+		 * parent, publish slot, grandparent} with no compressed shape in between.
+		 */
+		const uint8_t *dk = dst_ord;
+
+		ft_descent_init(&d_dst, ft);
+		while (d_dst.depth < dst_len) {
+			if (!d_dst.nf || ft_node_external(d_dst.nf) ||
+					ft_node_compressed(d_dst.nf)
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+					|| ft_node_skip_compressed(d_dst.nf)
+#endif
+			   ) {
+				ret = -EINVAL;
+				goto bail_build;
+			}
+			ft_descent_step(ft, &d_dst, *(dk++));
+		}
+		/*
+		 * The merge point itself must be a PLAIN INTERNAL node: a compressed,
+		 * skip or external D is the KEY_SHORTER / Edge-D / leaf-splice family,
+		 * which belongs to ft_merge_spine_copy.  d_dst.nf is non-NULL by the
+		 * probe, but re-checked because the probe ran outside this txn.
+		 */
+		if (d_dst.depth != dst_len || !d_dst.nf ||
+				ft_node_flip_proxy(d_dst.nf) ||
+				ft_node_external(d_dst.nf) ||
+				ft_node_compressed(d_dst.nf) ||
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+				ft_node_skip_compressed(d_dst.nf) ||
+#endif
+				!d_dst.pnf || !d_dst.nfp) {
+			ret = -EINVAL;
+			goto bail_build;
+		}
+		{
+			unsigned int dti = ft_node_type(d_dst.nf);
+
+			if (ft_types[dti].type_class != FT_POPCOUNT &&
+					ft_types[dti].type_class != FT_PIGEON) {
+				ret = -EINVAL;
+				goto bail_build;
+			}
+		}
+		/*
+		 * FENCE the publish parent OURSELVES, exactly as the GLUE arm does and
+		 * for the same reason: this txn is structural_sw, so the forward publish
+		 * PARKS a plain store into that node's slot, and the fold's rule is SW
+		 * iff the op holds the slot's lock.  ft_glue_txn_commit_edges would
+		 * otherwise degrade an acquire miss to a §4.B guard.
+		 */
+		pp_meta = ft_flag_to_metadata(ft, d_dst.pnf);
+		if (!pp_meta || ft_meta_copying_mark(pp_meta, &pp_snap)) {
+			pp_meta = NULL;
+			ret = -EAGAIN;
+			goto bail_build;
+		}
+		glue.publish_parent_holder = pp_meta;
+		glue.publish_parent_snap = pp_snap;
+
+		/* Size both glues from the read-only pre-pass, with headroom. */
+		ft_glue_init(&src_glue);
+		src_glue_live = true;
+		ft_merge_count(ft, s_top, 0, d_dst.nf, 0, &mcnt);
+		if (ft_glue_reserve(&glue, mcnt.nb + 8, mcnt.nd + 8,
+					mcnt.nf_dst + 8, mcnt.ns + 8) ||
+		    ft_glue_reserve(&src_glue, 0, 0, mcnt.nf_src + 8, 0)) {
+			ret = -ENOMEM;
+			goto bail_build;
+		}
+		/*
+		 * FUSE both free lists into the shared txn.  The dst side MUST (a fenced
+		 * overlap retire records its {COPYING|s -> TOMBSTONE|s} terminal into
+		 * g->txn and asserts on this flag), and the src side must for the reason
+		 * the whole fold exists: its free list carries S_top, whose retire has to
+		 * flip WITH the publish rather than as a standalone lone-edge store the
+		 * commit could not roll back.  The reserve above sized both.
+		 */
+		glue.fuse_free_list = true;
+		src_glue.txn = txn;
+		src_glue.fuse_free_list = true;
+		mctx.dst_ft = ft;
+		mctx.gd = &glue;
+		mctx.gs = &src_glue;
+		/*
+		 * FENCE the dst overlap spine.  Unlike the STAGED rekey -- which reaches
+		 * ft_merge_spine_copy already past its point of no return and so must
+		 * skip this -- the one-decide fold's single commit is still ahead of it,
+		 * so a missed fence is a clean re-descend and the fence is affordable.
+		 */
+		mctx.fence_overlap = ft->lock_fine;
+		mctx.overlap_contended = false;
+		merged_nf = ft_merge_build(&mctx, s_top, 0, d_dst.nf, 0, 0,
+				&merged_keys);
+		if (merged_nf == FT_MERGE_OOM) {
+			merged_nf = NULL;
+			ret = mctx.overlap_contended ? -EAGAIN : -ENOMEM;
+			goto bail_build;
+		}
+		/*
+		 * The merged top replaces D in the publish parent's slot.  Recorded, not
+		 * stored: ft_glue_txn_commit_edges runs at step 3c below, after the
+		 * detach, like the GLUE arm.
+		 */
+		ft_glue_set_publish(ft, &glue, d_dst.pnf, d_dst.nfp, merged_nf);
+		glue.attached_nf = merged_nf;
+		glue.count_delta = (long) cnt;
+		attached_nf = merged_nf;
+		adepth = (unsigned int) dst_len;
+		prep = FT_GRAFT_PREP_NOSPLIT;	/* not a graft; keeps the arms below off */
+	} else
 	prep = ft_graft_build(ft, dst_ord, dst_len, s_top_prime, cnt, &d_dst, &glue);
 	/*
 	 * Non-buildable outcomes, mapped to the driver's contract.  A build that
@@ -817,7 +971,17 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 	 * into &ft->root, a slot with no node word to lock, so its SW park would be
 	 * an unguarded plain store.
 	 */
-	if (prep == FT_GRAFT_PREP_GLUE) {
+	if (merge_dst) {
+		/*
+		 * The merge's two nodes, in the same roles the graft's pair plays: @D is
+		 * the one it RETIRES (through the fenced overlap terminal) and the
+		 * publish parent is the one it RELEASES at the flip.  Both are already
+		 * held -- D by the overlap fence, the parent by the mark above -- so the
+		 * gate below only has to keep the detach's junctions clear of them.
+		 */
+		graft_c = d_dst.nf;
+		graft_p = d_dst.pnf;
+	} else if (prep == FT_GRAFT_PREP_GLUE) {
 		cn_flag = d_dst.nf;		/* the compressed node the build split */
 		graft_c = cn_flag;
 		graft_p = glue.publish_parent;
@@ -849,13 +1013,32 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 	if (!ft_flip_txn_reserve_extra(txn, FT_REMOVE_COMMIT_REC_MAX_EDGES + 4 +
 			(ft->ordered_list ? FT_ORD_CELL_RUN_DETACH_MAX_EDGES +
 				FT_ORD_CELL_RUN_RESPLICE_MAX_EDGES : 0) +
+			/*
+			 * Merged cluster: every deferred re-parent costs up to THREE
+			 * records (parent, state guard, offset) now that the fold routes
+			 * them through ft_reparent_record, plus one tombstone per retired
+			 * overlap node on either side, the forward publish, and the
+			 * depth-bounded count walk.  Sized from the read-only pre-pass,
+			 * with the same +8 headroom the glue arrays get.
+			 */
+			(merge_dst ? 3 * (unsigned int) (mcnt.nd + 8) +
+				(unsigned int) (mcnt.nf_dst + mcnt.nf_src + 16) + 8 +
+				(ft->rank_stats ? (unsigned int) dst_len + 1 : 0) : 0) +
 			(prep == FT_GRAFT_PREP_GLUE ?
 				FT_GLUE_FLOOR_DEFERRED + 7 + 1 + FT_GLUE_FLOOR_FREE +
 				(ft->rank_stats ? (unsigned int) dst_len + 1 : 0) : 0))) {
 		ret = -ENOMEM;
 		goto bail_build;
 	}
-	if (prep == FT_GRAFT_PREP_GLUE) {
+	if (merge_dst) {
+		/*
+		 * Nothing more to prepare: the merged cluster is built, its publish is
+		 * set, and its publish parent was fenced with the descent (both above).
+		 * The single reserve is already drained by ft_merge_build's own
+		 * allocations, so there is no graft reserve to activate here.
+		 */
+		cds_ft_alloc_reserve_drain(ft, &reserve);
+	} else if (prep == FT_GRAFT_PREP_GLUE) {
 		/*
 		 * FENCE the publish parent OURSELVES, and fail the move on a miss.
 		 * ft_glue_txn_commit_edges would otherwise route an unheld parent
@@ -938,8 +1121,13 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 			 * glue build, destroy the txn.  (prepare failure freed its own
 			 * invisible build + left glue clean.)
 			 */
+			if (s_top_prime)		/* NULL on the merge path: no COW */
 			free_cds_ft_node_unpublished(ft, ft_node_ptr(s_top_prime));
 			ft_glue_abort(ft, &glue);
+			if (src_glue_live) {	/* merged cluster's src side */
+				ft_glue_abort(ft, &src_glue);
+				src_glue_live = false;
+			}
 			ft_flip_txn_destroy(txn);
 			ret = -EIO;
 			goto sweep;
@@ -997,10 +1185,15 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 		 */
 		if (pp_meta)
 			ft_meta_copying_clear(pp_meta);	/* GLUE: still ours here */
-		free_cds_ft_node_unpublished(ft, ft_node_ptr(s_top_prime));
+		if (s_top_prime)		/* NULL on the merge path: no COW */
+			free_cds_ft_node_unpublished(ft, ft_node_ptr(s_top_prime));
 		if (gst_st.old_recompacted_node)
 			free_cds_ft_node_unpublished(ft, ft_node_ptr(gst_st.dest));
 		ft_glue_abort(ft, &glue);
+			if (src_glue_live) {	/* merged cluster's src side */
+				ft_glue_abort(ft, &src_glue);
+				src_glue_live = false;
+			}
 		ft_flip_txn_destroy(txn);
 		goto sweep;
 	}
@@ -1055,6 +1248,7 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 				src_succ == ft_ord_or_sentinel(ft, run_dsucc)) {
 			if (pp_meta)
 				ft_meta_copying_clear(pp_meta);	/* GLUE: still ours */
+			if (s_top_prime)		/* NULL on the merge path: no COW */
 			free_cds_ft_node_unpublished(ft, ft_node_ptr(s_top_prime));
 			if (gst_st.old_recompacted_node)
 				free_cds_ft_node_unpublished(ft,
@@ -1063,6 +1257,10 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 				free_cds_ft_node_unpublished(ft,
 					ft_node_ptr(detach_rc.new_flag));
 			ft_glue_abort(ft, &glue);
+			if (src_glue_live) {	/* merged cluster's src side */
+				ft_glue_abort(ft, &src_glue);
+				src_glue_live = false;
+			}
 			ft_flip_txn_destroy(txn);
 			ret = -EAGAIN;
 			goto sweep;
@@ -1095,7 +1293,7 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 	 * publishes it, and from here the txn registry -- not this function -- owns
 	 * the publish parent's fence.
 	 */
-	if (prep == FT_GRAFT_PREP_GLUE) {
+	if (prep == FT_GRAFT_PREP_GLUE || merge_dst) {
 		/*
 		 * The status is CHECKED, not discarded.  It used to be `(void)` on the
 		 * reasoning above -- everything that can bail is upstream, so this call
@@ -1124,22 +1322,45 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 			 */
 			ft_meta_copying_clear(pp_meta);
 			pp_meta = NULL;
+			if (s_top_prime)		/* NULL on the merge path: no COW */
 			free_cds_ft_node_unpublished(ft, ft_node_ptr(s_top_prime));
 			if (detach_rc.new_flag)
 				free_cds_ft_node_unpublished(ft,
 					ft_node_ptr(detach_rc.new_flag));
 			ft_glue_abort(ft, &glue);
+			if (src_glue_live) {	/* merged cluster's src side */
+				ft_glue_abort(ft, &src_glue);
+				src_glue_live = false;
+			}
 			ft_flip_txn_destroy(txn);
 			ret = -EAGAIN;
 			goto sweep;
 		}
 		pp_meta = NULL;		/* ownership transferred to @txn */
+		/*
+		 * The merged cluster's SRC side has no publish of its own -- only
+		 * retires, S_top's among them -- so it never goes through
+		 * ft_glue_txn_commit_edges.  Record its freezes into the shared txn
+		 * directly, here, on the committing path and after the last bail above,
+		 * exactly where the dst side's own tombstone step just ran.
+		 */
+		if (src_glue_live)
+			ft_glue_tombstone_free_list(&src_glue);
 	}
 
 	/* 4. ONE commit of the whole stitch (consumes txn). */
 	st = ft_flip_txn_commit(ft, txn);
 	if (st == URCU_TXN_STATUS_OK) {
 		ft_glue_free_old(ft, &glue);		/* graft old copies */
+		/*
+		 * The merged cluster's SRC side: its free list holds S_top itself (and
+		 * any src overlap node the build copied), retired by this commit.  That
+		 * is what makes the cds_ft_free_item_deferred below a MERGE-path double
+		 * free -- the merge already owns S_top's reclaim, so only the cow_stop
+		 * path still owes it.
+		 */
+		if (src_glue_live)
+			ft_glue_free_old(ft, &src_glue);
 		/*
 		 * The reserve recompaction's relocated old dst-parent copy: its retire
 		 * committed with the flip (deferred past readers via the recompact's
@@ -1150,7 +1371,14 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 			free_cds_ft_node(ft, gst_st.old_recompacted_node);
 		if (detach_rc.old_node)
 			free_cds_ft_node(ft, detach_rc.old_node);	/* old BP copy */
-		cds_ft_free_item_deferred(ft, s_top_meta);	/* old S_top after GP */
+		/*
+		 * Old S_top after the grace period -- but ONLY on the cow_stop path.
+		 * The merge retires S_top through @src_glue's free list, so
+		 * ft_glue_free_old above already owns that reclaim; doing it here too
+		 * is a double free.
+		 */
+		if (!merge_dst)
+			cds_ft_free_item_deferred(ft, s_top_meta);
 		ret = 0;
 	} else {
 		/*
@@ -1161,15 +1389,22 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 		 * tombstones rolled back), so they are NOT freed here.  Unreachable under
 		 * the single-writer contract, kept leak-free for future concurrent use.
 		 */
-		free_cds_ft_node_unpublished(ft, ft_node_ptr(s_top_prime));
+		if (s_top_prime)		/* NULL on the merge path: no COW */
+			free_cds_ft_node_unpublished(ft, ft_node_ptr(s_top_prime));
 		if (gst_st.old_recompacted_node)
 			free_cds_ft_node_unpublished(ft, ft_node_ptr(gst_st.dest));
 		if (detach_rc.new_flag)
 			free_cds_ft_node_unpublished(ft, ft_node_ptr(detach_rc.new_flag));
 		ft_glue_abort(ft, &glue);
+			if (src_glue_live) {	/* merged cluster's src side */
+				ft_glue_abort(ft, &src_glue);
+				src_glue_live = false;
+			}
 		ret = -EAGAIN;
 	}
 	ft_glue_fini(&glue);
+	if (src_glue_live)
+		ft_glue_fini(&src_glue);
 	goto sweep;
 
 bail_build:
@@ -1186,8 +1421,13 @@ bail_build:
 	cds_ft_alloc_reserve_drain(ft, &reserve);
 	if (pp_meta)
 		ft_meta_copying_clear(pp_meta);
-	free_cds_ft_node_unpublished(ft, ft_node_ptr(s_top_prime));
+	if (s_top_prime)		/* NULL on the merge path: no COW */
+			free_cds_ft_node_unpublished(ft, ft_node_ptr(s_top_prime));
 	ft_glue_abort(ft, &glue);
+			if (src_glue_live) {	/* merged cluster's src side */
+				ft_glue_abort(ft, &src_glue);
+				src_glue_live = false;
+			}
 	ft_flip_txn_destroy(txn);
 
 sweep:
