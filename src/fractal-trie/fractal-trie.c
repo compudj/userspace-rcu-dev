@@ -184,6 +184,11 @@
 #include "ft-cluster-build.h"
 #include "ft-insert.h"
 #include "ft-remove.h"
+
+#ifdef FEATURE_FT_FAULT_INJECT
+extern long cds_ft_fault_commit_countdown;
+#endif
+
 #include "ft-graft.h"
 #include "ft-detach.h"
 #include "ft-merge.h"
@@ -1406,6 +1411,26 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 	}
 
 	/* 4. ONE commit of the whole stitch (consumes txn). */
+#ifdef FEATURE_FT_FAULT_INJECT
+	/*
+	 * Test-only: abort this commit exactly as a peer winning a raced MW slot
+	 * would.  Without it the fold's abort branch below is DEAD -- and not for
+	 * want of contention: the shared-destination merge oracle drove 62342
+	 * publish-parent fence misses and 1079 commit_edges misses over 71218
+	 * merges and still took this exit 0 times, because every acquire is AHEAD
+	 * of the commit and turns the peer away first.  @acquire_miss is the
+	 * engine's own discard-unpublished route, so what runs below is the real
+	 * unwind, not a synthesised status.
+	 */
+	if (merge_dst && cds_ft_fault_commit_countdown >= 0) {
+		if (cds_ft_fault_commit_countdown == 0) {
+			cds_ft_fault_commit_countdown = -1;
+			txn->acquire_miss = true;
+		} else {
+			cds_ft_fault_commit_countdown--;
+		}
+	}
+#endif
 	st = ft_flip_txn_commit(ft, txn);
 	if (st == URCU_TXN_STATUS_OK) {
 		ft_glue_free_old(ft, &glue);		/* graft old copies */

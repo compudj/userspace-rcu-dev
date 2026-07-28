@@ -190,9 +190,25 @@ int ft_hlist_insert_after_prepare(struct urcu_txn *txn,
  * is the lone recorded edge and the serializing one (CAS old = NULL: a
  * concurrent freeze of the tail fails this commit), so only the tail carries a
  * proxy while the commit is in flight; the interior of neither run is disturbed.
- * @run_head->prev = tail is a writer-only plain store -- readers never read prev,
- * and @run_head is caller-guaranteed unreachable to readers here (a merge
- * detaches + drains the src side before appending it).
+ *
+ * ★ @run_head->prev = tail is a PLAIN store, and the caller owns undoing it.
+ * The claim that used to stand here -- "writer-only; readers never read prev,
+ * and @run_head is unreachable to readers because a merge detaches and drains
+ * the src side before appending it" -- describes ft_merge_spine_copy, the only
+ * caller when it was written.  It is FALSE for the one-decide fold, which
+ * records the src detach and this splice into ONE txn: the src side is still
+ * LIVE here.  And prev IS read -- under SKIP_COMPRESSED a parent slot encodes
+ * the skip onto the head itself and ft_skip_to_compressed recovers the
+ * compressed node through prev.
+ *
+ * So this store is reader-visible and, unlike the recorded edge beside it,
+ * survives an aborted commit.  The caller must be able to put it back:
+ * ft_glue_record_splices snapshots the old value unconditionally and
+ * ft_glue_abort restores it.  Do not re-derive "prev is writer-only" here, and
+ * do not make that undo conditional on which caller you think can still abort
+ * -- ft_merge_spine_copy's own commit (ft-merge.h, after the record) can return
+ * non-OK too, and the next bail added anywhere after a record must be covered
+ * by default rather than by a decision frozen at the call site.
  */
 static inline
 void ft_hlist_append_run_prepare(struct urcu_txn *txn,

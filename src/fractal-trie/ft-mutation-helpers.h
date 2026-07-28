@@ -4336,6 +4336,36 @@ struct ft_glue_splice {
 	struct cds_ft_node *dst_head;		/* surviving head (kept first) */
 	struct cds_ft_node *src_head;		/* appended to dst_head's tail */
 	/*
+	 * @src_head's back-pointer as it stood BEFORE the append demoted it from
+	 * a head to a duplicate, and a flag saying the demotion actually ran.
+	 *
+	 * ft_hlist_append_run_prepare records the forward link tail->next into the
+	 * txn but writes run_head->prev = tail as a PLAIN store, on the reasoning
+	 * that prev is writer-only and the appended run is unreachable to readers.
+	 * Both halves hold for ft_merge_spine_copy, which detaches and drains the
+	 * src side first.  Neither holds for the one-decide FOLD, which records the
+	 * src detach and the splice into ONE txn: at splice time the src side is
+	 * still LIVE, and under SKIP_COMPRESSED its parent slot is skip-encoded
+	 * onto this very head -- ft_skip_to_compressed recovers the compressed
+	 * node THROUGH prev.  So the store is reader-visible, and on an abort it
+	 * is the one mutation the txn cannot roll back: the src slot survives
+	 * naming a head whose back-pointer now points into the dst chain, which
+	 * cds_ft_verify reports as slen != cn->len and a reader resolves to the
+	 * wrong subtree.  ft_glue_abort restores it.
+	 *
+	 * ARMED UNCONDITIONALLY, and consumed only by ft_glue_abort.  That is the
+	 * fail-safe direction and it costs nothing: ft_merge_spine_copy's every
+	 * ft_glue_abort on this glue is BEFORE its ft_glue_record_splices call
+	 * (ft-merge.h, aborts at 1325..1872 vs the record at 2028, no goto), so the
+	 * undo is a verified no-op there.  A per-caller opt-in was tried and
+	 * dropped: it was dead code in the only caller that passed false, and it
+	 * would silently skip the undo for any bail added between the record and
+	 * the commit -- the arming decision must not be frozen at the call site.
+	 */
+	void *src_prev;
+	void *src_demoted_to;
+	bool src_demoted;
+	/*
 	 * The demoted @src_head's ordered-list cell, captured by
 	 * ft_glue_record_splices.  It stays REACHABLE through its src-run
 	 * neighbours' stale ord_prev/ord_next until the post-publish interleave
@@ -5462,6 +5492,42 @@ void ft_glue_abort(struct cds_ft *ft, struct ft_glue *g)
 	int i;
 
 	/*
+	 * Demoted src heads (merge, collided keys): undo the ONE mutation the txn
+	 * does not carry.  ft_hlist_append_run_prepare stores run_head->prev =
+	 * tail plainly while recording only the forward tail->next edge, so an
+	 * aborted commit rolls back the forward link and leaves the back-pointer
+	 * re-homed into the dst chain -- with the src's skip-encoded slot still
+	 * naming this head, which is how a reader (and cds_ft_verify) finds the
+	 * wrong compressed node.  Restoring makes the abort byte-for-byte again.
+	 *
+	 * FIRST, while the dup-chain holder locks this op took are still HELD:
+	 * ft_glue_release_splice_holders below drops them, and a chain slot must
+	 * not be written after its holder's lock is gone.
+	 *
+	 * A committed merge must not reach here (same contract as the re-parent
+	 * marks below), so the demotion it made is never undone.
+	 */
+	for (i = 0; i < g->nr_splices; i++) {
+		if (!g->splices[i].src_demoted)
+			continue;
+		/*
+		 * CAS, not a store: undo OUR write and only while it is still ours.
+		 * ft_glue_acquire_splice_holders locks the DST head's chain holder
+		 * only (ft_chain_head_holder(ft, dst_head)); the SRC head's holder is
+		 * never acquired, so between the append and here a peer may
+		 * legitimately retarget src_head->prev -- a src-side recompact, or a
+		 * head promote swapping a fresh cell in.  A blind store would then
+		 * install our STALE snapshot over the peer's current value, which is
+		 * the same wrong-back-pointer corruption this undo exists to prevent,
+		 * merely pointing the other way.  If the CAS fails the peer owns the
+		 * field now and its value must stand.
+		 */
+		(void) uatomic_cmpxchg(&g->splices[i].src_head->prev,
+			g->splices[i].src_demoted_to, g->splices[i].src_prev);
+		g->splices[i].src_demoted = false;
+	}
+
+	/*
 	 * Dup-chain holder locks (MW LOCK_FINE): a merge that acquired its
 	 * splice lock-set and then bailed before the point of no return must
 	 * leave those holders LIVE and unlocked.  Every pre-commit merge bail
@@ -6092,6 +6158,15 @@ void ft_glue_record_splice(struct ft_glue *g,
 	g->splices[g->nr_splices].dst_head = dst_head;
 	g->splices[g->nr_splices].src_head = src_head;
 	g->splices[g->nr_splices].src_cell = NULL;
+	/*
+	 * Not demoted yet: ft_glue_record_splices arms these when (and only when)
+	 * it runs the append.  A bail BETWEEN this record and that call reaches
+	 * ft_glue_abort with the splice already in the array, and the undo loop
+	 * there must see false rather than whatever the buffer last held.
+	 */
+	g->splices[g->nr_splices].src_prev = NULL;
+	g->splices[g->nr_splices].src_demoted_to = NULL;
+	g->splices[g->nr_splices].src_demoted = false;
 	g->splices[g->nr_splices].holder = NULL;
 	g->splices[g->nr_splices].holder_snap = 0;
 	g->nr_splices++;
@@ -6258,6 +6333,12 @@ void ft_glue_record_splices(struct cds_ft *ft, struct ft_glue *g,
 		 */
 		g->splices[i].src_cell = ft->ordered_list ?
 			ft_ord_cell_ptr(src_head->prev) : NULL;
+		/*
+		 * Snapshot the back-pointer the append is about to overwrite, so an
+		 * abort can put it back (see @src_prev).  Taken here, before the
+		 * prepare, because the prepare is where the plain store happens.
+		 */
+		g->splices[i].src_prev = src_head->prev;
 
 		while (ft_node_next(tail))
 			tail = ft_node_next(tail);
@@ -6272,6 +6353,9 @@ void ft_glue_record_splices(struct cds_ft *ft, struct ft_glue *g,
 		 * always finds the true pre-merge tail.
 		 */
 		ft_hlist_append_run_prepare(ft_flip_txn_handle(txn), tail, src_head);
+		/* The value the prepare just stored: the undo's CAS expected-old. */
+		g->splices[i].src_demoted_to = tail;
+		g->splices[i].src_demoted = true;
 	}
 }
 

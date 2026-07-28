@@ -23825,6 +23825,7 @@ out:
 extern long cds_ft_fault_alloc_countdown;
 extern long cds_ft_fault_flip_countdown;
 extern long cds_ft_fault_lock_countdown;
+extern long cds_ft_fault_commit_countdown;
 extern long cds_ft_fault_rekey_countdown;
 
 /*
@@ -28668,7 +28669,27 @@ out:
  * The shape is the COLLIDING one, so the sweep also crosses the splice-holder
  * acquire and the chain append.
  */
-static int rekey_merge_bail_run(long n, bool alloc_fault)
+/*
+ * Which family of unwind this run drives.  They are not variations on one bail:
+ * each stops the fold at a different DEPTH, and the deepest is the one where a
+ * leak or a stuck lock would live.
+ */
+enum rkm_bail_knob {
+	RKM_KNOB_LOCK,		/* a missed acquire: the fold holds nothing it took */
+	RKM_KNOB_ALLOC,		/* an alloc fails INSIDE ft_merge_build */
+	RKM_KNOB_COMMIT,	/* the one commit aborts: everything built, nothing published */
+};
+
+static const char *rkm_knob_name(enum rkm_bail_knob k)
+{
+	switch (k) {
+	case RKM_KNOB_ALLOC:	return "alloc";
+	case RKM_KNOB_COMMIT:	return "commit";
+	default:		return "lock";
+	}
+}
+
+static int rekey_merge_bail_run(long n, enum rkm_bail_knob knob)
 {
 	struct cds_ft_group *group;
 	struct cds_ft *ft = create_fixed_fine_lock_listoff_ft(4, &group);
@@ -28676,6 +28697,7 @@ static int rekey_merge_bail_run(long n, bool alloc_fault)
 	uint64_t sub_key[2], sib_key[RK_NSIB], occ_key[2], dstl_key[2], post_key;
 	unsigned long before, after;
 	int i, rc = -1, drc;
+	bool fired = false;
 
 	sub_key[0] = ((uint64_t) RK_SX << 24) | ((uint64_t) RK_SY << 16) | (0x01ULL << 8);
 	sub_key[1] = ((uint64_t) RK_SX << 24) | ((uint64_t) RK_SY << 16) | (0x02ULL << 8);
@@ -28707,28 +28729,57 @@ static int rekey_merge_bail_run(long n, bool alloc_fault)
 	 * built cluster plus every fence the build had already taken: a strictly
 	 * longer unwind, and the one where a leak would live.
 	 */
-	if (alloc_fault)
+	switch (knob) {
+	case RKM_KNOB_ALLOC:
 		cds_ft_fault_alloc_countdown = n;
-	else
+		break;
+	case RKM_KNOB_COMMIT:
+		cds_ft_fault_commit_countdown = n;
+		break;
+	case RKM_KNOB_LOCK:
+	default:
 		cds_ft_fault_lock_countdown = n;
+		break;
+	}
 	drc = _cds_ft_debug_rekey_graft_simple(ft, src_key, 2, dst_key, 2);
+	fired = (knob == RKM_KNOB_COMMIT) && cds_ft_fault_commit_countdown < 0;
 	cds_ft_fault_lock_countdown = -1;
 	cds_ft_fault_alloc_countdown = -1;
+	cds_ft_fault_commit_countdown = -1;
+
+	/*
+	 * The COMMIT knob is a one-shot on a site the fold reaches exactly ONCE,
+	 * so n=0 fires and every larger n is the control: the merge must then
+	 * SUCCEED.  Checking that is what keeps the arm honest -- without it a
+	 * knob wired to the wrong site, or to nothing, reads as a clean sweep.
+	 */
+	if (knob == RKM_KNOB_COMMIT) {
+		if (fired && drc != -EAGAIN) {
+			fprintf(stderr, "merge-bail(commit) n=%ld: forced abort returned "
+				"rc=%d, expected -EAGAIN\n", n, drc);
+			goto out;
+		}
+		if (!fired && drc != 0) {
+			fprintf(stderr, "merge-bail(commit) n=%ld: unfaulted merge failed "
+				"rc=%d\n", n, drc);
+			goto out;
+		}
+	}
 
 	if (drc != 0 && drc != -EAGAIN && drc != -EIO && drc != -ENOMEM) {
-		fprintf(stderr, "merge-bail n=%ld: rc=%d (not transient)\n", n, drc);
+		fprintf(stderr, "merge-bail[%s] n=%ld: rc=%d (not transient)\n", rkm_knob_name(knob), n, drc);
 		goto out;
 	}
 	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
-		fprintf(stderr, "merge-bail n=%ld: verify failed (rc=%d)\n", n, drc);
+		fprintf(stderr, "merge-bail[%s] n=%ld: verify failed (rc=%d)\n", rkm_knob_name(knob), n, drc);
 		goto out;
 	}
 	rcu_read_lock();
 	after = cds_ft_count_entries(ft);
 	rcu_read_unlock();
 	if (after != before) {
-		fprintf(stderr, "merge-bail n=%ld: entries %lu != %lu (rc=%d) -- a "
-			"half-unwound merge lost a key\n", n, after, before, drc);
+		fprintf(stderr, "merge-bail[%s] n=%ld: entries %lu != %lu (rc=%d) -- a "
+			"half-unwound merge lost a key\n", rkm_knob_name(knob), n, after, before, drc);
 		goto out;
 	}
 	/* Mutate INTO the merged neighbourhood: a leaked COPYING is hit here. */
@@ -28736,23 +28787,24 @@ static int rekey_merge_bail_run(long n, bool alloc_fault)
 	rcu_read_lock();
 	if (insert_u64(ft, post_key, node_alloc(post_key)) != CDS_FT_STATUS_OK) {
 		rcu_read_unlock();
-		fprintf(stderr, "merge-bail n=%ld: trie REFUSES a mutation after the "
-			"bail -- a COPYING mark leaked (rc=%d)\n", n, drc);
+		fprintf(stderr, "merge-bail[%s] n=%ld: trie REFUSES a mutation after the "
+			"bail -- a COPYING mark leaked (rc=%d)\n", rkm_knob_name(knob), n, drc);
 		goto out;
 	}
 	rcu_read_unlock();
 	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
-		fprintf(stderr, "merge-bail n=%ld: verify failed after mutation\n", n);
+		fprintf(stderr, "merge-bail[%s] n=%ld: verify failed after mutation\n", rkm_knob_name(knob), n);
 		goto out;
 	}
 	rc = 0;
 	goto out;
 out_locked:
 	rcu_read_unlock();
-	fprintf(stderr, "merge-bail n=%ld: setup insert failed\n", n);
+	fprintf(stderr, "merge-bail[%s] n=%ld: setup insert failed\n", rkm_knob_name(knob), n);
 out:
 	cds_ft_fault_lock_countdown = -1;
 	cds_ft_fault_alloc_countdown = -1;
+	cds_ft_fault_commit_countdown = -1;
 	if (drain_and_destroy(ft, group) < 0)
 		rc = -1;
 	return rc;
@@ -28763,10 +28815,17 @@ static int test_fine_lock_rekey_merge_bail(void)
 	long n;
 
 	for (n = 0; n < 48; n++)
-		if (rekey_merge_bail_run(n, /*alloc_fault=*/ false) < 0)
+		if (rekey_merge_bail_run(n, RKM_KNOB_LOCK) < 0)
 			return -1;
 	for (n = 0; n < 48; n++)
-		if (rekey_merge_bail_run(n, /*alloc_fault=*/ true) < 0)
+		if (rekey_merge_bail_run(n, RKM_KNOB_ALLOC) < 0)
+			return -1;
+	/*
+	 * n=0 aborts the fold's one commit; n=1 is the control that must succeed.
+	 * Two runs is the whole sweep -- the site is reached once per merge.
+	 */
+	for (n = 0; n < 2; n++)
+		if (rekey_merge_bail_run(n, RKM_KNOB_COMMIT) < 0)
 			return -1;
 	return 0;
 }

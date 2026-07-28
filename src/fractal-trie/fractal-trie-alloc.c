@@ -1202,6 +1202,26 @@ long cds_ft_fault_flip_countdown = -1;
 long cds_ft_fault_lock_countdown = -1;
 
 /*
+ * Test-only FINAL-COMMIT abort injection for the coherent-rekey merge fold.
+ * Counts down over the fold's one commit and forces the (n+1)-th to abort,
+ * exactly as a peer that won a raced MW slot would.
+ *
+ * Why this knob has to exist, stated as a measurement rather than an argument:
+ * the shared-destination merge oracle contends the fold's acquires HARD -- over
+ * 71218 merges it took the publish-parent fence miss 62342 times, the overlap
+ * spine 89 and the commit_edges miss 1079 -- and took THIS exit 0 times.  Every
+ * acquire sits ahead of the commit, so a peer that could make the commit lose
+ * has already been turned away by one of them.  Real contention therefore does
+ * not reach the fold's LONGEST unwind: a fully built cluster, both glues, the
+ * src side's retires, and every fence still held.  Only injection does.
+ *
+ * It routes through the engine's own unpublished-discard path (@acquire_miss:
+ * age the handle, clear every registered COPYING, report ABORT), so the unwind
+ * under test is the real one and not a synthesised status.
+ */
+long cds_ft_fault_commit_countdown = -1;
+
+/*
  * Test-only REKEY-coherence second-walk fault injection
  * (automatic under the move gate).  Counts down over coherence checks -- the
  * point lookup's two descents and the relational two-pass, via
