@@ -1161,13 +1161,14 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 			 * glue build, destroy the txn.  (prepare failure freed its own
 			 * invisible build + left glue clean.)
 			 */
-			if (s_top_prime)		/* NULL on the merge path: no COW */
-			free_cds_ft_node_unpublished(ft, ft_node_ptr(s_top_prime));
+			if (s_top_prime)	/* NULL on the merge path: no COW */
+				free_cds_ft_node_unpublished(ft,
+					ft_node_ptr(s_top_prime));
 			ft_glue_abort(ft, &glue);
-			if (src_glue_live) {	/* merged cluster's src side */
-				ft_glue_abort(ft, &src_glue);
-				src_glue_live = false;
-			}
+	if (src_glue_live) {		/* merged cluster's src side */
+		ft_glue_abort(ft, &src_glue);
+		src_glue_live = false;
+	}
 			ft_flip_txn_destroy(txn);
 			ret = -EIO;
 			goto sweep;
@@ -1223,10 +1224,8 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 		 * graft's own attach node, hence already COPYING-held); the shape gate
 		 * now rejects that permanently, up front, before any of this is built.
 		 */
-		if (pp_meta)
-			ft_meta_copying_clear(pp_meta);	/* GLUE: still ours here */
+		pp_meta = NULL;		/* ft_glue_abort below is the single owner */
 		if (s_top_prime)		/* NULL on the merge path: no COW */
-		if (s_top_prime)
 			free_cds_ft_node_unpublished(ft, ft_node_ptr(s_top_prime));
 		if (gst_st.old_recompacted_node)
 			free_cds_ft_node_unpublished(ft, ft_node_ptr(gst_st.dest));
@@ -1287,10 +1286,10 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 		src_succ = ft_ord_cell_resolve_ord(&rlc->lnode.next);
 		if (src_pred == ft_ord_or_sentinel(ft, run_dpred) ||
 				src_succ == ft_ord_or_sentinel(ft, run_dsucc)) {
-			if (pp_meta)
-				ft_meta_copying_clear(pp_meta);	/* GLUE: still ours */
-			if (s_top_prime)		/* NULL on the merge path: no COW */
-			free_cds_ft_node_unpublished(ft, ft_node_ptr(s_top_prime));
+			pp_meta = NULL;		/* ft_glue_abort: single owner */
+			if (s_top_prime)	/* NULL on the merge path: no COW */
+				free_cds_ft_node_unpublished(ft,
+					ft_node_ptr(s_top_prime));
 			if (gst_st.old_recompacted_node)
 				free_cds_ft_node_unpublished(ft,
 					ft_node_ptr(gst_st.dest));
@@ -1355,16 +1354,25 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 		if (ft_glue_txn_commit_edges(ft, &glue, NULL, 0) !=
 				URCU_TXN_STATUS_OK) {
 			/*
-			 * @pp_meta is released HERE and not left to a label: this
-			 * exit is below bail_build, and sweep only walks @marks.
-			 * Reasoning "nothing else bails after this point" is what
-			 * leaked a fence the last time it was reasoned instead of
-			 * checked.
+			 * ☠ DO NOT release @pp_meta here.  An earlier version did,
+			 * reasoning that a failure could only come from the mark
+			 * acquire at the top of ft_glue_txn_commit_edges -- before
+			 * any record, so before ownership passes to the txn.  That
+			 * is an ARGUMENT about which failure happens, and under a
+			 * SHARED destination it is false: commit_edges also fails
+			 * AFTER routing the publish parent through the txn, which
+			 * NULLs g->publish_parent_holder and takes the fence with
+			 * it.  Clearing it then asserts on an unheld word.
+			 *
+			 * ft_glue_abort below is the choke point and already does
+			 * the right thing either way -- clear_IF_HELD, guarded on
+			 * the holder field the transfer NULLs.  Just disown it so
+			 * bail_build's own clear cannot double up.
 			 */
-			ft_meta_copying_clear(pp_meta);
 			pp_meta = NULL;
-			if (s_top_prime)		/* NULL on the merge path: no COW */
-			free_cds_ft_node_unpublished(ft, ft_node_ptr(s_top_prime));
+			if (s_top_prime)	/* NULL on the merge path: no COW */
+				free_cds_ft_node_unpublished(ft,
+					ft_node_ptr(s_top_prime));
 			if (detach_rc.new_flag)
 				free_cds_ft_node_unpublished(ft,
 					ft_node_ptr(detach_rc.new_flag));
@@ -1475,10 +1483,18 @@ bail_build:
 	 * fence (its single clear point).  @marks is swept below, as on every path.
 	 */
 	cds_ft_alloc_reserve_drain(ft, &reserve);
-	if (pp_meta)
-		ft_meta_copying_clear(pp_meta);
+	/*
+	 * The publish-parent fence has EXACTLY ONE owner on this path, and it is
+	 * ft_glue_abort below: @glue.publish_parent_holder is set in the same breath
+	 * as @pp_meta, ft_glue_abort clears it IF HELD, and the txn NULLs that field
+	 * when a record transfers ownership.  A second clear here was right only
+	 * while every bail above was known to still hold the fence -- under a SHARED
+	 * destination that stopped being true, and it asserted on an unheld word.
+	 * Disown and let the choke point do it.
+	 */
+	pp_meta = NULL;
 	if (s_top_prime)		/* NULL on the merge path: no COW */
-			free_cds_ft_node_unpublished(ft, ft_node_ptr(s_top_prime));
+		free_cds_ft_node_unpublished(ft, ft_node_ptr(s_top_prime));
 	ft_glue_abort(ft, &glue);
 			if (src_glue_live) {	/* merged cluster's src side */
 				ft_glue_abort(ft, &src_glue);
