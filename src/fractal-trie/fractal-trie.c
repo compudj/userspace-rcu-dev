@@ -911,6 +911,17 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 		 * so a missed fence is a clean re-descend and the fence is affordable.
 		 */
 		mctx.fence_overlap = ft->lock_fine;
+		/*
+		 * ★ And the SRC spine too, which the cross-trie merge does not need.
+		 * cds_ft_merge_at owns its source exclusively; THIS source is the live
+		 * in-trie subtree -- the detach is only RECORDED into the same txn, so
+		 * S_top and everything under it stays reachable to peers for the whole
+		 * build window.  Unfenced, a peer inserting below S_top during the copy
+		 * is retired along with the node it was inserted into: silent key loss
+		 * (ft_merge_lock_overlap's header states the mechanism for the dst side;
+		 * it is the same mechanism).
+		 */
+		mctx.fence_src = ft->lock_fine;
 		mctx.overlap_contended = false;
 		merged_nf = ft_merge_build(&mctx, s_top, 0, d_dst.nf, 0, 0,
 				&merged_keys);

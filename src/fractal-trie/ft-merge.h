@@ -87,6 +87,24 @@ struct ft_merge_ctx {
 	 */
 	bool fence_overlap;
 	/*
+	 * Fence each SRC overlap node too, and retire it through the fenced
+	 * terminal -- the mirror of @fence_overlap for the S side.
+	 *
+	 * A CROSS-TRIE merge does not need this: cds_ft_merge_at requires the src
+	 * exclusive, so no peer can touch S while the build copies it.  The
+	 * SAME-TRIE REKEY fold does: it RECORDS its detach into the same txn as
+	 * everything else, so its source is still LIVE and reader/writer-reachable
+	 * for the whole build window.  Without the fence, the hazard is the one
+	 * ft_merge_lock_overlap's header describes for the dst side -- a peer
+	 * inserting BELOW S in the copy window is invisible, the late expected-old
+	 * still matches, the commit succeeds and the peer's child is retired with
+	 * the node.  Silent key loss.
+	 *
+	 * Set by the caller when its source is live (the rekey fold); left false by
+	 * ft_merge_spine_copy.  See feedback_rekey_src_is_live_shared_helpers.
+	 */
+	bool fence_src;
+	/*
 	 * Set when a fence acquire MISSED: the build returns FT_MERGE_OOM like any
 	 * other failure (one sentinel, one caller unwind), but this distinguishes
 	 * CONTENTION from a real allocation failure so the caller can re-descend
@@ -371,6 +389,8 @@ struct cds_ft_inode_flag *ft_merge_build(struct ft_merge_ctx *c,
 #ifdef FEATURE_FT_MW_DLM_ACQUIRE
 	uintptr_t d_ov_snap = 0;	/* this frame's dst overlap fence snapshot */
 	bool d_ov_fenced = false;
+	uintptr_t s_ov_snap = 0;	/* and the src side's, when @fence_src */
+	bool s_ov_fenced = false;
 #endif
 
 	S = ft_resolve_skip_compressed(ft, S);
@@ -387,9 +407,35 @@ struct cds_ft_inode_flag *ft_merge_build(struct ft_merge_ctx *c,
 	 * shared-run recursion, but the node is freed whole.  src -> gs,
 	 * dst -> gd.  Internal overlap nodes are recorded at the tail instead.
 	 */
-	if (S_comp && off_s == 0)
-		ft_glue_defer_free(c->gs, cn_s, true);
 #ifdef FEATURE_FT_MW_DLM_ACQUIRE
+	/*
+	 * Plan-lock THIS FRAME's SRC overlap node, on exactly the terms the dst
+	 * block below states -- before any body read, and recording the retire in
+	 * the same breath as the mark so a frame that fails before its tail cannot
+	 * leave an unrecorded fence.  Only the rekey fold sets @fence_src; a
+	 * cross-trie merge owns its source exclusively and skips this.
+	 */
+	if (c->fence_src) {
+		void *snode = NULL;
+
+		if (S_comp) {
+			if (off_s == 0)
+				snode = cn_s;
+		} else if (!ft_node_external(S)) {
+			snode = ft_node_ptr(S);
+		}
+		if (snode) {
+			if (ft_merge_lock_overlap(snode, &s_ov_snap)) {
+				c->overlap_contended = true;
+				return FT_MERGE_OOM;
+			}
+			ft_glue_defer_free_fenced(c->gs, snode, S_comp,
+				s_ov_snap);
+			s_ov_fenced = true;
+		}
+	}
+	if (S_comp && off_s == 0 && !s_ov_fenced)
+		ft_glue_defer_free(c->gs, cn_s, true);
 	/*
 	 * Plan-lock THIS FRAME's dst overlap node BEFORE any body read below -- the
 	 * compressed prefix scan, the Pass-1 ft_node_get_nth_skip sweep, and the
@@ -438,6 +484,8 @@ struct cds_ft_inode_flag *ft_merge_build(struct ft_merge_ctx *c,
 	if (D_comp && off_d == 0 && !d_ov_fenced)
 		ft_glue_defer_free(c->gd, cn_d, true);
 #else
+	if (S_comp && off_s == 0)
+		ft_glue_defer_free(c->gs, cn_s, true);
 	if (D_comp && off_d == 0)
 		ft_glue_defer_free(c->gd, cn_d, true);
 #endif
@@ -658,7 +706,12 @@ struct cds_ft_inode_flag *ft_merge_build(struct ft_merge_ctx *c,
 	 * Reclaim the INTERNAL overlap nodes M copied (compressed ones were
 	 * recorded on entry above).  src -> gs, dst -> gd.
 	 */
-	if (!S_ext && !S_comp)
+	if (!S_ext && !S_comp
+#ifdef FEATURE_FT_MW_DLM_ACQUIRE
+			/* Already recorded at entry, together with its fence. */
+			&& !s_ov_fenced
+#endif
+	   )
 		ft_glue_defer_free(c->gs, ft_node_ptr(S), false);
 	if (!D_ext && !D_comp
 #ifdef FEATURE_FT_MW_DLM_ACQUIRE
@@ -1317,6 +1370,7 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	 * Skipped for the unfailable caller, which has no bail left to take.
 	 */
 	ctx.fence_overlap = dst_ft->lock_fine && !unfailable;
+	ctx.fence_src = false;		/* cross-trie: the source is exclusive */
 #endif
 	M = ft_merge_build(&ctx, S, off_src, D, off_dst, 0, &merged_keys);
 	if (M == FT_MERGE_OOM) {
