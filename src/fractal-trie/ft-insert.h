@@ -2943,12 +2943,24 @@ restart_attempt:
 			 * the append (ft_chain_node touches only last_node->next).
 			 * FT-wide lock makes the miss unreachable in soak (fault
 			 * injection drives the bail).
+			 *
+			 * @dup_head is a PUBLISHED head the descent just reached, so
+			 * it has a holder: ASSERT it rather than skipping the lock.
+			 * A NULL means a never-inserted node (prev NULL), produced
+			 * only by ft-insert's own unwind paths on UNPUBLISHED nodes,
+			 * which cannot be here.  The old tolerance silently appended
+			 * UNLOCKED, which the MW store's expected-value CAS still
+			 * arbitrated -- but once these become sw it is a LOST UPDATE,
+			 * so a wrong assumption must fail loudly now.  Measured
+			 * unreachable: 0 NULL in 491532 ft_chain_head_holder calls
+			 * across ft_unit and ft_inv's three list modes.
 			 */
 			if (ft->lock_fine) {
 				struct cds_ft_inode_flag *holder_flag =
 					ft_chain_head_holder(ft, dup_head);
 
-				if (holder_flag) {
+				assert(holder_flag);
+				{
 					struct cds_ft_metadata *hm =
 						ft_flag_to_metadata(ft, holder_flag);
 #ifdef FEATURE_FT_FAULT_INJECT
@@ -3905,12 +3917,19 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 			 * cds_ft_item_to_metadata).  Walk prev to the head's holder
 			 * exactly as the interior unchain does -- ft_unchain_node is
 			 * called with a NULL holder for this same case and derives
-			 * it the same way.  A NULL result means no lockable anchor;
-			 * proceed unlocked, as remove does.
+			 * it the same way.  
+			 *
+			 * @old_node is a PUBLISHED chain member here -- the removed
+			 * and never-inserted cases both returned NOT_FOUND above --
+			 * so it HAS a holder: ASSERT it rather than proceeding
+			 * unlocked.  Under sw an unlocked chain replace is a LOST
+			 * UPDATE, not the benign degradation the MW store's
+			 * expected-value CAS made it.  Measured unreachable: 0 NULL
+			 * in 491532 ft_chain_head_holder calls.
 			 */
-			lock_nf = ft->lock_fine ?
-				ft_chain_head_holder(ft, old_node) : NULL;
-			if (lock_nf) {
+			if (ft->lock_fine) {
+				lock_nf = ft_chain_head_holder(ft, old_node);
+				assert(lock_nf);
 				hm = ft_flag_to_metadata(ft, lock_nf);
 				if (ft_meta_copying_mark(hm, &hsnap)) {
 					new_node->next = NULL;

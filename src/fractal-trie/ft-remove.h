@@ -2903,7 +2903,19 @@ int ft_unchain_node(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 		struct cds_ft_inode_flag *lock_nf = parent_nf ? parent_nf :
 			ft_chain_head_holder(ft, node);
 
-		if (lock_nf) {
+		/*
+		 * @node is a PUBLISHED chain member being unchained, so it HAS a
+		 * holder -- ASSERT rather than fall through unlocked.  A NULL means
+		 * a never-inserted node (prev NULL), produced only by ft-insert's
+		 * unwind paths on UNPUBLISHED nodes, which never reach an unchain.
+		 * The old tolerance mutated the chain with NO exclusion, which the
+		 * MW store's expected-value CAS still arbitrated; once these become
+		 * sw it is a LOST UPDATE, so the assumption must fail loudly now.
+		 * Measured unreachable: 0 NULL in 491532 ft_chain_head_holder calls
+		 * across ft_unit and ft_inv's three list modes.
+		 */
+		assert(lock_nf);
+		{
 			struct cds_ft_metadata *lm = ft_flag_to_metadata(ft, lock_nf);
 #ifdef FEATURE_FT_FAULT_INJECT
 			if (cds_ft_fault_lock_countdown >= 0) {

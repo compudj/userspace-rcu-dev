@@ -5584,10 +5584,14 @@ void ft_glue_record_splice(struct ft_glue *g,
  * the same-key collision count -- 0 for the batch-staging workload, and bounded
  * by the smaller trie's key count otherwise.
  *
- * A NULL holder is skipped, as insert's duplicate append skips it: it means a
+ * A NULL holder is ASSERTED against, not skipped.  It would mean a
  * never-inserted head (prev NULL), whose only producers are ft-insert's unwind
- * paths on UNPUBLISHED nodes.  Both of ft_chain_head_holder's NULL branches
- * measured unreachable (0 in ~470k calls across three list modes).
+ * paths on UNPUBLISHED nodes -- and every @dst_head here was reached by the
+ * merge build walking LIVE dst structure.  Skipping would silently append with
+ * no exclusion, which is exactly the lost update this lock set exists to
+ * prevent once the chain stores become sw.  Both of ft_chain_head_holder's NULL
+ * branches measured unreachable: 0 in 491532 calls across ft_unit and ft_inv's
+ * three list modes.
  *
  * THE FENCES ARE DELIBERATELY NOT REGISTERED with the flip-txn.
  * FT_FLIP_TXN_MAX_COPYING (8) sizes the TXN-TRACKED fences of one recompact,
@@ -5615,8 +5619,7 @@ int ft_glue_acquire_splice_holders(struct cds_ft *ft, struct ft_glue *g)
 		struct cds_ft_metadata *hm;
 		bool held = false;
 
-		if (!hf)
-			continue;
+		assert(hf);
 		hm = ft_flag_to_metadata(ft, hf);
 		for (j = 0; j < i; j++) {
 			if (g->splices[j].holder == hm) {
