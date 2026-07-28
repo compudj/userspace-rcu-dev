@@ -898,6 +898,21 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 		ft_glue_set_publish(ft, &glue, d_dst.pnf, d_dst.nfp, merged_nf);
 		glue.attached_nf = merged_nf;
 		glue.count_delta = (long) cnt;
+		/*
+		 * COLLIDED KEYS: a full key present on BOTH sides makes ft_merge_build
+		 * splice the src leaf onto the dst head's DUPLICATE CHAIN.  That append
+		 * walks a LIVE chain, so it runs under the chain holder's COPYING lock --
+		 * the exclusion @cc91bd8b added when it closed the last unlocked chain
+		 * mutation.  ft_merge_spine_copy takes it before its own point of no
+		 * return and SKIPS it for a pre-reserved caller, whose placement cannot
+		 * fail; this fold is the case its comment anticipated -- a single commit
+		 * still ahead of us, so failing here is free and the lock is ours to take.
+		 * No-op on a collision-free merge, which is every disjoint union.
+		 */
+		if (ft_glue_acquire_splice_holders(ft, &glue)) {
+			ret = -EAGAIN;
+			goto bail_build;
+		}
 		attached_nf = merged_nf;
 		adepth = (unsigned int) dst_len;
 		prep = FT_GRAFT_PREP_NOSPLIT;	/* not a graft; keeps the arms below off */
@@ -1023,6 +1038,7 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 			 */
 			(merge_dst ? 3 * (unsigned int) (mcnt.nd + 8) +
 				(unsigned int) (mcnt.nf_dst + mcnt.nf_src + 16) + 8 +
+				(unsigned int) (mcnt.ns + 8) +	/* dup-chain splices */
 				(ft->rank_stats ? (unsigned int) dst_len + 1 : 0) : 0) +
 			(prep == FT_GRAFT_PREP_GLUE ?
 				FT_GLUE_FLOOR_DEFERRED + 7 + 1 + FT_GLUE_FLOOR_FREE +
@@ -1346,6 +1362,14 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 		 */
 		if (src_glue_live)
 			ft_glue_tombstone_free_list(&src_glue);
+		/*
+		 * The dup-chain appends, recorded (not stored) so the src duplicates
+		 * become reachable ATOMICALLY with the merged structure -- a collided
+		 * key never momentarily shows only its dst side.  After the cluster's
+		 * edges, exactly as ft_merge_spine_copy orders it.
+		 */
+		if (merge_dst)
+			ft_glue_record_splices(ft, &glue, txn);
 	}
 
 	/* 4. ONE commit of the whole stitch (consumes txn). */
@@ -1361,6 +1385,13 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 		 */
 		if (src_glue_live)
 			ft_glue_free_old(ft, &src_glue);
+		/*
+		 * Chain holders are NOT in the txn registry, so the commit does not
+		 * consume them: release them here, the committed path's own point.
+		 * Every non-committed path reaches ft_glue_abort, which owns the same
+		 * release -- the choke point, not the exits that happen to be visible.
+		 */
+		ft_glue_release_splice_holders(&glue);
 		/*
 		 * The reserve recompaction's relocated old dst-parent copy: its retire
 		 * committed with the flip (deferred past readers via the recompact's

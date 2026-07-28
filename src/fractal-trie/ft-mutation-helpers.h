@@ -5218,10 +5218,24 @@ static
 struct cds_ft_metadata *ft_glue_reparent_park_meta(struct cds_ft *ft,
 		struct cds_ft_inode_flag *child_nf)
 {
-	if (!child_nf || ft_node_flip_proxy(child_nf) ||
-			ft_node_external(child_nf))
+	if (!child_nf || ft_node_flip_proxy(child_nf))
 		return NULL;
 #ifdef FEATURE_FT_SKIP_COMPRESSED
+	/*
+	 * ☠ SKIP BEFORE EXTERNAL, and the order is the whole correctness of this
+	 * function.  A skip pointer whose target is an external leaf has low tag
+	 * bits == 0, so ft_node_external MATCHES it on the raw value -- the trap
+	 * ft_set_parent and ft_reparent_record both call out and both order around.
+	 * Testing external first therefore reports "no state word" for a node that
+	 * has one, its mark is never taken, and the commit SW-parks that word
+	 * unheld: the clobber this whole acquire exists to prevent.
+	 *
+	 * Measured, because it got this wrong first: with external tested first the
+	 * occupied-dst merge oracle found ZERO mark candidates over 4126 merges,
+	 * while the empty-dst oracle found 1883 -- the merge's children are
+	 * skip-compressed onto leaves, the graft's are plain internals, so only a
+	 * COLLIDING/merge shape exposes it.
+	 */
 	if (ft_node_skip_compressed(child_nf))
 		return cds_ft_item_to_metadata((struct cds_ft_inode *)
 			ft_skip_to_compressed(ft, child_nf));
@@ -5229,6 +5243,8 @@ struct cds_ft_metadata *ft_glue_reparent_park_meta(struct cds_ft *ft,
 		return cds_ft_item_to_metadata((struct cds_ft_inode *)
 			ft_compressed_node_ptr(child_nf));
 #endif
+	if (ft_node_external(child_nf))
+		return NULL;
 	(void) ft;
 	return cds_ft_item_to_metadata(ft_node_ptr(child_nf));
 }

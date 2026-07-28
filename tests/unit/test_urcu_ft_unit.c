@@ -50,7 +50,7 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_MW_DLM_ACQUIRE
-#define NR_TESTS_DLM 6		/* cow_stop_root_inplace, rekey_graft_{simple,liston,cross_junction,glue_dst}, rekey_merge_occupied_dst */
+#define NR_TESTS_DLM 7		/* cow_stop_root_inplace, rekey_graft_{simple,liston,cross_junction,glue_dst}, rekey_merge_{occupied,collide}_dst */
 #else
 #define NR_TESTS_DLM 0
 #endif
@@ -1073,6 +1073,122 @@ static int test_rekey_merge_occupied_dst(void)
 out_locked:
 	rcu_read_unlock();
 	fprintf(stderr, "rekey-merge: setup insert failed\n");
+out:
+	if (drain_and_destroy(ft, group) < 0)
+		rc = -1;
+	return rc;
+}
+
+/*
+ * INCREMENT 3, the COLLIDING union: a moved key lands on a key already at the
+ * destination, so ft_merge_build takes its leaf-splice arm and appends the src
+ * leaf to the dst head's DUPLICATE CHAIN.
+ *
+ * This is a different lock set, not just a different shape.  A chain append is a
+ * mutation of a LIVE list hanging off the destination node, and @cc91bd8b made
+ * the cross-trie merge take the chain holder's COPYING lock for exactly that
+ * reason -- it was "the last unlocked chain mutation".  That acquire lives in
+ * ft_merge_spine_copy; the fold calls ft_merge_build directly, so this test is
+ * what says whether the fold inherits the lock or silently drops it.
+ *
+ * Both keys must survive as a chain of two: a splice that dropped either end
+ * still leaves a verifiable trie, so counting the chain is the check.
+ */
+static int test_rekey_merge_collide_dst(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_fine_lock_listoff_ft(4, &group);
+	uint8_t src_key[2] = { RK_SX, RK_SY }, dst_key[2] = { RK_DX, RK_DZ };
+	uint64_t sub_key[2], sib_key[RK_NSIB], occ_key[2], dstl_key[2];
+	unsigned long cnt_before, cnt_after;
+	int i, rc = -1;
+
+	/*
+	 * The COLLIDING pair: mover (SX,SY,1,0) rekeys to (DX,DZ,1,0), which the
+	 * occupant already holds.  The second mover/occupant bytes stay disjoint so
+	 * the union still has a non-colliding child too.
+	 */
+	sub_key[0] = ((uint64_t) RK_SX << 24) | ((uint64_t) RK_SY << 16) |
+		((uint64_t) 0x01 << 8);
+	sub_key[1] = ((uint64_t) RK_SX << 24) | ((uint64_t) RK_SY << 16) |
+		((uint64_t) 0x02 << 8);
+	occ_key[0] = ((uint64_t) RK_DX << 24) | ((uint64_t) RK_DZ << 16) |
+		((uint64_t) 0x01 << 8);		/* <-- collides with sub_key[0] */
+	occ_key[1] = ((uint64_t) RK_DX << 24) | ((uint64_t) RK_DZ << 16) |
+		((uint64_t) 0x07 << 8);
+	for (i = 0; i < RK_NSIB; i++)
+		sib_key[i] = ((uint64_t) RK_SX << 24) | ((uint64_t) (i + 5) << 16);
+	dstl_key[0] = ((uint64_t) RK_DX << 24) | ((uint64_t) 0x01 << 16);
+	dstl_key[1] = ((uint64_t) RK_DX << 24) | ((uint64_t) 0x02 << 16);
+
+	rcu_read_lock();
+	for (i = 0; i < 2; i++)
+		if (insert_u64(ft, sub_key[i], node_alloc(sub_key[i])) !=
+					CDS_FT_STATUS_OK ||
+				insert_u64(ft, occ_key[i], node_alloc(occ_key[i])) !=
+					CDS_FT_STATUS_OK)
+			goto out_locked;
+	for (i = 0; i < RK_NSIB; i++)
+		if (insert_u64(ft, sib_key[i], node_alloc(sib_key[i])) !=
+				CDS_FT_STATUS_OK)
+			goto out_locked;
+	for (i = 0; i < 2; i++)
+		if (insert_u64(ft, dstl_key[i], node_alloc(dstl_key[i])) !=
+				CDS_FT_STATUS_OK)
+			goto out_locked;
+	/*
+	 * ENTRIES, not keys.  A collision merges two DISTINCT keys into one key
+	 * with a two-node chain, so cds_ft_count_keys legitimately DROPS by one and
+	 * would hide a lost chain end behind an expected decrease.  The external
+	 * node count is what must be conserved.
+	 */
+	cnt_before = cds_ft_count_entries(ft);
+	rcu_read_unlock();
+
+	rc = _cds_ft_debug_rekey_graft_simple(ft, src_key, 2, dst_key, 2);
+	if (rc != 0) {
+		fprintf(stderr, "rekey-collide: driver rc=%d\n", rc);
+		rc = -1;
+		goto out;
+	}
+	rc = -1;
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "rekey-collide: verify failed after the union\n");
+		goto out;
+	}
+	rcu_read_lock();
+	cnt_after = cds_ft_count_entries(ft);
+	rcu_read_unlock();
+	if (cnt_after != cnt_before) {
+		fprintf(stderr, "rekey-collide: entry count %lu != %lu -- a chain end "
+			"was dropped by the splice\n", cnt_after, cnt_before);
+		goto out;
+	}
+	/* The collided key must now be a chain of TWO; the other three singletons. */
+	{
+		unsigned long n = 0;
+		struct cds_ft_node *head = NULL;
+
+		rcu_read_lock();
+		if (lookup_u64(ft, occ_key[0], &head) != CDS_FT_STATUS_OK || !head) {
+			rcu_read_unlock();
+			fprintf(stderr, "rekey-collide: collided key absent\n");
+			goto out;
+		}
+		cds_ft_for_each_duplicate_rcu(head)
+			n++;
+		rcu_read_unlock();
+		if (n != 2) {
+			fprintf(stderr, "rekey-collide: collided key has %lu entries, "
+				"expected a chain of 2\n", n);
+			goto out;
+		}
+	}
+	rc = 0;
+	goto out;
+out_locked:
+	rcu_read_unlock();
+	fprintf(stderr, "rekey-collide: setup insert failed\n");
 out:
 	if (drain_and_destroy(ft, group) < 0)
 		rc = -1;
@@ -29177,6 +29293,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_cow_stop_root_inplace);
 	RUN_TEST(test_rekey_graft_simple);
 	RUN_TEST(test_rekey_merge_occupied_dst);
+	RUN_TEST(test_rekey_merge_collide_dst);
 	RUN_TEST(test_rekey_graft_liston);
 	RUN_TEST(test_rekey_graft_cross_junction);
 	RUN_TEST(test_rekey_graft_glue_dst);

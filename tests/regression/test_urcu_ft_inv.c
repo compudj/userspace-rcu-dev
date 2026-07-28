@@ -1505,6 +1505,16 @@ static int inv_rekey_graft_disjoint(void)
  */
 #define RKM_NW		8		/* writers, all contending root */
 #define RKM_SB		3		/* S_top slot byte inside both junctions */
+/*
+ * Byte-2 layout.  Mover 1 lands EXACTLY on resident 0, so every merge splices a
+ * duplicate chain as well as unioning a disjoint child -- the leaf-splice arm and
+ * the chain-holder lock it needs, under contention.  Mover 0 stays disjoint so a
+ * single move covers both.
+ */
+#define RKM_MV0		1
+#define RKM_MV1		5		/* == RKM_RES0: the COLLIDING pair */
+#define RKM_RES0	5
+#define RKM_RES1	6
 
 struct rkm_writer_arg {
 	struct cds_ft *ft;
@@ -1521,6 +1531,43 @@ static uint64_t rkm_key(uint8_t x, uint8_t b1, uint8_t b2)
 	return ((uint64_t) x << 24) | ((uint64_t) b1 << 16) |
 		((uint64_t) b2 << 8);
 }
+
+/*
+ * Remove the entry at @v that is NOT @keep, reclaiming it.  The collided key is a
+ * chain of two and only the MOVER may be taken back -- a plain remove would take
+ * whichever end the lookup lands on and could silently evict the resident, which
+ * is the very thing this oracle checks for.
+ */
+static enum cds_ft_status rkm_remove_dup_other(struct cds_ft *ft, uint64_t v,
+		struct cds_ft_node *keep)
+{
+	struct cds_ft_iter *iter = NULL;
+	struct cds_ft_node *head, *n;
+	enum cds_ft_status st = CDS_FT_STATUS_NOT_FOUND;
+	uint8_t k[8] = { 0 };
+
+	if (cds_ft_iter_create(ft, &iter) < 0)
+		abort();
+	rcu_read_lock();
+	cds_ft_u64_to_key(ft, v, k, CDS_FT_LEN_DEFAULT);
+	cds_ft_iter_set_key(iter, k, CDS_FT_LEN_DEFAULT);
+	cds_ft_lookup(ft, iter);
+	head = cds_ft_iter_node(iter);
+	for (n = head; n; n = cds_ft_node_next_rcu(n)) {
+		if (n == keep)
+			continue;
+		st = cds_ft_remove(ft, iter, n);
+		if (st == CDS_FT_STATUS_OK)
+			node_free_rcu(to_test_node(n));
+		break;
+	}
+	rcu_read_unlock();
+	cds_ft_iter_destroy(iter);
+	return st;
+}
+
+static const uint8_t rkm_mv[2] = { RKM_MV0, RKM_MV1 };
+static const uint8_t rkm_res[2] = { RKM_RES0, RKM_RES1 };
 
 static void *rkm_writer(void *arg)
 {
@@ -1544,8 +1591,7 @@ static void *rkm_writer(void *arg)
 		if (!w->seeded) {
 			rcu_read_lock();
 			for (c = 0; c < 2; c++) {
-				uint64_t mk = rkm_key(w->bp, RKM_SB,
-						(uint8_t) (c + 1));
+				uint64_t mk = rkm_key(w->bp, RKM_SB, rkm_mv[c]);
 
 				if (insert_u64(w->ft, mk, node_alloc(mk)) !=
 						CDS_FT_STATUS_OK) {
@@ -1574,11 +1620,10 @@ static void *rkm_writer(void *arg)
 			 */
 			rcu_read_lock();
 			for (c = 0; c < 2; c++) {
-				struct cds_ft_node *f = NULL;
-				uint64_t moved = rkm_key(w->dp, RKM_SB,
-						(uint8_t) (c + 1));
-				uint64_t resid = rkm_key(w->dp, RKM_SB,
-						(uint8_t) (c + 5));
+				struct cds_ft_node *f = NULL, *n;
+				uint64_t moved = rkm_key(w->dp, RKM_SB, rkm_mv[c]);
+				uint64_t resid = rkm_key(w->dp, RKM_SB, rkm_res[c]);
+				unsigned long chain = 0;
 
 				if (lookup_u64(w->ft, moved, &f) != CDS_FT_STATUS_OK) {
 					rcu_read_unlock();
@@ -1589,11 +1634,29 @@ static void *rkm_writer(void *arg)
 					mw_violation_snapshot();
 					goto out;
 				}
-				if (lookup_u64(w->ft, resid, &f) != CDS_FT_STATUS_OK ||
-						f != &w->res[c]->node) {
+				if (lookup_u64(w->ft, resid, &f) != CDS_FT_STATUS_OK) {
 					rcu_read_unlock();
 					fprintf(stderr, "rkm_writer bp=%u dp=%u: RESIDENT "
 						"key %d lost to the union\n",
+						w->bp, w->dp, c);
+					w->failed = 1;
+					mw_violation_snapshot();
+					goto out;
+				}
+				/*
+				 * The resident must still be ON the chain -- a splice
+				 * that replaced it rather than appending leaves a
+				 * perfectly valid single-entry key behind.
+				 */
+				for (n = f; n; n = cds_ft_node_next_rcu(n)) {
+					chain++;
+					if (n == &w->res[c]->node)
+						break;
+				}
+				if (!n) {
+					rcu_read_unlock();
+					fprintf(stderr, "rkm_writer bp=%u dp=%u: resident "
+						"%d not on its chain after the splice\n",
 						w->bp, w->dp, c);
 					w->failed = 1;
 					mw_violation_snapshot();
@@ -1603,10 +1666,19 @@ static void *rkm_writer(void *arg)
 			rcu_read_unlock();
 			/* Remove only the relocated movers; residents stay. */
 			for (c = 0; c < 2; c++) {
-				uint64_t moved = rkm_key(w->dp, RKM_SB,
-						(uint8_t) (c + 1));
+				uint64_t moved = rkm_key(w->dp, RKM_SB, rkm_mv[c]);
+				enum cds_ft_status rst;
 
-				if (remove_u64(w->ft, moved) != CDS_FT_STATUS_OK) {
+				/*
+				 * Mover 1 shares its key with resident 0, so take the
+				 * entry that is NOT the resident; mover 0 is a
+				 * singleton and a plain remove is exact.
+				 */
+				rst = (rkm_mv[c] == RKM_RES0 || rkm_mv[c] == RKM_RES1) ?
+					rkm_remove_dup_other(w->ft, moved,
+						&w->res[rkm_mv[c] == RKM_RES0 ? 0 : 1]->node) :
+					remove_u64(w->ft, moved);
+				if (rst != CDS_FT_STATUS_OK) {
 					fprintf(stderr, "rkm_writer bp=%u: cleanup "
 						"remove failed\n", w->bp);
 					w->failed = 1;
@@ -1675,7 +1747,7 @@ static int inv_rekey_merge_occupied_dst(void)
 				abort();
 		}
 		for (c = 0; c < 2; c++) {	/* residents: keep the dst OCCUPIED */
-			uint64_t rk = rkm_key(dp, RKM_SB, (uint8_t) (c + 5));
+			uint64_t rk = rkm_key(dp, RKM_SB, rkm_res[c]);
 
 			w[i].res[c] = node_alloc(rk);
 			if (insert_u64(ft, rk, w[i].res[c]) != CDS_FT_STATUS_OK)
@@ -1709,8 +1781,7 @@ static int inv_rekey_merge_occupied_dst(void)
 		if (!w[i].seeded)
 			continue;
 		for (c = 0; c < 2; c++)
-			(void) remove_u64(ft, rkm_key(w[i].bp, RKM_SB,
-					(uint8_t) (c + 1)));
+			(void) remove_u64(ft, rkm_key(w[i].bp, RKM_SB, rkm_mv[c]));
 		w[i].seeded = 0;
 	}
 
@@ -1744,7 +1815,7 @@ static int inv_rekey_merge_occupied_dst(void)
 		}
 		for (c = 0; c < 2; c++) {	/* residents survived every union */
 			struct cds_ft_node *f = NULL;
-			uint64_t rk = rkm_key(w[i].dp, RKM_SB, (uint8_t) (c + 5));
+			uint64_t rk = rkm_key(w[i].dp, RKM_SB, rkm_res[c]);
 
 			if (lookup_u64(ft, rk, &f) != CDS_FT_STATUS_OK ||
 					f != &w[i].res[c]->node) {
