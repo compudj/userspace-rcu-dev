@@ -5725,13 +5725,15 @@ void ft_glue_apply_deferred(struct cds_ft *ft, struct ft_glue *g)
 			 * Measured over the occupied-dst merge, the only shape reaching a
 			 * skip child here: 4 of 4 consistent, 0 stale.
 			 *
-			 * NOT YET COVERED: no CONCURRENT test reaches this -- 0 skip edges
-			 * across the whole FT_INV_MW plan, whose oracles all move into an
-			 * EMPTY dst.  A peer staling the flag between this resolution and
-			 * the flip is excluded only by the argument that re-homing the
-			 * compressed node's child means restructuring the node whose
-			 * COPYING this op holds.  That is an argument, not a measurement;
-			 * an occupied-dst oracle is what would close it.
+			 * CONCURRENTLY COVERED, and it was not until an oracle existed
+			 * for it: inv_rekey_merge_occupied_dst drives 8 writers merging
+			 * into permanently-occupied destinations and reaches this arm
+			 * 8548 times per run -- 8548 consistent, 0 stale.  Before it,
+			 * the whole FT_INV_MW plan reached this arm ZERO times (every
+			 * other oracle moves into an EMPTY dst), so "a peer cannot stale
+			 * the flag between this resolution and the flip" rested on an
+			 * argument about holding the compressed node's COPYING.  It now
+			 * rests on the assert below firing 0 times under contention.
 			 */
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 			if (g->deferred[i].child &&

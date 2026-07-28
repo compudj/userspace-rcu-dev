@@ -68,7 +68,7 @@
 #include "tap.h"
 
 #ifdef FEATURE_FT_MW_DLM_ACQUIRE
-#define NR_TESTS_REKEY_DLM	6	/* inv_rekey_graft_{disjoint,cross_junction,glue_dst,coherent_readers,shared}, inv_rekey_linearizability */
+#define NR_TESTS_REKEY_DLM	7	/* inv_rekey_graft_{disjoint,cross_junction,glue_dst,coherent_readers,shared}, inv_rekey_linearizability, inv_rekey_merge_occupied_dst */
 #else
 #define NR_TESTS_REKEY_DLM	0
 #endif
@@ -509,6 +509,60 @@ static struct cds_ft *create_fixed_fine_lock_ft(size_t klen,
 		abort();
 	if (cds_ft_group_attr_set_writer_strategy(attr,
 			CDS_FT_WRITER_LOCK_FINE) < 0)
+		abort();
+	if (cds_ft_group_create(attr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &ft) < 0)
+		abort();
+	*group_out = group;
+	return ft;
+}
+
+/*
+ * Remove the key @v and reclaim its node.  Own read section + own iterator, so
+ * it is safe to call from a writer that holds no other FT state.  Returns the
+ * remove status, or NOT_FOUND when the key is absent.
+ */
+static enum cds_ft_status remove_u64(struct cds_ft *ft, uint64_t v)
+{
+	struct cds_ft_iter *iter = NULL;
+	struct cds_ft_node *found;
+	enum cds_ft_status st = CDS_FT_STATUS_NOT_FOUND;
+	uint8_t k[8] = { 0 };
+
+	if (cds_ft_iter_create(ft, &iter) < 0)
+		abort();
+	rcu_read_lock();
+	cds_ft_u64_to_key(ft, v, k, CDS_FT_LEN_DEFAULT);
+	cds_ft_iter_set_key(iter, k, CDS_FT_LEN_DEFAULT);
+	cds_ft_lookup(ft, iter);
+	found = cds_ft_iter_node(iter);
+	if (found) {
+		st = cds_ft_remove(ft, iter, found);
+		if (st == CDS_FT_STATUS_OK)
+			node_free_rcu(to_test_node(found));
+	}
+	rcu_read_unlock();
+	cds_ft_iter_destroy(iter);
+	return st;
+}
+
+static struct cds_ft *create_fixed_fine_lock_listoff_ft(size_t klen,
+		struct cds_ft_group **group_out)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+
+	if (cds_ft_group_attr_create(&attr) < 0)
+		abort();
+	if (cds_ft_group_attr_set_key_len(attr, klen) < 0)
+		abort();
+	if (cds_ft_group_attr_set_writer_strategy(attr,
+			CDS_FT_WRITER_LOCK_FINE) < 0)
+		abort();
+	if (cds_ft_group_attr_set_ordered_list(attr, false) < 0)
 		abort();
 	if (cds_ft_group_create(attr, &group) < 0)
 		abort();
@@ -1397,6 +1451,322 @@ static int inv_rekey_graft_disjoint(void)
 	}
 	fprintf(stderr, "# inv_rekey_graft_disjoint: %d writers, %lu moves, "
 		"%lu retries, %lu live keys\n", RK_NW, total_ops, total_retries,
+		live);
+
+	free(w);
+	if (drain_and_destroy(ft, group) < 0)
+		ret = -1;
+	if (leak_check() < 0)
+		ret = -1;
+	return ret;
+}
+
+/*
+ * OCCUPIED-DESTINATION rekey oracle -- the ONLY concurrent coverage of the merge
+ * fold, and it exists because there was none.
+ *
+ * Every other rekey oracle moves a subtree into an EMPTY destination, which is
+ * the GRAFT path.  Measured across the whole FT_INV_MW plan, the merge fold's
+ * distinctive edge class (skip-compressed src-origin re-parents) was reached
+ * ZERO times, so the record-time resolution those edges depend on was validated
+ * single-threaded only, and "a peer cannot stale a skip flag between the
+ * resolution and the flip" rested on an argument rather than a measurement.
+ * This oracle is what turns that into evidence.
+ *
+ * ★ WHY IT RE-SEEDS INSTEAD OF SHUTTLING.  A merge EMPTIES its source, so the
+ * back-and-forth the other oracles use degenerates after ONE move: the second
+ * direction finds an empty destination and takes the graft path forever.  Each
+ * iteration therefore SEEDS the source afresh, moves it into a destination that
+ * is permanently occupied by RESIDENT keys, and removes only the relocated
+ * movers -- leaving the residents in place so the next move is a merge too.
+ *
+ * Per writer w, two root-child junctions bp=2w+1, dp=2w+2 (disjoint across
+ * writers, so no writer re-homes a peer's junction; they all still contend
+ * ROOT's COPYING, which is the contention this exercises):
+ *   (bp,1) (bp,5) (dp,1) (dp,5)   straddling sibs, keep both junctions >= 3
+ *                                 children so the detach stays an in-place delete
+ *   (dp,3,5) (dp,3,6)             RESIDENTS -- never move, keep the dst OCCUPIED
+ *   (bp,3,1) (bp,3,2)             MOVERS -- seeded, merged to (dp,3,*), removed
+ * A lone key under (X,3,c) path-compresses, so S_top's children are compressed:
+ * that is what makes the moved re-parents SKIP-COMPRESSED, the class this oracle
+ * is for.  The mover and resident byte-2 values are disjoint, so the union at the
+ * top frame adds children rather than colliding (dup-chain collisions are a
+ * separate shape, not covered here).
+ *
+ * THE ORACLE, checked after EVERY successful move and not only at quiescence:
+ * all four keys must be present under dp.  A merge that dropped the destination's
+ * own keys -- the exact failure the occupied-dst path risks, and one that leaves
+ * the trie perfectly VERIFIABLE -- is invisible to cds_ft_verify and to a key
+ * count taken at rest, because the residents are re-checked only where they
+ * should be.  Losing them here fails immediately.
+ *
+ * -EINVAL is FATAL: this layout satisfies every documented shape gate, so a
+ * permanent shape rejection is a real defect, not a race.  Opt-in FT_INV_MW=1.
+ */
+#define RKM_NW		8		/* writers, all contending root */
+#define RKM_SB		3		/* S_top slot byte inside both junctions */
+
+struct rkm_writer_arg {
+	struct cds_ft *ft;
+	uint8_t bp, dp;
+	struct ft_test_node *sib[4];	/* (bp,1)(bp,5)(dp,1)(dp,5) */
+	struct ft_test_node *res[2];	/* residents (dp,3,5)(dp,3,6) */
+	int seeded;			/* movers currently live at (bp,3,*) */
+	unsigned long ops, retries;
+	int failed;
+};
+
+static uint64_t rkm_key(uint8_t x, uint8_t b1, uint8_t b2)
+{
+	return ((uint64_t) x << 24) | ((uint64_t) b1 << 16) |
+		((uint64_t) b2 << 8);
+}
+
+static void *rkm_writer(void *arg)
+{
+	struct rkm_writer_arg *w = (struct rkm_writer_arg *) arg;
+	uint8_t src_key[2] = { 0, RKM_SB }, dst_key[2] = { 0, RKM_SB };
+	unsigned long iters = 0;
+	int c;
+
+	src_key[0] = w->bp;
+	dst_key[0] = w->dp;
+
+	rcu_register_thread();
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	while (!test_stop) {
+		int rc;
+
+		/* SEED the source: two lone deep keys -> compressed children. */
+		if (!w->seeded) {
+			rcu_read_lock();
+			for (c = 0; c < 2; c++) {
+				uint64_t mk = rkm_key(w->bp, RKM_SB,
+						(uint8_t) (c + 1));
+
+				if (insert_u64(w->ft, mk, node_alloc(mk)) !=
+						CDS_FT_STATUS_OK) {
+					rcu_read_unlock();
+					fprintf(stderr, "rkm_writer bp=%u: seed "
+						"insert failed\n", w->bp);
+					w->failed = 1;
+					goto out;
+				}
+			}
+			rcu_read_unlock();
+			w->seeded = 1;
+		}
+
+		/*
+		 * NO read lock: the move enters the per-trie MOVE GATE, which waits
+		 * a grace period -- holding a read section across it self-deadlocks.
+		 */
+		rc = _cds_ft_debug_rekey_graft_simple(w->ft, src_key, 2, dst_key, 2);
+		if (rc == 0) {
+			w->ops++;
+			/*
+			 * The union must hold BOTH sides.  Losing the residents is
+			 * the occupied-dst failure that a verify pass and a rest-time
+			 * count both sail straight past.
+			 */
+			rcu_read_lock();
+			for (c = 0; c < 2; c++) {
+				struct cds_ft_node *f = NULL;
+				uint64_t moved = rkm_key(w->dp, RKM_SB,
+						(uint8_t) (c + 1));
+				uint64_t resid = rkm_key(w->dp, RKM_SB,
+						(uint8_t) (c + 5));
+
+				if (lookup_u64(w->ft, moved, &f) != CDS_FT_STATUS_OK) {
+					rcu_read_unlock();
+					fprintf(stderr, "rkm_writer bp=%u dp=%u: moved "
+						"key %d absent after merge\n",
+						w->bp, w->dp, c);
+					w->failed = 1;
+					mw_violation_snapshot();
+					goto out;
+				}
+				if (lookup_u64(w->ft, resid, &f) != CDS_FT_STATUS_OK ||
+						f != &w->res[c]->node) {
+					rcu_read_unlock();
+					fprintf(stderr, "rkm_writer bp=%u dp=%u: RESIDENT "
+						"key %d lost to the union\n",
+						w->bp, w->dp, c);
+					w->failed = 1;
+					mw_violation_snapshot();
+					goto out;
+				}
+			}
+			rcu_read_unlock();
+			/* Remove only the relocated movers; residents stay. */
+			for (c = 0; c < 2; c++) {
+				uint64_t moved = rkm_key(w->dp, RKM_SB,
+						(uint8_t) (c + 1));
+
+				if (remove_u64(w->ft, moved) != CDS_FT_STATUS_OK) {
+					fprintf(stderr, "rkm_writer bp=%u: cleanup "
+						"remove failed\n", w->bp);
+					w->failed = 1;
+					goto out;
+				}
+			}
+			w->seeded = 0;
+		} else if (rc == -EAGAIN || rc == -EIO || rc == -ENOMEM) {
+			/* Transient: trie pristine, movers still at src -- retry. */
+			w->retries++;
+		} else {
+			fprintf(stderr, "rkm_writer bp=%u dp=%u: merge-move failed "
+				"rc=%d\n", w->bp, w->dp, rc);
+			w->failed = 1;
+			mw_violation_snapshot();
+			goto out;
+		}
+		if ((++iters & 0xff) == 0)
+			rcu_quiescent_state();
+	}
+out:
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static int inv_rekey_merge_occupied_dst(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	struct rkm_writer_arg *w;
+	pthread_t writers[RKM_NW];
+	struct timespec t0;
+	unsigned long total_ops = 0, total_retries = 0, live = 0;
+	int i, c, ret = 0;
+
+	if (!getenv("FT_INV_MW")) {
+		fprintf(stderr, "# inv_rekey_merge_occupied_dst: skipped "
+			"(set FT_INV_MW=1 to run the occupied-dst merge oracle)\n");
+		return 0;
+	}
+	mw_install_fatal_handler();
+	leak_reset();
+
+	/* LIST OFF: the merge fold refuses list-on (the ordered interleave is
+	 * per-key ms_edges machinery, not this driver's contiguous run move). */
+	ft = create_fixed_fine_lock_listoff_ft(4, &group);
+	cds_ft_make_concurrent(ft);
+
+	w = (struct rkm_writer_arg *) calloc(RKM_NW, sizeof(*w));
+	if (!w)
+		abort();
+	for (i = 0; i < RKM_NW; i++) {
+		uint8_t bp = (uint8_t) (2 * i + 1), dp = (uint8_t) (2 * i + 2);
+		uint64_t sk[4] = {
+			rkm_key(bp, 1, 0), rkm_key(bp, 5, 0),
+			rkm_key(dp, 1, 0), rkm_key(dp, 5, 0),
+		};
+
+		w[i].ft = ft;
+		w[i].bp = bp;
+		w[i].dp = dp;
+		rcu_read_lock();
+		for (c = 0; c < 4; c++) {
+			w[i].sib[c] = node_alloc(sk[c]);
+			if (insert_u64(ft, sk[c], w[i].sib[c]) != CDS_FT_STATUS_OK)
+				abort();
+		}
+		for (c = 0; c < 2; c++) {	/* residents: keep the dst OCCUPIED */
+			uint64_t rk = rkm_key(dp, RKM_SB, (uint8_t) (c + 5));
+
+			w[i].res[c] = node_alloc(rk);
+			if (insert_u64(ft, rk, w[i].res[c]) != CDS_FT_STATUS_OK)
+				abort();
+		}
+		rcu_read_unlock();
+		live += 6;
+	}
+
+	test_go = 0;
+	test_stop = 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < RKM_NW; i++)
+		pthread_create(&writers[i], NULL, rkm_writer, &w[i]);
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	test_go = 1;
+
+	rcu_thread_offline();
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
+		usleep(1000);
+	test_stop = 1;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < RKM_NW; i++)
+		pthread_join(writers[i], NULL);
+	rcu_thread_online();
+
+	/* Drop any movers left seeded at the source by the final iteration. */
+	synchronize_rcu();
+	for (i = 0; i < RKM_NW; i++) {
+		if (!w[i].seeded)
+			continue;
+		for (c = 0; c < 2; c++)
+			(void) remove_u64(ft, rkm_key(w[i].bp, RKM_SB,
+					(uint8_t) (c + 1)));
+		w[i].seeded = 0;
+	}
+
+	synchronize_rcu();
+	rcu_read_lock();
+	for (i = 0; i < RKM_NW; i++) {
+		total_ops += w[i].ops;
+		total_retries += w[i].retries;
+		if (w[i].failed)
+			ret = -1;
+		/*
+		 * PER-WRITER liveness: a global "some moves happened" sails right
+		 * past one starved writer, which is a measured failure mode here.
+		 */
+		if (w[i].ops == 0) {
+			fprintf(stderr, "rekey merge: writer %d made NO move "
+				"(starved / livelock)\n", i);
+			ret = -1;
+		}
+		for (c = 0; c < 4; c++) {
+			struct cds_ft_node *f = NULL;
+			uint64_t sk = c < 2 ? rkm_key(w[i].bp, c == 0 ? 1 : 5, 0) :
+				rkm_key(w[i].dp, c == 2 ? 1 : 5, 0);
+
+			if (lookup_u64(ft, sk, &f) != CDS_FT_STATUS_OK ||
+					f != &w[i].sib[c]->node) {
+				fprintf(stderr, "rekey merge: writer %d sib %d lost\n",
+					i, c);
+				ret = -1;
+			}
+		}
+		for (c = 0; c < 2; c++) {	/* residents survived every union */
+			struct cds_ft_node *f = NULL;
+			uint64_t rk = rkm_key(w[i].dp, RKM_SB, (uint8_t) (c + 5));
+
+			if (lookup_u64(ft, rk, &f) != CDS_FT_STATUS_OK ||
+					f != &w[i].res[c]->node) {
+				fprintf(stderr, "rekey merge: writer %d resident %d "
+					"lost\n", i, c);
+				ret = -1;
+			}
+		}
+	}
+	if (cds_ft_count_keys(ft) != live) {
+		fprintf(stderr, "rekey merge: count_keys %lu != live %lu\n",
+			cds_ft_count_keys(ft), live);
+		ret = -1;
+	}
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "rekey merge: cds_ft_verify failed\n");
+		ret = -1;
+	}
+	rcu_read_unlock();
+
+	fprintf(stderr, "# inv_rekey_merge_occupied_dst: %d writers, %lu merges, "
+		"%lu retries, %lu live keys\n", RKM_NW, total_ops, total_retries,
 		live);
 
 	free(w);
@@ -13639,6 +14009,7 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_rekey_graft_coherent_readers);
 	RUN_TEST(inv_rekey_graft_shared);
 	RUN_TEST(inv_rekey_linearizability);
+	RUN_TEST(inv_rekey_merge_occupied_dst);
 #endif
 	RUN_TEST(inv_concurrent_writers_shared);
 	RUN_TEST(inv_concurrent_writers_coarse_lock);
