@@ -22,6 +22,25 @@
  * rcu_read_lock / call_rcu, unless a flavor is bound with
  * urcu_txn_init_flavor().
  *
+ * SLOT LIFETIME -- RCU is an EXISTENCE guarantee here, not just a courtesy to
+ * readers.  The backing memory of every transacted slot must outlive every
+ * transaction that can still name it: it must be reclaimed through call_rcu
+ * (i.e. after a grace period) or be permanently allocated.  A transaction
+ * writes a slot twice -- a CAS at install, a plain store at settle -- and a
+ * transaction that LOSES does both as well: it plants a prefix, then settles
+ * that prefix back to the old values.  So a peer that unlinks an object and
+ * frees it immediately leaves the loser CASing or storing into freed memory.
+ * Every attempt runs inside an RCU read-side critical section, so deferring the
+ * free past a grace period is exactly what closes this: the grace period cannot
+ * elapse while any transaction that could still name the slot is in flight.
+ *
+ * The same wait covers REUSE, not only freeing.  An unlinked object must not be
+ * recycled into a fresh one before a grace period either: keeping the memory
+ * valid stops the fault, but a straggling settle still overwrites whatever the
+ * recycled object has since stored in that word, and the write is silently
+ * lost.  <urcu/rcu-txn-list.h>'s Reclaim section works this through for the
+ * doubly-linked list, where the straggler is an insert that lost to a delete.
+ *
  * Two commit entry points:
  *   - urcu_txn_commit() -- the sw-mw-aware path; use it when the write-set
  *     may contain MW records (store_mw / a load-validate guard).
