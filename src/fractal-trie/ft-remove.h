@@ -1597,6 +1597,29 @@ int ft_detach_node(struct cds_ft *ft,
 							(struct cds_ft_inode *)
 							trailing_skip_cn);
 
+			/*
+			 * The one-hop ft_skip_to_compressed is NOT MW-safe: a peer
+			 * split/merge can tear the skip back-pointer so it recovers
+			 * a node that is not this skip's target at all (type
+			 * confusion -- ft_reanchor_flag's header states the same
+			 * hazard for the descent side).  Every OTHER orphan is
+			 * guarded before it is retired (the walk breaks on
+			 * nr_child > 1, ft_detach_orphan_planlock refuses a grown
+			 * one); the trailing skip-target was the one that was not,
+			 * and it is retired unconditionally below.
+			 *
+			 * A compressed node holds exactly ONE child, so a resolved
+			 * target whose count says otherwise is not the node this
+			 * plan is about.  Measured: retiring it dropped a
+			 * concurrently published 2-child subtree, i.e. SILENT KEY
+			 * LOSS (an insert reported OK for a key no root descent
+			 * could then find).  Bail to the op's re-descend, the same
+			 * answer a dirty mark gets one line below.
+			 */
+					if (ft_meta_nr_child_load(tm) != 1) {
+						ret = -EAGAIN;
+						goto end;
+					}
 					if (ft_meta_copying_mark(tm,
 							&orphan_trailing_snap)) {
 						ret = -EAGAIN;
@@ -1886,6 +1909,14 @@ int ft_detach_node(struct cds_ft *ft,
 								ft_skip_to_compressed(ft,
 									walk_nf));
 
+						/* See the trailing-target guard above:
+						 * the one-hop skip resolver is not
+						 * MW-safe, and this target is retired
+						 * unguarded otherwise. */
+						if (ft_meta_nr_child_load(tm) != 1) {
+							ret = -EAGAIN;
+							goto end;
+						}
 						if (ft_meta_copying_mark(tm,
 							&orphan_trailing_snap)) {
 							ret = -EAGAIN;
