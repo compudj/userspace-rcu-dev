@@ -502,8 +502,10 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 	 * carries the retire of S_top itself -- the merge does what cow_stop would.
 	 */
 	struct ft_glue src_glue;
+#ifdef FEATURE_FT_MERGE
 	struct ft_merge_ctx mctx;
 	struct ft_merge_counts mcnt = { 0, 0, 0, 0, 0 };
+#endif
 	struct cds_ft_inode_flag *merged_nf = NULL;
 	unsigned long merged_keys = 0;
 	bool merge_dst = false, src_glue_live = false;
@@ -653,6 +655,18 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 		merge_dst = (d_probe.depth == dst_len && d_probe.nf != NULL);
 		if (merge_dst && ft->ordered_list)
 			return -EINVAL;		/* interleave: not this cut */
+#ifndef FEATURE_FT_MERGE
+		/*
+		 * An OCCUPIED destination IS a merge (INCREMENT 3 unions S_top
+		 * into it with ft_merge_build), so -DNO_FEATURE_FT_MERGE compiles
+		 * that fold out along with the rest of the subsystem.  Report it
+		 * the way the merge API itself does rather than building a fold
+		 * whose machinery is not there.  The EMPTY-dst rekey below is a
+		 * graft and stays available.
+		 */
+		if (merge_dst)
+			return -ENOTSUP;
+#endif
 	}
 
 	/*
@@ -797,6 +811,7 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 		goto sweep;
 	}
 	if (merge_dst) {
+#ifdef FEATURE_FT_MERGE
 		/*
 		 * INCREMENT 3, step 2': UNION S_top into the occupied dst.
 		 *
@@ -955,6 +970,7 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 		attached_nf = merged_nf;
 		adepth = (unsigned int) dst_len;
 		prep = FT_GRAFT_PREP_NOSPLIT;	/* not a graft; keeps the arms below off */
+#endif /* FEATURE_FT_MERGE */
 	} else
 	prep = ft_graft_build(ft, dst_ord, dst_len, s_top_prime, cnt, &d_dst, &glue);
 	/*
@@ -1075,10 +1091,12 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 			 * depth-bounded count walk.  Sized from the read-only pre-pass,
 			 * with the same +8 headroom the glue arrays get.
 			 */
+#ifdef FEATURE_FT_MERGE
 			(merge_dst ? 3 * (unsigned int) (mcnt.nd + 8) +
 				(unsigned int) (mcnt.nf_dst + mcnt.nf_src + 16) + 8 +
 				(unsigned int) (mcnt.ns + 8) +	/* dup-chain splices */
 				(ft->rank_stats ? (unsigned int) dst_len + 1 : 0) : 0) +
+#endif
 			(prep == FT_GRAFT_PREP_GLUE ?
 				FT_GLUE_FLOOR_DEFERRED + 7 + 1 + FT_GLUE_FLOOR_FREE +
 				(ft->rank_stats ? (unsigned int) dst_len + 1 : 0) : 0))) {
@@ -1425,8 +1443,10 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 		 * key never momentarily shows only its dst side.  After the cluster's
 		 * edges, exactly as ft_merge_spine_copy orders it.
 		 */
+#ifdef FEATURE_FT_MERGE
 		if (merge_dst)
 			ft_glue_record_splices(ft, &glue, txn);
+#endif
 	}
 
 	/* 4. ONE commit of the whole stitch (consumes txn). */
