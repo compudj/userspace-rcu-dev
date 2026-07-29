@@ -529,13 +529,8 @@
  * readiness.md S4.
  *
  * Default: recompact-on-insert (multi-writer-safe).  Opt into the in-place
- * fast path with -DFEATURE_FT_INSERT_IN_PLACE.  -DNO_FEATURE_FT_INSERT_IN_PLACE
- * forces recompact even if the fast path was requested (otherwise a no-op,
- * kept for back-compat).
+ * fast path with -DFEATURE_FT_INSERT_IN_PLACE (the gate's `in-place` config).
  */
-#ifdef NO_FEATURE_FT_INSERT_IN_PLACE
-# undef FEATURE_FT_INSERT_IN_PLACE
-#endif
 
 /*
  * Skip-compressed pointers encode the compressed path length in the

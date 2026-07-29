@@ -73,6 +73,32 @@ ALL_CONFIGS=(
 	"noskip|-DNO_FEATURE_FT_SKIP_COMPRESSED|u ioff"
 	"nocompress|-DNO_FEATURE_FT_COMPRESS|u ioff"
 	"in-place|-DFEATURE_FT_INSERT_IN_PLACE|u"
+	# The byte-key-only build (~25 KiB less .text): compiles out the
+	# non-identity key-map lookup specializations, after which
+	# cds_ft_group_attr_set_key_map returns NOT_SUPPORTED.  It had no gate
+	# config, so that state was untested by construction.
+	"nokeymap|-DNO_FEATURE_FT_KEY_MAP|u ion ioff"
+	# The access-discipline validator.  ft_unit ONLY, deliberately: its
+	# writer/writer check asserts that writers never overlap ("the contract
+	# serializes writers in both modes", fractal-trie-internal.h), which
+	# predates the FT-wide-lock drop and contradicts LOCK_FINE, where
+	# disjoint writers running in parallel IS the design.  Every concurrent
+	# ft_inv oracle therefore trips it by construction.  ft_unit is
+	# single-threaded, which is where the validator's own negative tests
+	# live -- and they used to SKIP, because nothing in the gate defined
+	# this flag.
+	"excl|-DFEATURE_FT_EXCL_VALIDATE|u"
+	# BUILD-ONLY, deliberately.  -DNO_FEATURE_FT_MERGE compiles out the merge
+	# subsystem (~20 KiB .text; cds_ft_merge then returns NOT_SUPPORTED).  It
+	# had no gate config and had ROTTED: the rekey fold's occupied-dst arm --
+	# which IS a merge -- was not guarded, so the library did not compile at
+	# all (9 errors).  Fixed; this config keeps it compiling.
+	#
+	# No test leg yet: 48 ft_unit tests exercise merge directly and FAIL
+	# rather than SKIP without it.  Giving them a runtime capability query
+	# (the shape cds_ft_excl_validate_enabled / _verify_at_mutation_enabled
+	# already use) is the follow-up that earns this config a `u`.
+	"nomerge|-DNO_FEATURE_FT_MERGE|"
 )
 
 # Optional positional filter: run only the named configs.
@@ -161,6 +187,13 @@ run_one() {	# $1=name $2=tests -- build lib+tests, run the TAP suites
 		notok=$(printf '%s' "$o" | grep -c '^not ok ')
 		abrt=$(printf '%s' "$o" | grep -c -i 'assert')
 		printf '  [%-11s] %s ok=%s notok=%s abrt=%s\n' "$name" "$lbl" "$ok" "$notok" "$abrt" >> "$out"
+		# NAME the failures, do not just count them.  An INTERMITTENT red is
+		# unattributable from a count alone: you cannot tell a known flake
+		# from a new regression without re-running and hoping it recurs.
+		# (Cost real time once: a fault-audit red that never reproduced.)
+		if [ "$notok" -gt 0 ]; then
+			printf '%s' "$o" | grep '^not ok ' | sed "s/^/      [$name] $lbl /" >> "$out"
+		fi
 		# A HUNG suite used to score GREEN.  The run is killed, its PARTIAL
 		# ok-count is reported, and with no 'not ok ' line and no abort the
 		# config passed -- so a single-threaded DLM self-deadlock rode in on
