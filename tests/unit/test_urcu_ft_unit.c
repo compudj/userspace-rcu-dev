@@ -49,18 +49,14 @@
 
 #include "tap.h"
 
-#ifdef FEATURE_FT_MW_DLM_ACQUIRE
 #define NR_TESTS_DLM 8		/* cow_stop_root_inplace, rekey_graft_{simple,liston,cross_junction,glue_dst,glue_dst_branch_child}, rekey_merge_{occupied,collide}_dst */
-#else
-#define NR_TESTS_DLM 0
-#endif
 
 /*
  * Tests needing DLM *and* fault injection in one build: the merge overlap-spine
  * fence bail, whose acquire only exists under DLM and only MISSES when the fault
  * hook forces it.  Only the gate's dlm-fault config defines both.
  */
-#if defined(FEATURE_FT_MW_DLM_ACQUIRE) && defined(FEATURE_FT_FAULT_INJECT)
+#ifdef FEATURE_FT_FAULT_INJECT
 #define NR_TESTS_DLM_FAULT 3	/* merge_overlap_fence, rekey_reparent_mark_bail, rekey_merge_bail */
 #else
 #define NR_TESTS_DLM_FAULT 0
@@ -626,7 +622,6 @@ static int test_writer_lock_mode_fine(void)
 	return drain_and_destroy(ft, group);
 }
 
-#ifdef FEATURE_FT_MW_DLM_ACQUIRE
 extern void *_cds_ft_debug_root(struct cds_ft *ft);
 extern int _cds_ft_debug_cow_replace_root(struct cds_ft *ft);
 
@@ -1943,7 +1938,6 @@ static int test_rekey_graft_glue_dst(void)
 	}
 	return 0;
 }
-#endif /* FEATURE_FT_MW_DLM_ACQUIRE */
 
 /*
  * Insert keys crafted to force COMPRESSED-NODE SPLITS, the shape whose forward
@@ -28508,7 +28502,6 @@ static int test_fine_lock_merge_splice_acquire(void)
 	return fine_lock_merge_splice_run(/*fault=*/ true);
 }
 
-#ifdef FEATURE_FT_MW_DLM_ACQUIRE
 /*
  * MW LOCK_FINE + DLM: the merge OVERLAP-SPINE plan-lock, and specifically its
  * BAIL.  ft_merge_build fences every dst overlap node before copying its body
@@ -28927,7 +28920,6 @@ static int test_fine_lock_rekey_reparent_mark_bail(void)
 			return -1;
 	return 0;
 }
-#endif /* FEATURE_FT_MW_DLM_ACQUIRE */
 
 /*
  * Compaction OOM (flip-txn allocation fault).  During cds_ft_compact on an
@@ -29560,7 +29552,6 @@ int main(int argc, char **argv)
 	RUN_TEST(test_writer_lock_mode_fine_split);
 	RUN_TEST(test_writer_lock_mode_fine_graft);
 	RUN_TEST(test_writer_lock_mode_fine_crosstrie_busy);
-#ifdef FEATURE_FT_MW_DLM_ACQUIRE
 	RUN_TEST(test_cow_stop_root_inplace);
 	RUN_TEST(test_rekey_graft_simple);
 	RUN_TEST(test_rekey_merge_occupied_dst);
@@ -29569,7 +29560,6 @@ int main(int argc, char **argv)
 	RUN_TEST(test_rekey_graft_cross_junction);
 	RUN_TEST(test_rekey_graft_glue_dst);
 	RUN_TEST(test_rekey_graft_glue_dst_branch_child);
-#endif
 #ifdef FEATURE_FT_FAULT_INJECT
 	RUN_TEST(test_rekey_coherence_fault_redescend);
 	RUN_TEST(test_rekey_coherence_relational_fault);
@@ -29617,11 +29607,9 @@ int main(int argc, char **argv)
 	RUN_TEST(test_fine_lock_acquire_fault);
 	RUN_TEST(test_fine_lock_chain_acquire_fault);
 	RUN_TEST(test_fine_lock_merge_splice_acquire);
-#ifdef FEATURE_FT_MW_DLM_ACQUIRE
 	RUN_TEST(test_fine_lock_merge_overlap_fence);
 	RUN_TEST(test_fine_lock_rekey_reparent_mark_bail);
 	RUN_TEST(test_fine_lock_rekey_merge_bail);
-#endif
 	RUN_TEST(test_compact_ordered_list_oom);
 	RUN_TEST(test_compact_ordered_list_oom_resume);
 #endif

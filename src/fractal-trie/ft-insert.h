@@ -108,7 +108,6 @@ struct ft_insert_commit {
 	struct cds_ft *ft;
 	struct cds_ft_inode_flag *created[FT_MAX_DEPTH];
 	int nr_created;
-#ifdef FEATURE_FT_MW_DLM_ACQUIRE
 	/*
 	 * DLM Step 1 (ft-step1-dlm-acquire.md) compressed-split acquire: when a
 	 * split builder pre-acquired CN's parent P (the value-swap forward-publish
@@ -123,7 +122,6 @@ struct ft_insert_commit {
 	 */
 	struct cds_ft_metadata *parent_locked_holder;
 	uintptr_t parent_locked_snap;
-#endif
 };
 
 static void ft_free_unpublished_split_cluster(struct cds_ft *ft,
@@ -499,12 +497,8 @@ void ft_insert_publish_or_park(struct cds_ft *ft,
 	 * (past-child {CN}, non-split shapes) routes to the incremental lock_or_guard,
 	 * behaviour-identical to non-DLM.
 	 */
-#ifdef FEATURE_FT_MW_DLM_ACQUIRE
 	ft_flip_txn_hold_or_lock_parent(ft, ic->txn, parent_nf,
 		ic->parent_locked_holder, ic->parent_locked_snap);
-#else
-	ft_flip_txn_lock_or_guard_parent(ft, ic->txn, parent_nf);
-#endif
 	_ft_publish_to_parent(ft, parent_nf, slot, new_top, expected_old, &rec);
 	for (k = 0; k < rec.n; k++)
 		ft_flip_txn_record_reserved(ic->txn,
@@ -515,7 +509,6 @@ void ft_insert_publish_or_park(struct cds_ft *ft,
 	ic->publish_to_parent = true;
 }
 
-#ifdef FEATURE_FT_MW_DLM_ACQUIRE
 /*
  * DLM Step 1 (ft-step1-dlm-acquire.md): acquire the compressed-split lock-set
  * {CN, P} in ONE all-or-none MCAS up front, replacing the incremental CN
@@ -589,7 +582,6 @@ void ft_insert_dlm_release_parent(struct ft_insert_commit *ic)
 		ic->parent_locked_holder = NULL;
 	}
 }
-#endif /* FEATURE_FT_MW_DLM_ACQUIRE */
 
 /*
  * Arm the one-commit txn just before a fresh-head publish (fallible; the
@@ -769,11 +761,9 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 	 * incremental CN mark here + the P lock inside publish_or_park.  Non-DLM /
 	 * non-lock_fine keeps the single CN copying-mark (byte-identical).
 	 */
-#ifdef FEATURE_FT_MW_DLM_ACQUIRE
 	if (ft->lock_fine)
 		fret = ft_insert_dlm_acquire_split(ft, cn_meta, &cn_fence, ic);
 	else
-#endif
 		fret = ft_meta_copying_mark(cn_meta, &cn_fence);
 
 	if (fret)
@@ -1085,9 +1075,7 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 	if (ft_resolve_parent_slot(cn_meta, ft, &cur_parent) != parent_slot) {
 		ft_free_unpublished_split_cluster(ft, created, nr_created);
 		ft_meta_copying_clear(cn_meta);
-#ifdef FEATURE_FT_MW_DLM_ACQUIRE
 		ft_insert_dlm_release_parent(ic);	/* release P held up front */
-#endif
 		return -EAGAIN;
 	}
 	/*
@@ -1158,9 +1146,7 @@ error:
 	 */
 	ft_free_unpublished_split_cluster(ft, created, nr_created);
 	ft_meta_copying_clear(cn_meta);
-#ifdef FEATURE_FT_MW_DLM_ACQUIRE
 	ft_insert_dlm_release_parent(ic);
-#endif
 	return -ENOMEM;
 }
 
@@ -2386,11 +2372,9 @@ int ft_insert_compressed_key_shorter(struct cds_ft *ft,
 	 * publish target below), mirroring the diverge builder.  Non-DLM /
 	 * non-lock_fine keeps the single CN copying-mark (byte-identical).
 	 */
-#ifdef FEATURE_FT_MW_DLM_ACQUIRE
 	if (ft->lock_fine)
 		sret = ft_insert_dlm_acquire_split(ft, cn_meta, &cn_fence, ic);
 	else
-#endif
 		sret = ft_meta_copying_mark(cn_meta, &cn_fence);
 	if (sret)
 		return sret;	/* -EAGAIN: peer owns the cn/P; nothing built */
@@ -2411,9 +2395,7 @@ int ft_insert_compressed_key_shorter(struct cds_ft *ft,
 		split_created, &split_nr_created);
 	if (sret) {
 		ft_meta_copying_clear(cn_meta);
-#ifdef FEATURE_FT_MW_DLM_ACQUIRE
 		ft_insert_dlm_release_parent(ic);	/* release P held up front */
-#endif
 		return sret;
 	}
 	jct_meta = cds_ft_item_to_metadata(ft_node_ptr(jct_flag));
@@ -2460,9 +2442,7 @@ int ft_insert_compressed_key_shorter(struct cds_ft *ft,
 		ft_free_unpublished_split_cluster(ft, split_created,
 			split_nr_created);
 		ft_meta_copying_clear(cn_meta);
-#ifdef FEATURE_FT_MW_DLM_ACQUIRE
 		ft_insert_dlm_release_parent(ic);	/* release P held up front */
-#endif
 		return sret;
 	}
 	/*
@@ -2490,10 +2470,8 @@ int ft_insert_compressed_key_shorter(struct cds_ft *ft,
 		/* Registered above: the txn owns CN's fence; discard both. */
 		ft_flip_txn_destroy(ic->txn);
 		ic->txn = NULL;
-#ifdef FEATURE_FT_MW_DLM_ACQUIRE
 		/* P was held up front, not yet registered (publish not reached). */
 		ft_insert_dlm_release_parent(ic);
-#endif
 		return -EAGAIN;
 	}
 	/*

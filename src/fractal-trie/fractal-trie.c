@@ -231,7 +231,6 @@ void _cds_ft_debug_move_gate_exit(struct cds_ft *ft)
 {
 	ft_move_gate_exit(ft);
 }
-#ifdef FEATURE_FT_MW_DLM_ACQUIRE
 /*
  * TEST/DEBUG (coherent-rekey sub-step 2, NOT public API): read the trie root as
  * an opaque address, so a test can observe a COW relocation moved its identity.
@@ -1584,4 +1583,3 @@ int _cds_ft_debug_rekey_graft_simple(struct cds_ft *ft,
 	ft_move_gate_exit(ft);
 	return ret;
 }
-#endif /* FEATURE_FT_MW_DLM_ACQUIRE */

@@ -293,7 +293,6 @@ struct ft_flip_txn {
 	 * than publish: an all-or-none lock-set, with the miss re-descending.
 	 */
 	bool acquire_miss;
-#ifdef FEATURE_FT_MW_DLM_ACQUIRE
 	/*
 	 * MIXED sw/mw commit (DLM lock_fine): when true, the STRUCTURAL record
 	 * helpers (every ft_flip_txn_record_tag edge) plant SW-kind records -- a
@@ -307,7 +306,6 @@ struct ft_flip_txn {
 	 * flip.  Default false keeps every non-opted-in op all-MW == byte-identical.
 	 */
 	bool structural_sw;
-#endif
 };
 
 /*
@@ -364,9 +362,7 @@ struct ft_flip_txn *ft_flip_txn_create(void)
 	t->reserved = false;		/* unbounded: @mtxn grows as edges record */
 	t->nr_copying = 0;
 	t->acquire_miss = false;
-#ifdef FEATURE_FT_MW_DLM_ACQUIRE
 	t->structural_sw = false;	/* all-MW until a caller opts in under lock_fine */
-#endif
 	return t;
 }
 
@@ -429,9 +425,7 @@ struct ft_flip_txn *ft_flip_txn_create_bounded(unsigned int cap)
 	t->reserved = true;
 	t->nr_copying = 0;
 	t->acquire_miss = false;
-#ifdef FEATURE_FT_MW_DLM_ACQUIRE
 	t->structural_sw = false;	/* all-MW until a caller opts in under lock_fine */
-#endif
 	return t;
 }
 
@@ -473,9 +467,7 @@ struct ft_flip_txn *ft_flip_txn_create_bounded_on(struct urcu_txn *op,
 	t->reserved = true;
 	t->nr_copying = 0;
 	t->acquire_miss = false;
-#ifdef FEATURE_FT_MW_DLM_ACQUIRE
 	t->structural_sw = false;	/* all-MW until a caller opts in under lock_fine */
-#endif
 	return t;
 }
 
@@ -850,7 +842,6 @@ void ft_flip_txn_record_tag(struct ft_flip_txn *t, void **slot,
 
 	FT_TP(edge_record, (const void *) t->mtxn, (const void *) slot,
 		(const void *) old_ptr, (const void *) new_ptr, tag);
-#ifdef FEATURE_FT_MW_DLM_ACQUIRE
 	/*
 	 * MIXED sw/mw: a STRUCTURAL edge parks SW when the op holds the DLM lock
 	 * over @slot (structural_sw set by the caller under lock_fine) -- a plain
@@ -860,7 +851,6 @@ void ft_flip_txn_record_tag(struct ft_flip_txn *t, void **slot,
 	if (t->structural_sw)
 		ret = urcu_txn_store_sw(t->mtxn, slot, old_ptr, new_ptr, tag);
 	else
-#endif
 		ret = urcu_txn_store_mw(t->mtxn, slot, old_ptr, new_ptr, tag);
 	assert(!ret);
 	(void) ret;	/* reserved up front -> never fails */
@@ -888,7 +878,6 @@ void ft_flip_txn_record_tag_mw(struct ft_flip_txn *t, void **slot,
 	(void) ret;	/* reserved up front -> never fails */
 }
 
-#ifdef FEATURE_FT_MW_DLM_ACQUIRE
 /*
  * MIXED sw/mw: opt @t's structural edges into SW-kind parks.  A caller holding
  * the DLM COPYING locks over the slots it structurally rewrites calls this right
@@ -902,7 +891,6 @@ void ft_flip_txn_set_structural_sw(struct ft_flip_txn *t, bool v)
 {
 	t->structural_sw = v;
 }
-#endif
 
 static inline
 void ft_flip_txn_record_reserved(struct ft_flip_txn *t, void **slot,
@@ -911,7 +899,6 @@ void ft_flip_txn_record_reserved(struct ft_flip_txn *t, void **slot,
 	ft_flip_txn_record_tag(t, slot, old_ptr, new_ptr, FT_FLIP_PROXY_TAG);
 }
 
-#ifdef FEATURE_FT_MW_DLM_ACQUIRE
 /*
  * MW LOCK_FINE DLM (Step 1, doc/design ft-step1-dlm-acquire.md): the composable
  * one-commit lock-set acquire.  An op derives its lock-set + read-set by a
@@ -1033,7 +1020,6 @@ int ft_dlm_acquire_set(const struct cds_ft *ft, struct ft_dlm_member *set,
 		return -EAGAIN;		/* commit freed @acq; nothing acquired */
 	return 0;
 }
-#endif /* FEATURE_FT_MW_DLM_ACQUIRE */
 
 /*
  * FT-local order-pinned insert-between (was the engine's
@@ -3488,7 +3474,6 @@ void ft_ord_cell_find_splice_pos(struct cds_ft *dst, const uint8_t *key,
 #endif
 }
 
-#ifdef FEATURE_FT_MW_DLM_ACQUIRE
 /*
  * COHERENT splice-position derivation: run ft_ord_cell_find_splice_pos TWICE and
  * accept the answer only if both passes agree -- same (pred, succ) AND the same
@@ -3533,7 +3518,6 @@ bool ft_ord_cell_find_splice_pos_coherent(struct cds_ft *dst, const uint8_t *key
 	*succ_out = succ1;
 	return true;
 }
-#endif /* FEATURE_FT_MW_DLM_ACQUIRE */
 
 /*
  * Splice the contiguous ordered-list run [@run_first .. @run_last] (already
@@ -3621,7 +3605,6 @@ unsigned int ft_ord_cell_run_splice_edges(struct cds_ft *dst,
 /* Max edges a run-splice commits: 2 outer links + 2 boundary back-edges. */
 #define FT_ORD_CELL_RUN_SPLICE_MAX_EDGES	4
 
-#ifdef FEATURE_FT_MW_DLM_ACQUIRE	/* the coherent same-trie rekey's only caller */
 /*
  * SAME-TRIE re-splice of a LIVE run (the coherent rekey's dst half), the variant
  * ft_ord_cell_run_splice_edges cannot be: it PRE-SETS the run's two outer links
@@ -3699,7 +3682,6 @@ unsigned int ft_ord_cell_run_resplice_edges(struct cds_ft *dst,
 
 /* Max edges a same-trie run re-splice commits: 2 outer links + 2 back-edges. */
 #define FT_ORD_CELL_RUN_RESPLICE_MAX_EDGES	4
-#endif /* FEATURE_FT_MW_DLM_ACQUIRE */
 
 /*
  * Pre-sets the run's outer links (run not yet reachable in @dst), flips the
@@ -4271,7 +4253,6 @@ struct ft_glue_deferred_edge {
 	 * single apply_deferred call still wires every edge.
 	 */
 	bool dst_origin;
-#ifdef FEATURE_FT_MW_DLM_ACQUIRE
 	/*
 	 * FOLD: this op holds @child's COPYING mark, taken by
 	 * ft_glue_acquire_reparent_marks because the commit SW-PARKS @child's
@@ -4280,7 +4261,6 @@ struct ft_glue_deferred_edge {
 	 * NOT reach a successful commit.  Never set outside structural_sw.
 	 */
 	bool marked;
-#endif
 };
 
 struct ft_glue_free_item {
@@ -4296,7 +4276,6 @@ struct ft_glue_free_item {
 	 * true: the retiring committer frees it exactly once.
 	 */
 	bool retired;
-#ifdef FEATURE_FT_MW_DLM_ACQUIRE
 	/*
 	 * DLM overlap-spine plan-lock (§9.4 M-2): this op holds the node's COPYING
 	 * fence, acquired BEFORE its body was read into the merged cluster, and
@@ -4312,7 +4291,6 @@ struct ft_glue_free_item {
 	 */
 	bool fenced;
 	uintptr_t snap;
-#endif
 };
 
 /*
@@ -5081,7 +5059,6 @@ void ft_glue_defer_edge_origin(struct cds_ft *ft, struct ft_glue *g,
 	g->deferred[g->nr_deferred].parent = parent;
 	g->deferred[g->nr_deferred].slot = slot;
 	g->deferred[g->nr_deferred].dst_origin = dst_origin;
-#ifdef FEATURE_FT_MW_DLM_ACQUIRE
 	/*
 	 * Every field of a new entry is set HERE and nowhere else: the backing
 	 * arrays are an uninitialised inline floor (or a malloc'd grow), so an
@@ -5092,7 +5069,6 @@ void ft_glue_defer_edge_origin(struct cds_ft *ft, struct ft_glue *g,
 	 * or not the fold ever acquired.
 	 */
 	g->deferred[g->nr_deferred].marked = false;
-#endif
 	g->nr_deferred++;
 }
 
@@ -5138,14 +5114,11 @@ void ft_glue_defer_free(struct ft_glue *g,
 	g->free_list[g->nr_free].node = node;
 	g->free_list[g->nr_free].compressed = compressed;
 	g->free_list[g->nr_free].retired = true;
-#ifdef FEATURE_FT_MW_DLM_ACQUIRE
 	g->free_list[g->nr_free].fenced = false;
 	g->free_list[g->nr_free].snap = 0;
-#endif
 	g->nr_free++;
 }
 
-#ifdef FEATURE_FT_MW_DLM_ACQUIRE
 /*
  * DLM overlap-spine plan-lock (§9.4 M-2): record a replaced node whose COPYING
  * fence the caller ALREADY acquired -- before copying its content into the merged
@@ -5385,7 +5358,7 @@ int ft_glue_acquire_reparent_marks(struct cds_ft *ft, struct ft_glue *g)
 		 * re-parented child.  That dead sweep is where an uninitialised
 		 * @marked hid, so it gets its own armed test rather than inherited
 		 * confidence.  Needs FEATURE_FT_FAULT_INJECT *and*
-		 * FEATURE_FT_MW_DLM_ACQUIRE in one build: the gate's `dlm-fault`.
+		 * fault injection in one build: the gate's `fault-audit`.
 		 */
 		if (cds_ft_fault_lock_countdown >= 0) {
 			if (cds_ft_fault_lock_countdown == 0) {
@@ -5437,7 +5410,6 @@ void ft_glue_release_reparent_marks(struct cds_ft *ft, struct ft_glue *g)
 		g->deferred[i].marked = false;
 	}
 }
-#endif
 
 /*
  * Drop every dup-chain holder lock ft_glue_acquire_splice_holders still owns
@@ -5554,7 +5526,6 @@ void ft_glue_abort(struct cds_ft *ft, struct ft_glue *g)
 	 * split-retire fence below.  No-op when nothing was acquired.
 	 */
 	ft_glue_release_splice_holders(g);
-#ifdef FEATURE_FT_MW_DLM_ACQUIRE
 	/*
 	 * DLM overlap-spine plan-lock (§9.4 M-2): release every COPYING fence this
 	 * aborted build took on a dst overlap node.  Every pre-commit merge bail
@@ -5573,7 +5544,6 @@ void ft_glue_abort(struct cds_ft *ft, struct ft_glue *g)
 	 * (see ft_glue_release_reparent_marks).
 	 */
 	ft_glue_release_reparent_marks(ft, g);
-#endif
 
 	/*
 	 * Split-retire cn fence (MW LOCK_FINE drop): a GLUE graft build that
@@ -5666,7 +5636,6 @@ void ft_glue_tombstone_free_list(struct ft_glue *g)
 		 */
 		if (g->split_cn_holder == meta)
 			continue;
-#ifdef FEATURE_FT_MW_DLM_ACQUIRE
 		/*
 		 * DLM overlap-spine plan-lock: this node's COPYING fence is HELD, and
 		 * its snap is the clean word the copy plan was derived from.  Record
@@ -5713,7 +5682,6 @@ void ft_glue_tombstone_free_list(struct ft_glue *g)
 				g->free_list[i].snap);
 			continue;
 		}
-#endif
 		/*
 		 * Fuse the freeze into @txn (committed with the forward publish
 		 * below) when the committer reserved for it; else a standalone
@@ -5765,7 +5733,6 @@ void ft_glue_apply_deferred(struct cds_ft *ft, struct ft_glue *g)
 	for (i = 0; i < g->nr_deferred; i++) {
 		if (g->deferred[i].dst_origin)
 			continue;
-#ifdef FEATURE_FT_MW_DLM_ACQUIRE
 		/*
 		 * FOLD (coherent rekey one-decide writer): "unreachable until the
 		 * forward flip" is what licenses the plain store, and it is FALSE
@@ -5851,7 +5818,6 @@ void ft_glue_apply_deferred(struct cds_ft *ft, struct ft_glue *g)
 				g->deferred[i].parent, g->deferred[i].slot);
 			continue;
 		}
-#endif
 		ft_set_parent(ft, g->deferred[i].child, g->deferred[i].parent,
 			g->deferred[i].slot);
 	}
@@ -5893,7 +5859,6 @@ enum urcu_txn_status ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue 
 	int i;
 	enum urcu_txn_status cst;
 
-#ifdef FEATURE_FT_MW_DLM_ACQUIRE
 	/*
 	 * FOLD: take the COPYING mark on every child the records below will SW-park
 	 * into, BEFORE the first of them is recorded and before
@@ -5911,7 +5876,6 @@ enum urcu_txn_status ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue 
 		if (ft_glue_acquire_reparent_marks(ft, g))
 			return URCU_TXN_STATUS_ABORT;
 	}
-#endif
 
 	/*
 	 * Hidden back-pointers -- re-parents of nodes NOT reader-observable
@@ -5931,7 +5895,6 @@ enum urcu_txn_status ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue 
 	for (i = 0; i < g->nr_deferred; i++) {
 		if (!g->deferred[i].dst_origin)
 			continue;
-#ifdef FEATURE_FT_MW_DLM_ACQUIRE
 		/*
 		 * FOLD (coherent rekey one-decide writer): a live child's re-home must
 		 * be the co-committed (parent, offset) PAIR, not
@@ -5972,7 +5935,6 @@ enum urcu_txn_status ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue 
 				g->deferred[i].parent, g->deferred[i].slot);
 			continue;
 		}
-#endif
 		ft_glue_record_back_edge(ft, g->txn, g->deferred[i].child,
 			g->deferred[i].parent, g->deferred[i].slot);
 	}
@@ -6150,7 +6112,7 @@ enum urcu_txn_status ft_glue_txn_commit_replace(struct cds_ft *ft,
 	/*
 	 * Return the commit status: under the FT-wide lock the replace is
 	 * failure-free (caller ignores it), but with the lock dropped
-	 * (FEATURE_FT_MW_LOCK_FINE_DROP) a peer relocating the contended dst
+	 * (FT-wide-lock drop) a peer relocating the contended dst
 	 * parent aborts the commit -- cds_ft_graft_swap re-descends on it.
 	 */
 	cst = ft_glue_txn_commit_edges(ft, g, cedges, n);
@@ -6265,7 +6227,6 @@ int ft_glue_acquire_splice_holders(struct cds_ft *ft, struct ft_glue *g)
 
 		assert(hf);
 		hm = ft_flag_to_metadata(ft, hf);
-#ifdef FEATURE_FT_MW_DLM_ACQUIRE
 		/*
 		 * Already fenced by the overlap-spine plan-lock: reuse it, take no
 		 * second lock, and record no holder -- ft_glue_clear_fenced owns that
@@ -6274,7 +6235,6 @@ int ft_glue_acquire_splice_holders(struct cds_ft *ft, struct ft_glue *g)
 		 */
 		if (ft_glue_fence_holds(g, hm))
 			continue;
-#endif
 		for (j = 0; j < i; j++) {
 			if (g->splices[j].holder == hm) {
 				held = true;

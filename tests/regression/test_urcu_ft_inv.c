@@ -67,11 +67,7 @@
 
 #include "tap.h"
 
-#ifdef FEATURE_FT_MW_DLM_ACQUIRE
 #define NR_TESTS_REKEY_DLM	8	/* inv_rekey_graft_{disjoint,cross_junction,glue_dst,coherent_readers,shared}, inv_rekey_linearizability, inv_rekey_merge_{occupied,shared}_dst */
-#else
-#define NR_TESTS_REKEY_DLM	0
-#endif
 
 /*
  * Base count = the RUN_TEST invocations in main() outside the DLM #ifdef.
@@ -1204,7 +1200,6 @@ static int inv_concurrent_writers_disjoint(void)
 	return ret;
 }
 
-#ifdef FEATURE_FT_MW_DLM_ACQUIRE
 /*
  * Coherent-rekey concurrent-writer oracle (DISJOINT): N writers each own a
  * private subtree and rekey it back and forth between two junctions that SHARE
@@ -3725,7 +3720,6 @@ static int inv_rekey_linearizability(void)
 		ret = -1;
 	return ret;
 }
-#endif /* FEATURE_FT_MW_DLM_ACQUIRE */
 
 /*
  * Companion to inv_concurrent_writers_disjoint: ALL writers contend the SAME
@@ -14391,7 +14385,6 @@ int main(int argc, char **argv)
 	diag("1. Iteration ordering");
 	RUN_TEST(inv_iteration_order);
 	RUN_TEST(inv_concurrent_writers_disjoint);
-#ifdef FEATURE_FT_MW_DLM_ACQUIRE
 	RUN_TEST(inv_rekey_graft_disjoint);
 	RUN_TEST(inv_rekey_graft_cross_junction);
 	RUN_TEST(inv_rekey_graft_glue_dst);
@@ -14400,7 +14393,6 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_rekey_linearizability);
 	RUN_TEST(inv_rekey_merge_occupied_dst);
 	RUN_TEST(inv_rekey_merge_shared_dst);
-#endif
 	RUN_TEST(inv_concurrent_writers_shared);
 	RUN_TEST(inv_concurrent_writers_coarse_lock);
 	RUN_TEST(inv_concurrent_writers_fine_lock);

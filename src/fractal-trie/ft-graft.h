@@ -2217,7 +2217,6 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
 		}
 	}
 
-#ifdef FEATURE_FT_MW_LOCK_FINE_DROP
 	if (dst_ft->lock_fine) {
 		const struct rcu_flavor_struct *flavor = dst_ft->group->flavor;
 
@@ -2245,7 +2244,6 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
 		status = ft_graft_keylen(dst_ft, _key, key_len, src_ft, NULL);
 		flavor->read_unlock();
 	} else
-#endif
 		status = ft_graft_keylen(dst_ft, _key, key_len, src_ft, NULL);
 	FT_TP(graft_exit, (int) status);
 	return status;
@@ -2527,7 +2525,6 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		struct cds_ft_alloc_reserve gs_reserve;
 		bool gs_reserved = false;
 		bool empty_pruned = false;
-#ifdef FEATURE_FT_MW_LOCK_FINE_DROP
 		bool gs_rlock = false;
 		/*
 		 * The non-empty swap-root retire was FUSED into the insert-replace
@@ -2535,14 +2532,12 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		 * it back and the retry re-descends with swap still full.
 		 */
 		bool swap_retire_fused = false;
-#endif
 
 		/*
 		 * Read-only descent: nothing is published, so the whole swap can be
 		 * assembled as a build-invisible transaction and an allocation failure
 		 * leaves both tries pristine.
 		 */
-#ifdef FEATURE_FT_MW_LOCK_FINE_DROP
 		/*
 		 * §11 cross-trie RCU-pinning: this descent captures live-dst spine
 		 * nodes (d.pnf ...) that the extract-side detach and the insert-side
@@ -2563,8 +2558,6 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 			dst_ft->group->flavor->read_lock();
 			gs_rlock = true;
 		}
-#endif
-#ifdef FEATURE_FT_MW_LOCK_FINE_DROP
 retry_swap:
 		/*
 		 * MW LOCK_FINE drop: the re-descend point.  graft_swap's commit is
@@ -2594,7 +2587,6 @@ retry_swap:
 		gs_reserved = false;
 		swap_retire_fused = false;
 		gs_d_first = gs_d_last = gs_s_first = gs_s_last = NULL;
-#endif
 		kase = ft_graft_swap_descend(dst_ft, key, key_len, &d);
 		if (kase == FT_GRAFT_SWAP_DELEGATE) {
 			/*
@@ -2609,10 +2601,8 @@ retry_swap:
 			enum cds_ft_status s = cds_ft_graft(dst_ft, _key, _key_len,
 					swap_ft);
 
-#ifdef FEATURE_FT_MW_LOCK_FINE_DROP
 			if (gs_rlock)
 				dst_ft->group->flavor->read_unlock();
-#endif
 			FT_TP(graft_swap_exit, (int) s);
 			return s;
 		}
@@ -2993,7 +2983,6 @@ retry_swap:
 		if (!swap_empty) {
 			struct cds_ft_inode_flag *empty = ft_node_flag(fresh, 0);
 
-#ifdef FEATURE_FT_MW_LOCK_FINE_DROP
 			/*
 			 * MW LOCK_FINE drop (exclusive swap, list off, insert side): FUSE
 			 * the swap-root retire INTO the insert-replace txn (recorded here,
@@ -3015,7 +3004,6 @@ retry_swap:
 					(void *) swap_ft->root, (void *) empty);
 				swap_retire_fused = true;
 			} else
-#endif
 			/*
 			 * Retire swap's root to an empty node AND (paired) unlink run_S
 			 * from swap's ordered list, FUSED in ONE flip so a reader never
@@ -3084,7 +3072,6 @@ retry_swap:
 				glue_publish_txn = NULL;	/* consumed */
 				glue_insert.txn = NULL;	/* the commit reclaimed it */
 			}
-#ifdef FEATURE_FT_MW_LOCK_FINE_DROP
 			/*
 			 * MW LOCK_FINE drop: a peer relocated the contended dst parent
 			 * between this op's descent and its replace commit, so the commit
@@ -3125,7 +3112,6 @@ retry_swap:
 				}
 				goto retry_swap;
 			}
-#endif
 			(void) ins_cst;
 		} else {
 			/*
@@ -3169,7 +3155,6 @@ retry_swap:
 					-(long) old_count /* fold -old_count onto the detach commit */,
 					NULL, false, NULL, NULL);
 			cds_ft_alloc_reserve_deactivate(dst_ft);
-#ifdef FEATURE_FT_MW_LOCK_FINE_DROP
 			/*
 			 * MW LOCK_FINE drop: under the FT-wide lock this detach is
 			 * failure-free, but with the lock dropped it can fail two ways,
@@ -3208,9 +3193,6 @@ retry_swap:
 				assert(dret == -ENOMEM);
 				goto prep_oom;
 			}
-#else
-			assert(dret == 0);	/* reserve guarantees no -ENOMEM */
-#endif
 			(void) dret;
 			swap_run.armed = drun.armed;
 			empty_pruned = true;
@@ -3276,7 +3258,6 @@ retry_swap:
 		 * Exclusive dst carries no RCU readers, so the sync is
 		 * skipped in that case.
 		 */
-#ifdef FEATURE_FT_MW_LOCK_FINE_DROP
 		/*
 		 * Release the §11 RCU-pin BEFORE this dst grace period: every
 		 * descent-captured dst node has been COPYING-locked by the
@@ -3290,7 +3271,6 @@ retry_swap:
 			dst_ft->group->flavor->read_unlock();
 			gs_rlock = false;
 		}
-#endif
 		if (!dst_ft->exclusive)
 			ft_writer_lock_gp_wait(dst_ft);
 
@@ -3467,13 +3447,11 @@ retry_swap:
 		 * No deferred edge was applied and nothing was published, so dst_ft and
 		 * swap_ft are both pristine -- there is nothing to roll back.
 		 */
-#ifdef FEATURE_FT_MW_LOCK_FINE_DROP
 		/* Every build error jumps here before the dst-drain release above. */
 		if (gs_rlock) {
 			dst_ft->group->flavor->read_unlock();
 			gs_rlock = false;
 		}
-#endif
 		ft_glue_abort(dst_ft, &glue_insert);
 		ft_glue_abort(swap_ft, &glue_extract);
 		if (glue_insert.txn)

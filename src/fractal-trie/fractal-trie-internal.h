@@ -126,18 +126,12 @@
  * 1600/1600 gate and the cross-trie oracles).  COARSE / OPTIMISTIC tries are
  * unaffected (COARSE keeps the mutex; OPTIMISTIC never took it).
  *
- * Build with -DFEATURE_FT_MW_LOCK_FINE_KEEP to OPT OUT (retain the FT-wide
- * mutex under FINE) -- reversible, for bisecting a regression to the drop.
- * An explicit -DFEATURE_FT_MW_LOCK_FINE_DROP is still honoured (idempotent).
- * This header is included first in the TU (before the impl headers), so the
- * definition reaches every `#ifdef FEATURE_FT_MW_LOCK_FINE_DROP` use site.
+ * This is now UNCONDITIONAL: the drop was the only shipping behaviour, and its
+ * opt-out (-DFEATURE_FT_MW_LOCK_FINE_KEEP) had no gate config, so the retained
+ * mutex was untested by construction.  Both flags are gone -- FINE always
+ * drops the FT-wide mutex, COARSE always keeps it, decided at RUNTIME by the
+ * group's writer strategy.
  */
-#ifndef FEATURE_FT_MW_LOCK_FINE_KEEP
-# ifndef FEATURE_FT_MW_LOCK_FINE_DROP
-#  define FEATURE_FT_MW_LOCK_FINE_DROP 1
-# endif
-#endif
-
 /*
  * Internal sentinel returned by ft_key_len() when a key-length argument
  * cannot be resolved (e.g. CDS_FT_LEN_DEFAULT passed to a variable-length
@@ -842,7 +836,7 @@ struct ft_pub_rec {
  * PARENT-owned per the edge principle (doc §8.3), and one word cannot be owned
  * by two locks.  It also removes a SELF-DEADLOCK: the offset setter had to spin
  * on FT_STATE_INPLACE_WAIT_MASK, which includes FT_STATE_COPYING under
- * FEATURE_FT_MW_DLM_ACQUIRE, so an op holding that node's own lock waited on
+ * the DLM lock-sets, so an op holding that node's own lock waited on
  * itself (see the reverted b20c471e).  The offset word carries no COPYING bit,
  * so its wait is over the engine proxy alone.
  */
@@ -932,11 +926,7 @@ struct ft_pub_rec {
  * only the recompact copy fence, resolved by the MW expected-old rather than
  * honored as a lock -- stays byte-identical.
  */
-#ifdef FEATURE_FT_MW_DLM_ACQUIRE
 #define FT_STATE_INPLACE_WAIT_MASK	(FT_STATE_PROXY | FT_STATE_COPYING)
-#else
-#define FT_STATE_INPLACE_WAIT_MASK	(FT_STATE_PROXY)
-#endif
 
 struct cds_ft_metadata {
 	/* 8-byte aligned fields. */
@@ -1142,7 +1132,7 @@ unsigned int ft_meta_parent_slot_offset(const struct cds_ft_metadata *meta)
  *
  * ★ The wait is over FT_STATE_PROXY ALONE, deliberately, NOT
  * FT_STATE_INPLACE_WAIT_MASK.  That mask includes FT_STATE_COPYING under
- * FEATURE_FT_MW_DLM_ACQUIRE, and while the offset shared @state an op holding
+ * the DLM lock-sets, and while the offset shared @state an op holding
  * this node's own COPYING lock spun on itself forever -- the self-deadlock that
  * reverted b20c471e (single-threaded, ft_unit test_lookup_nth_varlen: a prefix
  * insert builds a glue node and re-parents a node the op has locked).  The
@@ -1802,7 +1792,6 @@ void ft_writer_lock_scope_enter(struct cds_ft *ft)
 		 */
 		return;
 	}
-#ifdef FEATURE_FT_MW_LOCK_FINE_DROP
 	if (ft->lock_fine) {
 		/*
 		 * FT-WIDE-LOCK DROP (§11 drop-mechanics, MCAS-first): a FINE trie's
@@ -1823,7 +1812,6 @@ void ft_writer_lock_scope_enter(struct cds_ft *ft)
 		 */
 		return;
 	}
-#endif
 	if (caa_unlikely(ft_wlock_held != NULL)) {
 		/*
 		 * Two FT-wide locks at once: only a cross-trie op could nest

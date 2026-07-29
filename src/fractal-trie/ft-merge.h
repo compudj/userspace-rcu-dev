@@ -79,7 +79,6 @@ struct ft_merge_ctx {
 	struct cds_ft *dst_ft;		/* all fresh merged nodes live here */
 	struct ft_glue *gd;	/* dst cluster: built/deferred/dst frees/splices */
 	struct ft_glue *gs;	/* src side: src-overlap frees (+ prune later) */
-#ifdef FEATURE_FT_MW_DLM_ACQUIRE
 	/*
 	 * DLM overlap-spine plan-lock (§9.4 M-2): fence each DST overlap node
 	 * before reading its body, and retire it through the fenced terminal.
@@ -111,7 +110,6 @@ struct ft_merge_ctx {
 	 * instead of reporting MEMORY_ERROR.
 	 */
 	bool overlap_contended;
-#endif
 };
 
 /* Upper-bound counters for the read-only pre-pass that sizes the glues. */
@@ -326,7 +324,6 @@ struct cds_ft_inode_flag *ft_merge_build_run(struct ft_merge_ctx *c,
 	return plain;
 }
 
-#ifdef FEATURE_FT_MW_DLM_ACQUIRE
 /*
  * DLM overlap-spine plan-lock (§9.4 M-2): acquire a DST overlap node's COPYING
  * fence BEFORE ft_merge_build reads its body into the merged cluster, so the copy
@@ -369,7 +366,6 @@ int ft_merge_lock_overlap(void *node, uintptr_t *snap)
 	return ft_meta_copying_mark(cds_ft_item_to_metadata(
 		(struct cds_ft_inode *) node), snap);
 }
-#endif
 
 static
 struct cds_ft_inode_flag *ft_merge_build(struct ft_merge_ctx *c,
@@ -386,12 +382,10 @@ struct cds_ft_inode_flag *ft_merge_build(struct ft_merge_ctx *c,
 	unsigned long total_keys = 0;
 	bool tracked = false;
 	unsigned int b, s_fb = 0, d_fb = 0;
-#ifdef FEATURE_FT_MW_DLM_ACQUIRE
 	uintptr_t d_ov_snap = 0;	/* this frame's dst overlap fence snapshot */
 	bool d_ov_fenced = false;
 	uintptr_t s_ov_snap = 0;	/* and the src side's, when @fence_src */
 	bool s_ov_fenced = false;
-#endif
 
 	S = ft_resolve_skip_compressed(ft, S);
 	D = ft_resolve_skip_compressed(ft, D);
@@ -407,7 +401,6 @@ struct cds_ft_inode_flag *ft_merge_build(struct ft_merge_ctx *c,
 	 * shared-run recursion, but the node is freed whole.  src -> gs,
 	 * dst -> gd.  Internal overlap nodes are recorded at the tail instead.
 	 */
-#ifdef FEATURE_FT_MW_DLM_ACQUIRE
 	/*
 	 * Plan-lock THIS FRAME's SRC overlap node, on exactly the terms the dst
 	 * block below states -- before any body read, and recording the retire in
@@ -483,12 +476,6 @@ struct cds_ft_inode_flag *ft_merge_build(struct ft_merge_ctx *c,
 	}
 	if (D_comp && off_d == 0 && !d_ov_fenced)
 		ft_glue_defer_free(c->gd, cn_d, true);
-#else
-	if (S_comp && off_s == 0)
-		ft_glue_defer_free(c->gs, cn_s, true);
-	if (D_comp && off_d == 0)
-		ft_glue_defer_free(c->gd, cn_d, true);
-#endif
 
 	/*
 	 * Both compressed and sharing a prefix from their cursors -> collapse
@@ -707,17 +694,13 @@ struct cds_ft_inode_flag *ft_merge_build(struct ft_merge_ctx *c,
 	 * recorded on entry above).  src -> gs, dst -> gd.
 	 */
 	if (!S_ext && !S_comp
-#ifdef FEATURE_FT_MW_DLM_ACQUIRE
 			/* Already recorded at entry, together with its fence. */
 			&& !s_ov_fenced
-#endif
 	   )
 		ft_glue_defer_free(c->gs, ft_node_ptr(S), false);
 	if (!D_ext && !D_comp
-#ifdef FEATURE_FT_MW_DLM_ACQUIRE
 			/* Already recorded at entry, together with its fence. */
 			&& !d_ov_fenced
-#endif
 	   )
 		ft_glue_defer_free(c->gd, ft_node_ptr(D), false);
 
@@ -1362,7 +1345,6 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	}
 
 	/* Build the merged cluster invisibly (the only build-phase fallible step). */
-#ifdef FEATURE_FT_MW_DLM_ACQUIRE
 	/*
 	 * DLM overlap-spine plan-lock (§9.4 M-2): fence each dst overlap node before
 	 * the build reads it, and retire it through the fenced terminal, so a peer
@@ -1371,14 +1353,12 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	 */
 	ctx.fence_overlap = dst_ft->lock_fine && !unfailable;
 	ctx.fence_src = false;		/* cross-trie: the source is exclusive */
-#endif
 	M = ft_merge_build(&ctx, S, off_src, D, off_dst, 0, &merged_keys);
 	if (M == FT_MERGE_OOM) {
 		if (fresh_root)
 			free_cds_ft_node_unpublished(src_ft, fresh_root);
 		ft_glue_abort(dst_ft, &gd);
 		ft_glue_abort(src_ft, &gs);
-#ifdef FEATURE_FT_MW_DLM_ACQUIRE
 		/*
 		 * A missed overlap fence shares FT_MERGE_OOM's unwind but is
 		 * CONTENTION, not memory: both tries are pristine (the build published
@@ -1387,7 +1367,6 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		 */
 		if (ctx.overlap_contended)
 			*contended = true;
-#endif
 		return CDS_FT_STATUS_MEMORY_ERROR;
 	}
 	/*
@@ -2108,7 +2087,6 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	{
 		enum urcu_txn_status mst = ft_flip_txn_commit(dst_ft, txn);
 
-#ifdef FEATURE_FT_MW_DLM_ACQUIRE
 		/*
 		 * The flip did not happen, so no fenced retire took effect and this
 		 * op owns none of those frees -- renounce them before the step-7
@@ -2124,9 +2102,6 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		 */
 		if (mst != URCU_TXN_STATUS_OK)
 			ft_glue_fenced_renounce_free(&gd);
-#else
-		(void) mst;
-#endif
 	}
 
 	/*
@@ -2140,7 +2115,6 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	 *    was handed to @txn above and is already released by its flip.)
 	 */
 	ft_glue_release_splice_holders(&gd);
-#ifdef FEATURE_FT_MW_DLM_ACQUIRE
 	/*
 	 *    Same for the overlap-spine plan-locks: a COMMITTED fenced retire
 	 *    consumed each fence into TOMBSTONE (clear_if_held no-ops), while an
@@ -2150,7 +2124,6 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	 *    step-7 reclaim, while the nodes are still addressable.
 	 */
 	ft_glue_clear_fenced(&gd);
-#endif
 
 	/*
 	 * 6. The dst net key-count delta (merged_keys - cnt_dst) is FOLDED into
@@ -3033,9 +3006,7 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 		return status;
 	}
 
-#ifdef FEATURE_FT_MW_LOCK_FINE_DROP
 	bool md_rlock = false;
-#endif
 	bool md_contended;
 
 	/*
@@ -3049,7 +3020,6 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 	 * cds_ft_graft_swap's retry_swap.
 	 */
 merge_spine_retry:
-#ifdef FEATURE_FT_MW_LOCK_FINE_DROP
 	/*
 	 * §11 cross-trie RCU-pinning: the spine-copy path below descends the live
 	 * dst here and COPYING-locks a descent-captured dst node (@d_dst->pnf /
@@ -3068,7 +3038,6 @@ merge_spine_retry:
 		dst_ft->group->flavor->read_lock();
 		md_rlock = true;
 	}
-#endif
 	kd = ft_merge_descend(dst_ft, okey_dst, dst_key_len, &d_dst,
 			&off_dst, &cnt_dst);
 
@@ -3093,12 +3062,10 @@ merge_spine_retry:
 				pre_txn, &md_contended);
 		if (md_contended) {
 			/* Contention, nothing moved: re-pin, re-descend, rebuild. */
-#ifdef FEATURE_FT_MW_LOCK_FINE_DROP
 			if (md_rlock) {
 				dst_ft->group->flavor->read_unlock();
 				md_rlock = false;
 			}
-#endif
 			goto merge_spine_retry;
 		}
 		if (status == CDS_FT_STATUS_OK) {
@@ -3120,16 +3087,13 @@ merge_spine_retry:
 				uatomic_store(&dst_ft->max_used_key_len, nm,
 					CMM_RELAXED);
 		}
-#ifdef FEATURE_FT_MW_LOCK_FINE_DROP
 		if (md_rlock) {
 			dst_ft->group->flavor->read_unlock();
 			md_rlock = false;
 		}
-#endif
 		FT_TP(merge_exit, (int) status);
 		return status;
 	}
-#ifdef FEATURE_FT_MW_LOCK_FINE_DROP
 	/*
 	 * Fall-through: the spine-copy shape did not apply (whole-source move,
 	 * or an empty dst under @dst_key -> the detach graft below).  Release the
@@ -3141,7 +3105,6 @@ merge_spine_retry:
 		dst_ft->group->flavor->read_unlock();
 		md_rlock = false;
 	}
-#endif
 
 	/*
 	 * Whole-source move (src_key_len == 0): the entire @src_ft is the
@@ -3161,7 +3124,6 @@ merge_spine_retry:
 		 * BUSY at merge_at's entry, so this graft sees an exclusive source (or
 		 * a same-trie rekey); ft_graft_keylen runs its fused body directly.
 		 */
-#ifdef FEATURE_FT_MW_LOCK_FINE_DROP
 		if (dst_ft->lock_fine && src_ft->exclusive) {
 			const struct rcu_flavor_struct *flavor =
 				dst_ft->group->flavor;
@@ -3183,7 +3145,6 @@ merge_spine_retry:
 					src_ft, pre_txn);
 			flavor->read_unlock();
 		} else
-#endif
 			status = ft_graft_keylen(dst_ft, dst_key, dst_key_len,
 					src_ft, pre_txn);
 		FT_TP(merge_exit, (int) status);

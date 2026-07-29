@@ -1248,7 +1248,6 @@ int ft_node_recompact(enum ft_recompact mode,
 	 * peer publishes into (unpublished cluster / retained exclusion), so
 	 * they stay unfenced.
 	 */
-#ifdef FEATURE_FT_MW_DLM_ACQUIRE
 	/*
 	 * DLM Step 1 (ft-step1-dlm-acquire.md): acquire the WHOLE lock-set
 	 * {C, P, (GP)} in ONE all-or-none MCAS up front, replacing the incremental
@@ -1370,7 +1369,6 @@ int ft_node_recompact(enum ft_recompact mode,
 			nr_rel++;
 		}
 	} else
-#endif
 	if (retire_txn && !cluster_leaf && metadata && old_node) {
 		ret = ft_meta_copying_mark(metadata, &fence_state);
 		if (ret)
@@ -1531,23 +1529,8 @@ int ft_node_recompact(enum ft_recompact mode,
 			 * build-invisible until the commit), so the abort boundary
 			 * is byte-for-byte clean.
 			 */
-#ifndef FEATURE_FT_MW_DLM_ACQUIRE
-			if (ft->lock_fine && fenced && inh_parent &&
-					ft_copying_lock_member(
-						ft_flag_to_metadata(ft, inh_parent),
-						rel_meta, rel_snap, &nr_rel)) {
-				free_cds_ft_node_unpublished(ft, new_node);
-				/* Members locked by EARLIER incremental steps are
-				 * still held when this one fails -- release them
-				 * too, like every other bail below. */
-				ft_copying_unlock_members(rel_meta, nr_rel);
-				ft_meta_copying_clear(metadata);
-				return -EAGAIN;
-			}
-#else
 			/* DLM: {C,P,(GP)} were acquired up front (see the block at
 			 * function entry); P is already held here. */
-#endif
 			ext_snapshot = (struct cds_ft_node *)
 				rcu_dereference(metadata->external_nodes);
 			if (caa_unlikely(ft_node_flip_proxy(
@@ -2042,19 +2025,9 @@ skip_copy:
 					else
 						(void) ft_resolve_parent_slot(cn_meta,
 							ft, &gp_parent);
-#ifndef FEATURE_FT_MW_DLM_ACQUIRE
-					if (gp_parent &&
-					    ft_copying_lock_member(
-						ft_flag_to_metadata(ft, gp_parent),
-						rel_meta, rel_snap, &nr_rel)) {
-						ret = -EAGAIN;
-						goto abandon_fresh;
-					}
-#else
 					/* DLM: GP was acquired up front (whenever
 					 * P is compressed) -- already held. */
 					(void) gp_parent;
-#endif
 				}
 				/*
 				 * FT_RECOMPACT_DEL relocates the rebuilt
@@ -2280,7 +2253,6 @@ abandon_fresh:
 	return ret;
 }
 
-#ifdef FEATURE_FT_MW_DLM_ACQUIRE
 /*
  * The metadata whose STATE WORD carries a child's parent_slot_offset -- the word
  * an SW re-parent pso edge parks and that ft_meta_nr_child_inc CASes.  NULL for
@@ -2565,7 +2537,6 @@ abandon:
 out:
 	return ret;	/* marks[0..*nr_marks) swept by the caller */
 }
-#endif	/* FEATURE_FT_MW_DLM_ACQUIRE */
 
 /*
  * Return 0 on success or negative error value on error.

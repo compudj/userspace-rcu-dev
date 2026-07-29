@@ -55,31 +55,24 @@ fi
 # name | configure-time CPPFLAGS | tests
 #   u=ft_unit  ion=ft_inv-on  ioff=ft_inv-off  imw=ft_inv-on + FT_INV_MW=1
 ALL_CONFIGS=(
-	"default||u ion ioff"
+	# DLM (per-node lock-sets) is no longer a build flag: it is the ONLY
+	# multi-writer implementation, selected at RUNTIME by ft->lock_fine
+	# (the writer strategy).  The former "dlm" / "dlm-fault" configs folded
+	# into "default" / "fault-audit" -- every config now exercises the one
+	# MW implementation, so a failure no longer has to be attributed to a
+	# build mode first.  "default" keeps imw because the concurrent-writer
+	# and rekey oracles gate on FT_INV_MW at RUNTIME: without it they
+	# compile in and then skip, which reads as coverage and is not.
+	"default||u ion ioff imw"
+	# Fault injection drives the acquire bail + re-descend paths: those
+	# acquires never miss single-threaded, and the concurrent oracles merge
+	# DISJOINT key sets, so injection is the only thing that reaches them.
 	"fault-audit|-DFEATURE_FT_FAULT_INJECT -DFT_DEBUG_TOMBSTONE_AUDIT|u ioff"
 	"audit|-DFT_DEBUG_TOMBSTONE_AUDIT|u ion ioff"
 	"vam|-DFEATURE_FT_VERIFY_AT_MUTATION|u"
 	"noskip|-DNO_FEATURE_FT_SKIP_COMPRESSED|u ioff"
 	"nocompress|-DNO_FEATURE_FT_COMPRESS|u ioff"
 	"in-place|-DFEATURE_FT_INSERT_IN_PLACE|u"
-	# The DLM (per-node lock-set) build.  Until this config existed, NOTHING
-	# in the gate defined FEATURE_FT_MW_DLM_ACQUIRE -- unlike
-	# FEATURE_FT_MW_LOCK_FINE_DROP it does not self-enable -- so the whole
-	# mixed sw/mw subsystem (structural_sw, ft_flip_txn_record_tag's SW
-	# branch, ft_flip_txn_record_tag_mw) and the six rekey-graft oracles
-	# gated on it in ft_inv's main() were compiled out of every gate run.
-	# It carries imw because those oracles ALSO gate on FT_INV_MW at
-	# runtime: without it they would compile in and then skip, which reads
-	# as coverage and is not.
-	"dlm|-DFEATURE_FT_MW_DLM_ACQUIRE|u ion ioff imw"
-	# DLM *and* fault injection in ONE build.  Neither existing config gives
-	# this: "dlm" has no fault hook, "fault-audit" has no DLM.  So every test
-	# that arms cds_ft_fault_lock_countdown against a DLM-only acquire -- the
-	# merge overlap-spine fence, the recompact lock-set release -- compiled
-	# out of the whole gate and read as covered.  Those acquires never miss
-	# single-threaded and the concurrent oracles merge DISJOINT key sets, so
-	# fault injection is the only thing that drives their bail + re-descend.
-	"dlm-fault|-DFEATURE_FT_MW_DLM_ACQUIRE -DFEATURE_FT_FAULT_INJECT|u"
 )
 
 # Optional positional filter: run only the named configs.
