@@ -208,6 +208,88 @@ static void node_free_rcu(struct ft_test_node *n)
 	call_rcu(&n->head, node_free_rcu_cb);
 }
 
+static void mw_violation_snapshot(void);
+
+/*
+ * cds_ft_verify, and on a failure DUMP the structure that failed it.
+ *
+ * A structural violation names one node; what it is wired to is the rest of the
+ * finding, and it only exists right here -- the next step of any teardown
+ * destroys it.  cds_ft_show RECURSES the tree instead of navigating it in key
+ * order, so it returns on exactly the tries an ordered walk cannot get through,
+ * and the shapes that fail are small (the sibling oracle's whole trie is ~20
+ * nodes).
+ */
+static int verify_or_dump(struct cds_ft *ft, const char *what)
+{
+	if (cds_ft_verify(ft, stderr) == CDS_FT_STATUS_OK)
+		return 0;
+	fprintf(stderr, "%s: cds_ft_verify FAILS -- structure follows\n", what);
+	cds_ft_show(ft, stderr, CDS_FT_SHOW_PRETTY);
+	mw_violation_snapshot();
+	return -1;
+}
+
+/*
+ * Does a FULL ordered enumeration of the trie still terminate, and does the
+ * structure still verify, now that the writers are joined?
+ *
+ * Every concurrent invariant tears down through drain_and_destroy, and that
+ * drain only ever calls cds_ft_lookup_first in a loop: each call restarts at
+ * the root, so as long as the FIRST key stays reachable the drain completes and
+ * NOTHING ever walks the whole trie.  A trie whose successor walk is broken
+ * from the middle onwards therefore tears down silently, and the damage is
+ * reported -- if at all -- as a bare node leak three steps later.
+ *
+ * BOUNDED, never unbounded: the damage this looks for makes cds_ft_next cycle,
+ * and a diagnostic that hangs reports nothing at all.  An earlier attempt at
+ * this check used cds_ft_count_entries and turned five gate configs into
+ * timeouts, which costs every test after it in those configs -- worse than the
+ * missing check.  With the cap the same trie yields a named failure instead.
+ *
+ * Unconditional: measured at 36.1 s vs 36.8 s for the whole ft_inv suite, i.e.
+ * within run-to-run noise, so there is nothing to gate it behind.
+ */
+static int teardown_walk_check(struct cds_ft *ft, const char *what)
+{
+	struct cds_ft_iter *iter;
+	unsigned long steps = 0;
+	const unsigned long cap = 1000000;
+	enum cds_ft_status s;
+	int ret = 0;
+
+	/*
+	 * VERIFY FIRST, and on a failure do not walk at all.  The step cap below
+	 * does NOT bound the walk on a structurally broken trie: the observed
+	 * non-termination is a going-up cycle INSIDE one cds_ft_lookup_first call
+	 * (measured: the same level/slot/anchor 100001 times), which never comes
+	 * back to be counted.  A caught run that then hangs loses every test
+	 * after it, so the validator's named node is the report.
+	 */
+	if (verify_or_dump(ft, what)) {
+		fprintf(stderr, "%s: teardown ordered walk SKIPPED (it may not "
+			"return on this trie)\n", what);
+		return -1;
+	}
+	if (cds_ft_iter_create(ft, &iter) < 0)
+		return -1;
+	rcu_read_lock();
+	for (s = cds_ft_lookup_first(ft, iter); s == CDS_FT_STATUS_OK;
+			s = cds_ft_next(ft, iter)) {
+		if (++steps > cap) {
+			fprintf(stderr, "%s: teardown ordered walk OVERRUN "
+				"(%lu steps, still going)\n", what, cap);
+			ret = -1;
+			break;
+		}
+	}
+	rcu_read_unlock();
+	cds_ft_iter_destroy(iter);
+	if (ret)
+		mw_violation_snapshot();
+	return ret;
+}
+
 /* Free every node reachable through the trie, then destroy the trie. */
 static int drain_and_destroy(struct cds_ft *ft, struct cds_ft_group *group)
 {
@@ -215,6 +297,8 @@ static int drain_and_destroy(struct cds_ft *ft, struct cds_ft_group *group)
 	enum cds_ft_status s;
 	int ret = 0;
 
+	if (teardown_walk_check(ft, "drain_and_destroy"))
+		ret = -1;
 	s = cds_ft_iter_create(ft, &iter);
 	if (s < 0) {
 		cds_ft_destroy(ft);
@@ -4129,10 +4213,8 @@ static int inv_sibling_split_compress(void)
 			cds_ft_count_entries(ft), live);
 		ret = -1;
 	}
-	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
-		fprintf(stderr, "inv_sibling_split_compress: cds_ft_verify failed\n");
+	if (verify_or_dump(ft, "inv_sibling_split_compress"))
 		ret = -1;
-	}
 	rcu_read_unlock();
 
 	fprintf(stderr, "# inv_sibling_split_compress: %d pairs, %lu cycles, "
