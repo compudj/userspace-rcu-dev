@@ -78,7 +78,7 @@
  * compares the run count against this plan, so retiring a test means
  * decrementing here in the same commit.
  */
-#define NR_TESTS	(65 + NR_TESTS_REKEY_DLM)
+#define NR_TESTS	(66 + NR_TESTS_REKEY_DLM)
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -3714,6 +3714,238 @@ static int inv_rekey_linearizability(void)
 
 	free(w);
 	free(r);
+	if (drain_and_destroy(ft, group) < 0)
+		ret = -1;
+	if (leak_check() < 0)
+		ret = -1;
+	return ret;
+}
+
+/*
+ * SIBLING PAIR: two writers, one child each of a shared three-byte prefix, both
+ * cycling insert -> read-back -> remove.  With the peer's child present an
+ * insert has to SPLIT the prefix node; with it absent a remove has to
+ * PATH-COMPRESS the prefix back into a leaf.  So the pair drives a split and a
+ * compression of the SAME node, from two threads, continuously -- which the
+ * disjoint-key insert/remove oracles never do, because their keys diverge high
+ * enough that no node is ever both split and compressed under contention.
+ *
+ * ORACLE: an insert that returned OK must be readable in the very critical
+ * section that published it.  Nobody else writes that key, so a miss is not a
+ * race with a peer's legitimate removal -- it is a lost key.
+ */
+#define SIBP_NW		6		/* sibling pairs */
+
+/* (b0,b1,b2,b3) as a fixed four-byte key. */
+static uint64_t sibp_key(uint8_t b0, uint8_t b1, uint8_t b2, uint8_t b3)
+{
+	return ((uint64_t) b0 << 24) | ((uint64_t) b1 << 16) |
+		((uint64_t) b2 << 8) | (uint64_t) b3;
+}
+
+/* Remove the node @n stored at key @v, by IDENTITY. */
+static enum cds_ft_status sibp_remove(struct cds_ft *ft, uint64_t v,
+		struct ft_test_node *n)
+{
+	struct cds_ft_iter *iter = NULL;
+	enum cds_ft_status st = CDS_FT_STATUS_NOT_FOUND;
+	uint8_t k[8] = { 0 };
+
+	if (cds_ft_iter_create(ft, &iter) < 0)
+		abort();
+	rcu_read_lock();
+	cds_ft_u64_to_key(ft, v, k, CDS_FT_LEN_DEFAULT);
+	cds_ft_iter_set_key(iter, k, CDS_FT_LEN_DEFAULT);
+	cds_ft_lookup(ft, iter);
+	if (cds_ft_iter_node(iter)) {
+		st = cds_ft_remove(ft, iter, &n->node);
+		if (st == CDS_FT_STATUS_OK)
+			node_free_rcu(n);
+	}
+	rcu_read_unlock();
+	cds_ft_iter_destroy(iter);
+	return st;
+}
+
+struct sibp_arg {
+	struct cds_ft *ft;
+	uint64_t key;
+	unsigned long ops, busy, lost, stuck;
+	int failed;
+	int *stop_all;
+};
+
+static void *sibp_writer(void *arg)
+{
+	struct sibp_arg *w = (struct sibp_arg *) arg;
+	unsigned long iters = 0;
+
+	rcu_register_thread();
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	while (!test_stop) {
+		struct ft_test_node *n = node_alloc(w->key);
+		struct cds_ft_node *f = NULL;
+		enum cds_ft_status st;
+		int a;
+
+		rcu_read_lock();
+		st = insert_u64(w->ft, w->key, n);
+		if (st != CDS_FT_STATUS_OK) {
+			rcu_read_unlock();
+			node_free(n);
+			if (st == CDS_FT_STATUS_DUPLICATE_FOUND) {
+				fprintf(stderr, "sibp key=%#lx: DUPLICATE -- our own previous "
+					"node was never removed\n", (unsigned long) w->key);
+				w->failed = 1;
+				goto out;
+			}
+			w->busy++;		/* BUSY / MEMORY: transient */
+			continue;
+		}
+		if (lookup_u64(w->ft, w->key, &f) != CDS_FT_STATUS_OK ||
+				f != &n->node) {
+			rcu_read_unlock();
+			fprintf(stderr, "sibp key=%#lx: an OK insert is NOT READABLE in "
+				"the critical section that published it (f=%p want=%p) "
+				"after %lu ops, %lu busy\n", (unsigned long) w->key,
+				(void *) f, (void *) &n->node, w->ops, w->busy);
+			w->lost++;
+			w->failed = 1;
+			mw_violation_snapshot();
+			goto out;
+		}
+		rcu_read_unlock();
+
+		for (a = 0; a < 100000 && !test_stop; a++)
+			if (sibp_remove(w->ft, w->key, n) == CDS_FT_STATUS_OK)
+				break;
+		if (a == 100000) {
+			fprintf(stderr, "sibp key=%#lx: could not take back our own key\n",
+				(unsigned long) w->key);
+			w->stuck++;
+			w->failed = 1;
+			goto out;
+		}
+		w->ops++;
+		if ((++iters & 0xff) == 0)
+			rcu_quiescent_state();
+	}
+out:
+	*w->stop_all = 1;
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static int inv_sibling_split_compress(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	struct sibp_arg *w;
+	pthread_t th[SIBP_NW * 2];
+	struct timespec t0;
+	unsigned long ops = 0, busy = 0, lost = 0, live = 0;
+	int i, ret = 0, stop_all = 0;
+
+	/*
+	 * KNOWN-FAILING, ON PURPOSE.  This oracle reproduces a LIVE defect: two
+	 * writers cycling insert/remove on two SIBLING children of one prefix
+	 * lose keys outright (an insert reports OK for a key no root descent can
+	 * find).  It is registered unconditionally so the gate keeps reporting
+	 * it -- a skipped test reads as coverage and is not.
+	 *
+	 * It used to HANG rather than fail, which is strictly worse: a hung
+	 * suite scores GREEN against a gate that only counts failures.  That
+	 * wedge (a removal deriving its position from a stale node->prev that
+	 * named a RETIRED holder, then retrying the identical derivation
+	 * forever while holding the per-trie FIFO fair mutex) is fixed; what
+	 * remains is the key loss.
+	 */
+	mw_install_fatal_handler();
+	leak_reset();
+
+	ft = create_fixed_fine_lock_listoff_ft(4, &group);
+	cds_ft_make_concurrent(ft);
+
+	w = (struct sibp_arg *) calloc(SIBP_NW * 2, sizeof(*w));
+	if (!w)
+		abort();
+
+	rcu_read_lock();
+	for (i = 0; i < SIBP_NW; i++) {
+		uint8_t p = (uint8_t) (0x30 + i), m = (uint8_t) (0x10 + i);
+		uint64_t sk[3];
+		int c;
+
+		/* Static shape: (p,1) (p,5) keep p a branch, (p,3,guard) keeps
+		 * (p,3) a branch, so the only node that is split and compressed
+		 * under contention is the prefix (p,3,m). */
+		sk[0] = sibp_key(p, 1, 0, 0);
+		sk[1] = sibp_key(p, 5, 0, 0);
+		sk[2] = sibp_key(p, 3, (uint8_t) (0x40 + i), 0);
+		for (c = 0; c < 3; c++) {
+			if (insert_u64(ft, sk[c], node_alloc(sk[c])) !=
+					CDS_FT_STATUS_OK)
+				abort();
+			live++;
+		}
+
+		w[2 * i].ft = w[2 * i + 1].ft = ft;
+		w[2 * i].stop_all = w[2 * i + 1].stop_all = &stop_all;
+		w[2 * i].key = sibp_key(p, 3, m, 0x00);
+		w[2 * i + 1].key = sibp_key(p, 3, m, 0x60);
+	}
+	rcu_read_unlock();
+
+	test_go = 0;
+	test_stop = 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < SIBP_NW * 2; i++)
+		pthread_create(&th[i], NULL, sibp_writer, &w[i]);
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	test_go = 1;
+
+	rcu_thread_offline();
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS && !stop_all)
+		usleep(1000);
+	test_stop = 1;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < SIBP_NW * 2; i++)
+		pthread_join(th[i], NULL);
+	rcu_thread_online();
+
+	synchronize_rcu();
+	rcu_read_lock();
+	for (i = 0; i < SIBP_NW * 2; i++) {
+		ops += w[i].ops;
+		busy += w[i].busy;
+		lost += w[i].lost;
+		if (w[i].failed)
+			ret = -1;
+		if (w[i].ops == 0) {
+			fprintf(stderr, "inv_sibling_split_compress: writer %d never "
+				"completed a cycle\n", i);
+			ret = -1;
+		}
+	}
+	if (cds_ft_count_entries(ft) != live) {
+		fprintf(stderr, "inv_sibling_split_compress: entries %lu != live %lu\n",
+			cds_ft_count_entries(ft), live);
+		ret = -1;
+	}
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "inv_sibling_split_compress: cds_ft_verify failed\n");
+		ret = -1;
+	}
+	rcu_read_unlock();
+
+	fprintf(stderr, "# inv_sibling_split_compress: %d pairs, %lu cycles, "
+		"%lu transient, %lu lost\n", SIBP_NW, ops, busy, lost);
+
+	free(w);
 	if (drain_and_destroy(ft, group) < 0)
 		ret = -1;
 	if (leak_check() < 0)
@@ -14393,6 +14625,7 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_rekey_linearizability);
 	RUN_TEST(inv_rekey_merge_occupied_dst);
 	RUN_TEST(inv_rekey_merge_shared_dst);
+	RUN_TEST(inv_sibling_split_compress);
 	RUN_TEST(inv_concurrent_writers_shared);
 	RUN_TEST(inv_concurrent_writers_coarse_lock);
 	RUN_TEST(inv_concurrent_writers_fine_lock);
