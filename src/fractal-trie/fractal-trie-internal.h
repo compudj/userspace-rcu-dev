@@ -1683,13 +1683,22 @@ struct cds_ft {
 	 * pthread_self() of the thread currently inside a writer API
 	 * (claimed via atomic CAS), or 0 when no writer is active.
 	 * @excl_writer_depth is a reentry depth counter, accessed only
-	 * by the owning thread.  @excl_nr_readers counts readers that
-	 * are currently inside a reader API on an exclusive-mode trie;
-	 * concurrent-mode readers do not touch it (RCU handles them).
+	 * by the owning thread.  Both are meaningful ONLY where writers
+	 * actually serialize -- see @excl_nr_writers.  @excl_nr_readers
+	 * counts readers that are currently inside a reader API on an
+	 * exclusive-mode trie; concurrent-mode readers do not touch it
+	 * (RCU handles them).
+	 *
+	 * @excl_nr_writers is the FINE-trie replacement for @excl_owner: a
+	 * FINE trie skips the FT-wide writer mutex, so DISJOINT WRITERS RUN
+	 * IN PARALLEL BY DESIGN and no single owner word can represent them.
+	 * Count them instead, so the reader check can still ask the only
+	 * question that matters there -- is a DIFFERENT thread writing?
 	 */
 	unsigned long excl_owner;
 	unsigned long excl_writer_depth;
 	unsigned long excl_nr_readers;
+	unsigned long excl_nr_writers;
 #endif
 
 #ifdef FEATURE_FT_VERIFY_AT_MUTATION
@@ -2048,6 +2057,24 @@ struct ft_excl_reader_scope {
 		abort();						\
 	} while (0)
 
+/*
+ * This thread's writer nesting, for the FINE path below: @ft_excl_self_ft /
+ * @ft_excl_self_depth mirror ft_wlock_held / ft_wlock_depth (one trie, the
+ * live dst of a cross-trie op), and @ft_excl_self_any counts writer scopes on
+ * ANY trie.  The reader check aborts only when this thread's scopes are ALL
+ * accounted for on the trie being read -- so an untracked second trie costs a
+ * missed report, never a false one.
+ */
+static __thread struct cds_ft *ft_excl_self_ft;
+static __thread unsigned long ft_excl_self_depth;
+static __thread unsigned long ft_excl_self_any;
+
+static inline
+unsigned long ft_excl_self_writers(const struct cds_ft *ft)
+{
+	return ft_excl_self_ft == ft ? ft_excl_self_depth : 0;
+}
+
 static inline
 void ft_excl_writer_enter(struct cds_ft *ft)
 {
@@ -2060,18 +2087,47 @@ void ft_excl_writer_enter(struct cds_ft *ft)
 	 * optimistic trie.
 	 */
 	ft_writer_lock_scope_enter(ft);
-	prev = uatomic_cmpxchg(&ft->excl_owner, 0, self);
-	if (prev != 0) {
-		if (prev == self) {
-			/* Reentry from the same thread (e.g. graft_swap
-			 * delegating to graft). */
-			ft->excl_writer_depth++;
-			return;
-		}
-		ft_excl_abort("cds_ft=%p: writer conflict -- owner 0x%lx, entering thread 0x%lx\n",
-			(void *) ft, prev, self);
+	ft_excl_self_any++;
+	if (ft_excl_self_ft == ft) {
+		ft_excl_self_depth++;
+	} else if (!ft_excl_self_ft) {
+		ft_excl_self_ft = ft;
+		ft_excl_self_depth = 1;
 	}
-	ft->excl_writer_depth = 1;
+	if (ft->lock_fine && !ft->exclusive) {
+		/*
+		 * CONCURRENT + FINE is the ONLY combination where writer/writer
+		 * overlap is contract-conforming: a FINE trie skips the FT-wide
+		 * writer mutex, so writers on disjoint subtrees proceed in
+		 * parallel and only structural collisions serialize -- the POINT
+		 * of fine locking.  The single-owner CAS aborted on that, so
+		 * every concurrent oracle tripped this validator by construction
+		 * and it could only ever run single-threaded.  Count writers
+		 * instead; the reader check below uses the count.
+		 *
+		 * The other combinations KEEP the owner CAS, and it is the whole
+		 * point there: an EXCLUSIVE trie is one whose caller promised to
+		 * serialize access, so overlap is exactly the user error this
+		 * validator exists to catch (and an exclusive trie is FINE by
+		 * default, so gating on lock_fine alone would have disabled the
+		 * check where it matters most).  A COARSE trie serializes under
+		 * the FT-wide mutex, so its owner word is accurate anyway.
+		 */
+		uatomic_add(&ft->excl_nr_writers, 1);
+	} else {
+		prev = uatomic_cmpxchg(&ft->excl_owner, 0, self);
+		if (prev != 0) {
+			if (prev == self) {
+				/* Reentry from the same thread (e.g. graft_swap
+				 * delegating to graft). */
+				ft->excl_writer_depth++;
+				return;
+			}
+			ft_excl_abort("cds_ft=%p: writer conflict -- owner 0x%lx, entering thread 0x%lx\n",
+				(void *) ft, prev, self);
+		}
+		ft->excl_writer_depth = 1;
+	}
 	/*
 	 * A non-zero reader count means a reader is asserting mutual
 	 * exclusion against us: in exclusive mode every reader claims;
@@ -2089,8 +2145,14 @@ void ft_excl_writer_enter(struct cds_ft *ft)
 static inline
 void ft_excl_writer_exit(struct cds_ft *ft)
 {
-	if (--ft->excl_writer_depth == 0)
+	if (ft->lock_fine && !ft->exclusive) {
+		uatomic_sub(&ft->excl_nr_writers, 1);
+	} else if (--ft->excl_writer_depth == 0) {
 		uatomic_store(&ft->excl_owner, 0, CMM_RELEASE);
+	}
+	ft_excl_self_any--;
+	if (ft_excl_self_ft == ft && --ft_excl_self_depth == 0)
+		ft_excl_self_ft = NULL;
 }
 
 static inline
@@ -2118,6 +2180,22 @@ struct ft_excl_reader_scope ft_excl_reader_enter(struct cds_ft *ft)
 		ft_excl_abort("cds_ft=%p: reader 0x%lx entering with writer 0x%lx active (%s mode)\n",
 			(void *) ft, (unsigned long) pthread_self(), owner,
 			ft->exclusive ? "exclusive" : "concurrent without RCU read-side lock");
+	if (ft->lock_fine && !ft->exclusive) {
+		unsigned long mine = ft_excl_self_writers(ft);
+		unsigned long nw = uatomic_load(&ft->excl_nr_writers, CMM_ACQUIRE);
+
+		/*
+		 * A FINE trie claims no owner, so ask the count.  Abort only
+		 * when the excess provably belongs to ANOTHER thread: this
+		 * thread's own scopes must all be accounted for on THIS trie
+		 * (@ft_excl_self_any == @mine), else an untracked second trie
+		 * would make us report our own write as a peer's.
+		 */
+		if (nw > mine && ft_excl_self_any == mine)
+			ft_excl_abort("cds_ft=%p: reader 0x%lx entering with %lu concurrent writer(s) (concurrent without RCU read-side lock)\n",
+				(void *) ft, (unsigned long) pthread_self(),
+				nw - mine);
+	}
 	return scope;
 }
 

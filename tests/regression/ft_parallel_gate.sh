@@ -78,16 +78,11 @@ ALL_CONFIGS=(
 	# cds_ft_group_attr_set_key_map returns NOT_SUPPORTED.  It had no gate
 	# config, so that state was untested by construction.
 	"nokeymap|-DNO_FEATURE_FT_KEY_MAP|u ion ioff"
-	# The access-discipline validator.  ft_unit ONLY, deliberately: its
-	# writer/writer check asserts that writers never overlap ("the contract
-	# serializes writers in both modes", fractal-trie-internal.h), which
-	# predates the FT-wide-lock drop and contradicts LOCK_FINE, where
-	# disjoint writers running in parallel IS the design.  Every concurrent
-	# ft_inv oracle therefore trips it by construction.  ft_unit is
-	# single-threaded, which is where the validator's own negative tests
-	# live -- and they used to SKIP, because nothing in the gate defined
-	# this flag.
-	"excl|-DFEATURE_FT_EXCL_VALIDATE|u"
+	# The access-discipline validator.  Its writer/writer check is now
+	# MODE-AWARE, so it runs against the concurrent oracles too: a FINE trie
+	# counts writers instead of claiming a single owner, because disjoint
+	# writers running in parallel is the design there, not a violation.
+	"excl|-DFEATURE_FT_EXCL_VALIDATE|u ion ioff imw"
 	# BUILD-ONLY, deliberately.  -DNO_FEATURE_FT_MERGE compiles out the merge
 	# subsystem (~20 KiB .text; cds_ft_merge then returns NOT_SUPPORTED).  It
 	# had no gate config and had ROTTED: the rekey fold's occupied-dst arm --

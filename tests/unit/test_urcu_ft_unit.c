@@ -20440,8 +20440,17 @@ static void *excl_neg_reader(void *arg)
 }
 
 /*
- * In the forked child: two writers racing on the same trie trip the
- * writer/writer CAS.  Works in both concurrent and exclusive mode.
+ * In the forked child: two writers racing on an EXCLUSIVE trie trip the
+ * writer/writer CAS.
+ *
+ * The trie must be made EXCLUSIVE, because that is the contract this check
+ * exists to police: the caller has promised to serialize access, so overlap
+ * is a caller bug.  A CONCURRENT + FINE trie -- which is the DEFAULT -- makes
+ * no such promise: writers on disjoint subtrees proceed in parallel, that
+ * being the point of fine locking, and the validator counts writers there
+ * instead of claiming a single owner.  This provocation used to rely on the
+ * default trie and so asserted the opposite of the documented contract; it
+ * passed only because the check predated the FT-wide-lock drop.
  */
 __attribute__((noreturn))
 static void excl_neg_writer_writer_child(void)
@@ -20455,6 +20464,7 @@ static void excl_neg_writer_writer_child(void)
 	(void) freopen("/dev/null", "w", stderr);
 	alarm(30);
 	ctx_a.ft = ctx_b.ft = create_varlen_ft(&group);
+	cds_ft_make_exclusive(ctx_a.ft);
 	pthread_barrier_init(&start, NULL, 2);
 	ctx_a.start = ctx_b.start = &start;
 	ctx_a.seed_bump = 0x1111;
