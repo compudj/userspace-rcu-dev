@@ -83,12 +83,28 @@
  * A deleted node must not be RE-LINKED (re-inserted, or recycled into a fresh
  * node) until a grace period has elapsed either -- reclaiming it is not the
  * only thing that has to wait.  An insert builds its node's next/prev with
- * PLAIN stores, the node being private until the commit publishes it; but the
- * deleting transaction may still hold a parked proxy in that node's next slot,
- * awaiting its settle.  A plain store into a proxied slot is then overwritten
- * when that settle converts the proxy, and the write is silently lost -- a
- * permanently incoherent edge.  Wait out the grace period the reclaim itself
- * would have waited.
+ * PLAIN stores, the node being private until the commit publishes it; a plain
+ * store into a slot some transaction still holds proxied is overwritten when
+ * that proxy is converted, and the write is silently lost -- a permanently
+ * incoherent edge.
+ *
+ * The straggler is NOT the deleting transaction: the owner settles inside its
+ * own commit (install -> decide -> settle -> defer free), so when del() returns
+ * 1 nothing of the deleter's still names a slot.  It is a transaction that LOST
+ * to the delete.  urcu_txn_settle() is a LOOP of plain stores over the planted
+ * prefix, not one atomic operation, so a loser releases its slots one at a time.
+ * Concretely: insert_before(elem) guards &elem->next and writes &elem->prev, so
+ * it plants a proxy in both; when it aborts, converting &elem->next (the lower
+ * address, hence settled first) is precisely what unblocks the del() that was
+ * spinning on that slot.  The delete then commits and its caller call_rcu()s
+ * @elem while the loser's store into &elem->prev has not yet landed -- and
+ * nothing serializes that one, because a delete writes &elem->next and the two
+ * NEIGHBOUR edges, never &elem->prev itself (see the "next"-only mark rationale
+ * above: no delete names the removed node's own back pointer).
+ *
+ * Every such straggler is inside the RCU read-side section its own attempt runs
+ * in, so a grace period drains the pending writes exactly as it drains readers.
+ * Wait out the grace period the reclaim itself would have waited.
  *
  * Read / write contract
  * ---------------------
