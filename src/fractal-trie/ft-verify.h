@@ -881,6 +881,36 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 			return -1;
 		}
 		/*
+		 * A reachable non-root internal must hold at least one key: a child
+		 * slot, or an external_nodes chain of its own.  With neither it is a
+		 * DEAD END -- an interior node that carries nothing, still wired into
+		 * its parent's slot.
+		 *
+		 * The nr_child cross-check above cannot see this: an emptied node has
+		 * stored 0 and counted 0, and agrees with itself.  Every other
+		 * structural check passes too (parent pointer, slot round-trip, skip
+		 * encoding), so before this the state was verify-clean.
+		 *
+		 * ft-inequality.h's empty-subtree arm relies on the absence of such a
+		 * node BY NAME: "quiescently, reachable internal nodes have nr_child
+		 * >= 1 (the upward walk prunes single-child chains wholesale ... so a
+		 * slot-emptied internal is never left in place)", and on that premise
+		 * treats an empty node as "empty at this step" and climbs.  When the
+		 * premise breaks, the ordered walk either re-enters the same branch
+		 * forever or skips the remaining subtree -- while exact-key lookup
+		 * still finds every key, which is why nothing else reports it.  So the
+		 * validator has to be the one that names it.
+		 *
+		 * The root is exempt: an empty trie is exactly this shape.
+		 */
+		if (expected_parent != NULL && counted_children == 0 &&
+		    !external_nodes) {
+			if (out)
+				fprintf(out, "ft_verify: depth %u: internal node %p is reachable with no children and no external_nodes (dead interior node left wired in its parent slot)\n",
+					depth, node_flag);
+			return -1;
+		}
+		/*
 		 * Pigeon bitmap consistency: pigeon nodes maintain a
 		 * 256-bit occupancy bitmap (allocated alongside the node
 		 * via ft_alloc_item with type->bitmap=true) that the
