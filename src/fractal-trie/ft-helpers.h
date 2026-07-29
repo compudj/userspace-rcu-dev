@@ -2039,6 +2039,28 @@ struct cds_ft_metadata *ft_flag_to_metadata(const struct cds_ft *ft,
 }
 
 /*
+ * ft_flag_tombstoned: has this node flag been RETIRED?
+ *
+ * A retired node keeps its body readable (RCU) but its state word carries
+ * FT_STATE_TOMBSTONE, and every fence primitive refuses it -- so an op whose
+ * plan names a retired node can never make progress and must re-derive rather
+ * than retry.  An EXTERNAL head has no state word and is never "tombstoned" in
+ * this sense (its removal is signalled on node->next, see ft_node_is_removed).
+ */
+static inline
+bool ft_flag_tombstoned(const struct cds_ft *ft,
+		struct cds_ft_inode_flag *nf)
+{
+	struct cds_ft_metadata *meta;
+
+	if (!nf || ft_node_external(nf))
+		return false;
+	meta = ft_flag_to_metadata(ft, nf);
+	return meta != NULL &&
+		(CMM_LOAD_SHARED(meta->state) & FT_STATE_TOMBSTONE) != 0;
+}
+
+/*
  * If @nf is a skip-compressed pointer, return the underlying
  * compressed node's flag pointer.  Otherwise return @nf unchanged.
  *

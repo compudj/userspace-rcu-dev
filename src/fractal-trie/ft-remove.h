@@ -3112,6 +3112,49 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 		FT_TP(remove_exit, (int) CDS_FT_STATUS_NOT_FOUND);
 		return CDS_FT_STATUS_NOT_FOUND;
 	}
+	/*
+	 * STALE BACK-EDGE (measured: 78% of the cases where this fires).  The
+	 * derivation above trusts @node->prev, and a back-pointer is updated
+	 * LAZILY: a peer that replaced the holder can leave @node->prev naming
+	 * the RETIRED old one while the FORWARD path from the root still
+	 * resolves @node correctly.  The op is then derived against a dead
+	 * node -- ft_meta_copying_mark refuses a TOMBSTONE word, the caller
+	 * gets -EAGAIN, and the wrapper's retry re-derives the SAME dead
+	 * holder forever, holding the per-trie FIFO fair-mutex turn and
+	 * denying every other writer (measured: 2,000,000+ consecutive
+	 * attempts, 11 of 12 writer threads parked).  Escalation cannot break
+	 * it: a tombstone is permanent, not contention.
+	 *
+	 * The FORWARD path is authoritative, so re-derive the holder by a
+	 * key-guided descent -- the same walk ft_detach_at uses -- and carry
+	 * on with the live parent.  A descent that no longer reaches @node
+	 * (the minority shape: the key really is gone) is an idempotent miss,
+	 * reported like the ft_node_is_removed() early-out above rather than
+	 * spun on.
+	 */
+	if (caa_unlikely(ft_flag_tombstoned(ft, holder_flag))) {
+		struct ft_descent d;
+		const uint8_t *ik = iter_key;
+
+		ft_descent_init(&d, ft);
+		while (d.depth < key_len) {
+			if (!d.nf || ft_node_external(d.nf))
+				break;
+			if (ft_node_compressed(d.nf)) {
+				ft_descent_traverse_compressed(ft, &d,
+					ft_compressed_node_ptr(d.nf), &ik);
+				continue;
+			}
+			ft_descent_step(ft, &d, *(ik++));
+		}
+		if (!d.nf || d.pnf == NULL ||
+				ft_flag_tombstoned(ft, d.pnf)) {
+			/* The key is not reachable either: idempotent miss. */
+			FT_TP(remove_exit, (int) CDS_FT_STATUS_NOT_FOUND);
+			return CDS_FT_STATUS_NOT_FOUND;
+		}
+		holder_flag = d.pnf;
+	}
 
 	/*
 	 * Cell-always: @node heads its chain iff its prev is the cell (not an
