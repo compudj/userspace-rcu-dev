@@ -3771,6 +3771,7 @@ struct sibp_arg {
 	struct cds_ft *ft;
 	uint64_t key;
 	unsigned long ops, busy, lost, stuck;
+	struct ft_test_node *inflight;	/* published, not yet taken back */
 	int failed;
 	int *stop_all;
 };
@@ -3817,11 +3818,14 @@ static void *sibp_writer(void *arg)
 			mw_violation_snapshot();
 			goto out;
 		}
+		w->inflight = n;	/* the run owes this node a reclaim */
 		rcu_read_unlock();
 
 		for (a = 0; a < 100000 && !test_stop; a++)
-			if (sibp_remove(w->ft, w->key, n) == CDS_FT_STATUS_OK)
+			if (sibp_remove(w->ft, w->key, n) == CDS_FT_STATUS_OK) {
+				w->inflight = NULL;
 				break;
+			}
 		if (a == 100000) {
 			fprintf(stderr, "sibp key=%#lx: could not take back our own key\n",
 				(unsigned long) w->key);
@@ -3917,6 +3921,18 @@ static int inv_sibling_split_compress(void)
 		pthread_join(th[i], NULL);
 	rcu_thread_online();
 
+	synchronize_rcu();
+	/*
+	 * A writer stopped BETWEEN its publish and its take-back leaves exactly
+	 * one key behind -- harness bookkeeping, not a library leak, and it
+	 * would otherwise show up as entries > live.  Reclaim it here.
+	 */
+	for (i = 0; i < SIBP_NW * 2; i++) {
+		if (!w[i].inflight)
+			continue;
+		(void) sibp_remove(ft, w[i].key, w[i].inflight);
+		w[i].inflight = NULL;
+	}
 	synchronize_rcu();
 	rcu_read_lock();
 	for (i = 0; i < SIBP_NW * 2; i++) {
