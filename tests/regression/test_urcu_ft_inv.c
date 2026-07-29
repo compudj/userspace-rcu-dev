@@ -6430,6 +6430,19 @@ static void *inv_replace_skipx_writer(void *arg)
 		uint8_t k[8];
 
 		cds_ft_u64_to_key(ctx->ft, key, k, CDS_FT_LEN_DEFAULT);
+		/*
+		 * Stamp the ordinal key bytes BEFORE the node enters the trie,
+		 * exactly as insert_u64 / insert_replace_u64 do for every other
+		 * insert path in this file.  This is the speculative-key contract
+		 * (cds_ft_group_attr_set_speculative_key_offset: "the key bytes at
+		 * @key_offset must be present before the node is inserted"), not
+		 * harness bookkeeping -- on a speculative group the inequality
+		 * lookups take their result key by COPYING it from the matched
+		 * leaf, so a head published with @okey still zeroed hands every
+		 * later cds_ft_next the key 0.  The walk then asks for the
+		 * successor of the wrong key.
+		 */
+		memcpy(newn->okey, k, sizeof(newn->okey));
 		rcu_read_lock();
 		pthread_mutex_lock(&ctx->lock);
 		/* Look up the current head under the writer mutex, then replace it
