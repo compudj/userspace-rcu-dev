@@ -3857,6 +3857,149 @@ out:
 	return NULL;
 }
 
+/*
+ * Is every node this run allocated either FREED or still REACHABLE?
+ *
+ * Each one ends up in exactly one of those two places, so at teardown, with
+ * every deferred free drained,
+ *
+ *	allocated - freed  ==  nodes reachable from the root
+ *
+ * and an excess is a node that is NEITHER -- lost out of the structure without
+ * being reclaimed.  leak_check() reports the same excess, but as a bare delta
+ * and only AFTER drain_and_destroy(), by which time the trie that would explain
+ * it is gone.  Asked here, the answer arrives with the structure still in
+ * memory (and, under FT_INV_ABORT_ON_VIOLATION, in a core).
+ *
+ * ★ This check is the one that placed the defect: it comes back BALANCED on
+ * runs that then report a leak, which is what proved the loss happens in the
+ * TEARDOWN WALK and not in the concurrent phase -- see sibp_drain_checked().
+ */
+static int sibp_report_orphans(struct cds_ft *ft, unsigned long live)
+{
+	unsigned long unfreed, reachable;
+
+	rcu_barrier();		/* every deferred free of ours has run */
+	unfreed = __atomic_load_n(&nodes_allocated, __ATOMIC_RELAXED) -
+		__atomic_load_n(&nodes_freed, __ATOMIC_RELAXED);
+	rcu_read_lock();
+	reachable = cds_ft_count_entries(ft);
+	rcu_read_unlock();
+	if (unfreed == reachable && reachable == live)
+		return 0;
+	fprintf(stderr, "sibp ORPHAN: %ld node(s) neither freed nor reachable "
+		"(allocated-freed %lu, reachable %lu, expected %lu)\n",
+		(long) (unfreed - reachable), unfreed, reachable, live);
+	/* The trie is intact right here.  Keep the core. */
+	mw_violation_snapshot();
+	return -1;
+}
+
+/*
+ * Drain the STATIC seeds exactly the way drain_and_destroy does -- repeated
+ * lookup_first + remove_all, same order -- but after EVERY removal, check that
+ * each seed still in the trie is still findable BY ITS OWN KEY.
+ *
+ * The generic drain only reports a SHORTFALL ("freed 14 of 18"): by then a
+ * dozen removals have run and any of them could have been the one that broke
+ * the walk.  Checking between removals attributes it.  The seeds are the right
+ * probe because no writer ever touches them -- inserted once before the writers
+ * start, still there when they are joined -- so a seed that stops being
+ * findable cannot be a race with a legitimate removal.
+ *
+ * Runs after the join, single-threaded, so it cannot perturb the window that
+ * produced the damage -- only report it.
+ */
+static int sibp_drain_checked(struct cds_ft *ft, const uint64_t *seed, int nseed)
+{
+	struct cds_ft_iter *iter = NULL;
+	unsigned long drained = 0;
+	enum cds_ft_status s;
+	char *gone;
+	int j, ret = 0;
+
+	gone = (char *) calloc((size_t) nseed, 1);
+	if (!gone)
+		abort();
+	if (cds_ft_iter_create(ft, &iter) < 0)
+		abort();
+	rcu_read_lock();
+	while ((s = cds_ft_lookup_first(ft, iter)) == CDS_FT_STATUS_OK) {
+		struct cds_ft_node *head, *tmp;
+		uint64_t just = 0;
+
+		s = cds_ft_remove_all(ft, iter, &head);
+		if (s != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "sibp drain: remove_all st=%d on a key "
+				"lookup_first had just found\n", (int) s);
+			ret = -1;
+			break;
+		}
+		cds_ft_for_each_duplicate_safe_rcu(head, tmp) {
+			struct ft_test_node *tn = to_test_node(head);
+
+			just = tn->key;
+			for (j = 0; j < nseed; j++)
+				if (seed[j] == tn->key)
+					gone[j] = 1;
+			node_free_rcu(tn);
+			drained++;
+		}
+		for (j = 0; j < nseed; j++) {
+			struct cds_ft_node *f = NULL;
+
+			if (gone[j])
+				continue;
+			if (lookup_u64(ft, seed[j], &f) == CDS_FT_STATUS_OK && f)
+				continue;
+			fprintf(stderr, "sibp drain: removing key %#lx STRANDED key "
+				"%#lx -- an exact-key lookup no longer finds a key "
+				"that was never removed (%lu drained)\n",
+				(unsigned long) just, (unsigned long) seed[j],
+				drained);
+			if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK)
+				fprintf(stderr, "sibp drain: cds_ft_verify FAILS\n");
+			ret = -1;
+			mw_violation_snapshot();
+			goto out;
+		}
+	}
+	if (drained != (unsigned long) nseed) {
+		fprintf(stderr, "sibp drain: lookup_first STOPPED EARLY after %lu of "
+			"%d seeds (st=%d); still findable by exact key:",
+			drained, nseed, (int) s);
+		for (j = 0; j < nseed; j++) {
+			struct cds_ft_node *f = NULL;
+
+			if (gone[j])
+				continue;
+			fprintf(stderr, " %#lx=%s", (unsigned long) seed[j],
+				lookup_u64(ft, seed[j], &f) == CDS_FT_STATUS_OK ?
+					"yes" : "NO");
+		}
+		fprintf(stderr, "\n");
+		/*
+		 * Deliberately NO further ORDERED probe here (a GE from the key
+		 * itself, a lookup_last): on the remnant this fires on, those do
+		 * not return -- the same going-up cycle that made lookup_first
+		 * give up spins forever on a reachable internal whose nr_child
+		 * has reached 0.  A diagnostic that hangs reports nothing.  The
+		 * exact-key line above already carries the finding: the keys are
+		 * present, and only the ordered walk cannot reach them.
+		 */
+		if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK)
+			fprintf(stderr, "sibp drain: cds_ft_verify FAILS on the "
+				"remnant\n");
+		ret = -1;
+		mw_violation_snapshot();
+	}
+out:
+	rcu_read_unlock();
+	cds_ft_iter_destroy(iter);
+	free(gone);
+	return ret;
+}
+
 static int inv_sibling_split_compress(void)
 {
 	struct cds_ft_group *group;
@@ -3865,6 +4008,7 @@ static int inv_sibling_split_compress(void)
 	pthread_t th[SIBP_NW * 2];
 	struct timespec t0;
 	unsigned long ops = 0, busy = 0, lost = 0, live = 0, stuck = 0;
+	uint64_t seed[SIBP_NW * 3];	/* the static keys, for the checked drain */
 	int i, ret = 0, stop_all = 0;
 
 	/*
@@ -3890,7 +4034,6 @@ static int inv_sibling_split_compress(void)
 	w = (struct sibp_arg *) calloc(SIBP_NW * 2, sizeof(*w));
 	if (!w)
 		abort();
-
 	rcu_read_lock();
 	for (i = 0; i < SIBP_NW; i++) {
 		uint8_t p = (uint8_t) (0x30 + i), m = (uint8_t) (0x10 + i);
@@ -3907,7 +4050,7 @@ static int inv_sibling_split_compress(void)
 			if (insert_u64(ft, sk[c], node_alloc(sk[c])) !=
 					CDS_FT_STATUS_OK)
 				abort();
-			live++;
+			seed[live++] = sk[c];
 		}
 
 		w[2 * i].ft = w[2 * i + 1].ft = ft;
@@ -3954,11 +4097,19 @@ static int inv_sibling_split_compress(void)
 		 * load, reported as a LEAK delta with the trie itself exact
 		 * (0 lost, entries == live).
 		 */
-		if (sibp_remove(ft, w[i].key, w[i].inflight) != CDS_FT_STATUS_OK)
+		if (sibp_remove(ft, w[i].key, w[i].inflight) != CDS_FT_STATUS_OK) {
 			node_free(w[i].inflight);
+		}
 		w[i].inflight = NULL;
 	}
 	synchronize_rcu();
+	/*
+	 * Before anything is torn down: is every node this run allocated
+	 * either freed or still reachable?  An excess is an orphan, and the
+	 * evidence for it only exists here.
+	 */
+	if (sibp_report_orphans(ft, live) < 0)
+		ret = -1;
 	rcu_read_lock();
 	for (i = 0; i < SIBP_NW * 2; i++) {
 		ops += w[i].ops;
@@ -3989,8 +4140,26 @@ static int inv_sibling_split_compress(void)
 		SIBP_NW, ops, busy, lost, stuck);
 
 	free(w);
-	if (drain_and_destroy(ft, group) < 0)
+	/*
+	 * Attribute a drain shortfall to the removal that causes it, before the
+	 * generic drain (which then finds the trie already empty).
+	 */
+	if (sibp_drain_checked(ft, seed, SIBP_NW * 3) < 0) {
 		ret = -1;
+		/*
+		 * Tear down WITHOUT another walk.  The remnant just
+		 * characterized is one an ordered descent cannot get through --
+		 * on it, drain_and_destroy's own lookup_first does not
+		 * terminate, and a teardown that hangs turns an attributed
+		 * failure into a timeout that says nothing.  leak_check() below
+		 * then reports the stranded nodes, which is the accurate
+		 * outcome: the walk could not reach them, so nobody freed them.
+		 */
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+	} else if (drain_and_destroy(ft, group) < 0) {
+		ret = -1;
+	}
 	if (leak_check() < 0)
 		ret = -1;
 	return ret;
