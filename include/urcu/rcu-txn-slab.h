@@ -1,4 +1,6 @@
-/* SPDX-License-Identifier: LGPL-2.1-or-later */
+// SPDX-FileCopyrightText: 2026 Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+//
+// SPDX-License-Identifier: LGPL-2.1-or-later
 #ifndef _URCU_RCU_TXN_SLAB_H
 #define _URCU_RCU_TXN_SLAB_H
 
@@ -741,7 +743,6 @@ static inline int urcu_slab_rseq_ready(void) { return rseq_registered(); }
 static inline int urcu_slab_rseq_ready(void) { return 0; }
 #endif /* URCU_SLAB_RSEQ */
 
-
 /*
  * Demote @a: ->local becomes off-limits to rseq, so it can be drained from any
  * cpu.  This is the ONLY way an arena's local list can be reached remotely --
@@ -962,7 +963,6 @@ carve:
 	URCU_SLAB_STAT(s, carve);
 	return p;
 }
-
 
 /*
  * Free @block to its ORIGIN arena (found from the RANGE-aligned superblock),
@@ -1321,7 +1321,6 @@ counted:
 		call_rcu_fn(&a->close_head, urcu_slab_closer_cb);
 	}
 }
-
 
 #ifdef __cplusplus
 }
