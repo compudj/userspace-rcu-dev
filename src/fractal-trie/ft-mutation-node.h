@@ -1412,6 +1412,15 @@ int ft_node_recompact(enum ft_recompact mode,
 		assert(0);
 	}
 
+	/*
+	 * SIZE -> COPY window (-DFT_DELAY_INJECT only).  The replacement node's
+	 * type was just chosen from a live count read; the copy loop below then
+	 * skips any source child a peer has removed in between.  Widen the gap
+	 * so that skip actually happens under test.
+	 */
+#ifndef FT_DELAY_SITE_A_ONLY
+	ft_delay_writer();
+#endif
 	new_metadata = NULL;
 	dbg_printf("Recompact from type %d to type %d\n",
 			old_type_index, new_type_index);

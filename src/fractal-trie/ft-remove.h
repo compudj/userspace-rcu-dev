@@ -1362,6 +1362,19 @@ int ft_detach_node(struct cds_ft *ft,
 			if (!ft_node_compressed(cur))
 				ft_node_find_child(ft, cur, *detach_node_flag_ptr,
 					&n, NULL);
+			/*
+			 * PLAN -> COMMIT window (-DFT_DELAY_INJECT only, no-op
+			 * otherwise).  The decision "this ancestor keeps a child,
+			 * so it stays wired" has just been made from a count read
+			 * a few lines up; everything that empties it happens after
+			 * this point.  Widening the gap here is what lets a peer's
+			 * removal of the OTHER child land inside the window, which
+			 * is the interleaving the residual needs and which is
+			 * otherwise ~1 run in 100.
+			 */
+#ifndef FT_DELAY_SITE_B_ONLY
+			ft_delay_writer();
+#endif
 			break;
 		}
 		/*
