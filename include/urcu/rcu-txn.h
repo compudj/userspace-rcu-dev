@@ -318,22 +318,42 @@ void urcu_txn_domain_init(struct urcu_txn_domain *d)
 }
 
 struct urcu_txn {
+	/*
+	 * HOT SET, kept together in the first cache line: this is what the
+	 * per-record path reads.  The layout is deliberate -- @ryw_bloom is 128
+	 * bytes and, now that the filter is built lazily, most transactions
+	 * never touch it; leaving it mid-struct pushed @disjoint, @bloom_live
+	 * and @esc_pending three lines away from @desc, so recording one edge
+	 * touched two lines with cold bulk between them.
+	 */
 	struct urcu_txn_domain *domain;	/* escalation domain, or NULL */
 	const struct rcu_flavor_struct *flavor;	/* read-side bracket flavor, or NULL */
 	unsigned long retry;		/* attempts so far; aging priority */
-	unsigned int min_alloc;		/* floor for the initial descriptor capacity */
 	struct urcu_txn_desc *desc;	/* this attempt's descriptor / ENOMEM marker */
-	struct cds_fair_mutex_node waiter;	/* our node while awaiting the turn */
-	int in_fallback;		/* we currently hold the lane */
-	int fb_published;		/* we raised domain->active and owe the clear */
-	int retrying;			/* commit asked retry: keep the turn */
-	uint64_t ryw_bloom[URCU_TXN_BLOOM_WORDS];	/* read-your-own-writes filter */
-	int disjoint;			/* write set touches DISTINCT slots */
+	unsigned int min_alloc;		/* floor for the initial descriptor capacity */
 	unsigned int nload;		/* loads issued by the CURRENT attempt */
 	unsigned int last_cost;		/* high-water mark of completed attempts' costs */
-	int expect_conflict;		/* caller expects this txn to conflict */
-	int esc_pending;		/* age-0 optimistic attempt saw a coincidence */
-	int bloom_live;			/* @ryw_bloom is built (see urcu_txn__bloom_arm) */
+	/*
+	 * One-bit flags.  A handle is owned by ONE thread for its whole life --
+	 * nothing recovers it from @waiter, and every access is through the
+	 * owner's own txn pointer -- so packing them costs no synchronisation.
+	 * That is the precondition, not a detail: were the handle shared, two
+	 * threads touching two of these would be a data race under the C11
+	 * model as soon as they share a word.
+	 *
+	 * bool, not bit-fields: packing them into one word was measured SLOWER
+	 * (+5.7% non-disjoint), because writing a bit-field is a
+	 * read-modify-write of the containing word, and @esc_pending and
+	 * @bloom_live are written on the record path.  A byte store is a store.
+	 */
+	bool disjoint;			/* write set touches DISTINCT slots */
+	bool expect_conflict;		/* caller expects this txn to conflict */
+	bool esc_pending;		/* age-0 optimistic attempt saw a coincidence */
+	bool bloom_live;		/* @ryw_bloom is built (urcu_txn__bloom_arm) */
+	bool fb_published;		/* we raised domain->active and owe the clear */
+	bool retrying;			/* commit asked retry: keep the turn */
+	int in_fallback;		/* we currently hold the lane */
+	/* ---- cold below ---- */
 #ifdef URCU_TXN_ESCALATION_STATS
 	unsigned int esc_raw;
 	unsigned int esc_waw;
@@ -348,6 +368,29 @@ struct urcu_txn {
 	unsigned long rp_evicted;	/* table overflowed: a mark was dropped, so
 					 * a zero violation count is NOT a proof. */
 #endif
+	/*
+	 * DEAD LAST, past the conditional members too, so that init's single
+	 * clear reaches everything that needs zeroing -- the stats counters and
+	 * the read-policy table included -- without ever touching these 128
+	 * bytes.  The filter is built lazily (urcu_txn__bloom_arm), so clearing
+	 * it per transaction would reinstate exactly the `rep stos` that making
+	 * it lazy removed.
+	 */
+	uint64_t ryw_bloom[URCU_TXN_BLOOM_WORDS];	/* read-your-own-writes filter */
+	/*
+	 * FALSE SHARING.  This is the one member another thread writes: the
+	 * granter stores GRANTED/TEARDOWN into waiter.state, and wfcq's dequeue
+	 * side touches waiter.node.  Packed inline it straddled the first cache
+	 * line, so waiter.node sat beside @desc, @retry and @disjoint and every
+	 * hand-off invalidated the line the owner reads on its record path,
+	 * while waiter.state sat beside ryw_bloom[0..6].  Give it a line of its
+	 * own: the handle is per-thread and usually on the caller's stack, so
+	 * the padding costs a little stack and buys the owner's hot line back.
+	 *
+	 * Placed after ryw_bloom, hence outside init's clear, which is fine --
+	 * cds_fair_mutex_lock() initialises node, state and cpu before use.
+	 */
+	struct cds_fair_mutex_node waiter __attribute__((aligned(64)));
 };
 
 #ifdef URCU_TXN_DEBUG_READ_POLICY
@@ -477,29 +520,17 @@ void urcu_txn_init_flavor(struct urcu_txn *txn,
 		struct urcu_txn_domain *domain,
 		const struct rcu_flavor_struct *flavor)
 {
+	/*
+	 * One clear up to -- and NOT including -- ryw_bloom.  The filter is
+	 * built lazily, so zeroing its 128 bytes here would reinstate exactly
+	 * the per-transaction `rep stos` that making it lazy removed; that is
+	 * why it sits last in the struct, so a single length covers everything
+	 * that does need clearing.  The handle is not shared at init, so the
+	 * plain clear covers @in_fallback too.
+	 */
+	memset(txn, 0, offsetof(struct urcu_txn, ryw_bloom));
 	txn->domain = domain;
 	txn->flavor = flavor;
-	txn->retry = 0;
-	txn->min_alloc = 0;
-	txn->nload = 0;
-	txn->last_cost = 0;
-	txn->desc = NULL;
-	uatomic_store(&txn->in_fallback, 0, CMM_RELAXED);
-	txn->fb_published = 0;
-	txn->retrying = 0;
-	txn->disjoint = 0;
-	txn->expect_conflict = 0;
-	/* ryw_bloom needs no zeroing until urcu_txn__bloom_arm() builds it. */
-	txn->bloom_live = 0;
-	txn->esc_pending = 0;
-#ifdef URCU_TXN_ESCALATION_STATS
-	txn->esc_raw = txn->esc_waw = txn->esc_bloom = 0;
-#endif
-#ifdef URCU_TXN_DEBUG_READ_POLICY
-	txn->rp_violations = 0;
-	txn->rp_evicted = 0;
-	urcu_txn__rp_reset(txn);
-#endif
 }
 
 /* Initialize a handle bracketed in the compile-time-selected RCU flavor. */
