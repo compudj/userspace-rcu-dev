@@ -333,6 +333,7 @@ struct urcu_txn {
 	unsigned int last_cost;		/* high-water mark of completed attempts' costs */
 	int expect_conflict;		/* caller expects this txn to conflict */
 	int esc_pending;		/* age-0 optimistic attempt saw a coincidence */
+	int bloom_live;			/* @ryw_bloom is built (see urcu_txn__bloom_arm) */
 #ifdef URCU_TXN_ESCALATION_STATS
 	unsigned int esc_raw;
 	unsigned int esc_waw;
@@ -459,12 +460,13 @@ unsigned long urcu_txn_read_policy_evicted(const struct urcu_txn *txn)
 
 #endif	/* URCU_TXN_DEBUG_READ_POLICY */
 
-static inline
-void urcu_txn__bloom_reset(struct urcu_txn *txn)
-{
-	if (!txn->disjoint)
-		memset(txn->ryw_bloom, 0, sizeof(txn->ryw_bloom));
-}
+/*
+ * The filter is built LAZILY -- see urcu_txn__bloom_arm() and its use in
+ * urcu_txn__record().  Nothing is zeroed when the descriptor is allocated: a
+ * write set that stays under URCU_TXN_BLOOM_MIN never touches ryw_bloom at all,
+ * which is the common case and was measured at ~24% of a small commit's cycles
+ * (a 128-byte `rep stos` per transaction).
+ */
 
 /*
  * Initialize a handle before its retry loop, bracketing the txn's RCU read-side
@@ -487,7 +489,8 @@ void urcu_txn_init_flavor(struct urcu_txn *txn,
 	txn->retrying = 0;
 	txn->disjoint = 0;
 	txn->expect_conflict = 0;
-	/* ryw_bloom is zeroed by __bloom_reset() at first descriptor alloc. */
+	/* ryw_bloom needs no zeroing until urcu_txn__bloom_arm() builds it. */
+	txn->bloom_live = 0;
 	txn->esc_pending = 0;
 #ifdef URCU_TXN_ESCALATION_STATS
 	txn->esc_raw = txn->esc_waw = txn->esc_bloom = 0;
@@ -665,6 +668,7 @@ void urcu_txn_begin(struct urcu_txn *txn)
 	else
 		urcu_txn__maybe_publish(txn);
 	txn->desc = NULL;
+	txn->bloom_live = 0;		/* a new attempt starts with no filter */
 	txn->esc_pending = 0;
 #ifdef URCU_TXN_ESCALATION_STATS
 	txn->esc_raw = txn->esc_waw = txn->esc_bloom = 0;
@@ -694,7 +698,6 @@ int urcu_txn_reserve(struct urcu_txn *txn, unsigned int n)
 			txn->desc = URCU_TXN_ENOMEM;
 			return -ENOMEM;
 		}
-		urcu_txn__bloom_reset(txn);
 		txn->desc = m;
 		return 0;
 	}
@@ -721,6 +724,44 @@ bool urcu_txn__reconcile(struct urcu_txn *txn,
 }
 
 /*
+ * Build the filter from the records already in @m and mark it live.  Called at
+ * most once per attempt, from the record that first finds the write set at or
+ * above URCU_TXN_BLOOM_MIN.
+ */
+static inline
+void urcu_txn__bloom_arm(struct urcu_txn *txn, struct urcu_txn_desc *m)
+{
+	unsigned int i;
+
+	memset(txn->ryw_bloom, 0, sizeof(txn->ryw_bloom));
+	for (i = 0; i < m->nr; i++)
+		urcu_txn__ryw_bloom_set(txn->ryw_bloom, m->recs[i].slot);
+	txn->bloom_live = 1;
+}
+
+/*
+ * Does @slot alias a record already in this attempt's write set?
+ *
+ * Below URCU_TXN_BLOOM_MIN this is answered EXACTLY, by scanning the records:
+ * cheaper than arming the filter at that size, and free of false positives.
+ * At or above it the filter answers, and -- being a filter -- a yes means
+ * "maybe", which every caller already treats as such.  Either way a NO is
+ * definitive, which is the property the read-your-own-writes guard depends on:
+ * it skips the authoritative find only on a no.
+ */
+static inline
+int urcu_txn__ryw_hit(struct urcu_txn *txn, struct urcu_txn_desc *m,
+		void **slot)
+{
+	if (caa_unlikely(!txn->bloom_live)) {
+		if (m->nr < URCU_TXN_BLOOM_MIN)
+			return urcu_txn_find(m, slot) != NULL;
+		urcu_txn__bloom_arm(txn, m);
+	}
+	return urcu_txn__ryw_bloom_test(txn->ryw_bloom, slot);
+}
+
+/*
  * Buffer or reconcile one record of kind @kind: lazily create the descriptor,
  * grow it if full, keep one record per slot.  @upgrade is 1 for a store, 0 for a
  * load-validate guard.  Returns 0, or -ENOMEM (sticky).
@@ -742,13 +783,30 @@ int urcu_txn__record(struct urcu_txn *txn, void **slot,
 			txn->desc = URCU_TXN_ENOMEM;
 			return -ENOMEM;
 		}
-		urcu_txn__bloom_reset(txn);
 		txn->desc = m;
 	}
 	if (!txn->disjoint) {
-		int coincide = urcu_txn__ryw_bloom_test_and_set(txn->ryw_bloom,
-				slot);
+		int coincide;
 
+		/*
+		 * Below the threshold the record array IS the filter: scanning
+		 * it is cheaper than arming, and exact, so a small write set
+		 * never suffers a false-positive escalation either.  Arm on the
+		 * first record that finds the set big enough, rebuilding from
+		 * everything recorded so far; @slot itself is not in @m yet, so
+		 * the test-and-set below reports aliasing against EARLIER
+		 * records exactly as the eager filter did.
+		 */
+		if (caa_unlikely(!txn->bloom_live)) {
+			if (m->nr < URCU_TXN_BLOOM_MIN) {
+				coincide = urcu_txn_find(m, slot) != NULL;
+				goto coincide_known;
+			}
+			urcu_txn__bloom_arm(txn, m);
+		}
+		coincide = urcu_txn__ryw_bloom_test_and_set(txn->ryw_bloom,
+				slot);
+coincide_known:
 		if (coincide && urcu_txn__eff_retry(txn) == 0)
 			txn->esc_pending = 1;
 #ifdef URCU_TXN_ESCALATION_STATS
@@ -810,15 +868,15 @@ void *urcu_txn__load(struct urcu_txn *txn, void **slot,
 	if (!committed && !txn->disjoint && txn->desc != NULL
 			&& txn->desc != URCU_TXN_ENOMEM) {
 		if (urcu_txn__eff_retry(txn) == 0) {
-			if (urcu_txn__ryw_bloom_test(txn->ryw_bloom, slot))
+			if (urcu_txn__ryw_hit(txn, txn->desc, slot))
 				txn->esc_pending = 1;
 		} else {
 #ifdef URCU_TXN_ESCALATION_STATS
-			if (urcu_txn__ryw_bloom_test(txn->ryw_bloom, slot))
+			if (urcu_txn__ryw_hit(txn, txn->desc, slot))
 				txn->esc_bloom++;
 #endif
 #ifndef URCU_TXN_RYW_NO_BLOOM
-			if (urcu_txn__ryw_bloom_test(txn->ryw_bloom, slot))
+			if (urcu_txn__ryw_hit(txn, txn->desc, slot))
 #endif
 			{
 				struct urcu_txn_record *r =

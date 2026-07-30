@@ -67,6 +67,19 @@ extern "C" {
 # define URCU_TXN_BLOOM_K	3
 #endif
 
+/*
+ * URCU_TXN_BLOOM_MIN is the write-set size below which the filter is not built
+ * at all: an exact scan of that many records is cheaper than zeroing the filter
+ * and hashing into it, and it is EXACT, so it also spares the caller the
+ * spurious escalations a false positive would cause.  Only above this does the
+ * filter start paying.  Correctness never depends on the value -- it selects
+ * which of two answers-agreeing paths runs.  The sw engine uses the same
+ * constant for the same reason (URCU_TXN_SW_BLOOM_MIN).
+ */
+#ifndef URCU_TXN_BLOOM_MIN
+# define URCU_TXN_BLOOM_MIN	8
+#endif
+
 #define URCU_TXN_BLOOM_BITS	(64ULL * URCU_TXN_BLOOM_WORDS)
 /*
  * Two INDEPENDENT hashes of the slot.  A single multiply leaves the k derived
