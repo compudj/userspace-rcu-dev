@@ -221,7 +221,7 @@ struct urcu_txn_record {
 					 * own tag.
 					 */
 	struct urcu_txn_desc *desc;	/* back-pointer: shared status word */
-	unsigned int kind;		/* enum urcu_txn_kind (writer-side only) */
+	unsigned int kind;
 } __attribute__((aligned(16)));
 
 /*
@@ -234,6 +234,24 @@ struct urcu_txn_record {
  */
 struct urcu_txn_desc {
 	unsigned long status;		/* enum urcu_txn_desc_status */
+	/*
+	 * POSITION IS LOAD-BEARING, despite this being cold data touched only
+	 * at reclaim.  The slab threads its pending list through this field --
+	 * urcu_slab_init() is handed offsetof(struct urcu_txn_desc, rcu_head) as
+	 * @link_off -- and overlays a closed batch's metadata just past it, so
+	 * the smallest usable size class is
+	 *
+	 *   link_off + sizeof(struct rcu_head) + sizeof(struct urcu_slab_batch)
+	 *
+	 * which at the current offset is 8 + 16 + 8 = 32 bytes.  Moving it
+	 * later to pack the hot fields tighter would raise that floor and
+	 * invalidate the smallest class; the slab checks and disables itself
+	 * rather than corrupt anything, so the symptom would be a silent loss
+	 * of the cache, not a crash.
+	 *
+	 * It also cannot move to offset 0: that is @status, which a reader
+	 * loads while resolving a parked record.
+	 */
 	struct rcu_head rcu_head;	/* owner's deferred-free handle */
 	unsigned int nr;
 	unsigned int nr_mw;		/*

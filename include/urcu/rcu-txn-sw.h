@@ -341,6 +341,24 @@ struct urcu_txn_sw_latch {
  */
 struct urcu_txn_sw_block {
 	struct urcu_txn_sw_group group;		/* selector; parked proxies read &block->group */
+	/*
+	 * POSITION IS LOAD-BEARING, despite this being cold data touched only
+	 * at reclaim.  The slab threads its pending list through this field --
+	 * urcu_slab_init() is handed offsetof(struct urcu_txn_sw_block, rcu_head) as
+	 * @link_off -- and overlays a closed batch's metadata just past it, so
+	 * the smallest usable size class is
+	 *
+	 *   link_off + sizeof(struct rcu_head) + sizeof(struct urcu_slab_batch)
+	 *
+	 * which at the current offset is 8 + 16 + 8 = 32 bytes.  Moving it
+	 * later to pack the hot fields tighter would raise that floor and
+	 * invalidate the smallest class; the slab checks and disables itself
+	 * rather than corrupt anything, so the symptom would be a silent loss
+	 * of the cache, not a crash.
+	 *
+	 * It also cannot move to offset 0: that is @group, which parked
+	 * proxies point at.
+	 */
 	struct rcu_head rcu_head;		/* deferred-free handle */
 	unsigned int cap;			/* physical capacity */
 	unsigned int slab;			/*
@@ -374,15 +392,22 @@ urcu_static_assert(!(offsetof(struct urcu_txn_sw_block, latches) % 16),
 #endif
 
 struct urcu_txn_sw_txn {
-	enum urcu_txn_sw_state state;
+	/*
+	 * Ordered by access, and packed: laid out as declared before, this had
+	 * a 4-byte hole after @state and a 5-byte one after the flags.  The
+	 * whole hot set now fits the first cache line with no holes at all.
+	 * The handle is single-writer by construction and never published, so
+	 * nothing here is touched by another thread -- no false sharing to
+	 * avoid, unlike struct urcu_txn's queue node.
+	 */
 	struct urcu_txn_sw_latch *latches;	/* record array (realloc-grown, or caller-owned if @latches_inline) */
 	struct urcu_txn_sw_block *block;	/* heap path: single allocation (latches inline); NULL until first record */
 	unsigned int nr;
 	unsigned int cap;
+	enum urcu_txn_sw_state state;
 	bool latches_inline;			/* @latches is caller storage: never realloc'd, never freed */
 	bool disjoint;				/* write set declared slot-disjoint: skip the RYW find */
 	bool bloom_live;			/* @ryw_bloom is armed (see urcu_txn_sw__find_ryw) */
-	uint64_t ryw_bloom[URCU_TXN_BLOOM_WORDS];  /* RYW certain-miss filter */
 #ifdef URCU_TXN_SW_EXCL_VALIDATE
 	pthread_t excl_owner;			/*
 						 * pthread_self() of the thread
@@ -392,6 +417,14 @@ struct urcu_txn_sw_txn {
 						 * below.
 						 */
 #endif
+	/*
+	 * DEAD LAST, past the conditional member too, so init's single clear
+	 * covers everything that needs zeroing without ever touching these 128
+	 * bytes.  The filter is armed lazily (urcu_txn_sw__bloom_arm), so
+	 * clearing it per transaction would cost a `rep stos` that the lazy
+	 * arming exists to avoid.
+	 */
+	uint64_t ryw_bloom[URCU_TXN_BLOOM_WORDS];  /* RYW certain-miss filter */
 };
 
 #define URCU_TXN_SW_CAP	8	/* initial record-array capacity */
@@ -521,6 +554,27 @@ void urcu_txn_sw__excl_slot_unchanged(struct urcu_txn_sw_latch *l)
 #endif	/* URCU_TXN_SW_EXCL_VALIDATE */
 
 /*
+ * The body both public initializers share: they differed only in @latches,
+ * @cap and @latches_inline, everything else being the same zeroing.
+ *
+ * One clear up to -- and NOT including -- ryw_bloom, which is why that member
+ * sits last: the filter is armed lazily, so zeroing its 128 bytes here would
+ * reinstate the very cost the lazy arming removes.  @buf == NULL selects the
+ * heap-growing form.
+ */
+static inline
+void urcu_txn_sw__init(struct urcu_txn_sw_txn *t,
+		struct urcu_txn_sw_latch *buf, unsigned int cap)
+{
+	memset(t, 0, offsetof(struct urcu_txn_sw_txn, ryw_bloom));
+	t->state = URCU_TXN_SW_PREPARE;
+	t->latches = buf;
+	t->cap = cap;
+	t->latches_inline = (buf != NULL);
+	urcu_txn_sw__excl_claim(t);
+}
+
+/*
  * Initialize an on-stack transaction handle.  No allocation, so this cannot
  * fail; the first record()/reserve() is the first OOM checkpoint, and it is
  * sticky (commit reports MEMORY_ERROR).  Each edge carries its own tag (passed
@@ -529,15 +583,7 @@ void urcu_txn_sw__excl_slot_unchanged(struct urcu_txn_sw_latch *l)
 static inline
 void urcu_txn_sw_init(struct urcu_txn_sw_txn *t)
 {
-	t->state = URCU_TXN_SW_PREPARE;
-	t->latches = NULL;
-	t->block = NULL;
-	t->nr = 0;
-	t->cap = 0;
-	t->latches_inline = false;
-	t->disjoint = false;
-	t->bloom_live = false;		/* armed lazily; ryw_bloom needs no zeroing until then */
-	urcu_txn_sw__excl_claim(t);
+	urcu_txn_sw__init(t, NULL, 0);
 }
 
 /*
@@ -559,15 +605,7 @@ static inline
 void urcu_txn_sw_init_inline(struct urcu_txn_sw_txn *t,
 		struct urcu_txn_sw_latch *buf, unsigned int cap)
 {
-	t->state = URCU_TXN_SW_PREPARE;
-	t->latches = buf;
-	t->block = NULL;
-	t->nr = 0;
-	t->cap = cap;
-	t->latches_inline = true;
-	t->disjoint = false;
-	t->bloom_live = false;		/* armed lazily; ryw_bloom needs no zeroing until then */
-	urcu_txn_sw__excl_claim(t);
+	urcu_txn_sw__init(t, buf, cap);
 }
 
 #define urcu_txn_sw_blocksize(cap)	\
@@ -1131,6 +1169,13 @@ static inline
 void urcu_txn_sw_install(struct urcu_txn_sw_txn *t)
 {
 	unsigned int i;
+	/*
+	 * @nr is frozen here, but the latch installs store through
+	 * latch->slot -- a void ** the compiler cannot prove disjoint from the
+	 * handle -- so it reloads the field on every loop test.  Read it once,
+	 * as the concurrent engine's commit does.
+	 */
+	const unsigned int nr = t->nr;
 
 	urcu_txn_sw__excl_owner(t, "install()");
 	/*
@@ -1154,7 +1199,7 @@ void urcu_txn_sw_install(struct urcu_txn_sw_txn *t)
 		 * ever recorded or reserved.  Anything else would strand the
 		 * records buffered in the array we are about to replace.
 		 */
-		urcu_posix_assert(!t->nr);
+		urcu_posix_assert(!nr);
 		t->block = urcu_txn_sw__block_alloc(URCU_TXN_SW_CAP);
 		if (caa_unlikely(!t->block)) {
 			t->state = URCU_TXN_SW_OOM;	/* sticky; nothing parked */
@@ -1172,14 +1217,14 @@ void urcu_txn_sw_install(struct urcu_txn_sw_txn *t)
 	 * sort.  Debug-only: no cost under NDEBUG, and sw transactions are
 	 * small.
 	 */
-	for (i = 1; i < t->nr; i++) {
+	for (i = 1; i < nr; i++) {
 		unsigned int j;
 
 		for (j = 0; j < i; j++)
 			urcu_assert_debug(t->latches[i].slot != t->latches[j].slot);
 	}
 	t->state = URCU_TXN_SW_INSTALLED;
-	for (i = 0; i < t->nr; i++) {
+	for (i = 0; i < nr; i++) {
 		urcu_txn_sw__excl_slot_free(t->latches[i].slot,
 				t->latches[i].tag, "install (park)");
 		urcu_txn_sw_latch_install(t, &t->latches[i]);
@@ -1237,6 +1282,11 @@ enum urcu_txn_status urcu_txn_sw_commit_flavor(struct urcu_txn_sw_txn *t,
 {
 	struct urcu_txn_sw_block *blk;
 	unsigned int i;
+	/*
+	 * Frozen for the commit, but the settle stores go through latch->slot,
+	 * so the compiler must assume each may have changed it.  Read once.
+	 */
+	const unsigned int nr = t->nr;
 
 	urcu_txn_sw__excl_owner(t, "commit()");
 	if (caa_unlikely(t->state == URCU_TXN_SW_OOM)) {
@@ -1244,8 +1294,8 @@ enum urcu_txn_status urcu_txn_sw_commit_flavor(struct urcu_txn_sw_txn *t,
 		return URCU_TXN_STATUS_MEMORY_ERROR;
 	}
 	if (t->state == URCU_TXN_SW_PREPARE) {
-		if (t->nr <= 1) {
-			if (t->nr == 1) {
+		if (nr <= 1) {
+			if (nr == 1) {
 				struct urcu_txn_sw_latch *l = &t->latches[0];
 
 				urcu_txn_sw__excl_slot_unchanged(l);
@@ -1273,7 +1323,7 @@ enum urcu_txn_status urcu_txn_sw_commit_flavor(struct urcu_txn_sw_txn *t,
 	urcu_posix_assert(!t->latches_inline);
 	blk = t->block;
 	urcu_txn_sw_group_commit(&blk->group);
-	for (i = 0; i < t->nr; i++) {
+	for (i = 0; i < nr; i++) {
 		struct urcu_txn_sw_latch *l = &blk->latches[i];
 
 		urcu_txn_sw__excl_slot_ours(l);
