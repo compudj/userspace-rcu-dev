@@ -48,6 +48,25 @@ void urcu_txn_slab_ctor(void)
 {
 	int i;
 
+#ifdef URCU_SLAB_RSEQ
+	/*
+	 * librseq requires rseq_init() once per process before rseq_offset and
+	 * rseq_size mean anything.  liburcu never called it: it relied on
+	 * something else in the process happening to, which is not a missed
+	 * optimization but a crash.  rseq_registered() is what gates every rseq
+	 * path here, and until initialization runs, rseq_size holds -1U while
+	 * rseq_offset holds PTRDIFF_MIN -- so the gate opened and the first
+	 * per-cpu allocation dereferenced an rseq area built from a garbage
+	 * offset.
+	 *
+	 * The return value needs no inspection.  Every way this can fail leaves
+	 * rseq_size at a value rseq_registered() rejects: -1U when the libc does
+	 * not export the rseq symbols, 0 when registration was refused.  It must
+	 * however run BEFORE urcu_slab_init(), which consults rseq_registered()
+	 * to decide whether to register the expedited-rseq membarrier.
+	 */
+	(void) rseq_init();
+#endif
 	for (i = 0; i < URCU_TXN_SW_SLAB_NCLASS; i++)
 		urcu_txn_sw_slab_bytes[i] =
 				urcu_txn_sw_blocksize(urcu_txn_sw_slab_rc[i]);
