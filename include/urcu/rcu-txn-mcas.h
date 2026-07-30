@@ -180,10 +180,30 @@ enum urcu_txn_desc_status {
  * miniature; urcu_txn_record_chain() resolves it fail-safe (MW dominates) and
  * debug builds trap the likely bug.
  */
+/*
+ * ONE-HOT.  The values are single bits rather than ordinals so a kind can be
+ * tested by masking, which lets the MW tally in urcu_txn_add() be a branchless
+ * add of the masked bit instead of a conditional increment.  MW is deliberately
+ * bit 0, so (kind & URCU_TXN_KIND_MW) is exactly 0 or 1 and can be added
+ * directly; the assertion below is what keeps that true if anyone renumbers.
+ *
+ * Nothing may assume SW is zero: every kind is written explicitly by
+ * urcu_txn_add(), no record is ever zero-initialised into a default kind, and
+ * every test is a symbolic comparison.
+ */
 enum urcu_txn_kind {
-	URCU_TXN_KIND_SW = 0,
-	URCU_TXN_KIND_MW = 1,
+	URCU_TXN_KIND_MW = 1U << 0,
+	URCU_TXN_KIND_SW = 1U << 1,
 };
+
+urcu_static_assert(URCU_TXN_KIND_MW == 1U,
+		"urcu_txn_add() adds (kind & URCU_TXN_KIND_MW) straight into "
+		"nr_mw, which counts 1 per MW record only while MW is bit 0",
+		urcu_txn_kind_mw_not_bit_zero);
+urcu_static_assert((URCU_TXN_KIND_SW & URCU_TXN_KIND_MW) == 0,
+		"the kinds must be disjoint bits: masking one must never match "
+		"the other",
+		urcu_txn_kind_not_one_hot);
 
 struct urcu_txn_desc;
 
@@ -695,8 +715,8 @@ bool urcu_txn_add(struct urcu_txn_desc *t, void **slot,
 	r->new_ptr = new_ptr;
 	r->proxy_tag = tag;
 	r->kind = kind;
-	if (kind == URCU_TXN_KIND_MW)
-		t->nr_mw++;
+	/* one-hot: exactly 0 or 1, so no branch (see enum urcu_txn_kind) */
+	t->nr_mw += (kind & URCU_TXN_KIND_MW);
 	return true;
 }
 
@@ -822,17 +842,24 @@ bool urcu_txn_desc_commit(struct urcu_txn_desc *t,
 			void (*)(struct rcu_head *)))
 {
 	unsigned int i, nr_mw, planted;
+	/*
+	 * @nr is frozen for the whole commit -- nothing below writes it --
+	 * but the record settle stores go through record->slot, a void ** the
+	 * compiler cannot prove disjoint from the descriptor, so it reloads the
+	 * field on every loop test.  Read it once.
+	 */
+	const unsigned int nr = t->nr;
 	int failed;
 
 	if (caa_unlikely(t->poisoned)) {
 		urcu_txn_destroy(t);
 		return false;
 	}
-	if (t->nr == 0) {
+	if (nr == 0) {
 		urcu_txn_destroy(t);
 		return true;
 	}
-	if (t->nr == 1) {
+	if (nr == 1) {
 		struct urcu_txn_record *r = &t->recs[0];
 
 		if (r->kind == URCU_TXN_KIND_SW) {
@@ -862,7 +889,7 @@ bool urcu_txn_desc_commit(struct urcu_txn_desc *t,
 	 * Set the record back-pointers now, deferred from add time: from here the
 	 * descriptor is frozen and about to be parked.
 	 */
-	for (i = 0; i < t->nr; i++)
+	for (i = 0; i < nr; i++)
 		t->recs[i].desc = t;
 	/*
 	 * MW records first (an MW abort then wastes zero SW parks); only the MW
@@ -873,14 +900,14 @@ bool urcu_txn_desc_commit(struct urcu_txn_desc *t,
 	 * multi-writer-only engine does.
 	 */
 	nr_mw = t->nr_mw;
-	if (nr_mw != 0 && nr_mw != t->nr) {
+	if (nr_mw != 0 && nr_mw != nr) {
 		unsigned int k = urcu_txn_partition(t);
 
 		urcu_assert_debug(k == nr_mw);
 		(void) k;
 	}
 #if defined(DEBUG_RCU) || defined(CONFIG_RCU_DEBUG)
-	for (i = 1; i < t->nr; i++) {
+	for (i = 1; i < nr; i++) {
 		unsigned int j;
 
 		for (j = 0; j < i; j++)
@@ -900,10 +927,10 @@ bool urcu_txn_desc_commit(struct urcu_txn_desc *t,
 		return false;
 	}
 	/* Every MW record installed; the status is still UNDECIDED. */
-	for (i = nr_mw; i < t->nr; i++)
+	for (i = nr_mw; i < nr; i++)
 		urcu_txn_park(&t->recs[i]);	/* SW parks: plain, never fail */
 	urcu_txn_decide(t, URCU_TXN_DESC_SUCCEEDED);	/* linearization point */
-	urcu_txn_settle(t, t->nr);
+	urcu_txn_settle(t, nr);
 	call_rcu_fn(&t->rcu_head, urcu_txn_free_rcu);
 	return true;
 }
@@ -922,17 +949,24 @@ bool urcu_txn_desc_commit_sw(struct urcu_txn_desc *t,
 			void (*)(struct rcu_head *)))
 {
 	unsigned int i;
+	/*
+	 * @nr is frozen for the whole commit -- nothing below writes it --
+	 * but the record settle stores go through record->slot, a void ** the
+	 * compiler cannot prove disjoint from the descriptor, so it reloads the
+	 * field on every loop test.  Read it once.
+	 */
+	const unsigned int nr = t->nr;
 
 	urcu_assert_debug(t->nr_mw == 0);	/* caller promised store_sw-only */
 	if (caa_unlikely(t->poisoned)) {
 		urcu_txn_destroy(t);
 		return false;
 	}
-	if (t->nr == 0) {
+	if (nr == 0) {
 		urcu_txn_destroy(t);
 		return true;
 	}
-	if (t->nr == 1) {
+	if (nr == 1) {
 		struct urcu_txn_record *r = &t->recs[0];
 
 		urcu_assert_debug(r->kind == URCU_TXN_KIND_SW);
@@ -941,14 +975,14 @@ bool urcu_txn_desc_commit_sw(struct urcu_txn_desc *t,
 		urcu_txn_destroy(t);
 		return true;
 	}
-	for (i = 0; i < t->nr; i++) {
+	for (i = 0; i < nr; i++) {
 		urcu_assert_debug(t->recs[i].kind == URCU_TXN_KIND_SW);
 		t->recs[i].desc = t;		/* back-pointer: readers resolve through it */
 	}
-	for (i = 0; i < t->nr; i++)
+	for (i = 0; i < nr; i++)
 		urcu_txn_park(&t->recs[i]);		/* plain stores, never fail */
 	urcu_txn_decide(t, URCU_TXN_DESC_SUCCEEDED);	/* linearization point */
-	urcu_txn_settle(t, t->nr);
+	urcu_txn_settle(t, nr);
 	call_rcu_fn(&t->rcu_head, urcu_txn_free_rcu);
 	return true;
 }
