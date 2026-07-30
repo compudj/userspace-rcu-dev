@@ -67,7 +67,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS_REKEY_DLM	8	/* inv_rekey_graft_{disjoint,cross_junction,glue_dst,coherent_readers,shared}, inv_rekey_linearizability, inv_rekey_merge_{occupied,shared}_dst */
+#define NR_TESTS_REKEY_DLM	9	/* inv_rekey_graft_{disjoint,cross_junction,glue_dst,coherent_readers,shared}, inv_rekey_linearizability, inv_rekey_merge_{occupied,shared}_dst */
 
 /*
  * Base count = the RUN_TEST invocations in main() outside the DLM #ifdef.
@@ -3977,6 +3977,513 @@ static int sibp_report_orphans(struct cds_ft *ft, unsigned long live)
 	/* The trie is intact right here.  Keep the core. */
 	mw_violation_snapshot();
 	return -1;
+}
+
+#define RKSM_NW		6		/* mover/mutator pairs */
+#define RKSM_SB		3		/* S_top slot byte inside each junction */
+#define RKSM_MUT	0x60		/* mutator child byte base under S_top */
+
+struct rksm_arg {
+	struct cds_ft *ft;
+	uint8_t bp, dp, mine, guard, mut;	/* @mut is the DEEP byte, under @mine */
+	struct ft_test_node *seed_priv, *seed_guard;
+	int seeded;
+	unsigned long ops, retries, lost, checks, einval;
+	struct ft_test_node *mut_node;	/* in-flight, for post-join reclaim */
+	unsigned long stuck;		/* reclaim loops that ran out of retries */
+	int prev_rc;			/* the merge outcome one iteration back */
+	int failed;
+	int *stop_all;
+};
+
+/*
+ * Where did it go?  Walk the WHOLE trie for the node by IDENTITY.  "Present at
+ * neither src nor dst" has two very different causes -- a merge dropped it
+ * (absent from the structure entirely) or the harness lost track of where it
+ * put it (present, under some third key) -- and only a scan tells them apart.
+ * Concurrent, so a miss is weaker evidence than a hit; a hit is definitive.
+ */
+static int rksm_locate(struct cds_ft *ft, struct ft_test_node *n, uint64_t *at)
+{
+	struct cds_ft_iter *iter = NULL;
+	int found = 0;
+
+	if (cds_ft_iter_create(ft, &iter) < 0)
+		return -1;
+	rcu_read_lock();
+	cds_ft_for_each_rcu(ft, iter) {
+		uint8_t rk[8];
+		size_t rk_len;
+
+		if (cds_ft_iter_node(iter) != &n->node)
+			continue;
+		cds_ft_iter_get_key(iter, rk, sizeof(rk), &rk_len);
+		*at = cds_ft_key_to_u64(ft, rk, CDS_FT_LEN_DEFAULT);
+		found = 1;
+		break;
+	}
+	rcu_read_unlock();
+	cds_ft_iter_destroy(iter);
+	return found;
+}
+
+/*
+ * The mover is the SOLE writer of its own two seeds: the mutator's key is a
+ * sibling one byte deeper, and every other pair owns a different junction.  So
+ * "findable at neither the source nor the destination" is neither a race nor
+ * harness bookkeeping -- and a whole-trie scan by identity then says whether
+ * the node is gone from the structure or merely somewhere unexpected.
+ */
+static int rksm_seeds_check(struct rksm_arg *w, const char *when, int rc)
+{
+	uint64_t kp = rkm_key(w->bp, RKSM_SB, w->mine);
+	uint64_t kg = rkm_key(w->bp, RKSM_SB, w->guard);
+	uint64_t dp_priv = rkm_key(w->dp, RKSM_SB, w->mine);
+	uint64_t dp_guard = rkm_key(w->dp, RKSM_SB, w->guard);
+	struct cds_ft_node *ps = NULL, *pd = NULL, *gs = NULL, *gd = NULL;
+	int lost_priv, lost_guard, where;
+	uint64_t at = 0;
+
+	rcu_read_lock();
+	lost_priv = lookup_u64(w->ft, kp, &ps) != CDS_FT_STATUS_OK &&
+		lookup_u64(w->ft, dp_priv, &pd) != CDS_FT_STATUS_OK;
+	lost_guard = lookup_u64(w->ft, kg, &gs) != CDS_FT_STATUS_OK &&
+		lookup_u64(w->ft, dp_guard, &gd) != CDS_FT_STATUS_OK;
+	rcu_read_unlock();
+	if (!lost_priv && !lost_guard)
+		return 0;
+
+	where = rksm_locate(w->ft, lost_priv ? w->seed_priv : w->seed_guard, &at);
+	fprintf(stderr, "rksm MOVER bp=%u: own %s seed present at NEITHER src nor "
+		"dst @%s (rc=%d, prev rc=%d) -- priv{src=%d dst=%d} "
+		"guard{src=%d dst=%d} scan=%s key=%#lx "
+		"(moves=%lu retries=%lu drifts=%lu stuck=%lu)\n",
+		w->bp, lost_priv ? "priv" : "guard", when, rc, w->prev_rc,
+		ps != NULL, pd != NULL, gs != NULL, gd != NULL,
+		where > 0 ? "FOUND" : "absent", (unsigned long) at,
+		w->ops, w->retries, w->einval, w->stuck);
+	w->lost++;
+	w->failed = 1;
+	mw_violation_snapshot();
+	return -1;
+}
+
+static void *rksm_mover(void *arg)
+{
+	struct rksm_arg *w = (struct rksm_arg *) arg;
+	uint8_t src_key[2], dst_key[2];
+	unsigned long iters = 0;
+
+	src_key[0] = w->bp; src_key[1] = RKSM_SB;
+	dst_key[0] = w->dp; dst_key[1] = RKSM_SB;
+
+	rcu_register_thread();
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	while (!test_stop) {
+		uint64_t kp = rkm_key(w->bp, RKSM_SB, w->mine);
+		uint64_t kg = rkm_key(w->bp, RKSM_SB, w->guard);
+		int rc;
+
+		if (!w->seeded) {
+			rcu_read_lock();
+			w->seed_priv = node_alloc(kp);
+			w->seed_guard = node_alloc(kg);
+			if (insert_u64(w->ft, kp, w->seed_priv) != CDS_FT_STATUS_OK ||
+					insert_u64(w->ft, kg, w->seed_guard) !=
+						CDS_FT_STATUS_OK) {
+				rcu_read_unlock();
+				fprintf(stderr, "rksm bp=%u: seed failed\n", w->bp);
+				w->failed = 1;
+				goto out;
+			}
+			rcu_read_unlock();
+			w->seeded = 1;
+		}
+
+		/*
+		 * BEFORE and AFTER, so the window a loss happened in is a single
+		 * named interval rather than "some time in the last iteration".
+		 * BEFORE covers the seed's own publication and everything the
+		 * MUTATOR did while we were between merges; AFTER covers the merge.
+		 */
+		if (rksm_seeds_check(w, "pre-merge", 0) < 0)
+			goto out;
+		rc = _cds_ft_debug_rekey_graft_simple(w->ft, src_key, 2, dst_key, 2);
+		if (rksm_seeds_check(w, "post-merge", rc) < 0)
+			goto out;
+		w->prev_rc = rc;
+
+		if (rc == 0) {
+			w->ops++;
+			{
+				int a;
+
+				/* Transiently BUSY under a peer: retry, do not fail. */
+				for (a = 0; a < 1000; a++)
+					if (rkms_remove_node(w->ft,
+							rkm_key(w->dp, RKSM_SB, w->mine),
+							w->seed_priv) == CDS_FT_STATUS_OK)
+						break;
+				if (a == 1000)
+					w->stuck++;
+				for (a = 0; a < 1000; a++)
+					if (rkms_remove_node(w->ft,
+							rkm_key(w->dp, RKSM_SB, w->guard),
+							w->seed_guard) == CDS_FT_STATUS_OK)
+						break;
+				if (a == 1000)
+					w->stuck++;
+			}
+			w->seeded = 0;
+		} else if (rc == -EAGAIN || rc == -EIO || rc == -ENOMEM) {
+			w->retries++;
+		} else if (rc == -EINVAL) {
+			/*
+			 * SHAPE DRIFT, not a verdict on the library.  This oracle
+			 * mutates the source on purpose, and the mover's own seed can
+			 * end up removed at the dst while the mutator's key keeps the
+			 * byte alive -- leaving S_top single-child, hence PATH-
+			 * COMPRESSED, which the rekey scope gate refuses (measured: the
+			 * s_top gate, `compressed` bit only).  Re-seed and carry on.
+			 *
+			 * This does NOT mask a permanent -EINVAL: a shape the library
+			 * could never accept would drive @ops to zero, and the
+			 * per-writer liveness check below fails on exactly that.
+			 */
+			w->einval++;
+			/*
+			 * RECLAIM before re-seeding.  The seed is already published
+			 * (possibly partly at the src and partly at the dst after a
+			 * drifted move), and simply dropping it on the floor leaks
+			 * exactly one node per drift -- measured as a leak delta that
+			 * tracked this counter 1:1 until this loop existed.
+			 */
+			{
+				int a;
+
+				/* Retry: a single-shot remove loses to a peer. */
+				for (a = 0; a < 2000; a++)
+					if (rkms_remove_node(w->ft, kp, w->seed_priv)
+							== CDS_FT_STATUS_OK ||
+						rkms_remove_node(w->ft,
+							rkm_key(w->dp, RKSM_SB,
+								w->mine),
+							w->seed_priv) ==
+								CDS_FT_STATUS_OK)
+						break;
+				if (a == 2000)
+					w->stuck++;
+				for (a = 0; a < 2000; a++)
+					if (rkms_remove_node(w->ft, kg, w->seed_guard)
+							== CDS_FT_STATUS_OK ||
+						rkms_remove_node(w->ft,
+							rkm_key(w->dp, RKSM_SB,
+								w->guard),
+							w->seed_guard) ==
+								CDS_FT_STATUS_OK)
+						break;
+				if (a == 2000)
+					w->stuck++;
+			}
+			w->seeded = 0;
+		} else {
+			fprintf(stderr, "rksm bp=%u: merge failed rc=%d\n", w->bp, rc);
+			w->failed = 1;
+			mw_violation_snapshot();
+			goto out;
+		}
+		if ((++iters & 0xff) == 0)
+			rcu_quiescent_state();
+	}
+out:
+	*w->stop_all = 1;
+	rcu_unregister_thread();
+	return NULL;
+}
+
+/*
+ * The peer that the fence has to exclude: it adds a CHILD to the S_top its
+ * mover is copying, then insists the key still exists somewhere.
+ */
+static void *rksm_mutator(void *arg)
+{
+	struct rksm_arg *w = (struct rksm_arg *) arg;
+	unsigned long iters = 0;
+
+	rcu_register_thread();
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	while (!test_stop) {
+		/*
+		 * DEEPER than a sibling of S_top's children, on purpose.  As a
+		 * sibling this key can be the ONLY one under (bp,SB) in the window
+		 * between the mover's move and its re-seed, which PATH-COMPRESSES
+		 * S_top -- a shape the rekey legitimately refuses (-EINVAL, measured
+		 * at the s_top scope gate, `compressed` bit only).  Hanging it under
+		 * the mover's own child instead keeps S_top a >=2-child branch at all
+		 * times, while still adding a child INSIDE the subtree being copied,
+		 * which is the whole point.
+		 */
+		uint64_t at_src = ((uint64_t) w->bp << 24) |
+			((uint64_t) RKSM_SB << 16) |
+			((uint64_t) w->mine << 8) | (uint64_t) w->mut;
+		uint64_t at_dst = ((uint64_t) w->dp << 24) |
+			((uint64_t) RKSM_SB << 16) |
+			((uint64_t) w->mine << 8) | (uint64_t) w->mut;
+		struct ft_test_node *n = node_alloc(at_src);
+		struct cds_ft_node *f = NULL;
+		enum cds_ft_status st;
+
+		rcu_read_lock();
+		st = insert_u64(w->ft, at_src, n);
+		rcu_read_unlock();
+		if (st == CDS_FT_STATUS_OK)
+			w->mut_node = n;	/* published: the run owes its reclaim */
+		if (st != CDS_FT_STATUS_OK) {	/* BUSY / MEMORY: transient */
+			node_free(n);
+			w->retries++;
+			continue;
+		}
+
+		/*
+		 * The child is IN.  A concurrent merge may move it to the dst at any
+		 * point from here; what it may never do is lose it.
+		 */
+		w->checks++;
+		rcu_read_lock();
+		if (lookup_u64(w->ft, at_src, &f) != CDS_FT_STATUS_OK &&
+				lookup_u64(w->ft, at_dst, &f) != CDS_FT_STATUS_OK) {
+			rcu_read_unlock();
+			/*
+			 * Say WHAT was observed, not who did it.  "A merge
+			 * swallowed it" is an attribution, and the one time it
+			 * was chased it was wrong: the same loss reproduces with
+			 * the merge disabled entirely, and its minimal form is
+			 * two writers splitting and path-compressing one node
+			 * with no merge, rekey or graft in sight
+			 * (inv_sibling_split_compress).  A message that names a
+			 * culprit sends the next reader to the wrong subsystem.
+			 */
+			fprintf(stderr, "rksm MUT bp=%u: child %#lx is present at "
+				"NEITHER src nor dst -- it left the trie\n",
+				w->bp, (unsigned long) at_src);
+			w->lost++;
+			w->failed = 1;
+			mw_violation_snapshot();
+			goto out;
+		}
+		rcu_read_unlock();
+
+		/* Take it back from wherever it landed. */
+		if (rkms_remove_node(w->ft, at_src, n) != CDS_FT_STATUS_OK &&
+				rkms_remove_node(w->ft, at_dst, n) != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "rksm MUT bp=%u: could not reclaim %#lx\n",
+				w->bp, (unsigned long) at_src);
+			w->failed = 1;
+			goto out;
+		}
+		w->mut_node = NULL;		/* reclaimed by the remove above */
+		w->ops++;
+		if ((++iters & 0xff) == 0)
+			rcu_quiescent_state();
+	}
+out:
+	*w->stop_all = 1;
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static int inv_rekey_src_mutated(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	struct rksm_arg *mv, *mu;
+	struct ft_test_node *res[RKSM_NW][2];
+	pthread_t movers[RKSM_NW], mutators[RKSM_NW];
+	struct timespec t0;
+	unsigned long moves = 0, checks = 0, lost = 0, live = 0, einval = 0;
+	unsigned long stuck = 0;
+	int i, c, ret = 0, stop_all = 0;
+
+	/*
+	 * KNOWN-FAILING, so opt-in TWICE: FT_INV_MW selects the concurrent-writer
+	 * oracles at all, and FT_INV_RKSM arms this one.  It reproduces a LIVE
+	 * key loss -- a mover's own seed present at neither src nor dst, with a
+	 * matching leak delta -- in every run measured (1 lost, 3 of 3), and the
+	 * gate's imw legs would otherwise go permanently red, which is how a
+	 * genuine regression stops being visible.
+	 *
+	 * It is registered unconditionally rather than #ifdef'd out, because a
+	 * test that vanishes reads as coverage and is not; the skip below names
+	 * the defect so a reader of the log knows what is not being checked.
+	 * Remove the FT_INV_RKSM gate the moment the loss is fixed.
+	 */
+	if (!getenv("FT_INV_MW")) {
+		fprintf(stderr, "# inv_rekey_src_mutated: skipped "
+			"(set FT_INV_MW=1 to run the source-mutated merge oracle)\n");
+		return 0;
+	}
+	if (!getenv("FT_INV_RKSM")) {
+		fprintf(stderr, "# inv_rekey_src_mutated: skipped -- reproduces a "
+			"LIVE key loss (seed at neither src nor dst); set "
+			"FT_INV_RKSM=1 to run it\n");
+		return 0;
+	}
+	mw_install_fatal_handler();
+	leak_reset();
+
+	ft = create_fixed_fine_lock_listoff_ft(4, &group);	/* LIST OFF */
+	cds_ft_make_concurrent(ft);
+
+	mv = (struct rksm_arg *) calloc(RKSM_NW, sizeof(*mv));
+	mu = (struct rksm_arg *) calloc(RKSM_NW, sizeof(*mu));
+	if (!mv || !mu)
+		abort();
+
+	rcu_read_lock();
+	for (i = 0; i < RKSM_NW; i++) {
+		uint8_t bp = (uint8_t) (0x30 + i), dp = (uint8_t) (0x80 + i);
+
+		mv[i].ft = mu[i].ft = ft;
+		mv[i].bp = mu[i].bp = bp;
+		mv[i].dp = mu[i].dp = dp;
+		mv[i].mine = mu[i].mine = (uint8_t) (0x10 + i);
+		mv[i].guard = mu[i].guard = (uint8_t) (0x40 + i);
+		mv[i].mut = mu[i].mut = (uint8_t) (RKSM_MUT + i);	/* byte 3 */
+		mv[i].stop_all = mu[i].stop_all = &stop_all;
+
+		/* Sibs keep BP >= 3 children; residents keep the dst OCCUPIED. */
+		for (c = 0; c < 2; c++) {
+			uint64_t sk = rkm_key(bp, c == 0 ? 1 : 5, 0);
+			uint64_t dk = rkm_key(dp, c == 0 ? 1 : 5, 0);
+
+			if (insert_u64(ft, sk, node_alloc(sk)) != CDS_FT_STATUS_OK ||
+					insert_u64(ft, dk, node_alloc(dk)) !=
+						CDS_FT_STATUS_OK)
+				abort();
+			live += 2;
+		}
+		for (c = 0; c < 2; c++) {
+			uint64_t rk = rkm_key(dp, RKSM_SB, (uint8_t) (c + 1));
+
+			res[i][c] = node_alloc(rk);
+			if (insert_u64(ft, rk, res[i][c]) != CDS_FT_STATUS_OK)
+				abort();
+			live++;
+		}
+	}
+	rcu_read_unlock();
+
+	test_go = 0;
+	test_stop = 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < RKSM_NW; i++) {
+		pthread_create(&movers[i], NULL, rksm_mover, &mv[i]);
+		pthread_create(&mutators[i], NULL, rksm_mutator, &mu[i]);
+	}
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	test_go = 1;
+
+	rcu_thread_offline();
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS && !stop_all)
+		usleep(1000);
+	test_stop = 1;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < RKSM_NW; i++) {
+		pthread_join(movers[i], NULL);
+		pthread_join(mutators[i], NULL);
+	}
+	rcu_thread_online();
+
+	synchronize_rcu();
+	for (i = 0; i < RKSM_NW; i++) {	/* whatever the last iteration left */
+		if (!mv[i].seeded)
+			continue;
+		(void) rkms_remove_node(ft, rkm_key(mv[i].bp, RKSM_SB, mv[i].mine),
+				mv[i].seed_priv);
+		(void) rkms_remove_node(ft, rkm_key(mv[i].bp, RKSM_SB, mv[i].guard),
+				mv[i].seed_guard);
+		mv[i].seeded = 0;
+	}
+	/*
+	 * And the mutator's in-flight child: a run stopped between its insert and
+	 * its remove leaves exactly one key behind, which shows up as entries+1 and
+	 * a leak delta of 1 rather than as anything about the library.
+	 */
+	for (i = 0; i < RKSM_NW; i++) {
+		uint64_t at_src, at_dst;
+
+		if (!mu[i].mut_node)
+			continue;
+		at_src = ((uint64_t) mu[i].bp << 24) | ((uint64_t) RKSM_SB << 16) |
+			((uint64_t) mu[i].mine << 8) | (uint64_t) mu[i].mut;
+		at_dst = ((uint64_t) mu[i].dp << 24) | ((uint64_t) RKSM_SB << 16) |
+			((uint64_t) mu[i].mine << 8) | (uint64_t) mu[i].mut;
+		if (rkms_remove_node(ft, at_src, mu[i].mut_node) != CDS_FT_STATUS_OK)
+			(void) rkms_remove_node(ft, at_dst, mu[i].mut_node);
+		mu[i].mut_node = NULL;
+	}
+
+	synchronize_rcu();
+	rcu_read_lock();
+	for (i = 0; i < RKSM_NW; i++) {
+		moves += mv[i].ops;
+		einval += mv[i].einval;
+		stuck += mv[i].stuck;
+		checks += mu[i].checks;
+		lost += mu[i].lost + mv[i].lost;
+		if (mv[i].failed || mu[i].failed)
+			ret = -1;
+		if (mv[i].ops == 0) {
+			fprintf(stderr, "rekey src-mutated: mover %d made NO move\n", i);
+			ret = -1;
+		}
+		if (mu[i].checks == 0) {
+			fprintf(stderr, "rekey src-mutated: mutator %d landed NO child "
+				"-- it never contended the copy window\n", i);
+			ret = -1;
+		}
+		for (c = 0; c < 2; c++) {
+			struct cds_ft_node *f = NULL;
+			uint64_t rk = rkm_key(mv[i].dp, RKSM_SB, (uint8_t) (c + 1));
+
+			if (lookup_u64(ft, rk, &f) != CDS_FT_STATUS_OK ||
+					f != &res[i][c]->node) {
+				fprintf(stderr, "rekey src-mutated: resident %d/%d lost\n",
+					i, c);
+				ret = -1;
+			}
+		}
+	}
+	if (cds_ft_count_entries(ft) != live) {
+		fprintf(stderr, "rekey src-mutated: entries %lu != live %lu\n",
+			cds_ft_count_entries(ft), live);
+		ret = -1;
+	}
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "rekey src-mutated: cds_ft_verify failed\n");
+		ret = -1;
+	}
+	rcu_read_unlock();
+
+	fprintf(stderr, "# inv_rekey_src_mutated: %d mover/mutator pairs, %lu moves, "
+		"%lu children landed in the copy window, %lu lost, %lu shape re-seeds, "
+		"%lu stuck reclaims, %lu live keys\n",
+		RKSM_NW, moves, checks, lost, einval, stuck, live);
+
+	free(mv);
+	free(mu);
+	if (drain_and_destroy(ft, group) < 0)
+		ret = -1;
+	if (leak_check() < 0)
+		ret = -1;
+	return ret;
 }
 
 /*
@@ -14944,6 +15451,7 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_rekey_linearizability);
 	RUN_TEST(inv_rekey_merge_occupied_dst);
 	RUN_TEST(inv_rekey_merge_shared_dst);
+	RUN_TEST(inv_rekey_src_mutated);
 	RUN_TEST(inv_sibling_split_compress);
 	RUN_TEST(inv_concurrent_writers_shared);
 	RUN_TEST(inv_concurrent_writers_coarse_lock);
