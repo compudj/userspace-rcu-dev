@@ -44,6 +44,7 @@ noinst_PROGRAMS = \
 	test_rcu_txn_bitmap \
 	test_rcu_txn_skiplist \
 	test_rcu_txn_skiplist_ryw \
+	test_call_rcu_affinity \
 	test_rcu_txn_slab \
 	test_rcu_txn_read_policy \
 	test_rcu_txn_beginless \
@@ -103,6 +104,7 @@ TESTS = \
 	test_rcu_txn_bitmap \
 	test_rcu_txn_skiplist \
 	test_rcu_txn_skiplist_ryw \
+	test_call_rcu_affinity \
 	test_rcu_txn_slab \
 	test_rcu_txn_read_policy \
 	test_rcu_txn_beginless \
@@ -223,6 +225,17 @@ test_rcu_txn_skiplist_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
 
 test_rcu_txn_skiplist_ryw_SOURCES = test_rcu_txn_skiplist_ryw.c
 test_rcu_txn_skiplist_ryw_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
+
+
+# Fault-injection shim for test_call_rcu_affinity: interposes sched_getcpu()
+# and sched_setaffinity() so a cpu can be made to "depart" without root.
+noinst_LTLIBRARIES = libaffinity_fault.la
+libaffinity_fault_la_SOURCES = affinity_fault_preload.c
+libaffinity_fault_la_LDFLAGS = -module -avoid-version -shared -rpath $(abs_builddir)
+libaffinity_fault_la_LIBADD = -ldl
+
+test_call_rcu_affinity_SOURCES = test_call_rcu_affinity.c
+test_call_rcu_affinity_LDADD = $(URCU_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
 
 test_rcu_txn_slab_SOURCES = test_rcu_txn_slab.c
 test_rcu_txn_slab_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)

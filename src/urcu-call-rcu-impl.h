@@ -54,6 +54,21 @@ struct call_rcu_data {
 	int cpu_affinity;
 	unsigned long gp_count;
 	struct cds_list_head list;
+	/*
+	 * Affinity-change notifiers.  Registration is rare and notification is
+	 * rarer (rate-limited to one check per SET_AFFINITY_CHECK_PERIOD, and
+	 * then only on an actual departure), so a plain mutex is the right
+	 * weight -- and it must NOT be call_rcu_mutex, which is held across
+	 * crdp creation and teardown.
+	 *
+	 * @affinity_lost is the edge detector: notifiers fire on the 0->1
+	 * transition only, so a cpu that stays gone is reported once rather
+	 * than every 256 callbacks.  A successful re-pin clears it, so a cpu
+	 * that leaves, returns, and leaves again is reported each time.
+	 */
+	pthread_mutex_t affinity_lock;
+	struct cds_list_head affinity_notifiers;
+	int affinity_lost;
 } __attribute__((__aligned__(CAA_CACHE_LINE_SIZE)));
 
 struct call_rcu_completion {
@@ -191,6 +206,42 @@ static void call_rcu_unlock(pthread_mutex_t *pmp)
  */
 #ifdef HAVE_SCHED_SETAFFINITY
 /*
+ * Invoke every notifier once, on the 0->1 edge.  Called from the worker thread
+ * of @crdp, which is by construction NOT on crdp->cpu_affinity at this point.
+ *
+ * The lock is held across the callbacks: they are documented as forbidden from
+ * re-entering the call_rcu API or unregistering themselves, which is what makes
+ * that safe, and it keeps a concurrent unregister from freeing a notifier out
+ * from under the walk.
+ */
+static
+void call_rcu_affinity_lost(struct call_rcu_data *crdp)
+{
+	struct urcu_affinity_notifier *n;
+
+	if (crdp->cpu_affinity < 0)
+		return;
+	call_rcu_lock(&crdp->affinity_lock);
+	if (!crdp->affinity_lost) {
+		crdp->affinity_lost = 1;
+		cds_list_for_each_entry(n, &crdp->affinity_notifiers, node)
+			n->fct(crdp->cpu_affinity, n->priv);
+	}
+	call_rcu_unlock(&crdp->affinity_lock);
+}
+
+/* Re-arm: a cpu that comes back and leaves again is reported again. */
+static
+void call_rcu_affinity_regained(struct call_rcu_data *crdp)
+{
+	if (crdp->cpu_affinity < 0 || !uatomic_load(&crdp->affinity_lost, CMM_RELAXED))
+		return;
+	call_rcu_lock(&crdp->affinity_lock);
+	crdp->affinity_lost = 0;
+	call_rcu_unlock(&crdp->affinity_lock);
+}
+
+/*
  * Actually pin the calling thread to crdp->cpu_affinity.  Unconditional
  * (no rate-limit), so it is used for the initial placement at call_rcu
  * thread startup; the work loop reaches it through the rate-limited
@@ -213,10 +264,19 @@ int do_set_thread_cpu_affinity(struct call_rcu_data *crdp)
 	 * EINVAL is fine: can be caused by hotunplugged CPUs, or by
 	 * cpuset(7). This is why we should always retry if we detect
 	 * migration.
+	 *
+	 * It is also the only notice the library ever gets that this cpu is
+	 * gone -- ordinary migration re-pins successfully, so EINVAL means the
+	 * cpu cannot be honoured at all.  Anything owning per-cpu state for it
+	 * (a per-cpu allocator's rseq-only lists, say) can only be reached from
+	 * some other cpu, and this thread is on one.  Tell the notifiers.
 	 */
 	if (ret && errno == EINVAL) {
 		ret = 0;
 		errno = 0;
+		call_rcu_affinity_lost(crdp);
+	} else if (!ret) {
+		call_rcu_affinity_regained(crdp);
 	}
 	return ret;
 }
@@ -457,6 +517,10 @@ static void call_rcu_data_init(struct call_rcu_data **crdpp,
 	cds_list_add(&crdp->list, &call_rcu_data_list);
 	crdp->cpu_affinity = cpu_affinity;
 	crdp->gp_count = 0;
+	ret = pthread_mutex_init(&crdp->affinity_lock, NULL);
+	urcu_posix_assert(!ret);
+	CDS_INIT_LIST_HEAD(&crdp->affinity_notifiers);
+	crdp->affinity_lost = 0;
 	rcu_set_pointer(crdpp, crdp);
 
 	ret = sigfillset(&newmask);
@@ -527,6 +591,27 @@ struct call_rcu_data *create_call_rcu_data(unsigned long flags,
 {
 	struct call_rcu_data *crdp;
 
+#if defined(HAVE_SYSCONF) && defined(HAVE_SCHED_GETCPU)
+	/*
+	 * Refuse a cpu this machine can never have.  The worker would start,
+	 * fail to pin itself, and then run unpinned forever -- a per-cpu worker
+	 * that is not on its cpu, silently.  That is a caller bug, so report it
+	 * rather than degrade.
+	 *
+	 * Only the impossible range is rejected, NOT merely-offline cpus: the
+	 * bound is get_possible_cpus_array_len(), so a cpu that is hotpluggable
+	 * but currently down still gets its worker.  It has to --
+	 * create_all_cpu_call_rcu_data() builds one worker per POSSIBLE cpu and
+	 * gives up on the first failure, so rejecting offline cpus here would
+	 * break it outright on exactly the hotplug-capable machines this is
+	 * meant to serve.  Such a worker reports its predicament through the
+	 * affinity notifiers instead.
+	 */
+	if (cpu_affinity >= 0 && cpu_affinity >= get_possible_cpus_array_len()) {
+		errno = EINVAL;
+		return NULL;
+	}
+#endif
 	call_rcu_lock(&call_rcu_mutex);
 	crdp = __create_call_rcu_data(flags, cpu_affinity);
 	call_rcu_unlock(&call_rcu_mutex);
@@ -954,6 +1039,49 @@ void rcu_barrier(void)
 online:
 	if (was_online)
 		rcu_thread_online();
+}
+
+/*
+ * Register @notifier on @crdp.  See urcu/call-rcu.h for what a notifier may do.
+ * Registering on a crdp with no cpu affinity (cpu_affinity < 0) is accepted but
+ * can never fire, since there is no cpu whose departure could be detected.
+ */
+int call_rcu_affinity_notifier_register(struct call_rcu_data *crdp,
+		struct urcu_affinity_notifier *notifier)
+{
+	if (!crdp || !notifier || !notifier->fct)
+		return -EINVAL;
+	call_rcu_lock(&crdp->affinity_lock);
+	cds_list_add(&notifier->node, &crdp->affinity_notifiers);
+	/*
+	 * The cpu may already be gone -- the worker pins itself once at startup,
+	 * so a crdp created for an unavailable cpu latches the loss before any
+	 * caller can possibly have registered.  Report it now rather than never;
+	 * a notifier exists to reclaim that cpu's state, and the state is
+	 * already orphaned.  The caller cannot be running ON the departed cpu
+	 * (it is unavailable to the process), so the same guarantee holds as
+	 * when the worker reports it.
+	 */
+	if (crdp->affinity_lost && crdp->cpu_affinity >= 0)
+		notifier->fct(crdp->cpu_affinity, notifier->priv);
+	call_rcu_unlock(&crdp->affinity_lock);
+	return 0;
+}
+
+/*
+ * Unregister @notifier.  Once this returns, the notifier is not running and
+ * will not be invoked again, so its storage may be released.  Must NOT be
+ * called from within a notifier.
+ */
+int call_rcu_affinity_notifier_unregister(struct call_rcu_data *crdp,
+		struct urcu_affinity_notifier *notifier)
+{
+	if (!crdp || !notifier)
+		return -EINVAL;
+	call_rcu_lock(&crdp->affinity_lock);
+	cds_list_del(&notifier->node);
+	call_rcu_unlock(&crdp->affinity_lock);
+	return 0;
 }
 
 /*

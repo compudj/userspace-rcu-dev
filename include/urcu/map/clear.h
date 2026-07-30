@@ -45,6 +45,8 @@
 #undef free_all_cpu_call_rcu_data
 #undef call_rcu
 #undef call_rcu_data_free
+#undef call_rcu_affinity_notifier_register
+#undef call_rcu_affinity_notifier_unregister
 #undef call_rcu_before_fork
 #undef call_rcu_after_fork_parent
 #undef call_rcu_after_fork_child

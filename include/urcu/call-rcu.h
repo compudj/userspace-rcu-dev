@@ -17,6 +17,7 @@
 #include <pthread.h>
 
 #include <urcu/wfcqueue.h>
+#include <urcu/list.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -71,6 +72,49 @@ int set_cpu_call_rcu_data(int cpu, struct call_rcu_data *crdp);
 
 int create_all_cpu_call_rcu_data(unsigned long flags);
 void free_all_cpu_call_rcu_data(void);
+
+/*
+ * Affinity-change notification.
+ *
+ * A per-cpu call_rcu worker re-pins itself to its cpu periodically, and
+ * sched_setaffinity() reports EINVAL when that cpu can no longer be honoured --
+ * hot-unplugged, or removed from the process by cpuset(7).  The worker is the
+ * only thing in the library that both knows which cpu it stands for and finds
+ * out that the cpu is gone, so it is where such news has to come from.
+ *
+ * Registered notifiers are invoked, once per departure, on the worker thread of
+ * @crdp -- which by then is necessarily running on some OTHER cpu, so a
+ * notifier may safely touch per-cpu state belonging to the departed cpu.  If
+ * the cpu later returns and the re-pin succeeds, the notifier arms again.
+ *
+ * If the cpu is ALREADY known to be gone when a notifier registers, it is
+ * invoked immediately, on the registering thread.  The worker pins itself once
+ * at startup, so a crdp created for an unavailable cpu records the loss before
+ * any caller could have registered; reporting it late beats never.  The caller
+ * cannot itself be on the departed cpu -- the cpu is unavailable to the process
+ * -- so notifiers see the same guarantee either way.
+ *
+ * A notifier runs with the crdp's notifier lock held: it MUST NOT call back
+ * into the call_rcu API, and MUST NOT unregister itself.  Keep it to reclaiming
+ * whatever the departed cpu owned.
+ *
+ * CAVEAT.  The check lives in the worker's callback loop, so it is only reached
+ * while that worker has work.  In practice a departing cpu's queue still holds
+ * callbacks from before the change, and the notification fires as they drain --
+ * exactly when the per-cpu state was orphaned.  But a cpu that goes away with a
+ * completely empty queue will never wake its worker, and no notification comes.
+ * Treat this as a best-effort hint, not a guarantee.
+ */
+struct urcu_affinity_notifier {
+	struct cds_list_head node;	/* internal: owned by the crdp */
+	void (*fct)(int cpu, void *priv);
+	void *priv;
+};
+
+int call_rcu_affinity_notifier_register(struct call_rcu_data *crdp,
+				struct urcu_affinity_notifier *notifier);
+int call_rcu_affinity_notifier_unregister(struct call_rcu_data *crdp,
+				struct urcu_affinity_notifier *notifier);
 
 void call_rcu_before_fork(void);
 void call_rcu_after_fork_parent(void);
