@@ -4056,11 +4056,12 @@ static int rksm_seeds_check(struct rksm_arg *w, const char *when, int rc)
 	where = rksm_locate(w->ft, lost_priv ? w->seed_priv : w->seed_guard, &at);
 	fprintf(stderr, "rksm MOVER bp=%u: own %s seed present at NEITHER src nor "
 		"dst @%s (rc=%d, prev rc=%d) -- priv{src=%d dst=%d} "
-		"guard{src=%d dst=%d} scan=%s key=%#lx "
+		"guard{src=%d dst=%d} scan=%s key=%#lx seed=%p "
 		"(moves=%lu retries=%lu drifts=%lu stuck=%lu)\n",
 		w->bp, lost_priv ? "priv" : "guard", when, rc, w->prev_rc,
 		ps != NULL, pd != NULL, gs != NULL, gd != NULL,
 		where > 0 ? "FOUND" : "absent", (unsigned long) at,
+		(void *) (lost_priv ? w->seed_priv : w->seed_guard),
 		w->ops, w->retries, w->einval, w->stuck);
 	w->lost++;
 	w->failed = 1;
