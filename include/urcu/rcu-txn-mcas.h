@@ -106,6 +106,7 @@
 #include <string.h>
 
 #include <urcu/assert.h>
+#include <urcu/sort.h>
 #include <urcu/compiler.h>
 #include <urcu/uatomic.h>
 #include <urcu/call-rcu.h>		/* struct rcu_head */
@@ -412,21 +413,22 @@ unsigned int urcu_txn_partition(struct urcu_txn_desc *t)
 	return k;
 }
 
-/* Insertion-sort records [0..n) by slot address (transactions are small). */
+/*
+ * Order records [0..n) by slot address, giving concurrent transactions a common
+ * acquisition order.  Only the retry path sorts, so this is cold -- but it was
+ * an insertion sort over 48-byte records, i.e. quadratic with a fat constant,
+ * and a 128-record write set cost 6.8 us on reverse-sorted input, ten times the
+ * entire commit.  urcu/sort.h generates an introsort with the comparison and
+ * the element move both inlined; see there for why not qsort(3).
+ */
+#define urcu_txn_rec_less(a, b)						\
+	((uintptr_t) (a).slot < (uintptr_t) (b).slot)
+URCU_SORT_DEFINE(urcu_txn_sort_recs, struct urcu_txn_record, urcu_txn_rec_less)
+
 static inline
 void urcu_txn_sort(struct urcu_txn_desc *t, unsigned int n)
 {
-	unsigned int i, j;
-
-	for (i = 1; i < n; i++) {
-		struct urcu_txn_record key = t->recs[i];
-
-		for (j = i; j > 0 &&
-				(uintptr_t) t->recs[j - 1].slot >
-				(uintptr_t) key.slot; j--)
-			t->recs[j] = t->recs[j - 1];
-		t->recs[j] = key;
-	}
+	urcu_txn_sort_recs(t->recs, (size_t) n);
 }
 
 /*
