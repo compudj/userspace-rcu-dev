@@ -269,6 +269,37 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 		struct cds_ft_inode_flag **pub_slot =
 			ft_resolve_parent_slot(src_meta, ft, &pub_parent);
 
+		/*
+		 * The fresh replacement is EMPTY -- nothing below sets a child on
+		 * it -- and this sub-case exists for the ROOT: "a compressed root
+		 * from detach/graft_swap must remain internal" (the header above).
+		 * An empty internal AT THE ROOT is the empty trie, which is legal.
+		 *
+		 * Reached with a non-NULL parent, the same publish wires a
+		 * childless internal into a live parent slot, and that node stays
+		 * there: correctly counted (0), correctly back-pointered, of the
+		 * smallest type, holding nothing.  It is the "dead interior node"
+		 * cds_ft_verify names, and it breaks ordered navigation -- the
+		 * empty-subtree arm of the inequality descent is justified by the
+		 * premise that a slot-emptied internal is never left in place, so
+		 * a walk that reaches it either re-enters the branch forever or
+		 * climbs out and skips the remaining subtree.  Exact-key lookup
+		 * still finds every stranded key, which is why nothing else
+		 * reported it.
+		 *
+		 * The plan that led here is stale rather than the tree being
+		 * broken, so bail and let the caller re-descend, exactly as the
+		 * rewind and DLM acquire-miss bails above do.  PRE-commit: free
+		 * the unpublished node and destroy the caller-owned txn (the
+		 * caller skips the destroy on -EAGAIN, assuming a commit consumed
+		 * it), leaving the structure byte-for-byte as it was.
+		 */
+		if (pub_parent != NULL) {
+			free_cds_ft_node_unpublished(ft, fresh);
+			ft_flip_txn_destroy(txn);
+			return -EAGAIN;
+		}
+
 		fresh_meta->parent = pub_parent;
 		/*
 		 * DLM Step 1: acquire {src_cn (RETIRE), pub_parent (RELEASE)} in ONE
