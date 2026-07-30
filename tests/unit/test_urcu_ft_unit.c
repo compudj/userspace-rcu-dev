@@ -949,6 +949,11 @@ static int test_rekey_graft_simple(void)
 #define RKM_DOCC	0x03		/* dst occupant's byte1, distinct from RK_DZ */
 static int test_rekey_merge_occupied_dst(void)
 {
+	if (!cds_ft_merge_enabled()) {
+		diag("test_rekey_merge_occupied_dst: skipped, merge compiled out "
+			"(-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
 	struct cds_ft_group *group;
 	struct cds_ft *ft = create_fixed_fine_lock_listoff_ft(4, &group);
 	uint8_t src_key[2] = { RK_SX, RK_SY }, dst_key[2] = { RK_DX, RK_DZ };
@@ -1091,6 +1096,11 @@ out:
  */
 static int test_rekey_merge_collide_dst(void)
 {
+	if (!cds_ft_merge_enabled()) {
+		diag("test_rekey_merge_collide_dst: skipped, merge compiled out "
+			"(-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
 	struct cds_ft_group *group;
 	struct cds_ft *ft = create_fixed_fine_lock_listoff_ft(4, &group);
 	uint8_t src_key[2] = { RK_SX, RK_SY }, dst_key[2] = { RK_DX, RK_DZ };
@@ -2225,6 +2235,11 @@ out:
  */
 static int test_writer_lock_mode_fine_crosstrie_busy(void)
 {
+	if (!cds_ft_merge_enabled()) {
+		diag("test_writer_lock_mode_fine_crosstrie_busy: skipped, merge compiled out "
+			"(-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
 	struct cds_ft_group *group;
 	struct cds_ft *dst = create_varlen_fine_lock_ft(&group);
 	struct cds_ft *src = NULL;
@@ -6537,6 +6552,11 @@ out:
 
 static int test_rank_stats_merge_src_exact(void)
 {
+	if (!cds_ft_merge_enabled()) {
+		diag("test_rank_stats_merge_src_exact: skipped, merge compiled out "
+			"(-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
 	int lm, sc;
 
 	for (lm = 0; lm < 2; lm++)
@@ -6744,6 +6764,11 @@ static int rank_stats_merge_attach_run(bool ordered_list)
 
 static int test_rank_stats_merge_attach_exact(void)
 {
+	if (!cds_ft_merge_enabled()) {
+		diag("test_rank_stats_merge_attach_exact: skipped, merge compiled out "
+			"(-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
 	if (rank_stats_merge_attach_run(true) < 0)
 		return -1;
 	return rank_stats_merge_attach_run(false);
@@ -6838,6 +6863,11 @@ out:
 
 static int test_rank_stats_merge_spine_exact(void)
 {
+	if (!cds_ft_merge_enabled()) {
+		diag("test_rank_stats_merge_spine_exact: skipped, merge compiled out "
+			"(-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
 	if (rank_stats_merge_spine_run(true) < 0)
 		return -1;
 	return rank_stats_merge_spine_run(false);
@@ -10059,6 +10089,11 @@ out:
  */
 static int test_merge_ordered_fixed_root(void)
 {
+	if (!cds_ft_merge_enabled()) {
+		diag("test_merge_ordered_fixed_root: skipped, merge compiled out "
+			"(-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
 	struct cds_ft_group_attr *attr;
 	struct cds_ft_group *group;
 	struct cds_ft *dst, *src;
@@ -10266,16 +10301,31 @@ out:
 
 static int test_merge_rerooted_glue_ordered_ext(void)
 {
+	if (!cds_ft_merge_enabled()) {
+		diag("test_merge_rerooted_glue_ordered_ext: skipped, merge compiled out "
+			"(-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
 	return merge_rerooted_glue_ordered(0);
 }
 
 static int test_merge_rerooted_glue_ordered_compressed(void)
 {
+	if (!cds_ft_merge_enabled()) {
+		diag("test_merge_rerooted_glue_ordered_compressed: skipped, merge compiled out "
+			"(-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
 	return merge_rerooted_glue_ordered(1);
 }
 
 static int test_merge_rerooted_glue_ordered_key_shorter(void)
 {
+	if (!cds_ft_merge_enabled()) {
+		diag("test_merge_rerooted_glue_ordered_key_shorter: skipped, merge compiled out "
+			"(-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
 	return merge_rerooted_glue_ordered(2);
 }
 
@@ -10292,6 +10342,11 @@ static int test_merge_rerooted_glue_ordered_key_shorter(void)
  */
 static int test_merge_subpos_branch_reserve(void)
 {
+	if (!cds_ft_merge_enabled()) {
+		diag("test_merge_subpos_branch_reserve: skipped, merge compiled out "
+			"(-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
 	struct cds_ft_group_attr *attr;
 	struct cds_ft_group *group;
 	struct cds_ft *dst = NULL, *src = NULL;
@@ -10505,11 +10560,21 @@ out:
 
 static int test_merge_rerooted_nosplit_ordered_atnode(void)
 {
+	if (!cds_ft_merge_enabled()) {
+		diag("test_merge_rerooted_nosplit_ordered_atnode: skipped, merge compiled out "
+			"(-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
 	return merge_rerooted_nosplit_ordered(0);
 }
 
 static int test_merge_rerooted_nosplit_ordered_branch(void)
 {
+	if (!cds_ft_merge_enabled()) {
+		diag("test_merge_rerooted_nosplit_ordered_branch: skipped, merge compiled out "
+			"(-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
 	return merge_rerooted_nosplit_ordered(1);
 }
 
@@ -10531,6 +10596,11 @@ static enum cds_ft_status ft_rekey(struct cds_ft *ft, const char *nw,
  */
 static int test_merge_rekey_same_trie(void)
 {
+	if (!cds_ft_merge_enabled()) {
+		diag("test_merge_rekey_same_trie: skipped, merge compiled out "
+			"(-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
 	struct cds_ft_group *group;
 	struct cds_ft *ft;
 	int ret = -1;
@@ -10609,6 +10679,11 @@ out:
  */
 static int test_merge_rekey_same_trie_speculative_rejected(void)
 {
+	if (!cds_ft_merge_enabled()) {
+		diag("test_merge_rekey_same_trie_speculative_rejected: skipped, merge compiled out "
+			"(-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
 	struct cds_ft_group_attr *attr;
 	struct cds_ft_group *group;
 	struct cds_ft *ft = NULL;
@@ -10660,6 +10735,11 @@ out:
  */
 static int test_rekey_graft_vs_merge(void)
 {
+	if (!cds_ft_merge_enabled()) {
+		diag("test_rekey_graft_vs_merge: skipped, merge compiled out "
+			"(-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
 	struct cds_ft_group *group;
 	struct cds_ft *ft;
 	int ret = -1;
@@ -10741,6 +10821,11 @@ out:
  */
 static int test_merge_rekey_same_trie_ordered(void)
 {
+	if (!cds_ft_merge_enabled()) {
+		diag("test_merge_rekey_same_trie_ordered: skipped, merge compiled out "
+			"(-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
 	struct cds_ft_group_attr *attr;
 	struct cds_ft_group *group;
 	struct cds_ft *ft = NULL;
@@ -10856,6 +10941,11 @@ static unsigned int ft_test_dup_count(struct cds_ft *ft, const char *k)
  */
 static int test_merge_rekey_same_trie_listoff_collision(void)
 {
+	if (!cds_ft_merge_enabled()) {
+		diag("test_merge_rekey_same_trie_listoff_collision: skipped, merge compiled out "
+			"(-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
 	struct cds_ft_group_attr *attr;
 	struct cds_ft_group *group;
 	struct cds_ft *ft;
@@ -10911,6 +11001,11 @@ out:
  */
 static int test_nonidentity_bulk_ops(void)
 {
+	if (!cds_ft_merge_enabled()) {
+		diag("test_nonidentity_bulk_ops: skipped, merge compiled out "
+			"(-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
 	uint8_t k2o[256], o2k[256];
 	struct cds_ft_group_attr *attr;
 	struct cds_ft_group *group;
@@ -11056,6 +11151,11 @@ out:
  */
 static int test_merge_at_overflow(void)
 {
+	if (!cds_ft_merge_enabled()) {
+		diag("test_merge_at_overflow: skipped, merge compiled out "
+			"(-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
 	struct cds_ft_group_attr *attr;
 	struct cds_ft_group *group;
 	struct cds_ft *dst = NULL, *src = NULL;
@@ -11157,6 +11257,11 @@ out:
  */
 static int test_merge_at_fixed_ordered_splice(void)
 {
+	if (!cds_ft_merge_enabled()) {
+		diag("test_merge_at_fixed_ordered_splice: skipped, merge compiled out "
+			"(-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
 	int part, ret = -1;
 
 	for (part = 0; part < 2; part++) {
@@ -20682,6 +20787,11 @@ out:
  */
 static int test_merge_disjoint_prefix_fast_path(void)
 {
+	if (!cds_ft_merge_enabled()) {
+		diag("test_merge_disjoint_prefix_fast_path: skipped, merge compiled out "
+			"(-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
 	struct cds_ft_group *group;
 	struct cds_ft *dst, *src;
 	enum cds_ft_status s;
@@ -20740,6 +20850,11 @@ out_dst:
  */
 static int test_merge_overlapping_per_entry(void)
 {
+	if (!cds_ft_merge_enabled()) {
+		diag("test_merge_overlapping_per_entry: skipped, merge compiled out "
+			"(-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
 	struct cds_ft_group *group;
 	struct cds_ft *dst, *src;
 	enum cds_ft_status s;
@@ -20816,6 +20931,11 @@ out_dst:
  */
 static int test_merge_compressed_overlap(void)
 {
+	if (!cds_ft_merge_enabled()) {
+		diag("test_merge_compressed_overlap: skipped, merge compiled out "
+			"(-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
 	struct cds_ft_group *group;
 	struct cds_ft *dst, *src;
 	enum cds_ft_status s;
@@ -20917,6 +21037,11 @@ out_dst:
  */
 static int test_merge_empty_source(void)
 {
+	if (!cds_ft_merge_enabled()) {
+		diag("test_merge_empty_source: skipped, merge compiled out "
+			"(-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
 	struct cds_ft_group *group;
 	struct cds_ft *dst, *src;
 	struct ft_test_node *n;
@@ -20969,6 +21094,11 @@ out_dst:
  */
 static int test_merge_at_root_empty_dst(void)
 {
+	if (!cds_ft_merge_enabled()) {
+		diag("test_merge_at_root_empty_dst: skipped, merge compiled out "
+			"(-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
 	struct cds_ft_group *group;
 	struct cds_ft *dst, *src;
 	enum cds_ft_status s;
@@ -21020,6 +21150,11 @@ out_dst:
  */
 static int test_merge_duplicate_chains(void)
 {
+	if (!cds_ft_merge_enabled()) {
+		diag("test_merge_duplicate_chains: skipped, merge compiled out "
+			"(-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
 	struct cds_ft_group *group;
 	struct cds_ft *dst, *src;
 	struct cds_ft_iter *iter;
@@ -21091,6 +21226,11 @@ out_dst:
  */
 static int test_merge_invalid_arguments(void)
 {
+	if (!cds_ft_merge_enabled()) {
+		diag("test_merge_invalid_arguments: skipped, merge compiled out "
+			"(-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
 	struct cds_ft_group *group1, *group2;
 	struct cds_ft *ft1a, *ft1b, *ft2;
 	enum cds_ft_status s;
@@ -21131,6 +21271,11 @@ out_ft1a:
  */
 static int test_merge_concurrent_source(void)
 {
+	if (!cds_ft_merge_enabled()) {
+		diag("test_merge_concurrent_source: skipped, merge compiled out "
+			"(-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
 	struct cds_ft_group *group;
 	struct cds_ft *dst, *src;
 	enum cds_ft_status s;
@@ -21188,6 +21333,11 @@ out_dst:
  */
 static int test_merge_prefix_subtree(void)
 {
+	if (!cds_ft_merge_enabled()) {
+		diag("test_merge_prefix_subtree: skipped, merge compiled out "
+			"(-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
 	struct cds_ft_group *group;
 	struct cds_ft *dst, *src;
 	enum cds_ft_status s;
@@ -21246,6 +21396,11 @@ out_dst:
  */
 static int test_merge_fixed_length_fast_path(void)
 {
+	if (!cds_ft_merge_enabled()) {
+		diag("test_merge_fixed_length_fast_path: skipped, merge compiled out "
+			"(-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
 	struct cds_ft_group *group;
 	struct cds_ft *dst, *src;
 	enum cds_ft_status s;
@@ -21327,6 +21482,11 @@ out_dst:
  */
 static int test_merge_prefix_overlap_per_entry(void)
 {
+	if (!cds_ft_merge_enabled()) {
+		diag("test_merge_prefix_overlap_per_entry: skipped, merge compiled out "
+			"(-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
 	struct cds_ft_group *group;
 	struct cds_ft *dst, *src;
 	enum cds_ft_status s;
@@ -21393,6 +21553,11 @@ out_dst:
  */
 static int test_merge_at_varlen_rekey(void)
 {
+	if (!cds_ft_merge_enabled()) {
+		diag("test_merge_at_varlen_rekey: skipped, merge compiled out "
+			"(-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
 	struct cds_ft_group *group;
 	struct cds_ft *dst, *src;
 	enum cds_ft_status s;
@@ -21455,6 +21620,11 @@ out_dst:
  */
 static int test_merge_at_fixed_rekey(void)
 {
+	if (!cds_ft_merge_enabled()) {
+		diag("test_merge_at_fixed_rekey: skipped, merge compiled out "
+			"(-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
 	struct cds_ft_group *group;
 	struct cds_ft *dst, *src;
 	enum cds_ft_status s;
@@ -21520,6 +21690,11 @@ out_dst:
  */
 static int test_merge_at_overlap(void)
 {
+	if (!cds_ft_merge_enabled()) {
+		diag("test_merge_at_overlap: skipped, merge compiled out "
+			"(-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
 	struct cds_ft_group *group;
 	struct cds_ft *dst, *src;
 	enum cds_ft_status s;
@@ -21594,6 +21769,11 @@ out_dst:
  */
 static int test_merge_at_nonroot_src(void)
 {
+	if (!cds_ft_merge_enabled()) {
+		diag("test_merge_at_nonroot_src: skipped, merge compiled out "
+			"(-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
 	struct cds_ft_group *group;
 	struct cds_ft *dst, *src;
 	enum cds_ft_status s;
@@ -21703,6 +21883,11 @@ out_dst:
  */
 static int test_merge_at_nonroot_dst(void)
 {
+	if (!cds_ft_merge_enabled()) {
+		diag("test_merge_at_nonroot_dst: skipped, merge compiled out "
+			"(-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
 	struct cds_ft_group *group;
 	struct cds_ft *dst, *src;
 	enum cds_ft_status s;
@@ -21801,6 +21986,11 @@ out_dst:
  */
 static int test_merge_at_external_dst(void)
 {
+	if (!cds_ft_merge_enabled()) {
+		diag("test_merge_at_external_dst: skipped, merge compiled out "
+			"(-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
 	struct cds_ft_group *group;
 	struct cds_ft *dst, *src;
 	enum cds_ft_status s;
@@ -21897,6 +22087,11 @@ out_dst:
  */
 static int test_merge_at_external_dst_splice(void)
 {
+	if (!cds_ft_merge_enabled()) {
+		diag("test_merge_at_external_dst_splice: skipped, merge compiled out "
+			"(-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
 	struct cds_ft_group *group;
 	struct cds_ft *dst, *src;
 	struct cds_ft_node *out_node = NULL;
@@ -21973,6 +22168,11 @@ out_dst:
  */
 static int test_merge_at_compressed_dst_internal(void)
 {
+	if (!cds_ft_merge_enabled()) {
+		diag("test_merge_at_compressed_dst_internal: skipped, merge compiled out "
+			"(-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
 	struct cds_ft_group *group;
 	struct cds_ft *dst, *src;
 	enum cds_ft_status s;
@@ -22064,6 +22264,11 @@ out_dst:
  */
 static int test_merge_at_compressed_dst_compressed(void)
 {
+	if (!cds_ft_merge_enabled()) {
+		diag("test_merge_at_compressed_dst_compressed: skipped, merge compiled out "
+			"(-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
 	struct cds_ft_group *group;
 	struct cds_ft *dst, *src;
 	enum cds_ft_status s;
@@ -22153,6 +22358,11 @@ out_dst:
  */
 static int test_merge_at_key_shorter_dst_internal(void)
 {
+	if (!cds_ft_merge_enabled()) {
+		diag("test_merge_at_key_shorter_dst_internal: skipped, merge compiled out "
+			"(-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
 	struct cds_ft_group *group;
 	struct cds_ft *dst, *src;
 	enum cds_ft_status s;
@@ -22246,6 +22456,11 @@ out_dst:
  */
 static int test_merge_at_key_shorter_dst_splice(void)
 {
+	if (!cds_ft_merge_enabled()) {
+		diag("test_merge_at_key_shorter_dst_splice: skipped, merge compiled out "
+			"(-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
 	struct cds_ft_group *group;
 	struct cds_ft *dst, *src;
 	struct cds_ft_node *found, *p;
@@ -22327,6 +22542,11 @@ out_dst:
  */
 static int test_merge_at_key_shorter_src(void)
 {
+	if (!cds_ft_merge_enabled()) {
+		diag("test_merge_at_key_shorter_src: skipped, merge compiled out "
+			"(-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
 	struct cds_ft_group *group;
 	struct cds_ft *dst, *src;
 	enum cds_ft_status s;
@@ -22411,6 +22631,11 @@ out_dst:
  */
 static int test_merge_at_key_shorter_src_both(void)
 {
+	if (!cds_ft_merge_enabled()) {
+		diag("test_merge_at_key_shorter_src_both: skipped, merge compiled out "
+			"(-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
 	struct cds_ft_group *group;
 	struct cds_ft *dst, *src;
 	enum cds_ft_status s;
@@ -22495,6 +22720,11 @@ out_dst:
  */
 static int test_merge_at_compressed_parent_internal(void)
 {
+	if (!cds_ft_merge_enabled()) {
+		diag("test_merge_at_compressed_parent_internal: skipped, merge compiled out "
+			"(-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
 	struct cds_ft_group *group;
 	struct cds_ft *dst, *src;
 	enum cds_ft_status s;
@@ -22585,6 +22815,11 @@ out_dst:
  */
 static int test_merge_at_compressed_parent_splice(void)
 {
+	if (!cds_ft_merge_enabled()) {
+		diag("test_merge_at_compressed_parent_splice: skipped, merge compiled out "
+			"(-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
 	struct cds_ft_group *group;
 	struct cds_ft *dst, *src;
 	struct cds_ft_node *found, *p;
@@ -22667,6 +22902,11 @@ out_dst:
  */
 static int test_merge_at_fixed_unequal_keylen(void)
 {
+	if (!cds_ft_merge_enabled()) {
+		diag("test_merge_at_fixed_unequal_keylen: skipped, merge compiled out "
+			"(-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
 	struct cds_ft_group *group;
 	struct cds_ft *dst, *src;
 	enum cds_ft_status s;

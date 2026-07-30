@@ -374,6 +374,15 @@ bool cds_ft_excl_validate_enabled(void)
 #endif
 }
 
+bool cds_ft_merge_enabled(void)
+{
+#ifdef NO_FEATURE_FT_MERGE
+	return false;
+#else
+	return true;
+#endif
+}
+
 bool cds_ft_verify_at_mutation_enabled(void)
 {
 #ifdef FEATURE_FT_VERIFY_AT_MUTATION

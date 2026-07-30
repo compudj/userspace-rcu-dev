@@ -3014,6 +3014,24 @@ bool cds_ft_is_exclusive(const struct cds_ft *ft);
 bool cds_ft_excl_validate_enabled(void);
 
 /*
+ * cds_ft_merge_enabled - Query whether the merge subsystem is compiled in.
+ *
+ * The merge family (cds_ft_merge, cds_ft_merge_at and the graft paths
+ * that reuse them) can be compiled out with -DNO_FEATURE_FT_MERGE,
+ * which drops ~20 KiB of .text for a deployment that never merges;
+ * cds_ft_merge then returns CDS_FT_STATUS_NOT_SUPPORTED.
+ *
+ * Returns false in such a build, true otherwise.
+ *
+ * Primarily intended for tests, for the same reason
+ * cds_ft_excl_validate_enabled exists: a test that exercises merge
+ * directly can query this and SKIP itself rather than fail, so the
+ * merge-less configuration can be tested at all instead of being
+ * build-only.
+ */
+bool cds_ft_merge_enabled(void);
+
+/*
  * cds_ft_verify_at_mutation_enabled - Query whether the optional
  *                                     verify-at-mutation feature is
  *                                     compiled into the library.

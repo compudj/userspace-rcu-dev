@@ -96,17 +96,18 @@ ALL_CONFIGS=(
 	# counts writers instead of claiming a single owner, because disjoint
 	# writers running in parallel is the design there, not a violation.
 	"excl|-DFEATURE_FT_EXCL_VALIDATE|u ion ioff imw"
-	# BUILD-ONLY, deliberately.  -DNO_FEATURE_FT_MERGE compiles out the merge
-	# subsystem (~20 KiB .text; cds_ft_merge then returns NOT_SUPPORTED).  It
-	# had no gate config and had ROTTED: the rekey fold's occupied-dst arm --
-	# which IS a merge -- was not guarded, so the library did not compile at
-	# all (9 errors).  Fixed; this config keeps it compiling.
+	# -DNO_FEATURE_FT_MERGE compiles out the merge subsystem (~20 KiB .text;
+	# cds_ft_merge then returns NOT_SUPPORTED).  It had no gate config and had
+	# ROTTED: the rekey fold's occupied-dst arm -- which IS a merge -- was not
+	# guarded, so the library did not compile at all (9 errors).
 	#
-	# No test leg yet: 48 ft_unit tests exercise merge directly and FAIL
-	# rather than SKIP without it.  Giving them a runtime capability query
-	# (the shape cds_ft_excl_validate_enabled / _verify_at_mutation_enabled
-	# already use) is the follow-up that earns this config a `u`.
-	"nomerge|-DNO_FEATURE_FT_MERGE|"
+	# It was BUILD-ONLY until the 48 ft_unit tests that exercise merge
+	# directly could tell "compiled out" from "broken": they now ask
+	# cds_ft_merge_enabled() and skip, so the config runs the suite (295,
+	# 48 of them skips) instead of only proving it links.  Compiling is a
+	# weak claim about a configuration -- the rot above got in while this
+	# config compiled fine.
+	"nomerge|-DNO_FEATURE_FT_MERGE|u"
 )
 
 # Optional positional filter: run only the named configs.
