@@ -99,6 +99,7 @@ extern "C" {
 #ifndef URCU_SLAB_MAX_MB
 #define URCU_SLAB_MAX_MB	1024UL
 #endif
+
 #define URCU_SLAB_RANGE_MASK	(URCU_SLAB_RANGE - 1)
 
 /*
@@ -143,11 +144,13 @@ struct urcu_slab_batch {
 #endif
 
 struct urcu_slab_arena;
+
 struct urcu_slab_sb {			/* header at the RANGE-aligned superblock base */
 	struct urcu_slab_arena *owner;
 	size_t bump;			/* next free byte offset within this superblock */
 	struct urcu_slab_sb *next;	/* arena's superblock list (teardown/audit) */
 };
+
 struct urcu_slab_arena {
 	struct cds_lfs_stack freelist;	/* MP push (free), LF pop (alloc) */
 	/*
@@ -162,15 +165,47 @@ struct urcu_slab_arena {
 	 * never discovered.  The floor rides back into the freelist with its
 	 * batch, so it must be (and is) a real block of this arena's class.
 	 */
+
+	/*
+	 * ---- CACHE LINE 0-1: the atomically shared heads ----
+	 *
+	 * Written by threads OTHER than this arena's cpu: a block returns to
+	 * its ORIGIN arena, so a cross-cpu free lands on ->freelist here and a
+	 * cross-cpu deferred free on ->pending, and the closer xchgs ->pending
+	 * from the reclaim worker.  Keeping them away from the rseq-only state
+	 * below is the point of the grouping: those remote writes must not
+	 * invalidate the line the owning cpu reads on its fast path.
+	 */
 	struct cds_lfs_stack pending;
 	struct cds_lfs_node *floor;
 	size_t obj;			/* block size for this arena's class (carve only) */
 	struct rcu_head close_head;	/* fallback closer, for a trickle of frees */
+
+	/*
+	 * ---- CACHE LINE 2: cold, or written once ----
+	 */
 	unsigned long close_queued;	/* a fallback closer is in flight */
 	pthread_mutex_t boot;		/* serializes floor bootstrap only */
 	struct urcu_slab *slab;		/* owning slab */
 	int idx;			/* this arena's index within slab->arenas */
 	int cls;			/* size class */
+
+	/*
+	 * ---- CACHE LINE 3: state only this arena's cpu touches ----
+	 *
+	 * The rseq fast paths -- alloc's local pop, free's local push, the
+	 * deferred free's local_pending push -- read and write only these, so
+	 * they sit together and away from the shared heads above.  @cpu opens
+	 * the line because every one of those paths compares it against the
+	 * rseq cpu before entering its critical section.
+	 *
+	 * @nr_pending is the exception and is deliberate: a CROSS-CPU deferred
+	 * free bumps the origin arena's counter, so a remote write does land
+	 * here.  It is kept anyway because the same-cpu case -- 99.99% of
+	 * deferred frees, measured -- writes it alongside @local_pending and
+	 * @local_floor in this same line, and paying a second line on the
+	 * common path to spare the rare one is the wrong trade.
+	 */
 	int cpu;			/* cpu this arena belongs to */
 	/*
 	 * Non-zero while this arena may be operated on with rseq critical
@@ -226,6 +261,7 @@ struct urcu_slab_arena {
 	 * permanently-demoted arena costs.
 	 */
 	unsigned long rseq_ok;
+
 	struct urcu_slab_sb *sb;	/* current bump superblock + list head */
 	unsigned long nr_sb;		/* superblocks mapped by this arena */
 	/*
@@ -247,6 +283,7 @@ struct urcu_slab_arena {
 	 * array with matching alignment (calloc only promises 16).
 	 */
 } __attribute__((aligned(64)));
+
 struct urcu_slab {
 	struct urcu_slab_arena *arenas;	/* [nclass * ncpu], row-major by class */
 	const size_t *class_size;	/* ascending byte size per class */
