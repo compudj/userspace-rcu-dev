@@ -4003,6 +4003,30 @@ struct rksm_arg {
  * put it (present, under some third key) -- and only a scan tells them apart.
  * Concurrent, so a miss is weaker evidence than a hit; a hit is definitive.
  */
+/*
+ * Is @n findable at @k RIGHT NOW?  Called between the mover's own two seed
+ * inserts, which is what narrowed this oracle's loss from "the seed vanished
+ * somewhere inside the merge" to a single library call: the seed is present
+ * after its own insert returns OK and GONE after the SIBLING insert returns OK,
+ * same thread, same read-side critical section (6/6 runs).  So the producer is
+ * cds_ft_insert dropping a neighbouring key, not the rekey/graft/merge this
+ * oracle was built to exercise -- and checking here names it in one line
+ * instead of a trace.  A peer IS required: with the mutators disabled the
+ * movers run ~8k-21k moves per run and lose nothing (4/4).
+ */
+static void rksm_seed_present(struct cds_ft *ft, unsigned int bp, uint64_t k,
+		struct ft_test_node *n, const char *when, int *failed)
+{
+	struct cds_ft_node *got = NULL;
+
+	if (lookup_u64(ft, k, &got) == CDS_FT_STATUS_OK && got == &n->node)
+		return;
+	fprintf(stderr, "rksm bp=%u: seed %p is ABSENT at its own key %#lx %s -- "
+		"the insert that reported OK did not leave it findable (got %p)\n",
+		bp, (void *) n, (unsigned long) k, when, (void *) got);
+	*failed = 1;
+}
+
 static int rksm_locate(struct cds_ft *ft, struct ft_test_node *n, uint64_t *at)
 {
 	struct cds_ft_iter *iter = NULL;
@@ -4098,6 +4122,23 @@ static void *rksm_mover(void *arg)
 				rcu_read_unlock();
 				fprintf(stderr, "rksm bp=%u: seed failed\n", w->bp);
 				w->failed = 1;
+				goto out;
+			}
+			/*
+			 * Both seeds must be findable before anything else
+			 * runs.  Checked in the SAME critical section as the
+			 * inserts, so a loss reported here cannot be blamed on
+			 * reclamation or on a later operation.
+			 */
+			rksm_seed_present(w->ft, w->bp, kp, w->seed_priv,
+					"once BOTH seed inserts have returned OK",
+					&w->failed);
+			rksm_seed_present(w->ft, w->bp, kg, w->seed_guard,
+					"once BOTH seed inserts have returned OK",
+					&w->failed);
+			if (w->failed) {
+				rcu_read_unlock();
+				mw_violation_snapshot();
 				goto out;
 			}
 			rcu_read_unlock();
