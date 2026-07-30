@@ -51,11 +51,21 @@ void urcu_txn_slab_ctor(void)
 	for (i = 0; i < URCU_TXN_SW_SLAB_NCLASS; i++)
 		urcu_txn_sw_slab_bytes[i] =
 				urcu_txn_sw_blocksize(urcu_txn_sw_slab_rc[i]);
+	/*
+	 * Link the slab's lists through each block's rcu_head, never offset 0:
+	 * a block enters the pending list at commit, a grace period before
+	 * readers are done with it, and offset 0 is live reader state
+	 * (urcu_txn_sw_block::group / urcu_txn_desc::status).  rcu_head is the
+	 * one field nobody reads -- call_rcu writes it at deferral time for
+	 * exactly this reason.
+	 */
 	urcu_slab_init(&urcu_txn_sw_slab, urcu_txn_sw_slab_bytes,
-			URCU_TXN_SW_SLAB_NCLASS, "txn_sw");
+			URCU_TXN_SW_SLAB_NCLASS, "txn_sw",
+			offsetof(struct urcu_txn_sw_block, rcu_head));
 	for (i = 0; i < URCU_TXN_SLAB_NCLASS; i++)
 		urcu_txn_slab_bytes[i] =
 				urcu_txn_blocksize(urcu_txn_slab_rc[i]);
 	urcu_slab_init(&urcu_txn_slab, urcu_txn_slab_bytes,
-			URCU_TXN_SLAB_NCLASS, "txn");
+			URCU_TXN_SLAB_NCLASS, "txn",
+			offsetof(struct urcu_txn_desc, rcu_head));
 }

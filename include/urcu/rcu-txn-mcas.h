@@ -625,13 +625,21 @@ struct urcu_txn_desc *urcu_txn_alloc_cap(unsigned int req)
 		if (caa_likely(t != NULL)) {
 			t->cap = urcu_txn_slab_rc[cl];
 			t->slab = 1;
+			return t;
 		}
-	} else {
-		t = urcu_txn_alloc(urcu_txn_blocksize(req));
-		if (caa_likely(t != NULL)) {
-			t->cap = req;
-			t->slab = 0;
-		}
+		/*
+		 * The arena is at its footprint cap (or out of memory).  SPILL
+		 * to the exact allocator rather than failing the transaction:
+		 * slab superblocks are never unmapped, so the cap exists to
+		 * keep a burst from inflating the process permanently -- the
+		 * burst itself must still make progress, just more slowly and
+		 * out of memory libc can reclaim afterwards.
+		 */
+	}
+	t = urcu_txn_alloc(urcu_txn_blocksize(req));
+	if (caa_likely(t != NULL)) {
+		t->cap = req;
+		t->slab = 0;
 	}
 	return t;
 }

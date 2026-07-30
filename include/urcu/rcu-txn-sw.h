@@ -619,15 +619,23 @@ struct urcu_txn_sw_block *urcu_txn_sw__block_alloc(unsigned int cap)
 	struct urcu_txn_sw_block *blk;
 	int cl;
 
+	blk = NULL;
 	if (urcu_slab_enabled(&urcu_txn_sw_slab) &&
 			(cl = urcu_txn_sw_slab_class_of(cap)) >= 0) {
 		blk = (struct urcu_txn_sw_block *)
 				urcu_slab_alloc(&urcu_txn_sw_slab, cl);
-		if (caa_unlikely(!blk))
-			return NULL;
-		cap = urcu_txn_sw_slab_rc[cl];		/* physical class cap */
-		blk->slab = 1;
-	} else {
+		if (caa_likely(blk != NULL)) {
+			cap = urcu_txn_sw_slab_rc[cl];	/* physical class cap */
+			blk->slab = 1;
+		}
+		/*
+		 * NULL means the arena hit its footprint cap (or OOM): fall
+		 * through and SPILL to the exact allocator.  Superblocks are
+		 * never unmapped, so the cap bounds what a burst makes
+		 * permanent; the burst still has to complete.
+		 */
+	}
+	if (!blk) {
 		void *p;
 
 		if (posix_memalign(&p, 16, urcu_txn_sw_blocksize(cap)))

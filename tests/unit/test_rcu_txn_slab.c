@@ -134,7 +134,7 @@ static void footprint_test(void)
 	unsigned long carve1, carve2, reuse;
 	int i, all_reused = 1;
 
-	urcu_slab_init(&fs, CLASSES, NCLASS, "footprint");
+	urcu_slab_init(&fs, CLASSES, NCLASS, "footprint", 8);
 	pin_to(0);
 	for (i = 0; i < FB_N; i++)		/* round 1: fresh -> all carve */
 		r1[i] = urcu_slab_alloc(&fs, 0);
@@ -202,7 +202,7 @@ static void origin_test(void)
 		skip(1, "need >= 2 pinnable cpus for the origin-arena test");
 		return;
 	}
-	urcu_slab_init(&os, CLASSES, NCLASS, "origin");
+	urcu_slab_init(&os, CLASSES, NCLASS, "origin", 8);
 
 	aa.s = &os; aa.cpu = cA; aa.out = NULL;
 	pthread_create(&ta, NULL, origin_alloc_thr, &aa);
@@ -298,7 +298,7 @@ static void concurrent_test(void)
 	void *pr;
 	int prod_fail = 0;
 
-	urcu_slab_init(&cs, CLASSES, NCLASS, "concurrent");
+	urcu_slab_init(&cs, CLASSES, NCLASS, "concurrent", 8);
 	cds_wfs_init(&g_chan);
 	g_tok = 0; g_freed = 0;
 
@@ -329,13 +329,90 @@ static void concurrent_test(void)
 		"carve %lu bounded by peak in-flight %d", cs.st_carve, TOTAL);
 }
 
+/* ------------------------------------------------------------------ */
+/* 6. hotplug drain: ONE cpu folds back, its neighbours are untouched  */
+/* ------------------------------------------------------------------ */
+/*
+ * urcu_slab_drain_cpu() is the hotplug unit.  What it must guarantee is that a
+ * departed cpu's rseq-only lists become reachable again -- and, just as
+ * importantly, that it does NOT demote the rest of the slab: demotion is
+ * one-way, so an over-broad drain would put the whole process on the atomic
+ * path for one cpu's departure.  Both halves are checked here.
+ *
+ * The blocks are freed on cpuA, so in an rseq build they sit in cpuA's ->local,
+ * reachable from cpuA alone.  After draining cpuA from ANOTHER cpu they must be
+ * back on the atomic freelist and allocatable again.
+ */
+static void hotplug_test(void)
+{
+	static struct urcu_slab hs;
+	long online = sysconf(_SC_NPROCESSORS_ONLN);
+	int cA = 0, cB = 1, cl;
+	void *p[8], *q;
+	unsigned int i;
+	int scoped = 1, reusable;
+
+	if (online < 2 || pin_to(cA) != 0) {
+		skip(2, "need >= 2 pinnable cpus for the hotplug-drain test");
+		return;
+	}
+	urcu_slab_init(&hs, CLASSES, NCLASS, "hotplug", 8);
+
+	/* populate cpuA's arenas, then hand them all back on cpuA */
+	for (i = 0; i < 8; i++)
+		p[i] = urcu_slab_alloc(&hs, 0);
+	for (i = 0; i < 8; i++)
+		urcu_slab_free(p[i]);
+
+	/* drain cpuA from cpuB -- the cpu being drained is "gone" */
+	pin_to(cB);
+	urcu_slab_drain_cpu(&hs, cA);
+
+	/* every OTHER cpu's arenas must still be armed */
+	for (cl = 0; cl < NCLASS; cl++) {
+		int c;
+
+		for (c = 0; c < hs.ncpu; c++) {
+			struct urcu_slab_arena *a =
+				&hs.arenas[cl * hs.ncpu + c];
+
+			if (c == cA) {
+				if (a->rseq_ok)
+					scoped = 0;	/* drained: must be down */
+			} else if (!a->rseq_ok && urcu_slab_rseq_ready()) {
+				scoped = 0;		/* collateral demote */
+			}
+		}
+	}
+	ok(scoped, "drain_cpu demotes ONLY the drained cpu's arenas "
+		"(one-way, so the blast radius matters)");
+
+	/* the folded blocks must be allocatable again from the origin cpu */
+	pin_to(cA);
+	q = urcu_slab_alloc(&hs, 0);
+	reusable = 0;
+	for (i = 0; i < 8; i++)
+		if (q == p[i])
+			reusable = 1;
+	ok(q != NULL && reusable,
+		"drain_cpu folds ->local back onto the atomic freelist "
+		"(block is reachable after the cpu is drained)");
+	if (q)
+		urcu_slab_free(q);
+
+	/* out-of-range and disabled slabs must be no-ops, not crashes */
+	urcu_slab_drain_cpu(&hs, -1);
+	urcu_slab_drain_cpu(&hs, hs.ncpu);
+	urcu_slab_drain_cpu(&hs, hs.ncpu + 1000);
+}
+
 int main(void)
 {
 	static struct urcu_slab s;
 	int want_enabled = !getenv("URCU_TXN_NO_CACHE");
 
 	plan_no_plan();
-	urcu_slab_init(&s, CLASSES, NCLASS, "meta");
+	urcu_slab_init(&s, CLASSES, NCLASS, "meta", 8);
 	meta_tests(&s, want_enabled);
 	if (!want_enabled) {
 		diag("URCU_TXN_NO_CACHE set: slab disabled, functional tests skipped");
@@ -346,5 +423,6 @@ int main(void)
 	footprint_test();
 	origin_test();
 	concurrent_test();
+	hotplug_test();
 	return exit_status();
 }
