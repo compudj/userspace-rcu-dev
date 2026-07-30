@@ -851,6 +851,8 @@ bool urcu_txn_desc_commit(struct urcu_txn_desc *t,
 	 * field on every loop test.  Read it once.
 	 */
 	const unsigned int nr = t->nr;
+	/* likewise invariant, and reloaded for the same reason */
+	const unsigned int retry = t->retry;
 	int failed;
 
 	if (caa_unlikely(t->poisoned)) {
@@ -874,7 +876,7 @@ bool urcu_txn_desc_commit(struct urcu_txn_desc *t,
 			urcu_txn_destroy(t);
 			return true;
 		}
-		if (t->retry < URCU_TXN_ESCALATE) {
+		if (retry < URCU_TXN_ESCALATE) {
 			/*
 			 * Lone MW edge, not yet starved: the CAS itself is the
 			 * atomic commit -- no proxy, no grace period.
@@ -916,9 +918,9 @@ bool urcu_txn_desc_commit(struct urcu_txn_desc *t,
 			urcu_assert_debug(t->recs[i].slot != t->recs[j].slot);
 	}
 #endif
-	if (t->retry != 0)
+	if (retry != 0)
 		urcu_txn_sort(t, nr_mw);
-	if (t->retry == 0)
+	if (retry == 0)
 		planted = urcu_txn_install_mw_flat(t, nr_mw, &failed);
 	else
 		planted = urcu_txn_install_mw_depth(t, nr_mw, &failed);
