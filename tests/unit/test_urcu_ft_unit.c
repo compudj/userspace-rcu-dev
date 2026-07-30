@@ -67,9 +67,9 @@
  * plan said 327 where 328 tests ran, so the fault build failed its own TAP
  * plan.) */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (334 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (335 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (286 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (287 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -23912,6 +23912,160 @@ out:
 /*                                                                    */
 /* ================================================================== */
 
+/*
+ * An ordered walk must get PAST a reachable internal node that holds nothing.
+ *
+ * ft-inequality.h has an arm for exactly that node ("transiently empty internal
+ * node ... treat as empty at this step and let going_up find the next sibling at
+ * a higher level"), and a counter on it reads ZERO across this suite and ft_inv
+ * in every list mode -- the code that decides what a walk does when it lands on
+ * a childless internal has never run under test.  It is not academic: such a
+ * node was produced for real by a detach that published a fresh childless
+ * internal at a non-root, and the reader symptom was silent enumeration loss
+ * (keys still findable by exact key, invisible to the walk).
+ *
+ * The shape cannot be built through the public API -- that is the point of
+ * having fixed the producer -- so _cds_ft_debug_empty_holder strips a holder of
+ * its children and leaves it wired, handing back the caller-owned leaves.
+ *
+ * The empty node is placed BELOW the surviving key in trie order so a
+ * first-to-last walk descends into it before it has anything else to return:
+ * the walk has to recognise the dead end, climb, and carry on rather than stop.
+ */
+extern int _cds_ft_debug_empty_holder(struct cds_ft *ft, struct cds_ft_node *leaf,
+		struct cds_ft_node **out, unsigned int out_max,
+		unsigned int *out_n);
+
+static int test_walk_past_empty_internal(void)
+{
+#ifdef FEATURE_FT_VERIFY_AT_MUTATION
+	/*
+	 * Incompatible by construction, not a gap: this test leaves the trie in
+	 * a state cds_ft_verify must reject, and verify-at-mutation runs that
+	 * very check at the next writer scope exit -- so the mutation in the
+	 * teardown below aborts the process (it did: the vam config's ft_unit
+	 * died on signal 6 right after test 294).  The reader behaviour under
+	 * test is orthogonal to VAM, and every other config still covers it.
+	 */
+	diag("test_walk_past_empty_internal: skipped under "
+		"FEATURE_FT_VERIFY_AT_MUTATION (the shape is deliberately "
+		"verify-invalid)");
+	return 0;
+#else
+	struct cds_ft_group *group;
+	/*
+	 * LIST OFF, and that is load-bearing: with the ordered cell list on,
+	 * cds_ft_next walks the cell list and never consults the structure, so
+	 * the structural descent -- and its empty-subtree arm, the whole point
+	 * of this test -- is bypassed.  With the list off the walk is the
+	 * successor descent.
+	 */
+	struct cds_ft *ft = create_fixed_fine_lock_listoff_ft(2, &group);
+	struct cds_ft_iter *iter = NULL;
+	struct ft_test_node *a0, *a1, *b0;
+	struct cds_ft_node *stripped[4];
+	unsigned int nr_stripped = 0, seen = 0;
+	enum cds_ft_status s;
+	int ret = 0;
+
+	/*
+	 * 0x0100 and 0x0101 share a holder (they differ only in the last key
+	 * byte, so both are body children of the node at path 0x01); 0x0200
+	 * lives elsewhere and is the key the walk must still reach.
+	 */
+	a0 = node_alloc(0x0100);
+	a1 = node_alloc(0x0101);
+	b0 = node_alloc(0x0200);
+	rcu_read_lock();
+	if (insert_u64(ft, 0x0100, a0) != CDS_FT_STATUS_OK ||
+	    insert_u64(ft, 0x0101, a1) != CDS_FT_STATUS_OK ||
+	    insert_u64(ft, 0x0200, b0) != CDS_FT_STATUS_OK)
+		abort();
+	rcu_read_unlock();
+
+	if (_cds_ft_debug_empty_holder(ft, &a0->node, stripped, 4,
+			&nr_stripped)) {
+		/*
+		 * The holder was not an internal with only external children
+		 * (a compressed shape, say).  Nothing to test rather than a
+		 * failure -- but say so, because a silently skipped test reads
+		 * as coverage and is not.
+		 */
+		diag("test_walk_past_empty_internal: shape not produced, skipped");
+		goto out;
+	}
+	if (nr_stripped != 2) {
+		diag("test_walk_past_empty_internal: stripped %u leaves, expected 2",
+			nr_stripped);
+		ret = -1;
+		goto out;
+	}
+
+	/* The trie now holds the shape cds_ft_verify is meant to reject. */
+	if (cds_ft_verify(ft, NULL) == CDS_FT_STATUS_OK) {
+		diag("test_walk_past_empty_internal: verify ACCEPTED a childless "
+			"reachable internal");
+		ret = -1;
+	}
+
+	if (cds_ft_iter_create(ft, &iter) < 0)
+		abort();
+	rcu_read_lock();
+	for (s = cds_ft_lookup_first(ft, iter); s == CDS_FT_STATUS_OK;
+			s = cds_ft_next(ft, iter)) {
+		if (++seen > 8)
+			break;		/* cycling: bounded so the test reports */
+	}
+	rcu_read_unlock();
+	cds_ft_iter_destroy(iter);
+
+	if (seen != 1) {
+		diag("test_walk_past_empty_internal: walk visited %u keys, "
+			"expected 1 (0x0200) -- %s", seen,
+			seen > 8 ? "it did not terminate" :
+				"it stopped at the empty node");
+		ret = -1;
+	}
+out:
+	{
+		unsigned int i;
+
+		for (i = 0; i < nr_stripped; i++)
+			node_free(to_test_node(stripped[i]));
+	}
+	/*
+	 * Do NOT drain: the remnant is deliberately malformed, and the drain
+	 * asserts its way through a well-formed trie.  Remove what is still
+	 * reachable, then destroy.
+	 */
+	rcu_read_lock();
+	{
+		struct cds_ft_node *f = NULL;
+
+		if (lookup_u64(ft, 0x0200, &f) == CDS_FT_STATUS_OK && f) {
+			struct cds_ft_iter *it2 = NULL;
+
+			if (cds_ft_iter_create(ft, &it2) == CDS_FT_STATUS_OK) {
+				uint8_t k[8];
+
+				cds_ft_u64_to_key(ft, 0x0200, k, CDS_FT_LEN_DEFAULT);
+				cds_ft_iter_set_key(it2, k, CDS_FT_LEN_DEFAULT);
+				if (cds_ft_lookup(ft, it2) == CDS_FT_STATUS_OK &&
+						cds_ft_iter_node(it2))
+					(void) cds_ft_remove(ft, it2,
+						cds_ft_iter_node(it2));
+				cds_ft_iter_destroy(it2);
+			}
+		}
+	}
+	rcu_read_unlock();
+	node_free(b0);
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return ret;
+#endif
+}
+
 #ifdef FEATURE_FT_FAULT_INJECT
 extern long cds_ft_fault_alloc_countdown;
 extern long cds_ft_fault_flip_countdown;
@@ -29623,6 +29777,8 @@ int main(int argc, char **argv)
 	RUN_TEST(test_compact_ordered_list_oom);
 	RUN_TEST(test_compact_ordered_list_oom_resume);
 #endif
+
+	RUN_TEST(test_walk_past_empty_internal);
 
 	rcu_barrier();
 	rcu_unregister_thread();

@@ -1603,3 +1603,78 @@ int _cds_ft_debug_rekey_graft_simple(struct cds_ft *ft,
 	ft_move_gate_exit(ft);
 	return ret;
 }
+
+/*
+ * TEST-ONLY: strip @leaf's holder of every child, leaving the holder itself
+ * WIRED where it is -- the "dead interior node" shape.
+ *
+ * Why a hook rather than a test that provokes it: the shape is a library
+ * DEFECT's output, so once the defect is fixed no sequence of public calls
+ * produces it, and the reader code that copes with it becomes untestable.  It
+ * was untested: a counter on ft-inequality.h's empty-subtree arm reads ZERO
+ * across ft_unit and ft_inv in every list mode.  That arm decides what an
+ * ordered walk does when it descends into a childless internal, and an
+ * unexercised arm is where the next defect of this class hides -- the
+ * compressed-parent one hid behind a comment claiming zero hits.
+ *
+ * The holder's external children are handed back through @out rather than
+ * freed: they are CALLER-OWNED nodes (the application allocated them), so the
+ * library must not free them, and the test needs them to reclaim its own
+ * memory.  Returns -1 if the holder is not an internal node, if @out is too
+ * small, or if the trie is empty; otherwise 0 with *@out_n set.
+ *
+ * Leaves the trie in a state cds_ft_verify REJECTS, on purpose.  Callers are
+ * expected to walk it, assert whatever they are testing, and destroy it.
+ */
+int _cds_ft_debug_empty_holder(struct cds_ft *ft, struct cds_ft_node *leaf,
+		struct cds_ft_node **out, unsigned int out_max,
+		unsigned int *out_n)
+{
+	struct cds_ft_inode_flag *holder_flag;
+	struct cds_ft_metadata *meta;
+	unsigned int b, n = 0;
+
+	if (!ft || !leaf || !out || !out_n)
+		return -1;
+	holder_flag = ft_node_holder(ft, leaf);
+	if (!holder_flag || !ft_node_internal(holder_flag))
+		return -1;
+	meta = cds_ft_item_to_metadata(ft_node_ptr(holder_flag));
+
+	/*
+	 * Collect first, clear after: a slot cleared mid-scan would change what
+	 * the remaining ft_node_get_nth_skip calls see on a popcount layout,
+	 * where the slot index is a rank over the occupancy bitmap.
+	 */
+	for (b = 0; b < 256; b++) {
+		struct cds_ft_inode_flag **slot = NULL;
+		struct cds_ft_inode_flag *child =
+			ft_node_get_nth_skip(holder_flag, &slot, (uint8_t) b,
+					FT_PF_NONE);
+
+		if (!child || !slot)
+			continue;
+		if (!ft_node_external(child))
+			return -1;	/* subtree, not a leaf: caller picked wrong */
+		if (n >= out_max)
+			return -1;
+		out[n++] = (struct cds_ft_node *) ft_node_ptr(child);
+	}
+	for (b = 0; b < 256; b++) {
+		struct cds_ft_inode_flag **slot = NULL;
+
+		if (!ft_node_get_nth_skip(holder_flag, &slot, (uint8_t) b,
+				FT_PF_NONE) || !slot)
+			continue;
+		rcu_assign_pointer(*slot, NULL);
+	}
+	if (meta->external_nodes) {
+		if (n >= out_max)
+			return -1;
+		out[n++] = meta->external_nodes;
+		rcu_assign_pointer(meta->external_nodes, NULL);
+	}
+	ft_meta_nr_child_set(meta, 0);
+	*out_n = n;
+	return 0;
+}
