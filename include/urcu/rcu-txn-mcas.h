@@ -555,10 +555,29 @@ unsigned int urcu_txn_install_mw_depth(struct urcu_txn_desc *t,
  * an MW slot still holds OUR proxy).
  */
 static inline
-void urcu_txn_settle(struct urcu_txn_desc *t, unsigned int planted)
+void urcu_txn_settle(struct urcu_txn_desc *t, unsigned int planted,
+		unsigned long st)
 {
-	unsigned long st = urcu_txn_desc_status(t);
 	unsigned int i;
+
+	/*
+	 * @st is PASSED, not re-read.  Every caller has just decided this
+	 * descriptor itself -- SUCCEEDED at the linearization point, or FAILED
+	 * from the installer -- so loading it back would be a load-acquire of a
+	 * word this thread released one instruction earlier, and the acquire
+	 * buys the owner nothing (program order already orders it; the
+	 * per-record release stores below are what readers pair with).
+	 *
+	 * The bigger effect is that @st is a compile-time constant at each call
+	 * site, so this loop specialises: the SUCCEEDED path stores new_ptr
+	 * unconditionally instead of selecting per record.
+	 *
+	 * Passing it is only sound because the owner is the SOLE driver: all
+	 * five urcu_txn_decide() sites act on their own descriptor, and while
+	 * an install is running the only value it can hold is FAILED, since
+	 * SUCCEEDED is stored after the installer returns.
+	 */
+	urcu_assert_debug(urcu_txn_desc_status(t) == st);
 
 	for (i = 0; i < planted; i++) {
 		struct urcu_txn_record *r = &t->recs[i];
@@ -944,7 +963,7 @@ bool urcu_txn_desc_commit(struct urcu_txn_desc *t,
 		planted = urcu_txn_install_mw_depth(t, nr_mw, &failed);
 	if (failed) {
 		/* Abort: restore the parked MW prefix to old, then reclaim. */
-		urcu_txn_settle(t, planted);
+		urcu_txn_settle(t, planted, URCU_TXN_DESC_FAILED);
 		call_rcu_fn(&t->rcu_head, urcu_txn_free_rcu);
 		return false;
 	}
@@ -952,7 +971,7 @@ bool urcu_txn_desc_commit(struct urcu_txn_desc *t,
 	for (i = nr_mw; i < nr; i++)
 		urcu_txn_park(&t->recs[i]);	/* SW parks: plain, never fail */
 	urcu_txn_decide(t, URCU_TXN_DESC_SUCCEEDED);	/* linearization point */
-	urcu_txn_settle(t, nr);
+	urcu_txn_settle(t, nr, URCU_TXN_DESC_SUCCEEDED);
 	call_rcu_fn(&t->rcu_head, urcu_txn_free_rcu);
 	return true;
 }
@@ -1004,7 +1023,7 @@ bool urcu_txn_desc_commit_sw(struct urcu_txn_desc *t,
 	for (i = 0; i < nr; i++)
 		urcu_txn_park(&t->recs[i]);		/* plain stores, never fail */
 	urcu_txn_decide(t, URCU_TXN_DESC_SUCCEEDED);	/* linearization point */
-	urcu_txn_settle(t, nr);
+	urcu_txn_settle(t, nr, URCU_TXN_DESC_SUCCEEDED);
 	call_rcu_fn(&t->rcu_head, urcu_txn_free_rcu);
 	return true;
 }
