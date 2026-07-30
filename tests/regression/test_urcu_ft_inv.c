@@ -4096,18 +4096,30 @@ static int inv_sibling_split_compress(void)
 	int i, ret = 0, stop_all = 0;
 
 	/*
-	 * KNOWN-FAILING, ON PURPOSE.  This oracle reproduces a LIVE defect: two
-	 * writers cycling insert/remove on two SIBLING children of one prefix
-	 * lose keys outright (an insert reports OK for a key no root descent can
-	 * find).  It is registered unconditionally so the gate keeps reporting
-	 * it -- a skipped test reads as coverage and is not.
+	 * Two writers cycling insert/remove on two SIBLING children of one
+	 * prefix, so the pair splits and path-compresses the SAME node
+	 * continuously.  No other oracle drives that shape: the disjoint-key
+	 * insert/remove oracles diverge high enough that no node is ever both
+	 * split and compressed under contention.
 	 *
-	 * It used to HANG rather than fail, which is strictly worse: a hung
-	 * suite scores GREEN against a gate that only counts failures.  That
-	 * wedge (a removal deriving its position from a stale node->prev that
-	 * named a RETIRED holder, then retrying the identical derivation
-	 * forever while holding the per-trie FIFO fair mutex) is fixed; what
-	 * remains is the key loss.
+	 * It has found three defects and now passes, so it is a REGRESSION test
+	 * for them:
+	 *   - the WEDGE (@d1832abb): a removal derived its position from a
+	 *     stale node->prev naming a RETIRED holder and retried the identical
+	 *     derivation forever, holding the per-trie FIFO fair mutex.  It used
+	 *     to HANG rather than fail, which is strictly worse -- a hung suite
+	 *     scores GREEN against a gate that only counts failures.
+	 *   - an unguarded trailing skip-target retire (@9ce4c2c8).
+	 *   - the DEAD INTERIOR NODE (@c9b6391f): a compressed parent replaced
+	 *     by a freshly allocated childless internal at a non-root, which
+	 *     only an ordered walk could detect -- hence the teardown verify in
+	 *     drain_and_destroy, and cds_ft_verify's own check for it.
+	 *
+	 * The last one reproduced about 1 saturated run in 100, so treat a
+	 * single green run here as weak evidence: soak it
+	 * (fractal-trie-review-2026-06/sibp_verify_soak.sh), or build with
+	 * -DFT_DELAY_INJECT and run FT_DELAY_MODE=writer FT_DELAY_US=10, which
+	 * made that defect reproduce every run.
 	 */
 	mw_install_fatal_handler();
 	leak_reset();
