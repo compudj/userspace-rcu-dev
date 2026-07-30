@@ -905,9 +905,18 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 		 */
 		if (expected_parent != NULL && counted_children == 0 &&
 		    !external_nodes) {
-			if (out)
-				fprintf(out, "ft_verify: depth %u: internal node %p is reachable with no children and no external_nodes (dead interior node left wired in its parent slot)\n",
-					depth, node_flag);
+			if (out) {
+				unsigned int ti = ft_node_type(node_flag);
+
+				fprintf(out, "ft_verify: depth %u: internal node %p is reachable with no children and no external_nodes (dead interior node left wired in its parent slot) [meta %p, type %u class %d max_child %u order %zu, incoming_byte %u, state %#lx, nr_keys %lu]\n",
+					depth, node_flag, (void *) metadata, ti,
+					(int) ft_types[ti].type_class,
+					(unsigned int) ft_types[ti].max_child,
+					cds_ft_item_order(node),
+					(unsigned int) metadata->incoming_byte,
+					(unsigned long) metadata->state,
+					ft_nr_keys_get(metadata));
+			}
 			return -1;
 		}
 		/*
