@@ -129,7 +129,6 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 				qp_root & ((1U << qp_hi) - 1U));
 		qp_p = (qp_slot1 << 3) | qp_lo;
 
-#ifndef FEATURE_FT_INSERT_IN_PLACE
 		/* Recompact-on-insert: a new bitmap occupancy must not be set in
 		 * place on a LIVE node.  Report -ERANGE so the wrapper routes
 		 * through ft_node_recompact(ADD_SAME), exactly as a non-tail
@@ -138,10 +137,9 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 		 * means the target is an unpublished build node (recompact
 		 * child-copy / cluster-leaf) -- build-invisible, so keep the
 		 * in-place store.  See FEATURE_FT_INSERT_IN_PLACE. */
-		if (!defer_parent &&
+		if (!ft_in_place_ok(ft) && !defer_parent &&
 		    !((qp_root >> qp_hi & 1U) && ((qp_bms >> qp_p) & 1ULL)))
 			return -ERANGE;
-#endif
 		if (qp_root >> qp_hi & 1U) {
 			/* hi already present */
 			if ((qp_bms >> qp_p) & 1ULL) {
@@ -197,7 +195,6 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 					if (_replace_old_ptr)
 						*_replace_old_ptr = true;
 				} else {
-#ifndef FEATURE_FT_INSERT_IN_PLACE
 					/*
 					 * Recompact-on-insert (default): refilling a
 					 * soft-deleted hole (bit sticky-set, slot NULL)
@@ -208,9 +205,8 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 					 * @defer_parent = build-invisible node: keep in
 					 * place (also avoids recompact-within-recompact).
 					 */
-					if (!defer_parent)
+					if (!ft_in_place_ok(ft) && !defer_parent)
 						return -ERANGE;
-#endif
 					if (_replace_old_ptr)
 						*_replace_old_ptr = false;
 					ft_node_count_add(metadata, defer_parent,
@@ -304,16 +300,14 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 				qp_root & ((1ULL << qp_hi) - 1ULL));
 		qp_p = (qp_slot1 << 2) | qp_lo;
 
-#ifndef FEATURE_FT_INSERT_IN_PLACE
 		/* Recompact-on-insert (see FEATURE_FT_INSERT_IN_PLACE): a new
 		 * bitmap occupancy on a live node (!defer_parent) routes to
 		 * ADD_SAME via -ERANGE; a replace at an occupied slot, and a
 		 * build-into-unpublished-node insert (defer_parent), stay in
 		 * place. */
-		if (!defer_parent &&
+		if (!ft_in_place_ok(ft) && !defer_parent &&
 		    !(((qp_root >> qp_hi) & 1ULL) && ((qp_bms >> qp_p) & 1ULL)))
 			return -ERANGE;
-#endif
 		if ((qp_root >> qp_hi) & 1ULL) {
 			/* hi already present */
 			if ((qp_bms >> qp_p) & 1ULL) {
@@ -369,7 +363,6 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 					if (_replace_old_ptr)
 						*_replace_old_ptr = true;
 				} else {
-#ifndef FEATURE_FT_INSERT_IN_PLACE
 					/*
 					 * Recompact-on-insert (default): refilling a
 					 * soft-deleted hole (bit sticky-set, slot NULL)
@@ -380,9 +373,8 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 					 * @defer_parent = build-invisible node: keep in
 					 * place (also avoids recompact-within-recompact).
 					 */
-					if (!defer_parent)
+					if (!ft_in_place_ok(ft) && !defer_parent)
 						return -ERANGE;
-#endif
 					if (_replace_old_ptr)
 						*_replace_old_ptr = false;
 					ft_node_count_add(metadata, defer_parent,
@@ -473,13 +465,12 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 		qp_slot1 = (unsigned int) __builtin_popcount(
 				qp_root & ((1U << qp_hi) - 1U));
 
-#ifndef FEATURE_FT_INSERT_IN_PLACE
 		/* Recompact-on-insert (see FEATURE_FT_INSERT_IN_PLACE): a new
 		 * bitmap occupancy on a live node (!defer_parent) routes to
 		 * ADD_SAME via -ERANGE; a replace at an occupied slot, and a
 		 * build-into-unpublished-node insert (defer_parent), stay in
 		 * place. */
-		if (!defer_parent) {
+		if (!ft_in_place_ok(ft) && !defer_parent) {
 			bool qp_present = false;
 
 			if ((qp_root >> qp_hi) & 1U) {
@@ -490,7 +481,6 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 			if (!qp_present)
 				return -ERANGE;
 		}
-#endif
 
 		if ((qp_root >> qp_hi) & 1U) {
 			qp_sub = *ft_popcount_2l_sub_bm_addr(node,
@@ -558,7 +548,6 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 					if (_replace_old_ptr)
 						*_replace_old_ptr = true;
 				} else {
-#ifndef FEATURE_FT_INSERT_IN_PLACE
 					/*
 					 * Recompact-on-insert (default): refilling a
 					 * soft-deleted hole (bit sticky-set, slot NULL)
@@ -569,9 +558,8 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 					 * @defer_parent = build-invisible node: keep in
 					 * place (also avoids recompact-within-recompact).
 					 */
-					if (!defer_parent)
+					if (!ft_in_place_ok(ft) && !defer_parent)
 						return -ERANGE;
-#endif
 					if (_replace_old_ptr)
 						*_replace_old_ptr = false;
 					ft_node_count_add(metadata, defer_parent,
@@ -662,15 +650,13 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 		unsigned int ptr_idx = 0;
 		unsigned int k;
 
-#ifndef FEATURE_FT_INSERT_IN_PLACE
 		/* Recompact-on-insert (see FEATURE_FT_INSERT_IN_PLACE): a new
 		 * bitmap occupancy on a live node (!defer_parent) routes to
 		 * ADD_SAME via -ERANGE; a replace at an occupied slot, and a
 		 * build-into-unpublished-node insert (defer_parent), stay in
 		 * place. */
-		if (!defer_parent && !(word & bit))
+		if (!ft_in_place_ok(ft) && !defer_parent && !(word & bit))
 			return -ERANGE;
-#endif
 		if (word & bit) {
 			/* Case 1: in-place pointer replace. */
 			for (k = 0; k < word_idx; k++)
@@ -696,7 +682,6 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 				if (_replace_old_ptr)
 					*_replace_old_ptr = true;
 			} else {
-#ifndef FEATURE_FT_INSERT_IN_PLACE
 				/*
 				 * Recompact-on-insert (default): refilling a
 				 * soft-deleted hole (bit sticky-set, slot NULL) bumps
@@ -706,9 +691,8 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 				 * n).  @defer_parent = build-invisible node: keep in
 				 * place (also avoids recompact-within-recompact).
 				 */
-				if (!defer_parent)
+				if (!ft_in_place_ok(ft) && !defer_parent)
 					return -ERANGE;
-#endif
 				if (_replace_old_ptr)
 					*_replace_old_ptr = false;
 				ft_node_count_add(metadata, defer_parent,
@@ -785,7 +769,6 @@ int ft_pigeon_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 	if (!defer_parent)
 		ft_set_parent_raw(ft, child_node_flag, node_flag);
 	ptr = &((struct cds_ft_inode_flag **) node->data)[n];
-#ifndef FEATURE_FT_INSERT_IN_PLACE
 	/*
 	 * Recompact-on-insert (see FEATURE_FT_INSERT_IN_PLACE): retire the
 	 * in-place occupancy-bitmap set on a LIVE pigeon by reporting -ERANGE
@@ -808,9 +791,8 @@ int ft_pigeon_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 	 * too many changes here (it also needs the verify cross-check and the
 	 * delete bit-clear relaxed for the sticky semantics).
 	 */
-	if (!defer_parent && !*ptr)
+	if (!ft_in_place_ok(ft) && !defer_parent && !*ptr)
 		return -ERANGE;
-#endif
 	if (*ptr)
 		replace_old_ptr = true;
 	rcu_assign_pointer(*ptr, child_node_flag);
@@ -894,7 +876,6 @@ int ft_popcount_node_replace_ptr(struct cds_ft *ft, const struct cds_ft_type *ty
 	assert(ft_popcount_node_get_nr_child(type, node) <= type->max_child);
 
 	if (!newptr) {
-#ifndef FEATURE_FT_INSERT_IN_PLACE
 		/*
 		 * Recompact-on-remove (default, concurrent-safe): EVERY delete
 		 * rebuilds the node fresh (FT_RECOMPACT_DEL, dropping child n)
@@ -909,13 +890,9 @@ int ft_popcount_node_replace_ptr(struct cds_ft *ft, const struct cds_ft_type *ty
 		 * reader mid-mutation) the in-place fast path is retained; there
 		 * we only recompact once the node would shrink below min_child.
 		 */
-		return -EFBIG;
-#else
-		if (ft_meta_nr_child_load(metadata) <= type->min_child) {
-			/* We need to try recompacting the node */
+		if (!ft_in_place_ok(ft) ||
+		    ft_meta_nr_child_load(metadata) <= type->min_child)
 			return -EFBIG;
-		}
-#endif
 	}
 	dbg_printf("popcount replace ptr: node %p\n", node);
 	assert(*node_flag_ptr != NULL);
@@ -981,7 +958,6 @@ int ft_pigeon_node_replace_ptr(struct cds_ft *ft, const struct cds_ft_type *type
 	assert(ft_type_is_pigeon(type->type_class));
 
 	if (!newptr) {
-#ifndef FEATURE_FT_INSERT_IN_PLACE
 		/*
 		 * Recompact-on-remove (default, concurrent-safe): rebuild the
 		 * node fresh rather than soft-deleting the slot and decrementing
@@ -989,12 +965,9 @@ int ft_pigeon_node_replace_ptr(struct cds_ft *ft, const struct cds_ft_type *type
 		 * the nr_child change torn against the pointer/bitmap state.  See
 		 * the popcount variant for the full rationale.
 		 */
-		return -EFBIG;
-#else
-		/* We should try recompacting the node */
-		if (ft_meta_nr_child_load(metadata) <= type->min_child)
+		if (!ft_in_place_ok(ft) ||
+		    ft_meta_nr_child_load(metadata) <= type->min_child)
 			return -EFBIG;
-#endif
 	}
 	dbg_printf("ft_pigeon_node_replace_ptr: replace ptr: %p by %p\n", *node_flag_ptr, newptr);
 	assert(*node_flag_ptr != NULL);
@@ -1768,9 +1741,8 @@ int ft_node_recompact(enum ft_recompact mode,
 		 */
 		assert(mode == FT_RECOMPACT_DEL ||
 			mode == FT_RECOMPACT_RELOCATE
-#ifndef FEATURE_FT_INSERT_IN_PLACE
-			|| mode == FT_RECOMPACT_ADD_SAME
-#endif
+			|| (!ft_in_place_ok(ft) &&
+			    mode == FT_RECOMPACT_ADD_SAME)
 			);
 		for (i = 0; i < FT_ENTRY_PER_NODE; i++) {
 			struct cds_ft_inode_flag *iter;

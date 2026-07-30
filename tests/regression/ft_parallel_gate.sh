@@ -72,24 +72,20 @@ ALL_CONFIGS=(
 	"vam|-DFEATURE_FT_VERIFY_AT_MUTATION|u"
 	"noskip|-DNO_FEATURE_FT_SKIP_COMPRESSED|u ioff"
 	"nocompress|-DNO_FEATURE_FT_COMPRESS|u ioff"
-	# ft_unit ONLY, and that is the CONTRACT, not a coverage gap.
-	# FEATURE_FT_INSERT_IN_PLACE is the pre-MW fast path: a new-occupancy
-	# set_nth mutates {child ptr, occupancy bitmap word, nr_child} on a LIVE
-	# node as three disjoint stores, which is exactly what recompact-on-insert
-	# (the default since the MW campaign) exists to avoid.  doc/design/
-	# mcas-multiwriter-readiness.md §4.1 keeps it opt-in and says re-enabling
-	# it "for a single-writer / exclusive trie is a future runtime perf knob"
-	# -- the gate on the writer strategy is §5.2 and is not built yet, so the
-	# flag is single-writer by contract and nothing enforces it.
+	# Concurrent legs are SAFE here since the in-place tier became runtime
+	# gated on ft->exclusive: on a shared trie every one of these builds
+	# takes the recompact path, so this config now checks that the opt-in
+	# flag changes nothing a concurrent trie can observe.  Before that gate
+	# it failed 303 of 480 saturated runs of inv_sibling_split_compress
+	# ("ft_attach_node: Assertion `slot_ptr'"), because the flag alone
+	# decided and an in-place store on a LIVE node races a peer's rebuild.
 	#
-	# Adding a concurrent leg here does not test the flag, it violates it:
-	# measured 303 failures in 480 saturated runs of
-	# inv_sibling_split_compress, all "ft_attach_node: Assertion `slot_ptr'"
-	# -- the insert reserves a byte in the live attach node and a peer's
-	# rebuild drops the reserved (bit set, NULL child) hole before the
-	# reserving writer re-reads its slot.  Do not "fix" that assert; either
-	# build the §5.2 runtime gate or leave this leg single-threaded.
-	"in-place|-DFEATURE_FT_INSERT_IN_PLACE|u"
+	# What these legs do NOT cover is the in-place path itself: with the
+	# gate, ft_unit takes it 2255 times against 204M refusals, because most
+	# tries in the suite are not exclusive.  Exercising the fast path
+	# meaningfully needs exclusive-trie mutation coverage, which is its own
+	# piece of work.
+	"in-place|-DFEATURE_FT_INSERT_IN_PLACE|u ion ioff"
 	# The byte-key-only build (~25 KiB less .text): compiles out the
 	# non-identity key-map lookup specializations, after which
 	# cds_ft_group_attr_set_key_map returns NOT_SUPPORTED.  It had no gate

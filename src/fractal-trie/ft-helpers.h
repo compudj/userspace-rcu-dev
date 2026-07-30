@@ -61,6 +61,38 @@ void static_array_size_check(void)
  * ft-mutation-helpers.h (doc/design/mcas-multiwriter-readiness.md §4
  * refinement-1 site 2).
  */
+/*
+ * May a mutation write a LIVE node's {child pointer, occupancy bitmap,
+ * nr_child} in place, instead of routing through a whole-node recompact?
+ *
+ * Only on an EXCLUSIVE trie.  Those three words are separate stores, so a
+ * concurrent READER can sample them torn, and a concurrent WRITER can rebuild
+ * the node from its occupied slots while the mutation is mid-flight -- which
+ * drops a reserved (bit set, NULL child) hole from under the writer that
+ * reserved it.  cds_ft_attr_set_exclusive declares BOTH away ("single-writer,
+ * no concurrent readers"), which is what makes the in-place tier sound rather
+ * than merely faster: doc/design/mcas-multiwriter-readiness.md §5.2, "an
+ * exclusive trie keeps the in-place store".
+ *
+ * The build flag is the OPT-IN, this is the SAFETY CONDITION.  Without
+ * FEATURE_FT_INSERT_IN_PLACE the answer is always no and every caller behaves
+ * exactly as before; with it, a shared trie still recompacts and only an
+ * exclusive one takes the O(1) path.  The flag alone used to decide, so an
+ * opt-in build applied it to shared tries too -- where it asserts
+ * (ft_attach_node's slot_ptr, 303 failures in 480 saturated runs) or, worse,
+ * tears a publish quietly.
+ */
+static inline
+bool ft_in_place_ok(const struct cds_ft *ft)
+{
+#ifdef FEATURE_FT_INSERT_IN_PLACE
+	return ft && ft->exclusive;
+#else
+	(void) ft;
+	return false;
+#endif
+}
+
 static inline
 struct cds_ft_node *ft_node_next(const struct cds_ft_node *node)
 {
