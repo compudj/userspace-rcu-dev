@@ -599,8 +599,17 @@ unsigned int urcu_txn_esc_bloom(const struct urcu_txn *txn) { return txn->esc_bl
 
 /*
  * Assert this handle's transactions touch DISTINCT slots (no write-after-write,
- * no read-of-own-write).  Age 0 then blind-appends and maintains no RYW filter.
- * Call after init and before the first begin().
+ * no read-of-own-write).  Blind-appends at every age and maintains no RYW
+ * filter.  Call after init and before the first begin().
+ *
+ * It is a PROMISE, not a request, and it is not checked in release builds.
+ * Break it and the two halves fail differently: a write-after-write buffers two
+ * records for one slot, which the engine's duplicate-slot debug check catches
+ * (-DURCU_TXN_DEBUG_DISJOINT), while a read-of-own-write silently returns the
+ * COMMITTED value -- the load path skips the write-set consult entirely, so
+ * there is nothing to detect and no debug build reports it.  A composed edit
+ * that reads a slot an earlier edit of the same bracket wrote is therefore the
+ * dangerous shape here, not the duplicate store.
  */
 static inline
 void urcu_txn_declare_disjoint(struct urcu_txn *txn)
@@ -1034,7 +1043,24 @@ coincide_known:
 	{
 		bool recorded;
 
-		if (urcu_txn__eff_retry(txn) == 0) {
+		/*
+		 * Blind append when the records cannot alias: at age 0, or on a
+		 * handle that PROMISED they cannot.  Keying on the age alone sent
+		 * a disjoint handle that retried through urcu_txn__reconcile()
+		 * for every record -- an O(nr) urcu_txn_find() per record, O(nr^2)
+		 * per attempt -- to look for a match its own declaration says can
+		 * never exist, which is exactly the work the declaration buys out.
+		 * With no match to find, reconcile degenerates to this same
+		 * urcu_txn_add() call, argument for argument.
+		 *
+		 * The trade for a BROKEN promise: a retried disjoint handle used
+		 * to reconcile the duplicate away (and poison a disagreeing old);
+		 * now it appends a second record for the slot.  Deliberate --
+		 * failing loudly beats a contract silently repairing itself --
+		 * and the trap below now covers age 1+ for exactly that reason,
+		 * with the engine's commit-time duplicate-slot check behind it.
+		 */
+		if (txn->disjoint || urcu_txn__eff_retry(txn) == 0) {
 #ifdef URCU_TXN_DEBUG_DISJOINT
 			if (txn->disjoint && urcu_txn_find(m, slot) != NULL) {
 				fprintf(stderr, "urcu-txn: disjoint-contract violation: "
