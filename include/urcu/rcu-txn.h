@@ -1071,6 +1071,50 @@ void *urcu_txn__load(struct urcu_txn *txn, void **slot,
 			: urcu_txn_read(slot, tag);
 }
 
+/*
+ * THE FOUR LOAD FLAVORS.  Two independent axes:
+ *
+ *   waiting vs optimistic -- does the load help an undecided parker settle
+ *     before reading, or take the slot as it stands?  This is THE READ POLICY
+ *     above: wait iff the slot enters this transaction's read/write set,
+ *     read optimistically ONLY to navigate.
+ *   RYW vs committed -- does the load see this transaction's own pending
+ *     writes, or the committed state underneath them?
+ *
+ * urcu_txn_load()            settled read, sees own writes.  The default, and
+ *                            the only correct one for a slot this txn will
+ *                            store to or guard.
+ * urcu_txn_load_optimistic() navigation only: follow a pointer whose value
+ *                            never enters the read/write set.  Feeding its
+ *                            result to a store or a guard is a read-policy
+ *                            violation (-DURCU_TXN_DEBUG_READ_POLICY traps it).
+ * urcu_txn_load_committed()  READ-ONLY escape from read-your-own-writes: the
+ *                            state underneath this txn's pending writes,
+ *                            settled.  Records nothing.
+ * urcu_txn_load_committed_optimistic()
+ *                            the same escape without the settle -- so the
+ *                            value may be an undecided parker's logical old.
+ *                            Diagnostics and navigation only.
+ *
+ * THE COMMITTED FLAVORS ARE READ-ONLY.  Their result must not be fed back as a
+ * store's or urcu_txn_validate()'s expected old for a slot this transaction has
+ * already written: the chain then sees an expected value that disagrees with
+ * the pending new, poisons the descriptor, and every commit returns ABORT
+ * forever -- a deterministic livelock that presents as eternal contention, and
+ * that the read-policy checker cannot see, because these are waiting loads.
+ * For a slot this txn wrote, the only valid expected old is what
+ * urcu_txn_load() returns.
+ *
+ * AFTER A STICKY -ENOMEM the RYW consult is skipped (txn->desc holds the
+ * marker), so urcu_txn_load() silently degrades to urcu_txn_load_committed():
+ * it returns the committed value and no longer sees this transaction's pending
+ * writes.  A committing caller is safe -- commit reports MEMORY_ERROR and
+ * nothing was published -- but a path that BAILS OUT without committing, and
+ * derives its answer from a load made after an unchecked store (a wrapper
+ * concluding "-EEXIST: the key is already present" from a post-store lookup,
+ * say), computes that answer from a view that no longer includes its own edit.
+ * Check the store's return, or do not derive results from later loads.
+ */
 static inline
 void *urcu_txn_load(struct urcu_txn *txn, void **slot,
 		uintptr_t tag)
@@ -1116,20 +1160,27 @@ void *urcu_txn_load_validate(struct urcu_txn *txn, void **slot,
 	return v;
 }
 
-static inline
-void *urcu_txn_load_validate_optimistic(struct urcu_txn *txn,
-		void **slot, uintptr_t tag)
-{
-	void *v = urcu_txn_load_optimistic(txn, slot, tag);
-
-	(void) urcu_txn__record(txn, slot, v, v, 0, tag,
-			URCU_TXN_KIND_MW);
-	return v;
-}
+/*
+ * There is deliberately no urcu_txn_load_validate_optimistic().  A guard is a
+ * read-set entry by definition, so the optimistic form violates the read policy
+ * BY CONSTRUCTION: its expected value can be an undecided parker's logical old,
+ * and the moment that parker commits, this transaction's install is doomed --
+ * abort storms under contention, invisible to functional tests.  It serves no
+ * use case the waiting form does not: with no parker present the two cost the
+ * same, and with a parker present the optimistic one is the doomed one.
+ * (test_rcu_txn_read_policy.c builds the checker's negative control out of
+ * urcu_txn_load_optimistic() + urcu_txn_validate() instead.)
+ */
 
 /*
  * Record a pure MW guard {@expected -> @expected} on @slot: the commit succeeds
  * only if @slot still holds @expected at the install point.
+ *
+ * @expected must be what THIS transaction would read from @slot -- for a slot
+ * it has already written, the pending new value, i.e. what urcu_txn_load()
+ * returns.  A guard computed from urcu_txn_load_committed() on a written slot
+ * disagrees with the pending new, poisons the descriptor and turns every commit
+ * into a permanent ABORT.
  */
 static inline
 void urcu_txn_validate(struct urcu_txn *txn, void **slot,

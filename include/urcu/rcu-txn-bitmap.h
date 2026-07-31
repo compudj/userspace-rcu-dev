@@ -125,9 +125,11 @@ uintptr_t urcu_txn_bitmap_word_rcu(const uintptr_t *words, size_t w)
 	 * such load emits a full old == new MCAS record -- it PLANTS a proxy in the
 	 * word, so a concurrent writer's plant CAS off that word conflicts, and the
 	 * whole read set linearizes on the transaction's single status-word CAS.
-	 * That is a genuine atomic multi-word snapshot, not a re-check.  (Note
-	 * urcu_txn_load_validate_optimistic() records identically: "optimistic"
-	 * governs only whether the initial read waits, never the read set.)
+	 * That is a genuine atomic multi-word snapshot, not a re-check.  It must
+	 * be the WAITING load: a guard's expected value read without helping can
+	 * be an undecided parker's logical old, which dooms the install the moment
+	 * that parker commits -- which is why there is no
+	 * urcu_txn_load_validate_optimistic() to reach for here.
 	 */
 	return (uintptr_t) urcu_txn_read_optimistic(
 			(void **) &((uintptr_t *) words)[w], URCU_TXN_TAG);
