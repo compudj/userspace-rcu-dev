@@ -307,6 +307,18 @@ enum urcu_txn_sw_state {
 	URCU_TXN_SW_PREPARE = 0,
 	URCU_TXN_SW_INSTALLED,	/* internal: set once proxies are parked */
 	URCU_TXN_SW_OOM,		/* sticky: commit -> MEMORY_ERROR */
+	/*
+	 * Terminal: commit() consumed the handle.  It exists so that reusing a
+	 * consumed handle is a NAMED abort rather than a wild store.  Without
+	 * it, a handle that committed a SINGLE edge kept state == PREPARE with
+	 * nr == 1, cap == 8 and latches == NULL, so a second record() passed
+	 * every guard and wrote through &t->latches[1] off a NULL base -- a raw
+	 * SIGSEGV near address 0x30 with nothing to say it was a lifecycle bug.
+	 * (The multi-edge case already trapped, via state == INSTALLED.)
+	 * Clearing nr/cap instead would let stale reuse silently WORK, which
+	 * hides the mistake rather than reporting it.
+	 */
+	URCU_TXN_SW_DONE,
 };
 
 struct urcu_txn_sw_latch {
@@ -1164,10 +1176,17 @@ void *urcu_txn_sw_load(struct urcu_txn_sw_txn *t, void **slot,
 	void *v;
 
 	urcu_txn_sw__excl_owner(t, "load()");
+	urcu_posix_assert(t->state == URCU_TXN_SW_PREPARE ||
+			t->state == URCU_TXN_SW_OOM);
 	if (!t->disjoint && (l = urcu_txn_sw__find_ryw(t, slot)) != NULL)
 		return l->proxy.ptr[1];		/* our own pending write */
 	v = uatomic_load(slot, CMM_RELAXED);
-	urcu_assert_debug(((uintptr_t) v & tag) != tag);
+	/*
+	 * @tag && : the predicate reduces to 0 != 0 for a zero tag, which would
+	 * abort a legal tag-0 single-edge embedder (a transaction that never
+	 * parks needs no tag; see urcu_txn_sw_latch_install()).
+	 */
+	urcu_assert_debug(!tag || ((uintptr_t) v & tag) != tag);
 	return v;
 }
 
@@ -1349,8 +1368,10 @@ enum urcu_txn_status urcu_txn_sw_commit_flavor(struct urcu_txn_sw_txn *t,
 	const unsigned int nr = t->nr;
 
 	urcu_txn_sw__excl_owner(t, "commit()");
+	urcu_posix_assert(t->state != URCU_TXN_SW_DONE);	/* re-init to reuse */
 	if (caa_unlikely(t->state == URCU_TXN_SW_OOM)) {
 		urcu_txn_sw__free_records(t);
+		t->state = URCU_TXN_SW_DONE;
 		return URCU_TXN_STATUS_MEMORY_ERROR;
 	}
 	if (t->state == URCU_TXN_SW_PREPARE) {
@@ -1364,11 +1385,13 @@ enum urcu_txn_status urcu_txn_sw_commit_flavor(struct urcu_txn_sw_txn *t,
 			}
 			/* nr == 0: empty txn, nothing published. */
 			urcu_txn_sw__free_records(t);	/* no proxy: free now */
+			t->state = URCU_TXN_SW_DONE;
 			return URCU_TXN_STATUS_OK;
 		}
 		urcu_txn_sw_install(t);	/* lazily allocs block, parks proxies */
 		if (caa_unlikely(t->state == URCU_TXN_SW_OOM)) {
 			urcu_txn_sw__free_records(t);
+			t->state = URCU_TXN_SW_DONE;
 			return URCU_TXN_STATUS_MEMORY_ERROR;
 		}
 	}
@@ -1392,6 +1415,7 @@ enum urcu_txn_status urcu_txn_sw_commit_flavor(struct urcu_txn_sw_txn *t,
 	call_rcu_fn(&blk->rcu_head, urcu_txn_sw_free_rcu);	/* a reader may hold a proxy */
 	t->block = NULL;		/* handle consumed */
 	t->latches = NULL;
+	t->state = URCU_TXN_SW_DONE;
 	return URCU_TXN_STATUS_OK;
 }
 
