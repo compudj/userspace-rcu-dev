@@ -2089,8 +2089,15 @@ skip_copy:
 					 * into @new_node above.  Only the live re-parent
 					 * edge remains to record.
 					 */
+					/*
+					 * The DLM acquire locks {C,P,(GP)}
+					 * only -- C's CHILDREN are never in
+					 * it -- so the §4.B guard must
+					 * VALIDATE, not park.
+					 */
 					ft_reparent_record(ft, retire_txn, iter,
-							new_node_flag, slot);
+							new_node_flag, slot,
+							/*child_marked=*/ false);
 				} else
 					ft_set_parent(ft, iter, new_node_flag,
 							slot);
@@ -2115,8 +2122,15 @@ skip_copy:
 					/* No per-slot freeze: the node-level COPYING
 					 * fence covers every source slot.  See the
 					 * popcount sweep above. */
+					/*
+					 * The DLM acquire locks {C,P,(GP)}
+					 * only -- C's CHILDREN are never in
+					 * it -- so the §4.B guard must
+					 * VALIDATE, not park.
+					 */
 					ft_reparent_record(ft, retire_txn, iter,
-							new_node_flag, slot);
+							new_node_flag, slot,
+							/*child_marked=*/ false);
 				} else
 					ft_set_parent(ft, iter, new_node_flag,
 							slot);
@@ -2474,7 +2488,8 @@ int ft_rekey_cow_stop(struct cds_ft *ft, struct ft_flip_txn *txn,
 				nm++;
 				*nr_marks = nm;
 			}
-			ft_reparent_record(ft, txn, iter, new_flag, slot);
+			ft_reparent_record(ft, txn, iter, new_flag, slot,
+				/*child_marked=*/ true);	/* marked above */
 		}
 	} else {	/* FT_PIGEON */
 		for (i = 0; i < FT_ENTRY_PER_NODE; i++) {
@@ -2498,7 +2513,8 @@ int ft_rekey_cow_stop(struct cds_ft *ft, struct ft_flip_txn *txn,
 				nm++;
 				*nr_marks = nm;
 			}
-			ft_reparent_record(ft, txn, iter, new_flag, slot);
+			ft_reparent_record(ft, txn, iter, new_flag, slot,
+				/*child_marked=*/ true);	/* marked above */
 		}
 	}
 

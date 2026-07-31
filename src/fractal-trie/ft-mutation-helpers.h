@@ -3248,7 +3248,7 @@ int ft_remove_one_commit(struct cds_ft *ft,
 static void ft_reparent_record_meta(struct ft_flip_txn *txn,
 		struct cds_ft_metadata *meta,
 		struct cds_ft_inode_flag *parent_nf,
-		struct cds_ft_inode_flag **slot);
+		struct cds_ft_inode_flag **slot, bool child_marked);
 
 static
 void ft_pub_rec_add_back_edge(struct cds_ft *ft, struct ft_pub_rec *rec,
@@ -3287,7 +3287,8 @@ void ft_pub_rec_add_back_edge(struct cds_ft *ft, struct ft_pub_rec *rec,
 		 * skipped here (the new parent is always compressed), matching
 		 * the "no incoming_byte write" contract above.
 		 */
-		ft_reparent_record_meta(txn, meta, new_parent, slot);
+		ft_reparent_record_meta(txn, meta, new_parent, slot,
+			/*child_marked=*/ false);
 		return;
 	} else if (ft->ordered_list) {
 		field = &ft_ord_cell_ptr(
@@ -4435,6 +4436,16 @@ struct ft_glue_deferred_edge {
 	 * NOT reach a successful commit.  Never set outside structural_sw.
 	 */
 	bool marked;
+	/*
+	 * FOLD: this op HOLDS @child's COPYING -- either ft_glue_acquire_
+	 * reparent_marks took it (@marked) or another of the op's lock sets
+	 * already had it (ft_glue_op_holds: the caller_holder case, where we must
+	 * NOT take or release it but DO hold it).  Distinct from @marked, which is
+	 * release attribution.  This one picks the re-parent's state-edge KIND;
+	 * confusing the two turns the caller-held child's guard MW against a fence
+	 * we own = a guaranteed abort on every attempt.
+	 */
+	bool held_copying;
 };
 
 struct ft_glue_free_item {
@@ -5070,7 +5081,7 @@ static
 void ft_reparent_record_meta(struct ft_flip_txn *txn,
 		struct cds_ft_metadata *meta,
 		struct cds_ft_inode_flag *parent_nf,
-		struct cds_ft_inode_flag **slot)
+		struct cds_ft_inode_flag **slot, bool child_marked)
 {
 	uintptr_t old_state = meta->state;
 	/*
@@ -5135,8 +5146,40 @@ void ft_reparent_record_meta(struct ft_flip_txn *txn,
 	 * comment above describes -- expect the re-homed child CLEAN-LIVE at
 	 * commit, so a child a peer FROZE mid-recompact MISMATCHES and aborts.
 	 */
-	ft_flip_txn_record_tag(txn, (void **) &meta->state,
-		(void *) live_state, (void *) live_state, FT_STATE_PROXY);
+	/*
+	 * EDGE KIND follows who HOLDS @meta's COPYING.  The two disciplines are
+	 * mirror images and neither is optional:
+	 *
+	 *  - HELD (@child_marked -- ft_rekey_cow_stop, ft_glue_acquire_reparent_
+	 *    marks): the op owns the lock, so the SW park is safe, and it MUST
+	 *    stay SW because an MW edge expecting live_state would mismatch the
+	 *    op's OWN mark and abort every commit.  This edge is also what
+	 *    RELEASES the mark (live_state masks COPYING out).
+	 *  - NOT HELD (the recompact reparent sweep, whose DLM acquire takes
+	 *    {C,P,(GP)} and never C's children): under a structural_sw txn
+	 *    record_tag would degrade this guard to an UNVALIDATED plain store on
+	 *    a word the op does not own -- a contradiction, since the edge's whole
+	 *    job is the §4.B validate above, and a park validates nothing.  It
+	 *    would also erase whatever a peer put there: a committed nr_child edge
+	 *    from an insert BELOW the child (lost count) or a fresh COPYING mark
+	 *    (stolen lock), neither of which C's lock nor P's excludes.
+	 *
+	 * Byte-neutral for every non-fold caller: with structural_sw false,
+	 * record_tag IS record_tag_mw.
+	 *
+	 * The alternative -- MARK the sweep's children instead of validating --
+	 * was implemented in full and does NOT live: a contended child fails the
+	 * acquire, and escalation cannot rescue it (an escalated acquirer holds
+	 * its FIFO turn while spinning for a holder funnelled behind that turn).
+	 * Validating aborts the COMMIT instead, which is precisely what the
+	 * escalation lane arbitrates.
+	 */
+	if (child_marked)
+		ft_flip_txn_record_tag(txn, (void **) &meta->state,
+			(void *) live_state, (void *) live_state, FT_STATE_PROXY);
+	else
+		ft_flip_txn_record_tag_mw(txn, (void **) &meta->state,
+			(void *) live_state, (void *) live_state, FT_STATE_PROXY);
 	if (record_pso)
 		ft_flip_txn_record_tag(txn, (void **) &meta->parent_slot_offset,
 			(void *) old_pso, (void *) new_pso, FT_STATE_PROXY);
@@ -5158,7 +5201,7 @@ static
 void ft_reparent_record(struct cds_ft *ft, struct ft_flip_txn *txn,
 		struct cds_ft_inode_flag *child_nf,
 		struct cds_ft_inode_flag *parent_nf,
-		struct cds_ft_inode_flag **slot)
+		struct cds_ft_inode_flag **slot, bool child_marked)
 {
 	if (!child_nf)
 		return;
@@ -5171,7 +5214,7 @@ void ft_reparent_record(struct cds_ft *ft, struct ft_flip_txn *txn,
 
 		ft_reparent_record_meta(txn,
 			cds_ft_item_to_metadata((struct cds_ft_inode *) cn),
-			parent_nf, slot);
+			parent_nf, slot, child_marked);
 		return;
 	}
 	if (ft_node_compressed(child_nf)) {
@@ -5180,7 +5223,7 @@ void ft_reparent_record(struct cds_ft *ft, struct ft_flip_txn *txn,
 
 		ft_reparent_record_meta(txn,
 			cds_ft_item_to_metadata((struct cds_ft_inode *) cn),
-			parent_nf, slot);
+			parent_nf, slot, child_marked);
 		return;
 	}
 #endif
@@ -5204,7 +5247,7 @@ void ft_reparent_record(struct cds_ft *ft, struct ft_flip_txn *txn,
 		return;
 	}
 	ft_reparent_record_meta(txn,
-		cds_ft_item_to_metadata(ft_node_ptr(child_nf)), parent_nf, slot);
+		cds_ft_item_to_metadata(ft_node_ptr(child_nf)), parent_nf, slot, child_marked);
 }
 
 static
@@ -5243,6 +5286,7 @@ void ft_glue_defer_edge_origin(struct cds_ft *ft, struct ft_glue *g,
 	 * or not the fold ever acquired.
 	 */
 	g->deferred[g->nr_deferred].marked = false;
+	g->deferred[g->nr_deferred].held_copying = false;
 	g->nr_deferred++;
 }
 
@@ -5507,8 +5551,15 @@ int ft_glue_acquire_reparent_marks(struct cds_ft *ft, struct ft_glue *g)
 		bool dup = false;
 
 		g->deferred[i].marked = false;
-		if (!cm || ft_glue_op_holds(g, cm))
+		g->deferred[i].held_copying = false;
+		if (!cm)
 			continue;
+		if (ft_glue_op_holds(g, cm)) {
+			/* Held via another lock set: do not re-mark, do not
+			 * release -- but DO record that we hold it. */
+			g->deferred[i].held_copying = true;
+			continue;
+		}
 		/*
 		 * Two deferred entries can resolve to ONE metadata (a skip flag
 		 * and the plain flag of the same compressed node), and the
@@ -5521,8 +5572,11 @@ int ft_glue_acquire_reparent_marks(struct cds_ft *ft, struct ft_glue *g)
 					ft_glue_reparent_park_meta(ft,
 						g->deferred[j].child) == cm)
 				dup = true;
-		if (dup)
+		if (dup) {
+			/* Same word, marked via the earlier entry: we hold it. */
+			g->deferred[i].held_copying = true;
 			continue;
+		}
 #ifdef FEATURE_FT_FAULT_INJECT
 		/*
 		 * Test-only: miss this acquire exactly as a peer holding the child
@@ -5545,6 +5599,7 @@ int ft_glue_acquire_reparent_marks(struct cds_ft *ft, struct ft_glue *g)
 		if (ft_meta_copying_mark(cm, &snap))
 			return -EAGAIN;
 		g->deferred[i].marked = true;
+		g->deferred[i].held_copying = true;
 	}
 	return 0;
 }
@@ -5989,7 +6044,8 @@ void ft_glue_apply_deferred(struct cds_ft *ft, struct ft_glue *g)
 			}
 #endif
 			ft_reparent_record(ft, g->txn, g->deferred[i].child,
-				g->deferred[i].parent, g->deferred[i].slot);
+				g->deferred[i].parent, g->deferred[i].slot,
+				g->deferred[i].held_copying);
 			continue;
 		}
 		ft_set_parent(ft, g->deferred[i].child, g->deferred[i].parent,
@@ -6106,7 +6162,8 @@ enum urcu_txn_status ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue 
 		 */
 		if (g->txn->structural_sw) {
 			ft_reparent_record(ft, g->txn, g->deferred[i].child,
-				g->deferred[i].parent, g->deferred[i].slot);
+				g->deferred[i].parent, g->deferred[i].slot,
+				g->deferred[i].held_copying);
 			continue;
 		}
 		ft_glue_record_back_edge(ft, g->txn, g->deferred[i].child,
