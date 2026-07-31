@@ -964,7 +964,23 @@ bool urcu_txn_desc_commit(struct urcu_txn_desc *t,
 	if (failed) {
 		/* Abort: restore the parked MW prefix to old, then reclaim. */
 		urcu_txn_settle(t, planted, URCU_TXN_DESC_FAILED);
-		call_rcu_fn(&t->rcu_head, urcu_txn_free_rcu);
+		if (planted == 0) {
+			/*
+			 * Nothing was ever planted, so no slot has ever named
+			 * this descriptor and no reader can be resolving through
+			 * it -- the same "no proxy, no grace period" argument the
+			 * poisoned / nr == 0 / nr == 1 paths above make.  Worth
+			 * distinguishing because this IS the common abort: the
+			 * age-0 flat install failing its FIRST CAS.  Deferring
+			 * those adds a descriptor to the call_rcu queue per
+			 * abort and stretches slab reuse distance -- which is
+			 * already rate x grace-period latency -- on exactly the
+			 * abort-storm path where allocation churn hurts most.
+			 */
+			urcu_txn_destroy(t);
+		} else {
+			call_rcu_fn(&t->rcu_head, urcu_txn_free_rcu);
+		}
 		return false;
 	}
 	/* Every MW record installed; the status is still UNDECIDED. */
