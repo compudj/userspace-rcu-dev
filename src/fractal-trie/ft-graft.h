@@ -2300,6 +2300,24 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
 	return status;
 }
 
+#ifdef FEATURE_FT_PROBE_GRAFT_SWAP
+extern unsigned long cds_ft_probe_gs_commit_ok;
+extern unsigned long cds_ft_probe_gs_reoccupy;
+extern unsigned long cds_ft_probe_gs_slot_moved;
+extern unsigned long cds_ft_probe_gs_retry;
+extern unsigned long cds_ft_probe_gs_exact;
+extern unsigned long cds_ft_probe_gs_kshort;
+extern unsigned long cds_ft_probe_gs_delegate;
+extern unsigned long cds_ft_probe_gs_fused;
+extern unsigned long cds_ft_probe_gs_ext_child;
+extern unsigned long cds_ft_probe_gs_torn;
+extern unsigned long cds_ft_probe_gs_alias;
+extern unsigned long cds_ft_probe_gs_canon_alias;
+#define FT_GS_PROBE_INC(c)	__atomic_fetch_add(&(c), 1, __ATOMIC_RELAXED)
+#else
+#define FT_GS_PROBE_INC(c)	do { } while (0)
+#endif
+
 /*
  * Outcome of ft_graft_swap_descend's read-only descent toward the swap key.
  */
@@ -2308,6 +2326,63 @@ enum ft_graft_swap_case {
 	FT_GRAFT_SWAP_KEY_SHORTER,	/* key ends strictly inside compressed d->nf */
 	FT_GRAFT_SWAP_DELEGATE,		/* diverge / dead-end: no content at key */
 };
+
+/*
+ * Settle the graft point's PAIR -- the RAW slot value the commit quotes as its
+ * expected-old (@raw_ret) and the RESOLVED occupant the extract side re-roots
+ * into @swap_ft (@d->nf) -- from ONE load of the slot.
+ *
+ * ★ THEY USED TO COME FROM TWO.  ft_descent_step sets @d->nf from
+ * ft_node_get_nth_reanchor_slot's load; the descent then did a bare
+ * `*raw_ret = *d->nfp`, a SECOND, independent load of that same slot.  A peer
+ * graft_swap landing between the two makes the pair name DIFFERENT objects:
+ * the commit ratifies displacing the peer's freshly installed node (load #2)
+ * while the extract side re-roots the one the peer just took (load #1).  Both
+ * tries then own that subtree, and one round later the aliased node is what
+ * this op publishes AND what it quotes as expected-old -- a no-op replace that
+ * reports OK, after which the extract side NULLs the parent of a node still
+ * wired into dst at the graft point.  That is
+ * inv_graft_swap_shared_dst_nolist's "depth 1 ... parent mismatch: got (nil)".
+ * Counted, not argued (FEATURE_FT_PROBE_GRAFT_SWAP): the two loads disagreed
+ * up to 396 times per run, and the aliasing -> no-op-replace -> re-rooted-in-
+ * place chain fired in 13 of 13 red runs and 0 of 179 green ones.  A tear is
+ * NECESSARY but not sufficient -- green runs tear too; it corrupts only when
+ * the aliased node comes back round to the graft point.
+ *
+ * Re-derive through the SAME primitive ft_node_get_nth_reanchor_slot uses
+ * (resolve flip proxy, then reanchor) so the comparison is exact rather than a
+ * skip-encoding artifact.  That it IS exact rests on @d->nf always holding the
+ * REANCHORED form at both exits: every producer (ft_descent_init's root,
+ * ft_descent_step, ft_descent_traverse_compressed) yields a value that is
+ * "never skip-encoded", which is also why the descent loop's defensive
+ * ft_resolve_skip_compressed(@d->nf) is a no-op and does NOT leave the
+ * KEY_SHORTER exit comparing a one-hop resolve against a reanchor.  A future
+ * producer that skips the reanchor would turn this guard into a permanent
+ * mismatch -- i.e. an unbounded re-descend -- so keep that invariant.
+ * On disagreement -- or on a reanchor level-move --
+ * raise @d->skip_conflict, the existing "a mutating caller must re-descend"
+ * flag (ft-mutation-helpers.h), and leave @raw_ret NULL so a caller that
+ * somehow skipped the check still gets an expected-old that cannot match a
+ * populated slot, i.e. an aborted commit rather than a corrupted trie.
+ *
+ * Returns true when the pair is coherent.
+ */
+static
+bool ft_graft_swap_settle(struct cds_ft *ft, struct ft_descent *d,
+		struct cds_ft_inode_flag **raw_ret)
+{
+	struct cds_ft_inode_flag *raw = *d->nfp;	/* THE one load */
+	unsigned int rewind = 0;
+
+	if (caa_unlikely(ft_reanchor_flag(ft, ft_resolve_flip_proxy(raw),
+			&rewind) != d->nf || rewind != 0)) {
+		FT_GS_PROBE_INC(cds_ft_probe_gs_torn);
+		d->skip_conflict = true;
+		return false;
+	}
+	*raw_ret = raw;
+	return true;
+}
 
 /*
  * Read-only descent to the graft point for cds_ft_graft_swap.  Unlike
@@ -2340,6 +2415,18 @@ enum ft_graft_swap_case {
  * the raw slot, so for a SKIP_X occupant the two differ -- and an expected-old
  * that can never match turns the KEY_SHORTER legacy publish, whose commit
  * status is dropped, into a silent no-op that still frees the replaced node.
+ *
+ * ★ AND IT MUST BE THE SAME LOAD THAT PRODUCED @d->nf.  Reading the slot a
+ * second time here is what the ft_graft_swap_settle exit closes: the pair is
+ * settled from ONE load, and a disagreement raises @d->skip_conflict for the
+ * caller to re-descend (@raw_ret then stays NULL).
+ *
+ * A CALLER MUST TEST @d->skip_conflict before trusting @d or @raw_ret.
+ * cds_ft_graft_swap does (retry_swap).  Of ft_merge_descend's three callers
+ * only the dst descent does (fractal-trie.c:1016); the src descent
+ * (ft-merge.h:2794) and the merge-point re-descend (:2883) still ignore it,
+ * as they did before this exit existed -- the flag simply raises slightly
+ * more often now.  Those two are unaudited, not known-safe.
  */
 static
 enum ft_graft_swap_case ft_graft_swap_descend(struct cds_ft *ft,
@@ -2367,8 +2454,12 @@ enum ft_graft_swap_case ft_graft_swap_descend(struct cds_ft *ft,
 				ft_descent_traverse_compressed(ft, d, cn, &ik);
 				continue;
 			}
-			/* j == cmp == remaining < cn->len: key ends inside cn. */
-			*raw_ret = *d->nfp;
+			/*
+			 * j == cmp == remaining < cn->len: key ends inside cn.
+			 * @cn came from the earlier load, so settle the pair (and
+			 * with it this classification) against ONE load of the slot.
+			 */
+			(void) ft_graft_swap_settle(ft, d, raw_ret);
 			return FT_GRAFT_SWAP_KEY_SHORTER;
 		}
 		if (!ft_descent_step(ft, d, *(ik++)))
@@ -2376,7 +2467,7 @@ enum ft_graft_swap_case ft_graft_swap_descend(struct cds_ft *ft,
 	}
 	if (!d->nf)
 		return FT_GRAFT_SWAP_DELEGATE;	/* empty slot at key */
-	*raw_ret = *d->nfp;
+	(void) ft_graft_swap_settle(ft, d, raw_ret);
 	return FT_GRAFT_SWAP_EXACT;
 }
 
@@ -2609,6 +2700,10 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		bool gs_reserved = false;
 		bool empty_pruned = false;
 		bool gs_rlock = false;
+#ifdef FEATURE_FT_PROBE_GRAFT_SWAP
+		/* What this attempt published into the graft-point slot. */
+		struct cds_ft_inode_flag *gs_top = NULL;
+#endif
 
 		/*
 		 * Read-only descent: nothing is published, so the whole swap can be
@@ -2666,6 +2761,30 @@ retry_swap:
 		gs_d_first = gs_d_last = gs_s_first = gs_s_last = NULL;
 		kase = ft_graft_swap_descend(dst_ft, key, key_len, &d,
 				&gs_pub_old);
+#ifdef FEATURE_FT_PROBE_GRAFT_SWAP
+		gs_top = NULL;
+		if (kase == FT_GRAFT_SWAP_EXACT)
+			FT_GS_PROBE_INC(cds_ft_probe_gs_exact);
+		else if (kase == FT_GRAFT_SWAP_KEY_SHORTER)
+			FT_GS_PROBE_INC(cds_ft_probe_gs_kshort);
+		else
+			FT_GS_PROBE_INC(cds_ft_probe_gs_delegate);
+#endif
+		/*
+		 * The descent could not settle a coherent (raw slot, resolved
+		 * occupant) pair -- a peer moved the graft point under it, or a
+		 * chain-merge reanchored the captured slot to another level
+		 * (ft_graft_swap_settle / ft_descent_step both raise this).  A
+		 * pure read-only descent has published and allocated NOTHING at
+		 * this point, so re-plan against the settled tree: the same bail
+		 * cds_ft_graft takes (retry_attach, :1599) and insert takes
+		 * (ft-insert.h skip_conflict), which cds_ft_graft_swap had never
+		 * honoured.
+		 */
+		if (caa_unlikely(d.skip_conflict)) {
+			FT_GS_PROBE_INC(cds_ft_probe_gs_retry);
+			goto retry_swap;
+		}
 		if (kase == FT_GRAFT_SWAP_DELEGATE) {
 			/*
 			 * No content at @key: the swap reduces to inserting swap_ft's
@@ -2686,6 +2805,10 @@ retry_swap:
 		}
 
 		old_swap_root = swap_ft->root;
+#ifdef FEATURE_FT_PROBE_GRAFT_SWAP
+		if (old_swap_root && old_swap_root == gs_pub_old)
+			FT_GS_PROBE_INC(cds_ft_probe_gs_alias);
+#endif
 		swap_rmeta = ft_root_metadata(swap_ft);
 		swap_empty = (ft_meta_nr_child(swap_rmeta) == 0 && !swap_rmeta->external_nodes);
 		swap_count = swap_empty ? 0 : ft_nr_keys_get(swap_rmeta);
@@ -2714,6 +2837,8 @@ retry_swap:
 			 */
 			old_child_external = ft_node_external(old_child) &&
 				!ft_node_skip_compressed(old_child);
+			if (old_child_external)
+				FT_GS_PROBE_INC(cds_ft_probe_gs_ext_child);
 		}
 
 		ft_glue_init(&glue_insert);
@@ -2841,6 +2966,10 @@ retry_swap:
 				ft_glue_defer_free(&glue_insert, pcn, true);
 				d.pnf = merged_flag;	/* structural edits target @merged */
 				have_insert = true;
+#ifdef FEATURE_FT_PROBE_GRAFT_SWAP
+				gs_top = merged_skip;
+				FT_GS_PROBE_INC(cds_ft_probe_gs_fused);
+#endif
 			}
 		}
 #endif /* FEATURE_FT_SKIP_COMPRESSED */
@@ -2878,6 +3007,11 @@ retry_swap:
 			ft_glue_set_publish_old(dst_ft, &glue_insert, d.pnf, d.nfp,
 				top_A, gs_pub_old);
 			have_insert = true;
+#ifdef FEATURE_FT_PROBE_GRAFT_SWAP
+			gs_top = top_A;
+			if (top_A == gs_pub_old)
+				FT_GS_PROBE_INC(cds_ft_probe_gs_canon_alias);
+#endif
 		}
 
 		/*
@@ -3166,8 +3300,45 @@ retry_swap:
 					cds_ft_alloc_reserve_drain(dst_ft, &gs_reserve);
 					gs_reserved = false;
 				}
+				FT_GS_PROBE_INC(cds_ft_probe_gs_retry);
 				goto retry_swap;
 			}
+
+#ifdef FEATURE_FT_PROBE_GRAFT_SWAP
+			/*
+			 * B4 residual probe.  Our commit reported OK, so the graft
+			 * point must no longer hold @gs_pub_old -- the occupant the
+			 * extract side below is about to re-root into @swap_ft (and
+			 * whose parent back-pointer it NULLs).  Re-descend and check.
+			 * Still inside the §11 read section, so nothing read here can
+			 * have been reclaimed out from under the comparison.
+			 */
+			{
+				struct ft_descent d2;
+				struct cds_ft_inode_flag *raw2 = NULL;
+				enum ft_graft_swap_case k2;
+
+				FT_GS_PROBE_INC(cds_ft_probe_gs_commit_ok);
+				k2 = ft_graft_swap_descend(dst_ft, key, key_len,
+					&d2, &raw2);
+				if (raw2 && raw2 == gs_pub_old) {
+					FT_GS_PROBE_INC(cds_ft_probe_gs_reoccupy);
+					fprintf(stderr, "GSPROBE reoccupy: kase=%d k2=%d "
+						"pub_old=%p published=%p old_child=%p "
+						"nfp=%p->%p nfp2=%p->%p pnf=%p pnf2=%p\n",
+						(int) kase, (int) k2,
+						(void *) gs_pub_old, (void *) gs_top,
+						(void *) old_child,
+						(void *) d.nfp,
+						(void *) (d.nfp ? *d.nfp : NULL),
+						(void *) d2.nfp,
+						(void *) (d2.nfp ? *d2.nfp : NULL),
+						(void *) d.pnf, (void *) d2.pnf);
+				} else if (d2.nfp != d.nfp) {
+					FT_GS_PROBE_INC(cds_ft_probe_gs_slot_moved);
+				}
+			}
+#endif
 
 			/*
 			 * Retire swap's root to an empty node AND (paired) unlink run_S from
@@ -3284,6 +3455,7 @@ retry_swap:
 					cds_ft_alloc_reserve_drain(dst_ft, &gs_reserve);
 					gs_reserved = false;
 				}
+				FT_GS_PROBE_INC(cds_ft_probe_gs_retry);
 				goto retry_swap;
 			}
 			if (dret != 0) {

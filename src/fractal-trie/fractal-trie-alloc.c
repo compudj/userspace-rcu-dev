@@ -1266,6 +1266,58 @@ static void cds_ft_probe_empty_report(void)
 }
 #endif
 
+#ifdef FEATURE_FT_PROBE_GRAFT_SWAP
+/*
+ * B4 residual probe (ft-graft.h, cds_ft_graft_swap).  The oracle
+ * inv_graft_swap_shared_dst_nolist dies with "depth 1: internal node N parent
+ * mismatch: got (nil)" -- i.e. the extract side re-rooted into @swap_ft a node
+ * that is STILL wired into dst at the graft point.  Rather than argue about
+ * which compare is missing, COUNT the class: after this op's OWN insert commit
+ * reported OK, re-descend to @key and ask whether the occupant this attempt
+ * planned to displace is still there.  @reoccupy > 0 is the corruption, caught
+ * one statement before it is committed.
+ */
+unsigned long cds_ft_probe_gs_commit_ok;
+unsigned long cds_ft_probe_gs_reoccupy;
+unsigned long cds_ft_probe_gs_slot_moved;
+unsigned long cds_ft_probe_gs_retry;
+unsigned long cds_ft_probe_gs_exact;
+unsigned long cds_ft_probe_gs_kshort;
+unsigned long cds_ft_probe_gs_delegate;
+unsigned long cds_ft_probe_gs_fused;
+unsigned long cds_ft_probe_gs_ext_child;
+/*
+ * @torn: the descent's TWO loads of the graft-point slot disagreed.
+ * ft_descent_step sets d->nf from ft_node_get_nth_reanchor_slot (load #1);
+ * ft_graft_swap_descend then does *raw_ret = *d->nfp (load #2).  The
+ * expected-old comes from #2, the extracted occupant (d->nf) from #1, so a
+ * peer swapping the graft point between them makes the op RATIFY displacing
+ * one node while RE-ROOTING another.
+ * @alias: swap_ft's root already IS the dst occupant on entry (the downstream
+ * double-ownership state).  @canon_alias: what we are about to publish equals
+ * what we quoted as expected-old -- the no-op replace.
+ */
+unsigned long cds_ft_probe_gs_torn;
+unsigned long cds_ft_probe_gs_alias;
+unsigned long cds_ft_probe_gs_canon_alias;
+
+__attribute__((destructor))
+static void cds_ft_probe_gs_report(void)
+{
+	fprintf(stderr, "GSPROBE commit_ok=%lu reoccupy=%lu slot_moved=%lu "
+		"retry=%lu | torn=%lu alias=%lu canon_alias=%lu "
+		"| shapes exact=%lu kshort=%lu delegate=%lu "
+		"fused=%lu ext_child=%lu\n",
+		cds_ft_probe_gs_commit_ok, cds_ft_probe_gs_reoccupy,
+		cds_ft_probe_gs_slot_moved, cds_ft_probe_gs_retry,
+		cds_ft_probe_gs_torn, cds_ft_probe_gs_alias,
+		cds_ft_probe_gs_canon_alias,
+		cds_ft_probe_gs_exact, cds_ft_probe_gs_kshort,
+		cds_ft_probe_gs_delegate, cds_ft_probe_gs_fused,
+		cds_ft_probe_gs_ext_child);
+}
+#endif
+
 #ifdef FEATURE_FT_FAULT_INJECT
 
 /*
