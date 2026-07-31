@@ -1051,7 +1051,9 @@ bool urcu_txn_desc_commit(struct urcu_txn_desc *t,
  * branch-lean path for a transaction the embedder knows carries no MW records.
  * Returns true when published; false only when the descriptor was poisoned by a
  * torn same-slot read-set (never a contention abort -- SW parks cannot fail).
- * Use urcu_txn_desc_commit() when MW records may be present.
+ * Use urcu_txn_desc_commit() when MW records may be present; if one is present
+ * anyway this delegates there rather than plain-storing over a concurrent CAS,
+ * so the no-contention-abort property holds exactly while the precondition does.
  */
 static inline
 bool urcu_txn_desc_commit_sw(struct urcu_txn_desc *t,
@@ -1068,6 +1070,17 @@ bool urcu_txn_desc_commit_sw(struct urcu_txn_desc *t,
 	const unsigned int nr = t->nr;
 
 	urcu_assert_debug(t->nr_mw == 0);	/* caller promised store_sw-only */
+	/*
+	 * Release-mode fail-safe for that promise, the same MW-DOMINATES rule
+	 * urcu_txn_record_chain() applies to a kind conflict.  A stray MW record
+	 * here would be parked with a PLAIN STORE racing a concurrent CAS on the
+	 * same slot -- silent corruption -- and the descriptor already carries
+	 * the tally, so the check is one load from a line we are reading anyway
+	 * plus a branch that never mispredicts on a genuinely SW-only commit.
+	 * Degrading to the general path is strictly better than being wrong.
+	 */
+	if (caa_unlikely(t->nr_mw != 0))
+		return urcu_txn_desc_commit(t, call_rcu_fn);
 	if (caa_unlikely(t->poisoned)) {
 		urcu_txn_destroy(t);
 		return false;
