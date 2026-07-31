@@ -731,6 +731,22 @@ int urcu_txn_abort_was_poison(const struct urcu_txn *txn)
 }
 
 /*
+ * Has a store on this handle already failed to allocate?
+ *
+ * The marker is sticky until the terminal outcome, and a wrapper that DERIVES A
+ * VERDICT from an in-bracket load must consult it BEFORE doing so: past a
+ * sticky OOM the RYW consult is skipped, so loads return committed values and
+ * a composed prepare can fabricate an -ENOENT / -EEXIST out of a view that
+ * never existed -- burying the memory error under a status the caller acts on.
+ * Report -ENOMEM instead; it is terminal and nothing was published.
+ */
+static inline
+int urcu_txn_oom(const struct urcu_txn *txn)
+{
+	return txn->desc == URCU_TXN_ENOMEM;
+}
+
+/*
  * Has this ATTEMPT read a slot it had already written, without the write set
  * being consulted?  In other words: is anything computed from a load in this
  * attempt derived from a STALE VIEW of the transaction's own state?

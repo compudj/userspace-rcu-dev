@@ -67,9 +67,22 @@
  *      delete of that successor all CAS THAT SAME slot with the same expected
  *      old value, so the MCAS commits at most one; the losers fail their
  *      old-value check, abort, re-search and proceed.  Unlike the hlist there is
- *      no backward "pprev" edge, so an insert touches only pred[L]->next[L] (no
- *      successor-side load-validate): every race at a level funnels through that
- *      one shared slot.
+ *      no backward "pprev" edge, so an insert's STRUCTURAL write at a level is
+ *      only pred[L]->next[L]: every race at that level funnels through one
+ *      shared slot, and that funnel is what makes the level correct.
+ *
+ *      Both prepares nonetheless fold in a load-validate of the SUCCESSOR's
+ *      next[L] and bail -EAGAIN on a mark.  That is fail-fast, not the
+ *      correctness argument: pred[L]->next[L] == succ already proves the
+ *      spliced-to successor live at the install point, so the guard can never
+ *      be the only check that fails.  What it costs is a real conflict
+ *      widening -- level-L chain P -> S -> T, and insert(a) with P < a < S now
+ *      guards {S->next[L]} while insert(b) with S < b < T writes it, so two
+ *      inserts that commute abort each other.  On dense ordered workloads that
+ *      is an abort-rate tax; weigh it before copying the pattern.  (Demoting
+ *      the guards to a non-recording waiting load would recover it, but that
+ *      needs its own adversarial pass: the 2026-07-11 review recorded them as
+ *      part of the ordering fix.)
  *
  *  (2) The node used AS A PREDECESSOR was deleted -- the mark's one and only job.
  *      An insert whose pred[L] is @N, racing del(@N), would CAS @N->next[L]
@@ -87,9 +100,11 @@
  * ---------------------------------
  *   insert(new, key)  -- new->toplevel levels, each: pred[L]->next[L]: succ -> new
  *                        (and new->next[L] = succ, built invisibly).  1 visible
- *                        edge per level.
+ *                        edge per level, plus the successor guard above: 2
+ *                        RECORDS per level, both counting against reserve().
  *   del(key)          -- node's toplevel+1 levels, each: MARK node->next[L], and
- *                        pred[L]->next[L]: node -> node->next[L].  2 edges/level.
+ *                        pred[L]->next[L]: node -> node->next[L].  2 edges plus
+ *                        the successor guard: 3 records per level.
  *   move              -- del(key) in list A composed with insert(new, key) in
  *                        list B in ONE txn (see the _prepare forms).  The
  *                        commit is a single state transition, so no COMMITTED
@@ -210,6 +225,18 @@ extern "C" {
 #ifndef URCU_TXN_SKIPLIST_MARK
 #define URCU_TXN_SKIPLIST_MARK		2UL
 #endif
+
+/*
+ * A MARK-ed live "next" must never read as a proxy: were MARK to contain every
+ * bit of TAG, (n | MARK) & TAG == TAG for any n, and a mutator's load would
+ * fabricate a record pointer out of a live node address and dereference ->desc
+ * from node-interior garbage.  The hlist twin asserts this; so does this one.
+ */
+urcu_static_assert((URCU_TXN_SKIPLIST_MARK & URCU_TXN_SKIPLIST_TAG) !=
+			URCU_TXN_SKIPLIST_TAG,
+		"URCU_TXN_SKIPLIST_MARK must not contain every bit of "
+		"URCU_TXN_SKIPLIST_TAG: a marked next would resolve as a proxy",
+		urcu_txn_skiplist_mark_aliases_tag);
 
 struct urcu_txn_skiplist_node {
 	unsigned int toplevel;			/* highest level index; next[0..toplevel] */
@@ -463,8 +490,22 @@ struct urcu_txn_skiplist_node *urcu_txn_skiplist_lookup_rcu(
  * urcu_txn_skiplist_insert_prepare: record inserting @newp (whose tower height
  * newp->toplevel and trailing next[] the caller has already sized/initialized)
  * under @key into @sl, WITHOUT committing.  Composable form.  Returns 0,
- * -EEXIST if @key is already present, or -EAGAIN if a predecessor is
- * mid-deletion (retry).  OOM is sticky to the commit.
+ * -EEXIST if @key is already present, -EAGAIN if a predecessor is mid-deletion
+ * or the attempt read its own writes blind (retry), or -ENOMEM.
+ *
+ * WHAT A NEGATIVE RETURN DOES NOT DO: roll back.  Records this call already
+ * buffered -- and the load_validate guards it folded in -- stay in the write
+ * set, because a prepare records level by level and the failure is found part
+ * way down the tower.  The ATTEMPT IS DEAD: on -EAGAIN call urcu_txn_conflict()
+ * then urcu_txn_end() and re-run the WHOLE bracket; on -ENOMEM propagate (it is
+ * terminal, and nothing was published).  Never commit an attempt in which any
+ * prepare failed -- a partial tower published on its own is a torn structure.
+ *
+ * A STICKY OOM IS REPORTED HERE, not deferred to the commit.  Once a store has
+ * failed to allocate, later in-bracket loads silently lose read-your-own-writes
+ * and return committed values, so a composed prepare after that point can
+ * fabricate an -ENOENT or -EEXIST out of a view that never existed -- burying
+ * the memory error under a verdict the caller acts on.
  */
 static inline
 int urcu_txn_skiplist_insert_prepare(struct urcu_txn *txn,
@@ -484,6 +525,13 @@ int urcu_txn_skiplist_insert_prepare(struct urcu_txn *txn,
 	 * there.  Debug builds only.
 	 */
 	urcu_assert_debug(top < URCU_TXN_SKIPLIST_MAX_LEVELS);
+	/*
+	 * Report a sticky OOM before searching: past it the loads lose
+	 * read-your-own-writes, so a composed prepare would answer from a view
+	 * that never existed and bury the memory error under -EEXIST/-ENOENT.
+	 */
+	if (caa_unlikely(urcu_txn_oom(txn)))
+		return -ENOMEM;
 	cand = urcu_txn_skiplist_search(txn, sl, key, update, ssucc);
 	if (cand != NULL && sl->cmp(cand, key) == 0) {
 		/*
@@ -554,8 +602,21 @@ int urcu_txn_skiplist_insert_prepare(struct urcu_txn *txn,
  * WITHOUT committing.  On a committed OK, THIS call removed it and *removed is
  * set to the node (reclaim it after a grace period).  Composable form.  Returns
  * 0 (recorded; *removed set), -ENOENT if @key is not present or already being
- * deleted (*removed = NULL; do NOT reclaim), or -EAGAIN (retry).  OOM is sticky
- * to the commit.
+ * deleted (*removed = NULL; do NOT reclaim), -EAGAIN (retry), or -ENOMEM.
+ *
+ * WHAT A NEGATIVE RETURN DOES NOT DO: roll back.  Records this call already
+ * buffered -- and the load_validate guards it folded in -- stay in the write
+ * set, because a prepare records level by level and the failure is found part
+ * way down the tower.  The ATTEMPT IS DEAD: on -EAGAIN call urcu_txn_conflict()
+ * then urcu_txn_end() and re-run the WHOLE bracket; on -ENOMEM propagate (it is
+ * terminal, and nothing was published).  Never commit an attempt in which any
+ * prepare failed -- a partial tower published on its own is a torn structure.
+ *
+ * A STICKY OOM IS REPORTED HERE, not deferred to the commit.  Once a store has
+ * failed to allocate, later in-bracket loads silently lose read-your-own-writes
+ * and return committed values, so a composed prepare after that point can
+ * fabricate an -ENOENT or -EEXIST out of a view that never existed -- burying
+ * the memory error under a verdict the caller acts on.
  */
 static inline
 int urcu_txn_skiplist_del_prepare(struct urcu_txn *txn,
@@ -567,6 +628,9 @@ int urcu_txn_skiplist_del_prepare(struct urcu_txn *txn,
 	unsigned int level, top;
 
 	*removed = NULL;
+	/* see insert_prepare: never derive a verdict from a post-OOM view */
+	if (caa_unlikely(urcu_txn_oom(txn)))
+		return -ENOMEM;
 	/*
 	 * Delete's successor is the victim's OWN forward pointer (node->next[L],
 	 * loaded below), not search's per-level successor (which for the victim is
@@ -580,6 +644,8 @@ int urcu_txn_skiplist_del_prepare(struct urcu_txn *txn,
 		return -ENOENT;			/* not present */
 	}
 	top = node->toplevel;
+	/* as in insert_prepare: an over-tall tower indexes update[] past its end */
+	urcu_assert_debug(top < URCU_TXN_SKIPLIST_MAX_LEVELS);
 	/*
 	 * Each level the node occupies: MARK node->next[L] (logical delete + the
 	 * shared-slot conflict that catches an insert using @node as pred[L]), and
@@ -675,7 +741,12 @@ int urcu_txn_skiplist_add_rcu(struct urcu_txn_skiplist *sl,
 		if (ret != URCU_TXN_STATUS_ABORT)
 			break;
 	}
-	return ret < 0 ? -ENOMEM : 0;
+	/*
+	 * Map the status explicitly.  The negative region is documented as
+	 * extensible (<urcu/rcu-txn-status.h>), so "ret < 0 -> -ENOMEM" would
+	 * report a future second negative code as out of memory.
+	 */
+	return ret == URCU_TXN_STATUS_MEMORY_ERROR ? -ENOMEM : 0;
 }
 
 /*
@@ -714,7 +785,7 @@ int urcu_txn_skiplist_del_rcu(struct urcu_txn_skiplist *sl, void *key,
 		if (ret != URCU_TXN_STATUS_ABORT)
 			break;
 	}
-	if (ret < 0)
+	if (ret == URCU_TXN_STATUS_MEMORY_ERROR)	/* not "any negative" */
 		return -ENOMEM;
 	if (removed != NULL)
 		*removed = node;
