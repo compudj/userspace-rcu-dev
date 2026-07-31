@@ -41,6 +41,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#include <urcu/assert.h>
 #include <urcu/compiler.h>
 #include <urcu/uatomic.h>
 #include <urcu-qsbr.h>
@@ -65,7 +66,7 @@
 #define NR_KEEPERS		(NR_WRITERS * KEEPERS_PER_WRITER)
 #define NR_NODES		(NR_WRITERS + NR_KEEPERS)	/* anchors + keepers */
 
-#define NR_TESTS		5
+#define NR_TESTS		7
 
 struct leaf {
 	struct urcu_txn_list_node hx;	/* hook in list X */
@@ -138,6 +139,18 @@ static int compose_del(struct leaf *lf)
 			urcu_txn_end(&tx);
 			return 0;
 		}
+		/*
+		 * A MIXED outcome (one -ENOENT, the other 0) would commit a
+		 * half-edit: the live hook is changed while the dead one is
+		 * not, and the caller then reclaims a node still reachable from
+		 * the other list.  It cannot happen here -- a leaf enters and
+		 * leaves both lists in ONE commit, so the two hooks always die
+		 * together -- but that is a test-local invariant, not a
+		 * property of the composition.  An embedder composing edits of
+		 * INDEPENDENTLY deletable nodes must abandon the bracket on a
+		 * mixed outcome, not commit it.
+		 */
+		urcu_posix_assert((a == -ENOENT) == (b == -ENOENT));
 		st = urcu_txn_commit(&tx);
 		urcu_txn_end(&tx);
 		if (st != URCU_TXN_STATUS_ABORT)
@@ -168,6 +181,18 @@ static int compose_replace(struct leaf *nw, struct leaf *old)
 			urcu_txn_end(&tx);
 			return 0;
 		}
+		/*
+		 * A MIXED outcome (one -ENOENT, the other 0) would commit a
+		 * half-edit: the live hook is changed while the dead one is
+		 * not, and the caller then reclaims a node still reachable from
+		 * the other list.  It cannot happen here -- a leaf enters and
+		 * leaves both lists in ONE commit, so the two hooks always die
+		 * together -- but that is a test-local invariant, not a
+		 * property of the composition.  An embedder composing edits of
+		 * INDEPENDENTLY deletable nodes must abandon the bracket on a
+		 * mixed outcome, not commit it.
+		 */
+		urcu_posix_assert((a == -ENOENT) == (b == -ENOENT));
 		st = urcu_txn_commit(&tx);
 		urcu_txn_end(&tx);
 		if (st != URCU_TXN_STATUS_ABORT)
@@ -267,6 +292,107 @@ static int list_coherent(struct urcu_txn_list_head *h, int expect)
 	return 1;
 }
 
+/*
+ * SAME-LIST composition, the case the two-list fan-out above cannot reach.
+ *
+ * Every composed pair over X and Y touches structurally disjoint slots, so
+ * read-your-own-writes and same-slot chaining -- the whole reason the header
+ * says "compose on a DEFAULT handle" -- never fire.  These do: adjacent
+ * deletes fuse three same-slot pairs (the second del must see the first's
+ * redirected prev THROUGH RYW, then chain onto its record), and an insert next
+ * to a delete collides on the shared anchor edge.  Both also exercise the
+ * age-0 esc_pending abort and the age-1 chaining round-trip, since the
+ * prepares alias by construction.
+ */
+static void same_list_compose(void)
+{
+	struct urcu_txn_list_head h;
+	static struct urcu_txn_list_node n[4], ins;
+	struct urcu_txn tx;
+	enum urcu_txn_status st;
+	struct urcu_txn_list_node *p;
+	int i, len, ok_adj, ok_mix;
+
+	/* ring: h -> n0 -> n1 -> n2 -> n3 -> h */
+	urcu_txn_list_init(&h);
+	p = &h.node;
+	for (i = 0; i < 4; i++) {
+		urcu_txn_init(&tx, NULL);
+		urcu_txn_begin(&tx);
+		if (urcu_txn_list_insert_after_prepare(&tx, &n[i], p))
+			abort();
+		if (urcu_txn_commit(&tx) != URCU_TXN_STATUS_OK)
+			abort();
+		urcu_txn_end(&tx);
+		p = &n[i];
+	}
+
+	/* ADJACENT DELETES in one commit: n1 and n2, which share edges. */
+	urcu_txn_init(&tx, NULL);
+	for (;;) {
+		int a, b;
+
+		urcu_txn_begin(&tx);
+		a = urcu_txn_list_del_prepare(&tx, &n[1]);
+		b = urcu_txn_list_del_prepare(&tx, &n[2]);
+		if (a == -EAGAIN || b == -EAGAIN) {
+			urcu_txn_conflict(&tx);
+			urcu_txn_end(&tx);
+			continue;
+		}
+		if (a || b)
+			abort();
+		st = urcu_txn_commit(&tx);
+		urcu_txn_end(&tx);
+		if (st != URCU_TXN_STATUS_ABORT)
+			break;
+	}
+	len = 0;
+	ok_adj = (st == URCU_TXN_STATUS_OK);
+	for (p = urcu_txn_list_next_rcu(&h.node); p != &h.node;
+			p = urcu_txn_list_next_rcu(p)) {
+		if (p == &n[1] || p == &n[2])
+			ok_adj = 0;		/* a victim is still linked */
+		if (++len > 8)
+			break;			/* the ring is broken */
+	}
+	/* n0 <-> n3 must now be consecutive in BOTH directions */
+	ok_adj = ok_adj && len == 2 &&
+		urcu_txn_list_next_rcu(&n[0]) == &n[3] &&
+		urcu_txn_list_prev_rcu(&n[3]) == &n[0];
+	ok(ok_adj, "same-list compose: adjacent deletes fuse into one commit and "
+		"leave a coherent ring");
+
+	/* INSERT NEXT TO A DELETE: delete n3 and insert after n0, same commit. */
+	urcu_txn_init(&tx, NULL);
+	for (;;) {
+		int a, b;
+
+		urcu_txn_begin(&tx);
+		a = urcu_txn_list_del_prepare(&tx, &n[3]);
+		b = urcu_txn_list_insert_after_prepare(&tx, &ins, &n[0]);
+		if (a == -EAGAIN || b == -EAGAIN) {
+			urcu_txn_conflict(&tx);
+			urcu_txn_end(&tx);
+			continue;
+		}
+		if (a || b)
+			abort();
+		st = urcu_txn_commit(&tx);
+		urcu_txn_end(&tx);
+		if (st != URCU_TXN_STATUS_ABORT)
+			break;
+	}
+	ok_mix = (st == URCU_TXN_STATUS_OK) &&
+		urcu_txn_list_next_rcu(&h.node) == &n[0] &&
+		urcu_txn_list_next_rcu(&n[0]) == &ins &&
+		urcu_txn_list_next_rcu(&ins) == &h.node &&
+		urcu_txn_list_prev_rcu(&ins) == &n[0] &&
+		urcu_txn_list_prev_rcu(&h.node) == &ins;
+	ok(ok_mix, "same-list compose: an insert adjacent to a delete commits as "
+		"one edit, in both directions");
+}
+
 int main(void)
 {
 	pthread_t wt[NR_WRITERS], rt[NR_READERS];
@@ -276,6 +402,8 @@ int main(void)
 
 	plan_tests(NR_TESTS);
 	rcu_register_thread();
+
+	same_list_compose();
 
 	urcu_txn_list_init(&g_X);
 	urcu_txn_list_init(&g_Y);
