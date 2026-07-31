@@ -50,10 +50,9 @@
 #include "tap.h"
 
 /*
- * DLM is no longer a build mode -- per-node lock-sets are the ONLY multi-writer
- * implementation, selected at RUNTIME by ft->lock_fine.  The _DLM suffix
- * here is now just the historical name for this group of lock-set tests;
- * it does NOT mean a separate build.
+ * Per-node lock-sets are the ONLY multi-writer implementation and are selected
+ * at RUNTIME by ft->lock_fine, so the _DLM suffix names this group of lock-set
+ * tests -- it does NOT select a build.
  */
 #define NR_TESTS_DLM 8		/* cow_stop_root_inplace, rekey_graft_{simple,liston,cross_junction,glue_dst,glue_dst_branch_child}, rekey_merge_{occupied,collide}_dst */
 
@@ -2773,11 +2772,9 @@ out:
 /*
  * REKEY coherence on a LIST-OFF trie.  The point witness is two forward descents
  * and a continuation rides the carried key, so neither needs an ordered-list
- * cell -- which is what the old up-walk key rematerializer needed and why
- * coherence used to be gated on ->ordered_list.  This is the test for that gate
- * being gone: with the MOVE GATE HELD OPEN on a trie that has NO cell list at
- * all, exact lookups must still be right (present found at their node, absent
- * NOT_FOUND) and must not spin.
+ * cell, so coherence is NOT gated on ->ordered_list.  With the MOVE GATE HELD
+ * OPEN on a trie that has NO cell list at all, exact lookups must still be
+ * right (present found at their node, absent NOT_FOUND) and must not spin.
  */
 static int test_rekey_coherence_listoff(void)
 {

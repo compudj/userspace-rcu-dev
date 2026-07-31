@@ -2843,10 +2843,6 @@ enum cds_ft_status cds_ft_group_attr_set_optimize(
  * under every strategy; this selects only how concurrent structural WRITERS
  * coordinate.
  *
- * The optimistic (lock-free MCAS) strategy that used to be the default has been
- * REMOVED: its per-slot CAS granularity was a poor speed-versus-granularity
- * trade against the per-node lock-sets below.
- *
  * CDS_FT_WRITER_LOCK_COARSE: writers serialize under one FT-wide writer lock per
  *   trie (classic RCU single-writer).  This is the single-writer opt-in.
  * CDS_FT_WRITER_LOCK_FINE (the DEFAULT): writers coordinate through

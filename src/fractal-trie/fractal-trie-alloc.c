@@ -1353,9 +1353,9 @@ long cds_ft_fault_rekey_countdown = -1;
  * The reserve is a bulk op's OOM-avoidance pool: graft / merge / graft_swap
  * pre-fill it (while they can still fail cleanly), then ACTIVATE it so every
  * cds_ft_alloc_item into the target trie DRAWS from the pool instead of the
- * fallible arena -- the commit cannot fail mid-way.  It used to be a per-trie
- * field (cds_ft::active_reserve), safe only because the FT-wide writer lock
- * serialized bulk ops on a trie.  The FT-wide-lock drop removes that
+ * fallible arena -- the commit cannot fail mid-way.  It is NOT a per-trie
+ * field: that would be safe only while an FT-wide writer lock serialized bulk
+ * ops on a trie, and the FT-wide-lock drop removes that
  * serialization, so two concurrent grafts into one live dst would both stamp
  * the same field and collide.  A reserve is a stack-local owned by ONE op on
  * ONE thread, so its activation state is naturally THREAD-LOCAL: each writer's

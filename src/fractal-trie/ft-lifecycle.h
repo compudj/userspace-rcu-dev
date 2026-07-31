@@ -516,10 +516,7 @@ enum cds_ft_status _cds_ft_group_create(const struct cds_ft_group_attr *attr,
 		 * concurrency over the single lock.  Worse, the count-parent walk
 		 * assumes WRITER EXCLUSION for a stable, proxy-free ancestor chain
 		 * (ft_flip_txn_record_count_parent) -- an assumption FINE breaks under
-		 * the FT-wide-lock drop.  (This once also named the OPTIMISTIC
-		 * strategy and a `lock_mode == false` field; BOTH are gone -- the
-		 * strategy was removed and no such field exists.)  A rank-stats trie
-		 * is therefore
+		 * the FT-wide-lock drop.  A rank-stats trie is therefore
 		 * the COARSE single-lock target (§10.5): coerce ANY non-coarse
 		 * strategy to COARSE so it keeps the FT-wide lock (writer exclusion).
 		 */
@@ -799,8 +796,7 @@ enum cds_ft_status cds_ft_create(struct cds_ft_group *ft_group,
 	 * speculative trie must never host a move (and needs no coherence).  The
 	 * ordered list is NOT required: the point witness is two forward descents
 	 * and the continuation rides the carried key, neither of which needs a
-	 * cell (the earlier up-walk key rematerializer did, which is what the
-	 * ->ordered_list gate here used to be for).  Set BEFORE
+	 * cell.  Set BEFORE
 	 * ft_install_lookup_ops, which selects the specializations off it.
 	 */
 	ft->rekey_coherence = !ft->speculative_key_offset_active;

@@ -7,10 +7,10 @@
 
 /*
  * ft-txn-hlist: the fractal trie's duplicate chain, expressed as a small set of
- * TRANSACTIONAL link primitives on the RCU MCAS engine.  It began as an
- * FT-PRIVATE adaptation of the generic concurrent <urcu/rcu-txn-hlist.h>, but
- * now that every chain mutation runs under the head-holder's lock (MW LOCK_FINE
- * Step A -- one writer per chain) the multi-writer arbitration is dropped: the
+ * TRANSACTIONAL link primitives on the RCU MCAS engine.  It is an FT-PRIVATE
+ * counterpart to the generic concurrent <urcu/rcu-txn-hlist.h>, WITHOUT that
+ * header's multi-writer arbitration: every chain mutation runs under the
+ * head-holder's lock (MW LOCK_FINE Step A -- one writer per chain), so the
  * neighbour-mid-deletion load-validate and the marked-target -ENOENT/-EAGAIN
  * bails in insert_after/del/replace are dead and gone.  What remains from that
  * header is the forward slot as the sole serializer and the "next"-only mark --

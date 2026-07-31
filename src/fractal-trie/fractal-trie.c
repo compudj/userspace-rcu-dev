@@ -704,9 +704,8 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 * excluded by the DISJOINT-key rule at the top of this function -- an interior
 	 * neighbour would have to be bracketed by two run keys, which puts @dst_key
 	 * inside the run's own contiguous ordinal range and so makes @src_key a prefix
-	 * of it.  (That argument used to be carried by the d_src.ppnf == d_dst.ppnf
-	 * shape gate, via the src_len == dst_len it forced; the gate no longer forces
-	 * it, so the rule is stated where it belongs.)
+	 * of it.  The rule is stated here rather than left implicit in a shape
+	 * gate, because no gate forces src_len == dst_len.
 	 *
 	 * VALIDATE the located pair FIRST, and bail -EAGAIN (transient, re-derive) when
 	 * it does not bracket the dst key range: find_splice_pos derives the pair from a
@@ -1289,10 +1288,10 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		 * REACHABLE: a peer holding BP -- or, in the non-shared-parent shape,
 		 * BP's own parent -- makes the detach's up-front lock-set acquire abort
 		 * -EAGAIN right here, as does a peer that re-homed BP since this
-		 * descent (the @parent_guard read-set validation).  It used to be
-		 * reachable single-threaded too, via a same-junction move (BP == the
-		 * graft's own attach node, hence already LOCK-held); the shape gate
-		 * now rejects that permanently, up front, before any of this is built.
+		 * descent (the @parent_guard read-set validation).  The
+		 * single-threaded route -- a same-junction move (BP == the graft's
+		 * own attach node, hence already LOCK-held) -- is excluded: the shape
+		 * gate rejects it up front, before any of this is built.
 		 */
 		pp_meta = NULL;		/* ft_glue_abort below is the single owner */
 		if (s_top_prime)		/* NULL on the merge path: no COW */
@@ -1405,10 +1404,9 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 */
 	if (prep == FT_GRAFT_PREP_GLUE || merge_dst) {
 		/*
-		 * The status is CHECKED, not discarded.  It used to be `(void)` on the
-		 * reasoning above -- everything that can bail is upstream, so this call
-		 * cannot fail -- but the fold's re-parent mark acquire now runs inside
-		 * it, before it records anything, and CAN miss on a contended child.
+		 * The status is CHECKED, not discarded: the fold's re-parent mark
+		 * acquire runs inside this call, before it records anything, and CAN
+		 * miss on a contended child.
 		 * Discarding that would carry on to the commit below with children this
 		 * op does not hold, SW-parking their state words unexcluded: precisely
 		 * the silent-success shape (ignored commit status, op reports OK) that

@@ -3789,9 +3789,9 @@ insert_replace_done:
 		}
 	}
 	/*
-	 * The one-commit's status is the op's whole outcome, and it used to be
-	 * discarded on BOTH arms above -- so an ABORT (nothing published, the
-	 * fresh cluster rolled back by the txn's on-abort action) returned OK or
+	 * The one-commit's status is the op's whole outcome and MUST be checked on
+	 * both arms above.  Discarding it turns an ABORT (nothing published, the
+	 * fresh cluster rolled back by the txn's on-abort action) into OK or
 	 * DUPLICATE_FOUND with the key absent: a lost insert reported as success,
 	 * @precell leaked, and @node left with a stale ->prev that makes the
 	 * caller's retry fail entry validation with -EINVAL forever.

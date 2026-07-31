@@ -76,8 +76,7 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 	 * the whole build runs under the fence, so a cn->child change during the
 	 * build is caught too.  Gated on a txn'd graft under the drop: the
 	 * txn-less merge-rekey (glue->txn NULL) and the FT-wide-lock builds keep
-	 * the prior behaviour (the OPTIMISTIC build this also listed is gone).
-	 * On the fence-miss path nothing is
+	 * the prior behaviour.  On the fence-miss path nothing is
 	 * built and @cn is NOT marked (a clean re-descend); an OOM AFTER the mark
 	 * leaves @cn marked for the caller (ft_graft_keylen) to clear.
 	 */
@@ -2330,22 +2329,17 @@ enum ft_graft_swap_case {
  * expected-old (@raw_ret) and the RESOLVED occupant the extract side re-roots
  * into @swap_ft (@d->nf) -- from ONE load of the slot.
  *
- * ★ THEY USED TO COME FROM TWO.  ft_descent_step sets @d->nf from
- * ft_node_get_nth_reanchor_slot's load; the descent then did a bare
- * `*raw_ret = *d->nfp`, a SECOND, independent load of that same slot.  A peer
- * graft_swap landing between the two makes the pair name DIFFERENT objects:
- * the commit ratifies displacing the peer's freshly installed node (load #2)
- * while the extract side re-roots the one the peer just took (load #1).  Both
- * tries then own that subtree, and one round later the aliased node is what
- * this op publishes AND what it quotes as expected-old -- a no-op replace that
- * reports OK, after which the extract side NULLs the parent of a node still
- * wired into dst at the graft point.  That is
- * inv_graft_swap_shared_dst_nolist's "depth 1 ... parent mismatch: got (nil)".
- * Counted, not argued (FEATURE_FT_PROBE_GRAFT_SWAP): the two loads disagreed
- * up to 396 times per run, and the aliasing -> no-op-replace -> re-rooted-in-
- * place chain fired in 13 of 13 red runs and 0 of 179 green ones.  A tear is
- * NECESSARY but not sufficient -- green runs tear too; it corrupts only when
- * the aliased node comes back round to the graft point.
+ * ★ ONE LOAD, NOT TWO.  Deriving @d->nf and @raw_ret from separate loads of
+ * the slot lets a peer graft_swap land between them, so the pair names
+ * DIFFERENT objects: the commit ratifies displacing the node the peer just
+ * installed while the extract side re-roots the one the peer just took.  Both
+ * swap tries then own that subtree, and once the aliased node comes back round
+ * to the graft point it is BOTH what this op publishes and what it quotes as
+ * expected-old -- a no-op replace reporting OK, after which the extract side
+ * NULLs the parent of a node still wired into dst.  Note the window is wide:
+ * the two loads are observed to disagree hundreds of times per run of
+ * inv_graft_swap_shared_dst_nolist, so this is a routine interleaving, not a
+ * corner (FEATURE_FT_PROBE_GRAFT_SWAP counts it).
  *
  * Re-derive through the SAME primitive ft_node_get_nth_reanchor_slot uses
  * (resolve flip proxy, then reanchor) so the comparison is exact rather than a
@@ -3239,18 +3233,17 @@ retry_swap:
 				glue_insert.fuse_free_list = true;
 				ft_glue_apply_deferred(dst_ft, &glue_insert);
 				/*
-				 * ★ THIS STATUS USED TO BE DROPPED.  It is the same
-				 * point of no return as the fused arm above, and it
-				 * aborts for the same reason -- a peer took the graft
-				 * point.  Carrying on regardless made the op retire
-				 * @swap_ft's root, re-root the displaced subtree into
-				 * it and FREE the dst node the publish never replaced,
-				 * leaving a live dst grandchild whose parent points
-				 * into the OTHER trie.  Route it into the same unwind:
-				 * the abort is build-invisible on dst (nothing
-				 * published) and on @swap_ft (still holds its content;
-				 * apply_deferred rewrote only its own exclusive
-				 * interior), so a plain re-descend is clean.
+				 * ★ HONOUR THIS STATUS.  This is the same point of no
+				 * return as the fused arm above, and it aborts for the
+				 * same reason -- a peer took the graft point.  Ignoring
+				 * it would retire @swap_ft's root, re-root the
+				 * displaced subtree into it and FREE the dst node the
+				 * publish never replaced, leaving a live dst grandchild
+				 * whose parent points into the OTHER trie.  Route it
+				 * into the same unwind: the abort is build-invisible on
+				 * dst (nothing published) and on @swap_ft (still holds
+				 * its content; apply_deferred rewrote only its own
+				 * exclusive interior), so a plain re-descend is clean.
 				 */
 				ins_cst = ft_glue_publish_replace(dst_ft,
 					glue_publish_txn, &glue_insert,
@@ -3274,13 +3267,14 @@ retry_swap:
 			 * Free this attempt's build-invisible clusters + reserve + txns, then
 			 * re-descend (mirrors ft_graft_keylen's store-abort retry_attach).
 			 *
-			 * ★ THE STATUS USED TO BE DROPPED on every shape but the one fused
-			 * arm -- `(void) ins_cst`.  Two graft_swaps at ONE dst position then
-			 * BOTH returned OK while only one attach landed, and the loser still
-			 * ran its extract side: it re-rooted into @swap_ft a subtree the abort
-			 * had left wired into dst, NULLing that subtree's parent back-pointer
-			 * where it still hung at depth 1 of the destination.  That is
-			 * inv_graft_swap_shared_dst's "parent mismatch: got (nil)".
+			 * ★ EVERY SHAPE MUST HONOUR @ins_cst, not just the fused arm.
+			 * Two graft_swaps at ONE dst position can both reach here with
+			 * only one attach landed; a loser that ignores the status still
+			 * runs its extract side, re-rooting into @swap_ft a subtree the
+			 * abort left wired into dst and NULLing that subtree's parent
+			 * back-pointer where it still hangs at depth 1 of the
+			 * destination -- inv_graft_swap_shared_dst's "parent mismatch:
+			 * got (nil)".
 			 */
 			if (ins_cst != URCU_TXN_STATUS_OK) {
 				ft_glue_abort(dst_ft, &glue_insert);

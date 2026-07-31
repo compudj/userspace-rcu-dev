@@ -481,13 +481,11 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
  * on a frozen state word.  Record the FENCED {LOCK|s -> TOMBSTONE|s} terminal
  * from that snapshot instead of the plain RYW tombstone: a peer that grew the
  * orphan tears the fenced expected-old and ABORTS this commit (§9.2
- * orphan-chain coherence).  (This used to justify itself with "nr_child_inc
- * ignores LOCK".  It does not: ft_meta_nr_child_inc SPINS on
- * FT_STATE_INPLACE_WAIT_MASK, which includes FT_STATE_LOCK unconditionally
- * -- so a peer cannot grow a marked orphan at all, and the coherence this
- * fence buys comes from EXCLUSION, which is stronger than the tear-and-abort
- * the old wording described.  The conclusion held; the mechanism did not.)
- *  @snaps NULL keeps the plain path
+ * orphan-chain coherence).  In practice a peer cannot even get that far:
+ * ft_meta_nr_child_inc SPINS on FT_STATE_INPLACE_WAIT_MASK, which includes
+ * FT_STATE_LOCK unconditionally, so it WAITS for the mark and the coherence
+ * comes from EXCLUSION rather than from detect-and-abort.
+ * @snaps NULL keeps the plain path
  * byte-identical.  Under DLM @txn is always non-NULL (commit_txn is FORCE-TXN and
  * pub is never NULL), so the fenced arm never needs the standalone fallback.
  */
@@ -1589,8 +1587,7 @@ int ft_detach_node(struct cds_ft *ft,
 				 * and aborts our commit (detect) -- and in practice
 				 * cannot even reach that: ft_meta_nr_child_inc spins on
 				 * FT_STATE_INPLACE_WAIT_MASK, which includes LOCK
-				 * unconditionally, so it WAITS for the mark instead of
-				 * ignoring it as this comment used to claim.  One that
+				 * unconditionally, so it WAITS for the mark.  One that
 				 * grew it BEFORE is reflected
 				 * in @osnap and stops the walk (nr_child > 1).  A dirty
 				 * mark (peer proxy / concurrent copier / real retire)

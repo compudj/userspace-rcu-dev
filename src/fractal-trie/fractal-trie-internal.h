@@ -124,8 +124,7 @@
  * so disjoint writers run in parallel instead of serialising on one mutex
  * (doc/design/ft-wide-lock-drop-mechanics.md; certified by the §11.4 point-op
  * 1600/1600 gate and the cross-trie oracles).  COARSE tries are unaffected
- * (COARSE keeps the mutex).  The OPTIMISTIC per-slot-CAS strategy this once
- * also named has been REMOVED -- enum cds_ft_writer_strategy is COARSE|FINE.
+ * (COARSE keeps the mutex).
  *
  * This is now UNCONDITIONAL: the drop was the only shipping behaviour, and its
  * opt-out (-DFEATURE_FT_MW_LOCK_FINE_KEEP) had no gate config, so the retained
@@ -845,9 +844,7 @@ struct ft_pub_rec {
 						>> FT_PSO_SHIFT) & FT_PSO_VALMASK))
 /*
  * FT_STATE_LOCK (bit 19, above parent_slot_offset): the REVERSIBLE per-node
- * WRITER LOCK.  It began as the copy fence (MW campaign, Option A -- doc/design
- * + CORE_682870 fix plan F2) and the MW lock-escalation model (§0) is the
- * observation that the fence already IS a lock: CAS to acquire, held across the
+ * WRITER LOCK (MW lock-escalation model, §0).  CAS to acquire, held across the
  * build/reparent plan window, -EAGAIN on contention, resolved at commit.
  *
  * ACQUIRE: a standalone CAS {clean -> |LOCK}, taken BEFORE the first read of
@@ -876,14 +873,12 @@ struct ft_pub_rec {
  * differ only in who writes it (a bare CAS vs the atomic commit).
  *
  * Unlike the tombstone, LOCK is reversible BY DESIGN and never implies
- * death; it is never set at rest (ft-verify.h reports a leaked fence).
+ * death; it is never set at rest (ft-verify.h reports a leaked lock).
  */
 /*
- * Bit 19, unchanged by the §8.3 offset split.  It used to be derived as
- * (FT_STATE_PSO_SHIFT + FT_STATE_PSO_BITS); now that parent_slot_offset has its
- * own word the derivation is gone, and the bit is pinned LITERALLY rather than
- * re-derived from nr_child -- moving the writer lock to bit 11 would be an
- * invisible, silently-compiling change to the meaning of every state word.
+ * Bit 19, pinned LITERALLY rather than derived from any other field's width:
+ * moving the writer lock -- to bit 11, say -- would otherwise be an invisible,
+ * silently-compiling change to the meaning of every state word.
  * Bits 11-18 stay free (see the free-bits note above).
  */
 #define FT_STATE_LOCK		((uintptr_t) 1 << 19)
@@ -918,13 +913,11 @@ struct ft_pub_rec {
  * node's nr_child through these standalone primitives (instead of a recorded
  * edge) would break this and must not be done.
  *
- * LOCK IS IN THE MASK UNCONDITIONALLY.  This used to say "Non-DLM builds
- * exclude LOCK so the optimistic MW path ... stays byte-identical", one line
- * above a #define that has no #ifdef -- the optimistic MW strategy is gone and
- * DLM is the only multi-writer implementation, so there is no build in which
- * LOCK is merely a copy fence here.  The consequence is load-bearing and is
- * asserted in the wrong direction elsewhere: an in-place nr_child update SPINS
- * while a peer holds LOCK, i.e. it HONORS the lock rather than racing it.
+ * LOCK IS IN THE MASK UNCONDITIONALLY -- per-node lock-sets are the only
+ * multi-writer implementation, so there is no build in which this bit is
+ * merely a copy fence.  The consequence is load-bearing: an in-place nr_child
+ * update SPINS while a peer holds the lock, i.e. it HONORS the lock rather
+ * than racing it.
  */
 #define FT_STATE_INPLACE_WAIT_MASK	(FT_STATE_PROXY | FT_STATE_LOCK)
 
@@ -2518,7 +2511,7 @@ int cds_ft_alloc_reserve_add(struct cds_ft *ft, struct cds_ft_alloc_reserve *r,
  * allocating into several tries (e.g. merge same-trie rekey: dst + the transient
  * detach product) activates the SAME @r on each; the reserve is thread-local, so
  * a concurrent bulk op on the same live dst owns its own reserve and does not
- * collide (the FT-wide-lock drop, §11, removed the mutex this once relied on).
+ * collide -- which is what makes it safe with no FT-wide mutex (§11).
  * A trie may be activated at most once at a time (asserted).
  */
 __attribute__((visibility("hidden")))

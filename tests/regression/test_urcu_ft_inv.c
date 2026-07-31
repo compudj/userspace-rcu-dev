@@ -1177,14 +1177,11 @@ static int inv_concurrent_writers_disjoint(void)
 	struct cds_ft *ft;
 
 	/*
-	 * Opt-in (FT_INV_MW=1): the concurrent-writer oracle.  Phase 4.3 HAS
-	 * landed and the per-node-lock (DLM) writer path is the certified one --
-	 * this used to say "the concurrent-writer path is not yet correct" and
-	 * cite a nr_child-- vs child-index-walk race "until Phase 4.3 lands",
-	 * which now reads as a live defect and is not one.  It stays opt-in
-	 * because it is a saturating soak, not because it is known-broken (the
-	 * one genuinely known-failing oracle, inv_rekey_src_mutated, gates itself
-	 * a SECOND time on FT_INV_RKSM and says so).  Run it explicitly:
+	 * Opt-in (FT_INV_MW=1): the concurrent-writer oracle over the certified
+	 * per-node-lock writer path.  It is opt-in because it is a saturating
+	 * soak, NOT because it is known-broken -- the one known-failing oracle,
+	 * inv_rekey_src_mutated, gates itself a SECOND time on FT_INV_RKSM and
+	 * names the defect in its skip message.  Run it explicitly:
 	 *   FT_INV_MW=1 ./test_urcu_ft_inv inv_concurrent_writers_disjoint
 	 */
 	if (!getenv("FT_INV_MW")) {
@@ -5325,9 +5322,7 @@ static struct cds_ft *create_varlen_fine_lock_cfg_ft(
  * so concurrent cross-trie ops on a live dst were serialized.  The dst now
  * skips that lock too, so concurrent grafts and point-removes into one live dst
  * arbitrate SOLELY through the step-6A per-node attach RELEASE locks + MCAS.
- * (This was once gated on FEATURE_FT_MW_LOCK_FINE_DROP, with a "without the
- * flag this runs under the FT-wide lock" fallback; the flag was removed once
- * the drop became unconditional for FINE, so only the dropped path runs.)
+ * The drop is unconditional for FINE, so that is the only path this exercises.
  *
  * Layout MAXIMISES per-node contention: prefix = {p, w} with p shared across
  * ALL writers and w = writer id, so every writer's graft at {p, w} attaches a
@@ -5898,14 +5893,11 @@ static int mw_gs_oracle(void)
 	}
 	/*
 	 * graft_swap IS drop-safe: cds_ft_graft_swap re-descends on a
-	 * contention-abort (retry_swap -- the FEATURE_FT_MW_LOCK_FINE_DROP this
-	 * named is gone, the drop is unconditional for FINE), for
+	 * contention-abort (retry_swap) for
 	 * BOTH the empty-swap prune (ft_detach_node -EAGAIN, build-invisible) and
 	 * the non-empty exchange (the swap-root retire is FUSED into the
 	 * insert-replace txn, so a relocated-parent abort rolls both sides back --
 	 * mirroring ft_graft_keylen's retry_attach and the src_swap_fused move).
-	 * Runs unconditionally in the plan now (was gated behind FT_INV_MW_GS while
-	 * the assert(dret==0) was still a known defect).
 	 */
 	mw_install_fatal_handler();
 	ft = create_varlen_fine_lock_ft(&group);
@@ -7440,9 +7432,7 @@ static int inv_remove_cross_view_compressed(void)
  * @ws: NULL to inherit the group default (LOCK_FINE), or a strategy to pin.
  * Pinning is used by the graft_swap shape oracles (gs_shared_oracle), which pin
  * CDS_FT_WRITER_LOCK_FINE explicitly so the shape under test is not silently
- * coerced.  (This used to say pinning existed for LIVE-to-LIVE cross-trie ops
- * "which only CDS_FT_WRITER_OPTIMISTIC allows"; that enumerator no longer
- * exists, and the parameter is NOT dead.)
+ * coerced.  The parameter is live -- do not retire it as unused.
  */
 static struct cds_ft *create_varlen_ord_ft_ws(struct cds_ft_group **group_out,
 		const enum cds_ft_writer_strategy *ws)

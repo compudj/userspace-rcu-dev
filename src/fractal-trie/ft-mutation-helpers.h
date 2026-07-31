@@ -236,8 +236,7 @@ extern unsigned long cds_ft_probe_gs_pubok;
 /*
  * FT bridge to the concurrent MCAS transaction engine (<urcu/rcu-txn.h>).  An
  * op records its frozen edge set {slot, old, new} DIRECTLY into the engine
- * transaction (@mtxn -- a `struct urcu_txn *`; the field name predates the
- * rcu-mcas -> rcu-txn rename and is kept only to avoid churn) during its
+ * transaction (@mtxn, a `struct urcu_txn *`) during its
  * build -- through ft_flip_txn_record_reserved /
  * ft_flip_txn_record_tag and the ordered-list *_prepare helpers -- then
  * ft_flip_txn_commit commits @mtxn, so the whole set (structural index AND
@@ -1875,7 +1874,7 @@ uintptr_t ft_flip_txn_record_tombstone(struct ft_flip_txn *t,
  * run versus 2256 with the single fused record, a 278x difference.  Same-slot
  * chaining is CORRECT, but on this path it is never free.
  *
- * ORDERING / RESERVATION.  Recorded where the guard used to be, so it inherits
+ * ORDERING / RESERVATION.  Recorded in the guard's slot, so it inherits
  * the arm's existing guard reservation (net-zero) and stays on the safe side of
  * the release-then-guard rule: a lock release on this word is recorded by the
  * reserve's recompact EARLIER in the same txn, so this edge chains onto it
@@ -2784,9 +2783,9 @@ struct ft_ord_cell *ft_ord_cell_find_rel(struct cds_ft *ft, const uint8_t *key,
 /*
  * Returns 0 with *@pred_ret = the predecessor cell (NULL = the key is the
  * new minimum), or -EAGAIN on an INTERNAL failure (iterator setup / lookup
- * machinery error).  The two used to be conflated in a NULL return: an
- * internal failure then read as "new minimum" and spliced the cell at the
- * list head (the sentinel-splice mis-order class).
+ * machinery error).  The two must NOT be conflated in a NULL return: an
+ * internal failure reading as "new minimum" splices the cell at the list head
+ * (the sentinel-splice mis-order class).
  */
 static
 int ft_ord_cell_find_pred_from_head(struct cds_ft *ft,
@@ -3551,10 +3550,11 @@ void ft_dbg_splice_pos_check(struct cds_ft *dst, const uint8_t *key,
  * @key and @succ = first @dst key > @key (nothing of @dst's lies in the run's
  * range in between).
  *
- * ★ BOTH ENDPOINTS ARE DERIVED BY KEY ORDER.  @succ used to be READ OFF
- * @pred->next, which made the pair adjacent BY CONSTRUCTION and every downstream
- * expected-old CAS vacuous: {pred->next expect succ} cannot fail when @succ was
- * defined as @pred->next.  The window that opens is not the commit's -- it is
+ * ★ BOTH ENDPOINTS ARE DERIVED BY KEY ORDER.  @succ must NOT be read off
+ * @pred->next: that makes the pair adjacent BY CONSTRUCTION and every
+ * downstream expected-old CAS vacuous, since {pred->next expect succ} cannot
+ * fail when @succ is defined as @pred->next.  The window is not the
+ * commit's -- it is
  * between the DESCENT that produced @pred (T0) and the @pred->next read (T1): a
  * peer graft committing a run into that gap is READ BACK as our successor, so we
  * splice ahead of a run that belongs before us and the list goes out of order.
@@ -3726,11 +3726,11 @@ bool ft_ord_cell_find_splice_pos_coherent(struct cds_ft *dst, const uint8_t *key
  * (ft_store_at_graft_point's batch), closing the appear-side cross-view window;
  * ft_ord_cell_run_splice is the standalone (two-commit) wrapper.
  *
- * WHY THE OUTER LINKS ARE RECORDED, not plain-stored.  They used to be two
- * plain stores ("the run is not reachable in @dst yet, and this runs in the op's
- * UN-ABORTABLE failure-free section").  The second half of that premise died
- * with the FT-wide-lock drop: cell edges are ALWAYS MW, so a peer's conflicting
- * boundary splice now aborts this commit, and a plain store does NOT roll back.
+ * WHY THE OUTER LINKS ARE RECORDED, not plain-stored.  Plain stores would rest
+ * on the run being unreachable in @dst AND this section being un-abortable.
+ * The second half does not hold: cell edges are ALWAYS MW, so a peer's
+ * conflicting boundary splice aborts this commit, and a plain store does NOT
+ * roll back.
  * That leaves run_first->prev / run_last->next pointing into @dst's
  * neighbourhood while both neighbourhoods still point at their old targets --
  * the "PERMANENTLY broken back-edge" that broke inv_rekey_graft_shared and made
@@ -4713,12 +4713,8 @@ struct ft_glue {
 	 * its retry_merge label) -- both have a retry loop that handles the
 	 * fence-miss re-descend (FT_GRAFT_PREP_RETRY).
 	 *
-	 * ★ This used to say merge_at "has NO retry loop, so it leaves this false
-	 * ... the mark never fires there and no FT_GRAFT_PREP_RETRY can reach its
-	 * caller".  All three clauses are now false: merge_at grew retry_merge, it
-	 * sets the flag explicitly on every attempt (ft_glue_init resets it), and
-	 * its caller does handle the retry.  Left as prose it would invite exactly
-	 * the wrong repair -- deleting merge_at's PREP_RETRY handling as dead.
+	 * Both callers must keep that retry: merge_at's PREP_RETRY handling is
+	 * NOT dead code, it is what makes the fence safe to enable there.
 	 */
 	bool fence_split_cn;
 	/*
@@ -6752,17 +6748,15 @@ enum urcu_txn_status ft_glue_publish(struct cds_ft *ft, struct ft_flip_txn *txn,
 		ft_flip_txn_record_count_parent(ft, txn, g->publish_parent,
 			g->count_delta);
 	/*
-	 * ★ THIS STATUS USED TO BE DROPPED, on a comment that read "Bulk op, not
-	 * yet MW-hardened: ABORT unreachable under its exclusion".  It is
-	 * reachable.  Two cds_ft_graft_swap KEY_SHORTER swaps at ONE destination
-	 * both take this legacy path, and the loser's flip ABORTS -- measured
-	 * pubabort=1 in exactly the runs that went red, 0 in every green one, on
-	 * inv_graft_swap_shared_dst_deep_nolist.  Dropping it made the caller
-	 * carry on as though it had published: it re-rooted the displaced subtree
-	 * into @swap_ft and freed the dst node its publish never replaced, so a
-	 * live dst grandchild was left naming a parent inside the OTHER trie
-	 * ("depth 3 ... parent mismatch: expected P1, got P2").  The exclusion
-	 * the comment appealed to is the one thing a shared destination removes.
+	 * ★ ABORT IS REACHABLE HERE; RETURN THE STATUS.  Two cds_ft_graft_swap
+	 * KEY_SHORTER swaps at ONE destination both take this legacy path, and
+	 * the loser's flip aborts -- a SHARED destination is exactly what removes
+	 * the exclusion that would otherwise make this un-abortable, and the
+	 * public contract grants one.  A caller that assumes it published will
+	 * re-root the displaced subtree into @swap_ft and free the dst node the
+	 * publish never replaced, leaving a live dst grandchild naming a parent
+	 * inside the OTHER trie ("depth 3 ... parent mismatch: expected P1, got
+	 * P2", inv_graft_swap_shared_dst_deep_nolist).
 	 */
 	{
 		enum urcu_txn_status pst =
