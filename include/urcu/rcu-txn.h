@@ -272,6 +272,17 @@ urcu_static_assert(URCU_TXN_FALLBACK_MIN <= URCU_TXN_FALLBACK_MAX,
 #ifndef URCU_TXN_RCU_READ_UNLOCK
 #define URCU_TXN_RCU_READ_UNLOCK()	rcu_read_unlock()
 #endif
+/*
+ * Used only to bracket the escalation lane's blocking wait.  A no-op in every
+ * flavor but QSBR, where an online thread that is not quiescent holds up every
+ * grace period in the process (see urcu_txn__enter_fallback()).
+ */
+#ifndef URCU_TXN_RCU_THREAD_OFFLINE
+#define URCU_TXN_RCU_THREAD_OFFLINE()	rcu_thread_offline()
+#endif
+#ifndef URCU_TXN_RCU_THREAD_ONLINE
+#define URCU_TXN_RCU_THREAD_ONLINE()	rcu_thread_online()
+#endif
 
 /* Sticky out-of-memory marker parked in txn->desc by a failed store. */
 #define URCU_TXN_ENOMEM	((struct urcu_txn_desc *) -1L)
@@ -792,10 +803,28 @@ int urcu_txn__self_qualifies(const struct urcu_txn *txn)
 	return txn->retry >= urcu_txn__fallback_at(txn);
 }
 
+/*
+ * Take the lane, blocking until this handle's FIFO turn comes up.
+ *
+ * The wait is bracketed OFFLINE.  Called from begin(), before the read-side
+ * section opens, so the thread holds no RCU reference -- and under QSBR a
+ * registered thread that is online but never quiescent holds up every grace
+ * period in the process, so a writer parked behind a long episode would stall
+ * all deferred reclaim (this engine's descriptor frees included) for the whole
+ * wait.  Outside QSBR both calls compile to nothing.
+ */
 static inline
 void urcu_txn__enter_fallback(struct urcu_txn *txn)
 {
+	if (txn->flavor)
+		txn->flavor->thread_offline();
+	else
+		URCU_TXN_RCU_THREAD_OFFLINE();
 	cds_fair_mutex_lock(&txn->domain->lock, &txn->waiter);
+	if (txn->flavor)
+		txn->flavor->thread_online();
+	else
+		URCU_TXN_RCU_THREAD_ONLINE();
 	if (urcu_txn__self_qualifies(txn)) {
 		uatomic_store(&txn->domain->active, 1, CMM_RELAXED);
 		txn->fb_published = 1;
