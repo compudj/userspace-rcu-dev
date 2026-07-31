@@ -244,6 +244,12 @@ AE_FEATURE([compiler-atomic-builtins], [Enable the use of compiler atomic builti
 AE_FEATURE_DEFAULT_ENABLE
 AE_FEATURE([legacy-mb], [Disable legacy memory barriers.])
 
+# Experimental: run the transaction descriptor slab's per-cpu freelists as rseq
+# critical sections instead of atomics (URCU_SLAB_RSEQ, see rcu-txn-slab.h).
+# Disabled by default
+AE_FEATURE_DEFAULT_DISABLE
+AE_FEATURE([slab-rseq], [Experimental: use rseq per-cpu local freelists in the transaction descriptor slab. Requires librseq. The macro must be identical across every TU of a process, so an embedder building against this configuration must define URCU_SLAB_RSEQ too.])
+
 # When given, add -Werror to WARN_CFLAGS and WARN_CXXFLAGS.
 # Disabled by default
 AE_FEATURE_DEFAULT_DISABLE
@@ -279,6 +285,22 @@ AE_IF_FEATURE_ENABLED([compiler-atomic-builtins], [
 
 AE_IF_FEATURE_ENABLED([legacy-mb], [
   AC_DEFINE([CONFIG_RCU_EMIT_LEGACY_MB], [1], [Emit legacy memory barriers that were documented in the APIs.])
+])
+
+# URCU_SLAB_RSEQ goes into CPPFLAGS, NOT into config.h: config.h is included by
+# the library's own translation units only, while this macro changes how any TU
+# touches a shared arena -- a library built with it and an embedder built
+# without it would pop the same freelist with and without the lfstack pop lock.
+# CPPFLAGS at least covers the whole build tree, and the header states the
+# requirement for embedders.
+AE_IF_FEATURE_ENABLED([slab-rseq], [
+  AC_CHECK_HEADER([rseq/rseq.h], [], [
+    AC_MSG_ERROR([--enable-slab-rseq requires the librseq headers (rseq/rseq.h).])
+  ])
+  AC_CHECK_LIB([rseq], [rseq_init], [], [
+    AC_MSG_ERROR([--enable-slab-rseq requires librseq with rseq_init().])
+  ])
+  CPPFLAGS="$CPPFLAGS -DURCU_SLAB_RSEQ"
 ])
 
 ##                                                                          ##
