@@ -1,8 +1,14 @@
 # MW writer model: optimistic per-node locks + FIFO escalation — design note (2026-07-14)
 
-Status: **PROPOSED (2026-07-14).** A significant pivot for the Fractal Trie
-multi-writer (MW) transition, worked out in discussion with Mathieu Desnoyers.
-Not yet implemented. This note captures the model, its progress proof, the
+Status: **IMPLEMENTED (was PROPOSED 2026-07-14; status corrected 2026-07-31).**
+A significant pivot for the Fractal Trie multi-writer (MW) transition, worked
+out in discussion with Mathieu Desnoyers.  The per-node lock (DLM) model
+described here is now the ONLY multi-writer implementation -- it is selected at
+runtime by `ft->lock_fine`, not by a build flag, and the optimistic per-slot-CAS
+strategy it replaced has been removed.  Four sites in the FT sources cite this
+note (ft-insert.h, ft-mutation-node.h, ft-mutation-helpers.h), and the public
+header cites it too, so "not yet implemented" was actively misleading.  This
+note captures the model, its progress proof, the
 load-bearing disciplines, and what it buys vs. costs, so it is the reference we
 implement against. The next design corner *below* this note — per-operation
 lock-set definition — is deliberately left open (see "## Open: per-operation

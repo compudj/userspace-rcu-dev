@@ -793,9 +793,18 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 * over the dst parent + the republish grandparent and records its re-parents /
 	 * release / retire as SW under those locks -- so the graft forward publish and
 	 * recompact edges are correctly SW.  The detach's src-junction (BP) edges are
-	 * UNLOCKED, but ft_ord_cell_record_into forces them MW regardless of
-	 * structural_sw, so no toggle is needed (toggling OFF would wrongly demote the
+	 * UNLOCKED, and no toggle is needed (toggling OFF would wrongly demote the
 	 * recompact's COPYING-expecting edges to MW -> expected-old mismatch -> abort).
+	 *
+	 * ★ NOT because "ft_ord_cell_record_into forces them MW regardless of
+	 * structural_sw", which this said and which is false for exactly these
+	 * edges: ft_ord_cell_record_into dispatches on ft_edge_tag(), and
+	 * ft_edge_tag maps tag 0 -> FT_FLIP_PROXY_TAG, taking the
+	 * ft_flip_txn_record_tag (structural_sw-honouring) branch, NOT
+	 * ft_flip_txn_record_tag_mw.  Only a non-zero (ordered-cell) tag is forced
+	 * MW.  What actually makes the src-junction edges safe here is the
+	 * exclusive-source gate, not the record path -- so do not weaken that gate
+	 * on the strength of the old sentence.
 	 * The mixed commit installs the MW (detach) edges first, then parks the SW
 	 * (graft + cow_stop) edges before the flip.
 	 */

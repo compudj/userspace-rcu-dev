@@ -967,7 +967,8 @@ void ft_flip_txn_record_reserved(struct ft_flip_txn *t, void **slot,
 }
 
 /*
- * MW LOCK_FINE DLM (Step 1, doc/design ft-step1-dlm-acquire.md): the composable
+ * MW LOCK_FINE DLM (Step 1, see
+ * doc/design/mw-writer-lock-escalation-model.md): the composable
  * one-commit lock-set acquire.  An op derives its lock-set + read-set by a
  * read-only plan (following back-edges), records both onto a DEDICATED acquire
  * flip-txn -- NOT the content lane, since acquiring on the content txn
@@ -4704,13 +4705,18 @@ struct ft_glue {
 	struct cds_ft_metadata *caller_holder;
 	uintptr_t split_cn_snap;
 	/*
-	 * Enable the split-retire @cn fence (above) for THIS build.  Set only by
-	 * cds_ft_graft's ft_graft_keylen -- whose retry_attach loop handles the
-	 * fence-miss re-descend (FT_GRAFT_PREP_RETRY).  cds_ft_merge_at also
-	 * builds through ft_split_compressed_graft_build but has NO retry loop,
-	 * so it leaves this false (ft_glue_init default) and keeps its prior
-	 * behaviour -- the mark never fires there and no FT_GRAFT_PREP_RETRY can
-	 * reach its caller, which does not handle it.
+	 * Enable the split-retire @cn fence (above) for THIS build.  Set by
+	 * cds_ft_graft's ft_graft_keylen (retry_attach) AND by cds_ft_merge_at
+	 * (ft-merge.h, `glue.fence_split_cn = true` right after ft_glue_init at
+	 * its retry_merge label) -- both have a retry loop that handles the
+	 * fence-miss re-descend (FT_GRAFT_PREP_RETRY).
+	 *
+	 * ★ This used to say merge_at "has NO retry loop, so it leaves this false
+	 * ... the mark never fires there and no FT_GRAFT_PREP_RETRY can reach its
+	 * caller".  All three clauses are now false: merge_at grew retry_merge, it
+	 * sets the flag explicitly on every attempt (ft_glue_init resets it), and
+	 * its caller does handle the retry.  Left as prose it would invite exactly
+	 * the wrong repair -- deleting merge_at's PREP_RETRY handling as dead.
 	 */
 	bool fence_split_cn;
 	/*

@@ -1222,7 +1222,8 @@ int ft_node_recompact(enum ft_recompact mode,
 	 * they stay unfenced.
 	 */
 	/*
-	 * DLM Step 1 (ft-step1-dlm-acquire.md): acquire the WHOLE lock-set
+	 * DLM Step 1 (see doc/design/mw-writer-lock-escalation-model.md):
+	 * acquire the WHOLE lock-set
 	 * {C, P, (GP)} in ONE all-or-none MCAS up front, replacing the incremental
 	 * marks (C here, P at the inherit, GP at the skip-dual).  §9.3: P is resolved
 	 * from C and validated -- the read-set guard C.parent==P (and P.parent==GP)

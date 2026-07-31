@@ -46,9 +46,16 @@ derives no lock-set — §10.5).
 
 ## 1. The mechanism — one branch
 
-The entire runtime change is a skip in `ft_writer_lock_scope_enter`, gated
-behind `FEATURE_FT_MW_LOCK_FINE_DROP` (default off ⇒ shipping behaviour
-byte-identical, reversible per §11.2):
+The entire runtime change is a skip in `ft_writer_lock_scope_enter`.
+
+> ★ **STATUS (2026-07-31): the flag is GONE.** This section described the skip
+> as "gated behind `FEATURE_FT_MW_LOCK_FINE_DROP` (default off ⇒ shipping
+> behaviour byte-identical, reversible per §11.2)".  `FEATURE_FT_MW_LOCK_FINE_DROP`
+> no longer appears anywhere in `src/` or `include/` (verified by grep): the drop
+> became the default for FINE tries and the flag was then removed, so the skip is
+> unconditional for `ft->lock_fine` and there is no build in which the old
+> behaviour is still reachable.  The code block below is kept as the historical
+> shape of the change, NOT as current source:
 
 ```c
 #ifdef FEATURE_FT_MW_LOCK_FINE_DROP

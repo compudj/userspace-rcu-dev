@@ -480,8 +480,14 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
  * @trailing_snap for the trailing skip-target) so the collapse decision was made
  * on a frozen state word.  Record the FENCED {COPYING|s -> TOMBSTONE|s} terminal
  * from that snapshot instead of the plain RYW tombstone: a peer that grew the
- * orphan (nr_child_inc ignores COPYING) tears the fenced expected-old and ABORTS
- * this commit (§9.2 orphan-chain coherence).  @snaps NULL keeps the plain path
+ * orphan tears the fenced expected-old and ABORTS this commit (§9.2
+ * orphan-chain coherence).  (This used to justify itself with "nr_child_inc
+ * ignores COPYING".  It does not: ft_meta_nr_child_inc SPINS on
+ * FT_STATE_INPLACE_WAIT_MASK, which includes FT_STATE_COPYING unconditionally
+ * -- so a peer cannot grow a marked orphan at all, and the coherence this
+ * fence buys comes from EXCLUSION, which is stronger than the tear-and-abort
+ * the old wording described.  The conclusion held; the mechanism did not.)
+ *  @snaps NULL keeps the plain path
  * byte-identical.  Under DLM @txn is always non-NULL (commit_txn is FORCE-TXN and
  * pub is never NULL), so the fenced arm never needs the standalone fallback.
  */
@@ -1578,10 +1584,14 @@ int ft_detach_node(struct cds_ft *ft,
 				 * reading its nr_child for the collapse decision, so
 				 * the "retire it" verdict is derived from a FROZEN
 				 * word and the fenced tombstone's expected-old (this
-				 * snap) is exactly that state.  nr_child_inc ignores
-				 * COPYING, so a peer that grows the orphan AFTER the
-				 * mark tears the fenced expected-old and aborts our
-				 * commit (detect); one that grew it BEFORE is reflected
+				 * snap) is exactly that state.  A peer that grows the
+				 * orphan AFTER the mark tears the fenced expected-old
+				 * and aborts our commit (detect) -- and in practice
+				 * cannot even reach that: ft_meta_nr_child_inc spins on
+				 * FT_STATE_INPLACE_WAIT_MASK, which includes COPYING
+				 * unconditionally, so it WAITS for the mark instead of
+				 * ignoring it as this comment used to claim.  One that
+				 * grew it BEFORE is reflected
 				 * in @osnap and stops the walk (nr_child > 1).  A dirty
 				 * mark (peer proxy / concurrent copier / real retire)
 				 * bails to the caller's re-descend.

@@ -917,9 +917,13 @@ struct ft_pub_rec {
  * node's nr_child through these standalone primitives (instead of a recorded
  * edge) would break this and must not be done.
  *
- * Non-DLM builds exclude COPYING so the optimistic MW path -- where COPYING is
- * only the recompact copy fence, resolved by the MW expected-old rather than
- * honored as a lock -- stays byte-identical.
+ * COPYING IS IN THE MASK UNCONDITIONALLY.  This used to say "Non-DLM builds
+ * exclude COPYING so the optimistic MW path ... stays byte-identical", one line
+ * above a #define that has no #ifdef -- the optimistic MW strategy is gone and
+ * DLM is the only multi-writer implementation, so there is no build in which
+ * COPYING is merely a copy fence here.  The consequence is load-bearing and is
+ * asserted in the wrong direction elsewhere: an in-place nr_child update SPINS
+ * while a peer holds COPYING, i.e. it HONORS the lock rather than racing it.
  */
 #define FT_STATE_INPLACE_WAIT_MASK	(FT_STATE_PROXY | FT_STATE_COPYING)
 

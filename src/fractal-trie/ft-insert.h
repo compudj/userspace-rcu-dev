@@ -109,7 +109,8 @@ struct ft_insert_commit {
 	struct cds_ft_inode_flag *created[FT_MAX_DEPTH];
 	int nr_created;
 	/*
-	 * DLM Step 1 (ft-step1-dlm-acquire.md) compressed-split acquire: when a
+	 * DLM Step 1 compressed-split acquire (see
+	 * doc/design/mw-writer-lock-escalation-model.md): when a
 	 * split builder pre-acquired CN's parent P (the value-swap forward-publish
 	 * target) as part of its one-commit lock-set {CN, P}, @parent_locked_holder
 	 * is P's metadata and @parent_locked_snap the clean state word captured at
@@ -568,7 +569,8 @@ void ft_insert_publish_or_park(struct cds_ft *ft,
 }
 
 /*
- * DLM Step 1 (ft-step1-dlm-acquire.md): acquire the compressed-split lock-set
+ * DLM Step 1 (see doc/design/mw-writer-lock-escalation-model.md):
+ * acquire the compressed-split lock-set
  * {CN, P} in ONE all-or-none MCAS up front, replacing the incremental CN
  * copying-mark here plus the P lock_or_guard inside ft_insert_publish_or_park.
  * Mirrors the recompact hoist ({C,P}): P is CN's parent (the value-swap forward-
