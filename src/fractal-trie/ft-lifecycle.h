@@ -509,16 +509,17 @@ enum cds_ft_status _cds_ft_group_create(const struct cds_ft_group_attr *attr,
 		 * Order statistics maintain ONE global count on the root's nr_keys
 		 * word, which EVERY count-changing mutation walks up to and updates
 		 * (ft_flip_txn_record_count_parent to the root) -- so no two
-		 * count-changing writers are ever disjoint.  Both concurrent
-		 * strategies exploit disjointness they do not have here: FINE's
-		 * per-node lock-sets and OPTIMISTIC's lock-free MCAS both let
+		 * count-changing writers are ever disjoint.  FINE exploits
+		 * disjointness it does not have here: its per-node lock-sets let
 		 * would-be-disjoint writers proceed without the FT-wide lock, but with
-		 * rank stats all writers collide on the root count, so neither buys
+		 * rank stats all writers collide on the root count, so it buys no
 		 * concurrency over the single lock.  Worse, the count-parent walk
 		 * assumes WRITER EXCLUSION for a stable, proxy-free ancestor chain
 		 * (ft_flip_txn_record_count_parent) -- an assumption FINE breaks under
-		 * the FT-wide-lock drop and OPTIMISTIC breaks always (it takes no
-		 * FT-wide lock: lock_mode == false).  A rank-stats trie is therefore
+		 * the FT-wide-lock drop.  (This once also named the OPTIMISTIC
+		 * strategy and a `lock_mode == false` field; BOTH are gone -- the
+		 * strategy was removed and no such field exists.)  A rank-stats trie
+		 * is therefore
 		 * the COARSE single-lock target (§10.5): coerce ANY non-coarse
 		 * strategy to COARSE so it keeps the FT-wide lock (writer exclusion).
 		 */

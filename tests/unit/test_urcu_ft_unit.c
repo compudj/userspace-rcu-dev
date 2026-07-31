@@ -49,6 +49,12 @@
 
 #include "tap.h"
 
+/*
+ * DLM is no longer a build mode -- per-node lock-sets are the ONLY multi-writer
+ * implementation, selected at RUNTIME by ft->lock_fine.  The _DLM suffix
+ * here is now just the historical name for this group of lock-set tests;
+ * it does NOT mean a separate build.
+ */
 #define NR_TESTS_DLM 8		/* cow_stop_root_inplace, rekey_graft_{simple,liston,cross_junction,glue_dst,glue_dst_branch_child}, rekey_merge_{occupied,collide}_dst */
 
 /*

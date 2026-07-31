@@ -1201,8 +1201,9 @@ int ft_node_recompact(enum ft_recompact mode,
 	 * halves differ only in the terminal they record at commit.
 	 *
 	 * Held only under FINE: COARSE derives no lock-set (§10.5, one FT-wide
-	 * lock), and OPTIMISTIC keeps its §4.B guards (which the release record
-	 * would poison -- see ft_flip_txn_record_release_copying).
+	 * lock).  (The OPTIMISTIC arm this also described -- "keeps its §4.B
+	 * guards, which the release record would poison" -- is gone with the
+	 * strategy; see ft_flip_txn_record_release_copying.)
 	 */
 	struct cds_ft_metadata *rel_meta[2];
 	uintptr_t rel_snap[2];

@@ -75,8 +75,9 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 	 * the caller's pre-swap fence block) closes the read-then-fence window:
 	 * the whole build runs under the fence, so a cn->child change during the
 	 * build is caught too.  Gated on a txn'd graft under the drop: the
-	 * txn-less merge-rekey (glue->txn NULL) and the FT-wide-lock / OPTIMISTIC
-	 * builds keep the prior behaviour.  On the fence-miss path nothing is
+	 * txn-less merge-rekey (glue->txn NULL) and the FT-wide-lock builds keep
+	 * the prior behaviour (the OPTIMISTIC build this also listed is gone).
+	 * On the fence-miss path nothing is
 	 * built and @cn is NOT marked (a clean re-descend); an OOM AFTER the mark
 	 * leaves @cn marked for the caller (ft_graft_keylen) to clear.
 	 */

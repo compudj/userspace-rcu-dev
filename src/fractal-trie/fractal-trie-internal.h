@@ -123,8 +123,9 @@
  * on its per-node COPYING lock-sets + MCAS arbitration for writer exclusion --
  * so disjoint writers run in parallel instead of serialising on one mutex
  * (doc/design/ft-wide-lock-drop-mechanics.md; certified by the §11.4 point-op
- * 1600/1600 gate and the cross-trie oracles).  COARSE / OPTIMISTIC tries are
- * unaffected (COARSE keeps the mutex; OPTIMISTIC never took it).
+ * 1600/1600 gate and the cross-trie oracles).  COARSE tries are unaffected
+ * (COARSE keeps the mutex).  The OPTIMISTIC per-slot-CAS strategy this once
+ * also named has been REMOVED -- enum cds_ft_writer_strategy is COARSE|FINE.
  *
  * This is now UNCONDITIONAL: the drop was the only shipping behaviour, and its
  * opt-out (-DFEATURE_FT_MW_LOCK_FINE_KEEP) had no gate config, so the retained
@@ -830,8 +831,8 @@ struct ft_pub_rec {
  * that sharing forced: nr_child is NODE-owned, parent_slot_offset is
  * PARENT-owned per the edge principle (doc §8.3), and one word cannot be owned
  * by two locks.  It also removes a SELF-DEADLOCK: the offset setter had to spin
- * on FT_STATE_INPLACE_WAIT_MASK, which includes FT_STATE_COPYING under
- * the DLM lock-sets, so an op holding that node's own lock waited on
+ * on FT_STATE_INPLACE_WAIT_MASK, which includes FT_STATE_COPYING
+ * unconditionally, so an op holding that node's own lock waited on
  * itself (see the reverted b20c471e).  The offset word carries no COPYING bit,
  * so its wait is over the engine proxy alone.
  */
@@ -897,7 +898,7 @@ struct ft_pub_rec {
  *   - FT_STATE_PROXY: an engine MCAS flip is parked here (the word holds a record
  *     pointer, not a plain state); CASing would write f(latch-pointer) back.
  *     Always waited out, in every build.
- *   - FT_STATE_COPYING (DLM builds only): a peer holds the per-node writer lock
+ *   - FT_STATE_COPYING: a peer holds the per-node writer lock
  *     and may be SW-parking this word (a retire / lock release / re-home) in an
  *     in-flight mixed sw/mw commit.  An SW park is a plain store that never
  *     validates, so a racing CAS here would clobber it (<urcu/rcu-txn.h>: "if any
@@ -985,11 +986,12 @@ struct cds_ft_metadata {
 
 	/*
 	 * Packed bitfield -- small fields in a single uint32_t.
-	 * (nr_child AND parent_slot_offset both live in @state above, not here.
-	 * parent_slot_offset -- the pointer-stride offset of this node's slot in
-	 * its parent -- moved into the state word so a re-home commits the parent
-	 * edge and the slot offset as ONE atomic MCAS state edge; access it via
-	 * the ft_meta_parent_slot_offset* helpers.)
+	 * (nr_child lives in @state above, not here.  parent_slot_offset does NOT:
+	 * §8.3 gave it its OWN word (@parent_slot_offset) because a word cannot be
+	 * owned by two locks -- the slot offset is PARENT-owned while @state is
+	 * node-owned, and sharing them self-deadlocked the offset setter against
+	 * its own node's COPYING bit.  Access it via the
+	 * ft_meta_parent_slot_offset* helpers.)
 	 *
 	 * alloc_index:            near: FT_ALLOC_INDEX_BITS + 3 spare bits of
 	 *                         headroom above the page_size >>
@@ -1107,7 +1109,8 @@ void ft_meta_nr_child_dec(struct cds_ft_metadata *meta)
 
 /*
  * parent_slot_offset: the pointer-stride offset of this node's slot in its
- * parent body, held in @state bits FT_STATE_PSO_SHIFT.. (above nr_child).  This
+ * parent body, held in its OWN word (@parent_slot_offset), NOT in @state --
+ * §8.3 split it out; @state keeps nr_child and the lock/proxy bits.  This
  * raw reader suits a node the caller owns / that is quiescent; a reader that may
  * race a mid-commit proxy uses the resolving ft_meta_parent_slot_offset_load,
  * and a backtracker recovering the (parent, offset) PAIR must use

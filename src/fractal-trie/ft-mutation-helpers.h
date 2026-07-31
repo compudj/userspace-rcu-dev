@@ -235,8 +235,10 @@ extern unsigned long cds_ft_probe_gs_pubok;
 
 /*
  * FT bridge to the concurrent MCAS transaction engine (<urcu/rcu-txn.h>).  An
- * op records its frozen edge set {slot, old, new} DIRECTLY into the urcu_mcas
- * transaction (@mtxn) during its build -- through ft_flip_txn_record_reserved /
+ * op records its frozen edge set {slot, old, new} DIRECTLY into the engine
+ * transaction (@mtxn -- a `struct urcu_txn *`; the field name predates the
+ * rcu-mcas -> rcu-txn rename and is kept only to avoid churn) during its
+ * build -- through ft_flip_txn_record_reserved /
  * ft_flip_txn_record_tag and the ordered-list *_prepare helpers -- then
  * ft_flip_txn_commit commits @mtxn, so the whole set (structural index AND
  * ordered-cell list) publishes atomically (one status-word flip).  There is no

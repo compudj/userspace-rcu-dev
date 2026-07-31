@@ -2873,9 +2873,9 @@ enum cds_ft_writer_strategy {
  * Any strategy combined with order statistics
  * (cds_ft_group_attr_set_rank_stats) is coerced to CDS_FT_WRITER_LOCK_COARSE:
  * rank stats serialize every count-changing writer on the root count, so
- * neither fine-grained locking nor the optimistic engine buys parallelism
- * there, and both would run the count walk without the FT-wide-lock exclusion
- * it requires.
+ * fine-grained locking buys no parallelism there, and it would run the count
+ * walk without the FT-wide-lock exclusion the walk requires.  (The optimistic
+ * engine this sentence also weighed no longer exists.)
  */
 enum cds_ft_status cds_ft_group_attr_set_writer_strategy(
 		struct cds_ft_group_attr *attr,
