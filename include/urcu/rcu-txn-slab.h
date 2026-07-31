@@ -234,6 +234,10 @@ struct urcu_slab_arena {
 	 *   cross-cpu free -> freelist (atomic; ORIGIN arena, contract intact)
 	 *   alloc          -> pop local; when dry, pull the WHOLE freelist
 	 *                     across with one xchg and install it as local
+	 *
+	 * One reserved value: &slab->dead, the self-linked node a drain installs
+	 * here to retire the list (urcu_slab_take_local()).  It is never a real
+	 * block and never appears in a chain.
 	 */
 	struct cds_lfs_node *local;
 	/*
@@ -251,11 +255,20 @@ struct urcu_slab_arena {
 	struct cds_lfs_node *local_pending;
 	struct cds_lfs_node *local_floor;
 	/*
-	 * Non-zero while ->local may be touched with rseq.  Read INSIDE every
-	 * local critical section, so clearing it and then issuing
-	 * membarrier(...EXPEDITED_RSEQ) provably evicts any section still
+	 * Non-zero while the local lists may be touched with rseq.  Read INSIDE
+	 * every critical section that STORES A VALUE OF ITS OWN CHOOSING -- the
+	 * pushes, the refill install, the local close -- so clearing it and then
+	 * issuing membarrier(...EXPEDITED_RSEQ) provably evicts any section still
 	 * running on a stale decision; a check before the section would be
 	 * sampled once and survive the restart.
+	 *
+	 * The local POP is the exception, and deliberately so: its two compares
+	 * are spent on the head and on head->next (without the second one it has
+	 * the ABA of an unlocked Treiber pop -- see urcu_slab_local_pop()), which
+	 * leaves no slot for this flag.  A pop is stopped instead by the value in
+	 * the head word, which is sound only because a pop's commit value is
+	 * DERIVED from what it loaded: parking the self-linked &slab->dead there
+	 * makes the pop store @dead straight back.  See urcu_slab_take_local().
 	 *
 	 * One-way.  Promotion back would have to prove no atomic operation is
 	 * still in flight against ->local, which needs the fast and slow paths
@@ -326,11 +339,29 @@ struct urcu_slab {
 	unsigned long nr_sb_total;	/* superblocks currently mapped */
 	unsigned long batch_max;	/* close a batch at this many blocks */
 	/*
-	 * Deferral used to schedule drains.  A parameter, not a hardcoded
-	 * call_rcu(), so the slab stays flavor-agnostic like the engines above
-	 * it; struct rcu_head itself is flavor-independent.
+	 * Deferral used to schedule batch closes and splices.  A parameter, not a
+	 * hardcoded call_rcu(), so the slab stays flavor-agnostic like the engines
+	 * above it; struct rcu_head itself is flavor-independent.
+	 *
+	 * PRECONDITION: every urcu_slab_free_pending() caller of one slab must
+	 * pass the SAME function.  A grace period is flavor-scoped, and this field
+	 * is slab-wide while the engines' slab instances are process-wide, so two
+	 * embedders on two flavors would have whichever freed last decide when a
+	 * batch full of the OTHER flavor's descriptors becomes allocatable --
+	 * reader use-after-free.  urcu_slab_free() has no such constraint: there,
+	 * each caller's own flavor gates its own free.  free_pending() asserts on
+	 * a mismatch; an NDEBUG build cannot detect the violation at all.
 	 */
 	void (*call_rcu_fn)(struct rcu_head *, void (*)(struct rcu_head *));
+	/*
+	 * Retirement marker for the rseq local freelists: a node whose ->next is
+	 * itself.  Parked in an arena's ->local by urcu_slab_take_local(), where
+	 * it turns any straggling rseq pop into a no-op that stores @dead back.
+	 * One per SLAB, not per TU: a file-scope static would give each
+	 * translation unit its own marker, and a pop comparing against the wrong
+	 * one would hand @dead out as a block.
+	 */
+	struct cds_lfs_node dead;
 	/*
 	 * Stats fields are UNCONDITIONAL: the instance is shared across TUs
 	 * (one strong definition in liburcu-common), while the URCU_SLAB_STAT
@@ -482,6 +513,7 @@ void urcu_slab_init(struct urcu_slab *s, const size_t *class_size, int nclass,
 	s->batch_off = (link_off + sizeof(struct rcu_head) + 7) & ~(size_t) 7;
 	s->st_reuse = s->st_carve = s->st_sbs = 0;
 	s->call_rcu_fn = NULL;
+	s->dead.next = &s->dead;		/* self-linked: see urcu_slab::dead */
 	s->batch_max = URCU_SLAB_BATCH_MAX;
 	{
 		const char *e = getenv("URCU_TXN_BATCH_MAX");
@@ -668,59 +700,69 @@ void urcu_slab_push(struct cds_lfs_stack *s, struct cds_lfs_node *node)
 
 #ifdef URCU_SLAB_RSEQ
 /*
- * All three local-list operations are the same shape: verify the head has not
- * moved, then commit one plain store.  No atomic, and none is needed -- the
- * list is only ever touched from this arena's own cpu, and rseq restarts us if
- * we were preempted or migrated anywhere inside.
+ * The local-list WRITERS -- both pushes, the refill install, the local close --
+ * are the same shape: verify the head has not moved AND that the arena is still
+ * rseq-eligible, then commit one plain store.  No atomic, and none is needed:
+ * the list is only ever touched from this arena's own cpu, and rseq restarts us
+ * if we were preempted or migrated anywhere inside.
  *
  * Whatever is written into the node happens BEFORE the commit and while the
  * node is still unreachable, so an abort leaves nothing observable: the same
  * link-before-publish discipline lfstack uses.
+ *
+ * The POP is shaped differently -- see below.
+ */
+
+/*
+ * Pop one block off the local list.
+ *
+ * The successor MUST be loaded inside the critical section.  Reading
+ * head->next outside it and passing the value in as the commit operand gives
+ * this pop the exact ABA of an unlocked Treiber pop: the section value-checks
+ * the head only, so a thread preempted between the two -- on THIS cpu, which is
+ * the case the local list exists for -- can resume after its head has been
+ * allocated, freed and pushed back, and install a stale successor that is by
+ * then a live block.  Two allocations then return the same descriptor.
+ * rseq_load_cbeq_store_add_load_store__ptr() dereferences the head inside the
+ * section (add voffp, load, store), so the value it commits is correct AT the
+ * commit instant regardless of what happened before it.
+ *
+ * The price is the second compare, which the writers spend on @rseq_ok: this
+ * section cannot also check the demote flag.  What retires it instead is
+ * @slab->dead sitting in the head word -- self-linked, so the section pops
+ * @dead, stores @dead->next (i.e. @dead) back, and leaves the list exactly as
+ * it found it.  The caller recognizes it and falls back to the atomic path.
+ *
+ * Returns NULL for dry, migrated, preempted and demoted alike: the caller
+ * answers all four the same way, by refilling from the atomic freelist.
  */
 static inline
-struct cds_lfs_node *urcu_slab_local_pop(struct urcu_slab_arena *a, int cpu)
+struct cds_lfs_node *urcu_slab_local_pop(struct urcu_slab *s,
+		struct urcu_slab_arena *a, int cpu)
 {
-	for (;;) {
-		struct cds_lfs_node *head, *next;
+	intptr_t popped = 0;
 
-		int ret;
-
-		head = RSEQ_READ_ONCE(a->local);
-		if (!head)
-			return NULL;			/* dry: caller refills */
-		next = head->next;
-		ret = rseq_load_cbne_load_cbne_store__ptr(
-				RSEQ_MO_RELAXED, RSEQ_PERCPU_CPU_ID,
-				(intptr_t *) &a->local, (intptr_t) head,
-				(intptr_t *) &a->rseq_ok, (intptr_t) 1,
-				(intptr_t) next, cpu);
-		if (rseq_likely(!ret))
-			return head;
-		/*
-		 * @cpu was sampled by the caller, which also used it to pick
-		 * @a.  Once we migrate off it the cpu check aborts EVERY
-		 * attempt, and retrying here would spin forever -- @cpu is
-		 * loop-invariant, so nothing that made this fail can change.
-		 * Re-sampling would not help either: the arena belongs to the
-		 * old cpu.  Bail out exactly like the push does and let the
-		 * caller fall through to the atomic freelist.
-		 */
-		if (ret < 0)
-			return NULL;		/* migrated: caller goes atomic */
-		if (!uatomic_load(&a->rseq_ok, CMM_RELAXED))
-			return NULL;		/* demoted: caller goes atomic */
-		/* ne: raced on our own cpu, so a retry can make progress */
-	}
+	if (rseq_unlikely(rseq_load_cbeq_store_add_load_store__ptr(
+			RSEQ_MO_RELAXED, RSEQ_PERCPU_CPU_ID,
+			(intptr_t *) &a->local, (intptr_t) NULL,
+			(long) offsetof(struct cds_lfs_node, next),
+			&popped, cpu)))
+		return NULL;			/* empty, migrated or preempted */
+	if (caa_unlikely((struct cds_lfs_node *) popped == &s->dead))
+		return NULL;			/* retired: caller goes atomic */
+	return (struct cds_lfs_node *) popped;
 }
 
 static inline
-int urcu_slab_local_push(struct urcu_slab_arena *a, struct cds_lfs_node *node,
-		int cpu)
+int urcu_slab_local_push(struct urcu_slab *s, struct urcu_slab_arena *a,
+		struct cds_lfs_node *node, int cpu)
 {
 	for (;;) {
 		struct cds_lfs_node *head = RSEQ_READ_ONCE(a->local);
 		int ret;
 
+		if (caa_unlikely(head == &s->dead))
+			return -1;		/* retired: caller goes atomic */
 		node->next = head;			/* private until the commit */
 		ret = rseq_load_cbne_load_cbne_store__ptr(RSEQ_MO_RELAXED,
 				RSEQ_PERCPU_CPU_ID, (intptr_t *) &a->local,
@@ -728,14 +770,27 @@ int urcu_slab_local_push(struct urcu_slab_arena *a, struct cds_lfs_node *node,
 				(intptr_t) 1, (intptr_t) node, cpu);
 		if (rseq_likely(!ret))
 			return 0;
+		/*
+		 * @cpu was sampled by the caller, which also used it to pick
+		 * @a.  Once we migrate off it the cpu check aborts EVERY
+		 * attempt, and retrying here would spin forever -- @cpu is
+		 * loop-invariant, so nothing that made this fail can change.
+		 * Re-sampling would not help either: the arena belongs to the
+		 * old cpu.  Bail out and let the caller fall through to the
+		 * atomic freelist.
+		 */
 		if (ret < 0)
 			return -1;		/* migrated: caller goes atomic */
 		if (!uatomic_load(&a->rseq_ok, CMM_RELAXED))
 			return -1;		/* demoted: caller goes atomic */
+		/* ne: raced on our own cpu, so a retry can make progress */
 	}
 }
 
-/* Install a whole chain as the local list, iff it is still empty. */
+/*
+ * Install a whole chain as the local list, iff it is still empty.  A retired
+ * list holds &slab->dead, which is not NULL, so this fails on it too.
+ */
 static inline
 int urcu_slab_local_install(struct urcu_slab_arena *a,
 		struct cds_lfs_node *chain, int cpu)
@@ -778,6 +833,65 @@ int urcu_slab_demote_fence(void)
 #endif
 }
 
+static inline void urcu_slab_closer_cb(struct rcu_head *head);
+
+/*
+ * Arm the fallback closer on @a, unless one is already in flight.
+ */
+static inline
+void urcu_slab_arm_closer(struct urcu_slab *s, struct urcu_slab_arena *a)
+{
+	void (*call_rcu_fn)(struct rcu_head *, void (*)(struct rcu_head *)) =
+		uatomic_load(&s->call_rcu_fn, CMM_RELAXED);
+
+	if (!call_rcu_fn)
+		return;				/* nobody uses free_pending here */
+	if (!uatomic_load(&a->close_queued, CMM_RELAXED) &&
+			uatomic_cmpxchg(&a->close_queued, 0, 1) == 0)
+		call_rcu_fn(&a->close_head, urcu_slab_closer_cb);
+}
+
+/*
+ * Retire @a->local: take whatever is on it and park &slab->dead in the head
+ * word so no rseq pop can ever operate on it again.
+ *
+ * Unlike the pushes and the install, the pop does not compare @rseq_ok (see
+ * urcu_slab_local_pop()), so urcu_slab_demote_flag() does not stop it.  What
+ * stops it is @dead: a pop that loads it stores @dead->next -- @dead itself --
+ * straight back, so the marker is self-preserving and the pop is a no-op.
+ *
+ * That leaves exactly one window.  A section that loaded a REAL head just
+ * before our xchg, and commits just after it, overwrites @dead with a node of
+ * the chain we now own -- and hands the node above it to an allocator.  The
+ * fence evicts every section still executing; one that slipped past the fence
+ * had to have committed, and re-reading the head detects that, because once
+ * @dead is gone nothing can put it back: only a pop that READS @dead restores
+ * it, and @dead is never linked into a chain.  So we simply take again.  The
+ * retry keeps the surviving suffix and drops the prefix, which is precisely the
+ * set of nodes that were handed out.  It terminates: pushes are already dead
+ * (they do compare @rseq_ok) and every wipe consumes one node.
+ *
+ * An empty or already-retired list needs no fence -- rseq sections on one cpu
+ * are mutually exclusive, so the only section that could be in flight is one
+ * that loaded the same empty head, and an empty pop commits nothing.
+ */
+static inline
+struct cds_lfs_node *urcu_slab_take_local(struct urcu_slab_arena *a)
+{
+	struct cds_lfs_node *dead = &a->slab->dead;
+
+	for (;;) {
+		struct cds_lfs_node *n = uatomic_xchg(&a->local, dead);
+
+		if (!n || n == dead)
+			return NULL;
+		if (urcu_slab_demote_fence())
+			return NULL;		/* strand rather than corrupt */
+		if (uatomic_load(&a->local, CMM_RELAXED) == dead)
+			return n;
+	}
+}
+
 /*
  * Move a demoted arena's local list onto its atomic freelist.  Safe from any
  * cpu, but ONLY after urcu_slab_demote_flag() + urcu_slab_demote_fence():
@@ -791,7 +905,8 @@ int urcu_slab_demote_fence(void)
 static inline
 void urcu_slab_drain_local(struct urcu_slab_arena *a)
 {
-	struct cds_lfs_node *n = uatomic_xchg(&a->local, NULL);
+	struct cds_lfs_node *n = urcu_slab_take_local(a);
+	int moved_pending = 0;
 
 	while (n) {
 		struct cds_lfs_node *next = n->next;
@@ -803,7 +918,9 @@ void urcu_slab_drain_local(struct urcu_slab_arena *a)
 	/*
 	 * ->local_pending goes to ->pending, NOT to the freelist: those blocks
 	 * are still awaiting their grace period, and handing them straight back
-	 * to alloc would be a use-after-free.
+	 * to alloc would be a use-after-free.  It needs no @dead marker: every
+	 * section that writes it does compare @rseq_ok, so the demote fence has
+	 * already retired the list.
 	 */
 	n = uatomic_xchg(&a->local_pending, NULL);
 	a->local_floor = NULL;
@@ -902,7 +1019,7 @@ void *urcu_slab_alloc(struct urcu_slab *s, int cl)
 			uatomic_load(&a->rseq_ok, CMM_RELAXED))) {
 		struct cds_lfs_head *chain;
 
-		node = urcu_slab_local_pop(a, cpu);
+		node = urcu_slab_local_pop(s, a, cpu);
 		if (caa_likely(node != NULL)) {
 			URCU_SLAB_STAT(s, reuse);
 			URCU_SLAB_STAT(s, a_local);
@@ -1025,7 +1142,8 @@ void urcu_slab_free(void *block)
 			uatomic_load(&a->rseq_ok, CMM_RELAXED))) {
 		int cpu = rseq_current_cpu_raw();
 
-		if (cpu == a->cpu && !urcu_slab_local_push(a, node, cpu)) {
+		if (cpu == a->cpu &&
+				!urcu_slab_local_push(a->slab, a, node, cpu)) {
 			URCU_SLAB_STAT(a->slab, f_local);
 			return;
 		}
