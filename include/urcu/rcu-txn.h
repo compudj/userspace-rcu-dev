@@ -192,6 +192,15 @@ urcu_static_assert(URCU_TXN_FALLBACK_PER_COST_DEN > 0,
 urcu_static_assert(URCU_TXN_FALLBACK_MIN <= URCU_TXN_FALLBACK_MAX,
 		"URCU_TXN_FALLBACK_MIN must not exceed URCU_TXN_FALLBACK_MAX",
 		urcu_txn_fallback_bounds_ordered);
+/*
+ * urcu_txn__fallback_at() evaluates num * cost in uint64_t with cost bounded by
+ * UINT_MAX, so a larger numerator wraps and yields an arbitrary budget --
+ * escalate-on-the-first-abort or never-below-MAX -- instead of a diagnostic.
+ */
+urcu_static_assert((uint64_t) URCU_TXN_FALLBACK_PER_COST_NUM <=
+			(uint64_t) UINT64_MAX / (uint64_t) UINT_MAX,
+		"URCU_TXN_FALLBACK_PER_COST_NUM must not overflow num * cost",
+		urcu_txn_fallback_per_cost_num_fits);
 
 /*
  * Read-your-own-writes lookup filter (a Bloom word), maintained for every
