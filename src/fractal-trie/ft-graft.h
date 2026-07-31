@@ -504,7 +504,23 @@ enum cds_ft_status ft_store_at_graft_point_prepare(struct cds_ft *ft,
 			 * in it (d->ppnfp). */
 			&(const struct ft_parent_hint){
 				.parent = d->ppnf, .slot = d->pnfp,
-				.gp = d->pppnf, .gp_slot = d->ppnfp },
+				.gp = d->pppnf, .gp_slot = d->ppnfp,
+				/*
+				 * An ordinary hint deliberately skips the
+				 * C.parent == P read-set guard: the MW
+				 * cross-trie graft's parent identity is the
+				 * CALLER's and must not be validated against
+				 * C's lazily-updated back-pointer.  But the
+				 * SAME hint serves the FOLD's NOSPLIT
+				 * dst-parent recompaction, whose republish
+				 * PARKS SW into @parent's slot -- and an SW
+				 * park into a slot whose ownership rests on a
+				 * shape argument is exactly what the guard
+				 * exists to stop.  Ask for it when this is the
+				 * fold (record_only), which is byte-neutral for
+				 * the MW graft.
+				 */
+				.parent_guard = glue->record_only },
 			&st->count_deferred);
 		/*
 		 * -EAGAIN is a TRANSIENT peer conflict (the reserve found its
@@ -598,7 +614,11 @@ enum cds_ft_status ft_store_at_graft_point_prepare(struct cds_ft *ft,
 					.parent = d->ppnf,
 					.slot = d->pnfp,
 					.gp = d->pppnf,
-					.gp_slot = d->ppnfp },
+					.gp_slot = d->ppnfp,
+					/* Fold republish parks SW into
+					 * @parent's slot: guard the identity.
+					 * See the depth == key_len arm. */
+					.parent_guard = glue->record_only },
 				&st->count_deferred);
 			/* Transient peer conflict, not OOM: see the
 			 * depth == key_len arm above. */

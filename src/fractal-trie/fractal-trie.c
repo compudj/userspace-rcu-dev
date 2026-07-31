@@ -263,6 +263,7 @@ int _cds_ft_debug_cow_replace_root(struct cds_ft *ft)
 	struct cds_ft_metadata *marks[FT_ENTRY_PER_NODE + 1];
 	uintptr_t snaps[FT_ENTRY_PER_NODE + 1];
 	unsigned int nr_marks = 0, i, ti;
+	bool marks_consumed = false;
 	enum urcu_txn_status st;
 	int ret;
 
@@ -299,6 +300,7 @@ int _cds_ft_debug_cow_replace_root(struct cds_ft *ft)
 
 	st = ft_flip_txn_commit(ft, txn);		/* consumes txn */
 	if (st == URCU_TXN_STATUS_OK) {
+		marks_consumed = true;	/* every mark released by its state edge */
 		cds_ft_free_item_deferred(ft, old_root_meta);	/* old root freed after GP */
 		ret = 0;
 	} else {
@@ -316,12 +318,14 @@ int _cds_ft_debug_cow_replace_root(struct cds_ft *ft)
 
 sweep:
 	/*
-	 * Clear any COPYING mark a successful commit did not consume (a no-op then,
-	 * a release on every mark on a bail/abort) -- the caller-owned sweep the
-	 * primitive's contract requires, since the marks are not txn-registered.
+	 * The caller-owned release the primitive's contract requires (the marks are
+	 * not txn-registered), on bail/abort paths ONLY: a successful commit already
+	 * released every mark through its state edge, so clearing again would take a
+	 * peer's fresh mark off a node that is LIVE and CLEAN by then.
 	 */
-	for (i = 0; i < nr_marks; i++)
-		ft_meta_copying_clear_if_held(marks[i]);
+	if (!marks_consumed)
+		for (i = 0; i < nr_marks; i++)
+			ft_meta_copying_clear_if_held(marks[i]);
 	return ret;
 }
 
@@ -517,6 +521,7 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 	uintptr_t snaps[FT_ENTRY_PER_NODE + 2];
 	const uint8_t *ik;
 	unsigned int nr_marks = 0, adepth = 0, i, ti;
+	bool marks_consumed = false;
 	bool src_parent_held;
 	enum ft_graft_prep prep;
 	enum cds_ft_status gst;
@@ -1138,9 +1143,13 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 		 * and the offset lives in the state word ft_meta_nr_child_inc CASes
 		 * from an insert BELOW it -- which @cn's fence does not exclude -- so
 		 * MARK it, exactly as ft_rekey_cow_stop marks the children whose state
-		 * words it parks into.  The mark rides the caller's @marks sweep: the
-		 * commit's own pso edge clears it (new_state masks COPYING out), and
-		 * every bail path releases it.  An external child has no state word and
+		 * words it parks into.  Released by the re-parent's {live_state ->
+		 * live_state} STATE edge, which is recorded unconditionally -- NOT by
+		 * the pso edge, which since @118245b0 is its own word and is recorded
+		 * only when the slot index CHANGES (resting the release on it leaks a
+		 * permanent COPYING on every child that lands at the same index; see
+		 * ft_rekey_cow_stop's release-attribution note).  Every bail path
+		 * releases it through the @marks sweep.  An external child has no state word and
 		 * no metadata, so there is nothing to mark and nothing to clobber.
 		 */
 		{
@@ -1472,6 +1481,14 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 #endif
 	st = ft_flip_txn_commit(ft, txn);
 	if (st == URCU_TXN_STATUS_OK) {
+		/*
+		 * The commit CONSUMED every mark in @marks: each child's release is
+		 * ft_reparent_record_meta's {live_state -> live_state} state edge
+		 * (live_state has COPYING masked, and the edge is recorded
+		 * unconditionally), and @stop's is its retire.  So the sweep below
+		 * must NOT run -- see its own comment.
+		 */
+		marks_consumed = true;
 		ft_glue_free_old(ft, &glue);		/* graft old copies */
 		/*
 		 * The merged cluster's SRC side: its free list holds S_top itself (and
@@ -1567,8 +1584,23 @@ bail_build:
 	ft_flip_txn_destroy(txn);
 
 sweep:
-	for (i = 0; i < nr_marks; i++)
-		ft_meta_copying_clear_if_held(marks[i]);
+	/*
+	 * Release every mark the commit did NOT consume.
+	 *
+	 * ONLY on paths that did not reach a successful commit.  This used to run
+	 * unconditionally, on the reading that a consumed mark makes
+	 * clear_if_held "a no-op" -- true only with no peers.  After a successful
+	 * commit each of these nodes is LIVE and CLEAN, so a peer that re-marked
+	 * one in the commit->sweep window has its fence CLEARED here: fence theft,
+	 * the same shape as the publish-parent holder's, and the precise thing
+	 * ft_glue_release_reparent_marks' own contract ("call ONLY on paths that
+	 * did NOT reach a successful commit") exists to avoid.  The fold is not
+	 * concurrent yet, which is why this was invisible; it has to be right
+	 * before it is.
+	 */
+	if (!marks_consumed)
+		for (i = 0; i < nr_marks; i++)
+			ft_meta_copying_clear_if_held(marks[i]);
 	return ret;
 }
 
