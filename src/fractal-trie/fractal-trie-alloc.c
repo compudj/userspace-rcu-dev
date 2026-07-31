@@ -1242,6 +1242,31 @@ long cds_ft_fault_commit_countdown = -1;
  * real unwind and not a synthesised status.
  */
 long cds_ft_fault_replace_countdown = -1;
+#endif
+
+#ifdef FEATURE_FT_PROBE_EMPTY_INSERT
+/*
+ * A/B counters for the born-empty insert candidate (ft-insert.h).  Reported at
+ * exit so a soak run records BOTH the catch and the bail: a change that makes
+ * the defect vanish while its bail never fires has not fixed anything -- the
+ * rule four already-refuted removal-side candidates were settled by.
+ */
+unsigned long cds_ft_probe_empty_publish_split;
+unsigned long cds_ft_probe_empty_publish_attach;
+unsigned long cds_ft_probe_reach_split;
+unsigned long cds_ft_probe_reach_attach;
+
+__attribute__((destructor))
+static void cds_ft_probe_empty_report(void)
+{
+	fprintf(stderr, "EMPTYPUB split=%lu attach=%lu (reached split=%lu attach=%lu)\n",
+		cds_ft_probe_empty_publish_split,
+		cds_ft_probe_empty_publish_attach,
+		cds_ft_probe_reach_split, cds_ft_probe_reach_attach);
+}
+#endif
+
+#ifdef FEATURE_FT_FAULT_INJECT
 
 /*
  * Test-only REKEY-coherence second-walk fault injection

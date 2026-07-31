@@ -446,6 +446,63 @@ spliced:;
 	return st;
 }
 
+#ifdef FEATURE_FT_PROBE_EMPTY_INSERT
+/*
+ * A/B CANDIDATE, insert side: refuse to publish an EMPTY non-root internal into
+ * a live parent slot, and count every refusal.
+ *
+ * WHY HERE, AND WHY A BAIL RATHER THAN A PROBE.  The residual is a live
+ * reachable internal with nr_child == 0, no external_nodes, a CLEAN state word,
+ * the smallest internal type, and an incoming_byte that agrees with the parent
+ * slot it hangs from -- i.e. correctly formed and correctly wired, with only its
+ * CONTENT missing.  That fits a fresh node PUBLISHED empty far better than a
+ * node emptied in place, and every removal-side arm has now been A/B-refuted by
+ * a bail that never fired while the defect kept happening (the detach boundary
+ * re-validation, the shape-D fusion gate, the FT_RECOMPACT_DEL sizing, and the
+ * recompact copy loop's NULL-child skip).
+ *
+ * Six earlier instrumentation designs SUPPRESSED the defect -- including the
+ * tracing build with every event disabled -- so a passive counter at a shared
+ * chokepoint is not a legitimate experiment here.  What remains legitimate is an
+ * A/B of a candidate fix that CARRIES ITS OWN BAIL COUNTER, placed on the
+ * INSERT side rather than in the hot path that suppressed last time.  The rule
+ * that settles it: a change that makes the defect vanish while its bail NEVER
+ * FIRES has not fixed anything.
+ *
+ * Compiled out entirely by default, so the baseline arm of the A/B is the
+ * ordinary build rather than a differently-shaped one.
+ */
+extern unsigned long cds_ft_probe_empty_publish_split;
+extern unsigned long cds_ft_probe_empty_publish_attach;
+/*
+ * REACH controls.  "empty == 0" is only evidence if the site RUNS -- the same
+ * trap that let the replace family's abort arms sit unexecutable.  These count
+ * every visit to the two guarded publishes, so a zero empty-count can be read
+ * as "this family is innocent" rather than "this instrument never fired".
+ */
+extern unsigned long cds_ft_probe_reach_split;
+extern unsigned long cds_ft_probe_reach_attach;
+
+static inline
+bool ft_probe_internal_is_empty(struct cds_ft *ft,
+		struct cds_ft_inode_flag *nf)
+{
+	struct cds_ft_metadata *meta;
+
+	if (!nf || ft_node_flip_proxy(nf) || ft_node_external(nf))
+		return false;
+	if (ft_node_compressed(nf))
+		return false;
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+	if (ft_node_skip_compressed(nf))
+		return false;
+#endif
+	(void) ft;
+	meta = cds_ft_item_to_metadata(ft_node_ptr(nf));
+	return ft_meta_nr_child(meta) == 0 && !meta->external_nodes;
+}
+#endif /* FEATURE_FT_PROBE_EMPTY_INSERT */
+
 /*
  * Publish @new_top into @slot (owned by @parent_nf): direct via
  * ft_publish_to_parent, or -- one-commit insert, @ic armed -- RECORD the
@@ -1126,6 +1183,16 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 		ic->live_parent = deferred_parent;
 		ic->live_slot = deferred_slot;
 	}
+#ifdef FEATURE_FT_PROBE_EMPTY_INSERT
+	/* A/B: never wire an empty internal under a live parent (see the note). */
+	__atomic_fetch_add(&cds_ft_probe_reach_split, 1, __ATOMIC_RELAXED);
+	if (cur_parent && ft_probe_internal_is_empty(ft, top_flag)) {
+		__atomic_fetch_add(&cds_ft_probe_empty_publish_split, 1,
+			__ATOMIC_RELAXED);
+		ret = -EAGAIN;
+		goto error;
+	}
+#endif
 	ft_insert_publish_or_park(ft, cur_parent, parent_slot, top_flag,
 		fwd_expected_old, ic);
 
@@ -1899,6 +1966,17 @@ int ft_attach_node(struct cds_ft *ft,
 			if (!ft->lock_fine)
 				ft_flip_txn_guard_parent(ft, ic->txn,
 					idest_meta->parent);
+#ifdef FEATURE_FT_PROBE_EMPTY_INSERT
+			__atomic_fetch_add(&cds_ft_probe_reach_attach, 1,
+				__ATOMIC_RELAXED);
+			if (ft_probe_internal_is_empty(ft, iter_dest_node_flag)) {
+				__atomic_fetch_add(
+					&cds_ft_probe_empty_publish_attach, 1,
+					__ATOMIC_RELAXED);
+				ret = -EAGAIN;
+				goto check_error;
+			}
+#endif
 			_ft_publish_to_parent(ft, attach_node_flag,
 				attach_node_flag_ptr, iter_dest_node_flag,
 				attach_node_flag, &rec);
@@ -2008,6 +2086,17 @@ int ft_attach_node(struct cds_ft *ft,
 			 */
 			ft_flip_txn_lock_or_guard_parent(ft, ic->txn,
 				attach_meta->parent);
+#ifdef FEATURE_FT_PROBE_EMPTY_INSERT
+			__atomic_fetch_add(&cds_ft_probe_reach_attach, 1,
+				__ATOMIC_RELAXED);
+			if (ft_probe_internal_is_empty(ft, iter_dest_node_flag)) {
+				__atomic_fetch_add(
+					&cds_ft_probe_empty_publish_attach, 1,
+					__ATOMIC_RELAXED);
+				ret = -EAGAIN;
+				goto check_error;
+			}
+#endif
 			_ft_publish_to_parent(ft, attach_node_flag,
 				attach_node_flag_ptr, iter_dest_node_flag,
 				attach_node_flag, &rec);
