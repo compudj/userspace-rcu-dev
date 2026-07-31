@@ -9827,9 +9827,26 @@ static int gs_shared_oracle(const char *tname, bool list_on)
 		ret = -1;
 	}
 
-	drain_trie_keep_group(ctx.dst);
-	for (i = 0; i < 2; i++)
-		drain_trie_keep_group(ctx.swap[i]);
+	/*
+	 * On a DETECTED corruption, do NOT drain: the drain walks by key, and a
+	 * trie whose structure this oracle just proved broken makes
+	 * drain_trie_keep_group hit its stale-iterator abort() -- which killed
+	 * the whole ft_inv binary at test 40 and blocked every test after it in
+	 * all ten gate configs.  A red oracle must report and let the suite
+	 * continue.  The nodes leak for this run and leak_check reports it, on
+	 * top of the failure already recorded -- deliberate, and cheaper than
+	 * losing the other 40-odd invariants.  Mirrors the dead-internal
+	 * teardown detector, which dumps and skips its walk for the same reason.
+	 */
+	if (ret == 0) {
+		drain_trie_keep_group(ctx.dst);
+		for (i = 0; i < 2; i++)
+			drain_trie_keep_group(ctx.swap[i]);
+	} else {
+		fprintf(stderr, "%s: corruption detected -- skipping the drain "
+			"(its key walk would abort on the broken trie); the "
+			"round's nodes leak by design\n", tname);
+	}
 	rcu_barrier();
 	cds_ft_destroy(probe);
 	cds_ft_group_destroy(group);
