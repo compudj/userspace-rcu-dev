@@ -50,7 +50,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS	11
+#define NR_TESTS	16
 
 /* Opaque, bit-0-clear slot values (the engine owns bit 0). */
 #define V0	((void *) 0x10)
@@ -236,6 +236,92 @@ static void test_joiner_does_not_sustain_episode(void)
 		abort();
 }
 
+/* ------------------------------------------------------------------ */
+/* 12-14: aging is PER OPERATION.                                      */
+/*                                                                     */
+/* A handle outlives one operation -- the flagship test reuses one for  */
+/* 20 000 -- so if a terminal outcome does not retire @retry, the count */
+/* accumulates forever.  Nothing decrements it, so once the cumulative  */
+/* total crosses the escalation budget urcu_txn__self_qualifies() is    */
+/* permanently true: every later begin() takes the lane and publishes,  */
+/* funnelling the whole domain in behind it for the rest of the         */
+/* process.  Silent -- the lane is correct, just serial -- so only a    */
+/* white-box assertion can catch it.                                    */
+
+static void test_aging_is_per_operation(void)
+{
+	struct urcu_txn tx;
+
+	g_wa = V0;
+	urcu_txn_init(&tx, &g_dom);
+	tx.retry = URCU_TXN_FALLBACK;		/* white-box: a starved handle */
+	urcu_txn_begin(&tx);
+	urcu_txn_store_mw(&tx, &g_wa, V0, V1, URCU_TXN_TAG);
+	if (urcu_txn_commit(&tx) != URCU_TXN_STATUS_OK)
+		abort();
+	urcu_txn_end(&tx);
+	ok(tx.retry == 0 && !urcu_txn__want_fallback(&tx),
+		"a committed operation retires its aging: the reused handle does "
+		"not self-qualify for the lane again");
+
+	/* MEMORY_ERROR is terminal too: nothing was published. */
+	urcu_txn_init(&tx, &g_dom);
+	tx.retry = URCU_TXN_FALLBACK;
+	urcu_txn_begin(&tx);
+	tx.desc = URCU_TXN_ENOMEM;		/* white-box: a sticky store failure */
+	if (urcu_txn_commit(&tx) != URCU_TXN_STATUS_MEMORY_ERROR)
+		abort();
+	urcu_txn_end(&tx);
+	ok(tx.retry == 0 && !urcu_txn__want_fallback(&tx),
+		"a MEMORY_ERROR retires it as well");
+
+	/* An ABORT must NOT: aging has to accumulate within one operation. */
+	g_wa = V0;
+	urcu_txn_init(&tx, &g_dom);
+	urcu_txn_begin(&tx);
+	urcu_txn_store_mw(&tx, &g_wa, V1 /* wrong old */, V0, URCU_TXN_TAG);
+	if (urcu_txn_commit(&tx) != URCU_TXN_STATUS_ABORT)
+		abort();
+	ok(tx.retry == 1,
+		"control: an ABORT still advances aging, so one operation's "
+		"attempts keep earning the lane");
+	urcu_txn_abandon(&tx);
+	urcu_txn_end(&tx);
+}
+
+/* ------------------------------------------------------------------ */
+/* 15-16: urcu_txn_abandon() is what releases the lane on a give-up.   */
+/*                                                                     */
+/* end() deliberately KEEPS the turn while the last commit returned     */
+/* ABORT, so the re-attempt is not sent to the back of the FIFO.  A     */
+/* bounded-retry loop that gives up therefore has to say so, or the     */
+/* fair mutex stays held and domain->active stays set: every later      */
+/* begin() in the domain parks forever behind an owner that is gone.    */
+
+static void test_abandon_releases_the_lane(void)
+{
+	struct urcu_txn tx;
+
+	g_wa = V0;
+	urcu_txn_init(&tx, &g_dom);
+	tx.retry = URCU_TXN_FALLBACK;		/* white-box: a starved handle */
+	urcu_txn_begin(&tx);
+	urcu_txn_store_mw(&tx, &g_wa, V1 /* wrong old */, V0, URCU_TXN_TAG);
+	if (urcu_txn_commit(&tx) != URCU_TXN_STATUS_ABORT)
+		abort();
+	urcu_txn_end(&tx);			/* keeps the turn for the re-attempt */
+	ok(tx.in_fallback && tx.fb_published &&
+			uatomic_read(&g_dom.active) == 1,
+		"end() after an ABORT keeps the lane and the episode: the caller "
+		"is expected to re-attempt");
+
+	urcu_txn_abandon(&tx);			/* ... but it gives up instead */
+	urcu_txn_end(&tx);
+	ok(!tx.in_fallback && !tx.fb_published &&
+			uatomic_read(&g_dom.active) == 0,
+		"abandon() + end() releases the fair mutex and ends the episode");
+}
+
 int main(void)
 {
 	plan_tests(NR_TESTS);
@@ -247,6 +333,8 @@ int main(void)
 	test_joiner_does_not_publish();		/* 5, 6 */
 	test_joiner_promoted_on_starvation();	/* 7, 8 */
 	test_joiner_does_not_sustain_episode();	/* 9, 10, 11 */
+	test_aging_is_per_operation();		/* 12, 13, 14 */
+	test_abandon_releases_the_lane();	/* 15, 16 */
 
 	rcu_thread_offline();
 	rcu_barrier();
