@@ -49,8 +49,22 @@
  *
  * URCU_TXN_HLIST_TAG must satisfy the engine's per-record contract for EVERY
  * live value any hlist slot holds -- a (possibly MARK-ed) node "next", a "pprev"
- * slot address, the head-first pointer, and NULL: (value & TAG) != TAG.  Holds
- * for bit 0 and for the fractal trie's nibble tag on >= 4-byte-aligned nodes.
+ * slot address, the head-first pointer, and NULL: (value & TAG) != TAG.
+ *
+ * A TAG THAT INCLUDES BIT 0 is discharged outright by the >= 4-byte alignment
+ * of every node, field and head address.  A TAG CONFINED TO BITS >= 2 is not:
+ * it additionally requires every such address -- node addresses, MARK-ed node
+ * addresses, &node->next AT ITS OFFSET INSIDE THE CONTAINER, and &head->first,
+ * the head's own alignment, which "aligned nodes" says nothing about -- to be
+ * aligned past the tag's highest bit.  An hlist_node embedded at offset 8 of a
+ * 16-aligned struct puts &h.next at 8 mod 16, which sets every bit of a bit-3
+ * tag; a pprev slot then holds a value the resolve reads as a proxy.
+ *
+ * Get it wrong and the failure is a WILD READ, not an abort: urcu_txn_load()
+ * takes the proxy branch, fabricates a record pointer out of a live address and
+ * dereferences ->desc from node-interior garbage.  The engine's debug asserts
+ * cover the RECORD path only (a bad old/new being stored); the resolve path
+ * fabricates silently, in release and debug builds alike.
  *
  * Bit encoding: a "next" value carries an optional deletion MARK on bit 1 (see
  * URCU_TXN_HLIST_MARK; matches <urcu/rcu-txn-list.h>).  A marked live "next" is
@@ -163,7 +177,9 @@
  * opens an RCU read-side section per attempt and defers descriptor reclaim
  * through the flavor's call_rcu; include this header AFTER an RCU flavor.  A
  * mutator loops internally until it commits or definitively fails: 0/1 on
- * success, -ENOENT if the anchor was deleted, -ENOMEM on descriptor OOM.
+ * success, -ENOMEM on descriptor OOM, and -ENOENT if the anchor was deleted --
+ * except for del_rcu(), which HAS no anchor other than the victim and reports
+ * "someone else removed it" as 0, per the 1/0 convention above.
  *
  * The escalation DOMAIN is NOT embedded in the head (that is what keeps the head
  * at 8 bytes): the mutators take a struct urcu_txn_domain * explicitly, so a
@@ -323,9 +339,19 @@ int urcu_txn_hlist_empty(struct urcu_txn_hlist_head *head)
  * urcu_txn_hlist_insert_at_slot_prepare: the core composable primitive.  Record
  * the edges that make @slot name @newp, given that @slot currently resolves to
  * @succ (the caller read it -- via urcu_txn_load on the head or on a node's next
- * -- and stripped any mark), WITHOUT committing.  @slot is &head->first for
+ * -- and VERIFIED IT UNMARKED), WITHOUT committing.  @slot is &head->first for
  * insert-at-head or &pos->next for insert-after; @succ is the (possibly NULL)
- * unmarked value it holds.  The *slot store (old @succ) is the serializing edge:
+ * unmarked value it holds.
+ *
+ * DO NOT STRIP A MARK AND PROCEED.  A marked value means the slot's owner is
+ * deleted (or, for the head, sealed), and a next is never unmarked again -- so
+ * the recorded edge {*slot: succ -> newp} presents an old the committed state
+ * can never hold.  Every install CAS fails, every attempt returns ABORT, the
+ * retry loop re-reads the same marked value and loops forever; past the
+ * fallback budget the handle escalates and holds the domain's fair-mutex lane
+ * across those ABORTs, stalling every other writer behind a transaction that
+ * can never commit.  Bail with -ENOENT instead, as all three callers in this
+ * file do.  The *slot store (old @succ) is the serializing edge:
  * any concurrent insert/delete that rewrites @slot fails this commit's old-value
  * check.  Returns 0, or -EAGAIN if @succ is a neighbour mid-deletion (retry);
  * OOM is sticky to the commit.

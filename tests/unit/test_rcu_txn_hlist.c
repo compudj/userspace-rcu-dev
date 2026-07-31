@@ -157,47 +157,56 @@ static int deterministic_edge_cases(void)
 
 	urcu_txn_hlist_init(&bkt);
 
+	/*
+	 * Every mutator return is checked.  Discarding them makes the test itself
+	 * unsound: under descriptor OOM a replace_rcu() fails, the old node stays
+	 * linked, and the call_rcu free below it is a use-after-free -- which
+	 * would then surface as a baffling chain mismatch rather than as the OOM
+	 * that caused it.
+	 */
+#define MUST_OK(call)	do { if ((call) < 0) abort(); } while (0)
+
 	/* 1-edge insert into an empty bucket. */
 	n5 = hnode_alloc(5);
 	rcu_read_lock();
-	(void) urcu_txn_hlist_add_rcu(&n5->node, &bkt, &g_dom);
+	MUST_OK(urcu_txn_hlist_add_rcu(&n5->node, &bkt, &g_dom));
 	rcu_read_unlock();
 	{ int e[] = { 5 }; ok_all &= expect_chain(&bkt, e, 1); }
 
 	/* insert-at-head with a smaller key (2-edge: head slot + old-first pprev). */
 	n3 = hnode_alloc(3);
 	rcu_read_lock();
-	(void) urcu_txn_hlist_add_rcu(&n3->node, &bkt, &g_dom);
+	MUST_OK(urcu_txn_hlist_add_rcu(&n3->node, &bkt, &g_dom));
 	rcu_read_unlock();
 	{ int e[] = { 3, 5 }; ok_all &= expect_chain(&bkt, e, 2); }
 
 	/* insert-after an interior node. */
 	n4 = hnode_alloc(4);
 	rcu_read_lock();
-	(void) urcu_txn_hlist_insert_after_rcu(&n4->node, &n3->node, &g_dom);
+	MUST_OK(urcu_txn_hlist_insert_after_rcu(&n4->node, &n3->node, &g_dom));
 	rcu_read_unlock();
 	{ int e[] = { 3, 4, 5 }; ok_all &= expect_chain(&bkt, e, 3); }
 
 	/* insert-after the last node (its succ is NULL: newp->next becomes NULL). */
 	n7 = hnode_alloc(7);
 	rcu_read_lock();
-	(void) urcu_txn_hlist_insert_after_rcu(&n7->node, &n5->node, &g_dom);
+	MUST_OK(urcu_txn_hlist_insert_after_rcu(&n7->node, &n5->node, &g_dom));
 	rcu_read_unlock();
 	{ int e[] = { 3, 4, 5, 7 }; ok_all &= expect_chain(&bkt, e, 4); }
 
 	/* insert-before a node (re-points *pos->pprev). */
 	n6 = hnode_alloc(6);
 	rcu_read_lock();
-	(void) urcu_txn_hlist_insert_before_rcu(&n6->node, &n7->node, &g_dom);
+	MUST_OK(urcu_txn_hlist_insert_before_rcu(&n6->node, &n7->node, &g_dom));
 	rcu_read_unlock();
 	{ int e[] = { 3, 4, 5, 6, 7 }; ok_all &= expect_chain(&bkt, e, 5); }
 
 	/* replace an interior node in place. */
 	n6b = hnode_alloc(6);
 	rcu_read_lock();
-	(void) urcu_txn_hlist_replace_rcu(&n6->node, &n6b->node, &g_dom);
+	MUST_OK(urcu_txn_hlist_replace_rcu(&n6->node, &n6b->node, &g_dom));
 	rcu_read_unlock();
-	call_rcu(&n6->rh, hnode_free);
+	call_rcu(&n6->rh, hnode_free);	/* safe: the replace above succeeded */
 	{ int e[] = { 3, 4, 5, 6, 7 }; ok_all &= expect_chain(&bkt, e, 5); }
 
 	/*

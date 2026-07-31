@@ -213,6 +213,17 @@ static void build(struct urcu_txn_hlist_head *head, struct node **out4)
 
 /* --------------------------------------------------------------------- */
 
+/*
+ * NOTE ON THE free()s BELOW.  They are immediate, with no grace period, which
+ * is NOT the contract an embedder must follow: an unlinked node is reclaimable
+ * only after a grace period, because a concurrent reader may still be walking
+ * through it.  It is safe HERE for two reasons that do not generalise -- these
+ * cases are single-threaded, so there is no concurrent reader at all, and the
+ * commit settles every slot before returning, so no proxy naming the node
+ * survives the call.  Copy the discipline from test_rcu_txn_hlist.c's
+ * call_rcu() teardown, not from these lines.
+ */
+
 static void test_ryw_adjacent_deletes(void)
 {
 	struct urcu_txn_hlist_head head;
