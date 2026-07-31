@@ -277,6 +277,20 @@ int urcu_txn_sw_list_flip2(
  * accessors sees the committed list, not this transaction's pending one, so a
  * caller that walks and edits in the same bracket may still name a node its own
  * earlier edit has displaced.  Identify the victims first, then edit.
+ *
+ * AND: COMPOSE ON A DEFAULT HANDLE.  urcu_txn_sw_declare_disjoint() switches
+ * off exactly the two mechanisms this guarantee rests on -- pending() then
+ * returns committed values, and record_chain() degrades to a blind append.  The
+ * adjacent-delete walkthrough above runs again in its "reading RAW" form, on
+ * four pairwise-distinct slots, which means install's duplicate scan passes,
+ * URCU_TXN_SW_DEBUG_DISJOINT cannot fire (it traps a repeated slot, and there
+ * is none) and URCU_TXN_SW_EXCL_VALIDATE sees one clean writer.  The commit
+ * reports OK and republishes both deleted nodes, which the caller then frees:
+ * a reader use-after-free one grace period later, with every debug knob on.
+ *
+ * The declare_disjoint() call in each self-contained _rcu wrapper below is
+ * sound because those brackets carry exactly ONE op.  It is not part of the
+ * template for a composed bracket.
  */
 static inline
 int urcu_txn_sw_list_add_after_prepare(struct urcu_txn_sw_txn *txn,

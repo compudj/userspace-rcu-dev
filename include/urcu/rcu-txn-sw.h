@@ -1193,6 +1193,27 @@ void *urcu_txn_sw_load(struct urcu_txn_sw_txn *t, void **slot,
 			t->state == URCU_TXN_SW_OOM);
 	if (!t->disjoint && (l = urcu_txn_sw__find_ryw(t, slot)) != NULL)
 		return l->proxy.ptr[1];		/* our own pending write */
+#ifdef URCU_TXN_SW_DEBUG_DISJOINT
+	/*
+	 * The LOAD side of the disjoint promise, which nothing used to check.
+	 * record_chain() traps a repeated slot, but a disjoint composed bracket
+	 * more often goes wrong the other way: the load returns the COMMITTED
+	 * value, the caller computes its next edge from it, and every slot it
+	 * then records is genuinely distinct -- so the record-side trap, the
+	 * install duplicate scan and the exclusion validator all stay silent
+	 * while the commit republishes state the bracket had already replaced.
+	 */
+	if (t->disjoint && urcu_txn_sw__find(t, slot) != NULL) {
+		fprintf(stderr, "urcu-txn-sw: disjoint-contract violation: "
+			"slot %p is read after this transaction recorded it, but the "
+			"handle declared its write set disjoint via "
+			"urcu_txn_sw_declare_disjoint(), so this load returns the "
+			"COMMITTED value and not the pending one.  Anything computed "
+			"from it names pre-transaction state.  Use the default (do not "
+			"declare disjoint) for a composed bracket.\n", (void *) slot);
+		abort();
+	}
+#endif
 	v = uatomic_load(slot, CMM_RELAXED);
 	/*
 	 * @tag && : the predicate reduces to 0 != 0 for a zero tag, which would
