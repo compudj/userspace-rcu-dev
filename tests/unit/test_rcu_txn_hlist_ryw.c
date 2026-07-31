@@ -133,6 +133,16 @@ static int present(struct urcu_txn_hlist_head *head, unsigned long key)
 /*
  * Delete @a and @b (adjacent, a before b) in ONE transaction.  Returns 0,
  * a negative errno from a _prepare, or -ETIMEDOUT on a livelock.
+ *
+ * EVERY GIVE-UP PATH CALLS urcu_txn_abandon() BEFORE end().  An ABORT (and
+ * urcu_txn_conflict()) keeps the handle's FIFO turn so the re-attempt is not
+ * sent to the back of the queue, and end() honours that -- so a bounded-retry
+ * loop that simply returns leaves the domain's fair mutex held forever, and
+ * every later writer in the domain parks behind an owner that is gone.  Note in
+ * particular that the spin check has to happen while the bracket is still open:
+ * testing it at the top of the loop, after the previous iteration's end() has
+ * already kept the turn, is exactly the leak.  abandon() is idempotent and
+ * costs nothing on a handle that never escalated, so it goes on every exit.
  */
 static int del_two(struct urcu_txn_hlist_node *a, struct urcu_txn_hlist_node *b)
 {
@@ -144,8 +154,6 @@ static int del_two(struct urcu_txn_hlist_node *a, struct urcu_txn_hlist_node *b)
 	for (;;) {
 		int prep, retry = 0, err = 0;
 
-		if (++spins > SPIN_LIMIT)
-			return -ETIMEDOUT;
 		urcu_txn_begin(&txn);
 		prep = urcu_txn_hlist_del_prepare(&txn, a);
 		if (prep == -EAGAIN)
@@ -160,21 +168,32 @@ static int del_two(struct urcu_txn_hlist_node *a, struct urcu_txn_hlist_node *b)
 				err = prep;
 		}
 		if (err) {
+			urcu_txn_abandon(&txn);
 			urcu_txn_end(&txn);
 			return err;
 		}
 		if (retry) {
 			urcu_txn_conflict(&txn);
+			if (++spins > SPIN_LIMIT) {
+				urcu_txn_abandon(&txn);
+				urcu_txn_end(&txn);
+				return -ETIMEDOUT;
+			}
 			urcu_txn_end(&txn);
 			continue;
 		}
 		st = urcu_txn_commit(&txn);
-		urcu_txn_end(&txn);
-		if (st == URCU_TXN_STATUS_OK)
+		if (st == URCU_TXN_STATUS_OK) {
+			urcu_txn_end(&txn);
 			return 0;
-		if (st == URCU_TXN_STATUS_ABORT)
+		}
+		if (st == URCU_TXN_STATUS_ABORT && ++spins <= SPIN_LIMIT) {
+			urcu_txn_end(&txn);
 			continue;
-		return -ENOMEM;
+		}
+		urcu_txn_abandon(&txn);
+		urcu_txn_end(&txn);
+		return st == URCU_TXN_STATUS_ABORT ? -ETIMEDOUT : -ENOMEM;
 	}
 }
 
