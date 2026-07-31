@@ -1806,6 +1806,15 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
  *   against the point-update operations remains the caller's
  *   responsibility.
  *
+ *   A ROOT-LEVEL attach into an EMPTY destination (key_len 0 /
+ *   dst_key_len 0) arbitrates against those concurrent peers on the
+ *   destination's root: a peer that populates the destination first wins,
+ *   and this call then reports POPULATED_ERROR (cds_ft_graft) or falls
+ *   through to the ordinary merge into a populated destination
+ *   (cds_ft_merge_at).  A peer holding the root mid-attach yields
+ *   CDS_FT_STATUS_BUSY_ERROR; the caller may retry.  In every outcome the
+ *   losing side keeps its keys -- neither op's content is discarded.
+ *
  *   CDS_FT_WRITER_LOCK_COARSE: writers serialize on one FT-wide writer
  *   lock per trie, so any mix of update operations may be called
  *   concurrently.
@@ -2067,6 +2076,15 @@ enum cds_ft_status cds_ft_merge(struct cds_ft *dst_ft,
  *   which is what removes the need to exclude writers on it.  Exclusion
  *   against the point-update operations remains the caller's
  *   responsibility.
+ *
+ *   A ROOT-LEVEL attach into an EMPTY destination (key_len 0 /
+ *   dst_key_len 0) arbitrates against those concurrent peers on the
+ *   destination's root: a peer that populates the destination first wins,
+ *   and this call then reports POPULATED_ERROR (cds_ft_graft) or falls
+ *   through to the ordinary merge into a populated destination
+ *   (cds_ft_merge_at).  A peer holding the root mid-attach yields
+ *   CDS_FT_STATUS_BUSY_ERROR; the caller may retry.  In every outcome the
+ *   losing side keeps its keys -- neither op's content is discarded.
  *
  *   CDS_FT_WRITER_LOCK_COARSE: writers serialize on one FT-wide writer
  *   lock per trie, so any mix of update operations may be called

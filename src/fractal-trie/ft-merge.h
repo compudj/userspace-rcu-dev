@@ -3167,12 +3167,36 @@ merge_spine_retry:
 	if (dst_key_len == 0 && cnt_dst == 0) {
 		struct cds_ft_inode *fresh_root;
 		struct cds_ft_metadata *fresh_meta;
+		struct cds_ft_metadata *dst_rmeta;
+		struct cds_ft_inode_flag *dst_root_fenced;
+		uintptr_t dst_root_snap;
 		struct cds_ft_inode *old_dst_root;
 		struct ft_flip_txn *appear_txn = NULL;
 		size_t sm;
+		int fence_ret;
+
+		/*
+		 * @cnt_dst was sampled far above, and an ENTIRE ft_detach_keylen of
+		 * the source runs before the swap below -- the widest empty-dst
+		 * window in the FT.  Re-decide emptiness UNDER the old root's
+		 * COPYING fence, so a contract-legal peer attach can no longer land
+		 * inside that window and be freed with the root it landed on.  On a
+		 * peer-populated dst, fall through to the DIVERGED path below (which
+		 * merges into a populated destination) exactly as an up-front
+		 * cnt_dst != 0 would have; on a held root, report BUSY.
+		 */
+		fence_ret = ft_root_attach_fence_empty(dst_ft, &dst_root_fenced,
+			&dst_rmeta, &dst_root_snap);
+		if (fence_ret == -EEXIST)
+			goto diverged;
+		if (fence_ret) {
+			status = CDS_FT_STATUS_BUSY_ERROR;
+			goto out;
+		}
 
 		fresh_root = alloc_cds_ft_node(src_ft, &ft_types[0], &fresh_meta);
 		if (!fresh_root) {
+			ft_meta_copying_clear(dst_rmeta);
 			status = CDS_FT_STATUS_MEMORY_ERROR;
 			goto out;
 		}
@@ -3194,6 +3218,7 @@ merge_spine_retry:
 		else
 			appear_txn = ft_flip_txn_create_bounded(2);
 		if (!appear_txn) {
+			ft_meta_copying_clear(dst_rmeta);
 			free_cds_ft_node_unpublished(src_ft, fresh_root);
 			status = CDS_FT_STATUS_MEMORY_ERROR;
 			goto out;
@@ -3202,6 +3227,7 @@ merge_spine_retry:
 		status = ft_detach_keylen(src_ft, src_key, src_key_len, &subtree);
 		if (status < 0) {
 			/* NOT_FOUND impossible: @src_ft had content. */
+			ft_meta_copying_clear(dst_rmeta);
 			if (appear_txn)
 				ft_flip_txn_destroy(appear_txn);
 			free_cds_ft_node_unpublished(src_ft, fresh_root);
@@ -3216,7 +3242,12 @@ merge_spine_retry:
 		 * the moved content.  @dst_ft was empty, so it adopts @subtree's
 		 * whole ordered cell list wholesale (head/tail endpoints only).
 		 */
-		old_dst_root = ft_node_ptr(dst_ft->root);
+		/*
+		 * The FENCED root, not a fresh read: under the fence the two are
+		 * equal by construction, and using the fenced value keeps the
+		 * retire, the swap's expected-old and the free naming ONE node.
+		 */
+		old_dst_root = ft_node_ptr(dst_root_fenced);
 		/*
 		 * Fuse the structural root swap with the ordered-list head/tail
 		 * transfer into ONE flip (ft_root_list_swap_publish), so a reader
@@ -3241,10 +3272,11 @@ merge_spine_retry:
 			 * relink_incoming = true); @subtree's sentinel resets to empty with
 			 * a plain store.
 			 */
-			ft_flip_txn_record_tombstone(appear_txn,
-				cds_ft_item_to_metadata(old_dst_root));
+			ft_flip_txn_record_tombstone_copying(appear_txn,
+				dst_rmeta, dst_root_snap);
+			ft_flip_txn_copying_register(appear_txn, dst_rmeta);
 			ft_root_list_swap_publish(dst_ft, appear_txn, &dst_ft->root,
-				dst_ft->root, subtree->root,
+				dst_root_fenced, subtree->root,
 				NULL, ft_ord_first(subtree),
 				NULL, ft_ord_last(subtree), subtree, true);
 			urcu_txn_list_init(&subtree->ord_sentinel);
@@ -3261,9 +3293,10 @@ merge_spine_retry:
 			 */
 			ft_flip_txn_record_reserved(appear_txn,
 				(void **) &dst_ft->root,
-				(void *) dst_ft->root, (void *) subtree->root);
-			ft_flip_txn_record_tombstone(appear_txn,
-				cds_ft_item_to_metadata(old_dst_root));
+				(void *) dst_root_fenced, (void *) subtree->root);
+			ft_flip_txn_record_tombstone_copying(appear_txn,
+				dst_rmeta, dst_root_snap);
+			ft_flip_txn_copying_register(appear_txn, dst_rmeta);
 			ft_flip_txn_commit(dst_ft, appear_txn);
 		}
 		FT_TP(root_publish, (const void *) dst_ft,
@@ -3281,6 +3314,7 @@ merge_spine_retry:
 		return CDS_FT_STATUS_OK;
 	}
 
+diverged:
 	/*
 	 * Sub-position source into a dst absent at @dst_key: graft the source
 	 * subtree IN PLACE (no detach, no re-root) so the build-invisible cluster

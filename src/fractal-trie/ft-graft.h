@@ -1146,22 +1146,37 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		return CDS_FT_STATUS_OK;
 
 	if (key_len == 0) {
-		struct cds_ft_metadata *dst_rmeta = ft_root_metadata(dst_ft);
+		struct cds_ft_metadata *dst_rmeta;
+		struct cds_ft_inode_flag *dst_root_fenced;
+		uintptr_t dst_root_snap;
 		struct cds_ft_inode *fresh_root;
 		struct cds_ft_metadata *fresh_meta;
 		struct cds_ft_inode *old_dst_root;
+		int fence_ret;
 
-		/* Destination must be empty for a root-level graft. */
-		if (ft_meta_nr_child(dst_rmeta) != 0 || dst_rmeta->external_nodes)
+		/*
+		 * Destination must be empty for a root-level graft -- decided
+		 * UNDER the old root's COPYING fence, which the swap below then
+		 * consumes as its fenced retire.  Testing emptiness unfenced and
+		 * swapping later let a contract-legal peer attach land in the
+		 * window and be freed with the old root.
+		 */
+		fence_ret = ft_root_attach_fence_empty(dst_ft, &dst_root_fenced,
+			&dst_rmeta, &dst_root_snap);
+		if (fence_ret == -EEXIST)
 			return CDS_FT_STATUS_POPULATED_ERROR;
+		if (fence_ret)
+			return CDS_FT_STATUS_BUSY_ERROR;
 
 		/*
 		 * Allocate a fresh empty root for the source before
 		 * swapping, so the source remains a valid trie.
 		 */
 		fresh_root = alloc_cds_ft_node(dst_ft, &ft_types[0], &fresh_meta);
-		if (!fresh_root)
+		if (!fresh_root) {
+			ft_meta_copying_clear(dst_rmeta);
 			return CDS_FT_STATUS_MEMORY_ERROR;
+		}
 
 		/*
 		 * The cross-trie dual root-swap txn.  Take the caller's PRE-RESERVED
@@ -1182,6 +1197,7 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 			dual_txn = ft_flip_txn_create_bounded(
 				FT_ROOT_LIST_SWAP_DUAL_MAX_EDGES + 1);
 			if (!dual_txn) {
+				ft_meta_copying_clear(dst_rmeta);
 				free_cds_ft_node_unpublished(dst_ft, fresh_root);
 				return CDS_FT_STATUS_MEMORY_ERROR;
 			}
@@ -1203,7 +1219,13 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		 * readers that entered before the swap finish their
 		 * descent first.
 		 */
-		old_dst_root = ft_node_ptr(dst_ft->root);
+		/*
+		 * The FENCED root -- not a fresh read of @dst_ft->root.  Under the
+		 * fence the two are equal by construction, and taking the fenced
+		 * value is what keeps the retire, the swap's expected-old and the
+		 * free all naming the SAME node.
+		 */
+		old_dst_root = ft_node_ptr(dst_root_fenced);
 		/*
 		 * Ordered list: dst was empty (checked above), so src's WHOLE
 		 * ordered list becomes dst's.  Cells' internal links are
@@ -1228,7 +1250,7 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		 * required.)
 		 */
 		{
-			struct cds_ft_inode_flag *dst_old = dst_ft->root;
+			struct cds_ft_inode_flag *dst_old = dst_root_fenced;
 			struct cds_ft_inode_flag *src_root = src_ft->root;
 			struct ft_ord_cell *src_head = ft_ord_first(src_ft);
 			struct ft_ord_cell *src_tail = ft_ord_last(src_ft);
@@ -1252,9 +1274,18 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 			 * so the mark and the root-swap unlink flip atomically (atomic
 			 * detach).  src_root MOVES to dst, fresh_root is the new src
 			 * root -- neither is freed here; only @old_dst_root == @dst_old.
+			 *
+			 * FENCED form: the expected-old is the mark's clean snapshot
+			 * with the fence bit, so a peer state change that slipped under
+			 * the fence ABORTS this commit instead of being ratified by a
+			 * late re-read.  Registering hands the fence to the txn -- the
+			 * commit consumes it in the {COPYING|s -> TOMBSTONE|s}
+			 * transition, an abort CAS-clears it back to LIVE -- so no bail
+			 * path past this point owes a clear.
 			 */
-			ft_flip_txn_record_tombstone(dual_txn,
-				cds_ft_item_to_metadata(ft_node_ptr(dst_old)));
+			ft_flip_txn_record_tombstone_copying(dual_txn, dst_rmeta,
+				dst_root_snap);
+			ft_flip_txn_copying_register(dual_txn, dst_rmeta);
 			ft_root_list_swap_publish_dual(dual_txn, &appear,
 				&disappear);
 		}

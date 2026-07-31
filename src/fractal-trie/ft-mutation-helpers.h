@@ -1407,6 +1407,100 @@ unsigned int ft_ord_sentinel_edges(struct cds_ft *ft,
 }
 
 /*
+ * Fence an EMPTY destination root for a whole-trie root-level attach, and
+ * decide emptiness UNDER that fence.
+ *
+ * WHY.  The empty-dst root swaps (cds_ft_graft key_len == 0, cds_ft_merge_at
+ * dst_key_len == 0 && cnt_dst == 0) used to test emptiness, then allocate, then
+ * create a txn, then -- on the merge -- run an ENTIRE ft_detach_keylen of the
+ * source, and only then record the swap.  The commit validates its RYW
+ * expected-olds, but both of them (@dst_ft->root and the old root's state word)
+ * are READ AT RECORD TIME, so a peer that populated the destination inside that
+ * window is matched by construction instead of detected.  The swap then retires
+ * and frees the populated root: the peer's keys vanish while BOTH ops report
+ * success, and the peer's nodes keep parent pointers into reclaimed memory.
+ * That interleaving is contract-LEGAL -- fractal-trie.h grants concurrent
+ * cross-trie attaches on a shared destination -- so it is the implementation
+ * that has to arbitrate.
+ *
+ * WHAT THE FENCE BUYS.  Every path that can populate this root must first take
+ * its COPYING: a republish goes through ft_node_recompact's {C,P,(GP)} acquire
+ * (C == the root), and an in-place attach's nr_child CAS honours
+ * FT_STATE_INPLACE_WAIT_MASK.  So once the mark is ours, both the root POINTER
+ * and the root's state WORD are stable through the commit, which is what makes
+ * "@dst_ft is empty" still true at the linearization point rather than merely
+ * true when it was sampled.  The caller records the FENCED tombstone
+ * (ft_flip_txn_record_tombstone_copying, expected-old @snap|COPYING) so any
+ * state change that did slip under the fence aborts the commit instead of being
+ * ratified -- and that restored exclusion is what ft_root_list_swap_publish's
+ * infallible commit has always assumed.
+ *
+ * @external_nodes is checked but NOT covered by the fence: no retire validates
+ * that word (a known, separate hole -- ft_insert_park_external_nodes publishes
+ * it with no lock).  It cannot be reached here by a CONTRACT-legal peer, since
+ * parking externals on the root needs either a point insert (not granted
+ * against an attach) or a nil-key root attach (blocked by this very fence).
+ *
+ * Returns 0 with @root_out / @meta_out / @snap_out set and the fence HELD (the
+ * caller owns its release: hand it to the txn via ft_flip_txn_copying_register,
+ * or ft_meta_copying_clear on a bail).  -EAGAIN if a peer holds the root or
+ * keeps republishing it; -EEXIST if the destination is not, or no longer,
+ * empty.
+ */
+#define FT_ROOT_FENCE_REREAD_MAX	4
+static inline
+int ft_root_attach_fence_empty(struct cds_ft *dst_ft,
+		struct cds_ft_inode_flag **root_out,
+		struct cds_ft_metadata **meta_out, uintptr_t *snap_out)
+{
+	unsigned int attempt;
+
+	for (attempt = 0; attempt < FT_ROOT_FENCE_REREAD_MAX; attempt++) {
+		/*
+		 * Resolve a peer's parked flip proxy, exactly as
+		 * ft_root_metadata does and for the same reason: a raw load of
+		 * the root slot can hand back a RECORD address mid-commit, and
+		 * ft_node_ptr only masks the node flags -- the tag survives and
+		 * cds_ft_item_to_metadata then dereferences the record as a node.
+		 * (Found the hard way: this helper segfaulted right here.)
+		 */
+		struct cds_ft_inode_flag *root =
+			ft_resolve_flip_proxy(rcu_dereference(dst_ft->root));
+		struct cds_ft_metadata *rmeta =
+			cds_ft_item_to_metadata(ft_node_ptr(root));
+		uintptr_t snap;
+
+		if (ft_meta_copying_mark(rmeta, &snap))
+			return -EAGAIN;
+		/*
+		 * The root pointer can have moved between the load and the mark
+		 * (a peer's recompact republishing it), leaving the fence on a
+		 * node that is already retired while a fresh one is live.  Drop
+		 * it and re-read: the peer's republish is a COMPLETED event, so
+		 * this converges -- but bound the turns anyway and report -EAGAIN
+		 * rather than spin against a stream of peers.
+		 */
+		if (ft_resolve_flip_proxy(rcu_dereference(dst_ft->root)) != root) {
+			ft_meta_copying_clear(rmeta);
+			continue;
+		}
+		/*
+		 * Emptiness from the MARK's clean snapshot -- the word the fence
+		 * froze -- not from a fresh read that could race the mark.
+		 */
+		if (ft_state_nr_child(snap) != 0 || rmeta->external_nodes) {
+			ft_meta_copying_clear(rmeta);
+			return -EEXIST;
+		}
+		*root_out = root;
+		*meta_out = rmeta;
+		*snap_out = snap;
+		return 0;
+	}
+	return -EAGAIN;
+}
+
+/*
  * Whole-trie root + ordered-list transfer, fused in ONE flip.  The empty-dst
  * root-level graft / cds_ft_merge_at appear (dst adopts a whole list), and the
  * src-retire disappear (src empties), publish the root transition @struct_old ->
