@@ -622,6 +622,17 @@ void urcu_txn_settle(struct urcu_txn_desc *t, unsigned int planted,
  * Load @slot and return the value it currently denotes, waiting a bounded spin
  * for an undecided owner to decide (so the returned value is stable), but never
  * driving it.  Use to read the current value of a word you intend to transact.
+ *
+ * CALL FROM WITHIN AN RCU READ-SIDE SECTION.  Resolving a proxy dereferences
+ * the parker's record and its descriptor, which are freed one grace period
+ * after that transaction commits; outside a read-side section this is a
+ * use-after-free on any busy system.
+ *
+ * THE WAIT IS BEST-EFFORT-BOUNDED.  On patience expiry it returns the resolve
+ * of a still-UNDECIDED parker -- that is, the parker's logical OLD, exactly
+ * what urcu_txn_read_optimistic() would have returned.  A caller that feeds a
+ * degraded result back as a store's expected old gets a doomed install if that
+ * parker later commits: one extra abort, never a wrong commit.
  */
 static inline
 void *urcu_txn_read(void **slot, uintptr_t tag)
@@ -653,6 +664,9 @@ void *urcu_txn_read(void **slot, uintptr_t tag)
  * transaction: the non-blocking counterpart of urcu_txn_read().  Safe for
  * a read set -- a stale optimistic read is reconciled at install (an extra abort,
  * never a wrong commit).
+ *
+ * CALL FROM WITHIN AN RCU READ-SIDE SECTION: resolving a proxy dereferences a
+ * peer's record and descriptor, which are call_rcu-freed after it commits.
  */
 static inline
 void *urcu_txn_read_optimistic(void **slot, uintptr_t tag)
