@@ -80,7 +80,7 @@
  * This header provides two layers:
  *
  *   1. The low-level flip group / proxy primitive above (urcu_txn_sw_group,
- *      urcu_txn_sw_proxy, urcu_txn_sw_proxy_get, urcu_txn_sw_commit).  The
+ *      urcu_txn_sw_proxy, urcu_txn_sw_proxy_get, urcu_txn_sw_group_commit).  The
  *      embedder allocates and reclaims the proxies, tags them, and routes
  *      resolution -- as in the four-step lifecycle described above.
  *

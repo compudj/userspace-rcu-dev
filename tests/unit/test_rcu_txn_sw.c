@@ -10,7 +10,7 @@
  *
  * commit() owns reclaim: it frees the txn at once on the single-edge / empty
  * paths and defers it through call_rcu() once proxies are parked.  The test
- * therefore runs under an RCU flavor (memb) and drains the deferred frees with
+ * therefore runs under an RCU flavor (QSBR) and drains the deferred frees with
  * rcu_barrier() before exit.
  */
 
