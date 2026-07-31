@@ -935,8 +935,22 @@ void *urcu_slab_alloc(struct urcu_slab *s, int cl)
 				URCU_SLAB_STAT(s, a_refill);
 				return urcu_slab_block(s, first);
 			}
-			/* migrated mid-install: hand the chain back atomically */
-			urcu_slab_push(&a->freelist, first);
+			/*
+			 * Raced, migrated or demoted mid-install: hand the WHOLE
+			 * chain back, node by node.  urcu_slab_push() overwrites
+			 * the node's next with the freelist head, so pushing only
+			 * @first would sever @rest -- a permanent leak of every
+			 * block accumulated since the last refill, on an
+			 * interleaving as benign as one same-cpu free landing
+			 * between our dry pop and the install.  The path is cold.
+			 */
+			while (first) {
+				struct cds_lfs_node *next = first->next;
+
+				cds_lfs_node_init(first);
+				urcu_slab_push(&a->freelist, first);
+				first = next;
+			}
 		}
 		goto carve;
 	}
