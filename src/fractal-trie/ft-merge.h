@@ -39,7 +39,9 @@ enum ft_graft_swap_case ft_merge_descend(struct cds_ft *ft,
 		const uint8_t *key, size_t key_len, struct ft_descent *d,
 		unsigned int *off_ret, unsigned long *count_ret)
 {
-	enum ft_graft_swap_case kase = ft_graft_swap_descend(ft, key, key_len, d);
+	struct cds_ft_inode_flag *raw;	/* the merge has no forward-edge plan to quote it */
+	enum ft_graft_swap_case kase = ft_graft_swap_descend(ft, key, key_len, d,
+			&raw);
 
 	switch (kase) {
 	case FT_GRAFT_SWAP_KEY_SHORTER:

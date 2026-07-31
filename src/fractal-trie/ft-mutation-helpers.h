@@ -4602,6 +4602,30 @@ struct ft_glue {
 	struct cds_ft_inode_flag **publish_slot;
 	struct cds_ft_inode_flag *top;
 	/*
+	 * PLAN-SNAPSHOT expected-old for that forward store (@publish_old_set).
+	 *
+	 * _ft_publish_to_parent's contract for @expected_old is "the value
+	 * @parent_slot held in the SNAPSHOT THE CALLER'S PUBLISH PLAN WAS DERIVED
+	 * FROM"; the glue committers used to satisfy it with `*g->publish_slot' --
+	 * a re-read taken at RECORD time, one instruction before the edge is
+	 * handed to the txn.  For a cluster whose plan was decided at the same
+	 * moment (an insert's diverge split) those are the same value and the
+	 * re-read is exact.  For a REPLACE whose plan names the displaced occupant
+	 * -- cds_ft_graft_swap, which extracts that occupant into another trie --
+	 * they are not: a peer that swapped the graft point between the descent
+	 * and this record makes the re-read report the PEER's content, so the
+	 * forward CAS ratifies a world this op never planned against.  It then
+	 * publishes over the peer's attach and re-roots its OWN stale occupant
+	 * elsewhere.  Setting the plan value here turns exactly that into a commit
+	 * ABORT, which a retry-capable caller re-descends on.
+	 *
+	 * A separate @publish_old_set flag because NULL is a legal slot value (a
+	 * publish into an empty slot).  Unset (ft_glue_init default) keeps the
+	 * record-time re-read, so every non-graft_swap caller is byte-identical.
+	 */
+	struct cds_ft_inode_flag *publish_old;
+	bool publish_old_set;
+	/*
 	 * MW LOCK_FINE drop (§11, cross-trie GLUE graft): the COPYING lock on
 	 * @publish_parent acquired BEFORE the point-of-no-return src-root swap.
 	 * Under the FT-wide-lock drop @publish_parent (a live dst spine node the
@@ -4746,6 +4770,8 @@ void ft_glue_init(struct ft_glue *g)
 	g->publish_parent = NULL;
 	g->publish_slot = NULL;
 	g->top = NULL;
+	g->publish_old = NULL;
+	g->publish_old_set = false;
 	g->publish_parent_holder = NULL;
 	g->publish_parent_snap = 0;
 	g->split_cn_holder = NULL;
@@ -5321,6 +5347,38 @@ void ft_glue_set_publish(struct cds_ft *ft, struct ft_glue *g,
 	g->publish_slot = parent_slot;
 	g->top = top;
 	ft_glue_defer_edge(ft, g, top, parent_nf, parent_slot);
+}
+
+/*
+ * The forward publish's expected-old: the PLAN-snapshot value when the builder
+ * recorded one (ft_glue_set_publish_old), else the record-time re-read every
+ * caller used before that hook existed.  See @publish_old at the struct.
+ */
+static
+struct cds_ft_inode_flag *ft_glue_publish_expected_old(const struct ft_glue *g)
+{
+	if (g->publish_old_set)
+		return g->publish_old;
+	return *g->publish_slot;
+}
+
+/*
+ * ft_glue_set_publish for a REPLACE whose plan named the slot's DISPLACED
+ * occupant: record @old as the forward edge's expected-old so the commit
+ * ratifies the world the plan was derived from.  @old is the RAW slot value
+ * read at descent (a SKIP_X form included) -- not a resolved flag, since it is
+ * compared against the slot itself.
+ */
+static
+void ft_glue_set_publish_old(struct cds_ft *ft, struct ft_glue *g,
+		struct cds_ft_inode_flag *parent_nf,
+		struct cds_ft_inode_flag **parent_slot,
+		struct cds_ft_inode_flag *top,
+		struct cds_ft_inode_flag *old)
+{
+	ft_glue_set_publish(ft, g, parent_nf, parent_slot, top);
+	g->publish_old = old;
+	g->publish_old_set = true;
 }
 
 /* Record an old (replaced) live node to reclaim deferred at commit. */
@@ -6222,7 +6280,7 @@ enum urcu_txn_status ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue 
 		g->publish_parent_snap = 0;
 	}
 	_ft_publish_to_parent(ft, g->publish_parent, g->publish_slot, g->top,
-		*g->publish_slot /* SW graft: still holds the old child */, &rec);
+		ft_glue_publish_expected_old(g), &rec);
 	for (j = 0; j < rec.n; j++)
 		ft_flip_txn_record_reserved(g->txn, (void **) rec.slot[j],
 			rec.old_val[j], rec.new_val[j]);
@@ -6648,7 +6706,7 @@ void ft_glue_publish(struct cds_ft *ft, struct ft_flip_txn *txn,
 	 */
 	ft_flip_txn_lock_or_guard_parent(ft, txn, g->publish_parent);
 	_ft_publish_to_parent(ft, g->publish_parent, g->publish_slot, g->top,
-		*g->publish_slot /* SW graft: still holds the old child */, &rec);
+		ft_glue_publish_expected_old(g), &rec);
 	n = ft_pub_rec_sedges(&rec, sedges);
 	/*
 	 * Order-statistics fold (BULK): record the +count_delta nr_keys walk
@@ -6691,7 +6749,7 @@ void ft_glue_publish_replace(struct cds_ft *ft, struct ft_flip_txn *txn,
 	 */
 	ft_flip_txn_lock_or_guard_parent(ft, txn, g->publish_parent);
 	_ft_publish_to_parent(ft, g->publish_parent, g->publish_slot, g->top,
-		*g->publish_slot /* SW graft: still holds the old child */, &rec);
+		ft_glue_publish_expected_old(g), &rec);
 	/* Order-statistics fold (BULK): see ft_glue_publish. */
 	if (g->count_delta)
 		ft_flip_txn_record_count_parent(ft, txn, g->publish_parent,

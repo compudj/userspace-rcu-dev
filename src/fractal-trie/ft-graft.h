@@ -2324,13 +2324,31 @@ enum ft_graft_swap_case {
  *                              @key is empty -- there is nothing to extract, so
  *                              the swap reduces to an insert (the caller routes
  *                              to the now-atomic cds_ft_graft).
+ *
+ * @raw_ret (EXACT / KEY_SHORTER): the graft-point slot's RAW content, read here
+ * at the descent's own cursor.  The caller quotes it as the forward publish's
+ * expected-old, so the edge that DISPLACES the occupant is decided by the same
+ * descent that told the extract side which occupant to RE-ROOT.  Re-reading the
+ * slot later -- at the caller's plan, or (worse) at record time inside the glue
+ * committer -- widens that gap: a peer that swaps the graft point in between
+ * makes the late read report the PEER's node, so the commit ratifies displacing
+ * content this op never planned to take while the extract side still moves the
+ * stale occupant into @swap_ft.  Both then own the same subtree.
+ *
+ * ★ IT MUST BE THE SLOT, NOT @d->nf.  ft_descent_step stores the REANCHORED
+ * resolution of the slot (ft_node_get_nth_reanchor_slot) while @d->nfp names
+ * the raw slot, so for a SKIP_X occupant the two differ -- and an expected-old
+ * that can never match turns the KEY_SHORTER legacy publish, whose commit
+ * status is dropped, into a silent no-op that still frees the replaced node.
  */
 static
 enum ft_graft_swap_case ft_graft_swap_descend(struct cds_ft *ft,
-		const uint8_t *key, size_t key_len, struct ft_descent *d)
+		const uint8_t *key, size_t key_len, struct ft_descent *d,
+		struct cds_ft_inode_flag **raw_ret)
 {
 	const uint8_t *ik = key;
 
+	*raw_ret = NULL;
 	ft_descent_init(d, ft);
 	for (; d->depth < key_len; ) {
 		if (ft_node_external(d->nf))
@@ -2350,6 +2368,7 @@ enum ft_graft_swap_case ft_graft_swap_descend(struct cds_ft *ft,
 				continue;
 			}
 			/* j == cmp == remaining < cn->len: key ends inside cn. */
+			*raw_ret = *d->nfp;
 			return FT_GRAFT_SWAP_KEY_SHORTER;
 		}
 		if (!ft_descent_step(ft, d, *(ik++)))
@@ -2357,6 +2376,7 @@ enum ft_graft_swap_case ft_graft_swap_descend(struct cds_ft *ft,
 	}
 	if (!d->nf)
 		return FT_GRAFT_SWAP_DELEGATE;	/* empty slot at key */
+	*raw_ret = *d->nfp;
 	return FT_GRAFT_SWAP_EXACT;
 }
 
@@ -2555,6 +2575,18 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		struct cds_ft_inode_flag *canon = NULL;
 		struct cds_ft_inode_flag *top_B = NULL;	/* extracted swap root, NULL = external/none */
 		struct cds_ft_compressed_node *ks_cn = NULL;	/* key-shorter original cn */
+		/*
+		 * The RAW graft-point slot value this attempt PLANNED against, as
+		 * the DESCENT read it (ft_graft_swap_descend's @raw_ret) -- the
+		 * displaced occupant the extract side is about to re-root into
+		 * @swap_ft.  It becomes the forward publish's expected-old
+		 * (ft_glue_set_publish_old), so a peer that swaps the graft point out
+		 * from under this attempt makes the commit ABORT instead of ratifying
+		 * a world this op never saw.  Raw, not @d.nf: the descent RESOLVES a
+		 * skip-compressed occupant, and the expected-old is compared against
+		 * the slot.
+		 */
+		struct cds_ft_inode_flag *gs_pub_old = NULL;
 		bool swap_empty;
 		bool old_child_external = false;
 		bool have_insert = false;
@@ -2626,12 +2658,14 @@ retry_swap:
 		canon = NULL;
 		top_B = NULL;
 		ks_cn = NULL;
+		gs_pub_old = NULL;
 		old_child_external = false;
 		have_insert = false;
 		empty_pruned = false;
 		gs_reserved = false;
 		gs_d_first = gs_d_last = gs_s_first = gs_s_last = NULL;
-		kase = ft_graft_swap_descend(dst_ft, key, key_len, &d);
+		kase = ft_graft_swap_descend(dst_ft, key, key_len, &d,
+				&gs_pub_old);
 		if (kase == FT_GRAFT_SWAP_DELEGATE) {
 			/*
 			 * No content at @key: the swap reduces to inserting swap_ft's
@@ -2744,7 +2778,7 @@ retry_swap:
 				struct cds_ft_metadata *merged_meta;
 				struct cds_ft_inode_flag *merged_flag, *merged_skip;
 				struct cds_ft_inode_flag **pub_slot;
-				struct cds_ft_inode_flag *pub_parent;
+				struct cds_ft_inode_flag *pub_parent, *pub_old;
 
 				merged = alloc_compressed_node(dst_ft, merged_len,
 						&merged_meta);
@@ -2780,6 +2814,13 @@ retry_swap:
 				 */
 				pub_slot = ft_resolve_parent_slot(pcn_meta, dst_ft,
 					&pub_parent);
+				/*
+				 * The plan value for THIS slot (the grandparent's,
+				 * not @d.nfp's): @merged was built from @pcn's bytes
+				 * read a few lines up, so the occupant read here is
+				 * the world the fuse planned against.
+				 */
+				pub_old = *pub_slot;
 				merged_meta->parent = pub_parent;
 				ft_set_parent_slot(merged_meta, pub_parent, pub_slot);
 				merged_flag = ft_compressed_node_flag(merged);
@@ -2795,8 +2836,8 @@ retry_swap:
 				free_compressed_node_unpublished(dst_ft, ccn);
 				merged_skip = ft_publish_compressed(dst_ft, merged,
 						merged_flag);
-				ft_glue_set_publish(dst_ft, &glue_insert, pub_parent,
-					pub_slot, merged_skip);
+				ft_glue_set_publish_old(dst_ft, &glue_insert,
+					pub_parent, pub_slot, merged_skip, pub_old);
 				ft_glue_defer_free(&glue_insert, pcn, true);
 				d.pnf = merged_flag;	/* structural edits target @merged */
 				have_insert = true;
@@ -2834,7 +2875,8 @@ retry_swap:
 			if (ft_node_compressed(top_A))
 				top_A = ft_publish_compressed(dst_ft,
 					ft_compressed_node_ptr(top_A), top_A);
-			ft_glue_set_publish(dst_ft, &glue_insert, d.pnf, d.nfp, top_A);
+			ft_glue_set_publish_old(dst_ft, &glue_insert, d.pnf, d.nfp,
+				top_A, gs_pub_old);
 			have_insert = true;
 		}
 
@@ -3072,9 +3114,10 @@ retry_swap:
 			/*
 			 * MW LOCK_FINE drop: a peer touched the contended dst spine between
 			 * this op's descent and its replace commit -- it relocated
-			 * @publish_parent, so ft_flip_txn_guard_parent's clean-live
-			 * expectation fails against the retired/re-homed parent word, or
-			 * its own edges conflicted.  A flip-txn commit is all-or-none, and with the
+			 * @publish_parent (ft_flip_txn_guard_parent's clean-live expectation
+			 * fails against the retired/re-homed parent word) or it swapped the
+			 * graft point out from under us (the forward record's expected-old
+			 * mismatches).  A flip-txn commit is all-or-none, and with the
 			 * swap-root retire now BELOW this point NOTHING has been published on
 			 * either side: dst is byte-for-byte as before and @swap_ft still holds
 			 * its full content.  The replace's apply_deferred did already rewrite
