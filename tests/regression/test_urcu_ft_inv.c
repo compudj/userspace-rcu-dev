@@ -78,7 +78,7 @@
  * compares the run count against this plan, so retiring a test means
  * decrementing here in the same commit.
  */
-#define NR_TESTS	(70 + NR_TESTS_REKEY_DLM)
+#define NR_TESTS	(71 + NR_TESTS_REKEY_DLM)
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -9362,6 +9362,218 @@ static int inv_empty_dst_root_merge_peer_nolist(void)
 		EMPTY_DST_MODE_MERGE, /*list_on=*/ false);
 }
 
+/* ================================================================== */
+/*                                                                    */
+/*   PREFIX-KEY PARK vs churn under its holder (external_nodes)       */
+/*                                                                    */
+/* ================================================================== */
+
+/*
+ * A key that TERMINATES at an internal node does not sit in a child slot: its
+ * chain head is published into that node's meta->external_nodes, by
+ * ft_insert_park_external_nodes, as a {NULL -> node} edge carrying only a
+ * READ-ONLY validate of the holder's state word.  No retire anywhere validates
+ * &meta->external_nodes.  So the standing question is whether a retire of the
+ * holder can swallow a head parked concurrently into it -- a lost insert in the
+ * insert/remove mix the contract fully supports (fractal-trie.h: cds_ft_insert
+ * "may run concurrently with cds_ft_insert and cds_ft_remove on the same trie,
+ * including on the same key").
+ *
+ * NOTHING in the suite drove that park concurrently at all: instrumented, the
+ * whole of ft_inv executed ft_insert_park_external_nodes 54246 times and NOT
+ * ONCE while a peer held the holder's COPYING fence; every concurrent-writer
+ * oracle here scored a flat zero, because they all use key sets in which no key
+ * is a proper prefix of another.
+ *
+ * This oracle supplies that shape.  Each pair of writers shares one holder:
+ *   - the PREFIX writer inserts and removes the 1-byte key {0x40+w}, which
+ *     terminates AT the holder -- the park;
+ *   - the CHILD writer inserts and removes {0x40+w, s}, churning the holder's
+ *     child set and driving its recompaction.
+ * The key layout is deliberately 1-byte-prefix + 2-byte-children so that NO
+ * single-child chain forms on the path: with a compressed prefix (the obvious
+ * {0xB1,w} + {0xB1,w,s,x} layout) the terminating key lands on the COMPRESSED
+ * node while its CHILD does the branching, so the two writers never touch one
+ * node and the whole exercise measures nothing.
+ *
+ * The check is exact and needs no linearization argument: a prefix key is owned
+ * by exactly one thread, so an insert that returned OK must be findable by that
+ * thread immediately afterwards.  A miss is a swallowed park.
+ *
+ * WHAT THIS DOES AND DOES NOT COVER -- stated because the numbers were the
+ * point.  It drives the park hard and exposed: ~670k parks per run land while a
+ * peer holds the holder's COPYING, all of them the {NULL -> node} first-publish
+ * arm.  It has NOT reproduced a loss (0 across ~50M ops), and instrumentation
+ * says why: those fences are the holder being locked as the PARENT {P} of a
+ * child's recompact -- a {COPYING|s -> s} RELEASE lock, which never copies the
+ * holder's body, so external_nodes cannot be lost through it.  A loss needs the
+ * holder to be the recompact's own target C, and across every shape tried
+ * ft_node_recompact was entered on a node carrying an external head ZERO times
+ * (1506437 entries one shape, 3293 another).  Forcing the window open (a 60us
+ * delay between the recompact's ext_snapshot read and its commit, 288 times
+ * against 2.2M concurrent parks) produced ZERO parks into the delayed node.
+ *
+ * So this is a REGRESSION GUARD, not a refutation: the hazard is real on paper
+ * and the arm is unvalidated, but the two halves do not meet in any shape that
+ * could be constructed.  If a future change makes a holder its own recompact
+ * target, this is what should go red.
+ */
+#define PREFIX_PARK_PAIRS	6	/* one prefix writer + one child writer each */
+#define PREFIX_PARK_SUFFIX	48	/* child bytes per holder */
+#define PREFIX_PARK_MS		1000
+
+static unsigned long prefix_park_lost;
+
+struct prefix_park_arg {
+	struct cds_ft *ft;
+	unsigned int w;
+	int child_writer;
+	unsigned long ops;
+};
+
+static void *prefix_park_writer(void *arg)
+{
+	struct prefix_park_arg *a = (struct prefix_park_arg *) arg;
+	struct cds_ft_iter *iter;
+	unsigned int seed = a->w * 2654435761u + (unsigned int) a->child_writer;
+
+	rcu_register_thread();
+	if (cds_ft_iter_create(a->ft, &iter) < 0)
+		abort();
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	while (!test_stop) {
+		uint8_t key[2] = { (uint8_t) (0x40 + a->w), 0 };
+		size_t klen = 1;
+		struct ft_test_node *n;
+
+		if (a->child_writer) {
+			key[1] = (uint8_t) (rand_r(&seed) % PREFIX_PARK_SUFFIX);
+			klen = 2;
+		}
+		n = node_alloc(a->w);
+		memcpy(n->okey, key, klen);
+		n->value = klen;
+		if (cds_ft_insert(a->ft, key, klen, &n->node)
+				!= CDS_FT_STATUS_OK) {
+			node_free(n);
+			continue;
+		}
+		if (!a->child_writer) {
+			struct cds_ft_node *out = NULL;
+
+			/*
+			 * @key is owned by this thread alone -- no peer inserts
+			 * or removes it -- so an insert that reported OK must be
+			 * findable NOW.  A miss is a park swallowed by a peer's
+			 * retire of the holder.
+			 */
+			rcu_read_lock();
+			if (cds_ft_eager_lookup_key(a->ft, key, klen, 0, &out)
+					!= CDS_FT_STATUS_OK
+					|| out != &n->node)
+				uatomic_inc(&prefix_park_lost);
+			rcu_read_unlock();
+		}
+		rcu_read_lock();
+		cds_ft_iter_set_key(iter, key, klen);
+		if (cds_ft_lookup(a->ft, iter) == CDS_FT_STATUS_OK) {
+			struct cds_ft_node *hd = cds_ft_iter_node(iter);
+
+			if (hd && cds_ft_remove(a->ft, iter, hd)
+					== CDS_FT_STATUS_OK)
+				node_free_rcu(to_test_node(hd));
+		}
+		rcu_read_unlock();
+		a->ops++;
+		rcu_quiescent_state();
+	}
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static int inv_prefix_key_park_vs_holder_churn(void)
+{
+	enum cds_ft_writer_strategy ws = CDS_FT_WRITER_LOCK_FINE;
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_varlen_nolist_ft_ws(&group, &ws);
+	pthread_t th[PREFIX_PARK_PAIRS * 2];
+	struct prefix_park_arg a[PREFIX_PARK_PAIRS * 2];
+	struct timespec t0;
+	unsigned int i;
+	unsigned long total = 0;
+	int ret = 0;
+
+	prefix_park_lost = 0;
+	/*
+	 * Seed every holder with children so the 1-byte prefix key always lands
+	 * on an INTERNAL node -- on an empty trie it would be a plain leaf and
+	 * never reach the external_nodes park at all.
+	 */
+	for (i = 0; i < PREFIX_PARK_PAIRS; i++) {
+		unsigned int s;
+
+		for (s = 0; s < PREFIX_PARK_SUFFIX; s++) {
+			uint8_t ck[2] = { (uint8_t) (0x40 + i), (uint8_t) s };
+			struct ft_test_node *n = node_alloc(9000 + s);
+
+			memcpy(n->okey, ck, 2);
+			n->value = 2;
+			if (cds_ft_insert(ft, ck, 2, &n->node)
+					!= CDS_FT_STATUS_OK)
+				abort();
+		}
+	}
+
+	test_go = 0;
+	test_stop = 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < PREFIX_PARK_PAIRS * 2; i++) {
+		a[i].ft = ft;
+		a[i].w = i / 2;
+		a[i].child_writer = (int) (i % 2);
+		a[i].ops = 0;
+		pthread_create(&th[i], NULL, prefix_park_writer, &a[i]);
+	}
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	test_go = 1;
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	while (elapsed_ms(&t0) < PREFIX_PARK_MS)
+		rcu_quiescent_state();
+	test_stop = 1;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < PREFIX_PARK_PAIRS * 2; i++) {
+		pthread_join(th[i], NULL);
+		total += a[i].ops;
+	}
+
+	fprintf(stderr, "# inv_prefix_key_park_vs_holder_churn: %lu ops, "
+		"%lu lost prefix inserts\n", total, prefix_park_lost);
+	if (prefix_park_lost) {
+		fprintf(stderr, "inv_prefix_key_park_vs_holder_churn: %lu "
+			"insert(s) reported OK but the key was absent -- a "
+			"parked external head was swallowed by a peer retire\n",
+			prefix_park_lost);
+		ret = -1;
+	}
+	/* A run that did no work proves nothing; say so rather than pass. */
+	if (total == 0) {
+		fprintf(stderr, "inv_prefix_key_park_vs_holder_churn: no ops\n");
+		ret = -1;
+	}
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "inv_prefix_key_park_vs_holder_churn: verify "
+			"failed\n");
+		ret = -1;
+	}
+	drain_trie_keep_group(ft);
+	rcu_barrier();
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
 static int inv_merge_root_src_cross_view(void)
 {
 	struct cds_ft_group *group;
@@ -15959,6 +16171,7 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_graft_cross_view);
 	RUN_TEST(inv_graft_root_swap_cross_view);
 	RUN_TEST(inv_merge_root_swap_cross_view);
+	RUN_TEST(inv_prefix_key_park_vs_holder_churn);
 	RUN_TEST(inv_empty_dst_root_graft_peer);
 	RUN_TEST(inv_empty_dst_root_graft_peer_nolist);
 	RUN_TEST(inv_empty_dst_root_merge_peer);
