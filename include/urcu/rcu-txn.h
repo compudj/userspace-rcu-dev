@@ -19,8 +19,10 @@
  *
  * Include AFTER an RCU flavor header (e.g. <urcu-qsbr.h>): the read-side bracket
  * and urcu_txn_commit() default to the compile-time-selected flavor's
- * rcu_read_lock / call_rcu, unless a flavor is bound with
- * urcu_txn_init_flavor().
+ * rcu_read_lock / call_rcu.  Binding a flavor with urcu_txn_init_flavor()
+ * redirects BOTH -- the bracket to its read_lock/read_unlock, commit's
+ * descriptor reclaim to its update_call_rcu.  A commit_flavor() caller passing
+ * its own deferral is responsible for passing one of the right flavor.
  *
  * SLOT LIFETIME -- RCU is an EXISTENCE guarantee here, not just a courtesy to
  * readers.  The backing memory of every transacted slot must outlive every
@@ -352,6 +354,8 @@ struct urcu_txn {
 	bool bloom_live;		/* @ryw_bloom is built (urcu_txn__bloom_arm) */
 	bool fb_published;		/* we raised domain->active and owe the clear */
 	bool retrying;			/* commit asked retry: keep the turn */
+	bool poison_abort;		/* the last ABORT was a poisoned chain, not
+					 * contention (urcu_txn_abort_was_poison) */
 	int in_fallback;		/* we currently hold the lane */
 	/* ---- cold below ---- */
 #ifdef URCU_TXN_ESCALATION_STATS
@@ -512,8 +516,21 @@ unsigned long urcu_txn_read_policy_evicted(const struct urcu_txn *txn)
  */
 
 /*
- * Initialize a handle before its retry loop, bracketing the txn's RCU read-side
- * section in @flavor (or the compile-time-selected flavor when NULL).
+ * Initialize a handle, bracketing the txn's RCU read-side section in @flavor
+ * (or the compile-time-selected flavor when NULL).
+ *
+ * A handle may be REUSED for any number of operations: aging is per operation,
+ * retired at every terminal outcome by urcu_txn__op_done(), so a burst of
+ * contention on one operation does not follow the handle into the next.  What
+ * survives is the descriptor-capacity warm start (@min_alloc, which tracks the
+ * last operation's size and self-corrects) and the declarations.
+ *
+ * @flavor is bound for the READ-SIDE BRACKET and for commit's reclaim
+ * deferral -- urcu_txn_commit() and urcu_txn_commit_sw() route through
+ * @flavor->update_call_rcu.  A handle transacting slots whose readers run a
+ * different flavor from the compile-time-selected one MUST bind that flavor,
+ * or the descriptor is freed after the wrong flavor's grace period while a
+ * reader is still resolving a proxy through it.
  */
 static inline
 void urcu_txn_init_flavor(struct urcu_txn *txn,
@@ -527,6 +544,16 @@ void urcu_txn_init_flavor(struct urcu_txn *txn,
 	 * why it sits last in the struct, so a single length covers everything
 	 * that does need clearing.  The handle is not shared at init, so the
 	 * plain clear covers @in_fallback too.
+	 */
+	/*
+	 * No !in_fallback assertion here, tempting as it is: init also runs on
+	 * a handle that was never initialized -- a raw stack frame, deliberately
+	 * dirtied in test_rcu_txn_beginless.c -- so reading the flag would trap
+	 * on garbage.  Re-initializing a handle that still holds the lane IS an
+	 * error (the clear below drops @in_fallback and @fb_published, so nothing
+	 * ever unlocks the fair mutex or clears domain->active and every later
+	 * begin() in the domain parks forever); it is stated as an obligation at
+	 * urcu_txn_commit_flavor() and urcu_txn_end() instead.
 	 */
 	memset(txn, 0, offsetof(struct urcu_txn, ryw_bloom));
 	txn->domain = domain;
@@ -582,6 +609,123 @@ unsigned long urcu_txn__eff_retry(const struct urcu_txn *txn)
 	return (txn->expect_conflict && txn->retry == 0) ? 1UL : txn->retry;
 }
 
+/*
+ * The deferral this handle's reclaim must use.  A bound flavor's grace period
+ * is the one its readers are counted by, so commit defers descriptor frees
+ * through it; an unbound handle uses the compile-time-selected flavor, which is
+ * also what the read-side bracket falls back to.
+ */
+static inline
+void (*urcu_txn__call_rcu(const struct urcu_txn *txn))(struct rcu_head *,
+		void (*)(struct rcu_head *))
+{
+	return txn->flavor ? txn->flavor->update_call_rcu : call_rcu;
+}
+
+/*
+ * Retire the PER-OPERATION state at a terminal outcome -- a committed OK, a
+ * MEMORY_ERROR, or urcu_txn_abandon().  Not on ABORT: aging must accumulate
+ * across the attempts of ONE operation, which is the whole point of it.
+ *
+ * Without this a handle reused across operations accumulates @retry forever,
+ * and nothing ever decrements it.  Once the cumulative count crosses the
+ * escalation budget, urcu_txn__self_qualifies() is permanently true: every
+ * later begin() takes the lane and publishes domain->active, funnelling every
+ * other writer in behind it, and the domain runs serialized for the rest of the
+ * process.  Silent -- the lane is correct, just serial -- and an absorbing
+ * state, so one transient contention burst is enough.
+ *
+ * @last_cost goes with it: it is documented as this operation's high-water
+ * cost, and the next operation re-learns it on its own first attempt, before
+ * any budget comparison with a non-zero @retry can happen.  @min_alloc does
+ * NOT: it is a descriptor-capacity warm start, it tracks the last operation's
+ * size rather than a maximum, and it cannot influence escalation policy.
+ */
+static inline
+void urcu_txn__op_done(struct urcu_txn *txn)
+{
+	txn->retry = 0;
+	txn->last_cost = 0;
+	txn->esc_pending = 0;
+	txn->poison_abort = 0;
+}
+
+/*
+ * Record WHY the commit refused, and shout about it in debug builds.
+ *
+ * A poisoned descriptor and a contention abort are the same return value, and
+ * they need opposite responses: contention is transient and the retry loop is
+ * right to spin, while a poison is DETERMINISTIC -- the embedder recorded a
+ * same-slot old that disagrees with its own pending new (feeding a
+ * urcu_txn_load_committed() result back as an expected old, or writing a slot
+ * twice on a disjoint-declared handle).  Every attempt then poisons, every
+ * commit ABORTs, and the loop spins forever, carrying the livelock INTO the
+ * escalation lane once @retry crosses the budget, where it holds the fair mutex
+ * while aborting and stalls every writer in the domain.  From outside it looks
+ * exactly like eternal contention, and the read-policy checker cannot see it
+ * (the loads involved are waiting loads).
+ *
+ * -DURCU_TXN_DEBUG_POISON prints the first occurrence; wrappers can assert on
+ * urcu_txn_abort_was_poison() in their own tests.
+ */
+static inline
+void urcu_txn__note_poison(struct urcu_txn *txn, int poisoned)
+{
+	txn->poison_abort = poisoned ? 1 : 0;
+#ifdef URCU_TXN_DEBUG_POISON
+	if (poisoned) {
+		static int warned;
+
+		if (!warned) {
+			warned = 1;
+			fprintf(stderr, "urcu-txn: commit ABORTed on a POISONED "
+				"descriptor: a same-slot record named an expected "
+				"old that disagrees with this transaction's own "
+				"pending new.  This is deterministic -- retrying "
+				"cannot clear it.  Check for a "
+				"urcu_txn_load_committed() result fed back as an "
+				"expected old, or a write-after-write on a handle "
+				"that declared urcu_txn_declare_disjoint().\\n");
+		}
+	}
+#endif
+}
+
+/*
+ * Was the last ABORT a poisoned same-slot chain rather than contention?  Valid
+ * from the ABORT until the next terminal outcome.  See urcu_txn__note_poison().
+ */
+static inline
+int urcu_txn_abort_was_poison(const struct urcu_txn *txn)
+{
+	return txn->poison_abort;
+}
+
+/*
+ * BEGIN-LESS DRIVING MODE.  The bracket urcu_txn_begin()/urcu_txn_end() opens
+ * and closes the RCU read-side section for you; these two let a caller own it
+ * instead, so one read-side section can span several transactions:
+ *
+ *	urcu_txn_init(&txn, dom);
+ *	urcu_txn_read_lock(&txn);
+ *	... loads / stores ...
+ *	st = urcu_txn_commit_flavor(&txn, call_rcu);
+ *	urcu_txn_read_unlock(&txn);
+ *
+ * WHAT THE MODE GIVES UP.  urcu_txn__want_fallback() is consulted by begin()
+ * and nowhere else, so a begin-less handle NEITHER TAKES NOR RESPECTS the
+ * escalation lane: however starved it gets it never escalates, and it never
+ * observes domain->active, so it keeps hammering optimistically straight
+ * through a peer's fallback episode -- its age-0 CAS installs invalidating the
+ * lane holder's olds, which is precisely the starvation the episode exists to
+ * stop.  Mixing begin-less and bracketed writers on ONE domain therefore voids
+ * the lane's rescue guarantee for everyone on it.  Pass a NULL domain, or use
+ * the bracket.
+ *
+ * The install strategy does still age (commit advances @retry), and the
+ * per-attempt state that begin() resets -- the write set, the RYW filter, the
+ * pending private abort -- is reset by the terminal outcomes instead.
+ */
 static inline
 void urcu_txn_read_lock(struct urcu_txn *txn)
 {
@@ -1029,10 +1173,30 @@ int urcu_txn_store_sw(struct urcu_txn *txn, void **slot,
 
 /*
  * Commit the buffered write-set (sw-mw-aware), deferring reclaim through
- * @call_rcu_fn.  Returns OK on commit, ABORT on a contention abort (MW-only; the
- * caller re-runs begin..commit), or MEMORY_ERROR on allocation failure.  Call
- * between begin and end.  See urcu_txn_commit_sw_flavor() for a write-set
- * known to be store_sw-only.
+ * @call_rcu_fn.  Call between begin and end.  See urcu_txn_commit_sw_flavor()
+ * for a write-set known to be store_sw-only.
+ *
+ * @call_rcu_fn MUST belong to the flavor whose readers can name the transacted
+ * slots -- for a handle bound with urcu_txn_init_flavor(), that is
+ * txn->flavor->update_call_rcu, which is what urcu_txn_commit() passes.  A
+ * grace period is flavor-scoped, so the wrong one frees the descriptor while a
+ * reader of the right one is still resolving a proxy through it.
+ *
+ * Returns:
+ *
+ *  - OK: published.  Terminal; the operation's aging state is retired.
+ *  - MEMORY_ERROR: allocation failed, NOTHING was published.  Terminal.
+ *  - ABORT: a contention abort (MW-only), an age-0 same-slot coincidence, or a
+ *    poisoned same-slot chain.  NOT terminal: the caller either re-runs
+ *    begin..commit, or gives up -- and giving up means calling
+ *    urcu_txn_abandon() BEFORE end().
+ *
+ * That last clause is an obligation, not advice.  An ABORT keeps the handle's
+ * FIFO turn so the retry does not go to the back of the queue, so an escalated
+ * handle whose bounded-retry loop just returns leaves the domain's fair mutex
+ * held forever; if the handle had published its episode, domain->active stays
+ * set too and every subsequent begin() in the domain parks behind a lane whose
+ * owner is gone.  Total writer deadlock, silent, undetectable at runtime.
  */
 static inline
 enum urcu_txn_status urcu_txn_commit_flavor(struct urcu_txn *txn,
@@ -1040,13 +1204,17 @@ enum urcu_txn_status urcu_txn_commit_flavor(struct urcu_txn *txn,
 			void (*)(struct rcu_head *)))
 {
 	struct urcu_txn_desc *m = txn->desc;
+	int poisoned;
 
 	if (caa_unlikely(m == URCU_TXN_ENOMEM)) {
 		txn->desc = NULL;
+		urcu_txn__op_done(txn);		/* terminal: nothing published */
 		return URCU_TXN_STATUS_MEMORY_ERROR;
 	}
-	if (!m)
+	if (!m) {
+		urcu_txn__op_done(txn);
 		return URCU_TXN_STATUS_OK;
+	}
 	if (caa_unlikely(txn->esc_pending)) {
 		txn->esc_pending = 0;
 		txn->min_alloc = m->nr;
@@ -1055,22 +1223,27 @@ enum urcu_txn_status urcu_txn_commit_flavor(struct urcu_txn *txn,
 		txn->desc = NULL;
 		txn->retry++;
 		txn->retrying = 1;
+		txn->poison_abort = 0;		/* an age-0 coincidence, not a poison */
 		return URCU_TXN_STATUS_ABORT;
 	}
 	txn->min_alloc = m->nr;
 	urcu_txn__learn_cost(txn);
 	txn->desc = NULL;
-	if (urcu_txn_desc_commit(m, call_rcu_fn))
+	poisoned = m->poisoned;		/* read before commit consumes @m */
+	if (urcu_txn_desc_commit(m, call_rcu_fn)) {
+		urcu_txn__op_done(txn);
 		return URCU_TXN_STATUS_OK;
+	}
 	txn->retry++;
 	txn->retrying = 1;
+	urcu_txn__note_poison(txn, poisoned);
 	return URCU_TXN_STATUS_ABORT;
 }
 
 static inline
 enum urcu_txn_status urcu_txn_commit(struct urcu_txn *txn)
 {
-	return urcu_txn_commit_flavor(txn, call_rcu);
+	return urcu_txn_commit_flavor(txn, urcu_txn__call_rcu(txn));
 }
 
 /*
@@ -1084,8 +1257,12 @@ enum urcu_txn_status urcu_txn_commit(struct urcu_txn *txn)
  * an age-0 same-slot coincidence (esc_pending -> re-run at age 1+, where find
  * resolves read-your-own-writes) and a torn same-slot read-set (poisoned).  A
  * handle that declared disjoint or expect_conflict never hits the age-0 case, so
- * such a genuinely single-writer commit is abort-free.  Debug builds assert
- * every record is SW-kind.
+ * such a genuinely single-writer commit is abort-free.
+ *
+ * The store_sw-only precondition is debug-asserted and, in release builds,
+ * FAIL-SAFE: a stray MW record makes the engine delegate to the sw-mw-aware
+ * commit -- which can then contention-abort -- rather than plain-store over a
+ * concurrent CAS.  Correct rather than fast; the precondition still stands.
  */
 static inline
 enum urcu_txn_status urcu_txn_commit_sw_flavor(struct urcu_txn *txn,
@@ -1093,13 +1270,17 @@ enum urcu_txn_status urcu_txn_commit_sw_flavor(struct urcu_txn *txn,
 			void (*)(struct rcu_head *)))
 {
 	struct urcu_txn_desc *m = txn->desc;
+	int poisoned;
 
 	if (caa_unlikely(m == URCU_TXN_ENOMEM)) {
 		txn->desc = NULL;
+		urcu_txn__op_done(txn);		/* terminal: nothing published */
 		return URCU_TXN_STATUS_MEMORY_ERROR;
 	}
-	if (!m)
+	if (!m) {
+		urcu_txn__op_done(txn);
 		return URCU_TXN_STATUS_OK;
+	}
 	if (caa_unlikely(txn->esc_pending)) {
 		txn->esc_pending = 0;
 		txn->min_alloc = m->nr;
@@ -1108,22 +1289,27 @@ enum urcu_txn_status urcu_txn_commit_sw_flavor(struct urcu_txn *txn,
 		txn->desc = NULL;
 		txn->retry++;
 		txn->retrying = 1;
+		txn->poison_abort = 0;		/* an age-0 coincidence, not a poison */
 		return URCU_TXN_STATUS_ABORT;
 	}
 	txn->min_alloc = m->nr;
 	urcu_txn__learn_cost(txn);
 	txn->desc = NULL;
-	if (urcu_txn_desc_commit_sw(m, call_rcu_fn))
+	poisoned = m->poisoned;		/* read before commit consumes @m */
+	if (urcu_txn_desc_commit_sw(m, call_rcu_fn)) {
+		urcu_txn__op_done(txn);
 		return URCU_TXN_STATUS_OK;
+	}
 	txn->retry++;			/* poisoned: torn read-set, re-run */
 	txn->retrying = 1;
+	urcu_txn__note_poison(txn, poisoned);
 	return URCU_TXN_STATUS_ABORT;
 }
 
 static inline
 enum urcu_txn_status urcu_txn_commit_sw(struct urcu_txn *txn)
 {
-	return urcu_txn_commit_sw_flavor(txn, call_rcu);
+	return urcu_txn_commit_sw_flavor(txn, urcu_txn__call_rcu(txn));
 }
 
 /*
@@ -1148,15 +1334,28 @@ unsigned int urcu_txn_last_cost(const struct urcu_txn *txn)
 
 /*
  * Give up on the transaction instead of re-attempting after an ABORT: forfeits
- * the FIFO turn so end() releases the lane.  Call before end().
+ * the FIFO turn so end() releases the lane, and retires the operation's aging
+ * state.  Call before end().  Idempotent, and harmless on a handle that never
+ * escalated -- a bounded-retry loop can call it on every give-up path without
+ * checking.
  */
 static inline
 void urcu_txn_abandon(struct urcu_txn *txn)
 {
 	txn->retrying = 0;
+	urcu_txn__op_done(txn);
 }
 
-/* End the attempt: close the RCU read-side section.  Always pair with begin. */
+/*
+ * End the attempt: close the RCU read-side section.  Always pair with begin.
+ *
+ * An escalated handle KEEPS its lane here while the last commit returned ABORT,
+ * so that the re-attempt does not go to the back of the FIFO.  A caller that
+ * ends the bracket without re-attempting -- a bounded-retry loop giving up, an
+ * error path, a timeout -- must therefore call urcu_txn_abandon() first, or the
+ * domain's lane is held forever and every other writer parks behind it.  See
+ * urcu_txn_commit_flavor().
+ */
 static inline
 void urcu_txn_end(struct urcu_txn *txn)
 {
