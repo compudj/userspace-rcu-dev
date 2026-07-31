@@ -29,14 +29,22 @@
  * A zero-filled region is a valid empty bitmap (all bits clear, bit 0 clear),
  * so demand-zero / calloc'd storage needs no init.
  *
- * The tag is FIXED at bit 0 here, where <urcu/rcu-txn-sw-hlist.h> lets the
- * embedder pick one: an hlist slot is a POINTER, whose spare alignment bits
- * cost nothing and which an embedder may already tag under its own scheme.  A
- * bitmap word has no spare bits -- every bit is data, and the tag is SPENT from
- * the data space -- so widening it would shrink BITS_PER_WORD and move every
- * logical bit's physical position.  Holding it at bit 0 keeps this header's
- * layout bit-for-bit identical to <urcu/rcu-txn-bitmap.h>, so one words[] array
- * can be handed to either front-end (not to both at once -- see PARITY below).
+ * The tag's POSITION is fixed at bit 0 here, where <urcu/rcu-txn-sw-hlist.h>
+ * lets the embedder pick one: an hlist slot is a POINTER, whose spare alignment
+ * bits cost nothing and which an embedder may already tag under its own scheme.
+ * A bitmap word has no spare bits -- every bit is data, and the tag is SPENT
+ * from the data space -- so moving it would move every logical bit's physical
+ * position.  Holding it at bit 0 keeps this header's layout bit-for-bit
+ * identical to <urcu/rcu-txn-bitmap.h>, so one words[] array can be handed to
+ * either front-end (not to both at once -- see PARITY below).
+ *
+ * URCU_TXN_SW_BITMAP_TAG can still WIDEN to a superset of bit 0, for an
+ * embedder whose words live in slots it already tags.  Two constraints, both
+ * structural: it must INCLUDE BIT 0 -- a settled word always has bit 0 clear,
+ * and that is exactly what makes every live value miss the tag pattern -- and
+ * it must fit the low 4 bits, which is the alignment room the parked value
+ * (&latch->proxy | TAG) has.  Widening does not shrink BITS_PER_WORD: the extra
+ * bits are borrowed from the LATCH ADDRESS, not from the word.
  *
  * LAYOUT.  The API operates on a caller-provided `uintptr_t *words` (the bitmap
  * is embedded wherever the caller wants -- inside a node, a metadata block, ...)
@@ -110,7 +118,25 @@
  *     weight, find_*) are per-word hints, not snapshots: they hold no proxy and
  *     resolve each word against its own moment, so a scan can straddle a range
  *     commit.  If you need an atomic multi-word snapshot, use
- *     <urcu/rcu-txn-bitmap.h> even under a single updater.
+ *     <urcu/rcu-txn-bitmap.h> even under a single updater.  That means "drive
+ *     the WHOLE bitmap through the twin", not "borrow its snapshot for a
+ *     bitmap this engine writes" -- see the handoff rule immediately below.
+ *
+ * NOT TO BOTH AT ONCE, and here is why.  The layouts are bit-for-bit identical
+ * and both engines spend bit 0, but the value they PARK there is not the same
+ * kind of thing: the concurrent engine parks a tagged pointer to an MCAS record
+ * whose descriptor carries a status word, and this one parks a tagged pointer
+ * to a flip latch whose group carries a selector.  A reader resolves whichever
+ * it finds through its OWN front-end's resolver, so a word parked by one and
+ * resolved by the other is decoded with the wrong layout: it follows a garbage
+ * pointer to a status or a selector that was never written.  The install
+ * disciplines are incompatible too -- CAS-install against a blind park -- so
+ * even the writers cannot arbitrate each other.
+ *
+ * THE HANDOFF RULE is therefore quiescence, not interleaving: every commit of
+ * the outgoing front-end must have RETURNED (so no proxy is parked and every
+ * word holds a settled value) before the first transaction of the incoming one
+ * begins.  There is no way to detect a violation at runtime.
  *
  * Include this header AFTER an RCU flavor header (e.g. <urcu-qsbr.h>): commit
  * reclaims parked proxies through that flavor's call_rcu().
@@ -133,6 +159,13 @@
 #ifndef URCU_TXN_SW_BITMAP_TAG
 #define URCU_TXN_SW_BITMAP_TAG	1UL
 #endif
+
+urcu_static_assert((URCU_TXN_SW_BITMAP_TAG & 1UL) == 1UL &&
+			(URCU_TXN_SW_BITMAP_TAG & ~0xFUL) == 0,
+		"URCU_TXN_SW_BITMAP_TAG must include bit 0 (which a settled word "
+		"always leaves clear) and fit the low 4 bits left free by the "
+		"16-byte latch alignment",
+		urcu_txn_sw_bitmap_tag_out_of_range);
 
 #ifdef __cplusplus
 extern "C" {
@@ -307,6 +340,15 @@ int urcu_txn_sw_bitmap__word_edit(struct urcu_txn_sw_txn *txn, uintptr_t *words,
  * Unlike this header's sw siblings, these compose freely on ONE bitmap: flips
  * of distinct bits sharing a word fuse into a single record.  See the header
  * intro.
+ *
+ * @txn MUST BE A DEFAULT HANDLE for that to hold.  The fusion IS the engine's
+ * read-your-own-writes pair, and urcu_txn_sw_declare_disjoint() switches it
+ * off: the load then returns the committed word and the record blindly
+ * appends, so two flips sharing a word are parked and settled in record order
+ * and the earlier one is silently lost.  63 logical bits share one physical
+ * word, so distinct bit indexes are NOT distinct slots.  Declare disjoint only
+ * for a LONE range, or for edits proven to fall in different words, with
+ * nothing else in the transaction.
  */
 static inline
 int urcu_txn_sw_bitmap_set_prepare(struct urcu_txn_sw_txn *txn, uintptr_t *words,
@@ -335,7 +377,8 @@ int urcu_txn_sw_bitmap_clear_prepare(struct urcu_txn_sw_txn *txn, uintptr_t *wor
  * multi-word update (each spanned word one edge).  Delivers the property a
  * per-bit atomic cannot: a reader never sees a torn range.  Overlapping an
  * earlier flip -- another range, or a single bit -- is fine: the shared words
- * fuse.
+ * fuse, ON A DEFAULT HANDLE.  Under declare_disjoint() there is no fusion and
+ * the overlap silently last-wins; see the single-bit prepares above.
  */
 static inline
 int urcu_txn_sw_bitmap__range_prepare(struct urcu_txn_sw_txn *txn, uintptr_t *words,
@@ -386,15 +429,24 @@ int urcu_txn_sw_bitmap_clear_range_prepare(struct urcu_txn_sw_txn *txn,
  *
  * One bit is one edge, so commit takes the engine's nr == 1 fast path: a lone
  * release store to the word, with no proxy, no group block and no grace period.
- * (Commit uses the compile-time-selected RCU flavor's call_rcu -- include a
- * flavor header first.)
+ *
+ * The one-latch INLINE handle is what makes that claim true end to end.  A
+ * default handle allocates its record array on the first record and frees it at
+ * commit, so these wrappers paid a heap or slab round-trip -- and carried a
+ * spurious MEMORY_ERROR return -- for a transaction that publishes with a
+ * single store.  Caller storage removes both; the engine never grows it,
+ * because one edge never overflows a one-latch buffer.  MEMORY_ERROR therefore
+ * cannot happen here any more, and the return is kept only so the signature
+ * matches the composable forms.  (Commit uses the compile-time-selected RCU
+ * flavor's call_rcu -- include a flavor header first.)
  */
 static inline
 enum urcu_txn_status urcu_txn_sw_bitmap_set_rcu(uintptr_t *words, size_t bit)
 {
+	struct urcu_txn_sw_latch buf[1];
 	struct urcu_txn_sw_txn txn;
 
-	urcu_txn_sw_init(&txn);
+	urcu_txn_sw_init_inline(&txn, buf, 1);
 	urcu_txn_sw_declare_disjoint(&txn);	/* single-op commit: one word, no same-slot WAW */
 	(void) urcu_txn_sw_bitmap_set_prepare(&txn, words, bit);
 	return urcu_txn_sw_commit(&txn);
@@ -403,9 +455,10 @@ enum urcu_txn_status urcu_txn_sw_bitmap_set_rcu(uintptr_t *words, size_t bit)
 static inline
 enum urcu_txn_status urcu_txn_sw_bitmap_clear_rcu(uintptr_t *words, size_t bit)
 {
+	struct urcu_txn_sw_latch buf[1];
 	struct urcu_txn_sw_txn txn;
 
-	urcu_txn_sw_init(&txn);
+	urcu_txn_sw_init_inline(&txn, buf, 1);
 	urcu_txn_sw_declare_disjoint(&txn);	/* single-op commit: one word, no same-slot WAW */
 	(void) urcu_txn_sw_bitmap_clear_prepare(&txn, words, bit);
 	return urcu_txn_sw_commit(&txn);

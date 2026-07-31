@@ -56,6 +56,14 @@
  * computes a rank after recording a flip must read through the _txn accessors;
  * see the block above urcu_txn_bitmap_test_rcu().
  *
+ * CONTENTION IS PER WORD, not per bit.  A commit touching bit i CAS-validates
+ * all 63 data bits of its word, so it aborts on any concurrent flip of a
+ * neighbour sharing that word -- and a set of an already-set bit (or a clear of
+ * an already-clear one) is not free: it still records a full-word {v -> v},
+ * which guards the whole word against every concurrent flip in it.  A caller
+ * that wants a redundant flip to cost nothing must test first and skip the
+ * store, accepting that it then forfeits that guard.
+ *
  * COMPOSITION / the transacted slot is the WORD, not the bit.  Composing
  * several _prepare flips in one transaction REQUIRES the default
  * (read-your-own-writes) handle.  63 logical bits share one physical word, so
@@ -80,7 +88,18 @@
 extern "C" {
 #endif
 
-/* Data bits per transacted word (bit 0 is the engine proxy tag). */
+/*
+ * Data bits per transacted word (bit 0 is the engine proxy tag).
+ *
+ * The words are uintptr_t but the width comes from CAA_BITS_PER_LONG, so the
+ * two must agree; on an LLP64 target they do not, and the top 32 bits of every
+ * word would be outside the model -- addressable by the masks, invisible to
+ * rank/weight.  Assert rather than assume.
+ */
+urcu_static_assert(sizeof(uintptr_t) * 8 == CAA_BITS_PER_LONG,
+		"urcu_txn_bitmap stores uintptr_t words but sizes them with "
+		"CAA_BITS_PER_LONG; the two must be the same width",
+		urcu_txn_bitmap_word_width_mismatch);
 #define URCU_TXN_BITMAP_BITS_PER_WORD	((size_t) (CAA_BITS_PER_LONG - 1))
 
 /* Number of transacted words needed to hold @nbits logical bits. */
