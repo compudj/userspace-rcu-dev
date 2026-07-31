@@ -91,8 +91,36 @@
  * reads the reader-visible "next"/first slots through the engine's
  * read-your-own-writes load (urcu_txn_sw_hlist_pending_next) and chains a
  * same-slot record rather than duplicating it, so adjacent deletes and the like
- * commit correctly.  The one obligation left to the caller: name the nodes
- * before editing them, not by traversing mid-bracket.
+ * commit correctly.
+ *
+ * TWO obligations are left to the caller, not one.
+ *
+ * (1) Name the nodes before editing them, not by traversing mid-bracket.
+ *
+ * (2) EVERY ANCHOR MUST STILL BE LIVE AS THIS TRANSACTION LEAVES THE LIST.  An
+ * op anchored on a node an EARLIER op of the same bracket deleted is a ghost
+ * anchor, and there is nothing here to detect it: unlike the concurrent
+ * sibling, a single-updater delete leaves no deletion mark, so a prepare cannot
+ * tell a deleted anchor from a live one.  Naming the node up front satisfies
+ * obligation (1) and says nothing about this.
+ *
+ * 1 -> 2 -> 3, one bracket: del_prepare(2) then add_after_prepare(9, 2).  The
+ * delete records {&1->next: 2 -> 3} -- it never touches &2->next -- so the add
+ * reads a pending_next of 3 off the ghost and records {&2->next: 3 -> 9}, a
+ * fresh record on a slot inside it, and overwrites the delete's 3->pprev with
+ * &9->next.  Pairwise-distinct slots, so install's duplicate scan passes under
+ * DEBUG_RCU, no record_chain old assert is reached, EXCL_VALIDATE sees one
+ * thread, and the commit reports OK.  The committed chain is 1 -> 3; node 9 is
+ * reachable only through the ghost, and 3->pprev names a slot no live node
+ * holds.  A LATER del_rcu(3) then follows that pprev, matches its old, commits
+ * into the unreachable node, and returns success -- while 1->next still names
+ * 3, which the caller frees.  Every reader walking 1 -> 3 then touches freed
+ * memory.
+ *
+ * The add_before and replace variants chain onto the delete's record instead
+ * and trip record_chain's pending-old assert under DEBUG_RCU; under NDEBUG they
+ * resurrect the deleted node into the committed chain.  Only the add_after form
+ * above is caught by nothing at all.
  *
  * Configurable proxy tag (a compile-time define, never stored in the head)
  * ----------------------------------------------------------------------
