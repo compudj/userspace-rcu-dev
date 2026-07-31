@@ -135,9 +135,18 @@
  * stripped read-your-own-writes path: it maintains the Bloom filter but never
  * consults the write set.  A same-skiplist batch, whose prepares alias by
  * construction, therefore flags the coincidence and ABORTS by design,
- * re-running at age 1+ where find resolves it.  The batch is correct either
- * way, but that first attempt is guaranteed wasted --
- * urcu_txn_expect_conflict() (<urcu/rcu-txn.h>) skips it.
+ * re-running at age 1+ where find resolves it.  That first attempt is
+ * guaranteed wasted -- urcu_txn_expect_conflict() (<urcu/rcu-txn.h>) skips it,
+ * and for a same-skiplist batch it is the right default, not a tuning knob.
+ *
+ * The abort is a complete safety net only for what the batch PUBLISHES.  A
+ * prepare's -EEXIST / -ENOENT is a verdict the caller acts on BEFORE commit, so
+ * the net would never fire: at age 0 the descent reads committed values, and a
+ * composed del(k)+insert(k) would report -EEXIST for the key it just deleted --
+ * deterministically, and reproducibly on a fresh handle.  Both prepares
+ * therefore report -EAGAIN instead whenever urcu_txn_tainted() says the attempt
+ * read its own writes blind.  Callers already treat -EAGAIN as retry; nothing
+ * else changes.
  *
  * Declaring the write set disjoint
  * --------------------------------
@@ -476,8 +485,23 @@ int urcu_txn_skiplist_insert_prepare(struct urcu_txn *txn,
 	 */
 	urcu_assert_debug(top < URCU_TXN_SKIPLIST_MAX_LEVELS);
 	cand = urcu_txn_skiplist_search(txn, sl, key, update, ssucc);
-	if (cand != NULL && sl->cmp(cand, key) == 0)
+	if (cand != NULL && sl->cmp(cand, key) == 0) {
+		/*
+		 * -EEXIST is a TERMINAL verdict the caller acts on, so it must
+		 * not be derived from a stale view.  On an age-0 attempt the
+		 * search's loads never consult the write set: a composed
+		 * del(k)+insert(k) descends exactly the slots the del recorded,
+		 * flags every coincidence -- and still returns the COMMITTED
+		 * values, so the node this transaction just deleted reads as
+		 * present.  The caller ends the bracket on -EEXIST, commit never
+		 * runs, and the esc_pending net never fires; a fresh handle
+		 * re-runs at age 0 and reproduces it.  Report a retry instead:
+		 * at age 1+ the write set is consulted exactly.
+		 */
+		if (caa_unlikely(urcu_txn_tainted(txn)))
+			return -EAGAIN;
 		return -EEXIST;
+	}
 	/*
 	 * Splice newp between the (pred, succ) pair search validated at each level:
 	 * pred[L].key < @key < succ[L].key (succ.key is strictly > @key since @key
@@ -549,8 +573,12 @@ int urcu_txn_skiplist_del_prepare(struct urcu_txn *txn,
 	 * the victim itself, since victim.key == @key) -- so pass NULL for @succ.
 	 */
 	node = urcu_txn_skiplist_search(txn, sl, key, update, NULL);
-	if (node == NULL || sl->cmp(node, key) != 0)
+	if (node == NULL || sl->cmp(node, key) != 0) {
+		/* stale-view verdict: see insert_prepare's -EEXIST */
+		if (caa_unlikely(urcu_txn_tainted(txn)))
+			return -EAGAIN;
 		return -ENOENT;			/* not present */
+	}
 	top = node->toplevel;
 	/*
 	 * Each level the node occupies: MARK node->next[L] (logical delete + the

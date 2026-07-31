@@ -49,7 +49,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS	11
+#define NR_TESTS	13
 
 /* Bound every retry loop so a livelock FAILS the test instead of hanging it. */
 #define SPIN_LIMIT	100000
@@ -468,6 +468,49 @@ static void test_delete_then_insert(void)
 	sl_drain(&sl);
 }
 
+/*
+ * SAME-KEY composition: a replace, del(k) + insert(k) in one bracket.
+ *
+ * This is where a prepare's TERMINAL verdict has to be right, and where the
+ * engine's age-0 safety net cannot help.  At age 0 the loads never consult the
+ * write set, so the insert's descent finds the node the delete just recorded
+ * and would answer -EEXIST for a key this transaction has already removed.  The
+ * caller acts on that and ends the bracket, so commit -- where esc_pending is
+ * consumed -- never runs, and a fresh handle reproduces it exactly.
+ *
+ * insert_prepare()/del_prepare() therefore report -EAGAIN whenever the attempt
+ * is tainted.  The batch driver retries, age 1+ resolves the read set, and the
+ * replace goes through.  A wrong -EEXIST here means the taint check is gone.
+ */
+static void test_same_key_replace(void)
+{
+	static const unsigned long seed[] = { 1, 4, 7 };
+	static const unsigned long want[] = { 1, 4, 7 };
+	struct urcu_txn_skiplist sl;
+	struct op ops[2];
+	struct node *fresh;
+	int ret;
+
+	sl_seed(&sl, seed, 3, 2);
+
+	/* del(4) + insert(4): same key, so the two prepares alias by design. */
+	fresh = node_alloc(4, 3);
+	ops[0] = (struct op){ .kind = OP_DEL, .sl = &sl, .key = 4 };
+	ops[1] = (struct op){ .kind = OP_INS, .sl = &sl, .newn = fresh };
+
+	ret = batch_commit(ops, 2);
+	ok(ret == 0 && keys_equal(&sl, want, 3),
+			"ryw: a same-key replace commits (ret %d): the insert does not "
+			"report -EEXIST for the key the delete just removed", ret);
+	/* the fresh node is the one now linked, and the old one came back out */
+	ok(ops[0].removed != NULL &&
+			caa_container_of(ops[0].removed, struct node, sl) != fresh,
+			"ryw: the replace swapped the node, it did not no-op");
+
+	free(caa_container_of(ops[0].removed, struct node, sl));
+	sl_drain(&sl);
+}
+
 /* --------------------------------------------------------------------- */
 /* 6-7. RYW: adjacent deletes, adjacent inserts.                          */
 /* --------------------------------------------------------------------- */
@@ -732,6 +775,7 @@ int main(void)
 	test_whitebox_chain();			/* 3 */
 	test_whitebox_retarget();		/* 4 */
 	test_delete_then_insert();		/* 5 */
+	test_same_key_replace();		/* 6, 7 */
 	test_adjacent_deletes();		/* 6 */
 	test_adjacent_inserts();		/* 7 */
 	test_del_plus_insert_published_pred();	/* 8 */
