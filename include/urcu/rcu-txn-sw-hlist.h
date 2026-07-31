@@ -124,8 +124,10 @@
  *
  * Configurable proxy tag (a compile-time define, never stored in the head)
  * ----------------------------------------------------------------------
- * Every slot of the hlist is transacted under URCU_TXN_SW_HLIST_TAG, the flip
- * proxy tag (<urcu/rcu-txn-sw.h>).  It is a compile-time define (default
+ * Every READER-VISIBLE slot of the hlist -- head-first and a node's next -- is
+ * transacted under URCU_TXN_SW_HLIST_TAG, the flip proxy tag
+ * (<urcu/rcu-txn-sw.h>).  pprev is NOT: it is writer-only state, plain-stored,
+ * as the preamble above explains.  It is a compile-time define (default
  * bit 0) rather than a per-call argument, so the head costs no
  * extra storage and call sites stay kernel-terse, and rather than a hard-coded
  * constant so an embedder whose head lives in a slot it already transacts under
@@ -156,8 +158,15 @@
  * for a single op the commit is one release store, with no proxy parked and so
  * no grace period owed.  Include this header AFTER an RCU flavor header.
  *
- * A mutator returns 0 or -1 to match the concurrent <urcu/rcu-txn-hlist.h>, but
- * the single-op forms below allocate nothing and cannot fail.  A caller
+ * A mutator returns an int with errors negative, so a source port from the
+ * concurrent <urcu/rcu-txn-hlist.h> compiles; the single-op forms below
+ * allocate nothing and cannot fail.  THE CONVENTIONS ARE NOT OTHERWISE THE
+ * SAME, and a mechanical migration breaks on the differences: there, del()
+ * returns 1/0 to say whether THIS call removed the node, and that bit is the
+ * reclaim gate -- here there is a single updater, so a delete always removed it
+ * and the forms return 0.  Port a del site that gated call_rcu on a 1 and it
+ * either stops reclaiming or double-frees.  The error codes differ too, and the
+ * concurrent forms take a struct urcu_txn_domain * these do not.  A caller
  * composing several ops into one bracket takes on the reserve()-up-front
  * obligation described above.
  */
@@ -178,11 +187,26 @@ extern "C" {
 /*
  * Flip proxy tag for every hlist slot (head-first and node next/pprev).
  * Override before include to drive the chain under an embedder's own tag.  Must
- * satisfy (value & TAG) != TAG for every live value any slot holds.
+ * satisfy (value & TAG) != TAG for every live value any slot holds, must be
+ * non-zero, and must fit the low 4 bits (see the assert below).
  */
 #ifndef URCU_TXN_SW_HLIST_TAG
 #define URCU_TXN_SW_HLIST_TAG	1UL
 #endif
+
+/*
+ * Two constraints, and neither was stated.  Non-zero: with tag 0 every plain
+ * value satisfies the proxy predicate, so a reader resolves live pointers as
+ * proxies.  Within the low 4 bits: the parked value is (&latch->proxy | TAG)
+ * and the latch array is only 16-byte aligned, so a wider tag either collides
+ * with an address bit -- making the OR a no-op and the untag reconstruct the
+ * wrong address -- or is simply not free.
+ */
+urcu_static_assert(URCU_TXN_SW_HLIST_TAG != 0 &&
+			(URCU_TXN_SW_HLIST_TAG & ~0xFUL) == 0,
+		"URCU_TXN_SW_HLIST_TAG must be non-zero and fit the low 4 bits "
+		"left free by the 16-byte latch alignment",
+		urcu_txn_sw_hlist_tag_out_of_range);
 
 struct urcu_txn_sw_hlist_node {
 	struct urcu_txn_sw_hlist_node *next;	/* node ptr; reader-visible */
@@ -231,6 +255,11 @@ struct urcu_txn_sw_hlist_node *urcu_txn_sw_hlist_next_rcu(
 	return urcu_txn_sw_hlist_resolve(rcu_dereference(node->next));
 }
 
+/*
+ * True iff the chain is empty.  CALL WITHIN AN RCU READ-SIDE SECTION, like the
+ * accessors it is built on: resolving a parked proxy dereferences the writer's
+ * group block, which is reclaimed a grace period after that writer commits.
+ */
 static inline
 int urcu_txn_sw_hlist_empty(struct urcu_txn_sw_hlist_head *head)
 {
@@ -470,8 +499,9 @@ int urcu_txn_sw_hlist_replace_prepare(struct urcu_txn_sw_txn *txn,
  *
  * With no allocation there is no failure path: commit cannot report
  * MEMORY_ERROR and these cannot return -1.  The int return is kept for source
- * compatibility and for parity with the concurrent <urcu/rcu-txn-hlist.h>,
- * whose same-named forms CAN fail.
+ * compatibility with the concurrent <urcu/rcu-txn-hlist.h>, whose same-named
+ * forms CAN fail -- shape only; see the preamble for the convention
+ * differences a port has to fix by hand, del()'s reclaim gate above all.
  */
 static inline
 int urcu_txn_sw_hlist_add_head_rcu(struct urcu_txn_sw_hlist_node *newp,

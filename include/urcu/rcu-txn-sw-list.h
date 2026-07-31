@@ -189,6 +189,11 @@ struct urcu_txn_sw_list_node *urcu_txn_sw_list_prev_rcu(
 	return urcu_txn_sw_list_resolve(rcu_dereference(node->prev));
 }
 
+/*
+ * True iff the list is empty.  CALL WITHIN AN RCU READ-SIDE SECTION, like the
+ * accessors it is built on: resolving a parked proxy dereferences the writer's
+ * group block, reclaimed a grace period after that writer commits.
+ */
 static inline
 int urcu_txn_sw_list_empty(struct urcu_txn_sw_list_head *head)
 {
@@ -207,10 +212,14 @@ int urcu_txn_sw_list_empty(struct urcu_txn_sw_list_head *head)
  * together), and settles each slot to its direct new target.  commit() owns
  * reclaim and defers the group block through call_rcu() after a grace period.
  *
- * A list op always transacts exactly two edges, so the txn's record-array
- * growth, single-edge fast path and abort path are unused here; the only cost
- * over a bespoke fixed proxy block is the record array and the group block,
- * freed together by one call_rcu.
+ * A LOW-LEVEL CONVENIENCE, not the shape the list ops below use.  A SINGLE list
+ * op transacts exactly two edges, which is where the "two" comes from -- but
+ * the _prepare forms exist precisely so several ops can share one bracket, and
+ * those carry more.  Nothing in this file calls this.
+ *
+ * PRECONDITION: @slot0 and @slot1 must be DISTINCT.  This records blindly, with
+ * no chaining, so two records on one slot are parked and settled in record
+ * order and the earlier edit is silently lost.
  *
  * Returns 0 on success, -1 on allocation failure.  An OOM in reserve()/record()
  * is sticky and surfaces as commit()'s MEMORY_ERROR, so only the final commit
@@ -227,6 +236,7 @@ int urcu_txn_sw_list_flip2(
 {
 	struct urcu_txn_sw_txn txn;
 
+	urcu_posix_assert(slot0 != slot1);	/* no chaining here: see above */
 	urcu_txn_sw_init(&txn);
 	(void) urcu_txn_sw_reserve(&txn, 2);	/* sticky OOM -> commit reports it */
 	(void) urcu_txn_sw_record(&txn, (void **) slot0, old0, new0, URCU_TXN_SW_LIST_PROXY_TAG);
