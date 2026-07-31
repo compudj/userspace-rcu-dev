@@ -1047,16 +1047,24 @@ struct cds_lfs_node *urcu_slab_take_floor(struct urcu_slab *s,
 	n = __cds_lfs_pop(&a->freelist);
 	if (!n) {
 		/*
-		 * Exempt from the budget: the drain needs exactly one
-		 * block to make progress, and refusing it would strand the
-		 * whole pending batch forever -- the freelist would stay empty,
-		 * so every later close would fail the same way.  Bounded
-		 * overrun: one superblock per arena.
+		 * Exempt from the budget REFUSAL, but not from its ledger: the
+		 * close needs exactly one block to make progress, and refusing
+		 * it would strand the whole pending batch forever -- the
+		 * freelist would stay empty, so every later close would fail the
+		 * same way.  So map unconditionally, and still account it: a
+		 * superblock is never unmapped, and nothing reconciles the count
+		 * later, so skipping the add would make every floor carve widen
+		 * the real footprint past URCU_TXN_SLAB_MAX_MB invisibly.  The
+		 * overrun is one superblock per floor carve -- not, as this
+		 * comment used to claim, one per arena.
 		 */
 		if (!a->sb || a->sb->bump + a->obj > URCU_SLAB_RANGE) {
-			struct urcu_slab_sb *nsb = urcu_slab_sb_new(s, a);
+			struct urcu_slab_sb *nsb;
 
+			uatomic_add(&s->nr_sb_total, 1);
+			nsb = urcu_slab_sb_new(s, a);
 			if (!nsb) {
+				uatomic_dec(&s->nr_sb_total);
 				cds_lfs_pop_unlock(&a->freelist);
 				return NULL;
 			}
