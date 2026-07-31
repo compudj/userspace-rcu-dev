@@ -434,10 +434,18 @@ int urcu_slab_class_of(const struct urcu_slab *s, size_t bytes)
 	return -1;
 }
 
+/*
+ * @ncpu doubles as the enable flag, and readers dereference ->arenas straight
+ * after seeing it non-zero -- so it is published with a release store and read
+ * with an acquire load.  The normal sequence (constructor, before threads) does
+ * not need it, but a constructor-spawned thread committing while another
+ * constructor is still inside urcu_slab_init() would otherwise be allowed to
+ * see the count without the arenas.
+ */
 static inline
 int urcu_slab_enabled(const struct urcu_slab *s)
 {
-	return s->ncpu > 0;
+	return uatomic_load(&s->ncpu, CMM_ACQUIRE) > 0;
 }
 
 /*
@@ -569,7 +577,7 @@ void urcu_slab_init(struct urcu_slab *s, const size_t *class_size, int nclass,
 				s->arenas[cl * (int) n + c].rseq_ok = 1;
 	}
 #endif
-	s->ncpu = (int) n;
+	uatomic_store(&s->ncpu, (int) n, CMM_RELEASE);	/* publishes ->arenas */
 #ifdef URCU_TXN_CACHE_STATS
 	if (urcu_slab_nreg < URCU_SLAB_MAX_REG)
 		urcu_slab_registry[urcu_slab_nreg++] = s;
