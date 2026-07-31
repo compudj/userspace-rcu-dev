@@ -29502,9 +29502,23 @@ static int rekey_merge_bail_run(long n, enum rkm_bail_knob knob)
 	 * knob wired to the wrong site, or to nothing, reads as a clean sweep.
 	 */
 	if (knob == RKM_KNOB_COMMIT) {
-		if (fired && drc != -EAGAIN) {
-			fprintf(stderr, "merge-bail(commit) n=%ld: forced abort returned "
-				"rc=%d, expected -EAGAIN\n", n, drc);
+		/*
+		 * ABSORBED, not surfaced.  The fold now retries on its own
+		 * persistent handle (the escalation lane it needs to make
+		 * progress under contention), so a ONE-SHOT forced abort is
+		 * unwound and the next attempt succeeds: the op returns 0.
+		 * This used to expect -EAGAIN, from when the fold was
+		 * single-shot and handed every transient code to its caller.
+		 *
+		 * The assertion that matters is unchanged and follows below --
+		 * the forced abort's unwind ran, the retry re-derived, and the
+		 * trie is coherent, complete, and still mutable (no leaked
+		 * COPYING).  Reaching that through a retry is a STRONGER
+		 * statement than reporting the abort was.
+		 */
+		if (fired && drc != 0) {
+			fprintf(stderr, "merge-bail(commit) n=%ld: forced abort was "
+				"not absorbed by the retry, rc=%d\n", n, drc);
 			goto out;
 		}
 		if (!fired && drc != 0) {

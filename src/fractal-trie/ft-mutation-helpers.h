@@ -457,6 +457,38 @@ struct ft_flip_txn *ft_flip_txn_create_bounded(unsigned int cap)
 }
 
 /*
+ * UNBOUNDED FT flip-txn bound to an op's persistent engine handle -- the
+ * growable sibling of ft_flip_txn_create_bounded_on, for a fold whose edge
+ * count is not known up front.
+ *
+ * WHY IT HAS TO EXIST: ft_flip_txn_create() inits its own handle with NO
+ * escalation domain ("no escalation domain under POC exclusion"), so an op
+ * built on it can NEVER escalate however many times it retries -- every
+ * attempt is a fresh handle, retry aging resets to zero, and
+ * urcu_txn__self_qualifies is never reached.  A contended writer then
+ * livelocks by construction rather than taking its FIFO turn.  Binding to
+ * @op is what makes the retry loop terminate.
+ *
+ * Keeps create()'s expect_conflict: a dense fold write set saturates the
+ * age-0 RYW Bloom and would false-positive a same-slot coincidence.
+ */
+static inline
+struct ft_flip_txn *ft_flip_txn_create_on(struct urcu_txn *op)
+{
+	struct ft_flip_txn *t = (struct ft_flip_txn *) malloc(sizeof(*t));
+
+	if (!t)
+		return NULL;
+	t->mtxn = op;
+	urcu_txn_expect_conflict(t->mtxn);
+	t->reserved = false;		/* unbounded: @mtxn grows as edges record */
+	t->nr_copying = 0;
+	t->acquire_miss = false;
+	t->structural_sw = false;
+	return t;
+}
+
+/*
  * Bounded FT flip-txn BOUND to an op's persistent engine handle (@op,
  * ft_txn_op_init'd before the op's restart_attempt loop and bracketed by
  * urcu_txn_begin()/urcu_txn_end() per attempt): the recording facade is this

@@ -461,12 +461,15 @@ bool ft_rekey_splice_pos_brackets(struct cds_ft *ft, const uint8_t *dst_ord,
  * DISJOINT (neither a prefix of the other), of EQUAL length, on a FIXED-length
  * group -- see the scope checks at the top of the body for why each is required.
  *
- * CONCURRENCY.  Abort-clean and single-shot: every bail leaves the trie byte-for-
- * byte as before, so a CONCURRENT caller retries by simply calling again (there is
- * no internal retry loop).  Returns 0; -EINVAL when the controlled shape above is
- * not met; or a TRANSIENT contention code to retry on -- -EIO (the graft's up-front
- * acquire lost a race), -EAGAIN (a cow_stop / detach acquire, an incoherently
- * derived splice position, or the final commit aborted), -ENOMEM (reserve).  The
+ * CONCURRENCY.  Abort-clean: every bail leaves the trie byte-for-byte as before.
+ * This function is ONE ATTEMPT; ft_rekey_graft_simple_locked wraps it in the
+ * retry loop that owns the persistent handle and the escalation turn, and
+ * ABSORBS the transient codes -- -EIO (the graft's up-front acquire lost a race)
+ * and -EAGAIN (a cow_stop / detach acquire, an incoherently derived splice
+ * position, or the final commit aborted).  Callers therefore see 0, -EINVAL
+ * (the controlled shape above is not met), or -ENOMEM (reserve).  Retrying
+ * externally is NOT equivalent and was the old arrangement: a fresh handle per
+ * call never ages, so a contended writer never qualifies for its turn.  The
  * concurrent oracles (inv_rekey_graft_{disjoint,shared,coherent_readers}) exercise
  * exactly that contract.  What is NOT yet multi-writer safe in general: a dst
  * splice neighbour INTERIOR to a peer's concurrently-moving run (see the splice
@@ -474,9 +477,10 @@ bool ft_rekey_splice_pos_brackets(struct cds_ft *ft, const uint8_t *dst_ord,
  * only by the per-FT move seqcount / relational coherence work.
  */
 static
-int ft_rekey_graft_simple_locked(struct cds_ft *ft,
+int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		const uint8_t *src_key, size_t src_len,
-		const uint8_t *dst_key, size_t dst_len)
+		const uint8_t *dst_key, size_t dst_len,
+		struct urcu_txn *optxn)
 {
 	uint8_t src_ord[FT_MAX_KEY_LEN], dst_ord[FT_MAX_KEY_LEN];
 	struct cds_ft_inode_flag *s_top, *s_top_prime = NULL, *attached_nf = NULL;
@@ -762,7 +766,13 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 
 	cnt = ft_nr_keys_get(s_top_meta);	/* subtree key count (count edges no-op if rank off) */
 
-	txn = ft_flip_txn_create();
+	/*
+	 * ON the op's persistent handle, not a standalone one: retry aging and
+	 * the FIFO escalation turn live in @optxn and must survive this attempt.
+	 * ft_flip_txn_create() inits a handle with NO domain, so every attempt
+	 * started fresh, never qualified for a turn, and simply spun.
+	 */
+	txn = ft_flip_txn_create_on(optxn);
 	if (!txn)
 		return -ENOMEM;
 
@@ -1601,6 +1611,50 @@ sweep:
 	if (!marks_consumed)
 		for (i = 0; i < nr_marks; i++)
 			ft_meta_copying_clear_if_held(marks[i]);
+	return ret;
+}
+
+/*
+ * Retry wrapper: the escalation lane the fold never had.
+ *
+ * Every bail in the attempt above is abort-clean (the trie is byte-for-byte as
+ * before), so retrying is just calling again -- but calling again is not enough
+ * on its own.  Progress under contention comes from AGING a PERSISTENT handle:
+ * urcu_txn_conflict() advances @optxn->retry, and once it reaches the fallback
+ * budget the writer takes its FIFO turn on the trie's escalation domain and
+ * commits without competition.  A fresh handle per attempt -- which is what the
+ * caller's external "just call again" loop produced -- resets that age to zero
+ * every time, so the writer never qualifies and spins instead.
+ *
+ * SCOPE: this arbitrates COMMITS.  It deliberately does NOT wrap the per-node
+ * COPYING acquires -- an escalated acquirer would hold its FIFO turn while
+ * spinning for a holder that is itself funnelled behind that turn (the circular
+ * wait documented at the FT-wide writer lock).  An acquire miss stays a clean
+ * bail that re-descends.
+ *
+ * -EINVAL (shape) and -ENOMEM are terminal; the transient contention codes the
+ * attempt documents (-EAGAIN, -EIO) are what this loop absorbs.
+ */
+static
+int ft_rekey_graft_simple_locked(struct cds_ft *ft,
+		const uint8_t *src_key, size_t src_len,
+		const uint8_t *dst_key, size_t dst_len)
+{
+	struct urcu_txn optxn;
+	int ret;
+
+	ft_txn_op_init(ft, &optxn);
+	for (;;) {
+		urcu_txn_begin(&optxn);
+		ret = ft_rekey_graft_simple_attempt(ft, src_key, src_len,
+			dst_key, dst_len, &optxn);
+		if (ret != -EAGAIN && ret != -EIO)
+			break;
+		/* Age the conflict and keep the turn, as cds_ft_replace does. */
+		urcu_txn_conflict(&optxn);
+		urcu_txn_end(&optxn);
+	}
+	urcu_txn_end(&optxn);
 	return ret;
 }
 
