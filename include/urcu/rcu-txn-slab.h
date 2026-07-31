@@ -515,17 +515,34 @@ int urcu_slab_class_of(const struct urcu_slab *s, size_t bytes)
 }
 
 /*
- * @ncpu doubles as the enable flag, and readers dereference ->arenas straight
- * after seeing it non-zero -- so it is published with a release store and read
- * with an acquire load.  The normal sequence (constructor, before threads) does
- * not need it, but a constructor-spawned thread committing while another
- * constructor is still inside urcu_slab_init() would otherwise be allowed to
- * see the count without the arenas.
+ * @ncpu doubles as the enable flag, and a caller that sees it non-zero
+ * dereferences ->arenas straight after -- so init publishes it with a RELEASE
+ * store, which orders the arena initialisation before the count on the writer
+ * side and costs nothing (it runs once).
+ *
+ * THE READ IS A PLAIN LOAD, DELIBERATELY.  This is on the allocation path, once
+ * per transaction, and making it an atomic load costs about 1.9 ns/txn -- ~5%
+ * of a two-record single-writer commit, measured.  It is not the ordering that
+ * costs: a CMM_RELAXED load measures the same as CMM_ACQUIRE, because either
+ * way the compiler stops caching @ncpu and reloads ->arenas, ->class_size and
+ * ->nclass behind it.  Only a plain load is free.
+ *
+ * PRECONDITION, which is what the acquire would otherwise have bought: NO
+ * TRANSACTION MAY RUN UNTIL EVERY CONSTRUCTOR HAS COMPLETED.  @ncpu and
+ * ->arenas are independent loads, so on a weakly-ordered machine a
+ * constructor-spawned thread committing while another constructor is still
+ * inside urcu_slab_init() could see the count without the arenas.  That is the
+ * one window, it is constructor-only, and the engines' slabs are initialized
+ * from liburcu-common's own constructor -- so an ELF object's dependencies are
+ * initialized before it, and any ordinary embedder is already past it.  (The
+ * static-linking caveat in src/urcu-txn.c covers the other half: a transaction
+ * that beats the constructor entirely just sees the slab disabled and falls
+ * back to exact allocation.)
  */
 static inline
 int urcu_slab_enabled(const struct urcu_slab *s)
 {
-	return uatomic_load(&s->ncpu, CMM_ACQUIRE) > 0;
+	return s->ncpu > 0;
 }
 
 /*
@@ -659,7 +676,13 @@ void urcu_slab_init(struct urcu_slab *s, const size_t *class_size, int nclass,
 				s->arenas[cl * (int) n + c].rseq_ok = 1;
 	}
 #endif
-	uatomic_store(&s->ncpu, (int) n, CMM_RELEASE);	/* publishes ->arenas */
+	/*
+	 * Publish LAST, with release: everything above -- the arena array, every
+	 * arena's lists, locks and class -- must be visible to anyone who sees a
+	 * non-zero count.  The matching read is plain; see urcu_slab_enabled()
+	 * for why, and for the precondition that carries the other half.
+	 */
+	uatomic_store(&s->ncpu, (int) n, CMM_RELEASE);
 #ifdef URCU_TXN_CACHE_STATS
 	if (urcu_slab_nreg < URCU_SLAB_MAX_REG)
 		urcu_slab_registry[urcu_slab_nreg++] = s;
