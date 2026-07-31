@@ -101,12 +101,39 @@ static void sorted_insert(int key)
 		struct urcu_txn_list_node *prev = &g_head.node, *succ;
 
 		urcu_txn_begin(&txn);
-		/* prev = last node with key <= @key; succ = first with key > @key */
+		/*
+		 * prev = last node with key <= @key; succ = first with key > @key.
+		 *
+		 * Navigate with the READER accessor -- it neither waits nor records,
+		 * which is right while we are only walking.  But the two slots we end
+		 * up writing must be RE-READ with the waiting in-bracket load before
+		 * they enter the write set: urcu_txn_list_next_rcu() resolves an
+		 * undecided parker to its logical OLD, so recording that value as the
+		 * expected old dooms the install the moment that parker commits.  That
+		 * is the read policy (see <urcu/rcu-txn.h>), and note that
+		 * URCU_TXN_DEBUG_READ_POLICY cannot catch a violation of it here: the
+		 * reader accessors never mark the slot, so the checker sees a blind
+		 * store and has nothing to compare against.
+		 */
 		for (;;) {
 			succ = urcu_txn_list_next_rcu(prev);
 			if (succ == &g_head.node || key_of(succ) > key)
 				break;
 			prev = succ;
+		}
+		{
+			void *pn = urcu_txn_load(&txn, (void **) &prev->next,
+					URCU_TXN_TAG);
+			void *sp = urcu_txn_load(&txn, (void **) &succ->prev,
+					URCU_TXN_TAG);
+
+			if (pn != (void *) succ || sp != (void *) prev) {
+				/* the pair moved under us: re-find */
+				urcu_txn_conflict(&txn);
+				urcu_txn_end(&txn);
+				ret = URCU_TXN_STATUS_ABORT;
+				continue;
+			}
 		}
 		n->node.next = succ;
 		n->node.prev = prev;

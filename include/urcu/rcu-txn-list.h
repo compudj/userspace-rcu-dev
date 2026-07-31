@@ -12,9 +12,17 @@
  * <urcu/rcu-txn-sw-list.h> (which requires writer mutual exclusion).
  *
  * Like the single-writer version, every structural change flips both
- * reader-visible edges -- forward and backward -- as ONE atomic event, so the
- * two directions never disagree.  Here that atomic event is an MCAS commit, and
- * multiple writers may run concurrently with bounded-blocking progress.
+ * reader-visible edges -- forward and backward -- as ONE atomic event, so no
+ * COMMITTED STATE ever has the two directions disagreeing.  Here that atomic
+ * event is an MCAS commit, and multiple writers may run concurrently with
+ * bounded-blocking progress.
+ *
+ * That is a claim about states, not about what a reader observes.  A reader is
+ * not a transaction: two loads at different instants can straddle a commit --
+ * read A->next == B before an insert commits, then B->prev == X after -- and so
+ * see the directions disagree although no state ever held both.  Reading a pair
+ * of edges consistently needs a transaction (urcu_txn_load_validate() on each,
+ * retrying on ABORT), exactly as reading several bitmap words does.
  *
  * Logical deletion (anchor invalidation)
  * --------------------------------------
@@ -23,11 +31,17 @@
  * MARK (bit 1; bit 0 is the engine's proxy tag -- nodes are >=4-byte aligned so
  * both are free).  A marked next means the node is logically deleted.
  *
- *   del(elem)  = one 3-edge MCAS:
+ *   del(elem)  = 3 edge stores:
  *                  &elem->next : next  -> MARK(next)     (logical delete)
  *                  &prev->next : elem  -> next           (unlink forward)
  *                  &next->prev : elem  -> prev           (unlink backward)
- *   insert     = one 2-edge MCAS, after checking the anchor's next is unmarked.
+ *   insert     = 2 edge stores.
+ *
+ * Both also fold in a load-validate guard on the neighbour whose next they do
+ * NOT write, so the committed descriptors carry 4 and 3 RECORDS respectively.
+ * A guard is a full conflict-set entry -- installed and settled like any other
+ * record, not a pre-check -- so it counts against urcu_txn_reserve() and it
+ * widens the conflict footprint; see the guard comments at the prepares.
  *
  * Why a "next"-only mark is enough (insert/delete coherence)
  * ----------------------------------------------------------
@@ -260,6 +274,12 @@ struct urcu_txn_list_node *urcu_txn_list_prev_rcu(
 	return urcu_txn_list_resolve((void *) rcu_dereference(node->prev));
 }
 
+/*
+ * True iff the list is empty.  CALL WITHIN AN RCU READ-SIDE SECTION, like the
+ * accessors it is built on: it resolves head->node.next, and resolving a parked
+ * proxy dereferences the writer's record and descriptor, which are reclaimed a
+ * grace period after that writer commits.
+ */
 static inline
 int urcu_txn_list_empty(struct urcu_txn_list_head *head)
 {
@@ -316,14 +336,29 @@ int urcu_txn_list_insert_after_prepare(struct urcu_txn *txn,
 	succ = (struct urcu_txn_list_node *) pn;	/* unmarked successor */
 
 	/*
-	 * We write &succ->prev but NOT &succ->next.  The next slot that serializes
-	 * this insert against del(succ) is &pos->next -- but the slot-sorted MCAS
-	 * may install &succ->prev BEFORE it reaches &pos->next, so the prev-side
-	 * store can be driven against a succ a concurrent del(succ) is freeing
-	 * (a foreign slot in the descriptor, e.g. a composing structure's, widens
-	 * this window).  Fold a load-validate of succ->next -- the slot del(succ)
-	 * marks -- into the write-set, so the prev side serializes against
-	 * del(succ) exactly as the next side does; a marked succ aborts here.
+	 * We write &succ->prev but NOT &succ->next, and fold in a load-validate of
+	 * succ->next -- the slot del(succ) marks -- so a marked succ aborts here.
+	 *
+	 * WHAT THIS IS AND IS NOT FOR.  It is not what makes the insert safe
+	 * against a concurrent del(succ): that is already closed twice over.
+	 * Memory safety, because every install and settle runs inside the
+	 * attempt's RCU read-side section, so a plant landing on a just-unlinked
+	 * node's prev is the loser-straggler the Reclaim section below declares
+	 * safe -- the grace period drains it, and the plant cannot touch freed
+	 * memory.  Commit atomicity, because any operation that removes or
+	 * replaces succ MUST rewrite the one forward edge naming it, &pos->next --
+	 * which this insert also writes, with old succ -- so insert-after and
+	 * del(succ) can never both commit, whatever the install order.
+	 *
+	 * What it buys is a pre-commit FAIL-FAST: -EAGAIN in the window where the
+	 * neighbour's mark is already visible but our own old-value check would
+	 * not fire until the install, plus serialization against del(neighbour)
+	 * one plant earlier.
+	 *
+	 * What it costs is one adjacency of extra conflict footprint, and that is
+	 * real: insert_after(A, X) guards &B->next while insert_before(C, Y)
+	 * writes it, so two logically disjoint edits that would commit in parallel
+	 * now abort each other.  Weigh that before copying the pattern.
 	 */
 	/*
 	 * Skip the guard when succ == pos (inserting after a self-looping node --
