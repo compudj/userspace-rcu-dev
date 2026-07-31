@@ -186,8 +186,27 @@ struct urcu_slab_arena {
 	/*
 	 * ---- CACHE LINE 2: cold, or written once ----
 	 */
-	unsigned long close_queued;	/* a fallback closer is in flight */
-	pthread_mutex_t boot;		/* serializes floor bootstrap only */
+	unsigned int close_queued;	/* a fallback closer is in flight */
+	/*
+	 * The local batch can only be closed by this arena's own cpu (its close
+	 * commits with an rseq critical section), so the fallback closer -- which
+	 * runs on the call_rcu worker, essentially never that cpu -- cannot do
+	 * it.  It leaves this behind instead, and the next deferred free on the
+	 * owning cpu closes the batch and clears it.  Two 32-bit flags share the
+	 * word the single close_queued used to occupy, so the arena stays 4 lines.
+	 */
+	unsigned int close_local_req;	/* the closer wants the local batch closed */
+	/*
+	 * Serializes the floor bootstrap AND the batch close.  Both are
+	 * close-side-only state, so a per-arena mutex costs the free fast path
+	 * nothing: bootstrap runs once per arena ever, and a close is taken with
+	 * pthread_mutex_trylock() -- a closer that finds the arena already being
+	 * closed simply lets that closer cover it.
+	 *
+	 * Lock order is boot -> freelist pop lock (urcu_slab_take_floor() runs
+	 * under boot); nothing takes boot while holding the pop lock.
+	 */
+	pthread_mutex_t boot;
 	struct urcu_slab *slab;		/* owning slab */
 	int idx;			/* this arena's index within slab->arenas */
 	int cls;			/* size class */
@@ -591,6 +610,7 @@ void urcu_slab_init(struct urcu_slab *s, const size_t *class_size, int nclass,
 			a->rseq_ok = 0;
 			a->nr_pending = 0;
 			a->close_queued = 0;
+			a->close_local_req = 0;
 			a->obj = class_size[cl];
 		}
 	}
@@ -930,7 +950,15 @@ void urcu_slab_drain_local(struct urcu_slab_arena *a)
 		cds_lfs_node_init(n);
 		urcu_slab_push(&a->pending, n);
 		n = next;
+		moved_pending = 1;
 	}
+	/*
+	 * Those blocks are owed a grace period and now sit on ->pending, where
+	 * only a close can reach them.  Nothing else will arm one: the cpu whose
+	 * frees used to do it is exactly the cpu that just went away.
+	 */
+	if (moved_pending)
+		urcu_slab_arm_closer(a->slab, a);
 }
 
 /*
@@ -1221,19 +1249,62 @@ void urcu_slab_splice_cb(struct rcu_head *rh)
 			CMM_SEQ_CST, CMM_SEQ_CST) != old);
 }
 
+/*
+ * A close is the one operation on an arena that is not self-serializing, so it
+ * runs under @boot, taken with trylock: a closer that finds the arena already
+ * being closed lets that closer do the work rather than queueing behind it.
+ * Nothing here is on the free fast path -- the threshold trips once per
+ * batch_max blocks, the fallback closer once per grace period.
+ */
+static inline
+int urcu_slab_close_trylock(struct urcu_slab_arena *a)
+{
+	return pthread_mutex_trylock(&a->boot) == 0;
+}
+
+static inline
+void urcu_slab_close_unlock(struct urcu_slab_arena *a)
+{
+	(void) pthread_mutex_unlock(&a->boot);
+}
+
 #ifdef URCU_SLAB_RSEQ
 /*
- * Close ->local_pending and arm its splice.  Must run on the arena's own cpu;
- * the critical section's cpu check enforces that, and its rseq_ok check makes a
- * demote evict us.
+ * Close ->local_pending and arm its splice.  Caller holds the close lock.
+ *
+ * MUST run on the arena's own cpu.  The critical section's cpu check does NOT
+ * enforce that by itself: it compares @cpu against the cpu the section runs on,
+ * so a caller passing its own current cpu makes it a tautology and the section
+ * commits a plain store into another cpu's list -- against which nothing
+ * arbitrates, because rseq atomicity is scoped to one cpu.  The owner's
+ * concurrent push and this close would then both pass their compares and both
+ * commit: either the pushed block is dropped from the list (a GP-owed block
+ * that is never spliced) or the batch we just recorded stays reachable through
+ * ->local_pending and gets spliced a SECOND time, which puts one block on the
+ * freelist twice.  Hence the explicit comparison below.
+ *
+ * A caller on the wrong cpu leaves a request instead; the next deferred free on
+ * the owning cpu picks it up (see urcu_slab_free_pending()).
  */
 static inline
 int urcu_slab_close_local(struct urcu_slab *s, struct urcu_slab_arena *a, int cpu)
 {
 	struct cds_lfs_node *head, *tail, *new_floor;
 
-	if (!a->local_floor || !s->call_rcu_fn)
+	if (!uatomic_load(&a->local_floor, CMM_RELAXED) ||
+			!uatomic_load(&s->call_rcu_fn, CMM_RELAXED))
 		return 0;
+	if (cpu != a->cpu) {
+		/*
+		 * Racy off-cpu reads, deliberately: they only decide whether to
+		 * leave a request, and an over-request costs one extra close
+		 * attempt.
+		 */
+		if (uatomic_load(&a->local_pending, CMM_RELAXED) !=
+				uatomic_load(&a->local_floor, CMM_RELAXED))
+			uatomic_store(&a->close_local_req, 1, CMM_RELAXED);
+		return 0;
+	}
 	head = RSEQ_READ_ONCE(a->local_pending);
 	if (head == a->local_floor)
 		return 0;				/* nothing pushed */
@@ -1262,6 +1333,14 @@ int urcu_slab_close_local(struct urcu_slab *s, struct urcu_slab_arena *a, int cp
  * Close the open batch and arm its splice.  One xchg takes the chain and
  * installs the next floor; the outgoing floor becomes the batch's tail and
  * carries its rcu_head.  Returns 1 if a batch was closed.
+ *
+ * Caller holds the close lock.  Without it two closers both recall @floor as
+ * the batch tail -- it is read and written plainly here, and the batch_max
+ * trigger is deliberately imprecise, so two freeing threads (or a freeing
+ * thread and the fallback closer) reach this concurrently.  Both would then
+ * queue the SAME rcu_head into call_rcu, corrupting the callback queue, and the
+ * loser's chain would be recorded with a tail that is not its own: one closer's
+ * whole chain orphaned, and the freelist truncated where the splice lands.
  */
 static inline
 int urcu_slab_close_and_arm(struct urcu_slab *s, struct urcu_slab_arena *a)
@@ -1269,7 +1348,7 @@ int urcu_slab_close_and_arm(struct urcu_slab *s, struct urcu_slab_arena *a)
 	struct cds_lfs_head *chain;
 	struct cds_lfs_node *new_floor, *tail;
 
-	if (!a->floor || !s->call_rcu_fn)
+	if (!a->floor || !uatomic_load(&s->call_rcu_fn, CMM_RELAXED))
 		return 0;
 	if (uatomic_load(&a->pending.head, CMM_RELAXED) ==
 			caa_container_of(a->floor, struct cds_lfs_head, node))
@@ -1291,9 +1370,44 @@ int urcu_slab_close_and_arm(struct urcu_slab *s, struct urcu_slab_arena *a)
 }
 
 /*
+ * Close both of @a's open batches -- the rseq-local one (own cpu only) and the
+ * atomic one -- under the arena's close lock.  @cpu is the CALLER's cpu, or -1
+ * when it has none to offer.
+ *
+ * Returns 1 if a batch was closed.  A failed trylock returns 0 even though
+ * another closer is running: it may have sampled the pending head before our
+ * push, so our block is in the batch it did NOT take, and the caller should arm
+ * the fallback closer.
+ */
+static inline
+int urcu_slab_close_arena(struct urcu_slab *s, struct urcu_slab_arena *a, int cpu)
+{
+	int closed;
+
+	if (!urcu_slab_close_trylock(a))
+		return 0;
+#ifdef URCU_SLAB_RSEQ
+	closed = urcu_slab_close_local(s, a, cpu);
+#else
+	(void) cpu;
+	closed = 0;
+#endif
+	closed |= urcu_slab_close_and_arm(s, a);
+	urcu_slab_close_unlock(a);
+	return closed;
+}
+
+/*
  * Fallback closer: a trickle of frees may never reach batch_max, so the first
  * push of a batch also arms this.  It closes whatever is open one grace period
  * later, and re-arms only while frees keep arriving.
+ *
+ * The re-arm condition covers the ATOMIC batch only.  The local batch cannot be
+ * closed from here (this runs on the call_rcu worker, essentially never the
+ * arena's own cpu), so re-arming for it would queue one callback per grace
+ * period forever on a cpu that has gone quiet -- and keep taking grace periods
+ * to do it.  urcu_slab_close_local() latches a request instead.  The residual
+ * is stated at urcu_slab_free_pending().
  */
 static inline
 void urcu_slab_closer_cb(struct rcu_head *head)
@@ -1301,13 +1415,14 @@ void urcu_slab_closer_cb(struct rcu_head *head)
 	struct urcu_slab_arena *a = caa_container_of(head,
 			struct urcu_slab_arena, close_head);
 	struct urcu_slab *s = a->slab;
+	int cpu = -1;
 
-	uatomic_store(&a->close_queued, 0, CMM_SEQ_CST);
 #ifdef URCU_SLAB_RSEQ
-	if (urcu_slab_rseq_ready() && uatomic_load(&a->rseq_ok, CMM_RELAXED))
-		(void) urcu_slab_close_local(s, a, rseq_current_cpu_raw());
+	if (urcu_slab_rseq_ready())
+		cpu = rseq_current_cpu_raw();
 #endif
-	(void) urcu_slab_close_and_arm(s, a);
+	uatomic_store(&a->close_queued, 0, CMM_SEQ_CST);
+	(void) urcu_slab_close_arena(s, a, cpu);
 	/*
 	 * Clear before re-checking, so a push racing us either sees
 	 * close_queued == 0 and arms a closer itself, or landed early enough
@@ -1315,28 +1430,68 @@ void urcu_slab_closer_cb(struct rcu_head *head)
 	 */
 	if (a->floor &&
 			uatomic_load(&a->pending.head, CMM_RELAXED) !=
-				caa_container_of(a->floor, struct cds_lfs_head, node) &&
-			uatomic_cmpxchg(&a->close_queued, 0, 1) == 0)
-		s->call_rcu_fn(&a->close_head, urcu_slab_closer_cb);
+				caa_container_of(a->floor, struct cds_lfs_head, node))
+		urcu_slab_arm_closer(s, a);
 }
 
 /*
- * Free @block to its origin arena's PENDING stack rather than to the freelist.
- * The block does NOT become allocatable here: it does so only when
- * urcu_slab_drain() moves the batch across, so the caller owes the grace period
- * BEFORE that drain, not before this call.
+ * Free @block to its origin arena's PENDING stack rather than to the freelist,
+ * BEFORE its grace period has elapsed.  The slab supplies the deferral: the
+ * block becomes allocatable only when the batch it lands in is closed and then
+ * spliced by urcu_slab_splice_cb(), one grace period after the close.  So the
+ * caller owes the grace period at the SPLICE, not at this call -- which is the
+ * whole difference from urcu_slab_free().
  *
- * That is the whole point.  Deferring through call_rcu() costs a function
+ * That is also the whole point.  Deferring through call_rcu() costs a function
  * pointer stored per block and a per-block visit by the worker to invoke it,
  * over blocks gone cold during the grace period; here the destination is
  * implicit, so a batch is retired without the worker reading a single one of
- * them.  An embedder opts in by passing urcu_txn_desc_commit() a deferral
- * function that calls urcu_txn_free() directly instead of call_rcu(), and by
- * driving urcu_slab_drain() after each grace period.
+ * them.
  *
- * Callers that keep the stock call_rcu() deferral must keep using
- * urcu_slab_free(): the two paths must not be mixed on one arena, because the
- * drain assumes everything on @pending shares one grace period.
+ * OPTING IN.  An embedder passes urcu_txn_desc_commit() (or the sw engine's
+ * equivalent) a deferral function of its own instead of call_rcu().  The engine
+ * calls it with the block's rcu_head, which sits at @link_off, so:
+ *
+ *	static void my_defer(struct rcu_head *rh, void (*fn)(struct rcu_head *))
+ *	{
+ *		struct urcu_txn_desc *t = caa_container_of(rh,
+ *				struct urcu_txn_desc, rcu_head);
+ *
+ *		if (t->slab)
+ *			urcu_slab_free_pending(t, call_rcu);
+ *		else
+ *			call_rcu(rh, fn);	// exact-malloc block: stock path
+ *	}
+ *
+ * The @call_rcu_fn argument is what the slab uses to schedule its OWN closes
+ * and splices; it is never called on @block, and @fn is not called at all on
+ * the slab arm.  A deferral function that instead hands the block straight to
+ * urcu_txn_free() (hence urcu_slab_free()) makes it allocatable AT COMMIT TIME,
+ * a full grace period early: the next alloc reuses the descriptor and
+ * overwrites offset 0 while a reader is still resolving a parked proxy through
+ * it.  That is exactly the use-after-free the link_off != 0 design exists to
+ * prevent, so do not do it.
+ *
+ * There is no embedder-driven drain, and no urcu_slab_drain(): closes and
+ * splices arm themselves.
+ *
+ * PRECONDITIONS
+ *
+ *  - All free_pending callers of one slab must pass the same @call_rcu_fn.  A
+ *    grace period is flavor-scoped; see urcu_slab::call_rcu_fn.
+ *  - The bytes [link_off, batch_off + 8) of @block must be dead to readers from
+ *    this call until the splice; see struct urcu_slab_batch.
+ *
+ * MIXING WITH urcu_slab_free().  Allowed, per block: what matters is that a
+ * block's path matches its grace-period state -- urcu_slab_free() only after
+ * the caller's grace period, urcu_slab_free_pending() before it.  (The two
+ * lists are disjoint, and a block on @pending was pushed before its batch's
+ * close whatever the other list is doing, so there is no per-arena rule.)
+ *
+ * RESIDUAL, rseq builds only: the local batch is closed by its own cpu, so a
+ * cpu that stops issuing deferred frees leaves up to one open batch pending
+ * until its next deferred free -- or until urcu_slab_drain_cpu(), which is what
+ * an embedder that needs reclaim on quiesce should call.
  */
 static inline
 void urcu_slab_free_pending(void *block,
@@ -1347,6 +1502,7 @@ void urcu_slab_free_pending(void *block,
 			((uintptr_t) block & ~(uintptr_t) URCU_SLAB_RANGE_MASK);
 	struct urcu_slab_arena *a = sb->owner;		/* ORIGIN arena */
 	struct cds_lfs_node *node = urcu_slab_node(a->slab, block);
+	int cpu = -1;
 
 	cds_lfs_node_init(node);
 	if (caa_unlikely(!uatomic_load(&a->floor, CMM_RELAXED))) {
@@ -1378,7 +1534,7 @@ void urcu_slab_free_pending(void *block,
 	 */
 	if (caa_likely(urcu_slab_rseq_ready() &&
 			uatomic_load(&a->rseq_ok, CMM_RELAXED))) {
-		int cpu = rseq_current_cpu_raw();
+		cpu = rseq_current_cpu_raw();
 
 		if (cpu == a->cpu) {
 			if (caa_unlikely(!a->local_floor)) {
@@ -1454,12 +1610,14 @@ counted:
 	 *
 	 * A lost increment closes a little late; a doubled close finds nothing
 	 * pending and returns.  Neither can stall reclaim: every push that does
-	 * not trip the threshold arms the fallback closer below, so a batch is
-	 * closed at least once per grace period no matter what this says.
+	 * not close a batch arms the fallback closer below, so a batch is closed
+	 * at least once per grace period no matter what this says.
 	 */
 	n_pending = uatomic_load(&a->nr_pending, CMM_RELAXED) + 1;
 	uatomic_store(&a->nr_pending, n_pending, CMM_RELAXED);
-	if (n_pending >= a->slab->batch_max) {
+	if (n_pending >= a->slab->batch_max ||
+			caa_unlikely(uatomic_load(&a->close_local_req,
+					CMM_RELAXED))) {
 		/*
 		 * Reset HERE, not inside close_and_arm().  There are now two
 		 * lists, and whichever one is empty makes its close return
@@ -1467,19 +1625,22 @@ counted:
 		 * the counter latched at the threshold and every subsequent
 		 * free arms a callback, i.e. one per descriptor: precisely the
 		 * per-node cost the batching exists to remove.
+		 *
+		 * Clear the request BEFORE closing, so one arriving while we
+		 * close is kept rather than swallowed.
 		 */
 		uatomic_store(&a->nr_pending, 0, CMM_RELAXED);
-#ifdef URCU_SLAB_RSEQ
-		if (urcu_slab_rseq_ready() &&
-				uatomic_load(&a->rseq_ok, CMM_RELAXED))
-			(void) urcu_slab_close_local(a->slab, a,
-					rseq_current_cpu_raw());
-#endif
-		(void) urcu_slab_close_and_arm(a->slab, a);
-	} else if (!uatomic_load(&a->close_queued, CMM_RELAXED) &&
-			uatomic_cmpxchg(&a->close_queued, 0, 1) == 0) {
-		call_rcu_fn(&a->close_head, urcu_slab_closer_cb);
+		uatomic_store(&a->close_local_req, 0, CMM_RELAXED);
+		if (urcu_slab_close_arena(a->slab, a, cpu))
+			return;
+		/*
+		 * Nothing closed: the arena was already being closed by someone
+		 * who may have sampled the head before our push, or take_floor
+		 * came up empty.  Fall through and arm the fallback closer
+		 * rather than wait for the next batch_max blocks.
+		 */
 	}
+	urcu_slab_arm_closer(a->slab, a);
 }
 
 #ifdef __cplusplus
