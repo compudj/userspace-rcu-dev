@@ -252,15 +252,34 @@ static struct cds_ft *create_fixed_ord_ft(size_t klen,
  * per-trie MOVE GATE decides per call, so a test only has to hold the gate open
  * (_cds_ft_debug_move_gate_enter) to run the coherent path.
  */
-/* Move mode gate hooks (fractal-trie.c): let a single-threaded test run the
- * coherent reader path, which is otherwise correctly skipped with no move.
+/* EVERY _cds_ft_debug_* hook (fractal-trie.c) is declared HERE, in this one
+ * block, and not beside the test that uses it.
+ *
  * C linkage: this file is compiled as C++ too (test_urcu_ft_unit_cxx), and a
- * bare extern would then look for a mangled symbol the C library never emits. */
+ * bare extern would then look for a mangled symbol the C library never emits.
+ * The move-gate pair below had the guard and said so; the five that followed
+ * were each written next to their own test and each dropped it, which broke
+ * `make all` at the C++ link while the FT gate -- which builds only
+ * test_urcu_ft_unit and test_urcu_ft_inv -- stayed green.  One block is what
+ * makes the next hook inherit the linkage instead of re-deciding it.
+ *
+ * The move-gate hooks let a single-threaded test run the coherent reader path,
+ * which is otherwise correctly skipped with no move. */
 #ifdef __cplusplus
 extern "C" {
 #endif
 extern void _cds_ft_debug_move_gate_enter(struct cds_ft *ft);
 extern void _cds_ft_debug_move_gate_exit(struct cds_ft *ft);
+extern void *_cds_ft_debug_root(struct cds_ft *ft);
+extern int _cds_ft_debug_cow_replace_root(struct cds_ft *ft);
+extern void *_cds_ft_debug_child_at(struct cds_ft *ft, const uint8_t *key,
+		size_t key_len);
+extern int _cds_ft_debug_rekey_graft_simple(struct cds_ft *ft,
+		const uint8_t *src_key, size_t src_len,
+		const uint8_t *dst_key, size_t dst_len);
+extern int _cds_ft_debug_empty_holder(struct cds_ft *ft, struct cds_ft_node *leaf,
+		struct cds_ft_node **out, unsigned int out_max,
+		unsigned int *out_n);
 #ifdef __cplusplus
 }
 #endif
@@ -622,8 +641,6 @@ static int test_writer_lock_mode_fine(void)
 	return drain_and_destroy(ft, group);
 }
 
-extern void *_cds_ft_debug_root(struct cds_ft *ft);
-extern int _cds_ft_debug_cow_replace_root(struct cds_ft *ft);
 
 /*
  * Coherent-rekey sub-step 2: the S_top COW + interior re-parent primitive
@@ -731,11 +748,6 @@ static int test_cow_stop_root_inplace(void)
 	return drain_and_destroy(ft, group);
 }
 
-extern void *_cds_ft_debug_child_at(struct cds_ft *ft, const uint8_t *key,
-		size_t key_len);
-extern int _cds_ft_debug_rekey_graft_simple(struct cds_ft *ft,
-		const uint8_t *src_key, size_t src_len,
-		const uint8_t *dst_key, size_t dst_len);
 
 /*
  * Coherent-rekey sub-step 3: the one-decide rekey-graft in its SIMPLEST complete
@@ -24172,9 +24184,6 @@ out:
  * first-to-last walk descends into it before it has anything else to return:
  * the walk has to recognise the dead end, climb, and carry on rather than stop.
  */
-extern int _cds_ft_debug_empty_holder(struct cds_ft *ft, struct cds_ft_node *leaf,
-		struct cds_ft_node **out, unsigned int out_max,
-		unsigned int *out_n);
 
 static int test_walk_past_empty_internal(void)
 {
