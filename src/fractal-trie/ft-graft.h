@@ -2577,12 +2577,6 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		bool gs_reserved = false;
 		bool empty_pruned = false;
 		bool gs_rlock = false;
-		/*
-		 * The non-empty swap-root retire was FUSED into the insert-replace
-		 * txn (exclusive swap, list off) so a drop-abort of that commit rolls
-		 * it back and the retry re-descends with swap still full.
-		 */
-		bool swap_retire_fused = false;
 
 		/*
 		 * Read-only descent: nothing is published, so the whole swap can be
@@ -2636,7 +2630,6 @@ retry_swap:
 		have_insert = false;
 		empty_pruned = false;
 		gs_reserved = false;
-		swap_retire_fused = false;
 		gs_d_first = gs_d_last = gs_s_first = gs_s_last = NULL;
 		kase = ft_graft_swap_descend(dst_ft, key, key_len, &d);
 		if (kase == FT_GRAFT_SWAP_DELEGATE) {
@@ -3026,69 +3019,22 @@ retry_swap:
 		struct ft_graft_swap_run *swap_run_arg = gs_ord ? &swap_run : NULL;
 
 		/*
-		 * "Jump out" prevention: unlink old_swap_root from swap_ft (install
-		 * @fresh) and drain its readers BEFORE its parent pointer is flipped
-		 * into dst_ft.  Readers see an empty swap_ft between here and the final
-		 * root install below.
-		 */
-		if (!swap_empty) {
-			struct cds_ft_inode_flag *empty = ft_node_flag(fresh, 0);
-
-			/*
-			 * MW LOCK_FINE drop (exclusive swap, list off, insert side): FUSE
-			 * the swap-root retire INTO the insert-replace txn (recorded here,
-			 * committed at ft_glue_txn_commit_replace below) so the src unlink
-			 * and the dst attach flip ATOMICALLY.  A concurrent peer relocating
-			 * the contended dst parent aborts that commit; with the retire
-			 * fused, the abort rolls swap's root back to its full content too,
-			 * so the retry re-descends against a swap that still holds all its
-			 * content (no orphan window, no already-swapped bookkeeping).  swap
-			 * is exclusive => no readers => no drain -- so the replace's
-			 * immediate apply_deferred re-parents INTO swap (not rolled back)
-			 * are reader-invisible and overwritten by the rebuild.  (Mirrors
-			 * cds_ft_graft's src_swap_fused.)
-			 */
-			if (swap_ft->exclusive && !gs_ord && have_insert &&
-					glue_insert.txn) {
-				ft_flip_txn_record_reserved(glue_insert.txn,
-					(void **) &swap_ft->root,
-					(void *) swap_ft->root, (void *) empty);
-				swap_retire_fused = true;
-			} else
-			/*
-			 * Retire swap's root to an empty node AND (paired) unlink run_S
-			 * from swap's ordered list, FUSED in ONE flip so a reader never
-			 * sees swap structurally empty while its ordered list still shows
-			 * run_S -- the disappear-side cross-view window.  The following
-			 * sync then drains swap's readers of the old content; run_D is
-			 * installed as swap's list after the extract publish below.
-			 * (List off: just the lone root edge.)
-			 */
-			if (gs_ord)
-				/*
-				 * Empty swap's sentinel (relink_dest NULL): run_S's cells
-				 * are re-homed into dst by the run-replace below; run_D is
-				 * installed as swap's list after the extract publish.
-				 */
-				ft_root_list_swap_publish(swap_ft, swap_retire_txn,
-					&swap_ft->root,
-					swap_ft->root, empty,
-					ft_ord_first(swap_ft), NULL,
-					ft_ord_last(swap_ft), NULL,
-					NULL, false);
-			else
-				ft_root_edge_flip(swap_ft, &swap_ft->root,
-					swap_ft->root, empty);
-			FT_TP(root_publish, (const void *) swap_ft,
-				(const void *) swap_ft->root);
-			if (!swap_ft->exclusive)
-				ft_writer_lock_gp_wait(swap_ft);
-		}
-
-		/*
 		 * Insert side: wire the deferred live back-pointers, then the single
 		 * forward publish that splices cluster A into dst (detaching the old
 		 * content).  Empty swap publishes NULL (a remove).
+		 *
+		 * ★ THE DST ATTACH IS THE POINT OF NO RETURN, AND IT RUNS FIRST.  The
+		 * swap-root retire used to precede it, on a "jump out" argument that
+		 * required draining swap's readers between the unlink and the
+		 * re-parent.  That drain has been !exclusive-gated ever since a LIVE
+		 * @swap_ft became a BUSY rejection at entry, i.e. it is dead code: the
+		 * consumed source is ALWAYS exclusive here, so it has no readers to
+		 * jump out and no ordering to honour.  What the old order did cost was
+		 * the only thing that mattered -- a commit that ABORTS (a peer touched
+		 * the contended dst spine) left swap already emptied, so the abort was
+		 * unrecoverable and its status was DROPPED.  Retiring AFTER the attach
+		 * makes every abort build-invisible on both sides, which is what lets
+		 * the status be honoured with a plain re-descend.
 		 */
 		if (have_insert) {
 			enum urcu_txn_status ins_cst = URCU_TXN_STATUS_OK;
@@ -3124,30 +3070,46 @@ retry_swap:
 				glue_insert.txn = NULL;	/* the commit reclaimed it */
 			}
 			/*
-			 * MW LOCK_FINE drop: a peer relocated the contended dst parent
-			 * between this op's descent and its replace commit, so the commit
-			 * aborted (ft_flip_txn_guard_parent's clean-live expectation fails
-			 * against the retired/re-homed parent word).  A flip-txn commit is
-			 * all-or-none: nothing was published, and the FUSED swap-root retire
-			 * (recorded into the SAME txn) rolled back too.  dst is byte-for-byte
-			 * as before; swap_ft still holds its full content, and though the
-			 * replace's apply_deferred already rewrote swap's interior parent
-			 * back-pointers (immediate, not rolled back) that is invisible -- swap
-			 * is exclusive, the content nodes are never freed, and the rebuild
-			 * reads forward-only and overwrites them.  Free this attempt's
-			 * build-invisible clusters + reserve + txns, then re-descend (mirrors
-			 * ft_graft_keylen's store-abort retry_attach).  Gated on
-			 * @swap_retire_fused: only the
-			 * fused arm rolls the retire back, so only it can safely re-descend;
-			 * the legacy separate-retire arms keep their pre-drop behaviour (not
-			 * yet drop-hardened -- tracked follow-up, as for cds_ft_graft).
+			 * MW LOCK_FINE drop: a peer touched the contended dst spine between
+			 * this op's descent and its replace commit -- it relocated
+			 * @publish_parent, so ft_flip_txn_guard_parent's clean-live
+			 * expectation fails against the retired/re-homed parent word, or
+			 * its own edges conflicted.  A flip-txn commit is all-or-none, and with the
+			 * swap-root retire now BELOW this point NOTHING has been published on
+			 * either side: dst is byte-for-byte as before and @swap_ft still holds
+			 * its full content.  The replace's apply_deferred did already rewrite
+			 * swap's interior parent back-pointers (immediate stores, not rolled
+			 * back), which is invisible -- swap is exclusive, the content nodes are
+			 * never freed, and the rebuild reads forward-only and overwrites them.
+			 * Free this attempt's build-invisible clusters + reserve + txns, then
+			 * re-descend (mirrors ft_graft_keylen's store-abort retry_attach).
+			 *
+			 * ★ THE STATUS USED TO BE DROPPED on every shape but the one fused
+			 * arm -- `(void) ins_cst`.  Two graft_swaps at ONE dst position then
+			 * BOTH returned OK while only one attach landed, and the loser still
+			 * ran its extract side: it re-rooted into @swap_ft a subtree the abort
+			 * had left wired into dst, NULLing that subtree's parent back-pointer
+			 * where it still hung at depth 1 of the destination.  That is
+			 * inv_graft_swap_shared_dst's "parent mismatch: got (nil)".
 			 */
-			if (swap_retire_fused && ins_cst != URCU_TXN_STATUS_OK) {
+			if (ins_cst != URCU_TXN_STATUS_OK) {
 				ft_glue_abort(dst_ft, &glue_insert);
 				ft_glue_abort(swap_ft, &glue_extract);
 				if (fresh) {
-					free_cds_ft_node(swap_ft, fresh);
+					/*
+					 * UNPUBLISHED: the retire that would have
+					 * installed @fresh as swap's root is below
+					 * this bail, so it never became reader-visible
+					 * and carries no tombstone -- the audit build's
+					 * freeze-on-free assert is exactly right to
+					 * refuse it through the published path.
+					 */
+					free_cds_ft_node_unpublished(swap_ft, fresh);
 					fresh = NULL;
+				}
+				if (swap_retire_txn) {
+					ft_flip_txn_destroy(swap_retire_txn);
+					swap_retire_txn = NULL;
 				}
 				if (extract_txn) {
 					ft_flip_txn_destroy(extract_txn);
@@ -3163,7 +3125,48 @@ retry_swap:
 				}
 				goto retry_swap;
 			}
-			(void) ins_cst;
+
+			/*
+			 * Retire swap's root to an empty node AND (paired) unlink run_S from
+			 * swap's ordered list, FUSED in ONE flip.  Past the dst attach's
+			 * commit, so this is the failure-free section: the pre-reserved
+			 * @swap_retire_txn cannot abort, and @swap_ft is exclusive so the
+			 * cross-view window the fusion closes has no observer left anyway --
+			 * it is kept because the pairing is the invariant, not the audience.
+			 * run_D is installed as swap's list after the extract publish below.
+			 * (List off: just the lone root edge.)
+			 *
+			 * @swap_ft's content is momentarily reachable from BOTH tries here
+			 * (dst published it above, swap has not yet let go).  Only a reader of
+			 * @swap_ft could see that, and an exclusive trie has none -- the same
+			 * premise that lets the replace's apply_deferred re-parent swap's
+			 * interior into dst before this point.
+			 */
+			if (!swap_empty) {
+				struct cds_ft_inode_flag *empty =
+					ft_node_flag(fresh, 0);
+
+				assert(swap_ft->exclusive);
+				if (gs_ord)
+					/*
+					 * Empty swap's sentinel (relink_dest NULL):
+					 * run_S's cells were re-homed into dst by the
+					 * run-replace above; run_D is installed as
+					 * swap's list after the extract publish.
+					 */
+					ft_root_list_swap_publish(swap_ft,
+						swap_retire_txn, &swap_ft->root,
+						swap_ft->root, empty,
+						ft_ord_first(swap_ft), NULL,
+						ft_ord_last(swap_ft), NULL,
+						NULL, false);
+				else
+					ft_root_edge_flip(swap_ft, &swap_ft->root,
+						swap_ft->root, empty);
+				swap_retire_txn = NULL;	/* consumed */
+				FT_TP(root_publish, (const void *) swap_ft,
+					(const void *) swap_ft->root);
+			}
 		} else {
 			/*
 			 * Empty-swap remove (a REMOVE of @old_child at @key): route it
@@ -3465,9 +3468,28 @@ retry_swap:
 			}
 		}
 
-		/* Reclaim the old (replaced) live nodes after the publishes. */
+		/*
+		 * Reclaim the old (replaced) live nodes after the publishes.
+		 *
+		 * ★ BOTH free lists hold DST nodes, so BOTH reclaim through @dst_ft.
+		 * @glue_extract's list is the compressed @old_child that
+		 * ft_make_root_internal_glue PEELED to materialize swap's new root --
+		 * a node that lived in the DESTINATION, was reader-visible there, and
+		 * whose readers only this trie's grace period drains.  Reclaiming it
+		 * through @swap_ft instead took the trie's access discipline from the
+		 * WRONG side: cds_ft_free_item frees IMMEDIATELY on an exclusive trie
+		 * (no grace period, straight onto the arena free list), and @swap_ft
+		 * is exclusive by contract right up to the inherit below.  The node
+		 * was therefore recycled while dst readers -- and a peer writer's
+		 * in-flight descent -- still held it, and the arena handed the same
+		 * address back as the next allocation: a second trie's root wearing a
+		 * live destination node's address.  That is what
+		 * inv_graft_swap_shared_dst_nolist saw as a depth-1 node whose parent
+		 * had gone NULL.  ft_glue_apply_deferred above was already passed
+		 * @dst_ft for this same glue; this call was the odd one out.
+		 */
 		ft_glue_free_old(dst_ft, &glue_insert);
-		ft_glue_free_old(swap_ft, &glue_extract);
+		ft_glue_free_old(dst_ft, &glue_extract);
 
 		{
 			size_t nm = key_len + swap_max;
@@ -3516,7 +3538,7 @@ retry_swap:
 		if (run_replace_txn)
 			ft_flip_txn_destroy(run_replace_txn);
 		if (fresh)
-			free_cds_ft_node(swap_ft, fresh);
+			free_cds_ft_node_unpublished(swap_ft, fresh);	/* never published */
 		if (gs_reserved)
 			cds_ft_alloc_reserve_drain(dst_ft, &gs_reserve);
 		FT_TP(graft_swap_exit, (int) CDS_FT_STATUS_MEMORY_ERROR);
