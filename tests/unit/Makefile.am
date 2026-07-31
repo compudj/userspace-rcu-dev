@@ -45,6 +45,7 @@ noinst_PROGRAMS = \
 	test_rcu_txn_skiplist \
 	test_rcu_txn_skiplist_ryw \
 	test_call_rcu_affinity \
+	test_rcu_txn_bloom \
 	test_rcu_txn_slab \
 	test_rcu_txn_read_policy \
 	test_rcu_txn_beginless \
@@ -105,6 +106,7 @@ TESTS = \
 	test_rcu_txn_skiplist \
 	test_rcu_txn_skiplist_ryw \
 	test_call_rcu_affinity \
+	test_rcu_txn_bloom \
 	test_rcu_txn_slab \
 	test_rcu_txn_read_policy \
 	test_rcu_txn_beginless \
@@ -236,6 +238,9 @@ libaffinity_fault_la_LIBADD = -ldl
 
 test_call_rcu_affinity_SOURCES = test_call_rcu_affinity.c
 test_call_rcu_affinity_LDADD = $(URCU_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
+
+test_rcu_txn_bloom_SOURCES = test_rcu_txn_bloom.c
+test_rcu_txn_bloom_LDADD = $(URCU_COMMON_LIB) $(TAP_LIB)
 
 test_rcu_txn_slab_SOURCES = test_rcu_txn_slab.c
 test_rcu_txn_slab_LDADD = $(URCU_QSBR_LIB) $(URCU_COMMON_LIB) $(TAP_LIB)
