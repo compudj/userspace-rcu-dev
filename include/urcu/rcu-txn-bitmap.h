@@ -50,6 +50,12 @@
  * higher bit's insert claims).  rank() is otherwise an optimistic read: the
  * word's value-CAS at commit re-validates the bits within that word.
  *
+ * That covers a CONCURRENT writer moving the rank.  It says nothing about this
+ * transaction's OWN pending flips, which are in the commit rather than in
+ * conflict with it -- and the _rcu accessors cannot see them.  A bracket that
+ * computes a rank after recording a flip must read through the _txn accessors;
+ * see the block above urcu_txn_bitmap_test_rcu().
+ *
  * COMPOSITION / the transacted slot is the WORD, not the bit.  Composing
  * several _prepare flips in one transaction REQUIRES the default
  * (read-your-own-writes) handle.  63 logical bits share one physical word, so
@@ -135,6 +141,29 @@ uintptr_t urcu_txn_bitmap_word_rcu(const uintptr_t *words, size_t w)
 			(void **) &((uintptr_t *) words)[w], URCU_TXN_TAG);
 }
 
+/*
+ * THE _rcu ACCESSORS BELOW RETURN COMMITTED STATE.  They are handle-less, so
+ * inside a bracket they cannot see this transaction's own pending flips: a
+ * store is BUFFERED until commit, and the RYW consult lives in urcu_txn_load(),
+ * which needs the handle.
+ *
+ * That matters exactly where this header advertises composition.  Fold two
+ * occupancy inserts into one commit, and computing the second one's compressed
+ * index with urcu_txn_bitmap_rank_rcu() counts the pre-transaction bits: the
+ * first insert's flip is not there yet, so the index is off by one.  Nothing
+ * catches it -- the word record chains both flips correctly, the array edits
+ * validate against the committed values the caller genuinely loaded, and the
+ * commit installs and returns OK, leaving the compressed array inconsistent
+ * with the ranks the committed bitmap implies.
+ *
+ * So inside a bracket, read through the _txn forms further down, which take the
+ * handle and therefore see the transaction's own flips.  Age 0 answers such a
+ * read with the committed value and arms the private abort, so the bracket
+ * re-runs at age 1+ where the write set is consulted exactly -- the engine's
+ * intended escalation, and the reason a composed batch wants
+ * urcu_txn_expect_conflict().
+ */
+
 /* True iff logical @bit is set.  Call within an RCU read-side section. */
 static inline
 int urcu_txn_bitmap_test_rcu(const uintptr_t *words, size_t bit)
@@ -162,6 +191,50 @@ size_t urcu_txn_bitmap_rank_rcu(const uintptr_t *words, size_t bit)
 	for (i = 0; i < w; i++)
 		r += (size_t) __builtin_popcountl(urcu_txn_bitmap_word_rcu(words, i));
 	r += (size_t) __builtin_popcountl(urcu_txn_bitmap_word_rcu(words, w) & below);
+	return r;
+}
+
+/*
+ * IN-BRACKET counterparts of word_rcu / test_rcu / rank_rcu: they read through
+ * the transaction, so they see its own pending flips.  Use these for any value
+ * the bracket COMPUTES A WRITE SITE FROM -- a compressed-array index above all.
+ * The word enters the read/write set, which is what makes the read policy hold
+ * (see <urcu/rcu-txn.h>): these are waiting loads, and a word this transaction
+ * has already flipped resolves to the pending value at age 1+.
+ */
+static inline
+uintptr_t urcu_txn_bitmap_word_txn(struct urcu_txn *txn, const uintptr_t *words,
+		size_t w)
+{
+	return (uintptr_t) urcu_txn_load(txn,
+			(void **) &((uintptr_t *) words)[w], URCU_TXN_TAG);
+}
+
+static inline
+int urcu_txn_bitmap_test_txn(struct urcu_txn *txn, const uintptr_t *words,
+		size_t bit)
+{
+	size_t w;
+	uintptr_t mask;
+
+	urcu_txn_bitmap__locate(bit, &w, &mask);
+	return (urcu_txn_bitmap_word_txn(txn, words, w) & mask) != 0;
+}
+
+static inline
+size_t urcu_txn_bitmap_rank_txn(struct urcu_txn *txn, const uintptr_t *words,
+		size_t bit)
+{
+	size_t w = bit / URCU_TXN_BITMAP_BITS_PER_WORD;
+	unsigned phys = (unsigned) (1 + bit % URCU_TXN_BITMAP_BITS_PER_WORD);
+	uintptr_t below = ((uintptr_t) 1 << phys) - 1;	/* physical bits 0..phys-1 */
+	size_t r = 0, i;
+
+	for (i = 0; i < w; i++)
+		r += (size_t) __builtin_popcountl(
+				urcu_txn_bitmap_word_txn(txn, words, i));
+	r += (size_t) __builtin_popcountl(
+			urcu_txn_bitmap_word_txn(txn, words, w) & below);
 	return r;
 }
 
