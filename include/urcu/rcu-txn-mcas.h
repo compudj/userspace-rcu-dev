@@ -776,6 +776,15 @@ bool urcu_txn_add(struct urcu_txn_desc *t, void **slot,
 
 	urcu_assert_debug(!urcu_txn_is_proxy(old_ptr, tag));
 	urcu_assert_debug(!urcu_txn_is_proxy(new_ptr, tag));
+	/*
+	 * Exactly one kind bit.  The tally below masks while the commit's
+	 * partition classifies by exact equality, so a garbage kind
+	 * desynchronizes them: a dual-bit record counts toward @nr_mw but is
+	 * not moved into the MW prefix, so it lands in the SW park loop and is
+	 * plain-stored over a slot the embedder half-declared shared.  kind == 0
+	 * parks plain and is counted nowhere, so nothing downstream notices.
+	 */
+	urcu_assert_debug(kind == URCU_TXN_KIND_MW || kind == URCU_TXN_KIND_SW);
 	if (t->nr == t->cap)
 		return false;
 	r = &t->recs[t->nr++];
