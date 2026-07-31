@@ -543,11 +543,42 @@ void urcu_txn_sw__excl_slot_unchanged(struct urcu_txn_sw_latch *l)
 			(void *) l->slot, v, l->proxy.ptr[0]);
 }
 
+/*
+ * At the multi-edge park, the same VALUE witness the single-edge commit uses,
+ * not merely "no proxy is present".
+ *
+ * The presence check alone misses the shape this validator exists to catch: a
+ * racing writer that ran a COMPLETE transaction on the slot -- park, flip,
+ * settle -- between our record() and our install.  It leaves a plain value
+ * behind, so the slot looks free, and we then park a proxy whose ptr[0] is our
+ * stale old (readers in the park window see the committed value go backwards)
+ * and settle our new over its committed one, silently.
+ *
+ * The strengthening has no false positives in a correct single-updater program:
+ * this transaction has not touched the physical slot yet (every write is
+ * buffered until install), the same writer's earlier transactions settled
+ * before returning, and RYW chaining keeps the COMMITTED old in ptr[0].  What
+ * remains invisible shrinks to same-value ABA.
+ */
+static inline
+void urcu_txn_sw__excl_slot_parkable(struct urcu_txn_sw_latch *l)
+{
+	void *v = uatomic_load(l->slot, CMM_RELAXED);
+
+	if (urcu_txn_sw__is_proxy(v, l->tag))
+		urcu_txn_sw__excl_abort("slot=%p already holds a parked proxy (%p) at install (park): another writer is mid-transaction on it\n",
+			(void *) l->slot, v);
+	if (v != l->proxy.ptr[0])
+		urcu_txn_sw__excl_abort("slot=%p holds %p at install (park), but %p was recorded as its old: a concurrent writer committed over it\n",
+			(void *) l->slot, v, l->proxy.ptr[0]);
+}
+
 #else	/* !URCU_TXN_SW_EXCL_VALIDATE */
 
 # define urcu_txn_sw__excl_claim(t)			do { } while (0)
 # define urcu_txn_sw__excl_owner(t, what)		do { } while (0)
 # define urcu_txn_sw__excl_slot_free(slot, tag, what)	do { } while (0)
+# define urcu_txn_sw__excl_slot_parkable(l)		do { } while (0)
 # define urcu_txn_sw__excl_slot_ours(l)			do { } while (0)
 # define urcu_txn_sw__excl_slot_unchanged(l)		do { } while (0)
 
@@ -1225,8 +1256,7 @@ void urcu_txn_sw_install(struct urcu_txn_sw_txn *t)
 	}
 	t->state = URCU_TXN_SW_INSTALLED;
 	for (i = 0; i < nr; i++) {
-		urcu_txn_sw__excl_slot_free(t->latches[i].slot,
-				t->latches[i].tag, "install (park)");
+		urcu_txn_sw__excl_slot_parkable(&t->latches[i]);
 		urcu_txn_sw_latch_install(t, &t->latches[i]);
 	}
 }

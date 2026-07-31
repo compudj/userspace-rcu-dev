@@ -52,7 +52,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS	6
+#define NR_TESTS	7
 
 #define TAG	1UL		/* bit 0: no live value below carries it */
 
@@ -189,6 +189,30 @@ static void body_single_edge_changed(void)
 	(void) urcu_txn_sw_commit(&t);
 }
 
+/*
+ * 6. The MULTI-edge park has the same witness.  A peer that ran a COMPLETE
+ *    transaction on the slot -- park, flip, settle -- between our record() and
+ *    our install() leaves a PLAIN value behind, so a presence-only "is there a
+ *    proxy here?" check sees a free slot and waves us through.  We would then
+ *    park a proxy whose old is stale (readers in the park window watch the
+ *    committed value go backwards) and settle our new over the peer's,
+ *    silently.  The value check catches it; the peer's committed write is
+ *    simulated here by a plain store, which is what it leaves behind.
+ */
+static void body_park_over_settled(void)
+{
+	struct urcu_txn_sw_txn t;
+
+	g_a = V0;
+	g_b = V0;
+	urcu_txn_sw_init(&t);
+	(void) urcu_txn_sw_record(&t, &g_a, V0, V1, TAG);
+	(void) urcu_txn_sw_record(&t, &g_b, V0, V1, TAG);
+	uatomic_store(&g_b, V2, CMM_RELEASE);	/* a peer committed V0 -> V2 */
+	urcu_txn_sw_install(&t);		/* our park would lose it */
+	(void) urcu_txn_sw_commit(&t);
+}
+
 /* Control: a well-formed single-updater transaction trips nothing. */
 static void body_control(void)
 {
@@ -228,6 +252,9 @@ int main(void)
 		"recording a slot another writer has already parked aborts");
 	ok(aborts_in_child(body_park_over_parked),
 		"parking onto a slot another writer has already parked aborts");
+	ok(aborts_in_child(body_park_over_settled),
+		"parking onto a slot a peer already COMMITTED to aborts (the park "
+		"witness is the value, not just proxy-presence)");
 	ok(aborts_in_child(body_settle_clobbered),
 		"settling a slot whose parked proxy was overwritten aborts");
 	ok(aborts_in_child(body_single_edge_changed),
