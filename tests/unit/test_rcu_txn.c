@@ -67,9 +67,9 @@
  * only runs (and only counts) when that assert is compiled out.
  */
 #if defined(DEBUG_RCU) || defined(CONFIG_RCU_DEBUG)
-#define NR_TESTS	12
-#else
 #define NR_TESTS	13
+#else
+#define NR_TESTS	14
 #endif
 #ifndef NR_WORKERS
 #define NR_WORKERS	8
@@ -390,20 +390,49 @@ static void functional_checks(void)
 	ok(st == URCU_TXN_STATUS_OK && sa == (void *) 0xA2 && ma == (void *) 0xB2,
 		"retry with the correct old commits the mixed edit");
 
-	/* Read-your-own-writes across both kinds within one attempt. */
-	sa = (void *) 0x1000; ma = (void *) 0x2000;
-	urcu_txn_begin(&txn);
-	urcu_txn_store_sw(&txn, &sa, (void *) 0x1000, (void *) 0x1002, TAG);
-	urcu_txn_store_mw(&txn, &ma, (void *) 0x2000, (void *) 0x2002, TAG);
+	/*
+	 * Read-your-own-writes across both kinds -- BOTH halves of the aging
+	 * contract, because a bracket only ever reaches the second by way of the
+	 * first.  Age 0 runs the stripped filter-only path: a read of an
+	 * own-written slot is a coincidence, so it returns the COMMITTED value and
+	 * arms a private abort, and the caller re-runs.  At age 1+ the write set
+	 * is consulted exactly (urcu_txn_find) and the load returns the pending
+	 * value.
+	 *
+	 * A fresh handle, deliberately: aging is per operation and is retired at
+	 * every terminal outcome, so reusing @txn here would test age 0 -- the
+	 * pending-value assertion below used to pass only because a handle's
+	 * aging leaked out of the earlier deterministic-abort check.
+	 */
 	{
-		void *rsw = urcu_txn_load(&txn, &sa, TAG);
-		void *rmw = urcu_txn_load(&txn, &ma, TAG);
+		struct urcu_txn ryw;
+		void *rsw, *rmw;
 
+		sa = (void *) 0x1000; ma = (void *) 0x2000;
+		urcu_txn_init(&ryw, NULL);
+		urcu_txn_begin(&ryw);
+		urcu_txn_store_sw(&ryw, &sa, (void *) 0x1000, (void *) 0x1002, TAG);
+		urcu_txn_store_mw(&ryw, &ma, (void *) 0x2000, (void *) 0x2002, TAG);
+		rsw = urcu_txn_load(&ryw, &sa, TAG);
+		rmw = urcu_txn_load(&ryw, &ma, TAG);
+		st = urcu_txn_commit(&ryw);
+		urcu_txn_end(&ryw);
+		ok(st == URCU_TXN_STATUS_ABORT && rsw == (void *) 0x1000 &&
+			rmw == (void *) 0x2000 && sa == (void *) 0x1000 &&
+			ma == (void *) 0x2000,
+			"age 0: reading an own-written slot sees the committed value "
+			"and forces a private abort, publishing nothing");
+
+		urcu_txn_begin(&ryw);			/* re-run, now age 1 */
+		urcu_txn_store_sw(&ryw, &sa, (void *) 0x1000, (void *) 0x1002, TAG);
+		urcu_txn_store_mw(&ryw, &ma, (void *) 0x2000, (void *) 0x2002, TAG);
+		rsw = urcu_txn_load(&ryw, &sa, TAG);
+		rmw = urcu_txn_load(&ryw, &ma, TAG);
 		ok(rsw == (void *) 0x1002 && rmw == (void *) 0x2002,
 			"read-your-own-writes returns the pending value for SW and MW");
+		(void) urcu_txn_commit(&ryw);
+		urcu_txn_end(&ryw);
 	}
-	(void) urcu_txn_commit(&txn);
-	urcu_txn_end(&txn);
 
 #if !defined(DEBUG_RCU) && !defined(CONFIG_RCU_DEBUG)
 	/*

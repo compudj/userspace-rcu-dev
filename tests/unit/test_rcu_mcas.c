@@ -82,7 +82,7 @@ static __thread struct lf_stat t_stat;
 
 #include "tap.h"
 
-#define NR_TESTS	11
+#define NR_TESTS	12
 #define NR_WORKERS	8
 
 #define MILD_WORDS	16		/* moderate contention: atomicity focus */
@@ -421,6 +421,16 @@ int main(void)
 		"hot: k-CAS stayed atomic under heavy contention (sum invariant)");
 	ok(committed == (long) NR_WORKERS * HOT_OPS,
 		"hot: every transaction eventually committed (bounded-blocking progress)");
+	/*
+	 * The no-helping property, asserted rather than merely printed.  Every
+	 * commit attempt enters exactly one installer and nothing ever drives a
+	 * foreign transaction, so the counts must be equal -- helping would add
+	 * drives, a skipped install would subtract them.  This phase is
+	 * all-multi-edge, so the nr == 1 no-drive fast path cannot dilute it.
+	 */
+	ok(st.drive == attempts,
+		"hot: one drive per attempt (%lu == %lu): nothing drove a foreign "
+		"transaction", st.drive, attempts);
 	ok(max_retry < HOT_RETRY_BOUND,
 		"hot: worst single-op bypass stayed bounded (aging fairness)");
 

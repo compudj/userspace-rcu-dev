@@ -3,7 +3,10 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
 /*
- * Test for the guards of <urcu/rcu-txn.h>.
+ * Test for urcu_txn_load_validate() / urcu_txn_validate(), the MW load-only
+ * GUARDS of <urcu/rcu-txn.h>.  (Not to be confused with
+ * test_rcu_txn_guards.c, which death-tests the ENGINE's contract
+ * assertions -- duplicate slots, tagged values, the sw inline/frozen set.)
  *
  * urcu_txn_load_validate() reads a slot AND folds a load-only {v -> v}
  * record into the commit, so the transaction commits only if that slot still

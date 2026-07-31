@@ -148,16 +148,22 @@ static void test_checker(void)
 	   "helping load-validate (a pinned read): no violation");
 
 	/*
-	 * 5. GUARD, WRONG: load_validate_optimistic reads a read-set slot without
-	 * helping, so it violates BY CONSTRUCTION -- which is why it has no callers.
+	 * 5. GUARD, WRONG: an optimistic load whose value is then pinned as a
+	 * guard.  The slot enters the read set on a value read without helping,
+	 * which is a violation by construction -- and it is why the library
+	 * exposes no urcu_txn_load_validate_optimistic() to spell it in one call.
 	 */
 	slot = A;
 	urcu_txn_init(&txn, NULL);
 	urcu_txn_begin(&txn);
-	(void) urcu_txn_load_validate_optimistic(&txn, &slot, TAG);
+	{
+		void *seen = urcu_txn_load_optimistic(&txn, &slot, TAG);
+
+		urcu_txn_validate(&txn, &slot, seen, TAG);
+	}
 	commit_ok(&txn);
 	ok(urcu_txn_read_policy_violations(&txn) == 1,
-	   "load_validate_optimistic pins a slot it did not help: one violation");
+	   "a guard pinned on an optimistically-read slot: one violation");
 
 	/* 6. BLIND STORE: a slot never loaded this attempt -- nothing to check, 0. */
 	slot = A;
