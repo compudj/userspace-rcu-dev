@@ -49,6 +49,23 @@
  * defined once in liburcu-common (src/urcu-txn.c) where init -- hence stats
  * registration -- runs, so define it for the whole build (library and embedder
  * TUs alike): a TU-local define only adds increment instrumentation.
+ *
+ * EXPERIMENTAL SUBSYSTEMS.  Two parts of this file are opt-in and have no
+ * in-tree user, hence no CI coverage of their concurrency:
+ *
+ *  - BATCH RETIREMENT (urcu_slab_free_pending() and the floor / closer /
+ *    splice machinery).  The engines free through urcu_slab_free() from a
+ *    call_rcu callback; nothing in the tree opts in.
+ *  - RSEQ LOCAL LISTS (URCU_SLAB_RSEQ).  A developer CPPFLAG, wired into no
+ *    build file, so every in-tree build compiles the atomic paths only.
+ *
+ * Both are documented as they are implemented, but an embedder opting in is
+ * the first user of that code.  URCU_SLAB_RSEQ additionally shares the
+ * IDENTICAL-ACROSS-EVERY-TU requirement stated for URCU_SLAB_RANGE below, and
+ * for a sharper reason: a TU built without it takes the arena's pop lock while
+ * a TU built with it pops the same arena's freelist locklessly, which is the
+ * combination lfstack's synchronization matrix forbids.  Define it for the
+ * whole build or not at all.
  */
 
 #include <stddef.h>			/* offsetof, size_t */
@@ -62,6 +79,7 @@
 #include <unistd.h>			/* sysconf */
 #include <sys/mman.h>			/* mmap */
 #include <pthread.h>			/* floor bootstrap mutex */
+#include <urcu/assert.h>
 #include <urcu/compiler.h>
 #include <urcu/uatomic.h>
 #include <urcu/lfstack.h>		/* freelist: link-before-publish push, LF pop */
@@ -131,10 +149,18 @@ urcu_static_assert(!(URCU_SLAB_RANGE & URCU_SLAB_RANGE_MASK),
  * stays at offset 0 because the splice writes it as the chain's tail.
  *
  * CONTRACT: once a block is handed to urcu_slab_free()/free_pending(), the slab
- * owns its first sizeof(struct urcu_slab_batch) bytes and will scribble list
- * and batch metadata there.  A freed block's contents are dead by definition,
- * so this costs nothing -- but an embedder that expects to read anything back
- * out of a freed block will not get it.
+ * owns the bytes [link_off, batch_off + sizeof(struct urcu_slab_batch)) and
+ * will scribble list and batch metadata there -- the freelist link at
+ * @link_off on every freed block, and on a floor block additionally the full
+ * rcu_head at @link_off (call_rcu writes it) plus the batch head at
+ * @batch_off.  NOT the block's first bytes: offset 0 is live reader state and
+ * the slab never touches it (see urcu_slab::link_off).
+ *
+ * For urcu_slab_free() those bytes only have to be dead from the call onwards.
+ * For urcu_slab_free_pending() they must be dead for the whole deferral window,
+ * which STARTS AT THE CALL -- one grace period before readers are done with the
+ * block.  Both engines satisfy this: the overlay lands on urcu_txn_desc::nr/
+ * nr_mw and urcu_txn_sw_block::cap/slab, which no reader loads.
  */
 struct urcu_slab_batch {
 	struct cds_lfs_node *head;	/* the batch's chain head */
@@ -157,15 +183,16 @@ struct urcu_slab_arena {
 	struct cds_lfs_stack freelist;	/* MP push (free), LF pop (alloc) */
 	/*
 	 * Blocks handed to urcu_slab_free_pending() land here instead of on the
-	 * freelist, and urcu_slab_drain() later moves the WHOLE batch across
-	 * with one xchg and one cmpxchg -- touching no block but the tail, so a
-	 * batch of any size costs the same and the blocks stay cold until they
-	 * are actually reused.  @floor is that batch's bottom: pop_all hands
-	 * back only a head, so instead of swapping in NULL the drain swaps in a
-	 * floor block of its own, and the chain it gets back is terminated by
-	 * the floor installed on the PREVIOUS drain -- the tail is recalled,
-	 * never discovered.  The floor rides back into the freelist with its
-	 * batch, so it must be (and is) a real block of this arena's class.
+	 * freelist, and urcu_slab_splice_cb() -- armed one grace period earlier
+	 * by the close -- later moves the WHOLE batch across with one xchg and
+	 * one cmpxchg, touching no block but the tail, so a batch of any size
+	 * costs the same and the blocks stay cold until they are actually
+	 * reused.  @floor is that batch's bottom: pop_all hands back only a
+	 * head, so instead of swapping in NULL the close swaps in a floor block
+	 * of its own, and the chain it gets back is terminated by the floor
+	 * installed by the PREVIOUS close -- the tail is recalled, never
+	 * discovered.  The floor rides back into the freelist with its batch, so
+	 * it must be (and is) a real block of this arena's class.
 	 */
 
 	/*
@@ -228,18 +255,6 @@ struct urcu_slab_arena {
 	 * common path to spare the rare one is the wrong trade.
 	 */
 	int cpu;			/* cpu this arena belongs to */
-	/*
-	 * Non-zero while this arena may be operated on with rseq critical
-	 * sections instead of atomics.  Read INSIDE every such section, so a
-	 * demote followed by membarrier(...EXPEDITED_RSEQ) provably evicts any
-	 * section still running on a stale decision -- a check before the
-	 * section would be sampled once and survive the restart.
-	 *
-	 * One-way: an operation forced to run from the wrong cpu clears it for
-	 * good and everything falls back to the atomic path.  Promotion back
-	 * would have to prove no atomic operation is still in flight, which
-	 * costs more than a permanently-demoted arena does.
-	 */
 	/*
 	 * LOCAL freelist: a plain pointer, mutated ONLY by rseq critical
 	 * sections running on this arena's own cpu.  Disjoint from ->freelist,
@@ -317,6 +332,21 @@ struct urcu_slab_arena {
 	 * array with matching alignment (calloc only promises 16).
 	 */
 } __attribute__((aligned(64)));
+
+/*
+ * The line-by-line groupings above are EXACT for a 40-byte pthread_mutex_t
+ * (glibc/x86-64), where the arena is 256 bytes on the nose.  Elsewhere the
+ * mutex is a different size -- 48 bytes on glibc/aarch64, which makes it 320 --
+ * and the groupings shift: correctness is unaffected (aligned(64) still keeps
+ * neighbouring arenas off each other's lines), but the false sharing the
+ * grouping was chosen to avoid comes back WITHIN an arena.  Pin the claim where
+ * it is made so drift is caught rather than silently believed.
+ */
+#if defined(__x86_64__) && defined(__GLIBC__)
+urcu_static_assert(sizeof(struct urcu_slab_arena) == 256,
+		"struct urcu_slab_arena is documented as 4 cache lines exactly",
+		urcu_slab_arena_not_four_lines);
+#endif
 
 struct urcu_slab {
 	struct urcu_slab_arena *arenas;	/* [nclass * ncpu], row-major by class */
@@ -1013,6 +1043,14 @@ void urcu_slab_demote_all(struct urcu_slab *s)
  *
  * Safe to call from any cpu, which is the whole point -- @cpu itself may
  * already be gone.
+ *
+ * NOTHING CALLS THIS AUTOMATICALLY.  The slab has no hotplug notification of
+ * its own, so an embedder that offlines cpus must wire this up itself; until it
+ * runs, an offlined cpu's ->local blocks are unreachable and its ->local_pending
+ * blocks are owed a grace period nobody will complete.  It is also the way to
+ * reclaim a quiesced cpu's last open local batch (see urcu_slab_free_pending()),
+ * and it is idempotent, so calling it on a cpu that is merely idle is safe --
+ * at the cost of demoting that cpu's arenas to the atomic path for good.
  */
 static inline
 void urcu_slab_drain_cpu(struct urcu_slab *s, int cpu)
@@ -1144,10 +1182,19 @@ carve:
 }
 
 /*
- * Free @block to its ORIGIN arena (found from the RANGE-aligned superblock),
- * wait-free: the reclaim worker never blocks the writer.  @block must be a slab
- * block (the caller distinguishes slab vs exact-malloc blocks by its own tag,
- * e.g. a capacity field, before calling this).
+ * Free @block to its ORIGIN arena (found from the RANGE-aligned superblock).
+ * @block must be a slab block (the caller distinguishes slab vs exact-malloc
+ * blocks by its own tag, e.g. a capacity field, before calling this).
+ *
+ * The push itself is lock-free, not wait-free -- it is an lfstack cmpxchg retry
+ * loop (see WHY LFSTACK above).  What the asymmetry buys is the other side: the
+ * writer's alloc POP never waits on a pusher, so the reclaim worker cannot
+ * block the writer however badly it is preempted.
+ *
+ * THE CALLER OWES THE GRACE PERIOD.  The block becomes allocatable immediately,
+ * so it must already be unreachable to readers -- the engines satisfy this by
+ * freeing from a call_rcu callback.  Use urcu_slab_free_pending() to hand over a
+ * block whose grace period has NOT yet elapsed.
  */
 static inline
 void urcu_slab_free(void *block)
@@ -1524,6 +1571,17 @@ void urcu_slab_free_pending(void *block,
 			return;
 		}
 		pthread_mutex_unlock(&a->boot);
+	}
+	/*
+	 * One flavor per slab (see urcu_slab::call_rcu_fn).  Last writer wins, so
+	 * in release builds a second flavor silently takes over the deferral of
+	 * batches full of the first one's descriptors; debug builds trap on it.
+	 */
+	{
+		void (*bound)(struct rcu_head *, void (*)(struct rcu_head *)) =
+			uatomic_load(&a->slab->call_rcu_fn, CMM_RELAXED);
+
+		urcu_posix_assert(!bound || bound == call_rcu_fn);
 	}
 	uatomic_store(&a->slab->call_rcu_fn, call_rcu_fn, CMM_RELAXED);
 #ifdef URCU_SLAB_RSEQ
