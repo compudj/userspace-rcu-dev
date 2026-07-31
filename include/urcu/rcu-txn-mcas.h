@@ -96,7 +96,22 @@
  *     transacted slot must be at least 2-byte aligned (bit 0 clear); an embedder
  *     may use a wider per-record tag (see the proxy tag scheme);
  *   - the record set is frozen at commit;
- *   - a transaction's records must target pairwise-distinct slots.
+ *   - a transaction's records must target pairwise-distinct slots;
+ *   - THE TAG IS A PROPERTY OF THE SLOT, exactly as the kind is: every
+ *     transaction and every reader touching one slot must use the SAME tag.
+ *     Carrying it per record buys heterogeneous SLOTS in one engine, not
+ *     per-record variation on one slot.  Park under tag 3 and probe under tag
+ *     1 and urcu_txn_is_proxy() still says yes while the untag subtracts the
+ *     wrong amount: a misaligned record pointer whose ->desc load is garbage,
+ *     dereferenced by the resolve.  A crash, not an abort.  (The opposite
+ *     mismatch -- parked narrow, probed wide -- merely misreads the proxy as a
+ *     live value and aborts a CAS, which is why the hazard survives testing.)
+ *   - SLOT LIFETIME: the backing memory of a transacted slot must outlive every
+ *     transaction that can still name it -- reclaim it through call_rcu, or
+ *     never.  A LOSING transaction writes the slot twice as well (plant, then
+ *     settle back to old), so a peer that unlinks an object and frees it
+ *     immediately leaves the loser storing into freed memory.  Stated in full
+ *     in <urcu/rcu-txn.h>; it binds direct users of this header identically.
  */
 
 #include <stdbool.h>
@@ -329,8 +344,20 @@ void *urcu_txn_tag(struct urcu_txn_record *r, uintptr_t tag)
 static inline
 struct urcu_txn_record *urcu_txn_untag(void *v, uintptr_t tag)
 {
+	struct urcu_txn_record *r;
+
 	urcu_assert_debug(urcu_txn_is_proxy(v, tag));
-	return (struct urcu_txn_record *) ((uintptr_t) v - tag);
+	r = (struct urcu_txn_record *) ((uintptr_t) v - tag);
+	/*
+	 * Records are 16-byte aligned, so a misaligned decode means the value
+	 * was parked under a DIFFERENT tag than the one probed with -- the
+	 * per-slot tag consistency contract (see the constraints block) broken.
+	 * Catching it here matters because the release-build consequence is a
+	 * wild pointer: r->desc off a misaligned record is garbage, and the
+	 * resolve dereferences it.
+	 */
+	urcu_assert_debug(!((uintptr_t) r & 15));
+	return r;
 }
 
 /* Strong try-CAS returning a success bit. */
