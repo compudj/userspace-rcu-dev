@@ -78,7 +78,7 @@
  * compares the run count against this plan, so retiring a test means
  * decrementing here in the same commit.
  */
-#define NR_TESTS	(66 + NR_TESTS_REKEY_DLM)
+#define NR_TESTS	(70 + NR_TESTS_REKEY_DLM)
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -7479,7 +7479,8 @@ static struct cds_ft *create_varlen_ord_ft(struct cds_ft_group **group_out)
  * whose stale speculative key -- the pre-detach full key on a now-stripped
  * detached position -- disagrees with its slot).
  */
-static struct cds_ft *create_varlen_nolist_ft(struct cds_ft_group **group_out)
+static struct cds_ft *create_varlen_nolist_ft_ws(struct cds_ft_group **group_out,
+		const enum cds_ft_writer_strategy *ws)
 {
 	struct cds_ft_group_attr *attr;
 	struct cds_ft_group *group;
@@ -7492,6 +7493,8 @@ static struct cds_ft *create_varlen_nolist_ft(struct cds_ft_group **group_out)
 		abort();
 	if (cds_ft_group_attr_set_ordered_list(attr, false) < 0)
 		abort();
+	if (ws && cds_ft_group_attr_set_writer_strategy(attr, *ws) < 0)
+		abort();
 	if (cds_ft_group_create(attr, &group) < 0)
 		abort();
 	cds_ft_group_attr_destroy(attr);
@@ -7499,6 +7502,11 @@ static struct cds_ft *create_varlen_nolist_ft(struct cds_ft_group **group_out)
 		abort();
 	*group_out = group;
 	return ft;
+}
+
+static struct cds_ft *create_varlen_nolist_ft(struct cds_ft_group **group_out)
+{
+	return create_varlen_nolist_ft_ws(group_out, NULL);
 }
 
 /* Drain every key from @ft and destroy the trie, leaving its group alive. */
@@ -8947,6 +8955,411 @@ static void *inv_rootswap_disappear_reader(void *arg)
 		cds_ft_iter_destroy(iter);
 	rcu_unregister_thread();
 	return NULL;
+}
+
+/* ================================================================== */
+/*                                                                    */
+/*   EMPTY-DST ROOT ATTACH vs a concurrent KEYED attach (writer-side) */
+/*                                                                    */
+/* ================================================================== */
+
+/*
+ * The empty-dst ROOT attach decides "@dst_ft is empty" long before it commits,
+ * and nothing re-validates that decision at the commit.
+ *
+ *   ft_merge_at  (dst_key_len == 0 && cnt_dst == 0): cnt_dst is computed near
+ *     the top of the call; between it and the swap the path allocates a
+ *     replacement src root, creates the appear txn, and runs an ENTIRE
+ *     ft_detach_keylen of the source.
+ *   cds_ft_graft (key_len == 0): emptiness is the nr_child/external_nodes
+ *     check at the head of the root arm; then an alloc and a txn create.
+ *
+ * The commit validates only its RYW expected-olds -- the root pointer and the
+ * old root's state word, BOTH read at RECORD time -- so a peer that populated
+ * @dst_ft inside that window is matched by construction rather than detected.
+ * The peer's keys then ride the old root into free_cds_ft_node.
+ *
+ * WHY THE PEER IS LEGAL, and why it is an attach and not an insert.  The
+ * public contract grants exactly one concurrency here (fractal-trie.h, both
+ * cds_ft_graft and cds_ft_merge_at): under CDS_FT_WRITER_LOCK_FINE "several
+ * cross-trie attaches (cds_ft_graft, cds_ft_graft_swap, cds_ft_merge_at) may
+ * run concurrently on the same destination", while "exclusion against the
+ * point-update operations remains the caller's responsibility".  So the peer
+ * is a second cds_ft_graft -- a KEYED one, at {0x42} -- and a cds_ft_insert
+ * peer would prove nothing because the contract never promised it.
+ *
+ * THE ORACLE.  Per round, on a FRESH empty dst, thread A runs the root-level
+ * attach (whole src_a, keys under 0x41) and thread B a keyed graft at {0x42}.
+ * The two key spaces are disjoint by construction, so the check needs no
+ * linearization argument at all:
+ *
+ *     every attach that returned OK must have ALL of its keys in dst,
+ *     and every attach that did NOT return OK must have left its source
+ *     UNCHANGED (the contract's "on ANY failure @src_ft is left unchanged").
+ *
+ * Both orders satisfy that on a correct implementation.  A first: dst gets A's
+ * keys, then B's keyed graft attaches under 0x42, both OK, both present.  B
+ * first: A observes a populated dst -- graft returns POPULATED_ERROR (keys stay
+ * in src_a), merge_at falls through to its diverged sub-position path and
+ * merges -- and again nothing is lost.  The defect is the third outcome: A
+ * observes empty, B commits into the still-current root, A swaps that root away
+ * and frees it.  Both report OK and B's keys are gone.
+ *
+ * Runs over both list settings because the merge empty-dst arm is written twice
+ * (ft_root_list_swap_publish list-on vs the 2-edge root+tombstone flip
+ * list-off), and the graft root arm's dual swap likewise.
+ */
+#define EMPTY_DST_A_PREFIX	0x41	/* thread A's keys: {0x41, hi, lo}   */
+#define EMPTY_DST_B_PREFIX	0x42	/* thread B grafts its src AT {0x42} */
+#define EMPTY_DST_NR_KEYS	3	/* keys per side per round           */
+/*
+ * Longer than DEFAULT_DURATION_MS: this oracle needs the two attaches to
+ * collide inside a window bounded by one alloc + one txn create (graft) and
+ * the round cost is dominated by the serial refill/drain, so a 200 ms budget
+ * samples far too few collisions to be a dependable regression guard.
+ */
+#define EMPTY_DST_DURATION_MS	1500
+
+enum empty_dst_mode {
+	EMPTY_DST_MODE_GRAFT,	/* A = cds_ft_graft(dst, "", 0, src_a)           */
+	EMPTY_DST_MODE_MERGE,	/* A = cds_ft_merge_at(dst, "", 0, src_a, "", 0) */
+};
+
+struct empty_dst_ctx {
+	struct cds_ft *dst;		/* fresh per round, published before the release */
+	struct cds_ft *src_a, *src_b;
+	enum empty_dst_mode mode;
+	unsigned long seq;		/* bumped by main to release one round */
+	unsigned long done;		/* each attacher increments when finished */
+	int stop;
+	enum cds_ft_status st_a, st_b;
+};
+
+/*
+ * Round rendezvous, SPIN-and-quiesce rather than a pthread_barrier.
+ *
+ * This is a QSBR suite: a registered thread that blocks without reporting a
+ * quiescent state stalls every grace period in the process.  A pthread_barrier
+ * here deadlocks on the very first round -- the two attachers park in
+ * barrier_wait while main enters the round teardown, whose cds_ft_destroy waits
+ * for a grace period the parked threads can never let complete.  That is why
+ * every concurrent oracle in this file rendezvouses on spun flags.
+ *
+ * Returns the new @seq once it leaves @seen, or 0 when the run is stopping
+ * (@seq is bumped before the first round, so 0 is never a live round).
+ */
+static unsigned long empty_dst_wait_round(struct empty_dst_ctx *c,
+		unsigned long seen)
+{
+	for (;;) {
+		unsigned long s = uatomic_load(&c->seq, CMM_ACQUIRE);
+
+		if (s != seen)
+			return s;
+		if (uatomic_load(&c->stop, CMM_RELAXED))
+			return 0;
+		caa_cpu_relax();
+		rcu_quiescent_state();
+	}
+}
+
+/* Thread A: the ROOT-level attach -- the arm under test. */
+static void *empty_dst_root_attacher(void *arg)
+{
+	struct empty_dst_ctx *c = (struct empty_dst_ctx *) arg;
+	unsigned long seen = 0;
+
+	rcu_register_thread();
+	for (;;) {
+		seen = empty_dst_wait_round(c, seen);
+		if (!seen)
+			break;
+		if (c->mode == EMPTY_DST_MODE_GRAFT)
+			c->st_a = cds_ft_graft(c->dst,
+				(const uint8_t *) "", 0, c->src_a);
+		else
+			c->st_a = cds_ft_merge_at(c->dst,
+				(const uint8_t *) "", 0, c->src_a,
+				(const uint8_t *) "", 0);
+		uatomic_add(&c->done, 1);
+		rcu_quiescent_state();
+	}
+	rcu_unregister_thread();
+	return NULL;
+}
+
+/* Thread B: the contract-legal KEYED peer attach into the same destination. */
+static void *empty_dst_keyed_attacher(void *arg)
+{
+	struct empty_dst_ctx *c = (struct empty_dst_ctx *) arg;
+	const uint8_t bkey[1] = { EMPTY_DST_B_PREFIX };
+	unsigned long seen = 0;
+
+	rcu_register_thread();
+	for (;;) {
+		seen = empty_dst_wait_round(c, seen);
+		if (!seen)
+			break;
+		c->st_b = cds_ft_graft(c->dst, bkey, 1, c->src_b);
+		uatomic_add(&c->done, 1);
+		rcu_quiescent_state();
+	}
+	rcu_unregister_thread();
+	return NULL;
+}
+
+/*
+ * Fill @ft with EMPTY_DST_NR_KEYS keys of the form @prefix || {hi, lo} when
+ * @with_prefix, else the bare {hi, lo} suffix (thread B's source is grafted AT
+ * {0x42}, so its own keys must NOT already carry that byte).  @round
+ * disambiguates rounds so a stale node from a previous round is never mistaken
+ * for a live one.  Leaves @ft EXCLUSIVE, as a cross-trie source must be.
+ */
+static void empty_dst_fill_src(struct cds_ft *ft, uint8_t prefix,
+		bool with_prefix, unsigned int round)
+{
+	unsigned int s;
+
+	for (s = 0; s < EMPTY_DST_NR_KEYS; s++) {
+		uint8_t key[4];
+		size_t klen = 0;
+		struct ft_test_node *n = node_alloc(
+			((uint64_t) prefix << 32) | ((uint64_t) round << 8) | s);
+
+		if (with_prefix)
+			key[klen++] = prefix;
+		key[klen++] = (uint8_t) (round >> 8);
+		key[klen++] = (uint8_t) round;
+		key[klen++] = (uint8_t) s;
+		/* @okey holds the LANDED key, i.e. always prefixed. */
+		n->okey[0] = prefix;
+		memcpy(n->okey + 1, key + (with_prefix ? 1 : 0), klen - (with_prefix ? 1 : 0));
+		if (cds_ft_insert(ft, key, klen, &n->node) != CDS_FT_STATUS_OK)
+			abort();
+	}
+	/*
+	 * Idempotent and one-way; called every round because a source is
+	 * recycled, and a cross-trie source must be EXCLUSIVE under LOCK_FINE
+	 * (a live one is rejected with BUSY).
+	 */
+	cds_ft_make_exclusive(ft);
+}
+
+/*
+ * Are all EMPTY_DST_NR_KEYS keys of @prefix/@round present in @ft?  The landed
+ * key is always @prefix || {hi, lo, s}: thread A's source carried the prefix
+ * itself and moves to the root unchanged; thread B's did not and acquires it
+ * from the graft point.  Returns the number FOUND.
+ */
+static unsigned int empty_dst_count_present(struct cds_ft *ft, uint8_t prefix,
+		unsigned int round)
+{
+	struct cds_ft_iter *iter;
+	unsigned int s, found = 0;
+
+	if (cds_ft_iter_create(ft, &iter) < 0)
+		abort();
+	rcu_read_lock();
+	for (s = 0; s < EMPTY_DST_NR_KEYS; s++) {
+		uint8_t key[4] = { prefix, (uint8_t) (round >> 8),
+			(uint8_t) round, (uint8_t) s };
+
+		cds_ft_iter_set_key(iter, key, 4);
+		if (cds_ft_lookup(ft, iter) == CDS_FT_STATUS_OK
+				&& cds_ft_iter_node(iter) != NULL)
+			found++;
+	}
+	rcu_read_unlock();
+	cds_ft_iter_destroy(iter);
+	return found;
+}
+
+/* Remove every key from @ft (freeing the test nodes) but KEEP the trie. */
+static void empty_dst_drain_keys(struct cds_ft *ft)
+{
+	struct cds_ft_iter *iter;
+
+	if (cds_ft_iter_create(ft, &iter) < 0)
+		abort();
+	rcu_read_lock();
+	while (cds_ft_lookup_first(ft, iter) == CDS_FT_STATUS_OK) {
+		struct cds_ft_node *head, *tmp;
+
+		if (cds_ft_remove_all(ft, iter, &head) < 0)
+			abort();
+		cds_ft_for_each_duplicate_safe_rcu(head, tmp)
+			node_free_rcu(to_test_node(head));
+	}
+	rcu_read_unlock();
+	cds_ft_iter_destroy(iter);
+}
+
+static int empty_dst_oracle(const char *tname, enum empty_dst_mode mode,
+		bool list_on)
+{
+	enum cds_ft_writer_strategy ws = CDS_FT_WRITER_LOCK_FINE;
+	struct cds_ft_group *group;
+	struct cds_ft *probe;
+	struct empty_dst_ctx ctx;
+	pthread_t ta, tb;
+	struct timespec t0;
+	unsigned int round = 0;
+	unsigned long lost_a = 0, lost_b = 0, stranded = 0;
+	unsigned long ok_both = 0, ok_a_only = 0, ok_b_only = 0;
+	int ret = 0;
+
+	probe = list_on ? create_varlen_ord_ft_ws(&group, &ws)
+			: create_varlen_nolist_ft_ws(&group, &ws);
+
+	ctx.mode = mode;
+	ctx.stop = 0;
+	ctx.seq = 0;
+	ctx.done = 0;
+	/*
+	 * The three tries are created ONCE and recycled: each round drains them
+	 * back to the round-0 state (dst empty, both sources refilled) instead of
+	 * destroying and recreating.  cds_ft_destroy waits out a grace period, so
+	 * a create/destroy per round held the whole oracle to SIX rounds inside
+	 * the duration budget -- far too few to sample a window this narrow.
+	 * Recycling buys ~3 orders of magnitude more rounds for the same wall
+	 * clock, and the round counter keeps every round's keys distinct so a
+	 * straggler can never be mistaken for a live key.
+	 */
+	if (cds_ft_create(group, NULL, &ctx.dst) < 0)
+		abort();
+	if (cds_ft_create(group, NULL, &ctx.src_a) < 0)
+		abort();
+	if (cds_ft_create(group, NULL, &ctx.src_b) < 0)
+		abort();
+	pthread_create(&ta, NULL, empty_dst_root_attacher, &ctx);
+	pthread_create(&tb, NULL, empty_dst_keyed_attacher, &ctx);
+
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	for (;; round++) {
+		unsigned int in_dst_a, in_dst_b;
+
+		empty_dst_fill_src(ctx.src_a, EMPTY_DST_A_PREFIX, true, round);
+		empty_dst_fill_src(ctx.src_b, EMPTY_DST_B_PREFIX, false, round);
+		ctx.st_a = ctx.st_b = CDS_FT_STATUS_OK;
+
+		uatomic_store(&ctx.done, 0, CMM_RELAXED);
+		/* Publishes dst/src_a/src_b and the fresh statuses to both threads. */
+		uatomic_store(&ctx.seq, (unsigned long) round + 1, CMM_RELEASE);
+		while (uatomic_load(&ctx.done, CMM_ACQUIRE) != 2) {
+			caa_cpu_relax();
+			rcu_quiescent_state();
+		}
+
+		in_dst_a = empty_dst_count_present(ctx.dst,
+			EMPTY_DST_A_PREFIX, round);
+		in_dst_b = empty_dst_count_present(ctx.dst,
+			EMPTY_DST_B_PREFIX, round);
+
+		/* An attach that reported OK must have landed ALL of its keys. */
+		if (ctx.st_a == CDS_FT_STATUS_OK
+				&& in_dst_a != EMPTY_DST_NR_KEYS) {
+			if (!lost_a++)
+				fprintf(stderr, "%s: round %u: root attach "
+					"returned OK but only %u/%u of its keys "
+					"are in dst (peer st_b=%d)\n", tname,
+					round, in_dst_a, EMPTY_DST_NR_KEYS,
+					(int) ctx.st_b);
+			ret = -1;
+		}
+		if (ctx.st_b == CDS_FT_STATUS_OK
+				&& in_dst_b != EMPTY_DST_NR_KEYS) {
+			if (!lost_b++)
+				fprintf(stderr, "%s: round %u: the peer keyed "
+					"graft returned OK but only %u/%u of its "
+					"keys are in dst -- the root attach "
+					"(st_a=%d) swapped them away\n", tname,
+					round, in_dst_b, EMPTY_DST_NR_KEYS,
+					(int) ctx.st_a);
+			ret = -1;
+		}
+		/* An attach that FAILED must have left its source untouched. */
+		if (ctx.st_a != CDS_FT_STATUS_OK
+				&& empty_dst_count_present(ctx.src_a,
+					EMPTY_DST_A_PREFIX, round)
+					!= EMPTY_DST_NR_KEYS) {
+			if (!stranded++)
+				fprintf(stderr, "%s: round %u: root attach "
+					"failed (%d) but did not leave src_a "
+					"unchanged\n", tname, round,
+					(int) ctx.st_a);
+			ret = -1;
+		}
+		if (ctx.st_a == CDS_FT_STATUS_OK && ctx.st_b == CDS_FT_STATUS_OK)
+			ok_both++;
+		else if (ctx.st_a == CDS_FT_STATUS_OK)
+			ok_a_only++;
+		else if (ctx.st_b == CDS_FT_STATUS_OK)
+			ok_b_only++;
+
+		if (cds_ft_verify(ctx.dst, stderr) != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "%s: round %u: cds_ft_verify(dst) "
+				"failed\n", tname, round);
+			ret = -1;
+		}
+		empty_dst_drain_keys(ctx.dst);
+		empty_dst_drain_keys(ctx.src_a);
+		empty_dst_drain_keys(ctx.src_b);
+		rcu_quiescent_state();
+
+		if (elapsed_ms(&t0) >= EMPTY_DST_DURATION_MS)
+			break;
+	}
+
+	uatomic_store(&ctx.stop, 1, CMM_RELEASE);
+	pthread_join(ta, NULL);
+	pthread_join(tb, NULL);
+
+	/*
+	 * Report the interleaving census, not just the verdict.  A run where
+	 * ok_both is 0 has never driven the window at all -- the oracle would be
+	 * green for the wrong reason, so say so out loud rather than pass.
+	 */
+	fprintf(stderr, "# %s: %u rounds (both-OK %lu, root-only %lu, "
+		"peer-only %lu), lost: root %lu peer %lu, stranded %lu\n",
+		tname, round + 1, ok_both, ok_a_only, ok_b_only,
+		lost_a, lost_b, stranded);
+	if (ok_both == 0) {
+		fprintf(stderr, "%s: NO round had both attaches succeed -- the "
+			"concurrent empty-dst window was never driven\n", tname);
+		ret = -1;
+	}
+
+	cds_ft_destroy(ctx.dst);
+	cds_ft_destroy(ctx.src_a);
+	cds_ft_destroy(ctx.src_b);
+	rcu_barrier();
+	cds_ft_destroy(probe);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+static int inv_empty_dst_root_graft_peer(void)
+{
+	return empty_dst_oracle("inv_empty_dst_root_graft_peer",
+		EMPTY_DST_MODE_GRAFT, /*list_on=*/ true);
+}
+
+static int inv_empty_dst_root_graft_peer_nolist(void)
+{
+	return empty_dst_oracle("inv_empty_dst_root_graft_peer_nolist",
+		EMPTY_DST_MODE_GRAFT, /*list_on=*/ false);
+}
+
+static int inv_empty_dst_root_merge_peer(void)
+{
+	return empty_dst_oracle("inv_empty_dst_root_merge_peer",
+		EMPTY_DST_MODE_MERGE, /*list_on=*/ true);
+}
+
+static int inv_empty_dst_root_merge_peer_nolist(void)
+{
+	return empty_dst_oracle("inv_empty_dst_root_merge_peer_nolist",
+		EMPTY_DST_MODE_MERGE, /*list_on=*/ false);
 }
 
 static int inv_merge_root_src_cross_view(void)
@@ -15546,6 +15959,10 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_graft_cross_view);
 	RUN_TEST(inv_graft_root_swap_cross_view);
 	RUN_TEST(inv_merge_root_swap_cross_view);
+	RUN_TEST(inv_empty_dst_root_graft_peer);
+	RUN_TEST(inv_empty_dst_root_graft_peer_nolist);
+	RUN_TEST(inv_empty_dst_root_merge_peer);
+	RUN_TEST(inv_empty_dst_root_merge_peer_nolist);
 	RUN_TEST(inv_merge_root_src_cross_view);
 	RUN_TEST(inv_merge_cross_view);
 	RUN_TEST(inv_merge_spinecopy_cross_view);
