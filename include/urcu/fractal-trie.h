@@ -1502,6 +1502,9 @@ enum cds_ft_status cds_ft_insert_unique(struct cds_ft *ft,
  * Returns CDS_FT_STATUS_OK on success (node inserted, no prior node
  * existed). Returns CDS_FT_STATUS_DUPLICATE_FOUND on success when a
  * prior duplicate chain was replaced (*@result_node is the old head).
+ * Returns CDS_FT_STATUS_BUSY_ERROR if the publish lost an
+ * expected-value CAS or a guarded node was frozen: nothing was
+ * published and the call may be retried.
  * Returns a negative cds_ft_status on error.  On error, @node has
  * not been published and is left reusable for a subsequent insert
  * attempt.
@@ -1548,7 +1551,9 @@ enum cds_ft_status cds_ft_insert_replace(struct cds_ft *ft,
  *
  * Returns CDS_FT_STATUS_OK on success, CDS_FT_STATUS_NOT_FOUND if
  * @old_node is not found at the iterator position, or a negative
- * cds_ft_status on error.
+ * cds_ft_status on error.  A publish that loses an expected-value CAS
+ * is absorbed internally (the call re-derives and re-attempts), so it
+ * is never reported as success without @new_node installed.
  *
  * Update concurrency depends on the group's writer strategy
  * (cds_ft_group_attr_set_writer_strategy):

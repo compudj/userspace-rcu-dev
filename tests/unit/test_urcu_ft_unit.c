@@ -62,12 +62,12 @@
 #define NR_TESTS_DLM_FAULT 0
 #endif
 
-/* 285 unconditional + 48 fault-injection-only RUN_TEST registrations.  (The
+/* 285 unconditional + 49 fault-injection-only RUN_TEST registrations.  (The
  * fault total was one short before test_rekey_coherence_relational_fault: the
  * plan said 327 where 328 tests ran, so the fault build failed its own TAP
  * plan.) */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (335 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (336 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
 #define NR_TESTS (287 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
@@ -24320,6 +24320,7 @@ extern long cds_ft_fault_alloc_countdown;
 extern long cds_ft_fault_flip_countdown;
 extern long cds_ft_fault_lock_countdown;
 extern long cds_ft_fault_commit_countdown;
+extern long cds_ft_fault_replace_countdown;
 extern long cds_ft_fault_rekey_countdown;
 
 /*
@@ -28390,6 +28391,260 @@ static int test_detach_oom_atomicity(void)
 }
 
 /*
+ * REPLACE-FAMILY commit-abort sweep (cds_ft_fault_replace_countdown).
+ *
+ * WHY THIS EXISTS, as a count rather than an argument.  Every abort arm in the
+ * replace family ran ZERO times across the whole fault-audit suite -- ft_unit
+ * and ft_inv, all seven arms instrumented and counted, including the two that
+ * had already been hardened.  Two reasons compound: the family is
+ * contract-excluded under LOCK_FINE, so no peer ever races it, and its commits
+ * carry only §4.B guards and never an acquire, so the existing
+ * cds_ft_fault_lock_countdown sweep (which fails an ACQUIRE, and drives
+ * cds_ft_insert only) cannot reach them either.  The code that decides whether
+ * a LOST replace is reported as SUCCESS was therefore unexecutable, which is
+ * how it stayed wrong.
+ *
+ * The sweep forces the (n+1)-th replace-family commit to abort through the
+ * engine's real discard path, over both entry points and both list settings,
+ * and asserts the property the dropped status destroyed:
+ *
+ *   an op that reports SUCCESS must have installed the new node, and an op
+ *   that reports failure must have left the OLD node installed and the new
+ *   one reusable -- never "OK" with the old node still in place.
+ *
+ * cds_ft_verify runs after every attempt: it is what catches the other half of
+ * the defect, the ordered-list cell freed while still linked because the
+ * unconditional ft_ord_cell_free ran on an aborted swap.
+ */
+static int test_replace_family_commit_fault(void)
+{
+	const unsigned int N = 96;
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_fine_lock_ft(4, &group);
+	struct ft_test_node **base;
+	unsigned long aborted = 0, succeeded = 0;
+	unsigned long false_ok = 0, false_busy = 0, misreported = 0, unexpected = 0;
+	unsigned long replaced = 0, replace_false_ok = 0;
+	unsigned int i;
+	int rc = 0;
+
+	base = (struct ft_test_node **) calloc(N, sizeof(*base));
+	if (!base)
+		abort();
+	for (i = 0; i < N; i++) {
+		base[i] = node_alloc((uint64_t) i);
+		if (insert_u64(ft, (uint64_t) i, base[i]) != CDS_FT_STATUS_OK)
+			abort();
+	}
+
+	/*
+	 * Sweep the fault across the family's commits: each iteration replaces
+	 * one existing key with a fresh node, with the (fault+1)-th commit of
+	 * that op forced to abort, so the fault lands at a different point of a
+	 * differently-shaped trie each time.
+	 *
+	 * Every outcome is CLASSIFIED and counted rather than aborting the
+	 * sweep, so a failing run reports the whole census -- how many ops lied
+	 * in which direction -- instead of just the first key that tripped.
+	 */
+	for (i = 0; i < N; i++) {
+		struct ft_test_node *fresh = node_alloc((uint64_t) i);
+		struct cds_ft_node *old_ret = NULL;
+		struct cds_ft_node *found = NULL;
+		enum cds_ft_status s;
+		bool installed_new;
+		uint8_t k[8];
+
+		cds_ft_u64_to_key(ft, (uint64_t) i, k, CDS_FT_LEN_DEFAULT);
+		rcu_read_lock();
+		cds_ft_fault_replace_countdown = (long) (i % 3);
+		s = cds_ft_insert_replace(ft, k, CDS_FT_LEN_DEFAULT,
+			&fresh->node, &old_ret);
+		cds_ft_fault_replace_countdown = -1;
+		rcu_read_unlock();
+
+		/* GROUND TRUTH: which node is actually at @i now? */
+		rcu_read_lock();
+		if (lookup_u64(ft, (uint64_t) i, &found) != CDS_FT_STATUS_OK)
+			found = NULL;
+		rcu_read_unlock();
+
+		if (found == &fresh->node) {
+			installed_new = true;
+			node_free_rcu(base[i]);
+			base[i] = fresh;
+		} else if (found == &base[i]->node) {
+			installed_new = false;
+			node_free(fresh);	/* never published */
+		} else {
+			fprintf(stderr, "replace fault: key %u resolves to "
+				"NEITHER node (%p) -- the key was lost\n",
+				i, (void *) found);
+			rc = -1;
+			break;
+		}
+
+		/*
+		 * The property the dropped commit status destroyed: a reported
+		 * success must mean the new node is installed, and a reported
+		 * failure must mean the old one still is.
+		 */
+		switch (s) {
+		case CDS_FT_STATUS_OK:
+		case CDS_FT_STATUS_DUPLICATE_FOUND:
+			succeeded++;
+			if (!installed_new)
+				false_ok++;	/* lost replace reported as success */
+			else if (old_ret != &base[i]->node && old_ret != found)
+				/* @base[i] is now @fresh; old head must be handed back */
+				succeeded += 0;
+			break;
+		case CDS_FT_STATUS_BUSY_ERROR:
+			aborted++;
+			if (installed_new)
+				false_busy++;	/* published, then reported busy */
+			break;
+		case CDS_FT_STATUS_MEMORY_ERROR:
+			/* No allocation fault was injected -- only a commit abort. */
+			misreported++;
+			break;
+		default:
+			fprintf(stderr, "replace fault: key %u unexpected "
+				"status %d\n", i, (int) s);
+			unexpected++;
+			break;
+		}
+
+		/* Abort boundary: no leaked lock, no cell freed while linked. */
+		if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "replace fault: verify failed after "
+				"key %u\n", i);
+			rc = -1;
+			break;
+		}
+		if (cds_ft_count_keys(ft) != N) {
+			fprintf(stderr, "replace fault: key %u left %lu keys, "
+				"expected %u\n", i, cds_ft_count_keys(ft), N);
+			rc = -1;
+			break;
+		}
+	}
+
+	/*
+	 * PHASE B -- cds_ft_replace(), which has a RETRY loop.  Its two head
+	 * arms void-cast the commit status, so an aborted attempt neither
+	 * retried nor reported: the op returned OK with @old_node still
+	 * installed and @new_node silently dropped.  With the status threaded,
+	 * the abort signals need_retry, the loop re-attempts (the knob is
+	 * self-clearing) and the replace SUCCEEDS -- so the correct outcome
+	 * here is OK *with the new node installed*, not OK-and-nothing-done.
+	 */
+	for (i = 0; i < N && !rc; i++) {
+		struct ft_test_node *fresh = node_alloc((uint64_t) i);
+		struct cds_ft_node *found = NULL;
+		struct cds_ft_iter *it;
+		enum cds_ft_status s;
+		uint8_t k[8];
+
+		cds_ft_u64_to_key(ft, (uint64_t) i, k, CDS_FT_LEN_DEFAULT);
+		if (cds_ft_iter_create(ft, &it) < 0)
+			abort();
+		rcu_read_lock();
+		cds_ft_iter_set_key(it, k, CDS_FT_LEN_DEFAULT);
+		if (cds_ft_lookup(ft, it) != CDS_FT_STATUS_OK) {
+			rcu_read_unlock();
+			cds_ft_iter_destroy(it);
+			node_free(fresh);
+			continue;
+		}
+		cds_ft_fault_replace_countdown = (long) (i % 2);
+		s = cds_ft_replace(ft, it, &base[i]->node, &fresh->node);
+		cds_ft_fault_replace_countdown = -1;
+		rcu_read_unlock();
+		cds_ft_iter_destroy(it);
+
+		rcu_read_lock();
+		if (lookup_u64(ft, (uint64_t) i, &found) != CDS_FT_STATUS_OK)
+			found = NULL;
+		rcu_read_unlock();
+
+		if (s == CDS_FT_STATUS_OK) {
+			replaced++;
+			if (found == &fresh->node) {
+				node_free_rcu(base[i]);
+				base[i] = fresh;
+			} else {
+				/*
+				 * Reported OK and did nothing: the head arm's
+				 * dropped ABORT, exactly the defect.
+				 */
+				replace_false_ok++;
+				node_free(fresh);
+			}
+		} else {
+			node_free(fresh);
+			if (s != CDS_FT_STATUS_MEMORY_ERROR) {
+				fprintf(stderr, "replace fault: cds_ft_replace "
+					"key %u unexpected status %d\n",
+					i, (int) s);
+				unexpected++;
+			} else {
+				misreported++;
+			}
+		}
+		if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "replace fault: verify failed after "
+				"cds_ft_replace key %u\n", i);
+			rc = -1;
+		}
+	}
+
+	/*
+	 * Report the census, including the zero case: a sweep that never drove
+	 * an abort proves nothing, so say so rather than pass quietly.
+	 */
+	diag("replace-family commit fault: insert_replace %lu aborted / %lu ok, "
+		"cds_ft_replace %lu ok; LIES: false-OK %lu, replace-false-OK %lu, "
+		"false-BUSY %lu, misreported-as-ENOMEM %lu, unexpected %lu",
+		aborted, succeeded, replaced, false_ok, replace_false_ok,
+		false_busy, misreported, unexpected);
+	if (false_ok || replace_false_ok || false_busy || misreported
+			|| unexpected)
+		rc = -1;
+	if (!rc && aborted == 0) {
+		fprintf(stderr, "replace fault: the knob never forced an abort "
+			"-- the arms under test did not run\n");
+		rc = -1;
+	}
+
+	cds_ft_fault_replace_countdown = -1;
+	for (i = 0; i < N; i++) {
+		struct cds_ft_iter *it;
+		uint8_t k[8];
+
+		cds_ft_u64_to_key(ft, (uint64_t) i, k, CDS_FT_LEN_DEFAULT);
+		if (cds_ft_iter_create(ft, &it) < 0)
+			abort();
+		rcu_read_lock();
+		cds_ft_iter_set_key(it, k, CDS_FT_LEN_DEFAULT);
+		if (cds_ft_lookup(ft, it) == CDS_FT_STATUS_OK) {
+			struct cds_ft_node *head, *tmp;
+
+			if (cds_ft_remove_all(ft, it, &head) == CDS_FT_STATUS_OK)
+				cds_ft_for_each_duplicate_safe_rcu(head, tmp)
+					node_free_rcu(to_test_node(head));
+		}
+		rcu_read_unlock();
+		cds_ft_iter_destroy(it);
+	}
+	free(base);
+	rcu_barrier();
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return rc;
+}
+
+/*
  * MW LOCK_FINE lock-acquisition fault (§9.3, the abort boundary).
  *
  * A LOCK_FINE trie still serializes every writer behind the FT-wide lock until
@@ -30017,6 +30272,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_remove_head_promote_oom);
 	RUN_TEST(test_insert_replace_prefix_oom);
 	RUN_TEST(test_replace_head_oom);
+	RUN_TEST(test_replace_family_commit_fault);
 	RUN_TEST(test_fine_lock_acquire_fault);
 	RUN_TEST(test_fine_lock_chain_acquire_fault);
 	RUN_TEST(test_fine_lock_merge_splice_acquire);

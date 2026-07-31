@@ -1222,6 +1222,28 @@ long cds_ft_fault_lock_countdown = -1;
 long cds_ft_fault_commit_countdown = -1;
 
 /*
+ * Test-only COMMIT-abort injection for the REPLACE FAMILY
+ * (_cds_ft_insert_replace's chain + one-commit publishes, cds_ft_replace's two
+ * HEAD arms).  Counts down over those commits and forces the (n+1)-th to abort,
+ * exactly as a peer that won a raced MW slot would.
+ *
+ * Why this knob has to exist, stated as a measurement rather than an argument.
+ * All FIVE of those abort arms -- and the two the head path already had -- run
+ * ZERO times across the whole fault-audit suite (ft_unit and ft_inv both, every
+ * arm instrumented and counted).  Two reasons compound: the replace family is
+ * contract-excluded under LOCK_FINE, so no peer ever races it; and its commits
+ * carry only §4.B GUARDS, never an acquire, so cds_ft_fault_lock_countdown --
+ * which fails an ACQUIRE -- cannot reach them either.  The existing fault sweep
+ * drives cds_ft_insert only.  So the arms that decide whether a lost replace is
+ * reported as success were, until this knob, unexecutable.
+ *
+ * Routes through the engine's own unpublished-discard path (@acquire_miss: age
+ * the handle, clear every registered COPYING, report ABORT), so what runs is the
+ * real unwind and not a synthesised status.
+ */
+long cds_ft_fault_replace_countdown = -1;
+
+/*
  * Test-only REKEY-coherence second-walk fault injection
  * (automatic under the move gate).  Counts down over coherence checks -- the
  * point lookup's two descents and the relational two-pass, via

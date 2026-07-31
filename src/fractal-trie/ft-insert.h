@@ -3218,6 +3218,7 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 	int ret;
 	struct ft_ord_cell *precell;
 	struct ft_insert_commit ic = { 0 };
+	enum urcu_txn_status cst = URCU_TXN_STATUS_OK;	/* one-commit outcome */
 
 	*old_node_ret = NULL;
 
@@ -3390,8 +3391,21 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 						goto insert_replace_done;
 					}
 					ft_flip_txn_guard_parent(ft, txn, d.nf);
-					ft_ord_cell_swap_publish_multi(ft, old_cell,
-						precell, &sedge, 1, txn);
+					ft_replace_fault_arm_abort(txn);
+					/*
+					 * On a peer-conflict ABORT the commit installs
+					 * NOTHING: the old chain and its cell stay LIVE.
+					 * Dropping the status here reported the replace as
+					 * OK and then freed @old_cell -- a live cell, still
+					 * linked in the ordered list.  Surface -EAGAIN and
+					 * let the done handler free @precell unpublished,
+					 * exactly as the head arms below already do.
+					 */
+					if (ft_ord_cell_swap_publish_multi(ft, old_cell,
+							precell, &sedge, 1, txn) != 0) {
+						ret = -EAGAIN;
+						goto insert_replace_done;
+					}
 					ft_ord_cell_free(ft, old_cell);
 				} else {
 					/*
@@ -3423,8 +3437,12 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 						goto insert_replace_done;
 					}
 					ft_flip_txn_guard_parent(ft, txn, d.nf);
-					/* Replace op, not yet MW-hardened (no retry loop). */
-				(void) ft_ord_cell_flip_into(ft, txn, &sedge, 1);
+					ft_replace_fault_arm_abort(txn);
+					/* ABORT installs nothing: -EAGAIN, as the head arm. */
+					if (ft_ord_cell_flip_into(ft, txn, &sedge, 1) != 0) {
+						ret = -EAGAIN;
+						goto insert_replace_done;
+					}
 				}
 			} else {
 				/* No external nodes yet. New key at this node. */
@@ -3545,6 +3563,7 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 					}
 					/* VALIDATE (§4.B): guard the LIVE holder @d.pnf. */
 					ft_flip_txn_guard_parent(ft, txn, d.pnf);
+					ft_replace_fault_arm_abort(txn);
 					/*
 					 * Replace op, not yet MW-hardened (no retry loop):
 					 * on a peer-conflict ABORT the commit installs
@@ -3584,6 +3603,7 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 					}
 					/* VALIDATE (§4.B): guard the LIVE holder @d.pnf. */
 					ft_flip_txn_guard_parent(ft, txn, d.pnf);
+					ft_replace_fault_arm_abort(txn);
 					/* Replace op, not yet MW-hardened (no retry loop):
 					 * -EAGAIN on a peer-conflict ABORT (nothing
 					 * installed); the caller re-descends. */
@@ -3643,7 +3663,8 @@ insert_replace_done:
 			 * that commit.  A pure replace does not park (ic.slot
 			 * unset) and falls through untouched.
 			 */
-			ft_insert_one_commit(ft, _key, _key_len, NULL, &ic);
+			ft_replace_fault_arm_abort(ic.txn);
+			cst = ft_insert_one_commit(ft, _key, _key_len, NULL, &ic);
 			assert(ic.count_folded || !ft->rank_stats);
 		} else if (ic.txn) {
 			/* Armed but nothing parked (duplicate append): no
@@ -3670,9 +3691,31 @@ insert_replace_done:
 			 * into the replaced head's list slot at the replace site,
 			 * so it falls through here untouched.
 			 */
-			ft_insert_one_commit(ft, _key, _key_len, precell, &ic);
+			ft_replace_fault_arm_abort(ic.txn);
+			cst = ft_insert_one_commit(ft, _key, _key_len, precell, &ic);
 			assert(ic.count_folded || !ft->rank_stats);
 		}
+	}
+	/*
+	 * The one-commit's status is the op's whole outcome, and it used to be
+	 * discarded on BOTH arms above -- so an ABORT (nothing published, the
+	 * fresh cluster rolled back by the txn's on-abort action) returned OK or
+	 * DUPLICATE_FOUND with the key absent: a lost insert reported as success,
+	 * @precell leaked, and @node left with a stale ->prev that makes the
+	 * caller's retry fail entry validation with -EINVAL forever.
+	 *
+	 * _cds_ft_insert has always captured this and re-descended; this op has no
+	 * retry loop (it is contract-excluded under FINE), so it unwinds the same
+	 * way a failed attempt does and surfaces the condition to the caller.
+	 * MEMORY_ERROR stays defensive-only, exactly as in _cds_ft_insert: the
+	 * one-commit txn is pre-reserved, so its commit cannot allocate.
+	 */
+	if (caa_unlikely(cst != URCU_TXN_STATUS_OK) && ret == 0) {
+		node->prev = NULL;
+		if (ft->ordered_list)
+			ft_ord_cell_free_unpublished(ft, precell);
+		*old_node_ret = NULL;
+		ret = cst == URCU_TXN_STATUS_ABORT ? -EAGAIN : -ENOMEM;
 	}
 	if (ret == 0) {
 		if (key_len > uatomic_load(&ft->max_used_key_len, CMM_RELAXED))
@@ -3697,6 +3740,17 @@ enum cds_ft_status cds_ft_insert_replace(struct cds_ft *ft,
 		*result_node = NULL;
 		FT_TP(insert_replace_exit, (int) CDS_FT_STATUS_INVALID_ARGUMENT_ERROR);
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	}
+	if (ret == -EAGAIN) {
+		/*
+		 * A commit ABORT: a peer won an expected-value CAS or froze a
+		 * guarded node, so nothing published and @node is reusable.  The
+		 * catch-all below reported this as MEMORY_ERROR -- a peer conflict
+		 * dressed as an allocation failure, which a caller cannot act on.
+		 */
+		*result_node = NULL;
+		FT_TP(insert_replace_exit, (int) CDS_FT_STATUS_BUSY_ERROR);
+		return CDS_FT_STATUS_BUSY_ERROR;
 	}
 	if (ret) {
 		*result_node = NULL;
@@ -3840,6 +3894,7 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 		struct ft_pub_rec rec = { .n = 0 };
 		struct ft_ord_cell_edge sedges[2] = { 0 };
 		unsigned int n_s;
+		int r;			/* head-arm commit outcome */
 
 		/*
 		 * Alloc the fresh cell BEFORE any mutation so OOM aborts cleanly
@@ -4005,8 +4060,43 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 			 * above carries the extra edge.
 			 */
 			ft_hlist_freeze_prepare(ft_flip_txn_handle(txn), old_node);
-			ft_ord_cell_swap_publish_multi(ft, old_cell, new_cell,
+			ft_replace_fault_arm_abort(txn);
+			r = ft_ord_cell_swap_publish_multi(ft, old_cell, new_cell,
 				sedges, n_s, txn);
+			if (caa_unlikely(r)) {
+				/*
+				 * ABORT: nothing installed, @old_node and @old_cell
+				 * still LIVE.  Dropping this status freed @old_cell --
+				 * a cell still linked in the ordered list -- and
+				 * reported the replace as OK.  The non-head arm above
+				 * already had this exact fix; the head arms did not,
+				 * even though ft_ord_cell_flip_into's contract says a
+				 * retry-enabled op MUST propagate ABORT, and this op IS
+				 * retry-enabled (cds_ft_replace's need_retry loop).
+				 *
+				 * The successor's prev is the one LIVE store this arm
+				 * makes BEFORE the flip (it cannot ride the commit -- a
+				 * skip resolution reads a head's prev raw), so it is
+				 * also the one thing the unwind must put back: point it
+				 * at @old_node again, which is what it held.  Then reset
+				 * BOTH of @new_node's links, or the next attempt fails
+				 * entry validation with INVALID_ARGUMENT_ERROR instead
+				 * of retrying.
+				 */
+				if (new_node->next)
+					new_node->next->prev = old_node;
+				new_node->next = NULL;
+				new_node->prev = NULL;
+				ft_ord_cell_free_unpublished(ft, new_cell);
+				if (r == -EAGAIN) {
+					*need_retry = true;
+					s = CDS_FT_STATUS_OK;	/* discarded by the retry loop */
+				} else {
+					s = CDS_FT_STATUS_MEMORY_ERROR;
+				}
+				FT_TP(replace_exit, (int) s);
+				return s;
+			}
 			ft_ord_cell_free(ft, old_cell);
 		} else {
 			/*
@@ -4040,8 +4130,24 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 			n_s = ft_pub_rec_sedges(&rec, sedges);
 			/* Fuse @old_node's freeze into the structural publish (doc §4.B). */
 			ft_hlist_freeze_prepare(ft_flip_txn_handle(txn), old_node);
-			/* Replace op, not yet MW-hardened (no retry loop). */
-		(void) ft_ord_cell_flip_into(ft, txn, sedges, n_s);
+			ft_replace_fault_arm_abort(txn);
+			if (caa_unlikely(ft_ord_cell_flip_into(ft, txn, sedges, n_s)
+					!= URCU_TXN_STATUS_OK)) {
+				/*
+				 * ABORT: nothing installed.  Same unwind as the list-on
+				 * head arm -- restore the successor's prev (the one live
+				 * pre-flip store) and reset both of @new_node's links --
+				 * minus the cell.
+				 */
+				if (new_node->next)
+					new_node->next->prev = old_node;
+				new_node->next = NULL;
+				new_node->prev = NULL;
+				*need_retry = true;
+				s = CDS_FT_STATUS_OK;	/* discarded by the retry loop */
+				FT_TP(replace_exit, (int) s);
+				return s;
+			}
 		}
 	}
 

@@ -376,7 +376,34 @@ struct ft_flip_txn *ft_flip_txn_create(void)
  */
 #ifdef FEATURE_FT_FAULT_INJECT
 extern long cds_ft_fault_flip_countdown;
+extern long cds_ft_fault_replace_countdown;
 #endif
+
+/*
+ * Arm the next commit of @t to ABORT, for the replace family's otherwise
+ * unexecutable abort arms (see cds_ft_fault_replace_countdown).  Sets the
+ * engine's own @acquire_miss so ft_flip_txn_commit takes its real
+ * discard-unpublished path -- the caller's unwind under test is then the one
+ * that would run against a live peer.  No-op unless armed, and compiled out
+ * entirely without FEATURE_FT_FAULT_INJECT.
+ */
+static inline
+void ft_replace_fault_arm_abort(struct ft_flip_txn *t)
+{
+#ifdef FEATURE_FT_FAULT_INJECT
+	if (cds_ft_fault_replace_countdown >= 0) {
+		if (cds_ft_fault_replace_countdown == 0) {
+			cds_ft_fault_replace_countdown = -1;
+			t->acquire_miss = true;
+		} else {
+			cds_ft_fault_replace_countdown--;
+		}
+	}
+#else
+	(void) t;
+#endif
+}
+
 static inline
 struct ft_flip_txn *ft_flip_txn_create_bounded(unsigned int cap)
 {
