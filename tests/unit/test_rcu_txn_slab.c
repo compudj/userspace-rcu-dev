@@ -25,6 +25,22 @@
  *   6. Concurrent MP-push (free) / locked-pop (alloc) conservation stress:
  *      producers alloc+stamp+hand off, freers cross-thread free; every block is
  *      accounted exactly once (token-sum) with intact stamps and no crash.
+ *   7. urcu_slab_drain_cpu(): the departed cpu's local lists fold back, and
+ *      nothing else in the slab is demoted along with them.
+ *   8. BATCH RETIREMENT (urcu_slab_free_pending): the headline contract is that
+ *      a block handed over BEFORE its grace period does not become allocatable
+ *      until one grace period after its batch closes.  Checked head-on by
+ *      keeping the caller QSBR-ONLINE across the whole hand-over: no grace
+ *      period can then complete, so a pending block reappearing from
+ *      urcu_slab_alloc() is a real defect and not a race with the splice
+ *      callback.  Then the batches are drained and conservation is checked --
+ *      every block back exactly once, stamps intact at offset 0 (which the slab
+ *      must never touch) and past the batch overlay.
+ *   9. Concurrent close: several threads free_pending into ONE origin arena
+ *      around a small batch_max, so threshold closes race each other and the
+ *      fallback closer.  Two closers that both recall the same floor as their
+ *      batch tail queue one rcu_head twice and splice one chain twice, which
+ *      shows up here as a block handed out by two allocations.
  *
  * Compiled with -DURCU_TXN_CACHE_STATS so the st_reuse/st_carve counters on the
  * test's own slab instances are live and assertable (the counters are
@@ -46,6 +62,8 @@
 #include <urcu/compiler.h>
 #include <urcu/uatomic.h>
 #include <urcu/wfstack.h>
+#include <urcu-qsbr.h>
+#include <urcu-call-rcu.h>
 #include <urcu/rcu-txn-slab.h>
 
 #include "tap.h"
@@ -406,12 +424,349 @@ static void hotplug_test(void)
 	urcu_slab_drain_cpu(&hs, hs.ncpu + 1000);
 }
 
+/* ------------------------------------------------------------------ */
+/* 8 + 9. batch retirement (urcu_slab_free_pending)                    */
+/* ------------------------------------------------------------------ */
+/*
+ * The deferral contract, and the only reason free_pending exists: a block is
+ * handed over one grace period BEFORE readers are done with it, so it must not
+ * be allocatable again until the batch it landed in has been closed AND a grace
+ * period has elapsed since.
+ *
+ * Making that testable rather than merely probable is the point of the QSBR
+ * bracket below.  These tests hold the calling thread ONLINE across the whole
+ * hand-over, which is exactly the condition under which no QSBR grace period
+ * can complete -- so no splice callback can run, and any pending block coming
+ * back out of urcu_slab_alloc() is a defect rather than a lucky interleaving.
+ * The blocks are used for the class-1 (64 byte) arena so that, with link_off 8,
+ * the slab's scribble region [8, 32) leaves both a stamp at offset 0 -- which is
+ * live reader state and must never be touched -- and a check word at offset 32.
+ */
+#define BATCH_N		512
+#define BATCH_CL	1			/* 64-byte class */
+#define BATCH_MAX	16			/* small: many closes per run */
+#define BATCH_STAMP	0			/* reader-live word: slab must not touch */
+#define BATCH_CHECK	32			/* past batch_off + 8 */
+
+static int ptr_cmp(const void *a, const void *b)
+{
+	void *const *pa = (void *const *) a, *const *pb = (void *const *) b;
+
+	if (*pa < *pb)
+		return -1;
+	return *pa > *pb;
+}
+
+/* Number of duplicated pointers in @v (destructive: sorts @v). */
+static int count_dups(void **v, int n)
+{
+	int i, dups = 0;
+
+	qsort(v, (size_t) n, sizeof(*v), ptr_cmp);
+	for (i = 1; i < n; i++)
+		if (v[i] && v[i] == v[i - 1])
+			dups++;
+	return dups;
+}
+
+static void batch_stamp(void *p, uint64_t tok)
+{
+	*(uint64_t *) ((char *) p + BATCH_STAMP) = tok;
+	*(uint64_t *) ((char *) p + BATCH_CHECK) = tok * TOK_K;
+}
+
+static int batch_stamp_ok(void *p)
+{
+	uint64_t tok = *(uint64_t *) ((char *) p + BATCH_STAMP);
+
+	return tok != 0 &&
+		*(uint64_t *) ((char *) p + BATCH_CHECK) == tok * TOK_K;
+}
+
+/* Blocks the slab is legitimately holding back: the two live floors. */
+static int batch_floors_held(struct urcu_slab *s, struct urcu_slab_arena *a,
+		void **set, int n)
+{
+	int held = 0;
+
+	if (a->floor && in_set(set, n, urcu_slab_block(s, a->floor)))
+		held++;
+	if (a->local_floor &&
+			in_set(set, n, urcu_slab_block(s, a->local_floor)))
+		held++;
+	return held;
+}
+
+static void batch_drain(void)
+{
+	int i;
+
+	/*
+	 * Two grace periods deep at least: the fallback closer runs one grace
+	 * period after it was armed and only THEN arms the splice.  Four rounds
+	 * cover a closer that re-arms once because a free landed while it ran.
+	 */
+	for (i = 0; i < 4; i++)
+		rcu_barrier();
+}
+
+static void batch_test(void)
+{
+	static struct urcu_slab bs;
+	static void *blk[BATCH_N], *probe[BATCH_N], *back[2 * BATCH_N];
+	struct urcu_slab_arena *a;
+	int i, cpu, early = 0, recovered = 0, stamp_bad = 0, expect;
+
+	urcu_slab_init(&bs, CLASSES, NCLASS, "batch", 8);
+	if (!urcu_slab_enabled(&bs)) {
+		skip(3, "slab disabled");
+		return;
+	}
+	bs.batch_max = BATCH_MAX;
+	pin_to(0);
+	cpu = urcu_slab_cpu();			/* the arena the allocs land in */
+	if (cpu < 0 || cpu >= bs.ncpu)
+		cpu = 0;
+	a = &bs.arenas[BATCH_CL * bs.ncpu + cpu];
+
+	for (i = 0; i < BATCH_N; i++) {
+		blk[i] = urcu_slab_alloc(&bs, BATCH_CL);
+		if (!blk[i]) {
+			skip(3, "slab OOM during batch test setup");
+			return;
+		}
+		batch_stamp(blk[i], (uint64_t) i + 1);
+	}
+
+	/*
+	 * Hand every block over BEFORE its grace period, then immediately try to
+	 * allocate as many again.  This thread is QSBR-online throughout, so no
+	 * grace period completes and no splice can have run: every allocation
+	 * below must come from a fresh carve.
+	 */
+	for (i = 0; i < BATCH_N; i++)
+		urcu_slab_free_pending(blk[i], call_rcu);
+	for (i = 0; i < BATCH_N; i++) {
+		probe[i] = urcu_slab_alloc(&bs, BATCH_CL);
+		if (probe[i] && in_set(blk, BATCH_N, probe[i]))
+			early++;
+	}
+	ok(early == 0,
+		"free_pending: none of %d pending blocks is allocatable before "
+		"its grace period (%d early)", BATCH_N, early);
+
+	/* Now let the closes and splices run, and take everything back. */
+	batch_drain();
+	for (i = 0; i < 2 * BATCH_N; i++)
+		back[i] = urcu_slab_alloc(&bs, BATCH_CL);
+	for (i = 0; i < 2 * BATCH_N; i++) {
+		if (!back[i] || !in_set(blk, BATCH_N, back[i]))
+			continue;
+		recovered++;
+		if (!batch_stamp_ok(back[i]))
+			stamp_bad++;
+	}
+	expect = BATCH_N - batch_floors_held(&bs, a, blk, BATCH_N);
+	ok(recovered == expect && stamp_bad == 0,
+		"free_pending: %d/%d blocks spliced back after their grace "
+		"period (%d serving as floor), %d stamp faults",
+		recovered, BATCH_N, BATCH_N - expect, stamp_bad);
+	ok(count_dups(back, 2 * BATCH_N) == 0,
+		"free_pending: no block handed out twice (a doubled splice puts "
+		"one block on the freelist twice)");
+	diag("[slab batch] carve=%lu reuse=%lu over %d closes at batch_max=%d",
+		bs.st_carve, bs.st_reuse, BATCH_N / BATCH_MAX, BATCH_MAX);
+}
+
+/*
+ * Deterministic counterpart to the concurrent stress below.  Two closers that
+ * both recall the same ->floor as their batch tail need only a two-instruction
+ * window to do it, so a stress test catches that by luck at best; pin the
+ * property that rules it out instead -- the close is mutually exclusive per
+ * arena -- with a negative control, so the test cannot pass by never closing.
+ *
+ * White-box on purpose: it takes the arena's own close lock to stand in for the
+ * other closer, which is the only way to make the interleaving deterministic.
+ */
+static void batch_exclusion_test(void)
+{
+	static struct urcu_slab xs;
+	struct urcu_slab_arena *a;
+	struct cds_lfs_node *floor_before, *floor_blocked, *floor_after;
+	struct cds_lfs_node *lfloor_before, *lfloor_blocked, *lfloor_after;
+	void *p[4];
+	int i, cpu, closed_blocked, closed_free;
+
+	urcu_slab_init(&xs, CLASSES, NCLASS, "batch_excl", 8);
+	if (!urcu_slab_enabled(&xs)) {
+		skip(2, "slab disabled");
+		return;
+	}
+	xs.batch_max = ~0UL;			/* only close by hand, below */
+	pin_to(0);
+	cpu = urcu_slab_cpu();
+	if (cpu < 0 || cpu >= xs.ncpu)
+		cpu = 0;
+	a = &xs.arenas[BATCH_CL * xs.ncpu + cpu];
+
+	for (i = 0; i < 4; i++) {
+		p[i] = urcu_slab_alloc(&xs, BATCH_CL);
+		if (!p[i]) {
+			skip(2, "slab OOM during close-exclusion test setup");
+			return;
+		}
+	}
+	/*
+	 * p[0] bootstraps the atomic floor; p[1..3] make an open batch.  In an
+	 * rseq build the three land on ->local_pending instead, behind
+	 * ->local_floor, so watch both floors: whichever list took them, closing
+	 * it swaps that floor and only that floor.
+	 */
+	for (i = 0; i < 4; i++)
+		urcu_slab_free_pending(p[i], call_rcu);
+	floor_before = a->floor;
+	lfloor_before = a->local_floor;
+
+	/* Another closer owns the arena: this one must leave it alone. */
+	pthread_mutex_lock(&a->boot);
+	closed_blocked = urcu_slab_close_arena(&xs, a, cpu);
+	floor_blocked = a->floor;
+	lfloor_blocked = a->local_floor;
+	pthread_mutex_unlock(&a->boot);
+
+	/* Control: the very same call closes once the arena is free. */
+	closed_free = urcu_slab_close_arena(&xs, a, cpu);
+	floor_after = a->floor;
+	lfloor_after = a->local_floor;
+
+	ok(!closed_blocked && floor_blocked == floor_before &&
+			lfloor_blocked == lfloor_before,
+		"close is mutually exclusive per arena: a second closer leaves "
+		"the open batch and its floor untouched");
+	ok(closed_free && (floor_after != floor_before ||
+			lfloor_after != lfloor_before),
+		"control: the same call does close the batch once the arena is "
+		"free (so the check above is not vacuous)");
+	batch_drain();
+}
+
+/*
+ * Concurrent closes.  Every block below originates in ONE arena (allocated on
+ * cpu 0), so freeing them from several cpus routes them all back to that arena
+ * and the imprecise batch_max trigger lets two closers -- two freeing threads,
+ * or a freeing thread and the fallback closer on the call_rcu worker -- run at
+ * the same time.  Unserialized, they both recall the same ->floor as their
+ * batch tail: one rcu_head queued twice, and one chain spliced twice, which
+ * surfaces as a duplicate below.
+ */
+#define BC_THREADS	4
+#define BC_PER		256
+#define BC_TOTAL	(BC_THREADS * BC_PER)
+
+struct bc_arg {
+	struct urcu_slab *s;
+	void **blk;
+	int n;
+	int cpu;
+};
+
+static void *bc_freer_thr(void *v)
+{
+	struct bc_arg *arg = (struct bc_arg *) v;
+	int i;
+
+	pin_to(arg->cpu);
+	for (i = 0; i < arg->n; i++)
+		urcu_slab_free_pending(arg->blk[i], call_rcu);
+	return NULL;
+}
+
+static void batch_concurrent_test(void)
+{
+	static struct urcu_slab cbs;
+	static void *blk[BC_TOTAL], *back[2 * BC_TOTAL];
+	struct bc_arg arg[BC_THREADS];
+	pthread_t th[BC_THREADS];
+	struct urcu_slab_arena *a;
+	long online = sysconf(_SC_NPROCESSORS_ONLN);
+	int nc = online < 1 ? 1 : (int) online;
+	int i, cpu, recovered = 0, stamp_bad = 0, expect;
+
+	urcu_slab_init(&cbs, CLASSES, NCLASS, "batch_mt", 8);
+	if (!urcu_slab_enabled(&cbs)) {
+		skip(2, "slab disabled");
+		return;
+	}
+	cbs.batch_max = BATCH_MAX;
+	pin_to(0);
+	cpu = urcu_slab_cpu();
+	if (cpu < 0 || cpu >= cbs.ncpu)
+		cpu = 0;
+	a = &cbs.arenas[BATCH_CL * cbs.ncpu + cpu];
+
+	for (i = 0; i < BC_TOTAL; i++) {
+		blk[i] = urcu_slab_alloc(&cbs, BATCH_CL);
+		if (!blk[i]) {
+			skip(2, "slab OOM during concurrent batch test setup");
+			return;
+		}
+		batch_stamp(blk[i], (uint64_t) i + 1);
+	}
+
+	/*
+	 * Offline while the freers run: grace periods must be able to complete,
+	 * or the fallback closer never fires and the race we are after -- a
+	 * threshold close against the closer callback -- cannot happen.
+	 */
+	rcu_thread_offline();
+	for (i = 0; i < BC_THREADS; i++) {
+		arg[i].s = &cbs;
+		arg[i].blk = &blk[i * BC_PER];
+		arg[i].n = BC_PER;
+		arg[i].cpu = i % nc;
+		pthread_create(&th[i], NULL, bc_freer_thr, &arg[i]);
+	}
+	for (i = 0; i < BC_THREADS; i++)
+		pthread_join(th[i], NULL);
+	rcu_thread_online();
+
+	batch_drain();
+	pin_to(0);
+	for (i = 0; i < 2 * BC_TOTAL; i++)
+		back[i] = urcu_slab_alloc(&cbs, BATCH_CL);
+	for (i = 0; i < 2 * BC_TOTAL; i++) {
+		if (!back[i] || !in_set(blk, BC_TOTAL, back[i]))
+			continue;
+		recovered++;
+		if (!batch_stamp_ok(back[i]))
+			stamp_bad++;
+	}
+	expect = BC_TOTAL - batch_floors_held(&cbs, a, blk, BC_TOTAL);
+	ok(recovered == expect && stamp_bad == 0,
+		"concurrent close: %d/%d blocks conserved across %d freeing "
+		"threads, %d stamp faults", recovered, BC_TOTAL, BC_THREADS,
+		stamp_bad);
+	ok(count_dups(back, 2 * BC_TOTAL) == 0,
+		"concurrent close: no block handed out twice (witnesses a "
+		"double-armed batch tail)");
+}
+
 int main(void)
 {
 	static struct urcu_slab s;
 	int want_enabled = !getenv("URCU_TXN_NO_CACHE");
 
 	plan_no_plan();
+#ifdef URCU_SLAB_RSEQ
+	/*
+	 * The slab instances below are the test's own, so the liburcu-common
+	 * constructor's rseq_init() does not cover them -- and without it
+	 * rseq_registered() stays false and every rseq path is compiled but
+	 * never taken, which is exactly the coverage gap this build exists to
+	 * close.  Must run before the first urcu_slab_init().
+	 */
+	(void) rseq_init();
+#endif
 	urcu_slab_init(&s, CLASSES, NCLASS, "meta", 8);
 	meta_tests(&s, want_enabled);
 	if (!want_enabled) {
@@ -424,5 +779,12 @@ int main(void)
 	origin_test();
 	concurrent_test();
 	hotplug_test();
+
+	rcu_register_thread();
+	batch_test();
+	batch_exclusion_test();
+	batch_concurrent_test();
+	rcu_barrier();
+	rcu_unregister_thread();
 	return exit_status();
 }
