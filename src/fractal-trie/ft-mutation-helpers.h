@@ -934,6 +934,16 @@ int ft_dlm_lock(struct ft_flip_txn *t, struct cds_ft_metadata *meta,
 {
 	uintptr_t s = CMM_LOAD_SHARED(meta->state);
 
+	/*
+	 * The acquire MUST be a validated CAS: ft_flip_txn_record_tag dispatches
+	 * SW-vs-MW on @t->structural_sw alone, so a structural_sw acquire txn
+	 * would degrade the {clean -> COPYING} edge to a plain store -- a lock
+	 * that cannot fail against a peer, i.e. two owners.  Every caller today
+	 * builds a FRESH acquire txn for the lock-set (never the content lane,
+	 * see the composition sketch above), and the fold's structural_sw lives
+	 * only on content txns; assert it rather than rely on that reading.
+	 */
+	assert(!t->structural_sw);
 	if (caa_unlikely(s & (FT_STATE_PROXY | FT_STATE_TOMBSTONE |
 			FT_STATE_COPYING)))
 		return -EAGAIN;
@@ -1983,6 +1993,17 @@ void ft_flip_txn_hold_or_lock_parent(const struct cds_ft *ft,
 		struct cds_ft_metadata *held_holder, uintptr_t held_snap)
 {
 	if (held_holder) {
+		/*
+		 * The held arm takes the caller's word for it: it records the
+		 * release against @held_holder and NEVER derives it from
+		 * @parent_nf, so a caller that pairs a stale holder with a fresh
+		 * publish parent releases a fence on one node while publishing
+		 * into another -- both wrong, and silently so.  Identity is a
+		 * caller-construction property today (every setter assigns the
+		 * holder and the parent in the same breath); assert it so it stays
+		 * one.
+		 */
+		assert(parent_nf && held_holder == ft_flag_to_metadata(ft, parent_nf));
 		ft_flip_txn_record_release_copying(t, held_holder, held_snap);
 		ft_flip_txn_copying_register(t, held_holder);
 		return;
@@ -5964,6 +5985,32 @@ enum urcu_txn_status ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue 
 	 */
 	ft_flip_txn_hold_or_lock_parent(ft, g->txn, g->publish_parent,
 		g->publish_parent_holder, g->publish_parent_snap);
+	if (g->publish_parent_holder) {
+		/*
+		 * OWNERSHIP TRANSFER (the split_cn_holder block below mirrors
+		 * this): the held arm just recorded the {COPYING|s -> s} RELEASE
+		 * and REGISTERED the fence with @txn, so the txn owns the clear --
+		 * a commit consumes it, an abort or destroy CAS-clears it back to
+		 * LIVE through ft_flip_txn_copying_clear_all.  NULL the holder so
+		 * the caller's post-abort ft_glue_abort does NOT clear it a SECOND
+		 * time: by then the survivor is LIVE and CLEAN, and under the live
+		 * peers a commit-abort implies, a peer may have re-marked it in the
+		 * drain->abort window -- the second clear then STEALS the peer's
+		 * fence (double-free / torn publish), the exact hazard spelled out
+		 * for @split_cn_holder.
+		 *
+		 * Two callers already DOCUMENT this NULLing as the mechanism they
+		 * rely on (fractal-trie.c, the post-commit_edges bail and
+		 * bail_build) and ft_merge_spine_copy open-codes it at its own
+		 * hold_or_lock_parent call; commit_edges was the one path where the
+		 * mechanism was missing.  Safe here because every ft_glue_op_holds
+		 * read happens at the TOP of this function
+		 * (ft_glue_acquire_reparent_marks), so the reconciliation set is
+		 * complete before the field is disowned.
+		 */
+		g->publish_parent_holder = NULL;
+		g->publish_parent_snap = 0;
+	}
 	_ft_publish_to_parent(ft, g->publish_parent, g->publish_slot, g->top,
 		*g->publish_slot /* SW graft: still holds the old child */, &rec);
 	for (j = 0; j < rec.n; j++)
