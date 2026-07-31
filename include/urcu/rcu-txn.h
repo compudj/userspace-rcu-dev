@@ -731,6 +731,36 @@ int urcu_txn_abort_was_poison(const struct urcu_txn *txn)
 }
 
 /*
+ * Has this ATTEMPT read a slot it had already written, without the write set
+ * being consulted?  In other words: is anything computed from a load in this
+ * attempt derived from a STALE VIEW of the transaction's own state?
+ *
+ * True only on an age-0 attempt of a default handle, which runs the stripped
+ * read-your-own-writes path -- it maintains the Bloom filter, so it KNOWS the
+ * slot is in the write set, but it returns the committed value anyway and arms
+ * a private abort instead.  The abort is the safety net, and for a bracket that
+ * only publishes it is a complete one: commit sees esc_pending and re-runs at
+ * age 1+, where urcu_txn_find() resolves reads exactly.
+ *
+ * It is NOT a complete net for a wrapper that DERIVES A TERMINAL STATUS from
+ * such a load -- "-EEXIST: the key is already present", "-ENOENT: it is not" --
+ * because the caller acts on that status and ends the bracket, so commit never
+ * runs and the net never fires.  The answer is then deterministically wrong for
+ * a composed same-key batch (the key this transaction just deleted still reads
+ * as present) and re-running on a fresh handle reproduces it.
+ *
+ * So: a *_prepare form that reports such a verdict must check this before
+ * returning it, and report a retry instead.  The retry re-runs at age 1+ and
+ * the verdict then reflects the transaction's own serial semantics.
+ * urcu_txn_expect_conflict() avoids the situation entirely by skipping age 0.
+ */
+static inline
+int urcu_txn_tainted(const struct urcu_txn *txn)
+{
+	return txn->esc_pending;
+}
+
+/*
  * BEGIN-LESS DRIVING MODE.  The bracket urcu_txn_begin()/urcu_txn_end() opens
  * and closes the RCU read-side section for you; these two let a caller own it
  * instead, so one read-side section can span several transactions:
