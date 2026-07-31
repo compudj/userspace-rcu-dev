@@ -517,6 +517,18 @@ unsigned int urcu_txn_install_mw_depth(struct urcu_txn_desc *t,
 	unsigned int i;
 
 	URCU_TXN_STAT(drive);
+	/*
+	 * There is deliberately NO "did someone decide my status?" poll in this
+	 * loop.  Under the sole-driver protocol nobody ever writes a foreign
+	 * descriptor's status -- every urcu_txn_decide() call site acts on the
+	 * descriptor its own thread is committing, and every one of those inside
+	 * this installer returns immediately after deciding.  Such a poll would
+	 * therefore be dead code that costs an acquire load per record and per
+	 * wait iteration, and, worse, would READ AS PROTOCOL: it implies a
+	 * foreign decider exists, which is exactly the invariant urcu_txn_settle()
+	 * relies on being false when it forwards the decided status instead of
+	 * re-reading it.
+	 */
 	for (i = 0; i < nr_mw; i++) {
 		struct urcu_txn_record *r = &t->recs[i];
 		void *tagv = urcu_txn_tag(r, r->proxy_tag);
@@ -524,10 +536,6 @@ unsigned int urcu_txn_install_mw_depth(struct urcu_txn_desc *t,
 		for (;;) {
 			void *v;
 
-			if (urcu_txn_desc_status(t) != URCU_TXN_DESC_UNDECIDED) {
-				*failed = 1;
-				return i;
-			}
 			v = uatomic_load(r->slot, CMM_ACQUIRE);
 			if (v == tagv)
 				break;		/* already installed */
@@ -544,11 +552,6 @@ unsigned int urcu_txn_install_mw_depth(struct urcu_txn_desc *t,
 					while (urcu_txn_is_proxy(
 						uatomic_load(r->slot, CMM_ACQUIRE),
 						r->proxy_tag)) {
-						if (urcu_txn_desc_status(t) !=
-								URCU_TXN_DESC_UNDECIDED) {
-							*failed = 1;
-							return i;
-						}
 						if (patience-- == 0) {
 							URCU_TXN_STAT(wait_capped);
 							urcu_txn_decide(t,
