@@ -872,6 +872,16 @@ void urcu_txn_sw_latch_set(struct urcu_txn_sw_latch *l,
 static inline
 void urcu_txn_sw_latch_install(struct urcu_txn_sw_txn *t, struct urcu_txn_sw_latch *l)
 {
+	/*
+	 * Parking REQUIRES a non-zero tag that fits the alignment room.  With
+	 * tag == 0 every plain value satisfies urcu_txn_sw_is_proxy(), so a
+	 * reader resolves live values as proxies; with a tag bit already set in
+	 * the address, the OR is a no-op and urcu_txn_sw_untag()'s subtraction
+	 * reconstructs the wrong address.  Both hand the reader a garbage group
+	 * pointer.  Only the low 4 bits are free (16-byte-aligned latch array).
+	 */
+	urcu_assert_debug(l->tag != 0 && l->tag <= 0xf);
+	urcu_assert_debug(!((uintptr_t) &l->proxy & l->tag));
 	l->proxy.group = &t->block->group;	/* bind to the now-allocated group */
 	uatomic_store(l->slot,
 			(void *) ((uintptr_t) &l->proxy | l->tag), CMM_RELEASE);
@@ -990,6 +1000,26 @@ bool urcu_txn_sw_record(struct urcu_txn_sw_txn *t, void **slot,
 	if (caa_unlikely(t->state == URCU_TXN_SW_OOM))
 		return false;			/* sticky: an earlier alloc failed */
 	urcu_posix_assert(t->state == URCU_TXN_SW_PREPARE);
+	/*
+	 * Neither value may already look like a proxy under @tag.  After settle
+	 * the slot holds @new_ptr LIVE, so a tagged new_ptr makes every later
+	 * reader's urcu_txn_sw_resolve() fabricate a proxy out of it and
+	 * dereference ptr[selector] from garbage -- a wild read arbitrarily far
+	 * from the record that caused it.  The MCAS engine asserts the same pair
+	 * at its store; this is the sibling net.
+	 */
+	urcu_assert_debug(!urcu_txn_sw_is_proxy(old_ptr, tag));
+	urcu_assert_debug(!urcu_txn_sw_is_proxy(new_ptr, tag));
+	/*
+	 * Inline (caller-storage) handles are LONE-EDGE by construction: no
+	 * commit path accepts one with nr >= 2 (install asserts !latches_inline,
+	 * and under NDEBUG it would instead repoint ->latches at a fresh block
+	 * and release-store proxies through uninitialised slot pointers).  Trap
+	 * at the second record, where the sizing decision is still in view,
+	 * rather than at the commit far away -- capacity past 1 in
+	 * urcu_txn_sw_init_inline() is dead, not headroom.
+	 */
+	urcu_posix_assert(!t->latches_inline || t->nr == 0);
 	urcu_txn_sw__excl_owner(t, "record()");
 	urcu_txn_sw__excl_slot_free(slot, tag, "record()");
 	if (t->nr == t->cap) {
