@@ -2313,10 +2313,7 @@ extern unsigned long cds_ft_probe_gs_ext_child;
 extern unsigned long cds_ft_probe_gs_torn;
 extern unsigned long cds_ft_probe_gs_alias;
 extern unsigned long cds_ft_probe_gs_canon_alias;
-#define FT_GS_PROBE_INC(c)	__atomic_fetch_add(&(c), 1, __ATOMIC_RELAXED)
-#else
-#define FT_GS_PROBE_INC(c)	do { } while (0)
-#endif
+#endif	/* FT_GS_PROBE_INC comes from ft-mutation-helpers.h */
 
 /*
  * Outcome of ft_graft_swap_descend's read-only descent toward the swap key.
@@ -3240,8 +3237,23 @@ retry_swap:
 				glue_insert.txn = glue_publish_txn;
 				glue_insert.fuse_free_list = true;
 				ft_glue_apply_deferred(dst_ft, &glue_insert);
-				ft_glue_publish_replace(dst_ft, glue_publish_txn,
-					&glue_insert, swap_run_arg);
+				/*
+				 * ★ THIS STATUS USED TO BE DROPPED.  It is the same
+				 * point of no return as the fused arm above, and it
+				 * aborts for the same reason -- a peer took the graft
+				 * point.  Carrying on regardless made the op retire
+				 * @swap_ft's root, re-root the displaced subtree into
+				 * it and FREE the dst node the publish never replaced,
+				 * leaving a live dst grandchild whose parent points
+				 * into the OTHER trie.  Route it into the same unwind:
+				 * the abort is build-invisible on dst (nothing
+				 * published) and on @swap_ft (still holds its content;
+				 * apply_deferred rewrote only its own exclusive
+				 * interior), so a plain re-descend is clean.
+				 */
+				ins_cst = ft_glue_publish_replace(dst_ft,
+					glue_publish_txn, &glue_insert,
+					swap_run_arg);
 				glue_publish_txn = NULL;	/* consumed */
 				glue_insert.txn = NULL;	/* the commit reclaimed it */
 			}

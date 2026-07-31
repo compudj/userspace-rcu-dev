@@ -78,7 +78,7 @@
  * compares the run count against this plan, so retiring a test means
  * decrementing here in the same commit.
  */
-#define NR_TESTS	(73 + NR_TESTS_REKEY_DLM)
+#define NR_TESTS	(84 + NR_TESTS_REKEY_DLM)
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -9607,10 +9607,79 @@ static int inv_prefix_key_park_vs_holder_churn(void)
 #define GS_KEYS_PER_TRIE	4
 #define GS_ROUNDS_MS		1200
 #define GS_MAX_RETRY		4096
+#define GS_MAX_PREFIX		4
+
+/*
+ * ★ THE GRAFT-POINT SHAPE IS THE THING THIS FAMILY MUST VARY.
+ *
+ * Built with -DFEATURE_FT_PROBE_GRAFT_SWAP, the original fixture reports
+ * `exact=... kshort=0 delegate=0 fused=0 ext_child=0` over ~90k attempts: it
+ * drives exactly ONE of ft_graft_swap_descend's arms.  Every other arm --
+ * KEY_SHORTER, the compressed-grandparent fuse, an EXTERNAL occupant -- had
+ * never executed, so the @c9f02111 coherence fix landed on them blind.  Count
+ * the arm before trusting it (feedback_probe_the_class_dont_argue_it).
+ *
+ * @dst_prefix is the byte string every dst key shares; @key_len is how much of
+ * it the swap key spans.  Where that boundary falls INSIDE the compressed run
+ * the prefix collapses into is what selects the arm:
+ *
+ *   key_len == dst_prefix_len == 1   the graft point is a root slot        EXACT
+ *   key_len <  dst_prefix_len        the key ends inside the compressed
+ *                                    node the prefix collapsed into  KEY_SHORTER
+ *   key_len == dst_prefix_len > 1    the descent consumes the whole
+ *                                    compressed run and lands on its
+ *                                    child, so d.pnf is compressed --
+ *                                    the grandparent-fuse precondition
+ *
+ * The shapes are not stable across a round (a swap re-shapes the run it was
+ * grafted into), which is the point: the counters, not this comment, say what
+ * actually ran.  Read them.
+ */
+struct gs_layout {
+	const char *name;
+	uint8_t dst_prefix[GS_MAX_PREFIX];
+	unsigned int dst_prefix_len;
+	unsigned int key_len;	/* graft_swap key = dst_prefix[0 .. key_len) */
+	/*
+	 * Writers driving the shared destination.  2 is the oracle; 1 is the
+	 * CONTROL that says whether a red result needs a peer at all.  Without
+	 * the control a red shape-oracle cannot distinguish "this arm is broken
+	 * under concurrency" from "this arm is broken, full stop" -- and the
+	 * single-threaded KEY_SHORTER path IS covered elsewhere
+	 * (ft_unit rank_stats_graft_swap_ks_one), so the two answers point at
+	 * completely different code.
+	 */
+	unsigned int nwriters;
+	/*
+	 * Give each swap trie TWO top-level bytes instead of one.
+	 *
+	 * ★ WITHOUT THIS THE SHAPE DOES NOT HOLD.  A single-top-byte swap root
+	 * canonicalizes to a COMPRESSED node, which chain-merges into the
+	 * compressed run it is grafted into -- so the graft point moves and the
+	 * next round descends a different arm.  The probe shows it plainly:
+	 * kshort=1 over 129102 rounds, i.e. the shape under test ran ONCE and
+	 * the other 129101 rounds measured something else.  A branching swap
+	 * root cannot merge, so the graft point stays put and the arm actually
+	 * repeats.
+	 */
+	bool swap_branch;
+	/*
+	 * Bytes of shared prefix to give the SWAP content.
+	 *
+	 * ★ KEY_SHORTER UN-DOES ITSELF.  Grafting at a key that ends inside a
+	 * compressed run SPLITS that run there, so the same key is an EXACT
+	 * position next round -- which is why the first kshort layouts scored
+	 * kshort=1 and then measured EXACT forever.  Swap content carrying its
+	 * own deep prefix re-forms a long run under the graft key every time it
+	 * lands, so the arm actually repeats.
+	 */
+	unsigned int swap_prefix_len;
+};
 
 struct gs_shared_ctx {
 	struct cds_ft *dst;
 	struct cds_ft *swap[2];
+	const struct gs_layout *lay;
 	unsigned long seq;
 	unsigned long done;
 	unsigned long retries;
@@ -9646,7 +9715,8 @@ static void *gs_shared_writer(void *arg)
 {
 	struct gs_arg *a = (struct gs_arg *) arg;
 	struct gs_shared_ctx *c = a->ctx;
-	const uint8_t key[1] = { GS_SHARED_KEY };
+	const uint8_t *key = c->lay->dst_prefix;
+	const size_t key_len = c->lay->key_len;
 	unsigned long seen = 0;
 
 	rcu_register_thread();
@@ -9678,8 +9748,8 @@ static void *gs_shared_writer(void *arg)
 				 * exactly like a livelock and was not one.
 				 */
 				cds_ft_make_exclusive(c->swap[a->w]);
-				c->st[a->w] = cds_ft_graft_swap(c->dst, key, 1,
-					c->swap[a->w]);
+				c->st[a->w] = cds_ft_graft_swap(c->dst, key,
+					key_len, c->swap[a->w]);
 				if (c->st[a->w] != CDS_FT_STATUS_BUSY_ERROR)
 					break;
 				uatomic_inc(&c->retries);
@@ -9694,19 +9764,30 @@ static void *gs_shared_writer(void *arg)
 	return NULL;
 }
 
-/* Fill @ft with @n keys under @prefix (prefix omitted when @with_prefix). */
+/*
+ * Fill @ft with @n keys "@prefix ++ @tag ++ i".  @prefix is the dst layout's
+ * shared prefix for the destination and empty for a swap trie (whose content
+ * is re-homed under the graft key by the swap itself).  Every dst key sharing
+ * the whole prefix is what makes it collapse into ONE compressed run -- the
+ * run whose interior the KEY_SHORTER shape needs to land in.
+ */
+/* Shared prefix handed to a swap trie when the layout asks for a deep one. */
+static const uint8_t gs_swap_prefix[3] = { 0xC1, 0xC2, 0xC3 };
+
 static void gs_fill(struct cds_ft *ft, uint8_t tag, unsigned int n,
-		bool with_prefix)
+		const uint8_t *prefix, unsigned int prefix_len)
 {
 	unsigned int i;
 
 	for (i = 0; i < n; i++) {
-		uint8_t k[3];
+		uint8_t k[GS_MAX_PREFIX + 4];
 		size_t klen = 0;
 		struct ft_test_node *node = node_alloc(((uint64_t) tag << 8) | i);
 
-		if (with_prefix)
-			k[klen++] = GS_SHARED_KEY;
+		if (prefix_len) {
+			memcpy(k, prefix, prefix_len);
+			klen = prefix_len;
+		}
 		k[klen++] = tag;
 		k[klen++] = (uint8_t) i;
 		memcpy(node->okey, k, klen);
@@ -9716,7 +9797,8 @@ static void gs_fill(struct cds_ft *ft, uint8_t tag, unsigned int n,
 	}
 }
 
-static int gs_shared_oracle(const char *tname, bool list_on)
+static int gs_shared_oracle(const char *tname, bool list_on,
+		const struct gs_layout *lay)
 {
 	enum cds_ft_writer_strategy ws = CDS_FT_WRITER_LOCK_FINE;
 	struct cds_ft_group *group;
@@ -9728,9 +9810,11 @@ static int gs_shared_oracle(const char *tname, bool list_on)
 	unsigned long total, round = 0, lost_rounds = 0;
 	unsigned long both_ok = 0, one_ok = 0;
 	unsigned long stcount[8] = { 0 };
+	const unsigned int nw = lay->nwriters;
 	unsigned int i;
 	int ret = 0;
 
+	assert(nw >= 1 && nw <= 2);
 	probe = list_on ? create_varlen_ord_ft_ws(&group, &ws)
 			: create_varlen_nolist_ft_ws(&group, &ws);
 
@@ -9738,20 +9822,26 @@ static int gs_shared_oracle(const char *tname, bool list_on)
 	ctx.seq = 0;
 	ctx.done = 0;
 	ctx.retries = 0;
+	ctx.lay = lay;
 	if (cds_ft_create(group, NULL, &ctx.dst) < 0)
 		abort();
 	for (i = 0; i < 2; i++) {
 		if (cds_ft_create(group, NULL, &ctx.swap[i]) < 0)
 			abort();
 		gs_fill(ctx.swap[i], (uint8_t) (0xA0 + i), GS_KEYS_PER_TRIE,
-			/*with_prefix=*/ false);
+			gs_swap_prefix, lay->swap_prefix_len);
+		if (lay->swap_branch)
+			gs_fill(ctx.swap[i], (uint8_t) (0xB0 + i),
+				GS_KEYS_PER_TRIE, gs_swap_prefix,
+				lay->swap_prefix_len);
 	}
-	gs_fill(ctx.dst, 0xD0, GS_KEYS_PER_TRIE, /*with_prefix=*/ true);
+	gs_fill(ctx.dst, 0xD0, GS_KEYS_PER_TRIE, lay->dst_prefix,
+		lay->dst_prefix_len);
 
 	total = cds_ft_count_keys(ctx.dst) + cds_ft_count_keys(ctx.swap[0])
 		+ cds_ft_count_keys(ctx.swap[1]);
 
-	for (i = 0; i < 2; i++) {
+	for (i = 0; i < nw; i++) {
 		arg[i].ctx = &ctx;
 		arg[i].w = i;
 		pthread_create(&th[i], NULL, gs_shared_writer, &arg[i]);
@@ -9764,7 +9854,7 @@ static int gs_shared_oracle(const char *tname, bool list_on)
 		ctx.st[0] = ctx.st[1] = CDS_FT_STATUS_OK;
 		uatomic_store(&ctx.done, 0, CMM_RELAXED);
 		uatomic_store(&ctx.seq, round + 1, CMM_RELEASE);
-		while (uatomic_load(&ctx.done, CMM_ACQUIRE) != 2) {
+		while (uatomic_load(&ctx.done, CMM_ACQUIRE) != nw) {
 			caa_cpu_relax();
 			rcu_quiescent_state();
 		}
@@ -9786,14 +9876,21 @@ static int gs_shared_oracle(const char *tname, bool list_on)
 			ret = -1;
 			total = now;	/* re-baseline so one loss is not counted forever */
 		}
-		for (i = 0; i < 2; i++) {
+		for (i = 0; i < nw; i++) {
 			int idx = -(int) ctx.st[i];
 
 			if (idx < 0 || idx > 7)
 				idx = 0;
 			stcount[idx]++;
 		}
-		if (ctx.st[0] == CDS_FT_STATUS_OK
+		/*
+		 * "both" is every DRIVING writer -- with nw == 1 the control
+		 * still has to report that its one swap landed, or a control
+		 * that silently did nothing would read as a clean denominator.
+		 */
+		if (nw == 1)
+			both_ok += (ctx.st[0] == CDS_FT_STATUS_OK);
+		else if (ctx.st[0] == CDS_FT_STATUS_OK
 				&& ctx.st[1] == CDS_FT_STATUS_OK)
 			both_ok++;
 		else if (ctx.st[0] == CDS_FT_STATUS_OK
@@ -9811,7 +9908,7 @@ static int gs_shared_oracle(const char *tname, bool list_on)
 	}
 
 	uatomic_store(&ctx.stop, 1, CMM_RELEASE);
-	for (i = 0; i < 2; i++)
+	for (i = 0; i < nw; i++)
 		pthread_join(th[i], NULL);
 
 	fprintf(stderr, "# %s: %lu rounds (both-OK %lu, one-OK %lu), "
@@ -9820,9 +9917,9 @@ static int gs_shared_oracle(const char *tname, bool list_on)
 		tname, round + 1, both_ok, one_ok, lost_rounds, ctx.retries,
 		stcount[0], stcount[1], stcount[2], stcount[3], stcount[4],
 		stcount[5], stcount[6], stcount[7]);
-	/* A run where the two never both succeeded has not driven the window. */
+	/* A run where the writers never all succeeded has not driven the window. */
 	if (!ret && both_ok == 0) {
-		fprintf(stderr, "%s: no round had BOTH swaps succeed -- the "
+		fprintf(stderr, "%s: no round had every swap succeed -- the "
 			"shared-destination window was never driven\n", tname);
 		ret = -1;
 	}
@@ -9853,15 +9950,174 @@ static int gs_shared_oracle(const char *tname, bool list_on)
 	return ret;
 }
 
+/*
+ * The graft point is a ROOT SLOT: key_len == dst_prefix_len == 1, so the
+ * descent's last step lands directly on dst's depth-1 child.  This is the
+ * shape the family has always run -- FT_GRAFT_SWAP_EXACT with a plain parent.
+ */
+static const struct gs_layout gs_lay_exact = {
+	"exact", { GS_SHARED_KEY }, 1, 1, 2, false, 0
+};
+
+/*
+ * The graft point is INSIDE a compressed run: every dst key shares three
+ * prefix bytes, which collapse into one compressed node, and the swap key
+ * spans only two of them -- so the descent reports FT_GRAFT_SWAP_KEY_SHORTER
+ * and the swap must split that node's interior.  That arm carries its own
+ * extract build (ft_build_extracted_root_glue on the suffix), its own
+ * ks_cn deferred free, and the LEGACY publish path whose commit status is
+ * still dropped; none of it had ever executed.
+ */
+static const struct gs_layout gs_lay_kshort = {
+	"kshort", { GS_SHARED_KEY, 0x51, 0x52 }, 3, 2, 2, false, 0
+};
+/*
+ * DEPTH CONTROL: same deep dst as "kshort", but the swap key spans only the
+ * FIRST prefix byte, so the graft point is a root slot again (EXACT, plain
+ * parent) while the trie below it is just as deep.  Separates "the shape
+ * oracles are red because the trie got deeper" from "because the graft
+ * point's parent stopped being the root".
+ */
+static const struct gs_layout gs_lay_wide = {
+	"wide", { GS_SHARED_KEY, 0x51, 0x52 }, 3, 1, 2, false, 0
+};
+/*
+ * STABLE EXACT-UNDER-A-COMPRESSED-PARENT.  dst keys are prefix ++ 0xD0 ++ i,
+ * so the run under the root's 0x50 slot is [0x51, 0xD0] and the swap key spans
+ * all three bytes -- the descent consumes the whole run and stops on
+ * cn->child.  d.pnf is therefore a COMPRESSED node and the forward publish
+ * targets &cn->child rather than a root slot, which the original fixture never
+ * did.  @swap_branch keeps it that way across rounds.  Note dst_prefix_len (2)
+ * is what gs_fill writes; key_len (3) reaches one byte further, onto the tag
+ * every dst key shares.
+ */
+static const struct gs_layout gs_lay_cparent = {
+	"cparent", { GS_SHARED_KEY, 0x51, 0xD0 }, 2, 3, 2, true, 0
+};
+static const struct gs_layout gs_lay_cparent_solo = {
+	"cparent-solo", { GS_SHARED_KEY, 0x51, 0xD0 }, 2, 3, 1, true, 0
+};
+/*
+ * Deep dst run, key ending inside it, and swap content carrying its own deep
+ * prefix.
+ *
+ * ★ THIS WAS AN ATTEMPT AT A SUSTAINED KEY_SHORTER AND IT DID NOT WORK -- the
+ * probe says kshort=1 over 123280 rounds, same as the layouts without the deep
+ * swap prefix.  The swap prefix only shapes ROUND 0; from round 1 the ring
+ * circulates whatever was EXTRACTED from dst, and grafting at a key inside a
+ * compressed run SPLITS the run there, so that key is an EXACT position ever
+ * after.  KEY_SHORTER is self-cancelling in a swap ring.  Kept because it is a
+ * distinct round-0 shape and a cheap control, NOT because it soaks the arm:
+ * sustaining it needs a per-round reseed of dst (see the empty-dst oracles,
+ * which refill their sources every round).  Read the counters, not this name.
+ */
+static const struct gs_layout gs_lay_ks2 = {
+	"ks2", { GS_SHARED_KEY, 0x51, 0x52 }, 3, 2, 2, false, 3
+};
+static const struct gs_layout gs_lay_ks2_solo = {
+	"ks2-solo", { GS_SHARED_KEY, 0x51, 0x52 }, 3, 2, 1, false, 3
+};
+static const struct gs_layout gs_lay_kshort_solo = {
+	"kshort-solo", { GS_SHARED_KEY, 0x51, 0x52 }, 3, 2, 1, false, 0
+};
+
+/*
+ * The graft point is a COMPRESSED NODE'S CHILD: the key spans the whole
+ * shared prefix, so the descent consumes the compressed run and stops on
+ * cn->child with d.pnf compressed.  That is the precondition for the
+ * skip-compressed grandparent FUSE, which carries a second instance of the
+ * two-load shape @c9f02111 fixed (ft-graft.h, pub_old read separately from
+ * the pcn body the merged node is built from).
+ */
+static const struct gs_layout gs_lay_deep = {
+	"deep", { GS_SHARED_KEY, 0x51 }, 2, 2, 2, false, 0
+};
+static const struct gs_layout gs_lay_deep_solo = {
+	"deep-solo", { GS_SHARED_KEY, 0x51 }, 2, 2, 1, false, 0
+};
+
 static int inv_graft_swap_shared_dst(void)
 {
-	return gs_shared_oracle("inv_graft_swap_shared_dst", /*list_on=*/ true);
+	return gs_shared_oracle("inv_graft_swap_shared_dst", /*list_on=*/ true,
+		&gs_lay_exact);
 }
 
 static int inv_graft_swap_shared_dst_nolist(void)
 {
 	return gs_shared_oracle("inv_graft_swap_shared_dst_nolist",
-		/*list_on=*/ false);
+		/*list_on=*/ false, &gs_lay_exact);
+}
+
+static int inv_graft_swap_shared_dst_kshort(void)
+{
+	return gs_shared_oracle("inv_graft_swap_shared_dst_kshort",
+		/*list_on=*/ true, &gs_lay_kshort);
+}
+
+static int inv_graft_swap_shared_dst_kshort_nolist(void)
+{
+	return gs_shared_oracle("inv_graft_swap_shared_dst_kshort_nolist",
+		/*list_on=*/ false, &gs_lay_kshort);
+}
+
+static int inv_graft_swap_shared_dst_deep(void)
+{
+	return gs_shared_oracle("inv_graft_swap_shared_dst_deep",
+		/*list_on=*/ true, &gs_lay_deep);
+}
+
+static int inv_graft_swap_shared_dst_deep_nolist(void)
+{
+	return gs_shared_oracle("inv_graft_swap_shared_dst_deep_nolist",
+		/*list_on=*/ false, &gs_lay_deep);
+}
+
+/*
+ * THE CONTROLS.  Same layouts, same key, ONE writer -- so the destination is
+ * still re-shaped by a real graft_swap every round but no peer ever contends
+ * it.  These must stay GREEN: if a shape oracle is red and its control is red
+ * too, the arm is broken outright and the concurrency framing is wrong.
+ */
+static int inv_graft_swap_shared_dst_ks2_nolist(void)
+{
+	return gs_shared_oracle("inv_graft_swap_shared_dst_ks2_nolist",
+		/*list_on=*/ false, &gs_lay_ks2);
+}
+
+static int inv_graft_swap_shared_dst_ks2_solo(void)
+{
+	return gs_shared_oracle("inv_graft_swap_shared_dst_ks2_solo",
+		/*list_on=*/ false, &gs_lay_ks2_solo);
+}
+
+static int inv_graft_swap_shared_dst_cparent_nolist(void)
+{
+	return gs_shared_oracle("inv_graft_swap_shared_dst_cparent_nolist",
+		/*list_on=*/ false, &gs_lay_cparent);
+}
+
+static int inv_graft_swap_shared_dst_cparent_solo(void)
+{
+	return gs_shared_oracle("inv_graft_swap_shared_dst_cparent_solo",
+		/*list_on=*/ false, &gs_lay_cparent_solo);
+}
+
+static int inv_graft_swap_shared_dst_wide_nolist(void)
+{
+	return gs_shared_oracle("inv_graft_swap_shared_dst_wide_nolist",
+		/*list_on=*/ false, &gs_lay_wide);
+}
+
+static int inv_graft_swap_shared_dst_kshort_solo(void)
+{
+	return gs_shared_oracle("inv_graft_swap_shared_dst_kshort_solo",
+		/*list_on=*/ false, &gs_lay_kshort_solo);
+}
+
+static int inv_graft_swap_shared_dst_deep_solo(void)
+{
+	return gs_shared_oracle("inv_graft_swap_shared_dst_deep_solo",
+		/*list_on=*/ false, &gs_lay_deep_solo);
 }
 
 static int inv_merge_root_src_cross_view(void)
@@ -16463,6 +16719,17 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_merge_root_swap_cross_view);
 	RUN_TEST(inv_graft_swap_shared_dst);
 	RUN_TEST(inv_graft_swap_shared_dst_nolist);
+	RUN_TEST(inv_graft_swap_shared_dst_kshort);
+	RUN_TEST(inv_graft_swap_shared_dst_kshort_nolist);
+	RUN_TEST(inv_graft_swap_shared_dst_deep);
+	RUN_TEST(inv_graft_swap_shared_dst_deep_nolist);
+	RUN_TEST(inv_graft_swap_shared_dst_ks2_nolist);
+	RUN_TEST(inv_graft_swap_shared_dst_ks2_solo);
+	RUN_TEST(inv_graft_swap_shared_dst_cparent_nolist);
+	RUN_TEST(inv_graft_swap_shared_dst_cparent_solo);
+	RUN_TEST(inv_graft_swap_shared_dst_wide_nolist);
+	RUN_TEST(inv_graft_swap_shared_dst_kshort_solo);
+	RUN_TEST(inv_graft_swap_shared_dst_deep_solo);
 	RUN_TEST(inv_prefix_key_park_vs_holder_churn);
 	RUN_TEST(inv_empty_dst_root_graft_peer);
 	RUN_TEST(inv_empty_dst_root_graft_peer_nolist);

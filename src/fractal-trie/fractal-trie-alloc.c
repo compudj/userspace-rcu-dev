@@ -1297,6 +1297,15 @@ unsigned long cds_ft_probe_gs_ext_child;
  * double-ownership state).  @canon_alias: what we are about to publish equals
  * what we quoted as expected-old -- the no-op replace.
  */
+/*
+ * @pubabort: the KEY_SHORTER legacy publish's DROPPED commit status
+ * (ft_glue_publish's `(void) ft_ord_cell_flip_into`, whose comment claims
+ * "ABORT unreachable under its exclusion").  Its apply_deferred has already
+ * rewritten LIVE dst parent back-pointers by then, so a dropped abort leaves
+ * them naming a node this op never published.
+ */
+unsigned long cds_ft_probe_gs_pubabort;
+unsigned long cds_ft_probe_gs_pubok;
 unsigned long cds_ft_probe_gs_torn;
 unsigned long cds_ft_probe_gs_alias;
 unsigned long cds_ft_probe_gs_canon_alias;
@@ -1305,11 +1314,12 @@ __attribute__((destructor))
 static void cds_ft_probe_gs_report(void)
 {
 	fprintf(stderr, "GSPROBE commit_ok=%lu reoccupy=%lu slot_moved=%lu "
-		"retry=%lu | torn=%lu alias=%lu canon_alias=%lu "
+		"retry=%lu | pubok=%lu pubabort=%lu | torn=%lu alias=%lu canon_alias=%lu "
 		"| shapes exact=%lu kshort=%lu delegate=%lu "
 		"fused=%lu ext_child=%lu\n",
 		cds_ft_probe_gs_commit_ok, cds_ft_probe_gs_reoccupy,
 		cds_ft_probe_gs_slot_moved, cds_ft_probe_gs_retry,
+		cds_ft_probe_gs_pubok, cds_ft_probe_gs_pubabort,
 		cds_ft_probe_gs_torn, cds_ft_probe_gs_alias,
 		cds_ft_probe_gs_canon_alias,
 		cds_ft_probe_gs_exact, cds_ft_probe_gs_kshort,

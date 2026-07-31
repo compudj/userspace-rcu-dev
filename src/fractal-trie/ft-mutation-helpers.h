@@ -225,6 +225,14 @@ struct cds_ft_inode_flag *ft_descent_step(struct cds_ft *ft, struct ft_descent *
 	return d->nf;
 }
 
+#ifdef FEATURE_FT_PROBE_GRAFT_SWAP
+extern unsigned long cds_ft_probe_gs_pubabort;
+extern unsigned long cds_ft_probe_gs_pubok;
+#define FT_GS_PROBE_INC(c)	__atomic_fetch_add(&(c), 1, __ATOMIC_RELAXED)
+#else
+#define FT_GS_PROBE_INC(c)	do { } while (0)
+#endif
+
 /*
  * FT bridge to the concurrent MCAS transaction engine (<urcu/rcu-txn.h>).  An
  * op records its frozen edge set {slot, old, new} DIRECTLY into the urcu_mcas
@@ -4029,13 +4037,15 @@ struct ft_graft_swap_run {
  * parent slot, plus a compressed parent's SKIP_X dual) ATOMICALLY with @run's
  * ordered-list run-replace, in ONE flip through the caller-PRE-RESERVED txn @txn
  * (the legacy KEY_SHORTER graft_swap commit path).  This runs in the op's
- * failure-free section (after the per-side drains), so it is UN-ABORTABLE: the
- * caller reserves @txn (capacity >= FT_GLUE_PUBLISH_REPLACE_MAX_EDGES) in the
- * graft_swap fallible prefix and ft_ord_cell_flip_into commits it here
- * infallibly.  Arms @run.
+ * failure-free section (after the per-side drains), so it cannot fail for want
+ * of MEMORY: the caller reserves @txn (capacity >=
+ * FT_GLUE_PUBLISH_REPLACE_MAX_EDGES) in the graft_swap fallible prefix.  It can
+ * still ABORT on a peer -- the returned status is the caller's cue to re-plan,
+ * and @run is armed only when it committed.
  */
 static
-void ft_ord_cell_flip_rec_replace(struct cds_ft *ft, struct ft_flip_txn *txn,
+enum urcu_txn_status ft_ord_cell_flip_rec_replace(struct cds_ft *ft,
+		struct ft_flip_txn *txn,
 		struct ft_pub_rec *rec, struct ft_graft_swap_run *run)
 {
 	struct ft_ord_cell_edge edges[FT_GLUE_PUBLISH_REPLACE_MAX_EDGES] = { 0 };
@@ -4049,9 +4059,25 @@ void ft_ord_cell_flip_rec_replace(struct cds_ft *ft, struct ft_flip_txn *txn,
 	}
 	n = ft_ord_cell_run_replace_edges(ft, run->d_first, run->d_last,
 		run->s_first, run->s_last, edges, n);
-	/* Bulk op, not yet MW-hardened: ABORT unreachable under its exclusion. */
-	(void) ft_ord_cell_flip_into(ft, txn, edges, n);
-	run->armed = true;
+	/*
+	 * ★ ABORT IS REACHABLE HERE TOO -- see ft_glue_publish.  The "exclusion"
+	 * the old comment relied on does not exist on a SHARED destination, which
+	 * the public contract explicitly grants.  Arm @run only when the flip
+	 * actually committed: an armed run tells the caller the ordered list was
+	 * re-homed, and on an abort it was not.
+	 */
+	{
+		enum urcu_txn_status pst =
+			ft_ord_cell_flip_into(ft, txn, edges, n);
+
+		if (pst == URCU_TXN_STATUS_OK) {
+			run->armed = true;
+			FT_GS_PROBE_INC(cds_ft_probe_gs_pubok);
+		} else {
+			FT_GS_PROBE_INC(cds_ft_probe_gs_pubabort);
+		}
+		return pst;
+	}
 }
 
 /*
@@ -6682,7 +6708,7 @@ void ft_glue_free_collided_cells(struct cds_ft *ft,
  * node up through the cluster to publish_parent is in place.
  */
 static
-void ft_glue_publish(struct cds_ft *ft, struct ft_flip_txn *txn,
+enum urcu_txn_status ft_glue_publish(struct cds_ft *ft, struct ft_flip_txn *txn,
 		struct ft_glue *g)
 {
 	struct ft_pub_rec rec = { .n = 0 };
@@ -6717,8 +6743,29 @@ void ft_glue_publish(struct cds_ft *ft, struct ft_flip_txn *txn,
 	if (g->count_delta)
 		ft_flip_txn_record_count_parent(ft, txn, g->publish_parent,
 			g->count_delta);
-	/* Bulk op, not yet MW-hardened: ABORT unreachable under its exclusion. */
-	(void) ft_ord_cell_flip_into(ft, txn, sedges, n);
+	/*
+	 * ★ THIS STATUS USED TO BE DROPPED, on a comment that read "Bulk op, not
+	 * yet MW-hardened: ABORT unreachable under its exclusion".  It is
+	 * reachable.  Two cds_ft_graft_swap KEY_SHORTER swaps at ONE destination
+	 * both take this legacy path, and the loser's flip ABORTS -- measured
+	 * pubabort=1 in exactly the runs that went red, 0 in every green one, on
+	 * inv_graft_swap_shared_dst_deep_nolist.  Dropping it made the caller
+	 * carry on as though it had published: it re-rooted the displaced subtree
+	 * into @swap_ft and freed the dst node its publish never replaced, so a
+	 * live dst grandchild was left naming a parent inside the OTHER trie
+	 * ("depth 3 ... parent mismatch: expected P1, got P2").  The exclusion
+	 * the comment appealed to is the one thing a shared destination removes.
+	 */
+	{
+		enum urcu_txn_status pst =
+			ft_ord_cell_flip_into(ft, txn, sedges, n);
+
+		if (pst != URCU_TXN_STATUS_OK)
+			FT_GS_PROBE_INC(cds_ft_probe_gs_pubabort);
+		else
+			FT_GS_PROBE_INC(cds_ft_probe_gs_pubok);
+		return pst;
+	}
 }
 
 /*
@@ -6729,19 +6776,20 @@ void ft_glue_publish(struct cds_ft *ft, struct ft_flip_txn *txn,
  * and commit them all in ONE flip, so a reader never sees run_S's keys
  * reachable in the structure but absent from the ordered list (or run_D the
  * reverse).  @run NULL (ordered list off) falls back to the plain publish.  Both
- * commit through the caller-PRE-RESERVED @txn (un-abortable failure-free
- * section); @txn capacity must be >= FT_GLUE_PUBLISH_REPLACE_MAX_EDGES.
+ * commit through the caller-PRE-RESERVED @txn, so neither can fail for want of
+ * memory; @txn capacity must be >= FT_GLUE_PUBLISH_REPLACE_MAX_EDGES.  RETURNS
+ * the commit status: on a SHARED destination a peer can still make it ABORT,
+ * and the caller must re-plan rather than assume it published.
  */
 static
-void ft_glue_publish_replace(struct cds_ft *ft, struct ft_flip_txn *txn,
+enum urcu_txn_status ft_glue_publish_replace(struct cds_ft *ft,
+		struct ft_flip_txn *txn,
 		struct ft_glue *g, struct ft_graft_swap_run *run)
 {
 	struct ft_pub_rec rec = { .n = 0 };
 
-	if (!run) {
-		ft_glue_publish(ft, txn, g);
-		return;
-	}
+	if (!run)
+		return ft_glue_publish(ft, txn, g);
 	/*
 	 * VALIDATE (§4.B) / LOCK_FINE (step 6, §9.5): acquire publish_parent as a
 	 * RELEASE lock (value-swap REPLACE survivor, guard-fallback on a miss); see
@@ -6754,7 +6802,7 @@ void ft_glue_publish_replace(struct cds_ft *ft, struct ft_flip_txn *txn,
 	if (g->count_delta)
 		ft_flip_txn_record_count_parent(ft, txn, g->publish_parent,
 			g->count_delta);
-	ft_ord_cell_flip_rec_replace(ft, txn, &rec, run);
+	return ft_ord_cell_flip_rec_replace(ft, txn, &rec, run);
 }
 
 /*
