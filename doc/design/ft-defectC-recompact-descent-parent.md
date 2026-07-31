@@ -25,14 +25,14 @@ The stale parent originates in the recompact of `{p}`:
     new_metadata->parent = inh_parent;            // = freed gp
     ft_meta_parent_slot_offset_set(new_metadata, offset(inh_slot, inh_parent));
     if (ft->lock_fine && fenced && inh_parent &&
-        ft_copying_lock_member(ft_flag_to_metadata(ft, inh_parent), ...))  // "locks" freed gp
+        ft_lock_member(ft_flag_to_metadata(ft, inh_parent), ...))  // "locks" freed gp
         return -EAGAIN;
 
 `ft_resolve_parent_slot({p})` reads `{p}->meta->parent`, a **back-pointer that
 was never updated** when gp was recompacted->gp' (child back-pointers reanchor
 lazily via the parked proxy; readers follow the proxy). Once gp is *freed*,
 there is no proxy to follow — the read returns the dangling gp, and
-`ft_copying_lock_member` on gp's reclaimed/zeroed word false-succeeds (no
+`ft_lock_member` on gp's reclaimed/zeroed word false-succeeds (no
 TOMBSTONE bit survives reuse), so the "lock" does not reject it. Then FIX 2 in
 the commit resolves `st->dest->parent` (= inherited gp) and publishes into it.
 
@@ -117,7 +117,7 @@ also hardens the existing `st->pnf = d->pnf` / `d->pnfp` uses.)
 
 ## 4. Correctness
 
-- **No UAF:** `inh_parent = gp'` is the live reanchored node. `ft_copying_lock_member(gp')`
+- **No UAF:** `inh_parent = gp'` is the live reanchored node. `ft_lock_member(gp')`
   succeeds if gp' is live; if gp' was itself retired since the descent (TOMBSTONE
   set by freeze-on-free *before* free), the mark rejects it -> `-EAGAIN` ->
   re-descend — the same try-or-bail contract the point-op gate validated. The old

@@ -1187,8 +1187,8 @@ long cds_ft_fault_flip_countdown = -1;
 
 /*
  * Test-only per-node LOCK-acquisition fault injection (MW LOCK_FINE, §9.3).
- * Counts down over ft_copying_lock_member() calls and fails the (n+1)-th with
- * -EAGAIN, exactly as a peer holding the node's FT_STATE_COPYING lock would.
+ * Counts down over ft_lock_member() calls and fails the (n+1)-th with
+ * -EAGAIN, exactly as a peer holding the node's FT_STATE_LOCK would.
  *
  * Why this knob has to exist: a LOCK_FINE trie still serializes every writer
  * behind the FT-wide lock until the op-domains finish converting (§11.1), so no
@@ -1216,7 +1216,7 @@ long cds_ft_fault_lock_countdown = -1;
  * src side's retires, and every fence still held.  Only injection does.
  *
  * It routes through the engine's own unpublished-discard path (@acquire_miss:
- * age the handle, clear every registered COPYING, report ABORT), so the unwind
+ * age the handle, clear every registered LOCK, report ABORT), so the unwind
  * under test is the real one and not a synthesised status.
  */
 long cds_ft_fault_commit_countdown = -1;
@@ -1238,7 +1238,7 @@ long cds_ft_fault_commit_countdown = -1;
  * reported as success were, until this knob, unexecutable.
  *
  * Routes through the engine's own unpublished-discard path (@acquire_miss: age
- * the handle, clear every registered COPYING, report ABORT), so what runs is the
+ * the handle, clear every registered LOCK, report ABORT), so what runs is the
  * real unwind and not a synthesised status.
  */
 long cds_ft_fault_replace_countdown = -1;

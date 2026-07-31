@@ -172,7 +172,7 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 					 * CONTRACT (audited 2026-07-27): a
 					 * REPLACE at an already-occupied slot
 					 * stores straight into the LIVE pointer
-					 * array -- no COPYING lock, no txn
+					 * array -- no node lock, no txn
 					 * record.  That is sound only on a
 					 * build-invisible node, which is the
 					 * only way this arm is reachable today:
@@ -340,7 +340,7 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 					 * CONTRACT (audited 2026-07-27): a
 					 * REPLACE at an already-occupied slot
 					 * stores straight into the LIVE pointer
-					 * array -- no COPYING lock, no txn
+					 * array -- no node lock, no txn
 					 * record.  That is sound only on a
 					 * build-invisible node, which is the
 					 * only way this arm is reachable today:
@@ -525,7 +525,7 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 					 * CONTRACT (audited 2026-07-27): a
 					 * REPLACE at an already-occupied slot
 					 * stores straight into the LIVE pointer
-					 * array -- no COPYING lock, no txn
+					 * array -- no node lock, no txn
 					 * record.  That is sound only on a
 					 * build-invisible node, which is the
 					 * only way this arm is reachable today:
@@ -1181,11 +1181,11 @@ int ft_node_recompact(enum ft_recompact mode,
 	 * value compare is exact AGAINST THIS CAPTURE; it does NOT detect a
 	 * peer's clean republish of the slot (old -> fresh copy) in the
 	 * capture->copy window -- that stale-plan window is closed by the F2
-	 * COPYING fence (the mark precedes the capture), not here.
+	 * node lock (the mark precedes the capture), not here.
 	 */
 	struct cds_ft_inode_flag *nullify_val = NULL;
 	/*
-	 * F2 COPYING fence state: set when this recompact retires a LIVE
+	 * F2 node lock state: set when this recompact retires a LIVE
 	 * published node (@retire_txn arm) -- @fence_state is the clean
 	 * pre-mark state word, the ONE snapshot the whole copy plan (type
 	 * sizing, tombstone expected-old) derives from.
@@ -1203,18 +1203,18 @@ int ft_node_recompact(enum ft_recompact mode,
 	 * Held only under FINE: COARSE derives no lock-set (§10.5, one FT-wide
 	 * lock).  (The OPTIMISTIC arm this also described -- "keeps its §4.B
 	 * guards, which the release record would poison" -- is gone with the
-	 * strategy; see ft_flip_txn_record_release_copying.)
+	 * strategy; see ft_flip_txn_record_release_lock.)
 	 */
 	struct cds_ft_metadata *rel_meta[2];
 	uintptr_t rel_snap[2];
 	unsigned int nr_rel = 0, ri;
 
 	/*
-	 * F2 COPYING fence, MARK (doc at ft_meta_copying_mark): a live-retire
-	 * copy fences the old node BEFORE any body/state read below -- the
+	 * F2 node lock, MARK (doc at ft_meta_lock_acquire): a live-retire
+	 * locks the old node BEFORE any body/state read below -- the
 	 * sizing nr_child loads, the (parent, offset) inherit, the external-
 	 * head snapshot, and the copy loops all read under the fence, and the
-	 * commit's state record {COPYING|s -> TOMBSTONE|s} pins the word so a
+	 * commit's state record {LOCK|s -> TOMBSTONE|s} pins the word so a
 	 * peer publish that slips a state change under the fence aborts one of
 	 * the two.  A dirty mark (peer proxy / concurrent copier / real
 	 * retire) bails to the op's retry before anything is allocated.  The
@@ -1233,7 +1233,7 @@ int ft_node_recompact(enum ft_recompact mode,
 	 * @rel_meta / @rel_snap / @nr_rel the incremental scheme does, so the build,
 	 * the commit terminals (retire C via @fence_state, release P/GP via
 	 * @rel_snap), and the abandon_fresh unwind are all unchanged below.  Only the
-	 * LOCK_FINE retire arm hoists; the universal F2 copy fence (non-lock_fine /
+	 * LOCK_FINE retire arm hoists; the universal F2 lock (non-lock_fine /
 	 * flag-off) keeps its single mark.
 	 */
 	if (ft->lock_fine && retire_txn && !cluster_leaf && metadata && old_node) {
@@ -1263,7 +1263,7 @@ int ft_node_recompact(enum ft_recompact mode,
 		}
 
 		/*
-		 * FOLD (parent_held): P is already COPYING-held by an earlier step of
+		 * FOLD (parent_held): P is already LOCK-held by an earlier step of
 		 * the SAME op (a same-trie rekey's graft locked the shared spine), so
 		 * do NOT re-lock it (a second ft_dlm_lock would abort -EAGAIN) and do
 		 * NOT add it to @rel_meta below (the holder owns its release).  P stays
@@ -1276,7 +1276,7 @@ int ft_node_recompact(enum ft_recompact mode,
 		 * descent-time relationship, rather than park an SW store into a word it
 		 * does not hold.  HONEST SCOPE (measured: 0 mismatches in 5525 folds):
 		 * under the fold's OWN precondition it cannot fire -- re-homing C means
-		 * rewriting P's child set, which needs P's COPYING, which the holder has
+		 * rewriting P's child set, which needs P's LOCK, which the holder has
 		 * for the whole window, and a re-home that happened EARLIER tombstoned
 		 * the old P so the holder's own ft_dlm_lock(P) aborted first.  Its value
 		 * is the shapes the precondition does not cover (a climbing detach, where
@@ -1345,7 +1345,7 @@ int ft_node_recompact(enum ft_recompact mode,
 		}
 	} else
 	if (retire_txn && !cluster_leaf && metadata && old_node) {
-		ret = ft_meta_copying_mark(metadata, &fence_state);
+		ret = ft_meta_lock_acquire(metadata, &fence_state);
 		if (ret)
 			return ret;
 		fenced = true;
@@ -1424,20 +1424,20 @@ int ft_node_recompact(enum ft_recompact mode,
 			/* Release the WHOLE lock set, not just C: the up-front
 			 * acquire took P (and GP) into @rel_meta, and this bail is
 			 * before the txn registry takes ownership of them, so they
-			 * are still ours to clear.  Missing this left P/GP COPYING
+			 * are still ours to clear.  Missing this left P/GP LOCK
 			 * for good -- structurally invisible (the trie is
 			 * byte-for-byte intact) and fatal to every later op that
 			 * needs them. */
-			ft_copying_unlock_members(rel_meta, nr_rel);
+			ft_unlock_members(rel_meta, nr_rel);
 			if (fenced)
-				ft_meta_copying_clear(metadata);
+				ft_meta_lock_release(metadata);
 			return -ENOMEM;
 		}
 		new_node = alloc_cds_ft_node(ft, new_type, &new_metadata);
 		if (!new_node) {
-			ft_copying_unlock_members(rel_meta, nr_rel);
+			ft_unlock_members(rel_meta, nr_rel);
 			if (fenced)
-				ft_meta_copying_clear(metadata);
+				ft_meta_lock_release(metadata);
 			return -ENOMEM;
 		}
 
@@ -1526,9 +1526,9 @@ int ft_node_recompact(enum ft_recompact mode,
 				 * yet -- bail and retry after it settles.
 				 */
 				free_cds_ft_node_unpublished(ft, new_node);
-				ft_copying_unlock_members(rel_meta, nr_rel);
+				ft_unlock_members(rel_meta, nr_rel);
 				if (fenced)
-					ft_meta_copying_clear(metadata);
+					ft_meta_lock_release(metadata);
 				return -EAGAIN;
 			}
 			ft_metadata_set_external_nodes(new_node_flag,
@@ -1560,10 +1560,10 @@ int ft_node_recompact(enum ft_recompact mode,
 					rcu_dereference(*bc_slot);
 				if (caa_unlikely(ft_node_flip_proxy(bc_old))) {
 					free_cds_ft_node_unpublished(ft, new_node);
-					ft_copying_unlock_members(rel_meta,
+					ft_unlock_members(rel_meta,
 						nr_rel);
 					if (fenced)
-						ft_meta_copying_clear(metadata);
+						ft_meta_lock_release(metadata);
 					return -EAGAIN;
 				}
 				ft_flip_txn_record_reserved(retire_txn, bc_slot,
@@ -1810,7 +1810,7 @@ int ft_node_recompact(enum ft_recompact mode,
 		/*
 		 * Statically unreachable (every ft_types entry is POPCOUNT /
 		 * PIGEON / NULL), but route through abandon_fresh anyway: it is
-		 * the one failure arm past the COPYING mark, and `goto end`
+		 * the one failure arm past the lock acquire, and `goto end`
 		 * here would leak both the fresh node and the fence if a new
 		 * type class ever forgot to extend this switch.
 		 */
@@ -1880,10 +1880,10 @@ skip_copy:
 		 * parked @meta->parent here is always a DOOMED peer.  The only
 		 * writer that parks it is ft_reparent_record_meta(), which ALWAYS
 		 * records the &meta->state edge alongside it.  So either the peer
-		 * parked before our ft_meta_copying_mark(), which then observed
+		 * parked before our ft_meta_lock_acquire(), which then observed
 		 * FT_STATE_PROXY and bailed -EAGAIN (we never reach here), or it
 		 * parks after, and its state-word install fails against the word
-		 * the fence pinned to {COPYING|s -> TOMBSTONE|s}, aborting it.
+		 * the fence pinned to {LOCK|s -> TOMBSTONE|s}, aborting it.
 		 * Either way ft_resolve_flip_proxy() returns old_ptr == the true
 		 * current parent.  (A peer that COMMITTED before the mark leaves a
 		 * plain, coherent new parent; the caller's ft_get_parent_slot()
@@ -1927,7 +1927,7 @@ skip_copy:
 		 * pointer and the state-word offset flip as a co-committed PAIR
 		 * (ft_reparent_record_meta), and only ft_resolve_parent_slot's
 		 * same-mcas + stability re-read recovers them atomically.  It is
-		 * currently a same-value rewrite because the COPYING fence keeps
+		 * currently a same-value rewrite because the node lock keeps
 		 * a peer from parking either edge -- but relying on the fence for
 		 * COHERENCE (as opposed to for the resolve's exactness below) is
 		 * an invariant this code should not have to know.
@@ -1995,7 +1995,7 @@ skip_copy:
 
 					/*
 					 * Same §11 coherence: the great-grandparent
-					 * to COPYING-lock is cn's parent.  Prefer the
+					 * to node lock is cn's parent.  Prefer the
 					 * hint's LIVE reanchored great-grandparent
 					 * (d->pppnf) over ft_resolve_parent_slot(cn_meta),
 					 * which reads cn's stale back-pointer and would
@@ -2083,11 +2083,11 @@ skip_copy:
 				if (retire_txn) {
 					/*
 					 * No per-slot COPY_SLOT freeze: the node-level
-					 * COPYING fence (ft_meta_copying_mark, set before
+					 * node lock (ft_meta_lock_acquire, set before
 					 * the copy loop) already froze every source slot
 					 * of the retiring node against a peer republish --
 					 * a peer's §4.B clean-LIVE guard fails against the
-					 * COPYING bit -- and the child value was copied
+					 * LOCK bit -- and the child value was copied
 					 * into @new_node above.  Only the live re-parent
 					 * edge remains to record.
 					 */
@@ -2121,7 +2121,7 @@ skip_copy:
 				ft_node_get_nth_skip(new_node_flag,
 						&slot, i, FT_PF_NONE);
 				if (retire_txn) {
-					/* No per-slot freeze: the node-level COPYING
+					/* No per-slot freeze: the node-level LOCK
 					 * fence covers every source slot.  See the
 					 * popcount sweep above. */
 					/*
@@ -2194,13 +2194,13 @@ skip_copy:
 			 * MARK snapshot -- the commit ratifies exactly the
 			 * state the copy was planned against -- and the fence
 			 * hands its outcome to @retire_txn (commit OK consumes
-			 * it via the {COPYING|s -> TOMBSTONE|s} transition;
+			 * it via the {LOCK|s -> TOMBSTONE|s} transition;
 			 * every other terminal outcome clears it through the
 			 * wrapper's registry).
 			 */
-			ft_flip_txn_record_tombstone_copying(retire_txn,
+			ft_flip_txn_record_tombstone_locked(retire_txn,
 					metadata, fence_state);
-			ft_flip_txn_copying_register(retire_txn, metadata);
+			ft_flip_txn_lock_register(retire_txn, metadata);
 		} else if (retire_txn)
 			ft_flip_txn_record_tombstone(retire_txn, metadata);
 		else
@@ -2209,7 +2209,7 @@ skip_copy:
 	/*
 	 * §9.3 LOCK_FINE, the RELEASE half of the lock-set: {P} (+ {GP} when P is
 	 * compressed) are EDITED, not retired, so their locks resolve through the
-	 * other terminal -- {COPYING|s -> s}, dropped atomically with the publish
+	 * other terminal -- {LOCK|s -> s}, dropped atomically with the publish
 	 * that flips their slots.  Expected old is each member's MARK snapshot, so
 	 * a peer state change on a locked node between the mark and the commit
 	 * aborts this recompact rather than committing a plan derived from a world
@@ -2222,9 +2222,9 @@ skip_copy:
 	 * below must NOT unlock them -- the txn owns them.
 	 */
 	for (ri = 0; ri < nr_rel; ri++) {
-		ft_flip_txn_record_release_copying(retire_txn, rel_meta[ri],
+		ft_flip_txn_record_release_lock(retire_txn, rel_meta[ri],
 				rel_snap[ri]);
-		ft_flip_txn_copying_register(retire_txn, rel_meta[ri]);
+		ft_flip_txn_lock_register(retire_txn, rel_meta[ri]);
 	}
 
 	ret = 0;
@@ -2244,9 +2244,9 @@ abandon_fresh:
 	 * success path above); -EAGAIN re-descends after the peer settles.
 	 */
 	free_cds_ft_node_unpublished(ft, new_node);
-	ft_copying_unlock_members(rel_meta, nr_rel);
+	ft_unlock_members(rel_meta, nr_rel);
 	if (fenced)
-		ft_meta_copying_clear(metadata);
+		ft_meta_lock_release(metadata);
 	return ret;
 }
 
@@ -2291,20 +2291,20 @@ struct cds_ft_metadata *ft_child_state_meta(struct cds_ft *ft,
  * (locked, cannot fail).
  *
  * SW SAFETY (why the parks cannot be clobbered): the parent-pointer edge is
- * owned by @stop's lock (no peer re-homes a child of a COPYING-held parent).
+ * owned by @stop's lock (no peer re-homes a child of a LOCK-held parent).
  * The re-parent's §4.B guard edge and the retire both park the STATE word, which
- * ft_meta_nr_child_inc CASes IGNORING COPYING, so each such node is
- * COPYING-MARKED here (@stop for the retire, every metadata-bearing child for
+ * ft_meta_nr_child_inc CASes IGNORING LOCK, so each such node is
+ * LOCK-MARKED here (@stop for the retire, every metadata-bearing child for
  * its guard) and a peer's count CAS now HONORS the mark and spins
  * (FT_STATE_INPLACE_WAIT_MASK) until this commit settles the word.  The interior
  * stays SHARED, so children of children need no marks.
  *
  * ☠ RELEASE ATTRIBUTION -- do not re-derive.  Each child's mark is released by
  * ft_reparent_record_meta's {live_state -> live_state} STATE edge, whose
- * live_state has COPYING masked out and which is recorded UNCONDITIONALLY; the
+ * live_state has LOCK masked out and which is recorded UNCONDITIONALLY; the
  * retire consumes @stop's.  It is NOT the pso edge: since @118245b0 the pso is
  * its own word and its edge is recorded only when the slot index CHANGES, so
- * resting the release on it would leak a permanent COPYING on every child that
+ * resting the release on it would leak a permanent LOCK on every child that
  * lands at the same index.  The pre-§8.3 story (pso rode the state word, the pso
  * edge did the masking) reads plausibly and is wrong.
  *
@@ -2313,9 +2313,9 @@ struct cds_ft_metadata *ft_child_state_meta(struct cds_ft *ft,
  *  - @marks / @snaps: caller-owned scratch of >= FT_ENTRY_PER_NODE + 1 entries;
  *    *@nr_marks returns the count recorded (published incrementally so a bail is
  *    covered).  These marks are NOT txn-registered (count can exceed
- *    FT_FLIP_TXN_MAX_COPYING), so the CALLER MUST, after committing OR aborting
- *    @txn, sweep ft_meta_copying_clear_if_held over marks[0..*@nr_marks) -- a
- *    no-op for the COPYING a commit consumed via the retire / pso SW edges, a
+ *    FT_FLIP_TXN_MAX_LOCKS), so the CALLER MUST, after committing OR aborting
+ *    @txn, sweep ft_meta_lock_release_if_held over marks[0..*@nr_marks) -- a
+ *    no-op for the LOCK a commit consumed via the retire / pso SW edges, a
  *    release for any still held on abort (the ft_detach_node orphan-chain
  *    pattern).
  *  - On success (0): *@stop_prime_ret is the fresh UNPUBLISHED copy.  The caller
@@ -2356,7 +2356,7 @@ int ft_rekey_cow_stop(struct cds_ft *ft, struct ft_flip_txn *txn,
 	assert(stop_meta->external_nodes == NULL);	/* sub-step-2 scope */
 
 	/* 1. Acquire @stop's retire lock -- the fence BEFORE any body read. */
-	if (ft_meta_copying_mark(stop_meta, &stop_snap))
+	if (ft_meta_lock_acquire(stop_meta, &stop_snap))
 		return -EAGAIN;
 	marks[nm] = stop_meta;
 	snaps[nm] = stop_snap;
@@ -2462,7 +2462,7 @@ int ft_rekey_cow_stop(struct cds_ft *ft, struct ft_flip_txn *txn,
 	/*
 	 * 4. MARK each metadata-bearing child + record its SW re-parent onto
 	 *    @stop'.  Iterate the FRESH node's children (post-copy).  The mark must
-	 *    precede ft_reparent_record so its pso edge's new_state (COPYING masked
+	 *    precede ft_reparent_record so its pso edge's new_state (LOCK masked
 	 *    out) releases the mark at the commit flip.
 	 */
 	if (type->type_class == FT_POPCOUNT) {
@@ -2481,7 +2481,7 @@ int ft_rekey_cow_stop(struct cds_ft *ft, struct ft_flip_txn *txn,
 			if (cm) {
 				uintptr_t csnap;
 
-				if (ft_meta_copying_mark(cm, &csnap)) {
+				if (ft_meta_lock_acquire(cm, &csnap)) {
 					ret = -EAGAIN;
 					goto abandon;
 				}
@@ -2506,7 +2506,7 @@ int ft_rekey_cow_stop(struct cds_ft *ft, struct ft_flip_txn *txn,
 			if (cm) {
 				uintptr_t csnap;
 
-				if (ft_meta_copying_mark(cm, &csnap)) {
+				if (ft_meta_lock_acquire(cm, &csnap)) {
 					ret = -EAGAIN;
 					goto abandon;
 				}
@@ -2521,12 +2521,12 @@ int ft_rekey_cow_stop(struct cds_ft *ft, struct ft_flip_txn *txn,
 	}
 
 	/*
-	 * 5. Retire @stop (SW fenced tombstone {COPYING|snap -> TOMBSTONE|snap}).
+	 * 5. Retire @stop (SW fenced tombstone {LOCK|snap -> TOMBSTONE|snap}).
 	 *    A peer's ft_meta_nr_child_inc(@stop) now honors the mark and spins, so
 	 *    the SW park is not clobbered.  Not registered -- the caller's sweep
 	 *    owns clearing (marks[0]).
 	 */
-	ft_flip_txn_record_tombstone_copying(txn, stop_meta, stop_snap);
+	ft_flip_txn_record_tombstone_locked(txn, stop_meta, stop_snap);
 
 	*stop_prime_ret = new_flag;
 	return 0;
@@ -2706,7 +2706,7 @@ int ft_node_replace_ptr(struct cds_ft *ft,
 		 * the identity is VALIDATED by a C.parent == @held_hint->parent
 		 * read-set guard riding the recompaction's own acquire commit, so a
 		 * re-home aborts -> re-descend.  Two shapes:
-		 *  - @parent_held: the graft already COPYING-holds that parent (the
+		 *  - @parent_held: the graft already holds the lock that parent (the
 		 *    two junctions share it), so this recompaction must REUSE the held
 		 *    lock -- a second ft_dlm_lock would abort -EAGAIN -- and must not
 		 *    record a second release.

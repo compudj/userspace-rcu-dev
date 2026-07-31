@@ -327,7 +327,7 @@ struct cds_ft_inode_flag *ft_merge_build_run(struct ft_merge_ctx *c,
 }
 
 /*
- * DLM overlap-spine plan-lock (§9.4 M-2): acquire a DST overlap node's COPYING
+ * DLM overlap-spine plan-lock (§9.4 M-2): acquire a DST overlap node's LOCK
  * fence BEFORE ft_merge_build reads its body into the merged cluster, so the copy
  * plan and the retire that ratifies it bracket the same world.
  *
@@ -365,7 +365,7 @@ int ft_merge_lock_overlap(void *node, uintptr_t *snap)
 		cds_ft_fault_lock_countdown--;
 	}
 #endif
-	return ft_meta_copying_mark(cds_ft_item_to_metadata(
+	return ft_meta_lock_acquire(cds_ft_item_to_metadata(
 		(struct cds_ft_inode *) node), snap);
 }
 
@@ -440,7 +440,7 @@ struct cds_ft_inode_flag *ft_merge_build(struct ft_merge_ctx *c,
 	 *
 	 * A compressed run re-entered at off_d > 0 by the shared-run recursion was
 	 * already fenced by the frame that entered it at 0, so it must NOT be
-	 * re-marked: ft_meta_copying_mark refuses an already-COPYING word and we
+	 * re-marked: ft_meta_lock_acquire refuses an already-locked word and we
 	 * would fail against our own fence.  An EXTERNAL D retires nothing here, so
 	 * it takes no lock.
 	 */
@@ -466,7 +466,7 @@ struct cds_ft_inode_flag *ft_merge_build(struct ft_merge_ctx *c,
 			 * FT_MERGE_OOM, a set_nth failure -- that return straight
 			 * out.  Recording at the tail (where the plain retire sits)
 			 * would leave those paths holding an unrecorded fence: a
-			 * node left permanently COPYING, which no later publish into
+			 * node left permanently LOCK, which no later publish into
 			 * it can ever survive.  Recording early is harmless on the
 			 * failing path, since the free list only tombstones anything
 			 * if this build reaches its commit.
@@ -1739,7 +1739,7 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	}
 
 	/*
-	 * Dup-chain lock-set (MW LOCK_FINE): take the COPYING lock of every
+	 * Dup-chain lock-set (MW LOCK_FINE): take the node lock of every
 	 * distinct holder whose chain step 3c appends a collided src run to, so
 	 * the tail walk + append run under the same per-node lock insert, remove,
 	 * promote and replace take on that chain.  HERE is the last point where a
@@ -1801,7 +1801,7 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	 * it CAN be a dup-chain holder we just locked (an external dst merge point),
 	 * so take that fence over rather than re-marking our own word -- the
 	 * self-deadlock this file has now hit twice.  Either way the holder rides
-	 * @gd to the publish, which records the {COPYING|s -> s} release directly
+	 * @gd to the publish, which records the {LOCK|s -> s} release directly
 	 * and so never consults lock_or_guard.  With no acquire left to miss, that
 	 * abort cause is gone rather than merely less likely.
 	 *
@@ -1813,7 +1813,7 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		uintptr_t psnap = 0;
 
 		if (!ft_glue_splice_holder_take(&gd, pm, &psnap) &&
-				ft_meta_copying_mark(pm, &psnap)) {
+				ft_meta_lock_acquire(pm, &psnap)) {
 			free(ms_src_pool);
 			free(ms_src_caps);
 			free(ms_edges);
@@ -1978,7 +1978,7 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		 * immediate parent -- @pub_parent.  Re-marking a word this op already
 		 * fenced MISSES, and a miss now sets acquire_miss and ABORTS a commit
 		 * with no bail path left (the src is already unlinked).  Hand the held
-		 * fence to the txn instead: hold_or_lock records the {COPYING|s -> s}
+		 * fence to the txn instead: hold_or_lock records the {LOCK|s -> s}
 		 * release, the guard's strictly stronger twin, and the txn owns the
 		 * unlock from here (so the take clears our entry).
 		 */
@@ -2055,7 +2055,7 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	 *    splice edge per moved key.  (Only cds_ft_rekey_graft demands an empty
 	 *    destination, and it never reaches the spine copy.)
 	 *
-	 *    Every append here runs under the chain holder's COPYING lock, taken
+	 *    Every append here runs under the chain holder's node lock, taken
 	 *    before the point of no return by ft_glue_acquire_splice_holders and
 	 *    released after the commit below -- so the walk to the tail cannot race
 	 *    a peer's append/unchain/promote on the same chain.
@@ -2094,7 +2094,7 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		 * op owns none of those frees -- renounce them before the step-7
 		 * reclaim.  The dominant reason a fenced terminal aborts is a PEER
 		 * retiring the node under our fence (the retire primitives do not
-		 * honour COPYING), and that peer owns the reclaim: freeing here
+		 * honour LOCK), and that peer owns the reclaim: freeing here
 		 * would be a double free on top of an already-lost merge.
 		 *
 		 * The merge itself still cannot recover -- the src is unlinked by
@@ -2112,15 +2112,15 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	 *    most holders are dst overlap-spine nodes this merge retires, and the
 	 *    fence has to come off while the node is still there to clear.  (The
 	 *    fence survives the commit either way: the free-list retire records a
-	 *    plain {COPYING|s -> COPYING|s|TOMBSTONE} upgrade, and an aborted
-	 *    commit leaves {COPYING|s}.  The one holder that IS the publish target
+	 *    plain {LOCK|s -> LOCK|s|TOMBSTONE} upgrade, and an aborted
+	 *    commit leaves {LOCK|s}.  The one holder that IS the publish target
 	 *    was handed to @txn above and is already released by its flip.)
 	 */
 	ft_glue_release_splice_holders(&gd);
 	/*
 	 *    Same for the overlap-spine plan-locks: a COMMITTED fenced retire
 	 *    consumed each fence into TOMBSTONE (clear_if_held no-ops), while an
-	 *    ABORTED commit left {COPYING|s} that must come off or every later peer
+	 *    ABORTED commit left {LOCK|s} that must come off or every later peer
 	 *    publish into that node fails forever.  One unconditional sweep covers
 	 *    both, which is why no per-outcome bookkeeping is kept.  Before the
 	 *    step-7 reclaim, while the nodes are still addressable.
@@ -3024,8 +3024,8 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 merge_spine_retry:
 	/*
 	 * §11 cross-trie RCU-pinning: the spine-copy path below descends the live
-	 * dst here and COPYING-locks a descent-captured dst node (@d_dst->pnf /
-	 * ->ppnf) inside ft_merge_spine_copy.  A COPYING lock false-succeeds on a
+	 * dst here and node locks a descent-captured dst node (@d_dst->pnf /
+	 * ->ppnf) inside ft_merge_spine_copy.  A node lock false-succeeds on a
 	 * reclaimed+recycled node (arena re-zeroes metadata), so pin the captured
 	 * nodes with the flavor read side across descent -> lock, as cds_ft_graft
 	 * does.  The dup-chain holders the splice lock set acquires are captured
@@ -3132,7 +3132,7 @@ merge_spine_retry:
 
 			/*
 			 * §11 cross-trie RCU-pinning: this is the SAME live-dst
-			 * descent + COPYING-lock as cds_ft_graft, reached through
+			 * descent + node lock as cds_ft_graft, reached through
 			 * cds_ft_merge / cds_ft_merge_at, so it needs the same read-
 			 * side bracket that pins descent-captured dst spine nodes
 			 * against a peer relocate+free+recycle (see the bracket in
@@ -3181,7 +3181,7 @@ merge_spine_retry:
 		 * @cnt_dst was sampled far above, and an ENTIRE ft_detach_keylen of
 		 * the source runs before the swap below -- the widest empty-dst
 		 * window in the FT.  Re-decide emptiness UNDER the old root's
-		 * COPYING fence, so a contract-legal peer attach can no longer land
+		 * node lock, so a contract-legal peer attach can no longer land
 		 * inside that window and be freed with the root it landed on.  On a
 		 * peer-populated dst, fall through to the DIVERGED path below (which
 		 * merges into a populated destination) exactly as an up-front
@@ -3198,7 +3198,7 @@ merge_spine_retry:
 
 		fresh_root = alloc_cds_ft_node(src_ft, &ft_types[0], &fresh_meta);
 		if (!fresh_root) {
-			ft_meta_copying_clear(dst_rmeta);
+			ft_meta_lock_release(dst_rmeta);
 			status = CDS_FT_STATUS_MEMORY_ERROR;
 			goto out;
 		}
@@ -3220,7 +3220,7 @@ merge_spine_retry:
 		else
 			appear_txn = ft_flip_txn_create_bounded(2);
 		if (!appear_txn) {
-			ft_meta_copying_clear(dst_rmeta);
+			ft_meta_lock_release(dst_rmeta);
 			free_cds_ft_node_unpublished(src_ft, fresh_root);
 			status = CDS_FT_STATUS_MEMORY_ERROR;
 			goto out;
@@ -3229,7 +3229,7 @@ merge_spine_retry:
 		status = ft_detach_keylen(src_ft, src_key, src_key_len, &subtree);
 		if (status < 0) {
 			/* NOT_FOUND impossible: @src_ft had content. */
-			ft_meta_copying_clear(dst_rmeta);
+			ft_meta_lock_release(dst_rmeta);
 			if (appear_txn)
 				ft_flip_txn_destroy(appear_txn);
 			free_cds_ft_node_unpublished(src_ft, fresh_root);
@@ -3274,9 +3274,9 @@ merge_spine_retry:
 			 * relink_incoming = true); @subtree's sentinel resets to empty with
 			 * a plain store.
 			 */
-			ft_flip_txn_record_tombstone_copying(appear_txn,
+			ft_flip_txn_record_tombstone_locked(appear_txn,
 				dst_rmeta, dst_root_snap);
-			ft_flip_txn_copying_register(appear_txn, dst_rmeta);
+			ft_flip_txn_lock_register(appear_txn, dst_rmeta);
 			ft_root_list_swap_publish(dst_ft, appear_txn, &dst_ft->root,
 				dst_root_fenced, subtree->root,
 				NULL, ft_ord_first(subtree),
@@ -3296,9 +3296,9 @@ merge_spine_retry:
 			ft_flip_txn_record_reserved(appear_txn,
 				(void **) &dst_ft->root,
 				(void *) dst_root_fenced, (void *) subtree->root);
-			ft_flip_txn_record_tombstone_copying(appear_txn,
+			ft_flip_txn_record_tombstone_locked(appear_txn,
 				dst_rmeta, dst_root_snap);
-			ft_flip_txn_copying_register(appear_txn, dst_rmeta);
+			ft_flip_txn_lock_register(appear_txn, dst_rmeta);
 			ft_flip_txn_commit(dst_ft, appear_txn);
 		}
 		FT_TP(root_publish, (const void *) dst_ft,

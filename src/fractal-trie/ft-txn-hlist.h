@@ -153,7 +153,7 @@ struct cds_ft_node *ft_hlist_next_rcu(struct cds_ft_node *node)
  * idiom.  OOM is sticky to the commit.
  *
  * Single-writer per chain (MW LOCK_FINE Step A: every chain mutation runs under
- * the head-holder's COPYING lock -- or, before the FT-wide lock drops, that lock;
+ * the head-holder's node lock -- or, before the FT-wide lock drops, that lock;
  * a disjoint-key optimistic writer owns its own chain), so @pos is never
  * concurrently deleted and @succ is never a neighbour mid-deletion.  The
  * multi-writer arbitration those cases needed -- bail -ENOENT on a marked @pos,

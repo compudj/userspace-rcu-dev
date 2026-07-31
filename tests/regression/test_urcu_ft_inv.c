@@ -568,7 +568,7 @@ static struct cds_ft *create_fixed_coarse_lock_ft(size_t klen,
  * Fine-grained MW lock-mode trie (CDS_FT_WRITER_LOCK_FINE): the op-domains
  * converted so far (§11.3 step 3: recompact) acquire their per-node lock-set
  * {C, P} (+ {GP}) instead of §4.B-guarding the parent, and release the surviving
- * members through the {COPYING|s -> s} terminal at the commit.  Until every
+ * members through the {LOCK|s -> s} terminal at the commit.  Until every
  * domain is converted the trie ALSO takes the FT-wide writer lock, so the
  * per-node locks are exercised under serialization rather than contended (the
  * §11.1 coexistence hazard forbids racing a converted op with an unconverted
@@ -1290,7 +1290,7 @@ static int inv_concurrent_writers_disjoint(void)
  * Coherent-rekey concurrent-writer oracle (DISJOINT): N writers each own a
  * private subtree and rekey it back and forth between two junctions that SHARE
  * the root as grandparent (d_src.ppnf == d_dst.ppnf == root), so every writer's
- * move COPYING-locks root and all N SERIALIZE on it -- the contention this hook's
+ * move node locks root and all N SERIALIZE on it -- the contention this hook's
  * up-front DLM acquire is designed to fail-fast + retry on.  Disjoint key
  * ownership means no writer ever re-homes a peer's junction, so the writer's
  * parent_held reuse is exercised under contention but not its racy re-home edge
@@ -1361,7 +1361,7 @@ static void *rk_writer(void *arg)
 			w->ops++;
 		} else if (rc == -EAGAIN || rc == -EIO || rc == -ENOMEM) {
 			/*
-			 * TRANSIENT contention abort (a peer holds root's COPYING
+			 * TRANSIENT contention abort (a peer holds root's LOCK
 			 * when this move tries to acquire it): -EIO = the graft
 			 * recompaction's up-front acquire lost the race (prepare
 			 * bailed clean), -EAGAIN = a cow_stop / detach / final-commit
@@ -1563,7 +1563,7 @@ static int inv_rekey_graft_disjoint(void)
  *
  * Per writer w, two root-child junctions bp=2w+1, dp=2w+2 (disjoint across
  * writers, so no writer re-homes a peer's junction; they all still contend
- * ROOT's COPYING, which is the contention this exercises):
+ * ROOT's LOCK, which is the contention this exercises):
  *   (bp,1) (bp,5) (dp,1) (dp,5)   straddling sibs, keep both junctions >= 3
  *                                 children so the detach stays an in-place delete
  *   (dp,3,5) (dp,3,6)             RESIDENTS -- never move, keep the dst OCCUPIED
@@ -3140,7 +3140,7 @@ static int inv_rekey_graft_coherent_readers(void)
  * the only node they share is root -- whose child set is FIXED, so root is never
  * recompacted and hence never relocated.  A disjoint writer's descent-captured
  * triple (S_top, BP, dst parent) therefore cannot be invalidated by a peer, and
- * the only concurrency exercised is the race for root's COPYING.
+ * the only concurrency exercised is the race for root's LOCK.
  *
  * Here RKS_NJ junction bytes are SHARED by RKS_NW writers: junction J holds the
  * S_top of each writer whose src it currently is AND receives each writer whose
@@ -3154,7 +3154,7 @@ static int inv_rekey_graft_coherent_readers(void)
  *      dead copy.
  *  (b) CROSS-WRITER CHILD RE-PARENT: that junction recompaction re-parents ALL of
  *      the junction's children, which now include the subtree ANOTHER writer is
- *      concurrently moving -- a node that writer holds COPYING on and parks its
+ *      concurrently moving -- a node that writer holds LOCK on and parks its
  *      own retire onto, in the same state word.
  *
  * The LAYOUT keeps every shape gate of the debug writer STATICALLY satisfied, so
@@ -4930,7 +4930,7 @@ static int inv_concurrent_writers_shared(void)
 	 * chain (ft-txn-hlist.h) is not safe for concurrent mutation, so two
 	 * writers on the SAME key must serialize (today via the FT-wide writer
 	 * lock a lock-mode trie takes; ultimately via the head-holder's per-node
-	 * COPYING lock once that FT-wide lock drops).  This oracle therefore runs
+	 * node lock once that FT-wide lock drops).  This oracle therefore runs
 	 * FINE (create_fixed_fine_lock_ft), NOT create_fixed_ft.  (It used to
 	 * justify that by contrast with an OPTIMISTIC trie, which "has neither
 	 * and cannot arbitrate same-key removers"; that strategy is gone.)
@@ -5126,14 +5126,14 @@ static int inv_concurrent_writers_coarse_lock(void)
  *
  * Same disjoint-range lost-key oracle as inv_concurrent_writers_coarse_lock, on
  * a trie whose recompacts acquire the per-node lock-set {C, P} (+ {GP} when P is
- * compressed) and resolve P/GP through the RELEASE terminal {COPYING|s -> s}.
+ * compressed) and resolve P/GP through the RELEASE terminal {LOCK|s -> s}.
  * 16 writers insert/remove over disjoint key ranges; every writer's shadow set
  * must match the final trie exactly.
  *
  * What this is actually gating, given the FT-wide lock still serializes writers
  * here (§11.1): that the release terminal COMMITS -- that a locked-but-surviving
  * node comes out of the commit LIVE and UNLOCKED.  A release that failed to
- * commit, or a bail path that forgot to unlock a member, leaves FT_STATE_COPYING
+ * commit, or a bail path that forgot to unlock a member, leaves FT_STATE_LOCK
  * set at rest -- which wedges every later publish into that node, and which
  * cds_ft_verify reports as a leaked copy fence.  Both endpoints are checked
  * below, and 100k+ recompacts run through them.
@@ -5341,7 +5341,7 @@ static struct cds_ft *create_varlen_fine_lock_cfg_ft(
  * POINT-REMOVE all S keys {p, w, s} (the established remove + node_free_rcu free
  * path, so no detached-trie drain is needed).  Final quiescent check: every
  * present prefix's S keys resolve to this writer's nodes, count_keys matches
- * the live total, and cds_ft_verify passes (a COPYING fence leaked by a dropped
+ * the live total, and cds_ft_verify passes (a node lock leaked by a dropped
  * bail path surfaces here).
  */
 #define MW_XT_NR_WRITERS	16
@@ -5568,7 +5568,7 @@ out:
 /*
  * See the block comment on mw_xt_writer.  Endpoints checked at quiescence: no
  * grafted key lost (resolves to the owning writer's node), count_keys equals
- * the live total, and cds_ft_verify reports no leaked COPYING fence.
+ * the live total, and cds_ft_verify reports no leaked node lock.
  */
 static int mw_xt_oracle(const char *tname, int attach_mode, bool list_on,
 		bool rank_on)
@@ -7085,7 +7085,7 @@ static void *inv_replace_skipx_writer(void *arg)
 		 * (cds_ft_group_attr_set_speculative_key_offset: "the key bytes at
 		 * @key_offset must be present before the node is inserted"), not
 		 * harness bookkeeping -- on a speculative group the inequality
-		 * lookups take their result key by COPYING it from the matched
+		 * lookups take their result key by LOCK it from the matched
 		 * leaf, so a head published with @okey still zeroed hands every
 		 * later cds_ft_next the key 0.  The walk then asks for the
 		 * successor of the wrong key.
@@ -9389,7 +9389,7 @@ static int inv_empty_dst_root_merge_peer_nolist(void)
  *
  * NOTHING in the suite drove that park concurrently at all: instrumented, the
  * whole of ft_inv executed ft_insert_park_external_nodes 54246 times and NOT
- * ONCE while a peer held the holder's COPYING fence; every concurrent-writer
+ * ONCE while a peer held the holder's node lock; every concurrent-writer
  * oracle here scored a flat zero, because they all use key sets in which no key
  * is a proper prefix of another.
  *
@@ -9410,10 +9410,10 @@ static int inv_empty_dst_root_merge_peer_nolist(void)
  *
  * WHAT THIS DOES AND DOES NOT COVER -- stated because the numbers were the
  * point.  It drives the park hard and exposed: ~670k parks per run land while a
- * peer holds the holder's COPYING, all of them the {NULL -> node} first-publish
+ * peer holds the holder's LOCK, all of them the {NULL -> node} first-publish
  * arm.  It has NOT reproduced a loss (0 across ~50M ops), and instrumentation
  * says why: those fences are the holder being locked as the PARENT {P} of a
- * child's recompact -- a {COPYING|s -> s} RELEASE lock, which never copies the
+ * child's recompact -- a {LOCK|s -> s} RELEASE lock, which never copies the
  * holder's body, so external_nodes cannot be lost through it.  A loss needs the
  * holder to be the recompact's own target C, and across every shape tried
  * ft_node_recompact was entered on a node carrying an external head ZERO times

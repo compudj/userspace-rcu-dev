@@ -1,6 +1,6 @@
 # Recompaction body-copy in the pre-commit window — design note (2026-07-13)
 
-Status: **ATTEMPTED AND REVERTED (2026-07-13).** The `FT_STATE_COPYING` fence is
+Status: **ATTEMPTED AND REVERTED (2026-07-13).** The `FT_STATE_LOCK` fence is
 load-bearing and cannot be retired; see "## Outcome" below. The rest of this note
 is retained as the record of *why* the pre-commit-callback direction does not
 work, so it is not re-attempted.
@@ -11,17 +11,17 @@ Desnoyers.
 ## Outcome (2026-07-13): REVERTED — the tombstone claim cannot fence the plan window
 
 Option 1 (defer the recompact body-copy into the pre-commit callback and retire
-`FT_STATE_COPYING`) was implemented on `ft-mutation-node.h` / `ft-mutation-helpers.h`,
+`FT_STATE_LOCK`) was implemented on `ft-mutation-node.h` / `ft-mutation-helpers.h`,
 passed single-writer (ft_unit 275/275, ft_inv 58/58), then **regressed the clean
 `d48ed267` MW baseline**: an 8×200 = 1600-run oracle soak produced 5/1600 failures
 (2 teardown SIGSEGV on a wild back-pointer in `ft_detach_node`; 3 lost-key oracle
 failures) versus 0/1600 at baseline. Both symptoms are one root cause: a corrupted
 trie (a dropped child + a dangling back-edge) committed during the concurrent phase.
 
-**Root cause — the plan→install window is unprotected.** The old `FT_STATE_COPYING`
+**Root cause — the plan→install window is unprotected.** The old `FT_STATE_LOCK`
 mark is a *persistent* CAS on `old_node.state`, held from **before the build loop
 through commit**. Any concurrent insertion that tries to `guard_parent(old_node)`
-during that whole window computes clean-LIVE, mismatches the COPYING-set word, and
+during that whole window computes clean-LIVE, mismatches the LOCK-set word, and
 **aborts** — so the build/reparent phase reads a frozen source.
 
 The tombstone claim cannot replace it, for a structural reason:
@@ -47,7 +47,7 @@ re-encodings (same resolved child), but the rare identity-changing ones corrupt
 where we iterate on the children nodes to reparent them is [not] protected
 adequately; a concurrent insertion won't be caught before we begin the install phase."
 
-**Why the callback then has no use.** With `FT_STATE_COPYING` kept, the fence
+**Why the callback then has no use.** With `FT_STATE_LOCK` kept, the fence
 transitively freezes every child slot (incl. its skip encoding) from build through
 commit, so the imperative build-phase copy already reads exactly the committed
 values; a pre-commit re-read is a redundant no-op. The stale-encoding gap the
@@ -57,9 +57,9 @@ simplification the callback was pitched to buy was already realized at `d48ed267
 path already frees immediately). Nothing was left for the callback to earn.
 
 **Disposition.** Reverted `ft-mutation-node.h` / `ft-mutation-helpers.h` to
-`d48ed267` (restoring `ft_meta_copying_mark` / `ft_flip_txn_record_tombstone_copying`
-/ `ft_flip_txn_copying_register` and the abort-path `copying_clear`s; removing the
-callback, `copy_ctx[]`, and the `_snapshot` helpers). The COPYING fence stays.
+`d48ed267` (restoring `ft_meta_lock_acquire` / `ft_flip_txn_record_tombstone_locked`
+/ `ft_flip_txn_lock_register` and the abort-path `copying_clear`s; removing the
+callback, `copy_ctx[]`, and the `_snapshot` helpers). The node lock stays.
 
 ---
 
@@ -68,7 +68,7 @@ Below: the original (now-rejected) design rationale, retained for the record.
 ## Decision
 
 Deprecate the **copy flag** (per-slot `COPY_SLOT` freeze records, and the
-hand-rolled `FT_STATE_COPYING` reversible fence) in favor of performing the
+hand-rolled `FT_STATE_LOCK` reversible fence) in favor of performing the
 `ft_node_recompact` body copy in the engine's **pre-commit callback**
 (`urcu_txn_on_precommit` / `urcu_mcas_commit_precommit`). The node-level
 **tombstone claim** on the retiring node's state word is the only fence
@@ -166,15 +166,15 @@ either way.
 
 Before (`ft_node_recompact`, live-retire arm):
 ```
-ft_meta_copying_mark(N)          # standalone CAS: set FT_STATE_COPYING
+ft_meta_lock_acquire(N)          # standalone CAS: set FT_STATE_LOCK
 for each src child slot:         # BUILD PHASE copy
     resolve_prio(&N.child[b]) -> V
     set_nth(N', b, V)
 record reparents / count / freeze
-ft_flip_txn_copying_register(N)  # {COPYING|s -> TOMBSTONE|s} rides the commit
+ft_flip_txn_lock_register(N)  # {LOCK|s -> TOMBSTONE|s} rides the commit
 record forward-publish (grandparent: N -> N')
 commit
-  ... on any bail: ft_meta_copying_clear(N)   # reversible-fence unwind
+  ... on any bail: ft_meta_lock_release(N)   # reversible-fence unwind
 ```
 
 After:
@@ -188,11 +188,11 @@ commit_precommit
   # in the frozen pre-commit window, fill_Nprime copies N's slots into N'
 ```
 
-Retired by the switch: the standalone `ft_meta_copying_mark` / `_clear` pair,
-the `FT_STATE_COPYING` state bit and its guard-mask term (`~(TOMBSTONE|COPYING)`
-collapses to `~TOMBSTONE`), and the ft-verify.h "leaked COPYING fence" check.
+Retired by the switch: the standalone `ft_meta_lock_acquire` / `_clear` pair,
+the `FT_STATE_LOCK` state bit and its guard-mask term (`~(TOMBSTONE|LOCK)`
+collapses to `~TOMBSTONE`), and the ft-verify.h "leaked node lock" check.
 (Caveat: only where recompact is *fully* txn'd — any single-writer / bulk /
-compact path still using `COPYING` must convert first, or the two schemes coexist
+compact path still using `LOCK` must convert first, or the two schemes coexist
 during the transition.)
 
 ## Status
@@ -200,7 +200,7 @@ during the transition.)
 - **Engine — done.** COPY_SLOT record kind dropped at 47a1a612; `resolve_prio`
   degraded to a committed read; pre-commit callback is the standard commit
   entry (`urcu_mcas_commit` == `commit_precommit(…, NULL, NULL)`).
-- **FT — pending.** `ft_node_recompact` still marks `FT_STATE_COPYING` and copies
+- **FT — pending.** `ft_node_recompact` still marks `FT_STATE_LOCK` and copies
   in the build phase; it calls `on_precommit` nowhere.
 - **Cleanup owed.** Stale `COPY_SLOT` references in ft-mutation-node.h comments
   (e.g. :1293) and the orphan unit tests `test_rcu_mcas_copy_slot.c` /
@@ -218,5 +218,5 @@ during the transition.)
    the reparent records re-home children's back-pointers. Confirm the fill runs
    before the forward-publish install (it does — pre-commit precedes RELEASE) and
    that reparents reference `N'` slots the fill has populated.
-4. Bulk / compact / `FEATURE_FT_INSERT_IN_PLACE` paths still on `FT_STATE_COPYING`
+4. Bulk / compact / `FEATURE_FT_INSERT_IN_PLACE` paths still on `FT_STATE_LOCK`
    — scope them out or convert before removing the bit.

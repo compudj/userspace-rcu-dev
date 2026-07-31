@@ -34,7 +34,7 @@ Memory: `[[project_ft_mw_lock_escalation_pivot]]`,
 ## 0. What "the drop" is
 
 Through step 6 (HEAD `fcd93a5c`) a FINE trie takes **two** things per op: the
-per-node lock-sets (COPYING try-locks, steps 3–6) **and** the FT-wide
+per-node lock-sets (LOCK try-locks, steps 3–6) **and** the FT-wide
 `cds_fair_mutex` `writer_lock` (`ft_writer_lock_scope_enter`, gated on
 `ft->lock_mode`). The FT-wide lock serialises every writer, so the per-node
 locks are *exercised but never contended* (the DEAD-PATH note: their bail
@@ -73,7 +73,7 @@ Placed after the reentrancy and exclusive tests. Everything else falls out:
 - **`ft_writer_lock_gp_wait` degrades to a plain `synchronize_rcu`.** Its
   `held = ft_wlock_held` is NULL (nothing held) ⇒ the drop/retake bracket is
   skipped and it is just the GP wait. **Bonus:** after the drop, a mid-op GP no
-  longer needs the lock drop/retake at all — a COPYING bit is non-blocking, so
+  longer needs the lock drop/retake at all — a LOCK bit is non-blocking, so
   the "no blocking lock across a GP" constraint (pivot constraint 2) is vacuous
   for FINE. The bracket stays only for COARSE.
 
@@ -93,11 +93,11 @@ option in §6 if the caution is wanted.)
 The pre-pivot lock-free-MW tree (`d48ed267`) reached **0/1600 @16w** on **pure
 MCAS**, no locks, with the reanchor / skip-resolver / PSO fixes that are **still
 in the tree** (deleted only at §11.6, after the default flips). So concurrent
-writers on MCAS-alone were *already correct*. The per-node COPYING try-locks sit
+writers on MCAS-alone were *already correct*. The per-node LOCK try-locks sit
 **on top**. Dropping the FT-wide lock returns FINE to "MCAS + extra try-locks",
 which can only differ from the proven MCAS baseline in three ways — all closed:
 
-1. **Deadlock?** No. The per-node COPYING locks are **try-or-bail**
+1. **Deadlock?** No. The per-node node locks are **try-or-bail**
    (acquire, or `-EAGAIN` + re-descend — they never block). No hold-and-wait ⇒
    no cycle. The *only* blocking primitive was the FT-wide mutex, now gone ⇒
    FINE post-drop has **no blocking lock at all** ⇒ deadlock-free by
@@ -126,13 +126,13 @@ which can only differ from the proven MCAS baseline in three ways — all closed
    which is precisely what 0/1600@16w certified.
 
 3. **A bail path with a broken abort boundary?** This is the **real risk
-   surface.** The per-node lock bail/unwind paths (`ft_copying_lock_member`
+   surface.** The per-node lock bail/unwind paths (`ft_lock_member`
    miss → re-descend; publish guard-fallback) were only ever *fault-injected*,
    never *naturally raced* (DEAD-PATH note). The drop makes them **live**. A
-   byte-for-byte-abort violation (a node left COPYING-marked, an orphaned child,
+   byte-for-byte-abort violation (a node left lock-acquired, an orphaned child,
    a half-published edge, a leaked reservation) would surface only now. Net (A)
    cannot argue this away — it is **what the soak validates** (`cds_ft_verify`
-   is a leaked-COPYING-fence detector; ASAN catches the UAF/leak). See §4.
+   is a leaked-node lock detector; ASAN catches the UAF/leak). See §4.
 
 ### Net (B): per-node lock-set completeness — DEFERRED to the sw cutover
 
@@ -152,7 +152,7 @@ cutover where net (A) no longer holds.
 Each op-domain relies on: its per-node lock-set for exclusion where complete,
 and net (A) (MCAS CAS/record) for the residual. None introduces a blocking wait.
 
-- **recompact `{C,P}(+GP)`** — COPYING fence *is* C's lock; miss ⇒ re-descend
+- **recompact `{C,P}(+GP)`** — node lock *is* C's lock; miss ⇒ re-descend
   (no fallback, body was copied). P/GP resolved via the RELEASE terminal.
   Complete; contention now real, arbitrated by the try-lock.
 - **insert `{P}`/`{P,CN}`** — publish-into node converted to a RELEASE lock with
@@ -182,7 +182,7 @@ confirmed (one-shot marker fired from the FINE branch — not a dead path).
 - **FINE MW disjoint oracle (`inv_concurrent_writers_fine_lock`, 16 writers),
   drop on:** **formal §11.4 gate PASSED — 1600/1600 @16w, 0 fail** (~119 min
   wall), plus **ASAN 40/40 clean** (no UAF/leak). The oracle checks every
-  writer's shadow set, `count_keys`, and `cds_ft_verify` (a leaked-COPYING-fence
+  writer's shadow set, `count_keys`, and `cds_ft_verify` (a leaked-node lock
   detector — the exact failure a broken bail path produces). This is the same
   `0/1600` acceptance number every prior pivot step (2–6) had to hold.
 
@@ -398,7 +398,7 @@ Two distinct crashes after the thread-local reserve fix (§8, Fix 1):
   peers grew `cn` into a multi-child internal; the branch-publish replaced the
   grown node via a refreshed expected-old but carried only the old child →
   siblings lost, **no crash, verify passes** (structure consistent, subtree
-  unreachable). Fix: **fence `cn` (its COPYING mark) BEFORE the split reads it**
+  unreachable). Fix: **fence `cn` (its lock acquire) BEFORE the split reads it**
   (mirroring `ft_split_compressed_insert`), record its retire on the glue txn, and
   bail→retry on a mark miss so a concurrent grow conflicts and one side re-descends.
 

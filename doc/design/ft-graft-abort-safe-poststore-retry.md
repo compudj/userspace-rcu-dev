@@ -144,11 +144,11 @@ node, and add a per-range nr_live watch if a leak is suspected.
 ## Termination / progress
 
 Each commit abort means a peer committed a conflicting flip (made progress);
-each retry re-descends the now-current tree and re-competes for {p}'s COPYING
+each retry re-descends the now-current tree and re-competes for {p}'s LOCK
 lock, whose try-or-bail guarantees a winner per round.  The retry loop is inside
 the whole-op RCU read section, so it delays grace periods for its duration --
 bounded because it terminates; if a livelock is ever observed, that is a
-separate bug (skip_conflict + COPYING-winner should prevent it), not a reason to
+separate bug (skip_conflict + LOCK-winner should prevent it), not a reason to
 release the pin mid-loop (which would reopen the ABA the pin closes).
 
 ## Validation plan

@@ -62,7 +62,7 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 	 * ft_split_compressed_insert). */
 	assert(!cn_meta->external_nodes);
 	/*
-	 * F2 COPYING fence, split-retire (MW LOCK_FINE drop): fence @cn BEFORE
+	 * F2 node lock, split-retire (MW LOCK_FINE drop): fence @cn BEFORE
 	 * any plan read -- this build derives its WHOLE plan from @cn (the
 	 * diverge slicing over cn->key_bytes, the cn->child snapshot, the
 	 * deferred-edge captures) and RETIRES @cn, exactly as
@@ -71,7 +71,7 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 	 * releases @cn, must either hold the fence (mark fails -> -EAGAIN,
 	 * re-descend, NOTHING built) or abort at commit against the fenced
 	 * tombstone's precise expected old (ft_glue_txn_commit_edges records
-	 * {COPYING|s -> TOMBSTONE|s} from @split_cn_snap).  Marking here (not in
+	 * {LOCK|s -> TOMBSTONE|s} from @split_cn_snap).  Marking here (not in
 	 * the caller's pre-swap fence block) closes the read-then-fence window:
 	 * the whole build runs under the fence, so a cn->child change during the
 	 * build is caught too.  Gated on a txn'd graft under the drop: the
@@ -84,7 +84,7 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 	if (ft->lock_fine && glue->txn && glue->fence_split_cn) {
 		uintptr_t cn_fence;
 
-		if (ft_meta_copying_mark(cn_meta, &cn_fence))
+		if (ft_meta_lock_acquire(cn_meta, &cn_fence))
 			return -EAGAIN;	/* peer owns @cn; nothing built */
 		glue->split_cn_holder = cn_meta;
 		glue->split_cn_snap = cn_fence;
@@ -747,7 +747,7 @@ enum urcu_txn_status ft_store_at_graft_point_commit(struct cds_ft *ft,
 			 * construction: the release was recorded first, so were the guard
 			 * kept it would chain as a read-your-writes no-op -- never the
 			 * poisoning guard-then-release order (rule at
-			 * ft_flip_txn_record_release_copying).  Non-lock_fine keeps the guard.
+			 * ft_flip_txn_record_release_lock).  Non-lock_fine keeps the guard.
 			 */
 			if (!ft->lock_fine)
 				ft_flip_txn_guard_parent(ft, st->glue->txn,
@@ -837,7 +837,7 @@ enum urcu_txn_status ft_store_at_graft_point_commit(struct cds_ft *ft,
 			 * Through the tag-dispatching recorder, NOT a raw
 			 * ft_flip_txn_record_tag loop: a CELL edge must be MW
 			 * whatever this txn's structural_sw mode is (the ordered
-			 * list is lock-free -- no cell carries a COPYING lock to
+			 * list is lock-free -- no cell carries a node lock to
 			 * park an SW store under), and a raw record_tag keys off
 			 * structural_sw alone, so it would silently demote these
 			 * to an unvalidated SW park under a caller that opted in.
@@ -855,7 +855,7 @@ enum urcu_txn_status ft_store_at_graft_point_commit(struct cds_ft *ft,
 		 *
 		 * LOCK_FINE (§9.3): under the FT-wide-lock drop the reserve's
 		 * ft_node_recompact ALREADY records @old_recompacted_node's retire
-		 * as its C-half {COPYING|s -> TOMBSTONE|s} terminal, registered on
+		 * as its C-half {LOCK|s -> TOMBSTONE|s} terminal, registered on
 		 * THIS glue->txn (ft-mutation-node.h).  That IS the atomic-detach
 		 * tombstone; a second plain ft_flip_txn_record_tombstone here would
 		 * DOUBLE-record the same word with a conflicting expected-old (plain
@@ -906,7 +906,7 @@ enum urcu_txn_status ft_store_at_graft_point_commit(struct cds_ft *ft,
 			run->armed = true;
 		/*
 		 * Only the writer whose commit actually retired
-		 * @old_recompacted_node ({COPYING|s -> TOMBSTONE|s}) may free
+		 * @old_recompacted_node ({LOCK|s -> TOMBSTONE|s}) may free
 		 * it.  An aborted commit rolled the retire back (the registered
 		 * fence was cleared, the node stays LIVE); freeing it here would
 		 * double-free the still-live node against the peer that
@@ -1177,7 +1177,7 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 
 		/*
 		 * Destination must be empty for a root-level graft -- decided
-		 * UNDER the old root's COPYING fence, which the swap below then
+		 * UNDER the old root's node lock, which the swap below then
 		 * consumes as its fenced retire.  Testing emptiness unfenced and
 		 * swapping later let a contract-legal peer attach land in the
 		 * window and be freed with the old root.
@@ -1195,7 +1195,7 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		 */
 		fresh_root = alloc_cds_ft_node(dst_ft, &ft_types[0], &fresh_meta);
 		if (!fresh_root) {
-			ft_meta_copying_clear(dst_rmeta);
+			ft_meta_lock_release(dst_rmeta);
 			return CDS_FT_STATUS_MEMORY_ERROR;
 		}
 
@@ -1218,7 +1218,7 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 			dual_txn = ft_flip_txn_create_bounded(
 				FT_ROOT_LIST_SWAP_DUAL_MAX_EDGES + 1);
 			if (!dual_txn) {
-				ft_meta_copying_clear(dst_rmeta);
+				ft_meta_lock_release(dst_rmeta);
 				free_cds_ft_node_unpublished(dst_ft, fresh_root);
 				return CDS_FT_STATUS_MEMORY_ERROR;
 			}
@@ -1300,13 +1300,13 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 			 * with the fence bit, so a peer state change that slipped under
 			 * the fence ABORTS this commit instead of being ratified by a
 			 * late re-read.  Registering hands the fence to the txn -- the
-			 * commit consumes it in the {COPYING|s -> TOMBSTONE|s}
+			 * commit consumes it in the {LOCK|s -> TOMBSTONE|s}
 			 * transition, an abort CAS-clears it back to LIVE -- so no bail
 			 * path past this point owes a clear.
 			 */
-			ft_flip_txn_record_tombstone_copying(dual_txn, dst_rmeta,
+			ft_flip_txn_record_tombstone_locked(dual_txn, dst_rmeta,
 				dst_root_snap);
-			ft_flip_txn_copying_register(dual_txn, dst_rmeta);
+			ft_flip_txn_lock_register(dual_txn, dst_rmeta);
 			ft_root_list_swap_publish_dual(dual_txn, &appear,
 				&disappear);
 		}
@@ -1450,7 +1450,7 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		 * and retry the whole attach on a fresh descent.  @graft_payload
 		 * and @nil_key_root are attach-invariant (computed above); every
 		 * per-attempt resource is (re)acquired below and freed on the
-		 * retry path.  Progress: {p}'s COPYING lock guarantees a winner
+		 * retry path.  Progress: {p}'s node lock guarantees a winner
 		 * each contention round.
 		 */
 retry_attach:
@@ -1533,7 +1533,7 @@ retry_attach:
 				src_count, &d, &glue);
 		if (prep == FT_GRAFT_PREP_OOM) {
 			/*
-			 * The GLUE build may have marked @cn's split-retire COPYING
+			 * The GLUE build may have marked @cn's split-retire LOCK
 			 * fence before hitting OOM; ft_glue_abort below releases it
 			 * (single clear point), so @cn stays LIVE for the re-descend.
 			 */
@@ -1552,7 +1552,7 @@ retry_attach:
 			 * cn->child).  ft_split_compressed_graft_build built NOTHING and
 			 * did NOT mark @cn, so this is a clean re-descend -- dst is
 			 * byte-for-byte unchanged, src pristine (pre-swap) or empty +
-			 * owned by this writer (post-swap).  @cn's try-or-bail COPYING
+			 * owned by this writer (post-swap).  @cn's try-or-bail LOCK
 			 * mark guarantees a winner each contention round (no livelock).
 			 */
 			ft_glue_abort(dst_ft, &glue);
@@ -1653,7 +1653,7 @@ retry_attach:
 				 * through ft_glue_abort.
 				 */
 				if (glue.split_cn_holder) {
-					ft_meta_copying_clear(glue.split_cn_holder);
+					ft_meta_lock_release(glue.split_cn_holder);
 					glue.split_cn_holder = NULL;
 					glue.split_cn_snap = 0;
 				}
@@ -1669,7 +1669,7 @@ retry_attach:
 			src_retire_txn = ft_flip_txn_create_bounded(2);
 			if (!src_retire_txn) {
 				if (glue.split_cn_holder) {
-					ft_meta_copying_clear(glue.split_cn_holder);
+					ft_meta_lock_release(glue.split_cn_holder);
 					glue.split_cn_holder = NULL;
 					glue.split_cn_snap = 0;
 				}
@@ -1724,7 +1724,7 @@ retry_attach:
 		 * FALLIBLE half -- ft_store_at_graft_point_prepare, i.e. the
 		 * recompact of the graft-point node {p} -- BEFORE the point-of-no-
 		 * return src-root swap.  A concurrent relocation of {p}, a peer that
-		 * holds {p}'s (or the grandparent's) COPYING lock, or a stale
+		 * holds {p}'s (or the grandparent's) node lock, or a stale
 		 * descent then surfaces as a clean re-descend with NOTHING on src
 		 * touched (no reader-visible src flicker, no rollback).  The
 		 * remaining commit is unfailable and runs after the swap through
@@ -1736,8 +1736,8 @@ retry_attach:
 		 * A compressed d.pnf means the descent raced a concurrent chain-
 		 * compress / relocation (ft_node_set_nth_rec cannot target a
 		 * compressed node) -- re-descend.  A tombstoned / proxied / peer-
-		 * locked {p} is caught INSIDE the recompact's COPYING mark
-		 * (ft_meta_copying_mark -> -EAGAIN -> prepare MEMORY_ERROR).
+		 * locked {p} is caught INSIDE the recompact's lock acquire
+		 * (ft_meta_lock_acquire -> -EAGAIN -> prepare MEMORY_ERROR).
 		 */
 		if (prep == FT_GRAFT_PREP_NOSPLIT) {
 			enum cds_ft_status pstatus;
@@ -1784,7 +1784,7 @@ retry_attach:
 				/*
 				 * Prepare failed BEFORE the swap: src is pristine,
 				 * only the invisible dst build + reserved txns need
-				 * unwinding.  Re-descend -- {p}'s COPYING lock
+				 * unwinding.  Re-descend -- {p}'s node lock
 				 * guarantees a winner each contention round.
 				 */
 				ft_glue_abort(dst_ft, &glue);
@@ -1816,11 +1816,11 @@ retry_attach:
 		 * into a tombstoned node -- a wild store that corrupts the arena, and
 		 * (worse) if the guard instead MISMATCHES the tombstoned word the commit
 		 * ABORTS past the point of no return, silently dropping the whole
-		 * subtree.  Lock @fence_parent's COPYING fence HERE, before the swap, so
+		 * subtree.  Lock @fence_parent's node lock HERE, before the swap, so
 		 * no peer can retire it through the commit (which records the held
-		 * {COPYING|s -> s} release via @publish_parent_holder, so the commit is
+		 * {LOCK|s -> s} release via @publish_parent_holder, so the commit is
 		 * truly unfailable).  A miss (already retired / proxied / peer-locked)
-		 * is a clean re-descend with src pristine -- ft_meta_copying_mark did
+		 * is a clean re-descend with src pristine -- ft_meta_lock_acquire did
 		 * NOT set the fence, so nothing to unwind but the invisible dst build.
 		 *
 		 * TWO shapes reach an unfenced forward publish into d.pnf: the GLUE
@@ -1828,7 +1828,7 @@ retry_attach:
 		 * DISPLACED-external attach (its commit publishes the fresh branch into
 		 * d.pnf's child slot, st.pnf == d.pnf; @st is valid once
 		 * @nosplit_prepared).  The in-place NOSPLIT store needs no fence here --
-		 * its ft_node_set_nth_rec recompacts + COPYING-locks {p} inside prepare
+		 * its ft_node_set_nth_rec recompacts + node locks {p} inside prepare
 		 * and holds it through commit.  Gated on lock_fine so the FT-wide-lock
 		 * build is byte-identical (the mutex already serialises retires).
 		 */
@@ -1854,7 +1854,7 @@ retry_attach:
 					ft_flag_to_metadata(dst_ft, fence_parent);
 				uintptr_t pp_snap = 0;
 
-				if (ft_meta_copying_mark(pp_meta, &pp_snap)) {
+				if (ft_meta_lock_acquire(pp_meta, &pp_snap)) {
 					/*
 					 * A miss (@publish_parent already retired / proxied /
 					 * peer-locked) is a clean re-descend, src pristine.
@@ -2131,13 +2131,13 @@ retry_attach:
 		 * retry): under the FT-wide-lock drop the attach commit can conflict
 		 * with a peer beyond the single word the pre-swap fence covers and
 		 * ABORT.  The rolled-back flip left dst byte-for-byte unchanged, every
-		 * registered COPYING fence auto-cleared (the recompact's {p} retire and
+		 * registered node lock auto-cleared (the recompact's {p} retire and
 		 * the Fix-A publish fence both back to LIVE), and glue.txn consumed.
 		 * The payload is still detached from the emptied EXCLUSIVE (reader-free)
 		 * src and OWNED by us, so RE-ATTEMPT the dst-side attach: free this
 		 * attempt's UNPUBLISHED products (the aborted txn rolled its edges back
 		 * but freed no nodes) and re-descend.  A peer committed a conflicting
-		 * flip => it made progress; {p}'s COPYING try-lock guarantees a winner
+		 * flip => it made progress; {p}'s LOCK try-lock guarantees a winner
 		 * each round, so the retry terminates (the whole-op RCU pin spans it).
 		 */
 		if (store_cst != URCU_TXN_STATUS_OK) {
@@ -2276,10 +2276,10 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
 		 * FT-wide-lock drop RCU-pinning (§11 cross-trie).  A FINE
 		 * cross-trie graft descends the SHARED dst WITHOUT the FT-wide
 		 * mutex and captures spine nodes (d->pnf / ppnf / pppnf) that its
-		 * recompact / Fix-A fence later COPYING-lock.  A COPYING lock
+		 * recompact / Fix-A fence later node lock.  A node lock
 		 * rejects a relocated-but-LIVE (tombstoned) node, but NOT a
 		 * reclaimed-and-recycled one -- the arena re-zeroes a slot's
-		 * metadata on reallocation, so ft_copying_lock_member false-
+		 * metadata on reallocation, so ft_lock_member false-
 		 * succeeds on a recycled node -> wild store into an unrelated live
 		 * node.  Nothing else pins the captured nodes: ft_graft_keylen
 		 * builds its txn with ft_flip_txn_create() (flavor NULL, "the
@@ -2711,7 +2711,7 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		/*
 		 * §11 cross-trie RCU-pinning: this descent captures live-dst spine
 		 * nodes (d.pnf ...) that the extract-side detach and the insert-side
-		 * publish-replace COPYING-lock below.  A COPYING lock rejects a
+		 * publish-replace node lock below.  A node lock rejects a
 		 * relocated-but-live node but NOT a reclaimed+recycled one (the arena
 		 * re-zeroes metadata on realloc -> false-success -> wild store), so
 		 * pin the captured nodes with the flavor read side across
@@ -2719,7 +2719,7 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		 * graft_swap drains dst readers with ft_writer_lock_gp_wait(dst_ft)
 		 * before its extract-side root install, and a grace period under a
 		 * read section self-deadlocks -- so the section is RELEASED just
-		 * before that dst drain (every descent-captured dst node is COPYING-
+		 * before that dst drain (every descent-captured dst node is LOCK-
 		 * locked by then).  The consumed @swap_ft is exclusive (BUSY_ERROR
 		 * otherwise), so its own ft_writer_lock_gp_wait is !exclusive-gated
 		 * and skipped, and nothing else synchronizes inside the section.
@@ -3542,7 +3542,7 @@ retry_swap:
 		 */
 		/*
 		 * Release the §11 RCU-pin BEFORE this dst grace period: every
-		 * descent-captured dst node has been COPYING-locked by the
+		 * descent-captured dst node has been LOCK-locked by the
 		 * extract/insert commits above (so it can no longer be reclaimed
 		 * out from under us), and a grace period inside a read section
 		 * would self-deadlock.  The extract-side root install below

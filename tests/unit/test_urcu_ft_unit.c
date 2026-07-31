@@ -584,12 +584,12 @@ static int test_writer_lock_mode_coarse(void)
  * converted op-domain -- recompact -- acquires its per-node lock-set {C, P}
  * (+ {GP} when P is a compressed node carrying a SKIP_X dual) instead of merely
  * §4.B-guarding P, and resolves the surviving members through the RELEASE
- * terminal {COPYING|s -> s} at the commit.
+ * terminal {LOCK|s -> s} at the commit.
  *
  * Drive both recompact directions: 256 dense inserts promote nodes through the
  * layout tiers (FT_RECOMPACT_ADD_NEXT / ADD_SAME), and the drain removes every
  * key (FT_RECOMPACT_DEL).  The load-bearing assertion is cds_ft_verify(), which
- * reports a COPYING bit set AT REST as a leaked copy fence: a release terminal
+ * reports a LOCK bit set AT REST as a leaked copy fence: a release terminal
  * that failed to commit -- or a bail path that forgot to unlock a member -- can
  * only end as a leaked lock, and would wedge every later publish into that node.
  */
@@ -653,12 +653,12 @@ static int test_writer_lock_mode_fine(void)
  * (ft_rekey_cow_stop) in ISOLATION, driven on the trie ROOT via the debug hook
  * _cds_ft_debug_cow_replace_root -- build a fresh-address copy of the root,
  * re-parent its children onto it, retire the old root, republish, as ONE mixed
- * SW/MW commit (structural_sw) under the honor-COPYING primitives.
+ * SW/MW commit (structural_sw) under the honor-LOCK primitives.
  *
  * Keys ((i<<24)) and ((i<<24)|1) for i in 0..COW_NG give a 4-byte key whose
  * first descent byte is i, so the root BRANCHES (a popcount/pigeon node) with
  * COW_NG metadata-bearing (compressed) children -- exercising the per-child
- * COPYING mark + SW re-parent, not just external-head children.  Each replace
+ * lock acquire + SW re-parent, not just external-head children.  Each replace
  * must (a) succeed, (b) leave every key present with an unchanged count, and
  * (c) MOVE the root to a fresh address (the identity change the reader's
  * two-descent address-witness relies on); repeated so a later COW re-clones the
@@ -1104,7 +1104,7 @@ out:
  *
  * This is a different lock set, not just a different shape.  A chain append is a
  * mutation of a LIVE list hanging off the destination node, and @cc91bd8b made
- * the cross-trie merge take the chain holder's COPYING lock for exactly that
+ * the cross-trie merge take the chain holder's node lock for exactly that
  * reason -- it was "the last unlocked chain mutation".  That acquire lives in
  * ft_merge_spine_copy; the fold calls ft_merge_build directly, so this test is
  * what says whether the fold inherits the lock or silently drops it.
@@ -1437,7 +1437,7 @@ static int test_rekey_graft_liston(void)
 /*
  * Coherent-rekey: the one-decide rekey-graft across junctions that do NOT SHARE A
  * PARENT -- the shape the hook's original gate (d_src.ppnf == d_dst.ppnf) refused.
- * The graft's dst-parent recompaction COPYING-holds the dst junction's parent; the
+ * The graft's dst-parent recompaction holds the lock the dst junction's parent; the
  * folded detach's src-junction recompaction can no longer REUSE that lock, so it
  * acquires (and releases) the src junction's own parent itself, guarded by a
  * BP.parent == @parent read-set validation riding the same acquire commit.
@@ -2008,7 +2008,7 @@ static int fine_split_keys_insert(struct cds_ft *ft, struct ft_test_node **n,
  * CDS_FT_WRITER_LOCK_FINE trie whose inserts force compressed-node splits, so
  * every forward publish through ft_insert_publish_or_park acquires the
  * publish-into node as a RELEASE lock (or, on an acquire miss, falls back to the
- * §4.B guard).  cds_ft_verify catches a leaked lock (a COPYING bit set at rest);
+ * §4.B guard).  cds_ft_verify catches a leaked lock (a LOCK bit set at rest);
  * a full presence check catches a lost or mis-published key.
  */
 #define FINE_SPLIT_NG	48
@@ -2076,7 +2076,7 @@ static int drain_trie(struct cds_ft *ft);
  *  B. root graft (key_len==0) into an empty dst: the whole source moves;
  *  C. POPULATED reject: the fused body fails invisibly, so the source keeps
  *     ALL its keys (pristine) -- no key is lost or stranded.
- * cds_ft_verify catches a COPYING lock leaked on either trie at rest.
+ * cds_ft_verify catches a node lock leaked on either trie at rest.
  */
 static int test_writer_lock_mode_fine_graft(void)
 {
@@ -24449,7 +24449,7 @@ out:
  * RECOMPACT allocation-failure lock release.  On a FINE-lock trie a node
  * recompaction acquires the lock SET {C, P, (GP)} up front; two of its bails --
  * the txn widen and the fresh-node allocation -- used to clear only C, leaving P
- * (and GP) COPYING for good, so every later operation touching them aborted
+ * (and GP) LOCK for good, so every later operation touching them aborted
  * forever.  Structure verification cannot see that: the trie is byte-for-byte
  * intact, it is the LOCKS that leaked.
  *
@@ -28655,7 +28655,7 @@ static int test_replace_family_commit_fault(void)
  *
  * A LOCK_FINE trie still serializes every writer behind the FT-wide lock until
  * the op-domains finish converting (§11.1), so no peer can hold a per-node lock
- * and ft_copying_lock_member() can never fail in a plain soak: its whole unwind
+ * and ft_lock_member() can never fail in a plain soak: its whole unwind
  * -- unlock the members already held, free the build-invisible copy, re-descend
  * -- is dead code, and a green LOCK_FINE oracle says NOTHING about it.  (Learned
  * the hard way: a clean MW oracle can mean "the abort path was never taken".)
@@ -28671,9 +28671,9 @@ static int test_replace_family_commit_fault(void)
  * The op must SURVIVE either way -- re-descend/retry or guard-fallback -- and
  * still report OK.  What is asserted after each armed insert is the abort
  * boundary: every key still present, and cds_ft_verify clean -- which catches a
- * LEAKED LOCK, since a COPYING bit left set at rest is reported as a leaked copy
+ * LEAKED LOCK, since a LOCK bit left set at rest is reported as a leaked copy
  * fence and would wedge every later publish into that node.  A forgotten
- * ft_copying_unlock_members (recompact) or a mishandled fallback (publish) fails
+ * ft_unlock_members (recompact) or a mishandled fallback (publish) fails
  * here.
  */
 static int test_fine_lock_acquire_fault(void)
@@ -28915,7 +28915,7 @@ static int test_fine_lock_acquire_fault(void)
  * Force THOSE acquires to miss (a peer holding the holder would look the same)
  * and assert the op SURVIVES -- bails -EAGAIN, re-descends, retries (the FT-wide
  * lock cleared the one-shot fault by then) -- with no key lost and no leaked
- * COPYING fence (cds_ft_verify reports a bit left set at rest as a leaked copy
+ * node lock (cds_ft_verify reports a bit left set at rest as a leaked copy
  * fence, which would wedge every later publish into that holder).  The countdown
  * reaching -1 after the op confirms the fault actually LANDED on an acquire: a
  * stable holder has no recompact/split, so it lands on the chain lock -- if the
@@ -29043,7 +29043,7 @@ static int test_fine_lock_chain_acquire_fault(void)
  * Phase 1 asserts the lock is TAKEN and released on the plain path: merge two
  * tries sharing both full keys, then check every duplicate is reachable, the key
  * count is unchanged (duplicates are not keys) and cds_ft_verify is clean -- a
- * COPYING bit left set at rest is reported as a leaked copy fence and would wedge
+ * LOCK bit left set at rest is reported as a leaked copy fence and would wedge
  * every later publish into that holder.
  *
  * NOTE for a build with DLM ALSO on: the merge overlap-spine fence runs BEFORE
@@ -29179,7 +29179,7 @@ static int test_fine_lock_merge_splice_acquire(void)
 /*
  * MW LOCK_FINE + DLM: the merge OVERLAP-SPINE plan-lock, and specifically its
  * BAIL.  ft_merge_build fences every dst overlap node before copying its body
- * into the merged cluster, so the copy plan and the {COPYING|s -> TOMBSTONE|s}
+ * into the merged cluster, so the copy plan and the {LOCK|s -> TOMBSTONE|s}
  * retire that ratifies it bracket the same world -- closing the "unlocked
  * retire" hole where a peer grows a node this merge is about to retire and the
  * peer's child goes with it.
@@ -29303,7 +29303,7 @@ static int test_fine_lock_merge_overlap_fence(void)
 /*
  * FOLD: the RE-PARENT MARK acquire's BAIL and its release sweep.
  *
- * ft_glue_acquire_reparent_marks takes the COPYING mark on every live child the
+ * ft_glue_acquire_reparent_marks takes the lock acquire on every live child the
  * fold's commit will SW-park into.  The acquire runs constantly -- measured 1883
  * marks taken across the FT_INV_MW oracle plan -- but its MISS never does: 0 of
  * those 1883 were contended, so the -EAGAIN bail AND
@@ -29320,7 +29320,7 @@ static int test_fine_lock_merge_overlap_fence(void)
  *   1. the move either succeeds or fails TRANSIENTLY; it never corrupts;
  *   2. cds_ft_verify is clean;
  *   3. ★ the trie still ACCEPTS A MUTATION afterwards.  This is the one that
- *      matters.  A leaked COPYING leaves the trie byte-for-byte intact, so
+ *      matters.  A leaked LOCK leaves the trie byte-for-byte intact, so
  *      verify PASSES with the lock still held -- which is why the analogous
  *      recompact OOM leak survived so long.  Only a later publish into the
  *      locked node exposes it, by failing forever.
@@ -29385,7 +29385,7 @@ static int rekey_reparent_mark_bail_run(long n, bool far)
 	if (insert_u64(ft, post_key, node_alloc(post_key)) != CDS_FT_STATUS_OK) {
 		rcu_read_unlock();
 		fprintf(stderr, "reparent-mark n=%ld: trie REFUSES a mutation after "
-			"the bail -- a COPYING mark leaked (rc=%d)\n", n, drc);
+			"the bail -- a lock acquire leaked (rc=%d)\n", n, drc);
 		goto out;
 	}
 	rcu_read_unlock();
@@ -29417,7 +29417,7 @@ out:
  *   2. cds_ft_verify clean;
  *   3. no key lost -- ENTRIES, since a collision merges two keys into one;
  *   4. ★ the trie still ACCEPTS A MUTATION, which is the only thing that catches
- *      a COPYING left set: the trie is byte-for-byte intact and verifies either
+ *      a LOCK left set: the trie is byte-for-byte intact and verifies either
  *      way, and only a later publish into the locked node exposes it.
  *
  * The shape is the COLLIDING one, so the sweep also crosses the splice-holder
@@ -29519,7 +29519,7 @@ static int rekey_merge_bail_run(long n, enum rkm_bail_knob knob)
 		 * The assertion that matters is unchanged and follows below --
 		 * the forced abort's unwind ran, the retry re-derived, and the
 		 * trie is coherent, complete, and still mutable (no leaked
-		 * COPYING).  Reaching that through a retry is a STRONGER
+		 * LOCK).  Reaching that through a retry is a STRONGER
 		 * statement than reporting the abort was.
 		 */
 		if (fired && drc != 0) {
@@ -29550,13 +29550,13 @@ static int rekey_merge_bail_run(long n, enum rkm_bail_knob knob)
 			"half-unwound merge lost a key\n", rkm_knob_name(knob), n, after, before, drc);
 		goto out;
 	}
-	/* Mutate INTO the merged neighbourhood: a leaked COPYING is hit here. */
+	/* Mutate INTO the merged neighbourhood: a leaked LOCK is hit here. */
 	post_key = ((uint64_t) RK_DX << 24) | ((uint64_t) RK_DZ << 16) | (0x40ULL << 8);
 	rcu_read_lock();
 	if (insert_u64(ft, post_key, node_alloc(post_key)) != CDS_FT_STATUS_OK) {
 		rcu_read_unlock();
 		fprintf(stderr, "merge-bail[%s] n=%ld: trie REFUSES a mutation after the "
-			"bail -- a COPYING mark leaked (rc=%d)\n", rkm_knob_name(knob), n, drc);
+			"bail -- a lock acquire leaked (rc=%d)\n", rkm_knob_name(knob), n, drc);
 		goto out;
 	}
 	rcu_read_unlock();

@@ -79,7 +79,7 @@ design is smaller and needs no new record *class* — a COPY_SLOT is a CAS recor
 The parked flip-proxy the copy loop meets on one of `N`'s child slots is a peer
 **child recompact's forward-publish** (it CASes `N.child[b]`, the child's own
 grandparent slot, from `child -> child'`). It does NOT touch `N.status`, so the
-F2 COPYING fence — which pins `N.status` — cannot see it. That is exactly the
+F2 node lock — which pins `N.status` — cannot see it. That is exactly the
 gap: `N.status` is fenced, but a per-child-slot republish is not.
 
 ### COPY_SLOT record `{src, V, dst}` (rcu-mcas.h, committed 25e18335)
@@ -144,7 +144,7 @@ live-retire (`retire_txn`) arm, per surviving child slot at byte b:
 
 Reserve widens by `nr_child` (one COPY_SLOT per child) on top of the existing
 `2*(nr_child+1)+1` reparent/back-channel budget. The claim stays the F2
-`{COPYING|s -> TOMBSTONE|s}` record on `N.status`; commit = claim + N COPY_SLOTs
+`{LOCK|s -> TOMBSTONE|s}` record on `N.status`; commit = claim + N COPY_SLOTs
 + reparents + forward-publish, one helpable txn.
 
 ### Reclamation under helping — `N'` must be GP-deferred, not immediate-freed
@@ -196,7 +196,7 @@ argument for keeping recompact aborts rare — priority/aging, not spin).
 ## 3. The status-word claim — one record, TOMBSTONE-first (no COPY flag)
 
 Plant a **TOMBSTONE-valued flip proxy on `N.status` as the first record**, ahead
-of the action records. A separate `FT_STATE_COPYING` flag is **not needed**: a
+of the action records. A separate `FT_STATE_LOCK` flag is **not needed**: a
 parked proxy already provides all three roles.
 
 1. **Conflict signal.** A parked proxy on `N.status` makes any txn that touches
@@ -205,10 +205,10 @@ parked proxy already provides all three roles.
 
 2. **Reversible-until-commit fence, for free.** The proxy resolves to `old`
    (LIVE) for readers and rolls back byte-for-byte to the old word on abort —
-   exactly the reversible fence `FT_STATE_COPYING` hand-rolled (set-then-clear),
+   exactly the reversible fence `FT_STATE_LOCK` hand-rolled (set-then-clear),
    without an explicit clear path. Because the proxy claims the **whole** word,
    a concurrent `nr_child+-` on `N` is forced to contend too (correct: a child
-   insert/remove during the copy is a true conflict), whereas COPYING-as-a-bit
+   insert/remove during the copy is a true conflict), whereas LOCK-as-a-bit
    let `nr_child` mutate underneath.
 
 3. **One-way death on commit.** Resolves to TOMBSTONE => `N` retired.
@@ -232,12 +232,12 @@ descriptor that records one slot twice, rcu-mcas.h ~948-973).
 [last] grandparent slot : N -> N'    (forward publish; visible only at commit)
 ```
 
-### Bonus — retire `FT_STATE_COPYING`
+### Bonus — retire `FT_STATE_LOCK`
 
 On a fully txn'd recompact path the guard mask collapses from
-`~(TOMBSTONE | COPYING)` to `~TOMBSTONE`; proxy contention handles the in-flight
+`~(TOMBSTONE | LOCK)` to `~TOMBSTONE`; proxy contention handles the in-flight
 case. Caveat: only where recompact is *fully* txn'd — any single-writer / bulk /
-compact path still using COPYING must convert first, or the two schemes coexist
+compact path still using LOCK must convert first, or the two schemes coexist
 during the transition.
 
 ## 4. The load-bearing precondition (why determinism holds)

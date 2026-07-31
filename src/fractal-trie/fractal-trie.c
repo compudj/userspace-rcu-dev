@@ -325,7 +325,7 @@ sweep:
 	 */
 	if (!marks_consumed)
 		for (i = 0; i < nr_marks; i++)
-			ft_meta_copying_clear_if_held(marks[i]);
+			ft_meta_lock_release_if_held(marks[i]);
 	return ret;
 }
 
@@ -441,7 +441,7 @@ bool ft_rekey_splice_pos_brackets(struct cds_ft *ft, const uint8_t *dst_ord,
  *     parent or not: in the default, concurrent-safe build EVERY popcount delete
  *     recompacts, so BP is rebuilt on the removal and republished into its parent,
  *     and that parent is either the node the graft's dst-parent recompaction
- *     already COPYING-holds -- REUSED via @src_held_hint rather than re-acquired --
+ *     already holds the lock -- REUSED via @src_held_hint rather than re-acquired --
  *     or a node this detach acquires itself, guarded.  Both are try-locks that
  *     abort rather than block, so their order is deadlock-free.
  *   - @dst_key is ABSENT and reached by a NOSPLIT graft into a spare slot with
@@ -453,7 +453,7 @@ bool ft_rekey_splice_pos_brackets(struct cds_ft *ft, const uint8_t *dst_ord,
  *     own ordered neighbourhood (adjacency guard below).
  * structural_sw STAYS TRUE the whole txn: cow_stop's S_top edges, the graft's
  * dst-parent recompaction, and the detach's BP recompaction all hold their DLM
- * COPYING locks (BP's parent held by the graft via @src_held_hint, or acquired
+ * node locks (BP's parent held by the graft via @src_held_hint, or acquired
  * here), so every structural edge is legitimately SW; the mixed engine still
  * sorts the (MW) count edges first.
  *
@@ -690,7 +690,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 * Locate the dst splice neighbours NOW, on the pristine list (find_splice_pos
 	 * needs the dst attach point empty, which it still is -- nothing is published
 	 * until the final commit), and REJECT an adjacency shape up front (before any
-	 * txn / COPYING mark / record, so the bail is a clean no-op -EINVAL): because
+	 * txn / lock acquire / record, so the bail is a clean no-op -EINVAL): because
 	 * find_splice_pos runs while the run is STILL at src, a dst gap that abuts the
 	 * run resolves the run's own ENDPOINT cell as a splice neighbour (dsucc == run
 	 * first, or dpred == run last), which would record a duplicate-slot MW edge and
@@ -789,12 +789,12 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 
 	/*
 	 * 2. + 3.  structural_sw STAYS TRUE for the rest: the graft ALWAYS relocates
-	 * the dst attach node (a reserve recompaction), which ACQUIRES COPYING locks
+	 * the dst attach node (a reserve recompaction), which ACQUIRES node locks
 	 * over the dst parent + the republish grandparent and records its re-parents /
 	 * release / retire as SW under those locks -- so the graft forward publish and
 	 * recompact edges are correctly SW.  The detach's src-junction (BP) edges are
 	 * UNLOCKED, and no toggle is needed (toggling OFF would wrongly demote the
-	 * recompact's COPYING-expecting edges to MW -> expected-old mismatch -> abort).
+	 * recompact's lock-expecting edges to MW -> expected-old mismatch -> abort).
 	 *
 	 * ★ NOT because "ft_ord_cell_record_into forces them MW regardless of
 	 * structural_sw", which this said and which is false for exactly these
@@ -910,7 +910,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 			cds_ft_fault_lock_countdown--;
 		}
 #endif
-		if (!pp_meta || ft_meta_copying_mark(pp_meta, &pp_snap)) {
+		if (!pp_meta || ft_meta_lock_acquire(pp_meta, &pp_snap)) {
 			pp_meta = NULL;
 			ret = -EAGAIN;
 			goto bail_build;
@@ -930,7 +930,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		}
 		/*
 		 * FUSE both free lists into the shared txn.  The dst side MUST (a fenced
-		 * overlap retire records its {COPYING|s -> TOMBSTONE|s} terminal into
+		 * overlap retire records its {LOCK|s -> TOMBSTONE|s} terminal into
 		 * g->txn and asserts on this flag), and the src side must for the reason
 		 * the whole fold exists: its free list carries S_top, whose retire has to
 		 * flip WITH the publish rather than as a standalone lone-edge store the
@@ -979,7 +979,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		/*
 		 * COLLIDED KEYS: a full key present on BOTH sides makes ft_merge_build
 		 * splice the src leaf onto the dst head's DUPLICATE CHAIN.  That append
-		 * walks a LIVE chain, so it runs under the chain holder's COPYING lock --
+		 * walks a LIVE chain, so it runs under the chain holder's node lock --
 		 * the exclusion @cc91bd8b added when it closed the last unlocked chain
 		 * mutation.  ft_merge_spine_copy takes it before its own point of no
 		 * return and SKIPS it for a pre-reserved caller, whose placement cannot
@@ -1144,11 +1144,11 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		 * this txn is structural_sw, so the forward publish PARKS a plain store
 		 * into that node's slot, and the fold's rule is SW iff the op holds the
 		 * slot's lock.  A miss (retired / proxied / peer-locked) is the clean
-		 * transient: nothing is published, and ft_meta_copying_mark did not set
+		 * transient: nothing is published, and ft_meta_lock_acquire did not set
 		 * the fence.  Mirrors ft_graft_keylen's own pre-swap fence.
 		 */
 		pp_meta = ft_flag_to_metadata(ft, glue.publish_parent);
-		if (ft_meta_copying_mark(pp_meta, &pp_snap)) {
+		if (ft_meta_lock_acquire(pp_meta, &pp_snap)) {
 			pp_meta = NULL;
 			ret = -EAGAIN;
 			goto bail_build;
@@ -1166,7 +1166,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		 * live_state} STATE edge, which is recorded unconditionally -- NOT by
 		 * the pso edge, which since @118245b0 is its own word and is recorded
 		 * only when the slot index CHANGES (resting the release on it leaks a
-		 * permanent COPYING on every child that lands at the same index; see
+		 * permanent LOCK on every child that lands at the same index; see
 		 * ft_rekey_cow_stop's release-attribution note).  Every bail path
 		 * releases it through the @marks sweep.  An external child has no state word and
 		 * no metadata, so there is nothing to mark and nothing to clobber.
@@ -1180,7 +1180,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 			if (cm) {
 				uintptr_t csnap;
 
-				if (ft_meta_copying_mark(cm, &csnap)) {
+				if (ft_meta_lock_acquire(cm, &csnap)) {
 					ret = -EAGAIN;
 					goto bail_build;
 				}
@@ -1251,7 +1251,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 * that recompaction republishes into BP's parent.  Two shapes, decided by the
 	 * gate above and carried by @src_parent_held:
 	 *   - BP's parent IS the spine ancestor the graft's dst-parent recompaction
-	 *     already COPYING-holds (both junctions are its children).  REUSE the held
+	 *     already holds the lock (both junctions are its children).  REUSE the held
 	 *     lock; re-acquiring it would abort -EAGAIN.
 	 *   - BP's parent is a node this op holds nothing on.  The recompaction
 	 *     acquires and releases it itself, in its own up-front lock-set commit.
@@ -1291,7 +1291,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		 * -EAGAIN right here, as does a peer that re-homed BP since this
 		 * descent (the @parent_guard read-set validation).  It used to be
 		 * reachable single-threaded too, via a same-junction move (BP == the
-		 * graft's own attach node, hence already COPYING-held); the shape gate
+		 * graft's own attach node, hence already LOCK-held); the shape gate
 		 * now rejects that permanently, up front, before any of this is built.
 		 */
 		pp_meta = NULL;		/* ft_glue_abort below is the single owner */
@@ -1503,7 +1503,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		/*
 		 * The commit CONSUMED every mark in @marks: each child's release is
 		 * ft_reparent_record_meta's {live_state -> live_state} state edge
-		 * (live_state has COPYING masked, and the edge is recorded
+		 * (live_state has LOCK masked, and the edge is recorded
 		 * unconditionally), and @stop's is its retire.  So the sweep below
 		 * must NOT run -- see its own comment.
 		 */
@@ -1619,7 +1619,7 @@ sweep:
 	 */
 	if (!marks_consumed)
 		for (i = 0; i < nr_marks; i++)
-			ft_meta_copying_clear_if_held(marks[i]);
+			ft_meta_lock_release_if_held(marks[i]);
 	return ret;
 }
 
@@ -1636,7 +1636,7 @@ sweep:
  * every time, so the writer never qualifies and spins instead.
  *
  * SCOPE: this arbitrates COMMITS.  It deliberately does NOT wrap the per-node
- * COPYING acquires -- an escalated acquirer would hold its FIFO turn while
+ * LOCK acquires -- an escalated acquirer would hold its FIFO turn while
  * spinning for a holder that is itself funnelled behind that turn (the circular
  * wait documented at the FT-wide writer lock).  An acquire miss stays a clean
  * bail that re-descends.

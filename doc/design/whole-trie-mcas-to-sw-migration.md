@@ -109,7 +109,7 @@ sw's own header (§"URCU_TXN_SW_EXCL_VALIDATE") states the contract bluntly:
 
 Therefore:
 
-- The COPYING per-node lock (`FT_STATE_COPYING`) and/or the FT-wide `writer_lock`
+- The LOCK per-node lock (`FT_STATE_LOCK`) and/or the FT-wide `writer_lock`
   is *exactly* the exclusion sw demands. The lock pivot is not merely
   compatible with sw — it is the **precondition** that makes sw sound.
 - OPTIMISTIC's whole value (the disjoint-key lock-free milestone, 0/1600 @16w)
@@ -144,14 +144,14 @@ multi-edge txn.
 ### 4.A The state-word composition layer (the ONE hard workstream)
 
 Today `&meta->state` is a transacted word carrying `nr_child`, `FT_STATE_PROXY`
-(bit 0), `FT_STATE_TOMBSTONE`, `FT_STATE_COPYING`. Several *distinct* edits
+(bit 0), `FT_STATE_TOMBSTONE`, `FT_STATE_LOCK`. Several *distinct* edits
 land on the SAME `state` word in ONE txn and RYW-chain into a single MCAS
 record:
 
 - `nr_child ± 1` (the child-count edge, e.g. `ft_state_edge` in
   `ft_remove_one_commit`, ft-mutation-helpers.h:2531)
-- `ft_flip_txn_record_tombstone` / `_tombstone_copying` — set TOMBSTONE
-- `ft_flip_txn_record_release_copying` — `{s|COPYING → s}` (drop the lock)
+- `ft_flip_txn_record_tombstone` / `_tombstone_locked` — set TOMBSTONE
+- `ft_flip_txn_record_release_lock` — `{s|LOCK → s}` (drop the lock)
 - `ft_flip_txn_guard_parent` — `{live → live}` validate
 
 Their composition is *engine-mediated*: each reads the word via `urcu_txn_load`
@@ -173,12 +173,12 @@ old = uatomic_load(&meta->state, RELAXED);   /* raw read, we hold the lock  */
 new = old;
 new = ft_state_dec_child(new);               /* if this op decrements       */
 new |=  FT_STATE_TOMBSTONE;                   /* if this op retires          */
-new &= ~FT_STATE_COPYING;                     /* if this op held+releases    */
+new &= ~FT_STATE_LOCK;                     /* if this op held+releases    */
 urcu_txn_sw_record(txn, &meta->state, (void*)old, (void*)new, FT_STATE_PROXY);
 /* NO guard record — see §4.C */
 ```
 
-One record per state word, computed once. The `{COPYING|s → s}` release stays
+One record per state word, computed once. The `{LOCK|s → s}` release stays
 (the fence bit is still the lock, still cleared at commit) but as a *component*
 of the single computed `new`, not a separate chained record. This is a rewrite
 of the `ft_flip_txn_record_*` state-word family, but bounded and mechanical
@@ -188,13 +188,13 @@ once the pattern is set; the callers (18 count sites, 16+7 tombstone,
 ### 4.B Engine-handle swap (`ft_flip_txn` internals)
 
 `struct ft_flip_txn` wraps `urcu_mcas_txn *mtxn` (+ inline `own`) + `reserved`
-+ `copying[8]` registry. The swap:
++ `locks[8]` registry. The swap:
 
 - `mtxn: urcu_mcas_txn → urcu_txn_sw_txn`. `create` → `urcu_txn_sw_init`;
   `create_bounded(cap)` → `urcu_txn_sw_reserve(cap)`; the on-stack bounded flip
   → `urcu_txn_sw_init_inline(buf, cap)` with a caller `aligned(16)` latch buf.
 - `record_reserved`/`record_tag`/`record_count_parent`/`record_tombstone`/
-  `record_release_copying` → `urcu_txn_sw_record(txn, slot, old, new, tag)`.
+  `record_release_lock` → `urcu_txn_sw_record(txn, slot, old, new, tag)`.
   Same {slot, old, new, tag} shape; the tag is the per-record arg already.
 - `commit` → `urcu_txn_sw_commit` (flavor-bound) — returns OK/MEMORY_ERROR,
   **never ABORT**. The retry loop around every mutator collapses to
@@ -237,7 +237,7 @@ must be proven slot-distinct (or its `state`-word coincidences refolded per
   unsplice (≤4) + `freeze_leaf` hlist MARK + `nr_child--` on `state`.
 - `ft_chain_compress_fused` (remove.h:433-733) — **the largest fold**: forward
   publish (+SKIP_X dual) + back-edge (parent,offset) + up to **3
-  `record_tombstone_copying`** (boundary + parent_cn + child_cn — distinct
+  `record_tombstone_locked`** (boundary + parent_cn + child_cn — distinct
   nodes ⇒ distinct `state` words) + orphan freezes + `freeze_leaf` hlist MARK +
   nr_keys count fold + cell unsplice.
 - `ft_detach_node` (remove.h:1645-2013): forward republish + orphan tombstones +

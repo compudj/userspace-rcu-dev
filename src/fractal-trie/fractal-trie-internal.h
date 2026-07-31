@@ -120,7 +120,7 @@
 /*
  * FT-wide-lock DROP is the DEFAULT for a FINE-locking trie (§11 rollout,
  * 2026-07-19).  A FINE trie skips the FT-wide writer mutex and relies solely
- * on its per-node COPYING lock-sets + MCAS arbitration for writer exclusion --
+ * on its per-node node lock-sets + MCAS arbitration for writer exclusion --
  * so disjoint writers run in parallel instead of serialising on one mutex
  * (doc/design/ft-wide-lock-drop-mechanics.md; certified by the §11.4 point-op
  * 1600/1600 gate and the cross-trie oracles).  COARSE tries are unaffected
@@ -806,7 +806,7 @@ struct ft_pub_rec {
 /*
  * Per-node MCAS state word (struct cds_ft_metadata.state) bit layout.
  * bit 0 = proxy (in-band flip marker), bit 1 = tombstone (LIVE->DEAD),
- * bits 2-10 = nr_child, bits 11-18 = parent_slot_offset, bit 19 = COPYING
+ * bits 2-10 = nr_child, bits 11-18 = parent_slot_offset, bit 19 = LOCK
  * (the reversible per-node writer lock; bits 20+ free).
  * See doc/design/mcas-multiwriter-readiness.md §4.2 and, for bit 19,
  * doc/design/mw-writer-lock-escalation-model.md §0/§2.
@@ -831,9 +831,9 @@ struct ft_pub_rec {
  * that sharing forced: nr_child is NODE-owned, parent_slot_offset is
  * PARENT-owned per the edge principle (doc §8.3), and one word cannot be owned
  * by two locks.  It also removes a SELF-DEADLOCK: the offset setter had to spin
- * on FT_STATE_INPLACE_WAIT_MASK, which includes FT_STATE_COPYING
+ * on FT_STATE_INPLACE_WAIT_MASK, which includes FT_STATE_LOCK
  * unconditionally, so an op holding that node's own lock waited on
- * itself (see the reverted b20c471e).  The offset word carries no COPYING bit,
+ * itself (see the reverted b20c471e).  The offset word carries no LOCK bit,
  * so its wait is over the engine proxy alone.
  */
 #define FT_PSO_SHIFT			1	/* bit 0 stays clear: engine proxy tag */
@@ -844,13 +844,13 @@ struct ft_pub_rec {
 #define FT_PSO_DECODE(word)		((unsigned int) (((uintptr_t) (word) \
 						>> FT_PSO_SHIFT) & FT_PSO_VALMASK))
 /*
- * FT_STATE_COPYING (bit 19, above parent_slot_offset): the REVERSIBLE per-node
+ * FT_STATE_LOCK (bit 19, above parent_slot_offset): the REVERSIBLE per-node
  * WRITER LOCK.  It began as the copy fence (MW campaign, Option A -- doc/design
  * + CORE_682870 fix plan F2) and the MW lock-escalation model (§0) is the
  * observation that the fence already IS a lock: CAS to acquire, held across the
  * build/reparent plan window, -EAGAIN on contention, resolved at commit.
  *
- * ACQUIRE: a standalone CAS {clean -> |COPYING}, taken BEFORE the first read of
+ * ACQUIRE: a standalone CAS {clean -> |LOCK}, taken BEFORE the first read of
  * the node it protects.  Every peer publish into the node then aborts on its
  * §4.B guard (the guard's clean-LIVE expectation masks this bit like the
  * tombstone), so the protected body cannot go stale under the holder without
@@ -861,21 +861,21 @@ struct ft_pub_rec {
  * MCAS edge on the state word whose expected old is the mark's CLEAN snapshot
  * (never a fresh read -- the CORE_682870 defect-1 contract):
  *
- *   RETIRE  {COPYING|s -> TOMBSTONE|s}  ft_flip_txn_record_tombstone_copying()
+ *   RETIRE  {LOCK|s -> TOMBSTONE|s}  ft_flip_txn_record_tombstone_locked()
  *           The holder copied the node away; it dies at the commit.  One-way
  *           tombstone semantics (exactly-once retire token, freeze-on-free) are
  *           UNCHANGED.
- *   RELEASE {COPYING|s -> s}            ft_flip_txn_record_release_copying()
+ *   RELEASE {LOCK|s -> s}            ft_flip_txn_record_release_lock()
  *           The holder only needed exclusion; the node SURVIVES the commit.
  *           This is what a lock-set member that is edited but not retired needs
  *           (recompact's parent P, §9.3) -- a lock that unlocks.
  *
  * On ABORT / a pre-commit bail the bit is CAS-cleared instead (the registry
- * drain, ft_flip_txn_copying_clear_all) and the node stays live -- so the
+ * drain, ft_flip_txn_lock_release_all) and the node stays live -- so the
  * ABORT terminal and the RELEASE terminal agree on the resulting word, they
  * differ only in who writes it (a bare CAS vs the atomic commit).
  *
- * Unlike the tombstone, COPYING is reversible BY DESIGN and never implies
+ * Unlike the tombstone, LOCK is reversible BY DESIGN and never implies
  * death; it is never set at rest (ft-verify.h reports a leaked fence).
  */
 /*
@@ -886,7 +886,7 @@ struct ft_pub_rec {
  * invisible, silently-compiling change to the meaning of every state word.
  * Bits 11-18 stay free (see the free-bits note above).
  */
-#define FT_STATE_COPYING		((uintptr_t) 1 << 19)
+#define FT_STATE_LOCK		((uintptr_t) 1 << 19)
 #define FT_STATE_TAG_MASK		(FT_STATE_PROXY | FT_STATE_TOMBSTONE)
 
 /*
@@ -898,7 +898,7 @@ struct ft_pub_rec {
  *   - FT_STATE_PROXY: an engine MCAS flip is parked here (the word holds a record
  *     pointer, not a plain state); CASing would write f(latch-pointer) back.
  *     Always waited out, in every build.
- *   - FT_STATE_COPYING: a peer holds the per-node writer lock
+ *   - FT_STATE_LOCK: a peer holds the per-node writer lock
  *     and may be SW-parking this word (a retire / lock release / re-home) in an
  *     in-flight mixed sw/mw commit.  An SW park is a plain store that never
  *     validates, so a racing CAS here would clobber it (<urcu/rcu-txn.h>: "if any
@@ -910,23 +910,23 @@ struct ft_pub_rec {
  *     racing op's own §4.B guard then aborts and re-descends past the dead node).
  *
  * INVARIANT this relies on (exhaustively audited 2026-07-23): NO op calls these
- * standalone primitives on a node it ITSELF holds COPYING on.  A COPYING-held
+ * standalone primitives on a node it ITSELF holds LOCK on.  A LOCK-held
  * node's count / offset change always rides the flip-txn as a RECORDED edge
- * (ft_state_edge / ft_flip_txn_record_release_copying / ft_flip_txn_record_count_
+ * (ft_state_edge / ft_flip_txn_record_release_lock / ft_flip_txn_record_count_
  * parent), never these primitives -- so the spin is on a PEER's lock only and
  * cannot self-deadlock.  A future guard->lock conversion that routes a locked
  * node's nr_child through these standalone primitives (instead of a recorded
  * edge) would break this and must not be done.
  *
- * COPYING IS IN THE MASK UNCONDITIONALLY.  This used to say "Non-DLM builds
- * exclude COPYING so the optimistic MW path ... stays byte-identical", one line
+ * LOCK IS IN THE MASK UNCONDITIONALLY.  This used to say "Non-DLM builds
+ * exclude LOCK so the optimistic MW path ... stays byte-identical", one line
  * above a #define that has no #ifdef -- the optimistic MW strategy is gone and
  * DLM is the only multi-writer implementation, so there is no build in which
- * COPYING is merely a copy fence here.  The consequence is load-bearing and is
+ * LOCK is merely a copy fence here.  The consequence is load-bearing and is
  * asserted in the wrong direction elsewhere: an in-place nr_child update SPINS
- * while a peer holds COPYING, i.e. it HONORS the lock rather than racing it.
+ * while a peer holds LOCK, i.e. it HONORS the lock rather than racing it.
  */
-#define FT_STATE_INPLACE_WAIT_MASK	(FT_STATE_PROXY | FT_STATE_COPYING)
+#define FT_STATE_INPLACE_WAIT_MASK	(FT_STATE_PROXY | FT_STATE_LOCK)
 
 struct cds_ft_metadata {
 	/* 8-byte aligned fields. */
@@ -990,7 +990,7 @@ struct cds_ft_metadata {
 	 * §8.3 gave it its OWN word (@parent_slot_offset) because a word cannot be
 	 * owned by two locks -- the slot offset is PARENT-owned while @state is
 	 * node-owned, and sharing them self-deadlocked the offset setter against
-	 * its own node's COPYING bit.  Access it via the
+	 * its own node's LOCK bit.  Access it via the
 	 * ft_meta_parent_slot_offset* helpers.)
 	 *
 	 * alloc_index:            near: FT_ALLOC_INDEX_BITS + 3 spare bits of
@@ -1133,12 +1133,12 @@ unsigned int ft_meta_parent_slot_offset(const struct cds_ft_metadata *meta)
  * wait is bounded by the owner's settle.
  *
  * ★ The wait is over FT_STATE_PROXY ALONE, deliberately, NOT
- * FT_STATE_INPLACE_WAIT_MASK.  That mask includes FT_STATE_COPYING under
+ * FT_STATE_INPLACE_WAIT_MASK.  That mask includes FT_STATE_LOCK under
  * the DLM lock-sets, and while the offset shared @state an op holding
- * this node's own COPYING lock spun on itself forever -- the self-deadlock that
+ * this node's own node lock spun on itself forever -- the self-deadlock that
  * reverted b20c471e (single-threaded, ft_unit test_lookup_nth_varlen: a prefix
  * insert builds a glue node and re-parents a node the op has locked).  The
- * offset word has no COPYING bit to wait on, which is the whole point of the
+ * offset word has no LOCK bit to wait on, which is the whole point of the
  * split, so DO NOT reintroduce that mask here.
  *
  * A LIVE, reader-reachable node must not come through here at all: its re-home
@@ -1806,7 +1806,7 @@ void ft_writer_lock_scope_enter(struct cds_ft *ft)
 	if (ft->lock_fine) {
 		/*
 		 * FT-WIDE-LOCK DROP (§11 drop-mechanics, MCAS-first): a FINE trie's
-		 * op-domains are ALL converted to per-node lock-sets (COPYING
+		 * op-domains are ALL converted to per-node lock-sets (LOCK
 		 * try-locks) that arbitrate writers directly, so the FT-wide mutex
 		 * is redundant -- SKIP it and let the per-node locks be the sole
 		 * exclusion.  Dropped ALL-AT-ONCE for FINE (not op-domain by

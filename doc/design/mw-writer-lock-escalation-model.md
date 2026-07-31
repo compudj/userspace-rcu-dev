@@ -17,7 +17,7 @@ lock-sets").
 Supersedes the *direction* of the lock-free-MW campaign at `d48ed267` (skip-resolver
 reanchor, detach coherence, PSO/graft/stale-slot fixes). Those fixes stay correct
 and stay in the tree; the pivot changes the *strategy* they were serving. Related:
-`recompact-copy-precommit-window.md` (why `FT_STATE_COPYING` is load-bearing — the
+`recompact-copy-precommit-window.md` (why `FT_STATE_LOCK` is load-bearing — the
 seed observation for this pivot), `transactional-flip-latch.md`,
 `mcas-multiwriter-readiness.md`.
 
@@ -25,7 +25,7 @@ seed observation for this pivot), `transactional-flip-latch.md`,
 
 ## 0. The seed observation
 
-`FT_STATE_COPYING` is a lock.
+`FT_STATE_LOCK` is a lock.
 
 - Acquired by CAS on the node's state word → a try-lock.
 - Held across a multi-step critical section (build the recompacted node, reparent)
@@ -36,7 +36,7 @@ seed observation for this pivot), `transactional-flip-latch.md`,
 That is mutual exclusion on a node's mutation, full stop. The reverted
 pre-commit-callback experiment (`recompact-copy-precommit-window.md`) is the proof:
 the tombstone *claim* is a commit-time record and could **not** fence the
-build/reparent plan window, whereas the persistent COPYING CAS could. COPYING was
+build/reparent plan window, whereas the persistent LOCK CAS could. LOCK was
 load-bearing precisely *because* it is a lock and the txn commit primitive is not.
 
 The pivot: stop half-implementing exclusion inside the txn state word and fighting
@@ -92,20 +92,20 @@ Why it was withdrawn — three independent reasons, each sufficient:
   "reader-invisible reclaim vs reader-visible delete" is a distinction with no
   reader to draw it.
 - **No writer consumer distinguishes the two meanings either.** All four treat any
-  tombstone identically: the lock's own dirty check (`ft_meta_copying_mark`) bails on
+  tombstone identically: the lock's own dirty check (`ft_meta_lock_acquire`) bails on
   it, `ft_flip_txn_guard_parent` masks it into an abort, the recompact reparent sweep
   masks it (the UAF guard), and the freeze-on-free audit accepts it as free-eligible.
   A writer already knows at the call site whether it is retiring keys or deleting
   them; it never needs to *read back* which kind of death a node died.
 - **It would not have dissolved the double-tombstone poison.** The poison was two
   records on the SAME WORD with a stale expected-old; splitting the bits leaves both
-  records on that same word (`{s|COPYING → s|RECLAIM}` then `{s → s|DELETED}` has
+  records on that same word (`{s|LOCK → s|RECLAIM}` then `{s → s|DELETED}` has
   exactly the same stale expected-old). What actually fixed it is the read-your-writes
   load in `ft_flip_txn_record_tombstone` (`47a1a612`,
   `project_ft_txn_double_tombstone_poison`).
 
 **What the lock model actually needed was the other thing this section was reaching
-for: a lock that can UNLOCK.** Today `FT_STATE_COPYING`'s only commit-OK terminal is
+for: a lock that can UNLOCK.** Today `FT_STATE_LOCK`'s only commit-OK terminal is
 `→ TOMBSTONE`, because the only thing that ever takes it is a copier that retires the
 node. The moment a lock-set contains a member that is *edited but survives* —
 recompact's parent `P` (§9.3) — the lock needs a second terminal. So the lock has
@@ -114,11 +114,11 @@ mark's clean snapshot:
 
 | terminal | transition | who |
 |---|---|---|
-| **retire** | `{COPYING\|s → TOMBSTONE\|s}` | the node is copied away and dies (`C`) |
-| **release** | `{COPYING\|s → s}` | the node is edited/protected and lives (`P`, `GP`) |
+| **retire** | `{LOCK\|s → TOMBSTONE\|s}` | the node is copied away and dies (`C`) |
+| **release** | `{LOCK\|s → s}` | the node is edited/protected and lives (`P`, `GP`) |
 
 Plus the pre-existing non-commit terminal: ABORT / MEMORY_ERROR / a pre-commit bail
-CAS-clear the bit through the txn's `copying[]` registry, leaving the node live — the
+CAS-clear the bit through the txn's `locks[]` registry, leaving the node live — the
 same resulting word as *release*, differing only in who writes it (a bare CAS vs the
 atomic commit). **The registry therefore needs no knowledge of which terminal an op
 chose**, which is why adding *release* touched neither the drain nor the CORE_682870
@@ -298,7 +298,7 @@ safety comes from *all-or-none acquire*, not from the lane's scope.
 
   This attacks the dominant MW cost directly — recompaction full-node copies + the
   alloc/free storm (`project_ft_recompaction_livelock`) — and *reduces how often* the
-  COPYING-fenced recompaction path runs at all. Scope today: amortized-O(1) append into
+  LOCK-fenced recompaction path runs at all. Scope today: amortized-O(1) append into
   capacity; a *full* node still grows via copy; middle-insert / middle physical
   compaction still copy (they move other children's reader-visible popcount indices).
 
@@ -469,7 +469,7 @@ Operations to pin, each its own analysis:
 
 - **insert** — leaf node; parent iff node-type change (split/grow).
 - **remove** — leaf node; parent iff merge/shrink; duplicate-chain nodes for same-key.
-- **recompact** — the node + its parent (the COPYING window, restated as an explicit
+- **recompact** — the node + its parent (the LOCK window, restated as an explicit
   lock).
 - **merge_at** — the spine.
 - **graft / graft_swap** — the spine + graft point.
@@ -485,8 +485,8 @@ the acquisition MCAS validates.
 past-child) is converted at its one shared choke point, `ft_insert_publish_or_park`:
 its `parent_nf` — the publish-into node, which SURVIVES the commit and whose slot is a
 same-slot value swap (I-4a's `P` = CN's parent; I-4b's `CN` itself) — is acquired as a
-per-node RELEASE lock ({COPYING|s → s}) instead of §4.B-guarded. The body-read node
-(`CN`, split/retired) was already COPYING-locked at build entry (ins:653/2188) and
+per-node RELEASE lock ({LOCK|s → s}) instead of §4.B-guarded. The body-read node
+(`CN`, split/retired) was already LOCK-locked at build entry (ins:653/2188) and
 RETIRE-terminated, so insert has no *new* body-locked node — `parent_nf` is the only
 guard→lock flip, and it is uniform across all three shapes.
 
@@ -508,7 +508,7 @@ fallback is `FEATURE_FT_FAULT_INJECT`-only.
   dual writes a slot in CN's parent), which is unguarded *today* (§9.1.4's under-count).
   Load-bearing only at the FT-wide-lock drop; deferred with it.
 - **I-3 duplicate append `{L}`** — `L` is a bare `cds_ft_node` hlist with no `state`
-  word, so it cannot take an FT_STATE_COPYING lock; `{L}` is the `last->next` value-CAS
+  word, so it cannot take an FT_STATE_LOCK; `{L}` is the `last->next` value-CAS
   in its own private txn. Nothing to convert.
 
 The original derivation follows.
@@ -534,7 +534,7 @@ Cases (all `arm(0)` — no spine fold; `P` = node whose slot gains the edge, `GP
 | **I-1** in-place reserve | `P` gains a child, has capacity | **{P}** | — | `guard_parent(P)` (ins:1632) |
 | **I-2** reserve recompacts `P` | `P` full → grow; fresh `P'` published at `GP` | **{GP, P}** | `P` | `guard_parent(GP)` (ins:1718) |
 | **I-3** duplicate append | append to dup-chain tail | **{L}** | — | recorded CAS `last->next` (ins:1934) |
-| **I-4a** compressed diverge / key-shorter | replace `CN` with prefix→branch | **{P, CN}** | `CN` | `guard_parent(P)` (ins:474); `CN` COPYING @build-entry |
+| **I-4a** compressed diverge / key-shorter | replace `CN` with prefix→branch | **{P, CN}** | `CN` | `guard_parent(P)` (ins:474); `CN` LOCK @build-entry |
 | **I-4b** compressed past-child | grow a branch under `CN` | **{CN, P}** skip / **{CN}** no-skip | — | `guard_parent(CN)`; `P` skip-dual recorded, unguarded |
 
 Four things this pins down:
@@ -559,7 +559,7 @@ Four things this pins down:
 3. **Abort-and-re-descend is already coded.** A peer re-homing `CN`/`P` between descent
    and build is caught by `ft_get_parent_slot(cn_meta) != parent_slot` → `-EAGAIN` →
    re-descend (ins:962, 1691, 2261) and the concurrent-writer bail (ins:1429) — exactly
-   "read-set stale → recompute the lock-set, re-descend" (§5). The `CN` COPYING mark
+   "read-set stale → recompute the lock-set, re-descend" (§5). The `CN` lock acquire
    (ins:653/2176), taken *before reading CN's body*, is `CN`'s lock acquired at build
    entry — confirming the set is held up front, not merely at commit.
 
@@ -620,7 +620,7 @@ Four load-bearing findings:
 1. **The lock-set is discovered by a read-only planning climb, not known at the leaf.**
    Only R-1a is determined by `@node` alone. Every spine path (R-3/4/5) finds `BP`,
    `GP`, the orphan set, and the merge neighbours *during* the `metadata->parent`
-   up-climb or under the COPYING fence — where the prune stops depends on live
+   up-climb or under the node lock — where the prune stops depends on live
    `nr_child`/`external_nodes` read mid-climb. So remove's acquisition is inherently
    two-phase, and **this is the template for recompact / merge_at / graft**:
 
@@ -631,7 +631,7 @@ Four load-bearing findings:
    > `BP`) → **abort and re-plan**.
 
    Not new machinery: the existing `-EAGAIN` bails (2035/1169/1875/1956) and
-   COPYING-fence bails (§4 @496/511/535) *are* the re-plan hooks. The lock model renames
+   node lock bails (§4 @496/511/535) *are* the re-plan hooks. The lock model renames
    "guard + validate at commit" to "acquire + validate the read-set," and fixes that the
    set is computed by the plan, never grown in place mid-climb.
 
@@ -695,16 +695,16 @@ insert I-2 (grow), remove R-3 (shrink), and the per-trie compactor (relocate) al
 invoke. Pinning it once fixes the atom the climbing ops reuse per level. Frame: `C` =
 the node being recompacted, `P` = `C`'s parent.
 
-**The COPYING fence *is* `C`'s lock — §0's seed observation, made concrete.**
-`ft_node_recompact` opens (mut-node:1043) with `ft_meta_copying_mark(C)` *before any read
+**The node lock *is* `C`'s lock — §0's seed observation, made concrete.**
+`ft_node_recompact` opens (mut-node:1043) with `ft_meta_lock_acquire(C)` *before any read
 of `C`'s body* — the sizing loads, the `(parent, offset)` inherit, and the copy loops all
-read under it — and the commit converts `{COPYING|s → TOMBSTONE|s}`. That is exactly
+read under it — and the commit converts `{LOCK|s → TOMBSTONE|s}`. That is exactly
 acquire-lock-up-front + node-reclaim-at-commit. A dirty mark (peer proxy / concurrent
 copier / real retire) **bails before any allocation** (mut-node:1044-46) — "couldn't
 acquire → re-descend." The whole pivot is this one function generalized.
 
 **Write-set (live retire, the `retire_txn` arm):**
-- `C` — state word `COPYING`→`TOMBSTONE`, retired → `C`'s lock (the fence).
+- `C` — state word `LOCK`→`TOMBSTONE`, retired → `C`'s lock (the fence).
 - every **surviving child of `C`** — back-edge `(parent, PSO, incoming_byte)` re-parented
   to the fresh copy (`ft_reparent_record_meta`), recorded into `retire_txn`. Owned by
   `C`'s lock (their parent), already held → **covered, not a separate member** (the
@@ -1051,8 +1051,8 @@ regardless of op order"):
    (§2) per §8.2; the **abort-boundary gate** (§5: byte-for-byte, free reserved) wired as
    the acquire/edit failure path. *The `node-reclaim` bit reserved in `4e943653` was
    UN-reserved at step 3: the tombstone split is withdrawn (§2). What the words actually
-   needed was one added terminal — RELEASE `{COPYING|s → s}` — and because a terminal is
-   just the MCAS record an op plants, the `copying[]` registry and its drain in
+   needed was one added terminal — RELEASE `{LOCK|s → s}` — and because a terminal is
+   just the MCAS record an op plants, the `locks[]` registry and its drain in
    `ft_flip_txn_commit` / `ft_flip_txn_destroy` were NOT touched at all. The abort-boundary
    gate was already built for the fence and carries the lock unchanged.*
 2. **`rank_stats`-ON = one FT-wide lock (§10.5).** — *LANDED (`14545ebb`), as
@@ -1070,7 +1070,7 @@ regardless of op order"):
 Then the fine-grained (`rank_stats`-OFF) op-domains, smallest / most-local lock-set first
 (the §9 order):
 
-3. **recompact `{C, P}` (§9.3).** — *LANDED.* Convert first — `FT_STATE_COPYING`
+3. **recompact `{C, P}` (§9.3).** — *LANDED.* Convert first — `FT_STATE_LOCK`
    *already is* this lock (§0), so it is the smallest conceptual delta and it validates
    the seed directly. It is also the shared boundary-copy atom behind insert-grow,
    remove-shrink and the compactor, so converting it has leverage. *As landed: under
@@ -1082,7 +1082,7 @@ Then the fine-grained (`rank_stats`-OFF) op-domains, smallest / most-local lock-
    reaches the same publish with no recompact and no lock).*
    **Two things this step was expected to carry, and does not:**
    *(a) the tombstone split is WITHDRAWN — see §2; what was needed was the release
-   terminal, which touches neither the `copying[]` drain nor the CORE_682870
+   terminal, which touches neither the `locks[]` drain nor the CORE_682870
    expected-old contract. (b) the §8.3 layout split is DEFERRED to the end of the
    transition — see §8.3: with the writers still CAS loops, word-sharing costs a
    spurious abort, not a lost update, so the split buys nothing until OPTIMISTIC's

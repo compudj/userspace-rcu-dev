@@ -26,7 +26,7 @@ node; every remove must PATH-COMPRESS it back. No merge, no rekey, no graft.
    tombstoned top.
 4. **The livelock is that same orphan met by a later remove.**
    `_cds_ft_remove_locked` returns -EAGAIN 2,000,000+ consecutive times;
-   `ft_meta_copying_mark` correctly refuses a TOMBSTONE word; the wrapper loop
+   `ft_meta_lock_acquire` correctly refuses a TOMBSTONE word; the wrapper loop
    (`cds_ft_remove`, ft-remove.h ~:3620) re-derives from `node->prev` with **no
    top-down descent** and **no tombstone check on the holder** (its only guard,
    `ft_node_is_removed`, is on the LEAF and is false here), so it re-derives the
@@ -35,7 +35,7 @@ node; every remove must PATH-COMPRESS it back. No merge, no rekey, no graft.
 5. **Feature-independent.** fine-drop / dlm / noskip / nocompress all reproduce
    with `state=0xa`. Turning features off only moves WHICH fence site refuses
    the dead node (ft-remove.h:749 `ft_chain_compress_fused` -> ft-mutation-node.h
-   `ft_node_recompact` / `ft_meta_copying_mark` directly).
+   `ft_node_recompact` / `ft_meta_lock_acquire` directly).
 
 ## What is still HYPOTHESIS
 

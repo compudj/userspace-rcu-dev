@@ -125,7 +125,7 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 		/*
 		 * DLM Step 1: @cn is the value-swap RELEASE target this external-
 		 * promote publishes into (its child slot); acquire it (hard, no guard-
-		 * fallback) up front and record its {COPYING|s -> s} release, so both
+		 * fallback) up front and record its {LOCK|s -> s} release, so both
 		 * publish arms below skip their lock_or_guard.  -EAGAIN before any edge
 		 * is recorded -> caller destroys @txn and re-descends.
 		 */
@@ -134,14 +134,14 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 				cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
 			uintptr_t cn_snap;
 
-			if (ft_meta_copying_mark(cn_meta, &cn_snap)) {
+			if (ft_meta_lock_acquire(cn_meta, &cn_snap)) {
 				/* Pre-commit -EAGAIN: destroy the caller-owned txn
 				 * (its cleanup skips destroy on -EAGAIN). */
 				ft_flip_txn_destroy(txn);
 				return -EAGAIN;
 			}
-			ft_flip_txn_record_release_copying(txn, cn_meta, cn_snap);
-			ft_flip_txn_copying_register(txn, cn_meta);
+			ft_flip_txn_record_release_lock(txn, cn_meta, cn_snap);
+			ft_flip_txn_lock_register(txn, cn_meta);
 		}
 		/*
 		 * Fold the external head's back-edge -- cell->parent (list on) or
@@ -337,11 +337,11 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 				return dret;	/* nothing acquired (all-or-none) */
 			}
 			src_snap = set[0].snap;
-			ft_flip_txn_copying_register(txn, src_cn_meta_a);
+			ft_flip_txn_lock_register(txn, src_cn_meta_a);
 			if (pp_meta) {
-				ft_flip_txn_record_release_copying(txn, pp_meta,
+				ft_flip_txn_record_release_lock(txn, pp_meta,
 					set[1].snap);
-				ft_flip_txn_copying_register(txn, pp_meta);
+				ft_flip_txn_lock_register(txn, pp_meta);
 			}
 			dlm_a2 = true;
 		}
@@ -388,11 +388,11 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			 * detach).  This detach sub-case is not reached by the current
 			 * test suite (verified: zero hits across ft_unit + ft_inv both
 			 * list modes), so the freeze-on-free audit never exercises it.
-			 * DLM: src_cn was COPYING-acquired up front, so record the FENCED
-			 * {COPYING|s -> TOMBSTONE|s} terminal (a peer state change aborts).
+			 * DLM: src_cn was LOCK-acquired up front, so record the FENCED
+			 * {LOCK|s -> TOMBSTONE|s} terminal (a peer state change aborts).
 			 */
 			if (dlm_a2)
-				ft_flip_txn_record_tombstone_copying(txn, src_cn_meta_a,
+				ft_flip_txn_record_tombstone_locked(txn, src_cn_meta_a,
 					src_snap);
 			else
 				ft_flip_txn_record_tombstone(txn, cds_ft_item_to_metadata(
@@ -476,14 +476,14 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
  * resolution mirrors the branch-2 free loop.
  *
  * DLM plan-lock (lock_fine): @snaps non-NULL means
- * the caller COPYING-marked each orphan at collection (parallel to @orphans, and
+ * the caller lock-acquired each orphan at collection (parallel to @orphans, and
  * @trailing_snap for the trailing skip-target) so the collapse decision was made
- * on a frozen state word.  Record the FENCED {COPYING|s -> TOMBSTONE|s} terminal
+ * on a frozen state word.  Record the FENCED {LOCK|s -> TOMBSTONE|s} terminal
  * from that snapshot instead of the plain RYW tombstone: a peer that grew the
  * orphan tears the fenced expected-old and ABORTS this commit (§9.2
  * orphan-chain coherence).  (This used to justify itself with "nr_child_inc
- * ignores COPYING".  It does not: ft_meta_nr_child_inc SPINS on
- * FT_STATE_INPLACE_WAIT_MASK, which includes FT_STATE_COPYING unconditionally
+ * ignores LOCK".  It does not: ft_meta_nr_child_inc SPINS on
+ * FT_STATE_INPLACE_WAIT_MASK, which includes FT_STATE_LOCK unconditionally
  * -- so a peer cannot grow a marked orphan at all, and the coherence this
  * fence buys comes from EXCLUSION, which is stronger than the tear-and-abort
  * the old wording described.  The conclusion held; the mechanism did not.)
@@ -506,7 +506,7 @@ void ft_detach_freeze_orphans(struct cds_ft *ft, struct ft_flip_txn *txn,
 			: cds_ft_item_to_metadata(ft_node_ptr(orphans[i]));
 
 		if (snaps)
-			ft_flip_txn_record_tombstone_copying(txn, m, snaps[i]);
+			ft_flip_txn_record_tombstone_locked(txn, m, snaps[i]);
 		else if (txn)
 			ft_flip_txn_record_tombstone(txn, m);
 		else
@@ -518,7 +518,7 @@ void ft_detach_freeze_orphans(struct cds_ft *ft, struct ft_flip_txn *txn,
 				trailing_skip_cn_flag));
 
 		if (snaps)
-			ft_flip_txn_record_tombstone_copying(txn, m, trailing_snap);
+			ft_flip_txn_record_tombstone_locked(txn, m, trailing_snap);
 		else if (txn)
 			ft_flip_txn_record_tombstone(txn, m);
 		else
@@ -526,7 +526,7 @@ void ft_detach_freeze_orphans(struct cds_ft *ft, struct ft_flip_txn *txn,
 	}
 }
 /*
- * DLM orphan plan-lock (§9.2, lock_fine): COPYING-mark orphan @m at collection
+ * DLM orphan plan-lock (§9.2, lock_fine): lock acquire orphan @m at collection
  * and record it into ft_detach_node's fn-scope lock arrays (parallel to its
  * to_free[]).  @require_single_child validates the marked snapshot's
  * nr_child == 1 -- the elevated-ancestor invariant the collapse rests on -- so a
@@ -536,7 +536,7 @@ void ft_detach_freeze_orphans(struct cds_ft *ft, struct ft_flip_txn *txn,
  * word and fails the mark).  Returns -EAGAIN on a dirty word or a grown orphan
  * (caller: `goto end`, whose sweep releases the marks already held); 0 stores
  * {m, snap} at *n and advances it.  The snapshot feeds the fenced
- * {COPYING|s -> TOMBSTONE|s} tombstone at freeze.
+ * {LOCK|s -> TOMBSTONE|s} tombstone at freeze.
  */
 static inline
 int ft_detach_orphan_planlock(struct cds_ft_metadata *m,
@@ -545,10 +545,10 @@ int ft_detach_orphan_planlock(struct cds_ft_metadata *m,
 {
 	uintptr_t s;
 
-	if (ft_meta_copying_mark(m, &s))
+	if (ft_meta_lock_acquire(m, &s))
 		return -EAGAIN;
 	if (require_single_child && ft_state_nr_child(s) != 1) {
-		ft_meta_copying_clear(m);
+		ft_meta_lock_release(m);
 		return -EAGAIN;
 	}
 	locked[*n] = m;
@@ -578,7 +578,7 @@ int ft_detach_orphan_planlock(struct cds_ft_metadata *m,
  * surviving child.
  * @plan_nr_child: the boundary's child count the caller's plan assumed (2 for
  * the shape-D fold that retires one of the two, 1 for the post-removal
- * collapses) -- re-validated against the boundary's COPYING-fence snapshot
+ * collapses) -- re-validated against the boundary's node lock snapshot
  * together with the @surviving_byte -> @surviving_child mapping, so a peer
  * commit between the caller's derivation and the fence mark surfaces as
  * -EAGAIN instead of a merge built from a stale plan.
@@ -593,7 +593,7 @@ int ft_detach_orphan_planlock(struct cds_ft_metadata *m,
  *
  * Returns 0 when the merge committed; -ENOMEM when the txn or @new_cn could
  * not be allocated (NOTHING was published -- the caller aborts the whole
- * removal, structure untouched); -EAGAIN on a peer conflict (a dirty COPYING
+ * removal, structure untouched); -EAGAIN on a peer conflict (a dirty LOCK
  * mark, a failed plan re-validation, a parked latch in a captured slot, or a
  * commit ABORT -- nothing installed, every fence cleared, the caller's retry
  * re-descends); a positive value when the merge does not apply because the
@@ -645,7 +645,7 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 	 * allocation, both BEFORE the build's first side-effect (a concurrent-
 	 * writer ABORT surfaces as -EAGAIN with new_cn reclaimed, see the commit
 	 * site below).  Created FIRST (its sizing needs only the caller's
-	 * arguments) so the COPYING fences below can register with it: every
+	 * arguments) so the LOCK fences below can register with it: every
 	 * bail from here on is a ft_flip_txn_destroy or the commit itself, and
 	 * both terminal paths drain the fence registry -- no unwind can leak a
 	 * fence.
@@ -659,7 +659,7 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 	if (!txn)
 		return -ENOMEM;	/* nothing touched: caller aborts */
 	/*
-	 * F2 COPYING fence (doc at ft_meta_copying_mark): fence the whole
+	 * F2 node lock (doc at ft_meta_lock_acquire): fence the whole
 	 * collapsed chain -- the boundary and the two compressed nodes whose
 	 * bodies the merged node subsumes -- BEFORE trusting any of their
 	 * mutable state.  Each mark's clean snapshot feeds that node's
@@ -728,37 +728,37 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		}
 		parent_cn_meta = parent_cn_meta_l;
 		s_iter = set[si].snap;
-		ft_flip_txn_copying_register(txn, iter_meta);
+		ft_flip_txn_lock_register(txn, iter_meta);
 		si++;
 		if (parent_cn_meta_l) {
 			s_pcn = set[si].snap;
-			ft_flip_txn_copying_register(txn, parent_cn_meta_l);
+			ft_flip_txn_lock_register(txn, parent_cn_meta_l);
 			si++;
 		}
 		if (child_cn_meta_l) {
 			s_ccn = set[si].snap;
-			ft_flip_txn_copying_register(txn, child_cn_meta_l);
+			ft_flip_txn_lock_register(txn, child_cn_meta_l);
 			si++;
 		}
 		if (pp_meta) {
 			/*
 			 * publish_parent is the value-swap RELEASE target (survives).
-			 * Record its {COPYING|s -> s} release + register it up front with
+			 * Record its {LOCK|s -> s} release + register it up front with
 			 * the acquire, so the publish below skips its lock_or_guard and
 			 * every pre-publish bail's ft_flip_txn_destroy drains it -- no
 			 * separate publish_parent unwind path.
 			 */
-			ft_flip_txn_record_release_copying(txn, pp_meta, set[si].snap);
-			ft_flip_txn_copying_register(txn, pp_meta);
+			ft_flip_txn_record_release_lock(txn, pp_meta, set[si].snap);
+			ft_flip_txn_lock_register(txn, pp_meta);
 			si++;
 		}
 	} else
 	{
-		if (ft_meta_copying_mark(iter_meta, &s_iter)) {
+		if (ft_meta_lock_acquire(iter_meta, &s_iter)) {
 			ft_flip_txn_destroy(txn);
 			return -EAGAIN;
 		}
-		ft_flip_txn_copying_register(txn, iter_meta);
+		ft_flip_txn_lock_register(txn, iter_meta);
 		/*
 		 * ONE snapshot of the boundary's parent (latch-checked): the F1
 		 * discipline -- a peer's parked flip proxy must be neither classified
@@ -776,23 +776,23 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		parent_cn_meta = parent_cn
 			? cds_ft_item_to_metadata((struct cds_ft_inode *) parent_cn)
 			: NULL;
-		if (parent_cn_meta && ft_meta_copying_mark(parent_cn_meta, &s_pcn)) {
+		if (parent_cn_meta && ft_meta_lock_acquire(parent_cn_meta, &s_pcn)) {
 			ft_flip_txn_destroy(txn);
 			return -EAGAIN;
 		}
 		if (parent_cn_meta)
-			ft_flip_txn_copying_register(txn, parent_cn_meta);
+			ft_flip_txn_lock_register(txn, parent_cn_meta);
 		child_cn = ft_node_compressed(surviving_child)
 			? ft_compressed_node_ptr(surviving_child)
 			: NULL;
-		if (child_cn && ft_meta_copying_mark(
+		if (child_cn && ft_meta_lock_acquire(
 				cds_ft_item_to_metadata((struct cds_ft_inode *) child_cn),
 				&s_ccn)) {
 			ft_flip_txn_destroy(txn);
 			return -EAGAIN;
 		}
 		if (child_cn)
-			ft_flip_txn_copying_register(txn,
+			ft_flip_txn_lock_register(txn,
 				cds_ft_item_to_metadata((struct cds_ft_inode *) child_cn));
 	}
 	/*
@@ -957,17 +957,17 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		 * gets its one-way LIVE->DEAD tombstone RECORDED INTO @txn (the +3
 		 * reserved above), so the freeze flips ATOMICALLY with the commit
 		 * that unlinks it: an aborted commit leaves every node live.  A
-		 * no-op under one writer.  All three are FENCED (marked COPYING
+		 * no-op under one writer.  All three are FENCED (marked LOCK
 		 * above), so each expected old is its mark's clean snapshot: the
 		 * commit ratifies exactly the chain state this merge was built
-		 * from, and {COPYING|s -> TOMBSTONE|s} consumes the fence.
+		 * from, and {LOCK|s -> TOMBSTONE|s} consumes the fence.
 		 */
-		ft_flip_txn_record_tombstone_copying(txn, iter_meta, s_iter);
+		ft_flip_txn_record_tombstone_locked(txn, iter_meta, s_iter);
 		if (parent_cn)
-			ft_flip_txn_record_tombstone_copying(txn, parent_cn_meta,
+			ft_flip_txn_record_tombstone_locked(txn, parent_cn_meta,
 				s_pcn);
 		if (child_cn)
-			ft_flip_txn_record_tombstone_copying(txn,
+			ft_flip_txn_record_tombstone_locked(txn,
 				cds_ft_item_to_metadata(
 					(struct cds_ft_inode *) child_cn),
 				s_ccn);
@@ -1109,13 +1109,13 @@ int ft_detach_node(struct cds_ft *ft,
 	/*
 	 * DLM orphan plan-lock (§9.2): under
 	 * ft->lock_fine every collected orphan (Block A or Block B, both mutually
-	 * exclusive) is COPYING-marked at collection so the nr_child==1 collapse
+	 * exclusive) is lock-acquired at collection so the nr_child==1 collapse
 	 * decision is made on a FROZEN state word; its clean snapshot feeds the
-	 * FENCED {COPYING|s -> TOMBSTONE|s} tombstone at freeze (a peer that grows
+	 * FENCED {LOCK|s -> TOMBSTONE|s} tombstone at freeze (a peer that grows
 	 * the orphan tears the expected-old and aborts our commit).  The marks live
-	 * in these fn-scope arrays (not the txn copying[] registry -- the chain
-	 * reaches FT_MAX_DEPTH, past FT_FLIP_TXN_MAX_COPYING), so the op OWNS their
-	 * clearing: one unconditional ft_meta_copying_clear_if_held sweep at @end
+	 * in these fn-scope arrays (not the txn locks[] registry -- the chain
+	 * reaches FT_MAX_DEPTH, past FT_FLIP_TXN_MAX_LOCKS), so the op OWNS their
+	 * clearing: one unconditional ft_meta_lock_release_if_held sweep at @end
 	 * releases every held mark and no-ops on the ones a successful commit already
 	 * consumed (TOMBSTONE), needing no per-commit "consumed" bookkeeping.
 	 */
@@ -1580,7 +1580,7 @@ int ft_detach_node(struct cds_ft *ft,
 					: cds_ft_item_to_metadata(
 						ft_node_ptr(walk_nf));
 				/*
-				 * §9.2 plan-lock: COPYING-mark the orphan BEFORE
+				 * §9.2 plan-lock: lock acquire the orphan BEFORE
 				 * reading its nr_child for the collapse decision, so
 				 * the "retire it" verdict is derived from a FROZEN
 				 * word and the fenced tombstone's expected-old (this
@@ -1588,7 +1588,7 @@ int ft_detach_node(struct cds_ft *ft,
 				 * orphan AFTER the mark tears the fenced expected-old
 				 * and aborts our commit (detect) -- and in practice
 				 * cannot even reach that: ft_meta_nr_child_inc spins on
-				 * FT_STATE_INPLACE_WAIT_MASK, which includes COPYING
+				 * FT_STATE_INPLACE_WAIT_MASK, which includes LOCK
 				 * unconditionally, so it WAITS for the mark instead of
 				 * ignoring it as this comment used to claim.  One that
 				 * grew it BEFORE is reflected
@@ -1597,7 +1597,7 @@ int ft_detach_node(struct cds_ft *ft,
 				 * bails to the caller's re-descend.
 				 */
 				if (ft->lock_fine) {
-					if (ft_meta_copying_mark(ometa, &osnap)) {
+					if (ft_meta_lock_acquire(ometa, &osnap)) {
 						ret = -EAGAIN;
 						goto end;
 					}
@@ -1623,7 +1623,7 @@ int ft_detach_node(struct cds_ft *ft,
 				if (!phase2_first &&
 				    (nr_child > 1 || ext_nodes)) {
 					if (ft->lock_fine)
-						ft_meta_copying_clear(ometa);
+						ft_meta_lock_release(ometa);
 					break;
 				}
 				phase2_first = false;
@@ -1674,7 +1674,7 @@ int ft_detach_node(struct cds_ft *ft,
 						ret = -EAGAIN;
 						goto end;
 					}
-					if (ft_meta_copying_mark(tm,
+					if (ft_meta_lock_acquire(tm,
 							&orphan_trailing_snap)) {
 						ret = -EAGAIN;
 						goto end;
@@ -1715,7 +1715,7 @@ int ft_detach_node(struct cds_ft *ft,
 							ft_skip_child_ptr(to_free[fi]))
 						: ft_node_ptr(to_free[fi]));
 				if (ft->lock_fine)
-					ft_flip_txn_record_tombstone_copying(
+					ft_flip_txn_record_tombstone_locked(
 						orphan_txn, m, orphan_snap[fi]);
 				else
 					ft_flip_txn_record_tombstone(orphan_txn, m);
@@ -1724,7 +1724,7 @@ int ft_detach_node(struct cds_ft *ft,
 				struct cds_ft_metadata *m = cds_ft_item_to_metadata(
 					(struct cds_ft_inode *) trailing_skip_cn);
 				if (ft->lock_fine)
-					ft_flip_txn_record_tombstone_copying(
+					ft_flip_txn_record_tombstone_locked(
 						orphan_txn, m, orphan_trailing_snap);
 				else
 					ft_flip_txn_record_tombstone(orphan_txn, m);
@@ -1909,7 +1909,7 @@ int ft_detach_node(struct cds_ft *ft,
 					 * the "retire it" verdict rests on.
 					 */
 					if (ft->lock_fine) {
-						if (ft_meta_copying_mark(ometa, &osnap)) {
+						if (ft_meta_lock_acquire(ometa, &osnap)) {
 							ret = -EAGAIN;
 							goto end;
 						}
@@ -1935,7 +1935,7 @@ int ft_detach_node(struct cds_ft *ft,
 					if (!phase2_first &&
 					    (nr_child > 1 || ext_nodes)) {
 						if (ft->lock_fine)
-							ft_meta_copying_clear(ometa);
+							ft_meta_lock_release(ometa);
 						break;
 					}
 					phase2_first = false;
@@ -1971,7 +1971,7 @@ int ft_detach_node(struct cds_ft *ft,
 							ret = -EAGAIN;
 							goto end;
 						}
-						if (ft_meta_copying_mark(tm,
+						if (ft_meta_lock_acquire(tm,
 							&orphan_trailing_snap)) {
 							ret = -EAGAIN;
 							goto end;
@@ -2397,12 +2397,12 @@ int ft_detach_node(struct cds_ft *ft,
 			 *
 			 * LOCK_FINE (§9.3): a recompact ran (@old_recompacted_node), so
 			 * this grandparent is its P -- already LOCKED, with a
-			 * {COPYING|s -> s} release recorded on this very word.  The release
+			 * {LOCK|s -> s} release recorded on this very word.  The release
 			 * record IS the guard (same word, same abort on a peer state
 			 * change) and is strictly stronger, so the conversion REPLACES it.
 			 * (Leaving the guard would be vacuous, not wrong: release-then-guard
 			 * chains as a read-your-writes no-op -- see the ordering rule at
-			 * ft_flip_txn_record_release_copying.)
+			 * ft_flip_txn_record_release_lock.)
 			 */
 			if (!(ft->lock_fine && old_recompacted_node))
 				ft_flip_txn_guard_parent(ft, commit_txn,
@@ -2494,8 +2494,8 @@ int ft_detach_node(struct cds_ft *ft,
 			 *
 			 * LOCK_FINE (§9.3): skip entirely ONLY when a recompact actually
 			 * ran -- then this grandparent is its P, already locked, and its
-			 * recorded {COPYING|s -> s} release IS the guard, strictly stronger
-			 * (see the ordering rule at ft_flip_txn_record_release_copying).
+			 * recorded {LOCK|s -> s} release IS the guard, strictly stronger
+			 * (see the ordering rule at ft_flip_txn_record_release_lock).
 			 * The external-promote sub-case below reaches here with
 			 * @old_recompacted_node == NULL and NO recompact, hence no lock on
 			 * this parent -- lock_or_guard acquires it (or guard-falls-back).
@@ -2593,12 +2593,12 @@ int ft_detach_node(struct cds_ft *ft,
 	}
 end:
 	/*
-	 * DLM orphan plan-lock cleanup (§9.2): release every orphan COPYING mark the
+	 * DLM orphan plan-lock cleanup (§9.2): release every orphan lock acquire the
 	 * op still holds.  On a successful detach the consuming commit already turned
-	 * each orphan's fenced {COPYING|s -> TOMBSTONE|s} tombstone terminal (COPYING
+	 * each orphan's fenced {LOCK|s -> TOMBSTONE|s} tombstone terminal (LOCK
 	 * dropped), so clear_if_held no-ops on those; on ANY abort / pre-commit bail
 	 * (including a mark-miss mid-collection, which jumps here) the fenced
-	 * tombstone never applied, so the marks are still {COPYING|s} and get
+	 * tombstone never applied, so the marks are still {LOCK|s} and get
 	 * released here -- the structure returns byte-for-byte to its pre-op state.
 	 * One sweep covers both Block A and Block B (mutually exclusive) and every
 	 * commit outcome (in-place / recompaction / shape-D), no "consumed" tracking.
@@ -2607,9 +2607,9 @@ end:
 		int oi;
 
 		for (oi = 0; oi < nr_orphan_locked; oi++)
-			ft_meta_copying_clear_if_held(orphan_locked_meta[oi]);
+			ft_meta_lock_release_if_held(orphan_locked_meta[oi]);
 		if (orphan_trailing_meta)
-			ft_meta_copying_clear_if_held(orphan_trailing_meta);
+			ft_meta_lock_release_if_held(orphan_trailing_meta);
 	}
 	/*
 	 * nr_keys fold (LEAF Increment 2): no abort rollback needed.  Every
@@ -2791,7 +2791,7 @@ int ft_promote_head(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 
 		if (!new_cell_flag) {
 			if (held_holder)
-				ft_meta_copying_clear(held_holder);
+				ft_meta_lock_release(held_holder);
 			return -ENOMEM;
 		}
 		txn = ft_flip_txn_create_bounded(
@@ -2801,7 +2801,7 @@ int ft_promote_head(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 			ft_ord_cell_free_unpublished(ft,
 				ft_ord_cell_ptr(new_cell_flag));
 			if (held_holder)
-				ft_meta_copying_clear(held_holder);
+				ft_meta_lock_release(held_holder);
 			return -ENOMEM;
 		}
 		new_cell = ft_ord_cell_ptr(new_cell_flag);
@@ -2823,7 +2823,7 @@ int ft_promote_head(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 		/*
 		 * VALIDATE (§4.B): guard the LIVE holder this head-promote
 		 * publishes into.  Holding its fence (held_holder): record the
-		 * release so it composes with the held COPYING instead of the
+		 * release so it composes with the held LOCK instead of the
 		 * masking guard-fallback that self-aborts on it.
 		 */
 		ft_flip_txn_hold_or_lock_parent(ft, txn, parent_nf,
@@ -2877,7 +2877,7 @@ int ft_promote_head(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 
 		if (!txn) {
 			if (held_holder)
-				ft_meta_copying_clear(held_holder);
+				ft_meta_lock_release(held_holder);
 			return -ENOMEM;
 		}
 		prev_save = rcu_dereference(next_node->prev);
@@ -2888,7 +2888,7 @@ int ft_promote_head(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 					(struct cds_ft_inode_flag *) inherit))) {
 			ft_flip_txn_destroy(txn);	/* PREPARE state: nothing recorded */
 			if (held_holder)
-				ft_meta_copying_clear(held_holder);
+				ft_meta_lock_release(held_holder);
 			return -EAGAIN;
 		}
 		ft_flip_txn_record_reserved(txn, (void **) &next_node->prev,
@@ -2932,15 +2932,15 @@ int ft_unchain_node(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 	/*
 	 * MW LOCK_FINE (Step A, holder lock): serialise concurrent same-key chain
 	 * mutation on the head's IMMEDIATE PARENT -- the trie holder.  Acquire its
-	 * COPYING lock BEFORE the chain read below (a peer mid-flip parks a proxy
+	 * node lock BEFORE the chain read below (a peer mid-flip parks a proxy
 	 * on node->next / relinks a neighbour's prev that this read would deref)
 	 * and hold it across the mutate+commit.  @parent_nf is the holder for a
 	 * head op; an interior detach passes NULL, so derive the head's holder by
 	 * walking prev (ft_chain_head_holder).  Released after the op: promote /
 	 * interior post-commit-clear -- their commits leave holder->state untouched
-	 * (promote is a slot swap + a COPYING-masking guard; interior relinks
+	 * (promote is a slot swap + a LOCK-masking guard; interior relinks
 	 * neighbours), so a held fence bit composes.  Head-no-successor records the
-	 * {COPYING|s -> s} RELEASE + registers it, so it FUSES with the same-word
+	 * {LOCK|s -> s} RELEASE + registers it, so it FUSES with the same-word
 	 * nr_child-- (a masking guard would disagree on expected-old and poison)
 	 * and the txn owns the clear (commit consumes it; abort/destroy auto-clears
 	 * the registered fence).  Under the FT-wide writer_lock no peer contends
@@ -2974,7 +2974,7 @@ int ft_unchain_node(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 				cds_ft_fault_lock_countdown--;
 			}
 #endif
-			if (ft_meta_copying_mark(lm, &hsnap))
+			if (ft_meta_lock_acquire(lm, &hsnap))
 				return -EAGAIN;
 			hmeta = lm;
 		}
@@ -3004,7 +3004,7 @@ int ft_unchain_node(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 
 		if (!txn) {
 			if (hmeta)
-				ft_meta_copying_clear(hmeta);
+				ft_meta_lock_release(hmeta);
 			return -ENOMEM;
 		}
 		if (ft_hlist_del_prepare(ft_flip_txn_handle(txn), node)) {
@@ -3016,7 +3016,7 @@ int ft_unchain_node(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 			 */
 			ft_flip_txn_destroy(txn);
 			if (hmeta)
-				ft_meta_copying_clear(hmeta);
+				ft_meta_lock_release(hmeta);
 			return -EAGAIN;
 		}
 		st = ft_flip_txn_commit(ft, txn);
@@ -3026,7 +3026,7 @@ int ft_unchain_node(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 		 * every outcome.
 		 */
 		if (hmeta)
-			ft_meta_copying_clear(hmeta);
+			ft_meta_lock_release(hmeta);
 		if (st < 0)
 			return -ENOMEM;
 		/* ABORT: peer won, nothing installed, @node fully chained. */
@@ -3043,7 +3043,7 @@ int ft_unchain_node(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 		 */
 		/*
 		 * Hand the held fence to ft_promote_head: it records the RELEASE
-		 * (composing with its holder guard, which a still-held COPYING
+		 * (composing with its holder guard, which a still-held LOCK
 		 * would otherwise self-abort) and OWNS the fence outcome -- commit
 		 * consumes it, an abort/destroy auto-clears the registered fence,
 		 * and every early-fail path clears it directly.  No post-commit
@@ -3078,12 +3078,12 @@ int ft_unchain_node(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 		if (!txn) {
 			/* Early fence held but not yet handed to the txn. */
 			if (hmeta)
-				ft_meta_copying_clear(hmeta);
+				ft_meta_lock_release(hmeta);
 			return -ENOMEM;
 		}
 		/*
 		 * VALIDATE (§4.B): guard the LIVE holder this head-clear publishes
-		 * into.  Holding its lock (hmeta): record the {COPYING|s -> s}
+		 * into.  Holding its lock (hmeta): record the {LOCK|s -> s}
 		 * RELEASE + register so it FUSES with the fused nr_child-- on the
 		 * same word (a masking guard would disagree on expected-old and
 		 * poison the descriptor) and the txn owns the fence outcome --
@@ -3203,7 +3203,7 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 	 * LAZILY: a peer that replaced the holder can leave @node->prev naming
 	 * the RETIRED old one while the FORWARD path from the root still
 	 * resolves @node correctly.  The op is then derived against a dead
-	 * node -- ft_meta_copying_mark refuses a TOMBSTONE word, the caller
+	 * node -- ft_meta_lock_acquire refuses a TOMBSTONE word, the caller
 	 * gets -EAGAIN, and the wrapper's retry re-derives the SAME dead
 	 * holder forever, holding the per-trie FIFO fair-mutex turn and
 	 * denying every other writer (measured: 2,000,000+ consecutive

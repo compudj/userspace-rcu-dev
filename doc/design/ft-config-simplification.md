@@ -32,8 +32,8 @@ The **default build with the default strategy** lands in the starred quadrant.
 Seven of nine gate configs are in it; only `dlm` and `dlm-fault` are not.
 
 Concretely, that quadrant is missing the §9.2 orphan-chain plan-lock: the
-collection-time `ft_meta_copying_mark`, the fenced
-`{COPYING|s -> TOMBSTONE|s}` retire terminal, and the release sweep are all
+collection-time `ft_meta_lock_acquire`, the fenced
+`{LOCK|s -> TOMBSTONE|s}` retire terminal, and the release sweep are all
 bracketed in `#ifdef FEATURE_FT_MW_DLM_ACQUIRE` *around code that is already
 runtime-gated on `ft->lock_fine`* — and they use only base F2 fence primitives,
 no DLM acquire sets. `ft_detach_freeze_orphans` (ft-remove.h:497/509) therefore

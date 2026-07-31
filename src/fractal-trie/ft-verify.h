@@ -442,16 +442,16 @@ int ft_verify_node_compressed(const struct cds_ft *ft, FILE *out,
 		return -1;
 	}
 	/*
-	 * FT_STATE_COPYING is a REVERSIBLE mid-copy fence: at rest (all-updater
+	 * FT_STATE_LOCK is the REVERSIBLE per-node writer lock: at rest (all-updater
 	 * quiescence) every copier has committed (fence consumed by the
-	 * {COPYING|s -> TOMBSTONE|s} transition) or unwound (fence cleared by
+	 * {LOCK|s -> TOMBSTONE|s} transition) or unwound (fence cleared by
 	 * the txn wrapper's registry).  A set bit here is a leaked fence -- a
-	 * bail path that skipped ft_meta_copying_clear -- which would make
+	 * bail path that skipped ft_meta_lock_release -- which would make
 	 * every future peer publish into this node abort forever.
 	 */
-	if (cn_meta->state & FT_STATE_COPYING) {
+	if (cn_meta->state & FT_STATE_LOCK) {
 		if (out)
-			fprintf(out, "ft_verify: depth %u: compressed node %p COPYING fence set at rest (leaked copy fence)\n",
+			fprintf(out, "ft_verify: depth %u: compressed node %p node lock set at rest (leaked lock)\n",
 				depth, node_flag);
 		return -1;
 	}
@@ -778,10 +778,10 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 				return -1;
 			}
 		}
-		/* Leaked COPYING fence: see the compressed-node check. */
-		if (metadata->state & FT_STATE_COPYING) {
+		/* Leaked node lock: see the compressed-node check. */
+		if (metadata->state & FT_STATE_LOCK) {
 			if (out)
-				fprintf(out, "ft_verify: depth %u: internal node %p COPYING fence set at rest (leaked copy fence)\n",
+				fprintf(out, "ft_verify: depth %u: internal node %p node lock set at rest (leaked lock)\n",
 					depth, node_flag);
 			return -1;
 		}

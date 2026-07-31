@@ -65,12 +65,12 @@ struct ft_insert_commit {
 	 * deferred) free must be queued only AFTER the commit -- a free queued
 	 * pre-commit would not cover readers that pick the proxy up later.
 	 *
-	 * @free_old_cn_fence: the COPYING-fence snapshot the split builder took
+	 * @free_old_cn_fence: the node lock snapshot the split builder took
 	 * on this cn's state word at ENTRY (F2 fence extended to the split-retire
 	 * family): the builder's whole plan -- diverge slicing, cn->child
 	 * snapshot, deferred-edge captures -- derives from the fenced cn, and
 	 * ft_insert_one_commit records the retire as the precise
-	 * {COPYING|s -> TOMBSTONE|s} transition, so a peer state change under the
+	 * {LOCK|s -> TOMBSTONE|s} transition, so a peer state change under the
 	 * fence (a concurrent split/collapse/re-home of the SAME cn) aborts
 	 * exactly one side instead of being erased by a ratified stale plan.
 	 */
@@ -115,7 +115,7 @@ struct ft_insert_commit {
 	 * target) as part of its one-commit lock-set {CN, P}, @parent_locked_holder
 	 * is P's metadata and @parent_locked_snap the clean state word captured at
 	 * the acquire.  ft_insert_publish_or_park then records P's RELEASE terminal
-	 * ({COPYING|snap -> snap}) from that held snap via
+	 * ({LOCK|snap -> snap}) from that held snap via
 	 * ft_flip_txn_hold_or_lock_parent -- instead of re-marking P -- and registers
 	 * it into @txn (whose commit/abort then owns P's fence).  NULL: no pre-
 	 * acquire (past-child {CN}, non-split shapes) -> publish_or_park takes the
@@ -387,14 +387,14 @@ spliced:;
 		 * was registered with @txn at arm time (cleared on every
 		 * non-commit outcome, consumed by this transition on commit).
 		 */
-		ft_flip_txn_record_tombstone_copying(ic->txn,
+		ft_flip_txn_record_tombstone_locked(ic->txn,
 			cds_ft_item_to_metadata(
 				(struct cds_ft_inode *) ic->free_old_cn),
 			ic->free_old_cn_fence);
 	/*
 	 * @free_old_node needs NO record here: its sole producer is the
 	 * ft_attach_node relocation, whose recompact runs with @ic->txn as the
-	 * retire txn and records the fenced {COPYING|s -> TOMBSTONE|s}
+	 * retire txn and records the fenced {LOCK|s -> TOMBSTONE|s}
 	 * transition itself.  A second raw {s -> s|TOMBSTONE} record on the
 	 * same word would same-slot-UPGRADE the recompact's new value and leak
 	 * the fence bit into the dead word.  The deferred free below still
@@ -572,15 +572,15 @@ void ft_insert_publish_or_park(struct cds_ft *ft,
  * DLM Step 1 (see doc/design/mw-writer-lock-escalation-model.md):
  * acquire the compressed-split lock-set
  * {CN, P} in ONE all-or-none MCAS up front, replacing the incremental CN
- * copying-mark here plus the P lock_or_guard inside ft_insert_publish_or_park.
+ * lock-acquire here plus the P lock_or_guard inside ft_insert_publish_or_park.
  * Mirrors the recompact hoist ({C,P}): P is CN's parent (the value-swap forward-
  * publish target), resolved racy and validated by the read-set guard
  * CN.parent==P in the SAME commit, so a peer re-homing CN between the plan read
  * and the acquire aborts it -> re-plan.
  *
  * On OK: @*cn_fence captures CN's clean word (the caller stores it into
- * ic->free_old_cn_fence exactly as ft_meta_copying_mark did -- the retire
- * terminal {COPYING|cn_fence -> TOMBSTONE|cn_fence} is byte-unchanged); and
+ * ic->free_old_cn_fence exactly as ft_meta_lock_acquire did -- the retire
+ * terminal {LOCK|cn_fence -> TOMBSTONE|cn_fence} is byte-unchanged); and
  * ic->parent_locked_holder/_snap carry P's held release so
  * ft_insert_publish_or_park records it (ft_flip_txn_hold_or_lock_parent) instead
  * of re-marking.  P == NULL (CN at the root) => the lock-set is {CN} only, no
@@ -631,14 +631,14 @@ int ft_insert_dlm_acquire_split(struct cds_ft *ft,
  * Release a compressed-split lock-set acquired by ft_insert_dlm_acquire_split on
  * a PRE-PUBLISH bail (CN's parent P is held but not yet registered into ic->txn
  * -- publish_or_park registers it).  The CN fence is cleared by the caller's own
- * ft_meta_copying_clear(cn_meta) / ic->txn drain, exactly as the incremental
+ * ft_meta_lock_release(cn_meta) / ic->txn drain, exactly as the incremental
  * scheme did; this only lifts the extra P the DLM hoist acquired up front.
  */
 static inline
 void ft_insert_dlm_release_parent(struct ft_insert_commit *ic)
 {
 	if (ic->parent_locked_holder) {
-		ft_meta_copying_clear(ic->parent_locked_holder);
+		ft_meta_lock_release(ic->parent_locked_holder);
 		ic->parent_locked_holder = NULL;
 	}
 }
@@ -798,7 +798,7 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 	struct cds_ft_metadata *cn_meta =
 		cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
 	/*
-	 * F2 COPYING fence, split-retire extension: this split retires @cn and
+	 * F2 node lock, split-retire extension: this split retires @cn and
 	 * derives its WHOLE plan from it -- the diverge slicing over
 	 * cn->key_bytes, the cn->child snapshot, the deferred-edge captures --
 	 * so fence @cn BEFORE the first read, exactly as a recompact fences the
@@ -806,7 +806,7 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 	 * retire of the SAME cn either holds the fence (mark fails -> -EAGAIN,
 	 * re-descend) or aborts at commit against the fenced tombstone's
 	 * precise expected old (ft_insert_one_commit records
-	 * {COPYING|s -> TOMBSTONE|s} from @cn_fence).  Cleared locally on every
+	 * {LOCK|s -> TOMBSTONE|s} from @cn_fence).  Cleared locally on every
 	 * bail until the arm registers it with @ic->txn (whose every terminal
 	 * path then owns the outcome).
 	 */
@@ -819,12 +819,12 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 	 * one all-or-none MCAS up front (P = CN's parent, the value-swap publish
 	 * target ft_insert_publish_or_park writes into below), replacing the
 	 * incremental CN mark here + the P lock inside publish_or_park.  Non-DLM /
-	 * non-lock_fine keeps the single CN copying-mark (byte-identical).
+	 * non-lock_fine keeps the single CN lock-acquire (byte-identical).
 	 */
 	if (ft->lock_fine)
 		fret = ft_insert_dlm_acquire_split(ft, cn_meta, &cn_fence, ic);
 	else
-		fret = ft_meta_copying_mark(cn_meta, &cn_fence);
+		fret = ft_meta_lock_acquire(cn_meta, &cn_fence);
 
 	if (fret)
 		return fret;	/* -EAGAIN: peer owns @cn/P; nothing built */
@@ -1134,7 +1134,7 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 	 */
 	if (ft_resolve_parent_slot(cn_meta, ft, &cur_parent) != parent_slot) {
 		ft_free_unpublished_split_cluster(ft, created, nr_created);
-		ft_meta_copying_clear(cn_meta);
+		ft_meta_lock_release(cn_meta);
 		ft_insert_dlm_release_parent(ic);	/* release P held up front */
 		return -EAGAIN;
 	}
@@ -1156,7 +1156,7 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 	 * local error path must NOT clear it (the caller's unwind destroys
 	 * @ic->txn, which drains the registry).
 	 */
-	ft_flip_txn_copying_register(ic->txn, cn_meta);
+	ft_flip_txn_lock_register(ic->txn, cn_meta);
 	ic->free_old_cn_fence = cn_fence;
 	/*
 	 * @cur_parent came from the guard's ft_resolve_parent_slot snapshot,
@@ -1215,7 +1215,7 @@ error:
 	 * so release it too.
 	 */
 	ft_free_unpublished_split_cluster(ft, created, nr_created);
-	ft_meta_copying_clear(cn_meta);
+	ft_meta_lock_release(cn_meta);
 	ft_insert_dlm_release_parent(ic);
 	return -ENOMEM;
 }
@@ -1834,7 +1834,7 @@ int ft_attach_node(struct cds_ft *ft,
 			 * value intact in the retired copy, so the CAS still matches
 			 * and commits the new key into a reclaimed node (UAF + lost
 			 * insert).  Guard the holder's state word so a peer's
-			 * freeze-on-free (COPYING/TOMBSTONE) between this descent and
+			 * freeze-on-free (LOCK/TOMBSTONE) between this descent and
 			 * the commit ABORTs instead -- symmetric with the split path
 			 * (ft_insert_publish_or_park) and the external-clear guards in
 			 * ft-remove.h.  A RELOCATION reserve publishes a build-
@@ -1847,7 +1847,7 @@ int ft_attach_node(struct cds_ft *ft,
 			 * guard left it merely validated, never held -- the gap the
 			 * lock-set completeness audit quantified (3 slot writes, 0
 			 * acquires).  ACQUIRE it: under lock_fine that records the
-			 * {COPYING|s -> s} release, and since f7cc59f9 a miss is
+			 * {LOCK|s -> s} release, and since f7cc59f9 a miss is
 			 * all-or-none (abort + re-descend) rather than a silent
 			 * degrade to the guard.  Non-lock_fine still lands on the
 			 * guard, unchanged.
@@ -1855,11 +1855,11 @@ int ft_attach_node(struct cds_ft *ft,
 			 * ORDER IS LOAD-BEARING: the acquire's release must be
 			 * recorded BEFORE @count_deferred's nr_child++ edge, since
 			 * both target this one state word.  release-then-count
-			 * chains to a single {COPYING|s -> s+1} -- release AND
+			 * chains to a single {LOCK|s -> s+1} -- release AND
 			 * increment in one record; count-then-release would arrive
-			 * with expected old COPYING|s against a pending s+1 and
+			 * with expected old LOCK|s against a pending s+1 and
 			 * POISON the descriptor (the ordering rule spelled out at
-			 * ft_flip_txn_record_release_copying).  Hence the count
+			 * ft_flip_txn_record_release_lock).  Hence the count
 			 * edge moved down here from just after the reserve.
 			 *
 			 * The RELOCATION arm needs nothing: the reserve's recompact
@@ -1957,12 +1957,12 @@ int ft_attach_node(struct cds_ft *ft,
 			 *
 			 * LOCK_FINE (§9.3): this grandparent is recompact's P -- already
 			 * LOCKED by the reserve's ft_node_recompact, which recorded its
-			 * {COPYING|s -> s} release on this very word.  The release record
+			 * {LOCK|s -> s} release on this very word.  The release record
 			 * IS the guard (same word, same abort on a peer state change) and
 			 * is strictly stronger, so the conversion REPLACES the guard here.
 			 * Leaving it would not corrupt anything -- release-then-guard
 			 * chains as a read-your-writes no-op (see the ordering rule at
-			 * ft_flip_txn_record_release_copying) -- it would just be a vacuous
+			 * ft_flip_txn_record_release_lock) -- it would just be a vacuous
 			 * record re-validating the value the release already pins.
 			 */
 			if (!ft->lock_fine)
@@ -2453,7 +2453,7 @@ int ft_insert_compressed_key_shorter(struct cds_ft *ft,
 	(void) unique_node_ret;
 
 	/*
-	 * F2 COPYING fence, split-retire extension (see
+	 * F2 node lock, split-retire extension (see
 	 * ft_split_compressed_insert): the key-shorter split retires @d->nf and
 	 * plans from its body + child, so fence it before the builder's first
 	 * read.  ft_insert_one_commit records the retire from @cn_fence.
@@ -2462,12 +2462,12 @@ int ft_insert_compressed_key_shorter(struct cds_ft *ft,
 	 * DLM Step 1: under LOCK_FINE, acquire the whole split lock-set {CN, P} in
 	 * one all-or-none MCAS up front (P = CN's parent @d->pnf, the value-swap
 	 * publish target below), mirroring the diverge builder.  Non-DLM /
-	 * non-lock_fine keeps the single CN copying-mark (byte-identical).
+	 * non-lock_fine keeps the single CN lock-acquire (byte-identical).
 	 */
 	if (ft->lock_fine)
 		sret = ft_insert_dlm_acquire_split(ft, cn_meta, &cn_fence, ic);
 	else
-		sret = ft_meta_copying_mark(cn_meta, &cn_fence);
+		sret = ft_meta_lock_acquire(cn_meta, &cn_fence);
 	if (sret)
 		return sret;	/* -EAGAIN: peer owns the cn/P; nothing built */
 
@@ -2486,7 +2486,7 @@ int ft_insert_compressed_key_shorter(struct cds_ft *ft,
 		&live_child, &live_parent, &live_slot,
 		split_created, &split_nr_created);
 	if (sret) {
-		ft_meta_copying_clear(cn_meta);
+		ft_meta_lock_release(cn_meta);
 		ft_insert_dlm_release_parent(ic);	/* release P held up front */
 		return sret;
 	}
@@ -2533,7 +2533,7 @@ int ft_insert_compressed_key_shorter(struct cds_ft *ft,
 		node->next = NULL;
 		ft_free_unpublished_split_cluster(ft, split_created,
 			split_nr_created);
-		ft_meta_copying_clear(cn_meta);
+		ft_meta_lock_release(cn_meta);
 		ft_insert_dlm_release_parent(ic);	/* release P held up front */
 		return sret;
 	}
@@ -2541,7 +2541,7 @@ int ft_insert_compressed_key_shorter(struct cds_ft *ft,
 	 * The armed txn now owns the fence outcome (registered clear on every
 	 * non-commit terminal; consumed by the fenced tombstone on commit).
 	 */
-	ft_flip_txn_copying_register(ic->txn, cn_meta);
+	ft_flip_txn_lock_register(ic->txn, cn_meta);
 	ic->free_old_cn_fence = cn_fence;
 	/*
 	 * Concurrent-writer conflict check (mirror of the diverge builder's
@@ -2913,7 +2913,7 @@ restart_attempt:
 				 * MW LOCK_FINE (Step A, holder lock): the chain walk
 				 * + tail append serialise on @metadata (the internal
 				 * node whose external_nodes root this chain, the head's
-				 * holder).  Acquire its COPYING lock BEFORE the walk (a
+				 * holder).  Acquire its node lock BEFORE the walk (a
 				 * peer relinking the chain would send it into freed
 				 * memory) and release after the append; ft_chain_node
 				 * touches only last_node->next, never holder->state, so
@@ -2931,7 +2931,7 @@ restart_attempt:
 						cds_ft_fault_lock_countdown--;
 					}
 #endif
-					if (ft_meta_copying_mark(metadata,
+					if (ft_meta_lock_acquire(metadata,
 							&dup_hsnap)) {
 						ret = -EAGAIN;
 						goto insert_done;
@@ -2949,7 +2949,7 @@ restart_attempt:
 				/* Adding duplicate at existing key: no key count change. */
 				ret = ft_chain_node(ft, last_node, node);
 				if (dup_hmeta)
-					ft_meta_copying_clear(dup_hmeta);
+					ft_meta_lock_release(dup_hmeta);
 				if (ret)
 					goto insert_done;
 			} else {
@@ -3043,7 +3043,7 @@ restart_attempt:
 						cds_ft_fault_lock_countdown--;
 					}
 #endif
-					if (ft_meta_copying_mark(hm, &dup_hsnap)) {
+					if (ft_meta_lock_acquire(hm, &dup_hsnap)) {
 						ret = -EAGAIN;
 						goto insert_done;
 					}
@@ -3061,7 +3061,7 @@ restart_attempt:
 			/* Adding duplicate at existing key: no key count change. */
 			ret = ft_chain_node(ft, last_node, node);
 			if (dup_hmeta)
-				ft_meta_copying_clear(dup_hmeta);
+				ft_meta_lock_release(dup_hmeta);
 			if (ret)
 				goto insert_done;
 		}
@@ -4026,7 +4026,7 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 
 			/*
 			 * {L}: a duplicate chain is owned by its HEAD-HOLDER's
-			 * COPYING lock -- ft_hlist_replace_prepare states that
+			 * node lock -- ft_hlist_replace_prepare states that
 			 * contract and DROPPED its multi-writer arbitration on the
 			 * strength of it, so acquire the holder here exactly as the
 			 * duplicate append does (ft_chain_node's caller) and as the
@@ -4056,7 +4056,7 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 				lock_nf = ft_chain_head_holder(ft, old_node);
 				assert(lock_nf);
 				hm = ft_flag_to_metadata(ft, lock_nf);
-				if (ft_meta_copying_mark(hm, &hsnap)) {
+				if (ft_meta_lock_acquire(hm, &hsnap)) {
 					new_node->next = NULL;
 					*need_retry = true;
 					s = CDS_FT_STATUS_OK;	/* discarded by the retry loop */
@@ -4068,7 +4068,7 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 					FT_HLIST_REPLACE_MAX_EDGES);
 			if (!txn) {
 				if (hm)
-					ft_meta_copying_clear(hm);
+					ft_meta_lock_release(hm);
 				new_node->next = NULL;
 				s = CDS_FT_STATUS_MEMORY_ERROR;
 				FT_TP(replace_exit, (int) s);
@@ -4078,7 +4078,7 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 				old_node, new_node);
 			cst = ft_flip_txn_commit(ft, txn);
 			if (hm)
-				ft_meta_copying_clear(hm);
+				ft_meta_lock_release(hm);
 			if (cst < 0) {
 				new_node->next = NULL;
 				s = CDS_FT_STATUS_MEMORY_ERROR;
