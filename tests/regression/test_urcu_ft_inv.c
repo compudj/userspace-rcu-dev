@@ -78,7 +78,7 @@
  * compares the run count against this plan, so retiring a test means
  * decrementing here in the same commit.
  */
-#define NR_TESTS	(71 + NR_TESTS_REKEY_DLM)
+#define NR_TESTS	(73 + NR_TESTS_REKEY_DLM)
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -9574,6 +9574,279 @@ static int inv_prefix_key_park_vs_holder_churn(void)
 	return ret;
 }
 
+/* ================================================================== */
+/*                                                                    */
+/*   TWO graft_swaps exchanging at ONE destination position           */
+/*                                                                    */
+/* ================================================================== */
+
+/*
+ * cds_ft_graft_swap is named in the public grant alongside cds_ft_graft and
+ * cds_ft_merge_at: under LOCK_FINE "several cross-trie attaches ... may run
+ * concurrently on the same destination".  Nothing has ever driven two of them
+ * at the SAME destination position.  The existing 16-writer graft_swap oracle
+ * gives every writer a DISJOINT {p,w} prefix -- they share a spine node, never
+ * a destination -- so the interleaving the header licenses is uncovered.
+ *
+ * THE CHECK IS CONSERVATION, which needs no linearization argument.  Each
+ * writer exchanges its own private trie with dst's subtree at ONE shared key,
+ * so content only ever MOVES between the three tries: the total key count
+ * across dst + swapA + swapB is invariant, whatever order the two swaps take
+ * and whichever of them wins.  A key that goes missing was dropped by a retire
+ * that could not see the peer's change -- graft_swap fences nothing and retires
+ * its destination nodes through the PLAIN tombstone, which takes its expected
+ * old from the committed word and so cannot tell "unchanged" from "changed by a
+ * peer".  That is the shape that cost cds_ft_merge_at and cds_ft_graft their
+ * empty-dst keys.
+ *
+ * Both swap tries are made EXCLUSIVE (the contract requires it of a source, and
+ * the flag is one-way, so they stay exclusive as content circulates through
+ * them).  Only dst is live.
+ */
+#define GS_SHARED_KEY		0x50
+#define GS_KEYS_PER_TRIE	4
+#define GS_ROUNDS_MS		1200
+#define GS_MAX_RETRY		4096
+
+struct gs_shared_ctx {
+	struct cds_ft *dst;
+	struct cds_ft *swap[2];
+	unsigned long seq;
+	unsigned long done;
+	unsigned long retries;
+	int stop;
+	enum cds_ft_status st[2];
+};
+
+/*
+ * Spun rendezvous, not a barrier: this is a QSBR suite and a registered thread
+ * parked in pthread_barrier_wait stalls the grace period the round teardown
+ * waits on.
+ */
+static unsigned long gs_wait_round(struct gs_shared_ctx *c, unsigned long seen)
+{
+	for (;;) {
+		unsigned long s = uatomic_load(&c->seq, CMM_ACQUIRE);
+
+		if (s != seen)
+			return s;
+		if (uatomic_load(&c->stop, CMM_RELAXED))
+			return 0;
+		caa_cpu_relax();
+		rcu_quiescent_state();
+	}
+}
+
+struct gs_arg {
+	struct gs_shared_ctx *ctx;
+	unsigned int w;
+};
+
+static void *gs_shared_writer(void *arg)
+{
+	struct gs_arg *a = (struct gs_arg *) arg;
+	struct gs_shared_ctx *c = a->ctx;
+	const uint8_t key[1] = { GS_SHARED_KEY };
+	unsigned long seen = 0;
+
+	rcu_register_thread();
+	for (;;) {
+		seen = gs_wait_round(c, seen);
+		if (!seen)
+			break;
+		/*
+		 * RETRY on BUSY.  graft_swap reports a transient peer conflict as
+		 * BUSY_ERROR (its -EAGAIN is mapped there so a caller need not
+		 * read "out of memory" as "re-descend") and has NO internal retry
+		 * loop, so two writers on one destination simply abort each other:
+		 * measured 545892 BUSY against 2 OK before this loop existed.
+		 * Retrying is what the caller is expected to do; bound it so a
+		 * livelock ends the round instead of the run.
+		 */
+		{
+			unsigned int attempt;
+
+			for (attempt = 0; attempt < GS_MAX_RETRY; attempt++) {
+				/*
+				 * RE-EXCLUDE EVERY TIME.  On success @swap_ft
+				 * INHERITS the destination's access discipline,
+				 * and dst is live -- so a swap trie is exclusive
+				 * only until its first successful swap, after
+				 * which graft_swap correctly rejects it with
+				 * BUSY.  Marking once at setup produced 22331392
+				 * BUSY retries and 2 successes, which looked
+				 * exactly like a livelock and was not one.
+				 */
+				cds_ft_make_exclusive(c->swap[a->w]);
+				c->st[a->w] = cds_ft_graft_swap(c->dst, key, 1,
+					c->swap[a->w]);
+				if (c->st[a->w] != CDS_FT_STATUS_BUSY_ERROR)
+					break;
+				uatomic_inc(&c->retries);
+				caa_cpu_relax();
+				rcu_quiescent_state();
+			}
+		}
+		uatomic_add(&c->done, 1);
+		rcu_quiescent_state();
+	}
+	rcu_unregister_thread();
+	return NULL;
+}
+
+/* Fill @ft with @n keys under @prefix (prefix omitted when @with_prefix). */
+static void gs_fill(struct cds_ft *ft, uint8_t tag, unsigned int n,
+		bool with_prefix)
+{
+	unsigned int i;
+
+	for (i = 0; i < n; i++) {
+		uint8_t k[3];
+		size_t klen = 0;
+		struct ft_test_node *node = node_alloc(((uint64_t) tag << 8) | i);
+
+		if (with_prefix)
+			k[klen++] = GS_SHARED_KEY;
+		k[klen++] = tag;
+		k[klen++] = (uint8_t) i;
+		memcpy(node->okey, k, klen);
+		node->value = klen;
+		if (cds_ft_insert(ft, k, klen, &node->node) != CDS_FT_STATUS_OK)
+			abort();
+	}
+}
+
+static int gs_shared_oracle(const char *tname, bool list_on)
+{
+	enum cds_ft_writer_strategy ws = CDS_FT_WRITER_LOCK_FINE;
+	struct cds_ft_group *group;
+	struct cds_ft *probe;
+	struct gs_shared_ctx ctx;
+	struct gs_arg arg[2];
+	pthread_t th[2];
+	struct timespec t0;
+	unsigned long total, round = 0, lost_rounds = 0;
+	unsigned long both_ok = 0, one_ok = 0;
+	unsigned long stcount[8] = { 0 };
+	unsigned int i;
+	int ret = 0;
+
+	probe = list_on ? create_varlen_ord_ft_ws(&group, &ws)
+			: create_varlen_nolist_ft_ws(&group, &ws);
+
+	ctx.stop = 0;
+	ctx.seq = 0;
+	ctx.done = 0;
+	ctx.retries = 0;
+	if (cds_ft_create(group, NULL, &ctx.dst) < 0)
+		abort();
+	for (i = 0; i < 2; i++) {
+		if (cds_ft_create(group, NULL, &ctx.swap[i]) < 0)
+			abort();
+		gs_fill(ctx.swap[i], (uint8_t) (0xA0 + i), GS_KEYS_PER_TRIE,
+			/*with_prefix=*/ false);
+	}
+	gs_fill(ctx.dst, 0xD0, GS_KEYS_PER_TRIE, /*with_prefix=*/ true);
+
+	total = cds_ft_count_keys(ctx.dst) + cds_ft_count_keys(ctx.swap[0])
+		+ cds_ft_count_keys(ctx.swap[1]);
+
+	for (i = 0; i < 2; i++) {
+		arg[i].ctx = &ctx;
+		arg[i].w = i;
+		pthread_create(&th[i], NULL, gs_shared_writer, &arg[i]);
+	}
+
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	for (;; round++) {
+		unsigned long now;
+
+		ctx.st[0] = ctx.st[1] = CDS_FT_STATUS_OK;
+		uatomic_store(&ctx.done, 0, CMM_RELAXED);
+		uatomic_store(&ctx.seq, round + 1, CMM_RELEASE);
+		while (uatomic_load(&ctx.done, CMM_ACQUIRE) != 2) {
+			caa_cpu_relax();
+			rcu_quiescent_state();
+		}
+
+		/*
+		 * CONSERVATION.  Content only moves between the three tries, so
+		 * the total is invariant no matter who won.
+		 */
+		now = cds_ft_count_keys(ctx.dst)
+			+ cds_ft_count_keys(ctx.swap[0])
+			+ cds_ft_count_keys(ctx.swap[1]);
+		if (now != total) {
+			if (!lost_rounds++)
+				fprintf(stderr, "%s: round %lu: %lu keys across "
+					"dst+swap0+swap1, expected %lu -- a "
+					"graft_swap retired a peer's content "
+					"(st0=%d st1=%d)\n", tname, round, now,
+					total, (int) ctx.st[0], (int) ctx.st[1]);
+			ret = -1;
+			total = now;	/* re-baseline so one loss is not counted forever */
+		}
+		for (i = 0; i < 2; i++) {
+			int idx = -(int) ctx.st[i];
+
+			if (idx < 0 || idx > 7)
+				idx = 0;
+			stcount[idx]++;
+		}
+		if (ctx.st[0] == CDS_FT_STATUS_OK
+				&& ctx.st[1] == CDS_FT_STATUS_OK)
+			both_ok++;
+		else if (ctx.st[0] == CDS_FT_STATUS_OK
+				|| ctx.st[1] == CDS_FT_STATUS_OK)
+			one_ok++;
+		if (cds_ft_verify(ctx.dst, stderr) != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "%s: round %lu: verify(dst) failed\n",
+				tname, round);
+			ret = -1;
+			break;
+		}
+		rcu_quiescent_state();
+		if (elapsed_ms(&t0) >= GS_ROUNDS_MS)
+			break;
+	}
+
+	uatomic_store(&ctx.stop, 1, CMM_RELEASE);
+	for (i = 0; i < 2; i++)
+		pthread_join(th[i], NULL);
+
+	fprintf(stderr, "# %s: %lu rounds (both-OK %lu, one-OK %lu), "
+		"%lu rounds lost keys, %lu BUSY retries; statuses ok=%lu inval=%lu mem=%lu "
+		"overflow=%lu busy=%lu populated=%lu integrity=%lu nosup=%lu\n",
+		tname, round + 1, both_ok, one_ok, lost_rounds, ctx.retries,
+		stcount[0], stcount[1], stcount[2], stcount[3], stcount[4],
+		stcount[5], stcount[6], stcount[7]);
+	/* A run where the two never both succeeded has not driven the window. */
+	if (!ret && both_ok == 0) {
+		fprintf(stderr, "%s: no round had BOTH swaps succeed -- the "
+			"shared-destination window was never driven\n", tname);
+		ret = -1;
+	}
+
+	drain_trie_keep_group(ctx.dst);
+	for (i = 0; i < 2; i++)
+		drain_trie_keep_group(ctx.swap[i]);
+	rcu_barrier();
+	cds_ft_destroy(probe);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+static int inv_graft_swap_shared_dst(void)
+{
+	return gs_shared_oracle("inv_graft_swap_shared_dst", /*list_on=*/ true);
+}
+
+static int inv_graft_swap_shared_dst_nolist(void)
+{
+	return gs_shared_oracle("inv_graft_swap_shared_dst_nolist",
+		/*list_on=*/ false);
+}
+
 static int inv_merge_root_src_cross_view(void)
 {
 	struct cds_ft_group *group;
@@ -16171,6 +16444,8 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_graft_cross_view);
 	RUN_TEST(inv_graft_root_swap_cross_view);
 	RUN_TEST(inv_merge_root_swap_cross_view);
+	RUN_TEST(inv_graft_swap_shared_dst);
+	RUN_TEST(inv_graft_swap_shared_dst_nolist);
 	RUN_TEST(inv_prefix_key_park_vs_holder_churn);
 	RUN_TEST(inv_empty_dst_root_graft_peer);
 	RUN_TEST(inv_empty_dst_root_graft_peer_nolist);
