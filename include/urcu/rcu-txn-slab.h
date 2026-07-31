@@ -912,8 +912,20 @@ void *urcu_slab_alloc(struct urcu_slab *s, int cl)
 		 * Local dry: take the WHOLE atomic freelist in one xchg and
 		 * install it, so the cross-cpu frees accumulated there cost one
 		 * atomic per refill instead of one per block.
+		 *
+		 * Under the pop lock, even though pop_all is itself atomic:
+		 * lfstack's synchronization matrix requires __cds_lfs_pop() to be
+		 * serialized against pop_all as well as against other pops, and
+		 * this arena's other consumers (the alloc slow path, and
+		 * urcu_slab_take_floor()) take that lock.  A mutex only some
+		 * consumers hold satisfies none of the matrix's three options, and
+		 * the hole is the classic pop-side ABA -- a locked popper resuming
+		 * with a stale successor that pop_all has since handed out.  One
+		 * lock per refill (not per alloc) restores it.
 		 */
+		cds_lfs_pop_lock(&a->freelist);
 		chain = __cds_lfs_pop_all(&a->freelist);
+		cds_lfs_pop_unlock(&a->freelist);
 		if (chain) {
 			struct cds_lfs_node *first = &chain->node;
 			struct cds_lfs_node *rest = first->next;
