@@ -24,8 +24,18 @@
  * means the slot is DEFINITELY absent, so the scan is skipped outright.  All k
  * bits set means present OR a false positive, which falls through to the
  * authoritative find.  It can therefore only ever save the scan, never change a
- * returned value -- correctness never depends on the filter, only speed does.
- * That is what lets each engine adopt, skip, or A/B it freely.
+ * returned value.
+ *
+ * PRECISELY WHICH HALF IS FREE.  Correctness never depends on the filter's
+ * PRESENCE, WIDTH or k: a false positive costs the find, or at age 0 one extra
+ * attempt, and nothing else.  That is what lets each engine adopt, skip or A/B
+ * it freely.  It does depend, load-bearingly, on the filter never lying about a
+ * MISS -- read-your-own-writes is skipped outright on a clear bit, so a false
+ * negative silently returns a committed value where a pending one was due.
+ * Two things keep that true, and both are obligations on the engine: the hash
+ * is deterministic and shared by set and test, and the filter must be set for
+ * EVERY slot recorded while it is live (arming rebuilds it from all records
+ * precisely so this holds from the moment it goes live).
  *
  * The state is the caller's: an engine declares its own uint64_t
  * [URCU_TXN_BLOOM_WORDS] array wherever it wants it (an on-stack handle,
@@ -41,8 +51,9 @@ extern "C" {
 
 /*
  * URCU_TXN_BLOOM_WORDS sets the filter width (64 bits each; default 16 = 1024
- * bits).  Widening it lowers the false-positive rate ~linearly (FP ~= k*records
- * / (64*WORDS)).
+ * bits).  Widening it cuts the sparse false-positive rate by ~2^k per doubling
+ * -- the model is (1 - e^{-kn/m})^k, which for a sparse filter is (kn/m)^k; see
+ * URCU_TXN_BLOOM_K below for the single statement of it.
  *
  * Both width and k are compile-time tunables that only ever trade filter cost
  * against the false-positive rate: correctness never depends on either.  The
@@ -55,9 +66,11 @@ extern "C" {
 /*
  * URCU_TXN_BLOOM_K sets the number of hash BITS a slot maps to (default 3).
  * With k bits over m = 64*WORDS bits and n recorded slots the false-positive
- * rate is ~(1 - e^{-kn/m})^k, which for a sparse filter falls off as (kn/m)^k
- * -- so raising k cuts false positives super-linearly where widening WORDS only
- * helps linearly.  The filter is a double-hashed k-bit filter built from two
+ * rate is ~(1 - e^{-kn/m})^k, which for a sparse filter falls off as (kn/m)^k.
+ * Both knobs are strong and neither dominates: doubling m divides the rate by
+ * ~2^k, while raising k by one multiplies it by the fill factor kn/m (a win
+ * only while the filter is sparse, which is why k has a knee).  The filter is a
+ * double-hashed k-bit filter built from two
  * INDEPENDENT avalanche hashes h1,h2 (position i = h1 + i*h2); the age-0/age-1
  * study used k as the lever to drive the filter-FP escalation component toward
  * zero and isolate the genuine-RYW rate.  A degenerate k=1 is valid too (one
@@ -73,8 +86,9 @@ extern "C" {
  * and hashing into it, and it is EXACT, so it also spares the caller the
  * spurious escalations a false positive would cause.  Only above this does the
  * filter start paying.  Correctness never depends on the value -- it selects
- * which of two answers-agreeing paths runs.  The sw engine uses the same
- * constant for the same reason (URCU_TXN_SW_BLOOM_MIN).
+ * which of two answers-agreeing paths runs.  The sw engine keeps its OWN knob
+ * with the same default and the same rationale (URCU_TXN_SW_BLOOM_MIN); it is
+ * an independent define, so overriding this one does not move it.
  */
 #ifndef URCU_TXN_BLOOM_MIN
 # define URCU_TXN_BLOOM_MIN	8
@@ -94,7 +108,14 @@ extern "C" {
 static inline
 void urcu_txn__ryw_bloom_h1h2(void **slot, uint64_t *h1, uint64_t *h2)
 {
-	uint64_t x = (uint64_t) (uintptr_t) slot >> 3;	/* slots are pointer-aligned */
+	/*
+	 * Shift by the alignment actually guaranteed.  >> 3 discards a live
+	 * address bit on ILP32, where slots are only 4-byte aligned, so adjacent
+	 * slots collapse onto identical k positions -- a false-positive rate the
+	 * model does not predict.  On LP64 the one residual zero bit is absorbed
+	 * by the SplitMix64 avalanche on the very next line.
+	 */
+	uint64_t x = (uint64_t) (uintptr_t) slot >> 2;
 
 	x ^= x >> 30; x *= 0xbf58476d1ce4e5b9ULL;
 	x ^= x >> 27; x *= 0x94d049bb133111ebULL;
