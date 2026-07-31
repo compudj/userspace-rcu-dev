@@ -1113,6 +1113,19 @@ bool urcu_txn_sw_record(struct urcu_txn_sw_txn *t, void **slot,
  * still build its write set from stale reads on pairwise-distinct slots unless
  * its traversal ALSO reads through urcu_txn_sw_load().  See the trap in
  * urcu_txn_sw_list_add_after_prepare().
+ *
+ * AFTER A STICKY OOM THE PAIR SILENTLY LOSES RYW.  A reserve()/record() that
+ * returned false latched URCU_TXN_SW_OOM and did NOT append its record, so a
+ * later load() of that slot finds nothing pending and returns the COMMITTED
+ * value -- while loads of slots recorded earlier still return pending ones.
+ * That is a mixed view of a state this transaction will never publish.  The
+ * engine itself stays safe (commit reports MEMORY_ERROR and publishes
+ * nothing); the damage channel is the one this header names elsewhere -- an
+ * embedder that mutates NON-transactional state as it goes (sw-hlist's
+ * writer-only pprev: "a plain store that no rollback can undo") would derive
+ * those stores from the inconsistent view.  So the ignore-the-bool style is
+ * only safe for a bracket with no such side effects: gate on
+ * urcu_txn_sw_append_is_infallible(), or check every record() return.
  */
 
 /*
