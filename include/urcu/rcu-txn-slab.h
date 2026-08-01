@@ -115,6 +115,29 @@ extern "C" {
  * arenas sit empty.  Any per-arena number is then simultaneously too small for
  * the busy arena and meaningless as a bound on the process.  Budget the total
  * and let arenas take what they need.
+ *
+ * THIS IS A MEMORY SAFETY VALVE, AND NOTHING MORE.  It is not a tuning knob,
+ * and reaching it is not a sizing mistake to be corrected by raising it.
+ * Superblocks are never unmapped, so the cap is the only thing standing between
+ * a workload that allocates faster than it recycles and a permanently inflated
+ * process; past it, allocation spills to posix_memalign(), which is slower but
+ * hands the memory back to libc when the burst ends.  Spilling is the valve
+ * doing its job.
+ *
+ * So hitting it is a SIGNAL, not a limit to relax: it says blocks are not
+ * returning to their freelist fast enough, and the fix is on the reclaim side.
+ * Raising the cap does buy throughput -- measured, a 384-cpu machine at 48
+ * writers goes from ~36 to ~99 Mchurn/s once the cap stops binding -- but it
+ * buys it by letting the footprint keep climbing: with the cap out of the way
+ * the same workload's slab grows LINEARLY with runtime, 7.6 GiB at 1 s to
+ * 48.7 GiB at 8 s, with no plateau.  That is not a working set, and a bigger
+ * number only moves when the valve opens.
+ *
+ * The actual fix is to stop the leak.  Routing an engine's retirement through
+ * URCU_TXN_SLAB_BATCH (see urcu_slab_free_pending()) takes block reuse from
+ * ~11% to 99.6%: the same workload then reaches ~122 Mchurn/s -- faster than
+ * the raised cap achieves -- while the footprint PLATEAUS at 194 MiB.  Bounded
+ * memory and better throughput, rather than one traded for the other.
  */
 #ifndef URCU_SLAB_MAX_MB
 #define URCU_SLAB_MAX_MB	1024UL
