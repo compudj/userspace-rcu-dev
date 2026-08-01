@@ -918,6 +918,47 @@ void urcu_txn_free_rcu(struct rcu_head *head)
 }
 
 /*
+ * Retire a committed descriptor.
+ *
+ * DEFAULT: one call_rcu per descriptor; the callback frees it with
+ * urcu_slab_free(), i.e. AFTER the caller's grace period, straight onto the
+ * origin arena's freelist.
+ *
+ * -DURCU_TXN_SLAB_BATCH: hand it to the slab's BATCH retirement instead --
+ * urcu_slab_free_pending(), BEFORE the grace period, the slab owning the
+ * deferral from here.  The block sits on its arena's pending list until a batch
+ * closes (every URCU_SLAB_BATCH_MAX blocks), and one call_rcu then splices the
+ * WHOLE batch onto the freelist with a single CAS.  That is what the batch
+ * machinery exists for, and it is the difference between one call_rcu per
+ * descriptor and one per batch: measured, this workload issues ~56M of the
+ * former in 2 s at 48 writers, and reclaim cannot keep up -- block reuse sits
+ * at 60-75% and the backlog grows without bound.
+ *
+ * Only a slab-backed descriptor may take that path: free_pending() derives the
+ * origin arena by masking the block address to its superblock, which is
+ * meaningless for an exact malloc'd descriptor.  The @slab STAMP decides, not
+ * the slab's current enabled state -- the same rule urcu_txn_free() uses.
+ *
+ * The layout precondition -- bytes [link_off, batch_off + 8) dead to readers
+ * from this call until the splice -- holds by construction: that range is
+ * @rcu_head plus the batch overlay reserved after it, and the descriptor pins
+ * @rcu_head's position for exactly this reason (see struct urcu_txn_desc).
+ */
+static inline
+void urcu_txn_retire(struct urcu_txn_desc *t,
+		void (*call_rcu_fn)(struct rcu_head *,
+			void (*)(struct rcu_head *)))
+{
+#ifdef URCU_TXN_SLAB_BATCH
+	if (caa_likely(t->slab)) {
+		urcu_slab_free_pending(t, call_rcu_fn);
+		return;
+	}
+#endif
+	call_rcu_fn(&t->rcu_head, urcu_txn_free_rcu);
+}
+
+/*
  * Commit @t (the sw-mw-aware path): install MW records (may abort), then SW
  * records, decide, settle.  Returns true on commit (SUCCEEDED), false on abort
  * (FAILED) -- the caller re-reads and retries.  Reclaim is deferred through
@@ -1032,7 +1073,7 @@ bool urcu_txn_desc_commit(struct urcu_txn_desc *t,
 			 */
 			urcu_txn_destroy(t);
 		} else {
-			call_rcu_fn(&t->rcu_head, urcu_txn_free_rcu);
+			urcu_txn_retire(t, call_rcu_fn);
 		}
 		return false;
 	}
@@ -1041,7 +1082,7 @@ bool urcu_txn_desc_commit(struct urcu_txn_desc *t,
 		urcu_txn_park(&t->recs[i]);	/* SW parks: plain, never fail */
 	urcu_txn_decide(t, URCU_TXN_DESC_SUCCEEDED);	/* linearization point */
 	urcu_txn_settle(t, nr, URCU_TXN_DESC_SUCCEEDED);
-	call_rcu_fn(&t->rcu_head, urcu_txn_free_rcu);
+	urcu_txn_retire(t, call_rcu_fn);
 	return true;
 }
 
@@ -1106,7 +1147,7 @@ bool urcu_txn_desc_commit_sw(struct urcu_txn_desc *t,
 		urcu_txn_park(&t->recs[i]);		/* plain stores, never fail */
 	urcu_txn_decide(t, URCU_TXN_DESC_SUCCEEDED);	/* linearization point */
 	urcu_txn_settle(t, nr, URCU_TXN_DESC_SUCCEEDED);
-	call_rcu_fn(&t->rcu_head, urcu_txn_free_rcu);
+	urcu_txn_retire(t, call_rcu_fn);
 	return true;
 }
 

@@ -1446,7 +1446,22 @@ enum urcu_txn_status urcu_txn_sw_commit_flavor(struct urcu_txn_sw_txn *t,
 		urcu_txn_sw__excl_slot_ours(l);
 		uatomic_store(l->slot, l->proxy.ptr[1], CMM_RELEASE);
 	}
-	call_rcu_fn(&blk->rcu_head, urcu_txn_sw_free_rcu);	/* a reader may hold a proxy */
+	/*
+	 * A reader may hold a proxy into @blk, so this must not free it before a
+	 * grace period.  Both routes honour that; they differ in WHO defers.
+	 * -DURCU_TXN_SLAB_BATCH hands the block to the slab's batch retirement
+	 * (one call_rcu per BATCH); the default keeps one call_rcu per block.
+	 * See urcu_txn_retire() in <urcu/rcu-txn-mcas.h> for the reasoning and
+	 * for why only slab-stamped blocks may take the batch route.
+	 */
+#ifdef URCU_TXN_SLAB_BATCH
+	if (caa_likely(blk->slab))
+		urcu_slab_free_pending(blk, call_rcu_fn);
+	else
+		call_rcu_fn(&blk->rcu_head, urcu_txn_sw_free_rcu);
+#else
+	call_rcu_fn(&blk->rcu_head, urcu_txn_sw_free_rcu);
+#endif
 	t->block = NULL;		/* handle consumed */
 	t->latches = NULL;
 	t->state = URCU_TXN_SW_DONE;
