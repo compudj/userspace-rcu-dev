@@ -1418,10 +1418,26 @@ int urcu_slab_close_and_arm(struct urcu_slab *s, struct urcu_slab_arena *a)
 	struct cds_lfs_head *chain;
 	struct cds_lfs_node *new_floor, *tail;
 
-	if (!a->floor || !uatomic_load(&s->call_rcu_fn, CMM_RELAXED))
+	/*
+	 * @floor is read WITHOUT the close lock by urcu_slab_free_pending()'s
+	 * bootstrap check and by urcu_slab_closer_cb()'s re-arm test, so every
+	 * access to it has to be atomic even though all WRITES happen under the
+	 * lock.  A plain store here against those loads is a data race in the
+	 * memory model -- TSAN reports it -- and the mixed plain/atomic access
+	 * is the defect regardless of what x86 happens to do with it.
+	 *
+	 * RELAXED suffices: the block @new_floor points at is published by the
+	 * SEQ_CST xchg into @pending.head below (which is what a concurrent
+	 * pusher synchronises against), and every reader of @floor itself only
+	 * NULL-tests it or compares it for identity.  The ordering the closers
+	 * need against each other is carried by the close lock.
+	 */
+	if (!uatomic_load(&a->floor, CMM_RELAXED) ||
+			!uatomic_load(&s->call_rcu_fn, CMM_RELAXED))
 		return 0;
 	if (uatomic_load(&a->pending.head, CMM_RELAXED) ==
-			caa_container_of(a->floor, struct cds_lfs_head, node))
+			caa_container_of(uatomic_load(&a->floor, CMM_RELAXED),
+				struct cds_lfs_head, node))
 		return 0;				/* nothing pushed */
 	new_floor = urcu_slab_take_floor(s, a);
 	if (!new_floor)
@@ -1430,8 +1446,8 @@ int urcu_slab_close_and_arm(struct urcu_slab *s, struct urcu_slab_arena *a)
 	chain = uatomic_xchg_mo(&a->pending.head,
 			caa_container_of(new_floor, struct cds_lfs_head, node),
 			CMM_SEQ_CST);
-	tail = a->floor;			/* recalled, not discovered */
-	a->floor = new_floor;
+	tail = uatomic_load(&a->floor, CMM_RELAXED);	/* recalled, not discovered */
+	uatomic_store(&a->floor, new_floor, CMM_RELAXED);
 	uatomic_store(&a->nr_pending, 0, CMM_RELAXED);
 
 	urcu_slab_batch_of(s, urcu_slab_block(s, tail))->head = &chain->node;
@@ -1498,10 +1514,21 @@ void urcu_slab_closer_cb(struct rcu_head *head)
 	 * close_queued == 0 and arms a closer itself, or landed early enough
 	 * for the check below to catch it.
 	 */
-	if (a->floor &&
-			uatomic_load(&a->pending.head, CMM_RELAXED) !=
-				caa_container_of(a->floor, struct cds_lfs_head, node))
-		urcu_slab_arm_closer(s, a);
+	{
+		/*
+		 * Read @floor once, atomically: this runs OUTSIDE the close lock
+		 * (close_arena took and released it above), so it races with a
+		 * concurrent closer's store in urcu_slab_close_and_arm().  Reading
+		 * it twice would also let the NULL test and the comparison see
+		 * different values.
+		 */
+		struct cds_lfs_node *floor = uatomic_load(&a->floor, CMM_RELAXED);
+
+		if (floor &&
+				uatomic_load(&a->pending.head, CMM_RELAXED) !=
+					caa_container_of(floor, struct cds_lfs_head, node))
+			urcu_slab_arm_closer(s, a);
+	}
 }
 
 /*
@@ -1584,7 +1611,10 @@ void urcu_slab_free_pending(void *block,
 		 * have pushed before the winner publishes it.
 		 */
 		pthread_mutex_lock(&a->boot);
-		if (!a->floor) {
+		/* Atomic even under the lock: the racing reader is the
+		 * lock-free test above, and one word must not be reached
+		 * through a mix of plain and atomic accesses. */
+		if (!uatomic_load(&a->floor, CMM_RELAXED)) {
 			node->next = NULL;
 			uatomic_store(&a->pending.head,
 				caa_container_of(node, struct cds_lfs_head, node),
