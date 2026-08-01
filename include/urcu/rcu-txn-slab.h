@@ -432,6 +432,105 @@ struct urcu_slab {
 static struct urcu_slab *urcu_slab_registry[URCU_SLAB_MAX_REG];
 static int urcu_slab_nreg;
 #define URCU_SLAB_STAT(s, f)	uatomic_inc(&(s)->st_##f)
+
+/*
+ * Walk a raw ->next chain, counting nodes.  @cap bounds the walk so a corrupt
+ * or concurrently-mutated list reports a number instead of hanging the exit
+ * path; a count that comes back == cap should be read as "at least".
+ */
+static inline
+unsigned long urcu_slab_count_chain(const struct cds_lfs_node *n,
+		const struct cds_lfs_node *stop, unsigned long cap)
+{
+	unsigned long k = 0;
+
+	while (n && n != stop && k < cap) {
+		k++;
+		n = n->next;
+	}
+	return k;
+}
+
+/*
+ * Footprint census.  st_reuse/st_carve say how allocation was SERVED; they
+ * cannot say whether the memory the slab mapped is being used, which is a
+ * different question and the one that matters when the footprint looks large.
+ *
+ * Two ratios, deliberately separate, because they fail for different reasons:
+ *
+ *   FILL  = carved bytes / mappable bytes.  Superblocks are bump-carved and
+ *           never unmapped, so a low fill means the slab mapped memory it never
+ *           handed out even once -- pure waste, and a bug in how superblocks
+ *           are retired or how arenas migrate off them.
+ *   LIVE  = (carved blocks - parked blocks) / carved blocks, where "parked" is
+ *           everything sitting on a freelist (reusable now) or in the deferral
+ *           pipeline (pending/local_pending: freed, but not reusable until a
+ *           batch closes and a grace period passes).  A low LIVE with a high
+ *           FILL is not waste -- it is in-flight memory, bounded by allocation
+ *           rate x reclaim latency, and the fix for it is reclaim throughput,
+ *           not a smaller cap.
+ *
+ * Quiescent-use only: this runs from a destructor and reads lists without
+ * synchronization.
+ */
+static inline
+void urcu_slab_census(struct urcu_slab *s)
+{
+	unsigned long mappable = 0, carved = 0, blk_carved = 0;
+	unsigned long on_free = 0, on_local = 0, on_pend = 0, on_lpend = 0;
+	size_t hdr = (sizeof(struct urcu_slab_sb) + 15) & ~(size_t) 15;
+	const unsigned long CAP = 1UL << 28;
+	int i, nar = s->nclass * s->ncpu;
+
+	for (i = 0; i < nar; i++) {
+		struct urcu_slab_arena *a = &s->arenas[i];
+		const struct urcu_slab_sb *sb;
+
+		for (sb = a->sb; sb; sb = sb->next) {
+			mappable += URCU_SLAB_RANGE - hdr;
+			carved += sb->bump - hdr;
+			if (a->obj)
+				blk_carved += (sb->bump - hdr) / a->obj;
+		}
+		if (a->freelist.head)
+			on_free += urcu_slab_count_chain(&a->freelist.head->node,
+					NULL, CAP);
+		if (a->local && a->local != &s->dead)
+			on_local += urcu_slab_count_chain(a->local, &s->dead, CAP);
+		if (a->pending.head)
+			on_pend += urcu_slab_count_chain(&a->pending.head->node,
+					uatomic_load(&a->floor, CMM_RELAXED), CAP);
+		if (a->local_pending)
+			on_lpend += urcu_slab_count_chain(a->local_pending,
+					a->local_floor, CAP);
+	}
+	{
+		unsigned long parked = on_free + on_local + on_pend + on_lpend;
+		unsigned long live = blk_carved > parked ? blk_carved - parked : 0;
+		/*
+		 * st_sbs, NOT nr_sb_total: reserve_sb() returns early without
+		 * counting when the budget is unlimited, so nr_sb_total is
+		 * maintained only while a cap is active and reads 0 exactly in
+		 * the unbounded case this census exists to inspect.
+		 */
+		double mapped_mb = (double) s->st_sbs *
+				(double) URCU_SLAB_RANGE / (1024.0 * 1024.0);
+
+		fprintf(stderr,
+		  "[slab %s]   census: mapped=%.1f MiB  FILL=%.1f%% (carved %.1f of %.1f MiB)\n"
+		  "[slab %s]   census: blocks carved=%lu  parked=%lu  LIVE=%lu (%.1f%%)\n"
+		  "[slab %s]   census: parked breakdown: freelist=%lu local=%lu"
+		  " pending=%lu local_pending=%lu\n",
+		  s->name, mapped_mb,
+		  mappable ? 100.0 * (double) carved / (double) mappable : 0.0,
+		  (double) carved / (1024.0 * 1024.0),
+		  (double) mappable / (1024.0 * 1024.0),
+		  s->name, blk_carved, parked, live,
+		  blk_carved ? 100.0 * (double) live / (double) blk_carved : 0.0,
+		  s->name, on_free, on_local, on_pend, on_lpend);
+	}
+}
+
 static __attribute__((destructor))
 void urcu_slab_stats_dump(void)
 {
@@ -464,6 +563,8 @@ void urcu_slab_stats_dump(void)
 			  s->name, pl, ps,
 			  100.0 * (double) pl / (double) (pl + ps + 1));
 		}
+		if (s->ncpu > 0 && s->arenas)
+			urcu_slab_census(s);
 	}
 }
 #else
