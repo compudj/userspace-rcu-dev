@@ -78,7 +78,7 @@
  * compares the run count against this plan, so retiring a test means
  * decrementing here in the same commit.
  */
-#define NR_TESTS	(84 + NR_TESTS_REKEY_DLM)
+#define NR_TESTS	(87 + NR_TESTS_REKEY_DLM)
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -9606,6 +9606,8 @@ static int inv_prefix_key_park_vs_holder_churn(void)
 #define GS_ROUNDS_MS		1200
 #define GS_MAX_RETRY		4096
 #define GS_MAX_PREFIX		4
+/* Drain bound: >> any legitimate content, small enough to fail fast. */
+#define GS_DRAIN_MAX		4096
 
 /*
  * ★ THE GRAFT-POINT SHAPE IS THE THING THIS FAMILY MUST VARY.
@@ -9672,6 +9674,21 @@ struct gs_layout {
 	 * lands, so the arm actually repeats.
 	 */
 	unsigned int swap_prefix_len;
+	/*
+	 * Rebuild all three tries to this layout between rounds.
+	 *
+	 * ★ REQUIRED TO SUSTAIN KEY_SHORTER.  The arm is self-cancelling in a
+	 * swap ring: grafting at a key that ends INSIDE a compressed run SPLITS
+	 * the run at exactly that key, so the key is an EXACT position from the
+	 * next descent onward.  Without a reseed the shape under test runs ONCE
+	 * (kshort=1) and every later round silently measures EXACT, which reads
+	 * as coverage and is not.  With it, kshort tracks the round count.
+	 *
+	 * Rounds are far fewer than a non-reseeding run's; rounds are not the
+	 * figure of merit here, kshort is.  Conservation is checked per round
+	 * against that round's freshly counted total.
+	 */
+	bool reseed;
 };
 
 struct gs_shared_ctx {
@@ -9795,6 +9812,91 @@ static void gs_fill(struct cds_ft *ft, uint8_t tag, unsigned int n,
 	}
 }
 
+/*
+ * Fill dst and both swap tries to @lay's shape.  Called at setup and, for a
+ * reseeding layout, once per round.
+ */
+static void gs_seed(struct gs_shared_ctx *c, const struct gs_layout *lay)
+{
+	unsigned int i;
+
+	for (i = 0; i < 2; i++) {
+		gs_fill(c->swap[i], (uint8_t) (0xA0 + i), GS_KEYS_PER_TRIE,
+			gs_swap_prefix, lay->swap_prefix_len);
+		if (lay->swap_branch)
+			gs_fill(c->swap[i], (uint8_t) (0xB0 + i),
+				GS_KEYS_PER_TRIE, gs_swap_prefix,
+				lay->swap_prefix_len);
+	}
+	gs_fill(c->dst, 0xD0, GS_KEYS_PER_TRIE, lay->dst_prefix,
+		lay->dst_prefix_len);
+}
+
+/*
+ * Empty @ft but KEEP IT USABLE.  drain_trie_keep_group() is deliberately not
+ * used: it keeps the GROUP and cds_ft_destroy()s the trie, and recreating a
+ * trie per round costs two orders of magnitude in rounds and races the writer
+ * threads that hold the pointer.
+ *
+ * BOUNDED.  An unbounded key-walk over a structurally broken trie is not a
+ * theoretical worry -- it ran away to 187 GB RSS and took a global OOM kill.
+ * The caller must only ever reach here on a trie that just VERIFIED, and this
+ * bound is the second line of defence.  Returns -1 if it did not converge.
+ */
+static int gs_drain_keep_trie(struct cds_ft *ft)
+{
+	struct cds_ft_iter *iter;
+	unsigned long removed = 0;
+	int ret = 0;
+
+	if (cds_ft_iter_create(ft, &iter) < 0)
+		abort();
+	rcu_read_lock();
+	while (cds_ft_lookup_first(ft, iter) == CDS_FT_STATUS_OK) {
+		struct cds_ft_node *head, *tmp;
+		enum cds_ft_status s = cds_ft_remove_all(ft, iter, &head);
+
+		if (s != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "gs_drain_keep_trie: lookup_first found "
+				"a key but remove_all reports %d after %lu "
+				"removals (count_keys=%lu)\n", (int) s, removed,
+				cds_ft_count_keys(ft));
+			ret = -1;
+			break;
+		}
+		cds_ft_for_each_duplicate_safe_rcu(head, tmp)
+			node_free_rcu(to_test_node(head));
+		if (++removed > GS_DRAIN_MAX) {
+			fprintf(stderr, "gs_drain_keep_trie: no convergence "
+				"after %lu removals (count_keys=%lu)\n",
+				removed, cds_ft_count_keys(ft));
+			ret = -1;
+			break;
+		}
+	}
+	rcu_read_unlock();
+	cds_ft_iter_destroy(iter);
+	return ret;
+}
+
+/*
+ * Drain all three tries and re-seed them, between rounds with both writers
+ * parked in gs_wait_round so nothing is concurrently reachable.  Callers must
+ * have VERIFIED all three first.  Returns -1 if any drain did not converge.
+ */
+static int gs_reseed(struct gs_shared_ctx *c, const struct gs_layout *lay)
+{
+	unsigned int i;
+
+	if (gs_drain_keep_trie(c->dst))
+		return -1;
+	for (i = 0; i < 2; i++)
+		if (gs_drain_keep_trie(c->swap[i]))
+			return -1;
+	gs_seed(c, lay);
+	return 0;
+}
+
 static int gs_shared_oracle(const char *tname, bool list_on,
 		const struct gs_layout *lay)
 {
@@ -9826,15 +9928,8 @@ static int gs_shared_oracle(const char *tname, bool list_on,
 	for (i = 0; i < 2; i++) {
 		if (cds_ft_create(group, NULL, &ctx.swap[i]) < 0)
 			abort();
-		gs_fill(ctx.swap[i], (uint8_t) (0xA0 + i), GS_KEYS_PER_TRIE,
-			gs_swap_prefix, lay->swap_prefix_len);
-		if (lay->swap_branch)
-			gs_fill(ctx.swap[i], (uint8_t) (0xB0 + i),
-				GS_KEYS_PER_TRIE, gs_swap_prefix,
-				lay->swap_prefix_len);
 	}
-	gs_fill(ctx.dst, 0xD0, GS_KEYS_PER_TRIE, lay->dst_prefix,
-		lay->dst_prefix_len);
+	gs_seed(&ctx, lay);
 
 	total = cds_ft_count_keys(ctx.dst) + cds_ft_count_keys(ctx.swap[0])
 		+ cds_ft_count_keys(ctx.swap[1]);
@@ -9894,15 +9989,54 @@ static int gs_shared_oracle(const char *tname, bool list_on,
 		else if (ctx.st[0] == CDS_FT_STATUS_OK
 				|| ctx.st[1] == CDS_FT_STATUS_OK)
 			one_ok++;
-		if (cds_ft_verify(ctx.dst, stderr) != CDS_FT_STATUS_OK) {
-			fprintf(stderr, "%s: round %lu: verify(dst) failed\n",
-				tname, round);
-			ret = -1;
-			break;
+		/*
+		 * ★ VERIFY ALL THREE TRIES, not just dst.  A corrupt SWAP trie
+		 * has been observed while dst verified clean and BOTH swaps
+		 * returned OK -- checking only the destination is blind to the
+		 * half of the exchange that gets re-rooted.
+		 */
+		{
+			struct cds_ft *bad = NULL;
+			const char *which = NULL;
+
+			if (cds_ft_verify(ctx.dst, stderr) != CDS_FT_STATUS_OK) {
+				bad = ctx.dst; which = "dst";
+			} else if (cds_ft_verify(ctx.swap[0], stderr)
+					!= CDS_FT_STATUS_OK) {
+				bad = ctx.swap[0]; which = "swap0";
+			} else if (nw > 1 && cds_ft_verify(ctx.swap[1], stderr)
+					!= CDS_FT_STATUS_OK) {
+				bad = ctx.swap[1]; which = "swap1";
+			}
+			if (bad) {
+				fprintf(stderr, "%s: round %lu: verify(%s) failed "
+					"(st0=%d st1=%d)\n", tname, round, which,
+					(int) ctx.st[0], (int) ctx.st[1]);
+				ret = -1;
+				break;
+			}
 		}
 		rcu_quiescent_state();
 		if (elapsed_ms(&t0) >= GS_ROUNDS_MS)
 			break;
+		/*
+		 * Restore the graft-point shape for the NEXT round.
+		 * DELIBERATELY AFTER the verify above, never before: the drain
+		 * walks by KEY, so draining a trie this oracle has just proved
+		 * broken is the mistake the teardown below refuses to make --
+		 * and it does not merely abort, it runs away (187 GB RSS, OOM).
+		 */
+		if (lay->reseed) {
+			if (gs_reseed(&ctx, lay)) {
+				fprintf(stderr, "%s: round %lu: reseed failed\n",
+					tname, round);
+				ret = -1;
+				break;
+			}
+			total = cds_ft_count_keys(ctx.dst)
+				+ cds_ft_count_keys(ctx.swap[0])
+				+ cds_ft_count_keys(ctx.swap[1]);
+		}
 	}
 
 	uatomic_store(&ctx.stop, 1, CMM_RELEASE);
@@ -9954,7 +10088,7 @@ static int gs_shared_oracle(const char *tname, bool list_on,
  * shape the family has always run -- FT_GRAFT_SWAP_EXACT with a plain parent.
  */
 static const struct gs_layout gs_lay_exact = {
-	"exact", { GS_SHARED_KEY }, 1, 1, 2, false, 0
+	"exact", { GS_SHARED_KEY }, 1, 1, 2, false, 0, false
 };
 
 /*
@@ -9967,7 +10101,7 @@ static const struct gs_layout gs_lay_exact = {
  * still dropped; none of it had ever executed.
  */
 static const struct gs_layout gs_lay_kshort = {
-	"kshort", { GS_SHARED_KEY, 0x51, 0x52 }, 3, 2, 2, false, 0
+	"kshort", { GS_SHARED_KEY, 0x51, 0x52 }, 3, 2, 2, false, 0, false
 };
 /*
  * DEPTH CONTROL: same deep dst as "kshort", but the swap key spans only the
@@ -9977,7 +10111,7 @@ static const struct gs_layout gs_lay_kshort = {
  * point's parent stopped being the root".
  */
 static const struct gs_layout gs_lay_wide = {
-	"wide", { GS_SHARED_KEY, 0x51, 0x52 }, 3, 1, 2, false, 0
+	"wide", { GS_SHARED_KEY, 0x51, 0x52 }, 3, 1, 2, false, 0, false
 };
 /*
  * STABLE EXACT-UNDER-A-COMPRESSED-PARENT.  dst keys are prefix ++ 0xD0 ++ i,
@@ -9990,10 +10124,10 @@ static const struct gs_layout gs_lay_wide = {
  * every dst key shares.
  */
 static const struct gs_layout gs_lay_cparent = {
-	"cparent", { GS_SHARED_KEY, 0x51, 0xD0 }, 2, 3, 2, true, 0
+	"cparent", { GS_SHARED_KEY, 0x51, 0xD0 }, 2, 3, 2, true, 0, false
 };
 static const struct gs_layout gs_lay_cparent_solo = {
-	"cparent-solo", { GS_SHARED_KEY, 0x51, 0xD0 }, 2, 3, 1, true, 0
+	"cparent-solo", { GS_SHARED_KEY, 0x51, 0xD0 }, 2, 3, 1, true, 0, false
 };
 /*
  * Deep dst run, key ending inside it, and swap content carrying its own deep
@@ -10010,13 +10144,25 @@ static const struct gs_layout gs_lay_cparent_solo = {
  * which refill their sources every round).  Read the counters, not this name.
  */
 static const struct gs_layout gs_lay_ks2 = {
-	"ks2", { GS_SHARED_KEY, 0x51, 0x52 }, 3, 2, 2, false, 3
+	"ks2", { GS_SHARED_KEY, 0x51, 0x52 }, 3, 2, 2, false, 3, false
 };
 static const struct gs_layout gs_lay_ks2_solo = {
-	"ks2-solo", { GS_SHARED_KEY, 0x51, 0x52 }, 3, 2, 1, false, 3
+	"ks2-solo", { GS_SHARED_KEY, 0x51, 0x52 }, 3, 2, 1, false, 3, false
+};
+/*
+ * SUSTAINED KEY_SHORTER.  Same deep-run layout as "kshort", rebuilt every round
+ * so the split the previous round's graft made is undone and the writers
+ * descend the KEY_SHORTER arm again.  This is the regression guard for the
+ * legacy publish path whose commit status @93fad396 stopped discarding.
+ */
+static const struct gs_layout gs_lay_ksfix = {
+	"ksfix", { GS_SHARED_KEY, 0x51, 0x52 }, 3, 2, 2, false, 0, true
+};
+static const struct gs_layout gs_lay_ksfix_solo = {
+	"ksfix-solo", { GS_SHARED_KEY, 0x51, 0x52 }, 3, 2, 1, false, 0, true
 };
 static const struct gs_layout gs_lay_kshort_solo = {
-	"kshort-solo", { GS_SHARED_KEY, 0x51, 0x52 }, 3, 2, 1, false, 0
+	"kshort-solo", { GS_SHARED_KEY, 0x51, 0x52 }, 3, 2, 1, false, 0, false
 };
 
 /*
@@ -10028,10 +10174,10 @@ static const struct gs_layout gs_lay_kshort_solo = {
  * the pcn body the merged node is built from).
  */
 static const struct gs_layout gs_lay_deep = {
-	"deep", { GS_SHARED_KEY, 0x51 }, 2, 2, 2, false, 0
+	"deep", { GS_SHARED_KEY, 0x51 }, 2, 2, 2, false, 0, false
 };
 static const struct gs_layout gs_lay_deep_solo = {
-	"deep-solo", { GS_SHARED_KEY, 0x51 }, 2, 2, 1, false, 0
+	"deep-solo", { GS_SHARED_KEY, 0x51 }, 2, 2, 1, false, 0, false
 };
 
 static int inv_graft_swap_shared_dst(void)
@@ -10104,6 +10250,24 @@ static int inv_graft_swap_shared_dst_wide_nolist(void)
 {
 	return gs_shared_oracle("inv_graft_swap_shared_dst_wide_nolist",
 		/*list_on=*/ false, &gs_lay_wide);
+}
+
+static int inv_graft_swap_shared_dst_ksfix(void)
+{
+	return gs_shared_oracle("inv_graft_swap_shared_dst_ksfix",
+		/*list_on=*/ true, &gs_lay_ksfix);
+}
+
+static int inv_graft_swap_shared_dst_ksfix_nolist(void)
+{
+	return gs_shared_oracle("inv_graft_swap_shared_dst_ksfix_nolist",
+		/*list_on=*/ false, &gs_lay_ksfix);
+}
+
+static int inv_graft_swap_shared_dst_ksfix_solo(void)
+{
+	return gs_shared_oracle("inv_graft_swap_shared_dst_ksfix_solo",
+		/*list_on=*/ false, &gs_lay_ksfix_solo);
 }
 
 static int inv_graft_swap_shared_dst_kshort_solo(void)
@@ -16726,6 +16890,9 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_graft_swap_shared_dst_cparent_nolist);
 	RUN_TEST(inv_graft_swap_shared_dst_cparent_solo);
 	RUN_TEST(inv_graft_swap_shared_dst_wide_nolist);
+	RUN_TEST(inv_graft_swap_shared_dst_ksfix);
+	RUN_TEST(inv_graft_swap_shared_dst_ksfix_nolist);
+	RUN_TEST(inv_graft_swap_shared_dst_ksfix_solo);
 	RUN_TEST(inv_graft_swap_shared_dst_kshort_solo);
 	RUN_TEST(inv_graft_swap_shared_dst_deep_solo);
 	RUN_TEST(inv_prefix_key_park_vs_holder_churn);
