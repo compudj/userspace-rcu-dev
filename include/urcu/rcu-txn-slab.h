@@ -481,7 +481,36 @@ struct urcu_slab {
 	 * non-stats-built library object.
 	 */
 	const char *name;
-	unsigned long st_reuse, st_carve, st_sbs;
+	/*
+	 * The counters start their OWN cache line, and that alignment is
+	 * load-bearing rather than tidiness.
+	 *
+	 * Unaligned the block began at offset 88, which put st_reuse / st_carve
+	 * / st_sbs / st_a_local / st_a_refill in the same line as @call_rcu_fn
+	 * -- a field read by EVERY urcu_slab_free_pending().  A stats build then
+	 * has uatomic_inc()s on five counters, from every cpu, invalidating the
+	 * line that holds the hottest read in the deferral path.  Measured at 48
+	 * writers on dcache churn, the stats build retained 8.0% of the
+	 * throughput of the same liburcu built without them: a 12.6x slowdown,
+	 * far past what the increments themselves cost.
+	 *
+	 * That is not merely slow, it is MISLEADING.  The distortion is worst
+	 * exactly where free_pending() is hottest, so the instrumentation
+	 * penalises the configuration it is most often used to study, and two
+	 * stats runs differ partly by how much false sharing each provoked.
+	 *
+	 * Aligned, the block clears @call_rcu_fn, which then shares its line
+	 * only with @dead and @name -- both write-once.
+	 *
+	 * NOTE this does NOT address @nr_sb_total, which is
+	 * uatomic_add_return()'d on every superblock reserve while sharing line
+	 * 0 with @arenas, @class_size, @link_off and the rest of the read-hot
+	 * configuration.  That one is pre-existing and mild: reserves are rare
+	 * once reuse is high, and vanish under an unlimited budget, where
+	 * urcu_slab_reserve_sb() returns before touching it.
+	 */
+	unsigned long st_reuse __attribute__((aligned(64)));
+	unsigned long st_carve, st_sbs;
 	/* which PATH served the op: rseq-local vs atomic fallback */
 	unsigned long st_a_local, st_a_refill, st_a_slow;
 	unsigned long st_f_local, st_f_slow;
