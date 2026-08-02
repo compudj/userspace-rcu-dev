@@ -78,7 +78,7 @@
  * compares the run count against this plan, so retiring a test means
  * decrementing here in the same commit.
  */
-#define NR_TESTS	(87 + NR_TESTS_REKEY_DLM)
+#define NR_TESTS	(90 + NR_TESTS_REKEY_DLM)
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -7477,6 +7477,62 @@ static struct cds_ft *create_varlen_ord_ft(struct cds_ft_group **group_out)
  * whose stale speculative key -- the pre-detach full key on a now-stripped
  * detached position -- disagrees with its slot).
  */
+/*
+ * As create_varlen_nolist_ft_ws, but SPECULATIVE (which leaves
+ * CDS_FT_FLAG_SKIP_COMPRESSED set) rather than EAGER (which clears it).
+ */
+static struct cds_ft *create_varlen_nolist_ft_ws_spec(
+		struct cds_ft_group **group_out,
+		const enum cds_ft_writer_strategy *ws)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+
+	if (cds_ft_group_attr_create(&attr) < 0)
+		abort();
+	if (cds_ft_group_attr_set_lookup_optimization(attr,
+			CDS_FT_LOOKUP_OPTIMIZE_SPECULATIVE) < 0)
+		abort();
+	if (cds_ft_group_attr_set_ordered_list(attr, false) < 0)
+		abort();
+	if (ws && cds_ft_group_attr_set_writer_strategy(attr, *ws) < 0)
+		abort();
+	if (cds_ft_group_create(attr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &ft) < 0)
+		abort();
+	*group_out = group;
+	return ft;
+}
+
+static struct cds_ft *create_varlen_ord_ft_ws_spec(
+		struct cds_ft_group **group_out,
+		const enum cds_ft_writer_strategy *ws)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+
+	if (cds_ft_group_attr_create(&attr) < 0)
+		abort();
+	if (cds_ft_group_attr_set_lookup_optimization(attr,
+			CDS_FT_LOOKUP_OPTIMIZE_SPECULATIVE) < 0)
+		abort();
+	if (cds_ft_group_attr_set_ordered_list(attr, true) < 0)
+		abort();
+	if (ws && cds_ft_group_attr_set_writer_strategy(attr, *ws) < 0)
+		abort();
+	if (cds_ft_group_create(attr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &ft) < 0)
+		abort();
+	*group_out = group;
+	return ft;
+}
+
 static struct cds_ft *create_varlen_nolist_ft_ws(struct cds_ft_group **group_out,
 		const enum cds_ft_writer_strategy *ws)
 {
@@ -9689,6 +9745,18 @@ struct gs_layout {
 	 * against that round's freshly counted total.
 	 */
 	bool reseed;
+	/*
+	 * Build the group with SPECULATIVE lookup optimization instead of EAGER.
+	 *
+	 * ★ REQUIRED TO REACH THE COMPRESSED-GRANDPARENT FUSE.  EAGER explicitly
+	 * CLEARS CDS_FT_FLAG_SKIP_COMPRESSED (ft-lifecycle.h), and
+	 * ft_compress_single_child_if_needed returns its argument unchanged when
+	 * the group has skip-compression off -- so @canon is never compressed and
+	 * the fuse's third precondition can never hold.  Measured: with EAGER the
+	 * parent condition fires 37336 times and the canon condition ZERO, so the
+	 * arm is unreachable by GROUP CONFIGURATION, not by geometry.
+	 */
+	bool speculative;
 };
 
 struct gs_shared_ctx {
@@ -9915,8 +9983,12 @@ static int gs_shared_oracle(const char *tname, bool list_on,
 	int ret = 0;
 
 	assert(nw >= 1 && nw <= 2);
-	probe = list_on ? create_varlen_ord_ft_ws(&group, &ws)
-			: create_varlen_nolist_ft_ws(&group, &ws);
+	if (lay->speculative)
+		probe = list_on ? create_varlen_ord_ft_ws_spec(&group, &ws)
+				: create_varlen_nolist_ft_ws_spec(&group, &ws);
+	else
+		probe = list_on ? create_varlen_ord_ft_ws(&group, &ws)
+				: create_varlen_nolist_ft_ws(&group, &ws);
 
 	ctx.stop = 0;
 	ctx.seq = 0;
@@ -10088,7 +10160,7 @@ static int gs_shared_oracle(const char *tname, bool list_on,
  * shape the family has always run -- FT_GRAFT_SWAP_EXACT with a plain parent.
  */
 static const struct gs_layout gs_lay_exact = {
-	"exact", { GS_SHARED_KEY }, 1, 1, 2, false, 0, false
+	"exact", { GS_SHARED_KEY }, 1, 1, 2, false, 0, false, false
 };
 
 /*
@@ -10101,7 +10173,7 @@ static const struct gs_layout gs_lay_exact = {
  * still dropped; none of it had ever executed.
  */
 static const struct gs_layout gs_lay_kshort = {
-	"kshort", { GS_SHARED_KEY, 0x51, 0x52 }, 3, 2, 2, false, 0, false
+	"kshort", { GS_SHARED_KEY, 0x51, 0x52 }, 3, 2, 2, false, 0, false, false
 };
 /*
  * DEPTH CONTROL: same deep dst as "kshort", but the swap key spans only the
@@ -10111,7 +10183,7 @@ static const struct gs_layout gs_lay_kshort = {
  * point's parent stopped being the root".
  */
 static const struct gs_layout gs_lay_wide = {
-	"wide", { GS_SHARED_KEY, 0x51, 0x52 }, 3, 1, 2, false, 0, false
+	"wide", { GS_SHARED_KEY, 0x51, 0x52 }, 3, 1, 2, false, 0, false, false
 };
 /*
  * STABLE EXACT-UNDER-A-COMPRESSED-PARENT.  dst keys are prefix ++ 0xD0 ++ i,
@@ -10124,10 +10196,10 @@ static const struct gs_layout gs_lay_wide = {
  * every dst key shares.
  */
 static const struct gs_layout gs_lay_cparent = {
-	"cparent", { GS_SHARED_KEY, 0x51, 0xD0 }, 2, 3, 2, true, 0, false
+	"cparent", { GS_SHARED_KEY, 0x51, 0xD0 }, 2, 3, 2, true, 0, false, false
 };
 static const struct gs_layout gs_lay_cparent_solo = {
-	"cparent-solo", { GS_SHARED_KEY, 0x51, 0xD0 }, 2, 3, 1, true, 0, false
+	"cparent-solo", { GS_SHARED_KEY, 0x51, 0xD0 }, 2, 3, 1, true, 0, false, false
 };
 /*
  * Deep dst run, key ending inside it, and swap content carrying its own deep
@@ -10144,10 +10216,10 @@ static const struct gs_layout gs_lay_cparent_solo = {
  * which refill their sources every round).  Read the counters, not this name.
  */
 static const struct gs_layout gs_lay_ks2 = {
-	"ks2", { GS_SHARED_KEY, 0x51, 0x52 }, 3, 2, 2, false, 3, false
+	"ks2", { GS_SHARED_KEY, 0x51, 0x52 }, 3, 2, 2, false, 3, false, false
 };
 static const struct gs_layout gs_lay_ks2_solo = {
-	"ks2-solo", { GS_SHARED_KEY, 0x51, 0x52 }, 3, 2, 1, false, 3, false
+	"ks2-solo", { GS_SHARED_KEY, 0x51, 0x52 }, 3, 2, 1, false, 3, false, false
 };
 /*
  * SUSTAINED KEY_SHORTER.  Same deep-run layout as "kshort", rebuilt every round
@@ -10155,14 +10227,34 @@ static const struct gs_layout gs_lay_ks2_solo = {
  * descend the KEY_SHORTER arm again.  This is the regression guard for the
  * legacy publish path whose commit status @93fad396 stopped discarding.
  */
+/*
+ * The compressed-grandparent FUSE.  Three conditions must hold at once
+ * (ft-graft.h): EXACT, the graft point's PARENT compressed, and @canon
+ * compressed, with pcn->len + ccn->len <= FT_SKIP_LEN_MAX.
+ *
+ * Geometry: dst keys are prefix ++ 0xD0 ++ i with prefix {0x50,0x51}, so the
+ * run under the root's 0x50 slot is [0x51,0xD0]; the swap key spans all three
+ * bytes, so the descent consumes that run and stops on cn->child with d.pnf
+ * COMPRESSED.  The swap trie keeps a SINGLE top byte (swap_branch false) so its
+ * root canonicalizes to a COMPRESSED node -- the condition "cparent" misses,
+ * which is why that layout reports fused=0 despite having the parent right.
+ * @reseed holds the shape, which a single-top-byte swap otherwise destroys by
+ * chain-merging into the run it lands in.
+ */
+static const struct gs_layout gs_lay_fuse = {
+	"fuse", { GS_SHARED_KEY, 0x51, 0xD0 }, 2, 3, 2, false, 0, true, true
+};
+static const struct gs_layout gs_lay_fuse_solo = {
+	"fuse-solo", { GS_SHARED_KEY, 0x51, 0xD0 }, 2, 3, 1, false, 0, true, true
+};
 static const struct gs_layout gs_lay_ksfix = {
-	"ksfix", { GS_SHARED_KEY, 0x51, 0x52 }, 3, 2, 2, false, 0, true
+	"ksfix", { GS_SHARED_KEY, 0x51, 0x52 }, 3, 2, 2, false, 0, true, false
 };
 static const struct gs_layout gs_lay_ksfix_solo = {
-	"ksfix-solo", { GS_SHARED_KEY, 0x51, 0x52 }, 3, 2, 1, false, 0, true
+	"ksfix-solo", { GS_SHARED_KEY, 0x51, 0x52 }, 3, 2, 1, false, 0, true, false
 };
 static const struct gs_layout gs_lay_kshort_solo = {
-	"kshort-solo", { GS_SHARED_KEY, 0x51, 0x52 }, 3, 2, 1, false, 0, false
+	"kshort-solo", { GS_SHARED_KEY, 0x51, 0x52 }, 3, 2, 1, false, 0, false, false
 };
 
 /*
@@ -10174,10 +10266,10 @@ static const struct gs_layout gs_lay_kshort_solo = {
  * the pcn body the merged node is built from).
  */
 static const struct gs_layout gs_lay_deep = {
-	"deep", { GS_SHARED_KEY, 0x51 }, 2, 2, 2, false, 0, false
+	"deep", { GS_SHARED_KEY, 0x51 }, 2, 2, 2, false, 0, false, false
 };
 static const struct gs_layout gs_lay_deep_solo = {
-	"deep-solo", { GS_SHARED_KEY, 0x51 }, 2, 2, 1, false, 0, false
+	"deep-solo", { GS_SHARED_KEY, 0x51 }, 2, 2, 1, false, 0, false, false
 };
 
 static int inv_graft_swap_shared_dst(void)
@@ -10250,6 +10342,24 @@ static int inv_graft_swap_shared_dst_wide_nolist(void)
 {
 	return gs_shared_oracle("inv_graft_swap_shared_dst_wide_nolist",
 		/*list_on=*/ false, &gs_lay_wide);
+}
+
+static int inv_graft_swap_shared_dst_fuse(void)
+{
+	return gs_shared_oracle("inv_graft_swap_shared_dst_fuse",
+		/*list_on=*/ true, &gs_lay_fuse);
+}
+
+static int inv_graft_swap_shared_dst_fuse_nolist(void)
+{
+	return gs_shared_oracle("inv_graft_swap_shared_dst_fuse_nolist",
+		/*list_on=*/ false, &gs_lay_fuse);
+}
+
+static int inv_graft_swap_shared_dst_fuse_solo(void)
+{
+	return gs_shared_oracle("inv_graft_swap_shared_dst_fuse_solo",
+		/*list_on=*/ false, &gs_lay_fuse_solo);
 }
 
 static int inv_graft_swap_shared_dst_ksfix(void)
@@ -16890,6 +17000,9 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_graft_swap_shared_dst_cparent_nolist);
 	RUN_TEST(inv_graft_swap_shared_dst_cparent_solo);
 	RUN_TEST(inv_graft_swap_shared_dst_wide_nolist);
+	RUN_TEST(inv_graft_swap_shared_dst_fuse);
+	RUN_TEST(inv_graft_swap_shared_dst_fuse_nolist);
+	RUN_TEST(inv_graft_swap_shared_dst_fuse_solo);
 	RUN_TEST(inv_graft_swap_shared_dst_ksfix);
 	RUN_TEST(inv_graft_swap_shared_dst_ksfix_nolist);
 	RUN_TEST(inv_graft_swap_shared_dst_ksfix_solo);

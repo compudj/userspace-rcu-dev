@@ -1306,6 +1306,11 @@ unsigned long cds_ft_probe_gs_ext_child;
  */
 unsigned long cds_ft_probe_gs_pubabort;
 unsigned long cds_ft_probe_gs_pubok;
+unsigned long cds_ft_probe_gs_fuse_pcn;
+unsigned long cds_ft_probe_gs_fuse_ccn;
+unsigned long cds_ft_probe_gs_fuse_len;
+unsigned long cds_ft_probe_gs_fuse_incoh;
+unsigned long cds_ft_probe_gs_fuse_incoh_committed;
 unsigned long cds_ft_probe_gs_torn;
 unsigned long cds_ft_probe_gs_alias;
 unsigned long cds_ft_probe_gs_canon_alias;
@@ -1316,7 +1321,8 @@ static void cds_ft_probe_gs_report(void)
 	fprintf(stderr, "GSPROBE commit_ok=%lu reoccupy=%lu slot_moved=%lu "
 		"retry=%lu | pubok=%lu pubabort=%lu | torn=%lu alias=%lu canon_alias=%lu "
 		"| shapes exact=%lu kshort=%lu delegate=%lu "
-		"fused=%lu ext_child=%lu\n",
+		"fused=%lu ext_child=%lu | fuse_pcn=%lu fuse_ccn=%lu fuse_len=%lu "
+		"fuse_incoh=%lu incoh_committed=%lu\n",
 		cds_ft_probe_gs_commit_ok, cds_ft_probe_gs_reoccupy,
 		cds_ft_probe_gs_slot_moved, cds_ft_probe_gs_retry,
 		cds_ft_probe_gs_pubok, cds_ft_probe_gs_pubabort,
@@ -1324,7 +1330,10 @@ static void cds_ft_probe_gs_report(void)
 		cds_ft_probe_gs_canon_alias,
 		cds_ft_probe_gs_exact, cds_ft_probe_gs_kshort,
 		cds_ft_probe_gs_delegate, cds_ft_probe_gs_fused,
-		cds_ft_probe_gs_ext_child);
+		cds_ft_probe_gs_ext_child, cds_ft_probe_gs_fuse_pcn,
+		cds_ft_probe_gs_fuse_ccn, cds_ft_probe_gs_fuse_len,
+		cds_ft_probe_gs_fuse_incoh,
+		cds_ft_probe_gs_fuse_incoh_committed);
 }
 #endif
 

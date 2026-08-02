@@ -2313,6 +2313,11 @@ extern unsigned long cds_ft_probe_gs_ext_child;
 extern unsigned long cds_ft_probe_gs_torn;
 extern unsigned long cds_ft_probe_gs_alias;
 extern unsigned long cds_ft_probe_gs_canon_alias;
+extern unsigned long cds_ft_probe_gs_fuse_pcn;
+extern unsigned long cds_ft_probe_gs_fuse_ccn;
+extern unsigned long cds_ft_probe_gs_fuse_len;
+extern unsigned long cds_ft_probe_gs_fuse_incoh;
+extern unsigned long cds_ft_probe_gs_fuse_incoh_committed;
 #endif	/* FT_GS_PROBE_INC comes from ft-mutation-helpers.h */
 
 /*
@@ -2695,6 +2700,7 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 #ifdef FEATURE_FT_PROBE_GRAFT_SWAP
 		/* What this attempt published into the graft-point slot. */
 		struct cds_ft_inode_flag *gs_top = NULL;
+		bool gs_fuse_incoh = false;
 #endif
 
 		/*
@@ -2755,6 +2761,7 @@ retry_swap:
 				&gs_pub_old);
 #ifdef FEATURE_FT_PROBE_GRAFT_SWAP
 		gs_top = NULL;
+		gs_fuse_incoh = false;
 		if (kase == FT_GRAFT_SWAP_EXACT)
 			FT_GS_PROBE_INC(cds_ft_probe_gs_exact);
 		else if (kase == FT_GRAFT_SWAP_KEY_SHORTER)
@@ -2886,6 +2893,15 @@ retry_swap:
 				if (ft_node_compressed(canon))
 					ccn = ft_compressed_node_ptr(canon);
 			}
+#ifdef FEATURE_FT_PROBE_GRAFT_SWAP
+			if (!swap_empty && kase == FT_GRAFT_SWAP_EXACT) {
+				if (pcn) FT_GS_PROBE_INC(cds_ft_probe_gs_fuse_pcn);
+				if (ccn) FT_GS_PROBE_INC(cds_ft_probe_gs_fuse_ccn);
+				if (pcn && ccn && (unsigned int) pcn->len + ccn->len
+						<= FT_SKIP_LEN_MAX)
+					FT_GS_PROBE_INC(cds_ft_probe_gs_fuse_len);
+			}
+#endif
 			if (pcn && ccn &&
 			    (unsigned int) pcn->len + ccn->len <= FT_SKIP_LEN_MAX) {
 				struct cds_ft_metadata *pcn_meta =
@@ -2938,6 +2954,37 @@ retry_swap:
 				 * the world the fuse planned against.
 				 */
 				pub_old = *pub_slot;
+				/*
+				 * ★ THE EXPECTED-OLD CANNOT ARBITRATE THIS ON ITS OWN.
+				 * @merged encodes @pcn's bytes and length, read above;
+				 * @pub_old is a LATER, independent read of the
+				 * grandparent slot.  A peer that replaces @pcn between
+				 * the two leaves them describing different worlds -- and
+				 * the commit still SUCCEEDS, because @pub_old was read
+				 * from the peer's world and therefore matches the slot.
+				 * What lands is @merged, encoding bytes that are already
+				 * stale, over the peer's node.
+				 *
+				 * So settle the pair here: the slot must still denote the
+				 * @pcn the fuse planned against.  If it does not, nothing
+				 * is published yet (@merged is untracked and unpublished,
+				 * both glues hold only build-invisible state), so drop
+				 * this attempt and re-descend -- the same bail
+				 * ft_graft_swap_settle takes for the graft point itself.
+				 */
+				if (caa_unlikely(ft_resolve_skip_compressed(dst_ft,
+						pub_old)
+						!= ft_compressed_node_flag(pcn))) {
+					FT_GS_PROBE_INC(cds_ft_probe_gs_fuse_incoh);
+#ifdef FEATURE_FT_PROBE_GRAFT_SWAP
+					gs_fuse_incoh = true;
+#endif
+					free_compressed_node_unpublished(dst_ft, merged);
+					ft_glue_abort(dst_ft, &glue_insert);
+					ft_glue_abort(swap_ft, &glue_extract);
+					FT_GS_PROBE_INC(cds_ft_probe_gs_retry);
+					goto retry_swap;
+				}
 				merged_meta->parent = pub_parent;
 				ft_set_parent_slot(merged_meta, pub_parent, pub_slot);
 				merged_flag = ft_compressed_node_flag(merged);
@@ -3326,6 +3373,9 @@ retry_swap:
 				enum ft_graft_swap_case k2;
 
 				FT_GS_PROBE_INC(cds_ft_probe_gs_commit_ok);
+				if (gs_fuse_incoh)
+					FT_GS_PROBE_INC(
+						cds_ft_probe_gs_fuse_incoh_committed);
 				k2 = ft_graft_swap_descend(dst_ft, key, key_len,
 					&d2, &raw2);
 				if (raw2 && raw2 == gs_pub_old) {
