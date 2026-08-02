@@ -75,6 +75,7 @@
 #include <stdio.h>
 #endif
 #include <stdint.h>			/* uintptr_t */
+#include <limits.h>			/* ULONG_MAX (batch threshold default) */
 #include <sched.h>			/* sched_getcpu */
 #include <unistd.h>			/* sysconf */
 #include <sys/mman.h>			/* mmap */
@@ -189,9 +190,47 @@ struct urcu_slab_batch {
 	struct cds_lfs_node *head;	/* the batch's chain head */
 };
 
-/* Close a batch once this many blocks have accumulated (URCU_TXN_BATCH_MAX). */
+/*
+ * Close a batch once this many blocks have accumulated (URCU_TXN_BATCH_MAX).
+ *
+ * THE GRACE PERIOD IS THE BATCHING CLOCK, not this number.  A batch is also
+ * closed by urcu_slab_closer_cb(), which urcu_slab_arm_closer() arms on the
+ * first deferred free and re-arms only once the previous one has run -- so an
+ * arena closes about once per grace period under load, with the batch sizing
+ * itself to the offered rate.  That is the mechanism; the threshold is a
+ * secondary bound on top of it.
+ *
+ * And a LOW bound costs, because closing early cannot make a block reusable any
+ * sooner: it still owes a grace period from the close, so in-flight memory is
+ * rate x GP latency either way.  Closing early only buys more call_rcu()
+ * invocations for the same reclaim latency -- the cost batching exists to
+ * remove.  Measured, 48 writers, dcache add/unlink churn, interleaved reps,
+ * median of 3:
+ *
+ *	batch_max     64    1024   16384   unreachable
+ *	Mchurn/s    100.6   109.0   112.6    112.4
+ *
+ * It SATURATES: once the bound is high enough that the closer gets there first,
+ * raising it further changes nothing, and removing it entirely is worth the
+ * same as a high value.  At this rate a grace period covers well over 1024
+ * blocks per arena, so the old 1024 default was closing early and cost ~3%.
+ * The footprint is flat across the whole range (194 vs 196 MiB, reuse 99.5% vs
+ * 99.6%), so the threshold bounded throughput, not memory.
+ *
+ * Default it out of reach and let the grace period do the batching -- a
+ * constant that only matters when it is too small is better removed than
+ * tuned.  What the bound still buys is a ceiling on how long one chain can get
+ * before it is handed to a single splice, for an embedder that wants one.
+ *
+ * The cost of GP clocking is latency, not memory: a block freed just after a
+ * close waits out the current grace period plus the next, which keeps ~18% more
+ * blocks in circulation (207911 vs 176341 carved over 4 s).  That shows up in
+ * the block count and not in the mapped footprint, because the extra blocks fit
+ * in superblocks already mapped.  An embedder that cares more about reclaim
+ * latency than about call_rcu() traffic is exactly who should lower this.
+ */
 #ifndef URCU_SLAB_BATCH_MAX
-#define URCU_SLAB_BATCH_MAX	1024UL
+#define URCU_SLAB_BATCH_MAX	ULONG_MAX
 #endif
 
 struct urcu_slab_arena;
