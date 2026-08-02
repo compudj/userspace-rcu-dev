@@ -486,6 +486,10 @@ struct urcu_slab {
 	unsigned long st_a_local, st_a_refill, st_a_slow;
 	unsigned long st_f_local, st_f_slow;
 	unsigned long st_p_local, st_p_slow;
+	/* how the deferral was CLOCKED: threshold close vs the per-GP closer,
+	 * and how many call_rcu()s each cost.  This is what distinguishes a
+	 * batch_max-driven close from a grace-period-driven one. */
+	unsigned long st_close_thresh, st_close_gp, st_arm;
 };
 
 #ifdef URCU_TXN_CACHE_STATS
@@ -624,6 +628,16 @@ void urcu_slab_stats_dump(void)
 			  100.0 * (double) fl / (double) (fl + fs + 1),
 			  s->name, pl, ps,
 			  100.0 * (double) pl / (double) (pl + ps + 1));
+		}
+		{
+			unsigned long ct = s->st_close_thresh, cg = s->st_close_gp,
+				ar = s->st_arm, tot = ct + cg + ar;
+
+			fprintf(stderr,
+			  "[slab %s]   clock: threshold-closes=%lu gp-closes=%lu"
+			  " closer-arms=%lu | call_rcu total=%lu (%.1f%% threshold)\n",
+			  s->name, ct, cg, ar, tot,
+			  tot ? 100.0 * (double) ct / (double) tot : 0.0);
 		}
 		if (s->ncpu > 0 && s->arenas)
 			urcu_slab_census(s);
@@ -1083,8 +1097,10 @@ void urcu_slab_arm_closer(struct urcu_slab *s, struct urcu_slab_arena *a)
 	if (!call_rcu_fn)
 		return;				/* nobody uses free_pending here */
 	if (!uatomic_load(&a->close_queued, CMM_RELAXED) &&
-			uatomic_cmpxchg(&a->close_queued, 0, 1) == 0)
+			uatomic_cmpxchg(&a->close_queued, 0, 1) == 0) {
+		URCU_SLAB_STAT(s, arm);
 		call_rcu_fn(&a->close_head, urcu_slab_closer_cb);
+	}
 }
 
 /*
@@ -1671,7 +1687,8 @@ void urcu_slab_closer_cb(struct rcu_head *head)
 		cpu = rseq_current_cpu_raw();
 #endif
 	uatomic_store(&a->close_queued, 0, CMM_SEQ_CST);
-	(void) urcu_slab_close_arena(s, a, cpu);
+	if (urcu_slab_close_arena(s, a, cpu))
+		URCU_SLAB_STAT(s, close_gp);
 	/*
 	 * Clear before re-checking, so a push racing us either sees
 	 * close_queued == 0 and arms a closer itself, or landed early enough
@@ -1926,8 +1943,10 @@ counted:
 		 */
 		uatomic_store(&a->nr_pending, 0, CMM_RELAXED);
 		uatomic_store(&a->close_local_req, 0, CMM_RELAXED);
-		if (urcu_slab_close_arena(a->slab, a, cpu))
+		if (urcu_slab_close_arena(a->slab, a, cpu)) {
+			URCU_SLAB_STAT(a->slab, close_thresh);
 			return;
+		}
 		/*
 		 * Nothing closed: the arena was already being closed by someone
 		 * who may have sampled the head before our push, or take_floor
