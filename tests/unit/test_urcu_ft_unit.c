@@ -68,13 +68,13 @@
 #endif
 
 /*
- * 291 unconditional + 49 fault-injection-only RUN_TEST registrations, on top of
+ * 292 unconditional + 49 fault-injection-only RUN_TEST registrations, on top of
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (340 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (341 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (291 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (292 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -10966,6 +10966,142 @@ out:
 	rcu_barrier();
 	cds_ft_destroy(ft);
 	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
+ * A COMPRESSED subtree top, moved by the atomic rekey -- and the encoding is what
+ * decides whether it is in scope, so this test asserts BOTH outcomes.
+ *
+ * The source prefix here has a single child byte, so the trie path-compresses it:
+ * the slot at {SX,SY} holds a compressed run covering byte2, whose one child is
+ * the branch below.  ft_rekey_cow_stop copies that run and its child and records
+ * the one re-parent, which is also what re-points the skip back-channel -- the
+ * copy loop is the same shape as the bitmap arms with a single child.
+ *
+ * WHY NO SKIP-ENCODED CASE IS NEEDED HERE, and the group is EAGER on purpose.  The
+ * skip encoding -- which names a run's CHILD rather than the run itself -- is a
+ * property of the GROUP, and cds_ft_group_attr_set_lookup_optimization CLEARS
+ * CDS_FT_FLAG_SKIP_COMPRESSED for EAGER.  A rekey requires EAGER (it cannot rewrite
+ * an app-owned stored key), so every compressed run a rekey can ever meet is
+ * published PLAIN.  The refusal cow_stop's caller keeps for the skip form is
+ * therefore a guard on an unreachable shape, not a scope limit -- which is also why
+ * this test needs one arm rather than one per build.
+ *
+ * The COW's own purpose is asserted: the value at the destination must not be the
+ * one that was at the source.  A fresh address is what the coherent reader's
+ * two-descent witness needs to see a move at all.
+ */
+static int test_rekey_compressed_stop(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	uint8_t src_key[2] = { RK_SX, RK_SY }, dst_key[2] = { RK_DX, RK_DZ };
+	uint64_t k0, k1;
+	void *before, *after;
+	enum cds_ft_status s;
+	int i, ret = -1;
+
+	if (!cds_ft_merge_enabled()) {
+		diag("test_rekey_compressed_stop: skipped, merge compiled out "
+			"(-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
+	{
+		/* EAGER: what a rekey requires, and what makes the run PLAIN. */
+		struct cds_ft_group_attr *gattr;
+
+		if (cds_ft_group_attr_create(&gattr) < 0)
+			abort();
+		if (cds_ft_group_attr_set_key_len(gattr, 4) < 0 ||
+				cds_ft_group_attr_set_lookup_optimization(gattr,
+					CDS_FT_LOOKUP_OPTIMIZE_EAGER) < 0 ||
+				cds_ft_group_attr_set_writer_strategy(gattr,
+					CDS_FT_WRITER_LOCK_FINE) < 0 ||
+				cds_ft_group_attr_set_ordered_list(gattr, false) < 0)
+			abort();
+		if (cds_ft_group_create(gattr, &group) < 0)
+			abort();
+		cds_ft_group_attr_destroy(gattr);
+		if (cds_ft_create(group, NULL, &ft) < 0)
+			abort();
+	}
+	/* One shared byte2 under the source prefix -> the run compresses. */
+	k0 = ((uint64_t) RK_SX << 24) | ((uint64_t) RK_SY << 16) |
+		(0x07ULL << 8) | 0x03ULL;
+	k1 = ((uint64_t) RK_SX << 24) | ((uint64_t) RK_SY << 16) |
+		(0x07ULL << 8) | 0x09ULL;
+	rcu_read_lock();
+	if (insert_u64(ft, k0, node_alloc(k0)) != CDS_FT_STATUS_OK ||
+			insert_u64(ft, k1, node_alloc(k1)) != CDS_FT_STATUS_OK)
+		abort();
+	for (i = 0; i < RK_NSIB; i++) {			/* junction survives */
+		uint64_t sk = ((uint64_t) RK_SX << 24) |
+			((uint64_t) (i + 5) << 16);
+
+		if (insert_u64(ft, sk, node_alloc(sk)) != CDS_FT_STATUS_OK)
+			abort();
+	}
+	for (i = 1; i <= 2; i++) {			/* dst parent children */
+		uint64_t dk = ((uint64_t) RK_DX << 24) | ((uint64_t) i << 16);
+
+		if (insert_u64(ft, dk, node_alloc(dk)) != CDS_FT_STATUS_OK)
+			abort();
+	}
+	before = _cds_ft_debug_child_at(ft, src_key, 2);
+	rcu_read_unlock();
+	if (!before) {
+		fprintf(stderr, "rekey_compressed: no subtree at the source\n");
+		goto out;
+	}
+
+	s = cds_ft_rekey_graft(ft, dst_key, 2, src_key, 2);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "rekey_compressed: refused (%s)\n",
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+	rcu_read_lock();
+	after = _cds_ft_debug_child_at(ft, dst_key, 2);
+	if (!after || after == before) {
+		fprintf(stderr, "rekey_compressed: the moved top kept its address\n");
+		rcu_read_unlock();
+		goto out;
+	}
+	for (i = 0; i < 2; i++) {
+		uint64_t moved = ((uint64_t) RK_DX << 24) |
+			((uint64_t) RK_DZ << 16) | (0x07ULL << 8) |
+			(i ? 0x09ULL : 0x03ULL);
+		struct cds_ft_node *f = NULL;
+
+		if (lookup_u64(ft, moved, &f) != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "rekey_compressed: moved key %d absent\n", i);
+			rcu_read_unlock();
+			goto out;
+		}
+	}
+	if (lookup_u64(ft, k0, (struct cds_ft_node **) &after) ==
+			CDS_FT_STATUS_OK) {
+		fprintf(stderr, "rekey_compressed: source key still present\n");
+		rcu_read_unlock();
+		goto out;
+	}
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "rekey_compressed: verify failed\n");
+		rcu_read_unlock();
+		goto out;
+	}
+	if (cds_ft_count_keys(ft) != (unsigned long) (2 + RK_NSIB + 2)) {
+		fprintf(stderr, "rekey_compressed: count %lu != %d\n",
+			cds_ft_count_keys(ft), 2 + RK_NSIB + 2);
+		rcu_read_unlock();
+		goto out;
+	}
+	rcu_read_unlock();
+	ret = 0;
+out:
+	if (drain_and_destroy(ft, group) < 0)
+		ret = -1;
 	return ret;
 }
 
@@ -30781,6 +30917,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_rekey_fixed_len_atomic_or_refused);
 	RUN_TEST(test_rekey_varlen_ordered_splice);
 	RUN_TEST(test_rekey_abutting_dst_keeps_list_order);
+	RUN_TEST(test_rekey_compressed_stop);
 	RUN_TEST(test_merge_rekey_same_trie_ordered);
 	RUN_TEST(test_merge_rekey_same_trie_listoff_collision);
 	RUN_TEST(test_nonidentity_bulk_ops);

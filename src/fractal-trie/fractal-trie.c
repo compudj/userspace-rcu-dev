@@ -446,6 +446,22 @@ int ft_rekey_prefix_range_cmp(const uint8_t *kb, size_t klen,
 }
 
 /*
+ * Free the UNPUBLISHED S_top copy ft_rekey_cow_stop made, whichever kind it is.
+ * The two kinds come from different arenas, and the compressed one is handed back
+ * as a plain node flag precisely so this inversion is safe (see cow_stop).
+ */
+static
+void ft_rekey_free_stop_prime(struct cds_ft *ft, struct cds_ft_inode_flag *nf)
+{
+	if (!nf)
+		return;
+	if (ft_node_compressed(nf))
+		free_compressed_node_unpublished(ft, ft_compressed_node_ptr(nf));
+	else
+		free_cds_ft_node_unpublished(ft, ft_node_ptr(nf));
+}
+
+/*
  * Order two key SUFFIXES the way the trie orders keys: bytes over the common
  * length, and on a tie the shorter one first.
  */
@@ -653,6 +669,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 * position alone -- see the splice-position derivation.
 	 */
 	bool run_keeps_pos = false;
+	bool s_top_compressed = false;	/* the moved top is a compressed run */
 	/*
 	 * +2, not +1: cow_stop can fill S_top plus all FT_ENTRY_PER_NODE of its
 	 * children, and the GLUE shape adds the split cluster's one displaced child.
@@ -726,17 +743,38 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	}
 	s_top = d_src.nf;
 	if (!s_top || d_src.depth != src_len || ft_node_flip_proxy(s_top) ||
-			ft_node_external(s_top) || ft_node_compressed(s_top))
+			ft_node_external(s_top))
 		return -EINVAL;
+	/*
+	 * A COMPRESSED S_top is in scope: ft_rekey_cow_stop copies the run and its
+	 * one child, and the one re-parent it records is also what re-points the
+	 * skip back-channel, so nothing about the encoding needs recomputing.
+	 *
+	 * The SKIP-ENCODED slot form is refused, and that refusal guards a shape a
+	 * REKEY CANNOT REACH rather than narrowing this cut.  The encoding is a GROUP
+	 * property, and cds_ft_group_attr_set_lookup_optimization CLEARS
+	 * CDS_FT_FLAG_SKIP_COMPRESSED for EAGER; a rekey requires EAGER, because it
+	 * re-parents a leaf without being able to rewrite an app-owned stored key.
+	 * So every compressed run a rekey meets was published PLAIN.  Keep the check:
+	 * it is cheap, and it is what stops the accessor mismatch below from becoming
+	 * a wild read if that coupling ever changes.
+	 */
+	if (ft_node_compressed(s_top)) {
+		s_top_compressed = true;
+	} else {
 #ifdef FEATURE_FT_SKIP_COMPRESSED
-	if (ft_node_skip_compressed(s_top))
-		return -EINVAL;
+		if (ft_node_skip_compressed(s_top))
+			return -EINVAL;
 #endif
-	ti = ft_node_type(s_top);
-	if (ft_types[ti].type_class != FT_POPCOUNT &&
-			ft_types[ti].type_class != FT_PIGEON)
-		return -EINVAL;
-	s_top_meta = cds_ft_item_to_metadata(ft_node_ptr(s_top));
+		ti = ft_node_type(s_top);
+		if (ft_types[ti].type_class != FT_POPCOUNT &&
+				ft_types[ti].type_class != FT_PIGEON)
+			return -EINVAL;
+	}
+	s_top_meta = s_top_compressed ?
+		cds_ft_item_to_metadata((struct cds_ft_inode *)
+			ft_compressed_node_ptr(s_top)) :
+		cds_ft_item_to_metadata(ft_node_ptr(s_top));
 	if (s_top_meta->external_nodes)
 		return -EINVAL;			/* cow_stop sub-step-2 scope */
 
@@ -813,6 +851,18 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		 */
 		if (merge_dst && require_empty)
 			return -EEXIST;
+		/*
+		 * A COMPRESSED S_top is in scope for the GRAFT arm only.  The merge arm
+		 * skips ft_rekey_cow_stop on the argument that ft_merge_build gives the
+		 * moved top a fresh address BY CONSTRUCTION -- and that argument names
+		 * its premise: "entered with an internal, non-compressed S_top,
+		 * ft_merge_build cannot take either of the two exits that return a live
+		 * node (the shared-run collapse needs BOTH SIDES COMPRESSED...)".  A
+		 * compressed S_top is exactly what unlocks that exit, so the freshness
+		 * the coherent reader's witness depends on would be gone.
+		 */
+		if (merge_dst && s_top_compressed)
+			return -EINVAL;
 #ifndef FEATURE_FT_MERGE
 		/*
 		 * An OCCUPIED destination IS a merge (INCREMENT 3 unions S_top
@@ -1459,9 +1509,8 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 			 * glue build, destroy the txn.  (prepare failure freed its own
 			 * invisible build + left glue clean.)
 			 */
-			if (s_top_prime)	/* NULL on the merge path: no COW */
-				free_cds_ft_node_unpublished(ft,
-					ft_node_ptr(s_top_prime));
+			/* NULL on the merge path: no COW */
+			ft_rekey_free_stop_prime(ft, s_top_prime);
 			ft_glue_abort(ft, &glue);
 	if (src_glue_live) {		/* merged cluster's src side */
 		ft_glue_abort(ft, &src_glue);
@@ -1523,8 +1572,8 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		 * gate rejects it up front, before any of this is built.
 		 */
 		pp_meta = NULL;		/* ft_glue_abort below is the single owner */
-		if (s_top_prime)		/* NULL on the merge path: no COW */
-			free_cds_ft_node_unpublished(ft, ft_node_ptr(s_top_prime));
+		/* NULL on the merge path: no COW */
+		ft_rekey_free_stop_prime(ft, s_top_prime);
 		if (gst_st.old_recompacted_node)
 			free_cds_ft_node_unpublished(ft, ft_node_ptr(gst_st.dest));
 		ft_glue_abort(ft, &glue);
@@ -1614,9 +1663,8 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		if (src_pred == ft_ord_or_sentinel(ft, run_dpred) ||
 				src_succ == ft_ord_or_sentinel(ft, run_dsucc)) {
 			pp_meta = NULL;		/* ft_glue_abort: single owner */
-			if (s_top_prime)	/* NULL on the merge path: no COW */
-				free_cds_ft_node_unpublished(ft,
-					ft_node_ptr(s_top_prime));
+			/* NULL on the merge path: no COW */
+			ft_rekey_free_stop_prime(ft, s_top_prime);
 			if (gst_st.old_recompacted_node)
 				free_cds_ft_node_unpublished(ft,
 					ft_node_ptr(gst_st.dest));
@@ -1698,9 +1746,8 @@ cells_done:
 			 * bail_build's own clear cannot double up.
 			 */
 			pp_meta = NULL;
-			if (s_top_prime)	/* NULL on the merge path: no COW */
-				free_cds_ft_node_unpublished(ft,
-					ft_node_ptr(s_top_prime));
+			/* NULL on the merge path: no COW */
+			ft_rekey_free_stop_prime(ft, s_top_prime);
 			if (detach_rc.new_flag)
 				free_cds_ft_node_unpublished(ft,
 					ft_node_ptr(detach_rc.new_flag));
@@ -1811,8 +1858,8 @@ cells_done:
 		 * tombstones rolled back), so they are NOT freed here.  Unreachable under
 		 * the single-writer contract, kept leak-free for future concurrent use.
 		 */
-		if (s_top_prime)		/* NULL on the merge path: no COW */
-			free_cds_ft_node_unpublished(ft, ft_node_ptr(s_top_prime));
+		/* NULL on the merge path: no COW */
+		ft_rekey_free_stop_prime(ft, s_top_prime);
 		if (gst_st.old_recompacted_node)
 			free_cds_ft_node_unpublished(ft, ft_node_ptr(gst_st.dest));
 		if (detach_rc.new_flag)
@@ -1851,8 +1898,8 @@ bail_build:
 	 * Disown and let the choke point do it.
 	 */
 	pp_meta = NULL;
-	if (s_top_prime)		/* NULL on the merge path: no COW */
-		free_cds_ft_node_unpublished(ft, ft_node_ptr(s_top_prime));
+	/* NULL on the merge path: no COW */
+	ft_rekey_free_stop_prime(ft, s_top_prime);
 	ft_glue_abort(ft, &glue);
 			if (src_glue_live) {	/* merged cluster's src side */
 				ft_glue_abort(ft, &src_glue);

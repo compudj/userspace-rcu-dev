@@ -2326,9 +2326,22 @@ struct cds_ft_metadata *ft_child_state_meta(struct cds_ft *ft,
  *    unpublished copy (if any) is already freed, nothing is published; the caller
  *    still sweeps @marks.
  *
- * SUB-STEP-2 SCOPE: @stop is an internal POPCOUNT / PIGEON node with no
- * co-located external list.  [sub-step-3 TODO: compressed / skip / external-head
- * S_top -- the copy loop and external back-channel need recompact's extra arms.]
+ * SCOPE: @stop is an internal POPCOUNT / PIGEON node with no co-located external
+ * list, or a PLAIN COMPRESSED one.  [TODO: an external-head S_top, and a
+ * co-located external list, still need recompact's extra arms.]
+ *
+ * THE COMPRESSED ARM IS THE SAME SHAPE WITH ONE CHILD.  A compressed node carries
+ * a key-byte run and a single child, so the copy is len + key_bytes + that child,
+ * and the mark/re-parent sweep runs once instead of over a bitmap.  Three things
+ * are particular to it:
+ *  - the CHILD COUNT is metadata, so setting ->child does not maintain it the way
+ *    the bitmap arms' set_nth calls do; cds_ft_verify cross-checks it.
+ *  - the caller gets the PLAIN node flag back.  The skip form cannot be inverted
+ *    before the commit (it names the child, and the node is recovered through that
+ *    child's back-pointer, which still names the original), so a caller freeing
+ *    the copy on a later bail would free the live original.
+ *  - a SKIP-encoded @stop never arrives: the encoding is a group property that
+ *    EAGER clears, and a rekey requires EAGER.  Asserted, not handled.
  */
 static
 int ft_rekey_cow_stop(struct cds_ft *ft, struct ft_flip_txn *txn,
@@ -2337,9 +2350,22 @@ int ft_rekey_cow_stop(struct cds_ft *ft, struct ft_flip_txn *txn,
 		struct cds_ft_metadata **marks, uintptr_t *snaps,
 		unsigned int *nr_marks)
 {
-	unsigned int ti = ft_node_type(stop_flag);
+	bool compressed = ft_node_compressed(stop_flag);
+	/*
+	 * ft_compressed_node_ptr, NOT ft_skip_to_compressed: the two accessors are
+	 * not interchangeable.  The skip one masks the length bits off and treats
+	 * what is left as the run's CHILD, recovering the node through that child's
+	 * back-pointer -- so handing it a PLAIN compressed flag makes it read a
+	 * child pointer out of a flag that is not one (measured: a segfault in the
+	 * first re-parent, on a garbage child).  A skip-encoded @stop_flag never
+	 * arrives here; the caller's shape gate refuses it.
+	 */
+	struct cds_ft_compressed_node *stop_cn = compressed ?
+		ft_compressed_node_ptr(stop_flag) : NULL;
+	unsigned int ti = compressed ? 0 : ft_node_type(stop_flag);
 	const struct cds_ft_type *type = &ft_types[ti];
-	struct cds_ft_inode *stop_node = ft_node_ptr(stop_flag);
+	struct cds_ft_inode *stop_node = compressed ?
+		(struct cds_ft_inode *) stop_cn : ft_node_ptr(stop_flag);
 	struct cds_ft_metadata *stop_meta = cds_ft_item_to_metadata(stop_node);
 	struct cds_ft_inode *new_node = NULL;
 	struct cds_ft_metadata *new_meta;
@@ -2352,8 +2378,12 @@ int ft_rekey_cow_stop(struct cds_ft *ft, struct ft_flip_txn *txn,
 	*stop_prime_ret = NULL;
 	*nr_marks = 0;
 	assert(ft->lock_fine && txn->structural_sw);
-	assert(type->type_class == FT_POPCOUNT || type->type_class == FT_PIGEON);
-	assert(stop_meta->external_nodes == NULL);	/* sub-step-2 scope */
+	assert(compressed || type->type_class == FT_POPCOUNT ||
+		type->type_class == FT_PIGEON);
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+	assert(!ft_node_skip_compressed(stop_flag));	/* caller's gate */
+#endif
+	assert(stop_meta->external_nodes == NULL);	/* scope */
 
 	/* 1. Acquire @stop's retire lock -- the fence BEFORE any body read. */
 	if (ft_meta_lock_acquire(stop_meta, &stop_snap))
@@ -2364,10 +2394,82 @@ int ft_rekey_cow_stop(struct cds_ft *ft, struct ft_flip_txn *txn,
 	*nr_marks = nm;
 
 	/* <=2 edges/child (parent + pso) + 1 retire; caller reserves its publish. */
-	if (!ft_flip_txn_reserve_extra(txn,
+	if (!ft_flip_txn_reserve_extra(txn, compressed ? 2 + 1 :
 			2 * ft_meta_nr_child_load(stop_meta) + 1)) {
 		ret = -ENOMEM;
 		goto out;
+	}
+
+	if (compressed) {
+		/*
+		 * 2'. + 3'. + 4'.  The one-child form: copy the run and its child,
+		 *     then mark and re-parent that child.  The source child is read
+		 *     RESOLVED through the txn for the same reason the bitmap arms
+		 *     resolve theirs -- a peer's parked flip proxy must never be
+		 *     embedded in the copy.
+		 */
+		struct cds_ft_compressed_node *new_cn;
+		struct cds_ft_inode_flag *child;
+		struct cds_ft_metadata *cm;
+		void *resolved;
+
+		new_cn = alloc_compressed_node(ft, stop_cn->len, &new_meta);
+		if (!new_cn) {
+			ret = -ENOMEM;
+			goto out;
+		}
+		new_node = (struct cds_ft_inode *) new_cn;
+		new_cn->len = stop_cn->len;
+		memcpy(new_cn->key_bytes, stop_cn->key_bytes, stop_cn->len);
+		if (!ft_flip_txn_resolve_prio(txn, (void **) &stop_cn->child,
+				&resolved)) {
+			ret = -EAGAIN;
+			goto abandon;
+		}
+		child = (struct cds_ft_inode_flag *) resolved;
+		new_cn->child = child;
+		/*
+		 * The child count is metadata, not a body field, so setting ->child
+		 * does not maintain it the way the bitmap arms' set_nth calls do --
+		 * and cds_ft_verify cross-checks it against cn->child's presence
+		 * ("compressed node nr_child 0 does not match cn->child presence").
+		 * Carry it over as ft_compact's clone does; it is 1 for a compressed
+		 * node.
+		 */
+		ft_meta_nr_child_set(new_meta, ft_meta_nr_child(stop_meta));
+		ft_nr_keys_store(ft, new_meta, ft_nr_keys_get(stop_meta),
+			CMM_RELAXED);
+		new_flag = ft_compressed_node_flag(new_cn);
+		cm = ft_child_state_meta(ft, child);
+		if (cm) {
+			uintptr_t csnap;
+
+			if (ft_meta_lock_acquire(cm, &csnap)) {
+				ret = -EAGAIN;
+				goto abandon;
+			}
+			marks[nm] = cm;
+			snaps[nm] = csnap;
+			nm++;
+			*nr_marks = nm;
+		}
+		ft_reparent_record(ft, txn, child, new_flag, &new_cn->child,
+			/*child_marked=*/ cm != NULL);
+		/*
+		 * 5'. Retire @stop and hand back the NODE flag, not the skip-encoded
+		 *     slot form.
+		 *
+		 * ★ THE SKIP FORM IS NOT INVERTIBLE HERE, which is why the caller gets
+		 * the plain one.  A skip value names the CHILD plus the run length, and
+		 * ft_skip_to_compressed recovers the node through that child's
+		 * back-pointer -- which, until this txn commits, still names the OLD
+		 * node.  A caller that had to free the copy on a later bail would
+		 * therefore resolve the skip flag to the LIVE ORIGINAL and free that.
+		 * The plain flag inverts with ft_compressed_node_ptr and cannot.
+		 */
+		ft_flip_txn_record_tombstone_locked(txn, stop_meta, stop_snap);
+		*stop_prime_ret = new_flag;
+		return 0;
 	}
 
 	/* 2. Fresh same-type, same-capacity copy (zeroed; body rebuilt below). */
@@ -2532,7 +2634,12 @@ int ft_rekey_cow_stop(struct cds_ft *ft, struct ft_flip_txn *txn,
 	return 0;
 
 abandon:
-	free_cds_ft_node_unpublished(ft, new_node);
+	/* Each kind to its own arena: a compressed copy came from the other one. */
+	if (compressed)
+		free_compressed_node_unpublished(ft,
+			(struct cds_ft_compressed_node *) new_node);
+	else
+		free_cds_ft_node_unpublished(ft, new_node);
 out:
 	return ret;	/* marks[0..*nr_marks) swept by the caller */
 }
