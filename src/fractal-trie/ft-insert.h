@@ -606,7 +606,18 @@ int ft_insert_dlm_acquire_split(struct cds_ft *ft,
 		p_meta = ft_flag_to_metadata(ft, pf_p);
 
 	/* ACQUIRE {CN, P} + the read-set guard CN.parent==P in one MCAS. */
-	acq = ft_flip_txn_create_bounded(2 /*locks*/ + 1 /*guard*/);
+	/*
+	 * Bind the ACQUIRE to the op's PERSISTENT handle when there is one.  A
+	 * per-attempt handle is domain-less and is never begin/end-bracketed, so
+	 * it neither ages nor consults the escalation lane -- the acquire is then
+	 * a participant the lane cannot order, and a peer can hold a lock-set
+	 * member while a lane-holding writer spins for it.  @ic->txn is not live
+	 * at this point (the commit is armed later), so the op carries only this
+	 * txn's records here.
+	 */
+	acq = ic && ic->op ? ft_flip_txn_create_bounded_on(ic->op,
+				2 /*locks*/ + 1 /*guard*/)
+			: ft_flip_txn_create_bounded(2 /*locks*/ + 1 /*guard*/);
 	if (!acq)
 		return -ENOMEM;
 	dret = ft_dlm_lock(acq, cn_meta, cn_fence);
