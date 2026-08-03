@@ -3120,10 +3120,11 @@ insert_done:
 			ic.txn = NULL;
 		}
 		/*
-		 * Age the pre-commit conflict exactly as a commit ABORT would,
-		 * keeping the FIFO turn (urcu_txn_conflict): without it a
-		 * writer that keeps bailing on the same hot slot never
-		 * advances txn->retry, never escalates, and can livelock.
+		 * Age the pre-commit conflict (urcu_txn_conflict): without it a
+		 * writer that keeps bailing on the same hot slot never advances
+		 * txn->retry, never escalates, and can livelock.  Aging is all
+		 * it does here -- the bail forfeits the FIFO turn, because the
+		 * re-descend below asks a peer for the position it just lost.
 		 */
 		urcu_txn_conflict(&optxn);
 		urcu_txn_end(&optxn);

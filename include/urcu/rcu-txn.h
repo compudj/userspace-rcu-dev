@@ -290,7 +290,7 @@ struct urcu_txn {
 	struct cds_fair_mutex_node waiter;	/* our node while awaiting the turn */
 	int in_fallback;		/* we currently hold the lane */
 	int fb_published;		/* we raised domain->active and owe the clear */
-	int retrying;			/* commit asked retry: keep the turn */
+	int retrying;			/* a COMMIT aborted and asks to re-attempt: keep the turn */
 	uint64_t ryw_bloom[URCU_TXN_BLOOM_WORDS];	/* read-your-own-writes filter */
 	int disjoint;			/* write set touches DISTINCT slots */
 	unsigned int nload;		/* loads issued by the CURRENT attempt */
@@ -1003,15 +1003,27 @@ enum urcu_txn_status urcu_txn_commit_sw(struct urcu_txn *txn)
 
 /*
  * Note a contention retry that abandons the attempt BEFORE commit.  Advances
- * aging and keeps the FIFO turn exactly as a commit ABORT does.  Call after the
+ * aging, and FORFEITS the FIFO turn: end() releases the lane.  Call after the
  * guard fires and before end(), then end()+begin() and re-attempt.
+ *
+ * Why a pre-commit retry must not keep the turn.  @retrying exists so that a
+ * commit that ABORTED may re-attempt without competition -- it re-runs a plan
+ * it already carried all the way to install.  A pre-commit bail is the opposite
+ * case: the attempt gave up because a peer holds something it needs (an
+ * embedder's node lock, a moved position), so it will re-descend and ask for
+ * that same resource again.  Holding the lane across that ask is a circular
+ * wait -- the holder it is waiting for is queued behind the very turn it keeps.
+ *
+ * The two are distinguished for free: begin() clears @retrying, and only the
+ * commit paths set it.  So a commit ABORT followed by this call still keeps the
+ * turn (@retrying is already 1), while an attempt that never reached a commit
+ * forfeits it.
  */
 static inline
 void urcu_txn_conflict(struct urcu_txn *txn)
 {
 	urcu_txn__learn_cost(txn);
 	txn->retry++;
-	txn->retrying = 1;
 }
 
 /* High-water cost across completed attempts: loads + write-set records. */

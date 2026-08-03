@@ -110,8 +110,10 @@ single mask-compare on the hot path.
   first → remover's freeze-CAS fails → re-reads, abandons collapse) is automatic.
 - **Duplicate-chain leaf:** the append uses the guarded form on `tail->next`
   (the word the appender CASes is the freed node's own `next`) so appending onto a
-  dying tail aborts. `urcu_txn_conflict()` on a fired guard advances retry + keeps
-  the FIFO turn (livelock-free).
+  dying tail aborts. `urcu_txn_conflict()` on a fired guard advances retry so the
+  writer still ages into the lane; it does NOT keep the FIFO turn, because the
+  re-attempt asks a peer for the position it just lost and holding the turn
+  across that ask is a circular wait.
 - **Atomic detach:** fold each freeze mark into the SAME `urcu_txn` as the unlink
   (today they are separate lone-edge flips — "the bridge"). The node goes
   LIVE→DEAD atomically with removal, so a concurrent writer sees live-or-dead, never

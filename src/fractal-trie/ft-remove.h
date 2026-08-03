@@ -3675,7 +3675,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 		s = _cds_ft_remove_locked(ft, iter, node, &need_retry);
 		if (!need_retry)
 			break;
-		/* Age the conflict, keep the FIFO turn, close the attempt. */
+		/* Age the conflict, forfeit the turn, close the attempt. */
 		urcu_txn_conflict(&optxn);
 		urcu_txn_end(&optxn);
 	}

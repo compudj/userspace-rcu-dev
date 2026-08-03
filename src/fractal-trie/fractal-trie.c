@@ -1693,7 +1693,7 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 			dst_key, dst_len, &optxn);
 		if (ret != -EAGAIN && ret != -EIO)
 			break;
-		/* Age the conflict and keep the turn, as cds_ft_replace does. */
+		/* Age the conflict, as cds_ft_replace does; the turn is forfeited. */
 		urcu_txn_conflict(&optxn);
 		urcu_txn_end(&optxn);
 	}
