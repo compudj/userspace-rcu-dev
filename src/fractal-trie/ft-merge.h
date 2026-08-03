@@ -3458,8 +3458,35 @@ enum cds_ft_status cds_ft_rekey_graft(struct cds_ft *ft,
 		const uint8_t *src_key, size_t src_key_len)
 {
 #ifdef FEATURE_FT_MERGE
-	return ft_merge_at_inner(ft, dst_key, dst_key_len, ft,
+	enum cds_ft_status status;
+
+	/*
+	 * ARM THE MOVE GATE.  A rekey is an IN-TRIE move: the same keys leave
+	 * one position and appear at another, and a reader walking the old path
+	 * must not conclude not-found.  ft_move_gate_enter publishes
+	 * @move_active and waits ONE grace period, so every reader already in a
+	 * critical section -- which may have branched to the FAST, non-verifying
+	 * lookup -- finishes before anything moves; readers that start after it
+	 * see the gate and take the two-pass path, which rematerializes the key
+	 * on the up-walk and re-descends when the bytes disagree.  A burst of
+	 * concurrent rekeys pays ~one grace period between them.
+	 *
+	 * Without this the two-pass machinery is unreachable in production: the
+	 * coherent lookup specializations are selected by @rekey_coherence but
+	 * ENTERED only under ft_move_active(), and until now the only callers of
+	 * the gate were the _cds_ft_debug_* test entries.
+	 *
+	 * CALLER CONTRACT, inherent to the gate: this BLOCKS on a grace period,
+	 * so it must not be called from inside an RCU read-side critical section
+	 * -- the grace period would wait on the caller's own section.  The
+	 * cross-trie cds_ft_merge_at has no such contract: its source is
+	 * exclusive, so it moves no live key and arms no gate.
+	 */
+	ft_move_gate_enter(ft);
+	status = ft_merge_at_inner(ft, dst_key, dst_key_len, ft,
 			src_key, src_key_len, NULL, FT_REKEY_GRAFT);
+	ft_move_gate_exit(ft);
+	return status;
 #else
 	(void) ft; (void) dst_key; (void) dst_key_len;
 	(void) src_key; (void) src_key_len;
@@ -3472,8 +3499,35 @@ enum cds_ft_status cds_ft_rekey_merge(struct cds_ft *ft,
 		const uint8_t *src_key, size_t src_key_len)
 {
 #ifdef FEATURE_FT_MERGE
-	return ft_merge_at_inner(ft, dst_key, dst_key_len, ft,
+	enum cds_ft_status status;
+
+	/*
+	 * ARM THE MOVE GATE.  A rekey is an IN-TRIE move: the same keys leave
+	 * one position and appear at another, and a reader walking the old path
+	 * must not conclude not-found.  ft_move_gate_enter publishes
+	 * @move_active and waits ONE grace period, so every reader already in a
+	 * critical section -- which may have branched to the FAST, non-verifying
+	 * lookup -- finishes before anything moves; readers that start after it
+	 * see the gate and take the two-pass path, which rematerializes the key
+	 * on the up-walk and re-descends when the bytes disagree.  A burst of
+	 * concurrent rekeys pays ~one grace period between them.
+	 *
+	 * Without this the two-pass machinery is unreachable in production: the
+	 * coherent lookup specializations are selected by @rekey_coherence but
+	 * ENTERED only under ft_move_active(), and until now the only callers of
+	 * the gate were the _cds_ft_debug_* test entries.
+	 *
+	 * CALLER CONTRACT, inherent to the gate: this BLOCKS on a grace period,
+	 * so it must not be called from inside an RCU read-side critical section
+	 * -- the grace period would wait on the caller's own section.  The
+	 * cross-trie cds_ft_merge_at has no such contract: its source is
+	 * exclusive, so it moves no live key and arms no gate.
+	 */
+	ft_move_gate_enter(ft);
+	status = ft_merge_at_inner(ft, dst_key, dst_key_len, ft,
 			src_key, src_key_len, NULL, FT_REKEY_MERGE);
+	ft_move_gate_exit(ft);
+	return status;
 #else
 	(void) ft; (void) dst_key; (void) dst_key_len;
 	(void) src_key; (void) src_key_len;
