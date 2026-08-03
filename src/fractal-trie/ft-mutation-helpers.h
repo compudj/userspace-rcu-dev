@@ -4383,16 +4383,23 @@ unsigned long ft_node_key_count(struct cds_ft *ft, struct cds_ft_inode_flag *c)
 }
 
 /*
- * Fill @r with a generous SUPERSET of the nodes a bulk op's commit can allocate
- * -- CDS_FT_ALLOC_RESERVE_CAP of every internal node type (its own order +
- * bitmap), the minimal order, and (speculative groups) the compressed-node
- * orders.  Drawn before the op's last fallible step, this lets the commit draw
- * and never fail on an arena allocation, so nothing after that step needs a
- * reader-observable rollback.  Used by the same-trie rekey (before its detach)
- * and by ft_graft_keylen's NOSPLIT attach (before it publishes the empty source
- * root).  A generous superset avoids predicting the exact manifest; a bulk op
- * already pays an RCU grace period, so the handful of throwaway arena
+ * Fill @r with a generous SUPERSET of the nodes ONE ATTEMPT at a bulk op's
+ * commit can allocate -- CDS_FT_ALLOC_RESERVE_CAP of every internal node type
+ * (its own order + bitmap), the minimal order, and (speculative groups) the
+ * compressed-node orders.  Drawn before the op's last fallible step, this lets
+ * the commit draw and never fail on an arena allocation, so nothing after that
+ * step needs a reader-observable rollback.  Used by the same-trie rekey (before
+ * its detach) and by ft_graft_keylen's NOSPLIT attach (before it publishes the
+ * empty source root).  A generous superset avoids predicting the exact manifest;
+ * a bulk op already pays an RCU grace period, so the handful of throwaway arena
  * pops/pushes is negligible.  Returns 0, or -ENOMEM (caller drains).
+ *
+ * PER ATTEMPT, NOT PER OP.  Every op that draws from a reserve re-descends and
+ * rebuilds on a contention bail, so what keeps a whole retry loop inside this one
+ * fill is that an aborted attempt REFUNDS its items (ft_alloc_reserve_refund) --
+ * not the size of the fill, which no constant could make sufficient.  Measured
+ * depth of a single attempt with refunds in place: 2 of the 8, across the unit
+ * suite and every concurrent-writer oracle.
  */
 static
 int ft_bulk_node_reserve_fill(struct cds_ft *ft, struct cds_ft_alloc_reserve *r)

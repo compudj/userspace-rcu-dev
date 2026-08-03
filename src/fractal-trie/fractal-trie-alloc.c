@@ -1401,6 +1401,7 @@ struct ft_tls_reserve_rec {
 static __thread struct ft_tls_reserve_rec ft_tls_reserves[FT_TLS_RESERVE_MAX];
 static __thread unsigned int ft_tls_reserve_nr;
 
+
 /* The reserve this thread has activated on @ft, or NULL. */
 static inline
 struct cds_ft_alloc_reserve *ft_tls_reserve_for(const struct cds_ft *ft)
@@ -1453,6 +1454,10 @@ struct cds_ft_metadata *cds_ft_alloc_item_from(struct cds_ft *ft,
 			 * missing bucket so a manifest can be extended to a new
 			 * shape.  Production falls through (degrading to
 			 * pre-reserve behaviour).
+			 *
+			 * It names ONE ATTEMPT's manifest, because an aborted
+			 * attempt gives its items back (ft_alloc_reserve_refund):
+			 * a retry loop cannot walk a bucket down round by round.
 			 */
 			fprintf(stderr,
 				"ft alloc reserve underflow: kind=%d order=%zu\n",
@@ -1783,6 +1788,89 @@ void cds_ft_free_item(struct cds_ft *ft, struct cds_ft_metadata *metadata)
 #endif
 }
 
+#ifndef FT_IMMEDIATE_FREE
+/*
+ * Give an UNPUBLISHED item back to this thread's active reserve for @ft, so an
+ * attempt that drew from the reserve and then aborted returns what it drew.
+ * Returns false when the item does not belong in a reserve bucket; the caller
+ * then frees it to the arena.
+ *
+ * THE RESERVE'S OTHER HALF.  ft_bulk_node_reserve_fill sizes a reserve to a
+ * superset of what ONE attempt at a bulk op's commit allocates, and the draw
+ * path above treats an empty bucket as an under-counted manifest.  But the ops
+ * that draw from a reserve RETRY: ft_graft_keylen re-descends from retry_attach
+ * on every contention bail and re-allocates that attempt's nodes -- the fresh
+ * source root, and a whole glue cluster for a diverge shape -- after freeing the
+ * previous attempt's to the ARENA.  Each round therefore shrank the reserve by
+ * one attempt's worth, so enough rounds exhausted it however generous the fill
+ * was: measured as a kind=0 order=5 underflow (the fresh source root) once a
+ * contended same-trie rekey reached its ninth round.  A refund makes an aborted
+ * attempt reserve-NEUTRAL, which is what bounds a whole retry loop by one
+ * attempt's manifest -- a property no constant can provide.
+ *
+ * SAFE, and cheaper than the free/alloc round trip it replaces: the item was
+ * never published, so no reader can reach it and this thread still owns it.  It
+ * goes straight back to the bucket it came from with no arena lock, no grace
+ * period, and no change to range->nr_live -- the slot stays live because it
+ * stays ours, and it is accounted exactly once when it is finally freed (by a
+ * later use, or by cds_ft_alloc_reserve_drain).
+ *
+ * It is CLEARED the way the arena's freelist-reuse path clears a recycled slot
+ * (body, metadata with alloc_index preserved, reverse bitmap), because the draw
+ * path hands items out as they are: a reserve filled by cds_ft_alloc_reserve_add
+ * holds untouched arena items, and alloc_cds_ft_node's callers rely on the
+ * allocator returning zeroed memory.  A used item is not zero, so refunding one
+ * without this would hand the next draw a dirty node.
+ *
+ * The item's ARENA names its bucket exactly -- there is one arena per (kind,
+ * order) -- and that lookup is also what rejects everything a reserve never
+ * holds: ordinal cells, and any item not from @ft's group's node arenas.  Those
+ * two group slots are published with a release store by the lazy arena create
+ * above, so they are read as atomics here; a relaxed load is enough because this
+ * only compares pointer identity, and every way the comparison can come out
+ * wrong (a slot still read as NULL) falls through to the plain arena free, which
+ * is what the caller did before this refund existed.
+ */
+static
+bool ft_alloc_reserve_refund(struct cds_ft *ft, struct cds_ft_metadata *metadata)
+{
+	struct cds_ft_alloc_reserve *r;
+	struct cds_ft_metadata_alloc *item;
+	struct cds_ft_alloc_arena *arena;
+	enum cds_ft_alloc_kind kind;
+	size_t order, alloc_index;
+	unsigned int *cnt;
+	void *p;
+
+	if (!ft_tls_reserve_nr)
+		return false;
+	r = ft_tls_reserve_for(ft);
+	if (!r)
+		return false;
+	arena = cds_ft_metadata_to_range(metadata)->arena;
+	order = arena->item_len_order;
+	if (order > FT_ALLOC_ORDER_MAX)
+		return false;
+	if (arena == uatomic_load(&ft->group->arena_order[order], CMM_RELAXED))
+		kind = CDS_FT_ALLOC_KIND_NODE;
+	else if (arena == uatomic_load(&ft->group->compressed_arena_order[order],
+			CMM_RELAXED))
+		kind = CDS_FT_ALLOC_KIND_COMPRESSED;
+	else
+		return false;		/* a cell, or not this group's node arena */
+	cnt = &r->count[kind][order];
+	if (*cnt >= CDS_FT_ALLOC_RESERVE_CAP)
+		return false;		/* bucket full: the arena takes it back */
+	item = caa_container_of(metadata, struct cds_ft_metadata_alloc, metadata);
+	p = cds_ft_metadata_to_item(metadata);
+	alloc_index = metadata->alloc_index;
+	memset(p, 0, 1UL << order);
+	ft_clear_recycled_slot(arena, item, alloc_index);
+	r->items[kind][order][(*cnt)++] = metadata;
+	return true;
+}
+#endif	/* !FT_IMMEDIATE_FREE */
+
 /*
  * Immediate-free path for items that were never published -- no reader
  * can hold a reference, so call_rcu would only delay arena reuse.
@@ -1793,6 +1881,16 @@ void cds_ft_free_item(struct cds_ft *ft, struct cds_ft_metadata *metadata)
 void cds_ft_free_item_unpublished(struct cds_ft *ft __attribute__((unused)),
 		struct cds_ft_metadata *metadata)
 {
+#ifndef FT_IMMEDIATE_FREE
+	/*
+	 * An attempt that drew this item from a reserve gets it back, so a retry
+	 * loop cannot drain the reserve it is supposed to be covered by.  Excluded
+	 * under FT_IMMEDIATE_FREE, whose whole point is that a freed slot is
+	 * poisoned and never reused.
+	 */
+	if (ft_alloc_reserve_refund(ft, metadata))
+		return;
+#endif
 	cds_ft_do_free_item(metadata);
 }
 
