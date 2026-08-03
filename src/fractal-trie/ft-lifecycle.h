@@ -759,11 +759,20 @@ enum cds_ft_status cds_ft_create(struct cds_ft_group *ft_group,
 	struct cds_ft_metadata *metadata;
 	const struct cds_ft_type *type0 = &ft_types[0];
 
-	ft = calloc(1, sizeof(*ft));
-	if (!ft) {
+	/*
+	 * posix_memalign, not calloc: the trie pointer is stored in the
+	 * TRANSACTED metadata->parent slot of its root (ft_trie_parent), so it
+	 * must clear FT's whole in-band tag.  malloc only promises
+	 * _Alignof(max_align_t) -- 16 on LP64, but 8 on common 32-bit ABIs,
+	 * which would let a trie pointer alias the tag space.  Freed with
+	 * free() as before.
+	 */
+	if (posix_memalign((void **) &ft, FT_PARENT_TRIE_ALIGN, sizeof(*ft))) {
 		*result_ft = NULL;
 		return CDS_FT_STATUS_MEMORY_ERROR;
 	}
+	memset(ft, 0, sizeof(*ft));
+	urcu_posix_assert(!((uintptr_t) ft & FT_PARENT_TAG_MASK));
 	ft->group = ft_group;
 	/* Cache the group's ordered-list mode for the read-side cell gate. */
 	ft->ordered_list = ft_group->ordered_list_set;

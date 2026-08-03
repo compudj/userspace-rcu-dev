@@ -790,6 +790,15 @@ unsigned int ft_meta_parent_slot_offset_load(const struct cds_ft_metadata *meta)
 #define FT_FLIP_PROXY_TYPE	7U
 #define FT_FLIP_PROXY_TAG	(FT_INTERNAL_MASK | (FT_FLIP_PROXY_TYPE << FT_INTERNAL_BITS))
 
+/*
+ * The parent slot's tag width must cover the proxy that parks in it: a trie
+ * pointer is distinguished from every other parent value by clearing exactly
+ * this mask (see ft_parent_is_trie).
+ */
+urcu_static_assert(FT_FLIP_PROXY_TAG <= FT_PARENT_TAG_MASK,
+		"the flip-proxy tag must fit within FT_PARENT_TAG_MASK",
+		ft_parent_tag_covers_proxy);
+
 static inline_lookup
 bool ft_node_flip_proxy(struct cds_ft_inode_flag *node)
 {

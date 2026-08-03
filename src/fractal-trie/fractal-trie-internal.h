@@ -1719,7 +1719,9 @@ struct cds_ft {
 	unsigned long verify_at_mutation_period;
 	unsigned long verify_at_mutation_counter;
 #endif
-};
+} __attribute__((aligned(16)));	/* >= FT_PARENT_TRIE_ALIGN: a trie pointer
+				 * is stored in the TRANSACTED parent slot and
+				 * must clear FT's whole in-band tag. */
 
 /*
  * Root ownership: a root's metadata->parent names its OWNING TRIE.
@@ -1733,23 +1735,37 @@ struct cds_ft {
  * trie closes that, so the check the walk already performs at every other
  * depth also holds at depth 0.
  *
- * ENCODING.  In a parent field bits 0-1 are 00 for no other value, so a plain
- * struct cds_ft * needs no tag bit:
+ * ENCODING.  metadata->parent is a TRANSACTED slot: it carries FT's in-band
+ * flip proxy, whose tag is FT_INTERNAL_MASK | FT_TYPE_MASK -- the low FOUR
+ * bits, not one (the MCAS engine owns bit 0 by default and lets an embedder
+ * widen it; FT does, with type 7 == 0xF).  So a value stored here is
+ * unambiguous only when its whole low nibble is clear:
  *
  *   internal          bit 0 set
- *   flip proxy        bit 0 set (FT_FLIP_PROXY_TAG, type 7)
+ *   flip proxy        low nibble == FT_FLIP_PROXY_TAG (0xF)
  *   compressed        bit 1 set
  *   skip-compressed   carries the OWNING node's own tag in bits 0-1, because a
  *                     skip pointer names the compressed node's child -- which
  *                     is the very node whose parent field this is, and only
  *                     internal / compressed nodes have a metadata (an external
- *                     cds_ft_node is {prev, next}).  So never 00.
- *   owning trie       bits 0-1 clear
+ *                     cds_ft_node is {prev, next}).  So never 0000.
+ *   owning trie       low nibble clear
+ *
+ * That is what FT_PARENT_TRIE_ALIGN and the assertions below buy: a
+ * struct cds_ft * only qualifies while it is aligned past the whole tag, and
+ * plain malloc alignment (_Alignof(max_align_t)) is 16 on LP64 but 8 on common
+ * 32-bit ABIs -- not enough, and not something to leave to the allocator.
  *
  * The classification is one mask, matching the cost of the NULL test it
  * replaces on the parent-pointer backtrack path.  NULL keeps its meaning of
  * "not yet parented" for a node under build, which is never reachable.
  */
+#define FT_PARENT_TAG_MASK	((uintptr_t) (FT_INTERNAL_MASK | FT_TYPE_MASK))
+#define FT_PARENT_TRIE_ALIGN	(FT_PARENT_TAG_MASK + 1)
+
+urcu_static_assert(!(FT_PARENT_TRIE_ALIGN & FT_PARENT_TAG_MASK),
+		"FT_PARENT_TRIE_ALIGN must be a power of two covering the whole parent tag",
+		ft_parent_trie_align_pow2);
 static inline
 struct cds_ft_inode_flag *ft_trie_parent(const struct cds_ft *ft)
 {
@@ -1759,8 +1775,12 @@ struct cds_ft_inode_flag *ft_trie_parent(const struct cds_ft *ft)
 static inline
 bool ft_parent_is_trie(const struct cds_ft_inode_flag *parent)
 {
-	return parent && !((uintptr_t) parent & FT_TAG_MASK);
+	return parent && !((uintptr_t) parent & FT_PARENT_TAG_MASK);
 }
+
+urcu_static_assert(!(__alignof__(struct cds_ft) % FT_PARENT_TRIE_ALIGN),
+		"struct cds_ft must be aligned past FT's in-band parent tag: a trie pointer lives in the transacted metadata->parent slot",
+		ft_trie_alignment_covers_parent_tag);
 
 static inline
 struct cds_ft *ft_parent_trie(struct cds_ft_inode_flag *parent)
