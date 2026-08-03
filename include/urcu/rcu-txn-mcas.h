@@ -227,7 +227,9 @@ struct urcu_txn_desc {
 					 */
 	unsigned int cap;
 	unsigned int retry;		/* aging priority: prior retries (tiny, bounded by the fallback) */
-	unsigned int poisoned;		/* set if a same-slot reconcile disagreed on old */
+	unsigned int poisoned;		/* this attempt cannot commit: a same-slot
+					 * reconcile disagreed on old, or a record
+					 * value was a proxy (see urcu_txn_add) */
 	unsigned int slab;		/* block origin: per-CPU slab (1) or posix_memalign (0) */
 	struct urcu_txn_record recs[];	/* frozen at commit */
 };
@@ -639,6 +641,22 @@ struct urcu_txn_desc *urcu_txn_create(unsigned int cap,
  * Append one edge {*slot: old -> new} of kind @kind.  Before commit only.
  * Returns false if the descriptor is full.  The back-pointer (r->desc) is set at
  * commit, after the write-set stops growing (a grow may move the descriptor).
+ *
+ * A record VALUE is never a proxy, and this is where that is enforced.  It is
+ * the ONE way a foreign parked record can escape into a live slot: settle()
+ * stores old_ptr (abort) or new_ptr (commit) BLIND, so a proxy sitting in
+ * either field is published over the word -- and stays there for good, because
+ * the record it denotes belongs to a transaction that decided and settled long
+ * before.  Every later reader of that word sees a parked proxy no one will ever
+ * clear: an embedder that treats "parked" as busy (an FT node-lock acquire)
+ * then fails on it forever.
+ *
+ * It means the embedder read the slot RAW instead of through urcu_txn_load() /
+ * urcu_txn_read(), so its expected-old does not describe the slot either way
+ * and the attempt cannot correctly commit.  Poison rather than trap: the commit
+ * aborts having parked nothing (freeze-before-install leaves the structure
+ * byte-for-byte untouched), and the retry re-reads a slot whose transient proxy
+ * has since settled.  Debug builds still trap, to name the raw read.
  */
 static inline
 bool urcu_txn_add(struct urcu_txn_desc *t, void **slot,
@@ -648,6 +666,9 @@ bool urcu_txn_add(struct urcu_txn_desc *t, void **slot,
 
 	urcu_assert_debug(!urcu_txn_is_proxy(old_ptr, tag));
 	urcu_assert_debug(!urcu_txn_is_proxy(new_ptr, tag));
+	if (caa_unlikely(urcu_txn_is_proxy(old_ptr, tag) ||
+			urcu_txn_is_proxy(new_ptr, tag)))
+		t->poisoned = 1;	/* recorded, but this attempt cannot commit */
 	if (t->nr == t->cap)
 		return false;
 	r = &t->recs[t->nr++];
@@ -873,8 +894,9 @@ bool urcu_txn_desc_commit(struct urcu_txn_desc *t,
  * Commit @t assuming EVERY record is SW-kind (caller-exclusive slots): park all,
  * flip, settle.  No partition, no sort, no CAS, no contention abort -- the
  * branch-lean path for a transaction the embedder knows carries no MW records.
- * Returns true when published; false only when the descriptor was poisoned by a
- * torn same-slot read-set (never a contention abort -- SW parks cannot fail).
+ * Returns true when published; false only when the descriptor was poisoned --
+ * a torn same-slot read-set, or a proxy-valued record (never a contention
+ * abort -- SW parks cannot fail).
  * Use urcu_txn_desc_commit() when MW records may be present.
  */
 static inline

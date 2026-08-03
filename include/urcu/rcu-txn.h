@@ -957,7 +957,8 @@ enum urcu_txn_status urcu_txn_commit(struct urcu_txn *txn)
  *
  * It still returns ABORT for the two non-contention retries the front-end owns:
  * an age-0 same-slot coincidence (esc_pending -> re-run at age 1+, where find
- * resolves read-your-own-writes) and a torn same-slot read-set (poisoned).  A
+ * resolves read-your-own-writes) and a poisoned descriptor (a torn same-slot
+ * read-set, or a record value read raw off a parked slot).  A
  * handle that declared disjoint or expect_conflict never hits the age-0 case, so
  * such a genuinely single-writer commit is abort-free.  Debug builds assert
  * every record is SW-kind.
@@ -990,7 +991,7 @@ enum urcu_txn_status urcu_txn_commit_sw_flavor(struct urcu_txn *txn,
 	txn->desc = NULL;
 	if (urcu_txn_desc_commit_sw(m, call_rcu_fn))
 		return URCU_TXN_STATUS_OK;
-	txn->retry++;			/* poisoned: torn read-set, re-run */
+	txn->retry++;			/* poisoned: nothing parked, re-run */
 	txn->retrying = 1;
 	return URCU_TXN_STATUS_ABORT;
 }
