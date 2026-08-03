@@ -163,6 +163,20 @@ extern "C" {
 #endif
 
 /*
+ * Instrumentation hook for a POISONED chain -- two records on one slot whose
+ * values do not chain (r->new_ptr != old_ptr).  Same embedder contract again.
+ *
+ * Worth its own hook rather than leaving it to the assertion next door: the
+ * kind-mismatch case asserts loudly, but THIS one is silent by design (it sets
+ * t->poisoned and lets commit abort), and the abort it produces is
+ * indistinguishable at the caller from ordinary contention.  A caller chasing a
+ * transaction that aborts forever has no way to tell the two apart.
+ */
+#ifndef URCU_TXN_POISON
+#define URCU_TXN_POISON(slot, want, got)	do { } while (0)
+#endif
+
+/*
  * Single-edge escalation threshold: a lone MW record commits with a bare CAS and
  * no descriptor until it has retried this many times, after which it commits
  * through the full descriptor protocol so it can hold the slot latched against
@@ -900,6 +914,7 @@ bool urcu_txn_record_chain(struct urcu_txn_desc *t, void **slot,
 			t->nr_mw++;			/* promoted SW -> MW: now counts */
 		}
 		if (caa_unlikely(r->new_ptr != old_ptr)) {
+			URCU_TXN_POISON(slot, r->new_ptr, old_ptr);
 			t->poisoned = 1;
 			return true;
 		}
