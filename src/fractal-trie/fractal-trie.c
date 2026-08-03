@@ -445,6 +445,77 @@ int ft_rekey_prefix_range_cmp(const uint8_t *kb, size_t klen,
 	return klen < dst_len ? -1 : 0;
 }
 
+/*
+ * Order two key SUFFIXES the way the trie orders keys: bytes over the common
+ * length, and on a tie the shorter one first.
+ */
+static
+int ft_rekey_suffix_cmp(const uint8_t *a, size_t alen, const uint8_t *b,
+		size_t blen)
+{
+	size_t n = alen < blen ? alen : blen;
+	int cmp = memcmp(a, b, n);
+
+	if (cmp != 0)
+		return cmp < 0 ? -1 : 1;
+	if (alen == blen)
+		return 0;
+	return alen < blen ? -1 : 1;
+}
+
+/*
+ * An OCCUPIED destination: does the moved run land entirely BELOW the merge
+ * region already there (-1), entirely ABOVE it (1), or INTERLEAVED with it (0)?
+ *
+ * Both sides are compared by the suffix BELOW their own merge point, which is what
+ * the merged order is decided on -- the moved keys become @dst_key ++ suffix, and
+ * the region's are @dst_key ++ their own, so the shared prefix cancels.
+ *
+ * ★ WHY THE ANSWER MATTERS SO MUCH.  Entirely below or entirely above, the moved
+ * cells stay ONE CONTIGUOUS list range and the move is the same run splice an empty
+ * destination gets -- at the region's front or back rather than into a gap.
+ * INTERLEAVED, it is not a run move at all: the cells have to be threaded
+ * individually between the region's, which is ft_merge_ord_interleave_collect's
+ * job, and that helper PLAIN-STORES each surviving cell's links on the premise
+ * that the cell "is not ord-reachable in @dst -- never was".  True for the
+ * cross-trie merge it was written for, FALSE here: an in-trie rekey's source cells
+ * are live in the very list being rebuilt, so those stores would be
+ * reader-visible and non-atomic.  Interleaving in-trie needs a mode that RECORDS
+ * every relink instead, so it is refused rather than approximated.
+ *
+ * A COLLISION cannot occur in the two cases this admits: identical full keys mean
+ * identical suffixes, which strict disjointness excludes.  That is what keeps the
+ * duplicate-chain absorption out of the picture here.
+ */
+static
+int ft_rekey_run_vs_region(struct cds_ft *ft,
+		struct ft_ord_cell *rfc, struct ft_ord_cell *rlc, size_t src_len,
+		struct ft_ord_cell *dfirst, struct ft_ord_cell *dlast,
+		size_t dst_len)
+{
+	size_t max_len = ft->group->max_key_len;
+	uint8_t rb[FT_MAX_KEY_LEN], db[FT_MAX_KEY_LEN];
+	size_t rl, dl;
+
+	/* run MAX vs region MIN: below iff strictly less. */
+	rl = ft_rebuild_key_upwalk(ft, rlc, rb, max_len);
+	dl = ft_rebuild_key_upwalk(ft, dfirst, db, max_len);
+	if (!rl || !dl || rl < src_len || dl < dst_len)
+		return 0;			/* unreadable: treat as interleaved */
+	if (ft_rekey_suffix_cmp(rb + (max_len - rl) + src_len, rl - src_len,
+			db + (max_len - dl) + dst_len, dl - dst_len) < 0)
+		return -1;
+	/* run MIN vs region MAX: above iff strictly greater. */
+	rl = ft_rebuild_key_upwalk(ft, rfc, rb, max_len);
+	dl = ft_rebuild_key_upwalk(ft, dlast, db, max_len);
+	if (!rl || !dl || rl < src_len || dl < dst_len)
+		return 0;
+	if (ft_rekey_suffix_cmp(rb + (max_len - rl) + src_len, rl - src_len,
+			db + (max_len - dl) + dst_len, dl - dst_len) > 0)
+		return 1;
+	return 0;
+}
+
 static
 bool ft_rekey_splice_pos_brackets(struct cds_ft *ft, const uint8_t *dst_ord,
 		size_t dst_len, struct ft_ord_cell *pred,
@@ -574,6 +645,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	struct ft_merge_counts mcnt = { 0, 0, 0, 0, 0 };
 #endif
 	struct cds_ft_inode_flag *merged_nf = NULL;
+	struct cds_ft_inode_flag *probe_D = NULL;	/* occupied dst merge point */
 	unsigned long merged_keys = 0;
 	bool merge_dst = false, src_glue_live = false;
 	/*
@@ -703,11 +775,14 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 *
 	 * SCOPE OF THIS FIRST CUT (each a PERMANENT -EINVAL, checked at the gate below,
 	 * not silently degraded):
-	 *  - LIST OFF.  With an empty dst the moved keys form one contiguous ordered
-	 *    run that re-splices as six boundary edges.  Merging into an OCCUPIED dst
-	 *    INTERLEAVES them with the keys already there, which is the per-key
-	 *    ms_edges machinery in ft_merge_spine_copy, not a run move.  A trie with
-	 *    the list on is refused rather than moved with a corrupt list.
+	 *  - with the list ON, a moved run whose suffixes DISJOINTLY precede or follow
+	 *    the destination region's.  Then the moved cells stay one contiguous range
+	 *    and splice at a region boundary, which is the same run move an empty
+	 *    destination gets.  An INTERLEAVED range is refused: threading the cells
+	 *    individually is ft_merge_ord_interleave_collect's job, and that helper
+	 *    plain-stores each surviving cell's links because they are not
+	 *    ord-reachable in a cross-trie merge -- which is false here, where the
+	 *    source cells live in the very list being rebuilt (ft_rekey_run_vs_region).
 	 *  - a PLAIN INTERNAL node at the dst point.  Compressed / skip / external
 	 *    merge points bring the KEY_SHORTER wrap and Edge-D shapes, which are
 	 *    ft_merge_spine_copy's job.
@@ -726,6 +801,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		      )
 			ft_descent_step(ft, &d_probe, *(pk++));
 		merge_dst = (d_probe.depth == dst_len && d_probe.nf != NULL);
+		probe_D = merge_dst ? d_probe.nf : NULL;
 		/*
 		 * @require_empty is the GRAFT caller's semantics (cds_ft_rekey_graft
 		 * refuses an occupied destination rather than unioning into it), and
@@ -737,8 +813,6 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		 */
 		if (merge_dst && require_empty)
 			return -EEXIST;
-		if (merge_dst && ft->ordered_list)
-			return -EINVAL;		/* interleave: not this cut */
 #ifndef FEATURE_FT_MERGE
 		/*
 		 * An OCCUPIED destination IS a merge (INCREMENT 3 unions S_top
@@ -813,27 +887,78 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		run_rlast = ft_subtree_minmax_head(ft, s_top, true);
 		rfc = ft_ord_cell_ptr(rcu_dereference(run_rfirst->prev));
 		rlc = ft_ord_cell_ptr(rcu_dereference(run_rlast->prev));
-		/*
-		 * COHERENT derivation: two from-root traversals, compared by their
-		 * visited-node witness (ft_ord_cell_find_splice_pos_coherent).  This
-		 * is what makes the splice position trustworthy -- the single-pass
-		 * relational answer is not, and no amount of checking the ANSWER
-		 * repairs that (measured: the key-bracket check below, which is a
-		 * relational-era read itself, was fooled too).  Disagreement means a
-		 * peer move is restructuring this neighbourhood: bail and re-derive.
-		 */
-		if (!ft_ord_cell_find_splice_pos_coherent(ft, dst_key, dst_len,
-				&run_dpred, &run_dsucc))
-			return -EAGAIN;		/* torn derivation: re-descend */
-		/*
-		 * Belt and braces, and cheap: the pair must also BRACKET the dst key
-		 * range.  Adjacent + bracketing is the full correctness condition for
-		 * a splice; the two-pass agreement establishes the pair was not read
-		 * torn, this establishes it is the RIGHT pair.
-		 */
-		if (!ft_rekey_splice_pos_brackets(ft, dst_ord, dst_len, run_dpred,
-				run_dsucc))
-			return -EAGAIN;
+		if (merge_dst) {
+			/*
+			 * OCCUPIED destination: the splice position is not a gap to
+			 * search for, it is a BOUNDARY of the merge region already there,
+			 * so derive it from that region's own endpoint cells instead of
+			 * relationally.  That is strictly better than find_splice_pos --
+			 * a structural read of the region needs no two-pass agreement and
+			 * no bracket check to be trusted -- and it is available only here,
+			 * where the region exists.
+			 *
+			 * Which boundary depends on where the moved run sorts relative to
+			 * the region, and an INTERLEAVE is refused: see
+			 * ft_rekey_run_vs_region for why that one needs machinery this
+			 * writer does not have.
+			 *
+			 * THE DISJOINTNESS SURVIVES TO THE COMMIT, and the splice's own
+			 * edges are what make it.  The only peer insert that can break it
+			 * is one landing BELOW the region's minimum (for a run spliced in
+			 * front) -- anything inside the region still sorts above the whole
+			 * run, so the order holds -- and such an insert splices between
+			 * @run_dpred and @run_dsucc, which is the very pair
+			 * ft_ord_cell_run_resplice_edges records as pred->next == succ and
+			 * succ->prev == pred.  It therefore ABORTS this commit rather than
+			 * mis-ordering the list.  Symmetrically for a run spliced behind.
+			 */
+			struct ft_ord_cell *dfirst, *dlast;
+
+			dfirst = ft_ord_cell_ptr(rcu_dereference(
+				ft_subtree_minmax_head(ft, probe_D, false)->prev));
+			dlast = ft_ord_cell_ptr(rcu_dereference(
+				ft_subtree_minmax_head(ft, probe_D, true)->prev));
+			if (!dfirst || !dlast)
+				return -EAGAIN;		/* region read torn */
+			switch (ft_rekey_run_vs_region(ft, rfc, rlc, src_len,
+					dfirst, dlast, dst_len)) {
+			case -1:			/* run below: splice in front */
+				run_dpred = ft_ord_cell_resolve_ord(
+						&dfirst->lnode.prev);
+				run_dsucc = dfirst;
+				break;
+			case 1:				/* run above: splice behind */
+				run_dpred = dlast;
+				run_dsucc = ft_ord_cell_resolve_ord(
+						&dlast->lnode.next);
+				break;
+			default:
+				return -EINVAL;		/* interleave: not this cut */
+			}
+		} else {
+			/*
+			 * COHERENT derivation: two from-root traversals, compared by their
+			 * visited-node witness (ft_ord_cell_find_splice_pos_coherent).
+			 * This is what makes the splice position trustworthy -- the
+			 * single-pass relational answer is not, and no amount of checking
+			 * the ANSWER repairs that (measured: the key-bracket check below,
+			 * which is a relational-era read itself, was fooled too).
+			 * Disagreement means a peer move is restructuring this
+			 * neighbourhood: bail and re-derive.
+			 */
+			if (!ft_ord_cell_find_splice_pos_coherent(ft, dst_key,
+					dst_len, &run_dpred, &run_dsucc))
+				return -EAGAIN;	/* torn derivation: re-descend */
+			/*
+			 * Belt and braces, and cheap: the pair must also BRACKET the dst
+			 * key range.  Adjacent + bracketing is the full correctness
+			 * condition for a splice; the two-pass agreement establishes the
+			 * pair was not read torn, this establishes it is the RIGHT pair.
+			 */
+			if (!ft_rekey_splice_pos_brackets(ft, dst_ord, dst_len,
+					run_dpred, run_dsucc))
+				return -EAGAIN;
+		}
 		/*
 		 * THE DST POSITION ABUTS THE RUN, and that is not a shape to refuse: it
 		 * means the moved keys sort into the SAME list slot the run already

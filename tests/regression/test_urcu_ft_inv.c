@@ -1800,8 +1800,13 @@ static int inv_rekey_merge_occupied_dst(void)
 	mw_install_fatal_handler();
 	leak_reset();
 
-	/* LIST OFF: the merge fold refuses list-on (the ordered interleave is
-	 * per-key ms_edges machinery, not this driver's contiguous run move). */
+	/*
+	 * LIST OFF, and it has to stay off for THIS layout: the merge fold takes a
+	 * list-on move only when the moved suffixes disjointly precede or follow the
+	 * destination region's, and this geometry deliberately COLLIDES (mover 1 lands
+	 * on resident 0), so its ranges overlap and the interleave is refused.
+	 * test_rekey_merge_occupied_dst_liston covers the disjoint shape.
+	 */
 	ft = create_fixed_fine_lock_listoff_ft(4, &group);
 	cds_ft_make_concurrent(ft);
 

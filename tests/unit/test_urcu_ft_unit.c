@@ -54,7 +54,7 @@
  * at RUNTIME by ft->lock_fine, so the _DLM suffix names this group of lock-set
  * tests -- it does NOT select a build.
  */
-#define NR_TESTS_DLM 8		/* cow_stop_root_inplace, rekey_graft_{simple,liston,cross_junction,glue_dst,glue_dst_branch_child}, rekey_merge_{occupied,collide}_dst */
+#define NR_TESTS_DLM 9		/* cow_stop_root_inplace, rekey_graft_{simple,liston,cross_junction,glue_dst,glue_dst_branch_child}, rekey_merge_{occupied,occupied_liston,collide}_dst */
 
 /*
  * Tests needing DLM *and* fault injection in one build: the merge overlap-spine
@@ -1091,6 +1091,151 @@ out_locked:
 	rcu_read_unlock();
 	fprintf(stderr, "rekey-merge: setup insert failed\n");
 out:
+	if (drain_and_destroy(ft, group) < 0)
+		rc = -1;
+	return rc;
+}
+
+/*
+ * The OCCUPIED destination with the ORDERED LIST ON, in the one shape that is a
+ * run move rather than an interleave.
+ *
+ * The moved keys and the destination's own occupy DISJOINT suffix ranges here
+ * (byte2 1..4 against 0x43/0x44), and disjoint on ONE SIDE: every moved key sorts
+ * below every resident one.  So the moved cells stay a single contiguous list
+ * range and splice in FRONT of the destination region -- the same run splice an
+ * empty destination gets, at a boundary derived from the region's own endpoint
+ * cells instead of from a relational gap search.  An INTERLEAVED range is refused
+ * (ft_rekey_run_vs_region says why), so this is the whole of what the list-on merge
+ * covers, and the disjointness is also what rules out a collision: identical keys
+ * mean identical suffixes.
+ *
+ * cds_ft_verify's ordered-cell pass plus an explicit ascending scan are the
+ * assertions that matter -- a splice at the wrong boundary leaves a well-formed
+ * list in the wrong order, which key membership and the count cannot see.
+ */
+static int test_rekey_merge_occupied_dst_liston(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	struct cds_ft_iter *iter = NULL;
+	uint8_t src_key[2] = { RK_SX, RK_SY }, dst_key[2] = { RK_DX, RK_DZ };
+	uint64_t sub_key[RK_NSUB], occ_key[2];
+	uint64_t prev = 0;
+	int i, nr = 0, rc = -1;
+
+	if (!cds_ft_merge_enabled()) {
+		diag("test_rekey_merge_occupied_dst_liston: skipped, merge "
+			"compiled out (-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
+	ft = create_fixed_fine_lock_ft(4, &group);		/* list ON */
+	if (cds_ft_iter_create(ft, &iter) < 0)
+		abort();
+	for (i = 0; i < RK_NSUB; i++)
+		sub_key[i] = ((uint64_t) RK_SX << 24) | ((uint64_t) RK_SY << 16) |
+			((uint64_t) (i + 1) << 8);
+	occ_key[0] = ((uint64_t) RK_DX << 24) | ((uint64_t) RK_DZ << 16) |
+		((uint64_t) (RKM_DOCC + 0x40) << 8);
+	occ_key[1] = ((uint64_t) RK_DX << 24) | ((uint64_t) RK_DZ << 16) |
+		((uint64_t) (RKM_DOCC + 0x41) << 8);
+
+	rcu_read_lock();
+	for (i = 0; i < RK_NSUB; i++)
+		if (insert_u64(ft, sub_key[i], node_alloc(sub_key[i]))
+				!= CDS_FT_STATUS_OK)
+			abort();
+	for (i = 0; i < RK_NSIB; i++) {			/* junction survives */
+		uint64_t sk = ((uint64_t) RK_SX << 24) |
+			((uint64_t) (i + 5) << 16);
+
+		if (insert_u64(ft, sk, node_alloc(sk)) != CDS_FT_STATUS_OK)
+			abort();
+	}
+	for (i = 1; i <= 2; i++) {			/* dst parent children */
+		uint64_t dk = ((uint64_t) RK_DX << 24) | ((uint64_t) i << 16);
+
+		if (insert_u64(ft, dk, node_alloc(dk)) != CDS_FT_STATUS_OK)
+			abort();
+	}
+	for (i = 0; i < 2; i++)				/* the OCCUPANT */
+		if (insert_u64(ft, occ_key[i], node_alloc(occ_key[i]))
+				!= CDS_FT_STATUS_OK)
+			abort();
+	rcu_read_unlock();
+
+	if (_cds_ft_debug_rekey_graft_simple(ft, src_key, 2, dst_key, 2) != 0) {
+		fprintf(stderr, "rekey-merge-liston: the move was refused\n");
+		goto out;
+	}
+	rcu_read_lock();
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "rekey-merge-liston: verify failed\n");
+		rcu_read_unlock();
+		goto out;
+	}
+	/* Strictly ascending, and every key still there. */
+	{
+		enum cds_ft_status s;
+
+		for (s = cds_ft_lookup_first(ft, iter); s == CDS_FT_STATUS_OK;
+				s = cds_ft_next(ft, iter)) {
+			uint8_t k[8];
+			size_t l;
+			uint64_t v = 0;
+			unsigned int b;
+
+			if (cds_ft_iter_get_key(iter, k, sizeof k, &l) !=
+					CDS_FT_STATUS_OK || l != 4)
+				break;
+			for (b = 0; b < 4; b++)
+				v = (v << 8) | k[b];
+			if (nr && v <= prev) {
+				fprintf(stderr, "rekey-merge-liston: list out of "
+					"order at %d (%#llx after %#llx)\n", nr,
+					(unsigned long long) v,
+					(unsigned long long) prev);
+				rcu_read_unlock();
+				goto out;
+			}
+			prev = v;
+			nr++;
+		}
+	}
+	/* RK_NSUB moved + RK_NSIB siblings + 2 dst children + 2 occupants. */
+	if (nr != RK_NSUB + RK_NSIB + 4 ||
+			cds_ft_count_keys(ft) != (unsigned long) nr) {
+		fprintf(stderr, "rekey-merge-liston: walked %d of %d (count %lu)\n",
+			nr, RK_NSUB + RK_NSIB + 4, cds_ft_count_keys(ft));
+		rcu_read_unlock();
+		goto out;
+	}
+	for (i = 0; i < RK_NSUB; i++) {
+		uint64_t moved = ((uint64_t) RK_DX << 24) |
+			((uint64_t) RK_DZ << 16) | ((uint64_t) (i + 1) << 8);
+		struct cds_ft_node *f = NULL;
+
+		if (lookup_u64(ft, moved, &f) != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "rekey-merge-liston: moved key %d absent\n",
+				i);
+			rcu_read_unlock();
+			goto out;
+		}
+	}
+	for (i = 0; i < 2; i++) {
+		struct cds_ft_node *f = NULL;
+
+		if (lookup_u64(ft, occ_key[i], &f) != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "rekey-merge-liston: occupant %d lost\n", i);
+			rcu_read_unlock();
+			goto out;
+		}
+	}
+	rcu_read_unlock();
+	rc = 0;
+out:
+	if (iter)
+		cds_ft_iter_destroy(iter);
 	if (drain_and_destroy(ft, group) < 0)
 		rc = -1;
 	return rc;
@@ -30856,6 +31001,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_cow_stop_root_inplace);
 	RUN_TEST(test_rekey_graft_simple);
 	RUN_TEST(test_rekey_merge_occupied_dst);
+	RUN_TEST(test_rekey_merge_occupied_dst_liston);
 	RUN_TEST(test_rekey_merge_collide_dst);
 	RUN_TEST(test_rekey_graft_liston);
 	RUN_TEST(test_rekey_graft_cross_junction);
