@@ -516,7 +516,7 @@ static
 int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		const uint8_t *src_key, size_t src_len,
 		const uint8_t *dst_key, size_t dst_len,
-		struct urcu_txn *optxn)
+		bool require_empty, struct urcu_txn *optxn)
 {
 	uint8_t src_ord[FT_MAX_KEY_LEN], dst_ord[FT_MAX_KEY_LEN];
 	struct cds_ft_inode_flag *s_top, *s_top_prime = NULL, *attached_nf = NULL;
@@ -698,6 +698,17 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		      )
 			ft_descent_step(ft, &d_probe, *(pk++));
 		merge_dst = (d_probe.depth == dst_len && d_probe.nf != NULL);
+		/*
+		 * @require_empty is the GRAFT caller's semantics (cds_ft_rekey_graft
+		 * refuses an occupied destination rather than unioning into it), and
+		 * -EEXIST is how it travels back: a distinct code, because the
+		 * dispatcher must tell "the destination holds content" (terminal,
+		 * POPULATED_ERROR) apart from "this shape is outside the one-decide
+		 * cut" (-EINVAL, try the staged writer).  Read-only so far, so this is
+		 * a clean no-op bail.
+		 */
+		if (merge_dst && require_empty)
+			return -EEXIST;
 		if (merge_dst && ft->ordered_list)
 			return -EINVAL;		/* interleave: not this cut */
 #ifndef FEATURE_FT_MERGE
@@ -1049,7 +1060,14 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		goto bail_build;
 	}
 	if (prep == FT_GRAFT_PREP_POPULATED) {
-		ret = -EINVAL;
+		/*
+		 * Content at or below the graft point that the up-front probe could
+		 * not prove (a compressed or skip-encoded occupant it declines to
+		 * walk).  For a GRAFT that is the destination-occupied answer its
+		 * caller documents; for a MERGE it is a dst shape this cut leaves to
+		 * ft_merge_spine_copy.
+		 */
+		ret = require_empty ? -EEXIST : -EINVAL;
 		goto bail_build;
 	}
 	/*
@@ -1681,7 +1699,7 @@ sweep:
 static
 int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 		const uint8_t *src_key, size_t src_len,
-		const uint8_t *dst_key, size_t dst_len)
+		const uint8_t *dst_key, size_t dst_len, bool require_empty)
 {
 	struct urcu_txn optxn;
 	int ret;
@@ -1690,7 +1708,7 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 	for (;;) {
 		urcu_txn_begin(&optxn);
 		ret = ft_rekey_graft_simple_attempt(ft, src_key, src_len,
-			dst_key, dst_len, &optxn);
+			dst_key, dst_len, require_empty, &optxn);
 		if (ret != -EAGAIN && ret != -EIO)
 			break;
 		/* Age the conflict, as cds_ft_replace does; the turn is forfeited. */
@@ -1715,8 +1733,12 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
  * period, so it must NOT be called from inside an RCU read-side critical section
  * -- the GP would wait for the caller's own section.  This entry takes the read
  * lock the body needs itself, AFTER the gate.  The gate is entered before the
- * shape gates run, so a rejected move also pays the GP; a production entry point
- * would cheap-check the shape first.
+ * shape gates run, so a rejected move also pays the GP; the public entry
+ * (ft_rekey_one_decide's caller) cheap-checks the shape first instead.
+ *
+ * An occupied destination MERGES here (@require_empty false), which is what the
+ * oracles driving this entry expect; the graft-semantics refusal belongs to the
+ * public entry that documents it.
  */
 int _cds_ft_debug_rekey_graft_simple(struct cds_ft *ft,
 		const uint8_t *src_key, size_t src_len,
@@ -1727,9 +1749,48 @@ int _cds_ft_debug_rekey_graft_simple(struct cds_ft *ft,
 
 	ft_move_gate_enter(ft);
 	flavor->read_lock();
-	ret = ft_rekey_graft_simple_locked(ft, src_key, src_len, dst_key, dst_len);
+	ret = ft_rekey_graft_simple_locked(ft, src_key, src_len, dst_key, dst_len,
+			false);
 	flavor->read_unlock();
 	ft_move_gate_exit(ft);
+	return ret;
+}
+
+/*
+ * The ATOMIC rekey, for the public entry points: move @src_key's subtree to
+ * @dst_key as ONE decide, or report that this shape is not one it covers.
+ *
+ * Everything the caller needs to know is in the return code.  0 committed the
+ * move atomically -- a reader sees the subtree at the source XOR the
+ * destination, with no instant where it is at neither, which is the property
+ * the staged writer (a committed detach, then a merge back) cannot provide.
+ * -EINVAL means the shape is outside this writer's cut and the caller should
+ * fall back; -EEXIST is a GRAFT caller's occupied destination; -ENOMEM and
+ * -ENOTSUP are terminal.  The transient contention codes never surface: the
+ * retry wrapper absorbs them.
+ *
+ * It takes the READ LOCK the body needs but NOT the move gate, so one gate
+ * bracket in the caller covers this attempt and any fallback -- two brackets
+ * would pay two grace periods for one move.  The caller must therefore already
+ * hold the gate and, by the gate's own contract, not be inside a read section.
+ *
+ * Hidden-visibility here rather than static because the public entries live in
+ * ft-merge.h, which is included ABOVE the composition this wraps (it needs
+ * detach, graft and merge all in scope); the declaration in
+ * fractal-trie-internal.h is what bridges that.
+ */
+__attribute__((visibility("hidden")))
+int ft_rekey_one_decide(struct cds_ft *ft,
+		const uint8_t *src_key, size_t src_len,
+		const uint8_t *dst_key, size_t dst_len, bool require_empty)
+{
+	const struct rcu_flavor_struct *flavor = ft->group->flavor;
+	int ret;
+
+	flavor->read_lock();
+	ret = ft_rekey_graft_simple_locked(ft, src_key, src_len, dst_key, dst_len,
+			require_empty);
+	flavor->read_unlock();
 	return ret;
 }
 

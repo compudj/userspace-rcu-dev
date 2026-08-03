@@ -10825,25 +10825,37 @@ out:
 }
 
 /*
- * A rekey on a FIXED-LENGTH group is refused, AND THE TRIE IS UNTOUCHED.
+ * A rekey on a FIXED-LENGTH group: ATOMIC where the one-decide writer covers the
+ * shape, and REFUSED WITHOUT TOUCHING THE TRIE where it does not.
  *
- * Both halves matter.  The move is staged as a detach into a transient trie plus
- * a merge of that trie back in, and a detached subtree's keys are stripped of the
- * prefix -- shorter than the group's one key length -- which is why cds_ft_detach
- * and cds_ft_graft take a non-root key on variable-length groups only.  Until the
- * entry check existed the rekey entries inherited that restriction WITHOUT
- * declaring it: the detach committed, the placement then met the fixed-length
+ * Both outcomes are the dispatcher's, and both need asserting.  A fixed-length
+ * group cannot use the staged writer at all -- that one detaches into a transient
+ * trie, and a detached subtree's keys are stripped of the prefix, shorter than the
+ * group's one key length, which is why cds_ft_detach and cds_ft_graft take a
+ * non-root key on variable-length groups only.  So the atomic writer is the only
+ * rekey such a group gets, and a shape outside its cut has to come back as a
+ * clean refusal.
+ *
+ * WHY THE REFUSAL HALF IS THE LOAD-BEARING ONE.  Before the entry check existed
+ * the rekey entries inherited the staged writer's restriction WITHOUT declaring
+ * it: the detach committed, the placement then met the fixed-length
  * equal-prefix-length guard and refused, and the caller got
  * INVALID_ARGUMENT_ERROR -- a status that reads as "argument rejected, nothing
  * happened" -- for a trie that had just lost every moved key with the destroyed
- * transient.  Measured on the four-key subtree below: count_keys 4 -> 0, every
- * key absent at BOTH positions, and cds_ft_verify still clean (the trie is
- * well-formed, just empty), so nothing but a count would have caught it.
+ * transient.  Measured on phase 2's four-key subtree: count_keys 4 -> 0, every key
+ * absent at BOTH positions, and cds_ft_verify still clean (the trie is
+ * well-formed, just empty), so nothing but a count would have caught it.  The
+ * status assertion alone passed throughout.
  *
- * So this asserts the status AND that all four keys are still at the source, none
- * at the destination, the count is unchanged and the trie verifies.
+ * PHASE 1 (in the cut, list off) is the atomic writer's single-threaded coverage
+ * through the PUBLIC entry -- the concurrent side is inv_rekey_public_atomic_no_gap
+ * -- and reuses test_rekey_graft_simple's depth-2 geometry, whose whole point is
+ * that BP and the dst parent are different nodes.  PHASE 2 (out of the cut) hands
+ * it a source junction with a single child, which the atomic writer refuses
+ * because removing the slot would collapse the junction rather than delete in
+ * place.
  */
-static int test_rekey_fixed_len_refused(void)
+static int test_rekey_fixed_len_atomic_or_refused(void)
 {
 	struct cds_ft_group *group;
 	struct cds_ft *ft;
@@ -10852,10 +10864,80 @@ static int test_rekey_fixed_len_refused(void)
 	int c, ret = -1;
 
 	if (!cds_ft_merge_enabled()) {
-		diag("test_rekey_fixed_len_refused: skipped, merge compiled out "
-			"(-DNO_FEATURE_FT_MERGE)");
+		diag("test_rekey_fixed_len_atomic_or_refused: skipped, merge "
+			"compiled out (-DNO_FEATURE_FT_MERGE)");
 		return 0;
 	}
+
+	/* PHASE 1: a shape the one-decide writer covers -> it moves, atomically. */
+	{
+		struct cds_ft_group *g1;
+		struct cds_ft *ft1 = create_fixed_fine_lock_listoff_ft(4, &g1);
+		uint8_t s1[2] = { RK_SX, RK_SY }, d1[2] = { RK_DX, RK_DZ };
+		enum cds_ft_status s;
+		int i, bad = 0;
+
+		rcu_read_lock();
+		for (i = 0; i < RK_NSUB; i++) {
+			uint64_t k = ((uint64_t) RK_SX << 24) |
+				((uint64_t) RK_SY << 16) |
+				((uint64_t) (i + 1) << 8);
+
+			if (insert_u64(ft1, k, node_alloc(k)) != CDS_FT_STATUS_OK)
+				abort();
+		}
+		for (i = 0; i < RK_NSIB; i++) {
+			uint64_t k = ((uint64_t) RK_SX << 24) |
+				((uint64_t) (i + 5) << 16);
+
+			if (insert_u64(ft1, k, node_alloc(k)) != CDS_FT_STATUS_OK)
+				abort();
+		}
+		for (i = 1; i <= 2; i++) {
+			uint64_t k = ((uint64_t) RK_DX << 24) |
+				((uint64_t) i << 16);
+
+			if (insert_u64(ft1, k, node_alloc(k)) != CDS_FT_STATUS_OK)
+				abort();
+		}
+		rcu_read_unlock();
+
+		s = cds_ft_rekey_graft(ft1, d1, 2, s1, 2);
+		rcu_read_lock();
+		for (i = 0; i < RK_NSUB; i++) {
+			uint64_t at_src = ((uint64_t) RK_SX << 24) |
+				((uint64_t) RK_SY << 16) |
+				((uint64_t) (i + 1) << 8);
+			uint64_t at_dst = ((uint64_t) RK_DX << 24) |
+				((uint64_t) RK_DZ << 16) |
+				((uint64_t) (i + 1) << 8);
+
+			if (lookup_u64(ft1, at_dst, &found) != CDS_FT_STATUS_OK ||
+					lookup_u64(ft1, at_src, &found)
+						== CDS_FT_STATUS_OK)
+				bad = 1;
+		}
+		if (s != CDS_FT_STATUS_OK || bad ||
+				cds_ft_count_keys(ft1) != RK_NSUB + RK_NSIB + 2 ||
+				cds_ft_verify(ft1, stderr) != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "rekey_fixed: the in-cut move did not happen "
+				"(%s, %lu keys)\n", cds_ft_status_to_string(s),
+				cds_ft_count_keys(ft1));
+			rcu_read_unlock();
+			drain_trie(ft1);
+			rcu_barrier();
+			cds_ft_destroy(ft1);
+			cds_ft_group_destroy(g1);
+			return -1;
+		}
+		rcu_read_unlock();
+		drain_trie(ft1);
+		rcu_barrier();
+		cds_ft_destroy(ft1);
+		cds_ft_group_destroy(g1);
+	}
+
+	/* PHASE 2: out of the cut -> refused, and the subtree is still there. */
 	ft = create_fixed_ord_rekey_ft(4, &group);
 	rcu_read_lock();
 	for (c = 1; c <= 4; c++) {
@@ -30233,7 +30315,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_merge_rekey_same_trie);
 	RUN_TEST(test_merge_rekey_same_trie_speculative_rejected);
 	RUN_TEST(test_rekey_graft_vs_merge);
-	RUN_TEST(test_rekey_fixed_len_refused);
+	RUN_TEST(test_rekey_fixed_len_atomic_or_refused);
 	RUN_TEST(test_merge_rekey_same_trie_ordered);
 	RUN_TEST(test_merge_rekey_same_trie_listoff_collision);
 	RUN_TEST(test_nonidentity_bulk_ops);

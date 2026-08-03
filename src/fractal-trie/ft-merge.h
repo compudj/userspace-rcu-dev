@@ -2697,14 +2697,20 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
 	}
 	/*
-	 * A rekey needs a VARIABLE-length group, and the refusal belongs HERE,
-	 * before anything is read or reserved.  The move is staged as a detach of
-	 * @src_key's subtree into a transient trie followed by a merge of that
-	 * trie back in at @dst_key, and a detached subtree carries keys STRIPPED
-	 * of the prefix -- shorter than a fixed-length group's one key length,
-	 * which is exactly why cds_ft_detach and cds_ft_graft take a non-root key
-	 * on variable-length groups only.  The rekey entries are composed of those
-	 * two operations, so they inherit the restriction.
+	 * The STAGED rekey needs a VARIABLE-length group, and the refusal belongs
+	 * HERE, before anything is read or reserved.  The move is staged as a
+	 * detach of @src_key's subtree into a transient trie followed by a merge of
+	 * that trie back in at @dst_key, and a detached subtree carries keys
+	 * STRIPPED of the prefix -- shorter than a fixed-length group's one key
+	 * length, which is exactly why cds_ft_detach and cds_ft_graft take a
+	 * non-root key on variable-length groups only.  The staged rekey is
+	 * composed of those two operations, so it inherits the restriction.
+	 *
+	 * A fixed-length group is served by the ATOMIC writer instead
+	 * (ft_rekey_one_decide, dispatched before this worker), which stages
+	 * through no transient trie and so has no such restriction -- it is the
+	 * only rekey a fixed-length group gets, and reaching here means its cut did
+	 * not cover the shape.
 	 *
 	 * Enforcing it at the entry is what makes the refusal SAFE.  The placement
 	 * is a merge of that transient at @dst_key, so it meets the fixed-length
@@ -3475,40 +3481,114 @@ enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
 #endif
 }
 
+#ifdef FEATURE_FT_MERGE
+/*
+ * The in-trie move, over TWO writers: the ATOMIC one (one decide) where it
+ * applies, the staged one everywhere else.
+ *
+ * WHY THE ATOMIC WRITER IS TRIED FIRST, and it is not an optimization.  The
+ * property a rekey exists to provide is that a key present throughout the move
+ * is never read as ABSENT -- at neither the old nor the new position.  The staged
+ * writer cannot provide it by construction: it detaches the subtree into a
+ * transient trie as ONE COMMIT and merges that trie back as ANOTHER, so between
+ * the two the moved keys are in no trie at all, for at least the grace period the
+ * detach drains (measured by inv_rekey_public_no_gap: ~745 absence observations
+ * per move).  ft_rekey_one_decide commits the src-slot clear, the destination
+ * publish and the re-parents as ONE flip, so a reader sees the subtree at the
+ * source XOR the destination and never at neither.
+ *
+ * The atomic writer covers a CUT of the shapes, not all of them, and reports
+ * -EINVAL for the rest (a compressed or external S_top, a source junction that
+ * would collapse, an ordered-list interleave, an unequal-length destination).
+ * Those fall back here, and on a fixed-length group there is nothing to fall back
+ * TO -- the staged writer is variable-length-only, since a detached subtree's
+ * keys are stripped of the prefix -- so ft_merge_at_inner refuses them rather
+ * than losing the subtree between its two commits.
+ *
+ * ARM THE MOVE GATE around both.  ft_move_gate_enter publishes @move_active and
+ * waits ONE grace period, so every reader already inside a critical section --
+ * which may have branched to the FAST, non-verifying lookup -- finishes before
+ * anything moves; readers that start after it see the gate and take the coherent
+ * two-pass path, which re-descends when its two traversals disagree.  A burst of
+ * concurrent rekeys pays ~one grace period in total.  Without the gate the
+ * two-pass machinery is unreachable in production: the coherent specializations
+ * are selected by @rekey_coherence but ENTERED only under ft_move_active().  ONE
+ * bracket covers the attempt AND the fallback -- two would pay two grace periods
+ * for one move.
+ *
+ * CALLER CONTRACT, inherent to the gate: this BLOCKS on a grace period, so it
+ * must not be called from inside an RCU read-side critical section -- the grace
+ * period would wait on the caller's own section.  The cross-trie cds_ft_merge_at
+ * has no such contract: its source is exclusive, so it moves no live key and arms
+ * no gate.
+ */
+static
+enum cds_ft_status ft_rekey_dispatch(struct cds_ft *ft,
+		const uint8_t *dst_key, size_t dst_key_len,
+		const uint8_t *src_key, size_t src_key_len,
+		enum ft_rekey_mode rekey)
+{
+	bool require_empty = (rekey == FT_REKEY_GRAFT);
+	enum cds_ft_status status;
+
+	if (!ft)
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	/*
+	 * The atomic writer's shape-independent preconditions, checked BEFORE the
+	 * gate so a trie that can never use it does not pay a grace period to be
+	 * told so.  Everything else it decides for itself, from the structure.
+	 *
+	 * ★ THIS LIST ALSO CARRIES EVERY ARGUMENT CHECK THE ATOMIC WRITER DOES NOT
+	 * REPEAT.  ft_merge_at_inner owns the entry contract -- NULL keys, a length
+	 * past the group maximum, a SPECULATIVE trie (a move re-parents a leaf but
+	 * cannot rewrite its app-owned stored key, so every moved key would lie) --
+	 * and returns INVALID_ARGUMENT_ERROR for each.  Excluding them here rather
+	 * than re-checking them keeps that contract in ONE place: a rejected
+	 * argument falls through to the worker that defines the answer, and only a
+	 * request that is VALID and merely outside the atomic cut is a fallback.
+	 */
+	bool one_decide = ft->lock_fine &&
+		!ft->speculative_key_offset_active &&
+		src_key && dst_key &&
+		src_key_len == dst_key_len && src_key_len != 0 &&
+		src_key_len <= ft->group->max_key_len &&
+		ft->group->key_len != CDS_FT_LEN_VARIABLE;
+
+	ft_move_gate_enter(ft);
+	if (one_decide) {
+		switch (ft_rekey_one_decide(ft, src_key, src_key_len, dst_key,
+				dst_key_len, require_empty)) {
+		case 0:
+			status = CDS_FT_STATUS_OK;
+			goto out;
+		case -EEXIST:
+			status = CDS_FT_STATUS_POPULATED_ERROR;
+			goto out;
+		case -ENOMEM:
+			status = CDS_FT_STATUS_MEMORY_ERROR;
+			goto out;
+		case -ENOTSUP:
+			status = CDS_FT_STATUS_NOT_SUPPORTED;
+			goto out;
+		default:
+			break;		/* -EINVAL: outside the cut, stage it */
+		}
+	}
+	status = ft_merge_at_inner(ft, dst_key, dst_key_len, ft,
+			src_key, src_key_len, NULL, rekey);
+out:
+	ft_move_gate_exit(ft);
+	return status;
+}
+#endif /* FEATURE_FT_MERGE */
+
 enum cds_ft_status cds_ft_rekey_graft(struct cds_ft *ft,
 		const uint8_t *dst_key, size_t dst_key_len,
 		const uint8_t *src_key, size_t src_key_len)
 {
 #ifdef FEATURE_FT_MERGE
-	enum cds_ft_status status;
-
-	/*
-	 * ARM THE MOVE GATE.  A rekey is an IN-TRIE move: the same keys leave
-	 * one position and appear at another, and a reader walking the old path
-	 * must not conclude not-found.  ft_move_gate_enter publishes
-	 * @move_active and waits ONE grace period, so every reader already in a
-	 * critical section -- which may have branched to the FAST, non-verifying
-	 * lookup -- finishes before anything moves; readers that start after it
-	 * see the gate and take the two-pass path, which rematerializes the key
-	 * on the up-walk and re-descends when the bytes disagree.  A burst of
-	 * concurrent rekeys pays ~one grace period between them.
-	 *
-	 * Without this the two-pass machinery is unreachable in production: the
-	 * coherent lookup specializations are selected by @rekey_coherence but
-	 * ENTERED only under ft_move_active(), and until now the only callers of
-	 * the gate were the _cds_ft_debug_* test entries.
-	 *
-	 * CALLER CONTRACT, inherent to the gate: this BLOCKS on a grace period,
-	 * so it must not be called from inside an RCU read-side critical section
-	 * -- the grace period would wait on the caller's own section.  The
-	 * cross-trie cds_ft_merge_at has no such contract: its source is
-	 * exclusive, so it moves no live key and arms no gate.
-	 */
-	ft_move_gate_enter(ft);
-	status = ft_merge_at_inner(ft, dst_key, dst_key_len, ft,
-			src_key, src_key_len, NULL, FT_REKEY_GRAFT);
-	ft_move_gate_exit(ft);
-	return status;
+	return ft_rekey_dispatch(ft, dst_key, dst_key_len, src_key, src_key_len,
+			FT_REKEY_GRAFT);
 #else
 	(void) ft; (void) dst_key; (void) dst_key_len;
 	(void) src_key; (void) src_key_len;
@@ -3521,35 +3601,8 @@ enum cds_ft_status cds_ft_rekey_merge(struct cds_ft *ft,
 		const uint8_t *src_key, size_t src_key_len)
 {
 #ifdef FEATURE_FT_MERGE
-	enum cds_ft_status status;
-
-	/*
-	 * ARM THE MOVE GATE.  A rekey is an IN-TRIE move: the same keys leave
-	 * one position and appear at another, and a reader walking the old path
-	 * must not conclude not-found.  ft_move_gate_enter publishes
-	 * @move_active and waits ONE grace period, so every reader already in a
-	 * critical section -- which may have branched to the FAST, non-verifying
-	 * lookup -- finishes before anything moves; readers that start after it
-	 * see the gate and take the two-pass path, which rematerializes the key
-	 * on the up-walk and re-descends when the bytes disagree.  A burst of
-	 * concurrent rekeys pays ~one grace period between them.
-	 *
-	 * Without this the two-pass machinery is unreachable in production: the
-	 * coherent lookup specializations are selected by @rekey_coherence but
-	 * ENTERED only under ft_move_active(), and until now the only callers of
-	 * the gate were the _cds_ft_debug_* test entries.
-	 *
-	 * CALLER CONTRACT, inherent to the gate: this BLOCKS on a grace period,
-	 * so it must not be called from inside an RCU read-side critical section
-	 * -- the grace period would wait on the caller's own section.  The
-	 * cross-trie cds_ft_merge_at has no such contract: its source is
-	 * exclusive, so it moves no live key and arms no gate.
-	 */
-	ft_move_gate_enter(ft);
-	status = ft_merge_at_inner(ft, dst_key, dst_key_len, ft,
-			src_key, src_key_len, NULL, FT_REKEY_MERGE);
-	ft_move_gate_exit(ft);
-	return status;
+	return ft_rekey_dispatch(ft, dst_key, dst_key_len, src_key, src_key_len,
+			FT_REKEY_MERGE);
 #else
 	(void) ft; (void) dst_key; (void) dst_key_len;
 	(void) src_key; (void) src_key_len;

@@ -67,7 +67,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS_REKEY_DLM	10	/* inv_rekey_graft_{disjoint,cross_junction,glue_dst,coherent_readers,shared}, inv_rekey_{linearizability,public_no_gap}, inv_rekey_merge_{occupied,shared}_dst */
+#define NR_TESTS_REKEY_DLM	11	/* inv_rekey_graft_{disjoint,cross_junction,glue_dst,coherent_readers,shared}, inv_rekey_linearizability, inv_rekey_public_{atomic_no_gap,staged_gap}, inv_rekey_merge_{occupied,shared}_dst */
 
 /*
  * Base count = the RUN_TEST invocations in main() outside the DLM #ifdef.
@@ -3843,34 +3843,30 @@ static int inv_rekey_linearizability(void)
  * nothing moving would indict the geometry, not the library -- so the quiet-phase
  * count is kept and reported apart from the moving-phase count.
  *
- * KNOWN-RED, hence opt-in TWICE (FT_INV_MW selects the concurrent-writer
- * oracles, FT_INV_RKPG arms this one).  The staged path detaches into a
- * transient trie and DRAINS before merging back, so the moved keys are absent
- * from the trie for at least a full grace period per move: this is not a narrow
- * race but the standing behaviour of the implementation the public entry runs
- * (inv_rekey_no_escape drives the same entry and asserts only that no GARBAGE
- * key ever appears).  The moving-phase count is the number the coherent
- * one-decide writer has to drive to zero; drop the FT_INV_RKPG gate when it
- * does.
+ * TWO ARMS, ONE BODY -- the two writers cds_ft_rekey_graft dispatches to, put
+ * under identical probes.  create_rekey_coherent_ft explains how the group config
+ * selects one:
  *
- * MEASURED (4 writers, 8 readers, 200 ms): 41 moves, 3646731 band probes, 23490
- * of them absent -- about 573 absence observations PER MOVE, which is what a
- * grace-period-wide window looks like rather than a race.  0 absent across the
- * control phase's probes, and 0 bad exact probes: the fixed siblings are always
- * present and a moving leaf never answers as a foreign node.  The same geometry
- * driven single-threaded through 40 moves answers both band probes correctly at
- * every rest point, so the absences are the move window and not the layout.
+ *  - inv_rekey_public_atomic_no_gap (fixed-length, list off) reaches
+ *    ft_rekey_one_decide, which commits the src clear, the dst publish and the
+ *    re-parents as ONE flip.  `absent moving` MUST be 0, and this arm GATES on
+ *    it: it is the acceptance test for the atomic writer, and the thing that
+ *    fails if a future change stops routing to it.
+ *  - inv_rekey_public_staged_gap (variable-length, list on) reaches the
+ *    detach-then-merge-back writer, whose absence window no probe can talk it out
+ *    of, so that arm MEASURES the window instead of gating on it.  Opt in twice
+ *    (FT_INV_MW + FT_INV_RKPG); an oracle that is red by construction must not be
+ *    what a gate reports.
  *
- * ★ IT ALSO TRIPS A SECOND, UNRELATED DEFECT: with several writers the staged
- * placement exhausts the node reserve the rekey pre-fills ("ft alloc reserve
- * underflow: kind=0 order=5"), which an assert build turns into an abort inside
- * cds_ft_alloc_item_from and a production build degrades to a FALLIBLE
- * allocation in the step documented as unfailable -- i.e. a possible
- * MEMORY_ERROR after the detach has already committed.  It needs contention (the
- * single-threaded run above never underflows), so a contended retry of the
- * placement re-allocating from a reserve that is only filled once is the shape
- * to look at.  Not fixed here; the abort is why this oracle stays opt-in even
- * among the FT_INV_MW set.
+ * MEASURED (4 writers, 8 readers, 200 ms each): the staged arm sees ~30000
+ * absences over ~44 moves -- roughly 700 absence observations per move, which is
+ * what a grace-period-wide window looks like rather than a race -- against 0 in
+ * the atomic arm over a comparable number of moves.  Both arms report 0 absent
+ * across the control phase's ~1.5M probes and 0 bad exact probes: the fixed
+ * siblings are always present, and a moving leaf never answers as a foreign node.
+ * The same geometry driven single-threaded through 40 moves answers both band
+ * probes correctly at every rest point in either config, so an absence is the
+ * move window and not the layout.
  */
 #define RKP_NW		4		/* writers, one private band each */
 #define RKP_NR		8		/* no-gap readers */
@@ -3881,16 +3877,31 @@ static int inv_rekey_linearizability(void)
 #define RKP_SLOT_DP	1		/* ... and in the dp junction */
 
 /*
- * A VARIABLE-length group with keys that all happen to be RKP_KLEN wide.  Rekey
- * needs the variable-length group -- it stages the move through a detached
- * subtree, whose keys are stripped of the prefix and so are shorter than a
- * fixed-length group's one key length, which is why a fixed-length group is
- * refused outright (test_rekey_fixed_len_refused covers that refusal).  Uniform
- * key width is this oracle's own doing: it makes the band's key order plain
- * lexicographic, so "nothing else sorts between the delimiters" is a property of
- * the four bytes and not of prefix-vs-string ordering rules.
+ * THE TWO TRIES ARE THE TWO WRITERS, and the group config is what selects them:
+ *
+ *  - ATOMIC (@atomic true): a FIXED-length group with the ordered list OFF.
+ *    cds_ft_rekey_graft dispatches such a trie to ft_rekey_one_decide, which
+ *    commits the whole move as one flip.  Both properties are load-bearing.
+ *    Fixed-length, because the atomic writer is the only rekey a fixed-length
+ *    group gets (the staged one detaches, and a detached subtree's keys are
+ *    stripped of the prefix).  List OFF, because the atomic writer locates the
+ *    dst cell-splice position while the run is STILL at the source, so it
+ *    refuses a destination that abuts the run's own ordered neighbourhood --
+ *    which is exactly what this band geometry is.  A general rekey would locate
+ *    the splice against the run-removed list; until then the band and the list
+ *    are mutually exclusive.
+ *
+ *  - STAGED (@atomic false): a VARIABLE-length group, list on.  The atomic
+ *    writer refuses a variable-length group (its splice-position validation is
+ *    fixed-length only), so this trie gets the detach-then-merge-back writer and
+ *    its absence window.
+ *
+ * Keys are RKP_KLEN wide in BOTH, which is this oracle's own doing: uniform width
+ * makes the band's key order plain lexicographic, so "nothing else sorts between
+ * the delimiters" is a property of the four bytes rather than of
+ * prefix-vs-string ordering rules.
  */
-static struct cds_ft *create_varlen_rekey_coherent_ft(
+static struct cds_ft *create_rekey_coherent_ft(bool atomic,
 		struct cds_ft_group **group_out)
 {
 	struct cds_ft_group_attr *gattr;
@@ -3900,15 +3911,20 @@ static struct cds_ft *create_varlen_rekey_coherent_ft(
 
 	if (cds_ft_group_attr_create(&gattr) < 0)
 		abort();
-	if (cds_ft_group_attr_set_max_key_len(gattr, RKP_KLEN) < 0)
-		abort();
+	if (atomic) {
+		if (cds_ft_group_attr_set_key_len(gattr, RKP_KLEN) < 0)
+			abort();
+	} else {
+		if (cds_ft_group_attr_set_max_key_len(gattr, RKP_KLEN) < 0)
+			abort();
+	}
 	if (cds_ft_group_attr_set_lookup_optimization(gattr,
 			CDS_FT_LOOKUP_OPTIMIZE_EAGER) < 0)
 		abort();
 	if (cds_ft_group_attr_set_writer_strategy(gattr,
 			CDS_FT_WRITER_LOCK_FINE) < 0)
 		abort();
-	if (cds_ft_group_attr_set_ordered_list(gattr, true) < 0)
+	if (cds_ft_group_attr_set_ordered_list(gattr, !atomic) < 0)
 		abort();
 	if (cds_ft_group_create(gattr, &group) < 0)
 		abort();
@@ -4173,7 +4189,7 @@ static void *rkp_reader(void *arg)
 	return NULL;
 }
 
-static int inv_rekey_public_no_gap(void)
+static int inv_rekey_public_no_gap_run(bool atomic, const char *name)
 {
 	struct cds_ft_group *group;
 	struct cds_ft *ft;
@@ -4187,22 +4203,10 @@ static int inv_rekey_public_no_gap(void)
 	unsigned long exact = 0, exact_bad = 0;
 	int i, c, j, ret = 0;
 
-	if (!getenv("FT_INV_MW")) {
-		fprintf(stderr, "# inv_rekey_public_no_gap: skipped "
-			"(set FT_INV_MW=1 to run the concurrent-writer oracles)\n");
-		return 0;
-	}
-	if (!getenv("FT_INV_RKPG")) {
-		fprintf(stderr, "# inv_rekey_public_no_gap: skipped -- the PUBLIC "
-			"cds_ft_rekey_graft still moves by detach-into-a-transient-trie, "
-			"so a moved key is absent for a grace period per move; set "
-			"FT_INV_RKPG=1 to measure the gap\n");
-		return 0;
-	}
 	mw_install_fatal_handler();
 	leak_reset();
 
-	ft = create_varlen_rekey_coherent_ft(&group);	/* EAGER + ordered list */
+	ft = create_rekey_coherent_ft(atomic, &group);
 	cds_ft_make_concurrent(ft);
 
 	guard_lo = node_alloc(0x00000000ULL);
@@ -4353,10 +4357,10 @@ static int inv_rekey_public_no_gap(void)
 	if (quiet_bad || move_bad || exact_bad)
 		ret = -1;
 
-	fprintf(stderr, "# inv_rekey_public_no_gap: %d writers %d readers, "
+	fprintf(stderr, "# %s: %d writers %d readers, "
 		"%lu moves, %lu busy, %lu band probes (%lu absent moving; "
 		"%lu parked, %lu absent), %lu exact probes (%lu bad), "
-		"%lu live keys\n",
+		"%lu live keys\n", name,
 		RKP_NW, RKP_NR, total_ops, total_busy, band, move_bad,
 		quiet, quiet_bad, exact, exact_bad, live);
 
@@ -4367,6 +4371,45 @@ static int inv_rekey_public_no_gap(void)
 	if (leak_check() < 0)
 		ret = -1;
 	return ret;
+}
+
+/*
+ * THE ATOMIC ARM -- the acceptance test for the one-decide writer, and a GATE:
+ * every band probe must answer the run, so `absent moving` must be 0.  It needs
+ * no second opt-in, unlike the staged arm below, because there is nothing
+ * known-red about it.
+ */
+static int inv_rekey_public_atomic_no_gap(void)
+{
+	if (!getenv("FT_INV_MW")) {
+		fprintf(stderr, "# inv_rekey_public_atomic_no_gap: skipped "
+			"(set FT_INV_MW=1 to run the concurrent-writer oracles)\n");
+		return 0;
+	}
+	return inv_rekey_public_no_gap_run(true,
+			"inv_rekey_public_atomic_no_gap");
+}
+
+/*
+ * THE STAGED ARM -- the same probes against the writer that cannot satisfy them,
+ * so it MEASURES the absence window (see the header above) instead of gating on
+ * it.  Opt in twice.
+ */
+static int inv_rekey_public_staged_gap(void)
+{
+	if (!getenv("FT_INV_MW")) {
+		fprintf(stderr, "# inv_rekey_public_staged_gap: skipped "
+			"(set FT_INV_MW=1 to run the concurrent-writer oracles)\n");
+		return 0;
+	}
+	if (!getenv("FT_INV_RKPG")) {
+		fprintf(stderr, "# inv_rekey_public_staged_gap: skipped -- a "
+			"variable-length group still moves by detach-into-a-transient-"
+			"trie, so a moved key is absent for a grace period per move; "
+			"set FT_INV_RKPG=1 to measure the gap\n");
+		return 0;
+	}
+	return inv_rekey_public_no_gap_run(false, "inv_rekey_public_staged_gap");
 }
 
 /*
@@ -17505,7 +17548,8 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_rekey_graft_coherent_readers);
 	RUN_TEST(inv_rekey_graft_shared);
 	RUN_TEST(inv_rekey_linearizability);
-	RUN_TEST(inv_rekey_public_no_gap);
+	RUN_TEST(inv_rekey_public_atomic_no_gap);
+	RUN_TEST(inv_rekey_public_staged_gap);
 	RUN_TEST(inv_rekey_merge_occupied_dst);
 	RUN_TEST(inv_rekey_merge_shared_dst);
 	RUN_TEST(inv_rekey_src_mutated);
