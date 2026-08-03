@@ -577,6 +577,11 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	unsigned long merged_keys = 0;
 	bool merge_dst = false, src_glue_live = false;
 	/*
+	 * The dst position abuts the moved run, so the move leaves the run's ordered
+	 * position alone -- see the splice-position derivation.
+	 */
+	bool run_keeps_pos = false;
+	/*
 	 * +2, not +1: cow_stop can fill S_top plus all FT_ENTRY_PER_NODE of its
 	 * children, and the GLUE shape adds the split cluster's one displaced child.
 	 */
@@ -829,8 +834,30 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		if (!ft_rekey_splice_pos_brackets(ft, dst_ord, dst_len, run_dpred,
 				run_dsucc))
 			return -EAGAIN;
+		/*
+		 * THE DST POSITION ABUTS THE RUN, and that is not a shape to refuse: it
+		 * means the moved keys sort into the SAME list slot the run already
+		 * occupies, so the unsplice and the re-splice CANCEL and the run STAYS
+		 * PUT.  Recorded as @run_keeps_pos and honoured at the splice below.
+		 *
+		 * Why it cancels, for the two ways it arises.  The located pair is
+		 * ADJACENT in the list, so @run_dsucc == the run's first cell forces
+		 * @run_dpred to be the run's own predecessor A, and @run_dpred == its
+		 * last cell forces @run_dsucc to be its successor B.  Either way the dst
+		 * key range lies strictly inside (A, B) -- and the run is the ONLY thing
+		 * in (A, B) -- so the run's NEW keys sort between A and B exactly where
+		 * its old ones did.  Nothing about the list has to change.
+		 *
+		 * Emitting the six edges anyway is what made this look unsupportable:
+		 * the unsplice's A->next = B and the re-splice's A->next = rfc are TWO
+		 * RECORDS ON ONE SLOT, which breaks the engine's distinct-slot rule and
+		 * would plain-store a self-cyclic run link.  Locating the pair against
+		 * the run-REMOVED list -- the other repair this comment used to propose
+		 * -- yields (A, B) and therefore those same cancelling edges; the
+		 * cancellation is the answer, not a different derivation.
+		 */
 		if (run_dsucc == rfc || run_dpred == rlc)
-			return -EINVAL;
+			run_keeps_pos = true;
 	}
 
 	cnt = ft_nr_keys_get(s_top_meta);	/* subtree key count (count edges no-op if rank off) */
@@ -1430,6 +1457,35 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		rlc = ft_ord_cell_ptr(rcu_dereference(run_rlast->prev));
 		src_pred = ft_ord_cell_resolve_ord(&rfc->lnode.prev);
 		src_succ = ft_ord_cell_resolve_ord(&rlc->lnode.next);
+		if (run_keeps_pos) {
+			/*
+			 * The run keeps its ordered position (the dst abuts it), so there
+			 * is nothing to splice -- but "nothing changed" still has to be
+			 * ASSERTED at the decide.  Between the derivation above and this
+			 * commit a peer can splice a key into the run's own boundary, and
+			 * the new keys would then sort on the wrong side of it: a list
+			 * left well-formed and no longer key-ordered, with no edge of this
+			 * commit noticing.  On the moving path the six edges are what
+			 * notices; here two VALIDATE edges (old == new) on the run's OUTER
+			 * links do it, so such a peer aborts this commit clean and the
+			 * caller re-derives.
+			 *
+			 * The run's own links rather than A's and B's: a peer may REMOVE a
+			 * neighbour, and an edge on a dying cell's slot is worse than one
+			 * on a cell this move already owns.  Distinct by construction --
+			 * ->prev and ->next are different fields even for a one-cell run.
+			 */
+			cedges[0].tag = URCU_TXN_TAG;
+			cedges[0].slot = (struct ft_ord_cell **) &rfc->lnode.prev;
+			cedges[0].old_target = src_pred;
+			cedges[0].new_target = src_pred;
+			cedges[1].tag = URCU_TXN_TAG;
+			cedges[1].slot = (struct ft_ord_cell **) &rlc->lnode.next;
+			cedges[1].old_target = src_succ;
+			cedges[1].new_target = src_succ;
+			ft_ord_cell_record_into(txn, cedges, 2);
+			goto cells_done;
+		}
 		if (src_pred == ft_ord_or_sentinel(ft, run_dpred) ||
 				src_succ == ft_ord_or_sentinel(ft, run_dsucc)) {
 			pp_meta = NULL;		/* ft_glue_abort: single owner */
@@ -1463,6 +1519,8 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		cn = ft_ord_cell_run_resplice_edges(ft, rfc, rlc, run_dpred,
 				run_dsucc, cedges, cn);
 		ft_ord_cell_record_into(txn, cedges, cn);
+cells_done:
+		;
 	}
 
 	/*

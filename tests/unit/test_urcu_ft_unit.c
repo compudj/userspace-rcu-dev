@@ -68,13 +68,13 @@
 #endif
 
 /*
- * 290 unconditional + 49 fault-injection-only RUN_TEST registrations, on top of
+ * 291 unconditional + 49 fault-injection-only RUN_TEST registrations, on top of
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (339 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (340 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (290 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (291 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -10817,6 +10817,153 @@ static int test_rekey_graft_vs_merge(void)
 	ret = 0;
 out:
 	rcu_read_unlock();
+	drain_trie(ft);
+	rcu_barrier();
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
+ * The atomic rekey when the destination ABUTS the moved run, with the ordered
+ * list ON -- the case where the splice CANCELS.
+ *
+ * The destination is ordered-adjacent to the run by construction here: the run
+ * sits at the TOP of the bp junction and the destination is the BOTTOM slot of the
+ * next junction, with nothing sorting between them.  So the moved keys land in the
+ * very list slot the run already occupies, the unsplice and the re-splice cancel,
+ * and the writer must leave the list alone rather than emit six edges of which two
+ * would target one slot.  Both directions run: bp->dp locates the run's LAST cell
+ * as the destination's predecessor, dp->bp locates its FIRST cell as the successor.
+ *
+ * The assertion that matters is the ORDERED WALK: a cancellation that skipped too
+ * much (or spliced anyway) leaves a list that is still a well-formed doubly-linked
+ * list and no longer in key order, which key membership and the count cannot see.
+ *
+ * The concurrent side is inv_rekey_public_atomic_no_gap_varlen, whose band geometry
+ * is abutting on every move; this exists so the path is also covered in the build
+ * configurations that do not run the concurrent-writer oracles at all.
+ */
+static int test_rekey_abutting_dst_keeps_list_order(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	struct cds_ft_iter *iter = NULL;
+	enum cds_ft_status s;
+	const uint8_t bp = 0x10, dp = 0x11;	/* CONSECUTIVE junction bytes */
+	uint8_t at_bp[2] = { 0x10, 0x09 }, at_dp[2] = { 0x11, 0x01 };
+	int dir, ret = -1;
+
+	if (!cds_ft_merge_enabled()) {
+		diag("test_rekey_abutting_dst_keeps_list_order: skipped, merge "
+			"compiled out (-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
+	ft = create_fixed_ord_rekey_ft(4, &group);	/* fixed, ordered list ON */
+	if (cds_ft_iter_create(ft, &iter) < 0)
+		abort();
+	rcu_read_lock();
+	/* List ends, so the run is never at the head or tail. */
+	if (insert_u64(ft, 0x00000000ULL, node_alloc(0)) != CDS_FT_STATUS_OK ||
+			insert_u64(ft, 0xff000000ULL, node_alloc(1))
+				!= CDS_FT_STATUS_OK)
+		abort();
+	/*
+	 * Junction siblings: the run's slot is the HIGHEST child of bp and the
+	 * destination slot the LOWEST of dp, so nothing sorts between them.  Three
+	 * children each keeps the junction from collapsing when the run leaves.
+	 */
+	{
+		uint64_t sib[4] = {
+			((uint64_t) bp << 24) | (0x01ULL << 16),
+			((uint64_t) bp << 24) | (0x05ULL << 16),
+			((uint64_t) dp << 24) | (0x05ULL << 16),
+			((uint64_t) dp << 24) | (0x09ULL << 16),
+		};
+		int i;
+
+		for (i = 0; i < 4; i++)
+			if (insert_u64(ft, sib[i], node_alloc(sib[i]))
+					!= CDS_FT_STATUS_OK)
+				abort();
+		for (i = 1; i <= 4; i++) {
+			uint64_t k = ((uint64_t) bp << 24) | (0x09ULL << 16) |
+				((uint64_t) i << 8);
+
+			if (insert_u64(ft, k, node_alloc(k)) != CDS_FT_STATUS_OK)
+				abort();
+		}
+	}
+	rcu_read_unlock();
+
+	/* dir 0: bp -> dp (dst pred IS the run's last cell); dir 1: back. */
+	for (dir = 0; dir < 2; dir++) {
+		const uint8_t *src = dir ? at_dp : at_bp;
+		const uint8_t *dst = dir ? at_bp : at_dp;
+		uint64_t prev = 0;
+		int nr = 0, i;
+
+		s = cds_ft_rekey_graft(ft, dst, 2, src, 2);
+		if (s != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "rekey_abut: dir %d refused (%s)\n", dir,
+				cds_ft_status_to_string(s));
+			goto out;
+		}
+		rcu_read_lock();
+		if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "rekey_abut: dir %d verify failed\n", dir);
+			rcu_read_unlock();
+			goto out;
+		}
+		/* The list must still be in key order. */
+		for (s = cds_ft_lookup_first(ft, iter); s == CDS_FT_STATUS_OK;
+				s = cds_ft_next(ft, iter)) {
+			uint8_t k[8];
+			size_t l;
+			uint64_t v = 0;
+			unsigned int b;
+
+			if (cds_ft_iter_get_key(iter, k, sizeof k, &l) !=
+					CDS_FT_STATUS_OK || l != 4)
+				break;
+			for (b = 0; b < 4; b++)
+				v = (v << 8) | k[b];
+			if (nr && v <= prev) {
+				fprintf(stderr, "rekey_abut: dir %d list out of "
+					"order at %d (%#llx after %#llx)\n", dir,
+					nr, (unsigned long long) v,
+					(unsigned long long) prev);
+				rcu_read_unlock();
+				goto out;
+			}
+			prev = v;
+			nr++;
+		}
+		/* 2 ends + 4 siblings + the 4-key run. */
+		if (nr != 10 || cds_ft_count_keys(ft) != 10) {
+			fprintf(stderr, "rekey_abut: dir %d walked %d of 10 "
+				"(count %lu)\n", dir, nr, cds_ft_count_keys(ft));
+			rcu_read_unlock();
+			goto out;
+		}
+		for (i = 1; i <= 4; i++) {
+			uint64_t moved = ((uint64_t) dst[0] << 24) |
+				((uint64_t) dst[1] << 16) | ((uint64_t) i << 8);
+			struct cds_ft_node *found = NULL;
+
+			if (lookup_u64(ft, moved, &found) != CDS_FT_STATUS_OK) {
+				fprintf(stderr, "rekey_abut: dir %d leaf %d not "
+					"at the dst\n", dir, i);
+				rcu_read_unlock();
+				goto out;
+			}
+		}
+		rcu_read_unlock();
+	}
+	ret = 0;
+out:
+	if (iter)
+		cds_ft_iter_destroy(iter);
 	drain_trie(ft);
 	rcu_barrier();
 	cds_ft_destroy(ft);
@@ -30488,6 +30635,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_rekey_graft_vs_merge);
 	RUN_TEST(test_rekey_fixed_len_atomic_or_refused);
 	RUN_TEST(test_rekey_varlen_ordered_splice);
+	RUN_TEST(test_rekey_abutting_dst_keeps_list_order);
 	RUN_TEST(test_merge_rekey_same_trie_ordered);
 	RUN_TEST(test_merge_rekey_same_trie_listoff_collision);
 	RUN_TEST(test_nonidentity_bulk_ops);

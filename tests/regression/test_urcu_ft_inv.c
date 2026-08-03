@@ -3880,22 +3880,28 @@ static int inv_rekey_linearizability(void)
  * THE GROUP CONFIG IS WHAT SELECTS THE WRITER, and the three arms cover both of
  * them plus both group flavours:
  *
- *  - RKP_ATOMIC_FIXED / RKP_ATOMIC_VARLEN: the ordered list OFF, so
- *    cds_ft_rekey_graft dispatches to ft_rekey_one_decide, which commits the
- *    whole move as one flip.  Fixed-length MUST take that writer (the staged one
- *    detaches, and a detached subtree's keys are stripped of the prefix, so a
- *    fixed-length group has no staged rekey at all); variable-length may, and the
- *    two arms differ ONLY in the group flavour, which is what makes the pair the
- *    acceptance test for widening the cut to variable-length groups.
+ *  - RKP_ATOMIC_FIXED: a FIXED-length group, list OFF -- the atomic writer with
+ *    no cells in play at all.  Fixed-length MUST take that writer, the staged one
+ *    being variable-length-only (it detaches, and a detached subtree's keys are
+ *    stripped of the prefix).
  *
- *  - RKP_STAGED: variable-length with the list ON.  The atomic writer locates the
- *    dst cell-splice position while the run is STILL at the source, so it refuses
- *    a destination abutting the run's own ordered neighbourhood -- which is
- *    exactly what this band geometry is -- and the move falls back to the
- *    detach-then-merge-back writer and its absence window.  ★ So the band and the
- *    ordered list stay mutually exclusive until a general rekey locates the splice
- *    against the run-removed list; that, not the key length, is what keeps this
- *    arm staged.
+ *  - RKP_ATOMIC_VARLEN: a VARIABLE-length group with the list ON -- the atomic
+ *    writer WITH the ordered-cell work, and specifically the case where the
+ *    destination ABUTS the moved run, which is what this band geometry always is
+ *    (the two candidate positions are ordered-adjacent by construction).  The
+ *    writer recognises that the run's ordered position does not change and
+ *    validates it instead of splicing.  This arm is therefore the acceptance test
+ *    for BOTH widenings: variable-length groups, and the abutting destination.
+ *
+ *  - RKP_STAGED: variable-length, list on, and a run of a SINGLE key, so the
+ *    source prefix path-compresses and the atomic writer refuses the shape (it
+ *    needs a plain POPCOUNT/PIGEON subtree top).  The move falls back to
+ *    detach-then-merge-back and its absence window.  ★ That is now what keeps this
+ *    arm staged: neither the key length nor the band's adjacency does any more.
+ *    ★★ NOT a COARSE trie, which would be the obvious way to force the fallback
+ *    and HANGS instead -- four COARSE writers park on the FT-wide mutex while
+ *    ONLINE, so the grace period inside the lock never completes (the stall
+ *    recorded in doc/design; measured here as a 300 s timeout).
  *
  * Keys are RKP_KLEN wide in ALL THREE, which is this oracle's own doing: uniform
  * width makes the band's key order plain lexicographic, so "nothing else sorts
@@ -3932,7 +3938,7 @@ static struct cds_ft *create_rekey_coherent_ft(enum rkp_mode mode,
 			CDS_FT_WRITER_LOCK_FINE) < 0)
 		abort();
 	if (cds_ft_group_attr_set_ordered_list(gattr,
-			mode == RKP_STAGED) < 0)
+			mode != RKP_ATOMIC_FIXED) < 0)
 		abort();
 	if (cds_ft_group_create(gattr, &group) < 0)
 		abort();
@@ -3976,7 +3982,8 @@ struct rkp_writer_arg {
 	struct cds_ft *ft;
 	uint8_t bp, dp;			/* consecutive junction bytes, bp < dp */
 	struct ft_test_node *sib[4];	/* fixed: (bp,1) (bp,5) (dp,5) (dp,9) */
-	struct ft_test_node *top[4];	/* the run's four leaves, they move */
+	struct ft_test_node *top[4];	/* the run's leaves, they move */
+	int nr_run;			/* how many of @top exist (see rkp_mode) */
 	int at_dst;			/* 0: run at (bp,9); 1: run at (dp,1) */
 	unsigned long ops, busy;
 	int failed;
@@ -4103,8 +4110,8 @@ static void *rkp_reader(void *arg)
 			 */
 			int hi = pick & 1;
 			uint64_t bound = hi ? rkp_sib_key(w, 2) : rkp_sib_key(w, 1);
-			struct cds_ft_node *expect = hi ? &w->top[3]->node :
-				&w->top[0]->node;
+			struct cds_ft_node *expect = hi ?
+				&w->top[w->nr_run - 1]->node : &w->top[0]->node;
 			int moving = rkp_moving;
 
 			cds_ft_u64_to_key(r->ft, bound, k, RKP_KLEN);
@@ -4165,7 +4172,7 @@ static void *rkp_reader(void *arg)
 			 * legitimate (the run may be at the other junction),
 			 * a FOREIGN node never is.
 			 */
-			int c = rand_r(&seed) & 3, hi = rand_r(&seed) & 1;
+			int c = rand_r(&seed) % w->nr_run, hi = rand_r(&seed) & 1;
 			uint64_t key = hi ?
 				rkp_key(w->dp, RKP_SLOT_DP, (uint8_t) (c + 1)) :
 				rkp_key(w->bp, RKP_SLOT_BP, (uint8_t) (c + 1));
@@ -4239,6 +4246,11 @@ static int inv_rekey_public_no_gap_run(enum rkp_mode mode, const char *name)
 		w[i].ft = ft;
 		w[i].bp = (uint8_t) (2 * i + 1);
 		w[i].dp = (uint8_t) (2 * i + 2);
+		/*
+		 * ONE key in the run stages the move: a single-key subtree
+		 * path-compresses, and the atomic writer needs a plain internal top.
+		 */
+		w[i].nr_run = (mode == RKP_STAGED) ? 1 : 4;
 		rcu_read_lock();
 		for (j = 0; j < 4; j++) {
 			uint64_t sk = rkp_sib_key(&w[i], j);
@@ -4247,7 +4259,7 @@ static int inv_rekey_public_no_gap_run(enum rkp_mode mode, const char *name)
 			if (rkp_insert(ft, sk, w[i].sib[j]) != CDS_FT_STATUS_OK)
 				abort();
 		}
-		for (c = 0; c < 4; c++) {
+		for (c = 0; c < w[i].nr_run; c++) {
 			uint64_t tk = rkp_key(w[i].bp, RKP_SLOT_BP,
 					(uint8_t) (c + 1));
 
@@ -4256,7 +4268,7 @@ static int inv_rekey_public_no_gap_run(enum rkp_mode mode, const char *name)
 				abort();
 		}
 		rcu_read_unlock();
-		live += 8;
+		live += 4 + (unsigned long) w[i].nr_run;
 	}
 	for (i = 0; i < RKP_NR; i++) {
 		r[i].ft = ft;
@@ -4324,7 +4336,7 @@ static int inv_rekey_public_no_gap_run(enum rkp_mode mode, const char *name)
 					found != &w[i].sib[j]->node)
 				ret = -1;
 		}
-		for (c = 0; c < 4; c++) {
+		for (c = 0; c < w[i].nr_run; c++) {
 			struct cds_ft_node *found = NULL;
 
 			if (rkp_lookup(ft, rkp_key(X, slot, (uint8_t) (c + 1)),
