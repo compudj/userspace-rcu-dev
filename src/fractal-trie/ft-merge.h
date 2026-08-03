@@ -2734,9 +2734,17 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 	/*
 	 * merge_at is a mutator; the application provides mutual exclusion
 	 * between mutators.  Take the reentrant writer-validation scope (like
-	 * cds_ft_graft_swap), NOT a flavor read lock -- the spine-copy commit
-	 * calls update_synchronize_rcu, which would deadlock inside a
-	 * read-side critical section.
+	 * cds_ft_graft_swap), NOT a blanket flavor read lock.
+	 *
+	 * The reason is the REKEY entries, not merge_at.  cds_ft_merge_at
+	 * consumes an EXCLUSIVE source, so every ft_writer_lock_gp_wait on its
+	 * path -- both here and both in ft_graft_keylen -- is
+	 * !src_ft->exclusive-gated and never runs; that path syncs nowhere, and
+	 * the spine copy pins it under a read lock for exactly that reason.
+	 * cds_ft_rekey_{graft,merge} share this body with src_ft == dst_ft, a
+	 * LIVE trie: there those waits DO run, and a read lock held across one
+	 * would be a writer waiting on its own grace period.  One body, two
+	 * source contracts -- so the pin is taken per path, not here.
 	 */
 	ft_crosstrie_lock_mode_guard(dst_ft, src_ft);
 	CDS_FT_SCOPED_WRITER(dst_ft);
@@ -3045,6 +3053,26 @@ merge_spine_retry:
 	kd = ft_merge_descend(dst_ft, okey_dst, dst_key_len, &d_dst,
 			&off_dst, &cnt_dst);
 	MRG_SKIPCONF_PROBE(2, d_dst);
+	/*
+	 * Reanchor level-move: a peer chain-merge absorbed this slot's level
+	 * into a longer compressed node while the descent walked it, so @d_dst
+	 * names a position that has moved and every count and offset derived
+	 * from it describes the old shape.  Insert and graft already bail on
+	 * this; merge read it and continued.
+	 *
+	 * Re-descend down the SAME unwind the spine copy's contention path
+	 * uses: nothing is built here (the label is above the read-lock pin,
+	 * and the detach branch returned long before), so this is the state
+	 * that path already returns to.  Release the pin first -- a retry
+	 * re-reads, so it must re-pin.
+	 */
+	if (caa_unlikely(d_dst.skip_conflict)) {
+		if (md_rlock) {
+			dst_ft->group->flavor->read_unlock();
+			md_rlock = false;
+		}
+		goto merge_spine_retry;
+	}
 
 	/*
 	 * Atomic build-invisible spine-copy of @src_ft's subtree at @src_key into
