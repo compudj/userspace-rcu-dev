@@ -67,7 +67,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS_REKEY_DLM	11	/* inv_rekey_graft_{disjoint,cross_junction,glue_dst,coherent_readers,shared}, inv_rekey_linearizability, inv_rekey_public_{atomic_no_gap,staged_gap}, inv_rekey_merge_{occupied,shared}_dst */
+#define NR_TESTS_REKEY_DLM	12	/* inv_rekey_graft_{disjoint,cross_junction,glue_dst,coherent_readers,shared}, inv_rekey_linearizability, inv_rekey_public_{atomic_no_gap,atomic_no_gap_varlen,staged_gap}, inv_rekey_merge_{occupied,shared}_dst */
 
 /*
  * Base count = the RUN_TEST invocations in main() outside the DLM #ifdef.
@@ -3877,31 +3877,38 @@ static int inv_rekey_linearizability(void)
 #define RKP_SLOT_DP	1		/* ... and in the dp junction */
 
 /*
- * THE TWO TRIES ARE THE TWO WRITERS, and the group config is what selects them:
+ * THE GROUP CONFIG IS WHAT SELECTS THE WRITER, and the three arms cover both of
+ * them plus both group flavours:
  *
- *  - ATOMIC (@atomic true): a FIXED-length group with the ordered list OFF.
- *    cds_ft_rekey_graft dispatches such a trie to ft_rekey_one_decide, which
- *    commits the whole move as one flip.  Both properties are load-bearing.
- *    Fixed-length, because the atomic writer is the only rekey a fixed-length
- *    group gets (the staged one detaches, and a detached subtree's keys are
- *    stripped of the prefix).  List OFF, because the atomic writer locates the
- *    dst cell-splice position while the run is STILL at the source, so it
- *    refuses a destination that abuts the run's own ordered neighbourhood --
- *    which is exactly what this band geometry is.  A general rekey would locate
- *    the splice against the run-removed list; until then the band and the list
- *    are mutually exclusive.
+ *  - RKP_ATOMIC_FIXED / RKP_ATOMIC_VARLEN: the ordered list OFF, so
+ *    cds_ft_rekey_graft dispatches to ft_rekey_one_decide, which commits the
+ *    whole move as one flip.  Fixed-length MUST take that writer (the staged one
+ *    detaches, and a detached subtree's keys are stripped of the prefix, so a
+ *    fixed-length group has no staged rekey at all); variable-length may, and the
+ *    two arms differ ONLY in the group flavour, which is what makes the pair the
+ *    acceptance test for widening the cut to variable-length groups.
  *
- *  - STAGED (@atomic false): a VARIABLE-length group, list on.  The atomic
- *    writer refuses a variable-length group (its splice-position validation is
- *    fixed-length only), so this trie gets the detach-then-merge-back writer and
- *    its absence window.
+ *  - RKP_STAGED: variable-length with the list ON.  The atomic writer locates the
+ *    dst cell-splice position while the run is STILL at the source, so it refuses
+ *    a destination abutting the run's own ordered neighbourhood -- which is
+ *    exactly what this band geometry is -- and the move falls back to the
+ *    detach-then-merge-back writer and its absence window.  ★ So the band and the
+ *    ordered list stay mutually exclusive until a general rekey locates the splice
+ *    against the run-removed list; that, not the key length, is what keeps this
+ *    arm staged.
  *
- * Keys are RKP_KLEN wide in BOTH, which is this oracle's own doing: uniform width
- * makes the band's key order plain lexicographic, so "nothing else sorts between
- * the delimiters" is a property of the four bytes rather than of
- * prefix-vs-string ordering rules.
+ * Keys are RKP_KLEN wide in ALL THREE, which is this oracle's own doing: uniform
+ * width makes the band's key order plain lexicographic, so "nothing else sorts
+ * between the delimiters" is a property of the four bytes rather than of the
+ * prefix-sorts-first rule that variable-length keys otherwise bring.
  */
-static struct cds_ft *create_rekey_coherent_ft(bool atomic,
+enum rkp_mode {
+	RKP_ATOMIC_FIXED,
+	RKP_ATOMIC_VARLEN,
+	RKP_STAGED,
+};
+
+static struct cds_ft *create_rekey_coherent_ft(enum rkp_mode mode,
 		struct cds_ft_group **group_out)
 {
 	struct cds_ft_group_attr *gattr;
@@ -3911,7 +3918,7 @@ static struct cds_ft *create_rekey_coherent_ft(bool atomic,
 
 	if (cds_ft_group_attr_create(&gattr) < 0)
 		abort();
-	if (atomic) {
+	if (mode == RKP_ATOMIC_FIXED) {
 		if (cds_ft_group_attr_set_key_len(gattr, RKP_KLEN) < 0)
 			abort();
 	} else {
@@ -3924,7 +3931,8 @@ static struct cds_ft *create_rekey_coherent_ft(bool atomic,
 	if (cds_ft_group_attr_set_writer_strategy(gattr,
 			CDS_FT_WRITER_LOCK_FINE) < 0)
 		abort();
-	if (cds_ft_group_attr_set_ordered_list(gattr, !atomic) < 0)
+	if (cds_ft_group_attr_set_ordered_list(gattr,
+			mode == RKP_STAGED) < 0)
 		abort();
 	if (cds_ft_group_create(gattr, &group) < 0)
 		abort();
@@ -4189,7 +4197,7 @@ static void *rkp_reader(void *arg)
 	return NULL;
 }
 
-static int inv_rekey_public_no_gap_run(bool atomic, const char *name)
+static int inv_rekey_public_no_gap_run(enum rkp_mode mode, const char *name)
 {
 	struct cds_ft_group *group;
 	struct cds_ft *ft;
@@ -4206,7 +4214,7 @@ static int inv_rekey_public_no_gap_run(bool atomic, const char *name)
 	mw_install_fatal_handler();
 	leak_reset();
 
-	ft = create_rekey_coherent_ft(atomic, &group);
+	ft = create_rekey_coherent_ft(mode, &group);
 	cds_ft_make_concurrent(ft);
 
 	guard_lo = node_alloc(0x00000000ULL);
@@ -4386,8 +4394,25 @@ static int inv_rekey_public_atomic_no_gap(void)
 			"(set FT_INV_MW=1 to run the concurrent-writer oracles)\n");
 		return 0;
 	}
-	return inv_rekey_public_no_gap_run(true,
+	return inv_rekey_public_no_gap_run(RKP_ATOMIC_FIXED,
 			"inv_rekey_public_atomic_no_gap");
+}
+
+/*
+ * THE SAME ARM ON A VARIABLE-LENGTH GROUP -- the acceptance test for widening the
+ * atomic cut past fixed-length groups.  It differs from the arm above in the group
+ * flavour and NOTHING else, so a nonzero `absent moving` here against a zero there
+ * would name the key-length generalization specifically.
+ */
+static int inv_rekey_public_atomic_no_gap_varlen(void)
+{
+	if (!getenv("FT_INV_MW")) {
+		fprintf(stderr, "# inv_rekey_public_atomic_no_gap_varlen: skipped "
+			"(set FT_INV_MW=1 to run the concurrent-writer oracles)\n");
+		return 0;
+	}
+	return inv_rekey_public_no_gap_run(RKP_ATOMIC_VARLEN,
+			"inv_rekey_public_atomic_no_gap_varlen");
 }
 
 /*
@@ -4409,7 +4434,8 @@ static int inv_rekey_public_staged_gap(void)
 			"set FT_INV_RKPG=1 to measure the gap\n");
 		return 0;
 	}
-	return inv_rekey_public_no_gap_run(false, "inv_rekey_public_staged_gap");
+	return inv_rekey_public_no_gap_run(RKP_STAGED,
+			"inv_rekey_public_staged_gap");
 }
 
 /*
@@ -17549,6 +17575,7 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_rekey_graft_shared);
 	RUN_TEST(inv_rekey_linearizability);
 	RUN_TEST(inv_rekey_public_atomic_no_gap);
+	RUN_TEST(inv_rekey_public_atomic_no_gap_varlen);
 	RUN_TEST(inv_rekey_public_staged_gap);
 	RUN_TEST(inv_rekey_merge_occupied_dst);
 	RUN_TEST(inv_rekey_merge_shared_dst);

@@ -406,9 +406,9 @@ void *_cds_ft_debug_child_at(struct cds_ft *ft, const uint8_t *key,
  *
  * So re-derive each neighbour's key from the STRUCTURE (the same up-walk the
  * rekey-coherent reader uses, ordinal space, right-aligned in @scratch) and
- * require pred < the dst range < succ.  Fixed-length groups only (the hook's
- * scope): the dst key is a PREFIX, so the range is @dst_ord padded with the
- * ordinal extremes.
+ * require pred < the dst range < succ.  @dst_key is a PREFIX, so the range is
+ * every key that extends it, and ft_rekey_prefix_range_cmp is what places a
+ * neighbour against that range in either group flavour.
  *
  * A sentinel / absent neighbour has no key, but it is NOT exempt: it ASSERTS that
  * the run belongs at the list end, so the assertion itself is what gets checked --
@@ -420,41 +420,64 @@ void *_cds_ft_debug_child_at(struct cds_ft *ft, const uint8_t *key,
  * the endpoint-adjacency guard as a bogus PERMANENT -EINVAL.  That was the last
  * residual failure of the shared-junction oracle (~1 run in 70).
  */
+/*
+ * Where does the ordinal key @kb (@klen bytes) sit relative to the RANGE of keys
+ * the prefix @dst_ord (@dst_len bytes) covers?  -1 below it, 0 inside it, 1 above.
+ *
+ * The trie's key order compares bytes over the COMMON length and, on a tie, puts
+ * the SHORTER key first (measured: 'aa' < 'ab' < 'abc' < 'abd' < 'b').  So the
+ * range is [@dst_ord itself .. every key extending it]: a strict PREFIX of
+ * @dst_ord sorts BELOW the range, and @dst_ord itself is INSIDE.  A fixed-length
+ * group is the special case where no key is shorter than @dst_len, which is why
+ * this used to be expressible as a plain compare against @dst_ord padded with the
+ * ordinal extremes -- that padding is what tied the check to fixed lengths, and
+ * comparing over the common length instead needs no padding at all.
+ */
+static
+int ft_rekey_prefix_range_cmp(const uint8_t *kb, size_t klen,
+		const uint8_t *dst_ord, size_t dst_len)
+{
+	size_t n = klen < dst_len ? klen : dst_len;
+	int cmp = memcmp(kb, dst_ord, n);
+
+	if (cmp != 0)
+		return cmp < 0 ? -1 : 1;
+	return klen < dst_len ? -1 : 0;
+}
+
 static
 bool ft_rekey_splice_pos_brackets(struct cds_ft *ft, const uint8_t *dst_ord,
 		size_t dst_len, struct ft_ord_cell *pred,
 		struct ft_ord_cell *succ)
 {
-	size_t flen = ft->group->key_len, max_len = ft->group->max_key_len;
-	uint8_t lo[FT_MAX_KEY_LEN], hi[FT_MAX_KEY_LEN];
+	size_t max_len = ft->group->max_key_len;
 	uint8_t scratch[FT_MAX_KEY_LEN];
 	struct ft_ord_cell *sentinel = ft_ord_sentinel_cell(ft);
 	bool pred_end = !pred || pred == sentinel;
 	bool succ_end = !succ || succ == sentinel;
 	size_t klen;
 
-	if (flen == CDS_FT_LEN_VARIABLE || dst_len > flen)
-		return true;			/* out of this hook's scope */
 	if (pred_end && succ_end)
 		return false;			/* "empty list" -- the run is IN it */
 	if (pred_end && ft_ord_first(ft) != succ)
 		return false;			/* head insert, but succ is not the min */
 	if (succ_end && ft_ord_last(ft) != pred)
 		return false;			/* tail insert, but pred is not the max */
-	memcpy(lo, dst_ord, dst_len);
-	memset(lo + dst_len, 0x00, flen - dst_len);
-	memcpy(hi, dst_ord, dst_len);
-	memset(hi + dst_len, 0xff, flen - dst_len);
+	/*
+	 * A neighbour INSIDE the range is the torn derivation this exists to catch:
+	 * the dst prefix is empty here (an occupied one is not a graft, and the
+	 * merge arm refuses the list), so no key legitimately extends it.
+	 */
 	if (pred && pred != sentinel) {
 		klen = ft_rebuild_key_upwalk(ft, pred, scratch, max_len);
-		if (klen != flen || memcmp(scratch + (max_len - klen), lo,
-				flen) >= 0)
+		if (!klen || ft_rekey_prefix_range_cmp(scratch + (max_len - klen),
+				klen, dst_ord, dst_len) >= 0)
 			return false;
 	}
 	if (succ && succ != sentinel) {
 		klen = ft_rebuild_key_upwalk(ft, succ, scratch, max_len);
-		if (klen != flen || memcmp(scratch + (max_len - klen), hi,
-				flen) <= 0)
+		if (!klen || ft_rekey_prefix_range_cmp(scratch + (max_len - klen),
+				klen, dst_ord, dst_len) <= 0)
 			return false;
 	}
 	return true;
@@ -573,20 +596,20 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 			src_len > FT_MAX_KEY_LEN || dst_len > FT_MAX_KEY_LEN)
 		return -EINVAL;
 	/*
-	 * SCOPE, both permanent (-EINVAL), both stated HERE now that the
-	 * shared-parent shape gate below no longer stands in for them:
-	 *  - FIXED-length group.  ft_rekey_splice_pos_brackets, the check that
-	 *    makes an incoherently derived splice position detectable, is
-	 *    fixed-length only (it pads @dst_ord with the ordinal extremes to
-	 *    bound the dst key range); on a variable-length group it returns true
-	 *    for everything, so such a trie was running the cell splice with HALF
-	 *    its validation.  Refuse it rather than degrade silently.
-	 *  - EQUAL lengths (which ppnf equality used to force).  A shorter or
-	 *    longer @dst_key rewrites every moved key's LENGTH -- which a
-	 *    fixed-length group cannot express at all, and which a variable-length
-	 *    one would need the max_used_key_len fold for.
+	 * SCOPE (permanent -EINVAL), stated HERE now that the shared-parent shape
+	 * gate below no longer stands in for it: EQUAL lengths, which ppnf equality
+	 * used to force.  A shorter or longer @dst_key rewrites every moved key's
+	 * LENGTH -- which a fixed-length group cannot express at all, and which a
+	 * variable-length one would need the max_used_key_len fold for.  With the
+	 * lengths equal every moved key keeps its own, so neither applies.
+	 *
+	 * The group flavour is NOT a scope limit: both are in.  The one thing that
+	 * tied this to fixed-length groups was ft_rekey_splice_pos_brackets, which
+	 * bounded the dst key range by padding @dst_ord with the ordinal extremes;
+	 * it now compares over the common length instead, which needs no padding and
+	 * so places a neighbour correctly whatever the key lengths are.
 	 */
-	if (ft->group->key_len == CDS_FT_LEN_VARIABLE || src_len != dst_len)
+	if (src_len != dst_len)
 		return -EINVAL;
 	ft_key_to_ordinals(src_ord, src_key, src_len, &ft->group->key_map);
 	ft_key_to_ordinals(dst_ord, dst_key, dst_len, &ft->group->key_map);

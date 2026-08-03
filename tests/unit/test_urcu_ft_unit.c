@@ -68,13 +68,13 @@
 #endif
 
 /*
- * 289 unconditional + 49 fault-injection-only RUN_TEST registrations, on top of
+ * 290 unconditional + 49 fault-injection-only RUN_TEST registrations, on top of
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (338 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (339 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (289 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (290 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -10817,6 +10817,177 @@ static int test_rekey_graft_vs_merge(void)
 	ret = 0;
 out:
 	rcu_read_unlock();
+	drain_trie(ft);
+	rcu_barrier();
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
+ * The atomic rekey's ORDERED-LIST splice on a VARIABLE-LENGTH group, with
+ * neighbours whose keys are LONGER and SHORTER than the destination prefix.
+ *
+ * This is the coverage the widening to variable-length groups needs, and no
+ * concurrent oracle can supply it: the band geometry those use puts the two
+ * candidate positions ordered-ADJACENT, which the splice guard refuses, so their
+ * variable-length arms run with the list OFF and never reach this code.
+ *
+ * WHAT IS BEING EXERCISED.  ft_rekey_splice_pos_brackets re-derives each splice
+ * neighbour's key and places it against the range the destination prefix covers.
+ * That used to be a compare against @dst_ord padded with the ordinal extremes,
+ * which only means anything when every key has the group's one length -- so a
+ * variable-length group got NO validation at all.  It now compares over the
+ * COMMON length, and the two branches that padding could not express are exactly
+ * what this geometry produces: the splice PRED is {DX,2,0xff}, one byte LONGER
+ * than the two-byte destination, and the SUCC is {DX+1}, one byte SHORTER.
+ *
+ * ★ A WRONG ANSWER HANGS RATHER THAN FAILS.  A false from that check is reported
+ * as -EAGAIN -- "the pair was derived torn, re-derive" -- and the retry wrapper
+ * loops on it, so a bracket check that wrongly rejects a correctly derived pair is
+ * an infinite retry, not an error.  That is why this test asserts a status at all
+ * rather than only inspecting the result: it times out where the gate can see it.
+ */
+static int test_rekey_varlen_ordered_splice(void)
+{
+	struct cds_ft_group_attr *gattr;
+	struct cds_ft_group *group;
+	struct cds_ft_attr *fattr;
+	struct cds_ft *ft = NULL;
+	struct cds_ft_iter *iter = NULL;
+	enum cds_ft_status s;
+	/* SX/SY name the source subtree, DX/DZ the destination point. */
+	const uint8_t src[2] = { 0x10, 0x01 }, dst[2] = { 0x20, 0x03 };
+	uint8_t prev[64];
+	size_t prev_len = 0;
+	int i, ret = -1, nr = 0;
+
+	if (!cds_ft_merge_enabled()) {
+		diag("test_rekey_varlen_ordered_splice: skipped, merge compiled "
+			"out (-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
+	if (cds_ft_group_attr_create(&gattr) < 0)
+		return -1;
+	if (cds_ft_group_attr_set_max_key_len(gattr, 8) < 0 ||
+			cds_ft_group_attr_set_lookup_optimization(gattr,
+				CDS_FT_LOOKUP_OPTIMIZE_EAGER) < 0 ||
+			cds_ft_group_attr_set_writer_strategy(gattr,
+				CDS_FT_WRITER_LOCK_FINE) < 0 ||
+			cds_ft_group_attr_set_ordered_list(gattr, true) < 0)
+		abort();
+	if (cds_ft_group_create(gattr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(gattr);
+	if (cds_ft_attr_create(&fattr) < 0)
+		abort();
+	if (cds_ft_attr_set_speculative_keys(fattr, false) < 0)
+		abort();
+	if (cds_ft_create(group, fattr, &ft) < 0 ||
+			cds_ft_iter_create(ft, &iter) < 0)
+		abort();
+	cds_ft_attr_destroy(fattr);
+
+	rcu_read_lock();
+	/* The moved run: four 3-byte keys under the source prefix. */
+	for (i = 1; i <= 4; i++) {
+		uint8_t k[3] = { 0x10, 0x01, (uint8_t) i };
+
+		if (cds_ft_insert(ft, k, 3, &node_alloc((uint64_t) i)->node)
+				!= CDS_FT_STATUS_OK)
+			abort();
+	}
+	/* Source-junction siblings, so the junction survives losing the run. */
+	for (i = 5; i <= 12; i++) {
+		uint8_t k[2] = { 0x10, (uint8_t) i };
+
+		if (cds_ft_insert(ft, k, 2, &node_alloc((uint64_t) i)->node)
+				!= CDS_FT_STATUS_OK)
+			abort();
+	}
+	{
+		/*
+		 * The destination neighbourhood, built so the splice pair straddles
+		 * the destination prefix with UNEQUAL key lengths.
+		 */
+		uint8_t dp1[2] = { 0x20, 0x01 };		/* dst parent child */
+		uint8_t pred[3] = { 0x20, 0x02, 0xff };		/* LONGER than dst */
+		uint8_t succ[1] = { 0x21 };			/* SHORTER than dst */
+
+		if (cds_ft_insert(ft, dp1, 2, &node_alloc(101)->node)
+					!= CDS_FT_STATUS_OK ||
+				cds_ft_insert(ft, pred, 3,
+					&node_alloc(102)->node) != CDS_FT_STATUS_OK ||
+				cds_ft_insert(ft, succ, 1,
+					&node_alloc(103)->node) != CDS_FT_STATUS_OK)
+			abort();
+	}
+	rcu_read_unlock();
+
+	s = cds_ft_rekey_graft(ft, dst, 2, src, 2);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "rekey_varlen: move refused (%s)\n",
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+	rcu_read_lock();
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "rekey_varlen: verify failed\n");
+		rcu_read_unlock();
+		goto out;
+	}
+	/*
+	 * The list must still be KEY-ORDERED after the run was spliced in at the
+	 * destination -- the property a mis-placed splice breaks while leaving a
+	 * well-formed doubly-linked list behind.  Trie order: bytes over the common
+	 * length, shorter first on a tie.
+	 */
+	for (s = cds_ft_lookup_first(ft, iter); s == CDS_FT_STATUS_OK;
+			s = cds_ft_next(ft, iter)) {
+		uint8_t k[64];
+		size_t l, n;
+
+		if (cds_ft_iter_get_key(iter, k, sizeof k, &l) !=
+				CDS_FT_STATUS_OK)
+			break;
+		n = l < prev_len ? l : prev_len;
+		if (nr && (memcmp(k, prev, n) < 0 ||
+				(memcmp(k, prev, n) == 0 && l <= prev_len))) {
+			fprintf(stderr, "rekey_varlen: ordered walk out of order "
+				"at position %d\n", nr);
+			rcu_read_unlock();
+			goto out;
+		}
+		memcpy(prev, k, l);
+		prev_len = l;
+		nr++;
+	}
+	/* 4 moved + 8 siblings + 3 destination-side = 15, all still present. */
+	if (nr != 15 || cds_ft_count_keys(ft) != 15) {
+		fprintf(stderr, "rekey_varlen: walked %d of 15 keys (count %lu)\n",
+			nr, cds_ft_count_keys(ft));
+		rcu_read_unlock();
+		goto out;
+	}
+	for (i = 1; i <= 4; i++) {
+		uint8_t at_dst[3] = { 0x20, 0x03, (uint8_t) i };
+		uint8_t at_src[3] = { 0x10, 0x01, (uint8_t) i };
+		struct cds_ft_node *found = NULL;
+
+		if (cds_ft_eager_lookup_key(ft, at_dst, 3, 0, &found) !=
+					CDS_FT_STATUS_OK ||
+				cds_ft_eager_lookup_key(ft, at_src, 3, 0, &found)
+					== CDS_FT_STATUS_OK) {
+			fprintf(stderr, "rekey_varlen: leaf %d not at the dst\n", i);
+			rcu_read_unlock();
+			goto out;
+		}
+	}
+	rcu_read_unlock();
+	ret = 0;
+out:
+	if (iter)
+		cds_ft_iter_destroy(iter);
 	drain_trie(ft);
 	rcu_barrier();
 	cds_ft_destroy(ft);
@@ -30316,6 +30487,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_merge_rekey_same_trie_speculative_rejected);
 	RUN_TEST(test_rekey_graft_vs_merge);
 	RUN_TEST(test_rekey_fixed_len_atomic_or_refused);
+	RUN_TEST(test_rekey_varlen_ordered_splice);
 	RUN_TEST(test_merge_rekey_same_trie_ordered);
 	RUN_TEST(test_merge_rekey_same_trie_listoff_collision);
 	RUN_TEST(test_nonidentity_bulk_ops);

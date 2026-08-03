@@ -3499,11 +3499,12 @@ enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
  *
  * The atomic writer covers a CUT of the shapes, not all of them, and reports
  * -EINVAL for the rest (a compressed or external S_top, a source junction that
- * would collapse, an ordered-list interleave, an unequal-length destination).
- * Those fall back here, and on a fixed-length group there is nothing to fall back
- * TO -- the staged writer is variable-length-only, since a detached subtree's
- * keys are stripped of the prefix -- so ft_merge_at_inner refuses them rather
- * than losing the subtree between its two commits.
+ * would collapse, an ordered-list interleave, a destination abutting the moved
+ * run's own ordered neighbourhood, an unequal-length destination).  Those fall
+ * back here.  Either group flavour may take it: a fixed-length group MUST, having
+ * nothing to fall back TO -- the staged writer is variable-length-only, since a
+ * detached subtree's keys are stripped of the prefix -- so ft_merge_at_inner
+ * refuses those rather than losing the subtree between its two commits.
  *
  * ARM THE MOVE GATE around both.  ft_move_gate_enter publishes @move_active and
  * waits ONE grace period, so every reader already inside a critical section --
@@ -3551,8 +3552,7 @@ enum cds_ft_status ft_rekey_dispatch(struct cds_ft *ft,
 		!ft->speculative_key_offset_active &&
 		src_key && dst_key &&
 		src_key_len == dst_key_len && src_key_len != 0 &&
-		src_key_len <= ft->group->max_key_len &&
-		ft->group->key_len != CDS_FT_LEN_VARIABLE;
+		src_key_len <= ft->group->max_key_len;
 
 	ft_move_gate_enter(ft);
 	if (one_decide) {
