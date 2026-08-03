@@ -67,7 +67,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS_REKEY_DLM	9	/* inv_rekey_graft_{disjoint,cross_junction,glue_dst,coherent_readers,shared}, inv_rekey_linearizability, inv_rekey_merge_{occupied,shared}_dst */
+#define NR_TESTS_REKEY_DLM	10	/* inv_rekey_graft_{disjoint,cross_junction,glue_dst,coherent_readers,shared}, inv_rekey_{linearizability,public_no_gap}, inv_rekey_merge_{occupied,shared}_dst */
 
 /*
  * Base count = the RUN_TEST invocations in main() outside the DLM #ifdef.
@@ -3794,6 +3794,571 @@ static int inv_rekey_linearizability(void)
 		"%lu walks / %lu steps: %lu alien %lu back %lu inner %lu early-end\n",
 		RK_NW, RKL_NR, total_ops, total_retries, probes, probe_bad,
 		walks, walk_steps, alien, back, inner, wend);
+
+	free(w);
+	free(r);
+	if (drain_and_destroy(ft, group) < 0)
+		ret = -1;
+	if (leak_check() < 0)
+		ret = -1;
+	return ret;
+}
+
+/*
+ * ===========================================================================
+ * PUBLIC-ENTRY NO-GAP ORACLE: cds_ft_rekey_graft must never make a moved key
+ * unreachable.
+ * ===========================================================================
+ *
+ * The property rekey exists to provide is that a key present throughout a move
+ * is NEVER read as absent -- at neither the old nor the new position.  Every
+ * other rekey oracle drives _cds_ft_debug_rekey_graft_simple, which is a
+ * SEPARATE and simpler one-decide implementation; the PUBLIC cds_ft_rekey_graft
+ * runs ft_merge_at_inner's staged path (detach the subtree into a transient
+ * trie, then merge that trie back in at the destination) and nothing has ever
+ * asserted no-gap against it.  This oracle does.
+ *
+ * THE WITNESS IS ONE ATOMIC RELATIONAL PROBE, needing no timestamps, no writer
+ * instrumentation and no bound on how often the writer flips.  Each writer's run
+ * sits under its bp junction XOR its dp junction, and the geometry puts BOTH
+ * candidate positions inside ONE key-order BAND:
+ *
+ *   (bp,1) (bp,5) | run at (bp,9,1..4)  XOR  run at (dp,1,1..4) | (dp,5) (dp,9)
+ *                 ^ band delimiter                              ^ band delimiter
+ *
+ * bp and dp are CONSECUTIVE junction bytes, and the run's slot is the HIGHEST
+ * child of bp and the LOWEST child of dp, so nothing but the run ever sorts
+ * between the two delimiters (bp,5) and (dp,5).  gt((bp,5)) is therefore the
+ * run's first leaf and lt((dp,5)) its last -- THE SAME NODE in both
+ * configurations.  This is the legal-pair check of inv_rekey_linearizability
+ * with the pair DEGENERATED TO ONE ELEMENT, which turns a membership test into a
+ * PRESENCE test: the correct answer does not depend on where the run currently
+ * is, so any other answer (the delimiter itself, or a miss) says the run was
+ * reachable from NEITHER position at that instant.  That is the gap, observed
+ * directly by one linearization-point-free read, with no way for an oscillating
+ * writer to fake agreement.
+ *
+ * IT CARRIES ITS OWN CONTROL: the readers run a QUIET PHASE first, with the
+ * writers parked.  The band probes must be clean there -- a violation with
+ * nothing moving would indict the geometry, not the library -- so the quiet-phase
+ * count is kept and reported apart from the moving-phase count.
+ *
+ * KNOWN-RED, hence opt-in TWICE (FT_INV_MW selects the concurrent-writer
+ * oracles, FT_INV_RKPG arms this one).  The staged path detaches into a
+ * transient trie and DRAINS before merging back, so the moved keys are absent
+ * from the trie for at least a full grace period per move: this is not a narrow
+ * race but the standing behaviour of the implementation the public entry runs
+ * (inv_rekey_no_escape drives the same entry and asserts only that no GARBAGE
+ * key ever appears).  The moving-phase count is the number the coherent
+ * one-decide writer has to drive to zero; drop the FT_INV_RKPG gate when it
+ * does.
+ *
+ * MEASURED (4 writers, 8 readers, 200 ms): 41 moves, 3646731 band probes, 23490
+ * of them absent -- about 573 absence observations PER MOVE, which is what a
+ * grace-period-wide window looks like rather than a race.  0 absent across the
+ * control phase's probes, and 0 bad exact probes: the fixed siblings are always
+ * present and a moving leaf never answers as a foreign node.  The same geometry
+ * driven single-threaded through 40 moves answers both band probes correctly at
+ * every rest point, so the absences are the move window and not the layout.
+ *
+ * ★ IT ALSO TRIPS A SECOND, UNRELATED DEFECT: with several writers the staged
+ * placement exhausts the node reserve the rekey pre-fills ("ft alloc reserve
+ * underflow: kind=0 order=5"), which an assert build turns into an abort inside
+ * cds_ft_alloc_item_from and a production build degrades to a FALLIBLE
+ * allocation in the step documented as unfailable -- i.e. a possible
+ * MEMORY_ERROR after the detach has already committed.  It needs contention (the
+ * single-threaded run above never underflows), so a contended retry of the
+ * placement re-allocating from a reserve that is only filled once is the shape
+ * to look at.  Not fixed here; the abort is why this oracle stays opt-in even
+ * among the FT_INV_MW set.
+ */
+#define RKP_NW		4		/* writers, one private band each */
+#define RKP_NR		8		/* no-gap readers */
+#define RKP_KLEN	4		/* every key is this wide (see below) */
+#define RKP_QUIET_MS	60		/* control phase: readers, no movers */
+#define RKP_MAX_REPORT	3		/* narrated per reader; the rest counted */
+#define RKP_SLOT_BP	9		/* the run's slot byte in the bp junction */
+#define RKP_SLOT_DP	1		/* ... and in the dp junction */
+
+/*
+ * A VARIABLE-length group with keys that all happen to be RKP_KLEN wide.  Rekey
+ * needs the variable-length group -- it stages the move through a detached
+ * subtree, whose keys are stripped of the prefix and so are shorter than a
+ * fixed-length group's one key length, which is why a fixed-length group is
+ * refused outright (test_rekey_fixed_len_refused covers that refusal).  Uniform
+ * key width is this oracle's own doing: it makes the band's key order plain
+ * lexicographic, so "nothing else sorts between the delimiters" is a property of
+ * the four bytes and not of prefix-vs-string ordering rules.
+ */
+static struct cds_ft *create_varlen_rekey_coherent_ft(
+		struct cds_ft_group **group_out)
+{
+	struct cds_ft_group_attr *gattr;
+	struct cds_ft_group *group;
+	struct cds_ft_attr *attr;
+	struct cds_ft *ft;
+
+	if (cds_ft_group_attr_create(&gattr) < 0)
+		abort();
+	if (cds_ft_group_attr_set_max_key_len(gattr, RKP_KLEN) < 0)
+		abort();
+	if (cds_ft_group_attr_set_lookup_optimization(gattr,
+			CDS_FT_LOOKUP_OPTIMIZE_EAGER) < 0)
+		abort();
+	if (cds_ft_group_attr_set_writer_strategy(gattr,
+			CDS_FT_WRITER_LOCK_FINE) < 0)
+		abort();
+	if (cds_ft_group_attr_set_ordered_list(gattr, true) < 0)
+		abort();
+	if (cds_ft_group_create(gattr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(gattr);
+	if (cds_ft_attr_create(&attr) < 0)
+		abort();
+	/* Rekey coherence is automatic on an EAGER trie; EAGER is all it needs. */
+	if (cds_ft_attr_set_speculative_keys(attr, false) < 0)
+		abort();
+	if (cds_ft_create(group, attr, &ft) < 0)
+		abort();
+	cds_ft_attr_destroy(attr);
+	*group_out = group;
+	return ft;
+}
+
+/* Insert / exact-lookup an RKP_KLEN-wide key (the shared u64 helpers resolve
+ * RKP_KLEN, which a variable-length trie has none of). */
+static enum cds_ft_status rkp_insert(struct cds_ft *ft, uint64_t v,
+		struct ft_test_node *n)
+{
+	uint8_t k[8] = { 0 };
+
+	cds_ft_u64_to_key(ft, v, k, RKP_KLEN);
+	return cds_ft_insert(ft, k, RKP_KLEN, &n->node);
+}
+
+static enum cds_ft_status rkp_lookup(struct cds_ft *ft, uint64_t v,
+		struct cds_ft_node **out)
+{
+	uint8_t k[8] = { 0 };
+
+	cds_ft_u64_to_key(ft, v, k, RKP_KLEN);
+	return cds_ft_eager_lookup_key(ft, k, RKP_KLEN, 0, out);
+}
+
+/* Are the movers released?  Readers grade the two phases apart. */
+static volatile int rkp_moving;
+
+struct rkp_writer_arg {
+	struct cds_ft *ft;
+	uint8_t bp, dp;			/* consecutive junction bytes, bp < dp */
+	struct ft_test_node *sib[4];	/* fixed: (bp,1) (bp,5) (dp,5) (dp,9) */
+	struct ft_test_node *top[4];	/* the run's four leaves, they move */
+	int at_dst;			/* 0: run at (bp,9); 1: run at (dp,1) */
+	unsigned long ops, busy;
+	int failed;
+};
+
+struct rkp_reader_arg {
+	struct cds_ft *ft;
+	struct rkp_writer_arg *w;
+	int nw;
+	unsigned long band;		/* band probes -- the no-gap witness */
+	unsigned long band_quiet;	/* ... of those, taken with the movers parked */
+	unsigned long band_quiet_bad;	/* absent with the movers parked (control) */
+	unsigned long band_move_bad;	/* absent during a move (the gap) */
+	unsigned long exact;		/* exact probes */
+	unsigned long exact_bad;	/* a fixed key missing, or a foreign node */
+	int failed;
+};
+
+/* (b0,b1,b2) as a fixed four-byte key; byte 3 is always zero here. */
+static uint64_t rkp_key(uint8_t b0, uint8_t b1, uint8_t b2)
+{
+	return ((uint64_t) b0 << 24) | ((uint64_t) b1 << 16) |
+		((uint64_t) b2 << 8);
+}
+
+/* The four fixed band/junction siblings, in key order. */
+static uint64_t rkp_sib_key(const struct rkp_writer_arg *w, int j)
+{
+	switch (j) {
+	case 0:	return rkp_key(w->bp, 1, 0);
+	case 1:	return rkp_key(w->bp, 5, 0);	/* low band delimiter */
+	case 2:	return rkp_key(w->dp, 5, 0);	/* high band delimiter */
+	default: return rkp_key(w->dp, 9, 0);
+	}
+}
+
+static void *rkp_writer(void *arg)
+{
+	struct rkp_writer_arg *w = (struct rkp_writer_arg *) arg;
+	unsigned long iters = 0;
+
+	rcu_register_thread();
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	/*
+	 * The control phase.  Report a quiescent state while parked: a QSBR
+	 * thread that merely sleeps is a reader every grace period waits for,
+	 * and the readers below take grace periods (the coherent lookup does
+	 * not, but their call_rcu drain does).
+	 */
+	while (!rkp_moving && !test_stop) {
+		rcu_quiescent_state();
+		usleep(200);
+	}
+
+	while (!test_stop) {
+		uint8_t s = w->at_dst ? w->dp : w->bp;
+		uint8_t d = w->at_dst ? w->bp : w->dp;
+		uint8_t s_slot = w->at_dst ? RKP_SLOT_DP : RKP_SLOT_BP;
+		uint8_t d_slot = w->at_dst ? RKP_SLOT_BP : RKP_SLOT_DP;
+		uint8_t src_key[2] = { s, s_slot };
+		uint8_t dst_key[2] = { d, d_slot };
+		enum cds_ft_status st;
+
+		/*
+		 * NO read lock: cds_ft_rekey_graft enters the move gate, which
+		 * publishes "expect a move" and then waits a grace period, so a
+		 * caller holding a read section would wait for itself.
+		 */
+		st = cds_ft_rekey_graft(w->ft, dst_key, 2, src_key, 2);
+		if (st == CDS_FT_STATUS_OK) {
+			w->at_dst = !w->at_dst;
+			w->ops++;
+		} else if (st == CDS_FT_STATUS_BUSY_ERROR ||
+				st == CDS_FT_STATUS_MEMORY_ERROR) {
+			/*
+			 * Transient: a peer holds a node this move needs, or a
+			 * reserve came up short.  Both leave the run at the
+			 * source, so retry the SAME direction.
+			 */
+			w->busy++;
+		} else {
+			fprintf(stderr, "rkp writer bp=%u: rekey %02x,%02x -> "
+				"%02x,%02x: %s\n", w->bp, s, s_slot, d, d_slot,
+				cds_ft_status_to_string(st));
+			w->failed = 1;
+			mw_violation_snapshot();
+			break;
+		}
+		if ((++iters & 0xff) == 0)
+			rcu_quiescent_state();
+	}
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static void *rkp_reader(void *arg)
+{
+	struct rkp_reader_arg *r = (struct rkp_reader_arg *) arg;
+	struct cds_ft_iter *iter;
+	unsigned int seed = (unsigned int) (uintptr_t) r;
+	unsigned long iters = 0;
+
+	rcu_register_thread();
+	if (cds_ft_iter_create(r->ft, &iter) < 0)
+		abort();
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	while (!test_stop) {
+		struct rkp_writer_arg *w = &r->w[rand_r(&seed) % r->nw];
+		int pick = rand_r(&seed) & 7;
+		struct cds_ft_node *got = NULL;
+		enum cds_ft_status st;
+		uint8_t k[8];
+
+		if (pick < 4) {
+			/*
+			 * THE NO-GAP WITNESS.  One relational read from a band
+			 * delimiter; the run's outermost leaf is the answer at
+			 * every instant, whichever junction holds the run.
+			 */
+			int hi = pick & 1;
+			uint64_t bound = hi ? rkp_sib_key(w, 2) : rkp_sib_key(w, 1);
+			struct cds_ft_node *expect = hi ? &w->top[3]->node :
+				&w->top[0]->node;
+			int moving = rkp_moving;
+
+			cds_ft_u64_to_key(r->ft, bound, k, RKP_KLEN);
+			rcu_read_lock();
+			cds_ft_iter_set_key(iter, k, RKP_KLEN);
+			st = hi ? cds_ft_lookup_lt(r->ft, iter) :
+				cds_ft_lookup_gt(r->ft, iter);
+			if (st == CDS_FT_STATUS_OK)
+				got = cds_ft_iter_node(iter);
+			rcu_read_unlock();
+			r->band++;
+			if (!moving && !rkp_moving)
+				r->band_quiet++;
+			if (caa_unlikely(got != expect)) {
+				unsigned long *cnt = (moving || rkp_moving) ?
+					&r->band_move_bad : &r->band_quiet_bad;
+
+				(*cnt)++;
+				if (*cnt <= RKP_MAX_REPORT)
+					fprintf(stderr,
+						"rkp: %s(%#llx) -> %p (%s), the run's %s leaf %p is reachable from NEITHER junction%s\n",
+						hi ? "lt" : "gt",
+						(unsigned long long) bound,
+						(void *) got,
+						cds_ft_status_to_string(st),
+						hi ? "last" : "first",
+						(void *) expect,
+						(moving || rkp_moving) ? "" :
+							" -- WITH THE MOVERS PARKED");
+				mw_violation_snapshot();
+			}
+		} else if (pick < 6) {
+			/* A fixed sibling: present at every instant. */
+			int j = rand_r(&seed) & 3;
+			uint64_t key = rkp_sib_key(w, j);
+
+			cds_ft_u64_to_key(r->ft, key, k, RKP_KLEN);
+			rcu_read_lock();
+			cds_ft_iter_set_key(iter, k, RKP_KLEN);
+			st = cds_ft_lookup(r->ft, iter);
+			got = cds_ft_iter_node(iter);
+			rcu_read_unlock();
+			r->exact++;
+			if (caa_unlikely(got != &w->sib[j]->node)) {
+				r->exact_bad++;
+				if (r->exact_bad <= RKP_MAX_REPORT)
+					fprintf(stderr,
+						"rkp: fixed sib %#llx -> %p (%s), expect %p\n",
+						(unsigned long long) key,
+						(void *) got,
+						cds_ft_status_to_string(st),
+						(void *) &w->sib[j]->node);
+				mw_violation_snapshot();
+			}
+		} else {
+			/*
+			 * A moving leaf at ONE of its two positions: a miss is
+			 * legitimate (the run may be at the other junction),
+			 * a FOREIGN node never is.
+			 */
+			int c = rand_r(&seed) & 3, hi = rand_r(&seed) & 1;
+			uint64_t key = hi ?
+				rkp_key(w->dp, RKP_SLOT_DP, (uint8_t) (c + 1)) :
+				rkp_key(w->bp, RKP_SLOT_BP, (uint8_t) (c + 1));
+
+			cds_ft_u64_to_key(r->ft, key, k, RKP_KLEN);
+			rcu_read_lock();
+			cds_ft_iter_set_key(iter, k, RKP_KLEN);
+			st = cds_ft_lookup(r->ft, iter);
+			got = cds_ft_iter_node(iter);
+			rcu_read_unlock();
+			r->exact++;
+			if (caa_unlikely(got && got != &w->top[c]->node)) {
+				r->exact_bad++;
+				if (r->exact_bad <= RKP_MAX_REPORT)
+					fprintf(stderr,
+						"rkp: moving key %#llx -> %p (%s), expect miss or %p\n",
+						(unsigned long long) key,
+						(void *) got,
+						cds_ft_status_to_string(st),
+						(void *) &w->top[c]->node);
+				mw_violation_snapshot();
+			}
+		}
+		if ((++iters & 0xff) == 0)
+			rcu_quiescent_state();
+	}
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static int inv_rekey_public_no_gap(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	struct rkp_writer_arg *w;
+	struct rkp_reader_arg *r;
+	pthread_t writers[RKP_NW], readers[RKP_NR];
+	struct ft_test_node *guard_lo, *guard_hi;
+	struct timespec t0;
+	unsigned long total_ops = 0, total_busy = 0, live = 0;
+	unsigned long band = 0, quiet = 0, quiet_bad = 0, move_bad = 0;
+	unsigned long exact = 0, exact_bad = 0;
+	int i, c, j, ret = 0;
+
+	if (!getenv("FT_INV_MW")) {
+		fprintf(stderr, "# inv_rekey_public_no_gap: skipped "
+			"(set FT_INV_MW=1 to run the concurrent-writer oracles)\n");
+		return 0;
+	}
+	if (!getenv("FT_INV_RKPG")) {
+		fprintf(stderr, "# inv_rekey_public_no_gap: skipped -- the PUBLIC "
+			"cds_ft_rekey_graft still moves by detach-into-a-transient-trie, "
+			"so a moved key is absent for a grace period per move; set "
+			"FT_INV_RKPG=1 to measure the gap\n");
+		return 0;
+	}
+	mw_install_fatal_handler();
+	leak_reset();
+
+	ft = create_varlen_rekey_coherent_ft(&group);	/* EAGER + ordered list */
+	cds_ft_make_concurrent(ft);
+
+	guard_lo = node_alloc(0x00000000ULL);
+	guard_hi = node_alloc(0xff000000ULL);
+	rcu_read_lock();
+	if (rkp_insert(ft, 0x00000000ULL, guard_lo) != CDS_FT_STATUS_OK ||
+			rkp_insert(ft, 0xff000000ULL, guard_hi) != CDS_FT_STATUS_OK)
+		abort();
+	rcu_read_unlock();
+	live = 2;
+
+	w = (struct rkp_writer_arg *) calloc(RKP_NW, sizeof(*w));
+	r = (struct rkp_reader_arg *) calloc(RKP_NR, sizeof(*r));
+	if (!w || !r)
+		abort();
+	for (i = 0; i < RKP_NW; i++) {
+		/*
+		 * CONSECUTIVE junction bytes: the band between (bp,5) and (dp,5)
+		 * must contain the run and NOTHING else, so no other key -- no
+		 * peer writer's junction included -- may sort between bp and dp.
+		 */
+		w[i].ft = ft;
+		w[i].bp = (uint8_t) (2 * i + 1);
+		w[i].dp = (uint8_t) (2 * i + 2);
+		rcu_read_lock();
+		for (j = 0; j < 4; j++) {
+			uint64_t sk = rkp_sib_key(&w[i], j);
+
+			w[i].sib[j] = node_alloc(sk);
+			if (rkp_insert(ft, sk, w[i].sib[j]) != CDS_FT_STATUS_OK)
+				abort();
+		}
+		for (c = 0; c < 4; c++) {
+			uint64_t tk = rkp_key(w[i].bp, RKP_SLOT_BP,
+					(uint8_t) (c + 1));
+
+			w[i].top[c] = node_alloc(tk);
+			if (rkp_insert(ft, tk, w[i].top[c]) != CDS_FT_STATUS_OK)
+				abort();
+		}
+		rcu_read_unlock();
+		live += 8;
+	}
+	for (i = 0; i < RKP_NR; i++) {
+		r[i].ft = ft;
+		r[i].w = w;
+		r[i].nw = RKP_NW;
+	}
+
+	test_go = 0;
+	test_stop = 0;
+	rkp_moving = 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < RKP_NW; i++)
+		pthread_create(&writers[i], NULL, rkp_writer, &w[i]);
+	for (i = 0; i < RKP_NR; i++)
+		pthread_create(&readers[i], NULL, rkp_reader, &r[i]);
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	test_go = 1;
+
+	rcu_thread_offline();
+	/* CONTROL: readers only.  Every band probe must answer the run. */
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	while (elapsed_ms(&t0) < RKP_QUIET_MS)
+		usleep(1000);
+	rkp_moving = 1;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
+		usleep(1000);
+	test_stop = 1;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < RKP_NW; i++)
+		pthread_join(writers[i], NULL);
+	for (i = 0; i < RKP_NR; i++)
+		pthread_join(readers[i], NULL);
+	rcu_thread_online();
+
+	for (i = 0; i < RKP_NW; i++) {
+		total_ops += w[i].ops;
+		total_busy += w[i].busy;
+		if (w[i].failed)
+			ret = -1;
+	}
+	for (i = 0; i < RKP_NR; i++) {
+		band += r[i].band;
+		quiet += r[i].band_quiet;
+		quiet_bad += r[i].band_quiet_bad;
+		move_bad += r[i].band_move_bad;
+		exact += r[i].exact;
+		exact_bad += r[i].exact_bad;
+		if (r[i].failed)
+			ret = -1;
+	}
+
+	synchronize_rcu();
+	rcu_read_lock();
+	for (i = 0; i < RKP_NW; i++) {
+		uint8_t X = w[i].at_dst ? w[i].dp : w[i].bp;
+		uint8_t slot = w[i].at_dst ? RKP_SLOT_DP : RKP_SLOT_BP;
+
+		for (j = 0; j < 4; j++) {
+			struct cds_ft_node *found = NULL;
+
+			if (rkp_lookup(ft, rkp_sib_key(&w[i], j), &found)
+					!= CDS_FT_STATUS_OK ||
+					found != &w[i].sib[j]->node)
+				ret = -1;
+		}
+		for (c = 0; c < 4; c++) {
+			struct cds_ft_node *found = NULL;
+
+			if (rkp_lookup(ft, rkp_key(X, slot, (uint8_t) (c + 1)),
+					&found) != CDS_FT_STATUS_OK ||
+					found != &w[i].top[c]->node)
+				ret = -1;
+		}
+	}
+	if (cds_ft_count_keys(ft) != live) {
+		fprintf(stderr, "rkp: count_keys %lu != live %lu\n",
+			cds_ft_count_keys(ft), live);
+		ret = -1;
+	}
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "rkp: cds_ft_verify failed\n");
+		ret = -1;
+	}
+	rcu_read_unlock();
+
+	if (total_ops == 0) {
+		fprintf(stderr, "rkp: no successful moves (livelock?)\n");
+		ret = -1;
+	}
+	if (band == 0 || exact == 0) {
+		fprintf(stderr, "rkp: readers made no progress\n");
+		ret = -1;
+	}
+	/*
+	 * The control's "0 absences while parked" only means something next to the
+	 * number of probes that produced it, so require the quiet phase to have
+	 * really run: a zero out of zero probes is a dead control reading as a
+	 * clean one.
+	 */
+	if (quiet == 0) {
+		fprintf(stderr, "rkp: the control phase took no band probe\n");
+		ret = -1;
+	}
+	if (quiet_bad || move_bad || exact_bad)
+		ret = -1;
+
+	fprintf(stderr, "# inv_rekey_public_no_gap: %d writers %d readers, "
+		"%lu moves, %lu busy, %lu band probes (%lu absent moving; "
+		"%lu parked, %lu absent), %lu exact probes (%lu bad), "
+		"%lu live keys\n",
+		RKP_NW, RKP_NR, total_ops, total_busy, band, move_bad,
+		quiet, quiet_bad, exact, exact_bad, live);
 
 	free(w);
 	free(r);
@@ -16940,6 +17505,7 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_rekey_graft_coherent_readers);
 	RUN_TEST(inv_rekey_graft_shared);
 	RUN_TEST(inv_rekey_linearizability);
+	RUN_TEST(inv_rekey_public_no_gap);
 	RUN_TEST(inv_rekey_merge_occupied_dst);
 	RUN_TEST(inv_rekey_merge_shared_dst);
 	RUN_TEST(inv_rekey_src_mutated);
