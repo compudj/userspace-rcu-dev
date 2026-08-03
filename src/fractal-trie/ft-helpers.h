@@ -2019,7 +2019,8 @@ void ft_trace_pub_check(struct cds_ft *ft,
 	meta = cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
 	state = (uintptr_t) urcu_txn_read((void **) &meta->state,
 			FT_STATE_PROXY);
-	rt_parent = ft_resolve_flip_proxy(rcu_dereference(meta->parent));
+	rt_parent = ft_resolve_flip_proxy(ft_parent_node(
+			rcu_dereference(meta->parent)));
 	rt_slotp = rt_parent ? ft_get_parent_slot(meta, ft) : NULL;
 	if (caa_likely(cn->len != 0 && !(state & FT_STATE_TOMBSTONE) &&
 			rt_slotp == slot))
@@ -2278,7 +2279,7 @@ void _ft_publish_to_parent_meta(struct cds_ft *ft,
 		 * (which would read the deferred back-edge).
 		 */
 		if (new_child_meta) {
-			cp = new_child_meta->parent;
+			cp = ft_parent_node(new_child_meta->parent);
 		} else
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 		if (ft_node_skip_compressed(new_child)) {
@@ -2352,8 +2353,9 @@ void _ft_publish_to_parent_meta(struct cds_ft *ft,
 				child_meta = cds_ft_item_to_metadata(
 					ft_node_ptr(new_child));
 		}
-		if (child_meta && child_meta->parent)
-			ft_set_parent_slot(child_meta, child_meta->parent,
+		if (child_meta && ft_parent_node(child_meta->parent))
+			ft_set_parent_slot(child_meta,
+				ft_parent_node(child_meta->parent),
 				parent_slot);
 	}
 

@@ -1722,6 +1722,83 @@ struct cds_ft {
 };
 
 /*
+ * Root ownership: a root's metadata->parent names its OWNING TRIE.
+ *
+ * Every non-root node's parent identifies the node above it, so a node
+ * reachable from two tries contradicts one of them and cds_ft_verify catches
+ * it.  A root has no node above it, and encoding that as NULL makes the
+ * back-edge carry no identity at exactly the one position where the owner is
+ * the TRIE rather than a node: two tries rooted at one node would then agree
+ * with their own expected parent, and no per-trie walk could tell.  Naming the
+ * trie closes that, so the check the walk already performs at every other
+ * depth also holds at depth 0.
+ *
+ * ENCODING.  In a parent field bits 0-1 are 00 for no other value, so a plain
+ * struct cds_ft * needs no tag bit:
+ *
+ *   internal          bit 0 set
+ *   flip proxy        bit 0 set (FT_FLIP_PROXY_TAG, type 7)
+ *   compressed        bit 1 set
+ *   skip-compressed   carries the OWNING node's own tag in bits 0-1, because a
+ *                     skip pointer names the compressed node's child -- which
+ *                     is the very node whose parent field this is, and only
+ *                     internal / compressed nodes have a metadata (an external
+ *                     cds_ft_node is {prev, next}).  So never 00.
+ *   owning trie       bits 0-1 clear
+ *
+ * The classification is one mask, matching the cost of the NULL test it
+ * replaces on the parent-pointer backtrack path.  NULL keeps its meaning of
+ * "not yet parented" for a node under build, which is never reachable.
+ */
+static inline
+struct cds_ft_inode_flag *ft_trie_parent(const struct cds_ft *ft)
+{
+	return (struct cds_ft_inode_flag *) (uintptr_t) ft;
+}
+
+static inline
+bool ft_parent_is_trie(const struct cds_ft_inode_flag *parent)
+{
+	return parent && !((uintptr_t) parent & FT_TAG_MASK);
+}
+
+static inline
+struct cds_ft *ft_parent_trie(struct cds_ft_inode_flag *parent)
+{
+	return (struct cds_ft *) (uintptr_t) parent;
+}
+
+/*
+ * True for a node at the top of a trie -- the position whose slot is
+ * &ft->root.  Replaces the "parent == NULL" root test.
+ */
+static inline
+bool ft_parent_is_root_position(const struct cds_ft_inode_flag *parent)
+{
+	return !parent || ft_parent_is_trie(parent);
+}
+
+/*
+ * The node ABOVE this position, or NULL at a root.
+ *
+ * Every consumer asking "who is my parent NODE" -- an up-walk, a republish
+ * into the parent's slot, a parent-slot offset -- goes through here, because a
+ * root's stored parent names its owning TRIE, which is not a node and must
+ * never be walked or dereferenced as one.  Takes the value rather than the
+ * metadata so each caller keeps its own load and memory ordering.
+ *
+ * The two readers that want the raw word instead: ft_resolve_parent_slot,
+ * which turns it into &ft->root, and cds_ft_verify, which checks ownership.
+ * A transacted store also reads it raw -- the expected-old must be the word
+ * as it stands.
+ */
+static inline
+struct cds_ft_inode_flag *ft_parent_node(struct cds_ft_inode_flag *parent)
+{
+	return ft_parent_is_trie(parent) ? NULL : parent;
+}
+
+/*
  * Access-discipline validator.  See FEATURE_FT_EXCL_VALIDATE above.
  *
  * The helpers form two nested pairs: ft_excl_writer_enter / _exit

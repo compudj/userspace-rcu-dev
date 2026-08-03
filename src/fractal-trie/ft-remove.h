@@ -686,7 +686,7 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		int nr_set = 0, si = 0, dret;
 
 		iter_parent = (struct cds_ft_inode_flag *)
-			rcu_dereference(iter_meta->parent);
+			ft_parent_node(rcu_dereference(iter_meta->parent));
 		if (caa_unlikely(ft_node_flip_proxy(iter_parent))) {
 			ft_flip_txn_destroy(txn);
 			return -EAGAIN;
@@ -763,7 +763,7 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		 * nor embedded.
 		 */
 		iter_parent = (struct cds_ft_inode_flag *)
-			rcu_dereference(iter_meta->parent);
+			ft_parent_node(rcu_dereference(iter_meta->parent));
 		if (caa_unlikely(ft_node_flip_proxy(iter_parent))) {
 			ft_flip_txn_destroy(txn);
 			return -EAGAIN;
@@ -906,7 +906,8 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		}
 		new_cn_meta->parent = iter_parent;
 	}
-	ft_set_parent_slot(new_cn_meta, new_cn_meta->parent, publish_slot);
+	ft_set_parent_slot(new_cn_meta,
+			ft_parent_node(new_cn_meta->parent), publish_slot);
 
 	new_cn_flag = ft_compressed_node_flag(new_cn);
 	{
@@ -1321,7 +1322,8 @@ int ft_detach_node(struct cds_ft *ft,
 		 * exactly as the reader up-walk ft_skip_reanchor does.
 		 */
 		resolved_parent = ft_resolve_flip_proxy(
-			(struct cds_ft_inode_flag *) rcu_dereference(metadata->parent));
+			(struct cds_ft_inode_flag *) ft_parent_node(
+				rcu_dereference(metadata->parent)));
 		is_root = (resolved_parent == NULL);
 		/*
 		 * ONE proxy-resolved snapshot of this ancestor's child count, for
@@ -2024,7 +2026,7 @@ int ft_detach_node(struct cds_ft *ft,
 			    !topmost_external_nodes &&
 			    ft_meta_nr_child_load(bmeta) == 2 &&
 			    !bmeta->external_nodes &&
-			    bmeta->parent != NULL) {
+			    ft_parent_node(bmeta->parent) != NULL) {
 				struct cds_ft_inode_flag *s_child = NULL;
 				uint8_t s_byte = 0;
 				unsigned int b;
@@ -2403,8 +2405,8 @@ int ft_detach_node(struct cds_ft *ft,
 			 */
 			if (!(ft->lock_fine && old_recompacted_node))
 				ft_flip_txn_guard_parent(ft, commit_txn,
-					iter_meta->parent);
-			_ft_publish_to_parent(ft, iter_meta->parent,
+					ft_parent_node(iter_meta->parent));
+			_ft_publish_to_parent(ft, ft_parent_node(iter_meta->parent),
 				detach_parent_flag_ptr, iter_node_flag,
 				holder_old_flag, &rec);
 			/*
@@ -2414,7 +2416,8 @@ int ft_detach_node(struct cds_ft *ft,
 			 */
 			if (count_delta) {
 				ft_flip_txn_record_count_parent(ft, commit_txn,
-					iter_meta->parent, count_delta);
+					ft_parent_node(iter_meta->parent),
+					count_delta);
 				count_folded = true;
 			}
 			/*
@@ -2501,8 +2504,8 @@ int ft_detach_node(struct cds_ft *ft,
 				; /* recompact's P already locked; release IS the guard */
 			else
 				ft_flip_txn_lock_or_guard_parent(ft, commit_txn,
-					iter_meta->parent);
-			_ft_publish_to_parent(ft, iter_meta->parent,
+					ft_parent_node(iter_meta->parent));
+			_ft_publish_to_parent(ft, ft_parent_node(iter_meta->parent),
 				detach_parent_flag_ptr, iter_node_flag,
 				holder_old_flag, &rec);
 			/*
@@ -2516,7 +2519,8 @@ int ft_detach_node(struct cds_ft *ft,
 			 */
 			if (old_recompacted_node && count_delta) {
 				ft_flip_txn_record_count_parent(ft, commit_txn,
-					iter_meta->parent, count_delta);
+					ft_parent_node(iter_meta->parent),
+					count_delta);
 				count_folded = true;
 			}
 			if (ft_remove_commit_rec(ft, &rec, NULL, NULL,
@@ -2560,7 +2564,7 @@ int ft_detach_node(struct cds_ft *ft,
 		 */
 		if (ft_meta_nr_child(iter_meta) == 1 &&
 		    !iter_meta->external_nodes &&
-		    iter_meta->parent != NULL) {
+		    ft_parent_node(iter_meta->parent) != NULL) {
 			ft_canonicalize_chain_compress(ft, iter_node_flag,
 				iter_meta);
 		}
@@ -3382,7 +3386,7 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 			 */
 			if (ft_group_skip_compressed(ft->group) &&
 			    ft_meta_nr_child(holder_meta) == 1 &&
-			    holder_meta->parent != NULL) {
+			    ft_parent_node(holder_meta->parent) != NULL) {
 				uint8_t s_byte = 0;
 				struct cds_ft_inode_flag *s_child =
 					ft_node_get_minmax(ft, holder_flag,
@@ -3491,7 +3495,7 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 				if (ret == 0 && ft_group_skip_compressed(ft->group) &&
 				    !holder_meta->external_nodes &&
 				    ft_meta_nr_child(holder_meta) == 1 &&
-				    holder_meta->parent != NULL) {
+				    ft_parent_node(holder_meta->parent) != NULL) {
 					ft_canonicalize_chain_compress(ft, holder_flag,
 						holder_meta);
 				}
@@ -3930,7 +3934,7 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 			 */
 			if (ft_group_skip_compressed(ft->group) &&
 			    ft_meta_nr_child(holder_meta) == 1 &&
-			    holder_meta->parent != NULL) {
+			    ft_parent_node(holder_meta->parent) != NULL) {
 				uint8_t s_byte = 0;
 				struct cds_ft_inode_flag *s_child =
 					ft_node_get_minmax(ft, holder_flag,
@@ -4021,7 +4025,7 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 					 */
 					if (ft_group_skip_compressed(ft->group) &&
 					    ft_meta_nr_child(holder_meta) == 1 &&
-					    holder_meta->parent != NULL) {
+					    ft_parent_node(holder_meta->parent) != NULL) {
 						ft_canonicalize_chain_compress(ft, holder_flag,
 							holder_meta);
 					}

@@ -506,7 +506,7 @@ int ft_verify_node_compressed(const struct cds_ft *ft, FILE *out,
 	 */
 	{
 		struct cds_ft_inode_flag *child_in_chain = node_flag;
-		struct cds_ft_inode_flag *anc = cn_meta->parent;
+		struct cds_ft_inode_flag *anc = ft_parent_node(cn_meta->parent);
 		bool adj_violation = false;
 
 		while (anc && ft_node_compressed(anc)) {
@@ -518,7 +518,7 @@ int ft_verify_node_compressed(const struct cds_ft *ft, FILE *out,
 					depth, child_in_chain, anc);
 			adj_violation = true;
 			child_in_chain = anc;
-			anc = anc_meta->parent;
+			anc = ft_parent_node(anc_meta->parent);
 		}
 		if (adj_violation)
 			return -1;
@@ -712,7 +712,7 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 		 * at the mutation that introduced it, rather than as a
 		 * corrupted parent-pointer backtrack later.
 		 */
-		if (metadata->parent) {
+		if (ft_parent_node(metadata->parent)) {
 			struct cds_ft_inode_flag **slot =
 				ft_get_parent_slot(metadata,
 						(struct cds_ft *) ft);
@@ -728,8 +728,9 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 		}
 #ifdef FT_IMMEDIATE_FREE
 		/* Check parent target is not poisoned (freed). */
-		if (metadata->parent) {
-			unsigned char *p = (unsigned char *) ft_node_ptr(metadata->parent);
+		if (ft_parent_node(metadata->parent)) {
+			unsigned char *p = (unsigned char *) ft_node_ptr(
+				ft_parent_node(metadata->parent));
 			if (*p == 0xfe) {
 				if (out)
 					fprintf(out, "ft_verify: depth %u: internal node %p parent %p points to freed (poisoned) node\n",

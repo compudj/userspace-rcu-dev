@@ -1245,7 +1245,7 @@ int ft_node_recompact(enum ft_recompact mode,
 
 		/* PLAN (read-only, racy): resolve P (+GP iff P compressed). */
 		if (inh_hint)
-			pf_p = inh_hint->parent;
+			pf_p = ft_parent_node(inh_hint->parent);
 		else
 			(void) ft_resolve_parent_slot(metadata, ft, &pf_p);
 		if (pf_p) {
@@ -1459,7 +1459,7 @@ int ft_node_recompact(enum ft_recompact mode,
 				 * dangles to a reclaimed node (Defect C).  A NULL
 				 * hint->parent is a publish into &ft->root.
 				 */
-				inh_parent = inh_hint->parent;
+				inh_parent = ft_parent_node(inh_hint->parent);
 				inh_slot = inh_hint->slot;
 			} else {
 				inh_slot = ft_resolve_parent_slot(metadata, ft,

@@ -1209,7 +1209,8 @@ void ft_trace_miswire_check(struct cds_ft *ft,
 	meta = cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
 	state = (uintptr_t) urcu_txn_read((void **) &meta->state,
 			FT_STATE_PROXY);
-	rt_parent = ft_resolve_flip_proxy(rcu_dereference(meta->parent));
+	rt_parent = ft_resolve_flip_proxy(ft_parent_node(
+			rcu_dereference(meta->parent)));
 	rt_slotp = rt_parent ? ft_get_parent_slot(meta, ft) : NULL;
 	if (rt_slotp)
 		rt_val = ft_resolve_flip_proxy(rcu_dereference(*rt_slotp));
@@ -4247,7 +4248,7 @@ void ft_flip_txn_record_count_parent(struct cds_ft *ft, struct ft_flip_txn *t,
 		ft_flip_txn_record_tag_mw(t, (void **) &m->nr_keys,
 			(void *) old_raw, (void *) new_raw,
 			FT_NR_KEYS_PROXY_TAG);
-		cur = m->parent;
+		cur = ft_parent_node(m->parent);
 	}
 }
 

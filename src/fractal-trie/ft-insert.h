@@ -2038,7 +2038,7 @@ int ft_attach_node(struct cds_ft *ft,
 					ft_nr_keys_get(reloc_meta) + 1,
 					CMM_RELAXED);
 			}
-			ic->count_from = metadata->parent;
+			ic->count_from = ft_parent_node(metadata->parent);
 			ic->count_folded = true;
 		} else {
 			/*
