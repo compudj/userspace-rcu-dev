@@ -141,6 +141,21 @@ extern "C" {
 #endif
 
 /*
+ * Instrumentation hook for a FAILED install CAS -- same contract as
+ * URCU_TXN_STAT: compiles to nothing unless the embedder defines
+ * URCU_TXN_CAS_FAIL(idx, slot, old, seen) before including this header.
+ *
+ * It exists because "the commit aborted" is not a diagnosis.  A transaction
+ * that aborts forever needs to say WHICH of its records lost its CAS and what
+ * the slot held instead of the expected old; the record index alone localises
+ * it to one edge of the structure being committed, which is usually enough to
+ * tell a self-conflict from a live competitor.
+ */
+#ifndef URCU_TXN_CAS_FAIL
+#define URCU_TXN_CAS_FAIL(idx, slot, old, seen)	do { } while (0)
+#endif
+
+/*
  * Single-edge escalation threshold: a lone MW record commits with a bare CAS and
  * no descriptor until it has retried this many times, after which it commits
  * through the full descriptor protocol so it can hold the slot latched against
@@ -495,6 +510,8 @@ unsigned int urcu_txn_install_mw_flat(struct urcu_txn_desc *t,
 
 		if (caa_unlikely(!urcu_txn_try_cas(r->slot, r->old_ptr,
 				urcu_txn_tag(r, r->proxy_tag)))) {
+			URCU_TXN_CAS_FAIL(i, r->slot, r->old_ptr,
+					  uatomic_load(r->slot, CMM_RELAXED));
 			urcu_txn_decide(t, URCU_TXN_DESC_FAILED);
 			*failed = 1;
 			return i;	/* prefix [0..i) planted */
