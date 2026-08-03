@@ -3207,7 +3207,17 @@ int ft_remove_one_commit(struct cds_ft *ft,
 	 */
 	if (txn) {
 		if (state_meta) {
-			uintptr_t old = state_meta->state;
+			/*
+			 * WAITING load: this word enters the txn's write set on
+			 * the very next line.  A raw read would take a peer's
+			 * parked proxy as the expected-old AND mint the new
+			 * value out of pointer bits (proxy - NR_CHILD_ONE), so
+			 * a matching install would publish a corrupted word --
+			 * the transacted form of the hazard
+			 * ft_meta_state_transition waits out.
+			 */
+			uintptr_t old = (uintptr_t) urcu_txn_load(txn->mtxn,
+				(void **) &state_meta->state, FT_STATE_PROXY);
 
 			ft_state_edge(&edges[n], &state_meta->state, old,
 				old - FT_STATE_NR_CHILD_ONE);
@@ -5154,7 +5164,23 @@ void ft_reparent_record_meta(struct cds_ft *ft, struct ft_flip_txn *txn,
 		struct cds_ft_inode_flag *parent_nf,
 		struct cds_ft_inode_flag **slot, bool child_marked)
 {
-	uintptr_t old_state = meta->state;
+	/*
+	 * WAITING load, not a raw one -- the same rule the offset word below
+	 * obeys, and for the same reason: &meta->state enters THIS txn's write
+	 * set a few lines down, so its last load must wait out a parked owner.
+	 *
+	 * A raw read bakes a peer's parked FT_STATE_PROXY -- a descriptor-record
+	 * POINTER -- into @live_state, and the mask below cannot remove it (it
+	 * clears TOMBSTONE and LOCK, which a proxy carries in neither).  The edge
+	 * recorded from it is a VALIDATE (old == new), so a commit whose install
+	 * CAS happens to match PUBLISHES that pointer back into the live word
+	 * through settle.  Its owner decided and settled long before, so nothing
+	 * ever clears it: the node reads as permanently latched and every later
+	 * acquire of it fails forever.  ft_meta_state_transition's wait loop is
+	 * the standalone counterpart of this load.
+	 */
+	uintptr_t old_state = (uintptr_t) urcu_txn_load(txn->mtxn,
+		(void **) &meta->state, FT_STATE_PROXY);
 	/*
 	 * §4.B VALIDATE (Phase 4.3, MW): expect the re-homed child CLEAN-LIVE at
 	 * commit.  A RAW old_state bakes a peer's already-set TOMBSTONE/LOCK
@@ -5411,7 +5437,9 @@ struct cds_ft_inode_flag *ft_glue_publish_expected_old(const struct ft_glue *g)
 {
 	if (g->publish_old_set)
 		return g->publish_old;
-	return *g->publish_slot;
+	/* SETTLED, not raw: see ft_graft_swap_settle -- a parked engine proxy
+	 * is a marker, never a value the slot holds. */
+	return ft_resolve_flip_proxy(*g->publish_slot);
 }
 
 /*

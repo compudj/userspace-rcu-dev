@@ -2373,15 +2373,28 @@ bool ft_graft_swap_settle(struct cds_ft *ft, struct ft_descent *d,
 		struct cds_ft_inode_flag **raw_ret)
 {
 	struct cds_ft_inode_flag *raw = *d->nfp;	/* THE one load */
+	/*
+	 * Resolve ONCE, and hand the SETTLED form out.  The validation below
+	 * already resolves -- what @raw_ret feeds is the forward publish's
+	 * expected-old, and an engine proxy is not a value the slot HAS: it is a
+	 * parking marker for a record whose owner writes the real value at
+	 * settle.  Handing the marker out records an expected-old that either
+	 * never matches, or (worse, on a validate edge) matches while the parker
+	 * is still parked and republishes a pointer into a descriptor nobody will
+	 * ever settle again.  Resolving keeps the "one load" coherence -- both
+	 * uses come from @raw -- and yields the FT-form value (SKIP_X included)
+	 * the CAS must compare against.
+	 */
+	struct cds_ft_inode_flag *settled = ft_resolve_flip_proxy(raw);
 	unsigned int rewind = 0;
 
-	if (caa_unlikely(ft_reanchor_flag(ft, ft_resolve_flip_proxy(raw),
+	if (caa_unlikely(ft_reanchor_flag(ft, settled,
 			&rewind) != d->nf || rewind != 0)) {
 		FT_GS_PROBE_INC(cds_ft_probe_gs_torn);
 		d->skip_conflict = true;
 		return false;
 	}
-	*raw_ret = raw;
+	*raw_ret = settled;
 	return true;
 }
 
@@ -2957,7 +2970,9 @@ retry_swap:
 				 * read a few lines up, so the occupant read here is
 				 * the world the fuse planned against.
 				 */
-				pub_old = *pub_slot;
+				/* SETTLED, not raw: a parked engine proxy is not a
+				 * value this slot has (see ft_graft_swap_settle). */
+				pub_old = ft_resolve_flip_proxy(*pub_slot);
 				/*
 				 * ★ THE EXPECTED-OLD CANNOT ARBITRATE THIS ON ITS OWN.
 				 * @merged encodes @pcn's bytes and length, read above;
