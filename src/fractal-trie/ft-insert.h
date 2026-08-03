@@ -221,7 +221,7 @@ void ft_park_live_parent_edge(struct cds_ft *ft,
 		 * guards after the fresh cluster was freed, under the MW retry
 		 * loop that makes ABORT routine.
 		 */
-		ft_reparent_record_meta(txn, meta, new_parent, slot,
+		ft_reparent_record_meta(ft, txn, meta, new_parent, slot,
 			/*child_marked=*/ false);
 		return;
 	}

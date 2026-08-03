@@ -3268,7 +3268,7 @@ int ft_remove_one_commit(struct cds_ft *ft,
  * incoming_byte the child inherits via the parent's own slot, so no
  * incoming_byte write is needed here (matching ft_park_live_parent_edge).
  */
-static void ft_reparent_record_meta(struct ft_flip_txn *txn,
+static void ft_reparent_record_meta(struct cds_ft *ft, struct ft_flip_txn *txn,
 		struct cds_ft_metadata *meta,
 		struct cds_ft_inode_flag *parent_nf,
 		struct cds_ft_inode_flag **slot, bool child_marked);
@@ -3310,7 +3310,7 @@ void ft_pub_rec_add_back_edge(struct cds_ft *ft, struct ft_pub_rec *rec,
 		 * skipped here (the new parent is always compressed), matching
 		 * the "no incoming_byte write" contract above.
 		 */
-		ft_reparent_record_meta(txn, meta, new_parent, slot,
+		ft_reparent_record_meta(ft, txn, meta, new_parent, slot,
 			/*child_marked=*/ false);
 		return;
 	} else if (ft->ordered_list) {
@@ -5147,7 +5147,7 @@ void ft_glue_record_back_edge(struct cds_ft *ft, struct ft_flip_txn *txn,
  * recompact, so its plain store is a same-value write, safe before the commit.
  */
 static
-void ft_reparent_record_meta(struct ft_flip_txn *txn,
+void ft_reparent_record_meta(struct cds_ft *ft, struct ft_flip_txn *txn,
 		struct cds_ft_metadata *meta,
 		struct cds_ft_inode_flag *parent_nf,
 		struct cds_ft_inode_flag **slot, bool child_marked)
@@ -5207,8 +5207,15 @@ void ft_reparent_record_meta(struct ft_flip_txn *txn,
 				&ft_types[ft_node_type(parent_nf)],
 				ft_node_ptr(parent_nf), slot);
 	}
+	/*
+	 * @parent_nf stays the parent NODE above -- the offset and incoming-byte
+	 * maths dereferences it -- so only the STORED word takes the owner at a
+	 * root position (ft_parent_word).  A re-parent target is a fresh cluster
+	 * today, never a root, but the invariant "no parent word is left
+	 * anonymous" should not rest on that.
+	 */
 	ft_flip_txn_record_reserved(txn, (void **) &meta->parent_word,
-		meta->parent_word, parent_nf);
+		meta->parent_word, ft_parent_word(ft, parent_nf));
 	/*
 	 * The state edge is now a pure {live_state -> live_state} GUARD: it no
 	 * longer carries the offset, so its whole job is the §4.B validate the
@@ -5281,7 +5288,7 @@ void ft_reparent_record(struct cds_ft *ft, struct ft_flip_txn *txn,
 		struct cds_ft_compressed_node *cn =
 			ft_skip_to_compressed(ft, child_nf);
 
-		ft_reparent_record_meta(txn,
+		ft_reparent_record_meta(ft, txn,
 			cds_ft_item_to_metadata((struct cds_ft_inode *) cn),
 			parent_nf, slot, child_marked);
 		return;
@@ -5290,7 +5297,7 @@ void ft_reparent_record(struct cds_ft *ft, struct ft_flip_txn *txn,
 		struct cds_ft_compressed_node *cn =
 			ft_compressed_node_ptr(child_nf);
 
-		ft_reparent_record_meta(txn,
+		ft_reparent_record_meta(ft, txn,
 			cds_ft_item_to_metadata((struct cds_ft_inode *) cn),
 			parent_nf, slot, child_marked);
 		return;
@@ -5315,7 +5322,7 @@ void ft_reparent_record(struct cds_ft *ft, struct ft_flip_txn *txn,
 		}
 		return;
 	}
-	ft_reparent_record_meta(txn,
+	ft_reparent_record_meta(ft, txn,
 		cds_ft_item_to_metadata(ft_node_ptr(child_nf)), parent_nf, slot, child_marked);
 }
 
