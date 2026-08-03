@@ -70,6 +70,21 @@ ALL_CONFIGS=(
 	"fault-audit|-DFEATURE_FT_FAULT_INJECT -DFT_DEBUG_TOMBSTONE_AUDIT|u ioff"
 	"audit|-DFT_DEBUG_TOMBSTONE_AUDIT|u ion ioff"
 	"vam|-DFEATURE_FT_VERIFY_AT_MUTATION|u"
+	# The TRANSACTION ENGINE's own debug features.  Every other config
+	# compiles them out, so an engine-contract violation the FT commits is
+	# invisible to the whole matrix:
+	#   DEBUG_RCU                 -> urcu_assert_debug.  A record value that
+	#                                is itself a proxy (the embedder read the
+	#                                slot raw instead of through
+	#                                urcu_txn_load), two records on one slot,
+	#                                an MW record on the sw-only commit, a
+	#                                same-slot kind conflict.
+	#   URCU_TXN_DEBUG_READ_POLICY-> a slot that enters the read/write set
+	#                                after an OPTIMISTIC load.
+	# The two are complementary: the read-policy table only marks slots
+	# loaded through the engine's API, so a RAW C read of a transacted word
+	# leaves no mark and only the assert catches it.
+	"txndbg|-DDEBUG_RCU -DURCU_TXN_DEBUG_READ_POLICY|u ion ioff"
 	"noskip|-DNO_FEATURE_FT_SKIP_COMPRESSED|u ioff"
 	"nocompress|-DNO_FEATURE_FT_COMPRESS|u ioff"
 	# Concurrent legs are SAFE here since the in-place tier became runtime
