@@ -764,9 +764,23 @@ enum urcu_txn_status ft_store_at_graft_point_commit(struct cds_ft *ft,
 			if (!ft->lock_fine)
 				ft_flip_txn_guard_parent(ft, st->glue->txn,
 					pub_parent);
+			/*
+			 * SETTLED, not raw, for the expected-old -- the same rule as
+			 * the graft_swap merged publish and the five metadata reads
+			 * fixed with it.  @pub_slot is a TRANSACTED word, and when the
+			 * republish grandparent is the trie ROOT it is &ft->root, which
+			 * a peer's root-level graft parks a proxy in.  A raw load then
+			 * records that descriptor POINTER as the expected-old, and
+			 * urcu_txn_settle stores it back blind on a matching commit --
+			 * where nothing ever clears it, because its owning transaction
+			 * decided and settled long before, so every later acquire of
+			 * that word bails forever.  (Reached by a KEYED graft racing a
+			 * ROOT graft into one destination -- inv_empty_dst_root_graft_
+			 * peer, ~1 run in 40 under -DDEBUG_RCU.)
+			 */
 			_ft_publish_to_parent(ft, st->dest,
 				pub_slot, st->dest,
-				*pub_slot /* SW graft: old dst node */,
+				ft_resolve_flip_proxy(*pub_slot),
 				&st->reserve_rec);
 			for (k = 0; k < st->reserve_rec.n; k++)
 				ft_flip_txn_record_reserved(st->glue->txn,
