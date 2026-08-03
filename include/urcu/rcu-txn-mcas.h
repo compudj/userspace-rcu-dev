@@ -145,6 +145,13 @@ extern "C" {
  * URCU_TXN_STAT: compiles to nothing unless the embedder defines
  * URCU_TXN_CAS_FAIL(idx, slot, old, seen) before including this header.
  *
+ * Fires on EVERY path that can lose a slot: the flat installer's CAS, the depth
+ * installer's stale-value check and its patience cap, and the lone-MW fast path.
+ * Hooking only one of them is worse than hooking none -- a first version covered
+ * only the flat installer, and since a retrying transaction takes the DEPTH one,
+ * it reported ~0 failures against 142M aborts and read as "the CAS is not what
+ * is failing".
+ *
  * It exists because "the commit aborted" is not a diagnosis.  A transaction
  * that aborts forever needs to say WHICH of its records lost its CAS and what
  * the slot held instead of the expected old; the record index alone localises
@@ -571,6 +578,11 @@ unsigned int urcu_txn_install_mw_depth(struct urcu_txn_desc *t,
 						r->proxy_tag)) {
 						if (patience-- == 0) {
 							URCU_TXN_STAT(wait_capped);
+							URCU_TXN_CAS_FAIL(i,
+								r->slot,
+								r->old_ptr,
+								uatomic_load(r->slot,
+									CMM_RELAXED));
 							urcu_txn_decide(t,
 								URCU_TXN_DESC_FAILED);
 							*failed = 1;
@@ -582,6 +594,7 @@ unsigned int urcu_txn_install_mw_depth(struct urcu_txn_desc *t,
 				}
 			}
 			if (v != r->old_ptr) {
+				URCU_TXN_CAS_FAIL(i, r->slot, r->old_ptr, v);
 				urcu_txn_decide(t, URCU_TXN_DESC_FAILED);
 				*failed = 1;
 				return i;
@@ -1032,6 +1045,9 @@ bool urcu_txn_desc_commit(struct urcu_txn_desc *t,
 			bool committed = uatomic_cmpxchg(r->slot, r->old_ptr,
 					r->new_ptr) == r->old_ptr;
 
+			if (caa_unlikely(!committed))
+				URCU_TXN_CAS_FAIL(0, r->slot, r->old_ptr,
+					uatomic_load(r->slot, CMM_RELAXED));
 			urcu_txn_destroy(t);
 			return committed;
 		}
