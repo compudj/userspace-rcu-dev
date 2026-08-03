@@ -3663,12 +3663,44 @@ void cds_ft_s32_to_key(const struct cds_ft *ft, int32_t v, uint8_t *key, size_t 
  * (child and key counts, parent back-pointers, compressed-node
  * invariants).
  *
+ * Scoped to ONE trie: a node reachable from two tries of a group is
+ * self-consistent in each and passes here.  Use cds_ft_verify_disjoint
+ * to check a set of tries against each other.
+ *
  * Must be called with mutual exclusion wrt updaters.
  *
  * Returns CDS_FT_STATUS_OK if the trie passes all checks, or
  * CDS_FT_STATUS_INTEGRITY_ERROR on integrity violation.
  */
 enum cds_ft_status cds_ft_verify(const struct cds_ft *ft, FILE *out);
+
+/*
+ * cds_ft_verify_disjoint - Verify several tries, and that they share no node.
+ * @fts: Array of @nr_fts tries; no NULL entries.
+ * @nr_fts: Number of tries in @fts.
+ * @out: File stream for diagnostic output on failure (may be NULL
+ *       to suppress output).
+ *
+ * Runs the cds_ft_verify walk on each trie in turn, all against ONE
+ * visited set, so a node reachable from more than one of them is
+ * reported instead of passing as it does per-trie.
+ *
+ * The cross-trie operations (cds_ft_graft, cds_ft_graft_swap,
+ * cds_ft_merge_at with src != dst) MOVE nodes between tries of a group;
+ * none of them shares one.  An aliased node keeps every per-trie
+ * invariant intact and only shows up later, as a mutation in one trie
+ * corrupting another.
+ *
+ * Must be called with mutual exclusion wrt updaters of ALL @fts: an
+ * in-flight cross-trie operation legitimately holds a node between two
+ * tries.
+ *
+ * Returns CDS_FT_STATUS_OK if every trie passes and they are disjoint,
+ * CDS_FT_STATUS_INTEGRITY_ERROR on integrity violation, or
+ * CDS_FT_STATUS_INVALID_ARGUMENT_ERROR if @fts has a NULL entry.
+ */
+enum cds_ft_status cds_ft_verify_disjoint(struct cds_ft *const *fts,
+		size_t nr_fts, FILE *out);
 
 /*
  * enum cds_ft_compact_status - Drive/result status for the compaction API.

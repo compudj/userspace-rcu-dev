@@ -67,14 +67,11 @@
 #define NR_TESTS_DLM_FAULT 0
 #endif
 
-/* 285 unconditional + 49 fault-injection-only RUN_TEST registrations.  (The
- * fault total was one short before test_rekey_coherence_relational_fault: the
- * plan said 327 where 328 tests ran, so the fault build failed its own TAP
- * plan.) */
+/* 286 unconditional + 49 fault-injection-only RUN_TEST registrations. */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (336 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (337 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (287 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (288 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -24188,6 +24185,135 @@ out:
  * the walk has to recognise the dead end, climb, and carry on rather than stop.
  */
 
+/*
+ * cds_ft_verify_disjoint: the tries of a group share no node.
+ *
+ * cds_ft_verify is scoped to one trie, and at the ROOT its parent check is
+ * vacuous -- a root's metadata->parent is NULL, and the walk's expected_parent
+ * at depth 0 is NULL, in EVERY trie.  So two tries rooted at the same node are
+ * each self-consistent and both pass.  Only a walk that spans them can tell.
+ *
+ * The cross-trie ops MOVE nodes between tries; none shares one.  Both arms
+ * matter here: the legitimate move must NOT read as sharing (false positive),
+ * and a genuinely shared node MUST be reported -- the same trie passed twice
+ * is that case, reachable through the public API without building a corrupt
+ * trie by hand.
+ */
+static enum cds_ft_status vdisj_insert(struct cds_ft *ft, const char *key)
+{
+	struct ft_test_node *n = node_alloc(0);
+	enum cds_ft_status s = cds_ft_insert(ft, (const uint8_t *) key,
+			strlen(key), &n->node);
+
+	if (s != CDS_FT_STATUS_OK)
+		node_free(n);
+	return s;
+}
+
+static int test_verify_disjoint_cross_trie(void)
+{
+	struct cds_ft_group *group = NULL;
+	struct cds_ft *dst = create_varlen_ft(&group);
+	struct cds_ft *swap = NULL, *other = NULL;
+	struct cds_ft *set[3];
+	struct cds_ft *dup[2];
+	struct cds_ft *withnull[2];
+	enum cds_ft_status s;
+	int i, ret = -1;
+
+	if (cds_ft_create(group, NULL, &swap) < 0 ||
+	    cds_ft_create(group, NULL, &other) < 0)
+		abort();
+	set[0] = dst; set[1] = swap; set[2] = other;
+
+	/* Distinct EMPTY tries are already a real case: each is a bare root. */
+	if (cds_ft_verify_disjoint(set, 3, stderr) != CDS_FT_STATUS_OK) {
+		diag("verify_disjoint: three empty tries reported as sharing");
+		goto out;
+	}
+
+	rcu_read_lock();
+	if (vdisj_insert(dst, "PKa") != CDS_FT_STATUS_OK ||
+	    vdisj_insert(dst, "PKb") != CDS_FT_STATUS_OK ||
+	    vdisj_insert(dst, "PZ") != CDS_FT_STATUS_OK ||
+	    vdisj_insert(swap, "x") != CDS_FT_STATUS_OK ||
+	    vdisj_insert(swap, "y") != CDS_FT_STATUS_OK ||
+	    vdisj_insert(other, "Q") != CDS_FT_STATUS_OK) {
+		rcu_read_unlock();
+		diag("verify_disjoint: setup insert failed");
+		goto out;
+	}
+	rcu_read_unlock();
+	if (cds_ft_verify_disjoint(set, 3, stderr) != CDS_FT_STATUS_OK) {
+		diag("verify_disjoint: populated distinct tries reported as sharing");
+		goto out;
+	}
+
+	/*
+	 * A MOVE across tries: dst's "PK" subtree goes to @swap and @swap's
+	 * content lands in dst.  Every node stays reachable from exactly one
+	 * trie, so this must still pass -- the false-positive guard that keeps
+	 * the check usable by the graft/merge oracles.
+	 */
+	cds_ft_make_exclusive(swap);
+	s = cds_ft_graft_swap(dst, (const uint8_t *) "PK", 2, swap);
+	if (s != CDS_FT_STATUS_OK) {
+		diag("verify_disjoint: graft_swap: %s",
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+	if (cds_ft_verify_disjoint(set, 3, stderr) != CDS_FT_STATUS_OK) {
+		diag("verify_disjoint: a legitimate cross-trie MOVE reported as sharing");
+		goto out;
+	}
+
+	/*
+	 * The detecting arm.  Passing @dst twice makes every node of it
+	 * reachable from two entries of the set: exactly the shared-node
+	 * relation, and the only way to reach that arm without hand-building a
+	 * corrupt trie.  Without this the OK results above prove nothing.
+	 */
+	dup[0] = dst; dup[1] = dst;
+	if (cds_ft_verify_disjoint(dup, 2, NULL) !=
+			CDS_FT_STATUS_INTEGRITY_ERROR) {
+		diag("verify_disjoint: the SAME trie twice was NOT reported as sharing");
+		goto out;
+	}
+	/* Each of them alone is, of course, intact. */
+	for (i = 0; i < 3; i++) {
+		if (cds_ft_verify(set[i], stderr) != CDS_FT_STATUS_OK) {
+			diag("verify_disjoint: trie %d fails its own verify", i);
+			goto out;
+		}
+	}
+
+	withnull[0] = dst; withnull[1] = NULL;
+	if (cds_ft_verify_disjoint(withnull, 2, NULL) !=
+			CDS_FT_STATUS_INVALID_ARGUMENT_ERROR) {
+		diag("verify_disjoint: a NULL entry was not rejected");
+		goto out;
+	}
+	if (cds_ft_verify_disjoint(NULL, 0, NULL) != CDS_FT_STATUS_OK) {
+		diag("verify_disjoint: the empty set is not vacuously disjoint");
+		goto out;
+	}
+	ret = 0;
+out:
+	if (swap) {
+		drain_trie(swap);
+		rcu_barrier();
+		cds_ft_destroy(swap);
+	}
+	if (other) {
+		drain_trie(other);
+		rcu_barrier();
+		cds_ft_destroy(other);
+	}
+	if (drain_and_destroy(dst, group) < 0)
+		ret = -1;
+	return ret;
+}
+
 static int test_walk_past_empty_internal(void)
 {
 #ifdef FEATURE_FT_VERIFY_AT_MUTATION
@@ -30301,6 +30427,7 @@ int main(int argc, char **argv)
 #endif
 
 	RUN_TEST(test_walk_past_empty_internal);
+	RUN_TEST(test_verify_disjoint_cross_trie);
 
 	rcu_barrier();
 	rcu_unregister_thread();

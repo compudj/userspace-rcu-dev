@@ -1131,6 +1131,68 @@ out:
 }
 
 /*
+ * The whole of cds_ft_verify except the visited-set lifetime, which the
+ * caller owns.  Sharing ONE set across several tries turns the existing
+ * "reached twice" diagnostics into a CROSS-TRIE disjointness check
+ * (cds_ft_verify_disjoint).
+ *
+ * Returns 0 when the trie passes all checks, -1 on the first violation.
+ */
+static
+int ft_verify_one(const struct cds_ft *ft, FILE *out,
+		struct ft_visited_set *visited)
+{
+	struct cds_ft_inode_flag *root = ft->root;
+	unsigned long root_nr_keys = 0;
+	uint8_t path_buf[FT_MAX_KEY_LEN];
+	/*
+	 * Track the structural key down to each leaf ONLY when this trie reads
+	 * leaf-stored keys (ft->speculative_key_offset_active): the external-chain
+	 * walk then compares each leaf's stored speculative key against its
+	 * position (ft_verify_speculative_key).  For an EAGER trie the leaf key is
+	 * not consulted, so path tracking is left off and every path write/compare
+	 * short-circuits, exactly as before this check existed.
+	 */
+	uint8_t *path = ft->speculative_key_offset_active ? path_buf : NULL;
+	int ret;
+
+	if (ft_verify_no_proxy_at_rest(out, "root", root, NULL, 0))
+		return -1;
+	/*
+	 * Root-is-internal invariant.  ft->root must ALWAYS tag a plain internal
+	 * node -- never compressed / skip-compressed / external -- which the read
+	 * path's hot descent relies on.  Every mutator that re-roots the trie
+	 * (graft / graft_swap / detach / merge) materializes the new root through
+	 * the build-invisible internal-root builders (ft_make_root_internal_glue /
+	 * ft_build_extracted_root_glue), so no compressed root is ever published.
+	 * Asserted here so any future mutator that violates it is caught at the
+	 * next mutation point (and so the descent's defensive non-internal-root
+	 * resolver can be retired once this is proven 0 across the bulk-op suite).
+	 */
+	if (!ft_node_internal(root)) {
+		if (out)
+			fprintf(out, "ft_verify: root %p is NOT internal (compressed=%d skip=%d external=%d)\n",
+				(void *) root, (int) ft_node_compressed(root),
+				(int) ft_node_skip_compressed(root),
+				(int) ft_node_external(root));
+		return -1;
+	}
+	/*
+	 * @path is non-NULL only for a speculative-key-active trie (above), in
+	 * which case the leaf walk validates each stored key against its
+	 * position; otherwise it is NULL and all path-tracking writes / compares
+	 * short-circuit.
+	 */
+	ret = ft_verify_node_recursive(ft, out, visited, path, root, NULL, 0,
+			&root_nr_keys);
+	if (ret)
+		return -1;
+	if (ft->group->ordered_list_set && ft_verify_ord_cells(ft, out))
+		return -1;
+	return 0;
+}
+
+/*
  * cds_ft_verify - Verify integrity of the entire Fractal Trie.
  *
  * Recursively walks every internal and compressed node starting
@@ -1157,6 +1219,11 @@ out:
  * dedicated consistent resolver (the (parent, offset) pair, the state
  * word).  See the verify-at-mutation hook note below.
  *
+ * The visited set is PER CALL, so this validates one trie against
+ * itself only.  A node reachable from two tries of the same group is
+ * self-consistent in each and passes here; cds_ft_verify_disjoint is
+ * the check that spans them.
+ *
  * @out: file stream for diagnostic output on failure (may be NULL
  *       to suppress output).
  *
@@ -1165,61 +1232,87 @@ out:
  */
 enum cds_ft_status cds_ft_verify(const struct cds_ft *ft, FILE *out)
 {
-	struct cds_ft_inode_flag *root = ft->root;
-	unsigned long root_nr_keys = 0;
 	struct ft_visited_set visited;
-	uint8_t path_buf[FT_MAX_KEY_LEN];
-	/*
-	 * Track the structural key down to each leaf ONLY when this trie reads
-	 * leaf-stored keys (ft->speculative_key_offset_active): the external-chain
-	 * walk then compares each leaf's stored speculative key against its
-	 * position (ft_verify_speculative_key).  For an EAGER trie the leaf key is
-	 * not consulted, so path tracking is left off and every path write/compare
-	 * short-circuits, exactly as before this check existed.
-	 */
-	uint8_t *path = ft->speculative_key_offset_active ? path_buf : NULL;
 	int ret;
 
-	if (ft_verify_no_proxy_at_rest(out, "root", root, NULL, 0))
-		return CDS_FT_STATUS_INTEGRITY_ERROR;
-	/*
-	 * Root-is-internal invariant.  ft->root must ALWAYS tag a plain internal
-	 * node -- never compressed / skip-compressed / external -- which the read
-	 * path's hot descent relies on.  Every mutator that re-roots the trie
-	 * (graft / graft_swap / detach / merge) materializes the new root through
-	 * the build-invisible internal-root builders (ft_make_root_internal_glue /
-	 * ft_build_extracted_root_glue), so no compressed root is ever published.
-	 * Asserted here so any future mutator that violates it is caught at the
-	 * next mutation point (and so the descent's defensive non-internal-root
-	 * resolver can be retired once this is proven 0 across the bulk-op suite).
-	 */
-	if (!ft_node_internal(root)) {
-		if (out)
-			fprintf(out, "ft_verify: root %p is NOT internal (compressed=%d skip=%d external=%d)\n",
-				(void *) root, (int) ft_node_compressed(root),
-				(int) ft_node_skip_compressed(root),
-				(int) ft_node_external(root));
-		return CDS_FT_STATUS_INTEGRITY_ERROR;
-	}
 	if (ft_visited_init(&visited)) {
 		if (out)
 			fprintf(out, "ft_verify: visited-set allocation failed\n");
 		return CDS_FT_STATUS_INTEGRITY_ERROR;
 	}
-	/*
-	 * @path is non-NULL only for a speculative-key-active trie (above), in
-	 * which case the leaf walk validates each stored key against its
-	 * position; otherwise it is NULL and all path-tracking writes / compares
-	 * short-circuit.
-	 */
-	ret = ft_verify_node_recursive(ft, out, &visited, path, root, NULL, 0,
-			&root_nr_keys);
+	ret = ft_verify_one(ft, out, &visited);
 	ft_visited_destroy(&visited);
-	if (ret)
+	return ret ? CDS_FT_STATUS_INTEGRITY_ERROR : CDS_FT_STATUS_OK;
+}
+
+/*
+ * cds_ft_verify_disjoint - cds_ft_verify over @nr_fts tries at once, plus
+ * the invariant no single-trie walk can express: the tries are NODE-DISJOINT.
+ *
+ * The cross-trie ops MOVE nodes between tries of a group (graft, graft_swap,
+ * merge_at with src != dst); none of them SHARES one.  A node left reachable
+ * from two tries is internally consistent in both -- each trie's own parent
+ * pointers, nr_child and nr_keys still agree -- so cds_ft_verify passes on
+ * every trie individually.  The damage only surfaces when a mutation in one
+ * trie rewrites the shared node and the OTHER trie goes dirty underneath its
+ * owner, far from the op that aliased it.
+ *
+ * One visited set spans all @nr_fts walks, so the existing "reached twice"
+ * diagnostics (subtree and external-chain) fire on the second trie to reach a
+ * shared node.  Order-dependent in reporting only: whichever trie is walked
+ * later names the node.
+ *
+ * Same at-rest / writer-quiescence contract as cds_ft_verify, and the tries
+ * must be quiescent TOGETHER -- an in-flight cross-trie op legitimately has a
+ * node in hand between the two.
+ *
+ * @fts:    array of @nr_fts tries; no NULL entries.  Passing the same trie
+ *          twice is a caller error and reports as a self-alias.
+ * @out:    diagnostic stream, may be NULL.
+ *
+ * Returns CDS_FT_STATUS_OK when every trie passes and they are disjoint,
+ * CDS_FT_STATUS_INTEGRITY_ERROR on the first violation, or
+ * CDS_FT_STATUS_INVALID_ARGUMENT_ERROR for a NULL entry.
+ */
+enum cds_ft_status cds_ft_verify_disjoint(struct cds_ft *const *fts,
+		size_t nr_fts, FILE *out)
+{
+	struct ft_visited_set visited;
+	size_t i;
+	int ret = 0;
+
+	if (!fts && nr_fts)
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	if (ft_visited_init(&visited)) {
+		if (out)
+			fprintf(out, "ft_verify: visited-set allocation failed\n");
 		return CDS_FT_STATUS_INTEGRITY_ERROR;
-	if (ft->group->ordered_list_set && ft_verify_ord_cells(ft, out))
-		return CDS_FT_STATUS_INTEGRITY_ERROR;
-	return CDS_FT_STATUS_OK;
+	}
+	for (i = 0; i < nr_fts && !ret; i++) {
+		if (!fts[i]) {
+			ft_visited_destroy(&visited);
+			return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+		}
+		ret = ft_verify_one(fts[i], out, &visited);
+		if (ret && out) {
+			size_t j;
+
+			fprintf(out, "ft_verify_disjoint: trie %zu of %zu (%p) failed\n",
+				i, nr_fts, (void *) fts[i]);
+			/*
+			 * A shared node is a relation BETWEEN tries, so the roots
+			 * of all of them are the context: an alias at depth 0 is
+			 * two tries rooted at the same node, which no per-trie
+			 * walk can see (a root's parent is NULL in every trie).
+			 */
+			for (j = 0; j < nr_fts; j++)
+				fprintf(out, "ft_verify_disjoint:   trie %zu (%p) root %p\n",
+					j, (void *) fts[j],
+					fts[j] ? (void *) fts[j]->root : NULL);
+		}
+	}
+	ft_visited_destroy(&visited);
+	return ret ? CDS_FT_STATUS_INTEGRITY_ERROR : CDS_FT_STATUS_OK;
 }
 
 #ifdef FEATURE_FT_VERIFY_AT_MUTATION

@@ -10062,27 +10062,33 @@ static int gs_shared_oracle(const char *tname, bool list_on,
 				|| ctx.st[1] == CDS_FT_STATUS_OK)
 			one_ok++;
 		/*
-		 * ★ VERIFY ALL THREE TRIES, not just dst.  A corrupt SWAP trie
-		 * has been observed while dst verified clean and BOTH swaps
-		 * returned OK -- checking only the destination is blind to the
-		 * half of the exchange that gets re-rooted.
+		 * ★ VERIFY ALL THREE TRIES TOGETHER, not just dst, and not one
+		 * at a time.  A corrupt SWAP trie has been observed while dst
+		 * verified clean and BOTH swaps returned OK -- checking only the
+		 * destination is blind to the half of the exchange that gets
+		 * re-rooted.
+		 *
+		 * cds_ft_verify_disjoint, not three cds_ft_verify calls: an
+		 * exchange that hands the SAME node to two tries leaves each of
+		 * them self-consistent, so every per-trie walk passes.  At a
+		 * root that is not even a near miss -- a root's parent is NULL
+		 * in every trie, so two tries rooted at one node agree with
+		 * their own expected_parent.  Only the walk that spans them
+		 * sees it, and this exchange is exactly where such a node
+		 * comes from.
 		 */
 		{
-			struct cds_ft *bad = NULL;
-			const char *which = NULL;
+			struct cds_ft *set[3];
+			size_t nr = 0;
 
-			if (cds_ft_verify(ctx.dst, stderr) != CDS_FT_STATUS_OK) {
-				bad = ctx.dst; which = "dst";
-			} else if (cds_ft_verify(ctx.swap[0], stderr)
+			set[nr++] = ctx.dst;
+			set[nr++] = ctx.swap[0];
+			if (nw > 1)
+				set[nr++] = ctx.swap[1];
+			if (cds_ft_verify_disjoint(set, nr, stderr)
 					!= CDS_FT_STATUS_OK) {
-				bad = ctx.swap[0]; which = "swap0";
-			} else if (nw > 1 && cds_ft_verify(ctx.swap[1], stderr)
-					!= CDS_FT_STATUS_OK) {
-				bad = ctx.swap[1]; which = "swap1";
-			}
-			if (bad) {
-				fprintf(stderr, "%s: round %lu: verify(%s) failed "
-					"(st0=%d st1=%d)\n", tname, round, which,
+				fprintf(stderr, "%s: round %lu: verify_disjoint failed "
+					"(st0=%d st1=%d)\n", tname, round,
 					(int) ctx.st[0], (int) ctx.st[1]);
 				ret = -1;
 				break;
