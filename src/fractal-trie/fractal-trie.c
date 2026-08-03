@@ -124,6 +124,36 @@
 #include "urcu-utils.h"
 
 #include "fractal-trie-internal.h"
+
+#ifdef FEATURE_FT_PROBE_REANCHOR
+/*
+ * Reanchor level-move coverage.  A descent raises skip_conflict only when a
+ * reanchor lands SHALLOWER (rewind != 0) because a peer chain-merge moved the
+ * encoded position -- the condition graft and insert bail on and ft-merge.h
+ * does not.  Measured over the suite the rewind counters read ZERO against
+ * millions of reanchors, so neither the existing bails nor a new one is
+ * validated by any test: the counters are here so an oracle built to drive
+ * that race can say when it finally does.
+ */
+unsigned long ft_probe_mrg_desc[3], ft_probe_mrg_conf[3];
+unsigned long ft_probe_ranch[2], ft_probe_rewind[2];
+static const char *const ft_probe_mrg_name[3] = { "src", "mergepoint", "dst" };
+static __attribute__((destructor))
+void ft_probe_mrg_report(void)
+{
+	unsigned int i;
+
+	fprintf(stderr, "MRGPROBE");
+	for (i = 0; i < 3; i++)
+		fprintf(stderr, " %s: descents=%lu conflicts=%lu",
+			ft_probe_mrg_name[i], ft_probe_mrg_desc[i],
+			ft_probe_mrg_conf[i]);
+	fprintf(stderr, " | reanchor compressed=%lu rewinds=%lu slot=%lu rewinds=%lu\n",
+		ft_probe_ranch[0], ft_probe_rewind[0],
+		ft_probe_ranch[1], ft_probe_rewind[1]);
+}
+#endif
+
 #include "fractal-trie-trace.h"
 
 #include "bitmap.h"

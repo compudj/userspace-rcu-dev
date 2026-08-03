@@ -183,6 +183,7 @@ void ft_descent_traverse_compressed(struct cds_ft *ft, struct ft_descent *d,
 	 * wrong level -- flagged so a mutating caller re-descends.
 	 */
 	d->nf    = ft_reanchor_flag(ft, ft_resolve_flip_proxy(cn->child), &rewind);
+	MRG_REANCHOR_PROBE(0, rewind);
 	if (caa_unlikely(rewind != 0))
 		d->skip_conflict = true;
 	d->depth += cn->len;
@@ -219,6 +220,7 @@ struct cds_ft_inode_flag *ft_descent_step(struct cds_ft *ft, struct ft_descent *
 	 */
 	d->nf    = ft_node_get_nth_reanchor_slot(ft, d->pnf, &d->nfp,
 			key_value, FT_PF_NONE, &rewind);
+	MRG_REANCHOR_PROBE(1, rewind);
 	if (caa_unlikely(rewind != 0))
 		d->skip_conflict = true;
 	d->depth++;

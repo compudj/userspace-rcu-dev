@@ -2793,6 +2793,7 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 	 */
 	ks = ft_merge_descend(src_ft, okey_src, src_key_len, &d_src,
 			&off_src, &cnt_src);
+	MRG_SKIPCONF_PROBE(0, d_src);
 	if (ks == FT_GRAFT_SWAP_DELEGATE || cnt_src == 0) {
 		FT_TP(merge_exit, (int) CDS_FT_STATUS_OK);
 		return CDS_FT_STATUS_OK;
@@ -2882,6 +2883,7 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 		 */
 		(void) ft_merge_descend(dst_ft, omrg, omrg_len, &d_mrg, &off_mrg,
 			&m);
+		MRG_SKIPCONF_PROBE(1, d_mrg);
 
 		/*
 		 * cds_ft_rekey_graft: an occupied @dst_key (m > 0 keys at or below
@@ -3042,6 +3044,7 @@ merge_spine_retry:
 	}
 	kd = ft_merge_descend(dst_ft, okey_dst, dst_key_len, &d_dst,
 			&off_dst, &cnt_dst);
+	MRG_SKIPCONF_PROBE(2, d_dst);
 
 	/*
 	 * Atomic build-invisible spine-copy of @src_ft's subtree at @src_key into

@@ -1760,6 +1760,31 @@ struct cds_ft {
  * replaces on the parent-pointer backtrack path.  NULL keeps its meaning of
  * "not yet parented" for a node under build, which is never reachable.
  */
+
+#ifdef FEATURE_FT_PROBE_REANCHOR
+extern unsigned long ft_probe_mrg_desc[3], ft_probe_mrg_conf[3];
+#define MRG_SKIPCONF_PROBE(i, d)					\
+	do {								\
+		__atomic_fetch_add(&ft_probe_mrg_desc[i], 1,		\
+				__ATOMIC_RELAXED);			\
+		if ((d).skip_conflict)					\
+			__atomic_fetch_add(&ft_probe_mrg_conf[i], 1,	\
+					__ATOMIC_RELAXED);		\
+	} while (0)
+extern unsigned long ft_probe_ranch[2], ft_probe_rewind[2];
+#define MRG_REANCHOR_PROBE(i, rw)					\
+	do {								\
+		__atomic_fetch_add(&ft_probe_ranch[i], 1,		\
+				__ATOMIC_RELAXED);			\
+		if ((rw) != 0)						\
+			__atomic_fetch_add(&ft_probe_rewind[i], 1,	\
+					__ATOMIC_RELAXED);		\
+	} while (0)
+#else
+#define MRG_SKIPCONF_PROBE(i, d)	do { } while (0)
+#define MRG_REANCHOR_PROBE(i, rw)	do { } while (0)
+#endif
+
 #define FT_PARENT_TAG_MASK	((uintptr_t) (FT_INTERNAL_MASK | FT_TYPE_MASK))
 #define FT_PARENT_TRIE_ALIGN	(FT_PARENT_TAG_MASK + 1)
 
