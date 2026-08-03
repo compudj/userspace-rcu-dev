@@ -2697,6 +2697,28 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
 	}
 	/*
+	 * A rekey needs a VARIABLE-length group, and the refusal belongs HERE,
+	 * before anything is read or reserved.  The move is staged as a detach of
+	 * @src_key's subtree into a transient trie followed by a merge of that
+	 * trie back in at @dst_key, and a detached subtree carries keys STRIPPED
+	 * of the prefix -- shorter than a fixed-length group's one key length,
+	 * which is exactly why cds_ft_detach and cds_ft_graft take a non-root key
+	 * on variable-length groups only.  The rekey entries are composed of those
+	 * two operations, so they inherit the restriction.
+	 *
+	 * Enforcing it at the entry is what makes the refusal SAFE.  The placement
+	 * is a merge of that transient at @dst_key, so it meets the fixed-length
+	 * equal-prefix-length guard above with src_key_len == 0 != dst_key_len and
+	 * refuses -- but only AFTER the detach has committed, leaving the caller an
+	 * INVALID_ARGUMENT_ERROR (an "argument rejected, nothing happened" status)
+	 * for a trie that has just lost every moved key to the destroyed transient.
+	 */
+	if (rekey != FT_REKEY_NONE &&
+			dst_ft->group->key_len != CDS_FT_LEN_VARIABLE) {
+		FT_TP(merge_exit, (int) CDS_FT_STATUS_INVALID_ARGUMENT_ERROR);
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	}
+	/*
 	 * Combined-length overflow validation (mirrors cds_ft_graft): a moved
 	 * key K becomes dst_key || (K - src_key prefix), of length
 	 * dst_key_len + len(K) - src_key_len.  Bound len(K) by the source's

@@ -67,11 +67,14 @@
 #define NR_TESTS_DLM_FAULT 0
 #endif
 
-/* 286 unconditional + 49 fault-injection-only RUN_TEST registrations. */
+/*
+ * 289 unconditional + 49 fault-injection-only RUN_TEST registrations, on top of
+ * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
+ */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (337 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (338 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (288 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (289 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -10809,6 +10812,90 @@ static int test_rekey_graft_vs_merge(void)
 			ft, (const uint8_t *) "bc", 2)
 			!= CDS_FT_STATUS_INVALID_ARGUMENT_ERROR) {
 		fprintf(stderr, "merge_at: same-trie not rejected\n");
+		goto out;
+	}
+	ret = 0;
+out:
+	rcu_read_unlock();
+	drain_trie(ft);
+	rcu_barrier();
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
+ * A rekey on a FIXED-LENGTH group is refused, AND THE TRIE IS UNTOUCHED.
+ *
+ * Both halves matter.  The move is staged as a detach into a transient trie plus
+ * a merge of that trie back in, and a detached subtree's keys are stripped of the
+ * prefix -- shorter than the group's one key length -- which is why cds_ft_detach
+ * and cds_ft_graft take a non-root key on variable-length groups only.  Until the
+ * entry check existed the rekey entries inherited that restriction WITHOUT
+ * declaring it: the detach committed, the placement then met the fixed-length
+ * equal-prefix-length guard and refused, and the caller got
+ * INVALID_ARGUMENT_ERROR -- a status that reads as "argument rejected, nothing
+ * happened" -- for a trie that had just lost every moved key with the destroyed
+ * transient.  Measured on the four-key subtree below: count_keys 4 -> 0, every
+ * key absent at BOTH positions, and cds_ft_verify still clean (the trie is
+ * well-formed, just empty), so nothing but a count would have caught it.
+ *
+ * So this asserts the status AND that all four keys are still at the source, none
+ * at the destination, the count is unchanged and the trie verifies.
+ */
+static int test_rekey_fixed_len_refused(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	struct cds_ft_node *found = NULL;
+	uint8_t src_key[2] = { 1, 9 }, dst_key[2] = { 2, 1 };
+	int c, ret = -1;
+
+	if (!cds_ft_merge_enabled()) {
+		diag("test_rekey_fixed_len_refused: skipped, merge compiled out "
+			"(-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
+	ft = create_fixed_ord_rekey_ft(4, &group);
+	rcu_read_lock();
+	for (c = 1; c <= 4; c++) {
+		uint64_t k = (1ULL << 24) | (9ULL << 16) | ((uint64_t) c << 8);
+
+		if (insert_u64(ft, k, node_alloc(k)) != CDS_FT_STATUS_OK)
+			abort();
+	}
+
+	if (cds_ft_rekey_graft(ft, dst_key, 2, src_key, 2) !=
+			CDS_FT_STATUS_INVALID_ARGUMENT_ERROR) {
+		fprintf(stderr, "rekey_fixed: graft not refused\n");
+		goto out;
+	}
+	if (cds_ft_rekey_merge(ft, dst_key, 2, src_key, 2) !=
+			CDS_FT_STATUS_INVALID_ARGUMENT_ERROR) {
+		fprintf(stderr, "rekey_fixed: merge not refused\n");
+		goto out;
+	}
+	if (cds_ft_count_keys(ft) != 4) {
+		fprintf(stderr, "rekey_fixed: %lu keys left of 4 -- the refusal "
+			"consumed the subtree\n", cds_ft_count_keys(ft));
+		goto out;
+	}
+	for (c = 1; c <= 4; c++) {
+		uint64_t at_src = (1ULL << 24) | (9ULL << 16) | ((uint64_t) c << 8);
+		uint64_t at_dst = (2ULL << 24) | (1ULL << 16) | ((uint64_t) c << 8);
+
+		if (lookup_u64(ft, at_src, &found) != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "rekey_fixed: leaf %d lost from the source\n",
+				c);
+			goto out;
+		}
+		if (lookup_u64(ft, at_dst, &found) == CDS_FT_STATUS_OK) {
+			fprintf(stderr, "rekey_fixed: leaf %d moved anyway\n", c);
+			goto out;
+		}
+	}
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "rekey_fixed: verify failed\n");
 		goto out;
 	}
 	ret = 0;
@@ -30146,6 +30233,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_merge_rekey_same_trie);
 	RUN_TEST(test_merge_rekey_same_trie_speculative_rejected);
 	RUN_TEST(test_rekey_graft_vs_merge);
+	RUN_TEST(test_rekey_fixed_len_refused);
 	RUN_TEST(test_merge_rekey_same_trie_ordered);
 	RUN_TEST(test_merge_rekey_same_trie_listoff_collision);
 	RUN_TEST(test_nonidentity_bulk_ops);

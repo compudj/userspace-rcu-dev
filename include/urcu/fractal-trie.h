@@ -2119,12 +2119,18 @@ enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
  * re-parents each leaf under @dst_key but cannot rewrite its app-owned stored
  * key, so a speculative trie is refused with CDS_FT_STATUS_INVALID_ARGUMENT_ERROR.
  *
+ * The group must be VARIABLE-length, for the same reason cds_ft_detach and
+ * cds_ft_graft take a non-root key only there: the move is staged through a
+ * detached subtree, whose keys are stripped of the prefix and so are shorter
+ * than a fixed-length group's one key length.  A fixed-length group is refused
+ * with CDS_FT_STATUS_INVALID_ARGUMENT_ERROR and the trie is left untouched.
+ *
  * Returns CDS_FT_STATUS_OK (including when @src_key is absent -- a no-op),
  * CDS_FT_STATUS_POPULATED_ERROR if @dst_key is occupied, CDS_FT_STATUS_MEMORY_ERROR,
  * or CDS_FT_STATUS_INVALID_ARGUMENT_ERROR (NULL @ft, a key length exceeding the
- * group maximum, unequal key lengths on a fixed-length group, overlapping keys,
- * or a speculative trie), CDS_FT_STATUS_OVERFLOW_ERROR (a moved key would exceed
- * the group maximum length).
+ * group maximum, a fixed-length group, overlapping keys, or a speculative trie),
+ * CDS_FT_STATUS_OVERFLOW_ERROR (a moved key would exceed the group maximum
+ * length).
  */
 enum cds_ft_status cds_ft_rekey_graft(struct cds_ft *ft,
 		const uint8_t *dst_key, size_t dst_key_len,
@@ -2142,9 +2148,10 @@ enum cds_ft_status cds_ft_rekey_graft(struct cds_ft *ft,
  * @src_key_len: Length of @src_key in bytes.
  *
  * The merge (occupied-destination) counterpart of cds_ft_rekey_graft, standing
- * to it as cds_ft_merge_at stands to cds_ft_graft.  Same disjoint-key and EAGER
- * requirements.  Returns the same statuses as cds_ft_rekey_graft except it never
- * returns CDS_FT_STATUS_POPULATED_ERROR (an occupied @dst_key is merged into).
+ * to it as cds_ft_merge_at stands to cds_ft_graft.  Same disjoint-key, EAGER and
+ * variable-length-group requirements.  Returns the same statuses as
+ * cds_ft_rekey_graft except it never returns CDS_FT_STATUS_POPULATED_ERROR (an
+ * occupied @dst_key is merged into).
  */
 enum cds_ft_status cds_ft_rekey_merge(struct cds_ft *ft,
 		const uint8_t *dst_key, size_t dst_key_len,
