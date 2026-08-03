@@ -2570,7 +2570,11 @@ struct cds_ft_alloc_range *cds_ft_item_to_range(void *p)
 static inline
 struct cds_ft_metadata *cds_ft_item_to_metadata_fast(void *p, size_t item_len_order)
 {
-	struct cds_ft_alloc_range *range = cds_ft_item_to_range(p);
+	struct cds_ft_alloc_range *range;
+
+	/* A node, not a parked proxy -- see cds_ft_item_to_metadata. */
+	assert(((uintptr_t) p & FT_PARENT_TAG_MASK) != FT_PARENT_TAG_MASK);
+	range = cds_ft_item_to_range(p);
 	size_t page_offset = (unsigned long) p & (FT_RANGE_PAGE_UNIT - 1);
 	size_t index = page_offset >> item_len_order;
 

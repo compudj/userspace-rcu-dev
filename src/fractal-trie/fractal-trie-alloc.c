@@ -154,7 +154,21 @@ struct cds_ft_alloc_range *cds_ft_metadata_to_range(struct cds_ft_metadata *meta
 
 struct cds_ft_metadata *cds_ft_item_to_metadata(void *p)
 {
-	struct cds_ft_alloc_range *range = cds_ft_item_to_range(p);
+	struct cds_ft_alloc_range *range;
+
+	/*
+	 * @p must be a NODE, not a parked transaction proxy.  This is the choke
+	 * point for "treat this word as an arena item", and the very next line
+	 * dereferences the range header derived from it -- so a caller that read
+	 * a transacted slot RAW and handed the parked proxy (a descriptor-record
+	 * POINTER carrying the whole in-band tag) straight here faults on foreign
+	 * memory, with nothing in the backtrace naming the raw read.  An arena
+	 * item is (1 << item_len_order)-aligned and can never carry the whole
+	 * tag, so this only ever fires on that mistake.  Resolve the slot
+	 * (ft_resolve_flip_proxy / urcu_txn_load) before naming a node.
+	 */
+	assert(((uintptr_t) p & FT_PARENT_TAG_MASK) != FT_PARENT_TAG_MASK);
+	range = cds_ft_item_to_range(p);
 	return cds_ft_item_to_metadata_fast(p, range->arena->item_len_order);
 }
 
