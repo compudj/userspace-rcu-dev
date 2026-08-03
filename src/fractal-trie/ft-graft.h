@@ -64,16 +64,16 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 	/*
 	 * F2 node lock, split-retire (MW LOCK_FINE drop): fence @cn BEFORE
 	 * any plan read -- this build derives its WHOLE plan from @cn (the
-	 * diverge slicing over cn->key_bytes, the cn->child snapshot, the
+	 * diverge slicing over cn->key_bytes, the cn_child snapshot, the
 	 * deferred-edge captures) and RETIRES @cn, exactly as
 	 * ft_split_compressed_insert fences the node it splits.  A peer that
-	 * splits / grows / recompacts @cn, OR changes cn->child (X->X') and
+	 * splits / grows / recompacts @cn, OR changes cn_child (X->X') and
 	 * releases @cn, must either hold the fence (mark fails -> -EAGAIN,
 	 * re-descend, NOTHING built) or abort at commit against the fenced
 	 * tombstone's precise expected old (ft_glue_txn_commit_edges records
 	 * {LOCK|s -> TOMBSTONE|s} from @split_cn_snap).  Marking here (not in
 	 * the caller's pre-swap fence block) closes the read-then-fence window:
-	 * the whole build runs under the fence, so a cn->child change during the
+	 * the whole build runs under the fence, so a cn_child change during the
 	 * build is caught too.  Gated on a txn'd graft under the drop: the
 	 * txn-less merge-rekey (glue->txn NULL) and the FT-wide-lock builds keep
 	 * the prior behaviour.  On the fence-miss path nothing is
@@ -101,15 +101,28 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 	struct cds_ft_inode *old_branch = NULL;
 	unsigned long old_child_nr_keys;
 	int ret;
+	/*
+	 * THE ONE @cn->child LOAD, SETTLED.  This build derives its whole plan
+	 * from @cn under the F2 fence, and the child is part of that plan: it is
+	 * dereferenced for the old nr_keys, wired into the fresh suffix node, and
+	 * handed to the deferred back-edges.  A raw load can catch a peer's parked
+	 * engine proxy -- a descriptor-record POINTER -- and the fence on @cn's
+	 * state word does not exclude one: a peer mid-commit on this slot has
+	 * already parked, and only its COMMIT is arbitrated (against the fenced
+	 * tombstone's expected-old).  Dereferencing that pointer as a node faults;
+	 * copying it into @sfx->child would publish it.  Resolving yields the value
+	 * the slot denotes, and the commit still ratifies the plan.
+	 */
+	struct cds_ft_inode_flag *cn_child = ft_resolve_flip_proxy(cn->child);
 
 	(void) branch_cluster_leaf;	/* documents intent; both set_nth defer */
 
 	/* Compute old child's nr_keys. */
-	if (!ft_node_external(cn->child)) {
+	if (!ft_node_external(cn_child)) {
 		struct cds_ft_metadata *cm =
-			cds_ft_item_to_metadata(ft_node_ptr(cn->child));
+			cds_ft_item_to_metadata(ft_node_ptr(cn_child));
 		old_child_nr_keys = ft_nr_keys_get(cm);
-	} else if (cn->child) {
+	} else if (cn_child) {
 		old_child_nr_keys = 1;
 	} else {
 		old_child_nr_keys = 0;
@@ -117,7 +130,7 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 
 	/*
 	 * 1. Build the OLD-direction suffix -> old child (mirrors the legacy
-	 * split).  cn->child (live) is deferred into @glue.
+	 * split).  cn_child (live) is deferred into @glue.
 	 */
 	if (suffix_len >= 2
 #ifdef FEATURE_FT_SKIP_COMPRESSED
@@ -130,7 +143,7 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 		sfx = alloc_compressed_node(ft, suffix_len, &sfx_meta);
 		if (!sfx)
 			return -ENOMEM;
-		sfx->child = cn->child;
+		sfx->child = cn_child;
 		sfx->len = suffix_len;
 		memcpy(sfx->key_bytes, &cn->key_bytes[diverge_pos + 1],
 			suffix_len);
@@ -140,17 +153,17 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 		sfx_skip_flag = ft_publish_compressed(ft, sfx, old_suffix_flag);
 		ft_glue_track(glue, old_suffix_flag);
 		/*
-		 * The displaced child @cn->child is LIVE: a reader can still descend
+		 * The displaced child @cn_child is LIVE: a reader can still descend
 		 * to it through @cn (the compressed node being split, untouched until
 		 * the forward publish replaces it).  So its re-parent onto the fresh
 		 * @sfx is a reader-observable pointer -- ride it on the flip-txn
 		 * (dst_origin) so it flips atomically with the forward edge.  Holds for
-		 * an external @cn->child too: the up-walk readers (ft_get_parent_rcu /
+		 * an external @cn_child too: the up-walk readers (ft_get_parent_rcu /
 		 * ft_skip_to_compressed / ft_skip_reanchor) resolve a flip proxy parked
 		 * on an external's parent.  The merge-rekey path has no txn (glue->txn
 		 * NULL); there it stays on the legacy fresh-before-live immediate store.
 		 */
-		ft_glue_defer_edge_origin(ft, glue, cn->child, old_suffix_flag,
+		ft_glue_defer_edge_origin(ft, glue, cn_child, old_suffix_flag,
 			&sfx->child, glue->txn != NULL);
 	} else if (suffix_len == 1) {
 		struct cds_ft_inode_flag *dest = NULL;
@@ -158,7 +171,7 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 		/* 1-child internal suffix (non-SC): cluster-leaf. */
 		ret = ft_node_set_nth(ft, &dest,
 				cn->key_bytes[diverge_pos + 1],
-				cn->child, NULL, NULL,
+				cn_child, NULL, NULL,
 				d->depth + diverge_pos + 1, true);
 		if (ret)
 			return -ENOMEM;
@@ -169,10 +182,10 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 		ft_node_get_nth_skip(dest, &slot,
 			cn->key_bytes[diverge_pos + 1], FT_PF_NONE);
 		/* Displaced child: LIVE, ride the txn -- see the suffix_len>1 case. */
-		ft_glue_defer_edge_origin(ft, glue, cn->child, dest, slot,
+		ft_glue_defer_edge_origin(ft, glue, cn_child, dest, slot,
 			glue->txn != NULL);
 	} else {
-		old_suffix_flag = cn->child;	/* suffix_len == 0 */
+		old_suffix_flag = cn_child;	/* suffix_len == 0 */
 	}
 
 	/*
@@ -256,7 +269,7 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 	if (sfx_skip_flag && sfx_skip_flag != old_suffix_flag && slot)
 		*slot = sfx_skip_flag;
 	/*
-	 * suffix_len == 0: @old_suffix_flag IS the live @cn->child wired directly
+	 * suffix_len == 0: @old_suffix_flag IS the live @cn_child wired directly
 	 * under the branch (no fresh suffix node), so this edge re-parents a
 	 * reader-reachable node -- dst_origin (ride the txn).  suffix_len > 0:
 	 * @old_suffix_flag is the fresh sfx/dest, a hidden edge (src-origin).
