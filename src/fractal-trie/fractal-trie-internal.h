@@ -1905,6 +1905,90 @@ static __thread struct cds_ft *ft_wlock_held;
 static __thread unsigned long ft_wlock_depth;
 
 /*
+ * The access validator's writer OWNER word follows the FT-WIDE LOCK, not the
+ * writer scope, and ft_writer_lock_gp_wait is why.  That function drops the lock
+ * mid-scope by design, so on a COARSE trie two writer SCOPES legitimately overlap
+ * -- and the validator's premise for keeping the single-owner CAS there ("a COARSE
+ * trie serializes under the FT-wide mutex, so its owner word is accurate anyway")
+ * stops holding.  It fired the moment writers began making progress at all:
+ * "writer conflict -- owner ..., entering thread ...".
+ *
+ * So hand the claim back with the lock and retake it with the lock.  A no-op where
+ * the validator counts instead of owning (concurrent + FINE), and where there is no
+ * lock to drop (an exclusive trie skips it, and has no concurrent writer to race).
+ */
+#ifdef FEATURE_FT_EXCL_VALIDATE
+static inline
+unsigned long ft_excl_owner_release(struct cds_ft *ft)
+{
+	unsigned long depth;
+
+	if (ft->lock_fine && !ft->exclusive)
+		return 0;			/* counted, not owned */
+	depth = ft->excl_writer_depth;
+	ft->excl_writer_depth = 0;
+	uatomic_store(&ft->excl_owner, 0, CMM_RELEASE);
+	return depth;
+}
+
+static inline
+void ft_excl_owner_reclaim(struct cds_ft *ft, unsigned long depth)
+{
+	if (!depth)
+		return;
+	/* We hold the lock again, so we ARE the owner: store, do not contend. */
+	uatomic_store(&ft->excl_owner, (unsigned long) pthread_self(),
+		CMM_RELEASE);
+	ft->excl_writer_depth = depth;
+}
+#else
+static inline
+unsigned long ft_excl_owner_release(struct cds_ft *ft __attribute__((unused)))
+{
+	return 0;
+}
+
+static inline
+void ft_excl_owner_reclaim(struct cds_ft *ft __attribute__((unused)),
+		unsigned long depth __attribute__((unused)))
+{
+}
+#endif
+
+/*
+ * Take the FT-wide writer lock, parked OFFLINE.
+ *
+ * MANDATORY, and the invariant is the one ft_writer_lock_gp_wait states: "writers
+ * parked on the lock are RCU-online and non-quiescent, so they are precisely what
+ * stops this grace period from ever completing."  Dropping the lock across a GP
+ * (which gp_wait does) fixes only the SELF-deadlock -- a holder waiting on its own
+ * waiters.  It does nothing about the group: N writers whose ops each contain a
+ * grace period wedge each other, because whichever of them is parked here is an
+ * online reader the GP waits for, and the GP is what the lock holder is waiting
+ * on.  Measured: four concurrent cds_ft_rekey_graft writers on a COARSE trie made
+ * ZERO moves, permanently, while three sat here and the call_rcu thread sat in
+ * wait_for_readers.
+ *
+ * SAFE, because a park dereferences NOTHING and the caller already survives a full
+ * grace period across it.  Under QSBR, synchronize_rcu marks its caller quiescent
+ * for the duration anyway, so every pointer a writer holds across
+ * ft_writer_lock_gp_wait is ALREADY exposed to reclamation and must already be
+ * kept valid by the writer lock / exclusivity rather than by this thread's
+ * online-ness.  Being offline for the subsequent park adds no exposure.  The
+ * caller's own @node argument is app-owned and never library-reclaimed.  A no-op
+ * on the memb / mb flavors.
+ */
+static inline
+void ft_writer_lock_park(struct cds_ft *ft)
+{
+	const struct rcu_flavor_struct *flavor = ft->group->flavor;
+
+	flavor->thread_offline();
+	cds_fair_mutex_lock(&ft->writer_lock, &ft_wlock_waiter);
+	flavor->thread_online();
+}
+
+/*
  * Take the FT-wide writer lock at the OUTERMOST writer scope; reentrant no-op
  * on a nested scope for the same trie.  Every trie is lock-mode now (COARSE or
  * FINE), so there is no optimistic early-out; a FINE trie skips the FT-wide
@@ -1969,7 +2053,7 @@ void ft_writer_lock_scope_enter(struct cds_ft *ft)
 		fflush(stderr);
 		abort();
 	}
-	cds_fair_mutex_lock(&ft->writer_lock, &ft_wlock_waiter);
+	ft_writer_lock_park(ft);
 	ft_wlock_held = ft;
 	ft_wlock_depth = 1;
 }
@@ -2018,17 +2102,24 @@ void ft_writer_lock_gp_wait(struct cds_ft *ft)
 {
 	struct cds_ft *held = ft_wlock_held;
 	unsigned long depth = ft_wlock_depth;
+	unsigned long own = 0;
 
 	if (held) {
+		own = ft_excl_owner_release(held);
 		ft_wlock_held = NULL;
 		ft_wlock_depth = 0;
 		(void) cds_fair_mutex_unlock(&held->writer_lock, &ft_wlock_waiter);
 	}
 	ft->group->flavor->update_synchronize_rcu();
 	if (held) {
-		cds_fair_mutex_lock(&held->writer_lock, &ft_wlock_waiter);
+		/*
+		 * OFFLINE for the re-acquire, or the drop above buys nothing when
+		 * there is more than one writer: see ft_writer_lock_park.
+		 */
+		ft_writer_lock_park(held);
 		ft_wlock_held = held;
 		ft_wlock_depth = depth;
+		ft_excl_owner_reclaim(held, own);
 	}
 }
 

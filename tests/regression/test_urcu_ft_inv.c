@@ -67,7 +67,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS_REKEY_DLM	12	/* inv_rekey_graft_{disjoint,cross_junction,glue_dst,coherent_readers,shared}, inv_rekey_linearizability, inv_rekey_public_{atomic_no_gap,atomic_no_gap_varlen,staged_gap}, inv_rekey_merge_{occupied,shared}_dst */
+#define NR_TESTS_REKEY_DLM	13	/* inv_rekey_graft_{disjoint,cross_junction,glue_dst,coherent_readers,shared}, inv_rekey_linearizability, inv_rekey_public_{atomic_no_gap,atomic_no_gap_varlen,staged_gap}, inv_rekey_coarse_progress, inv_rekey_merge_{occupied,shared}_dst */
 
 /*
  * Base count = the RUN_TEST invocations in main() outside the DLM #ifdef.
@@ -3917,6 +3917,7 @@ enum rkp_mode {
 	RKP_ATOMIC_FIXED,
 	RKP_ATOMIC_VARLEN,
 	RKP_STAGED,
+	RKP_COARSE,	/* FT-wide writer lock: staged, and a LIVENESS check */
 };
 
 static struct cds_ft *create_rekey_coherent_ft(enum rkp_mode mode,
@@ -3940,7 +3941,8 @@ static struct cds_ft *create_rekey_coherent_ft(enum rkp_mode mode,
 			CDS_FT_LOOKUP_OPTIMIZE_EAGER) < 0)
 		abort();
 	if (cds_ft_group_attr_set_writer_strategy(gattr,
-			CDS_FT_WRITER_LOCK_FINE) < 0)
+			mode == RKP_COARSE ? CDS_FT_WRITER_LOCK_COARSE :
+				CDS_FT_WRITER_LOCK_FINE) < 0)
 		abort();
 	if (cds_ft_group_attr_set_ordered_list(gattr,
 			mode != RKP_ATOMIC_FIXED) < 0)
@@ -4209,7 +4211,8 @@ static void *rkp_reader(void *arg)
 	return NULL;
 }
 
-static int inv_rekey_public_no_gap_run(enum rkp_mode mode, const char *name)
+static int inv_rekey_public_no_gap_run(enum rkp_mode mode, bool expect_no_gap,
+		const char *name)
 {
 	struct cds_ft_group *group;
 	struct cds_ft *ft;
@@ -4379,7 +4382,7 @@ static int inv_rekey_public_no_gap_run(enum rkp_mode mode, const char *name)
 		fprintf(stderr, "rkp: the control phase took no band probe\n");
 		ret = -1;
 	}
-	if (quiet_bad || move_bad || exact_bad)
+	if (quiet_bad || exact_bad || (expect_no_gap && move_bad))
 		ret = -1;
 
 	fprintf(stderr, "# %s: %d writers %d readers, "
@@ -4411,7 +4414,7 @@ static int inv_rekey_public_atomic_no_gap(void)
 			"(set FT_INV_MW=1 to run the concurrent-writer oracles)\n");
 		return 0;
 	}
-	return inv_rekey_public_no_gap_run(RKP_ATOMIC_FIXED,
+	return inv_rekey_public_no_gap_run(RKP_ATOMIC_FIXED, true,
 			"inv_rekey_public_atomic_no_gap");
 }
 
@@ -4428,8 +4431,35 @@ static int inv_rekey_public_atomic_no_gap_varlen(void)
 			"(set FT_INV_MW=1 to run the concurrent-writer oracles)\n");
 		return 0;
 	}
-	return inv_rekey_public_no_gap_run(RKP_ATOMIC_VARLEN,
+	return inv_rekey_public_no_gap_run(RKP_ATOMIC_VARLEN, true,
 			"inv_rekey_public_atomic_no_gap_varlen");
+}
+
+/*
+ * THE COARSE ARM -- a LIVENESS check, and the regression test for a total wedge.
+ *
+ * A COARSE trie serializes every mutator on the FT-wide writer lock, and the
+ * staged rekey it falls back to takes a grace period mid-op.  Every writer parked
+ * on that lock used to park RCU-ONLINE, so it was itself a reader the grace period
+ * waited for: four writers made ZERO moves, permanently, with three sitting in
+ * ft_writer_lock_gp_wait's re-acquire and the call_rcu thread in wait_for_readers.
+ * Dropping the lock across the wait -- which that function already did -- fixes
+ * only the self-deadlock, not the group.
+ *
+ * So this arm asserts PROGRESS, not no-gap: it is staged, and the absence count is
+ * reported rather than gated (the requirement lives in the arms above).  ★ Note the
+ * failure mode it guards against is a HANG, so a regression shows up as this leg
+ * timing out rather than as a "not ok".
+ */
+static int inv_rekey_coarse_progress(void)
+{
+	if (!getenv("FT_INV_MW")) {
+		fprintf(stderr, "# inv_rekey_coarse_progress: skipped "
+			"(set FT_INV_MW=1 to run the concurrent-writer oracles)\n");
+		return 0;
+	}
+	return inv_rekey_public_no_gap_run(RKP_COARSE, false,
+			"inv_rekey_coarse_progress");
 }
 
 /*
@@ -4451,7 +4481,7 @@ static int inv_rekey_public_staged_gap(void)
 			"set FT_INV_RKPG=1 to measure the gap\n");
 		return 0;
 	}
-	return inv_rekey_public_no_gap_run(RKP_STAGED,
+	return inv_rekey_public_no_gap_run(RKP_STAGED, true,
 			"inv_rekey_public_staged_gap");
 }
 
@@ -17594,6 +17624,7 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_rekey_public_atomic_no_gap);
 	RUN_TEST(inv_rekey_public_atomic_no_gap_varlen);
 	RUN_TEST(inv_rekey_public_staged_gap);
+	RUN_TEST(inv_rekey_coarse_progress);
 	RUN_TEST(inv_rekey_merge_occupied_dst);
 	RUN_TEST(inv_rekey_merge_shared_dst);
 	RUN_TEST(inv_rekey_src_mutated);
