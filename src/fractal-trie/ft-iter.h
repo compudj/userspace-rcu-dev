@@ -176,7 +176,7 @@ size_t ft_rebuild_key_upwalk(const struct cds_ft *ft, struct ft_ord_cell *cell,
 		{
 			struct cds_ft_inode_flag *parent =
 				ft_resolve_flip_proxy(ft_parent_node(
-					rcu_dereference(meta->parent)));
+					rcu_dereference(meta->parent_word)));
 
 			if (parent && !ft_node_compressed(
 					ft_resolve_skip_compressed(ft, parent))) {

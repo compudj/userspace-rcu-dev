@@ -1075,7 +1075,7 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 	 * are never at the root).
 	 */
 	FT_TP(tree_edge_set, (const void *) ft,
-		(const void *) cn_meta->parent,
+		(const void *) ft_parent_node(cn_meta->parent),
 		(unsigned int) (node_depth - 1),
 		(uint8_t) iter_key[-1],
 		(const void *) top_flag);
@@ -1967,7 +1967,7 @@ int ft_attach_node(struct cds_ft *ft,
 			 */
 			if (!ft->lock_fine)
 				ft_flip_txn_guard_parent(ft, ic->txn,
-					idest_meta->parent);
+					ft_parent_node(idest_meta->parent_word));
 #ifdef FEATURE_FT_PROBE_EMPTY_INSERT
 			__atomic_fetch_add(&cds_ft_probe_reach_attach, 1,
 				__ATOMIC_RELAXED);
@@ -2038,7 +2038,7 @@ int ft_attach_node(struct cds_ft *ft,
 					ft_nr_keys_get(reloc_meta) + 1,
 					CMM_RELAXED);
 			}
-			ic->count_from = ft_parent_node(metadata->parent);
+			ic->count_from = ft_parent_node(metadata->parent_word);
 			ic->count_folded = true;
 		} else {
 			/*
@@ -2087,7 +2087,7 @@ int ft_attach_node(struct cds_ft *ft,
 			 * mismatch just above already does for the stale-slot case.
 			 */
 			ft_flip_txn_lock_or_guard_parent(ft, ic->txn,
-				attach_meta->parent);
+				ft_parent_node(attach_meta->parent_word));
 #ifdef FEATURE_FT_PROBE_EMPTY_INSERT
 			__atomic_fetch_add(&cds_ft_probe_reach_attach, 1,
 				__ATOMIC_RELAXED);

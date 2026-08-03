@@ -55,7 +55,7 @@ void ft_compact_relocate_at(struct cds_ft *ft, struct cds_ft_inode_flag **holder
 	unsigned int type_index = ft_node_type(nf);
 	struct cds_ft_inode *node = ft_node_ptr(nf), *old_ret = NULL;
 	struct cds_ft_metadata *meta = cds_ft_item_to_metadata(node);
-	struct cds_ft_inode_flag *parent = ft_parent_node(meta->parent);
+	struct cds_ft_inode_flag *parent = ft_parent_node(meta->parent_word);
 	struct ft_pub_rec rec = { .n = 0 };
 	struct ft_flip_txn *txn = NULL;
 	int ret;
@@ -163,7 +163,7 @@ struct cds_ft_compressed_node *ft_compact_relocate_compressed(struct cds_ft *ft,
 	cn2->len = len;
 	cn2->child = cn->child;
 	memcpy(cn2->key_bytes, cn->key_bytes, len);
-	cn2_meta->parent = cn_meta->parent;
+	cn2_meta->parent_word = cn_meta->parent_word;
 	/*
 	 * The relocated compressed node keeps the SAME slot in the SAME
 	 * parent, so its parent-slot offset is identical.  Copy it on every

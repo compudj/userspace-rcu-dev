@@ -1035,7 +1035,7 @@ static inline
 void ft_dlm_guard_parent(struct ft_flip_txn *t, struct cds_ft_metadata *child,
 		struct cds_ft_inode_flag *expected_pf)
 {
-	urcu_txn_validate(t->mtxn, (void **) &child->parent,
+	urcu_txn_validate(t->mtxn, (void **) &child->parent_word,
 			(void *) expected_pf, FT_FLIP_PROXY_TAG);
 }
 
@@ -2331,6 +2331,18 @@ void ft_root_list_swap_publish_dual(struct ft_flip_txn *txn,
 	for (s = 0; s < 2; s++) {
 		const struct ft_root_swap_side *r = sides[s];
 
+		/*
+		 * Each side's new root changes trie, so it names its NEW owner.
+		 * Done here, at the one helper both whole-trie swaps go through
+		 * (empty-dst root graft and whole-trie graft_swap), so neither
+		 * caller can forget.  Invisible to readers and mutators: they all
+		 * read a parent through ft_parent_node, which answers NULL for
+		 * either trie pointer, so an up-walk still just stops at the
+		 * root.  Only cds_ft_verify reads the identity.
+		 */
+		if (r->new_root && !ft_node_flip_proxy(r->new_root))
+			cds_ft_item_to_metadata(ft_node_ptr(r->new_root))
+				->parent_word = ft_trie_parent(r->ft);
 		edges[n].slot = (struct ft_ord_cell **) r->slot;
 		edges[n].old_target = (struct ft_ord_cell *) r->old_root;
 		edges[n].new_target = (struct ft_ord_cell *) r->new_root;
@@ -4152,14 +4164,14 @@ void ft_set_parent_raw(struct cds_ft *ft, struct cds_ft_inode_flag *child,
 		struct cds_ft_compressed_node *cn = ft_skip_to_compressed(ft, child);
 
 		cds_ft_item_to_metadata(
-			(struct cds_ft_inode *) cn)->parent = value;
+			(struct cds_ft_inode *) cn)->parent_word = value;
 		return;
 	}
 	if (ft_node_compressed(child)) {
 		struct cds_ft_compressed_node *cn = ft_compressed_node_ptr(child);
 
 		cds_ft_item_to_metadata(
-			(struct cds_ft_inode *) cn)->parent = value;
+			(struct cds_ft_inode *) cn)->parent_word = value;
 		return;
 	}
 #endif
@@ -4178,7 +4190,7 @@ void ft_set_parent_raw(struct cds_ft *ft, struct cds_ft_inode_flag *child,
 			((struct cds_ft_node *) child)->prev = value;
 		return;
 	}
-	cds_ft_item_to_metadata(ft_node_ptr(child))->parent = value;
+	cds_ft_item_to_metadata(ft_node_ptr(child))->parent_word = value;
 }
 
 /*
@@ -4248,7 +4260,7 @@ void ft_flip_txn_record_count_parent(struct cds_ft *ft, struct ft_flip_txn *t,
 		ft_flip_txn_record_tag_mw(t, (void **) &m->nr_keys,
 			(void *) old_raw, (void *) new_raw,
 			FT_NR_KEYS_PROXY_TAG);
-		cur = ft_parent_node(m->parent);
+		cur = ft_parent_node(m->parent_word);
 	}
 }
 
@@ -5056,8 +5068,8 @@ void ft_glue_record_back_edge(struct cds_ft *ft, struct ft_flip_txn *txn,
 			cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
 
 		ft_set_parent_slot(cn_meta, parent_nf, slot);
-		ft_flip_txn_record_reserved(txn, (void **) &cn_meta->parent,
-			cn_meta->parent, parent_nf);
+		ft_flip_txn_record_reserved(txn, (void **) &cn_meta->parent_word,
+			cn_meta->parent_word, ft_parent_word(ft, parent_nf));
 		return;
 	}
 	if (ft_node_compressed(child_nf)) {
@@ -5067,8 +5079,8 @@ void ft_glue_record_back_edge(struct cds_ft *ft, struct ft_flip_txn *txn,
 			cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
 
 		ft_set_parent_slot(cn_meta, parent_nf, slot);
-		ft_flip_txn_record_reserved(txn, (void **) &cn_meta->parent,
-			cn_meta->parent, parent_nf);
+		ft_flip_txn_record_reserved(txn, (void **) &cn_meta->parent_word,
+			cn_meta->parent_word, ft_parent_word(ft, parent_nf));
 		return;
 	}
 #endif
@@ -5117,8 +5129,8 @@ void ft_glue_record_back_edge(struct cds_ft *ft, struct ft_flip_txn *txn,
 				&ft_types[ft_node_type(parent_nf)],
 				ft_node_ptr(parent_nf), slot);
 		ft_set_parent_slot(meta, parent_nf, slot);
-		ft_flip_txn_record_reserved(txn, (void **) &meta->parent,
-			meta->parent, parent_nf);
+		ft_flip_txn_record_reserved(txn, (void **) &meta->parent_word,
+			meta->parent_word, ft_parent_word(ft, parent_nf));
 	}
 }
 
@@ -5195,8 +5207,8 @@ void ft_reparent_record_meta(struct ft_flip_txn *txn,
 				&ft_types[ft_node_type(parent_nf)],
 				ft_node_ptr(parent_nf), slot);
 	}
-	ft_flip_txn_record_reserved(txn, (void **) &meta->parent,
-		meta->parent, parent_nf);
+	ft_flip_txn_record_reserved(txn, (void **) &meta->parent_word,
+		meta->parent_word, parent_nf);
 	/*
 	 * The state edge is now a pure {live_state -> live_state} GUARD: it no
 	 * longer carries the offset, so its whole job is the §4.B validate the

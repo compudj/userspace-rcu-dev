@@ -118,6 +118,8 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 			cds_ft_destroy(detached);
 			return CDS_FT_STATUS_MEMORY_ERROR;
 		}
+		/* Fresh root for @ft: name its owner while still invisible. */
+		fresh_meta->parent_word = ft_trie_parent(ft);
 
 		/*
 		 * Move the source root into the detached trie.
@@ -134,16 +136,18 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 		FT_TP(root_publish, (const void *) detached,
 			(const void *) detached->root);
 		/*
-		 * This node was already @ft's root, so its parent is already
-		 * NULL; only the now-stale parent_slot_offset needs clearing.
+		 * The node changes trie, so its back-edge names @detached now --
+		 * it was @ft's root and still names @ft.  The parent_slot_offset
+		 * is stale for the same reason.  @detached is a fresh handle with
+		 * no readers, so a plain store is enough.
 		 */
-#ifdef FEATURE_FT_SKIP_COMPRESSED
 		{
 			struct cds_ft_metadata *m = cds_ft_item_to_metadata(
 				ft_node_ptr(detached->root));
+
+			m->parent_word = ft_trie_parent(detached);
 			ft_meta_parent_slot_offset_set(m, 0);
 		}
-#endif
 		uatomic_store(&detached->max_used_key_len,
 			      uatomic_load(&ft->max_used_key_len, CMM_RELAXED),
 			      CMM_RELAXED);
@@ -504,15 +508,15 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 				FT_TP(root_publish, (const void *) detached,
 					(const void *) detached->root);
 				/*
-				 * Clear parent: this node is now a root.
-				 * Use rcu_assign_pointer so read-side
-				 * parent-pointer walks see a single atomic
-				 * transition.
+				 * This node is now @detached's root: name that
+				 * trie in its back-edge.  Use rcu_assign_pointer
+				 * so read-side parent-pointer walks see a single
+				 * atomic transition.
 				 */
 				{
 					struct cds_ft_metadata *m = cds_ft_item_to_metadata(
 						ft_node_ptr(new_root));
-					m->parent = NULL;
+					m->parent_word = ft_trie_parent(detached);
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 					ft_meta_parent_slot_offset_set(m, 0);
 #endif

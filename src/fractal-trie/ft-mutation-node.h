@@ -1477,7 +1477,7 @@ int ft_node_recompact(enum ft_recompact mode,
 			 * from a single MCAS status snapshot (a plain read when no
 			 * re-home is in flight, so single-writer is unchanged).
 			 */
-			new_metadata->parent = inh_parent;
+			new_metadata->parent_word = ft_parent_word(ft, inh_parent);
 			/* The retyped node keeps its own incoming edge byte. */
 			new_metadata->incoming_byte = metadata->incoming_byte;
 			/*
@@ -1912,7 +1912,7 @@ skip_copy:
 		struct cds_ft_inode_flag *old_parent = inh_hint ?
 			inh_hint->parent :
 			ft_resolve_flip_proxy((struct cds_ft_inode_flag *)
-				rcu_dereference(old_meta->parent));
+				rcu_dereference(old_meta->parent_word));
 
 		/*
 		 * Inherit (parent, offset) ONLY for a dest with no @metadata --
@@ -1934,7 +1934,7 @@ skip_copy:
 		 */
 		assert(!metadata || metadata == old_meta);
 		if (!metadata) {
-			new_metadata->parent = old_parent;
+			new_metadata->parent_word = old_parent;
 			ft_meta_parent_slot_offset_set(new_metadata,
 				ft_meta_parent_slot_offset(old_meta));
 		}

@@ -296,6 +296,12 @@ int _cds_ft_debug_cow_replace_root(struct cds_ft *ft)
 		ret = -ENOMEM;
 		goto sweep;
 	}
+	/*
+	 * @root_prime becomes @ft's root: name the owner while it is still
+	 * unpublished (the bail above frees it as such).
+	 */
+	cds_ft_item_to_metadata(ft_node_ptr(root_prime))->parent_word =
+		ft_trie_parent(ft);
 	ft_flip_txn_record_reserved(txn, (void **) &ft->root, root, root_prime);
 
 	st = ft_flip_txn_commit(ft, txn);		/* consumes txn */

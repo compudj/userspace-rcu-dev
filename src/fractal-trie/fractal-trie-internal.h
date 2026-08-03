@@ -923,7 +923,7 @@ struct ft_pub_rec {
 
 struct cds_ft_metadata {
 	/* 8-byte aligned fields. */
-	struct cds_ft_inode_flag *parent;	/*
+	struct cds_ft_inode_flag *parent_word;	/*
 						 * Tagged pointer to parent node.  The only
 						 * NULL a reader can observe is at the root.
 						 * It is also transiently NULL on the write
@@ -1816,6 +1816,24 @@ static inline
 struct cds_ft_inode_flag *ft_parent_node(struct cds_ft_inode_flag *parent)
 {
 	return ft_parent_is_trie(parent) ? NULL : parent;
+}
+
+/*
+ * The word to STORE in a metadata->parent, given the parent NODE (NULL at a
+ * root).  Inverse of ft_parent_node, and the reason the two are a pair: a
+ * publish path computes its parent as a node -- NULL meaning "into
+ * &ft->root" -- and must not write that NULL through, or the node it builds
+ * becomes a root belonging to nobody and the depth-0 ownership check has
+ * nothing to compare.
+ *
+ * A copy that inherits an existing parent word verbatim does not need this;
+ * the word it copies already names whatever it should.
+ */
+static inline
+struct cds_ft_inode_flag *ft_parent_word(const struct cds_ft *ft,
+		struct cds_ft_inode_flag *parent_node)
+{
+	return parent_node ? parent_node : ft_trie_parent(ft);
 }
 
 /*

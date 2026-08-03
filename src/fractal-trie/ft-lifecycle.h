@@ -865,6 +865,8 @@ enum cds_ft_status cds_ft_create(struct cds_ft_group *ft_group,
 		return CDS_FT_STATUS_MEMORY_ERROR;
 	}
 	ft->root = ft_node_flag(root_node, 0);
+	/* The root's back-edge names its owning trie (see ft_trie_parent). */
+	metadata->parent_word = ft_trie_parent(ft);
 	FT_TP(root_publish, (const void *) ft, (const void *) ft->root);
 
 	uatomic_inc(&ft_group->nr_ft_instances, CMM_RELAXED);

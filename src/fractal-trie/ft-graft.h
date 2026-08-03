@@ -217,7 +217,7 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 		struct cds_ft_metadata *bm =
 			cds_ft_item_to_metadata(ft_node_ptr(branch_flag));
 
-		bm->parent = NULL;
+		bm->parent_word = NULL;
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 		ft_meta_parent_slot_offset_set(bm, 0);
 #endif
@@ -1197,6 +1197,8 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 			ft_meta_lock_release(dst_rmeta);
 			return CDS_FT_STATUS_MEMORY_ERROR;
 		}
+		/* Fresh root for @dst_ft: name its owner while still invisible. */
+		fresh_meta->parent_word = ft_trie_parent(dst_ft);
 
 		/*
 		 * The cross-trie dual root-swap txn.  Take the caller's PRE-RESERVED
@@ -1465,6 +1467,8 @@ retry_attach:
 			fresh_node = alloc_cds_ft_node(src_ft, &ft_types[0], &fresh_meta);
 			if (!fresh_node)
 				return CDS_FT_STATUS_MEMORY_ERROR;
+			/* Fresh root for @src_ft: named while still invisible. */
+			fresh_meta->parent_word = ft_trie_parent(src_ft);
 		}
 
 		/*
@@ -2985,7 +2989,7 @@ retry_swap:
 					FT_GS_PROBE_INC(cds_ft_probe_gs_retry);
 					goto retry_swap;
 				}
-				merged_meta->parent = pub_parent;
+				merged_meta->parent_word = ft_parent_word(dst_ft, pub_parent);
 				ft_set_parent_slot(merged_meta, pub_parent, pub_slot);
 				merged_flag = ft_compressed_node_flag(merged);
 				ft_glue_track(&glue_insert, merged_flag);
@@ -3139,6 +3143,8 @@ retry_swap:
 			fresh = alloc_cds_ft_node(swap_ft, &ft_types[0], &fresh_meta);
 			if (!fresh)
 				goto prep_oom;
+			/* Fresh root for @swap_ft: named while still invisible. */
+			fresh_meta->parent_word = ft_trie_parent(swap_ft);
 			/*
 			 * Pre-reserve the swap-root retire's txn -- a fallible step
 			 * before the failure-free commit.  The retire below runs past
@@ -3615,11 +3621,9 @@ retry_swap:
 				struct cds_ft_metadata *bm =
 					cds_ft_item_to_metadata(ft_node_ptr(top_B));
 
-				/* top_B is freshly built (invisible); wire its root parent. */
-				bm->parent = NULL;
-#ifdef FEATURE_FT_SKIP_COMPRESSED
+				/* @top_B is swap_ft's new root: name that trie. */
+				bm->parent_word = ft_trie_parent(swap_ft);
 				ft_meta_parent_slot_offset_set(bm, 0);
-#endif
 				/*
 				 * Structural root install, deferred into the fused flip
 				 * below so it commits atomically with run_D's head/tail --

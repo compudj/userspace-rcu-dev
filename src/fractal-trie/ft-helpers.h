@@ -1507,11 +1507,11 @@ struct cds_ft_inode_flag *ft_get_parent_rcu(struct cds_ft *ft,
 		 * here (after the caller resolves any skip form to its raw
 		 * compressed flag).
 		 */
-		parent = rcu_dereference(cds_ft_item_to_metadata(
-			(struct cds_ft_inode *) ft_compressed_node_ptr(node))->parent);
+		parent = ft_parent_node(rcu_dereference(cds_ft_item_to_metadata(
+			(struct cds_ft_inode *) ft_compressed_node_ptr(node))->parent_word));
 	else
-		parent = rcu_dereference(cds_ft_item_to_metadata(
-			ft_node_ptr(node))->parent);
+		parent = ft_parent_node(rcu_dereference(cds_ft_item_to_metadata(
+			ft_node_ptr(node))->parent_word));
 	/*
 	 * The parent slot may transiently hold a flip-proxy during a
 	 * cds_ft_merge_at commit; resolve it to the view-appropriate
@@ -1614,8 +1614,8 @@ struct cds_ft_compressed_node *ft_skip_to_compressed(const struct cds_ft *ft,
 		parent = ft_resolve_head_prev(ft,
 			ft_dereference_prev_resolved((struct cds_ft_node *) child));
 	else
-		parent = rcu_dereference(cds_ft_item_to_metadata(
-			ft_node_ptr(child))->parent);
+		parent = ft_parent_node(rcu_dereference(cds_ft_item_to_metadata(
+			ft_node_ptr(child))->parent_word));
 	/*
 	 * The recovered back-pointer may transiently be a flip proxy during a
 	 * cds_ft_merge_at commit -- a dst-origin subtree root wrapped under a
@@ -1701,8 +1701,9 @@ struct cds_ft_inode_flag *ft_skip_reanchor(struct cds_ft *ft,
 			parent = ft_resolve_head_prev(ft,
 				ft_dereference_prev_resolved((struct cds_ft_node *) cur));
 		else
-			parent = rcu_dereference(cds_ft_item_to_metadata(
-				ft_node_ptr(cur))->parent);
+			parent = ft_parent_node(rcu_dereference(
+				cds_ft_item_to_metadata(
+				ft_node_ptr(cur))->parent_word));
 		/* A picked child's parent may be a flip-proxy mid-merge. */
 		parent = ft_resolve_flip_proxy(parent);
 		FT_TP(reanchor_walk, (const void *) cur, (const void *) parent, acc);
@@ -1744,9 +1745,9 @@ struct cds_ft_inode_flag *ft_skip_reanchor(struct cds_ft *ft,
 			if (at_pos)
 				*at_pos = parent;
 			/* Same flip-proxy resolve as the up-walk read above. */
-			holder = ft_resolve_flip_proxy(rcu_dereference(
-				cds_ft_item_to_metadata(
-				(struct cds_ft_inode *) pitem)->parent));
+			holder = ft_resolve_flip_proxy(ft_parent_node(
+				rcu_dereference(cds_ft_item_to_metadata(
+				(struct cds_ft_inode *) pitem)->parent_word)));
 			/*
 			 * The holder is NULL only if @parent is the root -- the
 			 * encoded position is the root itself, i.e. a root-level
@@ -1934,7 +1935,7 @@ struct cds_ft_inode_flag **ft_resolve_parent_slot(
 	void *state;
 
 	for (;;) {
-		struct cds_ft_inode_flag *praw = rcu_dereference(meta->parent);
+		struct cds_ft_inode_flag *praw = rcu_dereference(meta->parent_word);
 		void *sraw = uatomic_load(
 				(void **) (uintptr_t) &meta->parent_slot_offset,
 				CMM_ACQUIRE);
@@ -1974,13 +1975,24 @@ struct cds_ft_inode_flag **ft_resolve_parent_slot(
 		 * on @meta->parent between the two loads above.  A stable parent
 		 * edge means (parent, offset) came from one consistent view.
 		 */
-		if (caa_likely(rcu_dereference(meta->parent) == praw))
+		if (caa_likely(rcu_dereference(meta->parent_word) == praw))
 			break;
 	}
 
+	/*
+	 * The owner stamp is a WITNESS, never a navigation aid: the slot comes
+	 * from the caller's @ft, exactly as it did when a root's parent was
+	 * NULL.  A cross-trie move legitimately leaves the stamp naming the
+	 * PREVIOUS owner until it commits, so deriving the slot from the stamp
+	 * would answer with a slot in the wrong trie mid-move -- while @ft is
+	 * the trie the caller is actually operating on.  Reading ownership is
+	 * cds_ft_verify's job, and it reads the word itself.
+	 *
+	 * @parent_out is the parent NODE, so a root still yields NULL.
+	 */
 	if (parent_out)
-		*parent_out = parent;
-	if (!parent)
+		*parent_out = ft_parent_node(parent);
+	if (ft_parent_is_root_position(parent))
 		return &ft->root;
 	return (struct cds_ft_inode_flag **)
 		((char *) ft_node_ptr(parent) +
@@ -1993,6 +2005,7 @@ struct cds_ft_inode_flag **ft_get_parent_slot(const struct cds_ft_metadata *meta
 {
 	return ft_resolve_parent_slot(meta, ft, NULL);
 }
+
 
 #ifdef FT_ENABLE_TRACING
 #include <stdio.h>
@@ -2288,12 +2301,13 @@ void _ft_publish_to_parent_meta(struct cds_ft *ft,
 		 * (which would read the deferred back-edge).
 		 */
 		if (new_child_meta) {
-			cp = ft_parent_node(new_child_meta->parent);
+			cp = ft_parent_node(new_child_meta->parent_word);
 		} else
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 		if (ft_node_skip_compressed(new_child)) {
-			cp = cds_ft_item_to_metadata((struct cds_ft_inode *)
-				ft_skip_to_compressed(ft, new_child))->parent;
+			cp = ft_parent_node(cds_ft_item_to_metadata(
+				(struct cds_ft_inode *)
+				ft_skip_to_compressed(ft, new_child))->parent_word);
 		} else
 #endif
 		if (ft_node_external(new_child)) {
@@ -2309,8 +2323,8 @@ void _ft_publish_to_parent_meta(struct cds_ft *ft,
 				folded_child_prev :
 				((struct cds_ft_node *) new_child)->prev);
 		} else {
-			cp = cds_ft_item_to_metadata(
-				ft_node_ptr(new_child))->parent;
+			cp = ft_parent_node(cds_ft_item_to_metadata(
+				ft_node_ptr(new_child))->parent_word);
 		}
 		assert(cp != NULL);
 	}
@@ -2362,9 +2376,9 @@ void _ft_publish_to_parent_meta(struct cds_ft *ft,
 				child_meta = cds_ft_item_to_metadata(
 					ft_node_ptr(new_child));
 		}
-		if (child_meta && ft_parent_node(child_meta->parent))
+		if (child_meta && ft_parent_node(child_meta->parent_word))
 			ft_set_parent_slot(child_meta,
-				ft_parent_node(child_meta->parent),
+				ft_parent_node(child_meta->parent_word),
 				parent_slot);
 	}
 
@@ -2413,7 +2427,7 @@ void _ft_publish_to_parent_meta(struct cds_ft *ft,
 			cn->len,
 			cn->key_bytes,
 			(const void *) new_child,
-			(const void *) cn_meta->parent);
+			(const void *) ft_parent_node(cn_meta->parent));
 	}
 	FT_TP(publish_to_parent, (const void *) parent_nf,
 		(const void *) parent_slot,
@@ -2548,7 +2562,16 @@ void ft_set_parent(struct cds_ft *ft, struct cds_ft_inode_flag *child_nf,
 		struct cds_ft_inode_flag *parent_nf,
 		struct cds_ft_inode_flag **slot)
 {
-	(void) ft;
+	/*
+	 * A NULL @parent_nf is the root position (the publish goes into
+	 * &ft->root): store the OWNING TRIE there rather than NULL, so the
+	 * back-edge identifies its owner at depth 0 as it does everywhere else.
+	 * @parent_nf itself stays as passed for the slot offset (a root has
+	 * none) and for an external child, whose holder is always a real node.
+	 */
+	struct cds_ft_inode_flag *stored_parent = parent_nf ?
+		parent_nf : ft_trie_parent(ft);
+
 	if (!child_nf)
 		return;
 	/*
@@ -2569,7 +2592,7 @@ void ft_set_parent(struct cds_ft *ft, struct cds_ft_inode_flag *child_nf,
 		struct cds_ft_metadata *cn_meta =
 			cds_ft_item_to_metadata(
 				(struct cds_ft_inode *) cn);
-		rcu_assign_pointer(cn_meta->parent, parent_nf);
+		rcu_assign_pointer(cn_meta->parent_word, stored_parent);
 		ft_set_parent_slot(cn_meta, parent_nf, slot);
 		return;
 	}
@@ -2588,7 +2611,7 @@ void ft_set_parent(struct cds_ft *ft, struct cds_ft_inode_flag *child_nf,
 		struct cds_ft_metadata *cn_meta =
 			cds_ft_item_to_metadata(
 				(struct cds_ft_inode *) cn);
-		rcu_assign_pointer(cn_meta->parent, parent_nf);
+		rcu_assign_pointer(cn_meta->parent_word, stored_parent);
 		ft_set_parent_slot(cn_meta, parent_nf, slot);
 		return;
 	}
@@ -2639,7 +2662,7 @@ void ft_set_parent(struct cds_ft *ft, struct cds_ft_inode_flag *child_nf,
 			meta->incoming_byte = ft_slot_to_byte(
 				&ft_types[ft_node_type(parent_nf)],
 				ft_node_ptr(parent_nf), slot);
-		rcu_assign_pointer(meta->parent, parent_nf);
+		rcu_assign_pointer(meta->parent_word, stored_parent);
 		ft_set_parent_slot(meta, parent_nf, slot);
 	}
 }

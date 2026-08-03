@@ -617,7 +617,7 @@ struct cds_ft_inode_flag *ft_merge_build(struct ft_merge_ctx *c,
 			 * Clear the recycled allocation's stale parent before
 			 * any later set_nth reallocation copies it forward.
 			 */
-			Mmeta->parent = NULL;
+			Mmeta->parent_word = NULL;
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 			ft_meta_parent_slot_offset_set(Mmeta, 0);
 #endif
@@ -1342,7 +1342,7 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 			ft_glue_fini(&gs);
 			return CDS_FT_STATUS_MEMORY_ERROR;
 		}
-		fresh_meta->parent = NULL;
+		fresh_meta->parent_word = ft_trie_parent(src_ft);
 		ft_nr_keys_store(src_ft, fresh_meta, 0, CMM_RELAXED);
 	}
 
@@ -3202,7 +3202,7 @@ merge_spine_retry:
 			status = CDS_FT_STATUS_MEMORY_ERROR;
 			goto out;
 		}
-		fresh_meta->parent = NULL;
+		fresh_meta->parent_word = ft_trie_parent(src_ft);
 		ft_nr_keys_store(src_ft, fresh_meta, 0, CMM_RELAXED);
 
 		/*
@@ -3266,6 +3266,16 @@ merge_spine_retry:
 		 * the unlink flip atomically (atomic detach).  Failure-free past
 		 * the detach above, so this runs only on the committing path.
 		 */
+		/*
+		 * @subtree->root becomes @dst_ft's root, so re-name its owner
+		 * before either branch publishes it -- a cross-trie move leaves
+		 * the back-edge naming the trie it came FROM, which is exactly
+		 * the aliasing cds_ft_verify reports at depth 0.  @subtree is the
+		 * fresh EXCLUSIVE detach product with no readers, so the store is
+		 * safe ahead of the flip.
+		 */
+		cds_ft_item_to_metadata(ft_node_ptr(subtree->root))->parent_word =
+			ft_trie_parent(dst_ft);
 		if (dst_ft->group->ordered_list_set) {
 			/*
 			 * dst FILLS by adopting @subtree's whole list.  @subtree is the

@@ -427,11 +427,11 @@ int ft_verify_node_compressed(const struct cds_ft *ft, FILE *out,
 		}
 	}
 	/* Parent pointer check. */
-	if (cn_meta->parent != expected_parent) {
+	if (cn_meta->parent_word != expected_parent) {
 		if (out)
 			fprintf(out, "ft_verify: depth %u: compressed node %p parent mismatch: "
 				"expected %p, got %p\n",
-				depth, node_flag, expected_parent, cn_meta->parent);
+				depth, node_flag, expected_parent, cn_meta->parent_word);
 		return -1;
 	}
 	/* nr_child must be 0 or 1. */
@@ -506,7 +506,7 @@ int ft_verify_node_compressed(const struct cds_ft *ft, FILE *out,
 	 */
 	{
 		struct cds_ft_inode_flag *child_in_chain = node_flag;
-		struct cds_ft_inode_flag *anc = ft_parent_node(cn_meta->parent);
+		struct cds_ft_inode_flag *anc = ft_parent_node(cn_meta->parent_word);
 		bool adj_violation = false;
 
 		while (anc && ft_node_compressed(anc)) {
@@ -518,7 +518,7 @@ int ft_verify_node_compressed(const struct cds_ft *ft, FILE *out,
 					depth, child_in_chain, anc);
 			adj_violation = true;
 			child_in_chain = anc;
-			anc = ft_parent_node(anc_meta->parent);
+			anc = ft_parent_node(anc_meta->parent_word);
 		}
 		if (adj_violation)
 			return -1;
@@ -696,12 +696,12 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 		unsigned int key;
 
 		/* Parent pointer check (root has NULL parent). */
-		if (metadata->parent != expected_parent) {
+		if (metadata->parent_word != expected_parent) {
 			if (out)
 				fprintf(out, "ft_verify: depth %u: internal node %p parent mismatch: "
 					"expected %p, got %p\n",
 					depth, node_flag, expected_parent,
-					metadata->parent);
+					metadata->parent_word);
 			return -1;
 		}
 		/*
@@ -712,7 +712,7 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 		 * at the mutation that introduced it, rather than as a
 		 * corrupted parent-pointer backtrack later.
 		 */
-		if (ft_parent_node(metadata->parent)) {
+		if (ft_parent_node(metadata->parent_word)) {
 			struct cds_ft_inode_flag **slot =
 				ft_get_parent_slot(metadata,
 						(struct cds_ft *) ft);
@@ -904,7 +904,8 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 		 *
 		 * The root is exempt: an empty trie is exactly this shape.
 		 */
-		if (expected_parent != NULL && counted_children == 0 &&
+		if (ft_parent_node(expected_parent) != NULL &&
+		    counted_children == 0 &&
 		    !external_nodes) {
 			if (out) {
 				unsigned int ti = ft_node_type(node_flag);
@@ -992,7 +993,7 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 		 *
 		 * Dual of the existing "no two adjacent compresseds" check.
 		 */
-		if (expected_parent != NULL &&
+		if (ft_parent_node(expected_parent) != NULL &&
 		    ft_group_skip_compressed(ft->group) &&
 		    counted_children == 1 && !external_nodes) {
 			if (out)
@@ -1184,8 +1185,14 @@ int ft_verify_one(const struct cds_ft *ft, FILE *out,
 	 * position; otherwise it is NULL and all path-tracking writes / compares
 	 * short-circuit.
 	 */
-	ret = ft_verify_node_recursive(ft, out, visited, path, root, NULL, 0,
-			&root_nr_keys);
+	/*
+	 * The root's expected parent is THIS trie.  That is what makes the
+	 * depth-0 check discriminating: with NULL the expected value was a
+	 * constant every trie shared, so two tries rooted at one node agreed
+	 * with their own expectation and both passed.
+	 */
+	ret = ft_verify_node_recursive(ft, out, visited, path, root,
+			ft_trie_parent(ft), 0, &root_nr_keys);
 	if (ret)
 		return -1;
 	if (ft->group->ordered_list_set && ft_verify_ord_cells(ft, out))
