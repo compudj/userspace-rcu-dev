@@ -255,10 +255,33 @@ int urcu_txn_deque_remove_prepare(struct urcu_txn *txn,
 		return -ENOENT;			/* not queued */
 	if ((struct urcu_txn_deque *) own != d)
 		return -ENOENT;			/* queued elsewhere */
+	/*
+	 * LOAD-VALIDATE, not load.  These two reads DERIVE the slots this
+	 * transaction writes, but neither slot is written by it -- so without a
+	 * validate record nothing aborts when a peer changes them under us, and
+	 * the commit installs edges computed from a state that no longer exists.
+	 *
+	 * Concretely: remove(P) rewrites &n->prev (its own &next->prev edge)
+	 * while remove(n) is deriving @prev from that same slot.  The two share
+	 * no WRITTEN slot -- remove(n) writes &n->owner, &prev->next and
+	 * &next->prev -- so both commit, and remove(n) records
+	 * &prev->next : n -> next against a P that has just left the deque.
+	 * That CAS can even SUCCEED, because a removed node's `next` is never
+	 * reset and later removes keep maintaining it, which builds a ghost
+	 * chain off a non-member.  Worse, remove propagates its own @prev into
+	 * &next->prev, so ONE stale read poisons every successor after it and
+	 * the deque never recovers: the victim ends up owned but unreachable,
+	 * and its remove retries forever inside the escalation lane.
+	 *
+	 * Validating both makes the derivation part of the transaction's
+	 * conflict set, which is what keeps `prev` truth rather than a hint.
+	 */
 	prev = urcu_txn_deque_resolve(
-			urcu_txn_load(txn, (void **) &n->prev, URCU_TXN_TAG));
+			urcu_txn_load_validate(txn, (void **) &n->prev,
+					URCU_TXN_TAG));
 	next = urcu_txn_deque_resolve(
-			urcu_txn_load(txn, (void **) &n->next, URCU_TXN_TAG));
+			urcu_txn_load_validate(txn, (void **) &n->next,
+					URCU_TXN_TAG));
 
 	ret = urcu_txn_store_mw(txn, (void **) &n->owner, d, NULL,
 			URCU_TXN_TAG);

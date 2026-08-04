@@ -652,6 +652,42 @@ int urcu_txn_list_del_prepare(struct urcu_txn *txn,
 	if (urcu_txn_list_is_marked(en))
 		return -ENOENT;			/* already deleted by a peer */
 	next = (struct urcu_txn_list_node *) en;
+	/*
+	 * A PLAIN LOAD IS ENOUGH HERE, AND THE REASON IS AN INVARIANT OF THIS
+	 * FILE RATHER THAN OF THIS FUNCTION -- so it is written down, because
+	 * the deque lost it and paid for it.
+	 *
+	 * This read DERIVES the &prev->next slot the store below writes, and
+	 * this transaction never writes &elem->prev.  A derivation that is not
+	 * in the conflict set is normally a defect: a peer rewrites it, nothing
+	 * aborts, and the commit installs an edge computed from a state that no
+	 * longer exists.  What saves it is that the derivation is in the
+	 * conflict set TRANSITIVELY, through a slot this transaction DOES write:
+	 *
+	 *   EVERY operation here that rewrites some X->prev also writes the OLD
+	 *   predecessor's next --
+	 *      insert_after (pos)  &pos->next        + &succ->prev
+	 *      insert_before(pos)  &prev->next       + &pos->prev
+	 *      del      (elem)     &elem->next MARK  + &prev->next + &next->prev
+	 *      replace  (old)      &old->next  MARK  + &prev->next + &next->prev
+	 *
+	 * so any peer that could invalidate @prev necessarily writes
+	 * &prev->next -- the very slot stored below, with the same expected old
+	 * (@elem).  The MCAS lets exactly one of them install; the loser aborts
+	 * and re-derives.  For del(P) on @elem's own predecessor, the shared
+	 * slot is &P->next: this call writes it to unlink, and del(P) writes it
+	 * to MARK.  They cannot both commit.
+	 *
+	 * ⚠ THE MARK IS WHAT MAKES THAT TRUE, and it is not free to give up.
+	 * <urcu/rcu-txn-deque.h> replaced the mark on next with an `owner` word,
+	 * so its remove writes {&n->owner, &n->seq, &prev->next, &next->prev}
+	 * and NEVER &n->next -- two adjacent removes then share no written slot,
+	 * both commit, and the stale derivation lands (a ghost chain off a
+	 * non-member, then an unreachable victim retrying forever in the
+	 * escalation lane).  That is why remove_prepare there load-validates
+	 * this same read and this one does not.  If a future change here drops
+	 * or moves the mark, THIS LOAD MUST BECOME urcu_txn_load_validate().
+	 */
 	prev = urcu_txn_list_unmark(
 			urcu_txn_load(txn, (void **) &elem->prev, URCU_TXN_TAG));
 
