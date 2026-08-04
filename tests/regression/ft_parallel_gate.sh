@@ -84,7 +84,16 @@ ALL_CONFIGS=(
 	# The two are complementary: the read-policy table only marks slots
 	# loaded through the engine's API, so a RAW C read of a transacted word
 	# leaves no mark and only the assert catches it.
-	"txndbg|-DDEBUG_RCU -DURCU_TXN_DEBUG_READ_POLICY|u ion ioff"
+	#
+	# imw matters MOST here, for the same reason it does on "default": the
+	# writers that do the heaviest transacted-slot work -- the concurrent-writer
+	# and rekey oracles -- gate on FT_INV_MW at RUNTIME, so without it the one
+	# config that carries the engine's assertions checks only the SINGLE-writer
+	# subset.  A proxy can only be another writer's, and an expected-old only
+	# arbitrates against a peer, so the raw-read class this config exists to
+	# detect is the class the missing leg hid.  The leg costs 82 s, alongside
+	# ioff's 76 s.
+	"txndbg|-DDEBUG_RCU -DURCU_TXN_DEBUG_READ_POLICY|u ion ioff imw"
 	"noskip|-DNO_FEATURE_FT_SKIP_COMPRESSED|u ioff"
 	"nocompress|-DNO_FEATURE_FT_COMPRESS|u ioff"
 	# Concurrent legs are SAFE here since the in-place tier became runtime
