@@ -2383,7 +2383,11 @@ int ft_rekey_cow_stop(struct cds_ft *ft, struct ft_flip_txn *txn,
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 	assert(!ft_node_skip_compressed(stop_flag));	/* caller's gate */
 #endif
-	assert(stop_meta->external_nodes == NULL);	/* scope */
+	/*
+	 * A CO-LOCATED EXTERNAL CHAIN is in scope: it is one forward pointer to
+	 * copy plus one back edge to record, the same shape as a child.  What stays
+	 * out of scope is an S_top that IS an external head -- see the caller.
+	 */
 
 	/* 1. Acquire @stop's retire lock -- the fence BEFORE any body read. */
 	if (ft_meta_lock_acquire(stop_meta, &stop_snap))
@@ -2560,6 +2564,26 @@ int ft_rekey_cow_stop(struct cds_ft *ft, struct ft_flip_txn *txn,
 		}
 	}
 #undef COW_IS_INIT
+
+	/*
+	 * 3b. The CO-LOCATED EXTERNAL CHAIN, if any: the key that ends exactly at
+	 *     @stop.  Its head is APP-OWNED and never copied -- only the forward
+	 *     pointer moves to the copy, and the head's back edge is recorded like
+	 *     any child's.  ft_reparent_record dispatches on the child kind, so it
+	 *     writes whichever back-channel this group uses (the cell's parent with
+	 *     the list on, the head's own prev with it off); there is no mark,
+	 *     because an external head carries no state word (ft_child_state_meta
+	 *     returns NULL for one).
+	 */
+	if (stop_meta->external_nodes) {
+		new_meta->external_nodes = stop_meta->external_nodes;
+		ft_reparent_record(ft, txn,
+			(struct cds_ft_inode_flag *) ft_dereference_external(
+				new_meta->external_nodes),
+			new_flag,
+			(struct cds_ft_inode_flag **) &new_meta->external_nodes,
+			/*child_marked=*/ false);
+	}
 
 	/*
 	 * 4. MARK each metadata-bearing child + record its SW re-parent onto

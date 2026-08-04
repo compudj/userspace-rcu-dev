@@ -934,12 +934,18 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 				ft_types[ti].type_class != FT_PIGEON)
 			return -EINVAL;
 	}
+	/*
+	 * A key ending exactly AT @src_key -- @s_top's co-located external chain --
+	 * moves with the subtree: ft_rekey_cow_stop carries the forward pointer and
+	 * records the head's back edge.  The head itself is app-owned and is never
+	 * copied, which is also why an S_top that IS an external head stays out:
+	 * there would be no library node to give a fresh address to, and the
+	 * coherent reader's witness is built on that freshness.
+	 */
 	s_top_meta = s_top_compressed ?
 		cds_ft_item_to_metadata((struct cds_ft_inode *)
 			ft_compressed_node_ptr(s_top)) :
 		cds_ft_item_to_metadata(ft_node_ptr(s_top));
-	if (s_top_meta->external_nodes)
-		return -EINVAL;			/* cow_stop sub-step-2 scope */
 
 	/* BP (= S_top's parent) must be plain and stay above min_child on removal. */
 	if (!d_src.pnf || ft_node_flip_proxy(d_src.pnf) ||
@@ -1025,6 +1031,14 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		 * the coherent reader's witness depends on would be gone.
 		 */
 		if (merge_dst && s_top_compressed)
+			return -EINVAL;
+		/*
+		 * A co-located external chain is carried by ft_rekey_cow_stop, which
+		 * the MERGE arm skips -- ft_merge_build would have to union that key
+		 * into the destination's own chain, and nothing here has tested it.
+		 * The graft arm takes it.
+		 */
+		if (merge_dst && s_top_meta->external_nodes)
 			return -EINVAL;
 #ifndef FEATURE_FT_MERGE
 		/*

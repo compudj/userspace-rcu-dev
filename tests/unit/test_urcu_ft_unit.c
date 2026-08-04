@@ -68,13 +68,13 @@
 #endif
 
 /*
- * 292 unconditional + 49 fault-injection-only RUN_TEST registrations, on top of
+ * 293 unconditional + 49 fault-injection-only RUN_TEST registrations, on top of
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (341 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (342 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (292 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (293 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -11111,6 +11111,171 @@ static int test_rekey_graft_vs_merge(void)
 	ret = 0;
 out:
 	rcu_read_unlock();
+	drain_trie(ft);
+	rcu_barrier();
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
+ * A subtree top carrying a CO-LOCATED EXTERNAL CHAIN: a key that ends exactly at
+ * the source prefix, moving along with the keys below it.
+ *
+ * Needs variable-length keys, because that key IS the prefix -- two bytes where
+ * its subtree's are three.  ft_rekey_cow_stop copies the one forward pointer to
+ * the chain and records the head's back edge like any child's; the head is
+ * APP-OWNED and is never copied, which is exactly why an S_top that IS an external
+ * head stays out of scope (nothing library-owned there could take a fresh address,
+ * and the coherent reader's witness is built on that freshness).
+ *
+ * ft_reparent_record dispatches on the child kind, so the back edge it writes is
+ * whichever channel the group uses -- the cell's parent with the ordered list on,
+ * the head's own prev with it off.  This runs with the list ON, and the ordered
+ * walk is what would catch the chain being left pointing at the retired copy.
+ *
+ * ★ WHAT THIS PINS IS THE RESULT, NOT THE ROUTE, and it cannot be otherwise: a
+ * co-located key is SHORTER than its own subtree's keys, so the group must be
+ * variable-length -- and on one of those the staged writer is an equally correct
+ * fallback, so both routes satisfy every assertion here.  That the ATOMIC one is
+ * what runs was established by instrumenting cow_stop's chain arm, which fires
+ * exactly once for this test.  A concurrent no-gap oracle is what would pin the
+ * route, and its band geometry cannot host a key of a second length.
+ */
+static int test_rekey_colocated_external(void)
+{
+	struct cds_ft_group_attr *gattr;
+	struct cds_ft_group *group;
+	struct cds_ft_attr *fattr;
+	struct cds_ft *ft = NULL;
+	struct cds_ft_iter *iter = NULL;
+	const uint8_t src[2] = { 0x10, 0x01 }, dst[2] = { 0x20, 0x03 };
+	enum cds_ft_status s;
+	uint8_t prev[64];
+	size_t prev_len = 0;
+	int i, nr = 0, ret = -1;
+
+	if (!cds_ft_merge_enabled()) {
+		diag("test_rekey_colocated_external: skipped, merge compiled out "
+			"(-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
+	if (cds_ft_group_attr_create(&gattr) < 0)
+		return -1;
+	if (cds_ft_group_attr_set_max_key_len(gattr, 8) < 0 ||
+			cds_ft_group_attr_set_lookup_optimization(gattr,
+				CDS_FT_LOOKUP_OPTIMIZE_EAGER) < 0 ||
+			cds_ft_group_attr_set_writer_strategy(gattr,
+				CDS_FT_WRITER_LOCK_FINE) < 0 ||
+			cds_ft_group_attr_set_ordered_list(gattr, true) < 0)
+		abort();
+	if (cds_ft_group_create(gattr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(gattr);
+	if (cds_ft_attr_create(&fattr) < 0)
+		abort();
+	if (cds_ft_attr_set_speculative_keys(fattr, false) < 0)
+		abort();
+	if (cds_ft_create(group, fattr, &ft) < 0 ||
+			cds_ft_iter_create(ft, &iter) < 0)
+		abort();
+	cds_ft_attr_destroy(fattr);
+
+	rcu_read_lock();
+	/* THE CO-LOCATED KEY: ends exactly at the source prefix. */
+	if (cds_ft_insert(ft, src, 2, &node_alloc(1)->node) != CDS_FT_STATUS_OK)
+		abort();
+	for (i = 1; i <= 2; i++) {			/* keys below it */
+		uint8_t k[3] = { 0x10, 0x01, (uint8_t) i };
+
+		if (cds_ft_insert(ft, k, 3, &node_alloc((uint64_t) i)->node)
+				!= CDS_FT_STATUS_OK)
+			abort();
+	}
+	for (i = 5; i <= 12; i++) {			/* junction survives */
+		uint8_t k[2] = { 0x10, (uint8_t) i };
+
+		if (cds_ft_insert(ft, k, 2, &node_alloc((uint64_t) i)->node)
+				!= CDS_FT_STATUS_OK)
+			abort();
+	}
+	for (i = 1; i <= 2; i++) {			/* dst parent children */
+		uint8_t k[2] = { 0x20, (uint8_t) i };
+
+		if (cds_ft_insert(ft, k, 2, &node_alloc((uint64_t) i)->node)
+				!= CDS_FT_STATUS_OK)
+			abort();
+	}
+	rcu_read_unlock();
+
+	s = cds_ft_rekey_graft(ft, dst, 2, src, 2);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "rekey_colocated: refused (%s)\n",
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+	rcu_read_lock();
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "rekey_colocated: verify failed\n");
+		rcu_read_unlock();
+		goto out;
+	}
+	/* The co-located key AND its subtree are at the destination now. */
+	{
+		struct cds_ft_node *f = NULL;
+		uint8_t d1[3] = { 0x20, 0x03, 0x01 }, d2[3] = { 0x20, 0x03, 0x02 };
+
+		if (cds_ft_eager_lookup_key(ft, dst, 2, 0, &f) != CDS_FT_STATUS_OK ||
+				cds_ft_eager_lookup_key(ft, d1, 3, 0, &f) !=
+					CDS_FT_STATUS_OK ||
+				cds_ft_eager_lookup_key(ft, d2, 3, 0, &f) !=
+					CDS_FT_STATUS_OK) {
+			fprintf(stderr, "rekey_colocated: a moved key is absent at "
+				"the destination\n");
+			rcu_read_unlock();
+			goto out;
+		}
+		if (cds_ft_eager_lookup_key(ft, src, 2, 0, &f) ==
+				CDS_FT_STATUS_OK) {
+			fprintf(stderr, "rekey_colocated: the co-located key is "
+				"still at the source\n");
+			rcu_read_unlock();
+			goto out;
+		}
+	}
+	/* Ordered walk still sorted: the chain's back edge landed on the copy. */
+	for (s = cds_ft_lookup_first(ft, iter); s == CDS_FT_STATUS_OK;
+			s = cds_ft_next(ft, iter)) {
+		uint8_t k[64];
+		size_t l, n;
+
+		if (cds_ft_iter_get_key(iter, k, sizeof k, &l) !=
+				CDS_FT_STATUS_OK)
+			break;
+		n = l < prev_len ? l : prev_len;
+		if (nr && (memcmp(k, prev, n) < 0 ||
+				(memcmp(k, prev, n) == 0 && l <= prev_len))) {
+			fprintf(stderr, "rekey_colocated: walk out of order at %d\n",
+				nr);
+			rcu_read_unlock();
+			goto out;
+		}
+		memcpy(prev, k, l);
+		prev_len = l;
+		nr++;
+	}
+	/* 1 co-located + 2 below + 8 siblings + 2 dst children. */
+	if (nr != 13 || cds_ft_count_keys(ft) != 13) {
+		fprintf(stderr, "rekey_colocated: walked %d of 13 (count %lu)\n",
+			nr, cds_ft_count_keys(ft));
+		rcu_read_unlock();
+		goto out;
+	}
+	rcu_read_unlock();
+	ret = 0;
+out:
+	if (iter)
+		cds_ft_iter_destroy(iter);
 	drain_trie(ft);
 	rcu_barrier();
 	cds_ft_destroy(ft);
@@ -31067,6 +31232,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_rekey_varlen_ordered_splice);
 	RUN_TEST(test_rekey_abutting_dst_keeps_list_order);
 	RUN_TEST(test_rekey_compressed_stop);
+	RUN_TEST(test_rekey_colocated_external);
 	RUN_TEST(test_merge_rekey_same_trie_ordered);
 	RUN_TEST(test_merge_rekey_same_trie_listoff_collision);
 	RUN_TEST(test_nonidentity_bulk_ops);
