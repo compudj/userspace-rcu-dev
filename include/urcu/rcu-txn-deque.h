@@ -52,9 +52,19 @@
  *     expected-old.  The list's insert wrote newp->next/newp->prev plainly at
  *     prepare time, un-CAS'd and not undone on abort, which is how a re-add
  *     could overwrite a live node's edges.  Nothing here can.
- *   - Therefore the invariant holds unconditionally: for every queued node n,
- *     n->prev->next == n and n->next->prev == n.  `prev` is TRUTH, not a hint,
- *     so no rescan or hint repair is needed anywhere.
+ *   - The INTENT is that the invariant hold unconditionally: for every queued
+ *     node n, n->prev->next == n and n->next->prev == n, making `prev` truth
+ *     rather than a hint.
+ *
+ * ⚠ THAT INTENT IS NOT YET MET.  test_deque's discriminator catches a queued,
+ * reachable node whose predecessor names it while its SUCCESSOR names a third
+ * node -- the backward chain broken at n->next -- after which a remove's
+ * &next->prev : n -> prev can never match and the retry loop runs forever
+ * inside the escalation lane.  It needs two writers and BOTH push and remove
+ * interleaved on a non-empty deque; push-only, remove-only and rotate-only all
+ * pass, as does either one alone with disjoint node slices.  So the defect is
+ * in the edge sets below, not in the engine and not in contention on a node.
+ * DO NOT USE until that is closed.
  *
  * Nodes are NOT reset on removal: next/prev keep stale values, which is safe
  * because nothing dereferences them (a later push only reads and CASes them
