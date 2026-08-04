@@ -67,7 +67,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS_REKEY_DLM	13	/* inv_rekey_graft_{disjoint,cross_junction,glue_dst,coherent_readers,shared}, inv_rekey_linearizability, inv_rekey_public_{atomic_no_gap,atomic_no_gap_varlen,staged_gap}, inv_rekey_coarse_progress, inv_rekey_merge_{occupied,shared}_dst */
+#define NR_TESTS_REKEY_DLM	13	/* inv_rekey_graft_{disjoint,cross_junction,glue_dst,coherent_readers,shared}, inv_rekey_linearizability, inv_rekey_public_{atomic_no_gap,atomic_no_gap_varlen,atomic_no_gap_compressed_top}, inv_rekey_coarse_progress, inv_rekey_merge_{occupied,shared}_dst */
 
 /*
  * Base count = the RUN_TEST invocations in main() outside the DLM #ifdef.
@@ -3857,18 +3857,17 @@ static int inv_rekey_linearizability(void)
  *    re-parents as ONE flip.  `absent moving` MUST be 0, and this arm GATES on
  *    it: it is the acceptance test for the atomic writer, and the thing that
  *    fails if a future change stops routing to it.
- *  - inv_rekey_public_staged_gap (variable-length, list on) reaches the
- *    detach-then-merge-back writer, whose absence window no probe can talk it out
- *    of, so that arm MEASURES the window instead of gating on it.  Opt in twice
- *    (FT_INV_MW + FT_INV_RKPG); an oracle that is red by construction must not be
- *    what a gate reports.
+ *  - inv_rekey_coarse_progress (an FT-wide writer lock, hence no atomic writer at
+ *    all) reaches the detach-then-merge-back writer, whose absence window no probe
+ *    can talk it out of.  That arm gates the OTHER WAY: it REQUIRES an absence,
+ *    which is what proves the probe the no-gap arms rest on still detects one.
  *
- * MEASURED (4 writers, 8 readers, 200 ms each): the staged arm sees ~30000
- * absences over ~44 moves -- roughly 700 absence observations per move, which is
- * what a grace-period-wide window looks like rather than a race -- against 0 in
- * the atomic arm over a comparable number of moves.  Both arms report 0 absent
- * across the control phase's ~1.5M probes and 0 bad exact probes: the fixed
- * siblings are always present, and a moving leaf never answers as a foreign node.
+ * MEASURED (4 writers, 8 readers, 200 ms each): the staged arm sees 1163089
+ * absences over 18 moves -- a grace-period-wide window per move rather than a
+ * race -- against 0 over 3014 moves in the compressed-top arm and 0 over 1839 in
+ * the fixed one.  Every arm reports 0 absent across the control phase's ~1.5M
+ * probes and 0 bad exact probes: the fixed siblings are always present, and a
+ * moving leaf never answers as a foreign node.
  * The same geometry driven single-threaded through 40 moves answers both band
  * probes correctly at every rest point in either config, so an absence is the
  * move window and not the layout.
@@ -3898,17 +3897,26 @@ static int inv_rekey_linearizability(void)
  *    validates it instead of splicing.  This arm is therefore the acceptance test
  *    for BOTH widenings: variable-length groups, and the abutting destination.
  *
- *  - RKP_STAGED: variable-length, list on, and a run of a SINGLE key, so the
- *    source prefix path-compresses and the atomic writer refuses the shape (it
- *    needs a plain POPCOUNT/PIGEON subtree top).  The move falls back to
- *    detach-then-merge-back and its absence window.  ★ That is now what keeps this
- *    arm staged: neither the key length nor the band's adjacency does any more.
- *    ★★ NOT a COARSE trie, which would be the obvious way to force the fallback
- *    and HANGS instead -- four COARSE writers park on the FT-wide mutex while
- *    ONLINE, so the grace period inside the lock never completes (the stall
- *    recorded in doc/design; measured here as a 300 s timeout).
+ *  - RKP_ATOMIC_COMPRESSED_TOP: variable-length, list on, and a run of a SINGLE
+ *    key, so the source prefix path-compresses and the subtree top is a
+ *    COMPRESSED node rather than a plain POPCOUNT/PIGEON one.  The atomic writer
+ *    takes it (@9e8eeec6 widened the cut to a compressed top), so this arm is
+ *    that widening's acceptance test under concurrent readers: measured 3014
+ *    moves, 0 absent.
  *
- * Keys are RKP_KLEN wide in ALL THREE, which is this oracle's own doing: uniform
+ *  - RKP_COARSE: the FT-wide writer lock, which has no per-node locks and so no
+ *    atomic writer at all -- every move stages, detaching into a transient trie
+ *    and merging back, with an absence window a grace period wide.  ★ This arm is
+ *    the ABSENCE DETECTOR'S OWN CONTROL (RKP_GAP_EXPECTED below), for the same
+ *    reason the quiet phase refuses a zero drawn from zero probes: if no arm ever
+ *    produces an absence, "0 absent" in the atomic arms is free, and a detector
+ *    that had stopped detecting would read exactly like a perfect writer.  It
+ *    cannot silently stop being the control either -- a COARSE trie is
+ *    structurally unable to reach the atomic writer.  It doubles as the LIVENESS
+ *    check that @781e0b9a's fix keeps green (COARSE writers used to park on the
+ *    FT-wide mutex while RCU-ONLINE and wedge as a group).
+ *
+ * Keys are RKP_KLEN wide in ALL FOUR, which is this oracle's own doing: uniform
  * width makes the band's key order plain lexicographic, so "nothing else sorts
  * between the delimiters" is a property of the four bytes rather than of the
  * prefix-sorts-first rule that variable-length keys otherwise bring.
@@ -3916,8 +3924,23 @@ static int inv_rekey_linearizability(void)
 enum rkp_mode {
 	RKP_ATOMIC_FIXED,
 	RKP_ATOMIC_VARLEN,
-	RKP_STAGED,
-	RKP_COARSE,	/* FT-wide writer lock: staged, and a LIVENESS check */
+	RKP_ATOMIC_COMPRESSED_TOP,
+	RKP_COARSE,	/* FT-wide writer lock: stages, and is the gap CONTROL */
+};
+
+/*
+ * What a moved key's absence MEANS for an arm, which is not the same question as
+ * whether the arm passes.
+ *
+ * RKP_GAP_NONE      the writer commits the move as ONE decide, so no reader can
+ *                   see the key missing from both positions: ANY absence fails.
+ * RKP_GAP_EXPECTED  the writer stages the move, so the absence window is the
+ *                   arm's subject.  ZERO absences FAILS: it means the probe that
+ *                   every RKP_GAP_NONE arm rests on has stopped detecting.
+ */
+enum rkp_gap {
+	RKP_GAP_NONE,
+	RKP_GAP_EXPECTED,
 };
 
 static struct cds_ft *create_rekey_coherent_ft(enum rkp_mode mode,
@@ -4211,7 +4234,7 @@ static void *rkp_reader(void *arg)
 	return NULL;
 }
 
-static int inv_rekey_public_no_gap_run(enum rkp_mode mode, bool expect_no_gap,
+static int inv_rekey_public_no_gap_run(enum rkp_mode mode, enum rkp_gap gap,
 		const char *name)
 {
 	struct cds_ft_group *group;
@@ -4258,7 +4281,7 @@ static int inv_rekey_public_no_gap_run(enum rkp_mode mode, bool expect_no_gap,
 		 * ONE key in the run stages the move: a single-key subtree
 		 * path-compresses, and the atomic writer needs a plain internal top.
 		 */
-		w[i].nr_run = (mode == RKP_STAGED) ? 1 : 4;
+		w[i].nr_run = (mode == RKP_ATOMIC_COMPRESSED_TOP) ? 1 : 4;
 		rcu_read_lock();
 		for (j = 0; j < 4; j++) {
 			uint64_t sk = rkp_sib_key(&w[i], j);
@@ -4382,8 +4405,23 @@ static int inv_rekey_public_no_gap_run(enum rkp_mode mode, bool expect_no_gap,
 		fprintf(stderr, "rkp: the control phase took no band probe\n");
 		ret = -1;
 	}
-	if (quiet_bad || exact_bad || (expect_no_gap && move_bad))
+	if (quiet_bad || exact_bad)
 		ret = -1;
+	if (gap == RKP_GAP_NONE && move_bad) {
+		ret = -1;			/* narrated per reader above */
+	} else if (gap == RKP_GAP_EXPECTED && !move_bad) {
+		/*
+		 * The control came back clean, which for a STAGING writer is not good
+		 * news: it means the band probe no longer catches a key that is absent
+		 * from both positions, and every RKP_GAP_NONE arm's zero is then drawn
+		 * from a dead detector.
+		 */
+		fprintf(stderr, "rkp: %s: a STAGED move's absence window went "
+			"UNDETECTED over %lu band probes and %lu moves -- the no-gap "
+			"arms rest on this probe, so their 0 is now unproven\n",
+			name, band, total_ops);
+		ret = -1;
+	}
 
 	fprintf(stderr, "# %s: %d writers %d readers, "
 		"%lu moves, %lu busy, %lu band probes (%lu absent moving; "
@@ -4403,9 +4441,9 @@ static int inv_rekey_public_no_gap_run(enum rkp_mode mode, bool expect_no_gap,
 
 /*
  * THE ATOMIC ARM -- the acceptance test for the one-decide writer, and a GATE:
- * every band probe must answer the run, so `absent moving` must be 0.  It needs
- * no second opt-in, unlike the staged arm below, because there is nothing
- * known-red about it.
+ * every band probe must answer the run, so `absent moving` must be 0.  That zero
+ * is only worth as much as the probe behind it, which is what the COARSE arm
+ * below exists to keep honest.
  */
 static int inv_rekey_public_atomic_no_gap(void)
 {
@@ -4414,7 +4452,7 @@ static int inv_rekey_public_atomic_no_gap(void)
 			"(set FT_INV_MW=1 to run the concurrent-writer oracles)\n");
 		return 0;
 	}
-	return inv_rekey_public_no_gap_run(RKP_ATOMIC_FIXED, true,
+	return inv_rekey_public_no_gap_run(RKP_ATOMIC_FIXED, RKP_GAP_NONE,
 			"inv_rekey_public_atomic_no_gap");
 }
 
@@ -4431,7 +4469,7 @@ static int inv_rekey_public_atomic_no_gap_varlen(void)
 			"(set FT_INV_MW=1 to run the concurrent-writer oracles)\n");
 		return 0;
 	}
-	return inv_rekey_public_no_gap_run(RKP_ATOMIC_VARLEN, true,
+	return inv_rekey_public_no_gap_run(RKP_ATOMIC_VARLEN, RKP_GAP_NONE,
 			"inv_rekey_public_atomic_no_gap_varlen");
 }
 
@@ -4446,10 +4484,13 @@ static int inv_rekey_public_atomic_no_gap_varlen(void)
  * Dropping the lock across the wait -- which that function already did -- fixes
  * only the self-deadlock, not the group.
  *
- * So this arm asserts PROGRESS, not no-gap: it is staged, and the absence count is
- * reported rather than gated (the requirement lives in the arms above).  ★ Note the
- * failure mode it guards against is a HANG, so a regression shows up as this leg
- * timing out rather than as a "not ok".
+ * So this arm asserts PROGRESS rather than no-gap -- and it asserts the OPPOSITE
+ * of the arms above: RKP_GAP_EXPECTED requires the absence window to be SEEN.
+ * A COARSE trie has no per-node locks and therefore no atomic writer to reach, so
+ * this is the one arm that stages no matter how far the atomic cut is widened,
+ * which is exactly what makes it a durable control for the band probe.  ★ Note the
+ * other failure mode it guards against is a HANG, so that regression shows up as
+ * this leg timing out rather than as a "not ok".
  */
 static int inv_rekey_coarse_progress(void)
 {
@@ -4458,31 +4499,32 @@ static int inv_rekey_coarse_progress(void)
 			"(set FT_INV_MW=1 to run the concurrent-writer oracles)\n");
 		return 0;
 	}
-	return inv_rekey_public_no_gap_run(RKP_COARSE, false,
+	return inv_rekey_public_no_gap_run(RKP_COARSE, RKP_GAP_EXPECTED,
 			"inv_rekey_coarse_progress");
 }
 
 /*
- * THE STAGED ARM -- the same probes against the writer that cannot satisfy them,
- * so it MEASURES the absence window (see the header above) instead of gating on
- * it.  Opt in twice.
+ * THE COMPRESSED-TOP ARM -- a run of a SINGLE key, so the source prefix
+ * path-compresses and the subtree top is a COMPRESSED node instead of a plain
+ * POPCOUNT/PIGEON one.  The atomic writer covers that shape, so this is its
+ * acceptance test under concurrent readers and it GATES on `absent moving` == 0
+ * like the other atomic arms: measured 3014 moves, 0 absent.
+ *
+ * ★ The shape is the one that used to select the staged writer, which is why the
+ * geometry differs from the varlen arm in nothing but the run length.  The staged
+ * writer's absence window is now demonstrated by the COARSE arm above, which
+ * cannot stop staging.
  */
-static int inv_rekey_public_staged_gap(void)
+static int inv_rekey_public_atomic_no_gap_compressed_top(void)
 {
 	if (!getenv("FT_INV_MW")) {
-		fprintf(stderr, "# inv_rekey_public_staged_gap: skipped "
-			"(set FT_INV_MW=1 to run the concurrent-writer oracles)\n");
+		fprintf(stderr, "# inv_rekey_public_atomic_no_gap_compressed_top: "
+			"skipped (set FT_INV_MW=1 to run the concurrent-writer "
+			"oracles)\n");
 		return 0;
 	}
-	if (!getenv("FT_INV_RKPG")) {
-		fprintf(stderr, "# inv_rekey_public_staged_gap: skipped -- a "
-			"variable-length group still moves by detach-into-a-transient-"
-			"trie, so a moved key is absent for a grace period per move; "
-			"set FT_INV_RKPG=1 to measure the gap\n");
-		return 0;
-	}
-	return inv_rekey_public_no_gap_run(RKP_STAGED, true,
-			"inv_rekey_public_staged_gap");
+	return inv_rekey_public_no_gap_run(RKP_ATOMIC_COMPRESSED_TOP, RKP_GAP_NONE,
+			"inv_rekey_public_atomic_no_gap_compressed_top");
 }
 
 /*
@@ -17623,7 +17665,7 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_rekey_linearizability);
 	RUN_TEST(inv_rekey_public_atomic_no_gap);
 	RUN_TEST(inv_rekey_public_atomic_no_gap_varlen);
-	RUN_TEST(inv_rekey_public_staged_gap);
+	RUN_TEST(inv_rekey_public_atomic_no_gap_compressed_top);
 	RUN_TEST(inv_rekey_coarse_progress);
 	RUN_TEST(inv_rekey_merge_occupied_dst);
 	RUN_TEST(inv_rekey_merge_shared_dst);
