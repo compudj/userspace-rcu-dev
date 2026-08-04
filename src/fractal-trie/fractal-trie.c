@@ -1954,14 +1954,35 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 		const uint8_t *src_key, size_t src_len,
 		const uint8_t *dst_key, size_t dst_len, bool require_empty)
 {
+	const struct rcu_flavor_struct *flavor = ft->group->flavor;
 	struct urcu_txn optxn;
 	int ret;
 
 	ft_txn_op_init(ft, &optxn);
+	/*
+	 * PARK THE ESCALATION QUIESCENT, which this op may do and insert / remove
+	 * may not.  urcu_txn_begin escalates -- and therefore blocks -- before it
+	 * opens the txn's own read section, so the only thing that could be pinned
+	 * across that park is an RCU section the CALLER holds.  This entry has none:
+	 * cds_ft_rekey_graft already forbids being called from a read section (its
+	 * move gate waits for a grace period), and the per-attempt pin below is
+	 * taken AFTER begin.  A writer parked online is what stops every grace
+	 * period in the process, so quiescing here is what keeps a contended move
+	 * from wedging the peers that wait on one.
+	 */
+	urcu_txn_set_park_quiescent(&optxn, 1);
 	for (;;) {
 		urcu_txn_begin(&optxn);
+		/*
+		 * PER ATTEMPT, not around the loop.  The pin exists to keep the
+		 * nodes ONE attempt captures alive from descent through commit, and
+		 * each attempt re-descends -- so per-attempt is both sufficient and
+		 * what leaves begin's park unpinned.
+		 */
+		flavor->read_lock();
 		ret = ft_rekey_graft_simple_attempt(ft, src_key, src_len,
 			dst_key, dst_len, require_empty, &optxn);
+		flavor->read_unlock();
 		if (ret != -EAGAIN && ret != -EIO)
 			break;
 		/* Age the conflict, as cds_ft_replace does; the turn is forfeited. */
@@ -1997,14 +2018,11 @@ int _cds_ft_debug_rekey_graft_simple(struct cds_ft *ft,
 		const uint8_t *src_key, size_t src_len,
 		const uint8_t *dst_key, size_t dst_len)
 {
-	const struct rcu_flavor_struct *flavor = ft->group->flavor;
 	int ret;
 
 	ft_move_gate_enter(ft);
-	flavor->read_lock();
 	ret = ft_rekey_graft_simple_locked(ft, src_key, src_len, dst_key, dst_len,
-			false);
-	flavor->read_unlock();
+			false);	/* pins per attempt: see the locked wrapper */
 	ft_move_gate_exit(ft);
 	return ret;
 }
@@ -2037,14 +2055,14 @@ int ft_rekey_one_decide(struct cds_ft *ft,
 		const uint8_t *src_key, size_t src_len,
 		const uint8_t *dst_key, size_t dst_len, bool require_empty)
 {
-	const struct rcu_flavor_struct *flavor = ft->group->flavor;
-	int ret;
-
-	flavor->read_lock();
-	ret = ft_rekey_graft_simple_locked(ft, src_key, src_len, dst_key, dst_len,
+	/*
+	 * NO read lock here: ft_rekey_graft_simple_locked pins PER ATTEMPT, which
+	 * is what lets its escalation park quiesce.  Wrapping the loop instead --
+	 * which this did -- pinned the park and made a contended move able to wedge
+	 * every peer waiting on a grace period.
+	 */
+	return ft_rekey_graft_simple_locked(ft, src_key, src_len, dst_key, dst_len,
 			require_empty);
-	flavor->read_unlock();
-	return ret;
 }
 
 /*

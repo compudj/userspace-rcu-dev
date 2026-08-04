@@ -290,6 +290,7 @@ struct urcu_txn {
 	struct cds_fair_mutex_node waiter;	/* our node while awaiting the turn */
 	int in_fallback;		/* we currently hold the lane */
 	int fb_published;		/* we raised domain->active and owe the clear */
+	int park_quiescent;		/* park the escalation OFFLINE (see the setter) */
 	int retrying;			/* a COMMIT aborted and asks to re-attempt: keep the turn */
 	uint64_t ryw_bloom[URCU_TXN_BLOOM_WORDS];	/* read-your-own-writes filter */
 	int disjoint;			/* write set touches DISTINCT slots */
@@ -448,6 +449,7 @@ void urcu_txn_init_flavor(struct urcu_txn *txn,
 	txn->desc = NULL;
 	uatomic_store(&txn->in_fallback, 0, CMM_RELAXED);
 	txn->fb_published = 0;
+	txn->park_quiescent = 0;	/* opt-in; see urcu_txn_set_park_quiescent */
 	txn->retrying = 0;
 	txn->disjoint = 0;
 	txn->expect_conflict = 0;
@@ -581,6 +583,36 @@ unsigned long urcu_txn__fallback_at(const struct urcu_txn *txn)
 extern __thread int urcu_txn_fb_depth;
 
 /*
+ * Park the escalation fallback QUIESCENT (RCU-offline) on @txn.  OFF by default,
+ * and opt-in for a reason.
+ *
+ * WHY IT HELPS.  A writer parked on the fallback lock is a registered QSBR reader
+ * that is ONLINE and non-quiescent, so while it waits it stops every grace period
+ * in the process -- and if the thread holding the lock is itself waiting for one,
+ * they wait on each other forever.  Parking offline removes the whole class:
+ * a parked writer holds up nothing.
+ *
+ * WHY IT IS NOT THE DEFAULT.  urcu_txn_begin() parks BEFORE opening the txn's own
+ * read section, so the txn holds nothing -- but an EMBEDDER may hold an RCU
+ * read-side section across the call, and quiescing inside it would expose whatever
+ * that section protects.  Under QSBR that cannot be detected here: a registered
+ * thread is online whether or not it is pinning anything.  So only an embedder
+ * that KNOWS no section is held at begin may set this, and it is the embedder's
+ * statement, not a discovery this code can make.
+ *
+ * (Fractal Trie: the same-trie rekey sets it -- its public entry already forbids
+ * being called from a read section, because it waits for a grace period in the move
+ * gate, and its retry loop pins per ATTEMPT, after begin.  cds_ft_insert and
+ * cds_ft_remove do NOT: their callers legitimately hold a read section across the
+ * call, and may hold reader-derived references across it.)
+ */
+static inline
+void urcu_txn_set_park_quiescent(struct urcu_txn *txn, int on)
+{
+	txn->park_quiescent = on;
+}
+
+/*
  * True while this thread holds a txn escalation fallback lock.
  *
  * ★ THE INVARIANT IT EXISTS FOR: never wait for a GRACE PERIOD while holding
@@ -611,8 +643,23 @@ int urcu_txn__self_qualifies(const struct urcu_txn *txn)
 static inline
 void urcu_txn__enter_fallback(struct urcu_txn *txn)
 {
+	int was_online = 0;
+
 	urcu_txn_fb_depth++;
+	/*
+	 * Quiesce across the park when the embedder has said it is safe: see
+	 * urcu_txn_set_park_quiescent.  Guarded on read_ongoing so a caller that
+	 * is ALREADY offline is left offline -- toggling it online here would hand
+	 * back a state it never asked for.
+	 */
+	if (txn->park_quiescent && txn->flavor) {
+		was_online = txn->flavor->read_ongoing();
+		if (was_online)
+			txn->flavor->thread_offline();
+	}
 	cds_fair_mutex_lock(&txn->domain->lock, &txn->waiter);
+	if (was_online)
+		txn->flavor->thread_online();
 	if (urcu_txn__self_qualifies(txn)) {
 		uatomic_store(&txn->domain->active, 1, CMM_RELAXED);
 		txn->fb_published = 1;
