@@ -2110,6 +2110,18 @@ void ft_writer_lock_gp_wait(struct cds_ft *ft)
 		ft_wlock_depth = 0;
 		(void) cds_fair_mutex_unlock(&held->writer_lock, &ft_wlock_waiter);
 	}
+	/*
+	 * NEVER a grace period while holding a txn escalation fallback: a peer
+	 * parked on that lock is an ONLINE, non-quiescent QSBR reader, so it is
+	 * exactly what would stop this grace period -- and it is waiting for the
+	 * lock this thread holds.  The two then wait on each other forever, which
+	 * is the freeze already on record for the escalation path.  Measured 0 of
+	 * these across every concurrent oracle (against ~11000 escalations in the
+	 * heaviest), so this asserts a property the code HAS; it is here to name
+	 * the cause the one time it is broken, because the wedge's own stacks
+	 * blame the innocent.
+	 */
+	assert(!urcu_txn_in_fallback());
 	ft->group->flavor->update_synchronize_rcu();
 	if (held) {
 		/*
@@ -2220,6 +2232,7 @@ void ft_move_gate_enter(struct cds_ft *ft)
 		 * already inside a critical section when the store landed may
 		 * still believe they are in fast mode, so let them finish.
 		 */
+		assert(!urcu_txn_in_fallback());	/* see gp_wait */
 		ft->group->flavor->update_synchronize_rcu();
 		pthread_mutex_lock(&ft->move_gate_lock);
 		ft->move_gate_gp = false;

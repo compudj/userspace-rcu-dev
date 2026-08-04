@@ -59,3 +59,6 @@ void urcu_txn_slab_ctor(void)
 	urcu_slab_init(&urcu_txn_slab, urcu_txn_slab_bytes,
 			URCU_TXN_SLAB_NCLASS, "txn");
 }
+
+/* See urcu_txn_in_fallback(): the invariant this exists to let embedders assert. */
+__thread int urcu_txn_fb_depth;

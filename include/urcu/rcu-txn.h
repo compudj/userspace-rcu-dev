@@ -572,6 +572,36 @@ unsigned long urcu_txn__fallback_at(const struct urcu_txn *txn)
 	return t > URCU_TXN_FALLBACK_MAX ? URCU_TXN_FALLBACK_MAX : t;
 }
 
+/*
+ * Depth of the escalation fallback THIS THREAD holds (0 = none).  Maintained on
+ * the escalation path only, which is rare by construction, and exists so an
+ * embedder can assert the one invariant that makes the fallback safe under QSBR:
+ * see urcu_txn_in_fallback().
+ */
+extern __thread int urcu_txn_fb_depth;
+
+/*
+ * True while this thread holds a txn escalation fallback lock.
+ *
+ * ★ THE INVARIANT IT EXISTS FOR: never wait for a GRACE PERIOD while holding
+ * this.  A writer parked on the fallback lock is a registered QSBR reader that is
+ * ONLINE and non-quiescent, so it is precisely what stops a grace period from
+ * completing -- and if the thread HOLDING the lock is the one waiting for that
+ * grace period, the two wait on each other forever.  The park cannot simply go
+ * offline the way ft_writer_lock_park does, because an embedder may hold an RCU
+ * read-side pin across its commit (the Fractal Trie does), and dropping it there
+ * would expose descent-captured nodes to reclamation.
+ *
+ * So the embedder's grace-period sites assert on this instead: a violation is a
+ * WEDGE, and a wedge's stacks blame the innocent -- the threads shown running are
+ * fine, and the culprit is whichever one is parked without quiescing.
+ */
+static inline
+int urcu_txn_in_fallback(void)
+{
+	return urcu_txn_fb_depth != 0;
+}
+
 static inline
 int urcu_txn__self_qualifies(const struct urcu_txn *txn)
 {
@@ -581,6 +611,7 @@ int urcu_txn__self_qualifies(const struct urcu_txn *txn)
 static inline
 void urcu_txn__enter_fallback(struct urcu_txn *txn)
 {
+	urcu_txn_fb_depth++;
 	cds_fair_mutex_lock(&txn->domain->lock, &txn->waiter);
 	if (urcu_txn__self_qualifies(txn)) {
 		uatomic_store(&txn->domain->active, 1, CMM_RELAXED);
@@ -597,6 +628,7 @@ void urcu_txn__exit_fallback(struct urcu_txn *txn)
 		txn->fb_published = 0;
 	}
 	uatomic_store(&txn->in_fallback, 0, CMM_RELAXED);
+	urcu_txn_fb_depth--;
 	(void) cds_fair_mutex_unlock(&txn->domain->lock, &txn->waiter);
 }
 
