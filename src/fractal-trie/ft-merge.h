@@ -871,6 +871,45 @@ int ft_merge_suffix_cmp(const uint8_t *a, size_t la, const uint8_t *b, size_t lb
 }
 
 /*
+ * A SURVIVOR cell's own forward / back link during the interleave: a plain store
+ * when the cell is not ord-reachable (the cross-trie merge, whose survivor came
+ * from a consumed source list), a RECORDED edge when it is (an in-trie rekey,
+ * whose survivors are live in the list being rebuilt).  See @record_all at
+ * ft_merge_ord_interleave_collect.
+ */
+static
+unsigned int ft_ord_survivor_link(struct ft_ord_cell *cell,
+		struct ft_ord_cell *next, struct ft_ord_cell_edge *edges,
+		unsigned int n, bool record_all)
+{
+	if (!record_all) {
+		cell->lnode.next = ft_ord_cell_lnode(next);
+		return n;
+	}
+	edges[n].tag = URCU_TXN_TAG;		/* ordered-cell edge */
+	edges[n].slot = (struct ft_ord_cell **) &cell->lnode.next;
+	edges[n].old_target = ft_ord_cell_resolve_ord(&cell->lnode.next);
+	edges[n].new_target = next;
+	return n + 1;
+}
+
+static
+unsigned int ft_ord_survivor_back(struct ft_ord_cell *cell,
+		struct ft_ord_cell *prev, struct ft_ord_cell_edge *edges,
+		unsigned int n, bool record_all)
+{
+	if (!record_all) {
+		cell->lnode.prev = ft_ord_cell_lnode(prev);
+		return n;
+	}
+	edges[n].tag = URCU_TXN_TAG;		/* ordered-cell edge */
+	edges[n].slot = (struct ft_ord_cell **) &cell->lnode.prev;
+	edges[n].old_target = ft_ord_cell_resolve_ord(&cell->lnode.prev);
+	edges[n].new_target = prev;
+	return n + 1;
+}
+
+/*
  * COLLECT the ordered-list edges that interleave the surviving source cells into
  * @dst's ordered list for a cds_ft_merge_at spine-copy, by a two-pointer
  * KEY-ORDER MERGE of the two already-sorted LIVE cell runs:
@@ -891,14 +930,29 @@ int ft_merge_suffix_cmp(const uint8_t *a, size_t la, const uint8_t *b, size_t lb
  * merged ORDER is reconstructed from the two live runs rather than by walking
  * the about-to-be-published merged structure, so the collect needs neither the
  * staged proxies nor a writer-side merged-view resolution -- and there is no
- * append-after-install (every edge is recorded before install).  Pre-sets each surviving
- * cell's own links with plain stores (the cell is not ord-reachable in @dst --
- * never was -- and the caller already unlinked it from src), and accumulates
- * ONLY the <= 2*merged_keys+2 reader-VISIBLE boundary edges -- a dst-original
- * cell's ord_next / ord_prev, or @dst's head / tail -- into @edges, RETURNED as a
- * count for the caller to record into the structural flip txn so structure +
- * interleave commit in ONE flip.  @prev_placed seeds at the region predecessor
- * (@dst_first's ord_prev).
+ * append-after-install (every edge is recorded before install).  It accumulates
+ * the reader-VISIBLE boundary edges -- a dst-original cell's ord_next / ord_prev,
+ * or @dst's head / tail -- into @edges, RETURNED as a count for the caller to
+ * record into the structural flip txn so structure + interleave commit in ONE
+ * flip.  @prev_placed seeds at the region predecessor (@dst_first's ord_prev).
+ *
+ * ★ @record_all DECIDES WHAT A SURVIVOR'S OWN LINKS COST.  With it FALSE the
+ * survivor's next/prev are PLAIN STORES, which is sound only because a cross-trie
+ * merge's survivor "is not ord-reachable in @dst -- never was -- and the caller
+ * already unlinked it from src".  An IN-TRIE rekey breaks both halves: its
+ * survivors are live in the very list being rebuilt, so a plain store there is a
+ * reader-visible, non-atomic mutation.  TRUE records those links as edges too, at
+ * up to 2 more per survivor, so the whole reorder lands in the one commit.  The
+ * caller sizes @edges accordingly: <= 2*merged_keys+2 visible, plus 2*nsrc when
+ * @record_all.
+ *
+ * @ncollide (optional) counts the equal-suffix steps.  A collision drops the src
+ * head from the merged order on the premise that it became a DUPLICATE on the dst
+ * head's chain and is "a floating duplicate never reachable as a distinct head" --
+ * true when the src list is consumed, FALSE in-trie, where that cell stays linked
+ * where it was and would keep answering as a distinct key.  An in-trie caller must
+ * therefore check this and decline; with @record_all the collect stores nothing, so
+ * a declined run costs only the walk.
  *
  * Identity key_map only (matches the rest of the ordered-list machinery).
  */
@@ -907,7 +961,8 @@ unsigned int ft_merge_ord_interleave_collect(struct cds_ft *dst,
 		size_t dst_key_len, struct ft_ord_cell *dst_first,
 		struct ft_ord_cell *dst_succ, struct ft_ord_cell *prev_placed,
 		const struct ft_merge_src_cap *src_caps, unsigned long nsrc,
-		const uint8_t *src_pool, struct ft_ord_cell_edge *edges)
+		const uint8_t *src_pool, struct ft_ord_cell_edge *edges,
+		bool record_all, unsigned long *ncollide)
 {
 	size_t max_len = dst->group->max_key_len;
 	uint8_t dbuf[FT_MAX_KEY_LEN];
@@ -964,8 +1019,11 @@ unsigned int ft_merge_ord_interleave_collect(struct cds_ft *dst,
 					src_pool + src_caps[si].suffix_off,
 					src_caps[si].suffix_len);
 			/* Tie: dst head wins, drop the colliding src head. */
-			if (cmp == 0)
+			if (cmp == 0) {
 				si++;
+				if (ncollide)
+					(*ncollide)++;
+			}
 			take_dst = (cmp <= 0);
 		}
 
@@ -978,7 +1036,8 @@ unsigned int ft_merge_ord_interleave_collect(struct cds_ft *dst,
 			 * was just placed before it (prev is a survivor).
 			 */
 			if (!prev_is_dst) {
-				prev->lnode.next = ft_ord_cell_lnode(cell);	/* survivor: invisible */
+				n = ft_ord_survivor_link(prev, cell, edges, n,
+						record_all);
 				edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
 				edges[n].slot = (struct ft_ord_cell **) &cell->lnode.prev;
 				edges[n].old_target =
@@ -995,7 +1054,7 @@ unsigned int ft_merge_ord_interleave_collect(struct cds_ft *dst,
 
 			/* Surviving src cell: pre-set its back link (prev may be the
 			 * sentinel: a new list minimum links its prev to &sentinel). */
-			cell->lnode.prev = ft_ord_cell_lnode(prev);		/* invisible */
+			n = ft_ord_survivor_back(cell, prev, edges, n, record_all);
 			if (prev_is_dst) {
 				/*
 				 * prev is a dst cell OR the sentinel (region at head):
@@ -1009,7 +1068,8 @@ unsigned int ft_merge_ord_interleave_collect(struct cds_ft *dst,
 				edges[n].new_target = cell;
 				n++;
 			} else {
-				prev->lnode.next = ft_ord_cell_lnode(cell);	/* survivor: invisible */
+				n = ft_ord_survivor_link(prev, cell, edges, n,
+						record_all);
 			}
 			prev = cell;
 			prev_is_dst = false;
@@ -1023,7 +1083,7 @@ unsigned int ft_merge_ord_interleave_collect(struct cds_ft *dst,
 	 * sentinel this IS the old "flip @dst's tail".
 	 */
 	if (!prev_is_dst) {
-		prev->lnode.next = ft_ord_cell_lnode(dst_succ);	/* survivor: invisible */
+		n = ft_ord_survivor_link(prev, dst_succ, edges, n, record_all);
 		edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
 		edges[n].slot = (struct ft_ord_cell **) &dst_succ->lnode.prev;
 		edges[n].old_target =
@@ -2030,7 +2090,8 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 
 		ms_n = ft_merge_ord_interleave_collect(dst_ft, dst_key_len,
 			ms_cursor, ms_succ, ms_prev, ms_src_caps, ms_nsrc,
-			ms_src_pool, ms_edges);
+			ms_src_pool, ms_edges, /*record_all=*/ false,
+			/*ncollide=*/ NULL);
 		for (i = 0; i < ms_n; i++)
 			ft_flip_txn_record_tag(txn,
 				(void **) ms_edges[i].slot,

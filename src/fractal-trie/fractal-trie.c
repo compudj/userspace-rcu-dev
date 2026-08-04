@@ -461,6 +461,165 @@ void ft_rekey_free_stop_prime(struct cds_ft *ft, struct cds_ft_inode_flag *nf)
 		free_cds_ft_node_unpublished(ft, ft_node_ptr(nf));
 }
 
+#ifdef FEATURE_FT_MERGE
+/*
+ * Build the ORDERED-CELL edge set for an IN-TRIE interleave: the moved run's keys
+ * thread individually between the destination region's, and every relink is
+ * RECORDED so the whole reorder lands in the move's one commit.
+ *
+ * This is the case a run splice cannot express.  When the moved suffixes do not
+ * disjointly precede or follow the region's, the moved cells do not stay
+ * contiguous, so there is no single pair of boundary edges to write -- each
+ * survivor lands between two region cells.  ft_merge_ord_interleave_collect
+ * computes exactly that order; what it needs from an in-trie caller is
+ * @record_all, because its survivors are live in the list being rebuilt rather
+ * than arriving from a consumed source list.
+ *
+ * ON TOP OF THE COLLECT, two things the cross-trie merge never needs:
+ *  - the SRC GAP.  A cross-trie merge throws its source list away; here the run
+ *    vacates a position in the same list, so its old neighbours must be stitched
+ *    to each other (ft_ord_cell_run_detach_edges, 2 edges).
+ *  - an ADJACENCY refusal.  The run and the region are each contiguous and
+ *    disjoint in the CURRENT list (their key prefixes are disjoint; they only
+ *    interleave AFTER the move), so the ONLY way an edge slot can repeat is the
+ *    two runs abutting -- then the gap closure and the collect's boundary edges
+ *    name the same links, and one of the collect's seeds would be a cell that is
+ *    itself moving.  Refused rather than special-cased.
+ *
+ * A COLLISION is refused too, and for a reason the collect's own contract states:
+ * it drops a colliding src head on the premise that the cell becomes an
+ * unreachable floating duplicate, which holds only when the src list is consumed.
+ * In-trie that cell stays linked where it is and would keep answering as a
+ * distinct key, so it would have to be unlinked as well -- a further step this
+ * does not take.  With @record_all the collect stores nothing, so running it and
+ * discarding the result is how the check is made.
+ *
+ * Returns 0 with *@edges_ret (caller frees) and *@n_ret, or -EINVAL (a shape
+ * above), -EAGAIN (a torn read) or -ENOMEM.  Records nothing itself.
+ */
+static
+int ft_rekey_ord_interleave(struct cds_ft *ft, struct cds_ft_inode_flag *D,
+		size_t dst_len, size_t src_len,
+		struct cds_ft_node *run_rfirst, struct cds_ft_node *run_rlast,
+		unsigned long merged_keys,
+		struct ft_ord_cell_edge **edges_ret, unsigned int *n_ret)
+{
+	size_t max_len = ft->group->max_key_len;
+	struct ft_ord_cell *rfc, *rlc, *run_pred, *run_succ;
+	struct ft_ord_cell *dfirst, *dlast, *reg_pred, *reg_succ;
+	struct ft_merge_src_cap *caps = NULL;
+	uint8_t *pool = NULL;
+	size_t pool_cap = 0, pool_len = 0;
+	struct ft_ord_cell_edge *edges = NULL;
+	unsigned long nsrc = 0, ncollide = 0, cap_n;
+	unsigned int n;
+	struct ft_ord_cell *sc, *slast;
+	int ret;
+
+	*edges_ret = NULL;
+	*n_ret = 0;
+	rfc = ft_ord_cell_ptr(rcu_dereference(run_rfirst->prev));
+	rlc = ft_ord_cell_ptr(rcu_dereference(run_rlast->prev));
+	dfirst = ft_ord_cell_ptr(rcu_dereference(
+		ft_subtree_minmax_head(ft, D, false)->prev));
+	dlast = ft_ord_cell_ptr(rcu_dereference(
+		ft_subtree_minmax_head(ft, D, true)->prev));
+	if (!rfc || !rlc || !dfirst || !dlast)
+		return -EAGAIN;
+	run_pred = ft_ord_cell_resolve_ord(&rfc->lnode.prev);
+	run_succ = ft_ord_cell_resolve_ord(&rlc->lnode.next);
+	reg_pred = ft_ord_cell_resolve_ord(&dfirst->lnode.prev);
+	reg_succ = ft_ord_cell_resolve_ord(&dlast->lnode.next);
+	/* The two runs must not abut, in either order (see the header). */
+	if (run_succ == dfirst || run_pred == dlast ||
+			reg_pred == rlc || reg_succ == rfc)
+		return -EINVAL;
+
+	/*
+	 * Capture the run's key SUFFIXES while it is still attached and
+	 * up-walkable, exactly as ft_merge_spine_copy does: the merge order is
+	 * rebuilt from the two live runs, never from the about-to-be-published
+	 * structure, so nothing needs a proxy installed first.
+	 */
+	caps = (struct ft_merge_src_cap *) malloc((merged_keys + 8) *
+			sizeof(*caps));
+	if (!caps)
+		return -ENOMEM;
+	sc = rfc;
+	slast = rlc;
+	for (;;) {
+		uint8_t sbuf[FT_MAX_KEY_LEN];
+		size_t sfl = ft_rebuild_key_upwalk(ft, sc, sbuf, max_len);
+		size_t suf_len;
+
+		if (sfl < src_len || nsrc >= merged_keys + 8) {
+			ret = -EAGAIN;		/* torn up-walk, or the run grew */
+			goto out;
+		}
+		suf_len = sfl - src_len;
+		if (pool_len + suf_len > pool_cap) {
+			size_t ncap = pool_cap ? pool_cap * 2 : 256;
+			uint8_t *np;
+
+			while (ncap < pool_len + suf_len)
+				ncap *= 2;
+			np = (uint8_t *) realloc(pool, ncap);
+			if (!np) {
+				ret = -ENOMEM;
+				goto out;
+			}
+			pool = np;
+			pool_cap = ncap;
+		}
+		memcpy(pool + pool_len, sbuf + (max_len - sfl) + src_len,
+			suf_len);
+		caps[nsrc].cell = sc;
+		caps[nsrc].suffix_off = pool_len;
+		caps[nsrc].suffix_len = suf_len;
+		pool_len += suf_len;
+		nsrc++;
+		if (sc == slast)
+			break;
+		sc = ft_ord_cell_resolve_ord(&sc->lnode.next);
+		if (!sc) {
+			ret = -EAGAIN;
+			goto out;
+		}
+	}
+
+	/*
+	 * <= 2 visible edges per survivor run + 2 boundary, plus (record_all) up to
+	 * 2 per survivor for its own links, plus the 2 src-gap edges.
+	 */
+	cap_n = 2 * merged_keys + 2 + 2 * nsrc + FT_ORD_CELL_RUN_DETACH_MAX_EDGES;
+	edges = (struct ft_ord_cell_edge *) calloc(cap_n, sizeof(*edges));
+	if (!edges) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	n = ft_merge_ord_interleave_collect(ft, dst_len, dfirst, reg_succ,
+			reg_pred, caps, nsrc, pool, edges, /*record_all=*/ true,
+			&ncollide);
+	if (ncollide) {
+		ret = -EINVAL;			/* see the header */
+		goto out;
+	}
+	/* Close the gap the run vacates. */
+	n = ft_ord_cell_run_detach_edges(ft, run_rfirst, run_rlast, &rfc, &rlc,
+			edges, n);
+	assert(n <= cap_n);
+	*edges_ret = edges;
+	*n_ret = n;
+	edges = NULL;
+	ret = 0;
+out:
+	free(edges);
+	free(pool);
+	free(caps);
+	return ret;
+}
+#endif /* FEATURE_FT_MERGE */
+
 /*
  * Order two key SUFFIXES the way the trie orders keys: bytes over the common
  * length, and on a tie the shorter one first.
@@ -670,6 +829,10 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 */
 	bool run_keeps_pos = false;
 	bool s_top_compressed = false;	/* the moved top is a compressed run */
+#ifdef FEATURE_FT_MERGE
+	/* Occupied dst: thread the cells individually, do not splice a run. */
+	bool run_interleaves = false;
+#endif
 	/*
 	 * +2, not +1: cow_stop can fill S_top plus all FT_ENTRY_PER_NODE of its
 	 * children, and the GLUE shape adds the split cluster's one displaced child.
@@ -983,7 +1146,19 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 						&dlast->lnode.next);
 				break;
 			default:
-				return -EINVAL;		/* interleave: not this cut */
+				/*
+				 * INTERLEAVED: not a run move.  The cells thread
+				 * individually between the region's, which
+				 * ft_rekey_ord_interleave builds at the cell step
+				 * below (and which refuses the shapes it cannot
+				 * express).  No splice pair applies.
+				 */
+#ifdef FEATURE_FT_MERGE
+				run_interleaves = true;
+				break;
+#else
+				return -EINVAL;		/* no merge: no interleave */
+#endif
 			}
 		} else {
 			/*
@@ -1660,6 +1835,49 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 			ft_ord_cell_record_into(txn, cedges, 2);
 			goto cells_done;
 		}
+#ifdef FEATURE_FT_MERGE
+		if (run_interleaves) {
+			/*
+			 * INTERLEAVE: every relink is recorded, so the cells reorder
+			 * with the structural publish in the one commit.  The edge set
+			 * is unbounded in the run length, hence heap-allocated and
+			 * freed here; a refusal is a clean pre-commit bail like the
+			 * distinct-slot one below.
+			 */
+			struct ft_ord_cell_edge *iedges = NULL;
+			unsigned int in = 0;
+			int iret = ft_rekey_ord_interleave(ft, probe_D, dst_len,
+					src_len, run_rfirst, run_rlast,
+					merged_keys, &iedges, &in);
+
+			if (!iret && !ft_flip_txn_reserve_extra(txn, in)) {
+				free(iedges);
+				iedges = NULL;
+				iret = -ENOMEM;
+			}
+			if (iret) {
+				pp_meta = NULL;	/* ft_glue_abort: single owner */
+				ft_rekey_free_stop_prime(ft, s_top_prime);
+				if (gst_st.old_recompacted_node)
+					free_cds_ft_node_unpublished(ft,
+						ft_node_ptr(gst_st.dest));
+				if (detach_rc.new_flag)
+					free_cds_ft_node_unpublished(ft,
+						ft_node_ptr(detach_rc.new_flag));
+				ft_glue_abort(ft, &glue);
+				if (src_glue_live) {
+					ft_glue_abort(ft, &src_glue);
+					src_glue_live = false;
+				}
+				ft_flip_txn_destroy(txn);
+				ret = iret;
+				goto sweep;
+			}
+			ft_ord_cell_record_into(txn, iedges, in);
+			free(iedges);
+			goto cells_done;
+		}
+#endif /* FEATURE_FT_MERGE: an occupied dst is a merge */
 		if (src_pred == ft_ord_or_sentinel(ft, run_dpred) ||
 				src_succ == ft_ord_or_sentinel(ft, run_dsucc)) {
 			pp_meta = NULL;		/* ft_glue_abort: single owner */
