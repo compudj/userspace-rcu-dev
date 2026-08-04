@@ -86,7 +86,45 @@ struct urcu_txn_deque_node {
 	struct urcu_txn_deque_node *next;	/* transacted slot */
 	struct urcu_txn_deque_node *prev;	/* transacted slot */
 	struct urcu_txn_deque      *owner;	/* transacted slot; NULL = free */
+	unsigned long		    seq;	/* transacted slot; see below */
 };
+
+/*
+ * seq -- the MEMBERSHIP SEQUENCE, and why `owner` alone is not enough.
+ *
+ * `owner` fixes the desync between membership and the links, because it is
+ * written by the same commit that moves the edges.  It does NOT fix ABA: it
+ * takes two values, so a transaction that reads owner == d, has the node
+ * removed and re-added underneath it, and validates at commit, sees owner == d
+ * again and accepts a derivation taken from a membership that no longer exists.
+ *
+ * seq is bumped by EVERY membership transition (push and remove) and never
+ * decreases, so "unchanged since I read it" becomes decidable.  A remove
+ * derives &prev->next from &n->prev and must therefore prove @prev is still
+ * the member it read -- and it cannot do that by validating &prev->next,
+ * because that is the very slot it stores to, and a validate plus a store on
+ * one slot is the same-slot merge the list documents as corrupting.  seq is a
+ * SEPARATE slot, which is the whole point: liveness can be checked inside the
+ * conflict set without colliding with the edge being written.
+ *
+ * Bumped by 2, never 1: bit 0 is reserved for the engine's descriptor proxy
+ * tag on every transacted slot, so the value must stay even.
+ */
+#define URCU_TXN_DEQUE_SEQ_STEP	2UL
+
+/*
+ * The guard itself, compile-out-able so its load-bearingness can be MEASURED
+ * rather than asserted.  A guard whose removal changes nothing is a guard that
+ * the test does not exercise, and this project has shipped three rules whose
+ * tests could not have failed.
+ */
+#ifdef URCU_TXN_DEQUE_NO_SEQ_GUARD
+#define URCU_TXN_DEQUE_SEQ_GUARD(txn, node)	do { (void) (node); } while (0)
+#else
+#define URCU_TXN_DEQUE_SEQ_GUARD(txn, node)				\
+	((void) urcu_txn_load_validate((txn), (void **) &(node)->seq,	\
+			URCU_TXN_TAG))
+#endif
 
 struct urcu_txn_deque {
 	struct urcu_txn_deque_node sentinel;	/* circular: next = head, prev = tail */
@@ -117,6 +155,7 @@ void urcu_txn_deque_node_init(struct urcu_txn_deque_node *n)
 	n->next = NULL;
 	n->prev = NULL;
 	n->owner = NULL;
+	n->seq = 0;
 }
 
 /* Resolve a raw slot value: only the engine's proxy tag can be set here. */
@@ -214,7 +253,7 @@ int urcu_txn_deque_push_tail_prepare(struct urcu_txn *txn,
 		struct urcu_txn_deque *d, struct urcu_txn_deque_node *n)
 {
 	struct urcu_txn_deque_node *sent = &d->sentinel, *oldtail;
-	void *own, *nn, *np;
+	void *own, *nn, *np, *sq;
 	int ret;
 
 	own = urcu_txn_load(txn, (void **) &n->owner, URCU_TXN_TAG);
@@ -224,8 +263,21 @@ int urcu_txn_deque_push_tail_prepare(struct urcu_txn *txn,
 			urcu_txn_load(txn, (void **) &sent->prev, URCU_TXN_TAG));
 	nn = urcu_txn_load(txn, (void **) &n->next, URCU_TXN_TAG);
 	np = urcu_txn_load(txn, (void **) &n->prev, URCU_TXN_TAG);
+	sq = urcu_txn_load(txn, (void **) &n->seq, URCU_TXN_TAG);
+	/*
+	 * @oldtail's identity came from &sent->prev and its &oldtail->next slot
+	 * is written below, so its LINK is covered -- but that only proves the
+	 * slot still holds the sentinel, not that @oldtail is the same
+	 * membership we read.  Validate its seq, which is not a slot this
+	 * transaction writes.
+	 */
+	if (oldtail != sent)
+		URCU_TXN_DEQUE_SEQ_GUARD(txn, oldtail);
 
 	ret = urcu_txn_store_mw(txn, (void **) &n->owner, NULL, d, URCU_TXN_TAG);
+	ret |= urcu_txn_store_mw(txn, (void **) &n->seq, sq,
+			(void *) ((uintptr_t) sq + URCU_TXN_DEQUE_SEQ_STEP),
+			URCU_TXN_TAG);
 	ret |= urcu_txn_store_mw(txn, (void **) &n->next, nn, sent,
 			URCU_TXN_TAG);
 	ret |= urcu_txn_store_mw(txn, (void **) &n->prev, np, oldtail,
@@ -263,7 +315,7 @@ int urcu_txn_deque_remove_prepare(struct urcu_txn *txn,
 		struct urcu_txn_deque *d, struct urcu_txn_deque_node *n)
 {
 	struct urcu_txn_deque_node *prev, *next;
-	void *own;
+	void *own, *sq;
 	int ret;
 
 	own = urcu_txn_load(txn, (void **) &n->owner, URCU_TXN_TAG);
@@ -299,7 +351,25 @@ int urcu_txn_deque_remove_prepare(struct urcu_txn *txn,
 			urcu_txn_load_validate(txn, (void **) &n->next,
 					URCU_TXN_TAG));
 
+	sq = urcu_txn_load(txn, (void **) &n->seq, URCU_TXN_TAG);
+	/*
+	 * THE ABA GUARD.  @prev and @next are derived from @n's links, and this
+	 * transaction writes &prev->next and &next->prev -- so their LINKS are
+	 * covered, but a neighbour that was removed and re-added since the read
+	 * would present the same link value and the same owner.  Their seqs are
+	 * separate slots and monotone, so validating them makes "still the
+	 * member I derived from" decidable.  Skipped for the sentinel, which is
+	 * immortal and never transitions.
+	 */
+	if (prev != &d->sentinel)
+		URCU_TXN_DEQUE_SEQ_GUARD(txn, prev);
+	if (next != &d->sentinel && next != prev)
+		URCU_TXN_DEQUE_SEQ_GUARD(txn, next);
+
 	ret = urcu_txn_store_mw(txn, (void **) &n->owner, d, NULL,
+			URCU_TXN_TAG);
+	ret |= urcu_txn_store_mw(txn, (void **) &n->seq, sq,
+			(void *) ((uintptr_t) sq + URCU_TXN_DEQUE_SEQ_STEP),
 			URCU_TXN_TAG);
 	/*
 	 * A single-element deque has prev == next == sentinel, so these two
@@ -361,6 +431,15 @@ int urcu_txn_deque_rotate_head_prepare(struct urcu_txn *txn,
 	 */
 	if (hn == sent)
 		return -EAGAIN;
+
+	/*
+	 * A rotate changes no node's MEMBERSHIP, so it bumps no seq -- keeping
+	 * it from needlessly aborting peers.  But @hn and @t are derived
+	 * identities whose slots it writes, so guard them the same way.
+	 */
+	URCU_TXN_DEQUE_SEQ_GUARD(txn, hn);
+	if (t != hn)
+		URCU_TXN_DEQUE_SEQ_GUARD(txn, t);
 
 	ret = urcu_txn_store_mw(txn, (void **) &sent->next, h, hn,
 			URCU_TXN_TAG);
