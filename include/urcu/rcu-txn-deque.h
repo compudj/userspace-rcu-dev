@@ -94,7 +94,8 @@ struct urcu_txn_deque {
 };
 
 /*
- * count is maintained OUTSIDE the transaction and is therefore approximate.
+ * count is maintained OUTSIDE the transaction by the CALLER, and is therefore
+ * approximate.
  * That is deliberate: it is not pointer-width, so transacting it is not
  * possible, and making membership depend on a separately-maintained word again
  * is precisely the mistake this structure exists to remove.  Read it as a scan
@@ -129,10 +130,23 @@ struct urcu_txn_deque_node *urcu_txn_deque_resolve(void *raw)
 }
 
 /*
- * Is @n queued, and on which deque?  A plain resolved load -- correct without
- * a transaction because owner only ever changes inside one, so any value read
- * is a value some commit published.  Call within an RCU read-side critical
- * section (resolving a parked proxy dereferences the writer's descriptor).
+ * Is @n queued, and on which deque?  A HINT, and only a hint.
+ *
+ * It is a plain resolved load, so it is a value some commit published -- but
+ * nothing holds it still, and it is the ONE read in this header that is not
+ * covered by a transaction.  A caller that branches on it is doing so
+ * test-and-then-act: by the time it acts, a peer may have pushed or removed
+ * @n.  That is SAFE only because every mutator re-derives membership inside
+ * its own commit and answers -EEXIST / -ENOENT, so acting on a stale hint
+ * costs a wasted attempt and never a wrong edge.
+ *
+ * DO NOT build a second membership record on top of it.  Caching this in a
+ * separate word and maintaining that word alongside the deque re-creates
+ * exactly what `owner` exists to eliminate -- two states no single commit
+ * covers -- which is the defect this structure was written to replace.
+ *
+ * Call within an RCU read-side critical section (resolving a parked proxy
+ * dereferences the writer's descriptor).
  */
 static inline
 struct urcu_txn_deque *urcu_txn_deque_owner(struct urcu_txn_deque_node *n)
@@ -146,10 +160,18 @@ struct urcu_txn_deque *urcu_txn_deque_owner(struct urcu_txn_deque_node *n)
 }
 
 /*
- * PEEK at the oldest node, or NULL if empty.  One hop off the sentinel -- this
- * is the only read this structure offers and it is not a traversal: the caller
- * may not step from the result to its successor.  Call within an RCU read-side
- * critical section.
+ * PEEK at the oldest node, or NULL if empty.  One hop off the sentinel -- not
+ * a traversal: the caller may not step from the result to its successor.
+ *
+ * A HINT, like urcu_txn_deque_owner() above and for the same reason: plain
+ * load, nothing holds it, and the node may be removed (and, once a grace
+ * period passes, freed) before the caller acts on it.  Hence the RCU read-side
+ * requirement, which is what keeps the returned pointer dereferenceable; the
+ * mutators then re-derive under their own commit.
+ *
+ * A sweeper must therefore treat "the head" as advisory and let its remove or
+ * rotate answer authoritatively.  Re-reading this every iteration -- rather
+ * than caching a cursor -- is also what keeps the no-traversal contract true.
  */
 static inline
 struct urcu_txn_deque_node *urcu_txn_deque_head(struct urcu_txn_deque *d)
