@@ -1086,7 +1086,7 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 	 * are never at the root).
 	 */
 	FT_TP(tree_edge_set, (const void *) ft,
-		(const void *) ft_parent_node(cn_meta->parent),
+		(const void *) ft_parent_node(CMM_LOAD_SHARED(cn_meta->parent_word)),
 		(unsigned int) (node_depth - 1),
 		(uint8_t) iter_key[-1],
 		(const void *) top_flag);

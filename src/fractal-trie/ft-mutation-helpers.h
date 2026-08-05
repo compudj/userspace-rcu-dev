@@ -1212,7 +1212,7 @@ void ft_trace_miswire_check(struct cds_ft *ft,
 	state = (uintptr_t) urcu_txn_read((void **) &meta->state,
 			FT_STATE_PROXY);
 	rt_parent = ft_resolve_flip_proxy(ft_parent_node(
-			rcu_dereference(meta->parent)));
+			rcu_dereference(meta->parent_word)));
 	rt_slotp = rt_parent ? ft_get_parent_slot(meta, ft) : NULL;
 	if (rt_slotp)
 		rt_val = ft_resolve_flip_proxy(rcu_dereference(*rt_slotp));
