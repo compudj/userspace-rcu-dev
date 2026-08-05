@@ -552,6 +552,37 @@ struct cds_ft_inode_flag *ft_merge_build(struct ft_merge_ctx *c,
 			dc_present = false;
 		if (!sc_present && !dc_present)
 			continue;
+		/*
+		 * F1 / RESOLVED-POINTER CONTRACT, at the build's source of children.
+		 * ft_node_get_nth_skip is the RAW scanner: every other caller resolves
+		 * its result (ft_node_get_nth and ft_node_get_nth_reanchor_slot both
+		 * do), and this one does not.  A peer mid-commit on a live dst slot
+		 * therefore hands the build a parked type-7 proxy, whose low nibble
+		 * reads as an internal node.
+		 *
+		 * Do NOT resolve it.  @dc is EMBEDDED into the merged cluster below
+		 * (child = dc, published by ft_node_set_nth), and resolving picks the
+		 * old or new target by the peer's CURRENT status -- a status still free
+		 * to flip, which would leave the merged node naming a retired child.
+		 * Unresolved it is worse: the count and glue-origin reads dereference
+		 * it, computing off the latch (ft_node_key_count, ft_glue_is_fresh).
+		 *
+		 * Bail on the CONTENTION channel instead, exactly as a missed overlap
+		 * fence does: FT_MERGE_OOM is the one unwind sentinel and
+		 * @overlap_contended is what tells the caller this was a peer and not
+		 * memory, so it re-descends rather than reporting MEMORY_ERROR.  Both
+		 * tries are pristine at this point -- the build has published nothing
+		 * and ft_glue_abort releases every fence it took.
+		 *
+		 * @sc is guarded too though no capture has ever named it: a cross-trie
+		 * source is exclusive, but the rekey fold's source is LIVE (the reason
+		 * @fence_src exists), and the test is one predicted-not-taken compare.
+		 */
+		if (caa_unlikely(ft_node_flip_proxy(sc) ||
+				ft_node_flip_proxy(dc))) {
+			c->overlap_contended = true;
+			return FT_MERGE_OOM;
+		}
 
 		if (sc_present && dc_present) {
 			/*
