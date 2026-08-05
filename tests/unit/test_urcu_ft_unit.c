@@ -54,7 +54,7 @@
  * at RUNTIME by ft->lock_fine, so the _DLM suffix names this group of lock-set
  * tests -- it does NOT select a build.
  */
-#define NR_TESTS_DLM 10		/* cow_stop_root_inplace, rekey_graft_{simple,liston,cross_junction,glue_dst,glue_dst_branch_child}, rekey_merge_{occupied,occupied_liston,interleave_liston,collide}_dst */
+#define NR_TESTS_DLM 11		/* cow_stop_root_inplace, rekey_graft_{simple,liston,cross_junction,glue_dst,glue_dst_branch_child}, rekey_merge_{occupied,occupied_liston,interleave_liston,collide}_dst, rekey_merge_compressed_top_refused */
 
 /*
  * Tests needing DLM *and* fault injection in one build: the merge overlap-spine
@@ -277,6 +277,8 @@ extern void _cds_ft_debug_move_gate_enter(struct cds_ft *ft);
 extern void _cds_ft_debug_move_gate_exit(struct cds_ft *ft);
 extern void *_cds_ft_debug_root(struct cds_ft *ft);
 extern int _cds_ft_debug_cow_replace_root(struct cds_ft *ft);
+extern int _cds_ft_debug_flag_is_compressed(void *flag);
+extern int _cds_ft_debug_compress_enabled(void);
 extern void *_cds_ft_debug_child_at(struct cds_ft *ft, const uint8_t *key,
 		size_t key_len);
 extern int _cds_ft_debug_rekey_graft_simple(struct cds_ft *ft,
@@ -1095,6 +1097,177 @@ out:
 		rc = -1;
 	return rc;
 }
+
+/*
+ * THE MERGE ARM'S COMPRESSED-TOP REFUSAL -- the shape, and the proof it is TOTAL.
+ *
+ * Same layout as test_rekey_merge_occupied_dst above, with ONE key in the moved
+ * subtree instead of RK_NSUB.  A single-key subtree path-compresses, so S_top is
+ * a COMPRESSED node, and the destination is still occupied -- which together are
+ * exactly the shape ft_rekey_graft_simple_attempt refuses:
+ *
+ *	if (merge_dst && s_top_compressed)
+ *		return -EINVAL;
+ *
+ * The merge arm skips ft_rekey_cow_stop, on the argument that ft_merge_build
+ * gives the moved top a fresh address by construction -- an argument whose stated
+ * premise is an "internal, non-compressed S_top".  A compressed one unlocks the
+ * shared-run collapse exit that returns a LIVE node, which is the freshness the
+ * coherent reader's two-descent witness depends on.
+ *
+ * ★ WHY THIS TEST EXISTS.  Every shape refusal in that writer counted ZERO across
+ * all five concurrent rekey oracles (190076 attempts, 0 refusals of any kind), so
+ * this branch had no coverage whatsoever and widening it could not have moved a
+ * number.  Neither concurrent merge oracle can host the shape: both are
+ * FIXED-length, and a fixed-length group has no staged writer to fall back to, so
+ * a refused shape there cannot move at all.
+ *
+ * What it asserts is not the refusal code but that the refusal is TOTAL: the
+ * driver reports non-zero AND the trie is exactly as it was -- same key count,
+ * the dst child pointer UNCHANGED (a fresh one would mean a partial union), the
+ * moved key still at the source, the occupant intact, verify clean.  A refusal
+ * that had already published something would pass a bare rc check and fail here.
+ *
+ * When the cut widens to admit a compressed S_top on the merge arm, this test is
+ * what says whether the newly-admitted move is correct: flip it to expect rc == 0
+ * and assert both sides survive, as the test above does.
+ */
+static int test_rekey_merge_compressed_top_refused(void)
+{
+	if (!cds_ft_merge_enabled()) {
+		diag("test_rekey_merge_compressed_top_refused: skipped, merge "
+			"compiled out (-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
+	/*
+	 * Without path compression a single-key subtree stays a plain internal
+	 * node, so the shape this test exists for cannot be built at all.  Skip
+	 * rather than fail -- but skip on the BUILD FLAG, not on observing an
+	 * uncompressed top, or a compression regression would skip too.
+	 */
+	if (!_cds_ft_debug_compress_enabled()) {
+		diag("test_rekey_merge_compressed_top_refused: skipped, path "
+			"compression compiled out (-DNO_FEATURE_FT_COMPRESS)");
+		return 0;
+	}
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_fine_lock_listoff_ft(4, &group);
+	uint8_t src_key[2] = { RK_SX, RK_SY }, dst_key[2] = { RK_DX, RK_DZ };
+	uint64_t sub_key, sib_key[RK_NSIB], occ_key[2], dstl_key[2];
+	void *before, *after, *src_before, *src_after;
+	unsigned long cnt_before, cnt_after;
+	struct cds_ft_node *f = NULL;
+	int i, rc = -1;
+
+	/* ONE key under {SX,SY}: the subtree path-compresses. */
+	sub_key = ((uint64_t) RK_SX << 24) | ((uint64_t) RK_SY << 16) |
+		((uint64_t) 1 << 8);
+	for (i = 0; i < RK_NSIB; i++)
+		sib_key[i] = ((uint64_t) RK_SX << 24) | ((uint64_t) (i + 5) << 16);
+	dstl_key[0] = ((uint64_t) RK_DX << 24) | ((uint64_t) 0x01 << 16);
+	dstl_key[1] = ((uint64_t) RK_DX << 24) | ((uint64_t) 0x02 << 16);
+	occ_key[0] = ((uint64_t) RK_DX << 24) | ((uint64_t) RK_DZ << 16) |
+		((uint64_t) (RKM_DOCC + 0x40) << 8);
+	occ_key[1] = ((uint64_t) RK_DX << 24) | ((uint64_t) RK_DZ << 16) |
+		((uint64_t) (RKM_DOCC + 0x41) << 8);
+
+	rcu_read_lock();
+	if (insert_u64(ft, sub_key, node_alloc(sub_key)) != CDS_FT_STATUS_OK)
+		goto out_locked;
+	for (i = 0; i < RK_NSIB; i++)
+		if (insert_u64(ft, sib_key[i], node_alloc(sib_key[i])) !=
+				CDS_FT_STATUS_OK)
+			goto out_locked;
+	for (i = 0; i < 2; i++)
+		if (insert_u64(ft, dstl_key[i], node_alloc(dstl_key[i])) !=
+					CDS_FT_STATUS_OK ||
+				insert_u64(ft, occ_key[i], node_alloc(occ_key[i])) !=
+					CDS_FT_STATUS_OK)
+			goto out_locked;
+	before = _cds_ft_debug_child_at(ft, dst_key, 2);
+	src_before = _cds_ft_debug_child_at(ft, src_key, 2);
+	cnt_before = cds_ft_count_keys(ft);
+	rcu_read_unlock();
+	/*
+	 * Both halves of the shape must actually be present, or the test would
+	 * pass by never reaching the branch it exists for.
+	 */
+	if (!before) {
+		fprintf(stderr, "rekey-merge-ct: dst is NOT occupied -- the shape is "
+			"wrong, this would take the graft path\n");
+		goto out;
+	}
+	if (!src_before || !_cds_ft_debug_flag_is_compressed(src_before)) {
+		fprintf(stderr, "rekey-merge-ct: S_top is NOT compressed (%p) -- a "
+			"single-key subtree should have path-compressed\n", src_before);
+		goto out;
+	}
+
+	/* The move takes the gate + a grace period: NOT from a read section. */
+	rc = _cds_ft_debug_rekey_graft_simple(ft, src_key, 2, dst_key, 2);
+	if (rc == 0) {
+		fprintf(stderr, "rekey-merge-ct: the writer ACCEPTED a compressed "
+			"S_top on the merge arm -- if the cut was widened deliberately, "
+			"this test is the acceptance test and must now assert the union\n");
+		rc = -1;
+		goto out;
+	}
+	rc = -1;
+
+	/* The refusal must be TOTAL: nothing published, nothing moved. */
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "rekey-merge-ct: verify failed after a REFUSED move\n");
+		goto out;
+	}
+	rcu_read_lock();
+	after = _cds_ft_debug_child_at(ft, dst_key, 2);
+	src_after = _cds_ft_debug_child_at(ft, src_key, 2);
+	cnt_after = cds_ft_count_keys(ft);
+	rcu_read_unlock();
+	if (after != before) {
+		fprintf(stderr, "rekey-merge-ct: the dst child CHANGED across a "
+			"refused move (%p -> %p) -- the refusal published something\n",
+			before, after);
+		goto out;
+	}
+	if (src_after != src_before) {
+		fprintf(stderr, "rekey-merge-ct: the src child CHANGED across a "
+			"refused move (%p -> %p)\n", src_before, src_after);
+		goto out;
+	}
+	if (cnt_after != cnt_before) {
+		fprintf(stderr, "rekey-merge-ct: key count %lu != %lu across a "
+			"refused move\n", cnt_after, cnt_before);
+		goto out;
+	}
+	rcu_read_lock();
+	if (lookup_u64(ft, sub_key, &f) != CDS_FT_STATUS_OK) {
+		rcu_read_unlock();
+		fprintf(stderr, "rekey-merge-ct: the moved key left the SOURCE on a "
+			"refused move\n");
+		goto out;
+	}
+	for (i = 0; i < 2; i++) {
+		f = NULL;
+		if (lookup_u64(ft, occ_key[i], &f) != CDS_FT_STATUS_OK) {
+			rcu_read_unlock();
+			fprintf(stderr, "rekey-merge-ct: dst occupant %d lost to a "
+				"refused move\n", i);
+			goto out;
+		}
+	}
+	rcu_read_unlock();
+	rc = 0;
+	goto out;
+out_locked:
+	rcu_read_unlock();
+	fprintf(stderr, "rekey-merge-ct: setup insert failed\n");
+out:
+	if (drain_and_destroy(ft, group) < 0)
+		rc = -1;
+	return rc;
+}
+
 
 /*
  * The OCCUPIED destination with the ORDERED LIST ON where the moved keys genuinely
@@ -31453,6 +31626,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_cow_stop_root_inplace);
 	RUN_TEST(test_rekey_graft_simple);
 	RUN_TEST(test_rekey_merge_occupied_dst);
+	RUN_TEST(test_rekey_merge_compressed_top_refused);
 	RUN_TEST(test_rekey_merge_occupied_dst_liston);
 	RUN_TEST(test_rekey_merge_interleave_liston);
 	RUN_TEST(test_rekey_merge_collide_dst);

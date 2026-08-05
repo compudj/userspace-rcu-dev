@@ -371,6 +371,43 @@ sweep:
  * can observe that a rekey moved the moved-subtree top (S_top) to a FRESH address.
  * NULL if the key is absent or its path traverses a non-plain-internal node.
  */
+/*
+ * Is path compression compiled in?
+ *
+ * Test-only.  A test that builds a compressed shape must tell "this build cannot
+ * make one" (skip) from "this build should have made one and did not" (fail) --
+ * a bare structural check collapses the two and would skip silently through a
+ * regression.
+ */
+int _cds_ft_debug_compress_enabled(void)
+{
+#ifdef FEATURE_FT_COMPRESS
+	return 1;
+#else
+	return 0;
+#endif
+}
+
+/*
+ * Is @flag (a value from _cds_ft_debug_child_at) a COMPRESSED node?
+ *
+ * Test-only shape introspection.  A test that builds a geometry to reach a
+ * kind-specific branch has to be able to say it built it: without this, asserting
+ * only the outcome passes whenever ANY other branch produces the same outcome.
+ */
+int _cds_ft_debug_flag_is_compressed(void *flag)
+{
+	struct cds_ft_inode_flag *nf = (struct cds_ft_inode_flag *) flag;
+
+	if (!nf)
+		return 0;
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+	if (ft_node_skip_compressed(nf))
+		return 1;
+#endif
+	return ft_node_compressed(nf) ? 1 : 0;
+}
+
 void *_cds_ft_debug_child_at(struct cds_ft *ft, const uint8_t *key,
 		size_t key_len)
 {
