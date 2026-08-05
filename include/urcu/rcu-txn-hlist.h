@@ -481,6 +481,7 @@ int urcu_txn_hlist_add_rcu(struct urcu_txn_hlist_node *newp,
 			continue;
 		}
 		if (prep) {				/* -ENOENT: head sealed */
+			urcu_txn_abandon(&txn);	/* or the lane is held forever */
 			urcu_txn_end(&txn);
 			return prep;		/* nothing recorded: do not commit */
 		}
@@ -516,6 +517,7 @@ int urcu_txn_hlist_insert_after_rcu(struct urcu_txn_hlist_node *newp,
 			continue;
 		}
 		if (prep) {				/* -ENOENT: @pos deleted */
+			urcu_txn_abandon(&txn);	/* or the lane is held forever */
 			urcu_txn_end(&txn);
 			return prep;
 		}
@@ -583,6 +585,7 @@ int urcu_txn_hlist_insert_before_rcu(struct urcu_txn_hlist_node *newp,
 		urcu_txn_begin(&txn);
 		prep = urcu_txn_hlist_insert_before_prepare(&txn, newp, pos);
 		if (prep) {				/* -ENOENT: @pos deleted */
+			urcu_txn_abandon(&txn);	/* or the lane is held forever */
 			urcu_txn_end(&txn);
 			return prep;
 		}
@@ -678,6 +681,7 @@ int urcu_txn_hlist_del_rcu(struct urcu_txn_hlist_node *elem,
 			continue;
 		}
 		if (prep) {				/* -ENOENT: already deleted */
+			urcu_txn_abandon(&txn);	/* or the lane is held forever */
 			urcu_txn_end(&txn);
 			return 0;			/* not removed by this call */
 		}
@@ -758,6 +762,7 @@ int urcu_txn_hlist_replace_rcu(struct urcu_txn_hlist_node *old,
 			continue;
 		}
 		if (prep) {				/* -ENOENT: @old already gone */
+			urcu_txn_abandon(&txn);	/* or the lane is held forever */
 			urcu_txn_end(&txn);
 			return prep;
 		}
