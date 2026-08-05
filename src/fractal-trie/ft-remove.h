@@ -1332,6 +1332,33 @@ int ft_detach_node(struct cds_ft *ft,
 			&cur_rewind);
 	}
 	entry_holder_slot = detach_parent_flag_ptr;
+	/*
+	 * HOLDER IDENTITY: @cur must be the very node @detach_node_flag_ptr
+	 * addresses a slot inside.  The caller reached that slot by descending
+	 * through the holder; @cur is a SEPARATE, later load of the slot that
+	 * holds the holder.  A peer that republishes the holder between the two
+	 * -- an insert splitting the compressed chain here, whose fresh copy
+	 * carries the removed key AND its own -- leaves the pair disagreeing:
+	 * the slot addresses the retired body, @cur names the fresh copy.
+	 *
+	 * The climb then walks the WRONG node.  It is fatal precisely because
+	 * the fresh copy looks prunable: a compressed node structurally holds
+	 * exactly one child, so the climb scores it a single-child ancestor,
+	 * elevates past it, and drops the branch whole -- the multi-child
+	 * junction the peer published UNDER it is never looked at, and the peer's
+	 * key goes with the prune.  No expected-old on the holder slot can see
+	 * this: that slot's value agrees with itself at every load (the climb
+	 * elevates ONTO it and both reads return the fresh copy).  What is stale
+	 * is the DESCENT's premise -- "the chain below this holder holds only the
+	 * key I am removing" -- and this is where that premise is checkable.
+	 *
+	 * Nothing is built, locked or reserved yet: re-descend against the
+	 * settled tree.  The invariant holds by construction across an elevation
+	 * below (the new @detach_node_flag_ptr is the slot ft_get_parent_slot
+	 * recovered INSIDE the new @cur), so it is tested once, here.
+	 */
+	if (caa_unlikely(!ft_slot_in_node(cur, detach_node_flag_ptr)))
+		return -EAGAIN;
 	/* Plan expected-old for a detach that never elevates (see @plan_old_child). */
 	plan_old_child = (struct cds_ft_inode_flag *)
 		rcu_dereference(*detach_node_flag_ptr);

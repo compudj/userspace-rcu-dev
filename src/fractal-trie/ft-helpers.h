@@ -2006,6 +2006,48 @@ struct cds_ft_inode_flag **ft_get_parent_slot(const struct cds_ft_metadata *meta
 	return ft_resolve_parent_slot(meta, ft, NULL);
 }
 
+/*
+ * ft_slot_in_node: is @slot one of @node_flag's OWN child slots?
+ *
+ * The inverse of ft_get_parent_slot, which computes every slot as the node body
+ * plus a pointer-stride offset: the node body IS the packed child-pointer array,
+ * sized (1 << type->order) and naturally aligned, so containment is an address
+ * range test.  A compressed node carries exactly one child slot, @cn->child.
+ *
+ * This is the pairing test for a plan that holds a slot address INSIDE one node
+ * and a separately-resolved pointer TO that node.  Both can be individually
+ * coherent while the PAIR is not: a peer that republishes the node between the
+ * descent that produced the slot and the load that resolved the pointer leaves
+ * the slot addressing the retired body while the pointer names the fresh copy.
+ * No expected-old on the holder slot can see that -- the value there matches
+ * itself; what is stale is the premise the descent established about the node.
+ *
+ * @node_flag must already be resolved (no flip proxy); a skip form resolves to
+ * the compressed node it names.  A value that holds no child slot at all (NULL,
+ * an external chain) answers false.
+ */
+static inline
+bool ft_slot_in_node(struct cds_ft_inode_flag *node_flag,
+		struct cds_ft_inode_flag **slot)
+{
+	const char *body;
+
+	if (!node_flag || !slot)
+		return false;
+	/* Skip before external: a skip pointer's low bits read as external. */
+	node_flag = ft_skip_child_ptr(node_flag);
+	if (ft_node_compressed(node_flag))
+		return slot == &ft_compressed_node_ptr(node_flag)->child;
+	if (!ft_node_internal(node_flag))
+		return false;
+	body = (const char *) ft_node_ptr(node_flag);
+	if (!body)
+		return false;
+	return (const char *) slot >= body &&
+		(const char *) slot < body +
+			((size_t) 1 << ft_types[ft_node_type(node_flag)].order);
+}
+
 
 #ifdef FT_ENABLE_TRACING
 #include <stdio.h>
