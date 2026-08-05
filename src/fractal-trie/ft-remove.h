@@ -1167,8 +1167,19 @@ int ft_detach_node(struct cds_ft *ft,
 	 * silently, with a byte and a child count that are both innocent.  So the
 	 * value is captured WHERE THE CLIMB USES IT: at entry for a plan that never
 	 * elevates, and at each elevation for the level it just decided to prune.
+	 *
+	 * The FIRST elevation is the load-bearing one and gets its value from the
+	 * SAME load that produced @cur (@entry_holder_raw below), not from a second
+	 * read: the two are ~300 ns apart and a peer publish lands between them.
 	 */
 	struct cds_ft_inode_flag *plan_old_child;
+	/*
+	 * The holder slot the climb starts from, and the ONE raw value it read
+	 * there -- the value @cur was resolved from.  When the climb elevates, that
+	 * slot becomes the drop target, so this pair IS its plan expected-old.
+	 */
+	struct cds_ft_inode_flag **entry_holder_slot;
+	struct cds_ft_inode_flag *entry_holder_raw;
 	/*
 	 * Snapshot of the holder slot (@detach_parent_flag_ptr) taken BEFORE
 	 * ft_node_replace_ptr overwrites @iter_node_flag with the fresh
@@ -1305,11 +1316,22 @@ int ft_detach_node(struct cds_ft *ft,
 		 */
 		unsigned int cur_rewind;
 
+		/*
+		 * ONE load feeds both @cur and @entry_holder_raw: the climb's
+		 * whole verdict about this level is derived from @cur, so the
+		 * expected-old that says "the slot still holds what I walked"
+		 * must be the SAME read that produced it.  A second load a few
+		 * hundred nanoseconds later is a coherent-pair violation, and
+		 * MEASURED to be one -- a peer's publish landing between the two
+		 * is captured as the plan's own expected value and then pruned.
+		 */
+		entry_holder_raw = (struct cds_ft_inode_flag *)
+			rcu_dereference(*detach_parent_flag_ptr);
 		cur = ft_reanchor_flag(ft,
-			ft_resolve_flip_proxy(
-				(struct cds_ft_inode_flag *) rcu_dereference(*detach_parent_flag_ptr)),
+			ft_resolve_flip_proxy(entry_holder_raw),
 			&cur_rewind);
 	}
+	entry_holder_slot = detach_parent_flag_ptr;
 	/* Plan expected-old for a detach that never elevates (see @plan_old_child). */
 	plan_old_child = (struct cds_ft_inode_flag *)
 		rcu_dereference(*detach_node_flag_ptr);
@@ -1515,11 +1537,18 @@ int ft_detach_node(struct cds_ft *ft,
 				 * Re-anchor the plan's expected-old onto the level
 				 * this iteration just decided to prune: @cur held
 				 * only the branch below, so the slot that holds @cur
-				 * is the one the drop targets, and its value HERE is
-				 * what that verdict is about (see @plan_old_child).
+				 * is the one the drop targets, and the value that
+				 * verdict rests on is the one @cur was resolved from
+				 * (see @plan_old_child).  For the entry holder that
+				 * value is already in hand -- reusing it is what keeps
+				 * the pair coherent; deeper levels reach @cur through
+				 * the back-pointer chain and have no earlier read.
 				 */
-				plan_old_child = (struct cds_ft_inode_flag *)
-					rcu_dereference(*detach_node_flag_ptr);
+				plan_old_child = detach_node_flag_ptr ==
+						entry_holder_slot ?
+					entry_holder_raw :
+					(struct cds_ft_inode_flag *)
+						rcu_dereference(*detach_node_flag_ptr);
 			}
 			cur_depth -= ft_parent_depth_span(parent_nf, cur);
 			cur = parent_nf;
