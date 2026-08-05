@@ -1545,6 +1545,41 @@ ft_check_popcount_1l_idx_assumptions(void)
 		 (((unsigned long) (type_idx) << FT_INTERNAL_BITS) |	\
 		  FT_INTERNAL_MASK)))
 
+/*
+ * The type index a tagged pointer carries when it names no node type:
+ * NODE_INDEX_NULL, which no real node is ever allocated with.
+ *
+ * A parked flip PROXY is exactly that, on purpose -- it is encoded as a
+ * synthetic internal node of the maximal type index (ft-helpers.h), so every
+ * caller that reaches a descent step still holding an unresolved proxy
+ * dispatches to here.
+ *
+ * This arm used to be __builtin_unreachable(), on the premise that such an
+ * index is "never encoded in a tagged pointer".  The proxy encoding makes that
+ * premise false, and being wrong about it cost the worst failure shape
+ * available: the compiler is entitled to index past the end of the jump table,
+ * so an unresolved proxy became a wild jump to a non-executable address --
+ * SIGILL, no diagnostic, nothing on the stack but a return address in the
+ * caller.  That is how the free-walk defect presented, and why it took a
+ * bisect and a hand-rolled probe to place rather than one assert.
+ *
+ * Answer "no child" instead.  Every caller already handles NULL: it is what an
+ * external or compressed parent returns from the tag test above, and what the
+ * reader descent turns into CDS_FT_STATUS_NOT_FOUND.  So a caller bug degrades
+ * to a miss it can cope with rather than to undefined control flow, and the
+ * debug build names the culprit first, with the frame still intact.
+ */
+static inline_lookup
+struct cds_ft_inode_flag *ft_node_dispatch_untyped(
+		struct cds_ft_inode_flag *node_flag,
+		struct cds_ft_inode_flag ***node_flag_ptr)
+{
+	ft_assert_resolved(node_flag);
+	if (caa_unlikely(node_flag_ptr))
+		*node_flag_ptr = NULL;
+	return NULL;
+}
+
 static inline_lookup
 struct cds_ft_inode_flag *ft_node_get_nth_skip(struct cds_ft_inode_flag *node_flag,
 		struct cds_ft_inode_flag ***node_flag_ptr,
@@ -1592,11 +1627,8 @@ struct cds_ft_inode_flag *ft_node_get_nth_skip(struct cds_ft_inode_flag *node_fl
 		return ft_pigeon_node_get_nth(NULL,
 			FT_NODE_SUB_TAG(node_flag, 6), node_flag_ptr, n, pf_hint);
 	default:
-		/*
-		 * type_index is a 3-bit field; values 7+ are NODE_INDEX_NULL,
-		 * never encoded in a tagged pointer.
-		 */
-		__builtin_unreachable();
+		/* NODE_INDEX_NULL: no node type. See ft_node_dispatch_untyped. */
+		return ft_node_dispatch_untyped(node_flag, node_flag_ptr);
 	}
 #else
 	switch (type_index) {
@@ -1619,7 +1651,8 @@ struct cds_ft_inode_flag *ft_node_get_nth_skip(struct cds_ft_inode_flag *node_fl
 		return ft_pigeon_node_get_nth(NULL,
 			FT_NODE_SUB_TAG(node_flag, 5), node_flag_ptr, n, pf_hint);
 	default:
-		__builtin_unreachable();
+		/* NODE_INDEX_NULL: no node type. See ft_node_dispatch_untyped. */
+		return ft_node_dispatch_untyped(node_flag, node_flag_ptr);
 	}
 #endif
 }
@@ -1678,7 +1711,8 @@ struct cds_ft_inode_flag *ft_node_get_nth_skip_pretyped(
 			FT_NODE_SUB_TAG_NOSKIP(node_flag, 6),
 			node_flag_ptr, n, pf_hint);
 	default:
-		__builtin_unreachable();
+		/* NODE_INDEX_NULL: no node type. See ft_node_dispatch_untyped. */
+		return ft_node_dispatch_untyped(node_flag, node_flag_ptr);
 	}
 #else
 	switch (type_index) {
@@ -1707,7 +1741,8 @@ struct cds_ft_inode_flag *ft_node_get_nth_skip_pretyped(
 			FT_NODE_SUB_TAG_NOSKIP(node_flag, 5),
 			node_flag_ptr, n, pf_hint);
 	default:
-		__builtin_unreachable();
+		/* NODE_INDEX_NULL: no node type. See ft_node_dispatch_untyped. */
+		return ft_node_dispatch_untyped(node_flag, node_flag_ptr);
 	}
 #endif
 }
