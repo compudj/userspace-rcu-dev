@@ -372,6 +372,28 @@ sweep:
  * NULL if the key is absent or its path traverses a non-plain-internal node.
  */
 /*
+ * Does @flag (a value from _cds_ft_debug_child_at) carry a CO-LOCATED external
+ * chain -- a key ending exactly at this node's position?
+ *
+ * Test-only, and for the same reason as the compressed query beside it: a test
+ * that builds this shape to reach a branch gated on it must be able to say it
+ * built it, or asserting the outcome alone passes on any other refusal.
+ */
+int _cds_ft_debug_flag_has_external_chain(struct cds_ft *ft, void *flag)
+{
+	struct cds_ft_inode_flag *nf = (struct cds_ft_inode_flag *) flag;
+	struct cds_ft_metadata *meta;
+
+	if (!nf || ft_node_external(nf))
+		return 0;
+	nf = ft_resolve_flip_proxy(nf);
+	if (ft_node_compressed(nf))
+		return 0;	/* a compressed node never carries one */
+	meta = ft_flag_to_metadata(ft, nf);
+	return meta && meta->external_nodes ? 1 : 0;
+}
+
+/*
  * Is path compression compiled in?
  *
  * Test-only.  A test that builds a compressed shape must tell "this build cannot

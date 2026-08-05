@@ -54,7 +54,7 @@
  * at RUNTIME by ft->lock_fine, so the _DLM suffix names this group of lock-set
  * tests -- it does NOT select a build.
  */
-#define NR_TESTS_DLM 11		/* cow_stop_root_inplace, rekey_graft_{simple,liston,cross_junction,glue_dst,glue_dst_branch_child}, rekey_merge_{occupied,occupied_liston,interleave_liston,collide}_dst, rekey_merge_compressed_top_refused */
+#define NR_TESTS_DLM 12		/* cow_stop_root_inplace, rekey_graft_{simple,liston,cross_junction,glue_dst,glue_dst_branch_child}, rekey_merge_{occupied,occupied_liston,interleave_liston,collide}_dst, rekey_merge_compressed_top_refused */
 
 /*
  * Tests needing DLM *and* fault injection in one build: the merge overlap-spine
@@ -279,6 +279,7 @@ extern void *_cds_ft_debug_root(struct cds_ft *ft);
 extern int _cds_ft_debug_cow_replace_root(struct cds_ft *ft);
 extern int _cds_ft_debug_flag_is_compressed(void *flag);
 extern int _cds_ft_debug_compress_enabled(void);
+extern int _cds_ft_debug_flag_has_external_chain(struct cds_ft *ft, void *flag);
 extern void *_cds_ft_debug_child_at(struct cds_ft *ft, const uint8_t *key,
 		size_t key_len);
 extern int _cds_ft_debug_rekey_graft_simple(struct cds_ft *ft,
@@ -1094,6 +1095,196 @@ out_locked:
 	fprintf(stderr, "rekey-merge: setup insert failed\n");
 out:
 	if (drain_and_destroy(ft, group) < 0)
+		rc = -1;
+	return rc;
+}
+
+/*
+ * THE MERGE ARM'S CO-LOCATED-CHAIN REFUSAL -- the second of the merge arm's two
+ * shapes, and the proof that this refusal is TOTAL too.
+ *
+ *	if (merge_dst && s_top_meta->external_nodes)
+ *		return -EINVAL;
+ *
+ * A co-located external chain is the key that ends exactly AT the source prefix,
+ * carried on S_top's metadata rather than below it.  ft_rekey_cow_stop carries it
+ * across, and the merge arm skips cow_stop -- so ft_merge_build would have to
+ * union that key into the destination's own chain, which nothing has tested.
+ *
+ * THE GROUP MUST BE VARIABLE-LENGTH: a co-located key is SHORTER than the keys
+ * of the subtree it sits on, which a fixed-length group cannot express.  That is
+ * the whole reason this shape needs its own test rather than a flag on the
+ * compressed-top one beside it.
+ *
+ * ★ AND S_top MUST NOT BE COMPRESSED.  The compressed-top refusal is checked
+ * FIRST, so a single-key subtree here would land on THAT branch and this test
+ * would pass having never reached the one it is named for.  Hence two suffix
+ * keys under the prefix: enough that S_top stays a plain internal node.
+ *
+ * Asserts the refusal is TOTAL, exactly as the compressed-top test does: refused,
+ * and the trie is as it was -- dst child pointer unchanged, src child pointer
+ * unchanged, key count unchanged, the co-located key and both suffixes still at
+ * the source, the occupant intact, verify clean.
+ *
+ * When the cut widens to admit a co-located chain on the merge arm, flip this to
+ * expect rc == 0 and assert the co-located key arrives at the destination -- it
+ * is the one most likely to be dropped, being the one that is not below S_top.
+ */
+static int test_rekey_merge_colocated_chain_refused(void)
+{
+	struct cds_ft_group *group = NULL;
+	struct cds_ft *ft = NULL;
+	uint8_t src_key[2] = { RK_SX, RK_SY }, dst_key[2] = { RK_DX, RK_DZ };
+	uint8_t colo[2] = { RK_SX, RK_SY };
+	uint8_t sfx[2][3] = { { RK_SX, RK_SY, 0x11 }, { RK_SX, RK_SY, 0x12 } };
+	uint8_t occ[2][3] = { { RK_DX, RK_DZ, 0x41 }, { RK_DX, RK_DZ, 0x42 } };
+	uint8_t dsib[2][2] = { { RK_DX, 0x01 }, { RK_DX, 0x02 } };
+	void *before, *after, *src_before, *src_after;
+	unsigned long cnt_before, cnt_after;
+	struct cds_ft_node *f = NULL;
+	int i, rc = -1;
+
+	if (!cds_ft_merge_enabled()) {
+		diag("test_rekey_merge_colocated_chain_refused: skipped, merge "
+			"compiled out (-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
+	{
+		/* VARIABLE-length (a co-located key is shorter), EAGER, FINE, list off. */
+		struct cds_ft_group_attr *gattr;
+
+		if (cds_ft_group_attr_create(&gattr) < 0)
+			abort();
+		if (cds_ft_group_attr_set_max_key_len(gattr, 4) < 0 ||
+				cds_ft_group_attr_set_lookup_optimization(gattr,
+					CDS_FT_LOOKUP_OPTIMIZE_EAGER) < 0 ||
+				cds_ft_group_attr_set_writer_strategy(gattr,
+					CDS_FT_WRITER_LOCK_FINE) < 0 ||
+				cds_ft_group_attr_set_ordered_list(gattr, false) < 0)
+			abort();
+		if (cds_ft_group_create(gattr, &group) < 0)
+			abort();
+		cds_ft_group_attr_destroy(gattr);
+		if (cds_ft_create(group, NULL, &ft) < 0)
+			abort();
+	}
+
+	rcu_read_lock();
+	/* The co-located key: ends AT the source prefix. */
+	if (cds_ft_insert(ft, colo, 2, &node_alloc(1)->node) != CDS_FT_STATUS_OK)
+		goto out_locked;
+	/* TWO suffixes, so S_top stays a plain internal (see the header). */
+	for (i = 0; i < 2; i++)
+		if (cds_ft_insert(ft, sfx[i], 3, &node_alloc((uint64_t) (10 + i))->node)
+				!= CDS_FT_STATUS_OK)
+			goto out_locked;
+	/* BP siblings: the source junction must survive losing S_top. */
+	for (i = 0; i < RK_NSIB; i++) {
+		uint8_t sk[2] = { RK_SX, (uint8_t) (i + 5) };
+
+		if (cds_ft_insert(ft, sk, 2, &node_alloc((uint64_t) (20 + i))->node)
+				!= CDS_FT_STATUS_OK)
+			goto out_locked;
+	}
+	/* The OCCUPIED destination, plus siblings so its parent is a real junction. */
+	for (i = 0; i < 2; i++)
+		if (cds_ft_insert(ft, occ[i], 3, &node_alloc((uint64_t) (30 + i))->node)
+					!= CDS_FT_STATUS_OK ||
+				cds_ft_insert(ft, dsib[i], 2,
+					&node_alloc((uint64_t) (40 + i))->node)
+					!= CDS_FT_STATUS_OK)
+			goto out_locked;
+	before = _cds_ft_debug_child_at(ft, dst_key, 2);
+	src_before = _cds_ft_debug_child_at(ft, src_key, 2);
+	cnt_before = cds_ft_count_keys(ft);
+	rcu_read_unlock();
+
+	/* Every half of the shape, or the test passes without reaching its branch. */
+	if (!before) {
+		fprintf(stderr, "rekey-merge-cc: dst is NOT occupied -- this would "
+			"take the graft path\n");
+		goto out;
+	}
+	if (!src_before) {
+		fprintf(stderr, "rekey-merge-cc: no S_top at the source prefix\n");
+		goto out;
+	}
+	if (_cds_ft_debug_flag_is_compressed(src_before)) {
+		fprintf(stderr, "rekey-merge-cc: S_top is COMPRESSED -- the "
+			"compressed-top refusal is checked FIRST, so this test would "
+			"not reach the co-located branch it exists for\n");
+		goto out;
+	}
+	if (!_cds_ft_debug_flag_has_external_chain(ft, src_before)) {
+		fprintf(stderr, "rekey-merge-cc: S_top carries NO co-located chain -- "
+			"the key ending at the source prefix did not land on it\n");
+		goto out;
+	}
+
+	/* The move takes the gate + a grace period: NOT from a read section. */
+	rc = _cds_ft_debug_rekey_graft_simple(ft, src_key, 2, dst_key, 2);
+	if (rc == 0) {
+		fprintf(stderr, "rekey-merge-cc: the writer ACCEPTED a co-located "
+			"chain on the merge arm -- if the cut was widened deliberately, "
+			"this test is the acceptance test and must now assert that the "
+			"co-located key arrived at the destination\n");
+		rc = -1;
+		goto out;
+	}
+	rc = -1;
+
+	/* The refusal must be TOTAL. */
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "rekey-merge-cc: verify failed after a REFUSED move\n");
+		goto out;
+	}
+	rcu_read_lock();
+	after = _cds_ft_debug_child_at(ft, dst_key, 2);
+	src_after = _cds_ft_debug_child_at(ft, src_key, 2);
+	cnt_after = cds_ft_count_keys(ft);
+	rcu_read_unlock();
+	if (after != before || src_after != src_before) {
+		fprintf(stderr, "rekey-merge-cc: a child pointer CHANGED across a "
+			"refused move (dst %p->%p, src %p->%p)\n",
+			before, after, src_before, src_after);
+		goto out;
+	}
+	if (cnt_after != cnt_before) {
+		fprintf(stderr, "rekey-merge-cc: key count %lu != %lu across a "
+			"refused move\n", cnt_after, cnt_before);
+		goto out;
+	}
+	rcu_read_lock();
+	if (cds_ft_eager_lookup_key(ft, colo, 2, 0, &f) != CDS_FT_STATUS_OK) {
+		rcu_read_unlock();
+		fprintf(stderr, "rekey-merge-cc: the CO-LOCATED key was lost to a "
+			"refused move\n");
+		goto out;
+	}
+	for (i = 0; i < 2; i++) {
+		f = NULL;
+		if (cds_ft_eager_lookup_key(ft, sfx[i], 3, 0, &f) !=
+				CDS_FT_STATUS_OK) {
+			rcu_read_unlock();
+			fprintf(stderr, "rekey-merge-cc: source suffix %d lost\n", i);
+			goto out;
+		}
+		f = NULL;
+		if (cds_ft_eager_lookup_key(ft, occ[i], 3, 0, &f) !=
+				CDS_FT_STATUS_OK) {
+			rcu_read_unlock();
+			fprintf(stderr, "rekey-merge-cc: dst occupant %d lost\n", i);
+			goto out;
+		}
+	}
+	rcu_read_unlock();
+	rc = 0;
+	goto out;
+out_locked:
+	rcu_read_unlock();
+	fprintf(stderr, "rekey-merge-cc: setup insert failed\n");
+out:
+	if (ft && drain_and_destroy(ft, group) < 0)
 		rc = -1;
 	return rc;
 }
@@ -31627,6 +31818,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_rekey_graft_simple);
 	RUN_TEST(test_rekey_merge_occupied_dst);
 	RUN_TEST(test_rekey_merge_compressed_top_refused);
+	RUN_TEST(test_rekey_merge_colocated_chain_refused);
 	RUN_TEST(test_rekey_merge_occupied_dst_liston);
 	RUN_TEST(test_rekey_merge_interleave_liston);
 	RUN_TEST(test_rekey_merge_collide_dst);
