@@ -1147,8 +1147,28 @@ int ft_detach_node(struct cds_ft *ft,
 	 * child ancestors and the original detach target (the elevation
 	 * walk only crosses nodes with nr_child==1, so the underlying
 	 * chain reaches the original detach child).
+	 *
+	 * It is equally the PLAN EXPECTED-OLD handed to ft_node_replace_ptr:
+	 * the orphan set, the count fold and the drop all name THIS subtree,
+	 * so a DEL recompaction that finds another one at the slot is working
+	 * from a plan a peer has already invalidated (-EAGAIN, re-descend).
 	 */
 	struct cds_ft_inode_flag *elevated_old_child;
+	/*
+	 * The same slot's value as the CLIMB read it -- the plan's expected-old.
+	 *
+	 * The climb decides "every level from the holder up to here holds only the
+	 * branch we are removing, so prune at this slot" from the nr_child of the
+	 * nodes it walks.  That verdict is about the SUBTREE the slot held THEN.  A
+	 * peer that republishes the slot mid-climb (an insert splitting the chain
+	 * below, whose fresh junction carries the removed key AND the peer's own)
+	 * makes the verdict false, and re-reading the slot after the climb adopts
+	 * the peer's subtree into the plan -- the prune then unlinks a live key,
+	 * silently, with a byte and a child count that are both innocent.  So the
+	 * value is captured WHERE THE CLIMB USES IT: at entry for a plan that never
+	 * elevates, and at each elevation for the level it just decided to prune.
+	 */
+	struct cds_ft_inode_flag *plan_old_child;
 	/*
 	 * Snapshot of the holder slot (@detach_parent_flag_ptr) taken BEFORE
 	 * ft_node_replace_ptr overwrites @iter_node_flag with the fresh
@@ -1290,6 +1310,9 @@ int ft_detach_node(struct cds_ft *ft,
 				(struct cds_ft_inode_flag *) rcu_dereference(*detach_parent_flag_ptr)),
 			&cur_rewind);
 	}
+	/* Plan expected-old for a detach that never elevates (see @plan_old_child). */
+	plan_old_child = (struct cds_ft_inode_flag *)
+		rcu_dereference(*detach_node_flag_ptr);
 	cur_depth = detach_depth - ft_parent_depth_span(cur, *detach_node_flag_ptr);
 
 	/*
@@ -1488,6 +1511,15 @@ int ft_detach_node(struct cds_ft *ft,
 					break;
 				detach_node_flag_ptr = detach_parent_flag_ptr;
 				detach_parent_flag_ptr = new_parent_flag_ptr;
+				/*
+				 * Re-anchor the plan's expected-old onto the level
+				 * this iteration just decided to prune: @cur held
+				 * only the branch below, so the slot that holds @cur
+				 * is the one the drop targets, and its value HERE is
+				 * what that verdict is about (see @plan_old_child).
+				 */
+				plan_old_child = (struct cds_ft_inode_flag *)
+					rcu_dereference(*detach_node_flag_ptr);
 			}
 			cur_depth -= ft_parent_depth_span(parent_nf, cur);
 			cur = parent_nf;
@@ -1510,6 +1542,16 @@ int ft_detach_node(struct cds_ft *ft,
 	 */
 	if (caa_unlikely(ft_node_flip_proxy(iter_node_flag) ||
 			ft_node_flip_proxy(elevated_old_child)))
+		return -EAGAIN;
+	/*
+	 * PLAN EXPECTED-OLD, enforced (see @plan_old_child): everything below --
+	 * the orphan set walked from @elevated_old_child, the count fold, and the
+	 * drop itself -- names the subtree the climb condemned.  A peer that
+	 * republished this slot since has put a DIFFERENT subtree here, one no
+	 * level of the climb ever counted, so the whole plan is void.  Nothing is
+	 * built, locked or reserved yet: re-descend against the settled tree.
+	 */
+	if (caa_unlikely(elevated_old_child != plan_old_child))
 		return -EAGAIN;
 	/* Plan-snapshot the holder slot before any recompaction overwrite. */
 	holder_old_flag = iter_node_flag;
@@ -2164,6 +2206,7 @@ int ft_detach_node(struct cds_ft *ft,
 			}
 			ret = ft_node_replace_ptr(ft,
 				detach_node_flag_ptr,
+				elevated_old_child,
 				&iter_node_flag,
 				&old_recompacted_node,
 				metadata_stack[nr_branch - 1],

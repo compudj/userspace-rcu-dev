@@ -1100,6 +1100,14 @@ unsigned int find_nearest_type_index(unsigned int type_index,
  * new node's slots, but the re-parent loop is skipped entirely.  See
  * ft_node_set_nth and the rcu-mutation build-invisible pattern.
  *
+ * @nullify_expected (FT_RECOMPACT_DEL only): the child the CALLER's plan drops,
+ * sampled from @nullify_node_flag_ptr when that plan was built.  The DEL arm
+ * identifies its victim by re-reading the slot under the F2 fence, so without
+ * this expected-old it drops whatever the slot holds THEN -- which, after a peer
+ * republished the slot between the plan and the fence, is the peer's freshly
+ * published subtree, silently dropping keys the plan never covered.  Mismatch is
+ * a stale plan: -EAGAIN, re-descend.
+ *
  * @rec: the accumulator for reader-visible forward stores.
  *  - The forward publish into @old_node_flag_ptr is recorded into @rec ONLY for
  *    FT_RECOMPACT_RELOCATE, where @old_node_flag_ptr is the LIVE slot and the
@@ -1129,6 +1137,7 @@ int ft_node_recompact(enum ft_recompact mode,
 		struct cds_ft_inode_flag **old_node_flag_ptr, uint8_t n,
 		struct cds_ft_inode_flag *child_node_flag,
 		struct cds_ft_inode_flag **nullify_node_flag_ptr,
+		struct cds_ft_inode_flag *nullify_expected,
 		struct cds_ft_inode **old_node_ret,
 		bool is_root,
 		unsigned int node_depth __attribute__((unused)),
@@ -1604,6 +1613,24 @@ int ft_node_recompact(enum ft_recompact mode,
 	if (mode == FT_RECOMPACT_DEL) {
 		nullify_val = rcu_dereference(*nullify_node_flag_ptr);
 		if (caa_unlikely(ft_node_flip_proxy(nullify_val))) {
+			ret = -EAGAIN;
+			goto abandon_fresh;
+		}
+		/*
+		 * PLAN EXPECTED-OLD (@nullify_expected, header): the caller
+		 * named a subtree to drop; this read only names the slot.  A
+		 * peer that republished the slot between the two -- an insert
+		 * splitting the compressed chain here, say, whose fresh junction
+		 * carries the caller's target AND the peer's own key -- makes
+		 * the two differ, and copying "every child except this slot"
+		 * then drops the peer's subtree whole.  The F2 fence does not
+		 * cover it: the peer's publish is serialized correctly, BEFORE
+		 * the mark, so the mark's snapshot already contains it.  A stale
+		 * plan cannot be repaired here (the caller's orphan set and
+		 * count fold derive from the same sample), so bail to the op's
+		 * re-descend.
+		 */
+		if (caa_unlikely(nullify_val != nullify_expected)) {
 			ret = -EAGAIN;
 			goto abandon_fresh;
 		}
@@ -2755,14 +2782,14 @@ int ft_node_set_nth_rec(struct cds_ft *ft,
 		/* Not enough space in node, need to recompact to next type. */
 		ret = ft_node_recompact(FT_RECOMPACT_ADD_NEXT, ft, type_index, type, node,
 					metadata, node_flag, n, child_node_flag, NULL,
-					old_node_ret, false, node_depth, cluster_leaf,
+					NULL, old_node_ret, false, node_depth, cluster_leaf,
 					rec, retire_txn, inh_hint);
 		break;
 	case -ERANGE:
 		/* Node needs to be recompacted. */
 		ret = ft_node_recompact(FT_RECOMPACT_ADD_SAME, ft, type_index, type, node,
 					metadata, node_flag, n, child_node_flag, NULL,
-					old_node_ret, false, node_depth, cluster_leaf,
+					NULL, old_node_ret, false, node_depth, cluster_leaf,
 					rec, retire_txn, inh_hint);
 		break;
 	}
@@ -2797,10 +2824,16 @@ int ft_node_set_nth(struct cds_ft *ft,
 
 /*
  * Return 0 on success or negative error value on error.
+ *
+ * @node_flag_expected: the child value @node_flag_ptr held when the CALLER built
+ * its plan -- the subtree this replace drops (delete) or displaces (external
+ * promote).  Threaded to ft_node_recompact's DEL arm as its plan expected-old
+ * (see its header); a peer republish of the slot since the plan is -EAGAIN.
  */
 static
 int ft_node_replace_ptr(struct cds_ft *ft,
 		struct cds_ft_inode_flag **node_flag_ptr,		/* Pointer to location to nullify */
+		struct cds_ft_inode_flag *node_flag_expected,
 		struct cds_ft_inode_flag **parent_node_flag_ptr,	/* Address of parent ptr in its parent */
 		struct cds_ft_inode **old_node_ret,
 		struct cds_ft_metadata *metadata,			/* of parent */
@@ -2852,7 +2885,8 @@ int ft_node_replace_ptr(struct cds_ft *ft,
 		/* Should try recompaction. */
 		ret = ft_node_recompact(FT_RECOMPACT_DEL, ft, type_index, type, node,
 				metadata, parent_node_flag_ptr, n, NULL,
-				node_flag_ptr, old_node_ret, is_root, node_depth,
+				node_flag_ptr, node_flag_expected,
+				old_node_ret, is_root, node_depth,
 				false, NULL, retire_txn, held_hint);
 	}
 	if (ret == 0)
