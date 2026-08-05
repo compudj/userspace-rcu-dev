@@ -35,8 +35,8 @@
  * edges.  That single property collapses three jobs a separate membership word
  * cannot do at once:
  *
- *   membership   owner != NULL, and it cannot desynchronise from the links
- *                because it is not separately maintained;
+ *   membership   owner names a deque, and it cannot desynchronise from the
+ *                links because it is not separately maintained;
  *   identity     the pointer IS the deque, so a node knows which one it is on;
  *   exclusion    the commit is the exclusion.  No claim protocol, no BUSY
  *                state: two concurrent pushes of one node both CAS
@@ -63,6 +63,14 @@
  * Nodes are NOT reset on removal: next/prev keep stale values, which is safe
  * because nothing dereferences them (a later push only reads and CASes them
  * away) and it saves two slots per removal.  owner is the only witness.
+ *
+ * And because owner is that one witness, it is also where RECLAMATION is
+ * expressed.  A caller that removes a node and frees it needs "removed, and no
+ * push may ever queue it again" to be ONE decision; a remove followed by a
+ * separate flag check is a window, not a guarantee.  So owner takes a third,
+ * terminal value -- see URCU_TXN_DEQUE_POISON and remove_seal below.  Callers
+ * that only ever push and remove can ignore it entirely, except for one thing:
+ * ask membership with urcu_txn_deque_queued(), not `owner() != NULL`.
  */
 
 #ifndef _URCU_RCU_TXN_DEQUE_H
@@ -111,6 +119,44 @@ struct urcu_txn_deque_node {
  * tag on every transacted slot, so the value must stay even.
  */
 #define URCU_TXN_DEQUE_SEQ_STEP	2UL
+
+/*
+ * POISON -- the TERMINAL owner value, and the only state a node cannot leave.
+ *
+ * `owner` already gives push and remove a shared exclusion point: both CAS it,
+ * so exactly one wins.  What it could not express is "and never again", because
+ * its free value is NULL and NULL is exactly what a push wants.  A caller that
+ * removes a node and then frees it therefore has a window it cannot close from
+ * outside: between the remove's commit and the free, a concurrent push_tail may
+ * legitimately find owner == NULL and queue storage already handed to call_rcu.
+ * Checking some liveness flag OUTSIDE the commit does not close that -- it
+ * narrows it, which is a different thing and reads the same in a five-run test.
+ *
+ * The seal closes it by giving `owner` a third value no push accepts:
+ *
+ *	urcu_txn_deque_remove_seal_prepare()   owner : d    -> POISON
+ *	urcu_txn_deque_seal_prepare()          owner : NULL -> POISON
+ *
+ * Both CAS the slot every push CASes, so a seal racing a push is decided by the
+ * engine, in one commit, exactly as two pushes are.  Afterwards
+ * push_tail_prepare answers -ESTALE for ever.
+ *
+ * ⚠ THIS WIDENS WHAT `owner != NULL` MEANS.  It used to be exactly "queued";
+ * it is now "queued OR sealed".  Code asking the MEMBERSHIP question must use
+ * urcu_txn_deque_queued(), which maps POISON to NULL -- a loop shaped like
+ * `while (owner(n)) remove(n);` spins for ever on a sealed node.
+ *
+ * ⚠ TERMINAL PER LIFETIME, NOT PER ADDRESS.  urcu_txn_deque_node_init() clears
+ * it, so recycled storage starts unsealed -- which is both correct and the only
+ * way to reuse a node.  Same rule `seq` has, for the same reason.
+ *
+ * The value is a compile-time constant that is never a real deque, with bit 0
+ * clear because that bit is the engine's descriptor-proxy tag on every
+ * transacted slot.  A constant rather than the address of some object,
+ * deliberately: a static object defined in a header is per-translation-unit, so
+ * two TUs would disagree about what "sealed" is.
+ */
+#define URCU_TXN_DEQUE_POISON	((struct urcu_txn_deque *) (uintptr_t) 0x100UL)
 
 /*
  * The guard itself, compile-out-able so its load-bearingness can be MEASURED
@@ -199,6 +245,38 @@ struct urcu_txn_deque *urcu_txn_deque_owner(struct urcu_txn_deque_node *n)
 }
 
 /*
+ * Has @n been SEALED?  Terminal once true (for this lifetime of the storage).
+ *
+ * Unlike the two accessors around it this one is NOT merely a hint in the
+ * direction that matters: nothing clears POISON except node_init, so a true
+ * answer stays true.  A false answer is a hint, as ever.
+ */
+static inline
+int urcu_txn_deque_sealed(struct urcu_txn_deque_node *n)
+{
+	return urcu_txn_deque_owner(n) == URCU_TXN_DEQUE_POISON;
+}
+
+/*
+ * WHICH DEQUE HOLDS @n, or NULL -- the MEMBERSHIP question, and the one almost
+ * every caller actually wants.
+ *
+ * It exists because urcu_txn_deque_owner() stopped being able to answer it once
+ * POISON was added: a sealed node has a non-NULL owner and belongs to no deque.
+ * Use this wherever the old `owner(n) != NULL` meant "queued" -- notably in any
+ * drain loop, where the raw accessor spins for ever on a sealed node.
+ *
+ * A HINT, exactly as urcu_txn_deque_owner() is, and for the same reason.
+ */
+static inline
+struct urcu_txn_deque *urcu_txn_deque_queued(struct urcu_txn_deque_node *n)
+{
+	struct urcu_txn_deque *q = urcu_txn_deque_owner(n);
+
+	return q == URCU_TXN_DEQUE_POISON ? NULL : q;
+}
+
+/*
  * PEEK at the oldest node, or NULL if empty.  One hop off the sentinel -- not
  * a traversal: the caller may not step from the result to its successor.
  *
@@ -257,6 +335,14 @@ int urcu_txn_deque_push_tail_prepare(struct urcu_txn *txn,
 	int ret;
 
 	own = urcu_txn_load(txn, (void **) &n->owner, URCU_TXN_TAG);
+	/*
+	 * SEALED is terminal and is NOT the same answer as "already queued":
+	 * -EEXIST invites the caller to try again later, -ESTALE tells it the
+	 * node will never accept a push again.  Both are terminal for THIS
+	 * call, so both take the bracket's abandon path.
+	 */
+	if (caa_unlikely(own == (void *) URCU_TXN_DEQUE_POISON))
+		return -ESTALE;			/* sealed; never again */
 	if (own)
 		return -EEXIST;			/* already on a deque */
 	oldtail = urcu_txn_deque_resolve(
@@ -309,10 +395,17 @@ int urcu_txn_deque_push_tail_prepare(struct urcu_txn *txn,
  *
  * Returns 0, -ENOENT if @n is not queued (terminal; the caller must NOT
  * reclaim, a peer owns that), or -ENOMEM.
+ *
+ * @newowner is the value `owner` lands on: NULL for a plain remove, or
+ * URCU_TXN_DEQUE_POISON to remove AND seal in the SAME commit.  The two differ
+ * in nothing else, which is the point -- a seal is not a second operation
+ * layered on a remove, it is the same three-slot commit with one different
+ * expected-new, so there is no instant in between at which a push could win.
  */
 static inline
-int urcu_txn_deque_remove_prepare(struct urcu_txn *txn,
-		struct urcu_txn_deque *d, struct urcu_txn_deque_node *n)
+int urcu_txn_deque__remove_to(struct urcu_txn *txn,
+		struct urcu_txn_deque *d, struct urcu_txn_deque_node *n,
+		struct urcu_txn_deque *newowner)
 {
 	struct urcu_txn_deque_node *prev, *next;
 	void *own, *sq;
@@ -321,6 +414,8 @@ int urcu_txn_deque_remove_prepare(struct urcu_txn *txn,
 	own = urcu_txn_load(txn, (void **) &n->owner, URCU_TXN_TAG);
 	if (!own)
 		return -ENOENT;			/* not queued */
+	if (caa_unlikely(own == (void *) URCU_TXN_DEQUE_POISON))
+		return -ESTALE;			/* sealed: not a member */
 	if ((struct urcu_txn_deque *) own != d)
 		return -ENOENT;			/* queued elsewhere */
 	/*
@@ -366,7 +461,7 @@ int urcu_txn_deque_remove_prepare(struct urcu_txn *txn,
 	if (next != &d->sentinel && next != prev)
 		URCU_TXN_DEQUE_SEQ_GUARD(txn, next);
 
-	ret = urcu_txn_store_mw(txn, (void **) &n->owner, d, NULL,
+	ret = urcu_txn_store_mw(txn, (void **) &n->owner, d, newowner,
 			URCU_TXN_TAG);
 	ret |= urcu_txn_store_mw(txn, (void **) &n->seq, sq,
 			(void *) ((uintptr_t) sq + URCU_TXN_DEQUE_SEQ_STEP),
@@ -383,6 +478,80 @@ int urcu_txn_deque_remove_prepare(struct urcu_txn *txn,
 	ret |= urcu_txn_store_mw(txn, (void **) &next->prev, n, prev,
 			URCU_TXN_TAG);
 	return ret ? -ENOMEM : 0;
+}
+
+static inline
+int urcu_txn_deque_remove_prepare(struct urcu_txn *txn,
+		struct urcu_txn_deque *d, struct urcu_txn_deque_node *n)
+{
+	return urcu_txn_deque__remove_to(txn, d, n, NULL);
+}
+
+/*
+ * REMOVE @n from @d AND SEAL IT, in one commit: owner : d -> POISON.
+ *
+ * This is what a caller that is about to FREE @n wants, and the reason it must
+ * be one commit rather than a remove followed by a seal is the instant in
+ * between: there, owner is NULL and a concurrent push_tail is entitled to win
+ * it.  Sealing is therefore an argument to the remove, not a second operation.
+ *
+ * After this returns 0 the node will never be queued again (until node_init),
+ * so the caller may hand it to call_rcu knowing no deque can come to name it.
+ *
+ * Returns 0, -ENOENT if @n is not queued or is queued elsewhere, -ESTALE if it
+ * was already sealed (terminal, and NOT an error for a caller that only wants
+ * the postcondition), or -ENOMEM.
+ */
+static inline
+int urcu_txn_deque_remove_seal_prepare(struct urcu_txn *txn,
+		struct urcu_txn_deque *d, struct urcu_txn_deque_node *n)
+{
+	return urcu_txn_deque__remove_to(txn, d, n, URCU_TXN_DEQUE_POISON);
+}
+
+/*
+ * SEAL a node that is NOT on any deque: owner : NULL -> POISON.  One slot.
+ *
+ * The companion to remove_seal for the other half of a caller's kill path --
+ * the node was never queued, or a peer removed it first.  Racing a push is
+ * decided by this single CAS: if the push wins, this answers -EEXIST and the
+ * caller re-reads and removes-and-seals instead; if this wins, the push answers
+ * -ESTALE.  There is no third outcome, which is what makes a kill path
+ * expressible as a bounded loop.
+ *
+ * NO SEQ BUMP, deliberately.  seq is bumped by every MEMBERSHIP transition so
+ * that a peer holding a derivation can tell the membership changed -- and a
+ * node that was already a non-member is in nobody's derivation.  Sealing it is
+ * a transition of the node's fate, not of its membership.
+ *
+ * Returns 0, -EEXIST if @n is currently queued (use remove_seal), -ESTALE if it
+ * was already sealed, or -ENOMEM.
+ */
+static inline
+int urcu_txn_deque_seal_prepare(struct urcu_txn *txn,
+		struct urcu_txn_deque_node *n)
+{
+	void *own = urcu_txn_load(txn, (void **) &n->owner, URCU_TXN_TAG);
+
+	if (caa_unlikely(own == (void *) URCU_TXN_DEQUE_POISON))
+		return -ESTALE;			/* already sealed */
+	if (own)
+		return -EEXIST;			/* queued: remove_seal it */
+	return urcu_txn_store_mw(txn, (void **) &n->owner, NULL,
+			URCU_TXN_DEQUE_POISON, URCU_TXN_TAG) ? -ENOMEM : 0;
+}
+
+/*
+ * UNSEAL, for storage being recycled.  Not a concurrent operation: the caller
+ * must already know no peer can reach @n -- which is exactly what having just
+ * reclaimed it after a grace period establishes.  urcu_txn_deque_node_init()
+ * does the same thing and more; this exists for callers that reuse a node in
+ * place and want to say what they mean.
+ */
+static inline
+void urcu_txn_deque_node_unseal(struct urcu_txn_deque_node *n)
+{
+	uatomic_store((void **) &n->owner, NULL, CMM_RELAXED);
 }
 
 /*
@@ -524,6 +693,23 @@ int urcu_txn_deque_remove(struct urcu_txn_deque *d,
 {
 	URCU_TXN_DEQUE_BRACKET(remove,
 		urcu_txn_deque_remove_prepare(&txn, d, n))
+}
+
+static inline
+int urcu_txn_deque_remove_seal(struct urcu_txn_deque *d,
+		struct urcu_txn_deque_node *n,
+		struct urcu_txn_domain *domain)
+{
+	URCU_TXN_DEQUE_BRACKET(remove_seal,
+		urcu_txn_deque_remove_seal_prepare(&txn, d, n))
+}
+
+static inline
+int urcu_txn_deque_seal(struct urcu_txn_deque_node *n,
+		struct urcu_txn_domain *domain)
+{
+	URCU_TXN_DEQUE_BRACKET(seal,
+		urcu_txn_deque_seal_prepare(&txn, n))
 }
 
 static inline
