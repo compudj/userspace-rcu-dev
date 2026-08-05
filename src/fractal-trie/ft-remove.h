@@ -1920,6 +1920,32 @@ int ft_detach_node(struct cds_ft *ft,
 				struct cds_ft_metadata *ometa;
 				bool require_sc;
 
+				/*
+				 * F1 / RESOLVED-POINTER CONTRACT, at every link.
+				 * The walk steps through raw child slots
+				 * (@cn->child below, and phase 2's @ocn->child):
+				 * a peer mid-commit on the chain parks a type-7
+				 * flip proxy there, and a proxy's low nibble reads
+				 * as an INTERNAL node.  Left unchecked it is
+				 * classified as one, its tag stripped into the
+				 * latch address, and ft_node_get_nth dispatches on
+				 * ft_types[7] -- the garbage jump named in
+				 * ft_node_get_nth's own header.
+				 *
+				 * Bail rather than resolve, exactly as the three
+				 * plan-lock bails in these loops do: a parked proxy
+				 * means a peer commit is in flight on the very
+				 * chain this free set is being derived from, so the
+				 * set is stale.  Nothing is published yet -- the
+				 * to_free[] walk runs BEFORE the commit and its
+				 * nodes are freed only in the !ret block -- so the
+				 * op re-descends and re-derives it.
+				 */
+				if (caa_unlikely(ft_node_flip_proxy(walk_nf))) {
+					ret = -EAGAIN;
+					goto end;
+				}
+
 				if (ft_node_skip_compressed(walk_nf)) {
 					/*
 					 * Skip-encoded elevated link: the slot value
@@ -1991,6 +2017,12 @@ int ft_detach_node(struct cds_ft *ft,
 					struct cds_ft_metadata *ometa;
 					struct cds_ft_compressed_node *ocn = NULL;
 					uintptr_t osnap = 0;
+
+					/* Same contract as phase 1 above. */
+					if (caa_unlikely(ft_node_flip_proxy(walk_nf))) {
+						ret = -EAGAIN;
+						goto end;
+					}
 
 					if (ft_node_compressed(walk_nf))
 						ocn = ft_compressed_node_ptr(walk_nf);
