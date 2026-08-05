@@ -94,6 +94,22 @@ ALL_CONFIGS=(
 	# detect is the class the missing leg hid.  The leg costs 82 s, alongside
 	# ioff's 76 s.
 	"txndbg|-DDEBUG_RCU -DURCU_TXN_DEBUG_READ_POLICY|u ion ioff imw"
+	# The FT's own resolved-pointer assertion (ft_assert_resolved): a parked
+	# flip proxy handed to an accessor that requires a resolved flag.  It is
+	# the embedder-side counterpart to txndbg's engine-side DEBUG_RCU, and it
+	# had NO config at all -- the flag appeared nowhere but its own definition,
+	# so every one of the accessors carrying it was asserting into a build
+	# nobody made.
+	#
+	# imw for the same reason txndbg needs it, only more so: a proxy is BY
+	# CONSTRUCTION another writer's, so without the MW leg this config asserts
+	# over a workload that cannot produce the thing it detects.
+	#
+	# noskip is in the CFLAGS deliberately.  The class this catches is the raw
+	# child-slot read, and skip-compression collapses the chains those reads
+	# walk -- the free-walk defect that motivated the config reproduced 10 of
+	# 10 without skip-compression and never with it.
+	"proxyassert|-DFT_DEBUG_PROXY_ASSERT -DNO_FEATURE_FT_SKIP_COMPRESSED|u ion ioff imw"
 	"noskip|-DNO_FEATURE_FT_SKIP_COMPRESSED|u ioff"
 	"nocompress|-DNO_FEATURE_FT_COMPRESS|u ioff"
 	# Concurrent legs are SAFE here since the in-place tier became runtime
