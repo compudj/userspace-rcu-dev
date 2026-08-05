@@ -78,7 +78,7 @@
  * compares the run count against this plan, so retiring a test means
  * decrementing here in the same commit.
  */
-#define NR_TESTS	(90 + NR_TESTS_REKEY_DLM)
+#define NR_TESTS	(91 + NR_TESTS_REKEY_DLM)
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -4541,6 +4541,14 @@ static int inv_rekey_public_atomic_no_gap_compressed_top(void)
  * race with a peer's legitimate removal -- it is a lost key.
  */
 #define SIBP_NW		6		/* sibling pairs */
+/*
+ * Take-back budget per published node.  Sized so that exhausting it cannot be
+ * load noise: a writer is the sole writer of its key, so a removal that is
+ * merely losing races wins within a handful of attempts.  Measured on a
+ * saturated machine (12 concurrent copies of this oracle) the honest maximum is
+ * single digits; this is four orders of magnitude above it.
+ */
+#define SIBP_TAKEBACK_TRIES	100000
 
 /* (b0,b1,b2,b3) as a fixed four-byte key. */
 static uint64_t sibp_key(uint8_t b0, uint8_t b1, uint8_t b2, uint8_t b3)
@@ -4627,30 +4635,59 @@ static void *sibp_writer(void *arg)
 		w->inflight = n;	/* the run owes this node a reclaim */
 		rcu_read_unlock();
 
-		for (a = 0; a < 100000 && !test_stop; a++)
+		for (a = 0; a < SIBP_TAKEBACK_TRIES && !test_stop; a++)
 			if (sibp_remove(w->ft, w->key, n) == CDS_FT_STATUS_OK) {
 				w->inflight = NULL;
 				break;
 			}
 		if (w->inflight) {
+			struct cds_ft_node *f = NULL;
+
 			/*
-			 * Exhausting the take-back retries is CONTENTION, not a
-			 * defect: this key is ours alone, so the removal is only
-			 * losing races.  Measured 1 run in 12 under a saturated
-			 * machine (12 concurrent copies of this oracle), and
-			 * identically with the access-discipline validator on and
-			 * off -- i.e. it is the bound, not the library.  Failing
-			 * here made the gate flaky and would have masked a real
-			 * defect behind a load artifact.
+			 * The take-back never succeeded.  Which of the two
+			 * reasons it was decides everything, and only one of them
+			 * is benign:
 			 *
-			 * Count it and stop this writer's cycle; @inflight is
-			 * reclaimed after the join, so the entries/leak checks
-			 * stay exact.  A genuine WEDGE (the defect this oracle was
-			 * built for) does not look like this -- it never completes
-			 * any cycle, which the per-writer liveness check below
-			 * catches.
+			 * SHUTDOWN -- @test_stop was raised mid-loop.  The run is
+			 * over and this writer simply stopped between its publish
+			 * and its take-back.  Count it and leave; @inflight is
+			 * reclaimed after the join so the entries/leak checks stay
+			 * exact.
+			 *
+			 * EXHAUSTED -- SIBP_TAKEBACK_TRIES removals of a key this
+			 * thread is the SOLE writer of all failed, with the run
+			 * still going.  That is not contention.  A losing race
+			 * retries and wins; this one cannot, and both shapes it
+			 * takes are defects:
+			 *   ORPHAN  the key is not findable at all -- it left the
+			 *           trie without this thread removing it, which no
+			 *           amount of contention can do.
+			 *   WEDGE   the key IS findable but cds_ft_remove refuses
+			 *           it forever, so the application can see a node
+			 *           it can never take back.
+			 * Report which, so the failure names its own shape.
 			 */
+			if (test_stop) {
+				w->stuck++;
+				goto out;
+			}
+			rcu_read_lock();
+			f = NULL;
+			if (lookup_u64(w->ft, w->key, &f) != CDS_FT_STATUS_OK)
+				f = NULL;
+			fprintf(stderr, "sibp key=%#lx: %s -- %d take-backs of a key "
+				"only this thread writes ALL failed after %lu ops, "
+				"%lu busy (lookup %s)\n", (unsigned long) w->key,
+				f ? "WEDGE" : "ORPHAN", SIBP_TAKEBACK_TRIES,
+				w->ops, w->busy,
+				f == &n->node ? "returns our node" :
+					f ? "returns ANOTHER node" : "finds nothing");
+			rcu_read_unlock();
+			if (!f)
+				w->lost++;
 			w->stuck++;
+			w->failed = 1;
+			mw_violation_snapshot();
 			goto out;
 		}
 		w->ops++;
@@ -5355,7 +5392,12 @@ out:
 	return ret;
 }
 
-static int inv_sibling_split_compress(void)
+/*
+ * @pin_prefix seeds the (p,3,guard) static key, which keeps (p,3) a branch and
+ * so confines the split-and-compress churn to the single prefix node (p,3,m).
+ * See the two arms below for what each setting buys.
+ */
+static int sibling_split_compress_body(const char *name, bool pin_prefix)
 {
 	struct cds_ft_group *group;
 	struct cds_ft *ft;
@@ -5365,33 +5407,8 @@ static int inv_sibling_split_compress(void)
 	unsigned long ops = 0, busy = 0, lost = 0, live = 0, stuck = 0;
 	uint64_t seed[SIBP_NW * 3];	/* the static keys, for the checked drain */
 	int i, ret = 0, stop_all = 0;
+	int nstatic = pin_prefix ? 3 : 2;
 
-	/*
-	 * Two writers cycling insert/remove on two SIBLING children of one
-	 * prefix, so the pair splits and path-compresses the SAME node
-	 * continuously.  No other oracle drives that shape: the disjoint-key
-	 * insert/remove oracles diverge high enough that no node is ever both
-	 * split and compressed under contention.
-	 *
-	 * It has found three defects and now passes, so it is a REGRESSION test
-	 * for them:
-	 *   - the WEDGE (@d1832abb): a removal derived its position from a
-	 *     stale node->prev naming a RETIRED holder and retried the identical
-	 *     derivation forever, holding the per-trie FIFO fair mutex.  It used
-	 *     to HANG rather than fail, which is strictly worse -- a hung suite
-	 *     scores GREEN against a gate that only counts failures.
-	 *   - an unguarded trailing skip-target retire (@9ce4c2c8).
-	 *   - the DEAD INTERIOR NODE (@c9b6391f): a compressed parent replaced
-	 *     by a freshly allocated childless internal at a non-root, which
-	 *     only an ordered walk could detect -- hence the teardown verify in
-	 *     drain_and_destroy, and cds_ft_verify's own check for it.
-	 *
-	 * The last one reproduced about 1 saturated run in 100, so treat a
-	 * single green run here as weak evidence: soak it
-	 * (fractal-trie-review-2026-06/sibp_verify_soak.sh), or build with
-	 * -DFT_DELAY_INJECT and run FT_DELAY_MODE=writer FT_DELAY_US=10, which
-	 * made that defect reproduce every run.
-	 */
 	mw_install_fatal_handler();
 	leak_reset();
 
@@ -5407,13 +5424,15 @@ static int inv_sibling_split_compress(void)
 		uint64_t sk[3];
 		int c;
 
-		/* Static shape: (p,1) (p,5) keep p a branch, (p,3,guard) keeps
-		 * (p,3) a branch, so the only node that is split and compressed
-		 * under contention is the prefix (p,3,m). */
+		/*
+		 * (p,1) and (p,5) keep p a branch in both arms.  The third seed
+		 * is the variable: it keeps (p,3) a branch too, so the collapse
+		 * stops there instead of climbing.
+		 */
 		sk[0] = sibp_key(p, 1, 0, 0);
 		sk[1] = sibp_key(p, 5, 0, 0);
 		sk[2] = sibp_key(p, 3, (uint8_t) (0x40 + i), 0);
-		for (c = 0; c < 3; c++) {
+		for (c = 0; c < nstatic; c++) {
 			if (insert_u64(ft, sk[c], node_alloc(sk[c])) !=
 					CDS_FT_STATUS_OK)
 				abort();
@@ -5486,30 +5505,30 @@ static int inv_sibling_split_compress(void)
 		if (w[i].failed)
 			ret = -1;
 		if (w[i].ops == 0) {
-			fprintf(stderr, "inv_sibling_split_compress: writer %d never "
-				"completed a cycle\n", i);
+			fprintf(stderr, "%s: writer %d never "
+				"completed a cycle\n", name, i);
 			ret = -1;
 		}
 	}
 	if (cds_ft_count_entries(ft) != live) {
-		fprintf(stderr, "inv_sibling_split_compress: entries %lu != live %lu\n",
-			cds_ft_count_entries(ft), live);
+		fprintf(stderr, "%s: entries %lu != live %lu\n",
+			name, cds_ft_count_entries(ft), live);
 		ret = -1;
 	}
-	if (verify_or_dump(ft, "inv_sibling_split_compress"))
+	if (verify_or_dump(ft, name))
 		ret = -1;
 	rcu_read_unlock();
 
-	fprintf(stderr, "# inv_sibling_split_compress: %d pairs, %lu cycles, "
+	fprintf(stderr, "# %s: %d pairs, %lu cycles, "
 		"%lu transient, %lu lost, %lu contended take-backs\n",
-		SIBP_NW, ops, busy, lost, stuck);
+		name, SIBP_NW, ops, busy, lost, stuck);
 
 	free(w);
 	/*
 	 * Attribute a drain shortfall to the removal that causes it, before the
 	 * generic drain (which then finds the trie already empty).
 	 */
-	if (sibp_drain_checked(ft, seed, SIBP_NW * 3) < 0) {
+	if (sibp_drain_checked(ft, seed, SIBP_NW * nstatic) < 0) {
 		ret = -1;
 		/*
 		 * Tear down WITHOUT another walk.  The remnant just
@@ -5528,6 +5547,63 @@ static int inv_sibling_split_compress(void)
 	if (leak_check() < 0)
 		ret = -1;
 	return ret;
+}
+
+/*
+ * Two writers cycling insert/remove on two SIBLING children of one prefix, so
+ * the pair splits and path-compresses the SAME node continuously.  No other
+ * oracle drives that shape: the disjoint-key insert/remove oracles diverge high
+ * enough that no node is ever both split and compressed under contention.
+ *
+ * This arm PINS the churn to one node with the (p,3,guard) seed, and is the
+ * regression test for the three defects it found in that confined shape:
+ *   - the WEDGE (@d1832abb): a removal derived its position from a stale
+ *     node->prev naming a RETIRED holder and retried the identical derivation
+ *     forever, holding the per-trie FIFO fair mutex.  It used to HANG rather
+ *     than fail, which is strictly worse -- a hung suite scores GREEN against a
+ *     gate that only counts failures.
+ *   - an unguarded trailing skip-target retire (@9ce4c2c8).
+ *   - the DEAD INTERIOR NODE (@c9b6391f): a compressed parent replaced by a
+ *     freshly allocated childless internal at a non-root, which only an ordered
+ *     walk could detect -- hence the teardown verify in drain_and_destroy, and
+ *     cds_ft_verify's own check for it.
+ *
+ * The last one reproduced about 1 saturated run in 100, so treat a single green
+ * run here as weak evidence: soak it
+ * (fractal-trie-review-2026-06/sibp_verify_soak.sh), or build with
+ * -DFT_DELAY_INJECT and run FT_DELAY_MODE=writer FT_DELAY_US=10, which made
+ * that defect reproduce every run.
+ */
+static int inv_sibling_split_compress(void)
+{
+	return sibling_split_compress_body("inv_sibling_split_compress", true);
+}
+
+/*
+ * The same shape with the (p,3,guard) seed DROPPED, so nothing pins the prefix
+ * and a removal's collapse climbs a level further.
+ *
+ * That one seed is what the pinned arm above buys its confinement with, and it
+ * bought silence too: the arms differ by ~13000x in sensitivity to the sibling
+ * key loss -- 0 detections in 4.8M inserts pinned, against 1 per ~360 unpinned.
+ * The pinned arm therefore CANNOT be the regression test for that defect, and
+ * read green through every session that hunted it.  A seed that holds a node's
+ * shape fixed forbids exactly the multi-level cascade this oracle exists to
+ * exercise, so the unpinned arm is the one that covers the climb.
+ *
+ * What it caught, and now guards: the prune-climb bootstrapping @cur from a
+ * separate load of the slot that holds the holder, so a peer republish left the
+ * climb walking a node the descent never reached (@2f4e9797).  Falsified both
+ * ways before landing -- RED on the parent commit, GREEN with the fix.
+ *
+ * Detectors are the body's: an insert not readable in the section that
+ * published it, a writer that completes no cycle, an allocated-but-unreachable
+ * node, a stranded seed at drain, entries != live, cds_ft_verify.
+ */
+static int inv_sibling_split_compress_unpinned(void)
+{
+	return sibling_split_compress_body("inv_sibling_split_compress_unpinned",
+		false);
 }
 
 /*
@@ -17671,6 +17747,7 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_rekey_merge_shared_dst);
 	RUN_TEST(inv_rekey_src_mutated);
 	RUN_TEST(inv_sibling_split_compress);
+	RUN_TEST(inv_sibling_split_compress_unpinned);
 	RUN_TEST(inv_concurrent_writers_shared);
 	RUN_TEST(inv_concurrent_writers_coarse_lock);
 	RUN_TEST(inv_concurrent_writers_fine_lock);
