@@ -67,7 +67,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS_REKEY_DLM	13	/* inv_rekey_graft_{disjoint,cross_junction,glue_dst,coherent_readers,shared}, inv_rekey_linearizability, inv_rekey_public_{atomic_no_gap,atomic_no_gap_varlen,atomic_no_gap_compressed_top}, inv_rekey_coarse_progress, inv_rekey_merge_{occupied,shared}_dst */
+#define NR_TESTS_REKEY_DLM	14	/* inv_rekey_graft_{disjoint,cross_junction,glue_dst,coherent_readers,shared}, inv_rekey_linearizability, inv_rekey_public_{atomic_no_gap,atomic_no_gap_varlen,atomic_no_gap_compressed_top}, inv_rekey_coarse_progress, inv_rekey_merge_{occupied,shared}_dst */
 
 /*
  * Base count = the RUN_TEST invocations in main() outside the DLM #ifdef.
@@ -3925,8 +3925,26 @@ enum rkp_mode {
 	RKP_ATOMIC_FIXED,
 	RKP_ATOMIC_VARLEN,
 	RKP_ATOMIC_COMPRESSED_TOP,
+	RKP_SPARSE_BP,	/* a 2-child source junction: OUTSIDE the atomic cut */
 	RKP_COARSE,	/* FT-wide writer lock: stages, and is the gap CONTROL */
 };
+
+/*
+ * Does @mode want the RKP_ATOMIC_FIXED group flavour (fixed-length keys, list
+ * off)?  RKP_SPARSE_BP does NOT, deliberately: a fixed-length group has no
+ * staged writer to fall back to (the staged one detaches, and a detached
+ * subtree's keys are stripped of the prefix), so a shape the atomic cut refuses
+ * there cannot move AT ALL -- cds_ft_rekey_graft returns INVALID_ARGUMENT and
+ * the arm would measure a refusal with no move behind it.  On the VARIABLE
+ * flavour the refusal routes to the staged writer instead, which is the
+ * behaviour worth pinning.  That also pairs it with
+ * inv_rekey_public_atomic_no_gap_varlen, from which it differs in the seeded
+ * GEOMETRY and nothing else.
+ */
+static bool rkp_mode_fixed_group(enum rkp_mode mode)
+{
+	return mode == RKP_ATOMIC_FIXED;
+}
 
 /*
  * What a moved key's absence MEANS for an arm, which is not the same question as
@@ -3953,7 +3971,7 @@ static struct cds_ft *create_rekey_coherent_ft(enum rkp_mode mode,
 
 	if (cds_ft_group_attr_create(&gattr) < 0)
 		abort();
-	if (mode == RKP_ATOMIC_FIXED) {
+	if (rkp_mode_fixed_group(mode)) {
 		if (cds_ft_group_attr_set_key_len(gattr, RKP_KLEN) < 0)
 			abort();
 	} else {
@@ -3968,7 +3986,7 @@ static struct cds_ft *create_rekey_coherent_ft(enum rkp_mode mode,
 				CDS_FT_WRITER_LOCK_FINE) < 0)
 		abort();
 	if (cds_ft_group_attr_set_ordered_list(gattr,
-			mode != RKP_ATOMIC_FIXED) < 0)
+			!rkp_mode_fixed_group(mode)) < 0)
 		abort();
 	if (cds_ft_group_create(gattr, &group) < 0)
 		abort();
@@ -4012,6 +4030,13 @@ struct rkp_writer_arg {
 	struct cds_ft *ft;
 	uint8_t bp, dp;			/* consecutive junction bytes, bp < dp */
 	struct ft_test_node *sib[4];	/* fixed: (bp,1) (bp,5) (dp,5) (dp,9) */
+	/*
+	 * Which of @sib this arm seeds, inclusive.  The band delimiters are 1 and
+	 * 2, so every arm seeds those; 0 and 3 are the OUTER siblings, and their
+	 * only job is to keep each junction at three children so the source
+	 * junction survives losing the run.  RKP_SPARSE_BP drops them (1..2).
+	 */
+	int sib_lo, sib_hi;
 	struct ft_test_node *top[4];	/* the run's leaves, they move */
 	int nr_run;			/* how many of @top exist (see rkp_mode) */
 	int at_dst;			/* 0: run at (bp,9); 1: run at (dp,1) */
@@ -4175,7 +4200,8 @@ static void *rkp_reader(void *arg)
 			}
 		} else if (pick < 6) {
 			/* A fixed sibling: present at every instant. */
-			int j = rand_r(&seed) & 3;
+			int j = w->sib_lo + (int) (rand_r(&seed) %
+					(unsigned int) (w->sib_hi - w->sib_lo + 1));
 			uint64_t key = rkp_sib_key(w, j);
 
 			cds_ft_u64_to_key(r->ft, key, k, RKP_KLEN);
@@ -4282,8 +4308,10 @@ static int inv_rekey_public_no_gap_run(enum rkp_mode mode, enum rkp_gap gap,
 		 * path-compresses, and the atomic writer needs a plain internal top.
 		 */
 		w[i].nr_run = (mode == RKP_ATOMIC_COMPRESSED_TOP) ? 1 : 4;
+		w[i].sib_lo = (mode == RKP_SPARSE_BP) ? 1 : 0;
+		w[i].sib_hi = (mode == RKP_SPARSE_BP) ? 2 : 3;
 		rcu_read_lock();
-		for (j = 0; j < 4; j++) {
+		for (j = w[i].sib_lo; j <= w[i].sib_hi; j++) {
 			uint64_t sk = rkp_sib_key(&w[i], j);
 
 			w[i].sib[j] = node_alloc(sk);
@@ -4299,7 +4327,8 @@ static int inv_rekey_public_no_gap_run(enum rkp_mode mode, enum rkp_gap gap,
 				abort();
 		}
 		rcu_read_unlock();
-		live += 4 + (unsigned long) w[i].nr_run;
+		live += (unsigned long) (w[i].sib_hi - w[i].sib_lo + 1) +
+			(unsigned long) w[i].nr_run;
 	}
 	for (i = 0; i < RKP_NR; i++) {
 		r[i].ft = ft;
@@ -4359,7 +4388,7 @@ static int inv_rekey_public_no_gap_run(enum rkp_mode mode, enum rkp_gap gap,
 		uint8_t X = w[i].at_dst ? w[i].dp : w[i].bp;
 		uint8_t slot = w[i].at_dst ? RKP_SLOT_DP : RKP_SLOT_BP;
 
-		for (j = 0; j < 4; j++) {
+		for (j = w[i].sib_lo; j <= w[i].sib_hi; j++) {
 			struct cds_ft_node *found = NULL;
 
 			if (rkp_lookup(ft, rkp_sib_key(&w[i], j), &found)
@@ -4462,6 +4491,45 @@ static int inv_rekey_public_atomic_no_gap(void)
  * flavour and NOTHING else, so a nonzero `absent moving` here against a zero there
  * would name the key-length generalization specifically.
  */
+/*
+ * THE SAME ARM ON A SPARSE SOURCE JUNCTION -- the geometry the atomic cut
+ * REFUSES, and the acceptance test for widening it.
+ *
+ * The other arms seed four fixed siblings per writer, two of which exist only to
+ * keep each junction at three children.  Drop those two and the source junction
+ * holds exactly the run plus one delimiter, so removing the run would collapse
+ * it: ft_rekey_graft_simple_attempt refuses on `nr_child < 3` and the move falls
+ * back to the staged writer, absence window and all.
+ *
+ * It differs from inv_rekey_public_atomic_no_gap_varlen in the seeded geometry
+ * and NOTHING else -- same group flavour, same band, same probes -- so the arms
+ * bracket the cut: one runs the atomic writer, the other is refused by it and
+ * stages.  (Pairing it with the FIXED arm instead would not work: a fixed-length
+ * group has no staged writer, so a refused shape there cannot move at all.)
+ *
+ * ★ Why this arm exists at all: EVERY shape refusal in the atomic writer counts
+ * ZERO across all five concurrent rekey oracles (measured: 190076 attempts, not
+ * one refusal of any kind), so the whole widening backlog had no coverage and
+ * widening any of it could not move a number.  This is the geometry that
+ * produces one, which had to come before the widening.
+ *
+ * Gap expectation: RKP_GAP_EXPECTED today, because the refusal routes the move
+ * to the staged writer.  Widening the cut to admit a collapsing source junction
+ * is what flips it to RKP_GAP_NONE -- and until then the arm ALSO serves as a
+ * second absence-detector control alongside inv_rekey_coarse_progress, reached
+ * by a different route (a shape refusal rather than a COARSE trie).
+ */
+static int inv_rekey_sparse_bp_staged(void)
+{
+	if (!getenv("FT_INV_MW")) {
+		fprintf(stderr, "# inv_rekey_sparse_bp_staged: skipped "
+			"(set FT_INV_MW=1 to run the concurrent-writer oracles)\n");
+		return 0;
+	}
+	return inv_rekey_public_no_gap_run(RKP_SPARSE_BP, RKP_GAP_EXPECTED,
+			"inv_rekey_sparse_bp_staged");
+}
+
 static int inv_rekey_public_atomic_no_gap_varlen(void)
 {
 	if (!getenv("FT_INV_MW")) {
@@ -17741,6 +17809,7 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_rekey_linearizability);
 	RUN_TEST(inv_rekey_public_atomic_no_gap);
 	RUN_TEST(inv_rekey_public_atomic_no_gap_varlen);
+	RUN_TEST(inv_rekey_sparse_bp_staged);
 	RUN_TEST(inv_rekey_public_atomic_no_gap_compressed_top);
 	RUN_TEST(inv_rekey_coarse_progress);
 	RUN_TEST(inv_rekey_merge_occupied_dst);
