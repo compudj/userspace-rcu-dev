@@ -1364,14 +1364,27 @@ static enum urcu_txn_status ft_ord_cell_flip_into(struct cds_ft *ft, struct ft_f
  * Commit a single edge as a lone publish.  A lone edge is ONE release store: it
  * parks no proxy, allocates no descriptor (hence is infallible -- cannot OOM),
  * and owes no grace period, so it is byte-identical to a bare rcu_assign_pointer.
+ *
+ * READERS are safe on the store alone, whatever the writer count: a single
+ * pointer-width release store is atomic and self-resolving, so a later reader
+ * loads either the old or the new pointer and never a proxy.
+ *
+ * WRITERS are safe because the slot is EXCLUDED, not because @old is checked.
+ * The store discards @old, so it cannot detect a peer that changed the slot --
+ * it would silently overwrite one.  What makes that sound is the per-node lock
+ * every caller holds over this slot: multi-writer IS the DLM lock-sets, so
+ * exclusion is what a peer is stopped by here, and the engine's expected-old is
+ * the mechanism the MULTI-slot commit needs and this one does not.  A caller
+ * that reaches here without the covering lock is therefore a lost update with
+ * nothing to catch it -- the lock-set, not this function, is where that is
+ * checked.
+ *
  * The {slot, old, new} descriptor shape is retained at the call sites for
- * uniformity, but @old is not needed under one writer and no engine transaction
- * is created for a single slot -- publishing the direct new value is atomic and
- * self-resolving (a later reader loads either the old or the new pointer, never
- * a proxy).  The lone-edge publish helpers (ft_root_edge_flip, ft_chain_next_flip,
- * the point insert/remove single-slot external_nodes publishes) and
- * ft_ord_cell_flip_try's n==1 fast path all commit through here; the edge's tag
- * is irrelevant (no proxy is installed).
+ * uniformity, so a slot can move to a multi-edge commit without reshaping its
+ * producer.  The lone-edge publish helpers (ft_root_edge_flip,
+ * ft_chain_next_flip, the point insert/remove single-slot external_nodes
+ * publishes) and ft_ord_cell_flip_try's n==1 fast path all commit through here;
+ * the edge's tag is irrelevant (no proxy is installed).
  */
 static
 void ft_ord_cell_flip_one(struct ft_ord_cell_edge *edge)
@@ -1616,13 +1629,15 @@ void ft_root_list_swap_publish(struct cds_ft *ft, struct ft_flip_txn *txn,
  * Publish a lone structural root edge as a single-edge flip descriptor.  A lone
  * edge commits as one release store (no proxy, no group flip, no grace period)
  * -- byte-identical to a bare rcu_assign_pointer -- but it is captured as a
- * {slot, old, new} descriptor edge so a future multi-writer MCAS commit covers
- * the root slot uniformly: a bare store would discard @old (the compare-and-swap
- * "expected" value) and sit outside the descriptor protocol, yet a root slot can
- * be in a concurrent writer's word-set (e.g. a near-root insert that recompacts
- * and republishes the root).  This is the ordered-list-OFF arm of every Class-G
- * root swap (detach / graft / graft_swap / merge), where there is no head/tail
- * endpoint to fuse and ft_root_list_swap_publish would reduce to this anyway.
+ * {slot, old, new} descriptor edge so the root slot keeps the same producer
+ * shape as every other publish: a root slot can be in a concurrent writer's
+ * word-set (e.g. a near-root insert that recompacts and republishes the root),
+ * and the caller's lock-set is what excludes that peer.  @old rides along
+ * unconsumed here (see ft_ord_cell_flip_one) and becomes the expected-old
+ * without reshaping this producer if the slot ever joins a multi-edge commit.
+ * This is the ordered-list-OFF arm of every Class-G root swap (detach / graft /
+ * graft_swap / merge), where there is no head/tail endpoint to fuse and
+ * ft_root_list_swap_publish would reduce to this anyway.
  */
 static
 void ft_root_edge_flip(struct cds_ft *ft,
