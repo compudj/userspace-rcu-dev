@@ -78,7 +78,7 @@
  * compares the run count against this plan, so retiring a test means
  * decrementing here in the same commit.
  */
-#define NR_TESTS	(91 + NR_TESTS_REKEY_DLM)
+#define NR_TESTS	(96 + NR_TESTS_REKEY_DLM)
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -10558,6 +10558,27 @@ static int inv_prefix_key_park_vs_holder_churn(void)
  * grafted into), which is the point: the counters, not this comment, say what
  * actually ran.  Read them.
  */
+/*
+ * What dst holds AT the graft key -- the thing that selects which arm of
+ * cds_ft_graft_swap runs at all.
+ *
+ * ★ EVERY LAYOUT BELOW PREDATING THIS FIELD BUILDS A SUBTREE THERE, which is
+ * why the probe reads ext_child=0 delegate=0 across all nine of them.  The
+ * arms are not rare, they are unreachable by FIXTURE GEOMETRY: the occupant
+ * decides, and the occupant was always the same kind of node.
+ */
+enum gs_dst_shape {
+	/* Content BELOW the key, so the occupant is an internal/compressed
+	 * subtree: FT_GRAFT_SWAP_EXACT with old_child_external false. */
+	GS_DST_SUBTREE = 0,
+	/* The key ITSELF, terminal and un-extended, so the occupant is a plain
+	 * external -- the one displaced node with no state word to fence. */
+	GS_DST_LEAF,
+	/* Nothing at the key: FT_GRAFT_SWAP_DELEGATE, which returns through
+	 * cds_ft_graft before any of the swap machinery runs. */
+	GS_DST_ABSENT,
+};
+
 struct gs_layout {
 	const char *name;
 	uint8_t dst_prefix[GS_MAX_PREFIX];
@@ -10624,6 +10645,15 @@ struct gs_layout {
 	 * arm is unreachable by GROUP CONFIGURATION, not by geometry.
 	 */
 	bool speculative;
+	/*
+	 * ★ BOTH NON-SUBTREE SHAPES SELF-CANCEL, so they need @reseed exactly
+	 * as KEY_SHORTER does.  Measured over a 20-round ring with no reseed:
+	 * GS_DST_LEAF scores ext_child=1 (the swap puts a SUBTREE at the key,
+	 * so every later round is EXACT), GS_DST_ABSENT scores delegate=7/20.
+	 * A layout that sets this without @reseed measures the arm once and
+	 * reads as coverage.
+	 */
+	enum gs_dst_shape dst_shape;
 };
 
 struct gs_shared_ctx {
@@ -10751,6 +10781,25 @@ static void gs_fill(struct cds_ft *ft, uint8_t tag, unsigned int n,
  * Fill dst and both swap tries to @lay's shape.  Called at setup and, for a
  * reseeding layout, once per round.
  */
+/* Insert @key exactly, as its own terminal key -- no tag/index suffix. */
+static void gs_insert_key(struct cds_ft *ft, const uint8_t *key,
+		unsigned int key_len)
+{
+	struct ft_test_node *node = node_alloc(0xE000);
+
+	memcpy(node->okey, key, key_len);
+	node->value = key_len;
+	if (cds_ft_insert(ft, key, key_len, &node->node) != CDS_FT_STATUS_OK)
+		abort();
+}
+
+/*
+ * A dst branch that does NOT collide with the graft key, so a layout can put
+ * the trie's bulk somewhere the swap never touches and leave the graft point
+ * holding exactly what it wants to test.
+ */
+static const uint8_t gs_dst_other[1] = { 0x60 };
+
 static void gs_seed(struct gs_shared_ctx *c, const struct gs_layout *lay)
 {
 	unsigned int i;
@@ -10763,8 +10812,28 @@ static void gs_seed(struct gs_shared_ctx *c, const struct gs_layout *lay)
 				GS_KEYS_PER_TRIE, gs_swap_prefix,
 				lay->swap_prefix_len);
 	}
-	gs_fill(c->dst, 0xD0, GS_KEYS_PER_TRIE, lay->dst_prefix,
-		lay->dst_prefix_len);
+	switch (lay->dst_shape) {
+	case GS_DST_SUBTREE:
+		gs_fill(c->dst, 0xD0, GS_KEYS_PER_TRIE, lay->dst_prefix,
+			lay->dst_prefix_len);
+		break;
+	case GS_DST_LEAF:
+		/*
+		 * The graft key itself and nothing under it, so the occupant is
+		 * a plain external.  The bulk goes on @gs_dst_other: a dst that
+		 * is ONLY this leaf would leave the swap ring emptying and
+		 * refilling a one-key trie, and the graft point would not sit
+		 * inside a populated root.
+		 */
+		gs_insert_key(c->dst, lay->dst_prefix, lay->key_len);
+		gs_fill(c->dst, 0xD0, GS_KEYS_PER_TRIE, gs_dst_other,
+			(unsigned int) sizeof gs_dst_other);
+		break;
+	case GS_DST_ABSENT:
+		gs_fill(c->dst, 0xD0, GS_KEYS_PER_TRIE, gs_dst_other,
+			(unsigned int) sizeof gs_dst_other);
+		break;
+	}
 }
 
 /*
@@ -11033,7 +11102,7 @@ static int gs_shared_oracle(const char *tname, bool list_on,
  * shape the family has always run -- FT_GRAFT_SWAP_EXACT with a plain parent.
  */
 static const struct gs_layout gs_lay_exact = {
-	"exact", { GS_SHARED_KEY }, 1, 1, 2, false, 0, false, false
+	"exact", { GS_SHARED_KEY }, 1, 1, 2, false, 0, false, false, GS_DST_SUBTREE
 };
 
 /*
@@ -11046,7 +11115,7 @@ static const struct gs_layout gs_lay_exact = {
  * still dropped; none of it had ever executed.
  */
 static const struct gs_layout gs_lay_kshort = {
-	"kshort", { GS_SHARED_KEY, 0x51, 0x52 }, 3, 2, 2, false, 0, false, false
+	"kshort", { GS_SHARED_KEY, 0x51, 0x52 }, 3, 2, 2, false, 0, false, false, GS_DST_SUBTREE
 };
 /*
  * DEPTH CONTROL: same deep dst as "kshort", but the swap key spans only the
@@ -11056,7 +11125,7 @@ static const struct gs_layout gs_lay_kshort = {
  * point's parent stopped being the root".
  */
 static const struct gs_layout gs_lay_wide = {
-	"wide", { GS_SHARED_KEY, 0x51, 0x52 }, 3, 1, 2, false, 0, false, false
+	"wide", { GS_SHARED_KEY, 0x51, 0x52 }, 3, 1, 2, false, 0, false, false, GS_DST_SUBTREE
 };
 /*
  * STABLE EXACT-UNDER-A-COMPRESSED-PARENT.  dst keys are prefix ++ 0xD0 ++ i,
@@ -11069,10 +11138,10 @@ static const struct gs_layout gs_lay_wide = {
  * every dst key shares.
  */
 static const struct gs_layout gs_lay_cparent = {
-	"cparent", { GS_SHARED_KEY, 0x51, 0xD0 }, 2, 3, 2, true, 0, false, false
+	"cparent", { GS_SHARED_KEY, 0x51, 0xD0 }, 2, 3, 2, true, 0, false, false, GS_DST_SUBTREE
 };
 static const struct gs_layout gs_lay_cparent_solo = {
-	"cparent-solo", { GS_SHARED_KEY, 0x51, 0xD0 }, 2, 3, 1, true, 0, false, false
+	"cparent-solo", { GS_SHARED_KEY, 0x51, 0xD0 }, 2, 3, 1, true, 0, false, false, GS_DST_SUBTREE
 };
 /*
  * Deep dst run, key ending inside it, and swap content carrying its own deep
@@ -11089,10 +11158,10 @@ static const struct gs_layout gs_lay_cparent_solo = {
  * which refill their sources every round).  Read the counters, not this name.
  */
 static const struct gs_layout gs_lay_ks2 = {
-	"ks2", { GS_SHARED_KEY, 0x51, 0x52 }, 3, 2, 2, false, 3, false, false
+	"ks2", { GS_SHARED_KEY, 0x51, 0x52 }, 3, 2, 2, false, 3, false, false, GS_DST_SUBTREE
 };
 static const struct gs_layout gs_lay_ks2_solo = {
-	"ks2-solo", { GS_SHARED_KEY, 0x51, 0x52 }, 3, 2, 1, false, 3, false, false
+	"ks2-solo", { GS_SHARED_KEY, 0x51, 0x52 }, 3, 2, 1, false, 3, false, false, GS_DST_SUBTREE
 };
 /*
  * SUSTAINED KEY_SHORTER.  Same deep-run layout as "kshort", rebuilt every round
@@ -11115,19 +11184,55 @@ static const struct gs_layout gs_lay_ks2_solo = {
  * chain-merging into the run it lands in.
  */
 static const struct gs_layout gs_lay_fuse = {
-	"fuse", { GS_SHARED_KEY, 0x51, 0xD0 }, 2, 3, 2, false, 0, true, true
+	"fuse", { GS_SHARED_KEY, 0x51, 0xD0 }, 2, 3, 2, false, 0, true, true, GS_DST_SUBTREE
 };
 static const struct gs_layout gs_lay_fuse_solo = {
-	"fuse-solo", { GS_SHARED_KEY, 0x51, 0xD0 }, 2, 3, 1, false, 0, true, true
+	"fuse-solo", { GS_SHARED_KEY, 0x51, 0xD0 }, 2, 3, 1, false, 0, true, true, GS_DST_SUBTREE
 };
 static const struct gs_layout gs_lay_ksfix = {
-	"ksfix", { GS_SHARED_KEY, 0x51, 0x52 }, 3, 2, 2, false, 0, true, false
+	"ksfix", { GS_SHARED_KEY, 0x51, 0x52 }, 3, 2, 2, false, 0, true, false, GS_DST_SUBTREE
 };
 static const struct gs_layout gs_lay_ksfix_solo = {
-	"ksfix-solo", { GS_SHARED_KEY, 0x51, 0x52 }, 3, 2, 1, false, 0, true, false
+	"ksfix-solo", { GS_SHARED_KEY, 0x51, 0x52 }, 3, 2, 1, false, 0, true, false, GS_DST_SUBTREE
 };
 static const struct gs_layout gs_lay_kshort_solo = {
-	"kshort-solo", { GS_SHARED_KEY, 0x51, 0x52 }, 3, 2, 1, false, 0, false, false
+	"kshort-solo", { GS_SHARED_KEY, 0x51, 0x52 }, 3, 2, 1, false, 0, false, false, GS_DST_SUBTREE
+};
+/*
+ * The two shapes the occupant -- not the key -- selects.
+ *
+ * EXTCHILD drives the EXTERNAL occupant: the graft key is itself a terminal
+ * key with nothing under it, so the displaced old-child is a plain external
+ * rather than a subtree root.  It is the one displaced node that carries NO
+ * state word, so the fencing every other shape relies on does not apply to
+ * it, and until now it had never run: ext_child=0 over ~590k attempts across
+ * the nine layouts above.
+ *
+ * DELEGATE drives the empty graft point, where the swap degenerates to
+ * cds_ft_graft and returns before any swap machinery runs.  Its value is the
+ * RACE, not the arm: the descent decides "nothing here" and then calls graft
+ * as a separate operation, so a peer that fills the graft point in between is
+ * exactly the window worth holding open.
+ *
+ * Both reseed -- they self-cancel otherwise (see @dst_shape) -- and both come
+ * with a 1-writer control, so a red result can be attributed to the peer
+ * rather than to the arm being broken outright.
+ */
+static const struct gs_layout gs_lay_extchild = {
+	"extchild", { GS_SHARED_KEY }, 1, 1, 2, true, 0, true, false,
+	GS_DST_LEAF
+};
+static const struct gs_layout gs_lay_extchild_solo = {
+	"extchild-solo", { GS_SHARED_KEY }, 1, 1, 1, true, 0, true, false,
+	GS_DST_LEAF
+};
+static const struct gs_layout gs_lay_delegate = {
+	"delegate", { GS_SHARED_KEY }, 1, 1, 2, true, 0, true, false,
+	GS_DST_ABSENT
+};
+static const struct gs_layout gs_lay_delegate_solo = {
+	"delegate-solo", { GS_SHARED_KEY }, 1, 1, 1, true, 0, true, false,
+	GS_DST_ABSENT
 };
 
 /*
@@ -11139,10 +11244,10 @@ static const struct gs_layout gs_lay_kshort_solo = {
  * the pcn body the merged node is built from).
  */
 static const struct gs_layout gs_lay_deep = {
-	"deep", { GS_SHARED_KEY, 0x51 }, 2, 2, 2, false, 0, false, false
+	"deep", { GS_SHARED_KEY, 0x51 }, 2, 2, 2, false, 0, false, false, GS_DST_SUBTREE
 };
 static const struct gs_layout gs_lay_deep_solo = {
-	"deep-solo", { GS_SHARED_KEY, 0x51 }, 2, 2, 1, false, 0, false, false
+	"deep-solo", { GS_SHARED_KEY, 0x51 }, 2, 2, 1, false, 0, false, false, GS_DST_SUBTREE
 };
 
 static int inv_graft_swap_shared_dst(void)
@@ -11263,6 +11368,31 @@ static int inv_graft_swap_shared_dst_deep_solo(void)
 {
 	return gs_shared_oracle("inv_graft_swap_shared_dst_deep_solo",
 		/*list_on=*/ false, &gs_lay_deep_solo);
+}
+static int inv_graft_swap_shared_dst_extchild_nolist(void)
+{
+	return gs_shared_oracle("inv_graft_swap_shared_dst_extchild_nolist",
+		/*list_on=*/ false, &gs_lay_extchild);
+}
+static int inv_graft_swap_shared_dst_extchild(void)
+{
+	return gs_shared_oracle("inv_graft_swap_shared_dst_extchild",
+		/*list_on=*/ true, &gs_lay_extchild);
+}
+static int inv_graft_swap_shared_dst_extchild_solo(void)
+{
+	return gs_shared_oracle("inv_graft_swap_shared_dst_extchild_solo",
+		/*list_on=*/ false, &gs_lay_extchild_solo);
+}
+static int inv_graft_swap_shared_dst_delegate_nolist(void)
+{
+	return gs_shared_oracle("inv_graft_swap_shared_dst_delegate_nolist",
+		/*list_on=*/ false, &gs_lay_delegate);
+}
+static int inv_graft_swap_shared_dst_delegate_solo(void)
+{
+	return gs_shared_oracle("inv_graft_swap_shared_dst_delegate_solo",
+		/*list_on=*/ false, &gs_lay_delegate_solo);
 }
 
 static int inv_merge_root_src_cross_view(void)
@@ -17885,6 +18015,11 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_graft_swap_shared_dst_ksfix);
 	RUN_TEST(inv_graft_swap_shared_dst_ksfix_nolist);
 	RUN_TEST(inv_graft_swap_shared_dst_ksfix_solo);
+	RUN_TEST(inv_graft_swap_shared_dst_extchild);
+	RUN_TEST(inv_graft_swap_shared_dst_extchild_nolist);
+	RUN_TEST(inv_graft_swap_shared_dst_extchild_solo);
+	RUN_TEST(inv_graft_swap_shared_dst_delegate_nolist);
+	RUN_TEST(inv_graft_swap_shared_dst_delegate_solo);
 	RUN_TEST(inv_graft_swap_shared_dst_kshort_solo);
 	RUN_TEST(inv_graft_swap_shared_dst_deep_solo);
 	RUN_TEST(inv_prefix_key_park_vs_holder_churn);
