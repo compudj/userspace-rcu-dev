@@ -2354,7 +2354,7 @@ static int rk_verify_keys(struct cds_ft *ft, const uint64_t *expect, int n,
 	}
 	rcu_read_lock();
 	if (cds_ft_count_entries(ft) != (unsigned long) n) {
-		fprintf(stderr, "rekey %s: count %lu != %d\n",
+		fprintf(stderr, "rekey %s: count %lu != %d\n", what,
 			cds_ft_count_entries(ft), n);
 		goto end;
 	}

@@ -9566,7 +9566,7 @@ static void *inv_rootswap_appear_reader(void *arg)
 				"a key is reachable in the structure but the"
 				" ordered-list front is stably empty -- the"
 				" empty-dst root graft published the root before"
-				" transferring the ordered-list head/tail", 0);
+				" transferring the ordered-list head/tail");
 		rcu_read_unlock();
 		rcu_quiescent_state();
 	}
@@ -9867,7 +9867,7 @@ static void *inv_rootswap_disappear_reader(void *arg)
 				"the ordered-list front is stably present but the"
 				" structure is empty -- the root_src merge swapped"
 				" src->root to empty before clearing the"
-				" ordered-list head/tail", 0);
+				" ordered-list head/tail");
 		rcu_read_unlock();
 		rcu_quiescent_state();
 	}
@@ -12728,7 +12728,7 @@ static void *inv_graft_swap_xview_reader(void *arg)
 			report_violation(ctx->test_name,
 				"structural range != STABLE ordered-list front"
 				" range -- the root graft_swap published the root"
-				" before transferring the ordered-list head/tail", 0);
+				" before transferring the ordered-list head/tail");
 		rcu_read_unlock();
 		rcu_quiescent_state();
 	}
