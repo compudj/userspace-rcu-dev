@@ -628,6 +628,31 @@ void urcu_txn_set_park_quiescent(struct urcu_txn *txn, int on)
  * WEDGE, and a wedge's stacks blame the innocent -- the threads shown running are
  * fine, and the culprit is whichever one is parked without quiescing.
  */
+#ifdef URCU_TXN_FALLBACK_STATS
+/*
+ * Escalation-lane instrumentation (opt-in, never in a shipped build).  Weak so
+ * every TU that includes this header-only engine can carry a definition and the
+ * linker folds them into one.  Read them by SAMPLING from a live thread: an
+ * exit destructor never runs on a wedged process, which is the case they exist
+ * to diagnose.
+ */
+__attribute__((weak)) unsigned long urcu_txn_stat_begin;
+__attribute__((weak)) unsigned long urcu_txn_stat_nodomain;
+__attribute__((weak)) unsigned long urcu_txn_stat_wantfb;
+__attribute__((weak)) unsigned long urcu_txn_stat_maxretry;
+__attribute__((weak)) unsigned long urcu_txn_stat_escalate;
+__attribute__((weak)) unsigned long urcu_txn_stat_exitfb;
+__attribute__((weak)) unsigned long urcu_txn_stat_infb_at_begin;
+#define URCU_TXN_STAT_INC(c)	__atomic_fetch_add(&(c), 1, __ATOMIC_RELAXED)
+#define URCU_TXN_STAT_MAX(c, v)	do {					\
+		unsigned long _v = (unsigned long) (v);			\
+		if (_v > (c)) (c) = _v;					\
+	} while (0)
+#else
+#define URCU_TXN_STAT_INC(c)	do { } while (0)
+#define URCU_TXN_STAT_MAX(c, v)	do { } while (0)
+#endif
+
 static inline
 int urcu_txn_in_fallback(void)
 {
@@ -645,6 +670,7 @@ void urcu_txn__enter_fallback(struct urcu_txn *txn)
 {
 	int was_online = 0;
 
+	URCU_TXN_STAT_INC(urcu_txn_stat_escalate);
 	urcu_txn_fb_depth++;
 	/*
 	 * Quiesce across the park when the embedder has said it is safe: see
@@ -674,6 +700,7 @@ void urcu_txn__exit_fallback(struct urcu_txn *txn)
 		uatomic_store(&txn->domain->active, 0, CMM_RELAXED);
 		txn->fb_published = 0;
 	}
+	URCU_TXN_STAT_INC(urcu_txn_stat_exitfb);
 	uatomic_store(&txn->in_fallback, 0, CMM_RELAXED);
 	urcu_txn_fb_depth--;
 	(void) cds_fair_mutex_unlock(&txn->domain->lock, &txn->waiter);
@@ -701,12 +728,20 @@ void urcu_txn__maybe_publish(struct urcu_txn *txn)
 static inline
 void urcu_txn_begin(struct urcu_txn *txn)
 {
+	URCU_TXN_STAT_INC(urcu_txn_stat_begin);
+	URCU_TXN_STAT_MAX(urcu_txn_stat_maxretry, txn->retry);
+	if (!txn->domain)
+		URCU_TXN_STAT_INC(urcu_txn_stat_nodomain);
+	if (uatomic_load(&txn->in_fallback, CMM_RELAXED))
+		URCU_TXN_STAT_INC(urcu_txn_stat_infb_at_begin);
 	txn->retrying = 0;
 	txn->nload = 0;
-	if (urcu_txn__want_fallback(txn))
+	if (urcu_txn__want_fallback(txn)) {
+		URCU_TXN_STAT_INC(urcu_txn_stat_wantfb);
 		urcu_txn__enter_fallback(txn);
-	else
+	} else {
 		urcu_txn__maybe_publish(txn);
+	}
 	txn->desc = NULL;
 	txn->esc_pending = 0;
 #ifdef URCU_TXN_ESCALATION_STATS
