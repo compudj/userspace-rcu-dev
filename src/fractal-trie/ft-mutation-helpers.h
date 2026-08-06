@@ -235,6 +235,15 @@ extern unsigned long cds_ft_probe_gs_pubok;
 #define FT_GS_PROBE_INC(c)	do { } while (0)
 #endif
 
+#ifdef FEATURE_FT_PROBE_PROMOTE
+extern unsigned long cds_ft_probe_promote_deferred;
+extern unsigned long cds_ft_probe_promote_immediate;
+extern unsigned long cds_ft_probe_promote_guarded;
+#define FT_PROMOTE_PROBE_INC(c)	__atomic_fetch_add(&(c), 1, __ATOMIC_RELAXED)
+#else
+#define FT_PROMOTE_PROBE_INC(c)	do { } while (0)
+#endif
+
 /*
  * FT bridge to the concurrent MCAS transaction engine (<urcu/rcu-txn.h>).  An
  * op records its frozen edge set {slot, old, new} DIRECTLY into the engine

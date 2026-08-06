@@ -2850,6 +2850,26 @@ int ft_node_replace_ptr(struct cds_ft *ft,
 	const struct cds_ft_type *type;
 	struct cds_ft_inode *node;
 
+	/*
+	 * @pub is NOT optional here, and the external-PROMOTE arm below depends
+	 * on it: with @pub the promote's single reader-visible forward store is
+	 * DEFERRED into it and committed after the §4.B acquire of the holder
+	 * (ft-remove.h, `!boundary_fused && pub && pub->armed`); without it that
+	 * arm stores into the LIVE holder immediately, i.e. mutates before
+	 * acquiring, which is what the acquire exists to prevent -- a peer that
+	 * recompacts the holder through its grandparent slot leaves the value
+	 * intact in the retired copy, so the CAS still matches and the promoted
+	 * head is published into a reclaimed node.
+	 *
+	 * The invariant holds structurally, not by convention: ft_detach_node is
+	 * this family's ONLY caller, and it substitutes its own @local_pub for a
+	 * NULL argument (ft-remove.h) before reaching here -- so a list-off
+	 * caller passing NULL still arrives with @pub set.  Asserted rather than
+	 * left implicit because the failure is silent: the pub-less arm compiles,
+	 * runs, and corrupts only under a concurrent recompaction.
+	 */
+	assert(pub != NULL);
+
 	dbg_printf("ft_node_replace_ptr for node %p, target ptr %p\n",
 		ft_node_ptr(*parent_node_flag_ptr), node_flag_ptr);
 

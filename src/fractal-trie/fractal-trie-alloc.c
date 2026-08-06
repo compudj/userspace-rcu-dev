@@ -1351,6 +1351,27 @@ static void cds_ft_probe_gs_report(void)
 }
 #endif
 
+#ifdef FEATURE_FT_PROBE_PROMOTE
+/*
+ * §4.B unguarded external-promote probe.  ft_node_replace_ptr's promote arm
+ * stores into the LIVE holder when @pub is NULL, while the §4.B guard for that
+ * holder sits inside the `pub && pub->armed` branch -- so the pub-less variant
+ * mutates before acquiring.  @pub is NULL exactly when the ordered list is off,
+ * so the unguarded variant needs a LIST-OFF trie AND a promote.  Counted at the
+ * call site; see FT_PROMOTE_PROBE_INC.
+ */
+unsigned long cds_ft_probe_promote_deferred;
+unsigned long cds_ft_probe_promote_immediate;
+unsigned long cds_ft_probe_promote_guarded;
+
+__attribute__((destructor))
+static void cds_ft_probe_promote_report(void)
+{
+	fprintf(stderr, "PROMOTEPROBE promotes: deferred=%lu immediate(UNGUARDED)=%lu | §4.B acquire ran=%lu\n",
+		cds_ft_probe_promote_deferred, cds_ft_probe_promote_immediate, cds_ft_probe_promote_guarded);
+}
+#endif
+
 #ifdef FEATURE_FT_FAULT_INJECT
 
 /*

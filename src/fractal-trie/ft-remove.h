@@ -2292,6 +2292,21 @@ int ft_detach_node(struct cds_ft *ft,
 					goto end;
 				}
 			}
+#ifdef FEATURE_FT_PROBE_PROMOTE
+			/*
+			 * §4.B unguarded-promote probe.  At the CALL SITE, not inside
+			 * ft_popcount_node_replace_ptr: that function returns from its
+			 * `if (pub)` branch before any counter placed within it, so an
+			 * inside counter reads 0 for BOTH variants and looks like the
+			 * arm is dead when only the unguarded one is.
+			 */
+			if (topmost_external_nodes) {
+				if (pub)
+					FT_PROMOTE_PROBE_INC(cds_ft_probe_promote_deferred);
+				else
+					FT_PROMOTE_PROBE_INC(cds_ft_probe_promote_immediate);
+			}
+#endif
 			ret = ft_node_replace_ptr(ft,
 				detach_node_flag_ptr,
 				elevated_old_child,
@@ -2372,6 +2387,17 @@ int ft_detach_node(struct cds_ft *ft,
 			 * two-commit -- the caller unsplices.
 			 */
 			if (!boundary_fused && pub && pub->armed) {
+#ifdef FEATURE_FT_PROBE_PROMOTE
+				/*
+				 * Did the §4.B acquire actually run for a PROMOTE?
+				 * `pub != NULL` is only a proxy: the guard needs
+				 * pub->armed too, so a promote that left @pub unarmed
+				 * would store without the acquire just as the pub-less
+				 * path would.  Count the consequence, not the proxy.
+				 */
+				if (topmost_external_nodes)
+					FT_PROMOTE_PROBE_INC(cds_ft_probe_promote_guarded);
+#endif
 				/*
 				 * nr_keys fold (LEAF Increment 2): the in-place delete /
 				 * external promote leaves the holder @iter_node_flag in
