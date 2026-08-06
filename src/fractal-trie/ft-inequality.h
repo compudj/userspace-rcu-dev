@@ -330,29 +330,37 @@ enum cds_ft_status ft_ineq_descend(struct cds_ft *ft,
 	struct cds_ft_node *ret_node;
 	uint8_t ordinal_key[FT_MAX_KEY_LEN];
 	/*
-	 * Empty-subtree retry origin (see the going-up scan and the "transiently
-	 * empty internal node" bail).  @retry_from_level < 0 = inactive; when it
-	 * matches the scan's current level, the sibling search starts from
-	 * @retry_from_byte -- the child just found empty -- instead of the
-	 * immutable search key, so the scan cannot re-derive it.  Declared at the
-	 * top of the function: every `goto` into going_up / descend_children is
-	 * backward or forward past this point, so no jump skips the init.
+	 * OFF-KEY BOUNDARY: the shallowest level at which the traversal stopped
+	 * following the search key and took a branch of its own -- a going-up
+	 * sibling, or a min/max child in the descend_children descent.  SSIZE_MAX
+	 * = still on the key.
+	 *
+	 * At and below it the going-up sibling scan must start from the byte the
+	 * traversal ACTUALLY took (ordinal_key[level - 1]), never from the search
+	 * key: the key names a branch that is already behind us, so scanning from
+	 * it hands back a subtree the traversal has already consumed.  Above it
+	 * the two agree by construction (the descent fills ordinal_key with the
+	 * key's own bytes), and the search key is the cheaper source -- it needs
+	 * no ordinal_key under @keep_ordinal == false.
+	 *
+	 * Declared at the top of the function: every `goto` into going_up /
+	 * descend_children is backward or forward past this point, so no jump
+	 * skips the init.
 	 */
-	ssize_t retry_from_level = -1;
-	uint8_t retry_from_byte = 0;
+	ssize_t off_key_level = SSIZE_MAX;
 	/*
 	 * @keep_ordinal: compile-time true for every instantiation EXCEPT
 	 * (use_keycopy && limit == LIMIT_NONE).  In that one case the matched leaf
 	 * is the sole result-key source (ft_speculative_keycopy_unconditional) and
-	 * going-up dispatch reads input_key, so ordinal_key is dead: its memset,
-	 * per-level fills (here and in the compressed helpers via fill_ordinal),
-	 * byte-record output slots, and fallback copies all DCE.  @ord_scratch is
-	 * the write-only sink for the going-up sibling / minmax byte-record on that
-	 * path (ft_node_get_direction needs a valid output slot).
+	 * on-key going-up dispatch reads input_key, so ordinal_key is dead ABOVE
+	 * @off_key_level: its memset, per-level descent fills (here and in the
+	 * compressed helpers via fill_ordinal), and fallback copies all DCE.  The
+	 * two off-key byte-record slots -- the going-up sibling scan and the minmax
+	 * scan -- are written on both paths: they are what @off_key_level reads
+	 * back, and the store costs the same as a scratch byte.
 	 */
 	const bool keep_ordinal = !(use_keycopy &&
 			limit == FT_LOOKUP_LIMIT_NONE);
-	uint8_t ord_scratch;
 	enum ft_direction dir;
 	const uint8_t *input_key = NULL;	/* set below; init for the hoisted cell-fastpath goto end */
 	const uint8_t *iter_key;
@@ -1064,19 +1072,6 @@ going_up:
 				break;
 			}
 			/*
-			 * EMPTY-SUBTREE RETRY: this level's previous candidate was
-			 * descended into and its subtree read empty, so scan from IT
-			 * rather than from the search key -- the search key is
-			 * immutable and would hand back the same candidate forever
-			 * (the traced stall).  One-shot: cleared here so a later
-			 * arrival at this level, with a genuinely different cursor,
-			 * uses the normal origin again.
-			 */
-			if (caa_unlikely(retry_from_level == level)) {
-				key_value = retry_from_byte;
-				retry_from_level = -1;
-			}
-			/*
 			 * Standard sibling lookup. Parent is level - 1. We are
 			 * looking for sibling of the byte at ordinal_key[level - 1].
 			 * Skip levels where the path entry is not an internal node
@@ -1090,8 +1085,30 @@ going_up:
 				going_up = true;
 				continue;
 			}
+			/*
+			 * OFF-KEY LEVEL: the traversal already left the search key
+			 * here (a sibling take, or a min/max step of the
+			 * descend_children descent), so the key names a branch behind
+			 * us.  Scan from the byte actually taken instead; being
+			 * strictly ordered, ft_node_get_leftright then returns the
+			 * next branch and the scan always advances.
+			 *
+			 * Placed after the non-internal skip, not before: only a level
+			 * that scans needs an origin, and only such a level is
+			 * guaranteed to HAVE the byte -- it is the level whose internal
+			 * parent a scan dispatched through, which is where the two
+			 * byte-record slots write.  The interior levels of a compressed
+			 * span have no ordinal byte under @keep_ordinal == false, and
+			 * they take the skip above.
+			 *
+			 * The switch above still runs on every level: it carries the
+			 * LIMIT_NONE iter_key back-step that the shallower, on-key
+			 * levels of this same climb read.
+			 */
+			if (caa_unlikely(level >= off_key_level))
+				key_value = ordinal_key[level - 1];
 			node_flag = ft_node_get_leftright(ft, up_parent, key_value,
-					keep_ordinal ? &ordinal_key[level - 1] : &ord_scratch,
+					&ordinal_key[level - 1],
 					dir, true /* validate_lookup */);
 	#ifdef FEATURE_FT_SKIP_COMPRESSED
 			/*
@@ -1178,6 +1195,13 @@ going_up:
 				 */
 				up_node = node_flag;
 				up_node_lo = level;
+				/*
+				 * The sibling is this traversal's own branch, not the
+				 * search key's: from here down, a later climb scans from
+				 * ordinal_key.
+				 */
+				if (level < off_key_level)
+					off_key_level = level;
 				/*
 				 * Reaching a sibling IS backtracking (up to the
 				 * parent, then over to a strictly-greater/lesser
@@ -1339,6 +1363,15 @@ descend_children:
 	level++;
 
 	/*
+	 * The min/max descent below picks its own branch at every level it
+	 * reaches, so all of them are off-key.  A descent entered straight from
+	 * the key walk (GE/GT past the end of the key, or a compressed
+	 * divergence) has taken no sibling and so has not marked one yet.
+	 */
+	if (level < off_key_level)
+		off_key_level = level;
+
+	/*
 	 * From this point, we are guaranteed to be able to find a
 	 * "lower than"/"greater than" match. ft_attach_node() and
 	 * ft_detach_node() both guarantee that it is not possible for a
@@ -1456,7 +1489,7 @@ descend_children:
 		}
 		skip_eq_external_nodes = false;
 		node_flag = ft_node_get_minmax(ft, node_flag,
-				keep_ordinal ? &ordinal_key[level - 1] : &ord_scratch, dir,
+				&ordinal_key[level - 1], dir,
 				true /* validate_lookup */);
 		/*
 		 * Prefetch the min/max child's body for the next iteration's scan.
@@ -1527,28 +1560,26 @@ descend_children:
 		if (caa_unlikely(!node_flag)) {
 			level--;
 			/*
-			 * ...and EXCLUDE the child we just found empty, or the
-			 * going-up scan re-derives it forever.  Its origin is
-			 * key_value == input_key[level - 1] -- the IMMUTABLE search
-			 * key -- so without this the next pass asks the same parent
-			 * the same question, gets the same sibling, descends into
-			 * the same empty subtree, and lands right back here.  That
-			 * is the cross-trie oracle's long-standing STALL: LTTng
+			 * The climb out of the empty subtree must EXCLUDE the branch
+			 * that led into it, or the going-up scan re-derives it
+			 * forever.  @off_key_level, set on the way in, already covers
+			 * every level of this descent: each one scans from the byte it
+			 * took (ordinal_key[level - 1]), and ft_node_get_leftright is
+			 * strictly ordered (smallest v > n for RIGHT), so the origin
+			 * advances at every level and the climb is monotone.
+			 *
+			 * That is the cross-trie oracle's long-standing STALL: LTTng
 			 * caught 100001 byte-identical going_up steps (same level,
 			 * same parent, same ord_key, found_sibling=1) with no peer
 			 * event interleaved -- a self-contained infinite loop, not a
 			 * contention livelock.  The comment above assumes going_up
 			 * "find[s] the NEXT sibling", which holds only if the scan
-			 * starts PAST this byte.  ft_node_get_leftright is strictly
-			 * ordered (smallest v > n for RIGHT), so seeding the origin
-			 * with the failed byte returns the next populated slot and
-			 * the scan always advances.
+			 * starts PAST the exhausted branch AT EVERY LEVEL IT CLIMBS:
+			 * a level whose dispatcher is compressed cannot scan at all,
+			 * so an exclusion bound to one level is dropped there and the
+			 * next level up falls back to the search key -- which names
+			 * the emptied subtree again.
 			 */
-			if (caa_likely(level >= 1)) {
-				retry_from_byte = keep_ordinal
-					? ordinal_key[level - 1] : ord_scratch;
-				retry_from_level = level;
-			}
 			going_up = true;
 			goto going_up;
 		}

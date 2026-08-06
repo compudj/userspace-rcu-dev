@@ -68,13 +68,13 @@
 #endif
 
 /*
- * 293 unconditional + 49 fault-injection-only RUN_TEST registrations, on top of
+ * 294 unconditional + 49 fault-injection-only RUN_TEST registrations, on top of
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (342 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (343 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (293 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (294 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -25890,6 +25890,171 @@ out:
 #endif
 }
 
+/*
+ * The same dead end, one level DEEPER: the walk must still get past it.
+ *
+ * Depth is the whole discriminator, and it decides between two different
+ * failures.  test_walk_past_empty_internal above empties a holder whose
+ * dispatcher is an ordinary internal node, so the climb out can scan that
+ * dispatcher for the next branch and move on.  Empty one reached through a
+ * COMPRESSED run instead and the level the climb resumes at has a compressed
+ * dispatcher, which has no siblings to scan: the climb passes straight through
+ * it to the level above, where the origin is the search key -- and the search
+ * key names the emptied subtree, so the walk descends into it again.  That is
+ * an INTRA-CALL infinite loop: cds_ft_next never returns, so the bounded outer
+ * walk below cannot catch it and this test hangs rather than fails.
+ *
+ *   "Aa0" "Aa1"     holder at depth 2, dispatcher internal   (the shallow one)
+ *   "Abc0" "Abc1"   holder at depth 3, dispatcher compressed ("bc")  <- emptied
+ *   "z0"            sorts above both, so the walk must cross the dead end
+ *
+ * Keys are asserted, not counted: a walk that stops early and one that skips
+ * the right number of keys are different failures.
+ */
+static int test_walk_past_deep_empty_internal(void)
+{
+#ifdef FEATURE_FT_VERIFY_AT_MUTATION
+	/* Deliberately verify-invalid, exactly as above. */
+	diag("test_walk_past_deep_empty_internal: skipped under "
+		"FEATURE_FT_VERIFY_AT_MUTATION (the shape is deliberately "
+		"verify-invalid)");
+	return 0;
+#else
+	static const char *const keys[] = { "Aa0", "Aa1", "Abc0", "Abc1", "z0" };
+	static const char *const expect[] = { "Aa0", "Aa1", "z0" };
+	struct cds_ft_group_attr *attr = NULL;
+	struct cds_ft_group *group = NULL;
+	struct cds_ft *ft = NULL;
+	struct cds_ft_iter *iter = NULL;
+	struct ft_test_node *leaf[5] = { NULL };
+	struct cds_ft_node *stripped[4];
+	unsigned int nr_stripped = 0, seen = 0, i;
+	enum cds_ft_status s;
+	int ret = 0;
+
+	/*
+	 * VARIABLE length -- a fixed-length group cannot hold the two holders at
+	 * different depths -- and the ordered list OFF, which is as load-bearing
+	 * here as in the test above: with the list on, cds_ft_next hops the cell
+	 * list and never runs the structural descent under test.
+	 */
+	if (cds_ft_group_attr_create(&attr) < 0 ||
+	    cds_ft_group_attr_set_max_key_len(attr, 8) < 0 ||
+	    cds_ft_group_attr_set_writer_strategy(attr,
+			CDS_FT_WRITER_LOCK_FINE) < 0 ||
+	    cds_ft_group_attr_set_ordered_list(attr, false) < 0 ||
+	    cds_ft_group_create(attr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &ft) < 0)
+		abort();
+
+	rcu_read_lock();
+	for (i = 0; i < CAA_ARRAY_SIZE(keys); i++) {
+		leaf[i] = node_alloc(0);
+		if (cds_ft_insert(ft, (const uint8_t *) keys[i],
+				strlen(keys[i]), &leaf[i]->node) !=
+					CDS_FT_STATUS_OK)
+			abort();
+	}
+	rcu_read_unlock();
+
+	/* leaf[2] is "Abc0": its holder is the DEEP one, below the "bc" run. */
+	if (_cds_ft_debug_empty_holder(ft, &leaf[2]->node, stripped, 4,
+			&nr_stripped)) {
+		diag("test_walk_past_deep_empty_internal: shape not produced, "
+			"skipped");
+		goto out;
+	}
+	if (nr_stripped != 2) {
+		diag("test_walk_past_deep_empty_internal: stripped %u leaves, "
+			"expected 2", nr_stripped);
+		ret = -1;
+		goto out;
+	}
+	if (cds_ft_verify(ft, NULL) == CDS_FT_STATUS_OK) {
+		diag("test_walk_past_deep_empty_internal: verify ACCEPTED a "
+			"childless reachable internal");
+		ret = -1;
+	}
+
+	if (cds_ft_iter_create(ft, &iter) < 0)
+		abort();
+	rcu_read_lock();
+	for (s = cds_ft_lookup_first(ft, iter); s == CDS_FT_STATUS_OK;
+			s = cds_ft_next(ft, iter)) {
+		uint8_t rk[8];
+		size_t rl = 0;
+
+		if (cds_ft_iter_get_key(iter, rk, sizeof rk, &rl) !=
+				CDS_FT_STATUS_OK)
+			abort();
+		if (seen < CAA_ARRAY_SIZE(expect) &&
+				(rl != strlen(expect[seen]) ||
+				 memcmp(rk, expect[seen], rl) != 0)) {
+			diag("test_walk_past_deep_empty_internal: step %u "
+				"returned \"%.*s\", expected \"%s\"",
+				seen, (int) rl, (const char *) rk,
+				expect[seen]);
+			ret = -1;
+		}
+		if (++seen > CAA_ARRAY_SIZE(expect))
+			break;		/* over-enumerating: bounded so we report */
+	}
+	rcu_read_unlock();
+	cds_ft_iter_destroy(iter);
+
+	if (seen != CAA_ARRAY_SIZE(expect)) {
+		diag("test_walk_past_deep_empty_internal: walk visited %u keys, "
+			"expected %zu -- %s", seen, CAA_ARRAY_SIZE(expect),
+			seen > CAA_ARRAY_SIZE(expect) ? "it over-enumerated" :
+				"it stopped at the empty node");
+		ret = -1;
+	}
+out:
+	/*
+	 * The stripped leaves are the caller's again.  Forget them here rather
+	 * than only freeing them: a PARTIAL strip (the nr_stripped != 2 failure
+	 * above) can leave one both handed back and still reachable, and the
+	 * by-key sweep below would then free it a second time -- turning a
+	 * reported failure into a crash that hides it.
+	 */
+	for (i = 0; i < nr_stripped; i++) {
+		unsigned int j;
+
+		for (j = 0; j < CAA_ARRAY_SIZE(leaf); j++)
+			if (leaf[j] == to_test_node(stripped[i]))
+				leaf[j] = NULL;
+		node_free(to_test_node(stripped[i]));
+	}
+	/*
+	 * Do NOT drain: the remnant is deliberately malformed.  Remove what is
+	 * still reachable by exact key, then destroy.
+	 */
+	rcu_read_lock();
+	for (i = 0; i < CAA_ARRAY_SIZE(keys); i++) {
+		struct cds_ft_iter *it2 = NULL;
+
+		if (leaf[i] == NULL)
+			continue;
+		if (cds_ft_iter_create(ft, &it2) != CDS_FT_STATUS_OK)
+			continue;
+		cds_ft_iter_set_key(it2, (const uint8_t *) keys[i],
+			strlen(keys[i]));
+		if (cds_ft_lookup(ft, it2) == CDS_FT_STATUS_OK &&
+				cds_ft_iter_node(it2)) {
+			(void) cds_ft_remove(ft, it2, cds_ft_iter_node(it2));
+			node_free(leaf[i]);
+		}
+		cds_ft_iter_destroy(it2);
+	}
+	rcu_read_unlock();
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return ret;
+#endif
+}
+
 #ifdef FEATURE_FT_FAULT_INJECT
 extern long cds_ft_fault_alloc_countdown;
 extern long cds_ft_fault_flip_countdown;
@@ -31882,6 +32047,7 @@ int main(int argc, char **argv)
 #endif
 
 	RUN_TEST(test_walk_past_empty_internal);
+	RUN_TEST(test_walk_past_deep_empty_internal);
 	RUN_TEST(test_verify_disjoint_cross_trie);
 
 	rcu_barrier();
