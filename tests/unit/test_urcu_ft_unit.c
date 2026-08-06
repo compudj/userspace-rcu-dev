@@ -25908,9 +25908,61 @@ out:
  *   "Abc0" "Abc1"   holder at depth 3, dispatcher compressed ("bc")  <- emptied
  *   "z0"            sorts above both, so the walk must cross the dead end
  *
+ * Both directions, and the reverse one is not redundant: it climbs with
+ * dir == FT_LEFT through the same emptied holder, and it spins on its own --
+ * measured against the pre-fix library, cds_ft_prev hangs here exactly as
+ * cds_ft_next does.
+ *
  * Keys are asserted, not counted: a walk that stops early and one that skips
  * the right number of keys are different failures.
  */
+static int deep_empty_walk(struct cds_ft *ft, bool forward,
+		const char *const *expect, unsigned int n_expect)
+{
+	struct cds_ft_iter *iter = NULL;
+	unsigned int seen = 0;
+	enum cds_ft_status s;
+	int ret = 0;
+
+	if (cds_ft_iter_create(ft, &iter) < 0)
+		abort();
+	rcu_read_lock();
+	for (s = forward ? cds_ft_lookup_first(ft, iter) :
+				cds_ft_lookup_last(ft, iter);
+			s == CDS_FT_STATUS_OK;
+			s = forward ? cds_ft_next(ft, iter) :
+				cds_ft_prev(ft, iter)) {
+		uint8_t rk[8];
+		size_t rl = 0;
+		const char *want = expect[forward ? seen : n_expect - 1 - seen];
+
+		if (cds_ft_iter_get_key(iter, rk, sizeof rk, &rl) !=
+				CDS_FT_STATUS_OK)
+			abort();
+		if (seen < n_expect && (rl != strlen(want) ||
+				memcmp(rk, want, rl) != 0)) {
+			diag("test_walk_past_deep_empty_internal: %s step %u "
+				"returned \"%.*s\", expected \"%s\"",
+				forward ? "forward" : "reverse", seen,
+				(int) rl, (const char *) rk, want);
+			ret = -1;
+		}
+		if (++seen > n_expect)
+			break;	/* over-enumerating: bounded so we report */
+	}
+	rcu_read_unlock();
+	cds_ft_iter_destroy(iter);
+
+	if (seen != n_expect) {
+		diag("test_walk_past_deep_empty_internal: %s walk visited %u "
+			"keys, expected %u -- %s", forward ? "forward" : "reverse",
+			seen, n_expect, seen > n_expect ? "it over-enumerated" :
+				"it stopped at the empty node");
+		ret = -1;
+	}
+	return ret;
+}
+
 static int test_walk_past_deep_empty_internal(void)
 {
 #ifdef FEATURE_FT_VERIFY_AT_MUTATION
@@ -25925,11 +25977,9 @@ static int test_walk_past_deep_empty_internal(void)
 	struct cds_ft_group_attr *attr = NULL;
 	struct cds_ft_group *group = NULL;
 	struct cds_ft *ft = NULL;
-	struct cds_ft_iter *iter = NULL;
 	struct ft_test_node *leaf[5] = { NULL };
 	struct cds_ft_node *stripped[4];
-	unsigned int nr_stripped = 0, seen = 0, i;
-	enum cds_ft_status s;
+	unsigned int nr_stripped = 0, i;
 	int ret = 0;
 
 	/*
@@ -25978,39 +26028,10 @@ static int test_walk_past_deep_empty_internal(void)
 		ret = -1;
 	}
 
-	if (cds_ft_iter_create(ft, &iter) < 0)
-		abort();
-	rcu_read_lock();
-	for (s = cds_ft_lookup_first(ft, iter); s == CDS_FT_STATUS_OK;
-			s = cds_ft_next(ft, iter)) {
-		uint8_t rk[8];
-		size_t rl = 0;
-
-		if (cds_ft_iter_get_key(iter, rk, sizeof rk, &rl) !=
-				CDS_FT_STATUS_OK)
-			abort();
-		if (seen < CAA_ARRAY_SIZE(expect) &&
-				(rl != strlen(expect[seen]) ||
-				 memcmp(rk, expect[seen], rl) != 0)) {
-			diag("test_walk_past_deep_empty_internal: step %u "
-				"returned \"%.*s\", expected \"%s\"",
-				seen, (int) rl, (const char *) rk,
-				expect[seen]);
-			ret = -1;
-		}
-		if (++seen > CAA_ARRAY_SIZE(expect))
-			break;		/* over-enumerating: bounded so we report */
-	}
-	rcu_read_unlock();
-	cds_ft_iter_destroy(iter);
-
-	if (seen != CAA_ARRAY_SIZE(expect)) {
-		diag("test_walk_past_deep_empty_internal: walk visited %u keys, "
-			"expected %zu -- %s", seen, CAA_ARRAY_SIZE(expect),
-			seen > CAA_ARRAY_SIZE(expect) ? "it over-enumerated" :
-				"it stopped at the empty node");
+	if (deep_empty_walk(ft, true, expect, CAA_ARRAY_SIZE(expect)) < 0)
 		ret = -1;
-	}
+	if (deep_empty_walk(ft, false, expect, CAA_ARRAY_SIZE(expect)) < 0)
+		ret = -1;
 out:
 	/*
 	 * The stripped leaves are the caller's again.  Forget them here rather
