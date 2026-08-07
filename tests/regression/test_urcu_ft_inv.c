@@ -78,7 +78,7 @@
  * compares the run count against this plan, so retiring a test means
  * decrementing here in the same commit.
  */
-#define NR_TESTS	(96 + NR_TESTS_REKEY_DLM)
+#define NR_TESTS	(97 + NR_TESTS_REKEY_DLM)
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -11395,6 +11395,349 @@ static int inv_graft_swap_shared_dst_delegate_solo(void)
 		/*list_on=*/ false, &gs_lay_delegate_solo);
 }
 
+/* ================================================================== */
+/*                                                                    */
+/*   INVARIANT: writers keep making progress under chain-merge        */
+/*              contention (the escalation lane must be given back)   */
+/*                                                                    */
+/* ================================================================== */
+
+/*
+ * Every other invariant here asks whether the answer is RIGHT.  This one asks
+ * whether an answer ARRIVES.
+ *
+ * @b9fcf7b4 fixed a writer that escalated for its COMMIT, took the domain's
+ * FIFO turn, then bailed PRE-COMMIT on a DLM acquire miss and KEPT the turn
+ * across every re-descend -- while the peer holding the contended node was
+ * queued behind that same turn.  Circular wait: measured 142 lane enters
+ * against 138 exits, 99.8% of begins already holding the turn, and every FT
+ * counter frozen permanently.  Nothing in this suite would notice it coming
+ * back: the shape needs real writer contention on ONE spine, and the failure
+ * is a WEDGE, not a wrong answer -- no assertion fires, no key goes missing.
+ *
+ * The shape, from the out-of-tree oracle that found it:
+ *   SPLITTER  inserts then removes a key diverging MID-span, so the branch it
+ *             creates collapses and the two halves re-merge into one longer
+ *             compressed node -- the absorb that moves an encoded position.
+ *   DESCENDER mutates a key whose path runs THROUGH that same span, so its
+ *             descent holds the skip pointer the splitter is invalidating.
+ *   MERGER    cds_ft_merge_at with a dst key inside the span, which is what
+ *             turns contention into the escalation this guards.
+ *
+ * ★★★ NOT FALSIFIED AGAINST THE HISTORICAL DEFECT -- READ THIS BEFORE TRUSTING
+ * A GREEN RESULT.  Reverting @b9fcf7b4 does NOT bring the wedge back, and nor
+ * does additionally reverting @a402b0f2 (the quiescent escalation park): the
+ * out-of-tree oracle that originally froze at 39 splits runs 186k-198k splits
+ * against a library with both reverted.  The freeze needed a code state that
+ * those two reverts do not reconstruct -- other commits since (notably
+ * @fdef60f0, binding the insert DLM acquire to the op's handle) contribute.
+ * So this test is a PROGRESS AND STRESS test whose detector is verified, NOT a
+ * proven guard for any one commit: its green says the workload made progress,
+ * not that the livelock would be caught.
+ * What IS verified: stalling the three workers deliberately makes the timer
+ * below report and the test return not-ok.  And the workload is not vacuous --
+ * it drives ~200k splits, ~250k merges and ~250k slot rewinds per run, a
+ * chain-merge contention shape nothing else in this suite produces.
+ *
+ * ★ THE FAILURE MODE IS A HANG, AND THAT IS WHY THE DETECTOR IS A TIMER.
+ * A wedged writer never returns from the library, so it never re-checks @stop
+ * and cannot be joined.  This thread never blocks (it spins with quiescent
+ * states, as a registered QSBR thread must), so it can still SAMPLE: if the
+ * writers' combined progress does not advance for GP_STALL_MS, the violation
+ * is REPORTED -- naming the livelock on stderr -- before the teardown that may
+ * then hang on the join.  A named failure beats a silent one; do not read the
+ * subsequent hang as the test being broken.
+ */
+#define CM_SPAN		12
+#define CM_SPLIT_AT	6
+#define CM_DESCENDERS	4
+#define CM_RUN_MS	5000
+#define CM_STALL_MS	2000		/* no progress this long == wedged */
+
+struct cm_ctx {
+	struct cds_ft *ft;
+	struct cds_ft_group *group;
+	struct cds_ft *msrc;	/* the merger's recycled source; destroyed by main */
+	int stop;
+	unsigned long splits, descents, merges;
+};
+
+/* key = 'A' x @plen + @tag, so every key shares the compressed prefix. */
+static size_t cm_mkkey(uint8_t *k, unsigned int plen, uint8_t tag)
+{
+	memset(k, 'A', plen);
+	k[plen] = tag;
+	return plen + 1;
+}
+
+/* Insert @k then remove it again, freeing the node.  Returns 1 if it landed. */
+static int cm_churn(struct cds_ft *ft, const uint8_t *k, size_t kl)
+{
+	struct ft_test_node *n = node_alloc(0);
+	struct cds_ft_iter *it = NULL;
+	struct cds_ft_node *got;
+
+	if (cds_ft_insert(ft, k, kl, &n->node) != CDS_FT_STATUS_OK) {
+		node_free(n);
+		return 0;
+	}
+	if (cds_ft_iter_create(ft, &it) != CDS_FT_STATUS_OK)
+		return 0;
+	rcu_read_lock();
+	cds_ft_iter_set_key(it, k, kl);
+	if (cds_ft_lookup(ft, it) == CDS_FT_STATUS_OK &&
+			(got = cds_ft_iter_node(it)) != NULL &&
+			cds_ft_remove(ft, it, got) == CDS_FT_STATUS_OK)
+		node_free_rcu(to_test_node(got));
+	rcu_read_unlock();
+	cds_ft_iter_destroy(it);
+	return 1;
+}
+
+static void *cm_splitter(void *arg)
+{
+	struct cm_ctx *c = arg;
+	uint8_t k[CM_SPAN + 8];
+	size_t kl = cm_mkkey(k, CM_SPLIT_AT, 'M');	/* diverges mid-span */
+
+	rcu_register_thread();
+	while (!uatomic_load(&c->stop, CMM_RELAXED)) {
+		if (cm_churn(c->ft, k, kl))
+			uatomic_add(&c->splits, 1);
+		rcu_quiescent_state();
+	}
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static void *cm_descender(void *arg)
+{
+	struct cm_ctx *c = *(struct cm_ctx **) arg;
+	unsigned long id = *((unsigned long *) arg + 1);
+	uint8_t k[CM_SPAN + 8];
+	size_t kl = cm_mkkey(k, CM_SPAN, (uint8_t) ('a' + id));
+
+	rcu_register_thread();
+	while (!uatomic_load(&c->stop, CMM_RELAXED)) {
+		if (cm_churn(c->ft, k, kl))
+			uatomic_add(&c->descents, 1);
+		rcu_quiescent_state();
+	}
+	rcu_unregister_thread();
+	return NULL;
+}
+
+/*
+ * RECYCLE one src trie for the whole run: cds_ft_merge_at consumes its
+ * CONTENT, not the handle, so it comes back empty and refillable.  Creating
+ * one per round would park this thread in cds_ft_destroy's rcu_barrier every
+ * iteration, stalling the grace period a peer writer waits on -- a harness
+ * deadlock that reads exactly like the library one under test.
+ */
+static void *cm_merger(void *arg)
+{
+	struct cm_ctx *c = arg;
+	uint8_t dk[CM_SPAN + 8], full[CM_SPAN + 8];
+	size_t dkl = cm_mkkey(dk, CM_SPLIT_AT + 2, 'Q');
+	const uint8_t sk[1] = { 'q' };
+	struct cds_ft *src = NULL;
+
+	rcu_register_thread();
+	if (cds_ft_create(c->group, NULL, &src) < 0)
+		goto out;
+	cds_ft_make_exclusive(src);
+	uatomic_store(&c->msrc, src, CMM_RELEASE);
+	while (!uatomic_load(&c->stop, CMM_RELAXED)) {
+		struct ft_test_node *n = node_alloc(0);
+		size_t fl;
+
+		if (cds_ft_insert(src, sk, 1, &n->node) != CDS_FT_STATUS_OK) {
+			node_free(n);
+			rcu_quiescent_state();
+			continue;
+		}
+		(void) cds_ft_merge_at(c->ft, dk, dkl, src, NULL, 0);
+		uatomic_add(&c->merges, 1);
+		/* Drain what landed, so the shape stays bounded. */
+		memcpy(full, dk, dkl);
+		fl = dkl;
+		full[fl++] = 'q';
+		{
+			struct cds_ft_iter *it = NULL;
+			struct cds_ft_node *got;
+
+			if (cds_ft_iter_create(c->ft, &it) == CDS_FT_STATUS_OK) {
+				rcu_read_lock();
+				cds_ft_iter_set_key(it, full, fl);
+				if (cds_ft_lookup(c->ft, it) == CDS_FT_STATUS_OK &&
+						(got = cds_ft_iter_node(it)) != NULL &&
+						cds_ft_remove(c->ft, it, got) ==
+							CDS_FT_STATUS_OK)
+					node_free_rcu(to_test_node(got));
+				rcu_read_unlock();
+				cds_ft_iter_destroy(it);
+			}
+		}
+		rcu_quiescent_state();
+	}
+	/*
+	 * Left for the main thread: cds_ft_destroy blocks in rcu_barrier, and
+	 * this thread is a registered QSBR reader -- blocking here stalls the
+	 * grace period the peers' writers are waiting on.
+	 */
+	uatomic_store(&c->msrc, src, CMM_RELEASE);
+out:
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static int inv_writer_progress_chainmerge(void)
+{
+	const char *tname = "inv_writer_progress_chainmerge";
+	enum cds_ft_writer_strategy ws = CDS_FT_WRITER_LOCK_FINE;
+	struct cm_ctx c;
+	struct ft_test_node *anchor_node;
+	uint8_t anchor[CM_SPAN + 8];
+	size_t al;
+	pthread_t sp, mg, dt[CM_DESCENDERS];
+	unsigned long dargs[CM_DESCENDERS][2];
+	struct timespec t0, tlast;
+	unsigned long seen = 0;
+	unsigned int i;
+	int ret = 0, stalled = 0, corrupt = 0;
+
+	memset(&c, 0, sizeof(c));
+	/* SPECULATIVE: skip-compression is what makes the span encodable. */
+	c.ft = create_varlen_nolist_ft_ws_spec(&c.group, &ws);
+	cds_ft_make_concurrent(c.ft);
+
+	/* Anchor keeps the long span alive so it stays compressed. */
+	anchor_node = node_alloc(0);
+	al = cm_mkkey(anchor, CM_SPAN, 'Z');
+	rcu_read_lock();
+	if (cds_ft_insert(c.ft, anchor, al, &anchor_node->node) !=
+			CDS_FT_STATUS_OK)
+		abort();
+	rcu_read_unlock();
+
+	pthread_create(&sp, NULL, cm_splitter, &c);
+	pthread_create(&mg, NULL, cm_merger, &c);
+	for (i = 0; i < CM_DESCENDERS; i++) {
+		dargs[i][0] = (unsigned long) &c;
+		dargs[i][1] = i;
+		pthread_create(&dt[i], NULL, cm_descender, &dargs[i]);
+	}
+
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	tlast = t0;
+	for (;;) {
+		unsigned long now = uatomic_load(&c.splits, CMM_RELAXED)
+			+ uatomic_load(&c.descents, CMM_RELAXED)
+			+ uatomic_load(&c.merges, CMM_RELAXED);
+
+		if (now != seen) {
+			seen = now;
+			clock_gettime(CLOCK_MONOTONIC, &tlast);
+		} else if (elapsed_ms(&tlast) >= CM_STALL_MS) {
+			/*
+			 * Reported BEFORE the teardown, because a wedged writer
+			 * cannot be joined and the join below may never return.
+			 */
+			report_violation(tname,
+				"no writer progress for %d ms (%lu splits, %lu "
+				"descents, %lu merges) -- an escalated writer is "
+				"holding the FIFO turn across a pre-commit bail",
+				CM_STALL_MS, c.splits, c.descents, c.merges);
+			ret = -1;
+			stalled = 1;
+			break;
+		}
+		if (elapsed_ms(&t0) >= CM_RUN_MS)
+			break;
+		caa_cpu_relax();
+		rcu_quiescent_state();
+	}
+	uatomic_store(&c.stop, 1, CMM_RELEASE);
+
+	/*
+	 * OFFLINE BEFORE JOINING.  This thread is a registered QSBR reader, so
+	 * blocking in pthread_join while online stalls every grace period -- a
+	 * worker finishing inside a grace-period wait would then wait on one
+	 * that can never advance.
+	 */
+	rcu_thread_offline();
+	pthread_join(sp, NULL);
+	pthread_join(mg, NULL);
+	for (i = 0; i < CM_DESCENDERS; i++)
+		pthread_join(dt[i], NULL);
+	rcu_thread_online();
+
+	/*
+	 * The merger moves subtrees ACROSS tries, so check for a node left
+	 * reachable from both.  Per-trie verify cannot see that: two tries
+	 * rooted at one node are each self-consistent, and at a root the parent
+	 * check is vacuous (a root's parent is NULL in every trie).  Only a walk
+	 * spanning them tells.
+	 */
+	{
+		struct cds_ft *set[2];
+		size_t nr = 0;
+
+		set[nr++] = c.ft;
+		if (c.msrc)
+			set[nr++] = c.msrc;
+		if (cds_ft_verify_disjoint(set, nr, stderr) != CDS_FT_STATUS_OK) {
+			report_violation(tname, "a node is reachable from BOTH "
+				"the destination and the merge source after "
+				"%lu merges", c.merges);
+			ret = -1;
+			corrupt = 1;
+		}
+	}
+
+	/*
+	 * A run that made progress must also have made SENSE: surviving the
+	 * contention is the invariant, but a wedge-free run that corrupted the
+	 * trie is still a failure.
+	 */
+	if (cds_ft_verify(c.ft, stderr) != CDS_FT_STATUS_OK) {
+		report_violation(tname, "verify failed after %lu splits / %lu "
+			"descents / %lu merges", c.splits, c.descents, c.merges);
+		ret = -1;
+		corrupt = 1;
+	}
+	if (!stalled && c.splits == 0) {
+		report_violation(tname,
+			"the splitter never landed a key -- the shape under "
+			"test did not run");
+		ret = -1;
+	}
+	/*
+	 * ★ drain_trie_keep_group() DESTROYS the trie and keeps only the GROUP.
+	 * Do not follow it with cds_ft_destroy -- that is a double destroy, and
+	 * it reads as trie corruption (verify reports a garbage root) rather
+	 * than as the double free it is.
+	 *
+	 * A trie reported CORRUPT is destroyed WITHOUT draining: the drain walks
+	 * by KEY, and a damaged remnant can run away -- a sibling oracle took a
+	 * global OOM kill exactly there.  Its nodes are then leaked, which the
+	 * per-test leak check reports, and that is the intended trade.
+	 */
+	if (c.msrc) {
+		if (corrupt)
+			cds_ft_destroy(c.msrc);
+		else
+			drain_trie_keep_group(c.msrc);
+	}
+	if (corrupt)
+		cds_ft_destroy(c.ft);
+	else
+		drain_trie_keep_group(c.ft);
+	rcu_barrier();
+	cds_ft_group_destroy(c.group);
+	return ret;
+}
+
 static int inv_merge_root_src_cross_view(void)
 {
 	struct cds_ft_group *group;
@@ -18020,6 +18363,7 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_graft_swap_shared_dst_extchild_solo);
 	RUN_TEST(inv_graft_swap_shared_dst_delegate_nolist);
 	RUN_TEST(inv_graft_swap_shared_dst_delegate_solo);
+	RUN_TEST(inv_writer_progress_chainmerge);
 	RUN_TEST(inv_graft_swap_shared_dst_kshort_solo);
 	RUN_TEST(inv_graft_swap_shared_dst_deep_solo);
 	RUN_TEST(inv_prefix_key_park_vs_holder_churn);
