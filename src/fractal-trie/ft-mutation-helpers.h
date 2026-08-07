@@ -80,6 +80,17 @@ struct ft_descent {
 	struct cds_ft_inode_flag *pppnf;	/* Great-grandparent node-flag value. */
 	struct cds_ft_inode_flag **pppnfp;	/* Slot that holds @pppnf. */
 	/*
+	 * Byte-depth each window slot STARTS at, rotated with the slot itself.
+	 * @depth alone cannot recover them: a compressed ancestor starts cn->len
+	 * bytes back, not one, and the span is not derivable from the flag.  An
+	 * acquire site anchors a lock-set member by its OWN depth
+	 * (ft_descent_anchor), so a member taken from the window needs the depth
+	 * that came with it.  Meaningful only where the matching slot is non-NULL.
+	 */
+	unsigned int pdepth;			/* Byte-depth of @pnf. */
+	unsigned int ppdepth;			/* Byte-depth of @ppnf. */
+	unsigned int pppdepth;			/* Byte-depth of @pppnf. */
+	/*
 	 * A reanchoring descent step (ft_descent_step) landed the live node
 	 * SHALLOWER than the dispatched child (ft_skip_reanchor rewind > 0: a
 	 * peer chain-merge moved the encoded position up), so the captured
@@ -302,6 +313,17 @@ void ft_descent_anchor_validate(const struct ft_descent *d)
 {
 	unsigned int back;
 
+	/*
+	 * Window depths are ordered and strictly shallower than the cursor: every
+	 * node spans at least one key byte, so a slot can never start where the
+	 * one below it does.  This holds under every granularity.
+	 */
+	if (d->pnf)
+		assert(d->pdepth < d->depth);
+	if (d->ppnf)
+		assert(d->ppdepth < d->pdepth);
+	if (d->pppnf)
+		assert(d->pppdepth < d->ppdepth);
 	if (d->lock_spacing == CDS_FT_LOCK_SPACING_PER_NODE)
 		return;
 	if (d->lock_spacing == CDS_FT_LOCK_SPACING_ROOT_ONLY) {
@@ -360,6 +382,9 @@ static
 void ft_descent_init(struct ft_descent *d, struct cds_ft *ft)
 {
 	d->depth = 0;
+	d->pdepth = 0;
+	d->ppdepth = 0;
+	d->pppdepth = 0;
 	d->anchor_pending = 0;
 	d->anchor_crossed = 0;
 	d->lock_spacing = ft->lock_spacing;
@@ -399,10 +424,13 @@ void ft_descent_traverse_compressed(struct cds_ft *ft, struct ft_descent *d,
 
 	d->pppnf  = d->ppnf;
 	d->pppnfp = d->ppnfp;
+	d->pppdepth = d->ppdepth;
 	d->ppnf  = d->pnf;
 	d->ppnfp = d->pnfp;
+	d->ppdepth = d->pdepth;
 	d->pnf   = d->nf;
 	d->pnfp  = d->nfp;
+	d->pdepth = d->depth;
 	d->nfp   = &cn->child;
 	/*
 	 * Resolve a transient type-7 flip proxy a peer parked on cn->child
@@ -443,10 +471,13 @@ struct cds_ft_inode_flag *ft_descent_step(struct cds_ft *ft, struct ft_descent *
 
 	d->pppnf  = d->ppnf;
 	d->pppnfp = d->ppnfp;
+	d->pppdepth = d->ppdepth;
 	d->ppnf  = d->pnf;
 	d->ppnfp = d->pnfp;
+	d->ppdepth = d->pdepth;
 	d->pnf   = d->nf;
 	d->pnfp  = d->nfp;
+	d->pdepth = d->depth;
 	/*
 	 * Navigate through the read side's robust reanchor primitive rather
 	 * than the pre-MW unvalidated one-hop skip resolve (ft_node_get_nth):
