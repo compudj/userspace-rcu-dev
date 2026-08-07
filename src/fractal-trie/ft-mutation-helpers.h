@@ -24,6 +24,24 @@
 #endif
 
 /*
+ * One lock level's anchor, captured as the descent crosses it
+ * (doc/design/ft-dlm-lock-coarseness.md §4).  @cover is the node whose
+ * half-open byte span contains the level; @bound is the node starting at the
+ * first node boundary at or after it, and @bound_start that boundary's byte.
+ *
+ * The two differ only inside a COMPRESSED node: a level strictly inside a span
+ * has no node starting at it, so @cover is that compressed node and @bound is
+ * its successor on the path (NULL until the descent reaches it).  Where a node
+ * starts exactly at the level -- every level in a bushy trie -- @cover ==
+ * @bound and @bound_start is the level itself.
+ */
+struct ft_lock_anchor {
+	struct cds_ft_inode_flag *cover;
+	struct cds_ft_inode_flag *bound;
+	unsigned int bound_start;
+};
+
+/*
  * Descent cursor -- tracks current, parent, and grandparent positions
  * during a key-guided traversal of the trie.
  *
@@ -35,6 +53,23 @@
  */
 struct ft_descent {
 	unsigned int depth;			/* Levels traversed (0 .. key_len). */
+	/*
+	 * Lock-level anchor table, one slot per ft_lock_level_index(), filled by
+	 * ft_descent_enter_node as the descent passes each level.  A lock-set
+	 * member's anchor is then an O(1) lookup (ft_descent_anchor) rather than
+	 * an up-walk: absolute byte-depth is unknown to a climb until it reaches
+	 * the root, so a climb cannot stop early and ends without the node it
+	 * walked past (doc/design/ft-dlm-lock-coarseness.md §5.3).
+	 *
+	 * Only slots the descent has CROSSED are readable, and a query at depth
+	 * @d touches ft_lock_level_index(@d) <= the deepest crossed slot, so
+	 * every reachable read is written first -- @anchor needs no init sweep on
+	 * the mutation hot path.  @anchor_crossed records the written set so a
+	 * debug build asserts that rather than trusting it.
+	 */
+	struct ft_lock_anchor anchor[FT_LOCK_LEVEL_MAX];
+	uint16_t anchor_pending;		/* Levels awaiting their boundary node. */
+	uint16_t anchor_crossed;		/* Levels written (debug validation). */
 	struct cds_ft_inode_flag *nf;		/* Current node-flag value. */
 	struct cds_ft_inode_flag **nfp;		/* Slot that holds @nf. */
 	struct cds_ft_inode_flag *pnf;		/* Parent node-flag value. */
@@ -123,10 +158,87 @@ struct ft_parent_hint {
 	bool parent_guard;
 };
 
+/*
+ * Record @nf, spanning key bytes [@start, @start + @len), into @d's anchor
+ * table.  A node starts exactly where its predecessor ended, so entering one
+ * resolves every level left pending by that predecessor; the node then covers
+ * each lock level inside its own span.
+ */
+static inline
+void ft_descent_enter_node(struct ft_descent *d, struct cds_ft_inode_flag *nf,
+		unsigned int start, unsigned int len)
+{
+	unsigned int lvl;
+
+	/* This node IS the boundary the pending levels were waiting for. */
+	while (caa_unlikely(d->anchor_pending != 0)) {
+		unsigned int i = (unsigned int) __builtin_ctz(d->anchor_pending);
+
+		d->anchor[i].bound = nf;
+		d->anchor_pending &= (uint16_t) ~(1U << i);
+	}
+	/* Levels inside [@start, @start + @len) are covered by this node. */
+	lvl = ft_lock_level(start);
+	if (lvl < start)
+		lvl = lvl ? lvl << 1 : 1;
+	for (; lvl < start + len; lvl = lvl ? lvl << 1 : 1) {
+		unsigned int i = ft_lock_level_index(lvl);
+
+		d->anchor[i].cover = nf;
+		d->anchor_crossed |= (uint16_t) (1U << i);
+		if (lvl == start) {
+			d->anchor[i].bound = nf;
+			d->anchor[i].bound_start = start;
+		} else {
+			/* No node starts at @lvl: its boundary is this span's end. */
+			d->anchor[i].bound = NULL;
+			d->anchor[i].bound_start = start + len;
+			d->anchor_pending |= (uint16_t) (1U << i);
+		}
+	}
+}
+
+/*
+ * The anchor for a node at byte-depth @depth: the node starting at the first
+ * node boundary at or after ft_lock_level(@depth), or -- with no boundary in
+ * [level, @depth] -- the node whose span contains that level
+ * (doc/design/ft-dlm-lock-coarseness.md §2).  The clamp keeps the result an
+ * ancestor-or-self of the queried node.
+ *
+ * @depth must be at most @d->depth: the table holds the levels the descent has
+ * PASSED, and a member BELOW the cursor is resolved by its caller from the two
+ * candidate boundaries it already holds (§7.1), not here.
+ *
+ * The cursor's own node is what the table cannot carry: it spans [@d->depth, ...)
+ * and has not been entered.  It is nonetheless a boundary, in two ways -- the
+ * level can fall exactly on it (@depth a power of two equal to @d->depth), and
+ * it is the boundary a still-pending level is waiting for, since a level goes
+ * pending only from the LAST entered node and that node ends at @d->depth.
+ */
+static inline
+struct cds_ft_inode_flag *ft_descent_anchor(const struct ft_descent *d,
+		unsigned int depth)
+{
+	unsigned int i, lvl = ft_lock_level(depth);
+	const struct ft_lock_anchor *a;
+
+	assert(depth <= d->depth);
+	if (lvl == d->depth)
+		return d->nf;
+	i = ft_lock_level_index(depth);
+	a = &d->anchor[i];
+	assert(d->anchor_crossed & (1U << i));
+	if (a->bound_start <= depth)
+		return a->bound ? a->bound : d->nf;
+	return a->cover;
+}
+
 static
 void ft_descent_init(struct ft_descent *d, struct cds_ft *ft)
 {
 	d->depth = 0;
+	d->anchor_pending = 0;
+	d->anchor_crossed = 0;
 	/*
 	 * Resolve a transient type-7 flip proxy a peer parked on the ROOT slot
 	 * (Phase 4.3: a root recompact's forward edge mid-commit) to its
@@ -186,6 +298,8 @@ void ft_descent_traverse_compressed(struct cds_ft *ft, struct ft_descent *d,
 	MRG_REANCHOR_PROBE(0, rewind);
 	if (caa_unlikely(rewind != 0))
 		d->skip_conflict = true;
+	/* @cn spans [d->depth, d->depth + cn->len) -- one lock, many levels. */
+	ft_descent_enter_node(d, d->pnf, d->depth, cn->len);
 	d->depth += cn->len;
 	*iter_key += cn->len;
 }
@@ -223,6 +337,8 @@ struct cds_ft_inode_flag *ft_descent_step(struct cds_ft *ft, struct ft_descent *
 	MRG_REANCHOR_PROBE(1, rewind);
 	if (caa_unlikely(rewind != 0))
 		d->skip_conflict = true;
+	/* The node just traversed spans one key byte, [d->depth, d->depth + 1). */
+	ft_descent_enter_node(d, d->pnf, d->depth, 1);
 	d->depth++;
 	return d->nf;
 }

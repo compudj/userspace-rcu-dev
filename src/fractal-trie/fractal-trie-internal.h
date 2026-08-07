@@ -79,6 +79,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <unistd.h>
 #include <urcu/list.h>
 /*
@@ -292,6 +293,45 @@
 #define FT_ENTRY_PER_NODE	256
 #define FT_MAX_KEY_LEN	256			/* Maximum key length supported. */
 #define FT_MAX_DEPTH	(FT_MAX_KEY_LEN + 1)	/* Maximum depth, including root. */
+
+/*
+ * DLM lock coarseness (doc/design/ft-dlm-lock-coarseness.md).  Lock levels sit
+ * at key-byte depths 0, 1, 2, 4, 8, ... -- dense near the root, sparse deeper.
+ * A structural writer anchors its lock-set on an ancestor at one of these
+ * levels instead of on every node it mutates, so members sharing a level
+ * collapse onto ONE lock word.  Key BYTES, not node hops: a lock's reach is
+ * bounded by the key space below it, and a compressed node advances several
+ * byte levels at the cost of one lock.
+ *
+ * Levels 0,1,2,4,...,256 for FT_MAX_KEY_LEN 256, so a per-descent table indexed
+ * by ft_lock_level_index() needs FT_LOCK_LEVEL_MAX slots.
+ */
+#define FT_LOCK_LEVEL_MAX	10
+
+/*
+ * The deepest lock level at or above @depth: all but the top set bit cleared.
+ */
+static inline
+unsigned int ft_lock_level(unsigned int depth)
+{
+	if (!depth)
+		return 0;
+	return 1U << ((sizeof(unsigned int) * CHAR_BIT - 1) -
+			(unsigned int) __builtin_clz(depth));
+}
+
+/*
+ * @depth's slot in a lock-level table: level 0 at index 0, level (1 << (i - 1))
+ * at index i.  Every depth sharing a level shares a slot.
+ */
+static inline
+unsigned int ft_lock_level_index(unsigned int depth)
+{
+	if (!depth)
+		return 0;
+	return (sizeof(unsigned int) * CHAR_BIT) -
+		(unsigned int) __builtin_clz(depth);
+}
 
 /*
  * Number of bytes of safe over-read past a caller's key_len that the
