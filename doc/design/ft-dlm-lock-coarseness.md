@@ -437,6 +437,75 @@ converts a validated edge into a park.
 
 ---
 
+## 9. Acquire-site inventory (2026-08-07)
+
+**Anchoring is all-or-nothing (§1), so the conversion cannot be incremental.**
+The moment one site anchors while another still locks the node, a coarser
+spacing excludes nothing — and a mostly single-writer suite still reports green,
+which is a false green on the one invariant the design rests on. Non-per-node
+spacings are therefore REFUSED by
+`cds_ft_group_attr_set_lock_spacing` (and the env override ignored) unless
+`FEATURE_FT_ANCHOR_VALIDATE` is defined; the gate lifts when this table is
+fully converted.
+
+**40 acquire sites across 23 functions** — 33 `ft_meta_lock_acquire`,
+5 `ft_dlm_lock`, 2 `ft_dlm_acquire_set`. By plumbing distance:
+
+### Tier 0 — depth already in hand (17 sites)
+
+| function | n | source |
+|---|---|---|
+| `ft_detach_node` (`ft-remove.h:1061`) | 4 | `detach_depth` param |
+| **`ft_node_recompact` (`ft-mutation-node.h:1131`)** | 4 | **`node_depth` param — present but `__attribute__((unused))`** |
+| `ft_rekey_graft_simple_attempt` (`fractal-trie.c:844`) | 3 | local `d_src` / `d_dst` |
+| `_cds_ft_insert` (`ft-insert.h:2697`) | 2 | local descent |
+| `ft_split_compressed_graft_build`, `ft_insert_compressed_key_shorter`, `ft_merge_spine_copy` | 3 | `struct ft_descent *` param |
+| `ft_split_compressed_insert` (`ft-insert.h:798`) | 1 | `node_depth` param |
+
+`ft_node_recompact` already **receives** the depth and discards it. Callers pass
+a real value (`ft-mutation-node.h:2785`). Dropping the `unused` attribute is the
+whole plumbing for the largest single cluster.
+
+### Tier 1 — one hop (6 sites)
+
+`ft_insert_dlm_acquire_split` (2; both callers have depth) and
+`ft_rekey_cow_stop` (4; caller holds `d_src`).
+
+### Tier 2 — no depth, multi-hop (14 sites)
+
+`ft_chain_compress_fused` (4), `ft_detach_node_replace_compressed_parent` (2),
+`ft_graft_keylen`, `_cds_ft_replace_locked`, `ft_merge_lock_overlap`,
+`ft_root_attach_fence_empty`, `ft_glue_acquire_reparent_marks`,
+`ft_glue_acquire_splice_holders`, `ft_detach_orphan_planlock`,
+`ft_unchain_node` (1 each).
+
+**Eight of these sit under the node-handle remove path** — exactly the §5.3
+hole. This tier is the real cost of the conversion, and it is where the
+remove-must-descend decision has to be made concrete.
+
+### Wrappers (2 sites, high leverage)
+
+`ft_flip_txn_lock_or_guard_parent` (`ft-mutation-helpers.h:2384`) is **one**
+conversion covering **13 call sites** — though each caller must still supply a
+depth. `ft_dlm_acquire_set` takes a member array, so it grows a per-member
+depth.
+
+### Dead (1 site)
+
+`ft_lock_member` (`ft-mutation-helpers.h:1042`) has **zero callers** — only
+comment references. It needs no conversion; it needs deleting.
+
+### Completeness is a machine check, not an audit
+
+Route every acquire through the anchored wrapper, and under the validate build
+assert the raw `ft_meta_lock_acquire` / `ft_dlm_lock` are unreachable directly.
+"Did we convert them all" is then answered by the build and the suite rather
+than by this table staying accurate.
+
+The suites are largely single-writer, so they check the MAPPING (same node →
+same anchor), not exclusion. Proving exclusion holds under a coarser spacing
+needs a multi-writer oracle per setting.
+
 ## 8. Rejected
 
 * **Partial coarsening** (anchor only descent-reached lock-sets) — unsafe, §1.

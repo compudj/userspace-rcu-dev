@@ -2919,6 +2919,13 @@ enum cds_ft_lock_spacing {
  * Meaningful only under CDS_FT_WRITER_LOCK_FINE.  The best setting is
  * workload-shaped -- it depends on trie depth, key distribution and how
  * disjoint the writers are -- so it is a knob rather than a fixed schedule.
+ *
+ * Anchoring is ALL-OR-NOTHING: two ops mutating one node must acquire the SAME
+ * word, so a spacing coarser than per-node is correct only once every acquire
+ * site maps its members through the anchor.  Until then
+ * CDS_FT_LOCK_SPACING_EXPONENTIAL and CDS_FT_LOCK_SPACING_ROOT_ONLY are
+ * REFUSED with CDS_FT_STATUS_INVALID_ARGUMENT_ERROR, rather than offered as a
+ * setting that silently excludes nothing.
  */
 enum cds_ft_status cds_ft_group_attr_set_lock_spacing(
 		struct cds_ft_group_attr *attr,

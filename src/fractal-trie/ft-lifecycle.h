@@ -317,6 +317,7 @@ enum cds_ft_status cds_ft_group_attr_set_writer_strategy(
 static
 enum cds_ft_lock_spacing ft_lock_spacing_default(void)
 {
+#ifdef FEATURE_FT_ANCHOR_VALIDATE
 	const char *env = getenv("CDS_FT_LOCK_SPACING");
 
 	if (env) {
@@ -325,6 +326,7 @@ enum cds_ft_lock_spacing ft_lock_spacing_default(void)
 		if (!strcmp(env, "root-only"))
 			return CDS_FT_LOCK_SPACING_ROOT_ONLY;
 	}
+#endif
 	return CDS_FT_LOCK_SPACING_PER_NODE;
 }
 
@@ -334,13 +336,34 @@ enum cds_ft_status cds_ft_group_attr_set_lock_spacing(
 {
 	switch (spacing) {
 	case CDS_FT_LOCK_SPACING_PER_NODE:
+		break;
 	case CDS_FT_LOCK_SPACING_EXPONENTIAL:
 	case CDS_FT_LOCK_SPACING_ROOT_ONLY:
-		attr->lock_spacing = spacing;
-		attr->lock_spacing_set = true;
-		return CDS_FT_STATUS_OK;
+		/*
+		 * ANCHORING IS ALL-OR-NOTHING: two ops that mutate one node must
+		 * acquire the SAME word, so a spacing coarser than per-node is
+		 * correct only once EVERY acquire site maps its members through
+		 * the anchor.  While any site still locks the node itself, a
+		 * coarser setting has converted sites anchoring on an ancestor
+		 * and unconverted ones on the node -- excluding nothing, and
+		 * quietly, since a mostly single-writer suite still passes.
+		 * Refuse it rather than ship a selectable config that is wrong.
+		 *
+		 * FEATURE_FT_ANCHOR_VALIDATE keeps the setting reachable for the
+		 * development sweep: it is not a shippable configuration, and
+		 * without it the anchor table has no test config at all.
+		 */
+#ifndef FEATURE_FT_ANCHOR_VALIDATE
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+#else
+		break;
+#endif
+	default:
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
 	}
-	return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	attr->lock_spacing = spacing;
+	attr->lock_spacing_set = true;
+	return CDS_FT_STATUS_OK;
 }
 
 enum cds_ft_status cds_ft_attr_create(struct cds_ft_attr **result)

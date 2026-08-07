@@ -3125,8 +3125,10 @@ static int test_lifecycle_lock_spacing(void)
 {
 	static const enum cds_ft_lock_spacing spacings[] = {
 		CDS_FT_LOCK_SPACING_PER_NODE,
+#ifdef FEATURE_FT_ANCHOR_VALIDATE
 		CDS_FT_LOCK_SPACING_EXPONENTIAL,
 		CDS_FT_LOCK_SPACING_ROOT_ONLY,
+#endif
 	};
 	static const char *const keys[] = {
 		"a", "ab", "abc",
@@ -3151,6 +3153,23 @@ static int test_lifecycle_lock_spacing(void)
 			cds_ft_group_attr_destroy(attr);
 			return -1;
 		}
+#ifndef FEATURE_FT_ANCHOR_VALIDATE
+		/*
+		 * Anchoring is all-or-nothing, so a spacing coarser than per-node
+		 * is refused until every acquire site maps through the anchor.
+		 */
+		if (cds_ft_group_attr_set_lock_spacing(attr,
+				CDS_FT_LOCK_SPACING_EXPONENTIAL)
+					!= CDS_FT_STATUS_INVALID_ARGUMENT_ERROR ||
+		    cds_ft_group_attr_set_lock_spacing(attr,
+				CDS_FT_LOCK_SPACING_ROOT_ONLY)
+					!= CDS_FT_STATUS_INVALID_ARGUMENT_ERROR) {
+			fprintf(stderr, "coarser-than-per-node spacing was accepted "
+				"while the conversion is incomplete\n");
+			cds_ft_group_attr_destroy(attr);
+			return -1;
+		}
+#endif
 		cds_ft_group_attr_destroy(attr);
 	}
 
