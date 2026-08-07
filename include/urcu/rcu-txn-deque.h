@@ -94,31 +94,60 @@ struct urcu_txn_deque_node {
 	struct urcu_txn_deque_node *next;	/* transacted slot */
 	struct urcu_txn_deque_node *prev;	/* transacted slot */
 	struct urcu_txn_deque      *owner;	/* transacted slot; NULL = free */
-	unsigned long		    seq;	/* transacted slot; see below */
 };
 
 /*
- * seq -- the MEMBERSHIP SEQUENCE, and why `owner` alone is not enough.
+ * WHY THERE IS NO MEMBERSHIP SEQUENCE, and why `owner` plus the links is enough.
  *
- * `owner` fixes the desync between membership and the links, because it is
- * written by the same commit that moves the edges.  It does NOT fix ABA: it
- * takes two values, so a transaction that reads owner == d, has the node
- * removed and re-added underneath it, and validates at commit, sees owner == d
- * again and accepts a derivation taken from a membership that no longer exists.
+ * A node used to carry a `seq` bumped by every membership transition, validated
+ * by any transaction that had DERIVED a slot from that node -- the classic
+ * version counter against ABA.  It was removed once the ABA it defends against
+ * was separated into its two kinds:
  *
- * seq is bumped by EVERY membership transition (push and remove) and never
- * decreases, so "unchanged since I read it" becomes decidable.  A remove
- * derives &prev->next from &n->prev and must therefore prove @prev is still
- * the member it read -- and it cannot do that by validating &prev->next,
- * because that is the very slot it stores to, and a validate plus a store on
- * one slot is the same-slot merge the list documents as corrupting.  seq is a
- * SEPARATE slot, which is the whole point: liveness can be checked inside the
- * conflict set without colliding with the edge being written.
+ *   IDENTITY ABA -- the node is freed and the address reused as a different
+ *   object.  RCU excludes it.  Mutators run inside a read-side critical section
+ *   (this file's contract, and the reason remove() may dereference neighbours
+ *   at all), so no node under derivation can be reclaimed.
  *
- * Bumped by 2, never 1: bit 0 is reserved for the engine's descriptor proxy
- * tag on every transacted slot, so the value must stay even.
+ *   STRUCTURAL ABA -- the same node leaves the deque and returns.  Pointer
+ *   identity never changed; only the membership epoch did.  This is the one a
+ *   version counter would catch.
+ *
+ * ⭐ AND STRUCTURAL ABA IS ALREADY HANDLED, BY THE EXPECTED-OLD.  Every derived
+ * write in this file is a store_mw whose expected-old is a STRUCTURAL FACT, not
+ * a version:
+ *
+ *	remove:     &prev->next : n -> next	&next->prev : n -> prev
+ *	push_tail:  &oldtail->next : sent -> n	&sent->prev : oldtail -> n
+ *	rotate:     all six edges, likewise
+ *
+ * "&prev->next is still n" is not a value coincidence -- it is the assertion
+ * "prev currently points at n".  Once identity ABA is off the table, only the
+ * real object can satisfy it, and if it holds at commit then splicing n out
+ * from between prev and next is correct NO MATTER how many times prev left and
+ * came back.  The derivation's provenance is irrelevant; the current structure
+ * is what the write is checked against.
+ *
+ * MEASURED, not argued: a repro that forces exactly the documented ABA -- hold
+ * a transaction between remove_prepare() and commit(), have a peer remove and
+ * re-push the predecessor and rotate the whole neighbourhood back into place --
+ * committed with the ring intact once the guard was gone, while the guard had
+ * been aborting it.  Removing the guard was worth ~1.13x committed ops on a
+ * 32-writer deque stress (2.26M vs 2.00M, ranges not overlapping over 5 runs
+ * each), because `seq` was WRITTEN by every membership transition and VALIDATED
+ * by every neighbouring one: it manufactured conflicts between operations that
+ * are otherwise disjoint.
+ *
+ * ⚠ WHAT WOULD BRING IT BACK.  The argument rests on an invariant -- A LIVE RING
+ * LINK NAMES A MEMBER -- which is what lets the load_validate on &n->prev carry
+ * prev's membership.  remove(prev) rewrites its successor's prev, so a removed
+ * node cannot stay named by a live link.  Add an operation that points a link
+ * at a non-member, or drop the neighbour load_validates for speed, and a
+ * removed node's stale `next` becomes reachable as an expected-old again -- the
+ * hazard this file already warns about ("that CAS can even SUCCEED, because a
+ * removed node's next is never cleared").  Then the version counter is needed
+ * again, and this comment is the place to say so.
  */
-#define URCU_TXN_DEQUE_SEQ_STEP	2UL
 
 /*
  * POISON -- the TERMINAL owner value, and the only state a node cannot leave.
@@ -148,7 +177,7 @@ struct urcu_txn_deque_node {
  *
  * ⚠ TERMINAL PER LIFETIME, NOT PER ADDRESS.  urcu_txn_deque_node_init() clears
  * it, so recycled storage starts unsealed -- which is both correct and the only
- * way to reuse a node.  Same rule `seq` has, for the same reason.
+ * way to reuse a node.
  *
  * The value is a compile-time constant that is never a real deque, with bit 0
  * clear because that bit is the engine's descriptor-proxy tag on every
@@ -157,20 +186,6 @@ struct urcu_txn_deque_node {
  * two TUs would disagree about what "sealed" is.
  */
 #define URCU_TXN_DEQUE_POISON	((struct urcu_txn_deque *) (uintptr_t) 0x100UL)
-
-/*
- * The guard itself, compile-out-able so its load-bearingness can be MEASURED
- * rather than asserted.  A guard whose removal changes nothing is a guard that
- * the test does not exercise, and this project has shipped three rules whose
- * tests could not have failed.
- */
-#ifdef URCU_TXN_DEQUE_NO_SEQ_GUARD
-#define URCU_TXN_DEQUE_SEQ_GUARD(txn, node)	do { (void) (node); } while (0)
-#else
-#define URCU_TXN_DEQUE_SEQ_GUARD(txn, node)				\
-	((void) urcu_txn_load_validate((txn), (void **) &(node)->seq,	\
-			URCU_TXN_TAG))
-#endif
 
 struct urcu_txn_deque {
 	struct urcu_txn_deque_node sentinel;	/* circular: next = head, prev = tail */
@@ -201,7 +216,6 @@ void urcu_txn_deque_node_init(struct urcu_txn_deque_node *n)
 	n->next = NULL;
 	n->prev = NULL;
 	n->owner = NULL;
-	n->seq = 0;
 }
 
 /* Resolve a raw slot value: only the engine's proxy tag can be set here. */
@@ -331,7 +345,7 @@ int urcu_txn_deque_push_tail_prepare(struct urcu_txn *txn,
 		struct urcu_txn_deque *d, struct urcu_txn_deque_node *n)
 {
 	struct urcu_txn_deque_node *sent = &d->sentinel, *oldtail;
-	void *own, *nn, *np, *sq;
+	void *own, *nn, *np;
 	int ret;
 
 	own = urcu_txn_load(txn, (void **) &n->owner, URCU_TXN_TAG);
@@ -349,21 +363,15 @@ int urcu_txn_deque_push_tail_prepare(struct urcu_txn *txn,
 			urcu_txn_load(txn, (void **) &sent->prev, URCU_TXN_TAG));
 	nn = urcu_txn_load(txn, (void **) &n->next, URCU_TXN_TAG);
 	np = urcu_txn_load(txn, (void **) &n->prev, URCU_TXN_TAG);
-	sq = urcu_txn_load(txn, (void **) &n->seq, URCU_TXN_TAG);
 	/*
 	 * @oldtail's identity came from &sent->prev and its &oldtail->next slot
 	 * is written below, so its LINK is covered -- but that only proves the
 	 * slot still holds the sentinel, not that @oldtail is the same
-	 * membership we read.  Validate its seq, which is not a slot this
-	 * transaction writes.
+	 * membership we read -- and that is enough: the store below carries
+	 * &oldtail->next : sent -> n, whose expected-old asserts the structure
+	 * rather than a version.  See the no-membership-sequence note above.
 	 */
-	if (oldtail != sent)
-		URCU_TXN_DEQUE_SEQ_GUARD(txn, oldtail);
-
 	ret = urcu_txn_store_mw(txn, (void **) &n->owner, NULL, d, URCU_TXN_TAG);
-	ret |= urcu_txn_store_mw(txn, (void **) &n->seq, sq,
-			(void *) ((uintptr_t) sq + URCU_TXN_DEQUE_SEQ_STEP),
-			URCU_TXN_TAG);
 	ret |= urcu_txn_store_mw(txn, (void **) &n->next, nn, sent,
 			URCU_TXN_TAG);
 	ret |= urcu_txn_store_mw(txn, (void **) &n->prev, np, oldtail,
@@ -408,7 +416,7 @@ int urcu_txn_deque__remove_to(struct urcu_txn *txn,
 		struct urcu_txn_deque *newowner)
 {
 	struct urcu_txn_deque_node *prev, *next;
-	void *own, *sq;
+	void *own;
 	int ret;
 
 	own = urcu_txn_load(txn, (void **) &n->owner, URCU_TXN_TAG);
@@ -446,25 +454,17 @@ int urcu_txn_deque__remove_to(struct urcu_txn *txn,
 			urcu_txn_load_validate(txn, (void **) &n->next,
 					URCU_TXN_TAG));
 
-	sq = urcu_txn_load(txn, (void **) &n->seq, URCU_TXN_TAG);
 	/*
-	 * THE ABA GUARD.  @prev and @next are derived from @n's links, and this
-	 * transaction writes &prev->next and &next->prev -- so their LINKS are
-	 * covered, but a neighbour that was removed and re-added since the read
-	 * would present the same link value and the same owner.  Their seqs are
-	 * separate slots and monotone, so validating them makes "still the
-	 * member I derived from" decidable.  Skipped for the sentinel, which is
-	 * immortal and never transitions.
+	 * ⭐ THE DERIVATION IS SAFE WITHOUT A VERSION, and the two stores below
+	 * are why: each carries expected-old @n, i.e. "prev still points at n"
+	 * and "next still points back at n".  A neighbour that was removed and
+	 * re-added since the read presents the same link value -- but if the
+	 * links still say prev -> n -> next at commit, splicing @n out is the
+	 * correct edit whatever that neighbour's history was.  See the
+	 * no-membership-sequence note at the top of this file for the full
+	 * argument and for what would invalidate it.
 	 */
-	if (prev != &d->sentinel)
-		URCU_TXN_DEQUE_SEQ_GUARD(txn, prev);
-	if (next != &d->sentinel && next != prev)
-		URCU_TXN_DEQUE_SEQ_GUARD(txn, next);
-
 	ret = urcu_txn_store_mw(txn, (void **) &n->owner, d, newowner,
-			URCU_TXN_TAG);
-	ret |= urcu_txn_store_mw(txn, (void **) &n->seq, sq,
-			(void *) ((uintptr_t) sq + URCU_TXN_DEQUE_SEQ_STEP),
 			URCU_TXN_TAG);
 	/*
 	 * A single-element deque has prev == next == sentinel, so these two
@@ -519,9 +519,8 @@ int urcu_txn_deque_remove_seal_prepare(struct urcu_txn *txn,
  * -ESTALE.  There is no third outcome, which is what makes a kill path
  * expressible as a bounded loop.
  *
- * NO SEQ BUMP, deliberately.  seq is bumped by every MEMBERSHIP transition so
- * that a peer holding a derivation can tell the membership changed -- and a
- * node that was already a non-member is in nobody's derivation.  Sealing it is
+ * NOTHING TO ANNOUNCE, deliberately.  A node that was already a non-member is
+ * in nobody's derivation, so a seal changes no peer's view.  Sealing it is
  * a transition of the node's fate, not of its membership.
  *
  * Returns 0, -EEXIST if @n is currently queued (use remove_seal), -ESTALE if it
@@ -602,14 +601,11 @@ int urcu_txn_deque_rotate_head_prepare(struct urcu_txn *txn,
 		return -EAGAIN;
 
 	/*
-	 * A rotate changes no node's MEMBERSHIP, so it bumps no seq -- keeping
-	 * it from needlessly aborting peers.  But @hn and @t are derived
-	 * identities whose slots it writes, so guard them the same way.
+	 * A rotate changes no node's MEMBERSHIP.  @hn and @t are derived
+	 * identities whose slots it writes, and each such write carries a
+	 * structural expected-old, which is what makes the derivation safe --
+	 * see the no-membership-sequence note above.
 	 */
-	URCU_TXN_DEQUE_SEQ_GUARD(txn, hn);
-	if (t != hn)
-		URCU_TXN_DEQUE_SEQ_GUARD(txn, t);
-
 	ret = urcu_txn_store_mw(txn, (void **) &sent->next, h, hn,
 			URCU_TXN_TAG);
 	ret |= urcu_txn_store_mw(txn, (void **) &hn->prev, h, sent,
