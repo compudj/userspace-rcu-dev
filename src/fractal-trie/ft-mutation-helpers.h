@@ -232,22 +232,61 @@ void ft_descent_enter_node(struct ft_descent *d, struct cds_ft_inode_flag *nf,
  * it is the boundary a still-pending level is waiting for, since a level goes
  * pending only from the LAST entered node and that node ends at @d->depth.
  */
+/*
+ * The node starting at the first node boundary at or after lock level @lvl,
+ * taking no boundary later than @clamp; the coverer of @lvl if none qualifies.
+ * @lvl must be a lock level the descent has crossed (or the cursor's own).
+ *
+ * @clamp is a separate argument because it is NOT always the depth that chose
+ * the level: an immediate child of the cursor takes ITS level but clamps at its
+ * OWN depth, which lies past the cursor.
+ */
+static inline
+struct cds_ft_inode_flag *ft_descent_anchor_at_level(const struct ft_descent *d,
+		unsigned int lvl, unsigned int clamp)
+{
+	const struct ft_lock_anchor *a;
+	unsigned int i;
+
+	if (lvl == d->depth)
+		return d->nf;
+	i = ft_lock_level_index(lvl);
+	a = &d->anchor[i];
+	assert(d->anchor_crossed & (1U << i));
+	if (a->bound_start <= clamp)
+		return a->bound ? a->bound : d->nf;
+	return a->cover;
+}
+
 static inline
 struct cds_ft_inode_flag *ft_descent_anchor(const struct ft_descent *d,
 		unsigned int depth)
 {
-	unsigned int i, lvl = ft_lock_level(depth);
-	const struct ft_lock_anchor *a;
-
 	assert(depth <= d->depth);
-	if (lvl == d->depth)
-		return d->nf;
-	i = ft_lock_level_index(depth);
-	a = &d->anchor[i];
-	assert(d->anchor_crossed & (1U << i));
-	if (a->bound_start <= depth)
-		return a->bound ? a->bound : d->nf;
-	return a->cover;
+	return ft_descent_anchor_at_level(d, ft_lock_level(depth), depth);
+}
+
+/*
+ * The anchor for @child_nf, the cursor's IMMEDIATE child, sitting at byte-depth
+ * @child_depth -- the below-cursor case ft_descent_anchor refuses (§7.1).
+ *
+ * Only two boundaries lie in (@d->depth, @child_depth]: the cursor's own start
+ * and the child's, because the cursor spans the whole gap -- one slot hop, or a
+ * compressed run of cn->len bytes.  So the child anchors on ITSELF when its
+ * level falls past the cursor, and otherwise on whatever the table already
+ * holds for that level.  Callers with a deeper member must extend the descent
+ * rather than reach further with this.
+ */
+static inline
+struct cds_ft_inode_flag *ft_descent_anchor_child(const struct ft_descent *d,
+		struct cds_ft_inode_flag *child_nf, unsigned int child_depth)
+{
+	unsigned int lvl = ft_lock_level(child_depth);
+
+	assert(child_depth > d->depth);
+	if (lvl > d->depth)
+		return child_nf;
+	return ft_descent_anchor_at_level(d, lvl, child_depth);
 }
 
 /*

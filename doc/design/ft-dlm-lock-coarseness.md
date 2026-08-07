@@ -339,6 +339,12 @@ holds ancestors only, so a below-pivot member is not in it.
 Closable without extending the ring: a member one hop below the pivot has only
 two candidate boundaries in `[L(depth(member)), depth(member)]` — the pivot's
 span and the member's own — and both are in hand at the acquire site.
+**`ft_descent_anchor_child()` implements exactly that**, and
+`ft_descent_anchor_at_level()` is the shared core: an immediate child takes ITS
+level but clamps at its OWN depth, which lies past the cursor, so the level and
+the clamp had to stop being the same argument. A member deeper than one hop has
+intermediate boundaries the table never saw — such a caller must extend the
+descent, not reach further with this.
 
 Note this set is derived entirely from back-pointers
 (`rcu_dereference(iter_meta->parent_word)`, `ft_resolve_parent_slot`), consistent
