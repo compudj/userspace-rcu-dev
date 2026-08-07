@@ -924,6 +924,20 @@ int ft_meta_lock_acquire(struct cds_ft_metadata *meta,
 {
 	uintptr_t s = CMM_LOAD_SHARED(meta->state);
 
+#ifdef FEATURE_FT_AGREEMENT_RED
+	/*
+	 * RED CONTROL for the agreement oracle (NOT a shipping configuration).
+	 * Report the lock as taken WITHOUT excluding anyone: peers see the word
+	 * clean and acquire it too.  This is exactly what a lock-set that does
+	 * not agree on its mapping produces -- two writers mutating one node,
+	 * each believing it holds it.  An oracle that stays GREEN under this
+	 * cannot certify the anchored conversion.
+	 */
+	if (!(s & (FT_STATE_PROXY | FT_STATE_TOMBSTONE))) {
+		*state_snapshot = s;
+		return 0;
+	}
+#endif
 	if (caa_unlikely(s & (FT_STATE_PROXY | FT_STATE_TOMBSTONE |
 			FT_STATE_LOCK)))
 		return -EAGAIN;
@@ -965,6 +979,17 @@ void ft_meta_lock_release(struct cds_ft_metadata *meta)
 		 * foreign state bits, so the bit is still set here (NDEBUG
 		 * builds degrade to a harmless same-value CAS if it is not).
 		 */
+#ifdef FEATURE_FT_AGREEMENT_RED
+		/*
+		 * The RED control never SET the bit, so its release must not
+		 * demand one: the point is to remove EXCLUSION while leaving the
+		 * protocol's bookkeeping self-consistent, so any corruption the
+		 * oracle reports comes from two writers sharing a node -- not
+		 * from a half-broken lock discipline.
+		 */
+		if (!(s & FT_STATE_LOCK))
+			return;
+#endif
 		assert(s & FT_STATE_LOCK);
 		if (caa_likely(uatomic_cmpxchg(&meta->state, s,
 				s & ~FT_STATE_LOCK) == s))
