@@ -1,7 +1,7 @@
 # DLM lock coarseness — the anchor rule
 
-Status: **anchor rule settled; the descent-side CAPTURE is IMPLEMENTED and
-INERT** (no acquire site consumes it yet). Working note (untracked). Extends
+Status: **anchor rule settled; the descent-side CAPTURE and the GRANULARITY KNOB
+are IMPLEMENTED and INERT** (no acquire site consumes the anchor yet). Extends
 `mw-writer-lock-escalation-model.md` (the DLM whose granularity this
 parameterises) and the mode axis in `[[project_ft_two_writer_modes_plan]]`.
 
@@ -290,20 +290,37 @@ does a same-mcas read plus a stability re-read per hop, and its unbounded
 
 ---
 
-## 6. The knob
+## 6. The knob — LANDED
 
-The spacing is a group attribute, alongside
-`cds_ft_group_attr_set_writer_strategy`. The enum becomes a granularity axis:
-per-node at the fine end (`anchor(X) = X`, today's behaviour), the exponential
-schedule in the middle, root-only at the coarse end (identical to
-`CDS_FT_WRITER_LOCK_COARSE`).
+`enum cds_ft_lock_spacing` + `cds_ft_group_attr_set_lock_spacing()`, resolved at
+group create and copied to each trie and then to each descent. The enum is the
+granularity axis:
 
-The default must come from the bench, not a guess — the win is workload-shaped
-(trie depth, key distribution, writer disjointness). Follow
-`[[project_bench_methodology_checklist]]`.
+| setting | anchor | note |
+|---|---|---|
+| `CDS_FT_LOCK_SPACING_PER_NODE` (default) | `X` itself | today's behaviour |
+| `CDS_FT_LOCK_SPACING_EXPONENTIAL` | §2 rule over levels `0,1,2,4,8,…` | |
+| `CDS_FT_LOCK_SPACING_ROOT_ONLY` | the root node | meets `CDS_FT_WRITER_LOCK_COARSE` from the other side |
 
-Because the knob decides whether remove pays a descent (§5.3), the per-node
-setting must remain a genuine zero-cost path, not a schedule with spacing 1.
+Per-node is a genuine zero-cost path, not a schedule with spacing 1:
+`ft_descent_enter_node` returns immediately, so it builds no table and reads
+none. Root-only fills slot 0 and returns on every later node. This matters
+because the setting also decides whether remove pays a descent (§5.3).
+
+The default stays PER_NODE — current semantics — until the bench picks
+otherwise; the win is workload-shaped (trie depth, key distribution, writer
+disjointness). Follow `[[project_bench_methodology_checklist]]`.
+
+**Coverage.** With PER_NODE as the default the table would be dead in every test
+config, so the resolution of the DEFAULT (never an explicit
+`cds_ft_group_attr_set_lock_spacing`, which always wins) honours a
+`CDS_FT_LOCK_SPACING` env override — `per-node` / `exponential` / `root-only` —
+letting a whole suite sweep the axis. `FEATURE_FT_ANCHOR_VALIDATE` additionally
+exercises the anchor LOOKUP from the descent at the depths an acquire site
+queries, since until an acquire site consumes the table
+`ft_descent_enter_node` is the only half the suites otherwise reach.
+`test_lifecycle_lock_spacing` covers the API contract and all three settings
+without the env var.
 
 ---
 

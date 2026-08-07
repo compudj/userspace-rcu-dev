@@ -307,6 +307,42 @@ enum cds_ft_status cds_ft_group_attr_set_writer_strategy(
 	return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
 }
 
+/*
+ * The lock-set granularity a group takes when the caller chose none:
+ * CDS_FT_LOCK_SPACING env override ("per-node" / "exponential" / "root-only"),
+ * else per-node.  An explicit cds_ft_group_attr_set_lock_spacing always wins --
+ * this moves the DEFAULT only, so a test run can sweep the granularity axis
+ * across a whole suite without every group-create site growing a knob.
+ */
+static
+enum cds_ft_lock_spacing ft_lock_spacing_default(void)
+{
+	const char *env = getenv("CDS_FT_LOCK_SPACING");
+
+	if (env) {
+		if (!strcmp(env, "exponential"))
+			return CDS_FT_LOCK_SPACING_EXPONENTIAL;
+		if (!strcmp(env, "root-only"))
+			return CDS_FT_LOCK_SPACING_ROOT_ONLY;
+	}
+	return CDS_FT_LOCK_SPACING_PER_NODE;
+}
+
+enum cds_ft_status cds_ft_group_attr_set_lock_spacing(
+		struct cds_ft_group_attr *attr,
+		enum cds_ft_lock_spacing spacing)
+{
+	switch (spacing) {
+	case CDS_FT_LOCK_SPACING_PER_NODE:
+	case CDS_FT_LOCK_SPACING_EXPONENTIAL:
+	case CDS_FT_LOCK_SPACING_ROOT_ONLY:
+		attr->lock_spacing = spacing;
+		attr->lock_spacing_set = true;
+		return CDS_FT_STATUS_OK;
+	}
+	return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+}
+
 enum cds_ft_status cds_ft_attr_create(struct cds_ft_attr **result)
 {
 	struct cds_ft_attr *attr = calloc(1, sizeof(struct cds_ft_attr));
@@ -506,6 +542,13 @@ enum cds_ft_status _cds_ft_group_create(const struct cds_ft_group_attr *attr,
 		ft_group->writer_strategy = attr->writer_strategy_set ?
 			attr->writer_strategy : CDS_FT_WRITER_LOCK_FINE;
 		/*
+		 * calloc-zero is not a valid spacing (the enumerators start at
+		 * 1), hence @lock_spacing_set: unset resolves to per-node, the
+		 * granularity at which a writer locks exactly what it mutates.
+		 */
+		ft_group->lock_spacing = attr->lock_spacing_set ?
+			attr->lock_spacing : ft_lock_spacing_default();
+		/*
 		 * Order statistics maintain ONE global count on the root's nr_keys
 		 * word, which EVERY count-changing mutation walks up to and updates
 		 * (ft_flip_txn_record_count_parent to the root) -- so no two
@@ -543,6 +586,7 @@ enum cds_ft_status _cds_ft_group_create(const struct cds_ft_group_attr *attr,
 		ft_group->numa_policy = CDS_FT_NUMA_DEFAULT;
 		ft_group->optimize = CDS_FT_OPTIMIZE_THROUGHPUT;
 		ft_group->writer_strategy = CDS_FT_WRITER_LOCK_FINE;	/* DLM default */
+		ft_group->lock_spacing = ft_lock_spacing_default();
 	}
 	*result_ft_group = ft_group;
 	FT_TP(group_create, (const void *) ft_group);
@@ -832,6 +876,7 @@ enum cds_ft_status cds_ft_create(struct cds_ft_group *ft_group,
 	 * of the group strategy so the hooks read one trie field each.
 	 */
 	ft->lock_fine = (ft_group->writer_strategy == CDS_FT_WRITER_LOCK_FINE);
+	ft->lock_spacing = ft_group->lock_spacing;
 	cds_fair_mutex_init(&ft->writer_lock);
 	/* Move mode gate (struct cds_ft::move_active): movers only. */
 	pthread_mutex_init(&ft->move_gate_lock, NULL);

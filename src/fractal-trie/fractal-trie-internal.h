@@ -1324,6 +1324,15 @@ struct cds_ft_group {
 	 * group create from @writer_strategy_set.
 	 */
 	enum cds_ft_writer_strategy writer_strategy;
+	/*
+	 * Granularity of the per-node lock-sets a FINE trie takes: how far up
+	 * the descent a writer anchors each lock-set member
+	 * (doc/design/ft-dlm-lock-coarseness.md).  Copied to each trie at
+	 * create; resolved at group create from @lock_spacing_set, default
+	 * CDS_FT_LOCK_SPACING_PER_NODE.  Inert under COARSE, which derives no
+	 * lock-set.
+	 */
+	enum cds_ft_lock_spacing lock_spacing;
 	/* Allocation arenas. */
 	struct cds_ft_alloc_arena *arena_order[FT_ALLOC_ORDER_MAX + 1];
 	/*
@@ -1700,6 +1709,13 @@ struct cds_ft {
 	 * conversions land.
 	 */
 	bool lock_fine;
+
+	/*
+	 * Hot-path copy of the group's lock-set granularity, read by the
+	 * mutation descent (ft_descent_init) to decide how far up it anchors
+	 * each lock-set member.  Inert unless @lock_fine.
+	 */
+	enum cds_ft_lock_spacing lock_spacing;
 
 
 	/*
@@ -3143,6 +3159,14 @@ struct cds_ft_group_attr {
 	 * cds_ft_group_attr_set_writer_strategy.
 	 */
 	enum cds_ft_writer_strategy writer_strategy;
+	/*
+	 * Granularity of the per-node lock-sets under CDS_FT_WRITER_LOCK_FINE.
+	 * Meaningful only when @lock_spacing_set; otherwise the group takes the
+	 * CDS_FT_LOCK_SPACING_PER_NODE default.  See
+	 * cds_ft_group_attr_set_lock_spacing.
+	 */
+	enum cds_ft_lock_spacing lock_spacing;
+	bool lock_spacing_set;
 };
 
 struct cds_ft_attr {

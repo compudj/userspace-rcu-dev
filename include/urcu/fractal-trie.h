@@ -2885,6 +2885,46 @@ enum cds_ft_status cds_ft_group_attr_set_writer_strategy(
 		enum cds_ft_writer_strategy strategy);
 
 /*
+ * Granularity of the per-node lock-sets a CDS_FT_WRITER_LOCK_FINE trie takes
+ * (doc/design/ft-dlm-lock-coarseness.md).  A writer normally locks each node it
+ * mutates; spacing the locks lets it instead lock an ANCESTOR at a designated
+ * key-byte depth, so lock-set members that share one such level collapse onto
+ * one lock word.  Readers are unaffected under every setting; this trades
+ * writer parallelism against the cost and width of an acquire.
+ *
+ * Ignored by CDS_FT_WRITER_LOCK_COARSE, which derives no lock-set at all.
+ *
+ * CDS_FT_LOCK_SPACING_PER_NODE (the DEFAULT): a writer locks exactly the nodes
+ *   it mutates -- maximum writer parallelism, widest acquire.
+ * CDS_FT_LOCK_SPACING_EXPONENTIAL: lock levels at key-byte depths 0, 1, 2, 4,
+ *   8, ... -- dense near the root, where one lock covers a subtree that may be
+ *   half the trie, and sparse deeper, where a subtree is small enough that a
+ *   lock spanning many levels excludes little.
+ * CDS_FT_LOCK_SPACING_ROOT_ONLY: the root is the only lock level, so every
+ *   writer serializes on it.  This is the granularity axis meeting
+ *   CDS_FT_WRITER_LOCK_COARSE from the other side: one lock per trie.
+ */
+enum cds_ft_lock_spacing {
+	CDS_FT_LOCK_SPACING_PER_NODE = 1,
+	CDS_FT_LOCK_SPACING_EXPONENTIAL = 2,
+	CDS_FT_LOCK_SPACING_ROOT_ONLY = 3,
+};
+
+/*
+ * cds_ft_group_attr_set_lock_spacing - Select the granularity of the group's
+ *   per-node lock-sets (enum cds_ft_lock_spacing); the default is
+ *   CDS_FT_LOCK_SPACING_PER_NODE.  Returns CDS_FT_STATUS_OK, or
+ *   CDS_FT_STATUS_INVALID_ARGUMENT_ERROR for an unknown @spacing.
+ *
+ * Meaningful only under CDS_FT_WRITER_LOCK_FINE.  The best setting is
+ * workload-shaped -- it depends on trie depth, key distribution and how
+ * disjoint the writers are -- so it is a knob rather than a fixed schedule.
+ */
+enum cds_ft_status cds_ft_group_attr_set_lock_spacing(
+		struct cds_ft_group_attr *attr,
+		enum cds_ft_lock_spacing spacing);
+
+/*
  * cds_ft_attr_create - Create a per-instance Fractal Trie attribute
  *                      structure.
  * @result: Attribute output. Set to the newly created attribute

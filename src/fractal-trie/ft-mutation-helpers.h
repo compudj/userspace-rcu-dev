@@ -70,6 +70,7 @@ struct ft_descent {
 	struct ft_lock_anchor anchor[FT_LOCK_LEVEL_MAX];
 	uint16_t anchor_pending;		/* Levels awaiting their boundary node. */
 	uint16_t anchor_crossed;		/* Levels written (debug validation). */
+	enum cds_ft_lock_spacing lock_spacing;	/* The trie's lock granularity. */
 	struct cds_ft_inode_flag *nf;		/* Current node-flag value. */
 	struct cds_ft_inode_flag **nfp;		/* Slot that holds @nf. */
 	struct cds_ft_inode_flag *pnf;		/* Parent node-flag value. */
@@ -170,6 +171,22 @@ void ft_descent_enter_node(struct ft_descent *d, struct cds_ft_inode_flag *nf,
 {
 	unsigned int lvl;
 
+	/*
+	 * Per-node granularity anchors every member on itself, so it reads no
+	 * table and builds none -- the zero-cost path the default rests on.
+	 * Root-only needs the FIRST node and nothing after it.
+	 */
+	if (d->lock_spacing == CDS_FT_LOCK_SPACING_PER_NODE)
+		return;
+	if (d->lock_spacing == CDS_FT_LOCK_SPACING_ROOT_ONLY) {
+		if (!d->anchor_crossed) {
+			d->anchor[0].cover = nf;
+			d->anchor[0].bound = nf;
+			d->anchor[0].bound_start = 0;
+			d->anchor_crossed = 1;
+		}
+		return;
+	}
 	/* This node IS the boundary the pending levels were waiting for. */
 	while (caa_unlikely(d->anchor_pending != 0)) {
 		unsigned int i = (unsigned int) __builtin_ctz(d->anchor_pending);
@@ -233,12 +250,80 @@ struct cds_ft_inode_flag *ft_descent_anchor(const struct ft_descent *d,
 	return a->cover;
 }
 
+/*
+ * Exercise the anchor LOOKUP from the descent itself, at exactly the depths an
+ * acquire site queries -- the cursor and the three ancestors the window carries.
+ * Until an acquire site consumes the table, ft_descent_enter_node is the only
+ * part the suites reach; this gate makes the lookup reachable too, so a build
+ * under CDS_FT_LOCK_SPACING=exponential covers both halves.
+ */
+#ifdef FEATURE_FT_ANCHOR_VALIDATE
+static inline
+void ft_descent_anchor_validate(const struct ft_descent *d)
+{
+	unsigned int back;
+
+	if (d->lock_spacing == CDS_FT_LOCK_SPACING_PER_NODE)
+		return;
+	if (d->lock_spacing == CDS_FT_LOCK_SPACING_ROOT_ONLY) {
+		assert(d->anchor_crossed & 1U);
+		assert(d->anchor[0].cover != NULL);
+		return;
+	}
+	/*
+	 * A NULL cursor means the descent walked off the trie (an absent
+	 * child): there is no node at @d->depth to anchor, and the two arms
+	 * that resolve to the cursor would report its absence, not a gap in
+	 * the table.
+	 */
+	if (!d->nf)
+		return;
+	for (back = 0; back < 4; back++) {
+		if (back > d->depth)
+			break;
+		assert(ft_descent_anchor(d, d->depth - back) != NULL);
+	}
+}
+#else
+static inline
+void ft_descent_anchor_validate(const struct ft_descent *d __attribute__((unused)))
+{
+}
+#endif
+
+/*
+ * The lock-set anchor for @nf, a node at byte-depth @depth that the acquire
+ * would otherwise lock directly.  This is the call-site-facing form: it applies
+ * the trie's granularity, so an acquire site asks for an anchor uniformly and
+ * per-node granularity hands back the node itself.
+ *
+ * Members mapping to ONE anchor must be acquired ONCE -- a second ft_dlm_lock on
+ * a held node aborts -EAGAIN -- so a caller with several members dedupes on the
+ * returned pointer (doc/design/ft-dlm-lock-coarseness.md §7.3).
+ */
+static inline
+struct cds_ft_inode_flag *ft_descent_anchor_of(const struct ft_descent *d,
+		struct cds_ft_inode_flag *nf, unsigned int depth)
+{
+	switch (d->lock_spacing) {
+	case CDS_FT_LOCK_SPACING_PER_NODE:
+		return nf;
+	case CDS_FT_LOCK_SPACING_ROOT_ONLY:
+		assert(d->anchor_crossed & 1U);
+		return d->anchor[0].cover;
+	case CDS_FT_LOCK_SPACING_EXPONENTIAL:
+	default:
+		return ft_descent_anchor(d, depth);
+	}
+}
+
 static
 void ft_descent_init(struct ft_descent *d, struct cds_ft *ft)
 {
 	d->depth = 0;
 	d->anchor_pending = 0;
 	d->anchor_crossed = 0;
+	d->lock_spacing = ft->lock_spacing;
 	/*
 	 * Resolve a transient type-7 flip proxy a peer parked on the ROOT slot
 	 * (Phase 4.3: a root recompact's forward edge mid-commit) to its
@@ -301,6 +386,7 @@ void ft_descent_traverse_compressed(struct cds_ft *ft, struct ft_descent *d,
 	/* @cn spans [d->depth, d->depth + cn->len) -- one lock, many levels. */
 	ft_descent_enter_node(d, d->pnf, d->depth, cn->len);
 	d->depth += cn->len;
+	ft_descent_anchor_validate(d);
 	*iter_key += cn->len;
 }
 
@@ -340,6 +426,7 @@ struct cds_ft_inode_flag *ft_descent_step(struct cds_ft *ft, struct ft_descent *
 	/* The node just traversed spans one key byte, [d->depth, d->depth + 1). */
 	ft_descent_enter_node(d, d->pnf, d->depth, 1);
 	d->depth++;
+	ft_descent_anchor_validate(d);
 	return d->nf;
 }
 

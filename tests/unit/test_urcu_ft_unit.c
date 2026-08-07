@@ -68,13 +68,13 @@
 #endif
 
 /*
- * 294 unconditional + 49 fault-injection-only RUN_TEST registrations, on top of
+ * 295 unconditional + 49 fault-injection-only RUN_TEST registrations, on top of
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (343 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (344 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (294 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (295 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -3112,6 +3112,132 @@ static int test_lifecycle_group_create_flavor(void)
 		return -1;
 	}
 	return drain_and_destroy(ft, group);
+}
+
+/*
+ * cds_ft_group_attr_set_lock_spacing: the granularity knob validates its
+ * argument, and a trie built at every setting inserts, finds and removes the
+ * same keys.  The deep/compressed keys matter: they are what drives lock levels
+ * strictly INSIDE a compressed node's span, the shape the anchor rule rounds up
+ * past (doc/design/ft-dlm-lock-coarseness.md §2.1).
+ */
+static int test_lifecycle_lock_spacing(void)
+{
+	static const enum cds_ft_lock_spacing spacings[] = {
+		CDS_FT_LOCK_SPACING_PER_NODE,
+		CDS_FT_LOCK_SPACING_EXPONENTIAL,
+		CDS_FT_LOCK_SPACING_ROOT_ONLY,
+	};
+	static const char *const keys[] = {
+		"a", "ab", "abc",
+		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaX",	/* deep, compressed */
+		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaY",	/* diverges at 40 */
+		"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+	};
+	unsigned int si, ki;
+
+	{
+		struct cds_ft_group_attr *attr;
+
+		if (cds_ft_group_attr_create(&attr) != CDS_FT_STATUS_OK)
+			return -1;
+		if (cds_ft_group_attr_set_lock_spacing(attr,
+				(enum cds_ft_lock_spacing) 0)
+					!= CDS_FT_STATUS_INVALID_ARGUMENT_ERROR ||
+		    cds_ft_group_attr_set_lock_spacing(attr,
+				(enum cds_ft_lock_spacing) 99)
+					!= CDS_FT_STATUS_INVALID_ARGUMENT_ERROR) {
+			fprintf(stderr, "lock spacing accepted an invalid value\n");
+			cds_ft_group_attr_destroy(attr);
+			return -1;
+		}
+		cds_ft_group_attr_destroy(attr);
+	}
+
+	for (si = 0; si < CAA_ARRAY_SIZE(spacings); si++) {
+		struct ft_test_node *nodes[CAA_ARRAY_SIZE(keys)] = { NULL };
+		struct cds_ft_group_attr *attr;
+		struct cds_ft_group *group;
+		struct cds_ft_iter *iter;
+		struct cds_ft *ft;
+		int ret = -1;
+
+		if (cds_ft_group_attr_create(&attr) != CDS_FT_STATUS_OK)
+			return -1;
+		if (cds_ft_group_attr_set_lock_spacing(attr, spacings[si])
+				!= CDS_FT_STATUS_OK) {
+			fprintf(stderr, "lock spacing %d rejected\n",
+				(int) spacings[si]);
+			cds_ft_group_attr_destroy(attr);
+			return -1;
+		}
+		if (cds_ft_group_create(attr, &group) != CDS_FT_STATUS_OK) {
+			cds_ft_group_attr_destroy(attr);
+			return -1;
+		}
+		cds_ft_group_attr_destroy(attr);
+		if (cds_ft_create(group, NULL, &ft) < 0) {
+			cds_ft_group_destroy(group);
+			return -1;
+		}
+		if (cds_ft_iter_create(ft, &iter) < 0) {
+			cds_ft_destroy(ft);
+			cds_ft_group_destroy(group);
+			return -1;
+		}
+		rcu_read_lock();
+		for (ki = 0; ki < CAA_ARRAY_SIZE(keys); ki++) {
+			enum cds_ft_status s;
+
+			nodes[ki] = node_alloc(ki);
+			s = cds_ft_insert(ft, (const uint8_t *) keys[ki],
+					strlen(keys[ki]), &nodes[ki]->node);
+			if (s != CDS_FT_STATUS_OK) {
+				fprintf(stderr, "spacing %d: insert %s: %s\n",
+					(int) spacings[si], keys[ki],
+					cds_ft_status_to_string(s));
+				goto unlock;
+			}
+		}
+		for (ki = 0; ki < CAA_ARRAY_SIZE(keys); ki++) {
+			enum cds_ft_status s;
+
+			cds_ft_iter_set_key(iter, (const uint8_t *) keys[ki],
+					strlen(keys[ki]));
+			s = cds_ft_lookup(ft, iter);
+			if (s != CDS_FT_STATUS_OK) {
+				fprintf(stderr, "spacing %d: lookup %s: %s\n",
+					(int) spacings[si], keys[ki],
+					cds_ft_status_to_string(s));
+				goto unlock;
+			}
+			s = cds_ft_remove(ft, iter, &nodes[ki]->node);
+			if (s != CDS_FT_STATUS_OK) {
+				fprintf(stderr, "spacing %d: remove %s: %s\n",
+					(int) spacings[si], keys[ki],
+					cds_ft_status_to_string(s));
+				goto unlock;
+			}
+		}
+		ret = 0;
+unlock:
+		rcu_read_unlock();
+		if (!ret && !cds_ft_empty(ft)) {
+			fprintf(stderr, "spacing %d: trie not empty after removes\n",
+				(int) spacings[si]);
+			ret = -1;
+		}
+		for (ki = 0; ki < CAA_ARRAY_SIZE(keys); ki++)
+			if (nodes[ki])
+				node_free_rcu(nodes[ki]);
+		cds_ft_iter_destroy(iter);
+		rcu_barrier();
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		if (ret)
+			return -1;
+	}
+	return 0;
 }
 
 /*
@@ -31640,6 +31766,7 @@ int main(int argc, char **argv)
 	diag("Lifecycle & attribute tests");
 	RUN_TEST(test_lifecycle_defaults);
 	RUN_TEST(test_lifecycle_group_create_flavor);
+	RUN_TEST(test_lifecycle_lock_spacing);
 	RUN_TEST(test_lifecycle_fixed_key_lengths);
 	RUN_TEST(test_lifecycle_nil_only_trie);
 	RUN_TEST(test_lifecycle_max_key_len);
