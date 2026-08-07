@@ -451,6 +451,41 @@ fully converted.
 **40 acquire sites across 23 functions** — 33 `ft_meta_lock_acquire`,
 5 `ft_dlm_lock`, 2 `ft_dlm_acquire_set`. By plumbing distance:
 
+### ★ Correction (2026-08-07): a depth SCALAR does not tier a site
+
+The tiering below reads "has a depth parameter" as "convertible". That is wrong,
+and the first conversion showed why: **a site locks `{C, P, GP}`, and a depth
+parameter gives only `C`.** `P` and `GP` are reached through
+`ft_resolve_parent_slot`, which yields nodes with **no depth at all** — so the
+site needs the descent's WINDOW depths (`pdepth` / `ppdepth`), not a scalar.
+
+`ft_insert_dlm_acquire_split` therefore took the descent, not `node_depth`, and
+re-plans where the descent disagrees with the plan's own parent resolution.
+
+Re-read the tiers with that in mind: the sites carrying a real `struct
+ft_descent` (`ft_rekey_graft_simple_attempt`, `ft_split_compressed_graft_build`,
+`ft_insert_compressed_key_shorter`, `_cds_ft_insert`, `ft_merge_spine_copy` —
+**8 sites**) are the genuinely mechanical ones. The depth-scalar sites
+(`ft_node_recompact` 4, `ft_detach_node` 4) still need a descent threading to
+them, and `ft_node_recompact` has none.
+
+### ★ A writer WALK should extend the descent, not run beside it
+
+`ft_detach_node`'s four acquires lock nodes off `walk_nf`, walking **down** a
+single-child chain (`ft-remove.h:1659-1727`) — so their depths are neither
+`detach_depth` nor anything the window carries.
+
+They are, however, perfectly derivable: the walk starts at a known depth and
+each step's span is known (1 for an internal node, `cn->len` for a compressed
+one). So the fix is not to invent a second depth-tracking scheme but to feed the
+walk through `ft_descent_enter_node`, continuing the SAME descent. The anchor
+table then covers the walked region and plain `ft_descent_anchor` answers for
+every node on it.
+
+**Generalise: any writer walk that moves deeper should extend the descent.**
+That keeps one depth-tracking mechanism and one anchor table for the whole op,
+which is what agreement wants.
+
 ### Tier 0 — depth already in hand (17 sites)
 
 | function | n | source |
