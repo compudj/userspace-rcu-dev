@@ -3285,12 +3285,52 @@ int ft_unchain_node(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
  *         with an internal node. Unlink the node from its list, leaving
  *         the external nodes list empty.
  */
+/*
+ * Key-guided walk to @key_len, stopping at an external or a short path.  The
+ * node-handle removal derives its holder from a back-pointer and never walks,
+ * so this is its only source of per-level BYTE-DEPTHS: the recovery arm uses it
+ * to re-derive a tombstoned holder from the authoritative forward path, and an
+ * anchored lock-set uses it for the depths that select each member's anchor.
+ * @ik_ret receives the key cursor the walk consumed.
+ */
+static
+void ft_remove_descend(struct cds_ft *ft, struct ft_descent *d,
+		const uint8_t *iter_key, size_t key_len, const uint8_t **ik_ret)
+{
+	const uint8_t *ik = iter_key;
+
+	ft_descent_init(d, ft);
+	while (d->depth < key_len) {
+		if (!d->nf || ft_node_external(d->nf))
+			break;
+		if (ft_node_compressed(d->nf)) {
+			ft_descent_traverse_compressed(ft, d,
+				ft_compressed_node_ptr(d->nf), &ik);
+			continue;
+		}
+		ft_descent_step(ft, d, *(ik++));
+	}
+	*ik_ret = ik;
+}
+
 static
 enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 		struct cds_ft_iter *iter,
 		struct cds_ft_node *node,
 		bool *need_retry)
 {
+	/*
+	 * Anchor source for the op's lock-sets, populated only where a descent
+	 * ran (@have_descent).  Under per-node granularity none does: every
+	 * member anchors on itself, so no depth is needed.
+	 */
+	struct ft_descent d;
+	/*
+	 * Consumed as this path's acquire sites convert to anchored lock-sets;
+	 * the descent that produces them is already gated on the granularity.
+	 */
+	bool have_descent __attribute__((unused)) = false;
+	unsigned int holder_depth __attribute__((unused)) = 0;
 	struct cds_ft_inode_flag *holder_flag;
 	struct cds_ft_metadata *holder_meta;
 	struct cds_ft_inode_flag **head_slot = NULL;
@@ -3376,20 +3416,9 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 	 * spun on.
 	 */
 	if (caa_unlikely(ft_flag_tombstoned(ft, holder_flag))) {
-		struct ft_descent d;
 		const uint8_t *ik = iter_key;
 
-		ft_descent_init(&d, ft);
-		while (d.depth < key_len) {
-			if (!d.nf || ft_node_external(d.nf))
-				break;
-			if (ft_node_compressed(d.nf)) {
-				ft_descent_traverse_compressed(ft, &d,
-					ft_compressed_node_ptr(d.nf), &ik);
-				continue;
-			}
-			ft_descent_step(ft, &d, *(ik++));
-		}
+		ft_remove_descend(ft, &d, iter_key, key_len, &ik);
 		if (!d.nf || d.pnf == NULL ||
 				ft_flag_tombstoned(ft, d.pnf)) {
 			/* The key is not reachable either: idempotent miss. */
@@ -3397,6 +3426,49 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 			return CDS_FT_STATUS_NOT_FOUND;
 		}
 		holder_flag = d.pnf;
+		have_descent = true;
+	} else if (ft->lock_spacing != CDS_FT_LOCK_SPACING_PER_NODE) {
+		/*
+		 * ANCHORED LOCK-SETS need a byte-depth per member, and this path has
+		 * none: it derives the holder from @node's back-pointer and never
+		 * walks.  Only the leaf's depth is free (== @key_len, what
+		 * ft_detach_node already takes as its detach_depth); the holder and
+		 * everything above it have none, and a climb cannot recover them --
+		 * absolute depth is unknown to it until the root, so it can neither
+		 * stop early nor hand back the node it walked past
+		 * (doc/design/ft-dlm-lock-coarseness.md §5.3).
+		 *
+		 * Descend for them.  The walk is the recovery arm's, and the cost is
+		 * OPT-IN WITH THE COARSENESS: per-node granularity anchors every member
+		 * on itself, needs no depth, and keeps this path handle-derived.
+		 */
+		const uint8_t *ik = iter_key;
+
+		ft_remove_descend(ft, &d, iter_key, key_len, &ik);
+		/*
+		 * Locate the holder ON the descent and take ITS byte-depth -- that
+		 * depth, not the leaf's, is what selects the holder's anchor.  The
+		 * descent stops in one of two places:
+		 *
+		 *  - UNDER the leaf: it broke on an external @d.nf, so the holder is
+		 *    @d.pnf at @d.pdepth.
+		 *  - ON the holder: the key ended at an internal node and the leaf
+		 *    hangs off its external_nodes (a prefix key), so the holder is
+		 *    @d.nf at @d.depth.
+		 *
+		 * Neither matches for an EXTERNAL holder: ft_node_holder resolves a
+		 * non-head duplicate's prev to its PREDECESSOR rather than to the trie
+		 * parent (the distinction the ft_node_external(holder_flag) arm below
+		 * turns on), so that chain's trie holder comes from
+		 * ft_chain_head_holder and is anchored with it, not from here.
+		 */
+		if (d.nf == holder_flag) {
+			holder_depth = d.depth;
+			have_descent = true;
+		} else if (d.pnf == holder_flag) {
+			holder_depth = d.pdepth;
+			have_descent = true;
+		}
 	}
 
 	/*
