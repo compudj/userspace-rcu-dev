@@ -300,6 +300,7 @@ struct cds_ft_inode_flag *ft_descent_anchor_child(const struct ft_descent *d,
 	return ft_descent_anchor_at_level(d, lvl, child_depth);
 }
 
+
 /*
  * Exercise the anchor LOOKUP from the descent itself, at exactly the depths an
  * acquire site queries -- the cursor and the three ancestors the window carries.
@@ -376,6 +377,52 @@ struct cds_ft_inode_flag *ft_descent_anchor_of(const struct ft_descent *d,
 	default:
 		return ft_descent_anchor(d, depth);
 	}
+}
+
+/*
+ * THE ACQUIRE CHOKE POINT.  Every lock-set member resolves through here to the
+ * metadata its acquire must actually take: the node's own under per-node
+ * granularity, its anchor's under a coarser one.  Sites call this instead of
+ * deriving metadata from the member flag directly, so the mapping lives in ONE
+ * place -- agreement is a property of every site computing the SAME anchor for
+ * a node, which is not something 40 independent derivations can be trusted to
+ * preserve (doc/design/ft-dlm-lock-coarseness.md §1, §9).
+ *
+ * @d may be NULL where no descent ran; that is legal ONLY under per-node
+ * granularity, where no depth is needed, and is asserted as such.
+ */
+static inline
+struct cds_ft_metadata *ft_anchor_meta(const struct cds_ft *ft,
+		const struct ft_descent *d, struct cds_ft_inode_flag *nf,
+		unsigned int depth)
+{
+	assert(d || ft->lock_spacing == CDS_FT_LOCK_SPACING_PER_NODE);
+	if (ft->lock_spacing == CDS_FT_LOCK_SPACING_PER_NODE)
+		return ft_flag_to_metadata(ft, nf);
+	return ft_flag_to_metadata(ft, ft_descent_anchor_of(d, nf, depth));
+}
+
+/*
+ * Has @meta already been acquired by this op?  Coarsening maps several members
+ * onto ONE anchor, and a second ft_dlm_lock / ft_meta_lock_acquire on a node the
+ * op already holds aborts -EAGAIN -- so a site with more than one member must
+ * test before acquiring, and record the terminal ONCE (§7.3: dedupe the LOCKS,
+ * keep ALL the guards; release/retire stay per-anchor).
+ *
+ * Linear over @n because a lock-set is small: the path members number <= 5, and
+ * a fan-out either collapses to ONE anchor for every child or gives each child
+ * its own, so neither shape wants a hash.
+ */
+static inline
+bool ft_anchor_held(struct cds_ft_metadata *const *held, unsigned int n,
+		const struct cds_ft_metadata *meta)
+{
+	unsigned int i;
+
+	for (i = 0; i < n; i++)
+		if (held[i] == meta)
+			return true;
+	return false;
 }
 
 static

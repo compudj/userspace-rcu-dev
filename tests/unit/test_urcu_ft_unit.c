@@ -3125,7 +3125,15 @@ static int test_lifecycle_lock_spacing(void)
 {
 	static const enum cds_ft_lock_spacing spacings[] = {
 		CDS_FT_LOCK_SPACING_PER_NODE,
-#ifdef FEATURE_FT_ANCHOR_VALIDATE
+		/*
+		 * A coarser spacing is only CORRECT once every acquire site maps
+		 * through the anchor, so exercising one before then asserts a
+		 * property the tree does not yet have.  FEATURE_FT_ANCHOR_VALIDATE
+		 * still makes them SELECTABLE -- that is what keeps the anchor table
+		 * reachable during the conversion -- but only
+		 * FEATURE_FT_ANCHOR_COMPLETE claims they WORK.
+		 */
+#ifdef FEATURE_FT_ANCHOR_COMPLETE
 		CDS_FT_LOCK_SPACING_EXPONENTIAL,
 		CDS_FT_LOCK_SPACING_ROOT_ONLY,
 #endif

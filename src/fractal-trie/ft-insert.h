@@ -591,6 +591,8 @@ void ft_insert_publish_or_park(struct cds_ft *ft,
  */
 static inline
 int ft_insert_dlm_acquire_split(struct cds_ft *ft,
+		const struct ft_descent *d, struct cds_ft_inode_flag *cn_flag,
+		unsigned int cn_depth,
 		struct cds_ft_metadata *cn_meta, uintptr_t *cn_fence,
 		struct ft_insert_commit *ic)
 {
@@ -602,8 +604,32 @@ int ft_insert_dlm_acquire_split(struct cds_ft *ft,
 
 	/* PLAN (read-only, racy): resolve CN's parent P. */
 	(void) ft_resolve_parent_slot(cn_meta, ft, &pf_p);
-	if (pf_p)
-		p_meta = ft_flag_to_metadata(ft, pf_p);
+
+	/*
+	 * ANCHOR both members.  Under per-node granularity these are CN and P
+	 * themselves and nothing below changes; under a coarser one they are the
+	 * ancestors that carry their lock, and the two may COINCIDE -- CN and P
+	 * share an anchor whenever they fall in one lock band.  Dedupe then, or
+	 * the second ft_dlm_lock aborts -EAGAIN on the op's own hold (§7.3).
+	 *
+	 * P's depth comes from the DESCENT's window, not from @pf_p: the plan
+	 * resolves P through CN's back-pointer, which yields a node with no depth
+	 * at all.  Where the two disagree the descent is not describing this P,
+	 * so there is no depth to anchor it by -- re-plan rather than anchor it
+	 * with a depth that belongs to another node.
+	 */
+	cn_meta = ft_anchor_meta(ft, d, cn_flag, cn_depth);
+	if (pf_p) {
+		if (ft->lock_spacing == CDS_FT_LOCK_SPACING_PER_NODE) {
+			p_meta = ft_flag_to_metadata(ft, pf_p);
+		} else {
+			if (!d || pf_p != d->pnf)
+				return -EAGAIN;
+			p_meta = ft_anchor_meta(ft, d, pf_p, d->pdepth);
+		}
+		if (p_meta == cn_meta)
+			p_meta = NULL;	/* one anchor covers both members */
+	}
 
 	/* ACQUIRE {CN, P} + the read-set guard CN.parent==P in one MCAS. */
 	/*
@@ -796,6 +822,7 @@ void ft_free_unpublished_split_cluster(struct cds_ft *ft,
 
 static
 int ft_split_compressed_insert(struct cds_ft *ft,
+		const struct ft_descent *dsc,	/* anchor source for the lock-set */
 		struct cds_ft_inode_flag **parent_slot,
 		struct cds_ft_inode_flag *compressed_flag,
 		const uint8_t *iter_key,	/* key bytes at compressed node's depth */
@@ -833,7 +860,8 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 	 * non-lock_fine keeps the single CN lock-acquire (byte-identical).
 	 */
 	if (ft->lock_fine)
-		fret = ft_insert_dlm_acquire_split(ft, cn_meta, &cn_fence, ic);
+		fret = ft_insert_dlm_acquire_split(ft, dsc, compressed_flag,
+				node_depth, cn_meta, &cn_fence, ic);
 	else
 		fret = ft_meta_lock_acquire(cn_meta, &cn_fence);
 
@@ -2405,7 +2433,7 @@ int ft_insert_compressed_diverge(struct cds_ft *ft,
 {
 	int dret;
 
-	dret = ft_split_compressed_insert(ft,
+	dret = ft_split_compressed_insert(ft, d,
 		d->nfp, d->nf, iter_key, remaining,
 		j, node, d->depth, ic);
 	if (dret)
@@ -2476,7 +2504,8 @@ int ft_insert_compressed_key_shorter(struct cds_ft *ft,
 	 * non-lock_fine keeps the single CN lock-acquire (byte-identical).
 	 */
 	if (ft->lock_fine)
-		sret = ft_insert_dlm_acquire_split(ft, cn_meta, &cn_fence, ic);
+		sret = ft_insert_dlm_acquire_split(ft, d, d->nf, d->depth,
+				cn_meta, &cn_fence, ic);
 	else
 		sret = ft_meta_lock_acquire(cn_meta, &cn_fence);
 	if (sret)
