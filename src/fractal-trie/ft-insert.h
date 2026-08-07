@@ -65,16 +65,17 @@ struct ft_insert_commit {
 	 * deferred) free must be queued only AFTER the commit -- a free queued
 	 * pre-commit would not cover readers that pick the proxy up later.
 	 *
-	 * @free_old_cn_fence: the node lock snapshot the split builder took
-	 * on this cn's state word at ENTRY (F2 fence extended to the split-retire
-	 * family): the builder's whole plan -- diverge slicing, cn->child
-	 * snapshot, deferred-edge captures -- derives from the fenced cn, and
-	 * ft_insert_one_commit records the retire as the precise
-	 * {LOCK|s -> TOMBSTONE|s} transition, so a peer state change under the
+	 * @free_old_cn_held: the lock-set member the split builder acquired at
+	 * ENTRY for this cn (F2 fence extended to the split-retire family) -- the
+	 * word actually CAS'd plus the clean snapshots of it and of the cn.  The
+	 * builder's whole plan -- diverge slicing, cn->child snapshot,
+	 * deferred-edge captures -- derives from the fenced cn, and
+	 * ft_insert_one_commit records the retire from this member
+	 * (ft_flip_txn_record_retire_anchored), so a peer state change under the
 	 * fence (a concurrent split/collapse/re-home of the SAME cn) aborts
 	 * exactly one side instead of being erased by a ratified stale plan.
 	 */
-	uintptr_t free_old_cn_fence;
+	struct ft_held_anchor free_old_cn_held;
 	struct cds_ft_compressed_node *free_old_cn;
 	/*
 	 * Old internal node replaced by a recompact-relocation forward publish
@@ -120,9 +121,18 @@ struct ft_insert_commit {
 	 * it into @txn (whose commit/abort then owns P's fence).  NULL: no pre-
 	 * acquire (past-child {CN}, non-split shapes) -> publish_or_park takes the
 	 * incremental lock_or_guard.  A pre-publish bail releases it explicitly.
+	 *
+	 * @parent_lock_shared distinguishes the THIRD state a NULL holder would
+	 * otherwise swallow: P was a lock-set member, but coarsening mapped it onto
+	 * the SAME anchor as CN, so the op holds P's lock already and the release
+	 * was recorded once, with CN's.  publish_or_park must then only guard --
+	 * acquiring would fail against the op's OWN hold and self-abort, and a
+	 * second release would double-record the one word.  Never set at per-node
+	 * granularity, where two distinct nodes cannot share a word.
 	 */
 	struct cds_ft_metadata *parent_locked_holder;
 	uintptr_t parent_locked_snap;
+	bool parent_lock_shared;
 };
 
 static void ft_free_unpublished_split_cluster(struct cds_ft *ft,
@@ -386,11 +396,13 @@ spliced:;
 		 * the cn state the split plan was derived from; the fence itself
 		 * was registered with @txn at arm time (cleared on every
 		 * non-commit outcome, consumed by this transition on commit).
+		 * One record while the lock sits on the cn itself, two once
+		 * coarsening moved it to a surviving ancestor.
 		 */
-		ft_flip_txn_record_tombstone_locked(ic->txn,
+		ft_flip_txn_record_retire_anchored(ic->txn,
+			&ic->free_old_cn_held,
 			cds_ft_item_to_metadata(
-				(struct cds_ft_inode *) ic->free_old_cn),
-			ic->free_old_cn_fence);
+				(struct cds_ft_inode *) ic->free_old_cn));
 	/*
 	 * @free_old_node needs NO record here: its sole producer is the
 	 * ft_attach_node relocation, whose recompact runs with @ic->txn as the
@@ -555,9 +567,18 @@ void ft_insert_publish_or_park(struct cds_ft *ft,
 	 * still-set fence and self-abort via the guard fallback.  A NULL holder
 	 * (past-child {CN}, non-split shapes) routes to the incremental lock_or_guard,
 	 * behaviour-identical to non-DLM.
+	 *
+	 * Coarsening adds the SHARED case: P's lock rode CN's anchor, so the op
+	 * holds it and its release is already recorded (with CN's, at registration).
+	 * Only the §4.B guard is left to plant -- re-acquiring would miss on the
+	 * op's own hold exactly as a re-mark would, and a second release would
+	 * double-record the one word.
 	 */
-	ft_flip_txn_hold_or_lock_parent(ft, ic->txn, parent_nf,
-		ic->parent_locked_holder, ic->parent_locked_snap);
+	if (ic->parent_lock_shared)
+		ft_flip_txn_guard_parent(ft, ic->txn, parent_nf);
+	else
+		ft_flip_txn_hold_or_lock_parent(ft, ic->txn, parent_nf,
+			ic->parent_locked_holder, ic->parent_locked_snap);
 	_ft_publish_to_parent(ft, parent_nf, slot, new_top, expected_old, &rec);
 	for (k = 0; k < rec.n; k++)
 		ft_flip_txn_record_reserved(ic->txn,
@@ -578,10 +599,12 @@ void ft_insert_publish_or_park(struct cds_ft *ft,
  * CN.parent==P in the SAME commit, so a peer re-homing CN between the plan read
  * and the acquire aborts it -> re-plan.
  *
- * On OK: @*cn_fence captures CN's clean word (the caller stores it into
- * ic->free_old_cn_fence exactly as ft_meta_lock_acquire did -- the retire
- * terminal {LOCK|cn_fence -> TOMBSTONE|cn_fence} is byte-unchanged); and
- * ic->parent_locked_holder/_snap carry P's held release so
+ * On OK: @*held names the word the acquire actually CAS'd for CN -- CN's own
+ * metadata under per-node granularity, its ANCHOR's under a coarser one -- plus
+ * the clean snapshots the caller's release and retire terminals need
+ * (struct ft_held_anchor).  The caller must name @held->lock, never @cn_meta,
+ * on every bail and registration: under coarsening CN's own word was never
+ * locked.  And ic->parent_locked_holder/_snap carry P's held release so
  * ft_insert_publish_or_park records it (ft_flip_txn_hold_or_lock_parent) instead
  * of re-marking.  P == NULL (CN at the root) => the lock-set is {CN} only, no
  * guard; publish_or_park's NULL @parent_nf then no-ops as today.
@@ -593,12 +616,16 @@ static inline
 int ft_insert_dlm_acquire_split(struct cds_ft *ft,
 		const struct ft_descent *d, struct cds_ft_inode_flag *cn_flag,
 		unsigned int cn_depth,
-		struct cds_ft_metadata *cn_meta, uintptr_t *cn_fence,
+		struct cds_ft_metadata *cn_meta, struct ft_held_anchor *held,
 		struct ft_insert_commit *ic)
 {
 	struct cds_ft_inode_flag *pf_p = NULL;
 	struct cds_ft_metadata *p_meta = NULL;
+	struct cds_ft_metadata *cn_lock;
+	uintptr_t cn_lock_snap;
+	uintptr_t cn_node_snap = 0;
 	uintptr_t snap_p = 0;
+	bool shared = false;
 	struct ft_flip_txn *acq;
 	int dret;
 
@@ -618,7 +645,7 @@ int ft_insert_dlm_acquire_split(struct cds_ft *ft,
 	 * so there is no depth to anchor it by -- re-plan rather than anchor it
 	 * with a depth that belongs to another node.
 	 */
-	cn_meta = ft_anchor_meta(ft, d, cn_flag, cn_depth);
+	cn_lock = ft_anchor_meta(ft, d, cn_flag, cn_depth);
 	if (pf_p) {
 		if (ft->lock_spacing == CDS_FT_LOCK_SPACING_PER_NODE) {
 			p_meta = ft_flag_to_metadata(ft, pf_p);
@@ -627,8 +654,16 @@ int ft_insert_dlm_acquire_split(struct cds_ft *ft,
 				return -EAGAIN;
 			p_meta = ft_anchor_meta(ft, d, pf_p, d->pdepth);
 		}
-		if (p_meta == cn_meta)
-			p_meta = NULL;	/* one anchor covers both members */
+		if (p_meta == cn_lock) {
+			/*
+			 * One anchor covers both members: acquire it ONCE (a
+			 * second ft_dlm_lock on a word this op holds aborts
+			 * -EAGAIN), and tell the publish that P's lock is held
+			 * and already accounted for rather than absent.
+			 */
+			p_meta = NULL;
+			shared = true;
+		}
 	}
 
 	/* ACQUIRE {CN, P} + the read-set guard CN.parent==P in one MCAS. */
@@ -641,13 +676,31 @@ int ft_insert_dlm_acquire_split(struct cds_ft *ft,
 	 * at this point (the commit is armed later), so the op carries only this
 	 * txn's records here.
 	 */
+	/*
+	 * Coarsening leaves CN's OWN word unlocked -- the exclusion moved to the
+	 * anchor -- but the split still RETIRES CN against that word, so this
+	 * acquire must ratify it just as ft_dlm_lock ratifies the word it locks.
+	 * Sample it now (refusing a dirty one, the same -EAGAIN the per-node
+	 * acquire gives) and guard the value into the commit below.
+	 */
+	if (cn_lock != cn_meta &&
+			ft_held_anchor_sample_node(cn_meta, &cn_node_snap))
+		return -EAGAIN;
 	acq = ic && ic->op ? ft_flip_txn_create_bounded_on(ic->op,
-				2 /*locks*/ + 1 /*guard*/)
-			: ft_flip_txn_create_bounded(2 /*locks*/ + 1 /*guard*/);
+				2 /*locks*/ + 2 /*guards*/)
+			: ft_flip_txn_create_bounded(2 /*locks*/ + 2 /*guards*/);
 	if (!acq)
 		return -ENOMEM;
-	dret = ft_dlm_lock(acq, cn_meta, cn_fence);
+	if (cn_lock != cn_meta)
+		ft_held_anchor_guard_node(acq, cn_meta, cn_node_snap);
+	dret = ft_dlm_lock(acq, cn_lock, &cn_lock_snap);
 	if (!dret && p_meta) {
+		/*
+		 * The guard is a read-set validation of CN's OWN back-edge (the
+		 * plan resolved P through it), so it names @cn_meta even where
+		 * the lock went to an ancestor -- anchoring moves the exclusion,
+		 * not the edge being validated.
+		 */
 		ft_dlm_guard_parent(acq, cn_meta, pf_p);
 		dret = ft_dlm_lock(acq, p_meta, &snap_p);
 	}
@@ -658,9 +711,11 @@ int ft_insert_dlm_acquire_split(struct cds_ft *ft,
 	if (ft_flip_txn_commit(ft, acq) != URCU_TXN_STATUS_OK)
 		return -EAGAIN;	/* commit freed @acq; nothing acquired */
 
+	ft_held_anchor_set(held, cn_lock, cn_lock_snap, cn_meta, cn_node_snap);
 	/* P's held release, threaded to ft_insert_publish_or_park. */
 	ic->parent_locked_holder = p_meta;
 	ic->parent_locked_snap = snap_p;
+	ic->parent_lock_shared = shared;
 	return 0;
 }
 
@@ -668,8 +723,11 @@ int ft_insert_dlm_acquire_split(struct cds_ft *ft,
  * Release a compressed-split lock-set acquired by ft_insert_dlm_acquire_split on
  * a PRE-PUBLISH bail (CN's parent P is held but not yet registered into ic->txn
  * -- publish_or_park registers it).  The CN fence is cleared by the caller's own
- * ft_meta_lock_release(cn_meta) / ic->txn drain, exactly as the incremental
- * scheme did; this only lifts the extra P the DLM hoist acquired up front.
+ * ft_meta_lock_release(held.lock) / ic->txn drain, exactly as the incremental
+ * scheme did; this only lifts the EXTRA word the DLM hoist acquired for P.
+ * Where coarsening mapped P onto CN's anchor there is no extra word -- the
+ * caller's own release lifts the one they share -- so the shared marker is
+ * simply dropped.
  */
 static inline
 void ft_insert_dlm_release_parent(struct ft_insert_commit *ic)
@@ -678,6 +736,7 @@ void ft_insert_dlm_release_parent(struct ft_insert_commit *ic)
 		ft_meta_lock_release(ic->parent_locked_holder);
 		ic->parent_locked_holder = NULL;
 	}
+	ic->parent_lock_shared = false;
 }
 
 /*
@@ -694,7 +753,6 @@ static
 int ft_insert_commit_arm(struct cds_ft *ft, struct ft_insert_commit *ic,
 		unsigned int count_edges)
 {
-	(void) ft;
 	assert(ic);
 	/*
 	 * Forward publish (<=2: the slot store + a compressed parent's skip-slot
@@ -718,10 +776,17 @@ int ft_insert_commit_arm(struct cds_ft *ft, struct ft_insert_commit *ic,
 	 * the ACTUAL descent depth (0 when the shape does not fold its count);
 	 * + 1 for the live re-parent's paired state edge (ft_reparent_record_meta
 	 * records parent AND slot-offset, two records, when the parked live child
-	 * bears metadata).
+	 * bears metadata);
+	 * + 1 once coarsening splits the split-retire terminal in two, the retired
+	 * cn's tombstone no longer being the same word as the release of the lock
+	 * that protected it (ft_flip_txn_record_retire_anchored).
 	 */
-	ic->txn = ic->op ? ft_flip_txn_create_bounded_on(ic->op, 14 + count_edges) :
-			ft_flip_txn_create_bounded(14 + count_edges);
+	unsigned int anchored = ft->lock_spacing == CDS_FT_LOCK_SPACING_PER_NODE ?
+			0 : 1;
+
+	ic->txn = ic->op ?
+		ft_flip_txn_create_bounded_on(ic->op, 14 + anchored + count_edges) :
+		ft_flip_txn_create_bounded(14 + anchored + count_edges);
 	if (!ic->txn)
 		return -ENOMEM;
 	return 0;
@@ -844,11 +909,15 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 	 * retire of the SAME cn either holds the fence (mark fails -> -EAGAIN,
 	 * re-descend) or aborts at commit against the fenced tombstone's
 	 * precise expected old (ft_insert_one_commit records
-	 * {LOCK|s -> TOMBSTONE|s} from @cn_fence).  Cleared locally on every
+	 * the retire from @held).  Cleared locally on every
 	 * bail until the arm registers it with @ic->txn (whose every terminal
 	 * path then owns the outcome).
+	 *
+	 * @held names the word the acquire CAS'd, which is @cn_meta only at
+	 * per-node granularity; every release and registration below goes
+	 * through @held.lock so it lifts the lock this op actually took.
 	 */
-	uintptr_t cn_fence;
+	struct ft_held_anchor held;
 	int fret;
 	struct cds_ft_inode_flag *fwd_expected_old;	/* set post-fence */
 
@@ -859,11 +928,17 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 	 * incremental CN mark here + the P lock inside publish_or_park.  Non-DLM /
 	 * non-lock_fine keeps the single CN lock-acquire (byte-identical).
 	 */
-	if (ft->lock_fine)
+	if (ft->lock_fine) {
 		fret = ft_insert_dlm_acquire_split(ft, dsc, compressed_flag,
-				node_depth, cn_meta, &cn_fence, ic);
-	else
+				node_depth, cn_meta, &held, ic);
+	} else {
+		uintptr_t cn_fence;
+
 		fret = ft_meta_lock_acquire(cn_meta, &cn_fence);
+		if (!fret)
+			ft_held_anchor_set(&held, cn_meta, cn_fence, cn_meta,
+				cn_fence);
+	}
 
 	if (fret)
 		return fret;	/* -EAGAIN: peer owns @cn/P; nothing built */
@@ -1173,7 +1248,7 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 	 */
 	if (ft_resolve_parent_slot(cn_meta, ft, &cur_parent) != parent_slot) {
 		ft_free_unpublished_split_cluster(ft, created, nr_created);
-		ft_meta_lock_release(cn_meta);
+		ft_meta_lock_release(held.lock);
 		ft_insert_dlm_release_parent(ic);	/* release P held up front */
 		return -EAGAIN;
 	}
@@ -1195,8 +1270,9 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 	 * local error path must NOT clear it (the caller's unwind destroys
 	 * @ic->txn, which drains the registry).
 	 */
-	ft_flip_txn_lock_register(ic->txn, cn_meta);
-	ic->free_old_cn_fence = cn_fence;
+	ft_flip_txn_lock_register(ic->txn, held.lock);
+	ft_flip_txn_record_anchor_release(ic->txn, &held, cn_meta);
+	ic->free_old_cn_held = held;
 	/*
 	 * @cur_parent came from the guard's ft_resolve_parent_slot snapshot,
 	 * consistent with @parent_slot (a peer re-home commits the parent and its
@@ -1254,7 +1330,7 @@ error:
 	 * so release it too.
 	 */
 	ft_free_unpublished_split_cluster(ft, created, nr_created);
-	ft_meta_lock_release(cn_meta);
+	ft_meta_lock_release(held.lock);
 	ft_insert_dlm_release_parent(ic);
 	return -ENOMEM;
 }
@@ -2478,7 +2554,7 @@ int ft_insert_compressed_key_shorter(struct cds_ft *ft,
 	int split_nr_created = 0;
 	struct cds_ft_metadata *cn_meta = cds_ft_item_to_metadata(
 		(struct cds_ft_inode *) ft_compressed_node_ptr(d->nf));
-	uintptr_t cn_fence;
+	struct ft_held_anchor held;
 	int sret;
 	struct cds_ft_inode_flag *fwd_expected_old;	/* set post-fence */
 
@@ -2495,7 +2571,7 @@ int ft_insert_compressed_key_shorter(struct cds_ft *ft,
 	 * F2 node lock, split-retire extension (see
 	 * ft_split_compressed_insert): the key-shorter split retires @d->nf and
 	 * plans from its body + child, so fence it before the builder's first
-	 * read.  ft_insert_one_commit records the retire from @cn_fence.
+	 * read.  ft_insert_one_commit records the retire from @held.
 	 */
 	/*
 	 * DLM Step 1: under LOCK_FINE, acquire the whole split lock-set {CN, P} in
@@ -2503,11 +2579,17 @@ int ft_insert_compressed_key_shorter(struct cds_ft *ft,
 	 * publish target below), mirroring the diverge builder.  Non-DLM /
 	 * non-lock_fine keeps the single CN lock-acquire (byte-identical).
 	 */
-	if (ft->lock_fine)
+	if (ft->lock_fine) {
 		sret = ft_insert_dlm_acquire_split(ft, d, d->nf, d->depth,
-				cn_meta, &cn_fence, ic);
-	else
+				cn_meta, &held, ic);
+	} else {
+		uintptr_t cn_fence;
+
 		sret = ft_meta_lock_acquire(cn_meta, &cn_fence);
+		if (!sret)
+			ft_held_anchor_set(&held, cn_meta, cn_fence, cn_meta,
+				cn_fence);
+	}
 	if (sret)
 		return sret;	/* -EAGAIN: peer owns the cn/P; nothing built */
 
@@ -2526,7 +2608,7 @@ int ft_insert_compressed_key_shorter(struct cds_ft *ft,
 		&live_child, &live_parent, &live_slot,
 		split_created, &split_nr_created);
 	if (sret) {
-		ft_meta_lock_release(cn_meta);
+		ft_meta_lock_release(held.lock);
 		ft_insert_dlm_release_parent(ic);	/* release P held up front */
 		return sret;
 	}
@@ -2573,7 +2655,7 @@ int ft_insert_compressed_key_shorter(struct cds_ft *ft,
 		node->next = NULL;
 		ft_free_unpublished_split_cluster(ft, split_created,
 			split_nr_created);
-		ft_meta_lock_release(cn_meta);
+		ft_meta_lock_release(held.lock);
 		ft_insert_dlm_release_parent(ic);	/* release P held up front */
 		return sret;
 	}
@@ -2581,8 +2663,9 @@ int ft_insert_compressed_key_shorter(struct cds_ft *ft,
 	 * The armed txn now owns the fence outcome (registered clear on every
 	 * non-commit terminal; consumed by the fenced tombstone on commit).
 	 */
-	ft_flip_txn_lock_register(ic->txn, cn_meta);
-	ic->free_old_cn_fence = cn_fence;
+	ft_flip_txn_lock_register(ic->txn, held.lock);
+	ft_flip_txn_record_anchor_release(ic->txn, &held, cn_meta);
+	ic->free_old_cn_held = held;
 	/*
 	 * Concurrent-writer conflict check (mirror of the diverge builder's
 	 * pre-arm guard): @d->nfp was recorded at descent as the cn's slot in

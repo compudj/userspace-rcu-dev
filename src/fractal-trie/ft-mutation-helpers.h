@@ -425,6 +425,73 @@ bool ft_anchor_held(struct cds_ft_metadata *const *held, unsigned int n,
 	return false;
 }
 
+/*
+ * A HELD lock-set member, once coarsening has split a node's two words apart.
+ *
+ * @lock is the word the acquire actually CAS'd -- the member's ANCHOR -- with
+ * its clean snapshot @lock_snap.  EVERY lock-lifecycle operation names that
+ * pair: ft_meta_lock_release, ft_flip_txn_lock_register, and the
+ * {LOCK|s -> s} release record.  Naming the node instead releases a word this
+ * op never locked and leaks the one it did.
+ *
+ * @node_snap is the clean word of the PROTECTED node itself, which is what a
+ * RETIRE tombstones.  It is sampled before the acquire and ratified by it
+ * (ft_held_anchor_sample_node / ft_held_anchor_guard_node), because the anchor
+ * excludes the node's mutators only from the linearization point on.
+ *
+ * Per-node granularity makes @lock the node's own metadata and the two
+ * snapshots equal, which is why the two terminals fuse there into the single
+ * {LOCK|s -> TOMBSTONE|s} transition.
+ */
+struct ft_held_anchor {
+	struct cds_ft_metadata *lock;
+	uintptr_t lock_snap;
+	uintptr_t node_snap;
+};
+
+/*
+ * Sample @node's own word for a member whose lock is going to @anchor, a
+ * DIFFERENT word.  -EAGAIN if it is dirty (PROXY | TOMBSTONE | LOCK), which is
+ * the same refusal ft_dlm_lock gives for the word it locks: per-node
+ * granularity gets that check for free because the two words are one, and
+ * coarsening must not lose it -- the retire tombstones @node against this
+ * snapshot, so a dirty value here is a retire that could only ever abort.
+ *
+ * Call BEFORE the acquire and validate the result into the acquire's own commit
+ * (ft_held_anchor_guard_node): the anchor excludes every mutator of @node only
+ * from the linearization point on, so the window between this sample and the
+ * commit needs the engine's read-set arbitration, exactly as the plan's racy
+ * parent resolution does.
+ */
+static inline
+int ft_held_anchor_sample_node(const struct cds_ft_metadata *node,
+		uintptr_t *node_snap)
+{
+	uintptr_t s = CMM_LOAD_SHARED(node->state);
+
+	if (caa_unlikely(s & (FT_STATE_PROXY | FT_STATE_TOMBSTONE |
+			FT_STATE_LOCK)))
+		return -EAGAIN;
+	*node_snap = s;
+	return 0;
+}
+
+/*
+ * Record that this op holds @node's lock-set member: @lock is the word the
+ * acquire CAS'd and @lock_snap the clean value it captured there, @node_snap
+ * the value ft_held_anchor_sample_node ratified for @node itself (ignored, and
+ * equal to @lock_snap, when the two words coincide).
+ */
+static inline
+void ft_held_anchor_set(struct ft_held_anchor *h, struct cds_ft_metadata *lock,
+		uintptr_t lock_snap, const struct cds_ft_metadata *node,
+		uintptr_t node_snap)
+{
+	h->lock = lock;
+	h->lock_snap = lock_snap;
+	h->node_snap = lock == node ? lock_snap : node_snap;
+}
+
 static
 void ft_descent_init(struct ft_descent *d, struct cds_ft *ft)
 {
@@ -1396,6 +1463,23 @@ void ft_dlm_guard_parent(struct ft_flip_txn *t, struct cds_ft_metadata *child,
 }
 
 /*
+ * Guard a coarsened member's OWN state word into the acquire commit, from the
+ * value ft_held_anchor_sample_node ratified: the anchor excludes every mutator
+ * of the node only from the linearization point on, so a peer that changes the
+ * word between the sample and that point must abort the whole acquire -- else
+ * the op retires the node against a stale expected old.  The per-node acquire
+ * needs none of this: ft_dlm_lock's own CAS is the guard, the word being the
+ * same one it locks.
+ */
+static inline
+void ft_held_anchor_guard_node(struct ft_flip_txn *t,
+		struct cds_ft_metadata *node, uintptr_t node_snap)
+{
+	urcu_txn_validate(t->mtxn, (void **) &node->state,
+			(void *) node_snap, FT_STATE_PROXY);
+}
+
+/*
  * One member of a DLM lock-set: the node @meta to acquire (LOCK), plus an
  * OPTIONAL read-set guard that @guard_child's back-edge still resolves to
  * @guard_pf (validating the racy plan read of @meta's position).  @snap
@@ -2350,6 +2434,59 @@ void ft_flip_txn_record_release_lock(struct ft_flip_txn *t,
 }
 
 /*
+ * A retire terminal whose lock-set member was ANCHORED has TWO halves on TWO
+ * words: the lock sits on an ancestor that SURVIVES the commit, while the
+ * retired node's own word was never locked.  Per-node granularity puts both on
+ * one word, which is what the fused {LOCK|s -> TOMBSTONE|s} transition above
+ * expresses in a single record.  Recording that fused form across two words
+ * instead would tombstone a LIVE ancestor, and would carry the ancestor's word
+ * as the node's expected old -- unrelated values, so the commit could only ever
+ * abort.  The two halves are recorded at DIFFERENT times, hence two functions.
+ *
+ * THE RELEASE half, recorded when the op REGISTERS the lock rather than at the
+ * commit.  The surviving ancestor can also be the publish target's own word,
+ * and a §4.B guard planted on a word BEFORE its release POISONS the txn
+ * permanently (the ordering rule on ft_flip_txn_record_release_lock).
+ * Recording the release first makes the later guard the harmless no-op that
+ * rule describes.  A no-op when the lock IS the retired node's word: the fused
+ * terminal covers it, unchanged.
+ *
+ * Costs ONE MORE reserved edge than the fused form; @t must have budgeted it.
+ */
+static inline
+void ft_flip_txn_record_anchor_release(struct ft_flip_txn *t,
+		const struct ft_held_anchor *h, const struct cds_ft_metadata *node)
+{
+	if (h->lock == node)
+		return;
+	ft_flip_txn_record_release_lock(t, h->lock, h->lock_snap);
+}
+
+/*
+ * THE RETIRE half: tombstone @node.  Fused with the release while they share a
+ * word, plain once ft_flip_txn_record_anchor_release has lifted the lock off a
+ * surviving ancestor.
+ *
+ * Either way the expected old is a snapshot taken at the ACQUIRE, never re-read
+ * here, which is what keeps the fenced contract: a peer state change on the
+ * retired node between the acquire and the commit aborts this op instead of
+ * being ratified by a coincidentally-matching late capture.
+ */
+static inline
+void ft_flip_txn_record_retire_anchored(struct ft_flip_txn *t,
+		const struct ft_held_anchor *h, struct cds_ft_metadata *node)
+{
+	if (h->lock == node) {
+		ft_flip_txn_record_tombstone_locked(t, node, h->lock_snap);
+		return;
+	}
+	ft_flip_txn_record_tag(t, (void **) &node->state,
+			(void *) h->node_snap,
+			(void *) (h->node_snap | FT_STATE_TOMBSTONE),
+			FT_STATE_PROXY);
+}
+
+/*
  * Invariant-2 VALIDATE side (§4.B / doc/design/step4-concurrent-engine-plan.md
  * §3.3): guard the LIVE parent @parent_nf that a forward edge publishes INTO, by
  * recording a {live->live} freeze guard on its state word.  Once concurrent
@@ -2537,8 +2674,15 @@ void ft_flip_txn_hold_or_lock_parent(const struct cds_ft *ft,
 		 * caller-construction property today (every setter assigns the
 		 * holder and the parent in the same breath); assert it so it stays
 		 * one.
+		 *
+		 * Coarsening makes the held word @parent_nf's ANCHOR rather than
+		 * its own metadata, so the identity is exact only at per-node
+		 * granularity.  Otherwise it is checked at the acquire site, which
+		 * is the only place holding both the member and its byte-depth.
 		 */
-		assert(parent_nf && held_holder == ft_flag_to_metadata(ft, parent_nf));
+		assert(parent_nf);
+		assert(ft->lock_spacing != CDS_FT_LOCK_SPACING_PER_NODE ||
+			held_holder == ft_flag_to_metadata(ft, parent_nf));
 		ft_flip_txn_record_release_lock(t, held_holder, held_snap);
 		ft_flip_txn_lock_register(t, held_holder);
 		return;
