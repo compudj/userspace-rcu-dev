@@ -868,6 +868,55 @@ int urcu_txn__self_qualifies(const struct urcu_txn *txn)
 }
 
 /*
+ * LANE INSTRUMENTATION -- an optional, compile-time hook around the escalation
+ * lane's acquire and release.
+ *
+ * WHY IT HAS TO BE HERE, AND NOT IN THE CALLER.  @in_fallback is the only
+ * caller-visible sign that a handle holds the lane, and it is set AFTER
+ * cds_fair_mutex_lock() returns and cleared BEFORE the unlock.  So a caller-side
+ * trace of the transaction bracket cannot distinguish
+ *
+ *	"no handle ever escalated"		from
+ *	"a handle acquired the lane and never gave it back",
+ *
+ * because in both cases every event it can see reads in_fallback == 0.  That is
+ * not a hypothetical gap: a lane held forever parks every other writer in the
+ * domain, which presents as a whole-process hang whose thread dump is identical
+ * to a livelock INSIDE the lane -- and telling those two apart is exactly what a
+ * caller cannot do.  Three events in the acquire path settle it in one pass:
+ * count ATTEMPT/HELD/RELEASE, and a lane that was taken and not returned is a
+ * subtraction.
+ *
+ * liburcu cannot carry tracepoints of its own -- lttng-ust depends on liburcu,
+ * so the dependency cannot run the other way -- which is why this is a hook the
+ * APPLICATION implements rather than an instrumentation backend.
+ *
+ * Define URCU_TXN_LANE_TRACE to enable it, and provide urcu_txn_lane_trace().
+ * It is compiled out entirely otherwise; there is no runtime check and no
+ * function pointer to load.  Called with the lane NOT yet held (ATTEMPT), held
+ * (HELD), and still held but about to be released (RELEASE), so the handle and
+ * its domain are safe to read in all three.
+ */
+enum urcu_txn_lane_event {
+	URCU_TXN_LANE_ATTEMPT,		/* about to block for the FIFO turn */
+	URCU_TXN_LANE_HELD,		/* the turn came up; the lane is ours */
+	URCU_TXN_LANE_RELEASE,		/* about to hand the lane on */
+};
+
+#ifdef URCU_TXN_LANE_TRACE
+/*
+ * Provided by the application when URCU_TXN_LANE_TRACE is defined.  Deliberately
+ * a link-time obligation rather than a weak symbol: enabling the hook without
+ * supplying it is a build error, not a silently dead probe.
+ */
+extern void urcu_txn_lane_trace(enum urcu_txn_lane_event ev,
+				const struct urcu_txn *txn);
+# define URCU_TXN_LANE_TRACE_EV(ev, txn)	urcu_txn_lane_trace((ev), (txn))
+#else
+# define URCU_TXN_LANE_TRACE_EV(ev, txn)	do { (void) (txn); } while (0)
+#endif
+
+/*
  * Take the lane, blocking until this handle's FIFO turn comes up.
  *
  * The wait is bracketed OFFLINE.  Called from begin(), before the read-side
@@ -884,7 +933,9 @@ void urcu_txn__enter_fallback(struct urcu_txn *txn)
 		txn->flavor->thread_offline();
 	else
 		URCU_TXN_RCU_THREAD_OFFLINE();
+	URCU_TXN_LANE_TRACE_EV(URCU_TXN_LANE_ATTEMPT, txn);
 	cds_fair_mutex_lock(&txn->domain->lock, &txn->waiter);
+	URCU_TXN_LANE_TRACE_EV(URCU_TXN_LANE_HELD, txn);
 	if (txn->flavor)
 		txn->flavor->thread_online();
 	else
@@ -904,6 +955,7 @@ void urcu_txn__exit_fallback(struct urcu_txn *txn)
 		txn->fb_published = 0;
 	}
 	uatomic_store(&txn->in_fallback, 0, CMM_RELAXED);
+	URCU_TXN_LANE_TRACE_EV(URCU_TXN_LANE_RELEASE, txn);
 	(void) cds_fair_mutex_unlock(&txn->domain->lock, &txn->waiter);
 }
 
