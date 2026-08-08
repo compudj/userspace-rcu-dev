@@ -184,6 +184,33 @@ observe the depth change mid-op. This closes the re-homing hazard that
 `[[project_ft_three_excl_modes_and_dlm_coarseness]]` flagged as the correctness
 constraint.
 
+### 3.1 A node under a move anchors on the path it is on NOW
+
+The same-trie **rekey fold** re-homes with a **live source**, so exclusivity does
+not settle it there and the question has to be answered directly: a node being
+moved has an OLD root-path and a NEW one, and `anchor()` is a function of the
+path.
+
+> **`anchor(X)` is evaluated on X's CURRENT path.** That is the only one a
+> concurrent peer can compute — a peer reaches X by DESCENDING to it, and until
+> this op's commit lands every descent arrives by the old path. The move is a
+> single commit, so no instant exists at which two ops disagree: before it, both
+> compute the old anchor; after it, both compute the new one. An op that
+> anchored a moved member on its DESTINATION path would name a node no peer of
+> that member ever looks at, and exclude nobody.
+
+The residual — a peer that computed the old anchor before the flip and mutates X
+after it — is closed by the exclusion itself, not by an extra rule: that peer
+must hold the old anchor to touch X, and this op holds it for the whole build, so
+one of the two re-plans. This is §3's split/fuse argument with the roles
+unchanged.
+
+**The consequence is structural: an op that moves a subtree reads TWO paths, so
+ONE descent cannot date its whole lock set.** `struct ft_glue` therefore carries
+`lock_d` *and* `lock_d_src`, and `deferred[].dst_origin` — which already
+separated the two sides for the apply order — selects between them. Every op
+whose members all lie on one path leaves `lock_d_src` NULL and is unchanged.
+
 ---
 
 ## 4. The anchor is captured on the way DOWN
@@ -844,39 +871,118 @@ not need it.** Placed first, it converts "this case needs no descent" into
 "every case needs a descent", and the arms that never exercise the case never
 notice.
 
-### ★ OPEN: the coarse REKEY path, root-caused, not fixed
+### CLOSED: the coarse REKEY fold — three defects, and no 19-site sweep
 
-Both remaining coarse unit stops are in `ft_rekey_graft_simple_attempt`,
-retried by `ft_rekey_graft_simple_locked`'s `for (;;)`.
+The exponential stop at 295 `test_rekey_merge_occupied_dst` was **three**
+defects stacked, each hidden by the one above it. All three are fixed, and the
+prospective fix the previous round costed — thread a byte depth through
+`ft_glue_defer_edge`'s **19 call sites** — turned out not to be needed at all.
 
-| arm / test | bail | cause |
-|---|---|---|
-| exponential 295 `test_rekey_merge_occupied_dst` | `-EAGAIN` | a deferred re-parent child cannot be DATED |
-| root-only 112 `test_rekey_fixed_len_atomic_or_refused` | `-EIO` | `ft_store_at_graft_point` returns BUSY, single-threaded |
+**What the measurement said, before any of it was written.** Dumping the whole
+deferred array at the bail, with each child's absolute depth taken by a
+probe-only up-walk from its back-pointers:
 
-root-only 295 hangs too and shows neither — a third site.
+```
+DEF[0..3] liveparent=0x…003 absdepth=3 dst_origin=0 | dsthop=3@0 srchop=1@2
+DEF[4..5] liveparent=0x…181 absdepth=3 dst_origin=1 | dsthop=1@2 srchop=3@0
+CURSOR    nf=0x…181 span=1 depth=2 -> child_depth_would_be=3
+```
 
-**Fixed on the way**: the fold's glue had NO anchor source (`lock_d == NULL`),
-the fourth glue to need one. Set where the descent and the glue are both in
-scope, as `ft_merge_spine_copy` does at its own `gd.lock_d`.
+Every child is **one hop below a cursor** — just not always the same cursor.
+`dst_origin` partitions them exactly: the src-origin four sit under `d_src`'s
+node, the dst-origin two under `d_dst`'s. Nothing is deep, nothing needs a depth
+carried from the build; what the code lacked was the SECOND descent and a way to
+date one hop DOWN.
 
-**Still open (1).** With the descent set, the deferred child is still undatable:
-it is a skip-encoded flag, and resolving identity by METADATA does not help
-either (measured) because the node genuinely is not in the 4-slot window — a
-deferred child comes from the BUILD, below the cursor. The fix is to carry the
-depth from the build, as a splice holder's now is; the cost is that
-`ft_glue_defer_edge` / `_origin` have **19 call sites**, and a lock set split
-across dated and undated members is the disagreement §1 forbids, so it cannot
-land partially.
+**1. The lock set spans two paths** (§3.1). `lock_d_src`, selected by
+`dst_origin`. Anchoring a src-origin member from the dst descent names a node on
+the wrong path — no exclusion, and §1's disagreement.
 
-★ Settle first whether a RE-HOMED node has a well-defined anchor at all. The
-deferred child is being moved, so it has an old root-path and a new one, and
-`anchor(X)` is a function of X's path. §3 closed exactly this for the cross-trie
-graft via the EXCLUSIVE-source requirement; the rekey fold re-homes inside one
-trie. Writing 19 call sites before answering that would be premature.
+**2. A build's members sit BELOW the cursor.** The window holds only nodes the
+descent ENTERED, and a build works below where it stopped, so `ft_descent_depth_of`
+answers false for every one of them. `ft_lock_ctx_depth_of_cursor_child` is the
+inverse of the existing `ft_lock_ctx_depth_of_parent`: it resolves the child's
+LIVE parent (`ft_resolve_parent_slot`), requires it to BE the cursor, and returns
+`d->depth + ft_node_span(cursor)`. Exact for one hop and refused past it —
+the same bound `ft_descent_anchor_child` carries, for the same reason (the cursor
+spans the whole gap, so the child's own start is the only boundary in it).
 
-**Still open (2).** `CDS_FT_STATUS_BUSY_ERROR` with no peer is another
-self-refusal, inside the store's own acquire set — unexplored.
+**3. The op's held set spans its TWO GLUES.** With the dating fixed the mark
+acquire still refused, and the hold-trace ledger named it in one line:
+
+```
+FT SELF-COLLISION: ft_glue_acquire_reparent_marks:7614 refused word 0x…058,
+                   taken at ft_merge_lock_overlap:362 (ledger 5 deep)
+```
+
+Coarsening is what makes them meet: a src child at depth 3 anchors at `L(3) = 2`,
+which is `S_top` — the src overlap node `ft_merge_build` already fenced, into
+`src_glue`'s free list. The dedupe read only `glue`. `struct ft_glue` now carries
+a `peer`, set symmetrically on both, and `ft_glue_held_snap` follows it exactly
+one level. **One op, one held set**
+(`[[project_ft_held_set_spans_more_than_one_registry]]` again, this time between
+two glues rather than two registries).
+
+### ☠ @held_lock names the CHILD'S OWN word, and coarsening splits them
+
+Fixing the dedupe exposes the defect underneath it, which no arm had reached
+because no arm had got this far: `held_lock` was set `true` whenever the mark
+was taken or deduped — but it selects the re-parent's **state-edge kind**, and
+the SW park is a plain store that validates NOTHING. It is legitimate only
+because the op holds *the very word it parks*.
+
+Take an ANCESTOR's word instead — which is what a coarse acquire does — and the
+child's own state word is **unheld**. A peer's `ft_meta_nr_child_inc` from an
+insert BELOW the child does not consult the anchor; it CASes the child's word
+after checking `FT_STATE_INPLACE_WAIT_MASK` in *that* word, sees it clean,
+proceeds — and the park then CLOBBERS its count. **That is the exact clobber the
+acquire exists to prevent.**
+
+So `held_lock = (h.lock == cm) || h.node_held`. A coarsened member keeps the MW
+guard, whose expected-old is the clean `live_state` the child really carries, and
+the same peer ABORTS this commit instead — the outcome the escalation lane
+arbitrates. Per-node fuses the two words and the SW park returns, byte-identical.
+
+**And a coarsened mark needs its own release.** The child's guard edge is what
+releases a per-node mark (`live_state` masks `LOCK` out); with the LOCK on an
+ancestor no edge lands on it, so the acquire records
+`ft_flip_txn_record_release_lock` + `ft_flip_txn_lock_register` for the anchor —
+the same hand-over the publish parent's held fence uses — and leaves `marked`
+false so the abort sweep cannot double-release.
+
+☠ **That release arm is UNEXERCISED, and the reason is fixture GEOMETRY, not
+rarity.** Arm counters over the fold tests under `exponential`:
+
+| test | cursor_child | held_peer | fresh_own | fresh_coarse | swpark | mwguard |
+|---|---|---|---|---|---|---|
+| `rekey_merge_occupied_dst` | 6 | 6 | 0 | **0** | 0 | 6 |
+| `…_occupied_dst_liston` | 6 | 6 | 0 | **0** | 0 | 6 |
+| `…_merge_collide_dst` | 2 | 2 | 0 | **0** | 0 | 2 |
+| `…_merge_interleave_liston` | 5 | 5 | 0 | **0** | 0 | 5 |
+| every one, at per-node | 0 | 1 | 22 | **0** | 23 | 0 |
+
+Every coarse anchor is ALREADY HELD, because these fixtures move 2-byte keys:
+the children sit at depth 3, `L(3) = 2` IS the merge point, and the merge point
+is exactly what `ft_merge_build` fences as an overlap node (`fence_src` /
+`fence_overlap`). The arm needs an anchor ABOVE the merge point, i.e.
+`L(child_depth) < cursor_depth` — a fold at key length 5 puts children at 6 with
+`L(6) = 4`, two bytes above a merge point at 5. **Until such a fixture exists the
+release path is argued, not measured**
+(`[[project_ft_b4_shape_arms_hidden_by_geometry]]`: an arm counting 0 is a
+question about the fixtures before it is a question about the code).
+
+The per-node row is the inertness proof for the whole change: 22 fresh acquires,
+all `fresh_own`, all SW parks, zero MW guards — byte-identical behaviour.
+
+★ **Generalisable:** a flag named for a NODE ("we hold the child's lock") is a
+coarsening hazard wherever the lock word can stop being the node's own. Every
+such flag has to say WHICH WORD, and the answer is a comparison, not a boolean
+the acquire sets on its way past.
+
+**Still open.** `ft_store_at_graft_point` returns `CDS_FT_STATUS_BUSY_ERROR`
+single-threaded (root-only 112 `test_rekey_fixed_len_atomic_or_refused`, `-EIO`)
+— with no peer, another self-refusal inside the store's own acquire set,
+unexplored.
 
 ### ★ An undemonstrated fix is not free
 
@@ -895,8 +1001,11 @@ it.
 | arm | unit | inv |
 |---|---|---|
 | per-node | 307/307 | 111/111 |
-| root-only | 111 — hangs at 112 | hangs 3 |
-| exponential | 294 of 307 — hangs at 295 | hangs 4 |
+| root-only | 111 — hangs at 112 `test_rekey_fixed_len_atomic_or_refused` | hangs 3 |
+| exponential | **301 of 307** — hangs at 302 `test_rekey_graft_cross_junction` | hangs 4 |
+
+Exponential was 294 before the three fold fixes above; root-only is unchanged
+because its stop is the `ft_store_at_graft_point` BUSY, which they do not touch.
 
 ### Still open in ft_descent_anchor_at_level
 
