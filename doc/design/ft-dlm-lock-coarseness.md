@@ -822,17 +822,37 @@ splice from the frame that owns the node holding that head, so it knows that
 node's byte-depth. Carry it on the splice record instead of re-deriving it from
 a structure that cannot hold it.
 
+### CLOSED: asserting a descent for an anchor that needs none
+
+`ft_anchor_meta` asserted a descent for every non-root depth — but two of the
+answers it can give read no descent at all.
+
+* **A node starting ON a lock level** is the first boundary at that level, so §2
+  settles it from the depth alone. That is the same rule the root case one line
+  above already is, at level 0. It lived in `ft_descent_anchor_of`, BELOW the
+  assert, so a descent-less site aborted on a depth the schedule could answer.
+* **Root-only** anchors every member on the trie's root, which a descent-less
+  site can name directly: `ft_descent_init` reads that same slot the same way,
+  so both routes answer with one node.
+
+Measured: `_cds_ft_debug_cow_replace_root` passes a NULL ctx and
+`ft_rekey_cow_stop` locks the root's child at depth 1 — a lock level. Both
+coarse arms aborted; per-node never reaches the assert.
+
+★ **An assert that guards a precondition must sit AFTER every path that does
+not need it.** Placed first, it converts "this case needs no descent" into
+"every case needs a descent", and the arms that never exercise the case never
+notice.
+
 ### Where the arms stand
 
 | arm | unit | inv |
 |---|---|---|
 | per-node | 307/307 | 111/111 |
-| root-only | **111** (was 108) — hangs at 112 `test_rekey_fixed_len_atomic_or_refused` | hangs 3 |
-| exponential | **292** (was 244) — ABORTS at 293 | hangs 4 |
+| root-only | **111** — hangs at 112 `test_rekey_fixed_len_atomic_or_refused` | hangs 3 |
+| exponential | **294** of 307 — hangs at 295 `test_rekey_merge_occupied_dst` | hangs 4 |
 
-Exponential now runs 292 of 307 and fails on an ASSERT rather than a timeout,
-which is a much better failure to work with than anything this arm has produced
-so far.
+Both remaining stops are in the REKEY path.
 
 ### Still open in ft_descent_anchor_at_level
 
