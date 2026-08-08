@@ -534,15 +534,31 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
  * ft_meta_nr_child_inc SPINS on FT_STATE_INPLACE_WAIT_MASK, which includes
  * FT_STATE_LOCK unconditionally, so it WAITS for the mark and the coherence
  * comes from EXCLUSION rather than from detect-and-abort.
- * @snaps NULL keeps the plain path
+ * @held NULL keeps the plain path
  * byte-identical.  Under DLM @txn is always non-NULL (commit_txn is FORCE-TXN and
  * pub is never NULL), so the fenced arm never needs the standalone fallback.
  */
+/*
+ * Freeze ONE orphan from the acquire that protects it: lift the lock off the
+ * ancestor that survives the retire (a no-op where the orphan carries its own),
+ * then tombstone the orphan against ITS clean word.  A member that deduped onto
+ * a word an earlier orphan took owes no release -- one word, one terminal.
+ */
+static inline
+void ft_detach_freeze_one(struct ft_flip_txn *txn,
+		const struct ft_held_anchor *h, struct cds_ft_metadata *m)
+{
+	if (!h->shared)
+		ft_flip_txn_record_anchor_release(txn, h, m);
+	ft_flip_txn_record_retire_anchored(txn, h, m);
+}
+
 static
 void ft_detach_freeze_orphans(struct cds_ft *ft, struct ft_flip_txn *txn,
 		struct cds_ft_inode_flag **orphans, int nr_orphans,
 		struct cds_ft_inode_flag *trailing_skip_cn_flag,
-		const uintptr_t *snaps, uintptr_t trailing_snap)
+		const struct ft_held_anchor *held,
+		const struct ft_held_anchor *trailing_held)
 {
 	int i;
 
@@ -552,8 +568,8 @@ void ft_detach_freeze_orphans(struct cds_ft *ft, struct ft_flip_txn *txn,
 				ft_compressed_node_ptr(orphans[i]))
 			: cds_ft_item_to_metadata(ft_node_ptr(orphans[i]));
 
-		if (snaps)
-			ft_flip_txn_record_tombstone_locked(txn, m, snaps[i]);
+		if (held)
+			ft_detach_freeze_one(txn, &held[i], m);
 		else if (txn)
 			ft_flip_txn_record_tombstone(txn, m);
 		else
@@ -564,8 +580,8 @@ void ft_detach_freeze_orphans(struct cds_ft *ft, struct ft_flip_txn *txn,
 			(struct cds_ft_inode *) ft_skip_to_compressed(ft,
 				trailing_skip_cn_flag));
 
-		if (snaps)
-			ft_flip_txn_record_tombstone_locked(txn, m, trailing_snap);
+		if (held)
+			ft_detach_freeze_one(txn, trailing_held, m);
 		else if (txn)
 			ft_flip_txn_record_tombstone(txn, m);
 		else
@@ -585,22 +601,44 @@ void ft_detach_freeze_orphans(struct cds_ft *ft, struct ft_flip_txn *txn,
  * {m, snap} at *n and advances it.  The snapshot feeds the fenced
  * {LOCK|s -> TOMBSTONE|s} tombstone at freeze.
  */
+/*
+ * Acquire an orphan the detach's DOWNWARD walk collected.
+ *
+ * ★ That walk moves BELOW the descent's cursor, so the window dates only its
+ * first node or two.  A deeper orphan has no depth here and is REFUSED: safe
+ * (never a wrong anchor) but a re-descend, which is the cost until the walk
+ * feeds ft_descent_enter_node and EXTENDS the same descent
+ * (doc/design/ft-dlm-lock-coarseness.md §9).  Per-node granularity needs no
+ * depth at all and pays none of it.
+ */
 static inline
-int ft_detach_orphan_planlock(struct cds_ft_metadata *m,
-		bool require_single_child,
-		struct cds_ft_metadata **locked, uintptr_t *snaps, int *n)
+int ft_detach_orphan_acquire(const struct cds_ft *ft,
+		const struct ft_lock_ctx *ctx, struct cds_ft_inode_flag *nf,
+		struct cds_ft_metadata *m, struct ft_held_anchor *held)
 {
-	uintptr_t s;
+	unsigned int depth;
 
-	if (ft_meta_lock_acquire(m, &s))
+	if (!ft_lock_ctx_depth_of(ft, ctx, nf, &depth))
 		return -EAGAIN;
-	if (require_single_child && ft_state_nr_child(s) != 1) {
-		ft_meta_lock_release(m);
+	return ft_acquire_member(ft, ctx, nf, m, depth, held);
+}
+
+static inline
+int ft_detach_orphan_planlock(const struct cds_ft *ft,
+		const struct ft_lock_ctx *ctx, struct cds_ft_inode_flag *nf,
+		struct cds_ft_metadata *m, bool require_single_child,
+		struct ft_held_anchor *locked, int *n)
+{
+	struct ft_held_anchor h;
+
+	if (ft_detach_orphan_acquire(ft, ctx, nf, m, &h))
+		return -EAGAIN;
+	if (require_single_child && ft_state_nr_child(h.node_snap) != 1) {
+		if (!h.shared)
+			ft_meta_lock_release(h.lock);
 		return -EAGAIN;
 	}
-	locked[*n] = m;
-	snaps[*n] = s;
-	(*n)++;
+	locked[(*n)++] = h;
 	return 0;
 }
 #ifdef FEATURE_FT_SKIP_COMPRESSED
@@ -687,8 +725,8 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		struct cds_ft_inode_flag **orphans,
 		int nr_orphans,
 		struct cds_ft_inode_flag *trailing_orphan,
-		const uintptr_t *orphan_snaps,
-		uintptr_t trailing_orphan_snap,
+		const struct ft_held_anchor *orphan_held,
+		const struct ft_held_anchor *trailing_orphan_held,
 		struct cds_ft_node *freeze_leaf,
 		long count_delta,
 		unsigned int count_reserve)
@@ -733,7 +771,8 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 	txn = ft_flip_txn_create_bounded(FT_REMOVE_COMMIT_REC_MAX_EDGES + 3
 			+ 1 /* §4.B parent guard */
 			+ 1 /* back-edge (parent, offset) pair: the state-word edge */
-			+ nr_orphans + (trailing_orphan ? 1 : 0)
+			+ ft_freeze_reserve(ft, (unsigned int) nr_orphans
+				+ (trailing_orphan ? 1 : 0))
 			+ (freeze_leaf ? FT_HLIST_FREEZE_MAX_EDGES : 0)
 			+ count_reserve /* nr_keys walk from publish_parent (R3 fold) */);
 	if (!txn)
@@ -1106,7 +1145,7 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 				cds_ft_item_to_metadata(
 					(struct cds_ft_inode *) child_cn));
 		ft_detach_freeze_orphans(ft, txn, orphans, nr_orphans,
-			trailing_orphan, orphan_snaps, trailing_orphan_snap);
+			trailing_orphan, orphan_held, trailing_orphan_held);
 		/*
 		 * The removed external leaf (a single-entry chain, so
 		 * freeze_leaf->next == NULL) freezes atomically with this same
@@ -1257,8 +1296,7 @@ int ft_detach_node(struct cds_ft *ft,
 	 * releases every held mark and no-ops on the ones a successful commit already
 	 * consumed (TOMBSTONE), needing no per-commit "consumed" bookkeeping.
 	 */
-	struct cds_ft_metadata *orphan_locked_meta[FT_MAX_DEPTH];
-	uintptr_t orphan_snap[FT_MAX_DEPTH];
+	struct ft_held_anchor orphan_held[FT_MAX_DEPTH];
 	int nr_orphan_locked = 0;
 	/*
 	 * This op's lock context: the caller's anchor source, plus the words
@@ -1269,7 +1307,7 @@ int ft_detach_node(struct cds_ft *ft,
 	 */
 	struct ft_lock_ctx lctx;
 	struct cds_ft_metadata *orphan_trailing_meta = NULL;
-	uintptr_t orphan_trailing_snap = 0;
+	struct ft_held_anchor orphan_trailing_held = { 0 };
 	bool retire_glue_fused = false;
 	bool freeze_leaf_fused = false;
 	struct cds_ft_node *topmost_external_nodes = NULL;
@@ -1376,7 +1414,7 @@ int ft_detach_node(struct cds_ft *ft,
 		pub = &local_pub;
 
 	ft_lock_ctx_init(&lctx, ft_lock_ctx_descent(op_ctx), NULL);
-	lctx.held.extra = orphan_locked_meta;
+	lctx.held.extra = orphan_held;
 
 	FT_TP(detach_node_enter, (const void *) *detach_node_flag_ptr, detach_depth);
 
@@ -1817,6 +1855,7 @@ int ft_detach_node(struct cds_ft *ft,
 				struct cds_ft_node *ext_nodes;
 				struct cds_ft_metadata *ometa;
 				struct cds_ft_compressed_node *ocn = NULL;
+				struct ft_held_anchor owalk = { 0 };
 				uintptr_t osnap = 0;
 
 				if (ft_node_compressed(walk_nf))
@@ -1844,10 +1883,15 @@ int ft_detach_node(struct cds_ft *ft,
 				 * bails to the caller's re-descend.
 				 */
 				if (ft->lock_fine) {
-					if (ft_meta_lock_acquire(ometa, &osnap)) {
+					lctx.held.nr_extra =
+						(unsigned int) nr_orphan_locked;
+					if (ft_detach_orphan_acquire(ft, &lctx,
+							walk_nf, ometa, &owalk))
+						{
 						ret = -EAGAIN;
 						goto end;
 					}
+					osnap = owalk.node_snap;
 					nr_child = ft_state_nr_child(osnap);
 				} else
 					nr_child = ft_meta_nr_child(ometa);
@@ -1869,17 +1913,14 @@ int ft_detach_node(struct cds_ft *ft,
 
 				if (!phase2_first &&
 				    (nr_child > 1 || ext_nodes)) {
-					if (ft->lock_fine)
-						ft_meta_lock_release(ometa);
+					if (ft->lock_fine && !owalk.shared)
+						ft_meta_lock_release(owalk.lock);
 					break;
 				}
 				phase2_first = false;
 				to_free[nr_to_free++] = walk_nf;
-				if (ft->lock_fine) {
-					orphan_locked_meta[nr_orphan_locked] = ometa;
-					orphan_snap[nr_orphan_locked] = osnap;
-					nr_orphan_locked++;
-				}
+				if (ft->lock_fine)
+					orphan_held[nr_orphan_locked++] = owalk;
 				walk_nf = next;
 			}
 			/*
@@ -1921,8 +1962,13 @@ int ft_detach_node(struct cds_ft *ft,
 						ret = -EAGAIN;
 						goto end;
 					}
-					if (ft_meta_lock_acquire(tm,
-							&orphan_trailing_snap)) {
+					lctx.held.nr_extra =
+						(unsigned int) nr_orphan_locked;
+					if (ft_detach_orphan_acquire(ft, &lctx,
+							ft_compressed_node_flag(
+								trailing_skip_cn),
+							tm,
+							&orphan_trailing_held)) {
 						ret = -EAGAIN;
 						goto end;
 					}
@@ -1944,8 +1990,8 @@ int ft_detach_node(struct cds_ft *ft,
 				ft_flip_txn_create_bounded(
 					FT_REMOVE_COMMIT_REC_MAX_EDGES
 					+ 1 /* §4.B parent guard (Sites 3+4 excl.) */
-					+ nr_to_free
-					+ (trailing_skip_cn ? 1 : 0)
+					+ ft_freeze_reserve(ft, (unsigned int) nr_to_free
+						+ (trailing_skip_cn ? 1 : 0))
 					+ (topmost_external_nodes ? 1 : 0) /* folded external back-edge */
 					+ (ft->rank_stats ? detach_depth + 1 : 0) /* nr_keys fold walk */
 					+ (freeze_leaf ? FT_HLIST_FREEZE_MAX_EDGES : 0));
@@ -1962,8 +2008,8 @@ int ft_detach_node(struct cds_ft *ft,
 							ft_skip_child_ptr(to_free[fi]))
 						: ft_node_ptr(to_free[fi]));
 				if (ft->lock_fine)
-					ft_flip_txn_record_tombstone_locked(
-						orphan_txn, m, orphan_snap[fi]);
+					ft_detach_freeze_one(orphan_txn,
+						&orphan_held[fi], m);
 				else
 					ft_flip_txn_record_tombstone(orphan_txn, m);
 			}
@@ -1971,8 +2017,8 @@ int ft_detach_node(struct cds_ft *ft,
 				struct cds_ft_metadata *m = cds_ft_item_to_metadata(
 					(struct cds_ft_inode *) trailing_skip_cn);
 				if (ft->lock_fine)
-					ft_flip_txn_record_tombstone_locked(
-						orphan_txn, m, orphan_trailing_snap);
+					ft_detach_freeze_one(orphan_txn,
+						&orphan_trailing_held, m);
 				else
 					ft_flip_txn_record_tombstone(orphan_txn, m);
 			}
@@ -2117,11 +2163,15 @@ int ft_detach_node(struct cds_ft *ft,
 					struct cds_ft_compressed_node *cn =
 						ft_skip_to_compressed(ft, walk_nf);
 					/* Skip-target: structurally single-child. */
+					lctx.held.nr_extra =
+						(unsigned int) nr_orphan_locked;
 					if (ft->lock_fine && ft_detach_orphan_planlock(
+							ft, &lctx,
+							ft_compressed_node_flag(cn),
 							cds_ft_item_to_metadata(
 								(struct cds_ft_inode *) cn),
-							false, orphan_locked_meta,
-							orphan_snap, &nr_orphan_locked)) {
+							false, orphan_held,
+							&nr_orphan_locked)) {
 						ret = -EAGAIN;
 						goto end;
 					}
@@ -2153,9 +2203,11 @@ int ft_detach_node(struct cds_ft *ft,
 						ft_node_ptr(walk_nf));
 					require_sc = true;	/* elevated internal: nr_child==1 */
 				}
-				if (ft->lock_fine && ft_detach_orphan_planlock(ometa,
-						require_sc, orphan_locked_meta,
-						orphan_snap, &nr_orphan_locked)) {
+				lctx.held.nr_extra = (unsigned int) nr_orphan_locked;
+				if (ft->lock_fine && ft_detach_orphan_planlock(ft,
+						&lctx, walk_nf, ometa,
+						require_sc, orphan_held,
+						&nr_orphan_locked)) {
 					ret = -EAGAIN;
 					goto end;
 				}
@@ -2175,6 +2227,7 @@ int ft_detach_node(struct cds_ft *ft,
 					struct cds_ft_node *ext_nodes;
 					struct cds_ft_metadata *ometa;
 					struct cds_ft_compressed_node *ocn = NULL;
+					struct ft_held_anchor owalk = { 0 };
 					uintptr_t osnap = 0;
 
 					/* Same contract as phase 1 above. */
@@ -2197,10 +2250,15 @@ int ft_detach_node(struct cds_ft *ft,
 					 * the "retire it" verdict rests on.
 					 */
 					if (ft->lock_fine) {
-						if (ft_meta_lock_acquire(ometa, &osnap)) {
+						lctx.held.nr_extra = (unsigned int)
+							nr_orphan_locked;
+						if (ft_detach_orphan_acquire(ft,
+								&lctx, walk_nf,
+								ometa, &owalk)) {
 							ret = -EAGAIN;
 							goto end;
 						}
+						osnap = owalk.node_snap;
 						nr_child = ft_state_nr_child(osnap);
 					} else
 						nr_child = ft_meta_nr_child(ometa);
@@ -2222,17 +2280,16 @@ int ft_detach_node(struct cds_ft *ft,
 
 					if (!phase2_first &&
 					    (nr_child > 1 || ext_nodes)) {
-						if (ft->lock_fine)
-							ft_meta_lock_release(ometa);
+						if (ft->lock_fine && !owalk.shared)
+							ft_meta_lock_release(
+								owalk.lock);
 						break;
 					}
 					phase2_first = false;
 					to_free[nr_to_free++] = walk_nf;
-					if (ft->lock_fine) {
-						orphan_locked_meta[nr_orphan_locked] = ometa;
-						orphan_snap[nr_orphan_locked] = osnap;
-						nr_orphan_locked++;
-					}
+					if (ft->lock_fine)
+						orphan_held[nr_orphan_locked++] =
+							owalk;
 					walk_nf = next;
 				}
 				/*
@@ -2259,8 +2316,12 @@ int ft_detach_node(struct cds_ft *ft,
 							ret = -EAGAIN;
 							goto end;
 						}
-						if (ft_meta_lock_acquire(tm,
-							&orphan_trailing_snap)) {
+						lctx.held.nr_extra = (unsigned int)
+							nr_orphan_locked;
+						if (ft_detach_orphan_acquire(ft,
+								&lctx,
+								walk_nf, tm,
+								&orphan_trailing_held)) {
 							ret = -EAGAIN;
 							goto end;
 						}
@@ -2353,8 +2414,8 @@ int ft_detach_node(struct cds_ft *ft,
 						fuse_cell, run,
 						to_free, nr_to_free,
 						trailing_skip_cn_flag,
-						ft->lock_fine ? orphan_snap : NULL,
-						orphan_trailing_snap,
+						ft->lock_fine ? orphan_held : NULL,
+						&orphan_trailing_held,
 						freeze_leaf,
 						count_delta,
 						ft->rank_stats ? detach_depth + 1 : 0);
@@ -2445,8 +2506,8 @@ int ft_detach_node(struct cds_ft *ft,
 				commit_txn = ft_flip_txn_create_bounded(
 					FT_REMOVE_COMMIT_REC_MAX_EDGES
 					+ 1 /* §4.B parent guard (Site 1 arms excl.) */
-					+ nr_to_free
-					+ (trailing_skip_cn_flag ? 1 : 0)
+					+ ft_freeze_reserve(ft, (unsigned int) nr_to_free
+						+ (trailing_skip_cn_flag ? 1 : 0))
 					+ (retire_glue ? retire_glue->cap_free : 0)
 					+ (ft->rank_stats ? detach_depth + 1 : 0) /* nr_keys fold walk */
 					+ (freeze_leaf ? FT_HLIST_FREEZE_MAX_EDGES : 0));
@@ -2502,8 +2563,8 @@ int ft_detach_node(struct cds_ft *ft,
 				ft_detach_freeze_orphans(ft,
 					(pub && commit_txn) ? commit_txn : NULL,
 					to_free, nr_to_free, trailing_skip_cn_flag,
-					ft->lock_fine ? orphan_snap : NULL,
-					orphan_trailing_snap);
+					ft->lock_fine ? orphan_held : NULL,
+					&orphan_trailing_held);
 			/*
 			 * A caller-supplied external retire set (@retire_glue: the
 			 * merge src-side glue's overlap-spine free-list, freed by the
@@ -2945,9 +3006,11 @@ end:
 		int oi;
 
 		for (oi = 0; oi < nr_orphan_locked; oi++)
-			ft_meta_lock_release_if_held(orphan_locked_meta[oi]);
-		if (orphan_trailing_meta)
-			ft_meta_lock_release_if_held(orphan_trailing_meta);
+			if (!orphan_held[oi].shared)
+				ft_meta_lock_release_if_held(
+					orphan_held[oi].lock);
+		if (orphan_trailing_meta && !orphan_trailing_held.shared)
+			ft_meta_lock_release_if_held(orphan_trailing_held.lock);
 	}
 	/*
 	 * nr_keys fold (LEAF Increment 2): no abort rollback needed.  Every

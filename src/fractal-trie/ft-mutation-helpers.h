@@ -1249,7 +1249,7 @@ extern long cds_ft_fault_lock_countdown;
  */
 struct ft_held_set {
 	struct ft_flip_txn *txn;		/* the commit's lock registry */
-	struct cds_ft_metadata *const *extra;	/* marks held outside it */
+	const struct ft_held_anchor *extra;	/* marks held outside it */
 	unsigned int nr_extra;
 };
 
@@ -1273,11 +1273,16 @@ static inline
 bool ft_held_set_contains(const struct ft_held_set *h,
 		const struct cds_ft_metadata *meta)
 {
+	unsigned int i;
+
 	if (!h)
 		return false;
 	if (h->txn && ft_anchor_held(h->txn->locks, h->txn->nr_locks, meta))
 		return true;
-	return ft_anchor_held(h->extra, h->nr_extra, meta);
+	for (i = 0; i < h->nr_extra; i++)
+		if (h->extra[i].lock == meta)
+			return true;
+	return false;
 }
 
 static inline
@@ -1328,6 +1333,21 @@ bool ft_lock_ctx_depth_of(const struct cds_ft *ft,
 		return true;
 	}
 	return ft_descent_depth_of(ft_lock_ctx_descent(ctx), nf, depth);
+}
+
+/*
+ * Reserved edges a FREEZE of @n anchored nodes costs.
+ *
+ * Per-node granularity fuses each retire into the single
+ * {LOCK|s -> TOMBSTONE|s}, so one edge per node.  Coarsening splits that in two
+ * -- a release on the surviving ancestor plus a plain tombstone on the node --
+ * and dedupe can only remove releases, never add them, so twice is an upper
+ * bound (§7.3: the reservation stays safe, merely loose).
+ */
+static inline
+unsigned int ft_freeze_reserve(const struct cds_ft *ft, unsigned int n)
+{
+	return ft->lock_spacing == CDS_FT_LOCK_SPACING_PER_NODE ? n : 2 * n;
 }
 
 /*
