@@ -2588,6 +2588,22 @@ extern long cds_ft_fault_lock_countdown;
  * @parent_nf's state word, and the arm already reserved the guard slot.  NULL
  * @t / NULL @parent_nf and non-lock_fine tries route straight to the guard
  * (which no-ops on NULL) -- behaviour-identical.
+ *
+ * ALREADY HELD: a lock spacing coarser than per-node maps several lock-set
+ * members onto ONE word, so an op can arrive here holding this publish target's
+ * lock already, taken for a DIFFERENT member of its own set.  Re-acquiring then
+ * misses against the op's OWN hold, which sets @acquire_miss and aborts the
+ * commit, and the caller retries into the identical shape: the op waits on
+ * itself, forever.  So consult the txn's lock registry first and take only the
+ * guard.  The registry IS the op's held set -- every held word is registered
+ * there together with its terminal -- so this needs no separate bookkeeping.
+ *
+ * ★ This covers only the acquires that come THROUGH here.  A raw
+ * ft_meta_lock_acquire elsewhere in the same op (ft_graft_keylen's publish-
+ * parent fence is one) can still collide with a held anchor, which is why a
+ * coarser spacing needs EVERY acquire routed through an anchoring, deduping
+ * choke point rather than converted site by site
+ * (doc/design/ft-dlm-lock-coarseness.md §9).
  */
 static inline
 void ft_flip_txn_lock_or_guard_parent(const struct cds_ft *ft,
@@ -2597,6 +2613,18 @@ void ft_flip_txn_lock_or_guard_parent(const struct cds_ft *ft,
 		struct cds_ft_metadata *pmeta = ft_flag_to_metadata(ft, parent_nf);
 		uintptr_t psnap = 0;
 		bool acquired;
+
+		/*
+		 * The terminal for a held word was recorded when it was acquired,
+		 * so all that is owed here is the guard -- and a guard AFTER a
+		 * release on one word is the ordering rule's harmless no-op (it
+		 * reads the record's own pending clean value and validates
+		 * {s -> s}), never the poison order.
+		 */
+		if (ft_anchor_held(t->locks, t->nr_locks, pmeta)) {
+			ft_flip_txn_guard_parent(ft, t, parent_nf);
+			return;
+		}
 
 #ifdef FEATURE_FT_FAULT_INJECT
 		/*
