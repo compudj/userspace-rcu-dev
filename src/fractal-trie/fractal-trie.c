@@ -1428,6 +1428,14 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		 * next attempt is identical.
 		 */
 		glue.lock_d = &d_dst;
+		/*
+		 * And the SRC path for the members still on it.  The fold's
+		 * deferred re-parents come from BOTH sides -- the src children
+		 * being moved and the dst children being absorbed -- and each
+		 * must anchor where it is NOW, which is the only position a peer
+		 * can descend to before this commit lands (§3).
+		 */
+		glue.lock_d_src = &d_src;
 		pp_meta = ft_flag_to_metadata(ft, d_dst.pnf);
 		{
 			struct ft_lock_ctx dctx;

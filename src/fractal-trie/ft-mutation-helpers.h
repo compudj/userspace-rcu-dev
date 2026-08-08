@@ -1731,6 +1731,43 @@ bool ft_lock_ctx_depth_of_parent(const struct cds_ft *ft,
 }
 
 /*
+ * ft_lock_ctx_depth_of for a member the site reached as a CHILD of the node the
+ * descent stopped on -- the shape a BUILD's re-parent targets take, since a
+ * build works below the descent's cursor and the window names only nodes the
+ * descent ENTERED.
+ *
+ * @child_parent is @child_nf's LIVE parent, resolved from its back-pointer: the
+ * anchor must describe where the node is NOW, which for a node about to be
+ * MOVED is its old path, not the one it is being built into (§3).
+ *
+ * Exact for ONE hop and refused beyond it, which is the same bound
+ * ft_descent_anchor_child carries and for the same reason: the cursor spans the
+ * whole gap [d->depth, child_depth), so the child's own start is the only node
+ * boundary inside it.  A member two hops down has a boundary between it and the
+ * cursor that the table never saw.
+ *
+ * FALSE is a RE-PLAN, not an error -- the op has no depth for the node, and
+ * anchoring it with another node's depth is the disagreement §1 forbids.
+ */
+static inline
+bool ft_lock_ctx_depth_of_cursor_child(const struct cds_ft *ft,
+		const struct ft_lock_ctx *ctx,
+		const struct cds_ft_inode_flag *child_parent,
+		unsigned int *depth)
+{
+	const struct ft_descent *d = ft_lock_ctx_descent(ctx);
+
+	if (ft->lock_spacing == CDS_FT_LOCK_SPACING_PER_NODE) {
+		*depth = 0;
+		return true;
+	}
+	if (!d || !d->nf || !child_parent || child_parent != d->nf)
+		return false;
+	*depth = d->depth + ft_node_span(ft, d->nf);
+	return true;
+}
+
+/*
  * Key-guided walk to @key_len, stopping at an external or a short path.
  *
  * The handle-derived entry points -- node-handle remove, remove-all, replace --
@@ -6208,6 +6245,26 @@ struct ft_glue {
 	 * granularity (doc/design/ft-dlm-lock-coarseness.md §2).
 	 */
 	const struct ft_descent *lock_d;
+	/*
+	 * Anchor source for the op's SRC-ORIGIN members, where "src" is a
+	 * SECOND key path the op reads: the rekey fold moves a subtree from one
+	 * prefix to another, so its lock set spans the src path and the dst
+	 * path, and @lock_d -- one descent, one path -- can date only half of it.
+	 *
+	 * A node under a move has an OLD path and a NEW one, and its anchor is a
+	 * function of the path it is on NOW: that is the only one a concurrent
+	 * peer can compute, since a peer reaches the node by descending to it,
+	 * and the move is a single commit, so no instant exists at which the two
+	 * disagree (doc/design/ft-dlm-lock-coarseness.md §3).  Anchoring a
+	 * src-origin member from @lock_d would name a node on the DST path and
+	 * exclude nobody.
+	 *
+	 * @deferred[].dst_origin, which already separates the two sides for the
+	 * apply order, is the selector.  NULL for every op whose members all lie
+	 * on @lock_d's path (graft, merge, insert), and then the selector is
+	 * inert.
+	 */
+	const struct ft_descent *lock_d_src;
 	struct cds_ft_inode_flag **publish_slot;
 	struct cds_ft_inode_flag *top;
 	/*
@@ -6385,6 +6442,20 @@ void ft_glue_lock_ctx(const struct ft_glue *g, struct ft_lock_ctx *ctx)
 	ctx->held.glue = g;
 }
 
+/*
+ * The same context, for a member whose CURRENT path is the op's src rather than
+ * its dst (@lock_d_src, above).  @dst_origin is the deferred edge's own flag;
+ * an op with no second path answers identically for both values.
+ */
+static inline
+void ft_glue_lock_ctx_origin(const struct ft_glue *g, struct ft_lock_ctx *ctx,
+		bool dst_origin)
+{
+	ft_glue_lock_ctx(g, ctx);
+	if (!dst_origin && g->lock_d_src)
+		ctx->d = g->lock_d_src;
+}
+
 
 /*
  * ft_glue helpers.  The struct and the rationale are defined just above;
@@ -6408,6 +6479,7 @@ void ft_glue_init(struct ft_glue *g)
 	g->cap_splices = FT_GLUE_FLOOR_SPLICE;
 	g->publish_parent = NULL;
 	g->lock_d = NULL;
+	g->lock_d_src = NULL;
 	g->publish_slot = NULL;
 	g->top = NULL;
 	g->publish_old = NULL;
@@ -7343,10 +7415,23 @@ int ft_glue_acquire_reparent_marks(struct cds_ft *ft, struct ft_glue *g)
 		 * 256 -> 0 -- or gives each its own, and none can collide.  The
 		 * dedupe below is what decides it either way.  A child the
 		 * descent cannot date has no anchor here: re-plan.
+		 *
+		 * A re-parent target sits on the path it is being moved OFF, so
+		 * the descent that dates it is the one that WALKED that path:
+		 * @dst_origin picks it (@lock_d_src).  And it sits BELOW that
+		 * descent's cursor -- it is a child of the node the build took it
+		 * from -- which the window cannot name, so the one-hop derivation
+		 * from its live parent is what answers.
 		 */
-		ft_glue_lock_ctx(g, &gctx);
-		if (!ft_lock_ctx_depth_of(ft, &gctx, g->deferred[i].child, &cd))
-			return -EAGAIN;
+		ft_glue_lock_ctx_origin(g, &gctx, g->deferred[i].dst_origin);
+		if (!ft_lock_ctx_depth_of(ft, &gctx, g->deferred[i].child, &cd)) {
+			struct cds_ft_inode_flag *live_parent = NULL;
+
+			(void) ft_resolve_parent_slot(cm, ft, &live_parent);
+			if (!ft_lock_ctx_depth_of_cursor_child(ft, &gctx,
+					live_parent, &cd))
+				return -EAGAIN;
+		}
 		anchor = ft_anchor_meta(ft, ft_lock_ctx_descent(&gctx),
 			g->deferred[i].child, cm, cd);
 		if (ft_glue_op_holds(g, anchor)) {
