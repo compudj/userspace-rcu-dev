@@ -1418,6 +1418,16 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		 * iff the op holds the slot's lock.  ft_glue_txn_commit_edges would
 		 * otherwise degrade an acquire miss to a §4.B guard.
 		 */
+		/*
+		 * Hand the fold's glue its anchor source, here, the single place
+		 * holding both (ft_merge_spine_copy does the same at its own
+		 * gd.lock_d).  The fold's members are reached from the BUILD --
+		 * a deferred re-parent child above all -- so nothing else can
+		 * date them, and a glue with no descent leaves every one of them
+		 * undatable: the acquire bails, the caller re-descends, and the
+		 * next attempt is identical.
+		 */
+		glue.lock_d = &d_dst;
 		pp_meta = ft_flag_to_metadata(ft, d_dst.pnf);
 		{
 			struct ft_lock_ctx dctx;
