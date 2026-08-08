@@ -1908,8 +1908,16 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		struct cds_ft_metadata *pm = ft_flag_to_metadata(dst_ft, pub_parent);
 		uintptr_t psnap = 0;
 
-		if (!ft_glue_splice_holder_take(&gd, pm, &psnap) &&
-				ft_meta_lock_acquire(pm, &psnap)) {
+		struct ft_lock_ctx pctx;
+		struct ft_held_anchor ph;
+		unsigned int pdep;
+		bool took = ft_glue_splice_holder_take(&gd, pm, &psnap);
+
+		ft_glue_lock_ctx(&gd, &pctx);
+		if (!took && (!ft_lock_ctx_depth_of(dst_ft, &pctx, pub_parent,
+					&pdep) ||
+				ft_acquire_member(dst_ft, &pctx, pub_parent, pm,
+					pdep, &ph) || ph.shared)) {
 			free(ms_src_pool);
 			free(ms_src_caps);
 			free(ms_edges);
@@ -1923,8 +1931,12 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 			*contended = true;
 			return CDS_FT_STATUS_MEMORY_ERROR;
 		}
-		gd.publish_parent_holder = pm;
-		gd.publish_parent_snap = psnap;
+		/*
+		 * The holder is whichever word protects @pub_parent: the splice
+		 * fence this op already took over, or the anchor just acquired.
+		 */
+		gd.publish_parent_holder = took ? pm : ph.lock;
+		gd.publish_parent_snap = took ? psnap : ph.lock_snap;
 	}
 
 	if (root_src) {

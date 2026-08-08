@@ -3548,34 +3548,6 @@ int ft_unchain_node(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
  *         with an internal node. Unlink the node from its list, leaving
  *         the external nodes list empty.
  */
-/*
- * Key-guided walk to @key_len, stopping at an external or a short path.  The
- * node-handle removal derives its holder from a back-pointer and never walks,
- * so this is its only source of per-level BYTE-DEPTHS: the recovery arm uses it
- * to re-derive a tombstoned holder from the authoritative forward path, and an
- * anchored lock-set uses it for the depths that select each member's anchor.
- * @ik_ret receives the key cursor the walk consumed.
- */
-static
-void ft_remove_descend(struct cds_ft *ft, struct ft_descent *d,
-		const uint8_t *iter_key, size_t key_len, const uint8_t **ik_ret)
-{
-	const uint8_t *ik = iter_key;
-
-	ft_descent_init(d, ft);
-	while (d->depth < key_len) {
-		if (!d->nf || ft_node_external(d->nf))
-			break;
-		if (ft_node_compressed(d->nf)) {
-			ft_descent_traverse_compressed(ft, d,
-				ft_compressed_node_ptr(d->nf), &ik);
-			continue;
-		}
-		ft_descent_step(ft, d, *(ik++));
-	}
-	*ik_ret = ik;
-}
-
 static
 enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 		struct cds_ft_iter *iter,
@@ -3677,7 +3649,7 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 	if (caa_unlikely(ft_flag_tombstoned(ft, holder_flag))) {
 		const uint8_t *ik = iter_key;
 
-		ft_remove_descend(ft, &d, iter_key, key_len, &ik);
+		ft_anchor_descend(ft, &d, iter_key, key_len, &ik);
 		if (!d.nf || d.pnf == NULL ||
 				ft_flag_tombstoned(ft, d.pnf)) {
 			/* The key is not reachable either: idempotent miss. */
@@ -3704,7 +3676,7 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 		 */
 		const uint8_t *ik = iter_key;
 
-		ft_remove_descend(ft, &d, iter_key, key_len, &ik);
+		ft_anchor_descend(ft, &d, iter_key, key_len, &ik);
 		/*
 		 * Locate the holder ON the descent and take ITS byte-depth -- that
 		 * depth, not the leaf's, is what selects the holder's anchor.  The
@@ -4388,7 +4360,7 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 	if (ft->lock_spacing != CDS_FT_LOCK_SPACING_PER_NODE) {
 		const uint8_t *ik = iter_key;
 
-		ft_remove_descend(ft, &d, iter_key, key_len, &ik);
+		ft_anchor_descend(ft, &d, iter_key, key_len, &ik);
 		/*
 		 * The holder is where the walk stopped: ON it for a prefix key
 		 * (the key ended at an internal node carrying external_nodes),

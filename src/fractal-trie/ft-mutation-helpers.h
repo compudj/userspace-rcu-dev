@@ -1344,6 +1344,36 @@ bool ft_lock_ctx_depth_of(const struct cds_ft *ft,
 }
 
 /*
+ * Key-guided walk to @key_len, stopping at an external or a short path.
+ *
+ * The handle-derived entry points -- node-handle remove, remove-all, replace --
+ * reach their holder through a back-pointer and never walk, so this is their
+ * only source of per-level BYTE-DEPTHS, which is what selects each lock-set
+ * member's anchor.  (Remove's stale-holder recovery arm uses the same walk to
+ * re-derive a tombstoned holder from the authoritative forward path.)
+ * @ik_ret receives the key cursor the walk consumed.
+ */
+static
+void ft_anchor_descend(struct cds_ft *ft, struct ft_descent *d,
+		const uint8_t *iter_key, size_t key_len, const uint8_t **ik_ret)
+{
+	const uint8_t *ik = iter_key;
+
+	ft_descent_init(d, ft);
+	while (d->depth < key_len) {
+		if (!d->nf || ft_node_external(d->nf))
+			break;
+		if (ft_node_compressed(d->nf)) {
+			ft_descent_traverse_compressed(ft, d,
+				ft_compressed_node_ptr(d->nf), &ik);
+			continue;
+		}
+		ft_descent_step(ft, d, *(ik++));
+	}
+	*ik_ret = ik;
+}
+
+/*
  * Reserved edges a FREEZE of @n anchored nodes costs.
  *
  * Per-node granularity fuses each retire into the single

@@ -2604,12 +2604,11 @@ int ft_insert_compressed_key_shorter(struct cds_ft *ft,
 		sret = ft_insert_dlm_acquire_split(ft, d, d->nf, d->depth,
 				cn_meta, &held, ic);
 	} else {
-		uintptr_t cn_fence;
+		struct ft_lock_ctx lctx;
 
-		sret = ft_meta_lock_acquire(cn_meta, &cn_fence);
-		if (!sret)
-			ft_held_anchor_set(&held, cn_meta, cn_fence, cn_meta,
-				cn_fence);
+		ft_lock_ctx_init(&lctx, d, ic ? ic->txn : NULL);
+		sret = ft_acquire_member(ft, &lctx, d->nf, cn_meta, d->depth,
+			&held);
 	}
 	if (sret)
 		return sret;	/* -EAGAIN: peer owns the cn/P; nothing built */
@@ -3087,12 +3086,22 @@ restart_attempt:
 						cds_ft_fault_lock_countdown--;
 					}
 #endif
-					if (ft_meta_lock_acquire(metadata,
-							&dup_hsnap)) {
-						ret = -EAGAIN;
-						goto insert_done;
+					{
+						struct ft_lock_ctx hctx;
+						struct ft_held_anchor hh;
+
+						ft_lock_ctx_init(&hctx, &d,
+							ic.txn);
+						if (ft_acquire_member(ft, &hctx,
+								d.nf, metadata,
+								d.depth, &hh) ||
+								hh.shared) {
+							ret = -EAGAIN;
+							goto insert_done;
+						}
+						dup_hmeta = hh.lock;
+						dup_hsnap = hh.lock_snap;
 					}
-					dup_hmeta = metadata;
 				}
 				/* Find last duplicate */
 				iter_node = external_nodes;
@@ -3199,11 +3208,33 @@ restart_attempt:
 						cds_ft_fault_lock_countdown--;
 					}
 #endif
-					if (ft_meta_lock_acquire(hm, &dup_hsnap)) {
-						ret = -EAGAIN;
-						goto insert_done;
+					{
+						struct ft_lock_ctx hctx;
+						struct ft_held_anchor hh;
+						unsigned int hd;
+
+						/*
+						 * The head's holder IS the
+						 * descent's parent (§5.2), so
+						 * the window dates it.
+						 */
+						ft_lock_ctx_init(&hctx, &d,
+							ic.txn);
+						if (!ft_lock_ctx_depth_of(ft,
+								&hctx,
+								holder_flag,
+								&hd) ||
+							ft_acquire_member(ft,
+								&hctx,
+								holder_flag,
+								hm, hd, &hh) ||
+							hh.shared) {
+							ret = -EAGAIN;
+							goto insert_done;
+						}
+						dup_hmeta = hh.lock;
+						dup_hsnap = hh.lock_snap;
 					}
-					dup_hmeta = hm;
 				}
 			}
 			/* Find last duplicate */
@@ -4224,12 +4255,52 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 				lock_nf = ft_chain_head_holder(ft, old_node);
 				assert(lock_nf);
 				hm = ft_flag_to_metadata(ft, lock_nf);
-				if (ft_meta_lock_acquire(hm, &hsnap)) {
-					new_node->next = NULL;
-					*need_retry = true;
-					s = CDS_FT_STATUS_OK;	/* discarded by the retry loop */
-					FT_TP(replace_exit, (int) s);
-					return s;
+				{
+					struct ft_descent hd;
+					struct ft_lock_ctx hctx;
+					struct ft_held_anchor hh;
+					unsigned int hdep = 0;
+					bool have_hd = false, descended = false;
+
+					/*
+					 * ANCHORED LOCK-SETS need a byte-depth,
+					 * and this path derives its holder from a
+					 * back-pointer.  Descend for it under the
+					 * same opt-in the remove side takes
+					 * (§5.3): per-node anchors the holder on
+					 * itself and keeps replace handle-derived.
+					 */
+					if (ft->lock_spacing !=
+							CDS_FT_LOCK_SPACING_PER_NODE) {
+						const uint8_t *ik = iter_key;
+
+						ft_anchor_descend(ft, &hd,
+							iter_key, key_len, &ik);
+						descended = true;
+						if (hd.nf == lock_nf) {
+							hdep = hd.depth;
+							have_hd = true;
+						} else if (hd.pnf == lock_nf) {
+							hdep = hd.pdepth;
+							have_hd = true;
+						}
+					} else
+						have_hd = true;
+					ft_lock_ctx_init(&hctx,
+						descended ? &hd : NULL, NULL);
+					if (!have_hd ||
+							ft_acquire_member(ft,
+								&hctx, lock_nf,
+								hm, hdep, &hh) ||
+							hh.shared) {
+						new_node->next = NULL;
+						*need_retry = true;
+						s = CDS_FT_STATUS_OK;	/* discarded by the retry loop */
+						FT_TP(replace_exit, (int) s);
+						return s;
+					}
+					hm = hh.lock;
+					hsnap = hh.lock_snap;
 				}
 			}
 			txn = ft_flip_txn_create_bounded(

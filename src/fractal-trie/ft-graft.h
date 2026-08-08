@@ -81,12 +81,15 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 	 * leaves @cn marked for the caller (ft_graft_keylen) to clear.
 	 */
 	if (ft->lock_fine && glue->txn && glue->fence_split_cn) {
-		uintptr_t cn_fence;
+		struct ft_lock_ctx sctx;
+		struct ft_held_anchor sh;
 
-		if (ft_meta_lock_acquire(cn_meta, &cn_fence))
+		ft_lock_ctx_init(&sctx, d, glue->txn);
+		if (ft_acquire_member(ft, &sctx, d->nf, cn_meta, d->depth, &sh)
+				|| sh.shared)
 			return -EAGAIN;	/* peer owns @cn; nothing built */
-		glue->split_cn_holder = cn_meta;
-		glue->split_cn_snap = cn_fence;
+		glue->split_cn_holder = sh.lock;
+		glue->split_cn_snap = sh.lock_snap;
 	}
 	unsigned int suffix_len = cn->len - diverge_pos - 1;
 	uint8_t old_ordinal = cn->key_bytes[diverge_pos];
@@ -1896,9 +1899,26 @@ retry_attach:
 			if (fence_parent) {
 				struct cds_ft_metadata *pp_meta =
 					ft_flag_to_metadata(dst_ft, fence_parent);
-				uintptr_t pp_snap = 0;
+				struct ft_lock_ctx fctx;
+				struct ft_held_anchor fh;
+				unsigned int fdep;
 
-				if (ft_meta_lock_acquire(pp_meta, &pp_snap)) {
+				/*
+				 * ROUTED, not raw: this fence is what collided
+				 * with the glue split's own anchor under a
+				 * coarse spacing -- the op missed against its
+				 * OWN hold, aborted, and retried into the
+				 * identical shape.  A miss is a clean re-descend
+				 * for a PEER's hold, never for the op's own, so
+				 * the dedupe has to see this one.
+				 */
+				ft_lock_ctx_init(&fctx, &d, glue.txn);
+				if (!ft_lock_ctx_depth_of(dst_ft, &fctx,
+							fence_parent, &fdep) ||
+						ft_acquire_member(dst_ft, &fctx,
+							fence_parent, pp_meta,
+							fdep, &fh) ||
+						fh.shared) {
 					/*
 					 * A miss (@publish_parent already retired / proxied /
 					 * peer-locked) is a clean re-descend, src pristine.
@@ -1921,8 +1941,8 @@ retry_attach:
 						free_cds_ft_node_unpublished(src_ft, fresh_node);
 					goto retry_attach;
 				}
-				glue.publish_parent_holder = pp_meta;
-				glue.publish_parent_snap = pp_snap;
+				glue.publish_parent_holder = fh.lock;
+				glue.publish_parent_snap = fh.lock_snap;
 			}
 		}
 
