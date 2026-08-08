@@ -347,26 +347,20 @@ struct cds_ft_inode_flag *ft_merge_build_run(struct ft_merge_ctx *c,
  * has no peer to exclude and its glue keeps the plain retire.
  */
 static inline
-int ft_merge_lock_overlap(void *node, uintptr_t *snap)
+int ft_merge_lock_overlap(const struct cds_ft *ft,
+		const struct ft_lock_ctx *ctx, struct cds_ft_inode_flag *nf,
+		unsigned int depth, void *node, uintptr_t *snap)
 {
-#ifdef FEATURE_FT_FAULT_INJECT
-	/*
-	 * Test-only: fail this acquire exactly as a peer holding the overlap node
-	 * would (shared cds_ft_fault_lock_countdown).  Without it the bail and the
-	 * caller's re-descend are DEAD CODE -- a single-threaded merge never misses,
-	 * and the concurrent oracles merge disjoint key sets, so nothing in the
-	 * suite drives a contended overlap fence.
-	 */
-	if (cds_ft_fault_lock_countdown >= 0) {
-		if (cds_ft_fault_lock_countdown == 0) {
-			cds_ft_fault_lock_countdown = -1;
-			return -EAGAIN;
-		}
-		cds_ft_fault_lock_countdown--;
+	{
+		struct cds_ft_metadata *m = cds_ft_item_to_metadata(
+			(struct cds_ft_inode *) node);
+		struct ft_held_anchor held;
+		int ret = ft_acquire_member(ft, ctx, nf, m, depth, &held);
+
+		if (!ret)
+			*snap = held.node_snap;
+		return ret;
 	}
-#endif
-	return ft_meta_lock_acquire(cds_ft_item_to_metadata(
-		(struct cds_ft_inode *) node), snap);
 }
 
 static
@@ -420,7 +414,11 @@ struct cds_ft_inode_flag *ft_merge_build(struct ft_merge_ctx *c,
 			snode = ft_node_ptr(S);
 		}
 		if (snode) {
-			if (ft_merge_lock_overlap(snode, &s_ov_snap)) {
+			struct ft_lock_ctx sctx;
+
+			ft_glue_lock_ctx(c->gs, &sctx);
+			if (ft_merge_lock_overlap(ft, &sctx, S, depth, snode,
+					&s_ov_snap)) {
 				c->overlap_contended = true;
 				return FT_MERGE_OOM;
 			}
@@ -454,7 +452,11 @@ struct cds_ft_inode_flag *ft_merge_build(struct ft_merge_ctx *c,
 			dnode = ft_node_ptr(D);
 		}
 		if (dnode) {
-			if (ft_merge_lock_overlap(dnode, &d_ov_snap)) {
+			struct ft_lock_ctx dctx;
+
+			ft_glue_lock_ctx(c->gd, &dctx);
+			if (ft_merge_lock_overlap(ft, &dctx, D, depth, dnode,
+					&d_ov_snap)) {
 				c->overlap_contended = true;
 				return FT_MERGE_OOM;
 			}

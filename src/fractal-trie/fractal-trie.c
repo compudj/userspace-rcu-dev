@@ -290,8 +290,7 @@ int _cds_ft_debug_cow_replace_root(struct cds_ft *ft)
 	struct cds_ft_inode_flag *root_prime;
 	struct cds_ft_metadata *old_root_meta;
 	struct ft_flip_txn *txn;
-	struct cds_ft_metadata *marks[FT_ENTRY_PER_NODE + 1];
-	uintptr_t snaps[FT_ENTRY_PER_NODE + 1];
+	struct ft_held_anchor marks[FT_ENTRY_PER_NODE + 1];
 	unsigned int nr_marks = 0, i, ti;
 	bool marks_consumed = false;
 	enum urcu_txn_status st;
@@ -312,7 +311,8 @@ int _cds_ft_debug_cow_replace_root(struct cds_ft *ft)
 		return -ENOMEM;
 	ft_flip_txn_set_structural_sw(txn, true);
 
-	ret = ft_rekey_cow_stop(ft, txn, root, &root_prime, marks, snaps,
+	/* The ROOT is its own anchor under every spacing: byte-depth 0. */
+	ret = ft_rekey_cow_stop(ft, NULL, txn, root, 0, &root_prime, marks,
 			&nr_marks);
 	if (ret) {
 		ft_flip_txn_destroy(txn);	/* pre-commit bail: destroy caller-owned txn */
@@ -361,7 +361,8 @@ sweep:
 	 */
 	if (!marks_consumed)
 		for (i = 0; i < nr_marks; i++)
-			ft_meta_lock_release_if_held(marks[i]);
+			if (!marks[i].shared)
+				ft_meta_lock_release_if_held(marks[i].lock);
 	return ret;
 }
 
@@ -856,6 +857,12 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	struct ft_glue glue;
 	struct ft_graft_store_state gst_st = { 0 };	/* GLUE never runs prepare */
 	struct ft_descent d_src, d_dst;
+	/*
+	 * The src descent is the anchor source for every acquire this attempt
+	 * makes; @d_src is only valid once the walk below has run, so the
+	 * context is (re)bound where it is used.
+	 */
+	struct ft_lock_ctx lctx_src;
 	struct cds_ft_alloc_reserve reserve;
 	struct ft_remove_pub pub = { .armed = false };
 	/*
@@ -896,8 +903,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 * +2, not +1: cow_stop can fill S_top plus all FT_ENTRY_PER_NODE of its
 	 * children, and the GLUE shape adds the split cluster's one displaced child.
 	 */
-	struct cds_ft_metadata *marks[FT_ENTRY_PER_NODE + 2];
-	uintptr_t snaps[FT_ENTRY_PER_NODE + 2];
+	struct ft_held_anchor marks[FT_ENTRY_PER_NODE + 2];
 	const uint8_t *ik;
 	unsigned int nr_marks = 0, adepth = 0, i, ti;
 	bool marks_consumed = false;
@@ -1298,8 +1304,9 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	/* 1. COW S_top -> S_top' (SW; records re-parents + retire, LOCKED). */
 	ft_flip_txn_set_structural_sw(txn, true);
 	if (!merge_dst) {
-		ret = ft_rekey_cow_stop(ft, txn, s_top, &s_top_prime, marks, snaps,
-				&nr_marks);
+		ft_lock_ctx_init(&lctx_src, &d_src, txn);
+		ret = ft_rekey_cow_stop(ft, &lctx_src, txn, s_top, d_src.depth,
+				&s_top_prime, marks, &nr_marks);
 		if (ret) {
 			ft_flip_txn_destroy(txn);	/* pre-commit bail: destroy caller-owned */
 			goto sweep;
@@ -1412,27 +1419,21 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		 * otherwise degrade an acquire miss to a §4.B guard.
 		 */
 		pp_meta = ft_flag_to_metadata(ft, d_dst.pnf);
-#ifdef FEATURE_FT_FAULT_INJECT
-		/*
-		 * Test-only: miss this fence exactly as a peer holding the publish
-		 * parent would.  Without it the bail is DEAD -- measured 0 of 4187
-		 * merges in the concurrent oracle, whose disjoint layout makes every
-		 * node this branch acquires writer-PRIVATE, so no peer can contend it.
-		 */
-		if (cds_ft_fault_lock_countdown >= 0) {
-			if (cds_ft_fault_lock_countdown == 0) {
-				cds_ft_fault_lock_countdown = -1;
+		{
+			struct ft_lock_ctx dctx;
+			struct ft_held_anchor pph;
+
+			/* The DST descent dates this one: it IS its parent slot. */
+			ft_lock_ctx_init(&dctx, &d_dst, txn);
+			if (!pp_meta || ft_acquire_member(ft, &dctx, d_dst.pnf,
+					pp_meta, d_dst.pdepth, &pph) ||
+					pph.shared) {
 				pp_meta = NULL;
 				ret = -EAGAIN;
 				goto bail_build;
 			}
-			cds_ft_fault_lock_countdown--;
-		}
-#endif
-		if (!pp_meta || ft_meta_lock_acquire(pp_meta, &pp_snap)) {
-			pp_meta = NULL;
-			ret = -EAGAIN;
-			goto bail_build;
+			pp_meta = pph.lock;
+			pp_snap = pph.lock_snap;
 		}
 		glue.publish_parent_holder = pp_meta;
 		glue.publish_parent_snap = pp_snap;
@@ -1673,11 +1674,31 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		 * transient: nothing is published, and ft_meta_lock_acquire did not set
 		 * the fence.  Mirrors ft_graft_keylen's own pre-swap fence.
 		 */
-		pp_meta = ft_flag_to_metadata(ft, glue.publish_parent);
-		if (ft_meta_lock_acquire(pp_meta, &pp_snap)) {
-			pp_meta = NULL;
-			ret = -EAGAIN;
-			goto bail_build;
+		{
+			struct ft_held_anchor pph;
+
+			ft_lock_ctx_init(&lctx_src, &d_src, txn);
+			pp_meta = ft_flag_to_metadata(ft, glue.publish_parent);
+			unsigned int ppd;
+
+			/*
+			 * The publish parent came from the glue, not from a
+			 * descent step, so the window is what dates it; a node
+			 * this descent never passed voids the attempt.  A word
+			 * the op already holds cannot hand back a snapshot for
+			 * this fence either -- both are the same clean re-plan.
+			 */
+			if (!ft_lock_ctx_depth_of(ft, &lctx_src,
+						glue.publish_parent, &ppd) ||
+					ft_acquire_member(ft, &lctx_src,
+						glue.publish_parent, pp_meta,
+						ppd, &pph) || pph.shared) {
+				pp_meta = NULL;
+				ret = -EAGAIN;
+				goto bail_build;
+			}
+			pp_meta = pph.lock;
+			pp_snap = pph.lock_snap;
 		}
 		glue.publish_parent_holder = pp_meta;
 		glue.publish_parent_snap = pp_snap;
@@ -1704,14 +1725,17 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 				ft_child_state_meta(ft, cn->child);
 
 			if (cm) {
-				uintptr_t csnap;
+				ft_lock_ctx_init(&lctx_src, &d_src, txn);
+				unsigned int cd;
 
-				if (ft_meta_lock_acquire(cm, &csnap)) {
+				if (!ft_lock_ctx_depth_of(ft, &lctx_src,
+							cn->child, &cd) ||
+						ft_acquire_member(ft, &lctx_src,
+							cn->child, cm, cd,
+							&marks[nr_marks])) {
 					ret = -EAGAIN;
 					goto bail_build;
 				}
-				marks[nr_marks] = cm;
-				snaps[nr_marks] = csnap;
 				nr_marks++;
 				/*
 				 * Tell the glue we already hold this one.  The split
@@ -1791,8 +1815,6 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 * rejects compressed nodes at every level it walks), so no SKIP_X dual and no
 	 * @gp member.
 	 */
-	struct ft_lock_ctx lctx_src;
-
 	ft_lock_ctx_init(&lctx_src, &d_src, NULL);
 	ret = ft_detach_node(ft, &lctx_src, d_src.nfp, d_src.pnfp, d_src.depth,
 			false /*free_detached_subtree: S_top is retired by cow_stop*/,
@@ -2218,7 +2240,8 @@ sweep:
 	 */
 	if (!marks_consumed)
 		for (i = 0; i < nr_marks; i++)
-			ft_meta_lock_release_if_held(marks[i]);
+			if (!marks[i].shared)
+				ft_meta_lock_release_if_held(marks[i].lock);
 	return ret;
 }
 

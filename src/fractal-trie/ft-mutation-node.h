@@ -2380,11 +2380,28 @@ struct cds_ft_metadata *ft_child_state_meta(struct cds_ft *ft,
  *  - a SKIP-encoded @stop never arrives: the encoding is a group property that
  *    EAGER clears, and a rekey requires EAGER.  Asserted, not handled.
  */
+/*
+ * Lock one child of the COW'd stop node -- the §7.2 fan-out.  Every child of one
+ * node sits at the SAME byte-depth, so under a coarse spacing they either all
+ * share one anchor on the path above (which this op frequently already holds, so
+ * the collapse is 256 -> 0) or each is its own, and no two can collide.  Either
+ * way the dedupe in the choke point is what decides it -- no set is needed here.
+ */
+static inline
+int ft_rekey_cow_lock_child(const struct cds_ft *ft,
+		const struct ft_lock_ctx *ctx, struct cds_ft_inode_flag *child,
+		struct cds_ft_metadata *cm, unsigned int child_depth,
+		struct ft_held_anchor *held)
+{
+	return ft_acquire_member(ft, ctx, child, cm, child_depth, held);
+}
+
 static
-int ft_rekey_cow_stop(struct cds_ft *ft, struct ft_flip_txn *txn,
-		struct cds_ft_inode_flag *stop_flag,
+int ft_rekey_cow_stop(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
+		struct ft_flip_txn *txn,
+		struct cds_ft_inode_flag *stop_flag, unsigned int stop_depth,
 		struct cds_ft_inode_flag **stop_prime_ret,
-		struct cds_ft_metadata **marks, uintptr_t *snaps,
+		struct ft_held_anchor *marks,
 		unsigned int *nr_marks)
 {
 	bool compressed = ft_node_compressed(stop_flag);
@@ -2408,7 +2425,13 @@ int ft_rekey_cow_stop(struct cds_ft *ft, struct ft_flip_txn *txn,
 	struct cds_ft_metadata *new_meta;
 	struct cds_ft_inode_flag *new_flag;
 	bool new_init_done = false;
-	uintptr_t stop_snap;
+	struct ft_held_anchor stop_held;
+	/*
+	 * Every child of @stop starts at the SAME byte-depth: one hop past a
+	 * bitmap node, past the whole run for a compressed one.  That single
+	 * depth is what the §7.2 fan-out hoists on.
+	 */
+	unsigned int child_depth;
 	unsigned int nm = 0, i;
 	int ret;
 
@@ -2427,11 +2450,10 @@ int ft_rekey_cow_stop(struct cds_ft *ft, struct ft_flip_txn *txn,
 	 */
 
 	/* 1. Acquire @stop's retire lock -- the fence BEFORE any body read. */
-	if (ft_meta_lock_acquire(stop_meta, &stop_snap))
+	if (ft_acquire_member(ft, ctx, stop_flag, stop_meta, stop_depth,
+			&stop_held))
 		return -EAGAIN;
-	marks[nm] = stop_meta;
-	snaps[nm] = stop_snap;
-	nm++;
+	marks[nm++] = stop_held;
 	*nr_marks = nm;
 
 	/* <=2 edges/child (parent + pso) + 1 retire; caller reserves its publish. */
@@ -2481,16 +2503,17 @@ int ft_rekey_cow_stop(struct cds_ft *ft, struct ft_flip_txn *txn,
 		ft_nr_keys_store(ft, new_meta, ft_nr_keys_get(stop_meta),
 			CMM_RELAXED);
 		new_flag = ft_compressed_node_flag(new_cn);
+		child_depth = stop_depth + stop_cn->len;
 		cm = ft_child_state_meta(ft, child);
 		if (cm) {
 			uintptr_t csnap;
 
-			if (ft_meta_lock_acquire(cm, &csnap)) {
+			if (ft_rekey_cow_lock_child(ft, ctx, child, cm,
+					child_depth, &marks[nm])) {
 				ret = -EAGAIN;
 				goto abandon;
 			}
-			marks[nm] = cm;
-			snaps[nm] = csnap;
+			csnap = marks[nm].node_snap;
 			nm++;
 			*nr_marks = nm;
 		}
@@ -2508,7 +2531,10 @@ int ft_rekey_cow_stop(struct cds_ft *ft, struct ft_flip_txn *txn,
 		 * therefore resolve the skip flag to the LIVE ORIGINAL and free that.
 		 * The plain flag inverts with ft_compressed_node_ptr and cannot.
 		 */
-		ft_flip_txn_record_tombstone_locked(txn, stop_meta, stop_snap);
+		if (!stop_held.shared)
+			ft_flip_txn_record_anchor_release(txn, &stop_held,
+				stop_meta);
+		ft_flip_txn_record_retire_anchored(txn, &stop_held, stop_meta);
 		*stop_prime_ret = new_flag;
 		return 0;
 	}
@@ -2520,6 +2546,7 @@ int ft_rekey_cow_stop(struct cds_ft *ft, struct ft_flip_txn *txn,
 		goto out;
 	}
 	new_flag = ft_node_flag(new_node, ti);
+	child_depth = stop_depth + 1;	/* a bitmap node spans ONE key byte */
 	ft_nr_keys_store(ft, new_meta, ft_nr_keys_get(stop_meta), CMM_RELAXED);
 
 	/*
@@ -2644,12 +2671,12 @@ int ft_rekey_cow_stop(struct cds_ft *ft, struct ft_flip_txn *txn,
 			if (cm) {
 				uintptr_t csnap;
 
-				if (ft_meta_lock_acquire(cm, &csnap)) {
+				if (ft_rekey_cow_lock_child(ft, ctx, iter, cm,
+						child_depth, &marks[nm])) {
 					ret = -EAGAIN;
 					goto abandon;
 				}
-				marks[nm] = cm;
-				snaps[nm] = csnap;
+				csnap = marks[nm].node_snap;
 				nm++;
 				*nr_marks = nm;
 			}
@@ -2669,12 +2696,12 @@ int ft_rekey_cow_stop(struct cds_ft *ft, struct ft_flip_txn *txn,
 			if (cm) {
 				uintptr_t csnap;
 
-				if (ft_meta_lock_acquire(cm, &csnap)) {
+				if (ft_rekey_cow_lock_child(ft, ctx, iter, cm,
+						child_depth, &marks[nm])) {
 					ret = -EAGAIN;
 					goto abandon;
 				}
-				marks[nm] = cm;
-				snaps[nm] = csnap;
+				csnap = marks[nm].node_snap;
 				nm++;
 				*nr_marks = nm;
 			}
@@ -2689,7 +2716,9 @@ int ft_rekey_cow_stop(struct cds_ft *ft, struct ft_flip_txn *txn,
 	 *    the SW park is not clobbered.  Not registered -- the caller's sweep
 	 *    owns clearing (marks[0]).
 	 */
-	ft_flip_txn_record_tombstone_locked(txn, stop_meta, stop_snap);
+	if (!stop_held.shared)
+		ft_flip_txn_record_anchor_release(txn, &stop_held, stop_meta);
+	ft_flip_txn_record_retire_anchored(txn, &stop_held, stop_meta);
 
 	*stop_prime_ret = new_flag;
 	return 0;

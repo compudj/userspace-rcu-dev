@@ -439,9 +439,17 @@ struct cds_ft_metadata *ft_anchor_meta(const struct cds_ft *ft,
 {
 	struct cds_ft_inode_flag *anchor;
 
-	assert(d || ft->lock_spacing == CDS_FT_LOCK_SPACING_PER_NODE);
 	if (ft->lock_spacing == CDS_FT_LOCK_SPACING_PER_NODE)
 		return node;
+	/*
+	 * Byte-depth 0 is the ROOT, and the root is its own anchor under every
+	 * spacing: it covers lock level 0, and no boundary lies above it.  So a
+	 * root-level acquire needs no descent, which is what lets the
+	 * descent-less root fences anchor at all.
+	 */
+	if (!depth)
+		return node;
+	assert(d);
 	anchor = ft_descent_anchor_of(d, nf, depth);
 	/*
 	 * @node, never a re-derivation, whenever the anchor IS the member: a
@@ -2300,8 +2308,16 @@ int ft_root_attach_fence_empty(struct cds_ft *dst_ft,
 			cds_ft_item_to_metadata(ft_node_ptr(root));
 		uintptr_t snap;
 
-		if (ft_meta_lock_acquire(rmeta, &snap))
+		struct ft_held_anchor held;
+
+		/*
+		 * The root is its own anchor under every spacing, so this fence
+		 * needs no descent -- but it still goes through the choke point,
+		 * for the dedupe and so the machine check stays total.
+		 */
+		if (ft_acquire_member(dst_ft, NULL, root, rmeta, 0, &held))
 			return -EAGAIN;
+		snap = held.lock_snap;
 		/*
 		 * The root pointer can have moved between the load and the mark
 		 * (a peer's recompact republishing it), leaving the fence on a
