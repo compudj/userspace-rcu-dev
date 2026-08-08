@@ -1309,14 +1309,18 @@ int ft_node_recompact(enum ft_recompact mode,
 
 		/*
 		 * P and GP were reached through a back-pointer or a caller's
-		 * hint, so neither carries a depth; the descent's window is what
-		 * dates them.  A member this op's descent never passed cannot be
-		 * anchored here at all -- re-plan rather than anchor it by
-		 * another node's depth.
+		 * hint, so neither carries a depth.  Each is dated from the node
+		 * BELOW it -- C by @node_depth, P by C -- with the descent's
+		 * window answering directly whenever it describes the member:
+		 * the window holds the last four nodes the descent passed, and a
+		 * three-ancestor set whose C already sits at the third slot runs
+		 * off it.  A member neither source can date is one this plan
+		 * cannot anchor: re-plan rather than borrow another node's depth.
 		 */
-		if ((p_meta && !ft_lock_ctx_depth_of(ft, ctx, pf_p, &p_depth)) ||
-				(gp_meta && !ft_lock_ctx_depth_of(ft, ctx,
-					pf_gp, &gp_depth)))
+		if ((p_meta && !ft_lock_ctx_depth_of_parent(ft, ctx, pf_p,
+					node_depth, &p_depth)) ||
+				(gp_meta && !ft_lock_ctx_depth_of_parent(ft, ctx,
+					pf_gp, p_depth, &gp_depth)))
 			return -EAGAIN;
 
 		/*

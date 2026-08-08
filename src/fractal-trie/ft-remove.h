@@ -609,11 +609,7 @@ static inline
 unsigned int ft_child_depth_of(const struct cds_ft *ft,
 		struct cds_ft_inode_flag *parent_nf, unsigned int parent_depth)
 {
-	if (ft_node_skip_compressed(parent_nf))
-		return parent_depth + ft_skip_to_compressed(ft, parent_nf)->len;
-	if (ft_node_compressed(parent_nf))
-		return parent_depth + ft_compressed_node_ptr(parent_nf)->len;
-	return parent_depth + 1;
+	return parent_depth + ft_node_span(ft, parent_nf);
 }
 
 /*

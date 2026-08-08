@@ -1449,7 +1449,94 @@ bool ft_lock_ctx_depth_of_at(const char *fn, int line,
 		*depth = 0;
 		return true;
 	}
-	return ft_descent_depth_of(ft_lock_ctx_descent(ctx), nf, depth);
+	if (caa_likely(ft_descent_depth_of(ft_lock_ctx_descent(ctx), nf, depth)))
+		return true;
+#ifdef FEATURE_FT_HOLD_TRACE
+	{
+		const struct ft_descent *d = ft_lock_ctx_descent(ctx);
+
+		fprintf(stderr,
+			"FT UNDATABLE MEMBER: %s:%d nf=%p descent=%p\n",
+			fn, line, (const void *) nf, (const void *) d);
+		if (d)
+			fprintf(stderr,
+				"  window nf=%p@%u pnf=%p@%u ppnf=%p@%u pppnf=%p@%u\n",
+				(void *) d->nf, d->depth,
+				(void *) d->pnf, d->pdepth,
+				(void *) d->ppnf, d->ppdepth,
+				(void *) d->pppnf, d->pppdepth);
+	}
+#endif
+	(void) fn; (void) line;
+	return false;
+}
+
+#define ft_lock_ctx_depth_of(ft, ctx, nf, depth)			\
+	ft_lock_ctx_depth_of_at(__func__, __LINE__, (ft), (ctx), (nf), (depth))
+
+/*
+ * The key bytes @nf consumes to reach its child: one for a bitmap node, the
+ * whole run for a compressed one -- kept in the TARGET for the skip-encoded
+ * form, whose tag is therefore tested FIRST, as everywhere else that dispatches
+ * on node kind.
+ */
+static inline
+unsigned int ft_node_span(const struct cds_ft *ft,
+		const struct cds_ft_inode_flag *nf)
+{
+	if (ft_node_skip_compressed(nf))
+		return ft_skip_to_compressed(ft, nf)->len;
+	if (ft_node_compressed(nf))
+		return ft_compressed_node_ptr(nf)->len;
+	return 1;
+}
+
+/*
+ * Date @parent_nf -- a member reached ONE HOP UP from a node whose byte-depth
+ * @child_depth is already known -- for the sets the descent's window cannot
+ * cover.
+ *
+ * A {C, P, GP} lock-set names three CONSECUTIVE ancestors, and the window holds
+ * the last four nodes the descent passed, not the last four a set names: with C
+ * already at the third slot, GP falls off the end.  Stepping one hop up from a
+ * DATED node is legal where a climb is not (§5.3 -- a climb starts undated, and
+ * byte-depth is absolute): a node's span is a property of the node itself, so
+ * the parent of a node at @child_depth sits at @child_depth - span(parent).
+ *
+ * FALSE when the span exceeds @child_depth: @parent_nf is then not the parent of
+ * anything at that depth, so the plan is stale and the op re-descends.
+ */
+static inline
+bool ft_parent_depth_of(const struct cds_ft *ft,
+		const struct cds_ft_inode_flag *parent_nf,
+		unsigned int child_depth, unsigned int *depth)
+{
+	unsigned int span = ft_node_span(ft, parent_nf);
+
+	if (span > child_depth)
+		return false;
+	*depth = child_depth - span;
+	return true;
+}
+
+/*
+ * ft_lock_ctx_depth_of for a member the site reached as the PARENT of a node it
+ * has already dated: the descent's window answers when it describes @parent_nf,
+ * and the one-hop derivation covers the rest.
+ */
+static inline
+bool ft_lock_ctx_depth_of_parent(const struct cds_ft *ft,
+		const struct ft_lock_ctx *ctx,
+		const struct cds_ft_inode_flag *parent_nf,
+		unsigned int child_depth, unsigned int *depth)
+{
+	if (ft->lock_spacing == CDS_FT_LOCK_SPACING_PER_NODE) {
+		*depth = 0;
+		return true;
+	}
+	if (ft_descent_depth_of(ft_lock_ctx_descent(ctx), parent_nf, depth))
+		return true;
+	return ft_parent_depth_of(ft, parent_nf, child_depth, depth);
 }
 
 /*
