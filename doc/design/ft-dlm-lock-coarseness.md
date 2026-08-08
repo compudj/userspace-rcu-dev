@@ -844,15 +844,59 @@ not need it.** Placed first, it converts "this case needs no descent" into
 "every case needs a descent", and the arms that never exercise the case never
 notice.
 
+### ★ OPEN: the coarse REKEY path, root-caused, not fixed
+
+Both remaining coarse unit stops are in `ft_rekey_graft_simple_attempt`,
+retried by `ft_rekey_graft_simple_locked`'s `for (;;)`.
+
+| arm / test | bail | cause |
+|---|---|---|
+| exponential 295 `test_rekey_merge_occupied_dst` | `-EAGAIN` | a deferred re-parent child cannot be DATED |
+| root-only 112 `test_rekey_fixed_len_atomic_or_refused` | `-EIO` | `ft_store_at_graft_point` returns BUSY, single-threaded |
+
+root-only 295 hangs too and shows neither — a third site.
+
+**Fixed on the way**: the fold's glue had NO anchor source (`lock_d == NULL`),
+the fourth glue to need one. Set where the descent and the glue are both in
+scope, as `ft_merge_spine_copy` does at its own `gd.lock_d`.
+
+**Still open (1).** With the descent set, the deferred child is still undatable:
+it is a skip-encoded flag, and resolving identity by METADATA does not help
+either (measured) because the node genuinely is not in the 4-slot window — a
+deferred child comes from the BUILD, below the cursor. The fix is to carry the
+depth from the build, as a splice holder's now is; the cost is that
+`ft_glue_defer_edge` / `_origin` have **19 call sites**, and a lock set split
+across dated and undated members is the disagreement §1 forbids, so it cannot
+land partially.
+
+★ Settle first whether a RE-HOMED node has a well-defined anchor at all. The
+deferred child is being moved, so it has an old root-path and a new one, and
+`anchor(X)` is a function of X's path. §3 closed exactly this for the cross-trie
+graft via the EXCLUSIVE-source requirement; the rekey fold re-homes inside one
+trie. Writing 19 call sites before answering that would be premature.
+
+**Still open (2).** `CDS_FT_STATUS_BUSY_ERROR` with no peer is another
+self-refusal, inside the store's own acquire set — unexplored.
+
+### ★ An undemonstrated fix is not free
+
+Beside the measured change above I landed a "same class as the one I just
+fixed" edit — swapping a bare `ft_lock_ctx_init` for `ft_glue_lock_ctx` at the
+publish-parent fence — that no probe had shown firing. `ft_glue_lock_ctx` also
+sets `held.glue`, which enables the glue dedupe **at per-node granularity**, so
+it is not inert there. The next `inv` run reported
+`inv_concurrent_writers_shared: LEAK allocated 3572, freed 3571 (delta 1)`; two
+runs without it were clean. Not proof of cause, but it was undemonstrated, so it
+was dropped. Recognising a class is a reason to MEASURE a site, not to change
+it.
+
 ### Where the arms stand
 
 | arm | unit | inv |
 |---|---|---|
 | per-node | 307/307 | 111/111 |
-| root-only | **111** — hangs at 112 `test_rekey_fixed_len_atomic_or_refused` | hangs 3 |
-| exponential | **294** of 307 — hangs at 295 `test_rekey_merge_occupied_dst` | hangs 4 |
-
-Both remaining stops are in the REKEY path.
+| root-only | 111 — hangs at 112 | hangs 3 |
+| exponential | 294 of 307 — hangs at 295 | hangs 4 |
 
 ### Still open in ft_descent_anchor_at_level
 
