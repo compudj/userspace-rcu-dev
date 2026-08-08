@@ -775,14 +775,6 @@ unsigned int ft_meta_parent_slot_offset_load(const struct cds_ft_metadata *meta)
 }
 
 /*
- * ft_parent_depth_span: number of key bytes a parent's slot covers.
- * Trivially 1 for every surviving node type (compressed/skip-compressed
- * still resolve via metadata->parent on the multi-byte hop, but the
- * caller of this helper iterates one ancestor at a time).
- */
-#define ft_parent_depth_span(p, c)	((void)(p), (void)(c), 1U)
-
-/*
  * Flip-proxy tag (see the full encoding note above ft_node_flip_proxy's original
  * home, further down).  Hoisted here because the tag-stripping helpers below
  * must be able to assert against it.

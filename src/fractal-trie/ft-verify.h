@@ -348,8 +348,8 @@ int ft_verify_external_chain(const struct cds_ft *ft, FILE *out,
  *
  * Catches double-wrap of an already-skip-encoded child, stale skip
  * pointers left behind by a recompact that did not refresh the
- * encoded slen, and the parent_depth_span class of bug fixed by
- * ft_parent_depth_span match against skip-encoded child.
+ * encoded slen, and the parent-depth-span class of bug: a hop up past a
+ * skip-encoded child must move the byte-depth by the target's whole run.
  */
 static
 int ft_verify_skip_encoding(const struct cds_ft *ft, FILE *out, struct cds_ft_inode_flag *slot_val,

@@ -1402,6 +1402,7 @@ int ft_detach_node(struct cds_ft *ft,
 	bool boundary_fused = false;
 	struct cds_ft_inode_flag *cur;
 	unsigned int cur_depth;
+	unsigned int cur_span;
 	/*
 	 * Snapshot of the slot value at the detach point.  Set once the
 	 * upward walk finishes elevating @detach_node_flag_ptr, before
@@ -1632,7 +1633,18 @@ int ft_detach_node(struct cds_ft *ft,
 	/* Plan expected-old for a detach that never elevates (see @plan_old_child). */
 	plan_old_child = (struct cds_ft_inode_flag *)
 		rcu_dereference(*detach_node_flag_ptr);
-	cur_depth = detach_depth - ft_parent_depth_span(cur, *detach_node_flag_ptr);
+	/*
+	 * @cur HOLDS the detached child's slot, so it starts a full SPAN above
+	 * it -- one key byte for a bitmap node, the whole run for a compressed
+	 * one, which is what ft_node_span answers.  A span wider than the
+	 * child's own depth means @cur is not the parent of anything at that
+	 * depth: the plan is stale, so re-descend (nothing is built, locked or
+	 * reserved yet, exactly as the bail above).
+	 */
+	cur_span = ft_node_span(ft, cur);
+	if (caa_unlikely(cur_span > detach_depth))
+		return -EAGAIN;
+	cur_depth = detach_depth - cur_span;
 
 	/*
 	 * nr_keys count fold (LEAF Increment 2): no standalone pre-decrement
@@ -1847,7 +1859,18 @@ int ft_detach_node(struct cds_ft *ft,
 					(struct cds_ft_inode_flag *)
 						rcu_dereference(*detach_node_flag_ptr);
 			}
-			cur_depth -= ft_parent_depth_span(parent_nf, cur);
+			/*
+			 * One hop up moves the byte-depth by the PARENT's span,
+			 * never by one: a compressed parent consumes its whole
+			 * run.  Dating the climb by one per ancestor puts every
+			 * node it reports at a depth the descent disagrees with,
+			 * and a lock-set member is then anchored at a level that
+			 * is not its own.
+			 */
+			cur_span = ft_node_span(ft, parent_nf);
+			if (caa_unlikely(cur_span > cur_depth))
+				return -EAGAIN;	/* stale plan: re-descend */
+			cur_depth -= cur_span;
 			cur = parent_nf;
 		}
 	}
