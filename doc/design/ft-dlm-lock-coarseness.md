@@ -437,7 +437,72 @@ converts a validated edge into a park.
 
 ---
 
-## 9. Acquire-site inventory (2026-08-07)
+## 9. Acquire-site inventory
+
+### The choke point
+
+Every acquire resolves its member through ONE of two entry points, which anchor
+and dedupe together:
+
+| | |
+|---|---|
+| `ft_acquire_member(ft, ctx, nf, node, depth, &held)` | immediate: marks the anchor now |
+| `ft_dlm_acquire_set(ft, ctx, set, nr)` | transacted: one all-or-none MCAS over a whole lock-set |
+
+`struct ft_lock_ctx` carries what belongs to the OP rather than to the member:
+the descent that supplies anchors, and the words already held. Its held set
+spans the txn registry **and** the marks an op keeps outside it
+(`ft_detach_node`'s orphan chain reaches `FT_MAX_DEPTH`, past
+`FT_FLIP_TXN_MAX_LOCKS`). A NULL context means "no descent, nothing held" and
+is legal only under per-node granularity, which `ft_anchor_meta` asserts.
+
+`struct ft_held_anchor` is the result: the word the acquire CAS'd (release,
+register) and the node's own clean word (retire), plus `shared` — the op
+already held the word, so this member owes neither terminal.
+
+★ **The anchor comes from the caller's METADATA, never from a flag rebuilt out
+of a node pointer and a type index.** That reconstruction takes the
+internal-node path in `ft_flag_to_metadata`, so for a compressed node reached
+through a skip pointer it names a DIFFERENT node — the acquire then fences one
+word while the retire tombstones another. `ft_anchor_meta` resolves a flag only
+when the anchor is a genuine ancestor, i.e. a flag the descent stored.
+
+★ **`ft_descent_depth_of`** answers what a depth SCALAR cannot: a site locking
+`{C, P, GP}` reaches P and GP through back-pointers, which yield nodes with no
+depth at all. It returns false where the descent does not describe the node, so
+the caller RE-PLANS rather than anchoring one node by another's depth.
+
+### Remaining (2026-08-07, after `e909a34a`)
+
+Converted: `ft_chain_compress_fused` (both arms),
+`ft_detach_node_replace_compressed_parent`, `ft_node_recompact`'s `{C, P, GP}`.
+`ft_lock_member` deleted (no callers).
+
+| function | n | what it needs |
+|---|---|---|
+| `ft_flip_txn_lock_or_guard_parent` | 1 | **highest leverage: 13 callers**, each must supply a depth |
+| `ft_detach_node` orphan walk | 4 | the walk must EXTEND the descent (below), not run beside it |
+| `ft_rekey_cow_stop` | 4 | fan-out; §7.2 hoist, caller holds `d_src` |
+| `ft_rekey_graft_simple_attempt` | 3 | local `d_src` / `d_dst` |
+| `_cds_ft_insert` | 2 | local descent; the second needs a WINDOW depth (`ft_chain_head_holder`) |
+| `ft_insert_dlm_acquire_split` | 2 | anchored already; fold onto `ft_dlm_acquire_set` |
+| `ft_split_compressed_insert`, `ft_insert_compressed_key_shorter`, `_cds_ft_replace_locked` | 3 | |
+| `ft_merge_lock_overlap`, `ft_merge_spine_copy` | 2 | |
+| `ft_detach_orphan_planlock`, `ft_unchain_node` | 2 | |
+| `ft_split_compressed_graft_build`, `ft_graft_keylen` | 2 | `ft_graft_keylen` is the measured self-collision |
+| `ft_root_attach_fence_empty` | 1 | the root anchors on itself under every spacing |
+| `ft_glue_acquire_reparent_marks`, `ft_glue_acquire_splice_holders` | 2 | fan-out; §7.3 hoist |
+| `ft_compact_relocate_at` | — | passes a NULL context: needs the depth `ft_compact_descend` tracks |
+
+**A writer WALK must extend the descent.** `ft_detach_node`'s orphan walk moves
+DOWN a single-child chain off `walk_nf`, so its depths are neither
+`detach_depth` nor anything the window carries — but each step's span is known
+(1 internal, `cn->len` compressed). Feed it through `ft_descent_enter_node` and
+plain `ft_descent_anchor` answers for every node on it. That needs the context
+to carry a MUTABLE descent the callee may extend, which is the one structural
+change still outstanding.
+
+### Why it cannot land site by site
 
 **Anchoring is all-or-nothing (§1), so the conversion cannot be incremental.**
 The moment one site anchors while another still locks the node, a coarser
@@ -447,88 +512,6 @@ spacings are therefore REFUSED by
 `cds_ft_group_attr_set_lock_spacing` (and the env override ignored) unless
 `FEATURE_FT_ANCHOR_VALIDATE` is defined; the gate lifts when this table is
 fully converted.
-
-**40 acquire sites across 23 functions** — 33 `ft_meta_lock_acquire`,
-5 `ft_dlm_lock`, 2 `ft_dlm_acquire_set`. By plumbing distance:
-
-### ★ Correction (2026-08-07): a depth SCALAR does not tier a site
-
-The tiering below reads "has a depth parameter" as "convertible". That is wrong,
-and the first conversion showed why: **a site locks `{C, P, GP}`, and a depth
-parameter gives only `C`.** `P` and `GP` are reached through
-`ft_resolve_parent_slot`, which yields nodes with **no depth at all** — so the
-site needs the descent's WINDOW depths (`pdepth` / `ppdepth`), not a scalar.
-
-`ft_insert_dlm_acquire_split` therefore took the descent, not `node_depth`, and
-re-plans where the descent disagrees with the plan's own parent resolution.
-
-Re-read the tiers with that in mind: the sites carrying a real `struct
-ft_descent` (`ft_rekey_graft_simple_attempt`, `ft_split_compressed_graft_build`,
-`ft_insert_compressed_key_shorter`, `_cds_ft_insert`, `ft_merge_spine_copy` —
-**8 sites**) are the genuinely mechanical ones. The depth-scalar sites
-(`ft_node_recompact` 4, `ft_detach_node` 4) still need a descent threading to
-them, and `ft_node_recompact` has none.
-
-### ★ A writer WALK should extend the descent, not run beside it
-
-`ft_detach_node`'s four acquires lock nodes off `walk_nf`, walking **down** a
-single-child chain (`ft-remove.h:1659-1727`) — so their depths are neither
-`detach_depth` nor anything the window carries.
-
-They are, however, perfectly derivable: the walk starts at a known depth and
-each step's span is known (1 for an internal node, `cn->len` for a compressed
-one). So the fix is not to invent a second depth-tracking scheme but to feed the
-walk through `ft_descent_enter_node`, continuing the SAME descent. The anchor
-table then covers the walked region and plain `ft_descent_anchor` answers for
-every node on it.
-
-**Generalise: any writer walk that moves deeper should extend the descent.**
-That keeps one depth-tracking mechanism and one anchor table for the whole op,
-which is what agreement wants.
-
-### Tier 0 — depth already in hand (17 sites)
-
-| function | n | source |
-|---|---|---|
-| `ft_detach_node` (`ft-remove.h:1061`) | 4 | `detach_depth` param |
-| **`ft_node_recompact` (`ft-mutation-node.h:1131`)** | 4 | **`node_depth` param — present but `__attribute__((unused))`** |
-| `ft_rekey_graft_simple_attempt` (`fractal-trie.c:844`) | 3 | local `d_src` / `d_dst` |
-| `_cds_ft_insert` (`ft-insert.h:2697`) | 2 | local descent |
-| `ft_split_compressed_graft_build`, `ft_insert_compressed_key_shorter`, `ft_merge_spine_copy` | 3 | `struct ft_descent *` param |
-| `ft_split_compressed_insert` (`ft-insert.h:798`) | 1 | `node_depth` param |
-
-`ft_node_recompact` already **receives** the depth and discards it. Callers pass
-a real value (`ft-mutation-node.h:2785`). Dropping the `unused` attribute is the
-whole plumbing for the largest single cluster.
-
-### Tier 1 — one hop (6 sites)
-
-`ft_insert_dlm_acquire_split` (2; both callers have depth) and
-`ft_rekey_cow_stop` (4; caller holds `d_src`).
-
-### Tier 2 — no depth, multi-hop (14 sites)
-
-`ft_chain_compress_fused` (4), `ft_detach_node_replace_compressed_parent` (2),
-`ft_graft_keylen`, `_cds_ft_replace_locked`, `ft_merge_lock_overlap`,
-`ft_root_attach_fence_empty`, `ft_glue_acquire_reparent_marks`,
-`ft_glue_acquire_splice_holders`, `ft_detach_orphan_planlock`,
-`ft_unchain_node` (1 each).
-
-**Eight of these sit under the node-handle remove path** — exactly the §5.3
-hole. This tier is the real cost of the conversion, and it is where the
-remove-must-descend decision has to be made concrete.
-
-### Wrappers (2 sites, high leverage)
-
-`ft_flip_txn_lock_or_guard_parent` (`ft-mutation-helpers.h:2384`) is **one**
-conversion covering **13 call sites** — though each caller must still supply a
-depth. `ft_dlm_acquire_set` takes a member array, so it grows a per-member
-depth.
-
-### Dead (1 site)
-
-`ft_lock_member` (`ft-mutation-helpers.h:1042`) has **zero callers** — only
-comment references. It needs no conversion; it needs deleting.
 
 ### Completeness is a machine check, not an audit
 
