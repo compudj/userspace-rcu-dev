@@ -674,29 +674,57 @@ pending word, so it was suppressing the only release. Probing whether it ever
 fired returned 0/0 on both arms. It was dropped; the guard fix carries the
 result alone.
 
-### ★ OPEN: a retire snapshot a LATER acquire invalidates
+### ★ OPEN: one node, two byte-depths
 
-`exponential` / `test_density_stress` remains. `@node_snap` is sampled when a
-member is acquired; a **later** acquire in the same op then takes that node's
-OWN word (the detach's orphan chain walks up, so a coarsened member becomes a
-direct anchor a step later). `ft_flip_txn_record_retire_anchored` then records
-`{clean -> clean|TOMBSTONE}` against a word carrying the op's own `LOCK`:
+`exponential` / `test_density_stress` still spins. Three defects sit on top of
+each other in `ft_detach_node`; two are fixed, the third is not.
+
+**Fixed — the anchor of a node starting ON a lock level.** §2 settles it from
+the depth alone: the node is the first boundary at that level, so it anchors on
+itself. The code applied that at depth 0 only and sent every other such node
+through the table, which answers from the path the DESCENT took. For a member
+the descent never passed, the arms return the cursor's node — or NULL, which
+`ft_anchor_meta` dereferences. Measured: two members whose anchors named each
+other, `anchor(B@4)=A` and `anchor(A@5)=B`. An anchor is an ancestor-or-self, so
+that forces `A==B`; the op refused its own marks forever.
+
+**Fixed — the orphan walk extends its own descent.** The walk leaves the key
+path, so entering its nodes into the op's descent re-answers the anchor query
+for every lock set resolving after it (the chain-compress fuse, both publish
+guards). All five of the walk's acquires moved together; a lock set split across
+two tables is the same disagreement from inside one op.
+
+**Open — the walk and the descent date the same node differently:**
 
 ```
-STALESNAP node=0x..598 snap=4 cur=80004 lock=0x..658 lock==node=0 node_held=0
+TBL  lvl=2 clamp=3 bound_start=2 bound=flag(0x..b32)  -> metadata 0x..d18
+ACQ  phase 2  depth=5  node=0x..d18
 ```
 
-`ft_member_node_snap` answers "did an EARLIER member anchor here?" — it cannot
-see a member that has not run yet. Per-node never exposes it: `lock == node`,
-so the fused terminal is taken and no separate snapshot exists to go stale.
+The descent recorded that node as starting at byte-depth **2**; the walk
+acquires it at **5**. A node has one byte depth, so `anchor()` is being asked
+about one node under two, and answers differently — §1 breaks at the SOURCE, and
+no table rule repairs it.
 
-The expected old must NOT be re-read raw (a peer change between acquire and
-commit must abort rather than be ratified by a late capture). The distinction
-needed is *our own mark vs a peer's change*, which the txn's own lock registry
-can answer at record time.
+★ Hypothesis, unconfirmed: the detach RE-HOMES nodes (the elevation the walk
+exists to clean up), so a node's byte depth changes mid-op — the descent holds
+pre-elevation depths and the walk computes post-elevation ones. If so the
+statement to settle is that **anchor(X) is not stable across an edit that
+re-homes X**, which §3 has only ever closed for the cross-trie graft via the
+EXCLUSIVE-source requirement; a remove's elevation re-homes inside one trie.
+Confirm before designing: print the walk's `nf` beside the table's `bound` flag
+and check they are the same flag, then compare `ft_child_depth_of` at the walk's
+start against the descent's own depth for that node. The cheaper alternative —
+the walk's depth derivation is simply wrong for the skip / elevated encoding —
+has not been ruled out.
 
-Status after these two: per-node `unit 307/307`, `inv 111/111`; root-only
-advances 102 → 109 and inv to 3 — same class, more sites.
+**Also open, same file.** `ft_descent_anchor_at_level`'s
+`a->bound ? a->bound : d->nf` substitutes the CURSOR for a boundary node the
+descent has not entered. Where `bound_start == clamp` the boundary is the
+queried node itself, so the answer is `nf`. Needs `nf` plumbed into that helper.
+
+Status: per-node `unit 307/307`, `inv 111/111`. root-only clean on both tests
+that used to hang, reaching test 109. Exponential still red on one test.
 
 ### Why it cannot land site by site
 
