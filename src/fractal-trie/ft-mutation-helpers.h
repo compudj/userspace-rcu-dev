@@ -410,7 +410,18 @@ struct cds_ft_inode_flag *ft_descent_anchor_of(const struct ft_descent *d,
 	case CDS_FT_LOCK_SPACING_PER_NODE:
 		return nf;
 	case CDS_FT_LOCK_SPACING_ROOT_ONLY:
-		assert(d->anchor_crossed & 1U);
+		/*
+		 * The first node ANY descent enters is the trie's root, so
+		 * @anchor[0] normally holds it.  A descent that never ADVANCED
+		 * entered nothing -- both advance paths enter the node they
+		 * LEAVE, and a merge whose point IS the root descends an empty
+		 * key, so its loop never steps -- and then the cursor is still
+		 * that root.  Either way the anchor is the root.
+		 */
+		if (caa_unlikely(!(d->anchor_crossed & 1U))) {
+			assert(!d->depth);
+			return d->nf;
+		}
 		return d->anchor[0].cover;
 	case CDS_FT_LOCK_SPACING_EXPONENTIAL:
 	default:
@@ -1595,6 +1606,19 @@ bool ft_lock_ctx_depth_of_at(const char *fn, int line,
 {
 	if (ft->lock_spacing == CDS_FT_LOCK_SPACING_PER_NODE) {
 		*depth = 0;
+		return true;
+	}
+	/*
+	 * Root-only anchors EVERY member on the root, so like per-node it never
+	 * reads the depth -- only the exponential schedule selects a level from
+	 * it.  Answering here is what keeps a member the descent never passed
+	 * (a chain head's holder below an empty-key merge point) from bailing to
+	 * a re-descend that must fail the same way forever.  Non-zero, so
+	 * ft_anchor_meta's "depth 0 IS the root" early-out does not mistake a
+	 * deep member for the root; both roads lead to the root regardless.
+	 */
+	if (ft->lock_spacing == CDS_FT_LOCK_SPACING_ROOT_ONLY) {
+		*depth = 1;
 		return true;
 	}
 	if (caa_likely(ft_descent_depth_of(ft_lock_ctx_descent(ctx), nf, depth)))
