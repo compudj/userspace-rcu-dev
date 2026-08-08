@@ -899,7 +899,18 @@ enum cds_ft_status cds_ft_create(struct cds_ft_group *ft_group,
 	 * of the group strategy so the hooks read one trie field each.
 	 */
 	ft->lock_fine = (ft_group->writer_strategy == CDS_FT_WRITER_LOCK_FINE);
-	ft->lock_spacing = ft_group->lock_spacing;
+	/*
+	 * Spacing is a FINE-mode property, and this is where it is made inert
+	 * everywhere else (every reader takes it from here, ft_descent_init
+	 * included).  A COARSE trie derives no lock-set at all (§10.5): its
+	 * remaining acquires are the F2 body-copy fences, taken one at a time
+	 * with no set to dedupe against, so a coarsened anchor there only
+	 * collapses an op's OWN marks onto one word -- the op then refuses
+	 * itself, and on a path with no retry (remove_all) that is a hard
+	 * MEMORY_ERROR.
+	 */
+	ft->lock_spacing = ft->lock_fine ? ft_group->lock_spacing :
+			CDS_FT_LOCK_SPACING_PER_NODE;
 	cds_fair_mutex_init(&ft->writer_lock);
 	/* Move mode gate (struct cds_ft::move_active): movers only. */
 	pthread_mutex_init(&ft->move_gate_lock, NULL);
