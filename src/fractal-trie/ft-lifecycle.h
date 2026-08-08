@@ -313,11 +313,24 @@ enum cds_ft_status cds_ft_group_attr_set_writer_strategy(
  * else per-node.  An explicit cds_ft_group_attr_set_lock_spacing always wins --
  * this moves the DEFAULT only, so a test run can sweep the granularity axis
  * across a whole suite without every group-create site growing a knob.
+ *
+ * The knob is its OWN feature, which either probe implies.  That separation is
+ * what makes a probe's cost measurable against the granularity it measures: a
+ * build carrying the knob alone runs the coarse arm with no instrumentation, so
+ * "the coarse arm is slow" and "the probe is slow" are distinguishable claims.
+ * Welded to the probes, a control build reads no env and reports the coarse arm
+ * on per-node timings.
  */
+#if defined(FEATURE_FT_ANCHOR_VALIDATE) || defined(FEATURE_FT_HOLD_TRACE)
+# ifndef FEATURE_FT_LOCK_SPACING_ENV
+#  define FEATURE_FT_LOCK_SPACING_ENV
+# endif
+#endif
+
 static
 enum cds_ft_lock_spacing ft_lock_spacing_default(void)
 {
-#if defined(FEATURE_FT_ANCHOR_VALIDATE) || defined(FEATURE_FT_HOLD_TRACE)
+#ifdef FEATURE_FT_LOCK_SPACING_ENV
 	const char *env = getenv("CDS_FT_LOCK_SPACING");
 
 	if (env) {
