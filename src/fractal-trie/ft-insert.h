@@ -623,13 +623,9 @@ int ft_insert_dlm_acquire_split(struct cds_ft *ft,
 		struct ft_insert_commit *ic)
 {
 	struct cds_ft_inode_flag *pf_p = NULL;
-	struct cds_ft_metadata *p_meta = NULL;
-	struct cds_ft_metadata *cn_lock;
-	uintptr_t cn_lock_snap;
-	uintptr_t cn_node_snap = 0;
-	uintptr_t snap_p = 0;
-	bool shared = false;
-	struct ft_flip_txn *acq;
+	struct ft_dlm_member set[2];
+	struct ft_lock_ctx lctx;
+	unsigned int p_depth = 0;
 	int dret;
 
 	/* PLAN (read-only, racy): resolve CN's parent P. */
@@ -648,78 +644,52 @@ int ft_insert_dlm_acquire_split(struct cds_ft *ft,
 	 * so there is no depth to anchor it by -- re-plan rather than anchor it
 	 * with a depth that belongs to another node.
 	 */
-	cn_lock = ft_anchor_meta(ft, d, cn_flag, cn_meta, cn_depth);
-	if (pf_p) {
-		if (ft->lock_spacing == CDS_FT_LOCK_SPACING_PER_NODE) {
-			p_meta = ft_flag_to_metadata(ft, pf_p);
-		} else {
-			if (!d || pf_p != d->pnf)
-				return -EAGAIN;
-			p_meta = ft_anchor_meta(ft, d, pf_p,
-					ft_flag_to_metadata(ft, pf_p), d->pdepth);
-		}
-		if (p_meta == cn_lock) {
-			/*
-			 * One anchor covers both members: acquire it ONCE (a
-			 * second ft_dlm_lock on a word this op holds aborts
-			 * -EAGAIN), and tell the publish that P's lock is held
-			 * and already accounted for rather than absent.
-			 */
-			p_meta = NULL;
-			shared = true;
-		}
+	if (pf_p && ft->lock_spacing != CDS_FT_LOCK_SPACING_PER_NODE) {
+		if (!d || pf_p != d->pnf)
+			return -EAGAIN;
+		p_depth = d->pdepth;
 	}
-
-	/* ACQUIRE {CN, P} + the read-set guard CN.parent==P in one MCAS. */
-	/*
-	 * Bind the ACQUIRE to the op's PERSISTENT handle when there is one.  A
-	 * per-attempt handle is domain-less and is never begin/end-bracketed, so
-	 * it neither ages nor consults the escalation lane -- the acquire is then
-	 * a participant the lane cannot order, and a peer can hold a lock-set
-	 * member while a lane-holding writer spins for it.  @ic->txn is not live
-	 * at this point (the commit is armed later), so the op carries only this
-	 * txn's records here.
-	 */
-	/*
-	 * Coarsening leaves CN's OWN word unlocked -- the exclusion moved to the
-	 * anchor -- but the split still RETIRES CN against that word, so this
-	 * acquire must ratify it just as ft_dlm_lock ratifies the word it locks.
-	 * Sample it now (refusing a dirty one, the same -EAGAIN the per-node
-	 * acquire gives) and guard the value into the commit below.
-	 */
-	if (cn_lock != cn_meta &&
-			ft_held_anchor_sample_node(cn_meta, &cn_node_snap))
-		return -EAGAIN;
-	acq = ic && ic->op ? ft_flip_txn_create_bounded_on(ic->op,
-				2 /*locks*/ + 2 /*guards*/)
-			: ft_flip_txn_create_bounded(2 /*locks*/ + 2 /*guards*/);
-	if (!acq)
-		return -ENOMEM;
-	if (cn_lock != cn_meta)
-		ft_held_anchor_guard_node(acq, cn_meta, cn_node_snap);
-	dret = ft_dlm_lock(acq, cn_lock, &cn_lock_snap);
-	if (!dret && p_meta) {
+	set[0] = (struct ft_dlm_member){ .nf = cn_flag, .node = cn_meta,
+		.depth = cn_depth,
 		/*
 		 * The guard is a read-set validation of CN's OWN back-edge (the
 		 * plan resolved P through it), so it names @cn_meta even where
-		 * the lock went to an ancestor -- anchoring moves the exclusion,
+		 * the lock goes to an ancestor -- anchoring moves the exclusion,
 		 * not the edge being validated.
 		 */
-		ft_dlm_guard_parent(acq, cn_meta, pf_p);
-		dret = ft_dlm_lock(acq, p_meta, &snap_p);
-	}
-	if (dret) {
-		ft_flip_txn_destroy(acq);
-		return -EAGAIN;
-	}
-	if (ft_flip_txn_commit(ft, acq) != URCU_TXN_STATUS_OK)
-		return -EAGAIN;	/* commit freed @acq; nothing acquired */
+		.guard_child = pf_p ? cn_meta : NULL, .guard_pf = pf_p };
+	set[1] = (struct ft_dlm_member){ .nf = pf_p,
+		.node = pf_p ? ft_flag_to_metadata(ft, pf_p) : NULL,
+		.depth = p_depth };
 
-	ft_held_anchor_set(held, cn_lock, cn_lock_snap, cn_meta, cn_node_snap);
-	/* P's held release, threaded to ft_insert_publish_or_park. */
-	ic->parent_locked_holder = p_meta;
-	ic->parent_locked_snap = snap_p;
-	ic->parent_lock_shared = shared;
+	/*
+	 * ACQUIRE {CN, P} + the read-set guard CN.parent==P in ONE MCAS.  The set
+	 * primitive samples and guards CN's OWN word where coarsening left it
+	 * unlocked -- the split still RETIRES CN against it -- and dedupes the two
+	 * members where one anchor covers both.
+	 *
+	 * Bound to the op's PERSISTENT handle when there is one, so the acquire
+	 * ages and takes its lane turn (struct ft_lock_ctx.op).  @ic->txn is not
+	 * live at this point (the commit is armed later), so the op carries only
+	 * this txn's records here.
+	 */
+	ft_lock_ctx_init(&lctx, d, NULL);
+	lctx.op = ic ? ic->op : NULL;
+	dret = ft_dlm_acquire_set(ft, &lctx, set, 2);
+	if (dret)
+		return dret == -ENOMEM ? -ENOMEM : -EAGAIN;
+
+	*held = set[0].held;
+	/*
+	 * P's held release, threaded to ft_insert_publish_or_park.  A P that
+	 * shares CN's anchor was acquired WITH it and its release is already
+	 * recorded, so the publish is told it is held-and-accounted-for rather
+	 * than absent.
+	 */
+	ic->parent_lock_shared = pf_p && set[1].held.shared;
+	ic->parent_locked_holder = (pf_p && !set[1].held.shared) ?
+		set[1].held.lock : NULL;
+	ic->parent_locked_snap = pf_p ? set[1].held.lock_snap : 0;
 	return 0;
 }
 

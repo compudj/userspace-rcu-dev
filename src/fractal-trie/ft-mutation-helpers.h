@@ -1275,6 +1275,15 @@ struct ft_held_set {
 struct ft_lock_ctx {
 	const struct ft_descent *d;
 	struct ft_held_set held;
+	/*
+	 * The op's PERSISTENT engine handle, when it has one.  A lock-set
+	 * acquire binds to it so the commit AGES and takes its FIFO turn: a
+	 * per-attempt handle is domain-less and never begin/end-bracketed, which
+	 * makes the acquire a participant the escalation lane cannot order --
+	 * and then a peer can hold a member while a lane-holding writer spins
+	 * for it.  NULL builds a standalone acquire txn, as before.
+	 */
+	struct urcu_txn *op;
 };
 
 static inline
@@ -1319,6 +1328,7 @@ void ft_lock_ctx_init(struct ft_lock_ctx *ctx, const struct ft_descent *d,
 	ctx->held.txn = txn;
 	ctx->held.extra = NULL;
 	ctx->held.nr_extra = 0;
+	ctx->op = NULL;
 }
 
 /*
@@ -1826,7 +1836,9 @@ int ft_dlm_acquire_set(const struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 	 * whatever the granularity (§7.3: the reservation stays safe, merely
 	 * loose).
 	 */
-	acq = ft_flip_txn_create_bounded(3 * nr_present);
+	acq = (ctx && ctx->op) ?
+		ft_flip_txn_create_bounded_on(ctx->op, 3 * nr_present) :
+		ft_flip_txn_create_bounded(3 * nr_present);
 	if (!acq)
 		return -ENOMEM;
 	for (i = 0; i < nr; i++) {
@@ -5421,6 +5433,15 @@ struct ft_glue_deferred_edge {
 	 * we own = a guaranteed abort on every attempt.
 	 */
 	bool held_lock;
+	/*
+	 * The word the acquire actually CAS'd for this child -- its ANCHOR
+	 * under a coarse spacing, its own metadata under per-node.  Stored
+	 * rather than re-derived, because the release sweep must lift the word
+	 * this op TOOK, and a re-derivation names the node instead.  Doubles as
+	 * the dedupe key: two deferred entries mapping to one anchor must be
+	 * acquired ONCE.
+	 */
+	struct cds_ft_metadata *lock_word;
 };
 
 struct ft_glue_free_item {
@@ -6334,6 +6355,7 @@ void ft_glue_defer_edge_origin(struct cds_ft *ft, struct ft_glue *g,
 	 */
 	g->deferred[g->nr_deferred].marked = false;
 	g->deferred[g->nr_deferred].held_lock = false;
+	g->deferred[g->nr_deferred].lock_word = NULL;
 	g->nr_deferred++;
 }
 
@@ -6628,34 +6650,52 @@ int ft_glue_acquire_reparent_marks(struct cds_ft *ft, struct ft_glue *g)
 	for (i = 0; i < g->nr_deferred; i++) {
 		struct cds_ft_metadata *cm =
 			ft_glue_reparent_park_meta(ft, g->deferred[i].child);
-		uintptr_t snap;
+		struct cds_ft_metadata *anchor;
+		struct ft_lock_ctx gctx;
+		struct ft_held_anchor h;
+		unsigned int cd;
 		bool dup = false;
 
 		g->deferred[i].marked = false;
 		g->deferred[i].held_lock = false;
+		g->deferred[i].lock_word = NULL;
 		if (!cm)
 			continue;
-		if (ft_glue_op_holds(g, cm)) {
+		/*
+		 * §7.2 fan-out: every child of one node shares a byte-depth, so
+		 * a coarse spacing either collapses them all onto one anchor --
+		 * frequently one this op already holds, making the collapse
+		 * 256 -> 0 -- or gives each its own, and none can collide.  The
+		 * dedupe below is what decides it either way.  A child the
+		 * descent cannot date has no anchor here: re-plan.
+		 */
+		ft_glue_lock_ctx(g, &gctx);
+		if (!ft_lock_ctx_depth_of(ft, &gctx, g->deferred[i].child, &cd))
+			return -EAGAIN;
+		anchor = ft_anchor_meta(ft, ft_lock_ctx_descent(&gctx),
+			g->deferred[i].child, cm, cd);
+		if (ft_glue_op_holds(g, anchor)) {
 			/* Held via another lock set: do not re-mark, do not
 			 * release -- but DO record that we hold it. */
 			g->deferred[i].held_lock = true;
+			g->deferred[i].lock_word = anchor;
 			continue;
 		}
 		/*
-		 * Two deferred entries can resolve to ONE metadata (a skip flag
-		 * and the plain flag of the same compressed node), and the
+		 * Two deferred entries can resolve to ONE word (a skip flag and
+		 * the plain flag of the same compressed node; or, under
+		 * coarsening, two distinct children sharing an anchor), and the
 		 * dedup in ft_glue_defer_edge_origin keys on the FLAG, so it
-		 * does not catch that.  A second mark on our own word is the
+		 * does not catch either.  A second mark on our own word is the
 		 * same self-deadlock as above.
 		 */
 		for (j = 0; j < i; j++)
-			if (g->deferred[j].marked &&
-					ft_glue_reparent_park_meta(ft,
-						g->deferred[j].child) == cm)
+			if (g->deferred[j].lock_word == anchor)
 				dup = true;
 		if (dup) {
 			/* Same word, marked via the earlier entry: we hold it. */
 			g->deferred[i].held_lock = true;
+			g->deferred[i].lock_word = anchor;
 			continue;
 		}
 #ifdef FEATURE_FT_FAULT_INJECT
@@ -6677,8 +6717,10 @@ int ft_glue_acquire_reparent_marks(struct cds_ft *ft, struct ft_glue *g)
 			cds_ft_fault_lock_countdown--;
 		}
 #endif
-		if (ft_meta_lock_acquire(cm, &snap))
+		if (ft_acquire_member(ft, &gctx, g->deferred[i].child, cm, cd,
+				&h) || h.shared)
 			return -EAGAIN;
+		g->deferred[i].lock_word = h.lock;
 		g->deferred[i].marked = true;
 		g->deferred[i].held_lock = true;
 	}
@@ -6713,7 +6755,7 @@ void ft_glue_release_reparent_marks(struct cds_ft *ft, struct ft_glue *g)
 
 		if (!g->deferred[i].marked)
 			continue;
-		cm = ft_glue_reparent_park_meta(ft, g->deferred[i].child);
+		cm = g->deferred[i].lock_word;
 		if (cm) {
 			ft_meta_lock_release(cm);
 		}
@@ -7566,21 +7608,36 @@ int ft_glue_acquire_splice_holders(struct cds_ft *ft, struct ft_glue *g)
 	for (i = 0; i < g->nr_splices; i++) {
 		struct cds_ft_node *dst_head = g->splices[i].dst_head;
 		struct cds_ft_inode_flag *hf = ft_chain_head_holder(ft, dst_head);
-		struct cds_ft_metadata *hm;
+		struct cds_ft_metadata *hm, *anchor;
+		struct ft_lock_ctx sctx;
+		struct ft_held_anchor sh;
+		unsigned int hd;
 		bool held = false;
 
 		assert(hf);
 		hm = ft_flag_to_metadata(ft, hf);
+		/*
+		 * The holder was reached by walking a chain head's prev, so the
+		 * descent's window is what dates it (§5.2: a head's holder IS
+		 * the descent's parent).  One it never passed cannot be anchored
+		 * here -- bail to the caller's re-descend, exactly as a
+		 * contended holder does.
+		 */
+		ft_glue_lock_ctx(g, &sctx);
+		if (!ft_lock_ctx_depth_of(ft, &sctx, hf, &hd))
+			goto miss;
+		anchor = ft_anchor_meta(ft, ft_lock_ctx_descent(&sctx), hf, hm,
+			hd);
 		/*
 		 * Already fenced by the overlap-spine plan-lock: reuse it, take no
 		 * second lock, and record no holder -- ft_glue_clear_fenced owns that
 		 * fence's release.  See ft_glue_fence_holds for why re-marking it is
 		 * a self-deadlock rather than a miss.
 		 */
-		if (ft_glue_fence_holds(g, hm))
+		if (ft_glue_fence_holds(g, anchor))
 			continue;
 		for (j = 0; j < i; j++) {
-			if (g->splices[j].holder == hm) {
+			if (g->splices[j].holder == anchor) {
 				held = true;
 				break;
 			}
@@ -7603,9 +7660,10 @@ int ft_glue_acquire_splice_holders(struct cds_ft *ft, struct ft_glue *g)
 			cds_ft_fault_lock_countdown--;
 		}
 #endif
-		if (ft_meta_lock_acquire(hm, &g->splices[i].holder_snap))
+		if (ft_acquire_member(ft, &sctx, hf, hm, hd, &sh) || sh.shared)
 			goto miss;
-		g->splices[i].holder = hm;
+		g->splices[i].holder = sh.lock;
+		g->splices[i].holder_snap = sh.lock_snap;
 		if (ft_chain_head_holder(ft, dst_head) != hf)
 			goto miss;	/* re-parented under us: stale lock */
 	}
@@ -7843,3 +7901,27 @@ void ft_glue_free_old(struct cds_ft *ft, struct ft_glue *g)
 			free_cds_ft_node(ft, g->free_list[i].node);
 	}
 }
+
+/*
+ * COMPLETENESS IS A MACHINE CHECK, NOT AN AUDIT
+ * (doc/design/ft-dlm-lock-coarseness.md §9).
+ *
+ * Anchoring is all-or-nothing: the moment ONE site locks a node directly while
+ * the rest resolve to its anchor, a coarser spacing excludes nothing -- and a
+ * mostly single-writer suite still reports green, which is a false green on the
+ * one invariant the design rests on.  Worse, the two collide inside a SINGLE op:
+ * the raw site takes a word the op already holds as some other member's anchor,
+ * reads its own hold as contention, and retries into the identical shape.
+ *
+ * "Did we convert them all" is therefore answered by the BUILD.  Past this
+ * point the raw primitives do not exist under the validate build; a new acquire
+ * must come through ft_acquire_member or ft_dlm_acquire_set, which is where the
+ * mapping and the dedupe live.  Both choke points are defined ABOVE, so they
+ * keep their access.
+ */
+#ifdef FEATURE_FT_ANCHOR_VALIDATE
+#define ft_meta_lock_acquire(...)	\
+	FT_A_RAW_ACQUIRE_MUST_GO_THROUGH_ft_acquire_member
+#define ft_dlm_lock(...)		\
+	FT_A_RAW_ACQUIRE_MUST_GO_THROUGH_ft_dlm_acquire_set
+#endif

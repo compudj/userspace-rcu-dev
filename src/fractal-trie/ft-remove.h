@@ -602,36 +602,72 @@ void ft_detach_freeze_orphans(struct cds_ft *ft, struct ft_flip_txn *txn,
  * {LOCK|s -> TOMBSTONE|s} tombstone at freeze.
  */
 /*
+ * Byte-depth of @parent_nf's immediate child: one key byte past a bitmap node,
+ * the whole run past a compressed one.
+ */
+static inline
+unsigned int ft_child_depth_of(const struct cds_ft *ft,
+		struct cds_ft_inode_flag *parent_nf, unsigned int parent_depth)
+{
+	if (ft_node_skip_compressed(parent_nf))
+		return parent_depth + ft_skip_to_compressed(ft, parent_nf)->len;
+	if (ft_node_compressed(parent_nf))
+		return parent_depth + ft_compressed_node_ptr(parent_nf)->len;
+	return parent_depth + 1;
+}
+
+/*
+ * EXTEND the descent over one step of a writer walk: position the cursor on
+ * @nf at @depth, then enter it so the anchor table covers the levels its span
+ * crosses.  The next node down is then anchored by plain ft_descent_anchor,
+ * exactly as if the original descent had walked here.  Returns the next node's
+ * byte-depth.
+ *
+ * A no-op under per-node granularity (ft_descent_enter_node returns at once)
+ * and where no descent ran.
+ */
+static inline
+unsigned int ft_walk_extend(struct ft_descent *d, bool valid,
+		struct cds_ft_inode_flag *nf, unsigned int depth,
+		unsigned int span)
+{
+	if (valid) {
+		d->nf = nf;
+		d->depth = depth;
+		ft_descent_enter_node(d, nf, depth, span);
+		d->depth = depth + span;
+	}
+	return depth + span;
+}
+
+/*
  * Acquire an orphan the detach's DOWNWARD walk collected.
  *
- * ★ That walk moves BELOW the descent's cursor, so the window dates only its
- * first node or two.  A deeper orphan has no depth here and is REFUSED: safe
- * (never a wrong anchor) but a re-descend, which is the cost until the walk
- * feeds ft_descent_enter_node and EXTENDS the same descent
- * (doc/design/ft-dlm-lock-coarseness.md §9).  Per-node granularity needs no
- * depth at all and pays none of it.
+ * The walk moves BELOW the descent's cursor, so @depth comes from the walk
+ * itself -- ft_walk_extend has entered every node above this one, so the anchor
+ * table covers it.  Refusing here instead would be fatal rather than merely
+ * costly: remove_all has NO retry loop, so its -EAGAIN surfaces as a hard
+ * MEMORY_ERROR.
  */
 static inline
 int ft_detach_orphan_acquire(const struct cds_ft *ft,
 		const struct ft_lock_ctx *ctx, struct cds_ft_inode_flag *nf,
-		struct cds_ft_metadata *m, struct ft_held_anchor *held)
+		unsigned int depth, struct cds_ft_metadata *m,
+		struct ft_held_anchor *held)
 {
-	unsigned int depth;
-
-	if (!ft_lock_ctx_depth_of(ft, ctx, nf, &depth))
-		return -EAGAIN;
 	return ft_acquire_member(ft, ctx, nf, m, depth, held);
 }
 
 static inline
 int ft_detach_orphan_planlock(const struct cds_ft *ft,
 		const struct ft_lock_ctx *ctx, struct cds_ft_inode_flag *nf,
-		struct cds_ft_metadata *m, bool require_single_child,
+		unsigned int depth, struct cds_ft_metadata *m,
+		bool require_single_child,
 		struct ft_held_anchor *locked, int *n)
 {
 	struct ft_held_anchor h;
 
-	if (ft_detach_orphan_acquire(ft, ctx, nf, m, &h))
+	if (ft_detach_orphan_acquire(ft, ctx, nf, depth, m, &h))
 		return -EAGAIN;
 	if (require_single_child && ft_state_nr_child(h.node_snap) != 1) {
 		if (!h.shared)
@@ -1306,6 +1342,17 @@ int ft_detach_node(struct cds_ft *ft,
 	 * refreshed at each acquire because the orphan walk is still growing it.
 	 */
 	struct ft_lock_ctx lctx;
+	/*
+	 * The op's descent, COPIED so the orphan walks below may EXTEND it.
+	 * Those walks move DOWN a chain past the descent's cursor, and their
+	 * nodes' depths exist nowhere else: feeding each step through
+	 * ft_descent_enter_node keeps ONE depth-tracking mechanism and ONE
+	 * anchor table for the whole op, which is what agreement wants
+	 * (doc/design/ft-dlm-lock-coarseness.md §9).  A copy, not the caller's,
+	 * because the extension is this op's business alone.
+	 */
+	struct ft_descent wd;
+	bool wd_valid = false;
 	struct cds_ft_metadata *orphan_trailing_meta = NULL;
 	struct ft_held_anchor orphan_trailing_held = { 0 };
 	bool retire_glue_fused = false;
@@ -1413,7 +1460,11 @@ int ft_detach_node(struct cds_ft *ft,
 	if (!pub)
 		pub = &local_pub;
 
-	ft_lock_ctx_init(&lctx, ft_lock_ctx_descent(op_ctx), NULL);
+	if (ft_lock_ctx_descent(op_ctx)) {
+		wd = *ft_lock_ctx_descent(op_ctx);
+		wd_valid = true;
+	}
+	ft_lock_ctx_init(&lctx, wd_valid ? &wd : NULL, NULL);
 	lctx.held.extra = orphan_held;
 
 	FT_TP(detach_node_enter, (const void *) *detach_node_flag_ptr, detach_depth);
@@ -1845,6 +1896,8 @@ int ft_detach_node(struct cds_ft *ft,
 		 */
 		if (free_detached_subtree) {
 			struct cds_ft_inode_flag *walk_nf = elevated_old_child;
+			unsigned int walk_depth = ft_child_depth_of(ft,
+				iter_node_flag, cur_depth);
 			bool phase2_first = true;
 
 			while (walk_nf &&
@@ -1886,8 +1939,8 @@ int ft_detach_node(struct cds_ft *ft,
 					lctx.held.nr_extra =
 						(unsigned int) nr_orphan_locked;
 					if (ft_detach_orphan_acquire(ft, &lctx,
-							walk_nf, ometa, &owalk))
-						{
+								walk_nf, walk_depth,
+								ometa, &owalk)) {
 						ret = -EAGAIN;
 						goto end;
 					}
@@ -1967,7 +2020,7 @@ int ft_detach_node(struct cds_ft *ft,
 					if (ft_detach_orphan_acquire(ft, &lctx,
 							ft_compressed_node_flag(
 								trailing_skip_cn),
-							tm,
+								walk_depth, tm,
 							&orphan_trailing_held)) {
 						ret = -EAGAIN;
 						goto end;
@@ -2115,6 +2168,8 @@ int ft_detach_node(struct cds_ft *ft,
 		 */
 		{
 			struct cds_ft_inode_flag *walk_nf = elevated_old_child;
+			unsigned int walk_depth = ft_child_depth_of(ft,
+				iter_node_flag, cur_depth);
 
 			/* Phase 1: elevated ancestors. */
 			while (nr_to_free < nr_clear &&
@@ -2168,6 +2223,7 @@ int ft_detach_node(struct cds_ft *ft,
 					if (ft->lock_fine && ft_detach_orphan_planlock(
 							ft, &lctx,
 							ft_compressed_node_flag(cn),
+							walk_depth,
 							cds_ft_item_to_metadata(
 								(struct cds_ft_inode *) cn),
 							false, orphan_held,
@@ -2177,6 +2233,9 @@ int ft_detach_node(struct cds_ft *ft,
 					}
 					to_free[nr_to_free++] =
 						ft_compressed_node_flag(cn);
+					walk_depth = ft_walk_extend(&wd, wd_valid,
+						ft_compressed_node_flag(cn),
+						walk_depth, cn->len);
 					walk_nf = ft_skip_child_ptr(walk_nf);
 					continue;
 				}
@@ -2205,13 +2264,18 @@ int ft_detach_node(struct cds_ft *ft,
 				}
 				lctx.held.nr_extra = (unsigned int) nr_orphan_locked;
 				if (ft->lock_fine && ft_detach_orphan_planlock(ft,
-						&lctx, walk_nf, ometa,
+						&lctx, walk_nf, walk_depth, ometa,
 						require_sc, orphan_held,
 						&nr_orphan_locked)) {
 					ret = -EAGAIN;
 					goto end;
 				}
 				to_free[nr_to_free++] = walk_nf;
+				walk_depth = ft_walk_extend(&wd, wd_valid, walk_nf,
+					walk_depth,
+					ft_node_compressed(walk_nf) ?
+						ft_compressed_node_ptr(walk_nf)->len :
+						1);
 				walk_nf = next;
 			}
 
@@ -2254,7 +2318,8 @@ int ft_detach_node(struct cds_ft *ft,
 							nr_orphan_locked;
 						if (ft_detach_orphan_acquire(ft,
 								&lctx, walk_nf,
-								ometa, &owalk)) {
+								walk_depth, ometa,
+								&owalk)) {
 							ret = -EAGAIN;
 							goto end;
 						}
@@ -2290,6 +2355,9 @@ int ft_detach_node(struct cds_ft *ft,
 					if (ft->lock_fine)
 						orphan_held[nr_orphan_locked++] =
 							owalk;
+					walk_depth = ft_walk_extend(&wd, wd_valid,
+						walk_nf, walk_depth,
+						ocn ? ocn->len : 1);
 					walk_nf = next;
 				}
 				/*
@@ -2319,8 +2387,8 @@ int ft_detach_node(struct cds_ft *ft,
 						lctx.held.nr_extra = (unsigned int)
 							nr_orphan_locked;
 						if (ft_detach_orphan_acquire(ft,
-								&lctx,
-								walk_nf, tm,
+								&lctx, walk_nf,
+								walk_depth, tm,
 								&orphan_trailing_held)) {
 							ret = -EAGAIN;
 							goto end;
