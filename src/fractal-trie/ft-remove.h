@@ -2204,6 +2204,24 @@ int ft_detach_node(struct cds_ft *ft,
 			struct cds_ft_inode_flag *walk_nf = elevated_old_child;
 			unsigned int walk_depth = ft_child_depth_of(ft,
 				iter_node_flag, cur_depth);
+			/*
+			 * The walk leaves the key path -- it descends the
+			 * elevated chain, then the target's own chain -- so it
+			 * extends a descent OF ITS OWN.  Extending the op's
+			 * would re-answer the anchor query for every lock set
+			 * that resolves after it (the chain-compress fuse and
+			 * both publish guards below): those members sit on the
+			 * KEY path, and a level whose boundary node is still
+			 * pending resolves to the descent's CURSOR, which the
+			 * walk would have moved onto its own branch.
+			 */
+			struct ft_descent wwd;
+			struct ft_lock_ctx wlctx;
+
+			if (wd_valid)
+				wwd = wd;
+			ft_lock_ctx_init(&wlctx, wd_valid ? &wwd : NULL, NULL);
+			wlctx.held.extra = orphan_held;
 
 			/* Phase 1: elevated ancestors. */
 			while (nr_to_free < nr_clear &&
@@ -2252,10 +2270,11 @@ int ft_detach_node(struct cds_ft *ft,
 					struct cds_ft_compressed_node *cn =
 						ft_skip_to_compressed(ft, walk_nf);
 					/* Skip-target: structurally single-child. */
-					lctx.held.nr_extra =
+					wlctx.held.txn = lctx.held.txn;
+					wlctx.held.nr_extra =
 						(unsigned int) nr_orphan_locked;
 					if (ft->lock_fine && ft_detach_orphan_planlock(
-							ft, &lctx,
+							ft, &wlctx,
 							ft_compressed_node_flag(cn),
 							walk_depth,
 							cds_ft_item_to_metadata(
@@ -2267,7 +2286,7 @@ int ft_detach_node(struct cds_ft *ft,
 					}
 					to_free[nr_to_free++] =
 						ft_compressed_node_flag(cn);
-					walk_depth = ft_walk_extend(&wd, wd_valid,
+					walk_depth = ft_walk_extend(&wwd, wd_valid,
 						ft_compressed_node_flag(cn),
 						walk_depth, cn->len);
 					walk_nf = ft_skip_child_ptr(walk_nf);
@@ -2296,16 +2315,17 @@ int ft_detach_node(struct cds_ft *ft,
 						ft_node_ptr(walk_nf));
 					require_sc = true;	/* elevated internal: nr_child==1 */
 				}
-				lctx.held.nr_extra = (unsigned int) nr_orphan_locked;
+				wlctx.held.txn = lctx.held.txn;
+				wlctx.held.nr_extra = (unsigned int) nr_orphan_locked;
 				if (ft->lock_fine && ft_detach_orphan_planlock(ft,
-						&lctx, walk_nf, walk_depth, ometa,
+						&wlctx, walk_nf, walk_depth, ometa,
 						require_sc, orphan_held,
 						&nr_orphan_locked)) {
 					ret = -EAGAIN;
 					goto end;
 				}
 				to_free[nr_to_free++] = walk_nf;
-				walk_depth = ft_walk_extend(&wd, wd_valid, walk_nf,
+				walk_depth = ft_walk_extend(&wwd, wd_valid, walk_nf,
 					walk_depth,
 					ft_node_compressed(walk_nf) ?
 						ft_compressed_node_ptr(walk_nf)->len :
@@ -2348,10 +2368,11 @@ int ft_detach_node(struct cds_ft *ft,
 					 * the "retire it" verdict rests on.
 					 */
 					if (ft->lock_fine) {
-						lctx.held.nr_extra = (unsigned int)
+						wlctx.held.txn = lctx.held.txn;
+						wlctx.held.nr_extra = (unsigned int)
 							nr_orphan_locked;
 						if (ft_detach_orphan_acquire(ft,
-								&lctx, walk_nf,
+								&wlctx, walk_nf,
 								walk_depth, ometa,
 								&owalk)) {
 							ret = -EAGAIN;
@@ -2389,7 +2410,7 @@ int ft_detach_node(struct cds_ft *ft,
 					if (ft->lock_fine)
 						orphan_held[nr_orphan_locked++] =
 							owalk;
-					walk_depth = ft_walk_extend(&wd, wd_valid,
+					walk_depth = ft_walk_extend(&wwd, wd_valid,
 						walk_nf, walk_depth,
 						ocn ? ocn->len : 1);
 					walk_nf = next;
@@ -2418,10 +2439,11 @@ int ft_detach_node(struct cds_ft *ft,
 							ret = -EAGAIN;
 							goto end;
 						}
-						lctx.held.nr_extra = (unsigned int)
+						wlctx.held.txn = lctx.held.txn;
+						wlctx.held.nr_extra = (unsigned int)
 							nr_orphan_locked;
 						if (ft_detach_orphan_acquire(ft,
-								&lctx, walk_nf,
+								&wlctx, walk_nf,
 								walk_depth, tm,
 								&orphan_held[nr_orphan_locked])) {
 							ret = -EAGAIN;
@@ -2429,7 +2451,7 @@ int ft_detach_node(struct cds_ft *ft,
 						}
 						orphan_trailing_held =
 							&orphan_held[nr_orphan_locked++];
-						lctx.held.nr_extra = (unsigned int)
+						wlctx.held.nr_extra = (unsigned int)
 							nr_orphan_locked;
 					}
 				}
