@@ -84,7 +84,8 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 		struct ft_lock_ctx sctx;
 		struct ft_held_anchor sh;
 
-		ft_lock_ctx_init(&sctx, d, glue->txn);
+		ft_glue_lock_ctx(glue, &sctx);
+		sctx.d = d;
 		if (ft_acquire_member(ft, &sctx, d->nf, cn_meta, d->depth, &sh)
 				|| sh.shared)
 			return -EAGAIN;	/* peer owns @cn; nothing built */
@@ -2931,6 +2932,13 @@ retry_swap:
 
 		ft_glue_init(&glue_insert);
 		ft_glue_init(&glue_extract);
+		/*
+		 * @d is the DST graft-point descent, so it dates the insert glue's
+		 * publish parent (that glue's whole cluster hangs off the graft
+		 * point).  The extract glue works the SWAP trie, which this descent
+		 * does not describe, so it gets none -- see its own commit.
+		 */
+		glue_insert.lock_d = &d;
 
 		/* ===== PREP: build clusters A and B (both tries pristine) ===== */
 

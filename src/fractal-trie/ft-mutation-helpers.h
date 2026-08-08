@@ -1383,10 +1383,24 @@ extern long cds_ft_fault_lock_countdown;
  * FT_MAX_DEPTH, past FT_FLIP_TXN_MAX_LOCKS, and owns its own release sweep --
  * because a held word is a held word wherever the op chose to remember it.
  */
+struct ft_glue;
+/*
+ * A glue keeps its marks in NAMED FIELDS rather than an array -- its publish
+ * parent, the compressed node its build splits, the overlap fences, the
+ * dup-chain splice holders -- so it is a third source the held set must consult.
+ * Defined with the glue itself; declared here because the choke point is above
+ * it.  @ratified says whether THIS op has the word's clean value: a word the
+ * CALLER acquired is held (dedupe still mandatory) but was never sampled here.
+ */
+static bool ft_glue_held_snap(const struct ft_glue *g,
+		const struct cds_ft_metadata *meta, uintptr_t *snap,
+		bool *ratified);
+
 struct ft_held_set {
 	struct ft_flip_txn *txn;		/* the commit's lock registry */
 	const struct ft_held_anchor *extra;	/* marks held outside it */
 	unsigned int nr_extra;
+	const struct ft_glue *glue;		/* marks the glue names by field */
 };
 
 /*
@@ -1453,6 +1467,8 @@ bool ft_held_set_snap(const struct ft_held_set *h,
 			*snap = h->extra[i].lock_snap;
 			return true;
 		}
+	if (h->glue)
+		return ft_glue_held_snap(h->glue, meta, snap, ratified);
 	return false;
 }
 
@@ -1486,6 +1502,7 @@ void ft_lock_ctx_init(struct ft_lock_ctx *ctx, const struct ft_descent *d,
 	ctx->held.txn = txn;
 	ctx->held.extra = NULL;
 	ctx->held.nr_extra = 0;
+	ctx->held.glue = NULL;
 	ctx->op = NULL;
 }
 
@@ -3359,7 +3376,8 @@ void ft_flip_txn_lock_or_guard_parent_at(const char *fn, int line,
 			.d = ft_lock_ctx_descent(ctx),
 			.held = { .txn = t,
 				.extra = ctx ? ctx->held.extra : NULL,
-				.nr_extra = ctx ? ctx->held.nr_extra : 0 },
+				.nr_extra = ctx ? ctx->held.nr_extra : 0,
+				.glue = ctx ? ctx->held.glue : NULL },
 		};
 		struct ft_held_anchor held;
 
@@ -6130,6 +6148,12 @@ static inline
 void ft_glue_lock_ctx(const struct ft_glue *g, struct ft_lock_ctx *ctx)
 {
 	ft_lock_ctx_init(ctx, g->lock_d, g->txn);
+	/*
+	 * The glue's OWN marks are part of the op's held set -- its build fences
+	 * the compressed node it splits, and under a coarse spacing the publish
+	 * parent acquired later anchors onto that very word.
+	 */
+	ctx->held.glue = g;
 }
 
 
@@ -6972,20 +6996,56 @@ struct cds_ft_metadata *ft_glue_reparent_park_meta(struct cds_ft *ft,
  * were the SAME node).  These arrays are small and this runs once per commit.
  */
 static
-bool ft_glue_op_holds(const struct ft_glue *g,
-		const struct cds_ft_metadata *meta)
+bool ft_glue_held_snap(const struct ft_glue *g,
+		const struct cds_ft_metadata *meta, uintptr_t *snap,
+		bool *ratified)
 {
 	int i;
 
-	if (g->publish_parent_holder == meta || g->split_cn_holder == meta ||
-			g->caller_holder == meta)
+	*ratified = true;
+	if (g->publish_parent_holder == meta) {
+		*snap = g->publish_parent_snap;
 		return true;
-	if (ft_glue_fence_holds(g, meta))
+	}
+	if (g->split_cn_holder == meta) {
+		*snap = g->split_cn_snap;
 		return true;
+	}
+	if (g->caller_holder == meta) {
+		/*
+		 * The CALLER acquired this one and owns its release, so this op
+		 * never sampled the word.  Held all the same: dedupe is what
+		 * makes the op terminate, and it must not be skipped for want of
+		 * a value.
+		 */
+		*ratified = false;
+		return true;
+	}
+	for (i = 0; i < g->nr_free; i++) {
+		if (!g->free_list[i].fenced)
+			continue;
+		if (cds_ft_item_to_metadata((struct cds_ft_inode *)
+				g->free_list[i].node) != meta)
+			continue;
+		*snap = g->free_list[i].snap;
+		return true;
+	}
 	for (i = 0; i < g->nr_splices; i++)
-		if (g->splices[i].holder == meta)
+		if (g->splices[i].holder == meta) {
+			*snap = g->splices[i].holder_snap;
 			return true;
+		}
 	return false;
+}
+
+static
+bool ft_glue_op_holds(const struct ft_glue *g,
+		const struct cds_ft_metadata *meta)
+{
+	uintptr_t snap;
+	bool ratified;
+
+	return ft_glue_held_snap(g, meta, &snap, &ratified);
 }
 
 /*
