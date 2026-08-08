@@ -780,6 +780,12 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 	struct cds_ft_inode_flag **publish_slot;
 	struct cds_ft_inode_flag *publish_parent;
 	unsigned int pub_depth = 0;
+	/*
+	 * The boundary's parent and ITS parent, dated once: the acquire arm needs
+	 * both as lock-set members, and the publish below needs whichever of them
+	 * it republishes into.
+	 */
+	unsigned int parent_depth = 0, pp_depth = 0;
 	struct cds_ft_inode_flag *iter_parent;
 	struct ft_flip_txn *txn;
 	/*
@@ -843,7 +849,6 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		struct cds_ft_metadata *parent_cn_meta_l, *child_cn_meta_l = NULL;
 		struct cds_ft_inode_flag *pp_flag = NULL;
 		struct ft_dlm_member set[4];
-		unsigned int parent_depth = 0, pp_depth = 0;
 		int nr_set = 0, si = 0, dret;
 
 		iter_parent = (struct cds_ft_inode_flag *)
@@ -870,12 +875,21 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 
 		/*
 		 * Both members above the boundary were reached by back-pointer, so
-		 * their depths come from the descent's window; a member the descent
-		 * never passed has no depth here and voids the plan (re-descend).
+		 * neither carries a depth: date each from the node BELOW it -- the
+		 * boundary is at @iter_depth, and where @pp_flag is the compressed
+		 * parent's own parent it is one hop above that.  (Where there is no
+		 * compressed parent, @pp_flag IS @iter_parent and shares its depth.)
+		 * A member neither the window nor the hop can date voids the plan.
 		 */
-		if (!ft_lock_ctx_depth_of(ft, ctx, iter_parent, &parent_depth) ||
-				(pp_flag && !ft_lock_ctx_depth_of(ft, ctx,
-					pp_flag, &pp_depth))) {
+		if (!ft_lock_ctx_depth_of_parent(ft, ctx, iter_parent, iter_depth,
+					&parent_depth)) {
+			ft_flip_txn_destroy(txn);
+			return -EAGAIN;
+		}
+		if (pp_flag && !(parent_cn_meta_l ?
+				ft_lock_ctx_depth_of_parent(ft, ctx, pp_flag,
+					parent_depth, &pp_depth) :
+				ft_lock_ctx_depth_of(ft, ctx, pp_flag, &pp_depth))) {
 			ft_flip_txn_destroy(txn);
 			return -EAGAIN;
 		}
@@ -931,14 +945,13 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 			if (!set[si].held.shared) {
 				ft_flip_txn_record_release_lock(txn,
 					set[si].held.lock, set[si].held.lock_snap);
-				ft_flip_txn_lock_register(txn, set[si].held.lock);
+				ft_flip_txn_lock_register(txn, set[si].held.lock,
+					set[si].held.lock_snap);
 			}
 			si++;
 		}
 	} else
 	{
-		unsigned int parent_depth = 0;
-
 		if (ft_acquire_member(ft, ctx, iter_node_flag, iter_meta,
 				iter_depth, &iter_held)) {
 			ft_flip_txn_destroy(txn);
@@ -963,8 +976,8 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 			? cds_ft_item_to_metadata((struct cds_ft_inode *) parent_cn)
 			: NULL;
 		if (parent_cn_meta) {
-			if (!ft_lock_ctx_depth_of(ft, ctx, iter_parent,
-						&parent_depth) ||
+			if (!ft_lock_ctx_depth_of_parent(ft, ctx, iter_parent,
+						iter_depth, &parent_depth) ||
 					ft_acquire_member(ft, ctx, iter_parent,
 						parent_cn_meta, parent_depth,
 						&pcn_held)) {
@@ -1112,9 +1125,13 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 	 * and it was resolved through a back-pointer, so the descent's window is
 	 * what dates it.  Checked here rather than at the acquire below: nothing
 	 * is reader-visible yet, so a target this descent cannot date is a clean
-	 * re-plan.  Under the DLM arm the same node was already anchored as @pp.
+	 * re-plan.  It is the parent of whichever node this publish REPLACES --
+	 * the compressed parent, else the boundary -- so the one-hop derivation
+	 * dates it where the window cannot.  Under the DLM arm the same node was
+	 * already anchored as @pp.
 	 */
-	if (!ft_lock_ctx_depth_of(ft, ctx, publish_parent, &pub_depth)) {
+	if (!ft_lock_ctx_depth_of_parent(ft, ctx, publish_parent,
+			parent_cn ? parent_depth : iter_depth, &pub_depth)) {
 		free_compressed_node_unpublished(ft, new_cn);
 		ft_flip_txn_destroy(txn);
 		return -EAGAIN;
