@@ -472,7 +472,26 @@ when the anchor is a genuine ancestor, i.e. a flag the descent stored.
 depth at all. It returns false where the descent does not describe the node, so
 the caller RE-PLANS rather than anchoring one node by another's depth.
 
-### Conversion status (2026-08-07, `84656d6c`)
+★ **The window is four NODES, not four SET MEMBERS**, and a `{C, P, GP}` set
+whose C already sits at the third slot runs off it — measured, not feared:
+`test_rekey_coherence_lookup` reaches `ft_node_recompact` with C at byte-depth
+6, P at 1 (a five-byte compressed run) and GP nowhere in the window.
+`ft_lock_ctx_depth_of_parent` dates such a member from the node BELOW it: a
+node's span is a property of the node itself, so the parent of a node at a
+KNOWN depth sits at that depth minus the parent's span (`ft_node_span`, shared
+with `ft_child_depth_of` so the two directions cannot drift). This is NOT the
+up-walk §5.3 forbids — a climb starts *undated*, and byte-depth is absolute;
+this steps one hop up from a member already dated.
+
+★ **Spacing is a FINE-mode property and is made inert elsewhere**
+(`cds_ft_create` resolves it beside `lock_fine`). COARSE derives no lock-set:
+its remaining acquires are the F2 body-copy fences, taken one at a time with no
+set to dedupe against, so coarsening them only collapses an op's OWN marks onto
+one word — `ft_chain_compress_fused` takes three in a row and the second
+refuses against the first. The FT-wide writer lock already excludes every peer
+the anchor would.
+
+### Conversion status
 
 **Every acquire site is converted**, and that is a BUILD property rather than a
 table: past the choke points the raw `ft_meta_lock_acquire` / `ft_dlm_lock` are
@@ -497,23 +516,58 @@ Two supporting pieces landed with it:
 `ft_compact_relocate_at` still passes a NULL context; it needs the depth
 `ft_compact_descend` already tracks.
 
-### ★ OPEN: the held set is not the txn registry
+### The self-collision class, and the detector that names it
 
-The first coarse run of the fully-converted tree is RED, for one measured
-reason. A word is **acquired and held for a WINDOW before it is registered in
-any txn**, so no dedupe sees it — and a coarse spacing then lands the next
-member's ANCHOR on it. `ft_dlm_acquire_set`'s member 0 fails `ft_dlm_lock`
-against the op's OWN hold.
+A refused acquire says the word carries `FT_STATE_LOCK`, never by WHOM — and
+under a coarse spacing the whom is usually the refusing op itself. Fatal rather
+than merely slow, because `_cds_ft_remove_all_locked` has **no retry loop**: its
+-EAGAIN surfaces as a hard `MEMORY_ERROR`.
+★ **A refusal is only a fallback where a RETRY exists.** Same reason the orphan
+walk had to extend the descent instead of refusing an undatable member.
 
-The fix is to make `struct ft_lock_ctx` the op's held set outright:
-append on acquire, **remove on release**. That model only became possible once
-the choke point was total, which it now is.
+`FEATURE_FT_HOLD_TRACE` is the oracle for the class: a per-thread ledger of the
+words held and the SITE that took each, kept at the lock PRIMITIVES rather than
+at the choke point so it sees every hold whatever registry the op filed it in —
+that mismatch being exactly what is measured. A refusal whose word the ledger
+names is reported with both sites and aborted. `ft_flip_txn_commit` drops its
+registry from the ledger on OK, because a committed lock stops being held
+through its recorded terminal with no release to observe; without that the
+ledger saturates and every report is a stale entry.
 
-Fatal rather than merely slow because `_cds_ft_remove_all_locked` has **no retry
-loop** — its -EAGAIN surfaces as a hard `MEMORY_ERROR`.
-★ **A refusal is only a fallback where a RETRY exists.** That is the same reason
-the orphan walk had to extend the descent instead of refusing an undatable
-member.
+Two instances found and closed with it, neither by inspection:
+
+* `ft_detach_node` kept the **trailing skip-target's** plan-lock in a variable
+  of its own, outside `@orphan_held` and so outside the held set entirely. It is
+  now an entry of that array like every other orphan. ★ 08-07b's *"the held set
+  needs no new plumbing: the txn's `locks[]` registry"* was wrong in the useful
+  direction — the word was in NEITHER registry, so filing is what was missing,
+  not a second view.
+* The **spacing was not inert under COARSE** (above).
+
+### ★ OPEN: an anchor that is the node the op RETIRES
+
+`assert(!(h->shared && h->lock == node))` in
+`ft_flip_txn_record_retire_anchored` — armed as a probe, deliberately — now
+FIRES under exponential on `test_rekey_coherence_lookup`. The shape it was
+written for is reachable: `ft_detach_node` acquires an orphan below C, whose
+anchor climbs to C; `ft_node_recompact` then retires C itself and finds its
+member `shared` on C's own word.
+
+Two things are missing there, and the second is the real one:
+
+1. **The snapshot.** A retire needs the node's CLEAN pre-mark word as expected
+   old, and only the first acquire has it. The dedupe path returns
+   `lock_snap = 0`, so the held set must carry SNAPS, not just words.
+2. **The terminal.** One word takes exactly ONE terminal, and the two members
+   want different ones: the orphan's anchor wants `{LOCK|s -> s}` (C survives),
+   C's own member wants `{LOCK|s -> TOMBSTONE|s}` (C dies). The retire is the
+   correct answer — a node's fate is a property of the op's plan, not of the
+   order its members were acquired — so a release recorded earlier for that
+   word must be superseded, not added to. The engine composes same-slot records
+   by read-your-own-writes, so a release then a retire IN THAT ORDER and in ONE
+   txn already chains ({LOCK|s -> s} then {s -> TOMBSTONE|s}); today the two can
+   land in different txns and in the wrong order (`ft_detach_freeze_orphans`
+   runs AFTER `ft_node_replace_ptr` on the Block B path).
 
 ### Why it cannot land site by site
 
