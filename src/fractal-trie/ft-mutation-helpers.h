@@ -414,6 +414,26 @@ struct cds_ft_inode_flag *ft_descent_anchor_of(const struct ft_descent *d,
 		return d->anchor[0].cover;
 	case CDS_FT_LOCK_SPACING_EXPONENTIAL:
 	default:
+		/*
+		 * A node whose own start IS a lock level is the first boundary
+		 * at that level, so §2 makes it its own anchor -- a pure
+		 * function of @depth, settled without consulting any descent.
+		 *
+		 * Answering it here is what keeps §1's agreement for a member
+		 * OFF the descent's path: the table describes the path the
+		 * descent took, so for a node the descent never passed (the
+		 * detach's orphan walk leaves the key path, and a sibling
+		 * reached by back-pointer was never on it) the arms below
+		 * answer from the wrong path -- handing back the CURSOR's node,
+		 * or NULL where the descent walked off the trie.  Two ops then
+		 * disagree about one node's anchor, which is the one property
+		 * coarsening rests on.
+		 *
+		 * The root is this same rule at depth 0, which ft_anchor_meta
+		 * already applies before any of this.
+		 */
+		if (ft_lock_level(depth) == depth)
+			return nf;
 		if (depth > d->depth)
 			return ft_descent_anchor_child(d, nf, depth);
 		return ft_descent_anchor(d, depth);
