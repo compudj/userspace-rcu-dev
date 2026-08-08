@@ -1095,6 +1095,25 @@ struct ft_hold_trace_ent {
 static __thread struct ft_hold_trace_ent ft_hold_trace[FT_HOLD_TRACE_MAX];
 static __thread unsigned int ft_hold_trace_n;
 
+/*
+ * A refusal a RETRY LOOP re-derives fires once per attempt, so an unbounded
+ * report is not a report -- it is a disk filling at the speed of the loop
+ * (measured: 25 GB in one suite).  Cap the whole feature's output; the first
+ * few lines are the diagnosis and the rest is the same line again.
+ */
+#define FT_HOLD_TRACE_REPORT_MAX	200
+static __thread unsigned int ft_hold_trace_reports;
+
+static inline
+bool ft_hold_trace_report_ok(void)
+{
+	if (ft_hold_trace_reports >= FT_HOLD_TRACE_REPORT_MAX)
+		return false;
+	if (++ft_hold_trace_reports == FT_HOLD_TRACE_REPORT_MAX)
+		fprintf(stderr, "FT HOLD TRACE: report cap reached, silencing\n");
+	return true;
+}
+
 static inline
 void ft_hold_trace_note(const struct cds_ft_metadata *lock, const char *fn,
 		int line)
@@ -1133,8 +1152,14 @@ void ft_hold_trace_refused(const struct cds_ft_metadata *lock, const char *fn,
 {
 	unsigned int i = ft_hold_trace_n;
 
-	if (!(CMM_LOAD_SHARED(lock->state) & FT_STATE_LOCK))
+	if (!(CMM_LOAD_SHARED(lock->state) & FT_STATE_LOCK)) {
+		if (ft_hold_trace_report_ok())
+			fprintf(stderr,
+				"FT REFUSED (not ours): %s:%d word %p state=%lx\n",
+				fn, line, (const void *) lock,
+				(unsigned long) CMM_LOAD_SHARED(lock->state));
 		return;
+	}
 	while (i--) {
 		if (ft_hold_trace[i].lock != lock)
 			continue;
@@ -1452,7 +1477,7 @@ bool ft_lock_ctx_depth_of_at(const char *fn, int line,
 	if (caa_likely(ft_descent_depth_of(ft_lock_ctx_descent(ctx), nf, depth)))
 		return true;
 #ifdef FEATURE_FT_HOLD_TRACE
-	{
+	if (ft_hold_trace_report_ok()) {
 		const struct ft_descent *d = ft_lock_ctx_descent(ctx);
 
 		fprintf(stderr,
@@ -1536,7 +1561,16 @@ bool ft_lock_ctx_depth_of_parent(const struct cds_ft *ft,
 	}
 	if (ft_descent_depth_of(ft_lock_ctx_descent(ctx), parent_nf, depth))
 		return true;
-	return ft_parent_depth_of(ft, parent_nf, child_depth, depth);
+	if (caa_likely(ft_parent_depth_of(ft, parent_nf, child_depth, depth)))
+		return true;
+#ifdef FEATURE_FT_HOLD_TRACE
+	if (ft_hold_trace_report_ok())
+		fprintf(stderr,
+			"FT UNDATABLE PARENT: nf=%p span=%u child_depth=%u\n",
+			(const void *) parent_nf, ft_node_span(ft, parent_nf),
+			child_depth);
+#endif
+	return false;
 }
 
 /*
@@ -1636,17 +1670,26 @@ int ft_acquire_member_at(const char *fn, int line,
 {
 	struct cds_ft_metadata *lock = ft_anchor_meta(ft, ft_lock_ctx_descent(ctx),
 			nf, node, depth);
-	uintptr_t lock_snap = 0, node_snap = 0;
+	uintptr_t lock_snap = 0, node_snap = 0, held_snap = 0;
 	int ret;
 
-	if (ft_lock_ctx_holds(ctx, lock)) {
+	if (ft_lock_ctx_holds(ctx, lock, &held_snap)) {
 		/*
 		 * The op holds this word for an earlier member.  @lock_snap stays
 		 * unset: the earlier acquire captured it and owns the terminal,
 		 * and a second one would double-record the single word.
+		 *
+		 * @node_snap is NOT optional though -- the caller re-validates its
+		 * plan against it and retires @node against it.  Where the word IS
+		 * @node's own, the acquire that took it is the only place that
+		 * value exists (a fresh read would sample the op's own LOCK), so it
+		 * comes from the held set.
 		 */
-		if (lock != node && ft_held_anchor_sample_node(node, &node_snap))
+		if (lock == node) {
+			node_snap = held_snap;
+		} else if (ft_held_anchor_sample_node(node, &node_snap)) {
 			return -EAGAIN;
+		}
 		held->lock = lock;
 		held->lock_snap = 0;
 		held->node_snap = node_snap;
@@ -2026,6 +2069,7 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 		struct ft_dlm_member *set, int nr)
 {
 	struct cds_ft_metadata *taken[FT_FLIP_TXN_MAX_LOCKS];
+	uintptr_t taken_snap[FT_FLIP_TXN_MAX_LOCKS];
 	unsigned int nr_taken = 0;
 	struct ft_flip_txn *acq;
 	int i, nr_present = 0;
@@ -2049,8 +2093,8 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 		return -ENOMEM;
 	for (i = 0; i < nr; i++) {
 		struct cds_ft_metadata *node, *lock;
-		uintptr_t node_snap = 0, lock_snap;
-		bool coarsened;
+		uintptr_t node_snap = 0, lock_snap, held_snap = 0;
+		bool coarsened, deduped = false;
 
 		if (!set[i].nf)
 			continue;
@@ -2081,8 +2125,29 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 		if (set[i].guard_child)
 			ft_dlm_guard_parent(acq, set[i].guard_child,
 				set[i].guard_pf);
-		if (ft_lock_ctx_holds(ctx, lock) ||
-				ft_anchor_held(taken, nr_taken, lock)) {
+		/*
+		 * Dedupe against the op's held set AND against this set's own
+		 * earlier members, taking the CLEAN word from whichever holds it:
+		 * an uncoarsened member's word IS @node's, and a deduped member
+		 * has no acquire of its own to sample it (a fresh read would
+		 * return the op's own LOCK).
+		 */
+		if (!ft_lock_ctx_holds(ctx, lock, &held_snap)) {
+			unsigned int k;
+
+			for (k = 0; k < nr_taken; k++) {
+				if (taken[k] != lock)
+					continue;
+				held_snap = taken_snap[k];
+				deduped = true;
+				break;
+			}
+		} else {
+			deduped = true;
+		}
+		if (deduped) {
+			if (!coarsened)
+				node_snap = held_snap;
 			set[i].held.lock = lock;
 			set[i].held.lock_snap = 0;
 			set[i].held.node_snap = node_snap;
@@ -2093,6 +2158,7 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 			ft_hold_trace_refused(lock, fn, line);
 			goto eagain;
 		}
+		taken_snap[nr_taken] = lock_snap;
 		taken[nr_taken++] = lock;
 		ft_held_anchor_set(&set[i].held, lock, lock_snap, node,
 			node_snap);
@@ -3204,10 +3270,12 @@ extern long cds_ft_fault_lock_countdown;
  * point dedupes against @ctx's held set instead and leaves only the guard owed.
  */
 static inline
-void ft_flip_txn_lock_or_guard_parent(const struct cds_ft *ft,
+void ft_flip_txn_lock_or_guard_parent_at(const char *fn, int line,
+		const struct cds_ft *ft,
 		struct ft_flip_txn *t, const struct ft_lock_ctx *ctx,
 		struct cds_ft_inode_flag *parent_nf, unsigned int parent_depth)
 {
+	(void) fn; (void) line;
 	if (ft->lock_fine && t && parent_nf) {
 		/*
 		 * @t is the registry this record joins, so it is authoritative
@@ -3225,6 +3293,10 @@ void ft_flip_txn_lock_or_guard_parent(const struct cds_ft *ft,
 		if (parent_depth == FT_DEPTH_FROM_DESCENT &&
 				!ft_lock_ctx_depth_of(ft, ctx, parent_nf,
 					&parent_depth)) {
+#ifdef FEATURE_FT_HOLD_TRACE
+			if (ft_hold_trace_report_ok())
+				fprintf(stderr, "  ...from %s:%d\n", fn, line);
+#endif
 			t->acquire_miss = true;
 			goto guard;
 		}
@@ -3271,6 +3343,10 @@ guard:
 	ft_flip_txn_guard_parent(ft, t, parent_nf);
 }
 
+#define ft_flip_txn_lock_or_guard_parent(ft, t, ctx, parent_nf, parent_depth)	\
+	ft_flip_txn_lock_or_guard_parent_at(__func__, __LINE__, (ft), (t),	\
+		(ctx), (parent_nf), (parent_depth))
+
 /*
  * Holder-lock variant of ft_flip_txn_lock_or_guard_parent (MW LOCK_FINE Step A):
  * when the op ALREADY holds @parent_nf's node lock -- acquired before the
@@ -3285,7 +3361,8 @@ guard:
  * (unheld op / non-lock_fine).
  */
 static inline
-void ft_flip_txn_hold_or_lock_parent(const struct cds_ft *ft,
+void ft_flip_txn_hold_or_lock_parent_at(const char *fn, int line,
+		const struct cds_ft *ft,
 		struct ft_flip_txn *t, const struct ft_lock_ctx *ctx,
 		struct cds_ft_inode_flag *parent_nf, unsigned int parent_depth,
 		struct cds_ft_metadata *held_holder, uintptr_t held_snap)
@@ -3310,11 +3387,16 @@ void ft_flip_txn_hold_or_lock_parent(const struct cds_ft *ft,
 		assert(ft->lock_spacing != CDS_FT_LOCK_SPACING_PER_NODE ||
 			held_holder == ft_flag_to_metadata(ft, parent_nf));
 		ft_flip_txn_record_release_lock(t, held_holder, held_snap);
-		ft_flip_txn_lock_register(t, held_holder);
+		ft_flip_txn_lock_register(t, held_holder, held_snap);
 		return;
 	}
-	ft_flip_txn_lock_or_guard_parent(ft, t, ctx, parent_nf, parent_depth);
+	ft_flip_txn_lock_or_guard_parent_at(fn, line, ft, t, ctx, parent_nf,
+			parent_depth);
 }
+
+#define ft_flip_txn_hold_or_lock_parent(ft, t, ctx, pnf, pd, hh, hs)	\
+	ft_flip_txn_hold_or_lock_parent_at(__func__, __LINE__, (ft), (t),	\
+		(ctx), (pnf), (pd), (hh), (hs))
 
 /*
  * Set a duplicate-chain node's removal tombstone (CDS_FT_NODE_REMOVED_FLAG on
