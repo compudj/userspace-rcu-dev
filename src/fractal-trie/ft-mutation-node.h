@@ -2439,6 +2439,16 @@ int ft_rekey_cow_stop(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 	unsigned int child_depth;
 	unsigned int nm = 0, i;
 	int ret;
+	/*
+	 * THIS function's held set.  @marks is where its acquires live -- @stop's
+	 * fence and one per child -- and none of them reaches a txn registry until
+	 * the caller's sweep, so a child acquire consulting the CALLER's context
+	 * cannot see them.  Under a coarse spacing every child of @stop anchors on
+	 * the path above, which is frequently @stop itself, and the op then refuses
+	 * its own fence.  @nr_extra is refreshed at each acquire because the fan-out
+	 * is still growing it.
+	 */
+	struct ft_lock_ctx cctx;
 
 	*stop_prime_ret = NULL;
 	*nr_marks = 0;
@@ -2460,6 +2470,15 @@ int ft_rekey_cow_stop(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		return -EAGAIN;
 	marks[nm++] = stop_held;
 	*nr_marks = nm;
+	/*
+	 * A held set carries ONE out-of-registry array, so a caller keeping marks
+	 * of its own would lose them here.  No caller does; assert it rather than
+	 * let a future one lose its exclusion silently.
+	 */
+	assert(!ctx || !ctx->held.nr_extra);
+	ft_lock_ctx_init(&cctx, ft_lock_ctx_descent(ctx), txn);
+	cctx.op = ctx ? ctx->op : NULL;
+	cctx.held.extra = marks;
 
 	/* <=2 edges/child (parent + pso) + 1 retire; caller reserves its publish. */
 	if (!ft_flip_txn_reserve_extra(txn, compressed ? 2 + 1 :
@@ -2513,7 +2532,8 @@ int ft_rekey_cow_stop(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		if (cm) {
 			uintptr_t csnap;
 
-			if (ft_rekey_cow_lock_child(ft, ctx, child, cm,
+			cctx.held.nr_extra = nm;
+			if (ft_rekey_cow_lock_child(ft, &cctx, child, cm,
 					child_depth, &marks[nm])) {
 				ret = -EAGAIN;
 				goto abandon;
@@ -2676,7 +2696,8 @@ int ft_rekey_cow_stop(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 			if (cm) {
 				uintptr_t csnap;
 
-				if (ft_rekey_cow_lock_child(ft, ctx, iter, cm,
+				cctx.held.nr_extra = nm;
+				if (ft_rekey_cow_lock_child(ft, &cctx, iter, cm,
 						child_depth, &marks[nm])) {
 					ret = -EAGAIN;
 					goto abandon;
@@ -2701,7 +2722,8 @@ int ft_rekey_cow_stop(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 			if (cm) {
 				uintptr_t csnap;
 
-				if (ft_rekey_cow_lock_child(ft, ctx, iter, cm,
+				cctx.held.nr_extra = nm;
+				if (ft_rekey_cow_lock_child(ft, &cctx, iter, cm,
 						child_depth, &marks[nm])) {
 					ret = -EAGAIN;
 					goto abandon;
