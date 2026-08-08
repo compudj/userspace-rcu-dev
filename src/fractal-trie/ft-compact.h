@@ -89,7 +89,7 @@ void ft_compact_relocate_at(struct cds_ft *ft, struct cds_ft_inode_flag **holder
 	ret = ft_node_recompact(FT_RECOMPACT_RELOCATE, ft, type_index,
 			&ft_types[type_index], node, meta, holder,
 			0, NULL, NULL, NULL, &old_ret, holder == &ft->root, 0,
-			false, &rec, txn, NULL);
+			false, &rec, txn, NULL, NULL);
 	if (ret != 0) {
 		/*
 		 * Node allocation failed inside the recompact before any

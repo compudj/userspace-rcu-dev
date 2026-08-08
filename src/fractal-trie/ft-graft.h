@@ -450,8 +450,16 @@ enum cds_ft_status ft_store_at_graft_point_prepare(struct cds_ft *ft,
 		struct ft_glue *glue,
 		struct ft_graft_store_state *st)
 {
+	struct ft_lock_ctx gctx;
+
 	memset(st, 0, sizeof(*st));
 	st->glue = glue;
+	/*
+	 * The recompactions below lock {p, its parent, its grandparent}; @d is
+	 * their anchor source, and @glue->txn the registry naming what this op
+	 * already holds.
+	 */
+	ft_lock_ctx_init(&gctx, d, glue->txn);
 
 	/*
 	 * Skip-mode chain-compress invariant: under SPECULATIVE-mode tries,
@@ -534,7 +542,7 @@ enum cds_ft_status ft_store_at_graft_point_prepare(struct cds_ft *ft,
 				 * the MW graft.
 				 */
 				.parent_guard = glue->record_only },
-			&st->count_deferred);
+			&gctx, &st->count_deferred);
 		/*
 		 * -EAGAIN is a TRANSIENT peer conflict (the reserve found its
 		 * byte filled under it), not an allocation failure: report it
@@ -632,7 +640,7 @@ enum cds_ft_status ft_store_at_graft_point_prepare(struct cds_ft *ft,
 					 * @parent's slot: guard the identity.
 					 * See the depth == key_len arm. */
 					.parent_guard = glue->record_only },
-				&st->count_deferred);
+				&gctx, &st->count_deferred);
 			/* Transient peer conflict, not OOM: see the
 			 * depth == key_len arm above. */
 			if (ret)
@@ -3522,7 +3530,10 @@ retry_swap:
 						true);
 			}
 			cds_ft_alloc_reserve_activate(dst_ft, &gs_reserve);
-			dret = ft_detach_node(dst_ft, d.nfp, d.pnfp, d.depth,
+			struct ft_lock_ctx lctx;
+
+			ft_lock_ctx_init(&lctx, &d, NULL);
+			dret = ft_detach_node(dst_ft, &lctx, d.nfp, d.pnfp, d.depth,
 					false, NULL, gs_ord ? &dpub : NULL,
 					gs_ord ? &drun : NULL, NULL, NULL,
 					-(long) old_count /* fold -old_count onto the detach commit */,

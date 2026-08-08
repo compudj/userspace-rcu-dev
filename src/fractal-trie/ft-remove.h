@@ -58,9 +58,16 @@
  *     free the compressed.  Returns -ENOMEM if the fresh
  *     allocation failed.
  */
+/*
+ * @iter_depth is the byte-depth of @iter_node_flag, and @ctx the op's lock
+ * context: both acquires below are lock-set members, and a member's acquire
+ * goes to its ANCHOR (doc/design/ft-dlm-lock-coarseness.md §2).
+ */
 static
 int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 		struct cds_ft_inode_flag *iter_node_flag,
+		unsigned int iter_depth,
+		const struct ft_lock_ctx *ctx,
 		struct cds_ft_inode_flag **detach_parent_flag_ptr,
 		struct cds_ft_node *topmost_external_nodes,
 		struct cds_ft_inode_flag *elevated_old_child,
@@ -130,18 +137,28 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 		 * is recorded -> caller destroys @txn and re-descends.
 		 */
 		if (ft->lock_fine) {
-			struct cds_ft_metadata *cn_meta =
-				cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
-			uintptr_t cn_snap;
+			struct ft_held_anchor cn_held;
 
-			if (ft_meta_lock_acquire(cn_meta, &cn_snap)) {
+			if (ft_acquire_member(ft, ctx,
+					ft_compressed_node_flag(cn),
+					cds_ft_item_to_metadata(
+						(struct cds_ft_inode *) cn),
+					iter_depth, &cn_held)) {
 				/* Pre-commit -EAGAIN: destroy the caller-owned txn
 				 * (its cleanup skips destroy on -EAGAIN). */
 				ft_flip_txn_destroy(txn);
 				return -EAGAIN;
 			}
-			ft_flip_txn_record_release_lock(txn, cn_meta, cn_snap);
-			ft_flip_txn_lock_register(txn, cn_meta);
+			/*
+			 * A member the op ALREADY held rode an earlier acquire,
+			 * which recorded its release; a second record would settle
+			 * the single word twice.
+			 */
+			if (!cn_held.shared) {
+				ft_flip_txn_record_release_lock(txn, cn_held.lock,
+					cn_held.lock_snap);
+				ft_flip_txn_lock_register(txn, cn_held.lock);
+			}
 		}
 		/*
 		 * Fold the external head's back-edge -- cell->parent (list on) or
@@ -312,19 +329,38 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 		 */
 		struct cds_ft_metadata *src_cn_meta_a =
 			cds_ft_item_to_metadata((struct cds_ft_inode *) src_cn);
-		uintptr_t src_snap = 0;
+		struct ft_held_anchor src_held;
 		bool dlm_a2 = false;
 
 		if (ft->lock_fine) {
-			struct cds_ft_metadata *pp_meta = pub_parent
-				? ft_flag_to_metadata(ft, pub_parent) : NULL;
 			struct ft_dlm_member set[2];
+			unsigned int pp_depth = 0;
 			int dret;
 
-			set[0] = (struct ft_dlm_member){ .meta = src_cn_meta_a,
-				.guard_child = src_cn_meta_a, .guard_pf = pub_parent };
-			set[1] = (struct ft_dlm_member){ .meta = pp_meta };
-			dret = ft_dlm_acquire_set(ft, set, 2);
+			/*
+			 * @pub_parent came from src_cn's back-pointer, which
+			 * carries no depth; the descent's window is what dates it.
+			 * A parent this descent never passed cannot be anchored
+			 * here at all -- re-plan rather than anchor it by another
+			 * node's depth.
+			 */
+			if (pub_parent && !ft_lock_ctx_depth_of(ft, ctx,
+					pub_parent, &pp_depth)) {
+				free_cds_ft_node_unpublished(ft, fresh);
+				ft_flip_txn_destroy(txn);
+				return -EAGAIN;
+			}
+			set[0] = (struct ft_dlm_member){
+				.nf = ft_compressed_node_flag(src_cn),
+				.node = src_cn_meta_a,
+				.depth = iter_depth,
+				.guard_child = src_cn_meta_a,
+				.guard_pf = pub_parent };
+			set[1] = (struct ft_dlm_member){ .nf = pub_parent,
+				.node = pub_parent ?
+					ft_flag_to_metadata(ft, pub_parent) : NULL,
+				.depth = pp_depth };
+			dret = ft_dlm_acquire_set(ft, ctx, set, 2);
 			if (dret) {
 				free_cds_ft_node_unpublished(ft, fresh);
 				/*
@@ -336,12 +372,22 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 					ft_flip_txn_destroy(txn);
 				return dret;	/* nothing acquired (all-or-none) */
 			}
-			src_snap = set[0].snap;
-			ft_flip_txn_lock_register(txn, src_cn_meta_a);
-			if (pp_meta) {
-				ft_flip_txn_record_release_lock(txn, pp_meta,
-					set[1].snap);
-				ft_flip_txn_lock_register(txn, pp_meta);
+			src_held = set[0].held;
+			/*
+			 * Coarsening put src_cn's lock on an ANCESTOR that
+			 * SURVIVES this retire, so the fused
+			 * {LOCK|s -> TOMBSTONE|s} splits: the ancestor is
+			 * released here (before any guard lands on it -- the
+			 * ordering rule), the node tombstoned below.  A no-op
+			 * where the two words coincide.
+			 */
+			ft_flip_txn_record_anchor_release(txn, &src_held,
+				src_cn_meta_a);
+			ft_flip_txn_lock_register(txn, src_held.lock);
+			if (pub_parent && !set[1].held.shared) {
+				ft_flip_txn_record_release_lock(txn,
+					set[1].held.lock, set[1].held.lock_snap);
+				ft_flip_txn_lock_register(txn, set[1].held.lock);
 			}
 			dlm_a2 = true;
 		}
@@ -389,11 +435,14 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			 * test suite (verified: zero hits across ft_unit + ft_inv both
 			 * list modes), so the freeze-on-free audit never exercises it.
 			 * DLM: src_cn was LOCK-acquired up front, so record the FENCED
-			 * {LOCK|s -> TOMBSTONE|s} terminal (a peer state change aborts).
+			 * terminal (a peer state change aborts) -- fused with the
+			 * release where the acquire took src_cn's own word, plain
+			 * against its clean word where coarsening sent the lock to a
+			 * surviving ancestor.
 			 */
 			if (dlm_a2)
-				ft_flip_txn_record_tombstone_locked(txn, src_cn_meta_a,
-					src_snap);
+				ft_flip_txn_record_retire_anchored(txn, &src_held,
+					src_cn_meta_a);
 			else
 				ft_flip_txn_record_tombstone(txn, cds_ft_item_to_metadata(
 					(struct cds_ft_inode *) src_cn));
@@ -601,9 +650,34 @@ int ft_detach_orphan_planlock(struct cds_ft_metadata *m,
  * explicitly at the commit so a future MCAS can fold each one's sequence
  * counter into the same transaction.
  */
+/*
+ * Hand a chain-compress RETIRE member's acquire to the commit txn: lift the lock
+ * off the ancestor that survives (a no-op where the member's own word carries
+ * it) and register the word so every unwind path drains it.  A member that
+ * deduped onto a word the set already took owes both to the acquire that first
+ * took it.  The tombstone itself is recorded later, at the commit.
+ */
+static inline
+void ft_chain_compress_register_retire(struct ft_flip_txn *txn,
+		const struct ft_held_anchor *h, struct cds_ft_metadata *node)
+{
+	if (h->shared)
+		return;
+	ft_flip_txn_record_anchor_release(txn, h, node);
+	ft_flip_txn_lock_register(txn, h->lock);
+}
+
+/*
+ * @iter_depth is the boundary's byte-depth and @ctx the op's lock context: the
+ * whole collapsed chain is a lock-set, and its members anchor by depth.  The set
+ * straddles the boundary -- parent_CN and pp lie ABOVE it, the surviving child
+ * ONE hop below -- which is exactly the shape §7.1 describes.
+ */
 static
 int ft_chain_compress_fused(struct cds_ft *ft,
 		struct cds_ft_inode_flag *iter_node_flag,
+		unsigned int iter_depth,
+		const struct ft_lock_ctx *ctx,
 		struct cds_ft_metadata *iter_meta,
 		struct cds_ft_inode_flag *surviving_child,
 		uint8_t surviving_byte,
@@ -629,7 +703,14 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 	struct cds_ft_inode_flag *publish_parent;
 	struct cds_ft_inode_flag *iter_parent;
 	struct ft_flip_txn *txn;
-	uintptr_t s_iter, s_pcn = 0, s_ccn = 0;
+	/*
+	 * The three RETIRE members of the collapsed chain.  Each names TWO words
+	 * once a coarse spacing splits them: the one its acquire took (released
+	 * at registration, since it is an ancestor that SURVIVES) and the node's
+	 * own (tombstoned at the commit, and the word every plan re-validation
+	 * below must read).
+	 */
+	struct ft_held_anchor iter_held, pcn_held, ccn_held;
 
 	assert(surviving_child);
 	/*
@@ -680,9 +761,9 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		 * and a peer split retires it -> ft_dlm_lock -EAGAIN).
 		 */
 		struct cds_ft_metadata *parent_cn_meta_l, *child_cn_meta_l = NULL;
-		struct cds_ft_metadata *pp_meta = NULL;
 		struct cds_ft_inode_flag *pp_flag = NULL;
 		struct ft_dlm_member set[4];
+		unsigned int parent_depth = 0, pp_depth = 0;
 		int nr_set = 0, si = 0, dret;
 
 		iter_parent = (struct cds_ft_inode_flag *)
@@ -706,57 +787,84 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 			(void) ft_resolve_parent_slot(parent_cn_meta_l, ft, &pp_flag);
 		else
 			pp_flag = iter_parent;
-		if (pp_flag)
-			pp_meta = ft_flag_to_metadata(ft, pp_flag);
 
-		set[nr_set++] = (struct ft_dlm_member){ .meta = iter_meta,
+		/*
+		 * Both members above the boundary were reached by back-pointer, so
+		 * their depths come from the descent's window; a member the descent
+		 * never passed has no depth here and voids the plan (re-descend).
+		 */
+		if (!ft_lock_ctx_depth_of(ft, ctx, iter_parent, &parent_depth) ||
+				(pp_flag && !ft_lock_ctx_depth_of(ft, ctx,
+					pp_flag, &pp_depth))) {
+			ft_flip_txn_destroy(txn);
+			return -EAGAIN;
+		}
+
+		set[nr_set++] = (struct ft_dlm_member){ .nf = iter_node_flag,
+			.node = iter_meta, .depth = iter_depth,
 			.guard_child = iter_meta, .guard_pf = iter_parent };
 		if (parent_cn_meta_l)
-			set[nr_set++] = (struct ft_dlm_member){ .meta = parent_cn_meta_l,
+			set[nr_set++] = (struct ft_dlm_member){ .nf = iter_parent,
+				.node = parent_cn_meta_l, .depth = parent_depth,
 				.guard_child = parent_cn_meta_l, .guard_pf = pp_flag };
 		if (child_cn_meta_l)
-			set[nr_set++] = (struct ft_dlm_member){ .meta = child_cn_meta_l };
-		if (pp_meta)
-			set[nr_set++] = (struct ft_dlm_member){ .meta = pp_meta };
+			/*
+			 * The one member BELOW the pivot (§7.1): an immediate child
+			 * of the boundary, so it starts one internal-node hop past
+			 * it.
+			 */
+			set[nr_set++] = (struct ft_dlm_member){ .nf = surviving_child,
+				.node = child_cn_meta_l,
+				.depth = iter_depth + 1 };
+		if (pp_flag)
+			set[nr_set++] = (struct ft_dlm_member){ .nf = pp_flag,
+				.node = ft_flag_to_metadata(ft, pp_flag),
+				.depth = pp_depth };
 
-		dret = ft_dlm_acquire_set(ft, set, nr_set);
+		dret = ft_dlm_acquire_set(ft, ctx, set, nr_set);
 		if (dret) {
 			ft_flip_txn_destroy(txn);
 			return dret;	/* -EAGAIN / -ENOMEM; nothing acquired */
 		}
 		parent_cn_meta = parent_cn_meta_l;
-		s_iter = set[si].snap;
-		ft_flip_txn_lock_register(txn, iter_meta);
-		si++;
+		iter_held = set[si++].held;
+		ft_chain_compress_register_retire(txn, &iter_held, iter_meta);
 		if (parent_cn_meta_l) {
-			s_pcn = set[si].snap;
-			ft_flip_txn_lock_register(txn, parent_cn_meta_l);
-			si++;
+			pcn_held = set[si++].held;
+			ft_chain_compress_register_retire(txn, &pcn_held,
+				parent_cn_meta_l);
 		}
 		if (child_cn_meta_l) {
-			s_ccn = set[si].snap;
-			ft_flip_txn_lock_register(txn, child_cn_meta_l);
-			si++;
+			ccn_held = set[si++].held;
+			ft_chain_compress_register_retire(txn, &ccn_held,
+				child_cn_meta_l);
 		}
-		if (pp_meta) {
+		if (pp_flag) {
 			/*
 			 * publish_parent is the value-swap RELEASE target (survives).
 			 * Record its {LOCK|s -> s} release + register it up front with
 			 * the acquire, so the publish below skips its lock_or_guard and
 			 * every pre-publish bail's ft_flip_txn_destroy drains it -- no
-			 * separate publish_parent unwind path.
+			 * separate publish_parent unwind path.  A member that deduped
+			 * onto a word the set already took owes neither.
 			 */
-			ft_flip_txn_record_release_lock(txn, pp_meta, set[si].snap);
-			ft_flip_txn_lock_register(txn, pp_meta);
+			if (!set[si].held.shared) {
+				ft_flip_txn_record_release_lock(txn,
+					set[si].held.lock, set[si].held.lock_snap);
+				ft_flip_txn_lock_register(txn, set[si].held.lock);
+			}
 			si++;
 		}
 	} else
 	{
-		if (ft_meta_lock_acquire(iter_meta, &s_iter)) {
+		unsigned int parent_depth = 0;
+
+		if (ft_acquire_member(ft, ctx, iter_node_flag, iter_meta,
+				iter_depth, &iter_held)) {
 			ft_flip_txn_destroy(txn);
 			return -EAGAIN;
 		}
-		ft_flip_txn_lock_register(txn, iter_meta);
+		ft_chain_compress_register_retire(txn, &iter_held, iter_meta);
 		/*
 		 * ONE snapshot of the boundary's parent (latch-checked): the F1
 		 * discipline -- a peer's parked flip proxy must be neither classified
@@ -774,24 +882,34 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		parent_cn_meta = parent_cn
 			? cds_ft_item_to_metadata((struct cds_ft_inode *) parent_cn)
 			: NULL;
-		if (parent_cn_meta && ft_meta_lock_acquire(parent_cn_meta, &s_pcn)) {
-			ft_flip_txn_destroy(txn);
-			return -EAGAIN;
+		if (parent_cn_meta) {
+			if (!ft_lock_ctx_depth_of(ft, ctx, iter_parent,
+						&parent_depth) ||
+					ft_acquire_member(ft, ctx, iter_parent,
+						parent_cn_meta, parent_depth,
+						&pcn_held)) {
+				ft_flip_txn_destroy(txn);
+				return -EAGAIN;
+			}
+			ft_chain_compress_register_retire(txn, &pcn_held,
+				parent_cn_meta);
 		}
-		if (parent_cn_meta)
-			ft_flip_txn_lock_register(txn, parent_cn_meta);
 		child_cn = ft_node_compressed(surviving_child)
 			? ft_compressed_node_ptr(surviving_child)
 			: NULL;
-		if (child_cn && ft_meta_lock_acquire(
-				cds_ft_item_to_metadata((struct cds_ft_inode *) child_cn),
-				&s_ccn)) {
-			ft_flip_txn_destroy(txn);
-			return -EAGAIN;
+		if (child_cn) {
+			/* The §7.1 below-pivot member: one hop past the boundary. */
+			if (ft_acquire_member(ft, ctx, surviving_child,
+					cds_ft_item_to_metadata(
+						(struct cds_ft_inode *) child_cn),
+					iter_depth + 1, &ccn_held)) {
+				ft_flip_txn_destroy(txn);
+				return -EAGAIN;
+			}
+			ft_chain_compress_register_retire(txn, &ccn_held,
+				cds_ft_item_to_metadata(
+					(struct cds_ft_inode *) child_cn));
 		}
-		if (child_cn)
-			ft_flip_txn_lock_register(txn,
-				cds_ft_item_to_metadata((struct cds_ft_inode *) child_cn));
 	}
 	/*
 	 * Re-validate the caller's PRE-fence plan under the fence: the
@@ -803,7 +921,7 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 	 * republish) is exactly what the mark snapshot cannot vouch for.
 	 * Never fires single-writer.
 	 */
-	if (caa_unlikely(ft_state_nr_child(s_iter) != plan_nr_child ||
+	if (caa_unlikely(ft_state_nr_child(iter_held.node_snap) != plan_nr_child ||
 			ft_node_get_nth(ft, iter_node_flag, NULL,
 				surviving_byte, FT_PF_NONE)
 					!= surviving_child)) {
@@ -959,17 +1077,19 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		 * no-op under one writer.  All three are FENCED (marked LOCK
 		 * above), so each expected old is its mark's clean snapshot: the
 		 * commit ratifies exactly the chain state this merge was built
-		 * from, and {LOCK|s -> TOMBSTONE|s} consumes the fence.
+		 * from.  The fence is consumed by the fused
+		 * {LOCK|s -> TOMBSTONE|s} where the member carries its own lock,
+		 * and by the release recorded at registration where coarsening
+		 * left the lock on a surviving ancestor.
 		 */
-		ft_flip_txn_record_tombstone_locked(txn, iter_meta, s_iter);
+		ft_flip_txn_record_retire_anchored(txn, &iter_held, iter_meta);
 		if (parent_cn)
-			ft_flip_txn_record_tombstone_locked(txn, parent_cn_meta,
-				s_pcn);
+			ft_flip_txn_record_retire_anchored(txn, &pcn_held,
+				parent_cn_meta);
 		if (child_cn)
-			ft_flip_txn_record_tombstone_locked(txn,
+			ft_flip_txn_record_retire_anchored(txn, &ccn_held,
 				cds_ft_item_to_metadata(
-					(struct cds_ft_inode *) child_cn),
-				s_ccn);
+					(struct cds_ft_inode *) child_cn));
 		ft_detach_freeze_orphans(ft, txn, orphans, nr_orphans,
 			trailing_orphan, orphan_snaps, trailing_orphan_snap);
 		/*
@@ -1025,6 +1145,8 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 static
 void ft_canonicalize_chain_compress(struct cds_ft *ft,
 		struct cds_ft_inode_flag *iter_node_flag,
+		unsigned int iter_depth,
+		const struct ft_lock_ctx *ctx,
 		struct cds_ft_metadata *iter_meta)
 {
 	uint8_t surviving_byte = 0;
@@ -1035,7 +1157,8 @@ void ft_canonicalize_chain_compress(struct cds_ft *ft,
 		false /* writer; no validation */);
 	if (!surviving_child)
 		return;
-	(void) ft_chain_compress_fused(ft, iter_node_flag, iter_meta,
+	(void) ft_chain_compress_fused(ft, iter_node_flag, iter_depth, ctx,
+		iter_meta,
 		surviving_child, surviving_byte,
 		1 /* already-committed 1-child boundary */, NULL, NULL,
 		NULL, 0, NULL, NULL, 0 /* no orphan chain */,
@@ -1059,6 +1182,7 @@ struct ft_detach_recompact_out {
 
 static
 int ft_detach_node(struct cds_ft *ft,
+		const struct ft_lock_ctx *op_ctx,
 		struct cds_ft_inode_flag **detach_node_flag_ptr,
 		struct cds_ft_inode_flag **detach_parent_flag_ptr,
 		unsigned int detach_depth,
@@ -1121,6 +1245,14 @@ int ft_detach_node(struct cds_ft *ft,
 	struct cds_ft_metadata *orphan_locked_meta[FT_MAX_DEPTH];
 	uintptr_t orphan_snap[FT_MAX_DEPTH];
 	int nr_orphan_locked = 0;
+	/*
+	 * This op's lock context: the caller's anchor source, plus the words
+	 * THIS function holds.  The orphan marks above are part of the held set
+	 * even though they sit outside any txn registry -- an acquire that
+	 * cannot see them re-takes one and waits on the op itself.  @nr_extra is
+	 * refreshed at each acquire because the orphan walk is still growing it.
+	 */
+	struct ft_lock_ctx lctx;
 	struct cds_ft_metadata *orphan_trailing_meta = NULL;
 	uintptr_t orphan_trailing_snap = 0;
 	bool retire_glue_fused = false;
@@ -1227,6 +1359,9 @@ int ft_detach_node(struct cds_ft *ft,
 
 	if (!pub)
 		pub = &local_pub;
+
+	ft_lock_ctx_init(&lctx, ft_lock_ctx_descent(op_ctx), NULL);
+	lctx.held.extra = orphan_locked_meta;
 
 	FT_TP(detach_node_enter, (const void *) *detach_node_flag_ptr, detach_depth);
 
@@ -1836,8 +1971,17 @@ int ft_detach_node(struct cds_ft *ft,
 					freeze_leaf);
 				freeze_leaf_fused = true;
 			}
+			/*
+			 * @cur_depth dates @iter_node_flag: the climb tracks the
+			 * holder's byte-depth alongside the node itself, and
+			 * @iter_node_flag is that same holder re-read from its
+			 * slot.
+			 */
+			lctx.held.txn = orphan_txn;
+			lctx.held.nr_extra = (unsigned int) nr_orphan_locked;
 			ret = ft_detach_node_replace_compressed_parent(ft,
-				iter_node_flag, detach_parent_flag_ptr,
+				iter_node_flag, cur_depth, &lctx,
+				detach_parent_flag_ptr,
 				topmost_external_nodes, elevated_old_child,
 				&nr_clear, fuse_cell,
 				pub, run, orphan_txn, count_delta);
@@ -2183,8 +2327,12 @@ int ft_detach_node(struct cds_ft *ft,
 					 * the walk (bounded by the removed leaf's depth); a no-op
 					 * for a count-neutral move / !rank_stats.
 					 */
+						lctx.held.txn = NULL;
+					lctx.held.nr_extra =
+						(unsigned int) nr_orphan_locked;
 					int cret = ft_chain_compress_fused(ft,
-						iter_node_flag, bmeta,
+						iter_node_flag, cur_depth, &lctx,
+						bmeta,
 						s_child, s_byte,
 						2 /* shape-D: survivor + the child this commit detaches */,
 						fuse_cell, run,
@@ -2307,6 +2455,8 @@ int ft_detach_node(struct cds_ft *ft,
 					FT_PROMOTE_PROBE_INC(cds_ft_probe_promote_immediate);
 			}
 #endif
+			lctx.held.txn = commit_txn;
+			lctx.held.nr_extra = (unsigned int) nr_orphan_locked;
 			ret = ft_node_replace_ptr(ft,
 				detach_node_flag_ptr,
 				elevated_old_child,
@@ -2315,7 +2465,8 @@ int ft_detach_node(struct cds_ft *ft,
 				metadata_stack[nr_branch - 1],
 				n, (struct cds_ft_inode_flag *) topmost_external_nodes,
 				detach_parent_flag_ptr == &ft->root,
-				cur_depth, pub, commit_txn, src_held_hint);
+				cur_depth, pub, commit_txn, src_held_hint,
+				&lctx);
 		}
 		if (!ret) {
 			/*
@@ -2722,8 +2873,15 @@ int ft_detach_node(struct cds_ft *ft,
 		if (ft_meta_nr_child(iter_meta) == 1 &&
 		    !iter_meta->external_nodes &&
 		    ft_parent_node(iter_meta->parent_word) != NULL) {
+			/*
+			 * Post-commit: the structural commit consumed its own
+			 * registry, so only the orphan marks this op still owns
+			 * are held.
+			 */
+			lctx.held.txn = NULL;
+			lctx.held.nr_extra = (unsigned int) nr_orphan_locked;
 			ft_canonicalize_chain_compress(ft, iter_node_flag,
-				iter_meta);
+				cur_depth, &lctx, iter_meta);
 		}
 #endif
 	}
@@ -3325,12 +3483,8 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 	 * member anchors on itself, so no depth is needed.
 	 */
 	struct ft_descent d;
-	/*
-	 * Consumed as this path's acquire sites convert to anchored lock-sets;
-	 * the descent that produces them is already gated on the granularity.
-	 */
-	bool have_descent __attribute__((unused)) = false;
-	unsigned int holder_depth __attribute__((unused)) = 0;
+	bool have_descent = false;
+	unsigned int holder_depth = 0;
 	struct cds_ft_inode_flag *holder_flag;
 	struct cds_ft_metadata *holder_meta;
 	struct cds_ft_inode_flag **head_slot = NULL;
@@ -3426,6 +3580,7 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 			return CDS_FT_STATUS_NOT_FOUND;
 		}
 		holder_flag = d.pnf;
+		holder_depth = d.pdepth;
 		have_descent = true;
 	} else if (ft->lock_spacing != CDS_FT_LOCK_SPACING_PER_NODE) {
 		/*
@@ -3470,6 +3625,15 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 			have_descent = true;
 		}
 	}
+
+	/*
+	 * The op's lock context.  @d is an anchor source only where the walk
+	 * above actually ran; under per-node granularity it never does, and a
+	 * NULL descent is exactly right there -- every member anchors on itself.
+	 */
+	struct ft_lock_ctx lctx;
+
+	ft_lock_ctx_init(&lctx, have_descent ? &d : NULL, NULL);
 
 	/*
 	 * Cell-always: @node heads its chain iff its prev is the cell (not an
@@ -3563,7 +3727,7 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 			 * metadata->parent.  Propagate -1 before detach, which may
 			 * free internal nodes.
 			 */
-			ret = ft_detach_node(ft, head_slot,
+			ret = ft_detach_node(ft, &lctx, head_slot,
 				ft_get_parent_slot(holder_meta, ft),
 				key_len, true, fuse_cell, pubp, NULL, NULL, node,
 				-1 /* leaf key removed: detach owns the -1 */,
@@ -3629,7 +3793,8 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 				 * OWN commit (count_delta -1), so no pre-decrement here.
 				 */
 				cret = ft_chain_compress_fused(ft,
-					holder_flag, holder_meta,
+					holder_flag, holder_depth, &lctx,
+					holder_meta,
 					s_child, s_byte,
 					1 /* sole body child; the removed entry is external */,
 					fuse_cell, NULL,
@@ -3726,7 +3891,7 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 				    ft_meta_nr_child(holder_meta) == 1 &&
 				    ft_parent_node(holder_meta->parent_word) != NULL) {
 					ft_canonicalize_chain_compress(ft, holder_flag,
-						holder_meta);
+						holder_depth, &lctx, holder_meta);
 				}
 #endif
 			}
@@ -3762,7 +3927,7 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 			 * Last/only entry: prune the now-empty branch.
 			 * Propagate -1 before detach, which may free internal nodes.
 			 */
-			ret = ft_detach_node(ft, head_slot,
+			ret = ft_detach_node(ft, &lctx, head_slot,
 				ft_get_parent_slot(holder_meta, ft),
 				key_len, true, fuse_cell, pubp, NULL, NULL, node,
 				-1 /* leaf key removed: detach owns the -1 */,
@@ -4100,6 +4265,38 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 	*result_node = chain_head;
 
 	/*
+	 * ANCHORED LOCK-SETS need a byte-depth per member, and locating the chain
+	 * head gives none: the holder comes from the cached node's back-pointer.
+	 * Descend for the depths, exactly as _cds_ft_remove_locked does and under
+	 * the same opt-in -- per-node granularity anchors every member on itself,
+	 * needs no depth, and leaves this path handle-derived
+	 * (doc/design/ft-dlm-lock-coarseness.md §5.3).
+	 */
+	struct ft_descent d;
+	struct ft_lock_ctx lctx;
+	unsigned int holder_depth = 0;
+	bool have_descent = false;
+
+	if (ft->lock_spacing != CDS_FT_LOCK_SPACING_PER_NODE) {
+		const uint8_t *ik = iter_key;
+
+		ft_remove_descend(ft, &d, iter_key, key_len, &ik);
+		/*
+		 * The holder is where the walk stopped: ON it for a prefix key
+		 * (the key ended at an internal node carrying external_nodes),
+		 * one level UP where the walk broke on the external leaf.
+		 */
+		if (d.nf == holder_flag) {
+			holder_depth = d.depth;
+			have_descent = true;
+		} else if (d.pnf == holder_flag) {
+			holder_depth = d.pdepth;
+			have_descent = true;
+		}
+	}
+	ft_lock_ctx_init(&lctx, have_descent ? &d : NULL, NULL);
+
+	/*
 	 * Ordered list on: the whole key leaves the trie, so its head's cell is
 	 * unspliced + freed below.  An in-place leaf detach fuses that unsplice
 	 * into its structural flip (pub.armed); the prefix and recompaction /
@@ -4177,7 +4374,8 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 				 * OWN commit (count_delta -1), so no pre-decrement here.
 				 */
 				cret = ft_chain_compress_fused(ft,
-					holder_flag, holder_meta,
+					holder_flag, holder_depth, &lctx,
+					holder_meta,
 					s_child, s_byte,
 					1 /* sole body child; the removed entry is external */,
 					ft->ordered_list ? dead_cell : NULL,
@@ -4256,7 +4454,7 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 					    ft_meta_nr_child(holder_meta) == 1 &&
 					    ft_parent_node(holder_meta->parent_word) != NULL) {
 						ft_canonicalize_chain_compress(ft, holder_flag,
-							holder_meta);
+							holder_depth, &lctx, holder_meta);
 					}
 #endif
 				}
@@ -4270,7 +4468,7 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 		 * the holder (it climbs via metadata->parent).  Propagate -1
 		 * before detach (which may free internal nodes).
 		 */
-		ret = ft_detach_node(ft, head_slot,
+		ret = ft_detach_node(ft, &lctx, head_slot,
 			ft_get_parent_slot(holder_meta, ft), key_len, true,
 			dead_cell, ft->ordered_list ? &pub : NULL, NULL, NULL,
 			NULL, -1 /* leaf key removed: detach owns the -1 */,

@@ -1206,7 +1206,10 @@ int ft_merge_unlink_src_subtree(struct cds_ft *src_ft,
 		struct ft_remove_pub pub = { .armed = false };
 		struct ft_remove_pub *pubp = run ? &pub : NULL;
 
-		ret = ft_detach_node(src_ft, d.nfp, d.pnfp, d.depth,
+		struct ft_lock_ctx lctx;
+
+		ft_lock_ctx_init(&lctx, &d, NULL);
+		ret = ft_detach_node(src_ft, &lctx, d.nfp, d.pnfp, d.depth,
 				/*free_detached_subtree=*/ false, NULL, pubp, run,
 				retire_glue, NULL,
 				/*

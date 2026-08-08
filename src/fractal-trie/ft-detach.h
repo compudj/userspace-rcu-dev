@@ -411,7 +411,10 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 				 * -1 fold).  No pre-decrement, no post-detach propagate walk
 				 * over the now-freed intermediate chain.
 				 */
-				ret = ft_detach_node(ft, d.nfp, d.pnfp, d.depth,
+				struct ft_lock_ctx lctx;
+
+				ft_lock_ctx_init(&lctx, &d, NULL);
+				ret = ft_detach_node(ft, &lctx, d.nfp, d.pnfp, d.depth,
 						false, NULL, pubp, runp, NULL, NULL,
 						-(long) detached_count, NULL, false,
 						NULL, NULL);

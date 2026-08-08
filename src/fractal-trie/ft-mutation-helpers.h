@@ -300,6 +300,39 @@ struct cds_ft_inode_flag *ft_descent_anchor_child(const struct ft_descent *d,
 	return ft_descent_anchor_at_level(d, lvl, child_depth);
 }
 
+/*
+ * The byte-depth the descent recorded for @nf, matched against the four window
+ * slots.  An acquire site resolves several of its lock-set members by a one-hop
+ * back-pointer (ft_resolve_parent_slot), which yields a node carrying NO depth
+ * at all, while a depth SCALAR describes only the member the caller was handed:
+ * a site locking {C, P, GP} needs the WINDOW depths for P and GP
+ * (doc/design/ft-dlm-lock-coarseness.md §9).
+ *
+ * FALSE when the descent does not describe @nf.  That is not an error but a
+ * RE-PLAN: a back-pointer resolving to a node this descent never passed is a
+ * node whose depth is unknown here, and anchoring it with another node's depth
+ * puts two ops on different anchors for one node -- the exact disagreement §1
+ * forbids.  ft_insert_dlm_acquire_split already follows this rule for P.
+ */
+static inline
+bool ft_descent_depth_of(const struct ft_descent *d,
+		const struct cds_ft_inode_flag *nf, unsigned int *depth)
+{
+	if (!d || !nf)
+		return false;
+	if (nf == d->nf)
+		*depth = d->depth;
+	else if (nf == d->pnf)
+		*depth = d->pdepth;
+	else if (nf == d->ppnf)
+		*depth = d->ppdepth;
+	else if (nf == d->pppnf)
+		*depth = d->pppdepth;
+	else
+		return false;
+	return true;
+}
+
 
 /*
  * Exercise the anchor LOOKUP from the descent itself, at exactly the depths an
@@ -362,6 +395,12 @@ void ft_descent_anchor_validate(const struct ft_descent *d __attribute__((unused
  * Members mapping to ONE anchor must be acquired ONCE -- a second ft_dlm_lock on
  * a held node aborts -EAGAIN -- so a caller with several members dedupes on the
  * returned pointer (doc/design/ft-dlm-lock-coarseness.md §7.3).
+ *
+ * A member BELOW the cursor -- the chain-compress set's surviving child is the
+ * canonical one (§7.1) -- resolves through ft_descent_anchor_child, which is
+ * exact for ONE hop and no further: past that the descent skipped boundaries the
+ * table never saw, and such a caller must extend the descent rather than reach
+ * deeper from here.
  */
 static inline
 struct cds_ft_inode_flag *ft_descent_anchor_of(const struct ft_descent *d,
@@ -375,6 +414,8 @@ struct cds_ft_inode_flag *ft_descent_anchor_of(const struct ft_descent *d,
 		return d->anchor[0].cover;
 	case CDS_FT_LOCK_SPACING_EXPONENTIAL:
 	default:
+		if (depth > d->depth)
+			return ft_descent_anchor_child(d, nf, depth);
 		return ft_descent_anchor(d, depth);
 	}
 }
@@ -394,12 +435,24 @@ struct cds_ft_inode_flag *ft_descent_anchor_of(const struct ft_descent *d,
 static inline
 struct cds_ft_metadata *ft_anchor_meta(const struct cds_ft *ft,
 		const struct ft_descent *d, struct cds_ft_inode_flag *nf,
-		unsigned int depth)
+		struct cds_ft_metadata *node, unsigned int depth)
 {
+	struct cds_ft_inode_flag *anchor;
+
 	assert(d || ft->lock_spacing == CDS_FT_LOCK_SPACING_PER_NODE);
 	if (ft->lock_spacing == CDS_FT_LOCK_SPACING_PER_NODE)
-		return ft_flag_to_metadata(ft, nf);
-	return ft_flag_to_metadata(ft, ft_descent_anchor_of(d, nf, depth));
+		return node;
+	anchor = ft_descent_anchor_of(d, nf, depth);
+	/*
+	 * @node, never a re-derivation, whenever the anchor IS the member: a
+	 * flag reconstructed from a node pointer and a type index is wrong for
+	 * every node kind whose metadata is not at the internal-node offset (a
+	 * compressed node reached through a skip pointer, above all), and the
+	 * acquire would then fence a DIFFERENT word than the one the caller
+	 * retires.  Only a genuine ancestor -- a flag the descent stored, and so
+	 * well-formed -- is resolved here.
+	 */
+	return anchor == nf ? node : ft_flag_to_metadata(ft, anchor);
 }
 
 /*
@@ -447,6 +500,15 @@ struct ft_held_anchor {
 	struct cds_ft_metadata *lock;
 	uintptr_t lock_snap;
 	uintptr_t node_snap;
+	/*
+	 * The op ALREADY held @lock when this member asked for it: coarsening
+	 * collapsed two of its members onto one word.  The member is protected --
+	 * by the op's own earlier acquire -- but it owes no release and no
+	 * terminal, both of which that earlier acquire recorded.  A second
+	 * release would drop the word while the op still writes under it, and a
+	 * second terminal would record the single word twice.
+	 */
+	bool shared;
 };
 
 /*
@@ -490,6 +552,7 @@ void ft_held_anchor_set(struct ft_held_anchor *h, struct cds_ft_metadata *lock,
 	h->lock = lock;
 	h->lock_snap = lock_snap;
 	h->node_snap = lock == node ? lock_snap : node_snap;
+	h->shared = false;
 }
 
 static
@@ -1162,30 +1225,169 @@ void ft_flip_txn_lock_register(struct ft_flip_txn *t,
 	t->locks[t->nr_locks++] = meta;
 }
 
-/*
- * Acquire the per-node lock of a RELEASE-terminal lock-set member -- a node the
- * op must exclude peers from but does NOT retire (recompact's {P} / {GP}, §9.3).
- * Same acquire as the retire half (ft_meta_lock_acquire: -EAGAIN on a dirty word
- * = "could not acquire, re-descend"); the halves diverge only at the commit,
- * where this one records {LOCK|s -> s} instead of the tombstone.
- *
- * The clean snapshot is stashed alongside the member so the commit can plant
- * that record and a bail can drop the lock again.  Members are held in a small
- * fixed array (the lock-set is bounded and known up front, §5: no growing a
- * lock-set in place), so an acquire failure just unwinds the ones already held.
- */
 #ifdef FEATURE_FT_FAULT_INJECT
 extern long cds_ft_fault_lock_countdown;
 #endif
+
+/*
+ * The anchors an OP currently holds -- the set every acquire must consult
+ * before taking another one.
+ *
+ * Coarsening maps several lock-set members onto ONE word, so an op reaches its
+ * second, third and fourth acquire already holding the word they resolve to.
+ * A second acquire on a held word returns -EAGAIN (ft_meta_lock_acquire refuses
+ * FT_STATE_LOCK, and it cannot tell the op's own mark from a peer's), the site
+ * reads that as contention and re-plans, and the retry rebuilds the identical
+ * shape: the op waits on ITSELF, forever.  That failure is a LIVELOCK, not an
+ * assertion -- no test reports it, the suite simply stops advancing.
+ *
+ * @txn is the ordinary registry: every word handed to a commit's outcome is
+ * recorded there with its terminal.  @extra covers the marks an op deliberately
+ * keeps OUTSIDE it -- ft_detach_node's orphan plan-lock chain reaches
+ * FT_MAX_DEPTH, past FT_FLIP_TXN_MAX_LOCKS, and owns its own release sweep --
+ * because a held word is a held word wherever the op chose to remember it.
+ */
+struct ft_held_set {
+	struct ft_flip_txn *txn;		/* the commit's lock registry */
+	struct cds_ft_metadata *const *extra;	/* marks held outside it */
+	unsigned int nr_extra;
+};
+
+/*
+ * An op's LOCK CONTEXT: the two things every acquire needs that belong to the
+ * OP rather than to the member being acquired -- the descent that supplies
+ * anchors, and the words the op already holds.  Threaded as one pointer because
+ * the acquires sit deep under the entry points that own both, and a conversion
+ * that added two parameters at each level would be abandoned halfway.
+ *
+ * A NULL context means "no descent ran and nothing is held".  That is legal
+ * ONLY under per-node granularity, where a member anchors on itself and no two
+ * members can collide; ft_anchor_meta asserts it.
+ */
+struct ft_lock_ctx {
+	const struct ft_descent *d;
+	struct ft_held_set held;
+};
+
 static inline
-int ft_lock_member(struct cds_ft_metadata *meta,
-		struct cds_ft_metadata **set, uintptr_t *snap, unsigned int *n)
+bool ft_held_set_contains(const struct ft_held_set *h,
+		const struct cds_ft_metadata *meta)
 {
+	if (!h)
+		return false;
+	if (h->txn && ft_anchor_held(h->txn->locks, h->txn->nr_locks, meta))
+		return true;
+	return ft_anchor_held(h->extra, h->nr_extra, meta);
+}
+
+static inline
+const struct ft_descent *ft_lock_ctx_descent(const struct ft_lock_ctx *ctx)
+{
+	return ctx ? ctx->d : NULL;
+}
+
+static inline
+bool ft_lock_ctx_holds(const struct ft_lock_ctx *ctx,
+		const struct cds_ft_metadata *meta)
+{
+	return ctx && ft_held_set_contains(&ctx->held, meta);
+}
+
+/*
+ * Build an op's lock context from its descent and its commit txn -- the shape
+ * every op has.  An op that also keeps marks outside the registry fills
+ * @held.extra itself afterwards.
+ */
+static inline
+void ft_lock_ctx_init(struct ft_lock_ctx *ctx, const struct ft_descent *d,
+		struct ft_flip_txn *txn)
+{
+	ctx->d = d;
+	ctx->held.txn = txn;
+	ctx->held.extra = NULL;
+	ctx->held.nr_extra = 0;
+}
+
+/*
+ * The byte-depth to anchor @nf by, for a member the site reached through a
+ * BACK-POINTER (ft_resolve_parent_slot and friends) rather than by descending
+ * to it -- the shape most lock-sets take for their P and GP members.
+ *
+ * FALSE means the descent does not describe @nf, so this op has no depth for it
+ * and must RE-PLAN.  Per-node granularity always succeeds with an unused depth:
+ * a member anchors on itself there, so no descent is required and none of these
+ * sites pay for the lookup.
+ */
+static inline
+bool ft_lock_ctx_depth_of(const struct cds_ft *ft,
+		const struct ft_lock_ctx *ctx,
+		const struct cds_ft_inode_flag *nf, unsigned int *depth)
+{
+	if (ft->lock_spacing == CDS_FT_LOCK_SPACING_PER_NODE) {
+		*depth = 0;
+		return true;
+	}
+	return ft_descent_depth_of(ft_lock_ctx_descent(ctx), nf, depth);
+}
+
+/*
+ * THE ACQUIRE CHOKE POINT.  Take the lock-set member @nf -- a node at byte-depth
+ * @depth -- for this op: resolve it to the word its acquire must actually CAS
+ * (its own under per-node granularity, its ANCHOR's under a coarser one), refuse
+ * to take that word TWICE, mark it, and ratify @nf's own state word.
+ *
+ * Every acquire in the library goes through here or through its transacted
+ * sibling ft_dlm_acquire_set.  That is not tidiness: agreement is the
+ * property that every op computes the SAME anchor for a node, which 40
+ * independent derivations cannot be trusted to preserve, and the dedupe above is
+ * only sound when the op's held set sees EVERY word the op took.  One site left
+ * outside collides with the converted ones and livelocks
+ * (doc/design/ft-dlm-lock-coarseness.md §1, §9).
+ *
+ * On 0, @held describes the member: @held->lock is the word to release /
+ * register / record the {LOCK|s -> s} release against, and @held->node_snap the
+ * clean word of @nf ITSELF, which is what a RETIRE tombstones.  @held->shared
+ * says the op already held the word, so this member owes NO release and NO
+ * terminal -- the acquire that first took it recorded both.
+ *
+ * -EAGAIN when a peer holds the word, or when @nf's own word is dirty
+ * (PROXY | TOMBSTONE | LOCK).  Per-node granularity gets that second check for
+ * free -- the two words are one -- and coarsening must not lose it: the op
+ * retires @nf against @node_snap, so a dirty value there is a retire that could
+ * only ever abort.  Nothing is held on failure.
+ *
+ * @nf's word is sampled AFTER the mark lands, which is where it is stable: from
+ * that point every mutator of @nf must first take the word we now hold.  The
+ * transacted sibling cannot do that -- its mark lands only at the commit -- and
+ * pays for it with a sample-then-guard instead.
+ */
+static inline
+int ft_acquire_member(const struct cds_ft *ft, const struct ft_lock_ctx *ctx,
+		struct cds_ft_inode_flag *nf, struct cds_ft_metadata *node,
+		unsigned int depth, struct ft_held_anchor *held)
+{
+	struct cds_ft_metadata *lock = ft_anchor_meta(ft, ft_lock_ctx_descent(ctx),
+			nf, node, depth);
+	uintptr_t lock_snap = 0, node_snap = 0;
 	int ret;
 
+	if (ft_lock_ctx_holds(ctx, lock)) {
+		/*
+		 * The op holds this word for an earlier member.  @lock_snap stays
+		 * unset: the earlier acquire captured it and owns the terminal,
+		 * and a second one would double-record the single word.
+		 */
+		if (lock != node && ft_held_anchor_sample_node(node, &node_snap))
+			return -EAGAIN;
+		held->lock = lock;
+		held->lock_snap = 0;
+		held->node_snap = node_snap;
+		held->shared = true;
+		return 0;
+	}
 #ifdef FEATURE_FT_FAULT_INJECT
 	/*
-	 * Test-only: fail this acquire exactly as a peer holding the lock would
+	 * Test-only: fail this acquire exactly as a peer holding the word would
 	 * (see cds_ft_fault_lock_countdown).  Drives the caller's unwind --
 	 * unlock the members already held, discard the build-invisible copy,
 	 * re-descend -- which the FT-wide lock otherwise makes unreachable.
@@ -1198,10 +1400,15 @@ int ft_lock_member(struct cds_ft_metadata *meta,
 		cds_ft_fault_lock_countdown--;
 	}
 #endif
-	ret = ft_meta_lock_acquire(meta, &snap[*n]);
+	ret = ft_meta_lock_acquire(lock, &lock_snap);
 	if (ret)
 		return ret;
-	set[(*n)++] = meta;
+	if (lock != node && ft_held_anchor_sample_node(node, &node_snap)) {
+		ft_meta_lock_release(lock);
+		return -EAGAIN;
+	}
+	ft_held_anchor_set(held, lock, lock_snap, node, node_snap);
+	held->shared = false;
 	return 0;
 }
 
@@ -1212,12 +1419,13 @@ int ft_lock_member(struct cds_ft_metadata *meta,
  * the txn's registry owns the unlock instead and this must not run.
  */
 static inline
-void ft_unlock_members(struct cds_ft_metadata **set, unsigned int n)
+void ft_unlock_held(const struct ft_held_anchor *set, unsigned int n)
 {
 	unsigned int i;
 
 	for (i = 0; i < n; i++)
-		ft_meta_lock_release(set[i]);
+		if (!set[i].shared)
+			ft_meta_lock_release(set[i].lock);
 }
 
 static inline
@@ -1480,64 +1688,130 @@ void ft_held_anchor_guard_node(struct ft_flip_txn *t,
 }
 
 /*
- * One member of a DLM lock-set: the node @meta to acquire (LOCK), plus an
- * OPTIONAL read-set guard that @guard_child's back-edge still resolves to
- * @guard_pf (validating the racy plan read of @meta's position).  @snap
- * receives the clean word captured at the acquire, for the caller's
- * retire/release terminal.  @meta == NULL skips the member (an absent optional
- * lock-set node -- e.g. a root with no parent, a compressed-parent that is not
- * present in a given shape); the caller then treats @snap as unused.
+ * One member of a DLM lock-set: the node @nf to protect, sitting at byte-depth
+ * @depth, plus an OPTIONAL read-set guard that @guard_child's back-edge still
+ * resolves to @guard_pf (validating the racy plan read of @nf's position).
+ *
+ * @nf is the node, NOT the word to lock: coarsening sends the acquire to @nf's
+ * ANCHOR, and only ft_dlm_acquire_set may make that mapping (§1 -- two sites
+ * deriving it independently is how agreement is lost).  @held returns the
+ * result, naming both words: the one the acquire CAS'd, for the release, and
+ * @nf's own, for a retire.
+ *
+ * @nf == NULL skips the member -- an absent optional lock-set node, e.g. a root
+ * with no parent, or a compressed parent a given shape does not have -- and
+ * leaves @held untouched.
  */
 struct ft_dlm_member {
-	struct cds_ft_metadata *meta;
+	struct cds_ft_inode_flag *nf;
+	struct cds_ft_metadata *node;
+	unsigned int depth;
 	struct cds_ft_metadata *guard_child;
 	struct cds_ft_inode_flag *guard_pf;
-	uintptr_t snap;
+	struct ft_held_anchor held;
 };
 
 /*
- * Acquire a whole lock-set in ONE all-or-none MCAS on a DEDICATED acquire
- * flip-txn (never the content lane -- the escalation model's circular-wait
- * constraint): for each present member, record its read-set guard (if any) and
- * its {clean -> LOCK} lock onto the acquire txn, then commit it once.  On
- * commit OK every present member holds LOCK (member.snap = its clean word)
- * and every guard validated at the linearization point; the caller registers
- * each member in its CONTENT txn and records the release/retire terminal from
- * member.snap, exactly as ft_insert_dlm_acquire_split and the recompact hoist
- * do.  Returns 0 (whole set acquired), -EAGAIN (a member is held/dirty or a
- * guarded back-edge re-homed -- NOTHING acquired, abort-and-regrow), or -ENOMEM.
- * Deadlock-free: a conflict aborts the commit, never blocks.
+ * THE ACQUIRE CHOKE POINT, transacted flavour: take a whole lock-set in ONE
+ * all-or-none MCAS on a DEDICATED acquire flip-txn (never the content lane --
+ * the escalation model's circular-wait constraint).  Each present member is
+ * resolved to its anchor, deduped, guarded and locked; then the set commits
+ * once.
+ *
+ * On commit OK every DISTINCT anchor in the set holds LOCK and every guard
+ * validated at the linearization point; the caller registers each held word in
+ * its CONTENT txn and records the release/retire terminal from
+ * @set[i].held, exactly as ft_insert_dlm_acquire_split does.  Members that
+ * deduped onto an anchor the set (or the op) already took come back
+ * @held.shared: protected, but owing no release and no terminal.
+ *
+ * Returns 0 (whole set acquired), -EAGAIN (a member is held by a PEER or dirty,
+ * a coarsened member's own word is dirty, or a guarded back-edge re-homed --
+ * NOTHING acquired, abort-and-regrow), or -ENOMEM.  Deadlock-free: a conflict
+ * aborts the commit, never blocks.
+ *
+ * @ctx supplies the anchors and the op's already-held words.  Passing NULL
+ * while the op does hold something is the self-collision livelock
+ * ft_held_set documents, not an optimisation.
  */
 static inline
-int ft_dlm_acquire_set(const struct cds_ft *ft, struct ft_dlm_member *set,
-		int nr)
+int ft_dlm_acquire_set(const struct cds_ft *ft, const struct ft_lock_ctx *ctx,
+		struct ft_dlm_member *set, int nr)
 {
+	struct cds_ft_metadata *taken[FT_FLIP_TXN_MAX_LOCKS];
+	unsigned int nr_taken = 0;
 	struct ft_flip_txn *acq;
 	int i, nr_present = 0;
 
 	for (i = 0; i < nr; i++)
-		if (set[i].meta)
+		if (set[i].nf)
 			nr_present++;
 	if (!nr_present)
 		return 0;
-	/* Up to one guard + one lock record per present member. */
-	acq = ft_flip_txn_create_bounded(2 * nr_present);
+	assert(nr_present <= FT_FLIP_TXN_MAX_LOCKS);
+	/*
+	 * Up to one back-edge guard + one lock + one coarsened-node guard per
+	 * present member.  Dedupe only ever removes records, so this bound holds
+	 * whatever the granularity (§7.3: the reservation stays safe, merely
+	 * loose).
+	 */
+	acq = ft_flip_txn_create_bounded(3 * nr_present);
 	if (!acq)
 		return -ENOMEM;
 	for (i = 0; i < nr; i++) {
-		if (!set[i].meta)
+		struct cds_ft_metadata *node, *lock;
+		uintptr_t node_snap = 0, lock_snap;
+		bool coarsened;
+
+		if (!set[i].nf)
 			continue;
+		node = set[i].node;
+		lock = ft_anchor_meta(ft, ft_lock_ctx_descent(ctx), set[i].nf,
+			node, set[i].depth);
+		coarsened = lock != node;
+		/*
+		 * A coarsened member's OWN word is not the one being CAS'd, so
+		 * the acquire does not ratify it.  Sample it and validate the
+		 * value into THIS commit: the anchor excludes @nf's mutators only
+		 * from the linearization point on, and the caller retires @nf
+		 * against this snapshot.  A dirty word is the same -EAGAIN the
+		 * per-node acquire gives for free.
+		 */
+		if (coarsened) {
+			if (ft_held_anchor_sample_node(node, &node_snap))
+				goto eagain;
+			ft_held_anchor_guard_node(acq, node, node_snap);
+		}
+		/*
+		 * The guard is a read-set validation of the MEMBER's own
+		 * back-edge, so it names the node even where the lock went to an
+		 * ancestor: anchoring moves the exclusion, not the edge being
+		 * validated.  It rides the commit for EVERY member, deduped or
+		 * not -- dedupe merges LOCKS, never guards (§7.3).
+		 */
 		if (set[i].guard_child)
 			ft_dlm_guard_parent(acq, set[i].guard_child,
 				set[i].guard_pf);
-		if (ft_dlm_lock(acq, set[i].meta, &set[i].snap)) {
-			ft_flip_txn_destroy(acq);
-			return -EAGAIN;	/* nothing acquired (all-or-none) */
+		if (ft_lock_ctx_holds(ctx, lock) ||
+				ft_anchor_held(taken, nr_taken, lock)) {
+			set[i].held.lock = lock;
+			set[i].held.lock_snap = 0;
+			set[i].held.node_snap = node_snap;
+			set[i].held.shared = true;
+			continue;
 		}
+		if (ft_dlm_lock(acq, lock, &lock_snap))
+			goto eagain;
+		taken[nr_taken++] = lock;
+		ft_held_anchor_set(&set[i].held, lock, lock_snap, node,
+			node_snap);
 	}
 	if (ft_flip_txn_commit((struct cds_ft *) ft, acq) != URCU_TXN_STATUS_OK)
 		return -EAGAIN;		/* commit freed @acq; nothing acquired */
 	return 0;
+eagain:
+	ft_flip_txn_destroy(acq);
+	return -EAGAIN;			/* nothing acquired (all-or-none) */
 }
 
 /*
@@ -2457,6 +2731,13 @@ static inline
 void ft_flip_txn_record_anchor_release(struct ft_flip_txn *t,
 		const struct ft_held_anchor *h, const struct cds_ft_metadata *node)
 {
+	/*
+	 * A member that deduped onto a word the op already holds owes no
+	 * release: the acquire that first took the word recorded one, and a
+	 * second record settles the single word twice.  Callers gate on
+	 * @h->shared; asserting keeps that from being forgotten silently.
+	 */
+	assert(!h->shared);
 	if (h->lock == node)
 		return;
 	ft_flip_txn_record_release_lock(t, h->lock, h->lock_snap);
@@ -2476,6 +2757,19 @@ static inline
 void ft_flip_txn_record_retire_anchored(struct ft_flip_txn *t,
 		const struct ft_held_anchor *h, struct cds_ft_metadata *node)
 {
+	/*
+	 * A retire needs @node's CLEAN pre-mark word as its expected old, and
+	 * the acquire that captured it is the only place it exists.  A member
+	 * that deduped onto @node's OWN word -- the op already held the very
+	 * node it now retires -- has no such snapshot here: the earlier acquire
+	 * kept it, and re-reading the word would sample the op's own LOCK.
+	 *
+	 * No caller constructs that shape today.  It becomes constructible only
+	 * once a spacing maps a member onto a node the same op retires (root-only
+	 * over a root retire is the candidate), so this assert is the probe that
+	 * says whether it is reachable, rather than an argument that it is not.
+	 */
+	assert(!(h->shared && h->lock == node));
 	if (h->lock == node) {
 		ft_flip_txn_record_tombstone_locked(t, node, h->lock_snap);
 		return;

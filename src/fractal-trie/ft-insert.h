@@ -645,14 +645,15 @@ int ft_insert_dlm_acquire_split(struct cds_ft *ft,
 	 * so there is no depth to anchor it by -- re-plan rather than anchor it
 	 * with a depth that belongs to another node.
 	 */
-	cn_lock = ft_anchor_meta(ft, d, cn_flag, cn_depth);
+	cn_lock = ft_anchor_meta(ft, d, cn_flag, cn_meta, cn_depth);
 	if (pf_p) {
 		if (ft->lock_spacing == CDS_FT_LOCK_SPACING_PER_NODE) {
 			p_meta = ft_flag_to_metadata(ft, pf_p);
 		} else {
 			if (!d || pf_p != d->pnf)
 				return -EAGAIN;
-			p_meta = ft_anchor_meta(ft, d, pf_p, d->pdepth);
+			p_meta = ft_anchor_meta(ft, d, pf_p,
+					ft_flag_to_metadata(ft, pf_p), d->pdepth);
 		}
 		if (p_meta == cn_lock) {
 			/*
@@ -1695,7 +1696,8 @@ int ft_attach_node(struct cds_ft *ft,
 		unsigned int level,
 		struct cds_ft_node *child_node,
 		struct cds_ft_node *external_nodes,
-		struct ft_insert_commit *ic)
+		struct ft_insert_commit *ic,
+		const struct ft_lock_ctx *ctx)
 {
 	struct cds_ft_metadata *metadata = NULL;
 	struct cds_ft_inode_flag *iter_node_flag, *iter_dest_node_flag,
@@ -1915,7 +1917,7 @@ int ft_attach_node(struct cds_ft *ft,
 				ret = ft_node_set_nth_rec(ft, &iter_dest_node_flag,
 					key_value, NULL, &old_recompacted_node,
 					metadata, level - 1, false, &rec, ic->txn,
-					NULL, &count_deferred);
+					NULL, ctx, &count_deferred);
 				if (ret) {
 					dbg_printf("branch publish error %d\n", ret);
 					goto check_error;
@@ -2826,6 +2828,12 @@ int _cds_ft_insert(struct cds_ft *ft,
 	void *cell = NULL;			/* @precell's carrier; reused across retries */
 	enum urcu_txn_status cst = URCU_TXN_STATUS_OK;	/* last commit outcome */
 	struct ft_insert_commit ic = { 0 };
+	/*
+	 * The attach's recompactions lock {C, P, GP}; @d dates them and @ic.txn
+	 * names what this op already holds.  Re-initialised at each attach,
+	 * because the txn is armed part-way through.
+	 */
+	struct ft_lock_ctx actx;
 	struct urcu_txn optxn;		/* persistent handle spanning the retry loop */
 
 	if (!valid_external_node(node) || !valid_key_len(ft, key_len))
@@ -2987,9 +2995,10 @@ restart_attempt:
 			dbg_printf("cds_ft_insert NULL ppnf %p pnf %p nfp %p nf %p\n",
 					d.ppnf, d.pnf, d.nfp, d.nf);
 
+			ft_lock_ctx_init(&actx, &d, ic.txn);
 			ret = ft_attach_node(ft, d.pnfp, d.pnf,
 					d.nfp, d.nf, key, key_len, d.depth, node,
-					NULL, &ic);
+					NULL, &ic, &actx);
 			if (ret == 0) {
 				/*
 				 * One-commit insert (ic.slot parked): the +1 count
@@ -3204,9 +3213,11 @@ restart_attempt:
 		dbg_printf("cds_ft_insert NULL or external ppnf %p pnf %p nfp %p nf %p\n",
 				d.ppnf, d.pnf, d.nfp, d.nf);
 
+		ft_lock_ctx_init(&actx, &d, ic.txn);
 		ret = ft_attach_node(ft, d.pnfp, d.pnf,
 				d.nfp, d.nf, key, key_len, d.depth, node,
-				(struct cds_ft_node *) ft_node_ptr(d.nf), &ic);
+				(struct cds_ft_node *) ft_node_ptr(d.nf), &ic,
+				&actx);
 		if (ret == 0) {
 			/* One-commit: +1 count folds into the commit (see above). */
 			assert(ic.slot || !ft->rank_stats);
@@ -3434,6 +3445,12 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 	int ret;
 	struct ft_ord_cell *precell;
 	struct ft_insert_commit ic = { 0 };
+	/*
+	 * The attach's recompactions lock {C, P, GP}; @d dates them and @ic.txn
+	 * names what this op already holds.  Re-initialised at each attach,
+	 * because the txn is armed part-way through.
+	 */
+	struct ft_lock_ctx actx;
 	enum urcu_txn_status cst = URCU_TXN_STATUS_OK;	/* one-commit outcome */
 
 	*old_node_ret = NULL;
@@ -3523,9 +3540,10 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 			/* No existing node. Regular attach. */
 			dbg_printf("_cds_ft_insert_replace NULL at end of key\n");
 
+			ft_lock_ctx_init(&actx, &d, ic.txn);
 			ret = ft_attach_node(ft, d.pnfp, d.pnf,
 					d.nfp, d.nf, key, key_len, d.depth, node,
-					NULL, &ic);
+					NULL, &ic, &actx);
 			if (ret == 0) {
 				/* Parked one-commit: +1 folds into the commit. */
 				assert(ic.slot || !ft->rank_stats);
@@ -3840,9 +3858,11 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 		 */
 		dbg_printf("_cds_ft_insert_replace: attach before end of key\n");
 
+		ft_lock_ctx_init(&actx, &d, ic.txn);
 		ret = ft_attach_node(ft, d.pnfp, d.pnf,
 				d.nfp, d.nf, key, key_len, d.depth, node,
-				(struct cds_ft_node *) ft_node_ptr(d.nf), &ic);
+				(struct cds_ft_node *) ft_node_ptr(d.nf), &ic,
+				&actx);
 		if (ret == 0) {
 			/* Parked one-commit: +1 folds into the commit. */
 			assert(ic.slot || !ft->rank_stats);

@@ -1140,11 +1140,12 @@ int ft_node_recompact(enum ft_recompact mode,
 		struct cds_ft_inode_flag *nullify_expected,
 		struct cds_ft_inode **old_node_ret,
 		bool is_root,
-		unsigned int node_depth __attribute__((unused)),
+		unsigned int node_depth,
 		bool cluster_leaf,
 		struct ft_pub_rec *rec,
 		struct ft_flip_txn *retire_txn,
-		const struct ft_parent_hint *inh_hint)
+		const struct ft_parent_hint *inh_hint,
+		const struct ft_lock_ctx *ctx)
 {
 	unsigned int new_type_index;
 	struct cds_ft_inode *new_node;
@@ -1195,18 +1196,19 @@ int ft_node_recompact(enum ft_recompact mode,
 	struct cds_ft_inode_flag *nullify_val = NULL;
 	/*
 	 * F2 node lock state: set when this recompact retires a LIVE
-	 * published node (@retire_txn arm) -- @fence_state is the clean
-	 * pre-mark state word, the ONE snapshot the whole copy plan (type
+	 * published node (@retire_txn arm).  @c_held names BOTH words a coarse
+	 * spacing splits apart: the one the acquire CAS'd, and C's own clean
+	 * pre-mark state word -- the ONE snapshot the whole copy plan (type
 	 * sizing, tombstone expected-old) derives from.
 	 */
-	uintptr_t fence_state = 0;
+	struct ft_held_anchor c_held = { 0 };
 	bool fenced = false;
 	/*
 	 * §9.3 LOCK_FINE lock-set, RELEASE half: the members this recompact locks
 	 * that SURVIVE the commit -- P (the parent whose slot the fresh copy is
 	 * published into) and, when P is a compressed node whose SKIP_X dual this
 	 * recompact re-encodes, GP (whose slot that dual writes).  C -- the node
-	 * copied away -- is the RETIRE half (@fenced / @fence_state above); the two
+	 * copied away -- is the RETIRE half (@fenced / @c_held above); the two
 	 * halves differ only in the terminal they record at commit.
 	 *
 	 * Held only under FINE: COARSE derives no lock-set (§10.5, one FT-wide
@@ -1214,8 +1216,7 @@ int ft_node_recompact(enum ft_recompact mode,
 	 * guards, which the release record would poison" -- is gone with the
 	 * strategy; see ft_flip_txn_record_release_lock.)
 	 */
-	struct cds_ft_metadata *rel_meta[2];
-	uintptr_t rel_snap[2];
+	struct ft_held_anchor rel_held[2];
 	unsigned int nr_rel = 0, ri;
 
 	/*
@@ -1238,18 +1239,18 @@ int ft_node_recompact(enum ft_recompact mode,
 	 * marks (C here, P at the inherit, GP at the skip-dual).  §9.3: P is resolved
 	 * from C and validated -- the read-set guard C.parent==P (and P.parent==GP)
 	 * rides the SAME commit, so a re-home between the racy plan read and the
-	 * acquire aborts it -> re-plan.  Populates the same @fenced / @fence_state /
-	 * @rel_meta / @rel_snap / @nr_rel the incremental scheme does, so the build,
-	 * the commit terminals (retire C via @fence_state, release P/GP via
-	 * @rel_snap), and the abandon_fresh unwind are all unchanged below.  Only the
+	 * acquire aborts it -> re-plan.  Populates the same @fenced / @c_held /
+	 * @rel_held / @nr_rel the incremental scheme does, so the build, the commit
+	 * terminals (retire C via @c_held, release P/GP via @rel_held), and the
+	 * abandon_fresh unwind are all unchanged below.  Only the
 	 * LOCK_FINE retire arm hoists; the universal F2 lock (non-lock_fine /
 	 * flag-off) keeps its single mark.
 	 */
 	if (ft->lock_fine && retire_txn && !cluster_leaf && metadata && old_node) {
 		struct cds_ft_inode_flag *pf_p = NULL, *pf_gp = NULL;
 		struct cds_ft_metadata *p_meta = NULL, *gp_meta = NULL;
-		uintptr_t snap_c, snap_p = 0, snap_gp = 0;
-		struct ft_flip_txn *acq;
+		struct ft_dlm_member set[3];
+		unsigned int p_depth = 0, gp_depth = 0;
 		int dret;
 
 		/* PLAN (read-only, racy): resolve P (+GP iff P compressed). */
@@ -1275,7 +1276,7 @@ int ft_node_recompact(enum ft_recompact mode,
 		 * FOLD (parent_held): P is already LOCK-held by an earlier step of
 		 * the SAME op (a same-trie rekey's graft locked the shared spine), so
 		 * do NOT re-lock it (a second ft_dlm_lock would abort -EAGAIN) and do
-		 * NOT add it to @rel_meta below (the holder owns its release).  P stays
+		 * NOT add it to @rel_held below (the holder owns its release).  P stays
 		 * the republish target; only C (and, if present, GP) are acquired here.
 		 *
 		 * The guard is NOT skipped with the lock: @pf_p is then the CALLER's
@@ -1306,55 +1307,58 @@ int ft_node_recompact(enum ft_recompact mode,
 		if (p_held && gp_meta)
 			return -EAGAIN;
 
-		/* ACQUIRE {C, (P), (GP)} + read-set guards in one MCAS. */
-		acq = ft_flip_txn_create_bounded(3 /*locks*/ + 2 /*guards*/);
-		if (!acq)
-			return -ENOMEM;
-		dret = ft_dlm_lock(acq, metadata, &snap_c);
-		if (!dret && p_meta && p_held)
-			ft_dlm_guard_parent(acq, metadata, pf_p);
-		if (!dret && p_meta && !p_held) {
-			/*
-			 * No hint: the plan resolved P from C's own back-pointer, so
-			 * the guard validates that racy read.  With a hint the parent
-			 * identity is the caller's, and an ordinary hint user does NOT
-			 * want it validated against C's lazily-updated back-pointer
-			 * (see ft_parent_hint) -- only a caller that asks for it
-			 * (@parent_guard: the rekey fold's non-held src junction, whose
-			 * republish parks SW into @parent's slot) gets the guard.
-			 */
-			if (!inh_hint || inh_hint->parent_guard)
-				ft_dlm_guard_parent(acq, metadata, pf_p);
-			dret = ft_dlm_lock(acq, p_meta, &snap_p);
-			if (!dret && gp_meta) {
-				if (!inh_hint)
-					ft_dlm_guard_parent(acq, p_meta, pf_gp);
-				dret = ft_dlm_lock(acq, gp_meta, &snap_gp);
-			}
-		}
-		if (dret) {
-			ft_flip_txn_destroy(acq);
+		/*
+		 * P and GP were reached through a back-pointer or a caller's
+		 * hint, so neither carries a depth; the descent's window is what
+		 * dates them.  A member this op's descent never passed cannot be
+		 * anchored here at all -- re-plan rather than anchor it by
+		 * another node's depth.
+		 */
+		if ((p_meta && !ft_lock_ctx_depth_of(ft, ctx, pf_p, &p_depth)) ||
+				(gp_meta && !ft_lock_ctx_depth_of(ft, ctx,
+					pf_gp, &gp_depth)))
 			return -EAGAIN;
-		}
-		if (ft_flip_txn_commit(ft, acq) != URCU_TXN_STATUS_OK)
-			return -EAGAIN;	/* commit freed @acq; nothing acquired */
+
+		/*
+		 * ACQUIRE {C, (P), (GP)} + read-set guards in one MCAS.
+		 *
+		 * C's guard validates the plan's racy read of its parent.  With
+		 * a hint the parent identity is the CALLER's, and an ordinary
+		 * hint user does NOT want it validated against C's lazily-updated
+		 * back-pointer (see ft_parent_hint) -- only a caller that asks
+		 * for it (@parent_guard: the rekey fold's non-held src junction,
+		 * whose republish parks SW into @parent's slot) gets it, and the
+		 * FOLD arm gets it unconditionally because its lock is skipped.
+		 */
+		set[0] = (struct ft_dlm_member){
+			.nf = *old_node_flag_ptr, .node = metadata,
+			.depth = node_depth,
+			.guard_child = (p_meta && (p_held || !inh_hint ||
+				inh_hint->parent_guard)) ? metadata : NULL,
+			.guard_pf = pf_p };
+		set[1] = (struct ft_dlm_member){
+			.nf = (p_meta && !p_held) ? pf_p : NULL,
+			.node = p_meta, .depth = p_depth };
+		set[2] = (struct ft_dlm_member){
+			.nf = (gp_meta && !p_held) ? pf_gp : NULL,
+			.node = gp_meta, .depth = gp_depth,
+			.guard_child = inh_hint ? NULL : p_meta,
+			.guard_pf = pf_gp };
+		dret = ft_dlm_acquire_set(ft, ctx, set, 3);
+		if (dret)
+			return dret == -ENOMEM ? -ENOMEM : -EAGAIN;
 
 		/* Populate the lock-set state -- build/commit/unwind unchanged. */
 		fenced = true;
-		fence_state = snap_c;
-		if (p_meta && !p_held) {
-			rel_meta[nr_rel] = p_meta;
-			rel_snap[nr_rel] = snap_p;
-			nr_rel++;
-		}
-		if (gp_meta && !p_held) {
-			rel_meta[nr_rel] = gp_meta;
-			rel_snap[nr_rel] = snap_gp;
-			nr_rel++;
-		}
+		c_held = set[0].held;
+		if (set[1].nf)
+			rel_held[nr_rel++] = set[1].held;
+		if (set[2].nf)
+			rel_held[nr_rel++] = set[2].held;
 	} else
 	if (retire_txn && !cluster_leaf && metadata && old_node) {
-		ret = ft_meta_lock_acquire(metadata, &fence_state);
+		ret = ft_acquire_member(ft, ctx, *old_node_flag_ptr, metadata,
+			node_depth, &c_held);
 		if (ret)
 			return ret;
 		fenced = true;
@@ -1431,22 +1435,22 @@ int ft_node_recompact(enum ft_recompact mode,
 					3 * (ft_meta_nr_child_load(metadata) + 1)
 					+ 1 + (ft->lock_fine ? 2 : 0))) {
 			/* Release the WHOLE lock set, not just C: the up-front
-			 * acquire took P (and GP) into @rel_meta, and this bail is
+			 * acquire took P (and GP) into @rel_held, and this bail is
 			 * before the txn registry takes ownership of them, so they
 			 * are still ours to clear.  Missing this left P/GP LOCK
 			 * for good -- structurally invisible (the trie is
 			 * byte-for-byte intact) and fatal to every later op that
 			 * needs them. */
-			ft_unlock_members(rel_meta, nr_rel);
-			if (fenced)
-				ft_meta_lock_release(metadata);
+			ft_unlock_held(rel_held, nr_rel);
+			if (fenced && !c_held.shared)
+				ft_meta_lock_release(c_held.lock);
 			return -ENOMEM;
 		}
 		new_node = alloc_cds_ft_node(ft, new_type, &new_metadata);
 		if (!new_node) {
-			ft_unlock_members(rel_meta, nr_rel);
-			if (fenced)
-				ft_meta_lock_release(metadata);
+			ft_unlock_held(rel_held, nr_rel);
+			if (fenced && !c_held.shared)
+				ft_meta_lock_release(c_held.lock);
 			return -ENOMEM;
 		}
 
@@ -1535,9 +1539,9 @@ int ft_node_recompact(enum ft_recompact mode,
 				 * yet -- bail and retry after it settles.
 				 */
 				free_cds_ft_node_unpublished(ft, new_node);
-				ft_unlock_members(rel_meta, nr_rel);
-				if (fenced)
-					ft_meta_lock_release(metadata);
+				ft_unlock_held(rel_held, nr_rel);
+				if (fenced && !c_held.shared)
+					ft_meta_lock_release(c_held.lock);
 				return -EAGAIN;
 			}
 			ft_metadata_set_external_nodes(new_node_flag,
@@ -1569,10 +1573,9 @@ int ft_node_recompact(enum ft_recompact mode,
 					rcu_dereference(*bc_slot);
 				if (caa_unlikely(ft_node_flip_proxy(bc_old))) {
 					free_cds_ft_node_unpublished(ft, new_node);
-					ft_unlock_members(rel_meta,
-						nr_rel);
-					if (fenced)
-						ft_meta_lock_release(metadata);
+					ft_unlock_held(rel_held, nr_rel);
+					if (fenced && !c_held.shared)
+						ft_meta_lock_release(c_held.lock);
 					return -EAGAIN;
 				}
 				ft_flip_txn_record_reserved(retire_txn, bc_slot,
@@ -2225,9 +2228,14 @@ skip_copy:
 			 * every other terminal outcome clears it through the
 			 * wrapper's registry).
 			 */
-			ft_flip_txn_record_tombstone_locked(retire_txn,
-					metadata, fence_state);
-			ft_flip_txn_lock_register(retire_txn, metadata);
+			if (!c_held.shared) {
+				ft_flip_txn_record_anchor_release(retire_txn,
+					&c_held, metadata);
+				ft_flip_txn_lock_register(retire_txn,
+					c_held.lock);
+			}
+			ft_flip_txn_record_retire_anchored(retire_txn, &c_held,
+					metadata);
 		} else if (retire_txn)
 			ft_flip_txn_record_tombstone(retire_txn, metadata);
 		else
@@ -2249,9 +2257,11 @@ skip_copy:
 	 * below must NOT unlock them -- the txn owns them.
 	 */
 	for (ri = 0; ri < nr_rel; ri++) {
-		ft_flip_txn_record_release_lock(retire_txn, rel_meta[ri],
-				rel_snap[ri]);
-		ft_flip_txn_lock_register(retire_txn, rel_meta[ri]);
+		if (rel_held[ri].shared)
+			continue;
+		ft_flip_txn_record_release_lock(retire_txn, rel_held[ri].lock,
+				rel_held[ri].lock_snap);
+		ft_flip_txn_lock_register(retire_txn, rel_held[ri].lock);
 	}
 
 	ret = 0;
@@ -2266,14 +2276,14 @@ abandon_fresh:
 	 * back-channel edge is a RECORD discarded with the abandoned attempt,
 	 * and the plain-store arm's prev publish is deferred past this point.
 	 * Reclaim the never-escaped copy immediately and lift the whole lock-set
-	 * -- the retire half (@fenced) and the release half (@rel_meta), neither
+	 * -- the retire half (@fenced) and the release half (@rel_held), neither
 	 * yet registered with @retire_txn (registration happens only on the
 	 * success path above); -EAGAIN re-descends after the peer settles.
 	 */
 	free_cds_ft_node_unpublished(ft, new_node);
-	ft_unlock_members(rel_meta, nr_rel);
-	if (fenced)
-		ft_meta_lock_release(metadata);
+	ft_unlock_held(rel_held, nr_rel);
+	if (fenced && !c_held.shared)
+		ft_meta_lock_release(c_held.lock);
 	return ret;
 }
 
@@ -2721,6 +2731,7 @@ int ft_node_set_nth_rec(struct cds_ft *ft,
 		struct ft_pub_rec *rec,
 		struct ft_flip_txn *retire_txn,
 		const struct ft_parent_hint *inh_hint,
+		const struct ft_lock_ctx *ctx,
 		bool *deferred_count)
 {
 	int ret;
@@ -2783,14 +2794,14 @@ int ft_node_set_nth_rec(struct cds_ft *ft,
 		ret = ft_node_recompact(FT_RECOMPACT_ADD_NEXT, ft, type_index, type, node,
 					metadata, node_flag, n, child_node_flag, NULL,
 					NULL, old_node_ret, false, node_depth, cluster_leaf,
-					rec, retire_txn, inh_hint);
+					rec, retire_txn, inh_hint, ctx);
 		break;
 	case -ERANGE:
 		/* Node needs to be recompacted. */
 		ret = ft_node_recompact(FT_RECOMPACT_ADD_SAME, ft, type_index, type, node,
 					metadata, node_flag, n, child_node_flag, NULL,
 					NULL, old_node_ret, false, node_depth, cluster_leaf,
-					rec, retire_txn, inh_hint);
+					rec, retire_txn, inh_hint, ctx);
 		break;
 	}
 	if (ret == 0)
@@ -2817,9 +2828,13 @@ int ft_node_set_nth(struct cds_ft *ft,
 		unsigned int node_depth,
 		bool cluster_leaf)
 {
+	/*
+	 * No @retire_txn, so no lock-set is derived and no anchor is needed:
+	 * this wrapper builds into a node whose retire nobody records.
+	 */
 	return ft_node_set_nth_rec(ft, node_flag, n, child_node_flag,
 			old_node_ret, metadata, node_depth, cluster_leaf, NULL,
-			NULL, NULL, NULL);
+			NULL, NULL, NULL, NULL);
 }
 
 /*
@@ -2843,7 +2858,8 @@ int ft_node_replace_ptr(struct cds_ft *ft,
 		unsigned int node_depth,
 		struct ft_remove_pub *pub,
 		struct ft_flip_txn *retire_txn,
-		const struct ft_parent_hint *held_hint)
+		const struct ft_parent_hint *held_hint,
+		const struct ft_lock_ctx *ctx)
 {
 	int ret;
 	unsigned int type_index;
@@ -2907,7 +2923,7 @@ int ft_node_replace_ptr(struct cds_ft *ft,
 				metadata, parent_node_flag_ptr, n, NULL,
 				node_flag_ptr, node_flag_expected,
 				old_node_ret, is_root, node_depth,
-				false, NULL, retire_txn, held_hint);
+				false, NULL, retire_txn, held_hint, ctx);
 	}
 	if (ret == 0)
 		FT_TP(tree_edge_set, (const void *) ft,
