@@ -674,57 +674,71 @@ pending word, so it was suppressing the only release. Probing whether it ever
 fired returned 0/0 on both arms. It was dropped; the guard fix carries the
 result alone.
 
-### ★ OPEN: one node, two byte-depths
+### The exponential residual was a STACK OF THREE, all now closed
 
-`exponential` / `test_density_stress` still spins. Three defects sit on top of
-each other in `ft_detach_node`; two are fixed, the third is not.
+`test_density_stress` under an exponential spacing spun ~28.8 million retries in
+ONE remove. Three defects sat on top of each other; each was invisible until the
+one above it was fixed.
 
-**Fixed — the anchor of a node starting ON a lock level.** §2 settles it from
-the depth alone: the node is the first boundary at that level, so it anchors on
-itself. The code applied that at depth 0 only and sent every other such node
-through the table, which answers from the path the DESCENT took. For a member
-the descent never passed, the arms return the cursor's node — or NULL, which
-`ft_anchor_meta` dereferences. Measured: two members whose anchors named each
-other, `anchor(B@4)=A` and `anchor(A@5)=B`. An anchor is an ancestor-or-self, so
-that forces `A==B`; the op refused its own marks forever.
+**1. An anchor the definition already settles, looked up in a table.** §2 fixes
+`anchor(X)` from the depth alone when that depth IS a lock level: X starts on the
+level, so X is the first boundary at it. The code applied that at depth 0 only
+and sent every other such node through `ft_descent_anchor`, which answers from
+the path the DESCENT took — handing back the cursor's node for a member off that
+path, or NULL where the descent walked off the trie, which `ft_anchor_meta`
+dereferences.
 
-**Fixed — the orphan walk extends its own descent.** The walk leaves the key
-path, so entering its nodes into the op's descent re-answers the anchor query
-for every lock set resolving after it (the chain-compress fuse, both publish
-guards). All five of the walk's acquires moved together; a lock set split across
-two tables is the same disagreement from inside one op.
+**2. The detach's orphan walk extended the op's descent.** Its `ft_walk_extend`
+re-answered the anchor query for every lock set resolving after it — the
+chain-compress fuse and both publish guards. The walk now extends a copy.
 
-**Open — the walk and the descent date the same node differently:**
+**3. ★ A hop up moved the byte-depth by ONE.** `ft_parent_depth_span` was
+`1U`, argued as *"trivially 1 for every surviving node type … the caller
+iterates one ancestor at a time"*. Iterating one ancestor at a time is exactly
+why the step must be that ancestor's SPAN — a compressed parent consumes its
+whole run, which `ft_node_span` already answers for the DOWNWARD direction in
+`ft_child_depth_of`. The two disagreed in plain sight.
+
+The measurement, descent versus climb on the same flags:
 
 ```
-TBL  lvl=2 clamp=3 bound_start=2 bound=flag(0x..b32)  -> metadata 0x..d18
-ACQ  phase 2  depth=5  node=0x..d18
+descent: ENTER 0x..0a43 start=0 len=1      <- the root
+         ENTER 0x..15a1 start=1 len=1
+         ENTER 0x..0b32 start=2 len=4      <- span FOUR
+climb:   iter_nf=0x..0a43 cur_depth=3 (!)  <- the root, called depth 3
+         ENTER 0x..15a1 start=4            <- same flag, +3
+         ENTER 0x..0b32 start=5            <- same flag, +3
 ```
 
-The descent recorded that node as starting at byte-depth **2**; the walk
-acquires it at **5**. A node has one byte depth, so `anchor()` is being asked
-about one node under two, and answers differently — §1 breaks at the SOURCE, and
-no table rule repairs it.
+Chain `leaf@6 -> @2 (span 4) -> @1 -> @0`: subtracting one three times lands on
+3, short by exactly what the span-4 hop was worth. Every `cur_depth` consumer in
+`ft_detach_node` feeds an anchor derivation, so the wrong depth picked the wrong
+lock level and two members named EACH OTHER as anchors. Per-node ignores depth
+entirely, which is why it never showed there.
 
-★ Hypothesis, unconfirmed: the detach RE-HOMES nodes (the elevation the walk
-exists to clean up), so a node's byte depth changes mid-op — the descent holds
-pre-elevation depths and the walk computes post-elevation ones. If so the
-statement to settle is that **anchor(X) is not stable across an edit that
-re-homes X**, which §3 has only ever closed for the cross-trie graft via the
-EXCLUSIVE-source requirement; a remove's elevation re-homes inside one trie.
-Confirm before designing: print the walk's `nf` beside the table's `bound` flag
-and check they are the same flag, then compare `ft_child_depth_of` at the walk's
-start against the descent's own depth for that node. The cheaper alternative —
-the walk's depth derivation is simply wrong for the skip / elevated encoding —
-has not been ruled out.
+★ Confirming the two-depths reading needed the FLAGS printed on both sides.
+Identical pointers, two start depths — metadata pointers alone would not have
+settled it.
 
-**Also open, same file.** `ft_descent_anchor_at_level`'s
+### Where the coarse arms stand
+
+| arm | before | after |
+|---|---|---|
+| per-node unit / inv | 307/307, 111/111 | unchanged |
+| exponential unit | hung at 231 `test_density_stress` | hangs at **244** `test_merge_compressed_overlap` |
+| exponential inv | — | hangs at **4** |
+| root-only unit | hung at 102, then 109 | 109 (not re-measured since the depth fix) |
+
+Both remaining stops are in the MERGE path rather than remove — a different
+site, the same class. Expect more: a wrong or absent depth anywhere in a
+lock-set derivation is invisible at per-node granularity and fatal under a
+coarse one.
+
+### Still open in ft_descent_anchor_at_level
+
 `a->bound ? a->bound : d->nf` substitutes the CURSOR for a boundary node the
 descent has not entered. Where `bound_start == clamp` the boundary is the
 queried node itself, so the answer is `nf`. Needs `nf` plumbed into that helper.
-
-Status: per-node `unit 307/307`, `inv 111/111`. root-only clean on both tests
-that used to hang, reaching test 109. Exponential still red on one test.
 
 ### Why it cannot land site by site
 
