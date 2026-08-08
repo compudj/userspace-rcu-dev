@@ -494,6 +494,15 @@ struct ft_held_anchor {
 	 * second terminal would record the single word twice.
 	 */
 	bool shared;
+	/*
+	 * The op already holds @node's OWN word -- an EARLIER member of this op
+	 * anchored ON @node, so a coarsened member arrives at a node its own op
+	 * has marked.  Distinct from @shared, which is about the ANCHOR: this one
+	 * says the RETIRE must take the fused shape (drop LOCK, set TOMBSTONE)
+	 * rather than expect a clean word, and that the acquire's node guard is
+	 * redundant -- holding the word already excludes @node's mutators.
+	 */
+	bool node_held;
 };
 
 /*
@@ -509,6 +518,11 @@ struct ft_held_anchor {
  * from the linearization point on, so the window between this sample and the
  * commit needs the engine's read-set arbitration, exactly as the plan's racy
  * parent resolution does.
+ *
+ * ★ THE OP'S OWN MARK IS NOT A PEER'S -- see ft_member_node_snap.  A raw sample
+ * cannot tell them apart, and refusing one's own mark is a refusal no RETRY can
+ * clear (measured: 200M descents and 9M -EAGAIN from ONE detach site, under a
+ * coarse spacing that had anchored an earlier member on this very node).
  */
 static inline
 int ft_held_anchor_sample_node(const struct cds_ft_metadata *node,
@@ -538,6 +552,7 @@ void ft_held_anchor_set(struct ft_held_anchor *h, struct cds_ft_metadata *lock,
 	h->lock_snap = lock_snap;
 	h->node_snap = lock == node ? lock_snap : node_snap;
 	h->shared = false;
+	h->node_held = false;
 }
 
 static
@@ -1450,10 +1465,12 @@ struct ft_lock_ctx {
  */
 static inline
 bool ft_held_set_snap(const struct ft_held_set *h,
-		const struct cds_ft_metadata *meta, uintptr_t *snap)
+		const struct cds_ft_metadata *meta, uintptr_t *snap,
+		bool *ratified)
 {
 	unsigned int i;
 
+	*ratified = true;
 	if (!h)
 		return false;
 	if (h->txn)
@@ -1484,9 +1501,43 @@ const struct ft_descent *ft_lock_ctx_descent(const struct ft_lock_ctx *ctx)
  */
 static inline
 bool ft_lock_ctx_holds(const struct ft_lock_ctx *ctx,
-		const struct cds_ft_metadata *meta, uintptr_t *snap)
+		const struct cds_ft_metadata *meta, uintptr_t *snap,
+		bool *ratified)
 {
-	return ctx && ft_held_set_snap(&ctx->held, meta, snap);
+	*ratified = true;
+	return ctx && ft_held_set_snap(&ctx->held, meta, snap, ratified);
+}
+
+/*
+ * The CLEAN word of a lock-set member whose ANCHOR is a DIFFERENT word.
+ *
+ * ft_held_anchor_sample_node reads the word and refuses it dirty, which is right
+ * for a PEER's mark and wrong for the op's OWN: coarsening routinely anchors an
+ * earlier member ON this very node, so the LOCK a raw sample sees is one this op
+ * set.  Refusing it is a refusal no retry can clear -- the op re-descends and
+ * re-derives the identical plan -- so the held set answers first, with the clean
+ * value that acquire captured.  @held_out says which arm answered: a member
+ * whose node the op holds retires it in the FUSED shape and needs no acquire-time
+ * guard, both of which that flag carries.
+ *
+ * A word held but NOT ratified (the CALLER took it, so this op never sampled it)
+ * falls through to the raw sample, which refuses exactly as before: no snapshot
+ * exists to hand out, and inventing one would retire against a value nothing
+ * vouched for.
+ */
+static inline
+int ft_member_node_snap(const struct ft_lock_ctx *ctx,
+		const struct cds_ft_metadata *node, uintptr_t *node_snap,
+		bool *held_out)
+{
+	bool ratified;
+
+	if (ft_lock_ctx_holds(ctx, node, node_snap, &ratified) && ratified) {
+		*held_out = true;
+		return 0;
+	}
+	*held_out = false;
+	return ft_held_anchor_sample_node(node, node_snap);
 }
 
 /*
@@ -1723,9 +1774,10 @@ int ft_acquire_member_at(const char *fn, int line,
 	struct cds_ft_metadata *lock = ft_anchor_meta(ft, ft_lock_ctx_descent(ctx),
 			nf, node, depth);
 	uintptr_t lock_snap = 0, node_snap = 0, held_snap = 0;
+	bool held_ratified, node_held = false;
 	int ret;
 
-	if (ft_lock_ctx_holds(ctx, lock, &held_snap)) {
+	if (ft_lock_ctx_holds(ctx, lock, &held_snap, &held_ratified)) {
 		/*
 		 * The op holds this word for an earlier member.  @lock_snap stays
 		 * unset: the earlier acquire captured it and owns the terminal,
@@ -1738,14 +1790,26 @@ int ft_acquire_member_at(const char *fn, int line,
 		 * comes from the held set.
 		 */
 		if (lock == node) {
+			/*
+			 * PROBE: a word held by the CALLER rather than by this op
+			 * has no value we ratified, so a member that retires its
+			 * own word cannot get one.  No caller constructs that
+			 * shape (the caller-held word is a re-parent target, not a
+			 * retire target); the assert is what says whether it stays
+			 * that way, rather than a silent zero.
+			 */
+			assert(held_ratified);
 			node_snap = held_snap;
-		} else if (ft_held_anchor_sample_node(node, &node_snap)) {
+			node_held = true;
+		} else if (ft_member_node_snap(ctx, node, &node_snap,
+				&node_held)) {
 			return -EAGAIN;
 		}
 		held->lock = lock;
 		held->lock_snap = 0;
 		held->node_snap = node_snap;
 		held->shared = true;
+		held->node_held = node_held;
 		return 0;
 	}
 #ifdef FEATURE_FT_FAULT_INJECT
@@ -1769,12 +1833,35 @@ int ft_acquire_member_at(const char *fn, int line,
 		return ret;
 	}
 	ft_hold_trace_note(lock, fn, line);
-	if (lock != node && ft_held_anchor_sample_node(node, &node_snap)) {
+	if (lock != node && ft_member_node_snap(ctx, node, &node_snap,
+			&node_held)) {
+#ifdef FEATURE_FT_HOLD_TRACE
+		/*
+		 * The word is dirty and the op's own held set does not explain it.
+		 * Under a single writer that is not contention: report who the
+		 * ledger thinks holds it, which is how the last one of these was
+		 * traced to a mark this same op had taken.
+		 */
+		if (ft_hold_trace_report_ok()) {
+			uintptr_t st = CMM_LOAD_SHARED(node->state);
+			unsigned int k = ft_hold_trace_n;
+			const char *who = "not in ledger";
+
+			while (k--)
+				if (ft_hold_trace[k].lock == node) {
+					who = ft_hold_trace[k].fn;
+					break;
+				}
+			fprintf(stderr,
+				"FT NODE-WORD DIRTY: %s:%d node=%p state=%lx held-by=%s\n",
+				fn, line, (void *) node, (unsigned long) st, who);
+		}
+#endif
 		ft_meta_lock_release(lock);
 		return -EAGAIN;
 	}
 	ft_held_anchor_set(held, lock, lock_snap, node, node_snap);
-	held->shared = false;
+	held->node_held = node_held;
 	return 0;
 }
 
@@ -2146,7 +2233,8 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 	for (i = 0; i < nr; i++) {
 		struct cds_ft_metadata *node, *lock;
 		uintptr_t node_snap = 0, lock_snap, held_snap = 0;
-		bool coarsened, deduped = false;
+		bool coarsened, deduped = false, held_ratified = true;
+		bool node_held = false;
 
 		if (!set[i].nf)
 			continue;
@@ -2163,9 +2251,17 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 		 * per-node acquire gives for free.
 		 */
 		if (coarsened) {
-			if (ft_held_anchor_sample_node(node, &node_snap))
+			if (ft_member_node_snap(ctx, node, &node_snap,
+					&node_held))
 				goto eagain;
-			ft_held_anchor_guard_node(acq, node, node_snap);
+			/*
+			 * A word this op already HOLDS needs no such guard: the
+			 * mark is the exclusion the guard approximates, it is
+			 * already in force, and validating the CLEAN value against
+			 * a word carrying the op's own LOCK aborts every attempt.
+			 */
+			if (!node_held)
+				ft_held_anchor_guard_node(acq, node, node_snap);
 		}
 		/*
 		 * The guard is a read-set validation of the MEMBER's own
@@ -2184,7 +2280,7 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 		 * has no acquire of its own to sample it (a fresh read would
 		 * return the op's own LOCK).
 		 */
-		if (!ft_lock_ctx_holds(ctx, lock, &held_snap)) {
+		if (!ft_lock_ctx_holds(ctx, lock, &held_snap, &held_ratified)) {
 			unsigned int k;
 
 			for (k = 0; k < nr_taken; k++) {
@@ -2198,12 +2294,16 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 			deduped = true;
 		}
 		if (deduped) {
-			if (!coarsened)
+			if (!coarsened) {
+				assert(held_ratified);	/* see ft_acquire_member */
 				node_snap = held_snap;
+				node_held = true;
+			}
 			set[i].held.lock = lock;
 			set[i].held.lock_snap = 0;
 			set[i].held.node_snap = node_snap;
 			set[i].held.shared = true;
+			set[i].held.node_held = node_held;
 			continue;
 		}
 		if (ft_dlm_lock(acq, lock, &lock_snap)) {
@@ -2214,6 +2314,7 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 		taken[nr_taken++] = lock;
 		ft_held_anchor_set(&set[i].held, lock, lock_snap, node,
 			node_snap);
+		set[i].held.node_held = node_held;
 	}
 	if (ft_flip_txn_commit((struct cds_ft *) ft, acq) != URCU_TXN_STATUS_OK)
 		return -EAGAIN;		/* commit freed @acq; nothing acquired */
@@ -3203,8 +3304,15 @@ static inline
 void ft_flip_txn_record_retire_anchored(struct ft_flip_txn *t,
 		const struct ft_held_anchor *h, struct cds_ft_metadata *node)
 {
-	if (h->lock == node) {
-		if (caa_unlikely(h->shared)) {
+	if (h->lock == node || h->node_held) {
+		/*
+		 * The op holds @node's OWN word, whether because the member
+		 * anchored on itself or because an EARLIER member of this op did.
+		 * Either way the retire is the FUSED transition -- drop LOCK, set
+		 * TOMBSTONE -- never a clean-word expected old, which would name a
+		 * value the word has not carried since that mark landed.
+		 */
+		if (caa_unlikely(h->shared || h->node_held)) {
 			/*
 			 * The op already held the very node it now retires: an
 			 * earlier member ANCHORED on @node, and that acquire kept
