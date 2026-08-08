@@ -1336,8 +1336,14 @@ int ft_detach_node(struct cds_ft *ft,
 	 * clearing: one unconditional ft_meta_lock_release_if_held sweep at @end
 	 * releases every held mark and no-ops on the ones a successful commit already
 	 * consumed (TOMBSTONE), needing no per-commit "consumed" bookkeeping.
+	 *
+	 * Sized for the chain PLUS the trailing skip-target, which is one more
+	 * orphan and belongs in the same array: a mark kept in a variable of its
+	 * own is a mark no later acquire can see, and a coarse spacing then lands
+	 * the next member's anchor on it (the op waits on itself; remove_all has
+	 * no retry loop, so that surfaces as MEMORY_ERROR).
 	 */
-	struct ft_held_anchor orphan_held[FT_MAX_DEPTH];
+	struct ft_held_anchor orphan_held[FT_MAX_DEPTH + 1];
 	int nr_orphan_locked = 0;
 	/*
 	 * This op's lock context: the caller's anchor source, plus the words
@@ -1358,8 +1364,12 @@ int ft_detach_node(struct cds_ft *ft,
 	 */
 	struct ft_descent wd;
 	bool wd_valid = false;
-	struct cds_ft_metadata *orphan_trailing_meta = NULL;
-	struct ft_held_anchor orphan_trailing_held = { 0 };
+	/*
+	 * The trailing skip-target's mark, IN @orphan_held (never a copy): the
+	 * held set is what the next acquire consults, and the freeze needs the
+	 * same entry the release sweep will clear.  NULL until it is taken.
+	 */
+	struct ft_held_anchor *orphan_trailing_held = NULL;
 	bool retire_glue_fused = false;
 	bool freeze_leaf_fused = false;
 	struct cds_ft_node *topmost_external_nodes = NULL;
@@ -2026,11 +2036,14 @@ int ft_detach_node(struct cds_ft *ft,
 							ft_compressed_node_flag(
 								trailing_skip_cn),
 								walk_depth, tm,
-							&orphan_trailing_held)) {
+							&orphan_held[nr_orphan_locked])) {
 						ret = -EAGAIN;
 						goto end;
 					}
-					orphan_trailing_meta = tm;
+					orphan_trailing_held =
+						&orphan_held[nr_orphan_locked++];
+					lctx.held.nr_extra =
+						(unsigned int) nr_orphan_locked;
 				}
 			}
 		}
@@ -2076,7 +2089,7 @@ int ft_detach_node(struct cds_ft *ft,
 					(struct cds_ft_inode *) trailing_skip_cn);
 				if (ft->lock_fine)
 					ft_detach_freeze_one(orphan_txn,
-						&orphan_trailing_held, m);
+						orphan_trailing_held, m);
 				else
 					ft_flip_txn_record_tombstone(orphan_txn, m);
 			}
@@ -2394,11 +2407,14 @@ int ft_detach_node(struct cds_ft *ft,
 						if (ft_detach_orphan_acquire(ft,
 								&lctx, walk_nf,
 								walk_depth, tm,
-								&orphan_trailing_held)) {
+								&orphan_held[nr_orphan_locked])) {
 							ret = -EAGAIN;
 							goto end;
 						}
-						orphan_trailing_meta = tm;
+						orphan_trailing_held =
+							&orphan_held[nr_orphan_locked++];
+						lctx.held.nr_extra = (unsigned int)
+							nr_orphan_locked;
 					}
 				}
 			}
@@ -2488,7 +2504,7 @@ int ft_detach_node(struct cds_ft *ft,
 						to_free, nr_to_free,
 						trailing_skip_cn_flag,
 						ft->lock_fine ? orphan_held : NULL,
-						&orphan_trailing_held,
+						orphan_trailing_held,
 						freeze_leaf,
 						count_delta,
 						ft->rank_stats ? detach_depth + 1 : 0);
@@ -2637,7 +2653,7 @@ int ft_detach_node(struct cds_ft *ft,
 					(pub && commit_txn) ? commit_txn : NULL,
 					to_free, nr_to_free, trailing_skip_cn_flag,
 					ft->lock_fine ? orphan_held : NULL,
-					&orphan_trailing_held);
+					orphan_trailing_held);
 			/*
 			 * A caller-supplied external retire set (@retire_glue: the
 			 * merge src-side glue's overlap-spine free-list, freed by the
@@ -3072,8 +3088,10 @@ end:
 	 * (including a mark-miss mid-collection, which jumps here) the fenced
 	 * tombstone never applied, so the marks are still {LOCK|s} and get
 	 * released here -- the structure returns byte-for-byte to its pre-op state.
-	 * One sweep covers both Block A and Block B (mutually exclusive) and every
-	 * commit outcome (in-place / recompaction / shape-D), no "consumed" tracking.
+	 * One sweep covers both Block A and Block B (mutually exclusive), the
+	 * trailing skip-target (an entry of @orphan_held like any other) and every
+	 * commit outcome (in-place / recompaction / shape-D), no "consumed"
+	 * tracking.
 	 */
 	{
 		int oi;
@@ -3082,8 +3100,6 @@ end:
 			if (!orphan_held[oi].shared)
 				ft_meta_lock_release_if_held(
 					orphan_held[oi].lock);
-		if (orphan_trailing_meta && !orphan_trailing_held.shared)
-			ft_meta_lock_release_if_held(orphan_trailing_held.lock);
 	}
 	/*
 	 * nr_keys fold (LEAF Increment 2): no abort rollback needed.  Every
