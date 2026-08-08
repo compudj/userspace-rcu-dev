@@ -650,13 +650,18 @@ unsigned int ft_walk_extend(struct ft_descent *d, bool valid,
  * MEMORY_ERROR.
  */
 static inline
-int ft_detach_orphan_acquire(const struct cds_ft *ft,
+int ft_detach_orphan_acquire_at(const char *fn, int line,
+		const struct cds_ft *ft,
 		const struct ft_lock_ctx *ctx, struct cds_ft_inode_flag *nf,
 		unsigned int depth, struct cds_ft_metadata *m,
 		struct ft_held_anchor *held)
 {
-	return ft_acquire_member(ft, ctx, nf, m, depth, held);
+	return ft_acquire_member_at(fn, line, ft, ctx, nf, m, depth, held);
 }
+
+#define ft_detach_orphan_acquire(ft, ctx, nf, depth, m, held)		\
+	ft_detach_orphan_acquire_at(__func__, __LINE__, (ft), (ctx),	\
+		(nf), (depth), (m), (held))
 
 static inline
 int ft_detach_orphan_planlock(const struct cds_ft *ft,

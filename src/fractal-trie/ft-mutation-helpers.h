@@ -1075,6 +1075,102 @@ static void ft_flip_txn_call_rcu_now(struct rcu_head *head,
 	func(head);
 }
 
+#ifdef FEATURE_FT_HOLD_TRACE
+/*
+ * TEST-ONLY LEDGER of the words this thread currently holds, with the SITE that
+ * took each one.  It answers the one question the -EAGAIN cannot: a refused
+ * acquire says the word is LOCKed, never by WHOM, and under a coarse spacing the
+ * whom is usually the refusing op itself.
+ *
+ * Maintained at the primitives rather than at the choke point so it sees every
+ * hold regardless of which registry (if any) the op filed it in -- that
+ * mismatch is the defect being measured.
+ */
+#define FT_HOLD_TRACE_MAX	1024
+struct ft_hold_trace_ent {
+	const struct cds_ft_metadata *lock;
+	const char *fn;
+	int line;
+};
+static __thread struct ft_hold_trace_ent ft_hold_trace[FT_HOLD_TRACE_MAX];
+static __thread unsigned int ft_hold_trace_n;
+
+static inline
+void ft_hold_trace_note(const struct cds_ft_metadata *lock, const char *fn,
+		int line)
+{
+	if (ft_hold_trace_n >= FT_HOLD_TRACE_MAX)
+		return;
+	ft_hold_trace[ft_hold_trace_n].lock = lock;
+	ft_hold_trace[ft_hold_trace_n].fn = fn;
+	ft_hold_trace[ft_hold_trace_n].line = line;
+	ft_hold_trace_n++;
+}
+
+static inline
+void ft_hold_trace_drop(const struct cds_ft_metadata *lock)
+{
+	unsigned int i = ft_hold_trace_n;
+
+	while (i--) {
+		if (ft_hold_trace[i].lock == lock) {
+			ft_hold_trace[i] = ft_hold_trace[--ft_hold_trace_n];
+			return;
+		}
+	}
+}
+
+/*
+ * An acquire was refused.  Report it as a SELF-collision only when the word
+ * really carries LOCK and this thread's ledger names it: any other dirty bit is
+ * an ordinary peer refusal.  The tail of the ledger is printed too, because a
+ * commit that CONSUMED a fence (a fenced tombstone leaves TOMBSTONE, no LOCK)
+ * never calls a release and so leaves its entry behind.
+ */
+static inline
+void ft_hold_trace_refused(const struct cds_ft_metadata *lock, const char *fn,
+		int line)
+{
+	unsigned int i = ft_hold_trace_n;
+
+	if (!(CMM_LOAD_SHARED(lock->state) & FT_STATE_LOCK))
+		return;
+	while (i--) {
+		if (ft_hold_trace[i].lock != lock)
+			continue;
+		fprintf(stderr,
+			"FT SELF-COLLISION: %s:%d refused word %p, taken at %s:%d (ledger %u deep)\n",
+			fn, line, (const void *) lock, ft_hold_trace[i].fn,
+			ft_hold_trace[i].line, ft_hold_trace_n);
+		for (i = ft_hold_trace_n; i-- > 0 && i + 8 >= ft_hold_trace_n;)
+			fprintf(stderr, "  held[%u] %p %s:%d\n", i,
+				(const void *) ft_hold_trace[i].lock,
+				ft_hold_trace[i].fn, ft_hold_trace[i].line);
+		abort();
+	}
+}
+#else
+static inline
+void ft_hold_trace_note(const struct cds_ft_metadata *lock, const char *fn,
+		int line)
+{
+	(void) lock; (void) fn; (void) line;
+}
+
+static inline
+void ft_hold_trace_drop(const struct cds_ft_metadata *lock)
+{
+	(void) lock;
+}
+
+static inline
+void ft_hold_trace_refused(const struct cds_ft_metadata *lock, const char *fn,
+		int line)
+{
+	(void) lock; (void) fn; (void) line;
+}
+#endif	/* FEATURE_FT_HOLD_TRACE */
+
 /*
  * FT_STATE_LOCK, ACQUIRE side (MW F2, Option A --
  * fractal-trie-internal.h at the bit's definition, CORE_682870 fix plan).  A
@@ -1152,6 +1248,7 @@ int ft_meta_lock_acquire(struct cds_ft_metadata *meta,
 static inline
 void ft_meta_lock_release(struct cds_ft_metadata *meta)
 {
+	ft_hold_trace_drop(meta);
 	for (;;) {
 		uintptr_t s = CMM_LOAD_SHARED(meta->state);
 
@@ -1202,6 +1299,7 @@ void ft_meta_lock_release(struct cds_ft_metadata *meta)
 static inline
 void ft_meta_lock_release_if_held(struct cds_ft_metadata *meta)
 {
+	ft_hold_trace_drop(meta);
 	for (;;) {
 		uintptr_t s = CMM_LOAD_SHARED(meta->state);
 
@@ -1342,7 +1440,8 @@ void ft_lock_ctx_init(struct ft_lock_ctx *ctx, const struct ft_descent *d,
  * sites pay for the lookup.
  */
 static inline
-bool ft_lock_ctx_depth_of(const struct cds_ft *ft,
+bool ft_lock_ctx_depth_of_at(const char *fn, int line,
+		const struct cds_ft *ft,
 		const struct ft_lock_ctx *ctx,
 		const struct cds_ft_inode_flag *nf, unsigned int *depth)
 {
@@ -1443,7 +1542,8 @@ unsigned int ft_freeze_reserve(const struct cds_ft *ft, unsigned int n)
  * pays for it with a sample-then-guard instead.
  */
 static inline
-int ft_acquire_member(const struct cds_ft *ft, const struct ft_lock_ctx *ctx,
+int ft_acquire_member_at(const char *fn, int line,
+		const struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		struct cds_ft_inode_flag *nf, struct cds_ft_metadata *node,
 		unsigned int depth, struct ft_held_anchor *held)
 {
@@ -1482,8 +1582,11 @@ int ft_acquire_member(const struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 	}
 #endif
 	ret = ft_meta_lock_acquire(lock, &lock_snap);
-	if (ret)
+	if (ret) {
+		ft_hold_trace_refused(lock, fn, line);
 		return ret;
+	}
+	ft_hold_trace_note(lock, fn, line);
 	if (lock != node && ft_held_anchor_sample_node(node, &node_snap)) {
 		ft_meta_lock_release(lock);
 		return -EAGAIN;
@@ -1492,6 +1595,10 @@ int ft_acquire_member(const struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 	held->shared = false;
 	return 0;
 }
+
+#define ft_acquire_member(ft, ctx, nf, node, depth, held)		\
+	ft_acquire_member_at(__func__, __LINE__, (ft), (ctx), (nf),	\
+		(node), (depth), (held))
 
 /*
  * Drop every RELEASE-terminal lock the op holds, leaving the nodes LIVE: the
@@ -1600,8 +1707,19 @@ enum urcu_txn_status ft_flip_txn_commit(struct cds_ft *ft,
 	 * parked nothing, so both must clear the reversible bit or the still-live
 	 * nodes would fail every later peer guard forever.
 	 */
-	if (caa_unlikely(st != URCU_TXN_STATUS_OK))
+	if (caa_unlikely(st != URCU_TXN_STATUS_OK)) {
 		ft_flip_txn_lock_release_all(t);
+	} else {
+		unsigned int i;
+
+		/*
+		 * The terminals above are how a COMMITTED registered lock stops
+		 * being held: no ft_meta_lock_release runs, so the trace ledger
+		 * would otherwise keep the word forever.
+		 */
+		for (i = 0; i < t->nr_locks; i++)
+			ft_hold_trace_drop(t->locks[i]);
+	}
 	free(t);
 	return st;
 }
@@ -1816,7 +1934,8 @@ struct ft_dlm_member {
  * ft_held_set documents, not an optimisation.
  */
 static inline
-int ft_dlm_acquire_set(const struct cds_ft *ft, const struct ft_lock_ctx *ctx,
+int ft_dlm_acquire_set_at(const char *fn, int line,
+		const struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		struct ft_dlm_member *set, int nr)
 {
 	struct cds_ft_metadata *taken[FT_FLIP_TXN_MAX_LOCKS];
@@ -1883,19 +2002,26 @@ int ft_dlm_acquire_set(const struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 			set[i].held.shared = true;
 			continue;
 		}
-		if (ft_dlm_lock(acq, lock, &lock_snap))
+		if (ft_dlm_lock(acq, lock, &lock_snap)) {
+			ft_hold_trace_refused(lock, fn, line);
 			goto eagain;
+		}
 		taken[nr_taken++] = lock;
 		ft_held_anchor_set(&set[i].held, lock, lock_snap, node,
 			node_snap);
 	}
 	if (ft_flip_txn_commit((struct cds_ft *) ft, acq) != URCU_TXN_STATUS_OK)
 		return -EAGAIN;		/* commit freed @acq; nothing acquired */
+	for (i = 0; i < (int) nr_taken; i++)
+		ft_hold_trace_note(taken[i], fn, line);
 	return 0;
 eagain:
 	ft_flip_txn_destroy(acq);
 	return -EAGAIN;			/* nothing acquired (all-or-none) */
 }
+
+#define ft_dlm_acquire_set(ft, ctx, set, nr)				\
+	ft_dlm_acquire_set_at(__func__, __LINE__, (ft), (ctx), (set), (nr))
 
 /*
  * FT-local order-pinned insert-between (was the engine's
