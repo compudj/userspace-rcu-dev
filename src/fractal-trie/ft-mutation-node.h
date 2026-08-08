@@ -2236,7 +2236,7 @@ skip_copy:
 				ft_flip_txn_record_anchor_release(retire_txn,
 					&c_held, metadata);
 				ft_flip_txn_lock_register(retire_txn,
-					c_held.lock);
+					c_held.lock, c_held.lock_snap);
 			}
 			ft_flip_txn_record_retire_anchored(retire_txn, &c_held,
 					metadata);
@@ -2265,7 +2265,8 @@ skip_copy:
 			continue;
 		ft_flip_txn_record_release_lock(retire_txn, rel_held[ri].lock,
 				rel_held[ri].lock_snap);
-		ft_flip_txn_lock_register(retire_txn, rel_held[ri].lock);
+		ft_flip_txn_lock_register(retire_txn, rel_held[ri].lock,
+			rel_held[ri].lock_snap);
 	}
 
 	ret = 0;

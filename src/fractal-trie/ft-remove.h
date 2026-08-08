@@ -157,7 +157,8 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			if (!cn_held.shared) {
 				ft_flip_txn_record_release_lock(txn, cn_held.lock,
 					cn_held.lock_snap);
-				ft_flip_txn_lock_register(txn, cn_held.lock);
+				ft_flip_txn_lock_register(txn, cn_held.lock,
+					cn_held.lock_snap);
 			}
 		}
 		/*
@@ -382,11 +383,13 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			 */
 			ft_flip_txn_record_anchor_release(txn, &src_held,
 				src_cn_meta_a);
-			ft_flip_txn_lock_register(txn, src_held.lock);
+			ft_flip_txn_lock_register(txn, src_held.lock,
+				src_held.lock_snap);
 			if (pub_parent && !set[1].held.shared) {
 				ft_flip_txn_record_release_lock(txn,
 					set[1].held.lock, set[1].held.lock_snap);
-				ft_flip_txn_lock_register(txn, set[1].held.lock);
+				ft_flip_txn_lock_register(txn, set[1].held.lock,
+					set[1].held.lock_snap);
 			}
 			dlm_a2 = true;
 		}
@@ -739,7 +742,7 @@ void ft_chain_compress_register_retire(struct ft_flip_txn *txn,
 	if (h->shared)
 		return;
 	ft_flip_txn_record_anchor_release(txn, h, node);
-	ft_flip_txn_lock_register(txn, h->lock);
+	ft_flip_txn_lock_register(txn, h->lock, h->lock_snap);
 }
 
 /*

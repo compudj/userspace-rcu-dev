@@ -464,29 +464,6 @@ struct cds_ft_metadata *ft_anchor_meta(const struct cds_ft *ft,
 }
 
 /*
- * Has @meta already been acquired by this op?  Coarsening maps several members
- * onto ONE anchor, and a second ft_dlm_lock / ft_meta_lock_acquire on a node the
- * op already holds aborts -EAGAIN -- so a site with more than one member must
- * test before acquiring, and record the terminal ONCE (§7.3: dedupe the LOCKS,
- * keep ALL the guards; release/retire stay per-anchor).
- *
- * Linear over @n because a lock-set is small: the path members number <= 5, and
- * a fan-out either collapses to ONE anchor for every child or gives each child
- * its own, so neither shape wants a hash.
- */
-static inline
-bool ft_anchor_held(struct cds_ft_metadata *const *held, unsigned int n,
-		const struct cds_ft_metadata *meta)
-{
-	unsigned int i;
-
-	for (i = 0; i < n; i++)
-		if (held[i] == meta)
-			return true;
-	return false;
-}
-
-/*
  * A HELD lock-set member, once coarsening has split a node's two words apart.
  *
  * @lock is the word the acquire actually CAS'd -- the member's ANCHOR -- with
@@ -761,8 +738,17 @@ struct ft_flip_txn {
 	 * every later peer publish into the node aborts forever.  The two
 	 * terminal paths drain this registry so no caller unwind can leak a
 	 * lock.
+	 *
+	 * Each entry carries the CLEAN word the acquire captured, because the
+	 * registry is half of the op's HELD SET: a later member that coarsens
+	 * onto a registered word deduplicates against it and has no snapshot of
+	 * its own, while its plan re-validation and its retire both need the
+	 * value the FIRST acquire ratified.
 	 */
-	struct cds_ft_metadata *locks[FT_FLIP_TXN_MAX_LOCKS];
+	struct ft_flip_txn_lock {
+		struct cds_ft_metadata *meta;
+		uintptr_t snap;
+	} locks[FT_FLIP_TXN_MAX_LOCKS];
 	unsigned int nr_locks;
 	/*
 	 * Set when a per-node lock acquire MISSED (see
@@ -1188,6 +1174,7 @@ void ft_hold_trace_drop(const struct cds_ft_metadata *lock)
 	(void) lock;
 }
 
+
 static inline
 void ft_hold_trace_refused(const struct cds_ft_metadata *lock, const char *fn,
 		int line)
@@ -1347,13 +1334,19 @@ void ft_meta_lock_release_if_held(struct cds_ft_metadata *meta)
  * a commit OK consumes it through the recorded {LOCK|s -> TOMBSTONE|s}
  * transition instead.  Register only once the mark's holder can no longer
  * clear it itself (i.e. when the op hands the outcome to the txn).
+ *
+ * @snap is the CLEAN word the acquire captured: the registry doubles as half
+ * the op's held set, and a later member that coarsens onto this word carries no
+ * snapshot of its own.
  */
 static inline
 void ft_flip_txn_lock_register(struct ft_flip_txn *t,
-		struct cds_ft_metadata *meta)
+		struct cds_ft_metadata *meta, uintptr_t snap)
 {
 	assert(t->nr_locks < FT_FLIP_TXN_MAX_LOCKS);
-	t->locks[t->nr_locks++] = meta;
+	t->locks[t->nr_locks].meta = meta;
+	t->locks[t->nr_locks].snap = snap;
+	t->nr_locks++;
 }
 
 #ifdef FEATURE_FT_FAULT_INJECT
@@ -1409,19 +1402,45 @@ struct ft_lock_ctx {
 	struct urcu_txn *op;
 };
 
+/*
+ * Does the op hold @meta, and with WHAT snapshot?
+ *
+ * Coarsening maps several members onto ONE anchor, and a second acquire on a
+ * word the op already holds aborts -EAGAIN -- so a site with more than one
+ * member must test before acquiring, and record the terminal ONCE (§7.3: dedupe
+ * the LOCKS, keep ALL the guards).  Linear scans, because a lock-set is small:
+ * the path members number <= 5, and a fan-out either collapses to ONE anchor
+ * for every child or gives each child its own, so neither shape wants a hash.
+ *
+ * ★ The word alone is not enough.  A member that deduped onto a word the op
+ * already holds has no snapshot of its own -- the acquire never ran -- yet it
+ * still needs the CLEAN pre-mark value: to re-validate its plan against the
+ * word (a boundary's nr_child), and, where the word IS its own node, to retire
+ * against it.  Only the FIRST acquire has that value, so the held set must
+ * carry it.  @snap is left untouched when the word is not held.
+ *
+ * Entries in @extra that are themselves deduped (`shared`) carry no snapshot
+ * and are skipped: the one non-shared entry for a word is the acquire.
+ */
 static inline
-bool ft_held_set_contains(const struct ft_held_set *h,
-		const struct cds_ft_metadata *meta)
+bool ft_held_set_snap(const struct ft_held_set *h,
+		const struct cds_ft_metadata *meta, uintptr_t *snap)
 {
 	unsigned int i;
 
 	if (!h)
 		return false;
-	if (h->txn && ft_anchor_held(h->txn->locks, h->txn->nr_locks, meta))
-		return true;
+	if (h->txn)
+		for (i = 0; i < h->txn->nr_locks; i++)
+			if (h->txn->locks[i].meta == meta) {
+				*snap = h->txn->locks[i].snap;
+				return true;
+			}
 	for (i = 0; i < h->nr_extra; i++)
-		if (h->extra[i].lock == meta)
+		if (h->extra[i].lock == meta && !h->extra[i].shared) {
+			*snap = h->extra[i].lock_snap;
 			return true;
+		}
 	return false;
 }
 
@@ -1431,11 +1450,15 @@ const struct ft_descent *ft_lock_ctx_descent(const struct ft_lock_ctx *ctx)
 	return ctx ? ctx->d : NULL;
 }
 
+/*
+ * The op holds @meta: @snap receives the acquire's clean word (see
+ * ft_held_set_snap).  Pass a scratch uintptr_t where the value is not wanted.
+ */
 static inline
 bool ft_lock_ctx_holds(const struct ft_lock_ctx *ctx,
-		const struct cds_ft_metadata *meta)
+		const struct cds_ft_metadata *meta, uintptr_t *snap)
 {
-	return ctx && ft_held_set_contains(&ctx->held, meta);
+	return ctx && ft_held_set_snap(&ctx->held, meta, snap);
 }
 
 /*
@@ -1752,7 +1775,7 @@ void ft_flip_txn_lock_release_all(struct ft_flip_txn *t)
 	unsigned int i;
 
 	for (i = 0; i < t->nr_locks; i++)
-		ft_meta_lock_release(t->locks[i]);
+		ft_meta_lock_release(t->locks[i].meta);
 	t->nr_locks = 0;
 }
 
@@ -1848,7 +1871,7 @@ enum urcu_txn_status ft_flip_txn_commit(struct cds_ft *ft,
 		 * would otherwise keep the word forever.
 		 */
 		for (i = 0; i < t->nr_locks; i++)
-			ft_hold_trace_drop(t->locks[i]);
+			ft_hold_trace_drop(t->locks[i].meta);
 	}
 	free(t);
 	return st;
@@ -3095,12 +3118,32 @@ void ft_flip_txn_record_release_lock(struct ft_flip_txn *t,
  * rule describes.  A no-op when the lock IS the retired node's word: the fused
  * terminal covers it, unchanged.
  *
+ * ★ ONE WORD TAKES ONE TERMINAL, AND A RETIRE OUTRANKS A RELEASE.  Coarsening
+ * lets a member anchor on a node the SAME op retires: this member wants the
+ * anchor to survive, that one kills it, and a node's fate belongs to the op's
+ * PLAN, not to the order its members were acquired.  Recording both poisons the
+ * txn either way round -- {LOCK|s -> s} and {LOCK|s -> TOMBSTONE|s} carry the
+ * same expected old, so whichever lands second mismatches the first's pending
+ * new and record_chain sets t->poisoned, permanently (the ordering rule on
+ * ft_flip_txn_record_release_lock).  So the release YIELDS: if this txn's own
+ * pending view of the word already shows TOMBSTONE, the op has retired the
+ * anchor and that record is the terminal.  The other order needs nothing here
+ * -- the later retire chains onto the release's clean pending value.
+ *
+ * The read is READ-YOUR-OWN-WRITES for the reason spelled out on
+ * ft_flip_txn_record_tombstone: the word is in this record's own write set, so
+ * the engine's read policy requires it be read through the txn.  A TOMBSTONE
+ * seen here can only be OURS -- a peer's would have failed the acquire that
+ * gave us @h.
+ *
  * Costs ONE MORE reserved edge than the fused form; @t must have budgeted it.
  */
 static inline
 void ft_flip_txn_record_anchor_release(struct ft_flip_txn *t,
 		const struct ft_held_anchor *h, const struct cds_ft_metadata *node)
 {
+	uintptr_t pending;
+
 	/*
 	 * A member that deduped onto a word the op already holds owes no
 	 * release: the acquire that first took the word recorded one, and a
@@ -3110,6 +3153,10 @@ void ft_flip_txn_record_anchor_release(struct ft_flip_txn *t,
 	assert(!h->shared);
 	if (h->lock == node)
 		return;
+	pending = (uintptr_t) urcu_txn_load(t->mtxn, (void **) &h->lock->state,
+			FT_STATE_PROXY);
+	if (caa_unlikely(pending & FT_STATE_TOMBSTONE))
+		return;			/* the op retires the anchor itself */
 	ft_flip_txn_record_release_lock(t, h->lock, h->lock_snap);
 }
 
@@ -3118,29 +3165,43 @@ void ft_flip_txn_record_anchor_release(struct ft_flip_txn *t,
  * word, plain once ft_flip_txn_record_anchor_release has lifted the lock off a
  * surviving ancestor.
  *
- * Either way the expected old is a snapshot taken at the ACQUIRE, never re-read
- * here, which is what keeps the fenced contract: a peer state change on the
- * retired node between the acquire and the commit aborts this op instead of
- * being ratified by a coincidentally-matching late capture.
+ * The expected old is a snapshot taken at the ACQUIRE, never re-read here,
+ * which is what keeps the fenced contract: a peer state change on the retired
+ * node between the acquire and the commit aborts this op instead of being
+ * ratified by a coincidentally-matching late capture.
  */
 static inline
 void ft_flip_txn_record_retire_anchored(struct ft_flip_txn *t,
 		const struct ft_held_anchor *h, struct cds_ft_metadata *node)
 {
-	/*
-	 * A retire needs @node's CLEAN pre-mark word as its expected old, and
-	 * the acquire that captured it is the only place it exists.  A member
-	 * that deduped onto @node's OWN word -- the op already held the very
-	 * node it now retires -- has no such snapshot here: the earlier acquire
-	 * kept it, and re-reading the word would sample the op's own LOCK.
-	 *
-	 * No caller constructs that shape today.  It becomes constructible only
-	 * once a spacing maps a member onto a node the same op retires (root-only
-	 * over a root retire is the candidate), so this assert is the probe that
-	 * says whether it is reachable, rather than an argument that it is not.
-	 */
-	assert(!(h->shared && h->lock == node));
 	if (h->lock == node) {
+		if (caa_unlikely(h->shared)) {
+			/*
+			 * The op already held the very node it now retires: an
+			 * earlier member ANCHORED on @node, and that acquire kept
+			 * the clean snapshot this retire would want.  There is no
+			 * snapshot in @h to use -- a deduped member carries none --
+			 * so take the word's value from THIS txn (read-your-own-
+			 * writes), which is exact for both shapes the collapse
+			 * produces: an earlier release on @node returns its clean
+			 * pending value and the retire chains onto it, and no
+			 * earlier record returns the committed word, which no peer
+			 * can have moved because we hold it LOCKED.
+			 *
+			 * The transition is the fused one either way -- drop LOCK,
+			 * set TOMBSTONE -- so the mask is what expresses it, and it
+			 * is a no-op where a release already cleared the bit.
+			 */
+			uintptr_t pending = (uintptr_t) urcu_txn_load(t->mtxn,
+					(void **) &node->state, FT_STATE_PROXY);
+
+			ft_flip_txn_record_tag(t, (void **) &node->state,
+				(void *) pending,
+				(void *) ((pending & ~(uintptr_t) FT_STATE_LOCK)
+					| FT_STATE_TOMBSTONE),
+				FT_STATE_PROXY);
+			return;
+		}
 		ft_flip_txn_record_tombstone_locked(t, node, h->lock_snap);
 		return;
 	}
@@ -3317,7 +3378,7 @@ void ft_flip_txn_lock_or_guard_parent_at(const char *fn, int line,
 			}
 			ft_flip_txn_record_release_lock(t, held.lock,
 				held.lock_snap);
-			ft_flip_txn_lock_register(t, held.lock);
+			ft_flip_txn_lock_register(t, held.lock, held.lock_snap);
 			return;
 		}
 		/*
@@ -7663,7 +7724,8 @@ enum urcu_txn_status ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue 
 	if (g->split_cn_holder) {
 		ft_flip_txn_record_tombstone_locked(g->txn, g->split_cn_holder,
 			g->split_cn_snap);
-		ft_flip_txn_lock_register(g->txn, g->split_cn_holder);
+		ft_flip_txn_lock_register(g->txn, g->split_cn_holder,
+			g->split_cn_snap);
 		/*
 		 * OWNERSHIP TRANSFER (mirror publish_parent_holder): once
 		 * registered, the txn OWNS @cn's fence clear -- a commit consumes

@@ -1351,7 +1351,8 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 			 */
 			ft_flip_txn_record_tombstone_locked(dual_txn, dst_rmeta,
 				dst_root_snap);
-			ft_flip_txn_lock_register(dual_txn, dst_rmeta);
+			ft_flip_txn_lock_register(dual_txn, dst_rmeta,
+				dst_root_snap);
 			ft_root_list_swap_publish_dual(dual_txn, &appear,
 				&disappear);
 		}

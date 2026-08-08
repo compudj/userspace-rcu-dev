@@ -1243,7 +1243,7 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 	 * local error path must NOT clear it (the caller's unwind destroys
 	 * @ic->txn, which drains the registry).
 	 */
-	ft_flip_txn_lock_register(ic->txn, held.lock);
+	ft_flip_txn_lock_register(ic->txn, held.lock, held.lock_snap);
 	ft_flip_txn_record_anchor_release(ic->txn, &held, cn_meta);
 	ic->free_old_cn_held = held;
 	/*
@@ -2653,7 +2653,7 @@ int ft_insert_compressed_key_shorter(struct cds_ft *ft,
 	 * The armed txn now owns the fence outcome (registered clear on every
 	 * non-commit terminal; consumed by the fenced tombstone on commit).
 	 */
-	ft_flip_txn_lock_register(ic->txn, held.lock);
+	ft_flip_txn_lock_register(ic->txn, held.lock, held.lock_snap);
 	ft_flip_txn_record_anchor_release(ic->txn, &held, cn_meta);
 	ic->free_old_cn_held = held;
 	/*
