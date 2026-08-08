@@ -544,30 +544,58 @@ Two instances found and closed with it, neither by inspection:
   not a second view.
 * The **spacing was not inert under COARSE** (above).
 
-### ★ OPEN: an anchor that is the node the op RETIRES
+### CLOSED: an anchor that is the node the op RETIRES
 
-`assert(!(h->shared && h->lock == node))` in
-`ft_flip_txn_record_retire_anchored` — armed as a probe, deliberately — now
-FIRES under exponential on `test_rekey_coherence_lookup`. The shape it was
-written for is reachable: `ft_detach_node` acquires an orphan below C, whose
-anchor climbs to C; `ft_node_recompact` then retires C itself and finds its
-member `shared` on C's own word.
+The probe armed in `ft_flip_txn_record_retire_anchored` fired: `ft_detach_node`
+marks an orphan whose anchor climbs to the node `ft_node_recompact` then
+replaces, so the recompact's own member comes back `shared` on the node it is
+about to retire. Two things were missing.
 
-Two things are missing there, and the second is the real one:
+**The snapshot.** A deduped member carries none — the acquire never ran — and
+re-reading the word samples the op's own LOCK. Two consumers needed it and both
+were reading zero: the fenced retire's expected old, and the PLAN
+RE-VALIDATION (`ft_chain_compress_fused` reads its boundary's `nr_child` out of
+`node_snap`, so a deduped member failed the check and the merge re-planned into
+the same shape). The txn's `locks[]` registry therefore stores the snapshot
+beside the word, `ft_held_set_snap` returns the FIRST acquire's, and both choke
+points fill `node_snap` from it wherever the word IS the member's own node.
 
-1. **The snapshot.** A retire needs the node's CLEAN pre-mark word as expected
-   old, and only the first acquire has it. The dedupe path returns
-   `lock_snap = 0`, so the held set must carry SNAPS, not just words.
-2. **The terminal.** One word takes exactly ONE terminal, and the two members
-   want different ones: the orphan's anchor wants `{LOCK|s -> s}` (C survives),
-   C's own member wants `{LOCK|s -> TOMBSTONE|s}` (C dies). The retire is the
-   correct answer — a node's fate is a property of the op's plan, not of the
-   order its members were acquired — so a release recorded earlier for that
-   word must be superseded, not added to. The engine composes same-slot records
-   by read-your-own-writes, so a release then a retire IN THAT ORDER and in ONE
-   txn already chains ({LOCK|s -> s} then {s -> TOMBSTONE|s}); today the two can
-   land in different txns and in the wrong order (`ft_detach_freeze_orphans`
-   runs AFTER `ft_node_replace_ptr` on the Block B path).
+★ **ONE WORD TAKES ONE TERMINAL, AND A RETIRE OUTRANKS A RELEASE.** One member
+wants the anchor to survive, the other kills it, and a node's fate belongs to
+the op's PLAN, not to the order its members were acquired. Recording both
+poisons the txn either way round — the two carry the same expected old, so
+whichever lands second mismatches the first's pending new and `record_chain`
+sets `t->poisoned`, permanently. So the release YIELDS to a pending TOMBSTONE,
+and a retire that follows a release chains onto its clean pending value instead
+of re-asserting the mark.
+
+### The glue's anchor source, and how a livelock announces itself
+
+A glue's own acquires fire from commit helpers that never see a descent, so
+`ft_glue::lock_d` is how they get one — and only the graft's store-prepare set
+it. With it NULL, a coarse acquire has no depth, MISSES, aborts the commit, and
+the caller retries into the identical shape. That is a LIVELOCK, and the suite
+does not report it: it announced itself as **25 GB of one repeated diagnostic**.
+Hence the report cap on `FEATURE_FT_HOLD_TRACE` — an unbounded report of a
+refusal a retry loop re-derives is not a report.
+
+`lock_d` is now set where the descent is CREATED (`ft_graft_build`), because
+`ft_merge_graft_subpos_inplace` reaches the commit without passing through the
+consumer that used to set it.
+
+### ★ OPEN: two more marks held outside the visible set
+
+Both coarse arms now run clean to the point where the detector names a genuine
+self-collision, one per arm — the same class as the trailing skip-target, a
+mark the next acquire cannot see:
+
+| arm | refused at | taken at |
+|---|---|---|
+| exponential (stops after 111) | `ft_rekey_cow_lock_child` | `ft_rekey_cow_stop` |
+| root-only (stops after 101) | `ft_flip_txn_lock_or_guard_parent` (the glue publish) | `ft_split_compressed_graft_build` |
+
+Root-only is the sharper arm as predicted: every anchor collapses onto the root,
+so the glue's split-CN fence and its publish parent are the same word.
 
 ### Why it cannot land site by site
 
