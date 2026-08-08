@@ -583,19 +583,60 @@ refusal a retry loop re-derives is not a report.
 `ft_merge_graft_subpos_inplace` reaches the commit without passing through the
 consumer that used to set it.
 
-### ★ OPEN: two more marks held outside the visible set
+### The self-refusal class, closed on both words
 
-Both coarse arms now run clean to the point where the detector names a genuine
-self-collision, one per arm — the same class as the trailing skip-target, a
-mark the next acquire cannot see:
+Every coarse-arm defect so far has one shape: **the op refuses its own mark**.
+That is not contention and no retry can clear it — the op re-descends and
+re-derives a byte-identical plan — so it does not fail, it SPINS. A suite does
+not report a spin; it reports a timeout, hours later, on a test that names
+nothing.
 
-| arm | refused at | taken at |
-|---|---|---|
-| exponential (stops after 111) | `ft_rekey_cow_lock_child` | `ft_rekey_cow_stop` |
-| root-only (stops after 101) | `ft_flip_txn_lock_or_guard_parent` (the glue publish) | `ft_split_compressed_graft_build` |
+Three sources of marks were invisible to the choke point and are now in the held
+set:
 
-Root-only is the sharper arm as predicted: every anchor collapses onto the root,
-so the glue's split-CN fence and its publish parent are the same word.
+* **`ft_rekey_cow_stop`'s `@marks`** — @stop's fence plus one per child, none of
+  which reaches a txn registry until the caller's sweep. Every child of @stop
+  anchors on the path above, frequently @stop itself.
+* **A glue's NAMED FIELDS** — publish parent, the compressed node its build
+  splits, the overlap fences, the splice holders. `ft_glue_op_holds` already
+  enumerated them for sites that ask directly; `ft_held_set` could not see them.
+  Written once now, in `ft_glue_held_snap`, which also yields each field's
+  SNAPSHOT.
+* **A glue with no anchor source at all** (`lock_d` NULL) — three of them.
+
+★ **And the dedupe has to cover BOTH WORDS.** Coarsening splits a node's lock
+word from its own word, so an acquire deduped the ANCHOR and then sampled the
+member's OWN word with a raw read that refuses anything dirty. Right for a
+peer's mark, wrong for the op's: an earlier member routinely anchored ON this
+node. Measured: **200 million descents in 60 s** against under 16 million for
+the whole test at per-node granularity. `ft_member_node_snap` asks the held set
+first; `@node_held` then carries the two consequences — the acquire-time node
+guard is dropped (the mark IS that exclusion, already in force, and validating a
+clean value against the op's own LOCK aborts every attempt), and the retire
+takes the fused shape.
+
+### ★ OPEN: a residual that is NOT this class
+
+Two tests still do not finish, and each is fine in the OTHER coarse arm:
+
+| test | per-node | exponential | root-only |
+|---|---|---|---|
+| `test_density_stress` | 4.2 s | **does not finish** | 4.2 s |
+| `test_merge_at_fixed_ordered_splice` | 4.3 s | 4.3 s | **does not finish** |
+
+That symmetry is the clue: it is not "coarse is slow", it is a shape each
+spacing produces in a different op. What it is NOT, all measured:
+
+* **not a self-refusal** — the ledger reports nothing;
+* **not an -EAGAIN storm** — every `-EAGAIN` return tagged, none reaches 256k;
+* **not the validation build** — a `FEATURE_FT_HOLD_TRACE`-only build with the
+  knob but without the per-step anchor cross-check times identically;
+* **not one hot spot** — `perf` shows a flat profile of real work (`urcu_txn__record`
+  9.9%, `ft_detach_node` 9.5%, `ft_flip_txn_commit` 6.8%).
+
+Descents grow only ~2x while wall time grows 35x+, so the cost is per-descent
+rather than in retries. Next measurement: what a single op does differently
+under the failing spacing, not what the suite does.
 
 ### Why it cannot land site by site
 
