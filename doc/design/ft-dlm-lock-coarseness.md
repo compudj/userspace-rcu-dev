@@ -720,19 +720,54 @@ entirely, which is why it never showed there.
 Identical pointers, two start depths — metadata pointers alone would not have
 settled it.
 
-### Where the coarse arms stand
+### The merge path: two fixed, and a KEY LOSS the livelock was hiding
 
-| arm | before | after |
+★ **`test_merge_compressed_overlap` under root-only now FAILS instead of
+hanging: `missing 'aaaa3'`.** A merge silently drops a key under a coarse
+spacing. That is a CORRECTNESS defect, and it was invisible while the op
+livelocked. It is not caused by the two fixes below — the depth sentinel they
+introduce is unobservable (verified: 1 and 2 behave identically), and root-only
+anchors every member on the root regardless.
+
+**Fixed — a descent that never advanced.** Both advance paths
+(`ft_descent_step`, `ft_descent_traverse_compressed`) enter the node they
+LEAVE, so a descent whose loop never steps enters NOTHING. A merge whose
+destination point IS the root descends an empty key, and
+`ft_descent_anchor_of` then asserted on an empty table. Its cursor is still
+that root, which is what root-only anchors on.
+
+**Fixed — an undatable member bailing forever.** That same empty descent can
+date nothing below the root, so a member reached by back-pointer — a chain
+head's holder in `ft_glue_acquire_splice_holders` — failed
+`ft_lock_ctx_depth_of` and bailed as CONTENTION. Measured window at the bail:
+`{root@0}`, `depth=0`, holder not in it. No peer exists in the failing run and
+the bail is deterministic, so the caller's re-descend re-derives it forever.
+Root-only never reads the depth (every member anchors on the root), so it
+short-circuits exactly as the per-node arm above it already did.
+
+★ **A refusal that reports contention must be able to SUCCEED on retry.** Both
+of these presented as coarse-arm timeouts; neither had anything to do with
+contention.
+
+### Measured: a dedupe keyed on the ANCHOR answers for the wrong node
+
+`ft_glue_acquire_splice_holders` skips a holder when `ft_glue_fence_holds(g,
+anchor)` says the overlap plan already fenced it. Under per-node the anchor IS
+the node (`anchor == hm`), so the answer is about that node. Under root-only
+`anchor != hm`: the ROOT's fence answers for a node that was never fenced.
+
+Sound for EXCLUSION — the root lock does cover it — so this is not the key
+loss. Recorded because the shape recurs (`split_cn_holder` was the same
+mistake with teeth) and because the next anchor-keyed decision may not be
+about locking.
+
+### Where the arms stand
+
+| arm | unit | inv |
 |---|---|---|
-| per-node unit / inv | 307/307, 111/111 | unchanged |
-| exponential unit | hung at 231 `test_density_stress` | hangs at **244** `test_merge_compressed_overlap` |
-| exponential inv | — | hangs at **4** |
-| root-only unit | hung at 102, then 109 | 109 (not re-measured since the depth fix) |
-
-Both remaining stops are in the MERGE path rather than remove — a different
-site, the same class. Expect more: a wrong or absent depth anywhere in a
-lock-set derivation is invisible at per-node granularity and fatal under a
-coarse one.
+| per-node | 307/307 | 111/111 |
+| root-only | **fails 244** (key loss), hangs 109 | hangs 3 |
+| exponential | hangs 244 | hangs 4 |
 
 ### Still open in ft_descent_anchor_at_level
 
