@@ -1459,6 +1459,15 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		/* Size both glues from the read-only pre-pass, with headroom. */
 		ft_glue_init(&src_glue);
 		src_glue_live = true;
+		/*
+		 * ONE op, ONE held set.  The two glues commit together, so a mark
+		 * either takes is a mark the other's dedupe must see -- and under
+		 * coarsening they DO meet: a src child anchors on the src node the
+		 * merge build fenced as an overlap, so the re-parent mark refuses
+		 * against this op's own fence and every retry rebuilds it.
+		 */
+		glue.peer = &src_glue;
+		src_glue.peer = &glue;
 		ft_merge_count(ft, s_top, 0, d_dst.nf, 0, &mcnt);
 		if (ft_glue_reserve(&glue, mcnt.nb + 8, mcnt.nd + 8,
 					mcnt.nf_dst + 8, mcnt.ns + 8) ||

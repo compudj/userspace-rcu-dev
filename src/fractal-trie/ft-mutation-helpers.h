@@ -6265,6 +6265,26 @@ struct ft_glue {
 	 * inert.
 	 */
 	const struct ft_descent *lock_d_src;
+	/*
+	 * The op's OTHER glue, when it commits two together (the rekey fold's
+	 * dst glue and the src glue it fuses into one txn).  One OP has one HELD
+	 * SET, and a dedupe that reads only the glue it was handed answers "not
+	 * held" for a word the op is holding through the other -- which is not a
+	 * refusal a retry can clear, since the next attempt takes the same two
+	 * marks in the same order and refuses again
+	 * ([[feedback_self_refusal_is_not_contention]]).
+	 *
+	 * Coarsening is what makes the two meet: a src child's anchor is the src
+	 * node the merge build already fenced as an overlap.  Symmetric, set once
+	 * on both glues; followed exactly ONE level, never a chain.
+	 *
+	 * Torn down from BOTH ends by ft_glue_fini, which is why it is not const:
+	 * fini frees the very arrays a dedupe scans, and the two halves do NOT
+	 * die together -- the fold aborts its src side on paths its dst side
+	 * survives, so a surviving @peer would scan a freed list against a count
+	 * fini leaves standing.
+	 */
+	struct ft_glue *peer;
 	struct cds_ft_inode_flag **publish_slot;
 	struct cds_ft_inode_flag *top;
 	/*
@@ -6480,6 +6500,7 @@ void ft_glue_init(struct ft_glue *g)
 	g->publish_parent = NULL;
 	g->lock_d = NULL;
 	g->lock_d_src = NULL;
+	g->peer = NULL;
 	g->publish_slot = NULL;
 	g->top = NULL;
 	g->publish_old = NULL;
@@ -6508,6 +6529,15 @@ void ft_glue_init(struct ft_glue *g)
 static
 void ft_glue_fini(struct ft_glue *g)
 {
+	/*
+	 * Break the two-glue held set from BOTH ends, FIRST: everything below
+	 * frees an array a peer's dedupe would scan, and the counts naming those
+	 * arrays are left standing.
+	 */
+	if (g->peer) {
+		g->peer->peer = NULL;
+		g->peer = NULL;
+	}
 	if (g->deferred != g->deferred_floor) {
 		free(g->deferred);
 		g->deferred = g->deferred_floor;
@@ -7315,7 +7345,7 @@ struct cds_ft_metadata *ft_glue_reparent_park_meta(struct cds_ft *ft,
  * were the SAME node).  These arrays are small and this runs once per commit.
  */
 static
-bool ft_glue_held_snap(const struct ft_glue *g,
+bool ft_glue_held_snap_one(const struct ft_glue *g,
 		const struct cds_ft_metadata *meta, uintptr_t *snap,
 		bool *ratified)
 {
@@ -7355,6 +7385,22 @@ bool ft_glue_held_snap(const struct ft_glue *g,
 			return true;
 		}
 	return false;
+}
+
+/*
+ * The same question against the OP's held set rather than one glue's: @peer is
+ * the other half when a single commit fuses two builds.  One level, so the
+ * answer terminates whatever the callers wire.
+ */
+static
+bool ft_glue_held_snap(const struct ft_glue *g,
+		const struct cds_ft_metadata *meta, uintptr_t *snap,
+		bool *ratified)
+{
+	if (ft_glue_held_snap_one(g, meta, snap, ratified))
+		return true;
+	return g->peer &&
+		ft_glue_held_snap_one(g->peer, meta, snap, ratified);
 }
 
 static
@@ -7401,7 +7447,8 @@ int ft_glue_acquire_reparent_marks(struct cds_ft *ft, struct ft_glue *g)
 		struct ft_lock_ctx gctx;
 		struct ft_held_anchor h;
 		unsigned int cd;
-		bool dup = false;
+		uintptr_t cm_snap;
+		bool cm_rat, dup = false;
 
 		g->deferred[i].marked = false;
 		g->deferred[i].held_lock = false;
@@ -7435,9 +7482,14 @@ int ft_glue_acquire_reparent_marks(struct cds_ft *ft, struct ft_glue *g)
 		anchor = ft_anchor_meta(ft, ft_lock_ctx_descent(&gctx),
 			g->deferred[i].child, cm, cd);
 		if (ft_glue_op_holds(g, anchor)) {
-			/* Held via another lock set: do not re-mark, do not
-			 * release -- but DO record that we hold it. */
-			g->deferred[i].held_lock = true;
+			/*
+			 * Held via another lock set: do not re-mark, do not
+			 * release -- but DO record that we hold it.  @held_lock
+			 * still asks about the CHILD'S OWN word (see the acquire
+			 * below): holding an ancestor is not holding the child.
+			 */
+			g->deferred[i].held_lock = anchor == cm ||
+				ft_lock_ctx_holds(&gctx, cm, &cm_snap, &cm_rat);
 			g->deferred[i].lock_word = anchor;
 			continue;
 		}
@@ -7454,7 +7506,8 @@ int ft_glue_acquire_reparent_marks(struct cds_ft *ft, struct ft_glue *g)
 				dup = true;
 		if (dup) {
 			/* Same word, marked via the earlier entry: we hold it. */
-			g->deferred[i].held_lock = true;
+			g->deferred[i].held_lock = anchor == cm ||
+				ft_lock_ctx_holds(&gctx, cm, &cm_snap, &cm_rat);
 			g->deferred[i].lock_word = anchor;
 			continue;
 		}
@@ -7481,8 +7534,49 @@ int ft_glue_acquire_reparent_marks(struct cds_ft *ft, struct ft_glue *g)
 				&h) || h.shared)
 			return -EAGAIN;
 		g->deferred[i].lock_word = h.lock;
-		g->deferred[i].marked = true;
-		g->deferred[i].held_lock = true;
+		/*
+		 * ☠ @held_lock names the CHILD'S OWN word, never the anchor, and
+		 * coarsening is what splits them.  It picks the re-parent's
+		 * state-edge KIND: the SW park is a plain store that validates
+		 * nothing, and it is legitimate only because the op holds the very
+		 * word it parks.  Take an ANCESTOR's word instead and the child's
+		 * own word is unheld -- a peer's ft_meta_nr_child_inc from an
+		 * insert BELOW it sees a CLEAN word, does not honour
+		 * FT_STATE_INPLACE_WAIT_MASK, and the park CLOBBERS its count.
+		 * That is the exact clobber this acquire exists to prevent.
+		 *
+		 * So a coarsened member keeps the MW guard, whose expected-old is
+		 * the clean live_state the child really carries: the same peer then
+		 * ABORTS this commit instead, which is the outcome the escalation
+		 * lane arbitrates.  Per-node makes anchor and node one word and the
+		 * SW park returns, byte-identical.
+		 */
+		g->deferred[i].held_lock = h.lock == cm || h.node_held;
+		if (h.lock == cm) {
+			/*
+			 * The child's own guard edge RELEASES this mark at the
+			 * flip (live_state masks LOCK out), so the abort sweep
+			 * owns it only until then.
+			 */
+			g->deferred[i].marked = true;
+			continue;
+		}
+		/*
+		 * A coarsened mark has no such edge -- the guard lands on the
+		 * CHILD and the LOCK sits on its ANCESTOR -- so record the
+		 * anchor's own {LOCK|s -> s} release and hand it to the txn,
+		 * exactly as the publish parent's held fence is handed over.  The
+		 * registry then releases it on either outcome, and @marked stays
+		 * false so the abort sweep does not double-release.
+		 *
+		 * Bounded by TWO, well inside FT_FLIP_TXN_MAX_LOCKS: a dated
+		 * child is the CURSOR's own child (nothing else dates here), all
+		 * children of one node share a byte-depth and therefore ONE
+		 * anchor (§7.2), and an op has at most two cursors -- @lock_d and
+		 * @lock_d_src.
+		 */
+		ft_flip_txn_record_release_lock(g->txn, h.lock, h.lock_snap);
+		ft_flip_txn_lock_register(g->txn, h.lock, h.lock_snap);
 	}
 	return 0;
 }
