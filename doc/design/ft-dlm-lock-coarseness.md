@@ -472,35 +472,48 @@ when the anchor is a genuine ancestor, i.e. a flag the descent stored.
 depth at all. It returns false where the descent does not describe the node, so
 the caller RE-PLANS rather than anchoring one node by another's depth.
 
-### Remaining (2026-08-07, after `e909a34a`)
+### Conversion status (2026-08-07, `84656d6c`)
 
-Converted: `ft_chain_compress_fused` (both arms),
-`ft_detach_node_replace_compressed_parent`, `ft_node_recompact`'s `{C, P, GP}`.
-`ft_lock_member` deleted (no callers).
+**Every acquire site is converted**, and that is a BUILD property rather than a
+table: past the choke points the raw `ft_meta_lock_acquire` / `ft_dlm_lock` are
+`#define`d to an undeclared identifier under `FEATURE_FT_ANCHOR_VALIDATE`, so a
+new raw acquire cannot compile. Verified against a red control (a raw acquire
+reintroduced into `ft_split_compressed_graft_build` fails the build, naming the
+choke point it must use).
 
-| function | n | what it needs |
-|---|---|---|
-| `ft_flip_txn_lock_or_guard_parent` | 1 | **highest leverage: 13 callers**, each must supply a depth |
-| `ft_detach_node` orphan walk | 4 | the walk must EXTEND the descent (below), not run beside it |
-| `ft_rekey_cow_stop` | 4 | fan-out; §7.2 hoist, caller holds `d_src` |
-| `ft_rekey_graft_simple_attempt` | 3 | local `d_src` / `d_dst` |
-| `_cds_ft_insert` | 2 | local descent; the second needs a WINDOW depth (`ft_chain_head_holder`) |
-| `ft_insert_dlm_acquire_split` | 2 | anchored already; fold onto `ft_dlm_acquire_set` |
-| `ft_split_compressed_insert`, `ft_insert_compressed_key_shorter`, `_cds_ft_replace_locked` | 3 | |
-| `ft_merge_lock_overlap`, `ft_merge_spine_copy` | 2 | |
-| `ft_detach_orphan_planlock`, `ft_unchain_node` | 2 | |
-| `ft_split_compressed_graft_build`, `ft_graft_keylen` | 2 | `ft_graft_keylen` is the measured self-collision |
-| `ft_root_attach_fence_empty` | 1 | the root anchors on itself under every spacing |
-| `ft_glue_acquire_reparent_marks`, `ft_glue_acquire_splice_holders` | 2 | fan-out; §7.3 hoist |
-| `ft_compact_relocate_at` | — | passes a NULL context: needs the depth `ft_compact_descend` tracks |
+Two supporting pieces landed with it:
 
-**A writer WALK must extend the descent.** `ft_detach_node`'s orphan walk moves
-DOWN a single-child chain off `walk_nf`, so its depths are neither
-`detach_depth` nor anything the window carries — but each step's span is known
-(1 internal, `cn->len` compressed). Feed it through `ft_descent_enter_node` and
-plain `ft_descent_anchor` answers for every node on it. That needs the context
-to carry a MUTABLE descent the callee may extend, which is the one structural
-change still outstanding.
+* **`ft_walk_extend` — a writer walk EXTENDS the descent.** `ft_detach_node`'s
+  orphan walks move DOWN a chain past the cursor, so their depths are neither
+  `detach_depth` nor anything the window carries. Each step's span is known (1
+  internal, `cn->len` compressed), so feeding it through
+  `ft_descent_enter_node` puts the walked region in the SAME anchor table and
+  plain `ft_descent_anchor` answers for every node on it. One depth mechanism
+  and one table per op, which is what agreement wants.
+* **`ft_anchor_descend`** (§5.3) is now used by remove, remove-all AND replace —
+  every handle-derived entry point pays a descent exactly when the spacing is
+  coarser than per-node.
+
+`ft_compact_relocate_at` still passes a NULL context; it needs the depth
+`ft_compact_descend` already tracks.
+
+### ★ OPEN: the held set is not the txn registry
+
+The first coarse run of the fully-converted tree is RED, for one measured
+reason. A word is **acquired and held for a WINDOW before it is registered in
+any txn**, so no dedupe sees it — and a coarse spacing then lands the next
+member's ANCHOR on it. `ft_dlm_acquire_set`'s member 0 fails `ft_dlm_lock`
+against the op's OWN hold.
+
+The fix is to make `struct ft_lock_ctx` the op's held set outright:
+append on acquire, **remove on release**. That model only became possible once
+the choke point was total, which it now is.
+
+Fatal rather than merely slow because `_cds_ft_remove_all_locked` has **no retry
+loop** — its -EAGAIN surfaces as a hard `MEMORY_ERROR`.
+★ **A refusal is only a fallback where a RETRY exists.** That is the same reason
+the orphan walk had to extend the descent instead of refusing an undatable
+member.
 
 ### Why it cannot land site by site
 
