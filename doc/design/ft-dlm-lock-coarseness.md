@@ -615,28 +615,88 @@ guard is dropped (the mark IS that exclusion, already in force, and validating a
 clean value against the op's own LOCK aborts every attempt), and the retire
 takes the fused shape.
 
-### ★ OPEN: a residual that is NOT this class
+### The residual was TWO defects, and the control could not fail
 
-Two tests still do not finish, and each is fine in the OTHER coarse arm:
+Two tests did not finish, each fine in the OTHER coarse arm — read at the time
+as one spacing-dependent mechanism. It was **two unrelated defects in two
+different ops**; the symmetry was a coincidence. Both tests are
+SINGLE-THREADED, which is the fact that mattered: with no peer, every
+"contention" retry is self-inflicted.
 
-| test | per-node | exponential | root-only |
-|---|---|---|---|
-| `test_density_stress` | 4.2 s | **does not finish** | 4.2 s |
-| `test_merge_at_fixed_ordered_splice` | 4.3 s | 4.3 s | **does not finish** |
+★ **The knob was compiled in only under the probe macros**, so the obvious
+control — build it plain, is it still slow? — had never run a coarse arm at
+all. It answered with the per-node timing, and the number agreeing with the
+baseline is what made it convincing. `FEATURE_FT_LOCK_SPACING_ENV` now carries
+the knob and each probe implies it, so a build exists that runs the coarse arm
+with no instrumentation. With that control both hangs reproduce uninstrumented:
+the probes were innocent.
 
-That symmetry is the clue: it is not "coarse is slow", it is a shape each
-spacing produces in a different op. What it is NOT, all measured:
+Consequently the earlier "what it is NOT" list is void. Two of its entries were
+wrong outright: `test_density_stress` IS an `-EAGAIN` storm (28,799,994 retries
+in ONE remove op — the tagging sweep had missed the firing site, whose `return
+-EAGAIN;` carries a trailing comment), and the cost is not per-descent — the
+record set averages 3.5 entries, so it is the sheer NUMBER of tiny
+transactions. A retry loop that re-runs a whole op profiles as FLAT, because it
+re-does everything.
 
-* **not a self-refusal** — the ledger reports nothing;
-* **not an -EAGAIN storm** — every `-EAGAIN` return tagged, none reaches 256k;
-* **not the validation build** — a `FEATURE_FT_HOLD_TRACE`-only build with the
-  knob but without the per-step anchor cross-check times identically;
-* **not one hot spot** — `perf` shows a flat profile of real work (`urcu_txn__record`
-  9.9%, `ft_detach_node` 9.5%, `ft_flip_txn_commit` 6.8%).
+### CLOSED: a split-retire that named the anchor instead of the node
 
-Descents grow only ~2x while wall time grows 35x+, so the cost is per-descent
-rather than in retries. Next measurement: what a single op does differently
-under the failing spacing, not what the suite does.
+`ft_split_compressed_graft_build` stored the anchor its acquire locked into
+`glue->split_cn_holder`, and the commit recorded the fenced
+`{LOCK|s -> TOMBSTONE|s}` against that field. Per-node the anchor IS the
+compressed node. Coarsening splits them, and the commit **tombstoned the
+anchor** — measured as the dst root, `nr_child` 2 at depth 0, the node the
+graft publishes into. It never landed only because the publish parent's release
+was already recorded on that word, so the two contradicted and the engine
+poisoned the txn: **the livelock was the structure defending itself.** Where
+the anchor is an ancestor no other record touches, the tombstone lands.
+
+The glue now carries `@split_cn_node` / `@split_cn_node_snap` beside the
+holder, and `ft_glue_tombstone_free_list`'s skip matches the node's own word
+(matching the holder, it did not fire under coarsening and the node took a
+second plain tombstone).
+
+### CLOSED: a §4.B guard on a word the op holds
+
+`ft_flip_txn_lock_or_guard_parent`'s shared arm guarded the member it had just
+deduped. The guard's expected old is clean-LIVE — it masks out `FT_STATE_LOCK`,
+**including the op's own** — so on a held word it names a value that word has
+not carried since the mark landed, and the member that took it records its
+terminal later in the same commit. That is exactly the "guard THEN release =
+POISON, permanently" order §7.3's ordering rule calls unreachable; coarsening
+made a site reach it.
+
+★ **A fix you cannot show FIRING is not demonstrated.** An intermediate attempt
+made `ft_flip_txn_record_anchor_release` yield when the pending word showed
+LOCK already clear. The suite went green — and the rule was unsound: a guard's
+masked value and a terminal's cleared value are indistinguishable in the
+pending word, so it was suppressing the only release. Probing whether it ever
+fired returned 0/0 on both arms. It was dropped; the guard fix carries the
+result alone.
+
+### ★ OPEN: a retire snapshot a LATER acquire invalidates
+
+`exponential` / `test_density_stress` remains. `@node_snap` is sampled when a
+member is acquired; a **later** acquire in the same op then takes that node's
+OWN word (the detach's orphan chain walks up, so a coarsened member becomes a
+direct anchor a step later). `ft_flip_txn_record_retire_anchored` then records
+`{clean -> clean|TOMBSTONE}` against a word carrying the op's own `LOCK`:
+
+```
+STALESNAP node=0x..598 snap=4 cur=80004 lock=0x..658 lock==node=0 node_held=0
+```
+
+`ft_member_node_snap` answers "did an EARLIER member anchor here?" — it cannot
+see a member that has not run yet. Per-node never exposes it: `lock == node`,
+so the fused terminal is taken and no separate snapshot exists to go stale.
+
+The expected old must NOT be re-read raw (a peer change between acquire and
+commit must abort rather than be ratified by a late capture). The distinction
+needed is *our own mark vs a peer's change*, which the txn's own lock registry
+can answer at record time.
+
+Status after these two: per-node `unit 307/307`, `inv 111/111`; root-only
+advances 102 → 109 and inv to 3 — same class, more sites.
 
 ### Why it cannot land site by site
 
