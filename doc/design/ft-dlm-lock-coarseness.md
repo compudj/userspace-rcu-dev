@@ -720,14 +720,11 @@ entirely, which is why it never showed there.
 Identical pointers, two start depths — metadata pointers alone would not have
 settled it.
 
-### The merge path: two fixed, and a KEY LOSS the livelock was hiding
+### The merge path: three fixed, including a key loss the livelock was hiding
 
-★ **`test_merge_compressed_overlap` under root-only now FAILS instead of
-hanging: `missing 'aaaa3'`.** A merge silently drops a key under a coarse
-spacing. That is a CORRECTNESS defect, and it was invisible while the op
-livelocked. It is not caused by the two fixes below — the depth sentinel they
-introduce is unobservable (verified: 1 and 2 behave identically), and root-only
-anchors every member on the root regardless.
+Fixing two liveness defects turned a root-only timeout into a FAILED test —
+`missing 'aaaa3'` — which is how the key loss below was found. A hang never
+produces a wrong answer; fixing liveness is what exposes correctness.
 
 **Fixed — a descent that never advanced.** Both advance paths
 (`ft_descent_step`, `ft_descent_traverse_compressed`) enter the node they
@@ -749,25 +746,56 @@ short-circuits exactly as the per-node arm above it already did.
 of these presented as coarse-arm timeouts; neither had anything to do with
 contention.
 
-### Measured: a dedupe keyed on the ANCHOR answers for the wrong node
+### CLOSED: the coarse merge's key loss
 
-`ft_glue_acquire_splice_holders` skips a holder when `ft_glue_fence_holds(g,
-anchor)` says the overlap plan already fenced it. Under per-node the anchor IS
-the node (`anchor == hm`), so the answer is about that node. Under root-only
-`anchor != hm`: the ROOT's fence answers for a node that was never fenced.
+`test_merge_compressed_overlap` under root-only lost `'aaaa3'` — silent data
+loss, and the first coarse CORRECTNESS defect. It is the `split_cn_holder`
+mistake again, in the merge's fenced free list.
 
-Sound for EXCLUSION — the root lock does cover it — so this is not the key
-loss. Recorded because the shape recurs (`split_cn_holder` was the same
-mistake with teeth) and because the next anchor-keyed decision may not be
-about locking.
+`ft_glue_defer_free_fenced` recorded only the retired node's clean word, and
+`ft_glue_tombstone_free_list` built the fenced `{LOCK|s -> TOMBSTONE|s}`
+terminal against that node. Per-node puts the overlap fence on the node itself,
+so the terminal names a LOCK the node really carries. **Coarsening puts the
+fence on the node's ANCHOR**, and the terminal then names a LOCK the node has
+never carried:
+
+```
+per-node   TS free[1..6] state=80004 80008 80004 ...   <- LOCK on each node
+root-only  TS free[1..6] state=4     8     4     ...   <- LOCK is on the ROOT
+```
+
+The install mismatches, the commit ABORTS, `ft_glue_fenced_renounce_free`
+renounces every fenced free, and **the merge returns OK on top of a flip that
+never happened**. That is exactly the shape the `acquire_miss` note on the
+publish-parent block describes ("the ignored commit status let this function
+return CDS_FT_STATUS_OK on top of it. Silent data loss"), reached by a
+different cause.
+
+Fixed by carrying BOTH words in the entry and recording the anchored pair
+(`ft_flip_txn_record_retire_anchored` + `ft_flip_txn_record_anchor_release`),
+which fuse back to the single edge whenever the anchor IS the node. Two other
+questions keyed on the node had the same answer for the same reason:
+`ft_glue_clear_fenced` releases the word the acquire TOOK, and
+`ft_glue_fence_holds` compares the word an entry HOLDS against the word its
+caller is about to acquire.
+
+★ **The build plan was byte-identical between the two arms** (27 decisions, no
+diff). Diffing the PLAN is what proved the loss was at the commit, not in the
+copy — and that is the measurement to reach for first when a coarse arm returns
+a wrong answer rather than hanging.
+
+★ **A retire terminal must name the word the acquire LOCKED.** Three separate
+defects now (split_cn, the detach's held set, this) have been one sentence:
+per-node fuses a node's two words into one, so every site that conflates them
+is correct until coarsening splits them apart.
 
 ### Where the arms stand
 
 | arm | unit | inv |
 |---|---|---|
 | per-node | 307/307 | 111/111 |
-| root-only | **fails 244** (key loss), hangs 109 | hangs 3 |
-| exponential | hangs 244 | hangs 4 |
+| root-only | hangs 109 `test_merge_rekey_same_trie` | hangs 3 |
+| exponential | hangs 244 `test_merge_compressed_overlap` | hangs 4 |
 
 ### Still open in ft_descent_anchor_at_level
 
