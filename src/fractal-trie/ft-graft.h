@@ -460,6 +460,12 @@ enum cds_ft_status ft_store_at_graft_point_prepare(struct cds_ft *ft,
 	 * already holds.
 	 */
 	ft_lock_ctx_init(&gctx, d, glue->txn);
+	/*
+	 * The glue's own acquires (its publish parent, its split CN) fire from
+	 * commit helpers that never see @d, so hand it the anchor source here --
+	 * the one place holding both.
+	 */
+	glue->lock_d = d;
 
 	/*
 	 * Skip-mode chain-compress invariant: under SPECULATIVE-mode tries,

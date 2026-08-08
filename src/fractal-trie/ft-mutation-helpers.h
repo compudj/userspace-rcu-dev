@@ -1331,6 +1331,19 @@ bool ft_lock_ctx_depth_of(const struct cds_ft *ft,
 }
 
 /*
+ * "@ctx's descent knows the depth; look it up."
+ *
+ * A site that reached its member through a BACK-POINTER usually cannot name a
+ * byte-depth, and the descent's window is what dates it -- but that lookup can
+ * FAIL (a node this descent never passed), and most publish sites sit past the
+ * last point where a clean bail is available.  Passing this makes the failure
+ * the same one a CONTENDED acquire already produces there: the commit aborts and
+ * the caller re-descends.  A site that still has a bail should look the depth up
+ * itself and take it.
+ */
+#define FT_DEPTH_FROM_DESCENT	UINT_MAX
+
+/*
  * THE ACQUIRE CHOKE POINT.  Take the lock-set member @nf -- a node at byte-depth
  * @depth -- for this op: resolve it to the word its acquire must actually CAS
  * (its own under per-node granularity, its ANCHOR's under a coarser one), refuse
@@ -2883,67 +2896,65 @@ extern long cds_ft_fault_lock_countdown;
  * @t / NULL @parent_nf and non-lock_fine tries route straight to the guard
  * (which no-ops on NULL) -- behaviour-identical.
  *
- * ALREADY HELD: a lock spacing coarser than per-node maps several lock-set
- * members onto ONE word, so an op can arrive here holding this publish target's
- * lock already, taken for a DIFFERENT member of its own set.  Re-acquiring then
- * misses against the op's OWN hold, which sets @acquire_miss and aborts the
- * commit, and the caller retries into the identical shape: the op waits on
- * itself, forever.  So consult the txn's lock registry first and take only the
- * guard.  The registry IS the op's held set -- every held word is registered
- * there together with its terminal -- so this needs no separate bookkeeping.
+ * COARSENING keeps that net-zero, and needs no guard beside the release.  The
+ * release then lands on an ANCESTOR rather than on @parent_nf's own word, so it
+ * stops validating that word -- but it does not need to: every op that could
+ * retire @parent_nf must first take the same ancestor, which this op now holds,
+ * so the anchor is the strictly stronger representative the per-node release
+ * record was.  What coarsening does lose is the acquire's refusal of an
+ * ALREADY-dirty target (a node a previous holder of the anchor retired), and
+ * ft_acquire_member restores exactly that by sampling @parent_nf's own word.
  *
- * ★ This covers only the acquires that come THROUGH here.  A raw
- * ft_meta_lock_acquire elsewhere in the same op (ft_graft_keylen's publish-
- * parent fence is one) can still collide with a held anchor, which is why a
- * coarser spacing needs EVERY acquire routed through an anchoring, deduping
- * choke point rather than converted site by site
- * (doc/design/ft-dlm-lock-coarseness.md §9).
+ * ALREADY HELD: a coarser spacing maps several lock-set members onto ONE word,
+ * so an op can arrive here holding this publish target's lock already, taken for
+ * a DIFFERENT member of its own set.  Re-acquiring then misses against the op's
+ * OWN hold, which sets @acquire_miss and aborts the commit, and the caller
+ * retries into the identical shape: the op waits on itself, forever.  The choke
+ * point dedupes against @ctx's held set instead and leaves only the guard owed.
  */
 static inline
 void ft_flip_txn_lock_or_guard_parent(const struct cds_ft *ft,
-		struct ft_flip_txn *t, struct cds_ft_inode_flag *parent_nf)
+		struct ft_flip_txn *t, const struct ft_lock_ctx *ctx,
+		struct cds_ft_inode_flag *parent_nf, unsigned int parent_depth)
 {
 	if (ft->lock_fine && t && parent_nf) {
-		struct cds_ft_metadata *pmeta = ft_flag_to_metadata(ft, parent_nf);
-		uintptr_t psnap = 0;
-		bool acquired;
-
 		/*
-		 * The terminal for a held word was recorded when it was acquired,
-		 * so all that is owed here is the guard -- and a guard AFTER a
-		 * release on one word is the ordering rule's harmless no-op (it
-		 * reads the record's own pending clean value and validates
-		 * {s -> s}), never the poison order.
+		 * @t is the registry this record joins, so it is authoritative
+		 * for the dedupe; @ctx contributes the anchor source and any
+		 * marks the op keeps outside a txn.
 		 */
-		if (ft_anchor_held(t->locks, t->nr_locks, pmeta)) {
-			ft_flip_txn_guard_parent(ft, t, parent_nf);
-			return;
+		struct ft_lock_ctx lctx = {
+			.d = ft_lock_ctx_descent(ctx),
+			.held = { .txn = t,
+				.extra = ctx ? ctx->held.extra : NULL,
+				.nr_extra = ctx ? ctx->held.nr_extra : 0 },
+		};
+		struct ft_held_anchor held;
+
+		if (parent_depth == FT_DEPTH_FROM_DESCENT &&
+				!ft_lock_ctx_depth_of(ft, ctx, parent_nf,
+					&parent_depth)) {
+			t->acquire_miss = true;
+			goto guard;
 		}
-
-#ifdef FEATURE_FT_FAULT_INJECT
-		/*
-		 * Force the acquire to MISS (as a peer holding @parent_nf would),
-		 * exercising the guard fallback the FT-wide lock otherwise makes
-		 * unreachable.  Shares cds_ft_fault_lock_countdown with recompact's
-		 * ft_lock_member: whichever per-node acquire the countdown
-		 * lands on faults, and the op must degrade cleanly either way.
-		 */
-		if (cds_ft_fault_lock_countdown >= 0) {
-			if (cds_ft_fault_lock_countdown == 0) {
-				cds_ft_fault_lock_countdown = -1;
-				acquired = false;
-				goto fault_miss;
+		if (caa_likely(!ft_acquire_member(ft, &lctx, parent_nf,
+				ft_flag_to_metadata(ft, parent_nf),
+				parent_depth, &held))) {
+			/*
+			 * The terminal for a word the op already held was
+			 * recorded when it was acquired, so all that is owed
+			 * here is the guard -- and a guard AFTER a release on
+			 * one word is the ordering rule's harmless no-op (it
+			 * reads the record's own pending clean value and
+			 * validates {s -> s}), never the poison order.
+			 */
+			if (held.shared) {
+				ft_flip_txn_guard_parent(ft, t, parent_nf);
+				return;
 			}
-			cds_ft_fault_lock_countdown--;
-		}
-#endif
-		acquired = !ft_meta_lock_acquire(pmeta, &psnap);
-#ifdef FEATURE_FT_FAULT_INJECT
-fault_miss:
-#endif
-		if (caa_likely(acquired)) {
-			ft_flip_txn_record_release_lock(t, pmeta, psnap);
-			ft_flip_txn_lock_register(t, pmeta);
+			ft_flip_txn_record_release_lock(t, held.lock,
+				held.lock_snap);
+			ft_flip_txn_lock_register(t, held.lock);
 			return;
 		}
 		/*
@@ -2965,6 +2976,7 @@ fault_miss:
 		 */
 		t->acquire_miss = true;
 	}
+guard:
 	ft_flip_txn_guard_parent(ft, t, parent_nf);
 }
 
@@ -2983,7 +2995,8 @@ fault_miss:
  */
 static inline
 void ft_flip_txn_hold_or_lock_parent(const struct cds_ft *ft,
-		struct ft_flip_txn *t, struct cds_ft_inode_flag *parent_nf,
+		struct ft_flip_txn *t, const struct ft_lock_ctx *ctx,
+		struct cds_ft_inode_flag *parent_nf, unsigned int parent_depth,
 		struct cds_ft_metadata *held_holder, uintptr_t held_snap)
 {
 	if (held_holder) {
@@ -3009,7 +3022,7 @@ void ft_flip_txn_hold_or_lock_parent(const struct cds_ft *ft,
 		ft_flip_txn_lock_register(t, held_holder);
 		return;
 	}
-	ft_flip_txn_lock_or_guard_parent(ft, t, parent_nf);
+	ft_flip_txn_lock_or_guard_parent(ft, t, ctx, parent_nf, parent_depth);
 }
 
 /*
@@ -5495,6 +5508,14 @@ struct ft_glue {
 	 * publish_parent is recorded as an ordinary deferred edge.
 	 */
 	struct cds_ft_inode_flag *publish_parent;
+	/*
+	 * Anchor source for this op's acquires: @publish_parent and the split
+	 * CN are lock-set members, and a coarse spacing sends their acquires to
+	 * an ancestor selected by BYTE-DEPTH.  Set by the builder that owns the
+	 * descent; NULL where none ran, which is legal only under per-node
+	 * granularity (doc/design/ft-dlm-lock-coarseness.md §2).
+	 */
+	const struct ft_descent *lock_d;
 	struct cds_ft_inode_flag **publish_slot;
 	struct cds_ft_inode_flag *top;
 	/*
@@ -5645,6 +5666,19 @@ struct ft_glue {
 };
 
 /*
+ * The op's lock context, as a glue op carries it: the descent that dates its
+ * lock-set members, and @txn as the registry naming what it already holds.
+ * Built into the caller's own storage at each use rather than cached on the
+ * glue: the glue is shared across the op's steps, and @txn changes under it.
+ */
+static inline
+void ft_glue_lock_ctx(const struct ft_glue *g, struct ft_lock_ctx *ctx)
+{
+	ft_lock_ctx_init(ctx, g->lock_d, g->txn);
+}
+
+
+/*
  * ft_glue helpers.  The struct and the rationale are defined just above;
  * the build-invisible builders that reference the type (ft_build_branch and
  * the graft / merge spine builders) follow in the later mutation modules.
@@ -5665,6 +5699,7 @@ void ft_glue_init(struct ft_glue *g)
 	g->nr_splices = 0;
 	g->cap_splices = FT_GLUE_FLOOR_SPLICE;
 	g->publish_parent = NULL;
+	g->lock_d = NULL;
 	g->publish_slot = NULL;
 	g->top = NULL;
 	g->publish_old = NULL;
@@ -7173,8 +7208,14 @@ enum urcu_txn_status ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue 
 	 * re-mark's masking guard would self-abort on the op's own held fence).
 	 * Holder NULL routes to the ordinary acquire-or-guard (non-lock_fine / root).
 	 */
-	ft_flip_txn_hold_or_lock_parent(ft, g->txn, g->publish_parent,
-		g->publish_parent_holder, g->publish_parent_snap);
+	{
+		struct ft_lock_ctx gctx;
+
+		ft_glue_lock_ctx(g, &gctx);
+		ft_flip_txn_hold_or_lock_parent(ft, g->txn, &gctx,
+			g->publish_parent, FT_DEPTH_FROM_DESCENT,
+			g->publish_parent_holder, g->publish_parent_snap);
+	}
 	if (g->publish_parent_holder) {
 		/*
 		 * OWNERSHIP TRANSFER (the split_cn_holder block below mirrors
@@ -7626,7 +7667,13 @@ enum urcu_txn_status ft_glue_publish(struct cds_ft *ft, struct ft_flip_txn *txn,
 	 * RELEASE lock (value-swap REPLACE survivor, guard-fallback on a miss); see
 	 * ft_glue_txn_commit_edges for the full rationale.
 	 */
-	ft_flip_txn_lock_or_guard_parent(ft, txn, g->publish_parent);
+	{
+		struct ft_lock_ctx gctx;
+
+		ft_glue_lock_ctx(g, &gctx);
+		ft_flip_txn_lock_or_guard_parent(ft, txn, &gctx,
+			g->publish_parent, FT_DEPTH_FROM_DESCENT);
+	}
 	_ft_publish_to_parent(ft, g->publish_parent, g->publish_slot, g->top,
 		ft_glue_publish_expected_old(g), &rec);
 	n = ft_pub_rec_sedges(&rec, sedges);
@@ -7689,7 +7736,13 @@ enum urcu_txn_status ft_glue_publish_replace(struct cds_ft *ft,
 	 * RELEASE lock (value-swap REPLACE survivor, guard-fallback on a miss); see
 	 * ft_glue_txn_commit_edges for the full rationale.
 	 */
-	ft_flip_txn_lock_or_guard_parent(ft, txn, g->publish_parent);
+	{
+		struct ft_lock_ctx gctx;
+
+		ft_glue_lock_ctx(g, &gctx);
+		ft_flip_txn_lock_or_guard_parent(ft, txn, &gctx,
+			g->publish_parent, FT_DEPTH_FROM_DESCENT);
+	}
 	_ft_publish_to_parent(ft, g->publish_parent, g->publish_slot, g->top,
 		ft_glue_publish_expected_old(g), &rec);
 	/* Order-statistics fold (BULK): see ft_glue_publish. */

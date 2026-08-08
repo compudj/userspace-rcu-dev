@@ -2085,8 +2085,15 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		 * holder = non-lock_fine or the unfailable caller, which routes to the
 		 * ordinary acquire-or-guard exactly as before.
 		 */
-		ft_flip_txn_hold_or_lock_parent(dst_ft, txn, pub_parent,
-			gd.publish_parent_holder, gd.publish_parent_snap);
+		{
+			struct ft_lock_ctx mctx;
+
+			ft_lock_ctx_init(&mctx, NULL, txn);
+			ft_flip_txn_hold_or_lock_parent(dst_ft, txn, &mctx,
+				pub_parent, FT_DEPTH_FROM_DESCENT,
+				gd.publish_parent_holder,
+				gd.publish_parent_snap);
+		}
 		/*
 		 * OWNERSHIP TRANSFER (mirrors the graft): @txn's registry now owns
 		 * this fence -- a commit consumes it through the recorded release, an

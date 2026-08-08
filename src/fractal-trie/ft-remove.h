@@ -218,8 +218,8 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			 * DLM: cn's RELEASE was acquired + recorded up front under
 			 * lock_fine, so skip the incremental lock here. */
 			if (!ft->lock_fine)
-				ft_flip_txn_lock_or_guard_parent(ft, txn,
-					ft_compressed_node_flag(cn));
+				ft_flip_txn_lock_or_guard_parent(ft, txn, ctx,
+					ft_compressed_node_flag(cn), iter_depth);
 			_ft_publish_to_parent(ft, ft_compressed_node_flag(cn),
 				&cn->child,
 				(struct cds_ft_inode_flag *) topmost_external_nodes,
@@ -245,8 +245,8 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			 * DLM: cn's RELEASE was acquired + recorded up front under
 			 * lock_fine, so skip the incremental lock here. */
 			if (!ft->lock_fine)
-				ft_flip_txn_lock_or_guard_parent(ft, txn,
-					ft_compressed_node_flag(cn));
+				ft_flip_txn_lock_or_guard_parent(ft, txn, ctx,
+					ft_compressed_node_flag(cn), iter_depth);
 			_ft_publish_to_parent(ft, ft_compressed_node_flag(cn),
 				&cn->child,
 				(struct cds_ft_inode_flag *) topmost_external_nodes,
@@ -330,26 +330,25 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 		struct cds_ft_metadata *src_cn_meta_a =
 			cds_ft_item_to_metadata((struct cds_ft_inode *) src_cn);
 		struct ft_held_anchor src_held;
+		unsigned int pp_depth = 0;
 		bool dlm_a2 = false;
 
+		/*
+		 * @pub_parent came from src_cn's back-pointer, which carries no
+		 * depth; the descent's window is what dates it.  A parent this
+		 * descent never passed cannot be anchored here at all -- re-plan
+		 * rather than anchor it by another node's depth.
+		 */
+		if (pub_parent && !ft_lock_ctx_depth_of(ft, ctx, pub_parent,
+				&pp_depth)) {
+			free_cds_ft_node_unpublished(ft, fresh);
+			ft_flip_txn_destroy(txn);
+			return -EAGAIN;
+		}
 		if (ft->lock_fine) {
 			struct ft_dlm_member set[2];
-			unsigned int pp_depth = 0;
 			int dret;
 
-			/*
-			 * @pub_parent came from src_cn's back-pointer, which
-			 * carries no depth; the descent's window is what dates it.
-			 * A parent this descent never passed cannot be anchored
-			 * here at all -- re-plan rather than anchor it by another
-			 * node's depth.
-			 */
-			if (pub_parent && !ft_lock_ctx_depth_of(ft, ctx,
-					pub_parent, &pp_depth)) {
-				free_cds_ft_node_unpublished(ft, fresh);
-				ft_flip_txn_destroy(txn);
-				return -EAGAIN;
-			}
 			set[0] = (struct ft_dlm_member){
 				.nf = ft_compressed_node_flag(src_cn),
 				.node = src_cn_meta_a,
@@ -420,7 +419,8 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			 * coherently-resolved grandparent -- value-swap target (§10.5).
 			 * DLM: pub_parent's RELEASE was acquired up front under lock_fine. */
 			if (!ft->lock_fine)
-				ft_flip_txn_lock_or_guard_parent(ft, txn, pub_parent);
+				ft_flip_txn_lock_or_guard_parent(ft, txn, ctx,
+					pub_parent, pp_depth);
 			_ft_publish_to_parent(ft, pub_parent,
 				pub_slot,
 				ft_node_flag(fresh, 0),
@@ -701,6 +701,7 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 	struct cds_ft_inode_flag *new_cn_flag;
 	struct cds_ft_inode_flag **publish_slot;
 	struct cds_ft_inode_flag *publish_parent;
+	unsigned int pub_depth = 0;
 	struct cds_ft_inode_flag *iter_parent;
 	struct ft_flip_txn *txn;
 	/*
@@ -1027,6 +1028,19 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 	ft_set_parent_slot(new_cn_meta,
 			ft_parent_node(new_cn_meta->parent_word), publish_slot);
 
+	/*
+	 * The publish target is a lock-set member (the value-swap RELEASE half),
+	 * and it was resolved through a back-pointer, so the descent's window is
+	 * what dates it.  Checked here rather than at the acquire below: nothing
+	 * is reader-visible yet, so a target this descent cannot date is a clean
+	 * re-plan.  Under the DLM arm the same node was already anchored as @pp.
+	 */
+	if (!ft_lock_ctx_depth_of(ft, ctx, publish_parent, &pub_depth)) {
+		free_compressed_node_unpublished(ft, new_cn);
+		ft_flip_txn_destroy(txn);
+		return -EAGAIN;
+	}
+
 	new_cn_flag = ft_compressed_node_flag(new_cn);
 	{
 		struct ft_pub_rec rec = { .n = 0 };
@@ -1064,7 +1078,8 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		 * DLM: under lock_fine the whole lock-set (incl. publish_parent's
 		 * RELEASE) was acquired up front, so skip the incremental lock here. */
 		if (!ft->lock_fine)
-			ft_flip_txn_lock_or_guard_parent(ft, txn, publish_parent);
+			ft_flip_txn_lock_or_guard_parent(ft, txn, ctx,
+				publish_parent, pub_depth);
 		_ft_publish_to_parent_meta(ft, publish_parent, publish_slot,
 			new_cn_pub, pub_expected_old, new_cn_meta, NULL, &rec);
 		/*
@@ -2599,9 +2614,14 @@ int ft_detach_node(struct cds_ft *ft,
 				 * @commit_txn (mutually exclusive with the recompaction
 				 * republish guard, which fires only on the pub-UNARMED path).
 				 */
-				if (commit_txn && !pub->state_meta)
-					ft_flip_txn_lock_or_guard_parent(ft, commit_txn,
-						iter_node_flag);
+				if (commit_txn && !pub->state_meta) {
+					lctx.held.txn = commit_txn;
+					lctx.held.nr_extra =
+						(unsigned int) nr_orphan_locked;
+					ft_flip_txn_lock_or_guard_parent(ft,
+						commit_txn, &lctx,
+						iter_node_flag, cur_depth);
+				}
 				ret = ft_remove_one_commit(ft, pub->slot,
 					pub->old_val, pub->new_val,
 					pub->state_meta,
@@ -2812,7 +2832,9 @@ int ft_detach_node(struct cds_ft *ft,
 				; /* recompact's P already locked; release IS the guard */
 			else
 				ft_flip_txn_lock_or_guard_parent(ft, commit_txn,
-					ft_parent_node(iter_meta->parent_word));
+					&lctx,
+					ft_parent_node(iter_meta->parent_word),
+					FT_DEPTH_FROM_DESCENT);
 			_ft_publish_to_parent(ft, ft_parent_node(iter_meta->parent_word),
 				detach_parent_flag_ptr, iter_node_flag,
 				holder_old_flag, &rec);
@@ -3077,7 +3099,8 @@ end:
  * still a SETTLED store there (read raw), see the list-off branch.
  */
 static
-int ft_promote_head(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
+int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
+		struct cds_ft_inode_flag *parent_nf, unsigned int parent_depth,
 		struct cds_ft_node **head_slot, struct cds_ft_node *node,
 		struct cds_ft_node *next_node,
 		struct cds_ft_metadata *held_holder, uintptr_t held_snap)
@@ -3142,8 +3165,8 @@ int ft_promote_head(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 		 * release so it composes with the held LOCK instead of the
 		 * masking guard-fallback that self-aborts on it.
 		 */
-		ft_flip_txn_hold_or_lock_parent(ft, txn, parent_nf,
-			held_holder, held_snap);
+		ft_flip_txn_hold_or_lock_parent(ft, txn, ctx, parent_nf,
+			parent_depth, held_holder, held_snap);
 		_ft_publish_to_parent_meta(ft, parent_nf,
 			(struct cds_ft_inode_flag **) head_slot,
 			(struct cds_ft_inode_flag *) next_node,
@@ -3214,8 +3237,8 @@ int ft_promote_head(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 		 * publishes into -- release when we hold its fence (see the cell
 		 * arm above).
 		 */
-		ft_flip_txn_hold_or_lock_parent(ft, txn, parent_nf,
-			held_holder, held_snap);
+		ft_flip_txn_hold_or_lock_parent(ft, txn, ctx, parent_nf,
+			parent_depth, held_holder, held_snap);
 		_ft_publish_to_parent_meta(ft, parent_nf,
 			(struct cds_ft_inode_flag **) head_slot,
 			(struct cds_ft_inode_flag *) next_node,
@@ -3238,7 +3261,8 @@ int ft_promote_head(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 }
 
 static
-int ft_unchain_node(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
+int ft_unchain_node(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
+		struct cds_ft_inode_flag *parent_nf, unsigned int parent_depth,
 		struct cds_ft_node **head_slot, struct cds_ft_node *node)
 {
 	struct cds_ft_metadata *hmeta = NULL;	/* MW LOCK_FINE holder lock */
@@ -3280,19 +3304,35 @@ int ft_unchain_node(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 		 */
 		assert(lock_nf);
 		{
-			struct cds_ft_metadata *lm = ft_flag_to_metadata(ft, lock_nf);
-#ifdef FEATURE_FT_FAULT_INJECT
-			if (cds_ft_fault_lock_countdown >= 0) {
-				if (cds_ft_fault_lock_countdown == 0) {
-					cds_ft_fault_lock_countdown = -1;
-					return -EAGAIN;
-				}
-				cds_ft_fault_lock_countdown--;
-			}
-#endif
-			if (ft_meta_lock_acquire(lm, &hsnap))
+			struct ft_held_anchor h;
+			unsigned int lock_depth = parent_depth;
+
+			/*
+			 * A DERIVED holder (interior detach, @parent_nf NULL)
+			 * carries no depth of its own -- the head's holder IS the
+			 * descent's parent (§5.2), so let the window date it.
+			 */
+			if (!parent_nf)
+				lock_depth = FT_DEPTH_FROM_DESCENT;
+			if (lock_depth == FT_DEPTH_FROM_DESCENT &&
+					!ft_lock_ctx_depth_of(ft, ctx, lock_nf,
+						&lock_depth))
 				return -EAGAIN;
-			hmeta = lm;
+			if (ft_acquire_member(ft, ctx, lock_nf,
+					ft_flag_to_metadata(ft, lock_nf),
+					lock_depth, &h))
+				return -EAGAIN;
+			/*
+			 * A holder the op ALREADY held is protected without a
+			 * second mark, and its release belongs to the acquire
+			 * that took it: leave @hmeta NULL so the publish below
+			 * routes to the ordinary guard rather than recording a
+			 * second terminal on the one word.
+			 */
+			if (!h.shared) {
+				hmeta = h.lock;
+				hsnap = h.lock_snap;
+			}
 		}
 	}
 
@@ -3365,7 +3405,8 @@ int ft_unchain_node(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 		 * and every early-fail path clears it directly.  No post-commit
 		 * clear here.
 		 */
-		return ft_promote_head(ft, parent_nf, head_slot, node,
+		return ft_promote_head(ft, ctx, parent_nf, parent_depth,
+			head_slot, node,
 				next_node, hmeta, hsnap);
 	} else {
 		/*
@@ -3407,7 +3448,8 @@ int ft_unchain_node(struct cds_ft *ft, struct cds_ft_inode_flag *parent_nf,
 		 * registered fence (so the flip_into abort below needs no manual
 		 * clear).
 		 */
-		ft_flip_txn_hold_or_lock_parent(ft, txn, parent_nf, hmeta, hsnap);
+		ft_flip_txn_hold_or_lock_parent(ft, txn, ctx, parent_nf,
+			parent_depth, hmeta, hsnap);
 		_ft_publish_to_parent(ft, parent_nf,
 			(struct cds_ft_inode_flag **) head_slot, NULL,
 			(struct cds_ft_inode_flag *) node, &rec);
@@ -3686,7 +3728,7 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 		 * any grandparent skip pointer to it -- is untouched, so no head
 		 * slot is needed.
 		 */
-		ret = ft_unchain_node(ft, NULL, NULL, node);
+		ret = ft_unchain_node(ft, &lctx, NULL, 0, NULL, node);
 	} else if (ft_node_compressed(holder_flag) ||
 		   ft_node_skip_compressed(holder_flag)) {
 		/*
@@ -3742,7 +3784,8 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 			 * descent or ft_skip_reanchor up-walk never follows the stale
 			 * skip pointer into the about-to-be-freed old head.
 			 */
-			ret = ft_unchain_node(ft, ft_compressed_node_flag(cn),
+			ret = ft_unchain_node(ft, &lctx,
+				ft_compressed_node_flag(cn), holder_depth,
 				(struct cds_ft_node **) head_slot, node);
 		}
 	} else if (ft_node_external_nodes(holder_flag) ==
@@ -3863,7 +3906,8 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 					/* VALIDATE (§4.B): lock (or guard-fallback) the
 					 * LIVE holder whose external_nodes this single-node
 					 * clear empties -- value-swap target (§10.5). */
-					ft_flip_txn_lock_or_guard_parent(ft, txn, holder_flag);
+					ft_flip_txn_lock_or_guard_parent(ft, txn, &lctx,
+					holder_flag, holder_depth);
 					ft_flip_txn_record_count_parent(ft, txn,
 						holder_flag, -1);
 					ret = ft_remove_one_commit(ft,
@@ -3874,7 +3918,8 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 						pub.armed = true;
 				} else {
 					/* List off + rank stats off: unchanged; no count. */
-					ret = ft_unchain_node(ft, holder_flag,
+					ret = ft_unchain_node(ft, &lctx, holder_flag,
+						holder_depth,
 						(struct cds_ft_node **) &holder_meta->external_nodes,
 						node);
 				}
@@ -3897,7 +3942,7 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 			}
 		} else {
 			/* Duplicates remain: head promotion (fresh-cell swap). */
-			ret = ft_unchain_node(ft, holder_flag,
+			ret = ft_unchain_node(ft, &lctx, holder_flag, holder_depth,
 				(struct cds_ft_node **) &holder_meta->external_nodes,
 				node);
 		}
@@ -3935,7 +3980,7 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 			/* @node's freeze rode the detach commit (freeze_leaf). */
 		} else {
 			/* Removing the head, duplicates remain: key count unchanged. */
-			ret = ft_unchain_node(ft, holder_flag,
+			ret = ft_unchain_node(ft, &lctx, holder_flag, holder_depth,
 				(struct cds_ft_node **) head_slot, node);
 		}
 	}
@@ -4431,7 +4476,8 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 				/* VALIDATE (§4.B): lock (or guard-fallback) the LIVE
 				 * holder whose external_nodes this clear empties --
 				 * value-swap target (§10.5). */
-				ft_flip_txn_lock_or_guard_parent(ft, txn, holder_flag);
+				ft_flip_txn_lock_or_guard_parent(ft, txn, &lctx,
+					holder_flag, holder_depth);
 				ft_flip_txn_record_count_parent(ft, txn,
 					holder_flag, -1);
 				ft_remove_one_commit(ft,

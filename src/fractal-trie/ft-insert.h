@@ -529,7 +529,9 @@ bool ft_probe_internal_is_empty(struct cds_ft *ft,
  */
 static
 void ft_insert_publish_or_park(struct cds_ft *ft,
+		const struct ft_lock_ctx *ctx,
 		struct cds_ft_inode_flag *parent_nf,
+		unsigned int parent_depth,
 		struct cds_ft_inode_flag **slot,
 		struct cds_ft_inode_flag *new_top,
 		struct cds_ft_inode_flag *expected_old,
@@ -577,8 +579,9 @@ void ft_insert_publish_or_park(struct cds_ft *ft,
 	if (ic->parent_lock_shared)
 		ft_flip_txn_guard_parent(ft, ic->txn, parent_nf);
 	else
-		ft_flip_txn_hold_or_lock_parent(ft, ic->txn, parent_nf,
-			ic->parent_locked_holder, ic->parent_locked_snap);
+		ft_flip_txn_hold_or_lock_parent(ft, ic->txn, ctx, parent_nf,
+			parent_depth, ic->parent_locked_holder,
+			ic->parent_locked_snap);
 	_ft_publish_to_parent(ft, parent_nf, slot, new_top, expected_old, &rec);
 	for (k = 0; k < rec.n; k++)
 		ft_flip_txn_record_reserved(ic->txn,
@@ -933,12 +936,11 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 		fret = ft_insert_dlm_acquire_split(ft, dsc, compressed_flag,
 				node_depth, cn_meta, &held, ic);
 	} else {
-		uintptr_t cn_fence;
+		struct ft_lock_ctx lctx;
 
-		fret = ft_meta_lock_acquire(cn_meta, &cn_fence);
-		if (!fret)
-			ft_held_anchor_set(&held, cn_meta, cn_fence, cn_meta,
-				cn_fence);
+		ft_lock_ctx_init(&lctx, dsc, ic ? ic->txn : NULL);
+		fret = ft_acquire_member(ft, &lctx, compressed_flag, cn_meta,
+			node_depth, &held);
 	}
 
 	if (fret)
@@ -1311,8 +1313,18 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 		goto error;
 	}
 #endif
-	ft_insert_publish_or_park(ft, cur_parent, parent_slot, top_flag,
-		fwd_expected_old, ic);
+	{
+		struct ft_lock_ctx pctx;
+
+		/*
+		 * @cur_parent came from CN's back-pointer, so the descent's
+		 * window is what dates it.
+		 */
+		ft_lock_ctx_init(&pctx, dsc, ic ? ic->txn : NULL);
+		ft_insert_publish_or_park(ft, &pctx, cur_parent,
+			FT_DEPTH_FROM_DESCENT, parent_slot, top_flag,
+			fwd_expected_old, ic);
+	}
 
 	/*
 	 * 7. Free the old compressed node.  Parked publish: readers resolve
@@ -1985,7 +1997,8 @@ int ft_attach_node(struct cds_ft *ft,
 			 */
 			if (iter_dest_node_flag == attach_node_flag)
 				ft_flip_txn_lock_or_guard_parent(ft, ic->txn,
-					iter_dest_node_flag);
+					ctx, iter_dest_node_flag,
+					FT_DEPTH_FROM_DESCENT);
 			if (count_deferred)
 				ft_flip_txn_record_nr_child_inc(ic->txn, metadata);
 			ft_flip_txn_record_reserved(ic->txn, (void **) slot_ptr,
@@ -2203,8 +2216,9 @@ int ft_attach_node(struct cds_ft *ft,
 			 * (f7cc59f9), which is what the ft_get_parent_slot
 			 * mismatch just above already does for the stale-slot case.
 			 */
-			ft_flip_txn_lock_or_guard_parent(ft, ic->txn,
-				ft_parent_node(attach_meta->parent_word));
+			ft_flip_txn_lock_or_guard_parent(ft, ic->txn, ctx,
+				ft_parent_node(attach_meta->parent_word),
+				FT_DEPTH_FROM_DESCENT);
 #ifdef FEATURE_FT_PROBE_EMPTY_INSERT
 			__atomic_fetch_add(&cds_ft_probe_reach_attach, 1,
 				__ATOMIC_RELAXED);
@@ -2474,8 +2488,13 @@ int ft_insert_compressed_past_child(struct cds_ft *ft,
 	ic->live_parent = branch;
 	ic->live_slot = NULL;
 	/* &cn->child's plan-snapshot old is the displaced child == ic->live_child. */
-	ft_insert_publish_or_park(ft, d->nf, &cn->child, branch,
-		ic->live_child, ic);
+	{
+		struct ft_lock_ctx pctx;
+
+		ft_lock_ctx_init(&pctx, d, ic ? ic->txn : NULL);
+		ft_insert_publish_or_park(ft, &pctx, d->nf, d->depth,
+			&cn->child, branch, ic->live_child, ic);
+	}
 	/*
 	 * I5 count fold: @d->nf is the STABLE compressed node whose child slot
 	 * (&cn->child) this commit flips to the fresh branch; the branch was
@@ -2710,8 +2729,13 @@ int ft_insert_compressed_key_shorter(struct cds_ft *ft,
 	ic->live_child = live_child;
 	ic->live_parent = live_parent;
 	ic->live_slot = live_slot;
-	ft_insert_publish_or_park(ft, d->pnf, d->nfp, top_flag,
-		fwd_expected_old, ic);
+	{
+		struct ft_lock_ctx pctx;
+
+		ft_lock_ctx_init(&pctx, d, ic ? ic->txn : NULL);
+		ft_insert_publish_or_park(ft, &pctx, d->pnf, d->pdepth,
+			d->nfp, top_flag, fwd_expected_old, ic);
+	}
 	/*
 	 * I4 count fold: @d->pnf is the STABLE parent whose child slot (d->nfp)
 	 * this commit flips from the old compressed node to the fresh split
