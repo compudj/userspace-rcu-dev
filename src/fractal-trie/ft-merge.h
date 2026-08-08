@@ -1583,7 +1583,9 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 						+ 1 /* §4.B parent guard */
 						/* + count walk: the (merged_keys - cnt_dst) nr_keys ancestor
 						 * edges (BULK fold), bounded by the merge-point depth */
-						+ (dst_ft->rank_stats ? (int) dst_key_len + 1 : 0))) {
+						+ (dst_ft->rank_stats ? (int) dst_key_len + 1 : 0)
+				/* the split-retire terminal's second word, if any */
+				+ ft_glue_split_cn_reserve(dst_ft))) {
 				ft_flip_txn_destroy(txn);
 				txn = NULL;
 			} else if (txn) {

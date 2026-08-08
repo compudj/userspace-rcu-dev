@@ -1722,6 +1722,20 @@ unsigned int ft_freeze_reserve(const struct cds_ft *ft, unsigned int n)
 }
 
 /*
+ * Extra edges a GLUE build's split-retire terminal costs beyond its per-node
+ * form.  Per-node fuses the terminal into one {LOCK|s -> TOMBSTONE|s} on the one
+ * word @cn's lock and @cn's body share; coarsening splits it into a tombstone on
+ * @cn plus a release on its anchor.  A glue that sets @fence_split_cn budgets
+ * this so its post-detach publish stays the infallible step it is documented to
+ * be.
+ */
+static inline
+unsigned int ft_glue_split_cn_reserve(const struct cds_ft *ft)
+{
+	return ft->lock_spacing == CDS_FT_LOCK_SPACING_PER_NODE ? 0 : 1;
+}
+
+/*
  * "@ctx's descent knows the depth; look it up."
  *
  * A site that reached its member through a BACK-POINTER usually cannot name a
@@ -6174,8 +6188,18 @@ struct ft_glue {
 	 * @cn bails); the held {LOCK|s -> TOMBSTONE|s} RETIRE at commit (@cn is
 	 * replaced, not edited) flips atomically with the forward publish.  NULL =
 	 * not pre-acquired (non-lock_fine, or a NOSPLIT / root-splice publish).
+	 *
+	 * @split_cn_holder is the word the acquire LOCKED -- @cn's ANCHOR -- and
+	 * @split_cn_node is @cn's OWN word, the one the retire tombstones.  Under
+	 * per-node granularity they are the same word and the terminal is the
+	 * single fused {LOCK|s -> TOMBSTONE|s}; coarsening splits them, and then
+	 * the anchor takes a RELEASE while the tombstone lands on @cn.  Retiring
+	 * the anchor instead would tombstone a LIVE ancestor -- the very node this
+	 * graft publishes into.
 	 */
 	struct cds_ft_metadata *split_cn_holder;
+	struct cds_ft_metadata *split_cn_node;
+	uintptr_t split_cn_node_snap;
 	/*
 	 * A LOCK this op holds OUTSIDE the glue, for reconciliation ONLY: the
 	 * glue reads it in ft_glue_op_holds and never clears it -- the caller that
@@ -6313,6 +6337,8 @@ void ft_glue_init(struct ft_glue *g)
 	g->publish_parent_holder = NULL;
 	g->publish_parent_snap = 0;
 	g->split_cn_holder = NULL;
+	g->split_cn_node = NULL;
+	g->split_cn_node_snap = 0;
 	g->caller_holder = NULL;
 	g->split_cn_snap = 0;
 	g->fence_split_cn = false;
@@ -7540,8 +7566,12 @@ void ft_glue_tombstone_free_list(struct ft_glue *g)
 		 * permanent poison: every commit aborts), so skip it -- @cn stays
 		 * on the free list (retired) for reclaim, its LIVE->DEAD
 		 * transition owned by the fenced retire.
+		 *
+		 * Matched on @cn's OWN word, which is what both this sweep and
+		 * that terminal write; the anchor the acquire locked is a
+		 * different word under any coarser granularity.
 		 */
-		if (g->split_cn_holder == meta)
+		if (g->split_cn_node == meta)
 			continue;
 		/*
 		 * DLM overlap-spine plan-lock: this node's node lock is HELD, and
@@ -7921,8 +7951,26 @@ enum urcu_txn_status ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue 
 	 * (non-lock_fine / NOSPLIT / root splice) records nothing, byte-identical.
 	 */
 	if (g->split_cn_holder) {
-		ft_flip_txn_record_tombstone_locked(g->txn, g->split_cn_holder,
-			g->split_cn_snap);
+		/*
+		 * The two words the acquire distinguished: @cn takes the
+		 * TOMBSTONE, its anchor the RELEASE.  ft_flip_txn_record_retire_
+		 * anchored fuses them into the single {LOCK|s -> TOMBSTONE|s}
+		 * whenever the anchor IS @cn (always, under per-node), and
+		 * ft_flip_txn_record_anchor_release is then a no-op -- so the
+		 * default granularity records byte-identically to before.
+		 */
+		struct ft_held_anchor sh = {
+			.lock = g->split_cn_holder,
+			.lock_snap = g->split_cn_snap,
+			.node_snap = g->split_cn_node_snap,
+			.shared = false,
+			.node_held = false,
+		};
+
+		ft_flip_txn_record_retire_anchored(g->txn, &sh,
+			g->split_cn_node);
+		ft_flip_txn_record_anchor_release(g->txn, &sh,
+			g->split_cn_node);
 		ft_flip_txn_lock_register(g->txn, g->split_cn_holder,
 			g->split_cn_snap);
 		/*
@@ -7939,6 +7987,8 @@ enum urcu_txn_status ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue 
 		 */
 		g->split_cn_holder = NULL;
 		g->split_cn_snap = 0;
+		g->split_cn_node = NULL;
+		g->split_cn_node_snap = 0;
 	}
 	/*
 	 * Ordered list on: also record the <=4 boundary cell edges the caller

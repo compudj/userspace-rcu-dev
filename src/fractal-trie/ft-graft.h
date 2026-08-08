@@ -91,6 +91,8 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 			return -EAGAIN;	/* peer owns @cn; nothing built */
 		glue->split_cn_holder = sh.lock;
 		glue->split_cn_snap = sh.lock_snap;
+		glue->split_cn_node = cn_meta;
+		glue->split_cn_node_snap = sh.node_snap;
 	}
 	unsigned int suffix_len = cn->len - diverge_pos - 1;
 	uint8_t old_ordinal = cn->key_bytes[diverge_pos];
@@ -1567,7 +1569,9 @@ retry_attach:
 					/* +1 fused nil-key wrapper tombstone (exclusive nil-key src) */
 					+ ((src_ft->exclusive && nil_key_root) ? 1 : 0)
 					/* + count walk: the +src_count nr_keys ancestor edges (BULK fold) */
-					+ (dst_ft->rank_stats ? (int) key_len + 1 : 0))) {
+					+ (dst_ft->rank_stats ? (int) key_len + 1 : 0)
+					/* the split-retire terminal's second word, if any */
+					+ ft_glue_split_cn_reserve(dst_ft))) {
 				if (glue.txn)
 					ft_flip_txn_destroy(glue.txn);
 				if (already_swapped)
@@ -1715,6 +1719,8 @@ retry_attach:
 					ft_meta_lock_release(glue.split_cn_holder);
 					glue.split_cn_holder = NULL;
 					glue.split_cn_snap = 0;
+					glue.split_cn_node = NULL;
+					glue.split_cn_node_snap = 0;
 				}
 				if (src_retire_txn)
 					ft_flip_txn_destroy(src_retire_txn);
@@ -1731,6 +1737,8 @@ retry_attach:
 					ft_meta_lock_release(glue.split_cn_holder);
 					glue.split_cn_holder = NULL;
 					glue.split_cn_snap = 0;
+					glue.split_cn_node = NULL;
+					glue.split_cn_node_snap = 0;
 				}
 				ft_flip_txn_destroy(glue.txn);
 				free_cds_ft_node_unpublished(src_ft, fresh_node);
