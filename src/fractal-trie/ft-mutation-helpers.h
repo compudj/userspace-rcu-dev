@@ -1159,6 +1159,18 @@ void ft_hold_trace_refused(const struct cds_ft_metadata *lock, const char *fn,
 				ft_hold_trace[i].fn, ft_hold_trace[i].line);
 		abort();
 	}
+	/*
+	 * LOCK is set and the ledger does not name the word.  Under a single
+	 * writer that is not contention -- there is no peer -- it is a mark this
+	 * thread LEAKED: taken, dropped from the ledger by a terminal its commit
+	 * did not apply, and never released.  The next attempt then refuses
+	 * against it forever, which is a retry storm rather than a failure.
+	 */
+	if (ft_hold_trace_report_ok())
+		fprintf(stderr,
+			"FT REFUSED (LOCK, unknown holder): %s:%d word %p state=%lx\n",
+			fn, line, (const void *) lock,
+			(unsigned long) CMM_LOAD_SHARED(lock->state));
 }
 #else
 static inline

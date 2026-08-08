@@ -317,7 +317,7 @@ enum cds_ft_status cds_ft_group_attr_set_writer_strategy(
 static
 enum cds_ft_lock_spacing ft_lock_spacing_default(void)
 {
-#ifdef FEATURE_FT_ANCHOR_VALIDATE
+#if defined(FEATURE_FT_ANCHOR_VALIDATE) || defined(FEATURE_FT_HOLD_TRACE)
 	const char *env = getenv("CDS_FT_LOCK_SPACING");
 
 	if (env) {
