@@ -349,18 +349,17 @@ struct cds_ft_inode_flag *ft_merge_build_run(struct ft_merge_ctx *c,
 static inline
 int ft_merge_lock_overlap(const struct cds_ft *ft,
 		const struct ft_lock_ctx *ctx, struct cds_ft_inode_flag *nf,
-		unsigned int depth, void *node, uintptr_t *snap)
+		unsigned int depth, void *node, struct ft_held_anchor *held)
 {
-	{
-		struct cds_ft_metadata *m = cds_ft_item_to_metadata(
-			(struct cds_ft_inode *) node);
-		struct ft_held_anchor held;
-		int ret = ft_acquire_member(ft, ctx, nf, m, depth, &held);
+	struct cds_ft_metadata *m = cds_ft_item_to_metadata(
+		(struct cds_ft_inode *) node);
 
-		if (!ret)
-			*snap = held.node_snap;
-		return ret;
-	}
+	/*
+	 * Hand the WHOLE held anchor back, not just @node's clean word: the
+	 * fenced retire this fence pays for is recorded against the word the
+	 * acquire LOCKED, which coarsening makes an ancestor of @node.
+	 */
+	return ft_acquire_member(ft, ctx, nf, m, depth, held);
 }
 
 static
@@ -378,9 +377,9 @@ struct cds_ft_inode_flag *ft_merge_build(struct ft_merge_ctx *c,
 	unsigned long total_keys = 0;
 	bool tracked = false;
 	unsigned int b, s_fb = 0, d_fb = 0;
-	uintptr_t d_ov_snap = 0;	/* this frame's dst overlap fence snapshot */
+	struct ft_held_anchor d_ov_held = { 0 };	/* this frame's dst overlap fence */
 	bool d_ov_fenced = false;
-	uintptr_t s_ov_snap = 0;	/* and the src side's, when @fence_src */
+	struct ft_held_anchor s_ov_held = { 0 };	/* and the src side's, when @fence_src */
 	bool s_ov_fenced = false;
 
 	S = ft_resolve_skip_compressed(ft, S);
@@ -418,12 +417,12 @@ struct cds_ft_inode_flag *ft_merge_build(struct ft_merge_ctx *c,
 
 			ft_glue_lock_ctx(c->gs, &sctx);
 			if (ft_merge_lock_overlap(ft, &sctx, S, depth, snode,
-					&s_ov_snap)) {
+					&s_ov_held)) {
 				c->overlap_contended = true;
 				return FT_MERGE_OOM;
 			}
 			ft_glue_defer_free_fenced(c->gs, snode, S_comp,
-				s_ov_snap);
+				&s_ov_held);
 			s_ov_fenced = true;
 		}
 	}
@@ -456,7 +455,7 @@ struct cds_ft_inode_flag *ft_merge_build(struct ft_merge_ctx *c,
 
 			ft_glue_lock_ctx(c->gd, &dctx);
 			if (ft_merge_lock_overlap(ft, &dctx, D, depth, dnode,
-					&d_ov_snap)) {
+					&d_ov_held)) {
 				c->overlap_contended = true;
 				return FT_MERGE_OOM;
 			}
@@ -474,7 +473,7 @@ struct cds_ft_inode_flag *ft_merge_build(struct ft_merge_ctx *c,
 			 * if this build reaches its commit.
 			 */
 			ft_glue_defer_free_fenced(c->gd, dnode, D_comp,
-				d_ov_snap);
+				&d_ov_held);
 			d_ov_fenced = true;
 		}
 	}

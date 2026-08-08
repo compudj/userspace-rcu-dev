@@ -6043,6 +6043,21 @@ struct ft_glue_free_item {
 	 */
 	bool fenced;
 	uintptr_t snap;
+	/*
+	 * The word the acquire actually LOCKED -- @node's ANCHOR -- with its own
+	 * clean snapshot.  Under per-node granularity it IS @node's metadata and
+	 * the terminal fuses to the single {LOCK|s -> TOMBSTONE|s}; coarsening
+	 * splits the two, and then @node takes the TOMBSTONE while the anchor
+	 * takes a RELEASE.  Recording the fenced terminal against the NODE alone
+	 * names a LOCK the node does not carry: the install mismatches, the
+	 * commit aborts, and the merge reports OK on top of it.
+	 *
+	 * @holder_shared: the op ALREADY held that word, so this entry owes no
+	 * release -- the acquire that first took it recorded one.
+	 */
+	struct cds_ft_metadata *holder;
+	uintptr_t holder_snap;
+	bool holder_shared;
 };
 
 /*
@@ -7025,6 +7040,9 @@ void ft_glue_defer_free(struct ft_glue *g,
 	g->free_list[g->nr_free].compressed = compressed;
 	g->free_list[g->nr_free].retired = true;
 	g->free_list[g->nr_free].fenced = false;
+	g->free_list[g->nr_free].holder = NULL;
+	g->free_list[g->nr_free].holder_snap = 0;
+	g->free_list[g->nr_free].holder_shared = false;
 	g->free_list[g->nr_free].snap = 0;
 	g->nr_free++;
 }
@@ -7046,14 +7064,17 @@ void ft_glue_defer_free(struct ft_glue *g,
  */
 static
 void ft_glue_defer_free_fenced(struct ft_glue *g,
-		void *node, bool compressed, uintptr_t snap)
+		void *node, bool compressed, const struct ft_held_anchor *h)
 {
 	assert(g->nr_free < g->cap_free);
 	g->free_list[g->nr_free].node = node;
 	g->free_list[g->nr_free].compressed = compressed;
 	g->free_list[g->nr_free].retired = true;
 	g->free_list[g->nr_free].fenced = true;
-	g->free_list[g->nr_free].snap = snap;
+	g->free_list[g->nr_free].snap = h->node_snap;
+	g->free_list[g->nr_free].holder = h->lock;
+	g->free_list[g->nr_free].holder_snap = h->lock_snap;
+	g->free_list[g->nr_free].holder_shared = h->shared;
 	g->nr_free++;
 }
 
@@ -7091,8 +7112,12 @@ bool ft_glue_fence_holds(const struct ft_glue *g,
 	for (i = 0; i < g->nr_free; i++) {
 		if (!g->free_list[i].fenced)
 			continue;
-		if (cds_ft_item_to_metadata((struct cds_ft_inode *)
-				g->free_list[i].node) == meta)
+		/*
+		 * The caller asks about the word it would ACQUIRE, so compare
+		 * the word this entry HOLDS.  Comparing the node instead makes
+		 * a coarsened entry answer for a word it never took.
+		 */
+		if (g->free_list[i].holder == meta)
 			return true;
 	}
 	return false;
@@ -7128,8 +7153,14 @@ void ft_glue_clear_fenced(struct ft_glue *g)
 	for (i = 0; i < g->nr_free; i++) {
 		if (!g->free_list[i].fenced)
 			continue;
-		ft_meta_lock_release_if_held(cds_ft_item_to_metadata(
-			(struct cds_ft_inode *) g->free_list[i].node));
+		/*
+		 * Release the word the acquire TOOK, which coarsening makes an
+		 * ancestor rather than the node itself.  A shared entry took
+		 * none, so it releases none -- the entry that first held the
+		 * word owns that release.
+		 */
+		if (!g->free_list[i].holder_shared && g->free_list[i].holder)
+			ft_meta_lock_release_if_held(g->free_list[i].holder);
 		g->free_list[i].fenced = false;
 	}
 }
@@ -7652,6 +7683,13 @@ void ft_glue_tombstone_free_list(struct ft_glue *g)
 		 * LIVE->TOMBSTONE transition and owns no free.
 		 */
 		if (g->free_list[i].fenced) {
+			struct ft_held_anchor h = {
+				.lock = g->free_list[i].holder,
+				.lock_snap = g->free_list[i].holder_snap,
+				.node_snap = g->free_list[i].snap,
+				.shared = g->free_list[i].holder_shared,
+				.node_held = false,
+			};
 			uintptr_t cur;
 
 			assert(g->fuse_free_list);
@@ -7659,8 +7697,19 @@ void ft_glue_tombstone_free_list(struct ft_glue *g)
 				(void **) &meta->state, FT_STATE_PROXY);
 			if (cur & FT_STATE_TOMBSTONE)
 				g->free_list[i].retired = false;
-			ft_flip_txn_record_tombstone_locked(g->txn, meta,
-				g->free_list[i].snap);
+			/*
+			 * @meta takes the TOMBSTONE, its anchor the RELEASE --
+			 * fused back into the one {LOCK|s -> TOMBSTONE|s} record
+			 * whenever the anchor IS @meta, which is always under
+			 * per-node.  A member that deduped onto a word this op
+			 * already holds owes no release: the acquire that first
+			 * took it recorded one, and a second settles one word
+			 * twice.
+			 */
+			ft_flip_txn_record_retire_anchored(g->txn, &h, meta);
+			if (!h.shared)
+				ft_flip_txn_record_anchor_release(g->txn, &h,
+					meta);
 			continue;
 		}
 		/*
