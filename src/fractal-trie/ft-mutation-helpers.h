@@ -3509,9 +3509,28 @@ void ft_flip_txn_lock_or_guard_parent_at(const char *fn, int line,
 			 * one word is the ordering rule's harmless no-op (it
 			 * reads the record's own pending clean value and
 			 * validates {s -> s}), never the poison order.
+			 *
+			 * Except on the word the op HOLDS.  The guard's
+			 * expectation is clean-LIVE, which masks out the very
+			 * FT_STATE_LOCK this op set, so it names a value the
+			 * word has not carried since the mark landed -- and
+			 * the member that took the word records its terminal
+			 * LATER in the commit, which is the poison order the
+			 * ordering rule above forbids.  Per-node granularity
+			 * cannot reach it (the holder is @parent_nf's own
+			 * metadata and its release is already recorded, so the
+			 * RYW value really is clean); coarsening splits the
+			 * two apart, and then the op's own mark is what the
+			 * guard would be validating against.  The mark is the
+			 * stronger statement anyway -- it is the exclusion the
+			 * guard approximates, already in force -- so the word
+			 * it protects owes nothing here.
 			 */
 			if (held.shared) {
-				ft_flip_txn_guard_parent(ft, t, parent_nf);
+				if (held.lock != ft_flag_to_metadata(ft, parent_nf)
+						&& !held.node_held)
+					ft_flip_txn_guard_parent(ft, t,
+						parent_nf);
 				return;
 			}
 			ft_flip_txn_record_release_lock(t, held.lock,
