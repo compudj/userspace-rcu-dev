@@ -789,13 +789,50 @@ defects now (split_cn, the detach's held set, this) have been one sentence:
 per-node fuses a node's two words into one, so every site that conflates them
 is correct until coarsening splits them apart.
 
+### The named merge hangs: both CLOSED
+
+**root-only `test_merge_rekey_same_trie`** — `ft_graft_keylen` fenced
+`@publish_parent` through a ctx built by `ft_lock_ctx_init`, which carries no
+glue, so the acquire's dedupe could not see this op's own held set. Measured:
+`pp_meta == glue.split_cn_holder`, `state=0x80004` — the acquire refusing the
+word the GLUE build had already fenced, the same `-EAGAIN` every attempt. The
+comment above the site already stated the rule ("a miss is a clean re-descend
+for a PEER's hold, never for the op's own, so the dedupe has to see this one")
+and the ROUTING had been converted for it; the CONTEXT had not.
+
+★ Converting a site to route through the choke point is only half of it: the
+choke point answers from the ctx it is GIVEN. A bare ctx makes the dedupe blind
+and the op refuses itself — which reads exactly like contention.
+
+Then `|| fh.shared` had to go with it. SHARED is the dedupe SUCCEEDING: the op
+holds the word, the exclusion is in force, and the member owes no release and no
+terminal. Leaving the holder unset routes the commit through
+`ft_flip_txn_hold_or_lock_parent`'s ordinary acquire-or-guard path, whose own
+shared arm records nothing for that same reason.
+
+**exponential `test_merge_compressed_overlap`** —
+`ft_glue_acquire_splice_holders` dated a chain head's holder from the descent's
+WINDOW, and bailed as contention when that failed. The holder is reached by
+walking a head's prev, so the window is the only thing that can date it — and a
+merge point at the ROOT descends an empty key, so the descent has passed
+nothing and the lookup can NEVER succeed.
+
+★ **The depth was known where it was produced.** `ft_merge_build` records the
+splice from the frame that owns the node holding that head, so it knows that
+node's byte-depth. Carry it on the splice record instead of re-deriving it from
+a structure that cannot hold it.
+
 ### Where the arms stand
 
 | arm | unit | inv |
 |---|---|---|
 | per-node | 307/307 | 111/111 |
-| root-only | hangs 109 `test_merge_rekey_same_trie` | hangs 3 |
-| exponential | hangs 244 `test_merge_compressed_overlap` | hangs 4 |
+| root-only | **111** (was 108) — hangs at 112 `test_rekey_fixed_len_atomic_or_refused` | hangs 3 |
+| exponential | **292** (was 244) — ABORTS at 293 | hangs 4 |
+
+Exponential now runs 292 of 307 and fails on an ASSERT rather than a timeout,
+which is a much better failure to work with than anything this arm has produced
+so far.
 
 ### Still open in ft_descent_anchor_at_level
 
