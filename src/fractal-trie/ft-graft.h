@@ -1089,6 +1089,16 @@ enum ft_graft_prep ft_graft_build(struct cds_ft *ft,
 	const uint8_t *ik = key;
 
 	ft_descent_init(d, ft);
+	/*
+	 * Hand @glue the anchor source as the descent that will supply it is
+	 * created: the glue's own acquires -- its publish parent above all --
+	 * fire from commit helpers that never see @d, and an acquire with no
+	 * depth under a coarse spacing MISSES, which aborts a commit the
+	 * unfailable arms cannot retry.  That is a livelock, not a failure.
+	 * ft_store_at_graft_point_prepare repeats it for the callers that reach
+	 * it without building.
+	 */
+	glue->lock_d = d;
 	for (; d->depth < key_len; ) {
 		if (ft_node_external(d->nf))
 			break;

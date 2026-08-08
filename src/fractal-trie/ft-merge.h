@@ -1422,6 +1422,16 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	ft_merge_count(dst_ft, S, off_src, D, off_dst, &cnt);
 	ft_glue_init(&gd);
 	ft_glue_init(&gs);
+	/*
+	 * The dst glue's own acquires -- @pub_parent, above all -- fire from
+	 * commit helpers that never see a descent, so hand them the destination
+	 * one here, the single place holding both (the graft does the same at its
+	 * ft_glue_set_publish).  @pub_parent is @d_dst's own parent or
+	 * grandparent, so the window dates it; without this the acquire has no
+	 * depth under a coarse spacing and its miss aborts a commit the unfailable
+	 * arm cannot retry -- which is a LIVELOCK, not a failure.
+	 */
+	gd.lock_d = d_dst;
 	if (ft_glue_reserve(&gd, cnt.nb + 8, cnt.nd + 8,
 				cnt.nf_dst + 8, cnt.ns + 8) ||
 	    ft_glue_reserve(&gs, 0, 0, cnt.nf_src + 8, 0)) {
@@ -2102,7 +2112,7 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		{
 			struct ft_lock_ctx mctx;
 
-			ft_lock_ctx_init(&mctx, NULL, txn);
+			ft_glue_lock_ctx(&gd, &mctx);
 			ft_flip_txn_hold_or_lock_parent(dst_ft, txn, &mctx,
 				pub_parent, FT_DEPTH_FROM_DESCENT,
 				gd.publish_parent_holder,
