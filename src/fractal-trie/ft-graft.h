@@ -1931,14 +1931,23 @@ retry_attach:
 				 * identical shape.  A miss is a clean re-descend
 				 * for a PEER's hold, never for the op's own, so
 				 * the dedupe has to see this one.
+				 *
+				 * Which takes the GLUE's ctx, not a bare one:
+				 * the glue's marks are part of this op's held
+				 * set, and @fence_parent is routinely the very
+				 * word the build fenced as @split_cn_holder.
+				 * ft_lock_ctx_init carries no glue, so the
+				 * dedupe cannot see that hold and the acquire
+				 * refuses the op's own mark after all.  The
+				 * descent stays this site's own.
 				 */
-				ft_lock_ctx_init(&fctx, &d, glue.txn);
+				ft_glue_lock_ctx(&glue, &fctx);
+				fctx.d = &d;
 				if (!ft_lock_ctx_depth_of(dst_ft, &fctx,
 							fence_parent, &fdep) ||
 						ft_acquire_member(dst_ft, &fctx,
 							fence_parent, pp_meta,
-							fdep, &fh) ||
-						fh.shared) {
+							fdep, &fh)) {
 					/*
 					 * A miss (@publish_parent already retired / proxied /
 					 * peer-locked) is a clean re-descend, src pristine.
@@ -1961,8 +1970,24 @@ retry_attach:
 						free_cds_ft_node_unpublished(src_ft, fresh_node);
 					goto retry_attach;
 				}
-				glue.publish_parent_holder = fh.lock;
-				glue.publish_parent_snap = fh.lock_snap;
+				/*
+				 * SHARED is the dedupe SUCCEEDING, not a miss:
+				 * the op already holds the word protecting
+				 * @fence_parent, so the exclusion this fence
+				 * exists for is in force, and the member owes no
+				 * release and no terminal -- the acquire that
+				 * first took the word recorded both.  Leave the
+				 * holder unset and the commit's
+				 * ft_flip_txn_hold_or_lock_parent takes its
+				 * ordinary acquire-or-guard route, whose own
+				 * shared arm records nothing for that same
+				 * reason.  Bailing here refuses the op's OWN
+				 * hold, which no re-descend can clear.
+				 */
+				if (!fh.shared) {
+					glue.publish_parent_holder = fh.lock;
+					glue.publish_parent_snap = fh.lock_snap;
+				}
 			}
 		}
 
