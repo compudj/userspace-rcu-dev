@@ -513,7 +513,7 @@ struct cds_ft_inode_flag *ft_merge_build(struct ft_merge_ctx *c,
 	 * parent frame wires the slot and the dst head's back-pointer.
 	 */
 	if (S_ext && D_ext) {
-		ft_glue_record_splice(c->gd, D_leaf, S_leaf);
+		ft_glue_record_splice(c->gd, D_leaf, S_leaf, depth);
 		*nr_keys_ret = 1;
 		return D;
 	}
@@ -663,7 +663,7 @@ struct cds_ft_inode_flag *ft_merge_build(struct ft_merge_ctx *c,
 	/* Merged external_nodes (the key terminating at M itself). */
 	if (S_leaf && D_leaf) {
 		M_ext = D_leaf;
-		ft_glue_record_splice(c->gd, D_leaf, S_leaf);
+		ft_glue_record_splice(c->gd, D_leaf, S_leaf, depth);
 	} else if (D_leaf) {
 		M_ext = D_leaf;
 	} else {

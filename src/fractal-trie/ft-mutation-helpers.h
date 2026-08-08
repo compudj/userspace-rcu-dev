@@ -6138,6 +6138,15 @@ struct ft_glue_splice {
 	 */
 	struct cds_ft_metadata *holder;
 	uintptr_t holder_snap;
+	/*
+	 * The byte-depth of the node that HOLDS @dst_head, captured where the
+	 * splice is recorded -- the merge frame that owns that node knows it.
+	 * The descent cannot supply it: the holder is reached by walking a
+	 * chain head's prev, and for a merge point at the root the descent has
+	 * passed nothing at all, so ft_lock_ctx_depth_of fails and the acquire
+	 * bails to a re-descend that must fail identically forever.
+	 */
+	unsigned int holder_depth;
 };
 
 /*
@@ -8218,9 +8227,11 @@ enum urcu_txn_status ft_glue_txn_commit_replace(struct cds_ft *ft,
 static
 void ft_glue_record_splice(struct ft_glue *g,
 		struct cds_ft_node *dst_head,
-		struct cds_ft_node *src_head)
+		struct cds_ft_node *src_head,
+		unsigned int holder_depth)
 {
 	assert(g->nr_splices < g->cap_splices);
+	g->splices[g->nr_splices].holder_depth = holder_depth;
 	g->splices[g->nr_splices].dst_head = dst_head;
 	g->splices[g->nr_splices].src_head = src_head;
 	g->splices[g->nr_splices].src_cell = NULL;
@@ -8323,8 +8334,7 @@ int ft_glue_acquire_splice_holders(struct cds_ft *ft, struct ft_glue *g)
 		 * contended holder does.
 		 */
 		ft_glue_lock_ctx(g, &sctx);
-		if (!ft_lock_ctx_depth_of(ft, &sctx, hf, &hd))
-			goto miss;
+		hd = g->splices[i].holder_depth;
 		anchor = ft_anchor_meta(ft, ft_lock_ctx_descent(&sctx), hf, hm,
 			hd);
 		/*
