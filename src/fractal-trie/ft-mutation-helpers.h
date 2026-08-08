@@ -426,25 +426,16 @@ struct cds_ft_inode_flag *ft_descent_anchor_of(const struct ft_descent *d,
 	case CDS_FT_LOCK_SPACING_EXPONENTIAL:
 	default:
 		/*
-		 * A node whose own start IS a lock level is the first boundary
-		 * at that level, so §2 makes it its own anchor -- a pure
-		 * function of @depth, settled without consulting any descent.
-		 *
-		 * Answering it here is what keeps §1's agreement for a member
-		 * OFF the descent's path: the table describes the path the
-		 * descent took, so for a node the descent never passed (the
-		 * detach's orphan walk leaves the key path, and a sibling
-		 * reached by back-pointer was never on it) the arms below
-		 * answer from the wrong path -- handing back the CURSOR's node,
-		 * or NULL where the descent walked off the trie.  Two ops then
-		 * disagree about one node's anchor, which is the one property
-		 * coarsening rests on.
-		 *
-		 * The root is this same rule at depth 0, which ft_anchor_meta
-		 * already applies before any of this.
+		 * A node starting ON a lock level never reaches here --
+		 * ft_anchor_meta settles it from the depth alone.  What is left
+		 * is the depths that genuinely need the table, and the table
+		 * describes the path the DESCENT took: for a node it never
+		 * passed (the detach's orphan walk leaves the key path, a
+		 * sibling reached by back-pointer was never on it) the arms
+		 * below answer from the wrong path -- the CURSOR's node, or
+		 * NULL where the descent walked off the trie.  Such a caller
+		 * must extend the descent rather than reach further from here.
 		 */
-		if (ft_lock_level(depth) == depth)
-			return nf;
 		if (depth > d->depth)
 			return ft_descent_anchor_child(d, nf, depth);
 		return ft_descent_anchor(d, depth);
@@ -480,6 +471,25 @@ struct cds_ft_metadata *ft_anchor_meta(const struct cds_ft *ft,
 	 */
 	if (!depth)
 		return node;
+	/*
+	 * A node starting ON a lock level is the first boundary at that level,
+	 * so §2 settles its anchor from @depth alone -- the same rule the root
+	 * case above is, at level 0.  No descent is read, so a DESCENT-LESS
+	 * site is legal for it: the assert below guards only the depths that
+	 * genuinely need a table.
+	 */
+	if (ft->lock_spacing == CDS_FT_LOCK_SPACING_EXPONENTIAL &&
+			ft_lock_level(depth) == depth)
+		return node;
+	/*
+	 * Root-only anchors every member on the trie's ROOT, which a
+	 * descent-less site can name directly -- ft_descent_init reads this
+	 * same slot the same way, so both routes answer with one node, which is
+	 * what §1's agreement asks.
+	 */
+	if (ft->lock_spacing == CDS_FT_LOCK_SPACING_ROOT_ONLY && !d)
+		return ft_flag_to_metadata(ft, ft_resolve_flip_proxy(
+			rcu_dereference(ft->root)));
 	assert(d);
 	anchor = ft_descent_anchor_of(d, nf, depth);
 	/*
