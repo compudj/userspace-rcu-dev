@@ -1940,53 +1940,31 @@ unsigned int ft_glue_split_cn_reserve(const struct cds_ft *ft)
  * transacted sibling cannot do that -- its mark lands only at the commit -- and
  * pays for it with a sample-then-guard instead.
  */
+struct ft_dlm_member {
+	struct cds_ft_inode_flag *nf;
+	struct cds_ft_metadata *node;
+	unsigned int depth;
+	struct cds_ft_metadata *guard_child;
+	struct cds_ft_inode_flag *guard_pf;
+	struct ft_held_anchor held;
+};
+
+/* Defined below; the single-member acquire is a one-element set. */
+static inline
+int ft_dlm_acquire_set_at(const char *fn, int line,
+		const struct cds_ft *ft, const struct ft_lock_ctx *ctx,
+		struct ft_dlm_member *set, int nr);
+
 static inline
 int ft_acquire_member_at(const char *fn, int line,
 		const struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		struct cds_ft_inode_flag *nf, struct cds_ft_metadata *node,
 		unsigned int depth, struct ft_held_anchor *held)
 {
-	struct cds_ft_metadata *lock = ft_anchor_meta(ft, ft_lock_ctx_descent(ctx),
-			nf, node, depth);
-	uintptr_t lock_snap = 0, node_snap = 0, held_snap = 0;
-	bool held_ratified, node_held = false;
+	struct ft_dlm_member m = { .nf = nf, .node = node, .depth = depth,
+		.guard_child = NULL, .guard_pf = NULL };
 	int ret;
 
-	if (ft_lock_ctx_holds(ctx, lock, &held_snap, &held_ratified)) {
-		/*
-		 * The op holds this word for an earlier member.  @lock_snap stays
-		 * unset: the earlier acquire captured it and owns the terminal,
-		 * and a second one would double-record the single word.
-		 *
-		 * @node_snap is NOT optional though -- the caller re-validates its
-		 * plan against it and retires @node against it.  Where the word IS
-		 * @node's own, the acquire that took it is the only place that
-		 * value exists (a fresh read would sample the op's own LOCK), so it
-		 * comes from the held set.
-		 */
-		if (lock == node) {
-			/*
-			 * PROBE: a word held by the CALLER rather than by this op
-			 * has no value we ratified, so a member that retires its
-			 * own word cannot get one.  No caller constructs that
-			 * shape (the caller-held word is a re-parent target, not a
-			 * retire target); the assert is what says whether it stays
-			 * that way, rather than a silent zero.
-			 */
-			assert(held_ratified);
-			node_snap = held_snap;
-			node_held = true;
-		} else if (ft_member_node_snap(ctx, node, &node_snap,
-				&node_held)) {
-			return -EAGAIN;
-		}
-		held->lock = lock;
-		held->lock_snap = 0;
-		held->node_snap = node_snap;
-		held->shared = true;
-		held->node_held = node_held;
-		return 0;
-	}
 #ifdef FEATURE_FT_FAULT_INJECT
 	/*
 	 * Test-only: fail this acquire exactly as a peer holding the word would
@@ -2002,41 +1980,10 @@ int ft_acquire_member_at(const char *fn, int line,
 		cds_ft_fault_lock_countdown--;
 	}
 #endif
-	ret = ft_meta_lock_acquire(lock, &lock_snap);
-	if (ret) {
-		ft_hold_trace_refused(lock, fn, line);
-		return ret;
-	}
-	ft_hold_trace_note(lock, fn, line);
-	if (lock != node && ft_member_node_snap(ctx, node, &node_snap,
-			&node_held)) {
-#ifdef FEATURE_FT_HOLD_TRACE
-		/*
-		 * The word is dirty and the op's own held set does not explain it.
-		 * Under a single writer that is not contention: report who the
-		 * ledger thinks holds it, which is how the last one of these was
-		 * traced to a mark this same op had taken.
-		 */
-		if (ft_hold_trace_report_ok()) {
-			uintptr_t st = CMM_LOAD_SHARED(node->state);
-			unsigned int k = ft_hold_trace_n;
-			const char *who = "not in ledger";
-
-			while (k--)
-				if (ft_hold_trace[k].lock == node) {
-					who = ft_hold_trace[k].fn;
-					break;
-				}
-			fprintf(stderr,
-				"FT NODE-WORD DIRTY: %s:%d node=%p state=%lx held-by=%s\n",
-				fn, line, (void *) node, (unsigned long) st, who);
-		}
-#endif
-		ft_meta_lock_release(lock);
-		return -EAGAIN;
-	}
-	ft_held_anchor_set(held, lock, lock_snap, node, node_snap);
-	held->node_held = node_held;
+	ret = ft_dlm_acquire_set_at(fn, line, ft, ctx, &m, 1);
+	if (ret)
+		return ret;		/* nothing acquired */
+	*held = m.held;
 	return 0;
 }
 
@@ -2345,14 +2292,6 @@ void ft_held_anchor_guard_node(struct ft_flip_txn *t,
  * with no parent, or a compressed parent a given shape does not have -- and
  * leaves @held untouched.
  */
-struct ft_dlm_member {
-	struct cds_ft_inode_flag *nf;
-	struct cds_ft_metadata *node;
-	unsigned int depth;
-	struct cds_ft_metadata *guard_child;
-	struct cds_ft_inode_flag *guard_pf;
-	struct ft_held_anchor held;
-};
 
 /*
  * THE ACQUIRE CHOKE POINT, transacted flavour: take a whole lock-set in ONE

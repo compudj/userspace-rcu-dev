@@ -1308,18 +1308,16 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	if (!merge_dst) {
 		ft_lock_ctx_init(&lctx_src, &d_src, txn);
 		/*
-		 * Bind the op's PERSISTENT handle so this acquire's own commit
-		 * AGES: a per-attempt handle is domain-less and never
-		 * begin/end-bracketed, which makes the acquire a participant the
-		 * escalation lane cannot order, and a peer can then hold a member
-		 * while a lane-holding writer spins for it.  ft-insert.h's @ic.op
-		 * is the converted precedent; the rekey path was still unbound.
-		 *
-		 * This is the ACQUIRE's aging, not an escalated spin: the retry
-		 * wrapper below still arbitrates COMMITS only, and an acquire miss
-		 * stays a clean bail that re-descends.
+		 * NOT bound to @optxn.  ft_flip_txn_create_*_on sets t->mtxn =
+		 * op -- an "_on" txn SHARES the handle rather than making its own
+		 * -- and this driver's CONTENT txn is already
+		 * ft_flip_txn_create_on(optxn).  Binding here would put the
+		 * DEDICATED acquire txn on that same live handle and commit it
+		 * mid-op (measured: SIGSEGV in test_rekey_graft_liston, every
+		 * spacing).  The acquire's escalation aging and a content txn on
+		 * one handle are mutually exclusive; giving this path both needs
+		 * a SECOND handle, not a binding.
 		 */
-		lctx_src.op = optxn;
 		ret = ft_rekey_cow_stop(ft, &lctx_src, txn, s_top, d_src.depth,
 				&s_top_prime, marks, &nr_marks);
 		if (ret) {
@@ -1458,7 +1456,6 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 
 			/* The DST descent dates this one: it IS its parent slot. */
 			ft_lock_ctx_init(&dctx, &d_dst, txn);
-			dctx.op = optxn;	/* bind the op's FIFO turn (see above) */
 			if (!pp_meta || ft_acquire_member(ft, &dctx, d_dst.pnf,
 					pp_meta, d_dst.pdepth, &pph) ||
 					pph.shared) {
@@ -1573,7 +1570,6 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		struct ft_lock_ctx bctx;
 
 		ft_lock_ctx_init(&bctx, &d_src, txn);
-		bctx.op = optxn;	/* bind the op's FIFO turn (see above) */
 		bctx.held.extra = marks;
 		bctx.held.nr_extra = nr_marks;
 		prep = ft_graft_build(ft, dst_ord, dst_len, s_top_prime, cnt,
@@ -1740,7 +1736,6 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 			struct ft_held_anchor pph;
 
 			ft_lock_ctx_init(&lctx_src, &d_src, txn);
-			lctx_src.op = optxn;	/* bind the op's FIFO turn (see above) */
 			/*
 			 * The REST of the op's held set, exactly as the
 			 * store-prepare and detach arms name it:
@@ -1820,8 +1815,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 				unsigned int cd;
 
 				ft_lock_ctx_init(&dctx, &d_dst, txn);
-				dctx.op = optxn;	/* bind the op's FIFO turn (see above) */
-				/*
+					/*
 				 * The REST of the op's held set: the cow_stop
 				 * marks reach no registry until the sweep, and
 				 * the glue holds the split-CN fence.  Under a
@@ -1894,7 +1888,6 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 			struct ft_lock_ctx octx;
 
 			ft_lock_ctx_init(&octx, &d_src, txn);
-			octx.op = optxn;	/* bind the op's FIFO turn (see above) */
 			octx.held.extra = marks;
 			octx.held.nr_extra = nr_marks;
 			gst = ft_store_at_graft_point_prepare(ft, dst_ord,
@@ -1949,7 +1942,6 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 * @gp member.
 	 */
 	ft_lock_ctx_init(&lctx_src, &d_src, NULL);
-	lctx_src.op = optxn;	/* bind the op's FIFO turn (see above) */
 	/*
 	 * The op's marks so far -- ft_rekey_cow_stop's @stop fence and one per
 	 * COW'd child -- reach no txn registry until the sweep below, so the
