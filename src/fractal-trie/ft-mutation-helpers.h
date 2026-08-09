@@ -7406,10 +7406,23 @@ bool ft_glue_held_snap_one(const struct ft_glue *g,
 		if (!g->free_list[i].fenced)
 			continue;
 		if (cds_ft_item_to_metadata((struct cds_ft_inode *)
-				g->free_list[i].node) != meta)
-			continue;
-		*snap = g->free_list[i].snap;
-		return true;
+				g->free_list[i].node) == meta) {
+			*snap = g->free_list[i].snap;
+			return true;
+		}
+		/*
+		 * ★ And the word the acquire actually LOCKED, which coarsening
+		 * makes an ANCESTOR of @node.  Asking only about @node answers
+		 * "not held" for the very word this op holds; at per-node the two
+		 * ARE one word and this arm never fires.  A @holder_shared entry
+		 * carries no snapshot of its own -- the acquire that first took
+		 * the word owns its value -- exactly as @extra's shared entries.
+		 */
+		if (g->free_list[i].holder == meta &&
+				!g->free_list[i].holder_shared) {
+			*snap = g->free_list[i].holder_snap;
+			return true;
+		}
 	}
 	for (i = 0; i < g->nr_splices; i++)
 		if (g->splices[i].holder == meta) {
