@@ -1928,7 +1928,7 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		if (!took && (!ft_lock_ctx_depth_of(dst_ft, &pctx, pub_parent,
 					&pdep) ||
 				ft_acquire_member(dst_ft, &pctx, pub_parent, pm,
-					pdep, &ph) || ph.shared)) {
+					pdep, &ph))) {
 			free(ms_src_pool);
 			free(ms_src_caps);
 			free(ms_edges);
@@ -1946,8 +1946,22 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		 * The holder is whichever word protects @pub_parent: the splice
 		 * fence this op already took over, or the anchor just acquired.
 		 */
-		gd.publish_parent_holder = took ? pm : ph.lock;
-		gd.publish_parent_snap = took ? psnap : ph.lock_snap;
+		/*
+		 * A SHARED acquire owes no release.  The claim above -- that
+		 * @pub_parent is above the overlap spine and so never in the
+		 * fenced set -- holds for the NODE and not for its ANCHOR:
+		 * coarsening can put that anchor on an overlap node this op has
+		 * already fenced, and root-only puts EVERY member on one word.
+		 * Claiming it here would record a second terminal on a word whose
+		 * fenced retire already owns one, which the engine poisons.
+		 */
+		if (!took && ph.shared) {
+			gd.publish_parent_holder = NULL;
+			gd.publish_parent_snap = 0;
+		} else {
+			gd.publish_parent_holder = took ? pm : ph.lock;
+			gd.publish_parent_snap = took ? psnap : ph.lock_snap;
+		}
 	}
 
 	if (root_src) {
