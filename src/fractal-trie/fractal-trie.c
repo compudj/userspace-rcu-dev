@@ -1811,8 +1811,25 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		 * the caller's commit, so the caller frees it post-commit.
 		 */
 		cds_ft_alloc_reserve_activate(ft, &reserve);
-		gst = ft_store_at_graft_point_prepare(ft, dst_ord, dst_len, &d_dst,
-				s_top_prime, cnt, &glue, &gst_st);
+		{
+			/*
+			 * The op's outstanding marks -- ft_rekey_cow_stop's @stop
+			 * fence and one per COW'd child -- reach no registry until
+			 * the sweep below, so the store's own recompactions can
+			 * only see them through this frame.  Under a coarse spacing
+			 * they collapse onto one word and the store refuses its own
+			 * fence: the CDS_FT_STATUS_BUSY_ERROR that "is not expected
+			 * single-threaded".
+			 */
+			struct ft_lock_ctx octx;
+
+			ft_lock_ctx_init(&octx, &d_src, txn);
+			octx.held.extra = marks;
+			octx.held.nr_extra = nr_marks;
+			gst = ft_store_at_graft_point_prepare(ft, dst_ord,
+				dst_len, &d_dst, s_top_prime, cnt, &glue,
+				&octx.held, &gst_st);
+		}
 		if (gst == CDS_FT_STATUS_OK)
 			gcst = ft_store_at_graft_point_commit(ft, &attached_nf, &adepth,
 					NULL /*run*/, &gst_st, (long) cnt);

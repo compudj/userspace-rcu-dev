@@ -454,6 +454,7 @@ enum cds_ft_status ft_store_at_graft_point_prepare(struct cds_ft *ft,
 		struct cds_ft_inode_flag *graft_payload,
 		unsigned long graft_external_count,
 		struct ft_glue *glue,
+		const struct ft_held_set *outer,
 		struct ft_graft_store_state *st)
 {
 	struct ft_lock_ctx gctx;
@@ -464,8 +465,15 @@ enum cds_ft_status ft_store_at_graft_point_prepare(struct cds_ft *ft,
 	 * The recompactions below lock {p, its parent, its grandparent}; @d is
 	 * their anchor source, and @glue->txn the registry naming what this op
 	 * already holds.
+	 *
+	 * @outer is the REST of what it holds: a caller whose EARLIER step took
+	 * marks that reach no registry (the rekey fold's ft_rekey_cow_stop set)
+	 * chains its frame here, because under a coarse spacing those marks and
+	 * these recompactions collapse onto one word.  NULL for a caller with
+	 * nothing outstanding.
 	 */
 	ft_lock_ctx_init(&gctx, d, glue->txn);
+	gctx.held.outer = outer;
 	/*
 	 * The glue's own acquires (its publish parent, its split CN) fire from
 	 * commit helpers that never see @d, so hand it the anchor source here --
@@ -1005,7 +1013,8 @@ enum cds_ft_status ft_store_at_graft_point(struct cds_ft *ft,
 	enum urcu_txn_status cst;
 
 	status = ft_store_at_graft_point_prepare(ft, key, key_len, d,
-			graft_payload, graft_external_count, glue, &st);
+			graft_payload, graft_external_count, glue,
+			/*outer*/ NULL, &st);
 	if (status != CDS_FT_STATUS_OK) {
 		/*
 		 * MW LOCK_FINE drop: prepare can FAIL (the recompact of the
@@ -1839,7 +1848,7 @@ retry_attach:
 						&graft_reserve);
 				pstatus = ft_store_at_graft_point_prepare(dst_ft,
 					key, key_len, &d, graft_payload,
-					src_count, &glue, &st);
+					src_count, &glue, /*outer*/ NULL, &st);
 				if (self_secured)
 					cds_ft_alloc_reserve_deactivate(dst_ft);
 			}

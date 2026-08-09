@@ -1506,7 +1506,6 @@ int ft_detach_node(struct cds_ft *ft,
 	 */
 	lctx.held.outer = op_ctx ? &op_ctx->held : NULL;
 
-
 	FT_TP(detach_node_enter, (const void *) *detach_node_flag_ptr, detach_depth);
 
 	/*
