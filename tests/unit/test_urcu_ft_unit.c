@@ -54,7 +54,7 @@
  * at RUNTIME by ft->lock_fine, so the _DLM suffix names this group of lock-set
  * tests -- it does NOT select a build.
  */
-#define NR_TESTS_DLM 12		/* cow_stop_root_inplace, rekey_graft_{simple,liston,cross_junction,glue_dst,glue_dst_branch_child}, rekey_merge_{occupied,occupied_liston,interleave_liston,collide}_dst, rekey_merge_compressed_top_refused */
+#define NR_TESTS_DLM 13		/* cow_stop_root_inplace, rekey_graft_{simple,liston,cross_junction,glue_dst,glue_dst_branch_child}, rekey_merge_{occupied,occupied_deep,occupied_liston,interleave_liston,collide}_dst, rekey_merge_compressed_top_refused */
 
 /*
  * Tests needing DLM *and* fault injection in one build: the merge overlap-spine
@@ -967,6 +967,169 @@ static int test_rekey_graft_simple(void)
  *    frame, this fails rather than silently degrading reader coherence.
  */
 #define RKM_DOCC	0x03		/* dst occupant's byte1, distinct from RK_DZ */
+/*
+ * DEEP-KEY fold: the same union, at a FIVE-byte prefix instead of two.
+ *
+ * WHY IT EXISTS.  The doubling schedule is 0,1,2,4,8,..., so depths 0, 1 and 2
+ * are ALL lock levels: a fixture whose keys are 1-3 bytes long has almost
+ * nothing to coarsen, and measured over the whole unit suite only 1.42% of
+ * acquires resolved to an anchor different from the node
+ * (doc/design/ft-dlm-lock-coarseness.md).  At a five-byte prefix the merge point
+ * sits at depth 5 and its children at 6, whose level L(6) = 4 lies ABOVE it --
+ * so the anchor is a genuine ancestor, on both the descent and the re-parent
+ * mark paths.
+ *
+ * The shape costs one sibling per level: every node from the root down to the
+ * merge point must be a PLAIN INTERNAL node, which the fold's descents require
+ * and which a single-child run would violate by compressing.
+ */
+#define RKD_PLEN	5		/* prefix length: puts children at depth 6 */
+#define RKD_NSUB	4		/* S_top's children */
+
+static const uint8_t rkd_src[RKD_PLEN] = { 0x10, 0x01, 0x11, 0x12, 0x13 };
+static const uint8_t rkd_dst[RKD_PLEN] = { 0x20, 0x03, 0x11, 0x12, 0x13 };
+
+/* @p[0..np) followed by @tail, in the top bytes of an 8-byte fixed key. */
+static uint64_t rkd_key(const uint8_t *p, unsigned int np, uint8_t tail)
+{
+	uint64_t k = 0;
+	unsigned int i;
+
+	for (i = 0; i < np; i++)
+		k |= (uint64_t) p[i] << (56 - 8 * i);
+	return k | ((uint64_t) tail << (56 - 8 * np));
+}
+
+/*
+ * A key diverging from @p at byte @lvl, which is what forces the node AT that
+ * level to branch -- and a branching node is never compressed.
+ */
+static uint64_t rkd_sib(const uint8_t *p, unsigned int lvl, unsigned int v)
+{
+	uint8_t q[RKD_PLEN];
+	unsigned int i;
+
+	for (i = 0; i < RKD_PLEN; i++)
+		q[i] = p[i];
+	q[lvl] = (uint8_t) (p[lvl] ^ (0x80 + v));
+	return rkd_key(q, lvl + 1, 0x77);
+}
+
+static int test_rekey_merge_occupied_dst_deep(void)
+{
+	if (!cds_ft_merge_enabled()) {
+		diag("test_rekey_merge_occupied_dst_deep: skipped, merge compiled "
+			"out (-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_fine_lock_listoff_ft(8, &group);
+	unsigned long cnt_before, cnt_after;
+	void *before, *after;
+	unsigned int lvl;
+	int i, rc = -1;
+
+	rcu_read_lock();
+	/*
+	 * One sibling per level on BOTH prefixes: no level may compress.  THREE
+	 * at the last one, because the fold requires BP -- S_top's parent -- to
+	 * keep at least three children once S_top is removed.
+	 */
+	for (lvl = 0; lvl < RKD_PLEN; lvl++) {
+		unsigned int nv = lvl + 1 == RKD_PLEN ? 3 : 1, v;
+
+		for (v = 0; v < nv; v++) {
+			uint64_t a = rkd_sib(rkd_src, lvl, v);
+			uint64_t b = rkd_sib(rkd_dst, lvl, v);
+
+			if (insert_u64(ft, a, node_alloc(a)) !=
+						CDS_FT_STATUS_OK ||
+					insert_u64(ft, b, node_alloc(b)) !=
+						CDS_FT_STATUS_OK)
+				goto out_locked;
+		}
+	}
+	/* The moved subtree, and the occupant that makes dst a real union. */
+	for (i = 0; i < RKD_NSUB; i++) {
+		uint64_t k = rkd_key(rkd_src, RKD_PLEN, (uint8_t) (i + 1));
+		uint64_t o = rkd_key(rkd_dst, RKD_PLEN, (uint8_t) (i + 0x40));
+
+		if (insert_u64(ft, k, node_alloc(k)) != CDS_FT_STATUS_OK ||
+				insert_u64(ft, o, node_alloc(o)) !=
+					CDS_FT_STATUS_OK)
+			goto out_locked;
+	}
+	before = _cds_ft_debug_child_at(ft, rkd_dst, RKD_PLEN);
+	cnt_before = cds_ft_count_keys(ft);
+	rcu_read_unlock();
+	if (!before) {
+		fprintf(stderr, "rekey-deep: dst is not occupied -- the test would "
+			"take the graft path\n");
+		goto out;
+	}
+
+	/* The move takes the gate + a grace period: NOT from a read section. */
+	rc = _cds_ft_debug_rekey_graft_simple(ft, rkd_src, RKD_PLEN,
+		rkd_dst, RKD_PLEN);
+	if (rc != 0) {
+		fprintf(stderr, "rekey-deep: driver rc=%d\n", rc);
+		rc = -1;
+		goto out;
+	}
+	rc = -1;
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "rekey-deep: verify failed after the union\n");
+		goto out;
+	}
+	rcu_read_lock();
+	after = _cds_ft_debug_child_at(ft, rkd_dst, RKD_PLEN);
+	cnt_after = cds_ft_count_keys(ft);
+	rcu_read_unlock();
+	if (!after || after == before) {
+		fprintf(stderr, "rekey-deep: dst top did not move (before %p after "
+			"%p)\n", before, after);
+		goto out;
+	}
+	if (cnt_after != cnt_before) {
+		fprintf(stderr, "rekey-deep: key count %lu != %lu\n",
+			cnt_after, cnt_before);
+		goto out;
+	}
+	rcu_read_lock();
+	for (i = 0; i < RKD_NSUB; i++) {
+		uint64_t moved = rkd_key(rkd_dst, RKD_PLEN, (uint8_t) (i + 1));
+		uint64_t occ = rkd_key(rkd_dst, RKD_PLEN, (uint8_t) (i + 0x40));
+		uint64_t gone = rkd_key(rkd_src, RKD_PLEN, (uint8_t) (i + 1));
+		struct cds_ft_node *f = NULL;
+
+		if (lookup_u64(ft, moved, &f) != CDS_FT_STATUS_OK) {
+			rcu_read_unlock();
+			fprintf(stderr, "rekey-deep: moved key %d absent at dst\n", i);
+			goto out;
+		}
+		if (lookup_u64(ft, occ, &f) != CDS_FT_STATUS_OK) {
+			rcu_read_unlock();
+			fprintf(stderr, "rekey-deep: OCCUPANT key %d lost\n", i);
+			goto out;
+		}
+		if (lookup_u64(ft, gone, &f) == CDS_FT_STATUS_OK) {
+			rcu_read_unlock();
+			fprintf(stderr, "rekey-deep: src key %d still present\n", i);
+			goto out;
+		}
+	}
+	rcu_read_unlock();
+	rc = 0;
+	goto out;
+out_locked:
+	rcu_read_unlock();
+	fprintf(stderr, "rekey-deep: setup insert failed\n");
+out:
+	if (drain_and_destroy(ft, group) < 0)
+		rc = -1;
+	return rc;
+}
+
 static int test_rekey_merge_occupied_dst(void)
 {
 	if (!cds_ft_merge_enabled()) {
@@ -32157,6 +32320,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_cow_stop_root_inplace);
 	RUN_TEST(test_rekey_graft_simple);
 	RUN_TEST(test_rekey_merge_occupied_dst);
+	RUN_TEST(test_rekey_merge_occupied_dst_deep);
 	RUN_TEST(test_rekey_merge_compressed_top_refused);
 	RUN_TEST(test_rekey_merge_colocated_chain_refused);
 	RUN_TEST(test_rekey_merge_occupied_dst_liston);
