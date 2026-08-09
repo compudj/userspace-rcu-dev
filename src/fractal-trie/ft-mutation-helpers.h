@@ -1776,7 +1776,24 @@ bool ft_lock_ctx_depth_of_cursor_child(const struct cds_ft *ft,
 		*depth = 0;
 		return true;
 	}
-	if (!d || !d->nf || !child_parent || child_parent != d->nf)
+	/*
+	 * NO parent at all: the node is not reachable from the trie, either
+	 * because it sits at a ROOT position -- depth 0 by definition -- or
+	 * because this op BUILT it and has not published it yet.  The second is
+	 * the fold's COW copy: ft_rekey_cow_stop's @stop_prime is not in the
+	 * glue's @built array, because a DIFFERENT step of the op built it, so
+	 * the glue's own fresh test cannot see it and it arrives here looking
+	 * live.
+	 *
+	 * Depth 0 is right for both.  The root IS its own anchor under every
+	 * spacing (§2), and an unpublished node has no peer to agree WITH --
+	 * §1's agreement binds only nodes two ops can both reach.
+	 */
+	if (!child_parent) {
+		*depth = 0;
+		return true;
+	}
+	if (!d || !d->nf || child_parent != d->nf)
 		return false;
 	*depth = d->depth + ft_node_span(ft, d->nf);
 	return true;
