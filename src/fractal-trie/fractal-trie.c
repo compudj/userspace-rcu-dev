@@ -1887,6 +1887,13 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 */
 	lctx_src.held.extra = marks;
 	lctx_src.held.nr_extra = nr_marks;
+	/*
+	 * And the GLUE, which holds the rest -- the publish-parent fence above
+	 * all.  Under a coarse spacing that fence and BP's recompaction are ONE
+	 * word, so without this the detach refuses a fence this op took three
+	 * steps earlier.
+	 */
+	lctx_src.held.glue = &glue;
 	ret = ft_detach_node(ft, &lctx_src, d_src.nfp, d_src.pnfp, d_src.depth,
 			false /*free_detached_subtree: S_top is retired by cow_stop*/,
 			NULL /*fuse_cell: list off*/, &pub, NULL /*run*/,
