@@ -3478,10 +3478,12 @@ void ft_flip_txn_record_anchor_release(struct ft_flip_txn *t,
  * word, plain once ft_flip_txn_record_anchor_release has lifted the lock off a
  * surviving ancestor.
  *
- * The expected old is a snapshot taken at the ACQUIRE, never re-read here,
- * which is what keeps the fenced contract: a peer state change on the retired
- * node between the acquire and the commit aborts this op instead of being
- * ratified by a coincidentally-matching late capture.
+ * The expected old is a snapshot taken at the ACQUIRE, not a fresh raw read of
+ * the word, which is what keeps the fenced contract: a peer state change on the
+ * retired node between the acquire and the commit aborts this op instead of
+ * being ratified by a coincidentally-matching late capture.  The one value the
+ * snapshot is allowed to miss is a LOCK THIS OP took on @node's own word after
+ * the member was acquired -- see the arm that reads it back through the txn.
  */
 static inline
 void ft_flip_txn_record_retire_anchored(struct ft_flip_txn *t,
@@ -3524,6 +3526,40 @@ void ft_flip_txn_record_retire_anchored(struct ft_flip_txn *t,
 		}
 		ft_flip_txn_record_tombstone_locked(t, node, h->lock_snap);
 		return;
+	}
+	/*
+	 * @node's own word is not one this member locked, so the snapshot is the
+	 * expected old -- UNLESS the op has marked that word since, which under a
+	 * coarse spacing is ordinary: a LATER member anchoring ON @node locks it,
+	 * and the two acquires are separate commits, so nothing updated @h.  The
+	 * snapshot then names a value the word has not carried since that mark
+	 * landed, the install CAS can only fail, and every retry rebuilds the same
+	 * shape -- a deterministic abort with no diagnostic (measured
+	 * single-writer, so not contention).
+	 *
+	 * A LOCK that appears here is necessarily OURS: this member deduped onto
+	 * @node's ANCHOR, we hold it, and holding the anchor excludes every peer
+	 * mutator of @node -- the same justification the fused arm above carries
+	 * one level down.  So take the FUSED transition when the txn's own view
+	 * differs from the snapshot BY THE LOCK BIT ALONE.
+	 *
+	 * Any OTHER difference stays on the snapshot, which is what makes the
+	 * commit abort rather than ratify a world that moved -- the fenced
+	 * contract this arm exists for.  Per-node granularity never reaches here
+	 * (@h->lock is always @node), so the default stays byte-identical.
+	 */
+	{
+		uintptr_t pending = (uintptr_t) urcu_txn_load(t->mtxn,
+				(void **) &node->state, FT_STATE_PROXY);
+
+		if (caa_unlikely(pending == (h->node_snap | FT_STATE_LOCK))) {
+			ft_flip_txn_record_tag(t, (void **) &node->state,
+				(void *) pending,
+				(void *) ((pending & ~(uintptr_t) FT_STATE_LOCK)
+					| FT_STATE_TOMBSTONE),
+				FT_STATE_PROXY);
+			return;
+		}
 	}
 	ft_flip_txn_record_tag(t, (void **) &node->state,
 			(void *) h->node_snap,
