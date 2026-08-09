@@ -979,10 +979,77 @@ coarsening hazard wherever the lock word can stop being the node's own. Every
 such flag has to say WHICH WORD, and the answer is a comparison, not a boolean
 the acquire sets on its way past.
 
-**Still open.** `ft_store_at_graft_point` returns `CDS_FT_STATUS_BUSY_ERROR`
-single-threaded (root-only 112 `test_rekey_fixed_len_atomic_or_refused`, `-EIO`)
-— with no peer, another self-refusal inside the store's own acquire set,
-unexplored.
+**Then open, now CLOSED:** `ft_store_at_graft_point` returning
+`CDS_FT_STATUS_BUSY_ERROR` single-threaded (root-only 112
+`test_rekey_fixed_len_atomic_or_refused`, `-EIO`) was the held-set chain, below.
+
+### ★★ An op's HELD SET is a CHAIN of frames, not one array
+
+With the rekey fold's own defects closed, the arm walked four more tests and
+stopped on a class that had been underneath them the whole time. The ledger
+named it in one line each time:
+
+```
+FT SELF-COLLISION: ft_node_recompact:1351 refused word 0x…218,
+                   taken at ft_rekey_cow_stop:2468 (ledger 7 deep)
+FT SELF-COLLISION: ft_node_recompact:1351 refused word 0x…258,
+                   taken at ft_rekey_cow_stop:2468 (ledger 1 deep)
+```
+
+`ft_rekey_cow_stop`'s marks reach **no registry** until the driver's sweep — the
+function says so, and solves it INSIDE its own boundary by building a child
+context with `held.extra = marks`. Between two STEPS of one op it was still
+open, and `struct ft_held_set` is why: it carries exactly **one**
+out-of-registry array, so a nested step that keeps marks of its own
+(`ft_detach_node`'s `orphan_held`) silently DROPS its caller's.
+
+Coarsening is what makes the two meet. S_top sits at depth 3, `L(3) = 2`, and the
+node at byte 2 is **BP** — which is exactly what the detach recompacts. Under
+root-only every member anchors on the trie root, so the collapse is total.
+
+> **`struct ft_held_set` gains `outer`.** A frame chains to its caller's;
+> `ft_held_set_snap` follows the chain to the end. The array-per-frame limit
+> stops being a limit, and the frame pointed at is always further down the
+> stack, so it never dangles.
+
+Two sites needed chaining, and each closed a named test:
+
+| site | it dropped | closed |
+|---|---|---|
+| `ft_detach_node`'s `lctx` | the caller's, keeping `orphan_held` | exponential 302 |
+| `ft_store_at_graft_point_prepare`'s `gctx` | the caller's, built from `(d, glue->txn)` | root-only 112 |
+
+★ The second is the `CDS_FT_STATUS_BUSY_ERROR` this document listed as "another
+self-refusal, unexplored" — **`BUSY` with no peer was never a different defect**,
+just this one three call frames down. A refusal that reports contention with no
+contender is the op's own ledger, every time.
+
+**Chaining is HALF; the frame must also be filled.** The fold's `marks` reach no
+registry, so its own contexts have to name them (`held.extra = marks`) before
+chaining can carry them. Neither half works alone — measured that way, in that
+order.
+
+### Two members that were asking the wrong question
+
+The same walk turned up two dating defects that per-node cannot see, because
+per-node reads no depth at all:
+
+* **A member with NO parent is at depth 0**, not undatable. The fold's deferred
+  set contains its own COW copy: `ft_rekey_cow_stop` builds `stop_prime`, so it
+  is not in the glue's `built` array and `ft_glue_is_fresh` reports it LIVE.
+  Measured: `parent_word` NULL and `is_root=0` — the unpublished case, not the
+  root case. Depth 0 is right for both, and for the same reason: §1's agreement
+  binds only nodes two ops can both REACH, and nothing reaches an unpublished
+  one. Closes exponential 303.
+* **The split CN's displaced child is a DST member**, dated from the SRC
+  descent — a different key path entirely. `cn` IS the dst cursor (measured by
+  printing the identity: `cn_is_dstnf=1`), so the child is the cursor's
+  immediate child and `ft_lock_ctx_depth_of_cursor_child` answers it. Closes
+  exponential 304.
+
+★ Both were INERT at per-node and deterministic under a coarse spacing. "It
+works today" and "it asks the right question" are different claims, and only the
+coarse arm can tell them apart.
 
 ### ★ An undemonstrated fix is not free
 
@@ -1001,11 +1068,20 @@ it.
 | arm | unit | inv |
 |---|---|---|
 | per-node | 307/307 | 111/111 |
-| root-only | 111 — hangs at 112 `test_rekey_fixed_len_atomic_or_refused` | hangs 3 |
-| exponential | **301 of 307** — hangs at 302 `test_rekey_graft_cross_junction` | hangs 4 |
+| **exponential** | **307/307** | — |
+| root-only | **251 of 307** — stops at 252 `test_merge_fixed_length_fast_path` | — |
 
-Exponential was 294 before the three fold fixes above; root-only is unchanged
-because its stop is the `ft_store_at_graft_point` BUSY, which they do not touch.
+**Exponential is the first fully green coarse arm**, 294 → 307 across this
+round's seven fixes. Root-only went 111 → 251; its next stop is another
+self-collision, `ft_merge_spine_copy:1930` against `ft_merge_lock_overlap:362` —
+the merge's publish-parent acquire meeting the merge's own overlap fence, which
+under root-only are one word.
+
+★ Neither coarse arm has been shown NON-VACUOUS yet: green says the MAPPING
+agrees, not that exclusion holds. Count coarsened acquires (`lock != node`)
+before calling either one done
+(`[[feedback_clean_oracle_can_mean_dead_path]]`), and the multi-writer oracle
+per setting is still owed.
 
 ### Still open in ft_descent_anchor_at_level
 
