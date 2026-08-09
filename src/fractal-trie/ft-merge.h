@@ -2416,7 +2416,7 @@ retry_merge:
 	}
 	glue.fuse_free_list = true;	/* reserved free-list headroom above (§4.B) */
 	prep = ft_graft_build(dst_ft, okey_dst, dst_key_len, payload, cnt_src,
-			&d, &glue);
+			&d, &glue, /*outer*/ NULL);
 	*handled = true;
 	if (prep == FT_GRAFT_PREP_RETRY) {
 		/*

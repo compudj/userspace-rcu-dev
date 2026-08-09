@@ -52,7 +52,8 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 		unsigned int diverge_pos,
 		struct cds_ft_inode_flag *payload,
 		unsigned long src_count,
-		struct ft_glue *glue)
+		struct ft_glue *glue,
+		const struct ft_held_set *outer)
 {
 	struct cds_ft_compressed_node *cn = ft_compressed_node_ptr(d->nf);
 	struct cds_ft_metadata *cn_meta =
@@ -86,11 +87,31 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 
 		ft_glue_lock_ctx(glue, &sctx);
 		sctx.d = d;
-		if (ft_acquire_member(ft, &sctx, d->nf, cn_meta, d->depth, &sh)
-				|| sh.shared)
+		/*
+		 * @outer is the REST of the op's held set: a caller whose EARLIER
+		 * step took marks reaching no registry (the rekey fold's
+		 * ft_rekey_cow_stop set) chains its frame here, exactly as
+		 * ft_store_at_graft_point_prepare does.  Under a coarse spacing
+		 * those marks and @cn's fence collapse onto one word -- the trie
+		 * root, for an in-trie move -- and without the frame this acquire
+		 * refuses a word the op itself holds.  That refusal is not a
+		 * failure but a SPIN: the caller re-descends, rebuilds the
+		 * identical shape and refuses again.
+		 */
+		sctx.held.outer = outer;
+		if (ft_acquire_member(ft, &sctx, d->nf, cn_meta, d->depth, &sh))
 			return -EAGAIN;	/* peer owns @cn; nothing built */
+		/*
+		 * A SHARED hit is the dedupe WORKING, not a refusal: the op
+		 * already holds @cn's anchor, so this member owes NO release and
+		 * NO anchor terminal (the first acquire recorded both).  @cn's
+		 * OWN word is still retired here -- the tombstone lands on the
+		 * node, not on the shared anchor -- so the node fields are
+		 * recorded either way and @split_cn_shared gates the release half.
+		 */
 		glue->split_cn_holder = sh.lock;
 		glue->split_cn_snap = sh.lock_snap;
+		glue->split_cn_shared = sh.shared;
 		glue->split_cn_node = cn_meta;
 		glue->split_cn_node_snap = sh.node_snap;
 	}
@@ -1096,7 +1117,8 @@ static
 enum ft_graft_prep ft_graft_build(struct cds_ft *ft,
 		const uint8_t *key, size_t key_len,
 		struct cds_ft_inode_flag *payload, unsigned long src_count,
-		struct ft_descent *d, struct ft_glue *glue)
+		struct ft_descent *d, struct ft_glue *glue,
+		const struct ft_held_set *outer)
 {
 	const uint8_t *ik = key;
 
@@ -1129,7 +1151,7 @@ enum ft_graft_prep ft_graft_build(struct cds_ft *ft,
 			if (j < cmp) {
 				int bret = ft_split_compressed_graft_build(ft,
 					d, key, key_len, j, payload, src_count,
-					glue);
+					glue, outer);
 
 				if (bret == -EAGAIN)
 					return FT_GRAFT_PREP_RETRY;
@@ -1602,7 +1624,7 @@ retry_attach:
 		 */
 		glue.fuse_free_list = true;
 		prep = ft_graft_build(dst_ft, key, key_len, graft_payload,
-				src_count, &d, &glue);
+				src_count, &d, &glue, /*outer*/ NULL);
 		if (prep == FT_GRAFT_PREP_OOM) {
 			/*
 			 * The GLUE build may have marked @cn's split-retire LOCK
@@ -1725,8 +1747,11 @@ retry_attach:
 				 * through ft_glue_abort.
 				 */
 				if (glue.split_cn_holder) {
-					ft_meta_lock_release(glue.split_cn_holder);
+					/* SHARED: the caller's earlier acquire owns the release. */
+					if (!glue.split_cn_shared)
+						ft_meta_lock_release(glue.split_cn_holder);
 					glue.split_cn_holder = NULL;
+					glue.split_cn_shared = false;
 					glue.split_cn_snap = 0;
 					glue.split_cn_node = NULL;
 					glue.split_cn_node_snap = 0;
@@ -1743,8 +1768,11 @@ retry_attach:
 			src_retire_txn = ft_flip_txn_create_bounded(2);
 			if (!src_retire_txn) {
 				if (glue.split_cn_holder) {
-					ft_meta_lock_release(glue.split_cn_holder);
+					/* SHARED: the caller's earlier acquire owns the release. */
+					if (!glue.split_cn_shared)
+						ft_meta_lock_release(glue.split_cn_holder);
 					glue.split_cn_holder = NULL;
+					glue.split_cn_shared = false;
 					glue.split_cn_snap = 0;
 					glue.split_cn_node = NULL;
 					glue.split_cn_node_snap = 0;

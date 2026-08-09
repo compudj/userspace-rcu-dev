@@ -6398,6 +6398,15 @@ struct ft_glue {
 	 * ordinary acquire-or-guard, behaviour-identical to before.
 	 */
 	struct cds_ft_metadata *publish_parent_holder;
+	/*
+	 * @publish_parent_holder deduped onto a word the op ALREADY held (a
+	 * caller's out-of-registry marks chained in as @outer).  The fence is in
+	 * force -- so the forward publish may still PARK its SW store, which is
+	 * legal exactly because the op holds the slot's word -- but the acquire
+	 * that FIRST took it owns both the release and the registry entry, so
+	 * this commit records neither.
+	 */
+	bool publish_parent_shared;
 	uintptr_t publish_parent_snap;
 	/*
 	 * MW LOCK_FINE drop, split-compressed graft: the node lock held on
@@ -6423,6 +6432,15 @@ struct ft_glue {
 	 * graft publishes into.
 	 */
 	struct cds_ft_metadata *split_cn_holder;
+	/*
+	 * @split_cn_holder deduped onto a word the op ALREADY held (its caller's
+	 * out-of-registry marks, chained in as @outer).  The fence is in force,
+	 * but this member owes NO release and NO anchor terminal -- the acquire
+	 * that first took the word recorded both, and settling it twice drops a
+	 * word the op still writes under.  @cn's OWN retire is unaffected: the
+	 * tombstone lands on @split_cn_node, never on the shared anchor.
+	 */
+	bool split_cn_shared;
 	struct cds_ft_metadata *split_cn_node;
 	uintptr_t split_cn_node_snap;
 	/*
@@ -6576,8 +6594,10 @@ void ft_glue_init(struct ft_glue *g)
 	g->publish_old = NULL;
 	g->publish_old_set = false;
 	g->publish_parent_holder = NULL;
+	g->publish_parent_shared = false;
 	g->publish_parent_snap = 0;
 	g->split_cn_holder = NULL;
+	g->split_cn_shared = false;
 	g->split_cn_node = NULL;
 	g->split_cn_node_snap = 0;
 	g->caller_holder = NULL;
@@ -7860,8 +7880,15 @@ void ft_glue_abort(struct cds_ft *ft, struct ft_glue *g)
 	 * consumed by a committed retire, which does not reach ft_glue_abort).
 	 */
 	if (g->split_cn_holder) {
-		ft_meta_lock_release(g->split_cn_holder);
+		/*
+		 * A SHARED fence belongs to the caller's earlier acquire, which
+		 * owns its release: dropping it here would unlock a word the op
+		 * still writes under (one owner per fence).
+		 */
+		if (!g->split_cn_shared)
+			ft_meta_lock_release(g->split_cn_holder);
 		g->split_cn_holder = NULL;
+		g->split_cn_shared = false;
 		g->split_cn_snap = 0;
 	}
 	/*
@@ -7877,8 +7904,11 @@ void ft_glue_abort(struct cds_ft *ft, struct ft_glue *g)
 	 * double-cleared -- ft_meta_lock_release asserts the bit is still set.
 	 */
 	if (g->publish_parent_holder) {
-		ft_meta_lock_release_if_held(g->publish_parent_holder);
+		/* SHARED: the caller's earlier acquire owns the release. */
+		if (!g->publish_parent_shared)
+			ft_meta_lock_release_if_held(g->publish_parent_holder);
 		g->publish_parent_holder = NULL;
+		g->publish_parent_shared = false;
 		g->publish_parent_snap = 0;
 	}
 	for (i = 0; i < g->nr_built; i++) {
@@ -8294,9 +8324,18 @@ enum urcu_txn_status ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue 
 		struct ft_lock_ctx gctx;
 
 		ft_glue_lock_ctx(g, &gctx);
-		ft_flip_txn_hold_or_lock_parent(ft, g->txn, &gctx,
-			g->publish_parent, FT_DEPTH_FROM_DESCENT,
-			g->publish_parent_holder, g->publish_parent_snap);
+		/*
+		 * A SHARED fence records NOTHING here: the earlier acquire owns
+		 * both the {LOCK|s -> s} release and the registry entry, and the
+		 * held arm below would settle the single word a second time.
+		 * Routing it to the NULL arm instead would be worse -- that arm
+		 * re-acquires or guards a word this op already holds.
+		 */
+		if (!g->publish_parent_shared)
+			ft_flip_txn_hold_or_lock_parent(ft, g->txn, &gctx,
+				g->publish_parent, FT_DEPTH_FROM_DESCENT,
+				g->publish_parent_holder,
+				g->publish_parent_snap);
 	}
 	if (g->publish_parent_holder) {
 		/*
@@ -8322,6 +8361,7 @@ enum urcu_txn_status ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue 
 		 * complete before the field is disowned.
 		 */
 		g->publish_parent_holder = NULL;
+		g->publish_parent_shared = false;
 		g->publish_parent_snap = 0;
 	}
 	_ft_publish_to_parent(ft, g->publish_parent, g->publish_slot, g->top,
@@ -8352,16 +8392,24 @@ enum urcu_txn_status ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue 
 			.lock = g->split_cn_holder,
 			.lock_snap = g->split_cn_snap,
 			.node_snap = g->split_cn_node_snap,
-			.shared = false,
+			.shared = g->split_cn_shared,
 			.node_held = false,
 		};
 
 		ft_flip_txn_record_retire_anchored(g->txn, &sh,
 			g->split_cn_node);
-		ft_flip_txn_record_anchor_release(g->txn, &sh,
-			g->split_cn_node);
-		ft_flip_txn_lock_register(g->txn, g->split_cn_holder,
-			g->split_cn_snap);
+		/*
+		 * The RELEASE half, and the registry ownership that goes with it,
+		 * belong to the acquire that FIRST took the word: a deduped member
+		 * records neither (ft_flip_txn_record_anchor_release asserts it).
+		 * The retire above still lands -- it settles @cn's own word.
+		 */
+		if (!g->split_cn_shared) {
+			ft_flip_txn_record_anchor_release(g->txn, &sh,
+				g->split_cn_node);
+			ft_flip_txn_lock_register(g->txn, g->split_cn_holder,
+				g->split_cn_snap);
+		}
 		/*
 		 * OWNERSHIP TRANSFER (mirror publish_parent_holder): once
 		 * registered, the txn OWNS @cn's fence clear -- a commit consumes
@@ -8375,6 +8423,7 @@ enum urcu_txn_status ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue 
 		 * commit-step-1) so its split_cn skip saw the holder set.
 		 */
 		g->split_cn_holder = NULL;
+		g->split_cn_shared = false;
 		g->split_cn_snap = 0;
 		g->split_cn_node = NULL;
 		g->split_cn_node_snap = 0;

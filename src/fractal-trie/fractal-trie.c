@@ -873,6 +873,8 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	struct cds_ft_inode_flag *graft_c = NULL, *graft_p = NULL, *cn_flag = NULL;
 	struct cds_ft_metadata *pp_meta = NULL;	/* GLUE publish-parent fence WE own */
 	uintptr_t pp_snap = 0;
+	/* ...unless it DEDUPED onto a word an earlier step of this op took. */
+	bool pp_shared = false;
 	/*
 	 * INCREMENT 3: the dst point is OCCUPIED, so step 2 UNIONS into it with
 	 * ft_merge_build instead of grafting a COW'd S_top' into a spare slot.  The
@@ -1543,7 +1545,25 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		prep = FT_GRAFT_PREP_NOSPLIT;	/* not a graft; keeps the arms below off */
 #endif /* FEATURE_FT_MERGE */
 	} else
-	prep = ft_graft_build(ft, dst_ord, dst_len, s_top_prime, cnt, &d_dst, &glue);
+	{
+		/*
+		 * The op's outstanding marks -- ft_rekey_cow_stop's @stop fence
+		 * and one per COW'd child -- reach no registry until the sweep
+		 * below, so the build's own acquires can only see them through
+		 * this frame (the same frame the store-prepare arm passes).  This
+		 * is an IN-TRIE move: src and dst share a root, so under a coarse
+		 * spacing those marks and the split-CN fence are ONE word, and
+		 * without the frame the build refuses the op's own fence and the
+		 * caller re-descends onto the identical shape forever.
+		 */
+		struct ft_lock_ctx bctx;
+
+		ft_lock_ctx_init(&bctx, &d_src, txn);
+		bctx.held.extra = marks;
+		bctx.held.nr_extra = nr_marks;
+		prep = ft_graft_build(ft, dst_ord, dst_len, s_top_prime, cnt,
+			&d_dst, &glue, &bctx.held);
+	}
 	/*
 	 * Non-buildable outcomes, mapped to the driver's contract.  A build that
 	 * reports OOM or a lost split-fence race has published NOTHING (and, on the
@@ -1705,30 +1725,50 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 			struct ft_held_anchor pph;
 
 			ft_lock_ctx_init(&lctx_src, &d_src, txn);
+			/*
+			 * The REST of the op's held set, exactly as the
+			 * store-prepare and detach arms name it:
+			 * ft_rekey_cow_stop's marks reach no registry until the
+			 * sweep, and the glue holds the split-CN fence.  Under a
+			 * coarse spacing this publish parent anchors onto one of
+			 * them -- the trie root, for an in-trie move -- and a
+			 * frame naming neither refuses the op's own fence.
+			 */
+			lctx_src.held.extra = marks;
+			lctx_src.held.nr_extra = nr_marks;
+			lctx_src.held.glue = &glue;
 			pp_meta = ft_flag_to_metadata(ft, glue.publish_parent);
 			unsigned int ppd;
 
 			/*
 			 * The publish parent came from the glue, not from a
 			 * descent step, so the window is what dates it; a node
-			 * this descent never passed voids the attempt.  A word
-			 * the op already holds cannot hand back a snapshot for
-			 * this fence either -- both are the same clean re-plan.
+			 * this descent never passed voids the attempt.
 			 */
 			if (!ft_lock_ctx_depth_of(ft, &lctx_src,
 						glue.publish_parent, &ppd) ||
 					ft_acquire_member(ft, &lctx_src,
 						glue.publish_parent, pp_meta,
-						ppd, &pph) || pph.shared) {
+						ppd, &pph)) {
 				pp_meta = NULL;
 				ret = -EAGAIN;
 				goto bail_build;
 			}
+			/*
+			 * A SHARED hit is the dedupe WORKING: the fence is in
+			 * force from an earlier acquire of this same op, so the
+			 * publish may park its SW store -- the fold's rule is SW
+			 * iff the op holds the slot's word, and it does.  What it
+			 * must NOT do is settle the word twice, which is what
+			 * @publish_parent_shared tells the commit.
+			 */
 			pp_meta = pph.lock;
 			pp_snap = pph.lock_snap;
+			pp_shared = pph.shared;
 		}
 		glue.publish_parent_holder = pp_meta;
 		glue.publish_parent_snap = pp_snap;
+		glue.publish_parent_shared = pp_shared;
 		/*
 		 * The one LIVE node the split cluster re-parents: @cn's displaced
 		 * child, which moves onto the fresh suffix (or straight under the fresh
@@ -1764,6 +1804,19 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 				unsigned int cd;
 
 				ft_lock_ctx_init(&dctx, &d_dst, txn);
+				/*
+				 * The REST of the op's held set: the cow_stop
+				 * marks reach no registry until the sweep, and
+				 * the glue holds the split-CN fence.  Under a
+				 * coarse spacing this child anchors onto one of
+				 * them, and a frame naming neither refuses a word
+				 * the op took two steps earlier.  @nr_extra is
+				 * read at the acquire because this same array is
+				 * still growing (the mark lands at @nr_marks).
+				 */
+				dctx.held.extra = marks;
+				dctx.held.nr_extra = nr_marks;
+				dctx.held.glue = &glue;
 				if (!ft_lock_ctx_depth_of(ft, &dctx, cn->child,
 						&cd)) {
 					struct cds_ft_inode_flag *lp = NULL;
