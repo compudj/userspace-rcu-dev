@@ -3851,19 +3851,36 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 		 * turns on), so that chain's trie holder comes from
 		 * ft_chain_head_holder and is anchored with it, not from here.
 		 */
-		if (d.nf == holder_flag) {
+		have_descent = true;
+		/*
+		 * Locating the holder ON the descent is what makes @holder_depth
+		 * the HOLDER's rather than the leaf's; not locating it leaves the
+		 * handle-derived value, and the walk is an anchor source either
+		 * way.
+		 */
+		if (d.nf == holder_flag)
 			holder_depth = d.depth;
-			have_descent = true;
-		} else if (d.pnf == holder_flag) {
+		else if (d.pnf == holder_flag)
 			holder_depth = d.pdepth;
-			have_descent = true;
-		}
 	}
 
 	/*
-	 * The op's lock context.  @d is an anchor source only where the walk
-	 * above actually ran; under per-node granularity it never does, and a
-	 * NULL descent is exactly right there -- every member anchors on itself.
+	 * The op's lock context.  @d is an anchor source wherever the walk above
+	 * actually RAN -- which is every coarse spacing, since the arm that runs
+	 * it is gated on exactly that -- and NULL under per-node, where it never
+	 * runs and every member anchors on itself anyway.
+	 *
+	 * ☠ "The walk RAN" is not "the walk LOCATED THE HOLDER".  This flag used
+	 * to mean the second, so a holder the two arms above do not match threw a
+	 * perfectly good anchor table away -- and a member dated by the ONE-HOP
+	 * rule (ft_lock_ctx_depth_of_parent needs no descent to answer a DEPTH)
+	 * then reached ft_anchor_meta with no descent to answer its ANCHOR.  That
+	 * is the assert, in ft_chain_compress_fused under
+	 * CDS_FT_LOCK_SPACING=exponential.
+	 *
+	 * A descent that does not describe a member reports that PER MEMBER and
+	 * the caller re-plans; withholding it turns "this member" into "every
+	 * member".
 	 */
 	struct ft_lock_ctx lctx;
 
