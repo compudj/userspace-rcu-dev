@@ -1077,11 +1077,38 @@ self-collision, `ft_merge_spine_copy:1930` against `ft_merge_lock_overlap:362` �
 the merge's publish-parent acquire meeting the merge's own overlap fence, which
 under root-only are one word.
 
-★ Neither coarse arm has been shown NON-VACUOUS yet: green says the MAPPING
-agrees, not that exclusion holds. Count coarsened acquires (`lock != node`)
-before calling either one done
-(`[[feedback_clean_oracle_can_mean_dead_path]]`), and the multi-writer oracle
-per setting is still owed.
+### ★★ How much of that green is COARSENED at all
+
+Counted at `ft_anchor_meta` — the choke point every acquire routes through —
+over the whole unit suite, and per test:
+
+| run | total | `lock != node` | on a lock level | depth 0 |
+|---|---|---|---|---|
+| whole suite, per-node | 3 483 778 | **0** (0.00%) | — | — |
+| whole suite, exponential | 3 459 319 | **49 258** (1.42%) | 3 335 101 (96.4%) | 31 741 |
+| `test_insert_basic`, exponential | 3 | **0** | 1 | 2 |
+| `test_count_keys_distinct`, exponential | 296 | **0** | 99 | 100 |
+| `test_rekey_graft_cross_junction`, exponential | 77 | **11** (14.3%) | 50 | 14 |
+| the same three, root-only | 3 / 298 / 87 | **1 / 197 / 68** (33–78%) | — | 2 / 101 / 17 |
+
+Per-node is zero by construction, which is the control. **Root-only is strongly
+non-vacuous.** Exponential is non-vacuous *in aggregate* — 49k coarsened
+acquires is not a dead path — but the distribution is the finding:
+
+★ **96.4% of exponential's acquires never coarsen, because their depth IS a
+lock level.** The schedule is `0,1,2,4,8,…`, so depths 0, 1 and 2 are all
+levels, and the unit fixtures use 1–3 byte keys: only depth 3 can coarsen at
+all. Two whole tests measure **exactly zero** — under `exponential` they are
+byte-for-byte the per-node arm, and their green says nothing about coarsening.
+
+⇒ **The exponential arm's green rests on ~1.4% of its acquires.** Exercising the
+schedule needs keys of length ≥ 5 (depths 5–7 fold to `L = 4`; 9–15 to `L = 8`)
+— the *same* fixture gap the coarse-mark release arm needs (above). One deep-key
+fold fixture closes both.
+
+The multi-writer oracle per setting is still owed on top of that: these counts
+prove the MAPPING is exercised, not that exclusion holds
+(`[[feedback_clean_oracle_can_mean_dead_path]]`).
 
 ### Still open in ft_descent_anchor_at_level
 
