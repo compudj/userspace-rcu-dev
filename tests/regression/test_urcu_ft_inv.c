@@ -8442,8 +8442,19 @@ static void drain_trie_keep_group(struct cds_ft *ft)
 		struct cds_ft_node *head, *tmp;
 		enum cds_ft_status s = cds_ft_remove_all(ft, iter, &head);
 
-		if (s < 0)
+		/*
+		 * SAY WHAT HAPPENED.  A bare abort() here reports nothing at all
+		 * -- not even an assertion string -- so a failure costs a gdb run
+		 * to learn which status was returned, and the status is what picks
+		 * the path.  (Measured: it does fail, under
+		 * CDS_FT_LOCK_SPACING=exponential.)
+		 */
+		if (s < 0) {
+			fprintf(stderr,
+				"drain_trie_keep_group: remove_all failed: %s (%d)\n",
+				cds_ft_status_to_string(s), (int) s);
 			abort();
+		}
 		/* No-progress guard: see drain_and_destroy. */
 		if (s == CDS_FT_STATUS_NOT_FOUND) {
 			fprintf(stderr,
