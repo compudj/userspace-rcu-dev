@@ -1067,8 +1067,8 @@ it.
 
 | arm | unit | inv |
 |---|---|---|
-| per-node | 307/307 | 111/111 |
-| **exponential** | **307/307** | — |
+| per-node | **308/308** | 111/111 |
+| exponential | 307/307 on the SHALLOW set; **RED** at the new deep fixture | — |
 | root-only | **251 of 307** — stops at 252 `test_merge_fixed_length_fast_path` | — |
 
 **Exponential is the first fully green coarse arm**, 294 → 307 across this
@@ -1103,8 +1103,39 @@ byte-for-byte the per-node arm, and their green says nothing about coarsening.
 
 ⇒ **The exponential arm's green rests on ~1.4% of its acquires.** Exercising the
 schedule needs keys of length ≥ 5 (depths 5–7 fold to `L = 4`; 9–15 to `L = 8`)
-— the *same* fixture gap the coarse-mark release arm needs (above). One deep-key
-fold fixture closes both.
+— the *same* fixture gap the coarse-mark release arm needs (above).
+
+### The deep-key fixture, and what it found immediately
+
+`test_rekey_merge_occupied_dst_deep` is that fixture: the same union at a
+**five-byte** prefix, so the merge point sits at depth 5 and its children at 6,
+whose level `L(6) = 4` is a genuine ancestor. **40% of its acquires coarsen**,
+against 14.3% for the best of the shallow ones and 0% for two of them.
+
+Its shape is dictated by the fold's own gates, each found by probing which one
+refused: one sibling per level (every node from the root to the merge point must
+be a PLAIN INTERNAL node, and a single-child run compresses), and **three** at
+the last level, because the fold requires BP to keep ≥ 3 children once S_top is
+removed.
+
+**It passes at per-node and hangs under BOTH coarse spacings on the first
+attempt** — which is the whole reason to write it. The ledger names the next
+one:
+
+```
+FT SELF-COLLISION: ft_node_recompact:1351 refused word 0x…058,
+                   taken at ft_rekey_graft_simple_attempt:1450
+```
+
+The fold's own publish-parent fence, which lives in the GLUE rather than in
+`marks`, so the detach's frame does not name it. Same class as the four fixes
+above, one more carrier — and this time the change that would fix it (`held.glue`
+on that frame) is one a previous round dropped as undemonstrated. It is
+demonstrated now, which is how it should be earned.
+
+★ **A green from a desensitised fixture is worth less than a red from a
+sensitive one.** "exponential 307/307" was true and is restated as what it was:
+green on the SHALLOW set.
 
 The multi-writer oracle per setting is still owed on top of that: these counts
 prove the MAPPING is exercised, not that exclusion holds
