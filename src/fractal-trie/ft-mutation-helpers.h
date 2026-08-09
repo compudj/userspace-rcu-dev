@@ -7563,8 +7563,23 @@ int ft_glue_acquire_reparent_marks(struct cds_ft *ft, struct ft_glue *g)
 		}
 #endif
 		if (ft_acquire_member(ft, &gctx, g->deferred[i].child, cm, cd,
-				&h) || h.shared)
+				&h))
 			return -EAGAIN;
+		if (h.shared) {
+			/*
+			 * NOT a failure: the acquire found the word in the op's
+			 * held set and DEDUPED.  ft_glue_op_holds above reads the
+			 * GLUE only, while this reads the whole context -- the txn
+			 * registry, the caller's frames, an out-of-registry array
+			 * -- so a word held anywhere else arrives here instead of
+			 * there.  Refusing it refuses this op's own fence, which no
+			 * retry can clear.  Record it held, owing no release: the
+			 * acquire that first took it owns that.
+			 */
+			g->deferred[i].lock_word = h.lock;
+			g->deferred[i].held_lock = h.lock == cm || h.node_held;
+			continue;
+		}
 		g->deferred[i].lock_word = h.lock;
 		/*
 		 * ☠ @held_lock names the CHILD'S OWN word, never the anchor, and
