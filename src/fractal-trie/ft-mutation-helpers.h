@@ -765,12 +765,29 @@ extern unsigned long cds_ft_probe_promote_guarded;
  * the commit returns a clean MEMORY_ERROR with nothing parked.
  */
 /*
- * Upper bound of FT_STATE_LOCK locks one commit can hold: the chain-compress
- * fused merge fences the collapsed chain (boundary + old parent cn + old child
- * cn = 3); a LOCK_FINE recompact holds its whole {C, P} lock-set, plus {GP} when
- * P is a compressed node whose SKIP_X dual it re-encodes (§9.3) = 3.
+ * Upper bound of FT_STATE_LOCK locks one commit can hold.
+ *
+ * The small consumers are unchanged: the chain-compress fused merge fences the
+ * collapsed chain (boundary + old parent cn + old child cn = 3), and a
+ * LOCK_FINE recompact holds its whole {C, P} lock-set, plus {GP} when P is a
+ * compressed node whose SKIP_X dual it re-encodes (§9.3) = 3.
+ *
+ * The bound is the FAN-OUT, though, not those.  A lock-set is the unit the MCAS
+ * install can SORT by slot address, and that order is what makes concurrent
+ * acquisition deadlock-free (rcu-txn-mcas.h) -- so a site that wants ordering
+ * must present its whole set at once, and the widest such set is a node's
+ * children plus the node itself.  At 8 that was impossible: ft_rekey_cow_stop
+ * alone reaches 17 distinct anchors on the unit fixture (3 of 18 calls exceed
+ * 8), which is why its marks live in fn-scope arrays outside the registry
+ * rather than in a set.
+ *
+ * ☠ COST, paid by every op: this array is embedded in struct ft_flip_txn, which
+ * is malloc'd per attempt, and ft_dlm_acquire_set mirrors it TWICE on the stack.
+ * At 16 bytes an entry that is 4 KB in each place.  If that shows up in a
+ * profile, the shape to move to is a small embedded array with a heap overflow
+ * for the rare wide set -- not a lower cap, which merely re-hides the assert.
  */
-#define FT_FLIP_TXN_MAX_LOCKS	8
+#define FT_FLIP_TXN_MAX_LOCKS	(FT_ENTRY_PER_NODE + 1)
 
 struct ft_flip_txn {
 	struct urcu_txn *mtxn;	/* the concurrent commit engine handle:
