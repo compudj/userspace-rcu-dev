@@ -1086,6 +1086,32 @@ name. Six instances, each named by the hold-trace ledger in a single line:
 | `ft_merge_spine_copy` | `ft_merge_lock_overlap` | the glue answered for the NODE, not the word it LOCKED |
 | the merge's publish parent | its own overlap fence | `ph.shared` read as a FAILURE, and a second terminal |
 
+### A DEPTH is derivable without a descent; an ANCHOR is not
+
+`inv` under `exponential` — the first multi-writer run the coarse arms have
+reached — aborted immediately on a different shape:
+
+```
+ft_anchor_meta: Assertion `d' failed
+  ft_chain_compress_fused -> ft_dlm_acquire_set -> ft_anchor_meta
+  cds_ft_remove -> _cds_ft_remove_locked -> ft_detach_node
+```
+
+`ft_lock_ctx_depth_of_parent` answers a **depth** from
+`child_depth - span(parent)` and needs no descent to do it; `ft_anchor_meta`
+answers an **anchor** and needs the descent's table. So a member passed the
+site's own dating guard and then asserted.
+
+The node-handle remove DOES take the §5.3 descent whenever the spacing is
+coarser than per-node — and discarded it unless the walk also **located the
+holder**, a different question. One flag answered both, and only the narrower
+one was in its name. A descent that does not describe a member reports that PER
+MEMBER and the caller re-plans; withholding it turns *this member* into *every
+member*.
+
+★ Anywhere a site dates a member without a descent, ask what will resolve its
+ANCHOR.
+
 ★ Two shapes recur, and both are worth grepping for:
 
 1. **A carrier the frame does not name.** `marks`, `glue`, `outer`, the txn
