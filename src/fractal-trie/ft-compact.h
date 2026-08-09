@@ -46,9 +46,18 @@
  * Relocate the internal node at *@holder into a fresh slot; RCU-free the old.
  * Sets *@oom on a best-effort leave-in-place (allocation failure) so the caller
  * can stop the pass rather than keep walking into doomed allocations.
+ *
+ * @node_depth is the node's absolute byte depth and @ctx carries the walk's
+ * descent: together they let the recompaction's acquire DATE its {C, P, GP}
+ * members and resolve each one's anchor under a coarse spacing.  Passing
+ * neither refuses every member that is not the root -- the one-hop rule dates a
+ * parent as @node_depth - span(parent), which underflows at depth 0 -- and the
+ * refusal is a -EAGAIN this best-effort caller reports as *@oom, so the pass
+ * makes no progress and its driver loops forever.
  */
 static
 void ft_compact_relocate_at(struct cds_ft *ft, struct cds_ft_inode_flag **holder,
+		unsigned int node_depth, const struct ft_lock_ctx *ctx,
 		bool *oom)
 {
 	struct cds_ft_inode_flag *nf = *holder;
@@ -88,16 +97,24 @@ void ft_compact_relocate_at(struct cds_ft *ft, struct cds_ft_inode_flag **holder
 	}
 	ret = ft_node_recompact(FT_RECOMPACT_RELOCATE, ft, type_index,
 			&ft_types[type_index], node, meta, holder,
-			0, NULL, NULL, NULL, &old_ret, holder == &ft->root, 0,
-			false, &rec, txn, NULL, NULL);
+			0, NULL, NULL, NULL, &old_ret, holder == &ft->root,
+			node_depth, false, &rec, txn, NULL, ctx);
 	if (ret != 0) {
 		/*
-		 * Node allocation failed inside the recompact before any
-		 * reader-visible store, or the copy met a peer's parked flip
-		 * proxy and abandoned itself (-EAGAIN, side effects undone).
-		 * Either way nothing was recorded into @rec and *holder is
-		 * unchanged: best-effort, leave the node in place (a bailed
+		 * A node or reservation failure inside the recompact before any
+		 * reader-visible store, the copy meeting a peer's parked flip
+		 * proxy and abandoning itself, or -- once a coarse spacing puts
+		 * this walk on the DLM path -- a member it cannot date or a
+		 * lock-set acquire a peer already holds.  Every one of them
+		 * returns before the child re-parent sweep, so nothing was
+		 * recorded into @rec, no mark is still held and no copy is
+		 * unfreed: best-effort, leave the node in place (a bailed
 		 * relocation is retried by a later compaction pass).
+		 *
+		 * A contended -EAGAIN therefore reaches the caller as
+		 * CDS_FT_COMPACT_OOM.  That is the right STRUCTURAL answer (stop
+		 * the pass, resume from the interrupted key) under the wrong
+		 * name; the status enum has no "contended" member.
 		 */
 		if (txn)
 			ft_flip_txn_destroy(txn);	/* reserved, unused */
@@ -363,6 +380,17 @@ struct ft_ord_cell *ft_compact_relocate_cell(struct cds_ft *ft,
  * and the skip pointer.  Increments *@relocated per node moved.  Stops the
  * descent and sets *@oom if a relocation hits an allocation failure (the node
  * stays in place; further nodes on this path would likely fail the same way).
+ *
+ * The walk carries a real struct ft_descent, extended one node at a time with
+ * ft_walk_extend: a relocation's acquire anchors its {C, P, GP} lock-set
+ * through ft_anchor_meta, which under a coarse spacing resolves the anchor from
+ * the descent's level table (doc/design/ft-dlm-lock-coarseness.md §9).  A byte
+ * depth alone is not enough -- the one-hop rule DATES a member without a
+ * descent, but only the table can name the boundary node its anchor IS -- so
+ * this walk enters every node it passes, exactly as the read descent does, and
+ * with the same flag the parent slot holds (a skip-compressed node is entered
+ * by its SKIP flag, which ft_flag_to_metadata resolves through the child's
+ * back-pointer and so survives the node's own relocation).
  */
 static
 void ft_compact_descend(struct cds_ft *ft, const uint8_t *key,
@@ -370,7 +398,17 @@ void ft_compact_descend(struct cds_ft *ft, const uint8_t *key,
 {
 	const struct cds_ft_key_map *km = &ft->group->key_map;
 	struct cds_ft_inode_flag **holder = &ft->root;
+	struct ft_descent d;
+	struct ft_lock_ctx ctx;
 	size_t depth = 0;
+
+	/*
+	 * No outer held set: each relocation acquires, commits and releases its
+	 * own lock-set, so the only dedupe that matters is the intra-set one
+	 * ft_dlm_acquire_set already does.
+	 */
+	ft_descent_init(&d, ft);
+	ft_lock_ctx_init(&ctx, &d, NULL);
 
 	for (;;) {
 		struct cds_ft_inode_flag *nf = rcu_dereference(*holder);
@@ -382,12 +420,22 @@ void ft_compact_descend(struct cds_ft *ft, const uint8_t *key,
 			return;		/* reached a leaf */
 		if (!cds_ft_metadata_in_recompact_private(
 				cds_ft_item_to_metadata(ft_node_ptr(nf)))) {
-			ft_compact_relocate_at(ft, holder, oom);
+			ft_compact_relocate_at(ft, holder, (unsigned int) depth,
+				&ctx, oom);
 			(*relocated)++;
 			if (*oom)
 				return;		/* memory pressure: stop the descent */
 			nf = rcu_dereference(*holder);	/* the relocated node */
 		}
+		/*
+		 * Enter the node -- the RELOCATED one, so the table names a live
+		 * boundary -- before descending past it, so its children anchor
+		 * on the levels its span covers.  One key byte: *@holder is
+		 * always a plain internal node (a compressed run arrives through
+		 * the arms below, which enter it over its own length), which is
+		 * the same one byte the depth++ below consumes.
+		 */
+		(void) ft_walk_extend(&d, true, nf, (unsigned int) depth, 1);
 		if (depth >= key_len)
 			return;		/* consumed the whole key */
 		ord = key_to_ordinal(key[depth], km);
@@ -398,8 +446,8 @@ void ft_compact_descend(struct cds_ft *ft, const uint8_t *key,
 		if (ft_node_skip_compressed(raw)) {
 			struct cds_ft_compressed_node *cn =
 				ft_skip_to_compressed(ft, raw);
+			unsigned int span = ft_skip_len(raw);
 
-			depth += ft_skip_len(raw);
 			/*
 			 * Relocate the compressed node carrying the skip.
 			 * ft_skip_to_compressed recovers it through the child's
@@ -419,11 +467,19 @@ void ft_compact_descend(struct cds_ft *ft, const uint8_t *key,
 				if (*oom)
 					return;		/* memory pressure: stop the descent */
 			}
+			/*
+			 * The skip flag addresses the TARGET, not cn, so the
+			 * relocation leaves it valid: enter it as the parent slot
+			 * holds it, and ft_flag_to_metadata resolves it to the
+			 * LIVE compressed node through the child's back-pointer.
+			 */
+			depth = ft_walk_extend(&d, true, raw, (unsigned int) depth,
+				span);
 			holder = &cn->child;
 		} else if (ft_node_compressed(raw)) {
 			struct cds_ft_compressed_node *cn = ft_compressed_node_ptr(raw);
+			unsigned int span = cn->len;
 
-			depth += cn->len;
 			/* Traditional: the grandparent slot (child_slot) holds the cn flag. */
 			if (!cds_ft_metadata_in_recompact_private(
 					cds_ft_item_to_metadata((struct cds_ft_inode *) cn))) {
@@ -432,6 +488,9 @@ void ft_compact_descend(struct cds_ft *ft, const uint8_t *key,
 				if (*oom)
 					return;		/* memory pressure: stop the descent */
 			}
+			/* The grandparent slot now holds the relocated node's flag. */
+			depth = ft_walk_extend(&d, true, ft_compressed_node_flag(cn),
+				(unsigned int) depth, span);
 			holder = &cn->child;
 		} else {
 			holder = child_slot;	/* plain internal or external child */
