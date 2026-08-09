@@ -1228,6 +1228,36 @@ void ft_hold_trace_refused(const struct cds_ft_metadata *lock, const char *fn,
 			fn, line, (const void *) lock,
 			(unsigned long) CMM_LOAD_SHARED(lock->state));
 }
+
+/*
+ * A RELEASE naming a word this thread never took -- the MIRROR of a
+ * self-collision, and the shape coarsening produces when a site re-derives the
+ * release target from the NODE instead of naming the word the acquire actually
+ * CAS'd (its ANCHOR).  The bare assert below says only that some word was not
+ * locked; this says WHICH word and what this thread does hold instead, which is
+ * the whole diagnosis.
+ */
+static inline
+void ft_hold_trace_bad_release(const struct cds_ft_metadata *lock,
+		uintptr_t s)
+{
+	unsigned int i = ft_hold_trace_n;
+
+	/*
+	 * Capped like every other report in this feature: the assert below is
+	 * compiled out under NDEBUG, and the release then RETRIES -- an
+	 * uncapped line here is a disk filling at the speed of that loop.
+	 */
+	if (!ft_hold_trace_report_ok())
+		return;
+	fprintf(stderr,
+		"FT BAD RELEASE: word %p state=%lx not held (ledger %u deep)\n",
+		(const void *) lock, (unsigned long) s, ft_hold_trace_n);
+	while (i-- > 0 && i + 12 >= ft_hold_trace_n)
+		fprintf(stderr, "  held[%u] %p %s:%d\n", i,
+			(const void *) ft_hold_trace[i].lock,
+			ft_hold_trace[i].fn, ft_hold_trace[i].line);
+}
 #else
 static inline
 void ft_hold_trace_note(const struct cds_ft_metadata *lock, const char *fn,
@@ -1248,6 +1278,12 @@ void ft_hold_trace_refused(const struct cds_ft_metadata *lock, const char *fn,
 		int line)
 {
 	(void) lock; (void) fn; (void) line;
+}
+
+static inline
+void ft_hold_trace_bad_release(const struct cds_ft_metadata *lock, uintptr_t s)
+{
+	(void) lock; (void) s;
 }
 #endif	/* FEATURE_FT_HOLD_TRACE */
 
@@ -1352,6 +1388,8 @@ void ft_meta_lock_release(struct cds_ft_metadata *meta)
 		if (!(s & FT_STATE_LOCK))
 			return;
 #endif
+		if (caa_unlikely(!(s & FT_STATE_LOCK)))
+			ft_hold_trace_bad_release(meta, s);
 		assert(s & FT_STATE_LOCK);
 		if (caa_likely(uatomic_cmpxchg(&meta->state, s,
 				s & ~FT_STATE_LOCK) == s))
