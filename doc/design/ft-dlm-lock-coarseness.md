@@ -1068,8 +1068,13 @@ it.
 | arm | unit | inv |
 |---|---|---|
 | per-node | **308/308** | 111/111 |
-| exponential | 307/307 on the SHALLOW set; **RED** at the new deep fixture | — |
-| root-only | **251 of 307** — stops at 252 `test_merge_fixed_length_fast_path` | — |
+| **exponential** | **308/308**, deep fixture included | — |
+| root-only | **251 of 308** — stops at 252 `test_merge_fixed_length_fast_path` | — |
+
+Root-only's stop is a third instance of the same class, already named by the
+ledger: `ft_merge_spine_copy:1930` refusing a word taken at
+`ft_merge_lock_overlap:362` — the merge's publish-parent acquire meeting the
+merge's OWN overlap fence, which under root-only are one word.
 
 **Exponential is the first fully green coarse arm**, 294 → 307 across this
 round's seven fixes. Root-only went 111 → 251; its next stop is another
@@ -1118,24 +1123,36 @@ be a PLAIN INTERNAL node, and a single-child run compresses), and **three** at
 the last level, because the fold requires BP to keep ≥ 3 children once S_top is
 removed.
 
-**It passes at per-node and hangs under BOTH coarse spacings on the first
-attempt** — which is the whole reason to write it. The ledger names the next
-one:
+**It passed at per-node and hung under BOTH coarse spacings on the first
+attempt** — which is the whole reason to write it — and found **two more
+defects**, one per arm.
+
+**root-only.** The ledger, one line again:
 
 ```
 FT SELF-COLLISION: ft_node_recompact:1351 refused word 0x…058,
-                   taken at ft_rekey_graft_simple_attempt:1450
+                   taken at ft_rekey_graft_simple_attempt:1446
 ```
 
-The fold's own publish-parent fence, which lives in the GLUE rather than in
-`marks`, so the detach's frame does not name it. Same class as the four fixes
-above, one more carrier — and this time the change that would fix it (`held.glue`
-on that frame) is one a previous round dropped as undemonstrated. It is
-demonstrated now, which is how it should be earned.
+The fold's own **publish-parent fence**, which lives in the GLUE rather than in
+`marks` — so chaining the detach's frame carried the marks and not the fence.
+Naming the glue in that frame is the same repair as `marks` beside it: one op,
+one held set, and every CARRIER of it has to be in the frame or the chain
+reaches past it. (This is the `held.glue` edit a previous round dropped as
+undemonstrated. It is demonstrated now, which is how it should be earned.)
+
+**exponential.** `ft_glue_acquire_reparent_marks` refused on `h.shared` — and
+`shared` is **the dedupe working**, not a failure. It was right when the only
+route to it was a glue-dedupe miss; once `ft_acquire_member` consults the whole
+context (txn registry, `outer` frames, out-of-registry array), a word the op
+holds anywhere else arrives there instead, and refusing it refuses the op's own
+fence. Measured: `ar=0 shared=1`, anchor `state=0x80010` (LOCK, ours), `cd=6` —
+the depth-6 child whose `L(6)=4` is a genuine ancestor, a shape only a deep
+fixture produces.
 
 ★ **A green from a desensitised fixture is worth less than a red from a
-sensitive one.** "exponential 307/307" was true and is restated as what it was:
-green on the SHALLOW set.
+sensitive one.** "exponential 307/307" was green on the SHALLOW set; with the
+deep fixture in and both defects it found closed, exponential is **308/308**.
 
 The multi-writer oracle per setting is still owed on top of that: these counts
 prove the MAPPING is exercised, not that exclusion holds
