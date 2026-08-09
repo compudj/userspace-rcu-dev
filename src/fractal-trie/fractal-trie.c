@@ -1752,14 +1752,32 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 				ft_child_state_meta(ft, cn->child);
 
 			if (cm) {
-				ft_lock_ctx_init(&lctx_src, &d_src, txn);
+				/*
+				 * The DST descent dates this one, and @cn IS its
+				 * cursor -- so the displaced child is the cursor's
+				 * immediate child, the below-cursor case the window
+				 * cannot name (§7.1).  Dating it from the SRC
+				 * descent asked the wrong path entirely; that was
+				 * inert only because per-node reads no depth at all.
+				 */
+				struct ft_lock_ctx dctx;
 				unsigned int cd;
 
-				if (!ft_lock_ctx_depth_of(ft, &lctx_src,
-							cn->child, &cd) ||
-						ft_acquire_member(ft, &lctx_src,
-							cn->child, cm, cd,
-							&marks[nr_marks])) {
+				ft_lock_ctx_init(&dctx, &d_dst, txn);
+				if (!ft_lock_ctx_depth_of(ft, &dctx, cn->child,
+						&cd)) {
+					struct cds_ft_inode_flag *lp = NULL;
+
+					(void) ft_resolve_parent_slot(cm, ft,
+						&lp);
+					if (!ft_lock_ctx_depth_of_cursor_child(
+							ft, &dctx, lp, &cd)) {
+						ret = -EAGAIN;
+						goto bail_build;
+					}
+				}
+				if (ft_acquire_member(ft, &dctx, cn->child, cm,
+						cd, &marks[nr_marks])) {
 					ret = -EAGAIN;
 					goto bail_build;
 				}
