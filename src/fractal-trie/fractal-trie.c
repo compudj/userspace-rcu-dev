@@ -1843,6 +1843,15 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 * @gp member.
 	 */
 	ft_lock_ctx_init(&lctx_src, &d_src, NULL);
+	/*
+	 * The op's marks so far -- ft_rekey_cow_stop's @stop fence and one per
+	 * COW'd child -- reach no txn registry until the sweep below, so the
+	 * detach's own acquires can only see them through this frame.  Under a
+	 * coarse spacing S_top's fence lands on BP, which is exactly the node
+	 * this detach recompacts.
+	 */
+	lctx_src.held.extra = marks;
+	lctx_src.held.nr_extra = nr_marks;
 	ret = ft_detach_node(ft, &lctx_src, d_src.nfp, d_src.pnfp, d_src.depth,
 			false /*free_detached_subtree: S_top is retired by cow_stop*/,
 			NULL /*fuse_cell: list off*/, &pub, NULL /*run*/,

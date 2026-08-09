@@ -1498,6 +1498,14 @@ int ft_detach_node(struct cds_ft *ft,
 	}
 	ft_lock_ctx_init(&lctx, wd_valid ? &wd : NULL, NULL);
 	lctx.held.extra = orphan_held;
+	/*
+	 * This frame keeps its OWN out-of-registry array (@orphan_held), so the
+	 * caller's would be lost: CHAIN to it.  The rekey fold arrives here
+	 * holding ft_rekey_cow_stop's marks, and under a coarse spacing S_top's
+	 * fence lands on the very node this detach recompacts.
+	 */
+	lctx.held.outer = op_ctx ? &op_ctx->held : NULL;
+
 
 	FT_TP(detach_node_enter, (const void *) *detach_node_flag_ptr, detach_depth);
 

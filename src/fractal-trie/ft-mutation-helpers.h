@@ -1457,6 +1457,20 @@ struct ft_held_set {
 	const struct ft_held_anchor *extra;	/* marks held outside it */
 	unsigned int nr_extra;
 	const struct ft_glue *glue;		/* marks the glue names by field */
+	/*
+	 * The CALLER's held set, when this one belongs to a nested step of the
+	 * same op.  One op has ONE held set, and it is a CHAIN of frames because
+	 * a frame carries only ONE out-of-registry array: a step that keeps marks
+	 * of its own (ft_detach_node's orphan set) would otherwise DROP its
+	 * caller's (the rekey fold's ft_rekey_cow_stop marks), and a dropped
+	 * frame is not a missed optimisation -- it is the op refusing its own
+	 * fence, deterministically, on every retry.
+	 *
+	 * Points at a frame that OUTLIVES this one (a caller's, further down the
+	 * stack), so it never dangles.  Followed to the end; the chain is
+	 * bounded by the call depth.
+	 */
+	const struct ft_held_set *outer;
 };
 
 /*
@@ -1525,9 +1539,9 @@ bool ft_held_set_snap(const struct ft_held_set *h,
 			*snap = h->extra[i].lock_snap;
 			return true;
 		}
-	if (h->glue)
-		return ft_glue_held_snap(h->glue, meta, snap, ratified);
-	return false;
+	if (h->glue && ft_glue_held_snap(h->glue, meta, snap, ratified))
+		return true;
+	return ft_held_set_snap(h->outer, meta, snap, ratified);
 }
 
 static inline
@@ -1595,6 +1609,7 @@ void ft_lock_ctx_init(struct ft_lock_ctx *ctx, const struct ft_descent *d,
 	ctx->held.extra = NULL;
 	ctx->held.nr_extra = 0;
 	ctx->held.glue = NULL;
+	ctx->held.outer = NULL;
 	ctx->op = NULL;
 }
 
