@@ -544,6 +544,23 @@ struct ft_held_anchor {
 	 * redundant -- holding the word already excludes @node's mutators.
 	 */
 	bool node_held;
+	/*
+	 * A txn now OWNS this mark's outcome: it carries the {LOCK|s -> s}
+	 * release in its edge set AND the word in its locks[] registry, so a
+	 * commit OK consumes the mark and every other terminal drains it.  The
+	 * holder that took the mark must stop sweeping it -- one owner per fence.
+	 *
+	 * ★ Set only where the anchor SURVIVES the commit, and there it is
+	 * MANDATORY, because such a word is clean and re-lockable the instant the
+	 * release settles: a sweep that reaches it afterwards and asks "is it
+	 * still locked?" gets YES from a PEER'S fresh mark and clears that.  The
+	 * question has no answer at the word -- an owner-less LOCK bit cannot say
+	 * whose it is -- so the outcome must be tracked, not sampled.  A mark
+	 * whose terminal is the node's own TOMBSTONE needs none of this: the
+	 * acquire refuses a TOMBSTONE, so nobody re-locks that word and a
+	 * still-set LOCK there can only be ours.
+	 */
+	bool txn_owned;
 };
 
 /*
@@ -594,6 +611,7 @@ void ft_held_anchor_set(struct ft_held_anchor *h, struct cds_ft_metadata *lock,
 	h->node_snap = lock == node ? lock_snap : node_snap;
 	h->shared = false;
 	h->node_held = false;
+	h->txn_owned = false;
 }
 
 static
@@ -2435,6 +2453,7 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 			set[i].held.node_snap = node_snap;
 			set[i].held.shared = true;
 			set[i].held.node_held = node_held;
+			set[i].held.txn_owned = false;
 			continue;
 		}
 		if (ft_dlm_lock(acq, lock, &lock_snap)) {

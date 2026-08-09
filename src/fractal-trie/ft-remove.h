@@ -546,13 +546,29 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
  * ancestor that survives the retire (a no-op where the orphan carries its own),
  * then tombstone the orphan against ITS clean word.  A member that deduped onto
  * a word an earlier orphan took owes no release -- one word, one terminal.
+ *
+ * A SURVIVING anchor is handed to @txn outright -- release record AND registry
+ * entry -- so the caller's sweep stops owning it (struct ft_held_anchor's
+ * @txn_owned).  The two owners cannot be reconciled after the fact: the release
+ * leaves that word clean and LIVE, a peer takes it immediately (under a coarse
+ * spacing every op wants the same ancestor), and a later "release it if it is
+ * still locked" then strips the PEER's mark.  Where the anchor IS the retired
+ * node the fused tombstone is its terminal and the word is unlockable
+ * afterwards, so that mark stays with the caller and costs no registry slot --
+ * which is what keeps a FT_MAX_DEPTH orphan chain inside FT_FLIP_TXN_MAX_LOCKS,
+ * and the per-node granularity byte-identical.
  */
 static inline
 void ft_detach_freeze_one(struct ft_flip_txn *txn,
-		const struct ft_held_anchor *h, struct cds_ft_metadata *m)
+		struct ft_held_anchor *h, struct cds_ft_metadata *m)
 {
-	if (!h->shared)
+	if (!h->shared) {
 		ft_flip_txn_record_anchor_release(txn, h, m);
+		if (h->lock != m) {
+			ft_flip_txn_lock_register(txn, h->lock, h->lock_snap);
+			h->txn_owned = true;
+		}
+	}
 	ft_flip_txn_record_retire_anchored(txn, h, m);
 }
 
@@ -560,8 +576,8 @@ static
 void ft_detach_freeze_orphans(struct cds_ft *ft, struct ft_flip_txn *txn,
 		struct cds_ft_inode_flag **orphans, int nr_orphans,
 		struct cds_ft_inode_flag *trailing_skip_cn_flag,
-		const struct ft_held_anchor *held,
-		const struct ft_held_anchor *trailing_held)
+		struct ft_held_anchor *held,
+		struct ft_held_anchor *trailing_held)
 {
 	int i;
 
@@ -765,8 +781,8 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		struct cds_ft_inode_flag **orphans,
 		int nr_orphans,
 		struct cds_ft_inode_flag *trailing_orphan,
-		const struct ft_held_anchor *orphan_held,
-		const struct ft_held_anchor *trailing_orphan_held,
+		struct ft_held_anchor *orphan_held,
+		struct ft_held_anchor *trailing_orphan_held,
 		struct cds_ft_node *freeze_leaf,
 		long count_delta,
 		unsigned int count_reserve)
@@ -3150,22 +3166,29 @@ int ft_detach_node(struct cds_ft *ft,
 end:
 	/*
 	 * DLM orphan plan-lock cleanup (§9.2): release every orphan lock acquire the
-	 * op still holds.  On a successful detach the consuming commit already turned
-	 * each orphan's fenced {LOCK|s -> TOMBSTONE|s} tombstone terminal (LOCK
-	 * dropped), so clear_if_held no-ops on those; on ANY abort / pre-commit bail
-	 * (including a mark-miss mid-collection, which jumps here) the fenced
-	 * tombstone never applied, so the marks are still {LOCK|s} and get
-	 * released here -- the structure returns byte-for-byte to its pre-op state.
-	 * One sweep covers both Block A and Block B (mutually exclusive), the
-	 * trailing skip-target (an entry of @orphan_held like any other) and every
-	 * commit outcome (in-place / recompaction / shape-D), no "consumed"
-	 * tracking.
+	 * op still holds AND still owns.  What is left here marks the orphan's OWN
+	 * word, so its terminal is the fenced {LOCK|s -> TOMBSTONE|s} tombstone: a
+	 * successful detach committed it (LOCK dropped, and an acquire refuses a
+	 * TOMBSTONE, so the bit cannot come back) and clear_if_held no-ops; on ANY
+	 * abort / pre-commit bail (including a mark-miss mid-collection, which
+	 * jumps here) the tombstone never applied, so the mark is still {LOCK|s}
+	 * and is released here -- the structure returns byte-for-byte to its
+	 * pre-op state.  One sweep covers both Block A and Block B (mutually
+	 * exclusive), the trailing skip-target (an entry of @orphan_held like any
+	 * other) and every commit outcome (in-place / recompaction / shape-D), no
+	 * "consumed" tracking.
+	 *
+	 * A mark whose anchor SURVIVES the retire is NOT here: ft_detach_freeze_one
+	 * handed it to the freezing txn (@txn_owned), which is the only owner that
+	 * can tell a consumed mark from a peer's fresh one on that still-lockable
+	 * word.
 	 */
 	{
 		int oi;
 
 		for (oi = 0; oi < nr_orphan_locked; oi++)
-			if (!orphan_held[oi].shared)
+			if (!orphan_held[oi].shared &&
+					!orphan_held[oi].txn_owned)
 				ft_meta_lock_release_if_held(
 					orphan_held[oi].lock);
 	}
