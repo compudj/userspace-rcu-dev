@@ -1069,12 +1069,34 @@ it.
 |---|---|---|
 | per-node | **308/308** | 111/111 |
 | **exponential** | **308/308**, deep fixture included | — |
-| root-only | **251 of 308** — stops at 252 `test_merge_fixed_length_fast_path` | — |
+| root-only | **303 of 308** — stops at 304 `test_rekey_graft_glue_dst` | — |
 
-Root-only's stop is a third instance of the same class, already named by the
-ledger: `ft_merge_spine_copy:1930` refusing a word taken at
-`ft_merge_lock_overlap:362` — the merge's publish-parent acquire meeting the
-merge's OWN overlap fence, which under root-only are one word.
+### The class, all the way down
+
+Every stop since the fold closed has been ONE class — *the op refusing a word it
+already holds* — differing only in which CARRIER the asking frame failed to
+name. Six instances, each named by the hold-trace ledger in a single line:
+
+| refuser | holder | the carrier that was missing |
+|---|---|---|
+| `ft_node_recompact` | `ft_rekey_cow_stop` | the caller's frame (`held.outer`) |
+| `ft_node_recompact` | `ft_rekey_cow_stop` | the store's ctx had no `outer` |
+| `ft_node_recompact` | the fold's publish-parent fence | `held.glue` on the fold's frame |
+| the re-parent marks | anything held elsewhere | `h.shared` read as a FAILURE |
+| `ft_merge_spine_copy` | `ft_merge_lock_overlap` | the glue answered for the NODE, not the word it LOCKED |
+| the merge's publish parent | its own overlap fence | `ph.shared` read as a FAILURE, and a second terminal |
+
+★ Two shapes recur, and both are worth grepping for:
+
+1. **A carrier the frame does not name.** `marks`, `glue`, `outer`, the txn
+   registry — an op's held set is the UNION, and any frame naming a subset
+   refuses its own fence.
+2. **`shared` read as failure.** `|| h.shared` was correct while a single
+   dedupe ran ahead of the acquire; once the acquire consults the whole context
+   it is how a legitimate hit REPORTS. Both sites that had it were wrong.
+
+And one premise that coarsening narrows: *"X is never in the fenced set"* is a
+claim about a NODE. Its ANCHOR can be, and under root-only always is.
 
 **Exponential is the first fully green coarse arm**, 294 → 307 across this
 round's seven fixes. Root-only went 111 → 251; its next stop is another
