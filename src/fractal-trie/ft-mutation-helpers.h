@@ -6870,6 +6870,32 @@ bool ft_glue_is_fresh(struct cds_ft *ft, struct ft_glue *g,
  *   wrapper later absorbed by a chain-merge keeps only its final mapping.
  */
 /*
+ * Record a child's PARENT WORD re-parent edge, expected old read THROUGH the
+ * txn.
+ *
+ * The slot enters this txn's WRITE set here, so the engine's read policy
+ * demands a WAITING load.  A raw read bakes a peer's parked FT_FLIP_PROXY_TAG
+ * -- a descriptor POINTER -- into the expected old: the install CAS can then
+ * never match, so the attempt is a guaranteed abort and the retry re-reads the
+ * same parked word.  A release build turns that into a silent poison-and-abort
+ * the retry loops absorb, which is why it stayed invisible; --enable-rcu-debug
+ * traps it at urcu_txn_add's !urcu_txn_is_proxy assert.
+ *
+ * The tag is the one the RECORD carries (FT_FLIP_PROXY_TAG via
+ * ft_flip_txn_record_reserved), NOT the state word's FT_STATE_PROXY.
+ */
+static inline
+void ft_flip_txn_record_parent_word(const struct cds_ft *ft,
+		struct ft_flip_txn *txn, struct cds_ft_metadata *meta,
+		struct cds_ft_inode_flag *parent_nf)
+{
+	ft_flip_txn_record_reserved(txn, (void **) &meta->parent_word,
+		urcu_txn_load(txn->mtxn, (void **) &meta->parent_word,
+			FT_FLIP_PROXY_TAG),
+		ft_parent_word(ft, parent_nf));
+}
+
+/*
  * ft_glue_record_back_edge: the flip-txn dual of a deferred back-pointer.
  * Instead of setting @child_nf's parent to @parent_nf now (or deferring it to a
  * post-drain ft_set_parent), RECORD the parent-field transition {old ->
@@ -6885,9 +6911,13 @@ bool ft_glue_is_fresh(struct cds_ft *ft, struct ft_glue *g,
  * flip).
  *
  * @child_nf is LIVE (the caller took the fresh fast path) and never a flip
- * proxy.  List off only (the converted phase): an external head's parent is its
- * prev directly.  Records cannot fail -- the caller reserved @txn to the bounded
- * cluster size up front.
+ * proxy.  That says nothing about the child's PARENT WORD, which a peer can
+ * have parked: a graft's displaced-child re-parent reaches here on a published
+ * node (measured, from ft_merge_at_inner), so every parent-word edge goes
+ * through ft_flip_txn_record_parent_word's read-your-own-writes load.  List off
+ * only (the converted phase): an external head's parent is its prev directly.
+ * Records cannot fail -- the caller reserved @txn to the bounded cluster size
+ * up front.
  */
 static
 void ft_glue_record_back_edge(struct cds_ft *ft, struct ft_flip_txn *txn,
@@ -6903,8 +6933,7 @@ void ft_glue_record_back_edge(struct cds_ft *ft, struct ft_flip_txn *txn,
 			cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
 
 		ft_set_parent_slot(cn_meta, parent_nf, slot);
-		ft_flip_txn_record_reserved(txn, (void **) &cn_meta->parent_word,
-			cn_meta->parent_word, ft_parent_word(ft, parent_nf));
+		ft_flip_txn_record_parent_word(ft, txn, cn_meta, parent_nf);
 		return;
 	}
 	if (ft_node_compressed(child_nf)) {
@@ -6914,8 +6943,7 @@ void ft_glue_record_back_edge(struct cds_ft *ft, struct ft_flip_txn *txn,
 			cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
 
 		ft_set_parent_slot(cn_meta, parent_nf, slot);
-		ft_flip_txn_record_reserved(txn, (void **) &cn_meta->parent_word,
-			cn_meta->parent_word, ft_parent_word(ft, parent_nf));
+		ft_flip_txn_record_parent_word(ft, txn, cn_meta, parent_nf);
 		return;
 	}
 #endif
@@ -6964,8 +6992,7 @@ void ft_glue_record_back_edge(struct cds_ft *ft, struct ft_flip_txn *txn,
 				&ft_types[ft_node_type(parent_nf)],
 				ft_node_ptr(parent_nf), slot);
 		ft_set_parent_slot(meta, parent_nf, slot);
-		ft_flip_txn_record_reserved(txn, (void **) &meta->parent_word,
-			meta->parent_word, ft_parent_word(ft, parent_nf));
+		ft_flip_txn_record_parent_word(ft, txn, meta, parent_nf);
 	}
 }
 
@@ -7065,8 +7092,22 @@ void ft_reparent_record_meta(struct cds_ft *ft, struct ft_flip_txn *txn,
 	 * today, never a root, but the invariant "no parent word is left
 	 * anonymous" should not rest on that.
 	 */
-	ft_flip_txn_record_reserved(txn, (void **) &meta->parent_word,
-		meta->parent_word, ft_parent_word(ft, parent_nf));
+	/*
+	 * READ IT THROUGH THE TXN, for the reason the parent_slot_offset load
+	 * above spells out -- the two fields are siblings and the rule is the
+	 * same.  This slot enters THIS txn's write set on the very next line, so
+	 * the engine's read policy requires a WAITING load: a raw read bakes a
+	 * peer's parked FT_FLIP_PROXY_TAG -- a descriptor POINTER -- into the
+	 * expected old, which the install CAS can never match, so the attempt is
+	 * a guaranteed abort and the retry re-reads the same parked word.
+	 *
+	 * @meta is LIVE here (this is the re-parent of a published child), which
+	 * is exactly the case that CAN meet a peer's park.  Measured:
+	 * --enable-rcu-debug traps it at urcu_txn_add's !urcu_txn_is_proxy
+	 * assert, on the DEFAULT per-node granularity, from
+	 * ft_chain_compress_fused's back-edge fold.
+	 */
+	ft_flip_txn_record_parent_word(ft, txn, meta, parent_nf);
 	/*
 	 * The state edge is now a pure {live_state -> live_state} GUARD: it no
 	 * longer carries the offset, so its whole job is the §4.B validate the
