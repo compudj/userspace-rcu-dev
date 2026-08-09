@@ -1307,6 +1307,19 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	ft_flip_txn_set_structural_sw(txn, true);
 	if (!merge_dst) {
 		ft_lock_ctx_init(&lctx_src, &d_src, txn);
+		/*
+		 * Bind the op's PERSISTENT handle so this acquire's own commit
+		 * AGES: a per-attempt handle is domain-less and never
+		 * begin/end-bracketed, which makes the acquire a participant the
+		 * escalation lane cannot order, and a peer can then hold a member
+		 * while a lane-holding writer spins for it.  ft-insert.h's @ic.op
+		 * is the converted precedent; the rekey path was still unbound.
+		 *
+		 * This is the ACQUIRE's aging, not an escalated spin: the retry
+		 * wrapper below still arbitrates COMMITS only, and an acquire miss
+		 * stays a clean bail that re-descends.
+		 */
+		lctx_src.op = optxn;
 		ret = ft_rekey_cow_stop(ft, &lctx_src, txn, s_top, d_src.depth,
 				&s_top_prime, marks, &nr_marks);
 		if (ret) {
@@ -1445,6 +1458,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 
 			/* The DST descent dates this one: it IS its parent slot. */
 			ft_lock_ctx_init(&dctx, &d_dst, txn);
+			dctx.op = optxn;	/* bind the op's FIFO turn (see above) */
 			if (!pp_meta || ft_acquire_member(ft, &dctx, d_dst.pnf,
 					pp_meta, d_dst.pdepth, &pph) ||
 					pph.shared) {
@@ -1559,6 +1573,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		struct ft_lock_ctx bctx;
 
 		ft_lock_ctx_init(&bctx, &d_src, txn);
+		bctx.op = optxn;	/* bind the op's FIFO turn (see above) */
 		bctx.held.extra = marks;
 		bctx.held.nr_extra = nr_marks;
 		prep = ft_graft_build(ft, dst_ord, dst_len, s_top_prime, cnt,
@@ -1725,6 +1740,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 			struct ft_held_anchor pph;
 
 			ft_lock_ctx_init(&lctx_src, &d_src, txn);
+			lctx_src.op = optxn;	/* bind the op's FIFO turn (see above) */
 			/*
 			 * The REST of the op's held set, exactly as the
 			 * store-prepare and detach arms name it:
@@ -1804,6 +1820,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 				unsigned int cd;
 
 				ft_lock_ctx_init(&dctx, &d_dst, txn);
+				dctx.op = optxn;	/* bind the op's FIFO turn (see above) */
 				/*
 				 * The REST of the op's held set: the cow_stop
 				 * marks reach no registry until the sweep, and
@@ -1877,6 +1894,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 			struct ft_lock_ctx octx;
 
 			ft_lock_ctx_init(&octx, &d_src, txn);
+			octx.op = optxn;	/* bind the op's FIFO turn (see above) */
 			octx.held.extra = marks;
 			octx.held.nr_extra = nr_marks;
 			gst = ft_store_at_graft_point_prepare(ft, dst_ord,
@@ -1931,6 +1949,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 * @gp member.
 	 */
 	ft_lock_ctx_init(&lctx_src, &d_src, NULL);
+	lctx_src.op = optxn;	/* bind the op's FIFO turn (see above) */
 	/*
 	 * The op's marks so far -- ft_rekey_cow_stop's @stop fence and one per
 	 * COW'd child -- reach no txn registry until the sweep below, so the
@@ -2250,6 +2269,35 @@ cells_done:
 		}
 	}
 #endif
+	/*
+	 * The marks' anchor releases.
+	 *
+	 * `marks_consumed` below claims the commit consumed every mark, and its
+	 * two justifications -- a child's {live_state -> live_state} re-parent
+	 * edge, @stop's retire -- are claims about each NODE's OWN word.  Under a
+	 * coarse spacing the word the acquire TOOK is the node's ANCHOR, and no
+	 * node terminal touches it: without this the LOCK survives the commit and
+	 * leaks, so the next op to anchor there refuses it forever and a later
+	 * release of it asserts.
+	 *
+	 * Placed here because this is past the LAST acquire -- @nr_marks is still
+	 * growing up to the displaced-child mark above -- NOT for ordering:
+	 * ft_flip_txn_record_anchor_release_held reads the word through the txn,
+	 * so it chains onto whatever the op has already recorded there and is
+	 * order-independent by construction (measured: recording it right after
+	 * ft_rekey_cow_stop is equally green).  Self-guarding too, so an
+	 * UNcoarsened mark -- whose node terminal IS its release -- records
+	 * nothing and the default granularity stays byte-identical.
+	 */
+	for (i = 0; i < nr_marks; i++) {
+		if (marks[i].shared)
+			continue;	/* an earlier acquire owns its release */
+		if (!ft_flip_txn_reserve_extra(txn, 1)) {
+			ret = -ENOMEM;
+			goto bail_build;
+		}
+		ft_flip_txn_record_anchor_release_held(txn, marks[i].lock);
+	}
 	st = ft_flip_txn_commit(ft, txn);
 	if (st == URCU_TXN_STATUS_OK) {
 		/*
@@ -2260,6 +2308,27 @@ cells_done:
 		 * must NOT run -- see its own comment.
 		 */
 		marks_consumed = true;
+		{	/* TEMPORARY PROBE: did the commit really settle every mark? */
+			unsigned int k;
+
+			for (k = 0; k < nr_marks; k++) {
+				uintptr_t st2;
+
+				if (marks[k].shared)
+					continue;
+				st2 = CMM_LOAD_SHARED(marks[k].lock->state);
+				if (st2 & FT_STATE_LOCK) {
+					static __thread unsigned long _n;
+
+					if (_n++ < 8)
+						fprintf(stderr,
+							"[POST] mark %u/%u word=%p STILL LOCKED state=%lx\n",
+							k, nr_marks,
+							(void *) marks[k].lock,
+							(unsigned long) st2);
+				}
+			}
+		}
 		ft_glue_free_old(ft, &glue);		/* graft old copies */
 		/*
 		 * The merged cluster's SRC side: its free list holds S_top itself (and

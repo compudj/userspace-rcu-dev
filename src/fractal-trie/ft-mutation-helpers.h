@@ -3406,6 +3406,58 @@ void ft_flip_txn_record_release_lock(struct ft_flip_txn *t,
 }
 
 /*
+ * Drop LOCK from a word the op HOLDS, chaining onto whatever THIS txn has
+ * already written to it -- the release twin of
+ * ft_flip_txn_record_retire_anchored's fused arm, and for the same reason.
+ *
+ * ft_flip_txn_record_anchor_release carries the mark's acquire-time CLEAN
+ * snapshot as its expected old, which makes the record a read-set guard on the
+ * anchor.  That is right when the anchor is a word the op does not otherwise
+ * touch (a graft's publish parent, acquired late).  It is UNUSABLE for an
+ * anchor the op keeps WRITING: under a coarse spacing the anchor is an
+ * ancestor's state word -- under root-only, the trie root's -- and the op
+ * records its own counts, re-parents and terminals there.  A fixed expected old
+ * then matches at NO point in the chain: recorded first, the op's later edges
+ * expect the committed value while pending has already moved; recorded last,
+ * the earlier edges have moved pending off the snapshot.  Either way every
+ * commit aborts and the retry rebuilds the same shape -- a livelock with no
+ * diagnostic (measured: single-writer, so not contention).
+ *
+ * The RYW load is what the retire twin already does, and its justification
+ * carries over exactly: no peer can have moved this word, BECAUSE WE HOLD IT
+ * LOCKED.  So the fresh read gives up nothing -- the LOCK is the exclusion the
+ * snapshot form was approximating, and it is strictly stronger.
+ *
+ * Self-guarding, which is what makes it safe to call for EVERY non-shared mark:
+ * a TOMBSTONE in pending means the op retires the anchor itself, and a pending
+ * value with LOCK already clear means a node terminal (a retire's fused
+ * transition, a re-parent's {live_state -> live_state}) has settled it.  Both
+ * return without recording, so an UNcoarsened mark -- whose node terminal IS
+ * its release -- costs nothing here.
+ *
+ * ORDER-INDEPENDENT, which is the point of the RYW load: recorded before the
+ * op's other edges on the word it drops LOCK and they chain onto that; recorded
+ * after them it sees their pending value and chains onto it.  Callers place it
+ * by COVERAGE (past the last acquire), not by order.
+ */
+static inline
+void ft_flip_txn_record_anchor_release_held(struct ft_flip_txn *t,
+		struct cds_ft_metadata *lock)
+{
+	uintptr_t pending = (uintptr_t) urcu_txn_load(t->mtxn,
+			(void **) &lock->state, FT_STATE_PROXY);
+
+	if (caa_unlikely(pending & FT_STATE_TOMBSTONE))
+		return;			/* the op retires the anchor itself */
+	if (!(pending & FT_STATE_LOCK))
+		return;			/* a node terminal already settled it */
+	ft_flip_txn_record_tag(t, (void **) &lock->state,
+			(void *) pending,
+			(void *) (pending & ~FT_STATE_LOCK),
+			FT_STATE_PROXY);
+}
+
+/*
  * A retire terminal whose lock-set member was ANCHORED has TWO halves on TWO
  * words: the lock sits on an ancestor that SURVIVES the commit, while the
  * retired node's own word was never locked.  Per-node granularity puts both on
