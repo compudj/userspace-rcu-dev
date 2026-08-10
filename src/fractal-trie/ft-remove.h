@@ -3880,15 +3880,44 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 		 */
 		have_descent = true;
 		/*
-		 * Locating the holder ON the descent is what makes @holder_depth
-		 * the HOLDER's rather than the leaf's; not locating it leaves the
-		 * handle-derived value, and the walk is an anchor source either
-		 * way.
+		 * A holder the descent does NOT pass is one @node->prev names
+		 * STALELY: a peer republished the holder and the back-edge still
+		 * carries the old copy, which the tombstone test above misses
+		 * whenever the peer's retire has not landed yet.  Take the
+		 * FORWARD path's holder, the same authority the arm above
+		 * applies -- the two positions are the two bullets listed there.
+		 *
+		 * Keeping the back-pointer's node instead leaves it UNDATED, and
+		 * a byte-depth of 0 does not READ as undated: it is THE ROOT, so
+		 * ft_anchor_meta anchors that holder on ITSELF while every op
+		 * that dates it anchors on an ancestor.  The two then exclude
+		 * nothing, which is the §1 disagreement -- measured as a LOST
+		 * UPDATE, a chain-head promote publishing in place into a holder
+		 * a peer was COW-recompacting (inv_writer_progress_chainmerge).
 		 */
-		if (d.nf == holder_flag)
+		if (d.nf == holder_flag) {
 			holder_depth = d.depth;
-		else if (d.pnf == holder_flag)
+		} else if (d.pnf == holder_flag) {
 			holder_depth = d.pdepth;
+		} else if (!ft_node_external(holder_flag)) {
+			bool prefix = d.nf && !ft_node_external(d.nf) &&
+				d.depth == key_len;
+			struct cds_ft_inode_flag *fwd = prefix ? d.nf : d.pnf;
+
+			if (!fwd || ft_flag_tombstoned(ft, fwd)) {
+				/*
+				 * The forward holder is dead too: nothing is
+				 * reserved or published yet, so re-derive the
+				 * whole position against the settled tree --
+				 * the retry the tail takes for a peer-won
+				 * commit, reached before any of the work.
+				 */
+				*need_retry = true;
+				return CDS_FT_STATUS_OK;
+			}
+			holder_flag = fwd;
+			holder_depth = prefix ? d.depth : d.pdepth;
+		}
 	}
 
 	/*
