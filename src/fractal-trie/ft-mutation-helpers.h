@@ -6282,6 +6282,18 @@ struct ft_glue_free_item {
 	struct cds_ft_metadata *holder;
 	uintptr_t holder_snap;
 	bool holder_shared;
+	/*
+	 * The txn now OWNS @holder's outcome -- its {LOCK|s -> s} release is in
+	 * the edge set AND the word is in locks[] -- so ft_glue_clear_fenced must
+	 * stop sweeping it.  ONE OWNER PER FENCE (ft_held_anchor's @txn_owned,
+	 * and the same argument): a SURVIVING anchor is clean and re-lockable the
+	 * instant the release settles, and under a coarse spacing every op wants
+	 * that same ancestor, so a later "release it if it is still held" reads
+	 * back a PEER's fresh mark and strips it.  Only an anchor that IS the
+	 * retired node stays with the sweep: the acquire refuses a TOMBSTONE, so
+	 * a LOCK still set on that word can only be ours.
+	 */
+	bool holder_txn_owned;
 };
 
 /*
@@ -7402,6 +7414,7 @@ void ft_glue_defer_free(struct ft_glue *g,
 	g->free_list[g->nr_free].holder = NULL;
 	g->free_list[g->nr_free].holder_snap = 0;
 	g->free_list[g->nr_free].holder_shared = false;
+	g->free_list[g->nr_free].holder_txn_owned = false;
 	g->free_list[g->nr_free].snap = 0;
 	g->nr_free++;
 }
@@ -7411,7 +7424,8 @@ void ft_glue_defer_free(struct ft_glue *g,
  * fence the caller ALREADY acquired -- before copying its content into the merged
  * cluster -- stashing the mark's clean @snap so the freeze can record the fenced
  * {LOCK|s -> TOMBSTONE|s} terminal.  The mark is owned by the op and released
- * by ft_glue_clear_fenced on any non-committing exit.
+ * by ft_glue_clear_fenced on any non-committing exit -- unless the freeze hands
+ * a SURVIVING anchor to the txn instead (@holder_txn_owned).
  *
  * WHY THIS EXISTS.  The plain retire (above) records {s -> s|TOMBSTONE} with an
  * expected-old read fresh at commit time, and takes NO lock over the window in
@@ -7434,16 +7448,24 @@ void ft_glue_defer_free_fenced(struct ft_glue *g,
 	g->free_list[g->nr_free].holder = h->lock;
 	g->free_list[g->nr_free].holder_snap = h->lock_snap;
 	g->free_list[g->nr_free].holder_shared = h->shared;
+	g->free_list[g->nr_free].holder_txn_owned = false;
 	g->nr_free++;
 }
 
 /*
- * Release every node lock this glue's overlap-spine plan-lock still holds.
- * Call at the op's terminal on BOTH the committing and the aborting path:
- * ft_meta_lock_release_if_held no-ops on an entry whose fenced retire the commit
- * already turned TOMBSTONE, and releases one left {LOCK|s} by an abort -- so no
- * per-outcome bookkeeping is needed, which is the same reason the detach's orphan
- * chain sweeps unconditionally.
+ * Release every node lock this glue's overlap-spine plan-lock still holds AND
+ * still owns.  Call at the op's terminal on BOTH the committing and the aborting
+ * path: ft_meta_lock_release_if_held no-ops on an entry whose fenced retire the
+ * commit already turned TOMBSTONE, and releases one left {LOCK|s} by an abort --
+ * so no per-outcome bookkeeping is needed, which is the same reason the detach's
+ * orphan chain sweeps unconditionally.
+ *
+ * ★ THAT ARGUMENT IS THE RETIRED NODE'S OWN WORD SPEAKING, and it holds only
+ * while the mark sits on it: a TOMBSTONE is un-lockable, so a LOCK still set
+ * there is ours.  A COARSENED mark sits on an ancestor that SURVIVES, whose
+ * terminal leaves it clean, LIVE and immediately re-lockable -- asking that word
+ * "are you still locked?" gets YES from a PEER and strips its mark.  Such a mark
+ * is handed to the txn at the freeze (@holder_txn_owned) and skipped here.
  *
  * The nodes are still addressable at both call points: on success they are
  * call_rcu-deferred (the writer's own read-side section holds the grace period
@@ -7516,9 +7538,11 @@ void ft_glue_clear_fenced(struct ft_glue *g)
 		 * Release the word the acquire TOOK, which coarsening makes an
 		 * ancestor rather than the node itself.  A shared entry took
 		 * none, so it releases none -- the entry that first held the
-		 * word owns that release.
+		 * word owns that release; a txn-owned one was handed away.
 		 */
-		if (!g->free_list[i].holder_shared && g->free_list[i].holder)
+		if (!g->free_list[i].holder_shared &&
+				!g->free_list[i].holder_txn_owned &&
+				g->free_list[i].holder)
 			ft_meta_lock_release_if_held(g->free_list[i].holder);
 		g->free_list[i].fenced = false;
 	}
@@ -8187,9 +8211,27 @@ void ft_glue_tombstone_free_list(struct ft_glue *g)
 				ft_flip_txn_record_retire_anchored(g->txn,
 					&fctx, &h, meta);
 			}
-			if (!h.shared)
+			if (!h.shared) {
 				ft_flip_txn_record_anchor_release(g->txn, &h,
 					meta);
+				/*
+				 * A SURVIVING anchor goes to the txn outright --
+				 * release record above, registry entry here -- so
+				 * ft_glue_clear_fenced stops owning it.  The txn is
+				 * the only owner that can tell a consumed mark from
+				 * a peer's fresh one: commit OK consumes it through
+				 * the release, every other terminal drains the
+				 * registry.  Where the anchor IS @meta the fused
+				 * terminal is the whole story and the mark stays
+				 * with the sweep, which costs no registry slot and
+				 * keeps per-node granularity byte-identical.
+				 */
+				if (h.lock != meta) {
+					ft_flip_txn_lock_register(g->txn,
+						h.lock, h.lock_snap);
+					g->free_list[i].holder_txn_owned = true;
+				}
+			}
 			continue;
 		}
 		/*
