@@ -1165,8 +1165,22 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		 * @iter_node_flag) resolved just above -- nothing has been stored
 		 * yet.  The commit CAS rejects a peer that raced it (see
 		 * ft_pub_rec_add).
+		 *
+		 * WAITING load, not a raw one: @publish_slot is recorded as an
+		 * edge of THIS txn a few lines down, so it enters the txn's own
+		 * write set and the read-policy rule is to wait out an undecided
+		 * parker.  "The commit CAS rejects a peer that raced it" holds
+		 * for a stale PLAIN value and not for a parked flip proxy: that
+		 * is a descriptor-record POINTER, and handing it to the engine as
+		 * an expected-old trips urcu_txn_add's !urcu_txn_is_proxy check
+		 * (--enable-rcu-debug; a release build POISONS the descriptor and
+		 * the retry loop absorbs it, so the arm is green and wrong).
+		 * Only a coarse spacing exposes it -- under per-node this op
+		 * holds @publish_parent's own word, so no peer can park here.
 		 */
-		struct cds_ft_inode_flag *pub_expected_old = *publish_slot;
+		struct cds_ft_inode_flag *pub_expected_old =
+			urcu_txn_load(txn->mtxn, (void **) publish_slot,
+				FT_FLIP_PROXY_TAG);
 
 		/*
 		 * Chain-compress canonicalization publish: the merged compressed
