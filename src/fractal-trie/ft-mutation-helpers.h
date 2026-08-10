@@ -8906,8 +8906,24 @@ int ft_glue_acquire_splice_holders(struct cds_ft *ft, struct ft_glue *g)
 			cds_ft_fault_lock_countdown--;
 		}
 #endif
-		if (ft_acquire_member(ft, &sctx, hf, hm, hd, &sh) || sh.shared)
+		if (ft_acquire_member(ft, &sctx, hf, hm, hd, &sh))
 			goto miss;
+		/*
+		 * DEDUPED ONTO A MARK THIS OP ALREADY HOLDS.  @shared is the
+		 * acquire's "protected, owing no release and no terminal" answer,
+		 * so the chain is excluded exactly as the ft_glue_fence_holds arm
+		 * above is: take no second lock, record no holder, and leave the
+		 * release to whichever registry owns the mark.
+		 *
+		 * Treating it as a MISS is a SELF-REFUSAL, not contention: the
+		 * caller re-descends onto the identical shape and asks again
+		 * forever.  ft_glue_fence_holds only scans the glue's FENCED free
+		 * list, while the acquire dedupes against the whole held set (the
+		 * txn's locks[], the frame chain, the glue), so a mark filed in any
+		 * other registry reaches here as @shared.
+		 */
+		if (sh.shared)
+			continue;
 		g->splices[i].holder = sh.lock;
 		g->splices[i].holder_snap = sh.lock_snap;
 		if (ft_chain_head_holder(ft, dst_head) != hf)
