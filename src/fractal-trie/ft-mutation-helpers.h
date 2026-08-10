@@ -5054,10 +5054,20 @@ void ft_pub_rec_add_back_edge(struct cds_ft *ft, struct ft_pub_rec *rec,
 			&((struct cds_ft_node *) child)->prev;
 	}
 	/*
-	 * Back-edge expected-old = the child's current back-pointer (cell->parent
-	 * / prev); matches the sibling ft_reparent_record_meta's raw meta->parent.
+	 * Back-edge expected-old = the child's current back-pointer
+	 * (cell->parent / prev), read as a WAITING load rather than raw: @rec is
+	 * recorded into @txn by the caller, so this slot enters that txn's write
+	 * set and its last load must wait out an undecided parker.  A raw read
+	 * bakes a peer's parked flip proxy -- a descriptor-record POINTER -- into
+	 * the expected-old, which is the engine's !urcu_txn_is_proxy self-check.
+	 *
+	 * ★ The comment this replaces justified the raw read by pointing at "the
+	 * sibling ft_reparent_record_meta's raw meta->parent".  That sibling
+	 * stopped reading raw; the justification outlived the mechanism.
 	 */
-	ft_pub_rec_add(rec, field, *field, new_parent);
+	ft_pub_rec_add(rec, field,
+		urcu_txn_load(txn->mtxn, (void **) field, FT_FLIP_PROXY_TAG),
+		new_parent);
 }
 
 /*

@@ -1671,7 +1671,15 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 				ft_compressed_node_ptr(pub), pub);
 	else
 		M_slot = pub;
-	D_old = *pub_slot;
+	/*
+	 * WAITING load, not a raw one: @pub_slot is this flip's forward edge, so
+	 * it enters @txn's own write set.  "Untouched until the flip" is true of
+	 * THIS op's stores and says nothing about a PEER parking a flip proxy
+	 * there; that proxy is a descriptor-record POINTER, and as an
+	 * expected-old it trips urcu_txn_add's !urcu_txn_is_proxy self-check.
+	 */
+	D_old = urcu_txn_load(txn->mtxn, (void **) pub_slot,
+		FT_FLIP_PROXY_TAG);
 
 	/*
 	 * Ordered list: capture the dst merge subtree's min head (the cursor for
