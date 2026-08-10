@@ -112,6 +112,26 @@ struct ft_merge_ctx {
 	 * instead of reporting MEMORY_ERROR.
 	 */
 	bool overlap_contended;
+	/*
+	 * The ABSOLUTE byte-depth each side's merge point sits at, so a fence can
+	 * date its node.  ft_merge_build's @depth counts bytes from the merge
+	 * point -- it is where the RECURSION is, not where the NODE is -- and an
+	 * anchor is a function of the node's absolute depth (§2).  Handing the
+	 * relative value to ft_anchor_meta dates the top overlap node as byte-depth
+	 * 0, which is not "undated" but THE ROOT, so it anchors on ITSELF while
+	 * every op that dates it correctly anchors on an ancestor: two ops, two
+	 * words, no exclusion.
+	 *
+	 * Set at the single construction site of each caller, where the two
+	 * descents are in scope.  @off is included because a KEY_SHORTER merge
+	 * point sits INSIDE a compressed run: the run starts at @d->depth, the
+	 * cursor is @off bytes further, and it is the cursor that relative depth 0
+	 * names.  The run itself is not fenced at that frame (a compressed node is
+	 * fenced only when entered at offset 0), so no fence reads a base that
+	 * skipped its own node's start.
+	 */
+	unsigned int dst_base_depth;
+	unsigned int src_base_depth;
 };
 
 /* Upper-bound counters for the read-only pre-pass that sizes the glues. */
@@ -416,7 +436,8 @@ struct cds_ft_inode_flag *ft_merge_build(struct ft_merge_ctx *c,
 			struct ft_lock_ctx sctx;
 
 			ft_glue_lock_ctx(c->gs, &sctx);
-			if (ft_merge_lock_overlap(ft, &sctx, S, depth, snode,
+			if (ft_merge_lock_overlap(ft, &sctx, S,
+					c->src_base_depth + depth, snode,
 					&s_ov_held)) {
 				c->overlap_contended = true;
 				return FT_MERGE_OOM;
@@ -454,7 +475,8 @@ struct cds_ft_inode_flag *ft_merge_build(struct ft_merge_ctx *c,
 			struct ft_lock_ctx dctx;
 
 			ft_glue_lock_ctx(c->gd, &dctx);
-			if (ft_merge_lock_overlap(ft, &dctx, D, depth, dnode,
+			if (ft_merge_lock_overlap(ft, &dctx, D,
+					c->dst_base_depth + depth, dnode,
 					&d_ov_held)) {
 				c->overlap_contended = true;
 				return FT_MERGE_OOM;
@@ -1431,6 +1453,18 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	 * arm cannot retry -- which is a LIVELOCK, not a failure.
 	 */
 	gd.lock_d = d_dst;
+	/*
+	 * And the SOURCE glue's, for the same reason: a src overlap fence is
+	 * dated on the path the node is on NOW, which only @d_src describes.
+	 * Inert for a cross-trie merge (@fence_src stays false -- the source is
+	 * exclusive), set so the two glues answer from the same rule.
+	 */
+	gs.lock_d = d_src;
+	/*
+	 * Where relative depth 0 IS, on each side (see @dst_base_depth).
+	 */
+	ctx.dst_base_depth = (unsigned int) d_dst->depth + off_dst;
+	ctx.src_base_depth = (unsigned int) d_src->depth + off_src;
 	if (ft_glue_reserve(&gd, cnt.nb + 8, cnt.nd + 8,
 				cnt.nf_dst + 8, cnt.ns + 8) ||
 	    ft_glue_reserve(&gs, 0, 0, cnt.nf_src + 8, 0)) {

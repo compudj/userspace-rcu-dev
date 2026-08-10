@@ -1471,6 +1471,12 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 
 		/* Size both glues from the read-only pre-pass, with headroom. */
 		ft_glue_init(&src_glue);
+		/*
+		 * The merge's SRC glue anchors from the src descent, as the dst
+		 * glue does from @d_dst: its overlap fences land on nodes still
+		 * sitting under @s_top, and only @d_src dates those.
+		 */
+		src_glue.lock_d = &d_src;
 		src_glue_live = true;
 		/*
 		 * ONE op, ONE held set.  The two glues commit together, so a mark
@@ -1521,6 +1527,14 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		 */
 		mctx.fence_src = ft->lock_fine;
 		mctx.overlap_contended = false;
+		/*
+		 * Where relative depth 0 IS on each side, so both spines' fences
+		 * date their nodes ABSOLUTELY (struct ft_merge_ctx).  The fold
+		 * enters both sides at offset 0, so each base is its descent's
+		 * own cursor depth.
+		 */
+		mctx.dst_base_depth = d_dst.depth;
+		mctx.src_base_depth = d_src.depth;
 		merged_nf = ft_merge_build(&mctx, s_top, 0, d_dst.nf, 0, 0,
 				&merged_keys);
 		if (merged_nf == FT_MERGE_OOM) {
