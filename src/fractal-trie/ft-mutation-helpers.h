@@ -7278,14 +7278,29 @@ void ft_reparent_record(struct cds_ft *ft, struct ft_flip_txn *txn,
 		 * rides @txn (cell->parent list-on, en->prev list-off), which a
 		 * reader resolves via ft_resolve_head_prev.
 		 */
+		/*
+		 * WAITING loads, not raw ones, for the reason
+		 * ft_reparent_record_meta's &meta->state load spells out: the
+		 * slot read here is the slot recorded on the very next line, so
+		 * it enters THIS txn's write set and its last load must wait out
+		 * a parked owner.  A raw read hands a peer's parked flip proxy --
+		 * a descriptor-record POINTER -- to urcu_txn_add as the
+		 * expected-old, which is the engine's !urcu_txn_is_proxy(old_ptr)
+		 * self-check (an --enable-rcu-debug abort; a release build
+		 * POISONS the descriptor instead and the retry loop absorbs it).
+		 */
 		if (ft->ordered_list) {
 			struct ft_ord_cell *cell = ft_ord_cell_ptr(en->prev);
 
 			ft_flip_txn_record_reserved(txn, (void **) &cell->parent,
-				cell->parent, parent_nf);
+				urcu_txn_load(txn->mtxn, (void **) &cell->parent,
+					FT_FLIP_PROXY_TAG),
+				parent_nf);
 		} else {
 			ft_flip_txn_record_reserved(txn, (void **) &en->prev,
-				en->prev, parent_nf);
+				urcu_txn_load(txn->mtxn, (void **) &en->prev,
+					FT_FLIP_PROXY_TAG),
+				parent_nf);
 		}
 		return;
 	}
