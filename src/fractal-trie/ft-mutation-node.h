@@ -2238,8 +2238,8 @@ skip_copy:
 				ft_flip_txn_lock_register(retire_txn,
 					c_held.lock, c_held.lock_snap);
 			}
-			ft_flip_txn_record_retire_anchored(retire_txn, &c_held,
-					metadata);
+			ft_flip_txn_record_retire_anchored(retire_txn, ctx,
+					&c_held, metadata);
 		} else if (retire_txn)
 			ft_flip_txn_record_tombstone(retire_txn, metadata);
 		else
@@ -2559,7 +2559,8 @@ int ft_rekey_cow_stop(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		if (!stop_held.shared)
 			ft_flip_txn_record_anchor_release(txn, &stop_held,
 				stop_meta);
-		ft_flip_txn_record_retire_anchored(txn, &stop_held, stop_meta);
+		ft_flip_txn_record_retire_anchored(txn, ctx, &stop_held,
+			stop_meta);
 		*stop_prime_ret = new_flag;
 		return 0;
 	}
@@ -2745,7 +2746,7 @@ int ft_rekey_cow_stop(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 	 */
 	if (!stop_held.shared)
 		ft_flip_txn_record_anchor_release(txn, &stop_held, stop_meta);
-	ft_flip_txn_record_retire_anchored(txn, &stop_held, stop_meta);
+	ft_flip_txn_record_retire_anchored(txn, ctx, &stop_held, stop_meta);
 
 	*stop_prime_ret = new_flag;
 	return 0;

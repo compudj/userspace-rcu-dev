@@ -399,7 +399,13 @@ spliced:;
 		 * One record while the lock sits on the cn itself, two once
 		 * coarsening moved it to a surviving ancestor.
 		 */
-		ft_flip_txn_record_retire_anchored(ic->txn,
+		/*
+		 * NULL ledger: the commit runs past the split's lock context, and
+		 * @free_old_cn is the node this op RETIRES -- nothing of this op
+		 * anchors on a word it is about to tombstone, so the arm that needs
+		 * the ledger cannot apply.
+		 */
+		ft_flip_txn_record_retire_anchored(ic->txn, NULL,
 			&ic->free_old_cn_held,
 			cds_ft_item_to_metadata(
 				(struct cds_ft_inode *) ic->free_old_cn));

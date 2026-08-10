@@ -3503,9 +3503,17 @@ void ft_flip_txn_record_anchor_release(struct ft_flip_txn *t,
  * being ratified by a coincidentally-matching late capture.  The one value the
  * snapshot is allowed to miss is a LOCK THIS OP took on @node's own word after
  * the member was acquired -- see the arm that reads it back through the txn.
+ *
+ * @ctx is the op's LEDGER, and that arm is the only thing it is read for:
+ * whether the op holds @node's own word is a fact about the OP, and the word
+ * cannot be asked (an owner-less LOCK bit does not say whose it is).  NULL is
+ * the conservative answer -- "not known to be held" -- which keeps the
+ * snapshot, so a caller with no ledger loses at most an abort it could have
+ * avoided.
  */
 static inline
 void ft_flip_txn_record_retire_anchored(struct ft_flip_txn *t,
+		const struct ft_lock_ctx *ctx,
 		const struct ft_held_anchor *h, struct cds_ft_metadata *node)
 {
 	if (h->lock == node || h->node_held) {
@@ -3556,11 +3564,18 @@ void ft_flip_txn_record_retire_anchored(struct ft_flip_txn *t,
 	 * shape -- a deterministic abort with no diagnostic (measured
 	 * single-writer, so not contention).
 	 *
-	 * A LOCK that appears here is necessarily OURS: this member deduped onto
-	 * @node's ANCHOR, we hold it, and holding the anchor excludes every peer
-	 * mutator of @node -- the same justification the fused arm above carries
-	 * one level down.  So take the FUSED transition when the txn's own view
-	 * differs from the snapshot BY THE LOCK BIT ALONE.
+	 * So take the FUSED transition when the txn's own view differs from the
+	 * snapshot BY THE LOCK BIT ALONE -- but ONLY once @ctx has confirmed the
+	 * op holds @node's own word.
+	 *
+	 * ☠ The bit alone does NOT identify its owner.  Holding the ANCHOR does
+	 * not exclude every mutator of @node either: a peer whose descent dates
+	 * @node differently -- across a graft, a merge, or any move that puts the
+	 * node on a second path -- anchors it elsewhere and locks it legitimately.
+	 * Swallowing that bit into the expected old turns the retire into a
+	 * COMMITTING write over a peer's fence: the tombstone lands, the peer's
+	 * lock silently vanishes with it, and the peer's own release then asserts
+	 * on a word no writer is accountable for.
 	 *
 	 * Any OTHER difference stays on the snapshot, which is what makes the
 	 * commit abort rather than ratify a world that moved -- the fenced
@@ -3570,8 +3585,12 @@ void ft_flip_txn_record_retire_anchored(struct ft_flip_txn *t,
 	{
 		uintptr_t pending = (uintptr_t) urcu_txn_load(t->mtxn,
 				(void **) &node->state, FT_STATE_PROXY);
+		uintptr_t held_snap;
+		bool ratified;
 
-		if (caa_unlikely(pending == (h->node_snap | FT_STATE_LOCK))) {
+		if (caa_unlikely(pending == (h->node_snap | FT_STATE_LOCK) &&
+				ft_lock_ctx_holds(ctx, node, &held_snap,
+					&ratified))) {
 			ft_flip_txn_record_tag(t, (void **) &node->state,
 				(void *) pending,
 				(void *) ((pending & ~(uintptr_t) FT_STATE_LOCK)
@@ -8136,7 +8155,13 @@ void ft_glue_tombstone_free_list(struct ft_glue *g)
 			 * took it recorded one, and a second settles one word
 			 * twice.
 			 */
-			ft_flip_txn_record_retire_anchored(g->txn, &h, meta);
+			{
+				struct ft_lock_ctx fctx;
+
+				ft_glue_lock_ctx(g, &fctx);
+				ft_flip_txn_record_retire_anchored(g->txn,
+					&fctx, &h, meta);
+			}
 			if (!h.shared)
 				ft_flip_txn_record_anchor_release(g->txn, &h,
 					meta);
@@ -8500,8 +8525,13 @@ enum urcu_txn_status ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue 
 			.node_held = false,
 		};
 
-		ft_flip_txn_record_retire_anchored(g->txn, &sh,
-			g->split_cn_node);
+		{
+			struct ft_lock_ctx dctx;
+
+			ft_glue_lock_ctx(g, &dctx);
+			ft_flip_txn_record_retire_anchored(g->txn, &dctx, &sh,
+				g->split_cn_node);
+		}
 		/*
 		 * The RELEASE half, and the registry ownership that goes with it,
 		 * belong to the acquire that FIRST took the word: a deduped member

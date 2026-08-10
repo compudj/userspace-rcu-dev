@@ -444,8 +444,8 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			 * surviving ancestor.
 			 */
 			if (dlm_a2)
-				ft_flip_txn_record_retire_anchored(txn, &src_held,
-					src_cn_meta_a);
+				ft_flip_txn_record_retire_anchored(txn, ctx,
+					&src_held, src_cn_meta_a);
 			else
 				ft_flip_txn_record_tombstone(txn, cds_ft_item_to_metadata(
 					(struct cds_ft_inode *) src_cn));
@@ -560,6 +560,7 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
  */
 static inline
 void ft_detach_freeze_one(struct ft_flip_txn *txn,
+		const struct ft_lock_ctx *ctx,
 		struct ft_held_anchor *h, struct cds_ft_metadata *m)
 {
 	if (!h->shared) {
@@ -569,11 +570,12 @@ void ft_detach_freeze_one(struct ft_flip_txn *txn,
 			h->txn_owned = true;
 		}
 	}
-	ft_flip_txn_record_retire_anchored(txn, h, m);
+	ft_flip_txn_record_retire_anchored(txn, ctx, h, m);
 }
 
 static
 void ft_detach_freeze_orphans(struct cds_ft *ft, struct ft_flip_txn *txn,
+		const struct ft_lock_ctx *ctx,
 		struct cds_ft_inode_flag **orphans, int nr_orphans,
 		struct cds_ft_inode_flag *trailing_skip_cn_flag,
 		struct ft_held_anchor *held,
@@ -588,7 +590,7 @@ void ft_detach_freeze_orphans(struct cds_ft *ft, struct ft_flip_txn *txn,
 			: cds_ft_item_to_metadata(ft_node_ptr(orphans[i]));
 
 		if (held)
-			ft_detach_freeze_one(txn, &held[i], m);
+			ft_detach_freeze_one(txn, ctx, &held[i], m);
 		else if (txn)
 			ft_flip_txn_record_tombstone(txn, m);
 		else
@@ -600,7 +602,7 @@ void ft_detach_freeze_orphans(struct cds_ft *ft, struct ft_flip_txn *txn,
 				trailing_skip_cn_flag));
 
 		if (held)
-			ft_detach_freeze_one(txn, trailing_held, m);
+			ft_detach_freeze_one(txn, ctx, trailing_held, m);
 		else if (txn)
 			ft_flip_txn_record_tombstone(txn, m);
 		else
@@ -1209,15 +1211,16 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		 * and by the release recorded at registration where coarsening
 		 * left the lock on a surviving ancestor.
 		 */
-		ft_flip_txn_record_retire_anchored(txn, &iter_held, iter_meta);
+		ft_flip_txn_record_retire_anchored(txn, ctx, &iter_held,
+			iter_meta);
 		if (parent_cn)
-			ft_flip_txn_record_retire_anchored(txn, &pcn_held,
+			ft_flip_txn_record_retire_anchored(txn, ctx, &pcn_held,
 				parent_cn_meta);
 		if (child_cn)
-			ft_flip_txn_record_retire_anchored(txn, &ccn_held,
+			ft_flip_txn_record_retire_anchored(txn, ctx, &ccn_held,
 				cds_ft_item_to_metadata(
 					(struct cds_ft_inode *) child_cn));
-		ft_detach_freeze_orphans(ft, txn, orphans, nr_orphans,
+		ft_detach_freeze_orphans(ft, txn, ctx, orphans, nr_orphans,
 			trailing_orphan, orphan_held, trailing_orphan_held);
 		/*
 		 * The removed external leaf (a single-entry chain, so
@@ -2141,7 +2144,7 @@ int ft_detach_node(struct cds_ft *ft,
 							ft_skip_child_ptr(to_free[fi]))
 						: ft_node_ptr(to_free[fi]));
 				if (ft->lock_fine)
-					ft_detach_freeze_one(orphan_txn,
+					ft_detach_freeze_one(orphan_txn, &lctx,
 						&orphan_held[fi], m);
 				else
 					ft_flip_txn_record_tombstone(orphan_txn, m);
@@ -2150,7 +2153,7 @@ int ft_detach_node(struct cds_ft *ft,
 				struct cds_ft_metadata *m = cds_ft_item_to_metadata(
 					(struct cds_ft_inode *) trailing_skip_cn);
 				if (ft->lock_fine)
-					ft_detach_freeze_one(orphan_txn,
+					ft_detach_freeze_one(orphan_txn, &lctx,
 						orphan_trailing_held, m);
 				else
 					ft_flip_txn_record_tombstone(orphan_txn, m);
@@ -2735,6 +2738,7 @@ int ft_detach_node(struct cds_ft *ft,
 			if (!boundary_fused && (nr_to_free > 0 || trailing_skip_cn_flag))
 				ft_detach_freeze_orphans(ft,
 					(pub && commit_txn) ? commit_txn : NULL,
+					&lctx,
 					to_free, nr_to_free, trailing_skip_cn_flag,
 					ft->lock_fine ? orphan_held : NULL,
 					orphan_trailing_held);
