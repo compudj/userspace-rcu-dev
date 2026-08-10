@@ -3070,13 +3070,25 @@ restart_attempt:
 							ic.txn);
 						if (ft_acquire_member(ft, &hctx,
 								d.nf, metadata,
-								d.depth, &hh) ||
-								hh.shared) {
+								d.depth, &hh)) {
 							ret = -EAGAIN;
 							goto insert_done;
 						}
-						dup_hmeta = hh.lock;
-						dup_hsnap = hh.lock_snap;
+						/*
+						 * SHARED is a SUCCESS: the word is
+						 * already in this op's held set, so
+						 * the chain walk is excluded and the
+						 * FIRST acquire owns the release.
+						 * Leaving @dup_hmeta NULL is exactly
+						 * "held, owing no release".  Folding
+						 * it into the miss above would refuse
+						 * this op's OWN mark, which no retry
+						 * can clear.
+						 */
+						if (!hh.shared) {
+							dup_hmeta = hh.lock;
+							dup_hsnap = hh.lock_snap;
+						}
 					}
 				}
 				/* Find last duplicate */
@@ -3203,13 +3215,15 @@ restart_attempt:
 							ft_acquire_member(ft,
 								&hctx,
 								holder_flag,
-								hm, hd, &hh) ||
-							hh.shared) {
+								hm, hd, &hh)) {
 							ret = -EAGAIN;
 							goto insert_done;
 						}
-						dup_hmeta = hh.lock;
-						dup_hsnap = hh.lock_snap;
+						/* Held already: no release owed. */
+						if (!hh.shared) {
+							dup_hmeta = hh.lock;
+							dup_hsnap = hh.lock_snap;
+						}
 					}
 				}
 			}
@@ -4264,6 +4278,19 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 						have_hd = true;
 					ft_lock_ctx_init(&hctx,
 						descended ? &hd : NULL, NULL);
+					/*
+					 * @hh.shared is DEAD here, not defensive:
+					 * this context is built with a NULL txn and
+					 * fills in no extra / glue / outer, so its
+					 * held set is EMPTY and the acquire has
+					 * nothing to dedupe against.  Should this
+					 * path ever gain a registry -- a txn, a
+					 * glue -- the fold below turns into the
+					 * self-refusal livelock it is elsewhere in
+					 * this file, and @shared must then become
+					 * the "held, owing no release" arm the two
+					 * dup-chain acquires above take.
+					 */
 					if (!have_hd ||
 							ft_acquire_member(ft,
 								&hctx, lock_nf,

@@ -1457,17 +1457,27 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 			/* The DST descent dates this one: it IS its parent slot. */
 			ft_lock_ctx_init(&dctx, &d_dst, txn);
 			if (!pp_meta || ft_acquire_member(ft, &dctx, d_dst.pnf,
-					pp_meta, d_dst.pdepth, &pph) ||
-					pph.shared) {
+					pp_meta, d_dst.pdepth, &pph)) {
 				pp_meta = NULL;
 				ret = -EAGAIN;
 				goto bail_build;
 			}
 			pp_meta = pph.lock;
 			pp_snap = pph.lock_snap;
+			/*
+			 * A SHARED acquire deduped onto a word this op already
+			 * holds: the fence is in force -- so the forward publish
+			 * may still PARK its SW store -- but the FIRST acquire
+			 * owns both the release and the registry entry, which is
+			 * what @publish_parent_shared tells the commit.  The
+			 * split arm below carries the same flag; refusing it here
+			 * instead would refuse the op's own mark forever.
+			 */
+			pp_shared = pph.shared;
 		}
 		glue.publish_parent_holder = pp_meta;
 		glue.publish_parent_snap = pp_snap;
+		glue.publish_parent_shared = pp_shared;
 
 		/* Size both glues from the read-only pre-pass, with headroom. */
 		ft_glue_init(&src_glue);
