@@ -468,9 +468,26 @@ struct cds_ft_metadata *ft_anchor_meta(const struct cds_ft *ft,
 	 * spacing: it covers lock level 0, and no boundary lies above it.  So a
 	 * root-level acquire needs no descent, which is what lets the
 	 * descent-less root fences anchor at all.
+	 *
+	 * ★ 0 IS A POSITION, NOT AN "UNKNOWN".  A caller that could not date its
+	 * member and leaves the depth at its initializer arrives here, and this
+	 * arm answers -- anchoring that node on ITSELF while every op that dates
+	 * it anchors on an ancestor, so the two exclude nothing (§1).  An undated
+	 * member is FT_DEPTH_FROM_DESCENT, which the acquire sites refuse.
+	 *
+	 * FEATURE_FT_ANCHOR_VALIDATE checks the claim instead of trusting it: the
+	 * failure is silent, coarse-only, and reads as a lost update three layers
+	 * away.  It is opt-in rather than standing because a member dated
+	 * RELATIVE to its op's own origin lands here too, and the merge spine
+	 * still does that below its first hop.
 	 */
-	if (!depth)
+	if (!depth) {
+#ifdef FEATURE_FT_ANCHOR_VALIDATE
+		assert(ft_node_flip_proxy(node->parent_word) ||
+			!ft_parent_node(node->parent_word));
+#endif
 		return node;
+	}
 	/*
 	 * A node starting ON a lock level is the first boundary at that level,
 	 * so §2 settles its anchor from @depth alone -- the same rule the root
@@ -3710,12 +3727,20 @@ extern long cds_ft_fault_lock_countdown;
  *
  * COARSENING keeps that net-zero, and needs no guard beside the release.  The
  * release then lands on an ANCESTOR rather than on @parent_nf's own word, so it
- * stops validating that word -- but it does not need to: every op that could
- * retire @parent_nf must first take the same ancestor, which this op now holds,
- * so the anchor is the strictly stronger representative the per-node release
- * record was.  What coarsening does lose is the acquire's refusal of an
- * ALREADY-dirty target (a node a previous holder of the anchor retired), and
- * ft_acquire_member restores exactly that by sampling @parent_nf's own word.
+ * stops validating that word.  What stands in for it is §1's AGREEMENT
+ * property: an op that could retire @parent_nf resolves it to the SAME anchor
+ * and so contends for the word this op now holds, making the anchor the
+ * strictly stronger representative the per-node release record was.
+ *
+ * ☠ That is a property of the DATING, not of this site.  A member whose
+ * byte-depth the caller could not derive, passed as the 0 an initializer left
+ * behind, reads as THE ROOT (ft_anchor_meta) and anchors on ITSELF -- and then
+ * the retiring op and this one hold two different words and exclude nothing.
+ * Such a member is FT_DEPTH_FROM_DESCENT, refused below.
+ *
+ * What coarsening does lose is the acquire's refusal of an ALREADY-dirty target
+ * (a node a previous holder of the anchor retired), and ft_acquire_member
+ * restores exactly that by sampling @parent_nf's own word.
  *
  * ALREADY HELD: a coarser spacing maps several lock-set members onto ONE word,
  * so an op can arrive here holding this publish target's lock already, taken for
