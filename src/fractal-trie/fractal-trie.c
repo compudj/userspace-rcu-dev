@@ -2300,27 +2300,6 @@ cells_done:
 		 * must NOT run -- see its own comment.
 		 */
 		marks_consumed = true;
-		{	/* TEMPORARY PROBE: did the commit really settle every mark? */
-			unsigned int k;
-
-			for (k = 0; k < nr_marks; k++) {
-				uintptr_t st2;
-
-				if (marks[k].shared)
-					continue;
-				st2 = CMM_LOAD_SHARED(marks[k].lock->state);
-				if (st2 & FT_STATE_LOCK) {
-					static __thread unsigned long _n;
-
-					if (_n++ < 8)
-						fprintf(stderr,
-							"[POST] mark %u/%u word=%p STILL LOCKED state=%lx\n",
-							k, nr_marks,
-							(void *) marks[k].lock,
-							(unsigned long) st2);
-				}
-			}
-		}
 		ft_glue_free_old(ft, &glue);		/* graft old copies */
 		/*
 		 * The merged cluster's SRC side: its free list holds S_top itself (and
