@@ -127,8 +127,28 @@ void ft_compact_relocate_at(struct cds_ft *ft, struct cds_ft_inode_flag **holder
 	 * through the pre-reserved @txn.  This is the moment the relocated node
 	 * becomes reader-reachable at *holder and the old copy is frozen dead.
 	 */
-	/* Compaction, not yet MW-hardened: ABORT unreachable under its exclusion. */
-	(void) ft_remove_commit_rec(ft, &rec, NULL, NULL, txn, false);
+	/*
+	 * Compaction, not yet MW-hardened: ABORT unreachable under its
+	 * exclusion -- CHECKED, because there is no recovery from it here and
+	 * the silent form is a use-after-free.
+	 *
+	 * On an abort the forward publish never landed, so *@holder still names
+	 * the OLD copy and the free below would reclaim a node that is still
+	 * reader-reachable.  Nor can this bail instead: ft_node_recompact has
+	 * already re-parented the children onto the fresh copy (the reservation
+	 * comment above calls that the point of no return), so leaving the node
+	 * in place strands them on a node no slot points at.  The commit MUST
+	 * be infallible here, which is exactly what the exclusion buys -- so
+	 * ASSERT the claim rather than discard the status, and the day
+	 * compaction goes MW this fails loudly instead of freeing a live node.
+	 */
+	{
+		enum urcu_txn_status st = ft_remove_commit_rec(ft, &rec, NULL,
+				NULL, txn, false);
+
+		assert(st == URCU_TXN_STATUS_OK);
+		(void) st;	/* NDEBUG: behaviour-identical to the old discard */
+	}
 	/*
 	 * The old node was just unpublished; concurrent readers may still
 	 * hold it, so free it after a grace period.  Its range's nr_live
