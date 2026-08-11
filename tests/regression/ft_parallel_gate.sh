@@ -43,6 +43,31 @@
 #                so one green leg is not evidence.  Multiplies the whole
 #                matrix, hence opt-in.
 #
+#                ★ WHY THE STANDING DEFAULT IS 1.  Measured 2026-08-11 on a
+#                384-thread box, per-config trees already configured:
+#                  * anchorval -- the only config that has ever reproduced
+#                    that class -- costs 981 s (16 min) at N=1, and it is
+#                    the gate's LONG POLE: its 12 legs run one after another
+#                    while the 4-leg single-spacing configs finish in ~5.5
+#                    min alongside.  The whole 14-config matrix is 1053 s,
+#                    i.e. anchorval plus noise, so the gate's wall time is
+#                    ~N x 16 min.
+#                  * The cost is flat across the swept axis (per-node 328 s,
+#                    exponential 325, root-only 328) and the inv legs are
+#                    83% of it (unit 55 s, ion 89, ioff 88, imw 95).
+#                  * Detection per gate run: 3 inv invocations land on the
+#                    ONE spacing that reproduces, so an 8%-per-run defect is
+#                    seen 1-0.92^3 = 23% of the time at N=1 -- and 54% at
+#                    N=3 (44 min), 73% at N=5 (71 min).
+#                A pre-commit gate that takes 45 minutes stops being run,
+#                and a 23%-per-commit detector still surfaces a NEWLY
+#                introduced defect within a few commits -- now with the CORE
+#                kept (see the note in run_one), which is what makes a hit
+#                actionable instead of merely alarming.  So N stays 1 here.
+#                Raise it deliberately when hunting a known intermittent, or
+#                better use tests/regression/ft_corecatch.sh, which repeats
+#                ONE suite with the evidence kept and no build-matrix tax.
+#
 # Requires a bootstrapped source (./configure present -- run
 # ./bootstrap first on a fresh clone).  Exit status is non-zero if any
 # config fails to build or reports a failing/aborted test.
