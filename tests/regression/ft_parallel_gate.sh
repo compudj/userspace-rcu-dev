@@ -236,6 +236,19 @@ sync_src() {	# $1=name -- refresh live sources into the (already-configured) tre
 	rsync -a "$ROOT/include/" "$dir/include/" 2>/dev/null
 }
 
+run_leg() {	# $1=cwd $2=timeout-secs ; $3.. = the command -- run it, echo its output
+	local d=$1 tmo=$2; shift 2
+	( cd "$d" || exit 99
+	  # A crash is an EXPECTED outcome for this harness, so let it dump...
+	  ulimit -c unlimited 2>/dev/null
+	  # ...and drop bash's own "Aborted (core dumped)" job line, which would
+	  # otherwise land on the gate's stderr once per red leg and read like
+	  # the harness itself failing.  The command's own stderr is folded into
+	  # stdout below and is not affected by this.
+	  exec 2>/dev/null
+	  timeout "$tmo" "$@" 2>&1 )
+}
+
 run_one() {	# $1=name $2=tests $3=spacings $4=cppflags -- build lib+tests, run TAP
 	local name=$1 tests=$2 spacings=${3:-} flags=${4:-}
 	[ -n "$spacings" ] || spacings=${FT_GATE_SPACINGS:-per-node}
@@ -281,7 +294,23 @@ run_one() {	# $1=name $2=tests $3=spacings $4=cppflags -- build lib+tests, run T
 		return
 	fi
 	echo "$name: build ok" >> "$out"
-	local t o ok notok abrt lbl rc plan ran sp rep
+	local t o ok notok abrt lbl rc plan ran sp rep cdir bin tmo c
+	local env_x
+	# ★ KEEP THE CORE.  Counting aborts names the CONFIG; it does not name
+	# the slot, the writer or the arm -- and both instances of the
+	# raw-read-of-a-parked-slot class closed so far were root-caused from a
+	# CORE, after gdb had failed to reproduce either one under a debugger
+	# (single-stepping closes the window).  So every leg below runs in its
+	# OWN directory with the core limit raised, and that directory SURVIVES
+	# iff the leg went red: a green matrix leaves nothing behind, a red one
+	# leaves the evidence next to the line that names it.
+	# The per-leg cwd is not tidiness.  core_pattern is a bare RELATIVE
+	# "core" on the usual configuration, so without it the cores land
+	# wherever the gate was invoked from -- the repo, polluting git status --
+	# and concurrent legs overwrite each other's.  core_uses_pid then names
+	# the file core.PID, so glob core*, never exactly "core".
+	local cores=$GATE/$name.cores
+	rm -rf "$cores"; mkdir -p "$cores"
 	# REPEAT: an intermittent defect is a coin flip at one run.  The two
 	# measured instances of the raw-read class fired at ~10% and ~8%, so a
 	# single green leg is not evidence.  Opt-in (default 1) because it
@@ -289,20 +318,21 @@ run_one() {	# $1=name $2=tests $3=spacings $4=cppflags -- build lib+tests, run T
 	for sp in $spacings; do
 	for rep in $(seq 1 "${FT_GATE_REPEAT:-1}"); do
 	for t in $tests; do
+		cdir=$cores/$sp-$t-$rep
+		mkdir -p "$cdir"
 		case $t in
-		u)    o=$(LD_LIBRARY_PATH=$LIB CDS_FT_LOCK_SPACING=$sp timeout 900 "$U" 2>&1); rc=$?
-		      lbl="ft_unit   ";;
-		ion)  o=$(LD_LIBRARY_PATH=$LIB CDS_FT_LOCK_SPACING=$sp timeout 300 "$I" 2>&1); rc=$?
-		      lbl="ft_inv on ";;
-		ioff) o=$(LD_LIBRARY_PATH=$LIB CDS_FT_LOCK_SPACING=$sp FT_INV_NO_ORDERED_LIST=1 timeout 300 "$I" 2>&1); rc=$?
-		      lbl="ft_inv off";;
+		u)    bin=$U; tmo=900;  lbl="ft_unit   "; env_x=() ;;
+		ion)  bin=$I; tmo=300;  lbl="ft_inv on "; env_x=() ;;
+		ioff) bin=$I; tmo=300;  lbl="ft_inv off"; env_x=(FT_INV_NO_ORDERED_LIST=1) ;;
 		# The concurrent-writer oracles (MW writers, coherent rekey) all
 		# gate on FT_INV_MW at runtime and are otherwise skipped, so ion
 		# / ioff never exercise them.  They are the long leg -- hence the
 		# larger timeout.
-		imw)  o=$(LD_LIBRARY_PATH=$LIB CDS_FT_LOCK_SPACING=$sp FT_INV_MW=1 timeout 1800 "$I" 2>&1); rc=$?
-		      lbl="ft_inv mw ";;
+		imw)  bin=$I; tmo=1800; lbl="ft_inv mw "; env_x=(FT_INV_MW=1) ;;
 		esac
+		o=$(run_leg "$cdir" "$tmo" env LD_LIBRARY_PATH="$LIB" \
+			CDS_FT_LOCK_SPACING="$sp" \
+			${env_x[@]+"${env_x[@]}"} "$bin"); rc=$?
 		# The SPACING rides every label below: a red that names only the
 		# suite is unattributable when three spacings run the same leg.
 		lbl="$lbl $sp"
@@ -344,9 +374,25 @@ run_one() {	# $1=name $2=tests $3=spacings $4=cppflags -- build lib+tests, run T
 		elif [ "$rc" -ne 0 ]; then
 			echo "$name: $lbl NONZERO EXIT ($rc) with a complete run" >> "$out"
 		fi
+		# Keep this leg's directory iff it went red, and say where the core
+		# is (see the KEEP THE CORE note above).  "Red" is deliberately
+		# WIDER here than the RESULTS grep below: a leg killed by a timeout
+		# or a signal leaves a core too, and that core is the entire point
+		# of having kept the directory.
+		if [ "$notok" -gt 0 ] || [ "$abrt" -gt 0 ] || [ "$rc" -ne 0 ] \
+				|| [ -z "$plan" ] || [ "$ran" -ne "$plan" ]; then
+			c=$(ls "$cdir"/core* 2>/dev/null | head -1)
+			if [ -n "$c" ]; then
+				echo "$name: $lbl CORE kept -- LD_LIBRARY_PATH=$LIB gdb $bin $c" >> "$out"
+			fi
+		else
+			rm -rf "$cdir"
+		fi
 	done
 	done
 	done
+	# Every leg was green, so nothing was kept: drop the empty spine too.
+	rmdir "$cores" 2>/dev/null
 }
 
 echo "gate dir : $GATE   (-j$J x ${#CONFIGS[@]} configs on $NCPU cores)"
