@@ -113,7 +113,7 @@ ALL_CONFIGS=(
 	# peer can park in it; root-only serialises every op on one word; only
 	# coarsening-to-an-ancestor leaves the slot open.  A defect can live in
 	# the MIDDLE of this axis, so testing its two ends proves nothing about it.
-	"txndbg|-DDEBUG_RCU -DURCU_TXN_DEBUG_READ_POLICY|u ion ioff imw|per-node exponential root-only"
+	"txndbg|-DDEBUG_RCU -DURCU_TXN_DEBUG_READ_POLICY -DFEATURE_FT_ANCHOR_VALIDATE|u ion ioff imw|per-node exponential root-only"
 	# The FT's own resolved-pointer assertion (ft_assert_resolved): a parked
 	# flip proxy handed to an accessor that requires a resolved flag.  It is
 	# the embedder-side counterpart to txndbg's engine-side DEBUG_RCU, and it
@@ -131,7 +131,7 @@ ALL_CONFIGS=(
 	# 10 without skip-compression and never with it.
 	# Swept for the same reason txndbg is: this is the embedder-side detector
 	# for the same class, so it is blind to the same spacings.
-	"proxyassert|-DFT_DEBUG_PROXY_ASSERT -DNO_FEATURE_FT_SKIP_COMPRESSED|u ion ioff imw|per-node exponential root-only"
+	"proxyassert|-DFT_DEBUG_PROXY_ASSERT -DNO_FEATURE_FT_SKIP_COMPRESSED -DFEATURE_FT_ANCHOR_VALIDATE|u ion ioff imw|per-node exponential root-only"
 	# ★ THE CONFIG THAT ACTUALLY CATCHES THE RAW-READ CLASS.
 	#
 	# txndbg above arms the same engine assert and NEVER FIRES IT: with
@@ -147,9 +147,14 @@ ALL_CONFIGS=(
 	#   txndbg (DEBUG_RCU + READ_POLICY)         0 / 144
 	#   these exact CPPFLAGS                     1 /  96
 	#
-	# So ANCHOR_VALIDATE is not just "another assert to run green": it is what
-	# makes this class OBSERVABLE, presumably by widening the anchor window a
-	# peer parks in.  An assert config that never fires is not coverage.
+	# ANCHOR_VALIDATE is not an extra assert here -- it is what makes a COARSE
+	# SPACING SELECTABLE AT ALL.  Without it FEATURE_FT_LOCK_SPACING_ENV is not
+	# compiled in, so CDS_FT_LOCK_SPACING is never read and every leg runs
+	# per-node (and cds_ft_group_attr_set_lock_spacing refuses coarse outright).
+	# That, not a widened window, is why the table above reads the way it does:
+	# every 0-scoring row was running per-node against an EXPONENTIAL-only
+	# defect.  Hence the guard below -- a swept config without the flag is a
+	# sweep that silently does not happen.
 	#
 	# ★ The rate is ~1-4%, so ONE run of this config proves nothing -- it is
 	# here to be run with FT_GATE_REPEAT when hunting, and the 3-spacing sweep
@@ -231,9 +236,23 @@ sync_src() {	# $1=name -- refresh live sources into the (already-configured) tre
 	rsync -a "$ROOT/include/" "$dir/include/" 2>/dev/null
 }
 
-run_one() {	# $1=name $2=tests $3=spacings -- build lib+tests, run the TAP suites
-	local name=$1 tests=$2 spacings=${3:-}
+run_one() {	# $1=name $2=tests $3=spacings $4=cppflags -- build lib+tests, run TAP
+	local name=$1 tests=$2 spacings=${3:-} flags=${4:-}
 	[ -n "$spacings" ] || spacings=${FT_GATE_SPACINGS:-per-node}
+	# ★ A SWEEP THE BUILD CANNOT HONOUR IS WORSE THAN NO SWEEP: it relabels
+	# three identical per-node runs as three spacings.  CDS_FT_LOCK_SPACING is
+	# only read when FEATURE_FT_LOCK_SPACING_ENV is compiled in, which
+	# FEATURE_FT_ANCHOR_VALIDATE / FEATURE_FT_HOLD_TRACE imply -- and without
+	# it the library refuses a coarse spacing anyway.  Refuse to pretend.
+	case " $spacings " in
+	*" exponential "*|*" root-only "*)
+		case "$flags" in
+		*FEATURE_FT_ANCHOR_VALIDATE*|*FEATURE_FT_HOLD_TRACE*|*FEATURE_FT_LOCK_SPACING_ENV*) ;;
+		*)
+			echo "$name: CONFIG ERROR (sweeps [$spacings] but its flags cannot select one -- add -DFEATURE_FT_ANCHOR_VALIDATE)" >> "$GATE/$name.result"
+			return ;;
+		esac ;;
+	esac
 	local dir=$GATE/$name out=$GATE/$name.result
 	local LIB=$dir/src/.libs U=$dir/tests/unit/.libs/test_urcu_ft_unit
 	local I=$dir/tests/regression/.libs/test_urcu_ft_inv
@@ -336,7 +355,7 @@ for c in "${CONFIGS[@]}"; do IFS='|' read -r n f _ <<< "$c"; setup_tree "$n" "$f
 echo "=== [2/3] sync live sources (parallel) ==="
 for c in "${CONFIGS[@]}"; do sync_src "${c%%|*}" & done; wait
 echo "=== [3/3] build + test (parallel) ==="
-for c in "${CONFIGS[@]}"; do IFS='|' read -r n _ t sp <<< "$c"; run_one "$n" "$t" "$sp" & done; wait
+for c in "${CONFIGS[@]}"; do IFS='|' read -r n f t sp <<< "$c"; run_one "$n" "$t" "$sp" "$f" & done; wait
 
 echo "=== RESULTS ==="
 rc=0
@@ -351,7 +370,7 @@ for c in "${CONFIGS[@]}"; do
 	# but never ran (missing/unlinked binary, e.g. tests/utils not built) --
 	# notok/abrt alone would let that pass as a false GREEN.
 	if ! grep -q 'build ok' "$GATE/$n.result" || \
-	   grep -qE 'BUILD FAIL|notok=[1-9]|abrt=[1-9]|ok=0 notok=|INCOMPLETE|NO TAP PLAN' "$GATE/$n.result"; then
+	   grep -qE 'BUILD FAIL|CONFIG ERROR|notok=[1-9]|abrt=[1-9]|ok=0 notok=|INCOMPLETE|NO TAP PLAN' "$GATE/$n.result"; then
 		rc=1
 	fi
 done
