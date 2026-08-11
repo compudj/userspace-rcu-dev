@@ -7009,6 +7009,21 @@ void ft_flip_txn_record_parent_word(const struct cds_ft *ft,
  * only (the converted phase): an external head's parent is its prev directly.
  * Records cannot fail -- the caller reserved @txn to the bounded cluster size
  * up front.
+ *
+ * ★ WHICH ARM the published-node case reaches matters, and this comment used to
+ * leave it open: it is the METADATA arms, and those are exactly the ones that
+ * take the RYW-safe ft_flip_txn_record_parent_word.  The EXTERNAL arm below
+ * reads its back-edge RAW, which is only sound because the external children
+ * reaching it are build-invisible -- reachable solely through the forward flip,
+ * so no peer can park on that field.  Read as a single claim about the whole
+ * function the two look contradictory, and the raw read reads like the
+ * expected-old defects fixed at c3400b27 / f8b1640e.
+ *
+ * MEASURED rather than argued, since the distinction is the whole safety
+ * argument: a probe counting how often either external field already carries a
+ * proxy sees ZERO, over 5541 reaches of the two arms across unit + inv, all
+ * three lock spacings, with the MW oracles enabled.  (The same probe over the
+ * other nine raw expected-old reads in the tree: zero of 16.4M.)
  */
 static
 void ft_glue_record_back_edge(struct cds_ft *ft, struct ft_flip_txn *txn,
