@@ -475,17 +475,23 @@ struct cds_ft_metadata *ft_anchor_meta(const struct cds_ft *ft,
 	 * it anchors on an ancestor, so the two exclude nothing (§1).  An undated
 	 * member is FT_DEPTH_FROM_DESCENT, which the acquire sites refuse.
 	 *
-	 * FEATURE_FT_ANCHOR_VALIDATE checks the claim instead of trusting it: the
-	 * failure is silent, coarse-only, and reads as a lost update three layers
-	 * away.  It is opt-in rather than standing because a member dated
-	 * RELATIVE to its op's own origin lands here too, and the merge spine
-	 * still does that below its first hop.
+	 * So CHECK the claim rather than trust it: depth 0 must mean this node
+	 * really has no parent.  The failure it catches is silent, coarse-only,
+	 * and reads as a lost update three layers away, so nothing downstream
+	 * will report it for you.
+	 *
+	 * STANDING as of the merge spine's absolute dating (1c288c07).  It was
+	 * opt-in behind FEATURE_FT_ANCHOR_VALIDATE for one reason -- "a member
+	 * dated RELATIVE to its op's own origin lands here too, and the merge
+	 * spine still does that below its first hop" -- and that reason died with
+	 * ft_merge_build's @dst_base_depth / @src_base_depth: every fence now
+	 * arrives dated from the trie root, not from the recursion.  An assert
+	 * with ONE opt-in config is an assert almost nobody runs, and this class
+	 * has already produced two hard defects (@becb4528, @1c288c07).
 	 */
 	if (!depth) {
-#ifdef FEATURE_FT_ANCHOR_VALIDATE
 		assert(ft_node_flip_proxy(node->parent_word) ||
 			!ft_parent_node(node->parent_word));
-#endif
 		return node;
 	}
 	/*
