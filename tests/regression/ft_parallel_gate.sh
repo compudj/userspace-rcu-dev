@@ -32,6 +32,16 @@
 #                repo so the GB of copies never pollute git status)
 #   FT_GATE_J    make -j per config                 (default: cores/12,
 #                so nconfigs*J stays near the core count)
+#   FT_GATE_SPACINGS  lock spacings to run every config at (default
+#                per-node).  The two DETECTOR configs (txndbg,
+#                proxyassert) carry their own 3-spacing sweep in the
+#                matrix and ignore this default -- see the comment there
+#                for why a defect can hide in the middle of that axis.
+#   FT_GATE_REPEAT    run each leg N times (default 1).  For hunting an
+#                INTERMITTENT: the two measured instances of the
+#                raw-read-of-a-parked-slot class fired at ~10% and ~8%,
+#                so one green leg is not evidence.  Multiplies the whole
+#                matrix, hence opt-in.
 #
 # Requires a bootstrapped source (./configure present -- run
 # ./bootstrap first on a fresh clone).  Exit status is non-zero if any
@@ -93,7 +103,17 @@ ALL_CONFIGS=(
 	# arbitrates against a peer, so the raw-read class this config exists to
 	# detect is the class the missing leg hid.  The leg costs 82 s, alongside
 	# ioff's 76 s.
-	"txndbg|-DDEBUG_RCU -DURCU_TXN_DEBUG_READ_POLICY|u ion ioff imw"
+	#
+	# ★ SWEPT ACROSS LOCK SPACINGS (the 4th field), because the class this
+	# config exists to detect HIDES IN ONE.  The gate ran every leg at the
+	# default per-node and found nothing for months; the same suite under
+	# CDS_FT_LOCK_SPACING=exponential produced a raw-read abort in 4 runs of
+	# 48 (ft_chain_compress_fused's forward slot, @f8b1640e), and 0 of 48
+	# under per-node AND root-only.  Per-node holds the slot's own word so no
+	# peer can park in it; root-only serialises every op on one word; only
+	# coarsening-to-an-ancestor leaves the slot open.  A defect can live in
+	# the MIDDLE of this axis, so testing its two ends proves nothing about it.
+	"txndbg|-DDEBUG_RCU -DURCU_TXN_DEBUG_READ_POLICY|u ion ioff imw|per-node exponential root-only"
 	# The FT's own resolved-pointer assertion (ft_assert_resolved): a parked
 	# flip proxy handed to an accessor that requires a resolved flag.  It is
 	# the embedder-side counterpart to txndbg's engine-side DEBUG_RCU, and it
@@ -109,7 +129,32 @@ ALL_CONFIGS=(
 	# child-slot read, and skip-compression collapses the chains those reads
 	# walk -- the free-walk defect that motivated the config reproduced 10 of
 	# 10 without skip-compression and never with it.
-	"proxyassert|-DFT_DEBUG_PROXY_ASSERT -DNO_FEATURE_FT_SKIP_COMPRESSED|u ion ioff imw"
+	# Swept for the same reason txndbg is: this is the embedder-side detector
+	# for the same class, so it is blind to the same spacings.
+	"proxyassert|-DFT_DEBUG_PROXY_ASSERT -DNO_FEATURE_FT_SKIP_COMPRESSED|u ion ioff imw|per-node exponential root-only"
+	# ★ THE CONFIG THAT ACTUALLY CATCHES THE RAW-READ CLASS.
+	#
+	# txndbg above arms the same engine assert and NEVER FIRES IT: with
+	# ft_chain_compress_fused's raw-read defect (@f8b1640e) deliberately put
+	# back, txndbg scored 0 of 144 runs -- at -O2 AND at -O1, with and
+	# without the MW leg -- while this combination reproduced it.  The
+	# ingredient is FEATURE_FT_ANCHOR_VALIDATE, bisected against the same
+	# reverted defect on the same machine:
+	#
+	#   --enable-rcu-debug + ANCHOR_VALIDATE     6 / 144   (the repro)
+	#   --enable-rcu-debug, no ANCHOR_VALIDATE   0 /  96
+	#   -DDEBUG_RCU alone                        0 /  48
+	#   txndbg (DEBUG_RCU + READ_POLICY)         0 / 144
+	#   these exact CPPFLAGS                     1 /  96
+	#
+	# So ANCHOR_VALIDATE is not just "another assert to run green": it is what
+	# makes this class OBSERVABLE, presumably by widening the anchor window a
+	# peer parks in.  An assert config that never fires is not coverage.
+	#
+	# ★ The rate is ~1-4%, so ONE run of this config proves nothing -- it is
+	# here to be run with FT_GATE_REPEAT when hunting, and the 3-spacing sweep
+	# is mandatory because the defect it was built from is exponential-only.
+	"anchorval|-DDEBUG_RCU -DFEATURE_FT_ANCHOR_VALIDATE|u ion ioff imw|per-node exponential root-only"
 	"noskip|-DNO_FEATURE_FT_SKIP_COMPRESSED|u ioff"
 	"nocompress|-DNO_FEATURE_FT_COMPRESS|u ioff"
 	# Concurrent legs are SAFE here since the in-place tier became runtime
@@ -186,8 +231,9 @@ sync_src() {	# $1=name -- refresh live sources into the (already-configured) tre
 	rsync -a "$ROOT/include/" "$dir/include/" 2>/dev/null
 }
 
-run_one() {	# $1=name $2=tests -- build lib+tests, run the TAP suites
-	local name=$1 tests=$2
+run_one() {	# $1=name $2=tests $3=spacings -- build lib+tests, run the TAP suites
+	local name=$1 tests=$2 spacings=${3:-}
+	[ -n "$spacings" ] || spacings=${FT_GATE_SPACINGS:-per-node}
 	local dir=$GATE/$name out=$GATE/$name.result
 	local LIB=$dir/src/.libs U=$dir/tests/unit/.libs/test_urcu_ft_unit
 	local I=$dir/tests/regression/.libs/test_urcu_ft_inv
@@ -216,22 +262,31 @@ run_one() {	# $1=name $2=tests -- build lib+tests, run the TAP suites
 		return
 	fi
 	echo "$name: build ok" >> "$out"
-	local t o ok notok abrt lbl rc plan ran
+	local t o ok notok abrt lbl rc plan ran sp rep
+	# REPEAT: an intermittent defect is a coin flip at one run.  The two
+	# measured instances of the raw-read class fired at ~10% and ~8%, so a
+	# single green leg is not evidence.  Opt-in (default 1) because it
+	# multiplies the whole matrix; use it when hunting, not on every commit.
+	for sp in $spacings; do
+	for rep in $(seq 1 "${FT_GATE_REPEAT:-1}"); do
 	for t in $tests; do
 		case $t in
-		u)    o=$(LD_LIBRARY_PATH=$LIB timeout 900 "$U" 2>&1); rc=$?
+		u)    o=$(LD_LIBRARY_PATH=$LIB CDS_FT_LOCK_SPACING=$sp timeout 900 "$U" 2>&1); rc=$?
 		      lbl="ft_unit   ";;
-		ion)  o=$(LD_LIBRARY_PATH=$LIB timeout 300 "$I" 2>&1); rc=$?
+		ion)  o=$(LD_LIBRARY_PATH=$LIB CDS_FT_LOCK_SPACING=$sp timeout 300 "$I" 2>&1); rc=$?
 		      lbl="ft_inv on ";;
-		ioff) o=$(LD_LIBRARY_PATH=$LIB FT_INV_NO_ORDERED_LIST=1 timeout 300 "$I" 2>&1); rc=$?
+		ioff) o=$(LD_LIBRARY_PATH=$LIB CDS_FT_LOCK_SPACING=$sp FT_INV_NO_ORDERED_LIST=1 timeout 300 "$I" 2>&1); rc=$?
 		      lbl="ft_inv off";;
 		# The concurrent-writer oracles (MW writers, coherent rekey) all
 		# gate on FT_INV_MW at runtime and are otherwise skipped, so ion
 		# / ioff never exercise them.  They are the long leg -- hence the
 		# larger timeout.
-		imw)  o=$(LD_LIBRARY_PATH=$LIB FT_INV_MW=1 timeout 1800 "$I" 2>&1); rc=$?
+		imw)  o=$(LD_LIBRARY_PATH=$LIB CDS_FT_LOCK_SPACING=$sp FT_INV_MW=1 timeout 1800 "$I" 2>&1); rc=$?
 		      lbl="ft_inv mw ";;
 		esac
+		# The SPACING rides every label below: a red that names only the
+		# suite is unattributable when three spacings run the same leg.
+		lbl="$lbl $sp"
 		ok=$(printf '%s' "$o" | grep -c '^ok ')
 		notok=$(printf '%s' "$o" | grep -c '^not ok ')
 		abrt=$(printf '%s' "$o" | grep -c -i 'assert')
@@ -271,6 +326,8 @@ run_one() {	# $1=name $2=tests -- build lib+tests, run the TAP suites
 			echo "$name: $lbl NONZERO EXIT ($rc) with a complete run" >> "$out"
 		fi
 	done
+	done
+	done
 }
 
 echo "gate dir : $GATE   (-j$J x ${#CONFIGS[@]} configs on $NCPU cores)"
@@ -279,7 +336,7 @@ for c in "${CONFIGS[@]}"; do IFS='|' read -r n f _ <<< "$c"; setup_tree "$n" "$f
 echo "=== [2/3] sync live sources (parallel) ==="
 for c in "${CONFIGS[@]}"; do sync_src "${c%%|*}" & done; wait
 echo "=== [3/3] build + test (parallel) ==="
-for c in "${CONFIGS[@]}"; do IFS='|' read -r n _ t <<< "$c"; run_one "$n" "$t" & done; wait
+for c in "${CONFIGS[@]}"; do IFS='|' read -r n _ t sp <<< "$c"; run_one "$n" "$t" "$sp" & done; wait
 
 echo "=== RESULTS ==="
 rc=0
