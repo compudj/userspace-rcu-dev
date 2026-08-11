@@ -4533,10 +4533,21 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 				return CDS_FT_STATUS_MEMORY_ERROR;
 			}
 			ft_flip_txn_record_count_parent(ft, txn, ft->root, -1);
-			ft_remove_one_commit(ft,
-				(struct cds_ft_inode_flag **) &metadata->external_nodes,
-				(struct cds_ft_inode_flag *) external_nodes, NULL,
-				NULL, dead, NULL, txn, NULL, false);
+			/*
+			 * Same rule as the prefix clear below: the pre-reserved
+			 * txn cannot fail to ALLOCATE, but the flip can still
+			 * ABORT, and an aborted flip left the NIL key in the
+			 * trie.  Returning OK there hands the caller a chain it
+			 * may reclaim while the root still points at it -- and
+			 * frees @dead while it is still spliced into the list.
+			 */
+			if (ft_remove_one_commit(ft,
+					(struct cds_ft_inode_flag **) &metadata->external_nodes,
+					(struct cds_ft_inode_flag *) external_nodes, NULL,
+					NULL, dead, NULL, txn, NULL, false)) {
+				*result_node = NULL;
+				return CDS_FT_STATUS_MEMORY_ERROR;
+			}
 			if (dead)
 				ft_ord_cell_free(ft, dead);
 		} else {
@@ -4759,14 +4770,31 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 					holder_flag, holder_depth);
 				ft_flip_txn_record_count_parent(ft, txn,
 					holder_flag, -1);
-				ft_remove_one_commit(ft,
+				/*
+				 * The commit's status is the ANSWER, not a
+				 * formality: "pre-reserved => infallible" covers
+				 * the ALLOCATION, and the §4.B VALIDATE arm above
+				 * can still abort -- which, as that comment says,
+				 * LEAVES THE KEY IN PLACE.  Discarding it and
+				 * setting ret = 0 reported CDS_FT_STATUS_OK for a
+				 * removal that did not happen, and a caller that
+				 * believes OK reclaims a node still linked in the
+				 * trie.  (The `ret = 0; if (ret == 0)` this
+				 * replaces was the scar of the dropped status.)
+				 */
+				ret = ft_remove_one_commit(ft,
 					(struct cds_ft_inode_flag **) &holder_meta->external_nodes,
 					(struct cds_ft_inode_flag *) chain_head, NULL,
 					NULL, dead_cell, NULL, txn, NULL, false);
-				if (ft->ordered_list)
-					pub.armed = true;
-				ret = 0;
 				if (ret == 0) {
+					/*
+					 * Only a COMMITTED flip carried the
+					 * unsplice; an aborted one leaves the cell
+					 * spliced, and the tail's abort arm
+					 * releases the unused reservation.
+					 */
+					if (ft->ordered_list)
+						pub.armed = true;
 					ft_chain_mark_removed_flip(ft, chain_head);
 					assert(ft_meta_nr_child(holder_meta) > 0);
 #ifdef FEATURE_FT_SKIP_COMPRESSED
