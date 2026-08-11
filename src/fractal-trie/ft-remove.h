@@ -3765,7 +3765,20 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 	struct cds_ft_inode_flag **head_slot = NULL;
 	const uint8_t *iter_key;
 	size_t key_len = ft_key_len(ft, ft_iter_resolve_key_len(iter));
-	int ret;
+	/*
+	 * POISONED, not zeroed.  Every path assigns @ret today (gcc's
+	 * -Wmaybe-uninitialized agrees), but the terminal switch below ends in
+	 * `default: abort()`, so a path added later that forgets to assign
+	 * decides the op's whole outcome from stack garbage: garbage that lands
+	 * on 0 reports CDS_FT_STATUS_OK for a removal that may not have
+	 * happened -- the defect @2d3b92ea fixed in remove_all -- and any other
+	 * value aborts or not depending on the frame.
+	 *
+	 * -EINVAL is deliberately NOT a case in that switch, so an unassigned
+	 * @ret reaches `default:` DETERMINISTICALLY instead of by luck.  The
+	 * unknown is outside the domain and the consumer already refuses it.
+	 */
+	int ret = -EINVAL;
 
 	FT_TP(remove_enter, (const void *) ft, (const void *) iter,
 		iter_key(iter), key_len);
