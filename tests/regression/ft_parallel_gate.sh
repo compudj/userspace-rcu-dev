@@ -43,30 +43,35 @@
 #                so one green leg is not evidence.  Multiplies the whole
 #                matrix, hence opt-in.
 #
-#                ★ WHY THE STANDING DEFAULT IS 1.  Measured 2026-08-11 on a
-#                384-thread box, per-config trees already configured:
-#                  * anchorval -- the only config that has ever reproduced
-#                    that class -- costs 981 s (16 min) at N=1, and it is
-#                    the gate's LONG POLE: its 12 legs run one after another
-#                    while the 4-leg single-spacing configs finish in ~5.5
-#                    min alongside.  The whole 14-config matrix is 1053 s,
-#                    i.e. anchorval plus noise, so the gate's wall time is
-#                    ~N x 16 min.
-#                  * The cost is flat across the swept axis (per-node 328 s,
-#                    exponential 325, root-only 328) and the inv legs are
+#                ★ WHAT IT COSTS AND BUYS.  Measured 2026-08-11 on a
+#                384-thread box, per-config trees already configured, with
+#                the spacings running CONCURRENTLY (see run_one):
+#                  * The full 14-config matrix is 383 s at N=1, and anchorval
+#                    -- the only config that has ever reproduced that class --
+#                    is 365 s of it, so the gate is still exactly as long as
+#                    its longest swept config.
+#                  * Repeats are SEQUENTIAL within a spacing while the three
+#                    spacings are not, so each +1 adds one spacing's legs
+#                    (~330 s), not three.  N=1 383 s, N=3 ~17 min,
+#                    N=5 ~28 min.
+#                  * The per-leg cost is flat across the swept axis (per-node
+#                    328 s, exponential 325, root-only 328); the inv legs are
 #                    83% of it (unit 55 s, ion 89, ioff 88, imw 95).
 #                  * Detection per gate run: 3 inv invocations land on the
 #                    ONE spacing that reproduces, so an 8%-per-run defect is
 #                    seen 1-0.92^3 = 23% of the time at N=1 -- and 54% at
-#                    N=3 (44 min), 73% at N=5 (71 min).
-#                A pre-commit gate that takes 45 minutes stops being run,
-#                and a 23%-per-commit detector still surfaces a NEWLY
-#                introduced defect within a few commits -- now with the CORE
-#                kept (see the note in run_one), which is what makes a hit
-#                actionable instead of merely alarming.  So N stays 1 here.
-#                Raise it deliberately when hunting a known intermittent, or
-#                better use tests/regression/ft_corecatch.sh, which repeats
-#                ONE suite with the evidence kept and no build-matrix tax.
+#                    N=3, 73% at N=5.
+#                The standing default is 1: 23% per commit still surfaces a
+#                NEWLY introduced defect within a few commits, and it now
+#                keeps the CORE when it does (see run_one), which is what
+#                makes a hit actionable rather than merely alarming.
+#                ★ N=3 is now affordable in a way it was not before the
+#                spacings were parallelised -- it costs ~17 min, which is
+#                what N=1 cost when they ran one after another.  Raise it if
+#                you would rather spend that; nothing else needs to change.
+#                For a deliberate hunt prefer tests/regression/ft_corecatch.sh,
+#                which repeats ONE suite with the evidence kept and no
+#                build-matrix tax.
 #
 # Requires a bootstrapped source (./configure present -- run
 # ./bootstrap first on a fresh clone).  Exit status is non-zero if any
@@ -336,11 +341,49 @@ run_one() {	# $1=name $2=tests $3=spacings $4=cppflags -- build lib+tests, run T
 	# the file core.PID, so glob core*, never exactly "core".
 	local cores=$GATE/$name.cores
 	rm -rf "$cores"; mkdir -p "$cores"
+	# ★ THE SPACINGS RUN CONCURRENTLY, and this is what makes a swept config
+	# affordable.  Serialised, each three-spacing config took 981 s and was
+	# the whole gate's critical path -- the 14-config matrix measured 1053 s,
+	# i.e. one swept config plus noise, with eleven others idling alongside
+	# it.  The axis is embarrassingly parallel (separate processes, separate
+	# cwds, one shared read-only build), so sweeping it now costs ONE
+	# spacing rather than three: anchorval 1017 s -> 365 s, the whole matrix
+	# 1053 s -> 383 s, same 61 legs, same verdict.
+	# Peak concurrency rises from ~14 legs to ~19; measured load stayed near
+	# 54 on this 192-core box, so the axis fits without a throttle.  Add one
+	# here if a future matrix makes (configs x spacings) outgrow the machine.
+	#
+	# Each spacing writes its OWN result file.  They are concatenated below in
+	# the DECLARED order, never in completion order: appending concurrently to
+	# one file interleaves the lines of a red with the lines of a green, and an
+	# unattributable red is worse than a slow gate.  It also keeps two runs of
+	# the gate diffable, which completion order would not.
+	local sp
+	for sp in $spacings; do
+		run_spacing "$name" "$tests" "$sp" "$GATE/$name.result.$sp" &
+	done
+	wait
+	for sp in $spacings; do
+		cat "$GATE/$name.result.$sp" >> "$out" 2>/dev/null
+		rm -f "$GATE/$name.result.$sp"
+	done
+	# Every leg was green, so nothing was kept: drop the empty spine too.
+	rmdir "$cores" 2>/dev/null
+}
+
+run_spacing() {	# $1=name $2=tests $3=spacing $4=outfile -- every leg at ONE spacing
+	local name=$1 tests=$2 sp=$3 out=$4
+	local dir=$GATE/$name
+	local LIB=$dir/src/.libs U=$dir/tests/unit/.libs/test_urcu_ft_unit
+	local I=$dir/tests/regression/.libs/test_urcu_ft_inv
+	local cores=$GATE/$name.cores
+	local t o ok notok abrt lbl rc plan ran rep cdir bin tmo c
+	local env_x
+	: > "$out"
 	# REPEAT: an intermittent defect is a coin flip at one run.  The two
 	# measured instances of the raw-read class fired at ~10% and ~8%, so a
 	# single green leg is not evidence.  Opt-in (default 1) because it
 	# multiplies the whole matrix; use it when hunting, not on every commit.
-	for sp in $spacings; do
 	for rep in $(seq 1 "${FT_GATE_REPEAT:-1}"); do
 	for t in $tests; do
 		cdir=$cores/$sp-$t-$rep
@@ -415,9 +458,6 @@ run_one() {	# $1=name $2=tests $3=spacings $4=cppflags -- build lib+tests, run T
 		fi
 	done
 	done
-	done
-	# Every leg was green, so nothing was kept: drop the empty spine too.
-	rmdir "$cores" 2>/dev/null
 }
 
 echo "gate dir : $GATE   (-j$J x ${#CONFIGS[@]} configs on $NCPU cores)"
