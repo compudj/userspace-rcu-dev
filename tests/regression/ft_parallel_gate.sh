@@ -370,7 +370,11 @@ for c in "${CONFIGS[@]}"; do
 	# but never ran (missing/unlinked binary, e.g. tests/utils not built) --
 	# notok/abrt alone would let that pass as a false GREEN.
 	if ! grep -q 'build ok' "$GATE/$n.result" || \
-	   grep -qE 'BUILD FAIL|CONFIG ERROR|notok=[1-9]|abrt=[1-9]|ok=0 notok=|INCOMPLETE|NO TAP PLAN' "$GATE/$n.result"; then
+	# NONZERO EXIT belongs in this list: run_one PRINTS it and nothing acted
+	# on it, so a leg that completed its plan with no failing TAP line and a
+	# non-zero status -- a crash in teardown after the last test, an explicit
+	# exit(1) -- reported its own red line under a "GATE PASS".
+	   grep -qE 'BUILD FAIL|CONFIG ERROR|notok=[1-9]|abrt=[1-9]|ok=0 notok=|INCOMPLETE|NO TAP PLAN|NONZERO EXIT' "$GATE/$n.result"; then
 		rc=1
 	fi
 done
