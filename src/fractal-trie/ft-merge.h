@@ -3389,9 +3389,17 @@ merge_spine_retry:
 			 * against a peer relocate+free+recycle (see the bracket in
 			 * cds_ft_graft).  With an EXCLUSIVE src the fused body takes
 			 * no grace period (ft_writer_lock_gp_wait is !exclusive-
-			 * gated), so the whole-op read lock cannot self-deadlock --
-			 * unlike merge's spine-copy branch, which synchronizes and
-			 * therefore stays out of any read section.
+			 * gated), so the whole-op read lock cannot self-deadlock.
+			 *
+			 * That is the SAME condition, and the same reason, as the
+			 * spine-copy pin above -- both branches read_lock() under
+			 * exactly `dst_ft->lock_fine && src_ft->exclusive`.  What
+			 * decides it is the SOURCE CONTRACT, not the branch: a
+			 * cross-trie src is exclusive or the op was already refused
+			 * with BUSY, and every grace period on that path is
+			 * !exclusive-gated.  Only the same-trie rekey (src == dst,
+			 * a LIVE src) actually runs those waits, and it is exactly
+			 * the case this condition excludes from the read section.
 			 */
 			flavor->read_lock();
 			status = ft_graft_keylen(dst_ft, dst_key, dst_key_len,
