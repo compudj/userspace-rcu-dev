@@ -920,6 +920,49 @@ void ft_txn_op_init(struct cds_ft *ft, struct urcu_txn *op)
 		urcu_txn_init_flavor(op, &ft->txn_domain, ft->group->flavor);
 }
 
+/*
+ * Close one attempt of a retry loop bracketed by the handle above, on a path
+ * that is NOT re-attempting: success, or a terminal error.
+ *
+ * @open is the loop's own record of whether it opened the bracket, and it is a
+ * VARIABLE rather than a re-test of the opening condition on purpose.  The
+ * bulk-op loops bracket CONDITIONALLY -- only a body that provably takes no
+ * grace period may hold a read section or an escalation turn -- and a condition
+ * re-evaluated at the exit is a second chance to disagree with the entry.  One
+ * flag set beside begin() cannot.
+ */
+static inline
+void ft_txn_attempt_end(struct urcu_txn *op, bool open)
+{
+	if (open)
+		urcu_txn_end(op);
+}
+
+/*
+ * Close one attempt that BAILED BEFORE ITS OWN COMMIT and will re-attempt.
+ *
+ * Two things, in this order.  urcu_txn_conflict() AGES the handle, which is the
+ * entire point of giving the loop one: without it every attempt restarts at
+ * retry 0, the domain never escalates the writer into its per-trie FIFO
+ * fair-mutex lane, and the loop has no termination argument at all.  Then
+ * end(), which FORFEITS the turn -- a pre-commit bail re-descends and asks a
+ * peer for the very thing it just lost, so keeping the lane across that ask
+ * queues the holder behind the waiter (the insert livelock).
+ *
+ * Use ft_txn_attempt_end() instead where the ABORT came from a commit made
+ * THROUGH this handle: that commit already aged it and legitimately keeps the
+ * turn.  These loops commit through a separate per-attempt ft_flip_txn, so
+ * every one of their retry edges is a bail by this definition.
+ */
+static inline
+void ft_txn_attempt_bail(struct urcu_txn *op, bool open)
+{
+	if (open) {
+		urcu_txn_conflict(op);
+		urcu_txn_end(op);
+	}
+}
+
 static inline
 struct ft_flip_txn *ft_flip_txn_create(void)
 {

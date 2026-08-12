@@ -1540,13 +1540,54 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		 * and retry the whole attach on a fresh descent.  @graft_payload
 		 * and @nil_key_root are attach-invariant (computed above); every
 		 * per-attempt resource is (re)acquired below and freed on the
-		 * retry path.  Progress: {p}'s node lock guarantees a winner
-		 * each contention round.
+		 * retry path.
+		 *
+		 * Progress: {p}'s node lock guarantees a winner each contention
+		 * round -- a SYSTEM claim, not a per-op one.  A winner every round
+		 * is fully compatible with one particular op losing every round.
+		 * Per-op progress is a different property, and @optxn supplies it.
 		 */
-	unsigned long ra_depth __attribute__((unused)) = 0;
+		/*
+		 * The op's PERSISTENT engine handle (doc §11), spanning the whole
+		 * @retry_attach loop as ft_txn_op_init does for insert, remove and
+		 * replace.  It is what makes this loop terminate: urcu_txn_conflict()
+		 * ages contention ACROSS attempts, so the domain escalates this
+		 * writer into its per-trie FIFO fair-mutex lane and the contention
+		 * drains.  Unaged, every attempt restarts at retry 0 and the loop
+		 * has no termination argument at all -- 679819 retries over one inv
+		 * run, 4214 of them for a single op.  That is STARVATION, not
+		 * livelock: the system still progresses, which is exactly why a
+		 * green suite is not evidence about it.
+		 *
+		 * @ra_txn is the bracket's condition, evaluated ONCE.  A bracket may
+		 * only span a body that takes NO grace period, for two independent
+		 * reasons: urcu_txn_begin() enters the RCU read side (a GP under it
+		 * waits on this very thread), and an aged handle escalates into the
+		 * fallback lane (ft_writer_lock_gp_wait asserts
+		 * !urcu_txn_in_fallback(), a peer parked on that lane being an
+		 * ONLINE, non-quiescent reader that holds the GP open).  The only
+		 * grace period reachable from this body is its own src drain, which
+		 * is !src_ft->exclusive-gated, and dst_ft->lock_fine is what binds
+		 * the escalation domain at all -- so the conjunction IS the GP-free
+		 * contract, and it is the same condition ft_merge_at_inner already
+		 * read_lock()s this call under.  It covers every retry the loop
+		 * takes: excl=679819 live=0, against 225 ops entering off-contract
+		 * in the same run, so the split is not vacuous.
+		 */
+		struct urcu_txn optxn;
+		const bool ra_txn = dst_ft->lock_fine && src_ft->exclusive;
+		unsigned long ra_depth __attribute__((unused)) = 0;
+
+		ft_txn_op_init(dst_ft, &optxn);
 
 retry_attach:
-	RSPIN_ENTER_X(2, ra_depth, 1, dst_ft->lock_fine && src_ft->exclusive);
+		/*
+		 * Open the attempt BEFORE anything it must undo: an aged retry
+		 * escalates here, and escalation blocks on the domain's fair mutex.
+		 */
+		if (ra_txn)
+			urcu_txn_begin(&optxn);
+		RSPIN_ENTER_X(2, ra_depth, 1, ra_txn);
 		/*
 		 * Preallocate a fresh empty root for the source trie
 		 * before the point of no return, so we can fail cleanly
@@ -1557,8 +1598,10 @@ retry_attach:
 		 */
 		if (!already_swapped) {
 			fresh_node = alloc_cds_ft_node(src_ft, &ft_types[0], &fresh_meta);
-			if (!fresh_node)
+			if (!fresh_node) {
+				ft_txn_attempt_end(&optxn, ra_txn);
 				return CDS_FT_STATUS_MEMORY_ERROR;
+			}
 			/* Fresh root for @src_ft: named while still invisible. */
 			fresh_meta->parent_word = ft_trie_parent(src_ft);
 		}
@@ -1608,9 +1651,12 @@ retry_attach:
 					+ ft_glue_split_cn_reserve(dst_ft))) {
 				if (glue.txn)
 					ft_flip_txn_destroy(glue.txn);
-				if (already_swapped)
+				if (already_swapped) {
+					ft_txn_attempt_bail(&optxn, ra_txn);
 					goto retry_attach;	/* src consumed: OOM is transient */
+				}
 				free_cds_ft_node_unpublished(src_ft, fresh_node);
+				ft_txn_attempt_end(&optxn, ra_txn);
 				return CDS_FT_STATUS_MEMORY_ERROR;
 			}
 		}
@@ -1637,9 +1683,12 @@ retry_attach:
 			ft_glue_abort(dst_ft, &glue);
 			if (glue.txn)
 				ft_flip_txn_destroy(glue.txn);
-			if (already_swapped)
+			if (already_swapped) {
+				ft_txn_attempt_bail(&optxn, ra_txn);
 				goto retry_attach;	/* src consumed: OOM is transient */
+			}
 			free_cds_ft_node_unpublished(src_ft, fresh_node);
+			ft_txn_attempt_end(&optxn, ra_txn);
 			return CDS_FT_STATUS_MEMORY_ERROR;
 		}
 		if (prep == FT_GRAFT_PREP_RETRY) {
@@ -1665,6 +1714,7 @@ retry_attach:
 			}
 			if (!already_swapped)
 				free_cds_ft_node_unpublished(src_ft, fresh_node);
+			ft_txn_attempt_bail(&optxn, ra_txn);
 			goto retry_attach;
 		}
 		if (prep == FT_GRAFT_PREP_POPULATED) {
@@ -1681,6 +1731,7 @@ retry_attach:
 				ft_flip_txn_destroy(glue.txn);
 			if (!already_swapped)	/* NDEBUG: @fresh_node is NULL post-swap */
 				free_cds_ft_node_unpublished(src_ft, fresh_node);
+			ft_txn_attempt_end(&optxn, ra_txn);
 			return CDS_FT_STATUS_POPULATED_ERROR;
 		}
 		/*
@@ -1700,6 +1751,7 @@ retry_attach:
 				ft_flip_txn_destroy(glue.txn);
 			if (!already_swapped)
 				free_cds_ft_node_unpublished(src_ft, fresh_node);
+			ft_txn_attempt_bail(&optxn, ra_txn);
 			goto retry_attach;
 		}
 		/*
@@ -1714,6 +1766,7 @@ retry_attach:
 			ft_flip_txn_destroy(glue.txn);
 			if (!already_swapped)	/* NDEBUG: @fresh_node is NULL post-swap */
 				free_cds_ft_node_unpublished(src_ft, fresh_node);
+			ft_txn_attempt_end(&optxn, ra_txn);
 			return CDS_FT_STATUS_POPULATED_ERROR;
 		}
 
@@ -1765,6 +1818,7 @@ retry_attach:
 					ft_flip_txn_destroy(run_splice_txn);
 				ft_flip_txn_destroy(glue.txn);
 				free_cds_ft_node_unpublished(src_ft, fresh_node);
+				ft_txn_attempt_end(&optxn, ra_txn);
 				return CDS_FT_STATUS_MEMORY_ERROR;
 			}
 		} else if (!already_swapped && nil_key_root && !src_ft->exclusive) {
@@ -1782,6 +1836,7 @@ retry_attach:
 				}
 				ft_flip_txn_destroy(glue.txn);
 				free_cds_ft_node_unpublished(src_ft, fresh_node);
+				ft_txn_attempt_end(&optxn, ra_txn);
 				return CDS_FT_STATUS_MEMORY_ERROR;
 			}
 		}
@@ -1818,9 +1873,12 @@ retry_attach:
 					ft_flip_txn_destroy(src_retire_txn);
 				if (run_splice_txn)
 					ft_flip_txn_destroy(run_splice_txn);
-				if (already_swapped)
+				if (already_swapped) {
+					ft_txn_attempt_bail(&optxn, ra_txn);
 					goto retry_attach;	/* src consumed: OOM is transient */
+				}
 				free_cds_ft_node_unpublished(src_ft, fresh_node);
+				ft_txn_attempt_end(&optxn, ra_txn);
 				return CDS_FT_STATUS_MEMORY_ERROR;
 			}
 			self_secured = true;
@@ -1907,6 +1965,7 @@ retry_attach:
 				}
 				if (!already_swapped)
 					free_cds_ft_node_unpublished(src_ft, fresh_node);
+				ft_txn_attempt_bail(&optxn, ra_txn);
 				goto retry_attach;
 			}
 			nosplit_prepared = true;
@@ -2008,6 +2067,7 @@ retry_attach:
 					}
 					if (!already_swapped)
 						free_cds_ft_node_unpublished(src_ft, fresh_node);
+					ft_txn_attempt_bail(&optxn, ra_txn);
 					goto retry_attach;
 				}
 				/*
@@ -2327,6 +2387,7 @@ retry_attach:
 			}
 			if (!already_swapped)
 				free_cds_ft_node_unpublished(src_ft, fresh_node);
+			ft_txn_attempt_bail(&optxn, ra_txn);
 			goto retry_attach;
 		}
 
@@ -2367,6 +2428,12 @@ retry_attach:
 		 */
 		if (nil_key_root)
 			free_cds_ft_node(src_ft, ft_node_ptr(old_src_root));
+		/*
+		 * The attach SUCCEEDED and nothing below re-attempts: close the
+		 * attempt without aging it.  This is the loop's only fall-out
+		 * edge; every other exit closes at its own return / goto.
+		 */
+		ft_txn_attempt_end(&optxn, ra_txn);
 	}
 
 done:
