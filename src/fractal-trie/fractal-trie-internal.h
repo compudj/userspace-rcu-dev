@@ -1864,7 +1864,36 @@ extern unsigned long ft_probe_mspin[5];
 				__ATOMIC_RELAXED, __ATOMIC_RELAXED))	\
 			;						\
 	} while (0)
+/*
+ * The OTHER unbracketed retry loops, probed as a CLASS after merge_spine_retry
+ * turned out to spin 377 deep with no aging: ft_merge_graft_subpos_inplace's
+ * retry_merge, ft_graft_keylen's retry_attach and cds_ft_graft_swap's
+ * retry_swap -- the two the merge source itself calls "the same plan->commit
+ * retry shape", in a file (ft-graft.h) that brackets no engine txn at all.
+ * Counted at the LABEL rather than at each of the 24 goto edges, so the count
+ * cannot drift from the control flow.  Pairs: {entries beyond the first,
+ * deepest single op}.  [0,1] retry_merge  [2,3] retry_attach  [4,5] retry_swap.
+ */
+extern unsigned long ft_probe_rspin[6];
+#define RSPIN_ENTER(i, v)						\
+	do {								\
+		unsigned long d_, o_;					\
+									\
+		(v)++;							\
+		if ((v) < 2)						\
+			break;						\
+		d_ = (v) - 1;						\
+		__atomic_fetch_add(&ft_probe_rspin[i], 1,		\
+				__ATOMIC_RELAXED);			\
+		o_ = __atomic_load_n(&ft_probe_rspin[(i) + 1],		\
+				__ATOMIC_RELAXED);			\
+		while (d_ > o_ && !__atomic_compare_exchange_n(		\
+				&ft_probe_rspin[(i) + 1], &o_, d_, 0,	\
+				__ATOMIC_RELAXED, __ATOMIC_RELAXED))	\
+			;						\
+	} while (0)
 #else
+#define RSPIN_ENTER(i, v)		do { } while (0)
 #define MRG_SKIPCONF_PROBE(i, d)	do { } while (0)
 #define MRG_REANCHOR_PROBE(i, rw)	do { } while (0)
 #define MRG_SPIN_PROBE(i)		do { } while (0)

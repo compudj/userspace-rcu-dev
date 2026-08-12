@@ -2426,7 +2426,10 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 	 * Either way the source unlink is the single last fallible step, so an OOM
 	 * leaves both tries pristine -- no rollback, no leak.
 	 */
+	unsigned long rm_depth __attribute__((unused)) = 0;
+
 retry_merge:
+	RSPIN_ENTER(0, rm_depth);
 	ft_glue_init(&glue);
 	/*
 	 * Fence the compressed divergence node (like cds_ft_graft), so a

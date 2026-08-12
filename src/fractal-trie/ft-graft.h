@@ -1543,7 +1543,10 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		 * retry path.  Progress: {p}'s node lock guarantees a winner
 		 * each contention round.
 		 */
+	unsigned long ra_depth __attribute__((unused)) = 0;
+
 retry_attach:
+	RSPIN_ENTER(2, ra_depth);
 		/*
 		 * Preallocate a fresh empty root for the source trie
 		 * before the point of no return, so we can fail cleanly
@@ -2888,7 +2891,10 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 			dst_ft->group->flavor->read_lock();
 			gs_rlock = true;
 		}
+	unsigned long rs_depth __attribute__((unused)) = 0;
+
 retry_swap:
+	RSPIN_ENTER(4, rs_depth);
 		/*
 		 * MW LOCK_FINE drop: the re-descend point.  graft_swap's commit is
 		 * failure-free under the FT-wide lock, but with the lock dropped a
