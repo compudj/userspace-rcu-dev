@@ -1836,9 +1836,31 @@ extern unsigned long ft_probe_ranch[2], ft_probe_rewind[2];
 			__atomic_fetch_add(&ft_probe_rewind[i], 1,	\
 					__ATOMIC_RELAXED);		\
 	} while (0)
+/*
+ * merge_spine_retry's spin depth.  ft-merge.h brackets no engine transaction,
+ * so that loop ages nothing and has no termination argument the way every other
+ * mutator's retry does; before adding one, measure whether it ever actually
+ * spins.  [0] merge ops, [1] retries from a declined dup-chain lock set,
+ * [2] retries from a reanchor level-move, [3] the deepest single op's retries.
+ */
+extern unsigned long ft_probe_mspin[4];
+#define MRG_SPIN_PROBE(i)						\
+	__atomic_fetch_add(&ft_probe_mspin[i], 1, __ATOMIC_RELAXED)
+#define MRG_SPIN_MAX(v)							\
+	do {								\
+		unsigned long v_ = (v);					\
+		unsigned long o_ = __atomic_load_n(&ft_probe_mspin[3],	\
+				__ATOMIC_RELAXED);			\
+		while (v_ > o_ && !__atomic_compare_exchange_n(		\
+				&ft_probe_mspin[3], &o_, v_, 0,		\
+				__ATOMIC_RELAXED, __ATOMIC_RELAXED))	\
+			;						\
+	} while (0)
 #else
 #define MRG_SKIPCONF_PROBE(i, d)	do { } while (0)
 #define MRG_REANCHOR_PROBE(i, rw)	do { } while (0)
+#define MRG_SPIN_PROBE(i)		do { } while (0)
+#define MRG_SPIN_MAX(v)			do { } while (0)
 #endif
 
 #define FT_PARENT_TAG_MASK	((uintptr_t) (FT_INTERNAL_MASK | FT_TYPE_MASK))

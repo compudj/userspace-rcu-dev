@@ -137,6 +137,7 @@
  */
 unsigned long ft_probe_mrg_desc[3], ft_probe_mrg_conf[3];
 unsigned long ft_probe_ranch[2], ft_probe_rewind[2];
+unsigned long ft_probe_mspin[4];
 static const char *const ft_probe_mrg_name[3] = { "src", "mergepoint", "dst" };
 static __attribute__((destructor))
 void ft_probe_mrg_report(void)
@@ -148,9 +149,12 @@ void ft_probe_mrg_report(void)
 		fprintf(stderr, " %s: descents=%lu conflicts=%lu",
 			ft_probe_mrg_name[i], ft_probe_mrg_desc[i],
 			ft_probe_mrg_conf[i]);
-	fprintf(stderr, " | reanchor compressed=%lu rewinds=%lu slot=%lu rewinds=%lu\n",
+	fprintf(stderr, " | reanchor compressed=%lu rewinds=%lu slot=%lu rewinds=%lu",
 		ft_probe_ranch[0], ft_probe_rewind[0],
 		ft_probe_ranch[1], ft_probe_rewind[1]);
+	fprintf(stderr, " | mergespin ops=%lu contended=%lu levelmove=%lu deepest=%lu\n",
+		ft_probe_mspin[0], ft_probe_mspin[1], ft_probe_mspin[2],
+		ft_probe_mspin[3]);
 }
 #endif
 

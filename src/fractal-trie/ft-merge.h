@@ -3231,6 +3231,9 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 
 	bool md_rlock = false;
 	bool md_contended;
+	unsigned long md_spin = 0;	/* this op's merge_spine_retry depth (probe) */
+
+	MRG_SPIN_PROBE(0);
 
 	/*
 	 * Re-entered when a spine-copy attempt could not take its dup-chain lock
@@ -3282,6 +3285,9 @@ merge_spine_retry:
 			dst_ft->group->flavor->read_unlock();
 			md_rlock = false;
 		}
+		md_spin++;
+		MRG_SPIN_PROBE(2);
+		MRG_SPIN_MAX(md_spin);
 		goto merge_spine_retry;
 	}
 
@@ -3310,6 +3316,9 @@ merge_spine_retry:
 				dst_ft->group->flavor->read_unlock();
 				md_rlock = false;
 			}
+			md_spin++;
+			MRG_SPIN_PROBE(1);
+			MRG_SPIN_MAX(md_spin);
 			goto merge_spine_retry;
 		}
 		if (status == CDS_FT_STATUS_OK) {
