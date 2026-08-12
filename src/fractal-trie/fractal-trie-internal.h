@@ -830,17 +830,36 @@ struct ft_pub_rec {
 };
 
 /*
- * Struct layout (32 bytes, zero internal padding):
- *   offset  0: 8-byte parent pointer
- *   offset  8: 8-byte external_nodes pointer
- *   offset 16: 8-byte nr_keys (unsigned long, total keys in subtree)
- *   offset 24: 4-byte packed bitfield (nr_child, parent_slot_offset,
- *              alloc_index)
- *   offset 28: 4-byte tail padding
+ * Struct layout, ONE WORD PER LINE so it holds on both ABIs (LP64 byte
+ * offsets bracketed; 48 B on LP64, 24 B on ILP32 -- the same six words at
+ * half the width, zero internal padding):
+ *   word 0 [ 0]: parent_word
+ *   word 1 [ 8]: external_nodes
+ *   word 2 [16]: parent_slot_offset -- its OWN word since the §8.3 split
+ *   word 3 [24]: nr_keys
+ *   word 4 [32]: state -- nr_child lives here (bits 2-10), not in a bitfield
+ *   word 5 [40]: alloc_index + incoming_byte packed, plus tail padding
  *
- * In cds_ft_metadata_alloc, rcu_head is a separate field placed
- * before the metadata union -- no overlap with metadata fields.
- * All metadata fields remain valid throughout the RCU grace period.
+ * In cds_ft_metadata_alloc (64 B on LP64 -- one cache line), rcu_head is a
+ * SEPARATE field placed before the metadata union: it overlaps no metadata
+ * field, so every metadata field stays valid for the whole RCU grace period.
+ *
+ * The union's OTHER member has no such property, and the difference matters.
+ * @free_list_next occupies exactly the bytes of @parent_word, so returning an
+ * item to its range freelist overwrites the parent link with a pointer to
+ * another cds_ft_metadata_alloc.  That write lands only AFTER the grace
+ * period -- cds_ft_free_item defers it through call_rcu, and the
+ * exclusive-mode synchronous push has no concurrent readers by construction
+ * -- so no reader that respects its pin can observe it.  A reader that does
+ * NOT, one holding a reference past its grace period, reads a freelist link;
+ * and because that link is >= 8-byte aligned, ft_node_external() and every
+ * other structural predicate accept it.  It does not fault at the load, it
+ * MASQUERADES as a legal external parent and faults later, in
+ * cds_ft_item_to_metadata, on an address in the metadata region.
+ *
+ * So the overlap is what makes such a use-after-free LOUD.  Separating the
+ * union would leave @parent_word holding the node's last real parent, and the
+ * same stale reader would then walk a plausible wrong tree in silence.
  */
 /*
  * Per-node MCAS state word (struct cds_ft_metadata.state) bit layout.
@@ -1035,11 +1054,10 @@ struct cds_ft_metadata {
 	/*
 	 * A 2 MiB far macro-block holds far more than 256 items (e.g. ~18 700
 	 * order-5 nodes), overflowing the FT_ALLOC_INDEX_BITS (8-bit) packed
-	 * field.  Store alloc_index in its own word -- it lands in the struct's
-	 * existing 4-byte tail padding, so the struct stays 32 B and the hot
-	 * descent bitfield (nr_child/parent_slot_offset) is untouched.  24 bits
-	 * (16 M) is ample for a 2 MiB block; the top 8 bits carry incoming_byte
-	 * (below), keeping the struct 32 B without a separate tail byte.
+	 * field.  Store alloc_index in the struct's TAIL WORD, which it shares
+	 * with @incoming_byte: it costs no additional word and leaves every field
+	 * above it untouched.  24 bits (16 M) is ample for a 2 MiB block; the top
+	 * 8 bits carry incoming_byte (below), so the tail needs no separate byte.
 	 */
 	uint32_t alloc_index:24;
 	uint32_t incoming_byte:8;
@@ -1061,8 +1079,8 @@ struct cds_ft_metadata {
 	 *   - compressed node: unused -- key_bytes[0] already IS that byte.
 	 *   - external head: stored in the head's CELL metadata (the cell is the
 	 *     head's metadata record), set to the key's last byte at insert.
-	 * Near layout: occupies the 32 B struct's offset-28 tail padding; the
-	 * hot descent bitfield is untouched.
+	 * Near layout: shares the struct's tail word with @alloc_index, so it
+	 * costs no additional word and leaves every field above it untouched.
 	 */
 	uint8_t incoming_byte;
 #endif
