@@ -1546,7 +1546,7 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 	unsigned long ra_depth __attribute__((unused)) = 0;
 
 retry_attach:
-	RSPIN_ENTER(2, ra_depth);
+	RSPIN_ENTER_X(2, ra_depth, 1, dst_ft->lock_fine && src_ft->exclusive);
 		/*
 		 * Preallocate a fresh empty root for the source trie
 		 * before the point of no return, so we can fail cleanly
@@ -2894,7 +2894,7 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 	unsigned long rs_depth __attribute__((unused)) = 0;
 
 retry_swap:
-	RSPIN_ENTER(4, rs_depth);
+	RSPIN_ENTER_X(4, rs_depth, 2, dst_ft->lock_fine && swap_ft->exclusive);
 		/*
 		 * MW LOCK_FINE drop: the re-descend point.  graft_swap's commit is
 		 * failure-free under the FT-wide lock, but with the lock dropped a

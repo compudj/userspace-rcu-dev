@@ -139,6 +139,7 @@ unsigned long ft_probe_mrg_desc[3], ft_probe_mrg_conf[3];
 unsigned long ft_probe_ranch[2], ft_probe_rewind[2];
 unsigned long ft_probe_mspin[5];
 unsigned long ft_probe_rspin[6];
+unsigned long ft_probe_rspin_x[3], ft_probe_rspin_n[3];
 static const char *const ft_probe_mrg_name[3] = { "src", "mergepoint", "dst" };
 static __attribute__((destructor))
 void ft_probe_mrg_report(void)
@@ -157,9 +158,23 @@ void ft_probe_mrg_report(void)
 		ft_probe_mspin[0], ft_probe_mspin[1], ft_probe_mspin[4],
 		ft_probe_mspin[1] - ft_probe_mspin[4], ft_probe_mspin[2],
 		ft_probe_mspin[3]);
-	fprintf(stderr, "RSPIN retry_merge=%lu deepest=%lu | retry_attach=%lu deepest=%lu | retry_swap=%lu deepest=%lu\n",
-		ft_probe_rspin[0], ft_probe_rspin[1], ft_probe_rspin[2],
-		ft_probe_rspin[3], ft_probe_rspin[4], ft_probe_rspin[5]);
+	/*
+	 * Each loop's retries split by the contract that decides whether a
+	 * persistent-handle bracket is expressible there at all: excl = the
+	 * retries that landed under it, live = the retries that did not.
+	 */
+	fprintf(stderr, "RSPIN retry_merge=%lu deepest=%lu (excl=%lu live=%lu offc=%lu)"
+		" | retry_attach=%lu deepest=%lu (excl=%lu live=%lu offc=%lu)"
+		" | retry_swap=%lu deepest=%lu (excl=%lu live=%lu offc=%lu)\n",
+		ft_probe_rspin[0], ft_probe_rspin[1],
+		ft_probe_rspin_x[0], ft_probe_rspin[0] - ft_probe_rspin_x[0],
+		ft_probe_rspin_n[0],
+		ft_probe_rspin[2], ft_probe_rspin[3],
+		ft_probe_rspin_x[1], ft_probe_rspin[2] - ft_probe_rspin_x[1],
+		ft_probe_rspin_n[1],
+		ft_probe_rspin[4], ft_probe_rspin[5],
+		ft_probe_rspin_x[2], ft_probe_rspin[4] - ft_probe_rspin_x[2],
+		ft_probe_rspin_n[2]);
 }
 #endif
 

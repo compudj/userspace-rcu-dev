@@ -1892,8 +1892,51 @@ extern unsigned long ft_probe_rspin[6];
 				__ATOMIC_RELAXED, __ATOMIC_RELAXED))	\
 			;						\
 	} while (0)
+/*
+ * Split each of those retry counts by the SOURCE CONTRACT, which is what
+ * decides whether a persistent-handle fix is EXPRESSIBLE at all rather than
+ * merely desirable -- the same question ft_probe_mspin[4] answered for
+ * merge_spine_retry (exclsrc=585250 livesrc=0).
+ *
+ * urcu_txn_begin() opens an RCU read section AND urcu_txn_conflict() ages the
+ * handle into the domain's FIFO fallback lane; ft_writer_lock_gp_wait() both
+ * self-deadlocks under the first and asserts !urcu_txn_in_fallback() under the
+ * second.  So a bracket may only span a body that takes NO grace period, and
+ * every grace period on these three paths is gated on a source being LIVE:
+ *
+ *   [0] retry_merge   dst_ft->lock_fine && src_ft->exclusive
+ *   [1] retry_attach  dst_ft->lock_fine && src_ft->exclusive
+ *   [2] retry_swap    dst_ft->lock_fine && swap_ft->exclusive
+ *
+ * which are exactly the conditions the three bodies already read_lock() under
+ * (ft-merge.h's spine pin, ft-graft.h's @gs_rlock).  A loop whose retries all
+ * land OUTSIDE its condition cannot be fixed this way, and that is a
+ * measurement, not an argument.
+ *
+ * ft_probe_rspin_n[] is this split's RED CONTROL, and it is not optional:
+ * live == 0 would read identically whether no retry ever happens off-contract
+ * or @cond is simply TRUE BY CONSTRUCTION at that label, and the second reading
+ * makes the whole measurement vacuous.  So count the ops that ENTER each loop
+ * with @cond false (first entry, v == 1).  A non-zero n proves the condition
+ * varies at that site and the counter can tell the two apart; n == 0 means the
+ * split says nothing at all there.
+ */
+extern unsigned long ft_probe_rspin_x[3], ft_probe_rspin_n[3];
+#define RSPIN_ENTER_X(i, v, xi, cond)					\
+	do {								\
+		bool c_ = (cond);					\
+									\
+		RSPIN_ENTER(i, v);					\
+		if ((v) >= 2 && c_)					\
+			__atomic_fetch_add(&ft_probe_rspin_x[xi], 1,	\
+					__ATOMIC_RELAXED);		\
+		if ((v) == 1 && !c_)					\
+			__atomic_fetch_add(&ft_probe_rspin_n[xi], 1,	\
+					__ATOMIC_RELAXED);		\
+	} while (0)
 #else
 #define RSPIN_ENTER(i, v)		do { } while (0)
+#define RSPIN_ENTER_X(i, v, xi, cond)	do { } while (0)
 #define MRG_SKIPCONF_PROBE(i, d)	do { } while (0)
 #define MRG_REANCHOR_PROBE(i, rw)	do { } while (0)
 #define MRG_SPIN_PROBE(i)		do { } while (0)
