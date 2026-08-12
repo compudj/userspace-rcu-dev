@@ -3232,8 +3232,28 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 	bool md_rlock = false;
 	bool md_contended;
 	unsigned long md_spin = 0;	/* this op's merge_spine_retry depth (probe) */
+	/*
+	 * The op's PERSISTENT engine handle, spanning the whole merge_spine_retry
+	 * loop the way ft_txn_op_init does for insert, remove and replace (doc
+	 * §11).  Without it this loop ages nothing: every attempt started at
+	 * retry 0, so the domain never escalated the writer into the per-trie
+	 * FIFO fair-mutex lane and the loop had no termination argument at all --
+	 * measured at 585250 declined lock sets over 235141 merges under an
+	 * exponential spacing, one op re-descending 348 times.
+	 *
+	 * It is bound and bracketed ONLY on the arm that takes the read pin
+	 * below, and that is not an optimization: urcu_txn_begin() enters the
+	 * RCU read side, and the SAME-TRIE rekey shares this body with a LIVE
+	 * src whose ft_writer_lock_gp_wait calls do run -- a read section held
+	 * across one is a writer waiting on its own grace period.  The condition
+	 * `dst_ft->lock_fine && src_ft->exclusive` is exactly the source
+	 * contract that syncs nowhere, and it is where every one of those
+	 * 585250 declines was measured (livesrc=0).
+	 */
+	struct urcu_txn optxn;
 
 	MRG_SPIN_PROBE(0);
+	ft_txn_op_init(dst_ft, &optxn);
 
 	/*
 	 * Re-entered when a spine-copy attempt could not take its dup-chain lock
@@ -3261,6 +3281,17 @@ merge_spine_retry:
 	 * above (a retry re-descends, so it must re-pin what it re-reads).
 	 */
 	if (dst_ft->lock_fine && src_ft->exclusive) {
+		/*
+		 * Open the attempt on the persistent handle FIRST: a retry that
+		 * has aged escalates here, and escalation blocks on the domain's
+		 * fair mutex, which must not happen holding the pin below.  The
+		 * explicit read_lock stays -- it is what pins the descent-captured
+		 * dst nodes, and it must not become conditional on the handle
+		 * having a flavour bound (ft_txn_op_init binds NULL on an
+		 * exclusive dst).  RCU read sections nest; @md_rlock now marks
+		 * both, and every site that releases it closes the txn too.
+		 */
+		urcu_txn_begin(&optxn);
 		dst_ft->group->flavor->read_lock();
 		md_rlock = true;
 	}
@@ -3283,6 +3314,9 @@ merge_spine_retry:
 	if (caa_unlikely(d_dst.skip_conflict)) {
 		if (md_rlock) {
 			dst_ft->group->flavor->read_unlock();
+			/* Nothing moved: age the conflict, close the attempt. */
+			urcu_txn_conflict(&optxn);
+			urcu_txn_end(&optxn);
 			md_rlock = false;
 		}
 		md_spin++;
@@ -3314,10 +3348,24 @@ merge_spine_retry:
 			/* Contention, nothing moved: re-pin, re-descend, rebuild. */
 			if (md_rlock) {
 				dst_ft->group->flavor->read_unlock();
+				/*
+				 * AGE IT.  This is the arm that spun 348 deep with
+				 * nothing to make it terminate: urcu_txn_conflict
+				 * carries the retry count on the persistent handle, so
+				 * the domain escalates this writer into the FIFO lane
+				 * and the contention drains.  end() then FORFEITS the
+				 * turn -- this is a pre-commit bail, and a bail that
+				 * keeps its turn while the peer it waits on queues
+				 * behind that same turn is the insert livelock.
+				 */
+				urcu_txn_conflict(&optxn);
+				urcu_txn_end(&optxn);
 				md_rlock = false;
 			}
 			md_spin++;
 			MRG_SPIN_PROBE(1);
+			if (src_ft->exclusive)
+				MRG_SPIN_PROBE(4);
 			MRG_SPIN_MAX(md_spin);
 			goto merge_spine_retry;
 		}
@@ -3342,6 +3390,7 @@ merge_spine_retry:
 		}
 		if (md_rlock) {
 			dst_ft->group->flavor->read_unlock();
+			urcu_txn_end(&optxn);
 			md_rlock = false;
 		}
 		FT_TP(merge_exit, (int) status);
@@ -3356,6 +3405,7 @@ merge_spine_retry:
 	 */
 	if (md_rlock) {
 		dst_ft->group->flavor->read_unlock();
+		urcu_txn_end(&optxn);
 		md_rlock = false;
 	}
 

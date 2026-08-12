@@ -1842,8 +1842,16 @@ extern unsigned long ft_probe_ranch[2], ft_probe_rewind[2];
  * mutator's retry does; before adding one, measure whether it ever actually
  * spins.  [0] merge ops, [1] retries from a declined dup-chain lock set,
  * [2] retries from a reanchor level-move, [3] the deepest single op's retries.
+ *
+ * [4] splits [1] by SOURCE CONTRACT, which is what decides whether the fix is
+ * even expressible: one body serves two: cds_ft_merge_at consumes an EXCLUSIVE
+ * src, so every ft_writer_lock_gp_wait on its path is !exclusive-gated and the
+ * spine copy runs GP-free UNDER A READ LOCK; cds_ft_rekey_* share it with
+ * src_ft == dst_ft, a LIVE trie, where those waits DO run and a read section
+ * held across one would be a writer waiting on its own grace period.
+ * urcu_txn_begin() takes the read side, so it can only bracket the first.
  */
-extern unsigned long ft_probe_mspin[4];
+extern unsigned long ft_probe_mspin[5];
 #define MRG_SPIN_PROBE(i)						\
 	__atomic_fetch_add(&ft_probe_mspin[i], 1, __ATOMIC_RELAXED)
 #define MRG_SPIN_MAX(v)							\
