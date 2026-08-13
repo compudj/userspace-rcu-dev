@@ -97,6 +97,23 @@ size_t ft_rebuild_key_upwalk(const struct cds_ft *ft, struct ft_ord_cell *cell,
 	 * (old-or-merged) parent, consistent across the walk.
 	 */
 	nf = ft_resolve_flip_proxy(rcu_dereference(cell->parent));
+	/*
+	 * A parent link names an INTERNAL or COMPRESSED node, never an external
+	 * one -- the same invariant ft_get_parent_rcu asserts on its own load,
+	 * asserted here because this walk is the other consumer of a parent word
+	 * and had no check at all.
+	 *
+	 * It is not a formality.  A metadata slot returned to its range freelist
+	 * has @free_list_next written over @parent_word (they are the same bytes;
+	 * see the layout note on struct cds_ft_metadata), and a freelist link is
+	 * >= 8-byte aligned, so ft_node_external() ACCEPTS it.  Without this the
+	 * walk carries that link into ft_flag_to_metadata below and dies two
+	 * frames later inside cds_ft_item_to_metadata, on an address in the
+	 * metadata region, with nothing left on the stack naming the stale
+	 * reference.  Trap it at the LOAD instead, where @cell and the walk are
+	 * still in the frame.
+	 */
+	assert(!nf || !ft_node_external(nf));
 
 	/*
 	 * Fill the buffer FROM THE END: write the deepest (leaf-edge) byte at
@@ -144,8 +161,13 @@ size_t ft_rebuild_key_upwalk(const struct cds_ft *ft, struct ft_ord_cell *cell,
 	/* else parent compressed: the head byte is covered by its key_bytes. */
 
 	while (nf) {
-		struct cds_ft_inode_flag *rnf = ft_resolve_skip_compressed(ft, nf);
-		struct cds_ft_metadata *meta = ft_flag_to_metadata(ft, nf);
+		struct cds_ft_inode_flag *rnf;
+		struct cds_ft_metadata *meta;
+
+		/* Same invariant, re-checked per level: see the load above. */
+		assert(!ft_node_external(nf));
+		rnf = ft_resolve_skip_compressed(ft, nf);
+		meta = ft_flag_to_metadata(ft, nf);
 
 		if (ft_node_compressed(rnf)) {
 			const struct cds_ft_compressed_node *cn =
