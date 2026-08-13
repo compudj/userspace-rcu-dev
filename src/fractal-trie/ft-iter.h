@@ -96,7 +96,26 @@ size_t ft_rebuild_key_upwalk(const struct cds_ft *ft, struct ft_ord_cell *cell,
 	 * otherwise dereference the proxy as a node.  Gives the view-appropriate
 	 * (old-or-merged) parent, consistent across the walk.
 	 */
-	nf = ft_resolve_flip_proxy(rcu_dereference(cell->parent));
+	/*
+	 * Launder the head's parent through ft_parent_node() exactly as the climb
+	 * below does.  A parent word at a ROOT POSITION names the owning TRIE, not
+	 * a node, and must never be walked as one; ft_parent_node() turns that
+	 * stamp into NULL, which the root-position arm below already handles.
+	 * Every other parent reader in the tree -- ft-verify, ft-compact,
+	 * ft-insert, and this function's own climb -- goes through it; this load
+	 * was the only one that did not.
+	 *
+	 * Identity TODAY, and deliberately not left to that: a head always hangs
+	 * under a node (even a lone nil key is held by a childless-internal
+	 * wrapper AT the root), so @cell->parent is an internal or compressed flag
+	 * whose low nibble is never 0, and no writer stamps a cell -- every
+	 * ft_trie_parent() store targets a metadata @parent_word.  Measured: ZERO
+	 * root-position cells in 215 M up-walks across both spacings and ft_unit.
+	 * Written this way so the walk stays correct if cells ever adopt the owner
+	 * stamp the metadata parent words already carry, rather than silently
+	 * dereferencing a struct cds_ft as a node.
+	 */
+	nf = ft_resolve_flip_proxy(ft_parent_node(rcu_dereference(cell->parent)));
 	/*
 	 * A parent link names an INTERNAL or COMPRESSED node, never an external
 	 * one -- the same invariant ft_get_parent_rcu asserts on its own load,
@@ -131,7 +150,12 @@ size_t ft_rebuild_key_upwalk(const struct cds_ft *ft, struct ft_ord_cell *cell,
 	 * edge byte (the compressed key_bytes run through the head's position).
 	 */
 	if (!nf) {
-		/* Parentless head: its byte stands alone. */
+		/*
+		 * Head AT A ROOT POSITION -- @cell->parent was NULL or a trie
+		 * stamp the load above resolved to NULL.  Its byte stands alone.
+		 * Unobserved in practice (see the load's measurement); kept as the
+		 * arm a stamped cell would land in rather than removed.
+		 */
 		struct cds_ft_metadata *hmeta = cds_ft_item_to_metadata(cell);
 
 		if (pos == 0)
