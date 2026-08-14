@@ -1453,6 +1453,59 @@ struct cds_ft_compressed_node *ft_compressed_node_ptr(
 		(((unsigned long) node) & ~(unsigned long) FT_TAG_MASK);
 }
 
+#ifdef FT_DEBUG_PARENT_VIOLATION
+#include <stdio.h>
+/*
+ * The same violation the ordered up-walk dumps (ft-iter.h), at the OTHER load
+ * that carries the invariant.  A bare assert here names only the READER -- the
+ * thread that followed the link -- while the question is about the node whose
+ * @parent_word produced the illegal value, and nothing on this frame survives
+ * into a core to name it at -O1.
+ *
+ * @node is that node, i.e. the one suspected of having been retired and freed
+ * while still referenced.  Print its metadata, state and rcu_head words at the
+ * point of detection instead of reconstructing them afterwards.
+ */
+__attribute__((noinline, cold, unused))
+static void ft_parent_rcu_violation(struct cds_ft *ft,
+		struct cds_ft_inode_flag *node,
+		struct cds_ft_inode_flag *bad)
+{
+	struct cds_ft_metadata *m = NULL;
+
+	if (!ft_node_external(node))
+		m = ft_node_compressed(node) ?
+			cds_ft_item_to_metadata((struct cds_ft_inode *)
+				ft_compressed_node_ptr(node)) :
+			cds_ft_item_to_metadata(ft_node_ptr(node));
+	fprintf(stderr, "FT_PARENT_RCU_VIOLATION: illegal parent %p\n",
+		(void *) bad);
+	fprintf(stderr, "  ft=%p node=%p meta=%p\n",
+		(void *) ft, (void *) node, (void *) m);
+	if (m) {
+		fprintf(stderr, "  node parent_word=%p state=0x%lx\n",
+			(void *) m->parent_word, (unsigned long) m->state);
+		fprintf(stderr, "  node rcu_head words: %p %p\n",
+			((void **) m)[-2], ((void **) m)[-1]);
+	}
+	fprintf(stderr, "  bad rcu_head words: %p %p\n",
+		((void **) bad)[0], ((void **) bad)[1]);
+	fflush(stderr);
+	abort();
+}
+# define ft_parent_rcu_check(ft, node, parent)				\
+	do {								\
+		if (caa_unlikely((parent) && ft_node_external(parent)))	\
+			ft_parent_rcu_violation((ft), (node), (parent));	\
+	} while (0)
+#else
+# define ft_parent_rcu_check(ft, node, parent)				\
+	do {								\
+		(void) (node);						\
+		assert(!(parent) || !ft_node_external(parent));		\
+	} while (0)
+#endif
+
 /*
  * ft_get_parent_rcu: read the parent pointer of @node via
  * rcu_dereference.
@@ -1510,7 +1563,7 @@ struct cds_ft_inode_flag *ft_get_parent_rcu(struct cds_ft *ft,
 	 * (old or merged) parent before returning.
 	 */
 	parent = ft_resolve_flip_proxy(parent);
-	assert(!parent || !ft_node_external(parent));
+	ft_parent_rcu_check(ft, node, parent);
 	return parent;
 }
 

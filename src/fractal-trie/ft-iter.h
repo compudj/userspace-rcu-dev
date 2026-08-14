@@ -62,6 +62,131 @@ struct ft_ord_cell *ft_ord_cell_cursor(const struct cds_ft_iter *iter)
 }
 
 /*
+ * The climb's recent history, recorded only by the violation-dump build below.
+ * Declared unconditionally so the walk can carry a NULL pointer to it in an
+ * ordinary build without a second set of declarations.
+ */
+#define FT_UPWALK_HIST	8
+struct ft_upwalk_hist {
+	struct cds_ft_inode_flag *nf;
+	uintptr_t state;
+	void *rcu_func;		/* cds_ft_free_item_rcu => queued/freed */
+	struct cds_ft_inode_flag *parent_raw;	/* meta->parent_word, unlaundered */
+	struct cds_ft_inode_flag **slot;	/* the (parent, PSO) pair's slot */
+	struct cds_ft_inode_flag *slot_val;	/* what that slot actually holds */
+};
+
+#ifdef FT_DEBUG_PARENT_VIOLATION
+#include <stdio.h>
+/*
+ * One flag arms BOTH parent-word dumps -- this one and ft_get_parent_rcu's in
+ * ft-helpers.h -- because they check the same invariant at the two loads that
+ * carry it, and a report from either is only readable beside the other.
+ *
+ * Self-diagnosing form of the parent-word assert below.  The bare assert says
+ * only THAT a parent read is illegal; at -O1 every local naming WHICH node
+ * produced it is optimized out of the core, so the interesting half -- the node
+ * whose @parent_word yielded the bad value, i.e. the one suspected of having
+ * been freed while still referenced -- is unrecoverable.  Dump it at the point
+ * of detection instead, where the walk is still live.
+ *
+ * @from is that node (NULL when the bad value came from @cell->parent itself).
+ * The two words at @bad are printed raw because a metadata slot returned to its
+ * range freelist has @free_list_next over @parent_word, so a stale parent read
+ * lands on a struct cds_ft_metadata_alloc whose rcu_head is {next, func}: a
+ * @bad[1] that symbolizes to cds_ft_free_item_rcu is the freed-item signature.
+ * Symbolize offline -- that callback is static to fractal-trie-alloc.c.
+ *
+ * The dump names the node whose parent_word was clobbered, but the DANGLING
+ * LINK is one level BELOW that -- on the last node still alive, which is what
+ * has to be explained.  @hist therefore carries each level so the live -> freed
+ * boundary is visible in the dump instead of inferred from it.
+ *
+ * Naming the boundary is still not naming the STALE EDGE: a live node whose
+ * parent_word reaches a freed node is equally consistent with (a) a retire that
+ * missed this child's back-pointer and (b) a back-pointer that was never stale
+ * at all, because the node ABOVE it was itself freed and reallocated under the
+ * link that reached it.  The two are told apart by the FORWARD edge: the slot
+ * that this node's own (parent, PSO) pair derives must hold this very node.
+ * The DEEPEST level whose slot does NOT hold it is where the structure first
+ * disagrees with itself, and the level below that names the op to look at.
+ */
+__attribute__((noinline, cold, unused))
+static void ft_upwalk_parent_violation(const struct cds_ft *ft,
+		struct ft_ord_cell *cell, struct cds_ft_inode_flag *from,
+		struct cds_ft_inode_flag *bad, unsigned int level,
+		const struct ft_upwalk_hist *hist)
+{
+	fprintf(stderr, "FT_UPWALK_VIOLATION: illegal parent %p at level %u\n",
+		(void *) bad, level);
+	fprintf(stderr, "  ft=%p cell=%p cell->node=%p cell->parent=%p\n",
+		(const void *) ft, (void *) cell,
+		cell ? (void *) cell->node : NULL,
+		cell ? (void *) cell->parent : NULL);
+	if (cell) {
+		struct cds_ft_metadata *cm = cds_ft_item_to_metadata(cell);
+
+		fprintf(stderr, "  cell meta=%p parent_word=%p state=0x%lx\n",
+			(void *) cm, (void *) cm->parent_word,
+			(unsigned long) cm->state);
+	}
+	if (from) {
+		struct cds_ft_metadata *fm = ft_flag_to_metadata(ft, from);
+
+		fprintf(stderr, "  from=%p meta=%p parent_word=%p external_nodes=%p state=0x%lx\n",
+			(void *) from, (void *) fm, (void *) fm->parent_word,
+			(void *) fm->external_nodes, (unsigned long) fm->state);
+		fprintf(stderr, "  from rcu_head words: %p %p\n",
+			((void **) fm)[-2], ((void **) fm)[-1]);
+	}
+	fprintf(stderr, "  bad rcu_head words: %p %p\n",
+		((void **) bad)[0], ((void **) bad)[1]);
+	if (hist) {
+		unsigned int i, n = level < FT_UPWALK_HIST ?
+			level : FT_UPWALK_HIST;
+
+		/*
+		 * DIFFERS is flagged on the RAW words, deliberately: resolving
+		 * a skip form here would dereference a slot that is already
+		 * suspect and could lose the whole dump to a fault.  A slot
+		 * holding the SKIP form of the same node differs raw-wise, so
+		 * decode any flag offline before calling it stale -- both words
+		 * are printed for exactly that.
+		 */
+		fprintf(stderr, "  climb (deepest first), TOMB = state bit 1,\n"
+			"  DIFFERS = the slot my own (parent, PSO) pair derives does not hold me (raw):\n");
+		for (i = 0; i < n; i++)
+			fprintf(stderr, "    L%u nf=%p state=0x%lx%s rcu_func=%p praw=%p slot=%p *slot=%p%s\n",
+				i, (void *) hist[i].nf,
+				(unsigned long) hist[i].state,
+				(hist[i].state & FT_STATE_TOMBSTONE) ?
+					" TOMB" : " live",
+				hist[i].rcu_func,
+				(void *) hist[i].parent_raw,
+				(void *) hist[i].slot,
+				(void *) hist[i].slot_val,
+				(hist[i].slot && hist[i].slot_val != hist[i].nf) ?
+					"  <== DIFFERS" : "");
+	}
+	fflush(stderr);
+	abort();
+}
+# define ft_upwalk_check_parent(ft, cell, from, bad, level, hist)	\
+	do {								\
+		if (caa_unlikely((bad) && ft_node_external(bad)))	\
+			ft_upwalk_parent_violation((ft), (cell), (from),	\
+					(bad), (level), (hist));	\
+	} while (0)
+#else
+# define ft_upwalk_check_parent(ft, cell, from, bad, level, hist)	\
+	do {								\
+		(void) (cell); (void) (from); (void) (level);		\
+		(void) (hist);						\
+		assert(!(bad) || !ft_node_external(bad));		\
+	} while (0)
+#endif
+
+/*
  * Rebuild the ORDINAL key for a cell head @cell of length @key_len by walking
  * UP the parent chain, recovering each level's branch byte structurally:
  *   - external head: its last byte = the head's cell-metadata incoming_byte
@@ -83,6 +208,14 @@ size_t ft_rebuild_key_upwalk(const struct cds_ft *ft, struct ft_ord_cell *cell,
 		uint8_t *out, size_t max_len)
 {
 	struct cds_ft_inode_flag *nf;
+	struct cds_ft_inode_flag *from = NULL;	/* whose parent_word gave @nf */
+	unsigned int level = 0;
+#ifdef FT_DEBUG_PARENT_VIOLATION
+	struct ft_upwalk_hist hist[FT_UPWALK_HIST];
+	struct ft_upwalk_hist *histp = hist;
+#else
+	struct ft_upwalk_hist *histp = NULL;
+#endif
 	size_t pos = max_len;	/* fill DEEPEST-byte-first leftward from the end */
 
 	(void) ft;
@@ -132,7 +265,7 @@ size_t ft_rebuild_key_upwalk(const struct cds_ft *ft, struct ft_ord_cell *cell,
 	 * reference.  Trap it at the LOAD instead, where @cell and the walk are
 	 * still in the frame.
 	 */
-	assert(!nf || !ft_node_external(nf));
+	ft_upwalk_check_parent(ft, cell, NULL, nf, 0, histp);
 
 	/*
 	 * Fill the buffer FROM THE END: write the deepest (leaf-edge) byte at
@@ -189,9 +322,38 @@ size_t ft_rebuild_key_upwalk(const struct cds_ft *ft, struct ft_ord_cell *cell,
 		struct cds_ft_metadata *meta;
 
 		/* Same invariant, re-checked per level: see the load above. */
-		assert(!ft_node_external(nf));
+		ft_upwalk_check_parent(ft, cell, from, nf, level, histp);
 		rnf = ft_resolve_skip_compressed(ft, nf);
 		meta = ft_flag_to_metadata(ft, nf);
+#ifdef FT_DEBUG_PARENT_VIOLATION
+		if (level < FT_UPWALK_HIST) {
+			struct cds_ft_inode_flag *praw = meta->parent_word;
+			struct cds_ft_inode_flag *pnode = ft_parent_node(praw);
+
+			hist[level].nf = nf;
+			hist[level].state = meta->state;
+			/* rcu_head sits immediately BEFORE the metadata. */
+			hist[level].rcu_func = ((void **) meta)[-1];
+			hist[level].parent_raw = praw;
+			hist[level].slot = NULL;
+			hist[level].slot_val = NULL;
+			/*
+			 * The forward edge, for the back-edge comparison in the
+			 * dump.  Resolved only while the parent word still names
+			 * a node OR a root position (whose slot is &ft->root): a
+			 * freelist link is 8-mod-16, so it clears neither
+			 * ft_parent_is_trie's alignment nor ft_node_external's
+			 * tag, and the slot address would be computed off junk.
+			 */
+			if (!pnode || !ft_node_external(pnode)) {
+				hist[level].slot = ft_get_parent_slot(meta,
+						(struct cds_ft *) ft);
+				if (hist[level].slot)
+					hist[level].slot_val =
+						*hist[level].slot;
+			}
+		}
+#endif
 
 		if (ft_node_compressed(rnf)) {
 			const struct cds_ft_compressed_node *cn =
@@ -230,7 +392,9 @@ size_t ft_rebuild_key_upwalk(const struct cds_ft *ft, struct ft_ord_cell *cell,
 					return 0;
 				out[--pos] = (uint8_t) meta->incoming_byte;
 			}
+			from = nf;	/* whose parent_word produced the next @nf */
 			nf = parent;
+			level++;
 		}
 	}
 
