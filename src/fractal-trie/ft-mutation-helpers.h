@@ -3440,6 +3440,8 @@ static inline
 void ft_flip_txn_record_release_lock(struct ft_flip_txn *t,
 		struct cds_ft_metadata *meta, uintptr_t state_snapshot)
 {
+	/* The commit owns this release now; the op no longer owes one. */
+	ft_hold_trace_drop(meta);
 	ft_flip_txn_record_tag(t, (void **) &meta->state,
 			(void *) (state_snapshot | FT_STATE_LOCK),
 			(void *) state_snapshot,
@@ -3488,6 +3490,28 @@ void ft_flip_txn_record_anchor_release_held(struct ft_flip_txn *t,
 	uintptr_t pending = (uintptr_t) urcu_txn_load(t->mtxn,
 			(void **) &lock->state, FT_STATE_PROXY);
 
+	/*
+	 * The ledger tracks who still OWES a release, and past this point the op
+	 * owes none: all three arms below hand the release to the COMMIT (a
+	 * recorded {LOCK|s -> s}, a fused retire terminal, or a node terminal
+	 * that already settled it), and none of them goes through
+	 * ft_meta_lock_release, which is where the ledger is otherwise dropped.
+	 *
+	 * ☠ WITHOUT THIS THE LEDGER POISONS ITSELF.  A successful commit sets
+	 * marks_consumed, which suppresses the caller's sweep -- the only other
+	 * dropper -- so the entry survives the op that is done with it.  The next
+	 * op to refuse that word for ORDINARY PEER CONTENTION then finds the
+	 * stale entry and reports a SELF-COLLISION, fatally, against a lock the
+	 * peer legitimately holds.  That is a detector fault reported as a code
+	 * fault, and it needs a peer to show up at all: measured, every spacing
+	 * aborts under FT_INV_MW with the ledger armed and passes 111/111 with it
+	 * compiled out.
+	 *
+	 * Dropping here cannot lose a real release: if the commit aborts, the
+	 * caller's sweep still runs ft_meta_lock_release_if_held over the marks,
+	 * which clears the word regardless of the ledger.
+	 */
+	ft_hold_trace_drop(lock);
 	if (caa_unlikely(pending & FT_STATE_TOMBSTONE))
 		return;			/* the op retires the anchor itself */
 	if (!(pending & FT_STATE_LOCK))
@@ -3582,6 +3606,16 @@ void ft_flip_txn_record_retire_anchored(struct ft_flip_txn *t,
 		const struct ft_lock_ctx *ctx,
 		const struct ft_held_anchor *h, struct cds_ft_metadata *node)
 {
+	/*
+	 * Every arm below hands @node's LOCK to the commit -- fused into the
+	 * tombstone where the op holds @node's own word, and lifted by
+	 * ft_flip_txn_record_anchor_release beforehand where it does not.  Either
+	 * way the op stops owing a release on it, so the ledger must forget it;
+	 * see ft_flip_txn_record_anchor_release_held for what a surviving entry
+	 * does to the next op that refuses this word.  A no-op when @node was
+	 * never in the ledger (the anchored case, where its own word is unlocked).
+	 */
+	ft_hold_trace_drop(node);
 	if (h->lock == node || h->node_held) {
 		/*
 		 * The op holds @node's OWN word, whether because the member
@@ -7291,10 +7325,17 @@ void ft_reparent_record_meta(struct cds_ft *ft, struct ft_flip_txn *txn,
 	 * Validating aborts the COMMIT instead, which is precisely what the
 	 * escalation lane arbitrates.
 	 */
-	if (child_marked)
+	if (child_marked) {
+		/*
+		 * This edge IS the mark's release (live_state masks LOCK out), so
+		 * the op stops owing one the moment it is recorded and the ledger
+		 * must forget the word -- nothing else will, because the caller
+		 * skips its release sweep once the commit consumed the marks.
+		 */
+		ft_hold_trace_drop(meta);
 		ft_flip_txn_record_tag(txn, (void **) &meta->state,
 			(void *) live_state, (void *) live_state, FT_STATE_PROXY);
-	else
+	} else
 		ft_flip_txn_record_tag_mw(txn, (void **) &meta->state,
 			(void *) live_state, (void *) live_state, FT_STATE_PROXY);
 	if (record_pso)
