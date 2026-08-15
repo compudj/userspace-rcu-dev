@@ -7055,12 +7055,39 @@ bool ft_glue_is_fresh(struct cds_ft *ft, struct ft_glue *g,
 static inline
 void ft_flip_txn_record_parent_word(const struct cds_ft *ft,
 		struct ft_flip_txn *txn, struct cds_ft_metadata *meta,
-		struct cds_ft_inode_flag *parent_nf)
+		struct cds_ft_inode_flag *parent_nf, bool child_held)
 {
-	ft_flip_txn_record_reserved(txn, (void **) &meta->parent_word,
-		urcu_txn_load(txn->mtxn, (void **) &meta->parent_word,
-			FT_FLIP_PROXY_TAG),
-		ft_parent_word(ft, parent_nf));
+	void *old_pw = urcu_txn_load(txn->mtxn, (void **) &meta->parent_word,
+			FT_FLIP_PROXY_TAG);
+	void *new_pw = ft_parent_word(ft, parent_nf);
+
+	/*
+	 * EDGE KIND follows who HOLDS the child, exactly as the state edge in
+	 * ft_reparent_record_meta does -- same node, same reason.
+	 *
+	 * A structural edge may park SW only "when the op holds the DLM lock
+	 * over @slot" (ft_flip_txn_record_tag), and an SW park CANNOT FAIL: it
+	 * does not arbitrate against a peer.  @slot here is the CHILD's
+	 * parent_word, while the DLM set is {C,(P),(GP)} whose acquire states
+	 * that "C's CHILDREN are never in it".  Parking unconditionally
+	 * therefore claims an exclusion the op does not have whenever
+	 * @child_held is false, and two ops re-parenting one unheld child both
+	 * park, neither fails, and the last install wins -- a lost update that
+	 * leaves the loser's child naming a node the winner then retires.
+	 *
+	 * The {live_state -> live_state} validates recorded beside this cannot
+	 * arbitrate that pair either: both expect the same value and neither
+	 * moves it.
+	 *
+	 * MW makes the second writer's expected-old mismatch and abort, which is
+	 * what the retry lane exists to absorb.
+	 */
+	if (child_held)
+		ft_flip_txn_record_reserved(txn, (void **) &meta->parent_word,
+			old_pw, new_pw);
+	else
+		ft_flip_txn_record_tag_mw(txn, (void **) &meta->parent_word,
+			old_pw, new_pw, FT_FLIP_PROXY_TAG);
 }
 
 /*
@@ -7116,7 +7143,8 @@ void ft_glue_record_back_edge(struct cds_ft *ft, struct ft_flip_txn *txn,
 			cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
 
 		ft_set_parent_slot(cn_meta, parent_nf, slot);
-		ft_flip_txn_record_parent_word(ft, txn, cn_meta, parent_nf);
+		ft_flip_txn_record_parent_word(ft, txn, cn_meta, parent_nf,
+		/*child_held=*/ true);
 		return;
 	}
 	if (ft_node_compressed(child_nf)) {
@@ -7126,7 +7154,8 @@ void ft_glue_record_back_edge(struct cds_ft *ft, struct ft_flip_txn *txn,
 			cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
 
 		ft_set_parent_slot(cn_meta, parent_nf, slot);
-		ft_flip_txn_record_parent_word(ft, txn, cn_meta, parent_nf);
+		ft_flip_txn_record_parent_word(ft, txn, cn_meta, parent_nf,
+		/*child_held=*/ true);
 		return;
 	}
 #endif
@@ -7175,7 +7204,8 @@ void ft_glue_record_back_edge(struct cds_ft *ft, struct ft_flip_txn *txn,
 				&ft_types[ft_node_type(parent_nf)],
 				ft_node_ptr(parent_nf), slot);
 		ft_set_parent_slot(meta, parent_nf, slot);
-		ft_flip_txn_record_parent_word(ft, txn, meta, parent_nf);
+		ft_flip_txn_record_parent_word(ft, txn, meta, parent_nf,
+		/*child_held=*/ true);
 	}
 }
 
@@ -7290,7 +7320,8 @@ void ft_reparent_record_meta(struct cds_ft *ft, struct ft_flip_txn *txn,
 	 * assert, on the DEFAULT per-node granularity, from
 	 * ft_chain_compress_fused's back-edge fold.
 	 */
-	ft_flip_txn_record_parent_word(ft, txn, meta, parent_nf);
+	ft_flip_txn_record_parent_word(ft, txn, meta, parent_nf,
+		child_marked);
 	/*
 	 * The state edge is now a pure {live_state -> live_state} GUARD: it no
 	 * longer carries the offset, so its whole job is the §4.B validate the
