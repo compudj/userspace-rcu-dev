@@ -1747,6 +1747,10 @@ void cds_ft_alloc_reserve_drain(struct cds_ft *ft,
 	}
 }
 
+#ifdef FT_DEBUG_TOMBSTONE_AUDIT
+unsigned long ft_unpub_free_calls;
+#endif
+
 static
 void cds_ft_free_item_rcu(struct rcu_head *rcu_head)
 {
@@ -1902,6 +1906,33 @@ bool ft_alloc_reserve_refund(struct cds_ft *ft, struct cds_ft_metadata *metadata
 void cds_ft_free_item_unpublished(struct cds_ft *ft __attribute__((unused)),
 		struct cds_ft_metadata *metadata)
 {
+#ifdef FT_DEBUG_TOMBSTONE_AUDIT
+	/*
+	 * Counted so a green is a claim about the CODE and not about whether
+	 * this path runs at all: an assert nothing reaches is not coverage.
+	 */
+	uatomic_inc(&ft_unpub_free_calls);
+	/*
+	 * THE OTHER HALF of free_cds_ft_node's freeze-on-free guard, which
+	 * asserts that everything reaching the DEFERRED path carries the
+	 * one-way tombstone, and states the converse in prose: "abandoned fresh
+	 * (never-reader-visible) nodes use free_cds_ft_node_unpublished and do
+	 * not reach here."  That converse was never checked.
+	 *
+	 * The tombstone is set only by a retire, i.e. only on a node that WAS
+	 * published, so a tombstoned item arriving here is one this path's
+	 * contract excludes -- "items that were never published, no reader can
+	 * hold a reference".  Freeing it immediately returns its metadata to the
+	 * range freelist under readers and writers that may still hold it, and
+	 * free_list_next then lands on parent_word, which is what an ancestor
+	 * climb later dereferences.
+	 *
+	 * Asserted rather than tolerated because the immediate path is chosen by
+	 * the CALLER: nothing else can catch a site that picks it for a node it
+	 * has already published.
+	 */
+	assert(!ft_meta_tombstone(metadata));
+#endif
 #ifndef FT_IMMEDIATE_FREE
 	/*
 	 * An attempt that drew this item from a reserve gets it back, so a retry

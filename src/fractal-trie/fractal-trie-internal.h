@@ -3360,4 +3360,8 @@ struct cds_ft_inode {
 		__attribute__((__aligned__(sizeof(struct cds_ft_inode_flag *))));
 };
 
+#ifdef FT_DEBUG_TOMBSTONE_AUDIT
+extern unsigned long ft_unpub_free_calls;
+#endif
+
 #endif /* _URCU_FT_INTERNAL_H */
