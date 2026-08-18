@@ -7369,9 +7369,36 @@ void ft_reparent_record_meta(struct cds_ft *ft, struct ft_flip_txn *txn,
 	} else
 		ft_flip_txn_record_tag_mw(txn, (void **) &meta->state,
 			(void *) live_state, (void *) live_state, FT_STATE_PROXY);
-	if (record_pso)
-		ft_flip_txn_record_tag(txn, (void **) &meta->parent_slot_offset,
-			(void *) old_pso, (void *) new_pso, FT_STATE_PROXY);
+	/*
+	 * THE OFFSET IS THE THIRD WORD OF THE SAME CHILD, and it takes the same
+	 * kind dispatch as the two above it -- @meta->parent_word
+	 * (ft_flip_txn_record_parent_word) and @meta->state.  It is the one word
+	 * of the parentage triple that was left on the unconditional recorder,
+	 * which dispatches on @txn->structural_sw ALONE: in a fold commit that
+	 * parks an UNVALIDATED plain store on a word the op does not own, since
+	 * the DLM set here is {C,(P),(GP)} and C's CHILDREN are never in it.
+	 *
+	 * An SW park cannot fail, so two ops re-homing one unheld child both
+	 * park, neither aborts, and the later SETTLE stores its offset over the
+	 * winner's -- and the settle is a plain store, so it also erases
+	 * whatever the peer left in the word after that.
+	 *
+	 * MW makes the second writer's expected-old mismatch and abort, which is
+	 * what the retry lane absorbs.  Byte-neutral for every non-fold caller:
+	 * with structural_sw false, record_tag IS record_tag_mw.
+	 */
+	if (record_pso) {
+		if (child_marked)
+			ft_flip_txn_record_tag(txn,
+				(void **) &meta->parent_slot_offset,
+				(void *) old_pso, (void *) new_pso,
+				FT_STATE_PROXY);
+		else
+			ft_flip_txn_record_tag_mw(txn,
+				(void **) &meta->parent_slot_offset,
+				(void *) old_pso, (void *) new_pso,
+				FT_STATE_PROXY);
+	}
 }
 
 /*
