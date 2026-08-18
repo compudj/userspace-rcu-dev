@@ -231,6 +231,26 @@ struct urcu_txn_desc {
 					 * reconcile disagreed on old, or a record
 					 * value was a proxy (see urcu_txn_add) */
 	unsigned int slab;		/* block origin: per-CPU slab (1) or posix_memalign (0) */
+	/*
+	 * THE WORDS THAT HAND OWNERSHIP OVER, SETTLED LAST.
+	 *
+	 * A settle is a plain store per parked word, so between the DECIDE and
+	 * the last of those stores an embedder's LOCK word can already read
+	 * "free" while the words that lock protects are still this descriptor's
+	 * proxies.  A peer that takes the lock there is a CORRECT holder --
+	 * nothing it does is wrong -- but the word it writes is one this settle
+	 * is about to store over, and what it published is lost.
+	 *
+	 * Declaring the ownership words' proxy tag makes settle run them in a
+	 * SECOND pass, so the lock is handed over only once every word it
+	 * protects is plain.  0 = no late class (one forward pass): an embedder
+	 * that declares nothing keeps exactly the previous behaviour.
+	 *
+	 * The header grows 48 -> 64 bytes: recs[] is 16-byte aligned (a parked
+	 * slot is (&record | tag), so the tag bits must stay free), which
+	 * urcu_txn_recs_aligned above already asserts.
+	 */
+	uintptr_t late_tag;
 	struct urcu_txn_record recs[];	/* frozen at commit */
 };
 
@@ -484,6 +504,15 @@ unsigned int urcu_txn_install_mw_depth(struct urcu_txn_desc *t,
  * FAILED.  Converts the parked prefix [0..planted) with plain RELEASE stores.
  * Owner-only, never waits; works for both kinds (an SW slot is caller-exclusive,
  * an MW slot still holds OUR proxy).
+ *
+ * OWNERSHIP WORDS LAST (@t->late_tag).  These stores are plain and unordered
+ * against each other, so a word that hands ownership over -- an embedder's lock
+ * -- must not become free while the words it protects are still this
+ * descriptor's proxies: a peer would then take the lock legitimately, write one
+ * of those words, and the store below would put our value back over it.  Both
+ * passes stay inside ONE commit, so nothing about the transaction's atomicity
+ * changes: every record decided together at the linearization point, and a
+ * reader resolving a parked slot never sees this order at all.
  */
 static inline
 void urcu_txn_settle(struct urcu_txn_desc *t, unsigned int planted)
@@ -496,8 +525,38 @@ void urcu_txn_settle(struct urcu_txn_desc *t, unsigned int planted)
 		void *want = (st == URCU_TXN_DESC_SUCCEEDED) ?
 				r->new_ptr : r->old_ptr;
 
+		if (t->late_tag && r->proxy_tag == t->late_tag)
+			continue;		/* second pass, below */
 		uatomic_store(r->slot, want, CMM_RELEASE);
 	}
+	if (t->late_tag) {
+		for (i = 0; i < planted; i++) {
+			struct urcu_txn_record *r = &t->recs[i];
+
+			if (r->proxy_tag != t->late_tag)
+				continue;
+			uatomic_store(r->slot,
+				st == URCU_TXN_DESC_SUCCEEDED ?
+					r->new_ptr : r->old_ptr,
+				CMM_RELEASE);
+		}
+	}
+}
+
+/*
+ * Declare the proxy tag of this descriptor's OWNERSHIP words (see @late_tag).
+ * Call before commit; 0 restores the single forward pass.
+ */
+static inline
+void urcu_txn_desc_set_late_tag(struct urcu_txn_desc *t, uintptr_t tag)
+{
+	/*
+	 * URCU_TXN_ENOMEM is the LAYER ABOVE's sentinel (<urcu/rcu-txn.h>, which
+	 * includes this header, not the other way round), so spell it out rather
+	 * than reach forward for the macro.
+	 */
+	if (t && t != (struct urcu_txn_desc *) -1L)
+		t->late_tag = tag;
 }
 
 /*
@@ -634,6 +693,7 @@ struct urcu_txn_desc *urcu_txn_create(unsigned int cap,
 	t->nr = 0;
 	t->nr_mw = 0;
 	t->poisoned = 0;
+	t->late_tag = 0;	/* recycled slab block: declare nothing by default */
 	return t;
 }
 

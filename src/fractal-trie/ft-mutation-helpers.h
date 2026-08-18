@@ -2172,6 +2172,15 @@ enum urcu_txn_status ft_flip_txn_commit(struct cds_ft *ft,
 				ft->group->flavor->update_call_rcu;
 	enum urcu_txn_status st;
 
+	/*
+	 * THE FT'S OWNERSHIP WORDS ARE ITS STATE WORDS.  A node's lock lives in
+	 * meta->state (FT_STATE_PROXY), and this commit's release of that lock
+	 * must become visible only once every structural word the lock protects
+	 * is plain -- otherwise a peer acquires on the strength of the release
+	 * while our parks are still parked, publishes into a word we hold
+	 * parked, and our own settle stores over what it published.
+	 */
+	urcu_txn_desc_set_late_tag(t->mtxn->desc, FT_STATE_PROXY);
 	if (caa_unlikely(t->acquire_miss)) {
 		/*
 		 * A lock-set member was not acquired, so this attempt writes a
