@@ -12764,6 +12764,95 @@ out:
 }
 
 /*
+ * A BINARY BRANCH POINT AT THE SOURCE JUNCTION -- the shape the atomic rekey's
+ * `nr_child < 3` gate used to refuse, and a regression test for the livelock
+ * that refusal was hiding.
+ *
+ * 'a' has exactly two children {b, c}.  Moving "ab" away leaves it with one, so
+ * the move OWES a chain-compress collapse, which ft_detach_node now folds into
+ * the caller's single decide instead of letting it commit a txn of its own.
+ *
+ * ★ THE SHAPE IS CHOSEN TO ISOLATE THE ARITY.  src and dst sit under DIFFERENT
+ * parents ('a' and 'x'), and neither junction is the root, so none of the
+ * writer's OTHER scope rules -- the root-junction refusal and the
+ * same-junction/aliasing refusal -- can be what answers.  Both 'a' and 'x' are
+ * binary, so the destination side exercises the same arity.
+ *
+ * ☠ WHAT IT CATCHES.  Folded, the graft side's ft_node_recompact release is only
+ * RECORDED -- the junction word keeps its LOCK bit until the one decide -- so
+ * the collapse's ft_dlm_acquire_set meets a mark this very op holds.  The dedupe
+ * finds it only through the lock context's txn registry, the sole witness of a
+ * hold whose release is recorded but not committed; a detach context that does
+ * not name that txn reads the op's own mark as contention and the retry loop
+ * spins forever, SINGLE-THREADED.  So this test HANGS rather than failing when
+ * it regresses.
+ */
+static int test_rekey_binary_branch_point(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	int ret = -1;
+	enum cds_ft_status s;
+
+	if (!cds_ft_merge_enabled()) {
+		diag("test_rekey_binary_branch_point: skipped, merge compiled out "
+			"(-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
+	if (cds_ft_group_create(NULL, &group) < 0)
+		abort();
+	if (cds_ft_create(group, NULL, &ft) < 0)
+		abort();
+	rcu_read_lock();
+
+	cds_ft_insert(ft, (const uint8_t *) "abm", 3, &node_alloc(1)->node);
+	cds_ft_insert(ft, (const uint8_t *) "abn", 3, &node_alloc(2)->node);
+	cds_ft_insert(ft, (const uint8_t *) "acp", 3, &node_alloc(3)->node);
+	cds_ft_insert(ft, (const uint8_t *) "xzr", 3, &node_alloc(4)->node);
+	cds_ft_insert(ft, (const uint8_t *) "xwr", 3, &node_alloc(5)->node);
+
+	s = cds_ft_rekey_merge(ft, (const uint8_t *) "xy", 2,
+			(const uint8_t *) "ab", 2);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "binary-BP rekey refused (%s)\n",
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "binary-BP rekey: verify failed\n");
+		goto out;
+	}
+	/* The moved keys arrived, the source is gone, and 'a' collapsed to "acp". */
+	if (!ft_test_has_key(ft, "xym") || !ft_test_has_key(ft, "xyn")) {
+		fprintf(stderr, "binary-BP rekey: moved key missing\n");
+		goto out;
+	}
+	if (ft_test_has_key(ft, "abm") || ft_test_has_key(ft, "abn")) {
+		fprintf(stderr, "binary-BP rekey: source key survived\n");
+		goto out;
+	}
+	/* The collapse must not take the surviving sibling or the dst side with it. */
+	if (!ft_test_has_key(ft, "acp") || !ft_test_has_key(ft, "xzr") ||
+			!ft_test_has_key(ft, "xwr")) {
+		fprintf(stderr, "binary-BP rekey: bystander key lost\n");
+		goto out;
+	}
+	if (cds_ft_count_keys(ft) != 5) {
+		fprintf(stderr, "binary-BP rekey: count %lu != 5\n",
+			cds_ft_count_keys(ft));
+		goto out;
+	}
+	ret = 0;
+out:
+	rcu_read_unlock();
+	drain_trie(ft);
+	rcu_barrier();
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
  * Bulk ops (merge_at spine, graft_swap DELEGATE) on a NON-IDENTITY key map.
  * Regression for the 2026-06 review's finding 2.10: the merge-point descents
  * consumed the caller's application bytes raw while the source unlink
@@ -32352,6 +32441,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_rekey_varlen_ordered_splice);
 	RUN_TEST(test_rekey_abutting_dst_keeps_list_order);
 	RUN_TEST(test_rekey_compressed_stop);
+	RUN_TEST(test_rekey_binary_branch_point);
 	RUN_TEST(test_rekey_colocated_external);
 	RUN_TEST(test_merge_rekey_same_trie_ordered);
 	RUN_TEST(test_merge_rekey_same_trie_listoff_collision);

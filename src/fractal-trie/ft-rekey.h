@@ -1125,34 +1125,24 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 * run).  ft_meta_nr_child_load resolves the proxy to the committed value.
 	 */
 	/*
-	 * ☠ STILL THREE, AND THE COLLAPSE IS NO LONGER WHAT HOLDS IT THERE.
+	 * A BINARY BP IS COVERED.  An internal node has at least two children (a
+	 * one-child one is path-compressed away), so two is the MINIMUM ARITY and
+	 * refusing it would refuse the ordinary case rather than a corner one.
+	 * Dropping S_top from a binary BP leaves one child, so the move owes a
+	 * chain-compress collapse -- and ft_chain_compress_fused RECORDS that
+	 * collapse into this op's txn rather than committing one of its own (two
+	 * commits cannot be one decide), hands its chain back for reclaim on the
+	 * right side of the commit, and the reservation below is sized for its
+	 * edges.  Two children therefore ride the same single decide as three.
 	 *
-	 * The gate refuses a BINARY branch point -- an internal node has at least
-	 * two children (a one-child one is path-compressed away), so `< 3` is the
-	 * MINIMUM ARITY, not a corner case.  What used to stand behind it was
-	 * ft_detach_node's fold: the collapse BP owes on its way to one child was
-	 * ft_chain_compress_fused, which owned and COMMITTED its own txn, and two
-	 * commits cannot be one decide.  That blocker is gone -- the collapse now
-	 * records into the caller's txn (@record_only, @a7c07a48), hands its chain
-	 * back for the caller to reclaim on the right side of the commit
-	 * (@0fa65bc3), and the reservation below is sized for its edges.
-	 *
-	 * MEASURED with the gate lowered to `< 2`: the shape reaches
-	 * ft_detach_node(record_only) as intended and then LIVELOCKS -- every
-	 * attempt returns -EAGAIN and ft_rekey_graft_simple_locked's retry loop
-	 * spins forever, SINGLE-THREADED, so it is a self-refusal and not
-	 * contention.  Stack sampling lands in a different stage of the attempt
-	 * each time (ft_graft_build's descent, the detach's surviving-child scan,
-	 * ft_ord_cell_find_rel), which is the loop, not one stuck site.
-	 * Reproducer: insert "abm","abn","acp","xzr","xwr" then rekey "ab" -> "xy"
-	 * ('a' is binary, and src/dst sit under DIFFERENT parents so the
-	 * junction-aliasing rule below is not what answers).
-	 *
-	 * A livelock is strictly worse than a refusal -- NOT_SUPPORTED lets the
-	 * caller do something else, an infinite retry loop does not -- so the gate
-	 * holds at three until the -EAGAIN source is named.
+	 * THE FLOOR STAYS AT TWO, and not as a leftover.  A one-child BP is the
+	 * shape where the detach's upward walk ELEVATES -- it stops only at a
+	 * boundary, and nr_child > 1 is what makes one -- stranding an orphan chain
+	 * whose deferred free the record_only fold has no committed unlink to stand
+	 * on, and tripping the simple-shape assert on the non-fused branch.  It is
+	 * also not a shape a canonical trie holds: it is path-compressed away.
 	 */
-	if (ft_meta_nr_child_load(bp_meta) < 3)
+	if (ft_meta_nr_child_load(bp_meta) < 2)
 		return FT_REKEY_UNCOVERED;
 
 	/*
@@ -1876,8 +1866,8 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 			 *
 			 * ☠ RESERVED UNCONDITIONALLY, never off the shape gate's nr_child
 			 * read.  That read is a plan-time snapshot of a word peers commit
-			 * into, so BP can fall to two children between the gate and the
-			 * detach's own count and make the collapse fire under a
+			 * into, so BP can fall to the collapsing arity between the gate and
+			 * the detach's own count and make the collapse fire under a
 			 * reservation sized for its absence.  A reservation is where OOM
 			 * gets answered -- once the detach has cleared BP's slot the op is
 			 * past the point where there is an answer, and the shortfall
@@ -2128,14 +2118,31 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 * rejects compressed nodes at every level it walks), so no SKIP_X dual and no
 	 * @gp member.
 	 */
-	ft_lock_ctx_init(&lctx_src, &d_src, NULL);
 	/*
+	 * ★ THE CONTENT TXN IS PART OF THIS OP'S HELD SET, and naming it is
+	 * MANDATORY for a fold.  @txn's locks[] registry is where an acquire whose
+	 * RELEASE has been RECORDED but not yet COMMITTED still lives, and under
+	 * the fold that is every acquire this op has made -- the one decide has not
+	 * run yet.  ft_flip_txn_record_release_lock drops the hold-trace entry as
+	 * soon as it records the {LOCK|s -> s} edge ("the commit owns this release
+	 * now") while the WORD keeps its LOCK bit until that commit lands, so the
+	 * registry is the ONLY remaining witness that this op holds the word.
+	 *
+	 * ☠ WITHOUT IT THE MOVE LIVELOCKS.  The graft side's ft_node_recompact
+	 * acquires the src junction and records its release into @txn; the collapse
+	 * ft_chain_compress_fused runs inside the same decide and meets that LOCK
+	 * bit still set.  A registry this frame does not name is a hold
+	 * ft_dlm_acquire_set's dedupe cannot see, so ft_dlm_lock reads the op's OWN
+	 * mark as contention and the -EAGAIN retry re-derives the identical plan
+	 * forever -- single-threaded, so no peer can ever clear it.
+	 *
 	 * The op's marks so far -- ft_rekey_cow_stop's @stop fence and one per
 	 * COW'd child -- reach no txn registry until the sweep below, so the
-	 * detach's own acquires can only see them through this frame.  Under a
-	 * coarse spacing S_top's fence lands on BP, which is exactly the node
-	 * this detach recompacts.
+	 * detach's own acquires see THOSE through @extra on this frame instead.
+	 * Under a coarse spacing S_top's fence lands on BP, which is exactly the
+	 * node this detach recompacts.
 	 */
+	ft_lock_ctx_init(&lctx_src, &d_src, txn);
 	lctx_src.held.extra = marks;
 	lctx_src.held.nr_extra = nr_marks;
 	/*
