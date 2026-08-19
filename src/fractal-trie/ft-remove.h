@@ -769,6 +769,26 @@ void ft_chain_compress_register_retire(struct ft_flip_txn *txn,
  * straddles the boundary -- parent_CN and pp lie ABOVE it, the surviving child
  * ONE hop below -- which is exactly the shape §7.1 describes.
  */
+/*
+ * WHAT A FOLDED COLLAPSE OWES ITS CALLER.  Under @record_only the collapse is
+ * RECORDED and not committed, so the chain it retires is still live and linked
+ * when it returns.  The nodes are handed back for the caller to reclaim after
+ * ITS commit lands.
+ */
+struct ft_chain_compress_reclaim {
+	struct cds_ft_inode *boundary;		/* the 1-child boundary node */
+	struct cds_ft_compressed_node *parent_cn;
+	struct cds_ft_compressed_node *child_cn;
+};
+
+/*
+ * @shared_txn / @record_only (FOLD, for the rekey's one-decide writer): record
+ * this collapse into the caller's txn instead of committing a second time.  Two
+ * commits cannot be one decide, and this collapse owning its own txn is exactly
+ * what confined ft_detach_node's fold to the SIMPLE shape (BP above min_child)
+ * -- which is what the rekey's `nr_child < 3` gate restated.
+ * @reclaim is REQUIRED when @record_only.
+ */
 static
 int ft_chain_compress_fused(struct cds_ft *ft,
 		struct cds_ft_inode_flag *iter_node_flag,
@@ -787,7 +807,10 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		struct ft_held_anchor *trailing_orphan_held,
 		struct cds_ft_node *freeze_leaf,
 		long count_delta,
-		unsigned int count_reserve)
+		unsigned int count_reserve,
+		struct ft_flip_txn *shared_txn,
+		bool record_only,
+		struct ft_chain_compress_reclaim *reclaim)
 {
 	struct cds_ft_compressed_node *parent_cn, *child_cn;
 	struct cds_ft_metadata *parent_cn_meta;
@@ -832,13 +855,22 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 	 * both terminal paths drain the fence registry -- no unwind can leak a
 	 * fence.
 	 */
-	txn = ft_flip_txn_create_bounded(FT_REMOVE_COMMIT_REC_MAX_EDGES + 3
-			+ 1 /* §4.B parent guard */
-			+ 1 /* back-edge (parent, offset) pair: the state-word edge */
-			+ ft_freeze_reserve(ft, (unsigned int) nr_orphans
-				+ (trailing_orphan ? 1 : 0))
-			+ (freeze_leaf ? FT_HLIST_FREEZE_MAX_EDGES : 0)
-			+ count_reserve /* nr_keys walk from publish_parent (R3 fold) */);
+	if (record_only) {
+		/*
+		 * FOLD: the caller's txn, which the caller pre-reserved for this
+		 * collapse's edges too.  NEVER destroyed on a bail below -- the
+		 * caller owns it and may still commit the rest of its plan.
+		 */
+		txn = shared_txn;
+	} else {
+		txn = ft_flip_txn_create_bounded(FT_REMOVE_COMMIT_REC_MAX_EDGES + 3
+				+ 1 /* §4.B parent guard */
+				+ 1 /* back-edge (parent, offset) pair: the state-word edge */
+				+ ft_freeze_reserve(ft, (unsigned int) nr_orphans
+					+ (trailing_orphan ? 1 : 0))
+				+ (freeze_leaf ? FT_HLIST_FREEZE_MAX_EDGES : 0)
+				+ count_reserve /* nr_keys walk from publish_parent (R3 fold) */);
+	}
 	if (!txn)
 		return -ENOMEM;	/* nothing touched: caller aborts */
 	/*
@@ -872,7 +904,8 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		iter_parent = (struct cds_ft_inode_flag *)
 			ft_parent_node(rcu_dereference(iter_meta->parent_word));
 		if (caa_unlikely(ft_node_flip_proxy(iter_parent))) {
-			ft_flip_txn_destroy(txn);
+			if (!record_only)
+				ft_flip_txn_destroy(txn);
 			return -EAGAIN;
 		}
 		parent_cn = ft_node_compressed(iter_parent)
@@ -901,14 +934,16 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		 */
 		if (!ft_lock_ctx_depth_of_parent(ft, ctx, iter_parent, iter_depth,
 					&parent_depth)) {
-			ft_flip_txn_destroy(txn);
+			if (!record_only)
+				ft_flip_txn_destroy(txn);
 			return -EAGAIN;
 		}
 		if (pp_flag && !(parent_cn_meta_l ?
 				ft_lock_ctx_depth_of_parent(ft, ctx, pp_flag,
 					parent_depth, &pp_depth) :
 				ft_lock_ctx_depth_of(ft, ctx, pp_flag, &pp_depth))) {
-			ft_flip_txn_destroy(txn);
+			if (!record_only)
+				ft_flip_txn_destroy(txn);
 			return -EAGAIN;
 		}
 
@@ -935,7 +970,8 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 
 		dret = ft_dlm_acquire_set(ft, ctx, set, nr_set);
 		if (dret) {
-			ft_flip_txn_destroy(txn);
+			if (!record_only)
+				ft_flip_txn_destroy(txn);
 			return dret;	/* -EAGAIN / -ENOMEM; nothing acquired */
 		}
 		parent_cn_meta = parent_cn_meta_l;
@@ -972,7 +1008,8 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 	{
 		if (ft_acquire_member(ft, ctx, iter_node_flag, iter_meta,
 				iter_depth, &iter_held)) {
-			ft_flip_txn_destroy(txn);
+			if (!record_only)
+				ft_flip_txn_destroy(txn);
 			return -EAGAIN;
 		}
 		ft_chain_compress_register_retire(txn, &iter_held, iter_meta);
@@ -984,7 +1021,8 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		iter_parent = (struct cds_ft_inode_flag *)
 			ft_parent_node(rcu_dereference(iter_meta->parent_word));
 		if (caa_unlikely(ft_node_flip_proxy(iter_parent))) {
-			ft_flip_txn_destroy(txn);
+			if (!record_only)
+				ft_flip_txn_destroy(txn);
 			return -EAGAIN;
 		}
 		parent_cn = ft_node_compressed(iter_parent)
@@ -999,7 +1037,8 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 					ft_acquire_member(ft, ctx, iter_parent,
 						parent_cn_meta, parent_depth,
 						&pcn_held)) {
-				ft_flip_txn_destroy(txn);
+				if (!record_only)
+					ft_flip_txn_destroy(txn);
 				return -EAGAIN;
 			}
 			ft_chain_compress_register_retire(txn, &pcn_held,
@@ -1014,7 +1053,8 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 					cds_ft_item_to_metadata(
 						(struct cds_ft_inode *) child_cn),
 					iter_depth + 1, &ccn_held)) {
-				ft_flip_txn_destroy(txn);
+				if (!record_only)
+					ft_flip_txn_destroy(txn);
 				return -EAGAIN;
 			}
 			ft_chain_compress_register_retire(txn, &ccn_held,
@@ -1036,7 +1076,8 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 			ft_node_get_nth(ft, iter_node_flag, NULL,
 				surviving_byte, FT_PF_NONE)
 					!= surviving_child)) {
-		ft_flip_txn_destroy(txn);
+		if (!record_only)
+			ft_flip_txn_destroy(txn);
 		return -EAGAIN;
 	}
 	parent_len = parent_cn ? parent_cn->len : 0;
@@ -1045,12 +1086,14 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 
 	if (merged_len > FT_SKIP_LEN_MAX) {
 		/* Merge does not apply: caller falls back (fences cleared). */
-		ft_flip_txn_destroy(txn);
+		if (!record_only)
+			ft_flip_txn_destroy(txn);
 		return 1;
 	}
 	new_cn = alloc_compressed_node(ft, merged_len, &new_cn_meta);
 	if (!new_cn) {
-		ft_flip_txn_destroy(txn);	/* PREPARE state: no grace period */
+		if (!record_only)
+			ft_flip_txn_destroy(txn);	/* PREPARE state: no grace period */
 		return -ENOMEM;	/* nothing published: caller aborts */
 	}
 
@@ -1076,7 +1119,8 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		 */
 		if (caa_unlikely(ft_node_flip_proxy(child_child))) {
 			free_compressed_node_unpublished(ft, new_cn);
-			ft_flip_txn_destroy(txn);
+			if (!record_only)
+				ft_flip_txn_destroy(txn);
 			return -EAGAIN;
 		}
 		new_cn->child = child_child;
@@ -1130,7 +1174,8 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 			&publish_parent);
 		if (caa_unlikely(publish_parent != iter_parent)) {
 			free_compressed_node_unpublished(ft, new_cn);
-			ft_flip_txn_destroy(txn);
+			if (!record_only)
+				ft_flip_txn_destroy(txn);
 			return -EAGAIN;
 		}
 		new_cn_meta->parent_word = ft_parent_word(ft, iter_parent);
@@ -1151,7 +1196,8 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 	if (!ft_lock_ctx_depth_of_parent(ft, ctx, publish_parent,
 			parent_cn ? parent_depth : iter_depth, &pub_depth)) {
 		free_compressed_node_unpublished(ft, new_cn);
-		ft_flip_txn_destroy(txn);
+		if (!record_only)
+			ft_flip_txn_destroy(txn);
 		return -EAGAIN;
 	}
 
@@ -1255,7 +1301,8 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		if (count_delta)
 			ft_flip_txn_record_count_parent(ft, txn, publish_parent,
 				count_delta);
-		if (ft_remove_commit_rec(ft, &rec, dead_cell, run, txn, false) > 0) {
+		if (ft_remove_commit_rec(ft, &rec, dead_cell, run, txn,
+				record_only) > 0) {
 			/*
 			 * Peer won: NOTHING installed -- the collapsed chain
 			 * (boundary + parent_cn/child_cn) is still live and
@@ -1269,6 +1316,19 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		}
 	}
 
+	if (record_only) {
+		/*
+		 * ☠ NOT FREED HERE.  Under the fold nothing has committed yet, so
+		 * this chain is still LIVE and LINKED: these frees would reclaim
+		 * nodes the caller's pending commit has not unlinked, and a reader
+		 * is entitled to be walking them.  Hand them back instead -- the
+		 * free path is the CALLER's choice (@913cf0ca).
+		 */
+		reclaim->boundary = ft_node_ptr(iter_node_flag);
+		reclaim->parent_cn = parent_cn;
+		reclaim->child_cn = child_cn;
+		return 0;
+	}
 	free_cds_ft_node(ft, ft_node_ptr(iter_node_flag));
 	if (parent_cn)
 		free_compressed_node(ft, parent_cn);
@@ -1306,7 +1366,8 @@ void ft_canonicalize_chain_compress(struct cds_ft *ft,
 		surviving_child, surviving_byte,
 		1 /* already-committed 1-child boundary */, NULL, NULL,
 		NULL, 0, NULL, NULL, 0 /* no orphan chain */,
-		NULL, 0 /* count-neutral canonicalize */, 0);
+		NULL, 0 /* count-neutral canonicalize */, 0,
+				NULL, false, NULL);
 }
 #endif
 
@@ -2639,7 +2700,8 @@ int ft_detach_node(struct cds_ft *ft,
 						orphan_trailing_held,
 						freeze_leaf,
 						count_delta,
-						ft->rank_stats ? detach_depth + 1 : 0);
+						ft->rank_stats ? detach_depth + 1 : 0,
+				NULL, false, NULL);
 
 					if (cret == 0) {
 						ret = 0;
@@ -4165,7 +4227,8 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 					1 /* sole body child; the removed entry is external */,
 					fuse_cell, NULL,
 					NULL, 0, NULL, NULL, 0 /* no orphan chain */, node,
-					-1, ft->rank_stats ? key_len + 1 : 0);
+					-1, ft->rank_stats ? key_len + 1 : 0,
+					NULL, false, NULL);
 
 				if (cret == 0) {
 					/*
@@ -4759,7 +4822,8 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 					1 /* sole body child; the removed entry is external */,
 					ft->ordered_list ? dead_cell : NULL,
 					NULL, NULL, 0, NULL, NULL, 0 /* no orphan chain */, NULL,
-					-1, ft->rank_stats ? key_len + 1 : 0);
+					-1, ft->rank_stats ? key_len + 1 : 0,
+					NULL, false, NULL);
 
 				if (cret == 0) {
 					ft_chain_mark_removed_flip(ft, chain_head);
