@@ -1124,6 +1124,34 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 * shape as PERMANENTLY invalid (measured: 10-12 spurious -EINVAL per stress
 	 * run).  ft_meta_nr_child_load resolves the proxy to the committed value.
 	 */
+	/*
+	 * ☠ STILL THREE, AND THE COLLAPSE IS NO LONGER WHAT HOLDS IT THERE.
+	 *
+	 * The gate refuses a BINARY branch point -- an internal node has at least
+	 * two children (a one-child one is path-compressed away), so `< 3` is the
+	 * MINIMUM ARITY, not a corner case.  What used to stand behind it was
+	 * ft_detach_node's fold: the collapse BP owes on its way to one child was
+	 * ft_chain_compress_fused, which owned and COMMITTED its own txn, and two
+	 * commits cannot be one decide.  That blocker is gone -- the collapse now
+	 * records into the caller's txn (@record_only, @a7c07a48), hands its chain
+	 * back for the caller to reclaim on the right side of the commit
+	 * (@0fa65bc3), and the reservation below is sized for its edges.
+	 *
+	 * MEASURED with the gate lowered to `< 2`: the shape reaches
+	 * ft_detach_node(record_only) as intended and then LIVELOCKS -- every
+	 * attempt returns -EAGAIN and ft_rekey_graft_simple_locked's retry loop
+	 * spins forever, SINGLE-THREADED, so it is a self-refusal and not
+	 * contention.  Stack sampling lands in a different stage of the attempt
+	 * each time (ft_graft_build's descent, the detach's surviving-child scan,
+	 * ft_ord_cell_find_rel), which is the loop, not one stuck site.
+	 * Reproducer: insert "abm","abn","acp","xzr","xwr" then rekey "ab" -> "xy"
+	 * ('a' is binary, and src/dst sit under DIFFERENT parents so the
+	 * junction-aliasing rule below is not what answers).
+	 *
+	 * A livelock is strictly worse than a refusal -- NOT_SUPPORTED lets the
+	 * caller do something else, an infinite retry loop does not -- so the gate
+	 * holds at three until the -EAGAIN source is named.
+	 */
 	if (ft_meta_nr_child_load(bp_meta) < 3)
 		return FT_REKEY_UNCOVERED;
 
@@ -1809,8 +1837,10 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 * the six ordered-cell run boundary edges (src unsplice + dst splice), plus
 	 * -- for the GLUE shape -- the split cluster's own bound: its deferred
 	 * back-edges, forward publish, split retire and free-list tombstones, the
-	 * same floor ft_graft_keylen reserves its standalone txn to.  The count walk
-	 * is depth-bounded and only exists when the trie keeps rank stats.
+	 * same floor ft_graft_keylen reserves its standalone txn to, plus the
+	 * edges a folded chain-compress collapse adds when the detach takes BP
+	 * down to one child.  The count walk is depth-bounded and only exists when
+	 * the trie keeps rank stats.
 	 */
 	if (!ft_flip_txn_reserve_extra(txn, FT_REMOVE_COMMIT_REC_MAX_EDGES + 4 +
 			(ft->ordered_list ? FT_ORD_CELL_RUN_DETACH_MAX_EDGES +
@@ -1831,7 +1861,41 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 #endif
 			(prep == FT_GRAFT_PREP_GLUE ?
 				FT_GLUE_FLOOR_DEFERRED + 7 + 1 + FT_GLUE_FLOOR_FREE +
-				(ft->rank_stats ? (unsigned int) dst_len + 1 : 0) : 0))) {
+				(ft->rank_stats ? (unsigned int) dst_len + 1 : 0) : 0) +
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+			/*
+			 * A FOLDED COLLAPSE.  Dropping S_top can leave BP with a single
+			 * child, and ft_chain_compress_fused then records the whole
+			 * chain-compress -- the merged forward publish, the surviving
+			 * child's (parent, offset) back-edge pair, the §4.B parent guard
+			 * and the collapsed chain's freeze tombstones -- into THIS txn
+			 * instead of committing a second one.  This is its own standalone
+			 * bound MINUS the FT_REMOVE_COMMIT_REC_MAX_EDGES already counted
+			 * above: the two shapes SHARE that budget, because exactly one of
+			 * them runs (@boundary_fused).
+			 *
+			 * ☠ RESERVED UNCONDITIONALLY, never off the shape gate's nr_child
+			 * read.  That read is a plan-time snapshot of a word peers commit
+			 * into, so BP can fall to two children between the gate and the
+			 * detach's own count and make the collapse fire under a
+			 * reservation sized for its absence.  A reservation is where OOM
+			 * gets answered -- once the detach has cleared BP's slot the op is
+			 * past the point where there is an answer, and the shortfall
+			 * surfaces as a sticky -ENOMEM at the commit instead.
+			 *
+			 * The freeze term covers an orphan chain the same race admits: at
+			 * the gate's nr_child >= 2 the climb stops ON BP (a boundary is
+			 * nr_child > 1), so it elevates nothing and there are no orphans
+			 * -- but a peer that empties BP further reopens the elevation, and
+			 * the climb is bounded by the detach depth either way.
+			 */
+			(ft_group_skip_compressed(ft->group) ?
+				3 + 1 /* §4.B parent guard */
+				+ 1 /* back-edge (parent, offset) pair */
+				+ ft_freeze_reserve(ft, (unsigned int) d_src.depth + 1)
+				+ (ft->rank_stats ? (unsigned int) d_src.depth + 1 : 0) : 0) +
+#endif
+			0)) {
 		ret = -ENOMEM;
 		goto bail_build;
 	}
