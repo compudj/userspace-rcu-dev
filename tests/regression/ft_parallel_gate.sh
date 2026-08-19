@@ -143,7 +143,7 @@ ALL_CONFIGS=(
 	# peer can park in it; root-only serialises every op on one word; only
 	# coarsening-to-an-ancestor leaves the slot open.  A defect can live in
 	# the MIDDLE of this axis, so testing its two ends proves nothing about it.
-	"txndbg|-DDEBUG_RCU -DURCU_TXN_DEBUG_READ_POLICY -DFEATURE_FT_ANCHOR_VALIDATE|u ion ioff imw|per-node exponential root-only"
+	"txndbg|-DDEBUG_RCU -DURCU_TXN_DEBUG_READ_POLICY -DURCU_TXN_DEBUG_SETTLE -DFEATURE_FT_ANCHOR_VALIDATE|u ion ioff imw sp|per-node exponential root-only"
 	# The FT's own resolved-pointer assertion (ft_assert_resolved): a parked
 	# flip proxy handed to an accessor that requires a resolved flag.  It is
 	# the embedder-side counterpart to txndbg's engine-side DEBUG_RCU, and it
@@ -250,19 +250,50 @@ setup_tree() {	# $1=name $2=cppflags -- one-time: copy source + configure WITH f
 		return 0	# already configured with these exact flags
 	fi
 	rm -rf "$dir"; mkdir -p "$dir"
-	rsync -a --exclude='.git' --exclude='build-*' --exclude='ft-parallel-gate-*' \
-		"$ROOT/"  "$dir/" 2>/dev/null
-	( cd "$dir" && make distclean >/dev/null 2>&1
-	  CPPFLAGS="$flags" ./configure --quiet >/dev/null 2>&1 )
+	# ☠ A FAILED SETUP MUST NOT REPORT OK, AND MUST NOT BE CACHED.
+	#
+	# Both halves were wrong and they compounded.  rsync's status was
+	# discarded, so a copy that died part way (a full disk: see the excludes
+	# above) left a tree missing arbitrary files; success was then inferred
+	# from config.status EXISTING, which a configure that failed on a missing
+	# Makefile.in still leaves behind; and .gate_flags was written regardless,
+	# so the NEXT run took the early-return above and reused the broken tree.
+	# The visible result was three consecutive runs reporting "setup ok"
+	# followed by an autotools error from a disk-space failure.
+	#
+	# So: check both commands, keep their output for the report, prove the
+	# configure by the file the build actually needs (src/Makefile -- not
+	# config.status), and stamp .gate_flags ONLY on success so a failure
+	# retries from scratch instead of sticking.
+	if ! rsync -aS --exclude='.git' --exclude='build-*' --exclude='ft-parallel-gate-*' \
+			--exclude='ft-hunt-*' --exclude='ft-segv-*' \
+			--exclude='core' --exclude='core.*' --exclude='vgcore.*' --exclude='*.core' \
+			"$ROOT/"  "$dir/" >"$GATE/$1.setup" 2>&1; then
+		echo "  setup $1 FAILED (copy -- see $GATE/$1.setup)"
+		echo "$1: CONFIG ERROR (source copy failed; see $GATE/$1.setup)" >> "$GATE/$1.result"
+		return
+	fi
+	if ! ( cd "$dir" && make distclean >/dev/null 2>&1
+	       CPPFLAGS="$flags" ./configure --quiet >>"$GATE/$1.setup" 2>&1 ); then
+		echo "  setup $1 FAILED (configure -- see $GATE/$1.setup)"
+		echo "$1: CONFIG ERROR (configure failed; see $GATE/$1.setup)" >> "$GATE/$1.result"
+		return
+	fi
+	if [ ! -f "$dir/src/Makefile" ]; then
+		echo "  setup $1 FAILED (no src/Makefile -- see $GATE/$1.setup)"
+		echo "$1: CONFIG ERROR (configure left no src/Makefile; see $GATE/$1.setup)" >> "$GATE/$1.result"
+		return
+	fi
 	printf 'CPPFLAGS=%s\n' "$flags" > "$dir/.gate_flags"
-	[ -f "$dir/config.status" ] && echo "  setup $1 ok" || echo "  setup $1 FAILED"
+	echo "  setup $1 ok"
 }
 
 sync_src() {	# $1=name -- refresh live sources into the (already-configured) tree
 	local dir=$GATE/$1
 	rsync -a --delete "$ROOT/src/fractal-trie/" "$dir/src/fractal-trie/" 2>/dev/null
 	rsync -a "$ROOT/src/"     "$dir/src/"     --exclude='.libs' --exclude='*.o' --exclude='*.lo' 2>/dev/null
-	rsync -a "$ROOT/tests/"   "$dir/tests/"   --exclude='.libs' --exclude='*.o' --exclude='*.lo' 2>/dev/null
+	rsync -aS "$ROOT/tests/"  "$dir/tests/"   --exclude='.libs' --exclude='*.o' --exclude='*.lo' \
+		--exclude='core' --exclude='core.*' --exclude='vgcore.*' --exclude='*.core' 2>/dev/null
 	rsync -a "$ROOT/include/" "$dir/include/" 2>/dev/null
 }
 
@@ -299,6 +330,7 @@ run_one() {	# $1=name $2=tests $3=spacings $4=cppflags -- build lib+tests, run T
 	local dir=$GATE/$name out=$GATE/$name.result
 	local LIB=$dir/src/.libs U=$dir/tests/unit/.libs/test_urcu_ft_unit
 	local I=$dir/tests/regression/.libs/test_urcu_ft_inv
+	local SP=$dir/tests/unit/.libs/test_rcu_txn_settle_premise
 	: > "$out"
 	if ! make -C "$dir/src" -j"$J" >"$GATE/$name.build" 2>&1; then
 		echo "$name: BUILD FAIL (see $GATE/$name.build)" >> "$out"; return
@@ -323,6 +355,17 @@ run_one() {	# $1=name $2=tests $3=spacings $4=cppflags -- build lib+tests, run T
 		echo "$name: TEST BUILD FAIL (ft_inv; see $GATE/$name.build)" >> "$out"
 		return
 	fi
+	# Only the configs that ASK for it (tests list contains sp) build the
+	# settle-premise validator, because it is only meaningful where
+	# -DURCU_TXN_DEBUG_SETTLE is defined -- elsewhere it compiles to a skip.
+	case " $tests " in
+	*" sp "*)
+		if ! make -C "$dir/tests/unit" test_rcu_txn_settle_premise -j"$J" \
+				>>"$GATE/$name.build" 2>&1; then
+			echo "$name: TEST BUILD FAIL (txn settle; see $GATE/$name.build)" >> "$out"
+			return
+		fi ;;
+	esac
 	echo "$name: build ok" >> "$out"
 	local t o ok notok abrt lbl rc plan ran sp rep cdir bin tmo c
 	local env_x
@@ -376,6 +419,7 @@ run_spacing() {	# $1=name $2=tests $3=spacing $4=outfile -- every leg at ONE spa
 	local dir=$GATE/$name
 	local LIB=$dir/src/.libs U=$dir/tests/unit/.libs/test_urcu_ft_unit
 	local I=$dir/tests/regression/.libs/test_urcu_ft_inv
+	local SP=$dir/tests/unit/.libs/test_rcu_txn_settle_premise
 	local cores=$GATE/$name.cores
 	local t o ok notok abrt lbl rc plan ran rep cdir bin tmo c
 	local env_x
@@ -397,6 +441,13 @@ run_spacing() {	# $1=name $2=tests $3=spacing $4=outfile -- every leg at ONE spa
 		# / ioff never exercise them.  They are the long leg -- hence the
 		# larger timeout.
 		imw)  bin=$I; tmo=1800; lbl="ft_inv mw "; env_x=(FT_INV_MW=1) ;;
+		# The settle-premise DETECTOR's own validation.  It belongs to a
+		# config that DEFINES -DURCU_TXN_DEBUG_SETTLE and nowhere else:
+		# without the flag it skips, and a detector whose self-test only
+		# ever skips is indistinguishable from one that is blind.  It
+		# constructs its violation rather than waiting for one, so it is
+		# ~20 ms and carries no spacing dependence.
+		sp)   bin=$SP; tmo=120; lbl="txn settle"; env_x=() ;;
 		esac
 		o=$(run_leg "$cdir" "$tmo" env LD_LIBRARY_PATH="$LIB" \
 			CDS_FT_LOCK_SPACING="$sp" \
