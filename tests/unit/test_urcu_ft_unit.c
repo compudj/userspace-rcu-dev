@@ -69,13 +69,13 @@
 #endif
 
 /*
- * 298 unconditional + 49 fault-injection-only RUN_TEST registrations, on top of
+ * 299 unconditional + 49 fault-injection-only RUN_TEST registrations, on top of
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (347 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (348 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (298 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (299 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -12921,6 +12921,123 @@ static int test_rekey_occupied_dst_behind_compressed(void)
 	}
 	ret = 0;
 out:
+	rcu_read_lock();
+	drain_trie(ft);
+	rcu_read_unlock();
+	rcu_barrier();
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
+ * THE SAME SHAPE, NOW COVERED: an occupied destination reached through a
+ * path-compressed run MOVES, it does not merely fail to hang.
+ *
+ * "az" is occupied by azm/azq and sits behind the compressed run under 'a', so
+ * the @merge_dst probe used to read it as EMPTY and route the move to the
+ * empty-dst splice arm.  The probe now DECODES a run the destination key
+ * consumes whole, which puts the move on the merge arm -- where the publish
+ * parent is the compressed node itself, and the forward publish therefore also
+ * re-encodes the SKIP_X dual in that node's own parent.  Both slots are parked
+ * SW by the one decide, so the op must hold both words: the grandparent's node
+ * lock rides @publish_gp_holder.
+ *
+ * Distinct from test_rekey_occupied_dst_behind_compressed above, which keeps a
+ * full-key COLLISION (qzm -> azm) in the move: with the ordered list on, an
+ * in-trie interleave refuses a collision for its own reason and that shape is
+ * still out.  Here the moved suffixes {x, y} are disjoint from the region's
+ * {m, q}, so the move completes and the ordered walk must show the interleave.
+ */
+static int test_rekey_merge_dst_behind_compressed_moves(void)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	struct cds_ft_iter *iter = NULL;
+	const char *exp[] = { "azm", "azq", "azx", "azy", "qwm" };
+	enum cds_ft_status s;
+	unsigned int i;
+	int ret = -1;
+
+	if (!cds_ft_merge_enabled()) {
+		diag("test_rekey_merge_dst_behind_compressed_moves: skipped, "
+			"merge compiled out (-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
+	if (cds_ft_group_attr_create(&attr) < 0)
+		abort();
+	cds_ft_group_attr_set_key_len(attr, CDS_FT_LEN_VARIABLE);
+	cds_ft_group_attr_set_ordered_list(attr, true);
+	if (cds_ft_group_create(attr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &ft) < 0 ||
+	    cds_ft_iter_create(ft, &iter) < 0)
+		abort();
+	rcu_read_lock();
+	cds_ft_insert(ft, (const uint8_t *) "azm", 3, &node_alloc(1)->node);
+	cds_ft_insert(ft, (const uint8_t *) "azq", 3, &node_alloc(2)->node);
+	cds_ft_insert(ft, (const uint8_t *) "qzx", 3, &node_alloc(3)->node);
+	cds_ft_insert(ft, (const uint8_t *) "qzy", 3, &node_alloc(4)->node);
+	/* 'q' keeps a second child, so the source "qz" is a plain internal. */
+	cds_ft_insert(ft, (const uint8_t *) "qwm", 3, &node_alloc(5)->node);
+	rcu_read_unlock();
+
+	s = cds_ft_rekey_merge(ft, (const uint8_t *) "az", 2,
+			(const uint8_t *) "qz", 2);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "occupied-dst behind compressed: merge: %s\n",
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+	rcu_read_lock();
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "occupied-dst behind compressed: verify failed\n");
+		rcu_read_unlock();
+		goto out;
+	}
+	if (cds_ft_count_keys(ft) != 5) {
+		fprintf(stderr, "occupied-dst behind compressed: count %lu != 5\n",
+			cds_ft_count_keys(ft));
+		rcu_read_unlock();
+		goto out;
+	}
+	/* Structure AND list: the moved keys thread between the region's. */
+	s = cds_ft_lookup_first(ft, iter);
+	for (i = 0; i < 5; i++) {
+		uint8_t rk[64];
+		size_t rl;
+
+		if (s != CDS_FT_STATUS_OK ||
+		    cds_ft_iter_get_key(iter, rk, sizeof rk, &rl) !=
+				CDS_FT_STATUS_OK ||
+		    rl != strlen(exp[i]) || memcmp(rk, exp[i], rl) != 0) {
+			fprintf(stderr,
+				"occupied-dst behind compressed: pos %u mismatch "
+				"(status=%d got '%.*s' want '%s')\n",
+				i, (int) s, (int) rl, (const char *) rk, exp[i]);
+			rcu_read_unlock();
+			goto out;
+		}
+		s = cds_ft_next(ft, iter);
+	}
+	if (s == CDS_FT_STATUS_OK) {
+		fprintf(stderr, "occupied-dst behind compressed: extra keys\n");
+		rcu_read_unlock();
+		goto out;
+	}
+	if (ft_test_has_key(ft, "qzx") || ft_test_has_key(ft, "qzy")) {
+		fprintf(stderr, "occupied-dst behind compressed: src keys "
+			"survived the move\n");
+		rcu_read_unlock();
+		goto out;
+	}
+	rcu_read_unlock();
+	ret = 0;
+out:
+	if (iter)
+		cds_ft_iter_destroy(iter);
 	rcu_read_lock();
 	drain_trie(ft);
 	rcu_read_unlock();
@@ -32533,6 +32650,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_rekey_compressed_stop);
 	RUN_TEST(test_rekey_binary_branch_point);
 	RUN_TEST(test_rekey_occupied_dst_behind_compressed);
+	RUN_TEST(test_rekey_merge_dst_behind_compressed_moves);
 	RUN_TEST(test_rekey_colocated_external);
 	RUN_TEST(test_merge_rekey_same_trie_ordered);
 	RUN_TEST(test_merge_rekey_same_trie_listoff_collision);

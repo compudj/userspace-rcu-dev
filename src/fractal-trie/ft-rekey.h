@@ -1042,25 +1042,20 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 * gate below no longer stands in for it: EQUAL lengths, which ppnf equality
 	 * used to force.  A shorter or longer @dst_key rewrites every moved key's
 	 * LENGTH -- which a fixed-length group cannot express at all, and which a
-	 * variable-length one would need the max_used_key_len fold for.  With the
-	 * lengths equal every moved key keeps its own, so neither applies.
+	 * variable-length one would need a combined-length overflow bound for.
+	 * With the lengths equal every moved key keeps its own, so neither applies.
 	 *
-	 * ☐ RELAXING THIS FOR A VARIABLE-LENGTH GROUP IS NOT THE ONE-LINER IT
-	 * LOOKS LIKE, and max_used_key_len is not what stands in the way: the field
-	 * is a conservative hint no read path consumes, and a node stores neither a
-	 * depth nor a key length, so shifting every moved node's depth rewrites
-	 * nothing stored.  What blocks it is the DESTINATION probe -- @merge_dst
-	 * stops at a compressed / external / skip node rather than decode it, so an
-	 * occupied destination reached through a compressed run reads as empty and
-	 * the move lands on the empty-dst splice arm, which cannot express it.
-	 * Measured: with the length rule relaxed, every unequal-length shape still
-	 * refuses, just at a different gate.  Widening the probe is the real work.
+	 * ☐ RELAXING THIS is no longer blocked by the DESTINATION probe: @merge_dst
+	 * now decodes a compressed run the dst key consumes whole, which is the
+	 * gate every unequal-length shape used to refuse at.  What is left is the
+	 * length rule itself, the group flavour, and the overflow bound.
 	 *
-	 * The group flavour is NOT a scope limit: both are in.  The one thing that
-	 * tied this to fixed-length groups was ft_rekey_splice_pos_brackets, which
-	 * bounded the dst key range by padding @dst_ord with the ordinal extremes;
-	 * it now compares over the common length instead, which needs no padding and
-	 * so places a neighbour correctly whatever the key lengths are.
+	 * The group flavour is NOT a scope limit while the lengths are equal: both
+	 * are in.  The one thing that tied this to fixed-length groups was
+	 * ft_rekey_splice_pos_brackets, which bounded the dst key range by padding
+	 * @dst_ord with the ordinal extremes; it now compares over the common
+	 * length instead, which needs no padding and so places a neighbour
+	 * correctly whatever the key lengths are.
 	 */
 	if (src_len != dst_len)
 		return -EINVAL;
@@ -1249,23 +1244,70 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 *    plain-stores each surviving cell's links because they are not
 	 *    ord-reachable in a cross-trie merge -- which is false here, where the
 	 *    source cells live in the very list being rebuilt (ft_rekey_run_vs_region).
-	 *  - a PLAIN INTERNAL node at the dst point.  Compressed / skip / external
-	 *    merge points bring the KEY_SHORTER wrap and Edge-D shapes, which are
-	 *    ft_merge_spine_copy's job.
+	 *  - a PLAIN INTERNAL node at the dst POINT.  A compressed / skip /
+	 *    external node AT @dst_len brings the KEY_SHORTER wrap and Edge-D
+	 *    shapes, which are ft_merge_spine_copy's job.  A compressed run
+	 *    strictly ABOVE the point is in scope -- see the probe below.
 	 */
 	{
 		struct ft_descent d_probe;
 		const uint8_t *pk = dst_ord;
 
+		/*
+		 * DECODE a compressed run the destination path crosses, instead of
+		 * stopping at it.  A run the dst key consumes WHOLE is a plain
+		 * matter of ROUTING only: the node at @dst_len below it is whatever it
+		 * is, and the arm is chosen by THAT node, not by how the descent
+		 * reached it.  Stopping short instead reported an OCCUPIED "az"
+		 * (reached through the path-compressed run under 'a') as an EMPTY
+		 * destination, which sent an occupied-destination move to the
+		 * empty-dst splice arm -- whose bracket check then found the dst's
+		 * own keys inside its range and refused, forever
+		 * (project_ft_rekey_occupied_dst_behind_compressed_livelock).
+		 *
+		 * Two readings still stop the walk, and both leave @merge_dst false
+		 * exactly as before:
+		 *  - the run DIVERGES from @dst_ord: no key carries the dst prefix,
+		 *    so the destination really is empty and the splice arm is right;
+		 *  - the run OVERSHOOTS @dst_len (the dst key ends INSIDE it): the
+		 *    KEY_SHORTER dst, still outside this cut.  Deliberately NOT
+		 *    hardened into an immediate shape refusal -- a peer split can
+		 *    make this reading transient, so it keeps the BOUNDED path
+		 *    (feedback_structural_single_threaded_can_be_transient_under_peers).
+		 */
 		ft_descent_init(&d_probe, ft);
-		while (d_probe.depth < dst_len && d_probe.nf &&
-				!ft_node_external(d_probe.nf) &&
-				!ft_node_compressed(d_probe.nf)
+		while (d_probe.depth < dst_len && d_probe.nf) {
+			/*
+			 * SKIP, then COMPRESSED, then EXTERNAL -- the kind
+			 * dispatch order the rest of the unit uses, and it is
+			 * not cosmetic: a skip pointer ONTO AN EXTERNAL leaf has
+			 * low tag bits 0, so ft_node_external() matches it on the
+			 * raw value (feedback_skip_before_external_tag_order).
+			 * The old AND-chain was order-blind because every arm
+			 * meant the same thing; a dispatch is not.
+			 */
 #ifdef FEATURE_FT_SKIP_COMPRESSED
-				&& !ft_node_skip_compressed(d_probe.nf)
+			if (ft_node_skip_compressed(d_probe.nf))
+				break;
 #endif
-		      )
+			if (ft_node_external(d_probe.nf))
+				break;
+			if (ft_node_compressed(d_probe.nf)) {
+				struct cds_ft_compressed_node *cn =
+					ft_compressed_node_ptr(d_probe.nf);
+				unsigned int remaining =
+					(unsigned int) (dst_len - d_probe.depth);
+
+				if ((unsigned int) cn->len > remaining ||
+						ft_match_compressed_key(pk, cn,
+							(unsigned int) cn->len)
+						!= (unsigned int) cn->len)
+					break;
+				ft_descent_traverse_compressed(ft, &d_probe, cn, &pk);
+				continue;
+			}
 			ft_descent_step(ft, &d_probe, *(pk++));
+		}
 		merge_dst = (d_probe.depth == dst_len && d_probe.nf != NULL);
 		probe_D = merge_dst ? d_probe.nf : NULL;
 		/*
@@ -1603,22 +1645,51 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		 * INCREMENT 3, step 2': UNION S_top into the occupied dst.
 		 *
 		 * Descend the dst ourselves -- ft_graft_build would report POPULATED and
-		 * hand back nothing to publish into.  Plain internal nodes only, the same
-		 * restriction the src descent above makes, so d_dst names {D, publish
-		 * parent, publish slot, grandparent} with no compressed shape in between.
+		 * hand back nothing to publish into.  MIRRORS the @merge_dst probe
+		 * above byte for byte, which is what makes the two agree on a quiet
+		 * tree: a wholly-consumed compressed run is decoded, and every reading
+		 * the probe stops on (divergence, an overshooting run, a skip or
+		 * external node) bails here too.  A disagreement is therefore a PEER
+		 * changing the shape between the probe and this descent; it keeps the
+		 * pre-existing terminal answer rather than a retry, because a probe
+		 * and a descent that disagree on a QUIET tree would be a defect this
+		 * op cannot retry its way out of.
+		 *
+		 * @d_dst then names {D, publish parent, publish slot, grandparent},
+		 * where the publish parent may now be the compressed node itself and
+		 * the publish slot its ->child -- a slot with metadata, a state word
+		 * and a lock level of its own (ft_descent_traverse_compressed enters
+		 * it as one), so every fence and acquire below reads it the same way
+		 * it reads a plain parent.
 		 */
 		const uint8_t *dk = dst_ord;
 
 		ft_descent_init(&d_dst, ft);
 		while (d_dst.depth < dst_len) {
-			if (!d_dst.nf || ft_node_external(d_dst.nf) ||
-					ft_node_compressed(d_dst.nf)
+			/* Kind dispatch, SKIP first: see the probe's note. */
+			if (!d_dst.nf
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 					|| ft_node_skip_compressed(d_dst.nf)
 #endif
-			   ) {
+					|| ft_node_external(d_dst.nf)) {
 				ret = -EINVAL;
 				goto bail_build;
+			}
+			if (ft_node_compressed(d_dst.nf)) {
+				struct cds_ft_compressed_node *cn =
+					ft_compressed_node_ptr(d_dst.nf);
+				unsigned int remaining =
+					(unsigned int) (dst_len - d_dst.depth);
+
+				if ((unsigned int) cn->len > remaining ||
+						ft_match_compressed_key(dk, cn,
+							(unsigned int) cn->len)
+						!= (unsigned int) cn->len) {
+					ret = -EINVAL;
+					goto bail_build;
+				}
+				ft_descent_traverse_compressed(ft, &d_dst, cn, &dk);
+				continue;
 			}
 			ft_descent_step(ft, &d_dst, *(dk++));
 		}
@@ -1702,6 +1773,98 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		glue.publish_parent_holder = pp_meta;
 		glue.publish_parent_snap = pp_snap;
 		glue.publish_parent_shared = pp_shared;
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+		/*
+		 * A COMPRESSED publish parent -- the shape a destination behind a
+		 * path-compressed run presents -- makes the forward publish TWO
+		 * stores, not one: _ft_publish_to_parent also re-encodes the SKIP_X
+		 * pointer that lets a candidate reader BYPASS the compressed node,
+		 * and that pointer sits in a slot of the compressed node's own
+		 * parent.  This txn is structural_sw, so both stores PARK, and a
+		 * park does not arbitrate -- the op must hold the word behind each.
+		 * @publish_parent_holder covers the first; this covers the second,
+		 * the same {GP} third lock-set member ft_node_recompact takes
+		 * whenever its own parent is compressed (§9.3).
+		 */
+		if (ft_node_compressed(d_dst.pnf)) {
+			struct cds_ft_compressed_node *pcn =
+				ft_compressed_node_ptr(d_dst.pnf);
+			struct cds_ft_metadata *pcn_meta =
+				cds_ft_item_to_metadata(
+					(struct cds_ft_inode *) pcn);
+			struct cds_ft_inode_flag **dual =
+				ft_get_parent_slot(pcn_meta, ft);
+
+			/*
+			 * ☠ THE PUBLISH AND THE LOCK MUST NAME ONE SLOT.  The
+			 * publish derives the dual from @pcn's OWN back-pointer;
+			 * the lock below is taken on the parent the DESCENT
+			 * reached.  A disagreement means a peer re-homed @pcn
+			 * since the descent, so the lock would fence a node the
+			 * publish never writes -- and the store it does make would
+			 * be an unguarded park.  Answer the peer, not the shape:
+			 * this is precisely a condition a re-descent clears.
+			 *
+			 * (@pcn's own lock is taken ABOVE, and holding it is what
+			 * makes the reading stable from here to the commit: a peer
+			 * re-home of @pcn parks @pcn's state word, which it cannot
+			 * do behind this fence.)
+			 */
+			if (dual != d_dst.pnfp) {
+				ret = -EAGAIN;
+				goto bail_build;
+			}
+			if (dual && ft_node_skip_compressed(*dual)) {
+				struct ft_lock_ctx gctx;
+				struct ft_held_anchor gph;
+				struct cds_ft_metadata *gp_meta;
+
+				/*
+				 * The dual lives in &ft->root: a slot with no
+				 * node word to park under.  Same refusal the
+				 * junction gate below makes for a root-level
+				 * junction, and for the same reason.
+				 */
+				if (!d_dst.ppnf) {
+					ret = FT_REKEY_UNCOVERED;
+					goto bail_build;
+				}
+				gp_meta = ft_flag_to_metadata(ft, d_dst.ppnf);
+				ft_lock_ctx_init(&gctx, &d_dst, txn);
+				/*
+				 * ☠ CHAIN THE GLUE, or a COARSE spacing
+				 * livelocks the move.  @publish_parent's mark
+				 * is set a few lines up and reaches NO txn
+				 * registry until ft_glue_txn_commit_edges runs
+				 * -- the one decide has not happened yet -- so
+				 * the glue is the only witness that this op
+				 * holds it.  Under a spacing that collapses the
+				 * compressed parent and its own parent onto ONE
+				 * word, an acquire that cannot see that witness
+				 * reads the op's OWN fence as contention, bails
+				 * -EAGAIN, and every retry re-derives the
+				 * identical plan.  Single-threaded, so no peer
+				 * can ever clear it.
+				 */
+				gctx.held.glue = &glue;
+				if (!gp_meta || ft_acquire_member(ft, &gctx,
+						d_dst.ppnf, gp_meta,
+						d_dst.ppdepth, &gph)) {
+					ret = -EAGAIN;
+					goto bail_build;
+				}
+				glue.publish_gp_holder = gph.lock;
+				glue.publish_gp_snap = gph.lock_snap;
+				/*
+				 * Coarsening collapses GP onto the publish
+				 * parent's word routinely (they are adjacent
+				 * levels): the fence is in force either way, but
+				 * only the FIRST acquire owes the release.
+				 */
+				glue.publish_gp_shared = gph.shared;
+			}
+		}
+#endif /* FEATURE_FT_SKIP_COMPRESSED */
 
 		/* Size both glues from the read-only pre-pass, with headroom. */
 		ft_glue_init(&src_glue);
@@ -1875,7 +2038,11 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 *    below -- @glue.publish_parent, the live node whose slot the forward
 	 *    publish replaces.  A COMPRESSED publish_parent is refused: the publish
 	 *    would then also rewrite the SKIP_X dual, a slot in a THIRD node this
-	 *    op does not hold.
+	 *    arm does not hold.  ★ The MERGE arm DOES hold it (@publish_gp_holder,
+	 *    taken with the publish parent above), so a compressed publish parent
+	 *    is in scope there and only there -- which is what routes an occupied
+	 *    destination reached through a path-compressed run to this arm instead
+	 *    of to the empty-dst splice.
 	 *
 	 * Against that pair, the src junction BP (= d_src.pnf) and its parent:
 	 *   - BP's parent IS the graft-held node: REUSE the held lock
@@ -1922,7 +2089,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	}
 	src_parent_held = d_src.ppnf == graft_p;
 	if (!d_src.ppnf || !graft_p || !graft_c ||
-			ft_node_compressed(graft_p) ||
+			(ft_node_compressed(graft_p) && !merge_dst) ||
 			ft_node_skip_compressed(graft_p) ||
 			d_src.pnf == graft_c || d_src.pnf == graft_p ||
 			d_src.ppnf == graft_c) {
@@ -1954,6 +2121,19 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 			(merge_dst ? 3 * (unsigned int) (mcnt.nd + 8) +
 				(unsigned int) (mcnt.nf_dst + mcnt.nf_src + 16) + 8 +
 				(unsigned int) (mcnt.ns + 8) +	/* dup-chain splices */
+				/*
+				 * A COMPRESSED publish parent -- the destination
+				 * behind a path-compressed run -- costs TWO more
+				 * records than a plain one: the SKIP_X dual the
+				 * forward publish re-encodes, and the {LOCK|s -> s}
+				 * release of the grandparent that owns it.  Counted
+				 * unconditionally rather than off the shape, on the
+				 * same reasoning the folded collapse's term states:
+				 * a reservation is where OOM gets ANSWERED, and by
+				 * the time the shortfall shows up the op is past
+				 * the point where there is an answer.
+				 */
+				2 +
 				(ft->rank_stats ? (unsigned int) dst_len + 1 : 0) : 0) +
 #endif
 			(prep == FT_GRAFT_PREP_GLUE ?

@@ -67,7 +67,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS_REKEY_DLM	18	/* inv_rekey_graft_{disjoint,cross_junction,glue_dst,coherent_readers,shared}, inv_rekey_linearizability, inv_rekey_public_{atomic_no_gap,atomic_no_gap_varlen,atomic_no_gap_compressed_top}, inv_rekey_coarse_progress, inv_rekey_{coarse,fine,contended}_mixed_writers, inv_rekey_merge_{occupied,shared}_dst */
+#define NR_TESTS_REKEY_DLM	19	/* inv_rekey_graft_{disjoint,cross_junction,glue_dst,coherent_readers,shared}, inv_rekey_linearizability, inv_rekey_public_{atomic_no_gap,atomic_no_gap_varlen,atomic_no_gap_compressed_top}, inv_rekey_coarse_progress, inv_rekey_{coarse,fine,contended}_mixed_writers, inv_rekey_merge_{occupied,compressed,shared}_dst */
 
 /*
  * Base count = the RUN_TEST invocations in main() outside the DLM #ifdef.
@@ -1641,6 +1641,7 @@ struct rkm_writer_arg {
 	struct cds_ft *ft;
 	uint8_t bp, dp;
 	struct ft_test_node *sib[4];	/* (bp,1)(bp,5)(dp,1)(dp,5) */
+	int nsib;			/* 4, or 2 for the COMPRESSED-dst arm */
 	struct ft_test_node *res[2];	/* residents (dp,3,5)(dp,3,6) */
 	int seeded;			/* movers currently live at (bp,3,*) */
 	unsigned long ops, retries;
@@ -1825,7 +1826,20 @@ out:
 	return NULL;
 }
 
-static int inv_rekey_merge_occupied_dst(void)
+/*
+ * @nsib picks the DESTINATION PATH, and that is the only difference between the
+ * two arms below.
+ *
+ * 4: the destination prefix (dp, RKM_SB) also carries the siblings (dp,1) and
+ *    (dp,5), so the node above it branches and the merge's publish parent is a
+ *    PLAIN internal node.
+ * 2: those two are left out, so RKM_SB is the lone child under @dp and the trie
+ *    PATH-COMPRESSES it.  The destination is then reached THROUGH a compressed
+ *    run, and the merge publishes into that run's ->child -- which also makes
+ *    the forward publish re-encode the SKIP_X dual in the run's own parent.
+ *    Two parked slots in two different nodes, under contention.
+ */
+static int rkm_run(const char *name, int nsib)
 {
 	struct cds_ft_group *group;
 	struct cds_ft *ft;
@@ -1836,8 +1850,9 @@ static int inv_rekey_merge_occupied_dst(void)
 	int i, c, ret = 0;
 
 	if (!getenv("FT_INV_MW")) {
-		fprintf(stderr, "# inv_rekey_merge_occupied_dst: skipped "
-			"(set FT_INV_MW=1 to run the occupied-dst merge oracle)\n");
+		fprintf(stderr, "# %s: skipped "
+			"(set FT_INV_MW=1 to run the occupied-dst merge oracle)\n",
+			name);
 		return 0;
 	}
 	mw_install_fatal_handler();
@@ -1866,8 +1881,9 @@ static int inv_rekey_merge_occupied_dst(void)
 		w[i].ft = ft;
 		w[i].bp = bp;
 		w[i].dp = dp;
+		w[i].nsib = nsib;
 		rcu_read_lock();
-		for (c = 0; c < 4; c++) {
+		for (c = 0; c < nsib; c++) {
 			w[i].sib[c] = node_alloc(sk[c]);
 			if (insert_u64(ft, sk[c], w[i].sib[c]) != CDS_FT_STATUS_OK)
 				abort();
@@ -1880,7 +1896,7 @@ static int inv_rekey_merge_occupied_dst(void)
 				abort();
 		}
 		rcu_read_unlock();
-		live += 6;
+		live += (unsigned long) nsib + 2;
 	}
 
 	test_go = 0;
@@ -1927,7 +1943,7 @@ static int inv_rekey_merge_occupied_dst(void)
 				"(starved / livelock)\n", i);
 			ret = -1;
 		}
-		for (c = 0; c < 4; c++) {
+		for (c = 0; c < w[i].nsib; c++) {
 			struct cds_ft_node *f = NULL;
 			uint64_t sk = c < 2 ? rkm_key(w[i].bp, c == 0 ? 1 : 5, 0) :
 				rkm_key(w[i].dp, c == 2 ? 1 : 5, 0);
@@ -1962,9 +1978,9 @@ static int inv_rekey_merge_occupied_dst(void)
 	}
 	rcu_read_unlock();
 
-	fprintf(stderr, "# inv_rekey_merge_occupied_dst: %d writers, %lu merges, "
-		"%lu retries, %lu live keys\n", RKM_NW, total_ops, total_retries,
-		live);
+	fprintf(stderr, "# %s: %d writers, %lu merges, "
+		"%lu retries, %lu live keys\n", name, RKM_NW, total_ops,
+		total_retries, live);
 
 	free(w);
 	if (drain_and_destroy(ft, group) < 0)
@@ -1972,6 +1988,31 @@ static int inv_rekey_merge_occupied_dst(void)
 	if (leak_check() < 0)
 		ret = -1;
 	return ret;
+}
+
+static int inv_rekey_merge_occupied_dst(void)
+{
+	return rkm_run("inv_rekey_merge_occupied_dst", 4);
+}
+
+/*
+ * THE SAME ORACLE ONTO A DESTINATION BEHIND A PATH-COMPRESSED RUN.
+ *
+ * The one-decide writer used to read such a destination as EMPTY -- its
+ * @merge_dst probe stopped at the compressed node instead of decoding it -- and
+ * route the move to the empty-dst splice arm, which refused.  The probe now
+ * decodes a run the destination key consumes whole, so the move lands HERE, on
+ * the merge arm, and its forward publish becomes TWO parked slots: the run's
+ * ->child, and the SKIP_X dual in the run's own parent.  The op must hold both
+ * words; the second is @publish_gp_holder.
+ *
+ * Its predecessor arm cannot cover this: measured, it reaches a compressed
+ * publish parent ZERO times in a full run, because the (dp,1)/(dp,5) siblings it
+ * seeds are exactly what stops the destination path from compressing.
+ */
+static int inv_rekey_merge_compressed_dst(void)
+{
+	return rkm_run("inv_rekey_merge_compressed_dst", 2);
 }
 
 /*
@@ -19187,6 +19228,7 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_rekey_public_atomic_no_gap_compressed_top);
 	RUN_TEST(inv_rekey_coarse_progress);
 	RUN_TEST(inv_rekey_merge_occupied_dst);
+	RUN_TEST(inv_rekey_merge_compressed_dst);
 	RUN_TEST(inv_rekey_merge_shared_dst);
 	RUN_TEST(inv_rekey_src_mutated);
 	RUN_TEST(inv_sibling_split_compress);
