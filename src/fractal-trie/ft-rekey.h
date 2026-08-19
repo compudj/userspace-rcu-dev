@@ -911,6 +911,13 @@ void ft_rekey_collapse_free_unpublished(struct cds_ft *ft,
 	memset(rc, 0, sizeof(*rc));
 }
 
+/*
+ * Attempt age past which a refusal that COULD be a peer is treated as the shape
+ * it also could be.  See the -1 arm of the bracket check below for why the two
+ * are indistinguishable from one attempt.
+ */
+#define FT_REKEY_UNCOVERED_AFTER	4096
+
 static
 int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		const uint8_t *src_key, size_t src_len,
@@ -1452,13 +1459,31 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 				break;			/* bracketed: proceed */
 			case -1:
 				/*
-				 * The destination is OCCUPIED behind a node the
-				 * @merge_dst probe would not decode, so this arm
-				 * -- which is the EMPTY-dst splice -- cannot
-				 * express the move.  A SHAPE refusal, never
-				 * -EAGAIN: nothing about the trie will change the
-				 * answer, and a retry re-derives it forever.
+				 * A key extends the dst prefix.  ☠ THAT IS NOT
+				 * ALWAYS STRUCTURAL, and assuming it was is what
+				 * this bound exists to correct: single-threaded
+				 * it means the destination is OCCUPIED behind a
+				 * node the @merge_dst probe would not decode, and
+				 * no retry can clear it; under PEERS the very
+				 * same reading is produced transiently by another
+				 * move mid-splice, and retrying is exactly right.
+				 * Measured: inv_rekey_graft_shared (16 writers
+				 * over 2 shared junctions) refuses moves that
+				 * used to succeed if this answers UNCOVERED at
+				 * the first sight of it.
+				 *
+				 * So retry it like the contention it may be, and
+				 * give up only once the attempt age says no peer
+				 * is plausibly still responsible.  The bound is
+				 * what converts the permanent case from an
+				 * unbounded spin into a refusal; its exact value
+				 * only has to sit far above real contention (the
+				 * rekey oracles complete their moves with single
+				 * -digit retries) and far below a livelock (the
+				 * measured one ran 193k attempts).
 				 */
+				if (optxn->retry < FT_REKEY_UNCOVERED_AFTER)
+					return -EAGAIN;
 				return FT_REKEY_UNCOVERED;
 			default:
 				return -EAGAIN;		/* torn: re-derive */
