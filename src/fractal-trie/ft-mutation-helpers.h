@@ -1328,16 +1328,37 @@ void ft_hold_trace_refused(const struct cds_ft_metadata *lock, const char *fn,
 	}
 	/*
 	 * LOCK is set and the ledger does not name the word.  Under a single
-	 * writer that is not contention -- there is no peer -- it is a mark this
-	 * thread LEAKED: taken, dropped from the ledger by a terminal its commit
-	 * did not apply, and never released.  The next attempt then refuses
-	 * against it forever, which is a retry storm rather than a failure.
+	 * writer that is not contention -- there is no peer -- so it is this
+	 * thread's own mark, and there are TWO ways to get here.  Print the
+	 * ledger, because which one it is shows in whether the op still holds
+	 * anything at all.
+	 *
+	 *  - LEAKED: taken, dropped from the ledger by a terminal its commit did
+	 *    not apply, and never released.
+	 *  - STILL HELD, RELEASE ONLY RECORDED: ft_flip_txn_record_release_lock
+	 *    and friends drop the ledger entry the moment they record the
+	 *    {LOCK|s -> s} edge ("the commit owns this release now"), while the
+	 *    word keeps its LOCK bit until that commit lands.  Between those two
+	 *    points the txn's locks[] registry is the ONLY witness of the hold --
+	 *    so a site that re-acquires the word here is really missing the
+	 *    registry from its ft_lock_ctx, not meeting a leak.  A fold makes that
+	 *    window the whole op: nothing commits until the single decide.
+	 *
+	 * Either way the next attempt refuses against it forever, which is a
+	 * retry storm rather than a failure.
 	 */
-	if (ft_hold_trace_report_ok())
+	if (ft_hold_trace_report_ok()) {
 		fprintf(stderr,
-			"FT REFUSED (LOCK, unknown holder): %s:%d word %p state=%lx\n",
+			"FT REFUSED (LOCK, unknown holder): %s:%d word %p state=%lx "
+			"(ledger %u deep)\n",
 			fn, line, (const void *) lock,
-			(unsigned long) CMM_LOAD_SHARED(lock->state));
+			(unsigned long) CMM_LOAD_SHARED(lock->state),
+			ft_hold_trace_n);
+		for (i = ft_hold_trace_n; i-- > 0 && i + 8 >= ft_hold_trace_n;)
+			fprintf(stderr, "  held[%u] %p %s:%d\n", i,
+				(const void *) ft_hold_trace[i].lock,
+				ft_hold_trace[i].fn, ft_hold_trace[i].line);
+	}
 }
 
 /*
