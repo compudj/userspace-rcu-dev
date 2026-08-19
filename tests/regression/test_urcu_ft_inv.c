@@ -4083,6 +4083,22 @@ struct rkp_writer_arg {
 	struct ft_test_node *top[4];	/* the run's leaves, they move */
 	int nr_run;			/* how many of @top exist (see rkp_mode) */
 	int at_dst;			/* 0: run at (bp,9); 1: run at (dp,1) */
+	/*
+	 * SYNTHESISE THE ABSENCE (control arms only).  A RKP_GAP_EXPECTED arm
+	 * exists to prove the band probe can still SEE a key that is missing from
+	 * both positions -- it is the positive control every RKP_GAP_NONE arm's
+	 * zero rests on.  It used to get that absence for free from the STAGED
+	 * rekey writer, which hid the key for a grace period per move; that writer
+	 * was deleted as a guarantee failure, and coarse now reaches the atomic
+	 * one, so nothing in the tree produces an absence on purpose any more.
+	 *
+	 * So the control MANUFACTURES one, in the test rather than in the library:
+	 * remove the run's leaves, then re-insert them at the other junction.  The
+	 * window between the two is a real absence of a real key, which is exactly
+	 * what the probe must catch -- and it needs no staged writer, no library
+	 * knob, and no weakening of the property the no-gap arms assert.
+	 */
+	int synth_gap;
 	unsigned long ops, busy;
 	int failed;
 };
@@ -4147,6 +4163,60 @@ static void *rkp_writer(void *arg)
 		uint8_t dst_key[2] = { d, d_slot };
 		enum cds_ft_status st;
 
+		if (w->synth_gap) {
+			/*
+			 * THE CONTROL'S MOVE: cds_ft_detach the run into a
+			 * temporary trie, then cds_ft_graft it back at the other
+			 * junction.  Between the two the run is reachable from
+			 * NEITHER position -- a real absence of real keys, which
+			 * is exactly what the band probe must catch.
+			 *
+			 * DETACH + GRAFT rather than per-leaf remove + insert,
+			 * because they are BULK ops of the same family as the
+			 * rekey itself: this is the staged rekey's own shape
+			 * (detach into a temporary trie, merge it back), so the
+			 * control reproduces the window the deleted staged writer
+			 * used to provide instead of approximating it with point
+			 * ops the arm does not otherwise exercise.
+			 */
+			struct cds_ft *tmp = NULL;
+
+			st = cds_ft_detach(w->ft, src_key, 2, &tmp);
+			if (st != CDS_FT_STATUS_OK || !tmp) {
+				if (st == CDS_FT_STATUS_BUSY_ERROR ||
+						st == CDS_FT_STATUS_MEMORY_ERROR) {
+					w->busy++;
+					goto synth_next;
+				}
+				fprintf(stderr, "rkp writer bp=%u: control detach "
+					"%02x,%02x: %s\n", w->bp, s, s_slot,
+					cds_ft_status_to_string(st));
+				w->failed = 1;
+				break;
+			}
+			/*
+			 * WIDEN THE WINDOW deliberately.  The probe has to be able
+			 * to land in it; a window closed within a few instructions
+			 * would make this control a timing test of the readers'
+			 * scheduling rather than a test of the probe.
+			 */
+			usleep(50);
+			st = cds_ft_graft(w->ft, dst_key, 2, tmp);
+			if (st != CDS_FT_STATUS_OK) {
+				fprintf(stderr, "rkp writer bp=%u: control graft "
+					"%02x,%02x: %s\n", w->bp, d, d_slot,
+					cds_ft_status_to_string(st));
+				w->failed = 1;
+				break;
+			}
+			cds_ft_destroy(tmp);		/* graft consumed its content */
+			w->at_dst = !w->at_dst;
+			w->ops++;
+synth_next:
+			if ((++iters & 0xff) == 0)
+				rcu_quiescent_state();
+			continue;
+		}
 		/*
 		 * NO read lock: cds_ft_rekey_graft enters the move gate, which
 		 * publishes "expect a move" and then waits a grace period, so a
@@ -4351,6 +4421,12 @@ static int inv_rekey_public_no_gap_run(enum rkp_mode mode, enum rkp_gap gap,
 		 * path-compresses, and the atomic writer needs a plain internal top.
 		 */
 		w[i].nr_run = (mode == RKP_ATOMIC_COMPRESSED_TOP) ? 1 : 4;
+		/*
+		 * Only the CONTROL arms synthesise the absence; every other arm
+		 * must go through the real writer, because their whole assertion
+		 * is that the real writer never produces one.
+		 */
+		w[i].synth_gap = (gap == RKP_GAP_EXPECTED);
 		w[i].sib_lo = (mode == RKP_SPARSE_BP) ? 1 : 0;
 		w[i].sib_hi = (mode == RKP_SPARSE_BP) ? 2 : 3;
 		rcu_read_lock();
