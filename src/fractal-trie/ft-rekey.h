@@ -854,6 +854,44 @@ bool ft_rekey_splice_pos_brackets(struct cds_ft *ft, const uint8_t *dst_ord,
  */
 #define FT_REKEY_UNCOVERED	(-EDOM)
 
+/*
+ * A FOLDED COLLAPSE'S TWO LIFETIMES (struct ft_chain_compress_reclaim).  The
+ * collapse records into this op's txn and commits nothing, so it hands its
+ * nodes back rather than freeing them: at the point it returns, the chain it
+ * retires is still LIVE AND LINKED and a reader is entitled to be walking it.
+ * Which side of the commit each node belongs to is the same split
+ * ft_detach_recompact_out draws between @old_node and @new_flag.
+ *
+ * RETIRED CHAIN -- freed when the commit SUCCEEDS, because that commit is what
+ * unlinks them.  Deferred past readers by the free helpers themselves.
+ */
+static inline
+void ft_rekey_collapse_free_retired(struct cds_ft *ft,
+		struct ft_chain_compress_reclaim *rc)
+{
+	if (rc->boundary)
+		free_cds_ft_node(ft, rc->boundary);
+	if (rc->parent_cn)
+		free_compressed_node(ft, rc->parent_cn);
+	if (rc->child_cn)
+		free_compressed_node(ft, rc->child_cn);
+	memset(rc, 0, sizeof(*rc));
+}
+
+/*
+ * MERGED NODE -- recorded but never published, so it is ours to reclaim when
+ * the commit ABORTS or the op bails before it.  The retired chain is NOT freed
+ * on these paths: nothing unlinked it, so it is still live.
+ */
+static inline
+void ft_rekey_collapse_free_unpublished(struct cds_ft *ft,
+		struct ft_chain_compress_reclaim *rc)
+{
+	if (rc->new_cn)
+		free_compressed_node_unpublished(ft, rc->new_cn);
+	memset(rc, 0, sizeof(*rc));
+}
+
 static
 int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		const uint8_t *src_key, size_t src_len,
@@ -2298,6 +2336,8 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 				if (detach_rc.new_flag)
 					free_cds_ft_node_unpublished(ft,
 						ft_node_ptr(detach_rc.new_flag));
+				ft_rekey_collapse_free_unpublished(ft,
+					&detach_rc.collapse);
 				ft_glue_abort(ft, &glue);
 				if (src_glue_live) {
 					ft_glue_abort(ft, &src_glue);
@@ -2323,6 +2363,8 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 			if (detach_rc.new_flag)
 				free_cds_ft_node_unpublished(ft,
 					ft_node_ptr(detach_rc.new_flag));
+			ft_rekey_collapse_free_unpublished(ft,
+				&detach_rc.collapse);
 			ft_glue_abort(ft, &glue);
 			if (src_glue_live) {	/* merged cluster's src side */
 				ft_glue_abort(ft, &src_glue);
@@ -2403,6 +2445,8 @@ cells_done:
 			if (detach_rc.new_flag)
 				free_cds_ft_node_unpublished(ft,
 					ft_node_ptr(detach_rc.new_flag));
+			ft_rekey_collapse_free_unpublished(ft,
+				&detach_rc.collapse);
 			ft_glue_abort(ft, &glue);
 			if (src_glue_live) {	/* merged cluster's src side */
 				ft_glue_abort(ft, &src_glue);
@@ -2521,6 +2565,8 @@ cells_done:
 			free_cds_ft_node(ft, gst_st.old_recompacted_node);
 		if (detach_rc.old_node)
 			free_cds_ft_node(ft, detach_rc.old_node);	/* old BP copy */
+		/* The folded collapse's retired chain: this commit unlinked it. */
+		ft_rekey_collapse_free_retired(ft, &detach_rc.collapse);
 		/*
 		 * Old S_top after the grace period -- but ONLY on the cow_stop path.
 		 * The merge retires S_top through @src_glue's free list, so
@@ -2545,6 +2591,7 @@ cells_done:
 			free_cds_ft_node_unpublished(ft, ft_node_ptr(gst_st.dest));
 		if (detach_rc.new_flag)
 			free_cds_ft_node_unpublished(ft, ft_node_ptr(detach_rc.new_flag));
+		ft_rekey_collapse_free_unpublished(ft, &detach_rc.collapse);
 		ft_glue_abort(ft, &glue);
 			if (src_glue_live) {	/* merged cluster's src side */
 				ft_glue_abort(ft, &src_glue);
@@ -2581,6 +2628,18 @@ bail_build:
 	pp_meta = NULL;
 	/* NULL on the merge path: no COW */
 	ft_rekey_free_stop_prime(ft, s_top_prime);
+	/*
+	 * REACHED AFTER THE DETACH TOO -- the mark-release reserve loop bails here
+	 * -- so this label owes the same unpublished copies the post-detach @sweep
+	 * bails free: the detach's relocated BP copy and a folded collapse's merged
+	 * node.  Both are zeroed on every path that reaches here BEFORE the detach,
+	 * which is what makes one unconditional unwind correct for both halves; and
+	 * the post-detach paths that free them themselves @goto sweep, skipping
+	 * this label, so neither can be freed twice.
+	 */
+	if (detach_rc.new_flag)
+		free_cds_ft_node_unpublished(ft, ft_node_ptr(detach_rc.new_flag));
+	ft_rekey_collapse_free_unpublished(ft, &detach_rc.collapse);
 	ft_glue_abort(ft, &glue);
 			if (src_glue_live) {	/* merged cluster's src side */
 				ft_glue_abort(ft, &src_glue);
