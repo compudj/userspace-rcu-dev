@@ -2185,10 +2185,10 @@ enum urcu_txn_status ft_flip_txn_commit(struct cds_ft *ft,
 	/*
 	 * THE FT'S OWNERSHIP WORDS ARE ITS STATE WORDS.  A node's lock lives in
 	 * meta->state (FT_STATE_PROXY), and this commit's release of that lock
-	 * must become visible only once every structural word the lock protects
+	 * must become visible only after every structural word the lock protects
 	 * is plain -- otherwise a peer acquires on the strength of the release
-	 * while our parks are still parked, publishes into a word we hold
-	 * parked, and our own settle stores over what it published.
+	 * while our SW parks are still parked, and our own settle overwrites
+	 * what it then publishes.
 	 */
 	urcu_txn_desc_set_late_tag(t->mtxn->desc, FT_STATE_PROXY);
 	if (caa_unlikely(t->acquire_miss)) {
@@ -2309,6 +2309,58 @@ void ft_flip_txn_record_reserved(struct ft_flip_txn *t, void **slot,
 }
 
 /*
+ * THE STATE-WORD PROTOCOL, and the record KIND each of its steps requires.
+ *
+ * A node's state word is written by three different steps, and they do NOT all
+ * take the same kind, because only one of them arbitrates between contending
+ * ops:
+ *
+ *   1. TAKE the lock protecting the node  {clean -> LOCK|s}          -- MW.
+ *      THE ARBITRATION POINT.  Two ops racing for the node are decided here and
+ *      nowhere else: an MW record installs with a CAS-old, so the loser's commit
+ *      aborts.  An SW park cannot fail, so an SW take would hand BOTH ops the
+ *      node.  ft_dlm_lock asserts !structural_sw for exactly this reason.
+ *   2. SET THE TOMBSTONE  {LOCK|s -> TOMBSTONE|s}                    -- SW.
+ *      Legitimate BECAUSE step 1 already won the word.  Re-validating here would
+ *      arbitrate a race that was settled one step earlier, at the cost of an
+ *      abort the caller has no way to retry (the copy is already built).
+ *   3. RELEASE the lock   {LOCK|s -> s}                              -- SW, for
+ *      the same reason.  The lock released need not sit on the node that was
+ *      tombstoned: under a coarse acquire the mark is on a surviving ANCESTOR,
+ *      so the retire's two halves land on two words.
+ *
+ * ⇒ AN SW TOMBSTONE IS NOT A DEFECT, IT IS THE PROTOCOL.  What is a defect is an
+ * SW take, or a step-2/3 record made without the lock step 1 was supposed to
+ * take -- and, on the far side, an op that writes or validates this word having
+ * never performed step 1 at all.  A peer cannot substitute a {live -> live}
+ * validate for the take: the take is what excludes it, and the engine's
+ * "SW xor MW, globally" rule means an MW validate is not arbitrated against the
+ * SW parks of steps 2 and 3 anyway.  Ownership is taken, never observed.
+ *
+ * CONDITIONAL ON THE MODE.  Steps 2 and 3 are SW only where the op runs under
+ * lock_fine with structural_sw set; every other op records all-MW, which is
+ * stricter and always sound.  That is what the @sw_ok argument selects: it says
+ * "SW is PERMITTED for this step", not "SW is used".
+ */
+#define ft_flip_txn_record_state(t, meta, o, n)				\
+	ft_flip_txn_record_state_kind((t), (meta), (o), (n), 1)
+#define ft_flip_txn_record_state_mw(t, meta, o, n)			\
+	ft_flip_txn_record_state_kind((t), (meta), (o), (n), 0)
+
+static inline
+void ft_flip_txn_record_state_kind(struct ft_flip_txn *t,
+		struct cds_ft_metadata *meta, void *old_ptr, void *new_ptr,
+		int sw_ok)
+{
+	if (sw_ok)
+		ft_flip_txn_record_tag(t, (void **) &meta->state,
+			old_ptr, new_ptr, FT_STATE_PROXY);
+	else
+		ft_flip_txn_record_tag_mw(t, (void **) &meta->state,
+			old_ptr, new_ptr, FT_STATE_PROXY);
+}
+
+/*
  * MW LOCK_FINE DLM (Step 1, see
  * doc/design/mw-writer-lock-escalation-model.md): the composable
  * one-commit lock-set acquire.  An op derives its lock-set + read-set by a
@@ -2358,9 +2410,8 @@ int ft_dlm_lock(struct ft_flip_txn *t, struct cds_ft_metadata *meta,
 			FT_STATE_LOCK)))
 		return -EAGAIN;
 	*snap = s;
-	ft_flip_txn_record_tag(t, (void **) &meta->state,
-			(void *) s, (void *) (s | FT_STATE_LOCK),
-			FT_STATE_PROXY);
+	ft_flip_txn_record_state(t, meta,
+			(void *) s, (void *) (s | FT_STATE_LOCK));
 	return 0;
 }
 
@@ -3305,9 +3356,8 @@ uintptr_t ft_flip_txn_record_tombstone(struct ft_flip_txn *t,
 	uintptr_t old = (uintptr_t) urcu_txn_load(t->mtxn,
 			(void **) &meta->state, FT_STATE_PROXY);
 
-	ft_flip_txn_record_tag(t, (void **) &meta->state,
-			(void *) old, (void *) (old | FT_STATE_TOMBSTONE),
-			FT_STATE_PROXY);
+	ft_flip_txn_record_state(t, meta,
+			(void *) old, (void *) (old | FT_STATE_TOMBSTONE));
 	/*
 	 * Return the RYW old so a caller retiring a set of nodes (the glue
 	 * free-list) can tell whether THIS txn performs the LIVE->TOMBSTONE
@@ -3385,9 +3435,8 @@ void ft_flip_txn_record_nr_child_inc(struct ft_flip_txn *t,
 	uintptr_t live = old & ~(uintptr_t) (FT_STATE_TOMBSTONE | FT_STATE_LOCK);
 
 	assert(ft_state_nr_child(live) < FT_STATE_NR_CHILD_VALMASK);
-	ft_flip_txn_record_tag(t, (void **) &meta->state,
-			(void *) live, (void *) (live + FT_STATE_NR_CHILD_ONE),
-			FT_STATE_PROXY);
+	ft_flip_txn_record_state(t, meta,
+			(void *) live, (void *) (live + FT_STATE_NR_CHILD_ONE));
 }
 
 /*
@@ -3407,10 +3456,9 @@ static inline
 void ft_flip_txn_record_tombstone_locked(struct ft_flip_txn *t,
 		struct cds_ft_metadata *meta, uintptr_t state_snapshot)
 {
-	ft_flip_txn_record_tag(t, (void **) &meta->state,
+	ft_flip_txn_record_state_kind(t, meta,
 			(void *) (state_snapshot | FT_STATE_LOCK),
-			(void *) (state_snapshot | FT_STATE_TOMBSTONE),
-			FT_STATE_PROXY);
+			(void *) (state_snapshot | FT_STATE_TOMBSTONE), 1);
 }
 
 /*
@@ -3461,10 +3509,9 @@ void ft_flip_txn_record_release_lock(struct ft_flip_txn *t,
 {
 	/* The commit owns this release now; the op no longer owes one. */
 	ft_hold_trace_drop(meta);
-	ft_flip_txn_record_tag(t, (void **) &meta->state,
+	ft_flip_txn_record_state(t, meta,
 			(void *) (state_snapshot | FT_STATE_LOCK),
-			(void *) state_snapshot,
-			FT_STATE_PROXY);
+			(void *) state_snapshot);
 }
 
 /*
@@ -3535,10 +3582,9 @@ void ft_flip_txn_record_anchor_release_held(struct ft_flip_txn *t,
 		return;			/* the op retires the anchor itself */
 	if (!(pending & FT_STATE_LOCK))
 		return;			/* a node terminal already settled it */
-	ft_flip_txn_record_tag(t, (void **) &lock->state,
+	ft_flip_txn_record_state(t, lock,
 			(void *) pending,
-			(void *) (pending & ~FT_STATE_LOCK),
-			FT_STATE_PROXY);
+			(void *) (pending & ~FT_STATE_LOCK));
 }
 
 /*
@@ -3663,11 +3709,10 @@ void ft_flip_txn_record_retire_anchored(struct ft_flip_txn *t,
 			uintptr_t pending = (uintptr_t) urcu_txn_load(t->mtxn,
 					(void **) &node->state, FT_STATE_PROXY);
 
-			ft_flip_txn_record_tag(t, (void **) &node->state,
+			ft_flip_txn_record_state(t, node,
 				(void *) pending,
 				(void *) ((pending & ~(uintptr_t) FT_STATE_LOCK)
-					| FT_STATE_TOMBSTONE),
-				FT_STATE_PROXY);
+					| FT_STATE_TOMBSTONE));
 			return;
 		}
 		ft_flip_txn_record_tombstone_locked(t, node, h->lock_snap);
@@ -3710,18 +3755,16 @@ void ft_flip_txn_record_retire_anchored(struct ft_flip_txn *t,
 		if (caa_unlikely(pending == (h->node_snap | FT_STATE_LOCK) &&
 				ft_lock_ctx_holds(ctx, node, &held_snap,
 					&ratified))) {
-			ft_flip_txn_record_tag(t, (void **) &node->state,
+			ft_flip_txn_record_state(t, node,
 				(void *) pending,
 				(void *) ((pending & ~(uintptr_t) FT_STATE_LOCK)
-					| FT_STATE_TOMBSTONE),
-				FT_STATE_PROXY);
+					| FT_STATE_TOMBSTONE));
 			return;
 		}
 	}
-	ft_flip_txn_record_tag(t, (void **) &node->state,
+	ft_flip_txn_record_state(t, node,
 			(void *) h->node_snap,
-			(void *) (h->node_snap | FT_STATE_TOMBSTONE),
-			FT_STATE_PROXY);
+			(void *) (h->node_snap | FT_STATE_TOMBSTONE));
 }
 
 /*
@@ -7383,11 +7426,11 @@ void ft_reparent_record_meta(struct cds_ft *ft, struct ft_flip_txn *txn,
 		 * skips its release sweep once the commit consumed the marks.
 		 */
 		ft_hold_trace_drop(meta);
-		ft_flip_txn_record_tag(txn, (void **) &meta->state,
-			(void *) live_state, (void *) live_state, FT_STATE_PROXY);
+		ft_flip_txn_record_state(txn, meta,
+			(void *) live_state, (void *) live_state);
 	} else
-		ft_flip_txn_record_tag_mw(txn, (void **) &meta->state,
-			(void *) live_state, (void *) live_state, FT_STATE_PROXY);
+		ft_flip_txn_record_state_mw(txn, meta,
+			(void *) live_state, (void *) live_state);
 	/*
 	 * THE OFFSET IS THE THIRD WORD OF THE SAME CHILD, and it takes the same
 	 * kind dispatch as the two above it -- @meta->parent_word

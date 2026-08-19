@@ -109,13 +109,35 @@ for: a lock that can UNLOCK.** Today `FT_STATE_LOCK`'s only commit-OK terminal i
 `→ TOMBSTONE`, because the only thing that ever takes it is a copier that retires the
 node. The moment a lock-set contains a member that is *edited but survives* —
 recompact's parent `P` (§9.3) — the lock needs a second terminal. So the lock has
-exactly two, both recorded as an MCAS edge on the state word whose expected old is the
-mark's clean snapshot:
+exactly two, both recorded on the state word with the mark's clean snapshot as their
+expected old:
 
-| terminal | transition | who |
-|---|---|---|
-| **retire** | `{LOCK\|s → TOMBSTONE\|s}` | the node is copied away and dies (`C`) |
-| **release** | `{LOCK\|s → s}` | the node is edited/protected and lives (`P`, `GP`) |
+| step | transition | kind | who |
+|---|---|---|---|
+| **take** | `{clean → LOCK\|s}` | **MW** | the acquire (`ft_dlm_lock`) |
+| **retire** | `{LOCK\|s → TOMBSTONE\|s}` | SW | the node is copied away and dies (`C`) |
+| **release** | `{LOCK\|s → s}` | SW | the node is edited/protected and lives (`P`, `GP`) |
+
+**The kind column is not decoration — it is the whole exclusion argument.** The *take*
+is the only step that arbitrates: an MW record installs with a CAS-old, so of two ops
+racing for the node the loser aborts. An SW park cannot fail, so an SW take would hand
+both ops the node — `ft_dlm_lock` asserts `!structural_sw` for exactly this reason. The
+two terminals are then SW *because* the take already won the word; re-validating there
+would arbitrate a race settled one step earlier, and charge an abort to a caller whose
+copy is already built.
+
+Two consequences worth stating, because both have been got wrong:
+
+- **An SW tombstone is not a defect.** It is the protocol. The defect shapes are an SW
+  *take*, and a terminal recorded without the lock the take was supposed to have
+  installed.
+- **A peer cannot substitute a `{live → live}` validate on this word for taking the
+  lock.** The engine's rule is `SW xor MW, globally`, so such a validate is not
+  arbitrated against the terminals' SW parks at all — it is recorded, reached, and
+  silently never fires. Ownership here is *taken*, never *observed*.
+
+The SW spelling of the two terminals is conditional on `structural_sw` (`lock_fine`);
+every other op records all-MW, which is stricter and always sound.
 
 Plus the pre-existing non-commit terminal: ABORT / MEMORY_ERROR / a pre-commit bail
 CAS-clear the bit through the txn's `locks[]` registry, leaving the node live — the
