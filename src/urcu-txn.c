@@ -33,6 +33,7 @@
 #define _LGPL_SOURCE
 #endif
 
+#include <stdio.h>
 #include <urcu/rcu-txn-sw.h>
 #include <urcu/rcu-txn-mcas.h>	/* engine layer only (flavor-free) */
 
@@ -62,3 +63,31 @@ void urcu_txn_slab_ctor(void)
 
 /* See urcu_txn_in_fallback(): the invariant this exists to let embedders assert. */
 __thread int urcu_txn_fb_depth;
+
+#ifdef URCU_TXN_DEBUG_SETTLE
+/*
+ * Counters for the settle-premise check (urcu_txn_dbg_parked_check).
+ * Diagnostic only, and defined here for the same reason the other engine
+ * instances are: one definition in liburcu-common rather than one per TU.
+ */
+__thread void *urcu_txn_dbg_foreign_slot[URCU_TXN_DBG_FOREIGN_MAX];
+__thread void *urcu_txn_dbg_foreign_cur[URCU_TXN_DBG_FOREIGN_MAX];
+__thread unsigned int urcu_txn_dbg_foreign_n;
+unsigned long urcu_txn_dbg_settle_checked;
+unsigned long urcu_txn_dbg_settle_foreign;
+unsigned long urcu_txn_dbg_settle_sibling;
+
+/*
+ * The census.  checked is what makes a zero FOREIGN mean something: a zero with
+ * checked=0 says the settle never ran, not that the premise held.
+ */
+__attribute__((destructor))
+static void urcu_txn_dbg_settle_report(void)
+{
+	fprintf(stderr,
+		"# URCU_TXN_SETTLE checked=%lu FOREIGN=%lu same_slot_sibling=%lu\n",
+		uatomic_load(&urcu_txn_dbg_settle_checked, CMM_RELAXED),
+		uatomic_load(&urcu_txn_dbg_settle_foreign, CMM_RELAXED),
+		uatomic_load(&urcu_txn_dbg_settle_sibling, CMM_RELAXED));
+}
+#endif /* URCU_TXN_DEBUG_SETTLE */

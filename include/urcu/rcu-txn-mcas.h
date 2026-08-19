@@ -514,6 +514,86 @@ unsigned int urcu_txn_install_mw_depth(struct urcu_txn_desc *t,
  * changes: every record decided together at the linearization point, and a
  * reader resolving a parked slot never sees this order at all.
  */
+
+#ifdef URCU_TXN_DEBUG_SETTLE
+/*
+ * =====================================================================
+ * DIAGNOSTIC (opt-in: -DURCU_TXN_DEBUG_SETTLE).  NOT part of the engine.
+ * =====================================================================
+ *
+ * CHECK THE PREMISE THE SETTLE IS WRITTEN ON.  urcu_txn_settle converts a
+ * parked slot with a PLAIN release store, which is sound only while nothing
+ * else can write that word between the park and the settle -- "an SW slot is
+ * caller-exclusive, an MW slot still holds OUR proxy".  Both halves are
+ * EMBEDDER obligations (the lock-set for SW, the MW protocol for MW) and
+ * neither is checked, so a violation is invisible: the settle silently
+ * OVERWRITES the foreign value, re-publishing whatever this descriptor wrote
+ * into a slot its owner has since replaced.
+ *
+ * A parked slot holds exactly urcu_txn_tag(r, r->proxy_tag) whichever kind
+ * parked it, so the check is one load and one compare per record.
+ *
+ * Validated by tests/unit/test_rcu_txn_settle_premise.c, which CONSTRUCTS the
+ * violation rather than waiting for one -- see the note there on why the
+ * obvious validation (re-inject a historical defect into a contended arm) no
+ * longer reproduces on this tree.
+ */
+#define URCU_TXN_DBG_FOREIGN_MAX	8
+extern __thread void *urcu_txn_dbg_foreign_slot[URCU_TXN_DBG_FOREIGN_MAX];
+extern __thread void *urcu_txn_dbg_foreign_cur[URCU_TXN_DBG_FOREIGN_MAX];
+extern __thread unsigned int urcu_txn_dbg_foreign_n;
+extern unsigned long urcu_txn_dbg_settle_checked;
+extern unsigned long urcu_txn_dbg_settle_foreign;
+extern unsigned long urcu_txn_dbg_settle_sibling;
+
+static inline
+void urcu_txn_dbg_parked_check(const struct urcu_txn_desc *t,
+		struct urcu_txn_record *r, unsigned int i)
+{
+	void *parked = urcu_txn_tag(r, r->proxy_tag);
+	void *cur = uatomic_load(r->slot, CMM_ACQUIRE);
+	unsigned int j, sib = (unsigned int) -1;
+
+	uatomic_inc(&urcu_txn_dbg_settle_checked);
+	if (caa_likely(cur == parked))
+		return;
+	/*
+	 * RULE OUT THE DESCRIPTOR ITSELF BEFORE ACCUSING A PEER.  Two records on
+	 * ONE slot park over each other and settle in index order, so the earlier
+	 * one's settled value is what a later one finds -- a violation of this
+	 * premise that is entirely THIS descriptor's doing, and a different defect
+	 * (the engine's distinct-slot invariant) from a peer writing a word we
+	 * hold parked.  Scanned only on a FAILED check, so the O(nr) cost is paid
+	 * once per violation and never per settle.
+	 */
+	for (j = 0; j < t->nr; j++) {
+		if (j != i && t->recs[j].slot == r->slot) {
+			sib = j;
+			break;
+		}
+	}
+	if (sib != (unsigned int) -1) {
+		uatomic_inc(&urcu_txn_dbg_settle_sibling);
+		return;
+	}
+	uatomic_inc(&urcu_txn_dbg_settle_foreign);
+	/*
+	 * Hand the violating SLOTS back to the embedder: the engine knows the
+	 * word and the kind but not WHO declared the record SW, and that call
+	 * site is the whole answer, since an SW record is a promise of exclusion
+	 * this word did not keep.  Drained by the commit's caller in the same
+	 * thread, while its per-slot recording sites are still around.
+	 */
+	if (urcu_txn_dbg_foreign_n < URCU_TXN_DBG_FOREIGN_MAX) {
+		urcu_txn_dbg_foreign_cur[urcu_txn_dbg_foreign_n] = cur;
+		urcu_txn_dbg_foreign_slot[urcu_txn_dbg_foreign_n++] =
+			(void *) r->slot;
+	}
+}
+#else
+#define urcu_txn_dbg_parked_check(t, r, i)	do { } while (0)
+#endif /* URCU_TXN_DEBUG_SETTLE */
+
 static inline
 void urcu_txn_settle(struct urcu_txn_desc *t, unsigned int planted)
 {
@@ -527,6 +607,7 @@ void urcu_txn_settle(struct urcu_txn_desc *t, unsigned int planted)
 
 		if (t->late_tag && r->proxy_tag == t->late_tag)
 			continue;		/* second pass, below */
+		urcu_txn_dbg_parked_check(t, r, i);
 		uatomic_store(r->slot, want, CMM_RELEASE);
 	}
 	if (t->late_tag) {
@@ -535,6 +616,7 @@ void urcu_txn_settle(struct urcu_txn_desc *t, unsigned int planted)
 
 			if (r->proxy_tag != t->late_tag)
 				continue;
+			urcu_txn_dbg_parked_check(t, r, i);
 			uatomic_store(r->slot,
 				st == URCU_TXN_DESC_SUCCEEDED ?
 					r->new_ptr : r->old_ptr,
