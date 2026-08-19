@@ -266,6 +266,31 @@ struct urcu_txn__rp_entry {
 #endif
 
 /*
+ * THE RESERVATION IS A PROMISE, and nothing else checks it.  urcu_txn_reserve()
+ * exists so that a caller which has already taken a side-effect it cannot undo
+ * -- an unlinked node, a decremented child count, a built-but-unpublished copy
+ * -- can record the rest of its plan without allocating, making its commit
+ * infallible.  ☠ But an UNDER-reservation is silent: urcu_txn__record() below
+ * simply grows the descriptor, so the promise is broken and every test passes.
+ * It surfaces only under memory pressure, and then as a STICKY -ENOMEM raised at
+ * the COMMIT -- arbitrarily far from the store that overflowed, and reported as
+ * the wrong op failing for the wrong reason.
+ *
+ * Build with -DURCU_TXN_DEBUG_RESERVE to make it loud: a record that fills a
+ * descriptor belonging to a handle which declared a reservation aborts, naming
+ * the reserved floor and the record that did not fit.  Add
+ * -DURCU_TXN_DEBUG_RESERVE_SOFT to count the overflows in the handle instead
+ * (urcu_txn_reserve_overflows), for surveying a tree rather than stopping at its
+ * first offender.  A handle that never reserved (@min_alloc == 0) grows by
+ * design and is not checked; a later urcu_txn_reserve() -- the deliberate
+ * grow-the-plan call -- raises the floor and is not an overflow.
+ */
+#ifdef URCU_TXN_DEBUG_RESERVE
+# include <stdio.h>
+# include <stdlib.h>
+#endif
+
+/*
  * Per-contention-domain escalation state, shared by every handle transacting the
  * same structure.  Pass &domain to init(), or NULL to disable the fallback.
  */
@@ -311,6 +336,10 @@ struct urcu_txn {
 					 * was optimistic; sums over the attempts. */
 	unsigned long rp_evicted;	/* table overflowed: a mark was dropped, so
 					 * a zero violation count is NOT a proof. */
+#endif
+#ifdef URCU_TXN_DEBUG_RESERVE
+	unsigned long resv_overflows;	/* records that did not fit a declared
+					 * reservation; sums over the attempts. */
 #endif
 };
 
@@ -424,6 +453,59 @@ unsigned long urcu_txn_read_policy_evicted(const struct urcu_txn *txn)
 
 #endif	/* URCU_TXN_DEBUG_READ_POLICY */
 
+#ifdef URCU_TXN_DEBUG_RESERVE
+
+/*
+ * A record did not fit.  Checked only for a handle that DECLARED a reservation:
+ * @min_alloc is the floor urcu_txn_reserve() last asked for, and the descriptor
+ * is full, so this record is past what the caller promised its commit would
+ * need.  The growth that follows still succeeds here -- the point is to name the
+ * store, because the -ENOMEM it risks is raised at the commit instead.
+ */
+static inline
+void urcu_txn__resv_overflow(struct urcu_txn *txn, void **slot,
+		unsigned int cap)
+{
+	if (!txn->min_alloc)
+		return;			/* unreserved: growth is by design */
+	txn->resv_overflows++;
+#ifndef URCU_TXN_DEBUG_RESERVE_SOFT
+	fprintf(stderr, "urcu-txn: reservation overflow: slot %p is record %u of "
+		"a transaction whose caller reserved %u (descriptor capacity "
+		"%u).  The descriptor grows here, so this passes -- but the "
+		"reservation was the caller's promise that its commit cannot "
+		"fail for want of memory, and under memory pressure this store "
+		"instead parks a STICKY -ENOMEM that surfaces at the commit, far "
+		"from here.  Size the reservation for every edge the plan can "
+		"record, or grow it explicitly with urcu_txn_reserve() before "
+		"the first irreversible side-effect.\n",
+		(void *) slot, cap + 1, txn->min_alloc, cap);
+	abort();
+#else
+	(void) slot;
+	(void) cap;
+#endif
+}
+
+static inline
+unsigned long urcu_txn_reserve_overflows(const struct urcu_txn *txn)
+{
+	return txn->resv_overflows;
+}
+
+#else	/* !URCU_TXN_DEBUG_RESERVE */
+
+# define urcu_txn__resv_overflow(txn, slot, cap)	do { } while (0)
+
+static inline
+unsigned long urcu_txn_reserve_overflows(const struct urcu_txn *txn)
+{
+	(void) txn;
+	return 0;
+}
+
+#endif	/* URCU_TXN_DEBUG_RESERVE */
+
 static inline
 void urcu_txn__bloom_reset(struct urcu_txn *txn)
 {
@@ -462,6 +544,9 @@ void urcu_txn_init_flavor(struct urcu_txn *txn,
 	txn->rp_violations = 0;
 	txn->rp_evicted = 0;
 	urcu_txn__rp_reset(txn);
+#endif
+#ifdef URCU_TXN_DEBUG_RESERVE
+	txn->resv_overflows = 0;
 #endif
 }
 
@@ -860,6 +945,7 @@ int urcu_txn__record(struct urcu_txn *txn, void **slot,
 			recorded = urcu_txn__reconcile(txn, m, slot,
 					old_ptr, new_ptr, upgrade, tag, kind);
 		if (caa_unlikely(!recorded)) {
+			urcu_txn__resv_overflow(txn, slot, m->cap);
 			m = urcu_txn_grow(m);
 			if (caa_unlikely(!m)) {
 				urcu_txn_destroy(txn->desc);
