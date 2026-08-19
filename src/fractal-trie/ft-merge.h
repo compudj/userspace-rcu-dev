@@ -15,8 +15,36 @@
 #error "ft-merge.h is an implementation unit; #include it from fractal-trie.c only"
 #endif
 
-#ifdef FEATURE_FT_MERGE
+/*
+ * Same-trie rekey mode threaded into ft_merge_at_inner.  FT_REKEY_NONE is a
+ * plain CROSS-trie cds_ft_merge_at (src_ft != dst_ft enforced at entry).
+ * FT_REKEY_MERGE / FT_REKEY_GRAFT are the cds_ft_rekey_merge / cds_ft_rekey_graft
+ * entry points (src_ft == dst_ft == the trie): GRAFT additionally REQUIRES an
+ * empty destination (POPULATED_ERROR otherwise, mirroring cds_ft_graft), MERGE
+ * unions into an occupied one (mirroring cds_ft_merge_at).
+ */
+enum ft_rekey_mode {
+	FT_REKEY_NONE = 0,
+	FT_REKEY_MERGE,
+	FT_REKEY_GRAFT,
+};
 
+/*
+ * ★ OUTSIDE THE MERGE GUARD ON PURPOSE.  This is REKEY's vocabulary, not
+ * merge's: with -DNO_FEATURE_FT_MERGE the rekey GRAFT stays available (only the
+ * occupied-destination MERGE mode goes away), so FT_REKEY_NONE / FT_REKEY_GRAFT
+ * must still be declared.  FT_REKEY_MERGE remains declared too -- the arms that
+ * ACT on it are what the feature guard removes, and a mode nobody can reach
+ * costs nothing.
+ */
+
+/*
+ * ★ SHARED INFRASTRUCTURE, OUTSIDE THE MERGE GUARD.  A read-only descent and a
+ * source-subtree unlink: the REKEY paths that survive -DNO_FEATURE_FT_MERGE
+ * (only the occupied-destination merge mode goes away) call both, so they are
+ * not part of the feature.  Neither calls another merge-internal helper, which
+ * is what makes the split at this line exact.
+ */
 /*
  * Read-only locate of a merge point at the end of @key.  Reuses
  * ft_graft_swap_descend (the same three outcomes, publishes nothing) and
@@ -61,6 +89,114 @@ enum ft_graft_swap_case ft_merge_descend(struct cds_ft *ft,
 	}
 	return kase;
 }
+
+/*
+ * Unlink the EXACT subtree at @src_key from @src_ft IN PLACE, preserving the
+ * subtree node so the spine-copy merge can keep referencing it (it is
+ * re-parented into the merged cluster at commit).  This is the non-root-src
+ * analogue of the root-src ft->root swap: it removes the merge source from
+ * @src_ft and prunes the now-empty single-child branch above it.
+ *
+ * The descent + ft_detach_node + chain reclaim mirror ft_detach_keylen's
+ * non-root path, but with @free_detached_subtree = false and WITHOUT wrapping
+ * the subtree in a transient trie (the merge owns it via @gd's referenced
+ * edges; wrapping it would double-own it).  @detached_count is the subtree's
+ * unique-key count (from ft_merge_descend), propagated out of the ancestors.
+ *
+ * The caller invokes this as the LAST fallible commit step: on -ENOMEM
+ * (ft_detach_node recompaction failed) @src_ft is left pristine, so the caller
+ * aborts the still-invisible build with both tries intact -- no rollback.  On
+ * success the caller drains @src_ft and runs the failure-free commit tail.
+ */
+static
+int ft_merge_unlink_src_subtree(struct cds_ft *src_ft,
+		const uint8_t *_src_key, size_t src_key_len,
+		unsigned long detached_count, struct ft_detach_run *run,
+		struct ft_glue *retire_glue)
+{
+	/*
+	 * @src_key is ALREADY ORDINAL (cds_ft_merge_at converts once at its
+	 * entry); a second key-map application here would descend a different
+	 * subtree than the one the spine build copied.
+	 */
+	const uint8_t *key = _src_key, *ik;
+	struct ft_descent d;
+	int ret;
+
+	ik = key;
+
+	/*
+	 * Plain key-guided descent to the merge source's subtree root.  As in
+	 * ft_detach_keylen, no branch-point snapshot is tracked: ft_detach_node
+	 * is bootstrapped from the target's own slot and climbs parent pointers
+	 * to the surviving ancestor.  A KEY_SHORTER source (the key ends inside
+	 * a compressed node) overshoots that node -- @d.nf becomes its child --
+	 * and the climb's free walk reclaims the whole compressed node while
+	 * preserving @d.nf, matching the old explicit chain reclaim.
+	 */
+	ft_descent_init(&d, src_ft);
+	for (; d.depth < src_key_len; ) {
+		uint8_t kv;
+
+		/* Caller already established EXACT, so the path is present. */
+		if (ft_node_compressed(d.nf)) {
+			struct cds_ft_compressed_node *cn =
+				ft_compressed_node_ptr(d.nf);
+
+			ft_descent_traverse_compressed(src_ft, &d, cn, &ik);
+			continue;
+		}
+		kv = *(ik++);
+		ft_descent_step(src_ft, &d, kv);
+	}
+
+
+	/*
+	 * Unlink the branch in place, preserving the move target (@d.nf, the
+	 * subtree root the spine-copy merge keeps referencing).  Bootstrapped
+	 * from the target's own slot, ft_detach_node climbs to the surviving
+	 * ancestor and its free-walk phase 1 reclaims the intermediate single-
+	 * child chain (compressed / skip-target nodes included) while phase 2 --
+	 * which would free the target -- stays gated off for move-style.
+	 */
+	{
+		/*
+		 * @run (EXCISE-ONLY, into==NULL) fuses the structural unlink with the
+		 * run's removal from src's ordered list in ONE flip -- but the fusion
+		 * in ft_detach_node is gated on a non-NULL @pub (the structural-publish
+		 * deferral it records and commits alongside the cell edges), so supply
+		 * one here exactly as ft_detach's move-style unlink does.  @run NULL
+		 * (list off) leaves both NULL = the unfused two-store unlink.
+		 */
+		struct ft_remove_pub pub = { .armed = false };
+		struct ft_remove_pub *pubp = run ? &pub : NULL;
+
+		struct ft_lock_ctx lctx;
+
+		ft_lock_ctx_init(&lctx, &d, NULL);
+		ret = ft_detach_node(src_ft, &lctx, d.nfp, d.pnfp, d.depth,
+				/*free_detached_subtree=*/ false, NULL, pubp, run,
+				retire_glue, NULL,
+				/*
+				 * Fold the whole-subtree count removal onto the unlink:
+				 * -detached_count rides ft_detach_node's own commit (exact
+				 * under concurrent writers; magnitude-agnostic leaf machinery).
+				 */
+				-(long) detached_count, NULL, false, NULL, NULL);
+	}
+	if (ret < 0) {
+		/*
+		 * Recompaction OOM: the folded count edges rode the
+		 * uncommitted txn (an abort applies nothing), so src is
+		 * pristine -- no propagation to undo.
+		 */
+		return -ENOMEM;
+	}
+	return 0;
+}
+
+#ifdef FEATURE_FT_MERGE
+
 
 /*
  * cds_ft_merge_at build-invisible spine-copy.  ft_merge_build recursively
@@ -674,7 +810,8 @@ struct cds_ft_inode_flag *ft_merge_build(struct ft_merge_ctx *c,
 			 * reader can hold a reference", and it PROVES that by
 			 * asserting the node carries no tombstone -- which this
 			 * body does, so the immediate free read as a live-node
-			 * free.  The cluster being build-invisible does not
+			 * free (unit test 60, every FT_DEBUG_TOMBSTONE_AUDIT
+			 * build).  The cluster being build-invisible does not
 			 * change the ownership: the mark says the retire is
 			 * already owned, and the grace period is what that
 			 * ownership costs, once per node GROWTH in a merge build.
@@ -1167,110 +1304,6 @@ unsigned int ft_merge_ord_interleave_collect(struct cds_ft *dst,
 	return n;
 }
 
-/*
- * Unlink the EXACT subtree at @src_key from @src_ft IN PLACE, preserving the
- * subtree node so the spine-copy merge can keep referencing it (it is
- * re-parented into the merged cluster at commit).  This is the non-root-src
- * analogue of the root-src ft->root swap: it removes the merge source from
- * @src_ft and prunes the now-empty single-child branch above it.
- *
- * The descent + ft_detach_node + chain reclaim mirror ft_detach_keylen's
- * non-root path, but with @free_detached_subtree = false and WITHOUT wrapping
- * the subtree in a transient trie (the merge owns it via @gd's referenced
- * edges; wrapping it would double-own it).  @detached_count is the subtree's
- * unique-key count (from ft_merge_descend), propagated out of the ancestors.
- *
- * The caller invokes this as the LAST fallible commit step: on -ENOMEM
- * (ft_detach_node recompaction failed) @src_ft is left pristine, so the caller
- * aborts the still-invisible build with both tries intact -- no rollback.  On
- * success the caller drains @src_ft and runs the failure-free commit tail.
- */
-static
-int ft_merge_unlink_src_subtree(struct cds_ft *src_ft,
-		const uint8_t *_src_key, size_t src_key_len,
-		unsigned long detached_count, struct ft_detach_run *run,
-		struct ft_glue *retire_glue)
-{
-	/*
-	 * @src_key is ALREADY ORDINAL (cds_ft_merge_at converts once at its
-	 * entry); a second key-map application here would descend a different
-	 * subtree than the one the spine build copied.
-	 */
-	const uint8_t *key = _src_key, *ik;
-	struct ft_descent d;
-	int ret;
-
-	ik = key;
-
-	/*
-	 * Plain key-guided descent to the merge source's subtree root.  As in
-	 * ft_detach_keylen, no branch-point snapshot is tracked: ft_detach_node
-	 * is bootstrapped from the target's own slot and climbs parent pointers
-	 * to the surviving ancestor.  A KEY_SHORTER source (the key ends inside
-	 * a compressed node) overshoots that node -- @d.nf becomes its child --
-	 * and the climb's free walk reclaims the whole compressed node while
-	 * preserving @d.nf, matching the old explicit chain reclaim.
-	 */
-	ft_descent_init(&d, src_ft);
-	for (; d.depth < src_key_len; ) {
-		uint8_t kv;
-
-		/* Caller already established EXACT, so the path is present. */
-		if (ft_node_compressed(d.nf)) {
-			struct cds_ft_compressed_node *cn =
-				ft_compressed_node_ptr(d.nf);
-
-			ft_descent_traverse_compressed(src_ft, &d, cn, &ik);
-			continue;
-		}
-		kv = *(ik++);
-		ft_descent_step(src_ft, &d, kv);
-	}
-
-
-	/*
-	 * Unlink the branch in place, preserving the move target (@d.nf, the
-	 * subtree root the spine-copy merge keeps referencing).  Bootstrapped
-	 * from the target's own slot, ft_detach_node climbs to the surviving
-	 * ancestor and its free-walk phase 1 reclaims the intermediate single-
-	 * child chain (compressed / skip-target nodes included) while phase 2 --
-	 * which would free the target -- stays gated off for move-style.
-	 */
-	{
-		/*
-		 * @run (EXCISE-ONLY, into==NULL) fuses the structural unlink with the
-		 * run's removal from src's ordered list in ONE flip -- but the fusion
-		 * in ft_detach_node is gated on a non-NULL @pub (the structural-publish
-		 * deferral it records and commits alongside the cell edges), so supply
-		 * one here exactly as ft_detach's move-style unlink does.  @run NULL
-		 * (list off) leaves both NULL = the unfused two-store unlink.
-		 */
-		struct ft_remove_pub pub = { .armed = false };
-		struct ft_remove_pub *pubp = run ? &pub : NULL;
-
-		struct ft_lock_ctx lctx;
-
-		ft_lock_ctx_init(&lctx, &d, NULL);
-		ret = ft_detach_node(src_ft, &lctx, d.nfp, d.pnfp, d.depth,
-				/*free_detached_subtree=*/ false, NULL, pubp, run,
-				retire_glue, NULL,
-				/*
-				 * Fold the whole-subtree count removal onto the unlink:
-				 * -detached_count rides ft_detach_node's own commit (exact
-				 * under concurrent writers; magnitude-agnostic leaf machinery).
-				 */
-				-(long) detached_count, NULL, false, NULL, NULL);
-	}
-	if (ret < 0) {
-		/*
-		 * Recompaction OOM: the folded count edges rode the
-		 * uncommitted txn (an abort applies nothing), so src is
-		 * pristine -- no propagation to undo.
-		 */
-		return -ENOMEM;
-	}
-	return 0;
-}
 
 /*
  * KEY_SHORTER dst: the merge point sits @off bytes inside a compressed dst
@@ -1856,6 +1889,22 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	 * larger bound (4-edge run-unlink >= 3-edge root swap).  OOM here aborts
 	 * the still-invisible build (both tries pristine).  The lone-edge list-off
 	 * paths (ft_root_edge_flip) need no txn, so reserve only when ms_ord.
+	 *
+	 * ☠ WHY THE SRC SIDE IS TRANSACTED AT ALL, given cds_ft_merge_at and
+	 * cds_ft_graft both REJECT a non-exclusive src (BUSY_ERROR), and an
+	 * exclusive trie has no concurrent reader or writer to be atomic against:
+	 *
+	 * because that rejection is `src_ft != dst_ft` -- SAME-TRIE is excluded
+	 * from it on purpose.  cds_ft_rekey_{graft,merge} reach this worker
+	 * through ft_merge_at_inner(ft, ..., ft, ...) with @rekey set, so on that
+	 * path @src_ft IS @dst_ft: the LIVE, SHARED, concurrently-read trie.  Its
+	 * "src side" is therefore exactly as contended as its dst side, and every
+	 * edge here needs the same atomicity a cross-trie merge's src does not.
+	 *
+	 * So "the src is always exclusive now, drop the src-side txn" is a sound
+	 * reading of the entry gates and a WRONG conclusion about this body.  The
+	 * exclusivity that would justify it belongs to the CROSS-TRIE callers
+	 * only; this code is shared with the one caller that has none.
 	 */
 	struct ft_flip_txn *src_side_txn = NULL;
 
@@ -2127,8 +2176,19 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	/* Reserved but unused: a non-root run whose unlink already fused it. */
 	if (src_side_txn)
 		ft_flip_txn_destroy(src_side_txn);
-	if (!src_ft->exclusive)
-		ft_writer_lock_gp_wait(src_ft);
+	/*
+	 * NO SRC DRAIN.  This worker is now CROSS-TRIE ONLY -- the same-trie
+	 * rekey moved to ft-rekey.h -- and ft_merge_at_inner's gates leave both
+	 * src_ft != dst_ft and src_ft->exclusive holding unconditionally by the
+	 * time it calls here.  An exclusive trie has no concurrent reader, so
+	 * there is nothing to wait out: the grace period that used to stand here
+	 * was serving the same-trie caller, which no longer reaches this body.
+	 *
+	 * Asserted rather than deleted outright so the precondition stays
+	 * VISIBLE: a future caller that reaches this worker with a shared src
+	 * would otherwise silently skip a drain it needs.
+	 */
+	assert(src_ft->exclusive);
 
 	/*
 	 * 2. Re-parent the SRC-origin referenced subtrees directly: the src
@@ -2448,7 +2508,7 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 	unsigned long rm_depth __attribute__((unused)) = 0;
 
 retry_merge:
-	RSPIN_ENTER_X(0, rm_depth, 0, dst_ft->lock_fine && src_ft->exclusive);
+	RSPIN_ENTER_X(0, rm_depth, 0, dst_ft->lock_fine);	/* src always exclusive here */
 	ft_glue_init(&glue);
 	/*
 	 * Fence the compressed divergence node (like cds_ft_graft), so a
@@ -2656,8 +2716,9 @@ retry_merge:
 			run_unlink_txn = NULL;
 		}
 
-		if (!src_ft->exclusive)
-			ft_writer_lock_gp_wait(src_ft);
+		/* No src drain: cross-trie only, src is exclusive.  See
+		 * ft_merge_spine_copy's assert for the full reasoning. */
+		assert(src_ft->exclusive);
 
 		/*
 		 * An EXTERNAL payload's edge byte changes (src_key's last byte ->
@@ -2804,20 +2865,6 @@ retry_merge:
 }
 
 /*
- * Same-trie rekey mode threaded into ft_merge_at_inner.  FT_REKEY_NONE is a
- * plain CROSS-trie cds_ft_merge_at (src_ft != dst_ft enforced at entry).
- * FT_REKEY_MERGE / FT_REKEY_GRAFT are the cds_ft_rekey_merge / cds_ft_rekey_graft
- * entry points (src_ft == dst_ft == the trie): GRAFT additionally REQUIRES an
- * empty destination (POPULATED_ERROR otherwise, mirroring cds_ft_graft), MERGE
- * unions into an occupied one (mirroring cds_ft_merge_at).
- */
-enum ft_rekey_mode {
-	FT_REKEY_NONE = 0,
-	FT_REKEY_MERGE,
-	FT_REKEY_GRAFT,
-};
-
-/*
  * @pre_txn carries a flip-txn the caller reserved before its own last fallible
  * step, so the spine-copy / graft commit below draws an unfailable txn instead
  * of allocating one.  NULL on the public paths (cds_ft_merge_at and the outer
@@ -2832,7 +2879,7 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 		const uint8_t *dst_key, size_t dst_key_len,
 		struct cds_ft *src_ft,
 		const uint8_t *src_key, size_t src_key_len,
-		struct ft_flip_txn **pre_txn, enum ft_rekey_mode rekey)
+		struct ft_flip_txn **pre_txn)
 {
 	struct cds_ft *subtree = NULL;
 	enum cds_ft_status status;
@@ -2883,7 +2930,7 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 	 * this worker with @rekey set.  A same-trie cds_ft_merge_at (@rekey ==
 	 * FT_REKEY_NONE) is rejected; use the dedicated rekey entry points instead.
 	 */
-	if (rekey == FT_REKEY_NONE && src_ft == dst_ft) {
+	if (src_ft == dst_ft) {
 		FT_TP(merge_exit, (int) CDS_FT_STATUS_INVALID_ARGUMENT_ERROR);
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
 	}
@@ -2897,10 +2944,6 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 	 * FEATURE_FT_VERIFY_AT_MUTATION).  Only EAGER tries -- which reconstruct the
 	 * key from structure and never read the stored field -- may rekey.
 	 */
-	if (rekey != FT_REKEY_NONE && dst_ft->speculative_key_offset_active) {
-		FT_TP(merge_exit, (int) CDS_FT_STATUS_INVALID_ARGUMENT_ERROR);
-		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
-	}
 	/*
 	 * The STAGED rekey needs a VARIABLE-length group, and the refusal belongs
 	 * HERE, before anything is read or reserved.  The move is staged as a
@@ -2924,11 +2967,6 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 	 * INVALID_ARGUMENT_ERROR (an "argument rejected, nothing happened" status)
 	 * for a trie that has just lost every moved key to the destroyed transient.
 	 */
-	if (rekey != FT_REKEY_NONE &&
-			dst_ft->group->key_len != CDS_FT_LEN_VARIABLE) {
-		FT_TP(merge_exit, (int) CDS_FT_STATUS_INVALID_ARGUMENT_ERROR);
-		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
-	}
 	/*
 	 * Combined-length overflow validation (mirrors cds_ft_graft): a moved
 	 * key K becomes dst_key || (K - src_key prefix), of length
@@ -2959,7 +2997,13 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 	 * SAME-trie rekey (src == dst) is excluded -- it takes one lock reentrantly.
 	 * Inert outside lock-mode.
 	 */
-	if (src_ft != dst_ft && !src_ft->exclusive) {
+	/*
+	 * THE GATE that makes src exclusivity an invariant for everything below
+	 * (and for ft_merge_spine_copy / ft_merge_graft_subpos_inplace, which
+	 * only this function calls).  The former `src_ft != dst_ft &&` term is
+	 * gone: same-trie is rejected above, so it was constant-true here.
+	 */
+	if (!src_ft->exclusive) {
 		FT_TP(merge_exit, (int) CDS_FT_STATUS_BUSY_ERROR);
 		return CDS_FT_STATUS_BUSY_ERROR;
 	}
@@ -3016,15 +3060,6 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 	 * ordinal space (the key map is a per-position bijection).  Cross-trie
 	 * subtrees are disjoint by construction, so the guard is same-trie only.
 	 */
-	if (rekey != FT_REKEY_NONE) {
-		size_t m = src_key_len < dst_key_len ? src_key_len : dst_key_len;
-
-		if (m == 0 || memcmp(okey_src, okey_dst, m) == 0) {
-			FT_TP(merge_exit,
-				(int) CDS_FT_STATUS_INVALID_ARGUMENT_ERROR);
-			return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
-		}
-	}
 
 	/*
 	 * Locate both merge points read-only (a writer descends its own
@@ -3061,195 +3096,14 @@ static enum cds_ft_status ft_merge_at_inner(struct cds_ft *dst_ft,
 	 * residual cn_s bytes -- ft_detach_keylen overshoots a compressed node, so
 	 * it must be handed a boundary key, not an interior one.
 	 */
-	if (rekey != FT_REKEY_NONE) {
-		struct cds_ft *tmp = NULL;
-		const uint8_t *det_key = src_key, *mrg_key = dst_key;
-		size_t det_len = src_key_len, mrg_len = dst_key_len;
-		uint8_t det_buf[FT_MAX_KEY_LEN], mrg_buf[FT_MAX_KEY_LEN];
-		uint8_t omrg_buf[FT_MAX_KEY_LEN];
-		const uint8_t *omrg = okey_dst;		/* ordinal mrg key */
-		size_t omrg_len = dst_key_len;
-		struct cds_ft_alloc_reserve reserve;
-		struct ft_descent d_mrg;
-		unsigned int off_mrg;
-		unsigned long n = cnt_src, m;		/* moved / dst subtree counts */
-		struct ft_flip_txn *pf_txn = NULL;
-
-		if (off_src > 0) {
-			struct cds_ft_compressed_node *cn_s =
-				ft_compressed_node_ptr(d_src.nf);
-			const struct cds_ft_key_map *km =
-				&dst_ft->group->key_map;
-			unsigned int base = (unsigned int) d_src.depth, j;
-
-			/* det_key = src prefix to cn_s start ++ ALL of cn_s. */
-			memcpy(det_buf, src_key, base);
-			/* mrg_key = dst_key ++ the residual cn_s bytes. */
-			memcpy(mrg_buf, dst_key, dst_key_len);
-			if (km->identity) {
-				memcpy(&det_buf[base], cn_s->key_bytes, cn_s->len);
-				memcpy(&mrg_buf[dst_key_len],
-					&cn_s->key_bytes[off_src],
-					cn_s->len - off_src);
-			} else {
-				for (j = 0; j < cn_s->len; j++)
-					det_buf[base + j] = km->ordinal_to_key[
-						cn_s->key_bytes[j]];
-				for (j = off_src; j < cn_s->len; j++)
-					mrg_buf[dst_key_len + j - off_src] =
-						km->ordinal_to_key[
-						cn_s->key_bytes[j]];
-			}
-			det_key = det_buf;
-			det_len = base + cn_s->len;
-			mrg_key = mrg_buf;
-			mrg_len = dst_key_len + (cn_s->len - off_src);
-			/* Ordinal mrg key: dst prefix ++ residual cn_s (already ordinal). */
-			memcpy(omrg_buf, okey_dst, dst_key_len);
-			memcpy(&omrg_buf[dst_key_len], &cn_s->key_bytes[off_src],
-				cn_s->len - off_src);
-			omrg = omrg_buf;
-			omrg_len = mrg_len;
-		}
-
-		/*
-		 * Read-only count pass at @mrg_key (writer lock held, so the counts
-		 * stay valid for the post-detach merge): @m, the dst subtree key
-		 * count, bounds the structural re-parent flips (nr_dst <= m); @n
-		 * (== cnt_src, the moved subtree) sizes the ordered interleave flips
-		 * (2n+2).  Both are O(1) reads off the subtree-root metadata.  The
-		 * detach preserves @n into @tmp and only reshapes the PATH to
-		 * @mrg_key (never its subtree), so nr_dst <= m still holds after.
-		 * m == 0 means @mrg_key is absent (the merge grafts).
-		 */
-		(void) ft_merge_descend(dst_ft, omrg, omrg_len, &d_mrg, &off_mrg,
-			&m);
-		MRG_SKIPCONF_PROBE(1, d_mrg);
-
-		/*
-		 * cds_ft_rekey_graft: an occupied @dst_key (m > 0 keys at or below
-		 * the merge point) is refused, mirroring cds_ft_graft.  Checked
-		 * BEFORE any reservation or the detach, so the trie is byte-for-byte
-		 * untouched on refusal (no reader-visible mutation, nothing to free).
-		 */
-		if (rekey == FT_REKEY_GRAFT && m > 0) {
-			FT_TP(merge_exit, (int) CDS_FT_STATUS_POPULATED_ERROR);
-			return CDS_FT_STATUS_POPULATED_ERROR;
-		}
-
-		/*
-		 * Pre-reserve the merge's flip-txn HERE -- before the detach, where a
-		 * malloc failure is harmless (nothing has moved).  The post-detach
-		 * merge then has no fallible allocation left (every node draws from
-		 * @reserve, every flip latch from this reserved txn), so it CANNOT fail
-		 * and needs no reader-observable rollback.  @pf_txn feeds the structural
-		 * re-parent or the graft commit; the consume site NULLs the slot it
-		 * takes, so we free it below only if a given shape left it unused.
-		 *
-		 * Size per shape (the rekey recursion lands on spine-copy when @mrg_key
-		 * is occupied, graft when absent):
-		 *   - m > 0 (spine-copy): the structural re-parent (<= m+1); plus <= n
-		 *     duplicate-chain splice tail-appends (one per full-key collision --
-		 *     the src run appended at the dst tail, folded into this same flip by
-		 *     ft_glue_record_splices, so occupied-key rekeys stay allocation-free
-		 *     post-detach); plus, for an ordered merge, the folded interleave's
-		 *     <= 2n+2 cell edges.
-		 *   - m == 0 (graft): the cluster floor FT_GLUE_FLOOR_DEFERRED + 7, the
-		 *     bound ft_graft_keylen reserves its own txn to -- it covers a GLUE
-		 *     diverge's back-edges + forward + run-splice AND the NOSPLIT store's
-		 *     slot proxy + run edges (FT_GRAFT_RUN_FLIP_CAP), whichever the graft
-		 *     point turns out to be, plus +1 for a recompact-relocate retire's
-		 *     tombstone fused into the commit (atomic detach, §4.B), plus
-		 *     + FT_GLUE_FLOOR_FREE for the graft's floor-bounded free-list
-		 *     tombstones -- so the take() path fuses them too.  The detached
-		 *     @tmp is EXCLUSIVE, so ft_graft_keylen's src-swap-fused arm records
-		 *     its src-root retire edge (+1) AND, for a nil-key @tmp (a single
-		 *     detached external), the emptied wrapper's tombstone (+1) into THIS
-		 *     take() txn when the list is off -- so reserve both, matching the
-		 *     ft_graft_keylen create-path reservation (ft-graft.h).  List on
-		 *     retires through ft_graft_keylen's own bounded src_retire_txn, not
-		 *     this one, so no add there.
-		 */
-		{
-			unsigned int pf_cap;
-
-			if (m == 0)
-				pf_cap = FT_GLUE_FLOOR_DEFERRED + 7 + 1 /* +1 §4.B parent guard */ + FT_GLUE_FLOOR_FREE
-					/* +1 fused src-root retire + +1 fused nil-key wrapper
-					 * tombstone (exclusive tmp, list off); mirrors ft-graft.h */
-					+ (dst_ft->group->ordered_list_set ? 0 : 2);
-			else if (dst_ft->group->ordered_list_set)
-				pf_cap = (unsigned int) (m + 1) +
-					(unsigned int) (2 * n + 2) +
-					(unsigned int) n +
-					1 /* §4.B parent guard */;
-			else
-				pf_cap = (unsigned int) (m + 1) +
-					(unsigned int) n +
-					1 /* §4.B parent guard */;
-			/*
-			 * + count walk (BULK fold): the graft's +cnt_src (m == 0) or the
-			 * spine-copy's (merged_keys - cnt_dst) (m != 0) nr_keys ancestor
-			 * edges ride this take() txn, bounded by the merge-point depth --
-			 * over-reserve to the group max so the failure-free post-drain
-			 * commit never grows the pre-reserved txn.  A no-op when rank
-			 * stats are off.
-			 */
-			if (dst_ft->rank_stats)
-				pf_cap += (unsigned int) dst_ft->group->max_key_len + 1;
-			pf_txn = ft_flip_txn_create();
-			if (pf_txn && !ft_flip_txn_reserve(pf_txn, pf_cap)) {
-				ft_flip_txn_destroy(pf_txn);
-				pf_txn = NULL;
-			}
-		}
-		if (!pf_txn) {
-			FT_TP(merge_exit, (int) CDS_FT_STATUS_MEMORY_ERROR);
-			return CDS_FT_STATUS_MEMORY_ERROR;
-		}
-
-		/*
-		 * Generous node reserve, also before the detach, so the merge's node
-		 * allocations cannot fail either.  With both reserves in hand the
-		 * detach is the LAST fallible step (clean on its own failure).
-		 */
-		memset(&reserve, 0, sizeof(reserve));
-		if (ft_bulk_node_reserve_fill(dst_ft, &reserve)) {
-			cds_ft_alloc_reserve_drain(dst_ft, &reserve);
-			ft_flip_txn_destroy(pf_txn);
-			FT_TP(merge_exit, (int) CDS_FT_STATUS_MEMORY_ERROR);
-			return CDS_FT_STATUS_MEMORY_ERROR;
-		}
-		status = ft_detach_keylen(dst_ft, det_key, det_len, &tmp);
-		if (status < 0) {
-			cds_ft_alloc_reserve_drain(dst_ft, &reserve);
-			ft_flip_txn_destroy(pf_txn);
-			FT_TP(merge_exit, (int) (status == CDS_FT_STATUS_NOT_FOUND
-				? CDS_FT_STATUS_OK : status));
-			return status == CDS_FT_STATUS_NOT_FOUND
-				? CDS_FT_STATUS_OK : status;	/* NOT_FOUND -> no-op */
-		}
-		cds_ft_alloc_reserve_activate(dst_ft, &reserve);
-		cds_ft_alloc_reserve_activate(tmp, &reserve);
-		/*
-		 * Unfailable placement: every node draws from @reserve and every
-		 * flip latch from @pf_txn, so the merge always commits the move.  No
-		 * failure path can strand @tmp's content back at @det_key -- that
-		 * re-graft was the reader-observable rollback we removed.
-		 */
-		status = ft_merge_at_inner(dst_ft, mrg_key, mrg_len, tmp, NULL, 0,
-			&pf_txn, FT_REKEY_NONE);
-		cds_ft_alloc_reserve_deactivate(dst_ft);
-		cds_ft_alloc_reserve_deactivate(tmp);
-		assert(status == CDS_FT_STATUS_OK);
-		/* Free the flip-txn this merge shape did not consume. */
-		if (pf_txn)
-			ft_flip_txn_destroy(pf_txn);
-		cds_ft_alloc_reserve_drain(dst_ft, &reserve);
-		cds_ft_destroy(tmp);
-		FT_TP(merge_exit, (int) status);
-		return status;
-	}
+	/*
+	 * The STAGED rekey lived here: a detach of @src_key's subtree into a
+	 * transient trie followed by a merge of that trie back in at @dst_key,
+	 * plus the argument checks that only it needed.  It moved to
+	 * ft_rekey_at_inner (ft-rekey.h) with the rest of the same-trie writer,
+	 * so this worker is now CROSS-TRIE ONLY and no longer recursive -- the
+	 * recursive ft_merge_at_inner() call was inside that block.
+	 */
 
 	bool md_rlock = false;
 	bool md_contended;
@@ -3302,7 +3156,7 @@ merge_spine_retry:
 	 * on the fall-through to the detach/graft paths, and before each retry
 	 * above (a retry re-descends, so it must re-pin what it re-reads).
 	 */
-	if (dst_ft->lock_fine && src_ft->exclusive) {
+	if (dst_ft->lock_fine) {		/* src exclusive: gated above */
 		/*
 		 * Open the attempt on the persistent handle FIRST: a retry that
 		 * has aged escalates here, and escalation blocks on the domain's
@@ -3386,8 +3240,7 @@ merge_spine_retry:
 			}
 			md_spin++;
 			MRG_SPIN_PROBE(1);
-			if (src_ft->exclusive)
-				MRG_SPIN_PROBE(4);
+			MRG_SPIN_PROBE(4);	/* src always exclusive here */
 			MRG_SPIN_MAX(md_spin);
 			goto merge_spine_retry;
 		}
@@ -3446,10 +3299,10 @@ merge_spine_retry:
 	if (src_key_len == 0) {
 		/*
 		 * A live (non-exclusive) cross-trie source was already rejected with
-		 * BUSY at merge_at's entry, so this graft sees an exclusive source (or
-		 * a same-trie rekey); ft_graft_keylen runs its fused body directly.
+		 * BUSY at merge_at's entry, so this graft sees an exclusive source;
+		 * ft_graft_keylen runs its fused body directly.
 		 */
-		if (dst_ft->lock_fine && src_ft->exclusive) {
+		if (dst_ft->lock_fine) {		/* src exclusive: gated above */
 			const struct rcu_flavor_struct *flavor =
 				dst_ft->group->flavor;
 
@@ -3747,7 +3600,7 @@ enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
 {
 #ifdef FEATURE_FT_MERGE
 	return ft_merge_at_inner(dst_ft, dst_key, dst_key_len, src_ft,
-			src_key, src_key_len, NULL, FT_REKEY_NONE);
+			src_key, src_key_len, NULL);
 #else
 	(void) dst_ft; (void) dst_key; (void) dst_key_len;
 	(void) src_ft; (void) src_key; (void) src_key_len;
@@ -3797,92 +3650,36 @@ enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
  * has no such contract: its source is exclusive, so it moves no live key and arms
  * no gate.
  */
-static
-enum cds_ft_status ft_rekey_dispatch(struct cds_ft *ft,
-		const uint8_t *dst_key, size_t dst_key_len,
-		const uint8_t *src_key, size_t src_key_len,
-		enum ft_rekey_mode rekey)
-{
-	bool require_empty = (rekey == FT_REKEY_GRAFT);
-	enum cds_ft_status status;
 
-	if (!ft)
-		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
-	/*
-	 * The atomic writer's shape-independent preconditions, checked BEFORE the
-	 * gate so a trie that can never use it does not pay a grace period to be
-	 * told so.  Everything else it decides for itself, from the structure.
-	 *
-	 * ★ THIS LIST ALSO CARRIES EVERY ARGUMENT CHECK THE ATOMIC WRITER DOES NOT
-	 * REPEAT.  ft_merge_at_inner owns the entry contract -- NULL keys, a length
-	 * past the group maximum, a SPECULATIVE trie (a move re-parents a leaf but
-	 * cannot rewrite its app-owned stored key, so every moved key would lie) --
-	 * and returns INVALID_ARGUMENT_ERROR for each.  Excluding them here rather
-	 * than re-checking them keeps that contract in ONE place: a rejected
-	 * argument falls through to the worker that defines the answer, and only a
-	 * request that is VALID and merely outside the atomic cut is a fallback.
-	 */
-	bool one_decide = ft->lock_fine &&
-		!ft->speculative_key_offset_active &&
-		src_key && dst_key &&
-		src_key_len == dst_key_len && src_key_len != 0 &&
-		src_key_len <= ft->group->max_key_len;
+/*
+ * ============================================================================
+ * REKEY TWINS of the three merge workers that carry ATOMICITY.
+ *
+ * A same-trie rekey (cds_ft_rekey_{graft,merge}) reaches these bodies with
+ * src_ft == dst_ft, so its "src side" IS the live shared destination; a
+ * cross-trie merge reaches them with an EXCLUSIVE src that the entry gates
+ * enforce (src_ft != dst_ft && !src_ft->exclusive -> BUSY_ERROR).  The two
+ * callers therefore need OPPOSITE src-side atomicity, and the shared bodies
+ * had NO fork on which caller they had -- 0 tests on @rekey or src_ft ==
+ * dst_ft across 599 lines of worker code -- so both were served by the
+ * stricter contract, unconditionally and invisibly.
+ *
+ * Split by DUPLICATION first, deliberately: these are byte-identical copies
+ * modulo the three names, so this step changes no behaviour and the
+ * specialisation of each side can then be reviewed as its own diff against a
+ * known-equal base.
+ *
+ * The boundary is DERIVED, not chosen: exactly the functions that COMMIT,
+ * DRAIN, or CREATE A TXN are twinned.  The other 15 functions reachable from
+ * here (ft_merge_build, ft_merge_count, ft_merge_ord_interleave_collect, ...)
+ * compute shape only and carry no atomicity contract, so they stay SHARED --
+ * as the atomic rekey path already demonstrates by calling three of them.
+ * ============================================================================
+ */
 
-	ft_move_gate_enter(ft);
-	if (one_decide) {
-		switch (ft_rekey_one_decide(ft, src_key, src_key_len, dst_key,
-				dst_key_len, require_empty)) {
-		case 0:
-			status = CDS_FT_STATUS_OK;
-			goto out;
-		case -EEXIST:
-			status = CDS_FT_STATUS_POPULATED_ERROR;
-			goto out;
-		case -ENOMEM:
-			status = CDS_FT_STATUS_MEMORY_ERROR;
-			goto out;
-		case -ENOTSUP:
-			status = CDS_FT_STATUS_NOT_SUPPORTED;
-			goto out;
-		default:
-			break;		/* -EINVAL: outside the cut, stage it */
-		}
-	}
-	status = ft_merge_at_inner(ft, dst_key, dst_key_len, ft,
-			src_key, src_key_len, NULL, rekey);
-out:
-	ft_move_gate_exit(ft);
-	return status;
-}
+
 #endif /* FEATURE_FT_MERGE */
 
-enum cds_ft_status cds_ft_rekey_graft(struct cds_ft *ft,
-		const uint8_t *dst_key, size_t dst_key_len,
-		const uint8_t *src_key, size_t src_key_len)
-{
-#ifdef FEATURE_FT_MERGE
-	return ft_rekey_dispatch(ft, dst_key, dst_key_len, src_key, src_key_len,
-			FT_REKEY_GRAFT);
-#else
-	(void) ft; (void) dst_key; (void) dst_key_len;
-	(void) src_key; (void) src_key_len;
-	return CDS_FT_STATUS_NOT_SUPPORTED;
-#endif
-}
-
-enum cds_ft_status cds_ft_rekey_merge(struct cds_ft *ft,
-		const uint8_t *dst_key, size_t dst_key_len,
-		const uint8_t *src_key, size_t src_key_len)
-{
-#ifdef FEATURE_FT_MERGE
-	return ft_rekey_dispatch(ft, dst_key, dst_key_len, src_key, src_key_len,
-			FT_REKEY_MERGE);
-#else
-	(void) ft; (void) dst_key; (void) dst_key_len;
-	(void) src_key; (void) src_key_len;
-	return CDS_FT_STATUS_NOT_SUPPORTED;
-#endif
-}
 
 enum cds_ft_status cds_ft_merge(struct cds_ft *dst_ft,
 		const uint8_t *key, size_t key_len,

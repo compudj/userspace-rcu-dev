@@ -2080,6 +2080,23 @@ static __thread struct cds_fair_mutex_node ft_wlock_waiter;
 static __thread struct cds_ft *ft_wlock_held;
 static __thread unsigned long ft_wlock_depth;
 
+#ifdef FT_RED_REKEY_NOLOCK
+/*
+ * RED CONTROL for inv_rekey_coarse_mixed_writers -- a deliberately BROKEN
+ * build, never shipped and never a default.  Set across ft_rekey_dispatch, it
+ * makes the rekey take no FT-wide writer lock, which is exactly the state the
+ * atomic rekey was in before the @lock_fine gate was understood: on a COARSE
+ * trie every OTHER writer excludes through that mutex, so a rekey that skips it
+ * arbitrates with nobody and its edge installs are lost updates against a
+ * concurrent insert or remove.
+ *
+ * Injected HERE rather than by deleting a CDS_FT_SCOPED_WRITER because the
+ * question the control asks is about the whole op -- "does this writer join the
+ * protocol at all" -- and the staged path nests several scopes.
+ */
+static __thread int ft_red_rekey_nolock;
+#endif
+
 /*
  * The access validator's writer OWNER word follows the FT-WIDE LOCK, not the
  * writer scope, and ft_writer_lock_gp_wait is why.  That function drops the lock
@@ -2196,6 +2213,19 @@ void ft_writer_lock_scope_enter(struct cds_ft *ft)
 		 */
 		return;
 	}
+#ifdef FT_RED_REKEY_NOLOCK
+	/*
+	 * RED CONTROL, never a shipped configuration.  See @ft_red_rekey_nolock:
+	 * with it set this thread's writer scopes take NO FT-wide lock, which is
+	 * precisely the defect inv_rekey_coarse_mixed_writers exists to detect.
+	 * Placed FIRST so no lock state is recorded at all -- the exit keys off
+	 * @ft_wlock_held identity and so no-ops by itself, and
+	 * ft_writer_lock_gp_wait sees held == NULL and degrades to a plain
+	 * synchronize_rcu.  The injection is therefore state-balanced.
+	 */
+	if (ft_red_rekey_nolock)
+		return;
+#endif
 	if (ft->lock_fine) {
 		/*
 		 * FT-WIDE-LOCK DROP (§11 drop-mechanics, MCAS-first): a FINE trie's
@@ -3138,6 +3168,36 @@ static inline void ft_delay_reader(void) { }
 	} while (0)
 #else
 # define CDS_FT_ASSERT_RCU_READ_LOCKED(ft) do { } while (0)
+#endif
+
+/*
+ * The CONVERSE: entries that BLOCK on a grace period must NOT be called from
+ * inside an RCU read-side critical section -- the grace period would wait on
+ * the caller's own section.  ft_rekey_one_decide is one: its caller holds the
+ * move gate, which waits a grace period, and its retry loop lets the escalation
+ * park take the thread OFFLINE (urcu_txn_set_park_quiescent), which silently
+ * quiesces a caller that believes it is pinned.
+ *
+ * ☠ ONLY MEANINGFUL FOR FLAVORS WHOSE read_ongoing() COUNTS SECTIONS (memb,
+ * mb, bp).  Under QSBR it is `urcu_qsbr_reader.ctr` -- ONLINE-ness -- which is
+ * non-zero for any registered thread whether or not it is in a section, so this
+ * would fire on every correct call.  Do not enable
+ * URCU_FRACTAL_TRIE_DEBUG_LOCKING on a QSBR build.
+ */
+#ifdef URCU_FRACTAL_TRIE_DEBUG_LOCKING
+# define CDS_FT_ASSERT_RCU_NOT_READ_LOCKED(ft)                                 \
+	do {                                                                   \
+		if (caa_unlikely((ft)->group->flavor->read_ongoing())) {       \
+			fprintf(stderr, "[Fatal] Fractal Trie API violation: " \
+					"called from inside an RCU read-side " \
+					"critical section at %s:%d -- this "   \
+					"entry waits for a grace period\n",    \
+					__FILE__, __LINE__);                   \
+			abort();                                               \
+		}                                                              \
+	} while (0)
+#else
+# define CDS_FT_ASSERT_RCU_NOT_READ_LOCKED(ft) do { } while (0)
 #endif
 
 /*

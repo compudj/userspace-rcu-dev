@@ -2465,6 +2465,54 @@ void ft_held_anchor_guard_node(struct ft_flip_txn *t,
  */
 
 /*
+ * Is @node where its own back-edge says it is -- i.e. does the parent slot it
+ * names actually hold it?  A node that answers false is not (yet, or no longer)
+ * part of the tree: a copy still being built, or one a peer has already
+ * replaced.  Locking such a node arbitrates nothing, because the writer that
+ * matters -- its builder -- is not playing on that word.
+ *
+ * @node NULL (an external member carrying no metadata) answers true: the
+ * question does not apply, and the acquire's other members still gate it.
+ */
+static inline
+bool ft_dlm_member_linked(const struct cds_ft *ft,
+		struct cds_ft_metadata *node)
+{
+	struct cds_ft_inode_flag *parent = NULL;
+	struct cds_ft_inode_flag **slot;
+	struct cds_ft_inode_flag *v;
+
+	if (!node)
+		return true;
+	slot = ft_resolve_parent_slot(node, (struct cds_ft *) ft, &parent);
+	if (!slot)
+		return false;
+	v = ft_resolve_flip_proxy((struct cds_ft_inode_flag *)
+			CMM_LOAD_SHARED(*slot));
+	if (!v)
+		return false;
+	/*
+	 * COMPARE NODES, NOT WORDS.  A slot value is an ENCODING -- a type tag
+	 * in the low bits, and for SKIP_X a run length in the high ones -- so
+	 * masking the low tag off and comparing addresses answers "no" for
+	 * every skip-compressed child that is perfectly well linked.  Measured
+	 * as a permanent refusal loop (the same node refused over and over,
+	 * ft_insert_dlm_acquire_split, unit test 2) before this resolved the
+	 * value the way every other reader of a slot does.  Test skip FIRST: a
+	 * SKIP_X flag carries its child's low tag bits, so ft_node_external()
+	 * would misclassify it.
+	 */
+	if (ft_node_external(v))
+		return false;		/* an external head carries no metadata */
+	return (ft_node_compressed(v) ?
+			cds_ft_item_to_metadata((struct cds_ft_inode *)
+				ft_compressed_node_ptr(v)) :
+			cds_ft_item_to_metadata(ft_node_ptr(
+				ft_resolve_skip_compressed(ft, v)))) == node;
+}
+
+
+/*
  * THE ACQUIRE CHOKE POINT, transacted flavour: take a whole lock-set in ONE
  * all-or-none MCAS on a DEDICATED acquire flip-txn (never the content lane --
  * the escalation model's circular-wait constraint).  Each present member is
@@ -2524,6 +2572,46 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 		if (!set[i].nf)
 			continue;
 		node = set[i].node;
+#ifdef FT_ACQUIRE_LINK_GATE
+		/*
+		 * EXPERIMENT, OFF BY DEFAULT -- the predicate is not yet exact.
+		 *
+		 * STEP 1 IS ONLY AN ARBITRATION OVER NODES THAT ARE IN THE TREE.
+		 *
+		 * A node under construction has a CLEAN state word, so nothing
+		 * below refuses a take on it -- and its builder holds no lock on
+		 * it either (a copy is private by convention, not by exclusion).
+		 * A plan that resolves a member to such a copy therefore acquires
+		 * it, retires it, and the builder publishes it afterwards: the
+		 * live parent slot then names a node whose grace period has
+		 * already run (project_ft_retire_still_linked_forward_edge).
+		 * Measured: EVERY dangling link came through a take on a member
+		 * whose own back-edge did not name it, all at ft_node_recompact's
+		 * {C,P,GP} acquire, against 56.7M takes on linked members.
+		 *
+		 * So ask the member's OWN back-edge whether it is where it claims
+		 * to be, and re-plan when it is not.  The value is resolved
+		 * through a parked proxy first: a member whose slot a peer is
+		 * mid-flip on IS in the tree, and refusing that would trade a
+		 * correctness gap for a contention one.
+		 *
+		 * MEASURED, 900-run batches of inv_rekey_contended_mixed_writers:
+		 * the FT_RETIRE_STILL_LINKED oracle drops from 25/3600 runs to
+		 * 3/1800.  ☠ BUT ft_dlm_member_linked answers NO for shapes that
+		 * are perfectly well linked -- a member whose resolved parent slot
+		 * holds an EXTERNAL head, seen at ft_insert_dlm_acquire_split --
+		 * and a false refusal is permanent: the plan re-derives the same
+		 * member and is refused again.  test_urcu_ft_unit stalls at test 2
+		 * with the gate on and passes 308/308 with it off.  So the
+		 * DIRECTION is confirmed by the oracle and the PREDICATE is not
+		 * finished: it needs to be exact for every node kind (external
+		 * heads, duplicate chains, compressed runs) before it can gate a
+		 * real acquire.
+		 */
+		if (!ft_dlm_member_linked(ft, node)) {
+			goto eagain;
+		}
+#endif
 		lock = ft_anchor_meta(ft, ft_lock_ctx_descent(ctx), set[i].nf,
 			node, set[i].depth);
 		coarsened = lock != node;
@@ -6080,7 +6168,10 @@ enum urcu_txn_status ft_ord_cell_flip_rec_replace(struct cds_ft *ft,
 /* Max edges a run-unlink commits: the two boundary back-edges. */
 #define FT_ORD_CELL_RUN_UNLINK_MAX_EDGES	2
 
-#ifdef FEATURE_FT_MERGE
+/*
+ * ★ NOT PART OF THE MERGE FEATURE: a generic ordered-run unlink, called by the
+ * rekey paths that survive -DNO_FEATURE_FT_MERGE.
+ */
 static
 void ft_ord_cell_run_unlink(struct cds_ft *ft, struct ft_flip_txn *txn,
 		struct cds_ft_node *first_head, struct cds_ft_node *last_head)
@@ -6113,6 +6204,8 @@ void ft_ord_cell_run_unlink(struct cds_ft *ft, struct ft_flip_txn *txn,
 	/* Bulk op, not yet MW-hardened: ABORT unreachable under its exclusion. */
 	(void) ft_ord_cell_flip_into(ft, txn, edges, n);
 }
+
+#ifdef FEATURE_FT_MERGE
 #endif /* FEATURE_FT_MERGE */
 
 /*
@@ -7199,6 +7292,19 @@ bool ft_glue_is_fresh(struct cds_ft *ft, struct ft_glue *g,
  * The tag is the one the RECORD carries (FT_FLIP_PROXY_TAG via
  * ft_flip_txn_record_reserved), NOT the state word's FT_STATE_PROXY.
  */
+#ifdef FT_RED_PARENT_WORD_SW
+static unsigned long ft_red_pw_sw_unheld, ft_red_pw_sw_held;
+
+static __attribute__((destructor))
+void ft_red_pw_sw_report(void)
+{
+	fprintf(stderr, "# FT_RED_PARENT_WORD_SW: %lu parent_word parks on an "
+		"UNHELD child (the injected defect), %lu on a held one\n",
+		uatomic_load(&ft_red_pw_sw_unheld, CMM_RELAXED),
+		uatomic_load(&ft_red_pw_sw_held, CMM_RELAXED));
+}
+#endif
+
 static inline
 void ft_flip_txn_record_parent_word(const struct cds_ft *ft,
 		struct ft_flip_txn *txn, struct cds_ft_metadata *meta,
@@ -7229,6 +7335,31 @@ void ft_flip_txn_record_parent_word(const struct cds_ft *ft,
 	 * MW makes the second writer's expected-old mismatch and abort, which is
 	 * what the retry lane exists to absorb.
 	 */
+#ifdef FT_RED_PARENT_WORD_SW
+	/*
+	 * RED CONTROL, never a shipped configuration: park unconditionally,
+	 * which is this function as it stood before @9ef2f648 and is a REAL
+	 * defect rather than a synthetic one -- the canonical unarbitrated SW
+	 * park.  It exists so inv_rekey_fine_mixed_writers can be shown to
+	 * DETECT the class it is named for instead of merely running in it.
+	 * Keep it out of --enable-rcu-debug builds: there the engine's own
+	 * kind/duplicate-slot asserts fire first, and then the assert is the
+	 * detector, not the oracle.
+	 *
+	 * ★ AND IT COUNTS ITS OWN ARM.  A red control that is never TAKEN is
+	 * indistinguishable from a green one, and that mistake has already been
+	 * made twice on this arm -- so the unheld parks (the ones this
+	 * deliberately gets wrong) are tallied and reported at exit.  A zero
+	 * there means the control proved nothing, whatever the arm reported.
+	 */
+	if (!child_held)
+		uatomic_inc(&ft_red_pw_sw_unheld);
+	else
+		uatomic_inc(&ft_red_pw_sw_held);
+	ft_flip_txn_record_reserved(txn, (void **) &meta->parent_word,
+		old_pw, new_pw);
+	return;
+#endif
 	if (child_held)
 		ft_flip_txn_record_reserved(txn, (void **) &meta->parent_word,
 			old_pw, new_pw);
