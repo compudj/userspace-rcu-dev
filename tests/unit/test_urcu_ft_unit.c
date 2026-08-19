@@ -69,13 +69,13 @@
 #endif
 
 /*
- * 297 unconditional + 49 fault-injection-only RUN_TEST registrations, on top of
+ * 298 unconditional + 49 fault-injection-only RUN_TEST registrations, on top of
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (346 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (347 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (297 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (298 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -12847,6 +12847,83 @@ static int test_rekey_binary_branch_point(void)
 out:
 	rcu_read_unlock();
 	drain_trie(ft);
+	rcu_barrier();
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
+ * AN OCCUPIED DESTINATION BEHIND A COMPRESSED RUN, with the ordered list ON --
+ * a shape the atomic rekey must REFUSE rather than spin on.
+ *
+ * The @merge_dst probe stops at a compressed / external / skip node rather than
+ * decode it, so "az" -- occupied by azm and azq, but reached through the
+ * path-compressed run under 'a' -- reads as an EMPTY destination.  The move then
+ * takes the empty-dst splice arm, whose bracket check finds azm/azq sitting
+ * INSIDE the destination range and refuses.
+ *
+ * ☠ THAT REFUSAL USED TO BE -EAGAIN, which is a transient code for a permanent
+ * condition: the op re-descended, re-derived the identical pair, and refused
+ * again forever.  So this test HANGS rather than failing when it regresses --
+ * measured at ~193k refusals before the timeout.
+ *
+ * 'q' carries a second child so the source "qz" is a plain internal node; a
+ * compressed source is refused earlier, by a different gate, and would not
+ * reach the check under test.
+ */
+static int test_rekey_occupied_dst_behind_compressed(void)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	enum cds_ft_status s;
+	int ret = -1;
+
+	if (!cds_ft_merge_enabled()) {
+		diag("test_rekey_occupied_dst_behind_compressed: skipped, merge "
+			"compiled out (-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
+	if (cds_ft_group_attr_create(&attr) < 0)
+		abort();
+	cds_ft_group_attr_set_key_len(attr, CDS_FT_LEN_VARIABLE);
+	cds_ft_group_attr_set_ordered_list(attr, true);
+	if (cds_ft_group_create(attr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &ft) < 0)
+		abort();
+	rcu_read_lock();
+	cds_ft_insert(ft, (const uint8_t *) "azm", 3, &node_alloc(1)->node);
+	cds_ft_insert(ft, (const uint8_t *) "azq", 3, &node_alloc(2)->node);
+	cds_ft_insert(ft, (const uint8_t *) "qzm", 3, &node_alloc(3)->node);
+	cds_ft_insert(ft, (const uint8_t *) "qzx", 3, &node_alloc(4)->node);
+	cds_ft_insert(ft, (const uint8_t *) "qwm", 3, &node_alloc(5)->node);
+	rcu_read_unlock();
+
+	/* Must come back -- with a refusal, not after an unbounded retry loop. */
+	s = cds_ft_rekey_merge(ft, (const uint8_t *) "az", 2,
+			(const uint8_t *) "qz", 2);
+	if (s == CDS_FT_STATUS_OK) {
+		/* If a later widening covers it, the move must be correct. */
+		rcu_read_lock();
+		if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK ||
+				!ft_test_has_key(ft, "azm") ||
+				!ft_test_has_key(ft, "azzm") ||
+				cds_ft_count_keys(ft) != 5) {
+			fprintf(stderr, "occupied-dst rekey reported OK but the "
+				"trie is wrong\n");
+			rcu_read_unlock();
+			goto out;
+		}
+		rcu_read_unlock();
+	}
+	ret = 0;
+out:
+	rcu_read_lock();
+	drain_trie(ft);
+	rcu_read_unlock();
 	rcu_barrier();
 	cds_ft_destroy(ft);
 	cds_ft_group_destroy(group);
@@ -32455,6 +32532,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_rekey_abutting_dst_keeps_list_order);
 	RUN_TEST(test_rekey_compressed_stop);
 	RUN_TEST(test_rekey_binary_branch_point);
+	RUN_TEST(test_rekey_occupied_dst_behind_compressed);
 	RUN_TEST(test_rekey_colocated_external);
 	RUN_TEST(test_merge_rekey_same_trie_ordered);
 	RUN_TEST(test_merge_rekey_same_trie_listoff_collision);

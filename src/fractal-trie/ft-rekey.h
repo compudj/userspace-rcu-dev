@@ -789,8 +789,28 @@ int ft_rekey_run_vs_region(struct cds_ft *ft,
 	return 0;
 }
 
+/*
+ * TRI-STATE, and the third value is the whole point: 1 the pair brackets the
+ * dst range, 0 the derivation was TORN (transient -- re-derive), -1 a
+ * neighbour is STRUCTURALLY inside the range.
+ *
+ * ☠ THE TWO FAILURES ARE NOT THE SAME FAILURE, and answering both with a retry
+ * is an infinite loop.  A torn read is a peer restructuring this neighbourhood
+ * and clears on its own.  A neighbour inside the range means a key legitimately
+ * EXTENDS the dst prefix -- the destination is occupied -- and no retry can
+ * change that: the op re-descends, re-derives the identical pair, and refuses
+ * again forever.
+ *
+ * That shape is reachable whenever the caller's @merge_dst probe answered NO
+ * for a destination that is in fact occupied, which it does by construction: the
+ * probe stops at a COMPRESSED (or external / skip) node rather than decode it,
+ * so an occupied destination reached through a compressed run reads as an empty
+ * one.  The premise this check was written under -- "the dst prefix is empty
+ * here" -- therefore does not hold, and the caller must answer the miss with a
+ * SHAPE refusal the dispatcher can fall back on.
+ */
 static
-bool ft_rekey_splice_pos_brackets(struct cds_ft *ft, const uint8_t *dst_ord,
+int ft_rekey_splice_pos_brackets(struct cds_ft *ft, const uint8_t *dst_ord,
 		size_t dst_len, struct ft_ord_cell *pred,
 		struct ft_ord_cell *succ)
 {
@@ -802,29 +822,28 @@ bool ft_rekey_splice_pos_brackets(struct cds_ft *ft, const uint8_t *dst_ord,
 	size_t klen;
 
 	if (pred_end && succ_end)
-		return false;			/* "empty list" -- the run is IN it */
+		return 0;			/* "empty list" -- the run is IN it */
 	if (pred_end && ft_ord_first(ft) != succ)
-		return false;			/* head insert, but succ is not the min */
+		return 0;			/* head insert, but succ is not the min */
 	if (succ_end && ft_ord_last(ft) != pred)
-		return false;			/* tail insert, but pred is not the max */
-	/*
-	 * A neighbour INSIDE the range is the torn derivation this exists to catch:
-	 * the dst prefix is empty here (an occupied one is not a graft, and the
-	 * merge arm refuses the list), so no key legitimately extends it.
-	 */
+		return 0;			/* tail insert, but pred is not the max */
 	if (pred && pred != sentinel) {
 		klen = ft_rebuild_key_upwalk(ft, pred, scratch, max_len);
-		if (!klen || ft_rekey_prefix_range_cmp(scratch + (max_len - klen),
+		if (!klen)
+			return 0;		/* unreadable: torn */
+		if (ft_rekey_prefix_range_cmp(scratch + (max_len - klen),
 				klen, dst_ord, dst_len) >= 0)
-			return false;
+			return -1;		/* a key extends the dst prefix */
 	}
 	if (succ && succ != sentinel) {
 		klen = ft_rebuild_key_upwalk(ft, succ, scratch, max_len);
-		if (!klen || ft_rekey_prefix_range_cmp(scratch + (max_len - klen),
+		if (!klen)
+			return 0;		/* unreadable: torn */
+		if (ft_rekey_prefix_range_cmp(scratch + (max_len - klen),
 				klen, dst_ord, dst_len) <= 0)
-			return false;
+			return -1;		/* a key extends the dst prefix */
 	}
-	return true;
+	return 1;
 }
 
 /*
@@ -1018,6 +1037,17 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 * LENGTH -- which a fixed-length group cannot express at all, and which a
 	 * variable-length one would need the max_used_key_len fold for.  With the
 	 * lengths equal every moved key keeps its own, so neither applies.
+	 *
+	 * ☐ RELAXING THIS FOR A VARIABLE-LENGTH GROUP IS NOT THE ONE-LINER IT
+	 * LOOKS LIKE, and max_used_key_len is not what stands in the way: the field
+	 * is a conservative hint no read path consumes, and a node stores neither a
+	 * depth nor a key length, so shifting every moved node's depth rewrites
+	 * nothing stored.  What blocks it is the DESTINATION probe -- @merge_dst
+	 * stops at a compressed / external / skip node rather than decode it, so an
+	 * occupied destination reached through a compressed run reads as empty and
+	 * the move lands on the empty-dst splice arm, which cannot express it.
+	 * Measured: with the length rule relaxed, every unequal-length shape still
+	 * refuses, just at a different gate.  Widening the probe is the real work.
 	 *
 	 * The group flavour is NOT a scope limit: both are in.  The one thing that
 	 * tied this to fixed-length groups was ft_rekey_splice_pos_brackets, which
@@ -1416,9 +1446,23 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 			 * condition for a splice; the two-pass agreement establishes the
 			 * pair was not read torn, this establishes it is the RIGHT pair.
 			 */
-			if (!ft_rekey_splice_pos_brackets(ft, dst_ord, dst_len,
-					run_dpred, run_dsucc))
-				return -EAGAIN;
+			switch (ft_rekey_splice_pos_brackets(ft, dst_ord,
+					dst_len, run_dpred, run_dsucc)) {
+			case 1:
+				break;			/* bracketed: proceed */
+			case -1:
+				/*
+				 * The destination is OCCUPIED behind a node the
+				 * @merge_dst probe would not decode, so this arm
+				 * -- which is the EMPTY-dst splice -- cannot
+				 * express the move.  A SHAPE refusal, never
+				 * -EAGAIN: nothing about the trie will change the
+				 * answer, and a retry re-derives it forever.
+				 */
+				return FT_REKEY_UNCOVERED;
+			default:
+				return -EAGAIN;		/* torn: re-derive */
+			}
 		}
 		/*
 		 * THE DST POSITION ABUTS THE RUN, and that is not a shape to refuse: it
