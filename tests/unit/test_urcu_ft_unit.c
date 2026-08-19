@@ -44,6 +44,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -68,13 +69,13 @@
 #endif
 
 /*
- * 296 unconditional + 49 fault-injection-only RUN_TEST registrations, on top of
+ * 297 unconditional + 49 fault-injection-only RUN_TEST registrations, on top of
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (345 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (346 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (296 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (297 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -22795,6 +22796,18 @@ static int excl_neg_expect_sigabrt(void (*child_fn)(void))
 		return -1;
 	}
 	if (pid == 0) {
+		/*
+		 * The abort below is the PASS condition, so its core dump is
+		 * not evidence -- it is 4 GB of tmpfs (and the time to write
+		 * it) per provocation.  The gate keeps a leg's core whenever
+		 * that leg is red for ANY reason, so these expected cores
+		 * outlive every run in which some other test failed.  Suppress
+		 * them here for the same reason the children already redirect
+		 * stderr: an expected abort should leave no debris.
+		 */
+		struct rlimit rl = { .rlim_cur = 0, .rlim_max = 0 };
+
+		(void) setrlimit(RLIMIT_CORE, &rl);
 		child_fn();
 		_exit(42);	/* unreachable */
 	}
