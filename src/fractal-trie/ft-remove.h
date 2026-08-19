@@ -699,6 +699,32 @@ int ft_detach_orphan_planlock(const struct cds_ft *ft,
 	locked[(*n)++] = h;
 	return 0;
 }
+/*
+ * WHAT A FOLDED COLLAPSE OWES ITS CALLER.  Under @record_only the collapse is
+ * RECORDED and not committed, so the chain it retires is still live and linked
+ * when it returns.  The nodes are handed back for the caller to reclaim after
+ * ITS commit lands.
+ *
+ * ☠ DEFINED OUTSIDE the FEATURE_FT_SKIP_COMPRESSED block that holds the
+ * collapse itself, because struct ft_detach_recompact_out EMBEDS it BY VALUE
+ * and that struct exists in every build.  A build with skip-compression off has
+ * no collapse to run, but it still needs the type to be complete.
+ */
+struct ft_chain_compress_reclaim {
+	/*
+	 * TWO LIFETIMES, and mixing them frees a live node.  The first three are
+	 * the RETIRED chain: the caller's commit unlinks them, so they are freed
+	 * when it SUCCEEDS.  @new_cn is the merged node this collapse built and
+	 * recorded but never published, so it is freed when the caller's commit
+	 * ABORTS -- the same split ft_detach_recompact_out draws between
+	 * @old_node and @new_flag.
+	 */
+	struct cds_ft_inode *boundary;		/* the 1-child boundary node */
+	struct cds_ft_compressed_node *parent_cn;
+	struct cds_ft_compressed_node *child_cn;
+	struct cds_ft_compressed_node *new_cn;	/* unpublished: free on ABORT */
+};
+
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 /*
  * ft_chain_compress_fused: the fused-merge primitive behind the
@@ -769,27 +795,6 @@ void ft_chain_compress_register_retire(struct ft_flip_txn *txn,
  * straddles the boundary -- parent_CN and pp lie ABOVE it, the surviving child
  * ONE hop below -- which is exactly the shape §7.1 describes.
  */
-/*
- * WHAT A FOLDED COLLAPSE OWES ITS CALLER.  Under @record_only the collapse is
- * RECORDED and not committed, so the chain it retires is still live and linked
- * when it returns.  The nodes are handed back for the caller to reclaim after
- * ITS commit lands.
- */
-struct ft_chain_compress_reclaim {
-	/*
-	 * TWO LIFETIMES, and mixing them frees a live node.  The first three are
-	 * the RETIRED chain: the caller's commit unlinks them, so they are freed
-	 * when it SUCCEEDS.  @new_cn is the merged node this collapse built and
-	 * recorded but never published, so it is freed when the caller's commit
-	 * ABORTS -- the same split ft_detach_recompact_out draws between
-	 * @old_node and @new_flag.
-	 */
-	struct cds_ft_inode *boundary;		/* the 1-child boundary node */
-	struct cds_ft_compressed_node *parent_cn;
-	struct cds_ft_compressed_node *child_cn;
-	struct cds_ft_compressed_node *new_cn;	/* unpublished: free on ABORT */
-};
-
 /*
  * @shared_txn / @record_only (FOLD, for the rekey's one-decide writer): record
  * this collapse into the caller's txn instead of committing a second time.  Two
