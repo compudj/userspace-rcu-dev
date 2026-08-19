@@ -2471,3 +2471,14 @@ void cds_ft_external_arena_destroy(struct cds_ft_external_arena *a)
 	free(a);
 }
 
+
+#ifdef FT_RED_REKEY_NOLOCK
+unsigned long ft_red_rekey_nolock_taken;
+
+__attribute__((destructor))
+static void ft_red_rekey_nolock_report(void)
+{
+	fprintf(stderr, "# FT_RED_REKEY_NOLOCK scopes_skipped=%lu\n",
+		uatomic_load(&ft_red_rekey_nolock_taken, CMM_RELAXED));
+}
+#endif

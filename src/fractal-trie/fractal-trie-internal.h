@@ -2095,6 +2095,7 @@ static __thread unsigned long ft_wlock_depth;
  * protocol at all" -- and the staged path nests several scopes.
  */
 static __thread int ft_red_rekey_nolock;
+extern unsigned long ft_red_rekey_nolock_taken;	/* GLOBAL: outlives the writers */
 #endif
 
 /*
@@ -2223,8 +2224,17 @@ void ft_writer_lock_scope_enter(struct cds_ft *ft)
 	 * ft_writer_lock_gp_wait sees held == NULL and degrades to a plain
 	 * synchronize_rcu.  The injection is therefore state-balanced.
 	 */
-	if (ft_red_rekey_nolock)
+	if (ft_red_rekey_nolock) {
+		/*
+		 * ★ COUNT THE ARM.  A red control that is never TAKEN is
+		 * indistinguishable from a green one, and this one's whole
+		 * purpose is to make a green mean something -- so report how
+		 * many scopes it actually skipped, as FT_RED_PARENT_WORD_SW
+		 * does.  Measured 68,655 on inv_rekey_coarse_mixed_writers.
+		 */
+		uatomic_inc(&ft_red_rekey_nolock_taken);
 		return;
+	}
 #endif
 	if (ft->lock_fine) {
 		/*

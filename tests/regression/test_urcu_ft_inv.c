@@ -5276,20 +5276,22 @@ static int inv_rekey_mixed_writers_run(enum rkp_mode mode,
  * entry for one move and requiring it to refuse.
  *
  * ★ Measured, not argued: with the coarse rekey's FT-wide lock DELETED
- * (-DFT_RED_REKEY_NOLOCK, a red control), this arm stayed green over 6 runs of
- * ~1350 moves against ~90000 insert/remove ops each -- roughly 300x the exposure
- * of the normal build.  A defect injected into the exclusion this arm is named
- * for does not move its oracle, because the staged writer it actually drives
- * arbitrates through its commits and not through that lock.
+ * (-DFT_RED_REKEY_NOLOCK, a red control), this arm stayed green -- and that is
+ * still true, so it is NOT a detector for the exclusion it is named for.  What
+ * covers that now is the engine-side check: -DURCU_TXN_DEBUG_SETTLE reports any
+ * word a peer wrote between our park and our settle, and with the same red
+ * control armed (68,655 scopes skipped) it found 0 foreign writes in 1.37M
+ * settle records.
  *
- * WHAT IT IS STILL WORTH: the STAGED rekey concurrent with insert/remove on one
- * trie, which nothing else in the suite covers.  For the SW-park class see
- * inv_rekey_fine_mixed_writers -- which reaches the atomic writer, and is ALSO
- * not a detector for it, for a different and more useful reason.
+ * ☑ NOW EXPECTS THE ATOMIC WRITER.  It expected the STAGED one for as long as
+ * coarse had no atomic writer; the staged writer has since been DELETED as a
+ * guarantee failure, and the coarse gate that sent this mode to it has been
+ * lifted.  What it exercises is therefore the ATOMIC rekey concurrent with
+ * insert/remove on one coarse trie, which nothing else covers.
  */
 static int inv_rekey_coarse_mixed_writers(void)
 {
-	return inv_rekey_mixed_writers_run(RKP_COARSE, RKMIX_WRITER_STAGED,
+	return inv_rekey_mixed_writers_run(RKP_COARSE, RKMIX_WRITER_ATOMIC,
 			/*contended=*/ false, "inv_rekey_coarse_mixed_writers");
 }
 
@@ -5364,15 +5366,18 @@ static int inv_rekey_contended_mixed_writers(void)
 }
 
 /*
- * The COARSE twin of the arm above: same contended geometry, but the movers
- * reach the STAGED writer instead of the atomic one.  It isolates WHICH writer
- * the residual use-after-retire needs -- the two arms differ in the rekey
- * writer and in nothing else.
+ * The COARSE twin of the arm above: same contended geometry, same ATOMIC
+ * writer, and the EXCLUSION underneath it is what differs -- the FT-wide mutex
+ * here (CDS_FT_SCOPED_WRITER), the per-node DLM locks there.  So the pair
+ * isolates the exclusion mode rather than the writer, which is what it can
+ * still isolate now that coarse and fine reach the same writer.
+ *
+ * (It expected the STAGED writer until coarse gained one; see the arm above.)
  */
 static int inv_rekey_coarse_contended_writers(void)
 {
 	return inv_rekey_mixed_writers_run(RKP_COARSE,
-			RKMIX_WRITER_STAGED, /*contended=*/ true,
+			RKMIX_WRITER_ATOMIC, /*contended=*/ true,
 			"inv_rekey_coarse_contended_writers");
 }
 
