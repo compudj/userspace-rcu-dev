@@ -2971,7 +2971,38 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		}
 	unsigned long rs_depth __attribute__((unused)) = 0;
 
+	/*
+	 * ESCALATION LANE for retry_swap.  Without a persistent handle this loop
+	 * ages nothing: every attempt commits through its own ft_flip_txn, so
+	 * urcu_txn_conflict() is never called, txn->retry never advances and
+	 * urcu_txn__self_qualifies() is never reached -- and a standalone handle
+	 * carries no domain anyway.  A contended writer then spins with no
+	 * termination argument instead of taking its FIFO turn.
+	 *
+	 * SCOPED to the contended region, not the whole op: all four retry edges
+	 * are above the dst drain, and the bracket is closed before it -- see the
+	 * two close sites.
+	 *
+	 * @optxn is NEVER bound into a commit (they all use standalone
+	 * ft_flip_txn_create_bounded), so optxn->desc stays NULL and
+	 * urcu_txn_end() never reaches urcu_txn_destroy(): the double free that
+	 * reverted an earlier attempt at this pattern is designed out, and the
+	 * grep "optxn appears only in init/begin/end/bail" is the invariant.
+	 *
+	 * @gs_open is a VARIABLE, not a re-test of @gs_bracket at each exit: a
+	 * re-evaluated condition is a second chance to disagree with the entry.
+	 */
+	const bool gs_bracket = dst_ft->lock_fine && swap_ft->exclusive;
+	struct urcu_txn optxn;
+	bool gs_open = false;
+
+	if (gs_bracket)
+		ft_txn_op_init(dst_ft, &optxn);
 retry_swap:
+	if (gs_bracket) {
+		urcu_txn_begin(&optxn);
+		gs_open = true;
+	}
 	RSPIN_ENTER_X(4, rs_depth, 2, dst_ft->lock_fine && swap_ft->exclusive);
 		/*
 		 * MW LOCK_FINE drop: the re-descend point.  graft_swap's commit is
@@ -3026,6 +3057,8 @@ retry_swap:
 		 */
 		if (caa_unlikely(d.skip_conflict)) {
 			FT_GS_PROBE_INC(cds_ft_probe_gs_retry);
+			ft_txn_attempt_bail(&optxn, gs_open);
+			gs_open = false;
 			goto retry_swap;
 		}
 		if (kase == FT_GRAFT_SWAP_DELEGATE) {
@@ -3044,6 +3077,8 @@ retry_swap:
 			if (gs_rlock)
 				dst_ft->group->flavor->read_unlock();
 			FT_TP(graft_swap_exit, (int) s);
+			ft_txn_attempt_end(&optxn, gs_open);
+			gs_open = false;
 			return s;
 		}
 
@@ -3236,6 +3271,8 @@ retry_swap:
 					ft_glue_abort(dst_ft, &glue_insert);
 					ft_glue_abort(swap_ft, &glue_extract);
 					FT_GS_PROBE_INC(cds_ft_probe_gs_retry);
+					ft_txn_attempt_bail(&optxn, gs_open);
+					gs_open = false;
 					goto retry_swap;
 				}
 				merged_meta->parent_word = ft_parent_word(dst_ft, pub_parent);
@@ -3610,6 +3647,8 @@ retry_swap:
 					gs_reserved = false;
 				}
 				FT_GS_PROBE_INC(cds_ft_probe_gs_retry);
+				ft_txn_attempt_bail(&optxn, gs_open);
+				gs_open = false;
 				goto retry_swap;
 			}
 
@@ -3771,6 +3810,8 @@ retry_swap:
 					gs_reserved = false;
 				}
 				FT_GS_PROBE_INC(cds_ft_probe_gs_retry);
+				ft_txn_attempt_bail(&optxn, gs_open);
+				gs_open = false;
 				goto retry_swap;
 			}
 			if (dret != 0) {
@@ -3851,6 +3892,16 @@ retry_swap:
 		 * re-parents only the already-detached displaced subtree, which
 		 * needs no descent-capture pin.
 		 */
+		/*
+		 * Close the escalation bracket BEFORE the dst drain below:
+		 * ft_writer_lock_gp_wait() waits a grace period, and a writer parked
+		 * on the domain's FIFO lane is an ONLINE, non-quiescent reader holding
+		 * that grace period open -- which is why that function asserts
+		 * !urcu_txn_in_fallback().  Same reason the read section is released
+		 * immediately below.
+		 */
+		ft_txn_attempt_end(&optxn, gs_open);
+		gs_open = false;
 		if (gs_rlock) {
 			dst_ft->group->flavor->read_unlock();
 			gs_rlock = false;
@@ -4049,6 +4100,16 @@ retry_swap:
 		 * swap_ft are both pristine -- there is nothing to roll back.
 		 */
 		/* Every build error jumps here before the dst-drain release above. */
+		/*
+		 * Close the escalation bracket BEFORE the build-error unwind:
+		 * ft_writer_lock_gp_wait() waits a grace period, and a writer parked
+		 * on the domain's FIFO lane is an ONLINE, non-quiescent reader holding
+		 * that grace period open -- which is why that function asserts
+		 * !urcu_txn_in_fallback().  Same reason the read section is released
+		 * immediately below.
+		 */
+		ft_txn_attempt_end(&optxn, gs_open);
+		gs_open = false;
 		if (gs_rlock) {
 			dst_ft->group->flavor->read_unlock();
 			gs_rlock = false;
