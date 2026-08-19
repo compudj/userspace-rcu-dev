@@ -660,8 +660,27 @@ struct cds_ft_inode_flag *ft_merge_build(struct ft_merge_ctx *c,
 		if (ret)
 			return FT_MERGE_OOM;
 		if (old) {
+			/*
+			 * @old is not a displaced CHILD: ft_node_set_nth returns
+			 * the node's own SUPERSEDED BODY here when the slot did
+			 * not fit and the node had to GROW (ft_node_recompact,
+			 * @old_node_ret).  That recompact has already marked it
+			 * DEAD -- §4.B freeze-on-free, set for every retire it
+			 * performs -- and states the matching obligation: "the
+			 * caller ... frees @old_node AFTER A GRACE PERIOD".
+			 *
+			 * So take the RETIRE path, not the unpublished one.  The
+			 * immediate path's contract is "never published, no
+			 * reader can hold a reference", and it PROVES that by
+			 * asserting the node carries no tombstone -- which this
+			 * body does, so the immediate free read as a live-node
+			 * free.  The cluster being build-invisible does not
+			 * change the ownership: the mark says the retire is
+			 * already owned, and the grace period is what that
+			 * ownership costs, once per node GROWTH in a merge build.
+			 */
 			ft_glue_untrack(ft, c->gd, old);
-			free_cds_ft_node_unpublished(ft, old);
+			free_cds_ft_node(ft, old);
 		}
 		if (!tracked) {
 			ft_glue_track(c->gd, M);

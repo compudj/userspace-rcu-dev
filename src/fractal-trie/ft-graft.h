@@ -274,9 +274,20 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 	if (ret)
 		return -ENOMEM;
 	if (old_branch) {
-		/* Reallocated: drop the order-1 copy from tracking + free it. */
+		/*
+		 * Reallocated: drop the order-1 copy from tracking + RETIRE it.
+		 *
+		 * The grow ran through ft_node_recompact, which marks every body
+		 * it supersedes DEAD (§4.B freeze-on-free) and states the matching
+		 * obligation -- "the caller ... frees @old_node after a grace
+		 * period".  The unpublished path is the wrong one even though this
+		 * cluster is build-invisible: its contract is proven by asserting
+		 * the node carries NO tombstone, so a marked body freed there
+		 * reads as a live-node free.  ft-insert.h's own recompact-on-grow
+		 * (@old_recompacted) already frees through here.
+		 */
 		ft_glue_untrack(ft, glue, old_branch);
-		free_cds_ft_node_unpublished(ft, old_branch);
+		free_cds_ft_node(ft, old_branch);
 		ft_glue_track(glue, branch_flag);
 	}
 	/*
