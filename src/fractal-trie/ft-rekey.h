@@ -2759,6 +2759,15 @@ sweep:
  * -EINVAL (shape) and -ENOMEM are terminal; the transient contention codes the
  * attempt documents (-EAGAIN, -EIO) are what this loop absorbs.
  */
+#ifdef FT_DEBUG_REKEY_RETRY_CAP
+# include <stdio.h>
+# include <stdlib.h>
+# ifndef FT_REKEY_RETRY_CAP
+#  define FT_REKEY_RETRY_CAP	50000
+# endif
+static __thread unsigned int ft_rekey_attempts;
+#endif
+
 static
 int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 		const uint8_t *src_key, size_t src_len,
@@ -2796,6 +2805,9 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 	 */
 	CDS_FT_SCOPED_WRITER(ft);
 
+#ifdef FT_DEBUG_REKEY_RETRY_CAP
+	ft_rekey_attempts = 0;		/* per MOVE, not per thread lifetime */
+#endif
 	ft_txn_op_init(ft, &optxn);
 	/*
 	 * PARK THE ESCALATION QUIESCENT, which this op may do and insert / remove
@@ -2810,6 +2822,36 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 	 */
 	urcu_txn_set_park_quiescent(&optxn, 1);
 	for (;;) {
+#ifdef FT_DEBUG_REKEY_RETRY_CAP
+		/*
+		 * A LIVELOCK DETECTOR, and it is cheap because of what -EAGAIN
+		 * MEANS: the code promises that retrying can help, i.e. that some
+		 * PEER is responsible for the refusal.  So an attempt count that
+		 * runs away is a self-refusal -- a condition no re-descent can
+		 * change -- and the op will spin on it forever.  Three of these
+		 * have been found in this writer by hand, each presenting as a
+		 * silent hang; this turns the whole class into a loud failure
+		 * without needing to know which site is at fault.
+		 *
+		 * The cap is deliberately far above any real contention: a
+		 * saturated multi-writer arm re-attempts single digits, so five
+		 * figures cannot be a peer.
+		 */
+		if (caa_unlikely(++ft_rekey_attempts > FT_REKEY_RETRY_CAP)) {
+			fprintf(stderr,
+				"FT REKEY LIVELOCK: %u attempts on one move -- "
+				"an -EAGAIN no re-descent can clear.  Single-"
+				"threaded this is certain; under peers it is "
+				"still far past any real contention.  Find the "
+				"site by breaking on each -EAGAIN return in "
+				"ft_rekey_graft_simple_attempt (full header path "
+				"+ `set breakpoint pending on`); a refusal that "
+				"is a property of the STRUCTURE owes "
+				"FT_REKEY_UNCOVERED, not a retry.\n",
+				ft_rekey_attempts);
+			abort();
+		}
+#endif
 		urcu_txn_begin(&optxn);
 		/*
 		 * PER ATTEMPT, not around the loop.  The pin exists to keep the

@@ -108,7 +108,12 @@ ALL_CONFIGS=(
 	# acquires never miss single-threaded, and the concurrent oracles merge
 	# DISJOINT key sets, so injection is the only thing that reaches them.
 	"fault-audit|-DFEATURE_FT_FAULT_INJECT -DFT_DEBUG_TOMBSTONE_AUDIT|u ioff"
-	"audit|-DFT_DEBUG_TOMBSTONE_AUDIT|u ion ioff"
+	# FT_DEBUG_REKEY_RETRY_CAP rides here rather than buying a config of its
+	# own: it costs one increment and one compare per rekey attempt, and this
+	# config already runs the unit suite and both single-writer inv legs, which
+	# is where every rekey shape the tests can reach gets driven.  A detector
+	# compiled into no configuration is not coverage.
+	"audit|-DFT_DEBUG_TOMBSTONE_AUDIT -DFT_DEBUG_REKEY_RETRY_CAP|u ion ioff"
 	"vam|-DFEATURE_FT_VERIFY_AT_MUTATION|u"
 	# The TRANSACTION ENGINE's own debug features.  Every other config
 	# compiles them out, so an engine-contract violation the FT commits is
