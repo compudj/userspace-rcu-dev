@@ -1000,6 +1000,10 @@ extern long cds_ft_fault_flip_countdown;
 extern long cds_ft_fault_replace_countdown;
 #endif
 
+/* Defined below; the bounded constructor is a composition over it. */
+static inline
+bool ft_flip_txn_reserve(struct ft_flip_txn *t, unsigned int cap);
+
 /*
  * Arm the next commit of @t to ABORT, for the replace family's otherwise
  * unexecutable abort arms (see cds_ft_fault_replace_countdown).  Sets the
@@ -1046,34 +1050,40 @@ struct ft_flip_txn *ft_flip_txn_create_bounded(unsigned int cap)
 		cds_ft_fault_flip_countdown--;
 	}
 #endif
-	t = (struct ft_flip_txn *) malloc(sizeof(*t));
+	/*
+	 * COMPOSITION, not a second implementation.  Reservation is an ENGINE
+	 * capability (urcu_txn_reserve: "optional; call after begin, before the
+	 * first store") and the FT already exposes it as a METHOD --
+	 * ft_flip_txn_reserve, used by the glue folds at five sites, which sets
+	 * the very same @reserved flag.  Spelling it a second time as a
+	 * CONSTRUCTOR duplicated the logic and, worse, made boundedness a birth
+	 * attribute that then multiplied against the _on axis into four
+	 * constructors for one constructor plus one method.
+	 *
+	 * Behaviour-identical to the open-coded form it replaces: create() sets
+	 * @reserved false and performs the same urcu_txn_init +
+	 * expect_conflict (whose reasoning -- a dense pre-reserved write set
+	 * saturates the age-0 RYW Bloom and false-positives into a spurious
+	 * abort -- applies to exactly these commits), and reserve() then makes
+	 * the same urcu_txn_reserve call and sets @reserved true.
+	 *
+	 * ☠ ft_flip_txn_create_bounded_on is deliberately NOT collapsed the same
+	 * way: it omits expect_conflict where create_on performs it, so routing
+	 * it through create_on would silently change its install lane.  That
+	 * asymmetry is defensible (its op handle carries a retry loop that
+	 * absorbs an age-0 false positive, which the standalone commits here --
+	 * remove_all et al. -- do not have) but it is a behaviour difference,
+	 * not a spelling one.
+	 */
+	t = ft_flip_txn_create();
 	if (!t)
 		return NULL;
-	t->mtxn = &t->own;
-	urcu_txn_init(t->mtxn, NULL);	/* no escalation domain under POC exclusion */
-	/*
-	 * Skip the age-0 optimistic install.  Age 0 detects a same-slot read-
-	 * your-own-writes coincidence with a fixed-size Bloom filter and, on a
-	 * hit, sets esc_pending to force an ABORT-and-escalate to the exact
-	 * age-1+ reconcile.  A pre-reserved FT commit is a DENSE bulk write set
-	 * (a whole-chain detach reserves 100+ edges) that SATURATES that Bloom,
-	 * so a non-coinciding slot false-positives and the commit aborts -- and
-	 * these commits have no retry loop (remove_all et al.), surfacing the
-	 * abort as a spurious MEMORY_ERROR.  expect_conflict runs the sorted,
-	 * exact-reconcile install from attempt 0, which has no Bloom and no
-	 * false positive; it is also the right lane for a contended MW commit.
-	 */
-	urcu_txn_expect_conflict(t->mtxn);
-	if (urcu_txn_reserve(t->mtxn, cap) < 0) {
+	if (!ft_flip_txn_reserve(t, cap)) {
 		if (t->mtxn->desc && t->mtxn->desc != URCU_TXN_ENOMEM)
 			urcu_txn_destroy(t->mtxn->desc);
 		free(t);
 		return NULL;
 	}
-	t->reserved = true;
-	t->nr_locks = 0;
-	t->acquire_miss = false;
-	t->structural_sw = false;	/* all-MW until a caller opts in under lock_fine */
 	return t;
 }
 
