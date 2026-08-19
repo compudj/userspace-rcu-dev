@@ -6882,6 +6882,27 @@ struct ft_glue {
 	bool publish_parent_shared;
 	uintptr_t publish_parent_snap;
 	/*
+	 * THE SKIP_X DUAL'S OWNER (§9.3, one level up).  A publish into a
+	 * COMPRESSED @publish_parent is not one store: _ft_publish_to_parent also
+	 * re-encodes the SKIP_X pointer that lets a candidate reader bypass the
+	 * compressed node, and that pointer lives in a slot of the compressed
+	 * node's OWN parent -- a THIRD node.  Under MW the record's expected-old
+	 * arbitrates that second slot, so every ordinary glue caller leaves this
+	 * NULL and is byte-identical.  A STRUCTURAL_SW caller cannot: its records
+	 * PARK, a park does not arbitrate, and the fold's rule is "SW iff the op
+	 * holds the slot's word" -- so it must present that grandparent's node
+	 * lock here, exactly as ft_node_recompact takes {GP} as the third member
+	 * of its lock-set whenever its parent P is compressed.
+	 *
+	 * @publish_gp_shared says the acquire deduped onto a word the op already
+	 * held (coarsening collapses GP onto the same word as @publish_parent
+	 * routinely): the fence is in force, but the FIRST acquire owns both the
+	 * release and the registry entry, so this commit records neither.
+	 */
+	struct cds_ft_metadata *publish_gp_holder;
+	bool publish_gp_shared;
+	uintptr_t publish_gp_snap;
+	/*
 	 * MW LOCK_FINE drop, split-compressed graft: the node lock held on
 	 * the compressed divergence node @cn (== d->nf) that this GLUE build
 	 * SPLITS and REPLACES.  A graft that diverges inside a compressed node
@@ -7069,6 +7090,9 @@ void ft_glue_init(struct ft_glue *g)
 	g->publish_parent_holder = NULL;
 	g->publish_parent_shared = false;
 	g->publish_parent_snap = 0;
+	g->publish_gp_holder = NULL;
+	g->publish_gp_shared = false;
+	g->publish_gp_snap = 0;
 	g->split_cn_holder = NULL;
 	g->split_cn_shared = false;
 	g->split_cn_node = NULL;
@@ -8105,6 +8129,10 @@ bool ft_glue_held_snap_one(const struct ft_glue *g,
 		*snap = g->publish_parent_snap;
 		return true;
 	}
+	if (g->publish_gp_holder == meta) {
+		*snap = g->publish_gp_snap;
+		return true;
+	}
 	if (g->split_cn_holder == meta) {
 		*snap = g->split_cn_snap;
 		return true;
@@ -8569,6 +8597,14 @@ void ft_glue_abort(struct cds_ft *ft, struct ft_glue *g)
 		g->publish_parent_holder = NULL;
 		g->publish_parent_shared = false;
 		g->publish_parent_snap = 0;
+	}
+	/* The SKIP_X dual's owner, on the same terms. */
+	if (g->publish_gp_holder) {
+		if (!g->publish_gp_shared)
+			ft_meta_lock_release_if_held(g->publish_gp_holder);
+		g->publish_gp_holder = NULL;
+		g->publish_gp_shared = false;
+		g->publish_gp_snap = 0;
 	}
 	for (i = 0; i < g->nr_built; i++) {
 		struct cds_ft_inode_flag *nf = g->built[i];
@@ -9046,6 +9082,34 @@ enum urcu_txn_status ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue 
 		g->publish_parent_holder = NULL;
 		g->publish_parent_shared = false;
 		g->publish_parent_snap = 0;
+	}
+	/*
+	 * THE SECOND SLOT THE PUBLISH BELOW WRITES.  A compressed
+	 * @publish_parent makes _ft_publish_to_parent re-encode the SKIP_X dual
+	 * -- a slot in the compressed node's own parent -- and a caller that
+	 * parks its records SW had to acquire that grandparent for the park to
+	 * be legal.  Record the {LOCK|s -> s} RELEASE and register it, the same
+	 * two lines the held arm of ft_flip_txn_hold_or_lock_parent runs, then
+	 * DISOWN the field: the txn now carries the clear, so a commit consumes
+	 * it and an abort CAS-clears it through ft_flip_txn_lock_release_all --
+	 * and the caller's ft_glue_abort must not clear it a SECOND time (fence
+	 * theft, the hazard @split_cn_holder spells out).
+	 *
+	 * A SHARED dedupe records neither: the acquire that FIRST took the word
+	 * owns both, and settling it twice drops a word the op still writes
+	 * under.  NULL holder (every caller but the fold, and the fold whenever
+	 * the parent is plain or carries no dual) is byte-identical to before.
+	 */
+	if (g->publish_gp_holder) {
+		if (!g->publish_gp_shared) {
+			ft_flip_txn_record_release_lock(g->txn,
+				g->publish_gp_holder, g->publish_gp_snap);
+			ft_flip_txn_lock_register(g->txn, g->publish_gp_holder,
+				g->publish_gp_snap);
+		}
+		g->publish_gp_holder = NULL;
+		g->publish_gp_shared = false;
+		g->publish_gp_snap = 0;
 	}
 	_ft_publish_to_parent(ft, g->publish_parent, g->publish_slot, g->top,
 		ft_glue_publish_expected_old(g), &rec);
