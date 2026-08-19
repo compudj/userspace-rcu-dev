@@ -67,7 +67,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS_REKEY_DLM	14	/* inv_rekey_graft_{disjoint,cross_junction,glue_dst,coherent_readers,shared}, inv_rekey_linearizability, inv_rekey_public_{atomic_no_gap,atomic_no_gap_varlen,atomic_no_gap_compressed_top}, inv_rekey_coarse_progress, inv_rekey_merge_{occupied,shared}_dst */
+#define NR_TESTS_REKEY_DLM	18	/* inv_rekey_graft_{disjoint,cross_junction,glue_dst,coherent_readers,shared}, inv_rekey_linearizability, inv_rekey_public_{atomic_no_gap,atomic_no_gap_varlen,atomic_no_gap_compressed_top}, inv_rekey_coarse_progress, inv_rekey_{coarse,fine,contended}_mixed_writers, inv_rekey_merge_{occupied,shared}_dst */
 
 /*
  * Base count = the RUN_TEST invocations in main() outside the DLM #ifdef.
@@ -1314,7 +1314,14 @@ extern int _cds_ft_debug_rekey_graft_simple(struct cds_ft *ft,
 		const uint8_t *src_key, size_t src_len,
 		const uint8_t *dst_key, size_t dst_len);
 
-#define RK_NW		8		/* rekey writers, all contending root */
+/*
+ * Rekey writers, all contending root.  Overridable at build time so a hunt can
+ * raise the in-process contention without editing the arm: the CONTENDED
+ * geometry below derives its key bands from this count, so nothing collides.
+ */
+#ifndef RK_NW
+#define RK_NW		8
+#endif
 
 struct rk_writer_arg {
 	struct cds_ft *ft;
@@ -1369,8 +1376,13 @@ static void *rk_writer(void *arg)
 			 */
 			w->retries++;
 		} else {
-			/* -EINVAL (a permanent shape violation this layout must never
-			 * hit) or an unexpected code: a real oracle failure. */
+			/*
+			 * A permanent refusal this layout must never hit:
+			 * -EINVAL (bad ARGUMENTS) or FT_REKEY_UNCOVERED /
+			 * -EDOM (a SHAPE outside the one-decide cut, which
+			 * this layout is built to stay inside).  Either way,
+			 * or any unexpected code: a real oracle failure.
+			 */
 			fprintf(stderr, "rk_writer bp=%u dp=%u: move %02x,%02x -> "
 				"%02x,%02x failed rc=%d\n", w->bp, w->dp, cur,
 				w->sb, oth, w->sb, rc);
@@ -1384,6 +1396,37 @@ static void *rk_writer(void *arg)
 	rcu_unregister_thread();
 	return NULL;
 }
+
+/*
+ * MIXED WRITERS ON A COARSE TRIE -- the arm that tests the rekey's WRITER
+ * EXCLUSION, which every other rekey oracle is structurally unable to see.
+ *
+ * ☠ WHY IT HAD TO EXIST.  The atomic rekey parks its structural edges SW
+ * (ft_flip_txn_set_structural_sw), and an SW park CANNOT FAIL -- it does not
+ * arbitrate -- so it is legal only where the op excludes every peer writer over
+ * those slots.  In FINE mode the per-node DLM LOCK try-locks are that protocol
+ * and every writer speaks it.  In COARSE mode every OTHER writer excludes
+ * through the FT-WIDE MUTEX instead, and the rekey took NO writer scope at all:
+ * it spoke to nobody, and its unfailable SW parks were lost updates waiting for
+ * a concurrent insert or remove.
+ *
+ * ★ AND NO EXISTING ARM COULD DETECT IT.  Every rekey oracle's writers issue
+ * cds_ft_rekey_graft and NOTHING ELSE, so no peer insert/remove exists on the
+ * trie and the exclusion gap is unobservable -- 3.0M band probes measured a race
+ * that could not occur in that configuration.  This arm supplies the missing
+ * ingredient: rekey writers and insert/remove writers on the SAME COARSE trie.
+ *
+ * SHAPE: the rekey writers own top-byte bands 1..2*RK_NW (as
+ * inv_rekey_graft_disjoint does); the insert/remove writers own bands
+ * RKMIX_BASE.. -- DISJOINT KEYS but the SAME ROOT AND UPPER SPINE, which is
+ * where an SW park and a peer's edge actually collide.
+ *
+ * DETECTION is the lost-key oracle on both sides: every rekey writer's subtree
+ * must be at its final position and absent at the other, and every insert/remove
+ * writer's shadow must match the trie key for key.  A lost update from an
+ * unarbitrated SW park shows up as a missing key or a cds_ft_verify failure,
+ * not as a crash.
+ */
 
 static int inv_rekey_graft_disjoint(void)
 {
@@ -4554,11 +4597,19 @@ static int inv_rekey_public_atomic_no_gap_varlen(void)
  *
  * So this arm asserts PROGRESS rather than no-gap -- and it asserts the OPPOSITE
  * of the arms above: RKP_GAP_EXPECTED requires the absence window to be SEEN.
- * A COARSE trie has no per-node locks and therefore no atomic writer to reach, so
- * this is the one arm that stages no matter how far the atomic cut is widened,
- * which is exactly what makes it a durable control for the band probe.  ★ Note the
- * other failure mode it guards against is a HANG, so that regression shows up as
- * this leg timing out rather than as a "not ok".
+ * ★ Note the other failure mode it guards against is a HANG, so that regression
+ * shows up as this leg timing out rather than as a "not ok".
+ *
+ * ☐ WHY COARSE STILL STAGES, checked 2026-08-16 and NOT for the reason this
+ * comment used to give.  The old reasoning -- "a COARSE trie has no per-node
+ * locks and therefore no atomic writer to reach" -- conflates ARBITRATION with
+ * ATOMICITY: coarse has the STRONGEST writer exclusion (the FT-wide mutex makes
+ * it a single updater), and what a reader needs is that the publish be ONE
+ * FLIP, a property of the commit.  The real blocker is TERMINATION: with
+ * one_decide's @lock_fine gate lifted, ft_rekey_graft_simple_locked's retry loop
+ * NEVER TERMINATES on a coarse trie (three stack samples 30s apart, same move,
+ * RSS flat).  Escalation cannot fix it -- it arbitrates COMMITS, never ACQUIRES.
+ * See the gate comment in ft-rekey.h and inv_rekey_coarse_mixed_writers.
  */
 static int inv_rekey_coarse_progress(void)
 {
@@ -4569,6 +4620,760 @@ static int inv_rekey_coarse_progress(void)
 	}
 	return inv_rekey_public_no_gap_run(RKP_COARSE, RKP_GAP_EXPECTED,
 			"inv_rekey_coarse_progress");
+}
+
+/*
+ * Keys per insert/remove writer.  Deliberately far below MW_RANGE: the mixers
+ * draw uniformly and only REMOVE a key they drew before, so with 256 offsets and
+ * the few hundred ops this arm gets, a repeat draw -- and therefore a remove --
+ * is rare.  The arm needs both halves of the insert/remove pair to collide with
+ * the movers, so keep the range small enough that the shadow saturates and the
+ * draw is a coin flip between the two.
+ */
+#define RKMIX_RANGE	32
+#if RKMIX_RANGE > MW_RANGE
+#error "RKMIX_RANGE must fit the mw_writer_arg shadow arrays"
+#endif
+
+/*
+ * Seed @iter at @v and resolve it, on the VARIABLE-length group the mixed arm
+ * needs: RKP_KLEN explicitly, never CDS_FT_LEN_DEFAULT (which names the group's
+ * ONE key length and so means nothing here).  Unlike rkp_lookup, this leaves the
+ * resolved PATH cached in @iter, which is what cds_ft_remove consumes.
+ */
+static struct cds_ft_node *rkp_iter_lookup(struct cds_ft_iter *iter,
+		struct cds_ft *ft, uint64_t v)
+{
+	uint8_t k[8] = { 0 };
+
+	cds_ft_u64_to_key(ft, v, k, RKP_KLEN);
+	cds_ft_iter_set_key(iter, k, RKP_KLEN);
+	cds_ft_lookup(ft, iter);
+	return cds_ft_iter_node(iter);
+}
+
+/*
+ * The mixed arm's insert/remove writer.  mw_writer cannot be reused: it passes
+ * CDS_FT_LEN_DEFAULT, which names the group's ONE key length and so means
+ * nothing on the variable-length group this arm needs.  Same lost-key shadow
+ * (@present / @node), explicit RKP_KLEN keys, in a top-byte band disjoint from
+ * every rekey writer's -- disjoint KEYS, shared ROOT AND UPPER SPINE, which is
+ * where a rekey's edges and an insert's actually meet.
+ *
+ * ☠ THE ITERATOR IS NOT OPTIONAL.  This writer used to look the key up with
+ * rkp_lookup (which yields a NODE, no path) and then pass @iter as NULL to
+ * cds_ft_remove.  _cds_ft_remove_locked dereferences it unconditionally -- for
+ * the key length before anything else (ft-remove.h:3964) -- so every remove that
+ * was actually REACHED was a NULL dereference.  It stayed hidden because the
+ * writer only removes a key it inserted earlier and its ops were so few against
+ * MW_RANGE that a repeat draw was rare: the arm reported green by never taking
+ * its own remove path.  Caught as a SIGSEGV in 7 of 25 runs once the mixers
+ * stopped holding the movers' grace periods open.
+ */
+static void *rkmix_kv_writer(void *arg)
+{
+	struct mw_writer_arg *w = (struct mw_writer_arg *) arg;
+	unsigned int seed = (unsigned int) (uintptr_t) w;
+	struct cds_ft_iter *iter;
+
+	rcu_register_thread();
+	if (cds_ft_iter_create(w->ft, &iter) < 0)
+		abort();
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	while (!test_stop) {
+		unsigned int off = (unsigned int) (rand_r(&seed) % RKMIX_RANGE);
+		uint64_t key = w->base + off;
+		struct cds_ft_node *found = NULL;
+
+		/*
+		 * The section spans lookup + remove: the lookup reference and
+		 * the iter's cached path are valid only inside it, and
+		 * cds_ft_remove consumes both (the §11 reference-lifetime
+		 * contract).
+		 */
+		rcu_read_lock();
+		found = rkp_iter_lookup(iter, w->ft, key);
+		if (w->present[off]) {
+			if (found == &w->node[off]->node) {
+				if (cds_ft_remove(w->ft, iter, found) ==
+						CDS_FT_STATUS_OK) {
+					node_free_rcu(to_test_node(found));
+					w->present[off] = 0;
+					w->node[off] = NULL;
+					w->ops++;
+				}
+			} else {
+				fprintf(stderr, "rkmix_kv_writer: key %llu LOST "
+					"(found %p != %p) -- a rekey edge clobbered "
+					"an insert\n", (unsigned long long) key,
+					(void *) found,
+					(void *) &w->node[off]->node);
+				w->failed = 1;
+				rcu_read_unlock();
+				break;
+			}
+			rcu_read_unlock();
+		} else if (found) {
+			/*
+			 * My band is mine alone (RKMIX_BASE.. is disjoint from
+			 * every rekey writer's 1..2*RK_NW), so a node at a key
+			 * my shadow calls absent is a foreign edge landing in
+			 * my band -- the same lost-update class, seen from the
+			 * other side.
+			 */
+			fprintf(stderr, "rkmix_kv_writer: key %llu absent but "
+				"found %p -- a foreign edge in my band\n",
+				(unsigned long long) key, (void *) found);
+			w->failed = 1;
+			rcu_read_unlock();
+			break;
+		} else {
+			struct ft_test_node *n = node_alloc(key);
+
+			/*
+			 * Only @found's boolean absence is consumed past this
+			 * point, so the section closes HERE and the insert runs
+			 * with no caller-held one -- the FT owns its own
+			 * bracket (§11 Phase A), as mw_writer does.
+			 */
+			rcu_read_unlock();
+			if (rkp_insert(w->ft, key, n) == CDS_FT_STATUS_OK) {
+				w->present[off] = 1;
+				w->node[off] = n;
+				w->ops++;
+			} else {
+				node_free(n);
+			}
+		}
+		/*
+		 * UNCONDITIONALLY quiescent, once per iteration -- this is the
+		 * arm's THROUGHPUT, not hygiene.  Every staged rekey move waits
+		 * a GRACE PERIOD (it detaches, then merges back), and in QSBR a
+		 * registered thread outside a read section still holds every GP
+		 * open until it reports.  A gated report (the usual
+		 * `(ops & 0x3f) == 0`) cannot work HERE because @ops advances
+		 * only on a SUCCEEDING op: each mixer reported once, then went
+		 * silent for the rest of the run.  That -- not slowness -- is
+		 * what capped the arm at 24 moves / 42 ops: the mixers were the
+		 * brake on the movers they are supposed to be racing.
+		 */
+		rcu_quiescent_state();
+	}
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+/*
+ * The mixed arm's rekey writer.  Same move geometry as rk_writer, but through
+ * the PUBLIC entry: _cds_ft_debug_rekey_graft_simple goes STRAIGHT to the atomic
+ * writer with no staged fallback, so on a COARSE trie it answers
+ * FT_REKEY_UNCOVERED and no move ever happens -- the arm would report a livelock
+ * that is really just the wrong entry point.  cds_ft_rekey_graft dispatches, so
+ * coarse reaches the staged writer and the arm actually exercises what it is
+ * for: a rekey concurrent with insert/remove on one trie.
+ */
+static void *rkmix_rekey_writer(void *arg)
+{
+	struct rk_writer_arg *w = (struct rk_writer_arg *) arg;
+
+	rcu_register_thread();
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	while (!test_stop) {
+		uint8_t cur = w->at_dst ? w->dp : w->bp;
+		uint8_t oth = w->at_dst ? w->bp : w->dp;
+		uint8_t src_key[2] = { cur, w->sb };
+		uint8_t dst_key[2] = { oth, w->sb };
+		enum cds_ft_status st;
+
+		/* NO read lock: the entry takes the move gate, which waits a GP. */
+		st = cds_ft_rekey_graft(w->ft, dst_key, 2, src_key, 2);
+		if (st == CDS_FT_STATUS_OK) {
+			w->at_dst = !w->at_dst;
+			w->ops++;
+		} else if (st == CDS_FT_STATUS_BUSY_ERROR ||
+				st == CDS_FT_STATUS_POPULATED_ERROR ||
+				st == CDS_FT_STATUS_MEMORY_ERROR) {
+			w->retries++;		/* transient contention */
+		} else {
+			fprintf(stderr, "rkmix_rekey_writer bp=%u dp=%u: move "
+				"failed st=%d\n", w->bp, w->dp, (int) st);
+			w->failed = 1;
+			break;
+		}
+		/* Same reason as the kv writer: @ops gates on SUCCESS. */
+		rcu_quiescent_state();
+	}
+	rcu_unregister_thread();
+	return NULL;
+}
+
+/*
+ * PURE READERS for the mixed arms, and they answer a specific question: can a
+ * READER reach the residual use-after-retire, or only a writer?
+ *
+ * The two crash signatures both consume a parent link -- ft_get_parent_rcu via
+ * ft_ineq_descend, and ft_rebuild_key_upwalk via iteration -- but both were
+ * observed inside WRITERS (an insert's splice search, the rekey's detach climb).
+ * A reader holds ONE continuous read-side section per operation, so if the
+ * defect is a writer reusing a reference across its own per-attempt pin drop, a
+ * reader structurally cannot see it and these threads will stay clean however
+ * long they run.  That makes their silence evidence, not absence of coverage --
+ * provided they really do drive those paths, which is why they issue the
+ * inequality lookups and the iteration walk and nothing else.
+ *
+ * No oracle: correctness of the ANSWER is the other arms' job.  These exist to
+ * fault, or not.
+ */
+static void *rkmix_reader(void *arg)
+{
+	struct mw_writer_arg *r = (struct mw_writer_arg *) arg;
+	struct cds_ft_iter *iter;
+	unsigned int seed = (unsigned int) (uintptr_t) r;
+
+	rcu_register_thread();
+	if (cds_ft_iter_create(r->ft, &iter) < 0)
+		abort();
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	while (!test_stop) {
+		unsigned int pick = (unsigned int) rand_r(&seed) & 7;
+		/*
+		 * Aim INTO the contended junctions (top bytes 1 and 2), which is
+		 * where the movers restructure and the mixers insert.
+		 */
+		uint64_t key = ((uint64_t) (1 + (rand_r(&seed) & 1)) << 24) |
+			((uint64_t) (rand_r(&seed) & 0x7f) << 16) |
+			((uint64_t) (rand_r(&seed) & 0xff) << 8);
+		uint8_t k[8] = { 0 };
+
+		cds_ft_u64_to_key(r->ft, key, k, RKP_KLEN);
+		rcu_read_lock();
+		cds_ft_iter_set_key(iter, k, RKP_KLEN);
+		switch (pick) {
+		case 0: (void) cds_ft_lookup_ge(r->ft, iter); break;
+		case 1: (void) cds_ft_lookup_gt(r->ft, iter); break;
+		case 2: (void) cds_ft_lookup_le(r->ft, iter); break;
+		case 3: (void) cds_ft_lookup_lt(r->ft, iter); break;
+		default:
+			/*
+			 * The ITERATION path: cds_ft_next rebuilds the key by
+			 * walking parents (ft_rebuild_key_upwalk), which is the
+			 * other faulting site.
+			 */
+			if (cds_ft_lookup_ge(r->ft, iter) == CDS_FT_STATUS_OK) {
+				int n;
+
+				for (n = 0; n < 8; n++)
+					if (cds_ft_next(r->ft, iter) !=
+							CDS_FT_STATUS_OK)
+						break;
+			}
+			break;
+		}
+		(void) cds_ft_iter_node(iter);
+		rcu_read_unlock();
+		r->ops++;
+		rcu_quiescent_state();
+	}
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+#ifndef RKMIX_NR
+#define RKMIX_NR	8		/* pure readers */
+#endif
+#ifndef RKMIX_NW
+#define RKMIX_NW	6		/* insert/remove writers */
+#endif
+/*
+ * The DISJOINT geometry's mixer band, in the TOP byte.  Every rekey writer owns
+ * top bytes 1..2*RK_NW there, so this must start above them -- derived from
+ * RK_NW for the same reason as the contended band below, and with the same gap
+ * choice that leaves the shipped RK_NW == 8 geometry at its original 0x20.
+ */
+#define RKMIX_BASE	(2 * RK_NW + 16)
+#if RKMIX_BASE + RKMIX_NW > 254
+#error "RK_NW / RKMIX_NW too large: the mixer band collides with the 0xff guard"
+#endif
+/*
+ * The CONTENDED geometry's mixer slot byte, and it must clear the movers'
+ * OCCUPIED RANGE, not merely their slot bytes: writer i owns sb-2, sb, sb+2 for
+ * sb = 3 + 6i, so bytes 1..6*RK_NW-1 belong to the movers and a mixer inside
+ * that range has its keys legitimately MOVED to the destination junction --
+ * which the arm then reports as a lost key it invented.  DERIVED from RK_NW so
+ * that raising the writer count cannot silently re-create that collision, with
+ * the gap chosen to leave the shipped RK_NW == 8 geometry at its original 0x50.
+ */
+#define RKMIX_CONTENDED_BASE	(6 * RK_NW + 32)
+#if RKMIX_CONTENDED_BASE + RKMIX_NW > 255
+#error "RK_NW / RKMIX_NW too large: the contended mixer band runs off byte 2"
+#endif
+
+/*
+ * ★ DURATION IS THE ONLY LEVER THE COARSE ARM HAS.  Its move count is
+ * digit-exact across runs (8 writers x N moves, never N +- 1), which is the
+ * tell: the movers are SERIALIZED on the coarse trie's FIFO fair mutex and each
+ * staged move costs grace periods, so they take strict turns and the run yields
+ * exactly duration / move-cost moves.  Adding rekey writers therefore buys
+ * NOTHING there -- it only lengthens the queue -- and that is why this arm runs
+ * longer than DEFAULT_DURATION_MS instead of wider.  The FINE arms do run their
+ * movers concurrently, so RK_NW is a real lever for those.
+ */
+#ifndef RKMIX_DURATION_MULT
+#define RKMIX_DURATION_MULT	10
+#endif
+#define RKMIX_DURATION_MS	(RKMIX_DURATION_MULT * DEFAULT_DURATION_MS)
+
+/*
+ * Which rekey WRITER does @mode's trie actually reach?  This is the arm's
+ * central fact, so it is measured rather than assumed -- see
+ * rkmix_probe_writer_reached().
+ */
+enum rkmix_writer {
+	RKMIX_WRITER_STAGED,	/* the detach-then-merge-back fallback */
+	RKMIX_WRITER_ATOMIC,	/* ft_rekey_one_decide: parks its edges SW */
+};
+
+/*
+ * ★ PROBE, NOT AN ARGUMENT: which rekey writer will the movers use?
+ *
+ * _cds_ft_debug_rekey_graft_simple is the ATOMIC entry with no staged fallback,
+ * so its answer for one real move IS the fact: OK means the atomic writer covers
+ * this trie and shape (and its SW parks will run against the mixers);
+ * FT_REKEY_UNCOVERED (-EDOM) means it refuses and every move will be staged.
+ *
+ * Run once before the threads start, on writer 0's move, and hand the caller
+ * back the direction it left behind so the seeded geometry stays consistent.
+ * The arm then GATES on the answer matching what the mode is supposed to give,
+ * which is what stops it from silently becoming vacuous the way the coarse arm
+ * did -- a trie that cannot reach the atomic writer cannot witness an
+ * unarbitrated SW park, however many moves it makes.
+ */
+static int rkmix_probe_writer_reached(struct cds_ft *ft, struct rk_writer_arg *w,
+		enum rkmix_writer want, const char *name)
+{
+	uint8_t src_key[2] = { w->bp, w->sb };
+	uint8_t dst_key[2] = { w->dp, w->sb };
+	enum rkmix_writer got;
+	int rc;
+
+	rc = _cds_ft_debug_rekey_graft_simple(ft, src_key, 2, dst_key, 2);
+	if (rc == 0) {
+		got = RKMIX_WRITER_ATOMIC;
+		w->at_dst = !w->at_dst;		/* the probe MOVED it */
+	} else if (rc == -EDOM) {		/* FT_REKEY_UNCOVERED, internal */
+		got = RKMIX_WRITER_STAGED;
+	} else {
+		fprintf(stderr, "%s: writer probe returned rc=%d, which is "
+			"neither a move nor an uncovered shape -- the probe "
+			"cannot answer\n", name, rc);
+		return -1;
+	}
+	fprintf(stderr, "# %s: rekey writer reached = %s\n", name,
+		got == RKMIX_WRITER_ATOMIC ? "ATOMIC (SW parks)" : "STAGED");
+	if (got != want) {
+		fprintf(stderr, "%s: expected the %s writer, got the %s one -- "
+			"this arm is not exercising what it exists for\n", name,
+			want == RKMIX_WRITER_ATOMIC ? "ATOMIC" : "STAGED",
+			got == RKMIX_WRITER_ATOMIC ? "ATOMIC" : "STAGED");
+		return -1;
+	}
+	return 0;
+}
+
+static int inv_rekey_mixed_writers_run(enum rkp_mode mode,
+		enum rkmix_writer want, bool contended, const char *name)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	struct rk_writer_arg *w;
+	struct mw_writer_arg *m;
+	pthread_t writers[RK_NW], mixers[RKMIX_NW], readers[RKMIX_NR];
+	struct mw_writer_arg *rd;
+	struct ft_test_node *guard_lo, *guard_hi;
+	struct timespec t0;
+	unsigned long total_ops = 0, total_retries = 0, mix_ops = 0, live = 0;
+	int i, c, ret = 0;
+
+	if (!getenv("FT_INV_MW")) {
+		fprintf(stderr, "# %s: skipped "
+			"(set FT_INV_MW=1 to run the concurrent-writer oracles)\n",
+			name);
+		return 0;
+	}
+	mw_install_fatal_handler();
+	leak_reset();
+
+	/*
+	 * VARIABLE-length in BOTH modes.  A COARSE trie can only reach the
+	 * STAGED writer (one_decide is gated on @lock_fine), and the staged
+	 * writer REFUSES a fixed-length group -- it moves through a detached
+	 * subtree whose keys are stripped of the prefix, so they are shorter
+	 * than the group's one length.  On a fixed COARSE trie a rekey is
+	 * therefore impossible by BOTH routes and the arm measures nothing.
+	 */
+	ft = create_rekey_coherent_ft(mode, &group);
+	cds_ft_make_concurrent(ft);
+
+	guard_lo = node_alloc(0x00000000ULL);
+	guard_hi = node_alloc(0xff000000ULL);
+	rcu_read_lock();
+	if (rkp_insert(ft, 0x00000000ULL, guard_lo) != CDS_FT_STATUS_OK ||
+			rkp_insert(ft, 0xff000000ULL, guard_hi) != CDS_FT_STATUS_OK)
+		abort();
+	rcu_read_unlock();
+	live = 2;
+
+	w = (struct rk_writer_arg *) calloc(RK_NW, sizeof(*w));
+	m = (struct mw_writer_arg *) calloc(RKMIX_NW, sizeof(*m));
+	rd = (struct mw_writer_arg *) calloc(RKMIX_NR, sizeof(*rd));
+	if (!w || !m || !rd)
+		abort();
+	for (i = 0; i < RK_NW; i++) {
+		/*
+		 * DISJOINT: writer i owns junction pair (2i+1, 2i+2) and every
+		 * writer sits at the same slot byte 3, so writers share the ROOT
+		 * and the upper spine and nothing below it.
+		 *
+		 * CONTENDED: every writer shares ONE junction pair (1, 2) and
+		 * owns a distinct slot byte instead.  That is the whole
+		 * difference between the two arms, and it is the difference that
+		 * decides whether the SW-park class can occur at all: an
+		 * unarbitrated re-parent needs TWO OPS REACHING ONE CHILD, which
+		 * a shared spine does NOT provide and a shared junction does --
+		 * moving any writer's subtree out of it recompacts the node
+		 * holding every other writer's, and every mixer's, children.
+		 */
+		uint8_t bp = contended ? 1 : (uint8_t) (2 * i + 1);
+		uint8_t dp = contended ? 2 : (uint8_t) (2 * i + 2);
+		/*
+		 * STRIDE 6, not 4.  The sibs bracket @sb at +-2, so a stride of
+		 * 4 makes writer i's HIGH sib and writer i+1's LOW sib the same
+		 * key: on a variable-length group that inserts a DUPLICATE
+		 * rather than failing, the lookup then resolves to whichever
+		 * node heads the chain, and the arm reports "sib lost" for a
+		 * defect it invented.  6 is the smallest stride that keeps every
+		 * seeded key distinct (writer i uses sb-2, sb, sb+2).
+		 */
+		uint8_t sb = contended ? (uint8_t) (3 + 6 * i) : 3;
+		uint64_t bpk = (uint64_t) bp << 24, dpk = (uint64_t) dp << 24;
+		/*
+		 * The straddling sibs bracket @sb at +-2.  For the disjoint
+		 * geometry's sb == 3 that is the historical {1, 5}, unchanged;
+		 * under contention they step with @sb, staying distinct across
+		 * writers while landing in the SAME junction.
+		 */
+		uint64_t lo = (uint64_t) (sb - 2) << 16;
+		uint64_t hi = (uint64_t) (sb + 2) << 16;
+		uint64_t sk[4] = { bpk | lo, bpk | hi, dpk | lo, dpk | hi };
+
+		w[i].ft = ft;
+		w[i].bp = bp;
+		w[i].dp = dp;
+		w[i].sb = sb;
+		rcu_read_lock();
+		for (c = 0; c < 4; c++) {
+			w[i].sib[c] = node_alloc(sk[c]);
+			if (rkp_insert(ft, sk[c], w[i].sib[c]) != CDS_FT_STATUS_OK)
+				abort();
+		}
+		for (c = 0; c < 4; c++) {
+			uint64_t tk = bpk | ((uint64_t) sb << 16) |
+				((uint64_t) (c + 1) << 8);
+
+			w[i].top[c] = node_alloc(tk);
+			if (rkp_insert(ft, tk, w[i].top[c]) != CDS_FT_STATUS_OK)
+				abort();
+		}
+		rcu_read_unlock();
+		live += 8;
+	}
+	for (i = 0; i < RKMIX_NW; i++) {
+		m[i].ft = ft;
+		/*
+		 * CONTENDED: the mixers move INTO the movers' source junction
+		 * (top byte 1) at their own slot bytes, so their inserts and
+		 * removes reshape the very node whose children the rekeys
+		 * re-parent.  The KEYS stay disjoint; the NODES no longer are.
+		 */
+		m[i].base = contended
+			? ((1ULL << 24) |
+			   ((uint64_t) (RKMIX_CONTENDED_BASE + i) << 16))
+			: (((uint64_t) (RKMIX_BASE + i)) << 24);
+	}
+
+	/* Which writer will the movers use?  Measured, before any of them run. */
+	if (rkmix_probe_writer_reached(ft, &w[0], want, name) < 0)
+		ret = -1;
+
+	test_go = 0;
+	test_stop = 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < RK_NW; i++)
+		pthread_create(&writers[i], NULL, rkmix_rekey_writer, &w[i]);
+	for (i = 0; i < RKMIX_NW; i++)
+		pthread_create(&mixers[i], NULL, rkmix_kv_writer, &m[i]);
+	for (i = 0; i < RKMIX_NR; i++) {
+		rd[i].ft = ft;
+		pthread_create(&readers[i], NULL, rkmix_reader, &rd[i]);
+	}
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	test_go = 1;
+
+	rcu_thread_offline();
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	while (elapsed_ms(&t0) < RKMIX_DURATION_MS)
+		usleep(1000);
+	test_stop = 1;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < RK_NW; i++)
+		pthread_join(writers[i], NULL);
+	for (i = 0; i < RKMIX_NW; i++)
+		pthread_join(mixers[i], NULL);
+	for (i = 0; i < RKMIX_NR; i++)
+		pthread_join(readers[i], NULL);
+	rcu_thread_online();
+
+	synchronize_rcu();
+	rcu_read_lock();
+	for (i = 0; i < RK_NW; i++) {
+		uint8_t bp = w[i].bp, dp = w[i].dp;
+		uint64_t bpk = (uint64_t) bp << 24, dpk = (uint64_t) dp << 24;
+		uint8_t X = w[i].at_dst ? dp : bp, O = w[i].at_dst ? bp : dp;
+		uint64_t Xk = (uint64_t) X << 24, Ok = (uint64_t) O << 24;
+		uint64_t lo = (uint64_t) (w[i].sb - 2) << 16;
+		uint64_t hi = (uint64_t) (w[i].sb + 2) << 16;
+		uint64_t sk[4] = { bpk | lo, bpk | hi, dpk | lo, dpk | hi };
+
+		total_ops += w[i].ops;
+		total_retries += w[i].retries;
+		if (w[i].failed)
+			ret = -1;
+		for (c = 0; c < 4; c++) {
+			struct cds_ft_node *found = NULL;
+
+			if (rkp_lookup(ft, sk[c], &found) != CDS_FT_STATUS_OK ||
+					found != &w[i].sib[c]->node) {
+				fprintf(stderr, "%s: rekey writer %d sib %d lost\n",
+					name, i, c);
+				ret = -1;
+			}
+		}
+		for (c = 0; c < 4; c++) {
+			uint64_t sbk = (uint64_t) w[i].sb << 16;
+			uint64_t here = Xk | sbk | ((uint64_t) (c + 1) << 8);
+			uint64_t there = Ok | sbk | ((uint64_t) (c + 1) << 8);
+			struct cds_ft_node *found = NULL;
+
+			if (rkp_lookup(ft, here, &found) != CDS_FT_STATUS_OK ||
+					found != &w[i].top[c]->node) {
+				fprintf(stderr, "%s: rekey writer %d top %d absent "
+					"at final pos (at_dst=%d)\n", name, i, c,
+					w[i].at_dst);
+				ret = -1;
+			}
+			if (rkp_lookup(ft, there, &found) == CDS_FT_STATUS_OK) {
+				fprintf(stderr, "%s: rekey writer %d top %d still "
+					"at old pos\n", name, i, c);
+				ret = -1;
+			}
+		}
+	}
+	for (i = 0; i < RKMIX_NW; i++) {
+		unsigned int off;
+
+		mix_ops += m[i].ops;
+		if (m[i].failed)
+			ret = -1;
+		for (off = 0; off < RKMIX_RANGE; off++) {
+			struct cds_ft_node *found = NULL;
+
+			if (!m[i].present[off])
+				continue;
+			live++;
+			if (rkp_lookup(ft, m[i].base + off, &found)
+					!= CDS_FT_STATUS_OK ||
+			    found != &m[i].node[off]->node) {
+				fprintf(stderr, "%s: insert/remove writer %d key "
+					"%llu LOST (found %p != %p) -- an edge from "
+					"a concurrent rekey clobbered it\n",
+					name, i,
+					(unsigned long long) (m[i].base + off),
+					(void *) found, (void *) &m[i].node[off]->node);
+				ret = -1;
+			}
+		}
+	}
+	if (cds_ft_count_keys(ft) != live) {
+		fprintf(stderr, "%s: count_keys %lu != live %lu\n", name,
+			cds_ft_count_keys(ft), live);
+		ret = -1;
+	}
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "%s: cds_ft_verify failed\n", name);
+		ret = -1;
+	}
+	rcu_read_unlock();
+
+	/* Both writer kinds must have RUN, else the mix is not a mix. */
+	if (total_ops == 0) {
+		fprintf(stderr, "%s: no rekey moves (livelock?)\n", name);
+		ret = -1;
+	}
+	if (mix_ops == 0) {
+		fprintf(stderr, "%s: no insert/remove ops -- the arm did "
+			"NOT exercise the mixed-writer case it exists for\n", name);
+		ret = -1;
+	}
+	fprintf(stderr, "# %s: %d rekey writers "
+		"(%lu moves, %lu retries) + %d insert/remove writers (%lu ops), "
+		"%lu live keys\n", name, RK_NW, total_ops, total_retries,
+		RKMIX_NW, mix_ops, live);
+
+	{
+		unsigned long rops = 0;
+
+		for (i = 0; i < RKMIX_NR; i++)
+			rops += rd[i].ops;
+		fprintf(stderr, "# %s: %d readers, %lu read ops\n", name,
+			RKMIX_NR, rops);
+		/* A reader pool that never ran proves nothing by staying clean. */
+		if (rops == 0) {
+			fprintf(stderr, "%s: readers did NOT run\n", name);
+			ret = -1;
+		}
+	}
+	free(w);
+	free(m);
+	free(rd);
+	if (drain_and_destroy(ft, group) < 0)
+		ret = -1;
+	if (leak_check() < 0)
+		ret = -1;
+	return ret;
+}
+
+/*
+ * ☠ THIS ARM CANNOT WITNESS THE SW-PARK CLASS, and its own probe says so.
+ *
+ * It was written for it -- the reasoning was that on a COARSE trie every OTHER
+ * writer excludes through the FT-wide mutex while the rekey took no writer scope
+ * at all, so its unfailable SW parks arbitrated with nobody.  That was true only
+ * of the (reverted) build in which one_decide's @lock_fine gate had been lifted.
+ * With the gate in place a COARSE trie NEVER REACHES the atomic writer, so it
+ * never parks an edge SW, so the class does not occur here at all -- and
+ * rkmix_probe_writer_reached() asserts exactly that by asking the atomic-only
+ * entry for one move and requiring it to refuse.
+ *
+ * ★ Measured, not argued: with the coarse rekey's FT-wide lock DELETED
+ * (-DFT_RED_REKEY_NOLOCK, a red control), this arm stayed green over 6 runs of
+ * ~1350 moves against ~90000 insert/remove ops each -- roughly 300x the exposure
+ * of the normal build.  A defect injected into the exclusion this arm is named
+ * for does not move its oracle, because the staged writer it actually drives
+ * arbitrates through its commits and not through that lock.
+ *
+ * WHAT IT IS STILL WORTH: the STAGED rekey concurrent with insert/remove on one
+ * trie, which nothing else in the suite covers.  For the SW-park class see
+ * inv_rekey_fine_mixed_writers -- which reaches the atomic writer, and is ALSO
+ * not a detector for it, for a different and more useful reason.
+ */
+static int inv_rekey_coarse_mixed_writers(void)
+{
+	return inv_rekey_mixed_writers_run(RKP_COARSE, RKMIX_WRITER_STAGED,
+			/*contended=*/ false, "inv_rekey_coarse_mixed_writers");
+}
+
+/*
+ * THE ARM THE SW-PARK CLASS ACTUALLY LIVES IN.
+ *
+ * The atomic rekey parks its structural edges SW (ft_flip_txn_set_structural_sw)
+ * and an SW park CANNOT FAIL -- it does not arbitrate -- so it is legal only
+ * where the op excludes every peer writer over those slots.  On a FINE trie the
+ * per-node DLM LOCK try-locks are that protocol, the atomic writer runs (the
+ * probe requires it), and insert/remove speak the same protocol.  So this is the
+ * configuration in which a missing or mismatched acquire in the rekey's lock set
+ * shows up as a peer's lost key.
+ *
+ * Same geometry, same oracle, same disjoint-key / shared-spine layout as the
+ * coarse arm -- the mode is the whole difference, which is what makes the pair
+ * readable against each other.
+ *
+ * ☠☠ AND IT IS NOT A DETECTOR OF THAT CLASS EITHER.  Red control: build with
+ * -DFT_RED_PARENT_WORD_SW, which restores ft_flip_txn_record_parent_word to its
+ * pre-@9ef2f648 form -- a REAL defect, the canonical unarbitrated SW park, not a
+ * synthetic one -- and which counts the parks it deliberately gets wrong so the
+ * control cannot be silently inert.  Measured, 3000 runs per side at 90-way
+ * parallelism, GREEN (build-hunt) against RED (the same tree, one -D apart):
+ *
+ *   per run      58527 moves, 58014 insert/remove ops, 234815 UNHELD SW parks
+ *   RED          0 failures / 3000 runs  (~7.0e8 injected violations)
+ *   GREEN        0 failures / 3000 runs  (no false positives either)
+ *
+ * ★ WHY, and it is the DESIGN and not the exposure: the defect needs TWO OPS
+ * RE-PARENTING ONE UNHELD CHILD, and this layout is built so that never happens.
+ * Every rekey writer owns its own junction pair and every insert/remove writer
+ * its own top-byte band; they share the ROOT and the upper spine but never a
+ * child.  "Rekey and insert/remove on one trie" is not the precondition -- two
+ * writers reaching the SAME child is.  An arm that wants this class must make
+ * its writers CONTEND on one junction, and the disjointness that makes the
+ * lost-key shadow easy to check is exactly what forecloses it.
+ */
+static int inv_rekey_fine_mixed_writers(void)
+{
+	return inv_rekey_mixed_writers_run(RKP_ATOMIC_VARLEN,
+			RKMIX_WRITER_ATOMIC, /*contended=*/ false,
+			"inv_rekey_fine_mixed_writers");
+}
+
+/*
+ * THE ARM BUILT FROM THE REASON THE OTHER TWO CANNOT SEE THE CLASS.
+ *
+ * An unarbitrated SW park becomes a LOST UPDATE only when TWO OPS RE-PARENT ONE
+ * CHILD: both park, neither can fail, and the last install wins.  Both mixed
+ * arms above give their writers DISJOINT bands -- shared root, shared upper
+ * spine, never a shared child -- so they satisfy "rekey and insert/remove on one
+ * trie" and still never meet the precondition.  Measured: the fine arm survived
+ * ~7.0e8 injected real defects (-DFT_RED_PARENT_WORD_SW) across 3000 runs
+ * without one detection.
+ *
+ * So put every writer on ONE JUNCTION instead.  All RK_NW movers share the pair
+ * (1, 2) and differ only in their slot byte; all RKMIX_NW insert/remove writers
+ * live in that same source junction at slot bytes of their own.  Keys stay
+ * disjoint -- the lost-key shadow is unchanged and still exact -- but the NODE
+ * every writer reshapes is now the same node, which is what a re-parent
+ * collision requires.
+ *
+ * FINE, because that is where the atomic writer runs and therefore where an SW
+ * park exists at all; the probe gates on it.
+ */
+static int inv_rekey_contended_mixed_writers(void)
+{
+	return inv_rekey_mixed_writers_run(RKP_ATOMIC_VARLEN,
+			RKMIX_WRITER_ATOMIC, /*contended=*/ true,
+			"inv_rekey_contended_mixed_writers");
+}
+
+/*
+ * The COARSE twin of the arm above: same contended geometry, but the movers
+ * reach the STAGED writer instead of the atomic one.  It isolates WHICH writer
+ * the residual use-after-retire needs -- the two arms differ in the rekey
+ * writer and in nothing else.
+ */
+static int inv_rekey_coarse_contended_writers(void)
+{
+	return inv_rekey_mixed_writers_run(RKP_COARSE,
+			RKMIX_WRITER_STAGED, /*contended=*/ true,
+			"inv_rekey_coarse_contended_writers");
 }
 
 /*
@@ -18286,6 +19091,10 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_iteration_order);
 	RUN_TEST(inv_concurrent_writers_disjoint);
 	RUN_TEST(inv_rekey_graft_disjoint);
+	RUN_TEST(inv_rekey_coarse_mixed_writers);
+	RUN_TEST(inv_rekey_fine_mixed_writers);
+	RUN_TEST(inv_rekey_contended_mixed_writers);
+	RUN_TEST(inv_rekey_coarse_contended_writers);
 	RUN_TEST(inv_rekey_graft_cross_junction);
 	RUN_TEST(inv_rekey_graft_glue_dst);
 	RUN_TEST(inv_rekey_graft_coherent_readers);
