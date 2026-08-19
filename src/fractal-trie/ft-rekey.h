@@ -1037,28 +1037,6 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 * the detector itself is proven able to see that class
 	 * (tests/unit/test_rcu_txn_settle_premise.c).
 	 */
-	/*
-	 * SCOPE (permanent -EINVAL), stated HERE now that the shared-parent shape
-	 * gate below no longer stands in for it: EQUAL lengths, which ppnf equality
-	 * used to force.  A shorter or longer @dst_key rewrites every moved key's
-	 * LENGTH -- which a fixed-length group cannot express at all, and which a
-	 * variable-length one would need a combined-length overflow bound for.
-	 * With the lengths equal every moved key keeps its own, so neither applies.
-	 *
-	 * ☐ RELAXING THIS is no longer blocked by the DESTINATION probe: @merge_dst
-	 * now decodes a compressed run the dst key consumes whole, which is the
-	 * gate every unequal-length shape used to refuse at.  What is left is the
-	 * length rule itself, the group flavour, and the overflow bound.
-	 *
-	 * The group flavour is NOT a scope limit while the lengths are equal: both
-	 * are in.  The one thing that tied this to fixed-length groups was
-	 * ft_rekey_splice_pos_brackets, which bounded the dst key range by padding
-	 * @dst_ord with the ordinal extremes; it now compares over the common
-	 * length instead, which needs no padding and so places a neighbour
-	 * correctly whatever the key lengths are.
-	 */
-	if (src_len != dst_len)
-		return -EINVAL;
 	ft_key_to_ordinals(src_ord, src_key, src_len, &ft->group->key_map);
 	ft_key_to_ordinals(dst_ord, dst_key, dst_len, &ft->group->key_map);
 	/*
@@ -1078,6 +1056,60 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 */
 	if (memcmp(src_ord, dst_ord, src_len < dst_len ? src_len : dst_len) == 0)
 		return -EINVAL;
+
+	/*
+	 * UNEQUAL LENGTHS ARE IN SCOPE, and what let them in was the destination
+	 * probe below: while it stopped at a compressed node, every unequal-length
+	 * shape refused anyway -- at a LATER gate -- because a longer @dst_key puts
+	 * the destination behind exactly the path-compressed run the probe declined
+	 * to decode.  Measured then, and it is why relaxing the length rule alone
+	 * was reverted rather than landed.
+	 *
+	 * Nothing STORED needs rewriting: a node carries neither a depth nor a key
+	 * length (cds_ft_metadata is parent_word / external_nodes /
+	 * parent_slot_offset; cds_ft_node is prev / next), so a moved subtree's new
+	 * key lengths are entirely a property of where its top hangs.
+	 *
+	 * Two things do follow from the length change, and both are handled the way
+	 * ft_rekey_at_inner already handles them for the staged path:
+	 *
+	 *  - OVERFLOW.  A moved key K becomes @dst_key || (K minus the @src_key
+	 *    prefix), so a longer destination can push it past the group's
+	 *    max_key_len and overflow the fixed-size key buffers downstream (the
+	 *    iterator's, the up-walk's).  Bound len(K) by the trie's own
+	 *    max_used_key_len and REFUSE THE SHAPE rather than answering the
+	 *    argument here: ft_rekey_at_inner owns that contract and returns
+	 *    OVERFLOW_ERROR for it, and FT_REKEY_UNCOVERED is the one code that
+	 *    falls through to it (see the dispatcher).  One place defines the
+	 *    answer.
+	 *
+	 *  - max_used_key_len itself, raised by the caller on a committed move.
+	 *
+	 * ☠ AND THE FIXED-LENGTH FLAVOUR IS EXCLUDED HERE, EXPLICITLY.  It does
+	 * reach this writer -- test_rekey_fixed_len_atomic_or_refused drives it --
+	 * and the equal-length rule used to be what kept it safe: with the lengths
+	 * free, moving a 2-byte prefix onto a 1-byte one SHORTENS every key it
+	 * carries, and a group whose keys all have ONE length cannot express that.
+	 * The refusal is a shape code, not an argument answer, for the same reason
+	 * the overflow one is: ft_rekey_at_inner owns the "a rekey needs a
+	 * variable-length group" contract and returns INVALID_ARGUMENT for it.
+	 *
+	 * ☠ AND THE JUNCTION GATE BELOW IS WHAT KEEPS THIS HONEST: with the lengths
+	 * free the src and dst junctions no longer sit on the same level, so the
+	 * cross-depth aliases it rejects are now REACHABLE rather than vacuous.
+	 * They were written as rejections, not asserts, for exactly this day.
+	 */
+	if (src_len != dst_len) {
+		size_t src_max;
+
+		if (ft->group->key_len != CDS_FT_LEN_VARIABLE)
+			return FT_REKEY_UNCOVERED;
+		src_max = uatomic_load(&ft->max_used_key_len, CMM_RELAXED);
+		if (src_max > src_len &&
+				src_max - src_len >
+				ft->group->max_key_len - dst_len)
+			return FT_REKEY_UNCOVERED;
+	}
 
 	/*
 	 * Descend src to S_top through plain internal nodes, capturing (nfp, pnfp,
@@ -2088,8 +2120,33 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		}
 	}
 	src_parent_held = d_src.ppnf == graft_p;
-	if (!d_src.ppnf || !graft_p || !graft_c ||
-			(ft_node_compressed(graft_p) && !merge_dst) ||
+	/*
+	 * A ROOT-LEVEL JUNCTION is a SHAPE this cut declines, and it owes
+	 * FT_REKEY_UNCOVERED rather than -EINVAL.  The two are not
+	 * interchangeable: -EINVAL is TERMINAL ("no state of the trie would make
+	 * this call legal") while UNCOVERED falls through to the worker that owns
+	 * the entry contract -- which is what turns a declined shape into the
+	 * NOT_SUPPORTED the public entry documents.  The caller's arguments here
+	 * are perfectly valid; what is missing is a node word to park the
+	 * republish under (&ft->root has none).
+	 *
+	 * ☠ AND IT IS NOW AN ORDINARY REQUEST.  While the writer required equal
+	 * key lengths, a one-byte source could only ever pair with a one-byte
+	 * destination, so this arm was a corner; with the lengths free, "move the
+	 * subtree at a depth-1 key" is a normal call, and answering it INVALID
+	 * ARGUMENT would be a wrong answer rather than a narrow one.
+	 */
+	if (!d_src.ppnf || !graft_p || !graft_c) {
+		ret = FT_REKEY_UNCOVERED;
+		goto bail_build;
+	}
+	/*
+	 * The ALIASING terms keep -EINVAL, unchanged: they say the two junctions
+	 * are the SAME node (or that the graft's pair is unlockable), which no
+	 * fallback writer expresses either -- and two DLM tests pin that code as
+	 * the "refused cleanly, permanently, before any mutation" answer.
+	 */
+	if ((ft_node_compressed(graft_p) && !merge_dst) ||
 			ft_node_skip_compressed(graft_p) ||
 			d_src.pnf == graft_c || d_src.pnf == graft_p ||
 			d_src.ppnf == graft_c) {
@@ -3050,6 +3107,30 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 		urcu_txn_end(&optxn);
 	}
 	urcu_txn_end(&optxn);
+	/*
+	 * A COMMITTED move can LENGTHEN every key it carried (@dst_len > @src_len),
+	 * so raise the trie's high-water hint the same way ft_rekey_at_inner does
+	 * for the staged path and cds_ft_merge_at for the cross-trie one.  Bounded
+	 * by the pre-move maximum, which is conservative in the only direction that
+	 * matters: the hint may over-state, never under-state.  Read AFTER the
+	 * commit and stored unconditionally-if-greater, so a peer that raised it
+	 * further in between is not lowered.
+	 *
+	 * ★ WHY IT IS SAFE TO DO THIS AFTER THE ONE DECIDE rather than inside it:
+	 * the field is a HINT -- measured, no lookup / inequality / iteration path
+	 * consumes it, only the mutators that maintain it and the public accessor
+	 * cds_ft_max_used_key_len -- so a reader between the flip and this store
+	 * sees the moved keys and a stale hint, not an inconsistency it can act on.
+	 * The keys' own lengths are a property of where the subtree hangs, and that
+	 * moved atomically.
+	 */
+	if (ret == 0 && dst_len > src_len) {
+		size_t cur = uatomic_load(&ft->max_used_key_len, CMM_RELAXED);
+		size_t nm = cur > src_len ? dst_len + (cur - src_len) : dst_len;
+
+		if (nm > cur)
+			uatomic_store(&ft->max_used_key_len, nm, CMM_RELAXED);
+	}
 	return ret;
 }
 
@@ -5367,11 +5448,21 @@ enum cds_ft_status ft_rekey_dispatch(struct cds_ft *ft,
 	 * argument falls through to the worker that defines the answer, and only a
 	 * request that is VALID and merely outside the atomic cut is a fallback.
 	 */
+	/*
+	 * ★ NO EQUAL-LENGTH TERM.  The one decide used to require it; the two
+	 * lengths are now independent, and the combined-length OVERFLOW a longer
+	 * destination can produce is answered where the rest of the entry contract
+	 * lives -- the writer reports the shape as UNCOVERED and the fallback below
+	 * returns OVERFLOW_ERROR.  Both lengths are still bounded here because a
+	 * key longer than the group maximum is an ARGUMENT error, and this gate's
+	 * job is only to keep the writer off requests it has no business deciding.
+	 */
 	bool one_decide =
 		!ft->speculative_key_offset_active &&
 		src_key && dst_key &&
-		src_key_len == dst_key_len && src_key_len != 0 &&
-		src_key_len <= ft->group->max_key_len;
+		src_key_len != 0 && dst_key_len != 0 &&
+		src_key_len <= ft->group->max_key_len &&
+		dst_key_len <= ft->group->max_key_len;
 
 	ft_move_gate_enter(ft);
 #ifdef FT_RED_REKEY_NOLOCK

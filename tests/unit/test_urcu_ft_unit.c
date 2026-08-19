@@ -69,13 +69,13 @@
 #endif
 
 /*
- * 299 unconditional + 49 fault-injection-only RUN_TEST registrations, on top of
+ * 301 unconditional + 49 fault-injection-only RUN_TEST registrations, on top of
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (348 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (350 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (299 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (301 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -13038,6 +13038,280 @@ static int test_rekey_merge_dst_behind_compressed_moves(void)
 out:
 	if (iter)
 		cds_ft_iter_destroy(iter);
+	rcu_read_lock();
+	drain_trie(ft);
+	rcu_read_unlock();
+	rcu_barrier();
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
+ * UNEQUAL SOURCE / DESTINATION KEY LENGTHS, both directions.
+ *
+ * The one-decide writer used to require src_key_len == dst_key_len.  Lifting it
+ * was measured USELESS on its own and reverted once: a longer destination puts
+ * the merge point behind a path-compressed run, and while the @merge_dst probe
+ * stopped at such a run every unequal-length shape refused anyway, just at a
+ * later gate.  With the probe decoding the run, the rule comes off for real.
+ *
+ * Nothing STORED carries a key length -- a moved key's length is entirely a
+ * property of where its subtree top hangs -- so the two consequences are the
+ * overflow bound (checked below) and the max_used_key_len hint (checked here
+ * because it is the only observable the change touches).
+ *
+ * Both junctions are kept BELOW THE ROOT on purpose: a depth-1 source is the
+ * root-junction shape, which this cut still declines (NOT_SUPPORTED) because
+ * &ft->root has no node word to park the republish under.
+ */
+static int test_rekey_merge_unequal_key_lengths(void)
+{
+	/* SHORTEN: dst "a" (1) <- src "pq" (2); pqs -> as, pqt -> at. */
+	static const char *sh_ins[] = { "axm", "aym", "pqs", "pqt", "prm", NULL };
+	static const char *sh_exp[] = { "as", "at", "axm", "aym", "prm", NULL };
+	/* LENGTHEN: dst "azb" (3) <- src "pq" (2); pqs -> azbs, pqt -> azbt. */
+	static const char *ln_ins[] = { "azbx", "azby", "pqs", "pqt", "prm", NULL };
+	static const char *ln_exp[] = { "azbs", "azbt", "azbx", "azby", "prm", NULL };
+	unsigned int round;
+
+	if (!cds_ft_merge_enabled()) {
+		diag("test_rekey_merge_unequal_key_lengths: skipped, merge "
+			"compiled out (-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
+	/* Four rounds: {shorten, lengthen} x {list on, list off}. */
+	for (round = 0; round < 4; round++) {
+		const char **ins = (round & 1) ? ln_ins : sh_ins;
+		const char **exp = (round & 1) ? ln_exp : sh_exp;
+		const char *dst_key = (round & 1) ? "azb" : "a";
+		size_t dst_len = (round & 1) ? 3 : 1;
+		bool list_on = (round & 2) != 0;
+		struct cds_ft_group_attr *attr;
+		struct cds_ft_group *group;
+		struct cds_ft *ft = NULL;
+		struct cds_ft_iter *iter = NULL;
+		enum cds_ft_status s;
+		unsigned int i;
+		int rr = -1;		/* THIS round's verdict */
+
+		if (cds_ft_group_attr_create(&attr) < 0)
+			abort();
+		cds_ft_group_attr_set_key_len(attr, CDS_FT_LEN_VARIABLE);
+		cds_ft_group_attr_set_ordered_list(attr, list_on);
+		if (cds_ft_group_create(attr, &group) < 0)
+			abort();
+		cds_ft_group_attr_destroy(attr);
+		if (cds_ft_create(group, NULL, &ft) < 0 ||
+		    cds_ft_iter_create(ft, &iter) < 0)
+			abort();
+		rcu_read_lock();
+		for (i = 0; ins[i]; i++)
+			cds_ft_insert(ft, (const uint8_t *) ins[i],
+				strlen(ins[i]), &node_alloc(i + 1)->node);
+		rcu_read_unlock();
+
+		s = cds_ft_rekey_merge(ft, (const uint8_t *) dst_key, dst_len,
+				(const uint8_t *) "pq", 2);
+		if (s != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "unequal-len round %u: merge: %s\n",
+				round, cds_ft_status_to_string(s));
+			goto next;
+		}
+		rcu_read_lock();
+		if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "unequal-len round %u: verify failed\n",
+				round);
+			rcu_read_unlock();
+			goto next;
+		}
+		if (cds_ft_count_keys(ft) != 5) {
+			fprintf(stderr, "unequal-len round %u: count %lu != 5\n",
+				round, cds_ft_count_keys(ft));
+			rcu_read_unlock();
+			goto next;
+		}
+		for (i = 0; exp[i]; i++) {
+			if (!ft_test_has_key(ft, exp[i])) {
+				fprintf(stderr, "unequal-len round %u: '%s' "
+					"missing after the move\n", round, exp[i]);
+				rcu_read_unlock();
+				goto next;
+			}
+		}
+		if (ft_test_has_key(ft, "pqs") || ft_test_has_key(ft, "pqt")) {
+			fprintf(stderr, "unequal-len round %u: a source key "
+				"survived the move\n", round);
+			rcu_read_unlock();
+			goto next;
+		}
+		/*
+		 * The hint must cover every key now present.  It is allowed to
+		 * OVER-state (the bound is computed from the pre-move maximum,
+		 * as every other mover computes it) but never to under-state --
+		 * an under-stated hint would size a caller's key buffer short.
+		 */
+		if (cds_ft_max_used_key_len(ft) < strlen(exp[0])) {
+			fprintf(stderr, "unequal-len round %u: max_used_key_len "
+				"%zu < the moved key's %zu\n", round,
+				cds_ft_max_used_key_len(ft), strlen(exp[0]));
+			rcu_read_unlock();
+			goto next;
+		}
+		/* List on: the moved keys must also be in key order. */
+		if (list_on) {
+			s = cds_ft_lookup_first(ft, iter);
+			for (i = 0; exp[i]; i++) {
+				uint8_t rk[64];
+				size_t rl;
+
+				if (s != CDS_FT_STATUS_OK ||
+				    cds_ft_iter_get_key(iter, rk, sizeof rk, &rl) !=
+						CDS_FT_STATUS_OK ||
+				    rl != strlen(exp[i]) ||
+				    memcmp(rk, exp[i], rl) != 0) {
+					fprintf(stderr, "unequal-len round %u: "
+						"pos %u mismatch (want '%s')\n",
+						round, i, exp[i]);
+					rcu_read_unlock();
+					goto next;
+				}
+				s = cds_ft_next(ft, iter);
+			}
+			if (s == CDS_FT_STATUS_OK) {
+				fprintf(stderr, "unequal-len round %u: extra "
+					"keys in the ordered walk\n", round);
+				rcu_read_unlock();
+				goto next;
+			}
+		}
+		rcu_read_unlock();
+		rr = 0;
+next:
+		if (iter)
+			cds_ft_iter_destroy(iter);
+		rcu_read_lock();
+		drain_trie(ft);
+		rcu_read_unlock();
+		rcu_barrier();
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		if (rr != 0)
+			return -1;
+	}
+	return 0;
+}
+
+/*
+ * The OTHER half of lifting the equal-length rule: a destination long enough to
+ * push a moved key past the group's max_key_len must be REFUSED, not truncated
+ * into the fixed-size key buffers the up-walk and the iterator use.
+ *
+ * The one-decide writer reports the shape UNCOVERED rather than answering the
+ * argument itself, so the refusal comes back through the worker that owns the
+ * entry contract -- the same OVERFLOW_ERROR cds_ft_merge_at returns for the
+ * cross-trie form (test_merge_at_overflow).  One place defines the answer.
+ */
+static int test_rekey_merge_unequal_len_overflow(void)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *ft = NULL;
+	enum cds_ft_status s;
+	int ret = -1;
+
+	if (!cds_ft_merge_enabled()) {
+		diag("test_rekey_merge_unequal_len_overflow: skipped, merge "
+			"compiled out (-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
+	if (cds_ft_group_attr_create(&attr) < 0)
+		abort();
+	cds_ft_group_attr_set_key_len(attr, CDS_FT_LEN_VARIABLE);
+	cds_ft_group_attr_set_max_key_len(attr, 8);
+	if (cds_ft_group_create(attr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &ft) < 0)
+		abort();
+	rcu_read_lock();
+	cds_ft_insert(ft, (const uint8_t *) "azbx", 4, &node_alloc(1)->node);
+	cds_ft_insert(ft, (const uint8_t *) "azby", 4, &node_alloc(2)->node);
+	cds_ft_insert(ft, (const uint8_t *) "pqstuvw", 7, &node_alloc(3)->node);
+	cds_ft_insert(ft, (const uint8_t *) "pqstuvx", 7, &node_alloc(4)->node);
+	cds_ft_insert(ft, (const uint8_t *) "prm", 3, &node_alloc(5)->node);
+	rcu_read_unlock();
+
+	/* 7 + (7 - 2) = 12 > max 8: refused, and the trie left untouched. */
+	s = cds_ft_rekey_merge(ft, (const uint8_t *) "azbxxyz", 7,
+			(const uint8_t *) "pq", 2);
+	if (s != CDS_FT_STATUS_OVERFLOW_ERROR) {
+		fprintf(stderr, "unequal-len overflow: expected OVERFLOW, got %s\n",
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+	/*
+	 * The OTHER exclusion the lift owes: a FIXED-length group cannot express
+	 * keys of two lengths, so unequal prefixes must stay refused there.  The
+	 * one-decide writer reports the shape UNCOVERED and the worker that owns
+	 * the "a rekey needs a variable-length group" contract answers.  Checked in
+	 * the same test because it is the same one line that admits the shape.
+	 */
+	{
+		struct cds_ft_group_attr *fattr;
+		struct cds_ft_group *fgroup;
+		struct cds_ft *fft = NULL;
+		enum cds_ft_status fs;
+
+		if (cds_ft_group_attr_create(&fattr) < 0)
+			abort();
+		cds_ft_group_attr_set_key_len(fattr, 4);
+		if (cds_ft_group_create(fattr, &fgroup) < 0)
+			abort();
+		cds_ft_group_attr_destroy(fattr);
+		if (cds_ft_create(fgroup, NULL, &fft) < 0)
+			abort();
+		rcu_read_lock();
+		cds_ft_insert(fft, (const uint8_t *) "azbx", 4, &node_alloc(6)->node);
+		cds_ft_insert(fft, (const uint8_t *) "azby", 4, &node_alloc(7)->node);
+		cds_ft_insert(fft, (const uint8_t *) "pqst", 4, &node_alloc(8)->node);
+		cds_ft_insert(fft, (const uint8_t *) "pqsu", 4, &node_alloc(9)->node);
+		cds_ft_insert(fft, (const uint8_t *) "prmn", 4, &node_alloc(10)->node);
+		rcu_read_unlock();
+		fs = cds_ft_rekey_merge(fft, (const uint8_t *) "a", 1,
+				(const uint8_t *) "pq", 2);
+		if (fs != CDS_FT_STATUS_INVALID_ARGUMENT_ERROR) {
+			fprintf(stderr, "unequal-len fixed group: expected "
+				"INVALID_ARGUMENT, got %s\n",
+				cds_ft_status_to_string(fs));
+			rcu_read_lock();
+			drain_trie(fft);
+			rcu_read_unlock();
+			rcu_barrier();
+			cds_ft_destroy(fft);
+			cds_ft_group_destroy(fgroup);
+			goto out;
+		}
+		rcu_read_lock();
+		drain_trie(fft);
+		rcu_read_unlock();
+		rcu_barrier();
+		cds_ft_destroy(fft);
+		cds_ft_group_destroy(fgroup);
+	}
+	rcu_read_lock();
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK ||
+			cds_ft_count_keys(ft) != 5 ||
+			!ft_test_has_key(ft, "pqstuvw") ||
+			!ft_test_has_key(ft, "pqstuvx")) {
+		fprintf(stderr, "unequal-len overflow: the refused move changed "
+			"the trie\n");
+		rcu_read_unlock();
+		goto out;
+	}
+	rcu_read_unlock();
+	ret = 0;
+out:
 	rcu_read_lock();
 	drain_trie(ft);
 	rcu_read_unlock();
@@ -32651,6 +32925,8 @@ int main(int argc, char **argv)
 	RUN_TEST(test_rekey_binary_branch_point);
 	RUN_TEST(test_rekey_occupied_dst_behind_compressed);
 	RUN_TEST(test_rekey_merge_dst_behind_compressed_moves);
+	RUN_TEST(test_rekey_merge_unequal_key_lengths);
+	RUN_TEST(test_rekey_merge_unequal_len_overflow);
 	RUN_TEST(test_rekey_colocated_external);
 	RUN_TEST(test_merge_rekey_same_trie_ordered);
 	RUN_TEST(test_merge_rekey_same_trie_listoff_collision);
