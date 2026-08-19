@@ -2395,6 +2395,19 @@ bool ft_move_active(const struct cds_ft *ft)
  * the GP would wait for the caller's own section.  A mover takes its read lock
  * (for the descents it then does) AFTER this returns.
  */
+/*
+ * THE RECLAIM ROUTE.  Shared by the climb audit and by FT_ENABLE_TRACING's
+ * item_reclaim event, so it must not live inside either one's guard.
+ */
+#ifdef FT_ENABLE_TRACING
+#define FT_DBG_VIA_RCU		1	/* call_rcu callback: GP paid */
+#define FT_DBG_VIA_EXCLUSIVE	2	/* exclusive trie: no readers by contract */
+#define FT_DBG_VIA_UNPUB	3	/* "never published", freed immediately */
+#define FT_DBG_VIA_DRAIN	4	/* reserve drain: no GP, no defer */
+extern __thread unsigned long ft_dbg_free_via;
+#endif
+
+
 static inline
 void ft_move_gate_enter(struct cds_ft *ft)
 {

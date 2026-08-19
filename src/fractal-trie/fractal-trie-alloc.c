@@ -51,6 +51,7 @@
 #include <urcu/list.h>
 #include <urcu/uatomic.h>
 #include "fractal-trie-internal.h"
+#include "fractal-trie-trace.h"
 #include "urcu-utils.h"
 
 /*
@@ -1579,10 +1580,21 @@ struct cds_ft_metadata *cds_ft_alloc_cell_item(struct cds_ft *ft)
 static
 void cds_ft_do_free_item(struct cds_ft_metadata *metadata)
 {
+#ifdef FT_ENABLE_TRACING
+	/*
+	 * THE push itself, keyed on the ITEM pointer to match item_alloc /
+	 * item_free.  @via 0 means no site set it, which for this function means
+	 * the call_rcu callback.
+	 */
+	FT_TP(item_reclaim, cds_ft_metadata_to_item(metadata),
+		(unsigned int) (ft_dbg_free_via ? ft_dbg_free_via
+					: FT_DBG_VIA_RCU));
+#endif
 	struct cds_ft_metadata_alloc *metadata_alloc;
 
 	metadata_alloc =
 		caa_container_of(metadata, struct cds_ft_metadata_alloc, metadata);
+
 
 #ifdef FT_IMMEDIATE_FREE
 	/*
@@ -1731,6 +1743,21 @@ void cds_ft_alloc_reserve_deactivate(struct cds_ft *ft)
 	assert(0);	/* deactivate without a matching activate */
 }
 
+#ifdef FT_ENABLE_TRACING
+/* The fast-stop flag itself; see FT_TRACE_FREEZE in fractal-trie-trace.h. */
+int ft_trace_frozen;
+#endif
+
+#ifdef FT_ENABLE_TRACING
+/*
+ * The reclaim ROUTE, so cds_ft_do_free_item can say which path pushed an item
+ * back on the freelist.  Normally maintained by FT_DEBUG_CLIMB_AUDIT; tracing
+ * needs it independently, and the two must not define it twice.
+ */
+__thread unsigned long ft_dbg_free_via;
+#endif
+
+
 void cds_ft_alloc_reserve_drain(struct cds_ft *ft,
 		struct cds_ft_alloc_reserve *r)
 {
@@ -1738,10 +1765,14 @@ void cds_ft_alloc_reserve_drain(struct cds_ft *ft,
 
 	assert(!ft_tls_reserve_for(ft));	/* deactivate before drain */
 	(void) ft;
+#ifdef FT_ENABLE_TRACING
+	ft_dbg_free_via = FT_DBG_VIA_DRAIN;
+#endif
 	for (k = 0; k < CDS_FT_ALLOC_RESERVE_NR_KIND; k++) {
 		for (o = 0; o <= FT_ALLOC_ORDER_MAX; o++) {
-			for (i = 0; i < r->count[k][o]; i++)
+			for (i = 0; i < r->count[k][o]; i++) {
 				cds_ft_do_free_item(r->items[k][o][i]);
+			}
 			r->count[k][o] = 0;
 		}
 	}
@@ -1750,6 +1781,7 @@ void cds_ft_alloc_reserve_drain(struct cds_ft *ft,
 #ifdef FT_DEBUG_TOMBSTONE_AUDIT
 unsigned long ft_unpub_free_calls;
 #endif
+
 
 static
 void cds_ft_free_item_rcu(struct rcu_head *rcu_head)
@@ -1799,7 +1831,13 @@ void cds_ft_free_item(struct cds_ft *ft, struct cds_ft_metadata *metadata)
 	cds_ft_do_free_item(metadata);
 #else
 	if (ft->exclusive) {
+#ifdef FT_ENABLE_TRACING
+		ft_dbg_free_via = FT_DBG_VIA_EXCLUSIVE;
 		cds_ft_do_free_item(metadata);
+		ft_dbg_free_via = 0;
+#else
+		cds_ft_do_free_item(metadata);
+#endif
 	} else {
 		struct cds_ft_metadata_alloc *metadata_alloc =
 			caa_container_of(metadata, struct cds_ft_metadata_alloc, metadata);
@@ -1943,7 +1981,13 @@ void cds_ft_free_item_unpublished(struct cds_ft *ft __attribute__((unused)),
 	if (ft_alloc_reserve_refund(ft, metadata))
 		return;
 #endif
+#ifdef FT_ENABLE_TRACING
+	ft_dbg_free_via = FT_DBG_VIA_UNPUB;
 	cds_ft_do_free_item(metadata);
+	ft_dbg_free_via = 0;
+#else
+	cds_ft_do_free_item(metadata);
+#endif
 }
 
 /*

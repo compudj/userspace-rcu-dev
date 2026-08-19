@@ -1780,8 +1780,39 @@ int ft_detach_node(struct cds_ft *ft,
 		    (metadata->external_nodes && topmost_external_nodes) ||
 		    is_root) {
 			if (!is_root) {
-				struct cds_ft_metadata *parent_meta =
-					cds_ft_item_to_metadata(
+				struct cds_ft_metadata *parent_meta;
+
+#ifdef FT_ENABLE_TRACING
+				/*
+				 * THE CLIMB'S DEREFERENCE, checked before it
+				 * happens.  This is the frame the residual SEGV
+				 * faults in, and it is the signature that
+				 * SURVIVES tracing (the reader-side one does
+				 * not: 0/2100 traced against ~1%/run untraced).
+				 *
+				 * A freelist link is 8-mod-16, so it clears the
+				 * EXTERNAL tag -- a reclaimed parent reads as an
+				 * external node here, which is exactly the
+				 * invariant ft_get_parent_rcu asserts and this
+				 * climb never checked.  Round-trip it so the
+				 * event alone separates recycled memory from a
+				 * live object with a bad link.
+				 */
+				if (caa_unlikely(resolved_parent &&
+						ft_node_external(resolved_parent))) {
+					const void *pp = ft_node_ptr(resolved_parent);
+
+					FT_TP(parent_external_violation,
+						(const void *) cur, pp,
+						(const void *) cds_ft_metadata_to_item(
+							cds_ft_item_to_metadata(
+							(struct cds_ft_inode *) pp)),
+						(unsigned long) metadata->parent_word);
+					ft_trace_capture();
+					abort();
+				}
+#endif
+				parent_meta = cds_ft_item_to_metadata(
 						ft_node_ptr(resolved_parent));
 				metadata_stack[nr_metadata++] = parent_meta;
 			}

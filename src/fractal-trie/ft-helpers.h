@@ -1563,6 +1563,65 @@ struct cds_ft_inode_flag *ft_get_parent_rcu(struct cds_ft *ft,
 	 * (old or merged) parent before returning.
 	 */
 	parent = ft_resolve_flip_proxy(parent);
+#ifdef FT_ENABLE_TRACING
+	/*
+	 * FIRE AT DETECTION, not from a signal handler: the prior rig recorded
+	 * that a SIGSEGV-handler snapshot lands long after the ring has wrapped.
+	 * This is the same instant the assert below would abort on, but with the
+	 * window still intact.
+	 *
+	 * A freelist link is 8-mod-16, so it clears the EXTERNAL tag -- which is
+	 * exactly why a reclaimed parent reads as an external node here.  The
+	 * round trip (item -> metadata -> item) is the discriminator: equal means
+	 * a valid live object with a wrong link, unequal means recycled memory.
+	 */
+	/*
+	 * POSITIVE CONTROL for the whole emit -> freeze -> stop -> snapshot ->
+	 * decode chain.  A violation site that has never been shown to LAND in a
+	 * readable trace is an instrument on trust, and this one has already
+	 * produced two aborts whose snapshots contained no violation event.
+	 * FT_TRACE_SELFTEST=1 fires the identical sequence on the first call,
+	 * from a state that is perfectly healthy, so a snapshot WITHOUT the event
+	 * indicts the rig and one WITH it clears the rig.
+	 */
+	{
+		static int selftest = -1;
+
+		if (caa_unlikely(selftest < 0))
+			selftest = getenv("FT_TRACE_SELFTEST") ? 1 : 0;
+		if (caa_unlikely(selftest == 1)) {
+			selftest = 0;
+			FT_TP(parent_external_violation, node, parent, parent,
+				0xdeadbeefUL);
+			ft_trace_capture();
+			fprintf(stderr, "FT_TRACE_SELFTEST: fired\n");
+			abort();
+		}
+	}
+	if (caa_unlikely(parent && ft_node_external(parent))) {
+		const void *pp = ft_node_ptr(parent);
+		const void *rt = NULL;
+
+		rt = cds_ft_metadata_to_item(cds_ft_item_to_metadata(
+			(struct cds_ft_inode *) pp));
+		FT_TP(parent_external_violation, node, pp, rt,
+			(unsigned long) rcu_dereference(cds_ft_item_to_metadata(
+				ft_node_ptr(node))->parent_word));
+		/*
+		 * STOP FIRST, then snapshot.  system() is a fork+exec costing
+		 * milliseconds, and this workload emits millions of events per
+		 * second -- the 64 KiB ring wraps several times over during it,
+		 * so a plain "snapshot record" here dumps a window that no
+		 * longer contains the violation that triggered it.  Measured:
+		 * the snapshot was written and the event was already gone.
+		 * lttng stop freezes every buffer before the dump, at the cost
+		 * of ending tracing for the run -- which is exactly what we
+		 * want, since this process is about to abort anyway.
+		 */
+		ft_trace_capture();
+		abort();
+	}
+#endif
 	ft_parent_rcu_check(ft, node, parent);
 	return parent;
 }

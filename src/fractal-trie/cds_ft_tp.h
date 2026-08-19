@@ -709,6 +709,57 @@ LTTNG_UST_TRACEPOINT_EVENT(cds_ft, item_free,
 )
 
 /*
+ * THE ACTUAL FREELIST PUSH, with the route that reached it.  item_free fires at
+ * the RETIRE -- before the defer decision -- so it cannot answer "did this one
+ * pay a grace period".  This one can, and that is the whole question when a
+ * reader faults on a link into reclaimed memory.
+ *
+ * @via is FT_DBG_VIA_*: 1 rcu_callback (GP paid), 2 exclusive, 3 unpublished
+ * (immediate), 4 reserve_drain (immediate).
+ *
+ * ☠ Emitted with the ITEM pointer, not the metadata: item_alloc / item_free use
+ * the item address, and keying this event differently once cost a whole analysis
+ * (a grep for the victim returned nothing and read as "never reclaimed").
+ */
+LTTNG_UST_TRACEPOINT_EVENT(cds_ft, item_reclaim,
+	LTTNG_UST_TP_ARGS(
+		const void *, item,
+		unsigned int, via
+	),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_integer_hex(uintptr_t, item, (uintptr_t) item)
+		lttng_ust_field_integer(unsigned int, via, via)
+	)
+)
+
+/*
+ * THE READER-SIDE VIOLATION, fired at DETECTION rather than from a signal
+ * handler -- the prior rig recorded that a SIGSEGV-handler snapshot fires long
+ * after the ring has wrapped.  ft_get_parent_rcu already asserts that a parent
+ * is never EXTERNAL, and a freelist link (8-mod-16) clears that tag, so the
+ * check is exactly where the corruption becomes knowable.
+ *
+ * Self-diagnosing: @rt round-trips the parent through item->metadata->item, so
+ * rt == parent means a valid live object and rt != parent means RECYCLED memory
+ * -- that single field separates use-after-free from a mis-wired link before
+ * the window is even read.
+ */
+LTTNG_UST_TRACEPOINT_EVENT(cds_ft, parent_external_violation,
+	LTTNG_UST_TP_ARGS(
+		const void *, node,
+		const void *, parent,
+		const void *, rt,
+		unsigned long, pw
+	),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_integer_hex(uintptr_t, node, (uintptr_t) node)
+		lttng_ust_field_integer_hex(uintptr_t, parent, (uintptr_t) parent)
+		lttng_ust_field_integer_hex(uintptr_t, rt, (uintptr_t) rt)
+		lttng_ust_field_integer_hex(uintptr_t, pw, (unsigned long) pw)
+	)
+)
+
+/*
  * TEMPORARY (MW firing-path attribution): the call_rcu RETIRE of a published
  * internal node, tagged with free_cds_ft_node's caller return address so the
  * exact retiring site (addr2line) can be read from the snapshot.
