@@ -776,9 +776,18 @@ void ft_chain_compress_register_retire(struct ft_flip_txn *txn,
  * ITS commit lands.
  */
 struct ft_chain_compress_reclaim {
+	/*
+	 * TWO LIFETIMES, and mixing them frees a live node.  The first three are
+	 * the RETIRED chain: the caller's commit unlinks them, so they are freed
+	 * when it SUCCEEDS.  @new_cn is the merged node this collapse built and
+	 * recorded but never published, so it is freed when the caller's commit
+	 * ABORTS -- the same split ft_detach_recompact_out draws between
+	 * @old_node and @new_flag.
+	 */
 	struct cds_ft_inode *boundary;		/* the 1-child boundary node */
 	struct cds_ft_compressed_node *parent_cn;
 	struct cds_ft_compressed_node *child_cn;
+	struct cds_ft_compressed_node *new_cn;	/* unpublished: free on ABORT */
 };
 
 /*
@@ -1327,6 +1336,13 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		reclaim->boundary = ft_node_ptr(iter_node_flag);
 		reclaim->parent_cn = parent_cn;
 		reclaim->child_cn = child_cn;
+		/*
+		 * The merged node is RECORDED, not published: the caller's commit
+		 * is what publishes it, so an abort leaves it ours to reclaim.
+		 * (The non-folded path cannot reach here with it unpublished --
+		 * every bail above frees it and returns.)
+		 */
+		reclaim->new_cn = new_cn;
 		return 0;
 	}
 	free_cds_ft_node(ft, ft_node_ptr(iter_node_flag));
@@ -1383,6 +1399,13 @@ void ft_canonicalize_chain_compress(struct cds_ft *ft,
 struct ft_detach_recompact_out {
 	struct cds_ft_inode *old_node;		/* retired copy: free on commit OK */
 	struct cds_ft_inode_flag *new_flag;	/* fresh copy: free unpublished on abort */
+	/*
+	 * A FOLDED COLLAPSE's nodes, when the detach's boundary parent fell to
+	 * one child and the collapse was recorded into the caller's txn rather
+	 * than committed.  Same two lifetimes as the pair above; @boundary is
+	 * NULL when no collapse happened.
+	 */
+	struct ft_chain_compress_reclaim collapse;
 };
 
 static
@@ -2701,7 +2724,16 @@ int ft_detach_node(struct cds_ft *ft,
 						freeze_leaf,
 						count_delta,
 						ft->rank_stats ? detach_depth + 1 : 0,
-				NULL, false, NULL);
+				/*
+				 * FOLD the collapse into the caller's txn when this
+				 * detach is itself being folded, so the whole move is
+				 * ONE decide.  Its retired chain and its unpublished
+				 * merged node come back through @recompact_out for the
+				 * caller to reclaim on the right side of its commit.
+				 */
+				record_only ? shared_txn : NULL, record_only,
+				record_only && recompact_out ?
+					&recompact_out->collapse : NULL);
 
 					if (cret == 0) {
 						ret = 0;
