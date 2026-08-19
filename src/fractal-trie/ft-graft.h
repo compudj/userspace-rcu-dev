@@ -928,7 +928,7 @@ enum urcu_txn_status ft_store_at_graft_point_commit(struct cds_ft *ft,
 			 * structural_sw alone, so it would silently demote these
 			 * to an unvalidated SW park under a caller that opted in.
 			 */
-			ft_ord_cell_record_into(st->glue->txn, redges, rn);
+			ft_ord_cell_record_into_ft(ft, st->glue->txn, redges, rn);
 		}
 		/*
 		 * Freeze-on-free (doc §4.B): a reserve recompaction relocated the

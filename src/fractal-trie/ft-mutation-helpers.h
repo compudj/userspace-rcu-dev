@@ -4501,6 +4501,104 @@ enum urcu_txn_status ft_ord_cell_flip_into(struct cds_ft *ft,
 	return ft_flip_txn_commit(ft, t);
 }
 
+/* Is @m in this op's held set (the DLM lock registry)? */
+static inline
+bool ft_flip_txn_holds(const struct ft_flip_txn *t,
+		const struct cds_ft_metadata *m)
+{
+	unsigned int i;
+
+	for (i = 0; i < t->nr_locks; i++)
+		if (t->locks[i].meta == m)
+			return true;
+	return false;
+}
+
+/*
+ * §4.B VALIDATE FOR A FORWARD PUBLISH WHOSE VALUE IS AN EXISTING NODE.
+ *
+ * A structural edge's own arbitration covers the SLOT, never the VALUE, and the
+ * DLM acquire takes {C,P,(GP)} and never C's children -- so a lock can NEVER
+ * cover the node a forward edge installs.  Without a guard, a peer that retires
+ * that node between this op building its write set and its commit landing loses
+ * the race silently: the commit republishes a node whose grace period is already
+ * running, and once that period ends the slot names arena memory.  Measured as
+ * the dangling parent slot in [[project_ft_retire_still_linked_forward_edge]] --
+ * every occurrence of it came through here.
+ *
+ * The guard is the same {live_state -> live_state} edge the re-parent sweep
+ * records (ft_reparent_record_meta), for the same reason and with the same three
+ * rules:
+ *
+ *  - WAITING load, not a raw one: a raw read bakes a peer's parked
+ *    FT_STATE_PROXY into the expected-old, and a validate that matches it
+ *    publishes that pointer back into the live word, latching the node forever.
+ *  - MASK TOMBSTONE and LOCK out of the expected value, so a node a peer FROZE
+ *    or LOCKED MISMATCHES and aborts this commit.
+ *  - MW kind, unconditionally: an SW park validates nothing (it cannot fail), so
+ *    recording this through the structural_sw-dispatching helper would be a
+ *    guard in name only.
+ *
+ * SKIPPED when the op HOLDS the node: its own terminal already governs that
+ * word, and an MW edge expecting live_state would mismatch the op's OWN lock and
+ * abort every commit -- the mirror of ft_reparent_record_meta's @child_marked
+ * arm.
+ */
+static inline
+void ft_flip_txn_guard_installed_child(struct cds_ft *ft, struct ft_flip_txn *t,
+		struct cds_ft_inode_flag *nf)
+{
+	struct cds_ft_metadata *meta;
+	uintptr_t old_state, live_state;
+
+	/*
+	 * NULL clears a slot, a parked proxy is a value in flight rather than a
+	 * node, and an external head carries no state word to validate.
+	 */
+	if (!nf || ft_node_flip_proxy(nf) || ft_node_external(nf))
+		return;
+	meta = ft_node_compressed(nf) ?
+		cds_ft_item_to_metadata((struct cds_ft_inode *)
+			ft_compressed_node_ptr(nf)) :
+		cds_ft_item_to_metadata(ft_node_ptr(
+			ft_resolve_skip_compressed(ft, nf)));
+	if (ft_flip_txn_holds(t, meta)) {
+		return;
+	}
+	if (!ft_flip_txn_reserve_extra(t, 1)) {
+		return;
+	}
+	old_state = (uintptr_t) urcu_txn_load(t->mtxn,
+		(void **) &meta->state, FT_STATE_PROXY);
+	live_state = old_state & ~(FT_STATE_TOMBSTONE | FT_STATE_LOCK);
+	ft_flip_txn_record_state_mw(t, meta,
+		(void *) live_state, (void *) live_state);
+}
+
+static inline
+void ft_ord_cell_record_into_ft(struct cds_ft *ft, struct ft_flip_txn *t,
+		const struct ft_ord_cell_edge *edges, unsigned int n)
+{
+	unsigned int i;
+
+	for (i = 0; i < n; i++) {
+		uintptr_t tag = ft_edge_tag(&edges[i]);
+
+		if (tag == FT_FLIP_PROXY_TAG) {
+			if (ft)
+				ft_flip_txn_guard_installed_child(ft, t,
+					(struct cds_ft_inode_flag *)
+						edges[i].new_target);
+			ft_flip_txn_record_tag(t, (void **) edges[i].slot,
+				(void *) edges[i].old_target,
+				(void *) edges[i].new_target, tag);
+		} else
+			ft_flip_txn_record_tag_mw(t, (void **) edges[i].slot,
+				(void *) edges[i].old_target,
+				(void *) edges[i].new_target, tag);
+	}
+}
+
 /*
  * RECORD-ONLY sibling of ft_ord_cell_flip_into: append @n heterogeneous edges to
  * the caller's SHARED mixed txn @t WITHOUT committing, so the caller runs the ONE
@@ -4528,20 +4626,7 @@ static
 void ft_ord_cell_record_into(struct ft_flip_txn *t,
 		const struct ft_ord_cell_edge *edges, unsigned int n)
 {
-	unsigned int i;
-
-	for (i = 0; i < n; i++) {
-		uintptr_t tag = ft_edge_tag(&edges[i]);
-
-		if (tag == FT_FLIP_PROXY_TAG)
-			ft_flip_txn_record_tag(t, (void **) edges[i].slot,
-				(void *) edges[i].old_target,
-				(void *) edges[i].new_target, tag);
-		else
-			ft_flip_txn_record_tag_mw(t, (void **) edges[i].slot,
-				(void *) edges[i].old_target,
-				(void *) edges[i].new_target, tag);
-	}
+	ft_ord_cell_record_into_ft(NULL, t, edges, n);
 }
 
 /*
@@ -5102,7 +5187,7 @@ int ft_remove_one_commit(struct cds_ft *ft,
 		 */
 		if (record_only) {
 			assert(!run);
-			ft_ord_cell_record_into(txn, edges, n);
+			ft_ord_cell_record_into_ft(ft, txn, edges, n);
 			return 0;
 		}
 		if (ft_ord_cell_flip_into(ft, txn, edges, n) > 0)
@@ -5270,7 +5355,7 @@ enum urcu_txn_status ft_remove_commit_rec(struct cds_ft *ft,
 		 * list-off (no run/cell) so far -- asserted.
 		 */
 		assert(!run && !dead_cell);
-		ft_ord_cell_record_into(txn, edges, n);
+		ft_ord_cell_record_into_ft(ft, txn, edges, n);
 		return URCU_TXN_STATUS_OK;
 	}
 	if (txn) {
@@ -8901,7 +8986,7 @@ enum urcu_txn_status ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue 
 	 * carries a node lock to park an SW store under -- while record_tag
 	 * keys off structural_sw alone and would demote them.
 	 */
-	ft_ord_cell_record_into(g->txn, cedges, n_cedges);
+	ft_ord_cell_record_into_ft(ft, g->txn, cedges, n_cedges);
 
 	/*
 	 * Order-statistics fold (BULK): record the +count_delta nr_keys walk from
