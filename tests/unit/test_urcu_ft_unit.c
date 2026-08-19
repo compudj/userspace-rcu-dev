@@ -68,13 +68,13 @@
 #endif
 
 /*
- * 295 unconditional + 49 fault-injection-only RUN_TEST registrations, on top of
+ * 296 unconditional + 49 fault-injection-only RUN_TEST registrations, on top of
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (344 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (345 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (295 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (296 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -21870,6 +21870,259 @@ fail_nounlock:
 	return -1;
 }
 
+/*
+ * The ORDERED-LIST counterpart of test_density_stress: a randomized stream of
+ * point ops against a library-owned ordinal-cell list, with cds_ft_verify()
+ * after EVERY op.
+ *
+ * Why this sits beside the two dozen targeted ordered-list tests rather than
+ * being covered by them: each of those builds ONE shape and asserts it.  But
+ * the cell list is maintained by splice / unsplice / relocate edges riding the
+ * SAME commits as the structural change, so what breaks it is the
+ * COMBINATION -- a duplicate chain whose head is replaced while its key's cell
+ * is the list endpoint, a remove_all unsplicing a whole run, a recompact
+ * relocating cells out from under a neighbour's back-edge.  A random walk over
+ * the five point ops reaches those; one enumerated test per combination cannot
+ * be written.
+ *
+ * TWO oracles, because they fail in different directions:
+ *
+ *   cds_ft_verify()      with the ordered list on, it walks the trie in key
+ *                        order and checks the cell list matches exactly --
+ *                        order, BOTH neighbour back-edges, cell->node, and the
+ *                        head/tail endpoints.  This is the structural one.
+ *   cds_ft_count_keys()  verify compares the list AGAINST THE TRIE, so a key
+ *                        that both of them lost agrees with itself.  The shadow
+ *                        count is what notices that.
+ *
+ * Keyspace deliberately small so the trie stays dense: most inserts land on an
+ * existing node and drive compress / split / recompact, rather than growing a
+ * sparse trie where every key is its own leaf.  Up to two nodes per key keeps
+ * duplicate chains in the mix.
+ */
+#define ORD_STREAM_KEYSPACE	64
+#define ORD_STREAM_DUPS		2	/* nodes per key: head + one duplicate */
+#define ORD_STREAM_OPS		20000
+
+/* Structural + count check, run after every single mutation. */
+static int ord_stream_check(struct cds_ft *ft, const char *what,
+		unsigned int op, uint64_t k, unsigned int live)
+{
+	enum cds_ft_status s;
+	unsigned long keys;
+
+	rcu_read_lock();
+	s = cds_ft_verify(ft, stderr);
+	rcu_read_unlock();
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "ord_stream: verify failed after %s op %u key %llu\n",
+			what, op, (unsigned long long) k);
+		return -1;
+	}
+	keys = cds_ft_count_keys(ft);
+	if (keys != (unsigned long) live) {
+		fprintf(stderr, "ord_stream: after %s op %u key %llu: count_keys %lu, shadow %u\n",
+			what, op, (unsigned long long) k, keys, live);
+		return -1;
+	}
+	return 0;
+}
+
+static int test_ordered_list_random_stream(void)
+{
+	struct ft_test_node *present[ORD_STREAM_KEYSPACE][ORD_STREAM_DUPS];
+	unsigned int count[ORD_STREAM_KEYSPACE];
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_ord_ft(8, &group);
+	struct cds_ft_iter *iter;
+	uint32_t rng = 0x5eed1234;	/* fixed seed: reproducible failures */
+	unsigned int op, live = 0, walked = 0;
+	uint64_t prev_key = 0;
+	enum cds_ft_status s;
+
+	memset(present, 0, sizeof(present));
+	memset(count, 0, sizeof(count));
+
+	if (cds_ft_iter_create(ft, &iter) < 0) {
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+
+	for (op = 0; op < ORD_STREAM_OPS; op++) {
+		uint64_t k = xorshift32(&rng) % ORD_STREAM_KEYSPACE;
+		unsigned int which = xorshift32(&rng) % 5;
+		struct cds_ft_node *out = NULL, *tmp;
+		struct ft_test_node *n;
+		uint8_t kb[8];
+		unsigned int slot;
+
+		cds_ft_u64_to_key(ft, k, kb, CDS_FT_LEN_DEFAULT);
+
+		switch (which) {
+		case 0:		/* insert: fresh head, or a duplicate */
+			if (count[k] >= ORD_STREAM_DUPS)
+				break;
+			n = node_alloc(k);
+			s = cds_ft_insert(ft, kb, CDS_FT_LEN_DEFAULT, &n->node);
+			if (s != CDS_FT_STATUS_OK) {
+				fprintf(stderr, "ord_stream: op %u insert %llu: %s\n",
+					op, (unsigned long long) k,
+					cds_ft_status_to_string(s));
+				node_free(n);
+				goto fail;
+			}
+			if (count[k]++ == 0)
+				live++;
+			present[k][count[k] - 1] = n;
+			if (ord_stream_check(ft, "insert", op, k, live))
+				goto fail;
+			break;
+
+		case 1:		/* insert_replace: the whole chain, or a fresh key */
+			n = node_alloc(k);
+			s = cds_ft_insert_replace(ft, kb, CDS_FT_LEN_DEFAULT,
+					&n->node, &out);
+			/* OK = fresh insert; DUPLICATE_FOUND = chain replaced. */
+			if (s != CDS_FT_STATUS_OK &&
+					s != CDS_FT_STATUS_DUPLICATE_FOUND) {
+				fprintf(stderr, "ord_stream: op %u replace %llu: %s\n",
+					op, (unsigned long long) k,
+					cds_ft_status_to_string(s));
+				node_free(n);
+				goto fail;
+			}
+			cds_ft_for_each_duplicate_safe_rcu(out, tmp)
+				node_free_rcu(to_test_node(out));
+			if (count[k] == 0)
+				live++;
+			present[k][0] = n;
+			present[k][1] = NULL;
+			count[k] = 1;
+			if (ord_stream_check(ft, "replace", op, k, live))
+				goto fail;
+			break;
+
+		case 2:		/* remove the head */
+		case 3:		/* remove the duplicate, when there is one */
+			if (count[k] == 0)
+				break;
+			slot = (which == 3 && count[k] == ORD_STREAM_DUPS) ? 1 : 0;
+			n = present[k][slot];
+			cds_ft_iter_set_key(iter, kb, CDS_FT_LEN_DEFAULT);
+			rcu_read_lock();
+			s = cds_ft_remove(ft, iter, &n->node);
+			rcu_read_unlock();
+			if (s != CDS_FT_STATUS_OK) {
+				fprintf(stderr, "ord_stream: op %u remove %llu slot %u: %s\n",
+					op, (unsigned long long) k, slot,
+					cds_ft_status_to_string(s));
+				goto fail;
+			}
+			present[k][slot] = present[k][1];
+			present[k][1] = NULL;
+			if (--count[k] == 0)
+				live--;
+			node_free_rcu(n);
+			if (ord_stream_check(ft, "remove", op, k, live))
+				goto fail;
+			break;
+
+		case 4:		/* remove_all: unsplice the key's whole run */
+			if (count[k] == 0)
+				break;
+			cds_ft_iter_set_key(iter, kb, CDS_FT_LEN_DEFAULT);
+			rcu_read_lock();
+			s = cds_ft_remove_all(ft, iter, &out);
+			rcu_read_unlock();
+			if (s != CDS_FT_STATUS_OK) {
+				fprintf(stderr, "ord_stream: op %u remove_all %llu: %s\n",
+					op, (unsigned long long) k,
+					cds_ft_status_to_string(s));
+				goto fail;
+			}
+			cds_ft_for_each_duplicate_safe_rcu(out, tmp)
+				node_free_rcu(to_test_node(out));
+			present[k][0] = present[k][1] = NULL;
+			count[k] = 0;
+			live--;
+			if (ord_stream_check(ft, "remove_all", op, k, live))
+				goto fail;
+			break;
+		}
+		/*
+		 * QSBR quiescent state, OUTSIDE any read-side section: this is
+		 * what lets the unspliced cells actually be reclaimed as the
+		 * stream runs, instead of piling up until the end.  A cell whose
+		 * neighbours still name it is only a use-after-free once it is
+		 * really freed.
+		 */
+		rcu_quiescent_state();
+	}
+
+	/*
+	 * Final ordered walk.  Strictly increasing, exactly the live keys, and
+	 * every materialized key agreeing with the node the cell points at --
+	 * the last of which is what catches a cell wired to the wrong node while
+	 * the list order itself stayed intact.
+	 */
+	rcu_read_lock();
+	for (s = cds_ft_lookup_first(ft, iter); s == CDS_FT_STATUS_OK;
+			s = cds_ft_next(ft, iter)) {
+		struct cds_ft_node *node = cds_ft_iter_node(iter);
+		uint8_t rk[8];
+		size_t rk_len;
+		uint64_t v;
+
+		cds_ft_iter_get_key(iter, rk, sizeof(rk), &rk_len);
+		v = cds_ft_key_to_u64(ft, rk, CDS_FT_LEN_DEFAULT);
+		if (v >= ORD_STREAM_KEYSPACE || count[v] == 0) {
+			fprintf(stderr, "ord_stream: walk yielded absent key %llu\n",
+				(unsigned long long) v);
+			goto fail_rcu;
+		}
+		if (walked && v <= prev_key) {
+			fprintf(stderr, "ord_stream: walk out of order: %llu after %llu\n",
+				(unsigned long long) v,
+				(unsigned long long) prev_key);
+			goto fail_rcu;
+		}
+		if (to_test_node(node)->key != v) {
+			fprintf(stderr, "ord_stream: cell key %llu names node holding %llu\n",
+				(unsigned long long) v,
+				(unsigned long long) to_test_node(node)->key);
+			goto fail_rcu;
+		}
+		prev_key = v;
+		walked++;
+	}
+	rcu_read_unlock();
+	if (walked != live) {
+		fprintf(stderr, "ord_stream: walk visited %u keys, shadow says %u\n",
+			walked, live);
+		goto fail;
+	}
+
+	cds_ft_iter_destroy(iter);
+	return drain_and_destroy(ft, group);
+
+fail_rcu:
+	rcu_read_unlock();
+fail:
+	/*
+	 * DELIBERATELY NOT DRAINED.  The oracles above have just proved the
+	 * ordered list is corrupt, and draining walks that same list to free
+	 * the nodes -- which is how a DETECTED failure turns into a HANG
+	 * instead of a "not ok" line.  Measured with an injected unsplice
+	 * defect that leaves pred->next naming the dead cell: the diagnosis
+	 * printed, then drain_and_destroy spun and the TAP result never
+	 * appeared.  RUN_TEST short-circuits leak_check() on a non-zero
+	 * return, so the abandoned nodes are not also reported as a leak.
+	 */
+	cds_ft_iter_destroy(iter);
+	return -1;
+}
+
+
 /* ================================================================== */
 /*                                                                    */
 /*         17. EXCLUSIVE ACCESS DISCIPLINE TESTS                      */
@@ -32242,6 +32495,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_density_remove_through_compress);
 	RUN_TEST(test_density_graft_swap);
 	RUN_TEST(test_density_stress);
+	RUN_TEST(test_ordered_list_random_stream);
 
 	/* 17. Exclusive access discipline tests */
 	diag("Exclusive access discipline tests");
