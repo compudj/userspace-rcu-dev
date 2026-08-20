@@ -67,7 +67,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS_REKEY_DLM	19	/* inv_rekey_graft_{disjoint,cross_junction,glue_dst,coherent_readers,shared}, inv_rekey_linearizability, inv_rekey_public_{atomic_no_gap,atomic_no_gap_varlen,atomic_no_gap_compressed_top}, inv_rekey_coarse_progress, inv_rekey_{coarse,fine,contended}_mixed_writers, inv_rekey_merge_{occupied,compressed,shared}_dst */
+#define NR_TESTS_REKEY_DLM	20	/* inv_rekey_graft_{disjoint,cross_junction,glue_dst,coherent_readers,shared}, inv_rekey_linearizability, inv_rekey_public_{atomic_no_gap,atomic_no_gap_varlen,atomic_no_gap_compressed_top}, inv_rekey_coarse_progress, inv_rekey_{coarse,fine,contended}_mixed_writers, inv_rekey_merge_{occupied,compressed,shared}_dst, inv_rekey_merge_compressed_dst_rootchurn */
 
 /*
  * Base count = the RUN_TEST invocations in main() outside the DLM #ifdef.
@@ -1637,6 +1637,36 @@ static int inv_rekey_graft_disjoint(void)
 #define RKM_RES0	5
 #define RKM_RES1	6
 
+/*
+ * ROOT CHURN (@churn), the peer this oracle otherwise has no way to supply.
+ *
+ * On the COMPRESSED-dst arm the merge's publish parent is a path-compressed run
+ * at depth 1, so the forward publish also re-encodes the SKIP_X dual in that
+ * run's own parent -- and that parent is the ROOT.  The only peer that can
+ * write the dual slot is a RECOMPACTION of the root, and with the root's child
+ * set seeded once and never touched again, no writer ever causes one.  The
+ * `dual != d_dst.pnfp` guard that protects the second slot then fires ZERO
+ * times in a full run: it has no coverage at all.
+ *
+ * So a churning writer inserts and drops RKM_CHURN_N keys under a PRIVATE range
+ * of root-level bytes every iteration.  The root's child count oscillates
+ * across node-type boundaries, it recompacts, and it re-homes the compressed
+ * node underneath the other writers' moves.  Private ranges keep the churn from
+ * becoming a second contention oracle in its own right; the insert and the
+ * remove sit in one block, so no iteration can exit holding churn keys and the
+ * count_keys == live check below stays exact.
+ */
+#define RKM_CHURN_N	4		/* root-level bytes churned per writer */
+
+/*
+ * DOES THE ROOT ACTUALLY RELOCATE?  Without asking, the churn cannot tell "a
+ * lock excludes the peer" from "the peer never ran" -- and those two produce
+ * the identical green.  Sampled per round and reported, so a future change that
+ * quietly stops the root moving shows up as a number going to zero rather than
+ * as continued success.
+ */
+extern void *_cds_ft_debug_root(struct cds_ft *ft);
+
 struct rkm_writer_arg {
 	struct cds_ft *ft;
 	uint8_t bp, dp;
@@ -1644,7 +1674,10 @@ struct rkm_writer_arg {
 	int nsib;			/* 4, or 2 for the COMPRESSED-dst arm */
 	struct ft_test_node *res[2];	/* residents (dp,3,5)(dp,3,6) */
 	int seeded;			/* movers currently live at (bp,3,*) */
-	unsigned long ops, retries;
+	uint8_t cp;			/* churn range base (root byte), private */
+	int churn;			/* recompact the root under the peers */
+	void *root_seen;		/* last root address this writer sampled */
+	unsigned long ops, retries, churns, rootmoves;
 	int failed;
 };
 
@@ -1708,6 +1741,49 @@ static void *rkm_writer(void *arg)
 
 	while (!test_stop) {
 		int rc;
+
+		/*
+		 * Recompact the ROOT under the other writers' moves.  Self-
+		 * contained: every key inserted here is dropped again before the
+		 * move below, so no exit path can leave one behind and the
+		 * count_keys == live check stays exact.
+		 */
+		if (w->churn) {
+			rcu_read_lock();
+			for (c = 0; c < RKM_CHURN_N; c++) {
+				uint64_t ck = rkm_key((uint8_t) (w->cp + c), 1, 0);
+
+				if (insert_u64(w->ft, ck, node_alloc(ck)) !=
+						CDS_FT_STATUS_OK) {
+					rcu_read_unlock();
+					fprintf(stderr, "rkm_writer cp=%u: churn "
+						"insert failed\n", w->cp);
+					w->failed = 1;
+					goto out;
+				}
+			}
+			rcu_read_unlock();
+			for (c = 0; c < RKM_CHURN_N; c++)
+				if (remove_u64(w->ft, rkm_key((uint8_t) (w->cp + c),
+						1, 0)) != CDS_FT_STATUS_OK) {
+					fprintf(stderr, "rkm_writer cp=%u: churn "
+						"remove failed\n", w->cp);
+					w->failed = 1;
+					goto out;
+				}
+			w->churns++;
+			rcu_read_lock();
+			{
+				void *r = _cds_ft_debug_root(w->ft);
+
+				if (r != w->root_seen) {
+					if (w->root_seen)
+						w->rootmoves++;
+					w->root_seen = r;
+				}
+			}
+			rcu_read_unlock();
+		}
 
 		/* SEED the source: two lone deep keys -> compressed children. */
 		if (!w->seeded) {
@@ -1839,14 +1915,15 @@ out:
  *    the forward publish re-encode the SKIP_X dual in the run's own parent.
  *    Two parked slots in two different nodes, under contention.
  */
-static int rkm_run(const char *name, int nsib)
+static int rkm_run(const char *name, int nsib, int churn)
 {
 	struct cds_ft_group *group;
 	struct cds_ft *ft;
 	struct rkm_writer_arg *w;
 	pthread_t writers[RKM_NW];
 	struct timespec t0;
-	unsigned long total_ops = 0, total_retries = 0, live = 0;
+	unsigned long total_ops = 0, total_retries = 0, total_churns = 0, live = 0;
+	unsigned long total_rootmoves = 0;
 	int i, c, ret = 0;
 
 	if (!getenv("FT_INV_MW")) {
@@ -1882,6 +1959,13 @@ static int rkm_run(const char *name, int nsib)
 		w[i].bp = bp;
 		w[i].dp = dp;
 		w[i].nsib = nsib;
+		/*
+		 * PRIVATE and clear of the oracle's own bytes (bp/dp run 1..16
+		 * for RKM_NW == 8), so the churn recompacts the root without
+		 * colliding on any key the checks below assert about.
+		 */
+		w[i].cp = (uint8_t) (100 + RKM_CHURN_N * i);
+		w[i].churn = churn;
 		rcu_read_lock();
 		for (c = 0; c < nsib; c++) {
 			w[i].sib[c] = node_alloc(sk[c]);
@@ -1932,6 +2016,8 @@ static int rkm_run(const char *name, int nsib)
 	for (i = 0; i < RKM_NW; i++) {
 		total_ops += w[i].ops;
 		total_retries += w[i].retries;
+		total_churns += w[i].churns;
+		total_rootmoves += w[i].rootmoves;
 		if (w[i].failed)
 			ret = -1;
 		/*
@@ -1979,8 +2065,13 @@ static int rkm_run(const char *name, int nsib)
 	rcu_read_unlock();
 
 	fprintf(stderr, "# %s: %d writers, %lu merges, "
-		"%lu retries, %lu live keys\n", name, RKM_NW, total_ops,
+		"%lu retries, %lu live keys", name, RKM_NW, total_ops,
 		total_retries, live);
+	if (churn)
+		fprintf(stderr, ", %lu root-churn rounds (%lu insert+remove pairs), "
+			"%lu observed ROOT RELOCATIONS",
+			total_churns, total_churns * RKM_CHURN_N, total_rootmoves);
+	fprintf(stderr, "\n");
 
 	free(w);
 	if (drain_and_destroy(ft, group) < 0)
@@ -1992,7 +2083,7 @@ static int rkm_run(const char *name, int nsib)
 
 static int inv_rekey_merge_occupied_dst(void)
 {
-	return rkm_run("inv_rekey_merge_occupied_dst", 4);
+	return rkm_run("inv_rekey_merge_occupied_dst", 4, 0);
 }
 
 /*
@@ -2012,7 +2103,32 @@ static int inv_rekey_merge_occupied_dst(void)
  */
 static int inv_rekey_merge_compressed_dst(void)
 {
-	return rkm_run("inv_rekey_merge_compressed_dst", 2);
+	return rkm_run("inv_rekey_merge_compressed_dst", 2, 0);
+}
+
+/*
+ * THE SAME ARM WITH THE GRANDPARENT MOVING UNDER IT.
+ *
+ * The arm above publishes into a compressed run's ->child and re-encodes the
+ * SKIP_X dual in that run's PARENT -- the trie root.  It cannot exercise the
+ * guard that protects the second slot, because it never moves the root: its
+ * child set is seeded once and never touched, so `dual != d_dst.pnfp` fires
+ * ZERO times in a full run and the op's re-read always agrees with its plan.
+ *
+ * Root churn supplies the missing peer, and the difference is measured, not
+ * assumed: 0 -> 60..81 guard hits per run, against ~1300 observed root
+ * relocations.  That guard had no coverage at all before.
+ *
+ * ☞ THE COST IS REAL AND IT IS THE POINT.  Under churn the moves contend the
+ * root far harder, so merges per run fall by roughly a quarter and the
+ * grandparent acquire is refused ~93% of the time.  Measured, that refusal is
+ * ordinary PEER contention, not the op meeting itself: with
+ * FEATURE_FT_HOLD_TRACE armed the run reports ZERO self-collisions, and 98.8%
+ * of the refusals see LOCK actually set on the word.
+ */
+static int inv_rekey_merge_compressed_dst_rootchurn(void)
+{
+	return rkm_run("inv_rekey_merge_compressed_dst_rootchurn", 2, 1);
 }
 
 /*
@@ -19229,6 +19345,7 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_rekey_coarse_progress);
 	RUN_TEST(inv_rekey_merge_occupied_dst);
 	RUN_TEST(inv_rekey_merge_compressed_dst);
+	RUN_TEST(inv_rekey_merge_compressed_dst_rootchurn);
 	RUN_TEST(inv_rekey_merge_shared_dst);
 	RUN_TEST(inv_rekey_src_mutated);
 	RUN_TEST(inv_sibling_split_compress);
