@@ -574,6 +574,32 @@ int ft_verify_node_compressed(const struct cds_ft *ft, FILE *out,
 						slot_val, target_cn, cn);
 				return -1;
 			}
+			/*
+			 * A ROUND-TRIP IS NOT AN EQUALITY.  The check above
+			 * resolves the slot through ft_skip_to_compressed,
+			 * which follows the CHILD's parent_word -- and a
+			 * RETIRED former child still names @cn there.  So a
+			 * dual left encoding a superseded child passes it,
+			 * while every later publish into @cn->child plans its
+			 * expected-old against the value the dual does NOT
+			 * hold and aborts forever.
+			 *
+			 * What the publisher actually maintains is the
+			 * equality: the dual encodes the CURRENT cn->child
+			 * (ft_publish_to_parent writes the two as one flip).
+			 * Check that.  A parked cn->child is not comparable at
+			 * rest and is reported by the no-proxy check below.
+			 */
+			if (ft_node_skip_compressed(slot_val) &&
+					!ft_node_flip_proxy(cn->child) &&
+					ft_skip_child_ptr(slot_val) != cn->child) {
+				if (out)
+					fprintf(out, "ft_verify: depth %u: compressed %p stale SKIP_X dual: slot %p encodes child %p but cn->child is %p\n",
+						depth, node_flag, skip_slot,
+						ft_skip_child_ptr(slot_val),
+						cn->child);
+				return -1;
+			}
 		}
 	}
 	/*
