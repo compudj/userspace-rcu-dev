@@ -827,6 +827,24 @@ struct ft_pub_rec {
 	struct cds_ft_inode_flag *old_val[3];
 	struct cds_ft_inode_flag *new_val[3];
 	unsigned int n;
+	/*
+	 * The commit engine handle this rec's edges will be recorded into, when
+	 * the caller has one.  It is not plumbing for the record -- the caller
+	 * does that itself -- it is what lets the SKIP_X dual slot be derived
+	 * READ-YOUR-OWN-WRITES.
+	 *
+	 * The dual lives in the compressed parent's OWN parent, at the offset
+	 * that parent's metadata records; both words are ordinary transacted
+	 * slots, so an op that RE-PARENTS the compressed node in this very txn
+	 * has pending edges on them and a raw derivation answers with the
+	 * PRE-OP slot -- a word inside the node the same commit retires.  The
+	 * refreshed dual then lands in the copy nobody will read, and the live
+	 * trie keeps a dual naming a superseded child.
+	 *
+	 * NULL keeps the raw derivation (a direct-store publish has no txn to
+	 * consult, and no pending edges to miss).
+	 */
+	struct urcu_txn *mtxn;
 };
 
 /*

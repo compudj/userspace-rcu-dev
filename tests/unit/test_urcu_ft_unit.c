@@ -69,13 +69,13 @@
 #endif
 
 /*
- * 301 unconditional + 49 fault-injection-only RUN_TEST registrations, on top of
+ * 302 unconditional + 49 fault-injection-only RUN_TEST registrations, on top of
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (350 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (351 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (301 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (302 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -12758,6 +12758,142 @@ static int test_merge_rekey_same_trie_listoff_collision(void)
 out:
 	rcu_read_unlock();
 	drain_trie(ft);
+	rcu_barrier();
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
+ * A ROOT-LEVEL SOURCE JUNCTION -- a one-byte source key, so the subtree being
+ * moved hangs directly off the trie ROOT.
+ *
+ * ★ WHAT MAKES IT ITS OWN SHAPE.  The src branch point IS the root
+ * (d_src.ppnf == NULL), so ft_detach_node RECOMPACTS THE ROOT -- and a recompact
+ * re-parents every one of its children.  One of those children is the node the
+ * merge arm holds as its publish parent, so the op meets ITSELF on that child's
+ * state word.  Nothing below the root can produce that: it needs the two
+ * subsystems' lock sets to collide, which happens only when the detach's node is
+ * the ancestor of the merge's.
+ *
+ * ☠ IT PINS TWO DISTINCT WAYS THAT COLLISION GOES WRONG, and neither is an
+ * ordinary wrong answer:
+ *   - the recompact's reparent sweep records a §4.B validate expecting each
+ *     re-homed child CLEAN while the merge arm holds one of them LOCKED.  The
+ *     install CAS can then never match and the retry loop rebuilds the identical
+ *     descriptor forever -- a LIVELOCK, single-threaded, so no peer can clear
+ *     it (with -DFT_DEBUG_REKEY_RETRY_CAP it exits at the cap instead).
+ *   - the merge's publish parent is a compressed node whose own parent is that
+ *     same root, so the publish also re-encodes its SKIP_X dual -- and a dual
+ *     derived from the pre-op words lands in the root copy this commit RETIRES.
+ *     The rekey then reports OK and the trie is unoperable: see the drain below.
+ *
+ * ★ THE GEOMETRY IS CHOSEN TO ISOLATE THE ROOT JUNCTION.  Two OTHER refusals sit
+ * behind it and would otherwise answer first:
+ *   - the ordered-list ADJACENCY rule -- avoided by running LIST OFF, and "bm"
+ *     is seeded so the moved suffixes and the destination region interleave
+ *     rather than sit disjointly, which is what that rule keys on;
+ *   - the junction ALIASING terms (d_src.pnf == graft_p / graft_c) -- avoided by
+ *     giving src and dst different junctions ("q" and "az").
+ * Both junctions BRANCH (two children each), so neither is path-compressed and
+ * the shape does not depend on FEATURE_FT_SKIP_COMPRESSED either.
+ *
+ * The move also COLLIDES on one key: "qm" lands on the live "azm", so the union
+ * must demote it to a duplicate rather than replace it -- checked, because a
+ * splice that replaced the resident would leave a perfectly valid single-entry
+ * key behind and both a verify pass and a key count would sail past it.
+ */
+static int test_rekey_root_junction(void)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	int ret = -1;
+	enum cds_ft_status s;
+
+	if (!cds_ft_merge_enabled()) {
+		diag("test_rekey_root_junction: skipped, merge compiled out "
+			"(-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
+	if (cds_ft_group_attr_create(&attr) < 0)
+		abort();
+	if (cds_ft_group_attr_set_ordered_list(attr, false) < 0 ||
+	    cds_ft_group_create(attr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &ft) < 0)
+		abort();
+	rcu_read_lock();
+
+	cds_ft_insert(ft, (const uint8_t *) "azm", 3, &node_alloc(1)->node);
+	cds_ft_insert(ft, (const uint8_t *) "azq", 3, &node_alloc(2)->node);
+	cds_ft_insert(ft, (const uint8_t *) "bm", 2, &node_alloc(3)->node);
+	cds_ft_insert(ft, (const uint8_t *) "qm", 2, &node_alloc(4)->node);
+	cds_ft_insert(ft, (const uint8_t *) "qx", 2, &node_alloc(5)->node);
+
+	/* Move the DEPTH-1 subtree "q" onto "az": qm->azm COLLIDES, qx->azx. */
+	s = ft_rekey(ft, "az", "q");
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "root-junction rekey failed (%s)\n",
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "root-junction rekey: verify failed\n");
+		goto out;
+	}
+	if (!ft_test_has_key(ft, "azm") || !ft_test_has_key(ft, "azq") ||
+	    !ft_test_has_key(ft, "azx") || !ft_test_has_key(ft, "bm") ||
+	    ft_test_has_key(ft, "qm") || ft_test_has_key(ft, "qx")) {
+		fprintf(stderr, "root-junction rekey: key membership wrong\n");
+		goto out;
+	}
+	/*
+	 * The COLLIDED key must be a 2-node chain -- the resident "azm" kept and
+	 * the moved "qm" appended -- while the two uncollided keys stay single.
+	 */
+	if (ft_test_dup_count(ft, "azm") != 2 ||
+	    ft_test_dup_count(ft, "azq") != 1 ||
+	    ft_test_dup_count(ft, "azx") != 1) {
+		fprintf(stderr, "root-junction rekey: chain arity wrong "
+			"(azm=%u azq=%u azx=%u)\n",
+			ft_test_dup_count(ft, "azm"),
+			ft_test_dup_count(ft, "azq"),
+			ft_test_dup_count(ft, "azx"));
+		goto out;
+	}
+	if (cds_ft_count_keys(ft) != 4) {
+		fprintf(stderr, "root-junction rekey: count_keys %lu != 4\n",
+			cds_ft_count_keys(ft));
+		goto out;
+	}
+	rcu_read_unlock();
+	/*
+	 * ☠ AND NOW DRAIN IT -- the drain is part of the test, not part of the
+	 * teardown.  cds_ft_verify checks the structure's invariants AT REST;
+	 * it does not check that every OTHER op can still operate on what this
+	 * writer produced.  This shape passed verify, passed a key-membership
+	 * walk and an exact count, and then failed cds_ft_remove_all on the
+	 * COLLIDED key -- deterministically, single-threaded -- because the
+	 * rekey left the compressed publish parent's SKIP_X dual encoding a
+	 * superseded child.  Nothing above this line can see that.
+	 */
+	if (drain_trie(ft) < 0) {
+		fprintf(stderr, "root-junction rekey: drain failed -- the "
+			"structure verifies but cannot be operated on\n");
+		goto out_unlocked;
+	}
+	rcu_read_lock();
+	if (cds_ft_count_keys(ft) != 0) {
+		fprintf(stderr, "root-junction rekey: %lu keys left after drain\n",
+			cds_ft_count_keys(ft));
+		goto out;
+	}
+	ret = 0;
+out:
+	rcu_read_unlock();
+out_unlocked:
 	rcu_barrier();
 	cds_ft_destroy(ft);
 	cds_ft_group_destroy(group);
@@ -32930,6 +33066,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_rekey_colocated_external);
 	RUN_TEST(test_merge_rekey_same_trie_ordered);
 	RUN_TEST(test_merge_rekey_same_trie_listoff_collision);
+	RUN_TEST(test_rekey_root_junction);
 	RUN_TEST(test_nonidentity_bulk_ops);
 	RUN_TEST(test_merge_at_overflow);
 

@@ -9056,7 +9056,7 @@ static
 enum urcu_txn_status ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue *g,
 		const struct ft_ord_cell_edge *cedges, unsigned int n_cedges)
 {
-	struct ft_pub_rec rec = { .n = 0 };
+	struct ft_pub_rec rec = { .n = 0, .mtxn = g->txn ? g->txn->mtxn : NULL };
 	unsigned int j;
 	int i;
 	enum urcu_txn_status cst;
@@ -9722,7 +9722,7 @@ static
 enum urcu_txn_status ft_glue_publish(struct cds_ft *ft, struct ft_flip_txn *txn,
 		struct ft_glue *g)
 {
-	struct ft_pub_rec rec = { .n = 0 };
+	struct ft_pub_rec rec = { .n = 0, .mtxn = txn ? txn->mtxn : NULL };
 	struct ft_ord_cell_edge sedges[2] = { 0 };	/* forward slot + compressed SKIP_X dual */
 	unsigned int n;
 
@@ -9801,7 +9801,7 @@ enum urcu_txn_status ft_glue_publish_replace(struct cds_ft *ft,
 		struct ft_flip_txn *txn,
 		struct ft_glue *g, struct ft_graft_swap_run *run)
 {
-	struct ft_pub_rec rec = { .n = 0 };
+	struct ft_pub_rec rec = { .n = 0, .mtxn = txn ? txn->mtxn : NULL };
 
 	if (!run)
 		return ft_glue_publish(ft, txn, g);

@@ -2157,7 +2157,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 * subtree at a depth-1 key" is a normal call, and answering it INVALID
 	 * ARGUMENT would be a wrong answer rather than a narrow one.
 	 */
-	if (!d_src.ppnf || !graft_p || !graft_c) {
+	if (!graft_p || !graft_c) {
 		ret = FT_REKEY_UNCOVERED;
 		goto bail_build;
 	}

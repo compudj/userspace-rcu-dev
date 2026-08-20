@@ -2111,6 +2111,44 @@ struct cds_ft_inode_flag **ft_get_parent_slot(const struct cds_ft_metadata *meta
 }
 
 /*
+ * ft_txn_parent_slot: @meta's parent slot as @mtxn WILL LEAVE IT.
+ *
+ * ft_resolve_parent_slot above answers from the words as they stand: it
+ * resolves a PEER's parked re-home through the flip proxy, but an edge this
+ * op has merely RECORDED is not parked yet and lives only in the descriptor,
+ * so a raw derivation cannot see it.  An op that re-parents @meta and then
+ * derives @meta's parent slot in the same attempt therefore gets the PRE-OP
+ * slot -- and when the re-parent came from a recompaction, that slot sits
+ * inside the copy this very commit retires.
+ *
+ * So read both words READ-YOUR-OWN-WRITES.  The (parent, offset) pair needs no
+ * coherence re-read here: a re-parent records them together, so the txn returns
+ * one op's view of both, and any word without a pending edge falls through to
+ * the same waiting load ft_resolve_parent_slot performs.
+ *
+ * @mtxn NULL answers exactly as ft_get_parent_slot does.
+ */
+static inline
+struct cds_ft_inode_flag **ft_txn_parent_slot(const struct cds_ft_metadata *meta,
+		struct cds_ft *ft, struct urcu_txn *mtxn)
+{
+	struct cds_ft_inode_flag *parent;
+	void *state;
+
+	if (!mtxn)
+		return ft_resolve_parent_slot(meta, ft, NULL);
+	parent = urcu_txn_load(mtxn,
+		(void **) (uintptr_t) &meta->parent_word, FT_FLIP_PROXY_TAG);
+	state = urcu_txn_load(mtxn,
+		(void **) (uintptr_t) &meta->parent_slot_offset, FT_STATE_PROXY);
+	if (ft_parent_is_root_position(parent))
+		return &ft->root;
+	return (struct cds_ft_inode_flag **)
+		((char *) ft_node_ptr(parent) +
+		 FT_PSO_DECODE(state) * sizeof(void *));
+}
+
+/*
  * ft_slot_in_node: is @slot one of @node_flag's OWN child slots?
  *
  * The inverse of ft_get_parent_slot, which computes every slot as the node body
@@ -2541,8 +2579,15 @@ void _ft_publish_to_parent_meta(struct cds_ft *ft,
 
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 		{
+			/*
+			 * READ-YOUR-OWN-WRITES: a recorded re-parent of @cn is
+			 * invisible to a raw derivation, and this op may be
+			 * relocating @cn's parent in the same commit that
+			 * refreshes the dual.  See ft_txn_parent_slot.
+			 */
 			struct cds_ft_inode_flag **skip_slot =
-				ft_get_parent_slot(cn_meta, ft);
+				ft_txn_parent_slot(cn_meta, ft,
+					rec ? rec->mtxn : NULL);
 			if (skip_slot &&
 			    ft_node_skip_compressed(*skip_slot)) {
 				struct cds_ft_inode_flag *skip_new =
