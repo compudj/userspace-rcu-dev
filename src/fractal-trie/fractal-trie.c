@@ -140,7 +140,7 @@ unsigned long ft_probe_ranch[2], ft_probe_rewind[2];
 unsigned long ft_probe_mspin[5];
 unsigned long ft_probe_rspin[6];
 unsigned long ft_probe_rspin_x[3], ft_probe_rspin_n[3];
-unsigned long ft_probe_rspin_e[2][2];
+unsigned long ft_probe_rspin_e[3][2];
 static const char *const ft_probe_mrg_name[3] = { "src", "mergepoint", "dst" };
 static __attribute__((destructor))
 void ft_probe_mrg_report(void)
@@ -182,9 +182,11 @@ void ft_probe_mrg_report(void)
 	 * contract, answers both.
 	 */
 	fprintf(stderr, "RSPIN-ENTRIES merge_subpos{oncontract=%lu offcontract=%lu}"
-		" rekey_subpos{oncontract=%lu offcontract=%lu}\n",
+		" rekey_subpos{oncontract=%lu offcontract=%lu}"
+		" graft_swap{oncontract=%lu offcontract=%lu}\n",
 		ft_probe_rspin_e[0][1], ft_probe_rspin_e[0][0],
-		ft_probe_rspin_e[1][1], ft_probe_rspin_e[1][0]);
+		ft_probe_rspin_e[1][1], ft_probe_rspin_e[1][0],
+		ft_probe_rspin_e[2][1], ft_probe_rspin_e[2][0]);
 }
 #endif
 

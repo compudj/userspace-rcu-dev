@@ -1966,9 +1966,9 @@ extern unsigned long ft_probe_rspin_x[3], ft_probe_rspin_n[3];
  * SITE, split by @cond -- slot 0 is shared by ft_merge_graft_subpos_inplace and
  * ft_rekey_subpos_inplace, so a per-slot number cannot say which one ran.
  *   [site][0] = entries with cond FALSE, [site][1] = entries with cond TRUE
- *   site 0 = merge subpos, site 1 = rekey subpos
+ *   site 0 = merge subpos, site 1 = rekey subpos, site 2 = graft_swap
  */
-extern unsigned long ft_probe_rspin_e[2][2];
+extern unsigned long ft_probe_rspin_e[3][2];
 #define RSPIN_SITE_ENTER(site, v, cond)					\
 	do {								\
 		if ((v) == 1)						\

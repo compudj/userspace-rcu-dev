@@ -3003,7 +3003,14 @@ retry_swap:
 		urcu_txn_begin(&optxn);
 		gs_open = true;
 	}
-	RSPIN_ENTER_X(4, rs_depth, 2, dst_ft->lock_fine && swap_ft->exclusive);
+	/*
+	 * ASK @gs_bracket, not the expression it was built from.  The bracket
+	 * below keys on the const bool precisely so the condition is evaluated
+	 * ONCE (see @gs_open's comment above); a probe that re-derives it is a
+	 * second chance to disagree with the arm it claims to be measuring.
+	 */
+	RSPIN_ENTER_X(4, rs_depth, 2, gs_bracket);
+	RSPIN_SITE_ENTER(2, rs_depth, gs_bracket);
 		/*
 		 * MW LOCK_FINE drop: the re-descend point.  graft_swap's commit is
 		 * failure-free under the FT-wide lock, but with the lock dropped a
