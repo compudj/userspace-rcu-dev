@@ -1958,6 +1958,24 @@ extern unsigned long ft_probe_rspin[6];
  * split says nothing at all there.
  */
 extern unsigned long ft_probe_rspin_x[3], ft_probe_rspin_n[3];
+/*
+ * PROBE (2026-08-20): ft_probe_rspin_n[] counts only OFF-CONTRACT entries, so a
+ * zero there cannot distinguish "the loop is never entered off-contract" from
+ * "the loop is never entered AT ALL".  Both read as offc=0, and the second is a
+ * statement about reachability, not about the contract.  Count TOTAL entries per
+ * SITE, split by @cond -- slot 0 is shared by ft_merge_graft_subpos_inplace and
+ * ft_rekey_subpos_inplace, so a per-slot number cannot say which one ran.
+ *   [site][0] = entries with cond FALSE, [site][1] = entries with cond TRUE
+ *   site 0 = merge subpos, site 1 = rekey subpos
+ */
+extern unsigned long ft_probe_rspin_e[2][2];
+#define RSPIN_SITE_ENTER(site, v, cond)					\
+	do {								\
+		if ((v) == 1)						\
+			__atomic_fetch_add(				\
+				&ft_probe_rspin_e[site][(cond) ? 1 : 0],\
+				1, __ATOMIC_RELAXED);			\
+	} while (0)
 #define RSPIN_ENTER_X(i, v, xi, cond)					\
 	do {								\
 		bool c_ = (cond);					\
@@ -1973,6 +1991,7 @@ extern unsigned long ft_probe_rspin_x[3], ft_probe_rspin_n[3];
 #else
 #define RSPIN_ENTER(i, v)		do { } while (0)
 #define RSPIN_ENTER_X(i, v, xi, cond)	do { } while (0)
+#define RSPIN_SITE_ENTER(site, v, cond)	do { } while (0)
 #define MRG_SKIPCONF_PROBE(i, d)	do { } while (0)
 #define MRG_REANCHOR_PROBE(i, rw)	do { } while (0)
 #define MRG_SPIN_PROBE(i)		do { } while (0)

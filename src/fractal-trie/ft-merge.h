@@ -2509,6 +2509,7 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 
 retry_merge:
 	RSPIN_ENTER_X(0, rm_depth, 0, dst_ft->lock_fine);	/* src always exclusive here */
+	RSPIN_SITE_ENTER(0, rm_depth, dst_ft->lock_fine);
 	ft_glue_init(&glue);
 	/*
 	 * Fence the compressed divergence node (like cds_ft_graft), so a
