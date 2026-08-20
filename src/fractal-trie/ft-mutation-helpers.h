@@ -4197,7 +4197,30 @@ void ft_flip_txn_hold_or_lock_parent_at(const char *fn, int line,
 		assert(parent_nf);
 		assert(ft->lock_spacing != CDS_FT_LOCK_SPACING_PER_NODE ||
 			held_holder == ft_flag_to_metadata(ft, parent_nf));
-		ft_flip_txn_record_release_lock(t, held_holder, held_snap);
+		/*
+		 * ★ ONE WORD TAKES ONE TERMINAL, AND A RETIRE OUTRANKS A RELEASE
+		 * -- the rule ft_flip_txn_record_anchor_release states, and the
+		 * reason this arm uses the SELF-GUARDING form rather than the
+		 * fixed-snapshot ft_flip_txn_record_release_lock.
+		 *
+		 * The publish parent's ANCHOR can be a word the SAME op retires:
+		 * coarsening puts it on an ancestor, and root-only puts every
+		 * member on one word.  Then {LOCK|s -> s} and
+		 * {LOCK|s -> TOMBSTONE|s} carry the same expected old, whichever
+		 * lands second mismatches the first's pending new, and
+		 * record_chain POISONS the descriptor -- permanently, so every
+		 * commit aborts and the retry rebuilds the identical shape.  A
+		 * livelock with no contention, which is exactly how it presents
+		 * (measured single-threaded at the rekey's retry cap).
+		 *
+		 * The RYW form yields: a pending TOMBSTONE means the op retires
+		 * this anchor itself and that record is the terminal; a pending
+		 * value with LOCK already clear means a node terminal settled
+		 * it.  What it gives up is the acquire-time read-set guard the
+		 * snapshot form doubled as -- and that guard was approximating
+		 * an exclusion this arm already has, since we HOLD the word.
+		 */
+		ft_flip_txn_record_anchor_release_held(t, held_holder);
 		ft_flip_txn_lock_register(t, held_holder, held_snap);
 		return;
 	}
@@ -9159,8 +9182,19 @@ enum urcu_txn_status ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue 
 	 */
 	if (g->publish_gp_holder) {
 		if (!g->publish_gp_shared) {
-			ft_flip_txn_record_release_lock(g->txn,
-				g->publish_gp_holder, g->publish_gp_snap);
+			/*
+			 * SELF-GUARDING, for the reason the publish parent's own
+			 * release above states: this anchor can be a word the SAME
+			 * op RETIRES.  The grandparent of a compressed publish
+			 * parent is the node ABOVE it, and when the op's other end
+			 * is a root-level source junction that node is the ROOT --
+			 * which the detach recompacts and therefore retires.  A
+			 * release recorded beside that retire poisons the
+			 * descriptor permanently.  One word, one terminal; the
+			 * retire outranks.
+			 */
+			ft_flip_txn_record_anchor_release_held(g->txn,
+				g->publish_gp_holder);
 			ft_flip_txn_lock_register(g->txn, g->publish_gp_holder,
 				g->publish_gp_snap);
 		}
