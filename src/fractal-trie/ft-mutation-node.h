@@ -2130,10 +2130,32 @@ skip_copy:
 					 * only -- C's CHILDREN are never in
 					 * it -- so the §4.B guard must
 					 * VALIDATE, not park.
+					 *
+					 * ☠ THAT IS TRUE OF THIS RECOMPACTION
+					 * AND FALSE OF THE OP.  A second
+					 * subsystem in the same op can hold one
+					 * of C's children: an atomic rekey whose
+					 * source junction is at depth 1 makes C
+					 * the ROOT, and its merge arm holds the
+					 * publish parent, which is a root child.
+					 * The validate expects the word CLEAN,
+					 * the word carries the op's OWN LOCK, so
+					 * the install CAS can never match and
+					 * every attempt aborts -- a livelock
+					 * with no contention.
+					 *
+					 * So hand the recorder @ctx, the op's
+					 * whole held set, and let it answer the
+					 * question this site cannot see.  A
+					 * child found there takes NO state edge:
+					 * this sweep is never the acquirer, so
+					 * the step that took the word still owes
+					 * its release.
 					 */
 					ft_reparent_record(ft, retire_txn, iter,
 							new_node_flag, slot,
-							/*child_marked=*/ false);
+							/*child_marked=*/ false,
+							ctx);
 				} else
 					ft_set_parent(ft, iter, new_node_flag,
 							slot);
@@ -2159,14 +2181,15 @@ skip_copy:
 					 * fence covers every source slot.  See the
 					 * popcount sweep above. */
 					/*
-					 * The DLM acquire locks {C,P,(GP)}
-					 * only -- C's CHILDREN are never in
-					 * it -- so the §4.B guard must
-					 * VALIDATE, not park.
+					 * @ctx for the reason the popcount sweep
+					 * above spells out: "C's children are
+					 * never in the DLM set" is true of this
+					 * recompaction and false of the op.
 					 */
 					ft_reparent_record(ft, retire_txn, iter,
 							new_node_flag, slot,
-							/*child_marked=*/ false);
+							/*child_marked=*/ false,
+							ctx);
 				} else
 					ft_set_parent(ft, iter, new_node_flag,
 							slot);

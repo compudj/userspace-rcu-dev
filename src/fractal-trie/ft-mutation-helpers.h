@@ -5423,7 +5423,8 @@ int ft_remove_one_commit(struct cds_ft *ft,
 static void ft_reparent_record_meta(struct cds_ft *ft, struct ft_flip_txn *txn,
 		struct cds_ft_metadata *meta,
 		struct cds_ft_inode_flag *parent_nf,
-		struct cds_ft_inode_flag **slot, bool child_marked);
+		struct cds_ft_inode_flag **slot, bool child_marked,
+		const struct ft_lock_ctx *hold_ctx);
 
 static
 void ft_pub_rec_add_back_edge(struct cds_ft *ft, struct ft_pub_rec *rec,
@@ -5463,7 +5464,7 @@ void ft_pub_rec_add_back_edge(struct cds_ft *ft, struct ft_pub_rec *rec,
 		 * the "no incoming_byte write" contract above.
 		 */
 		ft_reparent_record_meta(ft, txn, meta, new_parent, slot,
-			/*child_marked=*/ false);
+			/*child_marked=*/ false, /*hold_ctx=*/ NULL);
 		return;
 	} else if (ft->ordered_list) {
 		field = &ft_ord_cell_ptr(
@@ -7628,8 +7629,45 @@ static
 void ft_reparent_record_meta(struct cds_ft *ft, struct ft_flip_txn *txn,
 		struct cds_ft_metadata *meta,
 		struct cds_ft_inode_flag *parent_nf,
-		struct cds_ft_inode_flag **slot, bool child_marked)
+		struct cds_ft_inode_flag **slot, bool child_marked,
+		const struct ft_lock_ctx *hold_ctx)
 {
+	/*
+	 * THE THIRD STATE @child_marked cannot express: the op HOLDS this
+	 * child's word, but a DIFFERENT STEP took it and therefore owns its
+	 * release.
+	 *
+	 * @child_marked is two-valued and both of its values are wrong here.
+	 * FALSE records the §4.B MW validate below, whose expected-old is the
+	 * word CLEAN -- and the word carries the op's OWN LOCK, so the install
+	 * CAS can never match: a deterministic abort on every attempt, which
+	 * presents as a livelock with no contention.  TRUE records the SW
+	 * {live_state -> live_state} form, which IS a release -- and releasing
+	 * a mark this step never took hands the word a second terminal.
+	 *
+	 * So a caller that can see the op's whole held set passes it, and a
+	 * child found in it takes neither: no state edge at all.  The
+	 * justification is already written at ft_flip_txn_hold_or_lock_parent's
+	 * SHARED arm -- "the mark is the stronger statement anyway, it is the
+	 * exclusion the guard approximates, already in force, so the word it
+	 * protects owes nothing here."  The validate exists to catch a child a
+	 * PEER froze mid-recompact; a word this op holds cannot be frozen by a
+	 * peer at all.
+	 *
+	 * NULL @hold_ctx keeps every caller that cannot answer the question on
+	 * the two-valued dispatch, byte-identical.  Only a caller that is NEVER
+	 * THE ACQUIRER may pass one -- for it, "held" always means "held by an
+	 * earlier step" -- which is exactly ft_node_recompact's reparent sweep.
+	 */
+	bool held_earlier = false;
+
+	if (hold_ctx) {
+		uintptr_t held_snap;
+		bool ratified;
+
+		held_earlier = ft_lock_ctx_holds(hold_ctx, meta, &held_snap,
+				&ratified);
+	}
 	/*
 	 * WAITING load, not a raw one -- the same rule the offset word below
 	 * obeys, and for the same reason: &meta->state enters THIS txn's write
@@ -7724,7 +7762,7 @@ void ft_reparent_record_meta(struct cds_ft *ft, struct ft_flip_txn *txn,
 	 * ft_chain_compress_fused's back-edge fold.
 	 */
 	ft_flip_txn_record_parent_word(ft, txn, meta, parent_nf,
-		child_marked);
+		child_marked || held_earlier);
 	/*
 	 * The state edge is now a pure {live_state -> live_state} GUARD: it no
 	 * longer carries the offset, so its whole job is the §4.B validate the
@@ -7759,7 +7797,13 @@ void ft_reparent_record_meta(struct cds_ft *ft, struct ft_flip_txn *txn,
 	 * Validating aborts the COMMIT instead, which is precisely what the
 	 * escalation lane arbitrates.
 	 */
-	if (child_marked) {
+	if (held_earlier) {
+		/*
+		 * NEITHER, and the ledger is NOT dropped: the step that took
+		 * this word still owes its release and is still the only one
+		 * that may record it.  See the @hold_ctx note at the top.
+		 */
+	} else if (child_marked) {
 		/*
 		 * This edge IS the mark's release (live_state masks LOCK out), so
 		 * the op stops owing one the moment it is recorded and the ledger
@@ -7791,7 +7835,7 @@ void ft_reparent_record_meta(struct cds_ft *ft, struct ft_flip_txn *txn,
 	 * with structural_sw false, record_tag IS record_tag_mw.
 	 */
 	if (record_pso) {
-		if (child_marked)
+		if (child_marked || held_earlier)
 			ft_flip_txn_record_tag(txn,
 				(void **) &meta->parent_slot_offset,
 				(void *) old_pso, (void *) new_pso,
@@ -7820,7 +7864,8 @@ static
 void ft_reparent_record(struct cds_ft *ft, struct ft_flip_txn *txn,
 		struct cds_ft_inode_flag *child_nf,
 		struct cds_ft_inode_flag *parent_nf,
-		struct cds_ft_inode_flag **slot, bool child_marked)
+		struct cds_ft_inode_flag **slot, bool child_marked,
+		const struct ft_lock_ctx *hold_ctx)
 {
 	if (!child_nf)
 		return;
@@ -7833,7 +7878,7 @@ void ft_reparent_record(struct cds_ft *ft, struct ft_flip_txn *txn,
 
 		ft_reparent_record_meta(ft, txn,
 			cds_ft_item_to_metadata((struct cds_ft_inode *) cn),
-			parent_nf, slot, child_marked);
+			parent_nf, slot, child_marked, hold_ctx);
 		return;
 	}
 	if (ft_node_compressed(child_nf)) {
@@ -7842,7 +7887,7 @@ void ft_reparent_record(struct cds_ft *ft, struct ft_flip_txn *txn,
 
 		ft_reparent_record_meta(ft, txn,
 			cds_ft_item_to_metadata((struct cds_ft_inode *) cn),
-			parent_nf, slot, child_marked);
+			parent_nf, slot, child_marked, hold_ctx);
 		return;
 	}
 #endif
@@ -7881,7 +7926,8 @@ void ft_reparent_record(struct cds_ft *ft, struct ft_flip_txn *txn,
 		return;
 	}
 	ft_reparent_record_meta(ft, txn,
-		cds_ft_item_to_metadata(ft_node_ptr(child_nf)), parent_nf, slot, child_marked);
+		cds_ft_item_to_metadata(ft_node_ptr(child_nf)), parent_nf, slot,
+		child_marked, hold_ctx);
 }
 
 static
@@ -8971,7 +9017,7 @@ void ft_glue_apply_deferred(struct cds_ft *ft, struct ft_glue *g)
 #endif
 			ft_reparent_record(ft, g->txn, g->deferred[i].child,
 				g->deferred[i].parent, g->deferred[i].slot,
-				g->deferred[i].held_lock);
+				g->deferred[i].held_lock, /*hold_ctx=*/ NULL);
 			continue;
 		}
 		ft_set_parent(ft, g->deferred[i].child, g->deferred[i].parent,
@@ -9089,7 +9135,7 @@ enum urcu_txn_status ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue 
 		if (g->txn->structural_sw) {
 			ft_reparent_record(ft, g->txn, g->deferred[i].child,
 				g->deferred[i].parent, g->deferred[i].slot,
-				g->deferred[i].held_lock);
+				g->deferred[i].held_lock, /*hold_ctx=*/ NULL);
 			continue;
 		}
 		ft_glue_record_back_edge(ft, g->txn, g->deferred[i].child,

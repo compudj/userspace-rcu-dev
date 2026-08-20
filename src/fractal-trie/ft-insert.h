@@ -232,7 +232,7 @@ void ft_park_live_parent_edge(struct cds_ft *ft,
 		 * loop that makes ABORT routine.
 		 */
 		ft_reparent_record_meta(ft, txn, meta, new_parent, slot,
-			/*child_marked=*/ false);
+			/*child_marked=*/ false, /*hold_ctx=*/ NULL);
 		return;
 	}
 	if (ft->ordered_list) {

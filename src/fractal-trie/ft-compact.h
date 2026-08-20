@@ -242,7 +242,7 @@ struct cds_ft_compressed_node *ft_compact_relocate_compressed(struct cds_ft *ft,
 			return cn;
 		}
 		ft_reparent_record(ft, t, cn2->child, cn2_flag, &cn2->child,
-			/*child_marked=*/ false);
+			/*child_marked=*/ false, /*hold_ctx=*/ NULL);
 		ft_flip_txn_record_reserved(t, (void **) gp_slot, *gp_slot,
 			cn2_flag);
 		if (ft_flip_txn_commit(ft, t) != URCU_TXN_STATUS_OK) {
