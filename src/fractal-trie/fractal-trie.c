@@ -445,6 +445,27 @@ int _cds_ft_debug_compress_enabled(void)
 }
 
 /*
+ * Is the in-place occupancy-bitmap tier compiled in?
+ *
+ * Test-only, and it must be ASKED OF THE LIBRARY rather than reproduced as a
+ * test-side #ifdef: a test that maintains its own copy of a build flag reports
+ * on its own copy, and a build whose library and tests disagree reads as a pass.
+ *
+ * ☠ THE FLAG IS ONLY HALF THE CONDITION.  ft_in_place_ok() also requires an
+ * EXCLUSIVE trie, so a test that wants the in-place path must ALSO create one
+ * -- which is why the gate's `in-place` config alone never reached
+ * ft_store_at_graft_point_commit's in-place arm.
+ */
+int _cds_ft_debug_in_place_enabled(void)
+{
+#ifdef FEATURE_FT_INSERT_IN_PLACE
+	return 1;
+#else
+	return 0;
+#endif
+}
+
+/*
  * Is @flag (a value from _cds_ft_debug_child_at) a COMPRESSED node?
  *
  * Test-only shape introspection.  A test that builds a geometry to reach a

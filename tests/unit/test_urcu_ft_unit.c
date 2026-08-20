@@ -69,13 +69,13 @@
 #endif
 
 /*
- * 302 unconditional + 49 fault-injection-only RUN_TEST registrations, on top of
+ * 303 unconditional + 49 fault-injection-only RUN_TEST registrations, on top of
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (351 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (352 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (302 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (303 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -280,6 +280,7 @@ extern void *_cds_ft_debug_root(struct cds_ft *ft);
 extern int _cds_ft_debug_cow_replace_root(struct cds_ft *ft);
 extern int _cds_ft_debug_flag_is_compressed(void *flag);
 extern int _cds_ft_debug_compress_enabled(void);
+extern int _cds_ft_debug_in_place_enabled(void);
 extern int _cds_ft_debug_flag_has_external_chain(struct cds_ft *ft, void *flag);
 extern void *_cds_ft_debug_child_at(struct cds_ft *ft, const uint8_t *key,
 		size_t key_len);
@@ -12760,6 +12761,146 @@ out:
 	drain_trie(ft);
 	rcu_barrier();
 	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
+ * THE GRAFT'S IN-PLACE RESERVE ARM -- ft_store_at_graft_point_commit's `else`
+ * of `if (st->old_recompacted_node)`, the branch taken when reserving the graft
+ * byte did NOT have to rebuild the destination's attach node.
+ *
+ * ★ WHY IT NEEDED ITS OWN TEST.  Reaching it takes BOTH halves of
+ * ft_in_place_ok(): the -DFEATURE_FT_INSERT_IN_PLACE build tier AND an
+ * EXCLUSIVE destination trie.  The gate carries the flag (its `in-place`
+ * config) and still never reached this arm, because nothing else in either
+ * suite grafts into an exclusive trie -- so the branch had ZERO coverage in
+ * every configuration.  A build flag being in the gate matrix is not the same
+ * as the feature's runtime precondition being met.
+ *
+ * ★ AND IT ASSERTS THE ARM RAN, not merely that the graft worked.  An in-place
+ * reserve mutates the attach node's occupancy bitmap where it stands; a
+ * recompact republishes a fresh copy at a NEW address.  So the node under the
+ * "a" prefix keeping its identity across the graft IS the discriminator, and
+ * the ordinary graft assertions below would pass either way without it.
+ *
+ * The feature question goes to the LIBRARY (_cds_ft_debug_in_place_enabled),
+ * never to a test-side #ifdef: a test holding its own copy of a build flag
+ * reports on its own copy.
+ *
+ * ☠ cds_ft_graft's own preconditions cost four wrong guesses to find, so they
+ * are spelled out here: ONE group shared by both tries, VARIABLE key length,
+ * the source made exclusive AFTER it is populated, and the call made OUTSIDE
+ * any RCU read-side critical section.
+ */
+static int test_graft_inplace_exclusive(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft_attr *attr;
+	struct cds_ft *dst = NULL, *src = NULL;
+	void *attach_before, *attach_after;
+	enum cds_ft_status s;
+	char k[4];
+	int i, ret = -1;
+
+	if (!_cds_ft_debug_in_place_enabled()) {
+		diag("test_graft_inplace_exclusive: skipped, in-place tier not "
+			"compiled in (needs -DFEATURE_FT_INSERT_IN_PLACE)");
+		return 0;
+	}
+	/* NULL group attr == VARIABLE key length, which cds_ft_graft requires. */
+	if (cds_ft_group_create(NULL, &group) < 0)
+		abort();
+	if (cds_ft_attr_create(&attr) < 0)
+		abort();
+	if (cds_ft_attr_set_exclusive(attr, true) < 0)
+		abort();
+	if (cds_ft_create(group, attr, &dst) < 0)		/* EXCLUSIVE dst */
+		abort();
+	cds_ft_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &src) < 0)		/* SAME group */
+		abort();
+
+	rcu_read_lock();
+	/*
+	 * Enough children under "a" that the attach node is a real branch, but
+	 * short of the type boundary -- one more byte has to FIT, or even the
+	 * in-place tier grows the node and takes the recompact arm instead.
+	 */
+	for (i = 0; i < 20; i++) {
+		snprintf(k, sizeof k, "a%c", 'a' + i);
+		cds_ft_insert(dst, (const uint8_t *) k, 2, &node_alloc(i)->node);
+	}
+	for (i = 0; i < 3; i++) {
+		snprintf(k, sizeof k, "%c", 'x' + i);
+		cds_ft_insert(src, (const uint8_t *) k, 1,
+			&node_alloc(100 + i)->node);
+	}
+	attach_before = _cds_ft_debug_child_at(dst, (const uint8_t *) "a", 1);
+	rcu_read_unlock();
+	cds_ft_make_exclusive(src);
+
+	if (!attach_before) {
+		fprintf(stderr, "graft_inplace: no attach node under \"a\"\n");
+		goto out;
+	}
+	s = cds_ft_graft(dst, (const uint8_t *) "au", 2, src);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "graft_inplace: graft -> %s\n",
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+
+	rcu_read_lock();
+	attach_after = _cds_ft_debug_child_at(dst, (const uint8_t *) "a", 1);
+	rcu_read_unlock();
+	/*
+	 * THE ARM CHECK.  Same node, same address: the reserve mutated it in
+	 * place.  A different address means the reserve recompacted and this
+	 * ran the OTHER branch -- which every other assertion here would still
+	 * be happy with.
+	 */
+	if (attach_after != attach_before) {
+		fprintf(stderr, "graft_inplace: attach node RELOCATED (%p -> %p) "
+			"-- the in-place reserve arm did not run\n",
+			attach_before, attach_after);
+		goto out;
+	}
+
+	rcu_read_lock();
+	if (!ft_test_has_key(dst, "aux") || !ft_test_has_key(dst, "auy") ||
+	    !ft_test_has_key(dst, "auz") || !ft_test_has_key(dst, "aa") ||
+	    !ft_test_has_key(dst, "at")) {
+		fprintf(stderr, "graft_inplace: key membership wrong\n");
+		rcu_read_unlock();
+		goto out;
+	}
+	if (cds_ft_verify(dst, stderr) != CDS_FT_STATUS_OK ||
+	    cds_ft_verify(src, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "graft_inplace: verify failed\n");
+		rcu_read_unlock();
+		goto out;
+	}
+	if (cds_ft_count_keys(dst) != 23 || cds_ft_count_keys(src) != 0) {
+		fprintf(stderr, "graft_inplace: counts dst %lu (want 23) "
+			"src %lu (want 0)\n",
+			cds_ft_count_keys(dst), cds_ft_count_keys(src));
+		rcu_read_unlock();
+		goto out;
+	}
+	rcu_read_unlock();
+	/* Verify is at-rest only: prove the result can still be OPERATED on. */
+	if (drain_trie(dst) < 0) {
+		fprintf(stderr, "graft_inplace: drain failed\n");
+		goto out;
+	}
+	ret = 0;
+out:
+	rcu_barrier();
+	if (src)
+		cds_ft_destroy(src);
+	if (dst)
+		cds_ft_destroy(dst);
 	cds_ft_group_destroy(group);
 	return ret;
 }
@@ -33067,6 +33208,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_merge_rekey_same_trie_ordered);
 	RUN_TEST(test_merge_rekey_same_trie_listoff_collision);
 	RUN_TEST(test_rekey_root_junction);
+	RUN_TEST(test_graft_inplace_exclusive);
 	RUN_TEST(test_nonidentity_bulk_ops);
 	RUN_TEST(test_merge_at_overflow);
 
