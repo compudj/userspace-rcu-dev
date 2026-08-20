@@ -884,6 +884,52 @@ struct ft_flip_txn {
 	 * flip.  Default false keeps every non-opted-in op all-MW == byte-identical.
 	 */
 	bool structural_sw;
+	/*
+	 * THE ONE SLOT A STRUCTURAL_SW OP MUST NOT PARK: &ft->root.
+	 *
+	 * Every other structural slot such an op writes lives inside a node
+	 * whose state word the op holds, and that hold is what makes an
+	 * unarbitrated park legal.  The root POINTER lives in no node --
+	 * ft_node_recompact says so at its own NULL-parent arm ("no node to
+	 * lock, auto-guarded by the root-slot CAS") -- so what arbitrates it is
+	 * the CAS, and an SW park is not a CAS: it neither arbitrates nor is
+	 * VISIBLE to one, because the engine's kind rule is SW xor MW per slot
+	 * GLOBALLY.  A park here would be a plain store racing every other
+	 * writer of the trie root.
+	 *
+	 * ☠ NOT because the root pointer COULD NOT be locked.  A lock word on
+	 * struct cds_ft itself would span the empty<->non-empty transition
+	 * fine; only putting the word in the root NODE is impossible.  The
+	 * reasons a lock is the wrong instrument here are these, and they are
+	 * design reasons rather than impossibilities:
+	 *
+	 *   - EVERY OTHER WRITER OF THIS SLOT IS ALREADY MW.  insert, remove,
+	 *     graft, graft_swap, merge, detach and the bulk root swaps all CAS
+	 *     it; ft_flip_txn_set_structural_sw has two callers in the whole
+	 *     tree, so the SW ops are the outliers and this exemption is what
+	 *     makes them conform.  Going the other way -- a per-trie lock word
+	 *     -- is a legitimate alternative design, but it is a tree-wide
+	 *     protocol change across all seven of those ops, and it buys
+	 *     uniformity rather than correctness.
+	 *   - A node lock buys a LONG UNFAILABLE WINDOW: reserve the set, build
+	 *     invisibly, park at the end.  The root pointer takes ONE
+	 *     transition per op and its collision window is a POINT, which is
+	 *     what an optimistic CAS is for; a lock would be pessimistic over
+	 *     the whole build of the hottest word in the structure.
+	 *   - A fence's lifetime here is bounded by NODE DEATH ("the acquire
+	 *     refuses a TOMBSTONE, so nobody re-locks that word").  A trie-level
+	 *     word never dies, so a mark leaked on it would have no natural end.
+	 *
+	 * So this one slot opts back out to MW, exactly as the ordered-cell and
+	 * rank-count edges do (ft_flip_txn_record_tag_mw, "the genuinely-
+	 * unlocked slots") -- named as a SLOT rather than as a call site,
+	 * because the ops that write it reach it through shared helpers that
+	 * cannot tell the root republish from any other forward publish.
+	 *
+	 * NULL on every txn that never opted into structural_sw, where the
+	 * dispatch below is MW for everything anyway -- byte-identical.
+	 */
+	void **sw_exempt_slot;
 };
 
 /*
@@ -984,6 +1030,7 @@ struct ft_flip_txn *ft_flip_txn_create(void)
 	t->nr_locks = 0;
 	t->acquire_miss = false;
 	t->structural_sw = false;	/* all-MW until a caller opts in under lock_fine */
+	t->sw_exempt_slot = NULL;
 	return t;
 }
 
@@ -1116,6 +1163,7 @@ struct ft_flip_txn *ft_flip_txn_create_on(struct urcu_txn *op)
 	t->nr_locks = 0;
 	t->acquire_miss = false;
 	t->structural_sw = false;
+	t->sw_exempt_slot = NULL;
 	return t;
 }
 
@@ -1158,6 +1206,7 @@ struct ft_flip_txn *ft_flip_txn_create_bounded_on(struct urcu_txn *op,
 	t->nr_locks = 0;
 	t->acquire_miss = false;
 	t->structural_sw = false;	/* all-MW until a caller opts in under lock_fine */
+	t->sw_exempt_slot = NULL;
 	return t;
 }
 
@@ -2278,7 +2327,7 @@ void ft_flip_txn_record_tag(struct ft_flip_txn *t, void **slot,
 	 * locked park, installed after the MW edges, that cannot fail.  Otherwise
 	 * (every other op, non-lock_fine) it is MW == the all-MW behaviour.
 	 */
-	if (t->structural_sw)
+	if (t->structural_sw && slot != t->sw_exempt_slot)
 		ret = urcu_txn_store_sw(t->mtxn, slot, old_ptr, new_ptr, tag);
 	else
 		ret = urcu_txn_store_mw(t->mtxn, slot, old_ptr, new_ptr, tag);
@@ -2317,9 +2366,17 @@ void ft_flip_txn_record_tag_mw(struct ft_flip_txn *t, void **slot,
  * BEFORE the first structural record.
  */
 static inline
-void ft_flip_txn_set_structural_sw(struct ft_flip_txn *t, bool v)
+void ft_flip_txn_set_structural_sw(struct ft_flip_txn *t, bool v,
+		void **sw_exempt_slot)
 {
 	t->structural_sw = v;
+	/*
+	 * Taken WITH the mode, not as a separate opt-in: the exemption exists
+	 * only because the mode does, and a caller that set one without the
+	 * other would park the root pointer unarbitrated -- silently, since
+	 * nothing downstream can tell an exempt slot it was never told about.
+	 */
+	t->sw_exempt_slot = v ? sw_exempt_slot : NULL;
 }
 
 static inline

@@ -334,7 +334,14 @@ int _cds_ft_debug_cow_replace_root(struct cds_ft *ft)
 	txn = ft_flip_txn_create();
 	if (!txn)
 		return -ENOMEM;
-	ft_flip_txn_set_structural_sw(txn, true);
+	/*
+	 * ...with &ft->root exempt.  The forward publish below parks that very
+	 * slot, and its comment already names the reason it is safe -- "root
+	 * slot self-guarded", i.e. arbitrated by its own CAS.  An SW park is
+	 * not that: it neither arbitrates nor is visible to a peer's CAS.  So
+	 * say it in the mode rather than in a comment.
+	 */
+	ft_flip_txn_set_structural_sw(txn, true, (void **) &ft->root);
 
 	/* The ROOT is its own anchor under every spacing: byte-depth 0. */
 	ret = ft_rekey_cow_stop(ft, NULL, txn, root, 0, &root_prime, marks,
@@ -344,7 +351,8 @@ int _cds_ft_debug_cow_replace_root(struct cds_ft *ft)
 		goto sweep;
 	}
 
-	/* Forward publish ft->root: root -> root' (SW; root slot self-guarded). */
+	/* Forward publish ft->root: root -> root' (MW: the root slot is
+	 * arbitrated by its own CAS -- see the sw_exempt_slot above). */
 	if (!ft_flip_txn_reserve_extra(txn, 1)) {
 		free_cds_ft_node_unpublished(ft, ft_node_ptr(root_prime));
 		ft_flip_txn_destroy(txn);

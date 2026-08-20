@@ -1602,7 +1602,26 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		return -ENOMEM;
 
 	/* 1. COW S_top -> S_top' (SW; records re-parents + retire, LOCKED). */
-	ft_flip_txn_set_structural_sw(txn, true);
+	/*
+	 * ...with ONE slot exempt: &ft->root, which this op must CAS rather
+	 * than park (see the field's own comment for why that slot is MW).
+	 *
+	 * ☠ IT CHANGES NOTHING HERE TODAY, and saying so is the point.  A
+	 * depth-1 source junction is the only shape that would make the detach
+	 * recompact the ROOT and republish it at that slot, and the junction
+	 * gate below refuses exactly that shape, FT_REKEY_UNCOVERED -- giving
+	 * as its reason that &ft->root has "no node word to park the republish
+	 * under".  Measured: zero records reach the exemption from this caller
+	 * across ft_unit and ft_inv at all three spacings.
+	 *
+	 * The exemption is what ANSWERS that reason.  It belongs with the mode
+	 * and not with the shape, because the gate can only decline the whole
+	 * move whereas the txn can simply record that one slot the way every
+	 * other writer of it already does.  Lifting the gate is a separate
+	 * question -- other refusals sit behind it -- but it cannot be lifted
+	 * onto a txn that would park the root pointer.
+	 */
+	ft_flip_txn_set_structural_sw(txn, true, (void **) &ft->root);
 	if (!merge_dst) {
 		ft_lock_ctx_init(&lctx_src, &d_src, txn);
 		/*
