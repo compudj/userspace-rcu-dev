@@ -2506,10 +2506,54 @@ enum cds_ft_status ft_merge_graft_subpos_inplace(struct cds_ft *dst_ft,
 	 * leaves both tries pristine -- no rollback, no leak.
 	 */
 	unsigned long rm_depth __attribute__((unused)) = 0;
+	/*
+	 * PERSISTENT OP HANDLE for this retry loop.  Without one, every attempt
+	 * built its transaction with the UNBOUND ft_flip_txn_create(): a fresh
+	 * handle whose retry age restarts at zero, so urcu_txn_conflict() never
+	 * advances it, urcu_txn__self_qualifies() is never reached, and the
+	 * writer can never take its per-trie FIFO turn.  A contended writer then
+	 * livelocks by construction -- ft_flip_txn_create's own docstring says so,
+	 * and this loop was measured spinning 266-587 attempts deep on ONE op in
+	 * runs that PASS, with the tail reaching 1036 under load.  The sibling
+	 * loops that already have a handle top out around 90 on the same workload.
+	 *
+	 * THE BRACKET IS CONDITIONAL, and @rm_open is a VARIABLE rather than a
+	 * re-test of @rm_bracket at each exit: a re-test is a second chance to
+	 * disagree with the arm actually opened.
+	 *
+	 * WHY THE BODY MAY BE BRACKETED AT ALL.  urcu_txn_begin() enters the RCU
+	 * read side, and urcu_txn_conflict() ages into the domain's FIFO fallback
+	 * lane -- where ft_writer_lock_gp_wait asserts !urcu_txn_in_fallback().
+	 * Either one is fatal over a grace period, so the body must take none.
+	 * Established by REACHABILITY CLOSURE over the whole translation unit, not
+	 * by grep: seeding {ft_writer_lock_gp_wait, ft_move_gate_enter} (the only
+	 * two functions in the FT that reach update_synchronize_rcu, and they
+	 * reach it INDIRECTLY through the flavor struct, which no call graph sees)
+	 * and taking the fixpoint gives 19 GP-reaching functions FT-wide; this
+	 * function reaches 432, and the intersection is EMPTY.  The same tool
+	 * reproduces ft_graft_keylen's known answer -- its own direct
+	 * ft_writer_lock_gp_wait -- which is what makes the empty set here
+	 * credible rather than merely convenient.
+	 *
+	 * @dst_ft->lock_fine is the contract the class uses, and the source is
+	 * always exclusive at this label.  The coarse arm is left unbracketed on
+	 * purpose: there ft_merge_at_inner holds the FT-wide writer lock across
+	 * this whole loop, so no peer can make its commit abort and there is
+	 * nothing for an escalation turn to win.
+	 */
+	const bool rm_bracket = dst_ft->lock_fine;
+	struct urcu_txn optxn;
+	bool rm_open = false;
 
+	if (rm_bracket)
+		ft_txn_op_init(dst_ft, &optxn);
 retry_merge:
-	RSPIN_ENTER_X(0, rm_depth, 0, dst_ft->lock_fine);	/* src always exclusive here */
-	RSPIN_SITE_ENTER(0, rm_depth, dst_ft->lock_fine);
+	if (rm_bracket) {
+		urcu_txn_begin(&optxn);
+		rm_open = true;
+	}
+	RSPIN_ENTER_X(0, rm_depth, 0, rm_bracket);
+	RSPIN_SITE_ENTER(0, rm_depth, rm_bracket);
 	ft_glue_init(&glue);
 	/*
 	 * Fence the compressed divergence node (like cds_ft_graft), so a
@@ -2535,8 +2579,13 @@ retry_merge:
 		if (glue.txn)
 			ft_flip_txn_destroy(glue.txn);
 		ft_glue_fini(&glue);
-		if (already_unlinked)
+		if (already_unlinked) {
+			ft_txn_attempt_bail(&optxn, rm_open);
+			rm_open = false;
 			goto retry_merge;	/* src consumed: OOM is transient */
+		}
+		ft_txn_attempt_end(&optxn, rm_open);
+		rm_open = false;
 		return CDS_FT_STATUS_MEMORY_ERROR;
 	}
 	glue.fuse_free_list = true;	/* reserved free-list headroom above (§4.B) */
@@ -2551,13 +2600,20 @@ retry_merge:
 		 */
 		ft_glue_abort(dst_ft, &glue);
 		ft_flip_txn_destroy(glue.txn);
+		ft_txn_attempt_bail(&optxn, rm_open);
+		rm_open = false;
 		goto retry_merge;
 	}
 	if (prep == FT_GRAFT_PREP_OOM) {
 		ft_glue_abort(dst_ft, &glue);
 		ft_flip_txn_destroy(glue.txn);
-		if (already_unlinked)
+		if (already_unlinked) {
+			ft_txn_attempt_bail(&optxn, rm_open);
+			rm_open = false;
 			goto retry_merge;	/* src consumed: OOM is transient */
+		}
+		ft_txn_attempt_end(&optxn, rm_open);
+		rm_open = false;
 		return CDS_FT_STATUS_MEMORY_ERROR;	/* both tries pristine */
 	}
 	if (prep == FT_GRAFT_PREP_POPULATED) {
@@ -2569,6 +2625,8 @@ retry_merge:
 		assert(!already_unlinked);
 		ft_flip_txn_destroy(glue.txn);
 		ft_glue_fini(&glue);
+		ft_txn_attempt_end(&optxn, rm_open);
+		rm_open = false;
 		return CDS_FT_STATUS_POPULATED_ERROR;
 	}
 	if (prep == FT_GRAFT_PREP_NOSPLIT) {
@@ -2592,8 +2650,13 @@ retry_merge:
 			cds_ft_alloc_reserve_drain(dst_ft, &reserve);
 			ft_glue_abort(dst_ft, &glue);
 			ft_flip_txn_destroy(glue.txn);
-			if (already_unlinked)
+			if (already_unlinked) {
+				ft_txn_attempt_bail(&optxn, rm_open);
+				rm_open = false;
 				goto retry_merge;	/* src consumed: transient */
+			}
+			ft_txn_attempt_end(&optxn, rm_open);
+			rm_open = false;
 			return CDS_FT_STATUS_MEMORY_ERROR;
 		}
 	}
@@ -2616,6 +2679,8 @@ retry_merge:
 		cds_ft_alloc_reserve_drain(dst_ft, &reserve);
 		ft_glue_abort(dst_ft, &glue);
 		ft_flip_txn_destroy(glue.txn);
+		ft_txn_attempt_end(&optxn, rm_open);
+		rm_open = false;
 		return CDS_FT_STATUS_POPULATED_ERROR;
 	}
 
@@ -2678,6 +2743,8 @@ retry_merge:
 				cds_ft_alloc_reserve_drain(dst_ft, &reserve);
 				ft_glue_abort(dst_ft, &glue);
 				ft_flip_txn_destroy(glue.txn);
+				ft_txn_attempt_end(&optxn, rm_open);
+				rm_open = false;
 				return CDS_FT_STATUS_MEMORY_ERROR;
 			}
 		}
@@ -2697,6 +2764,8 @@ retry_merge:
 			cds_ft_alloc_reserve_drain(dst_ft, &reserve);
 			ft_glue_abort(dst_ft, &glue);
 			ft_flip_txn_destroy(glue.txn);
+			ft_txn_attempt_end(&optxn, rm_open);
+			rm_open = false;
 			return CDS_FT_STATUS_MEMORY_ERROR;
 		}
 		already_unlinked = true;	/* POINT OF NO RETURN: @payload owned */
@@ -2765,6 +2834,8 @@ retry_merge:
 			 * / @run_first / @run_last persist (src already excised).
 			 */
 			ft_glue_abort(dst_ft, &glue);
+			ft_txn_attempt_bail(&optxn, rm_open);
+			rm_open = false;
 			goto retry_merge;
 		}
 		attached_nf = glue.attached_nf;
@@ -2821,9 +2892,13 @@ retry_merge:
 			 */
 			if (st == CDS_FT_STATUS_POPULATED_ERROR) {
 				assert(!already_unlinked);
+				ft_txn_attempt_end(&optxn, rm_open);
+				rm_open = false;
 				return CDS_FT_STATUS_POPULATED_ERROR;
 			}
-			goto retry_merge;
+			ft_txn_attempt_bail(&optxn, rm_open);
+		rm_open = false;
+		goto retry_merge;
 		}
 		ft_glue_fini(&glue);
 	}
@@ -2862,6 +2937,8 @@ retry_merge:
 	if (nm > dm)
 		uatomic_store(&dst_ft->max_used_key_len, nm, CMM_RELAXED);
 
+	ft_txn_attempt_end(&optxn, rm_open);
+	rm_open = false;
 	return CDS_FT_STATUS_OK;
 }
 
