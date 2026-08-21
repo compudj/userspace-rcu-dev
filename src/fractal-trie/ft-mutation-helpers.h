@@ -2636,9 +2636,14 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 	 * whatever the granularity (§7.3: the reservation stays safe, merely
 	 * loose).
 	 */
-	acq = (ctx && ctx->op) ?
-		ft_flip_txn_create_bounded_on(ctx->op, 3 * nr_present) :
-		ft_flip_txn_create_bounded(3 * nr_present);
+	/*
+	 * The acquire txn is STANDALONE.  What a retry loop needs from a refused
+	 * acquire is the CONTENTION AGE (see the eagain path), and that is
+	 * separable from sharing the op's handle: binding to it would also share
+	 * its descriptor and its install lane, which measured WORSE (median 9.5
+	 * starving removes against 4 for aging alone, complete separation).
+	 */
+	acq = ft_flip_txn_create_bounded(3 * nr_present);
 	if (!acq)
 		return -ENOMEM;
 	for (i = 0; i < nr; i++) {
