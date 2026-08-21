@@ -3487,6 +3487,8 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 	int nr_snapshot = 0;
 	int ret;
 	struct ft_ord_cell *precell;
+	void *cell = NULL;		/* @precell's carrier; reused across retries */
+	struct urcu_txn optxn;
 	struct ft_insert_commit ic = { 0 };
 	/*
 	 * The attach's recompactions lock {C, P, GP}; @d dates them and @ic.txn
@@ -3516,7 +3518,7 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 	 * leaves @node uninstalled -- both freed below).  List off: no cell. */
 	precell = NULL;
 	if (ft->ordered_list) {
-		void *cell = ft_ord_cell_alloc(ft, node, NULL);
+		cell = ft_ord_cell_alloc(ft, node, NULL);
 
 		if (!cell)
 			return -ENOMEM;
@@ -3533,6 +3535,34 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 			cds_ft_item_to_metadata(precell)->incoming_byte =
 				(uint8_t) key[key_len - 1];
 	}
+
+	/*
+	 * The op's persistent engine handle, initialised ONCE so contention
+	 * aging, the FIFO escalation turn and the learned descriptor size span
+	 * every attempt (doc §11) -- exactly as _cds_ft_insert does.  @cell /
+	 * @precell are allocated above and REUSED: only a committing attempt
+	 * splices the cell, so a bailed one leaves it ours.
+	 */
+	ft_txn_op_init(ft, &optxn);
+
+restart_replace_attempt:
+	urcu_txn_begin(&optxn);
+	/*
+	 * Per-attempt state.  A bailed attempt published nothing and its fresh
+	 * cluster was already rolled back, so re-arm @node's linkage and the
+	 * commit scope and re-descend from the root against the current tree.
+	 */
+	ic = (struct ft_insert_commit){ 0 };
+	ic.op = &optxn;
+	cst = URCU_TXN_STATUS_OK;
+	ret = 0;
+	nr_snapshot = 0;
+	*old_node_ret = NULL;
+	node->prev = cell;		/* NULL when the list is off */
+	node->next = NULL;
+	if (precell && key_len)
+		cds_ft_item_to_metadata(precell)->incoming_byte =
+			(uint8_t) key[key_len - 1];
 
 	key_depth = key_len + 1;
 
@@ -3920,6 +3950,21 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 
 insert_replace_done:
 	/*
+	 * Concurrent-writer PRE-COMMIT conflict: the build found its descended
+	 * position moved under a peer and bailed before arming or committing
+	 * anything, freeing its own fresh cluster.  This test comes FIRST, ahead
+	 * of the cleanup below, precisely because that cleanup frees @precell --
+	 * a retry must keep it.
+	 */
+	if (ret == -EAGAIN) {
+		if (ic.txn) {
+			ft_flip_txn_destroy(ic.txn);
+			ic.txn = NULL;
+		}
+		ft_txn_attempt_bail(&optxn, true);
+		goto restart_replace_attempt;
+	}
+	/*
 	 * @node became the installed head iff node->prev still carries its
 	 * pre-wired cell (not external).  A duplicate append (descent through a
 	 * compressed node chained @node), the uninstalled key_shorter -EEXIST
@@ -3989,18 +4034,35 @@ insert_replace_done:
 	 * MEMORY_ERROR stays defensive-only, exactly as in _cds_ft_insert: the
 	 * one-commit txn is pre-reserved, so its commit cannot allocate.
 	 */
+	if (caa_unlikely(cst == URCU_TXN_STATUS_ABORT) && ret == 0) {
+		/*
+		 * A peer won the one-commit's expected-value CAS: nothing
+		 * published, the fresh cluster rolled back by the txn's on-abort
+		 * action, and @precell was not spliced (the commit is atomic).
+		 * Re-descend.  The commit already aged the handle, so this edge
+		 * KEEPS the turn -- ft_txn_attempt_end, not _bail.
+		 */
+		ft_txn_attempt_end(&optxn, true);
+		goto restart_replace_attempt;
+	}
 	if (caa_unlikely(cst != URCU_TXN_STATUS_OK) && ret == 0) {
+		/*
+		 * Defensive only, as in _cds_ft_insert: the one-commit txn is
+		 * pre-reserved, so its commit cannot allocate.  Publishing
+		 * nothing while reporting OK would lose the insert.
+		 */
 		node->prev = NULL;
 		if (ft->ordered_list)
 			ft_ord_cell_free_unpublished(ft, precell);
 		*old_node_ret = NULL;
-		ret = cst == URCU_TXN_STATUS_ABORT ? -EAGAIN : -ENOMEM;
+		ret = -ENOMEM;
 	}
 	if (ret == 0) {
 		if (key_len > uatomic_load(&ft->max_used_key_len, CMM_RELAXED))
 			uatomic_store(&ft->max_used_key_len, key_len, CMM_RELAXED);
 	}
 
+	urcu_txn_end(&optxn);
 	return ret;
 }
 
