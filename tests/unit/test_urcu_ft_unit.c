@@ -31589,6 +31589,19 @@ static int test_detach_oom_atomicity(void)
  *   that reports failure must have left the OLD node installed and the new
  *   one reusable -- never "OK" with the old node still in place.
  *
+ * ★ BOTH ENTRY POINTS NOW HAVE A RETRY LOOP, so a single forced abort is
+ * ABSORBED and the op must SUCCEED: the knob is self-clearing, so the
+ * re-attempt runs without the fault.  A BUSY_ERROR reaching the caller is
+ * therefore itself a defect (counted as unabsorbed-BUSY), not the expected
+ * outcome it was before cds_ft_insert_replace grew its loop.
+ *
+ * ★ COVERAGE IS READ FROM THE KNOB, NOT FROM THE RETURN VALUE.
+ * ft_replace_fault_arm_abort sets the countdown to -1 at the instant it arms,
+ * so "-1 after the call" means the arm ran -- true whatever the op then
+ * reports.  The old check inferred it from a BUSY return, which a retry loop
+ * legitimately makes disappear; that would have turned this sweep silently
+ * vacuous rather than failing loudly.
+ *
  * cds_ft_verify runs after every attempt: it is what catches the other half of
  * the defect, the ordered-list cell freed while still linked because the
  * unconditional ft_ord_cell_free ran on an aborted swap.
@@ -31599,7 +31612,8 @@ static int test_replace_family_commit_fault(void)
 	struct cds_ft_group *group;
 	struct cds_ft *ft = create_fixed_fine_lock_ft(4, &group);
 	struct ft_test_node **base;
-	unsigned long aborted = 0, succeeded = 0;
+	unsigned long fired_a = 0, fired_b = 0, succeeded = 0;
+	unsigned long unabsorbed = 0;
 	unsigned long false_ok = 0, false_busy = 0, misreported = 0, unexpected = 0;
 	unsigned long replaced = 0, replace_false_ok = 0;
 	unsigned int i;
@@ -31637,6 +31651,15 @@ static int test_replace_family_commit_fault(void)
 		cds_ft_fault_replace_countdown = (long) (i % 3);
 		s = cds_ft_insert_replace(ft, k, CDS_FT_LEN_DEFAULT,
 			&fresh->node, &old_ret);
+		/*
+		 * DID THE ARM RUN?  ft_replace_fault_arm_abort self-clears the
+		 * knob to -1 at the moment it arms, so -1 here means an abort
+		 * was forced -- a signal independent of what the op then
+		 * returned.  Inferring it from a BUSY_ERROR stopped working the
+		 * moment the op grew a retry loop that absorbs the abort.
+		 */
+		if (cds_ft_fault_replace_countdown == -1)
+			fired_a++;
 		cds_ft_fault_replace_countdown = -1;
 		rcu_read_unlock();
 
@@ -31677,7 +31700,13 @@ static int test_replace_family_commit_fault(void)
 				succeeded += 0;
 			break;
 		case CDS_FT_STATUS_BUSY_ERROR:
-			aborted++;
+			/*
+			 * cds_ft_insert_replace has a retry loop now, and the
+			 * knob is self-clearing, so the re-attempt runs without
+			 * the fault and must succeed.  A BUSY escaping to the
+			 * caller means the loop did not absorb it.
+			 */
+			unabsorbed++;
 			if (installed_new)
 				false_busy++;	/* published, then reported busy */
 			break;
@@ -31736,6 +31765,8 @@ static int test_replace_family_commit_fault(void)
 		}
 		cds_ft_fault_replace_countdown = (long) (i % 2);
 		s = cds_ft_replace(ft, it, &base[i]->node, &fresh->node);
+		if (cds_ft_fault_replace_countdown == -1)
+			fired_b++;	/* the arm ran; see phase A */
 		cds_ft_fault_replace_countdown = -1;
 		rcu_read_unlock();
 		cds_ft_iter_destroy(it);
@@ -31780,17 +31811,27 @@ static int test_replace_family_commit_fault(void)
 	 * Report the census, including the zero case: a sweep that never drove
 	 * an abort proves nothing, so say so rather than pass quietly.
 	 */
-	diag("replace-family commit fault: insert_replace %lu aborted / %lu ok, "
-		"cds_ft_replace %lu ok; LIES: false-OK %lu, replace-false-OK %lu, "
-		"false-BUSY %lu, misreported-as-ENOMEM %lu, unexpected %lu",
-		aborted, succeeded, replaced, false_ok, replace_false_ok,
-		false_busy, misreported, unexpected);
-	if (false_ok || replace_false_ok || false_busy || misreported
-			|| unexpected)
+	diag("replace-family commit fault: aborts FORCED insert_replace %lu / "
+		"cds_ft_replace %lu; insert_replace %lu ok, cds_ft_replace %lu ok; "
+		"LIES: false-OK %lu, replace-false-OK %lu, false-BUSY %lu, "
+		"unabsorbed-BUSY %lu, misreported-as-ENOMEM %lu, unexpected %lu",
+		fired_a, fired_b, succeeded, replaced, false_ok,
+		replace_false_ok, false_busy, unabsorbed, misreported,
+		unexpected);
+	if (false_ok || replace_false_ok || false_busy || unabsorbed
+			|| misreported || unexpected)
 		rc = -1;
-	if (!rc && aborted == 0) {
-		fprintf(stderr, "replace fault: the knob never forced an abort "
-			"-- the arms under test did not run\n");
+	/*
+	 * A sweep that never drove an abort proves nothing, so say so rather
+	 * than pass quietly -- and say it PER PHASE: one phase firing does not
+	 * cover the other, and phase B had no such check at all before.
+	 */
+	if (!rc && (fired_a == 0 || fired_b == 0)) {
+		fprintf(stderr, "replace fault: the knob forced no abort in "
+			"%s%s%s -- the arm(s) under test did not run\n",
+			fired_a == 0 ? "cds_ft_insert_replace" : "",
+			(!fired_a && !fired_b) ? " and " : "",
+			fired_b == 0 ? "cds_ft_replace" : "");
 		rc = -1;
 	}
 
