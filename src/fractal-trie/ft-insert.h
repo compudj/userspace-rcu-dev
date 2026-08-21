@@ -3704,9 +3704,10 @@ restart_replace_attempt:
 					 * NOTHING: the old chain and its cell stay LIVE.
 					 * Dropping the status here reported the replace as
 					 * OK and then freed @old_cell -- a live cell, still
-					 * linked in the ordered list.  Surface -EAGAIN and
-					 * let the done handler free @precell unpublished,
-					 * exactly as the head arms below already do.
+					 * linked in the ordered list.  Surface -EAGAIN: the
+					 * done handler's pre-commit test re-attempts, KEEPING
+					 * @precell (nothing was published, so it is still
+					 * ours), exactly as the head arms below do.
 					 */
 					if (ft_ord_cell_swap_publish_multi(ft, old_cell,
 							precell, &sedge, 1, txn) != 0) {
@@ -3872,13 +3873,12 @@ restart_replace_attempt:
 					ft_flip_txn_guard_parent(ft, txn, d.pnf);
 					ft_replace_fault_arm_abort(txn);
 					/*
-					 * Replace op, not yet MW-hardened (no retry loop):
-					 * on a peer-conflict ABORT the commit installs
+					 * On a peer-conflict ABORT the commit installs
 					 * nothing (the old head and its cell stay live), so
-					 * surface -EAGAIN -- the done handler frees @precell
-					 * unpublished and resets @node exactly as the OOM
-					 * path does -- and do NOT free @old_cell (the swap
-					 * did not happen).
+					 * surface -EAGAIN -- the done handler's pre-commit
+					 * test re-attempts and @precell is KEPT for the next
+					 * attempt -- and do NOT free @old_cell (the swap did
+					 * not happen).
 					 */
 					if (ft_ord_cell_swap_publish_multi(ft, old_cell,
 							precell, sedges, n_sedge,
@@ -3911,9 +3911,8 @@ restart_replace_attempt:
 					/* VALIDATE (§4.B): guard the LIVE holder @d.pnf. */
 					ft_flip_txn_guard_parent(ft, txn, d.pnf);
 					ft_replace_fault_arm_abort(txn);
-					/* Replace op, not yet MW-hardened (no retry loop):
-					 * -EAGAIN on a peer-conflict ABORT (nothing
-					 * installed); the caller re-descends. */
+					/* -EAGAIN on a peer-conflict ABORT (nothing
+					 * installed); the op's own retry loop re-descends. */
 					if (ft_ord_cell_flip_into(ft, txn, sedges,
 							n_sedge) != 0) {
 						ret = -EAGAIN;
