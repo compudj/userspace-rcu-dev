@@ -4541,8 +4541,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 		if (!need_retry)
 			break;
 		/* Age the conflict, forfeit the turn, close the attempt. */
-		urcu_txn_conflict(&optxn);
-		urcu_txn_end(&optxn);
+		ft_txn_attempt_bail(&optxn, true);
 	}
 	urcu_txn_end(&optxn);
 	return s;

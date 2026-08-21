@@ -3293,8 +3293,7 @@ insert_done:
 		 * it does here -- the bail forfeits the FIFO turn, because the
 		 * re-descend below asks a peer for the position it just lost.
 		 */
-		urcu_txn_conflict(&optxn);
-		urcu_txn_end(&optxn);
+		ft_txn_attempt_bail(&optxn, true);
 		goto restart_attempt;
 	}
 	/*
@@ -4538,8 +4537,7 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 		if (!need_retry)
 			break;
 		/* Age the conflict, keep the FIFO turn, close the attempt. */
-		urcu_txn_conflict(&optxn);
-		urcu_txn_end(&optxn);
+		ft_txn_attempt_bail(&optxn, true);
 	}
 	urcu_txn_end(&optxn);
 	return s;

@@ -3273,8 +3273,7 @@ merge_spine_retry:
 		if (md_rlock) {
 			dst_ft->group->flavor->read_unlock();
 			/* Nothing moved: age the conflict, close the attempt. */
-			urcu_txn_conflict(&optxn);
-			urcu_txn_end(&optxn);
+			ft_txn_attempt_bail(&optxn, true);
 			md_rlock = false;
 		}
 		md_spin++;
@@ -3316,8 +3315,7 @@ merge_spine_retry:
 				 * keeps its turn while the peer it waits on queues
 				 * behind that same turn is the insert livelock.
 				 */
-				urcu_txn_conflict(&optxn);
-				urcu_txn_end(&optxn);
+				ft_txn_attempt_bail(&optxn, true);
 				md_rlock = false;
 			}
 			md_spin++;
