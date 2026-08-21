@@ -1000,13 +1000,39 @@ void ft_txn_attempt_end(struct urcu_txn *op, bool open)
  * turn.  These loops commit through a separate per-attempt ft_flip_txn, so
  * every one of their retry edges is a bail by this definition.
  */
+/*
+ * Lock refusals this attempt has taken and not yet aged for.
+ *
+ * ft_dlm_acquire_set records them and ages nothing: an acquire knows a WORD was
+ * contended, but only the op's retry loop knows an ATTEMPT ended, and aging is
+ * a statement about attempts.  Splitting it that way keeps ONE ager -- see the
+ * bail below -- so every op ages by the same rule no matter which level noticed
+ * the conflict.
+ */
+static __thread unsigned int ft_acq_contended;
+
 static inline
 void ft_txn_attempt_bail(struct urcu_txn *op, bool open)
 {
 	if (open) {
 		urcu_txn_conflict(op);
+		/*
+		 * Then once per refused lock-set.  An attempt that lost three
+		 * acquires waited on three peers, and folding them into the one
+		 * conflict above under-ages exactly the op the FIFO lane exists
+		 * to rescue.
+		 */
+		while (ft_acq_contended) {
+			urcu_txn_conflict(op);
+			ft_acq_contended--;
+		}
 		urcu_txn_end(op);
 	}
+	/*
+	 * Refusals from an attempt that went on to SUCCEED belong to no retry.
+	 * Drop them, or the next op on this thread is aged for them.
+	 */
+	ft_acq_contended = 0;
 }
 
 static inline
@@ -2793,6 +2819,20 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 	return 0;
 eagain:
 	ft_flip_txn_destroy(acq);
+	/*
+	 * RECORD the refusal for the op's retry loop; do not age here.  Aging at
+	 * this level too would count one contention event twice, and unevenly:
+	 * ft-insert.h reaches -EAGAIN through
+	 *
+	 *	if (!ft_lock_ctx_depth_of(...) || ft_acquire_member(...))
+	 *
+	 * whose first disjunct never enters an acquire and whose second does, so
+	 * one statement would age by one or by two with nothing at the caller
+	 * able to tell which.  Escalation rate must not depend on WHERE the
+	 * conflict was detected.
+	 */
+	if (ctx && ctx->op)
+		ft_acq_contended++;
 	return -EAGAIN;			/* nothing acquired (all-or-none) */
 }
 
