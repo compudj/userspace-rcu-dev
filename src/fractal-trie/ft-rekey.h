@@ -204,8 +204,7 @@ int ft_rekey_cow_stop(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 	 * let a future one lose its exclusion silently.
 	 */
 	assert(!ctx || !ctx->held.nr_extra);
-	ft_lock_ctx_init(&cctx, ft_lock_ctx_descent(ctx), txn);
-	cctx.op = ctx ? ctx->op : NULL;
+	ft_lock_ctx_init(&cctx, ft_lock_ctx_descent(ctx), txn, ctx ? ctx->op : NULL);
 	cctx.held.extra = marks;
 
 	/* <=2 edges/child (parent + pso) + 1 retire; caller reserves its publish. */
@@ -1625,7 +1624,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 */
 	ft_flip_txn_set_structural_sw(txn, true, (void **) &ft->root);
 	if (!merge_dst) {
-		ft_lock_ctx_init(&lctx_src, &d_src, txn);
+		ft_lock_ctx_init(&lctx_src, &d_src, txn, optxn);
 		/*
 		 * NOT bound to @optxn.  ft_flip_txn_create_*_on sets t->mtxn =
 		 * op -- an "_on" txn SHARES the handle rather than making its own
@@ -1669,6 +1668,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 
 	/* 2. Graft-fold: record-only attach of S_top' at @dst_key. */
 	ft_glue_init(&glue);
+	glue.op = optxn;
 	glue.txn = txn;
 	glue.record_only = true;
 	/*
@@ -1803,7 +1803,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 			struct ft_held_anchor pph;
 
 			/* The DST descent dates this one: it IS its parent slot. */
-			ft_lock_ctx_init(&dctx, &d_dst, txn);
+			ft_lock_ctx_init(&dctx, &d_dst, txn, optxn);
 			if (!pp_meta || ft_acquire_member(ft, &dctx, d_dst.pnf,
 					pp_meta, d_dst.pdepth, &pph)) {
 				pp_meta = NULL;
@@ -1883,7 +1883,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 					goto bail_build;
 				}
 				gp_meta = ft_flag_to_metadata(ft, d_dst.ppnf);
-				ft_lock_ctx_init(&gctx, &d_dst, txn);
+				ft_lock_ctx_init(&gctx, &d_dst, txn, optxn);
 				/*
 				 * ☠ CHAIN THE GLUE, or a COARSE spacing
 				 * livelocks the move.  @publish_parent's mark
@@ -1921,6 +1921,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 
 		/* Size both glues from the read-only pre-pass, with headroom. */
 		ft_glue_init(&src_glue);
+		src_glue.op = optxn;
 		/*
 		 * The merge's SRC glue anchors from the src descent, as the dst
 		 * glue does from @d_dst: its overlap fences land on nodes still
@@ -2033,7 +2034,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		 */
 		struct ft_lock_ctx bctx;
 
-		ft_lock_ctx_init(&bctx, &d_src, txn);
+		ft_lock_ctx_init(&bctx, &d_src, txn, optxn);
 		bctx.held.extra = marks;
 		bctx.held.nr_extra = nr_marks;
 		prep = ft_graft_build(ft, dst_ord, dst_len, s_top_prime, cnt,
@@ -2277,7 +2278,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		{
 			struct ft_held_anchor pph;
 
-			ft_lock_ctx_init(&lctx_src, &d_src, txn);
+			ft_lock_ctx_init(&lctx_src, &d_src, txn, optxn);
 			/*
 			 * The REST of the op's held set, exactly as the
 			 * store-prepare and detach arms name it:
@@ -2356,7 +2357,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 				struct ft_lock_ctx dctx;
 				unsigned int cd;
 
-				ft_lock_ctx_init(&dctx, &d_dst, txn);
+				ft_lock_ctx_init(&dctx, &d_dst, txn, optxn);
 					/*
 				 * The REST of the op's held set: the cow_stop
 				 * marks reach no registry until the sweep, and
@@ -2429,7 +2430,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 			 */
 			struct ft_lock_ctx octx;
 
-			ft_lock_ctx_init(&octx, &d_src, txn);
+			ft_lock_ctx_init(&octx, &d_src, txn, optxn);
 			octx.held.extra = marks;
 			octx.held.nr_extra = nr_marks;
 			gst = ft_store_at_graft_point_prepare(ft, dst_ord,
@@ -2507,7 +2508,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 * Under a coarse spacing S_top's fence lands on BP, which is exactly the
 	 * node this detach recompacts.
 	 */
-	ft_lock_ctx_init(&lctx_src, &d_src, txn);
+	ft_lock_ctx_init(&lctx_src, &d_src, txn, optxn);
 	lctx_src.held.extra = marks;
 	lctx_src.held.nr_extra = nr_marks;
 	/*
@@ -5226,7 +5227,7 @@ merge_spine_retry:
 		 * cnt_dst != 0 would have; on a held root, report BUSY.
 		 */
 		fence_ret = ft_root_attach_fence_empty(dst_ft, &dst_root_fenced,
-			&dst_rmeta, &dst_root_snap);
+			&dst_rmeta, &dst_root_snap, &optxn);
 		if (fence_ret == -EEXIST)
 			goto diverged;
 		if (fence_ret) {

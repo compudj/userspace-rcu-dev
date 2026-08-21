@@ -1618,7 +1618,8 @@ int ft_detach_node(struct cds_ft *ft,
 		wd = *ft_lock_ctx_descent(op_ctx);
 		wd_valid = true;
 	}
-	ft_lock_ctx_init(&lctx, wd_valid ? &wd : NULL, NULL);
+	ft_lock_ctx_init(&lctx, wd_valid ? &wd : NULL, NULL,
+		op_ctx ? op_ctx->op : NULL);
 	lctx.held.extra = orphan_held;
 	/*
 	 * This frame keeps its OWN out-of-registry array (@orphan_held), so the
@@ -2403,7 +2404,8 @@ int ft_detach_node(struct cds_ft *ft,
 
 			if (wd_valid)
 				wwd = wd;
-			ft_lock_ctx_init(&wlctx, wd_valid ? &wwd : NULL, NULL);
+			ft_lock_ctx_init(&wlctx, wd_valid ? &wwd : NULL, NULL,
+				op_ctx ? op_ctx->op : NULL);
 			wlctx.held.extra = orphan_held;
 
 			/* Phase 1: elevated ancestors. */
@@ -3880,7 +3882,8 @@ static
 enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 		struct cds_ft_iter *iter,
 		struct cds_ft_node *node,
-		bool *need_retry)
+		bool *need_retry,
+		struct urcu_txn *op)
 {
 	/*
 	 * Anchor source for the op's lock-sets, populated only where a descent
@@ -4097,7 +4100,7 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 	 */
 	struct ft_lock_ctx lctx;
 
-	ft_lock_ctx_init(&lctx, have_descent ? &d : NULL, NULL);
+	ft_lock_ctx_init(&lctx, have_descent ? &d : NULL, NULL, op);
 
 	/*
 	 * Cell-always: @node heads its chain iff its prev is the cell (not an
@@ -4534,7 +4537,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 	for (;;) {
 		need_retry = false;
 		urcu_txn_begin(&optxn);
-		s = _cds_ft_remove_locked(ft, iter, node, &need_retry);
+		s = _cds_ft_remove_locked(ft, iter, node, &need_retry, &optxn);
 		if (!need_retry)
 			break;
 		/* Age the conflict, forfeit the turn, close the attempt. */
@@ -4603,7 +4606,8 @@ bool ft_locate_chain_head(struct cds_ft *ft, struct cds_ft_node *head,
 static
 enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 		struct cds_ft_iter *iter,
-		struct cds_ft_node **result_node)
+		struct cds_ft_node **result_node,
+		struct urcu_txn *op)
 {
 	struct cds_ft_node *chain_head;
 	struct cds_ft_inode_flag *holder_flag;
@@ -4773,7 +4777,7 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 			have_descent = true;
 		}
 	}
-	ft_lock_ctx_init(&lctx, have_descent ? &d : NULL, NULL);
+	ft_lock_ctx_init(&lctx, have_descent ? &d : NULL, NULL, op);
 
 	/*
 	 * Ordered list on: the whole key leaves the trie, so its head's cell is
@@ -5052,7 +5056,7 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 	 */
 	ft_txn_op_init(ft, &optxn);
 	urcu_txn_begin(&optxn);
-	s = _cds_ft_remove_all_locked(ft, iter, result_node);
+	s = _cds_ft_remove_all_locked(ft, iter, result_node, &optxn);
 	urcu_txn_end(&optxn);
 	return s;
 }

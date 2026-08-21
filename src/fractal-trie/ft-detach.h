@@ -39,10 +39,12 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 	struct cds_ft *detached;
 	struct cds_ft_inode_flag *child;
 	enum cds_ft_status status;
+	struct urcu_txn optxn;
 
 	*result_ft = NULL;
 
 	CDS_FT_SCOPED_WRITER(ft);
+	ft_txn_op_init(ft, &optxn);
 
 	const struct cds_ft_key_map *km = &ft->group->key_map;
 	uint8_t ordinal_buf[FT_MAX_KEY_LEN];
@@ -304,6 +306,7 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 			if (status != CDS_FT_STATUS_OK)
 				return status;
 			ft_glue_init(&glue);
+			glue.op = &optxn;
 			/*
 			 * The detached trie is returned exclusive: the
 			 * synchronize_rcu below drains in-flight readers of
@@ -413,11 +416,32 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 				 */
 				struct ft_lock_ctx lctx;
 
-				ft_lock_ctx_init(&lctx, &d, NULL);
+				/*
+				 * JOIN THE ESCALATION DOMAIN for the lock-set this
+				 * detach takes.  The op has no retry loop of its own,
+				 * so it needs no AGING -- what it needs is DEFERENCE:
+				 * begin() honours domain->active, so a peer starving
+				 * on one of these anchors is queued in front of this
+				 * detach instead of being barged past by it.
+				 *
+				 * ★ THE BRACKET IS THIS CALL AND NOTHING MORE.
+				 * ft_detach_keylen waits for three grace periods
+				 * (ft_writer_lock_gp_wait, above and below), and a
+				 * writer parked on the fallback lane is an ONLINE,
+				 * non-quiescent QSBR reader -- precisely what stops the
+				 * grace period it would then wait for.  That is the rule
+				 * ft_writer_lock_gp_wait asserts (!urcu_txn_in_fallback).
+				 * ft_detach_node itself takes no grace period -- there is
+				 * no ft_writer_lock_gp_wait anywhere in ft-remove.h -- so
+				 * a bracket around exactly it is provably clear of one.
+				 */
+				urcu_txn_begin(&optxn);
+				ft_lock_ctx_init(&lctx, &d, NULL, &optxn);
 				ret = ft_detach_node(ft, &lctx, d.nfp, d.pnfp, d.depth,
 						false, NULL, pubp, runp, NULL, NULL,
 						-(long) detached_count, NULL, false,
 						NULL, NULL);
+				urcu_txn_end(&optxn);
 				assert(ret != -ENOENT);
 				if (ret < 0) {
 					/*

@@ -414,7 +414,8 @@ struct ft_ord_cell *ft_compact_relocate_cell(struct cds_ft *ft,
  */
 static
 void ft_compact_descend(struct cds_ft *ft, const uint8_t *key,
-		size_t key_len, unsigned long *relocated, bool *oom)
+		size_t key_len, unsigned long *relocated, bool *oom,
+		struct urcu_txn *op)
 {
 	const struct cds_ft_key_map *km = &ft->group->key_map;
 	struct cds_ft_inode_flag **holder = &ft->root;
@@ -428,7 +429,15 @@ void ft_compact_descend(struct cds_ft *ft, const uint8_t *key,
 	 * ft_dlm_acquire_set already does.
 	 */
 	ft_descent_init(&d, ft);
-	ft_lock_ctx_init(&ctx, &d, NULL);
+	/*
+	 * @op has no retry loop behind it -- a refused acquire here reaches the
+	 * caller as -EAGAIN -- so it is carried for DEFERENCE, not aging: the
+	 * caller's begin() honours domain->active, and a peer starving on one of
+	 * these anchors is queued in front of this pass rather than barged past.
+	 * Nothing under this descent waits for a grace period, so holding a lane
+	 * turn across it cannot stall the readers it would then wait on.
+	 */
+	ft_lock_ctx_init(&ctx, &d, NULL, op);
 
 	for (;;) {
 		struct cds_ft_inode_flag *nf = rcu_dereference(*holder);
@@ -581,7 +590,9 @@ enum cds_ft_compact_status cds_ft_compact_step(struct cds_ft_compact_state *st,
 	const struct rcu_flavor_struct *flavor = ft->group->flavor;
 	unsigned long relocated = 0;
 	bool resume_inclusive;
+	struct urcu_txn optxn;
 
+	ft_txn_op_init(ft, &optxn);
 	if (st->done)
 		return CDS_FT_COMPACT_DONE;
 	if (batch == 0)
@@ -636,7 +647,10 @@ enum cds_ft_compact_status cds_ft_compact_step(struct cds_ft_compact_state *st,
 			st->done = true;
 			break;
 		}
-		ft_compact_descend(ft, key, key_len, &relocated, &st->oom);
+		urcu_txn_begin(&optxn);
+		ft_compact_descend(ft, key, key_len, &relocated, &st->oom,
+				&optxn);
+		urcu_txn_end(&optxn);
 		/*
 		 * Relocate this key's cell into a dense private cell range, in the
 		 * same key order the iterator visits -- so the ordered cell list

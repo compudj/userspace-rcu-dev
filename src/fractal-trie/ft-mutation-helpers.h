@@ -1819,9 +1819,22 @@ int ft_member_node_snap(const struct ft_lock_ctx *ctx,
  * every op has.  An op that also keeps marks outside the registry fills
  * @held.extra itself afterwards.
  */
+/*
+ * @op is the enclosing operation's PERSISTENT txn handle, or NULL where the op
+ * genuinely has none (an exclusive trie, or a standalone internal txn with no
+ * retry loop).
+ *
+ * IT IS A PARAMETER, not a field left for the caller to patch afterwards.  It
+ * used to be initialised to NULL unconditionally, and three sites out of
+ * thirty-two remembered to assign it: measured 6 enrolled acquires against
+ * 5,824,454 domain-less ones.  A refused acquire on a domain-less handle cannot
+ * age its op (ft_dlm_acquire_set's eagain path), so the op never reaches the
+ * escalation domain's FIFO lane and a contended anchor starves it.  Making it an
+ * argument is what stops a new site from re-opening that hole silently.
+ */
 static inline
 void ft_lock_ctx_init(struct ft_lock_ctx *ctx, const struct ft_descent *d,
-		struct ft_flip_txn *txn)
+		struct ft_flip_txn *txn, struct urcu_txn *op)
 {
 	ctx->d = d;
 	ctx->held.txn = txn;
@@ -1829,7 +1842,7 @@ void ft_lock_ctx_init(struct ft_lock_ctx *ctx, const struct ft_descent *d,
 	ctx->held.nr_extra = 0;
 	ctx->held.glue = NULL;
 	ctx->held.outer = NULL;
-	ctx->op = NULL;
+	ctx->op = op;
 }
 
 /*
@@ -3220,7 +3233,8 @@ unsigned int ft_ord_sentinel_edges(struct cds_ft *ft,
 static inline
 int ft_root_attach_fence_empty(struct cds_ft *dst_ft,
 		struct cds_ft_inode_flag **root_out,
-		struct cds_ft_metadata **meta_out, uintptr_t *snap_out)
+		struct cds_ft_metadata **meta_out, uintptr_t *snap_out,
+		struct urcu_txn *op)
 {
 	unsigned int attempt;
 
@@ -3246,7 +3260,17 @@ int ft_root_attach_fence_empty(struct cds_ft *dst_ft,
 		 * needs no descent -- but it still goes through the choke point,
 		 * for the dedupe and so the machine check stays total.
 		 */
-		if (ft_acquire_member(dst_ft, NULL, root, rmeta, 0, &held))
+		/*
+		 * @op reaches the acquire through a ctx built here: the fence
+		 * takes ONE member and needs no descent, so it had been passing
+		 * a literal NULL ctx -- which also meant the dst ROOT metadata,
+		 * the most contended word under root-only spacing, could never
+		 * age its op on a refusal.
+		 */
+		struct ft_lock_ctx fctx;
+
+		ft_lock_ctx_init(&fctx, NULL, NULL, op);
+		if (ft_acquire_member(dst_ft, &fctx, root, rmeta, 0, &held))
 			return -EAGAIN;
 		snap = held.lock_snap;
 		/*
@@ -4080,6 +4104,15 @@ void ft_flip_txn_lock_or_guard_parent_at(const char *fn, int line,
 		 */
 		struct ft_lock_ctx lctx = {
 			.d = ft_lock_ctx_descent(ctx),
+			/*
+			 * CARRY THE OP.  Omitting it here zero-initialises it,
+			 * so a @ctx that arrived ENROLLED in the escalation
+			 * domain was laundered into an unenrolled one and the
+			 * acquire below could no longer age it -- measured
+			 * 1,346,610 domain-less acquires per ft_inv run at this
+			 * one site, all from callers that had a handle.
+			 */
+			.op = ctx ? ctx->op : NULL,
 			.held = { .txn = t,
 				.extra = ctx ? ctx->held.extra : NULL,
 				.nr_extra = ctx ? ctx->held.nr_extra : 0,
@@ -6846,6 +6879,12 @@ struct ft_glue_splice {
 #define FT_GLUE_FLOOR_SPLICE	8
 
 struct ft_glue {
+	/*
+	 * The enclosing op's persistent txn handle, so the lock contexts this
+	 * glue builds can age it on a refused acquire (ft_dlm_acquire_set).
+	 * NULL where the op has none.
+	 */
+	struct urcu_txn *op;
 	struct ft_glue_deferred_edge *deferred;
 	int nr_deferred;
 	int cap_deferred;
@@ -7121,7 +7160,7 @@ struct ft_glue {
 static inline
 void ft_glue_lock_ctx(const struct ft_glue *g, struct ft_lock_ctx *ctx)
 {
-	ft_lock_ctx_init(ctx, g->lock_d, g->txn);
+	ft_lock_ctx_init(ctx, g->lock_d, g->txn, g->op);
 	/*
 	 * The glue's OWN marks are part of the op's held set -- its build fences
 	 * the compressed node it splits, and under a coarse spacing the publish
@@ -7153,6 +7192,7 @@ void ft_glue_lock_ctx_origin(const struct ft_glue *g, struct ft_lock_ctx *ctx,
 static
 void ft_glue_init(struct ft_glue *g)
 {
+	g->op = NULL;			/* the op sets it beside g->txn */
 	g->deferred = g->deferred_floor;
 	g->nr_deferred = 0;
 	g->cap_deferred = FT_GLUE_FLOOR_DEFERRED;

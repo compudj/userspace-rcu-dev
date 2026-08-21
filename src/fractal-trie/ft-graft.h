@@ -504,7 +504,7 @@ enum cds_ft_status ft_store_at_graft_point_prepare(struct cds_ft *ft,
 	 * these recompactions collapse onto one word.  NULL for a caller with
 	 * nothing outstanding.
 	 */
-	ft_lock_ctx_init(&gctx, d, glue->txn);
+	ft_lock_ctx_init(&gctx, d, glue->txn, glue->op);
 	gctx.held.outer = outer;
 	/*
 	 * The glue's own acquires (its publish parent, its split CN) fire from
@@ -1211,6 +1211,14 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		struct cds_ft *src_ft,
 		struct ft_flip_txn **pre_txn)
 {
+	/*
+	 * FUNCTION SCOPE on purpose: the key_len == 0 root-attach path below
+	 * returns before the retry loop that used to own this handle, and its
+	 * root fence takes the dst ROOT's lock -- the most contended word under
+	 * root-only spacing.  Scoping the handle to the retry loop left that
+	 * acquire with nothing to age.
+	 */
+	struct urcu_txn optxn;
 	struct cds_ft_metadata *src_rmeta;
 	size_t src_max;
 
@@ -1280,8 +1288,9 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		 * swapping later let a contract-legal peer attach land in the
 		 * window and be freed with the old root.
 		 */
+		ft_txn_op_init(dst_ft, &optxn);
 		fence_ret = ft_root_attach_fence_empty(dst_ft, &dst_root_fenced,
-			&dst_rmeta, &dst_root_snap);
+			&dst_rmeta, &dst_root_snap, &optxn);
 		if (fence_ret == -EEXIST)
 			return CDS_FT_STATUS_POPULATED_ERROR;
 		if (fence_ret)
@@ -1585,7 +1594,6 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		 * takes: excl=679819 live=0, against 225 ops entering off-contract
 		 * in the same run, so the split is not vacuous.
 		 */
-		struct urcu_txn optxn;
 		const bool ra_txn = dst_ft->lock_fine && src_ft->exclusive;
 		unsigned long ra_depth __attribute__((unused)) = 0;
 
@@ -1623,6 +1631,7 @@ retry_attach:
 		 * @glue; otherwise just locate the graft point in @d.
 		 */
 		ft_glue_init(&glue);
+		glue.op = &optxn;
 		/*
 		 * Enable the split-retire @cn fence for this graft: ft_graft_keylen's
 		 * retry_attach loop handles a fence-miss (FT_GRAFT_PREP_RETRY) as a
@@ -3127,7 +3136,9 @@ retry_swap:
 		}
 
 		ft_glue_init(&glue_insert);
+		glue_insert.op = &optxn;
 		ft_glue_init(&glue_extract);
+		glue_extract.op = &optxn;
 		/*
 		 * @d is the DST graft-point descent, so it dates the insert glue's
 		 * publish parent (that glue's whole cluster hangs off the graft
@@ -3777,7 +3788,7 @@ retry_swap:
 			cds_ft_alloc_reserve_activate(dst_ft, &gs_reserve);
 			struct ft_lock_ctx lctx;
 
-			ft_lock_ctx_init(&lctx, &d, NULL);
+			ft_lock_ctx_init(&lctx, &d, NULL, &optxn);
 			dret = ft_detach_node(dst_ft, &lctx, d.nfp, d.pnfp, d.depth,
 					false, NULL, gs_ord ? &dpub : NULL,
 					gs_ord ? &drun : NULL, NULL, NULL,

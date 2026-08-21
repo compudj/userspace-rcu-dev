@@ -679,8 +679,7 @@ int ft_insert_dlm_acquire_split(struct cds_ft *ft,
 	 * live at this point (the commit is armed later), so the op carries only
 	 * this txn's records here.
 	 */
-	ft_lock_ctx_init(&lctx, d, NULL);
-	lctx.op = ic ? ic->op : NULL;
+	ft_lock_ctx_init(&lctx, d, NULL, ic ? ic->op : NULL);
 	dret = ft_dlm_acquire_set(ft, &lctx, set, 2);
 	if (dret)
 		return dret == -ENOMEM ? -ENOMEM : -EAGAIN;
@@ -914,7 +913,7 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 	} else {
 		struct ft_lock_ctx lctx;
 
-		ft_lock_ctx_init(&lctx, dsc, ic ? ic->txn : NULL);
+		ft_lock_ctx_init(&lctx, dsc, ic ? ic->txn : NULL, ic ? ic->op : NULL);
 		fret = ft_acquire_member(ft, &lctx, compressed_flag, cn_meta,
 			node_depth, &held);
 	}
@@ -1296,7 +1295,7 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 		 * @cur_parent came from CN's back-pointer, so the descent's
 		 * window is what dates it.
 		 */
-		ft_lock_ctx_init(&pctx, dsc, ic ? ic->txn : NULL);
+		ft_lock_ctx_init(&pctx, dsc, ic ? ic->txn : NULL, ic ? ic->op : NULL);
 		ft_insert_publish_or_park(ft, &pctx, cur_parent,
 			FT_DEPTH_FROM_DESCENT, parent_slot, top_flag,
 			fwd_expected_old, ic);
@@ -2467,7 +2466,7 @@ int ft_insert_compressed_past_child(struct cds_ft *ft,
 	{
 		struct ft_lock_ctx pctx;
 
-		ft_lock_ctx_init(&pctx, d, ic ? ic->txn : NULL);
+		ft_lock_ctx_init(&pctx, d, ic ? ic->txn : NULL, ic ? ic->op : NULL);
 		ft_insert_publish_or_park(ft, &pctx, d->nf, d->depth,
 			&cn->child, branch, ic->live_child, ic);
 	}
@@ -2582,7 +2581,7 @@ int ft_insert_compressed_key_shorter(struct cds_ft *ft,
 	} else {
 		struct ft_lock_ctx lctx;
 
-		ft_lock_ctx_init(&lctx, d, ic ? ic->txn : NULL);
+		ft_lock_ctx_init(&lctx, d, ic ? ic->txn : NULL, ic ? ic->op : NULL);
 		sret = ft_acquire_member(ft, &lctx, d->nf, cn_meta, d->depth,
 			&held);
 	}
@@ -2707,7 +2706,7 @@ int ft_insert_compressed_key_shorter(struct cds_ft *ft,
 	{
 		struct ft_lock_ctx pctx;
 
-		ft_lock_ctx_init(&pctx, d, ic ? ic->txn : NULL);
+		ft_lock_ctx_init(&pctx, d, ic ? ic->txn : NULL, ic ? ic->op : NULL);
 		ft_insert_publish_or_park(ft, &pctx, d->pnf, d->pdepth,
 			d->nfp, top_flag, fwd_expected_old, ic);
 	}
@@ -2994,7 +2993,7 @@ restart_attempt:
 			dbg_printf("cds_ft_insert NULL ppnf %p pnf %p nfp %p nf %p\n",
 					d.ppnf, d.pnf, d.nfp, d.nf);
 
-			ft_lock_ctx_init(&actx, &d, ic.txn);
+			ft_lock_ctx_init(&actx, &d, ic.txn, ic.op);
 			ret = ft_attach_node(ft, d.pnfp, d.pnf,
 					d.nfp, d.nf, key, key_len, d.depth, node,
 					NULL, &ic, &actx);
@@ -3067,7 +3066,7 @@ restart_attempt:
 						struct ft_held_anchor hh;
 
 						ft_lock_ctx_init(&hctx, &d,
-							ic.txn);
+							ic.txn, ic.op);
 						if (ft_acquire_member(ft, &hctx,
 								d.nf, metadata,
 								d.depth, &hh)) {
@@ -3207,7 +3206,7 @@ restart_attempt:
 						 * the window dates it.
 						 */
 						ft_lock_ctx_init(&hctx, &d,
-							ic.txn);
+							ic.txn, ic.op);
 						if (!ft_lock_ctx_depth_of(ft,
 								&hctx,
 								holder_flag,
@@ -3258,7 +3257,7 @@ restart_attempt:
 		dbg_printf("cds_ft_insert NULL or external ppnf %p pnf %p nfp %p nf %p\n",
 				d.ppnf, d.pnf, d.nfp, d.nf);
 
-		ft_lock_ctx_init(&actx, &d, ic.txn);
+		ft_lock_ctx_init(&actx, &d, ic.txn, ic.op);
 		ret = ft_attach_node(ft, d.pnfp, d.pnf,
 				d.nfp, d.nf, key, key_len, d.depth, node,
 				(struct cds_ft_node *) ft_node_ptr(d.nf), &ic,
@@ -3585,7 +3584,7 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 			/* No existing node. Regular attach. */
 			dbg_printf("_cds_ft_insert_replace NULL at end of key\n");
 
-			ft_lock_ctx_init(&actx, &d, ic.txn);
+			ft_lock_ctx_init(&actx, &d, ic.txn, ic.op);
 			ret = ft_attach_node(ft, d.pnfp, d.pnf,
 					d.nfp, d.nf, key, key_len, d.depth, node,
 					NULL, &ic, &actx);
@@ -3903,7 +3902,7 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 		 */
 		dbg_printf("_cds_ft_insert_replace: attach before end of key\n");
 
-		ft_lock_ctx_init(&actx, &d, ic.txn);
+		ft_lock_ctx_init(&actx, &d, ic.txn, ic.op);
 		ret = ft_attach_node(ft, d.pnfp, d.pnf,
 				d.nfp, d.nf, key, key_len, d.depth, node,
 				(struct cds_ft_node *) ft_node_ptr(d.nf), &ic,
@@ -4052,7 +4051,8 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 		struct cds_ft_iter *iter,
 		struct cds_ft_node *old_node,
 		struct cds_ft_node *new_node,
-		bool *need_retry)
+		bool *need_retry,
+		struct urcu_txn *op)
 {
 	struct cds_ft_inode_flag *holder_flag;
 	struct cds_ft_inode_flag **pub_slot;
@@ -4277,7 +4277,7 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 					} else
 						have_hd = true;
 					ft_lock_ctx_init(&hctx,
-						descended ? &hd : NULL, NULL);
+						descended ? &hd : NULL, NULL, op);
 					/*
 					 * @hh.shared is DEAD here, not defensive:
 					 * this context is built with a NULL txn and
@@ -4534,7 +4534,7 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 		need_retry = false;
 		urcu_txn_begin(&optxn);
 		s = _cds_ft_replace_locked(ft, iter, old_node, new_node,
-				&need_retry);
+				&need_retry, &optxn);
 		if (!need_retry)
 			break;
 		/* Age the conflict, keep the FIFO turn, close the attempt. */

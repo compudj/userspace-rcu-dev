@@ -173,7 +173,8 @@ int ft_merge_unlink_src_subtree(struct cds_ft *src_ft,
 
 		struct ft_lock_ctx lctx;
 
-		ft_lock_ctx_init(&lctx, &d, NULL);
+		ft_lock_ctx_init(&lctx, &d, NULL,
+			retire_glue ? retire_glue->op : NULL);
 		ret = ft_detach_node(src_ft, &lctx, d.nfp, d.pnfp, d.depth,
 				/*free_detached_subtree=*/ false, NULL, pubp, run,
 				retire_glue, NULL,
@@ -1434,7 +1435,8 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		unsigned int off_src, struct ft_descent *d_dst,
 		unsigned long cnt_dst, unsigned int off_dst,
 		size_t dst_key_len,
-		struct ft_flip_txn **pre_txn, bool *contended)
+		struct ft_flip_txn **pre_txn, bool *contended,
+		struct urcu_txn *op)
 {
 	struct ft_glue gd, gs;
 	struct ft_merge_ctx ctx = { .dst_ft = dst_ft, .gd = &gd, .gs = &gs };
@@ -1495,6 +1497,7 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	ft_merge_count(dst_ft, S, off_src, D, off_dst, &cnt);
 	ft_glue_init(&gd);
 	ft_glue_init(&gs);
+	gd.op = gs.op = op;	/* both glues' lock ctxs age this op */
 	/*
 	 * The dst glue's own acquires -- @pub_parent, above all -- fire from
 	 * commit helpers that never see a descent, so hand them the destination
@@ -2555,6 +2558,7 @@ retry_merge:
 	RSPIN_ENTER_X(0, rm_depth, 0, rm_bracket);
 	RSPIN_SITE_ENTER(0, rm_depth, rm_bracket);
 	ft_glue_init(&glue);
+	glue.op = &optxn;
 	/*
 	 * Fence the compressed divergence node (like cds_ft_graft), so a
 	 * concurrent grow of it is arbitrated and the build re-descends on a
@@ -3297,7 +3301,7 @@ merge_spine_retry:
 		status = ft_merge_spine_copy(dst_ft, src_ft, &d_src,
 				okey_src, src_key_len, cnt_src, off_src,
 				&d_dst, cnt_dst, off_dst, dst_key_len,
-				pre_txn, &md_contended);
+				pre_txn, &md_contended, &optxn);
 		if (md_contended) {
 			/* Contention, nothing moved: re-pin, re-descend, rebuild. */
 			if (md_rlock) {
@@ -3450,7 +3454,7 @@ merge_spine_retry:
 		 * cnt_dst != 0 would have; on a held root, report BUSY.
 		 */
 		fence_ret = ft_root_attach_fence_empty(dst_ft, &dst_root_fenced,
-			&dst_rmeta, &dst_root_snap);
+			&dst_rmeta, &dst_root_snap, &optxn);
 		if (fence_ret == -EEXIST)
 			goto diverged;
 		if (fence_ret) {
