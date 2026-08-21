@@ -763,9 +763,15 @@ int ft_insert_commit_arm(struct cds_ft *ft, struct ft_insert_commit *ic,
 	unsigned int anchored = ft->lock_spacing == CDS_FT_LOCK_SPACING_PER_NODE ?
 			0 : 1;
 
-	ic->txn = ic->op ?
-		ft_flip_txn_create_bounded_on(ic->op, 14 + anchored + count_edges) :
-		ft_flip_txn_create_bounded(14 + anchored + count_edges);
+	/*
+	 * The content txn is STANDALONE.  Binding it to the op handle
+	 * (ft_flip_txn_create_bounded_on) shares the op's descriptor and its
+	 * install lane across attempts, and that sharing MANUFACTURES the very
+	 * conflicts the retry loop then absorbs -- see the commit log.  The op
+	 * still carries @ic->op for enrolment; what it must not do is commit
+	 * through it.
+	 */
+	ic->txn = ft_flip_txn_create_bounded(14 + anchored + count_edges);
 	if (!ic->txn)
 		return -ENOMEM;
 	return 0;
