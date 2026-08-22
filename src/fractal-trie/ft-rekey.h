@@ -2104,15 +2104,16 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 *   - BP's parent is any other node: the detach ACQUIRES it itself, guarded
 	 *     (@parent_guard).  Deadlock-free -- both acquires are try-locks that
 	 *     abort rather than block.
-	 *   - BP, or BP's parent, IS one of the graft's two nodes: rejected here,
-	 *     PERMANENTLY.  Re-locking a held node aborts -EAGAIN every time, so a
-	 *     caller retrying that transient code would spin forever; and the
-	 *     same-junction shape (BP == the node the graft relocates or retires) is
-	 *     worse than unlockable -- the detach would edit the copy the flip
-	 *     retires.  (Cross-depth aliases are unreachable while the scope keeps
-	 *     src_len == dst_len, which puts both junctions on the same level; they
-	 *     are rejected rather than asserted so that a later relaxation of the
-	 *     length rule cannot silently reach them.)
+	 *   - BP IS the graft's PUBLISH PARENT: supported.  The detach
+	 *     DEL-recompacts that node, which would strand the forward publish in
+	 *     the superseded copy; the op's pending publish rides the recompaction
+	 *     instead (ft_flip_txn @pending_pub_slot), so the replaced child and
+	 *     the shrunk parent go live in ONE flip.
+	 *   - BP, or BP's parent, IS the node the graft RETIRES: rejected here,
+	 *     PERMANENTLY -- the detach would edit the copy the flip retires, and
+	 *     no fallback writer expresses that shape.  (Cross-depth aliases are
+	 *     rejected rather than asserted so that a relaxation of the length
+	 *     rule cannot silently reach them.)
 	 *
 	 * Plus, for both: the junctions must be BELOW the root (d_src.ppnf and the
 	 * graft's own publish target non-NULL) -- a root-level junction republishes
@@ -2163,14 +2164,15 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		goto bail_build;
 	}
 	/*
-	 * The ALIASING terms keep -EINVAL, unchanged: they say the two junctions
-	 * are the SAME node (or that the graft's pair is unlockable), which no
-	 * fallback writer expresses either -- and two DLM tests pin that code as
-	 * the "refused cleanly, permanently, before any mutation" answer.
+	 * The ALIASING terms are -EINVAL: they say the src junction IS the node
+	 * the graft retires, which no fallback writer expresses -- and two DLM
+	 * tests pin that code as the "refused cleanly, permanently, before any
+	 * mutation" answer.  BP == the graft's publish PARENT is NOT among them:
+	 * the recompaction fold carries that shape (see @pending_pub_slot).
 	 */
 	if ((ft_node_compressed(graft_p) && !merge_dst) ||
 			ft_node_skip_compressed(graft_p) ||
-			d_src.pnf == graft_c || d_src.pnf == graft_p ||
+			d_src.pnf == graft_c ||
 			d_src.ppnf == graft_c) {
 		ret = -EINVAL;
 		goto bail_build;

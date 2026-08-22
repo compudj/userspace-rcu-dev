@@ -1713,6 +1713,19 @@ int ft_node_recompact(enum ft_recompact mode,
 				iter = (struct cds_ft_inode_flag *) resolved;
 				if (!iter)
 					continue;	/* peer removed the child */
+				/*
+				 * FOLD the op's own pending forward publish
+				 * into the copy (see @pending_pub_slot): this
+				 * recompaction is replacing the very node the
+				 * publish targets, so the copy must be born
+				 * holding the new child.  Applied BY IDENTITY
+				 * on the slot, like the nullify above -- the
+				 * resolve deliberately reads COMMITTED values,
+				 * and must keep doing so for every other slot.
+				 */
+				if (retire_txn && retire_txn->pending_pub_slot &&
+						src_slot == retire_txn->pending_pub_slot)
+					iter = retire_txn->pending_pub_val;
 			} else if (caa_unlikely(ft_node_flip_proxy(iter))) {
 				/*
 				 * Build-invisible / no-txn arm: no peer publishes
@@ -1811,6 +1824,19 @@ int ft_node_recompact(enum ft_recompact mode,
 				iter = (struct cds_ft_inode_flag *) resolved;
 				if (!iter)
 					continue;
+				/*
+				 * FOLD the op's own pending forward publish
+				 * into the copy (see @pending_pub_slot): this
+				 * recompaction is replacing the very node the
+				 * publish targets, so the copy must be born
+				 * holding the new child.  Applied BY IDENTITY
+				 * on the slot, like the nullify above -- the
+				 * resolve deliberately reads COMMITTED values,
+				 * and must keep doing so for every other slot.
+				 */
+				if (retire_txn && retire_txn->pending_pub_slot &&
+						src_slot == retire_txn->pending_pub_slot)
+					iter = retire_txn->pending_pub_val;
 			} else if (caa_unlikely(ft_node_flip_proxy(iter))) {
 				/* Copied-slot latch (unpublished arm): see popcount. */
 				ret = -EAGAIN;

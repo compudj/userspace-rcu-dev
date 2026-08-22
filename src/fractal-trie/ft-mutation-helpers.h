@@ -882,6 +882,26 @@ struct ft_flip_txn {
 	 */
 	bool acquire_enomem;
 	/*
+	 * THE OP'S PENDING FORWARD PUBLISH, carried so a recompaction of the
+	 * publish PARENT can fold it into the copy it makes.
+	 *
+	 * A same-trie rekey's src branch point IS its dst publish parent, so the
+	 * src detach DEL-recompacts the very node the glue captured in
+	 * @publish_slot.  The copy is built from that parent's COMMITTED slots
+	 * (ft_flip_txn_resolve_prio is deliberately not read-your-own-writes), so
+	 * it inherits the PRE-publish child; the forward publish then lands in a
+	 * node nothing reads, the merged top is stranded, and the coherent
+	 * reader's two-descent address witness never sees the move.
+	 *
+	 * Applied BY IDENTITY in the copy loop, exactly as @nullify_node_flag_ptr
+	 * applies a pending detach there.  The copy must not read pending values
+	 * wholesale -- that would drop children a buffered detach has NULLed --
+	 * so every pending edit it must honour is named explicitly.  Both edits
+	 * then ride ONE flip, which is what keeps the move atomic to readers.
+	 */
+	struct cds_ft_inode_flag **pending_pub_slot;
+	struct cds_ft_inode_flag *pending_pub_val;
+	/*
 	 * MIXED sw/mw commit (DLM lock_fine): when true, the STRUCTURAL record
 	 * helpers (every ft_flip_txn_record_tag edge) plant SW-kind records -- a
 	 * plain locked park that CANNOT fail -- because the op holds the DLM
@@ -1066,6 +1086,8 @@ struct ft_flip_txn *ft_flip_txn_create(void)
 	t->nr_locks = 0;
 	t->acquire_miss = false;
 	t->acquire_enomem = false;
+	t->pending_pub_slot = NULL;
+	t->pending_pub_val = NULL;
 	t->structural_sw = false;	/* all-MW until a caller opts in under lock_fine */
 	t->sw_exempt_slot = NULL;
 	return t;
@@ -1275,6 +1297,8 @@ struct ft_flip_txn *ft_flip_txn_create_on(struct urcu_txn *op)
 	t->nr_locks = 0;
 	t->acquire_miss = false;
 	t->acquire_enomem = false;
+	t->pending_pub_slot = NULL;
+	t->pending_pub_val = NULL;
 	t->structural_sw = false;
 	t->sw_exempt_slot = NULL;
 	return t;
@@ -1319,6 +1343,8 @@ struct ft_flip_txn *ft_flip_txn_create_bounded_on(struct urcu_txn *op,
 	t->nr_locks = 0;
 	t->acquire_miss = false;
 	t->acquire_enomem = false;
+	t->pending_pub_slot = NULL;
+	t->pending_pub_val = NULL;
 	t->structural_sw = false;	/* all-MW until a caller opts in under lock_fine */
 	t->sw_exempt_slot = NULL;
 	return t;
@@ -8218,6 +8244,15 @@ void ft_glue_set_publish(struct cds_ft *ft, struct ft_glue *g,
 	g->publish_parent = parent_nf;
 	g->publish_slot = parent_slot;
 	g->top = top;
+	/*
+	 * Announce the pending publish to any recompaction of @parent_nf that
+	 * runs before the commit -- the same-trie rekey's src detach does
+	 * exactly that -- so the copy carries @top, not the child it replaces.
+	 */
+	if (g->txn) {
+		g->txn->pending_pub_slot = parent_slot;
+		g->txn->pending_pub_val = top;
+	}
 	ft_glue_defer_edge(ft, g, top, parent_nf, parent_slot);
 }
 
