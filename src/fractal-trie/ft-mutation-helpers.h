@@ -1072,6 +1072,7 @@ struct ft_flip_txn *ft_flip_txn_create(void)
 extern long cds_ft_fault_flip_countdown;
 extern long cds_ft_fault_replace_countdown;
 extern long cds_ft_fault_compact_countdown;
+extern long cds_ft_fault_removeall_countdown;
 #endif
 
 /* Defined below; the bounded constructor is a composition over it. */
@@ -1112,6 +1113,50 @@ void ft_replace_fault_arm_abort(struct ft_flip_txn *t)
  * Must be consulted BEFORE the acquire: forcing the code after a successful
  * one would return -EAGAIN holding the set it just took.
  */
+/*
+ * cds_ft_remove_all's refused-acquire fault.  Armed for the dynamic extent of
+ * its detach only -- the acquire choke point below is shared by every op, so
+ * the scope flag is what keeps the fault from perturbing them.
+ */
+#ifdef FEATURE_FT_FAULT_INJECT
+static __thread bool ft_removeall_fault_scope;
+#endif
+
+static inline
+void ft_removeall_fault_scope_enter(void)
+{
+#ifdef FEATURE_FT_FAULT_INJECT
+	ft_removeall_fault_scope = true;
+#endif
+}
+
+static inline
+void ft_removeall_fault_scope_exit(void)
+{
+#ifdef FEATURE_FT_FAULT_INJECT
+	ft_removeall_fault_scope = false;
+#endif
+}
+
+static inline
+bool ft_removeall_fault_refuse_acquire(void)
+{
+#ifdef FEATURE_FT_FAULT_INJECT
+	if (!ft_removeall_fault_scope)
+		return false;
+	if (cds_ft_fault_removeall_countdown < 0)
+		return false;
+	if (cds_ft_fault_removeall_countdown == 0) {
+		cds_ft_fault_removeall_countdown = -1;
+		return true;
+	}
+	cds_ft_fault_removeall_countdown--;
+	return false;
+#else
+	return false;
+#endif
+}
+
 static inline
 bool ft_recompact_fault_refuse_acquire(enum ft_recompact mode)
 {
@@ -2698,6 +2743,8 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 			nr_present++;
 	if (!nr_present)
 		return 0;
+	if (ft_removeall_fault_refuse_acquire())
+		return -EAGAIN;		/* test-only; nothing acquired */
 	assert(nr_present <= FT_FLIP_TXN_MAX_LOCKS);
 	/*
 	 * Up to one back-edge guard + one lock + one coarsened-node guard per

@@ -1276,6 +1276,23 @@ long cds_ft_fault_replace_countdown = -1;
  * -EAGAIN class, and it returns with nothing acquired and nothing published.
  */
 long cds_ft_fault_compact_countdown = -1;
+
+/*
+ * Test-only refused-acquire injection for cds_ft_remove_all.
+ *
+ * WHY THIS EXISTS.  remove_all maps EVERY failure to
+ * CDS_FT_STATUS_MEMORY_ERROR, so a peer conflict is reported as an allocation
+ * failure ("KNOWN MW GAP" in its own tail).  It cannot happen while the op
+ * requires caller writer-exclusion, and measured over both suites it never did:
+ * 4,807,509 calls, failure tail reached ZERO times.  The arm the fine-grained
+ * conversion needs therefore had no way to run.
+ *
+ * Scoped to the dynamic extent of remove_all's own detach
+ * (ft_removeall_fault_scope_enter/exit) rather than to a mode, because 99.95%
+ * of its commits go through ft_detach_node, which builds its txn internally --
+ * measured: detach 697,344 of 697,675, holder-commit 101, NIL-commit 7.
+ */
+long cds_ft_fault_removeall_countdown = -1;
 #endif
 
 #ifdef FEATURE_FT_PROBE_EMPTY_INSERT

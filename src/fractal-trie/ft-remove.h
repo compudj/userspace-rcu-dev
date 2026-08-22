@@ -4969,11 +4969,13 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 		 * the holder (it climbs via metadata->parent).  Propagate -1
 		 * before detach (which may free internal nodes).
 		 */
+		ft_removeall_fault_scope_enter();
 		ret = ft_detach_node(ft, &lctx, head_slot,
 			ft_get_parent_slot(holder_meta, ft), key_len, true,
 			dead_cell, ft->ordered_list ? &pub : NULL, NULL, NULL,
 			NULL, -1 /* leaf key removed: detach owns the -1 */,
 			NULL, false, NULL, NULL);
+		ft_removeall_fault_scope_exit();
 		if (!ret)
 			ft_chain_mark_removed_flip(ft, chain_head);
 	}
@@ -5026,11 +5028,22 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 		 * the header contract -- so the caller cannot reclaim the
 		 * still-reachable chain.
 		 *
-		 * KNOWN MW GAP: a peer-conflict -EAGAIN (copied-slot latch
-		 * bail, chain-compress abort) also lands here as MEMORY_ERROR
-		 * -- remove_all has no retry loop yet ("not yet retry-
-		 * enabled" above).  Nothing is published either way; the
-		 * error class is wrong, not the structure.
+		 * ☐ KNOWN MW GAP, still open, and -EAGAIN IS NOT THE
+		 * DISCRIMINATOR that would close it.  A peer conflict does land
+		 * here as MEMORY_ERROR, which sends the caller freeing memory
+		 * over a peer -- but so does at least one ALLOCATION failure,
+		 * measured: over a fault-injection run this tail saw 33 -EAGAIN
+		 * of which 32 were forced refusals and ONE came from an
+		 * allocation fault, plus 4 -ENOMEM.  Mapping -EAGAIN to
+		 * BUSY_ERROR therefore mislabels an OOM as contention, which is
+		 * this defect inverted (it turns test_remove_prefix_siblings_oom
+		 * red, saying "Resource busy state mismatch").
+		 *
+		 * Closing it needs the SOURCES to carry the distinction, not the
+		 * tail to guess it: an allocation failure must stop returning
+		 * -EAGAIN.  cds_ft_fault_removeall_countdown can now execute the
+		 * contention arm (test_remove_all_contended_bail), so whoever
+		 * does that work has a witness to flip.
 		 */
 		*result_node = NULL;
 		return CDS_FT_STATUS_MEMORY_ERROR;

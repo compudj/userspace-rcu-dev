@@ -69,11 +69,11 @@
 #endif
 
 /*
- * 303 unconditional + 50 fault-injection-only RUN_TEST registrations, on top of
+ * 303 unconditional + 51 fault-injection-only RUN_TEST registrations, on top of
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (353 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (354 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
 #define NR_TESTS (303 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
@@ -26891,6 +26891,170 @@ out:
  * first coverage of the exclusive + compact combination.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
+extern long cds_ft_fault_removeall_countdown;
+
+/*
+ * cds_ft_remove_all CONTENTION BAIL (cds_ft_fault_removeall_countdown).
+ *
+ * WHY THIS EXISTS, as a count rather than an argument.  remove_all mapped EVERY
+ * failure to CDS_FT_STATUS_MEMORY_ERROR -- its own tail called that a "KNOWN MW
+ * GAP" -- and the arm could not be executed to prove it: the op requires caller
+ * writer-exclusion, so no peer can refuse it a lock-set, and measured over both
+ * suites its failure tail ran ZERO times in 4,807,509 calls.
+ *
+ * The knob refuses ONE lock-set acquire inside remove_all's detach, which is
+ * the real -EAGAIN class: it returns with nothing acquired and nothing
+ * published.  It is scoped to that detach's dynamic extent rather than to a
+ * mode, because 99.95% of remove_all's commits go through ft_detach_node, which
+ * builds its txn internally (measured: detach 697,344 of 697,675).
+ *
+ * ASSERTED: the chain must still be reachable (nothing was published) and
+ * *@result_node must be NULL, so the caller cannot reclaim a chain the trie
+ * still points at.
+ *
+ * ☐ THE STATUS IS PINNED, NOT FIXED.  Contention still reports
+ * CDS_FT_STATUS_MEMORY_ERROR -- the tail's "KNOWN MW GAP" -- and -EAGAIN cannot
+ * be used to tell the two apart: measured over a fault run, this tail saw 33
+ * -EAGAIN of which 32 were these forced refusals and ONE came from an
+ * ALLOCATION fault.  Mapping -EAGAIN to BUSY_ERROR inverts the defect and turns
+ * test_remove_prefix_siblings_oom red.  Closing it needs the SOURCES to stop
+ * conflating; this test is the witness that will flip when they do.
+ */
+static int test_remove_all_contended_bail(void)
+{
+	const unsigned int N = 64;
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_fine_lock_ft(4, &group);
+	struct ft_test_node **base;
+	unsigned long fired = 0, busy = 0, ok = 0;
+	unsigned int i;
+	int rc = 0;
+
+	base = (struct ft_test_node **) calloc(N, sizeof(*base));
+	if (!base)
+		abort();
+	for (i = 0; i < N; i++) {
+		base[i] = node_alloc((uint64_t) i);
+		if (insert_u64(ft, (uint64_t) i, base[i]) != CDS_FT_STATUS_OK)
+			abort();
+	}
+
+	for (i = 0; i < N && !rc; i++) {
+		struct cds_ft_iter *it;
+		struct cds_ft_node *res = (struct cds_ft_node *) (long) -1;
+		enum cds_ft_status s;
+		uint8_t k[8];
+		int this_fired;
+		bool still_there;
+
+		cds_ft_u64_to_key(ft, (uint64_t) i, k, CDS_FT_LEN_DEFAULT);
+		if (cds_ft_iter_create(ft, &it) < 0)
+			abort();
+		rcu_read_lock();
+		cds_ft_iter_set_key(it, k, CDS_FT_LEN_DEFAULT);
+		if (cds_ft_lookup(ft, it) != CDS_FT_STATUS_OK) {
+			rcu_read_unlock();
+			cds_ft_iter_destroy(it);
+			continue;
+		}
+		/* Refuse the acquire on every other key, so both arms run. */
+		cds_ft_fault_removeall_countdown = (i % 2) ? -1 : 0;
+		s = cds_ft_remove_all(ft, it, &res);
+		this_fired = cds_ft_fault_removeall_countdown == -1 && !(i % 2);
+		cds_ft_fault_removeall_countdown = -1;
+		rcu_read_unlock();
+		cds_ft_iter_destroy(it);
+
+		rcu_read_lock();
+		{
+			struct cds_ft_node *found = NULL;
+
+			still_there = lookup_u64(ft, (uint64_t) i, &found)
+					== CDS_FT_STATUS_OK;
+		}
+		rcu_read_unlock();
+
+		if (this_fired) {
+			fired++;
+			/*
+			 * PINNED: contention is reported as MEMORY_ERROR today.
+			 * When the sources stop conflating -EAGAIN, this is the
+			 * assertion to flip to BUSY_ERROR.
+			 */
+			if (s != CDS_FT_STATUS_MEMORY_ERROR) {
+				fprintf(stderr, "remove_all contended: key %u "
+					"reported %d, expected the known "
+					"MEMORY_ERROR mislabel (%d)\n",
+					i, (int) s,
+					(int) CDS_FT_STATUS_MEMORY_ERROR);
+				rc = -1;
+				break;
+			}
+			busy++;
+			/* Nothing published: the chain stays live and unowned. */
+			if (!still_there) {
+				fprintf(stderr, "remove_all contended: key %u "
+					"vanished on a refused removal\n", i);
+				rc = -1;
+				break;
+			}
+			if (res != NULL) {
+				fprintf(stderr, "remove_all contended: key %u "
+					"handed back a chain it did not remove\n", i);
+				rc = -1;
+				break;
+			}
+		} else if (s == CDS_FT_STATUS_OK) {
+			ok++;
+			if (still_there) {
+				fprintf(stderr, "remove_all contended: key %u "
+					"reported OK but is still present\n", i);
+				rc = -1;
+				break;
+			}
+			{
+				struct cds_ft_node *h = res, *tmp;
+
+				if (h)
+					cds_ft_for_each_duplicate_safe_rcu(h, tmp)
+						node_free_rcu(to_test_node(h));
+			}
+			base[i] = NULL;
+		} else {
+			fprintf(stderr, "remove_all contended: key %u unforced "
+				"failure %d\n", i, (int) s);
+			rc = -1;
+			break;
+		}
+		if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "remove_all contended: verify failed "
+				"after key %u\n", i);
+			rc = -1;
+			break;
+		}
+	}
+
+	diag("remove_all contended: %lu refusals forced (all reported as the "
+		"known MEMORY_ERROR mislabel: %lu), %lu uncontended removals",
+		fired, busy, ok);
+	/* A sweep that never refused an acquire proves nothing -- say so. */
+	if (!rc && fired == 0) {
+		fprintf(stderr, "remove_all contended: the knob never refused "
+			"an acquire -- the contention arm did not run\n");
+		rc = -1;
+	}
+
+	cds_ft_fault_removeall_countdown = -1;
+	drain_trie(ft);
+	free(base);
+	rcu_barrier();
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return rc;
+}
+#endif	/* FEATURE_FT_FAULT_INJECT */
+
+#ifdef FEATURE_FT_FAULT_INJECT
 extern long cds_ft_fault_compact_countdown;
 
 /*
@@ -33659,6 +33823,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_insert_replace_prefix_oom);
 	RUN_TEST(test_replace_head_oom);
 	RUN_TEST(test_compact_contended_bail);
+	RUN_TEST(test_remove_all_contended_bail);
 	RUN_TEST(test_replace_family_commit_fault);
 	RUN_TEST(test_fine_lock_acquire_fault);
 	RUN_TEST(test_fine_lock_chain_acquire_fault);
