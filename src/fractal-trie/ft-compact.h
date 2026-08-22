@@ -111,10 +111,24 @@ void ft_compact_relocate_at(struct cds_ft *ft, struct cds_ft_inode_flag **holder
 		 * unfreed: best-effort, leave the node in place (a bailed
 		 * relocation is retried by a later compaction pass).
 		 *
-		 * A contended -EAGAIN therefore reaches the caller as
-		 * CDS_FT_COMPACT_OOM.  That is the right STRUCTURAL answer (stop
-		 * the pass, resume from the interrupted key) under the wrong
-		 * name; the status enum has no "contended" member.
+		 * ☞ THE CONTENDED CASE IS LATENT, NOT LIVE, AND THIS COMMENT USED
+		 * TO STATE OTHERWISE.  cds_ft_compact_step's contract requires
+		 * the caller to hold its writer exclusion across the call, so no
+		 * peer can park a proxy, hold a lock-set, or move a member under
+		 * this walk: the -EAGAIN classes listed above cannot occur.
+		 * MEASURED over both suites with fault injection armed -- 1,798
+		 * relocations reaching this site, bails ENOMEM 6, -EAGAIN ZERO.
+		 * So CDS_FT_COMPACT_OOM is an accurate report TODAY, not a
+		 * mislabel.
+		 *
+		 * It becomes one the moment compact is converted to fine-grained
+		 * locking, because then a contention refusal is reported as
+		 * memory pressure and the caller's documented response -- free
+		 * memory and resume -- is the wrong remedy.  The conversion
+		 * therefore owes the status enum a "contended" member AND this
+		 * bail the errno to distinguish it, which *@oom (a bool) throws
+		 * away.  Adding either NOW would be an arm no test can reach:
+		 * nothing available can force -EAGAIN here.
 		 */
 		if (txn)
 			ft_flip_txn_destroy(txn);	/* reserved, unused */
