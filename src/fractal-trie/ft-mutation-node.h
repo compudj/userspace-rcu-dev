@@ -1348,6 +1348,8 @@ int ft_node_recompact(enum ft_recompact mode,
 			.node = gp_meta, .depth = gp_depth,
 			.guard_child = inh_hint ? NULL : p_meta,
 			.guard_pf = pf_gp };
+		if (ft_recompact_fault_refuse_acquire(mode))
+			return -EAGAIN;		/* test-only; nothing acquired */
 		dret = ft_dlm_acquire_set(ft, ctx, set, 3);
 		if (dret)
 			return dret == -ENOMEM ? -ENOMEM : -EAGAIN;

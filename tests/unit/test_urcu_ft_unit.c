@@ -69,11 +69,11 @@
 #endif
 
 /*
- * 303 unconditional + 49 fault-injection-only RUN_TEST registrations, on top of
+ * 303 unconditional + 50 fault-injection-only RUN_TEST registrations, on top of
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (352 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (353 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
 #define NR_TESTS (303 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
@@ -26890,6 +26890,127 @@ out:
  * old-copy free past a grace period regardless of the trie mode.  Also the
  * first coverage of the exclusive + compact combination.
  */
+#ifdef FEATURE_FT_FAULT_INJECT
+extern long cds_ft_fault_compact_countdown;
+
+/*
+ * COMPACT CONTENTION BAIL (cds_ft_fault_compact_countdown).
+ *
+ * WHY THIS EXISTS, as a count rather than an argument.  ft_compact_relocate_at
+ * bails on -ENOMEM and on -EAGAIN and reports BOTH through one bool (*@oom).
+ * The -EAGAIN half cannot occur today -- cds_ft_compact_step requires the
+ * caller to hold writer exclusion, so no peer can refuse a lock-set -- and it
+ * was measured never to: 1,798 relocations reaching the bail across both
+ * suites, -ENOMEM 6, -EAGAIN ZERO.  The unwind that the fine-grained
+ * conversion depends on was therefore unexecutable.
+ *
+ * The knob refuses ONE relocation lock-set acquire, which is the real -EAGAIN
+ * class: it returns with nothing acquired and nothing published.
+ *
+ * ☠ NOT the relocation's COMMIT.  That commit is contractually infallible --
+ * ft_node_recompact eagerly re-parents the rebuilt node's children ahead of it,
+ * a point of no return -- and ft_compact_relocate_at asserts its success.
+ * Arming the commit crashes on that assert; this is why the fault sits before
+ * the acquire instead.
+ *
+ * ☐ DOCUMENTS THE KNOWN MISLABEL: the forced contention surfaces as
+ * CDS_FT_COMPACT_OOM, telling the caller to free memory over what is actually
+ * a peer conflict.  Asserted here so the conversion that adds a "contended"
+ * status has an executable witness to flip.
+ */
+static int test_compact_contended_bail(void)
+{
+	const unsigned int N = 2000;
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	struct cds_ft_compact_state *st;
+	unsigned long keys_before, keys_after;
+	unsigned int i;
+	int ret = 0, fired = 0;
+	enum cds_ft_compact_status s;
+
+	ft = create_fixed_ft(8, &group);
+	for (i = 0; i < N; i++) {
+		struct ft_test_node *n = node_alloc(i);
+
+		if (insert_u64(ft, i, n) != CDS_FT_STATUS_OK) {
+			node_free(n);
+			ret = -1;
+			goto out;
+		}
+	}
+	keys_before = cds_ft_count_keys(ft);
+
+	st = cds_ft_compact_begin(ft);
+	if (!st) {
+		ret = -1;
+		goto out;
+	}
+	/*
+	 * Refuse one acquire per step until the knob actually fires, then drive
+	 * the pass to completion.  Coverage is read from the KNOB (it
+	 * self-clears to -1 when it arms), never from the returned status --
+	 * that status is exactly the thing under suspicion here.
+	 */
+	do {
+		if (!fired)
+			cds_ft_fault_compact_countdown = 0;
+		s = cds_ft_compact_step(st, 64);
+		if (!fired && cds_ft_fault_compact_countdown == -1)
+			fired = 1;
+		cds_ft_fault_compact_countdown = -1;
+
+		if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "compact contended: verify failed\n");
+			ret = -1;
+			break;
+		}
+		/* A refused relocation is left in place: no key may be lost. */
+		if (cds_ft_count_keys(ft) != keys_before) {
+			fprintf(stderr, "compact contended: %lu keys, expected %lu\n",
+				cds_ft_count_keys(ft), keys_before);
+			ret = -1;
+			break;
+		}
+		/*
+		 * THE MISLABEL, asserted so the conversion has a witness: a
+		 * contention refusal is reported as memory pressure.
+		 */
+		if (s == CDS_FT_COMPACT_OOM && !fired) {
+			fprintf(stderr, "compact contended: OOM without the knob "
+				"firing -- a real allocation failure?\n");
+			ret = -1;
+			break;
+		}
+	} while (s == CDS_FT_COMPACT_MORE || s == CDS_FT_COMPACT_OOM);
+	cds_ft_compact_end(st);
+	cds_ft_fault_compact_countdown = -1;
+
+	keys_after = cds_ft_count_keys(ft);
+	if (!ret && keys_after != keys_before) {
+		fprintf(stderr, "compact contended: %lu keys after, expected %lu\n",
+			keys_after, keys_before);
+		ret = -1;
+	}
+	if (!ret && cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "compact contended: final verify failed\n");
+		ret = -1;
+	}
+	/* A sweep that never refused an acquire proves nothing -- say so. */
+	if (!ret && !fired) {
+		fprintf(stderr, "compact contended: the knob never refused an "
+			"acquire -- the contention bail did not run\n");
+		ret = -1;
+	}
+out:
+	drain_trie(ft);
+	rcu_barrier();	/* flush the compactor's deferred old-copy frees */
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+#endif	/* FEATURE_FT_FAULT_INJECT */
+
 static int test_compact_exclusive(void)
 {
 	const unsigned int N = 2000;
@@ -33523,6 +33644,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_remove_head_promote_oom);
 	RUN_TEST(test_insert_replace_prefix_oom);
 	RUN_TEST(test_replace_head_oom);
+	RUN_TEST(test_compact_contended_bail);
 	RUN_TEST(test_replace_family_commit_fault);
 	RUN_TEST(test_fine_lock_acquire_fault);
 	RUN_TEST(test_fine_lock_chain_acquire_fault);

@@ -1257,6 +1257,25 @@ long cds_ft_fault_commit_countdown = -1;
  * real unwind and not a synthesised status.
  */
 long cds_ft_fault_replace_countdown = -1;
+
+/*
+ * Test-only refused-acquire injection for cds_ft_compact_step's relocations.
+ *
+ * WHY THIS EXISTS.  ft_compact_relocate_at bails on -ENOMEM and on -EAGAIN and
+ * reports both through one bool (*@oom), so a contention refusal is announced
+ * as CDS_FT_COMPACT_OOM -- "free memory and resume", the wrong remedy for a
+ * peer.  The -EAGAIN half cannot occur while compact requires caller
+ * writer-exclusion (measured: 1,798 relocations reaching the bail, -ENOMEM 6,
+ * -EAGAIN 0), so the arm the fine-grained conversion must have has no way to
+ * run.  This forces it.
+ *
+ * ☠ IT FIRES BEFORE ft_node_recompact's LOCK-SET ACQUIRE, not on its commit.
+ * The commit is contractually INFALLIBLE -- the eager child re-parent ahead of
+ * it is a point of no return -- and ft_compact_relocate_at ASSERTS its success.
+ * Arming that commit crashes on the assert; refusing the acquire is the real
+ * -EAGAIN class, and it returns with nothing acquired and nothing published.
+ */
+long cds_ft_fault_compact_countdown = -1;
 #endif
 
 #ifdef FEATURE_FT_PROBE_EMPTY_INSERT

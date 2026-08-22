@@ -1071,6 +1071,7 @@ struct ft_flip_txn *ft_flip_txn_create(void)
 #ifdef FEATURE_FT_FAULT_INJECT
 extern long cds_ft_fault_flip_countdown;
 extern long cds_ft_fault_replace_countdown;
+extern long cds_ft_fault_compact_countdown;
 #endif
 
 /* Defined below; the bounded constructor is a composition over it. */
@@ -1099,6 +1100,35 @@ void ft_replace_fault_arm_abort(struct ft_flip_txn *t)
 	}
 #else
 	(void) t;
+#endif
+}
+
+/*
+ * Refuse the next RELOCATE lock-set acquire, for cds_ft_compact_step's
+ * otherwise unexecutable contention bail (cds_ft_fault_compact_countdown).
+ * Scoped by the mode because FT_RECOMPACT_RELOCATE has exactly one caller --
+ * ft_compact_relocate_at -- so no other recompact user is perturbed.
+ *
+ * Must be consulted BEFORE the acquire: forcing the code after a successful
+ * one would return -EAGAIN holding the set it just took.
+ */
+static inline
+bool ft_recompact_fault_refuse_acquire(enum ft_recompact mode)
+{
+#ifdef FEATURE_FT_FAULT_INJECT
+	if (mode != FT_RECOMPACT_RELOCATE)
+		return false;
+	if (cds_ft_fault_compact_countdown < 0)
+		return false;
+	if (cds_ft_fault_compact_countdown == 0) {
+		cds_ft_fault_compact_countdown = -1;
+		return true;
+	}
+	cds_ft_fault_compact_countdown--;
+	return false;
+#else
+	(void) mode;
+	return false;
 #endif
 }
 
