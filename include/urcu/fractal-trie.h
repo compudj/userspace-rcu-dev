@@ -3759,13 +3759,20 @@ enum cds_ft_status cds_ft_verify_disjoint(struct cds_ft *const *fts,
 /*
  * enum cds_ft_compact_status - Drive/result status for the compaction API.
  *
- * Returned by cds_ft_compact_step (DONE / MORE / OOM) and cds_ft_compact
- * (DONE / OOM, never MORE).
+ * Returned by cds_ft_compact_step (DONE / MORE / OOM / BUSY) and
+ * cds_ft_compact (DONE / OOM / BUSY, never MORE).
+ *
+ * OOM and BUSY are BOTH "stopped early, resume from the interrupted key", and
+ * they are distinct because the caller's remedy differs: OOM asks it to free
+ * memory, BUSY only to try again -- a relocation lost a lock-set to a peer and
+ * nothing is wrong with memory.  Reporting contention as OOM would send a
+ * caller freeing memory it does not need to free.
  */
 enum cds_ft_compact_status {
 	CDS_FT_COMPACT_DONE	= 0,	/* fully compacted (terminal success) */
 	CDS_FT_COMPACT_MORE	= 1,	/* more work remains; call cds_ft_compact_step again */
 	CDS_FT_COMPACT_OOM	= 2,	/* stopped on memory pressure; free memory and resume */
+	CDS_FT_COMPACT_BUSY	= 3,	/* stopped on writer contention; just resume */
 };
 
 /*

@@ -26913,10 +26913,11 @@ extern long cds_ft_fault_compact_countdown;
  * Arming the commit crashes on that assert; this is why the fault sits before
  * the acquire instead.
  *
- * ☐ DOCUMENTS THE KNOWN MISLABEL: the forced contention surfaces as
- * CDS_FT_COMPACT_OOM, telling the caller to free memory over what is actually
- * a peer conflict.  Asserted here so the conversion that adds a "contended"
- * status has an executable witness to flip.
+ * ★ AND IT PINS THE REPORT: forced contention must surface as
+ * CDS_FT_COMPACT_BUSY, never CDS_FT_COMPACT_OOM.  The two are both "stopped
+ * early, resume from the interrupted key", but a caller told OOM frees memory
+ * it does not need to free.  This assertion is what would catch the report
+ * regressing to the old bool that could not tell them apart.
  */
 static int test_compact_contended_bail(void)
 {
@@ -26956,8 +26957,23 @@ static int test_compact_contended_bail(void)
 		if (!fired)
 			cds_ft_fault_compact_countdown = 0;
 		s = cds_ft_compact_step(st, 64);
-		if (!fired && cds_ft_fault_compact_countdown == -1)
+		if (!fired && cds_ft_fault_compact_countdown == -1) {
 			fired = 1;
+			/*
+			 * THE POINT OF THE TEST: the refusal is contention, so
+			 * the step must say BUSY.  OOM here would be the old
+			 * bool's conflation back again.
+			 */
+			if (s != CDS_FT_COMPACT_BUSY) {
+				fprintf(stderr, "compact contended: forced "
+					"contention reported %d, expected "
+					"CDS_FT_COMPACT_BUSY (%d)\n",
+					(int) s, (int) CDS_FT_COMPACT_BUSY);
+				ret = -1;
+				cds_ft_fault_compact_countdown = -1;
+				break;
+			}
+		}
 		cds_ft_fault_compact_countdown = -1;
 
 		if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
@@ -26972,17 +26988,15 @@ static int test_compact_contended_bail(void)
 			ret = -1;
 			break;
 		}
-		/*
-		 * THE MISLABEL, asserted so the conversion has a witness: a
-		 * contention refusal is reported as memory pressure.
-		 */
-		if (s == CDS_FT_COMPACT_OOM && !fired) {
-			fprintf(stderr, "compact contended: OOM without the knob "
-				"firing -- a real allocation failure?\n");
+		/* No allocation fault is armed, so OOM must not appear at all. */
+		if (s == CDS_FT_COMPACT_OOM) {
+			fprintf(stderr, "compact contended: OOM with no "
+				"allocation fault armed -- contention "
+				"misreported as memory pressure?\n");
 			ret = -1;
 			break;
 		}
-	} while (s == CDS_FT_COMPACT_MORE || s == CDS_FT_COMPACT_OOM);
+	} while (s == CDS_FT_COMPACT_MORE || s == CDS_FT_COMPACT_BUSY);
 	cds_ft_compact_end(st);
 	cds_ft_fault_compact_countdown = -1;
 

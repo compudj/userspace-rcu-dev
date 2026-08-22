@@ -58,7 +58,7 @@
 static
 void ft_compact_relocate_at(struct cds_ft *ft, struct cds_ft_inode_flag **holder,
 		unsigned int node_depth, const struct ft_lock_ctx *ctx,
-		bool *oom)
+		int *bail)
 {
 	struct cds_ft_inode_flag *nf = *holder;
 	unsigned int type_index = ft_node_type(nf);
@@ -91,7 +91,7 @@ void ft_compact_relocate_at(struct cds_ft *ft, struct cds_ft_inode_flag **holder
 
 		txn = ft_flip_txn_create_bounded(cap);
 		if (!txn) {
-			*oom = true;
+			*bail = -ENOMEM;
 			return;		/* OOM: best-effort, leave in place */
 		}
 	}
@@ -122,17 +122,16 @@ void ft_compact_relocate_at(struct cds_ft *ft, struct cds_ft_inode_flag **holder
 		 * mislabel.
 		 *
 		 * It becomes one the moment compact is converted to fine-grained
-		 * locking, because then a contention refusal is reported as
-		 * memory pressure and the caller's documented response -- free
-		 * memory and resume -- is the wrong remedy.  The conversion
-		 * therefore owes the status enum a "contended" member AND this
-		 * bail the errno to distinguish it, which *@oom (a bool) throws
-		 * away.  Adding either NOW would be an arm no test can reach:
-		 * nothing available can force -EAGAIN here.
+		 * locking, so both halves are in place AHEAD of that: @bail
+		 * carries the errno rather than a bool, and cds_ft_compact_step
+		 * reports -EAGAIN as CDS_FT_COMPACT_BUSY instead of _OOM.  A
+		 * caller told OOM frees memory; a caller told BUSY just resumes.
+		 * cds_ft_fault_compact_countdown is what executes this arm until
+		 * a real peer can.
 		 */
 		if (txn)
 			ft_flip_txn_destroy(txn);	/* reserved, unused */
-		*oom = true;
+		*bail = ret;		/* -EAGAIN (contended) or -ENOMEM, kept apart */
 		return;
 	}
 	/*
@@ -197,18 +196,19 @@ static
 struct cds_ft_compressed_node *ft_compact_relocate_compressed(struct cds_ft *ft,
 		struct cds_ft_compressed_node *cn,
 		struct cds_ft_inode_flag **gp_slot,
-		bool *oom)
+		int *bail)
 {
 	struct cds_ft_metadata *cn_meta =
 		cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
 	struct cds_ft_metadata *cn2_meta;
 	struct cds_ft_compressed_node *cn2;
 	struct cds_ft_inode_flag *cn2_flag;
+	enum urcu_txn_status cst;
 	uint8_t len = cn->len;
 
 	cn2 = alloc_compressed_node(ft, len, &cn2_meta);
 	if (!cn2) {
-		*oom = true;
+		*bail = -ENOMEM;
 		return cn;	/* OOM: leave in place (best-effort) */
 	}
 	cn2->len = len;
@@ -252,16 +252,18 @@ struct cds_ft_compressed_node *ft_compact_relocate_compressed(struct cds_ft *ft,
 
 		if (!t) {
 			free_compressed_node_unpublished(ft, cn2);
-			*oom = true;
+			*bail = -ENOMEM;
 			return cn;
 		}
 		ft_reparent_record(ft, t, cn2->child, cn2_flag, &cn2->child,
 			/*child_marked=*/ false, /*hold_ctx=*/ NULL);
 		ft_flip_txn_record_reserved(t, (void **) gp_slot, *gp_slot,
 			cn2_flag);
-		if (ft_flip_txn_commit(ft, t) != URCU_TXN_STATUS_OK) {
+		cst = ft_flip_txn_commit(ft, t);
+		if (cst != URCU_TXN_STATUS_OK) {
 			free_compressed_node_unpublished(ft, cn2);
-			*oom = true;
+			/* An ABORT is a peer, not memory pressure. */
+			*bail = cst == URCU_TXN_STATUS_ABORT ? -EAGAIN : -ENOMEM;
 			return cn;
 		}
 	} else {
@@ -334,14 +336,15 @@ struct cds_ft_compressed_node *ft_compact_relocate_compressed(struct cds_ft *ft,
  */
 static
 struct ft_ord_cell *ft_compact_relocate_cell(struct cds_ft *ft,
-		struct ft_ord_cell *old, bool *oom)
+		struct ft_ord_cell *old, int *bail)
 {
 	struct cds_ft_metadata *meta = cds_ft_alloc_cell_item(ft);
 	struct cds_ft_node *head = old->node;
 	struct ft_ord_cell *new_cell;
+	int sret;
 
 	if (!meta) {
-		*oom = true;
+		*bail = -ENOMEM;
 		return old;		/* OOM: best-effort, leave in place */
 	}
 	if (ft_debug_counters())
@@ -352,7 +355,8 @@ struct ft_ord_cell *ft_compact_relocate_cell(struct cds_ft *ft,
 	/* Carry the head's edge byte across the relocation (up-walk key source). */
 	meta->incoming_byte = cds_ft_item_to_metadata(old)->incoming_byte;
 	/* ord_prev / ord_next are set from @old's neighbours by the swap. */
-	if (ft_ord_cell_swap(ft, old, new_cell) != 0) {
+	sret = ft_ord_cell_swap(ft, old, new_cell);
+	if (sret != 0) {
 		/*
 		 * OOM reserving the swap flip-txn: the abortable commit
 		 * installed nothing, so @old stays fully in the ordered list.
@@ -363,7 +367,8 @@ struct ft_ord_cell *ft_compact_relocate_cell(struct cds_ft *ft,
 		if (ft_debug_counters())
 			uatomic_inc(&ft->group->nr_cells_freed);
 		cds_ft_free_item_unpublished(ft, meta);
-		*oom = true;
+		/* An aborted swap is a peer; a failed reservation is memory. */
+		*bail = sret == -EAGAIN ? -EAGAIN : -ENOMEM;
 		return old;
 	}
 	/*
@@ -428,7 +433,7 @@ struct ft_ord_cell *ft_compact_relocate_cell(struct cds_ft *ft,
  */
 static
 void ft_compact_descend(struct cds_ft *ft, const uint8_t *key,
-		size_t key_len, unsigned long *relocated, bool *oom,
+		size_t key_len, unsigned long *relocated, int *bail,
 		struct urcu_txn *op)
 {
 	const struct cds_ft_key_map *km = &ft->group->key_map;
@@ -464,9 +469,9 @@ void ft_compact_descend(struct cds_ft *ft, const uint8_t *key,
 		if (!cds_ft_metadata_in_recompact_private(
 				cds_ft_item_to_metadata(ft_node_ptr(nf)))) {
 			ft_compact_relocate_at(ft, holder, (unsigned int) depth,
-				&ctx, oom);
+				&ctx, bail);
 			(*relocated)++;
-			if (*oom)
+			if (*bail)
 				return;		/* memory pressure: stop the descent */
 			nf = rcu_dereference(*holder);	/* the relocated node */
 		}
@@ -505,9 +510,9 @@ void ft_compact_descend(struct cds_ft *ft, const uint8_t *key,
 			 */
 			if (!cds_ft_metadata_in_recompact_private(
 					cds_ft_item_to_metadata((struct cds_ft_inode *) cn))) {
-				cn = ft_compact_relocate_compressed(ft, cn, NULL, oom);
+				cn = ft_compact_relocate_compressed(ft, cn, NULL, bail);
 				(*relocated)++;
-				if (*oom)
+				if (*bail)
 					return;		/* memory pressure: stop the descent */
 			}
 			/*
@@ -526,9 +531,9 @@ void ft_compact_descend(struct cds_ft *ft, const uint8_t *key,
 			/* Traditional: the grandparent slot (child_slot) holds the cn flag. */
 			if (!cds_ft_metadata_in_recompact_private(
 					cds_ft_item_to_metadata((struct cds_ft_inode *) cn))) {
-				cn = ft_compact_relocate_compressed(ft, cn, child_slot, oom);
+				cn = ft_compact_relocate_compressed(ft, cn, child_slot, bail);
 				(*relocated)++;
-				if (*oom)
+				if (*bail)
 					return;		/* memory pressure: stop the descent */
 			}
 			/* The grandparent slot now holds the relocated node's flag. */
@@ -567,7 +572,7 @@ struct cds_ft_compact_state {
 	 * its whole old arena range against reclaim, so resume must lose no key.
 	 * Reset at each step entry (a fresh attempt clears it).
 	 */
-	bool oom;
+	int bail;		/* 0, or the errno that stopped the last step */
 };
 
 struct cds_ft_compact_state *cds_ft_compact_begin(struct cds_ft *ft)
@@ -620,8 +625,8 @@ enum cds_ft_compact_status cds_ft_compact_step(struct cds_ft_compact_state *st,
 	 * The descent is idempotent (already-relocated nodes are recompact_
 	 * private), so the re-attempt only finishes the un-relocated remainder.
 	 */
-	resume_inclusive = st->oom;
-	st->oom = false;
+	resume_inclusive = st->bail != 0;
+	st->bail = 0;
 
 	/*
 	 * Route this step's relocations into private ranges, and hold the
@@ -662,7 +667,7 @@ enum cds_ft_compact_status cds_ft_compact_step(struct cds_ft_compact_state *st,
 			break;
 		}
 		urcu_txn_begin(&optxn);
-		ft_compact_descend(ft, key, key_len, &relocated, &st->oom,
+		ft_compact_descend(ft, key, key_len, &relocated, &st->bail,
 				&optxn);
 		urcu_txn_end(&optxn);
 		/*
@@ -675,18 +680,18 @@ enum cds_ft_compact_status cds_ft_compact_step(struct cds_ft_compact_state *st,
 		 * too when the descent stopped on OOM: the head node may be un-
 		 * relocated, and the resume re-attempts this whole key anyway.
 		 */
-		if (!st->oom && ft->group->ordered_list_set && st->iter->node) {
+		if (!st->bail && ft->group->ordered_list_set && st->iter->node) {
 			struct ft_ord_cell *cell = ft_ord_cell_ptr(
 				rcu_dereference(st->iter->node->prev));
 
 			if (!cds_ft_metadata_in_recompact_private(
 					cds_ft_item_to_metadata(cell))) {
-				ft_compact_relocate_cell(ft, cell, &st->oom);
+				ft_compact_relocate_cell(ft, cell, &st->bail);
 				relocated++;
 			}
 		}
-		if (st->oom)
-			break;		/* memory pressure: stop, resume re-attempts */
+		if (st->bail)
+			break;		/* stop the pass; the resume re-attempts */
 	}
 	/*
 	 * Drop the cached path before releasing the read lock: the nodes it
@@ -700,11 +705,14 @@ enum cds_ft_compact_status cds_ft_compact_step(struct cds_ft_compact_state *st,
 	flavor->read_unlock();
 	ft_recompact_alloc_set_active(NULL);
 	/*
-	 * OOM takes precedence (the caller frees memory and resumes from the
-	 * interrupted key); otherwise report completion or that more remains.
+	 * A bail takes precedence (the caller resumes from the interrupted
+	 * key); otherwise report completion or that more remains.  -EAGAIN and
+	 * -ENOMEM are reported APART: a caller told OOM frees memory, which is
+	 * the wrong remedy for a peer that merely held a lock-set.
 	 */
-	if (st->oom)
-		return CDS_FT_COMPACT_OOM;
+	if (st->bail)
+		return st->bail == -EAGAIN ? CDS_FT_COMPACT_BUSY :
+			CDS_FT_COMPACT_OOM;
 	return st->done ? CDS_FT_COMPACT_DONE : CDS_FT_COMPACT_MORE;
 }
 
@@ -734,5 +742,5 @@ enum cds_ft_compact_status cds_ft_compact(struct cds_ft *ft)
 		s = cds_ft_compact_step(st, 0);
 	} while (s == CDS_FT_COMPACT_MORE);
 	cds_ft_compact_end(st);
-	return s;	/* CDS_FT_COMPACT_DONE or CDS_FT_COMPACT_OOM */
+	return s;	/* DONE, or OOM / BUSY if a step stopped the pass */
 }
