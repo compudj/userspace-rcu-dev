@@ -1724,8 +1724,10 @@ int ft_node_recompact(enum ft_recompact mode,
 				 * and must keep doing so for every other slot.
 				 */
 				if (retire_txn && retire_txn->pending_pub_slot &&
-						src_slot == retire_txn->pending_pub_slot)
+						src_slot == retire_txn->pending_pub_slot) {
 					iter = retire_txn->pending_pub_val;
+					retire_txn->pending_pub_folded = true;
+				}
 			} else if (caa_unlikely(ft_node_flip_proxy(iter))) {
 				/*
 				 * Build-invisible / no-txn arm: no peer publishes
@@ -1835,8 +1837,10 @@ int ft_node_recompact(enum ft_recompact mode,
 				 * and must keep doing so for every other slot.
 				 */
 				if (retire_txn && retire_txn->pending_pub_slot &&
-						src_slot == retire_txn->pending_pub_slot)
+						src_slot == retire_txn->pending_pub_slot) {
 					iter = retire_txn->pending_pub_val;
+					retire_txn->pending_pub_folded = true;
+				}
 			} else if (caa_unlikely(ft_node_flip_proxy(iter))) {
 				/* Copied-slot latch (unpublished arm): see popcount. */
 				ret = -EAGAIN;

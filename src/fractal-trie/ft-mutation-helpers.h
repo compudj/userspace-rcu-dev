@@ -902,6 +902,13 @@ struct ft_flip_txn {
 	struct cds_ft_inode_flag **pending_pub_slot;
 	struct cds_ft_inode_flag *pending_pub_val;
 	/*
+	 * Set by the recompaction that FOLDED the publish above into its copy.
+	 * The forward publish is then already live in the surviving node, and
+	 * recording it a second time would aim an edge at the superseded copy --
+	 * a slot no reader reaches, on a node this same commit retires.
+	 */
+	bool pending_pub_folded;
+	/*
 	 * MIXED sw/mw commit (DLM lock_fine): when true, the STRUCTURAL record
 	 * helpers (every ft_flip_txn_record_tag edge) plant SW-kind records -- a
 	 * plain locked park that CANNOT fail -- because the op holds the DLM
@@ -1088,6 +1095,7 @@ struct ft_flip_txn *ft_flip_txn_create(void)
 	t->acquire_enomem = false;
 	t->pending_pub_slot = NULL;
 	t->pending_pub_val = NULL;
+	t->pending_pub_folded = false;
 	t->structural_sw = false;	/* all-MW until a caller opts in under lock_fine */
 	t->sw_exempt_slot = NULL;
 	return t;
@@ -1299,6 +1307,7 @@ struct ft_flip_txn *ft_flip_txn_create_on(struct urcu_txn *op)
 	t->acquire_enomem = false;
 	t->pending_pub_slot = NULL;
 	t->pending_pub_val = NULL;
+	t->pending_pub_folded = false;
 	t->structural_sw = false;
 	t->sw_exempt_slot = NULL;
 	return t;
@@ -1345,6 +1354,7 @@ struct ft_flip_txn *ft_flip_txn_create_bounded_on(struct urcu_txn *op,
 	t->acquire_enomem = false;
 	t->pending_pub_slot = NULL;
 	t->pending_pub_val = NULL;
+	t->pending_pub_folded = false;
 	t->structural_sw = false;	/* all-MW until a caller opts in under lock_fine */
 	t->sw_exempt_slot = NULL;
 	return t;
@@ -9500,11 +9510,20 @@ enum urcu_txn_status ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue 
 		g->publish_gp_shared = false;
 		g->publish_gp_snap = 0;
 	}
+	/*
+	 * A recompaction already folded this publish into the node that
+	 * replaced @publish_parent, so @publish_slot addresses the superseded
+	 * copy: recording it here would install into a node nothing reads.
+	 */
+	if (g->txn && g->txn->pending_pub_folded &&
+			g->publish_slot == g->txn->pending_pub_slot)
+		goto publish_done;
 	_ft_publish_to_parent(ft, g->publish_parent, g->publish_slot, g->top,
 		ft_glue_publish_expected_old(g), &rec);
 	for (j = 0; j < rec.n; j++)
 		ft_flip_txn_record_reserved(g->txn, (void **) rec.slot[j],
 			rec.old_val[j], rec.new_val[j]);
+publish_done:
 	/*
 	 * MW LOCK_FINE drop (split-compressed graft): retire the compressed
 	 * divergence node @cn this GLUE build split + replaced, consuming the
