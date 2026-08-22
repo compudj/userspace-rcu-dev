@@ -26908,17 +26908,13 @@ extern long cds_ft_fault_removeall_countdown;
  * mode, because 99.95% of remove_all's commits go through ft_detach_node, which
  * builds its txn internally (measured: detach 697,344 of 697,675).
  *
- * ASSERTED: the chain must still be reachable (nothing was published) and
- * *@result_node must be NULL, so the caller cannot reclaim a chain the trie
- * still points at.
- *
- * ☐ THE STATUS IS PINNED, NOT FIXED.  Contention still reports
- * CDS_FT_STATUS_MEMORY_ERROR -- the tail's "KNOWN MW GAP" -- and -EAGAIN cannot
- * be used to tell the two apart: measured over a fault run, this tail saw 33
- * -EAGAIN of which 32 were these forced refusals and ONE came from an
- * ALLOCATION fault.  Mapping -EAGAIN to BUSY_ERROR inverts the defect and turns
- * test_remove_prefix_siblings_oom red.  Closing it needs the SOURCES to stop
- * conflating; this test is the witness that will flip when they do.
+ * ASSERTED: the refused arm reports CDS_FT_STATUS_BUSY_ERROR (a peer, so the
+ * caller retries -- not MEMORY_ERROR, which would send it freeing memory over a
+ * lock it merely lost), the chain is still reachable (nothing was published),
+ * and *@result_node is NULL so the caller cannot reclaim a chain the trie still
+ * points at.  The paired witness for the other class is
+ * test_remove_prefix_siblings_oom, which drives an allocation failure through
+ * the same tail and must keep reporting MEMORY_ERROR.
  */
 static int test_remove_all_contended_bail(void)
 {
@@ -26976,17 +26972,11 @@ static int test_remove_all_contended_bail(void)
 
 		if (this_fired) {
 			fired++;
-			/*
-			 * PINNED: contention is reported as MEMORY_ERROR today.
-			 * When the sources stop conflating -EAGAIN, this is the
-			 * assertion to flip to BUSY_ERROR.
-			 */
-			if (s != CDS_FT_STATUS_MEMORY_ERROR) {
+			if (s != CDS_FT_STATUS_BUSY_ERROR) {
 				fprintf(stderr, "remove_all contended: key %u "
-					"reported %d, expected the known "
-					"MEMORY_ERROR mislabel (%d)\n",
+					"reported %d, expected BUSY_ERROR (%d)\n",
 					i, (int) s,
-					(int) CDS_FT_STATUS_MEMORY_ERROR);
+					(int) CDS_FT_STATUS_BUSY_ERROR);
 				rc = -1;
 				break;
 			}

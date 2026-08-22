@@ -1280,12 +1280,12 @@ long cds_ft_fault_compact_countdown = -1;
 /*
  * Test-only refused-acquire injection for cds_ft_remove_all.
  *
- * WHY THIS EXISTS.  remove_all maps EVERY failure to
- * CDS_FT_STATUS_MEMORY_ERROR, so a peer conflict is reported as an allocation
- * failure ("KNOWN MW GAP" in its own tail).  It cannot happen while the op
- * requires caller writer-exclusion, and measured over both suites it never did:
- * 4,807,509 calls, failure tail reached ZERO times.  The arm the fine-grained
- * conversion needs therefore had no way to run.
+ * WHY THIS EXISTS.  remove_all's contention arm reports
+ * CDS_FT_STATUS_BUSY_ERROR where its allocation arm reports MEMORY_ERROR, and
+ * no workload reaches the contention one on its own: the op requires caller
+ * writer-exclusion, so no peer can refuse it a lock-set, and measured over both
+ * suites its failure tail ran ZERO times in 4,807,509 calls.  The arm the
+ * fine-grained conversion needs therefore has no other way to run.
  *
  * Scoped to the dynamic extent of remove_all's own detach
  * (ft_removeall_fault_scope_enter/exit) rather than to a mode, because 99.95%

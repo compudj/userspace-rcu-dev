@@ -3752,11 +3752,14 @@ restart_replace_attempt:
 					}
 					ft_flip_txn_guard_parent(ft, txn, d.nf);
 					ft_replace_fault_arm_abort(txn);
-					/* ABORT installs nothing: -EAGAIN, as the head arm. */
-					if (ft_ord_cell_flip_into(ft, txn, &sedge, 1) != 0) {
-						ret = -EAGAIN;
+					/* Installs nothing on either failure, as the
+					 * head arm: ABORT -> -EAGAIN (retry),
+					 * MEMORY_ERROR -> -ENOMEM (do not). */
+					ret = ft_flip_status_to_errno(
+						ft_ord_cell_flip_into(ft, txn,
+							&sedge, 1));
+					if (ret)
 						goto insert_replace_done;
-					}
 				}
 			} else {
 				/* No external nodes yet. New key at this node. */

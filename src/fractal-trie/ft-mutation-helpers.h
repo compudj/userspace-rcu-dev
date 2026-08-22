@@ -872,6 +872,16 @@ struct ft_flip_txn {
 	 */
 	bool acquire_miss;
 	/*
+	 * The miss above was an ALLOCATION failure, not a peer.  The acquire
+	 * choke point builds a small txn of its own (ft_dlm_acquire_set_at), so
+	 * it can fail -ENOMEM as well as -EAGAIN -- and its caller here returns
+	 * void, with @acquire_miss its only channel.  Without this bit the
+	 * commit reports an OOM as ABORT and ages the handle for it, so every
+	 * downstream errno test reads memory pressure as contention: measured as
+	 * the one -EAGAIN at cds_ft_remove_all's tail that no peer produced.
+	 */
+	bool acquire_enomem;
+	/*
 	 * MIXED sw/mw commit (DLM lock_fine): when true, the STRUCTURAL record
 	 * helpers (every ft_flip_txn_record_tag edge) plant SW-kind records -- a
 	 * plain locked park that CANNOT fail -- because the op holds the DLM
@@ -1055,6 +1065,7 @@ struct ft_flip_txn *ft_flip_txn_create(void)
 	t->reserved = false;		/* unbounded: @mtxn grows as edges record */
 	t->nr_locks = 0;
 	t->acquire_miss = false;
+	t->acquire_enomem = false;
 	t->structural_sw = false;	/* all-MW until a caller opts in under lock_fine */
 	t->sw_exempt_slot = NULL;
 	return t;
@@ -1263,6 +1274,7 @@ struct ft_flip_txn *ft_flip_txn_create_on(struct urcu_txn *op)
 	t->reserved = false;		/* unbounded: @mtxn grows as edges record */
 	t->nr_locks = 0;
 	t->acquire_miss = false;
+	t->acquire_enomem = false;
 	t->structural_sw = false;
 	t->sw_exempt_slot = NULL;
 	return t;
@@ -1306,6 +1318,7 @@ struct ft_flip_txn *ft_flip_txn_create_bounded_on(struct urcu_txn *op,
 	t->reserved = true;
 	t->nr_locks = 0;
 	t->acquire_miss = false;
+	t->acquire_enomem = false;
 	t->structural_sw = false;	/* all-MW until a caller opts in under lock_fine */
 	t->sw_exempt_slot = NULL;
 	return t;
@@ -2378,18 +2391,26 @@ enum urcu_txn_status ft_flip_txn_commit(struct cds_ft *ft,
 	if (caa_unlikely(t->acquire_miss)) {
 		/*
 		 * A lock-set member was not acquired, so this attempt writes a
-		 * slot it does not own: discard it unpublished and report ABORT,
-		 * which every caller already routes to a re-descend.  Age the
-		 * handle first, exactly as a real contention abort does inside
-		 * urcu_txn_commit_flavor -- without it the op never advances
-		 * txn->retry, never escalates to the FIFO lane, and a contended
-		 * node could starve it indefinitely.
+		 * slot it does not own: discard it unpublished and report the
+		 * reason, which every caller routes to a re-descend (ABORT) or
+		 * out to the app (MEMORY_ERROR).  Nothing was parked either way.
+		 *
+		 * Age the handle on ABORT only, exactly as a real contention
+		 * abort does inside urcu_txn_commit_flavor -- without it the op
+		 * never advances txn->retry, never escalates to the FIFO lane,
+		 * and a contended node could starve it indefinitely.  An
+		 * allocation failure is NOT contention: aging for it spends the
+		 * escalation budget on a conflict that never happened, and
+		 * re-descending cannot make memory appear.
 		 */
-		urcu_txn_conflict(t->mtxn);
-		FT_TP(txn_commit, (const void *) t->mtxn,
-			(int) URCU_TXN_STATUS_ABORT);
+		enum urcu_txn_status miss_st = t->acquire_enomem ?
+			URCU_TXN_STATUS_MEMORY_ERROR : URCU_TXN_STATUS_ABORT;
+
+		if (miss_st == URCU_TXN_STATUS_ABORT)
+			urcu_txn_conflict(t->mtxn);
+		FT_TP(txn_commit, (const void *) t->mtxn, (int) miss_st);
 		ft_flip_txn_destroy(t);
-		return URCU_TXN_STATUS_ABORT;
+		return miss_st;
 	}
 	st = urcu_txn_commit_flavor(t->mtxn, reclaim);
 	FT_TP(txn_commit, (const void *) t->mtxn, (int) st);
@@ -4247,9 +4268,11 @@ void ft_flip_txn_lock_or_guard_parent_at(const char *fn, int line,
 			t->acquire_miss = true;
 			goto guard;
 		}
-		if (caa_likely(!ft_acquire_member(ft, &lctx, parent_nf,
+		int aret = ft_acquire_member(ft, &lctx, parent_nf,
 				ft_flag_to_metadata(ft, parent_nf),
-				parent_depth, &held))) {
+				parent_depth, &held);
+
+		if (caa_likely(!aret)) {
 			/*
 			 * The terminal for a word the op already held was
 			 * recorded when it was acquired, so all that is owed
@@ -4304,6 +4327,14 @@ void ft_flip_txn_lock_or_guard_parent_at(const char *fn, int line,
 		 * shape identical between the hit and miss paths.
 		 */
 		t->acquire_miss = true;
+		/*
+		 * -ENOMEM is not a peer.  Distinguish it so the commit reports
+		 * MEMORY_ERROR instead of ABORT and does NOT age the handle:
+		 * aging for an allocation failure spends the op's escalation
+		 * budget on a conflict that never happened.
+		 */
+		if (aret == -ENOMEM)
+			t->acquire_enomem = true;
 	}
 guard:
 	ft_flip_txn_guard_parent(ft, t, parent_nf);
@@ -4830,6 +4861,25 @@ struct ft_detach_run {
  * an op not yet MW-hardened void-casts the return with a comment (ABORT is
  * unreachable under its current exclusion).
  */
+/*
+ * The commit status as an errno, for the ops that speak errno.  The engine's
+ * three-way status is SIGNED on purpose (MEMORY_ERROR < OK < ABORT), and a bare
+ * "> 0 ? -EAGAIN : 0" therefore reads MEMORY_ERROR as SUCCESS -- publishing
+ * nothing and reporting that it did.  That is unreachable while every commit
+ * here runs on a pre-reserved txn, but an acquire that could not allocate now
+ * surfaces exactly here (ft_flip_txn_commit's @acquire_enomem arm), so the
+ * distinction has to be carried rather than assumed away.
+ */
+static inline
+int ft_flip_status_to_errno(enum urcu_txn_status st)
+{
+	if (st > 0)
+		return -EAGAIN;		/* ABORT: a peer won; nothing installed */
+	if (st < 0)
+		return -ENOMEM;		/* nothing installed either */
+	return 0;
+}
+
 static
 enum urcu_txn_status ft_ord_cell_flip_into(struct cds_ft *ft,
 		struct ft_flip_txn *t,
@@ -5001,7 +5051,7 @@ int ft_ord_cell_flip_try(struct cds_ft *ft, struct ft_ord_cell_edge *edges,
 	t = ft_flip_txn_create_bounded(n);
 	if (caa_unlikely(!t))
 		return -ENOMEM;
-	return ft_ord_cell_flip_into(ft, t, edges, n) > 0 ? -EAGAIN : 0;
+	return ft_flip_status_to_errno(ft_ord_cell_flip_into(ft, t, edges, n));
 }
 
 /*
@@ -5395,8 +5445,8 @@ int ft_ord_cell_swap_publish_multi(struct cds_ft *ft,
 	if (new_cell)
 		n = ft_ord_cell_swap_edges(ft, old_cell, new_cell, edges, n);
 	if (txn)
-		return ft_ord_cell_flip_into(ft, txn, edges, n) > 0 ?
-			-EAGAIN : 0;
+		return ft_flip_status_to_errno(
+			ft_ord_cell_flip_into(ft, txn, edges, n));
 	return ft_ord_cell_flip_try(ft, edges, n);
 }
 
@@ -5534,8 +5584,13 @@ int ft_remove_one_commit(struct cds_ft *ft,
 			ft_ord_cell_record_into_ft(ft, txn, edges, n);
 			return 0;
 		}
-		if (ft_ord_cell_flip_into(ft, txn, edges, n) > 0)
-			return -EAGAIN;	/* peer won: nothing installed, caller retries */
+		int cret = ft_flip_status_to_errno(
+			ft_ord_cell_flip_into(ft, txn, edges, n));
+
+		if (cret)
+			return cret;	/* nothing installed: -EAGAIN peer won and the
+					 * caller retries; -ENOMEM an acquire could
+					 * not allocate and retrying cannot help */
 	} else {
 		assert(!record_only);	/* record-only requires a caller-supplied txn */
 		int cret = ft_ord_cell_flip_try(ft, edges, n);

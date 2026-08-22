@@ -3640,14 +3640,18 @@ int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		n_s = ft_pub_rec_sedges(&rec, sedges);
 		/* Fuse @node's freeze into the structural publish (doc §4.B). */
 		ft_hlist_freeze_prepare(ft_flip_txn_handle(txn), node);
-		if (ft_ord_cell_flip_into(ft, txn, sedges, n_s) > 0) {
+		int cret = ft_flip_status_to_errno(
+			ft_ord_cell_flip_into(ft, txn, sedges, n_s));
+
+		if (cret) {
 			/*
-			 * Peer won: NOTHING installed -- the folded prev edge
-			 * was discarded with the aborted commit, @next_node's
-			 * prev still names its predecessor @node.  Retry from a
-			 * fresh derivation; nothing to undo.
+			 * NOTHING installed -- the folded prev edge was
+			 * discarded with the failed commit, @next_node's prev
+			 * still names its predecessor @node.  Nothing to undo:
+			 * -EAGAIN retries from a fresh derivation, -ENOMEM
+			 * (an acquire that could not allocate) does not.
 			 */
-			return -EAGAIN;
+			return cret;
 		}
 	}
 	return 0;
@@ -3848,9 +3852,12 @@ int ft_unchain_node(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 			(struct cds_ft_inode_flag *) node, &rec);
 		n_s = ft_pub_rec_sedges(&rec, sedges);
 		ft_hlist_freeze_prepare(ft_flip_txn_handle(txn), node);
-		if (ft_ord_cell_flip_into(ft, txn, sedges, n_s) > 0)
-			/* Peer won: nothing installed, @node still chained. */
-			return -EAGAIN;
+		int cret = ft_flip_status_to_errno(
+			ft_ord_cell_flip_into(ft, txn, sedges, n_s));
+
+		if (cret)
+			/* Nothing installed, @node still chained. */
+			return cret;
 	}
 	return 0;
 }
@@ -5028,25 +5035,20 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 		 * the header contract -- so the caller cannot reclaim the
 		 * still-reachable chain.
 		 *
-		 * ☐ KNOWN MW GAP, still open, and -EAGAIN IS NOT THE
-		 * DISCRIMINATOR that would close it.  A peer conflict does land
-		 * here as MEMORY_ERROR, which sends the caller freeing memory
-		 * over a peer -- but so does at least one ALLOCATION failure,
-		 * measured: over a fault-injection run this tail saw 33 -EAGAIN
-		 * of which 32 were forced refusals and ONE came from an
-		 * allocation fault, plus 4 -ENOMEM.  Mapping -EAGAIN to
-		 * BUSY_ERROR therefore mislabels an OOM as contention, which is
-		 * this defect inverted (it turns test_remove_prefix_siblings_oom
-		 * red, saying "Resource busy state mismatch").
-		 *
-		 * Closing it needs the SOURCES to carry the distinction, not the
-		 * tail to guess it: an allocation failure must stop returning
-		 * -EAGAIN.  cds_ft_fault_removeall_countdown can now execute the
-		 * contention arm (test_remove_all_contended_bail), so whoever
-		 * does that work has a witness to flip.
+		 * -EAGAIN is a peer, -ENOMEM is memory, and the two report
+		 * differently: BUSY_ERROR sends the caller back to retry,
+		 * MEMORY_ERROR tells it to free something first.  The
+		 * distinction is only as good as the sources, which is what
+		 * blocked this mapping before -- an acquire that could not
+		 * allocate its own lock txn used to reach the commit as
+		 * @acquire_miss and abort, arriving here as -EAGAIN with no
+		 * allocation failure anywhere in the errno.  That path now
+		 * carries @acquire_enomem and commits MEMORY_ERROR instead, so
+		 * every -EAGAIN landing here is a peer.
 		 */
 		*result_node = NULL;
-		return CDS_FT_STATUS_MEMORY_ERROR;
+		return ret == -EAGAIN ? CDS_FT_STATUS_BUSY_ERROR :
+			CDS_FT_STATUS_MEMORY_ERROR;
 	}
 
 	return CDS_FT_STATUS_OK;
