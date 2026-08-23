@@ -205,6 +205,7 @@ void ft_probe_mrg_report(void)
 #include "ft-tables.h"
 #include "ft-delay.h"
 #include "ft-helpers.h"
+#include "ft-txn-kind-stats.h"	/* -DFT_DEBUG_TXN_KIND record-kind counters */
 #include "ft-txn-hlist.h"	/* duplicate-chain transactional hlist (unused until wired) */
 #include "ft-trace-helpers.h"
 #include "ft-lookup-node.h"

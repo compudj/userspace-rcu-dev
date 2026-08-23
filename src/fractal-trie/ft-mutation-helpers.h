@@ -1001,6 +1001,14 @@ struct ft_flip_txn {
 	 * dispatch below is MW for everything anyway -- byte-identical.
 	 */
 	void **sw_exempt_slot;
+	/*
+	 * -DFT_DEBUG_TXN_KIND only (ft-txn-kind-stats.h): where this txn was
+	 * created, and whether the record in flight is the DLM lock TAKE.  The
+	 * take reaches the same dispatch as every other structural edge, so
+	 * without the flag it would be counted as a conservative-MW edge --
+	 * i.e. as convertible, which it is precisely not.
+	 */
+	FT_TK_TXN_FIELDS
 };
 
 /*
@@ -1107,7 +1115,7 @@ void ft_txn_attempt_bail(struct urcu_txn *op, bool open)
 }
 
 static inline
-struct ft_flip_txn *ft_flip_txn_create(void)
+struct ft_flip_txn *ft_flip_txn_create_at(FT_TK_SITE_PARAM_ONLY)
 {
 	struct ft_flip_txn *t = (struct ft_flip_txn *) malloc(sizeof(*t));
 
@@ -1135,6 +1143,7 @@ struct ft_flip_txn *ft_flip_txn_create(void)
 	t->pending_del_folded = false;
 	t->structural_sw = false;	/* all-MW until a caller opts in under lock_fine */
 	t->sw_exempt_slot = NULL;
+	FT_TK_TXN_INIT(t, dbg_site);
 	return t;
 }
 
@@ -1256,7 +1265,8 @@ bool ft_recompact_fault_refuse_acquire(enum ft_recompact mode)
 }
 
 static inline
-struct ft_flip_txn *ft_flip_txn_create_bounded(unsigned int cap)
+struct ft_flip_txn *ft_flip_txn_create_bounded_at(FT_TK_SITE_PARAM
+		unsigned int cap)
 {
 	struct ft_flip_txn *t;
 
@@ -1301,7 +1311,7 @@ struct ft_flip_txn *ft_flip_txn_create_bounded(unsigned int cap)
 	 * remove_all et al. -- do not have) but it is a behaviour difference,
 	 * not a spelling one.
 	 */
-	t = ft_flip_txn_create();
+	t = ft_flip_txn_create_at(FT_TK_SITE_FWD_ONLY);
 	if (!t)
 		return NULL;
 	if (!ft_flip_txn_reserve(t, cap)) {
@@ -1330,7 +1340,8 @@ struct ft_flip_txn *ft_flip_txn_create_bounded(unsigned int cap)
  * age-0 RYW Bloom and would false-positive a same-slot coincidence.
  */
 static inline
-struct ft_flip_txn *ft_flip_txn_create_on(struct urcu_txn *op)
+struct ft_flip_txn *ft_flip_txn_create_on_at(FT_TK_SITE_PARAM
+		struct urcu_txn *op)
 {
 	struct ft_flip_txn *t = (struct ft_flip_txn *) malloc(sizeof(*t));
 
@@ -1350,6 +1361,7 @@ struct ft_flip_txn *ft_flip_txn_create_on(struct urcu_txn *op)
 	t->pending_del_folded = false;
 	t->structural_sw = false;
 	t->sw_exempt_slot = NULL;
+	FT_TK_TXN_INIT(t, dbg_site);
 	return t;
 }
 
@@ -1366,8 +1378,8 @@ struct ft_flip_txn *ft_flip_txn_create_on(struct urcu_txn *op)
  * with -ENOMEM.  Shares the fault-injection countdown with create_bounded.
  */
 static inline
-struct ft_flip_txn *ft_flip_txn_create_bounded_on(struct urcu_txn *op,
-		unsigned int cap)
+struct ft_flip_txn *ft_flip_txn_create_bounded_on_at(FT_TK_SITE_PARAM
+		struct urcu_txn *op, unsigned int cap)
 {
 	struct ft_flip_txn *t;
 
@@ -1400,8 +1412,38 @@ struct ft_flip_txn *ft_flip_txn_create_bounded_on(struct urcu_txn *op,
 	t->pending_del_folded = false;
 	t->structural_sw = false;	/* all-MW until a caller opts in under lock_fine */
 	t->sw_exempt_slot = NULL;
+	FT_TK_TXN_INIT(t, dbg_site);
 	return t;
 }
+
+/*
+ * THE CREATION SITE IS THE INSTRUMENT'S IDENTITY (ft-txn-kind-stats.h).  Each
+ * expansion below plants a function-static naming its own __FILE__:__LINE__ and
+ * hands it to the constructor, so the per-site record-kind / commit-outcome
+ * table needs nothing from the 70 call sites themselves.  Without the knob the
+ * site argument is absent from the SIGNATURE too (FT_TK_SITE_PARAM), so the
+ * uninstrumented build is not merely cheaper but identical -- an always-NULL
+ * argument still moves the compiler's inlining decisions, and an instrument
+ * used to compare latencies must not perturb the paths it compares.
+ */
+#ifdef FT_DEBUG_TXN_KIND
+# define ft_flip_txn_create()						\
+	ft_flip_txn_create_at(FT_TK_SITE_HERE("create"))
+# define ft_flip_txn_create_bounded(cap)				\
+	ft_flip_txn_create_bounded_at(FT_TK_SITE_HERE("bounded"), (cap))
+# define ft_flip_txn_create_on(op)					\
+	ft_flip_txn_create_on_at(FT_TK_SITE_HERE("on"), (op))
+# define ft_flip_txn_create_bounded_on(op, cap)				\
+	ft_flip_txn_create_bounded_on_at(FT_TK_SITE_HERE("bounded_on"),	\
+			(op), (cap))
+#else
+# define ft_flip_txn_create()		ft_flip_txn_create_at()
+# define ft_flip_txn_create_bounded(cap)				\
+	ft_flip_txn_create_bounded_at(cap)
+# define ft_flip_txn_create_on(op)	ft_flip_txn_create_on_at(op)
+# define ft_flip_txn_create_bounded_on(op, cap)				\
+	ft_flip_txn_create_bounded_on_at((op), (cap))
+#endif
 
 /*
  * Reserve @cap records on an already-created (unbounded) flip-txn -- the glue
@@ -2414,6 +2456,7 @@ void ft_flip_txn_lock_release_all(struct ft_flip_txn *t)
 static inline
 void ft_flip_txn_destroy(struct ft_flip_txn *t)
 {
+	FT_TK_COUNT_END(t, FT_TK_BAILED);
 	ft_flip_txn_lock_release_all(t);
 	if (t->mtxn->desc && t->mtxn->desc != URCU_TXN_ENOMEM) {
 		urcu_txn_destroy(t->mtxn->desc);
@@ -2488,11 +2531,15 @@ enum urcu_txn_status ft_flip_txn_commit(struct cds_ft *ft,
 		if (miss_st == URCU_TXN_STATUS_ABORT)
 			urcu_txn_conflict(t->mtxn);
 		FT_TP(txn_commit, (const void *) t->mtxn, (int) miss_st);
+		FT_TK_COUNT_END(t, FT_TK_MISS);
 		ft_flip_txn_destroy(t);
 		return miss_st;
 	}
 	st = urcu_txn_commit_flavor(t->mtxn, reclaim);
 	FT_TP(txn_commit, (const void *) t->mtxn, (int) st);
+	FT_TK_COUNT_END(t, st == URCU_TXN_STATUS_OK ? FT_TK_OK :
+			(st == URCU_TXN_STATUS_MEMORY_ERROR ? FT_TK_MEMERR :
+				FT_TK_ABORT));
 	/*
 	 * node locks: a committed txn transitioned each registered node
 	 * through the terminal its op recorded -- {LOCK|s -> TOMBSTONE|s}
@@ -2541,10 +2588,19 @@ void ft_flip_txn_record_tag(struct ft_flip_txn *t, void **slot,
 	 * locked park, installed after the MW edges, that cannot fail.  Otherwise
 	 * (every other op, non-lock_fine) it is MW == the all-MW behaviour.
 	 */
-	if (t->structural_sw && slot != t->sw_exempt_slot)
+	if (t->structural_sw && slot != t->sw_exempt_slot) {
+		FT_TK_COUNT_REC(t, FT_TK_SW);
 		ret = urcu_txn_store_sw(t->mtxn, slot, old_ptr, new_ptr, tag);
-	else
+	} else {
+		/*
+		 * The DLM lock TAKE reaches this same branch and is the one MW
+		 * record that must never become SW, so it is counted apart from
+		 * the conservative ones (ft-txn-kind-stats.h).
+		 */
+		FT_TK_COUNT_REC(t, FT_TK_TXN_IS_TAKE(t) ?
+				FT_TK_MW_LOCK : FT_TK_MW_STRUCT);
 		ret = urcu_txn_store_mw(t->mtxn, slot, old_ptr, new_ptr, tag);
+	}
 	assert(!ret);
 	(void) ret;	/* reserved up front -> never fails */
 }
@@ -2566,6 +2622,7 @@ void ft_flip_txn_record_tag_mw(struct ft_flip_txn *t, void **slot,
 
 	FT_TP(edge_record, (const void *) t->mtxn, (const void *) slot,
 		(const void *) old_ptr, (const void *) new_ptr, tag);
+	FT_TK_COUNT_REC(t, FT_TK_MW_ALWAYS);
 	ret = urcu_txn_store_mw(t->mtxn, slot, old_ptr, new_ptr, tag);
 	assert(!ret);
 	(void) ret;	/* reserved up front -> never fails */
@@ -2584,6 +2641,8 @@ void ft_flip_txn_set_structural_sw(struct ft_flip_txn *t, bool v,
 		void **sw_exempt_slot)
 {
 	t->structural_sw = v;
+	if (v)
+		FT_TK_COUNT_ARMED(t);
 	/*
 	 * Taken WITH the mode, not as a separate opt-in: the exemption exists
 	 * only because the mode does, and a caller that set one without the
@@ -2702,8 +2761,10 @@ int ft_dlm_lock(struct ft_flip_txn *t, struct cds_ft_metadata *meta,
 			FT_STATE_LOCK)))
 		return -EAGAIN;
 	*snap = s;
+	FT_TK_TXN_SET_TAKE(t, true);
 	ft_flip_txn_record_state(t, meta,
 			(void *) s, (void *) (s | FT_STATE_LOCK));
+	FT_TK_TXN_SET_TAKE(t, false);
 	return 0;
 }
 
@@ -2719,6 +2780,7 @@ static inline
 void ft_dlm_guard_parent(struct ft_flip_txn *t, struct cds_ft_metadata *child,
 		struct cds_ft_inode_flag *expected_pf)
 {
+	FT_TK_COUNT_REC(t, FT_TK_VALIDATE);
 	urcu_txn_validate(t->mtxn, (void **) &child->parent_word,
 			(void *) expected_pf, FT_FLIP_PROXY_TAG);
 }
@@ -2736,6 +2798,7 @@ static inline
 void ft_held_anchor_guard_node(struct ft_flip_txn *t,
 		struct cds_ft_metadata *node, uintptr_t node_snap)
 {
+	FT_TK_COUNT_REC(t, FT_TK_VALIDATE);
 	urcu_txn_validate(t->mtxn, (void **) &node->state,
 			(void *) node_snap, FT_STATE_PROXY);
 }
@@ -3055,7 +3118,9 @@ int ft_txn_list_insert_between_prepare(struct urcu_txn *txn,
 	/* Build the fresh node invisibly, then record the two forward edges. */
 	newp->next = succ_expected;
 	newp->prev = pos;
+	FT_TK_COUNT_CELL_MW();		/* a cell edge: see ft_hlist_store_mw */
 	urcu_txn_store_mw(txn, (void **) &pos->next, succ_expected, newp, URCU_TXN_TAG);
+	FT_TK_COUNT_CELL_MW();
 	urcu_txn_store_mw(txn, (void **) &succ_expected->prev, pos, newp, URCU_TXN_TAG);
 	return 0;
 }

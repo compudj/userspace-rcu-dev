@@ -105,6 +105,22 @@
 #define FT_HLIST_REPLACE_MAX_EDGES	4
 #define FT_HLIST_FREEZE_MAX_EDGES	1
 
+/*
+ * Every chain edge below goes through here, for one reason beyond the store:
+ * these records carry no back-pointer to the flip-txn they fold into, so the
+ * per-creation-site table in ft-txn-kind-stats.h cannot attribute them.  This
+ * is where they are counted instead -- as one global class, which is all they
+ * need to be: a chain edge is MW ON PURPOSE (the chain is not covered by the
+ * structural node locks) and is not part of the conservative-MW conversion.
+ */
+static inline
+int ft_hlist_store_mw(struct urcu_txn *txn, void **slot, void *old_ptr,
+		void *new_ptr, uintptr_t tag)
+{
+	FT_TK_COUNT_CELL_MW();
+	return urcu_txn_store_mw(txn, slot, old_ptr, new_ptr, tag);
+}
+
 static inline
 void *ft_hlist_set_mark(struct cds_ft_node *n)
 {
@@ -174,9 +190,9 @@ int ft_hlist_insert_after_prepare(struct urcu_txn *txn,
 	newp->prev = pos;
 
 	/* pos->next: succ -> newp ; succ->prev: pos -> newp. */
-	urcu_txn_store_mw(txn, (void **) &pos->next, succ, newp, FT_HLIST_TAG);
+	ft_hlist_store_mw(txn, (void **) &pos->next, succ, newp, FT_HLIST_TAG);
 	if (succ != NULL)
-		urcu_txn_store_mw(txn, (void **) &succ->prev, pos, newp, FT_HLIST_TAG);
+		ft_hlist_store_mw(txn, (void **) &succ->prev, pos, newp, FT_HLIST_TAG);
 	return 0;
 }
 
@@ -218,7 +234,7 @@ void ft_hlist_append_run_prepare(struct urcu_txn *txn,
 	int ret;
 
 	run_head->prev = tail;		/* writer-only plain store */
-	ret = urcu_txn_store_mw(txn, (void **) &tail->next, NULL, run_head,
+	ret = ft_hlist_store_mw(txn, (void **) &tail->next, NULL, run_head,
 			FT_HLIST_TAG);
 	assert(!ret);			/* caller reserved the edge up front */
 	(void) ret;
@@ -255,11 +271,11 @@ int ft_hlist_del_prepare(struct urcu_txn *txn, struct cds_ft_node *elem)
 	 * head ops fold it (ft_hlist_freeze_prepare) for atomicity with the
 	 * structural anchor edge.
 	 */
-	urcu_txn_store_mw(txn, (void **) &elem->next, next,
+	ft_hlist_store_mw(txn, (void **) &elem->next, next,
 			ft_hlist_set_mark(next), FT_HLIST_TAG);
-	urcu_txn_store_mw(txn, (void **) &pred->next, elem, next, FT_HLIST_TAG);
+	ft_hlist_store_mw(txn, (void **) &pred->next, elem, next, FT_HLIST_TAG);
 	if (next != NULL)
-		urcu_txn_store_mw(txn, (void **) &next->prev, elem, pred, FT_HLIST_TAG);
+		ft_hlist_store_mw(txn, (void **) &next->prev, elem, pred, FT_HLIST_TAG);
 	return 0;
 }
 
@@ -289,11 +305,11 @@ int ft_hlist_replace_prepare(struct urcu_txn *txn,
 	newp->next = next;
 	newp->prev = pred;
 
-	urcu_txn_store_mw(txn, (void **) &old->next, next,
+	ft_hlist_store_mw(txn, (void **) &old->next, next,
 			ft_hlist_set_mark(next), FT_HLIST_TAG);
-	urcu_txn_store_mw(txn, (void **) &pred->next, old, newp, FT_HLIST_TAG);
+	ft_hlist_store_mw(txn, (void **) &pred->next, old, newp, FT_HLIST_TAG);
 	if (next != NULL)
-		urcu_txn_store_mw(txn, (void **) &next->prev, old, newp, FT_HLIST_TAG);
+		ft_hlist_store_mw(txn, (void **) &next->prev, old, newp, FT_HLIST_TAG);
 	return 0;
 }
 
@@ -316,7 +332,7 @@ void ft_hlist_freeze_prepare(struct urcu_txn *txn, struct cds_ft_node *node)
 	void *en = urcu_txn_load(txn, (void **) &node->next, FT_HLIST_TAG);
 	int ret;
 
-	ret = urcu_txn_store_mw(txn, (void **) &node->next, en,
+	ret = ft_hlist_store_mw(txn, (void **) &node->next, en,
 			ft_hlist_set_mark((struct cds_ft_node *) en), FT_HLIST_TAG);
 	assert(!ret);			/* caller reserved the edge up front */
 	(void) ret;
