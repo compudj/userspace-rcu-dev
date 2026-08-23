@@ -1477,6 +1477,19 @@ int ft_detach_node(struct cds_ft *ft,
 	struct cds_ft_inode_flag *orphan_trailing = NULL;
 	bool free_orphans_pending = false;
 	/*
+	 * THE BOUNDARY THE CLIMB ACTUALLY LANDED ON, and its slot.  A caller's
+	 * @src_held_hint describes the DETACH TARGET's junction, which stops
+	 * being the recompacted node the moment the climb ELEVATES: it then
+	 * recompacts an ANCESTOR, whose parent is one level higher again.
+	 * Forwarding the caller's hint there points the republish -- and the
+	 * read-set guard that validates it -- at the wrong node.  These name
+	 * the real pair, re-derived by the climb that moved.
+	 */
+	struct cds_ft_inode_flag *boundary_parent_nf = NULL;
+	bool climbed = false;
+	struct ft_parent_hint elevated_hint;
+	const struct ft_parent_hint *replace_hint = src_held_hint;
+	/*
 	 * DLM orphan plan-lock (§9.2): under
 	 * ft->lock_fine every collected orphan (Block A or Block B, both mutually
 	 * exclusive) is lock-acquired at collection so the nr_child==1 collapse
@@ -1823,6 +1836,7 @@ int ft_detach_node(struct cds_ft *ft,
 			(struct cds_ft_inode_flag *) ft_parent_node(
 				rcu_dereference(metadata->parent_word)));
 		is_root = (resolved_parent == NULL);
+		boundary_parent_nf = resolved_parent;	/* always names @cur */
 		/*
 		 * ONE proxy-resolved snapshot of this ancestor's child count, for
 		 * exactly the same two reasons as @resolved_parent just above --
@@ -2047,6 +2061,7 @@ int ft_detach_node(struct cds_ft *ft,
 				return -EAGAIN;	/* stale plan: re-descend */
 			cur_depth -= cur_span;
 			cur = parent_nf;
+			climbed = true;
 		}
 	}
 
@@ -2887,6 +2902,51 @@ int ft_detach_node(struct cds_ft *ft,
 #endif
 			lctx.held.txn = commit_txn;
 			lctx.held.nr_extra = (unsigned int) nr_orphan_locked;
+			/*
+			 * RE-DERIVE the hint when the climb MOVED.  The caller's
+			 * names the detach target's junction; after an elevation
+			 * the recompacted node is an ANCESTOR of that, and its own
+			 * parent is @boundary_parent_nf with @detach_parent_flag_ptr
+			 * as its slot -- both re-derived by the same walk that
+			 * moved, which is the only frame that can know them.  Left
+			 * stale, the @parent_guard read-set term validates the
+			 * recompacted node against a parent that is not its own, so
+			 * the acquire's commit ABORTS on every attempt and the
+			 * caller's -EAGAIN loop re-derives the identical plan
+			 * forever.
+			 *
+			 * @parent_held is FALSE and @gp / @gp_slot are NULL: the
+			 * caller's answers were about ITS junction and say nothing
+			 * about this one.  A word this op does happen to hold is
+			 * still handled -- the acquire DEDUPES against the held set
+			 * rather than refusing -- and a COMPRESSED parent, whose
+			 * SKIP_X dual would need a great-grandparent this frame has
+			 * not derived, is refused above.
+			 */
+			if (climbed && src_held_hint &&
+					boundary_parent_nf &&
+					ft_node_compressed(boundary_parent_nf)) {
+				/*
+				 * A COMPRESSED landing parent carries a SKIP_X dual the
+				 * recompact re-encodes into its OWN parent's slot, and
+				 * this walk has not derived that great-grandparent pair.
+				 * Deriving it from a back-pointer has exactly the
+				 * staleness the hint exists to avoid.  A shape this frame
+				 * cannot express, not a peer: -EDOM, so the caller
+				 * reports it uncovered instead of retrying forever.
+				 */
+				ret = -EDOM;
+				goto end;
+			}
+			if (climbed && src_held_hint) {
+				elevated_hint = (struct ft_parent_hint){
+					.parent = boundary_parent_nf,
+					.slot = detach_parent_flag_ptr,
+					.gp = NULL, .gp_slot = NULL,
+					.parent_held = false,
+					.parent_guard = src_held_hint->parent_guard };
+				replace_hint = &elevated_hint;
+			}
 			ret = ft_node_replace_ptr(ft,
 				detach_node_flag_ptr,
 				elevated_old_child,
@@ -2895,7 +2955,7 @@ int ft_detach_node(struct cds_ft *ft,
 				metadata_stack[nr_branch - 1],
 				n, (struct cds_ft_inode_flag *) topmost_external_nodes,
 				detach_parent_flag_ptr == &ft->root,
-				cur_depth, pub, commit_txn, src_held_hint,
+				cur_depth, pub, commit_txn, replace_hint,
 				&lctx);
 		}
 		if (!ret) {
