@@ -1147,13 +1147,34 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	ft_descent_init(&d_src, ft);
 	ik = src_ord;
 	while (d_src.depth < src_len) {
-		if (!d_src.nf || ft_node_external(d_src.nf) ||
-				ft_node_compressed(d_src.nf))
+		if (!d_src.nf || ft_node_external(d_src.nf))
 			return FT_REKEY_UNCOVERED;
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 		if (ft_node_skip_compressed(d_src.nf))
 			return FT_REKEY_UNCOVERED;
 #endif
+		/*
+		 * A compressed run on the way DOWN to S_top is crossed whole, the
+		 * way the dst probe crosses one: step() advances a single byte, so
+		 * walking a run with it counts the bytes but never resolves into
+		 * cn->child, landing depth-correct on NULL.  The run must also FIT
+		 * the remaining key and MATCH it -- a run reaching past @src_len
+		 * would put S_top mid-run, which has no slot to clear.
+		 */
+		if (ft_node_compressed(d_src.nf)) {
+			struct cds_ft_compressed_node *cn =
+				ft_compressed_node_ptr(d_src.nf);
+			unsigned int remaining =
+				(unsigned int) (src_len - d_src.depth);
+
+			if ((unsigned int) cn->len > remaining ||
+					ft_match_compressed_key(ik, cn,
+						(unsigned int) cn->len)
+					!= (unsigned int) cn->len)
+				return FT_REKEY_UNCOVERED;
+			ft_descent_traverse_compressed(ft, &d_src, cn, &ik);
+			continue;
+		}
 		ft_descent_step(ft, &d_src, *(ik++));
 	}
 	s_top = d_src.nf;
@@ -1199,11 +1220,29 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 			ft_compressed_node_ptr(s_top)) :
 		cds_ft_item_to_metadata(ft_node_ptr(s_top));
 
-	/* BP (= S_top's parent) must be plain and stay above min_child on removal. */
+	/*
+	 * BP (= S_top's parent).  A COMPRESSED BP is in scope: a run is a node
+	 * like any other to the detach -- it just has exactly one child, so
+	 * dropping S_top empties it and the detach's upward walk ELEVATES past
+	 * it.  That shape is carried by the fold (the orphan chain rides
+	 * @detach_rc and is reclaimed on the far side of the one commit), so
+	 * the only thing the run changes here is where its metadata lives.
+	 *
+	 * A SKIP-COMPRESSED BP stays out: its metadata is the skip target's,
+	 * and the detach's trailing-skip arm is a second retire the fold has
+	 * no owner for.
+	 */
 	if (!d_src.pnf || ft_node_flip_proxy(d_src.pnf) ||
-			ft_node_external(d_src.pnf) || ft_node_compressed(d_src.pnf))
+			ft_node_external(d_src.pnf))
 		return FT_REKEY_UNCOVERED;
-	bp_meta = cds_ft_item_to_metadata(ft_node_ptr(d_src.pnf));
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+	if (ft_node_skip_compressed(d_src.pnf))
+		return FT_REKEY_UNCOVERED;
+#endif
+	bp_meta = ft_node_compressed(d_src.pnf) ?
+		cds_ft_item_to_metadata((struct cds_ft_inode *)
+			ft_compressed_node_ptr(d_src.pnf)) :
+		cds_ft_item_to_metadata(ft_node_ptr(d_src.pnf));
 	/*
 	 * RACE-WINDOW INJECTION for the descent->detach ABA hypothesis
 	 * (-DFT_DELAY_INJECT, FT_DELAY_MODE=writer, FT_DELAY_US=N).
@@ -1266,15 +1305,19 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 * right side of the commit, and the reservation below is sized for its
 	 * edges.  Two children therefore ride the same single decide as three.
 	 *
-	 * THE FLOOR STAYS AT TWO, and not as a leftover.  A one-child BP is the
-	 * shape where the detach's upward walk ELEVATES -- it stops only at a
-	 * boundary, and nr_child > 1 is what makes one -- stranding an orphan chain
-	 * whose deferred free the record_only fold has no committed unlink to stand
-	 * on, and tripping the simple-shape assert on the non-fused branch.  It is
-	 * also not a shape a canonical trie holds: it is path-compressed away.
+	 * A ONE-CHILD BP is covered too, and it is the compressed-run shape: a
+	 * run holds exactly one child, so dropping S_top empties it and the
+	 * detach's upward walk ELEVATES -- it stops only at a boundary, and
+	 * nr_child > 1 is what makes one.  The orphan chain that walk clears
+	 * rides @detach_rc back to this frame and is freed on the far side of
+	 * the one commit, which is the unlink it must follow.
+	 *
+	 * ZERO is not a shape: BP is S_top's parent, so it has at least the one
+	 * child this move removes.  A count that reads below one is a torn or
+	 * superseded read, and re-descending is the answer.
 	 */
-	if (ft_meta_nr_child_load(bp_meta) < 2)
-		return FT_REKEY_UNCOVERED;
+	if (ft_meta_nr_child_load(bp_meta) < 1)
+		return -EAGAIN;
 
 	/*
 	 * INCREMENT 3: an OCCUPIED dst is a MERGE, not an error -- the moved subtree
