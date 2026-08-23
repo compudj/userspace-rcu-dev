@@ -113,6 +113,7 @@
 #include <urcu/rcu-txn-list.h>
 #include <urcu/rculfhash.h>
 #include <urcu/arch.h>
+#include <urcu/assert.h>	/* urcu_assert_debug: the engine self-checks' arm */
 #include <urcu/call-rcu.h>
 #include <urcu/uatomic.h>
 #include <urcu/fractal-trie.h>	/* enum cds_ft_numa_policy, cds_ft_optimize */
@@ -826,6 +827,16 @@ struct ft_pub_rec {
 	struct cds_ft_inode_flag **slot[3];
 	struct cds_ft_inode_flag *old_val[3];
 	struct cds_ft_inode_flag *new_val[3];
+	/*
+	 * Per-edge: this slot is a TRIE ROOT (&ft->root), so every replay of
+	 * this rec must record it MW (ft_flip_txn_record_root).  A root lives
+	 * in no node, so no lock-set can own it and no structural_sw op may
+	 * park it.  The publish is the only place that KNOWS -- it branches on
+	 * the NULL parent already (the root_publish tracepoint) -- and the
+	 * replays are several and far away, so the answer travels with the
+	 * edge rather than being re-derived at each of them.
+	 */
+	bool root[3];
 	unsigned int n;
 	/*
 	 * The commit engine handle this rec's edges will be recorded into, when

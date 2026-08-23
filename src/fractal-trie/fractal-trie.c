@@ -347,14 +347,7 @@ int _cds_ft_debug_cow_replace_root(struct cds_ft *ft)
 	txn = ft_flip_txn_create(ft);
 	if (!txn)
 		return -ENOMEM;
-	/*
-	 * ...with &ft->root exempt.  The forward publish below parks that very
-	 * slot, and its comment already names the reason it is safe -- "root
-	 * slot self-guarded", i.e. arbitrated by its own CAS.  An SW park is
-	 * not that: it neither arbitrates nor is visible to a peer's CAS.  So
-	 * say it in the mode rather than in a comment.
-	 */
-	ft_flip_txn_set_structural_sw(txn, true, (void **) &ft->root);
+	ft_flip_txn_set_structural_sw(txn, true);
 
 	/* The ROOT is its own anchor under every spacing: byte-depth 0. */
 	ret = ft_rekey_cow_stop(ft, NULL, txn, root, 0, 0 /*cut*/, &root_prime,
@@ -364,8 +357,9 @@ int _cds_ft_debug_cow_replace_root(struct cds_ft *ft)
 		goto sweep;
 	}
 
-	/* Forward publish ft->root: root -> root' (MW: the root slot is
-	 * arbitrated by its own CAS -- see the sw_exempt_slot above). */
+	/* Forward publish ft->root: root -> root' (MW by construction -- the
+	 * root slot is arbitrated by its own CAS, and an SW park is neither a
+	 * CAS nor visible to one; see ft_flip_txn_record_root). */
 	if (!ft_flip_txn_reserve_extra(txn, 1)) {
 		free_cds_ft_node_unpublished(ft, ft_node_ptr(root_prime));
 		ft_flip_txn_destroy(txn);
@@ -378,7 +372,7 @@ int _cds_ft_debug_cow_replace_root(struct cds_ft *ft)
 	 */
 	cds_ft_item_to_metadata(ft_node_ptr(root_prime))->parent_word =
 		ft_trie_parent(ft);
-	ft_flip_txn_record_reserved(txn, (void **) &ft->root, root, root_prime);
+	ft_flip_txn_record_root(txn, (void **) &ft->root, root, root_prime);
 
 	st = ft_flip_txn_commit(ft, txn);		/* consumes txn */
 	if (st == URCU_TXN_STATUS_OK) {

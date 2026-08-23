@@ -1733,25 +1733,24 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 
 	/* 1. COW S_top -> S_top' (SW; records re-parents + retire, LOCKED). */
 	/*
-	 * ...with ONE slot exempt: &ft->root, which this op must CAS rather
-	 * than park (see the field's own comment for why that slot is MW).
+	 * The mode says nothing about &ft->root: a root records MW by
+	 * construction (ft_flip_txn_record_root), whichever txn writes it.
 	 *
-	 * ☠ IT CHANGES NOTHING HERE TODAY, and saying so is the point.  A
+	 * ☠ NO SHAPE HERE REACHES ONE TODAY, and saying so is the point.  A
 	 * depth-1 source junction is the only shape that would make the detach
 	 * recompact the ROOT and republish it at that slot, and the junction
 	 * gate below refuses exactly that shape, FT_REKEY_UNCOVERED -- giving
 	 * as its reason that &ft->root has "no node word to park the republish
-	 * under".  Measured: zero records reach the exemption from this caller
-	 * across ft_unit and ft_inv at all three spacings.
+	 * under".
 	 *
-	 * The exemption is what ANSWERS that reason.  It belongs with the mode
-	 * and not with the shape, because the gate can only decline the whole
-	 * move whereas the txn can simply record that one slot the way every
-	 * other writer of it already does.  Lifting the gate is a separate
-	 * question -- other refusals sit behind it -- but it cannot be lifted
-	 * onto a txn that would park the root pointer.
+	 * The record helper is what ANSWERS that reason, and it answers it for
+	 * every caller at once rather than per txn: the gate can only decline
+	 * the whole move, whereas the record simply plants that one slot the
+	 * way every other writer of it already does.  Lifting the gate is a
+	 * separate question -- other refusals sit behind it -- but arming is
+	 * no longer part of it.
 	 */
-	ft_flip_txn_set_structural_sw(txn, true, (void **) &ft->root);
+	ft_flip_txn_set_structural_sw(txn, true);
 	if (!merge_dst) {
 		ft_lock_ctx_init(&lctx_src, &d_src, txn, optxn);
 		/*
@@ -4212,7 +4211,7 @@ enum cds_ft_status ft_rekey_spine_copy(struct cds_ft *dst_ft,
 			 * rather than a bare store followed by standalone freezes.  The
 			 * root edge normalizes to the same FT_FLIP_PROXY_TAG the swap uses.
 			 */
-			ft_flip_txn_record_reserved(src_side_txn,
+			ft_flip_txn_record_root(src_side_txn,
 				(void **) &src_ft->root,
 				(void *) src_ft->root,
 				(void *) ft_node_flag(fresh_root, 0));
@@ -4351,7 +4350,8 @@ enum cds_ft_status ft_rekey_spine_copy(struct cds_ft *dst_ft,
 		 */
 		gd.publish_parent_holder = NULL;
 		gd.publish_parent_snap = 0;
-		ft_flip_txn_record_reserved(txn, (void **) pub_slot,
+		/* @pub_slot is d_dst->nfp: &dst_ft->root at depth 0. */
+		ft_flip_txn_record_publish(txn, dst_ft, pub_slot,
 			D_old, M_slot);
 	}
 
@@ -5592,7 +5592,7 @@ merge_spine_retry:
 			 * (@subtree is the fresh EXCLUSIVE trie, so its root reset
 			 * below stays a plain store.)
 			 */
-			ft_flip_txn_record_reserved(appear_txn,
+			ft_flip_txn_record_root(appear_txn,
 				(void **) &dst_ft->root,
 				(void *) dst_root_fenced, (void *) subtree->root);
 			ft_flip_txn_record_tombstone_locked(appear_txn,

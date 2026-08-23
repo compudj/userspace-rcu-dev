@@ -2154,9 +2154,12 @@ skip_copy:
 							new_node_flag, cn->len);
 
 					if (rec)
-						/* SW compaction: *slot == plan old. */
+						/* SW compaction: *slot == plan old.
+						 * A compressed ROOT's dual slot
+						 * IS &ft->root. */
 						ft_pub_rec_add(rec, skip_slot,
-							*skip_slot, skip_new);
+							*skip_slot, skip_new,
+							skip_slot == &ft->root);
 					else
 						*skip_slot = skip_new;
 				}
@@ -2303,9 +2306,11 @@ skip_copy:
 	 * architecture expose an unwired copy).
 	 */
 	if (mode == FT_RECOMPACT_RELOCATE)
-		/* SW compaction: *slot == plan old. */
+		/* SW compaction: *slot == plan old.  Relocating the ROOT node
+		 * publishes into &ft->root (ft_compact_descend starts its walk
+		 * there), so the holder slot must be asked. */
 		ft_pub_rec_add(rec, old_node_flag_ptr, *old_node_flag_ptr,
-			new_node_flag);
+			new_node_flag, old_node_flag_ptr == &ft->root);
 	else
 		*old_node_flag_ptr = new_node_flag;
 	if (old_node && old_node_ret)

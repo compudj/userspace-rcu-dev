@@ -2116,7 +2116,7 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 			 * rather than a bare store followed by standalone freezes.  The
 			 * root edge normalizes to the same FT_FLIP_PROXY_TAG the swap uses.
 			 */
-			ft_flip_txn_record_reserved(src_side_txn,
+			ft_flip_txn_record_root(src_side_txn,
 				(void **) &src_ft->root,
 				(void *) src_ft->root,
 				(void *) ft_node_flag(fresh_root, 0));
@@ -2266,7 +2266,8 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		 */
 		gd.publish_parent_holder = NULL;
 		gd.publish_parent_snap = 0;
-		ft_flip_txn_record_reserved(txn, (void **) pub_slot,
+		/* @pub_slot is d_dst->nfp: &dst_ft->root at depth 0. */
+		ft_flip_txn_record_publish(txn, dst_ft, pub_slot,
 			D_old, M_slot);
 	}
 
@@ -3568,7 +3569,7 @@ merge_spine_retry:
 			 * (@subtree is the fresh EXCLUSIVE trie, so its root reset
 			 * below stays a plain store.)
 			 */
-			ft_flip_txn_record_reserved(appear_txn,
+			ft_flip_txn_record_root(appear_txn,
 				(void **) &dst_ft->root,
 				(void *) dst_root_fenced, (void *) subtree->root);
 			ft_flip_txn_record_tombstone_locked(appear_txn,

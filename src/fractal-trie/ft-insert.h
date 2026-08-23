@@ -544,7 +544,6 @@ void ft_insert_publish_or_park(struct cds_ft *ft,
 		struct ft_insert_commit *ic)
 {
 	struct ft_pub_rec rec = { .n = 0 };
-	unsigned int k;
 
 	/*
 	 * @expected_old: the plan-snapshot value of *slot (the old subtree this
@@ -589,11 +588,7 @@ void ft_insert_publish_or_park(struct cds_ft *ft,
 			parent_depth, ic->parent_locked_holder,
 			ic->parent_locked_snap);
 	_ft_publish_to_parent(ft, parent_nf, slot, new_top, expected_old, &rec);
-	for (k = 0; k < rec.n; k++)
-		ft_flip_txn_record_reserved(ic->txn,
-			(void **) rec.slot[k],
-			(void *) rec.old_val[k],
-			(void *) rec.new_val[k]);
+	ft_flip_txn_record_pub_rec(ic->txn, &rec);
 	ic->slot = slot;	/* sentinel: one-commit forward recorded */
 	ic->publish_to_parent = true;
 }
@@ -2022,7 +2017,6 @@ int ft_attach_node(struct cds_ft *ft,
 			struct cds_ft_metadata *idest_meta =
 				cds_ft_item_to_metadata(
 					ft_node_ptr(iter_dest_node_flag));
-			unsigned int k;
 
 			/*
 			 * Phase 4.3 atomic re-home: the fresh copy inherited the attach
@@ -2093,11 +2087,7 @@ int ft_attach_node(struct cds_ft *ft,
 			_ft_publish_to_parent(ft, attach_node_flag,
 				attach_node_flag_ptr, iter_dest_node_flag,
 				attach_node_flag, &rec);
-			for (k = 0; k < rec.n; k++)
-				ft_flip_txn_record_reserved(ic->txn,
-					(void **) rec.slot[k],
-					(void *) rec.old_val[k],
-					(void *) rec.new_val[k]);
+			ft_flip_txn_record_pub_rec(ic->txn, &rec);
 			ic->free_old_node = old_recompacted_node;
 			old_recompacted_node = NULL;
 			/*
@@ -2179,7 +2169,6 @@ int ft_attach_node(struct cds_ft *ft,
 			struct cds_ft_metadata *attach_meta =
 				cds_ft_item_to_metadata(
 					ft_node_ptr(attach_node_flag));
-			unsigned int k;
 
 			if (ft_get_parent_slot(attach_meta, ft) !=
 					attach_node_flag_ptr) {
@@ -2214,11 +2203,7 @@ int ft_attach_node(struct cds_ft *ft,
 			_ft_publish_to_parent(ft, attach_node_flag,
 				attach_node_flag_ptr, iter_dest_node_flag,
 				attach_node_flag, &rec);
-			for (k = 0; k < rec.n; k++)
-				ft_flip_txn_record_reserved(ic->txn,
-					(void **) rec.slot[k],
-					(void *) rec.old_val[k],
-					(void *) rec.new_val[k]);
+			ft_flip_txn_record_pub_rec(ic->txn, &rec);
 			/*
 			 * I6 count fold (rank stats ON): the attach node stays in
 			 * place, so its metadata->parent chain up to the root is

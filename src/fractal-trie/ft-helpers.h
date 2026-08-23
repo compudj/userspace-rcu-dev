@@ -2407,10 +2407,17 @@ struct cds_ft_metadata *ft_skip_to_compressed_meta(struct cds_ft *ft,
 static
 void ft_pub_rec_add(struct ft_pub_rec *rec, struct cds_ft_inode_flag **slot,
 		struct cds_ft_inode_flag *expected_old,
-		struct cds_ft_inode_flag *new_val)
+		struct cds_ft_inode_flag *new_val, bool root)
 {
 	assert(rec->n < 3);
 	rec->slot[rec->n] = slot;
+	/*
+	 * @root: a TRIE ROOT slot, which every replay must record MW (see
+	 * struct ft_pub_rec).  A parameter rather than a re-derivation,
+	 * because only the caller holds the trie the slot would be compared
+	 * against -- and a cross-trie op holds two.
+	 */
+	rec->root[rec->n] = root;
 	/*
 	 * @expected_old is the value the slot held in the snapshot the
 	 * publishing PLAN was derived from -- NOT a fresh *slot re-read at
@@ -2595,10 +2602,14 @@ void _ft_publish_to_parent_meta(struct cds_ft *ft,
 						cn->len);
 
 				if (rec)
+					/* A COMPRESSED ROOT's dual slot IS
+					 * &ft->root (ft_txn_parent_slot's root
+					 * arm), so ask rather than assume. */
 					ft_pub_rec_add(rec, skip_slot,
 						ft_skip_compressed_flag(
 							expected_old, cn->len),
-						skip_new);
+						skip_new,
+						skip_slot == &ft->root);
 				else if (*skip_slot != skip_new)
 					rcu_assign_pointer(*skip_slot, skip_new);
 			}
@@ -2633,7 +2644,8 @@ void _ft_publish_to_parent_meta(struct cds_ft *ft,
 		FT_TP(root_publish, (const void *) ft,
 			(const void *) new_child);
 	if (rec)
-		ft_pub_rec_add(rec, parent_slot, expected_old, new_child);
+		ft_pub_rec_add(rec, parent_slot, expected_old, new_child,
+			parent_slot == &ft->root);
 	else if (*parent_slot != new_child)
 		/*
 		 * Direct (rec == NULL) publish.  The only two callers -- the

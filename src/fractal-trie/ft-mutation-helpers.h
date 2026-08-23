@@ -777,6 +777,33 @@ extern unsigned long cds_ft_probe_promote_guarded;
 #endif
 
 /*
+ * A TRIE ROOT LIVES IN NO NODE, so no lock-set can own it and no structural
+ * record may park it SW.  ft_flip_txn_record_root is the mechanism that
+ * enforces this (see it for the argument); these three macros are the
+ * --enable-rcu-debug DETECTOR that no other record helper reaches a root slot
+ * behind the mechanism's back.
+ *
+ * Armed regardless of @structural_sw, so the check has coverage NOW -- before
+ * ft_txn_content_sw_ok arms anything -- rather than only once a wrongly-routed
+ * root has become a silent erasure.  A release build carries no field, no
+ * store and no compare.
+ */
+#if defined(DEBUG_RCU) || defined(CONFIG_RCU_DEBUG)
+# define FT_ROOT_ASSERT_TXN_FIELD	void **dbg_root_slot;
+# define FT_ROOT_ASSERT_INIT(t, ft)					\
+	do {								\
+		(t)->dbg_root_slot = (ft) ?				\
+			(void **) &(ft)->root : NULL;			\
+	} while (0)
+# define FT_ROOT_ASSERT_NOT_ROOT(t, slot)				\
+	urcu_assert_debug((void **) (slot) != (t)->dbg_root_slot)
+#else
+# define FT_ROOT_ASSERT_TXN_FIELD
+# define FT_ROOT_ASSERT_INIT(t, ft)	do { (void) (ft); } while (0)
+# define FT_ROOT_ASSERT_NOT_ROOT(t, slot)	do { } while (0)
+#endif
+
+/*
  * FT bridge to the concurrent MCAS transaction engine (<urcu/rcu-txn.h>).  An
  * op records its frozen edge set {slot, old, new} DIRECTLY into the engine
  * transaction (@mtxn, a `struct urcu_txn *`) during its
@@ -956,51 +983,21 @@ struct ft_flip_txn {
 	 */
 	bool structural_sw;
 	/*
-	 * THE ONE SLOT A STRUCTURAL_SW OP MUST NOT PARK: &ft->root.
+	 * --enable-rcu-debug only: the NAMED trie's root slot, for the
+	 * assertion in ft_flip_txn_record_tag that no generic structural
+	 * record ever aims at it (ft_flip_txn_record_root is the only legal
+	 * way to write a root).  A DETECTOR, not a dispatcher: the kind is
+	 * decided by which helper the site calls, so a release build carries
+	 * neither the field nor the compare.
 	 *
-	 * Every other structural slot such an op writes lives inside a node
-	 * whose state word the op holds, and that hold is what makes an
-	 * unarbitrated park legal.  The root POINTER lives in no node --
-	 * ft_node_recompact says so at its own NULL-parent arm ("no node to
-	 * lock, auto-guarded by the root-slot CAS") -- so what arbitrates it is
-	 * the CAS, and an SW park is not a CAS: it neither arbitrates nor is
-	 * VISIBLE to one, because the engine's kind rule is SW xor MW per slot
-	 * GLOBALLY.  A park here would be a plain store racing every other
-	 * writer of the trie root.
-	 *
-	 * ☠ NOT because the root pointer COULD NOT be locked.  A lock word on
-	 * struct cds_ft itself would span the empty<->non-empty transition
-	 * fine; only putting the word in the root NODE is impossible.  The
-	 * reasons a lock is the wrong instrument here are these, and they are
-	 * design reasons rather than impossibilities:
-	 *
-	 *   - EVERY OTHER WRITER OF THIS SLOT IS ALREADY MW.  insert, remove,
-	 *     graft, graft_swap, merge, detach and the bulk root swaps all CAS
-	 *     it; ft_flip_txn_set_structural_sw has two callers in the whole
-	 *     tree, so the SW ops are the outliers and this exemption is what
-	 *     makes them conform.  Going the other way -- a per-trie lock word
-	 *     -- is a legitimate alternative design, but it is a tree-wide
-	 *     protocol change across all seven of those ops, and it buys
-	 *     uniformity rather than correctness.
-	 *   - A node lock buys a LONG UNFAILABLE WINDOW: reserve the set, build
-	 *     invisibly, park at the end.  The root pointer takes ONE
-	 *     transition per op and its collision window is a POINT, which is
-	 *     what an optimistic CAS is for; a lock would be pessimistic over
-	 *     the whole build of the hottest word in the structure.
-	 *   - A fence's lifetime here is bounded by NODE DEATH ("the acquire
-	 *     refuses a TOMBSTONE, so nobody re-locks that word").  A trie-level
-	 *     word never dies, so a mark leaked on it would have no natural end.
-	 *
-	 * So this one slot opts back out to MW, exactly as the ordered-cell and
-	 * rank-count edges do (ft_flip_txn_record_tag_mw, "the genuinely-
-	 * unlocked slots") -- named as a SLOT rather than as a call site,
-	 * because the ops that write it reach it through shared helpers that
-	 * cannot tell the root republish from any other forward publish.
-	 *
-	 * NULL on every txn that never opted into structural_sw, where the
-	 * dispatch below is MW for everything anyway -- byte-identical.
+	 * ☠ BLIND TO A CROSS-TRIE TXN'S SECOND ROOT.  A dual names one trie
+	 * and writes two roots, and this word can hold only one of them --
+	 * which is precisely why the helper, not this assert, is the
+	 * mechanism.  The dual's two roots are marked at the one helper both
+	 * whole-trie swaps go through (ft_root_list_swap_publish_dual), so
+	 * they are covered by construction rather than by detection.
 	 */
-	void **sw_exempt_slot;
+	FT_ROOT_ASSERT_TXN_FIELD
 	/*
 	 * -DFT_DEBUG_TXN_KIND only (ft-txn-kind-stats.h): where this txn was
 	 * created, and whether the record in flight is the DLM lock TAKE.  The
@@ -1116,8 +1113,7 @@ void ft_txn_attempt_bail(struct urcu_txn *op, bool open)
 
 /* Defined below; the constructors arm through it. */
 static inline
-void ft_flip_txn_set_structural_sw(struct ft_flip_txn *t, bool v,
-		void **sw_exempt_slot);
+void ft_flip_txn_set_structural_sw(struct ft_flip_txn *t, bool v);
 
 /*
  * MAY a CONTENT txn on @ft park its structural edges SW instead of recording
@@ -1139,16 +1135,13 @@ void ft_flip_txn_set_structural_sw(struct ft_flip_txn *t, bool v,
  *
  * @ft NULL is the acquire lane, which never arms.
  *
- * ☠ A CROSS-TRIE TXN NAMES ONE TRIE AND MAY WRITE TWO ROOTS.  @sw_exempt_slot
- * is a single slot, and the graft / graft_swap DUAL txns flip &dst_ft->root and
- * &src_ft->root (resp. &swap_ft->root) in the same commit.  Arming such a txn
- * off its named trie would exempt one root and PARK THE OTHER unarbitrated --
- * a plain store racing every other writer of that word, which is precisely what
- * the exemption exists to prevent.  So this switch must not be turned on for a
- * txn that writes a second trie's root until the exemption can name more than
- * one slot (or the root republish is routed through a record helper that is
- * always MW, which would retire the exemption entirely).  The two dual sites
- * say so at the call.
+ * The answer is SHAPE-INDEPENDENT: a CROSS-TRIE txn names one trie and may
+ * write two roots (the graft / graft_swap duals flip &dst_ft->root together
+ * with &src_ft->root, resp. &swap_ft->root), and arming off the named trie is
+ * sound anyway because roots record MW by construction -- every root edge goes
+ * through ft_flip_txn_record_root, whichever trie it belongs to.  What remains
+ * to argue per arm is only the ordinary one: that the op excludes every peer
+ * writer of the NON-root slots it rewrites.
  */
 static inline
 bool ft_txn_content_sw_ok(const struct cds_ft *ft)
@@ -1160,9 +1153,8 @@ bool ft_txn_content_sw_ok(const struct cds_ft *ft)
 /*
  * A CONTENT flip-txn: the lane that rewrites the STRUCTURE -- forward publishes,
  * re-parents, retires, lock releases.  It takes @ft because arming is decided
- * from the trie (ft_txn_content_sw_ok) and because the &ft->root exemption has
- * no other source; that argument is also what makes the CONTENT / ACQUIRE split
- * compiler-enforced rather than a naming convention.
+ * from the trie (ft_txn_content_sw_ok); that argument is also what makes the
+ * CONTENT / ACQUIRE split compiler-enforced rather than a naming convention.
  *
  * ☠ NOT for a DLM lock-set acquire.  Use ft_flip_txn_acquire_bounded(): the
  * lock take {clean -> LOCK|s} is the arbitration point and must record MW even
@@ -1196,9 +1188,9 @@ struct ft_flip_txn *ft_flip_txn_create_at(FT_TK_SITE_PARAM struct cds_ft *ft)
 	t->pending_del_expected = NULL;
 	t->pending_del_folded = false;
 	t->structural_sw = false;	/* all-MW until a caller opts in under lock_fine */
-	t->sw_exempt_slot = NULL;
+	FT_ROOT_ASSERT_INIT(t, ft);
 	if (ft_txn_content_sw_ok(ft))
-		ft_flip_txn_set_structural_sw(t, true, (void **) &ft->root);
+		ft_flip_txn_set_structural_sw(t, true);
 	FT_TK_TXN_INIT(t, dbg_site);
 	return t;
 }
@@ -1416,9 +1408,9 @@ struct ft_flip_txn *ft_flip_txn_create_on_at(FT_TK_SITE_PARAM
 	t->pending_del_expected = NULL;
 	t->pending_del_folded = false;
 	t->structural_sw = false;
-	t->sw_exempt_slot = NULL;
+	FT_ROOT_ASSERT_INIT(t, ft);
 	if (ft_txn_content_sw_ok(ft))
-		ft_flip_txn_set_structural_sw(t, true, (void **) &ft->root);
+		ft_flip_txn_set_structural_sw(t, true);
 	FT_TK_TXN_INIT(t, dbg_site);
 	return t;
 }
@@ -1469,9 +1461,9 @@ struct ft_flip_txn *ft_flip_txn_create_bounded_on_at(FT_TK_SITE_PARAM
 	t->pending_del_expected = NULL;
 	t->pending_del_folded = false;
 	t->structural_sw = false;	/* all-MW until a caller opts in under lock_fine */
-	t->sw_exempt_slot = NULL;
+	FT_ROOT_ASSERT_INIT(t, ft);
 	if (ft_txn_content_sw_ok(ft))
-		ft_flip_txn_set_structural_sw(t, true, (void **) &ft->root);
+		ft_flip_txn_set_structural_sw(t, true);
 	FT_TK_TXN_INIT(t, dbg_site);
 	return t;
 }
@@ -2672,7 +2664,8 @@ void ft_flip_txn_record_tag(struct ft_flip_txn *t, void **slot,
 	 * locked park, installed after the MW edges, that cannot fail.  Otherwise
 	 * (every other op, non-lock_fine) it is MW == the all-MW behaviour.
 	 */
-	if (t->structural_sw && slot != t->sw_exempt_slot) {
+	FT_ROOT_ASSERT_NOT_ROOT(t, slot);
+	if (t->structural_sw) {
 		FT_TK_COUNT_REC(t, FT_TK_SW);
 		ret = urcu_txn_store_sw(t->mtxn, slot, old_ptr, new_ptr, tag);
 	} else {
@@ -2713,6 +2706,52 @@ void ft_flip_txn_record_tag_mw(struct ft_flip_txn *t, void **slot,
 }
 
 /*
+ * Record a TRIE ROOT edge.  ALWAYS MW, whatever @t's structural_sw mode and
+ * whichever trie the slot belongs to.
+ *
+ * A ROOT LIVES IN NO NODE.  Every other structural slot a structural_sw op
+ * writes sits inside a node whose state word the op holds, and that hold is
+ * what makes an unarbitrated park legal.  The root POINTER has no such node --
+ * ft_node_recompact says so at its own NULL-parent arm ("no node to lock,
+ * auto-guarded by the root-slot CAS") -- so what arbitrates it is the CAS, and
+ * an SW park is not a CAS: it neither arbitrates nor is VISIBLE to one,
+ * because the engine's kind rule is SW xor MW per slot GLOBALLY.  A park here
+ * would be a plain store racing every other writer of the trie root.
+ *
+ * ☠ NOT because the root pointer COULD NOT be locked.  A lock word on struct
+ * cds_ft itself would span the empty<->non-empty transition fine; only putting
+ * the word in the root NODE is impossible.  The reasons a lock is the wrong
+ * instrument are design reasons rather than impossibilities:
+ *
+ *   - EVERY OTHER WRITER OF THIS SLOT IS ALREADY MW.  insert, remove, graft,
+ *     graft_swap, merge, detach and the bulk root swaps all CAS it, so an SW
+ *     op is the outlier and this helper is what makes it conform.  A per-trie
+ *     lock word is a legitimate alternative, but it is a tree-wide protocol
+ *     change across all seven ops, and it buys uniformity, not correctness.
+ *   - A node lock buys a LONG UNFAILABLE WINDOW: reserve the set, build
+ *     invisibly, park at the end.  The root pointer takes ONE transition per
+ *     op and its collision window is a POINT, which is what an optimistic CAS
+ *     is for; a lock would be pessimistic over the whole build of the hottest
+ *     word in the structure.
+ *   - A fence's lifetime here is bounded by NODE DEATH ("the acquire refuses a
+ *     TOMBSTONE, so nobody re-locks that word").  A trie-level word never
+ *     dies, so a mark leaked on it would have no natural end.
+ *
+ * The rule is a property of the SLOT, not of the txn's named trie, which is
+ * what lets a CROSS-TRIE dual -- one txn, two roots (ft_graft / graft_swap) --
+ * record both of them MW while its own trie's content parks SW.  Counted
+ * MW_ALWAYS: a root can never convert, so it is not part of the MW_STRUCT
+ * conversion surface.
+ */
+static inline
+void ft_flip_txn_record_root(struct ft_flip_txn *t, void **slot,
+		void *old_ptr, void *new_ptr)
+{
+	ft_flip_txn_record_tag_mw(t, slot, old_ptr, new_ptr,
+		FT_FLIP_PROXY_TAG);
+}
+
+/*
  * MIXED sw/mw: opt @t's structural edges into SW-kind parks.  A caller holding
  * the DLM node locks over the slots it structurally rewrites calls this right
  * after creating its commit txn, so the forward publish, the re-parents, the
@@ -2721,19 +2760,11 @@ void ft_flip_txn_record_tag_mw(struct ft_flip_txn *t, void **slot,
  * BEFORE the first structural record.
  */
 static inline
-void ft_flip_txn_set_structural_sw(struct ft_flip_txn *t, bool v,
-		void **sw_exempt_slot)
+void ft_flip_txn_set_structural_sw(struct ft_flip_txn *t, bool v)
 {
 	t->structural_sw = v;
 	if (v)
 		FT_TK_COUNT_ARMED(t);
-	/*
-	 * Taken WITH the mode, not as a separate opt-in: the exemption exists
-	 * only because the mode does, and a caller that set one without the
-	 * other would park the root pointer unarbitrated -- silently, since
-	 * nothing downstream can tell an exempt slot it was never told about.
-	 */
-	t->sw_exempt_slot = v ? sw_exempt_slot : NULL;
 }
 
 static inline
@@ -2741,6 +2772,58 @@ void ft_flip_txn_record_reserved(struct ft_flip_txn *t, void **slot,
 		void *old_ptr, void *new_ptr)
 {
 	ft_flip_txn_record_tag(t, slot, old_ptr, new_ptr, FT_FLIP_PROXY_TAG);
+}
+
+/*
+ * Record a FORWARD PUBLISH whose slot a DESCENT resolved, so its shape is not
+ * known statically: it is @ft's root exactly when the descent stood at depth 0
+ * (ft_descent_init seeds d->nfp = &ft->root) and an in-node child slot at every
+ * other depth.  Dispatches to the always-MW root record for the first case.
+ *
+ * @ft is the trie whose root the slot could be -- the one the descent ran in --
+ * which is what keeps this correct for a CROSS-TRIE op: the caller names the
+ * side it descended, not the txn's named trie.
+ */
+static inline
+void ft_flip_txn_record_publish(struct ft_flip_txn *t, struct cds_ft *ft,
+		struct cds_ft_inode_flag **slot,
+		void *old_ptr, void *new_ptr)
+{
+	if (slot == &ft->root)
+		ft_flip_txn_record_root(t, (void **) slot, old_ptr, new_ptr);
+	else
+		ft_flip_txn_record_reserved(t, (void **) slot, old_ptr,
+			new_ptr);
+}
+
+/*
+ * Replay a recorded publish (@rec, from _ft_publish_to_parent) into @t, each
+ * edge with the KIND its slot demands: a TRIE ROOT records MW whatever the
+ * txn's mode (ft_flip_txn_record_root), every in-node slot takes the ordinary
+ * structural_sw dispatch.
+ *
+ * The rule lives here once, for the callers that record a rec STRAIGHT into a
+ * txn.  The callers that first convert a rec into ft_ord_cell_edges
+ * (ft_remove_commit_rec, ft_pub_rec_sedges, ft_ord_cell_flip_rec_replace) carry
+ * the same per-edge flag across the conversion and dispatch it in
+ * ft_ord_cell_flip_into / ft_ord_cell_record_into_ft.
+ */
+static inline
+void ft_flip_txn_record_pub_rec(struct ft_flip_txn *t,
+		const struct ft_pub_rec *rec)
+{
+	unsigned int i;
+
+	for (i = 0; i < rec->n; i++) {
+		if (rec->root[i])
+			ft_flip_txn_record_root(t, (void **) rec->slot[i],
+				(void *) rec->old_val[i],
+				(void *) rec->new_val[i]);
+		else
+			ft_flip_txn_record_reserved(t, (void **) rec->slot[i],
+				(void *) rec->old_val[i],
+				(void *) rec->new_val[i]);
+	}
 }
 
 /*
@@ -3365,6 +3448,15 @@ struct ft_ord_cell_edge {
 	 * designated-initializer / zero-initialized edge defaults to structural.
 	 */
 	uintptr_t tag;
+	/*
+	 * This edge's slot is a TRIE ROOT (&ft->root), so it records MW
+	 * whatever the txn's structural_sw mode -- see ft_flip_txn_record_root.
+	 * Set by the two whole-trie swap helpers (which know the shape
+	 * statically) and carried in from ft_pub_rec, whose forward edge is a
+	 * root exactly when the publishing descent had a NULL parent.  A
+	 * zero-initialized edge is an ordinary in-node slot.
+	 */
+	bool root;
 };
 
 /* Resolve an edge's engine proxy tag: unset (0) => the structural 0xF tag. */
@@ -3692,9 +3784,16 @@ void ft_root_list_swap_publish(struct cds_ft *ft, struct ft_flip_txn *txn,
 	struct ft_ord_cell_edge edges[FT_ROOT_LIST_SWAP_MAX_EDGES] = { 0 };
 	unsigned int n = 0;
 
+	/*
+	 * Every Class-G root swap passes its own trie's root slot, which is
+	 * what makes the edge below a root edge unconditionally -- asserted
+	 * rather than assumed, since the flag is what keeps it MW.
+	 */
+	assert(struct_slot == &ft->root);
 	edges[n].slot = (struct ft_ord_cell **) struct_slot;
 	edges[n].old_target = (struct ft_ord_cell *) struct_old;
 	edges[n].new_target = (struct ft_ord_cell *) struct_new;
+	edges[n].root = true;		/* a root records MW: no node owns it */
 	n++;
 	n = ft_ord_sentinel_edges(ft, head_old, head_new, tail_old, tail_new,
 			relink_dest, relink_incoming, edges, n);
@@ -4814,9 +4913,17 @@ void ft_root_list_swap_publish_dual(struct ft_flip_txn *txn,
 		if (r->new_root && !ft_node_flip_proxy(r->new_root))
 			cds_ft_item_to_metadata(ft_node_ptr(r->new_root))
 				->parent_word = ft_trie_parent(r->ft);
+		assert(r->slot == &r->ft->root);
 		edges[n].slot = (struct ft_ord_cell **) r->slot;
 		edges[n].old_target = (struct ft_ord_cell *) r->old_root;
 		edges[n].new_target = (struct ft_ord_cell *) r->new_root;
+		/*
+		 * BOTH sides' roots, though @txn names only ONE trie: the rule
+		 * is a property of the slot, not of the named trie, so a dual
+		 * arming off its own trie still records the foreign root MW.
+		 * This is what makes the arming decision shape-independent.
+		 */
+		edges[n].root = true;
 		n++;
 		if (!r->ft->group->ordered_list_set)
 			continue;
@@ -5115,11 +5222,17 @@ enum urcu_txn_status ft_ord_cell_flip_into(struct cds_ft *ft,
 {
 	unsigned int i;
 
-	for (i = 0; i < n; i++)
-		ft_flip_txn_record_tag(t, (void **) edges[i].slot,
-			(void *) edges[i].old_target,
-			(void *) edges[i].new_target,
-			ft_edge_tag(&edges[i]));
+	for (i = 0; i < n; i++) {
+		if (edges[i].root)
+			ft_flip_txn_record_root(t, (void **) edges[i].slot,
+				(void *) edges[i].old_target,
+				(void *) edges[i].new_target);
+		else
+			ft_flip_txn_record_tag(t, (void **) edges[i].slot,
+				(void *) edges[i].old_target,
+				(void *) edges[i].new_target,
+				ft_edge_tag(&edges[i]));
+	}
 	return ft_flip_txn_commit(ft, t);
 }
 
@@ -5211,9 +5324,22 @@ void ft_ord_cell_record_into_ft(struct cds_ft *ft, struct ft_flip_txn *t,
 				ft_flip_txn_guard_installed_child(ft, t,
 					(struct cds_ft_inode_flag *)
 						edges[i].new_target);
-			ft_flip_txn_record_tag(t, (void **) edges[i].slot,
-				(void *) edges[i].old_target,
-				(void *) edges[i].new_target, tag);
+			/*
+			 * A root edge takes the SAME §4.B guard -- what the
+			 * guard covers is the VALUE (a node a peer may have
+			 * retired), which a root publish installs like any
+			 * other.  Only the record KIND differs.
+			 */
+			if (edges[i].root)
+				ft_flip_txn_record_root(t,
+					(void **) edges[i].slot,
+					(void *) edges[i].old_target,
+					(void *) edges[i].new_target);
+			else
+				ft_flip_txn_record_tag(t,
+					(void **) edges[i].slot,
+					(void *) edges[i].old_target,
+					(void *) edges[i].new_target, tag);
 		} else
 			ft_flip_txn_record_tag_mw(t, (void **) edges[i].slot,
 				(void *) edges[i].old_target,
@@ -5697,6 +5823,8 @@ unsigned int ft_pub_rec_sedges(struct ft_pub_rec *rec,
 		sedges[i].slot = (struct ft_ord_cell **) rec->slot[i];
 		sedges[i].old_target = (struct ft_ord_cell *) rec->old_val[i];
 		sedges[i].new_target = (struct ft_ord_cell *) rec->new_val[i];
+		sedges[i].root = rec->root[i];
+		sedges[i].root = rec->root[i];
 	}
 	return rec->n;
 }
@@ -5923,9 +6051,11 @@ void ft_pub_rec_add_back_edge(struct cds_ft *ft, struct ft_pub_rec *rec,
 	 * sibling ft_reparent_record_meta's raw meta->parent".  That sibling
 	 * stopped reading raw; the justification outlived the mechanism.
 	 */
+	/* A BACK edge (&cell->parent / &node->prev): inside the child, never a
+	 * trie root -- a root has no back-edge to record. */
 	ft_pub_rec_add(rec, field,
 		urcu_txn_load(txn->mtxn, (void **) field, FT_FLIP_PROXY_TAG),
-		new_parent);
+		new_parent, /*root=*/ false);
 }
 
 /*
@@ -5964,6 +6094,7 @@ enum urcu_txn_status ft_remove_commit_rec(struct cds_ft *ft,
 		edges[n].slot = (struct ft_ord_cell **) rec->slot[i];
 		edges[n].old_target = (struct ft_ord_cell *) rec->old_val[i];
 		edges[n].new_target = (struct ft_ord_cell *) rec->new_val[i];
+		edges[n].root = rec->root[i];
 		n++;
 	}
 	if (run)
@@ -6672,6 +6803,7 @@ enum urcu_txn_status ft_ord_cell_flip_rec_replace(struct cds_ft *ft,
 		edges[n].slot = (struct ft_ord_cell **) rec->slot[i];
 		edges[n].old_target = (struct ft_ord_cell *) rec->old_val[i];
 		edges[n].new_target = (struct ft_ord_cell *) rec->new_val[i];
+		edges[n].root = rec->root[i];
 		n++;
 	}
 	n = ft_ord_cell_run_replace_edges(ft, run->d_first, run->d_last,
@@ -9538,7 +9670,6 @@ enum urcu_txn_status ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue 
 		const struct ft_ord_cell_edge *cedges, unsigned int n_cedges)
 {
 	struct ft_pub_rec rec = { .n = 0, .mtxn = g->txn ? g->txn->mtxn : NULL };
-	unsigned int j;
 	int i;
 	enum urcu_txn_status cst;
 
@@ -9739,9 +9870,7 @@ enum urcu_txn_status ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue 
 		goto publish_done;
 	_ft_publish_to_parent(ft, g->publish_parent, g->publish_slot, g->top,
 		ft_glue_publish_expected_old(g), &rec);
-	for (j = 0; j < rec.n; j++)
-		ft_flip_txn_record_reserved(g->txn, (void **) rec.slot[j],
-			rec.old_val[j], rec.new_val[j]);
+	ft_flip_txn_record_pub_rec(g->txn, &rec);
 publish_done:
 	/*
 	 * MW LOCK_FINE drop (split-compressed graft): retire the compressed

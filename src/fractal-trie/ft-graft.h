@@ -801,7 +801,6 @@ enum urcu_txn_status ft_store_at_graft_point_commit(struct cds_ft *ft,
 		ft_set_parent(ft, st->attached, st->dest, slot);
 		ft_glue_apply_deferred(ft, st->glue);
 		if (st->old_recompacted_node) {
-			unsigned int k;
 			/*
 			 * MW LOCK_FINE drop (§11, cross-trie): the publish slot must
 			 * come from st->dest's OWN (parent, offset) -- the COHERENT pair
@@ -876,11 +875,8 @@ enum urcu_txn_status ft_store_at_graft_point_commit(struct cds_ft *ft,
 				pub_slot, st->dest,
 				ft_resolve_flip_proxy(*pub_slot),
 				&st->reserve_rec);
-			for (k = 0; k < st->reserve_rec.n; k++)
-				ft_flip_txn_record_reserved(st->glue->txn,
-					(void **) st->reserve_rec.slot[k],
-					(void *) st->reserve_rec.old_val[k],
-					(void *) st->reserve_rec.new_val[k]);
+			ft_flip_txn_record_pub_rec(st->glue->txn,
+				&st->reserve_rec);
 			/*
 			 * Order-statistics fold (BULK): the reserve relocated the
 			 * attach parent to the fresh @st->dest, recompacted with
@@ -1359,12 +1355,13 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 
 		if (!dual_txn) {
 			/*
-			 * ☠ NAMED FOR @dst_ft, WRITES BOTH ROOTS.  The dual
-			 * flips &dst_ft->root AND &src_ft->root in one commit,
-			 * so the trie named here cannot stand for "the trie
-			 * whose root this txn may not park" -- see
-			 * ft_txn_content_sw_ok, which must refuse to arm this
-			 * shape while the exemption names a single slot.
+			 * NAMED FOR @dst_ft, WRITES BOTH ROOTS: the dual flips
+			 * &dst_ft->root AND &src_ft->root in one commit.  The
+			 * trie named here decides only ARMING
+			 * (ft_txn_content_sw_ok); both roots record MW by
+			 * construction (ft_root_list_swap_publish_dual marks
+			 * them), so the named trie need not stand for the
+			 * foreign one.
 			 */
 			dual_txn = ft_flip_txn_create_bounded(dst_ft,
 				FT_ROOT_LIST_SWAP_DUAL_MAX_EDGES + 1);
@@ -2218,7 +2215,7 @@ retry_attach:
 				 * re-descends with src still full (clean, like a pre-swap
 				 * failure).
 				 */
-				ft_flip_txn_record_reserved(glue.txn,
+				ft_flip_txn_record_root(glue.txn,
 					(void **) &src_ft->root,
 					(void *) old_src_root,
 					(void *) ft_node_flag(fresh_node, 0));
@@ -2260,7 +2257,7 @@ retry_attach:
 				 * pre-reserved txn (readers resolve the transient root proxy
 				 * exactly as on the list-on path).
 				 */
-				ft_flip_txn_record_reserved(src_retire_txn,
+				ft_flip_txn_record_root(src_retire_txn,
 					(void **) &src_ft->root,
 					(void *) old_src_root,
 					(void *) ft_node_flag(fresh_node, 0));
@@ -2850,9 +2847,9 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		 * off (never a lone store).
 		 */
 		/*
-		 * ☠ NAMED FOR @dst_ft, WRITES BOTH ROOTS -- here &dst_ft->root
-		 * and &swap_ft->root.  Same caveat as the graft dual above; see
-		 * ft_txn_content_sw_ok.
+		 * NAMED FOR @dst_ft, WRITES BOTH ROOTS -- here &dst_ft->root and
+		 * &swap_ft->root.  Both record MW by construction, exactly as in
+		 * the graft dual above.
 		 */
 		dual_txn = ft_flip_txn_create_bounded(dst_ft,
 			FT_ROOT_LIST_SWAP_DUAL_MAX_EDGES);
@@ -4002,6 +3999,8 @@ retry_swap:
 				edges[n].old_target =
 					(struct ft_ord_cell *) swap_ft->root;
 				edges[n].new_target = (struct ft_ord_cell *) top_B;
+				/* A root records MW: no node owns it. */
+				edges[n].root = true;
 				n++;
 			} else {
 				/*
