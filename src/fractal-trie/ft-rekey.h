@@ -2280,18 +2280,26 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		graft_c = d_dst.pnf;
 		graft_p = d_dst.ppnf;
 		/*
-		 * A SHORT landing is a CAPABILITY gap, not an argument error: the
-		 * descent stopped above @dst_len on an empty slot, so the attach
-		 * owes the intermediate path down to the key -- something a wider
-		 * cut closes.  Reporting -EINVAL would make it TERMINAL and answer
-		 * a perfectly legal move with 'the caller passed nonsense'.
+		 * A SHORT landing is IN SCOPE: the descent stopped above @dst_len
+		 * on an empty slot, and ft_store_at_graft_point_prepare's other
+		 * arm already builds the intermediate path down to the key and
+		 * reserves the slot for it -- with the same recompaction, the same
+		 * parent hint and the same fold guard as the exact arm.  The two
+		 * differ only in WHAT goes in the slot: the payload itself, or a
+		 * fresh branch carrying it.  Neither changes which nodes this move
+		 * locks, so @graft_c / @graft_p keep their meaning.
+		 *
+		 * @d_dst.nf still refuses, and it means two different things at the
+		 * two depths.  AT @dst_len the point is OCCUPIED -- an argument
+		 * error, terminal.  ABOVE it the slot holds an EXTERNAL leaf, a key
+		 * ending on the path, which the attach would DISPLACE into the
+		 * fresh branch's metadata; that is a legal move this cut does not
+		 * express (the displaced shape carries a second publish the fold
+		 * has no owner for), so it owes UNCOVERED, not -EINVAL.
 		 */
-		if (d_dst.depth != dst_len) {
-			ret = FT_REKEY_UNCOVERED;
-			goto bail_build;
-		}
 		if (d_dst.nf) {
-			ret = -EINVAL;		/* occupied NOSPLIT point */
+			ret = d_dst.depth == dst_len ?
+				-EINVAL : FT_REKEY_UNCOVERED;
 			goto bail_build;
 		}
 	}
