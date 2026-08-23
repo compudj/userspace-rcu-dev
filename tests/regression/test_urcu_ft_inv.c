@@ -67,7 +67,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS_REKEY_DLM	21	/* inv_rekey_graft_{disjoint,cross_junction,run_junction,glue_dst,coherent_readers,shared}, inv_rekey_linearizability, inv_rekey_public_{atomic_no_gap,atomic_no_gap_varlen,atomic_no_gap_compressed_top}, inv_rekey_coarse_progress, inv_rekey_{coarse,fine,contended}_mixed_writers, inv_rekey_merge_{occupied,compressed,shared}_dst, inv_rekey_merge_compressed_dst_rootchurn */
+#define NR_TESTS_REKEY_DLM	22	/* inv_rekey_graft_{disjoint,cross_junction,run_junction,elevating_junction,glue_dst,coherent_readers,shared}, inv_rekey_linearizability, inv_rekey_public_{atomic_no_gap,atomic_no_gap_varlen,atomic_no_gap_compressed_top}, inv_rekey_coarse_progress, inv_rekey_{coarse,fine,contended}_mixed_writers, inv_rekey_merge_{occupied,compressed,shared}_dst, inv_rekey_merge_compressed_dst_rootchurn */
 
 /*
  * Base count = the RUN_TEST invocations in main() outside the DLM #ifdef.
@@ -2754,6 +2754,283 @@ static int inv_rekey_graft_run_junction(void)
 	}
 	fprintf(stderr, "# inv_rekey_graft_run_junction: %d writers, %lu moves, "
 		"%lu retries, %lu live keys\n", RKR_NW, total_ops, total_retries,
+		live);
+
+	free(w);
+	if (drain_and_destroy(ft, group) < 0)
+		ret = -1;
+	if (leak_check() < 0)
+		ret = -1;
+	return ret;
+}
+
+/*
+ * THE ELEVATING-DETACH REKEY ORACLE -- the move whose SOURCE JUNCTION EMPTIES.
+ *
+ * When the moved subtree's parent is a path-compressed run, taking the subtree
+ * away leaves that run with nothing, so the detach's upward walk ELEVATES past
+ * it and hands back an orphan chain the fold must reclaim on the far side of
+ * the one commit.  The run-junction oracle cannot reach that arm: there the
+ * destination diverges inside the SAME run, so the split drops its old
+ * direction and the detach is skipped entirely.
+ *
+ * It could not be reached from a SYMMETRIC fixture at all until the short
+ * landing was in scope, and the reason is the shape's own doing: an elevating
+ * move DELETES its source junction, so the return leg's destination is a slot
+ * that no longer exists and the descent stops ABOVE the key.  That is why this
+ * oracle and that widening arrive together -- leg 1 exercises the elevation,
+ * leg 2 exercises the short landing it creates.
+ *
+ * GEOMETRY, per writer, on its own root byte R -- TWO junction nodes, and
+ * they must be two:
+ *
+ *      R --A--> J_a{ P --> run(X) --> S_top --> leaves,  Q1, Q2 }
+ *      R --B--> J_b{ Q1, Q2 }
+ *
+ * The move alternates the subtree between J_a's slot P and J_b's.  Each leg:
+ *
+ *   - the src descent crosses run(X) WHOLE, so the branch parent IS that run;
+ *   - dropping the subtree EMPTIES that run, so the detach's climb elevates
+ *     one level and recompacts the junction node -- the elevating arm;
+ *   - the junction keeps Q1 and Q2, which is what STOPS the climb there;
+ *   - the destination junction has no P, so the descent lands one byte ABOVE
+ *     the key -- the SHORT landing, which the elevation on the other side is
+ *     what creates.
+ *
+ * ★ WHY TWO JUNCTIONS AND NOT ONE.  With both positions under a single node,
+ * that node is BOTH the graft's attach node and the src branch parent's
+ * parent -- the `d_src.ppnf == graft_c` alias, which is refused permanently
+ * because the detach would edit the copy the graft retires.  Splitting them
+ * across J_a and J_b is what keeps the two junctions disjoint, and it is the
+ * only reason the fixture has a second one.
+ *
+ * ORACLE: at rest every leaf is readable at its writer's current junction and
+ * absent at the other, BOTH filler keys survive every elevation and collapse,
+ * the key count is exact, and cds_ft_verify passes.  Zero moves would mean a
+ * livelock; a refused shape surfaces as rc != 0, the debug entry point calling
+ * the atomic writer directly.
+ */
+#define RKE_NW		8	/* elevating rekey writers, one root byte each */
+#define RKE_NSUB	4	/* S_top's leaves, moving with it */
+#define RKE_A		1	/* the two junction bytes under R */
+#define RKE_B		2
+#define RKE_P		3	/* the junction slot the subtree occupies */
+#define RKE_Q1		4	/* two fillers per junction: they stop the climb */
+#define RKE_Q2		5
+#define RKE_X		6	/* the run byte the subtree hangs under */
+
+struct rke_writer_arg {
+	struct cds_ft *ft;
+	uint8_t root;
+	struct ft_test_node *top[RKE_NSUB];
+	struct ft_test_node *fill[4];	/* Q1/Q2 under each junction */
+	int at_b;			/* 0: subtree under J_a; 1: under J_b */
+	unsigned long ops, retries;
+	int failed;
+};
+
+static void *rke_writer(void *arg)
+{
+	struct rke_writer_arg *w = (struct rke_writer_arg *) arg;
+	unsigned long iters = 0;
+
+	rcu_register_thread();
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	while (!test_stop) {
+		uint8_t cur = w->at_b ? RKE_B : RKE_A;
+		uint8_t oth = w->at_b ? RKE_A : RKE_B;
+		uint8_t src_key[4] = { w->root, cur, RKE_P, RKE_X };
+		uint8_t dst_key[4] = { w->root, oth, RKE_P, RKE_X };
+		int rc;
+
+		/* No read lock: the move enters the gate, which waits a GP. */
+		rc = _cds_ft_debug_rekey_graft_simple(w->ft, src_key, 4,
+				dst_key, 4);
+		if (rc == 0) {
+			w->at_b = !w->at_b;
+			w->ops++;
+		} else if (rc == -EAGAIN || rc == -EIO || rc == -ENOMEM) {
+			w->retries++;	/* transient: trie pristine, re-descend */
+		} else {
+			fprintf(stderr, "rke_writer root=%u: move from %02x "
+				"failed rc=%d\n", w->root, cur, rc);
+			w->failed = 1;
+			mw_violation_snapshot();
+			break;
+		}
+		if ((++iters & 0xff) == 0)
+			rcu_quiescent_state();
+	}
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static int inv_rekey_graft_elevating_junction(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	struct rke_writer_arg *w;
+	pthread_t writers[RKE_NW];
+	struct ft_test_node *guard_lo, *guard_hi;
+	struct timespec t0;
+	unsigned long total_ops = 0, total_retries = 0, live = 0;
+	int i, c, ret = 0;
+
+	if (!getenv("FT_INV_MW")) {
+		fprintf(stderr, "# inv_rekey_graft_elevating_junction: skipped "
+			"(set FT_INV_MW=1 to run the coherent-rekey writer oracle)\n");
+		return 0;
+	}
+	mw_install_fatal_handler();
+	leak_reset();
+
+	ft = create_fixed_fine_lock_ft(5, &group);	/* list ON (default) */
+	cds_ft_make_concurrent(ft);
+
+	guard_lo = node_alloc(RKX_KEY(0x00, 0, 0, 0, 0));
+	guard_hi = node_alloc(RKX_KEY(0xff, 0, 0, 0, 0));
+	rcu_read_lock();
+	if (insert_u64(ft, RKX_KEY(0x00, 0, 0, 0, 0), guard_lo) != CDS_FT_STATUS_OK ||
+			insert_u64(ft, RKX_KEY(0xff, 0, 0, 0, 0), guard_hi) !=
+			CDS_FT_STATUS_OK)
+		abort();
+	rcu_read_unlock();
+	live = 2;
+
+	w = (struct rke_writer_arg *) calloc(RKE_NW, sizeof(*w));
+	if (!w)
+		abort();
+	for (i = 0; i < RKE_NW; i++) {
+		static const uint8_t junc[2] = { RKE_A, RKE_B };
+		static const uint8_t qb[2] = { RKE_Q1, RKE_Q2 };
+		int j, q;
+
+		w[i].ft = ft;
+		w[i].root = (uint8_t) (i + 1);
+		rcu_read_lock();
+		/*
+		 * TWO fillers under each junction, so it is a plain node that
+		 * KEEPS at least two children when the subtree leaves -- which is
+		 * what stops the elevating climb there instead of letting it walk
+		 * on and delete the junction the graft just attached under.
+		 */
+		for (j = 0; j < 2; j++) {
+			for (q = 0; q < 2; q++) {
+				uint64_t fk = RKX_KEY(w[i].root, junc[j],
+						qb[q], 0, 0);
+
+				w[i].fill[2 * j + q] = node_alloc(fk);
+				if (insert_u64(ft, fk, w[i].fill[2 * j + q]) !=
+						CDS_FT_STATUS_OK)
+					abort();
+			}
+		}
+		/*
+		 * ONE byte under J_a's slot P, so that edge is single-child and
+		 * the subtree's parent is a RUN -- the junction that empties.
+		 */
+		for (c = 0; c < RKE_NSUB; c++) {
+			uint64_t tk = RKX_KEY(w[i].root, RKE_A, RKE_P, RKE_X,
+					(uint8_t) (c + 1));
+
+			w[i].top[c] = node_alloc(tk);
+			if (insert_u64(ft, tk, w[i].top[c]) != CDS_FT_STATUS_OK)
+				abort();
+		}
+		rcu_read_unlock();
+		live += 4 + RKE_NSUB;
+	}
+
+	test_go = 0;
+	test_stop = 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < RKE_NW; i++)
+		pthread_create(&writers[i], NULL, rke_writer, &w[i]);
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	test_go = 1;
+
+	rcu_thread_offline();
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
+		usleep(1000);
+	test_stop = 1;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < RKE_NW; i++)
+		pthread_join(writers[i], NULL);
+	rcu_thread_online();
+
+	synchronize_rcu();
+	rcu_read_lock();
+	for (i = 0; i < RKE_NW; i++) {
+		uint8_t here = w[i].at_b ? RKE_B : RKE_A;
+		uint8_t there = w[i].at_b ? RKE_A : RKE_B;
+		struct cds_ft_node *found = NULL;
+
+		total_ops += w[i].ops;
+		total_retries += w[i].retries;
+		if (w[i].failed)
+			ret = -1;
+		/*
+		 * The fillers are the point as much as the leaves: an elevation
+		 * that climbed one level too far takes THESE out.
+		 */
+		{
+			static const uint8_t junc[2] = { RKE_A, RKE_B };
+			static const uint8_t qb[2] = { RKE_Q1, RKE_Q2 };
+			int j, q;
+
+			for (j = 0; j < 2; j++)
+				for (q = 0; q < 2; q++)
+					if (lookup_u64(ft, RKX_KEY(w[i].root,
+							junc[j], qb[q], 0, 0),
+							&found) !=
+							CDS_FT_STATUS_OK ||
+							found != &w[i].fill[2 * j + q]->node) {
+						fprintf(stderr, "rekey elevating: "
+							"writer %d filler %d/%d lost\n",
+							i, j, q);
+						ret = -1;
+					}
+		}
+		for (c = 0; c < RKE_NSUB; c++) {
+			if (lookup_u64(ft, RKX_KEY(w[i].root, here, RKE_P, RKE_X,
+					(uint8_t) (c + 1)), &found) !=
+					CDS_FT_STATUS_OK ||
+					found != &w[i].top[c]->node) {
+				fprintf(stderr, "rekey elevating: writer %d leaf %d "
+					"absent at final pos (at_b=%d)\n", i, c,
+					w[i].at_b);
+				ret = -1;
+			}
+			if (lookup_u64(ft, RKX_KEY(w[i].root, there, RKE_P,
+					RKE_X, (uint8_t) (c + 1)), &found) ==
+					CDS_FT_STATUS_OK) {
+				fprintf(stderr, "rekey elevating: writer %d leaf %d "
+					"still at old pos\n", i, c);
+				ret = -1;
+			}
+		}
+	}
+	if (cds_ft_count_keys(ft) != live) {
+		fprintf(stderr, "rekey elevating: count_keys %lu != live %lu\n",
+			cds_ft_count_keys(ft), live);
+		ret = -1;
+	}
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "rekey elevating: cds_ft_verify failed\n");
+		ret = -1;
+	}
+	rcu_read_unlock();
+
+	if (total_ops == 0) {
+		fprintf(stderr, "rekey elevating: no successful moves (livelock?)\n");
+		ret = -1;
+	}
+	fprintf(stderr, "# inv_rekey_graft_elevating_junction: %d writers, %lu moves, "
+		"%lu retries, %lu live keys\n", RKE_NW, total_ops, total_retries,
 		live);
 
 	free(w);
@@ -19569,6 +19846,7 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_rekey_coarse_contended_writers);
 	RUN_TEST(inv_rekey_graft_cross_junction);
 	RUN_TEST(inv_rekey_graft_run_junction);
+	RUN_TEST(inv_rekey_graft_elevating_junction);
 	RUN_TEST(inv_rekey_graft_glue_dst);
 	RUN_TEST(inv_rekey_graft_coherent_readers);
 	RUN_TEST(inv_rekey_graft_shared);
