@@ -1630,6 +1630,18 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 				 */
 				if (optxn->retry < FT_REKEY_UNCOVERED_AFTER)
 					return -EAGAIN;
+				/*
+				 * Aged out, so the reading is STRUCTURAL: the
+				 * destination really is occupied.  For a GRAFT that
+				 * is the CALLER'S ANSWER -- the same -EEXIST the
+				 * decoded @merge_dst probe gives a few lines above --
+				 * and no wider cut changes it, so reporting UNCOVERED
+				 * would send a settled refusal to a fallback.  Only a
+				 * MERGE, which would UNION into that occupant, is the
+				 * shape this writer leaves uncovered here.
+				 */
+				if (require_empty)
+					return -EEXIST;
 				return FT_REKEY_UNCOVERED;
 			default:
 				return -EAGAIN;		/* torn: re-derive */
