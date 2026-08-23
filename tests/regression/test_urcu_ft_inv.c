@@ -67,7 +67,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS_REKEY_DLM	20	/* inv_rekey_graft_{disjoint,cross_junction,glue_dst,coherent_readers,shared}, inv_rekey_linearizability, inv_rekey_public_{atomic_no_gap,atomic_no_gap_varlen,atomic_no_gap_compressed_top}, inv_rekey_coarse_progress, inv_rekey_{coarse,fine,contended}_mixed_writers, inv_rekey_merge_{occupied,compressed,shared}_dst, inv_rekey_merge_compressed_dst_rootchurn */
+#define NR_TESTS_REKEY_DLM	21	/* inv_rekey_graft_{disjoint,cross_junction,run_junction,glue_dst,coherent_readers,shared}, inv_rekey_linearizability, inv_rekey_public_{atomic_no_gap,atomic_no_gap_varlen,atomic_no_gap_compressed_top}, inv_rekey_coarse_progress, inv_rekey_{coarse,fine,contended}_mixed_writers, inv_rekey_merge_{occupied,compressed,shared}_dst, inv_rekey_merge_compressed_dst_rootchurn */
 
 /*
  * Base count = the RUN_TEST invocations in main() outside the DLM #ifdef.
@@ -2528,6 +2528,240 @@ static void *rkx_writer(void *arg)
 	}
 	rcu_unregister_thread();
 	return NULL;
+}
+
+/*
+ * THE RUN-JUNCTION REKEY ORACLE -- a subtree whose parent IS a path-compressed
+ * run, moved to a destination that DIVERGES INSIDE that same run.
+ *
+ * This is the shape the atomic writer gained in @b97bfabe (a compressed run on
+ * the src descent, and a compressed branch parent) and @1756c666 (the split
+ * DROPS its old direction, so the move needs no detach at all).  Every one of
+ * those landed with a SINGLE deterministic unit-test witness and ZERO
+ * concurrent coverage: measured on the whole ft_inv suite, the src descent met
+ * a compressed node 0 times and the drop was armed 2826 times and taken 0.  A
+ * publish path with no peers on it is a path whose lock set has never been
+ * contended, so this oracle exists to put peers on it.
+ *
+ * GEOMETRY, and every part of it is load-bearing:
+ *
+ *      root --R--> run(X) --> S_top --> RKR_NSUB leaves
+ *
+ * Writer i owns root byte R = i + 1 and NOTHING else lives under R, which is
+ * what makes the depth-1 edge single-child and therefore a RUN.  The move
+ * alternates the run's byte between RKR_X1 and RKR_X2:
+ *
+ *   - the SRC descent crosses the run WHOLE (its one byte is the src key's
+ *     second), so S_top is the run's child and the branch parent IS the run;
+ *   - the DST key diverges at the run's FIRST byte, so ft_graft_build splits
+ *     it -- and the node it splits is the branch parent, which is exactly the
+ *     drop's precondition.
+ *
+ * So one fixture drives three widenings at once, and the move is symmetric:
+ * after it the run carries the other byte and the next move is its mirror.
+ *
+ * ★ THE ROOT IS THE CONTENDED WORD, deliberately.  Every writer's forward
+ * publish replaces a slot in the ONE root node, so eight writers serialise
+ * there -- which is the point, since the drop's publish parent is that node and
+ * nothing else in this suite contends it through a compressed junction.
+ *
+ * ORACLE: at rest every writer's leaves are readable at its CURRENT run byte
+ * and absent at the other, the key count is exact, and cds_ft_verify passes.
+ * Plus LIVENESS: a shape this writer refuses would surface as rc != 0 (the
+ * debug entry point calls the atomic writer DIRECTLY, so no fallback can hide
+ * one), and a livelock would surface as zero moves.
+ */
+#define RKR_NW		8	/* run-junction rekey writers, one root byte each */
+#define RKR_NSUB	4	/* S_top's leaves, moving with it */
+#define RKR_X1		1	/* the two bytes the run alternates between */
+#define RKR_X2		2
+
+struct rkr_writer_arg {
+	struct cds_ft *ft;
+	uint8_t root;			/* this writer's root byte */
+	struct ft_test_node *top[RKR_NSUB];
+	int at_x2;			/* 0: run carries RKR_X1; 1: RKR_X2 */
+	unsigned long ops, retries;
+	int failed;
+};
+
+static void *rkr_writer(void *arg)
+{
+	struct rkr_writer_arg *w = (struct rkr_writer_arg *) arg;
+	unsigned long iters = 0;
+
+	rcu_register_thread();
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	while (!test_stop) {
+		uint8_t cur = w->at_x2 ? RKR_X2 : RKR_X1;
+		uint8_t oth = w->at_x2 ? RKR_X1 : RKR_X2;
+		uint8_t src_key[2] = { w->root, cur };
+		uint8_t dst_key[2] = { w->root, oth };
+		int rc;
+
+		/* No read lock: the move enters the gate, which waits a GP. */
+		rc = _cds_ft_debug_rekey_graft_simple(w->ft, src_key, 2,
+				dst_key, 2);
+		if (rc == 0) {
+			w->at_x2 = !w->at_x2;
+			w->ops++;
+		} else if (rc == -EAGAIN || rc == -EIO || rc == -ENOMEM) {
+			w->retries++;	/* transient: trie pristine, re-descend */
+		} else {
+			fprintf(stderr, "rkr_writer root=%u: move from %02x "
+				"failed rc=%d\n", w->root, cur, rc);
+			w->failed = 1;
+			mw_violation_snapshot();
+			break;
+		}
+		if ((++iters & 0xff) == 0)
+			rcu_quiescent_state();
+	}
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static int inv_rekey_graft_run_junction(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	struct rkr_writer_arg *w;
+	pthread_t writers[RKR_NW];
+	struct ft_test_node *guard_lo, *guard_hi;
+	struct timespec t0;
+	unsigned long total_ops = 0, total_retries = 0, live = 0;
+	int i, c, ret = 0;
+
+	if (!getenv("FT_INV_MW")) {
+		fprintf(stderr, "# inv_rekey_graft_run_junction: skipped "
+			"(set FT_INV_MW=1 to run the coherent-rekey writer oracle)\n");
+		return 0;
+	}
+	mw_install_fatal_handler();
+	leak_reset();
+
+	ft = create_fixed_fine_lock_ft(5, &group);	/* list ON (default) */
+	cds_ft_make_concurrent(ft);
+
+	/*
+	 * Global guards so no writer's subtree is ever the list head or tail.
+	 * They sit at root bytes 0x00 / 0xff, outside every writer's byte.
+	 */
+	guard_lo = node_alloc(RKX_KEY(0x00, 0, 0, 0, 0));
+	guard_hi = node_alloc(RKX_KEY(0xff, 0, 0, 0, 0));
+	rcu_read_lock();
+	if (insert_u64(ft, RKX_KEY(0x00, 0, 0, 0, 0), guard_lo) != CDS_FT_STATUS_OK ||
+			insert_u64(ft, RKX_KEY(0xff, 0, 0, 0, 0), guard_hi) !=
+			CDS_FT_STATUS_OK)
+		abort();
+	rcu_read_unlock();
+	live = 2;
+
+	w = (struct rkr_writer_arg *) calloc(RKR_NW, sizeof(*w));
+	if (!w)
+		abort();
+	for (i = 0; i < RKR_NW; i++) {
+		w[i].ft = ft;
+		w[i].root = (uint8_t) (i + 1);
+		/*
+		 * ONLY these keys under @root: any sibling at depth 1 would give
+		 * the root child two branches and there would be no run to cross,
+		 * split or drop -- the arm would silently become an ordinary
+		 * plain-junction move.  The counters below are what check that it
+		 * did not.
+		 */
+		rcu_read_lock();
+		for (c = 0; c < RKR_NSUB; c++) {
+			uint64_t tk = RKX_KEY(w[i].root, RKR_X1,
+					(uint8_t) (c + 1), 0, 0);
+
+			w[i].top[c] = node_alloc(tk);
+			if (insert_u64(ft, tk, w[i].top[c]) != CDS_FT_STATUS_OK)
+				abort();
+		}
+		rcu_read_unlock();
+		live += RKR_NSUB;
+	}
+
+	test_go = 0;
+	test_stop = 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < RKR_NW; i++)
+		pthread_create(&writers[i], NULL, rkr_writer, &w[i]);
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	test_go = 1;
+
+	rcu_thread_offline();
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
+		usleep(1000);
+	test_stop = 1;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < RKR_NW; i++)
+		pthread_join(writers[i], NULL);
+	rcu_thread_online();
+
+	/* Quiescent: every leaf at its writer's final byte, absent at the other. */
+	synchronize_rcu();
+	rcu_read_lock();
+	for (i = 0; i < RKR_NW; i++) {
+		uint8_t here = w[i].at_x2 ? RKR_X2 : RKR_X1;
+		uint8_t there = w[i].at_x2 ? RKR_X1 : RKR_X2;
+
+		total_ops += w[i].ops;
+		total_retries += w[i].retries;
+		if (w[i].failed)
+			ret = -1;
+		for (c = 0; c < RKR_NSUB; c++) {
+			struct cds_ft_node *found = NULL;
+
+			if (lookup_u64(ft, RKX_KEY(w[i].root, here,
+					(uint8_t) (c + 1), 0, 0), &found) !=
+					CDS_FT_STATUS_OK ||
+					found != &w[i].top[c]->node) {
+				fprintf(stderr, "rekey run-junction: writer %d leaf %d "
+					"absent at final pos (at_x2=%d)\n", i, c,
+					w[i].at_x2);
+				ret = -1;
+			}
+			if (lookup_u64(ft, RKX_KEY(w[i].root, there,
+					(uint8_t) (c + 1), 0, 0), &found) ==
+					CDS_FT_STATUS_OK) {
+				fprintf(stderr, "rekey run-junction: writer %d leaf %d "
+					"still at old pos\n", i, c);
+				ret = -1;
+			}
+		}
+	}
+	if (cds_ft_count_keys(ft) != live) {
+		fprintf(stderr, "rekey run-junction: count_keys %lu != live %lu\n",
+			cds_ft_count_keys(ft), live);
+		ret = -1;
+	}
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "rekey run-junction: cds_ft_verify failed\n");
+		ret = -1;
+	}
+	rcu_read_unlock();
+
+	if (total_ops == 0) {			/* liveness: writers made progress */
+		fprintf(stderr, "rekey run-junction: no successful moves "
+			"(livelock?)\n");
+		ret = -1;
+	}
+	fprintf(stderr, "# inv_rekey_graft_run_junction: %d writers, %lu moves, "
+		"%lu retries, %lu live keys\n", RKR_NW, total_ops, total_retries,
+		live);
+
+	free(w);
+	if (drain_and_destroy(ft, group) < 0)
+		ret = -1;
+	if (leak_check() < 0)
+		ret = -1;
+	return ret;
 }
 
 static int inv_rekey_graft_cross_junction(void)
@@ -19334,6 +19568,7 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_rekey_contended_mixed_writers);
 	RUN_TEST(inv_rekey_coarse_contended_writers);
 	RUN_TEST(inv_rekey_graft_cross_junction);
+	RUN_TEST(inv_rekey_graft_run_junction);
 	RUN_TEST(inv_rekey_graft_glue_dst);
 	RUN_TEST(inv_rekey_graft_coherent_readers);
 	RUN_TEST(inv_rekey_graft_shared);
