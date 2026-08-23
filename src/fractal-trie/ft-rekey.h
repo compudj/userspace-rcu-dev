@@ -95,8 +95,16 @@
  *
  * THE COMPRESSED ARM IS THE SAME SHAPE WITH ONE CHILD.  A compressed node carries
  * a key-byte run and a single child, so the copy is len + key_bytes + that child,
- * and the mark/re-parent sweep runs once instead of over a bitmap.  Three things
- * are particular to it:
+ * and the mark/re-parent sweep runs once instead of over a bitmap.
+ *
+ * @cut CUTS that run: the copy carries key_bytes[@cut .. len) instead of the whole
+ * span, which is what a src key ENDING INSIDE the run needs -- the moved top is
+ * the run's tail, manufactured here because no node exists at that depth.  The
+ * child is unchanged (a run has exactly one, and everything below the cut is
+ * everything the run held), so the mark and re-parent are the same single edge,
+ * and @stop is retired WHOLE exactly as an uncut copy retires it.  @cut is 0 for
+ * every other caller and must be < len; the bitmap arms reject a non-zero one,
+ * having no run to cut.  Three things are particular to this arm:
  *  - the CHILD COUNT is metadata, so setting ->child does not maintain it the way
  *    the bitmap arms' set_nth calls do; cds_ft_verify cross-checks it.
  *  - the caller gets the PLAIN node flag back.  The skip form cannot be inverted
@@ -126,6 +134,7 @@ static
 int ft_rekey_cow_stop(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		struct ft_flip_txn *txn,
 		struct cds_ft_inode_flag *stop_flag, unsigned int stop_depth,
+		unsigned int cut,
 		struct cds_ft_inode_flag **stop_prime_ret,
 		struct ft_held_anchor *marks,
 		unsigned int *nr_marks)
@@ -181,6 +190,12 @@ int ft_rekey_cow_stop(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 	 * here asserted one mode's mechanism, not the property.
 	 */
 	assert(txn->structural_sw);
+	/*
+	 * A cut names a byte offset INTO a run, so only the compressed arm can
+	 * honour one, and it must leave at least one byte behind: a zero-length
+	 * run is not a node.
+	 */
+	assert(!cut || (compressed && cut < (unsigned int) stop_cn->len));
 	assert(compressed || type->type_class == FT_POPCOUNT ||
 		type->type_class == FT_PIGEON);
 #ifdef FEATURE_FT_SKIP_COMPRESSED
@@ -227,14 +242,16 @@ int ft_rekey_cow_stop(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		struct cds_ft_metadata *cm;
 		void *resolved;
 
-		new_cn = alloc_compressed_node(ft, stop_cn->len, &new_meta);
+		unsigned int tail_len = (unsigned int) stop_cn->len - cut;
+
+		new_cn = alloc_compressed_node(ft, tail_len, &new_meta);
 		if (!new_cn) {
 			ret = -ENOMEM;
 			goto out;
 		}
 		new_node = (struct cds_ft_inode *) new_cn;
-		new_cn->len = stop_cn->len;
-		memcpy(new_cn->key_bytes, stop_cn->key_bytes, stop_cn->len);
+		new_cn->len = tail_len;
+		memcpy(new_cn->key_bytes, stop_cn->key_bytes + cut, tail_len);
 		if (!ft_flip_txn_resolve_prio(txn, (void **) &stop_cn->child,
 				&resolved)) {
 			ret = -EAGAIN;
@@ -1003,6 +1020,15 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 */
 	bool run_keeps_pos = false;
 	bool s_top_compressed = false;	/* the moved top is a compressed run */
+	/*
+	 * The src key ends INSIDE a run, @src_cut bytes into it.  Then S_top is
+	 * not a node: it is the run's TAIL, and ft_rekey_cow_stop manufactures it
+	 * by copying @key_bytes from this offset instead of from zero.  The
+	 * junction is the run's OWN parent slot and the whole run is retired --
+	 * a run has one child, so cutting it moves everything it held.  Zero for
+	 * the ordinary shape, where S_top is a node the descent landed on.
+	 */
+	unsigned int src_cut = 0;
 #ifdef FEATURE_FT_MERGE
 	/* Occupied dst: thread the cells individually, do not splice a run. */
 	bool run_interleaves = false;
@@ -1157,9 +1183,17 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		 * A compressed run on the way DOWN to S_top is crossed whole, the
 		 * way the dst probe crosses one: step() advances a single byte, so
 		 * walking a run with it counts the bytes but never resolves into
-		 * cn->child, landing depth-correct on NULL.  The run must also FIT
-		 * the remaining key and MATCH it -- a run reaching past @src_len
-		 * would put S_top mid-run, which has no slot to clear.
+		 * cn->child, landing depth-correct on NULL.
+		 *
+		 * A run that OVERSHOOTS @src_len is not out of scope either -- the
+		 * src key simply ends inside it.  There is no node at that depth to
+		 * be S_top and no slot in the run to clear, so the move CUTS the
+		 * run instead: the moved top is its TAIL (@src_cut bytes in), and
+		 * the junction is the run's own parent slot.  Nothing is stranded
+		 * by that -- a run holds exactly one child, so everything below the
+		 * cut is everything the run held, and the run itself is retired
+		 * whole.  The bytes BEFORE the cut must still match the key; the
+		 * bytes after it are what the tail carries to the destination.
 		 */
 		if (ft_node_compressed(d_src.nf)) {
 			struct cds_ft_compressed_node *cn =
@@ -1167,9 +1201,15 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 			unsigned int remaining =
 				(unsigned int) (src_len - d_src.depth);
 
-			if ((unsigned int) cn->len > remaining ||
-					ft_match_compressed_key(ik, cn,
-						(unsigned int) cn->len)
+			if ((unsigned int) cn->len > remaining) {
+				if (ft_match_compressed_key(ik, cn, remaining)
+						!= remaining)
+					return FT_REKEY_UNCOVERED;
+				src_cut = remaining;
+				break;		/* S_top is this run's tail */
+			}
+			if (ft_match_compressed_key(ik, cn,
+					(unsigned int) cn->len)
 					!= (unsigned int) cn->len)
 				return FT_REKEY_UNCOVERED;
 			ft_descent_traverse_compressed(ft, &d_src, cn, &ik);
@@ -1178,8 +1218,14 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		ft_descent_step(ft, &d_src, *(ik++));
 	}
 	s_top = d_src.nf;
-	if (!s_top || d_src.depth != src_len || ft_node_flip_proxy(s_top) ||
-			ft_node_external(s_top))
+	/*
+	 * @src_cut lands the descent ON the run rather than past it, so the
+	 * depth it stopped at is the RUN'S OWN and the key ends @src_cut bytes
+	 * further in.  Both readings say the same thing: the src prefix is
+	 * exhausted exactly here.
+	 */
+	if (!s_top || d_src.depth + src_cut != src_len ||
+			ft_node_flip_proxy(s_top) || ft_node_external(s_top))
 		return FT_REKEY_UNCOVERED;
 	/*
 	 * A COMPRESSED S_top is in scope: ft_rekey_cow_stop copies the run and its
@@ -1720,6 +1766,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		 * a SECOND handle, not a binding.
 		 */
 		ret = ft_rekey_cow_stop(ft, &lctx_src, txn, s_top, d_src.depth,
+			src_cut,
 				&s_top_prime, marks, &nr_marks);
 		if (ret) {
 			ft_flip_txn_destroy(txn);	/* pre-commit bail: destroy caller-owned */

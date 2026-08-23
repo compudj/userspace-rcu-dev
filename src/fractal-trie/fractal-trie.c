@@ -356,8 +356,8 @@ int _cds_ft_debug_cow_replace_root(struct cds_ft *ft)
 	ft_flip_txn_set_structural_sw(txn, true, (void **) &ft->root);
 
 	/* The ROOT is its own anchor under every spacing: byte-depth 0. */
-	ret = ft_rekey_cow_stop(ft, NULL, txn, root, 0, &root_prime, marks,
-			&nr_marks);
+	ret = ft_rekey_cow_stop(ft, NULL, txn, root, 0, 0 /*cut*/, &root_prime,
+			marks, &nr_marks);
 	if (ret) {
 		ft_flip_txn_destroy(txn);	/* pre-commit bail: destroy caller-owned txn */
 		goto sweep;
