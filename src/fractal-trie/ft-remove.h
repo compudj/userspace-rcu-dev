@@ -877,7 +877,7 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		 */
 		txn = shared_txn;
 	} else {
-		txn = ft_flip_txn_create_bounded(FT_REMOVE_COMMIT_REC_MAX_EDGES + 3
+		txn = ft_flip_txn_create_bounded(ft, FT_REMOVE_COMMIT_REC_MAX_EDGES + 3
 				+ 1 /* §4.B parent guard */
 				+ 1 /* back-edge (parent, offset) pair: the state-word edge */
 				+ ft_freeze_reserve(ft, (unsigned int) nr_orphans
@@ -2287,7 +2287,7 @@ int ft_detach_node(struct cds_ft *ft,
 		 */
 		{
 			struct ft_flip_txn *orphan_txn =
-				ft_flip_txn_create_bounded(
+				ft_flip_txn_create_bounded(ft,
 					FT_REMOVE_COMMIT_REC_MAX_EDGES
 					+ 1 /* §4.B parent guard (Sites 3+4 excl.) */
 					+ ft_freeze_reserve(ft, (unsigned int) nr_to_free
@@ -2872,7 +2872,7 @@ int ft_detach_node(struct cds_ft *ft,
 				assert(!retire_glue && !freeze_leaf);
 				commit_txn = shared_txn;
 			} else {
-				commit_txn = ft_flip_txn_create_bounded(
+				commit_txn = ft_flip_txn_create_bounded(ft,
 					FT_REMOVE_COMMIT_REC_MAX_EDGES
 					+ 1 /* §4.B parent guard (Site 1 arms excl.) */
 					+ ft_freeze_reserve(ft, (unsigned int) nr_to_free
@@ -3638,7 +3638,7 @@ int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 				ft_meta_lock_release(held_holder);
 			return -ENOMEM;
 		}
-		txn = ft_flip_txn_create_bounded(
+		txn = ft_flip_txn_create_bounded(ft,
 			FT_ORD_CELL_SWAP_PUBLISH_MAX_EDGES +
 			FT_HLIST_FREEZE_MAX_EDGES + 2);	/* +1 §4.B parent guard, +1 next_node->prev fold */
 		if (!txn) {
@@ -3713,7 +3713,7 @@ int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		 * attempt before anything is recorded.
 		 */
 		struct ft_flip_txn *txn =
-			ft_flip_txn_create_bounded(FT_PUB_SEDGE_MAX_EDGES +
+			ft_flip_txn_create_bounded(ft, FT_PUB_SEDGE_MAX_EDGES +
 				FT_HLIST_FREEZE_MAX_EDGES + 2);	/* +1 §4.B parent guard, +1 prev fold */
 
 		void *prev_save;
@@ -3864,7 +3864,7 @@ int ft_unchain_node(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		 * published and @node stays fully chained.
 		 */
 		struct ft_flip_txn *txn =
-			ft_flip_txn_create_bounded(FT_HLIST_DEL_MAX_EDGES);
+			ft_flip_txn_create_bounded(ft, FT_HLIST_DEL_MAX_EDGES);
 		enum urcu_txn_status st;
 
 		if (!txn) {
@@ -3939,7 +3939,7 @@ int ft_unchain_node(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		struct ft_flip_txn *txn;
 		unsigned int n_s;
 
-		txn = ft_flip_txn_create_bounded(FT_PUB_SEDGE_MAX_EDGES +
+		txn = ft_flip_txn_create_bounded(ft, FT_PUB_SEDGE_MAX_EDGES +
 			FT_HLIST_FREEZE_MAX_EDGES + 1);
 		if (!txn) {
 			/* Early fence held but not yet handed to the txn. */
@@ -4255,7 +4255,7 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 	struct ft_flip_txn *unsplice_txn = NULL;
 
 	if (fuse_remove) {
-		unsplice_txn = ft_flip_txn_create_bounded(
+		unsplice_txn = ft_flip_txn_create_bounded(ft,
 			FT_ORD_CELL_UNSPLICE_MAX_EDGES);
 		if (!unsplice_txn) {
 			FT_TP(remove_exit, (int) CDS_FT_STATUS_MEMORY_ERROR);
@@ -4438,7 +4438,7 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 				 * infallible lone ft_unchain_node store, unchanged.
 				 */
 				if (ft->ordered_list || ft->rank_stats) {
-					struct ft_flip_txn *txn = ft_flip_txn_create_bounded(
+					struct ft_flip_txn *txn = ft_flip_txn_create_bounded(ft,
 						FT_REMOVE_COMMIT_REC_MAX_EDGES + 1 +
 						(ft->rank_stats ? key_len + 1 : 0));
 
@@ -4560,7 +4560,7 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 						dead_cell) > 0) {
 					do {
 						unsplice_txn =
-							ft_flip_txn_create_bounded(
+							ft_flip_txn_create_bounded(ft,
 							FT_ORD_CELL_UNSPLICE_MAX_EDGES);
 					} while (caa_unlikely(!unsplice_txn));
 				}
@@ -4791,7 +4791,7 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 			 * reserved txn commits infallibly and the arm is the only abort.
 			 * A no-op count record when rank stats are off (list-on path).
 			 */
-			txn = ft_flip_txn_create_bounded(
+			txn = ft_flip_txn_create_bounded(ft,
 				FT_REMOVE_COMMIT_REC_MAX_EDGES +
 				(ft->rank_stats ? 1 : 0));
 			if (!txn) {
@@ -4916,7 +4916,7 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 	struct ft_flip_txn *unsplice_txn = NULL;
 
 	if (dead_cell) {
-		unsplice_txn = ft_flip_txn_create_bounded(
+		unsplice_txn = ft_flip_txn_create_bounded(ft,
 			FT_ORD_CELL_UNSPLICE_MAX_EDGES);
 		if (!unsplice_txn) {
 			*result_node = NULL;
@@ -5020,7 +5020,7 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 				 * place.  List off + rank off: the forward clear + the
 				 * guard, a 2-record slab-allocated MCAS commit.
 				 */
-				struct ft_flip_txn *txn = ft_flip_txn_create_bounded(
+				struct ft_flip_txn *txn = ft_flip_txn_create_bounded(ft,
 					FT_REMOVE_COMMIT_REC_MAX_EDGES + 1 +
 					(ft->rank_stats ? key_len + 1 : 0));
 

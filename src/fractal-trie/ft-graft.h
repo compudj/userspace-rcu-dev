@@ -1358,7 +1358,15 @@ enum cds_ft_status ft_graft_keylen(struct cds_ft *dst_ft,
 		struct ft_flip_txn *dual_txn = ft_flip_txn_take(pre_txn);
 
 		if (!dual_txn) {
-			dual_txn = ft_flip_txn_create_bounded(
+			/*
+			 * ☠ NAMED FOR @dst_ft, WRITES BOTH ROOTS.  The dual
+			 * flips &dst_ft->root AND &src_ft->root in one commit,
+			 * so the trie named here cannot stand for "the trie
+			 * whose root this txn may not park" -- see
+			 * ft_txn_content_sw_ok, which must refuse to arm this
+			 * shape while the exemption names a single slot.
+			 */
+			dual_txn = ft_flip_txn_create_bounded(dst_ft,
 				FT_ROOT_LIST_SWAP_DUAL_MAX_EDGES + 1);
 			if (!dual_txn) {
 				ft_meta_lock_release(dst_rmeta);
@@ -1691,7 +1699,7 @@ retry_attach:
 		 */
 		glue.txn = ft_flip_txn_take(pre_txn);
 		if (!glue.txn) {
-			glue.txn = ft_flip_txn_create();
+			glue.txn = ft_flip_txn_create(dst_ft);
 			if (!glue.txn || !ft_flip_txn_reserve(glue.txn,
 					/* + FLOOR_FREE: fused free-list tombstones (§4.B) */
 					FT_GLUE_FLOOR_DEFERRED + 7 + 1 /* +1 §4.B parent guard */ + FT_GLUE_FLOOR_FREE
@@ -1846,9 +1854,9 @@ retry_attach:
 		 * would use @run_splice_txn is never taken).
 		 */
 		if (!already_swapped && dst_ft->group->ordered_list_set) {
-			src_retire_txn = ft_flip_txn_create_bounded(
+			src_retire_txn = ft_flip_txn_create_bounded(src_ft,
 				FT_ROOT_LIST_SWAP_MAX_EDGES + 1);
-			run_splice_txn = ft_flip_txn_create_bounded(
+			run_splice_txn = ft_flip_txn_create_bounded(dst_ft,
 				FT_ORD_CELL_RUN_SPLICE_MAX_EDGES);
 			if (!src_retire_txn || !run_splice_txn) {
 				/*
@@ -1876,7 +1884,7 @@ retry_attach:
 				return CDS_FT_STATUS_MEMORY_ERROR;
 			}
 		} else if (!already_swapped && nil_key_root && !src_ft->exclusive) {
-			src_retire_txn = ft_flip_txn_create_bounded(2);
+			src_retire_txn = ft_flip_txn_create_bounded(src_ft, 2);
 			if (!src_retire_txn) {
 				if (glue.split_cn_holder) {
 					/* SHARED: the caller's earlier acquire owns the release. */
@@ -2841,7 +2849,12 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		 * The dual always flips both roots, so it is multi-edge even list
 		 * off (never a lone store).
 		 */
-		dual_txn = ft_flip_txn_create_bounded(
+		/*
+		 * ☠ NAMED FOR @dst_ft, WRITES BOTH ROOTS -- here &dst_ft->root
+		 * and &swap_ft->root.  Same caveat as the graft dual above; see
+		 * ft_txn_content_sw_ok.
+		 */
+		dual_txn = ft_flip_txn_create_bounded(dst_ft,
 			FT_ROOT_LIST_SWAP_DUAL_MAX_EDGES);
 		if (!dual_txn) {
 			FT_TP(graft_swap_exit,
@@ -3444,7 +3457,7 @@ retry_swap:
 		 * the commit below (doc §4.B).
 		 */
 		if (have_insert && kase != FT_GRAFT_SWAP_KEY_SHORTER) {
-			glue_insert.txn = ft_flip_txn_create();
+			glue_insert.txn = ft_flip_txn_create(dst_ft);
 			if (!glue_insert.txn || !ft_flip_txn_reserve(glue_insert.txn,
 					/* +1: fused recompact-relocate tombstone (§4.B);
 					 * + FLOOR_FREE: fused free-list tombstones */
@@ -3468,7 +3481,7 @@ retry_swap:
 			 * free-list freeze fuses; the live wrap re-parent stays on the
 			 * immediate apply_deferred path (not yet txn-classified).
 			 */
-			glue_publish_txn = ft_flip_txn_create_bounded(
+			glue_publish_txn = ft_flip_txn_create_bounded(dst_ft,
 				FT_GLUE_PUBLISH_REPLACE_MAX_EDGES + FT_GLUE_FLOOR_FREE
 				+ 1 /* +1 §4.B parent guard */
 				+ (dst_ft->rank_stats ? (int) key_len + 1 : 0) /* nr_keys fold walk */);
@@ -3494,7 +3507,7 @@ retry_swap:
 			 * frees it.
 			 */
 			if (gs_ord) {
-				swap_retire_txn = ft_flip_txn_create_bounded(
+				swap_retire_txn = ft_flip_txn_create_bounded(swap_ft,
 					FT_ROOT_LIST_SWAP_MAX_EDGES);
 				if (!swap_retire_txn)
 					goto prep_oom;
@@ -3532,14 +3545,14 @@ retry_swap:
 		 * ft_glue_tombstone_free_list's loop is skipped (no NULL-txn deref).
 		 */
 		if (gs_ord || top_B) {
-			extract_txn = ft_flip_txn_create_bounded(gs_ord ?
+			extract_txn = ft_flip_txn_create_bounded(swap_ft, gs_ord ?
 				FT_ROOT_LIST_SWAP_MAX_EDGES + 2 : 3);
 			if (!extract_txn)
 				goto prep_oom;
 			glue_extract.txn = extract_txn;
 			glue_extract.fuse_free_list = true;
 			if (gs_ord) {
-				run_replace_txn = ft_flip_txn_create_bounded(
+				run_replace_txn = ft_flip_txn_create_bounded(dst_ft,
 					FT_ORD_CELL_RUN_REPLACE_MAX_EDGES);
 				if (!run_replace_txn)
 					goto prep_oom;

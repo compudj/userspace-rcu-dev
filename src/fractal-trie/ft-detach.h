@@ -101,7 +101,7 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 		struct ft_flip_txn *root_txn = NULL;
 
 		if (ft->group->ordered_list_set) {
-			root_txn = ft_flip_txn_create_bounded(
+			root_txn = ft_flip_txn_create_bounded(ft,
 				FT_ROOT_LIST_SWAP_MAX_EDGES);
 			if (!root_txn) {
 				cds_ft_destroy(detached);
@@ -397,7 +397,7 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 					 * OOM here aborts cleanly (undo propagation, abort the
 					 * build, destroy @detached), leaving @ft pristine.
 					 */
-					run_txn = ft_flip_txn_create_bounded(
+					run_txn = ft_flip_txn_create_bounded(ft,
 						FT_ORD_CELL_RUN_DETACH_MAX_EDGES);
 					if (!run_txn) {
 						ft_glue_abort(detached, &glue);

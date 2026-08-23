@@ -245,9 +245,8 @@ void ft_tk_count_cell_mw(void)
  * layout decisions, and this instrument must not perturb the very code paths
  * whose latency it is used to compare.
  */
-#define FT_TK_SITE_PARAM_ONLY	struct ft_tk_site *dbg_site
 #define FT_TK_SITE_PARAM	struct ft_tk_site *dbg_site,
-#define FT_TK_SITE_FWD_ONLY	dbg_site
+#define FT_TK_SITE_FWD		dbg_site,
 
 struct ft_tk_row {
 	const struct ft_tk_site *site;
@@ -419,9 +418,8 @@ void ft_tk_dump_at_exit(void)
 
 struct ft_tk_site;	/* incomplete: the NULL the constructors take */
 
-#define FT_TK_SITE_PARAM_ONLY		void
 #define FT_TK_SITE_PARAM
-#define FT_TK_SITE_FWD_ONLY
+#define FT_TK_SITE_FWD
 #define FT_TK_TXN_FIELDS
 #define FT_TK_TXN_INIT(t, site)		do { } while (0)
 #define FT_TK_TXN_IS_TAKE(t)		0

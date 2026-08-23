@@ -1664,7 +1664,7 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 				nr_dst++;
 		txn = ft_flip_txn_take(pre_txn);
 		if (!txn) {
-			txn = ft_flip_txn_create();
+			txn = ft_flip_txn_create(dst_ft);
 			if (txn && !ft_flip_txn_reserve(txn,
 					nr_dst + 1 + ms_cap + gd.cap_free
 						+ gd.nr_splices
@@ -1927,7 +1927,7 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	 * forward publish.)
 	 */
 	if (ms_ord) {
-		src_side_txn = ft_flip_txn_create_bounded(root_src ?
+		src_side_txn = ft_flip_txn_create_bounded(src_ft, root_src ?
 			FT_ROOT_LIST_SWAP_MAX_EDGES + (unsigned int) gs.cap_free :
 			FT_ORD_CELL_RUN_UNLINK_MAX_EDGES);
 		if (!src_side_txn) {
@@ -1943,7 +1943,7 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		}
 	} else if (root_src && gs.nr_free) {
 		/* List-off root with retires: 1 root edge + gs.cap_free tombstones. */
-		src_side_txn = ft_flip_txn_create_bounded(
+		src_side_txn = ft_flip_txn_create_bounded(src_ft,
 			1u + (unsigned int) gs.cap_free);
 		if (!src_side_txn) {
 			free(ms_src_pool);
@@ -2573,7 +2573,7 @@ retry_merge:
 	 * its slot proxy + run-splice edges, all out of this txn.  Create it BEFORE
 	 * the build; destroyed on a POPULATED point (nothing to commit).
 	 */
-	glue.txn = ft_flip_txn_create();
+	glue.txn = ft_flip_txn_create(dst_ft);
 	if (!glue.txn || !ft_flip_txn_reserve(glue.txn,
 			/* +1: fused recompact-relocate tombstone (§4.B);
 			 * + FLOOR_FREE: fused free-list tombstones;
@@ -2734,9 +2734,9 @@ retry_merge:
 			 * structural flip is public, un-abortable).  OOM here aborts the
 			 * still-invisible build (both tries pristine).
 			 */
-			run_unlink_txn = ft_flip_txn_create_bounded(
+			run_unlink_txn = ft_flip_txn_create_bounded(src_ft,
 				FT_ORD_CELL_RUN_UNLINK_MAX_EDGES);
-			run_splice_txn = ft_flip_txn_create_bounded(
+			run_splice_txn = ft_flip_txn_create_bounded(dst_ft,
 				FT_ORD_CELL_RUN_SPLICE_MAX_EDGES);
 			if (!run_unlink_txn || !run_splice_txn) {
 				if (run_unlink_txn)
@@ -3479,10 +3479,10 @@ merge_spine_retry:
 		 * tombstone) instead of the former lone ft_root_edge_flip store.
 		 */
 		if (dst_ft->group->ordered_list_set)
-			appear_txn = ft_flip_txn_create_bounded(
+			appear_txn = ft_flip_txn_create_bounded(dst_ft,
 				FT_ROOT_LIST_SWAP_MAX_EDGES + 1);
 		else
-			appear_txn = ft_flip_txn_create_bounded(2);
+			appear_txn = ft_flip_txn_create_bounded(dst_ft, 2);
 		if (!appear_txn) {
 			ft_meta_lock_release(dst_rmeta);
 			free_cds_ft_node_unpublished(src_ft, fresh_root);

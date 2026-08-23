@@ -1114,8 +1114,62 @@ void ft_txn_attempt_bail(struct urcu_txn *op, bool open)
 	ft_acq_contended = 0;
 }
 
+/* Defined below; the constructors arm through it. */
 static inline
-struct ft_flip_txn *ft_flip_txn_create_at(FT_TK_SITE_PARAM_ONLY)
+void ft_flip_txn_set_structural_sw(struct ft_flip_txn *t, bool v,
+		void **sw_exempt_slot);
+
+/*
+ * MAY a CONTENT txn on @ft park its structural edges SW instead of recording
+ * them MW?  This is the conversion's single policy switch, and it is asked of
+ * the TRIE rather than of the call site because the answer is a property of the
+ * trie's writer mode: an SW park cannot fail, so it is legal exactly where the
+ * op excludes every peer writer of the slots it rewrites.
+ *
+ *   COARSE non-exclusive   the FT-wide writer mutex is that exclusion
+ *   exclusive              single writer by contract
+ *   FINE non-exclusive     only the per-node DLM locks, so the promise holds
+ *                          for an op whose lock set provably covers every slot
+ *                          it rewrites -- a per-op property, not a trie-wide one
+ *
+ * Answering false leaves every content txn all-MW, which is what the ops record
+ * today: stricter than necessary and always sound.  The two callers that arm
+ * explicitly (the rekey writer, the root COW) still do so on their own
+ * reasoning; this switch is what will retire that hand-arming.
+ *
+ * @ft NULL is the acquire lane, which never arms.
+ *
+ * ☠ A CROSS-TRIE TXN NAMES ONE TRIE AND MAY WRITE TWO ROOTS.  @sw_exempt_slot
+ * is a single slot, and the graft / graft_swap DUAL txns flip &dst_ft->root and
+ * &src_ft->root (resp. &swap_ft->root) in the same commit.  Arming such a txn
+ * off its named trie would exempt one root and PARK THE OTHER unarbitrated --
+ * a plain store racing every other writer of that word, which is precisely what
+ * the exemption exists to prevent.  So this switch must not be turned on for a
+ * txn that writes a second trie's root until the exemption can name more than
+ * one slot (or the root republish is routed through a record helper that is
+ * always MW, which would retire the exemption entirely).  The two dual sites
+ * say so at the call.
+ */
+static inline
+bool ft_txn_content_sw_ok(const struct cds_ft *ft)
+{
+	(void) ft;
+	return false;
+}
+
+/*
+ * A CONTENT flip-txn: the lane that rewrites the STRUCTURE -- forward publishes,
+ * re-parents, retires, lock releases.  It takes @ft because arming is decided
+ * from the trie (ft_txn_content_sw_ok) and because the &ft->root exemption has
+ * no other source; that argument is also what makes the CONTENT / ACQUIRE split
+ * compiler-enforced rather than a naming convention.
+ *
+ * ☠ NOT for a DLM lock-set acquire.  Use ft_flip_txn_acquire_bounded(): the
+ * lock take {clean -> LOCK|s} is the arbitration point and must record MW even
+ * on a trie whose content may park SW.
+ */
+static inline
+struct ft_flip_txn *ft_flip_txn_create_at(FT_TK_SITE_PARAM struct cds_ft *ft)
 {
 	struct ft_flip_txn *t = (struct ft_flip_txn *) malloc(sizeof(*t));
 
@@ -1143,6 +1197,8 @@ struct ft_flip_txn *ft_flip_txn_create_at(FT_TK_SITE_PARAM_ONLY)
 	t->pending_del_folded = false;
 	t->structural_sw = false;	/* all-MW until a caller opts in under lock_fine */
 	t->sw_exempt_slot = NULL;
+	if (ft_txn_content_sw_ok(ft))
+		ft_flip_txn_set_structural_sw(t, true, (void **) &ft->root);
 	FT_TK_TXN_INIT(t, dbg_site);
 	return t;
 }
@@ -1266,7 +1322,7 @@ bool ft_recompact_fault_refuse_acquire(enum ft_recompact mode)
 
 static inline
 struct ft_flip_txn *ft_flip_txn_create_bounded_at(FT_TK_SITE_PARAM
-		unsigned int cap)
+		struct cds_ft *ft, unsigned int cap)
 {
 	struct ft_flip_txn *t;
 
@@ -1311,7 +1367,7 @@ struct ft_flip_txn *ft_flip_txn_create_bounded_at(FT_TK_SITE_PARAM
 	 * remove_all et al. -- do not have) but it is a behaviour difference,
 	 * not a spelling one.
 	 */
-	t = ft_flip_txn_create_at(FT_TK_SITE_FWD_ONLY);
+	t = ft_flip_txn_create_at(FT_TK_SITE_FWD ft);
 	if (!t)
 		return NULL;
 	if (!ft_flip_txn_reserve(t, cap)) {
@@ -1341,7 +1397,7 @@ struct ft_flip_txn *ft_flip_txn_create_bounded_at(FT_TK_SITE_PARAM
  */
 static inline
 struct ft_flip_txn *ft_flip_txn_create_on_at(FT_TK_SITE_PARAM
-		struct urcu_txn *op)
+		struct cds_ft *ft, struct urcu_txn *op)
 {
 	struct ft_flip_txn *t = (struct ft_flip_txn *) malloc(sizeof(*t));
 
@@ -1361,6 +1417,8 @@ struct ft_flip_txn *ft_flip_txn_create_on_at(FT_TK_SITE_PARAM
 	t->pending_del_folded = false;
 	t->structural_sw = false;
 	t->sw_exempt_slot = NULL;
+	if (ft_txn_content_sw_ok(ft))
+		ft_flip_txn_set_structural_sw(t, true, (void **) &ft->root);
 	FT_TK_TXN_INIT(t, dbg_site);
 	return t;
 }
@@ -1379,7 +1437,7 @@ struct ft_flip_txn *ft_flip_txn_create_on_at(FT_TK_SITE_PARAM
  */
 static inline
 struct ft_flip_txn *ft_flip_txn_create_bounded_on_at(FT_TK_SITE_PARAM
-		struct urcu_txn *op, unsigned int cap)
+		struct cds_ft *ft, struct urcu_txn *op, unsigned int cap)
 {
 	struct ft_flip_txn *t;
 
@@ -1412,8 +1470,29 @@ struct ft_flip_txn *ft_flip_txn_create_bounded_on_at(FT_TK_SITE_PARAM
 	t->pending_del_folded = false;
 	t->structural_sw = false;	/* all-MW until a caller opts in under lock_fine */
 	t->sw_exempt_slot = NULL;
+	if (ft_txn_content_sw_ok(ft))
+		ft_flip_txn_set_structural_sw(t, true, (void **) &ft->root);
 	FT_TK_TXN_INIT(t, dbg_site);
 	return t;
+}
+
+/*
+ * THE ACQUIRE LANE, and why it is a SEPARATE CONSTRUCTOR rather than a content
+ * txn used differently: the lock take {clean -> LOCK|s} IS the point at which
+ * two ops racing for a node are decided.  An MW record installs with a CAS-old,
+ * so the loser's commit aborts; an SW park cannot fail, so an SW take would
+ * hand BOTH ops the node.  This txn therefore names no trie and can never be
+ * armed -- and ft_dlm_lock's assert(!t->structural_sw) then catches a
+ * miscategorised site loudly instead of silently producing two lock owners.
+ *
+ * Always bounded: an acquire's edge count is its lock-set size plus its guards,
+ * both known before the first record.
+ */
+static inline
+struct ft_flip_txn *ft_flip_txn_acquire_bounded_at(FT_TK_SITE_PARAM
+		unsigned int cap)
+{
+	return ft_flip_txn_create_bounded_at(FT_TK_SITE_FWD NULL, cap);
 }
 
 /*
@@ -1427,22 +1506,27 @@ struct ft_flip_txn *ft_flip_txn_create_bounded_on_at(FT_TK_SITE_PARAM
  * used to compare latencies must not perturb the paths it compares.
  */
 #ifdef FT_DEBUG_TXN_KIND
-# define ft_flip_txn_create()						\
-	ft_flip_txn_create_at(FT_TK_SITE_HERE("create"))
-# define ft_flip_txn_create_bounded(cap)				\
-	ft_flip_txn_create_bounded_at(FT_TK_SITE_HERE("bounded"), (cap))
-# define ft_flip_txn_create_on(op)					\
-	ft_flip_txn_create_on_at(FT_TK_SITE_HERE("on"), (op))
-# define ft_flip_txn_create_bounded_on(op, cap)				\
+# define ft_flip_txn_create(ft)						\
+	ft_flip_txn_create_at(FT_TK_SITE_HERE("create"), (ft))
+# define ft_flip_txn_create_bounded(ft, cap)				\
+	ft_flip_txn_create_bounded_at(FT_TK_SITE_HERE("bounded"), (ft), (cap))
+# define ft_flip_txn_create_on(ft, op)					\
+	ft_flip_txn_create_on_at(FT_TK_SITE_HERE("on"), (ft), (op))
+# define ft_flip_txn_create_bounded_on(ft, op, cap)			\
 	ft_flip_txn_create_bounded_on_at(FT_TK_SITE_HERE("bounded_on"),	\
-			(op), (cap))
+			(ft), (op), (cap))
+# define ft_flip_txn_acquire_bounded(cap)				\
+	ft_flip_txn_acquire_bounded_at(FT_TK_SITE_HERE("acquire"), (cap))
 #else
-# define ft_flip_txn_create()		ft_flip_txn_create_at()
-# define ft_flip_txn_create_bounded(cap)				\
-	ft_flip_txn_create_bounded_at(cap)
-# define ft_flip_txn_create_on(op)	ft_flip_txn_create_on_at(op)
-# define ft_flip_txn_create_bounded_on(op, cap)				\
-	ft_flip_txn_create_bounded_on_at((op), (cap))
+# define ft_flip_txn_create(ft)		ft_flip_txn_create_at(ft)
+# define ft_flip_txn_create_bounded(ft, cap)				\
+	ft_flip_txn_create_bounded_at((ft), (cap))
+# define ft_flip_txn_create_on(ft, op)					\
+	ft_flip_txn_create_on_at((ft), (op))
+# define ft_flip_txn_create_bounded_on(ft, op, cap)			\
+	ft_flip_txn_create_bounded_on_at((ft), (op), (cap))
+# define ft_flip_txn_acquire_bounded(cap)				\
+	ft_flip_txn_acquire_bounded_at(cap)
 #endif
 
 /*
@@ -2922,7 +3006,7 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 	 * its descriptor and its install lane, which measured WORSE (median 9.5
 	 * starving removes against 4 for aging alone, complete separation).
 	 */
-	acq = ft_flip_txn_create_bounded(3 * nr_present);
+	acq = ft_flip_txn_acquire_bounded(3 * nr_present);
 	if (!acq)
 		return -ENOMEM;
 	for (i = 0; i < nr; i++) {
@@ -5192,7 +5276,7 @@ int ft_ord_cell_flip_try(struct cds_ft *ft, struct ft_ord_cell_edge *edges,
 		ft_ord_cell_flip_one(&edges[0]);
 		return 0;
 	}
-	t = ft_flip_txn_create_bounded(n);
+	t = ft_flip_txn_create_bounded(ft, n);
 	if (caa_unlikely(!t))
 		return -ENOMEM;
 	return ft_flip_status_to_errno(ft_ord_cell_flip_into(ft, t, edges, n));
@@ -5467,7 +5551,7 @@ int ft_ord_cell_swap(struct cds_ft *ft, struct ft_ord_cell *old_cell,
 		struct ft_ord_cell *new_cell)
 {
 	struct ft_flip_txn *t =
-		ft_flip_txn_create_bounded(FT_ORD_CELL_SWAP_REC_MAX_EDGES);
+		ft_flip_txn_create_bounded(ft, FT_ORD_CELL_SWAP_REC_MAX_EDGES);
 
 	if (caa_unlikely(!t))
 		return -ENOMEM;

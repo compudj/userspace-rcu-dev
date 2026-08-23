@@ -771,7 +771,7 @@ int ft_insert_commit_arm(struct cds_ft *ft, struct ft_insert_commit *ic,
 	 * still carries @ic->op for enrolment; what it must not do is commit
 	 * through it.
 	 */
-	ic->txn = ft_flip_txn_create_bounded(14 + anchored + count_edges);
+	ic->txn = ft_flip_txn_create_bounded(ft, 14 + anchored + count_edges);
 	if (!ic->txn)
 		return -ENOMEM;
 	return 0;
@@ -2325,7 +2325,7 @@ int ft_chain_node(struct cds_ft *ft, struct cds_ft_node *last_node,
 	 * @node's prev/next).  Previously ABORT was folded into 0 -- a silently
 	 * LOST duplicate under contention.
 	 */
-	t = ft_flip_txn_create_bounded(FT_HLIST_INSERT_AFTER_MAX_EDGES);
+	t = ft_flip_txn_create_bounded(ft, FT_HLIST_INSERT_AFTER_MAX_EDGES);
 	if (!t)
 		return -ENOMEM;
 	if (ft_hlist_insert_after_prepare(ft_flip_txn_handle(t), node,
@@ -3684,7 +3684,7 @@ restart_replace_attempt:
 							node,
 					};
 					struct ft_flip_txn *txn =
-						ft_flip_txn_create_bounded(
+						ft_flip_txn_create_bounded(ft,
 						FT_ORD_CELL_SWAP_PUBLISH_MAX_EDGES + 1);
 
 					/*
@@ -3744,7 +3744,7 @@ restart_replace_attempt:
 							node,
 					};
 					struct ft_flip_txn *txn =
-						ft_flip_txn_create_bounded(2);
+						ft_flip_txn_create_bounded(ft, 2);
 
 					if (!txn) {
 						ret = -ENOMEM;
@@ -3870,7 +3870,7 @@ restart_replace_attempt:
 					struct ft_ord_cell *old_cell =
 						ft_ord_cell_ptr((*old_node_ret)->prev);
 					struct ft_flip_txn *txn =
-						ft_flip_txn_create_bounded(
+						ft_flip_txn_create_bounded(ft,
 							FT_ORD_CELL_SWAP_PUBLISH_MAX_EDGES +
 							1 /* §4.B parent guard */);
 
@@ -3909,7 +3909,7 @@ restart_replace_attempt:
 					 * NOT freed and the replace aborts retriably.
 					 */
 					struct ft_flip_txn *txn =
-						ft_flip_txn_create_bounded(
+						ft_flip_txn_create_bounded(ft,
 							FT_PUB_SEDGE_MAX_EDGES +
 							1 /* §4.B parent guard */);
 
@@ -4375,7 +4375,7 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 					hsnap = hh.lock_snap;
 				}
 			}
-			txn = ft_flip_txn_create_bounded(
+			txn = ft_flip_txn_create_bounded(ft,
 					FT_HLIST_REPLACE_MAX_EDGES);
 			if (!txn) {
 				if (hm)
@@ -4433,7 +4433,7 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 			struct ft_ord_cell *new_cell =
 				ft_ord_cell_ptr(new_cell_flag);
 			struct ft_flip_txn *txn =
-				ft_flip_txn_create_bounded(
+				ft_flip_txn_create_bounded(ft,
 					FT_ORD_CELL_SWAP_PUBLISH_MAX_EDGES +
 					FT_HLIST_FREEZE_MAX_EDGES +
 					1 /* §4.B parent guard */);
@@ -4512,7 +4512,7 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 			 * replace retriable (@new_node restored to its fresh state).
 			 */
 			struct ft_flip_txn *txn =
-				ft_flip_txn_create_bounded(FT_PUB_SEDGE_MAX_EDGES +
+				ft_flip_txn_create_bounded(ft, FT_PUB_SEDGE_MAX_EDGES +
 					FT_HLIST_FREEZE_MAX_EDGES +
 					1 /* §4.B parent guard */);
 

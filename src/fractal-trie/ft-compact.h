@@ -89,7 +89,7 @@ void ft_compact_relocate_at(struct cds_ft *ft, struct cds_ft_inode_flag **holder
 				ft_node_skip_compressed(parent))) ?
 			FT_RELOCATE_COMMIT_MAX_EDGES + 1 : 2;
 
-		txn = ft_flip_txn_create_bounded(cap);
+		txn = ft_flip_txn_create_bounded(ft, cap);
 		if (!txn) {
 			*bail = -ENOMEM;
 			return;		/* OOM: best-effort, leave in place */
@@ -248,7 +248,7 @@ struct cds_ft_compressed_node *ft_compact_relocate_compressed(struct cds_ft *ft,
 		 * installed -- destroy the txn, free the unpublished copy, leave
 		 * @cn in place and stop the pass.
 		 */
-		struct ft_flip_txn *t = ft_flip_txn_create_bounded(3);
+		struct ft_flip_txn *t = ft_flip_txn_create_bounded(ft, 3);
 
 		if (!t) {
 			free_compressed_node_unpublished(ft, cn2);

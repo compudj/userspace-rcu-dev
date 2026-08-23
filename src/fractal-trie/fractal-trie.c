@@ -344,7 +344,7 @@ int _cds_ft_debug_cow_replace_root(struct cds_ft *ft)
 	if (old_root_meta->external_nodes)
 		return -EINVAL;			/* sub-step-2 scope */
 
-	txn = ft_flip_txn_create();
+	txn = ft_flip_txn_create(ft);
 	if (!txn)
 		return -ENOMEM;
 	/*
