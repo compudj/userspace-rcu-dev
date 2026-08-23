@@ -2334,6 +2334,32 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 * arms still owes a detach into a node this flip retires, and that is
 	 * the shape no writer expresses.
 	 */
+	/*
+	 * AN ELEVATING DETACH IS NOT EXPRESSIBLE YET, and it spins rather than
+	 * refuses, so it is caught here.  A one-child BP is emptied by the slot
+	 * drop, so the detach's climb does not stop on BP -- it ELEVATES and
+	 * recompacts BP's PARENT instead.  The hint this driver hands the detach
+	 * names BP's own junction (@d_src.ppnf, @d_src.pnfp), and its
+	 * @parent_guard then validates the recompacted node against a parent that
+	 * is not its own: the read-set guard fails, the lock-set acquire's commit
+	 * ABORTS, and the -EAGAIN sends the op round a loop that re-derives the
+	 * identical plan.  MEASURED with 8 writers: ~1.1M refusals, all from
+	 * ft_node_recompact's three-member acquire, all on the node that is also
+	 * the graft's publish parent, and the op never returns.
+	 *
+	 * A DROPPED old direction is exempt and is the shape that motivated
+	 * lifting the arity floor at all: there the split absorbs the slot drop
+	 * and no detach runs, so there is no climb to elevate.
+	 *
+	 * ☞ Lifting this needs the detach to RE-DERIVE the hint when it elevates
+	 * -- the climb knows the node it lands on, the driver cannot.  Until then
+	 * this is a capability gap, and UNCOVERED says so; a spin says nothing.
+	 */
+	if (!merge_dst && !glue.old_dir_dropped &&
+			ft_meta_nr_child_load(bp_meta) < 2) {
+		ret = FT_REKEY_UNCOVERED;
+		goto bail_build;
+	}
 	if ((ft_node_compressed(graft_p) && !merge_dst) ||
 			ft_node_skip_compressed(graft_p) ||
 			(d_src.pnf == graft_c &&
