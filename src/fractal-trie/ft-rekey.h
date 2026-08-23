@@ -2108,6 +2108,18 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		ft_lock_ctx_init(&bctx, &d_src, txn, optxn);
 		bctx.held.extra = marks;
 		bctx.held.nr_extra = nr_marks;
+		/*
+		 * ARM THE OLD-DIRECTION DROP.  When the dst key diverges inside
+		 * the very run S_top hangs off, that run's one child IS S_top --
+		 * the subtree @s_top_prime is the copy of -- so the split has no
+		 * old half to keep and the move owes no detach.  Naming the node
+		 * is the whole condition: a run has exactly one child, so
+		 * BP == the split node already says which edge goes.
+		 *
+		 * Set unconditionally -- the build only ever splits a compressed
+		 * node, so a plain BP can never match and needs no test here.
+		 */
+		glue.drop_old_dir_of = d_src.pnf;
 		prep = ft_graft_build(ft, dst_ord, dst_len, s_top_prime, cnt,
 			&d_dst, &glue, &bctx.held);
 	}
@@ -2241,17 +2253,22 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 * mutation" answer.  BP == the graft's publish PARENT is NOT among them:
 	 * the recompaction fold carries that shape (see @pending_pub_slot).
 	 *
-	 * NEITHER IS BP == the graft CHILD under a NOSPLIT prep: there the graft
+	 * NEITHER IS BP == the graft CHILD.  Under a NOSPLIT prep the graft
 	 * ADD-recompacts BP itself, and the detach's slot drop rides that same
 	 * copy via @pending_del_slot, so BP is superseded ONCE and its child
-	 * count is never transiently short (see the fold wired below).  A GLUE
-	 * prep builds a whole attach cluster instead of setting a slot in BP, so
-	 * it has no single copy to fold the drop into and keeps the term.
+	 * count is never transiently short.  Under a GLUE prep BP IS the run
+	 * the split retires, and there the build DROPS ITS OLD DIRECTION
+	 * (@drop_old_dir_of) -- so there is no second edit against that node
+	 * left to order.  The term therefore asks whether the build actually
+	 * took that path, not which prep it was: a GLUE split that KEPT both
+	 * arms still owes a detach into a node this flip retires, and that is
+	 * the shape no writer expresses.
 	 */
 	if ((ft_node_compressed(graft_p) && !merge_dst) ||
 			ft_node_skip_compressed(graft_p) ||
 			(d_src.pnf == graft_c &&
-				prep != FT_GRAFT_PREP_NOSPLIT) ||
+				prep != FT_GRAFT_PREP_NOSPLIT &&
+				!glue.old_dir_dropped) ||
 			d_src.ppnf == graft_c) {
 		ret = -EINVAL;
 		goto bail_build;
@@ -2496,7 +2513,13 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		 * ft_glue_txn_commit_edges records the +count walk from the stable
 		 * publish parent into the same commit.
 		 */
-		glue.count_delta = (long) cnt;
+		/*
+		 * NET ZERO when the old direction was dropped: the subtree LEAVES
+		 * the run and RE-ENTERS under the same publish parent's slot, so no
+		 * ancestor's key count moves -- the fresh path already carries the
+		 * moved count from build, and there is no detach to walk it back.
+		 */
+		glue.count_delta = glue.old_dir_dropped ? 0 : (long) cnt;
 		cds_ft_alloc_reserve_drain(ft, &reserve);	/* GLUE builds its own cluster */
 	} else {
 		/*
@@ -2639,7 +2662,13 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 * flag is set by the copy loop that actually consumed the drop, never by
 	 * the arming.
 	 */
-	if (!txn->pending_del_folded) {
+	/*
+	 * ...and skip it for the same reason when the GLUE split DROPPED the
+	 * old direction: the slot that would be cleared lives in a run this
+	 * flip retires WHOLE, and the fresh path published in its place never
+	 * held the src edge at all.
+	 */
+	if (!txn->pending_del_folded && !glue.old_dir_dropped) {
 		ft_lock_ctx_init(&lctx_src, &d_src, txn, optxn);
 		lctx_src.held.extra = marks;
 		lctx_src.held.nr_extra = nr_marks;

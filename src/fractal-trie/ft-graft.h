@@ -115,6 +115,40 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 		glue->split_cn_node = cn_meta;
 		glue->split_cn_node_snap = sh.node_snap;
 	}
+	/*
+	 * DROP THE OLD DIRECTION (@glue->drop_old_dir_of): @cn's one child is
+	 * a subtree this same decide MOVES, and @payload is its copy.  So the
+	 * old half of the split has nothing to hold -- build ONLY the new
+	 * key's path over the span @cn covered and publish that in its place.
+	 *
+	 * The path is @key[d->depth .. key_len), not the usual
+	 * [new_depth .. key_len): the prefix @cn shares with the new key is
+	 * that key's own bytes, so one ft_build_branch lays prefix, branch
+	 * byte and remainder in a single canonical run -- no branch node is
+	 * built for a fork that has only one arm left.
+	 *
+	 * @cn is fenced and deferred-freed exactly as the two-armed split
+	 * does, so the retire side is unchanged; only the built shape differs.
+	 * The displaced child gets NO deferred edge -- it is not re-parented,
+	 * it is left behind, and the caller retires it as part of the move.
+	 */
+	if (glue->drop_old_dir_of && glue->drop_old_dir_of == d->nf) {
+		struct cds_ft_inode_flag *canon, *top;
+		unsigned long moved_keys = src_count;
+
+		canon = ft_compress_single_child_if_needed(ft, payload, glue);
+		if (canon == (struct cds_ft_inode_flag *) (long) -ENOMEM)
+			return -ENOMEM;
+		top = ft_build_branch(ft, key, d->depth, (unsigned int) key_len,
+			canon, moved_keys, false, glue);
+		if (!top)
+			return -ENOMEM;
+		ft_glue_set_publish(ft, glue, d->pnf, d->nfp, top);
+		ft_glue_defer_free(glue, cn, true);
+		glue->attached_nf = top;
+		glue->old_dir_dropped = true;
+		return 0;
+	}
 	unsigned int suffix_len = cn->len - diverge_pos - 1;
 	uint8_t old_ordinal = cn->key_bytes[diverge_pos];
 	uint8_t new_ordinal = key[d->depth + diverge_pos];

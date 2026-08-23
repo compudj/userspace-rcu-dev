@@ -7343,6 +7343,31 @@ struct ft_glue {
 	 */
 	bool fence_split_cn;
 	/*
+	 * IN -- DROP THE OLD DIRECTION of the split.  Names the compressed node
+	 * whose ONE child is a subtree the caller is MOVING away in this same
+	 * decide: an in-trie rekey whose src junction hangs off the very run the
+	 * dst key diverges inside.  When the build splits exactly this node it
+	 * omits the old-direction half outright -- no suffix node, no branch, no
+	 * edge to the displaced child -- and lays a plain fresh path for the new
+	 * key over the span the run covered.  The old child is then unreachable
+	 * the instant the forward publish lands, which is what makes the move ONE
+	 * flip instead of a publish plus a detach.
+	 *
+	 * ☠ WHY IT CANNOT BE A DETACH INSTEAD.  Splitting a run RETIRES it, so a
+	 * detach that then clears a slot in that same node edits the copy this
+	 * flip already superseded -- its lock-set acquire aborts against the
+	 * pending tombstone and the op's retry loop re-derives the identical plan
+	 * forever.  Dropping the direction AT BUILD TIME is what removes the
+	 * second edit rather than trying to order it.
+	 *
+	 * The caller owes the identity: a compressed node has exactly one child,
+	 * so naming the node names the edge, and it must be the subtree whose
+	 * COPY this build's @payload is.
+	 */
+	struct cds_ft_inode_flag *drop_old_dir_of;
+	/* OUT: the build took that path, so the caller owes NO detach. */
+	bool old_dir_dropped;
+	/*
 	 * Node whose nr_keys == the grafted payload's key count, and from
 	 * whose parent the external-count propagation starts at commit.
 	 */
@@ -7477,6 +7502,8 @@ void ft_glue_init(struct ft_glue *g)
 	g->caller_holder = NULL;
 	g->split_cn_snap = 0;
 	g->fence_split_cn = false;
+	g->drop_old_dir_of = NULL;
+	g->old_dir_dropped = false;
 	g->attached_nf = NULL;
 	g->txn = NULL;
 	g->fuse_free_list = false;
