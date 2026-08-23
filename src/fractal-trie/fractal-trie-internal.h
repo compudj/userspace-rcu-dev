@@ -2117,6 +2117,17 @@ static __thread struct cds_fair_mutex_node ft_wlock_waiter;
 static __thread struct cds_ft *ft_wlock_held;
 static __thread unsigned long ft_wlock_depth;
 
+/*
+ * RED CONTROL for the rekey's single-recompaction fold -- a deliberately BROKEN
+ * build, never shipped and never a default.  It stops
+ * ft_rekey_graft_simple_attempt arming @pending_del_slot, so a same-junction
+ * move ATTACHES to BP and then DETACHES from it as two recompactions again: the
+ * second reads the child count of the copy the first retired, fuses a boundary
+ * that keeps two children, and retires a child the attach just re-parented.
+ * test_merge_rekey_same_trie then aborts on the engine's SW-xor-MW slot rule
+ * (urcu_txn_record_chain, r->kind == kind) -- which is the failure the fold
+ * exists to remove, so this knob is how that claim stays falsifiable.
+ */
 #ifdef FT_RED_REKEY_NOLOCK
 /*
  * RED CONTROL for inv_rekey_coarse_mixed_writers -- a deliberately BROKEN

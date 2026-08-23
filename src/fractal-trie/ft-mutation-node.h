@@ -1705,6 +1705,32 @@ int ft_node_recompact(enum ft_recompact mode,
 				if (mode == FT_RECOMPACT_DEL &&
 						src_slot == nullify_node_flag_ptr)
 					continue;
+				/*
+				 * FOLD the op's own pending slot drop into the
+				 * copy (see @pending_del_slot): this recompaction
+				 * supersedes the node the drop targets, so the
+				 * copy must be born WITHOUT the child.  Applied
+				 * BY IDENTITY on the slot, like the nullify above
+				 * and the publish below.
+				 */
+				if (retire_txn && retire_txn->pending_del_slot &&
+						src_slot == retire_txn->pending_del_slot) {
+					/*
+					 * PLAN EXPECTED-OLD, for the reason
+					 * @nullify_expected states: a peer that
+					 * republished this slot since the plan was
+					 * built holds a subtree "copy all but this
+					 * slot" would drop whole.  A parked flip
+					 * proxy fails the compare too.
+					 */
+					if (caa_unlikely(rcu_dereference(*src_slot) !=
+							retire_txn->pending_del_expected)) {
+						ret = -EAGAIN;
+						goto abandon_fresh;
+					}
+					retire_txn->pending_del_folded = true;
+					continue;
+				}
 				if (!ft_flip_txn_resolve_prio(retire_txn,
 						(void **) src_slot, &resolved)) {
 					ret = -EAGAIN;	/* CAP: retry higher-priority */
@@ -1818,6 +1844,32 @@ int ft_node_recompact(enum ft_recompact mode,
 				if (mode == FT_RECOMPACT_DEL &&
 						src_slot == nullify_node_flag_ptr)
 					continue;
+				/*
+				 * FOLD the op's own pending slot drop into the
+				 * copy (see @pending_del_slot): this recompaction
+				 * supersedes the node the drop targets, so the
+				 * copy must be born WITHOUT the child.  Applied
+				 * BY IDENTITY on the slot, like the nullify above
+				 * and the publish below.
+				 */
+				if (retire_txn && retire_txn->pending_del_slot &&
+						src_slot == retire_txn->pending_del_slot) {
+					/*
+					 * PLAN EXPECTED-OLD, for the reason
+					 * @nullify_expected states: a peer that
+					 * republished this slot since the plan was
+					 * built holds a subtree "copy all but this
+					 * slot" would drop whole.  A parked flip
+					 * proxy fails the compare too.
+					 */
+					if (caa_unlikely(rcu_dereference(*src_slot) !=
+							retire_txn->pending_del_expected)) {
+						ret = -EAGAIN;
+						goto abandon_fresh;
+					}
+					retire_txn->pending_del_folded = true;
+					continue;
+				}
 				if (!ft_flip_txn_resolve_prio(retire_txn,
 						(void **) src_slot, &resolved)) {
 					ret = -EAGAIN;

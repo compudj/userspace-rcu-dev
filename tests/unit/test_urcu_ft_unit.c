@@ -2230,7 +2230,7 @@ static int test_rekey_graft_liston(void)
 		int arc;
 
 		arc = _cds_ft_debug_rekey_graft_simple(ft, adj_src, 2, adj_dst, 2);
-		if (arc != -EINVAL) {
+		if (arc != 0) {
 			fprintf(stderr, "rekey-graft list-on: adjacency shape not rejected "
 				"(rc=%d)\n", arc);
 			drain_and_destroy(ft, group);
@@ -2461,19 +2461,51 @@ static int test_rekey_graft_cross_junction(void)
 	}
 
 	/*
-	 * SAME JUNCTION: {A,1,3} -> the free slot {A,1,7}.  The dst gap is clear of
-	 * the run's own neighbourhood (it sorts above the byte-5 sibling), so the
-	 * cell adjacency guard does NOT fire and the shape reaches the junction
-	 * gate, which must refuse it permanently.
+	 * SAME JUNCTION: {A,1,3} -> the free slot {A,1,7}.  Both the src slot and
+	 * the dst slot live in BP, so the move is a slot rename inside ONE node:
+	 * the graft ADD-recompacts BP and the detach's drop rides that same copy
+	 * (@pending_del_slot), which is the whole structural edit.  BP is
+	 * superseded once, its child set is right at birth, and the subtree keeps
+	 * every key -- only the byte that reaches it changes.
 	 */
 	rc = _cds_ft_debug_rekey_graft_simple(ft, a_key, 3, same_key, 3);
-	if (rc != -EINVAL) {
-		fprintf(stderr, "rekey-graft cross-junction: same-junction shape not "
-			"refused (rc=%d)\n", rc);
+	if (rc != 0) {
+		fprintf(stderr, "rekey-graft cross-junction: same-junction shape "
+			"failed (rc=%d)\n", rc);
 		drain_and_destroy(ft, group);
 		return -1;
 	}
-	if (rkx_check(ft, RKX_A, "after same-junction refusal")) {
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "rekey-graft cross-junction: verify failed after "
+			"same-junction move\n");
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+	rcu_read_lock();
+	before = _cds_ft_debug_child_at(ft, same_key, 3);
+	after = _cds_ft_debug_child_at(ft, a_key, 3);
+	if (!before || after || cds_ft_count_entries(ft) != RKX_NKEYS) {
+		rcu_read_unlock();
+		fprintf(stderr, "rekey-graft cross-junction: same-junction move left "
+			"src=%p dst=%p count=%lu\n", after, before,
+			cds_ft_count_entries(ft));
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+	rcu_read_unlock();
+	/*
+	 * Move it BACK, so the stages below still see the layout @rkx_keys
+	 * describes -- and so the rename is exercised in both directions (the
+	 * return trip drops the byte-7 slot and adds byte 3, the mirror fold).
+	 */
+	rc = _cds_ft_debug_rekey_graft_simple(ft, same_key, 3, a_key, 3);
+	if (rc != 0) {
+		fprintf(stderr, "rekey-graft cross-junction: same-junction return "
+			"failed (rc=%d)\n", rc);
+		drain_and_destroy(ft, group);
+		return -1;
+	}
+	if (rkx_check(ft, RKX_A, "after same-junction round trip")) {
 		drain_and_destroy(ft, group);
 		return -1;
 	}

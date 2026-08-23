@@ -909,6 +909,40 @@ struct ft_flip_txn {
 	 */
 	bool pending_pub_folded;
 	/*
+	 * THE OP'S PENDING SLOT DROP, carried so a recompaction of the node the
+	 * drop targets folds it into the copy it makes.  The mirror of
+	 * @pending_pub_slot above, reachable on the same geometry.
+	 *
+	 * A same-trie rekey whose src branch point IS the graft child both
+	 * ATTACHES to that node and DETACHES from it inside one decide.  The
+	 * attach ADD-recompacts it first, so a detach that then edits the node
+	 * addresses the copy the attach retired -- and DECIDES ITS SHAPE from
+	 * that copy's committed child count, which is short by the attach's
+	 * pending child.  A boundary that ends up keeping two children reads as
+	 * keeping one, and the chain-compress fuse retires a child the attach
+	 * has just re-parented onto its fresh copy.
+	 *
+	 * Folded, the surviving node is born with the new child present and the
+	 * dropped one absent: its child count is never transiently wrong, and
+	 * there is no second recompaction left to decide anything from.
+	 *
+	 * @pending_del_expected is the PLAN's expected-old, checked by identity
+	 * in the copy loop for the reason @nullify_expected states -- a peer that
+	 * republished the slot between the plan and the copy would otherwise have
+	 * its whole subtree dropped by a "copy every child except this slot".  A
+	 * peer's parked flip proxy cannot match it either, so it bails the same
+	 * way.
+	 */
+	struct cds_ft_inode_flag **pending_del_slot;
+	struct cds_ft_inode_flag *pending_del_expected;
+	/*
+	 * Set by the recompaction that FOLDED the drop above into its copy.  The
+	 * slot is then already absent from the surviving node, and clearing it a
+	 * second time would aim an edge at the superseded copy -- a slot no
+	 * reader reaches, on a node this same commit retires.
+	 */
+	bool pending_del_folded;
+	/*
 	 * MIXED sw/mw commit (DLM lock_fine): when true, the STRUCTURAL record
 	 * helpers (every ft_flip_txn_record_tag edge) plant SW-kind records -- a
 	 * plain locked park that CANNOT fail -- because the op holds the DLM
@@ -1096,6 +1130,9 @@ struct ft_flip_txn *ft_flip_txn_create(void)
 	t->pending_pub_slot = NULL;
 	t->pending_pub_val = NULL;
 	t->pending_pub_folded = false;
+	t->pending_del_slot = NULL;
+	t->pending_del_expected = NULL;
+	t->pending_del_folded = false;
 	t->structural_sw = false;	/* all-MW until a caller opts in under lock_fine */
 	t->sw_exempt_slot = NULL;
 	return t;
@@ -1308,6 +1345,9 @@ struct ft_flip_txn *ft_flip_txn_create_on(struct urcu_txn *op)
 	t->pending_pub_slot = NULL;
 	t->pending_pub_val = NULL;
 	t->pending_pub_folded = false;
+	t->pending_del_slot = NULL;
+	t->pending_del_expected = NULL;
+	t->pending_del_folded = false;
 	t->structural_sw = false;
 	t->sw_exempt_slot = NULL;
 	return t;
@@ -1355,6 +1395,9 @@ struct ft_flip_txn *ft_flip_txn_create_bounded_on(struct urcu_txn *op,
 	t->pending_pub_slot = NULL;
 	t->pending_pub_val = NULL;
 	t->pending_pub_folded = false;
+	t->pending_del_slot = NULL;
+	t->pending_del_expected = NULL;
+	t->pending_del_folded = false;
 	t->structural_sw = false;	/* all-MW until a caller opts in under lock_fine */
 	t->sw_exempt_slot = NULL;
 	return t;

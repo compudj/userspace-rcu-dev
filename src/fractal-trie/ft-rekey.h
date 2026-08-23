@@ -874,6 +874,7 @@ int ft_rekey_splice_pos_brackets(struct cds_ft *ft, const uint8_t *dst_ord,
  */
 #define FT_REKEY_UNCOVERED	(-EDOM)
 
+
 /*
  * A FOLDED COLLAPSE'S TWO LIFETIMES (struct ft_chain_compress_reclaim).  The
  * collapse records into this op's txn and commits nothing, so it hands its
@@ -2169,10 +2170,18 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 * tests pin that code as the "refused cleanly, permanently, before any
 	 * mutation" answer.  BP == the graft's publish PARENT is NOT among them:
 	 * the recompaction fold carries that shape (see @pending_pub_slot).
+	 *
+	 * NEITHER IS BP == the graft CHILD under a NOSPLIT prep: there the graft
+	 * ADD-recompacts BP itself, and the detach's slot drop rides that same
+	 * copy via @pending_del_slot, so BP is superseded ONCE and its child
+	 * count is never transiently short (see the fold wired below).  A GLUE
+	 * prep builds a whole attach cluster instead of setting a slot in BP, so
+	 * it has no single copy to fold the drop into and keeps the term.
 	 */
 	if ((ft_node_compressed(graft_p) && !merge_dst) ||
 			ft_node_skip_compressed(graft_p) ||
-			d_src.pnf == graft_c ||
+			(d_src.pnf == graft_c &&
+				prep != FT_GRAFT_PREP_NOSPLIT) ||
 			d_src.ppnf == graft_c) {
 		ret = -EINVAL;
 		goto bail_build;
@@ -2419,6 +2428,27 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		 * atomic publish, and under record_only its old copy stays LIVE until
 		 * the caller's commit, so the caller frees it post-commit.
 		 */
+		/*
+		 * ARM THE DETACH'S SLOT DROP ON THE GRAFT'S OWN COPY when BP is
+		 * the node this graft recompacts.  Both halves of the decide then
+		 * edit BP exactly once, in one copy: born holding the grafted
+		 * child and no longer holding S_top.  Without it the detach below
+		 * addresses -- and sizes its shape from -- the copy this prepare
+		 * retires, whose committed child count is short by the child
+		 * being added here.
+		 *
+		 * The expected-old is the LIVE flag the src descent resolved;
+		 * ft_rekey_cow_stop retires S_top's own state word and builds
+		 * S_top', but leaves BP's slot holding S_top until the commit.
+		 */
+		if (d_src.pnf == graft_c
+#ifdef FT_RED_NO_DEL_FOLD
+				&& 0	/* red control: see fractal-trie-internal.h */
+#endif
+		   ) {
+			txn->pending_del_slot = d_src.nfp;
+			txn->pending_del_expected = s_top;
+		}
 		cds_ft_alloc_reserve_activate(ft, &reserve);
 		{
 			/*
@@ -2440,8 +2470,16 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 				&octx.held, &gst_st);
 		}
 		if (gst == CDS_FT_STATUS_OK)
+			/*
+			 * NET count.  With the drop folded into this same copy the
+			 * subtree LEAVES and RE-ENTERS one node: BP' holds it under
+			 * the grafted byte instead of the src byte, so BP's key
+			 * count -- and every ancestor's -- is unchanged, and the
+			 * detach below that would have walked -@cnt does not run.
+			 */
 			gcst = ft_store_at_graft_point_commit(ft, &attached_nf, &adepth,
-					NULL /*run*/, &gst_st, (long) cnt);
+					NULL /*run*/, &gst_st,
+					txn->pending_del_folded ? 0 : (long) cnt);
 		cds_ft_alloc_reserve_deactivate(ft);
 		cds_ft_alloc_reserve_drain(ft, &reserve);
 		if (gst != CDS_FT_STATUS_OK || gcst != URCU_TXN_STATUS_OK) {
@@ -2510,56 +2548,70 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 * Under a coarse spacing S_top's fence lands on BP, which is exactly the
 	 * node this detach recompacts.
 	 */
-	ft_lock_ctx_init(&lctx_src, &d_src, txn, optxn);
-	lctx_src.held.extra = marks;
-	lctx_src.held.nr_extra = nr_marks;
 	/*
-	 * And the GLUE, which holds the rest -- the publish-parent fence above
-	 * all.  Under a coarse spacing that fence and BP's recompaction are ONE
-	 * word, so without this the detach refuses a fence this op took three
-	 * steps earlier.
+	 * SKIP THE DETACH ENTIRELY when its slot drop already rode the graft's
+	 * recompaction of BP (@pending_del_slot).  BP == graft_c means the src
+	 * slot and the grafted slot are BOTH IN BP, so the move is a slot rename
+	 * inside one node and that one copy is the whole structural edit: BP is
+	 * superseded ONCE, its child set is right at birth, and there is no
+	 * second recompaction left to size a shape from.
+	 *
+	 * Armed-but-not-folded falls through here and detaches normally -- the
+	 * flag is set by the copy loop that actually consumed the drop, never by
+	 * the arming.
 	 */
-	lctx_src.held.glue = &glue;
-	ret = ft_detach_node(ft, &lctx_src, d_src.nfp, d_src.pnfp, d_src.depth,
-			false /*free_detached_subtree: S_top is retired by cow_stop*/,
-			NULL /*fuse_cell: list off*/, &pub, NULL /*run*/,
-			NULL /*retire_glue*/, NULL /*freeze_leaf*/,
-			-(long) cnt, txn /*shared_txn*/, true /*record_only*/,
-			&(const struct ft_parent_hint){	/* BP's parent: held or acquired */
-				.parent = d_src.ppnf, .slot = d_src.pnfp,
-				.gp = NULL, .gp_slot = NULL,
-				.parent_held = src_parent_held,
-				.parent_guard = true },
-			&detach_rc /*old + fresh BP copies, reclaimed post-commit*/);
-	if (ret) {
+	if (!txn->pending_del_folded) {
+		ft_lock_ctx_init(&lctx_src, &d_src, txn, optxn);
+		lctx_src.held.extra = marks;
+		lctx_src.held.nr_extra = nr_marks;
 		/*
-		 * Pre-commit bail.  Reclaim EVERY unpublished fresh copy built so far --
-		 * S_top' AND the graft's relocated dst-parent copy (@gst_st.dest, whose
-		 * old counterpart is @gst_st.old_recompacted_node): the graft always
-		 * relocates the attach node, and under record_only nothing it built is
-		 * published until the caller's commit, so this arm owns the fresh copy
-		 * exactly as the commit-abort arm below does.  (@glue's own build is
-		 * covered by ft_glue_abort; nr_built is 0 for the NOSPLIT shape.)
-		 * REACHABLE: a peer holding BP -- or, in the non-shared-parent shape,
-		 * BP's own parent -- makes the detach's up-front lock-set acquire abort
-		 * -EAGAIN right here, as does a peer that re-homed BP since this
-		 * descent (the @parent_guard read-set validation).  The
-		 * single-threaded route -- a same-junction move (BP == the graft's
-		 * own attach node, hence already LOCK-held) -- is excluded: the shape
-		 * gate rejects it up front, before any of this is built.
+		 * And the GLUE, which holds the rest -- the publish-parent fence above
+		 * all.  Under a coarse spacing that fence and BP's recompaction are ONE
+		 * word, so without this the detach refuses a fence this op took three
+		 * steps earlier.
 		 */
-		pp_meta = NULL;		/* ft_glue_abort below is the single owner */
-		/* NULL on the merge path: no COW */
-		ft_rekey_free_stop_prime(ft, s_top_prime);
-		if (gst_st.old_recompacted_node)
-			free_cds_ft_node_unpublished(ft, ft_node_ptr(gst_st.dest));
-		ft_glue_abort(ft, &glue);
-			if (src_glue_live) {	/* merged cluster's src side */
-				ft_glue_abort(ft, &src_glue);
-				src_glue_live = false;
-			}
-		ft_flip_txn_destroy(txn);
-		goto sweep;
+		lctx_src.held.glue = &glue;
+		ret = ft_detach_node(ft, &lctx_src, d_src.nfp, d_src.pnfp, d_src.depth,
+				false /*free_detached_subtree: S_top is retired by cow_stop*/,
+				NULL /*fuse_cell: list off*/, &pub, NULL /*run*/,
+				NULL /*retire_glue*/, NULL /*freeze_leaf*/,
+				-(long) cnt, txn /*shared_txn*/, true /*record_only*/,
+				&(const struct ft_parent_hint){	/* BP's parent: held or acquired */
+					.parent = d_src.ppnf, .slot = d_src.pnfp,
+					.gp = NULL, .gp_slot = NULL,
+					.parent_held = src_parent_held,
+					.parent_guard = true },
+				&detach_rc /*old + fresh BP copies, reclaimed post-commit*/);
+		if (ret) {
+			/*
+			 * Pre-commit bail.  Reclaim EVERY unpublished fresh copy built so far --
+			 * S_top' AND the graft's relocated dst-parent copy (@gst_st.dest, whose
+			 * old counterpart is @gst_st.old_recompacted_node): the graft always
+			 * relocates the attach node, and under record_only nothing it built is
+			 * published until the caller's commit, so this arm owns the fresh copy
+			 * exactly as the commit-abort arm below does.  (@glue's own build is
+			 * covered by ft_glue_abort; nr_built is 0 for the NOSPLIT shape.)
+			 * REACHABLE: a peer holding BP -- or, in the non-shared-parent shape,
+			 * BP's own parent -- makes the detach's up-front lock-set acquire abort
+			 * -EAGAIN right here, as does a peer that re-homed BP since this
+			 * descent (the @parent_guard read-set validation).  The
+			 * single-threaded route -- a same-junction move (BP == the graft's
+			 * own attach node, hence already LOCK-held) -- is excluded: the shape
+			 * gate rejects it up front, before any of this is built.
+			 */
+			pp_meta = NULL;		/* ft_glue_abort below is the single owner */
+			/* NULL on the merge path: no COW */
+			ft_rekey_free_stop_prime(ft, s_top_prime);
+			if (gst_st.old_recompacted_node)
+				free_cds_ft_node_unpublished(ft, ft_node_ptr(gst_st.dest));
+			ft_glue_abort(ft, &glue);
+				if (src_glue_live) {	/* merged cluster's src side */
+					ft_glue_abort(ft, &src_glue);
+					src_glue_live = false;
+				}
+			ft_flip_txn_destroy(txn);
+			goto sweep;
+		}
 	}
 
 	/*
