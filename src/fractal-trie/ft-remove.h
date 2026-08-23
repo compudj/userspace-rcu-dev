@@ -1399,7 +1399,8 @@ void ft_canonicalize_chain_compress(struct cds_ft *ft,
  * (republished by the flip, freed UNPUBLISHED if the caller's commit ABORTS).
  * ft_detach_node surfaces both here (zeroed = no recompaction happened / not
  * record_only); NULL @recompact_out means the caller does not run a record_only
- * detach.
+ * detach.  An ELEVATING detach adds a third group with the OLD copy's lifetime:
+ * the orphan chain the upward walk cleared.
  */
 struct ft_detach_recompact_out {
 	struct cds_ft_inode *old_node;		/* retired copy: free on commit OK */
@@ -1411,6 +1412,19 @@ struct ft_detach_recompact_out {
 	 * NULL when no collapse happened.
 	 */
 	struct ft_chain_compress_reclaim collapse;
+	/*
+	 * An ELEVATING detach's orphan chain: the ancestors the upward walk
+	 * cleared plus the chain below the detach target, and the trailing
+	 * skip-compressed target if there is one.  Same lifetime as @old_node --
+	 * the caller's commit is what UNLINKS them, so they are freed when it
+	 * SUCCEEDS and left alone when it aborts (nothing unlinked them; a
+	 * reader is still entitled to be walking the chain).  Their
+	 * freeze-on-free tombstones were recorded into the caller's shared txn,
+	 * so they flip with that same unlink.
+	 */
+	struct cds_ft_inode_flag *orphans[FT_MAX_DEPTH];
+	int nr_orphans;
+	struct cds_ft_inode_flag *orphan_trailing;
 };
 
 static
@@ -2829,12 +2843,18 @@ int ft_detach_node(struct cds_ft *ft,
 				 * with the dst-attach + S_top COW the caller records into the
 				 * same txn; the caller runs the ONE commit and owns @commit_txn
 				 * (never freed here).  The caller pre-reserved it for the whole
-				 * fold.  Simple shape ONLY: BP > min_child (no orphan collapse,
-				 * no recompaction), so nr_to_free / retire_glue / freeze_leaf /
-				 * a recompact retire are all absent -- asserted below.
+				 * fold, an ELEVATING detach's orphan tombstones included.
+				 *
+				 * An ELEVATING detach IS expressible here: its orphan chain rides
+				 * @recompact_out with the RETIRED copy's lifetime (the caller's
+				 * commit is what unlinks it, so it is freed when that commit
+				 * lands), and every tombstone freezes into this same shared txn --
+				 * so the freeze flips with the unlink exactly as it does when this
+				 * detach commits for itself.  What remains out of scope is a
+				 * caller-supplied retire set or leaf freeze: the rekey fold passes
+				 * neither, and each would need a reclaim owner of its own.
 				 */
-				assert(nr_to_free == 0 && !trailing_skip_cn_flag &&
-					!retire_glue && !freeze_leaf);
+				assert(!retire_glue && !freeze_leaf);
 				commit_txn = shared_txn;
 			} else {
 				commit_txn = ft_flip_txn_create_bounded(
@@ -3034,11 +3054,31 @@ int ft_detach_node(struct cds_ft *ft,
 			 * into @commit_txn (pub) or standalone (list-off).
 			 */
 			if (!ret) {
-				for (fi = 0; fi < nr_to_free; fi++)
-					orphan_free[fi] = to_free[fi];
-				nr_orphan_free = nr_to_free;
-				orphan_trailing = trailing_skip_cn_flag;
-				free_orphans_pending = true;
+				/*
+				 * FOLD: this detach commits NOTHING, so the chain is
+				 * still live and linked when it returns -- the caller's
+				 * commit is the unlink.  Hand it out with the retired
+				 * copy's lifetime instead of arming the local deferred
+				 * free below, which would reclaim a node a reader is
+				 * entitled to be walking (and would free it even when
+				 * the caller's commit ABORTS and nothing unlinked it).
+				 */
+				if (record_only) {
+					if (recompact_out) {
+						for (fi = 0; fi < nr_to_free; fi++)
+							recompact_out->orphans[fi] =
+								to_free[fi];
+						recompact_out->nr_orphans = nr_to_free;
+						recompact_out->orphan_trailing =
+							trailing_skip_cn_flag;
+					}
+				} else {
+					for (fi = 0; fi < nr_to_free; fi++)
+						orphan_free[fi] = to_free[fi];
+					nr_orphan_free = nr_to_free;
+					orphan_trailing = trailing_skip_cn_flag;
+					free_orphans_pending = true;
+				}
 			}
 		}
 	}

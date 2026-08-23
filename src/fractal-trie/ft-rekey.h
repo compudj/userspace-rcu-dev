@@ -900,6 +900,33 @@ void ft_rekey_collapse_free_retired(struct cds_ft *ft,
 }
 
 /*
+ * An ELEVATING detach's ORPHAN CHAIN -- the ancestors its upward walk cleared,
+ * plus the trailing skip-compressed target.  Same lifetime as the retired chain
+ * above and for the same reason: THIS commit is what unlinks them, and their
+ * freeze-on-free tombstones rode it, so they are reclaimed here and nowhere
+ * else.  An ABORT leaves them live and linked, so no abort path frees them.
+ */
+static inline
+void ft_rekey_detach_free_orphans(struct cds_ft *ft,
+	struct ft_detach_recompact_out *rc)
+{
+	int i;
+
+	if (rc->orphan_trailing)
+		free_compressed_node(ft, ft_skip_to_compressed(ft,
+			rc->orphan_trailing));
+	for (i = 0; i < rc->nr_orphans; i++) {
+		if (ft_node_compressed(rc->orphans[i]))
+			free_compressed_node(ft,
+				ft_compressed_node_ptr(rc->orphans[i]));
+		else
+			free_cds_ft_node(ft, ft_node_ptr(rc->orphans[i]));
+	}
+	rc->nr_orphans = 0;
+	rc->orphan_trailing = NULL;
+}
+
+/*
  * MERGED NODE -- recorded but never published, so it is ours to reclaim when
  * the commit ABORTS or the op bails before it.  The retired chain is NOT freed
  * on these paths: nothing unlinked it, so it is still live.
@@ -2250,18 +2277,27 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 			 * past the point where there is an answer, and the shortfall
 			 * surfaces as a sticky -ENOMEM at the commit instead.
 			 *
-			 * The freeze term covers an orphan chain the same race admits: at
-			 * the gate's nr_child >= 2 the climb stops ON BP (a boundary is
-			 * nr_child > 1), so it elevates nothing and there are no orphans
-			 * -- but a peer that empties BP further reopens the elevation, and
-			 * the climb is bounded by the detach depth either way.
 			 */
 			(ft_group_skip_compressed(ft->group) ?
 				3 + 1 /* §4.B parent guard */
 				+ 1 /* back-edge (parent, offset) pair */
-				+ ft_freeze_reserve(ft, (unsigned int) d_src.depth + 1)
 				+ (ft->rank_stats ? (unsigned int) d_src.depth + 1 : 0) : 0) +
 #endif
+			/*
+			 * AN ELEVATING DETACH's orphan chain.  A one-child BP -- and a
+			 * compressed run is exactly that -- is EMPTIED by the slot drop,
+			 * so the detach's upward walk clears it and every one-child
+			 * ancestor above it, and each cleared node freezes into THIS txn.
+			 * The climb stops at the first boundary and can climb no higher
+			 * than the src depth, which is what bounds the term.
+			 *
+			 * Not gated on BP's arity, on the same reasoning the collapse term
+			 * above states: that read is a plan-time snapshot of a word peers
+			 * commit into, and a reservation is where OOM gets ANSWERED.  Nor
+			 * on skip-compression -- the walk elevates through plain nodes
+			 * just the same.
+			 */
+			ft_freeze_reserve(ft, (unsigned int) d_src.depth + 1) +
 			0)) {
 		ret = -ENOMEM;
 		goto bail_build;
@@ -2949,6 +2985,8 @@ cells_done:
 			free_cds_ft_node(ft, detach_rc.old_node);	/* old BP copy */
 		/* The folded collapse's retired chain: this commit unlinked it. */
 		ft_rekey_collapse_free_retired(ft, &detach_rc.collapse);
+		/* Likewise an ELEVATING detach's orphan chain. */
+		ft_rekey_detach_free_orphans(ft, &detach_rc);
 		/*
 		 * Old S_top after the grace period -- but ONLY on the cow_stop path.
 		 * The merge retires S_top through @src_glue's free list, so
