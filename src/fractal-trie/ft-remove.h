@@ -2407,6 +2407,18 @@ int ft_detach_node(struct cds_ft *ft,
 			ft_lock_ctx_init(&wlctx, wd_valid ? &wwd : NULL, NULL,
 				op_ctx ? op_ctx->op : NULL);
 			wlctx.held.extra = orphan_held;
+			/*
+			 * CHAIN to the caller's held set, for the same reason the
+			 * detach's own @lctx does: ft_lock_ctx_init NULLs .outer, so a
+			 * walk that does not restore it makes every orphan acquire BLIND
+			 * to the holds this op arrived with -- and reads its OWN mark as
+			 * a peer's.  ft_held_set_snap recurses through .outer and tests
+			 * each level's .glue, so the one link reaches the caller's txn
+			 * registry, its extra array and its glue alike.  The rekey fold
+			 * is the ctx that carries a glue, and it is exactly the caller
+			 * whose detach ELEVATES into this walk.
+			 */
+			wlctx.held.outer = op_ctx ? &op_ctx->held : NULL;
 
 			/* Phase 1: elevated ancestors. */
 			while (nr_to_free < nr_clear &&
