@@ -8978,6 +8978,17 @@ bool ft_glue_op_holds(const struct ft_glue *g,
  * guaranteed abort on every commit.  Measured, and it is why this is gated
  * rather than made unconditional.
  *
+ * AND ONLY UNDER LOCK_FINE, exactly as its sibling
+ * ft_glue_acquire_splice_holders.  The mark is a lock-set EXTENSION over a word
+ * the op's own DLM set does not cover, and it defends against ONE peer: the
+ * ft_meta_nr_child_inc of an insert BELOW @child.  It is FINE mode that leaves
+ * that peer unexcluded, because FINE is where the FT-wide writer mutex is
+ * dropped (§11) and the per-node lock-sets are the whole exclusion.  On a COARSE
+ * non-exclusive trie that peer holds the FT-wide mutex for its entire op -- the
+ * same mutex this op holds, and the very exclusion that licenses the SW park
+ * there -- so the mark has nobody to arbitrate against and the guard edge it
+ * would displace validates against a word no peer can move.
+ *
  * Returns -EAGAIN on a contended child; the caller aborts and re-descends, and
  * ft_glue_abort releases whatever was taken before the miss.
  */
@@ -8986,6 +8997,8 @@ int ft_glue_acquire_reparent_marks(struct cds_ft *ft, struct ft_glue *g)
 {
 	int i, j;
 
+	if (!ft->lock_fine)
+		return 0;
 	if (!g->txn || !g->txn->structural_sw)
 		return 0;
 	for (i = 0; i < g->nr_deferred; i++) {
@@ -9698,13 +9711,23 @@ enum urcu_txn_status ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue 
 	 * ft_glue_tombstone_free_list runs -- nothing of this commit has landed yet,
 	 * so a contended child is a clean transient.
 	 *
+	 * The gate MIRRORS the acquire's own (@ft->lock_fine + armed): this one
+	 * carries an assert on the ARMED STATE, not on the abort-returning path, so
+	 * a condition the acquire no-ops on must no-op here too or the assert names
+	 * states the acquire never sees.
+	 *
 	 * Only reachable under record_only, where @txn is the caller's and the
 	 * caller's single commit is still ahead: ABORT here is a genuine bail, not a
 	 * failure past the point of no return this function is otherwise specified
 	 * to run at.  Asserted rather than assumed, because that is the property
 	 * that makes returning ABORT from here legitimate.
+	 *
+	 * ☠ ARMING FINE (per-op lock-sets) MAKES NON-record_only GLUE TXNS ARMED and
+	 * this assert is what will say so.  The answer is not to relax it: the
+	 * acquire must be HOISTED ahead of the source unlink + drain, where a bail
+	 * is still clean, which is where ft_glue_acquire_splice_holders already sits.
 	 */
-	if (g->txn && g->txn->structural_sw) {
+	if (ft->lock_fine && g->txn && g->txn->structural_sw) {
 		assert(g->record_only);
 		if (ft_glue_acquire_reparent_marks(ft, g))
 			return URCU_TXN_STATUS_ABORT;
