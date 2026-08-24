@@ -5223,15 +5223,34 @@ enum urcu_txn_status ft_ord_cell_flip_into(struct cds_ft *ft,
 	unsigned int i;
 
 	for (i = 0; i < n; i++) {
+		uintptr_t tag = ft_edge_tag(&edges[i]);
+
+		/*
+		 * PER-EDGE KIND, exactly as in the record-only sibling
+		 * ft_ord_cell_record_into_ft: a trie ROOT and an ORDERED-CELL /
+		 * hlist edge (URCU_TXN_TAG) are both slots no lock-set owns, so
+		 * they record MW whatever @t's structural_sw mode; only a
+		 * STRUCTURAL trie edge takes the dispatch.  Recording a cell
+		 * through the dispatching helper would park the ordered list
+		 * under an armed txn -- the lane the conversion deliberately
+		 * leaves MW, and the lane whose clean MW abort is what lets the
+		 * mixed commit back out before any SW side effect.
+		 *
+		 * Unlike the sibling this path plants no §4.B installed-child
+		 * guard; that difference is pre-existing and untouched here.
+		 */
 		if (edges[i].root)
 			ft_flip_txn_record_root(t, (void **) edges[i].slot,
 				(void *) edges[i].old_target,
 				(void *) edges[i].new_target);
-		else
+		else if (tag == FT_FLIP_PROXY_TAG)
 			ft_flip_txn_record_tag(t, (void **) edges[i].slot,
 				(void *) edges[i].old_target,
-				(void *) edges[i].new_target,
-				ft_edge_tag(&edges[i]));
+				(void *) edges[i].new_target, tag);
+		else
+			ft_flip_txn_record_tag_mw(t, (void **) edges[i].slot,
+				(void *) edges[i].old_target,
+				(void *) edges[i].new_target, tag);
 	}
 	return ft_flip_txn_commit(ft, t);
 }
