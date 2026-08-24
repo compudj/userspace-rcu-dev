@@ -1136,6 +1136,27 @@ void ft_flip_txn_set_structural_sw(struct ft_flip_txn *t, bool v);
  * inside.  That mutex is a stronger exclusion than the per-node lock-set FINE
  * will have to argue slot by slot.
  *
+ * ARMED FOR EXCLUSIVE, at either granularity, and on a DIFFERENT argument --
+ * do not read the two as one rule.  An exclusive trie takes NO mutex at all
+ * (ft_writer_lock_scope_enter returns early on it, deliberately, so a
+ * cross-trie op can hold one live side's lock while an exclusive consumed
+ * source rides through the fused body).  The exclusion is the caller's
+ * single-writer contract, which cds_ft_make_exclusive also drains readers
+ * behind (ft_writer_lock_gp_wait before the flag is set).
+ *
+ * ☠ WHICH MAKES THE CROSS-TRIE DIRECTION THE THING TO CHECK, because a txn
+ * arms off the trie it NAMES while it may record a second trie's slots, and
+ * "exclusive" is a claim about one trie only.  The dst-named direction was
+ * already argued (an exclusive consumed src, guaranteed by the BUSY gate,
+ * writer-excludes the src slots).  The src-named direction is the new one, and
+ * it holds because those txns record NOTHING BUT their own trie's slots:
+ * ft_glue_apply_deferred's src pass stores rather than records for them (their
+ * edges are @live false), their root edges carry @root and are forced MW, and
+ * their ordered-cell edges carry URCU_TXN_TAG and are likewise forced MW.  The
+ * exclusivity itself spans the whole op -- the BUSY gates refuse a live
+ * swap_ft / src_ft up front, and the one place that MUTATES the flag
+ * (graft_swap handing swap_ft dst's discipline) runs after every commit.
+ *
  * Answering false leaves every content txn all-MW: stricter than necessary and
  * always sound.  The two callers that arm explicitly (the rekey writer, the root
  * COW) still do so on their own reasoning; this switch is what will retire that
@@ -1163,7 +1184,7 @@ bool ft_txn_content_sw_ok(const struct cds_ft *ft)
 {
 	if (!ft)
 		return false;		/* the acquire lane names no trie */
-	return !ft->lock_fine && !ft->exclusive;
+	return !ft->lock_fine || ft->exclusive;
 }
 
 /*
