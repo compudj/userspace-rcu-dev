@@ -607,24 +607,37 @@ the owner itself is absent).
 
 ### The readiness measurement — ☠ NO SITE CAN ARM YET
 
-`OWN_HELD` / `OWN_MISS` (ft-txn-kind-stats.h) run the same predicate on every
-record in EVERY mode, so a FINE **unarmed** run says whether an arm would be
-legal BEFORE the arm is written. They split `MW_STRUCT` exactly — the surface,
-by whether the op holds the word's owner — and `OWN_HELD + OWN_MISS ==
-MW_STRUCT` is an invariant of the table worth checking.
+`OWN_HELD` / `OWN_LEDGER` / `OWN_MISS` (ft-txn-kind-stats.h) run the same
+predicate on every record in EVERY mode, so a FINE **unarmed** run says whether
+an arm would be legal BEFORE the arm is written. They split `MW_STRUCT` exactly
+— the surface, by whether the op holds the word's owner — and their sum being
+`MW_STRUCT` is an invariant of the table worth checking.
 
-ft_inv, `FT_INV_MW=1`, 507 threads, per-node spacing, `build-tk`:
+The three columns are the two WITNESSES of a hold, plus neither. `OWN_HELD` is
+the txn's `locks[]` registry. `OWN_LEDGER` is `FEATURE_FT_HOLD_TRACE`'s
+per-thread ledger, maintained at the lock PRIMITIVES so it sees a hold
+whichever `ft_lock_ctx` frame filed it — a REGISTRY gap, not an exclusion gap.
+Neither subsumes the other, so the held set is the UNION: the ledger drops its
+entry the moment a release is *recorded* while the word keeps LOCK until that
+commit lands, and there the registry is the only witness. ☠ `OWN_LEDGER` reads
+a constant 0 without `-DFEATURE_FT_HOLD_TRACE`, and that zero is not evidence.
 
-| creation site | MW_STRUCT | OWN_HELD | owner-held |
-|---|---|---|---|
-| `ft-insert.h:776` — insert one-commit | 39,300,256 | 5,607,525 | **14.3%** |
-| `ft-remove.h:2877` — remove commit_rec | 39,201,793 | 4,033,801 | **10.3%** |
-| `ft-remove.h:3720` — publish-sedge | 14,924,241 | 0 | **0.0%** |
-| `ft-remove.h:882` — detach-side creator | 7,783,981 | 3,263,065 | **41.9%** |
-| `ft-remove.h:3946` — publish-sedge | 4,482,056 | 0 | **0.0%** |
-| `ft-graft.h:3463` | 2,115,340 | 0 | **0.0%** |
-| `ft-graft.h:1705` | 994,282 | 209,406 | 21.1% |
-| **TOTAL** | **109,929,466** | **13,114,407** | **11.9%** |
+ft_inv, `FT_INV_MW=1`, 507 threads, per-node spacing, `build-ownwide`
+(`--enable-rcu-debug CPPFLAGS="-DFT_DEBUG_TXN_KIND -DFEATURE_FT_HOLD_TRACE"`):
+
+| creation site | MW_STRUCT | registry | ledger | owner-held |
+|---|---|---|---|---|
+| `ft-insert.h:776` — insert one-commit | 41,124,651 | 5,991,155 | 0 | **14.6%** |
+| `ft-remove.h:2877` — remove commit_rec | 39,893,261 | 4,101,447 | 1,427,533 | **13.9%** |
+| `ft-remove.h:3735` — head promote | 12,977,124 | 4,325,708 | 0 | **33.3%** |
+| `ft-remove.h:882` — detach-side creator | 8,083,737 | 3,447,004 | 218,259 | **45.3%** |
+| `ft-remove.h:3958` — unchain publish | 5,010,706 | 0 | 0 | **0.0%** |
+| `ft-graft.h:3463` | 2,250,327 | 0 | 0 | **0.0%** |
+| `ft-graft.h:1705` | 1,080,992 | 198,055 | 136,632 | 31.0% |
+| **TOTAL** | **111,531,468** | **18,163,222** | **1,953,955** | **18.0%** |
+
+☠ ft_inv is concurrent and its totals move a few percent run to run, so compare
+COLUMNS WITHIN ONE RUN, never a percentage against an older run's.
 
 **NOT ONE creation site is owner-complete, so not one of the five sites below
 can arm as things stand** — the assert would fire at every one of them. That
@@ -632,38 +645,81 @@ is the finding, and it reorders the phase: the step per site is no longer
 "arm it", it is *make it owner-complete, prove it with the claim dry-run,
 then arm it*. The arm is the cheap half.
 
-### ☠ READ THE 11.9% AS A LOWER BOUND — the first task is the PREDICATE, not the locking
+### ☑ THE PREDICATE WAS PART-BLIND — measured, and it is worth 1.7 points
 
-The claim dry-run's very first abort proves it. Under
-`FT_RED_OWNER_CLAIM_ON_LOCK`, ft_unit aborts in
-`ft_flip_txn_record_retire_anchored` (ft-mutation-helpers.h:4679, reached from
-`ft_detach_node`), writing a node's own state word — and that line sits inside
-`if (h->lock == node || h->node_held)` **and** inside `if (h->shared ||
-h->node_held)`. Both conditions require the op to hold `node`'s own word. So
-the op demonstrably OWNS what it writes, and `ft_flip_txn_owns` says otherwise
-— because the hold came from an earlier member's acquire recorded in the
-`ft_held_anchor` / `ft_lock_ctx` ledger, not in `t->locks[]`.
+`ft_flip_txn_owns` asked the txn registry only, and the claim dry-run's first
+abort said that was too narrow: it landed in `ft_flip_txn_record_retire_anchored`
+(reached from `ft_detach_node`) inside `if (h->lock == node || h->node_held)`
+**and** `if (h->shared || h->node_held)` — both of which require the op to hold
+`node`'s own word. Structurally proven, no debugging needed: read the branch the
+frame is in.
 
-That is a FALSE NEGATIVE on the hottest retire path, structurally proven
-(no debugging needed — read the branch the frame is in). It does not weaken
-the assert, which only ever refuses a park; it means the gap between 11.9%
-and 100% is *some mixture* of real exclusion gaps and predicate blindness,
-and nobody should act on the split until the two are separated.
+Widening it to registry ∪ hold-ledger (`92e27199`) puts a number on it:
+**1,953,955 of 111,531,468 records, 1.7 points**, all of it at
+`ft-remove.h:2877` and `:882` and none at the insert site. The readiness
+conclusion does not move — no site is owner-complete — so the remainder can now
+be read as a REAL exclusion gap, which is what the site work needed.
 
-⇒ **The next step is to widen the predicate before widening the locking.**
-`ft_held_set_snap` already walks registry + extras + glue + outer; what a
-record helper lacks is the `ft_lock_ctx` to walk it from. Stash it on the txn
-under `--enable-rcu-debug` at the op entry points that own one, re-run the
-table, and only then read a site's remainder as a real exclusion gap.
+☠☠ **AND ITS FIRST ANSWER WAS A ZERO THAT WAS AN INSTRUMENT BUG.**
+`OWN_LEDGER` read 0 at every site over 110M records — not because the widening
+buys nothing, but because `ft_flip_txn_record_retire_anchored` called
+`ft_hold_trace_drop(node)` at the TOP, before planting the records that ask
+whether the op owns `node`. The one class where out-of-registry holds actually
+occur was erasing its own evidence. Two checks were needed and neither alone
+sufficed: a RED CONTROL (force the query true → every MISS moves to LEDGER,
+proving the wiring) and a LIVENESS PROBE (`return ft_hold_trace_n > 0` → 84.2M
+of 85.5M records are planted with a NON-EMPTY ledger, proving the zero was about
+*which* words it named). The red control alone would have "proved" the wiring
+and left the bug standing.
 
-The 0.0% rows are ONE class and it is already inventoried in the source:
-`FT_OWNER_NONE_EXTERNAL_HEAD` (11 sites) — an external head's back-channel
-word (`cell->parent`, `en->prev`, `next_node->prev`) has no owning lock at
-all, because neither a cell nor an external node carries a state word. §8.2
-puts the entry list under the HOLDER's lock, so closing this class means the
-holder's lock actually covering the chain, and it is worth **21.9M records**
-of the surface — a fifth of it, concentrated in three sites. It is the
-largest single item in Phase B and it is a design question, not plumbing.
+### The external-head class — ☠ NOT one design question, and the citation was phantom
+
+The 0.0% rows were recorded as ONE class, `FT_OWNER_NONE_EXTERNAL_HEAD` (11
+sites) — an external head's back-channel word (`cell->parent`, `en->prev`,
+`next_node->prev`) has no owning lock, because neither a cell nor an external
+node carries a state word — and as "the largest single item in Phase B, a
+design question, not plumbing", on the strength of *"§8.2 puts the entry list
+under the HOLDER's lock"*.
+
+☠ **§8.2 is "In-place mutation" (Phase F) and says nothing of the sort.** No
+section of this document assigns the entry list to the holder. The prescription
+had no basis here — the same shape as the "do NOT relax, hoist" instruction
+that dissolved at §9.5. Read the three rows apart and they are three different
+things:
+
+* **Head promote** (`ft-remove.h`, the `ft_promote_head` row). The holder was
+  never missing: it is a PARAMETER (`held_holder`), `@head_slot` is the holder's
+  own slot, and `ft_flip_txn_hold_or_lock_parent` REGISTERS it into this very
+  txn. The only obstacle was ORDERING — the `&next_node->prev` record was
+  planted before that call. Hoisting the acquire and naming
+  `ft_flag_to_metadata(ft, parent_nf)` took the row from **0.0% to 33.3%**, and
+  exactly so: 4,325,708 × 3 = 12,977,124, one owned back edge per two unowned
+  publish edges. Landed; it was plumbing, not design.
+* **Unchain publish** (`ft-remove.h:3958`) is NOT the external-head class at
+  all. Its acquire is already ahead of the publish; its edges arrive through
+  `struct ft_pub_rec`, whose `owner[3]` array **no producer ever fills**, so
+  every one of them is NULL by default. `ft_pub_rec_add` has no `owner`
+  parameter to fill it with. That is a PLUMBING item on the publish lane — add
+  the parameter, name the owner at its four call sites — and it is the same
+  two-thirds remainder the promote row still carries, so it is worth
+  substantially more than this one row.
+* **Back-edge re-parent of an external child** (`ft-graft.h:3463`, and the
+  `ft-insert.h` / glue sites) is the REAL design question, and it is the
+  SMALLEST of the three. `ft_reparent_record_meta` sets the convention —
+  `owner = meta`, the CHILD's own word — and an external has none. Closing it
+  is a CHOICE: give externals a state word (§8.1's layout split, Phase F), or
+  change the convention so a back edge is owned by the HOLDER. The phantom
+  citation assumed the second; it is a real option, simply never decided.
+
+☐ **Still unproven for all three, and it must not be skipped**: owner-AVAILABLE
+is not owner-SUFFICIENT. Nobody has yet shown the holder's lock EXCLUDES every
+writer of a chain member's `->prev` — an insert adding a duplicate, a
+rekey/graft moving the head, `cds_ft_compact` relocating cells
+(`ft-compact.h:403` writes `&head->prev`). The `ft-txn-hlist.h` `->prev` stores
+are a SEPARATE lane, MW_ALWAYS by design and out of scope (the G4 decision).
+Naming an owner only makes a site *eligible*; the exclusion argument is what
+the arm needs, and it gets its own adversarial skeptic.
+
 `FT_OWNER_UNPLUMBED` (1 site, `ft-compact.h`) is the other marker: the owner
 exists and is simply not in scope. Both are greppable.
 
@@ -675,9 +731,11 @@ claimed exclusion argument:
 
 1. `ft-insert.h:776` — the insert one-commit (39.3M; 14.3% held).
 2. `ft-remove.h:2877` — remove commit_rec (39.2M; 10.3% held).
-3. `ft-remove.h:3720` and `:3946` — the publish-sedge pair (19.4M; 0% held,
-   and 0% because it IS the external-head class — so this step is that
-   class's design question, not a per-site conversion).
+3. The PUBLISH LANE — `struct ft_pub_rec.owner[3]` is never filled, so every
+   edge a publish produces is unowned by default. `ft-remove.h:3958` is 100% of
+   that (0% held), and it is two-thirds of `ft-remove.h:3735` too. Add the
+   `owner` parameter to `ft_pub_rec_add` and name it at its four call sites;
+   this is plumbing and it moves more than any single site row.
 4. `ft-remove.h:882` — the detach-side creator (7.8M; 41.9% held, the closest
    to ready, and also the largest content-lane abort source).
 5. The remaining content sites in descending count.
@@ -973,12 +1031,16 @@ stale) — watch it across Phase B, it shares words with the converted sites.
                                                               measurement says NO site is
                                                               owner-complete (11.9% of the
                                                               surface); §4 has the table
-    Bx  the external-head class (FT_OWNER_NONE_EXTERNAL_HEAD) ☠ NEW, and it is the biggest
-                                                              single item in B: 21.9M records,
-                                                              3 sites at 0% owner-held, and a
-                                                              DESIGN question (§8.2 puts the
-                                                              entry list under the holder's
-                                                              lock; nothing enforces that today)
+    B0b the owner predicate: registry ∪ hold-ledger        ☑ LANDED @92e27199 — worth
+                                                              1.7 pts; its first zero was an
+                                                              INSTRUMENT BUG (§4)
+    Bx  the external-head class                            ☠ SPLIT IN THREE (§4), and the
+                                                              "§8.2" citation was PHANTOM.
+                                                              head promote ☑ LANDED (0%→33.3%,
+                                                              plumbing); publish-lane owner[]
+                                                              ☐ plumbing, the big one; external
+                                                              back-edge ☐ the real DESIGN call,
+                                                              and the smallest of the three
     B1-5 five hot sites, one at a time                      (each: owner-complete -> claim
                                                               dry-run -> arm; NOT mechanical)
     B6  retire hand-arming (rekey writer, root COW)         (small)
