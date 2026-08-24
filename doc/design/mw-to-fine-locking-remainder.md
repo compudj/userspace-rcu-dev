@@ -670,13 +670,53 @@ sites, which share its machinery.
 
 ### 9.2 The load-sensitive concurrency class
 
-`ft_inv` is clean alone and aborts with 4 concurrent process copies
-(`inv_remove_cross_view`), reproducible at the pre-split control commit. The
-single-process gate cannot see the class. Two obligations: add a
-multi-process arm to the gate, and root-cause it BEFORE Phase B
-certification — it is the one known FINE-mode concurrency failure, and
-arming SW content on top of an undiagnosed exclusion failure would convert
-its aborts into silent erasure (an SW park cannot fail).
+`ft_inv` is clean alone and was recorded aborting with 4 concurrent process
+copies (`inv_remove_cross_view`, plus aborts around the graft_swap solo
+family) at the pre-split control commit `6815f178`, at roughly a 50% per-round
+rate. The single-process gate cannot see the class. Two obligations: add a
+multi-process arm to the gate, and root-cause it BEFORE Phase B certification
+— it is the one known FINE-mode concurrency failure, and arming SW content on
+top of an undiagnosed exclusion failure would convert its aborts into silent
+erasure (an SW park cannot fail).
+
+**Obligation 1 — ☑ DONE `8adf179e`.** `ft_parallel_gate.sh` grew an `imwx`
+leg: `FT_GATE_COPIES` (default 4) concurrent copies on the default config,
+reported per copy, each keeping its own completeness checks and core dir.
+Proven to go red by a 2-second-timeout red control, not merely to run.
+
+**Obligation 2 — ☠ BLOCKED: IT NO LONGER REPRODUCES, and that is not the same
+as fixed.** Re-run 2026-08-24 at the very commit the failure was measured at
+(`6815f178`, worktree, `--enable-rcu-debug`, `FT_INV_MW=1`):
+
+    4 concurrent copies x 3 rounds     12/12 clean
+    8 concurrent copies x 2 rounds     16/16 clean
+    12 concurrent copies x 2 rounds    24/24 clean
+    16 concurrent copies x 2 rounds    32/32 clean
+    4 copies x 3 rounds under a concurrent `make -j96` churn loop   12/12 clean
+
+**96 clean runs where ~50% were expected to fail.** So the recorded repro
+conditions are INCOMPLETE — the variable that mattered was not captured. The
+leading hypothesis is that the original "control" tree was not clean
+`6815f178`: it is described as that commit *with the constructor split
+stashed*, and this working tree routinely carries other uncommitted WIP, so
+the control may have carried changes of its own. Machine load is the other
+candidate and is the one ruled out above.
+
+☞ **What this means for Phase B.** The obligation cannot be discharged by
+root-causing a failure that will not reproduce, and it must not be waved
+through either. Two things stand in for it, and BOTH are prerequisites:
+
+1. `imwx` above, so the class is visible from now on rather than only when
+   someone happens to run copies by hand.
+2. §4's **record-time owner assert**, which is the direct machine check for
+   precisely the hazard the gate exists to prevent — an SW park on a word the
+   op does not own. It converts "silent erasure" into an abort, which is what
+   made the undiagnosed failure dangerous in the first place. Build it BEFORE
+   arming any site (B1–B5), and run it under `imwx`.
+
+If the class resurfaces under `imwx`, catch a core
+(`tests/regression/ft_corecatch.sh`) and root-cause it then — the evidence
+will exist, which today it does not.
 
 ### 9.3 The deleted staged rekey writer
 
@@ -715,7 +755,10 @@ stale) — watch it across Phase B, it shares words with the converted sites.
     G1  reader-sufficiency answer                           ☑ ANSWERED YES 2026-08-23 — cleared
     A1  arm COARSE non-exclusive  + protocol §3             (small — step 2)
     A2  arm exclusive             + protocol §3             (small — step 3)
-    9.2 multi-process gate arm + root-cause cross_view      (medium, parallel)
+    9.2 multi-process gate arm                              ☑ LANDED 8adf179e
+    9.2 root-cause cross_view                               ☠ BLOCKED — 96 clean runs at
+                                                              its own control commit; §9.2
+                                                              names the two stand-ins
     9.1 rekey 109/111/122 fine-lock completion              (in flight)
     B   per-op arm helper + record-time owner assert        (medium)
     B1-5 five hot sites, one at a time                      (medium, mechanical tail)
