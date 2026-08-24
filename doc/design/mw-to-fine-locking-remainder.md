@@ -1,7 +1,7 @@
 # MW → fine locking: the remaining half — transition plan (2026-08-23)
 
-Status: **IN EXECUTION**. Branch `ft/unpub-free-audit` @ `a961c6e6` (G2 landed;
-next is step 2, A1).
+Status: **IN EXECUTION**. Branch `ft/unpub-free-audit` @ `543e7c53` (G2 and A1
+landed; next is step 3, A2 — arm exclusive).
 
 Companion docs: `mw-writer-lock-escalation-model.md` (the pivot's master note,
 §9 lock-sets / §11 migration posture), `ft-dlm-lock-coarseness.md` (the anchor
@@ -63,16 +63,64 @@ rekey site keeps `MW_STRUCT == 0`, and its expected small MW_STRUCT →
 MW_ALWAYS shift is **zero** — its baseline MW_STRUCT was already zero, so that
 writer records no roots in this workload.
 
-### Step 2 — A1: arm COARSE non-exclusive (one commit)
+### Step 2 — A1: arm COARSE non-exclusive — ☑ LANDED, FOUR commits
 
-Flip `ft_txn_content_sw_ok` (ft-mutation-helpers.h:1154) to the A1 predicate
-in §3. ⚠ Default-strategy tests run FINE — COARSE coverage comes from the
-`writer_lock_mode` unit tests and `inv_concurrent_writers_coarse_lock`; run
-those under build-tk and require armSW > 0 with MW_STRUCT moving to SW at
-the content sites they drive (a zero WITHOUT the armSW counter moving means
-the mechanism did not run — §10). Then the full §3 protocol: rcu-debug gate,
-smoke, 4-copy control, ASAN, fault builds; measure the ABORT column
-before/after and report against the 29% bound (§0).
+Not one commit, and not a predicate flip. The arm itself is
+`ft_txn_content_sw_ok` → `!ft->lock_fine && !ft->exclusive` (`543e7c53`), but
+three prerequisites had to land first, and each is the same lesson the §2/G2
+site map already taught:
+
+* `dc2cfde0` — **the glue's re-parent marks are a FINE-mode acquire.**
+  `ft_glue_acquire_reparent_marks` gated on arming while its sibling
+  `ft_glue_acquire_splice_holders` gates on `ft->lock_fine`; the mark defends
+  against ONE peer (`ft_meta_nr_child_inc` from an insert below the re-homed
+  child), and it is FINE that leaves that peer unexcluded. Behaviour-neutral
+  at the time it landed BY MEASUREMENT: 1,272,204 glue commits over the
+  FT_INV_MW plan, 26,787 armed, ZERO of them COARSE.
+* `a34db457` — **a deferred edge carries its own reader-reachability.**
+  `ft_glue_apply_deferred` chose store-vs-record from
+  `g->txn->structural_sw`, which answers how a record is KINDED, not whether
+  a reader can see the slot. The new `@live` bit is set at defer time and
+  selected the identical edge set under an equivalence probe (0 divergences
+  over 1,595,734 src-origin edges), so it too landed neutral.
+* `9ba72990` — `FT_TK_TXN_INIT` ran AFTER the constructor's arm decision, so
+  arming counted against an uninitialised `dbg_site`. Latent exactly as long
+  as nothing armed; the counter build faults inside the trie's insert path
+  the moment A1 lands, which reads as a trie defect rather than an instrument
+  that has not been told its own name.
+
+**The positive control** (`inv_concurrent_writers_coarse_lock`, build-tk):
+MW_STRUCT 369,694 → **0** across `ft-insert.h:769`, `ft-remove.h:2875` and
+`ft-remove.h:880`; armSW 0 → 8,898; SW 0 → 415,790; ABORT and MEMERR stay 0.
+`test_writer_lock_mode_*` (5) and both `*_coarse_lock` oracles run, not skip.
+
+**Protocol results.** rcu-debug gate 313 ok / 3 deliberate + 119/119; ASAN
+same, no AddressSanitizer report; fault-inject 367 ok / 3 + 119/119; the
+concurrent-copy control run like-for-like against a `5051c223` worktree built
+the same way — 4/4 and 8/8 clean on BOTH arms, so §9.2's pre-existing
+`inv_remove_cross_view` did not fire this time and the control bounds only
+NEW breakage, not the pre-existing rate.
+Reservations re-checked under `-DURCU_TXN_DEBUG_RESERVE` (proven to fire by
+under-reserving the graft glue txn into a red control): no overflow.
+
+☠ **THE ABORT COLUMN DOES NOT MOVE, and that is the correct outcome — do not
+go looking for A1's share of the 29%.** On a COARSE trie every writer holds
+the FT-wide mutex, so the content lanes had NO aborts to relieve: the coarse
+oracle's ABORT column is 0 before and 0 after. Over the whole FT_INV_MW plan
+the total abort RATE is 1.95–2.37% before and 1.82–2.39% after (n=3 each,
+alternated) — overlapping ranges, i.e. no effect distinguishable from
+run-to-run spread, while armSW rises 390k–475k → 544k–586k and SW 2.9M–3.6M →
+4.5M–4.8M. A single before/after pair reads as a 29% abort drop and is an
+artifact; the acquire lane, which A1 does not touch, moves further than the
+content lanes do. **The 29% content-lane bound is Phase B's to collect.**
+
+☞ What A1 buys is the record-kind conversion and the path it clears, not
+abort relief. Two red controls stand behind it: reverting `a34db457` under
+the arm aborts ft_unit at test 61 on `_ft_publish_to_parent_meta`'s
+`assert(cp != NULL)` and silently records 137 HIDDEN back-edges over the
+FT_INV_MW plan with every test still passing; reverting `dc2cfde0` alone is
+green. The 08-23e residual `not ok 70 inv_graft_swap_shared_dst_ksfix_solo`
+does NOT reproduce in any of the three configurations.
 
 ### Step 3 — A2: + exclusive (one commit)
 
@@ -418,7 +466,23 @@ Per-step protocol (same for every arming step in this plan):
    silently poisons the descriptor and the retry loop absorbs it.
 4. ft_unit + ft_inv (FT_INV_MW=1) + the 4-concurrent-copies control run
    (§9.2) + ASAN + the fault-inject builds that reach the abort arms.
-5. Measure the ABORT column before/after; report against the 29% bound.
+5. ABORT column, and ☠ **NOT against the 29% bound — that is an END-STATE
+   number and reporting it per step manufactures a false win.** While the
+   transition is incomplete the plan-wide total is dominated by the lanes
+   this step did NOT convert: the FINE tries still recording all-MW, plus the
+   acquire lane that is 71% of aborts and is never converted at all. So the
+   step-local signal is buried under run-to-run spread. Measured on A1: one
+   before/after pair reads as a 29% abort drop, and three alternated runs each
+   way dissolve it into overlapping ranges (1.95–2.37% vs 1.82–2.39%). What
+   the column IS good for per step:
+   * a **wrong-direction alarm** — an SW park cannot fail, so mis-arming does
+     not show up as an abort, but it often shows up as aborts RISING (an MW
+     guard edge whose expected-old now mismatches the op's own mark). Cheap,
+     keep it.
+   * a **per-mode baseline**, read on the oracles that actually DRIVE the
+     armed mode rather than on the plan total.
+   Never report a plan-wide abort delta from a single before/after pair; n>=3
+   alternated runs, or say nothing.
 
 Risk to keep in front: **an SW park cannot fail** — a wrongly-armed park does
 not abort, it silently erases a peer's committed edge. That is why each arm
