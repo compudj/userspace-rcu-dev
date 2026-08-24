@@ -5009,9 +5009,20 @@ void ft_flip_txn_lock_or_guard_parent_at(const char *fn, int line,
 						parent_nf);
 				return;
 			}
+			/*
+			 * REGISTER BEFORE RECORDING.  The op holds @held.lock --
+			 * that is why it is releasing it -- so the registry must
+			 * say so at the moment the release edge is planted, not
+			 * one line later: the record asks ft_flip_txn_owns who
+			 * owns the word it writes, and the answer has to be
+			 * already true.  Recording first made the whole acquire
+			 * lane report an exclusion gap it does not have.
+			 * ft_flip_txn_record_release_lock reads no registry, so
+			 * the order is free.
+			 */
+			ft_flip_txn_lock_register(t, held.lock, held.lock_snap);
 			ft_flip_txn_record_release_lock(t, held.lock,
 				held.lock_snap);
-			ft_flip_txn_lock_register(t, held.lock, held.lock_snap);
 			return;
 		}
 		/*
