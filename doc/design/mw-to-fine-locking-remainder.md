@@ -181,6 +181,13 @@ Gates: rcu-debug 313 ok / 3 deliberate + 119/119 with `FT_INV_MW=1`, no
 assertion; `FT_RED_OWNER_CLAIM_ON_LOCK` aborts on ft_unit's second test, by
 this assert's name. No abort claim applies (nothing converted).
 
+★ Behaviour-neutrality is MEASURED, not asserted: the full 13-config
+`ft_parallel_gate.sh` was run at this commit and at `4887aaab`, and **all 115
+legs are identical** — same ok / notok / abrt per leg. That is the strongest
+form of "changes nothing" available here, and it is what a step whose whole
+product is a DETECTOR should be held to. ☠ It also means the gate was already
+RED before this step: see §9.5.
+
 ☞ The owner is an UNCONDITIONAL parameter — unlike `FT_TK_SITE_PARAM`, which
 is knob-gated precisely so an instrument cannot perturb what it measures — so
 some sites now compute a metadata pointer a release build never reads.
@@ -840,6 +847,42 @@ through either. Two things stand in for it, and BOTH are prerequisites:
 If the class resurfaces under `imwx`, catch a core
 (`tests/regression/ft_corecatch.sh`) and root-cause it then — the evidence
 will exist, which today it does not.
+
+### 9.5 The gate is RED, in three PRE-EXISTING classes
+
+Found by running the full matrix at B0 and, as the control, at `4887aaab`:
+all 115 legs identical, so none of this is B0's and none of it is new. It is
+recorded here because it was not previously written down, and because the
+first class is a Phase B prerequisite that has come due EARLY.
+
+1. **`nocompress` / per-node — `assert(g->record_only)`.** `ft_unit` aborts
+   at `test_exclusive_graft_swap_inherit_non_root` (243 ok / 2 notok / 245
+   tests), in `ft_glue_txn_commit_edges` under
+   `ft->lock_fine && g->txn && g->txn->structural_sw`.
+
+   ☠ **This IS §4's prerequisite 1 — the `ft_glue_acquire_reparent_marks`
+   HOIST — and the trigger is not what was predicted.** The prediction was
+   that FINE arming would trip it at Phase B. It is EXCLUSIVE arming that
+   trips it, so **A2 (`f6093f8b`) is already red in a config it was never run
+   against**, and the hoist is due NOW rather than at B1. The answer is
+   unchanged and the comment at the assert already states it: hoist the
+   acquire above the source unlink + drain, as
+   `ft_glue_acquire_splice_holders` does. Do NOT relax the assert.
+
+   ☞ The lesson generalizes past this bug: A2's gate list (§4 step 3) was
+   ft_unit + ft_inv + ASAN + fault-inject + reserve + an 8-copy control, and
+   every one of them passed. None of them is the config that fails. An arming
+   step must be gated on the FEATURE-FLAG MATRIX, not on the default build.
+
+2. **`txndbg` and `anchorval` at `exponential` and `root-only` spacing.**
+   `ft_unit` aborts (291 and 236 tests in), and at root-only `ft_inv` aborts
+   after 73 tests on all three arms. `proxyassert` runs the same three
+   spacings and passes all of them, so this is not the coarse-spacing axis
+   alone — it is those two detectors ON that axis. Unattributed; no root
+   cause yet.
+
+Per-node — the default, and the spacing every other config runs at — is clean
+everywhere except class 1.
 
 ### 9.3 The deleted staged rekey writer
 
