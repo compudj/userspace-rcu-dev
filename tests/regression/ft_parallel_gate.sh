@@ -103,7 +103,7 @@ ALL_CONFIGS=(
 	# build mode first.  "default" keeps imw because the concurrent-writer
 	# and rekey oracles gate on FT_INV_MW at RUNTIME: without it they
 	# compile in and then skip, which reads as coverage and is not.
-	"default||u ion ioff imw"
+	"default||u ion ioff imw imwx"
 	# Fault injection drives the acquire bail + re-descend paths: those
 	# acquires never miss single-threaded, and the concurrent oracles merge
 	# DISJOINT key sets, so injection is the only thing that reaches them.
@@ -315,6 +315,77 @@ run_leg() {	# $1=cwd $2=timeout-secs ; $3.. = the command -- run it, echo its ou
 	  timeout "$tmo" "$@" 2>&1 )
 }
 
+run_leg_multi() {	# $1=name $2=cdir $3=spacing $4=bin $5=lib $6=outfile
+	# ★ THE MULTI-PROCESS ARM.  Every other leg runs ONE process, so the gate
+	# is structurally blind to the load-sensitive class: test_urcu_ft_inv is
+	# clean alone and has been recorded failing (`not ok inv_remove_cross_view`,
+	# aborts around the graft_swap solo family) only with several copies in
+	# flight.  A patch that "passes the gate" has therefore not been tested
+	# under load at all.
+	#
+	# Copies are SEPARATE PROCESSES on purpose, not more threads inside one:
+	# what the class needs is independent allocators, independent call_rcu
+	# worker sets and independent RCU grace-period domains competing for the
+	# same cores -- none of which raising a thread count inside one process
+	# reproduces.
+	#
+	# Reported per COPY, never merged: concatenating N TAP streams multiplies
+	# the ok-count and breaks the plan check that every other leg relies on to
+	# catch a hang, and an aggregate "notok=3" cannot say whether one copy
+	# failed three times or three copies failed once -- which is exactly the
+	# distinction this leg exists to make.
+	local name=$1 cdir=$2 sp=$3 bin=$4 lib=$5 out=$6
+	local n=${FT_GATE_COPIES:-4}
+	local i o rc ok notok plan ran clean=0 red=0 c
+	local -a pids=() dirs=()
+	for i in $(seq 1 "$n"); do
+		mkdir -p "$cdir/copy-$i"
+		dirs+=("$cdir/copy-$i")
+		( run_leg "$cdir/copy-$i" 1800 env LD_LIBRARY_PATH="$lib" \
+			CDS_FT_LOCK_SPACING="$sp" FT_INV_MW=1 "$bin" \
+			> "$cdir/copy-$i.out" 2>&1; echo $? > "$cdir/copy-$i.rc" ) &
+		pids+=($!)
+	done
+	wait "${pids[@]}" 2>/dev/null
+	for i in $(seq 1 "$n"); do
+		o=$(cat "$cdir/copy-$i.out" 2>/dev/null)
+		rc=$(cat "$cdir/copy-$i.rc" 2>/dev/null); rc=${rc:-99}
+		ok=$(printf '%s' "$o" | grep -c '^ok ')
+		notok=$(printf '%s' "$o" | grep -c '^not ok ')
+		plan=$(printf '%s' "$o" | sed -n 's/^1\.\.\([0-9]\{1,\}\)$/\1/p' | head -1)
+		ran=$((ok + notok))
+		# Same completeness checks as the single-process leg, and for the
+		# same reason: a HUNG copy emits no `not ok` and would otherwise
+		# score green on a partial run.
+		if [ "$notok" -gt 0 ] || [ "$rc" -ne 0 ] || [ -z "$plan" ] \
+				|| [ "$ran" -ne "$plan" ]; then
+			red=$((red + 1))
+			printf '%s' "$o" | grep '^not ok ' \
+				| sed "s/^/      [$name] ft_inv mwx $sp copy$i /" >> "$out"
+			if [ "$rc" -eq 124 ]; then
+				echo "$name: ft_inv mwx $sp copy$i INCOMPLETE (TIMEOUT/hang after $ran tests)" >> "$out"
+			elif [ "$rc" -gt 128 ]; then
+				echo "$name: ft_inv mwx $sp copy$i INCOMPLETE (killed by signal $((rc - 128)) after $ran tests)" >> "$out"
+			elif [ -z "$plan" ]; then
+				echo "$name: ft_inv mwx $sp copy$i NO TAP PLAN (completeness unverifiable)" >> "$out"
+			elif [ "$ran" -ne "$plan" ]; then
+				echo "$name: ft_inv mwx $sp copy$i INCOMPLETE (ran $ran of $plan planned)" >> "$out"
+			elif [ "$rc" -ne 0 ]; then
+				echo "$name: ft_inv mwx $sp copy$i NONZERO EXIT ($rc) with a complete run" >> "$out"
+			fi
+			c=$(ls "$cdir/copy-$i"/core* 2>/dev/null | head -1)
+			[ -n "$c" ] && echo "$name: ft_inv mwx $sp copy$i CORE kept -- LD_LIBRARY_PATH=$lib gdb $bin $c" >> "$out"
+		else
+			clean=$((clean + 1))
+			rm -rf "$cdir/copy-$i" "$cdir/copy-$i.out" "$cdir/copy-$i.rc"
+		fi
+	done
+	printf '  [%-11s] ft_inv mwx  %s copies=%s clean=%s red=%s\n' \
+		"$name" "$sp" "$n" "$clean" "$red" >> "$out"
+	[ "$red" -eq 0 ] && rm -rf "$cdir"
+	return 0
+}
+
 run_one() {	# $1=name $2=tests $3=spacings $4=cppflags -- build lib+tests, run TAP
 	local name=$1 tests=$2 spacings=${3:-} flags=${4:-}
 	[ -n "$spacings" ] || spacings=${FT_GATE_SPACINGS:-per-node}
@@ -437,6 +508,12 @@ run_spacing() {	# $1=name $2=tests $3=spacing $4=outfile -- every leg at ONE spa
 	for t in $tests; do
 		cdir=$cores/$sp-$t-$rep
 		mkdir -p "$cdir"
+		# The multi-process arm reports per copy and keeps its own cores, so
+		# it bypasses the single-process parsing below entirely.
+		if [ "$t" = imwx ]; then
+			run_leg_multi "$name" "$cdir" "$sp" "$I" "$LIB" "$out"
+			continue
+		fi
 		case $t in
 		u)    bin=$U; tmo=900;  lbl="ft_unit   "; env_x=() ;;
 		ion)  bin=$I; tmo=300;  lbl="ft_inv on "; env_x=() ;;
