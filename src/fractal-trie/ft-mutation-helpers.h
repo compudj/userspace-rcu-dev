@@ -7531,9 +7531,15 @@ struct ft_glue_deferred_edge {
 	 * src-origin child is drained by the early src unlink (applied at
 	 * apply_deferred); a dst-origin child stays reachable via the old dst
 	 * spine until the forward publish + dst drain, so its back-pointer flip
-	 * must wait (applied at apply_deferred_dst).  graft / graft_swap only
-	 * ever re-parent src-origin nodes, so this defaults to false and their
-	 * single apply_deferred call still wires every edge.
+	 * must wait (applied at apply_deferred_dst).
+	 *
+	 * ☠ THE NAME IS NARROWER THAN THE FLAG.  It reads "still reachable when
+	 * this commit runs, so RIDE the txn", and the graft paths set it for their
+	 * own live children too -- a displaced suffix child (ft-graft.h) and the
+	 * displaced external of a store-at-graft-point, which is dst-side but is
+	 * reached through a graft.  Only a child whose source is already unlinked
+	 * and drained leaves it false and takes the plain store.  @live is the
+	 * property actually consumed; this is one of its two sources.
 	 */
 	bool dst_origin;
 	/*
@@ -9320,6 +9326,49 @@ bool ft_glue_op_holds(const struct ft_glue *g,
 }
 
 /*
+ * ☠ THE EXCLUSIVE SKIP'S ONE OBLIGATION.
+ *
+ * Not taking the mark also means not DETECTING one: @held_lock stays false for
+ * every deferred entry, so a live re-parent records the §4.B MW guard, whose
+ * expected-old is the child's CLEAN live_state.  That is the right record iff
+ * the word really is clean -- and it is not if this op ALREADY holds the
+ * child's own word through one of its other lock sets.  The guard would then
+ * validate against a fence we planted ourselves and mismatch on every attempt:
+ * the deterministic self-abort ft_reparent_record_meta documents.
+ *
+ * No exclusive shape reaches here holding a re-parented child's word, so this
+ * STATES that instead of paying for a detection walk to discover it.  A claim
+ * with no behaviour attached is what makes it an assert and not a branch
+ * (FT_OWNER_ASSERT_OWNED is the same shape), and it is armed exactly where a
+ * violation would otherwise be absorbed by a retry loop.
+ *
+ * Both sets are asked because a word can be held from either: the glue's own
+ * lock sets (and its peer's, cross-trie) and the flip-txn registry.
+ */
+static
+void ft_glue_assert_reparent_unheld(struct cds_ft *ft, struct ft_glue *g)
+{
+#if defined(DEBUG_RCU) || defined(CONFIG_RCU_DEBUG)
+	int i;
+
+	for (i = 0; i < g->nr_deferred; i++) {
+		struct cds_ft_metadata *cm;
+
+		if (!g->deferred[i].live)
+			continue;
+		cm = ft_glue_reparent_park_meta(ft, g->deferred[i].child);
+		if (!cm)
+			continue;
+		urcu_assert_debug(!ft_glue_op_holds(g, cm));
+		urcu_assert_debug(!ft_flip_txn_owns(g->txn, cm));
+	}
+#else
+	(void) ft;
+	(void) g;
+#endif
+}
+
+/*
  * Acquire the lock acquire on every LIVE child this commit will re-parent.
  *
  * WHY.  Under structural_sw a re-parent RECORD is an SW park -- a plain store
@@ -9347,6 +9396,16 @@ bool ft_glue_op_holds(const struct ft_glue *g,
  * there -- so the mark has nobody to arbitrate against and the guard edge it
  * would displace validates against a word no peer can move.
  *
+ * AND NOT ON AN EXCLUSIVE TRIE, for that same reason carried one step further.
+ * The peer the mark arbitrates against is a concurrent WRITER, and an exclusive
+ * trie has none at all -- a stronger exclusion than the COARSE mutex, which at
+ * least admits one writer at a time.  @lock_fine is a GROUP property and
+ * @exclusive a per-trie one, so the two are independent and a FINE trie can be
+ * exclusive; taking the mark there costs an acquire that can only refuse, from
+ * a caller whose bail is a genuine abort.  ft_glue_txn_commit_edges mirrors
+ * this gate EXACTLY and asserts on the arming state, so the two must move
+ * together.
+ *
  * Returns -EAGAIN on a contended child; the caller aborts and re-descends, and
  * ft_glue_abort releases whatever was taken before the miss.
  */
@@ -9355,7 +9414,7 @@ int ft_glue_acquire_reparent_marks(struct cds_ft *ft, struct ft_glue *g)
 {
 	int i, j;
 
-	if (!ft->lock_fine)
+	if (!ft->lock_fine || ft->exclusive)
 		return 0;
 	if (!g->txn || !g->txn->structural_sw)
 		return 0;
@@ -10093,15 +10152,24 @@ enum urcu_txn_status ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue 
 	 * to run at.  Asserted rather than assumed, because that is the property
 	 * that makes returning ABORT from here legitimate.
 	 *
-	 * ☠ ARMING FINE (per-op lock-sets) MAKES NON-record_only GLUE TXNS ARMED and
-	 * this assert is what will say so.  The answer is not to relax it: the
-	 * acquire must be HOISTED ahead of the source unlink + drain, where a bail
-	 * is still clean, which is where ft_glue_acquire_splice_holders already sits.
+	 * ☠ AN EXCLUSIVE TRIE IS NOT record_only AND MUST NOT ASSERT.  It arms
+	 * @structural_sw through the constructor's `!lock_fine || exclusive` arm, so
+	 * a FINE exclusive trie satisfies this gate on every glue txn -- graft
+	 * attach, graft_swap and cds_ft_merge_at into an exclusive destination all
+	 * arrive here with @record_only false.  The acquire has nothing to do for
+	 * them (the mark arbitrates against a concurrent writer, which an exclusive
+	 * trie does not have), so the gate excludes them rather than the assert
+	 * admitting them: the assert keeps naming exactly the state it was written
+	 * for, an ARMED committer whose bail must be clean.
 	 */
 	if (ft->lock_fine && g->txn && g->txn->structural_sw) {
-		assert(g->record_only);
-		if (ft_glue_acquire_reparent_marks(ft, g))
-			return URCU_TXN_STATUS_ABORT;
+		if (ft->exclusive) {
+			ft_glue_assert_reparent_unheld(ft, g);
+		} else {
+			assert(g->record_only);
+			if (ft_glue_acquire_reparent_marks(ft, g))
+				return URCU_TXN_STATUS_ABORT;
+		}
 	}
 
 	/*

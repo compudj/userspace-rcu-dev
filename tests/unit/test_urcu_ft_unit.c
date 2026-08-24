@@ -73,9 +73,9 @@
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (354 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (356 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (303 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (305 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -11197,7 +11197,7 @@ out:
  * compressed "mango"; the moved run must land in dst's cell list in key order
  * ("mango" < "mb..."), with src's list left consistent.
  */
-static int merge_rerooted_glue_ordered(int shape)
+static int merge_rerooted_glue_ordered(int shape, bool excl_dst)
 {
 	struct cds_ft_group_attr *attr;
 	struct cds_ft_group *group;
@@ -11235,6 +11235,8 @@ static int merge_rerooted_glue_ordered(int shape)
 			goto out;
 		}
 		cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
+		if (excl_dst)
+			cds_ft_make_exclusive(dst);
 		s = cds_ft_merge_at(dst, (const uint8_t *) "mb", 2, src,
 				(const uint8_t *) "a", 1);
 	} else if (shape == 1) {
@@ -11244,6 +11246,8 @@ static int merge_rerooted_glue_ordered(int shape)
 			goto out;
 		}
 		cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
+		if (excl_dst)
+			cds_ft_make_exclusive(dst);
 		s = cds_ft_merge_at(dst, (const uint8_t *) "mb", 2, src,
 				(const uint8_t *) "x", 1);
 	} else {
@@ -11254,6 +11258,8 @@ static int merge_rerooted_glue_ordered(int shape)
 			goto out;
 		}
 		cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
+		if (excl_dst)
+			cds_ft_make_exclusive(dst);
 		s = cds_ft_merge_at(dst, (const uint8_t *) "mb", 2, src,
 				(const uint8_t *) "ca", 2);
 	}
@@ -11329,7 +11335,7 @@ static int test_merge_rerooted_glue_ordered_ext(void)
 			"(-DNO_FEATURE_FT_MERGE)");
 		return 0;
 	}
-	return merge_rerooted_glue_ordered(0);
+	return merge_rerooted_glue_ordered(0, false);
 }
 
 static int test_merge_rerooted_glue_ordered_compressed(void)
@@ -11339,7 +11345,34 @@ static int test_merge_rerooted_glue_ordered_compressed(void)
 			"(-DNO_FEATURE_FT_MERGE)");
 		return 0;
 	}
-	return merge_rerooted_glue_ordered(1);
+	return merge_rerooted_glue_ordered(1, false);
+}
+
+
+/*
+ * The same three shapes with an EXCLUSIVE DESTINATION, which is what carries
+ * them through ft_glue_txn_commit_edges' armed gate.
+ *
+ * cds_ft_merge_at requires only its SOURCE to be exclusive; the destination's
+ * mode is unrestricted, and the glue commit runs on @dst_ft.  A FINE dst that
+ * is also exclusive therefore arms @structural_sw (the constructor's
+ * `!lock_fine || exclusive` arm) with @record_only FALSE -- the one combination
+ * the rest of the suite never builds, because every other merge test makes only
+ * the src exclusive.  Without the exclusive gate on the re-parent acquire this
+ * aborts on assert(g->record_only), in EVERY feature configuration.
+ */
+static int test_merge_rerooted_glue_ordered_exclusive_dst(void)
+{
+	int shape, ret = 0;
+
+	if (!cds_ft_merge_enabled()) {
+		diag("test_merge_rerooted_glue_ordered_exclusive_dst: skipped, "
+			"merge compiled out (-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
+	for (shape = 0; shape < 3; shape++)
+		ret |= merge_rerooted_glue_ordered(shape, true);
+	return ret;
 }
 
 static int test_merge_rerooted_glue_ordered_key_shorter(void)
@@ -11349,7 +11382,7 @@ static int test_merge_rerooted_glue_ordered_key_shorter(void)
 			"(-DNO_FEATURE_FT_MERGE)");
 		return 0;
 	}
-	return merge_rerooted_glue_ordered(2);
+	return merge_rerooted_glue_ordered(2, false);
 }
 
 /*
@@ -25161,6 +25194,106 @@ out_dst:
 	return ret;
 }
 
+
+/*
+ * cds_ft_merge_at into a dst whose merge point is COMPRESSED and internal, on a
+ * FINE group, with an EXCLUSIVE DESTINATION.
+ *
+ * The plain-shape companion to test_merge_rerooted_glue_ordered_exclusive_dst:
+ * the same unrestricted-dst-mode contract, reached through the ordinary
+ * apply_deferred half rather than the run-splice commit.  Merging into an
+ * exclusive dst is a supported sequence -- cds_ft_make_exclusive is a general
+ * transition and cds_ft_merge_at constrains only @src_ft -- so it must produce
+ * the ordinary merge result.
+ */
+static int test_merge_at_exclusive_dst(void)
+{
+	if (!cds_ft_merge_enabled()) {
+		diag("test_merge_at_exclusive_dst: skipped, merge compiled out "
+			"(-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
+	struct cds_ft_group *group;
+	struct cds_ft *dst, *src;
+	enum cds_ft_status s;
+	int ret = -1;
+	static const char *const dkeys[] = { "Pabc", "Z" };
+	static const char *const skeys[] = { "x", "y" };
+	const struct merge_expected dst_after[] = {
+		{ "Pabc", 4 }, { "Px", 2 }, { "Py", 2 }, { "Z", 1 },
+	};
+	unsigned int i;
+	unsigned long total;
+
+	dst = create_varlen_fine_lock_ft(&group);
+	if (cds_ft_create(group, NULL, &src) < 0)
+		goto out_dst;
+
+	for (i = 0; i < CAA_ARRAY_SIZE(dkeys); i++) {
+		struct ft_test_node *n = node_alloc(0);
+
+		s = cds_ft_insert(dst, (const uint8_t *) dkeys[i],
+				strlen(dkeys[i]), &n->node);
+		if (s != CDS_FT_STATUS_OK) { node_free(n); goto out; }
+	}
+	for (i = 0; i < CAA_ARRAY_SIZE(skeys); i++) {
+		struct ft_test_node *n = node_alloc(0);
+
+		s = cds_ft_insert(src, (const uint8_t *) skeys[i],
+				strlen(skeys[i]), &n->node);
+		if (s != CDS_FT_STATUS_OK) { node_free(n); goto out; }
+	}
+
+	cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
+	cds_ft_make_exclusive(dst);	/* and the destination too */
+	s = cds_ft_merge_at(dst, (const uint8_t *) "P", 1, src, NULL, 0);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "merge_at_exclusive_dst: %s\n",
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+	if (!cds_ft_empty(src)) {
+		fprintf(stderr, "merge_at_exclusive_dst: src not empty\n");
+		goto out;
+	}
+	rcu_read_lock();
+	for (i = 0; i < CAA_ARRAY_SIZE(dst_after); i++) {
+		struct cds_ft_node *found = NULL;
+
+		if (cds_ft_eager_lookup_key(dst,
+				(const uint8_t *) dst_after[i].key,
+				dst_after[i].key_len, 0,
+				&found) != CDS_FT_STATUS_OK || !found) {
+			rcu_read_unlock();
+			fprintf(stderr, "merge_at_exclusive_dst: missing '%s'\n",
+				dst_after[i].key);
+			goto out;
+		}
+	}
+	total = cds_ft_count_entries(dst);
+	if (cds_ft_verify(dst, stderr) != CDS_FT_STATUS_OK) {
+		rcu_read_unlock();
+		fprintf(stderr, "merge_at_exclusive_dst: verify failed\n");
+		goto out;
+	}
+	rcu_read_unlock();
+	if (total != 4) {
+		fprintf(stderr, "merge_at_exclusive_dst: %lu entries, expected 4\n",
+			total);
+		goto out;
+	}
+	ret = 0;
+out:
+	drain_trie(dst);
+	drain_trie(src);
+	rcu_barrier();
+	cds_ft_destroy(src);
+out_dst:
+	cds_ft_destroy(dst);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
 /*
  * Merge into a COMPRESSED non-root dst merge point where the result M is
  * itself COMPRESSED (both sides compressed runs sharing a prefix), published
@@ -33551,6 +33684,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_merge_rerooted_glue_ordered_ext);
 	RUN_TEST(test_merge_rerooted_glue_ordered_compressed);
 	RUN_TEST(test_merge_rerooted_glue_ordered_key_shorter);
+	RUN_TEST(test_merge_rerooted_glue_ordered_exclusive_dst);
 	RUN_TEST(test_merge_subpos_branch_reserve);
 	RUN_TEST(test_merge_rerooted_nosplit_ordered_atnode);
 	RUN_TEST(test_merge_rerooted_nosplit_ordered_branch);
@@ -33750,6 +33884,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_merge_at_external_dst);
 	RUN_TEST(test_merge_at_external_dst_splice);
 	RUN_TEST(test_merge_at_compressed_dst_internal);
+	RUN_TEST(test_merge_at_exclusive_dst);
 	RUN_TEST(test_merge_at_compressed_dst_compressed);
 	RUN_TEST(test_merge_at_key_shorter_dst_internal);
 	RUN_TEST(test_merge_at_key_shorter_dst_splice);
