@@ -387,6 +387,15 @@ void ft_tk_dump_at_exit(void)
 	bool dbg_lock_take;						\
 	bool dbg_ended;
 
+/*
+ * ☠ FIRST, before ANY other counting call on @t.  Every other FT_TK_* macro
+ * reads @t->dbg_site to find the row it credits, and a constructor's @t comes
+ * from malloc -- so a count taken before this one dereferences uninitialised
+ * memory as a struct ft_tk_site *.  It does not read as an instrumentation bug
+ * when it lands, either: the fault is inside the trie's own hot path, on a
+ * thread doing ordinary work.  FT_TK_COUNT_ARMED is the one that will find it,
+ * because arming is decided inside the constructor itself.
+ */
 #define FT_TK_TXN_INIT(t, site)						\
 	do {								\
 		(t)->dbg_site = (site);					\

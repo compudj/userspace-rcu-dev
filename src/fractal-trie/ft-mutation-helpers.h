@@ -1189,9 +1189,9 @@ struct ft_flip_txn *ft_flip_txn_create_at(FT_TK_SITE_PARAM struct cds_ft *ft)
 	t->pending_del_folded = false;
 	t->structural_sw = false;	/* all-MW until a caller opts in under lock_fine */
 	FT_ROOT_ASSERT_INIT(t, ft);
+	FT_TK_TXN_INIT(t, dbg_site);	/* names @t before anything counts against it */
 	if (ft_txn_content_sw_ok(ft))
 		ft_flip_txn_set_structural_sw(t, true);
-	FT_TK_TXN_INIT(t, dbg_site);
 	return t;
 }
 
@@ -1409,9 +1409,9 @@ struct ft_flip_txn *ft_flip_txn_create_on_at(FT_TK_SITE_PARAM
 	t->pending_del_folded = false;
 	t->structural_sw = false;
 	FT_ROOT_ASSERT_INIT(t, ft);
+	FT_TK_TXN_INIT(t, dbg_site);	/* names @t before anything counts against it */
 	if (ft_txn_content_sw_ok(ft))
 		ft_flip_txn_set_structural_sw(t, true);
-	FT_TK_TXN_INIT(t, dbg_site);
 	return t;
 }
 
@@ -1462,9 +1462,9 @@ struct ft_flip_txn *ft_flip_txn_create_bounded_on_at(FT_TK_SITE_PARAM
 	t->pending_del_folded = false;
 	t->structural_sw = false;	/* all-MW until a caller opts in under lock_fine */
 	FT_ROOT_ASSERT_INIT(t, ft);
+	FT_TK_TXN_INIT(t, dbg_site);	/* names @t before anything counts against it */
 	if (ft_txn_content_sw_ok(ft))
 		ft_flip_txn_set_structural_sw(t, true);
-	FT_TK_TXN_INIT(t, dbg_site);
 	return t;
 }
 
