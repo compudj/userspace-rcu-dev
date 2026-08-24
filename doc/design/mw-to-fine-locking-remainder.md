@@ -1,8 +1,10 @@
 # MW → fine locking: the remaining half — transition plan (2026-08-23)
 
-Status: **IN EXECUTION**. Branch `ft/unpub-free-audit` @ `f6093f8b` (Phase A is
-COMPLETE — G2, A1 and A2 landed; next is Phase B, per-op FINE, which §4 gates
-behind the arm-from-held-set helper and the record-time owner assert).
+Status: **IN EXECUTION**. Branch `ft/unpub-free-audit` (Phase A is COMPLETE —
+G2, A1 and A2 landed; Phase B's mechanism — the owner parameter, the
+record-time assert and its readiness counters — is LANDED as step B0, and its
+first measurement says NO site is owner-complete yet, so each B1-B5 step now
+opens by closing that site's ownership gap: §4).
 
 Companion docs: `mw-writer-lock-escalation-model.md` (the pivot's master note,
 §9 lock-sets / §11 migration posture), `ft-dlm-lock-coarseness.md` (the anchor
@@ -168,12 +170,30 @@ step protocol above.
 FINE (a per-op argument, Phase B) and the root-COW driver names an arbitrary
 trie. Both still arm on their own reasoning.
 
+### Step 4 — B0: the record-time owner mechanism — ☑ LANDED
+
+The owner parameter, the record-time assert, the dry-run claim and its red
+control, plus the `OWN_HELD`/`OWN_MISS` readiness counters — all in §4, with
+the measurement they produced. Behaviour-neutral by construction: the owner is
+read only under `--enable-rcu-debug`, and no site arms per-op yet.
+
+Gates: rcu-debug 313 ok / 3 deliberate + 119/119 with `FT_INV_MW=1`, no
+assertion; `FT_RED_OWNER_CLAIM_ON_LOCK` aborts on ft_unit's second test, by
+this assert's name. No abort claim applies (nothing converted).
+
+☞ The owner is an UNCONDITIONAL parameter — unlike `FT_TK_SITE_PARAM`, which
+is knob-gated precisely so an instrument cannot perturb what it measures — so
+some sites now compute a metadata pointer a release build never reads.
+Measured rather than argued, like-for-like `-g -O2`: `liburcu-cds` text
+603,177 B before, 602,853 B after (**−324 B**). The optimizer drops the
+derivations; the parameter is free where it is not read.
+
 ### Then
 
-Phase B (per-op FINE) needs the arm-from-held-set helper and the record-time
-owner assert designed in §4 — do not start it before §9.2's root-cause is
-scheduled, and read §2/G5 for the bulk-op freeze gate that Phase B's bulk
-sites will sit behind. §11 has the full landing order.
+Phase B's mechanism is done; what it revealed is that **no site is
+owner-complete**, so each site step now starts with closing its ownership gap
+(§4). Read §2/G5 for the bulk-op freeze gate that Phase B's bulk sites will
+sit behind. §11 has the full landing order.
 
 ---
 
@@ -540,24 +560,127 @@ txn holding that node's COPYING* — a recompaction's child edges stay MW
 unless the op marks each child (the A3 lesson; the reverted lock-the-sweep
 experiment must not be silently re-run).
 
-Mechanism: `ft_txn_content_sw_ok` alone cannot answer a per-op question. Add
-a per-txn arm — the op arms `structural_sw` after its acquire commits, via a
-helper that takes the held set, so the compiler-enforced pattern is
-"acquire, then arm from what you hold". Pair it with a MACHINE CHECK, not a
-table: under `--enable-rcu-debug`, assert at SW-record time that the target
-word's owner is in the txn's held registry (`ft_held_set_snap` already walks
-it). A conversion table goes stale; the assert travels with the code.
+### Step B0 — the mechanism — ☑ LANDED
 
-Site order = the measured concentration, one site per step, one adversarial
-skeptic per claimed exclusion argument:
+`ft_txn_content_sw_ok` alone cannot answer a per-op question, so the answer
+travels with the RECORD. Three pieces, all in place:
 
-1. `ft-insert.h:774` — the insert one-commit (50.2M).
-2. `ft-remove.h:2875` — remove commit_rec (46.8M).
-3. `ft-remove.h:3716` and `:3942` — the publish-sedge pair (20.6M).
-4. `ft-remove.h:880` — the detach-side creator (9.6M; also the largest
-   content-lane abort source, 303,051).
-5. The remaining ~22 content sites in descending count; `ft-graft.h:3447`
-   (97,665 content aborts) early among them.
+* **An `owner` on every SW-capable record helper**, compiler-enforced exactly
+  as the CONTENT/ACQUIRE split was — `ft_flip_txn_record_tag`,
+  `_record_reserved`, `_record_publish`, and per EDGE in `ft_pub_rec.owner[]`
+  / `ft_ord_cell_edge.owner` (the `root[]` shape G2 landed, and for the same
+  reason: the producer is the only place that knows). ☠ A bare `void **slot`
+  cannot yield its owner — the owner differs by FIELD KIND (§8) and no
+  arithmetic on the address recovers it.
+* **The record-time assert** (`FT_OWNER_ASSERT_OWNED`, `--enable-rcu-debug`
+  only), asking `ft_flip_txn_owns` of every SW-capable record on a txn that
+  claims per-op ownership. Zero cost in a release build.
+* **`ft_flip_txn_claim_per_op` — the CLAIM WITHOUT THE ARM**, and it is the
+  tool the site steps below are run with. Converting a site asks two
+  questions — "does the op own what it writes?" and "does parking it pay?" —
+  and only the first can make the structure wrong. Claiming answers it with
+  an abort AT the offending record on a build that is otherwise
+  byte-identical to the unconverted one. It is also why the red control is
+  sound: a control that ARMED would plant SW parks its txn never reserved
+  for, and the engine's own kind / duplicate-slot self-checks would answer
+  first — proving the engine detects a malformed descriptor, not that this
+  check detects an unowned park.
+
+Proven RED by `FT_RED_OWNER_CLAIM_ON_LOCK` (claim on the first
+`ft_flip_txn_lock_register`): `ft_unit` aborts on its second test, and the
+abort is this assert by name, not the engine's.
+
+☠ `ft_flip_txn_owns` reads THE TXN REGISTRY, not `ft_held_set_snap` — a
+record helper cannot see the op's `ft_held_set`, which lives on a stack frame
+above it. A lock whose terminal this commit records must be registered on it
+anyway, so a word owned by an unregistered lock is a finding; but it does
+mean the numbers below are a LOWER BOUND on ownership. Exact at the default
+per-node lock spacing; conservative above it (a coarse anchor is held while
+the owner itself is absent).
+
+### The readiness measurement — ☠ NO SITE CAN ARM YET
+
+`OWN_HELD` / `OWN_MISS` (ft-txn-kind-stats.h) run the same predicate on every
+record in EVERY mode, so a FINE **unarmed** run says whether an arm would be
+legal BEFORE the arm is written. They split `MW_STRUCT` exactly — the surface,
+by whether the op holds the word's owner — and `OWN_HELD + OWN_MISS ==
+MW_STRUCT` is an invariant of the table worth checking.
+
+ft_inv, `FT_INV_MW=1`, 507 threads, per-node spacing, `build-tk`:
+
+| creation site | MW_STRUCT | OWN_HELD | owner-held |
+|---|---|---|---|
+| `ft-insert.h:776` — insert one-commit | 39,300,256 | 5,607,525 | **14.3%** |
+| `ft-remove.h:2877` — remove commit_rec | 39,201,793 | 4,033,801 | **10.3%** |
+| `ft-remove.h:3720` — publish-sedge | 14,924,241 | 0 | **0.0%** |
+| `ft-remove.h:882` — detach-side creator | 7,783,981 | 3,263,065 | **41.9%** |
+| `ft-remove.h:3946` — publish-sedge | 4,482,056 | 0 | **0.0%** |
+| `ft-graft.h:3463` | 2,115,340 | 0 | **0.0%** |
+| `ft-graft.h:1705` | 994,282 | 209,406 | 21.1% |
+| **TOTAL** | **109,929,466** | **13,114,407** | **11.9%** |
+
+**NOT ONE creation site is owner-complete, so not one of the five sites below
+can arm as things stand** — the assert would fire at every one of them. That
+is the finding, and it reorders the phase: the step per site is no longer
+"arm it", it is *make it owner-complete, prove it with the claim dry-run,
+then arm it*. The arm is the cheap half.
+
+### ☠ READ THE 11.9% AS A LOWER BOUND — the first task is the PREDICATE, not the locking
+
+The claim dry-run's very first abort proves it. Under
+`FT_RED_OWNER_CLAIM_ON_LOCK`, ft_unit aborts in
+`ft_flip_txn_record_retire_anchored` (ft-mutation-helpers.h:4679, reached from
+`ft_detach_node`), writing a node's own state word — and that line sits inside
+`if (h->lock == node || h->node_held)` **and** inside `if (h->shared ||
+h->node_held)`. Both conditions require the op to hold `node`'s own word. So
+the op demonstrably OWNS what it writes, and `ft_flip_txn_owns` says otherwise
+— because the hold came from an earlier member's acquire recorded in the
+`ft_held_anchor` / `ft_lock_ctx` ledger, not in `t->locks[]`.
+
+That is a FALSE NEGATIVE on the hottest retire path, structurally proven
+(no debugging needed — read the branch the frame is in). It does not weaken
+the assert, which only ever refuses a park; it means the gap between 11.9%
+and 100% is *some mixture* of real exclusion gaps and predicate blindness,
+and nobody should act on the split until the two are separated.
+
+⇒ **The next step is to widen the predicate before widening the locking.**
+`ft_held_set_snap` already walks registry + extras + glue + outer; what a
+record helper lacks is the `ft_lock_ctx` to walk it from. Stash it on the txn
+under `--enable-rcu-debug` at the op entry points that own one, re-run the
+table, and only then read a site's remainder as a real exclusion gap.
+
+The 0.0% rows are ONE class and it is already inventoried in the source:
+`FT_OWNER_NONE_EXTERNAL_HEAD` (11 sites) — an external head's back-channel
+word (`cell->parent`, `en->prev`, `next_node->prev`) has no owning lock at
+all, because neither a cell nor an external node carries a state word. §8.2
+puts the entry list under the HOLDER's lock, so closing this class means the
+holder's lock actually covering the chain, and it is worth **21.9M records**
+of the surface — a fifth of it, concentrated in three sites. It is the
+largest single item in Phase B and it is a design question, not plumbing.
+`FT_OWNER_UNPLUMBED` (1 site, `ft-compact.h`) is the other marker: the owner
+exists and is simply not in scope. Both are greppable.
+
+### Site order
+
+Unchanged as an ordering, but each step is now
+*owner-complete → claim → arm*, one site per step, one adversarial skeptic per
+claimed exclusion argument:
+
+1. `ft-insert.h:776` — the insert one-commit (39.3M; 14.3% held).
+2. `ft-remove.h:2877` — remove commit_rec (39.2M; 10.3% held).
+3. `ft-remove.h:3720` and `:3946` — the publish-sedge pair (19.4M; 0% held,
+   and 0% because it IS the external-head class — so this step is that
+   class's design question, not a per-site conversion).
+4. `ft-remove.h:882` — the detach-side creator (7.8M; 41.9% held, the closest
+   to ready, and also the largest content-lane abort source).
+5. The remaining content sites in descending count.
+
+☠ A raw `ft_flip_txn_record_tag` loop over ordered-cell edges survives at
+`ft-merge.h` and `ft-rekey.h` (the sibling graft path routes through the
+tag-dispatching recorder precisely to avoid it). Sound today only because the
+modes that arm exclude trie-wide; the per-edge `owner` stops it at the Phase B
+arm, and routing the loop through the dispatching recorder is the real fix,
+owed with those sites' arm.
 
 Then retire the hand-arming at the rekey writer and root-COW driver onto the
 same helper, so the switch has no bypass.
@@ -753,15 +876,25 @@ stale) — watch it across Phase B, it shares words with the converted sites.
 
     G2  always-MW root helper, retire sw_exempt_slot        ☑ LANDED a961c6e6 (site map in §2 was INCOMPLETE)
     G1  reader-sufficiency answer                           ☑ ANSWERED YES 2026-08-23 — cleared
-    A1  arm COARSE non-exclusive  + protocol §3             (small — step 2)
-    A2  arm exclusive             + protocol §3             (small — step 3)
+    A1  arm COARSE non-exclusive  + protocol §3             ☑ LANDED (four commits, §4 step 2)
+    A2  arm exclusive             + protocol §3             ☑ LANDED f6093f8b
     9.2 multi-process gate arm                              ☑ LANDED 8adf179e
     9.2 root-cause cross_view                               ☠ BLOCKED — 96 clean runs at
                                                               its own control commit; §9.2
                                                               names the two stand-ins
     9.1 rekey 109/111/122 fine-lock completion              (in flight)
-    B   per-op arm helper + record-time owner assert        (medium)
-    B1-5 five hot sites, one at a time                      (medium, mechanical tail)
+    B0  per-op arm helper + record-time owner assert        ☑ LANDED — and its first
+                                                              measurement says NO site is
+                                                              owner-complete (11.9% of the
+                                                              surface); §4 has the table
+    Bx  the external-head class (FT_OWNER_NONE_EXTERNAL_HEAD) ☠ NEW, and it is the biggest
+                                                              single item in B: 21.9M records,
+                                                              3 sites at 0% owner-held, and a
+                                                              DESIGN question (§8.2 puts the
+                                                              entry list under the holder's
+                                                              lock; nothing enforces that today)
+    B1-5 five hot sites, one at a time                      (each: owner-complete -> claim
+                                                              dry-run -> arm; NOT mechanical)
     B6  retire hand-arming (rekey writer, root COW)         (small)
     C   re-measure; G4 cell-lane decision                   (gate + data)
     G5  subtree freeze-state gate design (hybrid D)         (design, w/ D)
