@@ -1764,6 +1764,32 @@ void ft_hold_trace_note(const struct cds_ft_metadata *lock, const char *fn,
 	ft_hold_trace_n++;
 }
 
+/*
+ * Does THIS THREAD hold @lock, by the ledger rather than by any registry?
+ *
+ * The ledger's whole point is that it is maintained at the lock PRIMITIVES, so
+ * it sees a hold whichever ft_lock_ctx frame filed it -- extras, glue, an outer
+ * frame -- or none at all.  That is exactly the reach ft_flip_txn_owns lacks,
+ * and pairing the two is what separates a registry gap from an exclusion gap.
+ *
+ * ☠ NEITHER SIDE SUBSUMES THE OTHER, so only the UNION is the held set.  The
+ * ledger drops its entry the moment a release is RECORDED, while the word keeps
+ * LOCK until that commit lands -- ft_hold_trace_refused spells this out, and in
+ * that window the registry is the only witness.  The ledger in turn can carry a
+ * LEAKED entry (taken, dropped by a terminal whose commit never applied), so it
+ * can over-report.  Test-only either way.
+ */
+static inline
+bool ft_hold_trace_holds(const struct cds_ft_metadata *lock)
+{
+	unsigned int i = ft_hold_trace_n;
+
+	while (i--)
+		if (ft_hold_trace[i].lock == lock)
+			return true;
+	return false;
+}
+
 static inline
 void ft_hold_trace_drop(const struct cds_ft_metadata *lock)
 {
@@ -1881,6 +1907,13 @@ void ft_hold_trace_note(const struct cds_ft_metadata *lock, const char *fn,
 		int line)
 {
 	(void) lock; (void) fn; (void) line;
+}
+
+static inline
+bool ft_hold_trace_holds(const struct cds_ft_metadata *lock)
+{
+	(void) lock;
+	return false;
 }
 
 static inline
@@ -2910,7 +2943,7 @@ void ft_flip_txn_record_tag(struct ft_flip_txn *t,
 		 * mode Phase B has yet to convert.
 		 */
 		if (!t->structural_sw)
-			FT_TK_COUNT_OWN(t, ft_flip_txn_owns(t, owner));
+			FT_TK_COUNT_OWN(t, owner);
 	}
 	/*
 	 * ASKED OF EVERY SW-CAPABLE RECORD, not only of the ones that actually
@@ -4641,7 +4674,7 @@ void ft_flip_txn_record_anchor_release(struct ft_flip_txn *t,
  * avoided.
  */
 static inline
-void ft_flip_txn_record_retire_anchored(struct ft_flip_txn *t,
+void ft_flip_txn_record_retire_anchored_arms(struct ft_flip_txn *t,
 		const struct ft_lock_ctx *ctx,
 		const struct ft_held_anchor *h, struct cds_ft_metadata *node)
 {
@@ -4654,7 +4687,6 @@ void ft_flip_txn_record_retire_anchored(struct ft_flip_txn *t,
 	 * does to the next op that refuses this word.  A no-op when @node was
 	 * never in the ledger (the anchored case, where its own word is unlocked).
 	 */
-	ft_hold_trace_drop(node);
 	if (h->lock == node || h->node_held) {
 		/*
 		 * The op holds @node's OWN word, whether because the member
@@ -4739,6 +4771,31 @@ void ft_flip_txn_record_retire_anchored(struct ft_flip_txn *t,
 	ft_flip_txn_record_state(t, node,
 			(void *) h->node_snap,
 			(void *) (h->node_snap | FT_STATE_TOMBSTONE));
+}
+
+/*
+ * ☠ THE LEDGER DROP HAPPENS AFTER THE ARMS, NOT BEFORE THEM.
+ *
+ * Every arm above hands @node's LOCK to the commit, so the ledger must forget
+ * it -- but only once the records that arm plants have been made.  Those
+ * records ask, at the moment they are planted, whether the op OWNS the word
+ * (ft_flip_txn_owns, and the OWN_LEDGER counter beside it); dropping first
+ * answers "no" to a question whose true answer this branch has already
+ * established, and the whole class then reads as an exclusion gap instead of
+ * the registry gap it is.  Measured: 2,200,222 of 14,907,298 anchored retires
+ * under the MW oracle hold @node's own word with the registry silent, and the
+ * ledger is the only witness left.
+ *
+ * A no-op when @node was never in the ledger (the anchored case, where its own
+ * word is unlocked), and compiled out entirely without FEATURE_FT_HOLD_TRACE.
+ */
+static inline
+void ft_flip_txn_record_retire_anchored(struct ft_flip_txn *t,
+		const struct ft_lock_ctx *ctx,
+		const struct ft_held_anchor *h, struct cds_ft_metadata *node)
+{
+	ft_flip_txn_record_retire_anchored_arms(t, ctx, h, node);
+	ft_hold_trace_drop(node);
 }
 
 /*

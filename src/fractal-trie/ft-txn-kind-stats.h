@@ -108,6 +108,18 @@ enum ft_tk_rec_class {
 	 * site, never a bug count.
 	 */
 	FT_TK_OWN_HELD,
+	/*
+	 * The registry does NOT name the word's owner but this THREAD holds it
+	 * (ft_hold_trace_holds).  A REGISTRY gap, not an exclusion gap: the op
+	 * really does exclude every peer from that word, it just filed the hold
+	 * where a record helper cannot see it.  Separating the two is what makes
+	 * OWN_MISS readable as a Phase B obligation instead of a mix of the two.
+	 *
+	 * ☠ ZERO WITHOUT -DFEATURE_FT_HOLD_TRACE, where the query is a constant
+	 * false and every such record falls into OWN_MISS -- exactly the older
+	 * two-way split.  A zero column in that build is NOT evidence.
+	 */
+	FT_TK_OWN_LEDGER,
 	FT_TK_OWN_MISS,
 	FT_TK_REC_NR,
 };
@@ -352,11 +364,11 @@ void ft_tk_dump(void)
 	fprintf(stderr,
 "\n=== FT_DEBUG_TXN_KIND: record kind + commit outcome, per txn creation site ===\n"
 "    threads=%d sites=%d\n"
-"%-44s %9s %7s %10s %10s %10s %10s %8s %10s %9s %10s %9s %8s %7s %8s\n",
+"%-44s %9s %7s %10s %10s %10s %10s %8s %10s %10s %9s %10s %9s %8s %7s %8s\n",
 		threads, nr,
 		"site", "created", "armSW",
 		"SW", "MW_STRUCT", "MW_ALWAYS", "MW_LOCK", "VALID",
-		"OWN_HELD", "OWN_MISS",
+		"OWN_HELD", "OWN_LEDGER", "OWN_MISS",
 		"OK", "ABORT", "MEMERR", "MISS", "BAILED");
 	for (i = 0; i < nr; i++) {
 		int c;
@@ -368,12 +380,13 @@ void ft_tk_dump(void)
 		else
 			snprintf(name, sizeof(name), "%s", rows[i].site->file);
 		fprintf(stderr,
-"%-44s %9lu %7lu %10lu %10lu %10lu %10lu %8lu %10lu %9lu %10lu %9lu %8lu %7lu %8lu\n",
+"%-44s %9lu %7lu %10lu %10lu %10lu %10lu %8lu %10lu %10lu %9lu %10lu %9lu %8lu %7lu %8lu\n",
 			name, rows[i].created, rows[i].armed,
 			rows[i].rec[FT_TK_SW], rows[i].rec[FT_TK_MW_STRUCT],
 			rows[i].rec[FT_TK_MW_ALWAYS], rows[i].rec[FT_TK_MW_LOCK],
 			rows[i].rec[FT_TK_VALIDATE],
-			rows[i].rec[FT_TK_OWN_HELD], rows[i].rec[FT_TK_OWN_MISS],
+			rows[i].rec[FT_TK_OWN_HELD], rows[i].rec[FT_TK_OWN_LEDGER],
+			rows[i].rec[FT_TK_OWN_MISS],
 			rows[i].end[FT_TK_OK], rows[i].end[FT_TK_ABORT],
 			rows[i].end[FT_TK_MEMERR], rows[i].end[FT_TK_MISS],
 			rows[i].end[FT_TK_BAILED]);
@@ -385,12 +398,13 @@ void ft_tk_dump(void)
 		tot.armed += rows[i].armed;
 	}
 	fprintf(stderr,
-"%-44s %9lu %7lu %10lu %10lu %10lu %10lu %8lu %10lu %9lu %10lu %9lu %8lu %7lu %8lu\n",
+"%-44s %9lu %7lu %10lu %10lu %10lu %10lu %8lu %10lu %10lu %9lu %10lu %9lu %8lu %7lu %8lu\n",
 		"TOTAL", tot.created, tot.armed,
 		tot.rec[FT_TK_SW], tot.rec[FT_TK_MW_STRUCT],
 		tot.rec[FT_TK_MW_ALWAYS], tot.rec[FT_TK_MW_LOCK],
 		tot.rec[FT_TK_VALIDATE],
-		tot.rec[FT_TK_OWN_HELD], tot.rec[FT_TK_OWN_MISS],
+		tot.rec[FT_TK_OWN_HELD], tot.rec[FT_TK_OWN_LEDGER],
+		tot.rec[FT_TK_OWN_MISS],
 		tot.end[FT_TK_OK], tot.end[FT_TK_ABORT],
 		tot.end[FT_TK_MEMERR], tot.end[FT_TK_MISS],
 		tot.end[FT_TK_BAILED]);
@@ -399,7 +413,9 @@ void ft_tk_dump(void)
 		cell_mw);
 	fprintf(stderr,
 "    MW_STRUCT is the conversion surface; MW_ALWAYS + MW_LOCK + the cell/hlist line stay MW by design.\n"
-"    OWN_HELD/OWN_MISS split MW_STRUCT (the surface) by whether the op holds the word's owner; they sum to it:\n"
+"    OWN_HELD/OWN_LEDGER/OWN_MISS split MW_STRUCT (the surface) by whether the op holds the word's owner; they sum to it:\n"
+"      OWN_HELD   the txn registry names it.  OWN_LEDGER  only this thread's hold ledger does (a REGISTRY gap;\n"
+"      needs -DFEATURE_FT_HOLD_TRACE or it reads 0).  OWN_MISS  neither: a real exclusion gap.\n"
 "    a site with OWN_MISS == 0 is ready for the Phase B per-op arm; OWN_MISS is the size of its exclusion gap.\n\n");
 	free(rows);
 }
@@ -442,9 +458,16 @@ void ft_tk_dump_at_exit(void)
 #define FT_TK_TXN_IS_TAKE(t)		((t)->dbg_lock_take)
 #define FT_TK_TXN_SET_TAKE(t, v)	do { (t)->dbg_lock_take = (v); } while (0)
 #define FT_TK_COUNT_REC(t, c)		ft_tk_count_rec((t)->dbg_site, (c))
-#define FT_TK_COUNT_OWN(t, held)					\
+/*
+ * THE UNION IS THE HELD SET, and the three-way split says which witness saw it.
+ * Asked registry-first because that is the cheap one and the one a shipped
+ * (non-test) build can also answer.
+ */
+#define FT_TK_COUNT_OWN(t, owner)					\
 	ft_tk_count_rec((t)->dbg_site,					\
-		(held) ? FT_TK_OWN_HELD : FT_TK_OWN_MISS)
+		ft_flip_txn_owns((t), (owner)) ? FT_TK_OWN_HELD :	\
+		(ft_hold_trace_holds((owner)) ? FT_TK_OWN_LEDGER :	\
+			FT_TK_OWN_MISS))
 #define FT_TK_COUNT_ARMED(t)		ft_tk_count_armed((t)->dbg_site)
 #define FT_TK_COUNT_CELL_MW()		ft_tk_count_cell_mw()
 /*
