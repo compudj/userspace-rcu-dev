@@ -1,7 +1,8 @@
 # MW → fine locking: the remaining half — transition plan (2026-08-23)
 
-Status: **IN EXECUTION**. Branch `ft/unpub-free-audit` @ `543e7c53` (G2 and A1
-landed; next is step 3, A2 — arm exclusive).
+Status: **IN EXECUTION**. Branch `ft/unpub-free-audit` @ `f6093f8b` (Phase A is
+COMPLETE — G2, A1 and A2 landed; next is Phase B, per-op FINE, which §4 gates
+behind the arm-from-held-set helper and the record-time owner assert).
 
 Companion docs: `mw-writer-lock-escalation-model.md` (the pivot's master note,
 §9 lock-sets / §11 migration posture), `ft-dlm-lock-coarseness.md` (the anchor
@@ -122,11 +123,50 @@ FT_INV_MW plan with every test still passing; reverting `dc2cfde0` alone is
 green. The 08-23e residual `not ok 70 inv_graft_swap_shared_dst_ksfix_solo`
 does NOT reproduce in any of the three configurations.
 
-### Step 3 — A2: + exclusive (one commit)
+### Step 3 — A2: + exclusive — ☑ LANDED `f6093f8b` (one commit)
 
-Extend the predicate per §3. Exclusive-trie coverage lives in the bulk-op
-tests (consumed sources) and drain/destroy paths; same protocol, same
-counter proof. The lone-SW no-GP asymmetry is covered by G1's answer.
+`ft_txn_content_sw_ok` → `!ft->lock_fine || ft->exclusive`. ☠ A SECOND RULE,
+not a widening of A1's: an exclusive trie takes **no mutex at all**
+(`ft_writer_lock_scope_enter` returns early on it, deliberately, so a
+cross-trie op can hold one live side's lock while an exclusive consumed source
+rides through the fused body). The exclusion is the caller's single-writer
+contract, which `cds_ft_make_exclusive` drains readers behind
+(`ft_writer_lock_gp_wait` before the flag is set).
+
+**The audit that mattered was the CROSS-TRIE direction**, because a txn arms
+off the trie it NAMES while it may record a second trie's slots, and
+"exclusive" is a claim about one trie. §3's existing note covers only the
+dst-named direction. The src-named one — graft's `src_retire` / `swap_retire`
+/ `extract`, merge's `src_side` / `run_unlink` — holds because those record
+NOTHING BUT their own trie's slots: `ft_glue_apply_deferred`'s src pass stores
+rather than records for them (`@live` false), root edges carry `@root` and are
+forced MW, ordered-cell edges carry `URCU_TXN_TAG` and are likewise forced MW.
+Exclusivity spans the whole op — the BUSY gates refuse a live `swap_ft`
+(ft-graft.h) / `src_ft` (ft-merge.h) up front, and the one place that MUTATES
+the flag (graft_swap handing `swap_ft` dst's discipline) runs after every
+commit.
+
+☞ **The site list came from the COUNTERS, not from reading.** Arming into a
+throwaway build and diffing armSW per site named the seven sites A2 actually
+opens, which is a far smaller and more honest audit surface than the ~40
+creation sites — and it is the same lesson as §2/G2's incomplete site map,
+applied before the fact instead of after.
+
+**Positive control.** `ft_unit` under `-DFT_DEBUG_TXN_KIND` is deterministic
+and both runs agree on `created` to the txn (3,695,680), so this is exact
+rather than a sample: armSW 2,310 → 4,625, SW 27,774 → 41,552, ABORT 0 both
+ways, and MW_STRUCT goes to exactly **0** at every newly-armed site. On the
+FT_INV_MW plan the extract-side txn (`ft-graft.h:3545`) moves MW_STRUCT
+898,064–941,821 → **0**, with 926,651 SW records and 1,088,219 armed.
+
+Gates: rcu-debug 313 ok / 3 deliberate + 119/119; `-DURCU_TXN_DEBUG_RESERVE`
+clean; ASAN same, no report; fault-inject 367 ok / 3 + 119/119; 8-copy control
+8/8 clean on BOTH arms against a `570f0a3c` worktree. No abort claim, per the
+step protocol above.
+
+☞ The hand-arming is NOT retired by this step: the rekey writer arms under
+FINE (a per-op argument, Phase B) and the root-COW driver names an arbitrary
+trie. Both still arm on their own reasoning.
 
 ### Then
 
