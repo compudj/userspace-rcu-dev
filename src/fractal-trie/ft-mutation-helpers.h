@@ -1128,12 +1128,27 @@ void ft_flip_txn_set_structural_sw(struct ft_flip_txn *t, bool v);
  *                          for an op whose lock set provably covers every slot
  *                          it rewrites -- a per-op property, not a trie-wide one
  *
- * Answering false leaves every content txn all-MW, which is what the ops record
- * today: stricter than necessary and always sound.  The two callers that arm
- * explicitly (the rekey writer, the root COW) still do so on their own
- * reasoning; this switch is what will retire that hand-arming.
+ * ARMED FOR COARSE NON-EXCLUSIVE.  ft_writer_lock_scope_enter takes the FT-wide
+ * fair mutex at the OUTERMOST writer scope of every mutation on such a trie and
+ * holds it for the whole op body -- the per-domain DROP is FINE-only, and the
+ * exclusive early-out is the other mode.  So a content txn here has no peer
+ * writer at all: the word its park lands on is one no other mutator can be
+ * inside.  That mutex is a stronger exclusion than the per-node lock-set FINE
+ * will have to argue slot by slot.
+ *
+ * Answering false leaves every content txn all-MW: stricter than necessary and
+ * always sound.  The two callers that arm explicitly (the rekey writer, the root
+ * COW) still do so on their own reasoning; this switch is what will retire that
+ * hand-arming.
  *
  * @ft NULL is the acquire lane, which never arms.
+ *
+ * ☠ THE PARK IS UNFAILABLE, so a WRONGLY armed txn does not abort -- it silently
+ * erases whatever a peer left in the slot.  Every widening of this predicate
+ * therefore owes a positive control that the mode it opened actually RAN under
+ * the -DFT_DEBUG_TXN_KIND counters (armSW > 0 with MW_STRUCT moving to SW at the
+ * sites that mode drives), because a green suite proves nothing about a mode the
+ * suite never entered.  The default strategy is FINE.
  *
  * The answer is SHAPE-INDEPENDENT: a CROSS-TRIE txn names one trie and may
  * write two roots (the graft / graft_swap duals flip &dst_ft->root together
@@ -1146,8 +1161,9 @@ void ft_flip_txn_set_structural_sw(struct ft_flip_txn *t, bool v);
 static inline
 bool ft_txn_content_sw_ok(const struct cds_ft *ft)
 {
-	(void) ft;
-	return false;
+	if (!ft)
+		return false;		/* the acquire lane names no trie */
+	return !ft->lock_fine && !ft->exclusive;
 }
 
 /*
