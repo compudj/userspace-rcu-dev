@@ -672,7 +672,7 @@ of 85.5M records are planted with a NON-EMPTY ledger, proving the zero was about
 *which* words it named). The red control alone would have "proved" the wiring
 and left the bug standing.
 
-### The external-head class — ☠ NOT one design question, and the citation was phantom
+### The external-head class — ☠ NOT one design question, and §8.2 is the OTHER doc
 
 The 0.0% rows were recorded as ONE class, `FT_OWNER_NONE_EXTERNAL_HEAD` (11
 sites) — an external head's back-channel word (`cell->parent`, `en->prev`,
@@ -681,11 +681,21 @@ node carries a state word — and as "the largest single item in Phase B, a
 design question, not plumbing", on the strength of *"§8.2 puts the entry list
 under the HOLDER's lock"*.
 
-☠ **§8.2 is "In-place mutation" (Phase F) and says nothing of the sort.** No
-section of this document assigns the entry list to the holder. The prescription
-had no basis here — the same shape as the "do NOT relax, hoist" instruction
-that dissolved at §9.5. Read the three rows apart and they are three different
-things:
+☠ **THE CITATION IS TO `mw-writer-lock-escalation-model.md` §8.2
+("Field-by-field ownership"), NOT to §8.2 of THIS document** (which is In-place
+mutation, Phase F). That table is real and it answers more than the marker
+claimed: `external_nodes` → **self (C)**, and — the line that matters for the
+open fork — the `parent` pointer → **parent (P)**. ☞ Section numbers are reused
+across the two design docs; say WHICH doc.
+
+★★★★ **AND THE FORK IS NARROWER THAN "UNDECIDED" BECAUSE OF IT.** The
+escalation model already assigns the parent pointer to the PARENT, while the
+landed code keys the edge kind on holding the **child**
+(`ft_flip_txn_record_parent_word`'s `@child_held`). So the design question is
+not "pick a convention from scratch" — it is *the model and the code disagree,
+and one of them must move*. That is a much cheaper question to put to Mathieu.
+
+Read the three rows apart and they are three different things:
 
 * **Head promote** (`ft-remove.h`, the `ft_promote_head` row). The holder was
   never missing: it is a PARAMETER (`held_holder`), `@head_slot` is the holder's
@@ -708,8 +718,9 @@ things:
   SMALLEST of the three. `ft_reparent_record_meta` sets the convention —
   `owner = meta`, the CHILD's own word — and an external has none. Closing it
   is a CHOICE: give externals a state word (§8.1's layout split, Phase F), or
-  change the convention so a back edge is owned by the HOLDER. The phantom
-  citation assumed the second; it is a real option, simply never decided.
+  change the convention so a back edge is owned by the HOLDER — which is what
+  the escalation model's §8.2 already says for the `parent` pointer, against
+  what the code does.
 
 ☐ **Still unproven for all three, and it must not be skipped**: owner-AVAILABLE
 is not owner-SUFFICIENT. Nobody has yet shown the holder's lock EXCLUDES every

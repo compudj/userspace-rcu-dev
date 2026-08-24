@@ -866,11 +866,13 @@ extern unsigned long cds_ft_probe_promote_guarded;
  *   owns it, because neither a cell nor an external node carries a state word.
  *
  *   ☠ THE REMAINING SITES ARE THE BACK-EDGE RE-PARENTS, and for them this is a
- *   DESIGN question, not plumbing.  The convention is set by
- *   ft_reparent_record_meta, which names owner = meta, the CHILD's own word --
- *   so an external child has no owner to name under it, and closing the class
- *   is a CHOICE: give externals a state word (the §8.1 layout split), or make a
- *   back edge the HOLDER's rather than the child's.  Neither is decided.
+ *   DESIGN question, not plumbing.  The code keys the edge kind on holding the
+ *   CHILD (ft_flip_txn_record_parent_word's @child_held; ft_reparent_record_meta
+ *   names owner = meta), so an external child has no owner to name.  ☞ But
+ *   mw-writer-lock-escalation-model.md §8.2 "Field-by-field ownership" already
+ *   assigns the `parent` pointer to the PARENT (P) -- so the model and the code
+ *   DISAGREE, and closing this class means deciding which moves, not inventing
+ *   a convention.  The alternative is giving externals a state word (§8.1).
  *
  *   ☞ It is NOT the class every ownerless external-head word belongs to.  The
  *   head-promote sites had a holder all along -- ft_promote_head takes it as a
