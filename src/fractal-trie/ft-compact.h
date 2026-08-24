@@ -257,8 +257,15 @@ struct cds_ft_compressed_node *ft_compact_relocate_compressed(struct cds_ft *ft,
 		}
 		ft_reparent_record(ft, t, cn2->child, cn2_flag, &cn2->child,
 			/*child_marked=*/ false, /*hold_ctx=*/ NULL);
-		ft_flip_txn_record_reserved(t, (void **) gp_slot, *gp_slot,
-			cn2_flag);
+		/*
+		 * @gp_slot's owner is the GRANDPARENT node that contains it;
+		 * this helper is handed the bare slot (see its @gp_slot
+		 * parameter), so the meta is not in scope -- plumbing, not a
+		 * missing lock.  The compaction pass runs under whole-trie
+		 * exclusion, so it never reaches a per-op arm anyway.
+		 */
+		ft_flip_txn_record_reserved(t, FT_OWNER_UNPLUMBED,
+			(void **) gp_slot, *gp_slot, cn2_flag);
 		cst = ft_flip_txn_commit(ft, t);
 		if (cst != URCU_TXN_STATUS_OK) {
 			free_compressed_node_unpublished(ft, cn2);

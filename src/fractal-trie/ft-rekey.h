@@ -4350,9 +4350,16 @@ enum cds_ft_status ft_rekey_spine_copy(struct cds_ft *dst_ft,
 		 */
 		gd.publish_parent_holder = NULL;
 		gd.publish_parent_snap = 0;
-		/* @pub_slot is d_dst->nfp: &dst_ft->root at depth 0. */
-		ft_flip_txn_record_publish(txn, dst_ft, pub_slot,
-			D_old, M_slot);
+		/*
+		 * @pub_slot is d_dst->nfp: &dst_ft->root at depth 0 (whose
+		 * record is always MW and ignores the owner), and a child slot
+		 * inside @pub_parent below it -- the node the hold_or_lock
+		 * above put in this txn's registry.
+		 */
+		ft_flip_txn_record_publish(txn, dst_ft,
+			pub_parent ? ft_flag_to_metadata(dst_ft, pub_parent) :
+				NULL,
+			pub_slot, D_old, M_slot);
 	}
 
 	/*
@@ -4381,8 +4388,21 @@ enum cds_ft_status ft_rekey_spine_copy(struct cds_ft *dst_ft,
 			ms_cursor, ms_succ, ms_prev, ms_src_caps, ms_nsrc,
 			ms_src_pool, ms_edges, /*record_all=*/ false,
 			/*ncollide=*/ NULL);
+		/*
+		 * ☠ A RAW record_tag LOOP OVER ORD EDGES, which the sibling
+		 * graft path deliberately does NOT do (see the comment at
+		 * ft_ord_cell_record_into_ft's caller there): every edge here
+		 * takes the structural_sw dispatch, so a CELL edge parks SW
+		 * under an armed txn even though no cell carries a node lock.
+		 * Sound today only because the modes that arm -- COARSE and
+		 * exclusive -- exclude trie-wide.  The per-edge @owner is what
+		 * stops it at the PHASE B arm: a cell's owner is NULL, so the
+		 * record-time check refuses the park instead of taking it
+		 * silently.  Routing this loop through the tag-dispatching
+		 * recorder is the real fix and belongs with the site's arm.
+		 */
 		for (i = 0; i < ms_n; i++)
-			ft_flip_txn_record_tag(txn,
+			ft_flip_txn_record_tag(txn, ms_edges[i].owner,
 				(void **) ms_edges[i].slot,
 				(void *) ms_edges[i].old_target,
 				(void *) ms_edges[i].new_target,

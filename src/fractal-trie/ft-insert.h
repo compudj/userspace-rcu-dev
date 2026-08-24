@@ -253,7 +253,14 @@ void ft_park_live_parent_edge(struct cds_ft *ft,
 		field = (struct cds_ft_inode_flag **)
 			&((struct cds_ft_node *) child)->prev;
 	}
-	ft_flip_txn_record_reserved(txn, (void **) field, *field, new_parent);
+	/*
+	 * External head: @field is cell->parent or node->prev, and no lock
+	 * word owns either -- see FT_OWNER_NONE_EXTERNAL_HEAD.  The
+	 * metadata-bearing children took the ft_reparent_record_meta arm
+	 * above, which names its owner.
+	 */
+	ft_flip_txn_record_reserved(txn, FT_OWNER_NONE_EXTERNAL_HEAD,
+		(void **) field, *field, new_parent);
 }
 
 /*
@@ -790,7 +797,12 @@ void ft_insert_park_external_nodes(struct cds_ft *ft,
 		struct ft_insert_commit *ic)
 {
 	(void) ft;
-	ft_flip_txn_record_reserved(ic->txn,
+	/*
+	 * §8.2: the entry list is the HOLDER's own field, so @metadata owns
+	 * the word it parks into -- and the VALIDATE below guards that same
+	 * holder.
+	 */
+	ft_flip_txn_record_reserved(ic->txn, /*owner=*/ metadata,
 		(void **) &metadata->external_nodes,
 		(void *) metadata->external_nodes, (void *) node);
 	/*
@@ -1977,7 +1989,13 @@ int ft_attach_node(struct cds_ft *ft,
 					FT_DEPTH_FROM_DESCENT);
 			if (count_deferred)
 				ft_flip_txn_record_nr_child_inc(ic->txn, metadata);
-			ft_flip_txn_record_reserved(ic->txn, (void **) slot_ptr,
+			/*
+			 * @slot_ptr is a child slot inside
+			 * @iter_dest_node_flag, whose @metadata is the node the
+			 * two lines above lock-or-guard and count against.
+			 */
+			ft_flip_txn_record_reserved(ic->txn,
+				/*owner=*/ metadata, (void **) slot_ptr,
 				(void *) old_node_flag,
 				(void *) iter_node_flag);
 			ic->slot = slot_ptr;

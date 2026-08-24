@@ -837,6 +837,20 @@ struct ft_pub_rec {
 	 * edge rather than being re-derived at each of them.
 	 */
 	bool root[3];
+	/*
+	 * Per-edge: the node whose DLM lock OWNS this slot (§8), for the
+	 * record-time owner check every replay of this rec runs
+	 * (FT_OWNER_ASSERT_OWNED).  Carried per EDGE for the same reason
+	 * @root is: the publish is the only place that knows, and the replays
+	 * are several and far away.
+	 *
+	 * NULL is the SAFE default and it means "this producer does not name
+	 * an owner" -- the record is then never eligible for a per-op SW park,
+	 * which is the all-MW behaviour every unconverted path already has.
+	 * ☠ It is NOT the mirror of @root: an unset @root would wrongly PARK a
+	 * root, while an unset @owner only declines to convert.
+	 */
+	struct cds_ft_metadata *owner[3];
 	unsigned int n;
 	/*
 	 * The commit engine handle this rec's edges will be recorded into, when

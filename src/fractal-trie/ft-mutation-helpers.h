@@ -804,6 +804,83 @@ extern unsigned long cds_ft_probe_promote_guarded;
 #endif
 
 /*
+ * THE RECORD-TIME OWNER CHECK: under FINE the SW promise is PER-OP, so a
+ * structural edge may park only if the op's held lock-set OWNS that word
+ * (doc/design/mw-writer-lock-escalation-model.md §8: a parent->child edge's
+ * four fields are owned by the PARENT's lock, a node's state word by its own).
+ * ft_txn_content_sw_ok cannot answer that -- it is a property of the TRIE --
+ * so the answer travels with the RECORD, as the @owner every SW-capable
+ * record helper takes.
+ *
+ * ★ THE CHECK IS A MACHINE CHECK, NOT A TABLE.  A per-site conversion table
+ * goes stale the first time a slot's shape changes; this assert travels with
+ * the code and fires on the record that broke the rule
+ * ([[feedback_a_site_inventory_cannot_cover_a_dynamic_slot]]).
+ *
+ * ☠ ARMED ONLY FOR A PER-OP ARM, and that is not a weakening.  A COARSE or
+ * exclusive trie arms because a TRIE-WIDE exclusion holds (Phase A), and its
+ * ops register no per-node lock for most of what they park -- so asserting
+ * held-ness there would report the wide mutex's own soundness as a violation.
+ * @dbg_arm_per_op is set only by the Phase B arm (ft_flip_txn_arm_per_op) and
+ * by the dry-run claim beside it (ft_flip_txn_claim_per_op), so the assert
+ * covers exactly the txns whose promise is per-word.
+ *
+ * ⇒ IT THEREFORE HAS NO COVERAGE UNTIL THE FIRST SITE ARMS.  What gives it
+ * coverage NOW is the counter beside it (FT_TK_OWN_HELD / FT_TK_OWN_MISS,
+ * ft-txn-kind-stats.h), which runs the SAME predicate on every SW-capable
+ * record whatever the mode: a site whose records are 100% owner-held under
+ * FINE is a site the arm can convert, and one below that has named the
+ * exclusion gap it must close first
+ * ([[feedback_an_assert_config_that_never_fires_is_not_coverage]]).
+ *
+ * @owner NULL means "no node owns this word".  For a TRIE ROOT that is the
+ * true answer and the always-MW ft_flip_txn_record_root is the route (G2); on
+ * an SW-capable record it means the site has not named an owner, which is the
+ * surface Phase B closes -- so it is a MISS, never a pass.
+ */
+#if defined(DEBUG_RCU) || defined(CONFIG_RCU_DEBUG)
+# define FT_OWNER_ASSERT_TXN_FIELD	bool dbg_arm_per_op;
+# define FT_OWNER_ASSERT_INIT(t)					\
+	do { (t)->dbg_arm_per_op = false; } while (0)
+# define FT_OWNER_ASSERT_SET_PER_OP(t)					\
+	do { (t)->dbg_arm_per_op = true; } while (0)
+# define FT_OWNER_ASSERT_OWNED(t, owner)				\
+	urcu_assert_debug(!(t)->dbg_arm_per_op ||			\
+			ft_flip_txn_owns((t), (owner)))
+#else
+# define FT_OWNER_ASSERT_TXN_FIELD
+# define FT_OWNER_ASSERT_INIT(t)	do { } while (0)
+# define FT_OWNER_ASSERT_SET_PER_OP(t)	do { } while (0)
+# define FT_OWNER_ASSERT_OWNED(t, owner)				\
+	do { (void) (t); (void) (owner); } while (0)
+#endif
+
+/*
+ * THE TWO WAYS A SITE HAS NO OWNER TO NAME.  Both are NULL -- both therefore
+ * count OWN_MISS and both refuse a per-op SW park -- but they are different
+ * findings, and spelling them apart makes each one a GREPPABLE INVENTORY
+ * instead of a bare NULL that reads as an oversight.
+ *
+ * FT_OWNER_NONE_EXTERNAL_HEAD: the word belongs to an EXTERNAL HEAD or its
+ *   ordered cell -- cell->parent, en->prev, next_node->prev -- and there IS no
+ *   owning lock today, because neither a cell nor an external node carries a
+ *   state word.  §8.2 puts the entry list under the HOLDER's lock, so the
+ *   owner these want is the holder whose external_nodes chain chains them;
+ *   naming it means plumbing that holder to each site, and CLOSING it means
+ *   the holder's lock actually covering the chain.  Until then the record
+ *   stays MW, which is what it already is.
+ *
+ * FT_OWNER_UNPLUMBED: the owner EXISTS and is unambiguous -- it is simply not
+ *   in scope at the record, because the caller passed a bare slot pointer.
+ *   Purely a plumbing job, and until it is done the site cannot arm.
+ *
+ * ☠ Neither is a licence.  A MISS is a site the Phase B arm must skip; the
+ * counter is what says how much traffic each class carries.
+ */
+#define FT_OWNER_NONE_EXTERNAL_HEAD	NULL
+#define FT_OWNER_UNPLUMBED		NULL
+
+/*
  * FT bridge to the concurrent MCAS transaction engine (<urcu/rcu-txn.h>).  An
  * op records its frozen edge set {slot, old, new} DIRECTLY into the engine
  * transaction (@mtxn, a `struct urcu_txn *`) during its
@@ -998,6 +1075,14 @@ struct ft_flip_txn {
 	 * they are covered by construction rather than by detection.
 	 */
 	FT_ROOT_ASSERT_TXN_FIELD
+	/*
+	 * --enable-rcu-debug only: this txn armed @structural_sw from its own
+	 * HELD SET (ft_flip_txn_arm_per_op) rather than from a trie-wide
+	 * exclusion, so every SW record it plants must name an owner the
+	 * registry above holds.  See FT_OWNER_ASSERT_OWNED for why a
+	 * trie-wide arm is exempt.
+	 */
+	FT_OWNER_ASSERT_TXN_FIELD
 	/*
 	 * -DFT_DEBUG_TXN_KIND only (ft-txn-kind-stats.h): where this txn was
 	 * created, and whether the record in flight is the DLM lock TAKE.  The
@@ -1226,6 +1311,7 @@ struct ft_flip_txn *ft_flip_txn_create_at(FT_TK_SITE_PARAM struct cds_ft *ft)
 	t->pending_del_folded = false;
 	t->structural_sw = false;	/* all-MW until a caller opts in under lock_fine */
 	FT_ROOT_ASSERT_INIT(t, ft);
+	FT_OWNER_ASSERT_INIT(t);
 	FT_TK_TXN_INIT(t, dbg_site);	/* names @t before anything counts against it */
 	if (ft_txn_content_sw_ok(ft))
 		ft_flip_txn_set_structural_sw(t, true);
@@ -1446,6 +1532,7 @@ struct ft_flip_txn *ft_flip_txn_create_on_at(FT_TK_SITE_PARAM
 	t->pending_del_folded = false;
 	t->structural_sw = false;
 	FT_ROOT_ASSERT_INIT(t, ft);
+	FT_OWNER_ASSERT_INIT(t);
 	FT_TK_TXN_INIT(t, dbg_site);	/* names @t before anything counts against it */
 	if (ft_txn_content_sw_ok(ft))
 		ft_flip_txn_set_structural_sw(t, true);
@@ -1499,6 +1586,7 @@ struct ft_flip_txn *ft_flip_txn_create_bounded_on_at(FT_TK_SITE_PARAM
 	t->pending_del_folded = false;
 	t->structural_sw = false;	/* all-MW until a caller opts in under lock_fine */
 	FT_ROOT_ASSERT_INIT(t, ft);
+	FT_OWNER_ASSERT_INIT(t);
 	FT_TK_TXN_INIT(t, dbg_site);	/* names @t before anything counts against it */
 	if (ft_txn_content_sw_ok(ft))
 		ft_flip_txn_set_structural_sw(t, true);
@@ -1963,6 +2051,32 @@ void ft_meta_lock_release_if_held(struct cds_ft_metadata *meta)
 }
 
 /*
+ * THE CLAIM WITHOUT THE ARM: assert this commit's records against its held set
+ * while leaving every one of them MW.
+ *
+ * ★ THIS IS THE DRY RUN FOR B1-B5, and the reason the record-time check is not
+ * nested under @structural_sw.  Converting a site is two questions -- "does the
+ * op own what it writes?" and "does parking it pay?" -- and only the first can
+ * make the structure wrong.  Claiming answers it with an ABORT AT THE
+ * OFFENDING RECORD, naming the slot, on a build whose behaviour is otherwise
+ * byte-identical to the unconverted one.  Arming first and debugging the
+ * fallout answers the same question far more expensively.
+ *
+ * ☠ AND IT IS WHY THE RED CONTROL IS SOUND.  A control that armed would plant
+ * SW parks a mid-txn arm never reserved for, and the engine's own kind /
+ * duplicate-slot self-checks fire on those FIRST -- so the abort would prove
+ * the ENGINE detects a malformed descriptor, not that this check detects an
+ * unowned park ([[feedback_a_fix_you_cannot_revert_into_red]] wants the
+ * detector under test to be the one that speaks).  Claiming changes no record
+ * kind, so nothing else can answer first.
+ */
+static inline
+void ft_flip_txn_claim_per_op(struct ft_flip_txn *t)
+{
+	FT_OWNER_ASSERT_SET_PER_OP(t);
+}
+
+/*
  * Register a marked fence with the commit wrapper that owns its outcome: the
  * two terminal paths (ft_flip_txn_commit on ABORT / MEMORY_ERROR,
  * ft_flip_txn_destroy on a pre-commit bail) clear every registered fence, and
@@ -1982,6 +2096,68 @@ void ft_flip_txn_lock_register(struct ft_flip_txn *t,
 	t->locks[t->nr_locks].meta = meta;
 	t->locks[t->nr_locks].snap = snap;
 	t->nr_locks++;
+#ifdef FT_RED_OWNER_CLAIM_ON_LOCK
+	/*
+	 * RED CONTROL for the record-time owner check, never a shipped
+	 * configuration: the moment a commit holds ONE word, make it claim it
+	 * owns EVERY word it writes.  That is the canonical form of the defect
+	 * the check exists for -- an op parking on the strength of a lock that
+	 * covers something else -- rather than a synthetic wrong owner, and
+	 * ft_flip_txn_owns is the only thing that can answer it.
+	 *
+	 * Behaviour-neutral BY CONSTRUCTION: claiming sets no record kind (see
+	 * ft_flip_txn_claim_per_op), so an --enable-rcu-debug run under this
+	 * knob differs from one without it in exactly one way -- whether the
+	 * owner assert fires.  A build WITHOUT --enable-rcu-debug and with
+	 * this knob is a no-op, which is the control for the control.
+	 */
+	ft_flip_txn_claim_per_op(t);
+#endif
+}
+
+/* Is @m in this op's held set (the DLM lock registry)? */
+static inline
+bool ft_flip_txn_holds(const struct ft_flip_txn *t,
+		const struct cds_ft_metadata *m)
+{
+	unsigned int i;
+
+	for (i = 0; i < t->nr_locks; i++)
+		if (t->locks[i].meta == m)
+			return true;
+	return false;
+}
+
+/*
+ * Does this commit OWN the word a record is about to write -- i.e. is @owner,
+ * the node whose lock excludes every other writer of that word (§8), one this
+ * txn holds?
+ *
+ * The registry is the honest question to ask HERE.  ft_held_set_snap reaches
+ * wider (extras, glue, outer frames), but a record helper has only the txn:
+ * the op's ft_held_set lives on a stack frame the record cannot see.  That is
+ * not a gap being papered over -- a lock whose TERMINAL this commit records
+ * must be registered on this commit anyway, or the two terminal paths cannot
+ * clear it -- so a word owned by a lock absent from the registry is a finding,
+ * not a false negative.
+ *
+ * NULL @owner is a MISS: see FT_OWNER_ASSERT_OWNED.
+ *
+ * ☠ EXACT AT PER-NODE SPACING, CONSERVATIVE ABOVE IT.  Coarser lock spacing
+ * (CDS_FT_LOCK_SPACING=exponential / root-only) puts the word's lock on an
+ * ANCHOR ANCESTOR, which the registry holds while @owner itself is absent --
+ * so this reports a MISS for a word that IS excluded.  Per-node is the
+ * default, which is the mode the readiness numbers are taken in; at any other
+ * spacing read the counter as a LOWER BOUND on ownership, and note that the
+ * assert stays SAFE either way (it only ever refuses a park, never permits
+ * one).  Resolving the anchor here would need the op's descent, which a
+ * record helper does not have.
+ */
+static inline
+bool ft_flip_txn_owns(const struct ft_flip_txn *t,
+		const struct cds_ft_metadata *owner)
+{
+	return owner && ft_flip_txn_holds(t, owner);
 }
 
 #ifdef FEATURE_FT_FAULT_INJECT
@@ -2688,7 +2864,8 @@ enum urcu_txn_status ft_flip_txn_commit(struct cds_ft *ft,
  * MEMORY_ERROR (see the glue path); the assert only guards the reserved use.
  */
 static inline
-void ft_flip_txn_record_tag(struct ft_flip_txn *t, void **slot,
+void ft_flip_txn_record_tag(struct ft_flip_txn *t,
+		struct cds_ft_metadata *owner, void **slot,
 		void *old_ptr, void *new_ptr, uintptr_t tag)
 {
 	int ret;
@@ -2700,8 +2877,58 @@ void ft_flip_txn_record_tag(struct ft_flip_txn *t, void **slot,
 	 * over @slot (structural_sw set by the caller under lock_fine) -- a plain
 	 * locked park, installed after the MW edges, that cannot fail.  Otherwise
 	 * (every other op, non-lock_fine) it is MW == the all-MW behaviour.
+	 *
+	 * @owner is the node whose lock makes that park legal -- see
+	 * FT_OWNER_ASSERT_OWNED for the rule and for why the counter beside
+	 * the assert runs in EVERY mode while the assert itself waits for a
+	 * per-op arm.  It is named by the SITE because a bare `void **slot`
+	 * cannot yield it: the owner differs by FIELD KIND (an edge's four
+	 * fields are the PARENT's, a state word is its own node's, §8), and no
+	 * arithmetic on the address recovers that.
 	 */
 	FT_ROOT_ASSERT_NOT_ROOT(t, slot);
+	/*
+	 * ☠ NOT the DLM lock TAKE.  It reaches this same helper, but it is the
+	 * ARBITRATION POINT and must stay MW forever -- so it is not part of
+	 * the conversion surface, and counting it would put the whole acquire
+	 * lane in OWN_MISS and read as a gap that can never close.  A take is
+	 * also the one record that CANNOT be owner-held by construction: it is
+	 * what makes the op the owner.
+	 */
+	if (!FT_TK_TXN_IS_TAKE(t)) {
+		/*
+		 * COUNTED ONLY WHERE THE QUESTION IS OPEN, so that OWN_HELD +
+		 * OWN_MISS == MW_STRUCT exactly: the surface, split by whether
+		 * arming it would be legal.
+		 *
+		 * An ALREADY-ARMED txn is excluded because its arm was decided
+		 * on a wider argument -- a COARSE or exclusive trie excludes
+		 * every peer, and its ops register no per-node lock for most of
+		 * what they park -- so its records would land in OWN_MISS and
+		 * read as a gap in ops that have no gap.  The mode with that
+		 * arm is Phase A's, already done; what these two count is the
+		 * mode Phase B has yet to convert.
+		 */
+		if (!t->structural_sw)
+			FT_TK_COUNT_OWN(t, ft_flip_txn_owns(t, owner));
+	}
+	/*
+	 * ASKED OF EVERY SW-CAPABLE RECORD, not only of the ones that actually
+	 * park, and NOT behind the take gate above -- that gate is spelled in
+	 * a -DFT_DEBUG_TXN_KIND macro while this assert answers to
+	 * --enable-rcu-debug, and an assert whose reach depends on a SECOND,
+	 * unrelated knob is one that quietly loses coverage in the config
+	 * nobody thought to check.  A take needs no exemption anyway: it rides
+	 * the acquire lane, which never claims.
+	 *
+	 * A txn that CLAIMS per-op ownership is making the claim about its
+	 * whole record set, so the check belongs where the set is -- and
+	 * asking it outside the park branch lets the claim be made WITHOUT
+	 * arming (ft_flip_txn_claim_per_op), which turns "would arming this
+	 * site be legal?" into an abort at the offending record instead of a
+	 * number to interpret.
+	 */
+	FT_OWNER_ASSERT_OWNED(t, owner);
 	if (t->structural_sw) {
 		FT_TK_COUNT_REC(t, FT_TK_SW);
 		ret = urcu_txn_store_sw(t->mtxn, slot, old_ptr, new_ptr, tag);
@@ -2804,11 +3031,50 @@ void ft_flip_txn_set_structural_sw(struct ft_flip_txn *t, bool v)
 		FT_TK_COUNT_ARMED(t);
 }
 
+/*
+ * PHASE B ARM (§4 of doc/design/mw-to-fine-locking-remainder.md): opt this
+ * commit's structural edges into SW parks on the strength of THE LOCK-SET IT
+ * HOLDS, rather than of a trie-wide exclusion.
+ *
+ * ★ THE ORDER IS THE POINT.  Phase A's arm is decided inside the constructor,
+ * from the trie (ft_txn_content_sw_ok), because a COARSE or exclusive trie
+ * excludes every peer writer before the op does anything.  Under FINE nothing
+ * is excluded until the op's ACQUIRE COMMITS, so the arm cannot precede it --
+ * and taking the answer from @t->locks makes "acquire, then arm from what you
+ * hold" the shape of the call rather than a rule in a document.
+ *
+ * Refuses on a trie the constructor already decided (COARSE / exclusive): that
+ * txn is armed on a wider argument, and marking it per-op would point the
+ * record-time assert at words the wide mutex covers without registering.
+ *
+ * Refuses an EMPTY registry.  A commit holding nothing owns nothing, so every
+ * park it made would be unarbitrated -- the exact defect the assert exists to
+ * catch.  Refusing leaves it all-MW, which is stricter and always sound.
+ *
+ * ☠ THE REGISTRY MUST BE COMPLETE AT THE CALL.  A lock registered AFTER this
+ * point still protects its word, but a record planted in between is checked
+ * against a registry that does not yet name its owner -- so the arm belongs
+ * after the last ft_flip_txn_lock_register of the op, not after the first.
+ */
 static inline
-void ft_flip_txn_record_reserved(struct ft_flip_txn *t, void **slot,
+void ft_flip_txn_arm_per_op(const struct cds_ft *ft, struct ft_flip_txn *t)
+{
+	if (ft_txn_content_sw_ok(ft))
+		return;		/* the constructor armed it trie-wide */
+	if (!ft || !ft->lock_fine || !t->nr_locks)
+		return;
+	ft_flip_txn_claim_per_op(t);
+	ft_flip_txn_set_structural_sw(t, true);
+}
+
+
+static inline
+void ft_flip_txn_record_reserved(struct ft_flip_txn *t,
+		struct cds_ft_metadata *owner, void **slot,
 		void *old_ptr, void *new_ptr)
 {
-	ft_flip_txn_record_tag(t, slot, old_ptr, new_ptr, FT_FLIP_PROXY_TAG);
+	ft_flip_txn_record_tag(t, owner, slot, old_ptr, new_ptr,
+		FT_FLIP_PROXY_TAG);
 }
 
 /*
@@ -2823,13 +3089,14 @@ void ft_flip_txn_record_reserved(struct ft_flip_txn *t, void **slot,
  */
 static inline
 void ft_flip_txn_record_publish(struct ft_flip_txn *t, struct cds_ft *ft,
+		struct cds_ft_metadata *owner,
 		struct cds_ft_inode_flag **slot,
 		void *old_ptr, void *new_ptr)
 {
 	if (slot == &ft->root)
 		ft_flip_txn_record_root(t, (void **) slot, old_ptr, new_ptr);
 	else
-		ft_flip_txn_record_reserved(t, (void **) slot, old_ptr,
+		ft_flip_txn_record_reserved(t, owner, (void **) slot, old_ptr,
 			new_ptr);
 }
 
@@ -2857,7 +3124,8 @@ void ft_flip_txn_record_pub_rec(struct ft_flip_txn *t,
 				(void *) rec->old_val[i],
 				(void *) rec->new_val[i]);
 		else
-			ft_flip_txn_record_reserved(t, (void **) rec->slot[i],
+			ft_flip_txn_record_reserved(t, rec->owner[i],
+				(void **) rec->slot[i],
 				(void *) rec->old_val[i],
 				(void *) rec->new_val[i]);
 	}
@@ -2908,7 +3176,8 @@ void ft_flip_txn_record_state_kind(struct ft_flip_txn *t,
 		int sw_ok)
 {
 	if (sw_ok)
-		ft_flip_txn_record_tag(t, (void **) &meta->state,
+		ft_flip_txn_record_tag(t, /*owner=*/ meta,
+			(void **) &meta->state,
 			old_ptr, new_ptr, FT_STATE_PROXY);
 	else
 		ft_flip_txn_record_tag_mw(t, (void **) &meta->state,
@@ -3494,6 +3763,14 @@ struct ft_ord_cell_edge {
 	 * zero-initialized edge is an ordinary in-node slot.
 	 */
 	bool root;
+	/*
+	 * The node whose DLM lock OWNS @slot (§8), for the record-time owner
+	 * check (FT_OWNER_ASSERT_OWNED).  NULL -- the zero-initialized default
+	 * -- means the producer names no owner, so the edge stays ineligible
+	 * for a per-op SW park.  A CELL edge legitimately has none: no cell
+	 * carries a node lock, which is why the ordered list is MW by design.
+	 */
+	struct cds_ft_metadata *owner;
 };
 
 /* Resolve an edge's engine proxy tag: unset (0) => the structural 0xF tag. */
@@ -5281,7 +5558,8 @@ enum urcu_txn_status ft_ord_cell_flip_into(struct cds_ft *ft,
 				(void *) edges[i].old_target,
 				(void *) edges[i].new_target);
 		else if (tag == FT_FLIP_PROXY_TAG)
-			ft_flip_txn_record_tag(t, (void **) edges[i].slot,
+			ft_flip_txn_record_tag(t, edges[i].owner,
+				(void **) edges[i].slot,
 				(void *) edges[i].old_target,
 				(void *) edges[i].new_target, tag);
 		else
@@ -5290,19 +5568,6 @@ enum urcu_txn_status ft_ord_cell_flip_into(struct cds_ft *ft,
 				(void *) edges[i].new_target, tag);
 	}
 	return ft_flip_txn_commit(ft, t);
-}
-
-/* Is @m in this op's held set (the DLM lock registry)? */
-static inline
-bool ft_flip_txn_holds(const struct ft_flip_txn *t,
-		const struct cds_ft_metadata *m)
-{
-	unsigned int i;
-
-	for (i = 0; i < t->nr_locks; i++)
-		if (t->locks[i].meta == m)
-			return true;
-	return false;
 }
 
 /*
@@ -5392,7 +5657,7 @@ void ft_ord_cell_record_into_ft(struct cds_ft *ft, struct ft_flip_txn *t,
 					(void *) edges[i].old_target,
 					(void *) edges[i].new_target);
 			else
-				ft_flip_txn_record_tag(t,
+				ft_flip_txn_record_tag(t, edges[i].owner,
 					(void **) edges[i].slot,
 					(void *) edges[i].old_target,
 					(void *) edges[i].new_target, tag);
@@ -8168,13 +8433,22 @@ void ft_flip_txn_record_parent_word(const struct cds_ft *ft,
 		uatomic_inc(&ft_red_pw_sw_unheld);
 	else
 		uatomic_inc(&ft_red_pw_sw_held);
-	ft_flip_txn_record_reserved(txn, (void **) &meta->parent_word,
-		old_pw, new_pw);
+	ft_flip_txn_record_reserved(txn, /*owner=*/ meta,
+		(void **) &meta->parent_word, old_pw, new_pw);
 	return;
 #endif
+	/*
+	 * @child_held IS the ownership predicate this word needs, and @meta --
+	 * the CHILD -- is the node it tests: the DLM set here is {C,(P),(GP)}
+	 * and what makes the park legal is holding the child whose parent word
+	 * moves.  So the owner named here is the same node the branch above
+	 * already decides on; the record-time check re-asks it against the
+	 * registry, which is where a hold taken on a frame the txn never
+	 * registered shows up.
+	 */
 	if (child_held)
-		ft_flip_txn_record_reserved(txn, (void **) &meta->parent_word,
-			old_pw, new_pw);
+		ft_flip_txn_record_reserved(txn, /*owner=*/ meta,
+			(void **) &meta->parent_word, old_pw, new_pw);
 	else
 		ft_flip_txn_record_tag_mw(txn, (void **) &meta->parent_word,
 			old_pw, new_pw, FT_FLIP_PROXY_TAG);
@@ -8267,10 +8541,12 @@ void ft_glue_record_back_edge(struct cds_ft *ft, struct ft_flip_txn *txn,
 			struct ft_ord_cell *cell = ft_ord_cell_ptr(en->prev);
 
 			ft_flip_txn_record_reserved(txn,
+				FT_OWNER_NONE_EXTERNAL_HEAD,
 				(void **) &cell->parent, cell->parent, parent_nf);
 		} else {
-			ft_flip_txn_record_reserved(txn, (void **) &en->prev,
-				en->prev, parent_nf);
+			ft_flip_txn_record_reserved(txn,
+				FT_OWNER_NONE_EXTERNAL_HEAD,
+				(void **) &en->prev, en->prev, parent_nf);
 		}
 		return;
 	}
@@ -8522,7 +8798,7 @@ void ft_reparent_record_meta(struct cds_ft *ft, struct ft_flip_txn *txn,
 	 */
 	if (record_pso) {
 		if (child_marked || held_earlier)
-			ft_flip_txn_record_tag(txn,
+			ft_flip_txn_record_tag(txn, /*owner=*/ meta,
 				(void **) &meta->parent_slot_offset,
 				(void *) old_pso, (void *) new_pso,
 				FT_STATE_PROXY);
@@ -8599,12 +8875,16 @@ void ft_reparent_record(struct cds_ft *ft, struct ft_flip_txn *txn,
 		if (ft->ordered_list) {
 			struct ft_ord_cell *cell = ft_ord_cell_ptr(en->prev);
 
-			ft_flip_txn_record_reserved(txn, (void **) &cell->parent,
+			ft_flip_txn_record_reserved(txn,
+				FT_OWNER_NONE_EXTERNAL_HEAD,
+				(void **) &cell->parent,
 				urcu_txn_load(txn->mtxn, (void **) &cell->parent,
 					FT_FLIP_PROXY_TAG),
 				parent_nf);
 		} else {
-			ft_flip_txn_record_reserved(txn, (void **) &en->prev,
+			ft_flip_txn_record_reserved(txn,
+				FT_OWNER_NONE_EXTERNAL_HEAD,
+				(void **) &en->prev,
 				urcu_txn_load(txn->mtxn, (void **) &en->prev,
 					FT_FLIP_PROXY_TAG),
 				parent_nf);

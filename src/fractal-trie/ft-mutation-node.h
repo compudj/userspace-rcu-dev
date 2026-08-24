@@ -1584,7 +1584,8 @@ int ft_node_recompact(enum ft_recompact mode,
 						ft_meta_lock_release(c_held.lock);
 					return -EAGAIN;
 				}
-				ft_flip_txn_record_reserved(retire_txn, bc_slot,
+				ft_flip_txn_record_reserved(retire_txn,
+					FT_OWNER_NONE_EXTERNAL_HEAD, bc_slot,
 					bc_old, new_node_flag);
 			} else {
 				/*

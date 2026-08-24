@@ -944,8 +944,14 @@ enum urcu_txn_status ft_store_at_graft_point_commit(struct cds_ft *ft,
 		 * step in prepare; the slot + cell edges have none, and all draw
 		 * from the reserved txn (no allocation here).
 		 */
-		ft_flip_txn_record_reserved(st->glue->txn, (void **) slot,
-			NULL, (void *) st->slot_value);
+		/*
+		 * @slot was resolved out of @st->dest itself
+		 * (ft_node_get_nth_skip above), so the node that owns it is
+		 * @st->dest -- the same node whose nr_child this arm records.
+		 */
+		ft_flip_txn_record_reserved(st->glue->txn,
+			/*owner=*/ ft_flag_to_metadata(ft, st->dest),
+			(void **) slot, NULL, (void *) st->slot_value);
 		if (run) {
 			rn = ft_ord_cell_run_splice_edges(ft, run->run_first,
 				run->run_last, run->pred, run->succ, redges, 0);

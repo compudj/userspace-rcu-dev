@@ -80,6 +80,35 @@ enum ft_tk_rec_class {
 	FT_TK_MW_ALWAYS,
 	FT_TK_MW_LOCK,
 	FT_TK_VALIDATE,
+	/*
+	 * THE PHASE B READINESS PAIR, and it is NOT a kind: they SPLIT
+	 * MW_STRUCT -- the conversion surface -- by whether the op's lock
+	 * registry HOLDS the word's owner (ft_flip_txn_owns).  OWN_HELD +
+	 * OWN_MISS == MW_STRUCT is an invariant of the table, and a useful
+	 * self-check on it.
+	 *
+	 * WHY A COUNTER AND NOT ONLY THE ASSERT.  The assert
+	 * (FT_OWNER_ASSERT_OWNED) is armed only for a txn that armed PER-OP,
+	 * so it has no coverage until the first Phase B site arms -- and an
+	 * assert with no coverage is not coverage.  These two run the same
+	 * predicate on every SW-capable record in EVERY mode, so a FINE
+	 * unarmed run says, per site, whether the arm would be legal BEFORE
+	 * the arm is written:
+	 *
+	 *   OWN_MISS == 0   the site's structural records are all owner-held;
+	 *                   the per-op arm is the only thing missing.
+	 *   OWN_MISS > 0    the site names a word its lock-set does not own.
+	 *                   That is the exclusion gap to close, and its size
+	 *                   is the number here -- not an argument to be had.
+	 *
+	 * ☠ A MISS IS NOT AUTOMATICALLY A DEFECT TODAY.  Unarmed, the record
+	 * is MW and MW is always sound; and a site may hold the word through
+	 * a frame the txn registry cannot see (ft_flip_txn_owns says why that
+	 * is still worth reporting).  It is a Phase B PRECONDITION, read per
+	 * site, never a bug count.
+	 */
+	FT_TK_OWN_HELD,
+	FT_TK_OWN_MISS,
 	FT_TK_REC_NR,
 };
 
@@ -323,10 +352,11 @@ void ft_tk_dump(void)
 	fprintf(stderr,
 "\n=== FT_DEBUG_TXN_KIND: record kind + commit outcome, per txn creation site ===\n"
 "    threads=%d sites=%d\n"
-"%-44s %9s %7s %10s %10s %10s %10s %8s %10s %9s %8s %7s %8s\n",
+"%-44s %9s %7s %10s %10s %10s %10s %8s %10s %9s %10s %9s %8s %7s %8s\n",
 		threads, nr,
 		"site", "created", "armSW",
 		"SW", "MW_STRUCT", "MW_ALWAYS", "MW_LOCK", "VALID",
+		"OWN_HELD", "OWN_MISS",
 		"OK", "ABORT", "MEMERR", "MISS", "BAILED");
 	for (i = 0; i < nr; i++) {
 		int c;
@@ -338,11 +368,12 @@ void ft_tk_dump(void)
 		else
 			snprintf(name, sizeof(name), "%s", rows[i].site->file);
 		fprintf(stderr,
-"%-44s %9lu %7lu %10lu %10lu %10lu %10lu %8lu %10lu %9lu %8lu %7lu %8lu\n",
+"%-44s %9lu %7lu %10lu %10lu %10lu %10lu %8lu %10lu %9lu %10lu %9lu %8lu %7lu %8lu\n",
 			name, rows[i].created, rows[i].armed,
 			rows[i].rec[FT_TK_SW], rows[i].rec[FT_TK_MW_STRUCT],
 			rows[i].rec[FT_TK_MW_ALWAYS], rows[i].rec[FT_TK_MW_LOCK],
 			rows[i].rec[FT_TK_VALIDATE],
+			rows[i].rec[FT_TK_OWN_HELD], rows[i].rec[FT_TK_OWN_MISS],
 			rows[i].end[FT_TK_OK], rows[i].end[FT_TK_ABORT],
 			rows[i].end[FT_TK_MEMERR], rows[i].end[FT_TK_MISS],
 			rows[i].end[FT_TK_BAILED]);
@@ -354,11 +385,12 @@ void ft_tk_dump(void)
 		tot.armed += rows[i].armed;
 	}
 	fprintf(stderr,
-"%-44s %9lu %7lu %10lu %10lu %10lu %10lu %8lu %10lu %9lu %8lu %7lu %8lu\n",
+"%-44s %9lu %7lu %10lu %10lu %10lu %10lu %8lu %10lu %9lu %10lu %9lu %8lu %7lu %8lu\n",
 		"TOTAL", tot.created, tot.armed,
 		tot.rec[FT_TK_SW], tot.rec[FT_TK_MW_STRUCT],
 		tot.rec[FT_TK_MW_ALWAYS], tot.rec[FT_TK_MW_LOCK],
 		tot.rec[FT_TK_VALIDATE],
+		tot.rec[FT_TK_OWN_HELD], tot.rec[FT_TK_OWN_MISS],
 		tot.end[FT_TK_OK], tot.end[FT_TK_ABORT],
 		tot.end[FT_TK_MEMERR], tot.end[FT_TK_MISS],
 		tot.end[FT_TK_BAILED]);
@@ -366,7 +398,9 @@ void ft_tk_dump(void)
 "    cell/hlist MW stores (recorded straight on the engine handle, not site-attributed): %lu\n",
 		cell_mw);
 	fprintf(stderr,
-"    MW_STRUCT is the conversion surface; MW_ALWAYS + MW_LOCK + the cell/hlist line stay MW by design.\n\n");
+"    MW_STRUCT is the conversion surface; MW_ALWAYS + MW_LOCK + the cell/hlist line stay MW by design.\n"
+"    OWN_HELD/OWN_MISS split MW_STRUCT (the surface) by whether the op holds the word's owner; they sum to it:\n"
+"    a site with OWN_MISS == 0 is ready for the Phase B per-op arm; OWN_MISS is the size of its exclusion gap.\n\n");
 	free(rows);
 }
 
@@ -408,6 +442,9 @@ void ft_tk_dump_at_exit(void)
 #define FT_TK_TXN_IS_TAKE(t)		((t)->dbg_lock_take)
 #define FT_TK_TXN_SET_TAKE(t, v)	do { (t)->dbg_lock_take = (v); } while (0)
 #define FT_TK_COUNT_REC(t, c)		ft_tk_count_rec((t)->dbg_site, (c))
+#define FT_TK_COUNT_OWN(t, held)					\
+	ft_tk_count_rec((t)->dbg_site,					\
+		(held) ? FT_TK_OWN_HELD : FT_TK_OWN_MISS)
 #define FT_TK_COUNT_ARMED(t)		ft_tk_count_armed((t)->dbg_site)
 #define FT_TK_COUNT_CELL_MW()		ft_tk_count_cell_mw()
 /*
@@ -434,6 +471,7 @@ struct ft_tk_site;	/* incomplete: the NULL the constructors take */
 #define FT_TK_TXN_IS_TAKE(t)		0
 #define FT_TK_TXN_SET_TAKE(t, v)	do { } while (0)
 #define FT_TK_COUNT_REC(t, c)		do { } while (0)
+#define FT_TK_COUNT_OWN(t, held)	do { } while (0)
 #define FT_TK_COUNT_END(t, c)		do { } while (0)
 #define FT_TK_COUNT_ARMED(t)		do { } while (0)
 #define FT_TK_COUNT_CELL_MW()		do { } while (0)

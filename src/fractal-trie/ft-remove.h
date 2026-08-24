@@ -184,10 +184,12 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 					topmost_external_nodes->prev);
 
 				ft_flip_txn_record_reserved(txn,
+					FT_OWNER_NONE_EXTERNAL_HEAD,
 					(void **) &cell->parent,
 					cell->parent, cn_flag);
 			} else {
 				ft_flip_txn_record_reserved(txn,
+					FT_OWNER_NONE_EXTERNAL_HEAD,
 					(void **) &topmost_external_nodes->prev,
 					topmost_external_nodes->prev, cn_flag);
 			}
@@ -3065,6 +3067,7 @@ int ft_detach_node(struct cds_ft *ft,
 				if (pub->head_parent_field) {
 					if (commit_txn)
 						ft_flip_txn_record_reserved(commit_txn,
+							FT_OWNER_NONE_EXTERNAL_HEAD,
 							(void **) pub->head_parent_field,
 							pub->head_parent_old,
 							pub->head_parent_new);
@@ -3662,7 +3665,8 @@ int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		 * prev's intended value (new_cell_flag), not the not-yet-stored slot.
 		 * The reservation above carries this edge.
 		 */
-		ft_flip_txn_record_reserved(txn, (void **) &next_node->prev,
+		ft_flip_txn_record_reserved(txn, FT_OWNER_NONE_EXTERNAL_HEAD,
+			(void **) &next_node->prev,
 			next_node->prev, new_cell_flag);
 		/*
 		 * VALIDATE (§4.B): guard the LIVE holder this head-promote
@@ -3735,8 +3739,8 @@ int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 				ft_meta_lock_release(held_holder);
 			return -EAGAIN;
 		}
-		ft_flip_txn_record_reserved(txn, (void **) &next_node->prev,
-			prev_save, inherit);
+		ft_flip_txn_record_reserved(txn, FT_OWNER_NONE_EXTERNAL_HEAD,
+			(void **) &next_node->prev, prev_save, inherit);
 		/*
 		 * VALIDATE (§4.B): guard the LIVE holder this head-promote
 		 * publishes into -- release when we hold its fence (see the cell
