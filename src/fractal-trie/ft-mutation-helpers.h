@@ -7235,6 +7235,32 @@ struct ft_glue_deferred_edge {
 	 */
 	bool dst_origin;
 	/*
+	 * @child is READER-REACHABLE until the forward flip, so its back-pointer
+	 * must RIDE the commit: ft_glue_apply_deferred RECORDS this edge instead
+	 * of storing it, and the flip is what publishes it.  Two shapes carry it
+	 * -- a @dst_origin child, still on the old dst spine; and a FOLD child,
+	 * whose src spine is unlinked by this very commit and so stays reachable
+	 * for the whole build window.  Every other src-origin child is HIDDEN --
+	 * a drained payload or a fresh cluster -- and takes the plain store, in
+	 * recorded order.
+	 *
+	 * ☠ REACHABILITY IS A PROPERTY OF THE EDGE, NOT OF THE TXN.  Deriving the
+	 * store-vs-record choice from @g->txn->structural_sw instead reads the
+	 * txn's record KIND as if it answered reader visibility: every armed
+	 * committer then records its HIDDEN edges too, and the built cluster's
+	 * back-pointers are still unapplied when the forward publish runs --
+	 * _ft_publish_to_parent_meta reads parent_word RAW and cannot see a
+	 * merely recorded re-parent, and a SKIP_X top resolves its
+	 * ft_set_parent_slot dual against the pre-loop parent.
+	 *
+	 * ☠ NOT A COMPLETE REACHABILITY ORACLE, and its one gap is where it
+	 * already was: the graft_swap KEY_SHORTER wrap re-parents a LIVE dst
+	 * child on a glue with no @txn to record into, so it stays @live false
+	 * and keeps its immediate store.  ft-graft.h states that classification
+	 * at the site that defers it.
+	 */
+	bool live;
+	/*
 	 * FOLD: this op holds @child's lock acquire, taken by
 	 * ft_glue_acquire_reparent_marks because the commit SW-PARKS @child's
 	 * state word.  Released by the re-parent's own state guard edge at the
@@ -8571,6 +8597,7 @@ void ft_glue_defer_edge_origin(struct cds_ft *ft, struct ft_glue *g,
 			g->deferred[i].parent = parent;
 			g->deferred[i].slot = slot;
 			g->deferred[i].dst_origin = dst_origin;
+			g->deferred[i].live = dst_origin || g->record_only;
 			return;
 		}
 	}
@@ -8579,6 +8606,20 @@ void ft_glue_defer_edge_origin(struct cds_ft *ft, struct ft_glue *g,
 	g->deferred[g->nr_deferred].parent = parent;
 	g->deferred[g->nr_deferred].slot = slot;
 	g->deferred[g->nr_deferred].dst_origin = dst_origin;
+	/*
+	 * WHO IS STILL REACHABLE (see @live at the struct).  @record_only is the
+	 * FOLD, and the fold's src spine is unlinked by the very commit this edge
+	 * rides -- so a src-origin child under it is reader-reachable for the
+	 * whole build window.  Every other committer arrives here with its source
+	 * already unlinked and DRAINED (graft, the merge src side) or EXCLUSIVE
+	 * (graft_swap), which is what makes its src-origin children invisible and
+	 * their stores unobservable.
+	 *
+	 * Read at DEFER time, not at apply time, because it is the BUILD that
+	 * knows where a child came from -- and @record_only is set on the glue
+	 * before its build defers anything.
+	 */
+	g->deferred[g->nr_deferred].live = dst_origin || g->record_only;
 	/*
 	 * Every field of a new entry is set HERE and nowhere else: the backing
 	 * arrays are an uninitialised inline floor (or a malloc'd grow), so an
@@ -9014,6 +9055,17 @@ int ft_glue_acquire_reparent_marks(struct cds_ft *ft, struct ft_glue *g)
 		g->deferred[i].marked = false;
 		g->deferred[i].held_lock = false;
 		g->deferred[i].lock_word = NULL;
+		/*
+		 * ONLY THE EDGES THIS COMMIT RECORDS (@live at the struct).  The
+		 * mark exists to make an SW park safe, and only a recorded edge
+		 * parks: a HIDDEN edge is a plain store into a node no reader can
+		 * reach, whose only peer would be one that cannot reach it either.
+		 * Marking it takes a lock on a build-invisible child -- pure cost,
+		 * and an acquire that can only refuse, from a caller that is past
+		 * the source unlink and has no bail left.
+		 */
+		if (!g->deferred[i].live)
+			continue;
 		if (!cm)
 			continue;
 		/*
@@ -9580,57 +9632,57 @@ void ft_glue_apply_deferred(struct cds_ft *ft, struct ft_glue *g)
 		if (g->deferred[i].dst_origin)
 			continue;
 		/*
-		 * FOLD (coherent rekey one-decide writer): "unreachable until the
-		 * forward flip" is what licenses the plain store, and it is FALSE
-		 * for the fold.  A same-trie rekey re-parents the moved subtree's
-		 * own children -- which stay READER-REACHABLE through the old
-		 * source spine right up to the flip -- so storing here would be a
-		 * reader-visible mutation before the commit, and one that no abort
-		 * rolls back.  Record them instead, exactly as the dst-origin arm
-		 * does, so they flip atomically with the forward publish.
+		 * PER EDGE (@live at the struct): "unreachable until the forward
+		 * flip" is what licenses the plain store, and a src-origin edge is
+		 * the one place that premise can be false.  A same-trie rekey FOLD
+		 * re-parents the moved subtree's own children -- which stay
+		 * READER-REACHABLE through the old source spine right up to the flip
+		 * -- so storing one here would be a reader-visible mutation before
+		 * the commit, and one that no abort rolls back.  Record those,
+		 * exactly as the dst-origin arm does, so they flip atomically with
+		 * the forward publish; store the hidden ones, in recorded order.
+		 *
+		 * ☠ THE TXN'S ARMING IS NOT THE QUESTION.  structural_sw says how a
+		 * record is KINDED, never whether a reader can see the slot, so
+		 * asking it here makes every armed committer record its HIDDEN edges
+		 * -- and then _ft_publish_to_parent's parent-first check reads a
+		 * back-pointer this commit has only recorded.
 		 */
-		if (g->txn && g->txn->structural_sw) {
+		if (g->deferred[i].live) {
 			/*
-			 * ☠ ORDER-DEPENDENCE, and why this arm is narrow.  The
-			 * plain-store loop below is IN RECORDED ORDER on purpose:
-			 * ft_set_parent's skip-compressed arm resolves its target
-			 * through ft_skip_to_compressed, which reads a child
-			 * back-pointer an EARLIER edge of this same loop may have
-			 * just written.  Records do not land until the flip, so a
-			 * converted edge resolves against the PRE-loop back-pointer
-			 * -- a different node whenever that dependency is live.
-			 *
-			 * MEASURED, do not re-derive: instrumenting every src-origin
-			 * edge with its target resolved before vs. after the loop,
-			 * the divergence is EXACTLY the skip-compressed class and it
-			 * is total -- ft_unit 12 diverged of 18 skip (125 edges), the
-			 * FT_INV_MW rekey oracles 8 of 8 skip (21224 edges).  Every
-			 * non-skip edge resolves to a constant.
-			 *
-			 * Under structural_sw the class is EMPTY -- 0 skip and 0
-			 * divergent of 1879 fold re-parents across the same oracle
-			 * run -- because the rekey's shape gate admits no compressed
-			 * or skip-compressed node on the moved spine.  That is a
-			 * property of the GATE, not of the fold, so it is asserted
-			 * rather than assumed: relaxing the gate must re-measure, and
-			 * will find this assert rather than a silently mis-resolved
-			 * parent.
+			 * A live edge has nowhere to land but the commit, and only
+			 * the fold reaches this arm -- @dst_origin edges are skipped
+			 * above and every fold glue carries the caller's shared txn.
 			 */
+			assert(g->txn);
 			/*
 			 * THE SKIP-COMPRESSED QUESTION, SETTLED BY MEASUREMENT.
 			 *
-			 * The plain-store loop below is order-dependent: ft_set_parent's
-			 * skip arm resolves through ft_skip_to_compressed, which reads a
-			 * child back-pointer an EARLIER edge of the same loop just wrote,
-			 * and the divergence is exactly that class (ft_unit 12 of 18 skip,
-			 * the rekey oracles 8 of 8).  This arm first carried a blanket
-			 * assert against skip children on the strength of that.
+			 * The plain-store arm below is ORDER-DEPENDENT, and applies in
+			 * recorded order on purpose: ft_set_parent's skip-compressed arm
+			 * resolves its target through ft_skip_to_compressed, which reads
+			 * a child back-pointer an EARLIER edge of this same loop just
+			 * wrote.  MEASURED, do not re-derive: resolving every src-origin
+			 * edge before vs. in-order, the divergence is EXACTLY the
+			 * skip-compressed class and it is total -- ft_unit 12 diverged of
+			 * 18 skip (125 edges), the FT_INV_MW rekey oracles 8 of 8 skip
+			 * (21224 edges).  Every non-skip edge resolves to a constant.
 			 *
-			 * That was the wrong guard, because THIS arm never stores.  Under
-			 * structural_sw every src-origin edge is RECORDED, so all of them
-			 * resolve against one pristine state and the pre-loop and in-order
-			 * answers are identical BY CONSTRUCTION.  The order-dependence is a
-			 * property of the store path, not of the resolution.
+			 * THIS arm inherits none of that, because it never stores: a
+			 * record does not land until the flip, so every edge taking this
+			 * arm resolves against one pristine state and the pre-loop and
+			 * in-order answers are identical BY CONSTRUCTION.  The
+			 * order-dependence belongs to the store path, not to the
+			 * resolution.
+			 *
+			 * ☠ AND THE TWO ARMS DO NOT INTERLEAVE within one src pass, which
+			 * is what keeps that split clean: @live on a src-origin edge means
+			 * the FOLD, and the fold is a property of the GLUE, so a src pass
+			 * is all-record or all-store.  A future builder that mixes them
+			 * owes a re-measure -- a STORED edge whose skip resolution depends
+			 * on a back-pointer a RECORDED edge carries resolves against the
+			 * pre-loop value, which is the divergence above with the arms
+			 * swapped.
 			 *
 			 * What CAN still go wrong is a genuinely STALE flag -- one whose
 			 * encoded child was re-homed (by an immediate store earlier in the
@@ -9678,12 +9730,14 @@ void ft_glue_apply_deferred(struct cds_ft *ft, struct ft_glue *g)
  * publish.  A reader -- which descends (forward) before it walks up (back) --
  * thus observes the whole publish as old XOR new, never a half-applied mix.
  *
- *   - Hidden back-pointers (the drained payload + fresh cluster, tagged
- *     !dst_origin): ft_glue_apply_deferred sets them immediately, in recorded
- *     order.  Unreachable until the forward flip, so no atomicity is needed.
- *   - Live back-pointers (a node reachable via the OLD spine until the forward
- *     publish, tagged dst_origin) + the forward edge + the <=4 ordered-list
- *     cell edges: recorded into g->txn and committed with one selector flip.
+ *   - Hidden back-pointers (the drained payload + fresh cluster): tagged @live
+ *     false, ft_glue_apply_deferred sets them immediately, in recorded order.
+ *     Unreachable until the forward flip, so no atomicity is needed.
+ *   - Live back-pointers (a node reachable until the forward publish -- via the
+ *     OLD DST spine, tagged @dst_origin, or via the fold's not-yet-unlinked SRC
+ *     spine) + the forward edge + the <=4 ordered-list cell edges: recorded into
+ *     g->txn and committed with one selector flip.  The dst-origin half is
+ *     recorded by the loop below, the src-origin half by apply_deferred.
  *
  * Called AFTER the source unlink + drain, where abort is already impossible, so
  * the live back-edge bookkeeping (ft_set_parent_slot inside
@@ -9734,18 +9788,19 @@ enum urcu_txn_status ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue 
 	}
 
 	/*
-	 * Hidden back-pointers -- re-parents of nodes NOT reader-observable
-	 * during the commit window (the drained payload + the fresh cluster,
-	 * tagged !dst_origin) -- are set IMMEDIATELY with plain stores, in
-	 * recorded order: no reader can reach these nodes until the forward flip
-	 * below, so the stores need no atomicity, and the in-order application
-	 * lets a skip top resolve its compressed node (ft_skip_to_compressed
-	 * reads the child back-pointer a prior edge just wired).
+	 * The src-origin half, dispatched PER EDGE on @live.  Hidden re-parents --
+	 * nodes NOT reader-observable during the commit window (the drained
+	 * payload + the fresh cluster) -- are set IMMEDIATELY with plain stores,
+	 * in recorded order: no reader can reach these nodes until the forward
+	 * flip below, so the stores need no atomicity, and the in-order
+	 * application lets a skip top resolve its compressed node
+	 * (ft_skip_to_compressed reads the child back-pointer a prior edge just
+	 * wired).  The fold's src-origin edges are LIVE and are recorded there.
 	 */
 	ft_glue_apply_deferred(ft, g);
 	/*
-	 * Live back-pointers -- a node still reachable via the OLD spine until
-	 * the forward publish (tagged dst_origin) -- ride @txn so their flip is
+	 * The dst-origin half, live by construction -- a node still reachable via
+	 * the OLD dst spine until the forward publish -- rides @txn so its flip is
 	 * atomic with the forward edge: a reader sees the re-parent old XOR new.
 	 */
 	for (i = 0; i < g->nr_deferred; i++) {
