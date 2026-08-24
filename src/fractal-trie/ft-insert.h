@@ -254,13 +254,26 @@ void ft_park_live_parent_edge(struct cds_ft *ft,
 			&((struct cds_ft_node *) child)->prev;
 	}
 	/*
-	 * External head: @field is cell->parent or node->prev, and no lock
-	 * word owns either -- see FT_OWNER_NONE_EXTERNAL_HEAD.  The
-	 * metadata-bearing children took the ft_reparent_record_meta arm
-	 * above, which names its owner.
+	 * External head: @field is cell->parent or node->prev, and no lock word
+	 * owns either -- see FT_OWNER_NONE_EXTERNAL_HEAD.  The metadata-bearing
+	 * children took the ft_reparent_record_meta arm above, which names its
+	 * owner.
+	 *
+	 * ALWAYS MW, and that is the SAME dispatch ft_flip_txn_record_parent_word
+	 * already makes on @child_held: a structural edge may park SW only where
+	 * the op holds the DLM lock over the slot, and here it never can -- an
+	 * external carries no state word to hold, so this is that predicate's
+	 * PERMANENT false arm rather than a site that has not been converted yet.
+	 * Parking it would claim an exclusion the op does not have; MW makes a
+	 * second writer's expected-old mismatch and abort, which the retry lane
+	 * absorbs.  Byte-identical while this txn is unarmed (record_tag IS
+	 * record_tag_mw there); what it changes is that an ARMED insert cannot
+	 * park this word, and the record leaves the MW_STRUCT conversion surface
+	 * for MW_ALWAYS -- the ft_flip_txn_record_root treatment for a word that
+	 * can never convert.
 	 */
-	ft_flip_txn_record_reserved(txn, FT_OWNER_NONE_EXTERNAL_HEAD,
-		(void **) field, *field, new_parent);
+	ft_flip_txn_record_tag_mw(txn, (void **) field, *field, new_parent,
+		FT_FLIP_PROXY_TAG);
 }
 
 /*
