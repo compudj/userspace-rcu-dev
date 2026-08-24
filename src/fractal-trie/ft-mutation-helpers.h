@@ -862,13 +862,20 @@ extern unsigned long cds_ft_probe_promote_guarded;
  * instead of a bare NULL that reads as an oversight.
  *
  * FT_OWNER_NONE_EXTERNAL_HEAD: the word belongs to an EXTERNAL HEAD or its
- *   ordered cell -- cell->parent, en->prev, next_node->prev -- and there IS no
- *   owning lock today, because neither a cell nor an external node carries a
- *   state word.  §8.2 puts the entry list under the HOLDER's lock, so the
- *   owner these want is the holder whose external_nodes chain chains them;
- *   naming it means plumbing that holder to each site, and CLOSING it means
- *   the holder's lock actually covering the chain.  Until then the record
- *   stays MW, which is what it already is.
+ *   ordered cell -- cell->parent, en->prev, next_node->prev -- and no lock word
+ *   owns it, because neither a cell nor an external node carries a state word.
+ *
+ *   ☠ THE REMAINING SITES ARE THE BACK-EDGE RE-PARENTS, and for them this is a
+ *   DESIGN question, not plumbing.  The convention is set by
+ *   ft_reparent_record_meta, which names owner = meta, the CHILD's own word --
+ *   so an external child has no owner to name under it, and closing the class
+ *   is a CHOICE: give externals a state word (the §8.1 layout split), or make a
+ *   back edge the HOLDER's rather than the child's.  Neither is decided.
+ *
+ *   ☞ It is NOT the class every ownerless external-head word belongs to.  The
+ *   head-promote sites had a holder all along -- ft_promote_head takes it as a
+ *   parameter and registers it on the same txn -- and only the ORDER of the
+ *   acquire hid it.  Check for a holder in scope before reaching for this.
  *
  * FT_OWNER_UNPLUMBED: the owner EXISTS and is unambiguous -- it is simply not
  *   in scope at the record, because the caller passed a bare slot pointer.

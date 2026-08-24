@@ -3665,17 +3665,32 @@ int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		 * prev's intended value (new_cell_flag), not the not-yet-stored slot.
 		 * The reservation above carries this edge.
 		 */
-		ft_flip_txn_record_reserved(txn, FT_OWNER_NONE_EXTERNAL_HEAD,
-			(void **) &next_node->prev,
-			next_node->prev, new_cell_flag);
 		/*
-		 * VALIDATE (§4.B): guard the LIVE holder this head-promote
-		 * publishes into.  Holding its fence (held_holder): record the
-		 * release so it composes with the held LOCK instead of the
-		 * masking guard-fallback that self-aborts on it.
+		 * THE HOLDER'S FENCE IS TAKEN BEFORE THE BACK EDGE, NOT AFTER IT.
+		 *
+		 * @next_node->prev is a back-channel word of an EXTERNAL head, and
+		 * an external carries no state word of its own -- so the word that
+		 * excludes a peer here is the HOLDER's, the internal node whose
+		 * @head_slot chains this list.  Recording the edge first named no
+		 * owner at all and left the whole promote lane reading as an
+		 * exclusion gap; taking the fence first makes the holder a
+		 * REGISTERED lock on this very txn, which is what
+		 * ft_flip_txn_owns then answers with.
+		 *
+		 * Safe to move: ft_flip_txn_hold_or_lock_parent returns void -- the
+		 * held arm records a RELEASE terminal and registers it, the unheld
+		 * arm acquires-or-guards -- so no bail is introduced, and every bail
+		 * that releases @held_holder explicitly is still ABOVE this point.
+		 *
+		 * VALIDATE (§4.B): it also guards the LIVE holder this head-promote
+		 * publishes into.
 		 */
 		ft_flip_txn_hold_or_lock_parent(ft, txn, ctx, parent_nf,
 			parent_depth, held_holder, held_snap);
+		ft_flip_txn_record_reserved(txn,
+			ft_flag_to_metadata(ft, parent_nf),
+			(void **) &next_node->prev,
+			next_node->prev, new_cell_flag);
 		_ft_publish_to_parent_meta(ft, parent_nf,
 			(struct cds_ft_inode_flag **) head_slot,
 			(struct cds_ft_inode_flag *) next_node,
@@ -3739,15 +3754,12 @@ int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 				ft_meta_lock_release(held_holder);
 			return -EAGAIN;
 		}
-		ft_flip_txn_record_reserved(txn, FT_OWNER_NONE_EXTERNAL_HEAD,
-			(void **) &next_node->prev, prev_save, inherit);
-		/*
-		 * VALIDATE (§4.B): guard the LIVE holder this head-promote
-		 * publishes into -- release when we hold its fence (see the cell
-		 * arm above).
-		 */
+		/* The holder's fence FIRST -- see the cell arm above for why. */
 		ft_flip_txn_hold_or_lock_parent(ft, txn, ctx, parent_nf,
 			parent_depth, held_holder, held_snap);
+		ft_flip_txn_record_reserved(txn,
+			ft_flag_to_metadata(ft, parent_nf),
+			(void **) &next_node->prev, prev_save, inherit);
 		_ft_publish_to_parent_meta(ft, parent_nf,
 			(struct cds_ft_inode_flag **) head_slot,
 			(struct cds_ft_inode_flag *) next_node,
