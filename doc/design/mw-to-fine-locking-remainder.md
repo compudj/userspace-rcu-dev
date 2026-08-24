@@ -860,14 +860,57 @@ first class is a Phase B prerequisite that has come due EARLY.
    tests), in `ft_glue_txn_commit_edges` under
    `ft->lock_fine && g->txn && g->txn->structural_sw`.
 
-   ☠ **This IS §4's prerequisite 1 — the `ft_glue_acquire_reparent_marks`
-   HOIST — and the trigger is not what was predicted.** The prediction was
-   that FINE arming would trip it at Phase B. It is EXCLUSIVE arming that
-   trips it, so **A2 (`f6093f8b`) is already red in a config it was never run
-   against**, and the hoist is due NOW rather than at B1. The answer is
-   unchanged and the comment at the assert already states it: hoist the
-   acquire above the source unlink + drain, as
-   `ft_glue_acquire_splice_holders` does. Do NOT relax the assert.
+   **The trigger is not what was predicted.** The prediction (a code comment
+   at the assert, `ft-mutation-helpers.h`, introduced with `dc2cfde0`) was
+   that FINE arming would trip it at Phase B, and that the fix was to hoist
+   `ft_glue_acquire_reparent_marks` above the source unlink + drain. It is
+   EXCLUSIVE arming that trips it, so **A2 (`f6093f8b`) is already red in a
+   config it was never run against.**
+
+   ☠ **THE FIX IS OPEN — do not treat the hoist as decided.** The prescription
+   lives in ONE code comment, not in a signed-off plan step; an earlier
+   revision of this section claimed it discharged "§4's prerequisite 1", and
+   no such item exists in §4 — that cross-reference was wrong. What §4's A1
+   step actually records (`dc2cfde0`) is a GATING change to that acquire, not
+   a hoist. The candidates, and what is now established about each, are in
+   the handoff note `project_ft_glue_reparent_hoist_open_question`. In brief:
+
+   * All SIX paths into `ft_glue_txn_commit_edges` honour an ABORT — verified
+     per caller — so `record_only` is a stale PROXY for the property the
+     assert wants ("this caller absorbs an ABORT here"). ☞ But "honour"
+     differs: `ft-rekey.h:3001` and `ft-graft.h:3625` have a genuinely clean
+     bail, while `ft-merge.h:2849` / `ft-rekey.h:4836` / the non-fused graft
+     arms are PAST a point of no return and honour it only by a retry that
+     must eventually succeed.
+   * A full hoist is impossible for ATTACH-TIME-discovered edges: the acquire
+     needs `g->deferred[]` complete, and the displaced child's identity is
+     attach-time knowledge a retry's re-descend replaces. It is achievable
+     only for build-time edges. `ft_glue_acquire_splice_holders` — the model
+     the hoist appeals to — is itself SKIPPED on the `unfailable` path for
+     the same reason (`ft-merge.h:1978-1993`).
+   * ★ **A fourth candidate, and it addresses the cause:** on an EXCLUSIVE
+     trie the mark defends against nobody. The acquire's own header already
+     makes exactly this argument for COARSE — the mark arbitrates against one
+     peer (`ft_meta_nr_child_inc` from an insert below the child), and where
+     that peer is excluded "the mark has nobody to arbitrate against" — and
+     exclusivity excludes it more strongly than the COARSE mutex does. So the
+     gate may simply be wrong: `lock_fine && armed` should perhaps read
+     `lock_fine && armed && !exclusive`, which keeps the assert un-relaxed.
+     ☠ NOT free: skipping the acquire also skips its `ft_glue_op_holds`
+     detection, so `held_lock` stays false and the live re-parent records the
+     §4.B MW guard — a deterministic self-abort if any exclusive shape
+     self-holds a re-parented child's word. Unproven either way by reading.
+
+   ☞ Reachability is SETTLED BY READING, and it does not narrow the problem:
+   `structural_sw` has exactly two sources (the constructor arm
+   `!lock_fine || exclusive`, and the rekey one-decide writer);
+   `ft_flip_txn_arm_per_op` has zero call sites. Combined with `lock_fine`
+   the branch is reachable iff the glue txn's trie is FINE **and** exclusive
+   — and no graft/merge/rekey path gates an exclusive DST out (only src /
+   swap exclusivity is checked, `ft-graft.h:1283`, `:2795`). So graft-attach
+   can reach it. ☠ A runtime call counter would answer the WEAKER question of
+   which callers the SUITE drives there — see
+   `feedback_reachability_is_a_code_fact`.
 
    ☞ The lesson generalizes past this bug: A2's gate list (§4 step 3) was
    ft_unit + ft_inv + ASAN + fault-inject + reserve + an 8-copy control, and
