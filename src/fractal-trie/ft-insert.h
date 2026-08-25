@@ -806,29 +806,45 @@ int ft_insert_commit_arm(struct cds_ft *ft, struct ft_insert_commit *ic,
  */
 static
 void ft_insert_park_external_nodes(struct cds_ft *ft,
+		const struct ft_descent *d,
 		struct cds_ft_metadata *metadata, struct cds_ft_node *node,
 		struct ft_insert_commit *ic)
 {
-	(void) ft;
+	struct ft_lock_ctx lctx;
+
 	/*
-	 * §8.2: the entry list is the HOLDER's own field, so @metadata owns
-	 * the word it parks into -- and the VALIDATE below guards that same
-	 * holder.
+	 * ☠ STEP 1 FIRST: TAKE the holder, do not merely OBSERVE it.
+	 *
+	 * §8.2 puts the entry list in the HOLDER's own field, so @metadata owns
+	 * the word this parks into -- and owning it is not enough, the op has to
+	 * HOLD it.  A §4.B VALIDATE on @metadata->state stood here instead, and
+	 * it is sound only while every writer of that word is MW: an MW guard
+	 * arbitrates against an MW peer through the expected-old, and against an
+	 * SW park not at all.  "A slot is SW xor MW, globally"
+	 * (urcu_txn_store_sw).  The moment ANY insert shape arms per-op, its
+	 * lock releases and nr_child increments park @metadata->state SW -- and
+	 * this shape, holding nothing, would be exactly the far-side op
+	 * ft_flip_txn_record_state warns about: "an op that writes or validates
+	 * this word having never performed step 1 at all... Ownership is TAKEN,
+	 * never observed."
+	 *
+	 * So acquire and REGISTER the holder.  On a hit that replaces the guard
+	 * with the stronger {LOCK|s -> s} release terminal -- a concurrent remove
+	 * can no longer freeze the holder at all, rather than being detected
+	 * after the fact.  On a miss ft_flip_txn_lock_or_guard_parent sets
+	 * @acquire_miss and the commit ABORTS, all-or-none, and the op re-plans;
+	 * it deliberately does not spin.
+	 *
+	 * ★ BEFORE the record, never after: the record asks ft_flip_txn_owns who
+	 * owns the word it writes, so the registry has to name the holder
+	 * already.
 	 */
+	ft_lock_ctx_init(&lctx, d, ic->txn, ic->op);
+	ft_flip_txn_lock_or_guard_parent(ft, ic->txn, &lctx, d->nf,
+		FT_DEPTH_FROM_DESCENT);
 	ft_flip_txn_record_reserved(ic->txn, /*owner=*/ metadata,
 		(void **) &metadata->external_nodes,
 		(void *) metadata->external_nodes, (void *) node);
-	/*
-	 * VALIDATE (§4.B): guard the LIVE holder @metadata this external head
-	 * parks into, so a concurrent remove that froze it aborts this commit.
-	 * Guarded directly (metadata in hand, always a real node -- never the
-	 * &ft->root null-parent case ft_flip_txn_guard_parent handles).  Fits the
-	 * one guard slot the arm's edge budget reserves (this in-place park and
-	 * the recompact-relocation grandparent guard are mutually exclusive
-	 * insert shapes); no-op under retained exclusion.
-	 */
-	(void) urcu_txn_load_validate(ft_flip_txn_handle(ic->txn),
-		(void **) &metadata->state, FT_STATE_PROXY);
 	ic->slot = (struct cds_ft_inode_flag **) &metadata->external_nodes;
 	ic->publish_to_parent = false;
 }
@@ -3151,7 +3167,7 @@ restart_attempt:
 					ft->rank_stats ? d.depth + 2 : 0);
 				if (ret)
 					goto insert_done;
-				ft_insert_park_external_nodes(ft,
+				ft_insert_park_external_nodes(ft, &d,
 					metadata, node, &ic);
 				ic.count_from = d.nf;
 				/*
@@ -3796,7 +3812,7 @@ restart_replace_attempt:
 					ft->rank_stats ? d.depth + 2 : 0);
 				if (ret)
 					goto insert_replace_done;
-				ft_insert_park_external_nodes(ft,
+				ft_insert_park_external_nodes(ft, &d,
 					metadata, node, &ic);
 				ic.count_from = d.nf;
 				/* I1 (list on) / I2 (list off) count fold: see cds_ft_insert. */
