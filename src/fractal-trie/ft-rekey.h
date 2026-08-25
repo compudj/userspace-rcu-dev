@@ -2807,14 +2807,24 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 			pp_meta = NULL;		/* ft_glue_abort below is the single owner */
 			/* NULL on the merge path: no COW */
 			ft_rekey_free_stop_prime(ft, s_top_prime);
-			if (gst_st.old_recompacted_node)
-				free_cds_ft_node_unpublished(ft, ft_node_ptr(gst_st.dest));
 			ft_glue_abort(ft, &glue);
 				if (src_glue_live) {	/* merged cluster's src side */
 					ft_glue_abort(ft, &src_glue);
 					src_glue_live = false;
 				}
 			ft_flip_txn_destroy(txn);
+			/*
+			 * ☠ FREE AFTER THE REGISTRY SWEEP, NEVER BEFORE IT.
+			 * @gst_st.dest carries a fence this attempt registered on @txn
+			 * (the born-locked relocation acquire), and ft_flip_txn_destroy's
+			 * sweep RELEASES it through the node's own metadata.  Freeing
+			 * first hands that word to the allocator, which can refund the
+			 * item into the active reserve and re-zero its metadata on the
+			 * next draw -- so the release lands on a cleared word (assert) or
+			 * on a LIVE peer's word (corruption).
+			 */
+			if (gst_st.old_recompacted_node)
+				free_cds_ft_node_unpublished(ft, ft_node_ptr(gst_st.dest));
 			goto sweep;
 		}
 	}
@@ -2917,9 +2927,6 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 			if (iret) {
 				pp_meta = NULL;	/* ft_glue_abort: single owner */
 				ft_rekey_free_stop_prime(ft, s_top_prime);
-				if (gst_st.old_recompacted_node)
-					free_cds_ft_node_unpublished(ft,
-						ft_node_ptr(gst_st.dest));
 				if (detach_rc.new_flag)
 					free_cds_ft_node_unpublished(ft,
 						ft_node_ptr(detach_rc.new_flag));
@@ -2931,6 +2938,19 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 					src_glue_live = false;
 				}
 				ft_flip_txn_destroy(txn);
+				/*
+				 * ☠ FREE AFTER THE REGISTRY SWEEP, NEVER BEFORE IT.
+				 * @gst_st.dest carries a fence this attempt registered on @txn
+				 * (the born-locked relocation acquire), and ft_flip_txn_destroy's
+				 * sweep RELEASES it through the node's own metadata.  Freeing
+				 * first hands that word to the allocator, which can refund the
+				 * item into the active reserve and re-zero its metadata on the
+				 * next draw -- so the release lands on a cleared word (assert) or
+				 * on a LIVE peer's word (corruption).
+				 */
+				if (gst_st.old_recompacted_node)
+					free_cds_ft_node_unpublished(ft,
+						ft_node_ptr(gst_st.dest));
 				ret = iret;
 				goto sweep;
 			}
@@ -2944,9 +2964,6 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 			pp_meta = NULL;		/* ft_glue_abort: single owner */
 			/* NULL on the merge path: no COW */
 			ft_rekey_free_stop_prime(ft, s_top_prime);
-			if (gst_st.old_recompacted_node)
-				free_cds_ft_node_unpublished(ft,
-					ft_node_ptr(gst_st.dest));
 			if (detach_rc.new_flag)
 				free_cds_ft_node_unpublished(ft,
 					ft_node_ptr(detach_rc.new_flag));
@@ -2958,6 +2975,19 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 				src_glue_live = false;
 			}
 			ft_flip_txn_destroy(txn);
+			/*
+			 * ☠ FREE AFTER THE REGISTRY SWEEP, NEVER BEFORE IT.
+			 * @gst_st.dest carries a fence this attempt registered on @txn
+			 * (the born-locked relocation acquire), and ft_flip_txn_destroy's
+			 * sweep RELEASES it through the node's own metadata.  Freeing
+			 * first hands that word to the allocator, which can refund the
+			 * item into the active reserve and re-zero its metadata on the
+			 * next draw -- so the release lands on a cleared word (assert) or
+			 * on a LIVE peer's word (corruption).
+			 */
+			if (gst_st.old_recompacted_node)
+				free_cds_ft_node_unpublished(ft,
+					ft_node_ptr(gst_st.dest));
 			ret = -EAGAIN;
 			goto sweep;
 		}
@@ -3235,6 +3265,14 @@ bail_build:
 				src_glue_live = false;
 			}
 	ft_flip_txn_destroy(txn);
+	/*
+	 * @gst_st.dest was LEAKED here: this bail is reachable with a relocated
+	 * dest already built (the marks-reserve ENOMEM above).  @gst_st is
+	 * zero-initialised, so the guard is safe on paths that never grafted.
+	 * After the sweep, for the reason spelled out at the bails above.
+	 */
+	if (gst_st.old_recompacted_node)
+		free_cds_ft_node_unpublished(ft, ft_node_ptr(gst_st.dest));
 
 sweep:
 	/*
