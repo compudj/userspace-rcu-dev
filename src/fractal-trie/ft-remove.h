@@ -1272,7 +1272,8 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 			ft_flip_txn_lock_or_guard_parent(ft, txn, ctx,
 				publish_parent, pub_depth);
 		_ft_publish_to_parent_meta(ft, publish_parent, publish_slot,
-			new_cn_pub, pub_expected_old, new_cn_meta, NULL, &rec);
+			new_cn_pub, pub_expected_old, new_cn_meta, NULL, &rec,
+			/*slot_owner_nf=*/ publish_parent);
 		/*
 		 * Freeze-on-free (doc §4.B, atomic detach): the collapsed chain
 		 * this commit retires -- the 1-child boundary @iter_node_flag and
@@ -3696,7 +3697,7 @@ int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 			(struct cds_ft_inode_flag **) head_slot,
 			(struct cds_ft_inode_flag *) next_node,
 			(struct cds_ft_inode_flag *) node,
-			NULL, new_cell_flag, &rec);
+			NULL, new_cell_flag, &rec, /*slot_owner_nf=*/ parent_nf);
 		n_s = ft_pub_rec_sedges(&rec, sedges);
 		/*
 		 * Fuse @node's freeze (mark node->next, target preserved) into the
@@ -3765,7 +3766,8 @@ int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 			(struct cds_ft_inode_flag **) head_slot,
 			(struct cds_ft_inode_flag *) next_node,
 			(struct cds_ft_inode_flag *) node,
-			NULL, inherit /* folded prev: intended parent value */, &rec);
+			NULL, inherit /* folded prev: intended parent value */, &rec,
+			/*slot_owner_nf=*/ parent_nf);
 		n_s = ft_pub_rec_sedges(&rec, sedges);
 		/* Fuse @node's freeze into the structural publish (doc §4.B). */
 		ft_hlist_freeze_prepare(ft_flip_txn_handle(txn), node);

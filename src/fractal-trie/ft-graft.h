@@ -871,10 +871,20 @@ enum urcu_txn_status ft_store_at_graft_point_commit(struct cds_ft *ft,
 			 * ROOT graft into one destination -- inv_empty_dst_root_graft_
 			 * peer, ~1 run in 40 under -DDEBUG_RCU.)
 			 */
-			_ft_publish_to_parent(ft, st->dest,
+			/*
+			 * ☠ @parent_nf IS st->dest FOR THE DUAL, @slot_owner_nf IS
+			 * @pub_parent FOR THE OWNER, and they are different nodes.
+			 * st->dest is passed above only so a compressed grandparent's
+			 * SKIP_X dual is not re-emitted (it was already recorded by the
+			 * reserve); the slot being published lives in @pub_parent, which
+			 * is the word the recompact acquired and this txn holds.  Naming
+			 * st->dest as the owner reports an exclusion gap that is not real.
+			 */
+			_ft_publish_to_parent_meta(ft, st->dest,
 				pub_slot, st->dest,
 				ft_resolve_flip_proxy(*pub_slot),
-				&st->reserve_rec);
+				NULL, NULL, &st->reserve_rec,
+				/*slot_owner_nf=*/ pub_parent);
 			ft_flip_txn_record_pub_rec(st->glue->txn,
 				&st->reserve_rec);
 			/*

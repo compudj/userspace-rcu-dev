@@ -2470,8 +2470,20 @@ void _ft_publish_to_parent_meta(struct cds_ft *ft,
 		struct cds_ft_inode_flag *expected_old,
 		struct cds_ft_metadata *new_child_meta,
 		void *folded_child_prev,
-		struct ft_pub_rec *rec)
+		struct ft_pub_rec *rec,
+		struct cds_ft_inode_flag *slot_owner_nf)
 {
+	/*
+	 * @slot_owner_nf: the node @parent_slot LIVES IN, i.e. the word that owns
+	 * the forward edge (§8.2: a node's body is its own).  Almost always
+	 * @parent_nf, which is why _ft_publish_to_parent defaults it -- but NOT
+	 * always, and the difference cannot be derived here: a caller may pass
+	 * @parent_nf for its OTHER job, deciding whether a compressed parent's
+	 * SKIP_X dual is re-emitted, while publishing into a slot that lives
+	 * somewhere else entirely (ft_store_at_graft_point_commit's relocation
+	 * republish).  Deriving the owner from @parent_nf there names a node the op
+	 * does not hold and the record reports an exclusion gap that is not real.
+	 */
 	/*
 	 * @expected_old: the value @parent_slot held in the snapshot the
 	 * caller's publish plan was derived from (the RECORDED path only; the
@@ -2682,8 +2694,8 @@ void _ft_publish_to_parent_meta(struct cds_ft *ft,
 	if (rec)
 		ft_pub_rec_add(rec, parent_slot, expected_old, new_child,
 			parent_slot == &ft->root,
-			parent_slot == &ft->root || !parent_nf ? NULL :
-				ft_flag_to_metadata(ft, parent_nf));
+			parent_slot == &ft->root || !slot_owner_nf ? NULL :
+				ft_flag_to_metadata(ft, slot_owner_nf));
 	else if (*parent_slot != new_child)
 		/*
 		 * Direct (rec == NULL) publish.  The only two callers -- the
@@ -2712,7 +2724,7 @@ void _ft_publish_to_parent(struct cds_ft *ft,
 		struct ft_pub_rec *rec)
 {
 	_ft_publish_to_parent_meta(ft, parent_nf, parent_slot, new_child,
-		expected_old, NULL, NULL, rec);
+		expected_old, NULL, NULL, rec, /*slot_owner_nf=*/ parent_nf);
 }
 
 /*
