@@ -155,9 +155,9 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			 * the single word twice.
 			 */
 			if (!cn_held.shared) {
-				ft_flip_txn_record_release_lock(txn, cn_held.lock,
-					cn_held.lock_snap);
 				ft_flip_txn_lock_register(txn, cn_held.lock,
+					cn_held.lock_snap);
+				ft_flip_txn_record_release_lock(txn, cn_held.lock,
 					cn_held.lock_snap);
 			}
 		}
@@ -383,15 +383,15 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			 * ordering rule), the node tombstoned below.  A no-op
 			 * where the two words coincide.
 			 */
-			ft_flip_txn_record_anchor_release(txn, &src_held,
-				src_cn_meta_a);
 			ft_flip_txn_lock_register(txn, src_held.lock,
 				src_held.lock_snap);
+			ft_flip_txn_record_anchor_release(txn, &src_held,
+				src_cn_meta_a);
 			if (pub_parent && !set[1].held.shared) {
-				ft_flip_txn_record_release_lock(txn,
-					set[1].held.lock, set[1].held.lock_snap);
 				ft_flip_txn_lock_register(txn, set[1].held.lock,
 					set[1].held.lock_snap);
+				ft_flip_txn_record_release_lock(txn,
+					set[1].held.lock, set[1].held.lock_snap);
 			}
 			dlm_a2 = true;
 		}
@@ -566,11 +566,12 @@ void ft_detach_freeze_one(struct ft_flip_txn *txn,
 		struct ft_held_anchor *h, struct cds_ft_metadata *m)
 {
 	if (!h->shared) {
-		ft_flip_txn_record_anchor_release(txn, h, m);
+		/* Register BEFORE recording: the record asks who owns the word. */
 		if (h->lock != m) {
 			ft_flip_txn_lock_register(txn, h->lock, h->lock_snap);
 			h->txn_owned = true;
 		}
+		ft_flip_txn_record_anchor_release(txn, h, m);
 	}
 	ft_flip_txn_record_retire_anchored(txn, ctx, h, m);
 }
@@ -787,8 +788,8 @@ void ft_chain_compress_register_retire(struct ft_flip_txn *txn,
 {
 	if (h->shared)
 		return;
-	ft_flip_txn_record_anchor_release(txn, h, node);
 	ft_flip_txn_lock_register(txn, h->lock, h->lock_snap);
+	ft_flip_txn_record_anchor_release(txn, h, node);
 }
 
 /*
@@ -1013,10 +1014,10 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 			 * onto a word the set already took owes neither.
 			 */
 			if (!set[si].held.shared) {
-				ft_flip_txn_record_release_lock(txn,
-					set[si].held.lock, set[si].held.lock_snap);
 				ft_flip_txn_lock_register(txn, set[si].held.lock,
 					set[si].held.lock_snap);
+				ft_flip_txn_record_release_lock(txn,
+					set[si].held.lock, set[si].held.lock_snap);
 			}
 			si++;
 		}

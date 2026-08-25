@@ -3569,10 +3569,10 @@ merge_spine_retry:
 			 * relink_incoming = true); @subtree's sentinel resets to empty with
 			 * a plain store.
 			 */
-			ft_flip_txn_record_tombstone_locked(appear_txn,
-				dst_rmeta, dst_root_snap);
 			ft_flip_txn_lock_register(appear_txn, dst_rmeta,
 				dst_root_snap);
+			ft_flip_txn_record_tombstone_locked(appear_txn,
+				dst_rmeta, dst_root_snap);
 			ft_root_list_swap_publish(dst_ft, appear_txn, &dst_ft->root,
 				dst_root_fenced, subtree->root,
 				NULL, ft_ord_first(subtree),
@@ -3592,10 +3592,10 @@ merge_spine_retry:
 			ft_flip_txn_record_root(appear_txn,
 				(void **) &dst_ft->root,
 				(void *) dst_root_fenced, (void *) subtree->root);
-			ft_flip_txn_record_tombstone_locked(appear_txn,
-				dst_rmeta, dst_root_snap);
 			ft_flip_txn_lock_register(appear_txn, dst_rmeta,
 				dst_root_snap);
+			ft_flip_txn_record_tombstone_locked(appear_txn,
+				dst_rmeta, dst_root_snap);
 			ft_flip_txn_commit(dst_ft, appear_txn);
 		}
 		FT_TP(root_publish, (const void *) dst_ft,

@@ -5167,8 +5167,8 @@ void ft_flip_txn_hold_or_lock_parent_at(const char *fn, int line,
 		 * snapshot form doubled as -- and that guard was approximating
 		 * an exclusion this arm already has, since we HOLD the word.
 		 */
-		ft_flip_txn_record_anchor_release_held(t, held_holder);
 		ft_flip_txn_lock_register(t, held_holder, held_snap);
+		ft_flip_txn_record_anchor_release_held(t, held_holder);
 		return;
 	}
 	ft_flip_txn_lock_or_guard_parent_at(fn, line, ft, t, ctx, parent_nf,
@@ -9706,8 +9706,8 @@ int ft_glue_acquire_reparent_marks(struct cds_ft *ft, struct ft_glue *g)
 		 * anchor (§7.2), and an op has at most two cursors -- @lock_d and
 		 * @lock_d_src.
 		 */
-		ft_flip_txn_record_release_lock(g->txn, h.lock, h.lock_snap);
 		ft_flip_txn_lock_register(g->txn, h.lock, h.lock_snap);
+		ft_flip_txn_record_release_lock(g->txn, h.lock, h.lock_snap);
 	}
 	return 0;
 }
@@ -10460,10 +10460,10 @@ enum urcu_txn_status ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue 
 			 * descriptor permanently.  One word, one terminal; the
 			 * retire outranks.
 			 */
-			ft_flip_txn_record_anchor_release_held(g->txn,
-				g->publish_gp_holder);
 			ft_flip_txn_lock_register(g->txn, g->publish_gp_holder,
 				g->publish_gp_snap);
+			ft_flip_txn_record_anchor_release_held(g->txn,
+				g->publish_gp_holder);
 		}
 		g->publish_gp_holder = NULL;
 		g->publish_gp_shared = false;
@@ -10522,10 +10522,10 @@ publish_done:
 		 * The retire above still lands -- it settles @cn's own word.
 		 */
 		if (!g->split_cn_shared) {
-			ft_flip_txn_record_anchor_release(g->txn, &sh,
-				g->split_cn_node);
 			ft_flip_txn_lock_register(g->txn, g->split_cn_holder,
 				g->split_cn_snap);
+			ft_flip_txn_record_anchor_release(g->txn, &sh,
+				g->split_cn_node);
 		}
 		/*
 		 * OWNERSHIP TRANSFER (mirror publish_parent_holder): once
