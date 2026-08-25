@@ -1751,6 +1751,16 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 * no longer part of it.
 	 */
 	ft_flip_txn_set_structural_sw(txn, true);
+#ifdef FT_REKEY_CLAIM
+	/*
+	 * 9.1 AUDIT: this writer is HAND-armed, so B0's owner assert never runs on
+	 * it -- @dbg_arm_per_op is set only by ft_flip_txn_arm_per_op and the claim.
+	 * Point the claim at the one already-armed SW content site and the assert
+	 * names every slot it parks without owning, which is what §9.1 calls its
+	 * missing fine-lock conversions.
+	 */
+	ft_flip_txn_claim_per_op(txn);
+#endif
 	if (!merge_dst) {
 		ft_lock_ctx_init(&lctx_src, &d_src, txn, optxn);
 		/*
