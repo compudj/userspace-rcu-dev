@@ -10508,6 +10508,18 @@ publish_done:
 			.node_held = false,
 		};
 
+		/*
+		 * THE REGISTRY OWNERSHIP belongs to the acquire that FIRST took the
+		 * word, so a deduped member registers nothing -- an earlier member
+		 * already did.  ★ REGISTER BEFORE THE RETIRE, not after it: the
+		 * retire records @cn's own word and asks ft_flip_txn_owns who owns
+		 * what it writes, so the registry has to name the holder ALREADY.
+		 * Registering below the retire answered "not held" for a fence this
+		 * op demonstrably holds -- it is retiring under it.
+		 */
+		if (!g->split_cn_shared)
+			ft_flip_txn_lock_register(g->txn, g->split_cn_holder,
+				g->split_cn_snap);
 		{
 			struct ft_lock_ctx dctx;
 
@@ -10516,17 +10528,16 @@ publish_done:
 				g->split_cn_node);
 		}
 		/*
-		 * The RELEASE half, and the registry ownership that goes with it,
-		 * belong to the acquire that FIRST took the word: a deduped member
-		 * records neither (ft_flip_txn_record_anchor_release asserts it).
-		 * The retire above still lands -- it settles @cn's own word.
+		 * The RELEASE half belongs to that same first acquire: a deduped
+		 * member records none (ft_flip_txn_record_anchor_release asserts
+		 * it).  It stays BELOW the retire, which is where it has always
+		 * been -- at per-node granularity it is a no-op because the retire
+		 * already settled @cn's own word, and under coarsening it lands on
+		 * the ANCHOR, a different word entirely.
 		 */
-		if (!g->split_cn_shared) {
-			ft_flip_txn_lock_register(g->txn, g->split_cn_holder,
-				g->split_cn_snap);
+		if (!g->split_cn_shared)
 			ft_flip_txn_record_anchor_release(g->txn, &sh,
 				g->split_cn_node);
-		}
 		/*
 		 * OWNERSHIP TRANSFER (mirror publish_parent_holder): once
 		 * registered, the txn OWNS @cn's fence clear -- a commit consumes
