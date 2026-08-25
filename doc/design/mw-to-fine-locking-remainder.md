@@ -740,13 +740,20 @@ Unchanged as an ordering, but each step is now
 *owner-complete → claim → arm*, one site per step, one adversarial skeptic per
 claimed exclusion argument:
 
-1. `ft-insert.h:776` — the insert one-commit (39.3M; 14.3% held).
-2. `ft-remove.h:2877` — remove commit_rec (39.2M; 10.3% held).
-3. The PUBLISH LANE — `struct ft_pub_rec.owner[3]` is never filled, so every
-   edge a publish produces is unowned by default. `ft-remove.h:3958` is 100% of
-   that (0% held), and it is two-thirds of `ft-remove.h:3735` too. Add the
-   `owner` parameter to `ft_pub_rec_add` and name it at its four call sites;
-   this is plumbing and it moves more than any single site row.
+1. `ft-insert.h` insert one-commit — ☑ **OWNER-COMPLETE** (14.3% → 40.1% held).
+   Its claim dry-run passes ft_unit AND ft_inv `FT_INV_MW=1` at 507 threads with
+   no abort. NOT armed: the arm waits on 9.1, and its placement is an open API
+   question (`ft_flip_txn_arm_per_op` has zero call sites and refuses an empty
+   registry, yet kind dispatch happens at RECORD time). ☞ Read the DRY RUN as
+   the readiness signal, not the percentage — the counter also prices records on
+   txns the arm refuses outright.
+2. `ft-remove.h` remove commit_rec (39.2M; 25.5% held after the class fixes).
+3. The PUBLISH LANE — ☑ **LANDED** `6f54e698`: `ft_pub_rec_add` takes an `owner`
+   and all four producers name it. Every such slot is a BODY slot, so the owner
+   is the node the slot LIVES IN — which is not always `@parent_nf`, and
+   `695d23c1` fixed the one caller that passes it for a different job.
+   ☐ REMAINDER: the rec → `ft_ord_cell_edge` conversions copy `.root` and DROP
+   `.owner`, which is why `ft-remove.h:3958` still reads 0%.
 4. `ft-remove.h:882` — the detach-side creator (7.8M; 41.9% held, the closest
    to ready, and also the largest content-lane abort source).
 5. The remaining content sites in descending count.
@@ -1037,7 +1044,19 @@ stale) — watch it across Phase B, it shares words with the converted sites.
     9.2 root-cause cross_view                               ☠ BLOCKED — 96 clean runs at
                                                               its own control commit; §9.2
                                                               names the two stand-ins
-    9.1 rekey 109/111/122 fine-lock completion              (in flight)
+    9.1 rekey fine-lock completion                         (IN FLIGHT) — the reds are
+                                                              110/112/123 now (two
+                                                              regression tests shifted the
+                                                              indices).  ☞ TWO HALVES: the
+                                                              fine-lock conversions (what
+                                                              blocks B1) and the atomic
+                                                              writers for the deleted staged
+                                                              writer's shapes (what greens
+                                                              the three).  -DFT_REKEY_CLAIM
+                                                              (658989ef) enumerates the
+                                                              first, abort by abort;
+                                                              695d23c1 / d67851c6 / bec0c726
+                                                              landed
     B0  per-op arm helper + record-time owner assert        ☑ LANDED — and its first
                                                               measurement says NO site is
                                                               owner-complete (11.9% of the
@@ -1045,13 +1064,17 @@ stale) — watch it across Phase B, it shares words with the converted sites.
     B0b the owner predicate: registry ∪ hold-ledger        ☑ LANDED @92e27199 — worth
                                                               1.7 pts; its first zero was an
                                                               INSTRUMENT BUG (§4)
-    Bx  the external-head class                            ☠ SPLIT IN THREE (§4), and the
-                                                              "§8.2" citation was PHANTOM.
-                                                              head promote ☑ LANDED (0%→33.3%,
-                                                              plumbing); publish-lane owner[]
-                                                              ☐ plumbing, the big one; external
+    Bx  the external-head class                            ☠ SPLIT IN THREE (§4).  head
+                                                              promote ☑ LANDED e9268e13
+                                                              (0%→33.3%); publish-lane owner[]
+                                                              ☑ LANDED 6f54e698; external
                                                               back-edge ☐ the real DESIGN call,
-                                                              and the smallest of the three
+                                                              and the smallest of the three.
+                                                              ☞ The "§8.2" reference is NOT
+                                                              phantom — it is the ESCALATION
+                                                              MODEL's §8.2 (b44d08cc); the two
+                                                              design docs reuse section
+                                                              numbers, so always name the doc
     B1-5 five hot sites, one at a time                      (each: owner-complete -> claim
                                                               dry-run -> arm; NOT mechanical)
     B6  retire hand-arming (rekey writer, root COW)         (small)
