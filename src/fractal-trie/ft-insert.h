@@ -553,6 +553,56 @@ bool ft_probe_internal_is_empty(struct cds_ft *ft,
  * before-publish; with a recorded forward edge the cluster only becomes
  * reachable at the commit, by which time the wiring is complete either way).
  */
+/*
+ * §9.3, the GP member: "Lock-set: {C, P} (+ {GP} iff P compressed)".
+ *
+ * A publish under a COMPRESSED parent writes TWO slots, because a skip pointer
+ * is a shortcut that names the FAR END: besides @parent_nf's own child slot,
+ * _ft_publish_to_parent re-encodes the SKIP_X dual -- and that slot lives in
+ * GP's BODY, so §8.2 makes GP its owner.  The op must therefore HOLD GP, not
+ * merely write through it.
+ *
+ * ☠ THE CONDITION MIRRORS THE PRODUCER EXACTLY, including the mtxn the slot is
+ * resolved with (NULL, as ft_insert_publish_or_park's @rec carries none): an
+ * acquire taken on a different derivation than the record locks the wrong word,
+ * and one taken where no dual is recorded is pure contention on the hottest
+ * insert path.
+ *
+ * A COMPRESSED ROOT's dual slot IS &ft->root, which has no owning node and
+ * takes the always-MW ft_flip_txn_record_root route -- nothing to acquire.
+ *
+ * Registering hands the fence to @ic->txn, so every pre-publish bail that
+ * destroys the txn clears it; a miss sets @acquire_miss and the commit aborts
+ * all-or-none, exactly as the P acquire beside it does.
+ */
+static
+void ft_insert_lock_skip_dual_gp(struct cds_ft *ft,
+		const struct ft_lock_ctx *ctx,
+		struct cds_ft_inode_flag *parent_nf,
+		struct ft_insert_commit *ic)
+{
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+	struct cds_ft_compressed_node *cn;
+	struct cds_ft_metadata *cn_meta;
+	struct cds_ft_inode_flag *gp_nf = NULL;
+	struct cds_ft_inode_flag **skip_slot;
+
+	if (!parent_nf || !ft_node_compressed(parent_nf))
+		return;
+	cn = ft_compressed_node_ptr(parent_nf);
+	cn_meta = cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
+	skip_slot = ft_txn_parent_slot_at(cn_meta, ft, NULL, &gp_nf);
+	if (!skip_slot || !ft_node_skip_compressed(*skip_slot))
+		return;			/* no dual edge will be recorded */
+	if (skip_slot == &ft->root || !gp_nf)
+		return;			/* root dual: no owning node */
+	ft_flip_txn_lock_or_guard_parent(ft, ic->txn, ctx, gp_nf,
+		FT_DEPTH_FROM_DESCENT);
+#else
+	(void) ft; (void) ctx; (void) parent_nf; (void) ic;
+#endif
+}
+
 static
 void ft_insert_publish_or_park(struct cds_ft *ft,
 		const struct ft_lock_ctx *ctx,
@@ -607,6 +657,7 @@ void ft_insert_publish_or_park(struct cds_ft *ft,
 		ft_flip_txn_hold_or_lock_parent(ft, ic->txn, ctx, parent_nf,
 			parent_depth, ic->parent_locked_holder,
 			ic->parent_locked_snap);
+	ft_insert_lock_skip_dual_gp(ft, ctx, parent_nf, ic);
 	_ft_publish_to_parent(ft, parent_nf, slot, new_top, expected_old, &rec);
 	ft_flip_txn_record_pub_rec(ic->txn, &rec);
 	ic->slot = slot;	/* sentinel: one-commit forward recorded */
@@ -773,7 +824,11 @@ int ft_insert_commit_arm(struct cds_ft *ft, struct ft_insert_commit *ic,
 	 * bears metadata);
 	 * + 1 once coarsening splits the split-retire terminal in two, the retired
 	 * cn's tombstone no longer being the same word as the release of the lock
-	 * that protected it (ft_flip_txn_record_retire_anchored).
+	 * that protected it (ft_flip_txn_record_retire_anchored);
+	 * + 1 for the SKIP_X dual's GP release terminal (§9.3's GP member: a publish
+	 * under a COMPRESSED parent re-encodes a dual slot living in GP's body, so
+	 * the op acquires GP -- ft_insert_lock_skip_dual_gp -- and its release rides
+	 * this commit).
 	 */
 	unsigned int anchored = ft->lock_spacing == CDS_FT_LOCK_SPACING_PER_NODE ?
 			0 : 1;
@@ -786,7 +841,7 @@ int ft_insert_commit_arm(struct cds_ft *ft, struct ft_insert_commit *ic,
 	 * still carries @ic->op for enrolment; what it must not do is commit
 	 * through it.
 	 */
-	ic->txn = ft_flip_txn_create_bounded(ft, 14 + anchored + count_edges);
+	ic->txn = ft_flip_txn_create_bounded(ft, 15 + anchored + count_edges);
 	if (!ic->txn)
 		return -ENOMEM;
 	return 0;
