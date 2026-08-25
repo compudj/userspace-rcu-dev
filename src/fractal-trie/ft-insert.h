@@ -272,8 +272,19 @@ void ft_park_live_parent_edge(struct cds_ft *ft,
 	 * for MW_ALWAYS -- the ft_flip_txn_record_root treatment for a word that
 	 * can never convert.
 	 */
-	ft_flip_txn_record_tag_mw(txn, (void **) field, *field, new_parent,
-		FT_FLIP_PROXY_TAG);
+	/*
+	 * ☠ THE EXPECTED-OLD IS READ THROUGH THE TXN, NEVER RAW.  @field is a
+	 * TRANSACTED word: a concurrent op can have a transient proxy parked in
+	 * it, and a raw `*field` hands that descriptor POINTER to the engine as
+	 * the expected-old -- which urcu_txn_add traps under a debug build
+	 * ("Debug builds still trap, to name the raw read") and which silently
+	 * records a value no reader ever sees otherwise.  ft_pub_rec_add_back_edge
+	 * reads the same class of word the same way.
+	 */
+	ft_flip_txn_record_tag_mw(txn, (void **) field,
+		urcu_txn_load(ft_flip_txn_handle(txn), (void **) field,
+			FT_FLIP_PROXY_TAG),
+		new_parent, FT_FLIP_PROXY_TAG);
 }
 
 /*
