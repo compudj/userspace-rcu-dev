@@ -2153,6 +2153,26 @@ skip_copy:
 					struct cds_ft_inode_flag *skip_new =
 						ft_skip_compressed_flag(
 							new_node_flag, cn->len);
+					/*
+					 * @skip_slot is a slot in GP (see above),
+					 * and §8.2 puts a node's body under its
+					 * own lock -- so GP owns this edge.  Taken
+					 * from the descent hint when there is one,
+					 * for the same reason @skip_slot itself is:
+					 * cn's back edge can be stale.
+					 */
+					struct cds_ft_inode_flag *skip_owner_nf =
+						NULL;
+
+					if (skip_slot != &ft->root) {
+						if (inh_hint)
+							skip_owner_nf =
+								inh_hint->gp;
+						else
+							(void) ft_resolve_parent_slot(
+								cn_meta, ft,
+								&skip_owner_nf);
+					}
 
 					if (rec)
 						/* SW compaction: *slot == plan old.
@@ -2160,7 +2180,11 @@ skip_copy:
 						 * IS &ft->root. */
 						ft_pub_rec_add(rec, skip_slot,
 							*skip_slot, skip_new,
-							skip_slot == &ft->root);
+							skip_slot == &ft->root,
+							skip_owner_nf ?
+							ft_flag_to_metadata(ft,
+								skip_owner_nf) :
+							NULL);
 					else
 						*skip_slot = skip_new;
 				}
@@ -2306,12 +2330,24 @@ skip_copy:
 	 * metadata stores above it (a plain store would let a weakly-ordered
 	 * architecture expose an unwired copy).
 	 */
-	if (mode == FT_RECOMPACT_RELOCATE)
+	if (mode == FT_RECOMPACT_RELOCATE) {
 		/* SW compaction: *slot == plan old.  Relocating the ROOT node
 		 * publishes into &ft->root (ft_compact_descend starts its walk
 		 * there), so the holder slot must be asked. */
+		struct cds_ft_inode_flag *holder_nf = NULL;
+
+		/*
+		 * The holder slot lives in @metadata's PARENT (§8.2: a node's
+		 * body is its own), so that is the word that owns this edge --
+		 * resolved rather than assumed, because a root relocation has no
+		 * owning node and takes the always-MW route through @root.
+		 */
+		if (old_node_flag_ptr != &ft->root)
+			(void) ft_resolve_parent_slot(metadata, ft, &holder_nf);
 		ft_pub_rec_add(rec, old_node_flag_ptr, *old_node_flag_ptr,
-			new_node_flag, old_node_flag_ptr == &ft->root);
+			new_node_flag, old_node_flag_ptr == &ft->root,
+			holder_nf ? ft_flag_to_metadata(ft, holder_nf) : NULL);
+	}
 	else
 		*old_node_flag_ptr = new_node_flag;
 	if (old_node && old_node_ret)

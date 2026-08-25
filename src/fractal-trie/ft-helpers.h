@@ -2129,24 +2129,38 @@ struct cds_ft_inode_flag **ft_get_parent_slot(const struct cds_ft_metadata *meta
  * @mtxn NULL answers exactly as ft_get_parent_slot does.
  */
 static inline
-struct cds_ft_inode_flag **ft_txn_parent_slot(const struct cds_ft_metadata *meta,
-		struct cds_ft *ft, struct urcu_txn *mtxn)
+struct cds_ft_inode_flag **ft_txn_parent_slot_at(const struct cds_ft_metadata *meta,
+		struct cds_ft *ft, struct urcu_txn *mtxn,
+		struct cds_ft_inode_flag **parent_out)
 {
 	struct cds_ft_inode_flag *parent;
 	void *state;
 
+	if (parent_out)
+		*parent_out = NULL;
 	if (!mtxn)
-		return ft_resolve_parent_slot(meta, ft, NULL);
+		return ft_resolve_parent_slot(meta, ft, parent_out);
 	parent = urcu_txn_load(mtxn,
 		(void **) (uintptr_t) &meta->parent_word, FT_FLIP_PROXY_TAG);
 	state = urcu_txn_load(mtxn,
 		(void **) (uintptr_t) &meta->parent_slot_offset, FT_STATE_PROXY);
 	if (ft_parent_is_root_position(parent))
 		return &ft->root;
+	/*
+	 * @parent_out is the node the returned slot LIVES IN -- the word that
+	 * owns that slot (§8.2: a node's body is its own).  Handed back rather
+	 * than re-derived by the caller, because only the RYW load above can see
+	 * a re-parent this very commit recorded.
+	 */
+	if (parent_out)
+		*parent_out = ft_parent_node(parent);
 	return (struct cds_ft_inode_flag **)
 		((char *) ft_node_ptr(parent) +
 		 FT_PSO_DECODE(state) * sizeof(void *));
 }
+
+#define ft_txn_parent_slot(meta, ft, mtxn)				\
+	ft_txn_parent_slot_at((meta), (ft), (mtxn), NULL)
 
 /*
  * ft_slot_in_node: is @slot one of @node_flag's OWN child slots?
@@ -2407,10 +2421,26 @@ struct cds_ft_metadata *ft_skip_to_compressed_meta(struct cds_ft *ft,
 static
 void ft_pub_rec_add(struct ft_pub_rec *rec, struct cds_ft_inode_flag **slot,
 		struct cds_ft_inode_flag *expected_old,
-		struct cds_ft_inode_flag *new_val, bool root)
+		struct cds_ft_inode_flag *new_val, bool root,
+		struct cds_ft_metadata *owner)
 {
 	assert(rec->n < 3);
 	rec->slot[rec->n] = slot;
+	/*
+	 * @owner: the node whose lock excludes every other writer of @slot.
+	 * Every slot here is a BODY slot -- a forward child pointer or a SKIP_X
+	 * dual -- and mw-writer-lock-escalation-model.md §8.2 puts a node's body
+	 * under that node's own lock, so the owner is the node the slot LIVES IN,
+	 * never the child it points at.
+	 *
+	 * NULL where the producer cannot name one, and for a ROOT slot, which has
+	 * no owning node at all and takes the always-MW route through @root
+	 * instead.  A producer that leaves this unset only declines to convert
+	 * (see struct ft_pub_rec), so a missing owner is safe and merely counts
+	 * OWN_MISS -- which is what it did at EVERY producer before this
+	 * parameter existed.
+	 */
+	rec->owner[rec->n] = owner;
 	/*
 	 * @root: a TRIE ROOT slot, which every replay must record MW (see
 	 * struct ft_pub_rec).  A parameter rather than a re-derivation,
@@ -2592,9 +2622,11 @@ void _ft_publish_to_parent_meta(struct cds_ft *ft,
 			 * relocating @cn's parent in the same commit that
 			 * refreshes the dual.  See ft_txn_parent_slot.
 			 */
+			struct cds_ft_inode_flag *skip_owner_nf = NULL;
 			struct cds_ft_inode_flag **skip_slot =
-				ft_txn_parent_slot(cn_meta, ft,
-					rec ? rec->mtxn : NULL);
+				ft_txn_parent_slot_at(cn_meta, ft,
+					rec ? rec->mtxn : NULL,
+					&skip_owner_nf);
 			if (skip_slot &&
 			    ft_node_skip_compressed(*skip_slot)) {
 				struct cds_ft_inode_flag *skip_new =
@@ -2609,7 +2641,11 @@ void _ft_publish_to_parent_meta(struct cds_ft *ft,
 						ft_skip_compressed_flag(
 							expected_old, cn->len),
 						skip_new,
-						skip_slot == &ft->root);
+						skip_slot == &ft->root,
+						skip_slot == &ft->root ||
+						!skip_owner_nf ? NULL :
+						ft_flag_to_metadata(ft,
+							skip_owner_nf));
 				else if (*skip_slot != skip_new)
 					rcu_assign_pointer(*skip_slot, skip_new);
 			}
@@ -2645,7 +2681,9 @@ void _ft_publish_to_parent_meta(struct cds_ft *ft,
 			(const void *) new_child);
 	if (rec)
 		ft_pub_rec_add(rec, parent_slot, expected_old, new_child,
-			parent_slot == &ft->root);
+			parent_slot == &ft->root,
+			parent_slot == &ft->root || !parent_nf ? NULL :
+				ft_flag_to_metadata(ft, parent_nf));
 	else if (*parent_slot != new_child)
 		/*
 		 * Direct (rec == NULL) publish.  The only two callers -- the

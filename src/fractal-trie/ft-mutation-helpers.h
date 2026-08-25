@@ -6494,9 +6494,16 @@ void ft_pub_rec_add_back_edge(struct cds_ft *ft, struct ft_pub_rec *rec,
 	 */
 	/* A BACK edge (&cell->parent / &node->prev): inside the child, never a
 	 * trie root -- a root has no back-edge to record. */
+	/*
+	 * NO OWNER, and this is the ONE producer for which that is a finding
+	 * rather than an omission: @field is an EXTERNAL head's back channel
+	 * (cell->parent / node->prev), and no lock word owns it -- see
+	 * FT_OWNER_NONE_EXTERNAL_HEAD and the open fork it names.  Every other
+	 * ft_pub_rec_add is a BODY slot whose node owns it.
+	 */
 	ft_pub_rec_add(rec, field,
 		urcu_txn_load(txn->mtxn, (void **) field, FT_FLIP_PROXY_TAG),
-		new_parent, /*root=*/ false);
+		new_parent, /*root=*/ false, FT_OWNER_NONE_EXTERNAL_HEAD);
 }
 
 /*
