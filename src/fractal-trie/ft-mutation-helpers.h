@@ -844,8 +844,19 @@ extern unsigned long cds_ft_probe_promote_guarded;
 	do { (t)->dbg_arm_per_op = false; } while (0)
 # define FT_OWNER_ASSERT_SET_PER_OP(t)					\
 	do { (t)->dbg_arm_per_op = true; } while (0)
+/*
+ * ☠ @nr_locks IS PART OF THE PREDICATE, not a shortcut.  ft_flip_txn_arm_per_op
+ * REFUSES an empty registry -- a commit holding nothing owns nothing -- so a txn
+ * that has registered no lock is one the arm never touches, and asserting on it
+ * reports a gap that no conversion could ever close.  For the real arm the term
+ * is inert (it arms only when @nr_locks is already non-zero, and the registry
+ * never shrinks).  What it buys is the DRY RUN: a claim must be set before the
+ * records it wants to check, which is necessarily before the op's acquires have
+ * finished, and this is what stops that from reporting every pre-acquire record
+ * as a miss.
+ */
 # define FT_OWNER_ASSERT_OWNED(t, owner)				\
-	urcu_assert_debug(!(t)->dbg_arm_per_op ||			\
+	urcu_assert_debug(!(t)->dbg_arm_per_op || !(t)->nr_locks ||	\
 			ft_flip_txn_owns((t), (owner)))
 #else
 # define FT_OWNER_ASSERT_TXN_FIELD
@@ -3098,6 +3109,38 @@ void ft_flip_txn_set_structural_sw(struct ft_flip_txn *t, bool v)
  * against a registry that does not yet name its owner -- so the arm belongs
  * after the last ft_flip_txn_lock_register of the op, not after the first.
  */
+/*
+ * THE DRY RUN'S GATE: claim exactly where ft_flip_txn_arm_per_op would ARM, and
+ * nowhere else.
+ *
+ * ft_flip_txn_claim_per_op on its own claims unconditionally, which is wrong for
+ * a readiness measurement in the same way an ungated arm would be wrong for a
+ * conversion: it points the record-time assert at tries the arm REFUSES -- a
+ * COARSE or exclusive trie armed on the constructor's wider argument, or a
+ * non-FINE one -- and every record there reports a gap the site does not have.
+ * Measured: the ungated form aborts inside test_lifecycle_lock_spacing, a
+ * single-threaded trie no per-op arm would ever touch.
+ *
+ * ☠ IT CANNOT REPRODUCE THE @nr_locks REFUSAL, and that is a real limit rather
+ * than an oversight.  The arm belongs after the op's LAST lock_register, where
+ * an empty registry means "this commit owns nothing"; a dry run has to claim
+ * BEFORE the records it wants checked, which for most sites is before the
+ * acquires finish.  So a site whose records precede its own acquires still
+ * reports misses here -- and those are ORDERING findings, the class already
+ * fixed three times (92e27199, e9268e13, 8e8d0232), not false alarms.  Read a
+ * miss as "this record is planted before its owner is registered" first.
+ */
+static inline
+void ft_flip_txn_claim_per_op_armable(const struct cds_ft *ft,
+		struct ft_flip_txn *t)
+{
+	if (ft_txn_content_sw_ok(ft))
+		return;		/* the constructor armed it trie-wide */
+	if (!ft || !ft->lock_fine)
+		return;
+	ft_flip_txn_claim_per_op(t);
+}
+
 static inline
 void ft_flip_txn_arm_per_op(const struct cds_ft *ft, struct ft_flip_txn *t)
 {
