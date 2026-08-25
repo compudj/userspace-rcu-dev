@@ -955,13 +955,36 @@ enum urcu_txn_status ft_store_at_graft_point_commit(struct cds_ft *ft,
 		 * from the reserved txn (no allocation here).
 		 */
 		/*
-		 * @slot was resolved out of @st->dest itself
-		 * (ft_node_get_nth_skip above), so the node that owns it is
-		 * @st->dest -- the same node whose nr_child this arm records.
+		 * ☠ WHETHER THIS SLOT IS RECORDED AT ALL IS AN ARM QUESTION,
+		 * because the two arms write two different KINDS of word.
+		 *
+		 * RELOCATION: @st->dest is the fresh copy the reserve's recompact
+		 * produced -- build-invisible, reachable by nothing until the
+		 * grandparent forward edge above publishes it.  A slot in its
+		 * INTERIOR is not a reachability edge, so it takes a PLAIN STORE
+		 * like every other write into that private body (the copy loops,
+		 * ft_set_parent at the resolve above, the nr_keys bake below).
+		 * Recording it buys no atomicity: the engine flips a SET of slots,
+		 * and the set that matters -- the grandparent edge plus the cell
+		 * run-splice -- is already this one commit, so a reader sees
+		 * nothing and then a fully wired @st->dest either way.  This is
+		 * ft_glue_apply_deferred's per-edge rule ("unreachable until the
+		 * forward flip is what licenses the plain store"), which this arm
+		 * was the one outlier from.
+		 *
+		 * IN-PLACE: @st->dest is LIVE, so its slot IS reader-visible now
+		 * and the write must ride the flip -- that is what makes the
+		 * grafted key appear atomically with the ordered-list splice.
+		 * @slot was resolved out of @st->dest itself, so the node that
+		 * owns it is @st->dest, the same node whose nr_child this arm
+		 * records.
 		 */
-		ft_flip_txn_record_reserved(st->glue->txn,
-			/*owner=*/ ft_flag_to_metadata(ft, st->dest),
-			(void **) slot, NULL, (void *) st->slot_value);
+		if (st->old_recompacted_node)
+			*slot = st->slot_value;
+		else
+			ft_flip_txn_record_reserved(st->glue->txn,
+				/*owner=*/ ft_flag_to_metadata(ft, st->dest),
+				(void **) slot, NULL, (void *) st->slot_value);
 		if (run) {
 			rn = ft_ord_cell_run_splice_edges(ft, run->run_first,
 				run->run_last, run->pred, run->succ, redges, 0);
