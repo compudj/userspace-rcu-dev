@@ -3334,18 +3334,128 @@ void ft_flip_txn_claim_per_op_armable(const struct cds_ft *ft,
 	ft_flip_txn_claim_per_op(t);
 }
 
-static inline
-void ft_flip_txn_arm_per_op(const struct cds_ft *ft, struct ft_flip_txn *t)
+/*
+ * -DFT_ARM_REACH: DID THIS ARM EVEN RUN, and if it ran, WHICH TERM REFUSED IT?
+ * Per CALL SITE (`__FILE__:__LINE__`, one static record each, linked once).
+ *
+ * ★ WHY IT IS NOT ANSWERED BY THE armSW COLUMN, and why every Phase B arm gets
+ * one.  ft-txn-kind-stats prices records per TXN CREATION SITE, so armSW cannot
+ * tell an arm that never RAN from one that ran and was REFUSED, and it credits
+ * a DIFFERENT frame's hand-arm (the rekey writer's) to the site whose txn it
+ * armed.  Measured: B2's in-place arm read as "0.7% of the site" off armSW and
+ * is entered TEN times in a whole ft_inv run
+ * ([[feedback_armsw_is_not_an_arms_yield]]).
+ *
+ * The readable acceptance number is armSW against OK -- committing txns -- not
+ * against `created`, since a site with heavy BAILED can never show a high
+ * fraction of the latter however perfect the arm.
+ *
+ * Byte-neutral without the define: @rs is NULL and every hit compiles out.
+ */
+#ifdef FT_ARM_REACH
+struct ft_arm_reach_site {
+	const char *file;
+	int line;
+	int linked;
+	unsigned long reach, triewide, nofine, nolocks, spacing, armed;
+	struct ft_arm_reach_site *next;
+};
+
+static struct ft_arm_reach_site *ft_arm_reach_head;
+
+static
+void ft_arm_reach_link(struct ft_arm_reach_site *rs)
 {
-	if (ft_txn_content_sw_ok(ft))
+	struct ft_arm_reach_site *old;
+
+	if (uatomic_load(&rs->linked, CMM_ACQUIRE))
+		return;
+	if (uatomic_cmpxchg(&rs->linked, 0, 1) != 0)
+		return;
+	do {
+		old = uatomic_load(&ft_arm_reach_head, CMM_RELAXED);
+		rs->next = old;
+	} while (uatomic_cmpxchg(&ft_arm_reach_head, old, rs) != old);
+}
+
+static __attribute__((destructor))
+void ft_arm_reach_report(void)
+{
+	struct ft_arm_reach_site *rs;
+
+	fprintf(stderr, "\n=== FT_ARM_REACH: per-op arm, reach vs refusal, "
+		"per CALL SITE ===\n%-46s %10s %10s %10s %10s %10s %10s\n",
+		"site", "reach", "armed", "trie-wide", "!fine", "!nr_locks",
+		"spacing");
+	for (rs = uatomic_load(&ft_arm_reach_head, CMM_ACQUIRE); rs;
+			rs = rs->next) {
+		char where[64];
+
+		snprintf(where, sizeof(where), "%s:%d", rs->file, rs->line);
+		fprintf(stderr, "%-46s %10lu %10lu %10lu %10lu %10lu %10lu\n",
+			where,
+			uatomic_load(&rs->reach, CMM_RELAXED),
+			uatomic_load(&rs->armed, CMM_RELAXED),
+			uatomic_load(&rs->triewide, CMM_RELAXED),
+			uatomic_load(&rs->nofine, CMM_RELAXED),
+			uatomic_load(&rs->nolocks, CMM_RELAXED),
+			uatomic_load(&rs->spacing, CMM_RELAXED));
+	}
+	fprintf(stderr, "    reach == armed + the four refusals.  Read `armed` "
+		"against the site's OK column, never against `created`.\n");
+}
+
+# define FT_ARM_REACH_HIT(rs, field)					\
+	do {								\
+		struct ft_arm_reach_site *_r = (rs);			\
+									\
+		if (_r) {						\
+			ft_arm_reach_link(_r);				\
+			uatomic_inc(&_r->field);			\
+		}							\
+	} while (0)
+#else
+# define FT_ARM_REACH_HIT(rs, field)	do { (void) (rs); } while (0)
+#endif	/* FT_ARM_REACH */
+
+static inline
+void ft_flip_txn_arm_per_op_at(const struct cds_ft *ft, struct ft_flip_txn *t,
+		void *rs)
+{
+	FT_ARM_REACH_HIT(rs, reach);
+	if (ft_txn_content_sw_ok(ft)) {
+		FT_ARM_REACH_HIT(rs, triewide);
 		return;		/* the constructor armed it trie-wide */
-	if (!ft || !ft->lock_fine || !t->nr_locks)
+	}
+	if (!ft || !ft->lock_fine) {
+		FT_ARM_REACH_HIT(rs, nofine);
 		return;
-	if (!ft_txn_per_op_spacing_ok(ft))
+	}
+	if (!t->nr_locks) {
+		FT_ARM_REACH_HIT(rs, nolocks);
 		return;
+	}
+	if (!ft_txn_per_op_spacing_ok(ft)) {
+		FT_ARM_REACH_HIT(rs, spacing);
+		return;
+	}
 	ft_flip_txn_claim_per_op(t);
 	ft_flip_txn_set_structural_sw(t, true);
+	FT_ARM_REACH_HIT(rs, armed);
 }
+
+#ifdef FT_ARM_REACH
+#define ft_flip_txn_arm_per_op(ft, t)					\
+	do {								\
+		static struct ft_arm_reach_site _ft_arm_rs = {		\
+			.file = __FILE__, .line = __LINE__ };		\
+									\
+		ft_flip_txn_arm_per_op_at((ft), (t), &_ft_arm_rs);	\
+	} while (0)
+#else
+#define ft_flip_txn_arm_per_op(ft, t)					\
+	ft_flip_txn_arm_per_op_at((ft), (t), NULL)
+#endif
 
 
 static inline
