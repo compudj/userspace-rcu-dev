@@ -15,6 +15,82 @@
 #error "ft-remove.h is an implementation unit; #include it from fractal-trie.c only"
 #endif
 
+#ifdef FT_B2_ARM_PROBE
+/*
+ * -DFT_B2_ARM_PROBE: DID THE PATH EVEN RUN?  Per publish path of
+ * ft_detach_node, how often the path is REACHED carrying a commit txn, and
+ * what ft_flip_txn_arm_per_op's own predicate answers there -- an empty
+ * registry, a non-FINE trie, a spacing the arm refuses, or an arm already in
+ * force.  CALL counters, never failure counters.
+ *
+ * ★ WHY IT IS NOT ANSWERED BY THE armSW COLUMN.  ft-txn-kind-stats prices a
+ * site by TXN CREATION, so an arm that never runs and an arm that runs and is
+ * REFUSED report the same zero -- and a third site hand-arming the same txn
+ * (the rekey fold) reports as this site's armSW.  Splitting reach from refusal
+ * is the only way to read an arm's yield as a property of the arm.
+ *
+ * ☠ MEASURED, and it is the finding: ft_inv FT_INV_MW=1 reaches the IN-PLACE
+ * publish path TEN times in a whole run.  An in-place delete needs
+ * ft_in_place_ok(), which needs an EXCLUSIVE trie -- and an exclusive trie is
+ * one the per-op arm refuses outright -- so on a shared trie every delete
+ * recompacts and only the external PROMOTE sub-case reaches it at all.  The
+ * remove surface commits through the recompaction republish below.
+ */
+static unsigned long ft_b2p_inplace_reach, ft_b2p_inplace_nolocks,
+	ft_b2p_inplace_armed,
+	ft_b2p_pubA_reach, ft_b2p_pubA_nolocks, ft_b2p_pubA_armed,
+	ft_b2p_pubB_reach, ft_b2p_pubB_nolocks, ft_b2p_pubB_armed,
+	ft_b2p_created, ft_b2p_notfine, ft_b2p_nospacing;
+
+static __attribute__((destructor))
+void ft_b2_arm_probe_report(void)
+{
+	fprintf(stderr,
+"# FT_B2_ARM_PROBE (ft_detach_node commit_txn, per publish path)\n"
+"#   created           %lu   (!lock_fine %lu, bad spacing %lu)\n"
+"#   in-place  reach   %lu   nr_locks==0 %lu   armed %lu\n"
+"#   republish A reach %lu   nr_locks==0 %lu   armed %lu\n"
+"#   republish B reach %lu   nr_locks==0 %lu   armed %lu\n",
+		uatomic_load(&ft_b2p_created, CMM_RELAXED),
+		uatomic_load(&ft_b2p_notfine, CMM_RELAXED),
+		uatomic_load(&ft_b2p_nospacing, CMM_RELAXED),
+		uatomic_load(&ft_b2p_inplace_reach, CMM_RELAXED),
+		uatomic_load(&ft_b2p_inplace_nolocks, CMM_RELAXED),
+		uatomic_load(&ft_b2p_inplace_armed, CMM_RELAXED),
+		uatomic_load(&ft_b2p_pubA_reach, CMM_RELAXED),
+		uatomic_load(&ft_b2p_pubA_nolocks, CMM_RELAXED),
+		uatomic_load(&ft_b2p_pubA_armed, CMM_RELAXED),
+		uatomic_load(&ft_b2p_pubB_reach, CMM_RELAXED),
+		uatomic_load(&ft_b2p_pubB_nolocks, CMM_RELAXED),
+		uatomic_load(&ft_b2p_pubB_armed, CMM_RELAXED));
+}
+
+#define FT_B2P_PATH(name, ft, txn)					\
+	do {								\
+		if (txn) {						\
+			uatomic_inc(&ft_b2p_##name##_reach);		\
+			if (!(txn)->nr_locks)				\
+				uatomic_inc(&ft_b2p_##name##_nolocks);	\
+			if ((txn)->structural_sw)			\
+				uatomic_inc(&ft_b2p_##name##_armed);	\
+		}							\
+	} while (0)
+#define FT_B2P_CREATED(ft, txn)						\
+	do {								\
+		if (txn) {						\
+			uatomic_inc(&ft_b2p_created);			\
+			if (!(ft)->lock_fine)				\
+				uatomic_inc(&ft_b2p_notfine);		\
+			else if ((ft)->lock_spacing !=			\
+					CDS_FT_LOCK_SPACING_PER_NODE)	\
+				uatomic_inc(&ft_b2p_nospacing);		\
+		}							\
+	} while (0)
+#else
+#define FT_B2P_PATH(name, ft, txn)	do { } while (0)
+#define FT_B2P_CREATED(ft, txn)		do { } while (0)
+#endif	/* FT_B2_ARM_PROBE */
+
 /*
  * ft_detach_node: detach a node from the trie and prune empty
  * single-child ancestors above it.
@@ -2887,6 +2963,7 @@ int ft_detach_node(struct cds_ft *ft,
 					goto end;
 				}
 			}
+			FT_B2P_CREATED(ft, commit_txn);
 #ifdef FT_REMOVE_CLAIM
 			/*
 			 * §4 STEP B2's DRY RUN, the tool 658989ef was for the rekey
@@ -3146,6 +3223,7 @@ int ft_detach_node(struct cds_ft *ft,
 				 * passes the owner check, not merely the ones this arm
 				 * converts.
 				 */
+				FT_B2P_PATH(inplace, ft, commit_txn);
 				if (commit_txn)
 					ft_flip_txn_arm_per_op(ft, commit_txn);
 				ret = ft_remove_one_commit(ft, pub->slot,
@@ -3301,6 +3379,7 @@ int ft_detach_node(struct cds_ft *ft,
 			 * pre-reserved txn (reserved above; this arm requires
 			 * fuse_cell/run) and cannot fail.
 			 */
+			FT_B2P_PATH(pubA, ft, commit_txn_used ? NULL : commit_txn);
 			if (ft_remove_commit_rec(ft, &rec, fuse_cell, run,
 					commit_txn_used ? NULL : commit_txn,
 					record_only) > 0) {
@@ -3400,6 +3479,7 @@ int ft_detach_node(struct cds_ft *ft,
 					count_delta);
 				count_folded = true;
 			}
+			FT_B2P_PATH(pubB, ft, commit_txn_used ? NULL : commit_txn);
 			if (ft_remove_commit_rec(ft, &rec, NULL, NULL,
 					commit_txn_used ? NULL : commit_txn,
 					record_only) > 0) {
