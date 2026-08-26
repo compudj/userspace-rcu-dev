@@ -1080,124 +1080,62 @@ suite split — "ft_unit clean, only ft_inv aborts" — as a COVERAGE question
 first: ft_inv has dedicated COARSE rekey arms, ft_unit's rekeys run on FINE
 tries.
 
-#### ☐ §9.1(A) — the SIXTH witness: a VISIBILITY gap, not a finding of the same kind
+#### ☑ §9.1(A) IS COMPLETE — `64085ea3`. The claim is CLEAN on BOTH suites.
 
-With the claim gated, ft_unit stays clean and `ft_inv FT_INV_MW=1` advances from
-test 3 to test 9, stopping at:
+    -DFT_REKEY_CLAIM, --enable-rcu-debug:
+      ft_unit                      315 ok / 3 deliberate / NO ABORT
+      ft_inv FT_INV_MW=1 per-node  119 / 119            / NO ASSERTION
 
-    ft_detach_freeze_orphans (ft-remove.h:594) -> ft_detach_freeze_one (:574)
-      -> ft_flip_txn_record_retire_anchored -> the fused {LOCK|s -> TOMBSTONE|s}
+That is the same pair `bbb8e795` used to declare B1 owner-complete, and it is
+§9.1(A)'s completion criterion: **the rekey writer — the one site in the tree
+that already parks SW under FINE — now names an owner it holds at every record it
+plants.** The walk began this session at ft_unit test 112.
 
-`ft->lock_fine == true` (checked first), `owner == node == m`, and printed at the
-abort: `(h->lock == m) && !h->shared && !h->node_held` is **1**,
-`ctx->held.extra == held` is **1**, `txn->nr_locks` is **4**. So the op holds the
-orphan, the ctx witnesses it, and the registry is nowhere near full.
+The last witness turned on a distinction worth keeping: **an owner-check miss
+splits two ways, and only one of them is a defect.** Where the TXN owns the
+mark's clearing, a missing registry entry IS the double-clearing race — the five
+fixes before this one closed exactly that. Where a caller's SWEEP owns it, the
+entry is absent by design: the anchored retire's fused `{LOCK|s -> TOMBSTONE|s}`
+leaves the word tombstoned, `ft_meta_lock_acquire` refuses a tombstone forever,
+so no peer can re-mark it and the sweep is deterministic on both outcomes. That
+site also *cannot* register — `FT_MAX_DEPTH == FT_ENTRY_PER_NODE + 1 == 257`.
 
-☠ **THE FIVE-TIMES FIX IS UNAVAILABLE, AND SO ARE BOTH OBVIOUS ALTERNATIVES.**
-`ft_detach_freeze_one` already registers-before-recording when `h->lock != m`;
-the `h->lock == m` arm skips it, and that arm is RIGHT for two independent
-reasons, only one of which is the bound:
+**The mechanism**: the witness travels with the record, the judgment stays at the
+choke point. `__ft_flip_txn_record_tag_ctx` takes a debug-only `@dbg_ctx`;
+`record_tag` / `record_state_kind` / `record_tombstone_locked` become wrappers
+passing NULL, so every existing caller's predicate is unchanged to the bit. Only
+`ft_flip_txn_record_retire_anchored_arms` passes it, at its four record sites.
 
-* **Sizing.** `FT_MAX_DEPTH` (`FT_MAX_KEY_LEN + 1` = 257) equals
-  `FT_FLIP_TXN_MAX_LOCKS` (`FT_ENTRY_PER_NODE + 1` = 257), and the mark array is
-  `orphan_held[FT_MAX_DEPTH + 1]` = 258 (ft-remove.h:1513) while the op registers
-  real lock-set entries besides. Headroom is NEGATIVE, not zero. ☠ And the cap
-  guard is a plain `assert`, so "register anyway" is silent corruption under
-  `NDEBUG`.
-* **Lifecycle, which is the part that actually decides it.** Registration exists
-  to transfer the CLEARING. A surviving anchor must transfer it — post-commit the
-  word is clean and LIVE and a peer takes it, so a late caller-side release
-  strips the peer's mark. A RETIRED node cannot be stolen that way: the fused
-  terminal leaves `TOMBSTONE`, `ft_meta_lock_acquire` refuses a tombstone
-  forever, and the caller's unconditional sweep is deterministic on both
-  outcomes. **This site needs no lifecycle service, so registering buys it
-  nothing but a slot it does not have.**
+★ **The SHAPE decides, not the call path.** `ft_owner_retire_witnessed` widens
+only for a record whose slot is `@owner`'s own state word and whose NEW value
+sets `FT_STATE_TOMBSTONE`. A `ctx` supplied on a release, an edge or a count gets
+the narrow predicate back — misuse fails CLOSED. And it is a WITNESS, never a
+VERDICT: the ctx is looked up HERE, through the same `ft_held_set_snap` the
+exclusion logic already trusts for dedupe. A caller may not pass "I already
+checked" — a verdict token is mintable and unfalsifiable at the point that
+consumes it, which is how a red control goes blind.
 
-☠ **AND THE "SELF-WITNESSING RECORD" IDEA IS REFUTED ON ITS FACTS.** Its premise
-was that the expected-old carries `h->lock_snap | FT_STATE_LOCK`, so the LOCK bit
-proves the op's own acquire. Printed: `h->lock_snap == 0x4` — **no `0x80000`**.
-The acquire returns the CLEAN pre-mark word; `record_tombstone_locked`
-manufactures the LOCK bit itself. The record therefore witnesses nothing beyond
-"the caller passed an `h`", which is exactly the defect
-`FT_RED_OWNER_CLAIM_ON_LOCK` exists to catch — the exemption would have taught
-the auditor to wave its own red control through. The state-word protocol says it
-in four words: *"Ownership is taken, never observed."*
+☑ **DETECTOR VERIFIED, NOT ASSUMED**: `-DFT_RED_OWNER_CLAIM_ON_LOCK` still aborts
+ft_unit on its third test, on this assert by name, with the wide term present and
+correctly declining to save it. All 118 gate legs identical to the control.
 
-☞ **THE ROAD THE CODE ALREADY HALF-BUILT.** The recorder that plants this record
-already takes `@ctx`, already uses `ft_lock_ctx_holds(ctx, node, …)` in its OTHER
-arm (ft-mutation-helpers.h:4881), and the ctx demonstrably witnesses `m`
-(`lctx.held.extra = orphan_held`, ft-remove.h:1652, chained by `.outer`). Hoist
-the owner check for anchored-retire records to that level — predicate registry ∪
-held-set chain — and leave the clearing with the sweep. That is not an exemption:
-the predicate still verifies a MAINTAINED held set, the same structure the
-exclusion logic already trusts for dedupe, where a false positive would break
-real exclusion rather than just an assert.
+☞ It closed THREE witnesses, not one — the detach's orphan freeze plus
+`ft_rekey_cow_stop`'s two stop retires.
 
-☑ **THE COMPOSITION IS DECIDED** — and the class is wider than one record.
+#### ☞ WHAT §9.1(A) BEING DONE UNLOCKS, AND WHAT IT DOES NOT
 
-**It is a record CLASS, not a site.** `ft_flip_txn_record_retire_anchored_arms`
-plants every one of them, and two more sites share the sixth witness's exact
-signature — `ft_rekey_cow_stop`'s stop retires (ft-rekey.h:306 and :495, both
-`record_retire_anchored(txn, ctx, &stop_held, stop_meta)` with NO
-`lock_register`, the second saying so out loud: *"Not registered — the caller's
-sweep owns clearing"*) — and the chain-compress retires (ft-remove.h:1290). A fix
-at `ft_detach_freeze_one` closes one; a fix inside `_arms` closes all of them.
-☞ The sites that call `ft_flip_txn_record_tombstone_locked` DIRECTLY all register
-first (ft-graft.h:1494, ft-merge.h:3572/3595, ft-rekey.h:5737/5760) and must keep
-the narrow check — under this design they do, untouched.
+☑ **B1's arm is no longer blocked by 9.1(A)** — that was the whole dependency:
+arming removes the last detection of the rekey writer's unowned parks, and there
+are now none to detect.
 
-**The shape decides, not the call path.** The wide predicate is sound only where
-the record's new value sets `FT_STATE_TOMBSTONE` — only then is the word
-unlockable afterwards and the sweep deterministic. That is checkable from the
-record itself, and every record `_arms` plants has it.
+☐ **9.1(B) is untouched** — the atomic writers for the deleted staged rekey
+writer's shapes, which is what greens ft_unit 110/112/123. Large, and never a B1
+blocker.
 
-**The mechanism**: an internal `__ft_flip_txn_record_tag_ctx(t, dbg_ctx, owner,
-slot, old, new, tag)` whose assert adds one guarded term —
-
-    || (dbg_ctx && owner && slot == (void **) &owner->state
-        && ((uintptr_t) new_ptr & FT_STATE_TOMBSTONE)
-        && ft_lock_ctx_holds(dbg_ctx, owner, &snap, &rat))
-
-— with today's `record_tag` / `record_state_kind` / `record_state` becoming
-wrappers that pass `dbg_ctx = NULL`, so every existing caller keeps a
-byte-identical predicate and no call site moves. `_arms` (which already holds
-`@ctx`, using it behaviourally at ft-mutation-helpers.h:4881) calls the `_ctx`
-spelling. About four lines move, all inside `ft-mutation-helpers.h`.
-
-**Why it cannot rot**: the witness is a PARAMETER, so it has no lifetime — the
-leaky one-shot flag needs one. Misuse fail-closes: a future site passing `ctx` on
-a non-retire record gets the narrow predicate back, so the wide term can never
-bless a record whose word survives — which is the bug class the five earlier
-fixes closed. And `FT_RED_OWNER_CLAIM_ON_LOCK` still drives the same assert at
-the same choke point: the record supplies a WITNESS, never a VERDICT.
-
-☠ **THE SENTINEL FORM IS THE ONE TO REJECT** (have `_retire_anchored` verify and
-pass a distinguished "already-checked" owner value): a verdict token is
-MINTABLE, the choke point cannot falsify it, and the first surviving-anchor site
-that passes it ships the double-clearing race with the detector permanently blind
-for that record in EVERY config — findable only by grep. It also overloads
-`owner`, which `FT_TK_COUNT_OWN` reads for classification.
-
-☞ Precedent, so this is adoption rather than invention: `ft_pub_rec.owner[3]` /
-`.root[3]` carry the answer with the edge *"rather than being re-derived at each
-of them"* (fractal-trie-internal.h:830-855, naming `FT_OWNER_ASSERT_OWNED`), and
-`hold_ctx` on `ft_reparent_record_meta` (ft-mutation-helpers.h:8856) is already a
-lock-ctx threaded into a recorder with NULL meaning "caller cannot answer". The
-tree has NO windowed txn flag anywhere — `dbg_arm_per_op` and `dbg_lock_take` are
-both set-once — so the one-shot would have been a new anti-idiom.
-
-☠ **ONE PREDICTION OF THE DESIGN REVIEW FAILED, AND IT DOES NOT MATTER.** It
-predicted `ctx->held.txn == 0` at the abort, on the reasoning that a non-NULL
-`held.txn` would collapse "registry ∪ chain" to the registry. Printed:
-`held.txn` IS the content txn. The implication is wrong — `ft_held_set_snap`
-(ft-mutation-helpers.h:2336) falls THROUGH from the txn loop to `extra`, `glue`
-and `outer` unconditionally. The witness is carried by the EXTRA lane, verified
-directly: `nr_extra == 1`, `extra[0].lock == m`, `extra[0].shared == false`. The
-recommendation stands on that.
-
-☞ And the sentence that would have sent the wrong fix here has been retracted in
-the code (`01dd9584`): a miss splits into a FINDING where the txn owns the
-clearing and a VISIBILITY gap where a sweep does.
+☐ **Arm PLACEMENT remains the open API question**: `ft_flip_txn_arm_per_op` has
+zero call sites, refuses `!t->nr_locks`, and its doc says "after the last
+lock_register" — yet kind dispatch happens at RECORD time, so a doc-legal arm
+point converts only records planted after it.
 
 ### 9.2 The load-sensitive concurrency class
 
@@ -1386,15 +1324,13 @@ stale) — watch it across Phase B, it shares words with the converted sites.
                                                               / d4b4d2d7 / 05356918 / bf9c490c
                                                               landed — the WITNESS class is
                                                               CLOSED (4 instances); next is a
-                                                              / ebf24686 / a91ebafd landed —
-                                                              ★ ft_unit's claim is CLEAN;
-                                                              ft_inv MW's coarse arms were an
-                                                              INSTRUMENT ARTIFACT (67f72278);
-                                                              it now stops on a FINE trie at
-                                                              the orphan freeze — a
-                                                              VISIBILITY gap whose fix is a
-                                                              PREDICATE hoist, not a
-                                                              registration (§9.1)
+                                                              / ebf24686 / a91ebafd / 67f72278
+                                                              / 64085ea3 — ☑ §9.1(A) COMPLETE:
+                                                              the claim is CLEAN on ft_unit
+                                                              AND on ft_inv FT_INV_MW=1.
+                                                              B1's arm is no longer blocked by
+                                                              it; 9.1(B) and the arm-PLACEMENT
+                                                              question remain (§9.1)
     B0  per-op arm helper + record-time owner assert        ☑ LANDED — and its first
                                                               measurement says NO site is
                                                               owner-complete (11.9% of the
