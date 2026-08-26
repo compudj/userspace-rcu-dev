@@ -760,14 +760,22 @@ claimed exclusion argument:
    registry, yet kind dispatch happens at RECORD time). ☞ Read the DRY RUN as
    the readiness signal, not the percentage — the counter also prices records on
    txns the arm refuses outright.
-2. `ft-remove.h` remove commit_rec — ☞ **IN FLIGHT**, dry run landed `a3c75659`
-   (`-DFT_REMOVE_CLAIM`). Measured with the arm live, ft_inv MW 507 threads:
-   MW_STRUCT 13,321,107, OWN_HELD 11,864,058, **OWN_MISS 1,457,049** — a 10.9%
-   exclusion gap, so not yet owner-complete. The walk starts at ft_unit test
-   **239** (the rekey writer's started at 112 — the classes closed there were
-   shared machinery). First item: an UNNAMED owner (`owner == NULL`) on
-   `ft_remove_one_commit`'s structural edge, `b7334aa4`'s shape at a producer
-   that builds its edge inline.
+2. `ft-remove.h` remove commit_rec — ☑ **OWNER-COMPLETE** `a9ff9549`, after ONE
+   fix. Dry run (`-DFT_REMOVE_CLAIM`, `a3c75659`) started at ft_unit test **239**
+   — the rekey writer's started at 112, and the difference is the classes closed
+   there, which were shared machinery. The single item was an UNNAMED owner on
+   `ft_remove_one_commit`'s structural edge: `b7334aa4`'s shape at a producer
+   that builds its edge inline rather than through a rec. Fixed at the PRODUCER
+   (`struct ft_remove_pub` gains `@slot_owner`, filled where both
+   `ft_*_node_replace_ptr` arms already hold the node) rather than re-derived at
+   the replay — this session paid twice for that shape.
+   ☞ The dry run is now clean on ft_unit AND ft_inv `FT_INV_MW=1`, and it claims
+   EARLIER than an arm would, so it covers strictly more records than an arm
+   converts. NOT ARMED yet.
+   ☞ `OWN_MISS` barely moves (1,457,049 → 1,400,696 of MW_STRUCT 12.9M) and that
+   is the expected shape: the counter prices records on txns the arm refuses
+   outright, which the assert exempts via `!nr_locks`. Read the DRY RUN as the
+   readiness signal.
 3. The PUBLISH LANE — ☑ **LANDED** `6f54e698`: `ft_pub_rec_add` takes an `owner`
    and all four producers name it. Every such slot is a BODY slot, so the owner
    is the node the slot LIVES IN — which is not always `@parent_nf`, and
@@ -1365,9 +1373,9 @@ stale) — watch it across Phase B, it shares words with the converted sites.
                                                               RED at exponential + root-only
     B2-5 four hot sites, one at a time                      (each: owner-complete -> claim
                                                               dry-run -> arm; NOT mechanical).
-                                                              B2's dry run landed a3c75659;
-                                                              OWN_MISS 1.46M, walk starts at
-                                                              ft_unit 239
+                                                              B2 is OWNER-COMPLETE a9ff9549
+                                                              after ONE fix; dry run clean on
+                                                              both suites, not yet armed
     B6  retire hand-arming (rekey writer, root COW)         (small)
     C   re-measure; G4 cell-lane decision                   (gate + data)
     G5  subtree freeze-state gate design (hybrid D)         (design, w/ D)
