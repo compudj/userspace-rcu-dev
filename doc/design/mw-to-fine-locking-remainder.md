@@ -984,13 +984,26 @@ because it IS the status quo's policy behind one entry point.
 sweep" (`ft-lifecycle.h:355-375`). **Phase E is the prerequisite for CERTIFYING
 the coarse SW fallback, not for consolidating the arm.**
 
-☑ **THE LANDING**: in `ft_rekey_cow_stop`, after `ft_rekey_marks_to_txn`, arm
-through the helper and fall back explicitly —
-`ft_flip_txn_arm_per_op(ft, txn); if (!txn->structural_sw && ft->lock_fine &&
-!ft_txn_content_sw_ok(ft)) ft_flip_txn_set_structural_sw(txn, true);` — with the
-second line NAMED as the Phase-E debt (the anchor-discipline SW fallback for the
-dev-only coarse spacings), and `assert(txn->structural_sw)` kept below it, now
-valid at every spacing. One line for E to certify or replace.
+☑→☠ **THE LANDING WAS ATTEMPTED AND MUST BE REVERTED — one gate leg HANGS.**
+The shape is right: `ft_flip_txn_arm_per_op(ft, txn); if (!txn->structural_sw &&
+ft->lock_fine && !ft_txn_content_sw_ok(ft)) ft_flip_txn_set_structural_sw(txn,
+true);` after `ft_rekey_marks_to_txn`, assert below it, both hand-arms gone.
+**64 of 65 gate legs identical to control**, ft_unit 315/3 deliberate and ft_inv
+`FT_INV_MW=1` 119/119 at per-node, reach 278,544 / armed 236,182 (all 42,362
+refusals trie-wide).
+☠☠ **`nocompress` ft_unit per-node: TIMEOUT/HANG after 111 tests** — a LIVELOCK,
+not an assert, in a config the coarse-spacing argument does not cover and one
+that is shippable. Every other leg, all three spacings included, matched.
+☞ **THE SUSPECT IS FENCE-CLEAR OWNERSHIP, not the arm.** Registration TRANSFERS
+the clear (`@txn_owned`), and this landing registers marks EARLIER and at MORE
+growth points than before. The driver's sweep was given `!marks[i].txn_owned`;
+`ft_rekey_cow_stop`'s own bail paths and the writer's sweep were NOT audited. A
+mark that is registered but released by neither owner leaves a LOCK set on a live
+node, and the next op to anchor there refuses it forever — which is exactly what
+a hang with no assert looks like. ONE OWNER PER FENCE.
+☞ **NEXT**: audit every path that releases `marks[]` in `ft-rekey.h` for
+`txn_owned`, then re-run — `nocompress` at per-node is the canary, and it is NOT
+in the per-node smoke pair, which is why two green suites missed it.
 
 ☠ **THE RED CELLS WERE ALREADY RED AT HEAD, and this entry hid it.** On a clean
 tree with the gate's anchorval flags, ft_unit dies at **294** (exponential) and
