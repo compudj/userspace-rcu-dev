@@ -857,29 +857,31 @@ claimed exclusion argument:
    refusals; the site goes 2.00 → 1.00 MW_STRUCT per txn (the residue is
    `hold_or_lock_parent`'s own release terminal, which cannot move above its
    own register). `ABORT` 0 before and after — fairness only, as expected.
-   ☠☠ **`ft_promote_head`'s TWO ARMS — ARM BLOCKED.**
+   ☑ **`ft_promote_head`'s TWO ARMS — ARMED** `1c59dc9c`, after the per-edge
+   `@owner_held` fix `af22756b` (option (a) of the fork).
+   ☠☠ **THE GAP IT CLOSED, and the reason it was worse than a missing arm:**
    `_ft_publish_to_parent_meta` emits a **SKIP_X DUAL into the GRANDPARENT's
-   body** — a node these ops never acquire (in the ft_unit repro,
-   `test_dup_chain_head_promotion`, the ROOT NODE's slot at `item+8` against a
-   one-entry registry). `ft_ord_cell_flip_into` gives both edges the
-   dispatching recorder, so an armed txn would SW-park an unowned word. Sound
-   today only because the lane is all-MW.
-   ☠ **AND THE LIST-OFF ARM'S CLEAN DRY RUN WAS A COVERAGE ARTIFACT — PROVEN.**
-   A 60-line public-API program (list-off trie, four duplicates of one key,
-   remove the head) aborts on the very build whose whole-suite dry run was
-   clean. Both arms now share `-DFT_HLIST_CLAIM_PROMOTE`.
-   ☞ **THE FIX IS PER EDGE.** `struct ft_ord_cell_edge` already carries `@owner`
-   and `@root`; the missing third answer is whether the OP HOLDS that owner —
-   the shape `ft_flip_txn_record_parent_word` already takes as `@child_held`.
-   Alternatives and their corrected costs: extending the lock-set to the
-   grandparent is NOT a liveness risk (DLM acquires are refusal-based try-locks
-   and `ft_dlm_acquire_set` already ships this shape in two producers) but
-   widens a hot lane's conflict window; a blanket always-MW costs only the DUAL
-   edges at `ft_detach_node`, not its forward publish; and dispatching on
-   `ft_flip_txn_owns` inside `ft_ord_cell_flip_into` is two lines and no new
-   field but converts the record-time DETECTOR into a silent runtime FALLBACK,
-   absorbing the register-before-record ordering class instead of flagging it.
-   **Which one is a DESIGN call — owed to Mathieu.**
+   body**, a node neither arm acquires — and `struct ft_pub_rec`'s claim that a
+   NULL `@owner` leaves a record "never eligible for a per-op SW park" was a
+   **STALE MECHANISM**: `ft_flip_txn_record_tag` dispatches on `structural_sw`
+   ALONE, so an armed txn parks an unnamed slot SW and, without
+   `--enable-rcu-debug`, silently.
+   ☞ **THE FIX.** `@owner_held` is now a real per-edge word on `ft_pub_rec` and
+   `ft_ord_cell_edge`, false by default, false ⇒ MW; carried across all three
+   rec→edge conversions and honoured at all three replays. The FORWARD edge
+   inherits the caller's `@slot_owner_nf` declaration (so every existing
+   conversion is preserved); the DUAL's owner is DERIVED from a back-pointer, so
+   `_ft_publish_to_parent{,_meta}` take `@dual_owner_held` and all **19** call
+   sites state it, compiler-enforced. Only `ft_detach_node`'s two republishes
+   say true, and they say `old_recompacted_node != NULL` rather than a constant.
+   ☞ Verified on the construction that found it: the public-API repro
+   (`fractal-trie-review-2026-06/repro_listoff_promote_skipx_dual.c`) now
+   SURVIVES both arms, and both dry runs are clean. Reach 4,847,315 + 115,511,
+   ALL armed; the site goes 0% → 33.3% converted.
+   ☞ **NO CONVERSION REGRESSION**, and the ratio is what says so — the per-1k
+   column moved because records-per-txn moved. Conversion FRACTION before→after:
+   insert 29.5→30.5%, B2 25.2→24.9%, B3 23.5→23.7%, B5 exactly unchanged, the
+   hand-armed rekey writer still MW_STRUCT 0.
 6. The remaining content sites in descending count.
 
 ★ **EVERY ARM FROM HERE CARRIES A REACH COUNTER.** `-DFT_ARM_REACH` lives in
@@ -1494,14 +1496,11 @@ stale) — watch it across Phase B, it shares words with the converted sites.
                                                               by ROUTING, and a DETECTOR says
                                                               so (red control: silent on
                                                               ft_unit, 6 aborts on ft_inv)
-    B4  ft_promote_head (both arms)                         ☠☠ ARM BLOCKED -- the SKIP_X DUAL
-                                                              lands in the GRANDPARENT's body.
-                                                              The list-off arm's CLEAN dry run
-                                                              is a COVERAGE ARTIFACT, proven by
-                                                              a constructed public-API repro.
-                                                              Fix is per-EDGE held flag vs
-                                                              lock-set vs blanket-MW vs a
-                                                              record-time fallback: DESIGN call
+    B4  ft_promote_head (both arms)                         ☑ ARMED 1c59dc9c -- unblocked by
+                                                              the per-edge @owner_held fix af22756b
+                                                              (option (a)).  ☠☠ a NULL @owner
+                                                              NEVER failed closed: record_tag
+                                                              dispatches on structural_sw ALONE
     B6  retire hand-arming (rekey writer, root COW)         (small)
     C   re-measure; G4 cell-lane decision                   (gate + data)
     G5  subtree freeze-state gate design (hybrid D)         (design, w/ D)
