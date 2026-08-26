@@ -964,6 +964,29 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 	}
 	if (!txn)
 		return -ENOMEM;	/* nothing touched: caller aborts */
+#ifdef FT_COLLAPSE_CLAIM
+	/*
+	 * §4 STEP B3's DRY RUN, the a3c75659 tool aimed at the CHAIN-COMPRESS
+	 * collapse: point B0's owner assert at this txn so every record it plants
+	 * without owning is named, at an abort, on a build otherwise
+	 * byte-identical to the unarmed one.
+	 *
+	 * ☞ CLAIMED AT CREATION, EARLIER THAN THE ARM WOULD BE.  A dry run has to
+	 * claim BEFORE the records it wants checked, and for this site that is
+	 * before the lock-set acquire below -- so read a miss as "this record is
+	 * planted before its owner is registered" FIRST.  That ORDERING class has
+	 * been the answer more often than a missing acquire.
+	 *
+	 * ☠ And read a miss as "the registry cannot SEE this hold" before "the op
+	 * does not HOLD it": where a caller's SWEEP owns the mark's clearing, the
+	 * absence is by design (ft_flip_txn_owns).
+	 *
+	 * ☠ @record_only hands us the CALLER's txn.  Claim it anyway -- the claim
+	 * sets no record kind, so it is behaviour-neutral, and the fold's records
+	 * are exactly the ones this step has to judge.
+	 */
+	ft_flip_txn_claim_per_op_armable(ft, txn);
+#endif
 	/*
 	 * F2 node lock (doc at ft_meta_lock_acquire): fence the whole
 	 * collapsed chain -- the boundary and the two compressed nodes whose
