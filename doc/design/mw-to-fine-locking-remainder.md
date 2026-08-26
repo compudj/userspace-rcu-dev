@@ -1053,25 +1053,53 @@ Registry high-water (`-DFT_LOCKS_HIGHWATER`): unchanged at **15/257** (ft_inv MW
 and 13/257 (ft_unit) — the marks dedupe or peak below the existing maximum, so
 the bound is no more stressed than before.
 
-#### ☐ §9.1(A) IS NOT DONE — the CONCURRENT lane is next
+#### ☐ §9.1(A) IS NOT DONE — and the concurrent lane found a REAL EXCLUSION GAP
 
-ft_unit is single-threaded. `ft_inv` `FT_INV_MW=1` still aborts under the claim,
-at a site ft_unit never drives:
+ft_unit is single-threaded. `ft_inv` `FT_INV_MW=1` aborts under the claim at a
+site ft_unit never drives, and this one is not a bookkeeping gap:
 
     ft_store_at_graft_point_commit (ft-graft.h:888)
       -> ft_flip_txn_record_pub_rec -> the relocation republish
 
-Printed at the abort, nothing inferred: `rec.n == 1`, `rec.mtxn == NULL`, the one
-edge `{slot, old, new}` with `new == st->dest` and `old == st->old_recompacted_node`,
-`owner->state == 0x48` — **no `FT_STATE_LOCK`**, `nr_child == 18` — and
-`t->nr_locks == 6` without it.
+**THE OP PUBLISHES INTO A LIVE NODE IT DOES NOT HOLD.** Printed in ONE run,
+nothing inferred:
 
-☞ So it is NOT the witness class (no lock bit anywhere). The fork that has cost
-two wrong calls already is whether that owner is a LIVE node the op must fence
-(the `bbb8e795` shape, at the relocation's publish parent) or one this op built
-(the `ebf24686` / `bec0c726` shape, where the record is what does not belong).
-**Settle it by PRINTING the op's fresh inventories, not by reading addresses** —
-`g->built[]` is one of three, and arena adjacency proves nothing.
+    t->locks[6]                        = { …, 0x7fff37600218 }
+    st->publish_pmeta                  =       0x7fff37600218   <- REGISTERED
+    ft_flag_to_metadata(ft, pub_parent) =      0x7fff31e00118   <- the OWNER, absent
+    owner->state = 0x48   (nr_child 18, NO FT_STATE_LOCK)
+    t->acquire_miss = false, t->structural_sw = true
+
+And it is LIVE, not op-built: every fresh inventory in the op was printed and
+none holds it — `glue.nr_built == 0`, `detach_rc.new_flag == NULL`,
+`glue.publish_parent == NULL`, `glue.top == NULL`, and the one fresh node
+`gst_st.dest` is the record's NEW value, not its slot's home.
+
+**THE MECHANISM.** `pub_parent` is re-derived RAW at the write site —
+`ft_resolve_parent_slot(dest_meta, ft, &pub_parent)` (ft-graft.h:824) — while the
+op acquired and registered `st->publish_pmeta`, the identity the RESERVE
+recorded. The comment beside the publish asserts they are the same word (*"this
+is the SAME word the recompact … acquired and recorded a release on"*), and
+under ft_unit they are. Under concurrency they are not, and nothing checks it: an
+armed fold then parks a plain store into a live node with no exclusion at all.
+
+★ **THIS IS THE THIRD INSTANCE OF ONE SHAPE**: a RAW derivation at the write site
+disagreeing with the node the op actually ACQUIRED. The other two were the dual
+gate (raw) versus the dual sink (RYW), both closed by `ebf24686`. Here the op is
+even CARRYING the right answer — `st->publish_pmeta`, `st->pnfp` — and re-derives
+it anyway.
+
+☐ **Two candidate fixes, and the choice needs deciding rather than guessing**:
+publish through the identity the op RECORDED (`st->publish_pmeta` / `st->pnfp`),
+or DETECT the divergence and bail `-EAGAIN` so the caller re-descends (a peer
+re-homed the grandparent, which is a clean transient). The first keeps the op's
+exclusion argument intact; the second admits the resolve is racy and answers the
+peer. They differ in whether `dest`'s recorded parentage or the live trie is
+authoritative at the flip.
+
+☞ Method note, paid for three times this session: settle live-vs-built by
+PRINTING every fresh inventory, never by reading an address. This fold has at
+least four (`glue.built[]`, `detach_rc`, the collapse reclaim, `gst_st.dest`).
 
 ### 9.2 The load-sensitive concurrency class
 
@@ -1262,8 +1290,9 @@ stale) — watch it across Phase B, it shares words with the converted sites.
                                                               CLOSED (4 instances); next is a
                                                               / ebf24686 / a91ebafd landed —
                                                               ★ ft_unit's claim is CLEAN;
-                                                              next is the CONCURRENT lane
-                                                              (ft_inv MW) (§9.1)
+                                                              ft_inv MW found a REAL
+                                                              exclusion gap at the graft
+                                                              relocation republish (§9.1)
     B0  per-op arm helper + record-time owner assert        ☑ LANDED — and its first
                                                               measurement says NO site is
                                                               owner-complete (11.9% of the
