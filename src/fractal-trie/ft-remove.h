@@ -1322,6 +1322,37 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		ft_detach_freeze_orphans(ft, txn, ctx, orphans, nr_orphans,
 			trailing_orphan, orphan_held, trailing_orphan_held);
 		/*
+		 * PHASE B, STEP B3 -- THE ARM.  ft_detach_freeze_orphans above
+		 * holds this op's LAST ft_flip_txn_lock_register (an orphan
+		 * chain anchor, where the anchor is not the retired node
+		 * itself), and under lock_fine everything else was taken in the
+		 * ONE all-or-none acquire far above -- the incremental
+		 * lock_or_guard beside the publish is the !lock_fine arm, which
+		 * this helper refuses anyway.  So this is where
+		 * ft_flip_txn_arm_per_op's "after the op's last register"
+		 * contract puts it, and ft_remove_commit_rec below plants the
+		 * first record after it.
+		 *
+		 * ☞ READINESS: the dry run (-DFT_COLLAPSE_CLAIM) claims at txn
+		 * CREATION -- strictly earlier -- and is clean on ft_unit and
+		 * ft_inv FT_INV_MW=1 both, so every record on this txn already
+		 * passes the owner check.
+		 *
+		 * ☞ WHAT IT CONVERTS is the collapse's forward publish, whose
+		 * owner is @publish_parent -- a RELEASE member of the same
+		 * all-or-none lock-set.  The retires, the orphan freezes and
+		 * the child back-edge are planted ABOVE it and stay MW, which
+		 * is stricter and always sound; converting those would mean
+		 * arming before this op's own bookkeeping registers, which the
+		 * contract does not allow from here.
+		 *
+		 * ☠ NOT on the FOLD path (@record_only): @txn is the CALLER's
+		 * and the completeness of its registry is the caller's
+		 * judgement, not this frame's.
+		 */
+		if (!record_only)
+			ft_flip_txn_arm_per_op(ft, txn);
+		/*
 		 * The removed external leaf (a single-entry chain, so
 		 * freeze_leaf->next == NULL) freezes atomically with this same
 		 * commit that retires its holder chain (doc §4.B): one MARK(NULL)
