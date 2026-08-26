@@ -3375,7 +3375,39 @@ int ft_detach_node(struct cds_ft *ft,
 				ft_flip_txn_arm_per_op(ft, commit_txn);
 			_ft_publish_to_parent(ft, ft_parent_node(iter_meta->parent_word),
 				detach_parent_flag_ptr, iter_node_flag,
-				holder_old_flag, &rec, /*dual_owner_held=*/ old_recompacted_node != NULL);
+				holder_old_flag, &rec,
+				/*
+				 * ☠ FALSE, AND `old_recompacted_node != NULL`
+				 * WAS NOT SOUND.  It said "the recompact took
+				 * {C,P,GP}, so we hold the dual's owner", and
+				 * that is a PLAN-TIME fact: ft_node_recompact
+				 * resolves @pf_gp before the acquire and takes
+				 * GP only `if (pf_gp)`, while the empty member
+				 * is skipped by ft_dlm_acquire_set's
+				 * `if (!set[i].nf) continue` -- guard included.
+				 * The dual's owner, meanwhile, is DERIVED FRESH
+				 * at publish from cn_meta's back-pointer.  So a
+				 * compressed P that was ROOT-ATTACHED at plan
+				 * time yields no GP and no guard, and a peer
+				 * re-home landing in that window makes the
+				 * publish derive a grandparent this op never
+				 * acquired -- an SW park on an unowned word, at
+				 * an armed site, silent without rcu-debug.
+				 *
+				 * No current op live-re-homes a root-attached
+				 * compressed node (root restructures retire and
+				 * rebuild), so the window is unproven-reachable
+				 * -- which is a reason to keep looking, not a
+				 * reason to park on it.  The dual costs one
+				 * record on the minority of republishes whose
+				 * parent is compressed; MW is stricter and
+				 * always sound.
+				 *
+				 * ☞ To make this true again, the ANSWER must be
+				 * publish-time: the acquired GP compared against
+				 * the derived dual owner, not the plan's intent.
+				 */
+				false);
 			/*
 			 * nr_keys fold (LEAF Increment 2): the recompaction's -1
 			 * walk from the STABLE grandparent iter_meta->parent (the
@@ -3488,7 +3520,39 @@ int ft_detach_node(struct cds_ft *ft,
 				ft_flip_txn_arm_per_op(ft, commit_txn);
 			_ft_publish_to_parent(ft, ft_parent_node(iter_meta->parent_word),
 				detach_parent_flag_ptr, iter_node_flag,
-				holder_old_flag, &rec, /*dual_owner_held=*/ old_recompacted_node != NULL);
+				holder_old_flag, &rec,
+				/*
+				 * ☠ FALSE, AND `old_recompacted_node != NULL`
+				 * WAS NOT SOUND.  It said "the recompact took
+				 * {C,P,GP}, so we hold the dual's owner", and
+				 * that is a PLAN-TIME fact: ft_node_recompact
+				 * resolves @pf_gp before the acquire and takes
+				 * GP only `if (pf_gp)`, while the empty member
+				 * is skipped by ft_dlm_acquire_set's
+				 * `if (!set[i].nf) continue` -- guard included.
+				 * The dual's owner, meanwhile, is DERIVED FRESH
+				 * at publish from cn_meta's back-pointer.  So a
+				 * compressed P that was ROOT-ATTACHED at plan
+				 * time yields no GP and no guard, and a peer
+				 * re-home landing in that window makes the
+				 * publish derive a grandparent this op never
+				 * acquired -- an SW park on an unowned word, at
+				 * an armed site, silent without rcu-debug.
+				 *
+				 * No current op live-re-homes a root-attached
+				 * compressed node (root restructures retire and
+				 * rebuild), so the window is unproven-reachable
+				 * -- which is a reason to keep looking, not a
+				 * reason to park on it.  The dual costs one
+				 * record on the minority of republishes whose
+				 * parent is compressed; MW is stricter and
+				 * always sound.
+				 *
+				 * ☞ To make this true again, the ANSWER must be
+				 * publish-time: the acquired GP compared against
+				 * the derived dual owner, not the plan's intent.
+				 */
+				false);
 			/*
 			 * nr_keys fold (LEAF Increment 2): a non-fused RECOMPACTION
 			 * folds the -1 walk from the stable grandparent onto this
