@@ -891,88 +891,75 @@ next). This thread OWNS the only armed SW content site — it stays the
 conversion's live proving ground and should land ahead of Phase B's remove
 sites, which share its machinery.
 
-#### ☐ WHERE `-DFT_REKEY_CLAIM` STOPS NOW — a REGISTRY-TIMING item, not a fork
+#### ☑ THE GLUE-FENCE TIMING ITEM — LANDED `6e77bab7`
 
-Seven items closed (`695d23c1`, `d67851c6`, `bec0c726`, `280fdac1`,
-`c6ac8c42`, `b7334aa4`, `f79438e7`); the claim now reaches ft_unit **test 118**
-(`test_rekey_occupied_dst_behind_compressed`, was 113). The next abort:
+Eight items closed (`695d23c1`, `d67851c6`, `bec0c726`, `280fdac1`,
+`c6ac8c42`, `b7334aa4`, `f79438e7`, `6e77bab7`); the claim reaches ft_unit
+**test 119** (was 113 at the start of the session).
 
-    ft_chain_compress_fused (ft-remove.h:1320) -- the collapse's forward
-      republish into publish_parent's body, reached through ft_detach_node
-      (ft-remove.h:2764) from ft_rekey_graft_simple_attempt's detach-fold
+The abort was `ft_chain_compress_fused`'s republish into `publish_parent`'s
+body, reached through `ft_detach_node` from the rekey fold's detach. The record
+named its owner correctly and the op HELD the word — `owner->state` carried
+`FT_STATE_LOCK`, `glue.publish_gp_holder == owner`, `publish_gp_shared ==
+false`, single-threaded. Only the WITNESS failed: the fence lived in the glue's
+named field and reached `t->locks[]` at `ft_glue_txn_commit_edges`, after the
+detach. The detach's own acquire of the word DEDUPED onto that glue witness and
+so registered nothing (`ft-remove.h:1008` registers only `!held.shared`) —
+rightly, since the earlier acquire owes the release.
 
-The record NAMES its owner correctly (a body slot; the owner is the node it
-lives in, and at per-node spacing `ft_flip_txn_hold_or_lock_parent` even asserts
-`gph.lock == gp_meta`) and **the op really does hold that word** — proven at the
-abort: `owner->state` carries `FT_STATE_LOCK`, `glue.publish_gp_holder ==
-owner`, `publish_gp_shared == false`, on a single-threaded run. `ft-rekey.h:2246`
-already says so in prose: *"the MERGE arm DOES hold it (@publish_gp_holder,
-taken with the publish parent above)"*.
+Nothing was missing except WHEN the fence changes hands, so it changes hands at
+the TAKE, with `@publish_gp_txn_owned` moving only the CLEAR
+(`ft_glue_free_entry`'s `@holder_txn_owned`, applied to this fence). The FIELD
+stays set — it is still the witness every narrow glue predicate reads.
 
-**The miss is a REGISTRY TIMING gap, and it has an exact mechanism.**
-`ft_chain_compress_fused`'s `lock_fine` arm registers and release-records each
-member only when `!set[si].held.shared` (ft-remove.h:1008). Here the
-publish-parent member DEDUPED onto the word the glue already fences
-(`lctx_src.held.glue` is chained at ft-rekey.h:2777; `ft_glue_held_snap_one`
-matches `publish_gp_holder` at ft-mutation-helpers.h:9415), so it took no lock
-and registered nothing — correctly, since the glue owes the release. The fence
-reaches the registry only in `ft_glue_txn_commit_edges` (the `publish_gp_holder`
-block at ft-mutation-helpers.h:10484), called at ft-rekey.h:3041, i.e. AFTER the
-detach.
+☠ **TWO OBJECTIONS TO THAT HOIST WERE RAISED AND BOTH REFUTED** against the
+code. Recorded because each is a plausible trap:
 
-☑ **THE FIX IS THE TREE'S OWN OWNERSHIP-TRANSFER IDIOM, MOVED TO THE TAKE** —
-register + `ft_flip_txn_record_anchor_release_held` at ft-rekey.h:2048, then
-DISOWN the glue field, exactly as `ft_glue_txn_commit_edges` does today and
-exactly the two lines `ft_flip_txn_hold_or_lock_parent`'s held arm runs
-(ft-mutation-helpers.h:5180). After it the chain-compress member dedupes against
-the REGISTRY instead of the glue — the registry is part of the held set
-(ft-rekey.h:2727), so no livelock regression — and the assert passes because
-`ft_flip_txn_owns` finds the word.
-
-☠ **TWO OBJECTIONS TO THAT HOIST WERE RAISED AND ARE BOTH REFUTED**, by an
-adversarial review that checked them against the code. They are recorded because
-each one is a plausible-sounding trap:
-
-* *"Registering transfers the unlock, but `ft_glue_abort` still clears the
-  fence on every bail, before `ft_flip_txn_destroy`'s strict release."* True
-  about the ordering, and irrelevant: the transfer idiom ALWAYS pairs the
-  register with DISOWNING the glue field (`ft_glue_txn_commit_edges`
-  ft-mutation-helpers.h:10440 and :10484, `bail_build`'s `pp_meta = NULL` at
-  ft-rekey.h:3226, the free list's `@holder_txn_owned` at :7819), and every
-  `ft_glue_abort` arm is NULL-guarded. The objection describes a
-  register-WITHOUT-disown that the idiom never writes.
+* *"Registering transfers the unlock, but `ft_glue_abort` still clears the fence
+  on every bail, before `ft_flip_txn_destroy`'s strict release."* The ordering
+  is real; the objection describes a register-WITHOUT-disown the idiom never
+  writes. Every transfer in the tree pairs the register with disowning the clear
+  (`ft-mutation-helpers.h:10440` / `:10484`, `ft-rekey.h:3226`'s
+  `pp_meta = NULL`, `@holder_txn_owned` at `:7819`).
 * *"A registration is sound only where the commit is guaranteed to record that
-  word's terminal, which is why the register sits beside the release record."*
-  Contradicted two functions from the abort:
-  `ft_chain_compress_register_retire` (ft-remove.h:783) registers at the ACQUIRE
-  while *"The tombstone itself is recorded later, at the commit."* And the
-  companion worry — *"recording the release early is worse, because a later
-  retire outranks it"* — is backwards:
-  `ft_flip_txn_record_anchor_release_held`'s header states the release half is
-  *"recorded when the op REGISTERS the lock rather than at the commit"*, and
-  *"the later retire chains onto the release's clean pending value"*. Only the
-  OTHER order needs the yield, which is what its RYW self-guard is for.
+  word's terminal."* Contradicted two functions from the abort:
+  `ft_chain_compress_register_retire` (`ft-remove.h:783`) registers at the
+  ACQUIRE, with *"The tombstone itself is recorded later, at the commit."* And
+  the companion worry — *"recording the release early is worse, a retire
+  outranks"* — is backwards:
+  `ft_flip_txn_record_anchor_release_held`'s header puts the release half AT the
+  register, *"rather than at the commit"*, and says *"the later retire chains
+  onto the release's clean pending value"*. Only the OTHER order needs the yield,
+  which is what its RYW self-guard is for.
 
-☠ **AND THE ALTERNATIVE — widening `ft_flip_txn_owns` to consult the glue — is
-REJECTED, not merely bigger.** `ft_flip_txn_owns` (ft-mutation-helpers.h:2192)
-already considered and refused the wider witness in writing. It has a concrete
-hole the registry does not: `ft_glue_held_snap_one`'s `caller_holder` arm
-(:9424) returns held with `ratified = false` for a fence whose RELEASE belongs to
-an OUTER frame, untied to this txn's terminals — so it would authorise an SW park
-on a word this commit does not own the outcome of. And B0 already carries the
-wide answer as a deliberately SEPARATE category: `FT_TK_COUNT_OWN`
-(ft-txn-kind-stats.h:466) is three-way, registry-first, with `ft_hold_trace_holds`
-as `OWN_LEDGER`. Widening the predicate would erase exactly the distinction the
-counter exists to draw.
+☠ **AND WIDENING `ft_flip_txn_owns` TO CONSULT THE GLUE IS REJECTED**, not
+merely bigger. It already refused the wider witness in writing
+(`ft-mutation-helpers.h:2192`), and it has a hole the registry does not:
+`ft_glue_held_snap_one`'s `caller_holder` arm (`:9424`) returns held with
+`ratified = false` for a fence whose RELEASE belongs to an OUTER frame — an SW
+park on a word this commit does not own the outcome of. B0 already carries the
+wide answer as a deliberately separate category: `FT_TK_COUNT_OWN`
+(ft-txn-kind-stats.h:466) is three-way, registry-first, `ft_hold_trace_holds` =
+`OWN_LEDGER`. Widening would erase exactly that distinction.
 
-☞ Re-ordering `ft_glue_txn_commit_edges` before the detach instead is excluded by
-its own contract (*"Called AFTER the source unlink + drain, where abort is
-already impossible"*, ft-mutation-helpers.h:10283) — the detach still bails
-`-EAGAIN`.
+#### ☐ WHERE THE CLAIM STOPS NOW — the glue free-list retire
 
-☐ **Expected NEXT abort after this one**: the cow_stop MARKS class. Those marks
-are release-recorded at ft-rekey.h:3139 with no `ft_flip_txn_lock_register`, so a
-record owned by a marks-fenced word trips the same assert for the same reason.
+    ft_glue_tombstone_free_list (ft-mutation-helpers.h:10118)
+      -> ft_flip_txn_record_retire_anchored -> the fused
+         {LOCK|s -> TOMBSTONE|s}, owner = the retired node itself
+
+Two things in one site, and the FIRST is the ordering class again
+([[register before record]], 18 instances so far): the retire is recorded at
+`:10118`, while the `ft_flip_txn_lock_register` sits BELOW it at `:10121`. The
+second is a deliberate carve-out — that register runs only when
+`h.lock != meta`, on the argument that *"where the anchor IS @meta the fused
+terminal is the whole story and the mark stays with the sweep, which costs no
+registry slot"*. Under per-node spacing the anchor always IS the node, so the
+carve-out is the common case and the record has no registry witness at all.
+That argument is about FENCE THEFT being impossible there, not about the
+registry being wrong; giving it a slot plus `@holder_txn_owned` looks like the
+same shape as `6e77bab7`, but the "byte-identical per-node granularity" claim in
+that comment has to be checked before it moves.
 
 ### 9.2 The load-sensitive concurrency class
 
@@ -1157,11 +1144,10 @@ stale) — watch it across Phase B, it shares words with the converted sites.
                                                               first, abort by abort;
                                                               695d23c1 / d67851c6 / bec0c726
                                                               / 280fdac1 / c6ac8c42 /
-                                                              b7334aa4 / f79438e7 landed —
-                                                              the claim now reaches ft_unit
-                                                              118; its next item is a REGISTRY
-                                                              TIMING hoist with the fix shape
-                                                              settled (§9.1), NOT a fork
+                                                              b7334aa4 / f79438e7 / 6e77bab7
+                                                              landed — the claim now reaches
+                                                              ft_unit 119; next is the glue
+                                                              free-list retire (§9.1)
     B0  per-op arm helper + record-time owner assert        ☑ LANDED — and its first
                                                               measurement says NO site is
                                                               owner-complete (11.9% of the
