@@ -1125,7 +1125,7 @@ in four words: *"Ownership is taken, never observed."*
 
 ☞ **THE ROAD THE CODE ALREADY HALF-BUILT.** The recorder that plants this record
 already takes `@ctx`, already uses `ft_lock_ctx_holds(ctx, node, …)` in its OTHER
-arm (ft-mutation-helpers.h:4867), and the ctx demonstrably witnesses `m`
+arm (ft-mutation-helpers.h:4881), and the ctx demonstrably witnesses `m`
 (`lctx.held.extra = orphan_held`, ft-remove.h:1652, chained by `.outer`). Hoist
 the owner check for anchored-retire records to that level — predicate registry ∪
 held-set chain — and leave the clearing with the sweep. That is not an exemption:
@@ -1133,9 +1133,67 @@ the predicate still verifies a MAINTAINED held set, the same structure the
 exclusion logic already trusts for dedupe, where a false positive would break
 real exclusion rather than just an assert.
 
-☐ **THE ONE OPEN DESIGN DETAIL** — how the hoisted check composes with the
-`record_tag`-level assert for exactly one record without a leaky one-shot flag.
-That, not A-vs-B, is the question for Mathieu.
+☑ **THE COMPOSITION IS DECIDED** — and the class is wider than one record.
+
+**It is a record CLASS, not a site.** `ft_flip_txn_record_retire_anchored_arms`
+plants every one of them, and two more sites share the sixth witness's exact
+signature — `ft_rekey_cow_stop`'s stop retires (ft-rekey.h:306 and :495, both
+`record_retire_anchored(txn, ctx, &stop_held, stop_meta)` with NO
+`lock_register`, the second saying so out loud: *"Not registered — the caller's
+sweep owns clearing"*) — and the chain-compress retires (ft-remove.h:1290). A fix
+at `ft_detach_freeze_one` closes one; a fix inside `_arms` closes all of them.
+☞ The sites that call `ft_flip_txn_record_tombstone_locked` DIRECTLY all register
+first (ft-graft.h:1494, ft-merge.h:3572/3595, ft-rekey.h:5737/5760) and must keep
+the narrow check — under this design they do, untouched.
+
+**The shape decides, not the call path.** The wide predicate is sound only where
+the record's new value sets `FT_STATE_TOMBSTONE` — only then is the word
+unlockable afterwards and the sweep deterministic. That is checkable from the
+record itself, and every record `_arms` plants has it.
+
+**The mechanism**: an internal `__ft_flip_txn_record_tag_ctx(t, dbg_ctx, owner,
+slot, old, new, tag)` whose assert adds one guarded term —
+
+    || (dbg_ctx && owner && slot == (void **) &owner->state
+        && ((uintptr_t) new_ptr & FT_STATE_TOMBSTONE)
+        && ft_lock_ctx_holds(dbg_ctx, owner, &snap, &rat))
+
+— with today's `record_tag` / `record_state_kind` / `record_state` becoming
+wrappers that pass `dbg_ctx = NULL`, so every existing caller keeps a
+byte-identical predicate and no call site moves. `_arms` (which already holds
+`@ctx`, using it behaviourally at ft-mutation-helpers.h:4881) calls the `_ctx`
+spelling. About four lines move, all inside `ft-mutation-helpers.h`.
+
+**Why it cannot rot**: the witness is a PARAMETER, so it has no lifetime — the
+leaky one-shot flag needs one. Misuse fail-closes: a future site passing `ctx` on
+a non-retire record gets the narrow predicate back, so the wide term can never
+bless a record whose word survives — which is the bug class the five earlier
+fixes closed. And `FT_RED_OWNER_CLAIM_ON_LOCK` still drives the same assert at
+the same choke point: the record supplies a WITNESS, never a VERDICT.
+
+☠ **THE SENTINEL FORM IS THE ONE TO REJECT** (have `_retire_anchored` verify and
+pass a distinguished "already-checked" owner value): a verdict token is
+MINTABLE, the choke point cannot falsify it, and the first surviving-anchor site
+that passes it ships the double-clearing race with the detector permanently blind
+for that record in EVERY config — findable only by grep. It also overloads
+`owner`, which `FT_TK_COUNT_OWN` reads for classification.
+
+☞ Precedent, so this is adoption rather than invention: `ft_pub_rec.owner[3]` /
+`.root[3]` carry the answer with the edge *"rather than being re-derived at each
+of them"* (fractal-trie-internal.h:830-855, naming `FT_OWNER_ASSERT_OWNED`), and
+`hold_ctx` on `ft_reparent_record_meta` (ft-mutation-helpers.h:8856) is already a
+lock-ctx threaded into a recorder with NULL meaning "caller cannot answer". The
+tree has NO windowed txn flag anywhere — `dbg_arm_per_op` and `dbg_lock_take` are
+both set-once — so the one-shot would have been a new anti-idiom.
+
+☠ **ONE PREDICTION OF THE DESIGN REVIEW FAILED, AND IT DOES NOT MATTER.** It
+predicted `ctx->held.txn == 0` at the abort, on the reasoning that a non-NULL
+`held.txn` would collapse "registry ∪ chain" to the registry. Printed:
+`held.txn` IS the content txn. The implication is wrong — `ft_held_set_snap`
+(ft-mutation-helpers.h:2336) falls THROUGH from the txn loop to `extra`, `glue`
+and `outer` unconditionally. The witness is carried by the EXTRA lane, verified
+directly: `nr_extra == 1`, `extra[0].lock == m`, `extra[0].shared == false`. The
+recommendation stands on that.
 
 ☞ And the sentence that would have sent the wrong fix here has been retracted in
 the code (`01dd9584`): a miss splits into a FINDING where the txn owns the
