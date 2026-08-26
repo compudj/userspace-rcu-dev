@@ -2887,6 +2887,26 @@ int ft_detach_node(struct cds_ft *ft,
 					goto end;
 				}
 			}
+#ifdef FT_REMOVE_CLAIM
+			/*
+			 * §4 STEP B2's DRY RUN, the tool 658989ef was for the rekey
+			 * writer: point B0's owner assert at the remove commit_rec so
+			 * every record it plants without owning is named, at an abort,
+			 * on a build otherwise byte-identical to the unarmed one.
+			 *
+			 * ☞ CLAIMED HERE, WHICH IS EARLIER THAN THE ARM WOULD BE.  A
+			 * dry run has to claim BEFORE the records it wants checked, and
+			 * for this site that is before its acquires finish -- so read a
+			 * miss as "this record is planted before its owner is
+			 * registered" FIRST.  That ORDERING class has been the answer
+			 * more often than a missing acquire.
+			 *
+			 * ☠ And read a miss as "the registry cannot SEE this hold"
+			 * before "the op does not HOLD it": where a caller's SWEEP owns
+			 * the mark's clearing, the absence is by design (ft_flip_txn_owns).
+			 */
+			ft_flip_txn_claim_per_op_armable(ft, commit_txn);
+#endif
 #ifdef FEATURE_FT_PROBE_PROMOTE
 			/*
 			 * §4.B unguarded-promote probe.  At the CALL SITE, not inside
