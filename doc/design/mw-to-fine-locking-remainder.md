@@ -774,19 +774,45 @@ claimed exclusion argument:
    converts — the readiness is established for every arm point on this txn, not
    just the first.
    ☑ **IN-PLACE PUBLISH PATH ARMED** `6024f167`, after
-   `ft_remove_one_commit`'s last register. ☠ **AND THE MEASUREMENT IS THE
-   FINDING**: `created 4,854,685 / armSW 34,685 / SW 79,951 / MW_STRUCT
-   12,522,790` — roughly 0.7% of the site's txns reach an armed state, and part
-   of that 34,685 is the rekey fold's hand-arm already attributed here. So the
-   remove surface does NOT commit through this path. ☐ The recompact / collapse
-   edges are planted earlier on the same txn and need their own arm points, each
-   after its own last register. That is B2's remainder.
+   `ft_remove_one_commit`'s last register — correct, and it converts almost
+   nothing.
+   ☠☠ **AND THE "0.7%" WAS NOT A MEASUREMENT OF THAT ARM.** It was read off
+   `armSW`, and that column cannot answer the question: `ft-txn-kind-stats`
+   prices a site by TXN CREATION, so an arm that never RUNS and an arm that runs
+   and is REFUSED report the same number, and a *different* site hand-arming the
+   same txn (the rekey fold) reports as this site's `armSW`.
+   `-DFT_B2_ARM_PROBE` (`19befc1f`) splits REACH from REFUSAL, and the real
+   number is **10 reaches in a whole ft_inv run** — every
+   one of that 34,685 was the fold's. The mechanism is not a defect in the arm:
+   an in-place delete needs `ft_in_place_ok()`, which needs an EXCLUSIVE trie,
+   which is a trie the per-op arm refuses outright — so on a shared trie EVERY
+   delete recompacts (`ft_popcount_node_replace_ptr` returns `-EFBIG`) and only
+   the external PROMOTE sub-case reaches that path at all.
+   ★ **THE LESSON GENERALISES TO EVERY REMAINING B STEP**: `armSW` is not an
+   arm's yield. Pair each arm with a REACH counter, or the next site's zero will
+   read the same way.
+   ☑ **RECOMPACTION REPUBLISH ARMED** `21b6b559` (both paths) — that is where
+   the site commits. They do not share a last register:
+   the FUSED path's is `ft_node_recompact`'s RELEASE half ({P}, +{GP} when P is
+   compressed), planted inside `ft_node_replace_ptr`; the NON-FUSED path's is
+   `ft_flip_txn_lock_or_guard_parent` on its own `else` arm. Refused on the FOLD
+   path (`record_only`): there the txn is the CALLER's and the registry's
+   completeness is the caller's judgement.
+   Measured, WITHIN ONE RUN (ft_inv `FT_INV_MW=1`, 507 threads, per-node):
+   `created 5,103,780 / armSW 4,000,657 / SW 3,252,905 / MW_STRUCT 9,827,650 /
+   OK 3,999,992 / ABORT 665`, with the probe reading `in-place 10 armed 0 |
+   republish A 1,318,159 all armed | republish B 2,801,578 all armed`.
+   **`armSW` now tracks `OK` almost exactly**: essentially every committing txn
+   at this site is armed.
+   ☐ The REMAINDER is ~2.4 records per commit planted BEFORE the arm — the
+   reparent sweep's held-child edges, the tombstones, the anchor releases, the
+   orphan freezes. Converting those needs the op's ACQUIRES to finish earlier,
+   which no arm can do from a publish site; that is Phase C/E, not B2's.
    ☠ A cross-run delta against the unarmed measurement is NOT sound — ft_inv's
    totals move run to run, so columns compare only within one run.
-   ☞ `OWN_MISS` barely moves (1,457,049 → 1,400,696 of MW_STRUCT 12.9M) and that
-   is the expected shape: the counter prices records on txns the arm refuses
-   outright, which the assert exempts via `!nr_locks`. Read the DRY RUN as the
-   readiness signal.
+   ☞ `OWN_MISS` barely moves (1,377,786 → 1,405,328) and that is the expected
+   shape: the counter prices records on txns the arm refuses outright, which the
+   assert exempts via `!nr_locks`. Read the DRY RUN as the readiness signal.
 3. The PUBLISH LANE — ☑ **LANDED** `6f54e698`: `ft_pub_rec_add` takes an `owner`
    and all four producers name it. Every such slot is a BODY slot, so the owner
    is the node the slot LIVES IN — which is not always `@parent_nf`, and
@@ -1384,12 +1410,18 @@ stale) — watch it across Phase B, it shares words with the converted sites.
                                                               RED at exponential + root-only
     B2-5 four hot sites, one at a time                      (each: owner-complete -> claim
                                                               dry-run -> arm; NOT mechanical).
-                                                              B2 OWNER-COMPLETE a9ff9549 after
-                                                              ONE fix; its in-place path ARMED
-                                                              6024f167 -- but that is 0.7% of
-                                                              the site, so B2's remainder is
-                                                              arm points for the recompact /
-                                                              collapse edges
+                                                              B2 ☑ ARMED: owner-complete
+                                                              a9ff9549, in-place path 6024f167
+                                                              (reaches 10 times -- an EXCLUSIVE
+                                                              trie shape), RECOMPACTION
+                                                              REPUBLISH 21b6b559 -- armSW now
+                                                              tracks OK (4.00M of 4.00M
+                                                              commits).  ☠ "0.7%" was armSW
+                                                              mis-read as yield; 19befc1f is
+                                                              the REACH counter that separates
+                                                              them.  Remainder = the ~2.4
+                                                              records/commit planted BEFORE
+                                                              the acquires finish (Phase C/E)
     B6  retire hand-arming (rekey writer, root COW)         (small)
     C   re-measure; G4 cell-lane decision                   (gate + data)
     G5  subtree freeze-state gate design (hybrid D)         (design, w/ D)
