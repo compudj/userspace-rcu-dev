@@ -842,30 +842,44 @@ claimed exclusion argument:
    63.64) is WIDER than the gap while the armed leg is tight (56.69 / 55.81 /
    53.82), so what this establishes is the ABSENCE of a wrong-direction signal,
    not a certified 11% ([[feedback_abort_column_is_not_a_per_step_number]]).
-5. The EXTERNAL-HEAD lane — `ft_promote_head`'s two arms and `ft_unchain_node`'s
-   head clear (≈13.0M + 4.4M MW_STRUCT, `OWN_MISS` **0**, `ABORT` **0**: they
-   buy FAIRNESS only, which is why they come after B3).
-   ☠☠ **ARM BLOCKED — a SLOT-SHAPED exclusion gap**, found by the dry run
-   `8b0e52b7`. `_ft_publish_to_parent_meta` emits TWO structural edges when the
-   holder is skip-encoded: the forward `@head_slot`, owned by `@parent_nf` and
-   registered by the fence above it, and a **SKIP_X DUAL into the GRANDPARENT's
+5. The EXTERNAL-HEAD lane — split by what the evidence shows, after an
+   adversarial skeptic took the first framing apart in BOTH directions.
+   ☑ **`ft_unchain_node`'s HEAD CLEAR — ARMED** `8cd52c64`. It never emits a SKIP_X
+   dual, by ROUTING: `_ft_publish_to_parent`'s dual arm is gated on
+   `ft_node_compressed(@parent_nf)`, and `_cds_ft_remove_locked` sends a
+   COMPRESSED holder to `ft_detach_node` (no successor) or to the PROMOTE arm
+   (one or more), so this branch only ever sees a NULL or INTERNAL parent. The
+   branch comment naming "a compressed holder's SKIP_X dual" is STALE.
+   ☞ The arm rests on a DETECTOR (`urcu_assert_debug(n_s < 2)`), not on that
+   paragraph — a routing invariant is a code fact and code moves. Red control:
+   inverted it does NOT fire on ft_unit (that suite never reaches the lane) and
+   aborts 6× on ft_inv `FT_INV_MW=1`. Reach 2,346,297 / armed 2,346,297, ZERO
+   refusals; the site goes 2.00 → 1.00 MW_STRUCT per txn (the residue is
+   `hold_or_lock_parent`'s own release terminal, which cannot move above its
+   own register). `ABORT` 0 before and after — fairness only, as expected.
+   ☠☠ **`ft_promote_head`'s TWO ARMS — ARM BLOCKED.**
+   `_ft_publish_to_parent_meta` emits a **SKIP_X DUAL into the GRANDPARENT's
    body** — a node these ops never acquire (in the ft_unit repro,
-   `test_dup_chain_head_promotion`, it is the ROOT NODE's slot at `item+8`
-   against a one-entry registry). `ft_ord_cell_flip_into` gives BOTH edges the
-   dispatching recorder, so an armed txn would SW-park a word the op does not
-   exclude. Sound today only because the lane is all-MW.
-   ☞ `-DFT_HLIST_CLAIM_LISTON` aborts on both suites; `-DFT_HLIST_CLAIM` (the
-   other two lanes) is CLEAN — **and that clean run is NOT a licence to arm
-   them**. All three call the same producer and the other two name "a
-   compressed holder's SKIP_X dual" in their own comments; the suite merely
-   never built one there ([[feedback_a_site_inventory_cannot_cover_a_dynamic_slot]]).
+   `test_dup_chain_head_promotion`, the ROOT NODE's slot at `item+8` against a
+   one-entry registry). `ft_ord_cell_flip_into` gives both edges the
+   dispatching recorder, so an armed txn would SW-park an unowned word. Sound
+   today only because the lane is all-MW.
+   ☠ **AND THE LIST-OFF ARM'S CLEAN DRY RUN WAS A COVERAGE ARTIFACT — PROVEN.**
+   A 60-line public-API program (list-off trie, four duplicates of one key,
+   remove the head) aborts on the very build whose whole-suite dry run was
+   clean. Both arms now share `-DFT_HLIST_CLAIM_PROMOTE`.
    ☞ **THE FIX IS PER EDGE.** `struct ft_ord_cell_edge` already carries `@owner`
    and `@root`; the missing third answer is whether the OP HOLDS that owner —
-   the shape `ft_flip_txn_record_parent_word` already takes as `@child_held`. A
-   blanket always-MW for the dual gives back a real conversion, since
-   `ft_detach_node`'s republish DOES hold the recompact's `{P,GP}`. **Carrying
-   the flag vs. extending these ops' lock-set to the grandparent is a DESIGN
-   call — owed to Mathieu, not to be assumed by an arming step.**
+   the shape `ft_flip_txn_record_parent_word` already takes as `@child_held`.
+   Alternatives and their corrected costs: extending the lock-set to the
+   grandparent is NOT a liveness risk (DLM acquires are refusal-based try-locks
+   and `ft_dlm_acquire_set` already ships this shape in two producers) but
+   widens a hot lane's conflict window; a blanket always-MW costs only the DUAL
+   edges at `ft_detach_node`, not its forward publish; and dispatching on
+   `ft_flip_txn_owns` inside `ft_ord_cell_flip_into` is two lines and no new
+   field but converts the record-time DETECTOR into a silent runtime FALLBACK,
+   absorbing the register-before-record ordering class instead of flagging it.
+   **Which one is a DESIGN call — owed to Mathieu.**
 6. The remaining content sites in descending count.
 
 ★ **EVERY ARM FROM HERE CARRIES A REACH COUNTER.** `-DFT_ARM_REACH` lives in
@@ -1476,14 +1490,18 @@ stale) — watch it across Phase B, it shares words with the converted sites.
                                                               wrong-direction alarm and did not
                                                               survive (ctl 62.6 vs arm 55.4
                                                               aborts/1k, control spread 51-73)
-    B4/B5 the external-head lane                            ☠☠ ARM BLOCKED 8b0e52b7 -- the
-                                                              SKIP_X DUAL lands in the
-                                                              GRANDPARENT's body, which these
-                                                              ops never acquire.  SLOT-shaped,
-                                                              so the two CLEAN dry runs do not
-                                                              license their arms.  Fix is a
-                                                              per-EDGE held flag vs extending
-                                                              the lock-set: a DESIGN call
+    B5  ft_unchain_node's head clear                        ☑ ARMED 8cd52c64 -- no SKIP_X dual
+                                                              by ROUTING, and a DETECTOR says
+                                                              so (red control: silent on
+                                                              ft_unit, 6 aborts on ft_inv)
+    B4  ft_promote_head (both arms)                         ☠☠ ARM BLOCKED -- the SKIP_X DUAL
+                                                              lands in the GRANDPARENT's body.
+                                                              The list-off arm's CLEAN dry run
+                                                              is a COVERAGE ARTIFACT, proven by
+                                                              a constructed public-API repro.
+                                                              Fix is per-EDGE held flag vs
+                                                              lock-set vs blanket-MW vs a
+                                                              record-time fallback: DESIGN call
     B6  retire hand-arming (rekey writer, root COW)         (small)
     C   re-measure; G4 cell-lane decision                   (gate + data)
     G5  subtree freeze-state gate design (hybrid D)         (design, w/ D)
