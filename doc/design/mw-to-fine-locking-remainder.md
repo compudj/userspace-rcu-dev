@@ -971,17 +971,58 @@ that previously escaped the check under it. Read a backwards jump as coverage
 gained, not as a regression, and confirm it by identifying the newly-exposed
 record — never by reverting on the number alone.
 
-#### ☐ WHERE THE CLAIM STOPS NOW — the glue's deferred re-parent marks
+#### ☑ THE WITNESS CLASS IS CLOSED — four instances
 
-    ft_glue_apply_deferred (ft-mutation-helpers.h:10363)
-      -> ft_reparent_record(child_marked=true) -> ft_reparent_record_meta
-      -> ft_flip_txn_record_parent_word(child_held=true), owner = the child
+    6e77bab7  the glue's SKIP_X GRANDPARENT fence      (take -> txn)
+    d4b4d2d7  the glue FREE-LIST retire's anchor       (register, and BEFORE the record)
+    05356918  the glue's PUBLISH PARENT fence          (take -> txn, one shared helper)
+    bf9c490c  the glue's per-node RE-PARENT MARK       (register; @marked stays false)
 
-Third instance of the one class. `@child_marked` asserts the op holds the child —
-and it does: that arm records the mark's own release and drops the hold-trace
-entry. The mark lives in the glue's re-parent marks, which no registry has seen,
-and `ft_glue_apply_deferred` runs at the TOP of `ft_glue_txn_commit_edges`,
-before its own fence blocks. Same shape as the two above, at the third witness.
+All four were one shape: *the op HOLDS the word, a witness that is not the txn
+registry knows it, and the record-time owner check reads `t->locks[]` alone.*
+Recognise it in gdb on a single-threaded run — `owner->state & FT_STATE_LOCK`
+set, and `owner` findable in some other witness. Three of the four had a
+carve-out saying the registry was unnecessary, and each of those carve-outs was
+about who CLEARS the mark, never about whether the commit owns the word.
+
+☠ **THE CLAIM'S ABORT NUMBER CAN GO DOWN ON A CORRECT FIX**, and it did: 120 →
+112 at `05356918`. `FT_OWNER_ASSERT_OWNED` refuses on `!t->nr_locks` ("this
+commit owns nothing, so do not check"), so registering a lock SOONER puts
+records that previously escaped the check under it. Read a backwards jump as
+coverage gained; confirm it by identifying the newly-exposed record, never by
+reverting on the number.
+
+☐ **ONE BOUND IS OWED.** `bf9c490c` registers one entry per deferred child, and
+`FT_FLIP_TXN_MAX_LOCKS` (`FT_ENTRY_PER_NODE + 1` = 257) was sized on exactly
+that set — *"the widest such set is a node's children plus the node itself"*.
+Measured with `-DFT_LOCKS_HIGHWATER` (new; prints at each new maximum,
+immediately, because `atexit` does not run on `abort`): **15 / 257** on ft_inv
+`FT_INV_MW=1` at all three spacings, 13 on ft_unit. Seventeen-fold headroom on
+the suite as it stands; the worst case — a glue whose deferred list is one
+node's whole fan-out, plus its publish parent — is NOT proven, and ☠ the guard
+is a plain `assert`, so an overflow is silent under `NDEBUG`.
+
+#### ☐ WHERE THE CLAIM STOPS NOW — and it is a MISSING ACQUIRE, not a witness
+
+    ft_glue_txn_commit_edges (ft-mutation-helpers.h:10647)
+      -> ft_flip_txn_record_pub_rec -> rec edge 0, the SKIP_X DUAL
+
+The first abort of this walk that is NOT the witness class, and the difference is
+visible in one word: **`owner->state == 0x8` — no `FT_STATE_LOCK` at all.** The
+op does not hold this node, by any witness. `t->locks[]` does not contain it
+either, so the GP fence was never taken.
+
+The dual's slot lives in the compressed publish parent's OWN parent, and the
+fold takes a GP fence for it at `ft-rekey.h`'s dual gate — but only on the arm
+that reaches that gate. The SPLIT/GLUE take (the second
+`ft_glue_take_publish_parent` call site) acquires the publish parent and nothing
+above it, while its publish still re-encodes the dual. That is the same defect
+`bbb8e795` closed for the insert site ("a publish under a compressed parent must
+hold GP"), at the rekey fold's other arm.
+
+☞ This one ADDS AN ACQUIRE, so unlike the four above it is not
+behaviour-neutral: it needs the lock-ordering argument and the edge-budget check
+(`-DURCU_TXN_DEBUG_RESERVE`, since an under-reservation is silent).
 
 ### 9.2 The load-sensitive concurrency class
 
@@ -1167,10 +1208,12 @@ stale) — watch it across Phase B, it shares words with the converted sites.
                                                               695d23c1 / d67851c6 / bec0c726
                                                               / 280fdac1 / c6ac8c42 /
                                                               b7334aa4 / f79438e7 / 6e77bab7
-                                                              / d4b4d2d7 / 05356918 landed —
-                                                              ONE class at three witnesses;
-                                                              next is the glue's deferred
-                                                              re-parent marks (§9.1)
+                                                              / d4b4d2d7 / 05356918 / bf9c490c
+                                                              landed — the WITNESS class is
+                                                              CLOSED (4 instances); next is a
+                                                              MISSING ACQUIRE: the fold's
+                                                              split arm publishes a SKIP_X
+                                                              dual without holding GP (§9.1)
     B0  per-op arm helper + record-time owner assert        ☑ LANDED — and its first
                                                               measurement says NO site is
                                                               owner-complete (11.9% of the
