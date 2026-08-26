@@ -183,13 +183,11 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 				struct ft_ord_cell *cell = ft_ord_cell_ptr(
 					topmost_external_nodes->prev);
 
-				ft_flip_txn_record_reserved(txn,
-					FT_OWNER_NONE_EXTERNAL_HEAD,
+				ft_flip_txn_record_head_back_edge(txn,
 					(void **) &cell->parent,
 					cell->parent, cn_flag);
 			} else {
-				ft_flip_txn_record_reserved(txn,
-					FT_OWNER_NONE_EXTERNAL_HEAD,
+				ft_flip_txn_record_head_back_edge(txn,
 					(void **) &topmost_external_nodes->prev,
 					topmost_external_nodes->prev, cn_flag);
 			}
@@ -859,7 +857,7 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 	/*
 	 * Pre-reserve the commit flip-txn BEFORE any pre-flip side-effect.  The
 	 * surviving child's (parent, parent-slot-offset) pair is RECORDED into
-	 * @txn by ft_pub_rec_add_back_edge below (ft_reparent_record_meta: both
+	 * @txn by ft_record_child_back_edge below (ft_reparent_record_meta: both
 	 * edges co-committed), so an aborted flip discards the pair coherently
 	 * -- no settled offset survives against the still-old parent.  With the
 	 * txn reserved the publish commits through ft_ord_cell_flip_into without
@@ -1261,7 +1259,7 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		 * the pre-reserved @txn (ft_ord_cell_flip_into), so it is
 		 * allocation-free past this point and cannot fail.
 		 */
-		ft_pub_rec_add_back_edge(ft, &rec, txn, new_cn->child,
+		ft_record_child_back_edge(ft, txn, new_cn->child,
 			new_cn_flag, &new_cn->child);
 		new_cn_pub = ft_publish_compressed(ft, new_cn, new_cn_flag);
 		/* VALIDATE (§4.B): lock (or guard-fallback) the LIVE
@@ -3068,8 +3066,7 @@ int ft_detach_node(struct cds_ft *ft,
 				 */
 				if (pub->head_parent_field) {
 					if (commit_txn)
-						ft_flip_txn_record_reserved(commit_txn,
-							FT_OWNER_NONE_EXTERNAL_HEAD,
+						ft_flip_txn_record_head_back_edge(commit_txn,
 							(void **) pub->head_parent_field,
 							pub->head_parent_old,
 							pub->head_parent_new);

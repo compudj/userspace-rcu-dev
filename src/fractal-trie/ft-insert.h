@@ -254,23 +254,10 @@ void ft_park_live_parent_edge(struct cds_ft *ft,
 			&((struct cds_ft_node *) child)->prev;
 	}
 	/*
-	 * External head: @field is cell->parent or node->prev, and no lock word
-	 * owns either -- see FT_OWNER_NONE_EXTERNAL_HEAD.  The metadata-bearing
-	 * children took the ft_reparent_record_meta arm above, which names its
-	 * owner.
-	 *
-	 * ALWAYS MW, and that is the SAME dispatch ft_flip_txn_record_parent_word
-	 * already makes on @child_held: a structural edge may park SW only where
-	 * the op holds the DLM lock over the slot, and here it never can -- an
-	 * external carries no state word to hold, so this is that predicate's
-	 * PERMANENT false arm rather than a site that has not been converted yet.
-	 * Parking it would claim an exclusion the op does not have; MW makes a
-	 * second writer's expected-old mismatch and abort, which the retry lane
-	 * absorbs.  Byte-identical while this txn is unarmed (record_tag IS
-	 * record_tag_mw there); what it changes is that an ARMED insert cannot
-	 * park this word, and the record leaves the MW_STRUCT conversion surface
-	 * for MW_ALWAYS -- the ft_flip_txn_record_root treatment for a word that
-	 * can never convert.
+	 * External head: @field is cell->parent or node->prev -- the back channel
+	 * ft_flip_txn_record_head_back_edge records always-MW, and its header
+	 * carries the why.  The metadata-bearing children took the
+	 * ft_reparent_record_meta arm above, which names its owner.
 	 */
 	/*
 	 * ☠ THE EXPECTED-OLD IS READ THROUGH THE TXN, NEVER RAW.  @field is a
@@ -278,13 +265,13 @@ void ft_park_live_parent_edge(struct cds_ft *ft,
 	 * it, and a raw `*field` hands that descriptor POINTER to the engine as
 	 * the expected-old -- which urcu_txn_add traps under a debug build
 	 * ("Debug builds still trap, to name the raw read") and which silently
-	 * records a value no reader ever sees otherwise.  ft_pub_rec_add_back_edge
+	 * records a value no reader ever sees otherwise.  ft_record_child_back_edge
 	 * reads the same class of word the same way.
 	 */
-	ft_flip_txn_record_tag_mw(txn, (void **) field,
+	ft_flip_txn_record_head_back_edge(txn, (void **) field,
 		urcu_txn_load(ft_flip_txn_handle(txn), (void **) field,
 			FT_FLIP_PROXY_TAG),
-		new_parent, FT_FLIP_PROXY_TAG);
+		new_parent);
 }
 
 /*

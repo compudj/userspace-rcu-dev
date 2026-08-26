@@ -885,6 +885,13 @@ extern unsigned long cds_ft_probe_promote_guarded;
  *   DISAGREE, and closing this class means deciding which moves, not inventing
  *   a convention.  The alternative is giving externals a state word (§8.1).
  *
+ *   ☞ THE KIND, HOWEVER, IS SETTLED AHEAD OF THAT ANSWER: whoever owns the
+ *   word, no op can hold it today, so every DIRECT record of it goes through
+ *   the always-MW ft_flip_txn_record_head_back_edge and leaves the MW_STRUCT
+ *   conversion surface.  This marker therefore survives only where the word
+ *   travels through a RECORDER THAT CANNOT SAY MW -- ft_pub_rec_add, whose
+ *   per-edge answers are @root and @owner and neither means "always MW".
+ *
  *   ☞ It is NOT the class every ownerless external-head word belongs to.  The
  *   head-promote sites had a holder all along -- ft_promote_head takes it as a
  *   parameter and registers it on the same txn -- and only the ORDER of the
@@ -3062,6 +3069,38 @@ void ft_flip_txn_record_tag_mw(struct ft_flip_txn *t, void **slot,
  */
 static inline
 void ft_flip_txn_record_root(struct ft_flip_txn *t, void **slot,
+		void *old_ptr, void *new_ptr)
+{
+	ft_flip_txn_record_tag_mw(t, slot, old_ptr, new_ptr,
+		FT_FLIP_PROXY_TAG);
+}
+
+/*
+ * An EXTERNAL HEAD's BACK CHANNEL re-pointed at a new parent: cell->parent with
+ * the ordered list on, en->prev with it off.  ALWAYS MW, for the reason
+ * ft_flip_txn_record_parent_word decides per record on @child_held -- a
+ * structural edge may park SW only where the op holds the DLM lock over the
+ * slot, and here it never can, because neither an external node nor its cell
+ * carries a state word to hold.  This is that predicate's PERMANENT FALSE ARM,
+ * not a site awaiting conversion, so it takes the ft_flip_txn_record_root
+ * treatment: a word that can never convert leaves the MW_STRUCT surface.
+ *
+ * Parking it would claim an exclusion the op does not have -- two ops re-homing
+ * one head both park, neither fails, and the last install wins.  MW makes the
+ * second writer's expected-old mismatch and abort, which the retry lane exists
+ * to absorb.  Byte-identical on an unarmed txn (there record_tag IS
+ * record_tag_mw); what it changes is that an ARMED op cannot park this word.
+ *
+ * ☞ This settles the KIND, and only the kind.  WHO owns the back edge --
+ * FT_OWNER_NONE_EXTERNAL_HEAD's design question, the model's §8.2 assigning
+ * `parent` to P against the code keying it on holding the child -- stays open
+ * and is Phase C's ledger to re-examine.
+ *
+ * ☠ Reach for this only after checking for a HOLDER in scope: the head-promote
+ * sites looked ownerless and had their holder as a parameter all along.
+ */
+static inline
+void ft_flip_txn_record_head_back_edge(struct ft_flip_txn *t, void **slot,
 		void *old_ptr, void *new_ptr)
 {
 	ft_flip_txn_record_tag_mw(t, slot, old_ptr, new_ptr,
@@ -6414,7 +6453,7 @@ int ft_remove_one_commit(struct cds_ft *ft,
 }
 
 /*
- * Record a LIVE child's parent back-edge into @rec so it rides the SAME flip as
+ * Record a LIVE child's parent back-edge into @txn so it rides the SAME flip as
  * the forward publish (instead of a bare ft_set_parent before it): the child's
  * parent field transitions old -> @new_parent atomically with the structural
  * publish, closing the re-parent-before-publish window and making the back-edge
@@ -6437,8 +6476,7 @@ static void ft_reparent_record_meta(struct cds_ft *ft, struct ft_flip_txn *txn,
 		const struct ft_lock_ctx *hold_ctx);
 
 static
-void ft_pub_rec_add_back_edge(struct cds_ft *ft, struct ft_pub_rec *rec,
-		struct ft_flip_txn *txn,
+void ft_record_child_back_edge(struct cds_ft *ft, struct ft_flip_txn *txn,
 		struct cds_ft_inode_flag *child,
 		struct cds_ft_inode_flag *new_parent,
 		struct cds_ft_inode_flag **slot)
@@ -6485,28 +6523,23 @@ void ft_pub_rec_add_back_edge(struct cds_ft *ft, struct ft_pub_rec *rec,
 	}
 	/*
 	 * Back-edge expected-old = the child's current back-pointer
-	 * (cell->parent / prev), read as a WAITING load rather than raw: @rec is
-	 * recorded into @txn by the caller, so this slot enters that txn's write
-	 * set and its last load must wait out an undecided parker.  A raw read
-	 * bakes a peer's parked flip proxy -- a descriptor-record POINTER -- into
-	 * the expected-old, which is the engine's !urcu_txn_is_proxy self-check.
-	 *
-	 * ★ The comment this replaces justified the raw read by pointing at "the
-	 * sibling ft_reparent_record_meta's raw meta->parent".  That sibling
-	 * stopped reading raw; the justification outlived the mechanism.
+	 * (cell->parent / prev), read as a WAITING load rather than raw: this
+	 * slot enters @txn's write set on the very next line, so its last load
+	 * must wait out an undecided parker.  A raw read bakes a peer's parked
+	 * flip proxy -- a descriptor-record POINTER -- into the expected-old,
+	 * which is the engine's !urcu_txn_is_proxy self-check.
 	 */
-	/* A BACK edge (&cell->parent / &node->prev): inside the child, never a
-	 * trie root -- a root has no back-edge to record. */
 	/*
-	 * NO OWNER, and this is the ONE producer for which that is a finding
-	 * rather than an omission: @field is an EXTERNAL head's back channel
-	 * (cell->parent / node->prev), and no lock word owns it -- see
-	 * FT_OWNER_NONE_EXTERNAL_HEAD and the open fork it names.  Every other
-	 * ft_pub_rec_add is a BODY slot whose node owns it.
+	 * An EXTERNAL head's back channel goes STRAIGHT into @txn, always-MW,
+	 * exactly as the metadata arm above goes straight into it: routing it
+	 * through @rec instead put an ownerless word on the rec's SW-capable
+	 * replay, where an armed op would park a word it cannot hold.  Same
+	 * commit, same abort, same reservation -- the rec never added anything
+	 * to this edge, having no per-edge answer that means "always MW".
 	 */
-	ft_pub_rec_add(rec, field,
+	ft_flip_txn_record_head_back_edge(txn, (void **) field,
 		urcu_txn_load(txn->mtxn, (void **) field, FT_FLIP_PROXY_TAG),
-		new_parent, /*root=*/ false, FT_OWNER_NONE_EXTERNAL_HEAD);
+		new_parent);
 }
 
 /*
@@ -6523,7 +6556,7 @@ void ft_pub_rec_add_back_edge(struct cds_ft *ft, struct ft_pub_rec *rec,
  * FT_REMOVE_COMMIT_REC_MAX_EDGES) reserved in the op's fallible build phase --
  * the flip then commits through it (ft_ord_cell_flip_into) and cannot
  * ALLOC-fail, so a caller that has already wired a pre-flip side-effect (e.g. a
- * child's parent-slot offset via ft_pub_rec_add_back_edge) reaches an
+ * child's parent-slot offset via ft_record_child_back_edge) reaches an
  * allocation-free point of no return.  NULL keeps the transitional
  * self-allocating flip (bare-store fallback) for callers not yet migrated.
  *
@@ -8678,12 +8711,10 @@ void ft_glue_record_back_edge(struct cds_ft *ft, struct ft_flip_txn *txn,
 		if (ft->ordered_list) {
 			struct ft_ord_cell *cell = ft_ord_cell_ptr(en->prev);
 
-			ft_flip_txn_record_reserved(txn,
-				FT_OWNER_NONE_EXTERNAL_HEAD,
+			ft_flip_txn_record_head_back_edge(txn,
 				(void **) &cell->parent, cell->parent, parent_nf);
 		} else {
-			ft_flip_txn_record_reserved(txn,
-				FT_OWNER_NONE_EXTERNAL_HEAD,
+			ft_flip_txn_record_head_back_edge(txn,
 				(void **) &en->prev, en->prev, parent_nf);
 		}
 		return;
@@ -9013,15 +9044,13 @@ void ft_reparent_record(struct cds_ft *ft, struct ft_flip_txn *txn,
 		if (ft->ordered_list) {
 			struct ft_ord_cell *cell = ft_ord_cell_ptr(en->prev);
 
-			ft_flip_txn_record_reserved(txn,
-				FT_OWNER_NONE_EXTERNAL_HEAD,
+			ft_flip_txn_record_head_back_edge(txn,
 				(void **) &cell->parent,
 				urcu_txn_load(txn->mtxn, (void **) &cell->parent,
 					FT_FLIP_PROXY_TAG),
 				parent_nf);
 		} else {
-			ft_flip_txn_record_reserved(txn,
-				FT_OWNER_NONE_EXTERNAL_HEAD,
+			ft_flip_txn_record_head_back_edge(txn,
 				(void **) &en->prev,
 				urcu_txn_load(txn->mtxn, (void **) &en->prev,
 					FT_FLIP_PROXY_TAG),
