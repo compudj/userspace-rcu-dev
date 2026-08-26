@@ -872,16 +872,33 @@ claimed exclusion argument:
    inherits the caller's `@slot_owner_nf` declaration (so every existing
    conversion is preserved); the DUAL's owner is DERIVED from a back-pointer, so
    `_ft_publish_to_parent{,_meta}` take `@dual_owner_held` and all **19** call
-   sites state it, compiler-enforced. Only `ft_detach_node`'s two republishes
-   say true, and they say `old_recompacted_node != NULL` rather than a constant.
+   sites state it, compiler-enforced.
+   ☠☠ **AND EVERY ONE OF THEM NOW SAYS FALSE** (`46f33b7c`). The two
+   `ft_detach_node` republishes briefly said `old_recompacted_node != NULL`, on
+   the ground that "the recompact takes {C,P,GP} exactly when P is compressed".
+   That is a **PLAN-TIME** fact: `pf_gp` is resolved BEFORE the acquire and GP
+   enters the set only `if (pf_gp)`; an empty member is skipped by
+   `if (!set[i].nf) continue` — its GUARD with it — while the dual's slot AND
+   owner are derived FRESH at publish. A compressed P that was root-attached at
+   plan time yields no GP and no guard, so a peer re-home in that window makes
+   the publish derive a grandparent the op never acquired: an SW park on an
+   unowned word, at an ARMED site, silent without `--enable-rcu-debug`.
+   Unproven-reachable (no current op live-re-homes a root-attached compressed
+   node) — **not a defence**. The parameter stays: it is where a publish-time
+   answer belongs — the ACQUIRED GP compared against the DERIVED dual owner.
    ☞ Verified on the construction that found it: the public-API repro
    (`fractal-trie-review-2026-06/repro_listoff_promote_skipx_dual.c`) now
    SURVIVES both arms, and both dry runs are clean. Reach 4,847,315 + 115,511,
    ALL armed; the site goes 0% → 33.3% converted.
-   ☞ **NO CONVERSION REGRESSION**, and the ratio is what says so — the per-1k
-   column moved because records-per-txn moved. Conversion FRACTION before→after:
-   insert 29.5→30.5%, B2 25.2→24.9%, B3 23.5→23.7%, B5 exactly unchanged, the
-   hand-armed rekey writer still MW_STRUCT 0.
+   ☠ **THE "CONVERSION FRACTION" EVIDENCE IS RETRACTED.** `!owner_held` routes
+   through `ft_flip_txn_record_tag_mw`, which counts **MW_ALWAYS** — outside the
+   conversion surface by design — so the dual population leaves BOTH numerator
+   and denominator of `SW/(SW+MW_STRUCT)`, and the fraction can hold still while
+   conversions are lost. The honest figure, per 1k txns created, ONE RUN per
+   column (an estimate, not a certified delta): B2's `SW` goes 668 → 600 → 534
+   across the mechanism and then the fail-close — a tenth to a fifth of its SW
+   records, which is what closing the window above costs. `ABORT` at these sites
+   is unchanged.
 6. The remaining content sites in descending count.
 
 ★ **EVERY ARM FROM HERE CARRIES A REACH COUNTER.** `-DFT_ARM_REACH` lives in
