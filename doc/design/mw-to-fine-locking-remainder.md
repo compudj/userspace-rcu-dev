@@ -752,14 +752,22 @@ Unchanged as an ordering, but each step is now
 *owner-complete → claim → arm*, one site per step, one adversarial skeptic per
 claimed exclusion argument:
 
-1. `ft-insert.h` insert one-commit — ☑ **OWNER-COMPLETE** (14.3% → 40.1% held).
+1. `ft-insert.h` insert one-commit — ☑ **ARMED** `e2ba43f8`. (Was owner-complete
+   at 14.3% → 40.1% held.)
    Its claim dry-run passes ft_unit AND ft_inv `FT_INV_MW=1` at 507 threads with
    no abort. NOT armed: the arm waits on 9.1, and its placement is an open API
    question (`ft_flip_txn_arm_per_op` has zero call sites and refuses an empty
    registry, yet kind dispatch happens at RECORD time). ☞ Read the DRY RUN as
    the readiness signal, not the percentage — the counter also prices records on
    txns the arm refuses outright.
-2. `ft-remove.h` remove commit_rec (39.2M; 25.5% held after the class fixes).
+2. `ft-remove.h` remove commit_rec — ☞ **IN FLIGHT**, dry run landed `a3c75659`
+   (`-DFT_REMOVE_CLAIM`). Measured with the arm live, ft_inv MW 507 threads:
+   MW_STRUCT 13,321,107, OWN_HELD 11,864,058, **OWN_MISS 1,457,049** — a 10.9%
+   exclusion gap, so not yet owner-complete. The walk starts at ft_unit test
+   **239** (the rekey writer's started at 112 — the classes closed there were
+   shared machinery). First item: an UNNAMED owner (`owner == NULL`) on
+   `ft_remove_one_commit`'s structural edge, `b7334aa4`'s shape at a producer
+   that builds its edge inline.
 3. The PUBLISH LANE — ☑ **LANDED** `6f54e698`: `ft_pub_rec_add` takes an `owner`
    and all four producers name it. Every such slot is a BODY slot, so the owner
    is the node the slot LIVES IN — which is not always `@parent_nf`, and
@@ -1349,8 +1357,17 @@ stale) — watch it across Phase B, it shares words with the converted sites.
                                                               MODEL's §8.2 (b44d08cc); the two
                                                               design docs reuse section
                                                               numbers, so always name the doc
-    B1-5 five hot sites, one at a time                      (each: owner-complete -> claim
-                                                              dry-run -> arm; NOT mechanical)
+    B1  insert one-commit                                   ☑ ARMED e2ba43f8 -- 2.64M txns
+                                                              armed, 6,998,341 records SW.
+                                                              ☠ NEEDED A PER-NODE SPACING
+                                                              GATE: ungated, per-node stayed
+                                                              green and txndbg/anchorval went
+                                                              RED at exponential + root-only
+    B2-5 four hot sites, one at a time                      (each: owner-complete -> claim
+                                                              dry-run -> arm; NOT mechanical).
+                                                              B2's dry run landed a3c75659;
+                                                              OWN_MISS 1.46M, walk starts at
+                                                              ft_unit 239
     B6  retire hand-arming (rekey writer, root COW)         (small)
     C   re-measure; G4 cell-lane decision                   (gate + data)
     G5  subtree freeze-state gate design (hybrid D)         (design, w/ D)
