@@ -952,11 +952,35 @@ that the hand-arm sits at txn CREATION, where every witness is empty.
 constructor already armed them, and 39,420 of the measured arm reaches were
 `lock_fine == 0` — there the hand-arm is redundant and the swap is a no-op. The
 whole B6 residue is the FINE lane.
-☠ **BEFORE LANDING**: with the arm live from the first take, `cow_stop`'s own
-records get a NON-VACUOUS owner check for the first time (§9.1's green covered
-them only vacuously, `nr_locks == 0` throughout `cow_stop`). Run the
-`-DFT_REKEY_CLAIM` dry run WITH the hoist first; misses there are ordering
-findings of the known class, not blockers.
+☑ **THE HOIST WAS IMPLEMENTED AND IT WORKS AT PER-NODE.** `ft_rekey_marks_to_txn`
+at every mark-growth point in `ft_rekey_cow_stop`, `ft_flip_txn_arm_per_op` at
+the stop take, the assert moved below it, the hand-arms retired at BOTH sites,
+and the driver's sweep gaining the `!marks[i].txn_owned` clause registration
+requires: ft_unit 315 ok / 3 deliberate, ft_inv `FT_INV_MW=1` 119/119, no
+assertion — and the only `set_structural_sw` callers left were the constructor's
+trie-wide arm and the helper itself. The predicted ordering findings DID appear
+(a marked child's re-parent record ahead of its registration) and registering at
+every growth point closed them.
+
+☠☠ **THEN THE GATE KILLED IT AT THE OTHER TWO SPACINGS.** `txndbg`, `anchorval`
+and `proxyassert` went RED at **exponential and root-only**, ft_unit dying after
+109 tests. The mechanism is the arm's SPACING REFUSAL, not its placement:
+`ft_flip_txn_arm_per_op` declines any spacing but per-node, so at a coarser FINE
+spacing `structural_sw` stays false — and this writer **cannot run all-MW**.
+`ft_reparent_record_meta` (`ft-mutation-helpers.h:9324-9326`): a MARKED child's
+edge MUST stay SW, because "an MW edge expecting live_state would mismatch the
+op's OWN mark and **abort every commit**". A LIVELOCK, not a slowdown — and
+exactly what `assert(txn->structural_sw)` was guarding.
+
+⇒ **B6 IS BLOCKED ON PHASE E, NOT ON B6.** The hand-arm is what lets this writer
+run at exponential / root-only at all; retiring it requires the helper to accept
+those spacings, which is Phase E's spacing certification. Landing the per-node
+half behind a gate would leave the coarse spacings on the hand-arm — two doors
+again, the thing B6 exists to remove. **Do B6 after E.**
+☞ The per-node half is measured, so E's follow-up starts from data: reach
+287,942 / armed 243,981 (all 43,961 refusals trie-wide), and the writer gives up
+~0.64 records per txn to MW_STRUCT — 8.6% of its structural records — because the
+arm sits at the take rather than at creation.
 
 ## 5. Phase C — the residual MW_ALWAYS lanes (the G4 decision)
 
