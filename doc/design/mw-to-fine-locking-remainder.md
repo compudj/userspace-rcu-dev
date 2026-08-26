@@ -917,6 +917,38 @@ owed with those sites' arm.
 Then retire the hand-arming at the rekey writer and root-COW driver onto the
 same helper, so the switch has no bypass.
 
+☠☠ **B6 IS BLOCKED, AND MEASURED RATHER THAN ARGUED.** Swapping the rekey
+writer's `ft_flip_txn_set_structural_sw(txn, true)` (`ft-rekey.h`) for
+`ft_flip_txn_arm_per_op(ft, txn)` kills the writer immediately: ft_inv
+`FT_INV_MW=1` dies after **2** tests on
+`ft_rekey_cow_stop`'s own precondition, `assert(txn->structural_sw)`
+(`ft-rekey.h:192`) — the helper REFUSES, so the arm never lands.
+
+**Why it refuses.** `ft_flip_txn_arm_per_op`'s predicate includes `!t->nr_locks`,
+and this writer's exclusion does not live in the registry: its fences sit in
+`marks[]` (the op's `held.extra` ledger) and reach the txn only as RECORDS, via
+`ft_flip_txn_record_anchor_release_held` just before the commit — **no
+`ft_flip_txn_lock_register` at all**. `nr_locks` is 0 for the whole body. Nor can
+it simply register them: the registry is `FT_ENTRY_PER_NODE + 1`, the same bound
+the orphan chain overflows, which `ft_flip_txn_owns` already documents as a
+deliberate counterexample.
+
+⇒ **The bypass is not laziness; it is a second, wider WITNESS.** The registry is
+the honest question for a RECORD helper (which has only the txn); it is the
+wrong one for an ARM (which is called from the op and can see its held set).
+Two ways out, and choosing is a DESIGN call:
+  (a) **Widen the arm's predicate** — give `ft_flip_txn_arm_per_op` the op's
+      `struct ft_lock_ctx *` and let it count `held.extra` / glue / outer frames
+      via `ft_held_set_snap`, so one helper serves both witnesses. Keeps a single
+      door; changes the arm's contract, and the record-time assert would still
+      only see the registry, so the two would disagree.
+  (b) **Name the second door** — a distinct `ft_flip_txn_arm_ledger(ft, t, ctx)`
+      whose comment carries the ledger justification, so `set_structural_sw` has
+      no BARE caller even though there remain two ways to arm.
+☞ The root-COW driver (`_cds_ft_debug_cow_replace_root`, `fractal-trie.c`) has
+the same shape — it arms at creation, before `ft_rekey_cow_stop` takes its marks
+— so whichever way B6 goes, it goes the same way for both.
+
 ## 5. Phase C — the residual MW_ALWAYS lanes (the G4 decision)
 
 After Phase B, re-run the counter baseline. The decision input Mathieu asked
