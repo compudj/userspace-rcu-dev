@@ -1080,7 +1080,7 @@ suite split — "ft_unit clean, only ft_inv aborts" — as a COVERAGE question
 first: ft_inv has dedicated COARSE rekey arms, ft_unit's rekeys run on FINE
 tries.
 
-#### ☐ §9.1(A) — the SIXTH witness, and its carve-out has an EXACT bound
+#### ☐ §9.1(A) — the SIXTH witness: a VISIBILITY gap, not a finding of the same kind
 
 With the claim gated, ft_unit stays clean and `ft_inv FT_INV_MW=1` advances from
 test 3 to test 9, stopping at:
@@ -1088,47 +1088,58 @@ test 3 to test 9, stopping at:
     ft_detach_freeze_orphans (ft-remove.h:594) -> ft_detach_freeze_one (:574)
       -> ft_flip_txn_record_retire_anchored -> the fused {LOCK|s -> TOMBSTONE|s}
 
-`ft->lock_fine == true` — checked first this time — and the expected-old carries
-`FT_STATE_LOCK` (`0x80004`), so the op HOLDS the orphan it retires. Witness class,
-sixth witness.
+`ft->lock_fine == true` (checked first), `owner == node == m`, and printed at the
+abort: `(h->lock == m) && !h->shared && !h->node_held` is **1**,
+`ctx->held.extra == held` is **1**, `txn->nr_locks` is **4**. So the op holds the
+orphan, the ctx witnesses it, and the registry is nowhere near full.
 
-☠ **BUT THE FIX THAT WORKED FIVE TIMES IS BLOCKED HERE, AND THE BLOCK IS
-ARITHMETIC.** `ft_detach_freeze_one` ALREADY registers before recording — but
-only when `h->lock != m`. The `h->lock == m` arm (per-node: the anchor IS the
-retired node) deliberately does not, and its stated reason is a sizing argument,
-not a convenience:
+☠ **THE FIVE-TIMES FIX IS UNAVAILABLE, AND SO ARE BOTH OBVIOUS ALTERNATIVES.**
+`ft_detach_freeze_one` already registers-before-recording when `h->lock != m`;
+the `h->lock == m` arm skips it, and that arm is RIGHT for two independent
+reasons, only one of which is the bound:
 
-> *"the fused tombstone is its terminal and the word is unlockable afterwards, so
-> that mark stays with the caller and costs no registry slot — which is what keeps
-> a FT_MAX_DEPTH orphan chain inside FT_FLIP_TXN_MAX_LOCKS"*
+* **Sizing.** `FT_MAX_DEPTH` (`FT_MAX_KEY_LEN + 1` = 257) equals
+  `FT_FLIP_TXN_MAX_LOCKS` (`FT_ENTRY_PER_NODE + 1` = 257), and the mark array is
+  `orphan_held[FT_MAX_DEPTH + 1]` = 258 (ft-remove.h:1513) while the op registers
+  real lock-set entries besides. Headroom is NEGATIVE, not zero. ☠ And the cap
+  guard is a plain `assert`, so "register anyway" is silent corruption under
+  `NDEBUG`.
+* **Lifecycle, which is the part that actually decides it.** Registration exists
+  to transfer the CLEARING. A surviving anchor must transfer it — post-commit the
+  word is clean and LIVE and a peer takes it, so a late caller-side release
+  strips the peer's mark. A RETIRED node cannot be stolen that way: the fused
+  terminal leaves `TOMBSTONE`, `ft_meta_lock_acquire` refuses a tombstone
+  forever, and the caller's unconditional sweep is deterministic on both
+  outcomes. **This site needs no lifecycle service, so registering buys it
+  nothing but a slot it does not have.**
 
-And the two numbers are EQUAL, not merely close:
+☠ **AND THE "SELF-WITNESSING RECORD" IDEA IS REFUTED ON ITS FACTS.** Its premise
+was that the expected-old carries `h->lock_snap | FT_STATE_LOCK`, so the LOCK bit
+proves the op's own acquire. Printed: `h->lock_snap == 0x4` — **no `0x80000`**.
+The acquire returns the CLEAN pre-mark word; `record_tombstone_locked`
+manufactures the LOCK bit itself. The record therefore witnesses nothing beyond
+"the caller passed an `h`", which is exactly the defect
+`FT_RED_OWNER_CLAIM_ON_LOCK` exists to catch — the exemption would have taught
+the auditor to wave its own red control through. The state-word protocol says it
+in four words: *"Ownership is taken, never observed."*
 
-    FT_MAX_KEY_LEN 256  ->  FT_MAX_DEPTH          = 257   (fractal-trie-internal.h:295)
-    FT_ENTRY_PER_NODE 256 -> FT_FLIP_TXN_MAX_LOCKS = 257   (ft-mutation-helpers.h ~963)
+☞ **THE ROAD THE CODE ALREADY HALF-BUILT.** The recorder that plants this record
+already takes `@ctx`, already uses `ft_lock_ctx_holds(ctx, node, …)` in its OTHER
+arm (ft-mutation-helpers.h:4867), and the ctx demonstrably witnesses `m`
+(`lctx.held.extra = orphan_held`, ft-remove.h:1652, chained by `.outer`). Hoist
+the owner check for anchored-retire records to that level — predicate registry ∪
+held-set chain — and leave the clearing with the sweep. That is not an exemption:
+the predicate still verifies a MAINTAINED held set, the same structure the
+exclusion logic already trusts for dedupe, where a false positive would break
+real exclusion rather than just an assert.
 
-A maximum-depth orphan chain would consume the ENTIRE registry, leaving nothing
-for the op's own lock-set. `d4b4d2d7`'s move — register anyway, hand the clear
-over with `@txn_owned` — is unavailable at this site without changing the bound.
+☐ **THE ONE OPEN DESIGN DETAIL** — how the hoisted check composes with the
+`record_tag`-level assert for exactly one record without a leaky one-shot flag.
+That, not A-vs-B, is the question for Mathieu.
 
-☞ **THIS IS A FORK, and it wants a decision rather than a derivation:**
-
-* **Raise the registry.** The `FT_FLIP_TXN_MAX_LOCKS` comment already names the
-  shape — *"a small embedded array with a heap overflow for the rare wide set —
-  not a lower cap, which merely re-hides the assert"* — and prices today's array
-  at 4 KB in each of two places.
-* **Treat the record as SELF-WITNESSING.** The fused retire's expected-old is
-  `h->lock_snap | FT_STATE_LOCK` on the very word being written, and the acquire
-  refuses an already-locked word — so that LOCK bit can only be this op's. The
-  record proves the ownership the registry is being asked about. This is a
-  narrower claim than a lock carve-out, but it IS an exemption in the owner
-  check, and §10's rule is that exemptions wait for the transition and a proven
-  gain.
-* **Something else** — the two above are what the code suggests, not an
-  exhaustive list.
-
-☞ Do not resolve it by measurement alone: a measured maximum orphan chain says
-nothing about the bound, which is what the carve-out is defending.
+☞ And the sentence that would have sent the wrong fix here has been retracted in
+the code (`01dd9584`): a miss splits into a FINDING where the txn owns the
+clearing and a VISIBILITY gap where a sweep does.
 
 ### 9.2 The load-sensitive concurrency class
 
@@ -1322,9 +1333,10 @@ stale) — watch it across Phase B, it shares words with the converted sites.
                                                               ft_inv MW's coarse arms were an
                                                               INSTRUMENT ARTIFACT (67f72278);
                                                               it now stops on a FINE trie at
-                                                              the orphan freeze, whose
-                                                              carve-out has an EXACT bound
-                                                              (§9.1) — a FORK
+                                                              the orphan freeze — a
+                                                              VISIBILITY gap whose fix is a
+                                                              PREDICATE hoist, not a
+                                                              registration (§9.1)
     B0  per-op arm helper + record-time owner assert        ☑ LANDED — and its first
                                                               measurement says NO site is
                                                               owner-complete (11.9% of the
