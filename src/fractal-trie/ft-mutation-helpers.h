@@ -3194,8 +3194,11 @@ void ft_flip_txn_record_publish(struct ft_flip_txn *t, struct cds_ft *ft,
  * The rule lives here once, for the callers that record a rec STRAIGHT into a
  * txn.  The callers that first convert a rec into ft_ord_cell_edges
  * (ft_remove_commit_rec, ft_pub_rec_sedges, ft_ord_cell_flip_rec_replace) carry
- * the same per-edge flag across the conversion and dispatch it in
- * ft_ord_cell_flip_into / ft_ord_cell_record_into_ft.
+ * BOTH per-edge answers -- @root and @owner -- across the conversion and
+ * dispatch them in ft_ord_cell_flip_into / ft_ord_cell_record_into_ft.  The two
+ * travel together because neither is re-derivable at the replay: @root because
+ * only the publishing descent saw the NULL parent, @owner because a bare slot
+ * address cannot yield the node it lives in.
  */
 static inline
 void ft_flip_txn_record_pub_rec(struct ft_flip_txn *t,
@@ -6265,7 +6268,7 @@ unsigned int ft_pub_rec_sedges(struct ft_pub_rec *rec,
 		sedges[i].old_target = (struct ft_ord_cell *) rec->old_val[i];
 		sedges[i].new_target = (struct ft_ord_cell *) rec->new_val[i];
 		sedges[i].root = rec->root[i];
-		sedges[i].root = rec->root[i];
+		sedges[i].owner = rec->owner[i];
 	}
 	return rec->n;
 }
@@ -6543,6 +6546,7 @@ enum urcu_txn_status ft_remove_commit_rec(struct cds_ft *ft,
 		edges[n].old_target = (struct ft_ord_cell *) rec->old_val[i];
 		edges[n].new_target = (struct ft_ord_cell *) rec->new_val[i];
 		edges[n].root = rec->root[i];
+		edges[n].owner = rec->owner[i];
 		n++;
 	}
 	if (run)
@@ -7252,6 +7256,7 @@ enum urcu_txn_status ft_ord_cell_flip_rec_replace(struct cds_ft *ft,
 		edges[n].old_target = (struct ft_ord_cell *) rec->old_val[i];
 		edges[n].new_target = (struct ft_ord_cell *) rec->new_val[i];
 		edges[n].root = rec->root[i];
+		edges[n].owner = rec->owner[i];
 		n++;
 	}
 	n = ft_ord_cell_run_replace_edges(ft, run->d_first, run->d_last,
