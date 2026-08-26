@@ -3295,6 +3295,32 @@ void ft_flip_txn_set_structural_sw(struct ft_flip_txn *t, bool v)
  * fixed three times (92e27199, e9268e13, 8e8d0232), not false alarms.  Read a
  * miss as "this record is planted before its owner is registered" first.
  */
+/*
+ * PER-NODE SPACING IS PART OF THE GATE, and it is the predicate's limit rather
+ * than a shape the arm cannot serve.
+ *
+ * ft_flip_txn_owns is EXACT at per-node and CONSERVATIVE above it: a coarser
+ * spacing puts the word's lock on an ANCHOR ANCESTOR, which the registry holds
+ * while @owner itself is absent, so the check reports a MISS for a word that IS
+ * excluded.  Resolving the anchor would need the op's descent, which a record
+ * helper does not have.
+ *
+ * ☠ MEASURED, not reasoned: arming without this gate keeps every per-node leg
+ * green and turns the exponential and root-only legs of the txndbg and
+ * anchorval configs RED -- ft_unit dies after 8 tests on the owner assert, at
+ * the insert's own ctx-less retire.  A false miss, and under an ARM it is fatal
+ * rather than merely noisy.
+ *
+ * Refusing leaves those spacings all-MW, which is stricter and always sound.
+ * Lifting the gate is Phase E's "spacing certification", not Phase B's to
+ * assume.
+ */
+static inline
+bool ft_txn_per_op_spacing_ok(const struct cds_ft *ft)
+{
+	return ft && ft->lock_spacing == CDS_FT_LOCK_SPACING_PER_NODE;
+}
+
 static inline
 void ft_flip_txn_claim_per_op_armable(const struct cds_ft *ft,
 		struct ft_flip_txn *t)
@@ -3303,6 +3329,8 @@ void ft_flip_txn_claim_per_op_armable(const struct cds_ft *ft,
 		return;		/* the constructor armed it trie-wide */
 	if (!ft || !ft->lock_fine)
 		return;
+	if (!ft_txn_per_op_spacing_ok(ft))
+		return;		/* the claim must refuse what the ARM refuses */
 	ft_flip_txn_claim_per_op(t);
 }
 
@@ -3312,6 +3340,8 @@ void ft_flip_txn_arm_per_op(const struct cds_ft *ft, struct ft_flip_txn *t)
 	if (ft_txn_content_sw_ok(ft))
 		return;		/* the constructor armed it trie-wide */
 	if (!ft || !ft->lock_fine || !t->nr_locks)
+		return;
+	if (!ft_txn_per_op_spacing_ok(ft))
 		return;
 	ft_flip_txn_claim_per_op(t);
 	ft_flip_txn_set_structural_sw(t, true);

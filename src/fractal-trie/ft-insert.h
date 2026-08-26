@@ -656,6 +656,30 @@ void ft_insert_publish_or_park(struct cds_ft *ft,
 			parent_depth, ic->parent_locked_holder,
 			ic->parent_locked_snap);
 	ft_insert_lock_skip_dual_gp(ft, ctx, parent_nf, ic);
+	/*
+	 * PHASE B, STEP B1 -- THE ARM, and this is the only point in the op where
+	 * it is legal.  ft_flip_txn_arm_per_op's contract is "after the op's LAST
+	 * ft_flip_txn_lock_register": a lock registered later still protects its
+	 * word, but a record planted in between would be checked against a
+	 * registry that does not yet name its owner.  The two lines above ARE the
+	 * last two registers -- P's release (or its guard on the shared/miss arms)
+	 * and, when P is compressed, the SKIP_X dual's GP (§9.3's third member).
+	 *
+	 * ☞ WHAT IT CONVERTS, AND WHAT IT DELIBERATELY DOES NOT.  Kind dispatch
+	 * happens at RECORD time, so this arms the records planted from here on --
+	 * the forward publish below, and the retire / count / re-parent edges
+	 * ft_insert_commit adds later.  Records planted EARLIER on this same txn --
+	 * the ft_attach_node relocation's recompact edges -- stay MW, which is
+	 * STRICTER and always sound.  Converting those needs the arm moved above
+	 * the recompact, which its own {C, P, GP} acquire has not finished at that
+	 * point; that is a later step, not a gap this one leaves open.
+	 *
+	 * The helper refuses an empty registry, a non-FINE trie, and a trie whose
+	 * constructor already armed it trie-wide -- so a shape that acquired
+	 * nothing keeps today's all-MW behaviour rather than parking on an
+	 * exclusion it never took.
+	 */
+	ft_flip_txn_arm_per_op(ft, ic->txn);
 	_ft_publish_to_parent(ft, parent_nf, slot, new_top, expected_old, &rec);
 	ft_flip_txn_record_pub_rec(ic->txn, &rec);
 	ic->slot = slot;	/* sentinel: one-commit forward recorded */
