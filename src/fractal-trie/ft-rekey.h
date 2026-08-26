@@ -2575,8 +2575,10 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 			/*
 			 * The REST of the op's held set, exactly as the
 			 * store-prepare and detach arms name it:
-			 * ft_rekey_cow_stop's marks reach no registry until the
-			 * sweep, and the glue holds the split-CN fence.  Under a
+			 * ft_rekey_cow_stop's marks are handed to the registry by
+			 * ft_rekey_marks_to_txn right after the stop (and again
+			 * after the dst take), and the glue holds the split-CN
+			 * fence.  Under a
 			 * coarse spacing this publish parent anchors onto one of
 			 * them -- the trie root, for an in-trie move -- and a
 			 * frame naming neither refuses the op's own fence.

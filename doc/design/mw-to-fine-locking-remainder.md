@@ -917,37 +917,46 @@ owed with those sites' arm.
 Then retire the hand-arming at the rekey writer and root-COW driver onto the
 same helper, so the switch has no bypass.
 
-☠☠ **B6 IS BLOCKED, AND MEASURED RATHER THAN ARGUED.** Swapping the rekey
-writer's `ft_flip_txn_set_structural_sw(txn, true)` (`ft-rekey.h`) for
-`ft_flip_txn_arm_per_op(ft, txn)` kills the writer immediately: ft_inv
-`FT_INV_MW=1` dies after **2** tests on
-`ft_rekey_cow_stop`'s own precondition, `assert(txn->structural_sw)`
-(`ft-rekey.h:192`) — the helper REFUSES, so the arm never lands.
+☠☠ **B6 IS NOT BLOCKED — the entry that said so was WRONG, and this is its
+retraction.** It claimed the rekey writer's fences "reach the txn only as
+RECORDS ... no `ft_flip_txn_lock_register` at all", and that registering them was
+closed by the `FT_ENTRY_PER_NODE + 1` registry bound. Both false:
 
-**Why it refuses.** `ft_flip_txn_arm_per_op`'s predicate includes `!t->nr_locks`,
-and this writer's exclusion does not live in the registry: its fences sit in
-`marks[]` (the op's `held.extra` ledger) and reach the txn only as RECORDS, via
-`ft_flip_txn_record_anchor_release_held` just before the commit — **no
-`ft_flip_txn_lock_register` at all**. `nr_locks` is 0 for the whole body. Nor can
-it simply register them: the registry is `FT_ENTRY_PER_NODE + 1`, the same bound
-the orphan chain overflows, which `ft_flip_txn_owns` already documents as a
-deliberate counterexample.
+* `ft_rekey_marks_to_txn` (`ft-rekey.h:995`) loops `ft_flip_txn_lock_register`
+  over every non-shared mark and is called at **:1836** (right after
+  `ft_rekey_cow_stop`) and **:2684**. It landed at **`a91ebafd`** — an ANCESTOR
+  of the commit that claimed it did not exist.
+* Measured over a full ft_inv `FT_INV_MW=1` run: at the hand-arm point
+  `nr_locks == 0` in 383,140/383,140, but immediately after the stop it is
+  NONZERO in **285,294/285,294** (max 5) and at the commit in
+  **123,689/123,689** (max 15) — against a bound of **257**. The overflow
+  argument belongs to `ft_detach_freeze_one`'s orphan chain, a different op.
 
-⇒ **The bypass is not laziness; it is a second, wider WITNESS.** The registry is
-the honest question for a RECORD helper (which has only the txn); it is the
-wrong one for an ARM (which is called from the op and can see its held set).
-Two ways out, and choosing is a DESIGN call:
-  (a) **Widen the arm's predicate** — give `ft_flip_txn_arm_per_op` the op's
-      `struct ft_lock_ctx *` and let it count `held.extra` / glue / outer frames
-      via `ft_held_set_snap`, so one helper serves both witnesses. Keeps a single
-      door; changes the arm's contract, and the record-time assert would still
-      only see the registry, so the two would disagree.
-  (b) **Name the second door** — a distinct `ft_flip_txn_arm_ledger(ft, t, ctx)`
-      whose comment carries the ledger justification, so `set_structural_sw` has
-      no BARE caller even though there remain two ways to arm.
-☞ The root-COW driver (`_cds_ft_debug_cow_replace_root`, `fractal-trie.c`) has
-the same shape — it arms at creation, before `ft_rekey_cow_stop` takes its marks
-— so whichever way B6 goes, it goes the same way for both.
+⇒ **B6 is a PLACEMENT problem, exactly like B1–B5**: the fences reach the
+registry, just LATER than the first records — the register-before-record
+ordering class already closed once as a 17-site sweep (`55c0350c`). The
+"second witness" framing was invented to explain a refusal whose real cause is
+that the hand-arm sits at txn CREATION, where every witness is empty.
+
+**The shape of the fix** (small, and half of it is already built):
+  1. `ft_rekey_cow_stop`'s `assert(txn->structural_sw)` (`ft-rekey.h:192`) is a
+     DECLARATION, not an algorithmic dependency — `structural_sw` is consulted
+     only per record at plant time — so it can move below the stop-fence take.
+  2. Hoist the idempotent `ft_rekey_marks_to_txn` to the take, and put the one
+     sanctioned `ft_flip_txn_arm_per_op(ft, txn)` there, inside `cow_stop`,
+     which has both `ft` and `txn`.
+  3. Port the same handover to `_cds_ft_debug_cow_replace_root`, which — unlike
+     the writer — never adopted `ft_rekey_marks_to_txn`. **The two sites are NOT
+     the same shape**, contrary to the retracted entry.
+☞ COARSE / exclusive legs need nothing: `ft_txn_content_sw_ok` means the
+constructor already armed them, and 39,420 of the measured arm reaches were
+`lock_fine == 0` — there the hand-arm is redundant and the swap is a no-op. The
+whole B6 residue is the FINE lane.
+☠ **BEFORE LANDING**: with the arm live from the first take, `cow_stop`'s own
+records get a NON-VACUOUS owner check for the first time (§9.1's green covered
+them only vacuously, `nr_locks == 0` throughout `cow_stop`). Run the
+`-DFT_REKEY_CLAIM` dry run WITH the hoist first; misses there are ordering
+findings of the known class, not blockers.
 
 ## 5. Phase C — the residual MW_ALWAYS lanes (the G4 decision)
 
