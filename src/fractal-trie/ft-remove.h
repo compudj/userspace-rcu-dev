@@ -3121,6 +3121,7 @@ int ft_detach_node(struct cds_ft *ft,
 						iter_node_flag, cur_depth);
 				}
 				ret = ft_remove_one_commit(ft, pub->slot,
+					pub->slot_owner,
 					pub->old_val, pub->new_val,
 					pub->state_meta,
 					fuse_cell, run, commit_txn, NULL, record_only);
@@ -4493,6 +4494,7 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 						holder_flag, -1);
 					ret = ft_remove_one_commit(ft,
 						(struct cds_ft_inode_flag **) &holder_meta->external_nodes,
+						holder_meta,
 						(struct cds_ft_inode_flag *) node, NULL,
 						NULL, dead_cell, NULL, txn, node, false);
 					if (ret == 0 && fuse_remove)
@@ -4845,6 +4847,7 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 			 */
 			if (ft_remove_one_commit(ft,
 					(struct cds_ft_inode_flag **) &metadata->external_nodes,
+					metadata,
 					(struct cds_ft_inode_flag *) external_nodes, NULL,
 					NULL, dead, NULL, txn, NULL, false)) {
 				*result_node = NULL;
@@ -5087,6 +5090,7 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 				 */
 				ret = ft_remove_one_commit(ft,
 					(struct cds_ft_inode_flag **) &holder_meta->external_nodes,
+					holder_meta,
 					(struct cds_ft_inode_flag *) chain_head, NULL,
 					NULL, dead_cell, NULL, txn, NULL, false);
 				if (ret == 0) {

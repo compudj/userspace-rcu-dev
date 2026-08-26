@@ -4109,6 +4109,18 @@ uintptr_t ft_edge_tag(const struct ft_ord_cell_edge *edge)
  */
 struct ft_remove_pub {
 	struct cds_ft_inode_flag **slot;
+	/*
+	 * The node whose lock OWNS @slot (§8.2: a node's body is its own), for
+	 * the record-time owner check.  Set by the PRODUCER because that is the
+	 * only place that knows: @slot is a child slot of the node being
+	 * modified, and by the time ft_remove_one_commit replays it the
+	 * identity would have to be re-derived -- which is how a raw
+	 * re-derivation ends up naming a different node than the op acquired.
+	 *
+	 * ☞ NOT the same as @state_meta, which is NULL for a promote: the slot
+	 * lives in the same node either way, only the nr_child fold differs.
+	 */
+	struct cds_ft_metadata *slot_owner;
 	struct cds_ft_inode_flag *old_val;
 	struct cds_ft_inode_flag *new_val;	/* NULL for delete; chain head for promote */
 	struct cds_ft_metadata *state_meta;	/* non-NULL (delete) => fuse its nr_child-- */
@@ -6512,6 +6524,7 @@ unsigned int ft_pub_rec_sedges(struct ft_pub_rec *rec,
 static
 int ft_remove_one_commit(struct cds_ft *ft,
 		struct cds_ft_inode_flag **struct_slot,
+		struct cds_ft_metadata *slot_owner,
 		struct cds_ft_inode_flag *struct_old,
 		struct cds_ft_inode_flag *struct_new,
 		struct cds_ft_metadata *state_meta,
@@ -6527,6 +6540,7 @@ int ft_remove_one_commit(struct cds_ft *ft,
 	edges[n].slot = (struct ft_ord_cell **) struct_slot;
 	edges[n].old_target = (struct ft_ord_cell *) struct_old;
 	edges[n].new_target = (struct ft_ord_cell *) struct_new;
+	edges[n].owner = slot_owner;
 	n++;
 	if (run)
 		n = ft_ord_cell_run_detach_edges(ft, run->rfirst, run->rlast,

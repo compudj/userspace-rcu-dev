@@ -919,6 +919,8 @@ int ft_popcount_node_replace_ptr(struct cds_ft *ft, const struct cds_ft_type *ty
 			pub->head_parent_new = node_flag;
 		}
 		pub->slot = node_flag_ptr;
+		/* @slot is a child slot of THIS node, promote or delete alike. */
+		pub->slot_owner = metadata;
 		pub->old_val = *node_flag_ptr;
 		pub->new_val = newptr;
 		pub->armed = true;
@@ -996,6 +998,8 @@ int ft_pigeon_node_replace_ptr(struct cds_ft *ft, const struct cds_ft_type *type
 			pub->head_parent_new = node_flag;
 		}
 		pub->slot = node_flag_ptr;
+		/* @slot is a child slot of THIS node, promote or delete alike. */
+		pub->slot_owner = metadata;
 		pub->old_val = *node_flag_ptr;
 		pub->new_val = newptr;
 		pub->armed = true;
