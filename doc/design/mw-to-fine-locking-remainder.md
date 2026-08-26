@@ -1002,27 +1002,44 @@ the suite as it stands; the worst case — a glue whose deferred list is one
 node's whole fan-out, plus its publish parent — is NOT proven, and ☠ the guard
 is a plain `assert`, so an overflow is silent under `NDEBUG`.
 
-#### ☐ WHERE THE CLAIM STOPS NOW — and it is a MISSING ACQUIRE, not a witness
+#### ☐ WHERE THE CLAIM STOPS NOW — the dual lands in a node THIS COMMIT PUBLISHES
 
     ft_glue_txn_commit_edges (ft-mutation-helpers.h:10647)
       -> ft_flip_txn_record_pub_rec -> rec edge 0, the SKIP_X DUAL
 
-The first abort of this walk that is NOT the witness class, and the difference is
-visible in one word: **`owner->state == 0x8` — no `FT_STATE_LOCK` at all.** The
-op does not hold this node, by any witness. `t->locks[]` does not contain it
-either, so the GP fence was never taken.
+☠ **FIRST READ AS "A MISSING ACQUIRE". IT IS NOT ONE.** `owner->state == 0x8`,
+no `FT_STATE_LOCK` — which is what separates it from the witness class — but the
+reason is not that the op forgot to acquire. Probed at the take and at the
+publish in one attempt (`FT_DUALGATE_PROBE`, temporary):
 
-The dual's slot lives in the compressed publish parent's OWN parent, and the
-fold takes a GP fence for it at `ft-rekey.h`'s dual gate — but only on the arm
-that reaches that gate. The SPLIT/GLUE take (the second
-`ft_glue_take_publish_parent` call site) acquires the publish parent and nothing
-above it, while its publish still re-encodes the dual. That is the same defect
-`bbb8e795` closed for the insert site ("a publish under a compressed parent must
-hold GP"), at the rekey fold's other arm.
+    DUALGATE  dual=0x…088  pnfp=0x…088  *dual=skip-encoded  skip=1   <- the gate
+    PUBREC    edge0 slot=0x…0e8  owner=0x…218                        <- the publish
 
-☞ This one ADDS AN ACQUIRE, so unlike the four above it is not
-behaviour-neutral: it needs the lock-ordering argument and the edge-budget check
-(`-DURCU_TXN_DEBUG_RESERVE`, since an under-reservation is silent).
+Different slots, and different NODES: the gate's slot is owned by `…158`, the
+publish's by `…218`. The gate resolves the dual RAW (`ft_get_parent_slot`); the
+publish resolves it READ-YOUR-OWN-WRITES through `rec.mtxn`, which the fold sets.
+This commit RE-PARENTS the compressed node, so the two derivations part company —
+exactly the hazard `6f54e698` documented for the publish side, with the gate left
+on the raw read.
+
+★ **AND THE NODE THE PUBLISH RESOLVES TO IS `g->top`** —
+`g->built[0] == g->top == g->attached_nf == 0x…0c1`, and the dual slot `0x…0e8`
+is inside its body. That is the freshly built cluster top this very commit
+publishes: BUILD-INVISIBLE, reachable by no peer, so no lock is needed and none
+should be taken. Acquiring it would be the wrong fix.
+
+☞ **SO QUESTION THE RECORD, NOT THE LOCK SET** — the rule `bec0c726` established
+and §4's own lesson: *the txn publishes REACHABILITY, not INTERIORS; a private
+node's body is wired by PLAIN STORES.* The dual edge here writes the interior of
+the node the same commit installs, so it belongs in the build, not in the
+descriptor. The owner contract cannot express "into a node no peer can reach",
+and it should not have to.
+
+☐ Open: `_ft_publish_to_parent` is shared, so the fix has to distinguish a dual
+that lands in a LIVE node (a real transacted edge, owner = that node) from one
+that lands in a node this commit publishes. The glue knows which — `g->built[]` /
+`g->top` — and the raw-vs-RYW divergence at the gate is the same defect seen from
+the other end.
 
 ### 9.2 The load-sensitive concurrency class
 
@@ -1211,9 +1228,10 @@ stale) — watch it across Phase B, it shares words with the converted sites.
                                                               / d4b4d2d7 / 05356918 / bf9c490c
                                                               landed — the WITNESS class is
                                                               CLOSED (4 instances); next is a
-                                                              MISSING ACQUIRE: the fold's
-                                                              split arm publishes a SKIP_X
-                                                              dual without holding GP (§9.1)
+                                                              RECORD that should not exist:
+                                                              the SKIP_X dual lands inside
+                                                              g->top, the node this commit
+                                                              publishes (§9.1)
     B0  per-op arm helper + record-time owner assert        ☑ LANDED — and its first
                                                               measurement says NO site is
                                                               owner-complete (11.9% of the
