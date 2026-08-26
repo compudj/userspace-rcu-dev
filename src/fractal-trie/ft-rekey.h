@@ -2054,6 +2054,44 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 				 * only the FIRST acquire owes the release.
 				 */
 				glue.publish_gp_shared = gph.shared;
+				/*
+				 * HAND THE FENCE TO THE TXN HERE, not at
+				 * ft_glue_txn_commit_edges: the two lines are the
+				 * same two ft_flip_txn_hold_or_lock_parent's held
+				 * arm runs, and this is the moment they become
+				 * TRUE.  Between here and commit_edges the fold's
+				 * detach RECOMPACTS under this very word and
+				 * republishes into its body (ft_chain_compress_fused
+				 * -> the forward slot), and a record-time owner
+				 * check has only the txn's locks[]: a fence that
+				 * arrives afterwards reads as UNOWNED at every
+				 * record in between, which is what -DFT_REKEY_CLAIM
+				 * aborts on.
+				 *
+				 * The detach's own acquire of that word DEDUPES
+				 * (ft_chain_compress_fused registers only
+				 * !held.shared) and so registers nothing -- rightly,
+				 * since this acquire owes the release.  After the
+				 * transfer that dedupe answers from the REGISTRY,
+				 * which ft_held_set_snap reads FIRST, so the coarse
+				 * spacing the glue-chaining above protects is
+				 * unaffected.
+				 *
+				 * The release is recorded, not deferred, and the
+				 * early placement is the one its own contract asks
+				 * for: ft_flip_txn_record_anchor_release_held is
+				 * placed by COVERAGE rather than order, a §4.B guard
+				 * planted before a release would poison the txn, and
+				 * a retire this op decides LATER chains onto the
+				 * release's clean pending value.
+				 */
+				if (!gph.shared) {
+					ft_flip_txn_lock_register(txn, gph.lock,
+						gph.lock_snap);
+					ft_flip_txn_record_anchor_release_held(
+						txn, gph.lock);
+					glue.publish_gp_txn_owned = true;
+				}
 			}
 		}
 #endif /* FEATURE_FT_SKIP_COMPRESSED */

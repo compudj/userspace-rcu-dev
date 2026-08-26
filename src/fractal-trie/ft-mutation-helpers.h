@@ -8078,6 +8078,23 @@ struct ft_glue {
 	bool publish_gp_shared;
 	uintptr_t publish_gp_snap;
 	/*
+	 * The TXN owns this fence's outcome -- its {LOCK|s -> s} release is in
+	 * the edge set AND the word is in locks[] -- because the TAKE handed it
+	 * over immediately (@holder_txn_owned's argument, and the same
+	 * mechanism).  The FIELD stays set: it is still the witness every narrow
+	 * glue predicate reads (ft_glue_held_snap_one, ft_glue_op_holds), and
+	 * dropping it would answer "not held" for a word the op holds.  What the
+	 * flag changes is who CLEARS -- ft_glue_abort must not -- and that
+	 * ft_glue_txn_commit_edges must not hand the same fence over twice.
+	 *
+	 * ☠ THE TAKE IS THE ONLY CORRECT MOMENT.  Records into the fenced node's
+	 * BODY happen between the take and commit_edges -- the fold's detach
+	 * republishes into it -- and a record-time owner check reads the txn
+	 * registry alone, so a fence that arrives later reads as UNOWNED at every
+	 * one of them.
+	 */
+	bool publish_gp_txn_owned;
+	/*
 	 * MW LOCK_FINE drop, split-compressed graft: the node lock held on
 	 * the compressed divergence node @cn (== d->nf) that this GLUE build
 	 * SPLITS and REPLACES.  A graft that diverges inside a compressed node
@@ -8294,6 +8311,7 @@ void ft_glue_init(struct ft_glue *g)
 	g->publish_gp_holder = NULL;
 	g->publish_gp_shared = false;
 	g->publish_gp_snap = 0;
+	g->publish_gp_txn_owned = false;
 	g->split_cn_holder = NULL;
 	g->split_cn_shared = false;
 	g->split_cn_node = NULL;
@@ -9958,13 +9976,19 @@ void ft_glue_abort(struct cds_ft *ft, struct ft_glue *g)
 		g->publish_parent_shared = false;
 		g->publish_parent_snap = 0;
 	}
-	/* The SKIP_X dual's owner, on the same terms. */
+	/*
+	 * The SKIP_X dual's owner, on the same terms -- plus one: a fence the
+	 * TAKE already handed to the txn (@publish_gp_txn_owned) is drained by
+	 * ft_flip_txn_lock_release_all, and clearing it here as well is the
+	 * fence theft @split_cn_holder spells out.
+	 */
 	if (g->publish_gp_holder) {
-		if (!g->publish_gp_shared)
+		if (!g->publish_gp_shared && !g->publish_gp_txn_owned)
 			ft_meta_lock_release_if_held(g->publish_gp_holder);
 		g->publish_gp_holder = NULL;
 		g->publish_gp_shared = false;
 		g->publish_gp_snap = 0;
+		g->publish_gp_txn_owned = false;
 	}
 	for (i = 0; i < g->nr_built; i++) {
 		struct cds_ft_inode_flag *nf = g->built[i];
@@ -10482,7 +10506,7 @@ enum urcu_txn_status ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue 
 	 * the parent is plain or carries no dual) is byte-identical to before.
 	 */
 	if (g->publish_gp_holder) {
-		if (!g->publish_gp_shared) {
+		if (!g->publish_gp_shared && !g->publish_gp_txn_owned) {
 			/*
 			 * SELF-GUARDING, for the reason the publish parent's own
 			 * release above states: this anchor can be a word the SAME
@@ -10502,6 +10526,7 @@ enum urcu_txn_status ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue 
 		g->publish_gp_holder = NULL;
 		g->publish_gp_shared = false;
 		g->publish_gp_snap = 0;
+		g->publish_gp_txn_owned = false;
 	}
 	/*
 	 * A recompaction already folded this publish into the node that
