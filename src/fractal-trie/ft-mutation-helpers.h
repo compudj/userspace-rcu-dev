@@ -2153,6 +2153,17 @@ void ft_flip_txn_lock_register(struct ft_flip_txn *t,
 		struct cds_ft_metadata *meta, uintptr_t snap)
 {
 	assert(t->nr_locks < FT_FLIP_TXN_MAX_LOCKS);
+#ifdef FT_LOCKS_HIGHWATER
+	{
+		static unsigned int hw;
+
+		if (t->nr_locks + 1 > hw) {
+			hw = t->nr_locks + 1;
+			fprintf(stderr, "FT_LOCKS_HIGHWATER %u / %u\n", hw,
+				(unsigned int) FT_FLIP_TXN_MAX_LOCKS);
+		}
+	}
+#endif
 	t->locks[t->nr_locks].meta = meta;
 	t->locks[t->nr_locks].snap = snap;
 	t->nr_locks++;
@@ -9787,10 +9798,17 @@ int ft_glue_acquire_reparent_marks(struct cds_ft *ft, struct ft_glue *g)
 		if (h.lock == cm) {
 			/*
 			 * The child's own guard edge RELEASES this mark at the
-			 * flip (live_state masks LOCK out), so the abort sweep
-			 * owns it only until then.
+			 * flip (live_state masks LOCK out), so the terminal is on
+			 * this txn either way.  REGISTER IT ANYWAY: the re-parent
+			 * record ft_glue_apply_deferred plants names @cm as its
+			 * owner, and a record-time owner check reads locks[] and
+			 * nothing else -- the mark being sweep-owned is an answer
+			 * to who CLEARS, not to whether the commit owns the word.
+			 * @marked then stays false, exactly as the coarsened arm
+			 * below leaves it, so the abort sweep does not
+			 * double-release against ft_flip_txn_lock_release_all.
 			 */
-			g->deferred[i].marked = true;
+			ft_flip_txn_lock_register(g->txn, h.lock, h.lock_snap);
 			continue;
 		}
 		/*
