@@ -1002,44 +1002,68 @@ the suite as it stands; the worst case — a glue whose deferred list is one
 node's whole fan-out, plus its publish parent — is NOT proven, and ☠ the guard
 is a plain `assert`, so an overflow is silent under `NDEBUG`.
 
-#### ☐ WHERE THE CLAIM STOPS NOW — the dual lands in a node THIS COMMIT PUBLISHES
+#### ☐ WHERE THE CLAIM STOPS NOW — the dual's home MOVES, into the detach's fresh copy
 
     ft_glue_txn_commit_edges (ft-mutation-helpers.h:10647)
       -> ft_flip_txn_record_pub_rec -> rec edge 0, the SKIP_X DUAL
 
-☠ **FIRST READ AS "A MISSING ACQUIRE". IT IS NOT ONE.** `owner->state == 0x8`,
-no `FT_STATE_LOCK` — which is what separates it from the witness class — but the
-reason is not that the op forgot to acquire. Probed at the take and at the
-publish in one attempt (`FT_DUALGATE_PROBE`, temporary):
+`owner->state == 0x8` — no `FT_STATE_LOCK`, which is what separates this from
+the witness class. It took THREE readings to land, and the two wrong ones are
+recorded because each is a trap:
 
-    DUALGATE  dual=0x…088  pnfp=0x…088  *dual=skip-encoded  skip=1   <- the gate
-    PUBREC    edge0 slot=0x…0e8  owner=0x…218                        <- the publish
+* ☠ *"the fold's SPLIT arm publishes without holding GP"* — wrong: the failing op
+  has `merge_dst == true` and takes the MERGE arm, which DOES reach the dual gate.
+* ☠ *"the dual lands in `g->top`, so the record should not exist"* — right CLASS,
+  wrong NODE. Probed: `skip_owner_nf != new_child`. The inference behind it —
+  *"absent from `g->built[]`, therefore live"* — is unsound, and that is the
+  lesson: **the fold has THREE abort-free inventories, not one.** `ft_glue_track`
+  covers only what the GLUE builds; `struct ft_detach_recompact_out`
+  (ft-remove.h:1407) carries the detach's fresh copies, and the collapse and the
+  orphan chain carry more.
 
-Different slots, and different NODES: the gate's slot is owned by `…158`, the
-publish's by `…218`. The gate resolves the dual RAW (`ft_get_parent_slot`); the
-publish resolves it READ-YOUR-OWN-WRITES through `rec.mtxn`, which the fold sets.
-This commit RE-PARENTS the compressed node, so the two derivations part company —
-exactly the hazard `6f54e698` documented for the publish side, with the gate left
-on the raw read.
+**THE MECHANISM, verified.** The gate resolves the dual RAW
+(`ft_get_parent_slot`, ft-rekey.h:1983); the publish resolves it
+READ-YOUR-OWN-WRITES through `rec.mtxn`, which the fold sets
+(ft-mutation-helpers.h:10426). This same commit RE-PARENTS the compressed node,
+so the two derivations part company — RYW doing its job, not a defect. Measured
+in one attempt:
 
-★ **AND THE NODE THE PUBLISH RESOLVES TO IS `g->top`** —
-`g->built[0] == g->top == g->attached_nf == 0x…0c1`, and the dual slot `0x…0e8`
-is inside its body. That is the freshly built cluster top this very commit
-publishes: BUILD-INVISIBLE, reachable by no peer, so no lock is needed and none
-should be taken. Acquiring it would be the wrong fix.
+    skip_owner_nf      = 0x…0e1
+    detach_rc.new_flag = 0x…0e1      <- THE SAME NODE
+    detach_rc.old_node = 0x…080      <- and the GATE's slot 0x…088 is inside IT
+    glue.top           = 0x…0c1      <- not it
 
-☞ **SO QUESTION THE RECORD, NOT THE LOCK SET** — the rule `bec0c726` established
-and §4's own lesson: *the txn publishes REACHABILITY, not INTERIORS; a private
-node's body is wired by PLAIN STORES.* The dual edge here writes the interior of
-the node the same commit installs, so it belongs in the build, not in the
-descriptor. The owner contract cannot express "into a node no peer can reach",
-and it should not have to.
+So the dual's home is the detach's fresh DEL-recompact copy: **op-built,
+build-invisible, reachable by no peer.** The gate fenced the OLD home and the
+publish writes the NEW one, and the new one needs no fence at all.
 
-☐ Open: `_ft_publish_to_parent` is shared, so the fix has to distinguish a dual
-that lands in a LIVE node (a real transacted edge, owner = that node) from one
-that lands in a node this commit publishes. The glue knows which — `g->built[]` /
-`g->top` — and the raw-vs-RYW divergence at the gate is the same defect seen from
-the other end.
+⇒ **THIS IS `bec0c726`'s CLASS** — the txn publishes REACHABILITY, not INTERIORS;
+a private node's body is wired by PLAIN STORES. Question the record, not the
+lock set.
+
+☐ **THE FIX — a per-edge dispatch at the dual sink** (`_ft_publish_to_parent_meta`,
+ft-helpers.h:2642):
+
+* home NOT re-homed by this txn → today's behaviour, `ft_pub_rec_add` with the
+  GP as owner, which the gate fenced and registered at the take;
+* home re-homed by this txn → the home is op-built, so take the plain-store arm
+  that already exists three lines down for the `rec == NULL` case.
+
+☠ **The store must NOT simply be dropped.** The recompact copy loop resolved GP's
+slots to their COMMITTED values, so the fresh copy was born holding `skip(D)` —
+stale the instant the forward publish lands. Dropping it would leave candidate
+readers a skip pointer bypassing straight to the retired node.
+
+☞ Detect with `urcu_txn_find` on the descriptor for `&cn_meta->parent_word`, NOT
+`urcu_txn_load` — the load falls through to a fresh read and cannot say whether
+THIS txn recorded the re-home.
+
+☠ The dispatch rests on the invariant *"a re-parent target is a fresh cluster
+today, never a root"* (`ft_reparent_record_meta`, ft-mutation-helpers.h ~8944).
+If a future re-homer ever targets a LIVE node, the dispatch would plain-store
+into a live body — silently. Assert it, or say so loudly at both ends. That is
+also the argument for a unified op-fresh witness, which this branch's free audit
+wants anyway.
 
 ### 9.2 The load-sensitive concurrency class
 
@@ -1229,9 +1253,9 @@ stale) — watch it across Phase B, it shares words with the converted sites.
                                                               landed — the WITNESS class is
                                                               CLOSED (4 instances); next is a
                                                               RECORD that should not exist:
-                                                              the SKIP_X dual lands inside
-                                                              g->top, the node this commit
-                                                              publishes (§9.1)
+                                                              the SKIP_X dual's home MOVES
+                                                              into the detach's fresh copy
+                                                              (§9.1)
     B0  per-op arm helper + record-time owner assert        ☑ LANDED — and its first
                                                               measurement says NO site is
                                                               owner-complete (11.9% of the
