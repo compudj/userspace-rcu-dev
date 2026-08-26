@@ -1029,29 +1029,49 @@ inventories only what the GLUE builds, while `struct ft_detach_recompact_out`
 **Three abort-free inventories, not one.** Printing `detach_rc.new_flag` settled
 in one command what three rounds of address arithmetic did not.
 
-#### ☐ WHERE THE CLAIM STOPS NOW — the fold's own `marks[]`, a FIFTH witness
+#### ☑ THE FIFTH WITNESS — LANDED `a91ebafd`, and **ft_unit's claim is CLEAN**
 
-    ft_glue_txn_commit_edges (ft-mutation-helpers.h:10520)
-      -> ft_reparent_record(child_marked=true) -> ft_flip_txn_record_parent_word
+`ft_rekey_cow_stop`'s fences live in a fn-scope array rather than a lock-SET, and
+rightly: it reaches 17 anchors on the unit fixture, while a SET is the unit the
+MCAS install sorts for deadlock-free acquisition. But *"not a set"* was read as
+*"not in the registry either"*, and the registry answers a different question —
+it is what a RECORD-time owner check can see. Every later acquire of those words
+dedupes against the array through `@held.extra` and correctly registers nothing
+of its own, so the registry never learned them by any route, while the re-parent
+records those marks exist to license named them as owner.
 
-Back to the witness class: `owner->state == 0x80008`, LOCK **set**. Printed at the
-abort, the owner is `marks[5].lock` AND `glue.caller_holder` — two out-of-registry
-witnesses — with `shared == false`, `txn_owned == false`, and a registry of four
-that does not contain it. The deferred entry reads
-`held_lock = true, marked = false, lock_word == owner`, i.e.
-`ft_glue_acquire_reparent_marks` took the `h.shared` arm: the acquire DEDUPED onto
-a word the op already held, so it rightly registered nothing — and the first
-holder is `ft_rekey_cow_stop`'s marks, which reach no registry at all.
+`ft_rekey_marks_to_txn` registers at the TAKE and sets `@txn_owned` — the field
+`ft_held_anchor` has carried all along for exactly this handover — and the
+post-abort sweep skips those entries. The release RECORDS stay put; their own
+comment already called that placement order-independent. What was never
+order-independent is the REGISTRATION.
 
-The release loop for them (ft-rekey.h:3173) records
-`ft_flip_txn_record_anchor_release_held` and never registers, and its own comment
-says the placement is *"NOT for ordering … order-independent by construction"* —
-so registering at the TAKE is open. Two takes to convert: the `ft_rekey_cow_stop`
-fill (ft-rekey.h:1779) and the incremental displaced-child mark (:2625).
+★★★★★ **`-DFT_REKEY_CLAIM` NOW PASSES ft_unit ENTIRELY: 315 ok, 3 deliberate, NO
+ABORT.** The walk started this session at test 112.
 
-☞ `struct ft_held_anchor` already carries `@txn_owned` for exactly this handover,
-and the bound is fine: `ft_rekey_cow_stop` reaches 17 anchors at its worst against
-a 257 registry, and the measured high-water is 15.
+Registry high-water (`-DFT_LOCKS_HIGHWATER`): unchanged at **15/257** (ft_inv MW)
+and 13/257 (ft_unit) — the marks dedupe or peak below the existing maximum, so
+the bound is no more stressed than before.
+
+#### ☐ §9.1(A) IS NOT DONE — the CONCURRENT lane is next
+
+ft_unit is single-threaded. `ft_inv` `FT_INV_MW=1` still aborts under the claim,
+at a site ft_unit never drives:
+
+    ft_store_at_graft_point_commit (ft-graft.h:888)
+      -> ft_flip_txn_record_pub_rec -> the relocation republish
+
+Printed at the abort, nothing inferred: `rec.n == 1`, `rec.mtxn == NULL`, the one
+edge `{slot, old, new}` with `new == st->dest` and `old == st->old_recompacted_node`,
+`owner->state == 0x48` — **no `FT_STATE_LOCK`**, `nr_child == 18` — and
+`t->nr_locks == 6` without it.
+
+☞ So it is NOT the witness class (no lock bit anywhere). The fork that has cost
+two wrong calls already is whether that owner is a LIVE node the op must fence
+(the `bbb8e795` shape, at the relocation's publish parent) or one this op built
+(the `ebf24686` / `bec0c726` shape, where the record is what does not belong).
+**Settle it by PRINTING the op's fresh inventories, not by reading addresses** —
+`g->built[]` is one of three, and arena adjacency proves nothing.
 
 ### 9.2 The load-sensitive concurrency class
 
@@ -1240,10 +1260,10 @@ stale) — watch it across Phase B, it shares words with the converted sites.
                                                               / d4b4d2d7 / 05356918 / bf9c490c
                                                               landed — the WITNESS class is
                                                               CLOSED (4 instances); next is a
-                                                              / ebf24686 landed — the claim
-                                                              reaches ft_unit 315; next is a
-                                                              FIFTH witness, the fold's own
-                                                              marks[] (§9.1)
+                                                              / ebf24686 / a91ebafd landed —
+                                                              ★ ft_unit's claim is CLEAN;
+                                                              next is the CONCURRENT lane
+                                                              (ft_inv MW) (§9.1)
     B0  per-op arm helper + record-time owner assert        ☑ LANDED — and its first
                                                               measurement says NO site is
                                                               owner-complete (11.9% of the
