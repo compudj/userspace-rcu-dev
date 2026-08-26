@@ -942,24 +942,46 @@ wide answer as a deliberately separate category: `FT_TK_COUNT_OWN`
 (ft-txn-kind-stats.h:466) is three-way, registry-first, `ft_hold_trace_holds` =
 `OWN_LEDGER`. Widening would erase exactly that distinction.
 
-#### ☐ WHERE THE CLAIM STOPS NOW — the glue free-list retire
+#### ☑ TWO MORE CLOSED — the same class, three instances now
 
-    ft_glue_tombstone_free_list (ft-mutation-helpers.h:10118)
-      -> ft_flip_txn_record_retire_anchored -> the fused
-         {LOCK|s -> TOMBSTONE|s}, owner = the retired node itself
+    d4b4d2d7  the glue free-list retire's anchor: register, and BEFORE the record
+    05356918  the glue's PUBLISH PARENT fence, handed over at the take
 
-Two things in one site, and the FIRST is the ordering class again
-([[register before record]], 18 instances so far): the retire is recorded at
-`:10118`, while the `ft_flip_txn_lock_register` sits BELOW it at `:10121`. The
-second is a deliberate carve-out — that register runs only when
-`h.lock != meta`, on the argument that *"where the anchor IS @meta the fused
-terminal is the whole story and the mark stays with the sweep, which costs no
-registry slot"*. Under per-node spacing the anchor always IS the node, so the
-carve-out is the common case and the record has no registry witness at all.
-That argument is about FENCE THEFT being impossible there, not about the
-registry being wrong; giving it a slot plus `@holder_txn_owned` looks like the
-same shape as `6e77bab7`, but the "byte-identical per-node granularity" claim in
-that comment has to be checked before it moves.
+`d4b4d2d7` was the ordering class again, twice over. `ft_glue_tombstone_free_list`
+recorded a fused `{LOCK|s -> TOMBSTONE|s}` whose owner is the retired node, then
+registered the anchor BELOW that record — and only when the anchor was a
+different word. Under per-node the anchor IS the node always, so the common case
+registered nothing. The `h.lock != meta` gate was about SAFETY (a SURVIVING
+anchor must leave `ft_glue_clear_fenced`, a tombstoned one cannot be stolen), not
+about the registry, and `ft_chain_compress_register_retire` already registers the
+same retires with no such gate.
+
+`05356918` is `6e77bab7`'s sibling: a fold whose publish parent is PLAIN takes no
+SKIP_X dual and therefore no GP fence, so the word the detach republishes into is
+the publish parent itself. The rule now lives once, in
+`ft_glue_take_publish_parent` — this holder has FIVE producers across rekey /
+merge / graft, and a rule spread over five assignment triples is one a sixth
+producer will not know about. The two rekey-fold takes adopt it; merge and graft
+keep today's behaviour until their own sites are converted.
+
+☠ **THE CLAIM'S ABORT NUMBER CAN GO DOWN ON A CORRECT FIX, AND IT DID** — 120 →
+112 at `05356918`. `FT_OWNER_ASSERT_OWNED` refuses on `!t->nr_locks` ("this
+commit owns nothing, so do not check"), so registering a lock SOONER puts records
+that previously escaped the check under it. Read a backwards jump as coverage
+gained, not as a regression, and confirm it by identifying the newly-exposed
+record — never by reverting on the number alone.
+
+#### ☐ WHERE THE CLAIM STOPS NOW — the glue's deferred re-parent marks
+
+    ft_glue_apply_deferred (ft-mutation-helpers.h:10363)
+      -> ft_reparent_record(child_marked=true) -> ft_reparent_record_meta
+      -> ft_flip_txn_record_parent_word(child_held=true), owner = the child
+
+Third instance of the one class. `@child_marked` asserts the op holds the child —
+and it does: that arm records the mark's own release and drops the hold-trace
+entry. The mark lives in the glue's re-parent marks, which no registry has seen,
+and `ft_glue_apply_deferred` runs at the TOP of `ft_glue_txn_commit_edges`,
+before its own fence blocks. Same shape as the two above, at the third witness.
 
 ### 9.2 The load-sensitive concurrency class
 
@@ -1145,9 +1167,10 @@ stale) — watch it across Phase B, it shares words with the converted sites.
                                                               695d23c1 / d67851c6 / bec0c726
                                                               / 280fdac1 / c6ac8c42 /
                                                               b7334aa4 / f79438e7 / 6e77bab7
-                                                              landed — the claim now reaches
-                                                              ft_unit 119; next is the glue
-                                                              free-list retire (§9.1)
+                                                              / d4b4d2d7 / 05356918 landed —
+                                                              ONE class at three witnesses;
+                                                              next is the glue's deferred
+                                                              re-parent marks (§9.1)
     B0  per-op arm helper + record-time owner assert        ☑ LANDED — and its first
                                                               measurement says NO site is
                                                               owner-complete (11.9% of the
