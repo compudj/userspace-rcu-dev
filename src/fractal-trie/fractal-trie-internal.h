@@ -851,6 +851,29 @@ struct ft_pub_rec {
 	 * root, while an unset @owner only declines to convert.
 	 */
 	struct cds_ft_metadata *owner[3];
+	/*
+	 * Per-edge: does the OP HOLD @owner's DLM lock?  The third answer of
+	 * the parentage triple, and the one @owner cannot stand in for.
+	 *
+	 * ☠ A NULL @owner DOES NOT FAIL CLOSED.  The dispatching recorder
+	 * (ft_flip_txn_record_tag) branches on @t->structural_sw ALONE; @owner
+	 * feeds the debug assert and the counters and nothing else.  So an
+	 * armed txn parks an unnamed slot SW just as readily as a named one,
+	 * and in a build without --enable-rcu-debug it does so silently.  The
+	 * comment that used to stand on @owner -- "the record is then never
+	 * eligible for a per-op SW park" -- was a STALE MECHANISM.
+	 *
+	 * This is the word that decides: false => the replays record MW, which
+	 * is stricter and always sound.  The FORWARD edge inherits the
+	 * caller's own @slot_owner_nf declaration; the SKIP_X DUAL cannot, and
+	 * that is the whole reason this field exists -- its owner is the
+	 * GRANDPARENT, DERIVED inside the publish helper from a back-pointer,
+	 * so only the op can say whether it acquired it.  ft_detach_node's
+	 * republish does (the recompact takes {C,P,GP} exactly when P is
+	 * compressed, which is exactly when the dual arises); ft_promote_head
+	 * does not.
+	 */
+	bool owner_held[3];
 	unsigned int n;
 	/*
 	 * The commit engine handle this rec's edges will be recorded into, when

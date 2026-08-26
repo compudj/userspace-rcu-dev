@@ -2422,9 +2422,16 @@ static
 void ft_pub_rec_add(struct ft_pub_rec *rec, struct cds_ft_inode_flag **slot,
 		struct cds_ft_inode_flag *expected_old,
 		struct cds_ft_inode_flag *new_val, bool root,
-		struct cds_ft_metadata *owner)
+		struct cds_ft_metadata *owner, bool owner_held)
 {
 	assert(rec->n < 3);
+	/*
+	 * @owner_held: does the OP hold @owner's lock?  Separate from @owner
+	 * because a NULL @owner does NOT fail closed -- the dispatching
+	 * recorder branches on the txn's structural_sw alone -- so naming no
+	 * owner and holding no owner are the same to it.  false records MW.
+	 */
+	rec->owner_held[rec->n] = owner_held;
 	rec->slot[rec->n] = slot;
 	/*
 	 * @owner: the node whose lock excludes every other writer of @slot.
@@ -2538,7 +2545,8 @@ void _ft_publish_to_parent_meta(struct cds_ft *ft,
 		struct cds_ft_metadata *new_child_meta,
 		void *folded_child_prev,
 		struct ft_pub_rec *rec,
-		struct cds_ft_inode_flag *slot_owner_nf)
+		struct cds_ft_inode_flag *slot_owner_nf,
+		bool dual_owner_held)
 {
 	/*
 	 * @slot_owner_nf: the node @parent_slot LIVES IN, i.e. the word that owns
@@ -2718,6 +2726,17 @@ void _ft_publish_to_parent_meta(struct cds_ft *ft,
 					/* A COMPRESSED ROOT's dual slot IS
 					 * &ft->root (ft_txn_parent_slot's root
 					 * arm), so ask rather than assume. */
+					/*
+					 * ☠ THE DUAL'S OWNER IS DERIVED HERE,
+					 * NOT DECLARED BY THE CALLER: it is the
+					 * GRANDPARENT, reached through
+					 * @cn_meta's back-pointer, and this
+					 * frame cannot know whether the op
+					 * acquired it.  So the held answer is
+					 * the caller's -- @dual_owner_held --
+					 * and its default is false, which
+					 * records MW.
+					 */
 					ft_pub_rec_add(rec, skip_slot,
 						ft_skip_compressed_flag(
 							expected_old, cn->len),
@@ -2726,7 +2745,8 @@ void _ft_publish_to_parent_meta(struct cds_ft *ft,
 						skip_slot == &ft->root ||
 						!skip_owner_nf ? NULL :
 						ft_flag_to_metadata(ft,
-							skip_owner_nf));
+							skip_owner_nf),
+						dual_owner_held);
 				else if (*skip_slot != skip_new)
 					rcu_assign_pointer(*skip_slot, skip_new);
 			}
@@ -2761,10 +2781,18 @@ void _ft_publish_to_parent_meta(struct cds_ft *ft,
 		FT_TP(root_publish, (const void *) ft,
 			(const void *) new_child);
 	if (rec)
+		/*
+		 * The FORWARD edge's owner is the caller's own @slot_owner_nf
+		 * declaration -- the node it says @parent_slot lives in -- so
+		 * naming it IS the held answer here, and the record-time owner
+		 * assert is what checks it.  Only the DUAL above needs a
+		 * separate word, because only its owner is derived.
+		 */
 		ft_pub_rec_add(rec, parent_slot, expected_old, new_child,
 			parent_slot == &ft->root,
 			parent_slot == &ft->root || !slot_owner_nf ? NULL :
-				ft_flag_to_metadata(ft, slot_owner_nf));
+				ft_flag_to_metadata(ft, slot_owner_nf),
+			parent_slot != &ft->root && slot_owner_nf != NULL);
 	else if (*parent_slot != new_child)
 		/*
 		 * Direct (rec == NULL) publish.  The only two callers -- the
@@ -2790,10 +2818,12 @@ void _ft_publish_to_parent(struct cds_ft *ft,
 		struct cds_ft_inode_flag **parent_slot,
 		struct cds_ft_inode_flag *new_child,
 		struct cds_ft_inode_flag *expected_old,
-		struct ft_pub_rec *rec)
+		struct ft_pub_rec *rec,
+		bool dual_owner_held)
 {
 	_ft_publish_to_parent_meta(ft, parent_nf, parent_slot, new_child,
-		expected_old, NULL, NULL, rec, /*slot_owner_nf=*/ parent_nf);
+		expected_old, NULL, NULL, rec, /*slot_owner_nf=*/ parent_nf,
+		dual_owner_held);
 }
 
 /*
@@ -2808,7 +2838,7 @@ void ft_publish_to_parent(struct cds_ft *ft,
 		struct cds_ft_inode_flag *new_child)
 {
 	_ft_publish_to_parent(ft, parent_nf, parent_slot, new_child,
-		*parent_slot, NULL);
+		*parent_slot, NULL, false);
 }
 
 /*

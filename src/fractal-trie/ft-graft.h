@@ -884,7 +884,7 @@ enum urcu_txn_status ft_store_at_graft_point_commit(struct cds_ft *ft,
 				pub_slot, st->dest,
 				ft_resolve_flip_proxy(*pub_slot),
 				NULL, NULL, &st->reserve_rec,
-				/*slot_owner_nf=*/ pub_parent);
+				/*slot_owner_nf=*/ pub_parent, false);
 			ft_flip_txn_record_pub_rec(st->glue->txn,
 				&st->reserve_rec);
 			/*

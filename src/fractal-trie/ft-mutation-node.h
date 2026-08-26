@@ -2181,13 +2181,17 @@ skip_copy:
 						/* SW compaction: *slot == plan old.
 						 * A compressed ROOT's dual slot
 						 * IS &ft->root. */
+						/* Derived owner (the dual's
+						 * grandparent): not held --
+						 * MW.  ft-compact's lane is
+						 * FT_OWNER_UNPLUMBED. */
 						ft_pub_rec_add(rec, skip_slot,
 							*skip_slot, skip_new,
 							skip_slot == &ft->root,
 							skip_owner_nf ?
 							ft_flag_to_metadata(ft,
 								skip_owner_nf) :
-							NULL);
+							NULL, false);
 					else
 						*skip_slot = skip_new;
 				}
@@ -2347,9 +2351,15 @@ skip_copy:
 		 */
 		if (old_node_flag_ptr != &ft->root)
 			(void) ft_resolve_parent_slot(metadata, ft, &holder_nf);
+		/*
+		 * @holder_nf is RESOLVED here, not declared by the caller, so
+		 * this frame cannot vouch that the op holds it: not held -- MW.
+		 * (ft-compact's relocation lane is FT_OWNER_UNPLUMBED.)
+		 */
 		ft_pub_rec_add(rec, old_node_flag_ptr, *old_node_flag_ptr,
 			new_node_flag, old_node_flag_ptr == &ft->root,
-			holder_nf ? ft_flag_to_metadata(ft, holder_nf) : NULL);
+			holder_nf ? ft_flag_to_metadata(ft, holder_nf) : NULL,
+			false);
 	}
 	else
 		*old_node_flag_ptr = new_node_flag;

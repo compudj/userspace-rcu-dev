@@ -224,7 +224,7 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			_ft_publish_to_parent(ft, ft_compressed_node_flag(cn),
 				&cn->child,
 				(struct cds_ft_inode_flag *) topmost_external_nodes,
-				elevated_old_child, &rec);
+				elevated_old_child, &rec, false);
 			if (ft_remove_commit_rec(ft, &rec, fuse_cell, run,
 					txn, false) > 0)
 				/* Peer won: nothing installed (txn consumed). */
@@ -251,7 +251,7 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			_ft_publish_to_parent(ft, ft_compressed_node_flag(cn),
 				&cn->child,
 				(struct cds_ft_inode_flag *) topmost_external_nodes,
-				elevated_old_child, &rec);
+				elevated_old_child, &rec, false);
 			if (ft_remove_commit_rec(ft, &rec, NULL, NULL, txn, false) > 0)
 				/* Peer won: nothing installed (txn consumed). */
 				return -EAGAIN;
@@ -427,7 +427,7 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			_ft_publish_to_parent(ft, pub_parent,
 				pub_slot,
 				ft_node_flag(fresh, 0),
-				*pub_slot, &rec);
+				*pub_slot, &rec, false);
 			/*
 			 * Freeze the retired compressed node dead (§4.B freeze-on-
 			 * free): this compressed->fresh-internal recompaction retires
@@ -1294,7 +1294,7 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 				publish_parent, pub_depth);
 		_ft_publish_to_parent_meta(ft, publish_parent, publish_slot,
 			new_cn_pub, pub_expected_old, new_cn_meta, NULL, &rec,
-			/*slot_owner_nf=*/ publish_parent);
+			/*slot_owner_nf=*/ publish_parent, false);
 		/*
 		 * Freeze-on-free (doc §4.B, atomic detach): the collapsed chain
 		 * this commit retires -- the 1-child boundary @iter_node_flag and
@@ -3375,7 +3375,7 @@ int ft_detach_node(struct cds_ft *ft,
 				ft_flip_txn_arm_per_op(ft, commit_txn);
 			_ft_publish_to_parent(ft, ft_parent_node(iter_meta->parent_word),
 				detach_parent_flag_ptr, iter_node_flag,
-				holder_old_flag, &rec);
+				holder_old_flag, &rec, /*dual_owner_held=*/ old_recompacted_node != NULL);
 			/*
 			 * nr_keys fold (LEAF Increment 2): the recompaction's -1
 			 * walk from the STABLE grandparent iter_meta->parent (the
@@ -3488,7 +3488,7 @@ int ft_detach_node(struct cds_ft *ft,
 				ft_flip_txn_arm_per_op(ft, commit_txn);
 			_ft_publish_to_parent(ft, ft_parent_node(iter_meta->parent_word),
 				detach_parent_flag_ptr, iter_node_flag,
-				holder_old_flag, &rec);
+				holder_old_flag, &rec, /*dual_owner_held=*/ old_recompacted_node != NULL);
 			/*
 			 * nr_keys fold (LEAF Increment 2): a non-fused RECOMPACTION
 			 * folds the -1 walk from the stable grandparent onto this
@@ -3898,7 +3898,7 @@ int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 			(struct cds_ft_inode_flag **) head_slot,
 			(struct cds_ft_inode_flag *) next_node,
 			(struct cds_ft_inode_flag *) node,
-			NULL, new_cell_flag, &rec, /*slot_owner_nf=*/ parent_nf);
+			NULL, new_cell_flag, &rec, /*slot_owner_nf=*/ parent_nf, false);
 		n_s = ft_pub_rec_sedges(&rec, sedges);
 		/*
 		 * Fuse @node's freeze (mark node->next, target preserved) into the
@@ -3980,7 +3980,7 @@ int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 			(struct cds_ft_inode_flag *) next_node,
 			(struct cds_ft_inode_flag *) node,
 			NULL, inherit /* folded prev: intended parent value */, &rec,
-			/*slot_owner_nf=*/ parent_nf);
+			/*slot_owner_nf=*/ parent_nf, false);
 		n_s = ft_pub_rec_sedges(&rec, sedges);
 		/* Fuse @node's freeze into the structural publish (doc §4.B). */
 		ft_hlist_freeze_prepare(ft_flip_txn_handle(txn), node);
@@ -4201,7 +4201,7 @@ int ft_unchain_node(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 			parent_depth, hmeta, hsnap);
 		_ft_publish_to_parent(ft, parent_nf,
 			(struct cds_ft_inode_flag **) head_slot, NULL,
-			(struct cds_ft_inode_flag *) node, &rec);
+			(struct cds_ft_inode_flag *) node, &rec, false);
 		n_s = ft_pub_rec_sedges(&rec, sedges);
 		/*
 		 * THIS LANE EMITS NO SKIP_X DUAL, and the arm below depends on

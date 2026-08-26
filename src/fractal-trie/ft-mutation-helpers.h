@@ -3516,6 +3516,17 @@ void ft_flip_txn_record_pub_rec(struct ft_flip_txn *t,
 			ft_flip_txn_record_root(t, (void **) rec->slot[i],
 				(void *) rec->old_val[i],
 				(void *) rec->new_val[i]);
+		else if (!rec->owner_held[i])
+			/*
+			 * The op does not hold this slot's owner -- the SKIP_X
+			 * dual, whose owner the publish helper DERIVES from a
+			 * back-pointer and only the op can vouch for.  MW,
+			 * whatever the txn's mode.
+			 */
+			ft_flip_txn_record_tag_mw(t, (void **) rec->slot[i],
+				(void *) rec->old_val[i],
+				(void *) rec->new_val[i],
+				FT_FLIP_PROXY_TAG);
 		else
 			ft_flip_txn_record_reserved(t, rec->owner[i],
 				(void **) rec->slot[i],
@@ -4181,6 +4192,16 @@ struct ft_ord_cell_edge {
 	 * carries a node lock, which is why the ordered list is MW by design.
 	 */
 	struct cds_ft_metadata *owner;
+	/*
+	 * Does the OP HOLD @owner's DLM lock?  false -- the zero-initialized
+	 * default -- records MW whatever the txn's mode, which is stricter and
+	 * always sound.  @owner alone cannot carry this: the dispatching
+	 * recorder branches on @t->structural_sw and never looks at @owner, so
+	 * an unnamed slot parks SW under an armed txn exactly like a named one.
+	 * Carried per EDGE because the rule is SLOT-shaped: one publish emits a
+	 * forward edge the op holds and a SKIP_X dual it may not.
+	 */
+	bool owner_held;
 };
 
 /* Resolve an edge's engine proxy tag: unset (0) => the structural 0xF tag. */
@@ -6024,7 +6045,7 @@ enum urcu_txn_status ft_ord_cell_flip_into(struct cds_ft *ft,
 			ft_flip_txn_record_root(t, (void **) edges[i].slot,
 				(void *) edges[i].old_target,
 				(void *) edges[i].new_target);
-		else if (tag == FT_FLIP_PROXY_TAG)
+		else if (tag == FT_FLIP_PROXY_TAG && edges[i].owner_held)
 			ft_flip_txn_record_tag(t, edges[i].owner,
 				(void **) edges[i].slot,
 				(void *) edges[i].old_target,
@@ -6123,6 +6144,17 @@ void ft_ord_cell_record_into_ft(struct cds_ft *ft, struct ft_flip_txn *t,
 					(void **) edges[i].slot,
 					(void *) edges[i].old_target,
 					(void *) edges[i].new_target);
+			else if (!edges[i].owner_held)
+				/*
+				 * The op does not hold this slot's owner (a
+				 * SKIP_X dual into a grandparent it never
+				 * acquired): MW, whatever the txn's mode.
+				 */
+				ft_flip_txn_record_tag_mw(t,
+					(void **) edges[i].slot,
+					(void *) edges[i].old_target,
+					(void *) edges[i].new_target,
+					ft_edge_tag(&edges[i]));
 			else
 				ft_flip_txn_record_tag(t, edges[i].owner,
 					(void **) edges[i].slot,
@@ -6613,6 +6645,7 @@ unsigned int ft_pub_rec_sedges(struct ft_pub_rec *rec,
 		sedges[i].new_target = (struct ft_ord_cell *) rec->new_val[i];
 		sedges[i].root = rec->root[i];
 		sedges[i].owner = rec->owner[i];
+		sedges[i].owner_held = rec->owner_held[i];
 	}
 	return rec->n;
 }
@@ -6651,6 +6684,13 @@ int ft_remove_one_commit(struct cds_ft *ft,
 	edges[n].old_target = (struct ft_ord_cell *) struct_old;
 	edges[n].new_target = (struct ft_ord_cell *) struct_new;
 	edges[n].owner = slot_owner;
+	/*
+	 * @struct_slot is this commit's SOLE structural edge by contract (see
+	 * the header above: shapes with a SKIP_X dual do not use this helper),
+	 * so the caller's @slot_owner declaration IS the held answer -- there
+	 * is no second, derived owner to vouch for.
+	 */
+	edges[n].owner_held = (slot_owner != NULL);
 	n++;
 	if (run)
 		n = ft_ord_cell_run_detach_edges(ft, run->rfirst, run->rlast,
@@ -6887,6 +6927,7 @@ enum urcu_txn_status ft_remove_commit_rec(struct cds_ft *ft,
 		edges[n].new_target = (struct ft_ord_cell *) rec->new_val[i];
 		edges[n].root = rec->root[i];
 		edges[n].owner = rec->owner[i];
+		edges[n].owner_held = rec->owner_held[i];
 		n++;
 	}
 	if (run)
@@ -7597,6 +7638,7 @@ enum urcu_txn_status ft_ord_cell_flip_rec_replace(struct cds_ft *ft,
 		edges[n].new_target = (struct ft_ord_cell *) rec->new_val[i];
 		edges[n].root = rec->root[i];
 		edges[n].owner = rec->owner[i];
+		edges[n].owner_held = rec->owner_held[i];
 		n++;
 	}
 	n = ft_ord_cell_run_replace_edges(ft, run->d_first, run->d_last,
@@ -10939,7 +10981,7 @@ enum urcu_txn_status ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue 
 			g->publish_slot == g->txn->pending_pub_slot)
 		goto publish_done;
 	_ft_publish_to_parent(ft, g->publish_parent, g->publish_slot, g->top,
-		ft_glue_publish_expected_old(g), &rec);
+		ft_glue_publish_expected_old(g), &rec, false);
 	ft_flip_txn_record_pub_rec(g->txn, &rec);
 publish_done:
 	/*
@@ -11449,7 +11491,7 @@ enum urcu_txn_status ft_glue_publish(struct cds_ft *ft, struct ft_flip_txn *txn,
 			g->publish_parent, FT_DEPTH_FROM_DESCENT);
 	}
 	_ft_publish_to_parent(ft, g->publish_parent, g->publish_slot, g->top,
-		ft_glue_publish_expected_old(g), &rec);
+		ft_glue_publish_expected_old(g), &rec, false);
 	n = ft_pub_rec_sedges(&rec, sedges);
 	/*
 	 * Order-statistics fold (BULK): record the +count_delta nr_keys walk
@@ -11518,7 +11560,7 @@ enum urcu_txn_status ft_glue_publish_replace(struct cds_ft *ft,
 			g->publish_parent, FT_DEPTH_FROM_DESCENT);
 	}
 	_ft_publish_to_parent(ft, g->publish_parent, g->publish_slot, g->top,
-		ft_glue_publish_expected_old(g), &rec);
+		ft_glue_publish_expected_old(g), &rec, false);
 	/* Order-statistics fold (BULK): see ft_glue_publish. */
 	if (g->count_delta)
 		ft_flip_txn_record_count_parent(ft, txn, g->publish_parent,

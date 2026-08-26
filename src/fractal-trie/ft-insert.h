@@ -680,7 +680,7 @@ void ft_insert_publish_or_park(struct cds_ft *ft,
 	 * exclusion it never took.
 	 */
 	ft_flip_txn_arm_per_op(ft, ic->txn);
-	_ft_publish_to_parent(ft, parent_nf, slot, new_top, expected_old, &rec);
+	_ft_publish_to_parent(ft, parent_nf, slot, new_top, expected_old, &rec, false);
 	ft_flip_txn_record_pub_rec(ic->txn, &rec);
 	ic->slot = slot;	/* sentinel: one-commit forward recorded */
 	ic->publish_to_parent = true;
@@ -2210,7 +2210,7 @@ int ft_attach_node(struct cds_ft *ft,
 #endif
 			_ft_publish_to_parent(ft, attach_node_flag,
 				attach_node_flag_ptr, iter_dest_node_flag,
-				attach_node_flag, &rec);
+				attach_node_flag, &rec, false);
 			ft_flip_txn_record_pub_rec(ic->txn, &rec);
 			ic->free_old_node = old_recompacted_node;
 			old_recompacted_node = NULL;
@@ -2326,7 +2326,7 @@ int ft_attach_node(struct cds_ft *ft,
 #endif
 			_ft_publish_to_parent(ft, attach_node_flag,
 				attach_node_flag_ptr, iter_dest_node_flag,
-				attach_node_flag, &rec);
+				attach_node_flag, &rec, false);
 			ft_flip_txn_record_pub_rec(ic->txn, &rec);
 			/*
 			 * I6 count fold (rank stats ON): the attach node stays in
@@ -4564,7 +4564,7 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 			ft_flip_txn_guard_parent(ft, txn, parent_nf);
 			_ft_publish_to_parent(ft, parent_nf, pub_slot,
 				(struct cds_ft_inode_flag *) new_node,
-				(struct cds_ft_inode_flag *) old_node, &rec);
+				(struct cds_ft_inode_flag *) old_node, &rec, false);
 			n_s = ft_pub_rec_sedges(&rec, sedges);
 			/*
 			 * Fuse @old_node's freeze (mark old_node->next, target
@@ -4638,7 +4638,7 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 			ft_flip_txn_guard_parent(ft, txn, parent_nf);
 			_ft_publish_to_parent(ft, parent_nf, pub_slot,
 				(struct cds_ft_inode_flag *) new_node,
-				(struct cds_ft_inode_flag *) old_node, &rec);
+				(struct cds_ft_inode_flag *) old_node, &rec, false);
 			n_s = ft_pub_rec_sedges(&rec, sedges);
 			/* Fuse @old_node's freeze into the structural publish (doc §4.B). */
 			ft_hlist_freeze_prepare(ft_flip_txn_handle(txn), old_node);
