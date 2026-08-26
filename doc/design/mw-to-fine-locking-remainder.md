@@ -972,15 +972,46 @@ edge MUST stay SW, because "an MW edge expecting live_state would mismatch the
 op's OWN mark and **abort every commit**". A LIVELOCK, not a slowdown — and
 exactly what `assert(txn->structural_sw)` was guarding.
 
-⇒ **B6 IS BLOCKED ON PHASE E, NOT ON B6.** The hand-arm is what lets this writer
-run at exponential / root-only at all; retiring it requires the helper to accept
-those spacings, which is Phase E's spacing certification. Landing the per-node
-half behind a gate would leave the coarse spacings on the hand-arm — two doors
-again, the thing B6 exists to remove. **Do B6 after E.**
-☞ The per-node half is measured, so E's follow-up starts from data: reach
-287,942 / armed 243,981 (all 43,961 refusals trie-wide), and the writer gives up
-~0.64 records per txn to MW_STRUCT — 8.6% of its structural records — because the
-arm sits at the take rather than at creation.
+☠☠ **AND "BLOCKED ON PHASE E" IS ITSELF REFUTED — B6 IS LANDABLE NOW.** The
+"two doors" argument conflated CALL SITES with POLICIES. The two doors B6 exists
+to remove are the two HAND-ARM CALL SITES; a spacing dispatch *inside* the one
+sanctioned arm point is ONE door, retires both hand-arms today, and is
+byte-identical at every spacing. It is also exactly as sound as the status quo,
+because it IS the status quo's policy behind one entry point.
+☞ And the coarse spacings it covers are not shippable anyway:
+`cds_ft_group_attr_set_lock_spacing` refuses exponential / root-only without
+`FEATURE_FT_ANCHOR_VALIDATE` — "not a shippable configuration ... development
+sweep" (`ft-lifecycle.h:355-375`). **Phase E is the prerequisite for CERTIFYING
+the coarse SW fallback, not for consolidating the arm.**
+
+☑ **THE LANDING**: in `ft_rekey_cow_stop`, after `ft_rekey_marks_to_txn`, arm
+through the helper and fall back explicitly —
+`ft_flip_txn_arm_per_op(ft, txn); if (!txn->structural_sw && ft->lock_fine &&
+!ft_txn_content_sw_ok(ft)) ft_flip_txn_set_structural_sw(txn, true);` — with the
+second line NAMED as the Phase-E debt (the anchor-discipline SW fallback for the
+dev-only coarse spacings), and `assert(txn->structural_sw)` kept below it, now
+valid at every spacing. One line for E to certify or replace.
+
+☠ **THE RED CELLS WERE ALREADY RED AT HEAD, and this entry hid it.** On a clean
+tree with the gate's anchorval flags, ft_unit dies at **294** (exponential) and
+**238** (root-only), and ft_inv MW root-only after **73**, all on the engine's
+`urcu_txn_record_chain: r->kind == kind` assert (`rcu-txn-mcas.h:879`) — the
+§9.5 class-2 failures. The hoist did not turn those cells red; it died EARLIER
+in them (110 vs 294/238). Those pre-existing reds gate any future coarse-cell
+green and are NOT B6's.
+
+☞ **THE all-MW LIVELOCK IS REAL BUT NARROWER than stated**: measured, all-MW is
+outcome-identical to control at root-only and across the whole ft_unit surface
+(every child acquire DEDUPES there), and livelocks only on ft_inv `FT_INV_MW=1`
+at **exponential** — 7/119 tests in 480 s, with 112,271,789 child acquires taking
+the child's OWN word against 527,664 dedupes. The assert is load-bearing at
+exactly one measured spacing.
+
+☞ Per-node measurements, corrected: the writer gives up **~0.6-0.8 records/txn,
+~8-12%** of its structural records. Two identical runs gave 0.64/8.4% and
+0.81/11.6%, so the single figure this entry first quoted was one draw from a
+distribution as wide as its own precision. Reach/armed totals likewise vary ±25%
+run to run; what is stable is the refusal SPLIT (all trie-wide, three zeros).
 
 ## 5. Phase C — the residual MW_ALWAYS lanes (the G4 decision)
 
