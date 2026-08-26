@@ -3359,6 +3359,44 @@ int ft_detach_node(struct cds_ft *ft,
 			if (!(ft->lock_fine && old_recompacted_node))
 				ft_flip_txn_guard_parent(ft, commit_txn,
 					ft_parent_node(iter_meta->parent_word));
+			/*
+			 * PHASE B, STEP B2 -- THE ARM, RECOMPACTION PUBLISH
+			 * (fused).  This is where the remove surface commits:
+			 * an in-place delete needs an EXCLUSIVE trie
+			 * (ft_in_place_ok), which the per-op arm refuses
+			 * anyway, so on a shared trie every delete recompacts
+			 * and lands here or on the non-fused twin below.
+			 *
+			 * PLACEMENT.  The op's last ft_flip_txn_lock_register
+			 * on @commit_txn is ft_node_recompact's RELEASE-half
+			 * loop ({P}, plus {GP} when P is compressed), which ran
+			 * inside ft_node_replace_ptr above; the line beside
+			 * this one plants a read-set guard and registers
+			 * nothing, and ft_remove_commit_rec below plants the
+			 * first record after it.  Measured (-DFT_B2_ARM_PROBE):
+			 * @nr_locks is NEVER zero here, so the helper's
+			 * empty-registry refusal is not what decides this site.
+			 *
+			 * ☞ WHAT IT CONVERTS is the forward publish (+ a
+			 * compressed grandparent's SKIP_X dual), whose owner is
+			 * the grandparent this recompact holds and released
+			 * through this very txn.  The recompaction's OWN edges
+			 * -- the reparent sweep, the child state guards -- are
+			 * not converted and must not be: they dispatch MW
+			 * themselves (@child_held false in
+			 * ft_flip_txn_record_parent_word /
+			 * ft_reparent_record_meta) because C's CHILDREN are
+			 * never in the DLM set.  The cell / run edges stay
+			 * MW_ALWAYS by their own helpers.
+			 *
+			 * ☠ NOT ON THE FOLD PATH.  @record_only means
+			 * @commit_txn is the CALLER's shared txn, and whether
+			 * its registry is complete is the caller's judgement,
+			 * not this frame's -- the rekey writer arms it itself,
+			 * so refusing here costs nothing.
+			 */
+			if (commit_txn && !commit_txn_used && !record_only)
+				ft_flip_txn_arm_per_op(ft, commit_txn);
 			_ft_publish_to_parent(ft, ft_parent_node(iter_meta->parent_word),
 				detach_parent_flag_ptr, iter_node_flag,
 				holder_old_flag, &rec);
@@ -3461,6 +3499,18 @@ int ft_detach_node(struct cds_ft *ft,
 					&lctx,
 					ft_parent_node(iter_meta->parent_word),
 					FT_DEPTH_FROM_DESCENT);
+			/*
+			 * PHASE B, STEP B2 -- THE ARM, RECOMPACTION PUBLISH
+			 * (non-fused) and the non-in-place external promote.
+			 * The argument is the fused arm's above, with the one
+			 * difference that decides the placement: on the else
+			 * arm the lock_or_guard beside this line IS this path's
+			 * last register (the recompact arm's was
+			 * ft_node_recompact's release loop), so the arm sits
+			 * below BOTH.
+			 */
+			if (commit_txn && !commit_txn_used && !record_only)
+				ft_flip_txn_arm_per_op(ft, commit_txn);
 			_ft_publish_to_parent(ft, ft_parent_node(iter_meta->parent_word),
 				detach_parent_flag_ptr, iter_node_flag,
 				holder_old_flag, &rec);
