@@ -824,9 +824,33 @@ claimed exclusion argument:
    named it. Byte-neutral in a release build — `ft_flip_txn_record_tag` reads
    `@owner` only for the assert and the counters, and parks on
    `@t->structural_sw` alone.
-4. `ft-remove.h:882` — the detach-side creator (7.8M; 41.9% held, the closest
-   to ready, and also the largest content-lane abort source).
-5. The remaining content sites in descending count.
+4. `ft-remove.h:882` `ft_chain_compress_fused` — the detach-side creator, and
+   the largest CONTENT-LANE abort source. ☑ **ARMED** `ec00e234`, after
+   `ft_detach_freeze_orphans` (this op's last register; under `lock_fine` the
+   rest was taken in the ONE all-or-none acquire, and the incremental
+   `lock_or_guard` beside the publish is the `!lock_fine` arm the helper
+   refuses anyway). Refused on the FOLD path.
+   ☑ Its dry run `-DFT_COLLAPSE_CLAIM` (`cec68299`) was **clean at first
+   reading on BOTH suites** — no fixing pass at all, because the classes B2 paid
+   for were shared machinery. `-DFT_ARM_REACH`: 1,645,902 reaches, 1,642,370
+   armed (99.8%), only trie-wide refusals.
+   ☠ **AND THE ABORT COLUMN NEEDED n=3, ALTERNATED.** One armed run read as a
+   wrong-direction alarm (site aborts 5.69 → 6.74 per 100 created) and it did
+   not survive. Alternated ctl/arm ×3, per 1k txns created at the site:
+   `control 62.57 aborts / 2291.5 MW_STRUCT / 3.1 SW` vs
+   `armed 55.44 / 1763.2 / 565.4`. ☞ The control's own spread (51.25 / 72.81 /
+   63.64) is WIDER than the gap while the armed leg is tight (56.69 / 55.81 /
+   53.82), so what this establishes is the ABSENCE of a wrong-direction signal,
+   not a certified 11% ([[feedback_abort_column_is_not_a_per_step_number]]).
+5. The remaining content sites in descending count. ☞ The largest by MW_STRUCT
+   is now `ft-remove.h:3887`-class (≈15M, `OWN_MISS` **0**, `ABORT` **0**) — it
+   buys FAIRNESS only, which is why the ordering above still holds.
+
+★ **EVERY ARM FROM HERE CARRIES A REACH COUNTER.** `-DFT_ARM_REACH` lives in
+`ft_flip_txn_arm_per_op` itself and tallies reach against each refusal term per
+CALL SITE, because `armSW` cannot tell an arm that never RAN from one that ran
+and was refused, and credits another frame's hand-arm to the site whose txn it
+armed ([[feedback_armsw_is_not_an_arms_yield]]).
 
 ☠ A raw `ft_flip_txn_record_tag` loop over ordered-cell edges survives at
 `ft-merge.h` and `ft-rekey.h` (the sibling graft path routes through the
@@ -1408,7 +1432,7 @@ stale) — watch it across Phase B, it shares words with the converted sites.
                                                               GATE: ungated, per-node stayed
                                                               green and txndbg/anchorval went
                                                               RED at exponential + root-only
-    B2-5 four hot sites, one at a time                      (each: owner-complete -> claim
+    B2,B4,B5 the other hot sites, one at a time            (each: owner-complete -> claim
                                                               dry-run -> arm; NOT mechanical).
                                                               B2 ☑ ARMED: owner-complete
                                                               a9ff9549, in-place path 6024f167
@@ -1422,6 +1446,14 @@ stale) — watch it across Phase B, it shares words with the converted sites.
                                                               them.  Remainder = the ~2.4
                                                               records/commit planted BEFORE
                                                               the acquires finish (Phase C/E)
+    B3  ft_chain_compress_fused (the collapse)              ☑ ARMED ec00e234 -- dry run
+                                                              cec68299 CLEAN at FIRST reading,
+                                                              no fixing pass; 99.8% of reaches
+                                                              armed.  ☠ its abort column needed
+                                                              n=3 ALTERNATED: one run read as a
+                                                              wrong-direction alarm and did not
+                                                              survive (ctl 62.6 vs arm 55.4
+                                                              aborts/1k, control spread 51-73)
     B6  retire hand-arming (rekey writer, root COW)         (small)
     C   re-measure; G4 cell-lane decision                   (gate + data)
     G5  subtree freeze-state gate design (hybrid D)         (design, w/ D)
