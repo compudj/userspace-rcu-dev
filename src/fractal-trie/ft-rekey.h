@@ -1800,8 +1800,18 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 * Point the claim at the one already-armed SW content site and the assert
 	 * names every slot it parks without owning, which is what §9.1 calls its
 	 * missing fine-lock conversions.
+	 *
+	 * ☠ THE _ARMABLE FORM, NOT THE RAW ONE.  This driver runs under COARSE and
+	 * exclusive too (ft_rekey_graft_simple_locked takes CDS_FT_SCOPED_WRITER),
+	 * and there the SW parks are legal on the TRIE-WIDE exclusion -- the
+	 * per-node locks the assert looks for are deliberately never taken, so the
+	 * raw claim reports the wide mutex's own soundness as a violation.  That is
+	 * the false positive ft_flip_txn_claim_per_op_armable exists to refuse, and
+	 * skipping it cost a full misdiagnosis: ft_inv's coarse rekey arms aborted
+	 * at ft_store_at_graft_point_commit's republish with ft->lock_fine == false,
+	 * which reads exactly like a missing acquire and is not one.
 	 */
-	ft_flip_txn_claim_per_op(txn);
+	ft_flip_txn_claim_per_op_armable(ft, txn);
 #endif
 	if (!merge_dst) {
 		ft_lock_ctx_init(&lctx_src, &d_src, txn, optxn);
