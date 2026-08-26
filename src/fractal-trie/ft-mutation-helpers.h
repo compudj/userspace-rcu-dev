@@ -8061,6 +8061,12 @@ struct ft_glue {
 	bool publish_parent_shared;
 	uintptr_t publish_parent_snap;
 	/*
+	 * The TXN owns this fence's outcome, handed over at the TAKE rather than
+	 * at ft_glue_txn_commit_edges -- @publish_gp_txn_owned's argument and the
+	 * same mechanism.  See ft_glue_take_publish_parent.
+	 */
+	bool publish_parent_txn_owned;
+	/*
 	 * THE SKIP_X DUAL'S OWNER (§9.3, one level up).  A publish into a
 	 * COMPRESSED @publish_parent is not one store: _ft_publish_to_parent also
 	 * re-encodes the SKIP_X pointer that lets a candidate reader bypass the
@@ -8312,6 +8318,7 @@ void ft_glue_init(struct ft_glue *g)
 	g->publish_parent_holder = NULL;
 	g->publish_parent_shared = false;
 	g->publish_parent_snap = 0;
+	g->publish_parent_txn_owned = false;
 	g->publish_gp_holder = NULL;
 	g->publish_gp_shared = false;
 	g->publish_gp_snap = 0;
@@ -8330,6 +8337,44 @@ void ft_glue_init(struct ft_glue *g)
 	g->fuse_free_list = false;
 	g->record_only = false;
 	g->count_delta = 0;
+}
+
+/*
+ * Take the glue's PUBLISH PARENT fence AND hand it to @g->txn in the same
+ * breath: the two lines are the ones ft_flip_txn_hold_or_lock_parent's held arm
+ * runs, and the take is the moment they become true.
+ *
+ * ☠ THE TRANSFER CANNOT WAIT FOR ft_glue_txn_commit_edges.  Records into the
+ * fenced node's BODY happen in between -- the fold's detach recompacts under
+ * this word and republishes into it -- and a record-time owner check reads the
+ * txn's locks[] and nothing else, so a fence that arrives afterwards reads as
+ * UNOWNED at every record in the window.  The acquires those records sit behind
+ * DEDUPE onto this fence and therefore register nothing themselves (rightly:
+ * this acquire owes the release), so the registry never learns it by any other
+ * route.
+ *
+ * The FIELDS stay set.  They are still the witness every NARROW glue predicate
+ * reads (ft_glue_held_snap_one, ft_glue_op_holds), and clearing them would
+ * answer "not held" for a word the op holds; @publish_parent_txn_owned moves
+ * only who CLEARS -- ft_glue_abort must not, or a bail double-clears against
+ * ft_flip_txn_lock_release_all's strict release, and commit_edges must not hand
+ * the same fence over twice.
+ *
+ * A SHARED acquire transfers nothing: the fence is in force, but the acquire
+ * that FIRST took the word owns both the release and the registry entry.
+ */
+static inline
+void ft_glue_take_publish_parent(struct ft_glue *g,
+		struct cds_ft_metadata *holder, uintptr_t snap, bool shared)
+{
+	g->publish_parent_holder = holder;
+	g->publish_parent_snap = snap;
+	g->publish_parent_shared = shared;
+	if (shared || !holder || !g->txn)
+		return;
+	ft_flip_txn_lock_register(g->txn, holder, snap);
+	ft_flip_txn_record_anchor_release_held(g->txn, holder);
+	g->publish_parent_txn_owned = true;
 }
 
 /*
@@ -9973,12 +10018,18 @@ void ft_glue_abort(struct cds_ft *ft, struct ft_glue *g)
 	 * double-cleared -- ft_meta_lock_release asserts the bit is still set.
 	 */
 	if (g->publish_parent_holder) {
-		/* SHARED: the caller's earlier acquire owns the release. */
-		if (!g->publish_parent_shared)
+		/*
+		 * SHARED: the caller's earlier acquire owns the release.
+		 * TXN-OWNED: the TAKE already handed it over, and
+		 * ft_flip_txn_lock_release_all drains it -- clearing here as well
+		 * is the fence theft @split_cn_holder spells out.
+		 */
+		if (!g->publish_parent_shared && !g->publish_parent_txn_owned)
 			ft_meta_lock_release_if_held(g->publish_parent_holder);
 		g->publish_parent_holder = NULL;
 		g->publish_parent_shared = false;
 		g->publish_parent_snap = 0;
+		g->publish_parent_txn_owned = false;
 	}
 	/*
 	 * The SKIP_X dual's owner, on the same terms -- plus one: a fence the
@@ -10491,7 +10542,7 @@ enum urcu_txn_status ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue 
 		 * Routing it to the NULL arm instead would be worse -- that arm
 		 * re-acquires or guards a word this op already holds.
 		 */
-		if (!g->publish_parent_shared)
+		if (!g->publish_parent_shared && !g->publish_parent_txn_owned)
 			ft_flip_txn_hold_or_lock_parent(ft, g->txn, &gctx,
 				g->publish_parent, FT_DEPTH_FROM_DESCENT,
 				g->publish_parent_holder,
@@ -10523,6 +10574,7 @@ enum urcu_txn_status ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue 
 		g->publish_parent_holder = NULL;
 		g->publish_parent_shared = false;
 		g->publish_parent_snap = 0;
+		g->publish_parent_txn_owned = false;
 	}
 	/*
 	 * THE SECOND SLOT THE PUBLISH BELOW WRITES.  A compressed

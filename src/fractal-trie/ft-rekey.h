@@ -1962,9 +1962,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 			 */
 			pp_shared = pph.shared;
 		}
-		glue.publish_parent_holder = pp_meta;
-		glue.publish_parent_snap = pp_snap;
-		glue.publish_parent_shared = pp_shared;
+		ft_glue_take_publish_parent(&glue, pp_meta, pp_snap, pp_shared);
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 		/*
 		 * A COMPRESSED publish parent -- the shape a destination behind a
@@ -2562,9 +2560,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 			pp_snap = pph.lock_snap;
 			pp_shared = pph.shared;
 		}
-		glue.publish_parent_holder = pp_meta;
-		glue.publish_parent_snap = pp_snap;
-		glue.publish_parent_shared = pp_shared;
+		ft_glue_take_publish_parent(&glue, pp_meta, pp_snap, pp_shared);
 		/*
 		 * The one LIVE node the split cluster re-parents: @cn's displaced
 		 * child, which moves onto the fresh suffix (or straight under the fresh
