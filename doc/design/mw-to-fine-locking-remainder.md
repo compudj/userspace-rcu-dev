@@ -1053,53 +1053,48 @@ Registry high-water (`-DFT_LOCKS_HIGHWATER`): unchanged at **15/257** (ft_inv MW
 and 13/257 (ft_unit) — the marks dedupe or peak below the existing maximum, so
 the bound is no more stressed than before.
 
-#### ☐ §9.1(A) IS NOT DONE — and the concurrent lane found a REAL EXCLUSION GAP
+#### ☠ THE "REAL EXCLUSION GAP" ABOVE WAS AN INSTRUMENT ARTIFACT — `67f72278`
 
-ft_unit is single-threaded. `ft_inv` `FT_INV_MW=1` aborts under the claim at a
-site ft_unit never drives, and this one is not a bookkeeping gap:
+The previous revision of this row reported `ft_store_at_graft_point_commit`'s
+relocation republish as an op writing a live node it never fenced: unlocked
+owner, `acquire_miss == false`, absent from a populated registry, every fresh
+inventory empty. All true. **`ft->lock_fine` was `false`.**
 
-    ft_store_at_graft_point_commit (ft-graft.h:888)
-      -> ft_flip_txn_record_pub_rec -> the relocation republish
+On a COARSE (or exclusive) trie the exclusion is the FT-wide mutex —
+`ft_rekey_graft_simple_locked` takes `CDS_FT_SCOPED_WRITER` — and the recompact's
+DLM acquire block is gated on `lock_fine`, so P is correctly never locked and
+never registered. The registry is still non-empty (retire anchors, cow_stop
+marks), so the assert's `!nr_locks` escape does not fire, and the first record
+whose owner coarse mode never marks aborts.
 
-**THE OP PUBLISHES INTO A LIVE NODE IT DOES NOT HOLD.** Printed in ONE run,
-nothing inferred:
+`658989ef` reached for the raw `ft_flip_txn_claim_per_op`;
+`ft_flip_txn_claim_per_op_armable` exists for exactly this and says so in its own
+doc block, and `6f55710b` had already taught B1's dry run to use it. `67f72278`
+gates the rekey claim the same way. Diagnostic-only — the hunk is inside
+`#ifdef FT_REKEY_CLAIM`, which no shipped or gate configuration defines.
 
-    t->locks[6]                        = { …, 0x7fff37600218 }
-    st->publish_pmeta                  =       0x7fff37600218   <- REGISTERED
-    ft_flag_to_metadata(ft, pub_parent) =      0x7fff31e00118   <- the OWNER, absent
-    owner->state = 0x48   (nr_child 18, NO FT_STATE_LOCK)
-    t->acquire_miss = false, t->structural_sw = true
+☠☠ **THE FIRST QUESTION AT ANY CLAIM ABORT IS `p ft->lock_fine`** (and
+`ft->exclusive`, and the spacing). It costs one gdb line. Skipping it cost a full
+misdiagnosis and a doc revision that had to be retracted. ☞ And read a
+suite split — "ft_unit clean, only ft_inv aborts" — as a COVERAGE question
+first: ft_inv has dedicated COARSE rekey arms, ft_unit's rekeys run on FINE
+tries.
 
-And it is LIVE, not op-built: every fresh inventory in the op was printed and
-none holds it — `glue.nr_built == 0`, `detach_rc.new_flag == NULL`,
-`glue.publish_parent == NULL`, `glue.top == NULL`, and the one fresh node
-`gst_st.dest` is the record's NEW value, not its slot's home.
+#### ☐ §9.1(A) — the concurrent lane, now on a FINE trie
 
-**THE MECHANISM.** `pub_parent` is re-derived RAW at the write site —
-`ft_resolve_parent_slot(dest_meta, ft, &pub_parent)` (ft-graft.h:824) — while the
-op acquired and registered `st->publish_pmeta`, the identity the RESERVE
-recorded. The comment beside the publish asserts they are the same word (*"this
-is the SAME word the recompact … acquired and recorded a release on"*), and
-under ft_unit they are. Under concurrency they are not, and nothing checks it: an
-armed fold then parks a plain store into a live node with no exclusion at all.
+With the claim gated, ft_unit stays clean and `ft_inv FT_INV_MW=1` advances from
+test 3 to test 9, stopping at:
 
-★ **THIS IS THE THIRD INSTANCE OF ONE SHAPE**: a RAW derivation at the write site
-disagreeing with the node the op actually ACQUIRED. The other two were the dual
-gate (raw) versus the dual sink (RYW), both closed by `ebf24686`. Here the op is
-even CARRYING the right answer — `st->publish_pmeta`, `st->pnfp` — and re-derives
-it anyway.
+    ft_detach_freeze_orphans (ft-remove.h:594) -> ft_detach_freeze_one (:574)
+      -> ft_flip_txn_record_retire_anchored -> the fused {LOCK|s -> TOMBSTONE|s}
 
-☐ **Two candidate fixes, and the choice needs deciding rather than guessing**:
-publish through the identity the op RECORDED (`st->publish_pmeta` / `st->pnfp`),
-or DETECT the divergence and bail `-EAGAIN` so the caller re-descends (a peer
-re-homed the grandparent, which is a clean transient). The first keeps the op's
-exclusion argument intact; the second admits the resolve is racy and answers the
-peer. They differ in whether `dest`'s recorded parentage or the live trie is
-authoritative at the flip.
-
-☞ Method note, paid for three times this session: settle live-vs-built by
-PRINTING every fresh inventory, never by reading an address. This fold has at
-least four (`glue.built[]`, `detach_rc`, the collapse reclaim, `gst_st.dest`).
+`ft->lock_fine == true` — checked first this time — and the expected-old carries
+`FT_STATE_LOCK` (`0x80004`), so the op HOLDS the orphan it is retiring. That puts
+it back in the witness class, at a sixth witness: the detach's orphan freeze,
+whose `held[]` anchors reach no registry. Same shape as `d4b4d2d7`'s free-list
+retire, so the fix shape is known — register at the acquire, hand the clear over
+with `@txn_owned` — but the anchors and their sweep are the detach's, not the
+glue's, and want reading before the edit.
 
 ### 9.2 The load-sensitive concurrency class
 
@@ -1290,9 +1285,10 @@ stale) — watch it across Phase B, it shares words with the converted sites.
                                                               CLOSED (4 instances); next is a
                                                               / ebf24686 / a91ebafd landed —
                                                               ★ ft_unit's claim is CLEAN;
-                                                              ft_inv MW found a REAL
-                                                              exclusion gap at the graft
-                                                              relocation republish (§9.1)
+                                                              ft_inv MW's coarse arms were an
+                                                              INSTRUMENT ARTIFACT (67f72278);
+                                                              it now stops on a FINE trie at
+                                                              the orphan freeze (§9.1)
     B0  per-op arm helper + record-time owner assert        ☑ LANDED — and its first
                                                               measurement says NO site is
                                                               owner-complete (11.9% of the
