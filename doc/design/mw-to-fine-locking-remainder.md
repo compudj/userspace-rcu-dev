@@ -1080,7 +1080,7 @@ suite split — "ft_unit clean, only ft_inv aborts" — as a COVERAGE question
 first: ft_inv has dedicated COARSE rekey arms, ft_unit's rekeys run on FINE
 tries.
 
-#### ☐ §9.1(A) — the concurrent lane, now on a FINE trie
+#### ☐ §9.1(A) — the SIXTH witness, and its carve-out has an EXACT bound
 
 With the claim gated, ft_unit stays clean and `ft_inv FT_INV_MW=1` advances from
 test 3 to test 9, stopping at:
@@ -1089,12 +1089,46 @@ test 3 to test 9, stopping at:
       -> ft_flip_txn_record_retire_anchored -> the fused {LOCK|s -> TOMBSTONE|s}
 
 `ft->lock_fine == true` — checked first this time — and the expected-old carries
-`FT_STATE_LOCK` (`0x80004`), so the op HOLDS the orphan it is retiring. That puts
-it back in the witness class, at a sixth witness: the detach's orphan freeze,
-whose `held[]` anchors reach no registry. Same shape as `d4b4d2d7`'s free-list
-retire, so the fix shape is known — register at the acquire, hand the clear over
-with `@txn_owned` — but the anchors and their sweep are the detach's, not the
-glue's, and want reading before the edit.
+`FT_STATE_LOCK` (`0x80004`), so the op HOLDS the orphan it retires. Witness class,
+sixth witness.
+
+☠ **BUT THE FIX THAT WORKED FIVE TIMES IS BLOCKED HERE, AND THE BLOCK IS
+ARITHMETIC.** `ft_detach_freeze_one` ALREADY registers before recording — but
+only when `h->lock != m`. The `h->lock == m` arm (per-node: the anchor IS the
+retired node) deliberately does not, and its stated reason is a sizing argument,
+not a convenience:
+
+> *"the fused tombstone is its terminal and the word is unlockable afterwards, so
+> that mark stays with the caller and costs no registry slot — which is what keeps
+> a FT_MAX_DEPTH orphan chain inside FT_FLIP_TXN_MAX_LOCKS"*
+
+And the two numbers are EQUAL, not merely close:
+
+    FT_MAX_KEY_LEN 256  ->  FT_MAX_DEPTH          = 257   (fractal-trie-internal.h:295)
+    FT_ENTRY_PER_NODE 256 -> FT_FLIP_TXN_MAX_LOCKS = 257   (ft-mutation-helpers.h ~963)
+
+A maximum-depth orphan chain would consume the ENTIRE registry, leaving nothing
+for the op's own lock-set. `d4b4d2d7`'s move — register anyway, hand the clear
+over with `@txn_owned` — is unavailable at this site without changing the bound.
+
+☞ **THIS IS A FORK, and it wants a decision rather than a derivation:**
+
+* **Raise the registry.** The `FT_FLIP_TXN_MAX_LOCKS` comment already names the
+  shape — *"a small embedded array with a heap overflow for the rare wide set —
+  not a lower cap, which merely re-hides the assert"* — and prices today's array
+  at 4 KB in each of two places.
+* **Treat the record as SELF-WITNESSING.** The fused retire's expected-old is
+  `h->lock_snap | FT_STATE_LOCK` on the very word being written, and the acquire
+  refuses an already-locked word — so that LOCK bit can only be this op's. The
+  record proves the ownership the registry is being asked about. This is a
+  narrower claim than a lock carve-out, but it IS an exemption in the owner
+  check, and §10's rule is that exemptions wait for the transition and a proven
+  gain.
+* **Something else** — the two above are what the code suggests, not an
+  exhaustive list.
+
+☞ Do not resolve it by measurement alone: a measured maximum orphan chain says
+nothing about the bound, which is what the carve-out is defending.
 
 ### 9.2 The load-sensitive concurrency class
 
@@ -1288,7 +1322,9 @@ stale) — watch it across Phase B, it shares words with the converted sites.
                                                               ft_inv MW's coarse arms were an
                                                               INSTRUMENT ARTIFACT (67f72278);
                                                               it now stops on a FINE trie at
-                                                              the orphan freeze (§9.1)
+                                                              the orphan freeze, whose
+                                                              carve-out has an EXACT bound
+                                                              (§9.1) — a FORK
     B0  per-op arm helper + record-time owner assert        ☑ LANDED — and its first
                                                               measurement says NO site is
                                                               owner-complete (11.9% of the
