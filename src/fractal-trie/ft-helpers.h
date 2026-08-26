@@ -2462,6 +2462,73 @@ void ft_pub_rec_add(struct ft_pub_rec *rec, struct cds_ft_inode_flag **slot,
 	rec->n++;
 }
 
+/*
+ * IS THE SKIP_X DUAL'S HOME A NODE THIS COMMIT BUILT?
+ *
+ * The dual lives in @cn's OWN parent, and the publish resolves that parent
+ * READ-YOUR-OWN-WRITES -- so when the SAME commit re-parents @cn, the dual's
+ * home MOVES, from the live node the descent fenced to the fresh copy this op
+ * built.  A fresh copy is BUILD-INVISIBLE: no peer can reach it, no lock is
+ * needed, and none is taken -- so a transacted record naming it as owner names
+ * a word the commit cannot be shown to own, and no owner encoding fixes that.
+ * The txn publishes REACHABILITY, not INTERIORS: a private node's body is wired
+ * by PLAIN STORES, and the dual write is exactly that.
+ *
+ * ☠ THE STORE IS DEMOTED, NEVER DROPPED.  The recompact copy loop resolved the
+ * old home's slots to their COMMITTED values, so the fresh copy is born holding
+ * the skip pointer to the OLD child -- stale the instant the forward publish
+ * lands.  Skipping the write would leave a candidate reader a shortcut straight
+ * to a retired node.
+ *
+ * ☞ THE TEST IS "DID THIS TXN RE-HOME @cn", asked of the DESCRIPTOR.
+ * urcu_txn_load cannot answer it: with no record on the slot it falls through
+ * to a fresh read, which is indistinguishable from "not re-homed".  The
+ * divergence of the two derivations is a weaker witness of the same fact.
+ *
+ * A ROOT dual (&ft->root) is excluded whatever the descriptor says: it lives in
+ * no node, it is reader-visible at all times, and it takes the always-MW root
+ * route.
+ *
+ * ☠ THIS LEANS ON ONE INVARIANT: a re-parent target is a FRESH cluster, never a
+ * live node (ft_reparent_record_meta says so, and every producer in the tree
+ * obeys it today).  A future re-homer that targets a LIVE node would turn this
+ * dispatch into a plain store into a live body -- silently.  The debug arm below
+ * is what would catch it: a re-home that did not MOVE the home is the shape that
+ * cannot be private.
+ */
+static inline
+bool ft_dual_home_is_private(struct cds_ft *ft, const struct ft_pub_rec *rec,
+		struct cds_ft_metadata *cn_meta,
+		struct cds_ft_inode_flag **skip_slot,
+		struct cds_ft_inode_flag *skip_owner_nf)
+{
+	struct urcu_txn_desc *desc;
+
+	if (!rec || !rec->mtxn || skip_slot == &ft->root || !skip_owner_nf)
+		return false;
+	desc = rec->mtxn->desc;
+	if (!desc || desc == URCU_TXN_ENOMEM)
+		return false;
+	if (!urcu_txn_find(desc, (void **) (uintptr_t) &cn_meta->parent_word))
+		return false;
+#if defined(DEBUG_RCU) || defined(CONFIG_RCU_DEBUG)
+	{
+		/*
+		 * THE INVARIANT, CHECKED WHERE IT IS CHEAP: a re-home that did
+		 * not MOVE the home cannot be private, and this is the arm that
+		 * would notice a future re-parent target that is a LIVE node.
+		 * Guarded on the same pair urcu_assert_debug itself is, so the
+		 * raw re-resolution costs a release build nothing.
+		 */
+		struct cds_ft_inode_flag *raw_owner = NULL;
+
+		(void) ft_txn_parent_slot_at(cn_meta, ft, NULL, &raw_owner);
+		urcu_assert_debug(raw_owner != skip_owner_nf);
+	}
+#endif
+	return true;
+}
+
 static
 void _ft_publish_to_parent_meta(struct cds_ft *ft,
 		struct cds_ft_inode_flag *parent_nf,
@@ -2645,7 +2712,9 @@ void _ft_publish_to_parent_meta(struct cds_ft *ft,
 					ft_skip_compressed_flag(new_child,
 						cn->len);
 
-				if (rec)
+				if (rec && !ft_dual_home_is_private(ft, rec,
+						cn_meta, skip_slot,
+						skip_owner_nf))
 					/* A COMPRESSED ROOT's dual slot IS
 					 * &ft->root (ft_txn_parent_slot's root
 					 * arm), so ask rather than assume. */
