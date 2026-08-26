@@ -3803,7 +3803,7 @@ int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 				ft_meta_lock_release(held_holder);
 			return -ENOMEM;
 		}
-#ifdef FT_HLIST_CLAIM_LISTON
+#ifdef FT_HLIST_CLAIM_PROMOTE
 		/*
 		 * §4 STEP B4's DRY RUN, the a3c75659 tool aimed at the
 		 * EXTERNAL-HEAD lane: point B0's owner assert at this txn so
@@ -3819,8 +3819,10 @@ int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		 * ☠ And read a miss as "the registry cannot SEE this hold"
 		 * before "the op does not HOLD it" (ft_flip_txn_owns).
 		 *
-		 * ☠☠ ITS OWN KNOB, because this lane has a KNOWN EXCLUSION GAP
-		 * and a shared knob would mask the other two behind it.
+		 * ☠☠ THE PROMOTE KNOB IS SEPARATE FROM THE HEAD-CLEAR ONE,
+		 * because BOTH promote arms carry a KNOWN EXCLUSION GAP and the
+		 * head clear provably does not -- one knob would mask the
+		 * armable lane behind the blocked ones.
 		 *
 		 * THE GAP, measured (ft_unit test_dup_chain_head_promotion, the
 		 * 15th test, --enable-rcu-debug): _ft_publish_to_parent_meta
@@ -3832,13 +3834,13 @@ int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		 * gives both edges the dispatching recorder, so an armed txn
 		 * would SW-PARK a word the op does not exclude.
 		 *
-		 * ☠ IT IS NOT SPECIFIC TO THIS LANE -- it is SLOT-SHAPED
+		 * ☠ IT IS NOT SPECIFIC TO THIS ARM -- it is SLOT-SHAPED
 		 * ([[feedback_a_site_inventory_cannot_cover_a_dynamic_slot]]).
-		 * The list-off twin and ft_unchain_node's head clear call the
-		 * same producer and their own comments name "a compressed
-		 * holder's SKIP_X dual"; the suite simply never built one there,
-		 * which is why their dry runs are clean and why a clean dry run
-		 * is NOT on its own a licence to arm them.
+		 * The LIST-OFF twin below carries it too, and its whole-suite dry
+		 * run was CLEAN: a constructed public-API repro aborts it.  A
+		 * clean dry run is evidence about the SUITE, not about the lane.
+		 * ☞ ft_unchain_node's head clear is the exception, and by
+		 * ROUTING rather than by luck -- see the detector there.
 		 *
 		 * ☞ The fix is per EDGE, not per site: ft_ord_cell_edge already
 		 * carries @owner and @root, and the missing third answer is
@@ -3944,8 +3946,16 @@ int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 				ft_meta_lock_release(held_holder);
 			return -ENOMEM;
 		}
-#ifdef FT_HLIST_CLAIM
-		/* §4 STEP B4's DRY RUN -- see the promote arm above. */
+#ifdef FT_HLIST_CLAIM_PROMOTE
+		/*
+		 * §4 STEP B4's DRY RUN.  The SAME knob as the list-on arm above,
+		 * because this arm carries the SAME gap -- PROVEN by construction,
+		 * not inferred: a 60-line public-API program (list-off trie, four
+		 * duplicates of one key, remove the head) aborts at
+		 * ft-mutation-helpers.h:3108 on a build whose whole-suite dry run
+		 * was CLEAN.  The suite never builds a skip-encoded holder here;
+		 * that is a COVERAGE ARTIFACT, not an invariant.
+		 */
 		ft_flip_txn_claim_per_op_armable(ft, txn);
 #endif
 		prev_save = rcu_dereference(next_node->prev);
@@ -4170,7 +4180,11 @@ int ft_unchain_node(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 			return -ENOMEM;
 		}
 #ifdef FT_HLIST_CLAIM
-		/* §4 STEP B4's DRY RUN -- see the promote arm above. */
+		/*
+		 * §4 STEP B5's DRY RUN.  Its OWN knob, apart from the two
+		 * promote arms, because this lane does NOT carry their SKIP_X
+		 * dual gap and a shared knob would hide that behind their abort.
+		 */
 		ft_flip_txn_claim_per_op_armable(ft, txn);
 #endif
 		/*
@@ -4189,6 +4203,46 @@ int ft_unchain_node(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 			(struct cds_ft_inode_flag **) head_slot, NULL,
 			(struct cds_ft_inode_flag *) node, &rec);
 		n_s = ft_pub_rec_sedges(&rec, sedges);
+		/*
+		 * THIS LANE EMITS NO SKIP_X DUAL, and the arm below depends on
+		 * it, so a DETECTOR says so rather than a comment.
+		 *
+		 * The dual arm of _ft_publish_to_parent is gated on
+		 * ft_node_compressed(@parent_nf), and this branch is only
+		 * reachable with @parent_nf NULL (interior relink) or INTERNAL:
+		 * _cds_ft_remove_locked routes a COMPRESSED holder by whether
+		 * @node has a successor -- none goes to ft_detach_node, one or
+		 * more goes to the PROMOTE arm above -- so the head clear never
+		 * sees a compressed holder, and the remaining call sites pass an
+		 * internal holder_flag.  (The branch comment naming "a compressed
+		 * holder's SKIP_X dual" is stale.)
+		 *
+		 * ☠ A ROUTING INVARIANT IS A CODE FACT, AND CODE MOVES.  The two
+		 * promote arms sit one page away and DO emit the dual into a
+		 * grandparent they never acquire; a clean dry run did not catch
+		 * that there, so this lane's arm is not resting on one either.
+		 * Armed under --enable-rcu-debug, which the gate runs at three
+		 * spacings across four configs.
+		 */
+		urcu_assert_debug(n_s < 2);
+		/*
+		 * PHASE B, STEP B5 -- THE ARM.  ft_flip_txn_hold_or_lock_parent
+		 * above is this lane's LAST ft_flip_txn_lock_register (its held
+		 * arm registers @hmeta and records the release; its unheld arm
+		 * acquires-or-guards @parent_nf), and the publish below plants
+		 * the first record after it.
+		 *
+		 * ☞ WHAT IT CONVERTS is the head-slot clear, owned by
+		 * @parent_nf -- the word the fence above holds.  The detector
+		 * beside it is what makes that the WHOLE of what it converts:
+		 * with no dual, the publish is a lone structural edge and there
+		 * is no second owner to answer for.
+		 *
+		 * ☞ READINESS: -DFT_HLIST_CLAIM claims at txn CREATION,
+		 * strictly earlier, and is clean on ft_unit and ft_inv
+		 * FT_INV_MW=1 both.
+		 */
+		ft_flip_txn_arm_per_op(ft, txn);
 		ft_hlist_freeze_prepare(ft_flip_txn_handle(txn), node);
 		int cret = ft_flip_status_to_errno(
 			ft_ord_cell_flip_into(ft, txn, sedges, n_s));
