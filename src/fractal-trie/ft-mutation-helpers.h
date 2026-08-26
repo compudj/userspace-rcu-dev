@@ -7812,9 +7812,13 @@ struct ft_glue_free_item {
 	 * and the same argument): a SURVIVING anchor is clean and re-lockable the
 	 * instant the release settles, and under a coarse spacing every op wants
 	 * that same ancestor, so a later "release it if it is still held" reads
-	 * back a PEER's fresh mark and strips it.  Only an anchor that IS the
-	 * retired node stays with the sweep: the acquire refuses a TOMBSTONE, so
-	 * a LOCK still set on that word can only be ours.
+	 * back a PEER's fresh mark and strips it.
+	 *
+	 * ☞ An anchor that IS the retired node cannot be stolen that way -- the
+	 * acquire refuses a TOMBSTONE, so a LOCK still set on that word can only
+	 * be ours -- which makes the sweep SUFFICIENT there, not required.  It
+	 * goes to the txn all the same, because the retire RECORD names that node
+	 * as its owner and a record-time owner check has only locks[] to read.
 	 */
 	bool holder_txn_owned;
 };
@@ -10103,13 +10107,58 @@ void ft_glue_tombstone_free_list(struct ft_glue *g)
 			if (cur & FT_STATE_TOMBSTONE)
 				g->free_list[i].retired = false;
 			/*
-			 * @meta takes the TOMBSTONE, its anchor the RELEASE --
-			 * fused back into the one {LOCK|s -> TOMBSTONE|s} record
-			 * whenever the anchor IS @meta, which is always under
-			 * per-node.  A member that deduped onto a word this op
-			 * already holds owes no release: the acquire that first
-			 * took it recorded one, and a second settles one word
+			 * The retire is fused back into the one
+			 * {LOCK|s -> TOMBSTONE|s} record whenever the anchor IS
+			 * @meta, which is always under per-node.  A member that
+			 * deduped onto a word this op already holds owes no
+			 * release and no registry entry: the acquire that first
+			 * took it recorded both, and a second settles one word
 			 * twice.
+			 */
+			/*
+			 * THE MARK GOES TO THE TXN BEFORE THE RECORD IT COVERS,
+			 * and for BOTH anchor shapes.
+			 *
+			 * The retire below is a record whose owner is @meta, and
+			 * a record-time owner check reads the txn's locks[] and
+			 * nothing else -- so a registry entry that arrives after
+			 * it (or, where the anchor IS @meta, never) reads as a
+			 * word the commit does not own.  Registering the anchor
+			 * at the acquire with its terminal recorded afterwards is
+			 * the shape ft_chain_compress_register_retire already
+			 * uses for exactly these retires, and it gates on nothing
+			 * but @shared.
+			 *
+			 * ★ THE FORMER `h.lock != meta` GATE WAS ABOUT SAFETY, NOT
+			 * ABOUT THE REGISTRY.  A SURVIVING anchor MUST leave the
+			 * sweep -- it is clean and re-lockable the instant the
+			 * release settles, so a later "is it still locked?" reads
+			 * a PEER's fresh mark and strips it -- while a mark whose
+			 * terminal is @meta's own TOMBSTONE cannot be stolen that
+			 * way, the acquire refusing a TOMBSTONE.  That makes the
+			 * sweep merely SUFFICIENT there, not required, and the
+			 * registry the answer to a question the sweep cannot be
+			 * asked.  Under per-node the anchor IS @meta always, so
+			 * the gate skipped the common case entirely.
+			 *
+			 * @holder_txn_owned follows the registration, both shapes:
+			 * one owner per fence, and it is now the txn -- commit OK
+			 * consumes the mark through its terminal, every other
+			 * outcome drains locks[] (ft_flip_txn_lock_release_all),
+			 * and ft_glue_clear_fenced must not clear it a second time.
+			 * The registry is bounded by the FAN-OUT (257), which no
+			 * glue free list approaches.
+			 */
+			if (!h.shared) {
+				ft_flip_txn_lock_register(g->txn, h.lock,
+					h.lock_snap);
+				g->free_list[i].holder_txn_owned = true;
+			}
+			/*
+			 * @meta takes the TOMBSTONE, its anchor the RELEASE.  The
+			 * @h.lock == @meta arm consults no ctx, so the
+			 * registration above cannot have moved which arm this
+			 * takes.
 			 */
 			{
 				struct ft_lock_ctx fctx;
@@ -10118,27 +10167,14 @@ void ft_glue_tombstone_free_list(struct ft_glue *g)
 				ft_flip_txn_record_retire_anchored(g->txn,
 					&fctx, &h, meta);
 			}
-			if (!h.shared) {
+			/*
+			 * A no-op where the anchor IS @meta (the fused terminal
+			 * above is the whole story) -- ft_flip_txn_record_anchor_release
+			 * returns early on that shape.
+			 */
+			if (!h.shared)
 				ft_flip_txn_record_anchor_release(g->txn, &h,
 					meta);
-				/*
-				 * A SURVIVING anchor goes to the txn outright --
-				 * release record above, registry entry here -- so
-				 * ft_glue_clear_fenced stops owning it.  The txn is
-				 * the only owner that can tell a consumed mark from
-				 * a peer's fresh one: commit OK consumes it through
-				 * the release, every other terminal drains the
-				 * registry.  Where the anchor IS @meta the fused
-				 * terminal is the whole story and the mark stays
-				 * with the sweep, which costs no registry slot and
-				 * keeps per-node granularity byte-identical.
-				 */
-				if (h.lock != meta) {
-					ft_flip_txn_lock_register(g->txn,
-						h.lock, h.lock_snap);
-					g->free_list[i].holder_txn_owned = true;
-				}
-			}
 			continue;
 		}
 		/*
