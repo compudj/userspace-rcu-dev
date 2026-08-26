@@ -2204,13 +2204,27 @@ bool ft_flip_txn_holds(const struct ft_flip_txn *t,
  * the node whose lock excludes every other writer of that word (§8), one this
  * txn holds?
  *
- * The registry is the honest question to ask HERE.  ft_held_set_snap reaches
- * wider (extras, glue, outer frames), but a record helper has only the txn:
- * the op's ft_held_set lives on a stack frame the record cannot see.  That is
- * not a gap being papered over -- a lock whose TERMINAL this commit records
- * must be registered on this commit anyway, or the two terminal paths cannot
- * clear it -- so a word owned by a lock absent from the registry is a finding,
- * not a false negative.
+ * The registry is the honest question to ask HERE, for a mechanical reason: a
+ * record helper has only the txn.  ft_held_set_snap reaches wider (extras,
+ * glue, outer frames), but the op's ft_held_set lives on a stack frame the
+ * record cannot see.
+ *
+ * ☠ THE STRONGER JUSTIFICATION THAT USED TO STAND HERE IS FALSE, and it was
+ * load-bearing for reading every miss as a finding: "a lock whose TERMINAL this
+ * commit records must be registered on this commit anyway, or the two terminal
+ * paths cannot clear it".  The orphan freeze is a deliberate counterexample --
+ * ft_detach_freeze_one records the fused {LOCK|s -> TOMBSTONE|s} terminal on
+ * this commit and registers NOTHING when the anchor IS the retired node,
+ * because that terminal leaves the word TOMBSTONE, ft_meta_lock_acquire refuses
+ * a tombstone forever, and the caller's unconditional release_if_held sweep is
+ * therefore correct on BOTH outcomes with no per-commit bookkeeping.  It also
+ * cannot register: an orphan chain is FT_MAX_DEPTH long and the registry is
+ * FT_ENTRY_PER_NODE + 1, the same number.
+ *
+ * So a miss here is a finding at the sites whose clearing the txn owns, and a
+ * VISIBILITY gap at the sites whose clearing stays with a sweep.  Read it as
+ * "the registry cannot see this hold", never as "the op does not hold it", and
+ * check which of the two before acting.
  *
  * NULL @owner is a MISS: see FT_OWNER_ASSERT_OWNED.
  *
