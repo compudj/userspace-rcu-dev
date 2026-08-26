@@ -3803,6 +3803,55 @@ int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 				ft_meta_lock_release(held_holder);
 			return -ENOMEM;
 		}
+#ifdef FT_HLIST_CLAIM_LISTON
+		/*
+		 * §4 STEP B4's DRY RUN, the a3c75659 tool aimed at the
+		 * EXTERNAL-HEAD lane: point B0's owner assert at this txn so
+		 * every record it plants without owning is named at an abort,
+		 * on a build otherwise byte-identical to the unarmed one.
+		 *
+		 * ☞ CLAIMED AT CREATION, EARLIER THAN THE ARM WOULD BE -- so
+		 * read a miss as "this record is planted before its owner is
+		 * registered" FIRST.  That ORDERING class is what e9268e13
+		 * closed for this very lane by hoisting the holder's fence
+		 * ABOVE the back edge.
+		 *
+		 * ☠ And read a miss as "the registry cannot SEE this hold"
+		 * before "the op does not HOLD it" (ft_flip_txn_owns).
+		 *
+		 * ☠☠ ITS OWN KNOB, because this lane has a KNOWN EXCLUSION GAP
+		 * and a shared knob would mask the other two behind it.
+		 *
+		 * THE GAP, measured (ft_unit test_dup_chain_head_promotion, the
+		 * 15th test, --enable-rcu-debug): _ft_publish_to_parent_meta
+		 * emits TWO structural edges when the holder is skip-encoded --
+		 * the forward @head_slot, owned by @parent_nf and REGISTERED by
+		 * the fence above, and a SKIP_X DUAL into the GRANDPARENT's
+		 * body, owned by a node this op never acquires (in the repro it
+		 * is the ROOT node's slot at item+8).  ft_ord_cell_flip_into
+		 * gives both edges the dispatching recorder, so an armed txn
+		 * would SW-PARK a word the op does not exclude.
+		 *
+		 * ☠ IT IS NOT SPECIFIC TO THIS LANE -- it is SLOT-SHAPED
+		 * ([[feedback_a_site_inventory_cannot_cover_a_dynamic_slot]]).
+		 * The list-off twin and ft_unchain_node's head clear call the
+		 * same producer and their own comments name "a compressed
+		 * holder's SKIP_X dual"; the suite simply never built one there,
+		 * which is why their dry runs are clean and why a clean dry run
+		 * is NOT on its own a licence to arm them.
+		 *
+		 * ☞ The fix is per EDGE, not per site: ft_ord_cell_edge already
+		 * carries @owner and @root, and the missing third answer is
+		 * whether the OP HOLDS that owner -- the same shape
+		 * ft_flip_txn_record_parent_word already takes as @child_held.
+		 * Where the op does hold it (ft_detach_node's republish holds
+		 * the recompact's {P,GP}) the dual is a real conversion, so a
+		 * blanket always-MW would give that back.  Which of the two --
+		 * carry the flag, or extend these ops' lock-set to the
+		 * grandparent -- is a DESIGN call, not this step's to assume.
+		 */
+		ft_flip_txn_claim_per_op_armable(ft, txn);
+#endif
 		new_cell = ft_ord_cell_ptr(new_cell_flag);
 		cds_ft_item_to_metadata(new_cell)->incoming_byte =
 			cds_ft_item_to_metadata(old_cell)->incoming_byte;
@@ -3895,6 +3944,10 @@ int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 				ft_meta_lock_release(held_holder);
 			return -ENOMEM;
 		}
+#ifdef FT_HLIST_CLAIM
+		/* §4 STEP B4's DRY RUN -- see the promote arm above. */
+		ft_flip_txn_claim_per_op_armable(ft, txn);
+#endif
 		prev_save = rcu_dereference(next_node->prev);
 		inherit = rcu_dereference(node->prev);
 		if (caa_unlikely(ft_node_flip_proxy(
@@ -4116,6 +4169,10 @@ int ft_unchain_node(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 				ft_meta_lock_release(hmeta);
 			return -ENOMEM;
 		}
+#ifdef FT_HLIST_CLAIM
+		/* §4 STEP B4's DRY RUN -- see the promote arm above. */
+		ft_flip_txn_claim_per_op_armable(ft, txn);
+#endif
 		/*
 		 * VALIDATE (§4.B): guard the LIVE holder this head-clear publishes
 		 * into.  Holding its lock (hmeta): record the {LOCK|s -> s}
