@@ -964,6 +964,48 @@ void ft_rekey_collapse_free_unpublished(struct cds_ft *ft,
  */
 #define FT_REKEY_UNCOVERED_AFTER	4096
 
+/*
+ * HAND THE FOLD'S OUT-OF-REGISTRY MARKS TO @txn, at the TAKE.
+ *
+ * ft_rekey_cow_stop's fences live in a fn-scope array rather than a lock-SET --
+ * it reaches 17 distinct anchors on the unit fixture, and a set is the unit the
+ * MCAS install SORTS for deadlock-free acquisition, so the array is the right
+ * home for them.  But "not a set" was read as "not in the registry either", and
+ * the registry is a different question: it is what a RECORD-time owner check can
+ * see (ft_flip_txn_owns reads locks[] and nothing else).
+ *
+ * Every later acquire of one of these words DEDUPES against the array through
+ * @held.extra and correctly registers nothing of its own (ft_glue_acquire_
+ * reparent_marks' @h.shared arm), so without this the registry never learns the
+ * word by ANY route -- and the re-parent records those marks exist to license
+ * name it as their owner.
+ *
+ * Registration TRANSFERS the clear (ft_unlock_held's header), so @txn_owned
+ * follows it and the post-abort sweep must skip those entries -- one owner per
+ * fence.  A SHARED mark transfers nothing: the acquire that FIRST took the word
+ * owns both.  Idempotent, so a caller may re-run it as the array grows.
+ *
+ * The release records stay where they are (the marks loop before the commit):
+ * ft_flip_txn_record_anchor_release_held reads the word through the txn and
+ * chains onto whatever is already recorded there, so it is order-independent by
+ * construction -- what was NOT order-independent is the registration, which
+ * every record between here and there needs.
+ */
+static
+void ft_rekey_marks_to_txn(struct ft_flip_txn *txn,
+		struct ft_held_anchor *marks, unsigned int nr_marks)
+{
+	unsigned int i;
+
+	for (i = 0; i < nr_marks; i++) {
+		if (marks[i].shared || marks[i].txn_owned)
+			continue;
+		ft_flip_txn_lock_register(txn, marks[i].lock,
+			marks[i].lock_snap);
+		marks[i].txn_owned = true;
+	}
+}
+
 static
 int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		const uint8_t *src_key, size_t src_len,
@@ -1781,6 +1823,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 			ft_flip_txn_destroy(txn);	/* pre-commit bail: destroy caller-owned */
 			goto sweep;
 		}
+		ft_rekey_marks_to_txn(txn, marks, nr_marks);
 	}
 
 	/*
@@ -2627,6 +2670,8 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 					goto bail_build;
 				}
 				nr_marks++;
+				/* Same handover, for the mark that lands late. */
+				ft_rekey_marks_to_txn(txn, marks, nr_marks);
 				/*
 				 * Tell the glue we already hold this one.  The split
 				 * build DEFERS this same child, and
@@ -3323,9 +3368,14 @@ sweep:
 	 * concurrent yet, which is why this was invisible; it has to be right
 	 * before it is.
 	 */
+	/*
+	 * ...and NEVER a mark the txn owns (@txn_owned): its clear rides
+	 * ft_flip_txn_lock_release_all, whose release is the STRICT one, so a
+	 * second clear here would leave that assert reading an already-clean word.
+	 */
 	if (!marks_consumed)
 		for (i = 0; i < nr_marks; i++)
-			if (!marks[i].shared)
+			if (!marks[i].shared && !marks[i].txn_owned)
 				ft_meta_lock_release_if_held(marks[i].lock);
 	return ret;
 }
