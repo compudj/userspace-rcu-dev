@@ -722,6 +722,18 @@ Read the three rows apart and they are three different things:
   the escalation model's §8.2 already says for the `parent` pointer, against
   what the code does.
 
+  ☑ **THE KIND IS SETTLED AHEAD OF THAT ANSWER, AT EVERY SITE** — `5fa631c7`
+  ruled it and converted one; `4da182f2` converted the other seven records,
+  behind one named helper (`ft_flip_txn_record_head_back_edge`). Whoever ends
+  up owning the word, NO op can hold it today, so it is
+  `ft_flip_txn_record_parent_word`'s permanent false arm and takes the
+  always-MW `ft_flip_txn_record_root` treatment. The last one needed the
+  `ft_pub_rec` detour removed rather than a kind swap — a rec's per-edge
+  answers are `@root` and `@owner`, and neither can say "always MW" — which
+  also retired `ft_pub_rec_add_back_edge` into `ft_record_child_back_edge`.
+  What stays open is only OWNERSHIP, and it is Phase C's ledger to re-examine
+  now that the traffic has left the MW_STRUCT surface.
+
 ☐ **Still unproven for all three, and it must not be skipped**: owner-AVAILABLE
 is not owner-SUFFICIENT. Nobody has yet shown the holder's lock EXCLUDES every
 writer of a chain member's `->prev` — an insert adding a duplicate, a
@@ -752,8 +764,13 @@ claimed exclusion argument:
    and all four producers name it. Every such slot is a BODY slot, so the owner
    is the node the slot LIVES IN — which is not always `@parent_nf`, and
    `695d23c1` fixed the one caller that passes it for a different job.
-   ☐ REMAINDER: the rec → `ft_ord_cell_edge` conversions copy `.root` and DROP
-   `.owner`, which is why `ft-remove.h:3958` still reads 0%.
+   ☑ REMAINDER LANDED `b7334aa4`: the rec → `ft_ord_cell_edge` conversions
+   copied `.root` and DROPPED `.owner` at all three (`ft_pub_rec_sedges`
+   assigned `.root` TWICE, and the second of those was the owner), so every
+   converted edge reached the engine owner-NULL however well the producer had
+   named it. Byte-neutral in a release build — `ft_flip_txn_record_tag` reads
+   `@owner` only for the assert and the counters, and parks on
+   `@t->structural_sw` alone.
 4. `ft-remove.h:882` — the detach-side creator (7.8M; 41.9% held, the closest
    to ready, and also the largest content-lane abort source).
 5. The remaining content sites in descending count.
@@ -873,6 +890,66 @@ collision unlink is implemented but banked, the abut duplicate-slot fix
 next). This thread OWNS the only armed SW content site — it stays the
 conversion's live proving ground and should land ahead of Phase B's remove
 sites, which share its machinery.
+
+#### ☐ WHERE `-DFT_REKEY_CLAIM` STOPS NOW — a FORK, not a conversion
+
+Seven items closed (`695d23c1`, `d67851c6`, `bec0c726`, `280fdac1`,
+`c6ac8c42`, `b7334aa4`, `4da182f2`); the claim now reaches ft_unit **test 118**
+(was 113). The next abort is the FIRST one that is not plumbing:
+
+    ft_chain_compress_fused (ft-remove.h:1320)  -- the collapse's forward
+      republish into publish_parent's body, reached through ft_detach_node
+      from ft_rekey_graft_simple_attempt's detach-fold
+
+The record NAMES its owner correctly (it is a body slot; the owner is the node
+it lives in) and **the op really does hold that word** — proven at the abort:
+`owner->state` carries `FT_STATE_LOCK`, and `glue.publish_gp_holder == owner`
+with `publish_gp_shared == false`, on a single-threaded run where no peer could
+have set it. What fails is only the WITNESS: `ft_flip_txn_owns` reads
+`t->locks[]` and nothing else, and a glue fence reaches that registry only at
+`ft_glue_publish`, which runs AFTER the detach.
+
+☠ **AND THE OBVIOUS FIX IS THE WRONG ONE.** Hoisting the
+`ft_flip_txn_lock_register` to the take (`ft-rekey.h:2048`) breaks two rules the
+tree states explicitly:
+
+* Registration TRANSFERS the unlock to the txn (`ft_unlock_held`'s header),
+  while `ft_glue_abort` still clears the same fence `_if_held` on every bail —
+  and it runs BEFORE `ft_flip_txn_destroy` on all of them, so the strict
+  `ft_meta_lock_release` in `ft_flip_txn_lock_release_all` would then assert on
+  a cleared word. The tree's idiom for this is a `_txn_owned` flag
+  (`ft_glue_free_entry`'s `@holder_txn_owned`), not a bare hoist.
+* A COMMITTED txn does NOT drain its registry — the terminals do. So a
+  registration is only sound where the commit is guaranteed to record that
+  word's terminal, which is exactly why the register sits beside the release
+  record today. Moving the RELEASE record early instead is worse: the same op
+  may later RETIRE that node, and one word takes one terminal with the retire
+  outranking.
+
+So the two candidates are:
+
+  **(A) Widen the predicate.** Give `struct ft_flip_txn` a back-pointer to the
+  glue that binds it (`glue.txn = txn` already exists in the other direction)
+  and let `ft_flip_txn_owns` fall through to `ft_glue_held_snap` — which is
+  already forward-declared beside the held-set helpers, above every record
+  helper. This is what the tree's own lesson says: a narrow held-predicate is a
+  FAST PATH, and `ft_lock_ctx_holds` is the width that ANSWERS (txn `locks[]`,
+  `extra`, glue+peer, the `outer` chain). It changes no fence ownership and no
+  commit-time accounting, but it DOES change B0's mechanism and its OWN_* split,
+  so it is a plan change.
+
+  **(B) Transfer fence ownership at the take**, per the `@holder_txn_owned`
+  idiom: register on the txn at `ft-rekey.h:2048`, flag the glue field so
+  `ft_glue_abort` stops owning it, drop the now-duplicate register at
+  `ft_glue_publish` and keep the release record there (so the retire self-guard
+  still decides the terminal). Bigger, and it owes a proof that every COMMITTING
+  path records that fence's terminal.
+
+☞ **Needs Mathieu.** (A) is small and matches the stated width of the held set;
+(B) is what B0's "a lock whose terminal this commit records must be registered
+on this commit anyway" argues for. They are not equivalent: (A) accepts that a
+record helper may consult a wider witness than the txn, (B) insists the txn is
+the witness.
 
 ### 9.2 The load-sensitive concurrency class
 
@@ -1056,7 +1133,11 @@ stale) — watch it across Phase B, it shares words with the converted sites.
                                                               (658989ef) enumerates the
                                                               first, abort by abort;
                                                               695d23c1 / d67851c6 / bec0c726
-                                                              landed
+                                                              / 280fdac1 / c6ac8c42 /
+                                                              b7334aa4 / 4da182f2 landed —
+                                                              the claim now reaches ft_unit
+                                                              118, and its next abort is a
+                                                              FORK, not a conversion (§9.1)
     B0  per-op arm helper + record-time owner assert        ☑ LANDED — and its first
                                                               measurement says NO site is
                                                               owner-complete (11.9% of the
