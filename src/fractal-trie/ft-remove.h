@@ -3120,6 +3120,34 @@ int ft_detach_node(struct cds_ft *ft,
 						commit_txn, &lctx,
 						iter_node_flag, cur_depth);
 				}
+				/*
+				 * PHASE B, STEP B2 -- THE ARM.  The guard/release
+				 * above is this path's LAST ft_flip_txn_lock_register,
+				 * and ft_remove_one_commit below plants the first
+				 * record after it, so this is where
+				 * ft_flip_txn_arm_per_op's "after the op's last
+				 * register" contract puts it.  The helper applies the
+				 * lock_fine, per-node-spacing and empty-registry
+				 * refusals itself.
+				 *
+				 * ☞ WHAT IT CONVERTS IS THE TAIL, and that is a
+				 * property of this op rather than a gap.  ft_detach_node
+				 * interleaves registers and records -- the orphan
+				 * freezes and the recompact/collapse edges are planted
+				 * EARLIER on this same txn and stay MW, which is
+				 * stricter and always sound.  Converting them needs
+				 * their own arm points, each with its own last-register
+				 * to sit after; that is a later step, not something
+				 * this one leaves half-done.
+				 *
+				 * ☞ The dry run (-DFT_REMOVE_CLAIM) claims at txn
+				 * CREATION -- strictly earlier than here -- and is clean
+				 * on both suites, so every record on this txn already
+				 * passes the owner check, not merely the ones this arm
+				 * converts.
+				 */
+				if (commit_txn)
+					ft_flip_txn_arm_per_op(ft, commit_txn);
 				ret = ft_remove_one_commit(ft, pub->slot,
 					pub->slot_owner,
 					pub->old_val, pub->new_val,
