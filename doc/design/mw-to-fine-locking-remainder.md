@@ -984,26 +984,56 @@ because it IS the status quo's policy behind one entry point.
 sweep" (`ft-lifecycle.h:355-375`). **Phase E is the prerequisite for CERTIFYING
 the coarse SW fallback, not for consolidating the arm.**
 
-☑→☠ **THE LANDING WAS ATTEMPTED AND MUST BE REVERTED — one gate leg HANGS.**
-The shape is right: `ft_flip_txn_arm_per_op(ft, txn); if (!txn->structural_sw &&
-ft->lock_fine && !ft_txn_content_sw_ok(ft)) ft_flip_txn_set_structural_sw(txn,
-true);` after `ft_rekey_marks_to_txn`, assert below it, both hand-arms gone.
-**64 of 65 gate legs identical to control**, ft_unit 315/3 deliberate and ft_inv
-`FT_INV_MW=1` 119/119 at per-node, reach 278,544 / armed 236,182 (all 42,362
-refusals trie-wide).
-☠☠ **`nocompress` ft_unit per-node: TIMEOUT/HANG after 111 tests** — a LIVELOCK,
-not an assert, in a config the coarse-spacing argument does not cover and one
-that is shippable. Every other leg, all three spacings included, matched.
-☞ **THE SUSPECT IS FENCE-CLEAR OWNERSHIP, not the arm.** Registration TRANSFERS
-the clear (`@txn_owned`), and this landing registers marks EARLIER and at MORE
-growth points than before. The driver's sweep was given `!marks[i].txn_owned`;
-`ft_rekey_cow_stop`'s own bail paths and the writer's sweep were NOT audited. A
-mark that is registered but released by neither owner leaves a LOCK set on a live
-node, and the next op to anchor there refuses it forever — which is exactly what
-a hang with no assert looks like. ONE OWNER PER FENCE.
-☞ **NEXT**: audit every path that releases `marks[]` in `ft-rekey.h` for
-`txn_owned`, then re-run — `nocompress` at per-node is the canary, and it is NOT
-in the per-node smoke pair, which is why two green suites missed it.
+☑→☠→☑ **THE LANDING: ATTEMPTED, HUNG, ROOT-CAUSED.**  The shape is right; the
+PLACEMENT was wrong, and the fence-ownership suspect this entry named was WRONG.
+
+☠☠ **ROOT CAUSE — the arm was moved onto a branch one caller never visits.**
+Retiring the hand-arm at txn creation and putting the helper arm inside
+`ft_rekey_cow_stop` leaves the **merge_dst** branch of
+`ft_rekey_graft_simple_attempt` with NO arm point at all: `cow_stop` is called
+only on `!merge_dst`.  That branch then runs all-MW, and its MW edges on the
+state words the op ITSELF fenced expect `live_state`, read the op's OWN LOCK
+marks, and abort the commit **deterministically — no peer needed**.  The retry
+wrapper re-plans the identical shape forever.  It is the SAME livelock this
+entry already documented, reached by a BRANCH-shaped route rather than a
+spacing-shaped one.
+Proof, from the hung process: `txn->structural_sw = false`, `merge_dst = true`,
+`nr_marks = 0` (cow_stop never entered), commit returning `ABORT` repeatedly with
+`nr_locks = 4` climbing fresh every round.  `nocompress` is the only gate leg
+whose ft_unit drives that fold — with compression on, the shape gates route this
+rekey elsewhere.  A COVERAGE ARTIFACT, the §9.5 class again.
+
+☠ **THE `@txn_owned` SUSPECT IS REFUTED.**  No fence is leaked: `acquire_miss`
+is false and `nr_locks` climbs fresh each retry (a leaked LOCK would fail the
+next round's ACQUIRE, not its commit), and the release audit HOLDS — every
+`goto sweep` in the writer is destroy-preceded, `bail_build` routes through
+`ft_flip_txn_destroy`, commit-OK consumes registered marks via state edges,
+commit-ABORT clears them via `ft_flip_txn_lock_release_all`, and both sweeps skip
+`txn_owned`.  The registration half of the patch was always sound.
+
+☑ **THE SMALLEST CORRECT LANDING** (verified: restores `nocompress` to
+316 ok / 2 deliberate, byte-identical to control):
+  1. Put the arm+fallback pair **at txn CREATION** in
+     `ft_rekey_graft_simple_attempt` and in `_cds_ft_debug_cow_replace_root` —
+     where the hand-arm was.  At creation `nr_locks == 0`, so the helper always
+     declines and the FALLBACK carries correctness; this covers EVERY branch,
+     merge_dst included.
+  2. KEEP the arm-at-take inside `cow_stop` (idempotent).  At creation the helper
+     can never CLAIM (the per-op owner assert needs `nr_locks > 0`), so the
+     take-site arm is what buys B6's audit value on that path.
+  3. Keep the registration at every growth point and both `txn_owned` sweep
+     clauses — they closed the ordering findings and audit clean.
+  4. RESTORE `assert(txn->structural_sw)` at `cow_stop`'s top; valid again at
+     every spacing and every caller.
+  5. **ADD `assert(txn->structural_sw)` immediately before the writer's
+     `ft_flip_txn_commit`** — the commit is the one choke point EVERY branch
+     crosses, and that assert would have turned this hang into a named abort.
+  6. Optional: fold the pair into one `ft_flip_txn_arm_structural` helper so
+     neither site has a naked `set_structural_sw`.
+★ **THE LESSON THIS COST**: a CLAIM belongs at a choke point every path crosses,
+even where the ARM cannot live.  Moving the assert WITH the arm made the
+un-armed branch the un-asserted branch, which is why a livelock presented as a
+silent hang.
 
 ☠ **THE RED CELLS WERE ALREADY RED AT HEAD, and this entry hid it.** On a clean
 tree with the gate's anchorval flags, ft_unit dies at **294** (exponential) and
