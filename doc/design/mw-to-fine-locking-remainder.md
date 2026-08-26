@@ -771,7 +771,18 @@ claimed exclusion argument:
    the replay — this session paid twice for that shape.
    ☞ The dry run is now clean on ft_unit AND ft_inv `FT_INV_MW=1`, and it claims
    EARLIER than an arm would, so it covers strictly more records than an arm
-   converts. NOT ARMED yet.
+   converts — the readiness is established for every arm point on this txn, not
+   just the first.
+   ☑ **IN-PLACE PUBLISH PATH ARMED** `6024f167`, after
+   `ft_remove_one_commit`'s last register. ☠ **AND THE MEASUREMENT IS THE
+   FINDING**: `created 4,854,685 / armSW 34,685 / SW 79,951 / MW_STRUCT
+   12,522,790` — roughly 0.7% of the site's txns reach an armed state, and part
+   of that 34,685 is the rekey fold's hand-arm already attributed here. So the
+   remove surface does NOT commit through this path. ☐ The recompact / collapse
+   edges are planted earlier on the same txn and need their own arm points, each
+   after its own last register. That is B2's remainder.
+   ☠ A cross-run delta against the unarmed measurement is NOT sound — ft_inv's
+   totals move run to run, so columns compare only within one run.
    ☞ `OWN_MISS` barely moves (1,457,049 → 1,400,696 of MW_STRUCT 12.9M) and that
    is the expected shape: the counter prices records on txns the arm refuses
    outright, which the assert exempts via `!nr_locks`. Read the DRY RUN as the
@@ -1373,9 +1384,12 @@ stale) — watch it across Phase B, it shares words with the converted sites.
                                                               RED at exponential + root-only
     B2-5 four hot sites, one at a time                      (each: owner-complete -> claim
                                                               dry-run -> arm; NOT mechanical).
-                                                              B2 is OWNER-COMPLETE a9ff9549
-                                                              after ONE fix; dry run clean on
-                                                              both suites, not yet armed
+                                                              B2 OWNER-COMPLETE a9ff9549 after
+                                                              ONE fix; its in-place path ARMED
+                                                              6024f167 -- but that is 0.7% of
+                                                              the site, so B2's remainder is
+                                                              arm points for the recompact /
+                                                              collapse edges
     B6  retire hand-arming (rekey writer, root COW)         (small)
     C   re-measure; G4 cell-lane decision                   (gate + data)
     G5  subtree freeze-state gate design (hybrid D)         (design, w/ D)
