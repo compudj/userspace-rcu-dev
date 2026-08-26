@@ -3894,6 +3894,20 @@ int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 			ft_flag_to_metadata(ft, parent_nf),
 			(void **) &next_node->prev,
 			next_node->prev, new_cell_flag);
+		/*
+		 * PHASE B, STEP B4 -- THE ARM.  ft_flip_txn_hold_or_lock_parent
+		 * above is this arm's LAST ft_flip_txn_lock_register, and the
+		 * publish below plants the first record after it.
+		 *
+		 * ☞ WHAT UNBLOCKED IT is the per-edge @owner_held: this op holds
+		 * the HOLDER (the forward @head_slot's owner) and NOT the
+		 * grandparent, so the SKIP_X dual now records MW on its own
+		 * account instead of riding the txn's armed mode.  Before that,
+		 * arming here would have SW-parked a word the op never acquired
+		 * -- reproduced through the PUBLIC API, on a build whose
+		 * whole-suite dry run was clean.
+		 */
+		ft_flip_txn_arm_per_op(ft, txn);
 		_ft_publish_to_parent_meta(ft, parent_nf,
 			(struct cds_ft_inode_flag **) head_slot,
 			(struct cds_ft_inode_flag *) next_node,
@@ -3975,6 +3989,10 @@ int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		ft_flip_txn_record_reserved(txn,
 			ft_flag_to_metadata(ft, parent_nf),
 			(void **) &next_node->prev, prev_save, inherit);
+		/* PHASE B, STEP B4 -- THE ARM.  See the list-on arm above; the
+		 * per-edge @owner_held is what makes it legal here too, and this
+		 * is the arm whose absence a constructed repro exposed. */
+		ft_flip_txn_arm_per_op(ft, txn);
 		_ft_publish_to_parent_meta(ft, parent_nf,
 			(struct cds_ft_inode_flag **) head_slot,
 			(struct cds_ft_inode_flag *) next_node,
