@@ -858,12 +858,35 @@ extern unsigned long cds_ft_probe_promote_guarded;
 # define FT_OWNER_ASSERT_OWNED(t, owner)				\
 	urcu_assert_debug(!(t)->dbg_arm_per_op || !(t)->nr_locks ||	\
 			ft_flip_txn_owns((t), (owner)))
+/*
+ * THE SAME QUESTION, ASKED OF A RECORD THAT CARRIES ITS OWN WITNESS.
+ *
+ * A miss splits two ways (see ft_flip_txn_owns): a FINDING where the txn owns
+ * the mark's CLEARING, a VISIBILITY gap where a caller's SWEEP does.  Only the
+ * second may widen the predicate, and only one record SHAPE qualifies -- the
+ * argument lives on ft_owner_retire_witnessed.
+ *
+ * The witness is a PARAMETER, never txn state: it dies with the call, so no
+ * window exists in which another record could be covered by it and there is no
+ * `clear` to forget.  A caller that supplies @ctx on a record of any other
+ * shape gets the NARROW predicate back -- misuse fails CLOSED.
+ */
+# define FT_OWNER_ASSERT_OWNED_CTX(t, ctx, owner, slot, new_ptr)	\
+	urcu_assert_debug(!(t)->dbg_arm_per_op || !(t)->nr_locks ||	\
+			ft_flip_txn_owns((t), (owner)) ||		\
+			ft_owner_retire_witnessed((ctx), (owner),	\
+					(slot), (new_ptr)))
 #else
 # define FT_OWNER_ASSERT_TXN_FIELD
 # define FT_OWNER_ASSERT_INIT(t)	do { } while (0)
 # define FT_OWNER_ASSERT_SET_PER_OP(t)	do { } while (0)
 # define FT_OWNER_ASSERT_OWNED(t, owner)				\
 	do { (void) (t); (void) (owner); } while (0)
+# define FT_OWNER_ASSERT_OWNED_CTX(t, ctx, owner, slot, new_ptr)	\
+	do {								\
+		(void) (t); (void) (ctx); (void) (owner);		\
+		(void) (slot); (void) (new_ptr);			\
+	} while (0)
 #endif
 
 /*
@@ -2392,6 +2415,65 @@ bool ft_lock_ctx_holds(const struct ft_lock_ctx *ctx,
 }
 
 /*
+ * MAY THIS RECORD BE JUDGED ON THE OP'S WHOLE HELD SET RATHER THAN THE TXN
+ * REGISTRY ALONE?  Debug-only; the answer is NO unless all four hold.
+ *
+ * ★ THE SHAPE DECIDES, NOT THE CALL PATH.  Registration buys exactly one
+ * service -- the transfer of the mark's CLEARING -- and only a record whose new
+ * value sets FT_STATE_TOMBSTONE can do without it: that terminal leaves the word
+ * tombstoned, ft_meta_lock_acquire refuses a tombstone forever, so no peer can
+ * re-mark it and the caller's unconditional release_if_held sweep is
+ * deterministic on BOTH outcomes.  For every other record the word SURVIVES the
+ * commit clean and live, a peer takes it immediately, and a late caller-side
+ * release would strip that peer's mark -- which is the bug the narrow predicate
+ * is the only detector of, and the one this must never bless.
+ *
+ * ☠ SO THE TOMBSTONE TERM IS NOT A CONVENIENCE.  Drop it and a caller passing a
+ * @ctx on a release or an edge silently widens the check that catches the
+ * double-clearing race.  With it, misuse fails CLOSED: the wide term simply does
+ * not apply and the narrow one answers as before.
+ *
+ * ☠ AND THIS IS A WITNESS, NOT A VERDICT.  @ctx is consulted here, by the choke
+ * point, through the SAME ft_held_set_snap the exclusion logic already trusts
+ * for dedupe -- where a false positive would break real exclusion, not merely an
+ * assert.  A caller may not pass "I already checked": a verdict token is
+ * mintable and unfalsifiable at the point that consumes it, which is how a red
+ * control goes blind.  Ownership is TAKEN, never OBSERVED; here it is merely
+ * LOOKED UP in a maintained held set.
+ *
+ * ☞ @slot must be @owner's OWN state word: a retire tombstones the node whose
+ * lock it is, and any other slot with the tombstone bit set in its value would
+ * be a coincidence of encoding rather than this shape.
+ *
+ * The hold-trace ledger is deliberately NOT consulted: it is
+ * FEATURE_FT_HOLD_TRACE-gated, and an assert whose reach depends on a second
+ * unrelated knob quietly loses coverage in the config nobody checks (the rule
+ * ft_flip_txn_record_tag states beside FT_OWNER_ASSERT_OWNED).  The ledger stays
+ * in the counter's OWN_LEDGER lane.
+ */
+static inline
+bool ft_owner_retire_witnessed(const struct ft_lock_ctx *ctx,
+		const struct cds_ft_metadata *owner, void **slot,
+		const void *new_ptr)
+{
+	uintptr_t snap;
+	bool ratified;
+
+	if (!ctx || !owner)
+		return false;
+	if (slot != (void **) (uintptr_t) &owner->state)
+		return false;
+	if (!((uintptr_t) new_ptr & FT_STATE_TOMBSTONE))
+		return false;
+	/*
+	 * @ratified is ignored on purpose -- the question is OWNERSHIP, not
+	 * whether this frame sampled the word, and the anchored retire's own
+	 * held-set check does the same.
+	 */
+	return ft_lock_ctx_holds(ctx, owner, &snap, &ratified);
+}
+
+/*
  * The CLEAN word of a lock-set member whose ANCHOR is a DIFFERENT word.
  *
  * ft_held_anchor_sample_node reads the word and refuses it dirty, which is right
@@ -2948,8 +3030,18 @@ enum urcu_txn_status ft_flip_txn_commit(struct cds_ft *ft,
  * un-reserved txn that fails to grow is sticky-ENOMEM and surfaces at commit as
  * MEMORY_ERROR (see the glue path); the assert only guards the reserved use.
  */
+/*
+ * THE RECORDER CORE, taking the op's held-set witness as a PARAMETER.
+ *
+ * @dbg_ctx is consumed by FT_OWNER_ASSERT_OWNED_CTX and nothing else: it is the
+ * debug-only witness for the ONE record shape whose mark is swept rather than
+ * registered (ft_owner_retire_witnessed has the argument).  NULL -- what every
+ * wrapper below passes -- is the ordinary registry-only predicate, so no
+ * existing caller's check changes by a bit.
+ */
 static inline
-void ft_flip_txn_record_tag(struct ft_flip_txn *t,
+void __ft_flip_txn_record_tag_ctx(struct ft_flip_txn *t,
+		const struct ft_lock_ctx *dbg_ctx,
 		struct cds_ft_metadata *owner, void **slot,
 		void *old_ptr, void *new_ptr, uintptr_t tag)
 {
@@ -3013,7 +3105,7 @@ void ft_flip_txn_record_tag(struct ft_flip_txn *t,
 	 * site be legal?" into an abort at the offending record instead of a
 	 * number to interpret.
 	 */
-	FT_OWNER_ASSERT_OWNED(t, owner);
+	FT_OWNER_ASSERT_OWNED_CTX(t, dbg_ctx, owner, slot, new_ptr);
 	if (t->structural_sw) {
 		FT_TK_COUNT_REC(t, FT_TK_SW);
 		ret = urcu_txn_store_sw(t->mtxn, slot, old_ptr, new_ptr, tag);
@@ -3029,6 +3121,15 @@ void ft_flip_txn_record_tag(struct ft_flip_txn *t,
 	}
 	assert(!ret);
 	(void) ret;	/* reserved up front -> never fails */
+}
+
+static inline
+void ft_flip_txn_record_tag(struct ft_flip_txn *t,
+		struct cds_ft_metadata *owner, void **slot,
+		void *old_ptr, void *new_ptr, uintptr_t tag)
+{
+	__ft_flip_txn_record_tag_ctx(t, /*dbg_ctx=*/ NULL, owner, slot,
+		old_ptr, new_ptr, tag);
 }
 
 /*
@@ -3319,21 +3420,38 @@ void ft_flip_txn_record_pub_rec(struct ft_flip_txn *t,
  */
 #define ft_flip_txn_record_state(t, meta, o, n)				\
 	ft_flip_txn_record_state_kind((t), (meta), (o), (n), 1)
+/*
+ * The same, carrying the op's held-set witness for the ANCHORED RETIRE -- the
+ * one record shape whose mark is swept rather than registered.  Every other
+ * caller uses the plain spelling and keeps the registry-only predicate.
+ */
+#define ft_flip_txn_record_state_ctx(t, ctx, meta, o, n)			\
+	ft_flip_txn_record_state_kind_ctx((t), (ctx), (meta), (o), (n), 1)
 #define ft_flip_txn_record_state_mw(t, meta, o, n)			\
 	ft_flip_txn_record_state_kind((t), (meta), (o), (n), 0)
+
+static inline
+void ft_flip_txn_record_state_kind_ctx(struct ft_flip_txn *t,
+		const struct ft_lock_ctx *dbg_ctx,
+		struct cds_ft_metadata *meta, void *old_ptr, void *new_ptr,
+		int sw_ok)
+{
+	if (sw_ok)
+		__ft_flip_txn_record_tag_ctx(t, dbg_ctx, /*owner=*/ meta,
+			(void **) &meta->state,
+			old_ptr, new_ptr, FT_STATE_PROXY);
+	else
+		ft_flip_txn_record_tag_mw(t, (void **) &meta->state,
+			old_ptr, new_ptr, FT_STATE_PROXY);
+}
 
 static inline
 void ft_flip_txn_record_state_kind(struct ft_flip_txn *t,
 		struct cds_ft_metadata *meta, void *old_ptr, void *new_ptr,
 		int sw_ok)
 {
-	if (sw_ok)
-		ft_flip_txn_record_tag(t, /*owner=*/ meta,
-			(void **) &meta->state,
-			old_ptr, new_ptr, FT_STATE_PROXY);
-	else
-		ft_flip_txn_record_tag_mw(t, (void **) &meta->state,
-			old_ptr, new_ptr, FT_STATE_PROXY);
+	ft_flip_txn_record_state_kind_ctx(t, /*dbg_ctx=*/ NULL, meta,
+		old_ptr, new_ptr, sw_ok);
 }
 
 /*
@@ -4579,12 +4697,21 @@ void ft_flip_txn_record_nr_child_inc(struct ft_flip_txn *t,
  * cleared by the commit wrapper's registry.
  */
 static inline
+void ft_flip_txn_record_tombstone_locked_ctx(struct ft_flip_txn *t,
+		const struct ft_lock_ctx *dbg_ctx,
+		struct cds_ft_metadata *meta, uintptr_t state_snapshot)
+{
+	ft_flip_txn_record_state_kind_ctx(t, dbg_ctx, meta,
+			(void *) (state_snapshot | FT_STATE_LOCK),
+			(void *) (state_snapshot | FT_STATE_TOMBSTONE), 1);
+}
+
+static inline
 void ft_flip_txn_record_tombstone_locked(struct ft_flip_txn *t,
 		struct cds_ft_metadata *meta, uintptr_t state_snapshot)
 {
-	ft_flip_txn_record_state_kind(t, meta,
-			(void *) (state_snapshot | FT_STATE_LOCK),
-			(void *) (state_snapshot | FT_STATE_TOMBSTONE), 1);
+	ft_flip_txn_record_tombstone_locked_ctx(t, /*dbg_ctx=*/ NULL, meta,
+		state_snapshot);
 }
 
 /*
@@ -4834,13 +4961,14 @@ void ft_flip_txn_record_retire_anchored_arms(struct ft_flip_txn *t,
 			uintptr_t pending = (uintptr_t) urcu_txn_load(t->mtxn,
 					(void **) &node->state, FT_STATE_PROXY);
 
-			ft_flip_txn_record_state(t, node,
+			ft_flip_txn_record_state_ctx(t, ctx, node,
 				(void *) pending,
 				(void *) ((pending & ~(uintptr_t) FT_STATE_LOCK)
 					| FT_STATE_TOMBSTONE));
 			return;
 		}
-		ft_flip_txn_record_tombstone_locked(t, node, h->lock_snap);
+		ft_flip_txn_record_tombstone_locked_ctx(t, ctx, node,
+			h->lock_snap);
 		return;
 	}
 	/*
@@ -4880,14 +5008,14 @@ void ft_flip_txn_record_retire_anchored_arms(struct ft_flip_txn *t,
 		if (caa_unlikely(pending == (h->node_snap | FT_STATE_LOCK) &&
 				ft_lock_ctx_holds(ctx, node, &held_snap,
 					&ratified))) {
-			ft_flip_txn_record_state(t, node,
+			ft_flip_txn_record_state_ctx(t, ctx, node,
 				(void *) pending,
 				(void *) ((pending & ~(uintptr_t) FT_STATE_LOCK)
 					| FT_STATE_TOMBSTONE));
 			return;
 		}
 	}
-	ft_flip_txn_record_state(t, node,
+	ft_flip_txn_record_state_ctx(t, ctx, node,
 			(void *) h->node_snap,
 			(void *) (h->node_snap | FT_STATE_TOMBSTONE));
 }
