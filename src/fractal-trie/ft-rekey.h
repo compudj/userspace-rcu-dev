@@ -3298,6 +3298,7 @@ cells_done:
 		 * "held" there is the measured exponential-MW livelock.
 		 */
 		glue.caller_holder = NULL;
+		glue.publish_gp_holder = NULL;
 		{
 			int sc_i;
 

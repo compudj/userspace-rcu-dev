@@ -1896,6 +1896,8 @@ static void ft_flip_txn_call_rcu_now(struct rcu_head *head,
  * hold regardless of which registry (if any) the op filed it in -- that
  * mismatch is the defect being measured.
  */
+static __thread const char *ft_glue_dbg_last_arm;
+
 #define FT_HOLD_TRACE_MAX	1024
 struct ft_hold_trace_ent {
 	const struct cds_ft_metadata *lock;
@@ -4184,27 +4186,6 @@ bool ft_dlm_member_linked(const struct cds_ft *ft,
  * while the op does hold something is the self-collision livelock
  * ft_held_set documents, not an optimisation.
  */
-static bool ft_glue_op_holds(const struct ft_glue *g,
-		const struct cds_ft_metadata *meta);	/* defined below */
-
-/*
- * Does any frame's GLUE cover @lock?  The glue's accessory hold arms exist
- * so its OWN acquires dedupe against its holds; their field-based lifecycle
- * is not scrub-true, so the dedupe validation EXEMPTS this lane (finding A
- * stays open for it -- every enforcement form measured as a livelock).
- */
-static inline
-bool ft_dlm_glue_covered(const struct ft_lock_ctx *ctx,
-		const struct cds_ft_metadata *lock)
-{
-	const struct ft_held_set *hs;
-
-	for (hs = &ctx->held; hs; hs = hs->outer)
-		if (hs->glue && ft_glue_op_holds(hs->glue, lock))
-			return true;
-	return false;
-}
-
 /*
  * Is a RELEASE of @lock already recorded in any frame of the op's held-set
  * chain?  Distinguishes the two ways a covering hold's word can look free:
@@ -4391,17 +4372,6 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 			 * its own consumed fence.  Either way: owned, dedupe.
 			 */
 			deduped = true;
-		} else if (ft_dlm_glue_covered(ctx, lock)) {
-			/*
-			 * GLUE self-consultation on a word whose state is not
-			 * in the owned mask: dedupe as the glue always has
-			 * (pre-validation semantics); the oracle files
-			 * nothing for it, so nothing can leak or false-abort.
-			 */
-			deduped = true;
-#ifdef FEATURE_FT_HOLD_TRACE
-			set[i].held.oracle_skip = true;
-#endif
 		} else if (ft_dlm_covering_release_recorded(ctx, lock)) {
 			/*
 			 * The drop->commit-window dedupe: this op's own
@@ -4459,8 +4429,18 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 							towned = ch->extra[ei]
 								.txn_owned;
 						}
-					if (lane[0] == '?' && ch->glue)
-						lane = "glue?";
+					if (lane[0] == '?' && ch->glue) {
+						uintptr_t gs__;
+						bool gr__;
+
+						if (ft_glue_held_snap(
+								ch->glue, lock,
+								&gs__, &gr__))
+							lane =
+							 ft_glue_dbg_last_arm;
+						else
+							lane = "glue?";
+					}
 					if (lane[0] != '?')
 						break;
 				}
@@ -8854,6 +8834,17 @@ struct ft_glue_free_item {
 	 */
 	bool retired;
 	/*
+	 * Set by ft_glue_free_old at the reclaim hand-off.  From that point the
+	 * op's next quiescent state lets the deferred free run and the allocator
+	 * recycle the address into a FRESH LIVE node -- so a fenced entry may
+	 * keep answering holds() only while the word still wears the TOMBSTONE
+	 * (dedupe-on-dead); a recycled word belongs to whoever takes it, and
+	 * answering for it covers an acquire with an exclusion this op does not
+	 * have (measured: 1060 stale answers/run, exponential MW, every one a
+	 * consumed fenced retire on a live nr_child=1 word).
+	 */
+	bool consumed;
+	/*
 	 * DLM overlap-spine plan-lock (§9.4 M-2): this op holds the node's LOCK
 	 * fence, acquired BEFORE its body was read into the merged cluster, and
 	 * @snap is the mark's CLEAN pre-mark word.  The freeze then records the
@@ -10351,6 +10342,7 @@ void ft_glue_defer_free(struct ft_glue *g,
 	g->free_list[g->nr_free].node = node;
 	g->free_list[g->nr_free].compressed = compressed;
 	g->free_list[g->nr_free].retired = true;
+	g->free_list[g->nr_free].consumed = false;
 	g->free_list[g->nr_free].fenced = false;
 	g->free_list[g->nr_free].holder = NULL;
 	g->free_list[g->nr_free].holder_snap = 0;
@@ -10384,6 +10376,7 @@ void ft_glue_defer_free_fenced(struct ft_glue *g,
 	g->free_list[g->nr_free].node = node;
 	g->free_list[g->nr_free].compressed = compressed;
 	g->free_list[g->nr_free].retired = true;
+	g->free_list[g->nr_free].consumed = false;
 	g->free_list[g->nr_free].fenced = true;
 	g->free_list[g->nr_free].snap = h->node_snap;
 	g->free_list[g->nr_free].holder = h->lock;
@@ -10432,7 +10425,7 @@ bool ft_glue_fence_holds(const struct ft_glue *g,
 	int i;
 
 	for (i = 0; i < g->nr_free; i++) {
-		if (!g->free_list[i].fenced)
+		if (!g->free_list[i].fenced || g->free_list[i].consumed)
 			continue;
 		/*
 		 * The caller asks about the word it would ACQUIRE, so compare
@@ -10446,7 +10439,7 @@ bool ft_glue_fence_holds(const struct ft_glue *g,
 }
 
 /*
- * Does this glue hold a LIVE fence on @meta's NODE itself?
+ * Does this glue hold a LIVE (un-consumed) fence on @meta's NODE itself?
  *
  * The splice-holder acquire needs this IDENTITY answer: the holder it derived
  * (a chain head's prev) is very often a node this op already fenced, and
@@ -10465,7 +10458,7 @@ bool ft_glue_fence_holds_node(const struct ft_glue *g,
 	int i;
 
 	for (i = 0; i < g->nr_free; i++) {
-		if (!g->free_list[i].fenced)
+		if (!g->free_list[i].fenced || g->free_list[i].consumed)
 			continue;
 		if (cds_ft_item_to_metadata((struct cds_ft_inode *)
 				g->free_list[i].node) == meta)
@@ -10576,6 +10569,11 @@ struct cds_ft_metadata *ft_glue_reparent_park_meta(struct cds_ft *ft,
  * author expected (a collided key's chain hangs off a dst overlap node, so they
  * were the SAME node).  These arrays are small and this runs once per commit.
  */
+#ifdef FEATURE_FT_HOLD_TRACE
+# define FT_GLUE_ARM(name) (ft_glue_dbg_last_arm = (name))
+#else
+# define FT_GLUE_ARM(name) do { } while (0)
+#endif
 static
 bool ft_glue_held_snap_one(const struct ft_glue *g,
 		const struct cds_ft_metadata *meta, uintptr_t *snap,
@@ -10585,18 +10583,22 @@ bool ft_glue_held_snap_one(const struct ft_glue *g,
 
 	*ratified = true;
 	if (g->publish_parent_holder == meta) {
+		FT_GLUE_ARM("publish_parent");
 		*snap = g->publish_parent_snap;
 		return true;
 	}
 	if (g->publish_gp_holder == meta) {
+		FT_GLUE_ARM("publish_gp");
 		*snap = g->publish_gp_snap;
 		return true;
 	}
 	if (g->split_cn_holder == meta) {
+		FT_GLUE_ARM("split_cn");
 		*snap = g->split_cn_snap;
 		return true;
 	}
 	if (g->caller_holder == meta) {
+		FT_GLUE_ARM("caller");
 		/*
 		 * The CALLER acquired this one and owns its release, so this op
 		 * never sampled the word.  Held all the same: dedupe is what
@@ -10611,6 +10613,63 @@ bool ft_glue_held_snap_one(const struct ft_glue *g,
 			continue;
 		if (cds_ft_item_to_metadata((struct cds_ft_inode *)
 				g->free_list[i].node) == meta) {
+			/*
+			 * A CONSUMED fenced retire (the commit landed and
+			 * ft_glue_free_old handed the node to the reclaimer)
+			 * answers only while the word still wears the
+			 * TOMBSTONE: dedupe-on-dead is the designed flow for an
+			 * op consulting its own consumed fence, and a dead word
+			 * puts no exclusion at stake.  Once the allocator
+			 * recycles the address the word is a FRESH LIVE node
+			 * this op holds nothing on -- the entry stays for the
+			 * release bookkeeping, but it is not a holds() source.
+			 * (The acquire's claimability gate re-samples the word,
+			 * so a recycle racing this load costs one refusal, not
+			 * a covered acquire.)
+			 */
+			if (g->free_list[i].consumed &&
+					CMM_LOAD_SHARED(meta->state) !=
+					((g->free_list[i].snap &
+						~FT_STATE_LOCK) |
+						FT_STATE_TOMBSTONE))
+				continue;
+			FT_GLUE_ARM("freelist_item");
+#ifdef FEATURE_FT_HOLD_TRACE
+			{
+				uintptr_t st__ = CMM_LOAD_SHARED(meta->state);
+
+				if (!(st__ & (FT_STATE_LOCK | FT_STATE_PROXY |
+						FT_STATE_TOMBSTONE)) &&
+						ft_hold_trace_report_ok())
+					fprintf(stderr, "FT GLUE freelist_item"
+						" answers FREE word %p state="
+						"%lx retired=%d txn_owned=%d "
+						"shared=%d consumed=%d "
+						"holder=%p hstate=%lx "
+						"mown=%lx hown=%lx self=%lx\n",
+						(void *) meta,
+						(unsigned long) st__,
+						(int) g->free_list[i].retired,
+						(int) g->free_list[i]
+							.holder_txn_owned,
+						(int) g->free_list[i]
+							.holder_shared,
+						(int) g->free_list[i].consumed,
+						(void *) g->free_list[i].holder,
+						g->free_list[i].holder ?
+						(unsigned long) CMM_LOAD_SHARED(
+							g->free_list[i]
+							.holder->state) : 0UL,
+						(unsigned long) CMM_LOAD_SHARED(
+							meta->dbg_owner_tid),
+						g->free_list[i].holder ?
+						(unsigned long) CMM_LOAD_SHARED(
+							g->free_list[i].holder
+							->dbg_owner_tid) : 0UL,
+						(unsigned long)
+							pthread_self());
+			}
+#endif
 			*snap = g->free_list[i].snap;
 			return true;
 		}
@@ -10623,13 +10682,16 @@ bool ft_glue_held_snap_one(const struct ft_glue *g,
 		 * the word owns its value -- exactly as @extra's shared entries.
 		 */
 		if (g->free_list[i].holder == meta &&
-				!g->free_list[i].holder_shared) {
+				!g->free_list[i].holder_shared &&
+				!g->free_list[i].consumed) {
+			FT_GLUE_ARM("freelist_holder");
 			*snap = g->free_list[i].holder_snap;
 			return true;
 		}
 	}
 	for (i = 0; i < g->nr_splices; i++)
 		if (g->splices[i].holder == meta) {
+			FT_GLUE_ARM("splice");
 			*snap = g->splices[i].holder_snap;
 			return true;
 		}
@@ -12370,6 +12432,14 @@ void ft_glue_free_old(struct cds_ft *ft, struct ft_glue *g)
 	int i;
 
 	for (i = 0; i < g->nr_free; i++) {
+		/*
+		 * The reclaim hand-off: past this op's next quiescent state the
+		 * address can return to the claimable world, whichever committer
+		 * owns the free.  The fenced entry's holds() answer narrows to
+		 * the TOMBSTONE window (ft_glue_held_snap_one).
+		 */
+		if (g->free_list[i].fenced)
+			g->free_list[i].consumed = true;
 		/*
 		 * Only the committer that performed the node's LIVE->TOMBSTONE
 		 * transition frees it (ft_glue_tombstone_free_list clears @retired
