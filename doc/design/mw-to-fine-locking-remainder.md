@@ -1705,12 +1705,21 @@ certification, then the API gate lift (`ft-lifecycle.h:369`):
    certified, and a CONSUMED lifecycle flag closing the fenced free
    list's post-reclaim answering (own-terminal token; skeptic-shaped
    gates on all three matchers).
-   ☐ **(B) OPEN**: mark-vs-anchor DUAL COVERAGE at root-only MW (now
-   aborts at test 34, was 30 — the splice fix cleared four tests; both
-   sites named; mechanism + D1/D2/D3 fix directions in the analysis
-   note — D1 fence-under-anchor recommended, and the splice root cause
-   is precedent that a DERIVATION DISAGREEMENT, not the two systems'
-   coexistence, may be the mechanism — verify before designing).  The
+   ☑ **(B) ROOT-CAUSED @19ade8f7** (LTTng flight recorder; the analysis
+   note carries the interleaving).  NOT mark-vs-anchor dual coverage —
+   both parties are DLM acquire-sets, the anchors AGREE, and the
+   release drops by the key it filed by.  The defect is an op DEDUPING
+   ON A WORD ITS OWN COMMIT ALREADY GAVE BACK: the ledger is drained
+   pre-commit correctly, but the FRAME EXTRAS are not scrubbed when the
+   commit consumes the hold, so the op's next acquire is told it still
+   holds a word a peer has since taken for real, and both mutate under
+   one word's protection.  ⇒ finding B is finding A's class at a
+   consumption point the @aa03d23b scrubs missed; the remedy is the
+   rekey fold's `marks_consumed` discipline generalised to every commit
+   that consumes registered locks (R3).  D1/fence-under-anchor is
+   UNNECESSARY and its evidence is withdrawn.  ☐ Remaining: implement
+   the scrub, and establish whether the same window is reachable at
+   PER-NODE (not shown by the trace, and not to be assumed closed).  The
    gate's holdtrace config runs without its imw legs until B closes;
    re-adding them is E.2's completion criterion, and E.5 cannot lift
    the coarse spacings before that.
