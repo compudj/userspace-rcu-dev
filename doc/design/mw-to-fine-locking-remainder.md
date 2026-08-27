@@ -1560,6 +1560,29 @@ ever turns on is a separate decision from the curative work below.  The
 ~10ms stall class visible in both arms is unattributed — a candidate next
 question.
 
+### D.4 — the ~10ms stall class ROOT-CAUSED: the lane's 10ms poll quanta (@d41219c9)
+
+The class D.3 left unattributed (removes >8ms, ~20% of the >1ms
+population and its whole extreme tail, including attempts=0 ops, both
+arms).  Decomposition put the wall in `urcu_txn_begin` (the domain lane)
+or the bail's `end()`, clustered just above exactly 10ms.  The constant
+is the adaptative-wait fallbacks: the fair mutex's granted-waiter
+TEARDOWN wait (1000 cpu_relax then `poll(NULL,0,10)` — unwakeable BY
+DESIGN, the granter must never touch the node after TEARDOWN) and
+wfcqueue's `sync_next` busy-wait on the unlock side (same quantum).
+Verified by per-thread poll counters: 6 victims ate the teardown poll,
+17 the sync_next poll, each in its predicted column — and the ~446
+others counted ZERO polls of their own, because the lane is FIFO: **one
+thread sleeping its 10ms quantum mid-handshake convoys the whole
+enrolled queue** (23 pollers × 10–13 queued writers ≈ the downstream
+victims).  A µs-scale handshake race lost costs 10ms × queue depth.
+
+☞ The fix is liburcu-core wait policy (graduated poll(0)/poll(1) before
+the 10ms quantum, and/or a longer teardown spin budget), NOT an FT
+change — a separate decision.  Note the two classes compose: D.1–D.3's
+starvation is 1–8ms of legitimate bulk holds; D.4 is the lane's own
+handoff machinery quantizing rare µs races into 10ms convoys.
+
 **What this does to the fork above:** the starvation is priced by
 (bulk-op hold time × recompaction rate), so the CURATIVE lever is
 SHORTENING THE HOLD — which is §8.2 in-place mutation's exact target
