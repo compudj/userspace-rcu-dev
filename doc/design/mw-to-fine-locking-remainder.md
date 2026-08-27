@@ -1300,9 +1300,52 @@ to the peer that just won. The candidate causes are not yet separated —
 a peer writing that slot without the lock, an `owner` naming the wrong node
 ([[feedback_a_raw_rederivation_at_the_write_site_is_a_class]], three known
 instances), an expected-old captured before the acquire, or the cross-trie shape
-(`glue_insert.txn` is created on `dst_ft`). ☞ Next: `-DFT_ABORT_CLAIM` +
-the descriptor dump, which is what turned the last deterministic abort into a
-root cause in one run ([[feedback_dump_the_losing_mcas_record]]).
+(`glue_insert.txn` is created on `dst_ft`). 
+
+### C.1(e) — THE CLAIM DUMP: the owner is CORRECT, and the question moves
+
+`f2eaa3e1`. `-DFT_ABORT_CLAIM` prints, at the abort, every record in the
+descriptor — class, kind, witness, {slot, old, new}, the slot's LIVE value, the
+tag, the owner the record NAMED, its call site — with the loser marked, then the
+op's LOCK REGISTRY, which the engine cannot see. Three independent samples,
+identical shape:
+
+    rec[0] MW_STRUCT MW/held slot=..0148 old=..1a1 new=..0e1 now=..081 tag=0xf  <== LOST
+    rec[1] MW_STRUCT MW/held slot=..2f8  old=0x80004 new=0x4    now=0x80004 tag=0x1
+    registry: nr_locks=1   held[0] meta=..2d8
+
+`rec[1]` is the held node's own state word (`meta+0x20`, `offsetof(state)`
+confirmed) — the `{LOCK|s -> s}` release. `rec[0]` is a child POINTER slot whose
+value cycles among exactly **three** tagged pointers across samples: several
+peers are writing that one word. addr2line through the inlined chain names it
+exactly: `ft_glue_txn_commit_edges` → `ft_flip_txn_record_pub_rec` →
+`ft_flip_txn_record_reserved` — the glue's FORWARD PUBLISH, whose owner is
+`@publish_parent` by construction (`_ft_publish_to_parent` passes
+`slot_owner_nf = parent_nf`).
+
+☠☠ **AND THE "MISNAMED OWNER" EXPLANATION IS REFUTED.** The raw-re-derivation
+class was the obvious suspect and the two addresses are 2 MB apart — but that is
+an inference from an ADDRESS, and metadata and node bodies live in separate
+arenas, so the gap says nothing
+([[feedback_print_dont_debug_a_value_the_code_has]]). `ft_slot_in_node` is the
+pairing test for exactly this question — its own header was written for it —
+and counted at the publish it reads **in 1,231,998 / NOT-IN 0**. The slot IS one
+of the named parent's own child slots, every time.
+
+☞ **SO THE FINDING NARROWS RATHER THAN DISSOLVES**: the op holds P's DLM lock,
+writes a child slot inside P, and a peer still wins that word. The remaining
+question is about the **WINNER, not the loser** — who writes a child slot of P
+without holding P — and it needs a different instrument (stamp the writer's
+identity into the value, or trace the word). ☠ The two surviving candidates are
+a peer path that writes that slot without taking the lock, and the CROSS-TRIE
+shape (`cds_ft_graft_swap`'s glue txn is created on `dst_ft` while the oracle
+`gs_shared_writer` swaps subtrees between two tries). Not separated.
+
+★ METHOD NOTE, paid for twice in this section: a counter that reads 0 was quoted
+here as refuting the forward-publish reading, and the call site had never been
+added — two patch scripts aborted before reaching it. `in + NOT-IN` is a REACH
+counter and it is what caught the mistake
+([[feedback_verify_the_mechanism_ran_before_believing_a_zero]]).
 
 ☠ COVERAGE: ft_unit reports ZERO aborts, so the detector has none there. It
 lives on ft_inv MW.
