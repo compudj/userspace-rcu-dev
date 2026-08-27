@@ -254,6 +254,14 @@ struct ft_tk_tls {
 	unsigned long ab_mixed;		/* two classes chained onto the losing word */
 	unsigned long ab_unattrib;	/* an abort no hook could name (poisoned) */
 	unsigned long ab_alarm[FT_TK_MAX_SITES][2];	/* [0] state word, [1] pointer slot */
+	/*
+	 * ft_slot_in_node(g->publish_parent, g->publish_slot) at the glue publish:
+	 * is the slot this commit writes actually one of the named parent's own
+	 * child slots?  The record names that parent as the slot's OWNER, and the
+	 * record-time owner check asks only whether the op HOLDS it -- never
+	 * whether it OWNS the word.  [0] no, [1] yes.
+	 */
+	unsigned long pub_pair[2];
 #endif
 };
 
@@ -374,18 +382,69 @@ void ft_tk_count_mwa(enum ft_tk_mwa_class c)
 }
 
 #ifdef FT_ABORT_ATTRIB
+static const char * const ft_ab_names[FT_AB_CLS_NR] = {
+	"UNATTRIB", "SW", "MW_STRUCT", "MW_LOCK", "VALIDATE", "CELL_HANDLE",
+	"mwa:ROOT", "mwa:HEAD_BACK", "mwa:DUAL", "mwa:CELL",
+	"mwa:RANK", "mwa:PARENT_WORD", "mwa:PSO", "mwa:STATE", "mwa:GUARD",
+};
+
+static
+const char *ft_ab_cls_name(unsigned int cls)
+{
+	return cls < FT_AB_CLS_NR ? ft_ab_names[cls] : "?";
+}
+
 /*
  * The engine's abort hook, declared in ft-txn-rec-dbg.h and defined here where
  * struct urcu_txn_record is complete.  It only STASHES: the class is counted in
  * ft_flip_txn_commit, which still has the txn's creation site in hand.
  */
+static const char *ft_ab_cls_name(unsigned int cls);
+static int ft_ab_is_alarm(unsigned int cls, unsigned int own);
+
 static
-void ft_ab_note_lost(const struct urcu_txn_record *r)
+void ft_ab_note_lost(const struct urcu_txn_desc *t,
+		const struct urcu_txn_record *r)
 {
 	ft_ab_lost = r ? r->dbg_embedder :
 		ft_ab_code(FT_AB_UNSET, FT_AB_OWN_NA);
 	ft_ab_lost_tag = r ? r->proxy_tag : 0;
 	ft_ab_lost_valid = r != NULL;
+#ifdef FT_ABORT_CLAIM
+	/*
+	 * THE DESCRIPTOR IS STILL INTACT HERE and is freed on the way out, so
+	 * this is the only place the losing record can be read against its
+	 * SIBLINGS -- which is how it is read: "this CAS lost" is not a
+	 * diagnosis, "these two records disagree about whether the op holds
+	 * that word" is.  `now=` is what turns a mismatch into one: it says
+	 * which of the two is lying.
+	 */
+	if (r && ft_ab_is_alarm(ft_ab_code_cls(ft_ab_lost),
+			ft_ab_code_own(ft_ab_lost))) {
+		unsigned int i;
+
+		fprintf(stderr,
+"\n[FT_ABORT_CLAIM] a record that CANNOT lose, lost.  nr=%u nr_mw=%u retry=%u\n"
+"    ra base: cds_ft_create=%p  (file offset of ra = nm(cds_ft_create) + ra - this)\n",
+			t->nr, t->nr_mw, t->retry, (void *) &cds_ft_create);
+		for (i = 0; i < t->nr; i++) {
+			const struct urcu_txn_record *q = &t->recs[i];
+
+			fprintf(stderr,
+"    rec[%2u] %-14s %s%s slot=%p old=%p new=%p now=%p tag=0x%lx owner=%p ra=%p%s\n",
+				i, ft_ab_cls_name(ft_ab_code_cls(q->dbg_embedder)),
+				q->kind == URCU_TXN_KIND_SW ? "SW" : "MW",
+				ft_ab_code_own(q->dbg_embedder) == FT_AB_OWN_HELD ?
+					"/held" : (ft_ab_code_own(q->dbg_embedder) ==
+						FT_AB_OWN_MISS ? "/MISS " : "     "),
+				(void *) q->slot, q->old_ptr, q->new_ptr,
+				(void *) CMM_LOAD_SHARED(*q->slot),
+				(unsigned long) q->proxy_tag,
+				ft_ab_owner_of(q->slot), ft_ab_ra_of(q->slot),
+				q == r ? "   <== LOST" : "");
+		}
+	}
+#endif
 }
 
 /*
@@ -401,12 +460,18 @@ void ft_ab_note_lost(const struct urcu_txn_record *r)
  * ([[feedback_an_assert_config_that_never_fires_is_not_coverage]]).
  * -DFT_ABORT_CLAIM turns it into an abort at the first sighting.
  */
-static inline
+static
 int ft_ab_is_alarm(unsigned int cls, unsigned int own)
 {
 	if (cls == FT_AB_SW)
 		return 1;
 	return cls == FT_AB_MW_STRUCT && own == FT_AB_OWN_HELD;
+}
+
+static inline
+void ft_ab_count_pub_pair(int in_node)
+{
+	ft_tk_tls_get()->pub_pair[!!in_node]++;
 }
 
 static inline
@@ -434,16 +499,12 @@ void ft_ab_count_lost(struct ft_tk_site *site)
 		tls->ab_alarm[id][ptr]++;
 #ifdef FT_ABORT_CLAIM
 		fprintf(stderr,
-"\nFT_ABORT_CLAIM: a record that CANNOT lose lost one -- class=%u witness=%u%s\n"
-"  at %s:%d %s\n"
-"  An SW park does no CAS, and a structural MW record whose owner this op HOLDS\n"
-"  is excluded from every peer writer of that word.  The exclusion is not what\n"
-"  it claims.\n",
-			cls, own,
-			(ft_ab_lost & FT_AB_MIXED) ? " (MIXED: two classes on one word)" : "",
+"    at %s:%d %s -- class=%s witness=%u word=%s%s\n",
 			site ? site->file : "?", site ? site->line : 0,
-			site ? site->what : "?");
-		abort();
+			site ? site->what : "?", ft_ab_cls_name(cls), own,
+			ptr ? "CHILD POINTER SLOT" : "packed state word",
+			(ft_ab_lost & FT_AB_MIXED) ? " MIXED" : "");
+		ft_ab_claim_armed = 1;	/* the caller prints its registry, then aborts */
 #endif
 	}
 }
@@ -505,7 +566,7 @@ void ft_tk_dump(void)
 #ifdef FT_ABORT_ATTRIB
 	unsigned long ab[FT_AB_CLS_NR], ab_own[FT_AB_CLS_NR][FT_AB_OWN_NR];
 	unsigned long ab_alarm_site[FT_TK_MAX_SITES][2];
-	unsigned long ab_tot = 0, ab_alarm[2] = { 0, 0 };
+	unsigned long ab_tot = 0, ab_alarm[2] = { 0, 0 }, pub_pair[2] = { 0, 0 };
 	unsigned long ab_mixed = 0, ab_unattrib = 0;
 #endif
 	struct ft_tk_row tot;
@@ -554,6 +615,8 @@ void ft_tk_dump(void)
 			}
 			ab_mixed += tls->ab_mixed;
 			ab_unattrib += tls->ab_unattrib;
+			pub_pair[0] += tls->pub_pair[0];
+			pub_pair[1] += tls->pub_pair[1];
 		}
 #endif
 		for (i = 0; i < nr; i++) {
@@ -682,14 +745,6 @@ void ft_tk_dump(void)
 	 * are three, and the lone-MW-edge one builds no descriptor at all).
 	 */
 	{
-		static const char * const ab_name[FT_AB_CLS_NR] = {
-			"UNATTRIB", "SW", "MW_STRUCT", "MW_LOCK", "VALIDATE",
-			"CELL_HANDLE",
-			"mwa:ROOT", "mwa:HEAD_BACK", "mwa:DUAL", "mwa:CELL",
-			"mwa:RANK", "mwa:PARENT_WORD", "mwa:PSO", "mwa:STATE",
-			"mwa:GUARD",
-		};
-
 		for (i = 0; i < FT_AB_CLS_NR; i++)
 			ab_tot += ab[i];
 		fprintf(stderr,
@@ -700,7 +755,7 @@ void ft_tk_dump(void)
 				continue;
 			fprintf(stderr,
 "      %-16s %12lu  %5.1f%%   held %lu / ledger %lu / miss %lu / n-a %lu\n",
-				ab_name[i], ab[i],
+				ft_ab_names[i], ab[i],
 				ab_tot ? 100.0 * (double) ab[i] / (double) ab_tot : 0.0,
 				ab_own[i][FT_AB_OWN_HELD], ab_own[i][FT_AB_OWN_LEDGER],
 				ab_own[i][FT_AB_OWN_MISS], ab_own[i][FT_AB_OWN_NA]);
@@ -722,6 +777,10 @@ void ft_tk_dump(void)
 		 * losing one says only that a non-holder wrote another field of
 		 * the same word.  Pooling them would manufacture a defect.
 		 */
+		fprintf(stderr,
+"    glue publish PAIRING (ft_slot_in_node(publish_parent, publish_slot)):"
+" in %lu / ☠ NOT-IN %lu\n",
+			pub_pair[1], pub_pair[0]);
 		fprintf(stderr,
 "    ★ ALARM (a record that cannot lose, lost): pointer-slot %lu / state-word %lu\n"
 "      %s\n",
@@ -821,9 +880,39 @@ void ft_tk_dump_at_exit(void)
 #ifdef FT_ABORT_ATTRIB
 #define FT_AB_LOST_RESET()		do { ft_ab_lost_valid = 0; } while (0)
 #define FT_AB_COUNT_LOST(t)		ft_ab_count_lost((t)->dbg_site)
+#define FT_AB_COUNT_PUB_PAIR(ok)	ft_ab_count_pub_pair(ok)
+#ifdef FT_ABORT_CLAIM
+/*
+ * THE OTHER HALF OF THE CLAIM, and it has to be a macro expanded at the call
+ * site: the op's LOCK REGISTRY is what the alarm is an accusation about, and
+ * struct ft_flip_txn is not defined yet where ft_ab_count_lost is.  The engine
+ * printed the descriptor; this prints WHO THIS OP THOUGHT IT HELD, which is the
+ * pair the diagnosis lives in.
+ */
+#define FT_AB_CLAIM_REPORT(t_)						\
+	do {								\
+		unsigned int i_;					\
+									\
+		if (!ft_ab_claim_armed)					\
+			break;						\
+		fprintf(stderr,						\
+			"    registry: nr_locks=%u sw=%d miss=%d\n",	\
+			(t_)->nr_locks, (int) (t_)->structural_sw,	\
+			(int) (t_)->acquire_miss);			\
+		for (i_ = 0; i_ < (t_)->nr_locks; i_++)			\
+			fprintf(stderr, "      held[%u] meta=%p snap=0x%lx\n", \
+				i_, (void *) (t_)->locks[i_].meta,	\
+				(unsigned long) (t_)->locks[i_].snap);	\
+		abort();						\
+	} while (0)
+#else
+#define FT_AB_CLAIM_REPORT(t_)		do { } while (0)
+#endif
 #else
 #define FT_AB_LOST_RESET()		do { } while (0)
 #define FT_AB_COUNT_LOST(t)		do { } while (0)
+#define FT_AB_CLAIM_REPORT(t)		do { } while (0)
+#define FT_AB_COUNT_PUB_PAIR(ok)	do { } while (0)
 #endif
 /*
  * An outcome is recorded ONCE per txn: ft_flip_txn_commit's acquire-miss arm
@@ -858,6 +947,8 @@ struct ft_tk_site;	/* incomplete: the NULL the constructors take */
 #define FT_TK_COUNT_MWA(c)		do { } while (0)
 #define FT_AB_LOST_RESET()		do { } while (0)
 #define FT_AB_COUNT_LOST(t)		do { } while (0)
+#define FT_AB_CLAIM_REPORT(t)		do { } while (0)
+#define FT_AB_COUNT_PUB_PAIR(ok)	do { } while (0)
 
 #endif	/* FT_DEBUG_TXN_KIND */
 

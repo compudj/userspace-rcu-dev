@@ -3006,8 +3006,10 @@ enum urcu_txn_status ft_flip_txn_commit(struct cds_ft *ft,
 	 * rather than assumes) would otherwise inherit the previous commit's
 	 * loser and read as attribution.
 	 */
-	if (caa_unlikely(st == URCU_TXN_STATUS_ABORT))
+	if (caa_unlikely(st == URCU_TXN_STATUS_ABORT)) {
 		FT_AB_COUNT_LOST(t);
+		FT_AB_CLAIM_REPORT(t);
+	}
 	/*
 	 * node locks: a committed txn transitioned each registered node
 	 * through the terminal its op recorded -- {LOCK|s -> TOMBSTONE|s}
@@ -3137,6 +3139,7 @@ void __ft_flip_txn_record_tag_ctx(struct ft_flip_txn *t,
 		 * contention to convert away.  A TAKE carries no witness -- the
 		 * word it CASes is the one it is trying to acquire.
 		 */
+		FT_AB_NOTE_OWNER(slot, owner);
 		if (FT_TK_TXN_IS_TAKE(t))
 			FT_AB_ARM(FT_AB_MW_LOCK, FT_AB_OWN_NA);
 		else
@@ -11071,6 +11074,14 @@ enum urcu_txn_status ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue 
 	if (g->txn && g->txn->pending_pub_folded &&
 			g->publish_slot == g->txn->pending_pub_slot)
 		goto publish_done;
+	/*
+	 * ☠ THE PAIRING, not the pointer.  This publish names @publish_parent as
+	 * the OWNER of @publish_slot, and the record-time owner check asks only
+	 * whether the op HOLDS that node -- never whether that node OWNS the
+	 * word.  ft_slot_in_node is the pairing test its own header was written
+	 * for; asked here only to be COUNTED.
+	 */
+	FT_AB_COUNT_PUB_PAIR(ft_slot_in_node(g->publish_parent, g->publish_slot));
 	_ft_publish_to_parent(ft, g->publish_parent, g->publish_slot, g->top,
 		ft_glue_publish_expected_old(g), &rec, false);
 	ft_flip_txn_record_pub_rec(g->txn, &rec);

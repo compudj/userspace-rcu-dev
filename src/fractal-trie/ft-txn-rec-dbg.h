@@ -108,6 +108,63 @@ static __thread int ft_ab_lost_valid;
  * them.
  */
 static __thread uintptr_t ft_ab_lost_tag;
+#ifdef FT_ABORT_CLAIM
+static __thread int ft_ab_claim_armed;
+/*
+ * SLOT -> the OWNER the record NAMED, for the claim's dump only.  The engine
+ * record has no room for a pointer and this is not worth growing it for: a ring
+ * walked BACKWARDS finds the most recent naming of a slot, which is the one the
+ * losing record made.  Sized far above the largest observed graft descriptor.
+ */
+#define FT_AB_RING_NR	256
+static __thread struct {
+	void **slot;
+	const void *owner;
+	const void *ra;		/* the record's caller, for addr2line */
+} ft_ab_ring[FT_AB_RING_NR];
+static __thread unsigned int ft_ab_ring_n;
+
+#define FT_AB_NOTE_OWNER(slot_, owner_)					\
+	do {								\
+		unsigned int k_ = ft_ab_ring_n++ % FT_AB_RING_NR;	\
+									\
+		ft_ab_ring[k_].slot = (void **) (slot_);		\
+		ft_ab_ring[k_].owner = (const void *) (owner_);		\
+		ft_ab_ring[k_].ra = __builtin_return_address(0);		\
+	} while (0)
+
+static inline
+const void *ft_ab_owner_of(void **slot)
+{
+	unsigned int i, n = ft_ab_ring_n < FT_AB_RING_NR ?
+		ft_ab_ring_n : FT_AB_RING_NR;
+
+	for (i = 0; i < n; i++) {
+		unsigned int k = (ft_ab_ring_n - 1 - i) % FT_AB_RING_NR;
+
+		if (ft_ab_ring[k].slot == slot)
+			return ft_ab_ring[k].owner;
+	}
+	return NULL;
+}
+
+static inline
+const void *ft_ab_ra_of(void **slot)
+{
+	unsigned int i, n = ft_ab_ring_n < FT_AB_RING_NR ?
+		ft_ab_ring_n : FT_AB_RING_NR;
+
+	for (i = 0; i < n; i++) {
+		unsigned int k = (ft_ab_ring_n - 1 - i) % FT_AB_RING_NR;
+
+		if (ft_ab_ring[k].slot == slot)
+			return ft_ab_ring[k].ra;
+	}
+	return NULL;
+}
+#else
+#define FT_AB_NOTE_OWNER(slot_, owner_)	do { } while (0)
+#endif
 
 #define FT_AB_ARM(cls, own)	\
 	do { ft_ab_pending = ft_ab_code((cls), (own)); } while (0)
@@ -145,13 +202,16 @@ static __thread uintptr_t ft_ab_lost_tag;
  * ft-txn-kind-stats.h, where the record is complete and the counters exist.
  */
 struct urcu_txn_record;
-static void ft_ab_note_lost(const struct urcu_txn_record *r);
+struct urcu_txn_desc;
+static void ft_ab_note_lost(const struct urcu_txn_desc *t,
+		const struct urcu_txn_record *r);
 
-#define URCU_TXN_STAT_ABORT(r)		ft_ab_note_lost(r)
+#define URCU_TXN_STAT_ABORT(t, r)	ft_ab_note_lost((t), (r))
 
 #else	/* the instrument is not built */
 
 #define FT_AB_ARM(cls, own)		do { } while (0)
+#define FT_AB_NOTE_OWNER(slot_, owner_)	do { } while (0)
 
 #endif	/* FT_DEBUG_TXN_KIND && URCU_TXN_REC_DBG */
 

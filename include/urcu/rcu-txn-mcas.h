@@ -131,8 +131,12 @@ extern "C" {
  * it only by the transaction it started -- which is not attribution when one
  * transaction carries records of several kinds.
  *
- * URCU_TXN_STAT_ABORT(r) is handed the LOSING record, or NULL where the abort
- * has none (a poisoned descriptor).  ☠ It fires at THREE exits, not one: the
+ * URCU_TXN_STAT_ABORT(t, r) is handed the descriptor and the LOSING record --
+ * the latter NULL where the abort has none (a poisoned descriptor).  BOTH,
+ * because a losing record is read against its SIBLINGS ("these two records
+ * disagree about whether the op holds that word" is the diagnosis; "this CAS
+ * lost" is not), and because @r->desc is NOT yet set on the lone-MW-edge path:
+ * the back-pointers are filled in after that fast path has already returned.  ☠ It fires at THREE exits, not one: the
  * install loop's failure, AND the lone-MW-edge fast path, whose CAS is the whole
  * commit and never builds a descriptor at all.  An instrument hooked only at the
  * first is blind to every single-record contention abort.
@@ -145,7 +149,7 @@ extern "C" {
  * cannot.
  */
 #ifndef URCU_TXN_STAT_ABORT
-#define URCU_TXN_STAT_ABORT(r)		do { } while (0)
+#define URCU_TXN_STAT_ABORT(t, r)	do { } while (0)
 #endif
 #ifndef URCU_TXN_REC_DBG_STAMP
 #define URCU_TXN_REC_DBG_STAMP(r)	do { } while (0)
@@ -998,7 +1002,7 @@ bool urcu_txn_desc_commit(struct urcu_txn_desc *t,
 	int failed;
 
 	if (caa_unlikely(t->poisoned)) {
-		URCU_TXN_STAT_ABORT(NULL);	/* no losing record: poisoned */
+		URCU_TXN_STAT_ABORT(t, NULL);	/* no losing record: poisoned */
 		urcu_txn_destroy(t);
 		return false;
 	}
@@ -1028,7 +1032,7 @@ bool urcu_txn_desc_commit(struct urcu_txn_desc *t,
 					r->new_ptr) == r->old_ptr;
 
 			if (caa_unlikely(!committed))
-				URCU_TXN_STAT_ABORT(r);
+				URCU_TXN_STAT_ABORT(t, r);
 			urcu_txn_destroy(t);
 			return committed;
 		}
@@ -1071,7 +1075,7 @@ bool urcu_txn_desc_commit(struct urcu_txn_desc *t,
 		planted = urcu_txn_install_mw_depth(t, nr_mw, &failed);
 	if (failed) {
 		/* Abort: restore the parked MW prefix to old, then reclaim. */
-		URCU_TXN_STAT_ABORT(&t->recs[planted]);
+		URCU_TXN_STAT_ABORT(t, &t->recs[planted]);
 		urcu_txn_settle(t, planted);
 		call_rcu_fn(&t->rcu_head, urcu_txn_free_rcu);
 		return false;
@@ -1103,7 +1107,7 @@ bool urcu_txn_desc_commit_sw(struct urcu_txn_desc *t,
 
 	urcu_assert_debug(t->nr_mw == 0);	/* caller promised store_sw-only */
 	if (caa_unlikely(t->poisoned)) {
-		URCU_TXN_STAT_ABORT(NULL);	/* no losing record: poisoned */
+		URCU_TXN_STAT_ABORT(t, NULL);	/* no losing record: poisoned */
 		urcu_txn_destroy(t);
 		return false;
 	}
