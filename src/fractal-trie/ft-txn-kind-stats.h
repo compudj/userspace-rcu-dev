@@ -232,6 +232,11 @@ struct ft_tk_site {
 	int id;			/* -1 until registered */
 };
 
+#ifdef FT_WINNER_DBG
+/* Raw-note sites (FT_WIN_NOTE_RAW): the non-engine live-slot writers. */
+#define FT_WIN_RAW_NR	2
+#endif
+
 struct ft_tk_tls {
 	struct ft_tk_tls *next;
 	unsigned long rec[FT_TK_MAX_SITES][FT_TK_REC_NR];
@@ -262,6 +267,38 @@ struct ft_tk_tls {
 	 * whether it OWNS the word.  [0] no, [1] yes.
 	 */
 	unsigned long pub_pair[2];
+#ifdef FT_WINNER_DBG
+	/*
+	 * WHO WON the word an alarmed record lost.  The PRIMARY witness is the
+	 * value the losing CAS OBSERVED (URCU_TXN_REC_LOST) -- race-free.  A
+	 * proxy there decodes to the winning record exactly (win_beater_proxy);
+	 * a plain value is matched against the winner ledger for CORROBORATION
+	 * only (win_beater_ledger) -- under ABA a value-match can name an older
+	 * write of the same value, so it is a population claim, never proof of
+	 * the one write.  win_raw names the non-engine release-store lane by
+	 * its note site.  win_owner compares the owner the (ledger-corroborated)
+	 * winner named against the loser's -- [0] same, [1] ☠ DIFFERENT (two
+	 * metadata each believed to own the word), [2] unknown.  win_owner_tomb
+	 * and win_owner_unparented are LOSER-side probes of candidate 2: the
+	 * registered owner found TOMBSTONED, or mid re-home (parent_word NULL),
+	 * at the alarm itself.
+	 */
+	unsigned long win_beater[FT_AB_CLS_NR][FT_AB_OWN_NR];
+	unsigned long win_beater_proxy;
+	unsigned long win_beater_ledger;
+	unsigned long win_raw[FT_WIN_RAW_NR];
+	unsigned long win_ledger_mismatch;	/* plain beater; ledger has the slot, another value */
+	unsigned long win_ledger_absent;	/* plain beater; no ledger entry (eviction, or an unhooked writer) */
+	unsigned long win_seen_none;	/* the loss exit had no observed value in hand */
+	unsigned long win_drift;	/* the slot changed again between the loss and this lookup */
+	unsigned long win_owner[3];
+	unsigned long win_tid_same;	/* the corroborated winner was THIS thread's own write */
+	unsigned long win_owner_tomb;
+	unsigned long win_owner_unparented;
+	unsigned long win_torn;		/* the ledger entry would not settle under 4 seq retries */
+	unsigned long win_note;		/* reach: ledger writes by this thread */
+	unsigned long win_note_skip;	/* ledger writes skipped on entry contention */
+#endif
 #endif
 };
 
@@ -402,6 +439,307 @@ const char *ft_ab_cls_name(unsigned int cls)
 static const char *ft_ab_cls_name(unsigned int cls);
 static int ft_ab_is_alarm(unsigned int cls, unsigned int own);
 
+#ifdef FT_WINNER_DBG
+/*
+ * THE WINNER LEDGER.  A global slot-keyed table of the LAST ENGINE WRITE to
+ * each slot -- who (label, named owner, record call site, tid) and what value.
+ * Filled from URCU_TXN_REC_WROTE on the writer's own thread (which is what
+ * lets it read the writer's ring for the owner it named); read by an aborting
+ * peer whose alarmed record just lost that slot.
+ *
+ * ☠ THE LEDGER IS A CLAIM ABOUT A POPULATION, NOT ABOUT ONE WRITE.  The entry
+ * the loser reads is only "the last stamped write" -- under ABA (the alarmed
+ * slot's value is known to cycle among three pointers) a value-match may name
+ * an OLDER write of the same value, and a racing stamp is skipped outright.
+ * What makes it usable anyway: every stamped writer of the slot IS a writer of
+ * that slot, so the HISTOGRAM over tens of thousands of alarms describes the
+ * slot's writer population, which is the question ("who writes a child slot of
+ * P without holding P").  The value-match (win_attr vs win_stale) and the
+ * reach counters bound the noise instead of hiding it.
+ *
+ * Entries are seq-versioned (even = stable, odd = writer active).  A writer
+ * TRY-claims with one CAS and SKIPS on contention -- the ledger must never
+ * add a wait to the engine's install path -- and the skip is counted.
+ */
+#define FT_WIN_BITS	19
+#define FT_WIN_SIZE	(1UL << FT_WIN_BITS)
+#define FT_WIN_MASK	(FT_WIN_SIZE - 1)
+#define FT_WIN_WAYS	4
+
+struct ft_win_ent {
+	unsigned long seq;
+	void **slot;
+	void *val;
+	const void *owner;	/* the owner the WINNER named (its ring), or NULL */
+	const void *ra;		/* the winner's record call site, or NULL */
+	unsigned long tid;
+	unsigned int code;	/* the winner's dbg_embedder label */
+};
+
+static struct ft_win_ent ft_win_tbl[FT_WIN_SIZE];
+
+static inline
+unsigned long ft_win_hash(void **slot)
+{
+	uintptr_t a = (uintptr_t) slot >> 3;
+
+	a ^= a >> 33;
+	a *= 0xff51afd7ed558ccdULL;
+	a ^= a >> 29;
+	return (unsigned long) a & FT_WIN_MASK;
+}
+
+static inline
+unsigned long ft_win_tid(void)
+{
+	return (unsigned long) pthread_self();
+}
+
+/* Declared in ft-txn-rec-dbg.h; the engine's URCU_TXN_REC_WROTE lands here. */
+static
+void ft_win_note(void **slot, void *val, unsigned int code)
+{
+	struct ft_tk_tls *tls = ft_tk_tls_get();
+	unsigned long h = ft_win_hash(slot);
+	struct ft_win_ent *e = NULL;
+	unsigned long s;
+	unsigned int i, cls = ft_ab_code_cls(code);
+
+	for (i = 0; i < FT_WIN_WAYS; i++) {
+		struct ft_win_ent *c = &ft_win_tbl[(h + i) & FT_WIN_MASK];
+
+		if (CMM_LOAD_SHARED(c->slot) == slot) {
+			e = c;
+			break;
+		}
+		if (!e && !CMM_LOAD_SHARED(c->slot))
+			e = c;
+	}
+	if (!e)
+		e = &ft_win_tbl[h];	/* all ways foreign: evict the primary */
+	s = uatomic_load(&e->seq, CMM_RELAXED);
+	if ((s & 1) || uatomic_cmpxchg(&e->seq, s, s + 1) != s) {
+		tls->win_note_skip++;
+		return;
+	}
+	CMM_STORE_SHARED(e->slot, slot);
+	CMM_STORE_SHARED(e->val, val);
+	e->code = code;
+	/*
+	 * The ring notes owners only where FT_AB_NOTE_OWNER runs -- the
+	 * lock-coverable classes.  Asking it for any other class would return
+	 * a STALE note from an earlier record on this thread that happened to
+	 * share the slot.
+	 */
+	if (cls == FT_AB_MW_STRUCT || cls == FT_AB_MW_LOCK) {
+		e->owner = ft_ab_owner_of(slot);
+		e->ra = ft_ab_ra_of(slot);
+	} else if (cls >= FT_AB_CLS_NR) {
+		/* A raw note: the return address names the storing lane
+		 * (addr2line -i walks the inline chain to the caller). */
+		e->owner = NULL;
+		e->ra = __builtin_return_address(0);
+	} else {
+		e->owner = NULL;
+		e->ra = NULL;
+	}
+	e->tid = ft_win_tid();
+	uatomic_store(&e->seq, s + 2, CMM_RELEASE);
+	tls->win_note++;
+}
+
+enum ft_win_state {
+	FT_WIN_NONE = 0,	/* no observed value at the loss exit */
+	FT_WIN_ATTR,	/* plain beater, ledger-corroborated (population claim) */
+	FT_WIN_PROXY,	/* ★ the observed value IS the winning record (exact) */
+	FT_WIN_STALE,	/* ledger names the slot, another value: lag or an unhooked writer */
+	FT_WIN_MISS,	/* no ledger entry: eviction, or an unhooked writer */
+	FT_WIN_TORN,	/* the entry would not settle */
+	FT_WIN_RAW,	/* ☠ the beater was a NON-ENGINE release store, by note site */
+};
+
+/* The observed value of the last lost CAS (URCU_TXN_REC_LOST). */
+static __thread struct {
+	const struct urcu_txn_record *rec;
+	void *seen;
+	int valid;
+} ft_win_seen_tls;
+
+static
+void ft_win_lost(const struct urcu_txn_record *rec, void *seen)
+{
+	ft_win_seen_tls.rec = rec;
+	ft_win_seen_tls.seen = seen;
+	ft_win_seen_tls.valid = 1;
+}
+
+/* The last lookup's answer, for the -DFT_ABORT_CLAIM dump. */
+static __thread struct {
+	enum ft_win_state state;
+	unsigned int code;
+	const void *owner;
+	const void *ra;
+	unsigned long tid;
+	void *now;
+	void *seen;
+	void *val;
+	int have;
+	int owner_tomb;
+	int owner_unparented;
+} ft_win_last;
+
+static
+void ft_win_lookup(const struct urcu_txn_record *r)
+{
+	struct ft_tk_tls *tls = ft_tk_tls_get();
+	int have = ft_win_seen_tls.valid && ft_win_seen_tls.rec == r;
+	void *seen = have ? ft_win_seen_tls.seen : NULL;
+	void *now = CMM_LOAD_SHARED(*r->slot);
+	unsigned long h;
+	struct ft_win_ent snap;
+	int found = 0, torn = 0;
+	unsigned int i;
+
+	ft_win_seen_tls.valid = 0;
+	memset(&ft_win_last, 0, sizeof(ft_win_last));
+	ft_win_last.now = now;
+	ft_win_last.seen = seen;
+	ft_win_last.have = have;
+	/*
+	 * LOSER-SIDE probes of the re-home candidate, no winner cooperation
+	 * needed: is the owner this op registered (and still holds) already
+	 * TOMBSTONED, or mid re-home (the parent_word NULL transient belongs
+	 * to detach / graft_swap)?  Either found true at an alarm says the
+	 * word left the registered owner's coverage while the lock was held.
+	 */
+	{
+		const struct cds_ft_metadata *own =
+			(const struct cds_ft_metadata *)
+				ft_ab_owner_of(r->slot);
+
+		if (own) {
+			if (CMM_LOAD_SHARED(own->state) & FT_STATE_TOMBSTONE) {
+				tls->win_owner_tomb++;
+				ft_win_last.owner_tomb = 1;
+			}
+			if (!CMM_LOAD_SHARED(own->parent_word)) {
+				tls->win_owner_unparented++;
+				ft_win_last.owner_unparented = 1;
+			}
+		}
+	}
+	if (!have || !seen) {
+		/* No observed value (or a genuine NULL beater): unattributable. */
+		tls->win_seen_none++;
+		ft_win_last.state = FT_WIN_NONE;
+		return;
+	}
+	if (now != seen)
+		tls->win_drift++;	/* the window a re-read design would misread */
+	/*
+	 * ★ THE EXACT ARM.  A proxy observed AT the losing CAS is the winning
+	 * record itself -- RCU keeps its descriptor alive for this reader --
+	 * and its label needs no ledger.  The winner's ring is another
+	 * thread's, so its named owner stays unknown here.
+	 */
+	if (urcu_txn_is_proxy(seen, r->proxy_tag)) {
+		const struct urcu_txn_record *wr =
+			(const struct urcu_txn_record *)
+				urcu_txn_untag(seen, r->proxy_tag);
+		unsigned int wcode = CMM_LOAD_SHARED(wr->dbg_embedder);
+		unsigned int wcls = ft_ab_code_cls(wcode);
+
+		if (wcls >= FT_AB_CLS_NR)
+			wcls = FT_AB_UNSET;
+		tls->win_beater[wcls][ft_ab_code_own(wcode)]++;
+		tls->win_beater_proxy++;
+		ft_win_last.state = FT_WIN_PROXY;
+		ft_win_last.code = wcode;
+		return;
+	}
+	/* A plain beater: the ledger is corroboration, never proof. */
+	h = ft_win_hash(r->slot);
+	for (i = 0; i < FT_WIN_WAYS && !found && !torn; i++) {
+		struct ft_win_ent *e = &ft_win_tbl[(h + i) & FT_WIN_MASK];
+		unsigned int tries;
+
+		if (CMM_LOAD_SHARED(e->slot) != r->slot)
+			continue;
+		torn = 1;
+		for (tries = 0; tries < 4; tries++) {
+			unsigned long s0 = uatomic_load(&e->seq, CMM_ACQUIRE);
+
+			if (s0 & 1) {
+				caa_cpu_relax();
+				continue;
+			}
+			snap = *e;
+			cmm_smp_rmb();
+			if (uatomic_load(&e->seq, CMM_RELAXED) == s0) {
+				found = snap.slot == r->slot;
+				torn = 0;
+				break;
+			}
+		}
+	}
+	if (torn) {
+		tls->win_torn++;
+		ft_win_last.state = FT_WIN_TORN;
+		return;
+	}
+	if (found && snap.val == seen) {
+		/*
+		 * ☠ Compare the CLASS FIELD, not the code: the code carries the
+		 * ownership witness at bit 8, so an engine MW_STRUCT/held code
+		 * (0x102) is numerically past FT_AB_CLS_NR.  A full-code compare
+		 * misfiled every such winner as raw -- caught by ONE claim
+		 * sample printing the fields the counter had already binned.
+		 */
+		if (ft_ab_code_cls(snap.code) >= FT_AB_CLS_NR) {
+			unsigned int k = ft_ab_code_cls(snap.code) - FT_AB_CLS_NR;
+
+			tls->win_raw[k < FT_WIN_RAW_NR ? k : 0]++;
+			ft_win_last.state = FT_WIN_RAW;
+		} else {
+			unsigned int wcls = ft_ab_code_cls(snap.code);
+			const void *lown = ft_ab_owner_of(r->slot);
+
+			if (wcls >= FT_AB_CLS_NR)
+				wcls = FT_AB_UNSET;
+			tls->win_beater[wcls][ft_ab_code_own(snap.code)]++;
+			tls->win_beater_ledger++;
+			if (!snap.owner || !lown)
+				tls->win_owner[2]++;
+			else if (snap.owner == lown)
+				tls->win_owner[0]++;
+			else
+				tls->win_owner[1]++;
+			if (snap.tid == ft_win_tid())
+				tls->win_tid_same++;
+			ft_win_last.state = FT_WIN_ATTR;
+		}
+		ft_win_last.code = snap.code;
+		ft_win_last.owner = snap.owner;
+		ft_win_last.ra = snap.ra;
+		ft_win_last.tid = snap.tid;
+		ft_win_last.val = snap.val;
+		return;
+	}
+	if (found) {
+		tls->win_ledger_mismatch++;
+		ft_win_last.state = FT_WIN_STALE;
+		ft_win_last.code = snap.code;
+		ft_win_last.owner = snap.owner;
+		ft_win_last.ra = snap.ra;
+		ft_win_last.tid = snap.tid;
+		ft_win_last.val = snap.val;
+		return;
+	}
+	tls->win_ledger_absent++;
+	ft_win_last.state = FT_WIN_MISS;
+}
+#endif	/* FT_WINNER_DBG */
+
 static
 void ft_ab_note_lost(const struct urcu_txn_desc *t,
 		const struct urcu_txn_record *r)
@@ -410,6 +748,23 @@ void ft_ab_note_lost(const struct urcu_txn_desc *t,
 		ft_ab_code(FT_AB_UNSET, FT_AB_OWN_NA);
 	ft_ab_lost_tag = r ? r->proxy_tag : 0;
 	ft_ab_lost_valid = r != NULL;
+#ifdef FT_WINNER_DBG
+	/*
+	 * The winner lookup runs HERE, at the first instant after the lost
+	 * CAS: every microsecond of delay lets more writes land on the slot
+	 * and turns ATTRIBUTED into STALE.
+	 */
+	ft_win_last.state = FT_WIN_NONE;
+	if (r && ft_ab_is_alarm(ft_ab_code_cls(ft_ab_lost),
+			ft_ab_code_own(ft_ab_lost)))
+		ft_win_lookup(r);
+	/*
+	 * Consume the stash on EVERY abort: records live in a reused slab, so
+	 * a stale {rec, seen} pair could otherwise match a LATER alarm's
+	 * record by address and attribute last week's beater to it.
+	 */
+	ft_win_seen_tls.valid = 0;
+#endif
 #ifdef FT_ABORT_CLAIM
 	/*
 	 * THE DESCRIPTOR IS STILL INTACT HERE and is freed on the way out, so
@@ -443,6 +798,32 @@ void ft_ab_note_lost(const struct urcu_txn_desc *t,
 				ft_ab_owner_of(q->slot), ft_ab_ra_of(q->slot),
 				q == r ? "   <== LOST" : "");
 		}
+#ifdef FT_WINNER_DBG
+		{
+			static const char * const wst[] = {
+				"NONE (no observed value)",
+				"ledger-corroborated",
+				"★ PROXY-DECODED (exact)",
+				"ledger STALE",
+				"no ledger entry",
+				"ledger TORN",
+				"☠ RAW-LANE store",
+			};
+
+			fprintf(stderr,
+"    beater: %s  seen=%p now=%p  cls=%s own=%u owner=%p ra=%p tid=0x%lx%s%s\n",
+				wst[ft_win_last.state],
+				ft_win_last.seen, ft_win_last.now,
+				ft_ab_cls_name(ft_ab_code_cls(ft_win_last.code)),
+				ft_ab_code_own(ft_win_last.code),
+				ft_win_last.owner, ft_win_last.ra,
+				ft_win_last.tid,
+				ft_win_last.owner_tomb ?
+					"  ☠ REGISTERED OWNER TOMBSTONED" : "",
+				ft_win_last.owner_unparented ?
+					"  ☠ REGISTERED OWNER MID RE-HOME (parent_word NULL)" : "");
+		}
+#endif
 	}
 #endif
 }
@@ -568,6 +949,17 @@ void ft_tk_dump(void)
 	unsigned long ab_alarm_site[FT_TK_MAX_SITES][2];
 	unsigned long ab_tot = 0, ab_alarm[2] = { 0, 0 }, pub_pair[2] = { 0, 0 };
 	unsigned long ab_mixed = 0, ab_unattrib = 0;
+#ifdef FT_WINNER_DBG
+	unsigned long win_beater[FT_AB_CLS_NR][FT_AB_OWN_NR];
+	unsigned long win_raw[FT_WIN_RAW_NR];
+	unsigned long win_owner[3] = { 0, 0, 0 };
+	unsigned long win_beater_proxy = 0, win_beater_ledger = 0;
+	unsigned long win_ledger_mismatch = 0, win_ledger_absent = 0;
+	unsigned long win_seen_none = 0, win_drift = 0;
+	unsigned long win_tid_same = 0, win_torn = 0;
+	unsigned long win_owner_tomb = 0, win_owner_unparented = 0;
+	unsigned long win_note = 0, win_note_skip = 0;
+#endif
 #endif
 	struct ft_tk_row tot;
 	int nr, i, threads = 0;
@@ -582,6 +974,10 @@ void ft_tk_dump(void)
 	memset(ab, 0, sizeof(ab));
 	memset(ab_own, 0, sizeof(ab_own));
 	memset(ab_alarm_site, 0, sizeof(ab_alarm_site));
+#ifdef FT_WINNER_DBG
+	memset(win_beater, 0, sizeof(win_beater));
+	memset(win_raw, 0, sizeof(win_raw));
+#endif
 #endif
 	rows = (struct ft_tk_row *) calloc(nr ? nr : 1, sizeof(*rows));
 	if (!rows) {
@@ -617,6 +1013,27 @@ void ft_tk_dump(void)
 			ab_unattrib += tls->ab_unattrib;
 			pub_pair[0] += tls->pub_pair[0];
 			pub_pair[1] += tls->pub_pair[1];
+#ifdef FT_WINNER_DBG
+			for (c2 = 0; c2 < FT_AB_CLS_NR; c2++)
+				for (o2 = 0; o2 < FT_AB_OWN_NR; o2++)
+					win_beater[c2][o2] += tls->win_beater[c2][o2];
+			for (o2 = 0; o2 < FT_WIN_RAW_NR; o2++)
+				win_raw[o2] += tls->win_raw[o2];
+			for (o2 = 0; o2 < 3; o2++)
+				win_owner[o2] += tls->win_owner[o2];
+			win_beater_proxy += tls->win_beater_proxy;
+			win_beater_ledger += tls->win_beater_ledger;
+			win_ledger_mismatch += tls->win_ledger_mismatch;
+			win_ledger_absent += tls->win_ledger_absent;
+			win_seen_none += tls->win_seen_none;
+			win_drift += tls->win_drift;
+			win_tid_same += tls->win_tid_same;
+			win_torn += tls->win_torn;
+			win_owner_tomb += tls->win_owner_tomb;
+			win_owner_unparented += tls->win_owner_unparented;
+			win_note += tls->win_note;
+			win_note_skip += tls->win_note_skip;
+#endif
 		}
 #endif
 		for (i = 0; i < nr; i++) {
@@ -805,6 +1222,68 @@ void ft_tk_dump(void)
 					rows[i].site->what,
 					ab_alarm_site[id][1], ab_alarm_site[id][0]);
 		}
+#ifdef FT_WINNER_DBG
+		/*
+		 * WHO BEAT the alarmed word.  The primary witness is the value
+		 * the losing CAS OBSERVED (URCU_TXN_REC_LOST): a proxy there
+		 * decodes to the winning record EXACTLY; a plain value is only
+		 * ledger-CORROBORATED (a population claim -- ABA can name an
+		 * older write of the same value).  The rows are the WINNER's
+		 * label; the loser is always the owner-held structural record
+		 * above.  The reach line is the proof the stamps ran at all
+		 * ([[feedback_verify_the_mechanism_ran_before_believing_a_zero]]).
+		 */
+		{
+			static const char * const raw_names[FT_WIN_RAW_NR] = {
+				"lone-edge flip (ft_ord_cell_flip_one)",
+				"remove head-promote back store",
+			};
+			unsigned long win_tot = 0, raw_tot = 0;
+			int c3, o3;
+
+			for (c3 = 0; c3 < FT_AB_CLS_NR; c3++)
+				for (o3 = 0; o3 < FT_AB_OWN_NR; o3++)
+					win_tot += win_beater[c3][o3];
+			for (o3 = 0; o3 < FT_WIN_RAW_NR; o3++)
+				raw_tot += win_raw[o3];
+			fprintf(stderr,
+"\n    ★ BEATER of the alarmed word (-DFT_WINNER_DBG):\n"
+"      ledger reach: %lu writes stamped / %lu skipped on entry contention\n"
+"      engine winner %lu = ★ proxy-decoded (exact) %lu + ledger-corroborated %lu (self-tid %lu)\n"
+"      ☠ raw-lane winner %lu / plain unmatched: ledger-mismatch %lu + no-entry %lu / torn %lu\n"
+"      no observed value at the loss exit: %lu    drift (slot moved again before lookup): %lu\n"
+"      corroborated winner's named owner vs the loser's: same %lu / ☠ DIFFERENT %lu / unknown %lu\n"
+"      loser's registered owner AT the alarm: ☠ TOMBSTONED %lu / ☠ MID RE-HOME (parent_word NULL) %lu\n",
+				win_note, win_note_skip,
+				win_tot, win_beater_proxy, win_beater_ledger,
+				win_tid_same,
+				raw_tot, win_ledger_mismatch, win_ledger_absent,
+				win_torn, win_seen_none, win_drift,
+				win_owner[0], win_owner[1], win_owner[2],
+				win_owner_tomb, win_owner_unparented);
+			for (c3 = 0; c3 < FT_AB_CLS_NR; c3++) {
+				for (o3 = 0; o3 < FT_AB_OWN_NR; o3++) {
+					if (!win_beater[c3][o3])
+						continue;
+					fprintf(stderr,
+"        %-16s witness=%s %12lu  %5.1f%%\n",
+						ft_ab_cls_name(c3),
+						o3 == FT_AB_OWN_HELD ? "held" :
+						(o3 == FT_AB_OWN_LEDGER ? "ledger" :
+						(o3 == FT_AB_OWN_MISS ? "MISS" : "n/a")),
+						win_beater[c3][o3],
+						win_tot ? 100.0 *
+							(double) win_beater[c3][o3] /
+							(double) win_tot : 0.0);
+				}
+			}
+			for (o3 = 0; o3 < FT_WIN_RAW_NR; o3++)
+				if (win_raw[o3])
+					fprintf(stderr,
+"        ☠ raw: %-40s %12lu\n",
+						raw_names[o3], win_raw[o3]);
+		}
+#endif
 	}
 #endif
 	fprintf(stderr,

@@ -4375,6 +4375,7 @@ void ft_ord_cell_flip_one(struct ft_ord_cell_edge *edge)
 		(const void *) edge->old_target,
 		(const void *) edge->new_target);
 	rcu_assign_pointer(*edge->slot, edge->new_target);
+	FT_WIN_NOTE_RAW(edge->slot, edge->new_target, 0);
 }
 
 /*

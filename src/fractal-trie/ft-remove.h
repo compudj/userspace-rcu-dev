@@ -3139,14 +3139,17 @@ int ft_detach_node(struct cds_ft *ft,
 				 * forward store (single writer, cannot abort).
 				 */
 				if (pub->head_parent_field) {
-					if (commit_txn)
+					if (commit_txn) {
 						ft_flip_txn_record_head_back_edge(commit_txn,
 							(void **) pub->head_parent_field,
 							pub->head_parent_old,
 							pub->head_parent_new);
-					else
+					} else {
 						rcu_assign_pointer(*pub->head_parent_field,
 							pub->head_parent_new);
+						FT_WIN_NOTE_RAW(pub->head_parent_field,
+							pub->head_parent_new, 1);
+					}
 				}
 				/*
 				 * §4.B VALIDATE (Phase 4.3, MW): the EXTERNAL-PROMOTE

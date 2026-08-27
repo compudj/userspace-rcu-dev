@@ -42,6 +42,11 @@
  * printing zeros ([[feedback_verify_the_mechanism_ran_before_believing_a_zero]]).
  */
 
+#if defined(FT_WINNER_DBG) && \
+	!(defined(FT_DEBUG_TXN_KIND) && defined(URCU_TXN_REC_DBG))
+#error "-DFT_WINNER_DBG needs both -DFT_DEBUG_TXN_KIND and -DURCU_TXN_REC_DBG"
+#endif
+
 #if defined(FT_DEBUG_TXN_KIND) && defined(URCU_TXN_REC_DBG)
 
 #define FT_ABORT_ATTRIB	1
@@ -110,11 +115,15 @@ static __thread int ft_ab_lost_valid;
 static __thread uintptr_t ft_ab_lost_tag;
 #ifdef FT_ABORT_CLAIM
 static __thread int ft_ab_claim_armed;
+#endif
+#if defined(FT_ABORT_CLAIM) || defined(FT_WINNER_DBG)
 /*
- * SLOT -> the OWNER the record NAMED, for the claim's dump only.  The engine
- * record has no room for a pointer and this is not worth growing it for: a ring
- * walked BACKWARDS finds the most recent naming of a slot, which is the one the
- * losing record made.  Sized far above the largest observed graft descriptor.
+ * SLOT -> the OWNER the record NAMED.  The engine record has no room for a
+ * pointer and this is not worth growing it for: a ring walked BACKWARDS finds
+ * the most recent naming of a slot, which is the one the losing record made.
+ * Sized far above the largest observed graft descriptor.  Two consumers: the
+ * claim's dump (the loser's own naming), and the winner ledger (the writer
+ * stamps ITS naming as it wins the word, on its own thread, from its own ring).
  */
 #define FT_AB_RING_NR	256
 static __thread struct {
@@ -208,11 +217,54 @@ static void ft_ab_note_lost(const struct urcu_txn_desc *t,
 
 #define URCU_TXN_STAT_ABORT(t, r)	ft_ab_note_lost((t), (r))
 
+#ifdef FT_WINNER_DBG
+/*
+ * THE WINNER LEDGER (-DFT_WINNER_DBG, on top of the two defines above).  The
+ * alarm's remaining question is about the WINNER, not the loser: the op holds
+ * P's DLM lock, writes a child slot inside P, and a peer still wins that word
+ * -- so WHO writes a child slot of P without holding P?  Every engine write of
+ * a slot (proxy plant, park, settle, the lone-edge fast paths) lands here via
+ * URCU_TXN_REC_WROTE with the record's label, and is filed in a global
+ * slot-keyed ledger together with the owner this writer NAMED (its own ring,
+ * its own thread) and its tid.  The loser consults the ledger at the alarm.
+ *
+ * Declared against the incomplete engine type for the same reason as
+ * ft_ab_note_lost above; defined in ft-txn-kind-stats.h, where the counters
+ * and the ledger live.
+ */
+static void ft_win_note(void **slot, void *val, unsigned int code);
+static void ft_win_lost(const struct urcu_txn_record *rec, void *seen);
+
+#define URCU_TXN_REC_WROTE(r, v)	\
+	ft_win_note((r)->slot, (v), (r)->dbg_embedder)
+/*
+ * ★ THE PRIMARY WITNESS.  The value the losing CAS OBSERVED, captured by the
+ * engine at the loss itself -- race-free, unlike any later re-read of the
+ * slot.  A proxy here IS the winning record; a plain value is matched against
+ * the ledger for corroboration only.
+ */
+#define URCU_TXN_REC_LOST(r, seen)	ft_win_lost((r), (seen))
+/*
+ * A NON-ENGINE writer of a live slot -- the lone-edge release-store lane
+ * (ft_ord_cell_flip_one and friends), whose exclusion is the caller's lock,
+ * not an expected-old.  Filed in the same ledger under a synthetic class so an
+ * alarmed loser can name it; without these notes a raw winner is UNPROVABLE
+ * (it surfaces as a ledger mismatch, indistinguishable from ledger lag).
+ */
+#define FT_WIN_NOTE_RAW(slot_, val_, k_)				\
+	ft_win_note((void **) (slot_), (void *) (val_),			\
+		FT_AB_CLS_NR + (unsigned int) (k_))
+#endif	/* FT_WINNER_DBG */
+
 #else	/* the instrument is not built */
 
 #define FT_AB_ARM(cls, own)		do { } while (0)
 #define FT_AB_NOTE_OWNER(slot_, owner_)	do { } while (0)
 
 #endif	/* FT_DEBUG_TXN_KIND && URCU_TXN_REC_DBG */
+
+#ifndef FT_WIN_NOTE_RAW
+#define FT_WIN_NOTE_RAW(slot_, val_, k_)	do { } while (0)
+#endif
 
 #endif /* _FT_TXN_REC_DBG_H */
