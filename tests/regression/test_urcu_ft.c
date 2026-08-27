@@ -98,6 +98,7 @@ DEFINE_URCU_TLS(unsigned long long, nr_writes);
 DEFINE_URCU_TLS(unsigned long long, nr_reads);
 
 unsigned int nr_readers;
+static enum cds_ft_writer_strategy writer_strategy = CDS_FT_WRITER_LOCK_FINE;
 unsigned int nr_writers;
 
 static unsigned int insert_ratio = 50;
@@ -1791,6 +1792,9 @@ int do_mt_test(void)
 		abort();
 	if (cds_ft_group_attr_set_key_len(attr, key_len) < 0)
 		abort();
+	if (cds_ft_group_attr_set_writer_strategy(attr, writer_strategy)
+			!= CDS_FT_STATUS_OK)
+		abort();
 
 	printf("Allocating Fractal Trie for %u-byte keys\n", key_len);
 	if (cds_ft_group_create(attr, &test_ft_group) < 0) {
@@ -2113,11 +2117,20 @@ int main(int argc, char **argv)
 		goto usage_error;
 
 	optind = 4;
-	while ((opt = getopt_long(argc, argv, "d:c:va:r:kR:S:T:M:N:O:Vtxyb:B:m:uslZDqo",
+	while ((opt = getopt_long(argc, argv, "d:c:va:r:kR:S:T:M:N:O:Vtxyb:B:m:uslZDqoW:",
 				  long_options, NULL)) != -1) {
 		switch (opt) {
 		case 'd':
 			wdelay = atol(optarg);
+			break;
+		case 'W':
+			/* E.4: writer strategy, "fine" (default) or "coarse". */
+			if (!strcmp(optarg, "coarse"))
+				writer_strategy = CDS_FT_WRITER_LOCK_COARSE;
+			else if (!strcmp(optarg, "fine"))
+				writer_strategy = CDS_FT_WRITER_LOCK_FINE;
+			else
+				goto usage_error;
 			break;
 		case 'c':
 			rduration = atol(optarg);
