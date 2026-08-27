@@ -1087,6 +1087,51 @@ run to run; what is stable is the refusal SPLIT (all trie-wide, three zeros).
 
 ## 5. Phase C — the residual MW_ALWAYS lanes (the G4 decision)
 
+### C.1 — THE RE-MEASURE (Phase B complete, B1-B6 all landed)
+
+ft_inv `FT_INV_MW=1`, 507 threads, per-node, `--enable-rcu-debug`
+`-DFT_DEBUG_TXN_KIND`, against §4's pre-Phase-B baseline. Normalised per 1k txns
+created, because the two runs differ in size (94.9M vs 88.6M):
+
+    lane          baseline      post-B6 |  base/1k  post/1k   delta
+    SW           3,472,296   21,752,370 |     36.6    245.7   +571%
+    MW_STRUCT  136,857,021   44,580,604 |   1442.1    503.4    -65%
+    MW_ALWAYS   85,087,969  149,372,031 |    896.6   1686.9    +88%
+    MW_LOCK     52,667,070   46,413,021 |    555.0    524.1     -6%
+    VALIDATE    23,383,128   18,173,415 |    246.4    205.2    -17%
+    cell/hlist  17,551,703   14,565,802 |    184.9    164.5    -11%
+    ABORT        2,415,932    1,906,296 |     25.5     21.5    -15%
+
+☑ **THE CONVERSION SURFACE IS DOWN 65%** and SW is up 6.7×. That is Phase B's
+result, and it is large enough not to be run noise.
+
+☠ **THE ABORT NUMBER IS NOT.** −15% is inside the ±40% run-to-run spread
+measured on this column ([[feedback_abort_column_is_not_a_per_step_number]]), and
+§4's own ceiling for the whole conversion was ~29% of aborts (the content lanes;
+71% are the ACQUIRE lane, still 46.4M MW_LOCK records here). Read the direction,
+not the figure. A defensible number needs n≥3 alternated against a control
+build, which C should run before anything is claimed.
+
+☠☠ **MW_ALWAYS NEARLY DOUBLED, and part of that is BOOKKEEPING, not traffic.**
+`af22756b`'s per-edge `@owner_held` routes every unheld SKIP_X dual through
+`ft_flip_txn_record_tag_mw`, which counts MW_ALWAYS — so edges that used to sit
+in MW_STRUCT (or in SW, unsoundly) now land here. **The split between real
+MW_ALWAYS traffic and reclassified duals is not measured, and G4 must not be
+decided on this number until it is.** That is C's first task, and it is cheap:
+count the dual edges at their producer.
+
+### C.2 — G4's actual input
+
+With MW_STRUCT at 503/1k, the residue is dominated by MW_ALWAYS (1687/1k) and
+MW_LOCK (524/1k). MW_LOCK is the lock take and stays MW forever. So the G4
+question — does the ordered-cell / hlist lane stay MW? — is now the largest open
+lever, and `cell/hlist` (164/1k, unattributed by site) is only the part recorded
+straight on the engine handle; the rest is inside MW_ALWAYS above.
+☞ **Decompose MW_ALWAYS before G4 is argued**: reclassified duals, rank-count
+propagation, ordered-cell interleave, duplicate-chain splices. Four populations
+with four different answers, currently one number.
+
+
 After Phase B, re-run the counter baseline. The decision input Mathieu asked
 for is the granularity comparison: what fraction of remaining aborts and
 retries is the CELL lane (vs the acquire lane), and what would a per-cell
