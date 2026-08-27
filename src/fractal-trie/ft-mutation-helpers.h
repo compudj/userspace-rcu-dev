@@ -1296,6 +1296,67 @@ void ft_txn_attempt_bail(struct urcu_txn *op, bool open)
 	ft_acq_contended = 0;
 }
 
+/*
+ * -DFT_DLM_LINGER (default OFF, measurement arm): at remove's retry edge --
+ * after the bail, turn forfeited, txn ended, NOTHING held -- spin on the word
+ * whose LOCK refused the last attempt, capped, and re-attempt the instant it
+ * frees.  Not the refuted blind backoff: the wait is event-bounded on the
+ * word itself, so the victim's attempt rate at the release goes UP.  Arena
+ * metadata is never unmapped, so the racy read cannot fault.
+ */
+#ifdef FT_DLM_LINGER
+# include <time.h>
+# include <stdio.h>
+# ifndef FT_DLM_LINGER_US
+#  define FT_DLM_LINGER_US	200
+# endif
+static __thread const struct cds_ft_metadata *ft_linger_word;
+static __thread unsigned long ft_linger_calls, ft_linger_timeouts;
+
+static inline
+uint64_t ft_linger_now_ns(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t) ts.tv_sec * 1000000000ULL + (uint64_t) ts.tv_nsec;
+}
+
+static inline
+void ft_dlm_linger(struct urcu_txn *op)
+{
+	const struct cds_ft_metadata *w = ft_linger_word;
+	uint64_t t0;
+
+	if (!w)
+		return;
+	ft_linger_word = NULL;
+	/*
+	 * Only an ESCALATED op lingers.  Aging is attempt-denominated, and a
+	 * linger stretches an attempt ~30-60x without aging it -- an
+	 * un-escalated victim would reach its lane threshold at wall-clock
+	 * rates the mechanism itself deflated.  The measured victims are all
+	 * at the lane head, so this gate loses none of the target class.
+	 */
+	if (op->retry < URCU_TXN_FALLBACK_MIN)
+		return;
+	if (!(CMM_LOAD_SHARED(w->state) & FT_STATE_LOCK))
+		return;
+	if (caa_unlikely(!ft_linger_calls++))
+		fprintf(stderr, "FT DLM LINGER ARMED (cap %uus)\n",
+			(unsigned int) FT_DLM_LINGER_US);
+	t0 = ft_linger_now_ns();
+	while (CMM_LOAD_SHARED(w->state) & FT_STATE_LOCK) {
+		caa_cpu_relax();
+		if (ft_linger_now_ns() - t0 >
+				(uint64_t) FT_DLM_LINGER_US * 1000ULL) {
+			ft_linger_timeouts++;
+			break;
+		}
+	}
+}
+#endif /* FT_DLM_LINGER */
+
 /* Defined below; the constructors arm through it. */
 static inline
 void ft_flip_txn_set_structural_sw(struct ft_flip_txn *t, bool v);
@@ -3792,6 +3853,10 @@ int ft_dlm_lock(struct ft_flip_txn *t, struct cds_ft_metadata *meta,
 	assert(!t->structural_sw);
 	if (caa_unlikely(s & (FT_STATE_PROXY | FT_STATE_TOMBSTONE |
 			FT_STATE_LOCK))) {
+#ifdef FT_DLM_LINGER
+		if (s & FT_STATE_LOCK)
+			ft_linger_word = meta;
+#endif
 #ifdef FT_DEBUG_REMOVE_RETRY_CAP
 		if (s & FT_STATE_LOCK) {
 			ft_dbg_acq_dirty_lock++;

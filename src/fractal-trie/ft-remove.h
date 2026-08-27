@@ -5004,6 +5004,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 	bool need_retry;
 #ifdef FT_DEBUG_REMOVE_RETRY_CAP
 	unsigned int ft_remove_attempts = 0;
+	uint64_t ft_remove_t0 = ft_dbg_now_ns();
 
 	ft_dbg_acq_dirty_lock = 0;
 	ft_dbg_acq_dirty_other = 0;
@@ -5037,11 +5038,15 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 	for (;;) {
 		need_retry = false;
 		urcu_txn_begin(&optxn);
+#ifdef FT_DLM_LINGER
+		ft_linger_word = NULL;	/* only THIS attempt's refusal counts */
+#endif
 		s = _cds_ft_remove_locked(ft, iter, node, &need_retry, &optxn);
 		if (!need_retry)
 			break;
 #ifdef FT_DEBUG_REMOVE_RETRY_CAP
 		++ft_remove_attempts;
+#ifndef FT_REMOVE_TAIL_QUIET
 		if (caa_unlikely(ft_remove_attempts == 100 ||
 				ft_remove_attempts == 1000 ||
 				ft_remove_attempts == 10000)) {
@@ -5140,6 +5145,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 			}
 #endif /* !FT_ENABLE_TRACING */
 		}
+#endif /* !FT_REMOVE_TAIL_QUIET */
 		if (caa_unlikely(ft_remove_attempts > FT_REMOVE_RETRY_CAP)) {
 			fprintf(stderr, "FT REMOVE LIVELOCK: %u attempts on "
 				"one remove\n", ft_remove_attempts);
@@ -5148,8 +5154,24 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 #endif
 		/* Age the conflict, forfeit the turn, close the attempt. */
 		ft_txn_attempt_bail(&optxn, true);
+#ifdef FT_DLM_LINGER
+		ft_dlm_linger(&optxn);	/* nothing held here; see the helper */
+#endif
 	}
 	urcu_txn_end(&optxn);
+#ifdef FT_DEBUG_REMOVE_RETRY_CAP
+	{
+		uint64_t wall = ft_dbg_now_ns() - ft_remove_t0;
+
+		if (caa_unlikely(wall > 1000000))
+			fprintf(stderr, "FT REMOVE SLOW: wall_us=%llu "
+				"attempts=%u dirtyLOCK=%u dirtyOTHER=%u "
+				"cabort=%u\n",
+				(unsigned long long) (wall / 1000),
+				ft_remove_attempts, ft_dbg_acq_dirty_lock,
+				ft_dbg_acq_dirty_other, ft_dbg_acq_cabort);
+	}
+#endif
 	return s;
 }
 
