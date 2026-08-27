@@ -1151,6 +1151,87 @@ LTTNG_UST_TRACEPOINT_EVENT(cds_ft, dlm_drop,
 	)
 )
 
+/*
+ * FINDING B (the E.2 oracle's second catch).  A violation says two ops covered
+ * one node; these say WHICH hold-tracking entry outlived its hold.  The pair
+ * that matters is stamp_note (the FILING key) against stamp_drop (the RELEASE
+ * key): an entry is filed under the anchor the acquire DERIVED and dropped
+ * under the anchor the release derives, and if those two derivations disagree
+ * the entry -- and the owner stamp riding it -- survives the release.  @nmatch
+ * makes that visible without cross-referencing: a drop that matched NOTHING
+ * while the thread still holds entries is the disagreement, caught in the act.
+ */
+LTTNG_UST_TRACEPOINT_EVENT(cds_ft, stamp_note,
+	LTTNG_UST_TP_ARGS(
+		const void *, lock,
+		const void *, member,
+		int, shared,
+		const char *, fn,
+		int, line
+	),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_integer_hex(uintptr_t, lock, (uintptr_t) lock)
+		lttng_ust_field_integer_hex(uintptr_t, member,
+			(uintptr_t) member)
+		lttng_ust_field_integer(int, shared, shared)
+		lttng_ust_field_string(fn, fn)
+		lttng_ust_field_integer(int, line, line)
+	)
+)
+
+LTTNG_UST_TRACEPOINT_EVENT(cds_ft, stamp_drop,
+	LTTNG_UST_TP_ARGS(
+		const void *, lock,
+		unsigned long, state,
+		int, nmatch,
+		int, nheld
+	),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_integer_hex(uintptr_t, lock, (uintptr_t) lock)
+		lttng_ust_field_integer_hex(unsigned long, state, state)
+		lttng_ust_field_integer(int, nmatch, nmatch)
+		lttng_ust_field_integer(int, nheld, nheld)
+	)
+)
+
+LTTNG_UST_TRACEPOINT_EVENT(cds_ft, stamp_yield,
+	LTTNG_UST_TP_ARGS(
+		const void *, member,
+		unsigned long, old_tid
+	),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_integer_hex(uintptr_t, member,
+			(uintptr_t) member)
+		lttng_ust_field_integer_hex(unsigned long, old_tid, old_tid)
+	)
+)
+
+LTTNG_UST_TRACEPOINT_EVENT(cds_ft, stamp_violation,
+	LTTNG_UST_TP_ARGS(
+		const void *, member,
+		const void *, anchor,
+		const void *, owner_anchor,
+		unsigned long, owner_tid,
+		int, shared,
+		int, ledger_holds,
+		const char *, fn,
+		int, line
+	),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_integer_hex(uintptr_t, member,
+			(uintptr_t) member)
+		lttng_ust_field_integer_hex(uintptr_t, anchor,
+			(uintptr_t) anchor)
+		lttng_ust_field_integer_hex(uintptr_t, owner_anchor,
+			(uintptr_t) owner_anchor)
+		lttng_ust_field_integer_hex(unsigned long, owner_tid, owner_tid)
+		lttng_ust_field_integer(int, shared, shared)
+		lttng_ust_field_integer(int, ledger_holds, ledger_holds)
+		lttng_ust_field_string(fn, fn)
+		lttng_ust_field_integer(int, line, line)
+	)
+)
+
 LTTNG_UST_TRACEPOINT_EVENT(cds_ft, dlm_long_hold,
 	LTTNG_UST_TP_ARGS(
 		const void *, lock,

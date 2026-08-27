@@ -1979,6 +1979,11 @@ void ft_owner_stamp_claim(struct cds_ft_metadata *member,
 			anchor != oa ? "ANCHOR DISAGREEMENT" :
 				(shared ? ft_dlm_dbg_dedupe_lane :
 					"n/a (owner stamp outlived its hold)"));
+		FT_TP(stamp_violation, (const void *) member,
+			(const void *) anchor, (const void *) oa, old,
+			(int) shared, (int) ft_hold_trace_holds(anchor),
+			fn, line);
+		ft_trace_capture();
 		abort();
 	}
 	member->dbg_owner_fn = fn;
@@ -1995,6 +2000,7 @@ void ft_owner_stamp_yield(struct cds_ft_metadata *member)
 	if (!member)
 		return;
 	old = uatomic_cmpxchg(&member->dbg_owner_tid, self, 0);
+	FT_TP(stamp_yield, (const void *) member, old);
 	if (old != self && old != 0) {
 		/*
 		 * Print the site POINTER raw: a stale entry's member may have
@@ -2071,6 +2077,8 @@ void ft_hold_trace_note(const struct cds_ft_metadata *lock,
 	if (ft_hold_trace_n >= FT_HOLD_TRACE_MAX)
 		return;	/* no entry => no claim: nothing to yield later */
 	ft_owner_stamp_claim(member, lock, shared, fn, line);
+	FT_TP(stamp_note, (const void *) lock, (const void *) member,
+		(int) shared, fn, line);
 	ft_hold_trace[ft_hold_trace_n].lock = lock;
 	ft_hold_trace[ft_hold_trace_n].member = member;
 	ft_hold_trace[ft_hold_trace_n].fn = fn;
@@ -2132,17 +2140,32 @@ void ft_hold_trace_drop(const struct cds_ft_metadata *lock)
 		}
 	}
 #endif
-	while (i--) {
-		if (ft_hold_trace[i].lock == lock) {
-			/*
-			 * Yield the member this entry excluded for; the
-			 * swap-from-top always moves an already-visited
-			 * entry into the scanned slot, so no match is
-			 * skipped, and an anchor may cover several members.
-			 */
-			ft_owner_stamp_yield(ft_hold_trace[i].member);
-			ft_hold_trace[i] = ft_hold_trace[--ft_hold_trace_n];
+	{
+		int nmatch__ = 0;
+
+		while (i--) {
+			if (ft_hold_trace[i].lock == lock) {
+				/*
+				 * Yield the member this entry excluded for; the
+				 * swap-from-top always moves an already-visited
+				 * entry into the scanned slot, so no match is
+				 * skipped, and an anchor may cover several
+				 * members.
+				 */
+				ft_owner_stamp_yield(ft_hold_trace[i].member);
+				ft_hold_trace[i] =
+					ft_hold_trace[--ft_hold_trace_n];
+				nmatch__++;
+			}
 		}
+		/*
+		 * A release whose key matches NOTHING while this thread still
+		 * holds entries is the acquire-vs-release derivation
+		 * disagreement, caught in the act.
+		 */
+		FT_TP(stamp_drop, (const void *) lock,
+			(unsigned long) CMM_LOAD_SHARED(lock->state),
+			nmatch__, (int) ft_hold_trace_n);
 	}
 }
 

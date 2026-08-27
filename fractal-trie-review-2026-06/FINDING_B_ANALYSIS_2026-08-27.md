@@ -230,3 +230,92 @@ Two candidate mechanisms to test with it, in order:
       as an ANCHOR DISAGREEMENT in the stamp, which has NOT been
       observed -- so it is the weaker candidate, but it must be
       explained rather than left as an anomaly.
+
+
+---
+
+# ☑☑ ROOT-CAUSED BY TRACE (2026-08-27 night) — LTTng flight recorder
+
+Rig: 4 syscall-free tracepoints under FT_ENABLE_TRACING -- stamp_note (the
+FILING key + @shared), stamp_drop (the RELEASE key + @nmatch + ledger
+depth), stamp_yield, stamp_violation -- 64K x 4 overwrite, snapshot at the
+violation.  Reproduced on the FIRST run.  ☠ Needs -DFT_LIGHT_TRACING:
+without it ft_trace_miswire_check's per-descent round trip fires its own
+MISWIRE abort and suppresses this race.  ☠ ft_trace_capture()'s
+system() fork fails silently under `ulimit -v` at 30+ GB VIRT -- take the
+snapshot FROM THE SHELL after the abort instead (per-UID rings are owned
+by the sessiond and survive the process).
+
+## The interleaving, from the trace (one anchor word W = 0x…E98, root-only)
+
+    096378092  T680  note  W  member=…28D8  shared=0  detach_orphan_planlock:693
+                     ^^ T680 TAKES W FOR REAL
+    096379474  T680  note  W  member=W      shared=1  node_recompact:1357
+                     ^^ legitimate dedupe; stamps W with T680
+    096381407  T680  yield W  (old_tid = its own)
+    096381758  T680  drop  W  nmatch=3  nheld=0
+    096382188  T680  drop  W  nmatch=0  nheld=0
+                     ^^ the PRE-COMMIT ledger drain; the commit then
+                        consumes the hold and clears LOCK
+    096383601  T678  note  W  member=…0358  shared=0  detach_orphan_planlock:693
+                     ^^ T678 TAKES W FOR REAL -- which PROVES T680's hold
+                        had ended: a real CAS take cannot succeed on a
+                        locked word (the refusal path prints FT REFUSED)
+    096383691  T680  note  W  member=…1978  shared=1  chain_compress_fused:1009
+    096384061  T680  note  W  member=W      shared=1  chain_compress_fused:1009
+                     ^^ T680, WHOSE HOLD HAS ENDED, dedupes anyway and
+                        RE-STAMPS W
+    096384522  T678  note  W  member=…1258  shared=1  node_recompact:1357
+    096390711  T678  VIOLATION on W
+
+## What it proves, and what it kills
+
+☠ **M1 (a release dropping by a different key than it filed by) is
+REFUTED.**  The drops MATCHED -- nmatch=3 then nmatch=2 -- and the yield
+fired.  Nothing leaked at the drop; the acquire and release derive the
+SAME key.
+
+☠ **M2 (the =SELF anchoring) is EXPLAINED AND BENIGN.**  W is the ROOT,
+and "the root is its own anchor under every spacing" is the documented
+rule.  Many distinct members appear against lock=W, which is exactly
+root-only coarsening working as designed.
+
+☑ **THE DEFECT: an op keeps deduping on a word its own commit already
+gave back.**  The ledger is drained PRE-COMMIT by design (correct -- the
+words still carry LOCK at that instant, so no peer can claim in the
+window).  But the op's FRAME EXTRAS are not scrubbed when the commit
+CONSUMES the hold, so the very next acquire in the same op asks
+ft_lock_ctx_holds(), is told "held", and returns @shared -- protected,
+owing no release -- on a word a PEER now legitimately owns.  Both ops
+then mutate under one word's protection.  This is a REAL exclusion
+violation, not an oracle artifact: T678's take is real, T680's belief is
+stale, and both proceed.
+
+⇒ Finding B IS finding A's class -- a hold answer outliving its
+exclusion -- at a CONSUMPTION POINT the @aa03d23b scrubs did not cover.
+The remedy is the fold's existing discipline (`marks_consumed = true` ->
+`marks[i].shared = true`, ft-rekey.h ~3305) generalised to every commit
+that consumes registered locks, i.e. R3 of the truthful-ownership brief.
+D1/fence-under-anchor remains unnecessary.
+
+## ☠ Two of my own earlier conclusions were wrong; the trace unifies them
+
+  * c4940bdc said "the claimant's answer is stale, the fast path
+    laundered it" -- right MECHANISM, wrong PARTY.
+  * b6642f3b said "the OWNER's stamp is the stale one" -- right PARTY,
+    but it is not a stale STAMP: the stamp is 6.6 us OLD and freshly
+    re-filed.  What is stale is the HOLD ANSWER BEHIND it.
+  * ☠☠ AND THE DISCRIMINATOR THAT PRODUCED b6642f3b IS UNSOUND:
+    `ft_hold_trace_holds()` is NOT an independent witness, because
+    ft_hold_trace_note files a ledger entry for SHARED (deduped) members
+    too -- so a dedupe manufactures the very ledger entry that later
+    "confirms" it.  Only @shared on a note distinguishes a real take
+    from a belief.  A witness that records the belief cannot adjudicate
+    the belief.
+
+## Open
+
+Scope: measured at ROOT-ONLY, where one anchor covers many members so the
+re-acquire-after-consumption window is wide.  Whether the same stale
+dedupe is reachable at PER-NODE (the shipping default, suite-green) is
+NOT established by this trace and must not be assumed closed.
