@@ -1703,8 +1703,29 @@ certification, then the API gate lift (`ft-lifecycle.h:369`):
    fired 2,205 times in one leg alone.  Now CONTINUOUSLY certified: the
    gate matrix gained a swept `holdtrace` config (a collision aborts, so a
    red is a leg abort, not a grep).
-4. Bench the spacings (`-O2 -DNDEBUG`, sequential runs); pick the default
-   from data.
+4. ☑ BENCHED (2026-08-27; harness fractal-trie-review-2026-06/
+   e4_spacing_bench.sh, writes/10s, 5 reps, sequential, idle box; the
+   whole spacing matrix under FEATURE_FT_ANCHOR_VALIDATE for uniform
+   overhead + a plain per-node reference; -W coarse driver option):
+
+       load     plain-pn  av-pn    av-exp   av-ro    COARSE
+       4r/4w     859,626  995,022  985,608  979,994    986,078
+       32r/8w  1,044,316 1,054,858 1,086,384 1,033,456 1,181,500
+       96r/24w   795,659  789,602  770,462  772,692    881,490
+
+   TWO READINGS.  (i) The three spacings are WITHIN NOISE of each other
+   at every load (≤5% spread, no consistent winner): the default stays
+   per-node — the only certified spacing — and the choice costs nothing
+   today.  (ii) COARSE beats every FINE config by 11–14% at the two
+   concurrent loads: exactly §8.2's prediction that "FINE still COWs and
+   the bench measures the wrong thing" — the FINE write path pays
+   recompaction copy churn per publish that the wide lock never incurs.
+   ⇒ the FINE-vs-COARSE sweep is NOT actionable until §8.2 in-place
+   mutation lands, and step 5's alias question resolves NEGATIVE for
+   now: root-only does NOT match COARSE, so LOCK_COARSE stays (neither
+   alias nor retire).  Caveat: the plain-pn 4×4 cell ran first and reads
+   ~14% under av-pn — a warm-up artifact; treat same-flag columns as the
+   comparison, as designed.
 5. Lift the `FEATURE_FT_ANCHOR_VALIDATE`-only refusal; then fold the
    redundant strategy: rank-stats coercion retargets ROOT_ONLY spacing, and
    LOCK_COARSE becomes an alias (or is retired) once root-only spacing
