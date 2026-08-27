@@ -17,6 +17,7 @@ FRACTAL_TRIE = fractal-trie/fractal-trie.c fractal-trie/fractal-trie-alloc.c \
 	fractal-trie/fractal-trie-internal.h fractal-trie/fractal-trie-trace.h \
 	fractal-trie/cds_ft_tp.c fractal-trie/cds_ft_tp.h \
 	fractal-trie/ft-helpers.h fractal-trie/ft-txn-hlist.h fractal-trie/ft-trace-helpers.h fractal-trie/ft-lookup-node.h \
+	fractal-trie/ft-txn-kind-stats.h fractal-trie/ft-txn-rec-dbg.h \
 	fractal-trie/ft-descent.h fractal-trie/ft-lookup.h \
 	fractal-trie/ft-inequality.h fractal-trie/ft-insert.h \
 	fractal-trie/ft-remove.h fractal-trie/ft-graft.h \

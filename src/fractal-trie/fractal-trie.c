@@ -123,6 +123,14 @@
 #include <urcu/uatomic.h>
 #include "urcu-utils.h"
 
+/*
+ * ☠ BEFORE fractal-trie-internal.h, which pulls <urcu/rcu-txn.h>: this header
+ * DEFINES the engine's abort-attribution hooks, and the engine's static inlines
+ * are compiled where that header is parsed.  Included later it would expand to
+ * the engine's own inert defaults and the instrument would build clean and
+ * count nothing.
+ */
+#include "ft-txn-rec-dbg.h"
 #include "fractal-trie-internal.h"
 
 #ifdef FEATURE_FT_PROBE_REANCHOR

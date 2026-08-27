@@ -192,6 +192,18 @@ enum ft_tk_mwa_class {
 	FT_TK_MWA_NR,
 };
 
+#ifdef FT_ABORT_ATTRIB
+/*
+ * ft-txn-rec-dbg.h reserves its tail for these nine and is parsed BEFORE this
+ * header (it defines hooks the engine's inlines need), so it cannot use the
+ * enum itself.  Fail the BUILD if the two ever disagree rather than silently
+ * folding a tenth population into the last row.
+ */
+urcu_static_assert(FT_AB_CLS_NR - FT_AB_MWA_BASE == FT_TK_MWA_NR,
+	"ft-txn-rec-dbg.h reserves a different number of always-MW classes",
+	ft_ab_mwa_class_count);
+#endif
+
 enum ft_tk_end_class {
 	FT_TK_OK = 0,		/* urcu_txn_commit_flavor -> OK */
 	FT_TK_ABORT,		/* a peer won an MW record or a guard */
@@ -228,6 +240,21 @@ struct ft_tk_tls {
 	unsigned long armed[FT_TK_MAX_SITES];
 	unsigned long cell_mw;	/* not site-attributed, see the header comment */
 	unsigned long mwa[FT_TK_MWA_NR];
+#ifdef FT_ABORT_ATTRIB
+	/*
+	 * WHICH CLASS OF RECORD LOST, per txn creation site.  Per site because a
+	 * class that only ever loses at one site is a different problem from one
+	 * that loses everywhere, and the site is the unit every other row here is
+	 * keyed by.  The OWNERSHIP witness is kept GLOBALLY beside it: it splits
+	 * one class (the structural surface), and a full site x class x witness
+	 * cube would be 4x this for a column that is zero almost everywhere.
+	 */
+	unsigned long ab[FT_TK_MAX_SITES][FT_AB_CLS_NR];
+	unsigned long ab_own[FT_AB_CLS_NR][FT_AB_OWN_NR];
+	unsigned long ab_mixed;		/* two classes chained onto the losing word */
+	unsigned long ab_unattrib;	/* an abort no hook could name (poisoned) */
+	unsigned long ab_alarm[FT_TK_MAX_SITES][2];	/* [0] state word, [1] pointer slot */
+#endif
 };
 
 static pthread_mutex_t ft_tk_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -346,6 +373,82 @@ void ft_tk_count_mwa(enum ft_tk_mwa_class c)
 	ft_tk_tls_get()->mwa[c]++;
 }
 
+#ifdef FT_ABORT_ATTRIB
+/*
+ * The engine's abort hook, declared in ft-txn-rec-dbg.h and defined here where
+ * struct urcu_txn_record is complete.  It only STASHES: the class is counted in
+ * ft_flip_txn_commit, which still has the txn's creation site in hand.
+ */
+static
+void ft_ab_note_lost(const struct urcu_txn_record *r)
+{
+	ft_ab_lost = r ? r->dbg_embedder :
+		ft_ab_code(FT_AB_UNSET, FT_AB_OWN_NA);
+	ft_ab_lost_tag = r ? r->proxy_tag : 0;
+	ft_ab_lost_valid = r != NULL;
+}
+
+/*
+ * ★ THE ALARM.  An SW park cannot lose a CAS -- it does not do one -- and a
+ * STRUCTURAL MW record whose owner the op HOLDS should not either, because the
+ * DLM lock over the slot's owner is precisely what excludes every peer writer
+ * of that word.  Either sighting says the exclusion is not what it claims, and
+ * that is the opposite of a conversion opportunity: arming such a site would
+ * turn a contested word into an unarbitrated plain store.
+ *
+ * ☠ NOT AN ASSERT, YET.  It is counted first, because a detector that has never
+ * been shown to reach its subject is not coverage
+ * ([[feedback_an_assert_config_that_never_fires_is_not_coverage]]).
+ * -DFT_ABORT_CLAIM turns it into an abort at the first sighting.
+ */
+static inline
+int ft_ab_is_alarm(unsigned int cls, unsigned int own)
+{
+	if (cls == FT_AB_SW)
+		return 1;
+	return cls == FT_AB_MW_STRUCT && own == FT_AB_OWN_HELD;
+}
+
+static inline
+void ft_ab_count_lost(struct ft_tk_site *site)
+{
+	struct ft_tk_tls *tls = ft_tk_tls_get();
+	int id = site ? ft_tk_site_id(site) : FT_TK_OVERFLOW_ID;
+	unsigned int cls, own;
+
+	if (!ft_ab_lost_valid) {
+		tls->ab_unattrib++;
+		return;
+	}
+	cls = ft_ab_code_cls(ft_ab_lost);
+	own = ft_ab_code_own(ft_ab_lost);
+	if (cls >= FT_AB_CLS_NR)
+		cls = FT_AB_UNSET;	/* a stamp this build does not know */
+	tls->ab[id][cls]++;
+	tls->ab_own[cls][own]++;
+	if (ft_ab_lost & FT_AB_MIXED)
+		tls->ab_mixed++;
+	if (ft_ab_is_alarm(cls, own)) {
+		int ptr = ft_ab_lost_tag == FT_FLIP_PROXY_TAG;
+
+		tls->ab_alarm[id][ptr]++;
+#ifdef FT_ABORT_CLAIM
+		fprintf(stderr,
+"\nFT_ABORT_CLAIM: a record that CANNOT lose lost one -- class=%u witness=%u%s\n"
+"  at %s:%d %s\n"
+"  An SW park does no CAS, and a structural MW record whose owner this op HOLDS\n"
+"  is excluded from every peer writer of that word.  The exclusion is not what\n"
+"  it claims.\n",
+			cls, own,
+			(ft_ab_lost & FT_AB_MIXED) ? " (MIXED: two classes on one word)" : "",
+			site ? site->file : "?", site ? site->line : 0,
+			site ? site->what : "?");
+		abort();
+#endif
+	}
+}
+#endif /* FT_ABORT_ATTRIB */
+
 /*
  * The site object is a function-static: one per expansion of the constructor
  * macro, which is one per source line that creates a txn.
@@ -399,6 +502,12 @@ void ft_tk_dump(void)
 	unsigned long cell_mw = 0;
 	unsigned long mwa[FT_TK_MWA_NR];
 	unsigned long mwa_tot = 0;
+#ifdef FT_ABORT_ATTRIB
+	unsigned long ab[FT_AB_CLS_NR], ab_own[FT_AB_CLS_NR][FT_AB_OWN_NR];
+	unsigned long ab_alarm_site[FT_TK_MAX_SITES][2];
+	unsigned long ab_tot = 0, ab_alarm[2] = { 0, 0 };
+	unsigned long ab_mixed = 0, ab_unattrib = 0;
+#endif
 	struct ft_tk_row tot;
 	int nr, i, threads = 0;
 	char name[96];
@@ -408,6 +517,11 @@ void ft_tk_dump(void)
 	if (ft_tk_sites[FT_TK_OVERFLOW_ID])
 		nr = FT_TK_MAX_SITES;
 	memset(mwa, 0, sizeof(mwa));
+#ifdef FT_ABORT_ATTRIB
+	memset(ab, 0, sizeof(ab));
+	memset(ab_own, 0, sizeof(ab_own));
+	memset(ab_alarm_site, 0, sizeof(ab_alarm_site));
+#endif
 	rows = (struct ft_tk_row *) calloc(nr ? nr : 1, sizeof(*rows));
 	if (!rows) {
 		pthread_mutex_unlock(&ft_tk_lock);
@@ -422,6 +536,26 @@ void ft_tk_dump(void)
 		cell_mw += tls->cell_mw;
 		for (i = 0; i < FT_TK_MWA_NR; i++)
 			mwa[i] += tls->mwa[i];
+#ifdef FT_ABORT_ATTRIB
+		{
+			int c2, o2;
+
+			for (c2 = 0; c2 < FT_AB_CLS_NR; c2++) {
+				for (i = 0; i < nr; i++)
+					ab[c2] += tls->ab[i][c2];
+				for (o2 = 0; o2 < FT_AB_OWN_NR; o2++)
+					ab_own[c2][o2] += tls->ab_own[c2][o2];
+			}
+			for (i = 0; i < nr; i++) {
+				for (o2 = 0; o2 < 2; o2++) {
+					ab_alarm[o2] += tls->ab_alarm[i][o2];
+					ab_alarm_site[i][o2] += tls->ab_alarm[i][o2];
+				}
+			}
+			ab_mixed += tls->ab_mixed;
+			ab_unattrib += tls->ab_unattrib;
+		}
+#endif
 		for (i = 0; i < nr; i++) {
 			if (!rows[i].site)
 				continue;
@@ -539,6 +673,81 @@ void ft_tk_dump(void)
 			mwa_tot == tot.rec[FT_TK_MW_ALWAYS] ? "" :
 				" -- ☠ MISMATCH: an always-MW branch records no class");
 	}
+
+#ifdef FT_ABORT_ATTRIB
+	/*
+	 * WHICH RECORD LOST, over every aborted commit.  The rows sum to the
+	 * ABORT column above -- the same self-check the MW_ALWAYS table uses,
+	 * and here it also proves the engine hooks cover every abort EXIT (they
+	 * are three, and the lone-MW-edge one builds no descriptor at all).
+	 */
+	{
+		static const char * const ab_name[FT_AB_CLS_NR] = {
+			"UNATTRIB", "SW", "MW_STRUCT", "MW_LOCK", "VALIDATE",
+			"CELL_HANDLE",
+			"mwa:ROOT", "mwa:HEAD_BACK", "mwa:DUAL", "mwa:CELL",
+			"mwa:RANK", "mwa:PARENT_WORD", "mwa:PSO", "mwa:STATE",
+			"mwa:GUARD",
+		};
+
+		for (i = 0; i < FT_AB_CLS_NR; i++)
+			ab_tot += ab[i];
+		fprintf(stderr,
+"\n    ABORT attributed to the LOSING RECORD's class (%lu aborted commits):\n",
+			ab_tot);
+		for (i = 0; i < FT_AB_CLS_NR; i++) {
+			if (!ab[i])
+				continue;
+			fprintf(stderr,
+"      %-16s %12lu  %5.1f%%   held %lu / ledger %lu / miss %lu / n-a %lu\n",
+				ab_name[i], ab[i],
+				ab_tot ? 100.0 * (double) ab[i] / (double) ab_tot : 0.0,
+				ab_own[i][FT_AB_OWN_HELD], ab_own[i][FT_AB_OWN_LEDGER],
+				ab_own[i][FT_AB_OWN_MISS], ab_own[i][FT_AB_OWN_NA]);
+		}
+		fprintf(stderr,
+"      %-16s %12lu  (ABORT column %lu%s)\n"
+"      mixed-class losing words: %lu   aborts no hook could name: %lu\n",
+			"sum", ab_tot, tot.end[FT_TK_ABORT],
+			ab_tot + ab_unattrib == tot.end[FT_TK_ABORT] ? "" :
+				" -- ☠ MISMATCH: an abort EXIT is unhooked",
+			ab_mixed, ab_unattrib);
+		/*
+		 * ☠ SPLIT BY THE WORD, because the two halves are not the same
+		 * finding.  A child POINTER slot may only be written by a holder
+		 * of the owning node's lock, so an owner-held record losing one
+		 * is an exclusion that did not exclude.  The packed STATE word
+		 * has lock-free writers BY DESIGN (the re-parent sweep's guard,
+		 * the §4.B validates -- the MW_ALWAYS populations above), so
+		 * losing one says only that a non-holder wrote another field of
+		 * the same word.  Pooling them would manufacture a defect.
+		 */
+		fprintf(stderr,
+"    ★ ALARM (a record that cannot lose, lost): pointer-slot %lu / state-word %lu\n"
+"      %s\n",
+			ab_alarm[1], ab_alarm[0],
+			ab_alarm[1] ?
+				"☠ POINTER SLOT: an OWNER-HELD structural edge lost a CAS on a word only a holder may write" :
+				(ab_alarm[0] ?
+					"state word only: a non-holder wrote another field of the same packed word (by design)" :
+					"(none -- the exclusion held everywhere it was claimed)"));
+		/*
+		 * ☠ BY SITE ID, not by row index: the rows were sorted by
+		 * MW_STRUCT above, so row i is no longer site i.
+		 */
+		for (i = 0; (ab_alarm[0] || ab_alarm[1]) && i < nr; i++) {
+			int id = rows[i].site->id;
+
+			if (id >= 0 && id < FT_TK_MAX_SITES &&
+					(ab_alarm_site[id][0] || ab_alarm_site[id][1]))
+				fprintf(stderr,
+					"        %s:%d %s  ptr %lu / state %lu\n",
+					rows[i].site->file, rows[i].site->line,
+					rows[i].site->what,
+					ab_alarm_site[id][1], ab_alarm_site[id][0]);
+		}
+	}
+#endif
 	fprintf(stderr,
 "    MW_STRUCT is the conversion surface; MW_ALWAYS + MW_LOCK + the cell/hlist line stay MW by design.\n"
 "    OWN_HELD/OWN_LEDGER/OWN_MISS split MW_STRUCT (the surface) by whether the op holds the word's owner; they sum to it:\n"
@@ -609,6 +818,13 @@ void ft_tk_dump_at_exit(void)
 #define FT_TK_MWA_PARAM			, enum ft_tk_mwa_class dbg_mwa
 #define FT_TK_MWA(c)			, (c)
 #define FT_TK_COUNT_MWA(c)		ft_tk_count_mwa(c)
+#ifdef FT_ABORT_ATTRIB
+#define FT_AB_LOST_RESET()		do { ft_ab_lost_valid = 0; } while (0)
+#define FT_AB_COUNT_LOST(t)		ft_ab_count_lost((t)->dbg_site)
+#else
+#define FT_AB_LOST_RESET()		do { } while (0)
+#define FT_AB_COUNT_LOST(t)		do { } while (0)
+#endif
 /*
  * An outcome is recorded ONCE per txn: ft_flip_txn_commit's acquire-miss arm
  * reports MISS and then destroys the handle, and the destroy must not also
@@ -640,6 +856,8 @@ struct ft_tk_site;	/* incomplete: the NULL the constructors take */
 #define FT_TK_MWA_PARAM
 #define FT_TK_MWA(c)
 #define FT_TK_COUNT_MWA(c)		do { } while (0)
+#define FT_AB_LOST_RESET()		do { } while (0)
+#define FT_AB_COUNT_LOST(t)		do { } while (0)
 
 #endif	/* FT_DEBUG_TXN_KIND */
 

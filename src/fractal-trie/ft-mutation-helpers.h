@@ -2991,11 +2991,23 @@ enum urcu_txn_status ft_flip_txn_commit(struct cds_ft *ft,
 		ft_flip_txn_destroy(t);
 		return miss_st;
 	}
+	FT_AB_LOST_RESET();
 	st = urcu_txn_commit_flavor(t->mtxn, reclaim);
 	FT_TP(txn_commit, (const void *) t->mtxn, (int) st);
 	FT_TK_COUNT_END(t, st == URCU_TXN_STATUS_OK ? FT_TK_OK :
 			(st == URCU_TXN_STATUS_MEMORY_ERROR ? FT_TK_MEMERR :
 				FT_TK_ABORT));
+	/*
+	 * WHICH RECORD LOST.  The engine stashed it on the way out of the commit
+	 * just above; read it HERE, where the txn's creation site is still in
+	 * hand, so the class can be counted per site rather than globally.
+	 * RESET before the commit, never after: an ABORT that reached none of the
+	 * hooks (there is no such path today, and that is a claim this asserts
+	 * rather than assumes) would otherwise inherit the previous commit's
+	 * loser and read as attribution.
+	 */
+	if (caa_unlikely(st == URCU_TXN_STATUS_ABORT))
+		FT_AB_COUNT_LOST(t);
 	/*
 	 * node locks: a committed txn transitioned each registered node
 	 * through the terminal its op recorded -- {LOCK|s -> TOMBSTONE|s}
@@ -3108,6 +3120,7 @@ void __ft_flip_txn_record_tag_ctx(struct ft_flip_txn *t,
 	FT_OWNER_ASSERT_OWNED_CTX(t, dbg_ctx, owner, slot, new_ptr);
 	if (t->structural_sw) {
 		FT_TK_COUNT_REC(t, FT_TK_SW);
+		FT_AB_ARM(FT_AB_SW, FT_AB_OWN_NA);
 		ret = urcu_txn_store_sw(t->mtxn, slot, old_ptr, new_ptr, tag);
 	} else {
 		/*
@@ -3117,6 +3130,20 @@ void __ft_flip_txn_record_tag_ctx(struct ft_flip_txn *t,
 		 */
 		FT_TK_COUNT_REC(t, FT_TK_TXN_IS_TAKE(t) ?
 				FT_TK_MW_LOCK : FT_TK_MW_STRUCT);
+		/*
+		 * ★ THE WITNESS TRAVELS WITH THE RECORD, because that is the
+		 * whole detector: a structural edge whose owner the op HOLDS
+		 * losing its CAS is a lock that did not exclude somebody, not
+		 * contention to convert away.  A TAKE carries no witness -- the
+		 * word it CASes is the one it is trying to acquire.
+		 */
+		if (FT_TK_TXN_IS_TAKE(t))
+			FT_AB_ARM(FT_AB_MW_LOCK, FT_AB_OWN_NA);
+		else
+			FT_AB_ARM(FT_AB_MW_STRUCT,
+				ft_flip_txn_owns(t, owner) ? FT_AB_OWN_HELD :
+				(ft_hold_trace_holds(owner) ? FT_AB_OWN_LEDGER :
+					FT_AB_OWN_MISS));
 		ret = urcu_txn_store_mw(t->mtxn, slot, old_ptr, new_ptr, tag);
 	}
 	assert(!ret);
@@ -3151,6 +3178,7 @@ void ft_flip_txn_record_tag_mw(struct ft_flip_txn *t, void **slot,
 		(const void *) old_ptr, (const void *) new_ptr, tag);
 	FT_TK_COUNT_REC(t, FT_TK_MW_ALWAYS);
 	FT_TK_COUNT_MWA(dbg_mwa);
+	FT_AB_ARM(FT_AB_MWA_BASE + dbg_mwa, FT_AB_OWN_NA);
 	ret = urcu_txn_store_mw(t->mtxn, slot, old_ptr, new_ptr, tag);
 	assert(!ret);
 	(void) ret;	/* reserved up front -> never fails */
@@ -3710,6 +3738,7 @@ void ft_dlm_guard_parent(struct ft_flip_txn *t, struct cds_ft_metadata *child,
 		struct cds_ft_inode_flag *expected_pf)
 {
 	FT_TK_COUNT_REC(t, FT_TK_VALIDATE);
+	FT_AB_ARM(FT_AB_VALIDATE, FT_AB_OWN_NA);
 	urcu_txn_validate(t->mtxn, (void **) &child->parent_word,
 			(void *) expected_pf, FT_FLIP_PROXY_TAG);
 }
@@ -3728,6 +3757,7 @@ void ft_held_anchor_guard_node(struct ft_flip_txn *t,
 		struct cds_ft_metadata *node, uintptr_t node_snap)
 {
 	FT_TK_COUNT_REC(t, FT_TK_VALIDATE);
+	FT_AB_ARM(FT_AB_VALIDATE, FT_AB_OWN_NA);
 	urcu_txn_validate(t->mtxn, (void **) &node->state,
 			(void *) node_snap, FT_STATE_PROXY);
 }
@@ -4048,8 +4078,10 @@ int ft_txn_list_insert_between_prepare(struct urcu_txn *txn,
 	newp->next = succ_expected;
 	newp->prev = pos;
 	FT_TK_COUNT_CELL_MW();		/* a cell edge: see ft_hlist_store_mw */
+	FT_AB_ARM(FT_AB_CELL_HANDLE, FT_AB_OWN_NA);
 	urcu_txn_store_mw(txn, (void **) &pos->next, succ_expected, newp, URCU_TXN_TAG);
 	FT_TK_COUNT_CELL_MW();
+	FT_AB_ARM(FT_AB_CELL_HANDLE, FT_AB_OWN_NA);
 	urcu_txn_store_mw(txn, (void **) &succ_expected->prev, pos, newp, URCU_TXN_TAG);
 	return 0;
 }
@@ -5322,6 +5354,7 @@ void ft_flip_txn_guard_parent(const struct cds_ft *ft, struct ft_flip_txn *t,
 	 * matches -> proceed (the copy was abandoned, the holder unchanged).
 	 */
 	live = v & ~(FT_STATE_TOMBSTONE | FT_STATE_LOCK);
+	FT_AB_ARM(FT_AB_VALIDATE, FT_AB_OWN_NA);
 	urcu_txn_validate(t->mtxn,
 			(void **) &ft_flag_to_metadata(ft, parent_nf)->state,
 			(void *) live, FT_STATE_PROXY);

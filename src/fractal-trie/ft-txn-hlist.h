@@ -118,6 +118,7 @@ int ft_hlist_store_mw(struct urcu_txn *txn, void **slot, void *old_ptr,
 		void *new_ptr, uintptr_t tag)
 {
 	FT_TK_COUNT_CELL_MW();
+	FT_AB_ARM(FT_AB_CELL_HANDLE, FT_AB_OWN_NA);
 	return urcu_txn_store_mw(txn, slot, old_ptr, new_ptr, tag);
 }
 
