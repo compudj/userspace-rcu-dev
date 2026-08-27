@@ -1690,12 +1690,30 @@ certification, then the API gate lift (`ft-lifecycle.h:369`):
    Exponential MW runs 119/119 for the first time; the full gate's
    per-leg diff vs the E.0 baseline is exactly the nine holdtrace legs,
    all green.
-   ☐ **(B) OPEN**: mark-vs-anchor DUAL COVERAGE at root-only MW (abort
-   at test 30, both sites named; mechanism + D1/D2/D3 fix directions in
-   the analysis note — D1 fence-under-anchor recommended).  The gate's
-   holdtrace config runs without its imw legs until B (and A's glue
-   lane) close; re-adding them is E.2's completion criterion, and E.5
-   cannot lift the coarse spacings before that.
+   ☑ **(A) GLUE LANE CLOSED (2026-08-27 evening, redesign step 1,
+   @ec9e68f8 + @e49f6c13)**: the exemption is DELETED and the glue lane
+   runs ENFORCED — exponential MW 119/119 with 0 refusals, the config
+   that refuted seven enforcement forms.  The livelock's root cause was
+   never the arms' lifecycle: both ft_glue_record_splice filings dated
+   their holder MERGE-RELATIVE (ft_merge_build's @depth counts from the
+   merge point) while the fences dated absolutely — one op, two
+   exclusion words for one node, the dst_base_depth comment's own
+   documented hazard.  Fixed at the producer (@d_prov), plus an
+   identity fast-path (ft_glue_fence_holds_node) so a mis-dated depth
+   can never again split a node across two words, a HOLD_TRACE
+   disagreement detector keeping the depth arithmetic continuously
+   certified, and a CONSUMED lifecycle flag closing the fenced free
+   list's post-reclaim answering (own-terminal token; skeptic-shaped
+   gates on all three matchers).
+   ☐ **(B) OPEN**: mark-vs-anchor DUAL COVERAGE at root-only MW (now
+   aborts at test 34, was 30 — the splice fix cleared four tests; both
+   sites named; mechanism + D1/D2/D3 fix directions in the analysis
+   note — D1 fence-under-anchor recommended, and the splice root cause
+   is precedent that a DERIVATION DISAGREEMENT, not the two systems'
+   coexistence, may be the mechanism — verify before designing).  The
+   gate's holdtrace config runs without its imw legs until B closes;
+   re-adding them is E.2's completion criterion, and E.5 cannot lift
+   the coarse spacings before that.
 3. ☑ FIRST-PASS CLEAN (2026-08-27, unblocked by E.0): both suites at BOTH
    exponential and root-only under `-DDEBUG_RCU -DFEATURE_FT_HOLD_TRACE`:
    zero SELF-COLLISION, zero asserts, 315+3/119 everywhere.  The zero is
