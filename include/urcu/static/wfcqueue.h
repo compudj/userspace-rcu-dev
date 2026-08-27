@@ -15,6 +15,7 @@
 
 #include <pthread.h>
 #include <poll.h>
+#include <time.h>
 #include <stdbool.h>
 #include <urcu/assert.h>
 #include <urcu/compiler.h>
@@ -229,6 +230,15 @@ static inline bool _cds_wfcq_enqueue(cds_wfcq_head_ptr_t head,
 #define CDS_WFCQ_WAIT_SLEEP(msec) ___cds_wfcq_wait_sleep(msec)
 #endif
 
+/*
+ * CDS_WFCQ_WAIT_SLEEP_US: the sub-millisecond rungs of the graduated
+ * wait (see ___cds_wfcq_wait_rung).  Same override contract as
+ * CDS_WFCQ_WAIT_SLEEP.
+ */
+#ifndef CDS_WFCQ_WAIT_SLEEP_US
+#define CDS_WFCQ_WAIT_SLEEP_US(usec) ___cds_wfcq_wait_sleep_us(usec)
+#endif
+
 #ifdef CDS_FAIR_MUTEX_DBG_POLL
 /* Probe: count 10ms sync_next poll quanta (diagnosis builds only). */
 static __thread unsigned long cds_wfcq_dbg_polls __attribute__((unused));
@@ -242,6 +252,38 @@ static inline void ___cds_wfcq_wait_sleep(int msec)
 	(void) poll(NULL, 0, msec);
 }
 
+static inline void ___cds_wfcq_wait_sleep_us(int usec)
+{
+	struct timespec ts = { 0, (long) usec * 1000L };
+
+	(void) nanosleep(&ts, NULL);
+}
+
+/*
+ * ___cds_wfcq_wait_rung: one step of the graduated wait ladder.
+ *
+ * The windows these waits race (an enqueuer's xchg->link, a granter's
+ * teardown) are microsecond-scale, so a flat 10ms sleep charges three
+ * orders of magnitude over the typical remaining wait -- and under a
+ * FIFO lock built on this queue, one sleeper convoys every waiter
+ * behind it.  Escalate instead: us-scale sleeps first (bounded below
+ * by the scheduler's timer slack), then millisecond polls doubling to
+ * a 16ms cap.
+
+ *	rung  0..6   10us << rung   (10us .. 640us)
+ *	rung  7..10   1ms << (rung - 7)   (1, 2, 4, 8ms)
+ *	rung 11+     16ms
+ */
+static inline void ___cds_wfcq_wait_rung(int rung)
+{
+	if (rung < 7)
+		CDS_WFCQ_WAIT_SLEEP_US(10 << rung);
+	else if (rung < 11)
+		CDS_WFCQ_WAIT_SLEEP(1 << (rung - 7));
+	else
+		CDS_WFCQ_WAIT_SLEEP(16);
+}
+
 /*
  * ___cds_wfcq_busy_wait: adaptative busy-wait.
  *
@@ -252,12 +294,17 @@ ___cds_wfcq_busy_wait(int *attempt, int blocking)
 {
 	if (!blocking)
 		return 1;
-	if (++(*attempt) >= WFCQ_ADAPT_ATTEMPTS) {
-		CDS_WFCQ_WAIT_SLEEP(WFCQ_WAIT);		/* Wait for 10ms */
-		*attempt = 0;
-	} else {
+	/*
+	 * The counter climbs past the spin threshold so each consecutive
+	 * blocked probe takes the NEXT rung of the ladder; clamped so the
+	 * rung (and the shift feeding it) stays bounded at the 16ms cap.
+	 */
+	if (*attempt < WFCQ_ADAPT_ATTEMPTS + 16)
+		++(*attempt);
+	if (*attempt >= WFCQ_ADAPT_ATTEMPTS)
+		___cds_wfcq_wait_rung(*attempt - WFCQ_ADAPT_ATTEMPTS);
+	else
 		caa_cpu_relax();
-	}
 	return 0;
 }
 
