@@ -1221,6 +1221,17 @@ void ft_txn_attempt_end(struct urcu_txn *op, bool open)
  * the conflict.
  */
 static __thread unsigned int ft_acq_contended;
+#ifdef FT_DEBUG_REMOVE_RETRY_CAP
+/*
+ * Refusal-exit classifiers for the retry-tail milestone: what did a refused
+ * acquire actually see?  A LOCKed word (a holder -- preemption-stretched or
+ * not), a PROXY/TOMBSTONE word (replan class), or a set commit that lost the
+ * MCAS race on words whose pre-checks all passed CLEAN.
+ */
+static __thread unsigned int ft_dbg_acq_dirty_lock;
+static __thread unsigned int ft_dbg_acq_dirty_other;
+static __thread unsigned int ft_dbg_acq_cabort;
+#endif
 
 static inline
 void ft_txn_attempt_bail(struct urcu_txn *op, bool open)
@@ -3718,8 +3729,15 @@ int ft_dlm_lock(struct ft_flip_txn *t, struct cds_ft_metadata *meta,
 	 */
 	assert(!t->structural_sw);
 	if (caa_unlikely(s & (FT_STATE_PROXY | FT_STATE_TOMBSTONE |
-			FT_STATE_LOCK)))
+			FT_STATE_LOCK))) {
+#ifdef FT_DEBUG_REMOVE_RETRY_CAP
+		if (s & FT_STATE_LOCK)
+			ft_dbg_acq_dirty_lock++;
+		else
+			ft_dbg_acq_dirty_other++;
+#endif
 		return -EAGAIN;
+	}
 	*snap = s;
 	FT_TK_TXN_SET_TAKE(t, true);
 	ft_flip_txn_record_state(t, meta,
@@ -4014,8 +4032,12 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 			node_snap);
 		set[i].held.node_held = node_held;
 	}
-	if (ft_flip_txn_commit((struct cds_ft *) ft, acq) != URCU_TXN_STATUS_OK)
+	if (ft_flip_txn_commit((struct cds_ft *) ft, acq) != URCU_TXN_STATUS_OK) {
+#ifdef FT_DEBUG_REMOVE_RETRY_CAP
+		ft_dbg_acq_cabort++;
+#endif
 		return -EAGAIN;		/* commit freed @acq; nothing acquired */
+	}
 	for (i = 0; i < (int) nr_taken; i++)
 		ft_hold_trace_note(taken[i], fn, line);
 	return 0;

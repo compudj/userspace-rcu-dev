@@ -4987,6 +4987,14 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 	}
 }
 
+#ifdef FT_DEBUG_REMOVE_RETRY_CAP
+# include <stdio.h>
+# include <stdlib.h>
+# ifndef FT_REMOVE_RETRY_CAP
+#  define FT_REMOVE_RETRY_CAP	50000
+# endif
+#endif
+
 enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 		struct cds_ft_iter *iter,
 		struct cds_ft_node *node)
@@ -4994,6 +5002,13 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 	struct urcu_txn optxn;
 	enum cds_ft_status s;
 	bool need_retry;
+#ifdef FT_DEBUG_REMOVE_RETRY_CAP
+	unsigned int ft_remove_attempts = 0;
+
+	ft_dbg_acq_dirty_lock = 0;
+	ft_dbg_acq_dirty_other = 0;
+	ft_dbg_acq_cabort = 0;
+#endif
 
 	CDS_FT_SCOPED_WRITER(ft);
 	/*
@@ -5025,6 +5040,30 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 		s = _cds_ft_remove_locked(ft, iter, node, &need_retry, &optxn);
 		if (!need_retry)
 			break;
+#ifdef FT_DEBUG_REMOVE_RETRY_CAP
+		++ft_remove_attempts;
+		if (caa_unlikely(ft_remove_attempts == 100 ||
+				ft_remove_attempts == 1000 ||
+				ft_remove_attempts == 10000)) {
+			fprintf(stderr, "FT REMOVE RETRY TAIL: attempts=%u "
+				"retry=%lu in_fallback=%d(th %d) "
+				"fb_published=%d active=%d "
+				"dirtyLOCK=%u dirtyOTHER=%u cabort=%u\n",
+				ft_remove_attempts, optxn.retry,
+				optxn.in_fallback, urcu_txn_in_fallback(),
+				optxn.fb_published,
+				optxn.domain ? (int) uatomic_load(
+					&optxn.domain->active, CMM_RELAXED)
+					: -1,
+				ft_dbg_acq_dirty_lock, ft_dbg_acq_dirty_other,
+				ft_dbg_acq_cabort);
+		}
+		if (caa_unlikely(ft_remove_attempts > FT_REMOVE_RETRY_CAP)) {
+			fprintf(stderr, "FT REMOVE LIVELOCK: %u attempts on "
+				"one remove\n", ft_remove_attempts);
+			abort();
+		}
+#endif
 		/* Age the conflict, forfeit the turn, close the attempt. */
 		ft_txn_attempt_bail(&optxn, true);
 	}
