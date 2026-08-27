@@ -1577,11 +1577,26 @@ thread sleeping its 10ms quantum mid-handshake convoys the whole
 enrolled queue** (23 pollers × 10–13 queued writers ≈ the downstream
 victims).  A µs-scale handshake race lost costs 10ms × queue depth.
 
-☞ The fix is liburcu-core wait policy (graduated poll(0)/poll(1) before
-the 10ms quantum, and/or a longer teardown spin budget), NOT an FT
-change — a separate decision.  Note the two classes compose: D.1–D.3's
-starvation is 1–8ms of legitimate bulk holds; D.4 is the lane's own
-handoff machinery quantizing rare µs races into 10ms convoys.
+☑ **FIXED @2d857e80 (Mathieu's design): the graduated ladder** —
+busy-wait, then nanosleep 10→640µs doubling, then poll 1/2/4/8ms, then
+16ms per rung.  A lost race now costs ~10–60µs typical (timer slack is
+the floor), ≤2× overshoot, instead of a flat 10ms.  Measured: removes
+>8ms 96→0, max wall 17–20ms→4.9ms on churn; test_fair_mutex green;
+ft_unit/ft_inv smoke green; the full 64-leg gate's reds are exactly the
+documented set, and a pre-fix CONTROL run of the txndbg config
+reproduces its 15 legs identically, abort for abort.  Two recordings
+from the verification: §9.5 class 2's signature is the engine's
+`r->kind == kind` assert (rcu-txn-mcas.h:1000) via
+`ft_flip_txn_guard_parent`, and the class covers the ft_inv root-only
+legs too, not only ft_unit.  ☐ REMAINS OPEN: a small ~10ms residue on
+chainmerge that is NOT this mechanism — body-located (inside
+`_cds_ft_remove_locked`), zero rung-counter hits, tightly clustered
+just above 10ms, convoying the lane secondarily (~4/run).  The next
+unattributed constant.
+
+Note the two classes compose: D.1–D.3's starvation is 1–8ms of
+legitimate bulk holds; D.4 was the lane's own handoff machinery
+quantizing rare µs races into 10ms convoys.
 
 **What this does to the fork above:** the starvation is priced by
 (bulk-op hold time × recompaction rate), so the CURATIVE lever is
