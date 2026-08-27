@@ -1166,6 +1166,13 @@ struct cds_ft_metadata {
 	unsigned long dbg_owner_tid;
 	const char *dbg_owner_fn;
 	int dbg_owner_line;
+	/*
+	 * The ANCHOR the owner's site DERIVED for this member -- the word it
+	 * actually locked.  Two ops covering one node through DIFFERENT anchor
+	 * derivations is the class the member-keyed stamp exists to catch, and
+	 * only the anchors distinguish it from a genuine two-system collision.
+	 */
+	const struct cds_ft_metadata *dbg_owner_anchor;
 #endif
 };
 

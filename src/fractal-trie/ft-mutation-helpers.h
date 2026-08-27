@@ -1897,6 +1897,15 @@ static void ft_flip_txn_call_rcu_now(struct rcu_head *head,
  * mismatch is the defect being measured.
  */
 static __thread const char *ft_glue_dbg_last_arm;
+/*
+ * The lane that answered holds() for the dedupe currently being taken --
+ * carried to the owner stamp so an exclusion violation names WHICH hold
+ * system vouched for the claimant, not merely that one did.
+ */
+static __thread const char *ft_dlm_dbg_dedupe_lane = "?";
+struct ft_glue;
+static bool ft_glue_op_holds(const struct ft_glue *g,
+		const struct cds_ft_metadata *meta);	/* defined below */
 
 #define FT_HOLD_TRACE_MAX	1024
 struct ft_hold_trace_ent {
@@ -1936,8 +1945,9 @@ bool ft_hold_trace_report_ok(void)
  * aborting case.
  */
 static inline
-void ft_owner_stamp_claim(struct cds_ft_metadata *member, const char *fn,
-		int line)
+void ft_owner_stamp_claim(struct cds_ft_metadata *member,
+		const struct cds_ft_metadata *anchor, bool shared,
+		const char *fn, int line)
 {
 	unsigned long self = (unsigned long) pthread_self();
 	unsigned long old;
@@ -1946,16 +1956,27 @@ void ft_owner_stamp_claim(struct cds_ft_metadata *member, const char *fn,
 		return;
 	old = uatomic_xchg(&member->dbg_owner_tid, self);
 	if (old && old != self) {
+		const struct cds_ft_metadata *oa = member->dbg_owner_anchor;
+
 		fprintf(stderr, "FT EXCLUSION VIOLATION: node %p claimed at "
-			"%s:%d by tid %lx while owned by tid %lx (from "
-			"%s:%d)\n",
-			(void *) member, fn, line, self, old,
+			"%s:%d by tid %lx (anchor %p%s) while owned by tid "
+			"%lx (from %s:%d, anchor %p%s)  claimant %s: %s\n",
+			(void *) member, fn, line, self,
+			(const void *) anchor,
+			anchor == member ? "=SELF" : "",
+			old,
 			member->dbg_owner_fn ? member->dbg_owner_fn : "?",
-			member->dbg_owner_line);
+			member->dbg_owner_line, (const void *) oa,
+			oa == member ? "=SELF" : "",
+			shared ? "DEDUPED via lane" : "TOOK it; lane",
+			anchor != oa ? "ANCHOR DISAGREEMENT" :
+				(shared ? ft_dlm_dbg_dedupe_lane :
+					"n/a (owner stamp outlived its hold)"));
 		abort();
 	}
 	member->dbg_owner_fn = fn;
 	member->dbg_owner_line = line;
+	member->dbg_owner_anchor = anchor;
 }
 
 static inline
@@ -2037,11 +2058,12 @@ void ft_hold_trace_drop_tolerant(const struct cds_ft_metadata *lock)
 
 static inline
 void ft_hold_trace_note(const struct cds_ft_metadata *lock,
-		struct cds_ft_metadata *member, const char *fn, int line)
+		struct cds_ft_metadata *member, bool shared, const char *fn,
+		int line)
 {
 	if (ft_hold_trace_n >= FT_HOLD_TRACE_MAX)
 		return;	/* no entry => no claim: nothing to yield later */
-	ft_owner_stamp_claim(member, fn, line);
+	ft_owner_stamp_claim(member, lock, shared, fn, line);
 	ft_hold_trace[ft_hold_trace_n].lock = lock;
 	ft_hold_trace[ft_hold_trace_n].member = member;
 	ft_hold_trace[ft_hold_trace_n].fn = fn;
@@ -2228,10 +2250,11 @@ void ft_hold_trace_drop_tolerant(const struct cds_ft_metadata *lock)
 
 static inline
 void ft_hold_trace_note(const struct cds_ft_metadata *lock,
-		struct cds_ft_metadata *member, const char *fn, int line)
+		struct cds_ft_metadata *member, bool shared, const char *fn,
+		int line)
 {
 	(void) lock;
-	(void) member; (void) fn; (void) line;
+	(void) member; (void) shared; (void) fn; (void) line;
 }
 
 static inline
@@ -2307,7 +2330,8 @@ int ft_meta_lock_acquire(struct cds_ft_metadata *meta,
 	 */
 	if (!(s & (FT_STATE_PROXY | FT_STATE_TOMBSTONE))) {
 		*state_snapshot = s;
-		ft_hold_trace_note(meta, meta, "ft_meta_lock_acquire/red", 0);
+		ft_hold_trace_note(meta, meta, false,
+			"ft_meta_lock_acquire/red", 0);
 		return 0;
 	}
 #endif
@@ -2318,7 +2342,7 @@ int ft_meta_lock_acquire(struct cds_ft_metadata *meta,
 			s | FT_STATE_LOCK) != s))
 		return -EAGAIN;
 	*state_snapshot = s;
-	ft_hold_trace_note(meta, meta, "ft_meta_lock_acquire", 0);
+	ft_hold_trace_note(meta, meta, false, "ft_meta_lock_acquire", 0);
 	return 0;
 }
 
@@ -4372,6 +4396,45 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 			 * its own consumed fence.  Either way: owned, dedupe.
 			 */
 			deduped = true;
+#ifdef FEATURE_FT_HOLD_TRACE
+			{
+				const struct ft_held_set *ch;
+				int depth = 0;
+
+				ft_dlm_dbg_dedupe_lane = "?";
+				for (ch = &ctx->held; ch; ch = ch->outer,
+						depth++) {
+					unsigned int ei;
+
+					if (ch->txn) {
+						unsigned int li;
+
+						for (li = 0;
+							li < ch->txn->nr_locks;
+							li++)
+							if (ch->txn->locks[li]
+								.meta == lock)
+							 ft_dlm_dbg_dedupe_lane =
+								"registry";
+					}
+					for (ei = 0; ei < ch->nr_extra; ei++)
+						if (ch->extra[ei].lock ==
+								lock &&
+							!ch->extra[ei].shared)
+							 ft_dlm_dbg_dedupe_lane =
+								"extra";
+					if (ft_dlm_dbg_dedupe_lane[0] == '?' &&
+							ch->glue &&
+							ft_glue_op_holds(
+								ch->glue,
+								lock))
+						ft_dlm_dbg_dedupe_lane =
+							ft_glue_dbg_last_arm;
+					if (ft_dlm_dbg_dedupe_lane[0] != '?')
+						break;
+				}
+			}
+#endif
 		} else if (ft_dlm_covering_release_recorded(ctx, lock)) {
 			/*
 			 * The drop->commit-window dedupe: this op's own
@@ -4572,7 +4635,8 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 			continue;
 		}
 #endif
-		ft_hold_trace_note(set[i].held.lock, set[i].node, fn, line);
+		ft_hold_trace_note(set[i].held.lock, set[i].node,
+			set[i].held.shared, fn, line);
 	}
 #ifdef FT_DEBUG_REMOVE_RETRY_CAP
 	for (i = 0; i < (int) nr_taken; i++) {
