@@ -1903,6 +1903,7 @@ static __thread const char *ft_glue_dbg_last_arm;
  * system vouched for the claimant, not merely that one did.
  */
 static __thread const char *ft_dlm_dbg_dedupe_lane = "?";
+static bool ft_hold_trace_holds(const struct cds_ft_metadata *lock);
 struct ft_glue;
 static bool ft_glue_op_holds(const struct ft_glue *g,
 		const struct cds_ft_metadata *meta);	/* defined below */
@@ -1960,7 +1961,8 @@ void ft_owner_stamp_claim(struct cds_ft_metadata *member,
 
 		fprintf(stderr, "FT EXCLUSION VIOLATION: node %p claimed at "
 			"%s:%d by tid %lx (anchor %p%s) while owned by tid "
-			"%lx (from %s:%d, anchor %p%s)  claimant %s: %s\n",
+			"%lx (from %s:%d, anchor %p%s)\n  %s\n"
+			"  claimant %s: %s\n",
 			(void *) member, fn, line, self,
 			(const void *) anchor,
 			anchor == member ? "=SELF" : "",
@@ -1968,6 +1970,11 @@ void ft_owner_stamp_claim(struct cds_ft_metadata *member,
 			member->dbg_owner_fn ? member->dbg_owner_fn : "?",
 			member->dbg_owner_line, (const void *) oa,
 			oa == member ? "=SELF" : "",
+			ft_hold_trace_holds(anchor) ?
+				"ledger CONFIRMS the claimant holds it "
+				"(so the OWNER's stamp is the stale one)" :
+				"ledger says the claimant does NOT hold it "
+				"(so the claimant's answer is the stale one)",
 			shared ? "DEDUPED via lane" : "TOOK it; lane",
 			anchor != oa ? "ANCHOR DISAGREEMENT" :
 				(shared ? ft_dlm_dbg_dedupe_lane :

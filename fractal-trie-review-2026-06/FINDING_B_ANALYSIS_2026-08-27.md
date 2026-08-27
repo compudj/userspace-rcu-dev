@@ -153,3 +153,80 @@ defect seen from two sides") is CONFIRMED -- but the shared defect is
 truthful holds(), not fence-vs-anchor composition.  R2
 (fence-under-anchor) loses its evidence; R1 and R3 carry the whole
 redesign.
+
+
+---
+
+# ☠ CORRECTION (same evening, one probe later): THE ABOVE OVERREACHED
+
+The section above concluded "the claimant's answer is the stale one, and
+the owned-mask fast path laundered it".  That was inferred, not
+measured, and the next probe REFUTES it.  Asking the claimant's OWN
+thread-local ledger at the violation:
+
+    FT EXCLUSION VIOLATION: node N claimed at ft_node_recompact:1357
+      (anchor N=SELF) while owned by tid T2 (from
+      ft_chain_compress_fused:1009, anchor N=SELF)
+      ledger CONFIRMS the claimant holds it (so the OWNER's stamp is
+      the stale one)
+      claimant DEDUPED via lane: extra
+
+The claimant's dedupe is CORROBORATED by a second, independent hold
+system: it acquired the word earlier in the same op and never dropped
+it.  So the stale entry is the OWNER's stamp, not the claimant's answer,
+and the fast path laundered nothing.
+
+## What is actually established, and what is not
+
+ESTABLISHED (measured, not inferred):
+  1. Both sites are DLM acquire-sets, not fences (source-verified:
+     ft-mutation-node.h:1357 and ft-remove.h:1009 ARE the
+     ft_dlm_acquire_set calls).  The original fence-vs-anchor mechanism
+     is refuted on this evidence and D1 should not be built on it.
+  2. Both ops derive the SAME anchor, and it is the MEMBER ITSELF
+     (=SELF) -- at ROOT-ONLY, where every anchor is expected to be the
+     root word.  That anomaly is unexplained and is the most suspicious
+     fact on the table.
+  3. The claimant deduped via the EXTRA lane, and its ledger agrees.
+
+NOT ESTABLISHED -- and the trap to avoid: "the ledger confirms it" is
+only as strong as the DROP discipline, which is exactly what a stale
+stamp calls into question.  If a release can leave a stamp behind, the
+same release can leave a LEDGER ENTRY behind, and then both of the
+claimant's witnesses are stale together and T2 is the true holder.  The
+word itself cannot arbitrate: a LOCK bit names no owner.  So the honest
+statement is:
+
+    ONE of the two hold-tracking systems holds an entry that outlived
+    its hold, and no static reading of either can say which.
+
+## The next instrument (do not guess again)
+
+The remaining question is a HISTORY question -- who set the word's
+current LOCK bit last, and whether the loser's release ran -- and the
+tree already has the tool for exactly this wall: LTTng in flight-recorder
+(snapshot) mode, small per-CPU buffers, a violation event emitted from
+ft_owner_stamp_claim with the abort, then read the last events before the
+violation (CLAUDE.md's own root-cause recipe; rig notes in
+reference_ft_lttng_dlm_anchor_rig_2026_08_20).  Trace the acquire, the
+drop and the release of ONE word: the last writer of the LOCK bit and
+the presence or absence of the loser's drop settle it in one trace.
+
+Two candidate mechanisms to test with it, in order:
+  M1. A release that DROPS BY A DIFFERENT KEY THAN IT FILED BY.  The
+      entry is filed under the derived anchor (here =SELF); if the
+      release re-derives the anchor from a different context (or drops
+      the node while the entry is under an ancestor, or vice versa), the
+      entry and its stamp both survive the release.  This is the
+      acquire-vs-release form of the SAME derivation-disagreement class
+      the splice bug turned out to be (@ec9e68f8) -- one op, two
+      derivations of one node's word.
+  M2. The =SELF anchoring itself at root-only: ft_anchor_meta returns
+      the node for depth 0, and ft_descent_anchor_of returns the
+      descent's own cursor when the descent never advanced.  A member
+      dated 0 that is NOT the root would anchor on itself while a
+      correctly-dated peer anchors on the root -- a real exclusion gap,
+      and the one the spacing refusal exists to prevent.  M2 would show
+      as an ANCHOR DISAGREEMENT in the stamp, which has NOT been
+      observed -- so it is the weaker candidate, but it must be
+      explained rather than left as an anomaly.
