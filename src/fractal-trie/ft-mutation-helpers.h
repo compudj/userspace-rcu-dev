@@ -5504,6 +5504,43 @@ void ft_flip_txn_guard_parent(const struct cds_ft *ft, struct ft_flip_txn *t,
 	if (!t || !parent_nf)
 		return;
 	/*
+	 * A word this txn already covers with a LIVE lock-protocol record
+	 * needs no guard: the held per-node lock IS the exclusion the guard
+	 * approximates (the LOCK_FINE rule below, and ft_dlm_acquire_set_at's
+	 * node_held skip state the same) -- a peer can neither retire nor
+	 * freeze the holder while the word carries this op's lock, since its
+	 * CAS expects a clean word.  At the dev-only coarse spacings the
+	 * anchor coarsening makes the coincidence ROUTINE: the guarded parent
+	 * anchors on the very word this op holds, and the MW validate would
+	 * fuse onto the armed SW release -- benign at commit (the engine keeps
+	 * the original expected old and fail-safes SW->MW), but exactly the
+	 * mixed-kind shape the engine's record police refuses (S9.5 class 2).
+	 * Ask the DESCRIPTOR, never a fresh read.  A record whose NEW value
+	 * carries the tombstone is NOT exempt: publishing into a parent this
+	 * txn itself retires must keep failing loudly through the guard.
+	 */
+	{
+		struct cds_ft_metadata *pm = ft_flag_to_metadata(ft, parent_nf);
+
+		if (ft_flip_txn_owns(t, pm)) {
+			/*
+			 * The REGISTRY is the skip's predicate -- order-
+			 * independent, and it covers the mark-release shape
+			 * whose record masks the lock bit out of both values.
+			 * The descriptor is asked only for the carve-out.
+			 */
+			struct urcu_txn_desc *desc = t->mtxn->desc;
+			const struct urcu_txn_record *r = NULL;
+
+			if (desc && desc != URCU_TXN_ENOMEM)
+				r = urcu_txn_find(desc,
+					(void **) &pm->state);
+			if (!r || !(((uintptr_t) r->new_ptr) &
+					FT_STATE_TOMBSTONE))
+				return;
+		}
+	}
+	/*
 	 * §4.B VALIDATE as ONE record: read the holder's state (unrecorded)
 	 * and expect its LIVE value at commit -- {live -> live}, a pure
 	 * validate that writes nothing new.
