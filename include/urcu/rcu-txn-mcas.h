@@ -125,6 +125,36 @@ extern "C" {
 #endif
 
 /*
+ * ABORT ATTRIBUTION (opt-in, default inert).  A commit that returns ABORT says
+ * only that SOMETHING lost; the engine knows exactly WHICH record lost and has
+ * never reported it, so an embedder measuring its own abort rate can attribute
+ * it only by the transaction it started -- which is not attribution when one
+ * transaction carries records of several kinds.
+ *
+ * URCU_TXN_STAT_ABORT(r) is handed the LOSING record, or NULL where the abort
+ * has none (a poisoned descriptor).  ☠ It fires at THREE exits, not one: the
+ * install loop's failure, AND the lone-MW-edge fast path, whose CAS is the whole
+ * commit and never builds a descriptor at all.  An instrument hooked only at the
+ * first is blind to every single-record contention abort.
+ *
+ * URCU_TXN_REC_DBG_STAMP / _CHAIN let the embedder label a record as it is
+ * added, so the label travels WITH the record through the partition and the
+ * slot-address sort that reorder the write set before install.  _CHAIN fires
+ * where a read-your-own-writes store folds onto a record that already exists:
+ * the embedder decides what two labels on one word mean, because the engine
+ * cannot.
+ */
+#ifndef URCU_TXN_STAT_ABORT
+#define URCU_TXN_STAT_ABORT(r)		do { } while (0)
+#endif
+#ifndef URCU_TXN_REC_DBG_STAMP
+#define URCU_TXN_REC_DBG_STAMP(r)	do { } while (0)
+#endif
+#ifndef URCU_TXN_REC_DBG_CHAIN
+#define URCU_TXN_REC_DBG_CHAIN(r)	do { } while (0)
+#endif
+
+/*
  * Single-edge escalation threshold: a lone MW record commits with a bare CAS and
  * no descriptor until it has retried this many times, after which it commits
  * through the full descriptor protocol so it can hold the slot latched against
@@ -201,6 +231,23 @@ struct urcu_txn_record {
 					 */
 	struct urcu_txn_desc *desc;	/* back-pointer: shared status word */
 	unsigned int kind;		/* enum urcu_txn_kind (writer-side only) */
+#ifdef URCU_TXN_REC_DBG
+	/*
+	 * The embedder's label for this record (URCU_TXN_REC_DBG_STAMP), so an
+	 * abort can name the KIND of edge that lost rather than the transaction
+	 * that carried it.  Opaque to the engine: written by the embedder's hook,
+	 * read by its own.
+	 *
+	 * ☠ GATED ON A COMPILATION-WIDE DEFINE, not on an embedder header,
+	 * because the DESCRIPTOR is allocated by one translation unit
+	 * (urcu-txn.c's slab, sized with sizeof(struct urcu_txn_record)) and
+	 * filled by another.  A field only some TUs can see is a layout split,
+	 * not a diagnostic.  Pass -DURCU_TXN_REC_DBG in CFLAGS or not at all.
+	 * It lands in the tail padding the aligned(16) already reserves, so the
+	 * record does not grow.
+	 */
+	unsigned int dbg_embedder;
+#endif
 } __attribute__((aligned(16)));
 
 /*
@@ -819,6 +866,7 @@ bool urcu_txn_add(struct urcu_txn_desc *t, void **slot,
 	r->new_ptr = new_ptr;
 	r->proxy_tag = tag;
 	r->kind = kind;
+	URCU_TXN_REC_DBG_STAMP(r);
 	if (kind == URCU_TXN_KIND_MW)
 		t->nr_mw++;
 	return true;
@@ -876,6 +924,7 @@ bool urcu_txn_record_chain(struct urcu_txn_desc *t, void **slot,
 	struct urcu_txn_record *r = urcu_txn_find(t, slot);
 
 	if (r != NULL) {
+		URCU_TXN_REC_DBG_CHAIN(r);
 		urcu_assert_debug(r->kind == kind);
 		if (kind == URCU_TXN_KIND_MW && r->kind != URCU_TXN_KIND_MW) {
 			r->kind = URCU_TXN_KIND_MW;	/* MW dominates: fail-safe to CAS */
@@ -949,6 +998,7 @@ bool urcu_txn_desc_commit(struct urcu_txn_desc *t,
 	int failed;
 
 	if (caa_unlikely(t->poisoned)) {
+		URCU_TXN_STAT_ABORT(NULL);	/* no losing record: poisoned */
 		urcu_txn_destroy(t);
 		return false;
 	}
@@ -977,6 +1027,8 @@ bool urcu_txn_desc_commit(struct urcu_txn_desc *t,
 			bool committed = uatomic_cmpxchg(r->slot, r->old_ptr,
 					r->new_ptr) == r->old_ptr;
 
+			if (caa_unlikely(!committed))
+				URCU_TXN_STAT_ABORT(r);
 			urcu_txn_destroy(t);
 			return committed;
 		}
@@ -1019,6 +1071,7 @@ bool urcu_txn_desc_commit(struct urcu_txn_desc *t,
 		planted = urcu_txn_install_mw_depth(t, nr_mw, &failed);
 	if (failed) {
 		/* Abort: restore the parked MW prefix to old, then reclaim. */
+		URCU_TXN_STAT_ABORT(&t->recs[planted]);
 		urcu_txn_settle(t, planted);
 		call_rcu_fn(&t->rcu_head, urcu_txn_free_rcu);
 		return false;
@@ -1050,6 +1103,7 @@ bool urcu_txn_desc_commit_sw(struct urcu_txn_desc *t,
 
 	urcu_assert_debug(t->nr_mw == 0);	/* caller promised store_sw-only */
 	if (caa_unlikely(t->poisoned)) {
+		URCU_TXN_STAT_ABORT(NULL);	/* no losing record: poisoned */
 		urcu_txn_destroy(t);
 		return false;
 	}
