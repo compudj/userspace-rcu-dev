@@ -1675,15 +1675,27 @@ certification, then the API gate lift (`ft-lifecycle.h:369`):
    config clean, MW per-node included.  Four ledger-lifetime lanes were
    fixed to get there (pre-commit drop, tolerant backstop, closing-hold
    and stale-plan filing skips, the op-init leak canary).
-   ☐☐ **THE ORACLE'S FIRST CATCHES — the remaining certification debt,
-   now with names**: (A) dedupes onto UNLOCKED holds (stale plan-time
-   frames listing swept marks; 203–787/run at the coarse spacings, zero
-   at per-node) — an acquire believing itself covered by a free word;
-   (B) mark-vs-anchor DUAL COVERAGE at root-only MW (one node claimed
-   via the root anchor and via its own mark; abort at test 30, both
-   sites named).  The gate's holdtrace config runs without its imw legs
-   until both close; re-adding them is E.2's completion criterion, and
-   E.5 cannot lift the coarse spacings before that.
+   ☑ **(A) RESOLVED @aa03d23b** as a protocol rule reached through seven
+   measured rounds: *a frame entry answers holds() exactly as long as
+   its word is unclaimable by peers* (LOCK/PROXY/TOMBSTONE or a release
+   recorded in a live descriptor — any record shape — dedupe; released
+   live-free — scrubbed at the sweeps and the consumption point,
+   tombstone-guarded; record-less free — refuse through the aging
+   path).  The GLUE's self-consultation lane is exempted (its accessory
+   hold arms are not scrub-true; every enforcement form measured as a
+   livelock) — ☐ finding A stays open for that one lane behind the GLUE
+   HOLD-LIFECYCLE REDESIGN, which is plausibly the same work as (B)'s
+   fence-under-anchor direction (one truthful-ownership redesign serves
+   both; see fractal-trie-review-2026-06/FINDING_B_ANALYSIS_2026-08-27.md).
+   Exponential MW runs 119/119 for the first time; the full gate's
+   per-leg diff vs the E.0 baseline is exactly the nine holdtrace legs,
+   all green.
+   ☐ **(B) OPEN**: mark-vs-anchor DUAL COVERAGE at root-only MW (abort
+   at test 30, both sites named; mechanism + D1/D2/D3 fix directions in
+   the analysis note — D1 fence-under-anchor recommended).  The gate's
+   holdtrace config runs without its imw legs until B (and A's glue
+   lane) close; re-adding them is E.2's completion criterion, and E.5
+   cannot lift the coarse spacings before that.
 3. ☑ FIRST-PASS CLEAN (2026-08-27, unblocked by E.0): both suites at BOTH
    exponential and root-only under `-DDEBUG_RCU -DFEATURE_FT_HOLD_TRACE`:
    zero SELF-COLLISION, zero asserts, 315+3/119 everywhere.  The zero is
