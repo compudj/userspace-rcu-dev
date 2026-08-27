@@ -1535,6 +1535,31 @@ enrolled peer, the victim's collisions are with these running holds, not
 with a crowd.  ⇒ The 08-20 "lock-holder PREEMPTION" conclusion was the
 under-load special case; the idle-box steady state is scenario (3).
 
+### D.3 — the bounded-linger palliative, MEASURED (2026-08-27, @d3fe955a)
+
+The retry-edge linger (spin on the refused word after the bail, nothing
+held, 200µs cap) was skeptic-amended THREE ways before measuring — TLS word
+cleared at every begin (a stale word is the refuted blind backoff), gated on
+the ESCALATED state (aging is attempt-denominated), and the A/B run with the
+attempt-triggered milestone compiled out (`-DFT_REMOVE_TAIL_QUIET`) since it
+biases the control arm.  Clean rig (-O2 -DNDEBUG, wall-clock >1ms metric,
+interleaved, sequential):
+
+    churn      slow/run 136.5 → 87.5 (−36%); starved-class 71.5 → 38 (−47%)
+    chainmerge NO separation (311 vs 258, overlapping, lin outliers above)
+    max wall   ~10–20ms in BOTH arms — untouched
+    ops        within spread (~−3%)
+
+⇒ A CLASS-SPECIFIC palliative: it deflates attempts/CPU for the
+stable-single-word victim class (churn's unchain/insert holds) and does
+nothing for the rotating {C,P,GP} set class (chainmerge's recompact) —
+exactly the skeptic's prediction.  No latency-tail win anywhere (sub-µs
+inter-hold gaps cannot be captured by a µs wake-to-acquire path), and no
+tail growth from the de-escalation window.  Landed DEFAULT-OFF; whether it
+ever turns on is a separate decision from the curative work below.  The
+~10ms stall class visible in both arms is unattributed — a candidate next
+question.
+
 **What this does to the fork above:** the starvation is priced by
 (bulk-op hold time × recompaction rate), so the CURATIVE lever is
 SHORTENING THE HOLD — which is §8.2 in-place mutation's exact target
