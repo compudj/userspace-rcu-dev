@@ -159,6 +159,41 @@ extern "C" {
 #endif
 
 /*
+ * URCU_TXN_REC_WROTE(r, v) is the WINNER's half of the same attribution
+ * story.  URCU_TXN_STAT_ABORT names the record that LOST a slot; nothing
+ * names the write it lost TO.  This hook fires immediately AFTER every store
+ * the engine makes to a record's slot -- the proxy plants (CAS and park), the
+ * settle stores of both passes (the new value on SUCCEEDED, the old on the
+ * FAILED restore, which a loser can observe just the same), and the lone-edge
+ * fast paths whose single store IS the commit -- handing the embedder the
+ * record and the value just written, so it can keep a last-writer ledger an
+ * aborting peer may consult.
+ *
+ * ☠ AFTER the store, never before: a hook that fires first publishes a
+ * "winner" that may yet lose its own CAS, and the ledger would then name a
+ * writer of a value the slot never held.  The window this leaves (store
+ * done, ledger not yet) is the instrument's to account for, not to hide --
+ * the embedder can match the ledger's value against the slot before
+ * believing it.
+ */
+#ifndef URCU_TXN_REC_WROTE
+#define URCU_TXN_REC_WROTE(r, v)	do { } while (0)
+#endif
+
+/*
+ * URCU_TXN_REC_LOST(r, seen) hands the embedder the value the losing CAS
+ * OBSERVED, at the instant of the loss.  The CAS instruction returns that
+ * value and the engine has always thrown it away -- an embedder reconstructing
+ * it later from a re-read is racing every subsequent writer of the slot.
+ * @seen NULL where the exit has no observed value in hand (the pre-load
+ * status check).  Fires before URCU_TXN_STAT_ABORT for the same record; the
+ * embedder pairs the two.
+ */
+#ifndef URCU_TXN_REC_LOST
+#define URCU_TXN_REC_LOST(r, seen)	do { } while (0)
+#endif
+
+/*
  * Single-edge escalation threshold: a lone MW record commits with a bare CAS and
  * no descriptor until it has retried this many times, after which it commits
  * through the full descriptor protocol so it can hold the slot latched against
@@ -344,6 +379,23 @@ int urcu_txn_try_cas(void **slot, void *expect, void *desired)
 			/*weak=*/0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
 }
 
+/*
+ * Strong try-CAS that also reports the OBSERVED value through @seen -- the
+ * word the compare-exchange returns anyway.  On success *@seen == @expect.
+ * The inner shape mirrors urcu_txn_try_cas exactly; a caller whose @seen is
+ * dead (the hooks compiled out) folds to the same code.
+ */
+static inline
+int urcu_txn_try_cas_seen(void **slot, void *expect, void *desired,
+		void **seen)
+{
+	int ok = __atomic_compare_exchange_n(slot, &expect, desired,
+			/*weak=*/0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+
+	*seen = expect;
+	return ok;
+}
+
 static inline
 unsigned long urcu_txn_desc_status(const struct urcu_txn_desc *t)
 {
@@ -395,8 +447,11 @@ static inline
 int urcu_txn_plant(struct urcu_txn_record *r)
 {
 	void *tagv = urcu_txn_tag(r, r->proxy_tag);
+	int planted = uatomic_cmpxchg(r->slot, r->old_ptr, tagv) == r->old_ptr;
 
-	return uatomic_cmpxchg(r->slot, r->old_ptr, tagv) == r->old_ptr;
+	if (planted)
+		URCU_TXN_REC_WROTE(r, tagv);
+	return planted;
 }
 
 /*
@@ -407,6 +462,7 @@ static inline
 void urcu_txn_park(struct urcu_txn_record *r)
 {
 	uatomic_store(r->slot, urcu_txn_tag(r, r->proxy_tag), CMM_RELEASE);
+	URCU_TXN_REC_WROTE(r, urcu_txn_tag(r, r->proxy_tag));
 }
 
 /*
@@ -467,13 +523,16 @@ unsigned int urcu_txn_install_mw_flat(struct urcu_txn_desc *t,
 	URCU_TXN_STAT(drive);
 	for (i = 0; i < nr_mw; i++) {
 		struct urcu_txn_record *r = &t->recs[i];
+		void *seen;
 
-		if (caa_unlikely(!urcu_txn_try_cas(r->slot, r->old_ptr,
-				urcu_txn_tag(r, r->proxy_tag)))) {
+		if (caa_unlikely(!urcu_txn_try_cas_seen(r->slot, r->old_ptr,
+				urcu_txn_tag(r, r->proxy_tag), &seen))) {
+			URCU_TXN_REC_LOST(r, seen);
 			urcu_txn_decide(t, URCU_TXN_DESC_FAILED);
 			*failed = 1;
 			return i;	/* prefix [0..i) planted */
 		}
+		URCU_TXN_REC_WROTE(r, urcu_txn_tag(r, r->proxy_tag));
 	}
 	*failed = 0;
 	return nr_mw;
@@ -500,6 +559,7 @@ unsigned int urcu_txn_install_mw_depth(struct urcu_txn_desc *t,
 			void *v;
 
 			if (urcu_txn_desc_status(t) != URCU_TXN_DESC_UNDECIDED) {
+				URCU_TXN_REC_LOST(r, NULL);
 				*failed = 1;
 				return i;
 			}
@@ -517,15 +577,18 @@ unsigned int urcu_txn_install_mw_depth(struct urcu_txn_desc *t,
 						URCU_TXN_WAIT_PATIENCE;
 
 					while (urcu_txn_is_proxy(
-						uatomic_load(r->slot, CMM_ACQUIRE),
+						(v = uatomic_load(r->slot,
+							CMM_ACQUIRE)),
 						r->proxy_tag)) {
 						if (urcu_txn_desc_status(t) !=
 								URCU_TXN_DESC_UNDECIDED) {
+							URCU_TXN_REC_LOST(r, v);
 							*failed = 1;
 							return i;
 						}
 						if (patience-- == 0) {
 							URCU_TXN_STAT(wait_capped);
+							URCU_TXN_REC_LOST(r, v);
 							urcu_txn_decide(t,
 								URCU_TXN_DESC_FAILED);
 							*failed = 1;
@@ -537,6 +600,7 @@ unsigned int urcu_txn_install_mw_depth(struct urcu_txn_desc *t,
 				}
 			}
 			if (v != r->old_ptr) {
+				URCU_TXN_REC_LOST(r, v);
 				urcu_txn_decide(t, URCU_TXN_DESC_FAILED);
 				*failed = 1;
 				return i;
@@ -660,6 +724,7 @@ void urcu_txn_settle(struct urcu_txn_desc *t, unsigned int planted)
 			continue;		/* second pass, below */
 		urcu_txn_dbg_parked_check(t, r, i);
 		uatomic_store(r->slot, want, CMM_RELEASE);
+		URCU_TXN_REC_WROTE(r, want);
 	}
 	if (t->late_tag) {
 		for (i = 0; i < planted; i++) {
@@ -672,6 +737,9 @@ void urcu_txn_settle(struct urcu_txn_desc *t, unsigned int planted)
 				st == URCU_TXN_DESC_SUCCEEDED ?
 					r->new_ptr : r->old_ptr,
 				CMM_RELEASE);
+			URCU_TXN_REC_WROTE(r,
+				st == URCU_TXN_DESC_SUCCEEDED ?
+					r->new_ptr : r->old_ptr);
 		}
 	}
 }
@@ -1020,6 +1088,7 @@ bool urcu_txn_desc_commit(struct urcu_txn_desc *t,
 			 * period (as <urcu/rcu-txn-sw.h>).
 			 */
 			uatomic_store(r->slot, r->new_ptr, CMM_RELEASE);
+			URCU_TXN_REC_WROTE(r, r->new_ptr);
 			urcu_txn_destroy(t);
 			return true;
 		}
@@ -1028,11 +1097,16 @@ bool urcu_txn_desc_commit(struct urcu_txn_desc *t,
 			 * Lone MW edge, not yet starved: the CAS itself is the
 			 * atomic commit -- no proxy, no grace period.
 			 */
-			bool committed = uatomic_cmpxchg(r->slot, r->old_ptr,
-					r->new_ptr) == r->old_ptr;
+			void *seen = uatomic_cmpxchg(r->slot, r->old_ptr,
+					r->new_ptr);
+			bool committed = seen == r->old_ptr;
 
-			if (caa_unlikely(!committed))
+			if (caa_unlikely(!committed)) {
+				URCU_TXN_REC_LOST(r, seen);
 				URCU_TXN_STAT_ABORT(t, r);
+			} else {
+				URCU_TXN_REC_WROTE(r, r->new_ptr);
+			}
 			urcu_txn_destroy(t);
 			return committed;
 		}
@@ -1121,6 +1195,7 @@ bool urcu_txn_desc_commit_sw(struct urcu_txn_desc *t,
 		urcu_assert_debug(r->kind == URCU_TXN_KIND_SW);
 		/* Lone SW edge: caller-exclusive plain store, no proxy, no GP. */
 		uatomic_store(r->slot, r->new_ptr, CMM_RELEASE);
+		URCU_TXN_REC_WROTE(r, r->new_ptr);
 		urcu_txn_destroy(t);
 		return true;
 	}
