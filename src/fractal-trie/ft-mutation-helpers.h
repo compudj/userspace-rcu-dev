@@ -3457,6 +3457,38 @@ void ft_flip_txn_arm_per_op_at(const struct cds_ft *ft, struct ft_flip_txn *t,
 	ft_flip_txn_arm_per_op_at((ft), (t), NULL)
 #endif
 
+/*
+ * THE ONE DOOR for a writer whose whole body parks SW (the rekey writer, the
+ * root-COW driver) -- as opposed to an op that arms a TAIL of its records.
+ *
+ * Such a body cannot fall back to all-MW: its structural edges sit on state
+ * words the op ITSELF fenced, so an MW edge expecting live_state reads the op's
+ * OWN mark, the commit aborts with no peer involved, and the retry loop replans
+ * the identical shape forever.  Measured twice as a LIVELOCK -- once on ft_inv
+ * FT_INV_MW=1 at exponential, once on nocompress/ft_unit at per-node when a
+ * branch missed the arm entirely.  See ft_reparent_record_meta's @child_marked.
+ *
+ * So: take the sanctioned per-op arm when it will have it, and otherwise say SW
+ * explicitly.  ☠ THE SECOND LINE IS PHASE E's DEBT -- the per-op helper refuses
+ * any spacing but per-node, and those spacings are dev-only
+ * (cds_ft_group_attr_set_lock_spacing refuses them without
+ * FEATURE_FT_ANCHOR_VALIDATE) -- but it is a POLICY branch behind ONE entry
+ * point, not a second door.
+ *
+ * ☞ CALL IT AT TXN CREATION.  There @nr_locks is 0, so the per-op arm always
+ * declines and the fallback carries correctness -- which is the point: creation
+ * is the one place EVERY branch of the op passes.  A per-op arm that also
+ * CLAIMS belongs later, at a take, and is additive to this.
+ */
+static inline
+void ft_flip_txn_arm_structural(const struct cds_ft *ft, struct ft_flip_txn *t)
+{
+	ft_flip_txn_arm_per_op(ft, t);
+	if (!t->structural_sw && ft && ft->lock_fine && !ft_txn_content_sw_ok(ft))
+		ft_flip_txn_set_structural_sw(t, true);
+}
+
+
 
 static inline
 void ft_flip_txn_record_reserved(struct ft_flip_txn *t,

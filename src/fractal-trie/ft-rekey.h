@@ -72,7 +72,9 @@
  * edge did the masking) reads plausibly and is wrong.
  *
  * CALLER CONTRACT:
- *  - ft->lock_fine and ft_flip_txn_set_structural_sw(@txn, true) before calling.
+ *  - ft->lock_fine, and @txn armed structurally by the caller at CREATION
+ *    (ft_flip_txn_arm_structural).  This function adds the PER-OP arm at its
+ *    own stop fence, which is additive and is what carries the audit.
  *  - @marks / @snaps: caller-owned scratch of >= FT_ENTRY_PER_NODE + 1 entries;
  *    *@nr_marks returns the count recorded (published incrementally so a bail is
  *    covered).  These marks are NOT txn-registered (count can exceed
@@ -129,6 +131,11 @@ int ft_rekey_cow_lock_child(const struct cds_ft *ft,
 {
 	return ft_acquire_member(ft, ctx, child, cm, child_depth, held);
 }
+
+/* Defined below; ft_rekey_cow_stop hands it the marks it takes. */
+static
+void ft_rekey_marks_to_txn(struct ft_flip_txn *txn,
+		struct ft_held_anchor *marks, unsigned int nr_marks);
 
 static
 int ft_rekey_cow_stop(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
@@ -213,6 +220,21 @@ int ft_rekey_cow_stop(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		return -EAGAIN;
 	marks[nm++] = stop_held;
 	*nr_marks = nm;
+	/* register BEFORE the records this mark licenses. */
+	ft_rekey_marks_to_txn(txn, marks, nm);
+	/*
+	 * PHASE B, STEP B6 -- the per-op arm, at the first point this op holds
+	 * anything.  The caller already armed the txn structurally at CREATION
+	 * (ft_flip_txn_arm_structural), which is what covers every branch; this
+	 * one is ADDITIVE and is what buys the audit value -- only a per-op arm
+	 * sets @dbg_arm_per_op, and at creation @nr_locks is 0 so it cannot.
+	 *
+	 * Registering first is not optional: the records below name these marks
+	 * as their owner (register-BEFORE-record, the class 55c0350c closed
+	 * across 17 sites).  ft_rekey_marks_to_txn is idempotent (@txn_owned).
+	 */
+	ft_rekey_marks_to_txn(txn, marks, nm);
+	ft_flip_txn_arm_per_op(ft, txn);
 	/*
 	 * A held set carries ONE out-of-registry array, so a caller keeping marks
 	 * of its own would lose them here.  No caller does; assert it rather than
@@ -285,6 +307,8 @@ int ft_rekey_cow_stop(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 			csnap = marks[nm].node_snap;
 			nm++;
 			*nr_marks = nm;
+			/* register BEFORE the records this mark licenses. */
+			ft_rekey_marks_to_txn(txn, marks, nm);
 		}
 		ft_reparent_record(ft, txn, child, new_flag, &new_cn->child,
 			/*child_marked=*/ cm != NULL, /*hold_ctx=*/ NULL);
@@ -450,6 +474,8 @@ int ft_rekey_cow_stop(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 				csnap = marks[nm].node_snap;
 				nm++;
 				*nr_marks = nm;
+				/* register BEFORE the records this mark licenses. */
+				ft_rekey_marks_to_txn(txn, marks, nm);
 			}
 			ft_reparent_record(ft, txn, iter, new_flag, slot,
 				/*child_marked=*/ true,		/* marked above */
@@ -477,6 +503,8 @@ int ft_rekey_cow_stop(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 				csnap = marks[nm].node_snap;
 				nm++;
 				*nr_marks = nm;
+				/* register BEFORE the records this mark licenses. */
+				ft_rekey_marks_to_txn(txn, marks, nm);
 			}
 			ft_reparent_record(ft, txn, iter, new_flag, slot,
 				/*child_marked=*/ true,		/* marked above */
@@ -1792,7 +1820,14 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 * separate question -- other refusals sit behind it -- but arming is
 	 * no longer part of it.
 	 */
-	ft_flip_txn_set_structural_sw(txn, true);
+	/*
+	 * PHASE B, STEP B6: the hand-arm is retired onto the one door.  AT
+	 * CREATION, because that is the point EVERY branch of this op passes --
+	 * the merge_dst fold never reaches ft_rekey_cow_stop, and arming only
+	 * there left it all-MW, aborting its own commit forever (a livelock the
+	 * nocompress leg caught as a hang).
+	 */
+	ft_flip_txn_arm_structural(ft, txn);
 #ifdef FT_REKEY_CLAIM
 	/*
 	 * 9.1 AUDIT: this writer is HAND-armed, so B0's owner assert never runs on
@@ -3236,6 +3271,15 @@ cells_done:
 		}
 		ft_flip_txn_record_anchor_release_held(txn, marks[i].lock);
 	}
+	/*
+	 * THE CLAIM AT THE CHOKE POINT.  Every branch of this writer reaches this
+	 * commit, and every branch of it parks SW; an un-armed one aborts here
+	 * forever with no peer involved.  The arm cannot live at this point, but
+	 * the claim can -- and when the arm was moved onto a branch one caller
+	 * never visits, the missing assert is what turned a deterministic
+	 * livelock into a silent hang.
+	 */
+	assert(txn->structural_sw);
 	st = ft_flip_txn_commit(ft, txn);
 	if (st == URCU_TXN_STATUS_OK) {
 		/*

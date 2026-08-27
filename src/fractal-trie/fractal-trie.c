@@ -347,7 +347,8 @@ int _cds_ft_debug_cow_replace_root(struct cds_ft *ft)
 	txn = ft_flip_txn_create(ft);
 	if (!txn)
 		return -ENOMEM;
-	ft_flip_txn_set_structural_sw(txn, true);
+	/* PHASE B, STEP B6: the one door, at creation (see the rekey writer). */
+	ft_flip_txn_arm_structural(ft, txn);
 
 	/* The ROOT is its own anchor under every spacing: byte-depth 0. */
 	ret = ft_rekey_cow_stop(ft, NULL, txn, root, 0, 0 /*cut*/, &root_prime,
@@ -394,14 +395,18 @@ int _cds_ft_debug_cow_replace_root(struct cds_ft *ft)
 
 sweep:
 	/*
-	 * The caller-owned release the primitive's contract requires (the marks are
-	 * not txn-registered), on bail/abort paths ONLY: a successful commit already
+	 * The caller-owned release, on bail/abort paths ONLY: a successful commit already
 	 * released every mark through its state edge, so clearing again would take a
 	 * peer's fresh mark off a node that is LIVE and CLEAN by then.
 	 */
 	if (!marks_consumed)
 		for (i = 0; i < nr_marks; i++)
-			if (!marks[i].shared)
+			/*
+			 * ☠ @txn_owned is skipped: ft_rekey_cow_stop registers
+			 * its marks now, and registration TRANSFERS the clear to
+			 * the txn's terminals.  ONE OWNER PER FENCE.
+			 */
+			if (!marks[i].shared && !marks[i].txn_owned)
 				ft_meta_lock_release_if_held(marks[i].lock);
 	return ret;
 }
