@@ -51,6 +51,11 @@
 extern "C" {
 #endif
 
+#ifdef CDS_FAIR_MUTEX_DBG_POLL
+/* Probe: count 10ms teardown-wait poll quanta (diagnosis builds only). */
+static __thread unsigned long cds_fmtx_dbg_polls __attribute__((unused));
+#endif
+
 #define CDS_FAIR_MUTEX_WAIT_ATTEMPTS	1000
 /*
  * Grant-side confirm budget: after publishing GRANTED, the granter briefly
@@ -183,8 +188,12 @@ granted:
 			break;
 		caa_cpu_relax();
 	}
-	while (!(uatomic_load(&w->state, CMM_ACQUIRE) & CDS_FAIR_MUTEX_TEARDOWN))
+	while (!(uatomic_load(&w->state, CMM_ACQUIRE) & CDS_FAIR_MUTEX_TEARDOWN)) {
+#ifdef CDS_FAIR_MUTEX_DBG_POLL
+		cds_fmtx_dbg_polls++;
+#endif
 		(void) poll(NULL, 0, 10);
+	}
 	urcu_posix_assert(uatomic_load(&w->state) & CDS_FAIR_MUTEX_TEARDOWN);
 }
 
