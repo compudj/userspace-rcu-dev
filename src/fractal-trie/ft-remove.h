@@ -5057,6 +5057,88 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 					: -1,
 				ft_dbg_acq_dirty_lock, ft_dbg_acq_dirty_other,
 				ft_dbg_acq_cabort);
+#ifdef FT_ENABLE_TRACING
+			/*
+			 * The traced build's milestone IS the violation: emit
+			 * the self-diagnosing event, persist the ring, crash
+			 * before the window scrolls out.
+			 */
+			if (ft_remove_attempts == 100 && ft_dbg_last_refused) {
+				const struct cds_ft_metadata *m =
+					ft_dbg_last_refused;
+				const struct ft_dbg_take_slot *sl =
+					ft_dbg_take_slot_of(m);
+				int match = (sl->meta == m);
+
+				FT_TP(remove_anchor_starved, (const void *) m,
+					(unsigned long) CMM_LOAD_SHARED(
+						m->state),
+					ft_dbg_refused_streak,
+					ft_remove_attempts,
+					match ? sl->fn : "?",
+					match ? sl->line : 0,
+					match ? sl->op_bound : -1,
+					match ? (unsigned long)
+						((ft_dbg_now_ns() - sl->ts_ns)
+							/ 1000) : 0);
+				(void) system("lttng snapshot record 1>&2");
+				abort();
+			}
+#else /* !FT_ENABLE_TRACING */
+			/*
+			 * Sample the refused word for 200us: is this ONE hold
+			 * spanning the victim's episode, or a churn of takes?
+			 * The registry names the taker; arena-backed metadata
+			 * stays mapped, so a racy read cannot fault.
+			 */
+			if (ft_dbg_last_refused) {
+				const struct cds_ft_metadata *m =
+					ft_dbg_last_refused;
+				const struct ft_dbg_take_slot *sl =
+					ft_dbg_take_slot_of(m);
+				uint64_t t0 = ft_dbg_now_ns(), tnow;
+				unsigned int held = 0, total = 0, trans = 0;
+				int prev_locked = -1;
+
+				do {
+					uintptr_t sw = CMM_LOAD_SHARED(
+						m->state);
+					int locked = !!(sw & FT_STATE_LOCK);
+
+					total++;
+					held += locked;
+					if (prev_locked >= 0 &&
+							locked != prev_locked)
+						trans++;
+					prev_locked = locked;
+					caa_cpu_relax();
+					tnow = ft_dbg_now_ns();
+				} while (tnow - t0 < 200000);
+				if (sl->meta == m) {
+					fprintf(stderr, "FT REMOVE RETRY "
+						"HOLDER: streak=%u "
+						"held=%u/%u trans=%u "
+						"taker=%s:%d op_bound=%d "
+						"tid=%lx take_age_us=%llu\n",
+						ft_dbg_refused_streak,
+						held, total, trans,
+						sl->fn, sl->line,
+						sl->op_bound, sl->tid,
+						(unsigned long long)
+						(t0 - sl->ts_ns) / 1000);
+				} else {
+					fprintf(stderr, "FT REMOVE RETRY "
+						"HOLDER: streak=%u "
+						"held=%u/%u trans=%u "
+						"taker=UNKNOWN (slot %p vs "
+						"%p)\n",
+						ft_dbg_refused_streak,
+						held, total, trans,
+						(void *) sl->meta,
+						(void *) m);
+				}
+			}
+#endif /* !FT_ENABLE_TRACING */
 		}
 		if (caa_unlikely(ft_remove_attempts > FT_REMOVE_RETRY_CAP)) {
 			fprintf(stderr, "FT REMOVE LIVELOCK: %u attempts on "

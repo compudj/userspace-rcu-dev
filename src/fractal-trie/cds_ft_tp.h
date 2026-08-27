@@ -1117,6 +1117,82 @@ LTTNG_UST_TRACEPOINT_EVENT(cds_ft, reanchor_walk,
 	)
 )
 
+/*
+ * Phase D.2, the DLM anchor rig: who holds the word a starving remove keeps
+ * hitting, and for how long.  Take/drop are keyed on the ANCHOR word so the
+ * analysis can grep one address across every thread; @op_bound carries
+ * whether the taker's lock ctx had a domain-bound op (the enrolment
+ * discriminator); the starved violation carries the victim's streak and the
+ * registry's last-taker so it is self-diagnosing.
+ */
+LTTNG_UST_TRACEPOINT_EVENT(cds_ft, dlm_take,
+	LTTNG_UST_TP_ARGS(
+		const void *, lock,
+		const char *, fn,
+		int, line,
+		int, op_bound
+	),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_integer_hex(uintptr_t, lock, (uintptr_t) lock)
+		lttng_ust_field_string(fn, fn)
+		lttng_ust_field_integer(int, line, line)
+		lttng_ust_field_integer(int, op_bound, op_bound)
+	)
+)
+
+LTTNG_UST_TRACEPOINT_EVENT(cds_ft, dlm_drop,
+	LTTNG_UST_TP_ARGS(
+		const void *, lock,
+		unsigned long, state
+	),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_integer_hex(uintptr_t, lock, (uintptr_t) lock)
+		lttng_ust_field_integer_hex(unsigned long, state, state)
+	)
+)
+
+LTTNG_UST_TRACEPOINT_EVENT(cds_ft, dlm_long_hold,
+	LTTNG_UST_TP_ARGS(
+		const void *, lock,
+		unsigned long, wall_us,
+		const char *, fn,
+		int, line,
+		long, nvcsw,
+		long, nivcsw
+	),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_integer_hex(uintptr_t, lock, (uintptr_t) lock)
+		lttng_ust_field_integer(unsigned long, wall_us, wall_us)
+		lttng_ust_field_string(fn, fn)
+		lttng_ust_field_integer(int, line, line)
+		lttng_ust_field_integer(long, nvcsw, nvcsw)
+		lttng_ust_field_integer(long, nivcsw, nivcsw)
+	)
+)
+
+LTTNG_UST_TRACEPOINT_EVENT(cds_ft, remove_anchor_starved,
+	LTTNG_UST_TP_ARGS(
+		const void *, lock,
+		unsigned long, state,
+		unsigned int, streak,
+		unsigned int, attempts,
+		const char *, taker_fn,
+		int, taker_line,
+		int, taker_bound,
+		unsigned long, take_age_us
+	),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_integer_hex(uintptr_t, lock, (uintptr_t) lock)
+		lttng_ust_field_integer_hex(unsigned long, state, state)
+		lttng_ust_field_integer(unsigned int, streak, streak)
+		lttng_ust_field_integer(unsigned int, attempts, attempts)
+		lttng_ust_field_string(taker_fn, taker_fn)
+		lttng_ust_field_integer(int, taker_line, taker_line)
+		lttng_ust_field_integer(int, taker_bound, taker_bound)
+		lttng_ust_field_integer(unsigned long, take_age_us, take_age_us)
+	)
+)
+
 #endif /* _FT_TP_H */
 
 #include <lttng/tracepoint-event.h>

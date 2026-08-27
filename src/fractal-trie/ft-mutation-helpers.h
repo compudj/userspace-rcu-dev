@@ -1231,6 +1231,45 @@ static __thread unsigned int ft_acq_contended;
 static __thread unsigned int ft_dbg_acq_dirty_lock;
 static __thread unsigned int ft_dbg_acq_dirty_other;
 static __thread unsigned int ft_dbg_acq_cabort;
+
+/*
+ * WHO holds the word a starving remove keeps hitting?  A racy, diagnosis-only
+ * take registry: every successful acquire-set take stamps its slot with the
+ * CALLER's site, whether the taker's lock ctx carried a domain-bound op, and
+ * a timestamp.  Plain stores, hash-indexed, overwrites welcome -- the victim
+ * only SAMPLES it at its milestone, and a stale or missing entry is itself
+ * the answer "taken through some other path".
+ */
+# include <time.h>
+# include <pthread.h>
+# include <sys/resource.h>
+struct ft_dbg_take_slot {
+	const struct cds_ft_metadata *meta;
+	const char *fn;
+	int line;
+	int op_bound;
+	unsigned long tid;
+	uint64_t ts_ns;
+	long nvcsw;
+	long nivcsw;
+};
+static struct ft_dbg_take_slot ft_dbg_take_map[64];
+static __thread const struct cds_ft_metadata *ft_dbg_last_refused;
+static __thread unsigned int ft_dbg_refused_streak;
+
+static inline uint64_t ft_dbg_now_ns(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t) ts.tv_sec * 1000000000ULL + (uint64_t) ts.tv_nsec;
+}
+
+static inline struct ft_dbg_take_slot *ft_dbg_take_slot_of(
+		const struct cds_ft_metadata *meta)
+{
+	return &ft_dbg_take_map[(((uintptr_t) meta) >> 6) & 63];
+}
 #endif
 
 static inline
@@ -1856,6 +1895,29 @@ void ft_hold_trace_drop(const struct cds_ft_metadata *lock)
 {
 	unsigned int i = ft_hold_trace_n;
 
+#if defined(FT_ENABLE_TRACING) && defined(FT_DEBUG_REMOVE_RETRY_CAP)
+	{
+		const struct ft_dbg_take_slot *sl = ft_dbg_take_slot_of(lock);
+
+		FT_TP(dlm_drop, (const void *) lock,
+			(unsigned long) CMM_LOAD_SHARED(lock->state));
+		if (sl->meta == lock &&
+				sl->tid == (unsigned long) pthread_self()) {
+			uint64_t wall = ft_dbg_now_ns() - sl->ts_ns;
+
+			if (wall >= 50000) {
+				struct rusage ru;
+
+				getrusage(RUSAGE_THREAD, &ru);
+				FT_TP(dlm_long_hold, (const void *) lock,
+					(unsigned long) (wall / 1000),
+					sl->fn, sl->line,
+					(long) ru.ru_nvcsw - sl->nvcsw,
+					(long) ru.ru_nivcsw - sl->nivcsw);
+			}
+		}
+	}
+#endif
 	while (i--) {
 		if (ft_hold_trace[i].lock == lock) {
 			ft_hold_trace[i] = ft_hold_trace[--ft_hold_trace_n];
@@ -3731,10 +3793,17 @@ int ft_dlm_lock(struct ft_flip_txn *t, struct cds_ft_metadata *meta,
 	if (caa_unlikely(s & (FT_STATE_PROXY | FT_STATE_TOMBSTONE |
 			FT_STATE_LOCK))) {
 #ifdef FT_DEBUG_REMOVE_RETRY_CAP
-		if (s & FT_STATE_LOCK)
+		if (s & FT_STATE_LOCK) {
 			ft_dbg_acq_dirty_lock++;
-		else
+			if (meta == ft_dbg_last_refused) {
+				ft_dbg_refused_streak++;
+			} else {
+				ft_dbg_last_refused = meta;
+				ft_dbg_refused_streak = 1;
+			}
+		} else {
 			ft_dbg_acq_dirty_other++;
+		}
 #endif
 		return -EAGAIN;
 	}
@@ -4040,6 +4109,29 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 	}
 	for (i = 0; i < (int) nr_taken; i++)
 		ft_hold_trace_note(taken[i], fn, line);
+#ifdef FT_DEBUG_REMOVE_RETRY_CAP
+	for (i = 0; i < (int) nr_taken; i++) {
+		struct ft_dbg_take_slot *sl = ft_dbg_take_slot_of(taken[i]);
+
+		sl->meta = taken[i];
+		sl->fn = fn;
+		sl->line = line;
+		sl->op_bound = !!(ctx && ctx->op && ctx->op->domain);
+		sl->tid = (unsigned long) pthread_self();
+		sl->ts_ns = ft_dbg_now_ns();
+#ifdef FT_ENABLE_TRACING
+		{
+			struct rusage ru;
+
+			getrusage(RUSAGE_THREAD, &ru);
+			sl->nvcsw = ru.ru_nvcsw;
+			sl->nivcsw = ru.ru_nivcsw;
+		}
+		FT_TP(dlm_take, (const void *) taken[i], fn, line,
+			sl->op_bound);
+#endif
+	}
+#endif
 	return 0;
 eagain:
 	ft_flip_txn_destroy(acq);
