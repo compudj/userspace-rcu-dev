@@ -14,6 +14,7 @@
 #include <stdint.h>
 
 #include <urcu/arch.h>
+#include <urcu/wait-ladder.h>
 #include <urcu/assert.h>
 #include <urcu/futex.h>
 #include <urcu/system.h>
@@ -122,14 +123,28 @@ int compat_futex_async(int32_t *uaddr, int op, int32_t val,
 
 	switch (op) {
 	case FUTEX_WAIT:
+	{
+		/*
+		 * ASYNC-SIGNAL-SAFE, so poll rungs only: poll(2) is on the
+		 * POSIX async-signal-safe list, nanosleep is not.  Start at
+		 * the 1ms rung and hold at 8ms, under the old flat 10ms.
+		 */
+		struct urcu_wait_ladder wl = {
+			.step = URCU_WAIT_LADDER_US_RUNGS,
+		};
+
 		while (uatomic_load(uaddr) == val) {
-			if (poll(NULL, 0, 10) < 0) {
+			if (urcu_wait_ladder_sleep_us(
+					urcu_wait_ladder_rung_us(wl.step)) < 0) {
 				ret = -1;
-				/* Keep poll errno. Caller handles EINTR. */
+				/* Keep sleep errno. Caller handles EINTR. */
 				goto end;
 			}
+			if (wl.step < URCU_WAIT_LADDER_US_RUNGS + 3)
+				wl.step++;
 		}
 		break;
+	}
 	case FUTEX_WAKE:
 		break;
 	default:

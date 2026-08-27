@@ -22,6 +22,7 @@
 
 #include <urcu/annotate.h>
 #include <urcu/assert.h>
+#include <urcu/wait-ladder.h>
 #include <urcu/wfcqueue.h>
 #include <urcu/map/urcu-qsbr.h>
 #define BUILD_QSBR_LIB
@@ -87,10 +88,12 @@ static void mutex_lock(pthread_mutex_t *mutex)
 	if (ret)
 		urcu_die(ret);
 #else /* #ifndef DISTRUST_SIGNALS_EXTREME */
+	struct urcu_wait_ladder wl = URCU_WAIT_LADDER_INIT;
+
 	while ((ret = pthread_mutex_trylock(mutex)) != 0) {
 		if (ret != EBUSY && ret != EINTR)
 			urcu_die(ret);
-		(void) poll(NULL,0,10);
+		urcu_wait_ladder_wait(&wl, 0);
 	}
 #endif /* #else #ifndef DISTRUST_SIGNALS_EXTREME */
 }
