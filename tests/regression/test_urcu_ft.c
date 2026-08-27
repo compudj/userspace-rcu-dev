@@ -1860,6 +1860,13 @@ int do_mt_test(void)
 	}
 	urcu_qsbr_thread_online();
 
+	printf("SUMMARY nr_readers=%u nr_writers=%u duration=%lu "
+		"reads=%llu writes=%llu inserts=%llu insert_exists=%llu "
+		"removes=%llu\n",
+		nr_readers, nr_writers, duration,
+		tot_reads, tot_writes, tot_insert, tot_insert_exist,
+		tot_remove);
+
 	if (show_stats)
 		cds_ft_show_stats(test_ft, stderr);
 
