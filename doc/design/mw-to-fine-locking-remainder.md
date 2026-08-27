@@ -1118,7 +1118,65 @@ build, which C should run before anything is claimed.
 in MW_STRUCT (or in SW, unsoundly) now land here. **The split between real
 MW_ALWAYS traffic and reclassified duals is not measured, and G4 must not be
 decided on this number until it is.** That is C's first task, and it is cheap:
-count the dual edges at their producer.
+count the dual edges at their producer. ⇒ **DONE in C.1(b) below — and the
+suspect named in this paragraph turned out to be 0.4% of the column.**
+
+### C.1(b) — MW_ALWAYS DECOMPOSED, and this plan's own suspect was WRONG
+
+`ft_flip_txn_record_tag_mw` now takes a CLASS naming the population its caller
+joins — required in the instrumented build, absent from every other one, so the
+default `.text` is byte-identical (proved: same size, the only differing
+instructions are 30 `mov $imm,%edx` assert `__LINE__` constants). Eleven record
+branches, nine classes, and the classes SUM to the MW_ALWAYS column exactly —
+that equality is printed as the table's self-check, so a future branch added
+without a class announces itself instead of vanishing into a residue.
+
+Two runs, same rig as C.1 (ft_inv `FT_INV_MW=1`, 507 threads, per-node,
+`--enable-rcu-debug`), 119/119 both times, sum == column both times:
+
+    class          run 2 records   share   run 1 share   fate
+    HEAD_BACK         53,670,264   36.0%      36.2%      NEVER converts (no state word)
+    PARENT_WORD       39,082,973   26.2%      25.7%      lock-set REACH  ⎫ the recompaction
+    STATE             39,082,973   26.2%      25.8%*     a VALIDATE      ⎭ re-parent sweep
+    CELL               8,435,084    5.7%       6.2%      ☞ THE G4 LANE
+    ROOT               4,185,351    2.8%       3.0%      NEVER converts (no node to lock)
+    PSO                4,033,026    2.7%       2.7%      §8.3 retires it
+    DUAL                 526,699    0.4%       0.4%      ☠ THE SUSPECT ABOVE
+    GUARD                127,955    0.1%        —*       a VALIDATE
+    RANK                  19,582    0.0%       0.0%      Phase E (root-only spacing)
+    sum              149,163,907             (* run 1 counted GUARD inside STATE)
+
+**READ THE SHARES, NOT THE PER-1k.** Between these two runs the same build gave
+1527/1k and 1776/1k for the same column while every share moved ≤0.5pp — so the
+NORMALISER is the noisy part here, not the populations. Compare columns within
+one run, exactly as the per-1k tables above already warn.
+
+☠☠ **THE RECLASSIFICATION IS REAL AND IT IS THE WRONG COMMIT.** `af22756b`'s
+duals are 0.4%. The reclassification that moved ~36% of this column out of
+MW_STRUCT is **`f79438e7`** — it converted eight external-head back-edge sites
+from `ft_flip_txn_record_reserved` (which counts MW_STRUCT on an unarmed txn) to
+`ft_flip_txn_record_head_back_edge` (always MW). All three suspects
+(`5fa631c7`, `f79438e7`, `af22756b`) landed AFTER §4's baseline was recorded, so
+the whole HEAD_BACK population was MW_STRUCT in that baseline — 553-639 records
+per 1k txns, against a total rise of ~630/1k. ⇒ The doubling is bookkeeping, as
+this plan suspected, of a lane this plan had already ruled on.
+
+☑☑ **THE LARGEST POPULATION IS THE RECOMPACTION RE-PARENT SWEEP** — PARENT_WORD
+and STATE are the same records to the unit (39,082,973 each: two words per
+re-parented child), 52.4% of MW_ALWAYS and **1.8× the whole remaining MW_STRUCT
+conversion surface** (43.4M). This is the "B2 remainder" Phase B scoped out
+because no arm at a publish site can reach it, now with a size. Its two halves
+have DIFFERENT answers and that is why they are counted apart:
+
+* STATE is a `{live -> live}` VALIDATE on a child the sweep does not hold, and
+  it must stay MW — a park validates nothing. Marking those children instead
+  was implemented in full and does not live (a contended child fails the
+  acquire; escalation cannot rescue it — it holds its FIFO turn while spinning
+  for a holder funnelled behind that turn).
+* PARENT_WORD is a real STORE, and it is MW only because the sweep's acquire
+  takes {C,P,(GP)} and never C's children. With PSO (2.7%) it is 28.9% of the
+  column and it is §8.3's prize, quantified for the first time: parent-owned
+  edge WORDS make both plain stores under the junction lock.
 
 ### C.2 — G4's actual input
 
@@ -1127,9 +1185,21 @@ MW_LOCK (524/1k). MW_LOCK is the lock take and stays MW forever. So the G4
 question — does the ordered-cell / hlist lane stay MW? — is now the largest open
 lever, and `cell/hlist` (164/1k, unattributed by site) is only the part recorded
 straight on the engine handle; the rest is inside MW_ALWAYS above.
-☞ **Decompose MW_ALWAYS before G4 is argued**: reclassified duals, rank-count
-propagation, ordered-cell interleave, duplicate-chain splices. Four populations
-with four different answers, currently one number.
+☑ **MW_ALWAYS IS DECOMPOSED (C.1(b)), and G4's lane is now a number.** The
+ordered-cell / duplicate-chain lane is CELL (8.4M inside MW_ALWAYS) plus the
+`cell/hlist` line recorded straight on the engine handle (14.7M) =
+**23.1M of 252.8M MW records, 9.1%** (run 1: 27.2M of 274.0M, 9.9%). Against
+this section's own decision rule — "if the cell lane is minor, keep the narrow
+MW lane" — 9% on the same order as §4's expectation (17.5M of 315M) is the
+MINOR reading, and the mixed commit already backs a cell conflict out clean
+before any SW side effect. ☞ **G4's remaining input is therefore the ABORT
+attribution, not the record volume**: what fraction of aborts is the cell lane.
+That is the n≥3 alternated measurement C.1 already owes, and it should be read
+per lane, not plan-wide.
+
+☠ **AND THE ABORT COLUMN'S SPREAD IS NOW MEASURED ON THIS BUILD**: the two runs
+above are the same binary on the same rig and reported ABORT 2,981,880 and
+1,514,561 — a factor of 2.0. Any abort claim smaller than that is noise.
 
 
 After Phase B, re-run the counter baseline. The decision input Mathieu asked
