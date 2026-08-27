@@ -1667,15 +1667,23 @@ certification, then the API gate lift (`ft-lifecycle.h:369`):
    since `ff2c12da` (2026-08-09, before this doc was written): the walk
    builds a real `ft_lock_ctx` from its descent and passes the tracked
    depth.  Verified in-tree 2026-08-27.
-2. An EXCLUSION oracle per spacing that fails by VIOLATION, not by livelock —
-   strengthen `FEATURE_FT_AGREEMENT_RED` (today it reports only by hanging
-   >36x, a weak signal to certify 40 sites with).  ☞ Sketch (E.2): an OWNER
-   STAMP on the anchor word's metadata under a debug feature, written at the
-   post-acquire choke point (where `ft_hold_trace_note` sits) and cleared at
-   `ft_hold_trace_drop`; a second stamp on a stamped word IS the violation,
-   with both owners named.  The red control then fires in seconds instead of
-   hanging, and each spacing certifies by running clean under the armed
-   stamp.
+2. ☑ LANDED @d8e42e5d — the owner-stamp oracle, MEMBER-keyed (anchor
+   disagreement collides on the node itself), claim at the DLM choke /
+   yield at the ledger drop, red control MOVED to `ft_dlm_lock` (the old
+   one neutered the COLD fence primitive — why it only ever hung).  Red:
+   full ft_inv dies in 0.58s, both owners named.  Green: every shipping
+   config clean, MW per-node included.  Four ledger-lifetime lanes were
+   fixed to get there (pre-commit drop, tolerant backstop, closing-hold
+   and stale-plan filing skips, the op-init leak canary).
+   ☐☐ **THE ORACLE'S FIRST CATCHES — the remaining certification debt,
+   now with names**: (A) dedupes onto UNLOCKED holds (stale plan-time
+   frames listing swept marks; 203–787/run at the coarse spacings, zero
+   at per-node) — an acquire believing itself covered by a free word;
+   (B) mark-vs-anchor DUAL COVERAGE at root-only MW (one node claimed
+   via the root anchor and via its own mark; abort at test 30, both
+   sites named).  The gate's holdtrace config runs without its imw legs
+   until both close; re-adding them is E.2's completion criterion, and
+   E.5 cannot lift the coarse spacings before that.
 3. ☑ FIRST-PASS CLEAN (2026-08-27, unblocked by E.0): both suites at BOTH
    exponential and root-only under `-DDEBUG_RCU -DFEATURE_FT_HOLD_TRACE`:
    zero SELF-COLLISION, zero asserts, 315+3/119 everywhere.  The zero is
