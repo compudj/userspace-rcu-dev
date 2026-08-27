@@ -1354,6 +1354,70 @@ lives on ft_inv MW.
 above are the same binary on the same rig and reported ABORT 2,981,880 and
 1,514,561 — a factor of 2.0. Any abort claim smaller than that is noise.
 
+### C.1(f) — THE WINNER NAMED: the alarm is the graft swap's own conflict
+### detection, and the exclusion is INTACT
+
+The winner-side instrument (`-DFT_WINNER_DBG`, on two new default-inert engine
+hooks). The PRIMARY witness is the value the losing CAS **observed**, captured
+by the engine at the loss itself (`URCU_TXN_REC_LOST` — the compare-exchange
+returns that word and it had always been thrown away; any later re-read races
+every subsequent writer). A proxy observed there IS the winning record,
+decoded directly. A plain value is matched against a WINNER LEDGER — a global
+slot-keyed table of the last engine write {label, the owner the writer named
+(its own ring, its own thread), record call site, tid}, fed by
+`URCU_TXN_REC_WROTE` after every engine slot store, try-claim only — and a
+match is **corroboration, never proof** (ABA can name an older write of the
+same value). The non-engine release-store lane (`ft_ord_cell_flip_one`, the
+remove head-promote store) files raw notes so a raw winner is provable rather
+than inferred from a miss; two loser-side probes check the re-home candidate
+at the alarm itself (registered owner TOMBSTONED? `parent_word` NULL?).
+
+**THE ANSWER** (ft_inv MW, 507 threads, per-node, 119/119; claim sample
+agreeing, inside `inv_graft_swap_shared_dst_*`):
+
+    alarms 81,859 (create 77,364 / bounded 4,495), ledger reach 505M stamps
+    engine winner 81,859 = 100%, label MW_STRUCT witness=HELD 100%
+    winner's named owner == the loser's 100%; self-tid 0; proxy 0
+    raw-lane 0 / ledger-mismatch 0 / no-entry 0 / torn 0 / DRIFT 0
+    loser's owner at the alarm: TOMBSTONED 0 / MID-RE-HOME 0
+    claim sample ra: ft_glue_txn_commit_edges → ft_flip_txn_record_pub_rec
+      — the glue FORWARD PUBLISH, the same site the LOSER records through
+
+⇒ **The winner is a racing glue commit that held P's lock, published the same
+graft-point slot, and released before the loser acquired.** Two ops cannot
+hold one DLM lock at once, so the loser's expected-old predates its own
+acquire — and it does, BY DESIGN: `@publish_old` is the PLAN-SNAPSHOT
+expected-old `cds_ft_graft_swap` records precisely so a peer that swaps the
+graft point between the descent and the commit turns into an abort +
+re-descend instead of a publish over the peer's attach. DRIFT 0 over 81,859
+alarms is the exclusion's own witness: once the loser holds P, nobody writes
+that slot. Both surviving C.1(e) candidates are DEAD: no peer writes without
+the lock, and the cross-trie / re-home shape never fired its probes.
+
+**SO THE DETECTOR'S PREMISE GAINS ITS ONE EXCEPTION**: "an owner-held
+structural record cannot lose" is true of a record whose expected-old was
+read UNDER the held lock; the graft forward publish deliberately carries an
+OLDER one. Not a bug — and the lane is still **NOT ARMABLE**, now with the
+precise reason: an SW park does not CAS, so it cannot implement the
+plan-snapshot conflict check; arming would ratify the stale plan, which is
+the lost update `@publish_old` exists to prevent.
+
+☞ FOLLOW-UP (small, optional): stamp records whose expected-old is a declared
+plan snapshot (`publish_old_set`) with a label bit and EXEMPT them from the
+alarm — the alarm then returns to being a true invariant (today it is 100%
+this expected lane, and a real exclusion violation would drown in it).
+
+☠ METHOD, paid twice in this section: (1) a value-match ledger WITHOUT the
+raw lane hooked and WITHOUT the captured observed value gave the same headline
+number — but only coincidentally, and it could not have defended it; (2) the
+second attempt misfiled every winner as "raw" because
+`snap.code >= FT_AB_CLS_NR` compared the FULL label, which carries the
+ownership witness at bit 8 (`MW_STRUCT/held` = 0x102). ONE `-DFT_ABORT_CLAIM`
+sample printing the fields the counter had already binned caught it — a
+witness-bearing code must be compared by its CLASS FIELD, and a counter's
+first reading should always be checked against a sample that prints what was
+binned.
+
 
 After Phase B, re-run the counter baseline. The decision input Mathieu asked
 for is the granularity comparison: what fraction of remaining aborts and
