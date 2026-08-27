@@ -414,8 +414,19 @@ sweep:
 			 * its marks now, and registration TRANSFERS the clear to
 			 * the txn's terminals.  ONE OWNER PER FENCE.
 			 */
-			if (!marks[i].shared && !marks[i].txn_owned)
+			if (!marks[i].shared && !marks[i].txn_owned) {
 				ft_meta_lock_release_if_held(marks[i].lock);
+				/*
+				 * SCRUB only RELEASED-LIVE (finding A); a
+				 * TOMBSTONED word is a CONSUMED fence and must
+				 * keep answering holds() -- dedupe-on-dead is
+				 * the designed flow, and taking a dead word
+				 * hard-refuses forever (the exp-MW storm).
+				 */
+				if (!(CMM_LOAD_SHARED(marks[i].lock->state) &
+						FT_STATE_TOMBSTONE))
+					marks[i].shared = true;
+			}
 	return ret;
 }
 

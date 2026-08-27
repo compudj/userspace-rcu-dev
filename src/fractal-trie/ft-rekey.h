@@ -3290,6 +3290,24 @@ cells_done:
 		 * must NOT run -- see its own comment.
 		 */
 		marks_consumed = true;
+		/*
+		 * SCRUB the frames that listed those marks: the commit
+		 * consumed their fences and freed the txn's descriptor, so an
+		 * entry left answering holds() is finding A's RECORD-LESS
+		 * stale frame -- the glue keeps acquiring below, and a stale
+		 * "held" there is the measured exponential-MW livelock.
+		 */
+		glue.caller_holder = NULL;
+		{
+			int sc_i;
+
+			for (sc_i = 0; sc_i < nr_marks; sc_i++)
+				if (marks[sc_i].txn_owned &&
+					!(CMM_LOAD_SHARED(
+						marks[sc_i].lock->state) &
+						FT_STATE_TOMBSTONE))
+					marks[sc_i].shared = true;
+		}
 		ft_glue_free_old(ft, &glue);		/* graft old copies */
 		/*
 		 * The merged cluster's SRC side: its free list holds S_top itself (and
@@ -3431,8 +3449,18 @@ sweep:
 	 */
 	if (!marks_consumed)
 		for (i = 0; i < nr_marks; i++)
-			if (!marks[i].shared && !marks[i].txn_owned)
+			if (!marks[i].shared && !marks[i].txn_owned) {
 				ft_meta_lock_release_if_held(marks[i].lock);
+				/*
+				 * SCRUB: the frame chain answers holds() from
+				 * this array (ft_held_set_snap skips shared),
+				 * and a released entry left listed is the
+				 * record-less stale frame of finding A.
+				 */
+				if (!(CMM_LOAD_SHARED(marks[i].lock->state) &
+						FT_STATE_TOMBSTONE))
+					marks[i].shared = true;
+			}
 	return ret;
 }
 

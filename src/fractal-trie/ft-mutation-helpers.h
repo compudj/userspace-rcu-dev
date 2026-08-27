@@ -4184,6 +4184,64 @@ bool ft_dlm_member_linked(const struct cds_ft *ft,
  * while the op does hold something is the self-collision livelock
  * ft_held_set documents, not an optimisation.
  */
+static bool ft_glue_op_holds(const struct ft_glue *g,
+		const struct cds_ft_metadata *meta);	/* defined below */
+
+/*
+ * Does any frame's GLUE cover @lock?  The glue's accessory hold arms exist
+ * so its OWN acquires dedupe against its holds; their field-based lifecycle
+ * is not scrub-true, so the dedupe validation EXEMPTS this lane (finding A
+ * stays open for it -- every enforcement form measured as a livelock).
+ */
+static inline
+bool ft_dlm_glue_covered(const struct ft_lock_ctx *ctx,
+		const struct cds_ft_metadata *lock)
+{
+	const struct ft_held_set *hs;
+
+	for (hs = &ctx->held; hs; hs = hs->outer)
+		if (hs->glue && ft_glue_op_holds(hs->glue, lock))
+			return true;
+	return false;
+}
+
+/*
+ * Is a RELEASE of @lock already recorded in any frame of the op's held-set
+ * chain?  Distinguishes the two ways a covering hold's word can look free:
+ * the designed drop->commit-window dedupe (the release record exists in a
+ * live descriptor; the mark protocol still owns the word until its
+ * once-only, own-flag-keyed backstop sweep) from finding A's RECORD-LESS
+ * staleness (an immediate-CAS sweep already ran; nothing owns the word).
+ */
+static inline
+bool ft_dlm_covering_release_recorded(const struct ft_lock_ctx *ctx,
+		struct cds_ft_metadata *lock)
+{
+	const struct ft_held_set *hs;
+
+	for (hs = &ctx->held; hs; hs = hs->outer) {
+		struct urcu_txn_desc *d = hs->txn ? hs->txn->mtxn->desc : NULL;
+		const struct urcu_txn_record *r;
+
+		if (!d || d == URCU_TXN_ENOMEM)
+			continue;
+		/*
+		 * ANY record on the word's slot: the txn owns the word's
+		 * transition, whatever its spelling -- the plain release
+		 * {LOCK|s -> s}, the consumed-mark edge {live -> live} with
+		 * the lock bit MASKED OUT OF BOTH VALUES
+		 * (ft_reparent_record_meta), or the fence-preserving retire.
+		 * Testing lock bits here missed the masked shape and turned
+		 * the designed fusion dedupe into a refusal livelock
+		 * (measured, exponential MW test 20).
+		 */
+		r = urcu_txn_find(d, (void **) &lock->state);
+		if (r)
+			return true;
+	}
+	return false;
+}
+
 static inline
 int ft_dlm_acquire_set_at(const char *fn, int line,
 		const struct cds_ft *ft, const struct ft_lock_ctx *ctx,
@@ -4319,8 +4377,100 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 				deduped = true;
 				break;
 			}
-		} else {
+		} else if (caa_likely(CMM_LOAD_SHARED(lock->state) &
+				(FT_STATE_LOCK | FT_STATE_PROXY |
+					FT_STATE_TOMBSTONE))) {
+			/*
+			 * The covering hold is LIVE (LOCK), the word is
+			 * mid-flip under a parked record (PROXY), or the
+			 * fence was CONSUMED by a retire (TOMBSTONE, the
+			 * "fenced tombstone leaves TOMBSTONE, no LOCK"
+			 * shape) -- a tombstoned word can never be taken by
+			 * anyone again, so no exclusion is at stake and the
+			 * dedupe is the designed flow for an op consulting
+			 * its own consumed fence.  Either way: owned, dedupe.
+			 */
 			deduped = true;
+		} else if (ft_dlm_glue_covered(ctx, lock)) {
+			/*
+			 * GLUE self-consultation on a word whose state is not
+			 * in the owned mask: dedupe as the glue always has
+			 * (pre-validation semantics); the oracle files
+			 * nothing for it, so nothing can leak or false-abort.
+			 */
+			deduped = true;
+#ifdef FEATURE_FT_HOLD_TRACE
+			set[i].held.oracle_skip = true;
+#endif
+		} else if (ft_dlm_covering_release_recorded(ctx, lock)) {
+			/*
+			 * The drop->commit-window dedupe: this op's own
+			 * commit machinery released the word and a live
+			 * descriptor still records it.  The dedupe keeps its
+			 * designed semantics; taking here would plant a lock
+			 * on an anchor the op's commit deliberately released.
+			 */
+			deduped = true;
+#ifdef FEATURE_FT_HOLD_TRACE
+			set[i].held.oracle_skip = true;
+#endif
+		} else {
+			/*
+			 * DEDUPE VALIDATION (finding A): a RECORD-LESS stale
+			 * frame -- a mark swept by an immediate-CAS release
+			 * stays listed, and nothing owns the word.  Deduping
+			 * would leave this member UNCOVERED (the word is
+			 * free; a peer can take it).  Taking it for real is
+			 * ALSO unsound: at coarse anchoring several frames
+			 * can list one word, and a sibling sweep strips the
+			 * fresh take (measured twice as
+			 * ft_meta_lock_release's LOCK assert on exponential
+			 * MW).  So REFUSE the set -- nothing acquired, the
+			 * refusal ages the op through the normal eagain path,
+			 * and the re-plan re-derives its frames.
+			 */
+#ifdef FEATURE_FT_HOLD_TRACE
+			if (ft_hold_trace_report_ok()) {
+				/* classify WHICH lane answered stale */
+				const struct ft_held_set *ch;
+				const char *lane = "?";
+				int depth = 0, towned = -1;
+
+				for (ch = &ctx->held; ch; ch = ch->outer,
+						depth++) {
+					unsigned int ei;
+
+					if (ch->txn) {
+						unsigned int li;
+
+						for (li = 0;
+							li < ch->txn->nr_locks;
+							li++)
+							if (ch->txn->locks[li]
+								.meta == lock)
+								lane = "registry";
+					}
+					for (ei = 0; ei < ch->nr_extra; ei++)
+						if (ch->extra[ei].lock ==
+								lock &&
+							!ch->extra[ei]
+								.shared) {
+							lane = "extra";
+							towned = ch->extra[ei]
+								.txn_owned;
+						}
+					if (lane[0] == '?' && ch->glue)
+						lane = "glue?";
+					if (lane[0] != '?')
+						break;
+				}
+				fprintf(stderr, "FT DLM: record-less stale "
+					"frame at %s:%d -- refusing (lane=%s "
+					"depth=%d txn_owned=%d)\n",
+					fn, line, lane, depth, towned);
+			}
+#endif
+			goto eagain;
 		}
 		if (deduped) {
 			if (!coarsened) {
@@ -4348,7 +4498,7 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 			{
 				const struct ft_held_set *hs__;
 
-				set[i].held.oracle_skip = false;
+				/* may already be true via the protocol path */
 				/*
 				 * The held set is a CHAIN of frames; the
 				 * covering hold's release may be recorded in
@@ -4416,10 +4566,28 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 		 */
 		if (set[i].held.shared &&
 				!(CMM_LOAD_SHARED(set[i].held.lock->state) &
-					FT_STATE_LOCK)) {
+					(FT_STATE_LOCK | FT_STATE_PROXY))) {
+			/*
+			 * Unreachable since the dedupe validation takes for
+			 * real on a record-less stale frame; anything landing
+			 * here is a NEW staleness lane.  PROXY counts as
+			 * covered (a parked record owns the word), and under
+			 * the RED control peers strip winners' bits by
+			 * design, so red only reports.
+			 */
+			/*
+			 * NOT an abort: the covering hold can be released
+			 * LEGITIMATELY between the dedupe validation (word
+			 * LOCKed then) and this post-commit filing -- its
+			 * release rode a commit that landed meanwhile (the
+			 * closing window seen from the filing side; measured
+			 * at exponential MW test 5).  Skip the filing: no
+			 * stamp is claimed, so nothing can leak, and the
+			 * op-init canary still polices every real leak.
+			 */
 			if (ft_hold_trace_report_ok())
-				fprintf(stderr, "FT E2: dedupe onto UNLOCKED "
-					"hold at %s:%d (stale plan)\n",
+				fprintf(stderr, "FT E2: dedupe hold closed "
+					"before filing at %s:%d, not filed\n",
 					fn, line);
 			continue;
 		}

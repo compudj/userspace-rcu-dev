@@ -3672,9 +3672,21 @@ end:
 
 		for (oi = 0; oi < nr_orphan_locked; oi++)
 			if (!orphan_held[oi].shared &&
-					!orphan_held[oi].txn_owned)
+					!orphan_held[oi].txn_owned) {
 				ft_meta_lock_release_if_held(
 					orphan_held[oi].lock);
+				/*
+				 * SCRUB only RELEASED-LIVE (finding A); a
+				 * TOMBSTONED word is a CONSUMED fence and must
+				 * keep answering holds() -- dedupe-on-dead is
+				 * the designed flow, and taking a dead word
+				 * hard-refuses forever (the exp-MW storm).
+				 */
+				if (!(CMM_LOAD_SHARED(
+						orphan_held[oi].lock->state) &
+						FT_STATE_TOMBSTONE))
+					orphan_held[oi].shared = true;
+			}
 	}
 	/*
 	 * nr_keys fold (LEAF Increment 2): no abort rollback needed.  Every
