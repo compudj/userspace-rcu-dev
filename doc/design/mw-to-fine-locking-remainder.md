@@ -1637,6 +1637,29 @@ G5(D)'s freeze-drain bound inherits the hold tail: p99 ~240µs + one GP.
 
 ## 7. Phase E — lift the lock-spacing gate
 
+### E.0 — §9.5 CLASS 2 RESOLVED (@8e24cb1b): the first debt installment paid
+
+The certification's standing blocker — the txndbg/anchorval aborts at
+exponential/root-only, "pre-existing and unattributed, visible in every
+gate diff" — root-caused from a deterministic repro and fixed.  An ARMED
+txn's SW lock-release and `ft_flip_txn_guard_parent`'s MW validate
+coincide on the same root-anchored word at coarse spacing; the engine's
+kind police (`r->kind == kind`, rcu-txn-mcas.h:1000) refuses the (benign,
+designed) mixed-kind fold.  Fix at the choke point, per the tree's own
+rule ("a locked node needs NO separate guard_parent"): the guard is
+skipped when `ft_flip_txn_owns()` says the registry holds the word, with
+a descriptor-asked tombstone carve-out keeping a self-retire loud.  The
+engine assert is untouched — it remains a real same-txn misownership
+detector.  Gate: exactly the ten formerly-aborting legs improve (abrt→0,
+complete runs), all other legs identical; ft_unit completes all 318
+tests at both coarse spacings for the first time.
+
+☐ Named residual (adversarial review, not yet observed): an armed SW
+`nr_child` edge fusing with a guard on a word covered only via a
+DIFFERENT anchor (no registry entry) would re-raise the assert;
+`ft_flip_txn_guard_installed_child` shares the gap.  The E.3 sweep is
+where it would surface.
+
 The acquire-site conversion is complete and build-enforced; what remains is
 certification, then the API gate lift (`ft-lifecycle.h:369`):
 
