@@ -984,8 +984,37 @@ because it IS the status quo's policy behind one entry point.
 sweep" (`ft-lifecycle.h:355-375`). **Phase E is the prerequisite for CERTIFYING
 the coarse SW fallback, not for consolidating the arm.**
 
-☑→☠→☑ **THE LANDING: ATTEMPTED, HUNG, ROOT-CAUSED.**  The shape is right; the
-PLACEMENT was wrong, and the fence-ownership suspect this entry named was WRONG.
+☑☑ **B6 IS LANDED** `f8b6317f`, on the fourth attempt.  `ft_flip_txn_arm_structural`
+is the ONE DOOR: it takes the sanctioned per-op arm and, when that refuses, says
+SW explicitly.  Both hand-arms call it **at TXN CREATION** — the one point every
+branch of the op passes — and no site outside the two arm helpers touches
+`ft_flip_txn_set_structural_sw`.
+☞ The per-op arm STAYS at `cow_stop`'s stop fence, additive: only a per-op arm
+sets `@dbg_arm_per_op`, and at creation `nr_locks == 0` so it cannot.  Its marks
+are registered first at every growth point (register-BEFORE-record), and the
+driver's sweep gained `!marks[i].txn_owned` because registration TRANSFERS the
+clear.
+☞ `assert(txn->structural_sw)` now also sits before the writer's commit — the
+choke point every branch crosses.
+☠ The fallback line is **Phase E's debt**: a policy branch behind one entry
+point, one line to certify or replace.
+Verified: per-node ft_unit 315/3 deliberate, ft_inv `FT_INV_MW=1` 119/119,
+per-op reach 269,738 / armed 228,109 (all 41,629 refusals trie-wide); the
+**nocompress canary** back to 316/2, matching control; all 65 gate legs
+identical.
+
+★★★★★ **WHAT THE THREE FAILED ATTEMPTS TAUGHT**, and it generalises past B6:
+  1. A CLAIM belongs at a choke point EVERY path crosses, even where the ARM
+     cannot live.  Moving the assert with the arm made the un-armed branch the
+     un-asserted branch — a deterministic livelock presented as a silent hang.
+  2. Ask the LAST CONFIRMED mechanism whether it has another ROUTE before
+     inventing a new one.  The livelock was already documented; only its REACH
+     was open.
+  3. `gdb -p` on a hang is the FIRST move.  A leaked fence stalls the NEXT op at
+     an ACQUIRE; a livelock inside ONE op at COMMIT is a different signature.
+  4. Gate legs are CONFIGS, not branches.  When exactly one config diverges, ask
+     which BRANCH only that config drives (`nocompress` was the only leg driving
+     the merge_dst fold).
 
 ☠☠ **ROOT CAUSE — the arm was moved onto a branch one caller never visits.**
 Retiring the hand-arm at txn creation and putting the helper arm inside
