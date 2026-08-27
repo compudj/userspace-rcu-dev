@@ -296,7 +296,8 @@ static
 struct cds_ft_inode_flag *ft_merge_build(struct ft_merge_ctx *c,
 		struct cds_ft_inode_flag *S, unsigned int off_s,
 		struct cds_ft_inode_flag *D, unsigned int off_d,
-		unsigned int depth, unsigned long *nr_keys_ret);
+		unsigned int depth, unsigned int d_prov,
+		unsigned long *nr_keys_ret);
 
 /*
  * Advance a compressed cursor one byte past @next_off - 1: while still inside
@@ -423,7 +424,8 @@ struct cds_ft_inode_flag *ft_merge_build_run(struct ft_merge_ctx *c,
 
 	ft_merge_advance(cn_s, off_s + p, &adv_s, &aoff_s);
 	ft_merge_advance(cn_d, off_d + p, &adv_d, &aoff_d);
-	child = ft_merge_build(c, adv_s, aoff_s, adv_d, aoff_d, depth + p, &ck);
+	child = ft_merge_build(c, adv_s, aoff_s, adv_d, aoff_d, depth + p,
+			c->dst_base_depth + depth - off_d, &ck);
 	if (child == FT_MERGE_OOM)
 		return child;
 
@@ -519,11 +521,22 @@ int ft_merge_lock_overlap(const struct cds_ft *ft,
 	return ft_acquire_member(ft, ctx, nf, m, depth, held);
 }
 
+/*
+ * @d_prov: ABSOLUTE byte-depth of the OLD dst node whose slot provided @D --
+ * the holder of @D when @D is EXTERNAL (a dup-chain head hangs off its
+ * provider).  An anchor is a function of the holder's absolute depth (see
+ * @dst_base_depth); handing a merge-relative value to the splice record dated
+ * the holder as a near-root node, which anchors on ITSELF at coarse spacings
+ * while the fence dated it correctly and coarsened to an ancestor: one op,
+ * two exclusion words for one node, and the splice acquire refuses its own
+ * fence forever (measured: the exponential-MW occupied-dst graft storm).
+ */
 static
 struct cds_ft_inode_flag *ft_merge_build(struct ft_merge_ctx *c,
 		struct cds_ft_inode_flag *S, unsigned int off_s,
 		struct cds_ft_inode_flag *D, unsigned int off_d,
-		unsigned int depth, unsigned long *nr_keys_ret)
+		unsigned int depth, unsigned int d_prov,
+		unsigned long *nr_keys_ret)
 {
 	struct cds_ft *ft = c->dst_ft;
 	struct cds_ft_node *S_leaf, *D_leaf, *M_ext;
@@ -672,7 +685,7 @@ struct cds_ft_inode_flag *ft_merge_build(struct ft_merge_ctx *c,
 	 * parent frame wires the slot and the dst head's back-pointer.
 	 */
 	if (S_ext && D_ext) {
-		ft_glue_record_splice(c->gd, D_leaf, S_leaf, depth);
+		ft_glue_record_splice(c->gd, D_leaf, S_leaf, d_prov);
 		*nr_keys_ret = 1;
 		return D;
 	}
@@ -766,7 +779,9 @@ struct cds_ft_inode_flag *ft_merge_build(struct ft_merge_ctx *c,
 				td = dc;
 				od = 0;
 			}
-			child = ft_merge_build(c, ts, os, td, od, depth + 1, &ck);
+			child = ft_merge_build(c, ts, os, td, od, depth + 1,
+					c->dst_base_depth + depth -
+					(D_comp ? off_d : 0), &ck);
 			if (child == FT_MERGE_OOM)
 				return child;
 		} else if (sc_present) {
@@ -842,7 +857,8 @@ struct cds_ft_inode_flag *ft_merge_build(struct ft_merge_ctx *c,
 	/* Merged external_nodes (the key terminating at M itself). */
 	if (S_leaf && D_leaf) {
 		M_ext = D_leaf;
-		ft_glue_record_splice(c->gd, D_leaf, S_leaf, depth);
+		ft_glue_record_splice(c->gd, D_leaf, S_leaf,
+			D_ext ? d_prov : c->dst_base_depth + depth);
 	} else if (D_leaf) {
 		M_ext = D_leaf;
 	} else {
@@ -1549,7 +1565,8 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	 */
 	ctx.fence_overlap = dst_ft->lock_fine && !unfailable;
 	ctx.fence_src = false;		/* cross-trie: the source is exclusive */
-	M = ft_merge_build(&ctx, S, off_src, D, off_dst, 0, &merged_keys);
+	M = ft_merge_build(&ctx, S, off_src, D, off_dst, 0, d_dst->pdepth,
+			&merged_keys);
 	if (M == FT_MERGE_OOM) {
 		if (fresh_root)
 			free_cds_ft_node_unpublished(src_ft, fresh_root);

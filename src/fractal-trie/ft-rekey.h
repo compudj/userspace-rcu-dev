@@ -2250,7 +2250,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		mctx.dst_base_depth = d_dst.depth;
 		mctx.src_base_depth = d_src.depth;
 		merged_nf = ft_merge_build(&mctx, s_top, 0, d_dst.nf, 0, 0,
-				&merged_keys);
+				d_dst.pdepth, &merged_keys);
 		if (merged_nf == FT_MERGE_OOM) {
 			merged_nf = NULL;
 			ret = mctx.overlap_contended ? -EAGAIN : -ENOMEM;
@@ -3860,7 +3860,8 @@ enum cds_ft_status ft_rekey_spine_copy(struct cds_ft *dst_ft,
 	 */
 	ctx.fence_overlap = dst_ft->lock_fine && !unfailable;
 	ctx.fence_src = false;		/* cross-trie: the source is exclusive */
-	M = ft_merge_build(&ctx, S, off_src, D, off_dst, 0, &merged_keys);
+	M = ft_merge_build(&ctx, S, off_src, D, off_dst, 0, d_dst->pdepth,
+			&merged_keys);
 	if (M == FT_MERGE_OOM) {
 		if (fresh_root)
 			free_cds_ft_node_unpublished(src_ft, fresh_root);

@@ -10446,6 +10446,35 @@ bool ft_glue_fence_holds(const struct ft_glue *g,
 }
 
 /*
+ * Does this glue hold a LIVE fence on @meta's NODE itself?
+ *
+ * The splice-holder acquire needs this IDENTITY answer: the holder it derived
+ * (a chain head's prev) is very often a node this op already fenced, and
+ * whether the fence's LOCK sits on the node or on a coarsened ancestor, the
+ * fence is the exclusion the acquire wants -- taking a second lock against it
+ * self-refuses forever.  Matching by the ANCHOR (ft_glue_fence_holds) is not
+ * enough: the anchor is a derived answer, and a site that dates the node
+ * differently derives a different word (the measured splice storm: a
+ * merge-relative depth landed the anchor on the node itself while the fence
+ * coarsened to the ancestor -- one op, two exclusion words, endless refusal).
+ */
+static
+bool ft_glue_fence_holds_node(const struct ft_glue *g,
+		const struct cds_ft_metadata *meta)
+{
+	int i;
+
+	for (i = 0; i < g->nr_free; i++) {
+		if (!g->free_list[i].fenced)
+			continue;
+		if (cds_ft_item_to_metadata((struct cds_ft_inode *)
+				g->free_list[i].node) == meta)
+			return true;
+	}
+	return false;
+}
+
+/*
  * Renounce the free of every fenced overlap node: call when the commit did NOT
  * report OK.  A fenced retire's LIVE->TOMBSTONE transition is atomic with the
  * flip, so if the flip did not happen this op performed no retire and owns no
@@ -12040,6 +12069,30 @@ int ft_glue_acquire_splice_holders(struct cds_ft *ft, struct ft_glue *g)
 		 * contended holder does.
 		 */
 		ft_glue_lock_ctx(g, &sctx);
+		/*
+		 * IDENTITY FIRST: a holder this op already fenced is covered by
+		 * that fence wherever its LOCK sits (node or coarsened
+		 * ancestor) -- reuse it, take no second lock, record no holder.
+		 * Matching by the DERIVED anchor alone is what let a
+		 * mis-dated holder_depth split one node across two exclusion
+		 * words: the derivation put the anchor on the node itself, the
+		 * fence held the ancestor, neither matched the other, and the
+		 * acquire refused this op's own fence forever.
+		 */
+		if (ft_glue_fence_holds_node(g, hm)) {
+#ifdef FEATURE_FT_HOLD_TRACE
+			hd = g->splices[i].holder_depth;
+			anchor = ft_anchor_meta(ft,
+				ft_lock_ctx_descent(&sctx), hf, hm, hd);
+			if (anchor != hm && !ft_glue_fence_holds(g, anchor) &&
+					ft_hold_trace_report_ok())
+				fprintf(stderr, "FT SPLICE: fenced holder %p "
+					"derives unfenced anchor %p (hd=%u) "
+					"-- depth disagreement\n",
+					(void *) hm, (void *) anchor, hd);
+#endif
+			continue;
+		}
 		hd = g->splices[i].holder_depth;
 		anchor = ft_anchor_meta(ft, ft_lock_ctx_descent(&sctx), hf, hm,
 			hd);
