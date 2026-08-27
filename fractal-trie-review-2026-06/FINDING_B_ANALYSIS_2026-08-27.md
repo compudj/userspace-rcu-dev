@@ -313,9 +313,27 @@ D1/fence-under-anchor remains unnecessary.
     from a belief.  A witness that records the belief cannot adjudicate
     the belief.
 
-## Open
+## ☑ SCOPE SETTLED BY MEASUREMENT: the defect is COARSE-SPACING ONLY
 
-Scope: measured at ROOT-ONLY, where one anchor covers many members so the
-re-acquire-after-consumption window is wide.  Whether the same stale
-dedupe is reachable at PER-NODE (the shipping default, suite-green) is
-NOT established by this trace and must not be assumed closed.
+The open question -- is the stale dedupe reachable at PER-NODE, the
+shipping default? -- is answered by tracing the SAME workload at both
+spacings and counting the notes by @shared (a real take vs a belief):
+
+    PER-NODE   notes 453,873   real takes 453,873   dedupes         0
+    ROOT-ONLY  notes 544,285   real takes 226,757   dedupes   317,529  (58%)
+
+**PER-NODE NEVER DEDUPES ONCE IN 453,873 ACQUISITIONS.**  The reason is
+structural: the defect needs a dedupe, a dedupe needs two members of one
+op to collapse onto one word, and at per-node every member anchors on
+ITSELF -- so the lane the defect lives in is not exercised at all.  A
+stale-dedupe detector (a shared=1 note whose word's most recent REAL take
+belongs to ANOTHER thread) finds 217 instances in the root-only trace
+(0.07% of dedupes -- rare, matching the ~1-run-in-2 violation) and, of
+necessity, zero at per-node.
+
+⇒ The SHIPPING default is not affected by this defect; it gates the
+COARSE spacings, which is exactly where E.5's lift is blocked.  That
+lowers the urgency but not the requirement: E.2's imw gate legs and E.5
+both sit behind it.  (Stated as measured, not as a proof: the trace shows
+this workload never dedupes at per-node, and names the structural reason;
+it does not prove no op anywhere re-acquires one node twice.)
