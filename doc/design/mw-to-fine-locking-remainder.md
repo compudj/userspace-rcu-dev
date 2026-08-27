@@ -1110,7 +1110,9 @@ measured on this column ([[feedback_abort_column_is_not_a_per_step_number]]), an
 §4's own ceiling for the whole conversion was ~29% of aborts (the content lanes;
 71% are the ACQUIRE lane, still 46.4M MW_LOCK records here). Read the direction,
 not the figure. A defensible number needs n≥3 alternated against a control
-build, which C should run before anything is claimed.
+build, which C should run before anything is claimed. ⇒ **RUN in C.1(c) below.
+The −15% is superseded: the plan-wide column does not survive n=3, and the lane
+the conversion actually touches does — by −34.5%.**
 
 ☠☠ **MW_ALWAYS NEARLY DOUBLED, and part of that is BOOKKEEPING, not traffic.**
 `af22756b`'s per-edge `@owner_held` routes every unheld SKIP_X dual through
@@ -1178,6 +1180,51 @@ have DIFFERENT answers and that is why they are counted apart:
   column and it is §8.3's prize, quantified for the first time: parent-owned
   edge WORDS make both plain stores under the junction lock.
 
+### C.1(c) — THE n≥3 ALTERNATED ABORT MEASUREMENT
+
+Control `c8ce38c2` (the commit that recorded §4's baseline) against HEAD, both
+`--enable-rcu-debug -DFT_DEBUG_TXN_KIND -O1`, ft_inv `FT_INV_MW=1`, 507 threads,
+per-node, alternated ctl/arm ×3, SEQUENTIAL, 119/119 on all six.
+☑ `test_urcu_ft_inv.c` is byte-identical between the two commits, so both legs
+run the same workload — checked, not assumed.
+
+Aborts per 1k txns created, split by lane at the txn CREATION SITE (an acquire
+txn is one whose site records MW_LOCK and VALIDATE and nothing else):
+
+    lane      control runs          armed runs         paired Δ       verdict
+    TOTAL     24.86 22.58 18.22     19.81 17.72 14.43  −20.3/−21.5/−20.8  ☠ OVERLAP
+    ACQUIRE   18.09 14.20 11.71     15.19 12.41 10.21  −16.0/−12.6/−12.8  ☠ OVERLAP
+    CONTENT    6.77  8.38  6.51      4.62  5.31  4.22  −31.7/−36.6/−35.2  ☑ SEPARATED
+
+☑☑ **THE CONTENT LANE IS −34.5%, AND IT SEPARATES COMPLETELY.** Every control
+run's content-abort rate (min 6.51) is above every armed run's (max 5.31) — all
+nine cross-comparisons agree, which at n=3 v 3 is the strongest rank result
+available (p = 1/20 one-sided). The three paired deltas span 4.9pp. **This is
+the conversion's own lane and this is its number.**
+
+☠ **THE PLAN-WIDE COLUMN STILL DOES NOT SURVIVE, AND NOW THE REASON IS NAMED:
+IT DRIFTS.** Both legs fall monotonically across the session — control 24.86 →
+22.58 → 18.22, armed 19.81 → 17.72 → 14.43 — and the ACQUIRE lane carries the
+whole drift (18.09 → 14.20 → 11.71). The CONTENT lane does NOT drift (6.77 →
+8.38 → 6.51, non-monotone), which is exactly why it separates and the other two
+do not. A paired Δ on a drifting column credits the arm with the drift, so
+−20.9% plan-wide is NOT a result; −34.5% on the content lane is.
+⇒ **Any future abort claim must be made PER LANE and paired within a session.**
+
+☞ **AN UNEXPLAINED SECOND-ORDER EFFECT, AND IT IS NOT CLAIMED HERE.** The
+ACQUIRE lane fell too (−13.8% paired, direction consistent in 3/3), and the
+conversion does not touch it. The mechanism that would explain it is real: an
+MW_STRUCT record on `&meta->state` (a fused count, a tombstone) is a CAS
+contender on the very word the acquire's take arbitrates, so converting it to
+an SW park removes a competitor from the acquire's own arbitration point — which
+would mean §4's "~29% ceiling" UNDERSTATED the conversion's reach. It is a
+hypothesis. It shares its column with the drift above, so it cannot be read off
+this table; the test is a state-word-only conversion measured against the
+acquire lane alone, and Phase D owns it.
+
+☑ §4's ceiling holds as a share: CONTENT is 27/37/36% of all aborts on the
+control and 23/30/29% armed.
+
 ### C.2 — G4's actual input
 
 With MW_STRUCT at 503/1k, the residue is dominated by MW_ALWAYS (1687/1k) and
@@ -1194,8 +1241,21 @@ MW lane" — 9% on the same order as §4's expectation (17.5M of 315M) is the
 MINOR reading, and the mixed commit already backs a cell conflict out clean
 before any SW side effect. ☞ **G4's remaining input is therefore the ABORT
 attribution, not the record volume**: what fraction of aborts is the cell lane.
-That is the n≥3 alternated measurement C.1 already owes, and it should be read
-per lane, not plan-wide.
+C.1(c) has now run the alternated measurement and split aborts ACQUIRE vs
+CONTENT — but not CELL vs the rest of the content lane, and it cannot: the split
+is done at the txn CREATION SITE, and a content txn carries cell and structural
+records together. ☠ The obvious proxy — "aborts at sites that plant cell
+records" — is a loose bound, not attribution
+([[feedback_a_correlated_flag_is_not_attribution]]): the top content-abort sites
+(ft-remove.h:881, ft-insert.h:866, ft-graft.h:3496) all plant both.
+⇒ **The exact answer needs the LOSING RECORD's class**, which the engine has at
+`t->recs[planted]` in `urcu_txn_desc_commit` and does not report. ☠ And the
+proxy TAG cannot stand in for it: `FT_STATE_PROXY`, `FT_NR_KEYS_PROXY_TAG` and
+`URCU_TXN_TAG` are all `1`, so the tag separates structural from everything
+else and nothing more — checked. That instrument is three default-inert engine
+hooks (the two abort exits — `if (failed)` and the lone-MW-edge fast path, which
+is a contention abort with no descriptor — plus a per-record debug class), and
+it is a decision for Mathieu, since it touches the engine for an FT diagnostic.
 
 ☠ **AND THE ABORT COLUMN'S SPREAD IS NOW MEASURED ON THIS BUILD**: the two runs
 above are the same binary on the same rig and reported ABORT 2,981,880 and
