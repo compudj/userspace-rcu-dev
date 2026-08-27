@@ -1454,6 +1454,60 @@ itself (queue the acquire beside the engine, the way the COARSE lock is a
 mitigation on hot tries once Phase E certifies it. On QSBR the retry loop has
 no quiescent window at all — any queued design must park offline, not spin.
 
+### D.0/D.1 — the tail re-measured AND attributed at HEAD (2026-08-27)
+
+Instrument: `-DFT_DEBUG_REMOVE_RETRY_CAP` (landed, byte-neutral by default;
+the rekey cap detector's twin), with three per-op refusal classifiers.
+Removes reaching 100 attempts, 8 sequential reps each, idle 192-core box:
+`inv_prefix_key_park_vs_holder_churn` 7 8 5 9 11 8 9 5 (median 8);
+`inv_writer_progress_chainmerge` 2 3 5 11 19 3 3 6 (median 4.5); the
+1000-attempt milestone 0 of 17 runs.  ⇒ Phase B's −65% MW_STRUCT did NOT
+dissolve the tail, and the enrolment fix's gain held (no 374-class runs).
+
+☑☑ **THE ATTRIBUTION INVERTS THE DESIGN PREMISE.**  Of 61 victims at the
+100-attempt milestone, 52 report `dirtyLOCK=100 dirtyOTHER=0 cabort=0` and 7
+more `dirtyLOCK=99 cabort=1`: the victim's refusals are ~100% `ft_dlm_lock`
+pre-checks OBSERVING THE WORD HELD, with zero-to-one set-commit losses.
+Every victim is at the lane head (`in_fallback=1, active=1`).  So the
+residual tail is NOT an arbitration loss among runnable contenders — with
+the lane already silencing the crowd at begin(), the victim burns a full
+re-descend+replan per attempt only to re-sample a word that is STILL HELD
+across its whole episode (100 µs-scale attempts fit a single 119–380µs
+preemption-stretched hold; on an idle box, chained/long RUNNING holds — the
+08-20 p99 was 2.2µs, max 33µs — produce the same observation and the
+hold-length distribution needs a re-capture to split the two).
+
+**Consequences for the direction sentence above, all skeptic-verified
+(adversarial review, 2026-08-27):**
+
+* A RESERVATION / priority-token scheme (peers defer at begin) is REFUTED
+  three ways: the defer point sits under held locks on COARSE/nested paths
+  (inflating the very holds under attack); the claimant either honors
+  `domain->active` and parks at the lane's TAIL exactly when starving, or is
+  exempted and voids the lane's landed termination argument; and the
+  arithmetic — a begin()-time defer is a ~2% attempt-rate shift placed
+  µs upstream of the take, where flipping a streak would need a 10–30×
+  cut.  D.1's data then moots the whole family: there is no crowd left to
+  thin.
+* A FAIR-HANDOFF QUEUE on the word survives the wait-shape objections only
+  as GRANT-AT-RELEASE (nobody parks, nobody spins; the release terminal
+  grants {LOCK|snap → LOCK|next}), but that holds the hottest word for an
+  ABSENTEE winner across its re-descent (~100× duty-cycle inflation) and
+  needs lease machinery for a winner that never returns.  D.1 moots this
+  family too: the victim is not losing races at the release instant.
+* What the data actually prices: the cost of ONE MORE SAMPLE of a held word
+  is a full re-descent.  The un-refuted directions are (i) a BOUNDED linger
+  at the refused word (µs-scale, online, at `ft_dlm_lock`'s pre-check — the
+  inverse of the refuted backoff: the victim keeps its temporal position
+  instead of unwinding; must be refused/capped where earlier frames are
+  held), (ii) release-side notification (futex-class wake on release; a
+  protocol change on the release terminal), (iii) rseq time-slice extension
+  for holders (the preemption half only; the fair-mutex header already
+  anticipates it), (iv) accept-and-bound (the cap as a loud detector; the
+  tail is heavy but bounded on idle boxes).  Sizing (i)'s bound needs the
+  CURRENT hold-length distribution: re-run the 08-20 LTTng dlm_take/drop
+  capture at HEAD first (D.2).
+
 ## 7. Phase E — lift the lock-spacing gate
 
 The acquire-site conversion is complete and build-enforced; what remains is
