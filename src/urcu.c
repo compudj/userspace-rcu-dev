@@ -27,6 +27,7 @@
 #include <urcu/annotate.h>
 #include <urcu/assert.h>
 #include <urcu/arch.h>
+#include <urcu/wait-ladder.h>
 #include <urcu/wfcqueue.h>
 #include <urcu/map/urcu.h>
 #include <urcu/static/urcu.h>
@@ -135,6 +136,8 @@ static void mutex_lock(pthread_mutex_t *mutex)
 	if (ret)
 		urcu_die(ret);
 #else /* #ifndef DISTRUST_SIGNALS_EXTREME */
+	struct urcu_wait_ladder wl = URCU_WAIT_LADDER_INIT;
+
 	while ((ret = pthread_mutex_trylock(mutex)) != 0) {
 		if (ret != EBUSY && ret != EINTR)
 			urcu_die(ret);
@@ -143,7 +146,7 @@ static void mutex_lock(pthread_mutex_t *mutex)
 			uatomic_store(&URCU_TLS(rcu_reader).need_mb, 0);
 			cmm_smp_mb();
 		}
-		(void) poll(NULL, 0, 10);
+		urcu_wait_ladder_wait(&wl, 0);
 	}
 #endif /* #else #ifndef DISTRUST_SIGNALS_EXTREME */
 }

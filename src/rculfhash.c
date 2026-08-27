@@ -253,6 +253,7 @@
 
 #include "compat-getcpu.h"
 #include <urcu/assert.h>
+#include <urcu/wait-ladder.h>
 #include <urcu/pointer.h>
 #include <urcu/call-rcu.h>
 #include <urcu/flavor.h>
@@ -654,13 +655,15 @@ static void mutex_lock(pthread_mutex_t *mutex)
 	if (ret)
 		urcu_die(ret);
 #else /* #ifndef DISTRUST_SIGNALS_EXTREME */
+	struct urcu_wait_ladder wl = URCU_WAIT_LADDER_INIT;
+
 	while ((ret = pthread_mutex_trylock(mutex)) != 0) {
 		if (ret != EBUSY && ret != EINTR)
 			urcu_die(ret);
 		if (uatomic_load(&URCU_TLS(rcu_reader).need_mb)) {
 			uatomic_store(&URCU_TLS(rcu_reader).need_mb, 0, CMM_SEQ_CST);
 		}
-		(void) poll(NULL, 0, 10);
+		urcu_wait_ladder_wait(&wl, 0);
 	}
 #endif /* #else #ifndef DISTRUST_SIGNALS_EXTREME */
 }

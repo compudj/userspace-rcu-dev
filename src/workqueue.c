@@ -22,6 +22,7 @@
 
 #include "compat-getcpu.h"
 #include <urcu/assert.h>
+#include <urcu/wait-ladder.h>
 #include <urcu/wfcqueue.h>
 #include <urcu/pointer.h>
 #include <urcu/list.h>
@@ -162,6 +163,7 @@ static void *workqueue_thread(void *arg)
 	unsigned long cbcount;
 	struct urcu_workqueue *workqueue = (struct urcu_workqueue *) arg;
 	int rt = !!(uatomic_read(&workqueue->flags) & URCU_WORKQUEUE_RT);
+	struct urcu_wait_ladder rt_wl = URCU_WAIT_LADDER_INIT;
 
 	if (set_thread_cpu_affinity(workqueue))
 		urcu_die(errno);
@@ -194,8 +196,23 @@ static void *workqueue_thread(void *arg)
 				workqueue->worker_before_pause_fct(workqueue, workqueue->priv);
 			cmm_smp_mb__before_uatomic_or();
 			uatomic_or(&workqueue->flags, URCU_WORKQUEUE_PAUSED);
-			while ((uatomic_read(&workqueue->flags) & URCU_WORKQUEUE_PAUSE) != 0)
-				(void) poll(NULL, 0, 1);
+			{
+				struct urcu_wait_ladder pause_wl =
+					URCU_WAIT_LADDER_INIT;
+
+				while ((uatomic_read(&workqueue->flags) &
+						URCU_WORKQUEUE_PAUSE) != 0) {
+					urcu_wait_ladder_wait(&pause_wl, 0);
+					/*
+					 * The resume side has no wake; hold
+					 * the cadence at the old 1ms bound
+					 * (this loop spans fork via the
+					 * rculfhash atfork handlers).
+					 */
+					urcu_wait_ladder_clamp(&pause_wl,
+						0, URCU_WAIT_LADDER_US_RUNGS);
+				}
+			}
 			uatomic_and(&workqueue->flags, ~URCU_WORKQUEUE_PAUSED);
 			cmm_smp_mb__after_uatomic_and();
 			if (workqueue->worker_after_resume_fct)
@@ -240,7 +257,16 @@ static void *workqueue_thread(void *arg)
 		} else {
 			if (cds_wfcq_empty(&workqueue->cbs_head,
 					&workqueue->cbs_tail)) {
-				(void) poll(NULL, 0, 10);
+				urcu_wait_ladder_wait(&rt_wl, 0);
+				/*
+				 * RT mode has no wake at all -- this cadence
+				 * IS the work-pickup latency.  Hold at 8ms,
+				 * under the old flat 10ms.
+				 */
+				urcu_wait_ladder_clamp(&rt_wl, 0,
+					URCU_WAIT_LADDER_US_RUNGS + 3);
+			} else {
+				urcu_wait_ladder_init(&rt_wl);
 			}
 		}
 		if (workqueue->worker_after_wake_up_fct)

@@ -33,7 +33,6 @@
  */
 
 #include <poll.h>
-#include <time.h>
 #include <errno.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -41,6 +40,7 @@
 
 #include <urcu/wfcqueue.h>
 #include <urcu/uatomic.h>
+#include <urcu/wait-ladder.h>
 #include <urcu/futex.h>
 #include <sched.h>
 
@@ -56,28 +56,6 @@ extern "C" {
 /* Probe: count teardown-wait sleep rungs (diagnosis builds only). */
 static __thread unsigned long cds_fmtx_dbg_polls __attribute__((unused));
 #endif
-
-/*
- * One step of the graduated teardown wait: us-scale sleeps first (the
- * granter's GRANTED->TEARDOWN window is microseconds; this transition
- * is UNWAKEABLE by design -- after TEARDOWN the granter must never
- * touch our node again, so there is no futex to wake), then
- * millisecond polls doubling to a 16ms cap.  Twin of wfcqueue's
- * ___cds_wfcq_wait_rung, kept local because that helper is
- * LGPL-static and this header must stand alone.
- */
-static inline void cds_fair_mutex_wait_rung(int rung)
-{
-	if (rung < 7) {
-		struct timespec ts = { 0, (10L << rung) * 1000L };
-
-		(void) nanosleep(&ts, NULL);
-	} else if (rung < 11) {
-		(void) poll(NULL, 0, 1 << (rung - 7));
-	} else {
-		(void) poll(NULL, 0, 16);
-	}
-}
 
 #define CDS_FAIR_MUTEX_WAIT_ATTEMPTS	1000
 /*
@@ -211,17 +189,22 @@ granted:
 			break;
 		caa_cpu_relax();
 	}
+	/*
+	 * The graduated wait: the granter's GRANTED->TEARDOWN window is
+	 * microseconds, and this transition is UNWAKEABLE by design --
+	 * after TEARDOWN the granter must never touch our node again, so
+	 * there is no futex to wake.  Spin budget 0: the bounded spin
+	 * above already ran.
+	 */
 	{
-		int rung = 0;
+		struct urcu_wait_ladder wl = URCU_WAIT_LADDER_INIT;
 
 		while (!(uatomic_load(&w->state, CMM_ACQUIRE) &
 				CDS_FAIR_MUTEX_TEARDOWN)) {
 #ifdef CDS_FAIR_MUTEX_DBG_POLL
 			cds_fmtx_dbg_polls++;
 #endif
-			cds_fair_mutex_wait_rung(rung);
-			if (rung < 11)
-				rung++;
+			urcu_wait_ladder_wait(&wl, 0);
 		}
 	}
 	urcu_posix_assert(uatomic_load(&w->state) & CDS_FAIR_MUTEX_TEARDOWN);

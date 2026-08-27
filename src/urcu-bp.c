@@ -26,6 +26,7 @@
 #include <urcu/assert.h>
 #include <urcu/config.h>
 #include <urcu/arch.h>
+#include <urcu/wait-ladder.h>
 #include <urcu/wfcqueue.h>
 #include <urcu/map/urcu-bp.h>
 #include <urcu/static/urcu-bp.h>
@@ -171,10 +172,12 @@ static void mutex_lock(pthread_mutex_t *mutex)
 	if (ret)
 		urcu_die(ret);
 #else /* #ifndef DISTRUST_SIGNALS_EXTREME */
+	struct urcu_wait_ladder wl = URCU_WAIT_LADDER_INIT;
+
 	while ((ret = pthread_mutex_trylock(mutex)) != 0) {
 		if (ret != EBUSY && ret != EINTR)
 			urcu_die(ret);
-		(void) poll(NULL,0,10);
+		urcu_wait_ladder_wait(&wl, 0);
 	}
 #endif /* #else #ifndef DISTRUST_SIGNALS_EXTREME */
 }
@@ -215,6 +218,7 @@ static void wait_for_readers(struct cds_list_head *input_readers,
 			cmm_annotate_t *group)
 {
 	unsigned int wait_loops = 0;
+	struct urcu_wait_ladder wl = URCU_WAIT_LADDER_INIT;
 	struct urcu_bp_reader *index, *tmp;
 
 	/*
@@ -254,10 +258,17 @@ static void wait_for_readers(struct cds_list_head *input_readers,
 		} else {
 			/* Temporarily unlock the registry lock. */
 			mutex_unlock(&rcu_registry_lock);
-			if (wait_loops >= RCU_QS_ACTIVE_ATTEMPTS)
-				(void) poll(NULL, 0, RCU_SLEEP_DELAY_MS);
-			else
+			if (wait_loops >= RCU_QS_ACTIVE_ATTEMPTS) {
+				urcu_wait_ladder_wait(&wl, 0);
+				/*
+				 * Hold the re-check cadence at 8ms, under
+				 * the old flat RCU_SLEEP_DELAY_MS.
+				 */
+				urcu_wait_ladder_clamp(&wl, 0,
+					URCU_WAIT_LADDER_US_RUNGS + 3);
+			} else {
 				caa_cpu_relax();
+			}
 			/* Re-lock the registry lock before the next loop. */
 			mutex_lock(&rcu_registry_lock);
 		}

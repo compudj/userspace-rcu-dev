@@ -15,11 +15,11 @@
 
 #include <pthread.h>
 #include <poll.h>
-#include <time.h>
 #include <stdbool.h>
 #include <urcu/assert.h>
 #include <urcu/compiler.h>
 #include <urcu/uatomic.h>
+#include <urcu/wait-ladder.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -228,15 +228,23 @@ static inline bool _cds_wfcq_enqueue(cds_wfcq_head_ptr_t head,
  */
 #ifndef CDS_WFCQ_WAIT_SLEEP
 #define CDS_WFCQ_WAIT_SLEEP(msec) ___cds_wfcq_wait_sleep(msec)
+#define ___CDS_WFCQ_WAIT_SLEEP_IS_DEFAULT
 #endif
 
 /*
  * CDS_WFCQ_WAIT_SLEEP_US: the sub-millisecond rungs of the graduated
  * wait (see ___cds_wfcq_wait_rung).  Same override contract as
- * CDS_WFCQ_WAIT_SLEEP.
+ * CDS_WFCQ_WAIT_SLEEP.  An embedder that overrode only the millisecond
+ * hook keeps its every-sleep contract: the sub-ms rungs then route
+ * through CDS_WFCQ_WAIT_SLEEP(1), a 1ms floor rather than a silent
+ * bypass of their hook.
  */
 #ifndef CDS_WFCQ_WAIT_SLEEP_US
-#define CDS_WFCQ_WAIT_SLEEP_US(usec) ___cds_wfcq_wait_sleep_us(usec)
+# ifdef ___CDS_WFCQ_WAIT_SLEEP_IS_DEFAULT
+#  define CDS_WFCQ_WAIT_SLEEP_US(usec) ___cds_wfcq_wait_sleep_us(usec)
+# else
+#  define CDS_WFCQ_WAIT_SLEEP_US(usec) CDS_WFCQ_WAIT_SLEEP(1)
+# endif
 #endif
 
 #ifdef CDS_FAIR_MUTEX_DBG_POLL
@@ -254,9 +262,7 @@ static inline void ___cds_wfcq_wait_sleep(int msec)
 
 static inline void ___cds_wfcq_wait_sleep_us(int usec)
 {
-	struct timespec ts = { 0, (long) usec * 1000L };
-
-	(void) nanosleep(&ts, NULL);
+	(void) urcu_wait_ladder_sleep_us((unsigned int) usec);
 }
 
 /*
@@ -266,22 +272,18 @@ static inline void ___cds_wfcq_wait_sleep_us(int usec)
  * teardown) are microsecond-scale, so a flat 10ms sleep charges three
  * orders of magnitude over the typical remaining wait -- and under a
  * FIFO lock built on this queue, one sleeper convoys every waiter
- * behind it.  Escalate instead: us-scale sleeps first (bounded below
- * by the scheduler's timer slack), then millisecond polls doubling to
- * a 16ms cap.
-
- *	rung  0..6   10us << rung   (10us .. 640us)
- *	rung  7..10   1ms << (rung - 7)   (1, 2, 4, 8ms)
- *	rung 11+     16ms
+ * behind it.  The SCHEDULE is urcu/wait-ladder.h's; the sleeps route
+ * through the CDS_WFCQ_WAIT_SLEEP / CDS_WFCQ_WAIT_SLEEP_US override
+ * hooks so embedders keep their contract.
  */
 static inline void ___cds_wfcq_wait_rung(int rung)
 {
-	if (rung < 7)
-		CDS_WFCQ_WAIT_SLEEP_US(10 << rung);
-	else if (rung < 11)
-		CDS_WFCQ_WAIT_SLEEP(1 << (rung - 7));
+	unsigned int usec = urcu_wait_ladder_rung_us((unsigned int) rung);
+
+	if (usec < 1000)
+		CDS_WFCQ_WAIT_SLEEP_US((int) usec);
 	else
-		CDS_WFCQ_WAIT_SLEEP(16);
+		CDS_WFCQ_WAIT_SLEEP((int) (usec / 1000));
 }
 
 /*
@@ -299,7 +301,7 @@ ___cds_wfcq_busy_wait(int *attempt, int blocking)
 	 * blocked probe takes the NEXT rung of the ladder; clamped so the
 	 * rung (and the shift feeding it) stays bounded at the 16ms cap.
 	 */
-	if (*attempt < WFCQ_ADAPT_ATTEMPTS + 16)
+	if (*attempt < WFCQ_ADAPT_ATTEMPTS + URCU_WAIT_LADDER_RUNG_CAP)
 		++(*attempt);
 	if (*attempt >= WFCQ_ADAPT_ATTEMPTS)
 		___cds_wfcq_wait_rung(*attempt - WFCQ_ADAPT_ATTEMPTS);

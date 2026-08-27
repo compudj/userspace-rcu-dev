@@ -103,6 +103,7 @@ nobase_include_HEADERS = \
 	urcu/urcu-memb.h \
 	urcu/urcu-qsbr.h \
 	urcu/urcu_ref.h \
+	urcu/wait-ladder.h \
 	urcu/wfcqueue.h \
 	urcu/wfqueue.h \
 	urcu/wfstack.h \
