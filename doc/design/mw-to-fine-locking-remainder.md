@@ -1598,6 +1598,32 @@ Note the two classes compose: D.1–D.3's starvation is 1–8ms of
 legitimate bulk holds; D.4 was the lane's own handoff machinery
 quantizing rare µs races into 10ms convoys.
 
+### D.5 — the ladder is a PUBLIC API, and the residue is closed (@027eeb9d)
+
+Mathieu's call: the graduated delay lifted into `urcu/wait-ladder.h`
+(header-only; schedule constants overridable; `rung_us`/`sleep_us`/
+`clamp` primitives) and EVERY poll-for-delay site converted — wfcqueue
+(hooks preserved, ms-only overriders keep their every-sleep contract),
+fair-mutex, urcu-bp's GP re-check (clamped 8ms), workqueue pause
+(clamped at the old 1ms — the loop spans fork) and RT idle (8ms),
+compat-futex (POLL RUNGS ONLY: the function is documented
+async-signal-safe and nanosleep is not on the POSIX list), and the four
+DISTRUST trylock loops.  The adversarial review's amendments are all
+folded in.  Verified: 64-leg gate IDENTICAL PER LEG to the ladder
+baseline, fair-mutex/bp-torture/fork/FT suites green.
+
+☑ **The chainmerge/churn in-body ~10ms residue is CLOSED as a
+machine-load artifact** (@da868037): it fires only while concurrent
+builds saturate the box, every code-owned wait column reads zero (GP
+bracket: gp_calls=0 on 269+ slow removes — the remove body runs NO
+grace period on these workloads; ladder rungs 0; arena waits 0 idle),
+and its one discriminated instance is a single ~10ms deschedule
+(nvcsw=1 nivcsw=1) convoying the lane.  The instrument's new
+begin/body/bail + gp/arena/rusage columns make any future occurrence
+self-attributing.  Under real oversubscription the mitigation is
+scheduler-side (rseq slice extension for lane holders), not wait
+policy — noted for Phase F.
+
 **What this does to the fork above:** the starvation is priced by
 (bulk-op hold time × recompaction rate), so the CURATIVE lever is
 SHORTENING THE HOLD — which is §8.2 in-place mutation's exact target
