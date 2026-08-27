@@ -1249,13 +1249,63 @@ records" — is a loose bound, not attribution
 ([[feedback_a_correlated_flag_is_not_attribution]]): the top content-abort sites
 (ft-remove.h:881, ft-insert.h:866, ft-graft.h:3496) all plant both.
 ⇒ **The exact answer needs the LOSING RECORD's class**, which the engine has at
-`t->recs[planted]` in `urcu_txn_desc_commit` and does not report. ☠ And the
+`t->recs[planted]` in `urcu_txn_desc_commit` and did not report. ☠ And the
 proxy TAG cannot stand in for it: `FT_STATE_PROXY`, `FT_NR_KEYS_PROXY_TAG` and
 `URCU_TXN_TAG` are all `1`, so the tag separates structural from everything
-else and nothing more — checked. That instrument is three default-inert engine
-hooks (the two abort exits — `if (failed)` and the lone-MW-edge fast path, which
-is a contention abort with no descriptor — plus a per-record debug class), and
-it is a decision for Mathieu, since it touches the engine for an FT diagnostic.
+else and nothing more — checked. ⇒ **BUILT (Mathieu approved the engine touch):
+C.1(d) below.**
+
+### C.1(d) — ABORT ATTRIBUTED TO THE RECORD THAT LOST IT
+
+`eaf883af` (engine, default-inert) + `9e263841` (the FT label). Same rig, two
+runs, 119/119 both, and **the classes sum to the ABORT column exactly with ZERO
+unattributed** — which is also the proof that the three engine exits cover every
+abort, the lone-MW-edge fast path included.
+
+    losing record's class    run 2 aborts   share   run 1 share
+    MW_LOCK                     2,178,560   86.3%      78.1%     the lock take: losing IS its job
+    mwa:STATE                     261,276   10.4%      15.2%     the re-parent sweep's §4.B validate
+    MW_STRUCT                      61,347    2.4%       4.8%     ☠ see the alarm
+    mwa:CELL                       22,463    0.9%       1.9%     ☞ THE G4 LANE
+    VALIDATE                            —      —        0.0%
+    mwa:PARENT_WORD                     —      —        0.0%
+
+☑☑ **G4's LANE IS 0.9-1.9% OF ABORTS.** The ordered-cell lane is 6% of the
+always-MW record volume and **~1% of what actually aborts**. Against C.2's own
+decision rule — "if the cell lane is minor, keep the narrow MW lane" — this is
+as minor as the rule can be given, and it closes the volume-vs-abort gap C.1(c)
+left open. A per-cell lock would buy ~1% of aborts and cost a state word per
+cell plus neighbour serialization. ⇒ **KEEP THE NARROW MW LANE.**
+
+☠☠ **AND THE DETECTOR FIRED, WHICH IS THE REAL RESULT.** 60,727 of the 61,347
+MW_STRUCT losses are records whose owner the op **HOLDS** (79,445 of 80,179 in
+run 1) — and **every one of them is on a child POINTER slot**, zero on the
+packed state word. That distinction is the whole finding: a state word has
+lock-free writers by design, a child pointer slot may only be written by a
+holder of the owning node's lock. Two runs agree, and it is concentrated at
+**exactly two sites, both in the GRAFT lane**:
+
+    ft-graft.h:3496 create    ptr 56,461 / state 0      (glue_insert.txn)
+    ft-graft.h:3520 bounded   ptr  4,266 / state 0      (glue_publish_txn)
+
+Every Phase B armed site reports **zero**. `ft_flip_txn_owns` is registry-only
+with no trivially-true arm, so the hold is real
+([[feedback_the_first_question_at_a_claim_abort_is_lock_fine]] cleared).
+
+☞ **WHAT IT MEANS TODAY, AND WHAT IT DOES NOT.** Unarmed, the record is MW, the
+CAS loses, the op retries, and nothing is published wrong — this is not a live
+correctness bug. What it says is that **the graft lane must not be armed**: an
+armed txn parks that word SW, and an SW park neither arbitrates nor is visible
+to the peer that just won. The candidate causes are not yet separated —
+a peer writing that slot without the lock, an `owner` naming the wrong node
+([[feedback_a_raw_rederivation_at_the_write_site_is_a_class]], three known
+instances), an expected-old captured before the acquire, or the cross-trie shape
+(`glue_insert.txn` is created on `dst_ft`). ☞ Next: `-DFT_ABORT_CLAIM` +
+the descriptor dump, which is what turned the last deterministic abort into a
+root cause in one run ([[feedback_dump_the_losing_mcas_record]]).
+
+☠ COVERAGE: ft_unit reports ZERO aborts, so the detector has none there. It
+lives on ft_inv MW.
 
 ☠ **AND THE ABORT COLUMN'S SPREAD IS NOW MEASURED ON THIS BUILD**: the two runs
 above are the same binary on the same rig and reported ABORT 2,981,880 and
