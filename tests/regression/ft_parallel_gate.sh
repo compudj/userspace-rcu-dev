@@ -167,6 +167,12 @@ ALL_CONFIGS=(
 	# Swept for the same reason txndbg is: this is the embedder-side detector
 	# for the same class, so it is blind to the same spacings.
 	"proxyassert|-DFT_DEBUG_PROXY_ASSERT -DNO_FEATURE_FT_SKIP_COMPRESSED -DFEATURE_FT_ANCHOR_VALIDATE|u ion ioff imw|per-node exponential root-only"
+	# Phase E.3's certification config: the self-collision ledger
+	# (FEATURE_FT_HOLD_TRACE) armed across the spacing sweep.  A collision
+	# aborts (ft_hold_trace_refused), so a red here is a leg abort, not a
+	# grep.  DEBUG_RCU rides along so the engine's own asserts stay armed at
+	# the same spacings this config certifies.
+	"holdtrace|-DDEBUG_RCU -DFEATURE_FT_HOLD_TRACE -DFEATURE_FT_ANCHOR_VALIDATE|u ion ioff imw|per-node exponential root-only"
 	# ★ THE CONFIG THAT ACTUALLY CATCHES THE RAW-READ CLASS.
 	#
 	# txndbg above arms the same engine assert and NEVER FIRES IT: with

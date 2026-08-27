@@ -1663,13 +1663,26 @@ where it would surface.
 The acquire-site conversion is complete and build-enforced; what remains is
 certification, then the API gate lift (`ft-lifecycle.h:369`):
 
-1. `ft_compact_relocate_at` still passes a NULL lock context — plumb the
-   depth `ft_compact_descend` already tracks.
+1. ☑ STALE ROW — `ft_compact_relocate_at` dates and anchors its lock set
+   since `ff2c12da` (2026-08-09, before this doc was written): the walk
+   builds a real `ft_lock_ctx` from its descent and passes the tracked
+   depth.  Verified in-tree 2026-08-27.
 2. An EXCLUSION oracle per spacing that fails by VIOLATION, not by livelock —
    strengthen `FEATURE_FT_AGREEMENT_RED` (today it reports only by hanging
-   >36x, a weak signal to certify 40 sites with).
-3. `FEATURE_FT_HOLD_TRACE` (self-collision ledger) clean across the full
-   suite at exponential and root-only.
+   >36x, a weak signal to certify 40 sites with).  ☞ Sketch (E.2): an OWNER
+   STAMP on the anchor word's metadata under a debug feature, written at the
+   post-acquire choke point (where `ft_hold_trace_note` sits) and cleared at
+   `ft_hold_trace_drop`; a second stamp on a stamped word IS the violation,
+   with both owners named.  The red control then fires in seconds instead of
+   hanging, and each spacing certifies by running clean under the armed
+   stamp.
+3. ☑ FIRST-PASS CLEAN (2026-08-27, unblocked by E.0): both suites at BOTH
+   exponential and root-only under `-DDEBUG_RCU -DFEATURE_FT_HOLD_TRACE`:
+   zero SELF-COLLISION, zero asserts, 315+3/119 everywhere.  The zero is
+   proven live: the collision-checking function's informational sibling
+   fired 2,205 times in one leg alone.  Now CONTINUOUSLY certified: the
+   gate matrix gained a swept `holdtrace` config (a collision aborts, so a
+   red is a leg abort, not a grep).
 4. Bench the spacings (`-O2 -DNDEBUG`, sequential runs); pick the default
    from data.
 5. Lift the `FEATURE_FT_ANCHOR_VALIDATE`-only refusal; then fold the
