@@ -1508,6 +1508,44 @@ hold-length distribution needs a re-capture to split the two).
   CURRENT hold-length distribution: re-run the 08-20 LTTng dlm_take/drop
   capture at HEAD first (D.2).
 
+### D.2 — the LTTng capture: the holds are LEGITIMATE BULK-OP TAILS (2026-08-27)
+
+Mathieu named three candidate scenarios — (1) an acquire refusal forfeits the
+FIFO turn, (2) descent/acquire under a NULL domain, (3) a bulk mutation
+legitimately holds the lock long — and suspected (3).  The rig (committed
+this time: `cds_ft:dlm_take/dlm_drop/dlm_long_hold/remove_anchor_starved`,
+`442ff66f`) confirms (3) with the mechanism named:
+
+    one snapshot window, full ft_inv, traced -O2 -DNDEBUG:
+    546,877 takes; 19,025 holds ≥ 50µs — median 81µs, p90 122, p99 238
+    86%  ft_node_recompact:1357   (then detach_node:2727,
+         insert_dlm_acquire_split:771, detach_orphan_planlock:693,
+         chain_compress_fused:1009)
+    98.3% of long holds: nivcsw = 0 — the holder RAN the whole time
+    99.8% of takes carry a domain-bound op (scenario 2 retired: 0.2%,
+         all recompact:1357 / insert_split:771 — worth a look, not a cause)
+
+Untraced churn victims agree (the 200µs word-sampler): the refused word is
+held with `trans=0` across the whole window, take ages 160–535µs, takers
+`ft_unchain_node:4147` / `_cds_ft_insert:3329` — i.e. a DLM hold lasts from
+the acquire-set commit to the release terminal, the compound op's WHOLE
+build+publish tail.  Scenario (1) is true by construction (the bail must
+forfeit — the circular-wait rule) but secondary: with the lane parking every
+enrolled peer, the victim's collisions are with these running holds, not
+with a crowd.  ⇒ The 08-20 "lock-holder PREEMPTION" conclusion was the
+under-load special case; the idle-box steady state is scenario (3).
+
+**What this does to the fork above:** the starvation is priced by
+(bulk-op hold time × recompaction rate), so the CURATIVE lever is
+SHORTENING THE HOLD — which is §8.2 in-place mutation's exact target
+(~130 structural records per recompaction commit, re-parenting every
+child), now carrying a LIVENESS justification on top of its throughput
+one; a build-outside-the-lock / flip-inside recompaction shape is the same
+lever.  The victim-side BOUNDED LINGER (~1–2× median hold) remains the
+cheap PALLIATIVE for the retry-storm cost (100 re-descents per episode),
+and rseq slice extension addresses only the 1.7% preemption sliver.
+G5(D)'s freeze-drain bound inherits the hold tail: p99 ~240µs + one GP.
+
 ## 7. Phase E — lift the lock-spacing gate
 
 The acquire-site conversion is complete and build-enforced; what remains is
