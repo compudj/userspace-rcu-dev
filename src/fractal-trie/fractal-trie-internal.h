@@ -1150,6 +1150,23 @@ struct cds_ft_metadata {
 	 */
 	uint8_t incoming_byte;
 #endif
+#ifdef FEATURE_FT_HOLD_TRACE
+	/*
+	 * E.2 exclusion-oracle stamp: which thread currently claims this
+	 * NODE's exclusion, and from where.  Claimed at the acquire
+	 * primitives (ft_hold_trace_note), yielded when the covering lock's
+	 * release records (ft_hold_trace_drop).  MEMBER-keyed, not
+	 * anchor-keyed: two writers covering one node through DIFFERENT
+	 * anchors -- the anchor disagreement the spacing refusal exists to
+	 * prevent -- both stamp HERE, and the second claim aborts with both
+	 * owners named.  Zeroed by the allocator's metadata memset; the
+	 * free-poison lands only after the GP that follows the release, so a
+	 * yield always precedes it.
+	 */
+	unsigned long dbg_owner_tid;
+	const char *dbg_owner_fn;
+	int dbg_owner_line;
+#endif
 };
 
 /*

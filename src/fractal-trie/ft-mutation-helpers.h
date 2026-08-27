@@ -558,6 +558,10 @@ struct ft_held_anchor {
 	 * second terminal would record the single word twice.
 	 */
 	bool shared;
+#ifdef FEATURE_FT_HOLD_TRACE
+	/* Dedupe onto a CLOSING hold: file no oracle entry (see the choke). */
+	bool oracle_skip;
+#endif
 	/*
 	 * The op already holds @node's OWN word -- an EARLIER member of this op
 	 * anchored ON @node, so a coarsened member arrives at a node its own op
@@ -1168,9 +1172,16 @@ struct urcu_txn *ft_flip_txn_handle(struct ft_flip_txn *t)
  * begin()/end() only manage the per-attempt descriptor / deferred-cleanup
  * state: behavior-identical to the pre-bracket exclusive path.
  */
+#ifdef FEATURE_FT_HOLD_TRACE
+static void ft_hold_trace_leak_canary(void);	/* defined with the ledger */
+#else
+static inline void ft_hold_trace_leak_canary(void) { }
+#endif
+
 static inline
 void ft_txn_op_init(struct cds_ft *ft, struct urcu_txn *op)
 {
+	ft_hold_trace_leak_canary();
 	if (ft->exclusive)
 		urcu_txn_init_flavor(op, NULL, NULL);
 	else
@@ -1888,6 +1899,7 @@ static void ft_flip_txn_call_rcu_now(struct rcu_head *head,
 #define FT_HOLD_TRACE_MAX	1024
 struct ft_hold_trace_ent {
 	const struct cds_ft_metadata *lock;
+	struct cds_ft_metadata *member;	/* the NODE this hold excludes for */
 	const char *fn;
 	int line;
 };
@@ -1913,13 +1925,123 @@ bool ft_hold_trace_report_ok(void)
 	return true;
 }
 
+/*
+ * The E.2 exclusion oracle.  CLAIM the member node's stamp at the acquire;
+ * a live foreign stamp IS the violation -- two writers covering one node,
+ * whether through one word (no exclusion at all: the FEATURE_FT_AGREEMENT_RED
+ * control) or through two words (anchor disagreement).  Both owners are
+ * named.  The fn/line store after the xchg is racy only in the already-
+ * aborting case.
+ */
 static inline
-void ft_hold_trace_note(const struct cds_ft_metadata *lock, const char *fn,
+void ft_owner_stamp_claim(struct cds_ft_metadata *member, const char *fn,
 		int line)
 {
-	if (ft_hold_trace_n >= FT_HOLD_TRACE_MAX)
+	unsigned long self = (unsigned long) pthread_self();
+	unsigned long old;
+
+	if (!member)
 		return;
+	old = uatomic_xchg(&member->dbg_owner_tid, self);
+	if (old && old != self) {
+		fprintf(stderr, "FT EXCLUSION VIOLATION: node %p claimed at "
+			"%s:%d by tid %lx while owned by tid %lx (from "
+			"%s:%d)\n",
+			(void *) member, fn, line, self, old,
+			member->dbg_owner_fn ? member->dbg_owner_fn : "?",
+			member->dbg_owner_line);
+		abort();
+	}
+	member->dbg_owner_fn = fn;
+	member->dbg_owner_line = line;
+}
+
+static inline
+void ft_owner_stamp_yield(struct cds_ft_metadata *member)
+{
+	unsigned long self = (unsigned long) pthread_self();
+	unsigned long old;
+
+	if (!member)
+		return;
+	old = uatomic_cmpxchg(&member->dbg_owner_tid, self, 0);
+	if (old != self && old != 0) {
+		/*
+		 * Print the site POINTER raw: a stale entry's member may have
+		 * been reused, making dbg_owner_fn a wild pointer -- the
+		 * canary below makes that unreachable, but a diagnostic must
+		 * not crash inside its own report.
+		 */
+		fprintf(stderr, "FT EXCLUSION VIOLATION: yield of node %p by "
+			"tid %lx finds foreign owner tid %lx (site %p:%d)\n",
+			(void *) member, self, old,
+			(const void *) member->dbg_owner_fn,
+			member->dbg_owner_line);
+		abort();
+	}
+	/* old == 0: an idempotent second yield (duplicate entries). */
+}
+
+/*
+ * LEAK CANARY for the oracle: a filed entry's word carries LOCK from the
+ * filing (post-acquire-commit) until its drop, and every drop precedes the
+ * word's clear -- so an entry whose word has NO lock bit is a LEAKED hold (a
+ * release path that bypassed its drop).  Left alone it would age into a
+ * false abort once the arena reuses the addresses; caught at op init by the
+ * OWNER thread, it names the take that leaked instead.
+ */
+static void ft_hold_trace_leak_canary(void)
+{
+	unsigned int ci;
+
+	for (ci = 0; ci < ft_hold_trace_n; ci++) {
+		if (CMM_LOAD_SHARED(ft_hold_trace[ci].lock->state) &
+				FT_STATE_LOCK)
+			continue;
+		fprintf(stderr, "FT HOLD LEDGER LEAK: word %p (taken at "
+			"%s:%d) has no lock bit at op init\n",
+			(const void *) ft_hold_trace[ci].lock,
+			ft_hold_trace[ci].fn, ft_hold_trace[ci].line);
+		abort();
+	}
+}
+
+/*
+ * The POST-COMMIT backstop's drop: entries can be filed INSIDE the
+ * wrapper's drop->commit window by acquire-sets the commit machinery
+ * itself runs (the glue/fold edge callbacks), deduping onto the committing
+ * txn's registered anchors.  Their words are already free here, so a peer
+ * may have legitimately claimed a member: yield ONLY a stamp that is still
+ * ours and leave a foreign one untouched -- aborting on it would be the MW
+ * false positive all over again.  The op-init canary still polices
+ * anything this backstop misses.
+ */
+static inline
+void ft_hold_trace_drop_tolerant(const struct cds_ft_metadata *lock)
+{
+	unsigned long self = (unsigned long) pthread_self();
+	unsigned int i = ft_hold_trace_n;
+
+	while (i--) {
+		if (ft_hold_trace[i].lock != lock)
+			continue;
+		if (ft_hold_trace[i].member)
+			(void) uatomic_cmpxchg(
+				&ft_hold_trace[i].member->dbg_owner_tid,
+				self, 0);
+		ft_hold_trace[i] = ft_hold_trace[--ft_hold_trace_n];
+	}
+}
+
+static inline
+void ft_hold_trace_note(const struct cds_ft_metadata *lock,
+		struct cds_ft_metadata *member, const char *fn, int line)
+{
+	if (ft_hold_trace_n >= FT_HOLD_TRACE_MAX)
+		return;	/* no entry => no claim: nothing to yield later */
+	ft_owner_stamp_claim(member, fn, line);
 	ft_hold_trace[ft_hold_trace_n].lock = lock;
+	ft_hold_trace[ft_hold_trace_n].member = member;
 	ft_hold_trace[ft_hold_trace_n].fn = fn;
 	ft_hold_trace[ft_hold_trace_n].line = line;
 	ft_hold_trace_n++;
@@ -1981,8 +2103,14 @@ void ft_hold_trace_drop(const struct cds_ft_metadata *lock)
 #endif
 	while (i--) {
 		if (ft_hold_trace[i].lock == lock) {
+			/*
+			 * Yield the member this entry excluded for; the
+			 * swap-from-top always moves an already-visited
+			 * entry into the scanned slot, so no match is
+			 * skipped, and an anchor may cover several members.
+			 */
+			ft_owner_stamp_yield(ft_hold_trace[i].member);
 			ft_hold_trace[i] = ft_hold_trace[--ft_hold_trace_n];
-			return;
 		}
 	}
 }
@@ -1992,7 +2120,11 @@ void ft_hold_trace_drop(const struct cds_ft_metadata *lock)
  * really carries LOCK and this thread's ledger names it: any other dirty bit is
  * an ordinary peer refusal.  The tail of the ledger is printed too, because a
  * commit that CONSUMED a fence (a fenced tombstone leaves TOMBSTONE, no LOCK)
- * never calls a release and so leaves its entry behind.
+ * never calls a release and so leaves its entry behind.  ☠ That class dates
+ * from the fence-path era (ft_meta_lock_acquire is COLD today -- the poison
+ * macro routes every take through the DLM choke, whose entries drop before
+ * their commit); the op-init LEAK CANARY in ft_txn_op_init now polices it:
+ * any entry surviving its word's lock bit aborts, naming the take.
  */
 static inline
 void ft_hold_trace_refused(const struct cds_ft_metadata *lock, const char *fn,
@@ -2087,10 +2219,17 @@ void ft_hold_trace_bad_release(const struct cds_ft_metadata *lock,
 }
 #else
 static inline
-void ft_hold_trace_note(const struct cds_ft_metadata *lock, const char *fn,
-		int line)
+void ft_hold_trace_drop_tolerant(const struct cds_ft_metadata *lock)
 {
-	(void) lock; (void) fn; (void) line;
+	(void) lock;
+}
+
+static inline
+void ft_hold_trace_note(const struct cds_ft_metadata *lock,
+		struct cds_ft_metadata *member, const char *fn, int line)
+{
+	(void) lock;
+	(void) member; (void) fn; (void) line;
 }
 
 static inline
@@ -2166,6 +2305,7 @@ int ft_meta_lock_acquire(struct cds_ft_metadata *meta,
 	 */
 	if (!(s & (FT_STATE_PROXY | FT_STATE_TOMBSTONE))) {
 		*state_snapshot = s;
+		ft_hold_trace_note(meta, meta, "ft_meta_lock_acquire/red", 0);
 		return 0;
 	}
 #endif
@@ -2176,6 +2316,7 @@ int ft_meta_lock_acquire(struct cds_ft_metadata *meta,
 			s | FT_STATE_LOCK) != s))
 		return -EAGAIN;
 	*state_snapshot = s;
+	ft_hold_trace_note(meta, meta, "ft_meta_lock_acquire", 0);
 	return 0;
 }
 
@@ -3126,6 +3267,24 @@ enum urcu_txn_status ft_flip_txn_commit(struct cds_ft *ft,
 		return miss_st;
 	}
 	FT_AB_LOST_RESET();
+	/*
+	 * Drop (and, under the oracle, YIELD) the registered locks' ledger
+	 * entries BEFORE the commit: the release terminals consume the locks
+	 * AT the commit's linearization, so a post-commit drop leaves a
+	 * window where a peer legitimately takes the freed word while this
+	 * thread's stale stamp still claims it -- the false positive the MW
+	 * suite hit deterministically.  Pre-commit the words still carry the
+	 * lock, so nothing can claim between the yield and the commit; on
+	 * ABORT the locks stay held and ft_flip_txn_lock_release_all's own
+	 * drop-then-clear order (ft_meta_lock_release) covers the clears,
+	 * finding these entries already gone.
+	 */
+	{
+		unsigned int drop_i;
+
+		for (drop_i = 0; drop_i < t->nr_locks; drop_i++)
+			ft_hold_trace_drop(t->locks[drop_i].meta);
+	}
 	st = urcu_txn_commit_flavor(t->mtxn, reclaim);
 	FT_TP(txn_commit, (const void *) t->mtxn, (int) st);
 	FT_TK_COUNT_END(t, st == URCU_TXN_STATUS_OK ? FT_TK_OK :
@@ -3156,15 +3315,17 @@ enum urcu_txn_status ft_flip_txn_commit(struct cds_ft *ft,
 	if (caa_unlikely(st != URCU_TXN_STATUS_OK)) {
 		ft_flip_txn_lock_release_all(t);
 	} else {
-		unsigned int i;
+		unsigned int bs_i;
 
 		/*
-		 * The terminals above are how a COMMITTED registered lock stops
-		 * being held: no ft_meta_lock_release runs, so the trace ledger
-		 * would otherwise keep the word forever.
+		 * A COMMITTED registered lock was consumed by its release
+		 * terminal; its ledger entry was dropped BEFORE the commit
+		 * (see above).  The TOLERANT sweep below catches entries the
+		 * commit machinery's own callbacks filed inside the
+		 * drop->commit window (a dedupe onto this txn's anchor).
 		 */
-		for (i = 0; i < t->nr_locks; i++)
-			ft_hold_trace_drop(t->locks[i].meta);
+		for (bs_i = 0; bs_i < t->nr_locks; bs_i++)
+			ft_hold_trace_drop_tolerant(t->locks[bs_i].meta);
 	}
 	free(t);
 	return st;
@@ -3851,6 +4012,24 @@ int ft_dlm_lock(struct ft_flip_txn *t, struct cds_ft_metadata *meta,
 	 * only on content txns; assert it rather than rely on that reading.
 	 */
 	assert(!t->structural_sw);
+#ifdef FEATURE_FT_AGREEMENT_RED
+	/*
+	 * RED CONTROL for the E.2 exclusion oracle (NOT a shipping
+	 * configuration), moved here from ft_meta_lock_acquire when the DLM
+	 * conversion made that primitive cold: take DESPITE a held lock.  The
+	 * record degrades to a benign {LOCK|x -> LOCK|x} no-op, so two
+	 * writers both "hold" the word -- exactly what a lock-set that
+	 * excludes nothing produces -- and the SECOND owner-stamp claim on
+	 * any shared member is the violation the oracle must fire.  (The
+	 * loser's release record then mismatches and its op retries; that
+	 * churn is red-only noise, and the oracle fires before it.  The
+	 * held-release helpers may strip a winner's bit under red -- more
+	 * shared ownership, in-spirit for a control that dies in under a
+	 * second.)
+	 */
+	if (caa_unlikely(s & (FT_STATE_PROXY | FT_STATE_TOMBSTONE)))
+		return -EAGAIN;
+#else
 	if (caa_unlikely(s & (FT_STATE_PROXY | FT_STATE_TOMBSTONE |
 			FT_STATE_LOCK))) {
 #ifdef FT_DLM_LINGER
@@ -3872,6 +4051,7 @@ int ft_dlm_lock(struct ft_flip_txn *t, struct cds_ft_metadata *meta,
 #endif
 		return -EAGAIN;
 	}
+#endif /* !FEATURE_FT_AGREEMENT_RED */
 	*snap = s;
 	FT_TK_TXN_SET_TAKE(t, true);
 	ft_flip_txn_record_state(t, meta,
@@ -4154,6 +4334,52 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 			set[i].held.shared = true;
 			set[i].held.node_held = node_held;
 			set[i].held.txn_owned = false;
+#ifdef FEATURE_FT_HOLD_TRACE
+			/*
+			 * A dedupe onto a CLOSING hold must not file a ledger
+			 * entry: if the covering hold's release is already
+			 * RECORDED, its drop has already run -- an entry filed
+			 * now outlives every drop and ages into a false abort
+			 * (the leak canary's first catch, via the rekey
+			 * writer's early anchor releases).  The ctx frame is a
+			 * plan-time fact; ask the DESCRIPTOR for the
+			 * publish-time one.
+			 */
+			{
+				const struct ft_held_set *hs__;
+
+				set[i].held.oracle_skip = false;
+				/*
+				 * The held set is a CHAIN of frames; the
+				 * covering hold's release may be recorded in
+				 * ANY frame's registry.
+				 */
+				for (hs__ = &ctx->held; hs__;
+						hs__ = hs__->outer) {
+					struct urcu_txn_desc *d__ =
+						hs__->txn ?
+						hs__->txn->mtxn->desc : NULL;
+					const struct urcu_txn_record *r__;
+
+					if (!d__ || d__ == URCU_TXN_ENOMEM)
+						continue;
+					r__ = urcu_txn_find(d__, (void **)
+						&lock->state);
+					if (!r__ || !(((uintptr_t)
+							r__->old_ptr) &
+							FT_STATE_LOCK) ||
+						(((uintptr_t) r__->new_ptr) &
+							FT_STATE_LOCK))
+						continue;
+					if (ft_hold_trace_report_ok())
+						fprintf(stderr,
+							"FT E2: dedupe onto CLOSING hold at %s:%d, not filed\n",
+							fn, line);
+					set[i].held.oracle_skip = true;
+					break;
+				}
+			}
+#endif
 			continue;
 		}
 		if (ft_dlm_lock(acq, lock, &lock_snap)) {
@@ -4165,6 +4391,9 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 		ft_held_anchor_set(&set[i].held, lock, lock_snap, node,
 			node_snap);
 		set[i].held.node_held = node_held;
+#ifdef FEATURE_FT_HOLD_TRACE
+		set[i].held.oracle_skip = false;
+#endif
 	}
 	if (ft_flip_txn_commit((struct cds_ft *) ft, acq) != URCU_TXN_STATUS_OK) {
 #ifdef FT_DEBUG_REMOVE_RETRY_CAP
@@ -4172,8 +4401,31 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 #endif
 		return -EAGAIN;		/* commit freed @acq; nothing acquired */
 	}
-	for (i = 0; i < (int) nr_taken; i++)
-		ft_hold_trace_note(taken[i], fn, line);
+	for (i = 0; i < nr; i++) {
+		if (!set[i].nf)
+			continue;
+#ifdef FEATURE_FT_HOLD_TRACE
+		if (set[i].held.oracle_skip)
+			continue;
+		/*
+		 * A covering hold whose word carries NO lock is a STALE PLAN
+		 * answer (a swept mark still listed in a frame's extras): the
+		 * dedupe took nothing and nothing will drop an entry filed
+		 * for it.  Report it as its own class -- it is a candidate
+		 * REAL exclusion gap, not ledger hygiene -- and file nothing.
+		 */
+		if (set[i].held.shared &&
+				!(CMM_LOAD_SHARED(set[i].held.lock->state) &
+					FT_STATE_LOCK)) {
+			if (ft_hold_trace_report_ok())
+				fprintf(stderr, "FT E2: dedupe onto UNLOCKED "
+					"hold at %s:%d (stale plan)\n",
+					fn, line);
+			continue;
+		}
+#endif
+		ft_hold_trace_note(set[i].held.lock, set[i].node, fn, line);
+	}
 #ifdef FT_DEBUG_REMOVE_RETRY_CAP
 	for (i = 0; i < (int) nr_taken; i++) {
 		struct ft_dbg_take_slot *sl = ft_dbg_take_slot_of(taken[i]);
