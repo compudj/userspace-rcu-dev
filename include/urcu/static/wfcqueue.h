@@ -229,8 +229,16 @@ static inline bool _cds_wfcq_enqueue(cds_wfcq_head_ptr_t head,
 #define CDS_WFCQ_WAIT_SLEEP(msec) ___cds_wfcq_wait_sleep(msec)
 #endif
 
+#ifdef CDS_FAIR_MUTEX_DBG_POLL
+/* Probe: count 10ms sync_next poll quanta (diagnosis builds only). */
+static __thread unsigned long cds_wfcq_dbg_polls __attribute__((unused));
+#endif
+
 static inline void ___cds_wfcq_wait_sleep(int msec)
 {
+#ifdef CDS_FAIR_MUTEX_DBG_POLL
+	cds_wfcq_dbg_polls++;
+#endif
 	(void) poll(NULL, 0, msec);
 }
 

@@ -5005,6 +5005,12 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 #ifdef FT_DEBUG_REMOVE_RETRY_CAP
 	unsigned int ft_remove_attempts = 0;
 	uint64_t ft_remove_t0 = ft_dbg_now_ns();
+	uint64_t ft_acc_begin = 0, ft_acc_body = 0, ft_acc_bail = 0;
+	uint64_t ft_tA, ft_tB, ft_tC;
+#ifdef CDS_FAIR_MUTEX_DBG_POLL
+	unsigned long ft_fmtx0 = cds_fmtx_dbg_polls;
+	unsigned long ft_wfcq0 = cds_wfcq_dbg_polls;
+#endif
 
 	ft_dbg_acq_dirty_lock = 0;
 	ft_dbg_acq_dirty_other = 0;
@@ -5037,11 +5043,22 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 	ft_txn_op_init(ft, &optxn);
 	for (;;) {
 		need_retry = false;
+#ifdef FT_DEBUG_REMOVE_RETRY_CAP
+		ft_tA = ft_dbg_now_ns();
+#endif
 		urcu_txn_begin(&optxn);
+#ifdef FT_DEBUG_REMOVE_RETRY_CAP
+		ft_tB = ft_dbg_now_ns();
+		ft_acc_begin += ft_tB - ft_tA;
+#endif
 #ifdef FT_DLM_LINGER
 		ft_linger_word = NULL;	/* only THIS attempt's refusal counts */
 #endif
 		s = _cds_ft_remove_locked(ft, iter, node, &need_retry, &optxn);
+#ifdef FT_DEBUG_REMOVE_RETRY_CAP
+		ft_tC = ft_dbg_now_ns();
+		ft_acc_body += ft_tC - ft_tB;
+#endif
 		if (!need_retry)
 			break;
 #ifdef FT_DEBUG_REMOVE_RETRY_CAP
@@ -5157,6 +5174,9 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 #ifdef FT_DLM_LINGER
 		ft_dlm_linger(&optxn);	/* nothing held here; see the helper */
 #endif
+#ifdef FT_DEBUG_REMOVE_RETRY_CAP
+		ft_acc_bail += ft_dbg_now_ns() - ft_tC;
+#endif
 	}
 	urcu_txn_end(&optxn);
 #ifdef FT_DEBUG_REMOVE_RETRY_CAP
@@ -5166,10 +5186,23 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 		if (caa_unlikely(wall > 1000000))
 			fprintf(stderr, "FT REMOVE SLOW: wall_us=%llu "
 				"attempts=%u dirtyLOCK=%u dirtyOTHER=%u "
-				"cabort=%u\n",
+				"cabort=%u begin_us=%llu body_us=%llu "
+				"bail_us=%llu other_us=%llu\n",
 				(unsigned long long) (wall / 1000),
 				ft_remove_attempts, ft_dbg_acq_dirty_lock,
-				ft_dbg_acq_dirty_other, ft_dbg_acq_cabort);
+				ft_dbg_acq_dirty_other, ft_dbg_acq_cabort,
+				(unsigned long long) (ft_acc_begin / 1000),
+				(unsigned long long) (ft_acc_body / 1000),
+				(unsigned long long) (ft_acc_bail / 1000),
+				(unsigned long long) ((wall - ft_acc_begin -
+					ft_acc_body - ft_acc_bail) / 1000));
+#ifdef CDS_FAIR_MUTEX_DBG_POLL
+		if (caa_unlikely(wall > 1000000))
+			fprintf(stderr, "FT REMOVE SLOW POLLS: fmtx=%lu "
+				"wfcq=%lu\n",
+				cds_fmtx_dbg_polls - ft_fmtx0,
+				cds_wfcq_dbg_polls - ft_wfcq0);
+#endif
 	}
 #endif
 	return s;
