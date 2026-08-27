@@ -51,6 +51,21 @@
 #include <urcu/list.h>
 #include <urcu/uatomic.h>
 #include "fractal-trie-internal.h"
+
+#ifdef FT_DEBUG_REMOVE_RETRY_CAP
+__thread uint64_t ft_dbg_arena_ns;
+__thread unsigned int ft_dbg_arena_waits;
+
+static void ft_dbg_arena_mutex_lock(pthread_mutex_t *m)
+{
+	uint64_t t0 = ft_dbg_gp_clock();
+
+	pthread_mutex_lock(m);
+	ft_dbg_arena_ns += ft_dbg_gp_clock() - t0;
+	ft_dbg_arena_waits++;
+}
+# define pthread_mutex_lock(m) ft_dbg_arena_mutex_lock(m)
+#endif
 #include "fractal-trie-trace.h"
 #include "urcu-utils.h"
 

@@ -2409,9 +2409,29 @@ void ft_writer_lock_scope_exit(struct cds_ft *ft)
  * peer that mutates while we wait sees a coherent trie.  On an optimistic trie
  * (or outside any writer scope) this is a plain synchronize_rcu.
  */
+#ifdef FT_DEBUG_REMOVE_RETRY_CAP
+# include <time.h>
+static __thread uint64_t ft_dbg_gp_ns;
+static __thread unsigned int ft_dbg_gp_calls;
+/* Arena-lock wait accounting; defined in fractal-trie-alloc.c (its TU). */
+extern __thread uint64_t ft_dbg_arena_ns;
+extern __thread unsigned int ft_dbg_arena_waits;
+
+static inline uint64_t ft_dbg_gp_clock(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t) ts.tv_sec * 1000000000ULL + (uint64_t) ts.tv_nsec;
+}
+#endif
+
 static inline
 void ft_writer_lock_gp_wait(struct cds_ft *ft)
 {
+#ifdef FT_DEBUG_REMOVE_RETRY_CAP
+	uint64_t ft_dbg_gp_t0 = ft_dbg_gp_clock();
+#endif
 	struct cds_ft *held = ft_wlock_held;
 	unsigned long depth = ft_wlock_depth;
 	unsigned long own = 0;
@@ -2445,6 +2465,10 @@ void ft_writer_lock_gp_wait(struct cds_ft *ft)
 		ft_wlock_depth = depth;
 		ft_excl_owner_reclaim(held, own);
 	}
+#ifdef FT_DEBUG_REMOVE_RETRY_CAP
+	ft_dbg_gp_ns += ft_dbg_gp_clock() - ft_dbg_gp_t0;
+	ft_dbg_gp_calls++;
+#endif
 }
 
 /*
@@ -2558,7 +2582,17 @@ void ft_move_gate_enter(struct cds_ft *ft)
 		 * still believe they are in fast mode, so let them finish.
 		 */
 		assert(!urcu_txn_in_fallback());	/* see gp_wait */
+#ifdef FT_DEBUG_REMOVE_RETRY_CAP
+		{
+			uint64_t t0__ = ft_dbg_gp_clock();
+
+			ft->group->flavor->update_synchronize_rcu();
+			ft_dbg_gp_ns += ft_dbg_gp_clock() - t0__;
+			ft_dbg_gp_calls++;
+		}
+#else
 		ft->group->flavor->update_synchronize_rcu();
+#endif
 		pthread_mutex_lock(&ft->move_gate_lock);
 		ft->move_gate_gp = false;
 		pthread_cond_broadcast(&ft->move_gate_cond);

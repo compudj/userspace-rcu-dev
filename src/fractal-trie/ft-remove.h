@@ -5005,6 +5005,9 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 #ifdef FT_DEBUG_REMOVE_RETRY_CAP
 	unsigned int ft_remove_attempts = 0;
 	uint64_t ft_remove_t0 = ft_dbg_now_ns();
+	struct rusage ft_remove_ru0;
+
+	getrusage(RUSAGE_THREAD, &ft_remove_ru0);
 	uint64_t ft_acc_begin = 0, ft_acc_body = 0, ft_acc_bail = 0;
 	uint64_t ft_tA, ft_tB, ft_tC;
 #ifdef CDS_FAIR_MUTEX_DBG_POLL
@@ -5015,6 +5018,10 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 	ft_dbg_acq_dirty_lock = 0;
 	ft_dbg_acq_dirty_other = 0;
 	ft_dbg_acq_cabort = 0;
+	ft_dbg_gp_ns = 0;
+	ft_dbg_gp_calls = 0;
+	ft_dbg_arena_ns = 0;
+	ft_dbg_arena_waits = 0;
 #endif
 
 	CDS_FT_SCOPED_WRITER(ft);
@@ -5196,6 +5203,21 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 				(unsigned long long) (ft_acc_bail / 1000),
 				(unsigned long long) ((wall - ft_acc_begin -
 					ft_acc_body - ft_acc_bail) / 1000));
+		if (caa_unlikely(wall > 1000000)) {
+			struct rusage ru;
+
+			getrusage(RUSAGE_THREAD, &ru);
+			fprintf(stderr, "FT REMOVE SLOW GP: gp_us=%llu "
+				"gp_calls=%u arena_us=%llu arena_waits=%u "
+				"nvcsw=%ld nivcsw=%ld\n",
+				(unsigned long long) (ft_dbg_gp_ns / 1000),
+				ft_dbg_gp_calls,
+				(unsigned long long) (ft_dbg_arena_ns / 1000),
+				ft_dbg_arena_waits,
+				(long) (ru.ru_nvcsw - ft_remove_ru0.ru_nvcsw),
+				(long) (ru.ru_nivcsw -
+					ft_remove_ru0.ru_nivcsw));
+		}
 #ifdef CDS_FAIR_MUTEX_DBG_POLL
 		if (caa_unlikely(wall > 1000000))
 			fprintf(stderr, "FT REMOVE SLOW POLLS: fmtx=%lu "
