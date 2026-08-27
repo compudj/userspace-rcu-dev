@@ -124,6 +124,74 @@ enum ft_tk_rec_class {
 	FT_TK_REC_NR,
 };
 
+/*
+ * MW_ALWAYS IS NOT ONE POPULATION, and the G4 decision reads it as if it were.
+ * The column mixes slots that can NEVER convert (a trie root has no node to
+ * lock) with slots that are unheld only because THIS op's lock-set does not
+ * reach them (a SKIP_X dual in a grandparent) -- and af22756b's per-edge
+ * @owner_held moved the second family INTO this column from MW_STRUCT, which is
+ * why the post-Phase-B re-measure shows MW_ALWAYS nearly doubling while the
+ * conversion surface falls 65%.  Part of that rise is BOOKKEEPING, and no
+ * argument settles which part: this splits it.
+ *
+ * ONE CLASS PER RECORD BRANCH, declared by the branch itself.  There is no
+ * default: the class is a required argument of ft_flip_txn_record_tag_mw in the
+ * instrumented build, so a new always-MW branch cannot be added without saying
+ * which population it joins (the same compiler-enforced discipline @owner_held
+ * uses).  The classes are:
+ *
+ *   ROOT         &ft->root.  A root lives in no node, so there is no lock word
+ *                to make a park legal -- ft_flip_txn_record_root.  NEVER
+ *                converts, whatever G4 decides.
+ *   HEAD_BACK    an external head's back channel (cell->parent / en->prev).
+ *                Neither an external node nor its cell carries a state word,
+ *                so this is that predicate's permanent false arm.  NEVER
+ *                converts (kind settled at f79438e7).
+ *   DUAL         a STRUCTURAL trie edge whose owner the op does not hold: the
+ *                SKIP_X dual landing in a grandparent the op never acquired.
+ *                THE RECLASSIFIED POPULATION -- it was MW_STRUCT (or, before
+ *                af22756b, an unsound SW park) and it is convertible in
+ *                principle, by WIDENING THE LOCK-SET, not by arming.
+ *   CELL         an ordered-cell / duplicate-chain edge (a non-structural tag).
+ *                THE G4 LANE.  Convertible only if cells grow a state word and
+ *                join lock-sets -- the separately-planned workstream.
+ *   RANK         nr_keys propagated up UNLOCKED ancestors.  Convertible only
+ *                where the whole path is covered (root-only spacing), which is
+ *                Phase E's fold, not G4's.
+ *   PARENT_WORD  a child's parent_word written by the recompaction re-parent
+ *                sweep, whose acquire takes {C,P,(GP)} and never C's children.
+ *                Same shape as DUAL: a lock-set reach question.
+ *   PSO          the same child's parent_slot_offset, third word of the same
+ *                node.  §8.3's layout split is what retires it.
+ *   STATE        the recompaction re-parent sweep's own child state word,
+ *                recorded {live -> live}.  A VALIDATE in everything but the
+ *                engine's bookkeeping, and it must stay MW: a park validates
+ *                nothing.  MARKING those children instead was implemented in
+ *                full and does not live (a contended child fails the acquire,
+ *                and escalation cannot rescue it).
+ *   GUARD        the §4.B guard on a node a forward edge INSTALLS as a VALUE,
+ *                which no lock can ever cover (the acquire takes {C,P,(GP)},
+ *                never C's children).  Same shape as STATE, different source,
+ *                and separated here because one number for both is what this
+ *                decomposition exists to stop.
+ *
+ * ☞ CELL here counts only the cell edges that ride a flip-txn's edge replay.
+ * The ones recorded straight on the engine handle are the separate cell/hlist
+ * line -- see the header comment.  Both are the same lane for G4.
+ */
+enum ft_tk_mwa_class {
+	FT_TK_MWA_ROOT = 0,
+	FT_TK_MWA_HEAD_BACK,
+	FT_TK_MWA_DUAL,
+	FT_TK_MWA_CELL,
+	FT_TK_MWA_RANK,
+	FT_TK_MWA_PARENT_WORD,
+	FT_TK_MWA_PSO,
+	FT_TK_MWA_STATE,
+	FT_TK_MWA_GUARD,
+	FT_TK_MWA_NR,
+};
+
 enum ft_tk_end_class {
 	FT_TK_OK = 0,		/* urcu_txn_commit_flavor -> OK */
 	FT_TK_ABORT,		/* a peer won an MW record or a guard */
@@ -159,6 +227,7 @@ struct ft_tk_tls {
 	unsigned long created[FT_TK_MAX_SITES];
 	unsigned long armed[FT_TK_MAX_SITES];
 	unsigned long cell_mw;	/* not site-attributed, see the header comment */
+	unsigned long mwa[FT_TK_MWA_NR];
 };
 
 static pthread_mutex_t ft_tk_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -267,6 +336,17 @@ void ft_tk_count_cell_mw(void)
 }
 
 /*
+ * Which always-MW POPULATION this record joins.  Global rather than per site:
+ * the class is a property of the record BRANCH (its producer), and every branch
+ * is reached from many txn sites.
+ */
+static inline
+void ft_tk_count_mwa(enum ft_tk_mwa_class c)
+{
+	ft_tk_tls_get()->mwa[c]++;
+}
+
+/*
  * The site object is a function-static: one per expansion of the constructor
  * macro, which is one per source line that creates a txn.
  */
@@ -317,6 +397,8 @@ void ft_tk_dump(void)
 	struct ft_tk_row *rows;
 	struct ft_tk_tls *tls;
 	unsigned long cell_mw = 0;
+	unsigned long mwa[FT_TK_MWA_NR];
+	unsigned long mwa_tot = 0;
 	struct ft_tk_row tot;
 	int nr, i, threads = 0;
 	char name[96];
@@ -325,6 +407,7 @@ void ft_tk_dump(void)
 	nr = ft_tk_nr_sites;
 	if (ft_tk_sites[FT_TK_OVERFLOW_ID])
 		nr = FT_TK_MAX_SITES;
+	memset(mwa, 0, sizeof(mwa));
 	rows = (struct ft_tk_row *) calloc(nr ? nr : 1, sizeof(*rows));
 	if (!rows) {
 		pthread_mutex_unlock(&ft_tk_lock);
@@ -337,6 +420,8 @@ void ft_tk_dump(void)
 
 		threads++;
 		cell_mw += tls->cell_mw;
+		for (i = 0; i < FT_TK_MWA_NR; i++)
+			mwa[i] += tls->mwa[i];
 		for (i = 0; i < nr; i++) {
 			if (!rows[i].site)
 				continue;
@@ -411,6 +496,49 @@ void ft_tk_dump(void)
 	fprintf(stderr,
 "    cell/hlist MW stores (recorded straight on the engine handle, not site-attributed): %lu\n",
 		cell_mw);
+
+	/*
+	 * MW_ALWAYS, SPLIT BY THE BRANCH THAT RECORDED IT.  The classes sum to
+	 * the MW_ALWAYS total above -- that equality is the table's self-check,
+	 * and it is printed rather than asserted because a mismatch means a
+	 * record branch was added without a class, which is a fact about the
+	 * table, not a reason to kill the run.
+	 */
+	{
+		static const char * const mwa_name[FT_TK_MWA_NR] = {
+			"ROOT", "HEAD_BACK", "DUAL", "CELL",
+			"RANK", "PARENT_WORD", "PSO", "STATE",
+			"GUARD",
+		};
+		static const char * const mwa_what[FT_TK_MWA_NR] = {
+			"&ft->root -- no node to lock, NEVER converts",
+			"external head back channel -- no state word, NEVER converts",
+			"structural edge, owner NOT held (SKIP_X dual) -- RECLASSIFIED by af22756b; needs a wider lock-set",
+			"ordered-cell / dup-chain edge -- THE G4 LANE",
+			"nr_keys up unlocked ancestors -- Phase E (root-only spacing)",
+			"child parent_word, child not held (reparent sweep) -- lock-set reach",
+			"child parent_slot_offset -- §8.3 layout split retires it",
+			"the reparent sweep's own child state {live->live} -- a validate; must stay MW",
+			"§4.B guard on an INSTALLED value node -- a validate; must stay MW",
+		};
+
+		for (i = 0; i < FT_TK_MWA_NR; i++)
+			mwa_tot += mwa[i];
+		fprintf(stderr,
+"\n    MW_ALWAYS split by RECORD BRANCH (the G4 input -- one number was four populations):\n");
+		for (i = 0; i < FT_TK_MWA_NR; i++)
+			fprintf(stderr,
+"      %-12s %14lu  %5.1f%%  %s\n",
+				mwa_name[i], mwa[i],
+				mwa_tot ? 100.0 * (double) mwa[i] /
+					(double) mwa_tot : 0.0,
+				mwa_what[i]);
+		fprintf(stderr,
+"      %-12s %14lu  (MW_ALWAYS column %lu%s)\n",
+			"sum", mwa_tot, tot.rec[FT_TK_MW_ALWAYS],
+			mwa_tot == tot.rec[FT_TK_MW_ALWAYS] ? "" :
+				" -- ☠ MISMATCH: an always-MW branch records no class");
+	}
 	fprintf(stderr,
 "    MW_STRUCT is the conversion surface; MW_ALWAYS + MW_LOCK + the cell/hlist line stay MW by design.\n"
 "    OWN_HELD/OWN_LEDGER/OWN_MISS split MW_STRUCT (the surface) by whether the op holds the word's owner; they sum to it:\n"
@@ -471,6 +599,17 @@ void ft_tk_dump_at_exit(void)
 #define FT_TK_COUNT_ARMED(t)		ft_tk_count_armed((t)->dbg_site)
 #define FT_TK_COUNT_CELL_MW()		ft_tk_count_cell_mw()
 /*
+ * THE CLASS ARGUMENT EXISTS ONLY IN THE INSTRUMENTED BUILD, for the reason the
+ * site parameter does (see FT_TK_SITE_PARAM): an extra always-constant argument
+ * is free at runtime and still moves the compiler's inlining decisions, and
+ * this instrument must not perturb the paths it measures.  Written as a
+ * TRAILING pair so a call site reads
+ * ft_flip_txn_record_tag_mw(t, slot, o, n, tag FT_TK_MWA(FT_TK_MWA_ROOT)).
+ */
+#define FT_TK_MWA_PARAM			, enum ft_tk_mwa_class dbg_mwa
+#define FT_TK_MWA(c)			, (c)
+#define FT_TK_COUNT_MWA(c)		ft_tk_count_mwa(c)
+/*
  * An outcome is recorded ONCE per txn: ft_flip_txn_commit's acquire-miss arm
  * reports MISS and then destroys the handle, and the destroy must not also
  * report BAILED for it.
@@ -498,6 +637,9 @@ struct ft_tk_site;	/* incomplete: the NULL the constructors take */
 #define FT_TK_COUNT_END(t, c)		do { } while (0)
 #define FT_TK_COUNT_ARMED(t)		do { } while (0)
 #define FT_TK_COUNT_CELL_MW()		do { } while (0)
+#define FT_TK_MWA_PARAM
+#define FT_TK_MWA(c)
+#define FT_TK_COUNT_MWA(c)		do { } while (0)
 
 #endif	/* FT_DEBUG_TXN_KIND */
 

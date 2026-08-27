@@ -3143,13 +3143,14 @@ void ft_flip_txn_record_tag(struct ft_flip_txn *t,
  */
 static inline
 void ft_flip_txn_record_tag_mw(struct ft_flip_txn *t, void **slot,
-		void *old_ptr, void *new_ptr, uintptr_t tag)
+		void *old_ptr, void *new_ptr, uintptr_t tag FT_TK_MWA_PARAM)
 {
 	int ret;
 
 	FT_TP(edge_record, (const void *) t->mtxn, (const void *) slot,
 		(const void *) old_ptr, (const void *) new_ptr, tag);
 	FT_TK_COUNT_REC(t, FT_TK_MW_ALWAYS);
+	FT_TK_COUNT_MWA(dbg_mwa);
 	ret = urcu_txn_store_mw(t->mtxn, slot, old_ptr, new_ptr, tag);
 	assert(!ret);
 	(void) ret;	/* reserved up front -> never fails */
@@ -3198,7 +3199,7 @@ void ft_flip_txn_record_root(struct ft_flip_txn *t, void **slot,
 		void *old_ptr, void *new_ptr)
 {
 	ft_flip_txn_record_tag_mw(t, slot, old_ptr, new_ptr,
-		FT_FLIP_PROXY_TAG);
+		FT_FLIP_PROXY_TAG FT_TK_MWA(FT_TK_MWA_ROOT));
 }
 
 /*
@@ -3230,7 +3231,7 @@ void ft_flip_txn_record_head_back_edge(struct ft_flip_txn *t, void **slot,
 		void *old_ptr, void *new_ptr)
 {
 	ft_flip_txn_record_tag_mw(t, slot, old_ptr, new_ptr,
-		FT_FLIP_PROXY_TAG);
+		FT_FLIP_PROXY_TAG FT_TK_MWA(FT_TK_MWA_HEAD_BACK));
 }
 
 /*
@@ -3558,7 +3559,8 @@ void ft_flip_txn_record_pub_rec(struct ft_flip_txn *t,
 			ft_flip_txn_record_tag_mw(t, (void **) rec->slot[i],
 				(void *) rec->old_val[i],
 				(void *) rec->new_val[i],
-				FT_FLIP_PROXY_TAG);
+				FT_FLIP_PROXY_TAG
+				FT_TK_MWA(FT_TK_MWA_DUAL));
 		else
 			ft_flip_txn_record_reserved(t, rec->owner[i],
 				(void **) rec->slot[i],
@@ -3625,7 +3627,8 @@ void ft_flip_txn_record_state_kind_ctx(struct ft_flip_txn *t,
 			old_ptr, new_ptr, FT_STATE_PROXY);
 	else
 		ft_flip_txn_record_tag_mw(t, (void **) &meta->state,
-			old_ptr, new_ptr, FT_STATE_PROXY);
+			old_ptr, new_ptr, FT_STATE_PROXY
+			FT_TK_MWA(FT_TK_MWA_STATE));
 }
 
 static inline
@@ -6083,9 +6086,19 @@ enum urcu_txn_status ft_ord_cell_flip_into(struct cds_ft *ft,
 				(void *) edges[i].old_target,
 				(void *) edges[i].new_target, tag);
 		else
+			/*
+			 * TWO POPULATIONS IN ONE BRANCH: a non-structural tag is
+			 * a CELL edge, a structural one that got here is the
+			 * unheld SKIP_X DUAL.  Split for the counter rather than
+			 * by splitting the branch -- the class argument does not
+			 * exist outside the instrumented build, so this costs
+			 * that build nothing at all.
+			 */
 			ft_flip_txn_record_tag_mw(t, (void **) edges[i].slot,
 				(void *) edges[i].old_target,
-				(void *) edges[i].new_target, tag);
+				(void *) edges[i].new_target, tag
+				FT_TK_MWA(tag == FT_FLIP_PROXY_TAG ?
+					FT_TK_MWA_DUAL : FT_TK_MWA_CELL));
 	}
 	return ft_flip_txn_commit(ft, t);
 }
@@ -6147,8 +6160,16 @@ void ft_flip_txn_guard_installed_child(struct cds_ft *ft, struct ft_flip_txn *t,
 	old_state = (uintptr_t) urcu_txn_load(t->mtxn,
 		(void **) &meta->state, FT_STATE_PROXY);
 	live_state = old_state & ~(FT_STATE_TOMBSTONE | FT_STATE_LOCK);
-	ft_flip_txn_record_state_mw(t, meta,
-		(void *) live_state, (void *) live_state);
+	/*
+	 * Spelled as the record_tag_mw the record_state_mw macro expands to,
+	 * only so this guard can name its own always-MW CLASS: it and the
+	 * recompaction sweep's child validate are the same SHAPE ({live ->
+	 * live} on a word the op does not hold) with different sizes, and one
+	 * number for both is what the C.1 decomposition exists to stop.
+	 */
+	ft_flip_txn_record_tag_mw(t, (void **) &meta->state,
+		(void *) live_state, (void *) live_state, FT_STATE_PROXY
+		FT_TK_MWA(FT_TK_MWA_GUARD));
 }
 
 static inline
@@ -6186,7 +6207,8 @@ void ft_ord_cell_record_into_ft(struct cds_ft *ft, struct ft_flip_txn *t,
 					(void **) edges[i].slot,
 					(void *) edges[i].old_target,
 					(void *) edges[i].new_target,
-					ft_edge_tag(&edges[i]));
+					ft_edge_tag(&edges[i])
+					FT_TK_MWA(FT_TK_MWA_DUAL));
 			else
 				ft_flip_txn_record_tag(t, edges[i].owner,
 					(void **) edges[i].slot,
@@ -6195,7 +6217,8 @@ void ft_ord_cell_record_into_ft(struct cds_ft *ft, struct ft_flip_txn *t,
 		} else
 			ft_flip_txn_record_tag_mw(t, (void **) edges[i].slot,
 				(void *) edges[i].old_target,
-				(void *) edges[i].new_target, tag);
+				(void *) edges[i].new_target, tag
+				FT_TK_MWA(FT_TK_MWA_CELL));
 	}
 }
 
@@ -7864,7 +7887,8 @@ void ft_flip_txn_record_count_parent(struct cds_ft *ft, struct ft_flip_txn *t,
 		 */
 		ft_flip_txn_record_tag_mw(t, (void **) &m->nr_keys,
 			(void *) old_raw, (void *) new_raw,
-			FT_NR_KEYS_PROXY_TAG);
+			FT_NR_KEYS_PROXY_TAG
+			FT_TK_MWA(FT_TK_MWA_RANK));
 		cur = ft_parent_node(m->parent_word);
 	}
 }
@@ -9070,7 +9094,8 @@ void ft_flip_txn_record_parent_word(const struct cds_ft *ft,
 			(void **) &meta->parent_word, old_pw, new_pw);
 	else
 		ft_flip_txn_record_tag_mw(txn, (void **) &meta->parent_word,
-			old_pw, new_pw, FT_FLIP_PROXY_TAG);
+			old_pw, new_pw, FT_FLIP_PROXY_TAG
+			FT_TK_MWA(FT_TK_MWA_PARENT_WORD));
 }
 
 /*
@@ -9423,7 +9448,8 @@ void ft_reparent_record_meta(struct cds_ft *ft, struct ft_flip_txn *txn,
 			ft_flip_txn_record_tag_mw(txn,
 				(void **) &meta->parent_slot_offset,
 				(void *) old_pso, (void *) new_pso,
-				FT_STATE_PROXY);
+				FT_STATE_PROXY
+				FT_TK_MWA(FT_TK_MWA_PSO));
 	}
 }
 
