@@ -1780,9 +1780,18 @@ certification, then the API gate lift (`ft-lifecycle.h:369`):
    will not settle it; it needs a different instrument or a deterministic
    trigger.  The earlier "pre-existing, safe to land over" attribution
    stays REFUTED.
-   The gate's holdtrace config runs without its imw legs until B closes;
-   re-adding them is E.2's completion criterion, and E.5 cannot lift
-   the coarse spacings before that.
+   ☑☑ **E.2's COMPLETION CRITERION IS MET (2026-08-28)**: the gate's
+   holdtrace config carries its `imw` legs again, at ALL THREE spacings --
+   `ft_inv mw` 119/119 with zero aborts at per-node, exponential AND
+   root-only.  Those legs were removed because the owner-stamp oracle
+   failed by violation on findings A and B at the coarse spacings; both
+   are now closed, and the oracle runs armed inside the matrix rather than
+   being verified by hand.  ★ The full gate is otherwise PER-LEG IDENTICAL
+   to the finding-A baseline (`gate-fa.log`, 178 legs), so the scrub, the
+   growable registry and the freeze-lane closure regress nothing -- read
+   the per-leg diff, never the verdict, which is deliberately FAIL on this
+   branch for the three 9.1(B) rekey tests.
+   ⇒ E.5's remaining blocker on the coarse spacings is no longer E.2.
 3. ☑ FIRST-PASS CLEAN (2026-08-27, unblocked by E.0): both suites at BOTH
    exponential and root-only under `-DDEBUG_RCU -DFEATURE_FT_HOLD_TRACE`:
    zero SELF-COLLISION, zero asserts, 315+3/119 everywhere.  The zero is

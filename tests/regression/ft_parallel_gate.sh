@@ -172,13 +172,15 @@ ALL_CONFIGS=(
 	# aborts (ft_hold_trace_refused), so a red here is a leg abort, not a
 	# grep.  DEBUG_RCU rides along so the engine's own asserts stay armed at
 	# the same spacings this config certifies.
-	# ☠ imw is OUT of this config FOR NOW: the E.2 owner-stamp oracle it
-	# arms FAILS BY VIOLATION at the dev-only coarse spacings on two REAL
-	# findings (stale-plan dedupes onto unlocked words; mark-vs-anchor
-	# dual coverage at root-only) -- doc 7 E.2.  MW per-node was verified
-	# green manually; re-adding imw here is the completion criterion for
-	# those findings.
-	"holdtrace|-DDEBUG_RCU -DFEATURE_FT_HOLD_TRACE -DFEATURE_FT_ANCHOR_VALIDATE|u ion ioff|per-node exponential root-only"
+	# ★ imw AT ALL THREE SPACINGS IS THE POINT OF THIS CONFIG.  The E.2
+	# owner-stamp oracle only has two writers to arbitrate under MW, and
+	# the exclusion defects it exists for live at the COARSE spacings: a
+	# concurrent-writer leg at per-node alone cannot reach them, because
+	# per-node anchors every member on itself and no two members of one op
+	# ever collapse onto one word.  Its abort IS the failure signal -- a
+	# violation kills the leg rather than printing a line a grep must
+	# find.
+	"holdtrace|-DDEBUG_RCU -DFEATURE_FT_HOLD_TRACE -DFEATURE_FT_ANCHOR_VALIDATE|u ion ioff imw|per-node exponential root-only"
 	# ★ THE CONFIG THAT ACTUALLY CATCHES THE RAW-READ CLASS.
 	#
 	# txndbg above arms the same engine assert and NEVER FIRES IT: with
