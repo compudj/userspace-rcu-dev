@@ -564,12 +564,24 @@ void ft_detach_freeze_one(struct ft_flip_txn *txn,
 		struct ft_held_anchor *h, struct cds_ft_metadata *m)
 {
 	if (!h->shared) {
+		unsigned int slot = 0;
+		bool owned = false;
+		bool retires;
+
 		/* Register BEFORE recording: the record asks who owns the word. */
 		if (h->lock != m) {
-			ft_flip_txn_lock_register(txn, h->lock, h->lock_snap);
-			h->txn_owned = true;
+			slot = ft_flip_txn_lock_own(txn, h);
+			owned = true;
 		}
-		ft_flip_txn_record_anchor_release(txn, h, m);
+		/*
+		 * The record's own early-out is the ONLY place that knows
+		 * whether this word ends RELEASED or RETIRED, and the terminal
+		 * scrub needs that answer (it cannot re-derive it from the word
+		 * afterwards without racing a peer's retire).
+		 */
+		retires = ft_flip_txn_record_anchor_release(txn, h, m);
+		if (owned && retires)
+			txn->locks[slot].tombstone_terminal = true;
 	}
 	ft_flip_txn_record_retire_anchored(txn, ctx, h, m);
 }

@@ -1028,9 +1028,7 @@ void ft_rekey_marks_to_txn(struct ft_flip_txn *txn,
 	for (i = 0; i < nr_marks; i++) {
 		if (marks[i].shared || marks[i].txn_owned)
 			continue;
-		ft_flip_txn_lock_register(txn, marks[i].lock,
-			marks[i].lock_snap);
-		marks[i].txn_owned = true;
+		(void) ft_flip_txn_lock_own(txn, &marks[i]);
 	}
 }
 
@@ -2134,6 +2132,11 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 				glue.publish_gp_holder = gph.lock;
 				glue.publish_gp_snap = gph.lock_snap;
 				/*
+				 * A FRESH hand-off answers again -- see
+				 * ft_glue_take_publish_parent.
+				 */
+				glue.publish_gp_scrubbed = false;
+				/*
 				 * Coarsening collapses GP onto the publish
 				 * parent's word routinely (they are adjacent
 				 * levels): the fence is in force either way, but
@@ -2172,8 +2175,19 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 				 * release's clean pending value.
 				 */
 				if (!gph.shared) {
-					ft_flip_txn_lock_register(txn, gph.lock,
-						gph.lock_snap);
+					/*
+					 * OWN it, not merely register it: the
+					 * FIELDS stay set, so without a linked
+					 * silencer this fence keeps answering
+					 * holds() past the txn's terminal --
+					 * which is where the release below is
+					 * consumed and the word comes back LIVE
+					 * (finding B).
+					 */
+					(void) ft_flip_txn_lock_own_silenced(
+						txn, gph.lock, gph.lock_snap,
+						&glue.publish_gp_scrubbed);
+					FT_GLUE_OWN_COUNT(1);
 					ft_flip_txn_record_anchor_release_held(
 						txn, gph.lock);
 					glue.publish_gp_txn_owned = true;

@@ -1020,6 +1020,58 @@ struct ft_flip_txn {
 	struct ft_flip_txn_lock {
 		struct cds_ft_metadata *meta;
 		uintptr_t snap;
+		/*
+		 * THE SILENCER of the entry that HANDED this word's release to
+		 * the commit, or NULL for a word the txn registered on its own
+		 * account.  Setting it true makes that entry stop answering
+		 * holds(); it is the entry's OWN "no longer a holds() source"
+		 * flag, so the sources keep one meaning per field:
+		 *
+		 *   frame extras   @ft_held_anchor's  @shared
+		 *   glue fences    @publish_parent_scrubbed / @publish_gp_scrubbed
+		 *
+		 * A POINTER rather than the entry, because those sources share
+		 * no type and the glue ones are not reachable from an
+		 * ft_held_anchor.
+		 *
+		 * ☠ THE GLUE FREEZE LANE IS DELIBERATELY ABSENT.  Its flag would
+		 * live in the glue's MALLOC'D free list, and several bails free
+		 * that array (ft_glue_abort -> ft_glue_fini) BEFORE the txn's
+		 * terminal runs -- so linking it writes through freed heap.  See
+		 * ft_glue_tombstone_free_list for the full path and the cost of
+		 * leaving it open (measured: none).
+		 *
+		 * The entry keeps answering while unsilenced, and the op's
+		 * exclusion ends at THIS txn's terminal -- so the terminal is
+		 * the only place that can scrub it, and the caller's sweeps
+		 * deliberately skip a txn-owned entry.  Without the link the
+		 * entry outlives the hold and the op's NEXT acquire dedupes on a
+		 * word a peer has since taken for real (finding B, measured).
+		 *
+		 * ☠ LIFETIME: every source outlives the txn's terminal by
+		 * construction -- the frame extras are the OP's held set, and a
+		 * glue owns its txn, so ft_glue_fini (which frees the arrays the
+		 * freeze entries live in) runs strictly after the commit or
+		 * ft_flip_txn_destroy.
+		 */
+		bool *src_shared;
+		/*
+		 * @src's terminal RETIRES this word rather than releasing it.
+		 * Then the entry must KEEP answering: a tombstoned word can
+		 * never be taken by anyone again, so no exclusion is at stake,
+		 * and dedupe-on-dead is the designed flow -- scrubbing it turns
+		 * dedupes into takes of a dead word, which hard-refuse forever.
+		 *
+		 * ☠ RECORDED AT THE RECORD, NOT RE-DERIVED AT THE TERMINAL.  The
+		 * fact is ft_flip_txn_record_anchor_release's own early-out, and
+		 * it is knowable ONLY there: @txn_owned alone does not carry it
+		 * (the register is unconditional while the record declines when
+		 * this same commit already tombstones the word), and a state
+		 * load at the terminal RACES -- by then the word is given back
+		 * and a peer may have retired it, which would read as our own
+		 * tombstone and skip a scrub that is owed.
+		 */
+		bool tombstone_terminal;
 	} locks[FT_FLIP_TXN_MAX_LOCKS];
 	unsigned int nr_locks;
 	/*
@@ -1927,6 +1979,30 @@ static __thread unsigned int ft_hold_trace_n;
 #define FT_HOLD_TRACE_REPORT_MAX	200
 static __thread unsigned int ft_hold_trace_reports;
 
+/*
+ * ☠ THE CLASS DETECTORS GET THEIR OWN BUDGET, and this is not a nicety.  The
+ * cap above is per-thread and SHARED with every report in the feature -- and
+ * the routine FT REFUSED contention line is by far the loudest: measured, one
+ * root-only MW ft_inv run prints ~52,000 of them and silences ~270 threads.
+ * Past that point "FT EXTRAS STALE: 0" and "FT GLUE STALE: 0" are not
+ * observations, they are exhausted budgets, and a verification that reads them
+ * as evidence is reading noise.  FT REFUSED is the NOISE; these two are the
+ * MEASUREMENT, so they may not share a purse with it.
+ */
+#define FT_STALE_REPORT_MAX	200
+static __thread unsigned int ft_stale_reports;
+
+static inline
+bool ft_stale_report_ok(void)
+{
+	if (ft_stale_reports >= FT_STALE_REPORT_MAX)
+		return false;
+	if (++ft_stale_reports == FT_STALE_REPORT_MAX)
+		fprintf(stderr, "FT STALE DETECTOR: report cap reached, "
+			"silencing -- later zeros are NOT evidence\n");
+	return true;
+}
+
 static inline
 bool ft_hold_trace_report_ok(void)
 {
@@ -2520,6 +2596,8 @@ void ft_flip_txn_lock_register(struct ft_flip_txn *t,
 #endif
 	t->locks[t->nr_locks].meta = meta;
 	t->locks[t->nr_locks].snap = snap;
+	t->locks[t->nr_locks].src_shared = NULL;
+	t->locks[t->nr_locks].tombstone_terminal = false;
 	t->nr_locks++;
 #ifdef FT_RED_OWNER_CLAIM_ON_LOCK
 	/*
@@ -2539,6 +2617,79 @@ void ft_flip_txn_lock_register(struct ft_flip_txn *t,
 	ft_flip_txn_claim_per_op(t);
 #endif
 }
+
+/*
+ * Hand @lock over to @t: register it AND link the handing-over entry's
+ * silencer, so the commit's terminal can scrub an entry that would otherwise
+ * outlive the hold.  One owner per mark, and from here it is the txn (see
+ * @src_shared).
+ *
+ * ft_flip_txn_lock_register never dedupes, so the slot just filed is the last
+ * one; the caller stamps @tombstone_terminal onto it from the record's answer.
+ */
+static inline
+unsigned int ft_flip_txn_lock_own_silenced(struct ft_flip_txn *t,
+		struct cds_ft_metadata *lock, uintptr_t snap, bool *silencer)
+{
+	ft_flip_txn_lock_register(t, lock, snap);
+	t->locks[t->nr_locks - 1].src_shared = silencer;
+	return t->nr_locks - 1;
+}
+
+/* The frame-extras form: @h's own @shared is what stops it answering. */
+static inline
+unsigned int ft_flip_txn_lock_own(struct ft_flip_txn *t,
+		struct ft_held_anchor *h)
+{
+	unsigned int slot = ft_flip_txn_lock_own_silenced(t, h->lock,
+			h->lock_snap, &h->shared);
+
+	h->txn_owned = true;
+	return slot;
+}
+
+/*
+ * @lock's terminal in @t RETIRES the word: the entry that handed it over must
+ * keep answering holds() (dedupe-on-dead).  Keyed by word rather than by slot,
+ * for the release paths that do not carry the index.
+ */
+static inline
+void ft_flip_txn_lock_mark_retiring(struct ft_flip_txn *t,
+		const struct cds_ft_metadata *lock)
+{
+	unsigned int i;
+
+	for (i = 0; i < t->nr_locks; i++)
+		if (t->locks[i].meta == lock)
+			t->locks[i].tombstone_terminal = true;
+}
+
+/*
+ * THE TERMINAL SCRUB (finding B).  The op's exclusion on every handed-over word
+ * ends HERE, so every linked entry must stop answering holds() -- except one
+ * whose terminal RETIRED its word, which keeps answering dedupe-on-dead.
+ *
+ * @released_all: the words were cleared rather than settled through their
+ * recorded terminals (abort / destroy), so nothing was retired and every entry
+ * is scrubbed.
+ */
+static inline
+void ft_flip_txn_scrub_owned(struct ft_flip_txn *t, bool released_all)
+{
+#ifndef FT_SCRUB_OFF
+	unsigned int i;
+
+	for (i = 0; i < t->nr_locks; i++)
+		if (t->locks[i].src_shared &&
+				(released_all ||
+					!t->locks[i].tombstone_terminal))
+			*t->locks[i].src_shared = true;
+#else
+	(void) t;
+	(void) released_all;
+#endif
+}
+
 
 /* Is @m in this op's held set (the DLM lock registry)? */
 static inline
@@ -2718,6 +2869,30 @@ bool ft_held_set_snap(const struct ft_held_set *h,
 			}
 	for (i = 0; i < h->nr_extra; i++)
 		if (h->extra[i].lock == meta && !h->extra[i].shared) {
+#ifdef FEATURE_FT_HOLD_TRACE
+			/*
+			 * THE CLASS DETECTOR (finding B), reporting only.  A
+			 * TXN-OWNED entry answers holds() until that txn's
+			 * terminal scrubs it -- and until then its word is
+			 * unclaimable (LOCK, or PROXY mid-flip, or TOMBSTONE
+			 * once retired).  A CLEAN word here means the entry
+			 * outlived the hold: the op is about to dedupe on a
+			 * word a peer may already own.  Named by SLOT rather
+			 * than by site, so a hand-off whose terminal never
+			 * scrubs shows up wherever it lives.
+			 */
+			if (h->extra[i].txn_owned &&
+					!(CMM_LOAD_SHARED(meta->state) &
+						(FT_STATE_LOCK | FT_STATE_PROXY |
+						 FT_STATE_TOMBSTONE)) &&
+					ft_stale_report_ok())
+				fprintf(stderr, "FT EXTRAS STALE: txn-owned "
+					"entry answers for CLEAN word %p "
+					"(state %lx) -- unscrubbed hand-off\n",
+					(const void *) meta,
+					(unsigned long) CMM_LOAD_SHARED(
+						meta->state));
+#endif
 			*snap = h->extra[i].lock_snap;
 			return true;
 		}
@@ -3228,6 +3403,12 @@ void ft_flip_txn_lock_release_all(struct ft_flip_txn *t)
 {
 	unsigned int i;
 
+	/*
+	 * Scrub BEFORE the clears, for the same reason the ledger drops before
+	 * its commit: once a word is clean a peer takes it immediately, and an
+	 * entry still answering then is finding B.
+	 */
+	ft_flip_txn_scrub_owned(t, true);
 	for (i = 0; i < t->nr_locks; i++)
 		ft_meta_lock_release(t->locks[i].meta);
 	t->nr_locks = 0;
@@ -3380,6 +3561,14 @@ enum urcu_txn_status ft_flip_txn_commit(struct cds_ft *ft,
 		 * commit machinery's own callbacks filed inside the
 		 * drop->commit window (a dedupe onto this txn's anchor).
 		 */
+		/*
+		 * And the FRAME-EXTRAS entries that handed those words over
+		 * stop answering holds() here -- the release terminal has just
+		 * given each word back, LIVE and re-lockable, and the op keeps
+		 * acquiring below (finding B).  Retiring terminals are kept:
+		 * dedupe-on-dead.
+		 */
+		ft_flip_txn_scrub_owned(t, false);
 		for (bs_i = 0; bs_i < t->nr_locks; bs_i++)
 			ft_hold_trace_drop_tolerant(t->locks[bs_i].meta);
 	}
@@ -5520,6 +5709,17 @@ uintptr_t ft_flip_txn_record_tombstone(struct ft_flip_txn *t,
 	ft_flip_txn_record_state(t, meta,
 			(void *) old, (void *) (old | FT_STATE_TOMBSTONE));
 	/*
+	 * ☠ THE WORD ENDS DEAD, WHICHEVER SITE RECORDED THE EARLIER EDGE.  This
+	 * retire CHAINS onto a release already recorded on @meta in this same txn
+	 * -- the RYW load above IS that chaining -- and that release's slot was
+	 * filed as a RELEASE terminal.  Left unmarked, the terminal scrub silences
+	 * the entry that handed the word over, which is the carve-out INVERTED: a
+	 * scrubbed entry on a TOMBSTONED word turns the op's next dedupe into a
+	 * TAKE of a dead word, and the acquire hard-refuses a tombstone forever.
+	 * Keyed by word, so it finds the slot whichever site filed it.
+	 */
+	ft_flip_txn_lock_mark_retiring(t, meta);
+	/*
 	 * Return the RYW old so a caller retiring a set of nodes (the glue
 	 * free-list) can tell whether THIS txn performs the LIVE->TOMBSTONE
 	 * transition (old clean) or merely no-op-upgrades a word a peer already
@@ -5748,10 +5948,21 @@ void ft_flip_txn_record_anchor_release_held(struct ft_flip_txn *t,
 	 * which clears the word regardless of the ledger.
 	 */
 	ft_hold_trace_drop(lock);
-	if (caa_unlikely(pending & FT_STATE_TOMBSTONE))
+	if (caa_unlikely(pending & FT_STATE_TOMBSTONE)) {
+		/*
+		 * The word ends DEAD, so the handing-over entry must KEEP
+		 * answering: nobody can take it again, and scrubbing turns the
+		 * op's own dedupes into takes of a dead word, which hard-refuse
+		 * forever.  Recorded HERE because this early-out is the only
+		 * place that knows it (see @tombstone_terminal).
+		 */
+		ft_flip_txn_lock_mark_retiring(t, lock);
 		return;			/* the op retires the anchor itself */
+	}
 	if (!(pending & FT_STATE_LOCK))
-		return;			/* a node terminal already settled it */
+		return;			/* a node terminal already settled it:
+					 * our LOCK is gone, so the entry is
+					 * scrubbed like any released word */
 	ft_flip_txn_record_state(t, lock,
 			(void *) pending,
 			(void *) (pending & ~FT_STATE_LOCK));
@@ -5796,7 +6007,7 @@ void ft_flip_txn_record_anchor_release_held(struct ft_flip_txn *t,
  * Costs ONE MORE reserved edge than the fused form; @t must have budgeted it.
  */
 static inline
-void ft_flip_txn_record_anchor_release(struct ft_flip_txn *t,
+bool ft_flip_txn_record_anchor_release(struct ft_flip_txn *t,
 		const struct ft_held_anchor *h, const struct cds_ft_metadata *node)
 {
 	uintptr_t pending;
@@ -5809,12 +6020,13 @@ void ft_flip_txn_record_anchor_release(struct ft_flip_txn *t,
 	 */
 	assert(!h->shared);
 	if (h->lock == node)
-		return;
+		return true;		/* fused: @node's own retire is the terminal */
 	pending = (uintptr_t) urcu_txn_load(t->mtxn, (void **) &h->lock->state,
 			FT_STATE_PROXY);
 	if (caa_unlikely(pending & FT_STATE_TOMBSTONE))
-		return;			/* the op retires the anchor itself */
+		return true;		/* the op retires the anchor itself */
 	ft_flip_txn_record_release_lock(t, h->lock, h->lock_snap);
+	return false;			/* {LOCK|s -> s}: the word comes back LIVE */
 }
 
 /*
@@ -5850,6 +6062,13 @@ void ft_flip_txn_record_retire_anchored_arms(struct ft_flip_txn *t,
 	 * does to the next op that refuses this word.  A no-op when @node was
 	 * never in the ledger (the anchored case, where its own word is unlocked).
 	 */
+	/*
+	 * EVERY arm below ends in a TOMBSTONE on @node, and any of them may chain
+	 * onto a release this txn already recorded on that word -- so the slot's
+	 * terminal is a RETIRE, marked ONCE here rather than in four arms.  See
+	 * ft_flip_txn_record_tombstone for what an unmarked retire costs.
+	 */
+	ft_flip_txn_lock_mark_retiring(t, node);
 	if (h->lock == node || h->node_held) {
 		/*
 		 * The op holds @node's OWN word, whether because the member
@@ -9230,6 +9449,21 @@ struct ft_glue {
 	 */
 	bool publish_parent_txn_owned;
 	/*
+	 * THE TERMINAL SCRUB'S SILENCER (finding B).  Set by
+	 * ft_flip_txn_scrub_owned at the txn's terminal, where the release this
+	 * fence handed over is consumed and the word comes back LIVE and
+	 * re-lockable: from that instant the fence is no longer a holds()
+	 * source, and an op that keeps acquiring dedupes onto a word a peer may
+	 * already own.
+	 *
+	 * A flag rather than NULLing @publish_parent_holder, which every glue
+	 * predicate and both drains read for other reasons.  Ordinarily
+	 * ft_glue_txn_commit_edges has NULLed the field BEFORE the commit and
+	 * this changes nothing; it covers the paths that reach a terminal
+	 * without passing there (a bail after the take, an aborting commit).
+	 */
+	bool publish_parent_scrubbed;
+	/*
 	 * THE SKIP_X DUAL'S OWNER (§9.3, one level up).  A publish into a
 	 * COMPRESSED @publish_parent is not one store: _ft_publish_to_parent also
 	 * re-encodes the SKIP_X pointer that lets a candidate reader bypass the
@@ -9267,6 +9501,21 @@ struct ft_glue {
 	 * one of them.
 	 */
 	bool publish_gp_txn_owned;
+	/*
+	 * THE TERMINAL SCRUB'S SILENCER (finding B).  Set by
+	 * ft_flip_txn_scrub_owned at the txn's terminal, where the release this
+	 * fence handed over is consumed and the word comes back LIVE and
+	 * re-lockable: from that instant the fence is no longer a holds()
+	 * source, and an op that keeps acquiring dedupes onto a word a peer may
+	 * already own.
+	 *
+	 * A flag rather than NULLing @publish_gp_holder, which every glue
+	 * predicate and both drains read for other reasons.  Ordinarily
+	 * ft_glue_txn_commit_edges has NULLed the field BEFORE the commit and
+	 * this changes nothing; it covers the paths that reach a terminal
+	 * without passing there (a bail after the take, an aborting commit).
+	 */
+	bool publish_gp_scrubbed;
 	/*
 	 * MW LOCK_FINE drop, split-compressed graft: the node lock held on
 	 * the compressed divergence node @cn (== d->nf) that this GLUE build
@@ -9482,10 +9731,12 @@ void ft_glue_init(struct ft_glue *g)
 	g->publish_parent_shared = false;
 	g->publish_parent_snap = 0;
 	g->publish_parent_txn_owned = false;
+	g->publish_parent_scrubbed = false;
 	g->publish_gp_holder = NULL;
 	g->publish_gp_shared = false;
 	g->publish_gp_snap = 0;
 	g->publish_gp_txn_owned = false;
+	g->publish_gp_scrubbed = false;
 	g->split_cn_holder = NULL;
 	g->split_cn_shared = false;
 	g->split_cn_node = NULL;
@@ -9501,6 +9752,87 @@ void ft_glue_init(struct ft_glue *g)
 	g->record_only = false;
 	g->count_delta = 0;
 }
+
+#ifdef FEATURE_FT_HOLD_TRACE
+/*
+ * ☠ AND ITS REACH COUNTER, because a SILENT DETECTOR IS NOT COVERAGE.  The
+ * check above can only speak from inside these three arms with a txn-owned
+ * entry; if the suite never drives one, its zero says nothing about the class
+ * and everything about the workload.  So count the CONSULTATIONS -- what the
+ * detector was ASKED -- separately from the hits, and report both.
+ *
+ * Printed every FT_GLUE_REACH_TICK consultations rather than only at exit: the
+ * control build (-DFT_SCRUB_OFF) is expected to ABORT, and abort() runs no
+ * atexit handler, so an exit-only report loses exactly the runs that matter.
+ */
+#define FT_GLUE_REACH_TICK	1024
+static unsigned long ft_glue_reach[3];
+/*
+ * And the HAND-OFFS themselves, counted at the take.  Two different zeros hide
+ * behind one silent detector: an arm CONSULTED and never wrong, versus a
+ * hand-off the workload never performs at all.  Only the pair distinguishes
+ * "measured clean" from "unexercised", and only the first is evidence.
+ */
+static unsigned long ft_glue_own[3];
+/*
+ * And the SAVES: a consultation whose arm matched on identity and was answered
+ * "not held" ONLY because the terminal scrub had silenced it.  Without this the
+ * arm build cannot speak at all -- its zero consultations are indistinguishable
+ * between "never asked" and "asked, and the scrub did its job" -- and the
+ * control build cannot answer for the one spacing that matters, since a
+ * scrub-OFF run at root-only ABORTS before the freeze-heavy tests.
+ */
+static unsigned long ft_glue_saved[3];
+static const char * const ft_glue_reach_name[3] = {
+	"publish_parent", "publish_gp", "freelist_holder",
+};
+
+static
+void ft_glue_reach_report(void)
+{
+	fprintf(stderr, "FT GLUE REACH: hand-offs/consultations/scrub-saves "
+		"publish_parent=%lu/%lu/%lu publish_gp=%lu/%lu/%lu "
+		"freelist_holder=%lu/%lu/%lu\n",
+		ft_glue_own[0], ft_glue_reach[0], ft_glue_saved[0],
+		ft_glue_own[1], ft_glue_reach[1], ft_glue_saved[1],
+		ft_glue_own[2], ft_glue_reach[2], ft_glue_saved[2]);
+	fflush(stderr);
+}
+
+static void ft_glue_reach_fini(void) __attribute__((destructor));
+static void ft_glue_reach_fini(void)
+{
+	unsigned int i;
+
+	for (i = 0; i < 3; i++)
+		if (ft_glue_own[i] || ft_glue_reach[i] || ft_glue_saved[i]) {
+			ft_glue_reach_report();
+			return;
+		}
+}
+
+/* The scrub silenced an otherwise-matching consultation: see ft_glue_saved. */
+static inline
+void ft_glue_saved_count(unsigned int arm, bool txn_owned)
+{
+	if (txn_owned)
+		uatomic_inc(&ft_glue_saved[arm]);
+}
+
+/* @arm handed a word to the txn: see ft_glue_own. */
+static inline
+void ft_glue_own_count(unsigned int arm)
+{
+	if (!(uatomic_add_return(&ft_glue_own[arm], 1) % FT_GLUE_REACH_TICK))
+		ft_glue_reach_report();
+}
+
+# define FT_GLUE_OWN_COUNT(arm) ft_glue_own_count(arm)
+# define FT_GLUE_SAVED_COUNT(arm, o) ft_glue_saved_count(arm, o)
+#else
+# define FT_GLUE_OWN_COUNT(arm) do { } while (0)
+# define FT_GLUE_SAVED_COUNT(arm, o) do { } while (0)
+#endif
 
 /*
  * Take the glue's PUBLISH PARENT fence AND hand it to @g->txn in the same
@@ -9533,9 +9865,25 @@ void ft_glue_take_publish_parent(struct ft_glue *g,
 	g->publish_parent_holder = holder;
 	g->publish_parent_snap = snap;
 	g->publish_parent_shared = shared;
+	/*
+	 * A FRESH hand-off, so it answers again: a glue that already carried a
+	 * fence through a txn terminal has @publish_parent_scrubbed standing,
+	 * and inheriting it here would silence a fence the op genuinely holds.
+	 */
+	g->publish_parent_scrubbed = false;
 	if (shared || !holder || !g->txn)
 		return;
-	ft_flip_txn_lock_register(g->txn, holder, snap);
+	/*
+	 * OWN it, do not merely register it: the release recorded on the next
+	 * line is consumed at the txn's terminal, and the FIELDS stay set (see
+	 * above) -- so without a linked silencer this fence keeps answering
+	 * holds() for a word that came back LIVE (finding B).  Ordinarily
+	 * ft_glue_txn_commit_edges NULLs the field first and the scrub is a
+	 * no-op; this covers the paths that reach a terminal without it.
+	 */
+	(void) ft_flip_txn_lock_own_silenced(g->txn, holder, snap,
+		&g->publish_parent_scrubbed);
+	FT_GLUE_OWN_COUNT(0);
 	ft_flip_txn_record_anchor_release_held(g->txn, holder);
 	g->publish_parent_txn_owned = true;
 }
@@ -10668,6 +11016,44 @@ struct cds_ft_metadata *ft_glue_reparent_park_meta(struct cds_ft *ft,
 #else
 # define FT_GLUE_ARM(name) do { } while (0)
 #endif
+
+/*
+ * THE CLASS DETECTOR (finding B) on the GLUE lane, reporting only -- the
+ * ft_held_set_snap one, asked of the sources that answer from a glue instead of
+ * from the frame extras.  A hand-off whose word is in the txn registry keeps
+ * that word unclaimable (LOCK, or PROXY mid-flip, or TOMBSTONE once retired)
+ * until the txn's terminal; a CLEAN word here means the entry outlived the
+ * hold, so the op is about to dedupe on a word a peer may already own.
+ *
+ * Named by ARM, so a hand-off the terminal scrub does not reach shows up
+ * wherever it lives rather than at the one site that was audited.
+ */
+static inline
+void ft_glue_stale_check(unsigned int arm, const struct cds_ft_metadata *meta,
+		bool txn_owned)
+{
+#ifdef FEATURE_FT_HOLD_TRACE
+	unsigned long n;
+	uintptr_t st;
+
+	if (!txn_owned)
+		return;
+	n = uatomic_add_return(&ft_glue_reach[arm], 1);
+	if (!(n % FT_GLUE_REACH_TICK))
+		ft_glue_reach_report();
+	st = CMM_LOAD_SHARED(meta->state);
+	if (st & (FT_STATE_LOCK | FT_STATE_PROXY | FT_STATE_TOMBSTONE))
+		return;
+	if (!ft_stale_report_ok())
+		return;
+	fprintf(stderr, "FT GLUE STALE: txn-owned %s answers for CLEAN word "
+		"%p (state %lx) -- unscrubbed hand-off\n",
+		ft_glue_reach_name[arm], (const void *) meta,
+		(unsigned long) st);
+#else
+	(void) arm; (void) meta; (void) txn_owned;
+#endif
+}
 static
 bool ft_glue_held_snap_one(const struct ft_glue *g,
 		const struct cds_ft_metadata *meta, uintptr_t *snap,
@@ -10677,14 +11063,26 @@ bool ft_glue_held_snap_one(const struct ft_glue *g,
 
 	*ratified = true;
 	if (g->publish_parent_holder == meta) {
-		FT_GLUE_ARM("publish_parent");
-		*snap = g->publish_parent_snap;
-		return true;
+		if (caa_unlikely(g->publish_parent_scrubbed)) {
+			FT_GLUE_SAVED_COUNT(0, g->publish_parent_txn_owned);
+		} else {
+			FT_GLUE_ARM("publish_parent");
+			ft_glue_stale_check(0, meta,
+				g->publish_parent_txn_owned);
+			*snap = g->publish_parent_snap;
+			return true;
+		}
 	}
 	if (g->publish_gp_holder == meta) {
-		FT_GLUE_ARM("publish_gp");
-		*snap = g->publish_gp_snap;
-		return true;
+		if (caa_unlikely(g->publish_gp_scrubbed)) {
+			FT_GLUE_SAVED_COUNT(1, g->publish_gp_txn_owned);
+		} else {
+			FT_GLUE_ARM("publish_gp");
+			ft_glue_stale_check(1, meta,
+				g->publish_gp_txn_owned);
+			*snap = g->publish_gp_snap;
+			return true;
+		}
 	}
 	if (g->split_cn_holder == meta) {
 		FT_GLUE_ARM("split_cn");
@@ -10779,6 +11177,8 @@ bool ft_glue_held_snap_one(const struct ft_glue *g,
 				!g->free_list[i].holder_shared &&
 				!g->free_list[i].consumed) {
 			FT_GLUE_ARM("freelist_holder");
+			ft_glue_stale_check(2, meta,
+				g->free_list[i].holder_txn_owned);
 			*snap = g->free_list[i].holder_snap;
 			return true;
 		}
@@ -11302,6 +11702,7 @@ void ft_glue_abort(struct cds_ft *ft, struct ft_glue *g)
 		g->publish_parent_shared = false;
 		g->publish_parent_snap = 0;
 		g->publish_parent_txn_owned = false;
+		g->publish_parent_scrubbed = false;
 	}
 	/*
 	 * The SKIP_X dual's owner, on the same terms -- plus one: a fence the
@@ -11316,6 +11717,7 @@ void ft_glue_abort(struct cds_ft *ft, struct ft_glue *g)
 		g->publish_gp_shared = false;
 		g->publish_gp_snap = 0;
 		g->publish_gp_txn_owned = false;
+		g->publish_gp_scrubbed = false;
 	}
 	for (i = 0; i < g->nr_built; i++) {
 		struct cds_ft_inode_flag *nf = g->built[i];
@@ -11473,8 +11875,29 @@ void ft_glue_tombstone_free_list(struct ft_glue *g)
 			 * glue free list approaches.
 			 */
 			if (!h.shared) {
+				/*
+				 * ☠ NO SILENCER ON THIS LANE, DELIBERATELY.  A
+				 * pointer to @holder_scrubbed would address the
+				 * free list -- a MALLOC'D array once the retire
+				 * set passes FT_GLUE_FLOOR_FREE -- and several
+				 * bails run ft_glue_abort (which finis the glue
+				 * and FREES that array) BEFORE the txn's own
+				 * terminal: ft_rekey_graft_simple_attempt hands
+				 * off, then an -ENOMEM at the marks reserve
+				 * jumps to bail_build, which aborts both glues
+				 * and only then destroys the txn.  The scrub
+				 * would write through freed heap.
+				 *
+				 * The lane keeps its pre-scrub behaviour, which
+				 * costs nothing measurable: across both suites
+				 * and both builds this arm took 262k hand-offs
+				 * and was consulted ZERO times.  Closing it
+				 * needs the silencer in storage that outlives
+				 * the txn, not a second lifetime rule.
+				 */
 				ft_flip_txn_lock_register(g->txn, h.lock,
 					h.lock_snap);
+				FT_GLUE_OWN_COUNT(2);
 				g->free_list[i].holder_txn_owned = true;
 			}
 			/*
@@ -11496,8 +11919,8 @@ void ft_glue_tombstone_free_list(struct ft_glue *g)
 			 * returns early on that shape.
 			 */
 			if (!h.shared)
-				ft_flip_txn_record_anchor_release(g->txn, &h,
-					meta);
+				(void) ft_flip_txn_record_anchor_release(
+					g->txn, &h, meta);
 			continue;
 		}
 		/*
@@ -11847,6 +12270,7 @@ enum urcu_txn_status ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue 
 		g->publish_parent_shared = false;
 		g->publish_parent_snap = 0;
 		g->publish_parent_txn_owned = false;
+		g->publish_parent_scrubbed = false;
 	}
 	/*
 	 * THE SECOND SLOT THE PUBLISH BELOW WRITES.  A compressed
@@ -11887,6 +12311,7 @@ enum urcu_txn_status ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue 
 		g->publish_gp_shared = false;
 		g->publish_gp_snap = 0;
 		g->publish_gp_txn_owned = false;
+		g->publish_gp_scrubbed = false;
 	}
 	/*
 	 * A recompaction already folded this publish into the node that
