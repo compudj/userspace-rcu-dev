@@ -485,32 +485,87 @@ the longest in-flight point op, so Phase D remains the prerequisite —
 though only retries INTO the frozen subtree matter; (4) readers never check
 the state: wait-freedom untouched.
 
-**(E) SWAP THE SUBTREE'S MODE — shared -> EXCLUSIVE, via a per-subtree SEALED
-EPOCH (`mcas-multiwriter-readiness.md` §5.2/§5.3, its open question 2).** Not a
-freeze on a word the descent reads: a MODE TRANSITION for the subtree, whose
-whole difficulty is the transition itself. §5.3's asymmetry is the premise —
-producing structure ONTO an exclusive side is Tier-1 at any size, and the one
-irreducible multi-writer cost is going the other way, *quiescing the writers
-already inside*. ★ **The check lives at the writer's COMMIT / RETRY point, not
-on its descent**, which is exactly why it reaches an interior writer that never
-crosses the boundary again — the choke point every mutation passes, where
-(A)/(B)/(D)'s boundary has no purchase. Mechanically it needs no new blocking
-primitive: a commit whose write set falls under a live seal ABORTS, which is
-this engine's ordinary control flow, so the bulk op waits for in-flight peers
-to FAIL rather than to finish. Protocol: take the junction's DLM lock-set
-(bulk-vs-bulk rides the existing acquire/validate, as in (D)); publish the
-seal; one GP so every in-flight mutation has either committed or will see it;
-edit writer-excluded; publish the result with the O(1) boundary commit; clear
-and wake. ☠ **AND ITS PRIZE MUST NOT BE OVERSTATED — see G5.2**: a SEALED
-subtree is writer-quiesced but NOT reader-drained, so §5.2's full vacuity
-(plain stores, synchronous frees) does NOT apply to it. Obligations: the abort
-must be distinguishable from an ordinary conflict or the retry loop replans
-forever (the livelock class already measured twice here); aborters must PARK
-`thread_offline` rather than spin, or they starve the GP the seal's own drain
-needs (Phase D again); FIFO both ways. ☞ Engine gap, step4 §6.3: "may need a
-new per-subtree epoch the engine does not provide". ★ Note it DISSOLVES (D)'s
-obligation (1): a handle-based mutation that never descends still COMMITS, so
-a commit-point check covers it with no re-descend rule.
+**(E) WIDEN THE POINT OP'S LOCK SET — a DYNAMIC, SUBTREE-LOCAL LOCK SPACING
+(Mathieu, 2026-08-28).**  Not an exclusion primitive and not a freeze: a
+GRANULARITY change.  A bulk op MARKS the junction J it is working on; a point op
+whose ancestors include a marked node ADDS that node's lock to its own set.  The
+two then arbitrate through the ordinary DLM acquire — nothing is evicted,
+nothing aborts on principle, and no new engine mechanism appears (which retires
+step4 §6.3's "per-subtree epoch the engine does not provide").  ★ **It IS the
+anchor rule applied dynamically**: static lock spacing chooses how far up a
+member anchors, and a bulk op at J makes J a RUNTIME anchor for its subtree.
+"Swap the mode locally" is literal — the mode is the LOCK SPACING, scoped to a
+subtree instead of to the trie.
+
+*Detection is two-tier, so the steady state pays nothing.*  **Tier 1**: one
+trie-level word, "is any bulk op live?", `caa_likely` false — the
+`ft_move_active` shape (internal.h:2573).  Zero cost when no bulk op runs, which
+is the case the near-root goal is actually about.  **Tier 2**: when it is
+nonzero, the point op walks its ancestors via `meta->parent_word` and adds every
+marked ancestor's lock to its set.  ★ The walk already loads that metadata line
+at every level, so the mark is FREE exactly where it is read — and the mark
+never needs to be visible on the DESCENT, which is what G5.1's encoding survey
+was unable to make cheap.
+
+☠☠ **THE ANCESTOR LOCKS ARE *ADDED*, NEVER SUBSTITUTED — a CORRECTNESS
+REQUIREMENT, not a simplification.**  During the transition window point ops
+divide into OBSERVERS (they saw the mark) and NON-OBSERVERS (they built their
+set before it was visible to them).  If an observer REPLACED its leaf lock L
+with J — the pure anchor reading — then an observer holding {J} and a
+non-observer holding {L} on the SAME LEAF would share no word at all: two point
+ops excluding nothing.  That is precisely the hazard
+`cds_ft_group_attr_set_lock_spacing` refuses coarse spacings to prevent
+("anchoring is all-or-nothing … converted sites anchoring on an ancestor and
+unconverted ones on the node — excluding nothing, **and quietly**, since a
+mostly single-writer suite still passes"), reproduced **IN TIME** rather than in
+space: the window IS a partially-converted trie.  Keeping L gives the invariant
+the design rests on —
+* **L is never surrendered** ⇒ point-vs-point exclusion is IDENTICAL before,
+  during and after the window; the mark changes nothing about how point ops
+  synchronize with each other.
+* **J is purely additive** ⇒ point-vs-bulk exclusion, for observers.
+* **the GP** covers the non-observers, and is the only thing that must.
+
+*Protocol.*  (1) bulk op acquires J through its txn; (2) marks J, bumps tier 1;
+(3) ONE GRACE PERIOD — mutations run in the caller's RCU bracket, so afterwards
+every non-observer has retired; (4) edits, holding only J: every op that could
+commit underneath now takes J itself, so the bulk op's lock set is O(1), not
+O(fan) as in (A) nor O(subtree); (5) unmark, decrement, release.  ★ **The exit
+needs NO second GP**, and that asymmetry is a direct consequence of ADD: a stale
+observer afterwards holds {L, J} against a fresh {L} and is still excluded on L.
+Under substitution both ends would need one.
+
+*What the address-ordered acquire imposes, and gives.*  Deadlock-freedom comes
+from the txn sorting MW installs by SLOT ADDRESS at age 1+
+(rcu-txn-mcas.h:542), not from any tree order — so an ancestor lock taken
+"after" a descendant is a non-issue.  ☠ But the FT's own consequence binds
+(ft-mutation-helpers.h:975): *"a site that wants ordering must present its WHOLE
+SET AT ONCE."*  So the ancestor walk MUST complete before the set is presented;
+a late-discovered ancestor cannot be appended.  ⇒ if the walk raced a
+concurrent mark or a re-parent and missed one, the remedy is to re-plan and
+present a new whole set — an ordinary abort/retry, i.e. age escalation, not a
+new mechanism.  ☞ And an op whose tier-1 check says a window is live is by
+definition an op that expects to conflict: `urcu_txn_expect_conflict`
+(rcu-txn.h:583) skips the age-0 optimistic attempt and runs sorted+blocking from
+the first try, instead of burning an attempt predestined to lose.  ☞ The lock
+set grows by up to DEPTH entries during a window — affordable only because
+@758f432d already made the registry GROW; that fix is a prerequisite for this
+candidate and is already in.
+
+☐ **OPEN.**  (i) The age-1+ path BOUNDED-SPINS on a contended word rather than
+parking, and a bulk window is p99 ~240us + a GP (D.5) — the wrong wait, and
+under QSBR a spinner has no quiescent window, so it can starve the bulk op's own
+drain.  This lands exactly on Phase D's acquire lane ("the cure is in the
+ACQUIRE — queue"), with the D.5 wait-ladder as the tool.  (ii) ☠ **A STALL
+SHAPE THAT LEAKS OUT OF THE SUBTREE**: acquiring ascending by address, an
+observer blocked on J still HOLDS every lock in its set sorting below J,
+including leaf locks, for the whole window — so unrelated point ops queue behind
+an op that is itself waiting on the bulk op.  The exclusion is subtree-scoped;
+the stall is not.  (iii) Tier 1 is trie-wide, so any live bulk op makes every
+point op ANYWHERE pay the O(depth) walk; refinable (a depth bound, a coarse
+filter over the marked set) but start simple and measure.  (iv) A near-root J
+serializes broadly by construction — the honest cost of bulk-near-root, worth
+stating since G5's goal is about near-root contention.
 
 **Proposed split — ☠ REOPENED, do not act on it as written (G5.0/G5.1/G5.2 below).**
 As originally stated: (D) is the default for the bulk family — it gives (B)'s
@@ -600,7 +655,7 @@ become spurious aborts, and inherits `FT_STATE_INPLACE_WAIT_MASK` semantics
 (internal.h:1000-1046).  §8.3's "one word cannot be owned by two locks" is the
 argument; the `parent_slot_offset` split out of that word is the precedent.
 
-### G5.1 — THE ENCODING SURVEY, and ☠ THE CANDIDATE G5 NEVER LISTED: the LOCAL MODE SWAP (a per-subtree SEALED EPOCH)
+### G5.1 — THE ENCODING SURVEY, and ☠ THE CANDIDATE G5 NEVER LISTED: the LOCAL MODE SWAP (now (E))
 
 Two results.  The survey closes the per-node-encoding question; the second
 result makes most of it moot, and it was already written down elsewhere —
@@ -608,42 +663,36 @@ result makes most of it moot, and it was already written down elsewhere —
 §3.5/§4.4/§6.3.  **G5's candidate list above is incomplete: it never mentions
 transitioning a SHARED SUBTREE TO EXCLUSIVE — a mode swap done LOCALLY.**
 
-#### ☠ THE MISSING CANDIDATE (E): swap the subtree's MODE, don't freeze its boundary
+#### ☠ THE CANDIDATE THAT WAS MISSING — now (E) above
 
-§5.3's framing, and it is sharper than anything in G5 above:
+`mcas-multiwriter-readiness.md` §5.2/§5.3 and `step4-concurrent-engine-plan.md`
+§3.5/§4.4/§6.3 work out the LOCAL MODE SWAP — shared subtree -> exclusive — and
+that doc has carried it as its own **open question 2** since before this plan
+was written.  G5's list here never folded it in, so the encoding survey below
+was optimising a mechanism a neighbouring doc had already undercut.  What it
+contributes, and where its framing had to be replaced:
 
-* **The payoff is far bigger than (D) claims.**  G5(D) sells the freeze as
-  buying semantic freeze plus "SW content by the exclusive argument".  §5.2 is
-  stronger: on an exclusive side BOTH MCAS invariants are VACUOUS — plain
-  stores, no descriptor, no freeze, synchronous frees — and "producing
-  structure ONTO an exclusive side is Tier-1 regardless of size; only the O(1)
-  shared boundary publish is contended".  A locally-exclusive subtree is not
-  SW-armed content records, it is **NO TRANSACTION AT ALL** on the interior.
-  ⇒ G5 above UNDERSELLS its own best case.
-* ☠ **AND IT NAMES A HAZARD (D) DOES NOT ANSWER**: *"A writer deep in the
-  subtree does not touch the boundary edge, so freezing only the boundary does
-  not evict it."*  (D) freezes the JUNCTION — precisely the boundary.  Its
-  drain argument (one GP, because every point mutation runs in the caller's RCU
-  bracket) is sound only if every in-flight mutation either COMPLETES or
-  RE-DESCENDS through the junction.  The two ways that fails are (D)'s own
-  obligations (1) and (3): handle-based mutations that never descend (the §5.3
-  node-handle hole), and retry loops, which under QSBR have no quiescent window
-  at all.  §5.3 states this as **the irreducible Tier-3 cost**, not as a
-  checklist item — quiescing the writers ALREADY INSIDE is the whole problem,
-  and boundary freezing does not do it.
-* **The mechanism it proposes instead: a per-subtree "SEALED" EPOCH that
-  in-flight writers CHECK AND BACK OFF ON.**  ★ The check lives at the
-  WRITER'S commit / retry point, not on the descent — which is exactly why it
-  evicts a writer already inside who never crosses the boundary again.
-  Alternative offered in the same breath: subtree-wide freezing, or
-  (step4 §4.4) keep Tier-3 domain-serialized initially and lift later.
-* ☞ Engine gap, flagged at step4 §6.3: this "may need a new per-subtree epoch
-  the engine does not provide."  Precedent that already exists on the READER
-  half: detach makes a subtree exclusive by draining readers (`sync_rcu`);
-  **exclusive = reader-drained AND writer-quiesced**, and only the writer half
-  is missing.
-* ☞ It also lands exactly on the two-writer-mode end state (SW +/- mutex, and
-  DLM): a locally-exclusive subtree is MODE 1 running inside a MODE 2 trie.
+* ☠ **THE HAZARD (A)/(B)/(D) CANNOT ANSWER**, and it stands whatever the
+  mechanism: *"A writer deep in the subtree does not touch the boundary edge, so
+  freezing only the boundary does not evict it."*  (D) freezes exactly the
+  boundary.  Its one-GP drain is sound only if every in-flight mutation
+  COMPLETES or RE-DESCENDS through the junction — and (D)'s own obligations (1)
+  and (3) (the handle path; retry loops with no QSBR quiescent window) are the
+  two ways that fails.  §5.3 calls quiescing the writers ALREADY INSIDE **the
+  irreducible Tier-3 cost**, not a checklist item.
+* ☠ **BUT ITS "SEALED EPOCH" FRAMING IS SUPERSEDED** (Mathieu, 2026-08-28).  A
+  seal is an EXCLUSION primitive — it evicts, and eviction here means
+  abort-and-retry, which is MW-flavoured arbitration and therefore BACKWARDS
+  against this transition's direction of travel
+  ([[feedback_direction_is_toward_fine_locking_away_from_mw]]).  §5.3 was
+  written when the target was genuine exclusivity (writers ABSENT); under DLM
+  the question is not how to make writers absent but **at what granularity two
+  writers arbitrate**.  (E) above is that answer: widen the point op's lock set
+  instead of evicting it, and let the ordinary acquire do the work.
+* ★ Both the hazard and (E)'s answer reach the case the boundary cannot,
+  because a point op's ANCESTOR WALK starts from where the op actually is —
+  including a handle-based mutation that never descended at all, which is (D)'s
+  obligation (1) dissolved rather than discharged.
 
 #### ☑ THE ENCODING SURVEY (and why (E) makes most of it moot)
 
@@ -677,46 +726,41 @@ Asked: can (D)'s per-level check live somewhere the descent already loads?
 #### ☞ WHAT THIS DOES TO THE FORK
 
 B-vs-D was the wrong axis to decide first.  The prior question is **(E) vs the
-boundary freeze**: whether the bulk op quiesces writers by a per-subtree sealed
-epoch they check at their own commit/retry point (§5.3's proposal, with the
-plain-stores payoff and no per-node encoding), or by a freeze the descent reads
-(G5(A)/(B)/(D), which §5.3 says does not evict an interior writer).  ☐ OPEN,
-and it needs Mathieu — G5's list above must gain (E) before the split below is
-decided.  ☠ The `mcas-multiwriter-readiness.md` open-questions list has carried
-this as item 2 ("subtree-wide freezing vs a per-subtree sealed epoch") since
-before this doc was written; it was never folded in here.
+boundary mechanisms**: whether the bulk op coordinates by making point ops
+WIDEN their lock set (E), or by a freeze the descent reads ((A)/(B)/(D)), which
+§5.3 says cannot reach an interior writer.  ☐ OPEN, and it needs Mathieu — but
+note (E) needs no new primitive, no per-node encoding, and no engine change,
+which none of the others can say.
 
+### G5.2 — ☠ WIDENED IS NOT EXCLUSIVE: the "plain stores" prize is HALF of what §5.2 grants
 
-### G5.2 — ☠ SEALED IS NOT EXCLUSIVE: the "plain stores" prize is HALF of what §5.2 grants
+An earlier revision of G5.1 wrote that a locally-exclusive subtree pays "NO
+TRANSACTION AT ALL" on its interior.  ☠ **That overstates it for a subtree held
+by (E) — or by any of (A)/(B)/(D) — and the distinction is why this is a design
+rather than a copy of detach.**
 
-G5.1 wrote that a locally-exclusive subtree pays "NO TRANSACTION AT ALL" on its
-interior.  ☠ **That overstates it for a SEALED subtree, and the distinction is
-the whole reason (E) is a design rather than a copy of detach.**
+§5.2 grants vacuity to **`ft->exclusive`**, a trie with neither concurrent
+writers NOR concurrent readers, and its two invariants are SEPARABLE:
+* **Invariant 2 (writer-vs-writer)** — dies.  With every op that could commit
+  under J taking J, and J held, no peer writer can commit into the subtree:
+  interior edges need no MCAS, no descriptor, no expected-old arbitration.
+  **This is the expensive half, and it is genuinely won.**
+* **Invariant 1 (reader-visibility)** — **SURVIVES**.  The subtree is still
+  LINKED, so new readers keep arriving, and readers check nothing (their
+  wait-freedom is untouched, which is a requirement, not an oversight).
+  Interior edges therefore still need release publication and DEFERRED frees.
 
-`mcas-multiwriter-readiness.md` §5.2 grants vacuity to **`ft->exclusive`**,
-which is a trie with neither concurrent writers NOR concurrent readers, and the
-two invariants it kills are SEPARABLE:
-* **Invariant 2 (writer-vs-writer)** — dies under a seal.  No peer writer can
-  commit into the subtree, so interior edges need no MCAS, no descriptor, no
-  freeze, no expected-old arbitration.  **This is the expensive half, and (E)
-  really does win it.**
-* **Invariant 1 (reader-visibility)** — **SURVIVES**.  A sealed subtree is
-  still LINKED, so new readers keep arriving, and by (E)'s own design readers
-  never check the seal (wait-freedom untouched).  Interior edges therefore
-  still need release publication and DEFERRED (not synchronous) frees.
-
-So the honest statement is **writer-quiesced, not exclusive**: the interior
-work becomes plain RCU publication instead of transacted multi-writer
-arbitration — still a large win, and strictly better than (D)'s "SW content
-records" — but NOT §5.2's free-at-any-size Tier-1.
+So the honest statement is **writer-quiesced, not exclusive**: interior work
+becomes plain RCU publication instead of transacted multi-writer arbitration —
+a large win, and strictly better than (D)'s "SW content records" — but NOT
+§5.2's free-at-any-size Tier-1.
 
 ☠ **And the tempting fix is the one this project already rejected.**  Full
-exclusivity needs the reader drain too, i.e. UNLINK the subtree, GP, work,
-relink — which is exactly detach's shape and exactly what
-[[project_ft_staged_rekey_writer_deleted]] was deleted for: a tmp-trie HIDES
-LIVE KEYS for a grace period per move.  Unlinking a populated subtree makes its
-keys vanish from lookups for the whole window.  ⇒ (E) must stay LINKED, and
-must therefore claim only the writer half.
+exclusivity needs the reader drain too — UNLINK, GP, work, relink — which is
+detach's shape and exactly what [[project_ft_staged_rekey_writer_deleted]] was
+deleted for: a tmp-trie HIDES LIVE KEYS for a grace period per move.  Unlinking
+a populated subtree makes its keys vanish from lookups for the whole window.
+⇒ the subtree must stay LINKED, and the design can claim only the writer half.
 
 ---
 
