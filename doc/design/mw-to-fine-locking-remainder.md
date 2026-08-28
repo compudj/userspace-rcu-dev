@@ -592,17 +592,37 @@ filter over the marked set) but start simple and measure.  (ii) A near-root J
 serializes broadly by construction — the honest cost of bulk-near-root, worth
 stating since G5's goal is about near-root contention.
 
-**Proposed split — ☠ REOPENED, do not act on it as written (G5.0/G5.1/G5.2 below).**
-As originally stated: (D) is the default for the bulk family — it gives (B)'s
-semantic freeze and free SW-content arming at (A)'s scope, for a point-op
-cost of a branch on an already-loaded word, and (B) falls out of it as the
-root placement. (A) remains for bulk shapes that need no semantic freeze
-(deep ops commute and are never stalled; its fan half retires at §8.3
-regardless). (C) unchanged for cross-trie. To settle with Mathieu before
-Phase B reaches the bulk sites: the freeze encoding in the state word, the
-park/wake mechanism, FIFO fairness both ways, and the handle-path
-re-descend trigger.
+**☑☑ DECIDED (Mathieu, 2026-08-28): (E) IS THE MECHANISM.**  Bulk/point
+coordination is a GRANULARITY change, not an exclusion — the bulk op marks its
+junction, point ops ADD the marked ancestors' locks, and the ordinary DLM
+acquire arbitrates.  The split that stands:
 
+* **(E) for the bulk family.**  It alone needs no new primitive, no per-node
+  encoding and no engine change, and it reaches the interior writer that §5.3
+  says a boundary cannot.  ★ Placement generalizes exactly as (D)'s did: a mark
+  on the ROOT is the trie-wide case, so **(B) falls out of (E)** rather than
+  competing with it — one mechanism, placement chooses scope.
+* **(A) is RETIRED as an exclusion mechanism.**  Under (E) the bulk op holds
+  O(1) — just the junction — because every op that could commit underneath
+  takes it; the fan lock buys nothing it does not already have, and its fan half
+  was retiring at §8.3 regardless.
+* **(D) is NOT taken**: it freezes the boundary, which does not evict a writer
+  already inside (§5.3), and its per-level check has no cheap home (G5.1).
+* **(C) unchanged** for cross-trie: an EXCLUSIVE consumed source;
+  detach-and-hand-off is a mode swap by definition.
+
+☠☠ **PREREQUISITE, NOT A DETAIL — PHASE D'S ACQUIRE LANE LANDS FIRST.**  The
+contended acquire ABORTS rather than blocking (8192-spin then FAILED, above), so
+without a park the mark turns a bulk window into a trie-wide retry storm that
+can starve the bulk op's own drain GP.  (E) is not implementable before the
+acquire can queue/park.  Order: **Phase D acquire lane -> (E)**.
+
+☞ Then (E) itself, in the order its own structure implies: the tier-1 trie word;
+the mark in metadata (free on the ancestor walk that already loads it); the
+tier-2 walk feeding ONE presented lock set (the whole-set-at-once contract);
+ADD-never-substitute; and the mark's second duty, routing waiters to the park.
+Remaining open items are COST, not correctness: tier 1 is trie-wide, and a
+near-root J serializes broadly.
 
 ### G5.0 — (D)'s "ZERO EXTRA LOADS" PREMISE IS REFUTED; the COST CLAIM built on it was WRONG TWICE and is now scoped
 
@@ -2735,11 +2755,20 @@ stale) — watch it across Phase B, it shares words with the converted sites.
                                                               It was G5's PREREQUISITE and
                                                               hands it the drain bound:
                                                               p99 ~240us + one GP
-    G5  bulk vs point exclusion -- ☞ THE CURRENT STEP       (design, w/ Mathieu).  ☠ NOT
-                                                              "hybrid D": the candidate list
-                                                              is now FIVE (§2), and the
-                                                              proposed split is REOPENED.
-                                                              ☑ (E) ADDED @f4cb1731 --
+    G5  bulk vs point exclusion                            ☑☑ DECIDED 2026-08-28: (E).
+                                                              (B) falls out of it as the ROOT
+                                                              placement; (A) RETIRED as an
+                                                              exclusion mechanism (the bulk op
+                                                              holds O(1)); (D) not taken; (C)
+                                                              unchanged.  ☠☠ NOT IMPLEMENTABLE
+                                                              until Phase D's ACQUIRE LANE
+                                                              lands -- the contended acquire
+                                                              ABORTS (8192-spin then FAILED),
+                                                              so without a PARK the mark makes
+                                                              a bulk window a retry storm that
+                                                              starves its own drain GP.
+                                                              ☞ ORDER: D-acquire-lane -> (E)
+                                                              ☑ (E) @f4cb1731 --
                                                               LOCK-SCOPE WIDENING (mark the
                                                               junction; point ops ADD marked
                                                               ancestors' locks; the ordinary
