@@ -561,6 +561,92 @@ become spurious aborts, and inherits `FT_STATE_INPLACE_WAIT_MASK` semantics
 (internal.h:1000-1046).  §8.3's "one word cannot be owned by two locks" is the
 argument; the `parent_slot_offset` split out of that word is the precedent.
 
+### G5.1 — THE ENCODING SURVEY, and ☠ THE CANDIDATE G5 NEVER LISTED: the LOCAL MODE SWAP (a per-subtree SEALED EPOCH)
+
+Two results.  The survey closes the per-node-encoding question; the second
+result makes most of it moot, and it was already written down elsewhere —
+`mcas-multiwriter-readiness.md` §5.2/§5.3 and `step4-concurrent-engine-plan.md`
+§3.5/§4.4/§6.3.  **G5's candidate list above is incomplete: it never mentions
+transitioning a SHARED SUBTREE TO EXCLUSIVE — a mode swap done LOCALLY.**
+
+#### ☠ THE MISSING CANDIDATE (E): swap the subtree's MODE, don't freeze its boundary
+
+§5.3's framing, and it is sharper than anything in G5 above:
+
+* **The payoff is far bigger than (D) claims.**  G5(D) sells the freeze as
+  buying semantic freeze plus "SW content by the exclusive argument".  §5.2 is
+  stronger: on an exclusive side BOTH MCAS invariants are VACUOUS — plain
+  stores, no descriptor, no freeze, synchronous frees — and "producing
+  structure ONTO an exclusive side is Tier-1 regardless of size; only the O(1)
+  shared boundary publish is contended".  A locally-exclusive subtree is not
+  SW-armed content records, it is **NO TRANSACTION AT ALL** on the interior.
+  ⇒ G5 above UNDERSELLS its own best case.
+* ☠ **AND IT NAMES A HAZARD (D) DOES NOT ANSWER**: *"A writer deep in the
+  subtree does not touch the boundary edge, so freezing only the boundary does
+  not evict it."*  (D) freezes the JUNCTION — precisely the boundary.  Its
+  drain argument (one GP, because every point mutation runs in the caller's RCU
+  bracket) is sound only if every in-flight mutation either COMPLETES or
+  RE-DESCENDS through the junction.  The two ways that fails are (D)'s own
+  obligations (1) and (3): handle-based mutations that never descend (the §5.3
+  node-handle hole), and retry loops, which under QSBR have no quiescent window
+  at all.  §5.3 states this as **the irreducible Tier-3 cost**, not as a
+  checklist item — quiescing the writers ALREADY INSIDE is the whole problem,
+  and boundary freezing does not do it.
+* **The mechanism it proposes instead: a per-subtree "SEALED" EPOCH that
+  in-flight writers CHECK AND BACK OFF ON.**  ★ The check lives at the
+  WRITER'S commit / retry point, not on the descent — which is exactly why it
+  evicts a writer already inside who never crosses the boundary again.
+  Alternative offered in the same breath: subtree-wide freezing, or
+  (step4 §4.4) keep Tier-3 domain-serialized initially and lift later.
+* ☞ Engine gap, flagged at step4 §6.3: this "may need a new per-subtree epoch
+  the engine does not provide."  Precedent that already exists on the READER
+  half: detach makes a subtree exclusive by draining readers (`sync_rcu`);
+  **exclusive = reader-drained AND writer-quiesced**, and only the writer half
+  is missing.
+* ☞ It also lands exactly on the two-writer-mode end state (SW +/- mutex, and
+  DLM): a locally-exclusive subtree is MODE 1 running inside a MODE 2 trie.
+
+#### ☑ THE ENCODING SURVEY (and why (E) makes most of it moot)
+
+Asked: can (D)'s per-level check live somewhere the descent already loads?
+**Answer: no — the only uniform per-node home is metadata.**
+
+* ☠ **In-body slack: DEAD.**  Five of the seven 64-bit tiers are EXACTLY full
+  (header + max_child*8 == node size: 128, 256, 512, 1024, and pigeon's 2048).
+  Only tier 1 (scan_32_8) has 4 spare bytes.  Stealing a pointer slot is not
+  available on PIGEON, whose 256 slots ARE the 256 byte values with no header
+  at all — a flag there means order 11 -> 12, i.e. DOUBLING the densest
+  near-root nodes, which is where junctions live.
+* ☠ **Spare tag bits: DEAD where it matters.**  An INTERNAL pointer spends all
+  four low bits (1 internal + 3 type index, and all 8 type values are used:
+  0-6 real + 7 = NULL).  Compressed (`0b010`, 16-byte aligned) and external
+  (8-byte aligned) do have spare bits — but a junction is an internal node.
+* ☑ **Metadata word: the only uniform home**, costing one load per level on
+  non-skip levels in the default rank_stats-off config (free on skip-encoded
+  levels, which already load metadata — G5.0; and free with rank_stats on).
+* ☞ **The two-tier gate that makes it cheap**, and the shape (E) generalizes:
+  a trie-level "is ANY freeze active?" word, checked `caa_likely`-style, with
+  the per-level metadata check reached ONLY inside an active window.  Steady
+  state then costs exactly (B)'s one trie-level load.  ★ Precedent in-tree:
+  `ft_move_active` (internal.h:2573) is literally this — "with no move in
+  flight the reader takes the FAST path".
+* ⇒ **But (E) asks the question differently and better**: check at the writer's
+  COMMIT/RETRY point rather than on the descent, and the per-node encoding
+  question does not arise at all.  ☞ The survey's real conclusion is therefore
+  that **the descent is the wrong place to look**, which is also §5.3's point.
+
+#### ☞ WHAT THIS DOES TO THE FORK
+
+B-vs-D was the wrong axis to decide first.  The prior question is **(E) vs the
+boundary freeze**: whether the bulk op quiesces writers by a per-subtree sealed
+epoch they check at their own commit/retry point (§5.3's proposal, with the
+plain-stores payoff and no per-node encoding), or by a freeze the descent reads
+(G5(A)/(B)/(D), which §5.3 says does not evict an interior writer).  ☐ OPEN,
+and it needs Mathieu — G5's list above must gain (E) before the split below is
+decided.  ☠ The `mcas-multiwriter-readiness.md` open-questions list has carried
+this as item 2 ("subtree-wide freezing vs a per-subtree sealed epoch") since
+before this doc was written; it was never folded in here.
+
 **Proposed split:** (D) is the default for the bulk family — it gives (B)'s
 semantic freeze and free SW-content arming at (A)'s scope, for a point-op
 cost of a branch on an already-loaded word, and (B) falls out of it as the
