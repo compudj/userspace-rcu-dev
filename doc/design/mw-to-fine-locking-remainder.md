@@ -2694,12 +2694,75 @@ stale) — watch it across Phase B, it shares words with the converted sites.
                                                               (option (a)).  ☠☠ a NULL @owner
                                                               NEVER failed closed: record_tag
                                                               dispatches on structural_sw ALONE
-    B6  retire hand-arming (rekey writer, root COW)         (small)
-    C   re-measure; G4 cell-lane decision                   (gate + data)
-    G5  subtree freeze-state gate design (hybrid D)         (design, w/ D)
-    D   acquire fair-handoff design w/ Mathieu              (design, parallel)
-    E   spacing certification + gate lift + strategy fold   (medium)
-    F   §8.3 layout split + in-place + single-writer mode   (large, last)
+    B6  retire hand-arming (rekey writer, root COW)         ☑ LANDED f8b6317f -- ONE
+                                                              DOOR at txn CREATION
+    C   re-measure; G4 cell-lane decision                   ☑ DONE.  ☑☑ G4 ANSWERED
+                                                              by C.1(d): the ordered-cell
+                                                              lane is 0.9-1.9% OF ABORTS
+                                                              (6% of always-MW volume)
+                                                              => KEEP THE NARROW MW LANE.
+                                                              ☠ §2's G4 row still reads
+                                                              "do not decide it on argument
+                                                              now" -- STALE, the answer is
+                                                              in §5 C.2/C.1(d)
+    D   acquire fair-handoff design w/ Mathieu              ☑ DONE D.0-D.5 (@027eeb9d,
+                                                              the wait-ladder public API).
+                                                              It was G5's PREREQUISITE and
+                                                              hands it the drain bound:
+                                                              p99 ~240us + one GP
+    G5  bulk vs point exclusion -- ☞ THE CURRENT STEP       (design, w/ Mathieu).  ☠ NOT
+                                                              "hybrid D": the candidate list
+                                                              is now FIVE (§2), and the
+                                                              proposed split is REOPENED.
+                                                              ☑ (E) ADDED @f4cb1731 --
+                                                              LOCK-SCOPE WIDENING (mark the
+                                                              junction; point ops ADD marked
+                                                              ancestors' locks; the ordinary
+                                                              DLM arbitrates) = the anchor
+                                                              rule applied DYNAMICALLY.
+                                                              ☐ THE DECISION: (E) vs the
+                                                              BOUNDARY mechanisms
+                                                              ((A)/(B)/(D)) is the PRIOR
+                                                              question -- B-vs-D was the
+                                                              wrong axis (G5.0/G5.1).  (E)
+                                                              alone needs no new primitive,
+                                                              no per-node encoding and no
+                                                              engine change.
+                                                              ☐ Then G5's four originals:
+                                                              park/wake, FIFO both ways,
+                                                              the handle path (☑ DISSOLVED
+                                                              by (E) -- an ancestor walk
+                                                              starts where the op IS), and
+                                                              the mark's encoding (☑ ANSWERED
+                                                              by (E): metadata, free on the
+                                                              walk that already loads it)
+                                                              ☐ Two liveness items (E) adds:
+                                                              age-1+ BOUNDED-SPINS instead of
+                                                              parking (-> Phase D's acquire
+                                                              lane), and a STALL THAT LEAKS
+                                                              out of the subtree (an observer
+                                                              blocked on J holds every lock
+                                                              sorting below it)
+    E   spacing certification + gate lift + strategy fold   ☠ BLOCKED, and NOT on E.2 --
+                                                              re-derived @54c6358e: the blocker
+                                                              is ft_txn_per_op_spacing_ok ==
+                                                              PER_NODE, so a lift ships two
+                                                              spacings where ALL of Phase B is
+                                                              inert.  With E.4 measuring the
+                                                              spacings within noise, the lift
+                                                              BUYS NOTHING today: a VALUE
+                                                              question for Mathieu, not a
+                                                              certification chore.  ☑ E.1-E.4
+                                                              done; ☑ the probe-free control
+                                                              landed @c90228da
+    F   §8.3 layout split + in-place + single-writer mode   (large, last).  ★ §8.2 in-place
+                                                              is now DOUBLY motivated: E.4
+                                                              says the FINE-vs-COARSE sweep is
+                                                              not actionable until it lands,
+                                                              and D.5 says shortening the hold
+                                                              is the CURATIVE liveness lever
 
 Each step is bisectable, each gated by §3's protocol; nothing below the C
 line starts before the C measurement exists, because C is what prices D–F.
+☑ That gate is now SATISFIED — C is done and priced D–F — so the ordering
+constraint it expressed has been discharged rather than merely deferred.
