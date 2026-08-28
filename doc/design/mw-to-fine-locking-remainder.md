@@ -1717,10 +1717,70 @@ certification, then the API gate lift (`ft-lifecycle.h:369`):
    consumption point the @aa03d23b scrubs missed; the remedy is the
    rekey fold's `marks_consumed` discipline generalised to every commit
    that consumes registered locks (R3).  D1/fence-under-anchor is
-   UNNECESSARY and its evidence is withdrawn.  ☐ Remaining: implement
-   the scrub, and establish whether the same window is reachable at
-   PER-NODE (not shown by the trace, and not to be assumed closed).  The
-   gate's holdtrace config runs without its imw legs until B closes;
+   UNNECESSARY and its evidence is withdrawn.
+   ☑ **(B) FIXED (2026-08-28) — THE TERMINAL SCRUB**.  A txn's terminal is
+   the only place that can retire the entry which HANDED it a word: the
+   caller's sweeps deliberately skip a txn-owned entry, and the op's
+   exclusion ends exactly there.  Each hand-off links a SILENCER into its
+   `ft_flip_txn_lock` slot; `ft_flip_txn_scrub_owned` runs at the commit-OK
+   arm (skipping slots whose terminal RETIRES the word — dedupe-on-dead is
+   the designed flow) and at `ft_flip_txn_lock_release_all`.  ☠ Whether a
+   terminal retires is CAPTURED AT THE RECORD: a load at the terminal races
+   a peer's retire.  ☠ And it must be captured at EVERY recorder that can
+   chain a retire onto an already-recorded release (`record_tombstone`'s RYW
+   load IS that chaining) — one `mark_retiring` caller against several
+   chaining recorders left the carve-out INVERTED, silencing an entry whose
+   word ends dead, which turns the op's next dedupe into a take of a
+   tombstone and hard-refuses forever.
+   MEASURED, root-only MW, arm vs `-DFT_SCRUB_OFF` control, interleaved:
+   arm 8/8 (and 4/4 after the skeptic fixes) at 119/119 with zero
+   violations; control 8/8 reproducing.  Fisher p ~ 1e-4.  Green legs: inv
+   119/119 and unit 315+3 at all three spacings.
+   ★ **THE ORACLE IS THE BAR; THE DETECTORS ARE NOT.**  Its print and abort
+   are unconditional, and an over-silencing scrub shows as NON-COMPLETION
+   (re-acquire → hard refuse), which no report cap can hide.  The two STALE
+   detectors cannot corroborate it on a scrubbed lane: the frame-extras
+   detector fires inside `!extra[i].shared` and the scrub's silencer IS that
+   `shared` flag, so its silence is ENTAILED by the fix compiling.  They
+   remain evidence only for lanes the scrub does NOT reach.
+   ☠ They were also, until 2026-08-28, ATTENUATED to the point of
+   meaninglessness: the 200-report budget is per-thread and shared with the
+   routine FT REFUSED line, which prints ~52,000 times and silenced ~270
+   threads per root-only MW run.  The detectors now hold a SEPARATE budget
+   and announce their own exhaustion; a zero is readable only when that
+   sentinel is absent.
+   ☑ **SCOPE**: root-only reproduces 8/8; exponential 0/20; per-node 0/6
+   (all with the scrub OFF).  ☠ Read as BOUNDS, not as zeroes: 0/20 puts the
+   exponential rate at ≤0.14/run (95%), which does NOT exclude the
+   historical 0.125/run event, and the detector has no positive control at
+   that spacing.  ☞ Per-node immunity continues to rest on the CENSUS
+   (453,873 acquisitions, zero dedupes) and the structural argument that
+   every member anchors on itself — 0/6 bounds only ≤0.39/run and is
+   STRICTLY WEAKER than the census.  The earlier "coarse-only" wording was
+   NOT wrong; it was a claim about dedupe existence, which this data does
+   not contradict.
+   ☞ **THE GLUE LANE**.  Counters per arm (hand-offs / consultations /
+   scrub-saves) across both suites and builds: 262k hand-offs in one control
+   run, consultations ONLY on `publish_parent` at root-only, ZERO
+   scrub-saves.  ☠ What that licenses is narrow: no post-terminal
+   consultation reached a STILL-ARMED fence.  It is not "never consulted
+   after a terminal" — `ft_glue_txn_commit_edges` NULLs the holders BEFORE
+   the terminal, so an ordinary-path post-terminal consult misses on
+   identity and NO counter observes it.  The free-list lane carries NO
+   silencer: a pointer into that malloc'd array is a use-after-free, several
+   bails running `ft_glue_abort` (which frees it) before the txn's terminal.
+   ☐ **THE DISPUTED EXPONENTIAL EVENT IS STILL UNATTRIBUTED**, and no null
+   rehabilitates it.  A powered classified A/B (`-DFT_EXCL_REPORT_ONLY`),
+   20 runs per arm interleaved, returned ZERO collisions in BOTH arms.  The
+   fix shows no measurable cost, but 0-vs-0 BOUNDS rather than confirms
+   (~0.15/run per arm, spanning the 0.125 observed).  ☠ Pooled, 0/40 against
+   a build-invariant 0.125/run has probability 0.5% — the instrumented build
+   most likely does NOT expose the phenomenon at the original build's rate,
+   so "powered" overstates the power against the ORIGINAL event.  More runs
+   will not settle it; it needs a different instrument or a deterministic
+   trigger.  The earlier "pre-existing, safe to land over" attribution
+   stays REFUTED.
+   The gate's holdtrace config runs without its imw legs until B closes;
    re-adding them is E.2's completion criterion, and E.5 cannot lift
    the coarse spacings before that.
 3. ☑ FIRST-PASS CLEAN (2026-08-27, unblocked by E.0): both suites at BOTH

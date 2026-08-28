@@ -1,6 +1,17 @@
 import re, sys
 # A dedupe (shared=1) is SUSPECT when the most recent REAL take (shared=0) of
 # that word was by a DIFFERENT thread: a dedupe may only ride the op's own take.
+#
+# ☠ COMPARATIVE ONLY -- NOT A ZERO-BAR.  A release rides its commit and is not
+# traced, so this cannot maintain per-thread ownership: it keeps ONE last-taker
+# per word, and when two threads alternate on one anchor (each taking, holding,
+# releasing) a dedupe by the thread that took EARLIER but still holds is
+# misattributed to the other's newer take.  Verified false positive: a flagged
+# thread went on to drop FIVE entries keyed on that anchor (nmatch=5), i.e. it
+# genuinely held it.  Use the counts to COMPARE configurations (per-node 0 vs
+# root-only 217 is a structural difference); for a pass/fail bar use the
+# member-keyed oracle and the in-code FT EXTRAS STALE detector, both of which
+# know real ownership.
 last_take = {}      # lock -> vtid of most recent shared=0 note
 susp = 0; ok = 0; ex = []
 for line in open(sys.argv[1]):
