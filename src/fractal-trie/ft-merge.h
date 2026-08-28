@@ -1682,6 +1682,22 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		txn = ft_flip_txn_take(pre_txn);
 		if (!txn) {
 			txn = ft_flip_txn_create(dst_ft);
+			/*
+			 * SIZE THE LOCK REGISTRY FROM THE PLAN, here where
+			 * -ENOMEM still propagates.  The fenced overlap retires
+			 * are what load it -- ft_glue_tombstone_free_list
+			 * registers one word per !shared fenced holder, on BOTH
+			 * sides -- and @cap_free is exactly that plan-time
+			 * count.  Without this the registry grows mid-commit,
+			 * past the abort-impossible point, where an allocation
+			 * failure has nowhere to unwind to.
+			 */
+			if (txn && !ft_flip_txn_reserve_locks(txn,
+					gd.cap_free + gs.cap_free
+						+ FT_FLIP_TXN_FLOOR_LOCKS)) {
+				ft_flip_txn_destroy(txn);
+				txn = NULL;
+			}
 			if (txn && !ft_flip_txn_reserve(txn,
 					nr_dst + 1 + ms_cap + gd.cap_free
 						+ gd.nr_splices

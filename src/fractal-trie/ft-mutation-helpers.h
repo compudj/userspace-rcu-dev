@@ -986,7 +986,29 @@ extern unsigned long cds_ft_probe_promote_guarded;
  * profile, the shape to move to is a small embedded array with a heap overflow
  * for the rare wide set -- not a lower cap, which merely re-hides the assert.
  */
-#define FT_FLIP_TXN_MAX_LOCKS	(FT_ENTRY_PER_NODE + 1)
+/*
+ * ☠ NOT A CAP -- A FLOOR.  This was a fixed bound, and the bound was FALSE: the
+ * registry's load is set by the CALLER, not by a node's fan-out.  A lock_fine
+ * cds_ft_merge_at fences every internal overlap node on both sides
+ * (ft_merge_build -> ft_glue_defer_free_fenced) and registers each one, so the
+ * count tracks the OVERLAP SIZE.  Measured at per-node spacing, the shipping
+ * default: 254 overlapping internal nodes overflow it (highwater 257/257 at
+ * 253, assert at 254) -- and the assert is compiled out under NDEBUG, where
+ * @nr_locks is the field immediately after the array, so the first overflowing
+ * store clobbers the COUNT with a pointer's low word and the release sweep then
+ * CASes through garbage.  See fractal-trie-review-2026-06/cap_merge.c.
+ *
+ * So the array grows, as this file's own note above already prescribed: a small
+ * embedded array with a heap overflow for the rare wide set.  The floor keeps
+ * every shape that fits today allocation-free.
+ */
+#define FT_FLIP_TXN_FLOOR_LOCKS	(FT_ENTRY_PER_NODE + 1)
+/*
+ * Retained for the SEPARATE caller-side arrays sized by it (the acquire's
+ * @taken set, the orphan-chain sweeps): those bound a single node's fan-out,
+ * which genuinely is FT_ENTRY_PER_NODE, and are not the txn registry.
+ */
+#define FT_FLIP_TXN_MAX_LOCKS	FT_FLIP_TXN_FLOOR_LOCKS
 
 struct ft_flip_txn {
 	struct urcu_txn *mtxn;	/* the concurrent commit engine handle:
@@ -1072,8 +1094,14 @@ struct ft_flip_txn {
 		 * tombstone and skip a scrub that is owed.
 		 */
 		bool tombstone_terminal;
-	} locks[FT_FLIP_TXN_MAX_LOCKS];
+	} *locks;			/* @locks_floor, or a heap growth */
 	unsigned int nr_locks;
+	unsigned int cap_locks;
+	/*
+	 * The inline floor @locks points at until a wide op outgrows it.  Last
+	 * of the big members: everything above stays in the first cache lines.
+	 */
+	struct ft_flip_txn_lock locks_floor[FT_FLIP_TXN_FLOOR_LOCKS];
 	/*
 	 * Set when a per-node lock acquire MISSED (see
 	 * ft_flip_txn_lock_or_guard_parent).  The op then structurally writes a
@@ -1506,6 +1534,8 @@ bool ft_txn_content_sw_ok(const struct cds_ft *ft)
  * lock take {clean -> LOCK|s} is the arbitration point and must record MW even
  * on a trie whose content may park SW.
  */
+static inline void ft_flip_txn_free(struct ft_flip_txn *t);
+
 static inline
 struct ft_flip_txn *ft_flip_txn_create_at(FT_TK_SITE_PARAM struct cds_ft *ft)
 {
@@ -1525,6 +1555,8 @@ struct ft_flip_txn *ft_flip_txn_create_at(FT_TK_SITE_PARAM struct cds_ft *ft)
 	urcu_txn_expect_conflict(t->mtxn);
 	t->reserved = false;		/* unbounded: @mtxn grows as edges record */
 	t->nr_locks = 0;
+	t->locks = t->locks_floor;
+	t->cap_locks = FT_FLIP_TXN_FLOOR_LOCKS;
 	t->acquire_miss = false;
 	t->acquire_enomem = false;
 	t->pending_pub_slot = NULL;
@@ -1712,7 +1744,7 @@ struct ft_flip_txn *ft_flip_txn_create_bounded_at(FT_TK_SITE_PARAM
 	if (!ft_flip_txn_reserve(t, cap)) {
 		if (t->mtxn->desc && t->mtxn->desc != URCU_TXN_ENOMEM)
 			urcu_txn_destroy(t->mtxn->desc);
-		free(t);
+		ft_flip_txn_free(t);
 		return NULL;
 	}
 	return t;
@@ -1746,6 +1778,8 @@ struct ft_flip_txn *ft_flip_txn_create_on_at(FT_TK_SITE_PARAM
 	urcu_txn_expect_conflict(t->mtxn);
 	t->reserved = false;		/* unbounded: @mtxn grows as edges record */
 	t->nr_locks = 0;
+	t->locks = t->locks_floor;
+	t->cap_locks = FT_FLIP_TXN_FLOOR_LOCKS;
 	t->acquire_miss = false;
 	t->acquire_enomem = false;
 	t->pending_pub_slot = NULL;
@@ -1795,11 +1829,13 @@ struct ft_flip_txn *ft_flip_txn_create_bounded_on_at(FT_TK_SITE_PARAM
 		return NULL;
 	t->mtxn = op;
 	if (urcu_txn_reserve(op, cap) < 0) {
-		free(t);
+		ft_flip_txn_free(t);
 		return NULL;
 	}
 	t->reserved = true;
 	t->nr_locks = 0;
+	t->locks = t->locks_floor;
+	t->cap_locks = FT_FLIP_TXN_FLOOR_LOCKS;
 	t->acquire_miss = false;
 	t->acquire_enomem = false;
 	t->pending_pub_slot = NULL;
@@ -2742,11 +2778,82 @@ void ft_flip_txn_claim_per_op(struct ft_flip_txn *t)
  * the op's held set, and a later member that coarsens onto this word carries no
  * snapshot of its own.
  */
+/*
+ * Grow the registry to hold @want slots.  Doubling, so a wide op pays O(log n)
+ * allocations; the floor means no op that fits today allocates at all.
+ *
+ * SAFE TO MOVE: no caller holds a POINTER into locks[] -- ft_flip_txn_lock_own
+ * hands back an INDEX and every consumer is indexed -- so a growth cannot
+ * dangle a reference the way a pointer into the glue's free list would.
+ */
+static inline
+bool ft_flip_txn_locks_grow(struct ft_flip_txn *t, unsigned int want)
+{
+	struct ft_flip_txn_lock *p;
+	unsigned int cap = t->cap_locks;
+
+	if (caa_likely(want <= cap))
+		return true;
+	while (cap < want)
+		cap *= 2;
+	p = (struct ft_flip_txn_lock *) malloc((size_t) cap * sizeof(*p));
+	if (!p)
+		return false;
+	memcpy(p, t->locks, (size_t) t->nr_locks * sizeof(*p));
+	if (t->locks != t->locks_floor)
+		free(t->locks);
+	t->locks = p;
+	t->cap_locks = cap;
+	return true;
+}
+
+/*
+ * Size the registry from a PLAN-TIME count, at a choke point where -ENOMEM
+ * still propagates.  The merge/fold pre-pass already counts the fenced retires
+ * that will be registered, so the register below never has to grow on the
+ * committing path -- where a failure has nowhere to unwind to.
+ */
+static inline
+bool ft_flip_txn_reserve_locks(struct ft_flip_txn *t, unsigned int n)
+{
+	return ft_flip_txn_locks_grow(t, n);
+}
+
+/* Release the registry's heap growth.  Every txn free path routes here. */
+static inline
+void ft_flip_txn_free(struct ft_flip_txn *t)
+{
+	if (t->locks != t->locks_floor)
+		free(t->locks);
+	free(t);
+}
+
 static inline
 void ft_flip_txn_lock_register(struct ft_flip_txn *t,
 		struct cds_ft_metadata *meta, uintptr_t snap)
 {
-	assert(t->nr_locks < FT_FLIP_TXN_MAX_LOCKS);
+	/*
+	 * ☠ FAIL-STOP, NOT AN ASSERT.  The old guard was compiled out under
+	 * NDEBUG and the overflow it named is CALLER-DRIVEN and reachable (see
+	 * FT_FLIP_TXN_FLOOR_LOCKS).  Growing is the fix; this is the backstop
+	 * for a growth that cannot allocate.
+	 *
+	 * Why STOP rather than drop or propagate: a dropped registration is a
+	 * word whose release this txn now owns and will never perform -- the
+	 * hand-off already set @txn_owned, so the caller's own sweep skips it
+	 * too -- which leaves the word LOCKed forever and every later acquire
+	 * refusing it.  A permanent lock leak is a livelock, strictly worse
+	 * than stopping.  And the loudest producers (ft_glue_tombstone_free_list
+	 * via ft_glue_apply_deferred, ft_glue_txn_commit_edges) run PAST the
+	 * abort-impossible point, so there is no return value for them to
+	 * honour.  Callers that CAN unwind reserve up front instead.
+	 */
+	if (caa_unlikely(!ft_flip_txn_locks_grow(t, t->nr_locks + 1))) {
+		fprintf(stderr, "FT: out of memory growing the lock registry "
+			"(%u held) -- cannot drop a registration without "
+			"leaking the word's release\n", t->nr_locks);
+		abort();
+	}
 #ifdef FT_LOCKS_HIGHWATER
 	{
 		static unsigned int hw;
@@ -3602,7 +3709,7 @@ void ft_flip_txn_destroy(struct ft_flip_txn *t)
 		 */
 		t->mtxn->desc = NULL;
 	}
-	free(t);
+	ft_flip_txn_free(t);
 }
 
 /*
@@ -3736,7 +3843,7 @@ enum urcu_txn_status ft_flip_txn_commit(struct cds_ft *ft,
 		for (bs_i = 0; bs_i < t->nr_locks; bs_i++)
 			ft_hold_trace_drop_tolerant(t->locks[bs_i].meta);
 	}
-	free(t);
+	ft_flip_txn_free(t);
 	return st;
 }
 
