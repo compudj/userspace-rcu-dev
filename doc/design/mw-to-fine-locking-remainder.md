@@ -408,7 +408,7 @@ anchors deep ops near the root BY DESIGN — a bulk-heavy trie should stay
 per-node spacing, and Phase E's bench must measure the spacing axis against a
 bulk MIX, not the point mix alone.
 
-Three candidate mechanisms, with a proposed split:
+Five candidate mechanisms, with a proposed split:
 
 **(A) The bulk op locks its WRITTEN FAN — never the subtree.** A moved
 subtree's INTERIOR moves wholesale: no interior word is written, so a deep
@@ -484,6 +484,45 @@ around the wait (the QSBR mover fix, again); (3) the drain bound is still
 the longest in-flight point op, so Phase D remains the prerequisite —
 though only retries INTO the frozen subtree matter; (4) readers never check
 the state: wait-freedom untouched.
+
+**(E) SWAP THE SUBTREE'S MODE — shared -> EXCLUSIVE, via a per-subtree SEALED
+EPOCH (`mcas-multiwriter-readiness.md` §5.2/§5.3, its open question 2).** Not a
+freeze on a word the descent reads: a MODE TRANSITION for the subtree, whose
+whole difficulty is the transition itself. §5.3's asymmetry is the premise —
+producing structure ONTO an exclusive side is Tier-1 at any size, and the one
+irreducible multi-writer cost is going the other way, *quiescing the writers
+already inside*. ★ **The check lives at the writer's COMMIT / RETRY point, not
+on its descent**, which is exactly why it reaches an interior writer that never
+crosses the boundary again — the choke point every mutation passes, where
+(A)/(B)/(D)'s boundary has no purchase. Mechanically it needs no new blocking
+primitive: a commit whose write set falls under a live seal ABORTS, which is
+this engine's ordinary control flow, so the bulk op waits for in-flight peers
+to FAIL rather than to finish. Protocol: take the junction's DLM lock-set
+(bulk-vs-bulk rides the existing acquire/validate, as in (D)); publish the
+seal; one GP so every in-flight mutation has either committed or will see it;
+edit writer-excluded; publish the result with the O(1) boundary commit; clear
+and wake. ☠ **AND ITS PRIZE MUST NOT BE OVERSTATED — see G5.2**: a SEALED
+subtree is writer-quiesced but NOT reader-drained, so §5.2's full vacuity
+(plain stores, synchronous frees) does NOT apply to it. Obligations: the abort
+must be distinguishable from an ordinary conflict or the retry loop replans
+forever (the livelock class already measured twice here); aborters must PARK
+`thread_offline` rather than spin, or they starve the GP the seal's own drain
+needs (Phase D again); FIFO both ways. ☞ Engine gap, step4 §6.3: "may need a
+new per-subtree epoch the engine does not provide". ★ Note it DISSOLVES (D)'s
+obligation (1): a handle-based mutation that never descends still COMMITS, so
+a commit-point check covers it with no re-descend rule.
+
+**Proposed split — ☠ REOPENED, do not act on it as written (G5.0/G5.1/G5.2 below).**
+As originally stated: (D) is the default for the bulk family — it gives (B)'s
+semantic freeze and free SW-content arming at (A)'s scope, for a point-op
+cost of a branch on an already-loaded word, and (B) falls out of it as the
+root placement. (A) remains for bulk shapes that need no semantic freeze
+(deep ops commute and are never stalled; its fan half retires at §8.3
+regardless). (C) unchanged for cross-trie. To settle with Mathieu before
+Phase B reaches the bulk sites: the freeze encoding in the state word, the
+park/wake mechanism, FIFO fairness both ways, and the handle-path
+re-descend trigger.
+
 
 ### G5.0 — (D)'s "ZERO EXTRA LOADS" PREMISE IS REFUTED; the COST CLAIM built on it was WRONG TWICE and is now scoped
 
@@ -647,15 +686,37 @@ decided.  ☠ The `mcas-multiwriter-readiness.md` open-questions list has carrie
 this as item 2 ("subtree-wide freezing vs a per-subtree sealed epoch") since
 before this doc was written; it was never folded in here.
 
-**Proposed split:** (D) is the default for the bulk family — it gives (B)'s
-semantic freeze and free SW-content arming at (A)'s scope, for a point-op
-cost of a branch on an already-loaded word, and (B) falls out of it as the
-root placement. (A) remains for bulk shapes that need no semantic freeze
-(deep ops commute and are never stalled; its fan half retires at §8.3
-regardless). (C) unchanged for cross-trie. To settle with Mathieu before
-Phase B reaches the bulk sites: the freeze encoding in the state word, the
-park/wake mechanism, FIFO fairness both ways, and the handle-path
-re-descend trigger.
+
+### G5.2 — ☠ SEALED IS NOT EXCLUSIVE: the "plain stores" prize is HALF of what §5.2 grants
+
+G5.1 wrote that a locally-exclusive subtree pays "NO TRANSACTION AT ALL" on its
+interior.  ☠ **That overstates it for a SEALED subtree, and the distinction is
+the whole reason (E) is a design rather than a copy of detach.**
+
+`mcas-multiwriter-readiness.md` §5.2 grants vacuity to **`ft->exclusive`**,
+which is a trie with neither concurrent writers NOR concurrent readers, and the
+two invariants it kills are SEPARABLE:
+* **Invariant 2 (writer-vs-writer)** — dies under a seal.  No peer writer can
+  commit into the subtree, so interior edges need no MCAS, no descriptor, no
+  freeze, no expected-old arbitration.  **This is the expensive half, and (E)
+  really does win it.**
+* **Invariant 1 (reader-visibility)** — **SURVIVES**.  A sealed subtree is
+  still LINKED, so new readers keep arriving, and by (E)'s own design readers
+  never check the seal (wait-freedom untouched).  Interior edges therefore
+  still need release publication and DEFERRED (not synchronous) frees.
+
+So the honest statement is **writer-quiesced, not exclusive**: the interior
+work becomes plain RCU publication instead of transacted multi-writer
+arbitration — still a large win, and strictly better than (D)'s "SW content
+records" — but NOT §5.2's free-at-any-size Tier-1.
+
+☠ **And the tempting fix is the one this project already rejected.**  Full
+exclusivity needs the reader drain too, i.e. UNLINK the subtree, GP, work,
+relink — which is exactly detach's shape and exactly what
+[[project_ft_staged_rekey_writer_deleted]] was deleted for: a tmp-trie HIDES
+LIVE KEYS for a grace period per move.  Unlinking a populated subtree makes its
+keys vanish from lookups for the whole window.  ⇒ (E) must stay LINKED, and
+must therefore claim only the writer half.
 
 ---
 
