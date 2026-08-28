@@ -1173,6 +1173,16 @@ struct cds_ft_metadata {
 	 * only the anchors distinguish it from a genuine two-system collision.
 	 */
 	const struct cds_ft_metadata *dbg_owner_anchor;
+	/*
+	 * The last anchor ANY op derived for this node, kept across yields.
+	 * At a fixed spacing the anchor is a function of the node and its
+	 * DEPTH, so two ops deriving different words for one node is a
+	 * derivation disagreement -- the class that leaves each op excluding
+	 * on a word the other never takes.  Detecting it here needs no
+	 * collision, so it measures the DISAGREEMENT RATE rather than waiting
+	 * for two ops to lose the race on the same node.
+	 */
+	const struct cds_ft_metadata *dbg_last_anchor;
 #endif
 };
 

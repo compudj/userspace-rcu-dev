@@ -2013,6 +2013,112 @@ bool ft_hold_trace_report_ok(void)
 	return true;
 }
 
+#ifdef FT_EXCL_REPORT_ONLY
+/*
+ * THE POWERED CLASSIFIER (report-only).  The oracle's abort turns every run
+ * into ONE observation of the FIRST collision, which is why an 8-run arm can
+ * only ever say "1 of 8" -- a sample too small to attribute anything (Fisher
+ * p = 1.0 on 1/8 vs 0/7).  Under this knob the claim REPORTS and CONTINUES, so
+ * one run yields every collision it produces, and each is filed under the four
+ * facts that separate the candidate causes:
+ *
+ *   owner-anchor word LIVE (LOCK|PROXY) vs CLEAN
+ *		CLEAN says nobody could still be excluding on it, so the
+ *		OWNER'S STAMP IS STALE and the event is an oracle artifact
+ *		rather than a real two-writer overlap.
+ *   anchors DIFFER vs agree
+ *		differ = the two ops excluded on two words (a derivation
+ *		disagreement); agree = one word arbitrated both, which is a
+ *		hold-system defect, not a spacing one.
+ *   LANE	which hold system vouched for the claimant -- a glue-* lane
+ *		names finding-B residue in a hand-off the terminal scrub does
+ *		not reach.
+ *   shared	dedupe vs a real take.
+ *
+ * ☠ REPORT-ONLY IS NOT A PASSING RUN.  The stamp is left in the claimant's
+ * name and the op continues over a node another writer may be mutating, so a
+ * downstream crash under this build carries no information.  It is an
+ * INSTRUMENT, never a gate.
+ */
+#define FT_EXCL_RO_LANES	32
+struct ft_excl_ro_lane {
+	const char *lane;		/* the literal, compared by POINTER */
+	unsigned long n[2][2][2];	/* [owner LIVE][anchors differ][shared] */
+};
+static struct ft_excl_ro_lane ft_excl_ro_tab[FT_EXCL_RO_LANES];
+static unsigned long ft_excl_ro_total, ft_excl_ro_dropped;
+static pthread_mutex_t ft_excl_ro_lock = PTHREAD_MUTEX_INITIALIZER;
+static bool ft_excl_ro_registered;
+
+static
+void ft_excl_ro_summary(void)
+{
+	unsigned int i, live, diff, sh;
+
+	fprintf(stderr, "FT EXCL SUMMARY: total %lu (lane table overflow %lu)\n",
+		ft_excl_ro_total, ft_excl_ro_dropped);
+	for (i = 0; i < FT_EXCL_RO_LANES; i++) {
+		if (!ft_excl_ro_tab[i].lane)
+			continue;
+		for (live = 0; live < 2; live++)
+		for (diff = 0; diff < 2; diff++)
+		for (sh = 0; sh < 2; sh++) {
+			unsigned long v = ft_excl_ro_tab[i].n[live][diff][sh];
+
+			if (!v)
+				continue;
+			fprintf(stderr, "FT EXCL BUCKET: lane=%s owner=%s "
+				"anchors=%s claim=%s n=%lu\n",
+				ft_excl_ro_tab[i].lane,
+				live ? "LIVE" : "CLEAN",
+				diff ? "differ" : "agree",
+				sh ? "dedupe" : "take", v);
+		}
+	}
+	fflush(stderr);
+}
+
+static
+void ft_excl_ro_count(const char *lane, bool owner_live, bool differ,
+		bool shared)
+{
+	unsigned int i;
+
+	pthread_mutex_lock(&ft_excl_ro_lock);
+	if (!ft_excl_ro_registered) {
+		ft_excl_ro_registered = true;
+		atexit(ft_excl_ro_summary);
+	}
+	ft_excl_ro_total++;
+	/*
+	 * ☠ atexit IS NOT ENOUGH: abort() runs no handler, and this build shares
+	 * a process with the engine's own self-checks -- which a report-only run
+	 * MAKES more likely, since it deliberately continues past a real
+	 * violation.  Snapshot so a run killed from elsewhere still leaves its
+	 * classification behind: the LAST summary block in the log is the
+	 * reading.
+	 *
+	 * EVERY event while they are few, then every 512.  Measured: the class
+	 * these builds exist to weigh occurs about ONCE PER RUN, so a 512-tick
+	 * snapshot alone printed nothing at all and the whole classification of
+	 * a reproducing run was lost to its abort.
+	 */
+	if (ft_excl_ro_total <= 64 || !(ft_excl_ro_total % 512))
+		ft_excl_ro_summary();
+	for (i = 0; i < FT_EXCL_RO_LANES; i++) {
+		if (!ft_excl_ro_tab[i].lane)
+			ft_excl_ro_tab[i].lane = lane;
+		if (ft_excl_ro_tab[i].lane == lane) {
+			ft_excl_ro_tab[i].n[owner_live][differ][shared]++;
+			goto out;
+		}
+	}
+	ft_excl_ro_dropped++;
+out:
+	pthread_mutex_unlock(&ft_excl_ro_lock);
+}
+#endif /* FT_EXCL_REPORT_ONLY */
+
 /*
  * The E.2 exclusion oracle.  CLAIM the member node's stamp at the acquire;
  * a live foreign stamp IS the violation -- two writers covering one node,
@@ -2034,34 +2140,75 @@ void ft_owner_stamp_claim(struct cds_ft_metadata *member,
 	old = uatomic_xchg(&member->dbg_owner_tid, self);
 	if (old && old != self) {
 		const struct cds_ft_metadata *oa = member->dbg_owner_anchor;
+		uintptr_t oa_st = oa ? CMM_LOAD_SHARED(oa->state) : 0;
+		bool report = true;
 
-		fprintf(stderr, "FT EXCLUSION VIOLATION: node %p claimed at "
-			"%s:%d by tid %lx (anchor %p%s) while owned by tid "
-			"%lx (from %s:%d, anchor %p%s)\n  %s\n"
-			"  claimant %s: %s\n",
-			(void *) member, fn, line, self,
-			(const void *) anchor,
-			anchor == member ? "=SELF" : "",
-			old,
-			member->dbg_owner_fn ? member->dbg_owner_fn : "?",
-			member->dbg_owner_line, (const void *) oa,
-			oa == member ? "=SELF" : "",
-			ft_hold_trace_holds(anchor) ?
-				"ledger CONFIRMS the claimant holds it "
-				"(so the OWNER's stamp is the stale one)" :
-				"ledger says the claimant does NOT hold it "
-				"(so the claimant's answer is the stale one)",
-			shared ? "DEDUPED via lane" : "TOOK it; lane",
-			anchor != oa ? "ANCHOR DISAGREEMENT" :
-				(shared ? ft_dlm_dbg_dedupe_lane :
-					"n/a (owner stamp outlived its hold)"));
+#ifdef FT_EXCL_REPORT_ONLY
+		/*
+		 * COUNT FIRST, then print under the cap: the print is what a
+		 * long report-only run drowns in, while the classification is
+		 * the measurement and must survive the cap intact.
+		 */
+		ft_excl_ro_count(shared ? ft_dlm_dbg_dedupe_lane : "took",
+			!!(oa_st & (FT_STATE_LOCK | FT_STATE_PROXY)),
+			anchor != oa, shared);
+		report = ft_hold_trace_report_ok();
+#endif
+		if (report)
+			fprintf(stderr, "FT EXCLUSION VIOLATION: node %p claimed at "
+				"%s:%d by tid %lx (anchor %p%s) while owned by tid "
+				"%lx (from %s:%d, anchor %p%s)\n  %s\n"
+				"  claimant %s: %s | %s | owner-anchor state %lx, "
+				"claim-anchor state %lx\n",
+				(void *) member, fn, line, self,
+				(const void *) anchor,
+				anchor == member ? "=SELF" : "",
+				old,
+				member->dbg_owner_fn ? member->dbg_owner_fn : "?",
+				member->dbg_owner_line, (const void *) oa,
+				oa == member ? "=SELF" : "",
+				ft_hold_trace_holds(anchor) ?
+					"ledger CONFIRMS the claimant holds it "
+					"(so the OWNER's stamp is the stale one)" :
+					"ledger says the claimant does NOT hold it "
+					"(so the claimant's answer is the stale one)",
+				shared ? "DEDUPED via lane" : "TOOK it; lane",
+				shared ? ft_dlm_dbg_dedupe_lane : "n/a (took it)",
+				anchor != oa ? "ANCHORS DIFFER" : "anchors agree",
+				(unsigned long) oa_st,
+				(unsigned long) CMM_LOAD_SHARED(anchor->state));
 		FT_TP(stamp_violation, (const void *) member,
 			(const void *) anchor, (const void *) oa, old,
 			(int) shared, (int) ft_hold_trace_holds(anchor),
 			fn, line);
+#ifndef FT_EXCL_REPORT_ONLY
 		ft_trace_capture();
 		abort();
+#endif
 	}
+#ifdef FT_ANCHOR_AGREE_PROBE
+	/*
+	 * THE ANCHOR-DERIVATION PROBE, and ☠ ITS MEASURED NOISE FLOOR.  It
+	 * reports every SEQUENTIAL anchor change on a node, which a legitimate
+	 * re-parent produces in bulk: ~5,600 per exponential-MW run.  So its
+	 * Poisson floor is sqrt(5600) ~ 75 events, and it CANNOT exclude
+	 * anything rarer than that -- an arm-vs-control delta of 87 with n=1 a
+	 * side says nothing about an event occurring 0.125 times per run
+	 * (~600x below the floor).  Use it to find a derivation disagreement,
+	 * never to argue one away; the powered instrument for the latter is
+	 * FT_EXCL_REPORT_ONLY, which counts the COLLISIONS themselves.
+	 */
+	{
+		const struct cds_ft_metadata *la = member->dbg_last_anchor;
+
+		if (la && la != anchor && ft_hold_trace_report_ok())
+			fprintf(stderr, "FT ANCHOR DISAGREE: node %p was "
+				"anchored %p, now %p at %s:%d\n",
+				(void *) member, (const void *) la,
+				(const void *) anchor, fn, line);
+		member->dbg_last_anchor = anchor;
+	}
+#endif
 	member->dbg_owner_fn = fn;
 	member->dbg_owner_line = line;
 	member->dbg_owner_anchor = anchor;
@@ -2078,18 +2225,35 @@ void ft_owner_stamp_yield(struct cds_ft_metadata *member)
 	old = uatomic_cmpxchg(&member->dbg_owner_tid, self, 0);
 	FT_TP(stamp_yield, (const void *) member, old);
 	if (old != self && old != 0) {
+		bool report = true;
+
+#ifdef FT_EXCL_REPORT_ONLY
+		/*
+		 * A yield mismatch is the CLAIM violation's echo -- the stamp
+		 * the report-only claim deliberately left in a peer's name --
+		 * so it is not a second population, and it is capped rather
+		 * than counted.  Its abort must go too: it would truncate the
+		 * run at the first echo and cost exactly the power this build
+		 * exists to buy.
+		 */
+		report = ft_hold_trace_report_ok();
+#endif
 		/*
 		 * Print the site POINTER raw: a stale entry's member may have
 		 * been reused, making dbg_owner_fn a wild pointer -- the
 		 * canary below makes that unreachable, but a diagnostic must
 		 * not crash inside its own report.
 		 */
-		fprintf(stderr, "FT EXCLUSION VIOLATION: yield of node %p by "
-			"tid %lx finds foreign owner tid %lx (site %p:%d)\n",
-			(void *) member, self, old,
-			(const void *) member->dbg_owner_fn,
-			member->dbg_owner_line);
+		if (report)
+			fprintf(stderr, "FT EXCLUSION VIOLATION: yield of node "
+				"%p by tid %lx finds foreign owner tid %lx "
+				"(site %p:%d)\n",
+				(void *) member, self, old,
+				(const void *) member->dbg_owner_fn,
+				member->dbg_owner_line);
+#ifndef FT_EXCL_REPORT_ONLY
 		abort();
+#endif
 	}
 	/* old == 0: an idempotent second yield (duplicate entries). */
 }
