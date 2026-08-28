@@ -9788,6 +9788,32 @@ struct ft_glue {
 	 */
 	bool publish_gp_scrubbed;
 	/*
+	 * THE FENCED FREEZE LANE'S SILENCER (finding B), and ONE flag for the
+	 * whole batch rather than one per entry.
+	 *
+	 * ☠ IT LIVES IN THE GLUE STRUCT, NEVER IN @free_list.  That array is
+	 * MALLOC'D past FT_GLUE_FLOOR_FREE and several bails run ft_glue_abort
+	 * -- which finis the glue and FREES it -- BEFORE the txn's terminal:
+	 * ft_rekey_graft_simple_attempt hands off at the tombstone sweep, an
+	 * -ENOMEM at the marks reserve jumps to bail_build, which aborts both
+	 * glues and only then destroys the txn.  A silencer addressed into the
+	 * array is a write through freed heap.  The STRUCT outlives the txn on
+	 * every path -- it is the same lifetime the two publish fences above
+	 * already bet on -- so the flag rides a proven invariant and mints no
+	 * new one.  (A slot-indexed array cannot be used either: the registry
+	 * grows, so a slot index has no fixed bound.)
+	 *
+	 * ONE flag is enough because every freeze hand-off in a glue belongs to
+	 * the SAME txn and settles at the SAME terminal.  What the flag cannot
+	 * express -- which of them RETIRED its word, and so must keep answering
+	 * dedupe-on-dead -- the arm reads off the word itself: past our
+	 * terminal, answer only for a word wearing TOMBSTONE.  That test is
+	 * safe HERE though it is not safe at the scrub, because the outcomes
+	 * are asymmetric: a dead word puts no exclusion at stake whoever killed
+	 * it, while a LIVE one may already belong to a peer.
+	 */
+	bool freeze_terminal_done;
+	/*
 	 * MW LOCK_FINE drop, split-compressed graft: the node lock held on
 	 * the compressed divergence node @cn (== d->nf) that this GLUE build
 	 * SPLITS and REPLACES.  A graft that diverges inside a compressed node
@@ -10008,6 +10034,7 @@ void ft_glue_init(struct ft_glue *g)
 	g->publish_gp_snap = 0;
 	g->publish_gp_txn_owned = false;
 	g->publish_gp_scrubbed = false;
+	g->freeze_terminal_done = false;
 	g->split_cn_holder = NULL;
 	g->split_cn_shared = false;
 	g->split_cn_node = NULL;
@@ -11447,6 +11474,19 @@ bool ft_glue_held_snap_one(const struct ft_glue *g,
 		if (g->free_list[i].holder == meta &&
 				!g->free_list[i].holder_shared &&
 				!g->free_list[i].consumed) {
+			/*
+			 * Past our terminal this entry answers only for a DEAD
+			 * word: a released one came back LIVE and re-lockable,
+			 * and a peer may already hold it (finding B), while a
+			 * TOMBSTONE is dedupe-on-dead whoever set it.
+			 */
+			if (caa_unlikely(g->freeze_terminal_done) &&
+					!(CMM_LOAD_SHARED(meta->state) &
+						FT_STATE_TOMBSTONE)) {
+				FT_GLUE_SAVED_COUNT(2, g->free_list[i]
+					.holder_txn_owned);
+				continue;
+			}
 			FT_GLUE_ARM("freelist_holder");
 			ft_glue_stale_check(2, meta,
 				g->free_list[i].holder_txn_owned);
@@ -12033,6 +12073,13 @@ void ft_glue_tombstone_free_list(struct ft_glue *g)
 {
 	int i;
 
+	/*
+	 * A FRESH BATCH ANSWERS AGAIN.  One flag serves every hand-off below,
+	 * so a glue that already carried a batch through a terminal must clear
+	 * it here or the entries filed next would be born silenced -- the same
+	 * rule ft_glue_take_publish_parent applies to its own fence.
+	 */
+	g->freeze_terminal_done = false;
 	for (i = 0; i < g->nr_free; i++) {
 		struct cds_ft_metadata *meta = cds_ft_item_to_metadata(
 			(struct cds_ft_inode *) g->free_list[i].node);
@@ -12147,27 +12194,25 @@ void ft_glue_tombstone_free_list(struct ft_glue *g)
 			 */
 			if (!h.shared) {
 				/*
-				 * ☠ NO SILENCER ON THIS LANE, DELIBERATELY.  A
-				 * pointer to @holder_scrubbed would address the
-				 * free list -- a MALLOC'D array once the retire
-				 * set passes FT_GLUE_FLOOR_FREE -- and several
-				 * bails run ft_glue_abort (which finis the glue
-				 * and FREES that array) BEFORE the txn's own
-				 * terminal: ft_rekey_graft_simple_attempt hands
-				 * off, then an -ENOMEM at the marks reserve
-				 * jumps to bail_build, which aborts both glues
-				 * and only then destroys the txn.  The scrub
-				 * would write through freed heap.
+				 * OWN it: this entry answers holds() for the
+				 * ANCHOR until the txn's terminal gives that
+				 * word back.  The silencer is the GLUE's flag,
+				 * never this array element -- see
+				 * @freeze_terminal_done for why the array may
+				 * not be addressed.
 				 *
-				 * The lane keeps its pre-scrub behaviour, which
-				 * costs nothing measurable: across both suites
-				 * and both builds this arm took 262k hand-offs
-				 * and was consulted ZERO times.  Closing it
-				 * needs the silencer in storage that outlives
-				 * the txn, not a second lifetime rule.
+				 * @tombstone_terminal is deliberately NOT
+				 * stamped here.  With one shared flag it would
+				 * only decide whether the terminal announces
+				 * itself at all, and the arm resolves the
+				 * retire case from the word instead; a batch
+				 * that retires everything simply leaves the
+				 * flag clear, which its own TOMBSTONEs make
+				 * correct.
 				 */
-				ft_flip_txn_lock_register(g->txn, h.lock,
-					h.lock_snap);
+				(void) ft_flip_txn_lock_own_silenced(g->txn,
+					h.lock, h.lock_snap,
+					&g->freeze_terminal_done);
 				FT_GLUE_OWN_COUNT(2);
 				g->free_list[i].holder_txn_owned = true;
 			}
