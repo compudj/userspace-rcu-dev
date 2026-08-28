@@ -209,6 +209,38 @@ ALL_CONFIGS=(
 	# here to be run with FT_GATE_REPEAT when hunting, and the 3-spacing sweep
 	# is mandatory because the defect it was built from is exponential-only.
 	"anchorval|-DDEBUG_RCU -DFEATURE_FT_ANCHOR_VALIDATE|u ion ioff imw|per-node exponential root-only"
+	# ★ THE PROBE-FREE COARSE-SPACING LEG -- Phase E.5's missing control.
+	#
+	# Every other config that sweeps the spacing axis (txndbg, proxyassert,
+	# holdtrace, anchorval) carries FEATURE_FT_ANCHOR_VALIDATE or
+	# FEATURE_FT_HOLD_TRACE, because until this config existed those flags were
+	# the only way to make a coarse spacing SELECTABLE.  So the entire
+	# certification corpus for exponential and root-only was gathered on
+	# INSTRUMENTED builds, and the configuration the API gate would actually
+	# ship -- a coarse spacing with no probe compiled in -- had never been run.
+	#
+	# FEATURE_FT_LOCK_SPACING_ENV is the knob WITHOUT the probes.  It is reached
+	# through ft_lock_spacing_default() (ft-lifecycle.h), which sets the group's
+	# DEFAULT and is deliberately not behind the setter's refusal -- so this
+	# build selects a coarse spacing while cds_ft_group_attr_set_lock_spacing
+	# still refuses one, which is exactly the shipping API contract.
+	#
+	# ★ WHAT IT CAN AND CANNOT SEE, and that asymmetry is the point.  With no
+	# DEBUG_RCU, no anchor validation and no hold ledger, this leg detects only
+	# what a USER would: an invariant violation, a wrong key count, a crash, a
+	# hang.  It is not a better detector than anchorval -- it is the CONTROL for
+	# it, differing by exactly "-DDEBUG_RCU -DFEATURE_FT_ANCHOR_VALIDATE" over
+	# the same four suites at the same three spacings.  A failure HERE is a
+	# shipping-shape failure; a failure only in anchorval is a probe finding.
+	# It is also the uninstrumented arm the E.4 spacing bench had to fake by
+	# running its whole matrix under ANCHOR_VALIDATE for uniform overhead.
+	#
+	# ☠ It does NOT certify the coarse spacings.  The per-op arm refuses any
+	# spacing but per-node (ft_txn_per_op_spacing_ok), so the two coarse legs
+	# run the all-MW content path -- sound, and stricter, but NOT the engine
+	# Phase B built.  Reading a green here as "E.5 is clear" would be reading a
+	# control as a result.
+	"spacingenv|-DFEATURE_FT_LOCK_SPACING_ENV|u ion ioff imw|per-node exponential root-only"
 	"noskip|-DNO_FEATURE_FT_SKIP_COMPRESSED|u ioff"
 	"nocompress|-DNO_FEATURE_FT_COMPRESS|u ioff"
 	# Concurrent legs are SAFE here since the in-place tier became runtime
