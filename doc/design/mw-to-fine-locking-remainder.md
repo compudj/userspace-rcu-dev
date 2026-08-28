@@ -1827,6 +1827,61 @@ certification, then the API gate lift (`ft-lifecycle.h:369`):
    LOCK_COARSE becomes an alias (or is retired) once root-only spacing
    matches it on the bench.
 
+   ☞ **THE BLOCKER RE-DERIVED FROM CODE (2026-08-28), because "E.2 blocks
+   E.5" had gone stale the moment E.2 completed.**  Step 4 already resolved
+   the strategy fold NEGATIVE (root-only does not match COARSE), so only the
+   refusal is live.  What stands against it, read out of the tree rather
+   than off this doc's own status rows:
+
+   * **α — the owner predicate is anchor-blind, and this is a VALUE blocker,
+     not a soundness one.**  `ft_txn_per_op_spacing_ok` is literally
+     `lock_spacing == PER_NODE`, and it gates EVERY Phase B per-op arm
+     (`ft_flip_txn_arm_per_op_at`) and the dry-run claim.  Its own header
+     gives the reason: `ft_flip_txn_owns` is EXACT at per-node and
+     CONSERVATIVE above it -- a coarser spacing puts the word's lock on an
+     anchor ANCESTOR which the registry holds while `@owner` is absent, so
+     `owns()` reports a MISS for a word that IS excluded, and under an ARM a
+     false miss is fatal (measured: txndbg/anchorval RED at exponential and
+     root-only, ft_unit dying after 8 tests).  Resolving the anchor needs the
+     op's DESCENT, which a record helper does not have.  ⇒ lifting the
+     refusal today ships two spacings on which ALL of Phase B is inert:
+     content records fall back to all-MW -- sound, stricter, and the
+     pre-Phase-B engine.  With step 4 measuring the three spacings within
+     noise, **the lift currently buys nothing**, which makes α the item that
+     decides whether E.5 is worth doing at all rather than a chore blocking
+     it.  The code names this exact debt at `ft_flip_txn_arm_structural`
+     ("THE SECOND LINE IS PHASE E's DEBT") and again at the predicate
+     ("Lifting the gate is Phase E's spacing certification").
+   * **β — there was NO probe-free evidence at the coarse spacings.  ☑ NOW
+     DISCHARGED.**  All four configs that swept the axis carried
+     ANCHOR_VALIDATE or HOLD_TRACE, so the whole corpus was instrumented
+     builds and the shipping shape had never run.  The `spacingenv` config
+     (`-DFEATURE_FT_LOCK_SPACING_ENV` alone) is the control: 12 legs
+     PER-LEG IDENTICAL to anchorval's twelve, the pair differing by exactly
+     `-DDEBUG_RCU -DFEATURE_FT_ANCHOR_VALIDATE`.  ★ The knob was proven LIVE
+     in the gate's own tree (`_cds_ft_group_create` resolves 1 / 3 / 2 / 1
+     for unset / root-only / exponential / unrecognised) -- the sweep guard
+     checks CPPFLAGS and cannot see whether the build honours the value.
+     ☠ A green here is a CONTROL, not a certification: by α both coarse legs
+     ran the all-MW path.
+   * **γ — E.0's named residual is still ☐.**  An armed SW `nr_child` edge
+     fusing with a guard on a word covered only via a DIFFERENT anchor;
+     `ft_flip_txn_guard_installed_child` shares the gap.  This section said
+     the E.3 sweep is where it would surface, and E.3 is clean -- but "not
+     observed" is not "closed", and the class is coarse-spacing-specific by
+     construction.
+   * **δ — the disputed exponential event stays UNATTRIBUTED** (above), and
+     it lives on one of the two spacings being lifted.
+
+   ☠ **`FEATURE_FT_ANCHOR_COMPLETE` IS A DEAD FLAG.**  It appears in exactly
+   one place in the tree -- `test_lifecycle_lock_spacing`, whose comment says
+   it is what "claims they WORK" -- and NO build defines it, so that test's
+   functional sweep over EXPONENTIAL and ROOT_ONLY is compiled out of every
+   configuration.  The one test that would drive the coarse spacings through
+   the PUBLIC SETTER has never run anywhere.  It cannot simply be defined:
+   the setter refuses those spacings without ANCHOR_VALIDATE, so arming the
+   flag and lifting the refusal are ONE step, and that step is E.5 itself.
+
 ## 8. Phase F — the payoffs (strictly last)
 
 ### 8.1 §8.3 layout split
