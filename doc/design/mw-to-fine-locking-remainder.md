@@ -552,18 +552,43 @@ set grows by up to DEPTH entries during a window — affordable only because
 @758f432d already made the registry GROW; that fix is a prerequisite for this
 candidate and is already in.
 
-☐ **OPEN.**  (i) The age-1+ path BOUNDED-SPINS on a contended word rather than
-parking, and a bulk window is p99 ~240us + a GP (D.5) — the wrong wait, and
-under QSBR a spinner has no quiescent window, so it can starve the bulk op's own
-drain.  This lands exactly on Phase D's acquire lane ("the cure is in the
-ACQUIRE — queue"), with the D.5 wait-ladder as the tool.  (ii) ☠ **A STALL
-SHAPE THAT LEAKS OUT OF THE SUBTREE**: acquiring ascending by address, an
-observer blocked on J still HOLDS every lock in its set sorting below J,
-including leaf locks, for the whole window — so unrelated point ops queue behind
-an op that is itself waiting on the bulk op.  The exclusion is subtree-scoped;
-the stall is not.  (iii) Tier 1 is trie-wide, so any live bulk op makes every
+☑ **THE WAIT IS NOT A BLOCK — MEASURED IN THE ENGINE, and it REFUTES both
+liveness items this entry first carried.**  The age-1+ install spins
+`URCU_TXN_WAIT_PATIENCE` = **8192** `caa_cpu_relax()` iterations
+(rcu-txn-mcas.h:211, :577) and then does NOT block: it records `wait_capped`,
+calls `urcu_txn_decide(FAILED)` and returns, after which SETTLE restores the
+parked prefix `[0..planted)` to its OLD values (":617 — its new value on
+SUCCEEDED, its old on FAILED").  So a contended acquire ABORTS; it never waits
+out its opponent.  Two corrections follow, and they apply to **(B) and (D)
+equally** — any candidate that makes a point op wait on a word a bulk op holds:
+
+* ☠ **"BLOCKED WAITERS ARE PARKED, HENCE QUIESCENT, HENCE THE DRAIN GP
+  COMPLETES" IS FALSE.**  Post-mark ops do not park.  They spin 8192, abort,
+  re-descend, re-plan, spin again — for the whole window.  Under QSBR that
+  retry loop has NO quiescent window, so it can starve **the bulk op's own
+  drain GP**.  (E) therefore does NOT escape the starvation hazard; it
+  inherits it.  ☠ And the abort is the EXPECTED outcome, not the exception:
+  8192 relax iterations is tens to a few hundred microseconds against a window
+  of p99 ~240us of hold (D.5) **plus a grace period**.
+* ☠ **THE "STALL THAT LEAKS OUT OF THE SUBTREE" IS BOUNDED, not window-length.**
+  An op does hold the locks sorting below J while it waits — but only for the
+  capped spin, since settle-on-FAILED unwinds the parked prefix.  A real
+  secondary stall, bounded by patience rather than by the bulk op.
+
+⇒ ★ **THE DESIGN REQUIREMENT THIS PRODUCES: the mark must do DOUBLE DUTY.**  It
+is not only "widen your lock set"; it must also route the waiter to a **PARK**
+(`thread_offline` + wake at the unmark) instead of the ordinary
+spin-abort-retry.  Without that, a bulk window converts into a trie-wide retry
+storm across every op under J — wasted re-descents, and the drain GP endangered
+by the very ops it is waiting on.  ⇒ **Phase D's open acquire lane ("the cure is
+in the ACQUIRE — queue") is a HARD PREREQUISITE for (E), not an adjacent
+concern**, and D.5's wait-ladder is the tool.  ☞ `urcu_txn_expect_conflict`
+skips the doomed age-0 attempt but does NOT change this: the age-1+ path is the
+one that caps and fails.
+
+☐ **STILL OPEN.**  (i) Tier 1 is trie-wide, so any live bulk op makes every
 point op ANYWHERE pay the O(depth) walk; refinable (a depth bound, a coarse
-filter over the marked set) but start simple and measure.  (iv) A near-root J
+filter over the marked set) but start simple and measure.  (ii) A near-root J
 serializes broadly by construction — the honest cost of bulk-near-root, worth
 stating since G5's goal is about near-root contention.
 
@@ -2736,13 +2761,16 @@ stale) — watch it across Phase B, it shares words with the converted sites.
                                                               the mark's encoding (☑ ANSWERED
                                                               by (E): metadata, free on the
                                                               walk that already loads it)
-                                                              ☐ Two liveness items (E) adds:
-                                                              age-1+ BOUNDED-SPINS instead of
-                                                              parking (-> Phase D's acquire
-                                                              lane), and a STALL THAT LEAKS
-                                                              out of the subtree (an observer
-                                                              blocked on J holds every lock
-                                                              sorting below it)
+                                                              ☠☠ PHASE D'S ACQUIRE LANE IS A
+                                                              HARD PREREQUISITE: the age-1+
+                                                              wait is NOT a block -- it spins
+                                                              8192 then ABORTS (settle restores
+                                                              the prefix), so a bulk window
+                                                              becomes a RETRY STORM under J
+                                                              that can starve the bulk op's
+                                                              OWN drain GP.  The mark must also
+                                                              route waiters to a PARK.  True of
+                                                              (B)/(D) too
     E   spacing certification + gate lift + strategy fold   ☠ BLOCKED, and NOT on E.2 --
                                                               re-derived @54c6358e: the blocker
                                                               is ft_txn_per_op_spacing_ok ==
