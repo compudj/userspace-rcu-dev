@@ -485,6 +485,50 @@ the longest in-flight point op, so Phase D remains the prerequisite —
 though only retries INTO the frozen subtree matter; (4) readers never check
 the state: wait-freedom untouched.
 
+### G5.0 — ☠ (D)'s "ZERO EXTRA LOADS" PREMISE IS REFUTED, and it moves the fork
+
+Checked in-tree 2026-08-28, because (D) was proposed as the default on the
+strength of this one claim: *"the mutation descent already loads each entered
+node's state word for dispatch (kind, proxy, skip), so a per-level mode check
+is a BRANCH on a word already in hand."*  **It does not load that word.**
+
+* Kind, proxy and skip are all read from the TAGGED POINTER's low nibble
+  (`FT_TYPE_MASK` / `FT_INTERNAL_MASK`; `0xF` = flip proxy), not from
+  `cds_ft_metadata::state`.
+* The fast-path descent step is `ft_node_get_nth_skip` (the node BODY's child
+  array) -> `ft_resolve_flip_proxy` (a tag test) -> `ft_reanchor_flag` (a tag
+  test).  Neither `ft_descent_step` nor `ft_descent_step_compressed` touches
+  metadata; the only metadata reader on that path is the reanchor's
+  parent-chain walk, which runs on the MISMATCH path only.
+* So a freeze checked per descended node costs **one metadata cache-line load
+  per level**, in a different arena from the node bodies -- not zero.
+
+☠ AND THERE IS NO CHEAPER HOME FOR IT.  `struct cds_ft_inode` is a bare
+`data[FT_ENTRY_PER_NODE * sizeof(ptr)]` with NO header word, so the body the
+descent already touches has no spare slot; the pointer tag's low nibble is
+fully allocated.  The freeze must live in metadata.
+
+⇒ **THE COST COMPARISON INVERTS, so the proposed default is now an open
+question rather than a settled one.**  (B), the ROOT placement, costs point
+mutations ONE trie-level load -- which is exactly the existing `move_active`
+gate (`ft_move_active`, one stable load behind `caa_likely`), already proven
+and already on the rekey path.  (D), the JUNCTION placement, costs one
+metadata load PER DESCENDED LEVEL.  (D) still buys what it always bought --
+stall scope limited to ops crossing the frozen junction, and disjoint bulk ops
+running in parallel -- but it no longer buys it for free, and "the strongest
+possible fit for the near-root goal" was resting on the refuted premise.
+☞ THIS IS MATHIEU'S CALL and it is a fork, not a detail.
+
+☞ **If (D) is chosen, the freeze wants its OWN metadata word, not a
+`FT_STATE_*` bit.**  Bits 11-18 and 20+ of the state word are free, so there is
+room -- but that word is MCAS-transacted and NODE-owned, while the freeze is
+JUNCTION-owned: a bit there lands inside every recorded edge's expected-old
+capture on that word, must join `LOCK`/`TOMBSTONE` in the §4.B guard's masked
+set or become spurious aborts, and inherits `FT_STATE_INPLACE_WAIT_MASK`
+semantics.  §8.3's own rule -- "one word cannot be owned by two locks" -- is
+the argument, and the `parent_slot_offset` split is the precedent for taking a
+field OUT of that word for exactly this reason.
+
 **Proposed split:** (D) is the default for the bulk family — it gives (B)'s
 semantic freeze and free SW-content arming at (A)'s scope, for a point-op
 cost of a branch on an already-loaded word, and (B) falls out of it as the
