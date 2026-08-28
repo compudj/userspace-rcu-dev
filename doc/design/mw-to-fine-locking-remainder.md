@@ -485,49 +485,81 @@ the longest in-flight point op, so Phase D remains the prerequisite —
 though only retries INTO the frozen subtree matter; (4) readers never check
 the state: wait-freedom untouched.
 
-### G5.0 — ☠ (D)'s "ZERO EXTRA LOADS" PREMISE IS REFUTED, and it moves the fork
+### G5.0 — (D)'s "ZERO EXTRA LOADS" PREMISE IS REFUTED; the COST CLAIM built on it was WRONG TWICE and is now scoped
 
 Checked in-tree 2026-08-28, because (D) was proposed as the default on the
-strength of this one claim: *"the mutation descent already loads each entered
-node's state word for dispatch (kind, proxy, skip), so a per-level mode check
-is a BRANCH on a word already in hand."*  **It does not load that word.**
+strength of one claim: *"the mutation descent already loads each entered node's
+state word for dispatch (kind, proxy, skip), so a per-level mode check is a
+BRANCH on a word already in hand."*  **That word is not loaded** — but the
+first version of this section over-read that into a cost conclusion an
+adversarial review then refuted on four counts, all confirmed in code.  Both
+halves are recorded, because the survivor is narrower than it first looked.
 
-* Kind, proxy and skip are all read from the TAGGED POINTER's low nibble
-  (`FT_TYPE_MASK` / `FT_INTERNAL_MASK`; `0xF` = flip proxy), not from
-  `cds_ft_metadata::state`.
-* The fast-path descent step is `ft_node_get_nth_skip` (the node BODY's child
-  array) -> `ft_resolve_flip_proxy` (a tag test) -> `ft_reanchor_flag` (a tag
-  test).  Neither `ft_descent_step` nor `ft_descent_step_compressed` touches
-  metadata; the only metadata reader on that path is the reanchor's
-  parent-chain walk, which runs on the MISMATCH path only.
-* So a freeze checked per descended node costs **one metadata cache-line load
-  per level**, in a different arena from the node bodies -- not zero.
+☑ **WHAT HOLDS.**  Kind, proxy and skip are read from the TAGGED POINTER's low
+nibble, never from `cds_ft_metadata::state`: `ft_node_get_nth_skip` reads the
+node BODY's child array (ft-lookup-node.h:1584), `ft_resolve_flip_proxy` is a
+tag test (ft-helpers.h:995).  **No per-level `state` read exists on any
+mutation descent.**  So (D)'s literal premise is false, and a `FT_STATE_*` bit
+remains the wrong encoding for the freeze (below).
 
-☠ AND THERE IS NO CHEAPER HOME FOR IT.  `struct cds_ft_inode` is a bare
-`data[FT_ENTRY_PER_NODE * sizeof(ptr)]` with NO header word, so the body the
-descent already touches has no spare slot; the pointer tag's low nibble is
-fully allocated.  The freeze must live in metadata.
+☠ **WHAT DOES NOT.**
+1. **"the reanchor's parent-chain walk runs on the MISMATCH path only" —
+   FALSE.**  `ft_reanchor_flag` (ft-helpers.h:2361) fires on the skip-compressed
+   ENCODING, not on a mismatch, and `ft_skip_reanchor` loads metadata
+   (`cds_ft_item_to_metadata(...)->parent_word`) on its consistent exit
+   (ft-helpers.h:1808, :1852).  So the mutation descent ALREADY touches 1-2
+   metadata lines per SKIP-ENCODED level — and skip encoding is the default
+   steady-state form of internal->compressed edges on 64-bit, not a transient.
+   ★ This cuts BOTH ways: it strengthens "metadata is not free on the descent"
+   while destroying the per-level accounting the conclusion rested on.
+2. **"in a different arena from the node bodies" — FALSE.**  Same arena RANGE:
+   items at offset 0, the `cds_ft_metadata_alloc` array right after the range
+   header at `cds_ft_page_size` (fractal-trie-alloc.c:26-38).  A different cache
+   line, not a different arena.
+3. **"one EXTRA metadata load per level" is a `rank_stats`-OFF statement**, and
+   was written unconditionally.  With rank_stats ON,
+   `ft_flip_txn_record_count_parent` (ft-mutation-helpers.h:9105) already walks
+   every ancestor to the root touching those same `cds_ft_metadata` lines
+   (`nr_keys` and `state` share the 64 B alloc).  rank_stats is OFF by default
+   (ft-lifecycle.h:126), so the claim holds in the DEFAULT config only.
+4. **"there is no cheaper home" — NOT ESTABLISHED**, and two of its three
+   evidence legs are wrong.  `struct cds_ft_inode` is a bare array in C, but
+   popcount tiers carry an in-body header the descent loads for dispatch, and
+   some tiers have slack ON that line (scan_32_8: 4 pad bytes at node+12;
+   max_child=16: 48 B trailing slack — ft-lookup-node.h:285, :291).  And the low
+   nibble is full only for INTERNAL pointers: a compressed pointer is `0b010`
+   at 16-byte alignment (bits 2-3 free) and an external pointer is 8-byte
+   aligned (bit 2 free) — internal.h:150-161.
 
-⇒ **THE COST COMPARISON INVERTS, so the proposed default is now an open
-question rather than a settled one.**  (B), the ROOT placement, costs point
-mutations ONE trie-level load -- which is exactly the existing `move_active`
-gate (`ft_move_active`, one stable load behind `caa_likely`), already proven
-and already on the rekey path.  (D), the JUNCTION placement, costs one
-metadata load PER DESCENDED LEVEL.  (D) still buys what it always bought --
-stall scope limited to ops crossing the frozen junction, and disjoint bulk ops
-running in parallel -- but it no longer buys it for free, and "the strongest
-possible fit for the near-root goal" was resting on the refuted premise.
-☞ THIS IS MATHIEU'S CALL and it is a fork, not a detail.
+☞ **THE UNSURVEYED CANDIDATE, and it is the one that matters:** an in-band
+marker on the junction's INCOMING SLOT — a word the descent already dispatches
+on per level, with the `0xF` flip-proxy encoding as the precedent for parking a
+marker there.  That would give junction-scoped freeze at ZERO extra fast-path
+loads, which is what (D) claimed all along.  ☠ Its own objection, which this
+section must not skip: readers dispatch on that SAME word, so an in-band marker
+lands on the READER path and collides with (D)'s obligation (4), "readers never
+check the state: wait-freedom untouched".  A flip proxy costs readers a resolve;
+a freeze that outlives a grace period is not transient the way a proxy is.
+Unproven either way — **survey it before any B-vs-D decision.**
 
-☞ **If (D) is chosen, the freeze wants its OWN metadata word, not a
-`FT_STATE_*` bit.**  Bits 11-18 and 20+ of the state word are free, so there is
-room -- but that word is MCAS-transacted and NODE-owned, while the freeze is
+⇒ **THE CONCLUSION, CORRECTED.**  "The cost comparison inverts" does NOT follow
+as stated.  What is established: (D) implemented as a PER-LEVEL METADATA CHECK
+costs a load per level in the default rank_stats-off config, while (B)'s root
+placement costs ONE trie-level load — `ft_move_active` (internal.h:2573), one
+stable load behind `caa_likely`, though note it is consulted on READER paths
+only today (ft-lookup.h:136-294), so (B)'s mutation-side gate is a NEW check,
+exactly as §2 already says.  What is NOT established is that (D) REQUIRES a
+per-level check at all.  So the B-vs-D default stays open, and the missing input
+is the encoding survey above, not a measurement.
+
+☞ **IF (D) IS CHOSEN, THE FREEZE STILL WANTS ITS OWN WORD, NOT AN `FT_STATE_*`
+BIT.**  State-word bits 11-18 and 20+ are free (bit 19 = `FT_STATE_LOCK`, pinned
+literally), but that word is MCAS-transacted and NODE-owned while the freeze is
 JUNCTION-owned: a bit there lands inside every recorded edge's expected-old
-capture on that word, must join `LOCK`/`TOMBSTONE` in the §4.B guard's masked
-set or become spurious aborts, and inherits `FT_STATE_INPLACE_WAIT_MASK`
-semantics.  §8.3's own rule -- "one word cannot be owned by two locks" -- is
-the argument, and the `parent_slot_offset` split is the precedent for taking a
-field OUT of that word for exactly this reason.
+capture on that word, must join LOCK/TOMBSTONE in the §4.B guard's masked set or
+become spurious aborts, and inherits `FT_STATE_INPLACE_WAIT_MASK` semantics
+(internal.h:1000-1046).  §8.3's "one word cannot be owned by two locks" is the
+argument; the `parent_slot_offset` split out of that word is the precedent.
 
 **Proposed split:** (D) is the default for the bulk family — it gives (B)'s
 semantic freeze and free SW-content arming at (A)'s scope, for a point-op
