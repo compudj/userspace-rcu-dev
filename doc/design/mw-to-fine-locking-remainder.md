@@ -2193,6 +2193,56 @@ are option 3 (LEVEL 0, what ships) and option 4 -- **re-open the PER-NODE MARK**
 the only shape that asks the ANCESTOR rather than the member.  This session's
 whole finding is that the information lives ancestor-side.
 
+### G5.24 — ☑ LEVEL 0 ACCEPTED (Mathieu, 2026-08-29); the remaining gap is COVERAGE, and it is STRUCTURAL
+
+Decision: **take the approach that needs no level ceiling, and accept the root
+contention for now.**  That retires G5.16's fork -- every gate entry keeps
+passing 0 -- and makes the widening's only open item its COVERAGE: 1.2%, because
+only `ft_node_recompact` had a release owner wired.
+
+**☑ THE OWNER NOW DEFAULTS TO `@txn`, and that is principled rather than
+convenient.**  `ft_held_set::txn` is defined as *"the commit's lock registry"* --
+the txn whose TERMINAL releases this op's locks.  A widened hold registered there
+is given back by exactly the terminal that gives back every other word the op
+took: a recorded `{LOCK|s -> s}` on commit, or the registry's CAS-clear on abort
+/ memory error / a pre-commit bail.  Nothing about a widened hold wants a
+different lifetime.  `@widen_txn` still overrides, for the sites where the two
+DIFFER -- `ft_node_recompact`, whose owner is its `retire_txn` PARAMETER and sits
+in no ctx frame at all.
+
+**☠ AND IT BUYS ALMOST NOTHING, because the four remaining sites have NO TXN AT
+ALL.**  With the site counter using the SAME predicate as `ft_widen_owner`
+(fallback included -- a counter asking only about `@widen_txn` would answer for a
+rule the code no longer follows):
+
+    SITE                            live       led_ok    NO_OWNER
+    ft_unchain_node      :4188  2,682,988  2,536,055   2,682,988
+    _cds_ft_insert       :3329  2,523,199  2,497,840   2,523,199
+    ft_node_recompact    :1380  1,494,210  1,467,123           0
+    ft_insert_dlm_acq_sp : 771    412,232    411,144     412,232
+    ft_chain_compress    :1028    388,610    386,318     388,610
+
+**NO_OWNER == live at all four.**  Not "the wrong txn" -- NO txn in any frame.
+⇒ G5.12's STRUCTURAL half is confirmed exactly: these sites ACQUIRE BEFORE THEIR
+TXN EXISTS.  `_cds_ft_insert` builds its ctx with `ic.txn`, but
+`ft_insert_commit_arm` arms it LATER, so the field is NULL at the acquire.
+
+☠ **DO NOT READ THE GLOBAL `WIDENED` COUNT AS A DELTA.**  It varies 57,540 /
+70,152 / 85,260 across identical builds -- concurrency-dependent, so a
+before/after difference in it is NOISE.  The per-site `NO_OWNER == live` is the
+result; the global count is not.
+
+☞ **SO COVERAGE NEEDS PER-SITE RESTRUCTURING, one of two shapes:**
+1. **ARM THE TXN BEFORE THE ACQUIRE.**  `ft_insert_commit_arm` sizes from
+   `15 + anchored + count_edges`, computed after the descent, so this is a
+   reordering with real constraints rather than a move.
+2. **CARRY THE WIDENED HOLDS until the txn is armed**, then register + record.
+   Needs a per-op holding area AND a release-on-bail path for every early return
+   between acquire and arm -- the shape `ft_insert_dlm_release_parent` already
+   implements for P.
+☠ Neither is a one-liner, and (2) reintroduces the very "appended holds have no
+release owner" hazard the choke-point design exists to avoid, merely moved.
+
 ☞ **THE FORK THIS LEAVES**, and it needs a decision rather than a default:
 1. **DECLARE + ENFORCE + RE-ENTER.**  The op declares from its key; an acquire
    ABOVE the declared level REFUSES; the op then drops its locks, leaves the

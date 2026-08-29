@@ -5346,9 +5346,16 @@ void ft_wo_observe(const char *fn, int line, const struct cds_ft *ft,
 			const struct ft_held_set *hs__;
 			bool own__ = false;
 
+			/*
+			 * ☠ THE SAME PREDICATE ft_widen_owner USES, including the
+			 * @txn fallback -- a site counter that asked only about
+			 * @widen_txn would keep reporting sites the fallback now
+			 * covers, i.e. would answer for a rule the code no longer
+			 * follows.
+			 */
 			for (hs__ = ctx ? &ctx->held : NULL; hs__;
 					hs__ = hs__->outer)
-				if (hs__->widen_txn) {
+				if (hs__->widen_txn || hs__->txn) {
 					own__ = true;
 					break;
 				}
@@ -5417,9 +5424,25 @@ struct ft_flip_txn *ft_widen_owner(const struct ft_lock_ctx *ctx)
 {
 	const struct ft_held_set *hs;
 
+	/*
+	 * ★ @txn IS THE DEFAULT OWNER, and not as a convenience: it is defined
+	 * as "the commit's lock registry" -- the txn whose TERMINAL releases
+	 * this op's locks.  A widened hold registered there is therefore given
+	 * back by exactly the terminal that gives back every other word the op
+	 * took: a recorded {LOCK|s -> s} on commit, or the registry's CAS-clear
+	 * on abort / memory error / a pre-commit bail.  Nothing about a widened
+	 * hold wants a different lifetime.
+	 *
+	 * @widen_txn overrides it for the sites where the two DIFFER -- notably
+	 * ft_node_recompact, whose owner is its @retire_txn PARAMETER and sits
+	 * in no ctx frame at all.  Checked FIRST for that reason.
+	 */
 	for (hs = ctx ? &ctx->held : NULL; hs; hs = hs->outer)
 		if (hs->widen_txn)
 			return hs->widen_txn;
+	for (hs = ctx ? &ctx->held : NULL; hs; hs = hs->outer)
+		if (hs->txn)
+			return hs->txn;
 	return NULL;
 }
 
