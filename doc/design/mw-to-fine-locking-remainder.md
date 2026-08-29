@@ -2119,6 +2119,80 @@ yields the whole path once per descent, where an up-walk would be O(depth) PER
 MEMBER on the hottest path.  What changes is that it is no longer the ONLY
 possible source.
 
+### G5.23 — ☠☠ DECLARE + ENFORCE + ESCALATE IS REFUTED (adversarial review, verified)
+
+The up-walk unblocked the enforcement PREDICATE (G5.22), so the obvious next step
+was: DECLARE a level from the op's key, ENFORCE it at the acquire with the
+up-walk, ESCALATE (leave the gate, re-enter lower) on refusal.  **It does not
+work**, on two independently fatal grounds, both verified in-tree:
+
+**1. ☠ THE DECLARATION IS IN THE WRONG UNIT, and the op's OWN CORE LOCK SET
+violates it before any climb.**  The ledger stores a node's **START** offset --
+`ft_descent_enter_node(d, nf, start, len)` -> `ft_anc_ledger_push(nf, start)` --
+and the widening compares against it (`e[w0].depth < min_lvl`).  A KEY LENGTH is
+where the junction's key ENDS, so `start(J) = key_len - span(J) < key_len`: **the
+junction itself falls below its own declared level**, and the slot-holding parent
+every detach/graft/merge must lock starts lower still.  Under path compression
+the gap is unbounded.  ⇒ the refusal fires STRUCTURALLY, on ~every op, not
+exceptionally.  ★ This is the SECOND unit trap in the same area, after G5.18's
+byte-depth-is-not-node-depth.
+A sound declaration is `start(shallowest locked word)` -- which needs the descent
+the gate PRECEDES.  That circularity is the real obstacle.
+
+**2. ☠☠ ESCALATION IS IMPOSSIBLE PAST THE CONSUMED-SOURCE POINT, and that is
+exactly where the climbs are.**  graft and merge have phases whose failure may
+not unwind -- six sites, `goto retry_attach` / `retry_merge` with *"src consumed:
+OOM is transient"* (`ft-graft.h:1754`, `:1786`, `:1976`; `ft-merge.h:2643`,
+`:2671`, `:2714`).  Past that point the moved keys exist only in the consumed
+source: the op cannot drop its locks and leave the gate, cannot lower in place (a
+lowering owns a GP and the SEAM RULE forbids one under a held lock), and cannot
+be refused.  Recompaction climbs happen in precisely that attach phase.  So where
+enforcement matters most, the only outcomes are violating the declaration
+silently or wedging.
+
+**AND THREE MORE THAT WOULD EACH NEED SOLVING ANYWAY:**
+3. **PHASE 1 IS NOT INERT.**  Publishing real levels into the PRODUCTION packed
+   word with the widening ON and no enforcement makes point ops widen from
+   `key_len` down and MISS J (defect 1) -- exclusion breaks SILENTLY, and the
+   plan's own "re-take the A/B" step would come back GREEN AND WRONG.  Even with
+   the widening off it changes the GP schedule: today every entry passes 0 so the
+   lowering branch is DEAD, and heterogeneous levels make arrivals below the
+   current min own a `synchronize_rcu()` that never ran before -- plus the exit
+   rescan, 257 slots under the contended `move_gate_lock`.
+   ⇒ a measurement must publish to a DEBUG SHADOW word, never the packed one.
+4. **NO CARRIER FOR THE REFUSAL.**  `detach` has no retry loop and maps `ret < 0`
+   to MEMORY_ERROR; graft/merge retry INSIDE the gate scope at the SAME level, so
+   a structural refusal riding -EAGAIN is a deterministic livelock;
+   `cds_ft_remove_all` has no retry loop at all.  And -EAGAIN's attribution
+   already carries an explicit "every -EAGAIN here is a peer" contract that a
+   refusal would re-break.  ESCALATE needs a NEW status plumbed through five ops'
+   retry lanes plus a loop AROUND the scoped gate at all five entries.
+5. **THE PREDICATE HAS BLIND SPOTS.**  `ft_insert_park_external_nodes` publishes
+   `external_nodes` with NO lock (a documented hole), so a bulk body that parks
+   externals mutates above its declaration through no acquire at all; and the
+   empty-dst arms legitimately lock the ROOT, which guarantees refusal against any
+   nonzero declaration on those shapes.
+
+**☠ AND A CORRECTION TO G5.22.**  Its "0 disagreements over 462,843 members" is
+agreement measured ONLY ON THE SAFE HALF: the cross-check runs where the WINDOW
+can also answer, i.e. on near-path members whose back-edges the descent has just
+walked.  The ~55% window-undatable, back-pointer-resolved members -- **exactly
+where lazy and superseded back-edges live** -- get NO cross-check by
+construction.  A stale edge mis-sums spans in the PASS direction (enforcement
+passes what it should refuse: a silent exclusion gap).  Independent confirmation
+would need an exclusive-trie oracle recomputing every depth from the root and
+diffing, a per-hop re-parent epoch stamp, or an LTTng violation-abort on
+up-walk-vs-fresh-descent mismatch.  ★ The up-walk's 100% COVERAGE stands; its
+CORRECTNESS on the risk population does not.
+
+☞ **WHAT SURVIVES:** the gate mechanism (packed word, one-load sample,
+lowering-owns-a-GP); the up-walk as an INSTRUMENT; and escalation's termination
+argument where it can run at all.  ⇒ **Option 1 is dead.**  The live candidates
+are option 3 (LEVEL 0, what ships) and option 4 -- **re-open the PER-NODE MARK**
+(candidate (E) tier 2, G5.6/G5.7), refuted on its WORD and not its PRINCIPLE, and
+the only shape that asks the ANCESTOR rather than the member.  This session's
+whole finding is that the information lives ancestor-side.
+
 ☞ **THE FORK THIS LEAVES**, and it needs a decision rather than a default:
 1. **DECLARE + ENFORCE + RE-ENTER.**  The op declares from its key; an acquire
    ABOVE the declared level REFUSES; the op then drops its locks, leaves the
