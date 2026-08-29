@@ -5304,7 +5304,6 @@ void ft_wo_observe(const char *fn, int line, const struct cds_ft *ft,
 {
 	const struct ft_descent *d = ft_lock_ctx_descent(ctx);
 	struct ft_wo_site *site;
-	unsigned int min_lvl;
 	bool led_ok;
 
 	/*
@@ -5313,7 +5312,7 @@ void ft_wo_observe(const char *fn, int line, const struct cds_ft *ft,
 	 * every other zero below then proves nothing.
 	 */
 	uatomic_inc(&ft_wo_acq_total);
-	if (!ft_bulk_sample(ft, &min_lvl))
+	if (!ft_bulk_active(ft))
 		return;
 	if (ft_bulk_self_depth) {
 		uatomic_inc(&ft_wo_self_bulk);	/* the caller IS a bulk op */
@@ -5323,11 +5322,7 @@ void ft_wo_observe(const char *fn, int line, const struct cds_ft *ft,
 	led_ok = ft_anc_ledger_valid(ft, d);
 	if (led_ok) {
 		uatomic_inc(&ft_wo_led_ok);
-		/*
-		 * ☠ KEY DEPTH, NOT LOCK-SET SIZE -- see the header.  Every
-		 * gate entry passes level 0, so "from the min level down" is
-		 * the whole recorded path and nothing is being filtered.
-		 */
+		/* ☠ KEY DEPTH, NOT LOCK-SET SIZE -- see the header. */
 		ft_wo_max(&ft_wo_led_nr_max, ft_anc_ledger.nr);
 	} else if (!d) {
 		uatomic_inc(&ft_wo_led_nodescent);

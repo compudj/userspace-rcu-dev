@@ -2588,7 +2588,7 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
 	 * G5.5: BEFORE the read_lock below -- the gate waits a grace period,
 	 * which would otherwise wait on our own read section.
 	 */
-	CDS_FT_SCOPED_BULK_GATE(dst_ft, FT_BULK_WRITER_ONLY, 0);
+	CDS_FT_SCOPED_BULK_GATE(dst_ft, FT_BULK_WRITER_ONLY);
 
 	if (dst_ft->lock_fine) {
 		const struct rcu_flavor_struct *flavor = dst_ft->group->flavor;
@@ -2839,7 +2839,7 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 	}
 
 	/* G5.5: before the writer scopes -- the gate must not wait a GP under a lock. */
-	CDS_FT_SCOPED_BULK_GATE(dst_ft, FT_BULK_WRITER_ONLY, 0);
+	CDS_FT_SCOPED_BULK_GATE(dst_ft, FT_BULK_WRITER_ONLY);
 
 	ft_crosstrie_lock_mode_guard(dst_ft, swap_ft);
 	CDS_FT_SCOPED_WRITER(dst_ft);

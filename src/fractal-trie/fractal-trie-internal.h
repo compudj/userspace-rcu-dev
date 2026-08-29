@@ -1773,9 +1773,9 @@ struct cds_ft {
 	 * THE WRITER-SIDE WORD, beside @move_active and deliberately NOT it.
 	 * @move_active is READER-facing: nonzero puts every reader on the
 	 * COHERENT path, a cost a detach / graft / merge has no reason to
-	 * impose.  G5.5's widening is a WRITER question -- "is any bulk op
-	 * live?" -- so it gets its own trie-level word, read once per acquire
-	 * behind caa_likely and free in steady state.
+	 * impose.  G5.5's exclusion is a WRITER question -- "is any bulk op
+	 * live?" -- so it gets its own trie-level word, read once per writer
+	 * scope behind caa_likely and free in steady state.
 	 *
 	 * ☠ ONE GATE, ONE GP, TWO WORDS, TWO REFCOUNTS.  The machinery below
 	 * (@move_gate_lock / @move_gate_cond / @gate_gp_nr) is SHARED, so a
@@ -1784,36 +1784,15 @@ struct cds_ft {
 	 * clears: a single counter would either leave @move_active set by a
 	 * detach -- the exact cost this split exists to avoid -- or clear it
 	 * while a rekey is still live, which is a correctness bug.
-	 */
-	/*
-	 * PACKED {refcount, min level}, published as ONE word so a point op
-	 * reads both in ONE load.  Read as two words a point op could observe
-	 * "a bulk op is live" together with a STALE, DEEPER level and widen too
-	 * little -- an exclusion gap.  High bits refcount, low
-	 * FT_BULK_LEVEL_BITS the SHALLOWEST level any in-flight bulk op locks
-	 * at; FT_BULK_LEVEL_NONE when no bulk op is live.
 	 *
-	 * ★ WHY A LEVEL AT ALL: a bulk op holds a junction J and its frontier,
-	 * and holds NOTHING ABOVE J.  A point op's leaf->root chain meets J
-	 * exactly when the point op is inside J's subtree -- which is the
-	 * conflict case -- so locks strictly SHALLOWER than J buy no exclusion
-	 * and cost the ROOT, which is what would make the widening trie-wide.
+	 * @bulk_gate_nr is the count under @move_gate_lock; @bulk_state is the
+	 * SAME count published for peers to read without it, in ONE load
+	 * (ft_bulk_active).  Two words because the gate's own arithmetic is
+	 * serialized by the mutex while the predicate must be readable from a
+	 * writer scope that holds nothing.
 	 */
 	unsigned long bulk_state;
 	unsigned long bulk_gate_nr;	/* ALL bulk holders, rekey included */
-	/*
-	 * EXACT per-level occupancy, under @move_gate_lock -- not a monotone
-	 * low-water mark.  A min that only ever decreased and reset at refcount
-	 * 0 would RATCHET to the shallowest level ever used and stay there: G5.9
-	 * measured the refcount essentially never reaching 0 under load (two
-	 * windows in a 2 s run, duty 99.9%), so the reset would never fire and
-	 * the refinement would degenerate back to "always take the root".
-	 * Counting per level makes the published min RISE again as deep ops
-	 * drain.  The mutex already serializes every enter and exit, so this
-	 * needs no CAS.
-	 */
-	uint16_t bulk_level_nr[FT_MAX_DEPTH + 1];
-	unsigned int bulk_min_level;	/* cached min over @bulk_level_nr */
 	/*
 	 * In-flight grace periods, NOT a boolean.  Each runs OUTSIDE the lock,
 	 * so TWO owners can overlap: a detach publishing @bulk_active and a
@@ -3203,16 +3182,6 @@ bool ft_move_active(const struct cds_ft *ft)
 	return CMM_LOAD_SHARED(ft->move_active) != 0;
 }
 
-#define FT_BULK_LEVEL_BITS	16
-#define FT_BULK_LEVEL_MASK	((1UL << FT_BULK_LEVEL_BITS) - 1)
-#define FT_BULK_LEVEL_NONE	FT_BULK_LEVEL_MASK	/* no bulk op live */
-
-static inline
-unsigned long ft_bulk_pack(unsigned long nr, unsigned int level)
-{
-	return (nr << FT_BULK_LEVEL_BITS) | (level & FT_BULK_LEVEL_MASK);
-}
-
 /*
  * Is any BULK op live?  The writer-side tier-1 gate G5.5 turns on: false in
  * steady state, ONE trie-level load, and when true a FINE trie's point op
@@ -3223,44 +3192,7 @@ unsigned long ft_bulk_pack(unsigned long nr, unsigned int level)
 static inline
 bool ft_bulk_active(const struct cds_ft *ft)
 {
-	return (CMM_LOAD_SHARED(ft->bulk_state) >> FT_BULK_LEVEL_BITS) != 0;
-}
-
-/*
- * The SHALLOWEST level any in-flight bulk op locks at, or FT_BULK_LEVEL_NONE.
- * ☠ Take it from the SAME load as the refcount, never a second one: the pair
- * is only coherent as one word.
- */
-static inline
-unsigned int ft_bulk_min_level(const struct cds_ft *ft)
-{
-	unsigned long w = CMM_LOAD_SHARED(ft->bulk_state);
-
-	if (!(w >> FT_BULK_LEVEL_BITS))
-		return FT_BULK_LEVEL_NONE;
-	return (unsigned int) (w & FT_BULK_LEVEL_MASK);
-}
-
-/*
- * BOTH HALVES FROM ONE LOAD -- the form every widening site must use.  Returns
- * whether any bulk op is live and, when it is, the shallowest level one of them
- * locks at.
- *
- * ☠ The two accessors above answer one half each, and asking them in
- * sequence is TWO loads of a word a peer is changing: a live refcount paired
- * with a stale DEEPER level makes a point op widen from too far down, which is
- * an exclusion gap -- and one that reports nothing, because every lock it does
- * take succeeds.  That is why the pair is packed into one word at all.
- */
-static inline
-bool ft_bulk_sample(const struct cds_ft *ft, unsigned int *min_level)
-{
-	unsigned long w = CMM_LOAD_SHARED(ft->bulk_state);
-
-	if (!(w >> FT_BULK_LEVEL_BITS))
-		return false;
-	*min_level = (unsigned int) (w & FT_BULK_LEVEL_MASK);
-	return true;
+	return CMM_LOAD_SHARED(ft->bulk_state) != 0;
 }
 
 /*
@@ -3313,13 +3245,10 @@ extern __thread unsigned long ft_dbg_free_via;
 
 
 static inline
-void ft_bulk_gate_enter(struct cds_ft *ft, enum ft_bulk_kind kind,
-		unsigned int level)
+void ft_bulk_gate_enter(struct cds_ft *ft, enum ft_bulk_kind kind)
 {
 	bool own_gp = false;
 
-	if (level > FT_MAX_DEPTH)
-		level = FT_MAX_DEPTH;
 #ifdef FT_DEBUG_WIDEN_OWNER
 	/*
 	 * ☠ THE CONTROL FOR THE OTHER ZERO, and it must live under THIS flag.
@@ -3358,32 +3287,13 @@ void ft_bulk_gate_enter(struct cds_ft *ft, enum ft_bulk_kind kind,
 	 * @bulk_active (G5.25 -- it sampled the gate clear at its writer scope
 	 * and skipped the lock, so it is not excluded against this op yet).
 	 */
-	ft->bulk_level_nr[level]++;
-	if (ft->bulk_gate_nr++ == 0) {
-		ft->bulk_min_level = level;
+	if (ft->bulk_gate_nr++ == 0)
 		own_gp = true;
-	} else if (level < ft->bulk_min_level) {
-		/*
-		 * LOWERING owns a grace period exactly as publishing the word
-		 * does: point ops already in flight sampled the DEEPER level and
-		 * widened only from there down, so they are missing the newly
-		 * shallow locks and must be let finish first.
-		 *
-		 * ★ Safe against the SEAM RULE (no node lock held across a GP,
-		 * armed @d48b5c94) because @level is fixed at gate ENTRY, before
-		 * this op takes any lock.  An op can only ever lower the min on
-		 * the way IN; on the way out the min RISES, which needs no GP --
-		 * a point op holding MORE locks than it needs is never wrong.
-		 */
-		ft->bulk_min_level = level;
-		own_gp = true;
-	}
 	if (kind == FT_BULK_COHERENT && ft->move_gate_nr++ == 0) {
 		CMM_STORE_SHARED(ft->move_active, 1);
 		own_gp = true;
 	}
-	CMM_STORE_SHARED(ft->bulk_state,
-			ft_bulk_pack(ft->bulk_gate_nr, ft->bulk_min_level));
+	CMM_STORE_SHARED(ft->bulk_state, ft->bulk_gate_nr);
 	if (own_gp) {
 		ft->gate_gp_nr++;
 		pthread_mutex_unlock(&ft->move_gate_lock);
@@ -3466,13 +3376,7 @@ void ft_bulk_gate_enter(struct cds_ft *ft, enum ft_bulk_kind kind,
 static inline
 void ft_move_gate_enter(struct cds_ft *ft)
 {
-	/*
-	 * Level 0 (the root) is the CONSERVATIVE answer, and it is what an op
-	 * that cannot yet name its junction must pass: the gate is entered
-	 * before the descent that finds it.  It degrades exactly to G5.5's
-	 * "every ancestor to the root", so ops can be refined one at a time.
-	 */
-	ft_bulk_gate_enter(ft, FT_BULK_COHERENT, 0);
+	ft_bulk_gate_enter(ft, FT_BULK_COHERENT);
 }
 
 /*
@@ -3481,11 +3385,8 @@ void ft_move_gate_enter(struct cds_ft *ft)
  * set merely runs the coherent path once more, which is never wrong, only slower.
  */
 static inline
-void ft_bulk_gate_exit(struct cds_ft *ft, enum ft_bulk_kind kind,
-		unsigned int level)
+void ft_bulk_gate_exit(struct cds_ft *ft, enum ft_bulk_kind kind)
 {
-	if (level > FT_MAX_DEPTH)
-		level = FT_MAX_DEPTH;
 	ft_bulk_self_depth--;
 	pthread_mutex_lock(&ft->move_gate_lock);
 	/*
@@ -3495,27 +3396,10 @@ void ft_bulk_gate_exit(struct cds_ft *ft, enum ft_bulk_kind kind,
 	 */
 	if (kind == FT_BULK_COHERENT && --ft->move_gate_nr == 0)
 		CMM_STORE_SHARED(ft->move_active, 0);
-	ft->bulk_level_nr[level]--;
 	if (--ft->bulk_gate_nr) {
-		/*
-		 * The min RISES when the shallowest level empties.  Rescan
-		 * rather than track a low-water mark: an exact min is the whole
-		 * point (see @bulk_level_nr).  Bounded, and only on the exit
-		 * that actually empties the current min.
-		 */
-		if (level == ft->bulk_min_level && !ft->bulk_level_nr[level]) {
-			unsigned int l = level;
-
-			while (l < FT_MAX_DEPTH && !ft->bulk_level_nr[l])
-				l++;
-			ft->bulk_min_level = l;
-		}
-		CMM_STORE_SHARED(ft->bulk_state, ft_bulk_pack(
-				ft->bulk_gate_nr, ft->bulk_min_level));
+		CMM_STORE_SHARED(ft->bulk_state, ft->bulk_gate_nr);
 	} else {
-		ft->bulk_min_level = FT_BULK_LEVEL_NONE;
-		CMM_STORE_SHARED(ft->bulk_state,
-				ft_bulk_pack(0, FT_BULK_LEVEL_NONE));
+		CMM_STORE_SHARED(ft->bulk_state, 0);
 #ifdef FT_DEBUG_BULK_WINDOW
 		{
 			uint64_t now__ = ft_bw_now();
@@ -3548,19 +3432,18 @@ void ft_bulk_gate_exit(struct cds_ft *ft, enum ft_bulk_kind kind,
 static inline
 void ft_move_gate_exit(struct cds_ft *ft)
 {
-	ft_bulk_gate_exit(ft, FT_BULK_COHERENT, 0);
+	ft_bulk_gate_exit(ft, FT_BULK_COHERENT);
 }
 
 struct ft_bulk_gate_scope {
 	struct cds_ft *ft;
 	enum ft_bulk_kind kind;
-	unsigned int level;
 };
 
 static inline
 void ft_bulk_gate_scope_end(struct ft_bulk_gate_scope *s)
 {
-	ft_bulk_gate_exit(s->ft, s->kind, s->level);
+	ft_bulk_gate_exit(s->ft, s->kind);
 }
 
 /*
@@ -3575,11 +3458,11 @@ void ft_bulk_gate_scope_end(struct ft_bulk_gate_scope *s)
  * holding a node lock would break the seam rule (internal.h: no node lock may
  * be held across a GP).
  */
-#define CDS_FT_SCOPED_BULK_GATE(ft_, kind_, level_)			\
+#define CDS_FT_SCOPED_BULK_GATE(ft_, kind_)				\
 	struct ft_bulk_gate_scope ft_bulk_gate_scope__			\
 		__attribute__((cleanup(ft_bulk_gate_scope_end))) =	\
-		{ (ft_), (kind_), (level_) };				\
-	ft_bulk_gate_enter((ft_), (kind_), (level_))
+		{ (ft_), (kind_) };					\
+	ft_bulk_gate_enter((ft_), (kind_))
 
 struct ft_excl_reader_scope {
 	struct cds_ft *ft;

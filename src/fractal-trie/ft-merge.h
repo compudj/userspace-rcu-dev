@@ -3750,7 +3750,7 @@ enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
 		 * G5.5: @src_ft is exclusive by contract, so only @dst_ft has
 		 * point-op peers to exclude.
 		 */
-		CDS_FT_SCOPED_BULK_GATE(dst_ft, FT_BULK_WRITER_ONLY, 0);
+		CDS_FT_SCOPED_BULK_GATE(dst_ft, FT_BULK_WRITER_ONLY);
 
 		st__ = ft_merge_at_inner(dst_ft, dst_key, dst_key_len, src_ft,
 				src_key, src_key_len, NULL);

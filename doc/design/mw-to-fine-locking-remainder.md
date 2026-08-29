@@ -2392,6 +2392,38 @@ must be able to turn the ledger on by itself rather than depending on the probe.
 DEBUG-ONLY.  If a future consumer wants the path again, it is one flag away, with
 its hazard documentation intact.
 
+### G5.30 — ☑ THE GATE'S LEVEL HALF IS REMOVED: its last consumer went with the widening
+
+`bulk_state` was a PACKED `{refcount, min level}` word, and the level half
+existed for one purpose: to tell a widening point op how far up to stop.  The
+widening is gone (G5.27), so the half had no consumer at all --
+`ft_bulk_min_level()` had ZERO call sites and `ft_bulk_sample()` had one, inside
+`-DFT_DEBUG_WIDEN_OWNER`, which used only the boolean it returns.
+
+★ **AND IT WAS NEVER EXERCISED EVEN BEFORE THAT.**  Every gate entry in the tree
+passes level 0 (G5.24, decided), so `bulk_level_nr[0]` was the only slot ever
+touched, and the "LOWERING owns a grace period" branch was UNREACHABLE -- nothing
+can lower below 0.  What shipped was an exact-min occupancy array maintained for
+a min that was structurally always 0.
+
+Removed: `bulk_level_nr[FT_MAX_DEPTH + 1]`, `bulk_min_level`, the
+`FT_BULK_LEVEL_*` packing and `ft_bulk_pack`, both level accessors, the lowering
+GP branch, the exit rescan, and the `level` parameter of
+`ft_bulk_gate_enter` / `ft_bulk_gate_exit` / `CDS_FT_SCOPED_BULK_GATE`.
+`bulk_state` is now the published refcount and `ft_bulk_active` a plain `!= 0`.
+
+☑ **MEASURED, and it is not a rounding error: `sizeof(struct cds_ft)` goes
+864 -> 336 bytes, -61%** (the array alone was 516; alignment gives back the
+rest).  The array sat at offset `0xf0`, between `bulk_state` (`0xe0`) and
+`lock_fine` (`0x340`) -- two words `ft_writer_lock_scope_enter` reads on the same
+call, which it held 608 bytes apart.  ☞ The layout consequence is UNMEASURED; the
+size is the claim.
+
+☞ THIS DOES NOT CLOSE THE CEILING.  The junction-level ceiling is still
+UNMEASURED rather than refuted, and its banked design (G5.19) is TWO PACKED EPOCH
+WORDS with a demand-driven flip -- which does not use this array, so nothing was
+kept by keeping it.
+
 ### G5.26 — ☐ FOUND, NOT CHASED: a DEEP rekey is starved ~12,000x by point-op traffic, INSIDE one call
 
 Isolating `inv_widen_deep_junction`'s movers to explain their tiny bulk-side
@@ -4433,14 +4465,18 @@ stale) — watch it across Phase B, it shares words with the converted sites.
                                                               load-bearing: ft_writer_lock_gp_wait drops
                                                               this lock across every GP, which is what
                                                               makes holding it over a bulk body sound
+                                                              ☑ THE GATE'S LEVEL HALF IS REMOVED (§2
+                                                              G5.30): the widening was its only consumer
+                                                              and every entry passed 0 anyway, so the
+                                                              occupancy array, the packing, both
+                                                              accessors, the unreachable lowering GP and
+                                                              the level parameter are gone.
+                                                              sizeof(struct cds_ft) 864 -> 336, -61%
                                                               ☐ the junction-level CEILING is UNMEASURED,
                                                               not refuted -- banked in §2 G5.19 (two
-                                                              packed epoch words, flipped on demand).
-                                                              Every gate entry passes LEVEL 0 (Mathieu,
-                                                              2026-08-29), so @bulk_level_nr,
-                                                              ft_bulk_min_level and ft_bulk_state_read
-                                                              have NO consumer today
-                                                              ☞ §2 G5.0-G5.29 is the full record, incl.
+                                                              packed epoch words, flipped on demand),
+                                                              which does not use that array
+                                                              ☞ §2 G5.0-G5.30 is the full record, incl.
                                                               (F)'s protocol REFUTED (G5.4), the tier-2
                                                               per-node refcount REFUTED (G5.7) and
                                                               declare+enforce+escalate REFUTED (G5.23)
