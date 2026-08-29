@@ -1823,6 +1823,31 @@ subtree.  Only there does a published min level make the widened set small, and
 only there is "point ops stop taking the root" worth anything.  Until such an
 arm exists, the ceiling is UNMEASURED, not refuted.
 
+**☑ AND IF THE ARRAY SCAN COSTS TOO MUCH, THE MONOTONE CEILING IS THE FALLBACK.**
+`bulk_level_nr[]` is `uint16_t[FT_MAX_DEPTH + 1]` -- 516 bytes per trie
+(`fractal-trie-internal.h:1807`; the `level > FT_MAX_DEPTH` clamp indexes 257,
+which the `+ 1` makes valid).  Entry is O(1), but EXIT rescans
+`while (l < FT_MAX_DEPTH && !bulk_level_nr[l]) l++` -- up to 257 iterations
+**under `move_gate_lock`**, on the exit that empties the current min.  ☠ That is
+work on the CONTENDED mutex, the exact shape G5.9 paid 2x for.
+
+The fallback is the MONOTONE low-water mark this design started from: enter
+`if (level < min) min = level`, exit does nothing but reset to NONE at refcount
+0.  O(1) both ends, no array.  ★ **It loses no precision in the regime that
+matters** -- it is imprecise only while windows OVERLAP, and under G5.10's
+governing assumption (bulk ops INFREQUENT, refcount returns to 0) it is exactly
+as precise as the array.  Its imprecision is OVER-widening, which
+ADD-never-substitute makes safe: more locks are never wrong, only slower.
+⇒ the array's only advantage is the HAMMERING regime, which the governing
+assumption says not to design for.  ☠ This REVERSES the preference recorded when
+the packed word landed ("the per-level array is correct in BOTH regimes for a few
+bytes") -- that was priced against a refcount that never reaches 0, itself the
+hammering artifact.
+☞ Today the scan is inert: every op passes 0, so slot 0 is the only live one and
+emptying it coincides with `bulk_gate_nr == 0`, which takes the `else` branch.
+The cost appears only when ops publish REAL levels -- i.e. exactly when the
+ceiling is built.
+
 ☞ **THE FORK THIS LEAVES**, and it needs a decision rather than a default:
 1. **DECLARE + ENFORCE + RE-ENTER.**  The op declares from its key; an acquire
    ABOVE the declared level REFUSES; the op then drops its locks, leaves the
