@@ -5064,36 +5064,37 @@ bool ft_anc_ledger_valid(const struct cds_ft *ft, const struct ft_descent *d)
 
 #ifdef FT_DEBUG_WIDEN_OWNER
 /*
- * G5.5's WIDENING, MEASURED BEFORE IT IS BUILT.  This build widens NOTHING --
- * it takes exactly the locks it takes without it -- and only counts what the
- * widening WOULD find at this choke point.
+ * THE BULK-WINDOW ACQUIRE PROBE.  Named for the widening it was built to size
+ * (G5.5); that widening is GONE -- the FT-wide lock taken on the bulk refcount
+ * replaced it (G5.25/G5.27) -- and what survives here measures the WINDOW
+ * ITSELF, which the wide lock is gated on.  This build changes NO behaviour: it
+ * takes exactly the locks it takes without it.
  *
- *   Q1 WHO OWNS THE RELEASE.  An ancestor appended inside this function is
- *      invisible to the caller's @set[i].held sweep, so its release must be
- *      handed to a txn.  ☠ AND @ctx->held.txn IS NOT THAT QUESTION: the
- *      detach family ACQUIRES FIRST AND HANDS OFF LATER (ft_flip_txn_lock_own,
- *      ft-remove.h:573), and ft_node_recompact's owner is its @retire_txn
- *      PARAMETER -- non-NULL by its acquire's own guard, and in no ctx frame at
- *      all.  So this counts the ctx CHAIN, top frame and outer frames apart,
- *      and the answer it gives is a LOWER BOUND on ownership, never a verdict.
- *   Q2 IS THE LEDGER EVEN THIS ACQUIRE'S?  ft_anc_ledger_valid's verdict,
- *      broken out by the way it fails.
+ *   Q1 HOW OFTEN IS AN ACQUIRE INSIDE A BULK WINDOW, and from which SITES?
+ *      `live` vs `acq_total`, plus the per-site table.  That is the population
+ *      the FT-wide lock now serializes, so it is the population its cost is
+ *      paid on.
+ *   Q2 IS THE ANCESTOR LEDGER THIS ACQUIRE'S?  `ft_anc_ledger_valid`'s verdict,
+ *      broken out by the way it fails.  ☠ The ledger has NO shipping consumer
+ *      since the widening went; this is what still exercises it.
+ *   Q3 HOW SHALLOW DOES A BULK OP LOCK, and can it DATE its own members?
+ *      The `ft_bl_*` counters -- root-reach by identity, and the ledger /
+ *      descent-window / up-walk dating comparison.
  *
- * ☠☠ WHAT THIS CANNOT ANSWER, so that no one reads it as if it could:
- *   * HOW WIDE the widened set is.  Every gate entry in the tree passes
- *     level 0 (ft-detach.h:646, ft-graft.h:2591 / :2842, ft-merge.h:3753,
- *     ft_move_gate_enter), so ft_bulk_min_level() is CONSTANTLY 0 and a
- *     "from the min level down" count is just the arm's KEY DEPTH.  The
- *     ledger's @nr is reported under that name and must not be read as a
- *     lock-set size, still less allowed to size a bound -- the bound is
- *     structural (FT_DLM_ACQUIRE_MAX_SET) and stays that way.
+ * ☠☠ WHAT IT CANNOT ANSWER, so that no one reads it as if it could:
+ *   * ANY "how wide would the widening be" question.  There is no widening.
+ *     `ledger nr max` is the arm's KEY DEPTH and nothing else -- never a
+ *     lock-set size, and never allowed to size a bound (that bound is
+ *     structural, FT_DLM_ACQUIRE_MAX_SET, and stays that way).
  *   * WHETHER A SITE IS THE ONLY ONE.  Reachability is a code fact; a site
  *     absent from the table below was not exercised by the arm, which is a
  *     statement about the arm.
  *
  * ☠ Every counter is a process-wide atomic on the acquire path, so the
  * instrument PERTURBS what it measures (G5.9 paid 2x for exactly this).
- * EXISTENCE and MAXIMA survive that; RATIOS do not.
+ * EXISTENCE and MAXIMA survive that; RATIOS do not -- and the global totals
+ * vary by half across identical builds, so a before/after delta in one is
+ * NOISE (G5.24).
  */
 #define FT_WO_SITES	128
 struct ft_wo_site {
@@ -5374,8 +5375,9 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 	 * a member's @depth is 0 and meaningless at the shipping PER_NODE
 	 * spacing (ft_lock_ctx_depth_of answers 0/true there), so a depth
 	 * histogram would be measuring the spacing, not the op.  Reaching the
-	 * root is the case a per-op junction level cannot improve on, and it is
-	 * answerable by identity.
+	 * root is the case no junction level could have improved on, and it is
+	 * answerable by identity.  Kept after the widening's removal because it
+	 * is the only measurement of how far a bulk op's own lock set reaches.
 	 */
 	if (ft_bulk_self_depth) {
 		struct cds_ft_inode_flag *root__ = (struct cds_ft_inode_flag *)
