@@ -1702,6 +1702,63 @@ BUSY/MEMORY error -- so a widening refusal there would turn an op that succeeds
 today into a hard failure.  That site needs its own answer (an internal
 re-descend, or unconditional descent semantics) before it can widen at all.
 
+### G5.15 — the WIDENING IS BUILT, and it FAILS ITS OWN GATE: 5.8x on point ops, at 1.2% coverage
+
+Behind `-DFT_FEATURE_WIDEN`, OFF BY DEFAULT, because G5.9 established that the
+regime it creates cannot be measured until it exists and that LIVENESS, not
+correctness, is its first gate.  The widening lives in the universal acquire
+choke point; what is per-SITE is the RELEASE OWNER, and `ft_node_recompact`
+supplies its `retire_txn` through a CHAINED frame (`@widen_txn`) rather than by
+repointing `@ctx->held.txn`, which decides DEDUPE for every member of that set.
+
+**☑ CORRECT.**  ft_inv 119/119 with the widening ON; ft_unit at its three
+pre-existing failures.  `max=4` widened locks, 141,010 taken over 70,448
+widened acquires.
+
+**☠☠ AND IT FAILS THE GATING METRIC.**  Interleaved A/B on
+`inv_rekey_contended_mixed_writers`, 3 reps, same instrument in both arms:
+
+    widening OFF   77,675 / 86,478 / 80,975 point ops
+    widening ON    14,027 / 14,013 / 15,866
+
+**~5.8x, non-overlapping, against a ~8% noise floor.**  ★ AND THE MECHANISM IS
+NOT THE LOCK-TAKING: only 9% of live acquires widened at all (14,258 of
+153,902 -- the rest DEDUPED onto words the op already held), yet throughput fell
+5.8x.  The cost is the CONTENTION the extra word creates, and it is G5.5's own
+stated price arriving on schedule: **every gate entry passes level 0**, so
+`ft_bulk_min_level()` is constantly 0 and EVERY widened acquire takes THE ROOT.
+"All point ops serialize trie-wide for the window" is no longer a prediction.
+☞ ⇒ the PER-OP JUNCTION LEVEL is a REQUIREMENT, not the later refinement G5.10
+filed it as.  The packed word already carries the level; what is missing is ops
+that pass one.
+
+**☠☠ AND COVERAGE IS 1.2%.**  Per-site attribution of the acquires that COULD
+widen and had no owner wired, full suite:
+
+    SITE                            live      led_ok    NO_OWNER
+    ft_unchain_node      :4188  2,499,561   2,342,792   2,499,561
+    _cds_ft_insert       :3329  2,295,275   2,273,329   2,295,275
+    ft_node_recompact    :1380  1,729,268   1,693,101           0
+    ft_insert_dlm_acq_sp : 771    418,483     417,158     418,483
+    ft_chain_compress    :1028    396,742     394,452     396,742
+
+70,152 widened against 5,604,209 declined.  ☠ The two-arm measurement that put
+`ft_node_recompact` at 99.99% of the population was TRUE OF THOSE ARMS AND
+BADLY WRONG OF THE SUITE -- the largest single class is
+**a remove that does not recompact** (`ft_unchain_node`), which acquires through
+the same choke point and needs the same widening.
+
+☠ **AND FOUR OF THE FIVE SITES ACQUIRE BEFORE THEIR TXN EXISTS** --
+`ft_unchain_node` creates its txn inside the branches BELOW its acquire, exactly
+as `insert` does (G5.12).  So the remaining wiring is prerequisite 2's
+STRUCTURAL problem at four sites, not four one-liners.
+
+☞ **AND WIRING THEM IS THE WRONG NEXT MOVE.**  It would multiply, by ~80x in
+acquire count, a cost that ALREADY fails the gate -- every newly wired site
+would take the root too.  The order that follows from the measurement is:
+**(1) per-op junction levels so ops stop taking the root, (2) re-take the A/B,
+(3) only then complete the owner plumbing.**
+
 ☞ **REVISED ORDER.**  (1) ☑ prerequisite 1 -- DONE; (2) the widening carrying
 prerequisite 2, whose owner is a per-SITE txn (`retire_txn` at recompact) rather
 than `ctx->held.txn`; (3) the liveness gate; (4) re-take the point-op baseline.

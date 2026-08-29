@@ -363,6 +363,10 @@ unsigned long ft_wo_led_ok, ft_wo_led_nodescent, ft_wo_led_norec;
 unsigned long ft_wo_led_superseded, ft_wo_led_overflow;
 unsigned long ft_wo_led_nr_max;
 unsigned long ft_wo_joint[4];
+#ifdef FT_FEATURE_WIDEN
+unsigned long ft_wd_acq, ft_wd_locks, ft_wd_dedup;
+unsigned long ft_wd_no_owner, ft_wd_no_ledger, ft_wd_locks_max;
+#endif
 unsigned long ft_wo_nod_remove_locked, ft_wo_nod_chain_head;
 
 __attribute__((destructor))
@@ -433,17 +437,34 @@ static void ft_wo_dump(void)
 		ft_wo_joint[3], ft_wo_joint[2], ft_wo_joint[1], ft_wo_joint[0],
 		ft_wo_nod_remove_locked, ft_wo_nod_chain_head,
 		ft_wo_led_nodescent);
+#ifdef FT_FEATURE_WIDEN
+	/*
+	 * ☠ A WIDENING THAT DID NOT FIRE IS AN EXCLUSION GAP THAT SUCCEEDS AT
+	 * EVERYTHING IT DOES, so the misses are counted beside the hits and
+	 * named for their cause -- no owner at the site, or no ledger for the
+	 * path.  A build reporting zero acquisitions says so rather than
+	 * passing quietly.
+	 */
+	fprintf(stderr,
+		"  WIDENED: acquires=%lu locks=%lu max=%lu deduped=%lu%s\n"
+		"           NOT widened: no_owner=%lu no_ledger=%lu\n",
+		ft_wd_acq, ft_wd_locks, ft_wd_locks_max, ft_wd_dedup,
+		ft_wd_acq ? "" :
+			"   <-- NEVER WIDENED: this build proves nothing",
+		ft_wd_no_owner, ft_wd_no_ledger);
+#else
+	fprintf(stderr, "  WIDENED: not compiled in "
+		"(-DFT_FEATURE_WIDEN is off)\n");
+#endif
 	for (i = 0; i < FT_WO_SITES; i++) {
 		struct ft_wo_site *s = &ft_wo_site_tbl[i];
 
 		if (!s->fn || !s->live)
 			continue;
-		fprintf(stderr, "  SITE %-34s:%-5d live=%-9lu top=%-9lu "
-			"chain=%-7lu none=%-9lu led_ok=%-9lu led_bad=%-7lu "
-			"fine=%lu spacing=%lu\n",
-			s->fn, s->line, s->live, s->txn_top, s->txn_chain,
-			s->txn_none, s->led_ok, s->led_bad, s->fine,
-			s->spacing);
+		fprintf(stderr, "  SITE %-34s:%-5d live=%-10lu led_ok=%-10lu "
+			"NO_OWNER=%-10lu fine=%lu spacing=%lu\n",
+			s->fn, s->line, s->live, s->led_ok, s->no_owner,
+			s->fine, s->spacing);
 	}
 }
 #endif

@@ -1354,7 +1354,34 @@ int ft_node_recompact(enum ft_recompact mode,
 			.guard_pf = pf_gp };
 		if (ft_recompact_fault_refuse_acquire(mode))
 			return -EAGAIN;		/* test-only; nothing acquired */
+#ifdef FT_FEATURE_WIDEN
+		/*
+		 * G5.5's WIDENING NEEDS A RELEASE OWNER, and at this site it is
+		 * @retire_txn -- NON-NULL BY THIS ARM'S OWN GUARD above, and
+		 * already the txn whose commit consumes C's retire and P/GP's
+		 * releases below.  It is a PARAMETER, in no lock-context frame,
+		 * which is why the choke point could not find it: measured, of
+		 * the acquires here that could widen, NOT ONE carried a txn in
+		 * any ctx frame.
+		 *
+		 * Handed through a CHAINED frame rather than by overwriting
+		 * @ctx->held.txn: that field decides DEDUPE for every member of
+		 * this set, and repointing it would change which words this
+		 * acquire considers already held -- a behaviour change on the
+		 * hottest path, for a fact that belongs in its own field.
+		 */
+		{
+			struct ft_lock_ctx wctx;
+
+			ft_lock_ctx_init(&wctx, ft_lock_ctx_descent(ctx), NULL,
+					ctx ? ctx->op : NULL);
+			wctx.held.widen_txn = retire_txn;
+			wctx.held.outer = ctx ? &ctx->held : NULL;
+			dret = ft_dlm_acquire_set(ft, &wctx, set, 3);
+		}
+#else
 		dret = ft_dlm_acquire_set(ft, ctx, set, 3);
+#endif
 		if (dret)
 			return dret == -ENOMEM ? -ENOMEM : -EAGAIN;
 
