@@ -317,7 +317,9 @@ __thread unsigned long ft_bulk_self_depth;
  * op that must widen.  One block per thread; only touched while a bulk op is
  * live.
  */
+#ifdef FT_ANC_LEDGER
 __thread struct ft_anc_ledger ft_anc_ledger;
+#endif
 
 #ifdef FT_DEBUG_FORCE_ACQ_HEAP
 unsigned long ft_acq_heap_taken;

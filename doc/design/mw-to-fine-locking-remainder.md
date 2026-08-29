@@ -2362,6 +2362,36 @@ gap in anything.
 `-DFT_DEBUG_WIDEN_OWNER` reads it.  Left in place as the instrument's subject; a
 separate call.
 
+### G5.29 — ☑ THE LEDGER IS DEBUG-ONLY: it now depends on the flag that reads it
+
+The ancestor ledger's only consumer was the widening; with that gone (G5.27) and
+its filling descent gone (G5.28), it was live library code nobody read.  It is
+now compiled out of the default build entirely, gated on the measurement flags
+that use it:
+
+    #if defined(FT_DEBUG_WIDEN_OWNER) || defined(FT_DEBUG_ANC_LEDGER)
+    # define FT_ANC_LEDGER  1
+    #endif
+
+★ **AND IT WAS NOT FREE TO KEEP.**  The default build loses, per thread and per
+op: ~4 KB of TLS (`FT_MAX_DEPTH` entries), a SHARED-WORD LOAD PER DESCENT
+(`ft_descent_init`'s `ft_bulk_active` sample), a BRANCH PER LEVEL
+(`ft_descent_enter_node`'s push test), and two fields off `struct ft_descent` --
+which is a per-op STACK object.  All on the hot path, and POINT-OP SPEED is the
+metric this transition is gated on, so "harmless if unused" was not true.
+☑ Verified by symbol: `ft_anc_ledger` is ABSENT from the default
+`liburcu-cds.so` and PRESENT in the measurement build, whose probe still
+reports.
+
+☞ `-DFT_DEBUG_ANC_LEDGER` is kept in the predicate deliberately: it COUNTS the
+ledger (reach, overflow, disorder, copied pushes) without consuming it, so it
+must be able to turn the ledger on by itself rather than depending on the probe.
+
+☞ WHAT THIS LEAVES: the ledger, its `@anc_rec`/`@anc_gen` credential split and
+`ft_anc_ledger_valid` all still exist and are still correct -- they are simply
+DEBUG-ONLY.  If a future consumer wants the path again, it is one flag away, with
+its hazard documentation intact.
+
 ### G5.26 — ☐ FOUND, NOT CHASED: a DEEP rekey is starved ~12,000x by point-op traffic, INSIDE one call
 
 Isolating `inv_widen_deep_junction`'s movers to explain their tiny bulk-side

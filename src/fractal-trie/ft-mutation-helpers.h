@@ -42,6 +42,25 @@ struct ft_lock_anchor {
 };
 
 /*
+ * THE ANCESTOR LEDGER -- DEBUG-ONLY SINCE THE WIDENING WENT.
+ *
+ * It was built to feed G5.5's per-op lock-set widening; that widening is gone
+ * (the FT-wide lock on the bulk refcount replaced it), so the ledger has NO
+ * shipping consumer and is compiled out of the default build entirely.  ★ Not
+ * free if it were kept: FT_MAX_DEPTH entries is ~4 KB of TLS PER THREAD, plus a
+ * shared-word load per DESCENT in ft_descent_init and a branch per LEVEL in
+ * ft_descent_enter_node -- all on the hot path, and POINT-OP SPEED is the metric
+ * this whole transition is gated on.
+ *
+ * Enabled by either measurement build: -DFT_DEBUG_WIDEN_OWNER (which consumes
+ * it) or -DFT_DEBUG_ANC_LEDGER (which counts it).
+ */
+#if defined(FT_DEBUG_WIDEN_OWNER) || defined(FT_DEBUG_ANC_LEDGER)
+# define FT_ANC_LEDGER	1
+#endif
+
+#ifdef FT_ANC_LEDGER
+/*
  * G5.5's ANCESTOR LEDGER: the descent path, root-first, for the widening.
  *
  * ☠ NOTHING ELSE IN THE TREE CAN ANSWER "every ancestor" at the SHIPPING
@@ -149,6 +168,8 @@ void ft_anc_ledger_push(struct cds_ft_inode_flag *nf, unsigned int depth)
 	l->nr++;
 }
 
+#endif /* FT_ANC_LEDGER */
+
 /*
  * Descent cursor -- tracks current, parent, and grandparent positions
  * during a key-guided traversal of the trie.
@@ -188,6 +209,7 @@ struct ft_descent {
 	 * only part of the path, which is the silent-truncation shape the
 	 * parent_word walk was refuted for.
 	 */
+#ifdef FT_ANC_LEDGER
 	bool anc_rec;
 	/*
 	 * THE READ CREDENTIAL, and it is deliberately NOT @anc_rec.
@@ -209,6 +231,7 @@ struct ft_descent {
 	 * init leaves and what makes the predicate fail closed.
 	 */
 	unsigned long anc_gen;
+#endif
 	struct cds_ft_inode_flag *nf;		/* Current node-flag value. */
 	struct cds_ft_inode_flag **nfp;		/* Slot that holds @nf. */
 	struct cds_ft_inode_flag *pnf;		/* Parent node-flag value. */
@@ -324,8 +347,10 @@ void ft_descent_enter_node(struct ft_descent *d, struct cds_ft_inode_flag *nf,
 	 * BEFORE the per-node early return: the ledger is needed at EVERY
 	 * spacing, and per-node is the one where nothing else records the path.
 	 */
+#ifdef FT_ANC_LEDGER
 	if (caa_unlikely(d->anc_rec))
 		ft_anc_ledger_push(nf, start);
+#endif
 	/*
 	 * Per-node granularity anchors every member on itself, so it reads no
 	 * table and builds none -- the zero-cost path the default rests on.
@@ -795,10 +820,12 @@ void ft_descent_init(struct ft_descent *d, struct cds_ft *ft)
 	d->anchor_pending = 0;
 	d->anchor_crossed = 0;
 	d->lock_spacing = ft->lock_spacing;
+#ifdef FT_ANC_LEDGER
 	d->anc_rec = caa_unlikely(ft_bulk_active(ft));
 	d->anc_gen = 0;
 	if (caa_unlikely(d->anc_rec))
 		d->anc_gen = ft_anc_ledger_reset(ft);
+#endif
 	/*
 	 * Resolve a transient type-7 flip proxy a peer parked on the ROOT slot
 	 * (Phase 4.3: a root recompact's forward edge mid-commit) to its
@@ -5026,6 +5053,7 @@ bool ft_dlm_covering_release_recorded(const struct ft_lock_ctx *ctx,
 	return false;
 }
 
+#ifdef FT_ANC_LEDGER
 /*
  * MAY A CONSUMER READ THE LEDGER FOR THIS ACQUIRE?
  *
@@ -5061,6 +5089,7 @@ bool ft_anc_ledger_valid(const struct cds_ft *ft, const struct ft_descent *d)
 	return d && d->anc_gen && !ft_anc_ledger.overflow &&
 		ft_anc_ledger.ft == ft && ft_anc_ledger.gen == d->anc_gen;
 }
+#endif /* FT_ANC_LEDGER */
 
 #ifdef FT_DEBUG_WIDEN_OWNER
 /*

@@ -1728,7 +1728,9 @@ int ft_detach_node(struct cds_ft *ft,
 		 * ft_anc_ledger_valid still vouching for the result.  @anc_gen
 		 * is deliberately kept: reading is exactly what a copy is for.
 		 */
+#ifdef FT_ANC_LEDGER
 		wd.anc_rec = false;
+#endif
 	}
 	ft_lock_ctx_init(&lctx, wd_valid ? &wd : NULL, NULL,
 		op_ctx ? op_ctx->op : NULL);
