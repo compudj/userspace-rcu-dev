@@ -4150,9 +4150,50 @@ correctly declining to save it. All 118 gate legs identical to the control.
 arming removes the last detection of the rekey writer's unowned parks, and there
 are now none to detect.
 
-☐ **9.1(B) is untouched** — the atomic writers for the deleted staged rekey
-writer's shapes, which is what greens ft_unit 110/112/123. Large, and never a B1
-blocker.
+☑ **9.1(B) HAS ITS FIRST SHAPE — the ORDERED-LIST INTERLEAVE, `test_merge_rekey
+_same_trie_ordered` (123), is GREEN.** Two refusals stood in front of it and they
+had to land together, because 123 is the only shape that reaches the second.
+
+* **The COLLISION** was refused because the collect drops a colliding src head as
+  "a floating duplicate never reachable as a distinct head" — true only when the
+  src list is CONSUMED. In-trie the edges already route every surviving link
+  around that cell, so the drop was never the problem: what was missing is the
+  RECLAIM. The collect now returns the dropped cells and the caller frees them on
+  the far side of its commit, exactly as `ft_glue_free_collided_cells` does
+  cross-trie.
+* **The ABUT** refusal was REAL, and the earlier bracket proved it: lifting it
+  with the collision handled did not give a wrong answer, it LIVELOCKED
+  (65,897,286 attempts). The cause is a DUPLICATE SLOT. When the run abuts the
+  region, the region's neighbour on that side is a cell OF THE RUN, so the
+  collect seeds a boundary on a moving cell — and the gap closure
+  (`ft_ord_cell_run_detach_edges`) writes `run_pred->next`, the very slot the
+  collect writes when a survivor follows the last region cell. Two records, one
+  slot; the commit aborts and the retry loop spins forever.
+* ☞ **THE FIX IS NOT A SPECIAL CASE IN THE EDGE BUILDING.** Abutting, the merged
+  block occupies the UNION of the two ranges, so it has ONE boundary pair — the
+  run's outer neighbour on the abutting side, the region's on the other — and the
+  vacated gap is INTERIOR to it. So the abutting side's boundary is handed to the
+  collect as a link target (`tail_link` / `prev_placed` + `head_linked`, kept
+  distinct from `dst_succ`, which still bounds the region WALK) and the gap
+  closure is not emitted at all. The duplicate cannot arise because the second
+  writer is gone, not because the two happen to disagree.
+* ☑ **RED CONTROL**: restoring the unconditional gap closure reproduces the
+  livelock (`test_urcu_ft_unit` times out at 123, last completed 121). ☠ And note
+  WHAT detects it — **not** the engine's duplicate-slot assert, which does not
+  fire even under `--enable-rcu-debug`: the descriptor is poisoned and the op's
+  own retry loop absorbs it. The livelock IS the detector.
+* ☑ `test_rekey_occupied_dst_behind_compressed` (118) was written AROUND the
+  collision refusal: its `if (s == CDS_FT_STATUS_OK)` body had never executed, and
+  the expectations inside it (`"azzm"`, 5 keys) came from a `src="q"` scenario.
+  The shape now moves, so the test asserts it: `azm azq azx qwm`, 4 keys over 5
+  entries (the collided `qzm` absorbed onto `azm`'s chain). It does NOT abut
+  (`qwm` sits between run and region), so 118 is the collision witness and 123
+  the abutting one — both paths have one.
+
+☐ **THE REST OF 9.1(B) IS UNTOUCHED**: 110 `test_merge_rekey_same_trie` and 112
+`test_rekey_graft_vs_merge` are the VARIABLE-LENGTH shapes, tier 1 — never
+dispatched to the atomic writer at all (`src_key_len != dst_key_len`). Large, and
+never a B1 blocker.
 
 ☐ **Arm PLACEMENT remains the open API question**: `ft_flip_txn_arm_per_op` has
 zero call sites, refuses `!t->nr_locks`, and its doc says "after the last
@@ -4351,8 +4392,17 @@ stale) — watch it across Phase B, it shares words with the converted sites.
                                                               the claim is CLEAN on ft_unit
                                                               AND on ft_inv FT_INV_MW=1.
                                                               B1's arm is no longer blocked by
-                                                              it; 9.1(B) and the arm-PLACEMENT
-                                                              question remain (§9.1)
+                                                              it.  ☑ 9.1(B)'s FIRST SHAPE landed:
+                                                              the ordered-list interleave (123)
+                                                              greens once the COLLISION reclaim
+                                                              and the ABUT boundary land together
+                                                              -- abut was a DUPLICATE SLOT
+                                                              (livelock, 65.9M attempts), fixed by
+                                                              giving the collect the union range's
+                                                              boundary and dropping the gap
+                                                              closure.  ☐ 110/112 (VARLEN, tier 1)
+                                                              and the arm-PLACEMENT question
+                                                              remain (§9.1)
     B0  per-op arm helper + record-time owner assert        ☑ LANDED — and its first
                                                               measurement says NO site is
                                                               owner-complete (11.9% of the

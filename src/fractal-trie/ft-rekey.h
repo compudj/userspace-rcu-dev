@@ -623,30 +623,40 @@ void ft_rekey_free_stop_prime(struct cds_ft *ft, struct cds_ft_inode_flag *nf)
  *  - the SRC GAP.  A cross-trie merge throws its source list away; here the run
  *    vacates a position in the same list, so its old neighbours must be stitched
  *    to each other (ft_ord_cell_run_detach_edges, 2 edges).
- *  - an ADJACENCY refusal.  The run and the region are each contiguous and
- *    disjoint in the CURRENT list (their key prefixes are disjoint; they only
- *    interleave AFTER the move), so the ONLY way an edge slot can repeat is the
- *    two runs abutting -- then the gap closure and the collect's boundary edges
- *    name the same links, and one of the collect's seeds would be a cell that is
- *    itself moving.  Refused rather than special-cased.
+ *  - an ADJACENCY case.  The run and the region are each contiguous and disjoint
+ *    in the CURRENT list (their key prefixes are disjoint; they only interleave
+ *    AFTER the move), so the ONLY way an edge slot can repeat is the two runs
+ *    ABUTTING: the region's neighbour on the abutting side is then a cell of the
+ *    run itself, so the collect would seed a boundary on a cell that is moving,
+ *    AND the gap closure would write the very link the collect writes -- two
+ *    records on one slot, which the engine forbids.
  *
- * A COLLISION is refused too, and for a reason the collect's own contract states:
- * it drops a colliding src head on the premise that the cell becomes an
- * unreachable floating duplicate, which holds only when the src list is consumed.
- * In-trie that cell stays linked where it is and would keep answering as a
- * distinct key, so it would have to be unlinked as well -- a further step this
- * does not take.  With @record_all the collect stores nothing, so running it and
- * discarding the result is how the check is made.
+ * ★ HOW ABUTTING IS HANDLED, and why it is not a special case in the edge
+ * building at all.  When the two are adjacent the merged block occupies the UNION
+ * of the two ranges, so it has ONE boundary pair -- the run's outer neighbour on
+ * the abutting side, the region's on the other -- and the gap the run vacates is
+ * INSIDE the block rather than beside it.  So the abutting side's boundary is
+ * handed to the collect as its link target (@tail_link / @prev_placed +
+ * @head_linked) and the gap closure is not emitted at all.  One boundary pair,
+ * written once: the duplicate cannot arise because the second writer is gone,
+ * not because the two happen to disagree.
  *
- * Returns 0 with *@edges_ret (caller frees) and *@n_ret, or -EINVAL (a shape
- * above), -EAGAIN (a torn read) or -ENOMEM.  Records nothing itself.
+ * A COLLISION drops the colliding src head from the merged order.  The edges
+ * below route every surviving link around that cell, so it is unreachable to a
+ * new reader once this commit lands; it is RECLAIMED by the caller on the far
+ * side of that commit (*@collided_ret / *@ncollide_ret), never here.
+ *
+ * Returns 0 with *@edges_ret and *@collided_ret (caller frees both) and *@n_ret,
+ * or -EINVAL (a shape above), -EAGAIN (a torn read) or -ENOMEM.  Records nothing
+ * itself.
  */
 static
 int ft_rekey_ord_interleave(struct cds_ft *ft, struct cds_ft_inode_flag *D,
 		size_t dst_len, size_t src_len,
 		struct cds_ft_node *run_rfirst, struct cds_ft_node *run_rlast,
 		unsigned long merged_keys,
-		struct ft_ord_cell_edge **edges_ret, unsigned int *n_ret)
+		struct ft_ord_cell_edge **edges_ret, unsigned int *n_ret,
+		struct ft_ord_cell ***collided_ret, unsigned long *ncollide_ret)
 {
 	size_t max_len = ft->group->max_key_len;
 	struct ft_ord_cell *rfc, *rlc, *run_pred, *run_succ;
@@ -655,6 +665,9 @@ int ft_rekey_ord_interleave(struct cds_ft *ft, struct cds_ft_inode_flag *D,
 	uint8_t *pool = NULL;
 	size_t pool_cap = 0, pool_len = 0;
 	struct ft_ord_cell_edge *edges = NULL;
+	struct ft_ord_cell **collided = NULL;
+	struct ft_ord_cell *head_link, *tail_link;
+	bool abut_run_first, abut_region_first, head_linked;
 	unsigned long nsrc = 0, ncollide = 0, cap_n;
 	unsigned int n;
 	struct ft_ord_cell *sc, *slast;
@@ -662,6 +675,8 @@ int ft_rekey_ord_interleave(struct cds_ft *ft, struct cds_ft_inode_flag *D,
 
 	*edges_ret = NULL;
 	*n_ret = 0;
+	*collided_ret = NULL;
+	*ncollide_ret = 0;
 	rfc = ft_ord_cell_ptr(rcu_dereference(run_rfirst->prev));
 	rlc = ft_ord_cell_ptr(rcu_dereference(run_rlast->prev));
 	dfirst = ft_ord_cell_ptr(rcu_dereference(
@@ -674,10 +689,25 @@ int ft_rekey_ord_interleave(struct cds_ft *ft, struct cds_ft_inode_flag *D,
 	run_succ = ft_ord_cell_resolve_ord(&rlc->lnode.next);
 	reg_pred = ft_ord_cell_resolve_ord(&dfirst->lnode.prev);
 	reg_succ = ft_ord_cell_resolve_ord(&dlast->lnode.next);
-	/* The two runs must not abut, in either order (see the header). */
-	if (run_succ == dfirst || run_pred == dlast ||
-			reg_pred == rlc || reg_succ == rfc)
-		return -EINVAL;
+	/*
+	 * WHICH SIDE ABUTS, if either (see the header).  Both disjuncts of a side
+	 * are tested rather than one: they are equivalent on a coherent list, and
+	 * disagreeing means the list was read torn.
+	 */
+	abut_run_first = (run_succ == dfirst || reg_pred == rlc);
+	abut_region_first = (run_pred == dlast || reg_succ == rfc);
+	if (abut_run_first && abut_region_first)
+		return -EAGAIN;		/* torn: a run cannot abut on both sides */
+	/*
+	 * The merged block's OWN boundary pair.  On the abutting side the region's
+	 * neighbour is a cell of the run, so the block's neighbour is the run's
+	 * outer one; @head_linked then denies the pre-existing predecessor link the
+	 * collect would otherwise assume, because @head_link still points into the
+	 * run.  The region's walk bound stays @reg_succ either way.
+	 */
+	head_link = abut_run_first ? run_pred : reg_pred;
+	head_linked = !abut_run_first;
+	tail_link = abut_region_first ? run_succ : reg_succ;
 
 	/*
 	 * Capture the run's key SUFFIXES while it is still attached and
@@ -733,7 +763,11 @@ int ft_rekey_ord_interleave(struct cds_ft *ft, struct cds_ft_inode_flag *D,
 
 	/*
 	 * <= 2 visible edges per survivor run + 2 boundary, plus (record_all) up to
-	 * 2 per survivor for its own links, plus the 2 src-gap edges.
+	 * 2 per survivor for its own links, plus the 2 src-gap edges.  ☠ The gap
+	 * edges are NOT emitted on the abutting side, but the term stays
+	 * unconditional: a bound that tracked the branch would have to be right
+	 * about it, and this one costs two array slots.  With NDEBUG the assert
+	 * below is compiled out, so an overflow here is a wild write.
 	 */
 	cap_n = 2 * merged_keys + 2 + 2 * nsrc + FT_ORD_CELL_RUN_DETACH_MAX_EDGES;
 	edges = (struct ft_ord_cell_edge *) calloc(cap_n, sizeof(*edges));
@@ -741,22 +775,37 @@ int ft_rekey_ord_interleave(struct cds_ft *ft, struct cds_ft_inode_flag *D,
 		ret = -ENOMEM;
 		goto out;
 	}
-	n = ft_merge_ord_interleave_collect(ft, dst_len, dfirst, reg_succ,
-			reg_pred, caps, nsrc, pool, edges, /*record_all=*/ true,
-			&ncollide);
-	if (ncollide) {
-		ret = -EINVAL;			/* see the header */
-		goto out;
+	/* One slot per src head: a collision can drop at most all of them. */
+	if (nsrc) {
+		collided = (struct ft_ord_cell **) calloc((size_t) nsrc,
+				sizeof(*collided));
+		if (!collided) {
+			ret = -ENOMEM;
+			goto out;
+		}
 	}
-	/* Close the gap the run vacates. */
-	n = ft_ord_cell_run_detach_edges(ft, run_rfirst, run_rlast, &rfc, &rlc,
-			edges, n);
+	n = ft_merge_ord_interleave_collect(ft, dst_len, dfirst, reg_succ,
+			head_link, tail_link, head_linked, caps, nsrc, pool,
+			edges, /*record_all=*/ true, &ncollide, collided);
+	/*
+	 * Close the gap the run vacates -- ONLY when the run does not abut the
+	 * region.  Abutting, that gap is interior to the merged block and the
+	 * boundary pair above already spans it; emitting these two edges as well
+	 * would put a second record on a slot the collect wrote.
+	 */
+	if (!abut_run_first && !abut_region_first)
+		n = ft_ord_cell_run_detach_edges(ft, run_rfirst, run_rlast,
+				&rfc, &rlc, edges, n);
 	assert(n <= cap_n);
 	*edges_ret = edges;
 	*n_ret = n;
 	edges = NULL;
+	*collided_ret = collided;
+	*ncollide_ret = ncollide;
+	collided = NULL;
 	ret = 0;
 out:
+	free(collided);
 	free(edges);
 	free(pool);
 	free(caps);
@@ -1080,6 +1129,15 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 #endif
 	struct cds_ft_inode_flag *merged_nf = NULL;
 	struct cds_ft_inode_flag *probe_D = NULL;	/* occupied dst merge point */
+	/*
+	 * The interleave's DROPPED src heads' cells (an occupied dst whose merge
+	 * collides on a suffix).  The edges that route every surviving link around
+	 * them ride THIS op's commit, so they become reader-unreachable only when
+	 * it lands: freed on its far side, left alone on every abort.  The ARRAY is
+	 * this frame's either way and is released at @sweep.
+	 */
+	struct ft_ord_cell **collided_cells = NULL;
+	unsigned long nr_collided = 0;
 	unsigned long merged_keys = 0;
 	bool merge_dst = false, src_glue_live = false;
 	/*
@@ -3057,7 +3115,8 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 			unsigned int in = 0;
 			int iret = ft_rekey_ord_interleave(ft, probe_D, dst_len,
 					src_len, run_rfirst, run_rlast,
-					merged_keys, &iedges, &in);
+					merged_keys, &iedges, &in,
+					&collided_cells, &nr_collided);
 
 			if (!iret && !ft_flip_txn_reserve_extra(txn, in)) {
 				free(iedges);
@@ -3352,6 +3411,18 @@ cells_done:
 			free_cds_ft_node(ft, detach_rc.old_node);	/* old BP copy */
 		/* The folded collapse's retired chain: this commit unlinked it. */
 		ft_rekey_collapse_free_retired(ft, &detach_rc.collapse);
+		/*
+		 * The interleave's dropped heads' cells: this commit is what routed
+		 * every surviving link around them, so it is what makes the
+		 * grace-period defer inside ft_ord_cell_free cover the readers that
+		 * still hold one.
+		 */
+		{
+			unsigned long ci;
+
+			for (ci = 0; ci < nr_collided; ci++)
+				ft_ord_cell_free(ft, collided_cells[ci]);
+		}
 		/* Likewise an ELEVATING detach's orphan chain. */
 		ft_rekey_detach_free_orphans(ft, &detach_rc);
 		/*
@@ -3443,6 +3514,15 @@ bail_build:
 		free_cds_ft_node_unpublished(ft, ft_node_ptr(gst_st.dest));
 
 sweep:
+	/*
+	 * The collided-cell ARRAY belongs to this frame whatever the outcome; the
+	 * CELLS in it are freed only on the committed path above, since an abort
+	 * routed nothing around them and they are still live and linked.  Here
+	 * because EVERY path reaches this label -- the commit and abort arms jump
+	 * straight to it, so an unwind-only free would leak on success.
+	 */
+	free(collided_cells);
+	collided_cells = NULL;
 	/*
 	 * Release every mark the commit did NOT consume.
 	 *
@@ -4617,9 +4697,10 @@ enum cds_ft_status ft_rekey_spine_copy(struct cds_ft *dst_ft,
 		unsigned int i;
 
 		ms_n = ft_merge_ord_interleave_collect(dst_ft, dst_key_len,
-			ms_cursor, ms_succ, ms_prev, ms_src_caps, ms_nsrc,
+			ms_cursor, ms_succ, ms_prev, /*tail_link=*/ ms_succ,
+			/*head_linked=*/ true, ms_src_caps, ms_nsrc,
 			ms_src_pool, ms_edges, /*record_all=*/ false,
-			/*ncollide=*/ NULL);
+			/*ncollide=*/ NULL, /*collided=*/ NULL);
 		/*
 		 * ☠ A RAW record_tag LOOP OVER ORD EDGES, which the sibling
 		 * graft path deliberately does NOT do (see the comment at

@@ -13244,23 +13244,37 @@ static int test_rekey_occupied_dst_behind_compressed(void)
 	cds_ft_insert(ft, (const uint8_t *) "qwm", 3, &node_alloc(5)->node);
 	rcu_read_unlock();
 
-	/* Must come back -- with a refusal, not after an unbounded retry loop. */
+	/* Moves, and must come back -- never after an unbounded retry loop. */
 	s = cds_ft_rekey_merge(ft, (const uint8_t *) "az", 2,
 			(const uint8_t *) "qz", 2);
-	if (s == CDS_FT_STATUS_OK) {
-		/* If a later widening covers it, the move must be correct. */
-		rcu_read_lock();
-		if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK ||
-				!ft_test_has_key(ft, "azm") ||
-				!ft_test_has_key(ft, "azzm") ||
-				cds_ft_count_keys(ft) != 5) {
-			fprintf(stderr, "occupied-dst rekey reported OK but the "
-				"trie is wrong\n");
-			rcu_read_unlock();
-			goto out;
-		}
-		rcu_read_unlock();
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "occupied-dst rekey refused: %s\n",
+			cds_ft_status_to_string(s));
+		goto out;
 	}
+	rcu_read_lock();
+	/*
+	 * qzm and qzx move to az; qzm's suffix COLLIDES with the region's azm, so
+	 * it is absorbed onto that head's duplicate chain rather than becoming a
+	 * key of its own: four distinct keys over five entries.  The run does not
+	 * abut the region here (qwm sits between them), so this is the collision
+	 * on its own -- test_merge_rekey_same_trie_ordered is the abutting one.
+	 */
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK ||
+			!ft_test_has_key(ft, "azm") ||
+			!ft_test_has_key(ft, "azq") ||
+			!ft_test_has_key(ft, "azx") ||
+			!ft_test_has_key(ft, "qwm") ||
+			ft_test_has_key(ft, "qzm") ||
+			ft_test_has_key(ft, "qzx") ||
+			cds_ft_count_keys(ft) != 4 ||
+			cds_ft_count_entries(ft) != 5) {
+		fprintf(stderr, "occupied-dst rekey reported OK but the "
+			"trie is wrong\n");
+		rcu_read_unlock();
+		goto out;
+	}
+	rcu_read_unlock();
 	ret = 0;
 out:
 	rcu_read_lock();
@@ -13286,10 +13300,10 @@ out:
  * lock rides @publish_gp_holder.
  *
  * Distinct from test_rekey_occupied_dst_behind_compressed above, which keeps a
- * full-key COLLISION (qzm -> azm) in the move: with the ordered list on, an
- * in-trie interleave refuses a collision for its own reason and that shape is
- * still out.  Here the moved suffixes {x, y} are disjoint from the region's
- * {m, q}, so the move completes and the ordered walk must show the interleave.
+ * full-key COLLISION (qzm -> azm) in the move, so its merged order drops a head
+ * onto a duplicate chain.  Here the moved suffixes {x, y} are disjoint from the
+ * region's {m, q}, so every moved key stays a key of its own and the ordered
+ * walk must show the interleave.
  */
 static int test_rekey_merge_dst_behind_compressed_moves(void)
 {

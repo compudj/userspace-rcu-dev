@@ -1173,13 +1173,29 @@ unsigned int ft_ord_survivor_back(struct ft_ord_cell *cell,
  * caller sizes @edges accordingly: <= 2*merged_keys+2 visible, plus 2*nsrc when
  * @record_all.
  *
- * @ncollide (optional) counts the equal-suffix steps.  A collision drops the src
- * head from the merged order on the premise that it became a DUPLICATE on the dst
- * head's chain and is "a floating duplicate never reachable as a distinct head" --
- * true when the src list is consumed, FALSE in-trie, where that cell stays linked
- * where it was and would keep answering as a distinct key.  An in-trie caller must
- * therefore check this and decline; with @record_all the collect stores nothing, so
- * a declined run costs only the walk.
+ * @ncollide (optional) counts the equal-suffix steps and @collided (optional)
+ * receives the dropped cells.  A collision drops the src head from the merged
+ * order on the premise that it became a DUPLICATE on the dst head's chain and is
+ * "a floating duplicate never reachable as a distinct head".  Cross-trie that is
+ * free: the src list is CONSUMED, so nothing reaches the cell again.  IN-TRIE the
+ * src list is the list being rebuilt, so the drop is only half the work -- the
+ * edges below route every surviving link around the cell, which makes it
+ * unreachable to a new reader once the flip lands, and what remains is to RECLAIM
+ * it.  An in-trie caller takes @collided and frees each cell on the far side of
+ * its commit, as ft_glue_free_collided_cells does cross-trie.
+ *
+ * ★ THE TWO BOUNDARIES ARE LINK TARGETS, NOT THE WALK BOUNDS.  @dst_succ ends the
+ * REGION WALK; @tail_link is the cell the merged block's last element links to,
+ * and @prev_placed the one its first links back to.  They coincide for every
+ * caller whose region is bounded by cells that stay put, and they DO NOT when the
+ * moved run ABUTS the region: there the region's own neighbour on the abutting
+ * side is a cell that is itself moving, and the block's real neighbour is the
+ * run's outer one.  @head_linked says @prev_placed already points at the first
+ * merged cell (false only on that abutting side, where it points into the run);
+ * the tail's counterpart is derived, since @tail_link != @dst_succ IS the
+ * abutting tail.  Passing the run's outer neighbours here is what lets an
+ * abutting caller emit ONE boundary pair instead of a boundary pair plus a
+ * separate gap closure that would name the same slots.
  *
  * Identity key_map only (matches the rest of the ordered-list machinery).
  */
@@ -1187,9 +1203,11 @@ static
 unsigned int ft_merge_ord_interleave_collect(struct cds_ft *dst,
 		size_t dst_key_len, struct ft_ord_cell *dst_first,
 		struct ft_ord_cell *dst_succ, struct ft_ord_cell *prev_placed,
+		struct ft_ord_cell *tail_link, bool head_linked,
 		const struct ft_merge_src_cap *src_caps, unsigned long nsrc,
 		const uint8_t *src_pool, struct ft_ord_cell_edge *edges,
-		bool record_all, unsigned long *ncollide)
+		bool record_all, unsigned long *ncollide,
+		struct ft_ord_cell **collided)
 {
 	size_t max_len = dst->group->max_key_len;
 	uint8_t dbuf[FT_MAX_KEY_LEN];
@@ -1205,8 +1223,14 @@ unsigned int ft_merge_ord_interleave_collect(struct cds_ft *dst,
 	 * points at the region's first cell).  So the old "new list minimum" /
 	 * "list tail" head/tail special cases fold into the general neighbour-edge
 	 * path (the sentinel IS the neighbour).
+	 *
+	 * @head_linked false denies exactly that pre-existing link: @prev_placed is
+	 * then the run's outer neighbour and still points INTO the run, so the
+	 * first merged cell needs its forward edge written whether it is a survivor
+	 * or a dst-original.  Seeding the flag false is the whole of it -- with
+	 * @record_all the two branches emit the same recorded edge.
 	 */
-	bool prev_is_dst = true;
+	bool prev_is_dst = head_linked;
 	unsigned long si = 0;
 	unsigned int n = 0;
 	const uint8_t *dsuf = NULL;
@@ -1247,6 +1271,9 @@ unsigned int ft_merge_ord_interleave_collect(struct cds_ft *dst,
 					src_caps[si].suffix_len);
 			/* Tie: dst head wins, drop the colliding src head. */
 			if (cmp == 0) {
+				if (collided)
+					collided[ncollide ? *ncollide : 0] =
+						src_caps[si].cell;
 				si++;
 				if (ncollide)
 					(*ncollide)++;
@@ -1304,17 +1331,21 @@ unsigned int ft_merge_ord_interleave_collect(struct cds_ft *dst,
 		}
 	}
 	/*
-	 * Close the trailing edge: if the last placed cell is a survivor, link it
-	 * to the region successor @dst_succ (the sentinel at the list tail) and flip
-	 * that neighbour's back edge.  Sentinel topology: when @dst_succ is the
-	 * sentinel this IS the old "flip @dst's tail".
+	 * Close the trailing edge: link the last placed cell to @tail_link (the
+	 * sentinel at the list tail) and flip that neighbour's back edge.  A last
+	 * placed cell that is a dst-original already points there -- UNLESS
+	 * @tail_link is not the region's own successor, which is the abutting tail:
+	 * the region's successor is a cell inside the moving run, so even a
+	 * dst-original tail has to be re-pointed at the run's outer neighbour.
+	 * Sentinel topology: when @tail_link is the sentinel this IS the old
+	 * "flip @dst's tail".
 	 */
-	if (!prev_is_dst) {
-		n = ft_ord_survivor_link(prev, dst_succ, edges, n, record_all);
+	if (!prev_is_dst || tail_link != dst_succ) {
+		n = ft_ord_survivor_link(prev, tail_link, edges, n, record_all);
 		edges[n].tag = URCU_TXN_TAG;	/* ordered-cell edge */
-		edges[n].slot = (struct ft_ord_cell **) &dst_succ->lnode.prev;
+		edges[n].slot = (struct ft_ord_cell **) &tail_link->lnode.prev;
 		edges[n].old_target =
-			ft_ord_cell_resolve_ord(&dst_succ->lnode.prev);
+			ft_ord_cell_resolve_ord(&tail_link->lnode.prev);
 		edges[n].new_target = prev;
 		n++;
 	}
@@ -2334,9 +2365,10 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 		unsigned int i;
 
 		ms_n = ft_merge_ord_interleave_collect(dst_ft, dst_key_len,
-			ms_cursor, ms_succ, ms_prev, ms_src_caps, ms_nsrc,
+			ms_cursor, ms_succ, ms_prev, /*tail_link=*/ ms_succ,
+			/*head_linked=*/ true, ms_src_caps, ms_nsrc,
 			ms_src_pool, ms_edges, /*record_all=*/ false,
-			/*ncollide=*/ NULL);
+			/*ncollide=*/ NULL, /*collided=*/ NULL);
 		/*
 		 * ☠ A RAW record_tag LOOP OVER ORD EDGES, which the sibling
 		 * graft path deliberately does NOT do (see the comment at
