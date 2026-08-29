@@ -1288,6 +1288,111 @@ inflated by about that.  Per-class bodies aggregate a mostly low-contention
 suite.  ft_unit's 3 rekey/merge failures are PRE-EXISTING (proven against a
 pristine control build), not instrument-induced.
 
+### G5.10 — G5.5's GATE HALF IS BUILT; the WIDENING is BLOCKED on three prerequisites
+
+**LANDED.** The writer-side state is separate from `move_active`, as decided:
+ONE gate (`move_gate_lock` / `_cond`), TWO refcounts, and `gate_gp_nr` as a
+COUNTER rather than the old boolean -- the grace period runs OUTSIDE the lock,
+so a detach publishing the writer word and a rekey then publishing
+`move_active` can each own one, and a boolean cannot name two owners.  Gate
+entry now covers detach / graft / graft_swap / merge_at; rekey alone publishes
+both words.  The offline piggyback, `assert(!urcu_txn_in_fallback())` and the
+seam check are carried over unchanged.
+
+**☑ THE PACKED {refcount, min level} WORD (Mathieu, 2026-08-28).**  The word
+carries the refcount in its high bits and, in the low 16, the SHALLOWEST level
+at which any in-flight bulk op locks.  A point op then widens from that level
+DOWN, never above it.
+* ★ WHY IT IS SOUND: a bulk op holds a junction J and its frontier and holds
+  NOTHING ABOVE J.  A point op's leaf->root chain meets J exactly when the point
+  op is inside J's subtree -- the conflict case -- so locks strictly shallower
+  than J buy no exclusion.  ★★ AND THIS IS THE POINT: G5.9 measured duty at
+  ~99.9%, so "every ancestor to the root" is not an occasional widening but
+  PERMANENT trie-wide serialization on the root.  The level word is what stops
+  concurrent point ops from all serializing there.
+* ONE WORD, ONE LOAD: read as two words a point op could see refcount > 0 with a
+  STALE DEEPER level and widen too little -- an exclusion gap.
+* ☠ THE MIN IS EXACT, NOT MONOTONE.  A min that only decreased and reset at
+  refcount 0 would RATCHET to the shallowest level ever used and stay: G5.9
+  measured the refcount essentially never reaching 0 under load.  An exact
+  per-level count array under the gate mutex makes it RISE again as deep ops
+  drain -- and the mutex already serializes every enter/exit, so no CAS.
+* LOWERING the level OWNS A GRACE PERIOD (Mathieu): point ops in flight sampled
+  the deeper value and are missing the newly-shallow locks.
+* ★ THE LEVEL IS FIXED AT GATE ENTRY, never lowered mid-op.  Lowering mid-op
+  would need a GP while the op already holds locks, which would break the SEAM
+  RULE armed @`d48b5c94`.  An op can only lower on the way IN, before it holds
+  anything.  An op that cannot name its junction passes 0 and degrades exactly
+  to G5.5, so ops refine ONE AT A TIME.
+
+**☠☠ THE WIDENING IS NOT BUILT, and must not be built in the obvious shape.**
+Three prerequisites, two of them fatal (adversarial review + independent
+confirmation):
+1. **NO ANCESTOR DATA EXISTS AT THE DEFAULT SPACING.**  The descent's `anchor[]`
+   table is never built at `CDS_FT_LOCK_SPACING_PER_NODE`, the shipping default
+   (`ft_descent_enter_node` returns early; `anchor_crossed` stays 0 and the
+   table is deliberately uninitialised stack).  A widening reading it would take
+   garbage or the EMPTY SET -- a SILENT no-op in the default configuration.  The
+   `parent_word` up-walk is no fallback: it is refuted in-tree (transiently NULL
+   during detach/graft re-homes, and NULL reads as ROOT -> silent truncation).
+   ⇒ needs a DEDICATED per-descent ancestor ledger filled at ALL spacings, and
+   an acquire with no descent must be REFUSED (-EAGAIN) while a bulk op is live,
+   never silently unwidened.
+2. **APPENDED HOLDS HAVE NO RELEASE OWNER.**  Callers record each lock's release
+   from their own `set[i].held`; anything appended inside
+   `ft_dlm_acquire_set_at` is invisible to that sweep, so its `FT_STATE_LOCK` is
+   never cleared -- the ROOT stays locked forever and every later acquire
+   refuses: trie-wide livelock after ONE widened commit.  `insert` acquires
+   BEFORE its content txn exists, so there is no uniform registry to park them
+   in.  ⇒ ownership must be written down per caller family first.
+3. **THE FIXED BOUND OVERFLOWS.**  `taken[]` / `taken_snap[]` are
+   FT_FLIP_TXN_MAX_LOCKS (257) behind an assert COMPILED OUT UNDER NDEBUG; a
+   widened PER_NODE set reaches FT_MAX_DEPTH (257) path nodes plus the op's own
+   members.  This is the exact prior-art shape this file already records (merge
+   overlap, assert at 254, NDEBUG turned it into a clobbered count).  ⇒ size for
+   the widened set and make the bound a RUNTIME REFUSAL.
+
+☞ The level word helps (3) and makes (2) bite less often; it removes neither.
+
+**☠☠ MEASURED COST: THE COALESCING COLLAPSES.**  Extending the gate to the whole
+bulk family was priced with the G5.9 instrument (full suite, 0 failures; a
+throughput A/B on `inv_graft_swap_shared_dst` was ABANDONED as inconclusive --
+its noise floor is ~3x in BOTH arms, 9,660-30,051 before and 8,417-23,537
+after).  The gate's own counters are n=10^5-10^6 and carry no such noise:
+
+    metric                 rekey-only gate      whole bulk family
+    windows (opens)              3,249                848,712
+    enters                     124,835              1,407,425
+    movers per window            38.42                   1.66
+    GP share of open time         2.19%                 30.43%
+    waited on owner GP           1,880                278,328
+    DUTY                         12.84%                 36.99%
+
+★★ **movers per window 38.42 -> 1.66.**  "A burst of moves costs ~one GP, not
+one per move" (`internal.h`) is the amortization EVERY G5 variant leans on, and
+it DOES NOT SURVIVE the extension: almost every bulk op now opens its own window
+and pays its own grace period.  The reason is a property of the family, not of
+the gate -- graft / graft_swap / merge_at are SHORT (10-50 us) and NUMEROUS
+(269k / 911k / 107k in one suite), where rekey is long (915 us) and rare (67k).
+Short ops do not overlap, so they cannot piggyback.
+
+Per-class body cost, same run (the gate now sits inside the bracket, so its GP
+shows as in-body GP):
+
+    class         mean before   mean after   in-body GP before -> after
+    graft            9.7 us       17.8 us      0.00%  ->  18.45%
+    graft_swap      11.9 us       20.8 us     80.59%  ->  79.60%
+    merge_at        12.4 us       52.9 us      0.00%  ->  70.64%
+    rekey_graft      915 us        993 us      0.24%  ->   0.18%
+
+⇒ **1.8x-4.3x on the short bulk ops**, and rekey (which already paid the gate)
+is unchanged, which is the control that makes the attribution clean.
+
+☐ **A LEVER, NOT YET TAKEN:** the word is cleared the instant the refcount hits
+0.  Letting it LINGER (hysteresis) would restore coalescing by trading DUTY for
+GP COUNT -- more time widened, far fewer grace periods.  That is a design call,
+not a cleanup, and it interacts with G5.9's duty finding; it needs Mathieu.
+
 ---
 
 ## 3. Phase A — arm COARSE, then exclusive

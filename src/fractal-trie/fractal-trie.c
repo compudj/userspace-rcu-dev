@@ -305,6 +305,13 @@ struct cds_ft_node *cds_ft_node_next_resolve(void *raw)
  * make the coherence tests assert against dead code).  Same blocking contract as
  * a real move: not from an RCU read-side critical section.
  */
+/*
+ * Bulk-op nesting depth for THIS thread.  Read by ft_dlm_acquire_set_at to tell
+ * a point op that must widen from the bulk op that is holding the gate, which
+ * must not widen against itself.  Depth-counted because bulk bodies nest.
+ */
+__thread unsigned long ft_bulk_self_depth;
+
 void _cds_ft_debug_move_gate_enter(struct cds_ft *ft)
 {
 	ft_move_gate_enter(ft);

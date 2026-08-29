@@ -1760,8 +1760,60 @@ struct cds_ft {
 	unsigned long move_active;
 	pthread_mutex_t move_gate_lock;
 	pthread_cond_t move_gate_cond;
-	unsigned long move_gate_nr;	/* movers holding the gate */
-	bool move_gate_gp;		/* the 0->1 owner is inside its GP */
+	unsigned long move_gate_nr;	/* COHERENT holders (rekey) */
+	/*
+	 * THE WRITER-SIDE WORD, beside @move_active and deliberately NOT it.
+	 * @move_active is READER-facing: nonzero puts every reader on the
+	 * COHERENT path, a cost a detach / graft / merge has no reason to
+	 * impose.  G5.5's widening is a WRITER question -- "is any bulk op
+	 * live?" -- so it gets its own trie-level word, read once per acquire
+	 * behind caa_likely and free in steady state.
+	 *
+	 * ☠ ONE GATE, ONE GP, TWO WORDS, TWO REFCOUNTS.  The machinery below
+	 * (@move_gate_lock / @move_gate_cond / @gate_gp_nr) is SHARED, so a
+	 * rekey burst and a detach burst still amortize into one grace period.
+	 * What must not be shared is the refcount deciding when each WORD
+	 * clears: a single counter would either leave @move_active set by a
+	 * detach -- the exact cost this split exists to avoid -- or clear it
+	 * while a rekey is still live, which is a correctness bug.
+	 */
+	/*
+	 * PACKED {refcount, min level}, published as ONE word so a point op
+	 * reads both in ONE load.  Read as two words a point op could observe
+	 * "a bulk op is live" together with a STALE, DEEPER level and widen too
+	 * little -- an exclusion gap.  High bits refcount, low
+	 * FT_BULK_LEVEL_BITS the SHALLOWEST level any in-flight bulk op locks
+	 * at; FT_BULK_LEVEL_NONE when no bulk op is live.
+	 *
+	 * ★ WHY A LEVEL AT ALL: a bulk op holds a junction J and its frontier,
+	 * and holds NOTHING ABOVE J.  A point op's leaf->root chain meets J
+	 * exactly when the point op is inside J's subtree -- which is the
+	 * conflict case -- so locks strictly SHALLOWER than J buy no exclusion
+	 * and cost the ROOT, which is what would make the widening trie-wide.
+	 */
+	unsigned long bulk_state;
+	unsigned long bulk_gate_nr;	/* ALL bulk holders, rekey included */
+	/*
+	 * EXACT per-level occupancy, under @move_gate_lock -- not a monotone
+	 * low-water mark.  A min that only ever decreased and reset at refcount
+	 * 0 would RATCHET to the shallowest level ever used and stay there: G5.9
+	 * measured the refcount essentially never reaching 0 under load (two
+	 * windows in a 2 s run, duty 99.9%), so the reset would never fire and
+	 * the refinement would degenerate back to "always take the root".
+	 * Counting per level makes the published min RISE again as deep ops
+	 * drain.  The mutex already serializes every enter and exit, so this
+	 * needs no CAS.
+	 */
+	uint16_t bulk_level_nr[FT_MAX_DEPTH + 1];
+	unsigned int bulk_min_level;	/* cached min over @bulk_level_nr */
+	/*
+	 * In-flight grace periods, NOT a boolean.  Each runs OUTSIDE the lock,
+	 * so TWO owners can overlap: a detach publishing @bulk_active and a
+	 * rekey then publishing @move_active each own one.  A boolean cannot
+	 * name two owners, and the second clear would release waiters whose
+	 * word has not yet had a full grace period.
+	 */
+	unsigned long gate_gp_nr;
 #ifdef FT_DEBUG_BULK_WINDOW
 	/*
 	 * Bulk-window measurement state.  PER-TRIE, because the gate is: two
@@ -3102,6 +3154,60 @@ bool ft_move_active(const struct cds_ft *ft)
 	return CMM_LOAD_SHARED(ft->move_active) != 0;
 }
 
+#define FT_BULK_LEVEL_BITS	16
+#define FT_BULK_LEVEL_MASK	((1UL << FT_BULK_LEVEL_BITS) - 1)
+#define FT_BULK_LEVEL_NONE	FT_BULK_LEVEL_MASK	/* no bulk op live */
+
+static inline
+unsigned long ft_bulk_pack(unsigned long nr, unsigned int level)
+{
+	return (nr << FT_BULK_LEVEL_BITS) | (level & FT_BULK_LEVEL_MASK);
+}
+
+/*
+ * Is any BULK op live?  The writer-side tier-1 gate G5.5 turns on: false in
+ * steady state, ONE trie-level load, and when true a point op ADDS the
+ * ancestors from ft_bulk_min_level() DOWN to its own member -- never above,
+ * because no bulk op locks there.
+ */
+static inline
+bool ft_bulk_active(const struct cds_ft *ft)
+{
+	return (CMM_LOAD_SHARED(ft->bulk_state) >> FT_BULK_LEVEL_BITS) != 0;
+}
+
+/*
+ * The SHALLOWEST level any in-flight bulk op locks at, or FT_BULK_LEVEL_NONE.
+ * ☠ Take it from the SAME load as the refcount, never a second one: the pair
+ * is only coherent as one word.
+ */
+static inline
+unsigned int ft_bulk_min_level(const struct cds_ft *ft)
+{
+	unsigned long w = CMM_LOAD_SHARED(ft->bulk_state);
+
+	if (!(w >> FT_BULK_LEVEL_BITS))
+		return FT_BULK_LEVEL_NONE;
+	return (unsigned int) (w & FT_BULK_LEVEL_MASK);
+}
+
+/*
+ * Which words a bulk op publishes.  Only a REKEY needs reader coherence; every
+ * other bulk op publishes the writer word alone.
+ */
+enum ft_bulk_kind {
+	FT_BULK_WRITER_ONLY,	/* detach / graft / graft_swap / merge_at */
+	FT_BULK_COHERENT,	/* rekey: also publishes @move_active */
+};
+
+/*
+ * ☠ AM I MYSELF A BULK OP?  A bulk op must not widen its own point-op helpers
+ * against the gate it is holding.  Depth-counted, not a flag: bulk bodies nest
+ * (a rekey's staged fallback re-enters), and a flag would be cleared by the
+ * inner exit while the outer op is still live.
+ */
+extern __thread unsigned long ft_bulk_self_depth;
+
 /*
  * Enter the move mode gate: publish "expect a move" to readers and make sure
  * EVERY live reader has observed it before the caller mutates anything.
@@ -3131,38 +3237,76 @@ extern __thread unsigned long ft_dbg_free_via;
 
 
 static inline
-void ft_move_gate_enter(struct cds_ft *ft)
+void ft_bulk_gate_enter(struct cds_ft *ft, enum ft_bulk_kind kind,
+		unsigned int level)
 {
+	bool own_gp = false;
+
+	if (level > FT_MAX_DEPTH)
+		level = FT_MAX_DEPTH;
 	pthread_mutex_lock(&ft->move_gate_lock);
 #ifdef FT_DEBUG_BULK_WINDOW
 	/*
-	 * Under @move_gate_lock, so the counts and the open stamp inherit the
-	 * gate's own serialization.  PIGGYBACK is counted as movers that
-	 * actually WAITED on the owner's GP (@move_gate_gp still true), not as
-	 * every non-owner: a mover arriving after the GP completed waits for
+	 * The window measured is the WRITER word's -- @bulk_gate_nr > 0 --
+	 * because that is the interval G5.5 makes point ops pay for.  Under
+	 * @move_gate_lock, so it inherits the gate's serialization.  A
+	 * PIGGYBACK is an enter that actually WAITED on an owner's GP, not
+	 * merely any non-owner: an arrival after the GP completed waits for
 	 * nothing and would overstate "a burst pays one GP".
 	 */
 	ft->bw_enters++;
-	if (ft->move_gate_nr == 0) {
+	if (ft->bulk_gate_nr == 0)
 		ft->bw_t_open = ft_bw_now();
-	} else if (ft->move_gate_gp) {
+	else if (ft->gate_gp_nr)
 		ft->bw_piggyback++;
-	}
-	if (ft->move_gate_nr + 1 > ft->bw_peak)
-		ft->bw_peak = ft->move_gate_nr + 1;
+	if (ft->bulk_gate_nr + 1 > ft->bw_peak)
+		ft->bw_peak = ft->bulk_gate_nr + 1;
 #endif
-	if (ft->move_gate_nr++ == 0) {
+	/*
+	 * Publish each word this op needs that is not already published, and
+	 * OWN A GRACE PERIOD if it published anything.  Both words need the
+	 * same discipline -- publish, one full GP, only THEN mutate -- because
+	 * a peer that sampled the word as clear before the store is still
+	 * running on the old rule: a reader on the fast path for @move_active,
+	 * a point op with an UNWIDENED lock set for @bulk_active.
+	 */
+	ft->bulk_level_nr[level]++;
+	if (ft->bulk_gate_nr++ == 0) {
+		ft->bulk_min_level = level;
+		own_gp = true;
+	} else if (level < ft->bulk_min_level) {
+		/*
+		 * LOWERING owns a grace period exactly as publishing the word
+		 * does: point ops already in flight sampled the DEEPER level and
+		 * widened only from there down, so they are missing the newly
+		 * shallow locks and must be let finish first.
+		 *
+		 * ★ Safe against the SEAM RULE (no node lock held across a GP,
+		 * armed @d48b5c94) because @level is fixed at gate ENTRY, before
+		 * this op takes any lock.  An op can only ever lower the min on
+		 * the way IN; on the way out the min RISES, which needs no GP --
+		 * a point op holding MORE locks than it needs is never wrong.
+		 */
+		ft->bulk_min_level = level;
+		own_gp = true;
+	}
+	if (kind == FT_BULK_COHERENT && ft->move_gate_nr++ == 0) {
 		CMM_STORE_SHARED(ft->move_active, 1);
-		ft->move_gate_gp = true;
+		own_gp = true;
+	}
+	CMM_STORE_SHARED(ft->bulk_state,
+			ft_bulk_pack(ft->bulk_gate_nr, ft->bulk_min_level));
+	if (own_gp) {
+		ft->gate_gp_nr++;
 		pthread_mutex_unlock(&ft->move_gate_lock);
 		/*
-		 * The barrier the whole gate exists for: readers that were
+		 * The barrier the whole gate exists for: peers that were
 		 * already inside a critical section when the store landed may
-		 * still believe they are in fast mode, so let them finish.
+		 * still believe they are in the old mode, so let them finish.
 		 */
 		assert(!urcu_txn_in_fallback());	/* see gp_wait */
 #ifdef FEATURE_FT_HOLD_TRACE
-		ft_seam_check("ft_move_gate_enter");
+		ft_seam_check("ft_bulk_gate_enter");
 #endif
 #ifdef FT_DEBUG_REMOVE_RETRY_CAP
 		{
@@ -3187,34 +3331,60 @@ void ft_move_gate_enter(struct cds_ft *ft)
 		ft->group->flavor->update_synchronize_rcu();
 #endif
 		pthread_mutex_lock(&ft->move_gate_lock);
-		ft->move_gate_gp = false;
+		ft->gate_gp_nr--;
 		pthread_cond_broadcast(&ft->move_gate_cond);
 		pthread_mutex_unlock(&ft->move_gate_lock);
+		ft_bulk_self_depth++;
 		return;
 	}
-	if (ft->move_gate_gp) {
+	if (ft->gate_gp_nr) {
 		/*
 		 * PIGGYBACK, and go QUIESCENT while doing it.  Under a
 		 * quiescent-state flavor (QSBR) a registered thread counts as
 		 * being inside a read section until it reports otherwise, so a
-		 * mover that simply blocked here would be a reader the owner's
+		 * waiter that simply blocked here would be a reader the owner's
 		 * grace period waits for -- while the owner waits for us and we
 		 * wait for the owner.  That is a hard deadlock, and it is what
 		 * happens (measured: the 16-writer oracle wedged) without these
-		 * two calls.  Sound because a mover holds NO read section at this
-		 * point: the gate is entered BEFORE the read lock, by contract.
-		 * A no-op on the memb / mb flavors.
+		 * two calls.  Sound because a bulk op holds NO read section at
+		 * this point: the gate is entered BEFORE the read lock, by
+		 * contract.  A no-op on the memb / mb flavors.
+		 *
+		 * ☠ WAIT FOR ALL in-flight GPs, not for "the" one.  Our words
+		 * are already published, but a peer may still be inside the
+		 * very GP that makes one of them safe to act on, and a waiter
+		 * cannot cheaply tell which GP covers which word.  Waiting for
+		 * every one is conservative and never wrong; waiting for the
+		 * wrong one would let us mutate against a peer that has not yet
+		 * observed our word.
 		 */
 		ft->group->flavor->thread_offline();
 		do {
 			pthread_cond_wait(&ft->move_gate_cond,
 					&ft->move_gate_lock);
-		} while (ft->move_gate_gp);
+		} while (ft->gate_gp_nr);
 		pthread_mutex_unlock(&ft->move_gate_lock);
 		ft->group->flavor->thread_online();
+		ft_bulk_self_depth++;
 		return;
 	}
 	pthread_mutex_unlock(&ft->move_gate_lock);
+	ft_bulk_self_depth++;
+}
+
+/*
+ * The rekey spelling, unchanged for its callers: a move needs BOTH words.
+ */
+static inline
+void ft_move_gate_enter(struct cds_ft *ft)
+{
+	/*
+	 * Level 0 (the root) is the CONSERVATIVE answer, and it is what an op
+	 * that cannot yet name its junction must pass: the gate is entered
+	 * before the descent that finds it.  It degrades exactly to G5.5's
+	 * "every ancestor to the root", so ops can be refined one at a time.
+	 */
+	ft_bulk_gate_enter(ft, FT_BULK_COHERENT, 0);
 }
 
 /*
@@ -3223,11 +3393,41 @@ void ft_move_gate_enter(struct cds_ft *ft)
  * set merely runs the coherent path once more, which is never wrong, only slower.
  */
 static inline
-void ft_move_gate_exit(struct cds_ft *ft)
+void ft_bulk_gate_exit(struct cds_ft *ft, enum ft_bulk_kind kind,
+		unsigned int level)
 {
+	if (level > FT_MAX_DEPTH)
+		level = FT_MAX_DEPTH;
+	ft_bulk_self_depth--;
 	pthread_mutex_lock(&ft->move_gate_lock);
-	if (--ft->move_gate_nr == 0) {
+	/*
+	 * Each word clears on ITS OWN refcount reaching zero.  No grace period
+	 * on the way out: a peer that still sees a word set merely runs the
+	 * more conservative rule once more, which is never wrong, only slower.
+	 */
+	if (kind == FT_BULK_COHERENT && --ft->move_gate_nr == 0)
 		CMM_STORE_SHARED(ft->move_active, 0);
+	ft->bulk_level_nr[level]--;
+	if (--ft->bulk_gate_nr) {
+		/*
+		 * The min RISES when the shallowest level empties.  Rescan
+		 * rather than track a low-water mark: an exact min is the whole
+		 * point (see @bulk_level_nr).  Bounded, and only on the exit
+		 * that actually empties the current min.
+		 */
+		if (level == ft->bulk_min_level && !ft->bulk_level_nr[level]) {
+			unsigned int l = level;
+
+			while (l < FT_MAX_DEPTH && !ft->bulk_level_nr[l])
+				l++;
+			ft->bulk_min_level = l;
+		}
+		CMM_STORE_SHARED(ft->bulk_state, ft_bulk_pack(
+				ft->bulk_gate_nr, ft->bulk_min_level));
+	} else {
+		ft->bulk_min_level = FT_BULK_LEVEL_NONE;
+		CMM_STORE_SHARED(ft->bulk_state,
+				ft_bulk_pack(0, FT_BULK_LEVEL_NONE));
 #ifdef FT_DEBUG_BULK_WINDOW
 		{
 			uint64_t now__ = ft_bw_now();
@@ -3239,7 +3439,6 @@ void ft_move_gate_exit(struct cds_ft *ft)
 				ft_bw_record(ft_bw_gap, &ft_bw_gap_n,
 						&ft_bw_gap_sum, &ft_bw_gap_max,
 						ft->bw_t_open - ft->bw_t_close);
-			/* Fold this window's per-trie tallies into the globals. */
 			uatomic_add(&ft_bw_enters, ft->bw_enters);
 			uatomic_add(&ft_bw_piggyback, ft->bw_piggyback);
 			if (ft->bw_peak > uatomic_load(&ft_bw_peak, CMM_RELAXED))
@@ -3257,6 +3456,42 @@ void ft_move_gate_exit(struct cds_ft *ft)
 	}
 	pthread_mutex_unlock(&ft->move_gate_lock);
 }
+
+static inline
+void ft_move_gate_exit(struct cds_ft *ft)
+{
+	ft_bulk_gate_exit(ft, FT_BULK_COHERENT, 0);
+}
+
+struct ft_bulk_gate_scope {
+	struct cds_ft *ft;
+	enum ft_bulk_kind kind;
+	unsigned int level;
+};
+
+static inline
+void ft_bulk_gate_scope_end(struct ft_bulk_gate_scope *s)
+{
+	ft_bulk_gate_exit(s->ft, s->kind, s->level);
+}
+
+/*
+ * Scoped, because the public bulk entries reject arguments with EARLY RETURNS
+ * and a bracket that only covered the success path would leak the gate --
+ * leaving @bulk_active set for the life of the trie and every point op widened
+ * to the root forever.
+ *
+ * PLACE IT AFTER the cheap argument checks and BEFORE any lock or read section:
+ * the gate BLOCKS on a grace period, so a caller already inside an RCU read
+ * section would have the grace period wait on itself, and a caller already
+ * holding a node lock would break the seam rule (internal.h: no node lock may
+ * be held across a GP).
+ */
+#define CDS_FT_SCOPED_BULK_GATE(ft_, kind_, level_)			\
+	struct ft_bulk_gate_scope ft_bulk_gate_scope__			\
+		__attribute__((cleanup(ft_bulk_gate_scope_end))) =	\
+		{ (ft_), (kind_), (level_) };				\
+	ft_bulk_gate_enter((ft_), (kind_), (level_))
 
 struct ft_excl_reader_scope {
 	struct cds_ft *ft;

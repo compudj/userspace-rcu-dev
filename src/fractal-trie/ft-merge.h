@@ -3733,9 +3733,29 @@ enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
 		const uint8_t *src_key, size_t src_key_len)
 {
 #ifdef FEATURE_FT_MERGE
-	FT_BW_OP(FT_BW_MERGE_AT);
-	return ft_merge_at_inner(dst_ft, dst_key, dst_key_len, src_ft,
-			src_key, src_key_len, NULL);
+	{
+		enum cds_ft_status st__;
+
+		FT_BW_OP(FT_BW_MERGE_AT);
+		/*
+		 * ☠ VALIDATION LIVES IN ft_merge_at_inner, NOT HERE: this entry
+		 * is a pure delegation, so a NULL @dst_ft reaches it and the
+		 * gate must not dereference one on the way.  Let the inner
+		 * reject it, unchanged.
+		 */
+		if (!dst_ft)
+			return ft_merge_at_inner(dst_ft, dst_key, dst_key_len,
+					src_ft, src_key, src_key_len, NULL);
+		/*
+		 * G5.5: @src_ft is exclusive by contract, so only @dst_ft has
+		 * point-op peers to widen.
+		 */
+		CDS_FT_SCOPED_BULK_GATE(dst_ft, FT_BULK_WRITER_ONLY, 0);
+
+		st__ = ft_merge_at_inner(dst_ft, dst_key, dst_key_len, src_ft,
+				src_key, src_key_len, NULL);
+		return st__;
+	}
 #else
 	(void) dst_ft; (void) dst_key; (void) dst_key_len;
 	(void) src_ft; (void) src_key; (void) src_key_len;

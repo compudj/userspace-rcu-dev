@@ -977,6 +977,8 @@ void cds_ft_destroy(struct cds_ft *ft)
 	const struct rcu_flavor_struct *flavor = ft->group->flavor;
 
 	assert(ft->move_gate_nr == 0);		/* no move may still hold the gate */
+	assert(ft->bulk_gate_nr == 0);		/* nor any other bulk op */
+	assert(ft->gate_gp_nr == 0);		/* nor a grace period in flight */
 
 	/*
 	 * A compaction the caller never ended would otherwise strand its
