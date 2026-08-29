@@ -2627,6 +2627,15 @@ static inline uint64_t ft_dbg_gp_clock(void)
 }
 #endif
 
+#ifdef FEATURE_FT_HOLD_TRACE
+/*
+ * THE SEAM-RULE ARM: no NODE lock may be held across a grace period.  Defined
+ * with the hold ledger in ft-mutation-helpers.h, which is included long after
+ * this header; forward-declared here the way ft_hold_trace_leak_canary is.
+ */
+static void ft_seam_check(const char *site);
+#endif
+
 static inline
 void ft_writer_lock_gp_wait(struct cds_ft *ft)
 {
@@ -2659,6 +2668,9 @@ void ft_writer_lock_gp_wait(struct cds_ft *ft)
 	 * blame the innocent.
 	 */
 	assert(!urcu_txn_in_fallback());
+#ifdef FEATURE_FT_HOLD_TRACE
+	ft_seam_check("ft_writer_lock_gp_wait");
+#endif
 	ft->group->flavor->update_synchronize_rcu();
 	if (held) {
 		/*
@@ -2787,6 +2799,9 @@ void ft_move_gate_enter(struct cds_ft *ft)
 		 * still believe they are in fast mode, so let them finish.
 		 */
 		assert(!urcu_txn_in_fallback());	/* see gp_wait */
+#ifdef FEATURE_FT_HOLD_TRACE
+		ft_seam_check("ft_move_gate_enter");
+#endif
 #ifdef FT_DEBUG_REMOVE_RETRY_CAP
 		{
 			uint64_t t0__ = ft_dbg_gp_clock();

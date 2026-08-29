@@ -2319,6 +2319,103 @@ static void ft_hold_trace_leak_canary(void)
 }
 
 /*
+ * =====================================================================
+ * THE SEAM-RULE ARM.  Asserts the correctness half; changes NO behaviour.
+ * =====================================================================
+ *
+ * THE RULE (fractal-trie-internal.h, @writer_lock): a holder must NEVER wait
+ * on a grace period while holding a lock whose waiters are RCU-online and
+ * non-quiescent -- "the GP always sits at a seam BETWEEN two distinct
+ * commits".  The FT-wide lock obeys it by construction, because
+ * ft_writer_lock_gp_wait DROPS it across every GP.  NOTHING enforces the same
+ * for a NODE lock, and no primitive can drop those: they are held by the
+ * op's flip-txn until its commit terminal consumes them.
+ *
+ * WHY IT IS ABOUT TO MATTER MORE THAN IT DID.  Today a bulk op's mid-edit
+ * reader drains happen to sit at commit seams, so no node lock spans them.
+ * Under the G5 bulk/point coordination (doc/design/
+ * mw-to-fine-locking-remainder.md, G5.5) a point op WIDENS its lock set onto
+ * the nodes a live bulk window covers -- and a point op CANNOT quiesce, since
+ * its caller may hold an RCU read section across the call.  A node lock held
+ * across a drain GP then means that GP waits on a spinning point op which is
+ * waiting on that very lock: not a slowdown, a hang.  So this invariant
+ * changes from tidy to load-bearing, and an unenforced invariant cannot carry
+ * that load.
+ *
+ * EXACT, NOT OVER-REPORTING.  The ledger over-reports by construction -- a
+ * commit that CONSUMED a fence never calls a release and leaves its entry
+ * behind -- so an entry alone proves nothing.  Two facts together do: the
+ * entry's word still carries FT_STATE_LOCK, AND the member's owner stamp is
+ * still OURS.  A stale entry over a word a PEER has since taken fails the
+ * second test, which is exactly the false positive that would make this
+ * detector unbelievable.
+ */
+#define FT_SEAM_REPORT_MAX	20
+static __thread unsigned int ft_seam_reports;
+/*
+ * ITS OWN BUDGET, for the reason spelled out at FT_STALE_REPORT_MAX above:
+ * the feature's shared purse is drained by the routine FT REFUSED contention
+ * line (~52,000 in one root-only MW run), and a measurement that shares a
+ * purse with the noise reports an exhausted budget as a zero.
+ */
+static unsigned long ft_seam_checks_total;	/* the CALL counter */
+static unsigned long ft_seam_viol_total;
+
+static
+void ft_seam_check(const char *site)
+{
+	unsigned long self = (unsigned long) pthread_self();
+	unsigned int ci;
+
+	/*
+	 * COUNT THE CALL, ALWAYS AND FIRST.  A zero violation count is
+	 * evidence only if this site was REACHED; the first version of this
+	 * check reported 0 on three hand-picked tests that entered it 0, 0 and
+	 * 1 times, and a failure counter alone cannot tell that apart from a
+	 * clean run.
+	 */
+	uatomic_inc(&ft_seam_checks_total);
+	for (ci = 0; ci < ft_hold_trace_n; ci++) {
+		const struct ft_hold_trace_ent *e = &ft_hold_trace[ci];
+
+		if (!(CMM_LOAD_SHARED(e->lock->state) & FT_STATE_LOCK))
+			continue;	/* consumed by a commit terminal */
+		if (!e->member ||
+				uatomic_load(&e->member->dbg_owner_tid,
+					CMM_RELAXED) != self)
+			continue;	/* stale entry; a peer owns it now */
+		uatomic_inc(&ft_seam_viol_total);
+		if (ft_seam_reports < FT_SEAM_REPORT_MAX) {
+			if (++ft_seam_reports == FT_SEAM_REPORT_MAX)
+				fprintf(stderr, "FT SEAM: report cap reached, "
+					"silencing -- later zeros are NOT "
+					"evidence\n");
+			fprintf(stderr, "FT SEAM VIOLATION at %s: node lock "
+				"%p (member %p, taken at %s:%d) is HELD BY US "
+				"across a grace period\n",
+				site, (const void *) e->lock,
+				(const void *) e->member, e->fn, e->line);
+		}
+#ifdef FT_SEAM_ABORT
+		abort();
+#endif
+	}
+}
+
+__attribute__((destructor))
+static
+void ft_seam_dump(void)
+{
+	/*
+	 * Print the CALL count beside the violation count, so a zero is
+	 * legible as "checked N times, clean" rather than as "never ran".
+	 */
+	fprintf(stderr, "FT SEAM: %lu checks, %lu violations\n",
+		uatomic_load(&ft_seam_checks_total, CMM_RELAXED),
+		uatomic_load(&ft_seam_viol_total, CMM_RELAXED));
+}
+
+/*
  * The POST-COMMIT backstop's drop: entries can be filed INSIDE the
  * wrapper's drop->commit window by acquire-sets the commit machinery
  * itself runs (the glue/fold edge callbacks), deduping onto the committing
@@ -5128,6 +5225,17 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 		ft_hold_trace_note(set[i].held.lock, set[i].node,
 			set[i].held.shared, fn, line);
 	}
+#ifdef FT_RED_SEAM
+	/*
+	 * RED CONTROL, never a shipping configuration.  Call the seam check
+	 * where node locks PROVABLY ARE held -- immediately after this
+	 * acquire filed them.  A detector that has never fired is not
+	 * evidence, and this is what makes its zeros mean something: under
+	 * -DFT_RED_SEAM the violation count must be LARGE.  If it is zero
+	 * here, the check is broken, not the tree.
+	 */
+	ft_seam_check("RED-CONTROL-after-acquire");
+#endif
 #ifdef FT_DEBUG_REMOVE_RETRY_CAP
 	for (i = 0; i < (int) nr_taken; i++) {
 		struct ft_dbg_take_slot *sl = ft_dbg_take_slot_of(taken[i]);
