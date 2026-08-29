@@ -365,6 +365,7 @@ unsigned long ft_wo_led_nr_max;
 unsigned long ft_wo_joint[4];
 unsigned long ft_bl_acq, ft_bl_root, ft_bl_members;
 unsigned long ft_bl_found, ft_bl_undatable, ft_bl_led_empty;
+unsigned long ft_bl_win_ok, ft_bl_win_no;
 #ifdef FT_FEATURE_WIDEN
 unsigned long ft_wd_acq, ft_wd_locks, ft_wd_dedup;
 unsigned long ft_wd_no_owner, ft_wd_no_ledger, ft_wd_locks_max;
@@ -448,6 +449,10 @@ static void ft_wo_dump(void)
 		"  BULK members datable from the op's OWN ledger: %lu | "
 		"UNDATABLE: %lu | acquires with no ledger: %lu\n",
 		ft_bl_found, ft_bl_undatable, ft_bl_led_empty);
+	fprintf(stderr,
+		"  BULK members datable by the REAL path (descent WINDOW, "
+		"ft_descent_depth_of): %lu | NOT: %lu\n",
+		ft_bl_win_ok, ft_bl_win_no);
 #ifdef FT_FEATURE_WIDEN
 	/*
 	 * ☠ A WIDENING THAT DID NOT FIRE IS AN EXCLUSION GAP THAT SUCCEEDS AT

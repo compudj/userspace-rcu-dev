@@ -5152,6 +5152,16 @@ extern unsigned long ft_bl_acq, ft_bl_root, ft_bl_members;
  */
 extern unsigned long ft_bl_found, ft_bl_undatable, ft_bl_led_empty;
 /*
+ * ☠ AND THE REAL DATING PATH IS NOT THE LEDGER.  The coarse spacings date a
+ * member with ft_descent_depth_of -- the descent's FOUR-DEEP WINDOW -- which is
+ * a DIFFERENT source: for a COPIED descent the window keeps advancing through
+ * ft_walk_extend while the ledger deliberately no longer records (@3acd5488),
+ * so the window can date members the ledger has never seen.  These count what
+ * the ACTUAL machinery would answer if PER_NODE let it run, which is the number
+ * the enforcement predicate would live on.
+ */
+extern unsigned long ft_bl_win_ok, ft_bl_win_no;
+/*
  * ☠ TWO EQUAL MARGINALS ARE NOT A JOINT.  "every acquire that can widen lacks
  * an owner" is a claim about the PAIR, and separate led_ok / txn_none counters
  * cannot make it -- they would read identically for a population where the two
@@ -5456,6 +5466,20 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 					}
 				uatomic_inc(seen__ ? &ft_bl_found :
 						&ft_bl_undatable);
+			}
+		}
+		{
+			const struct ft_descent *wd__ =
+					ft_lock_ctx_descent(ctx);
+
+			for (j__ = 0; j__ < nr; j__++) {
+				unsigned int wdep__;
+
+				if (!set[j__].nf)
+					continue;
+				uatomic_inc(ft_descent_depth_of(wd__,
+						set[j__].nf, &wdep__) ?
+					&ft_bl_win_ok : &ft_bl_win_no);
 			}
 		}
 	}

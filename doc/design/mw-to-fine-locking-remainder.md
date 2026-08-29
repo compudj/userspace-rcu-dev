@@ -2013,6 +2013,51 @@ needed" is precisely the optimisation the widening cannot keep.
 members reach the acquire without a descent that describes them.  Whether the
 ONE-HOP rule can date them, and at what cost, is the open question.
 
+### G5.21 — ☠☠ THE ONE-HOP RULE DOES NOT CLOSE IT EITHER: ~55% of a bulk op's members stay UNDATABLE
+
+G5.20 left one question: the ledger cannot date a bulk op's members, but the
+REAL dating path is not the ledger -- coarse spacings use
+`ft_descent_depth_of`, the descent's FOUR-DEEP WINDOW.  That is a genuinely
+different source: for a COPIED descent the window keeps advancing through
+`ft_walk_extend` while the ledger deliberately no longer records (@`3acd5488`),
+so the window can date members the ledger has never seen.  Measured, by running
+the actual function against a bulk op's members:
+
+    arm            members   ledger-datable    WINDOW-datable   undatable
+    contended      498,173   137,822 (27.7%)   222,529 (44.7%)     55.3%
+    fine           552,290   153,196 (27.7%)   245,898 (44.5%)     55.5%
+    deep (n=32)         32        16 (50%)          24 (75%)       25%
+
+★ The window IS better than the ledger -- 28% -> 45% -- and for the predicted
+reason.  ☠ **But it still leaves the MAJORITY undatable.**  A conservative
+enforcement predicate must treat "undatable" as "possibly above my declared
+level", so it would escalate on 55% of members, i.e. on very nearly every
+acquire, i.e. to level 0 -- which is what ships today.
+
+⇒ **OPTION 1's ENFORCEMENT HALF IS NOT BUILDABLE ON THE EXISTING DATING
+MACHINERY.**  Supplying real depths at PER_NODE (G5.20's third step) is
+necessary and NOT sufficient.
+
+☠ The deep arm's 75% is far better and is the geometry the ceiling exists for --
+but n=32, from 8 moves.  It is a hint, not a result; the arm needs movers that
+cycle before it can carry that number.
+
+☞ **WHAT IS LEFT, none of it cheap:**
+1. **STORE a depth on the node.**  Then every member dates by a load.  ☠ But a
+   REKEY MOVES SUBTREES, so every node under a moved junction changes depth --
+   a stored depth would need rewriting across the whole subtree on every move,
+   which is very likely why it is not stored today.
+2. **AN IDENTITY-BASED PREDICATE that needs no depth.**  ☠ The obvious one -- walk
+   up from the member -- is the `parent_word` up-walk, refuted in-tree
+   (transiently NULL during re-homes; NULL reads as ROOT, so it truncates
+   SILENTLY).
+3. **MAKE THE DECLARATION SOUND BY CONSTRUCTION** -- bound the climb before the
+   gate.  No cheap bound is known (G5.16); the worst case is the root.
+4. **RE-OPEN THE PER-NODE MARK** (candidate (E)'s tier 2, G5.6/G5.7).  It was
+   refuted on its WORD, not on its principle, and it is the one shape that asks
+   the ANCESTOR rather than the member -- which is the side that HAS the
+   information.
+
 ☞ **THE FORK THIS LEAVES**, and it needs a decision rather than a default:
 1. **DECLARE + ENFORCE + RE-ENTER.**  The op declares from its key; an acquire
    ABOVE the declared level REFUSES; the op then drops its locks, leaves the
