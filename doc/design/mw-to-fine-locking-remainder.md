@@ -453,7 +453,10 @@ QSBR owner-waits-for-waiter deadlock, fixed once already for the mover's
 cond_wait); gate entry needs FIFO fairness both ways; ☠ and the drain's
 latency bound is the longest point-op retry storm — under QSBR a spinning
 retry loop has NO quiescent window, so Phase D's liveness work is a
-PREREQUISITE for (B)'s drain to have a bound at all.
+PREREQUISITE for (B)'s drain to have a bound at all.  ☞ SUPERSEDED BY G5.3:
+under (F) the drain GP is taken holding `writer_lock`, whose only waiters are
+bulk ops that may park OFFLINE, so the bound does not depend on a point-op
+park at all.
 
 **(C) The exclusivity contract** stays what it is: cross-trie ops require an
 EXCLUSIVE consumed source; detach-and-hand-off is a mode swap by definition.
@@ -482,7 +485,8 @@ the feature can be armed, the precedent `ft_anchor_descend` already
 established for coarse spacing; (2) parked mutators go `thread_offline`
 around the wait (the QSBR mover fix, again); (3) the drain bound is still
 the longest in-flight point op, so Phase D remains the prerequisite —
-though only retries INTO the frozen subtree matter; (4) readers never check
+though only retries INTO the frozen subtree matter (☞ moot: (D) is not taken,
+and G5.3 retires this prerequisite for the mechanism that was); (4) readers never check
 the state: wait-freedom untouched.
 
 **(E) WIDEN THE POINT OP'S LOCK SET — a DYNAMIC, SUBTREE-LOCAL LOCK SPACING
@@ -611,18 +615,15 @@ acquire arbitrates.  The split that stands:
 * **(C) unchanged** for cross-trie: an EXCLUSIVE consumed source;
   detach-and-hand-off is a mode swap by definition.
 
-☠☠ **PREREQUISITE, NOT A DETAIL — PHASE D'S ACQUIRE LANE LANDS FIRST.**  The
-contended acquire ABORTS rather than blocking (8192-spin then FAILED, above), so
-without a park the mark turns a bulk window into a trie-wide retry storm that
-can starve the bulk op's own drain GP.  (E) is not implementable before the
-acquire can queue/park.  Order: **Phase D acquire lane -> (E)**.
-
-☞ Then (E) itself, in the order its own structure implies: the tier-1 trie word;
-the mark in metadata (free on the ancestor walk that already loads it); the
-tier-2 walk feeding ONE presented lock set (the whole-set-at-once contract);
-ADD-never-substitute; and the mark's second duty, routing waiters to the park.
-Remaining open items are COST, not correctness: tier 1 is trie-wide, and a
-near-root J serializes broadly.
+☞ **SUPERSEDED BY (F), G5.3 (Mathieu, 2026-08-28).**  (E)'s granularity idea is
+kept whole; what changes is WHERE THE EXCLUSION AUTHORITY LIVES — the FT-wide
+`writer_lock` instead of the junction's own node lock.  That single move
+dissolves this candidate's recorded prerequisite (the Phase-D park) and the two
+hazards that killed every variant of it.  ☠ The paragraphs that stood here —
+"PHASE D'S ACQUIRE LANE LANDS FIRST" and the (E) implementation order ending in
+"the mark's second duty, routing waiters to the park" — are RETIRED; the park
+was never implementable at the ops it had to serve (G5.3).  Read G5.3 for the
+mechanism; (A)-(E) above remain the survey that produced it.
 
 ### G5.0 — (D)'s "ZERO EXTRA LOADS" PREMISE IS REFUTED; the COST CLAIM built on it was WRONG TWICE and is now scoped
 
@@ -806,6 +807,372 @@ detach's shape and exactly what [[project_ft_staged_rekey_writer_deleted]] was
 deleted for: a tmp-trie HIDES LIVE KEYS for a grace period per move.  Unlinking
 a populated subtree makes its keys vanish from lookups for the whole window.
 ⇒ the subtree must stay LINKED, and the design can claim only the writer half.
+
+### G5.3 — (F) THE DIRECTION: the BULK WINDOW'S AUTHORITY IS A TRIE-LIFETIME OBJECT, and the flags are DERIVED STATE — ☠ THE PROTOCOL BELOW IS REFUTED AS WRITTEN (G5.4)
+
+☠☠ **READ G5.4 FIRST.**  The REFRAME survives and is the useful part; the
+five-step protocol as written below does NOT — an adversarial review refuted it
+on three independently verified grounds, including one that is fatal by the
+bulk ops' OWN code.  The steps are kept because the refutation is only legible
+against them.
+
+**Mathieu, 2026-08-28.**  (E)'s granularity insight is kept whole — bulk/point
+coordination is a LOCK-SET WIDENING, not an exclusion — but the exclusion
+AUTHORITY moves off the junction node and onto the trie-lifetime FT-wide
+`writer_lock`.  Everything that killed (E)'s variants was a consequence of the
+authority being a NODE.
+
+**PROTOCOL.**  1 the bulk op takes `ft->writer_lock` (REUSED — not a second
+lock; on a FINE trie only bulk ops take it, coarse tries already take it for
+every op, so there is one lock and one ordering).  2 under it, set a BULK-OP
+FLAG on every node of the op's UPCOMING LOCK SET.  3 `synchronize_rcu` — the
+mode flip — **while holding `writer_lock`**.  4 edit, acquiring node locks
+normally.  5 clear the flags, release.  A point op's UPWARD WALK reads the
+flags and ADDS each flagged node's lock to its own set (the walk already loads
+`meta->parent_word`, so the check is free where it is read — G5.1's encoding
+result is unchanged), then presents ONE whole set (`ft-mutation-helpers.h:975`).
+
+☠☠ **TWO CONSTRAINTS THE WORD "REUSE" HIDES — get these wrong and (F) wedges.**
+`ft_writer_lock_scope_enter` returns at `internal.h:2532` (`if (ft->lock_fine)`)
+BEFORE it ever takes the lock, so **on a FINE trie NOBODY takes `writer_lock`
+today** — not even bulk ops.  (F) therefore does not merely reuse an existing
+acquisition, it ADDS one on the fine path, and:
+1. **That new fine-path acquisition MUST use the OFFLINE park**
+   (`ft_writer_lock_park`), NOT the scope-entry wait.  Since 2026-08-28 the
+   scope-entry wait is `ft_writer_lock_take`, which stays ONLINE deliberately
+   (it must not quiesce a point-op caller's read section — see the two-waits
+   comment at `internal.h`).  A bulk op waiting ONLINE while the holder sits in
+   step 3's `synchronize_rcu` is exactly the non-quiescent reader that GP waits
+   for: **deadlock**, and it is 781e0b9a's measured group wedge.  Offline is
+   legal here precisely because bulk entries forbid a read-section caller.
+2. **(F) IS A FINE-TRIE MECHANISM.**  On COARSE the flags are pointless (every
+   writer already serializes on `writer_lock`) and step 3 is UNSAFE (point ops
+   wait at the online scope entry, so holding across the flip GP wedges them).
+   Coarse keeps its existing discipline: DROP the lock across every GP via
+   `ft_writer_lock_gp_wait`.  ⇒ the two paths must not share one acquisition
+   helper by accident.
+
+★★ **WHY THE GP MAY BE HELD HERE AND NEVER COULD BE HELD ON J.**  The
+grace-period rule (`fractal-trie-internal.h:1806`) forbids waiting on a GP while
+holding a lock whose waiters are RCU-ONLINE non-quiescent readers.  On
+`writer_lock` (fine trie) **every waiter is another BULK op, and every bulk
+entry FORBIDS a read-section caller** — `fractal-trie.h:1715` ("Do NOT call
+these operations from within an RCU read-side critical section: they can block
+internally on `synchronize_rcu()`") for graft/detach/merge/swap, `:3024` for
+rekey.  So its waiters may park OFFLINE and cannot block the flip GP.  That is
+exactly the property NODE locks lack: point ops may NOT quiesce
+(`rcu-txn.h:688`, and QSBR cannot even detect a caller's section), which is why
+holding J across a GP was a deadlock and no park could fix it.
+
+**WHAT IT BUYS OVER (E), beyond being implementable:**
+* **The widening is EXACT.**  Flagging the actual upcoming lock set, not a
+  subtree, means only ops that TOUCH a flagged node widen.  ⇒ (E)'s open cost
+  "a near-root J serializes broadly" is RETIRED.
+* **Bulk-vs-bulk falls out** of the lock — no counter, no owner field, no new
+  mechanism (G5.2's open question closed).
+* **No retire/COW hazard.**  The authority is a trie-lifetime singleton that
+  cannot die; the per-node flags are DERIVED STATE re-established under the
+  lock.  A flagged node retired by a peer is a RE-PLAN, not a silent exclusion
+  gap — which is precisely what killed the (E) variants (below).
+
+**☠ TWO RULES THAT BIND, both discovered while deciding this:**
+1. **FLAG ADDITIONS COST A FLIP GP; REMOVALS DO NOT.**  A flag added mid-window
+   creates fresh non-observers who may commit under that node without taking
+   it.  A flag dropped only makes a point op conservative.  ⇒ flag a SUPERSET
+   up front; a narrowing re-plan is free, a growing one pays another GP.
+2. **THE SEAM RULE BECOMES LOAD-BEARING FOR POINT-OP LIVENESS.**  The flip GP
+   is NOT the only one: bulk edits carry their own reader drains
+   (`ft-detach.h:219/511/575`, `ft-graft.h:2960/4011`, `ft-rekey.h:4510/5035`,
+   all `!exclusive`-gated, so LIVE on the fine non-exclusive trie this
+   targets).  Those stay safe only while NO NODE LOCK is held across them —
+   `internal.h:1811`, "the GP always sits at a seam BETWEEN two distinct
+   commits".  Under (F) a point op spinning on a widened set IS the reader such
+   a GP would wait for.  ☐ **The invariant is OBSERVED BUT UNENFORCED** (the
+   probe that measured it at zero holding was never committed); it needs an ARM
+   on the `FEATURE_FT_HOLD_TRACE` ledger, which IS in the tree.
+
+**☠☠ WHAT WAS REFUTED GETTING HERE — do not re-tread:**
+* **The Phase-D park prerequisite is DISSOLVED, not satisfied.**  §2 (E) recorded
+  "the mark must route waiters to a PARK".  It was never implementable: the ops
+  that had to park are `cds_ft_insert`/`cds_ft_remove`, whose callers hold read
+  sections and reader-derived references across the call.  Under (F) point ops
+  never wait on `writer_lock` at all.
+* **Releasing the junction across the drain GP** (an attempt to obey the seam
+  rule with J as the authority) is REFUTED: in the gap a point op legitimately
+  holding J can RETIRE it (one-way TOMBSTONE) or COW-replace it, and the mark —
+  living in J's metadata — dies with it, silently ending the exclusion
+  mid-edit.  A trie-lifetime authority is the fix, not a better gap.
+* ☞ The GRACE-PERIOD RULE was independently reaffirmed this day on the coarse
+  path: the FT-wide lock's SCOPE-ENTRY wait was made ONLINE
+  (`ft_writer_lock_take`) so it stops quiescing the caller's read section, and
+  that is a DELAY rather than a wedge *only* because the holder never waits on a
+  GP while holding.  Measured cost of an online wait, 16 writers on one coarse
+  trie: hold p50 >= 16us / p99 >= 66us; wait p50 >= 524us / p99 >= 1.05ms at
+  ~75% lock utilization.  The `gp_wait` RE-ACQUIRE keeps its offline park
+  (`ft_writer_lock_park`), which is where 781e0b9a's measured wedge actually was.
+
+☐ **STILL OPEN:** the tier-1 "is any bulk op live?" trie word (the
+`ft_move_active` shape) so the steady state pays nothing; whether the flag rides
+an existing metadata word or needs its own; and the seam-rule arm above.
+
+### G5.4 — ☠☠ (F)'s PROTOCOL IS REFUTED; the REFRAME SURVIVES (adversarial review, 2026-08-28)
+
+Three grounds, each verified in-tree, not taken on the reviewer's word.
+
+1. ☠☠ **FATAL, AND IT IS THE BULK OP'S OWN CODE.**  `ft_writer_lock_gp_wait`
+   UNCONDITIONALLY DROPS `writer_lock` whenever `ft_wlock_held` is set
+   (`internal.h:2631-2686`: `held = ft_wlock_held; if (held) { ...
+   cds_fair_mutex_unlock ... }`), and the bulk bodies call it at SEVEN live
+   `!exclusive`-gated sites (`ft-detach.h:219/511/575`,
+   `ft-graft.h:2960/4011`, `ft-rekey.h:4510/5035`).  So (F)'s "lock held
+   throughout steps 1-5" is TORN OPEN by the op itself at every mid-edit
+   drain.  A peer bulk op then enters the gap, flags an overlapping set, and
+   its step-5 CLEAR erases the first op's flag on any shared node — a SINGLE
+   BIT cannot tell the two windows apart — so point ops stop widening while
+   the first op is still editing: **a silent exclusion gap**.  ⇒ "bulk-vs-bulk
+   falls out of the lock" is FALSE at every drain seam.
+2. ☠ **IT CONTRADICTS TWO SHIPPED API PROMISES, both for the DEFAULT (fine)
+   mode.**  `fractal-trie.h:1703` — *"No writer mutex needed under
+   CDS_FT_WRITER_LOCK_FINE (the default): concurrent grafts into one live
+   destination are supported, and serializing them here would discard exactly
+   the parallelism fine-grained locking exists to provide."*  (F) serializes
+   bulk ops on `writer_lock`, which is that discard.  And `:3023` — *"A burst
+   of concurrent moves pays about ONE grace period between them, not one
+   each"* — is delivered by the MOVE GATE's piggyback
+   (`internal.h:2749-2756`); under (F) each window takes its OWN flip GP under
+   an exclusive lock, so a burst pays one GP EACH.
+3. ☠ **THE FLAG STORE HAS NO SOUND HOME AS SPECIFIED.**  If the flag rides the
+   state word / `parent_word`, those are the plan's own SW-park targets — a
+   point op holding a flagged node's lock SW-parks that word with a plain
+   store and no expected-old, silently CLOBBERING the flag; an unintentional
+   removal is an ADDITION hazard with no GP behind it (bits 0-19 already
+   assigned, `internal.h:938-1009`).  If it takes its own word, G5.1's "the
+   check is FREE where the walk already loads it" is withdrawn — an extra load
+   per walked node, on every point op, forever.
+
+☞ **ALSO REFUTED:** "no retire/COW hazard" — moving the AUTHORITY to a
+singleton did not move the MECHANISM.  A COW of a flagged member publishes the
+replacement WITHOUT the flag (no propagation exists), and until the bulk op next
+touches that dead word, point ops commit under the replacement un-widened.
+☞ "widening is EXACT" is steady-state only: a window whose set includes a
+near-root node still funnels every point op beneath it onto ONE ABORTING
+try-lock for a window containing 1 flip GP + up to 7 drain GPs.
+
+☑ **WHAT SURVIVES, and it is the part worth keeping:** the REFRAME — the
+window's authority belongs on a TRIE-LIFETIME object rather than on a mortal
+node; widening, not exclusion; and the **Phase-D park prerequisite is genuinely
+DISSOLVED for point ops** (on a FINE trie every `CDS_FT_SCOPED_WRITER`
+early-outs at `internal.h:2532`, so point ops never wait on `writer_lock` at
+all).  Point-op whole-set presentation stays deadlock-free (all-or-none sorted
+acquire), so ADDING widening creates no lock-only cycle.  The flip-GP
+observer/non-observer argument holds as a SCHEMA, provided every point path
+re-reads the flag inside each attempt.
+
+### G5.5 — ☑ THE FIRST STEP (Mathieu, 2026-08-28): the MOVE GATE, and while it is set POINT OPS TAKE EVERY ANCESTOR UP TO THE ROOT
+
+Deliberately the COARSEST point on the same axis: **no per-node flags at all.**
+The bulk op enters the existing move gate; while `move_active` is set, a point
+op ADDS every ancestor's lock, up to and including the root, to its own set.
+Refine later only if measurement demands it.
+
+★ **IT SIDESTEPS ALL THREE OF G5.4's GROUNDS, BY SUBTRACTION** — which is why
+it is the right first step rather than a retreat:
+* **Ground 3 (the flag has no sound home) — VOID.**  There is no flag: the
+  tier-1 word IS `move_active`, one trie-level word that already exists.
+* **Ground 1 (a peer's clear erases an overlapping window) — VOID.**  There is
+  no per-node state to erase, and the gate is REFCOUNTED (`move_gate_nr`), so
+  concurrent bulk windows compose by construction.
+* **Ground 2 (serialization + a GP per op) — VOID.**  The gate does not
+  serialize movers, and its 0->1 owner owns the GP while later arrivals
+  PIGGYBACK it: "a burst of moves therefore costs ~one GP, not one per move"
+  (`internal.h:2755`).  Both shipped promises survive.
+
+**WHY EVERY ANCESTOR AND NOT JUST THE ROOT.**  The bulk op holds its own set
+(a junction J and its frontier), which need not include the root; a point op
+holding only the root would then share NO WORD with it.  Taking the whole chain
+guarantees overlap wherever the bulk op is working.  ☠ It is an **ADD, NEVER A
+SUBSTITUTE** — the leaf lock is never surrendered, so point-vs-point exclusion
+is unchanged and the observer/non-observer split (separated by the gate's GP)
+cannot leave two ops on one leaf sharing no word.
+
+**THE THREE PREREQUISITES ARE ALREADY IN THE TREE:**
+* the whole set is presented AT ONCE and the engine sorts by SLOT ADDRESS, so a
+  depth-sized set is deadlock-free with no hold-and-wait
+  (`ft-mutation-helpers.h:975`);
+* the txn lock registry GROWS (@`758f432d`), so a set that grows by DEPTH is
+  affordable — this was a hard prerequisite and it is landed;
+* the gate itself, with its offline piggyback wait (`internal.h:2820`).
+
+☐ **THE COST, STATED PLAINLY:** while ANY bulk op is live, every point op takes
+the ROOT, so all point ops serialize trie-wide for the window.  That is the
+honest price of the coarsest step — it is candidate **(B)**, the root
+placement, reached through the gate instead of through a new mode word.
+
+☐ **TWO THINGS TO SETTLE BEFORE IMPLEMENTING:**
+1. **The gate is entered ONLY by rekey today** (`ft-rekey.h:3667`, `:5991`);
+   detach / graft / merge do NOT enter it.  Extending it to the whole bulk
+   family is small but real work.
+2. ☑ **DECIDED (Mathieu, 2026-08-28): A SEPARATE WRITER STATE.**  `move_active`
+   is READER-facing (`internal.h:1737`: nonzero => readers take the COHERENT
+   path), so reusing it would put READERS on the coherent path for every
+   detach/graft — a cost they do not pay today and that the widening does not
+   need.  The writer side gets **its own word beside it**.
+   ★ That word IS the tier-1 "is any bulk op live?" gate that (E)/(F) both
+   wanted — one trie-level word, `caa_likely` false, zero steady-state cost —
+   so this closes that open item too.
+   ☞ **ONE GATE, ONE GP, TWO WORDS, TWO REFCOUNTS.**  The gate's machinery
+   (`move_gate_lock` / `_cond` / `_nr` / `_gp`, `internal.h:2777`) is generic and
+   should be shared, so a rekey burst and a detach burst still amortize into ONE
+   grace period; what must NOT be shared is the refcount that decides when each
+   WORD clears.  A rekey publishes BOTH words (it needs reader coherence); a
+   detach / graft / merge publishes ONLY the writer word.  ☠ A single
+   `move_gate_nr` would leave `move_active` set by a detach — the exact cost
+   this decision exists to avoid — or clear it while a rekey is still live,
+   which is a correctness bug, not a cost.  Two counters, one gate.
+
+☠☠ **AND THE ONE THING THIS STILL DOES NOT SOLVE — the same linchpin under
+EVERY variant.**  The bulk op's mid-edit drain GPs (`ft_writer_lock_gp_wait`,
+7 live sites) run while point ops may be spinning on a word the bulk op holds;
+those point ops CANNOT quiesce, so such a GP would never complete.  What makes
+it safe is the SEAM RULE — no NODE lock is held across a GP,
+`internal.h:1811` — which is **OBSERVED BUT UNENFORCED**.  ⇒ **ARMING THE SEAM
+RULE IS THE CONCRETE FIRST TASK, and it is prerequisite to (B)/(F)/(E) alike**;
+the `FEATURE_FT_HOLD_TRACE` ledger is in the tree and is the place to hang it.
+
+### G5.6 — ☞ EXPLORING: the tier-2 refinement, a PER-NODE BULK REFCOUNT (Mathieu, 2026-08-28)
+
+G5.5's widening is trie-wide (every ancestor to the root) while any bulk op is
+live.  The refinement: give each NODE a **refcount of the live bulk windows
+covering it**, and have the upward walk add a node's lock only where that count
+is nonzero.  ★ It is exactly what G5.4's ground 1 demanded — *"shared flags
+would have to be COUNTERS or owner-stamped, not bits"* — so it is the
+PRINCIPLED fix for overlapping windows, not a second guess at (F)'s bit.
+
+☠☠ **THE PARAGRAPH BELOW IS HALF WRONG — see G5.7.  The sizeof/padding half
+holds; the CACHE-LINE half is REFUTED for 100% of nodes.**  Kept as written
+because the correction is only legible against it.
+
+☑ **IT COSTS NOTHING TO CARRY — MEASURED, not estimated (2026-08-28).**
+`sizeof(struct cds_ft_metadata)` is **48 bytes**, with the packed tail word
+(`alloc_index` + `incoming_byte`) at offset 40..43 and **4 BYTES OF PADDING at
+44..47** (the struct rounds to 8 for `parent_word`'s alignment).  A
+`uint32_t bulk_refcount` at 44 leaves the struct **still 48 bytes**:
+* **zero memory cost per node** — it lands in existing padding;
+* **offset 44 < 64, the SAME cache line as `parent_word` (offset 0)** — so the
+  tier-2 check is free on the walk that already loads `parent_word`.
+  ★ This RESCUES G5.1's "free where it is read" claim, which G5.4 ground 3 had
+  forced us to withdraw — with the honest correction that it is the same LINE,
+  not the same word.
+  ☐ Verified for the non-FAR, non-HOLD_TRACE layout (the shipping one);
+  `FT_FAR_METADATA` keeps the same 40..43 tail, so it should be identical —
+  confirm before relying on it.
+
+☠ **IT MUST HAVE ITS OWN WORD, AND THE TREE ALREADY SETTLED WHY.**  Not in
+`state`: §8.3 split `parent_slot_offset` OUT of `state` precisely because *"a
+word cannot be owned by two locks"*.  The bulk refcount has that exact problem —
+it is written by a bulk op that does NOT hold the node's lock, while `state` is
+node-lock-owned and is the SW-PARK TARGET, so a park's plain store would clobber
+it.  Own word, `uatomic_add`/`uatomic_sub`.  ⇒ **G5.4's ground 3 is answered**,
+by the tree's own established rule rather than a new argument.
+
+★ **KEEP THE PER-FT WRITER STATE AS TIER 1 — this REFINES G5.5, it does not
+replace it.**  If the refcount were the only signal, every point op would have
+to walk its ancestors checking counts on EVERY operation; at per-node spacing a
+point op anchors on ITSELF and does not climb today, so that is a NEW O(depth)
+cost paid always.  With the per-FT word as a `caa_likely`-false tier 1, the walk
+happens only while a window is live.  ⇒ this is (E)'s two-tier structure at
+last, with a tier 2 that survives review.
+
+☑ **WHAT IT BUYS:** the widening becomes EXACT — a point op takes only the
+COVERED ancestors — so a deep bulk op stops serializing the whole trie.  That
+retires G5.5's accepted cost, which is the reason to want it.
+
+☠☠ **THE NEW HAZARD, AND IT IS THE REAL RISK: EXACT TRANSFER.**  A BIT can be
+re-set conservatively; a COUNT must MOVE EXACTLY across a COW / re-parent /
+retire.  Leak it and the node stays "covered" forever (point ops widen onto it
+for the rest of the trie's life); lose it and the exclusion silently ends
+mid-window.  This is (F)'s ground-5 COW hazard, made STRICTER by counting rather
+than softer.  ⇒ it needs an explicit transfer rule at every republish site AND
+an arm (leak / underflow detector) — ☐ neither exists yet, and this is where
+this refinement will actually be won or lost.
+
+☞ Unchanged from G5.5: increments land BEFORE the flip GP; a mid-window
+increment needs ANOTHER flip GP (additions cost one, removals are free);
+ADD-never-substitute; and the SEAM RULE remains the shared liveness linchpin.
+
+### G5.7 — ☠☠ G5.6 IS REFUTED (adversarial review, 2026-08-28); the COUNTER PRINCIPLE survives, the WORD does not
+
+Seven of eight claims fell.  The two that matter most are re-verified here
+in-tree, not taken on the reviewer's word.
+
+1. ☠☠ **THE "FREE CHECK" IS WRONG FOR EVERY NODE — I ASSERTED IT, AND THE
+   ARENA REFUTES IT.**  Metadata is not a bare struct: it is embedded in
+   `struct cds_ft_metadata_alloc` (`rcu_head` at 0, `.metadata` at **+16**,
+   sizeof **64**, `internal.h:3143`) inside the flexible array
+   `cds_ft_alloc_range::metadata[]`, which starts at **+72** (`internal.h:3186`).
+   Compiled probe against the real headers: every element's metadata sits at
+   **mod-64 offset 24**, so `parent_word` (metadata+0) and the proposed word at
+   metadata+44 are **on DIFFERENT CACHE LINES for 100% of nodes** — one extra
+   line per walked level, not a free field.
+   ☠ And worse than neutral: node N's refcount line CARRIES NODE N+1's HOT HALF
+   (`parent_word`..`state`), so a bulk op's `uatomic_add`/`sub` FALSE-SHARES
+   with a neighbouring node's read path and lock word.
+   ☑ The sizeof half stands: 48 bytes with padding at 44..47, in near, FAR
+   (the 64-bit DEFAULT) and HOLD_TRACE alike.
+2. ☠☠ **CLAIM 2 AND CLAIM 6 CONTRADICT EACH OTHER, INHERENTLY.**  The word must
+   live OUTSIDE engine-owned state to escape the SW-park clobber (that is what
+   makes G5.4 ground 3 answerable) — but a word outside the engine CANNOT RIDE
+   THE FLIP TXN as a recorded edge, so its transfer can never be made atomic
+   with the republish it must accompany.  A peer window's `uatomic_add` on the
+   OLD word lands between a republisher's load and its flip: the increment is
+   lost (that window silently uncovered on the new node) and the peer's exit
+   decrement then targets a freed slot.  ⇒ **not an implementation gap — the
+   two properties the design needs are mutually exclusive as specified.**
+
+☠ **ALSO REFUTED:** *the ancestor walk cannot be enumerated safely* —
+`parent_word` is transiently NULL during detach/graft_swap re-homes
+(`internal.h:1051`, plain NULL store `ft-graft.h:294`) and **NULL reads as THE
+ROOT to a walker** (`ft-mutation-helpers.h:6605`), so a point op that descended
+before the clear and climbs after silently TRUNCATES its ancestor set, misses
+covered ancestors, and commits sharing no word with the bulk op — a silent
+exclusion gap.  *Increments cannot all land before the GP* — bulk lock sets are
+DISCOVERED during the edit, not plannable (merge registers each overlap node as
+it walks, 254 measured; `ft-mutation-helpers.h:992`), and each growth owes
+another flip GP with nowhere legal to pay it (mid-edit it violates the seam
+rule; after dropping everything it is a full re-plan → livelock under churn).
+*Decrements are not free* — nothing PINS a covered member (a refcount is not a
+lock), so a point op may retire or COW it; after the GP the slot is freelisted
+and re-allocated memset-0, and the window-exit decrement UNDERFLOWS AN
+UNRELATED NODE.  *Liveness is unbudgeted* — D.1's measured tail is exactly this
+mechanism (an aborting queueless acquire re-sampling a bulk-held word, 100
+re-descends per episode) applied to a strictly LARGER population for whole
+windows; no D-section bounds it.
+
+☑ **WHAT SURVIVES, and it is not nothing:** the PRINCIPLE that overlapping
+windows need COUNTERS rather than bits; the sizeof/padding headroom; the
+tier-1 word being genuinely cheap IN ITSELF (read-mostly, written only at gate
+enter/exit); own-word immunity to IN-PLACE clobber; and tier-2 being strictly
+narrower than G5.5.  ☠ But note claim 3's premise died too: point ops do NOT
+climb today (a member anchors on ITSELF at per-node spacing,
+`ft-mutation-helpers.h:3088`, `:3323`), so the walk is NEW code — and on a
+bulk-heavy workload tier 1 is ~always set, making that walk the steady state.
+
+☞ **THE ONE UNEXPLORED EXIT, recorded as a QUESTION, not a proposal:** the
+contradiction in (2) is between "outside the engine" and "atomic with the
+republish".  A count that is itself a TRANSACTED SLOT — its own word, but
+engine-owned, so a republish carries it as a recorded edge — would satisfy both
+halves at once.  ☐ UNVETTED: it re-opens the SW-park question the own-word
+choice was made to escape, and nobody has checked whether a counter can be a
+flip-txn edge at all.  Do not build on it before it is skepticked.
+
+★ **WHERE (F) POINTED, from G5.4 ground 2:** the MOVE GATE is already the
+"flip a mode with ONE amortized GP" primitive this needs — it publishes
+`move_active`, waits one GP, lets a burst PIGGYBACK, waits OFFLINE
+(`internal.h:2749-2756`, `:2820`), and does NOT serialize the movers.  A flip
+carried by a gate rather than by an exclusive lock preserves both promises
+ground 2 cites.  ☐ It does not by itself answer the overlapping-window problem
+of ground 1: shared flags would have to be COUNTERS or owner-stamped, not bits.
+☐ UNDECIDED — this is a direction, not a third protocol.
 
 ---
 
@@ -2752,28 +3119,110 @@ stale) — watch it across Phase B, it shares words with the converted sites.
                                                               in §5 C.2/C.1(d)
     D   acquire fair-handoff design w/ Mathieu              ☑ DONE D.0-D.5 (@027eeb9d,
                                                               the wait-ladder public API).
-                                                              It was G5's PREREQUISITE and
-                                                              hands it the drain bound:
-                                                              p99 ~240us + one GP
-    G5  bulk vs point exclusion                            ☑☑ DECIDED 2026-08-28: (E).
-                                                              (B) falls out of it as the ROOT
+                                                              ☠ It was recorded as G5's
+                                                              PREREQUISITE; G5.3 RETIRES that
+                                                              -- (F) takes its flip GP under
+                                                              writer_lock, whose waiters park
+                                                              OFFLINE, so no point-op park is
+                                                              owed.  D.0-D.5 stand on their own
+                                                              (the tail, the ladder, the
+                                                              curative lever = §8.2)
+    G5  bulk vs point exclusion                            ☑ FIRST STEP CHOSEN 2026-08-28
+                                                              (Mathieu), §2 G5.5: the MOVE
+                                                              GATE, and while it is set POINT
+                                                              OPS TAKE EVERY ANCESTOR UP TO
+                                                              THE ROOT.  No per-node flags =>
+                                                              G5.4's three grounds are VOID by
+                                                              subtraction.  It is candidate (B),
+                                                              the root placement, reached through
+                                                              the existing gate.  Cost accepted:
+                                                              point ops serialize trie-wide for
+                                                              the window.  Refine later only on
+                                                              measurement.
+                                                              ☠☠ PREREQUISITE, and it is shared
+                                                              by EVERY variant: ARM THE SEAM RULE
+                                                              (no node lock held across a GP,
+                                                              internal.h:1811) -- the bulk op's
+                                                              7 mid-edit drain GPs are safe ONLY
+                                                              under it, and it is observed but
+                                                              UNENFORCED.  Hang it on
+                                                              FEATURE_FT_HOLD_TRACE.
+                                                              ☑ DECIDED: a SEPARATE WRITER STATE
+                                                              beside move_active, so readers keep
+                                                              the FAST path for detach/graft.  That
+                                                              word IS the tier-1 "any bulk op live"
+                                                              gate (E)/(F) wanted.  ONE gate, ONE
+                                                              GP, TWO words, TWO REFCOUNTS (a
+                                                              shared nr would either leave
+                                                              move_active set by a detach or clear
+                                                              it under a live rekey).
+                                                              ☐ settle first: the gate is entered
+                                                              only by REKEY today (ft-rekey.h:3667,
+                                                              :5991) -- extend to detach/graft/merge
+                                                              ☠☠ THE TIER-2 REFINEMENT (per-node
+                                                              bulk REFCOUNT, §2 G5.6) IS REFUTED
+                                                              (§2 G5.7): the "free check" is wrong
+                                                              for 100% of nodes (arena puts
+                                                              metadata at mod-64 offset 24, so
+                                                              parent_word and off-44 are on
+                                                              DIFFERENT lines, and the refcount
+                                                              line false-shares the NEXT node's hot
+                                                              half); and "own word" (needed vs the
+                                                              SW-park) CONTRADICTS "atomic transfer
+                                                              at republish" (a non-engine word
+                                                              cannot ride the flip txn) -- inherent,
+                                                              not an implementation gap.  Plus:
+                                                              the ancestor climb is NEW code and
+                                                              unsafe (parent_word transiently NULL
+                                                              reads as ROOT => silent truncation);
+                                                              bulk sets are DISCOVERED mid-edit so
+                                                              growth GPs have nowhere legal to sit;
+                                                              a decrement after a covered node is
+                                                              retired underflows a REALLOCATED slot.
+                                                              ☑ SURVIVES: counters-not-bits as a
+                                                              PRINCIPLE, the padding headroom, the
+                                                              tier-1 word's own cheapness.
+                                                              ⇒ G5.5 (trie-wide) STANDS as the
+                                                              first step.
+                                                              ☞ (F) 2026-08-28 (§2 G5.3)
+                                                              is REFUTED AS A PROTOCOL by
+                                                              adversarial review (§2 G5.4):
+                                                              ft_writer_lock_gp_wait DROPS
+                                                              writer_lock at 7 live mid-edit
+                                                              drain sites, so the window is torn
+                                                              open by the bulk op's OWN code and
+                                                              a peer's single-bit flag CLEAR
+                                                              silently ends the exclusion; and
+                                                              it contradicts two shipped FINE
+                                                              API promises (no writer mutex,
+                                                              fractal-trie.h:1703; burst pays ONE
+                                                              GP, :3023).
+                                                              ☑ THE REFRAME SURVIVES: the
+                                                              authority belongs on a
+                                                              TRIE-LIFETIME object, widening not
+                                                              exclusion, and the Phase-D park
+                                                              prerequisite IS dissolved for
+                                                              point ops (they never wait on
+                                                              writer_lock on a fine trie,
+                                                              internal.h:2532).
+                                                              ☞ NEXT: the MOVE GATE is the
+                                                              existing "flip a mode with ONE
+                                                              amortized GP, offline waiters, no
+                                                              serialization" primitive; shared
+                                                              flags must be COUNTERS, not bits.
+                                                              (E)'s GRANULARITY insight kept
+                                                              whole; the exclusion AUTHORITY
+                                                              moves off the junction node onto
+                                                              the FT-wide writer_lock.
+                                                              (B) falls out as the ROOT
                                                               placement; (A) RETIRED as an
-                                                              exclusion mechanism (the bulk op
-                                                              holds O(1)); (D) not taken; (C)
-                                                              unchanged.  ☠☠ NOT IMPLEMENTABLE
-                                                              until Phase D's ACQUIRE LANE
-                                                              lands -- the contended acquire
-                                                              ABORTS (8192-spin then FAILED),
-                                                              so without a PARK the mark makes
-                                                              a bulk window a retry storm that
-                                                              starves its own drain GP.
-                                                              ☞ ORDER: D-acquire-lane -> (E)
-                                                              ☑ (E) @f4cb1731 --
-                                                              LOCK-SCOPE WIDENING (mark the
-                                                              junction; point ops ADD marked
-                                                              ancestors' locks; the ordinary
-                                                              DLM arbitrates) = the anchor
-                                                              rule applied DYNAMICALLY.
+                                                              exclusion mechanism; (D) not
+                                                              taken; (C) unchanged.
+                                                              ☞ (E) @f4cb1731 is the SURVEY
+                                                              that produced it -- LOCK-SCOPE
+                                                              WIDENING, the anchor rule applied
+                                                              DYNAMICALLY -- superseded as the
+                                                              MECHANISM, not as the idea.
                                                               ☐ THE DECISION: (E) vs the
                                                               BOUNDARY mechanisms
                                                               ((A)/(B)/(D)) is the PRIOR
@@ -2782,24 +3231,39 @@ stale) — watch it across Phase B, it shares words with the converted sites.
                                                               alone needs no new primitive,
                                                               no per-node encoding and no
                                                               engine change.
-                                                              ☐ Then G5's four originals:
-                                                              park/wake, FIFO both ways,
-                                                              the handle path (☑ DISSOLVED
-                                                              by (E) -- an ancestor walk
-                                                              starts where the op IS), and
-                                                              the mark's encoding (☑ ANSWERED
-                                                              by (E): metadata, free on the
-                                                              walk that already loads it)
-                                                              ☠☠ PHASE D'S ACQUIRE LANE IS A
-                                                              HARD PREREQUISITE: the age-1+
-                                                              wait is NOT a block -- it spins
-                                                              8192 then ABORTS (settle restores
-                                                              the prefix), so a bulk window
-                                                              becomes a RETRY STORM under J
-                                                              that can starve the bulk op's
-                                                              OWN drain GP.  The mark must also
-                                                              route waiters to a PARK.  True of
-                                                              (B)/(D) too
+                                                              ☑☑ SUPERSEDED BY (F) 2026-08-28
+                                                              (Mathieu), §2 G5.3: REUSE the
+                                                              FT-wide writer_lock as the bulk
+                                                              window's authority; under it FLAG
+                                                              every node of the upcoming lock
+                                                              set; synchronize_rcu to flip mode
+                                                              WHILE HOLDING IT; edit; unflag.
+                                                              Point ops read the flags on their
+                                                              UPWARD WALK and ADD those locks.
+                                                              ★ The GP may be held there because
+                                                              every waiter on writer_lock is
+                                                              another BULK op, and every bulk
+                                                              entry forbids a read-section
+                                                              caller (fractal-trie.h:1715,
+                                                              :3024) => waiters park OFFLINE.
+                                                              ☑ PHASE D'S ACQUIRE LANE IS NO
+                                                              LONGER A PREREQUISITE -- it is
+                                                              DISSOLVED: point ops never wait on
+                                                              writer_lock, and the park it
+                                                              demanded was never implementable
+                                                              at insert/remove anyway
+                                                              (rcu-txn.h:688)
+                                                              ☠ TWO BINDING RULES: a flag ADDED
+                                                              mid-window costs another flip GP
+                                                              (removals are free) => flag a
+                                                              SUPERSET; and the SEAM RULE (no
+                                                              node lock held across a GP,
+                                                              internal.h:1811) becomes
+                                                              load-bearing for point-op
+                                                              liveness -- ☐ it needs an ARM on
+                                                              the FEATURE_FT_HOLD_TRACE ledger
+                                                              ☐ open: the tier-1 word, the
+                                                              flag's encoding, the seam arm
     E   spacing certification + gate lift + strategy fold   ☠ BLOCKED, and NOT on E.2 --
                                                               re-derived @54c6358e: the blocker
                                                               is ft_txn_per_op_spacing_ok ==
