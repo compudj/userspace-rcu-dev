@@ -1388,10 +1388,31 @@ shows as in-body GP):
 ⇒ **1.8x-4.3x on the short bulk ops**, and rekey (which already paid the gate)
 is unchanged, which is the control that makes the attribution clean.
 
-☐ **A LEVER, NOT YET TAKEN:** the word is cleared the instant the refcount hits
-0.  Letting it LINGER (hysteresis) would restore coalescing by trading DUTY for
-GP COUNT -- more time widened, far fewer grace periods.  That is a design call,
-not a cleanup, and it interacts with G5.9's duty finding; it needs Mathieu.
+☑ **AND THE GOVERNING ASSUMPTION, WHICH DEFLATES MOST OF THE ABOVE (Mathieu,
+2026-08-28): TYPICAL BULK OPS ARE INFREQUENT**, so the refcount DOES return to
+zero between them, and what must be preserved is **the speed of concurrent POINT
+OPS**.  Read against that workload:
+* G5.9's ~99.9% duty is a property of an arm running EIGHT DEDICATED MOVER
+  THREADS IN A TIGHT LOOP.  It is the right number for that arm and the wrong
+  one to design against; the sparse regime has duty ~ (bulk rate x bulk
+  duration), which is small.
+* The coalescing collapse is then NOT a cost: with no burst to amortize, one
+  grace period per bulk op is simply the expected behaviour.  The measured
+  1.8x-4.3x lands on BULK-OP LATENCY -- rare, and already the slow path -- not
+  on point ops.
+* ⇒ the hysteresis lever (letting the word LINGER to restore coalescing) is
+  NOT needed, and would be actively wrong here: it would trade a cost nobody
+  pays for MORE TIME WIDENED, which is the one thing this workload cannot
+  afford.
+
+☞ **SO THE METRIC THAT GATES THIS WORK IS POINT-OP SPEED, in two regimes:**
+1. **STEADY STATE (no bulk op live) -- the one that matters most.**  Cost must be
+   ONE relaxed load of the packed word behind `caa_likely`, and nothing else.
+   ☐ NOT YET MEASURED; nothing reads the word today, so point ops are currently
+   UNTOUCHED and the baseline is free to take.
+2. **INSIDE A WINDOW.**  Cost is the widened acquire, from the published min
+   level DOWN -- which is exactly what the level word exists to bound, and why
+   concurrent point ops do not all serialize on the root.
 
 ---
 
