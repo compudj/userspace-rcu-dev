@@ -1414,6 +1414,70 @@ OPS**.  Read against that workload:
    level DOWN -- which is exactly what the level word exists to bound, and why
    concurrent point ops do not all serialize on the root.
 
+### G5.11 — the ANCESTOR LEDGER lands; the RELEASE OWNER is settled; point ops measure UNCHANGED
+
+**☑ PREREQUISITE 1 IS BUILT: a per-thread ANCESTOR LEDGER.**  Nothing already in
+the tree can answer "every ancestor" at the shipping default, which is what made
+the obvious widening a silent no-op there:
+* `anchor[]` is never built at `CDS_FT_LOCK_SPACING_PER_NODE` --
+  `ft_descent_enter_node` returns before filling it, "the zero-cost path the
+  default rests on";
+* the descent keeps only a FOUR-DEEP window (`nf`/`pnf`/`ppnf`/`pppnf`);
+* the `metadata->parent` up-walk is REFUTED: transiently NULL while a detach or
+  graft re-homes a node, and a NULL parent reads as ROOT, so the walk truncates
+  SILENTLY.
+
+So the path is recorded where the descent already crosses it, in
+`ft_descent_enter_node` BEFORE the per-node early return.
+* ★ **PER-THREAD, NOT IN `struct ft_descent`**, which is a per-op STACK object
+  on every point op: FT_MAX_DEPTH entries is ~4 KB and would land on the hot
+  path whether or not a bulk op is live.  One TLS block per thread instead.
+* ★ **SAMPLED ONCE**, at `ft_descent_init`, from the packed bulk word.  Steady
+  state is one load per DESCENT plus one predictable branch per level -- never a
+  metadata read.  Sampling once is also what keeps the path SELF-CONSISTENT: a
+  mid-descent flip would record part of a path, which is the same
+  silent-truncation shape the `parent_word` walk was refuted for.
+* ☠ **OVERFLOW REFUSES, IT DOES NOT TRUNCATE** (`@overflow`).
+
+☑ **PROVEN LIVE, not assumed** (`-DFT_DEBUG_ANC_LEDGER`; nothing consumes the
+ledger yet, so a zero would have been unfalsifiable without a REACH counter):
+
+    arm                              descents   entries   overflow  disorder
+    inv_rekey_contended_mixed_writers 421,394  1,271,384         0         0
+    inv_rekey_fine_mixed_writers      396,373    958,597         0         0
+
+`disorder` counts any entry not strictly deeper than its predecessor: the
+widening needs the path ROOT-FIRST and strictly deepening, and zero across 2.2 M
+entries is that claim measured rather than argued.
+
+**☑ PREREQUISITE 2 IS SETTLED (design), and it is SMALLER than it looked.**  The
+release owner for a widened hold is `ft_flip_txn_lock_own(txn, &mark)`, the same
+hand-off `ft_rekey_cow_stop` already uses via `ft_rekey_marks_to_txn` -- it sets
+`@txn_owned`, so the txn's sweep drops the word.  The rule:
+* `ctx->held.txn != NULL` -> the choke point hands the ancestors straight to it.
+  No per-site work.  This covers the remove sites.
+* `ctx->held.txn == NULL` -> the caller must carry them.  **`insert` is the only
+  such site** (`ft_lock_ctx_init(&lctx, d, NULL, ...)`; "@ic->txn is not live at
+  this point"), so it is ONE site of plumbing, not four.
+* ☠ REGISTER BEFORE THE RECORDS THE MARK LICENSES -- the 17-site class closed at
+  `55c0350c`.
+
+☐ **PREREQUISITE 3 REMAINS:** `taken[]` / `taken_snap[]` are sized
+FT_FLIP_TXN_MAX_LOCKS behind an assert compiled out under NDEBUG, and a widened
+per-node set reaches FT_MAX_DEPTH plus the op's own members.  Size for the
+widened set and make the bound a RUNTIME REFUSAL.
+
+**☑ AND THE METRIC THAT GATES THIS WORK IS UNMOVED SO FAR.**  Steady-state point
+ops (`inv_concurrent_writers_disjoint`, 16 writers, no bulk op live), 10 reps per
+arm, INTERLEAVED A/B/A/B against `350141cd`:
+
+    AFTER  median 7,493 ops     BEFORE median 7,433 ops     delta < 1%
+
+☠ Read against a NOISE FLOOR of ~8% (7,210-7,789 across twelve reps of ONE
+build), so the honest statement is NOT DETECTABLE, not "0.8% faster".  The gate
+half adds a ~516-byte per-trie array and no point-op read, and that is what the
+number says.  ☞ Re-take this baseline once the widening actually reads the word.
+
 ---
 
 ## 3. Phase A — arm COARSE, then exclusive

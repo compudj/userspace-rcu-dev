@@ -42,6 +42,81 @@ struct ft_lock_anchor {
 };
 
 /*
+ * G5.5's ANCESTOR LEDGER: the descent path, root-first, for the widening.
+ *
+ * ☠ NOTHING ELSE IN THE TREE CAN ANSWER "every ancestor" at the SHIPPING
+ * DEFAULT.  @anchor[] is never built at CDS_FT_LOCK_SPACING_PER_NODE
+ * (ft_descent_enter_node returns before filling it -- "the zero-cost path the
+ * default rests on"), the descent retains only a four-deep window
+ * (nf/pnf/ppnf/pppnf), and the metadata->parent up-walk is refuted: it goes
+ * transiently NULL while a detach or graft re-homes a node, and a NULL parent
+ * reads as ROOT, so the walk truncates SILENTLY.  A widening built on any of
+ * those would exclude nothing and say nothing.
+ *
+ * ★ PER-THREAD, NOT IN struct ft_descent, which is a per-op STACK object on
+ * every point op: FT_MAX_DEPTH entries is ~4 KB and would land on the hot path
+ * whether or not a bulk op is live.  Here it is one TLS block per thread, and
+ * the steady-state cost is ONE PREDICTABLE BRANCH per level (@rec false).
+ */
+struct ft_anc_ledger {
+	unsigned int nr;
+	bool overflow;		/* deeper than FT_MAX_DEPTH: refuse, never truncate */
+	struct {
+		struct cds_ft_inode_flag *nf;
+		unsigned int depth;
+	} e[FT_MAX_DEPTH];
+};
+
+extern __thread struct ft_anc_ledger ft_anc_ledger;
+
+#ifdef FT_DEBUG_ANC_LEDGER
+/*
+ * ☠ A LEDGER NOTHING CONSUMES YET CANNOT BE BELIEVED ON A ZERO.  Nothing reads
+ * the ledger until the widening lands, so "it works" is unfalsifiable without a
+ * REACH counter: @ft_anc_rec_descents separates NEVER RAN from RAN AND FOUND
+ * NOTHING, which is the distinction a silent zero destroys.  The order check is
+ * the correctness half -- the widening needs the path ROOT-FIRST with strictly
+ * increasing depth, and a ledger that recorded a partial or reordered path
+ * would exclude the wrong nodes.
+ */
+extern unsigned long ft_anc_rec_descents, ft_anc_rec_entries;
+extern unsigned long ft_anc_rec_overflow, ft_anc_rec_disorder;
+#endif
+
+static inline
+void ft_anc_ledger_reset(void)
+{
+	ft_anc_ledger.nr = 0;
+	ft_anc_ledger.overflow = false;
+#ifdef FT_DEBUG_ANC_LEDGER
+	uatomic_inc(&ft_anc_rec_descents);
+#endif
+}
+
+static inline
+void ft_anc_ledger_push(struct cds_ft_inode_flag *nf, unsigned int depth)
+{
+	struct ft_anc_ledger *l = &ft_anc_ledger;
+
+	if (caa_unlikely(l->nr >= FT_MAX_DEPTH)) {
+		l->overflow = true;	/* the acquire refuses; see G5.10 */
+#ifdef FT_DEBUG_ANC_LEDGER
+		uatomic_inc(&ft_anc_rec_overflow);
+#endif
+		return;
+	}
+#ifdef FT_DEBUG_ANC_LEDGER
+	/* ROOT FIRST, strictly deepening: what the widening will walk. */
+	if (l->nr && depth <= l->e[l->nr - 1].depth)
+		uatomic_inc(&ft_anc_rec_disorder);
+	uatomic_inc(&ft_anc_rec_entries);
+#endif
+	l->e[l->nr].nf = nf;
+	l->e[l->nr].depth = depth;
+	l->nr++;
+}
+
+/*
  * Descent cursor -- tracks current, parent, and grandparent positions
  * during a key-guided traversal of the trie.
  *
@@ -71,6 +146,16 @@ struct ft_descent {
 	uint16_t anchor_pending;		/* Levels awaiting their boundary node. */
 	uint16_t anchor_crossed;		/* Levels written (debug validation). */
 	enum cds_ft_lock_spacing lock_spacing;	/* The trie's lock granularity. */
+	/*
+	 * Record the path into the per-thread ancestor ledger?  Sampled ONCE at
+	 * ft_descent_init from the packed bulk word, so the steady state pays one
+	 * load per DESCENT and one predictable branch per level -- never a
+	 * metadata read.  Sampling once is also what keeps the recorded path
+	 * self-consistent: a mid-descent flip would leave a ledger that covers
+	 * only part of the path, which is the silent-truncation shape the
+	 * parent_word walk was refuted for.
+	 */
+	bool anc_rec;
 	struct cds_ft_inode_flag *nf;		/* Current node-flag value. */
 	struct cds_ft_inode_flag **nfp;		/* Slot that holds @nf. */
 	struct cds_ft_inode_flag *pnf;		/* Parent node-flag value. */
@@ -182,6 +267,12 @@ void ft_descent_enter_node(struct ft_descent *d, struct cds_ft_inode_flag *nf,
 {
 	unsigned int lvl;
 
+	/*
+	 * BEFORE the per-node early return: the ledger is needed at EVERY
+	 * spacing, and per-node is the one where nothing else records the path.
+	 */
+	if (caa_unlikely(d->anc_rec))
+		ft_anc_ledger_push(nf, start);
 	/*
 	 * Per-node granularity anchors every member on itself, so it reads no
 	 * table and builds none -- the zero-cost path the default rests on.
@@ -651,6 +742,9 @@ void ft_descent_init(struct ft_descent *d, struct cds_ft *ft)
 	d->anchor_pending = 0;
 	d->anchor_crossed = 0;
 	d->lock_spacing = ft->lock_spacing;
+	d->anc_rec = caa_unlikely(ft_bulk_active(ft));
+	if (caa_unlikely(d->anc_rec))
+		ft_anc_ledger_reset();
 	/*
 	 * Resolve a transient type-7 flip proxy a peer parked on the ROOT slot
 	 * (Phase 4.3: a root recompact's forward edge mid-commit) to its

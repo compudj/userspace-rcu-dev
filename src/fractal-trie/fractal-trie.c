@@ -312,6 +312,33 @@ struct cds_ft_node *cds_ft_node_next_resolve(void *raw)
  */
 __thread unsigned long ft_bulk_self_depth;
 
+/*
+ * G5.5's ancestor ledger (ft-mutation-helpers.h): the descent path for a point
+ * op that must widen.  One block per thread; only touched while a bulk op is
+ * live.
+ */
+__thread struct ft_anc_ledger ft_anc_ledger;
+
+#ifdef FT_DEBUG_ANC_LEDGER
+unsigned long ft_anc_rec_descents, ft_anc_rec_entries;
+unsigned long ft_anc_rec_overflow, ft_anc_rec_disorder;
+
+__attribute__((destructor))
+static void ft_anc_rec_dump(void)
+{
+	if (!ft_anc_rec_descents) {
+		fprintf(stderr, "FT ANCLEDGER: NEVER RECORDED -- no descent ran "
+			"while a bulk op was live.  A CONFIGURATION MISS, not "
+			"a measurement: run an arm with concurrent bulk and "
+			"point ops.\n");
+		return;
+	}
+	fprintf(stderr, "FT ANCLEDGER: recording descents=%lu entries=%lu "
+		"overflow=%lu disorder=%lu\n", ft_anc_rec_descents,
+		ft_anc_rec_entries, ft_anc_rec_overflow, ft_anc_rec_disorder);
+}
+#endif
+
 void _cds_ft_debug_move_gate_enter(struct cds_ft *ft)
 {
 	ft_move_gate_enter(ft);
