@@ -1104,6 +1104,28 @@ extern unsigned long cds_ft_probe_promote_guarded;
  */
 #define FT_FLIP_TXN_MAX_LOCKS	FT_FLIP_TXN_FLOOR_LOCKS
 
+/*
+ * The widened ceiling: an op's own members plus, under G5.5, every ancestor of
+ * the deepest of them.  Anything past this is a caller bug, and the acquire
+ * refuses it before taking a single word rather than writing past its arrays.
+ */
+#define FT_DLM_ACQUIRE_MAX_SET	(FT_FLIP_TXN_MAX_LOCKS + FT_MAX_DEPTH)
+
+/*
+ * How large a set still fits the EMBEDDED arrays.  Separate from the array
+ * sizing so a test build can force the heap path: until the widening lands no
+ * caller presents a set past FT_FLIP_TXN_MAX_LOCKS, so the overflow branch
+ * would otherwise ship never having executed once -- and an allocation path
+ * that has never run is not covered by a green suite, it is merely unvisited.
+ * -DFT_DEBUG_FORCE_ACQ_HEAP sends essentially every acquire down it.
+ */
+#ifdef FT_DEBUG_FORCE_ACQ_HEAP
+# define FT_ACQ_EMBED_LOCKS	1
+extern unsigned long ft_acq_heap_taken;
+#else
+# define FT_ACQ_EMBED_LOCKS	FT_FLIP_TXN_MAX_LOCKS
+#endif
+
 struct ft_flip_txn {
 	struct urcu_txn *mtxn;	/* the concurrent commit engine handle:
 					 * &own (standalone txn), or the op's
@@ -4933,8 +4955,21 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 		const struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		struct ft_dlm_member *set, int nr)
 {
-	struct cds_ft_metadata *taken[FT_FLIP_TXN_MAX_LOCKS];
-	uintptr_t taken_snap[FT_FLIP_TXN_MAX_LOCKS];
+	struct cds_ft_metadata *taken_embed[FT_FLIP_TXN_MAX_LOCKS];
+	uintptr_t taken_snap_embed[FT_FLIP_TXN_MAX_LOCKS];
+	/*
+	 * EMBEDDED FOR THE COMMON SET, HEAP FOR THE WIDE ONE -- the shape
+	 * FT_FLIP_TXN_FLOOR_LOCKS prescribes, rather than a bigger fixed array.
+	 * G5.5's widening ADDS the member's ancestors, so a set can reach
+	 * FT_FLIP_TXN_MAX_LOCKS + FT_MAX_DEPTH; sizing the stack for that would
+	 * put ~8 KB on EVERY point op, including the overwhelming majority that
+	 * never widen at all, and point-op speed is the metric this step is
+	 * gated on.  So the ordinary set stays exactly as cheap as before and
+	 * only a genuinely wide one allocates.
+	 */
+	struct cds_ft_metadata **taken = taken_embed;
+	uintptr_t *taken_snap = taken_snap_embed;
+	void *taken_heap = NULL;
 	unsigned int nr_taken = 0;
 	struct ft_flip_txn *acq;
 	int i, nr_present = 0;
@@ -4946,7 +4981,30 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 		return 0;
 	if (ft_removeall_fault_refuse_acquire())
 		return -EAGAIN;		/* test-only; nothing acquired */
-	assert(nr_present <= FT_FLIP_TXN_MAX_LOCKS);
+	/*
+	 * ☠ A RUNTIME REFUSAL, NOT AN ASSERT.  The old assert is compiled out
+	 * under NDEBUG, and the bound it named is CALLER-DRIVEN and reachable:
+	 * that exact shape already produced a live defect once (a lock_fine
+	 * cds_ft_merge_at fences every overlapping internal node, overflowed at
+	 * 254, and under NDEBUG the first overflowing store clobbered @nr_locks
+	 * with a pointer's low word so the release sweep CASed through garbage).
+	 * Refusing here is SAFE in a way that dropping a registration is not --
+	 * NOTHING IS ACQUIRED YET, so there is no word whose release we would be
+	 * orphaning, and the caller's retry loop already handles -ENOMEM.
+	 */
+	if (caa_unlikely(nr_present > FT_DLM_ACQUIRE_MAX_SET))
+		return -ENOMEM;			/* nothing acquired */
+	if (caa_unlikely(nr_present > FT_ACQ_EMBED_LOCKS)) {
+		taken_heap = malloc((size_t) nr_present *
+				(sizeof(*taken) + sizeof(*taken_snap)));
+		if (!taken_heap)
+			return -ENOMEM;		/* nothing acquired */
+		taken = taken_heap;
+		taken_snap = (uintptr_t *) (taken + nr_present);
+#ifdef FT_DEBUG_FORCE_ACQ_HEAP
+		uatomic_inc(&ft_acq_heap_taken);
+#endif
+	}
 	/*
 	 * Up to one back-edge guard + one lock + one coarsened-node guard per
 	 * present member.  Dedupe only ever removes records, so this bound holds
@@ -4961,8 +5019,10 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 	 * starving removes against 4 for aging alone, complete separation).
 	 */
 	acq = ft_flip_txn_acquire_bounded(3 * nr_present);
-	if (!acq)
+	if (!acq) {
+		free(taken_heap);	/* allocated above; nothing acquired yet */
 		return -ENOMEM;
+	}
 	for (i = 0; i < nr; i++) {
 		struct cds_ft_metadata *node, *lock;
 		uintptr_t node_snap = 0, lock_snap, held_snap = 0;
@@ -5273,6 +5333,7 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 #ifdef FT_DEBUG_REMOVE_RETRY_CAP
 		ft_dbg_acq_cabort++;
 #endif
+		free(taken_heap);
 		return -EAGAIN;		/* commit freed @acq; nothing acquired */
 	}
 	for (i = 0; i < nr; i++) {
@@ -5353,9 +5414,11 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 #endif
 	}
 #endif
+	free(taken_heap);
 	return 0;
 eagain:
 	ft_flip_txn_destroy(acq);
+	free(taken_heap);
 	/*
 	 * RECORD the refusal for the op's retry loop; do not age here.  Aging at
 	 * this level too would count one contention event twice, and unevenly:

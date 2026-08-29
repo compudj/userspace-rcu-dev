@@ -319,6 +319,18 @@ __thread unsigned long ft_bulk_self_depth;
  */
 __thread struct ft_anc_ledger ft_anc_ledger;
 
+#ifdef FT_DEBUG_FORCE_ACQ_HEAP
+unsigned long ft_acq_heap_taken;
+
+__attribute__((destructor))
+static void ft_acq_heap_dump(void)
+{
+	fprintf(stderr, "FT ACQHEAP: overflow allocations taken = %lu%s\n",
+		ft_acq_heap_taken, ft_acq_heap_taken ? "" :
+		"  <-- PATH NEVER RAN: this build proves nothing");
+}
+#endif
+
 #ifdef FT_DEBUG_ANC_LEDGER
 unsigned long ft_anc_rec_descents, ft_anc_rec_entries;
 unsigned long ft_anc_rec_overflow, ft_anc_rec_disorder;

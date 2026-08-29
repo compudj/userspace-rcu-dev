@@ -1478,6 +1478,58 @@ build), so the honest statement is NOT DETECTABLE, not "0.8% faster".  The gate
 half adds a ~516-byte per-trie array and no point-op read, and that is what the
 number says.  ☞ Re-take this baseline once the widening actually reads the word.
 
+### G5.12 — the ACQUIRE BOUND is a RUNTIME REFUSAL; prerequisite 2 is INSEPARABLE from the widening
+
+**☑ PREREQUISITE 3 IS BUILT AND EXERCISED.**  `ft_dlm_acquire_set_at` sized its
+`taken[]` / `taken_snap[]` by FT_FLIP_TXN_MAX_LOCKS behind an assert COMPILED
+OUT UNDER NDEBUG, and G5.5's widening ADDS the member's ancestors, so a set can
+reach FT_FLIP_TXN_MAX_LOCKS + FT_MAX_DEPTH.  That is the shape which already
+produced a live defect once here (a lock_fine `cds_ft_merge_at` overflowed at
+254 and, under NDEBUG, the first overflowing store clobbered `@nr_locks` with a
+pointer's low word so the release sweep CASed through garbage).
+
+* **EMBEDDED ARRAY + HEAP OVERFLOW**, the shape FT_FLIP_TXN_FLOOR_LOCKS itself
+  prescribes -- NOT a bigger fixed array.  ★ Sizing the stack for the widened
+  worst case would put ~8 KB on EVERY point op, including the overwhelming
+  majority that never widen, and POINT-OP SPEED is the metric this step is gated
+  on (G5.10).  The ordinary set stays exactly as cheap as before.
+* **THE BOUND IS A RUNTIME REFUSAL** (`FT_DLM_ACQUIRE_MAX_SET`), not an assert.
+  ★ Refusing is SAFE HERE in a way that dropping a registration is not: NOTHING
+  IS ACQUIRED YET at that point, so there is no word whose release is orphaned
+  -- unlike `ft_flip_txn_lock_register`, which must `abort()` because a dropped
+  registration leaks a lock forever.
+* ☠ **AND THE PATH IS EXERCISED, NOT MERELY COMPILED.**  Until the widening
+  lands no caller presents a set past the embedded bound, so the overflow branch
+  would ship never having executed once -- unvisited, not covered.
+  `-DFT_DEBUG_FORCE_ACQ_HEAP` drops the embedded bound to 1 and sends
+  essentially every acquire down it.  Under ASAN with `detect_leaks=1`:
+
+      inv_rekey_contended_mixed_writers   170,615 overflow allocations, PASS
+      inv_concurrent_writers_disjoint                                   PASS
+      inv_rekey_fine_mixed_writers                                      PASS
+      AddressSanitizer / LeakSanitizer                                  CLEAN
+
+  The counter is what makes that green mean anything: a build reporting zero
+  allocations says so in words rather than passing quietly.
+
+**☠ PREREQUISITE 2 CANNOT LAND ON ITS OWN, and should not be attempted to.**
+The owner is settled (`ft_flip_txn_lock_own`, the hand-off `ft_rekey_cow_stop`
+already uses; `ctx->held.txn != NULL` covers the remove sites, and `insert` is
+the only site whose txn is not live at acquire time).  But `insert` creates its
+txn **BOUNDED** (`ft-insert.h:866`, `ft_flip_txn_create_bounded(ft, 15 +
+anchored + count_edges)`) AFTER the acquire at `:771`, and every widened hold
+needs a RELEASE EDGE in that reservation.  So producing the holds, SIZING the
+reservation for them, and recording their release are ONE edit -- and without
+the widening there is nothing to size, nothing to release, and nothing to test.
+⇒ prerequisite 2 lands WITH the widening, as one reviewable change.  Building it
+first would add an untestable path to the hottest point op, which is the same
+mistake the overflow branch above only avoided by being force-exercised.
+
+☞ **REMAINING, IN ORDER:** the widening itself (consuming the ledger from the
+published min level down, and handing its holds to the owner above), then the
+LIVENESS gate -- per-point-op abort/age histograms sampled INSIDE the attempt,
+which G5.9 established cannot be measured until the widened acquire exists.
+
 ---
 
 ## 3. Phase A — arm COARSE, then exclusive
