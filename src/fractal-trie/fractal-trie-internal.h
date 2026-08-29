@@ -2280,27 +2280,54 @@ void ft_excl_owner_reclaim(struct cds_ft *ft __attribute__((unused)),
 #endif
 
 /*
- * Take the FT-wide writer lock, parked OFFLINE.
+ * THE TWO WAITS ON THE FT-WIDE WRITER LOCK, AND WHY ONLY ONE OF THEM QUIESCES.
  *
- * MANDATORY, and the invariant is the one ft_writer_lock_gp_wait states: "writers
- * parked on the lock are RCU-online and non-quiescent, so they are precisely what
- * stops this grace period from ever completing."  Dropping the lock across a GP
- * (which gp_wait does) fixes only the SELF-deadlock -- a holder waiting on its own
- * waiters.  It does nothing about the group: N writers whose ops each contain a
- * grace period wedge each other, because whichever of them is parked here is an
- * online reader the GP waits for, and the GP is what the lock holder is waiting
- * on.  Measured: four concurrent cds_ft_rekey_graft writers on a COARSE trie made
- * ZERO moves, permanently, while three sat here and the call_rcu thread sat in
- * wait_for_readers.
+ * Both waits below block on the same fair mutex; they differ in what the
+ * WAITING THREAD is still answering for, so they differ in whether going
+ * RCU-offline is permitted.
  *
- * SAFE, because a park dereferences NOTHING and the caller already survives a full
- * grace period across it.  Under QSBR, synchronize_rcu marks its caller quiescent
- * for the duration anyway, so every pointer a writer holds across
- * ft_writer_lock_gp_wait is ALREADY exposed to reclamation and must already be
- * kept valid by the writer lock / exclusivity rather than by this thread's
- * online-ness.  Being offline for the subsequent park adds no exposure.  The
- * caller's own @node argument is app-owned and never library-reclaimed.  A no-op
- * on the memb / mb flavors.
+ *   ft_writer_lock_take()  SCOPE ENTRY -- stays ONLINE.  The caller may be
+ *                          inside its own RCU read-side critical section and
+ *                          may hold reader-derived references across the call;
+ *                          fractal-trie.h's reference-lifetime contract
+ *                          REQUIRES that section be continuous, because
+ *                          cds_ft_remove / cds_ft_replace dereference the
+ *                          caller's @node (via @node->prev) with no
+ *                          re-descent.  Under QSBR thread_offline() reports a
+ *                          quiescent state, so parking offline HERE would end
+ *                          that section and expose @node -- and the caller's
+ *                          key with it, since ft_iter_read_key() may return a
+ *                          pointer INTO @node.  So this wait does not quiesce.
+ *
+ *   ft_writer_lock_park()  gp_wait RE-ACQUIRE -- goes OFFLINE.  Sound here and
+ *                          only here: the thread has just waited out a full
+ *                          grace period, so everything it holds is ALREADY
+ *                          exposed to reclamation and must already be kept
+ *                          valid by the writer lock / exclusivity rather than
+ *                          by this thread's online-ness.  Being offline for
+ *                          the subsequent wait adds no exposure.
+ *
+ * WHAT THE ONLINE ENTRY WAIT COSTS, MEASURED (2026-08-28, -O2 -DNDEBUG, QSBR,
+ * inv_concurrent_writers_coarse_lock: 16 writers, one coarse trie, 200 ms):
+ * the lock runs ~75% utilized (5811 holds, mean 26 us), and a CONTENDED entry
+ * wait is p50 >= 524 us, p99 >= 1.05 ms, max 1.99 ms (31% of acquisitions are
+ * uncontended at ~32 ns).  An online waiter is a non-quiescent QSBR reader for
+ * exactly that long, so every grace period in the process is delayed by it.
+ * ACCEPTED DELIBERATELY (Mathieu, 2026-08-28): correctness of the caller's
+ * reference contract outranks grace-period latency on a coarse trie.
+ *
+ * ☠ IT IS A DELAY, NOT A WEDGE, and that is a property of the GRACE-PERIOD
+ * RULE above (@writer_lock): a holder NEVER waits on a grace period while
+ * holding, because ft_writer_lock_gp_wait drops the lock across every one.  So
+ * an online entry waiter is never waiting on a holder that is itself waiting
+ * on that waiter -- it acquires within queue-depth x hold and then completes.
+ * The group wedge 781e0b9a measured (four concurrent cds_ft_rekey_graft
+ * writers making ZERO moves) had THREE THREADS IN THE gp_wait RE-ACQUIRE, and
+ * that site keeps its offline park, so that fix is untouched.
+ *
+ * Both are a no-op distinction on the memb / mb / bp flavors, where
+ * thread_offline() is an empty function: those flavors have always waited
+ * online here, and their callers' read sections have always survived.
  */
 #ifdef FT_DEBUG_WLOCK_HOLD
 /*
@@ -2308,26 +2335,24 @@ void ft_excl_owner_reclaim(struct cds_ft *ft __attribute__((unused)),
  * MEASUREMENT (opt-in: -DFT_DEBUG_WLOCK_HOLD).  NOT part of the library.
  * =====================================================================
  *
- * PRICES THE ENTRY-PARK QUESTION.  ft_writer_lock_park takes the thread
- * OFFLINE across the wait, which under QSBR reports a quiescent state.  At
- * the gp_wait RE-ACQUIRE that is justified -- the caller has just survived a
- * grace period, so everything it holds is already exposed to reclamation.  At
- * the SCOPE-ENTRY site it is not: it quiesces a caller's read section that
- * include/urcu/fractal-trie.h requires be held CONTINUOUSLY, because
- * cds_ft_remove / cds_ft_replace dereference the caller's @node with no
- * re-descent.  The candidate fix is to wait ONLINE at that site -- whose
- * price is that the waiter stays NON-QUIESCENT for its whole WAIT, delaying
- * every grace period in the process for that long.
+ * PRICED THE ENTRY-WAIT DECISION, and it is the source of the numbers
+ * quoted in the two-waits comment above.  The entry wait now stays ONLINE
+ * (ft_writer_lock_take), so a waiter is a non-quiescent QSBR reader for its
+ * whole WAIT and delays every grace period in the process for that long.
+ * WAIT is therefore the grace-period latency the coarse path imposes, and
+ * HOLD is what generates it.  Re-run this whenever the coarse hold
+ * distribution could have moved -- the accepted cost is only as good as
+ * the distribution it was accepted against.
  *
- * So WAIT is the number that decision needs, and HOLD is what generates it.
- * Both are recorded in log2(ns) buckets and dumped at process exit.  There is
- * exactly one acquire path (ft_writer_lock_park, reached from both sites) and
+ * So WAIT is the number the decision needs, and HOLD is what generates it.
+ * Both are recorded in log2(ns) buckets and dumped at process exit.  There
+ * is exactly one acquire path (this function, reached from both sites) and
  * two release sites (scope_exit and gp_wait's drop).
  *
- * COARSE ONLY BY CONSTRUCTION: a FINE trie returns from
- * ft_writer_lock_scope_enter before the park, so a FINE run records ZERO --
- * which is a CONFIGURATION check, not a measurement.  Read the n= line before
- * reading anything else.
+ * ☠ COARSE ONLY BY CONSTRUCTION: a FINE trie returns from
+ * ft_writer_lock_scope_enter before the park, so a FINE run records ZERO
+ * -- which is a CONFIGURATION check, not a measurement.  Read the n= line
+ * before reading anything else.
  */
 #include <stdio.h>
 #include <time.h>
@@ -2411,26 +2436,43 @@ void ft_wlh_dump(void)
 }
 #endif /* FT_DEBUG_WLOCK_HOLD */
 
+#ifdef FT_DEBUG_WLOCK_HOLD
+# define FT_WLH_WAIT_BEGIN	uint64_t ft_wlh_t0 = ft_wlh_now()
+# define FT_WLH_WAIT_END						\
+	do {								\
+		uint64_t t1__ = ft_wlh_now();				\
+									\
+		ft_wlh_record(ft_wlh_wait, &ft_wlh_wait_n,		\
+				&ft_wlh_wait_sum, &ft_wlh_wait_max,	\
+				t1__ - ft_wlh_t0);			\
+		ft_wlh_acq_ns = t1__;					\
+	} while (0)
+#else
+# define FT_WLH_WAIT_BEGIN	do { } while (0)
+# define FT_WLH_WAIT_END	do { } while (0)
+#endif
+
+/* SCOPE ENTRY: stays ONLINE -- see the two-waits comment above. */
+static inline
+void ft_writer_lock_take(struct cds_ft *ft)
+{
+	FT_WLH_WAIT_BEGIN;
+
+	cds_fair_mutex_lock(&ft->writer_lock, &ft_wlock_waiter);
+	FT_WLH_WAIT_END;
+}
+
+/* gp_wait RE-ACQUIRE: goes OFFLINE -- see the two-waits comment above. */
 static inline
 void ft_writer_lock_park(struct cds_ft *ft)
 {
 	const struct rcu_flavor_struct *flavor = ft->group->flavor;
-#ifdef FT_DEBUG_WLOCK_HOLD
-	uint64_t t0 = ft_wlh_now();
-#endif
+	FT_WLH_WAIT_BEGIN;
 
 	flavor->thread_offline();
 	cds_fair_mutex_lock(&ft->writer_lock, &ft_wlock_waiter);
 	flavor->thread_online();
-#ifdef FT_DEBUG_WLOCK_HOLD
-	{
-		uint64_t t1 = ft_wlh_now();
-
-		ft_wlh_record(ft_wlh_wait, &ft_wlh_wait_n, &ft_wlh_wait_sum,
-				&ft_wlh_wait_max, t1 - t0);
-		ft_wlh_acq_ns = t1;	/* the sole acquire path: both sites */
-	}
-#endif
+	FT_WLH_WAIT_END;
 }
 
 /*
@@ -2520,7 +2562,7 @@ void ft_writer_lock_scope_enter(struct cds_ft *ft)
 		fflush(stderr);
 		abort();
 	}
-	ft_writer_lock_park(ft);
+	ft_writer_lock_take(ft);
 	ft_wlock_held = ft;
 	ft_wlock_depth = 1;
 }
