@@ -1759,6 +1759,53 @@ would take the root too.  The order that follows from the measurement is:
 **(1) per-op junction levels so ops stop taking the root, (2) re-take the A/B,
 (3) only then complete the owner plumbing.**
 
+### G5.16 — ☠ A STATIC PER-OP JUNCTION LEVEL IS UNSOUND: bulk ops REACH THE ROOT
+
+G5.15 made per-op levels a requirement.  The first question is whether an op can
+DECLARE one at all, and the gate's own design makes that strict: the level is
+**fixed at gate ENTRY** -- lowering it later owns a grace period, and the seam
+rule forbids one under a held lock -- so a declaration must bound the shallowest
+word the op will EVER lock, before its descent has run.
+
+The obvious bound is the op's KEY LENGTH: `cds_ft_graft`, `cds_ft_merge_at` and
+`cds_ft_detach_at` all take one, so the junction depth is a parameter and needs
+no descent.  ☠ **AND IT IS NOT SOUND, because recompaction CLIMBS** -- a DEL
+that empties a node recompacts its parent, which can cascade upward.  Measured
+at the acquire, for acquires made BY a bulk op (`ft_bulk_self_depth > 0`),
+asking only whether the set contains the trie ROOT:
+
+    arm         bulk acquires   members    reaching the ROOT
+    contended         442,483   513,610      71,127   (16.1%)
+    fine              471,342   547,132      75,790   (16.1%)
+
+**About one bulk acquire in six touches the root**, so a key-anchored
+declaration would be violated constantly and silently.
+☠ **READ IT QUALITATIVELY, NOT QUANTITATIVELY.**  Both arms hold 159-166 live
+keys and the ledger's depth maxes at 3-4, so almost everything is within a few
+hops of the root and 16% is a statement about THIS GEOMETRY.  What generalises
+is only the sign: the set is NOT confined below the junction, so a static
+declaration is unsound at any depth.  ★ Asking by IDENTITY rather than by depth
+is deliberate -- a member's `@depth` is 0 and meaningless at the shipping
+PER_NODE spacing (`ft_lock_ctx_depth_of` answers 0/true there), so a depth
+histogram would have measured the spacing instead of the op.
+
+☞ **THE FORK THIS LEAVES**, and it needs a decision rather than a default:
+1. **DECLARE + ENFORCE + RE-ENTER.**  The op declares from its key; an acquire
+   ABOVE the declared level REFUSES; the op then drops its locks, leaves the
+   gate, re-enters with a lower level and re-plans.  ★ It lands the cost on
+   BULK-OP LATENCY -- rare, and already slow -- which is where G5.10's governing
+   assumption says cost belongs, and it keeps point ops off the root in the
+   common case.  ☠ It is a NEW MECHANISM (a bulk op that fails its own
+   declaration), it costs a second grace period on every escalation, and the
+   enforcement predicate needs a depth the PER_NODE spacing does not supply.
+2. **DECLARE THE TRUE BOUND.**  Compute, before the gate, how far a climb could
+   reach.  ☠ No cheap bound is known; the worst case is the root, which is what
+   ships today.
+3. **LEAVE LEVEL 0** and accept the 5.8x while any bulk op is live, betting on
+   G5.10's assumption that bulk ops are INFREQUENT so the window is rare.  ☠
+   That is the honest reading of "the coarsest first step", but it means the
+   widening buys exclusion at a 5.8x point-op price whenever it is armed.
+
 ☞ **REVISED ORDER.**  (1) ☑ prerequisite 1 -- DONE; (2) the widening carrying
 prerequisite 2, whose owner is a per-SITE txn (`retire_txn` at recompact) rather
 than `ctx->held.txn`; (3) the liveness gate; (4) re-take the point-op baseline.

@@ -5128,6 +5128,17 @@ extern unsigned long ft_wo_led_ok, ft_wo_led_nodescent, ft_wo_led_norec;
 extern unsigned long ft_wo_led_superseded, ft_wo_led_overflow;
 extern unsigned long ft_wo_led_nr_max;
 /*
+ * ☠ CAN A BULK OP BOUND HOW SHALLOW IT LOCKS?  The gate's level is FIXED AT
+ * ENTRY -- lowering it later owns a grace period, which the seam rule forbids
+ * under a held lock -- so an op must declare a bound BEFORE its descent.  A
+ * key-anchored bound (key_len) is only sound if the op never locks ABOVE its
+ * junction, and recompaction CLIMBS: a DEL that empties a node recompacts its
+ * parent, which can cascade.  These count, for acquires made BY a bulk op,
+ * how often the set actually reaches the ROOT -- the level-0 case that a
+ * per-op level cannot improve on.
+ */
+extern unsigned long ft_bl_acq, ft_bl_root, ft_bl_members;
+/*
  * ☠ TWO EQUAL MARGINALS ARE NOT A JOINT.  "every acquire that can widen lacks
  * an owner" is a claim about the PAIR, and separate led_ok / txn_none counters
  * cannot make it -- they would read identically for a population where the two
@@ -5390,6 +5401,27 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 		return 0;
 #ifdef FT_DEBUG_WIDEN_OWNER
 	ft_wo_observe(fn, line, ft, ctx);
+	/*
+	 * HOW SHALLOW DOES A BULK OP ACTUALLY LOCK?  Only the ROOT is asked --
+	 * a member's @depth is 0 and meaningless at the shipping PER_NODE
+	 * spacing (ft_lock_ctx_depth_of answers 0/true there), so a depth
+	 * histogram would be measuring the spacing, not the op.  Reaching the
+	 * root is the case a per-op junction level cannot improve on, and it is
+	 * answerable by identity.
+	 */
+	if (ft_bulk_self_depth) {
+		struct cds_ft_inode_flag *root__ = (struct cds_ft_inode_flag *)
+				CMM_LOAD_SHARED(ft->root);
+		int j__;
+
+		uatomic_inc(&ft_bl_acq);
+		uatomic_add(&ft_bl_members, (unsigned long) nr_present);
+		for (j__ = 0; j__ < nr; j__++)
+			if (set[j__].nf && set[j__].nf == root__) {
+				uatomic_inc(&ft_bl_root);
+				break;
+			}
+	}
 #endif
 	if (ft_removeall_fault_refuse_acquire())
 		return -EAGAIN;		/* test-only; nothing acquired */

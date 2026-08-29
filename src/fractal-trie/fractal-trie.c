@@ -363,6 +363,7 @@ unsigned long ft_wo_led_ok, ft_wo_led_nodescent, ft_wo_led_norec;
 unsigned long ft_wo_led_superseded, ft_wo_led_overflow;
 unsigned long ft_wo_led_nr_max;
 unsigned long ft_wo_joint[4];
+unsigned long ft_bl_acq, ft_bl_root, ft_bl_members;
 #ifdef FT_FEATURE_WIDEN
 unsigned long ft_wd_acq, ft_wd_locks, ft_wd_dedup;
 unsigned long ft_wd_no_owner, ft_wd_no_ledger, ft_wd_locks_max;
@@ -437,6 +438,11 @@ static void ft_wo_dump(void)
 		ft_wo_joint[3], ft_wo_joint[2], ft_wo_joint[1], ft_wo_joint[0],
 		ft_wo_nod_remove_locked, ft_wo_nod_chain_head,
 		ft_wo_led_nodescent);
+	fprintf(stderr,
+		"  BULK-OP ACQUIRES: %lu (%lu members) | reaching the ROOT: "
+		"%lu%s\n",
+		ft_bl_acq, ft_bl_members, ft_bl_root,
+		ft_bl_acq ? "" : "  <-- none seen");
 #ifdef FT_FEATURE_WIDEN
 	/*
 	 * ☠ A WIDENING THAT DID NOT FIRE IS AN EXCLUSION GAP THAT SUCCEEDS AT
