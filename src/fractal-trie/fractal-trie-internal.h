@@ -2302,14 +2302,135 @@ void ft_excl_owner_reclaim(struct cds_ft *ft __attribute__((unused)),
  * caller's own @node argument is app-owned and never library-reclaimed.  A no-op
  * on the memb / mb flavors.
  */
+#ifdef FT_DEBUG_WLOCK_HOLD
+/*
+ * =====================================================================
+ * MEASUREMENT (opt-in: -DFT_DEBUG_WLOCK_HOLD).  NOT part of the library.
+ * =====================================================================
+ *
+ * PRICES THE ENTRY-PARK QUESTION.  ft_writer_lock_park takes the thread
+ * OFFLINE across the wait, which under QSBR reports a quiescent state.  At
+ * the gp_wait RE-ACQUIRE that is justified -- the caller has just survived a
+ * grace period, so everything it holds is already exposed to reclamation.  At
+ * the SCOPE-ENTRY site it is not: it quiesces a caller's read section that
+ * include/urcu/fractal-trie.h requires be held CONTINUOUSLY, because
+ * cds_ft_remove / cds_ft_replace dereference the caller's @node with no
+ * re-descent.  The candidate fix is to wait ONLINE at that site -- whose
+ * price is that the waiter stays NON-QUIESCENT for its whole WAIT, delaying
+ * every grace period in the process for that long.
+ *
+ * So WAIT is the number that decision needs, and HOLD is what generates it.
+ * Both are recorded in log2(ns) buckets and dumped at process exit.  There is
+ * exactly one acquire path (ft_writer_lock_park, reached from both sites) and
+ * two release sites (scope_exit and gp_wait's drop).
+ *
+ * COARSE ONLY BY CONSTRUCTION: a FINE trie returns from
+ * ft_writer_lock_scope_enter before the park, so a FINE run records ZERO --
+ * which is a CONFIGURATION check, not a measurement.  Read the n= line before
+ * reading anything else.
+ */
+#include <stdio.h>
+#include <time.h>
+
+#define FT_WLH_BUCKETS	40
+static unsigned long ft_wlh_hold[FT_WLH_BUCKETS];
+static unsigned long ft_wlh_wait[FT_WLH_BUCKETS];
+static unsigned long ft_wlh_hold_n, ft_wlh_wait_n;
+static unsigned long ft_wlh_hold_sum, ft_wlh_wait_sum;
+static unsigned long ft_wlh_hold_max, ft_wlh_wait_max;
+static __thread uint64_t ft_wlh_acq_ns;
+
+static inline
+uint64_t ft_wlh_now(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t) ts.tv_sec * 1000000000ULL + (uint64_t) ts.tv_nsec;
+}
+
+static inline
+void ft_wlh_record(unsigned long *hist, unsigned long *n, unsigned long *sum,
+		unsigned long *max, uint64_t ns)
+{
+	unsigned int b = 0;
+	uint64_t v = ns;
+
+	while (v >>= 1)
+		b++;
+	if (b >= FT_WLH_BUCKETS)
+		b = FT_WLH_BUCKETS - 1;
+	uatomic_inc(&hist[b]);
+	uatomic_inc(n);
+	uatomic_add(sum, (unsigned long) ns);
+	if (ns > uatomic_load(max, CMM_RELAXED))
+		uatomic_store(max, (unsigned long) ns, CMM_RELAXED);
+}
+
+static
+void ft_wlh_dump_one(const char *tag, const unsigned long *hist,
+		unsigned long n, unsigned long sum, unsigned long max)
+{
+	unsigned long cum = 0, p50 = 0, p90 = 0, p99 = 0;
+	unsigned int i;
+
+	fprintf(stderr, "FT WLOCK %s: n=%lu mean=%luns max=%luns\n",
+		tag, n, n ? sum / n : 0UL, max);
+	for (i = 0; i < FT_WLH_BUCKETS; i++) {
+		if (!hist[i])
+			continue;
+		cum += hist[i];
+		if (!p50 && cum * 100 >= n * 50)
+			p50 = 1UL << i;
+		if (!p90 && cum * 100 >= n * 90)
+			p90 = 1UL << i;
+		if (!p99 && cum * 100 >= n * 99)
+			p99 = 1UL << i;
+		fprintf(stderr, "  >=2^%-2u (%12lu ns) %10lu\n",
+			i, 1UL << i, hist[i]);
+	}
+	/* log2 buckets: each percentile is a LOWER bound, exact to 2x. */
+	fprintf(stderr, "FT WLOCK %s: p50>=%luns p90>=%luns p99>=%luns\n",
+		tag, p50, p90, p99);
+}
+
+__attribute__((destructor))
+static
+void ft_wlh_dump(void)
+{
+	if (!ft_wlh_hold_n && !ft_wlh_wait_n) {
+		fprintf(stderr, "FT WLOCK: NO SAMPLES -- the FT-wide lock was "
+			"never taken (a FINE or exclusive trie).  This is a "
+			"configuration miss, not a measurement.\n");
+		return;
+	}
+	ft_wlh_dump_one("HOLD", ft_wlh_hold, ft_wlh_hold_n, ft_wlh_hold_sum,
+			ft_wlh_hold_max);
+	ft_wlh_dump_one("WAIT", ft_wlh_wait, ft_wlh_wait_n, ft_wlh_wait_sum,
+			ft_wlh_wait_max);
+}
+#endif /* FT_DEBUG_WLOCK_HOLD */
+
 static inline
 void ft_writer_lock_park(struct cds_ft *ft)
 {
 	const struct rcu_flavor_struct *flavor = ft->group->flavor;
+#ifdef FT_DEBUG_WLOCK_HOLD
+	uint64_t t0 = ft_wlh_now();
+#endif
 
 	flavor->thread_offline();
 	cds_fair_mutex_lock(&ft->writer_lock, &ft_wlock_waiter);
 	flavor->thread_online();
+#ifdef FT_DEBUG_WLOCK_HOLD
+	{
+		uint64_t t1 = ft_wlh_now();
+
+		ft_wlh_record(ft_wlh_wait, &ft_wlh_wait_n, &ft_wlh_wait_sum,
+				&ft_wlh_wait_max, t1 - t0);
+		ft_wlh_acq_ns = t1;	/* the sole acquire path: both sites */
+	}
+#endif
 }
 
 /*
@@ -2424,6 +2545,10 @@ void ft_writer_lock_scope_exit(struct cds_ft *ft)
 	if (--ft_wlock_depth != 0)
 		return;			/* nested scope: keep the lock held */
 	ft_wlock_held = NULL;
+#ifdef FT_DEBUG_WLOCK_HOLD
+	ft_wlh_record(ft_wlh_hold, &ft_wlh_hold_n, &ft_wlh_hold_sum,
+			&ft_wlh_hold_max, ft_wlh_now() - ft_wlh_acq_ns);
+#endif
 	(void) cds_fair_mutex_unlock(&ft->writer_lock, &ft_wlock_waiter);
 }
 
@@ -2474,6 +2599,10 @@ void ft_writer_lock_gp_wait(struct cds_ft *ft)
 		own = ft_excl_owner_release(held);
 		ft_wlock_held = NULL;
 		ft_wlock_depth = 0;
+#ifdef FT_DEBUG_WLOCK_HOLD
+		ft_wlh_record(ft_wlh_hold, &ft_wlh_hold_n, &ft_wlh_hold_sum,
+				&ft_wlh_hold_max, ft_wlh_now() - ft_wlh_acq_ns);
+#endif
 		(void) cds_fair_mutex_unlock(&held->writer_lock, &ft_wlock_waiter);
 	}
 	/*
