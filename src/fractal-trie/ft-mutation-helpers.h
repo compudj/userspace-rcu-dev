@@ -100,6 +100,17 @@ extern __thread struct ft_anc_ledger ft_anc_ledger;
  */
 extern unsigned long ft_anc_rec_descents, ft_anc_rec_entries;
 extern unsigned long ft_anc_rec_overflow, ft_anc_rec_disorder;
+/*
+ * ☠ PUSHES MADE BY A **COPIED** DESCENT.  The generation stamp answers "which
+ * descent filled this"; it does NOT answer "did a COPY of that descent keep
+ * APPENDING to it".  ft_detach_node copies the caller's descent and the orphan
+ * walk extends the copy through ft_walk_extend -> ft_descent_enter_node, which
+ * pushes BEFORE the per-node early return -- so the orphan branch lands in the
+ * ledger under the ORIGINAL generation and ft_anc_ledger_valid still vouches
+ * for it.  Non-zero here means the ledger a widening would read describes the
+ * key path AND a subtree this op is tombstoning.
+ */
+extern unsigned long ft_anc_rec_copy_push;
 #endif
 
 /* Returns the generation the calling descent must remember. */
@@ -179,9 +190,23 @@ struct ft_descent {
 	 */
 	bool anc_rec;
 	/*
-	 * The ledger generation this descent filled, meaningful only while
-	 * @anc_rec.  A consumer compares it against the ledger's own before
-	 * reading a single entry (ft_anc_ledger_valid).
+	 * THE READ CREDENTIAL, and it is deliberately NOT @anc_rec.
+	 *
+	 * ☠ THE TWO ROLES ARE DIFFERENT AND CONFLATING THEM CORRUPTS THE
+	 * LEDGER.  @anc_rec says "this descent may WRITE"; @anc_gen says "the
+	 * ledger is still the one this descent's path produced, so it may be
+	 * READ".  A descent COPY (ft_detach_node's @wd, and the orphan walk's
+	 * @wwd taken from it) must keep the second and LOSE THE FIRST: the walk
+	 * extends the copy through ft_walk_extend -> ft_descent_enter_node,
+	 * whose push sits before the per-node early return, so a copy that kept
+	 * @anc_rec would APPEND THE ORPHANED SUBTREE to the key path under the
+	 * ORIGINAL generation -- and the stamp would still vouch for it.
+	 * Measured: supplying a descent to the per-node remove path turned that
+	 * from dormant into 13 copied pushes and 13 disorder events in one
+	 * two-second arm.
+	 *
+	 * Zero means "no ledger of mine", which is what a non-recording descent
+	 * init leaves and what makes the predicate fail closed.
 	 */
 	unsigned long anc_gen;
 	struct cds_ft_inode_flag *nf;		/* Current node-flag value. */
@@ -4995,6 +5020,12 @@ bool ft_dlm_covering_release_recorded(const struct ft_lock_ctx *ctx,
  *   SUPERSEDED      a later ft_descent_init on this thread refilled it, or it
  *                   was filled for ANOTHER TRIE (the mixed arms run two).
  *
+ * ☠ AND A FOURTH THIS PREDICATE CANNOT SEE -- RECORDED THE WRONG BRANCH.  The
+ * stamp has no PATH term, so a descent that walked the key's forward branch
+ * while the op mutates a holder its stale back-edge names still passes here.
+ * That one is closed at the PRODUCER instead: the site hands its descent to the
+ * lock context only when the walk demonstrably PASSED the holder.
+ *
  * Each leaves a ledger that is populated and self-consistent and describes the
  * WRONG PATH -- so a widening built on it locks the wrong ancestors and takes
  * every one of them successfully.  That is an exclusion gap with no symptom,
@@ -5005,7 +5036,7 @@ bool ft_dlm_covering_release_recorded(const struct ft_lock_ctx *ctx,
 static inline
 bool ft_anc_ledger_valid(const struct cds_ft *ft, const struct ft_descent *d)
 {
-	return d && d->anc_rec && !ft_anc_ledger.overflow &&
+	return d && d->anc_gen && !ft_anc_ledger.overflow &&
 		ft_anc_ledger.ft == ft && ft_anc_ledger.gen == d->anc_gen;
 }
 

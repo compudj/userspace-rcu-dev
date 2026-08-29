@@ -334,6 +334,7 @@ static void ft_acq_heap_dump(void)
 #ifdef FT_DEBUG_ANC_LEDGER
 unsigned long ft_anc_rec_descents, ft_anc_rec_entries;
 unsigned long ft_anc_rec_overflow, ft_anc_rec_disorder;
+unsigned long ft_anc_rec_copy_push;
 
 __attribute__((destructor))
 static void ft_anc_rec_dump(void)
@@ -346,8 +347,9 @@ static void ft_anc_rec_dump(void)
 		return;
 	}
 	fprintf(stderr, "FT ANCLEDGER: recording descents=%lu entries=%lu "
-		"overflow=%lu disorder=%lu\n", ft_anc_rec_descents,
-		ft_anc_rec_entries, ft_anc_rec_overflow, ft_anc_rec_disorder);
+		"overflow=%lu disorder=%lu copy_push=%lu\n", ft_anc_rec_descents,
+		ft_anc_rec_entries, ft_anc_rec_overflow, ft_anc_rec_disorder,
+		ft_anc_rec_copy_push);
 }
 #endif
 

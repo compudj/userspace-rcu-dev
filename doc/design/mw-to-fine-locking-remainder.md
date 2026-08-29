@@ -1653,11 +1653,63 @@ be a feature-flag-matrix miss reported as a measurement); and `lock_fine` +
 `lock_spacing` on every site row, so a dump that aggregates coarse and fine arms
 is readable rather than silently mixed.
 
-☞ **REVISED ORDER.**  (1) finish prerequisite 1 -- run the anchor descent when a
-bulk op is live, at the sites that skip it at PER_NODE; (2) THEN the widening
-carrying prerequisite 2, whose owner is a per-SITE txn (`retire_txn` at
-recompact) rather than `ctx->held.txn`; (3) the liveness gate; (4) re-take the
-point-op baseline.
+### G5.14 — ☑ PREREQUISITE 1 IS COMPLETE, and finishing it EXPOSED a silent ledger corruption
+
+**THE ARM.**  `_cds_ft_remove_locked` gains a third arm: at PER_NODE, when a bulk
+op is live, descend for the LEDGER.  Deliberately NOT the coarse arm's body --
+that one RETARGETS the holder and can demand a retry, a coarse-spacing
+correction this spacing has never taken and that nothing measures here, so
+`@holder_flag`, `@holder_depth` and `@need_retry` are left exactly as the handle
+derived them.  ☠ But only the RETARGET is dropped, never the VALIDATION: the
+descent reaches the lock context only when the walk demonstrably PASSED the
+holder and no reanchor rewind occurred (`@skip_conflict`).  A holder the descent
+did not pass is one the back-edge names STALELY -- the arm above measures that
+lane at 78% of its recoveries -- so the recorded path would be the key's FORWARD
+branch while the op mutates the other one, and **the ledger stamp has no path
+term to catch that**.  On a mismatch the context gets NO descent, the widening
+refuses, and the op's retry loop re-derives.
+
+    ledger verdict at the acquire     BEFORE            AFTER
+    live acquires                 420,671 / 306,215  557,041 / 320,419
+    VALID                         219,569 / 159,284  557,041 / 320,419
+    NO DESCENT                    201,102 / 146,931          0 / 0
+    led_bad, every site                    non-zero          0 / 0
+
+**☠☠ AND IT ACTIVATED A DORMANT CORRUPTION -- caught by an adversarial review
+BEFORE it landed, then MEASURED.**  `ft_detach_node` COPIES the caller's descent
+and the orphan walk extends the copy through `ft_walk_extend` ->
+`ft_descent_enter_node`, whose ledger push sits BEFORE the per-node early
+return.  So a copy that kept `@anc_rec` FILES THE ORPHANED SUBTREE onto the key
+path **under the original generation**, and `ft_anc_ledger_valid` still vouches
+for the result.  It was dormant only because the descent was missing -- the very
+gap this arm closes.  Measured with a copied-push counter: **0 before the arm,
+13 copied pushes and 13 disorder events with it**, in one two-second run.
+
+☑ **CLOSED BY SPLITTING THE CREDENTIAL.**  `@anc_rec` means "may WRITE";
+`@anc_gen` means "may READ".  A copy keeps the second and loses the first, so it
+can consume the ledger and can never append to it.  Re-measured: `copy_push = 0`,
+`disorder = 0`, over 4.1M ledger entries, with `led_ok == live` exactly.
+★ The two roles had been conflated since the ledger landed; nothing could see it
+while no descent reached the copy.
+☠ `ft_walk_extend`'s header still claimed "a no-op under per-node granularity" --
+false since the push was hoisted above that return, and a stale mechanism on a
+true claim is the worst shape.  Corrected.
+
+**☐ NOT APPLIED AT THE CHAIN-HEAD SITE** (`ft-remove.h:5470`), and the reason is
+not that it measured zero.  `cds_ft_remove_all` has **NO RETRY LOOP** -- it calls
+`_cds_ft_remove_all_locked` once and maps -EAGAIN to a user-visible
+BUSY/MEMORY error -- so a widening refusal there would turn an op that succeeds
+today into a hard failure.  That site needs its own answer (an internal
+re-descend, or unconditional descent semantics) before it can widen at all.
+
+☞ **REVISED ORDER.**  (1) ☑ prerequisite 1 -- DONE; (2) the widening carrying
+prerequisite 2, whose owner is a per-SITE txn (`retire_txn` at recompact) rather
+than `ctx->held.txn`; (3) the liveness gate; (4) re-take the point-op baseline.
+☠ Point-op steady state is untouched (one `caa_unlikely` load `ft_descent_init`
+already pays); inside a bulk window a remove now pays one extra key descent,
+which is what every coarse spacing and the tombstone recovery already pay, and
+there is no cheaper correct source -- the back-pointer climb is refuted twice
+over (absolute depth unrecoverable; back-edges lazily stale).
 
 ---
 
