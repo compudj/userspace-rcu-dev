@@ -887,9 +887,7 @@ holding J across a GP was a deadlock and no park could fix it.
    targets).  Those stay safe only while NO NODE LOCK is held across them —
    `internal.h:1811`, "the GP always sits at a seam BETWEEN two distinct
    commits".  Under (F) a point op spinning on a widened set IS the reader such
-   a GP would wait for.  ☐ **The invariant is OBSERVED BUT UNENFORCED** (the
-   probe that measured it at zero holding was never committed); it needs an ARM
-   on the `FEATURE_FT_HOLD_TRACE` ledger, which IS in the tree.
+   a GP would wait for.  ☑☑ **ARMED @`d48b5c94`, AND IT HOLDS** — see G5.8.
 
 **☠☠ WHAT WAS REFUTED GETTING HERE — do not re-tread:**
 * **The Phase-D park prerequisite is DISSOLVED, not satisfied.**  §2 (E) recorded
@@ -1035,9 +1033,9 @@ EVERY variant.**  The bulk op's mid-edit drain GPs (`ft_writer_lock_gp_wait`,
 7 live sites) run while point ops may be spinning on a word the bulk op holds;
 those point ops CANNOT quiesce, so such a GP would never complete.  What makes
 it safe is the SEAM RULE — no NODE lock is held across a GP,
-`internal.h:1811` — which is **OBSERVED BUT UNENFORCED**.  ⇒ **ARMING THE SEAM
-RULE IS THE CONCRETE FIRST TASK, and it is prerequisite to (B)/(F)/(E) alike**;
-the `FEATURE_FT_HOLD_TRACE` ledger is in the tree and is the place to hang it.
+`internal.h:1811`.  ☑☑ **NO LONGER AN ASSUMPTION — ARMED @`d48b5c94` and
+measured CLEAN with coverage (G5.8).**  It was the prerequisite shared by
+(B)/(E)/(F) alike, and it is discharged.
 
 ### G5.6 — ☞ EXPLORING: the tier-2 refinement, a PER-NODE BULK REFCOUNT (Mathieu, 2026-08-28)
 
@@ -1164,6 +1162,38 @@ engine-owned, so a republish carries it as a recorded edge — would satisfy bot
 halves at once.  ☐ UNVETTED: it re-opens the SW-park question the own-word
 choice was made to escape, and nobody has checked whether a counter can be a
 flip-txn edge at all.  Do not build on it before it is skepticked.
+
+### G5.8 — ☑☑ THE SEAM RULE IS ARMED, AND IT HOLDS (@`d48b5c94`)
+
+The prerequisite every G5 variant shared is discharged.  The arm runs at the
+two sites a writer waits for a GP — `ft_writer_lock_gp_wait` (which all seven
+bulk mid-edit drains route through) and `ft_move_gate_enter` — and asserts that
+this thread holds NO node lock across it.  It changes no behaviour.
+
+★ **EXACT, not over-reporting, which is what makes its zeros worth anything.**
+The hold ledger over-reports by construction (a commit that CONSUMED a fence
+leaves its entry behind), so an entry alone would fire on words a peer has
+since legitimately taken.  Two facts together are exact: the entry's word still
+carries `FT_STATE_LOCK` **and** the member's `dbg_owner_tid` is still OURS.
+Both already existed — no new state.
+
+    RED CONTROL (-DFT_RED_SEAM, checked right after an acquire files
+    its locks, where they provably ARE held):
+        ft_unit      1,360,090 checks   2,732,148 violations   ✅ live
+    GREEN:
+        ft_unit            728 checks           0 violations
+        ft_inv MW    2,267,316 checks           0 violations
+
+☠ The CALL counter is the half that makes the zero legible — an earlier version
+of this probe reported 0 on three tests it had entered 0, 0 and 1 times.
+Gate: identical per leg to the pre-arm run, zero aborts; the `holdtrace` config
+is clean at ALL THREE lock spacings, which is the stronger reading since coarse
+anchoring holds node locks more widely than per-node does.
+
+⇒ The bulk op's mid-edit drains do sit at commit seams, as the design assumed.
+☐ What the arm does NOT do: it observes the CURRENT tree.  It is a regression
+detector for the moment a G5 mechanism starts holding a widened lock across one
+of those drains — which is precisely when it will matter.
 
 ★ **WHERE (F) POINTED, from G5.4 ground 2:** the MOVE GATE is already the
 "flip a mode with ONE amortized GP" primitive this needs — it publishes
@@ -3144,9 +3174,11 @@ stale) — watch it across Phase B, it shares words with the converted sites.
                                                               (no node lock held across a GP,
                                                               internal.h:1811) -- the bulk op's
                                                               7 mid-edit drain GPs are safe ONLY
-                                                              under it, and it is observed but
-                                                              UNENFORCED.  Hang it on
-                                                              FEATURE_FT_HOLD_TRACE.
+                                                              under it.  ☑☑ ARMED @d48b5c94 and
+                                                              CLEAN: red control 2,732,148
+                                                              violations, green 2,267,316 checks /
+                                                              0 on ft_inv MW, gate identical per
+                                                              leg.  PREREQUISITE DISCHARGED.
                                                               ☑ DECIDED: a SEPARATE WRITER STATE
                                                               beside move_active, so readers keep
                                                               the FAST path for detach/graft.  That
@@ -3260,8 +3292,7 @@ stale) — watch it across Phase B, it shares words with the converted sites.
                                                               node lock held across a GP,
                                                               internal.h:1811) becomes
                                                               load-bearing for point-op
-                                                              liveness -- ☐ it needs an ARM on
-                                                              the FEATURE_FT_HOLD_TRACE ledger
+                                                              liveness -- ☑ ARMED @d48b5c94
                                                               ☐ open: the tier-1 word, the
                                                               flag's encoding, the seam arm
     E   spacing certification + gate lift + strategy fold   ☠ BLOCKED, and NOT on E.2 --
