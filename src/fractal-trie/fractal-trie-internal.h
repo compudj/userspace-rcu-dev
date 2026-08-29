@@ -3192,6 +3192,28 @@ unsigned int ft_bulk_min_level(const struct cds_ft *ft)
 }
 
 /*
+ * BOTH HALVES FROM ONE LOAD -- the form every widening site must use.  Returns
+ * whether any bulk op is live and, when it is, the shallowest level one of them
+ * locks at.
+ *
+ * ☠ The two accessors above answer one half each, and asking them in
+ * sequence is TWO loads of a word a peer is changing: a live refcount paired
+ * with a stale DEEPER level makes a point op widen from too far down, which is
+ * an exclusion gap -- and one that reports nothing, because every lock it does
+ * take succeeds.  That is why the pair is packed into one word at all.
+ */
+static inline
+bool ft_bulk_sample(const struct cds_ft *ft, unsigned int *min_level)
+{
+	unsigned long w = CMM_LOAD_SHARED(ft->bulk_state);
+
+	if (!(w >> FT_BULK_LEVEL_BITS))
+		return false;
+	*min_level = (unsigned int) (w & FT_BULK_LEVEL_MASK);
+	return true;
+}
+
+/*
  * Which words a bulk op publishes.  Only a REKEY needs reader coherence; every
  * other bulk op publishes the writer word alone.
  */
@@ -3207,6 +3229,10 @@ enum ft_bulk_kind {
  * inner exit while the outer op is still live.
  */
 extern __thread unsigned long ft_bulk_self_depth;
+
+#ifdef FT_DEBUG_WIDEN_OWNER
+extern unsigned long ft_wo_gate_enters;
+#endif
 
 /*
  * Enter the move mode gate: publish "expect a move" to readers and make sure
@@ -3244,6 +3270,16 @@ void ft_bulk_gate_enter(struct cds_ft *ft, enum ft_bulk_kind kind,
 
 	if (level > FT_MAX_DEPTH)
 		level = FT_MAX_DEPTH;
+#ifdef FT_DEBUG_WIDEN_OWNER
+	/*
+	 * ☠ THE CONTROL FOR THE OTHER ZERO, and it must live under THIS flag.
+	 * Without it "no acquire ever saw a live bulk op" cannot be told from
+	 * "no bulk op ever ran" -- and the bulk-window instrument's own enter
+	 * counter is behind a DIFFERENT -D, so reading it here would be a
+	 * feature-flag-matrix miss reported as a measurement.
+	 */
+	uatomic_inc(&ft_wo_gate_enters);
+#endif
 	pthread_mutex_lock(&ft->move_gate_lock);
 #ifdef FT_DEBUG_BULK_WINDOW
 	/*

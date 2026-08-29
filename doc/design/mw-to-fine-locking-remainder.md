@@ -1530,6 +1530,124 @@ published min level down, and handing its holds to the owner above), then the
 LIVENESS gate -- per-point-op abort/age histograms sampled INSIDE the attempt,
 which G5.9 established cannot be measured until the widened acquire exists.
 
+### G5.13 — ☠☠ PREREQUISITE 1 IS NOT DONE: the ledger had no OWNER STAMP, and half the acquires that must widen HAVE NO DESCENT AT ALL
+
+G5.11 landed the ancestor ledger and G5.12 called prerequisite 1 discharged.
+Measurement says it is not.  Two gaps, neither of which the ledger commit could
+have seen, because nothing consumed the ledger yet and the question "is this
+ledger MINE?" had no way to be asked.
+
+**THE INSTRUMENT** (`-DFT_DEBUG_WIDEN_OWNER`, opt-in).  It widens NOTHING --
+the build takes exactly the locks it takes without it -- and only counts, at
+`ft_dlm_acquire_set_at`, what the widening WOULD find.  Its FIRST version was
+REFUTED by an adversarial review before any conclusion was drawn from it; what
+follows is the surviving half, and the refutations are recorded below because
+each names a limit the widening itself inherits.
+
+    arm (2 s, FT_INV_MW=1, -O2 -DNDEBUG)   contended        fine
+    acquires                                 866,646       778,511
+    gate enters                                  490        16,176
+    LIVE (bulk up, caller not bulk)          420,671       306,215
+    self_bulk (the caller IS the bulk op)    445,657       471,960
+    ---- release owner, a LOWER BOUND ----
+    ctx->held.txn (top frame)                201,101       146,897
+    an OUTER frame's txn                           0             0
+    no txn in ANY frame                      219,570       159,318
+    ---- ledger verdict ----
+    VALID                                    219,569       159,284
+    NO DESCENT (ctx->d == NULL)              201,102       146,931
+    not recording / superseded / overflow      0/0/0         0/0/0
+
+    SITE                                  live      txn_top   led_ok
+    ft_node_recompact          :1357   420,628      201,101  219,527
+    ft_insert_dlm_acquire_split: 771        42            0       42
+    ft_chain_compress_fused    :1021         1            0        0
+    ft_detach_orphan_planlock  : 705  (fine arm only, 33)  0        0
+
+**☠ GAP 1 -- THE LEDGER COULD NOT SAY WHOSE IT WAS.**  `@anc_rec` is sampled
+ONCE at `ft_descent_init` while the acquire samples the gate LIVE, and an op
+runs more than one descent (`ft_detach_node`'s orphan walk, `ft_anchor_descend`).
+A bulk op that goes live MID-DESCENT therefore hands an acquire "widen now" over
+a ledger some EARLIER descent on that thread left behind -- possibly another
+op's, and (the mixed arms run two tries) possibly another trie's.  The result is
+populated, self-consistent, and describes THE WRONG PATH, so the widening would
+lock the wrong ancestors and take every one of them successfully: an exclusion
+gap with no symptom.
+☑ CLOSED by a GENERATION STAMP -- `@gen` (per-thread, monotone) and `@ft` on the
+ledger, `@anc_gen` on the descent, and `ft_anc_ledger_valid()` as the predicate a
+consumer must call.  A descent COPY carries the generation it was copied from,
+which is what keeps a copy legal until a fresh `ft_descent_init` supersedes it.
+★ The measured verdict is now a FALSIFIABLE NEGATIVE, which it could not be
+before: `superseded = 0` and `not_recording = 0` over 726,886 live acquires,
+against `led_bad` NON-ZERO -- so the classifier is demonstrably not inert.
+
+**☠☠ GAP 2 -- 48% OF THE ACQUIRES THAT MUST WIDEN HAVE NO DESCENT.**  Not a
+stale ledger: no ledger at all, and none possible.  `ctx->d == NULL` at 201,102
+of 420,671 live acquires (146,931 of 306,215 in the fine arm), all of them at
+`ft_node_recompact`.  The cause is the SAME SHAPE the ledger commit fixed one
+level down: the shipping default's zero-cost path skips the work the widening
+needs.  `ft_descent_enter_node` returns before filling `anchor[]` at PER_NODE --
+fixed @`fb7e2ce5` by recording BEFORE that early return -- but the remove paths
+gate the anchor descent ITSELF on the spacing (`ft-remove.h:4514`, `:5470`:
+`if (ft->lock_spacing != CDS_FT_LOCK_SPACING_PER_NODE)`), so at the default they
+build their lock context with NO descent whatsoever and there is nothing to
+record.  ⇒ prerequisite 1 needs those descents to run whenever a bulk op is
+live, exactly as the ledger recording does.
+
+**★ AND THE TWO HALVES ARE AN EXACT PARTITION**, which is the finding that
+reorders the work.  At `ft_node_recompact` the acquire either
+* HAS a descent -> the ledger is valid -> it CAN widen -> and `ctx->held.txn` is
+  NULL (219,527 / 219,527); or
+* HAS a `ctx->held.txn` -> and NO descent -> it cannot widen at all
+  (201,101 / 201,101).
+
+So there is no acquire in these arms that both can widen and carries its owner
+in the ctx.  Prerequisite 2 is not the next blocker; prerequisite 1 is.
+
+**☠ G5.12's RELEASE-OWNER PREDICATE IS REFUTED -- as a PREDICATE, not as a
+plan.**  "`ctx->held.txn != NULL` covers the remove sites; `insert` is the ONLY
+site needing plumbing" is false twice over.  By weight, `insert` is 42 of 420,671
+live acquires and `ft_node_recompact` is 420,628.  And `ctx->held.txn` is not the
+ownership question at all: `ft_node_recompact`'s release owner is its
+`@retire_txn` PARAMETER -- non-NULL by its own acquire's guard
+(`ft-mutation-node.h:1252`, `if (ft->lock_fine && retire_txn && ...)`) and
+already the owner it registers C/P/GP releases on (`:2400`, `:2430`) -- which sits
+in no ctx frame.  The detach family is the same shape the other way round: it
+ACQUIRES FIRST AND HANDS OFF LATER (`ft_flip_txn_lock_own`, `ft-remove.h:573`),
+stitching the txn into `lctx.held.txn` only afterwards (`:2409`, `:2991`, `:3185`).
+⇒ the counter's `txn_none` is a LOWER BOUND on ownership and must never be read
+as "no owner exists".
+
+**☠ WHAT THIS INSTRUMENT CANNOT ANSWER, recorded so no one reads it as if it
+could.**
+1. **HOW WIDE the widened set is.**  Every gate entry in the tree passes level 0
+   (`ft-detach.h:646`, `ft-graft.h:2591` / `:2842`, `ft-merge.h:3753`,
+   `ft_move_gate_enter`), so `ft_bulk_min_level()` is CONSTANTLY 0, "from the min
+   level down" filters nothing, and the count is the arm's KEY DEPTH (max 4 and
+   3 here) rather than a design quantity.  It is reported under that name.  ☠ And
+   it must not size anything: the bound is STRUCTURAL
+   (`FT_DLM_ACQUIRE_MAX_SET`), and replacing a structural bound with a measured
+   maximum is the defect class that fired at 254 (§ the MAX_LOCKS overflow).
+2. **WHETHER A SITE IS THE ONLY ONE.**  Reachability is a code fact; a site
+   absent from the table was not exercised by the arm.
+3. **RATIOS.**  Every counter is a process-wide atomic on the acquire path, so
+   the instrument perturbs what it measures (G5.9 paid 2x for this).  EXISTENCE
+   and MAXIMA survive; percentages do not.
+
+**☑ THE CONTROLS THE FIRST VERSION LACKED**, each answering a zero that would
+otherwise be unfalsifiable: `acq_total` (the choke point ran at all -- a
+non-`lock_fine` trie makes every number below vacuous); `gate_enters`, bumped
+inside `ft_bulk_gate_enter` UNDER THE SAME `-D` (a different flag's counter would
+be a feature-flag-matrix miss reported as a measurement); and `lock_fine` +
+`lock_spacing` on every site row, so a dump that aggregates coarse and fine arms
+is readable rather than silently mixed.
+
+☞ **REVISED ORDER.**  (1) finish prerequisite 1 -- run the anchor descent when a
+bulk op is live, at the sites that skip it at PER_NODE; (2) THEN the widening
+carrying prerequisite 2, whose owner is a per-SITE txn (`retire_txn` at
+recompact) rather than `ctx->held.txn`; (3) the liveness gate; (4) re-take the
+point-op baseline.
+
 ---
 
 ## 3. Phase A — arm COARSE, then exclusive

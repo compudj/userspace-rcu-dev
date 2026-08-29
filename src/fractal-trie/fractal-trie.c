@@ -351,6 +351,85 @@ static void ft_anc_rec_dump(void)
 }
 #endif
 
+#ifdef FT_DEBUG_WIDEN_OWNER
+struct ft_wo_site ft_wo_site_tbl[FT_WO_SITES];
+unsigned long ft_wo_site_overflow;
+unsigned long ft_wo_acq_total, ft_wo_gate_enters;
+unsigned long ft_wo_live, ft_wo_self_bulk;
+unsigned long ft_wo_txn_top, ft_wo_txn_chain, ft_wo_txn_none;
+unsigned long ft_wo_led_ok, ft_wo_led_nodescent, ft_wo_led_norec;
+unsigned long ft_wo_led_superseded, ft_wo_led_overflow;
+unsigned long ft_wo_led_nr_max;
+
+__attribute__((destructor))
+static void ft_wo_dump(void)
+{
+	unsigned int i;
+
+	/*
+	 * THREE ZEROS THAT LOOK ALIKE AND MEAN DIFFERENT THINGS, separated
+	 * here rather than left for a reader to guess:
+	 *   no acquire            the choke point never ran -- a configuration
+	 *                         miss (not a lock_fine trie), everything below
+	 *                         is vacuous;
+	 *   no gate enter         no bulk op ran at all -- a statement about
+	 *                         the ARM;
+	 *   gates but no overlap  bulk ops ran and never coincided with an
+	 *                         acquire -- a statement about the WORKLOAD,
+	 *                         and the only one of the three that is a
+	 *                         result.
+	 */
+	if (!ft_wo_acq_total) {
+		fprintf(stderr, "FT WIDENOWNER: THE ACQUIRE CHOKE POINT NEVER "
+			"RAN -- this build proves nothing.  Run a lock_fine "
+			"trie.\n");
+		return;
+	}
+	if (!ft_wo_gate_enters) {
+		fprintf(stderr, "FT WIDENOWNER: %lu acquires, and NO BULK OP "
+			"EVER ENTERED THE GATE -- a CONFIGURATION MISS, not a "
+			"measurement: run concurrent bulk and point ops.\n",
+			ft_wo_acq_total);
+		return;
+	}
+	if (!ft_wo_live) {
+		fprintf(stderr, "FT WIDENOWNER: %lu acquires, %lu gate enters, "
+			"but NONE OVERLAPPED (self_bulk %lu) -- the widening "
+			"would never have fired in this workload.\n",
+			ft_wo_acq_total, ft_wo_gate_enters, ft_wo_self_bulk);
+		return;
+	}
+	fprintf(stderr,
+		"FT WIDENOWNER: acquires=%lu gate_enters=%lu live=%lu "
+		"self_bulk=%lu\n"
+		"  release owner (LOWER BOUND -- a site's txn need not be in "
+		"any ctx frame):\n"
+		"                  txn_top=%lu txn_chain=%lu txn_none=%lu\n"
+		"  ledger verdict: ok=%lu | no_descent=%lu not_recording=%lu "
+		"superseded=%lu overflow=%lu\n"
+		"  ledger nr max=%lu  <-- KEY DEPTH, *not* a lock-set size "
+		"(every gate entry passes level 0)\n"
+		"  site table:     overflow=%lu\n",
+		ft_wo_acq_total, ft_wo_gate_enters, ft_wo_live, ft_wo_self_bulk,
+		ft_wo_txn_top, ft_wo_txn_chain, ft_wo_txn_none,
+		ft_wo_led_ok, ft_wo_led_nodescent, ft_wo_led_norec,
+		ft_wo_led_superseded, ft_wo_led_overflow,
+		ft_wo_led_nr_max, ft_wo_site_overflow);
+	for (i = 0; i < FT_WO_SITES; i++) {
+		struct ft_wo_site *s = &ft_wo_site_tbl[i];
+
+		if (!s->fn || !s->live)
+			continue;
+		fprintf(stderr, "  SITE %-34s:%-5d live=%-9lu top=%-9lu "
+			"chain=%-7lu none=%-9lu led_ok=%-9lu led_bad=%-7lu "
+			"fine=%lu spacing=%lu\n",
+			s->fn, s->line, s->live, s->txn_top, s->txn_chain,
+			s->txn_none, s->led_ok, s->led_bad, s->fine,
+			s->spacing);
+	}
+}
+#endif
+
 void _cds_ft_debug_move_gate_enter(struct cds_ft *ft)
 {
 	ft_move_gate_enter(ft);

@@ -59,6 +59,25 @@ struct ft_lock_anchor {
  * the steady-state cost is ONE PREDICTABLE BRANCH per level (@rec false).
  */
 struct ft_anc_ledger {
+	/*
+	 * WHICH DESCENT FILLED THIS, and of WHICH TRIE.  ☠ Without them the
+	 * ledger is UNFALSIFIABLE at the point that consumes it.  @anc_rec is
+	 * sampled ONCE, at ft_descent_init, while the acquire samples the gate
+	 * LIVE -- so a bulk op that becomes live MID-DESCENT gives an acquire
+	 * "widen now" over a ledger some EARLIER descent on this thread left
+	 * behind, possibly of another op and (the mixed arms run two tries)
+	 * another trie.  Every ancestor the widening then locked would be the
+	 * wrong one, and it would take them all successfully: an exclusion gap
+	 * that reports nothing.
+	 *
+	 * @gen is per-thread and monotone, so equality with the descent's copy
+	 * says "no later descent has run on this thread since"; @ft says "and
+	 * it was this trie's path".  A descent COPY (ft_detach_node's @wd)
+	 * carries the generation it was copied from, which is what makes a copy
+	 * legal until a fresh ft_descent_init supersedes it.
+	 */
+	unsigned long gen;
+	const struct cds_ft *ft;
 	unsigned int nr;
 	bool overflow;		/* deeper than FT_MAX_DEPTH: refuse, never truncate */
 	struct {
@@ -83,14 +102,17 @@ extern unsigned long ft_anc_rec_descents, ft_anc_rec_entries;
 extern unsigned long ft_anc_rec_overflow, ft_anc_rec_disorder;
 #endif
 
+/* Returns the generation the calling descent must remember. */
 static inline
-void ft_anc_ledger_reset(void)
+unsigned long ft_anc_ledger_reset(const struct cds_ft *ft)
 {
 	ft_anc_ledger.nr = 0;
 	ft_anc_ledger.overflow = false;
+	ft_anc_ledger.ft = ft;
 #ifdef FT_DEBUG_ANC_LEDGER
 	uatomic_inc(&ft_anc_rec_descents);
 #endif
+	return ++ft_anc_ledger.gen;
 }
 
 static inline
@@ -156,6 +178,12 @@ struct ft_descent {
 	 * parent_word walk was refuted for.
 	 */
 	bool anc_rec;
+	/*
+	 * The ledger generation this descent filled, meaningful only while
+	 * @anc_rec.  A consumer compares it against the ledger's own before
+	 * reading a single entry (ft_anc_ledger_valid).
+	 */
+	unsigned long anc_gen;
 	struct cds_ft_inode_flag *nf;		/* Current node-flag value. */
 	struct cds_ft_inode_flag **nfp;		/* Slot that holds @nf. */
 	struct cds_ft_inode_flag *pnf;		/* Parent node-flag value. */
@@ -743,8 +771,9 @@ void ft_descent_init(struct ft_descent *d, struct cds_ft *ft)
 	d->anchor_crossed = 0;
 	d->lock_spacing = ft->lock_spacing;
 	d->anc_rec = caa_unlikely(ft_bulk_active(ft));
+	d->anc_gen = 0;
 	if (caa_unlikely(d->anc_rec))
-		ft_anc_ledger_reset();
+		d->anc_gen = ft_anc_ledger_reset(ft);
 	/*
 	 * Resolve a transient type-7 flip proxy a peer parked on the ROOT slot
 	 * (Phase 4.3: a root recompact's forward edge mid-commit) to its
@@ -4950,6 +4979,206 @@ bool ft_dlm_covering_release_recorded(const struct ft_lock_ctx *ctx,
 	return false;
 }
 
+/*
+ * MAY A CONSUMER READ THE LEDGER FOR THIS ACQUIRE?
+ *
+ * ☠ THE LEDGER IS PER-THREAD AND LAST-WRITER-WINS, so "a bulk op is live" does
+ * NOT imply "the ledger describes the path I am acquiring on".  @anc_rec is
+ * sampled ONCE at ft_descent_init while the acquire samples the gate LIVE, and
+ * an op runs more than one descent (ft_detach_node's orphan walk,
+ * ft_anchor_descend).  Three distinct ways to be wrong, all of which read as
+ * "widen now" without this:
+ *
+ *   NO DESCENT      the site has no ft_descent at all -- nothing filled it;
+ *   NOT RECORDING   the descent ran BEFORE the gate opened, so it recorded
+ *                   nothing and the entries belong to an earlier op;
+ *   SUPERSEDED      a later ft_descent_init on this thread refilled it, or it
+ *                   was filled for ANOTHER TRIE (the mixed arms run two).
+ *
+ * Each leaves a ledger that is populated and self-consistent and describes the
+ * WRONG PATH -- so a widening built on it locks the wrong ancestors and takes
+ * every one of them successfully.  That is an exclusion gap with no symptom,
+ * which is why the check is a predicate the consumer must call and not a
+ * comment.  Overflow is folded in for the same reason: it REFUSES rather than
+ * truncating, and a truncated path excludes nothing above the cut.
+ */
+static inline
+bool ft_anc_ledger_valid(const struct cds_ft *ft, const struct ft_descent *d)
+{
+	return d && d->anc_rec && !ft_anc_ledger.overflow &&
+		ft_anc_ledger.ft == ft && ft_anc_ledger.gen == d->anc_gen;
+}
+
+#ifdef FT_DEBUG_WIDEN_OWNER
+/*
+ * G5.5's WIDENING, MEASURED BEFORE IT IS BUILT.  This build widens NOTHING --
+ * it takes exactly the locks it takes without it -- and only counts what the
+ * widening WOULD find at this choke point.
+ *
+ *   Q1 WHO OWNS THE RELEASE.  An ancestor appended inside this function is
+ *      invisible to the caller's @set[i].held sweep, so its release must be
+ *      handed to a txn.  ☠ AND @ctx->held.txn IS NOT THAT QUESTION: the
+ *      detach family ACQUIRES FIRST AND HANDS OFF LATER (ft_flip_txn_lock_own,
+ *      ft-remove.h:573), and ft_node_recompact's owner is its @retire_txn
+ *      PARAMETER -- non-NULL by its acquire's own guard, and in no ctx frame at
+ *      all.  So this counts the ctx CHAIN, top frame and outer frames apart,
+ *      and the answer it gives is a LOWER BOUND on ownership, never a verdict.
+ *   Q2 IS THE LEDGER EVEN THIS ACQUIRE'S?  ft_anc_ledger_valid's verdict,
+ *      broken out by the way it fails.
+ *
+ * ☠☠ WHAT THIS CANNOT ANSWER, so that no one reads it as if it could:
+ *   * HOW WIDE the widened set is.  Every gate entry in the tree passes
+ *     level 0 (ft-detach.h:646, ft-graft.h:2591 / :2842, ft-merge.h:3753,
+ *     ft_move_gate_enter), so ft_bulk_min_level() is CONSTANTLY 0 and a
+ *     "from the min level down" count is just the arm's KEY DEPTH.  The
+ *     ledger's @nr is reported under that name and must not be read as a
+ *     lock-set size, still less allowed to size a bound -- the bound is
+ *     structural (FT_DLM_ACQUIRE_MAX_SET) and stays that way.
+ *   * WHETHER A SITE IS THE ONLY ONE.  Reachability is a code fact; a site
+ *     absent from the table below was not exercised by the arm, which is a
+ *     statement about the arm.
+ *
+ * ☠ Every counter is a process-wide atomic on the acquire path, so the
+ * instrument PERTURBS what it measures (G5.9 paid 2x for exactly this).
+ * EXISTENCE and MAXIMA survive that; RATIOS do not.
+ */
+#define FT_WO_SITES	128
+struct ft_wo_site {
+	const char *fn;
+	int line;
+	unsigned long live, txn_top, txn_chain, txn_none;
+	unsigned long led_ok, led_bad;
+	unsigned long fine, spacing;	/* the trie this site was seen on */
+};
+extern struct ft_wo_site ft_wo_site_tbl[FT_WO_SITES];
+extern unsigned long ft_wo_site_overflow;
+extern unsigned long ft_wo_acq_total, ft_wo_gate_enters;
+extern unsigned long ft_wo_live, ft_wo_self_bulk;
+extern unsigned long ft_wo_txn_top, ft_wo_txn_chain, ft_wo_txn_none;
+extern unsigned long ft_wo_led_ok, ft_wo_led_nodescent, ft_wo_led_norec;
+extern unsigned long ft_wo_led_superseded, ft_wo_led_overflow;
+extern unsigned long ft_wo_led_nr_max;
+
+/*
+ * ☠ A LOST UPDATE ON A MAXIMUM UNDERSTATES IT, which is the one direction that
+ * is not conservative -- so this RETRIES until the slot is at least @v, rather
+ * than the single-shot load/compare/store the bulk-window peak uses.
+ */
+static inline
+void ft_wo_max(unsigned long *slot, unsigned long v)
+{
+	for (;;) {
+		unsigned long old = uatomic_load(slot, CMM_RELAXED);
+
+		if (v <= old || uatomic_cmpxchg(slot, old, v) == old)
+			return;
+	}
+}
+
+/*
+ * Find or claim the row for call site (@fn, @line).  Claiming is a two-store
+ * sequence, so a concurrent lookup can miss a row mid-claim and open a SECOND
+ * row for the same site; the dump therefore prints duplicate rows rather than
+ * pretending they are unique.  A diagnostic table, not a ledger.
+ */
+static inline
+struct ft_wo_site *ft_wo_site_of(const char *fn, int line)
+{
+	unsigned int i;
+
+	for (i = 0; i < FT_WO_SITES; i++) {
+		struct ft_wo_site *s = &ft_wo_site_tbl[i];
+		const char *cur = uatomic_load(&s->fn, CMM_ACQUIRE);
+
+		if (cur == fn && uatomic_load(&s->line, CMM_RELAXED) == line)
+			return s;
+		if (cur)
+			continue;
+		if (uatomic_cmpxchg(&s->fn, NULL, (char *) fn) == NULL) {
+			uatomic_store(&s->line, line, CMM_RELEASE);
+			return s;
+		}
+		i--;			/* lost the claim; re-read this row */
+	}
+	uatomic_inc(&ft_wo_site_overflow);
+	return NULL;
+}
+
+/* Does ANY frame of the op's held-set chain carry a txn? */
+static inline
+bool ft_wo_chain_has_txn(const struct ft_lock_ctx *ctx)
+{
+	const struct ft_held_set *hs;
+
+	for (hs = ctx ? &ctx->held : NULL; hs; hs = hs->outer)
+		if (hs->txn)
+			return true;
+	return false;
+}
+
+static inline
+void ft_wo_observe(const char *fn, int line, const struct cds_ft *ft,
+		const struct ft_lock_ctx *ctx)
+{
+	const struct ft_descent *d = ft_lock_ctx_descent(ctx);
+	struct ft_wo_site *site;
+	unsigned int min_lvl;
+	bool led_ok;
+
+	/*
+	 * THE CONTROL DENOMINATOR, bumped for every acquire whatever the gate
+	 * says: a zero here means the choke point never ran in this build, and
+	 * every other zero below then proves nothing.
+	 */
+	uatomic_inc(&ft_wo_acq_total);
+	if (!ft_bulk_sample(ft, &min_lvl))
+		return;
+	if (ft_bulk_self_depth) {
+		uatomic_inc(&ft_wo_self_bulk);	/* the caller IS a bulk op */
+		return;
+	}
+	uatomic_inc(&ft_wo_live);
+	led_ok = ft_anc_ledger_valid(ft, d);
+	if (led_ok) {
+		uatomic_inc(&ft_wo_led_ok);
+		/*
+		 * ☠ KEY DEPTH, NOT LOCK-SET SIZE -- see the header.  Every
+		 * gate entry passes level 0, so "from the min level down" is
+		 * the whole recorded path and nothing is being filtered.
+		 */
+		ft_wo_max(&ft_wo_led_nr_max, ft_anc_ledger.nr);
+	} else if (!d) {
+		uatomic_inc(&ft_wo_led_nodescent);
+	} else if (!d->anc_rec) {
+		uatomic_inc(&ft_wo_led_norec);	/* descended before the gate */
+	} else if (ft_anc_ledger.overflow) {
+		uatomic_inc(&ft_wo_led_overflow);
+	} else {
+		uatomic_inc(&ft_wo_led_superseded);
+	}
+	site = ft_wo_site_of(fn, line);
+	if (site) {
+		uatomic_inc(&site->live);
+		uatomic_inc(led_ok ? &site->led_ok : &site->led_bad);
+		uatomic_store(&site->fine, ft->lock_fine, CMM_RELAXED);
+		uatomic_store(&site->spacing, ft->lock_spacing, CMM_RELAXED);
+	}
+	if (ctx && ctx->held.txn) {
+		uatomic_inc(&ft_wo_txn_top);
+		if (site)
+			uatomic_inc(&site->txn_top);
+	} else if (ft_wo_chain_has_txn(ctx)) {
+		uatomic_inc(&ft_wo_txn_chain);
+		if (site)
+			uatomic_inc(&site->txn_chain);
+	} else {
+		uatomic_inc(&ft_wo_txn_none);
+		if (site)
+			uatomic_inc(&site->txn_none);
+	}
+}
+#endif /* FT_DEBUG_WIDEN_OWNER */
+
 static inline
 int ft_dlm_acquire_set_at(const char *fn, int line,
 		const struct cds_ft *ft, const struct ft_lock_ctx *ctx,
@@ -4979,6 +5208,9 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 			nr_present++;
 	if (!nr_present)
 		return 0;
+#ifdef FT_DEBUG_WIDEN_OWNER
+	ft_wo_observe(fn, line, ft, ctx);
+#endif
 	if (ft_removeall_fault_refuse_acquire())
 		return -EAGAIN;		/* test-only; nothing acquired */
 	/*
