@@ -5162,6 +5162,55 @@ extern unsigned long ft_bl_found, ft_bl_undatable, ft_bl_led_empty;
  */
 extern unsigned long ft_bl_win_ok, ft_bl_win_no;
 /*
+ * ☑ THE UP-WALK, NO LONGER REFUTED.  It used to truncate SILENTLY because a
+ * root's parent read as NULL and so did a node mid-re-home.  A root now stores
+ * the TRIE POINTER (ft_parent_word / ft_trie_parent), so the walk can STOP at
+ * ft_parent_is_trie() and REFUSE on NULL -- the two are different values.  This
+ * measures what such a walk would answer for a bulk op's members, which is the
+ * one source that needs neither a descent nor a stored depth.
+ * @up_disagree cross-checks it against the WINDOW wherever both can answer: a
+ * probe that cannot be wrong is not evidence.
+ */
+extern unsigned long ft_bl_up_ok, ft_bl_up_refused, ft_bl_up_capped;
+extern unsigned long ft_bl_up_agree, ft_bl_up_disagree;
+
+/*
+ * Byte-depth of @nf by walking parent_word to the trie, summing each parent's
+ * span.  0 = dated, 1 = refused (NULL: a re-home in flight), 2 = hop cap.
+ */
+static inline
+int ft_bl_upwalk_depth(const struct cds_ft *ft, struct cds_ft_inode_flag *nf,
+		unsigned int *out)
+{
+	struct cds_ft_inode_flag *cur = nf;
+	unsigned int depth = 0, hops = 0;
+
+	while (hops++ <= FT_MAX_DEPTH) {
+		struct cds_ft_metadata *m;
+		struct cds_ft_inode_flag *par;
+
+		if (!cur || ft_node_external(cur))
+			return 1;
+		m = ft_flag_to_metadata(ft, cur);
+		if (!m)
+			return 1;
+		par = (struct cds_ft_inode_flag *)
+				CMM_LOAD_SHARED(m->parent_word);
+		if (ft_parent_is_trie(par)) {
+			*out = depth;		/* reached the ROOT */
+			return 0;
+		}
+		if (!par)
+			return 1;		/* transient re-home: REFUSE */
+		par = ft_resolve_flip_proxy(par);
+		if (!par || ft_node_external(par))
+			return 1;
+		depth += ft_node_span(ft, par);
+		cur = par;
+	}
+	return 2;
+}
+/*
  * ☠ TWO EQUAL MARGINALS ARE NOT A JOINT.  "every acquire that can widen lacks
  * an owner" is a claim about the PAIR, and separate led_ok / txn_none counters
  * cannot make it -- they would read identically for a population where the two
@@ -5477,9 +5526,21 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 
 				if (!set[j__].nf)
 					continue;
-				uatomic_inc(ft_descent_depth_of(wd__,
-						set[j__].nf, &wdep__) ?
-					&ft_bl_win_ok : &ft_bl_win_no);
+				unsigned int updep__ = 0;
+				bool win__ = ft_descent_depth_of(wd__,
+						set[j__].nf, &wdep__);
+				int up__ = ft_bl_upwalk_depth(ft,
+						set[j__].nf, &updep__);
+
+				uatomic_inc(win__ ? &ft_bl_win_ok :
+						&ft_bl_win_no);
+				uatomic_inc(up__ == 0 ? &ft_bl_up_ok :
+					(up__ == 1 ? &ft_bl_up_refused :
+						&ft_bl_up_capped));
+				if (win__ && up__ == 0)
+					uatomic_inc(updep__ == wdep__ ?
+						&ft_bl_up_agree :
+						&ft_bl_up_disagree);
 			}
 		}
 	}

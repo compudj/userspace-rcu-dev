@@ -366,6 +366,8 @@ unsigned long ft_wo_joint[4];
 unsigned long ft_bl_acq, ft_bl_root, ft_bl_members;
 unsigned long ft_bl_found, ft_bl_undatable, ft_bl_led_empty;
 unsigned long ft_bl_win_ok, ft_bl_win_no;
+unsigned long ft_bl_up_ok, ft_bl_up_refused, ft_bl_up_capped;
+unsigned long ft_bl_up_agree, ft_bl_up_disagree;
 #ifdef FT_FEATURE_WIDEN
 unsigned long ft_wd_acq, ft_wd_locks, ft_wd_dedup;
 unsigned long ft_wd_no_owner, ft_wd_no_ledger, ft_wd_locks_max;
@@ -453,6 +455,12 @@ static void ft_wo_dump(void)
 		"  BULK members datable by the REAL path (descent WINDOW, "
 		"ft_descent_depth_of): %lu | NOT: %lu\n",
 		ft_bl_win_ok, ft_bl_win_no);
+	fprintf(stderr,
+		"  BULK members datable by the UP-WALK (parent_word to the "
+		"trie): %lu | refused(NULL, re-home): %lu | capped: %lu\n"
+		"    cross-check vs the window: agree=%lu DISAGREE=%lu\n",
+		ft_bl_up_ok, ft_bl_up_refused, ft_bl_up_capped,
+		ft_bl_up_agree, ft_bl_up_disagree);
 #ifdef FT_FEATURE_WIDEN
 	/*
 	 * ☠ A WIDENING THAT DID NOT FIRE IS AN EXCLUSION GAP THAT SUCCEEDS AT

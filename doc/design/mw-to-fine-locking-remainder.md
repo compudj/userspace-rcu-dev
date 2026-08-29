@@ -2058,6 +2058,67 @@ cycle before it can carry that number.
    the ANCESTOR rather than the member -- which is the side that HAS the
    information.
 
+### G5.22 — ☑☑ THE UP-WALK IS NO LONGER REFUTED, AND IT DATES **100%** OF A BULK OP'S MEMBERS
+
+Every "the parent_word up-walk is refuted" in this document and in @`fb7e2ce5`
+rests on ONE fact: *"it goes transiently NULL while a detach or graft re-homes a
+node, and a NULL parent reads as ROOT, so the walk truncates SILENTLY."*
+**THAT FACT NO LONGER HOLDS.**  A root does not store NULL any more -- it stores
+the TRIE POINTER:
+
+    ft_parent_word(ft, parent_node) = parent_node ? parent_node
+                                                  : ft_trie_parent(ft)
+    ft_parent_is_trie(p)            = p && !((uintptr_t) p & FT_PARENT_TAG_MASK)
+
+with `struct cds_ft` statically asserted aligned past the whole parent tag.  So
+the raw word has THREE distinguishable states -- a tagged node (a real parent),
+the trie pointer (**the ROOT**), and NULL (**a transient re-home**) -- and a walk
+can STOP at the trie and REFUSE on NULL instead of confusing the two.  The
+silent truncation is gone; only an honest refusal remains.
+☠ The `struct cds_ft_metadata::parent_word` comment still said "the only NULL a
+reader can observe is at the root", which is how the dead refutation kept
+propagating.  Corrected.
+
+**MEASURED** -- byte-depth by walking `parent_word` to the trie, summing each
+parent's `ft_node_span`, for every member of every bulk-op acquire:
+
+    source                       contended        fine        deep
+    ledger                  132,576 (27.7%)  154,578 (27.7%)   16/32
+    descent WINDOW          214,267 (44.7%)  248,576 (44.6%)   24/32
+    UP-WALK                 479,419 (100%)   557,732 (100%)    32/32
+    refused (NULL) / capped        0 / 0          0 / 0        0 / 0
+    cross-check vs window   agree 214,267    agree 248,576     agree 24
+                            DISAGREE 0       DISAGREE 0        DISAGREE 0
+
+★ **100% COVERAGE, AND IT AGREES EXACTLY WITH THE WINDOW** on all 462,843
+members where both can answer.  The summed spans reconstruct precisely the
+byte-depth the descent recorded -- which is what makes this a measurement rather
+than a plausible-looking number.
+
+⇒ **THE ENFORCEMENT PREDICATE IS UNBLOCKED**, and G5.20's "third step" (supply
+real member depths at PER_NODE) is no longer needed for it: the up-walk needs
+NEITHER a descent NOR a stored depth, so it sidesteps the whole
+`ft_lock_ctx_depth_of`-manufactures-0 problem, and it works at every spacing.
+
+☠ **THREE HONEST CAVEATS, none fatal:**
+1. **`refused = 0` over ~1.04M members DOES NOT PROVE the transient-NULL window
+   is unreachable** -- it is a rare event and a high-volume proxy cannot exclude
+   one.  The predicate must still handle it, and refusing (re-plan) is the
+   correct handling, so this is a cost question and not a correctness one.
+2. **COST is O(depth) per member**, one metadata load per hop.  Paid only while a
+   bulk op is live (gated) and only for a BULK op's own members -- the point side
+   keeps the ledger, which gives the whole path in one pass.
+3. **STALE BACK-EDGES.**  A back-pointer is lazily updated and can name a
+   SUPERSEDED parent copy, so a walk could date against an old path.  The zero
+   disagreement bounds this only where the window can also answer, and the window
+   may be stale in the same way; it is NOT independently confirmed.
+
+☞ **THIS ALSO WEAKENS -- BUT DOES NOT VOID -- THE LEDGER'S JUSTIFICATION**
+(@`fb7e2ce5`).  The ledger is still the right source for the POINT side: it
+yields the whole path once per descent, where an up-walk would be O(depth) PER
+MEMBER on the hottest path.  What changes is that it is no longer the ONLY
+possible source.
+
 ☞ **THE FORK THIS LEAVES**, and it needs a decision rather than a default:
 1. **DECLARE + ENFORCE + RE-ENTER.**  The op declares from its key; an acquire
    ABOVE the declared level REFUSES; the op then drops its locks, leaves the

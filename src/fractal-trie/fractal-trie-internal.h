@@ -1049,13 +1049,21 @@ struct ft_pub_rec {
 struct cds_ft_metadata {
 	/* 8-byte aligned fields. */
 	struct cds_ft_inode_flag *parent_word;	/*
-						 * Tagged pointer to parent node.  The only
-						 * NULL a reader can observe is at the root.
-						 * It is also transiently NULL on the write
-						 * side (between a detach / graft_swap
-						 * clearing the link and the new placement
-						 * completing), but such a node is not
-						 * reader-reachable: publication wires the
+						 * Tagged pointer to parent node.  ☠ A ROOT
+						 * DOES NOT STORE NULL HERE -- it stores the
+						 * TRIE pointer (ft_parent_word /
+						 * ft_trie_parent), so the three states are
+						 * DISTINGUISHABLE: a tagged node is a real
+						 * parent, ft_parent_is_trie() is the ROOT,
+						 * and NULL is a TRANSIENT RE-HOME (between a
+						 * detach / graft_swap clearing the link and
+						 * the new placement completing).  An up-walk
+						 * may therefore STOP at the trie and REFUSE
+						 * on NULL instead of mistaking one for the
+						 * other -- which is what used to make such a
+						 * walk truncate silently.  Such a node is
+						 * not reader-reachable anyway: publication
+						 * wires the
 						 * parent before the node is reachable, and
 						 * synchronize_rcu separates the phases.
 						 * Written by the mutation side via
