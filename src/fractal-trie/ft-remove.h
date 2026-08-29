@@ -4608,6 +4608,10 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 	 */
 	struct ft_lock_ctx lctx;
 
+#ifdef FT_DEBUG_WIDEN_OWNER
+	if (!have_descent && ft_bulk_active(ft))
+		uatomic_inc(&ft_wo_nod_remove_locked);
+#endif
 	ft_lock_ctx_init(&lctx, have_descent ? &d : NULL, NULL, op);
 
 	/*
@@ -5484,6 +5488,10 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 			have_descent = true;
 		}
 	}
+#ifdef FT_DEBUG_WIDEN_OWNER
+	if (!have_descent && ft_bulk_active(ft))
+		uatomic_inc(&ft_wo_nod_chain_head);
+#endif
 	ft_lock_ctx_init(&lctx, have_descent ? &d : NULL, NULL, op);
 
 	/*

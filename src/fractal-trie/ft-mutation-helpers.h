@@ -5058,6 +5058,22 @@ extern unsigned long ft_wo_txn_top, ft_wo_txn_chain, ft_wo_txn_none;
 extern unsigned long ft_wo_led_ok, ft_wo_led_nodescent, ft_wo_led_norec;
 extern unsigned long ft_wo_led_superseded, ft_wo_led_overflow;
 extern unsigned long ft_wo_led_nr_max;
+/*
+ * ☠ TWO EQUAL MARGINALS ARE NOT A JOINT.  "every acquire that can widen lacks
+ * an owner" is a claim about the PAIR, and separate led_ok / txn_none counters
+ * cannot make it -- they would read identically for a population where the two
+ * properties were independent and merely equinumerous.  So count the 2x2.
+ * Index: (led_ok ? 2 : 0) | (has_txn ? 1 : 0).
+ */
+extern unsigned long ft_wo_joint[4];
+/*
+ * ☠ AND THE NO-DESCENT CLASS NEEDS ATTRIBUTION, not a hypothesis.  The choke
+ * point sees a NULL @ctx->d and cannot say which caller built it; these count
+ * the two remove sites that skip the anchor descent at PER_NODE
+ * (ft-remove.h, the lock_spacing gates) while a bulk op is live.  If they do
+ * not add up to the no-descent total, the cause is somewhere else.
+ */
+extern unsigned long ft_wo_nod_remove_locked, ft_wo_nod_chain_head;
 
 /*
  * ☠ A LOST UPDATE ON A MAXIMUM UNDERSTATES IT, which is the one direction that
@@ -5155,6 +5171,12 @@ void ft_wo_observe(const char *fn, int line, const struct cds_ft *ft,
 		uatomic_inc(&ft_wo_led_overflow);
 	} else {
 		uatomic_inc(&ft_wo_led_superseded);
+	}
+	{
+		bool has_txn = (ctx && ctx->held.txn) ||
+				ft_wo_chain_has_txn(ctx);
+
+		uatomic_inc(&ft_wo_joint[(led_ok ? 2 : 0) | (has_txn ? 1 : 0)]);
 	}
 	site = ft_wo_site_of(fn, line);
 	if (site) {

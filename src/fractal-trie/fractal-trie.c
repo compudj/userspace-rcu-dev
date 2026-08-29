@@ -360,6 +360,8 @@ unsigned long ft_wo_txn_top, ft_wo_txn_chain, ft_wo_txn_none;
 unsigned long ft_wo_led_ok, ft_wo_led_nodescent, ft_wo_led_norec;
 unsigned long ft_wo_led_superseded, ft_wo_led_overflow;
 unsigned long ft_wo_led_nr_max;
+unsigned long ft_wo_joint[4];
+unsigned long ft_wo_nod_remove_locked, ft_wo_nod_chain_head;
 
 __attribute__((destructor))
 static void ft_wo_dump(void)
@@ -415,6 +417,20 @@ static void ft_wo_dump(void)
 		ft_wo_led_ok, ft_wo_led_nodescent, ft_wo_led_norec,
 		ft_wo_led_superseded, ft_wo_led_overflow,
 		ft_wo_led_nr_max, ft_wo_site_overflow);
+	/*
+	 * THE JOINT, because two equal marginals do not make one.  Reading
+	 * "every acquire that can widen lacks an owner" off separate led_ok /
+	 * txn_none totals would be true of an INDEPENDENT population that
+	 * merely happened to be equinumerous.
+	 */
+	fprintf(stderr,
+		"  joint led_ok x txn:  ok+txn=%lu ok+none=%lu bad+txn=%lu "
+		"bad+none=%lu\n"
+		"  no-descent blamed on: remove_locked=%lu chain_head=%lu "
+		"(of %lu)\n",
+		ft_wo_joint[3], ft_wo_joint[2], ft_wo_joint[1], ft_wo_joint[0],
+		ft_wo_nod_remove_locked, ft_wo_nod_chain_head,
+		ft_wo_led_nodescent);
 	for (i = 0; i < FT_WO_SITES; i++) {
 		struct ft_wo_site *s = &ft_wo_site_tbl[i];
 

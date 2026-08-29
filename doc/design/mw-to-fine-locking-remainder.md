@@ -1594,15 +1594,26 @@ build their lock context with NO descent whatsoever and there is nothing to
 record.  ⇒ prerequisite 1 needs those descents to run whenever a bulk op is
 live, exactly as the ledger recording does.
 
-**★ AND THE TWO HALVES ARE AN EXACT PARTITION**, which is the finding that
-reorders the work.  At `ft_node_recompact` the acquire either
-* HAS a descent -> the ledger is valid -> it CAN widen -> and `ctx->held.txn` is
-  NULL (219,527 / 219,527); or
-* HAS a `ctx->held.txn` -> and NO descent -> it cannot widen at all
-  (201,101 / 201,101).
+**★ AND THE TWO HALVES ARE AN EXACT PARTITION** -- the finding that reorders the
+work.  ☠ FIRST STATED OFF TWO EQUAL MARGINALS, WHICH DO NOT ESTABLISH IT: equal
+`led_ok` and `txn_none` totals read identically for a population where the two
+properties are INDEPENDENT and merely equinumerous.  So the 2x2 was counted:
 
-So there is no acquire in these arms that both can widen and carries its owner
-in the ctx.  Prerequisite 2 is not the next blocker; prerequisite 1 is.
+    joint (led_ok x has-txn-in-ANY-frame)   contended        fine
+    can widen  AND has a ctx txn                    0            0
+    can widen, NO ctx txn                     246,143      160,148
+    cannot widen, HAS a ctx txn               234,335      146,414
+    cannot widen, no ctx txn                        0            4
+
+**No acquire both can widen and carries its owner in the ctx.**  (The 4 are the
+two single-digit sites.)  ⇒ prerequisite 2 is not the next blocker;
+prerequisite 1 is.
+
+**☑ AND THE NO-DESCENT CLASS IS ATTRIBUTED, not hypothesised.**  Counters at the
+two candidate sites place **234,335 of 234,335** (and 146,414 of 146,418) at
+`_cds_ft_remove_locked` alone; the structurally identical chain-head site
+(`ft-remove.h:5470`) measured **zero** in these arms -- which is a statement
+about the arm, not about the site.
 
 **☠ G5.12's RELEASE-OWNER PREDICATE IS REFUTED -- as a PREDICATE, not as a
 plan.**  "`ctx->held.txn != NULL` covers the remove sites; `insert` is the ONLY
