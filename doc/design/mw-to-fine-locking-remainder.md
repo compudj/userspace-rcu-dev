@@ -1900,6 +1900,52 @@ measure whether it does.
 whole run (8 gate entries, 1.65M acquires seen as "bulk live"), so a single deep
 move is orders slower than a shallow one.
 
+### G5.19 — the CEILING REPRESENTATION: TWO PACKED EPOCH WORDS, flipped ON DEMAND
+
+The per-level count array buys an EXACT minimum and pays for it on the contended
+mutex (G5.16).  The single MONOTONE word is O(1) but is a ONE-WAY CRANK: the min
+only lowers while ops are live and resets only when the GLOBAL refcount reaches
+0, so an overlapping stream pins it at the shallowest level ever published.
+**TWO PACKED {refcount, level} WORDS -- two EPOCHS -- fix the crank without the
+array**, and the flip is DEMAND-DRIVEN:
+
+    ENTER(level)                       [under move_gate_lock]
+      if level >= cur.level:  cur.refcount++                 # no damage, NO GP
+      elif other.refcount == 0:  other = {1, level}; cur = other;  own a GP
+      else:                   cur.level = level; cur.refcount++;   own a GP
+
+    EXIT(level)   e.refcount--;  if 0: e.level = NONE        # recovers, NO GP
+    POINT OP      load BOTH words; min over those with refcount != 0
+
+★ **LOWERING IS THE TRIGGER, AN EMPTY PEER THE PRECONDITION.**  Lowering is the
+only operation that DAMAGES a ceiling -- permanently, for that epoch's lifetime
+-- so it is exactly the moment to ask whether a fresh epoch is free instead.  The
+shallow op then goes into the NEW epoch, the OLD one keeps its DEEPER level and
+drains on its own schedule, and when the shallow op leaves the ceiling recovers
+**immediately** rather than waiting for global quiescence.
+
+* ☠ **THE FLIP OWNS A GRACE PERIOD, exactly as a lowering does** -- from a point
+  op's side "a shallower level appeared" is one event whichever word carries it,
+  and peers already in flight widened from the deeper pair.  Safe against the
+  SEAM RULE because the level is fixed at gate ENTRY, before any lock is taken.
+* ☑ An ORDINARY enrolment (`level >= cur.level`) owns NO GP: it publishes nothing
+  a peer could be running against.  That keeps the common case cheap.
+* ☑ EXIT owns none either -- the ceiling only RISES there, and a point op holding
+  more locks than it needs is never wrong.
+* ☠ **THE OP MUST REMEMBER WHICH EPOCH IT ENROLLED IN**: exit decrements THAT
+  one, not the current one, which may have flipped underneath it.
+* ☠ **EACH EPOCH STAYS ONE PACKED WORD.**  The two point-op loads are not atomic
+  together and need not be -- a reader that sampled before the flip is a
+  NON-OBSERVER, which is what the GP waits for.  What no GP can rescue is a torn
+  read WITHIN an epoch (live refcount + stale DEEPER level = too few locks), so
+  the per-epoch packing is not optional.
+* Enter and exit both hold `move_gate_lock`, so the flip races with nothing.
+* When BOTH epochs are occupied the rule degrades to the single-word crank --
+  correct, and only in a genuinely busy window.
+
+⇒ O(1) at both ends, no 257-slot rescan under the gate mutex, 516 bytes back, and
+one extra relaxed load per point op (put the words adjacent).
+
 ☞ **THE FORK THIS LEAVES**, and it needs a decision rather than a default:
 1. **DECLARE + ENFORCE + RE-ENTER.**  The op declares from its key; an acquire
    ABOVE the declared level REFUSES; the op then drops its locks, leaves the
