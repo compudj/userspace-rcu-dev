@@ -1848,6 +1848,58 @@ emptying it coincides with `bulk_gate_nr == 0`, which takes the `else` branch.
 The cost appears only when ops publish REAL levels -- i.e. exactly when the
 ceiling is built.
 
+### G5.18 — ☑☑ THE DEEP-JUNCTION ARM: the 5.8x WAS THE GEOMETRY.  Deep, it is 1.48x
+
+`inv_widen_deep_junction` (`tests/regression/test_urcu_ft_inv.c`) varies the one
+thing both rekey arms hold fixed -- DEPTH.  Movers own a junction at byte 12,
+point writers live under their own top bytes (a subtree the movers never enter,
+so the two diverge at depth 0), keys are 16 bytes.  A THROUGHPUT probe, not an
+oracle: it asserts only progress, and the mixed-writer arms keep the
+correctness job.
+
+    point ops / run          OFF                    ON            ratio
+    shallow (junction d=1)   77,675/86,478/80,975   14,027/14,013/15,866   5.8x
+    DEEP    (junction d=12)  752,504/843,554/759,444 513,634/495,214/533,180 1.48x
+
+**☑☑ THE 5.8x WAS MOSTLY THE GEOMETRY.**  Same widening, same level 0, same
+instrument -- only the depth and the subtree disjointness change, and the cost
+falls from 5.8x to ~1.48x, distributions still separated.  ⇒ G5.15's number was
+the price of BULK-NEAR-ROOT-WITH-EVERY-WRITER-IN-ONE-JUNCTION, and reading it as
+the widening's cost was wrong.
+★ **AND THE RESIDUAL IS EXACTLY WHAT A LEVEL WOULD ATTACK**: this is still level
+0, so every widened acquire STILL TAKES THE ROOT and still widens over the whole
+15-node path.  A published junction level of 12 would cut that to the handful of
+nodes below it.  The ceiling now has something to cut, and an arm that can
+measure whether it does.
+
+**☠☠ AND THE ARM COST TWO REAL LESSONS BEFORE IT MEASURED ANYTHING.**
+
+1. **BYTE DEPTH IS NOT NODE DEPTH, and the widening walks NODES.**  The first cut
+   used 16-byte keys with a long shared prefix and produced an ancestor ledger
+   whose depth maxed at **2**: a sparse key PATH-COMPRESSES, so a run of bytes
+   nobody branches on collapses into ONE node.  Deep keys bought nothing.  The
+   fix is to FORCE A BRANCH AT EVERY LEVEL -- for each byte position d, one extra
+   key agreeing on [0,d) and differing at d, which is exactly the condition for a
+   node to exist at d.  Ledger depth 2 -> **15**, and point ops rose 6x (136k ->
+   822k) merely from the trie having a shape.
+   ☞ Generalises: any FT arm that means to be "deep" must SEED DENSITY, not long
+   keys.  `ledger nr max` under `-DFT_DEBUG_WIDEN_OWNER` is how to check it.
+2. **THE ORDERED LIST COUPLES DISJOINT SUBTREES, and it LIVELOCKS this arm.**
+   With the list on, the point writers' churn -- in a subtree the movers never
+   enter -- keeps `ft_ord_cell_find_splice_pos_coherent`'s two derivations from
+   agreeing; the rekey returns -EAGAIN ("torn derivation: re-descend") and its
+   internal retry never terminates.  Measured: one mover stuck inside a single
+   `_cds_ft_debug_rekey_graft_simple`, spinning in `ft_node_get_minmax`, every
+   other thread already stopped.  The cell list is TRIE-WIDE, so subtree
+   disjointness does not buy list disjointness.
+   ☞ ☐ **A REAL FINDING WORTH ITS OWN ARM** -- an unbounded internal retry driven
+   by unrelated traffic is a liveness bug, not a tuning matter.  Turned OFF here
+   because it confounds the trie-lock contention this arm isolates.
+
+☐ Also visible and not chased: a deep rekey holds the gate for essentially the
+whole run (8 gate entries, 1.65M acquires seen as "bulk live"), so a single deep
+move is orders slower than a shallow one.
+
 ☞ **THE FORK THIS LEAVES**, and it needs a decision rather than a default:
 1. **DECLARE + ENFORCE + RE-ENTER.**  The op declares from its key; an acquire
    ABOVE the declared level REFUSES; the op then drops its locks, leaves the

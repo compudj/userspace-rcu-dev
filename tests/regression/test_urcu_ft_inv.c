@@ -78,7 +78,7 @@
  * compares the run count against this plan, so retiring a test means
  * decrementing here in the same commit.
  */
-#define NR_TESTS	(97 + NR_TESTS_REKEY_DLM)
+#define NR_TESTS	(98 + NR_TESTS_REKEY_DLM)
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -5733,6 +5733,393 @@ static int rkmix_probe_writer_reached(struct cds_ft *ft, struct rk_writer_arg *w
 		return -1;
 	}
 	return 0;
+}
+
+/*
+ * THE DEEP-JUNCTION ARM -- built because every cost number G5.15/G5.16 produced
+ * was measured on BULK-AT-DEPTH-1 and is therefore silent on the thing it was
+ * read as judging.
+ *
+ * Both rekey mixed-writer arms drive their movers with TWO-BYTE keys, and the
+ * contended one gives all eight the same pair, so every move happens between two
+ * CHILDREN OF THE ROOT: the junction sits at depth 1 in a trie whose keys are
+ * four bytes.  A published per-op junction level there would be ~1, and widening
+ * "from level 1 down" instead of "from 0 down" excludes exactly ONE WORD -- the
+ * root -- out of a three-or-four deep path.  The array-based level ceiling has
+ * essentially nothing to cut, so those arms cannot tell a working ceiling from a
+ * broken one, and the 5.8x they report is the already-known cost of
+ * bulk-near-root rather than a verdict.
+ *
+ * So vary the one thing they hold fixed: DEPTH.
+ *
+ *  - keys are WDJ_KLEN bytes, not four;
+ *  - each mover owns a junction at byte WDJ_JUNCT, deep in the trie, and moves a
+ *    subtree back and forth across it, so the shallowest word a bulk op has any
+ *    business locking is DEEP;
+ *  - the point writers live under their own top bytes, a subtree the movers
+ *    never enter, so they diverge from the movers AT DEPTH 0.
+ *
+ * ☠ THIS ARM IS A THROUGHPUT PROBE, NOT AN ORACLE.  It asserts only that the
+ * writers make progress; whether the answers are RIGHT is the mixed-writer arms'
+ * job and they keep it.  What it exists to produce is a point-op rate that can be
+ * compared across -DFT_FEATURE_WIDEN, in a geometry where a junction level would
+ * actually have something to exclude.
+ *
+ * ☞ Reading it: with the widening OFF this is the baseline.  With it ON and every
+ * gate entry still passing level 0 -- which is what ships -- every widened
+ * acquire still takes the ROOT, so a large loss here says the cost is the
+ * ROOT-TAKING and not the junction depth, which is the first half of the
+ * question.  The second half needs a published level and is not wired.
+ */
+#define WDJ_NW		8	/* movers, one deep junction each */
+#define WDJ_NP		6	/* point writers, one private subtree each */
+#define WDJ_NR		8	/* readers */
+#define WDJ_KLEN	16	/* deep keys -- the whole point of the arm */
+#define WDJ_JUNCT	12	/* the byte src/dst diverge at: the junction */
+#define WDJ_SEED	6	/* keys seeded under each mover's source */
+#define WDJ_TOP_MOVER	0x10
+#define WDJ_TOP_POINT	0x40
+
+struct wdj_mover_arg {
+	struct cds_ft *ft;
+	uint8_t top;
+	bool at_dst;
+	unsigned long moves;
+	unsigned long fails;
+	int last_rc;
+};
+
+struct wdj_point_arg {
+	struct cds_ft *ft;
+	uint8_t top;
+	unsigned long ops;
+};
+
+/*
+ * The junction prefix: @top, then zeros, then @side at WDJ_JUNCT.  src and dst
+ * differ ONLY in that last byte, so their branch point -- the node a move
+ * restructures -- is at depth WDJ_JUNCT.
+ */
+static void wdj_prefix(uint8_t *k, uint8_t top, uint8_t side)
+{
+	memset(k, 0, WDJ_JUNCT + 1);
+	k[0] = top;
+	k[WDJ_JUNCT] = side;
+}
+
+static void *wdj_mover(void *arg)
+{
+	struct wdj_mover_arg *w = (struct wdj_mover_arg *) arg;
+
+	rcu_register_thread();
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	while (!test_stop) {
+		uint8_t src[WDJ_JUNCT + 1], dst[WDJ_JUNCT + 1];
+
+		wdj_prefix(src, w->top, w->at_dst ? 2 : 1);
+		wdj_prefix(dst, w->top, w->at_dst ? 1 : 2);
+		int rc = _cds_ft_debug_rekey_graft_simple(w->ft, src,
+				WDJ_JUNCT + 1, dst, WDJ_JUNCT + 1);
+
+		if (rc == 0) {
+			w->at_dst = !w->at_dst;
+			w->moves++;
+		} else {
+			w->fails++;
+			w->last_rc = rc;
+		}
+	}
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static void *wdj_point(void *arg)
+{
+	struct wdj_point_arg *w = (struct wdj_point_arg *) arg;
+	unsigned int seed = (unsigned int) (uintptr_t) w;
+	struct cds_ft_iter *iter;
+
+	rcu_register_thread();
+	if (cds_ft_iter_create(w->ft, &iter) < 0)
+		abort();
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	while (!test_stop) {
+		uint8_t key[WDJ_KLEN];
+		struct ft_test_node *n;
+		struct cds_ft_node *found;
+		int i;
+
+		/*
+		 * A private top byte, then a deep random tail: the point op's
+		 * own path is WDJ_KLEN deep, so a published junction level
+		 * would leave it widening over a handful of DEEP ancestors
+		 * rather than the whole spine.
+		 */
+		memset(key, 0, sizeof(key));
+		key[0] = w->top;
+		for (i = WDJ_KLEN - 4; i < WDJ_KLEN; i++)
+			key[i] = (uint8_t) rand_r(&seed);
+		n = node_alloc(0);
+		memcpy(n->okey, key, WDJ_KLEN);
+		/*
+		 * The section spans insert + lookup + remove: the lookup
+		 * reference and the iter's cached path are valid only inside
+		 * it, and cds_ft_remove consumes both.
+		 */
+		rcu_read_lock();
+		if (cds_ft_insert(w->ft, key, WDJ_KLEN, &n->node) !=
+				CDS_FT_STATUS_OK) {
+			/* a duplicate of my own earlier key; nothing published */
+			rcu_read_unlock();
+			node_free(n);
+			continue;
+		}
+		w->ops++;
+		cds_ft_iter_set_key(iter, key, WDJ_KLEN);
+		cds_ft_lookup(w->ft, iter);
+		found = cds_ft_iter_node(iter);
+		if (found == &n->node &&
+				cds_ft_remove(w->ft, iter, found) ==
+					CDS_FT_STATUS_OK) {
+			rcu_read_unlock();
+			node_free_rcu(to_test_node(found));
+			w->ops++;
+			continue;
+		}
+		rcu_read_unlock();
+	}
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static void *wdj_reader(void *arg)
+{
+	struct wdj_point_arg *r = (struct wdj_point_arg *) arg;
+	unsigned int seed = (unsigned int) (uintptr_t) r;
+	struct cds_ft_iter *iter;
+
+	rcu_register_thread();
+	if (cds_ft_iter_create(r->ft, &iter) < 0)
+		abort();
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	while (!test_stop) {
+		uint8_t key[WDJ_KLEN];
+
+		memset(key, 0, sizeof(key));
+		key[0] = (uint8_t) (WDJ_TOP_MOVER +
+				(rand_r(&seed) % WDJ_NW));
+		key[WDJ_JUNCT] = (uint8_t) (1 + (rand_r(&seed) & 1));
+		rcu_read_lock();
+		cds_ft_iter_set_key(iter, key, WDJ_KLEN);
+		(void) cds_ft_lookup_ge(r->ft, iter);
+		rcu_read_unlock();
+		r->ops++;
+	}
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static int inv_widen_deep_junction(void)
+{
+	struct cds_ft_group_attr *gattr;
+	struct cds_ft_group *group;
+	struct cds_ft_attr *attr;
+	struct cds_ft *ft;
+	struct wdj_mover_arg w[WDJ_NW];
+	struct wdj_point_arg pw[WDJ_NP], rd[WDJ_NR];
+	pthread_t movers[WDJ_NW], points[WDJ_NP], readers[WDJ_NR];
+	struct timespec t0;
+	unsigned long moves = 0, pops = 0, rops = 0, mfails = 0;
+	int last_rc = 0;
+	int i, c, ret = 0;
+
+	if (!getenv("FT_INV_MW")) {
+		fprintf(stderr, "# inv_widen_deep_junction: skipped "
+			"(set FT_INV_MW=1 to run the concurrent-writer oracles)\n");
+		return 0;
+	}
+	mw_install_fatal_handler();
+	leak_reset();
+
+	/*
+	 * VARIABLE-length and LOCK_FINE: the atomic rekey writer -- the one that
+	 * takes per-node DLM locks and therefore the one the widening interacts
+	 * with -- runs only there (see inv_rekey_fine_mixed_writers).  Variable
+	 * length is also what lets a mover name its junction by a PREFIX.
+	 *
+	 * ☠ ORDERED LIST OFF, and not as an economy.  With it on this arm
+	 * LIVELOCKS: the cell list is TRIE-WIDE, so the point writers' churn --
+	 * in a subtree the movers never enter -- keeps
+	 * ft_ord_cell_find_splice_pos_coherent's two derivations from agreeing,
+	 * the rekey returns -EAGAIN ("torn derivation: re-descend"), and its
+	 * internal retry never terminates.  Measured: one mover stuck inside a
+	 * single _cds_ft_debug_rekey_graft_simple call, spinning in
+	 * ft_node_get_minmax, with every other thread already stopped.
+	 * ★ A REAL interaction and worth its own arm, but not this one's
+	 * subject: it couples the two subtrees through the LIST and confounds
+	 * exactly the trie-lock contention this arm exists to isolate.
+	 */
+	if (cds_ft_group_attr_create(&gattr) < 0)
+		abort();
+	if (cds_ft_group_attr_set_max_key_len(gattr, WDJ_KLEN) < 0 ||
+			cds_ft_group_attr_set_lookup_optimization(gattr,
+				CDS_FT_LOOKUP_OPTIMIZE_EAGER) < 0 ||
+			cds_ft_group_attr_set_writer_strategy(gattr,
+				CDS_FT_WRITER_LOCK_FINE) < 0 ||
+			cds_ft_group_attr_set_ordered_list(gattr, false) < 0)
+		abort();
+	if (cds_ft_group_create(gattr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(gattr);
+	if (cds_ft_attr_create(&attr) < 0)
+		abort();
+	if (cds_ft_attr_set_speculative_keys(attr, false) < 0)
+		abort();
+	if (cds_ft_create(group, attr, &ft) < 0)
+		abort();
+	cds_ft_attr_destroy(attr);
+	cds_ft_make_concurrent(ft);
+
+	/*
+	 * ☠☠ BYTE DEPTH IS NOT NODE DEPTH, and the widening walks NODES.
+	 *
+	 * The first cut of this arm used sixteen-byte keys with a long shared
+	 * prefix and measured an ancestor ledger whose depth maxed out at TWO:
+	 * a sparse key PATH-COMPRESSES, so a run of bytes nobody branches on
+	 * collapses into a single node.  Deep keys bought nothing; the junction
+	 * was still a hop or two from the root, which is the very thing this arm
+	 * exists to escape.
+	 *
+	 * So FORCE A BRANCH AT EVERY LEVEL.  For each byte position d along a
+	 * writer's path, insert one extra key that agrees on [0, d) and differs
+	 * at d -- that is exactly the condition for a node to exist at d.  The
+	 * spine then has one node per byte and the recorded path is genuinely
+	 * WDJ_JUNCT deep.  Done for the movers' junction path AND for the point
+	 * writers' subtree, since a point op's widened set is drawn from ITS own
+	 * path and would otherwise be just as shallow.
+	 */
+	rcu_read_lock();
+	for (i = 0; i < WDJ_NW + WDJ_NP; i++) {
+		bool mover = i < WDJ_NW;
+		uint8_t top = mover ? (uint8_t) (WDJ_TOP_MOVER + i) :
+			(uint8_t) (WDJ_TOP_POINT + (i - WDJ_NW));
+		int d;
+
+		for (d = 1; d <= WDJ_JUNCT; d++) {
+			uint8_t key[WDJ_KLEN];
+			struct ft_test_node *n;
+
+			memset(key, 0, sizeof(key));
+			key[0] = top;
+			key[d] = 0xFF;		/* the branch that makes a node at d */
+			n = node_alloc(0);
+			memcpy(n->okey, key, WDJ_KLEN);
+			if (cds_ft_insert(ft, key, WDJ_KLEN, &n->node) !=
+					CDS_FT_STATUS_OK)
+				abort();
+		}
+		if (!mover)
+			continue;
+		/* and the subtree the mover actually moves */
+		for (c = 0; c < WDJ_SEED; c++) {
+			uint8_t key[WDJ_KLEN];
+			struct ft_test_node *n;
+
+			wdj_prefix(key, top, 1);
+			memset(key + WDJ_JUNCT + 1, 0,
+					WDJ_KLEN - WDJ_JUNCT - 1);
+			key[WDJ_KLEN - 1] = (uint8_t) (c + 1);
+			n = node_alloc(0);
+			memcpy(n->okey, key, WDJ_KLEN);
+			if (cds_ft_insert(ft, key, WDJ_KLEN, &n->node) !=
+					CDS_FT_STATUS_OK)
+				abort();
+		}
+	}
+	rcu_read_unlock();
+
+	test_go = 0;
+	test_stop = 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < WDJ_NW; i++) {
+		w[i].ft = ft;
+		w[i].top = (uint8_t) (WDJ_TOP_MOVER + i);
+		w[i].at_dst = false;
+		w[i].moves = 0;
+		w[i].fails = 0;
+		w[i].last_rc = 0;
+		pthread_create(&movers[i], NULL, wdj_mover, &w[i]);
+	}
+	for (i = 0; i < WDJ_NP; i++) {
+		pw[i].ft = ft;
+		pw[i].top = (uint8_t) (WDJ_TOP_POINT + i);
+		pw[i].ops = 0;
+		pthread_create(&points[i], NULL, wdj_point, &pw[i]);
+	}
+	for (i = 0; i < WDJ_NR; i++) {
+		rd[i].ft = ft;
+		rd[i].top = 0;
+		rd[i].ops = 0;
+		pthread_create(&readers[i], NULL, wdj_reader, &rd[i]);
+	}
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	test_go = 1;
+
+	rcu_thread_offline();
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	while (elapsed_ms(&t0) < RKMIX_DURATION_MS)
+		usleep(1000);
+	test_stop = 1;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < WDJ_NW; i++)
+		pthread_join(movers[i], NULL);
+	for (i = 0; i < WDJ_NP; i++)
+		pthread_join(points[i], NULL);
+	for (i = 0; i < WDJ_NR; i++)
+		pthread_join(readers[i], NULL);
+	rcu_thread_online();
+
+	for (i = 0; i < WDJ_NW; i++) {
+		moves += w[i].moves;
+		mfails += w[i].fails;
+		if (w[i].last_rc)
+			last_rc = w[i].last_rc;
+	}
+	for (i = 0; i < WDJ_NP; i++)
+		pops += pw[i].ops;
+	for (i = 0; i < WDJ_NR; i++)
+		rops += rd[i].ops;
+
+	fprintf(stderr, "# inv_widen_deep_junction: %d movers at junction "
+		"depth %d (%lu moves, %lu refused, last rc %d) + %d point "
+		"writers in a disjoint subtree (%lu ops), %d readers (%lu ops), "
+		"key len %d\n",
+		WDJ_NW, WDJ_JUNCT, moves, mfails, last_rc, WDJ_NP, pops,
+		WDJ_NR, rops, WDJ_KLEN);
+
+	/*
+	 * ☠ THE ONLY ASSERTION IS PROGRESS, and it is what keeps a zero from
+	 * reading as a pass: an arm whose movers or point writers never ran
+	 * would otherwise report a beautiful throughput number of nothing.
+	 * RUN_TEST supplies the ok(); returning non-zero is how it is failed.
+	 */
+	if (moves == 0 || pops == 0) {
+		fprintf(stderr, "inv_widen_deep_junction: NO PROGRESS "
+			"(moves %lu, point ops %lu) -- the arm measured "
+			"nothing\n", moves, pops);
+		ret = -1;
+	}
+	if (drain_and_destroy(ft, group) < 0)
+		ret = -1;
+	return ret;
 }
 
 static int inv_rekey_mixed_writers_run(enum rkp_mode mode,
@@ -19843,6 +20230,7 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_rekey_coarse_mixed_writers);
 	RUN_TEST(inv_rekey_fine_mixed_writers);
 	RUN_TEST(inv_rekey_contended_mixed_writers);
+	RUN_TEST(inv_widen_deep_junction);
 	RUN_TEST(inv_rekey_coarse_contended_writers);
 	RUN_TEST(inv_rekey_graft_cross_junction);
 	RUN_TEST(inv_rekey_graft_run_junction);
