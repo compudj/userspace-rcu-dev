@@ -1789,6 +1789,40 @@ is deliberate -- a member's `@depth` is 0 and meaningless at the shipping
 PER_NODE spacing (`ft_lock_ctx_depth_of` answers 0/true there), so a depth
 histogram would have measured the spacing instead of the op.
 
+### ☠☠ G5.17 — THE 5.8x AND THE 16% ARE BOTH MEASURED ON BULK-AT-DEPTH-1, so NEITHER JUDGES THE LEVEL CEILING
+
+**The arms cannot discriminate the thing G5.15/G5.16 were read as judging.**
+Both mixed-writer arms drive their movers with **TWO-BYTE keys**
+(`rkmix_probe_writer_reached`, `src_key[2] = { w->bp, w->sb }`), and the
+contended arm gives EVERY one of its eight movers `bp = 1`, `dp = 2` -- so every
+rekey moves a subtree between the ROOT'S CHILD 1 and the ROOT'S CHILD 2.  The
+junction sits at **DEPTH 1**, in a trie whose keys are `RKP_KLEN = 4` bytes (the
+ancestor ledger's depth maxes at 3-4, which agrees).  The disjoint arm differs
+only in giving each mover its own pair (`bp = 2i+1`, `dp = 2i+2`) -- still depth
+1.
+
+⇒ **A per-op junction level in these arms would publish ~1**, and widening "from
+level 1 down" instead of "from 0 down" excludes exactly ONE WORD -- the root --
+out of a 3-4 deep path, while the contention on the shared depth-1 junction
+remains in full.  **The array-based level ceiling has almost nothing to cut
+here.**
+
+☠ So the 5.8x is the cost of **bulk-at-depth-1 with every writer in one
+junction**, which is candidate (E)'s already-listed open item ("a near-root J
+serializes broadly -- the honest cost of bulk-near-root"), NOT a verdict on the
+ceiling.  And the 16% root-reach is the same geometry seen from the other side:
+at depth 1, touching the root is nearly unavoidable.  **Both numbers are SILENT
+on the ceiling's viability.**
+★ Same error class as reading a joint off two equal marginals: generalising from
+arms that cannot carry the claim.  The arms were built to expose an
+unarbitrated SW park on a shared child, not to vary DEPTH.
+
+☞ **WHAT WOULD DECIDE IT** -- an arm the suite does not have: LONG keys, a bulk
+junction genuinely DEEP in the trie, and point ops working in a DIFFERENT
+subtree.  Only there does a published min level make the widened set small, and
+only there is "point ops stop taking the root" worth anything.  Until such an
+arm exists, the ceiling is UNMEASURED, not refuted.
+
 ☞ **THE FORK THIS LEAVES**, and it needs a decision rather than a default:
 1. **DECLARE + ENFORCE + RE-ENTER.**  The op declares from its key; an acquire
    ABOVE the declared level REFUSES; the op then drops its locks, leaves the
