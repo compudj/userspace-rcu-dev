@@ -1910,26 +1910,41 @@ only lowers while ops are live and resets only when the GLOBAL refcount reaches
 array**, and the flip is DEMAND-DRIVEN:
 
     ENTER(level)                       [under move_gate_lock]
-      if level >= cur.level:  cur.refcount++                 # no damage, NO GP
-      elif other.refcount == 0:  other = {1, level}; cur = other;  own a GP
-      else:                   cur.level = level; cur.refcount++;   own a GP
+      if other.refcount == 0 and level != cur.level:
+          gp = (level < cur.level)       # ☠ GP iff we LOWER -- NOT because we flip
+          other = {1, level};  cur = other
+      elif level < cur.level:
+          cur.level = level;  cur.refcount++;  gp = true
+      else:
+          cur.refcount++;  gp = false
 
     EXIT(level)   e.refcount--;  if 0: e.level = NONE        # recovers, NO GP
     POINT OP      load BOTH words; min over those with refcount != 0
 
-★ **LOWERING IS THE TRIGGER, AN EMPTY PEER THE PRECONDITION.**  Lowering is the
-only operation that DAMAGES a ceiling -- permanently, for that epoch's lifetime
--- so it is exactly the moment to ask whether a fresh epoch is free instead.  The
-shallow op then goes into the NEW epoch, the OLD one keeps its DEEPER level and
-drains on its own schedule, and when the shallow op leaves the ceiling recovers
-**immediately** rather than waiting for global quiescence.
+☠☠ **THE GRACE PERIOD IS OWED BY THE LOWERING OF THE EFFECTIVE MINIMUM, NOT BY
+THE FLIP.**  The flip is only WHERE the new value is stored, and conflating the
+two hides a case worth having:
 
-* ☠ **THE FLIP OWNS A GRACE PERIOD, exactly as a lowering does** -- from a point
-  op's side "a shallower level appeared" is one event whichever word carries it,
-  and peers already in flight widened from the deeper pair.  Safe against the
-  SEAM RULE because the level is fixed at gate ENTRY, before any lock is taken.
-* ☑ An ORDINARY enrolment (`level >= cur.level`) owns NO GP: it publishes nothing
-  a peer could be running against.  That keeps the common case cheap.
+* **A flip that LOWERS** -- peers sampled the old, deeper ceiling and widened too
+  little, so the exclusion gap is real and the GP is unavoidable.
+* **A flip that does NOT lower** -- the arriving op's level is DEEPER than
+  `cur.level`.  After it, `min(cur_old.level, deep) == cur_old.level`: the
+  effective minimum is UNCHANGED, no peer needs to widen more than it already
+  has, and **no grace period is owed**.
+  ★ Worth exploiting, because otherwise a new DEEP op enrolling into the current
+  SHALLOW epoch keeps that shallow ceiling alive for its whole duration -- the
+  crank again in a different guise.  Flipping it into a fresh epoch lets the old
+  shallow epoch drain on its own, and the ceiling RISES the moment it does.
+
+⇒ **the flip never buys GP avoidance on the lowering path; it buys CEILING
+RECOVERY.**  The old epoch keeps its deeper level and drains independently, so
+when the shallow op leaves the ceiling springs back immediately instead of
+waiting for global quiescence.
+* ☑ An ORDINARY enrolment (`level >= cur.level`, peer busy) owns NO GP: it
+  publishes nothing a peer could be running against.  That keeps the common case
+  cheap.
+* ★ Safe against the SEAM RULE throughout: the level is fixed at gate ENTRY,
+  before the op takes any lock, so no GP is ever taken under one.
 * ☑ EXIT owns none either -- the ceiling only RISES there, and a point op holding
   more locks than it needs is never wrong.
 * ☠ **THE OP MUST REMEMBER WHICH EPOCH IT ENROLLED IN**: exit decrements THAT
