@@ -2298,6 +2298,32 @@ machinery and better liveness -- and it is COMPLETE today, which the widening is
 not.  Its cost is a longer critical section, which a complete widening would
 avoid at the price of the ledger, the owner plumbing and the abort-retry regime.
 
+### G5.26 — ☐ FOUND, NOT CHASED: a DEEP rekey is starved ~12,000x by point-op traffic, INSIDE one call
+
+Isolating `inv_widen_deep_junction`'s movers to explain their tiny bulk-side
+sample (n=32 members from 8 moves) turned up a liveness result that has nothing
+to do with the widening -- it reproduces with `-DFT_FEATURE_WIDEN` OFF and
+`-DFT_BULK_WIDE_LOCK=0`:
+
+    8 movers ALONE (no point writers, no readers)     97,526 moves
+    8 movers + 6 point writers + 8 readers                 8 moves
+
+Exactly **8** -- one per mover -- stable across runs, with **0 refused**.  So the
+movers are not being refused and re-planning: each is stuck INSIDE a single
+`_cds_ft_debug_rekey_graft_simple` call for essentially the whole window, and the
+starvation happens in the library's INTERNAL retry where no caller can see it.
+Per mover that is ~12,190 moves alone against 1 under load.
+
+☠ **AND IT IS INVISIBLE TO EVERY REFUSAL-BASED INSTRUMENT** -- an internal retry
+that never returns produces no -EAGAIN, no abort, no counter.  It is the
+[liveness lane]'s shape (`ft_remove`'s retry lane does not drain; the cure is in
+the ACQUIRE) seen from the BULK side.
+☞ Why it matters beyond the arm: it is what kept the deep arm's bulk-side
+numbers at n=32, so several of this section's bulk-side fractions rest on a
+sample that this starvation created.  Any future arm that wants bulk statistics
+must fix this first or size around it.
+☐ Not chased: it is a Phase D question, not a G5 one.
+
 ☞ **THE FORK THIS LEAVES**, and it needs a decision rather than a default:
 1. **DECLARE + ENFORCE + RE-ENTER.**  The op declares from its key; an acquire
    ABOVE the declared level REFUSES; the op then drops its locks, leaves the
