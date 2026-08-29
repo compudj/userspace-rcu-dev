@@ -1961,6 +1961,58 @@ waiting for global quiescence.
 ⇒ O(1) at both ends, no 257-slot rescan under the gate mutex, 516 bytes back, and
 one extra relaxed load per point op (put the words adjacent).
 
+### G5.20 — ☠ THE ENFORCEMENT PREDICATE: the LEDGER CANNOT DATE A BULK OP'S MEMBERS (72% off-path)
+
+The declaration half of a junction level is useless without an ENFORCEMENT half:
+a bulk op must detect that it is about to lock ABOVE the level it declared.  That
+needs a DEPTH per member, and `set[i].depth` cannot supply one at the shipping
+spacing -- `ft_anchor_meta` returns before reading it, `ft_lock_ctx_depth_of`
+MANUFACTURES 0, and a back-pointer-resolved member carries
+`FT_DEPTH_FROM_DESCENT`.
+
+**THE ASYMMETRY IS THE POINT: the POINT side HAS the information, the BULK side
+does NOT.**  A point op reads its ancestors from the ledger, whose depths are the
+`start` values the DESCENT passed to `ft_descent_enter_node` -- real, and
+recorded at EVERY spacing because the push sits before the per-node early return.
+That is why the widening resolves its widened members correctly even coarse.  A
+bulk op has no such source for the members it LOCKS.
+
+The obvious candidate is the bulk op's OWN ledger -- it descends too.  ☠
+**REFUTED BY MEASUREMENT: most of its members are not on its own path.**  Asked
+by IDENTITY, for acquires made by a bulk op:
+
+    arm                bulk members   datable from own ledger   UNDATABLE
+    contended (d=1)         489,277        135,284 (27.7%)   353,993 (72.3%)
+    fine      (d=1)         543,037        150,546 (27.7%)   392,491 (72.3%)
+    deep      (d=12)             32             16                 16
+
+⇒ **~72% OFF-PATH, and structurally so**: `ft_node_recompact` resolves P and GP
+through BACK-POINTERS, and the detach / orphan walks reach siblings and children
+the key descent never entered.  A predicate that refused on an undatable member
+would escalate nearly every bulk op to level 0 -- which is what ships today.
+★ The DEEP arm reaches the root **0** times against 16% shallow: a third
+independent confirmation that G5.16's fraction was geometry.
+
+☞ **AND THIS IS THE SAME SHAPE FOR THE THIRD TIME.**  The default's zero-cost
+path keeps skipping exactly what the widening needs, and each fix makes the work
+conditional on THE GATE BEING OPEN rather than on the spacing:
+
+    @fb7e2ce5   the ledger was not RECORDED at PER_NODE
+                -> record BEFORE ft_descent_enter_node's early return
+    @3acd5488   the anchor descent did not RUN at PER_NODE
+                -> run it when a bulk op is live
+    ☐ next      member DEPTHS are not SUPPLIED at PER_NODE
+                (ft_lock_ctx_depth_of manufactures 0)
+                -> supply real ones when a bulk op is live
+
+That third step is what the enforcement predicate waits on, and it is the honest
+cost of the ceiling: PER_NODE's "a member anchors on itself, so no depth is
+needed" is precisely the optimisation the widening cannot keep.
+☠ NOT free: dating a back-pointer-resolved member is what
+`ft_lock_ctx_depth_of_parent` and the descent WINDOW exist for, and 72% of
+members reach the acquire without a descent that describes them.  Whether the
+ONE-HOP rule can date them, and at what cost, is the open question.
+
 ☞ **THE FORK THIS LEAVES**, and it needs a decision rather than a default:
 1. **DECLARE + ENFORCE + RE-ENTER.**  The op declares from its key; an acquire
    ABOVE the declared level REFUSES; the op then drops its locks, leaves the

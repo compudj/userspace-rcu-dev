@@ -5139,6 +5139,19 @@ extern unsigned long ft_wo_led_nr_max;
  */
 extern unsigned long ft_bl_acq, ft_bl_root, ft_bl_members;
 /*
+ * ☠ CAN A BULK OP EVEN SEE HOW DEEP ITS OWN MEMBERS ARE?  The enforcement half
+ * of a declared junction level has to ask, at each acquire, "is this member
+ * ABOVE the level I declared" -- and @set[i].depth cannot answer at the shipping
+ * PER_NODE spacing (ft_anchor_meta never reads it, ft_lock_ctx_depth_of
+ * MANUFACTURES 0, and a back-pointer-resolved member carries
+ * FT_DEPTH_FROM_DESCENT).  The op's OWN ancestor ledger does carry real depths,
+ * recorded by the descent -- but only for nodes that descent ENTERED.  So count
+ * how many members a bulk op could date that way: @ft_bl_found vs
+ * @ft_bl_members is the predicate's coverage, and @ft_bl_undatable is what it
+ * would have to refuse on.
+ */
+extern unsigned long ft_bl_found, ft_bl_undatable, ft_bl_led_empty;
+/*
  * ☠ TWO EQUAL MARGINALS ARE NOT A JOINT.  "every acquire that can widen lacks
  * an owner" is a claim about the PAIR, and separate led_ok / txn_none counters
  * cannot make it -- they would read identically for a population where the two
@@ -5421,6 +5434,30 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 				uatomic_inc(&ft_bl_root);
 				break;
 			}
+		/*
+		 * Could the op DATE each member from its own recorded path?
+		 * Asked by IDENTITY -- the ledger holds node flags, and a
+		 * member the descent entered appears there with a REAL depth.
+		 */
+		if (!ft_anc_ledger.nr) {
+			uatomic_inc(&ft_bl_led_empty);
+		} else {
+			for (j__ = 0; j__ < nr; j__++) {
+				unsigned int k__;
+				bool seen__ = false;
+
+				if (!set[j__].nf)
+					continue;
+				for (k__ = 0; k__ < ft_anc_ledger.nr; k__++)
+					if (ft_anc_ledger.e[k__].nf ==
+							set[j__].nf) {
+						seen__ = true;
+						break;
+					}
+				uatomic_inc(seen__ ? &ft_bl_found :
+						&ft_bl_undatable);
+			}
+		}
 	}
 #endif
 	if (ft_removeall_fault_refuse_acquire())

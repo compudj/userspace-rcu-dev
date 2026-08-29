@@ -364,6 +364,7 @@ unsigned long ft_wo_led_superseded, ft_wo_led_overflow;
 unsigned long ft_wo_led_nr_max;
 unsigned long ft_wo_joint[4];
 unsigned long ft_bl_acq, ft_bl_root, ft_bl_members;
+unsigned long ft_bl_found, ft_bl_undatable, ft_bl_led_empty;
 #ifdef FT_FEATURE_WIDEN
 unsigned long ft_wd_acq, ft_wd_locks, ft_wd_dedup;
 unsigned long ft_wd_no_owner, ft_wd_no_ledger, ft_wd_locks_max;
@@ -443,6 +444,10 @@ static void ft_wo_dump(void)
 		"%lu%s\n",
 		ft_bl_acq, ft_bl_members, ft_bl_root,
 		ft_bl_acq ? "" : "  <-- none seen");
+	fprintf(stderr,
+		"  BULK members datable from the op's OWN ledger: %lu | "
+		"UNDATABLE: %lu | acquires with no ledger: %lu\n",
+		ft_bl_found, ft_bl_undatable, ft_bl_led_empty);
 #ifdef FT_FEATURE_WIDEN
 	/*
 	 * ☠ A WIDENING THAT DID NOT FIRE IS AN EXCLUSION GAP THAT SUCCEEDS AT
