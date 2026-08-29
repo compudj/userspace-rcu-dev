@@ -2330,6 +2330,38 @@ silent-zero trap this section has paid for more than once.
 own correctness argument, and the instrument that proves the gate behaves is
 built on them.
 
+### G5.28 — ☑ THE BULK-LIVE ANCHOR DESCENT IS DROPPED (Mathieu, 2026-08-29)
+
+`_cds_ft_remove_locked`'s third arm -- the descent that ran at PER_NODE when a
+bulk op was live, purely to fill the ancestor ledger (@`3acd5488`) -- is REMOVED.
+Its only consumer was the widening, and the widening is gone (G5.27), so it was
+a full extra key descent per remove inside every bulk window, buying nothing.
+The spacing gate returns to what it was: a descent runs for ANCHORING, and
+per-node anchors on itself.
+
+☑ **Measured back to the pre-fix picture, which is the point**: `no_descent`
+returns to ~50% of in-window acquires (6,200 of 12,498), all attributed to
+`_cds_ft_remove_locked`.  That is now a property of a ledger nobody reads, not a
+gap in anything.
+
+☠ **WHAT IS DELIBERATELY KEPT, and is NOT dead weight:**
+* the LEDGER's `@anc_rec` / `@anc_gen` CREDENTIAL SPLIT ("may WRITE" vs "may
+  READ") and `ft_anc_ledger_valid`.  The copied-descent corruption it closes is
+  RARE again without this arm -- but NOT unreachable: the TOMBSTONE-RECOVERY arm
+  sets `have_descent` at EVERY spacing, so a copy can still reach
+  `ft_walk_extend` and append the orphan branch under the original generation.
+  Removing the fix because its trigger got rarer is how a silent corruption
+  comes back.
+* `ft_walk_extend`'s corrected header -- it stopped being "a no-op under
+  per-node granularity" when the ledger push was hoisted above that early
+  return, and that is still true.
+* the probe's no-descent ATTRIBUTION counters, which is how the number above is
+  attributable at all.
+
+☐ The LEDGER ITSELF now has no shipping consumer -- only
+`-DFT_DEBUG_WIDEN_OWNER` reads it.  Left in place as the instrument's subject; a
+separate call.
+
 ### G5.26 — ☐ FOUND, NOT CHASED: a DEEP rekey is starved ~12,000x by point-op traffic, INSIDE one call
 
 Isolating `inv_widen_deep_junction`'s movers to explain their tiny bulk-side

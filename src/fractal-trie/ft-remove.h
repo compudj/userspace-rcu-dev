@@ -4603,41 +4603,6 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 			holder_flag = fwd;
 			holder_depth = prefix ? d.depth : d.pdepth;
 		}
-	} else if (caa_unlikely(ft_bulk_active(ft))) {
-		/*
-		 * PER-NODE, AND A BULK OP IS LIVE.  The widening needs THE PATH
-		 * -- every ancestor of the node this op locks -- and at this
-		 * spacing nothing on this path produces one: the arm above is
-		 * the only descent, and it is opt-in with the COARSENESS
-		 * because anchoring is the only thing that wanted it.  Widening
-		 * wants it at EVERY spacing, so descend here too.  Same shape as
-		 * the ledger recording itself, which runs before
-		 * ft_descent_enter_node's per-node early return: the default's
-		 * zero-cost path skips what the widening needs, so the gate that
-		 * skips it has to admit the other reason.
-		 *
-		 * ☠ DELIBERATELY NOT THE ARM ABOVE.  That one RETARGETS the
-		 * holder and can demand a retry -- a coarse-spacing correction
-		 * this spacing has never taken, and nothing measures it here.
-		 * @holder_flag, @holder_depth and @need_retry are left exactly
-		 * as the handle derived them; the descent is for the ledger.
-		 *
-		 * ☠ BUT THE VALIDATION IS NOT OPTIONAL, only the retarget is.
-		 * A holder the descent did not pass is one the back-edge names
-		 * STALELY (the arm above measures that lane at 78% of its
-		 * recoveries), so the recorded path would be the key's FORWARD
-		 * branch while this op mutates the other one -- and the ledger
-		 * stamp has no path term to catch it.  A reanchor rewind
-		 * (@skip_conflict) is the same hazard in time.  Either way hand
-		 * the lock context NO descent: the widening then refuses and the
-		 * op's retry loop re-derives, which is the designed answer.
-		 */
-		const uint8_t *ik = iter_key;
-
-		ft_anchor_descend(ft, &d, iter_key, key_len, &ik);
-		if (!d.skip_conflict &&
-				(d.nf == holder_flag || d.pnf == holder_flag))
-			have_descent = true;
 	}
 
 	/*
