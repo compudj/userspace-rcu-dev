@@ -1900,13 +1900,12 @@ struct cds_ft {
 	 * COARSE deliberately derives no lock-set (§10.5 -- one FT-wide lock, no
 	 * per-node locks), so a per-node acquire there would be pure cost.
 	 *
-	 * A FINE trie still takes the FT-wide writer lock as well, for now: the
-	 * op-domains convert one at a time (§11.3 steps 3-6) and an unconverted op
-	 * must not race a converted one (the §11.1 coexistence hazard).  So the
-	 * per-node lock-sets acquired below FINE are, until every domain is
-	 * converted, exercised under FT-wide serialization rather than contended.
-	 * They are dropped from serialization op-domain by op-domain as the
-	 * conversions land.
+	 * ☠ STALE AS WRITTEN -- a FINE trie NO LONGER takes the FT-wide writer
+	 * lock: ft_writer_lock_scope_enter drops it ALL-AT-ONCE for FINE, and has
+	 * since the §11 drop landed.  What remains true is the reason it once
+	 * did.  ☑ The ONE case that takes it back is a live BULK op (G5.25): the
+	 * refcount decides, so point ops keep the lock-free fast path in steady
+	 * state and re-serialize only inside a bulk window.
 	 */
 	bool lock_fine;
 
@@ -2563,6 +2562,19 @@ void ft_writer_lock_park(struct cds_ft *ft)
  * FINE), so there is no optimistic early-out; a FINE trie skips the FT-wide
  * lock further down, under the lock-set drop.
  */
+/*
+ * G5.25: while a bulk op is live, a FINE trie RE-TAKES the FT-wide writer lock
+ * instead of widening every point op's lock-set to the root.  On by default --
+ * it is the shipping bulk-vs-point exclusion; set to 0 for the pre-G5.25
+ * behaviour (no bulk/point exclusion unless -DFT_FEATURE_WIDEN is on).
+ */
+#ifndef FT_BULK_WIDE_LOCK
+# define FT_BULK_WIDE_LOCK	1
+#endif
+
+/* Defined below with the rest of the bulk gate; needed by the scope enter. */
+static inline bool ft_bulk_active(const struct cds_ft *ft);
+
 static inline
 void ft_writer_lock_scope_enter(struct cds_ft *ft)
 {
@@ -2611,7 +2623,35 @@ void ft_writer_lock_scope_enter(struct cds_ft *ft)
 		return;
 	}
 #endif
-	if (ft->lock_fine) {
+	if (ft->lock_fine &&
+			!(FT_BULK_WIDE_LOCK && caa_unlikely(ft_bulk_active(ft)))) {
+		/*
+		 * ☑ G5.25 -- AND THE ONE CASE THAT TAKES IT BACK.  While a BULK
+		 * op is live, a FINE trie RE-TAKES the FT-wide lock, so bulk and
+		 * point writers arbitrate on one word again.  That is the whole
+		 * of G5.5's exclusion, obtained by NOT dropping a lock that
+		 * already exists rather than by widening every point op's
+		 * lock-set to the root:
+		 *   - no ancestor ledger to consume, no up-walk to date members;
+		 *   - NO RELEASE-OWNER PROBLEM AT ALL -- a scoped mutex has no
+		 *     registry, no reservation to size, and no "acquire before
+		 *     the txn exists" blocker (the four sites that defeated the
+		 *     widening's coverage);
+		 *   - and it QUEUES.  The widened DLM acquire spins
+		 *     URCU_TXN_WAIT_PATIENCE and then ABORTS, which is the
+		 *     retry-storm hazard; cds_fair_mutex is FIFO.
+		 * ★ Sound against the seam rule for free: ft_writer_lock_gp_wait
+		 * DROPS this lock across every grace period (@writer_lock: "the
+		 * GP always sits at a seam BETWEEN two distinct commits, so
+		 * releasing there costs no atomicity").
+		 * ★ And the sample races nothing: a point op that read the gate
+		 * as clear is inside the read section urcu_txn_begin took, which
+		 * is exactly what the gate's publish-then-one-GP waits for.
+		 * ☠ The cost is honest and accepted (2026-08-29): while any bulk
+		 * op is live, point ops serialize trie-wide.  At level 0 the
+		 * widening serialized them on the ROOT's lock anyway, so this
+		 * trades an equivalent exclusion for far less machinery.
+		 */
 		/*
 		 * FT-WIDE-LOCK DROP (§11 drop-mechanics, MCAS-first): a FINE trie's
 		 * op-domains are ALL converted to per-node lock-sets (LOCK

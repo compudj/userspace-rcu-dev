@@ -2243,6 +2243,61 @@ result; the global count is not.
 ☠ Neither is a one-liner, and (2) reintroduces the very "appended holds have no
 release owner" hazard the choke-point design exists to avoid, merely moved.
 
+### G5.25 — ☑☑ THE FT-WIDE LOCK, TAKEN ON THE REFCOUNT: same exclusion, none of the machinery
+
+**Mathieu, 2026-08-29:** *"if we accept contention on root, then we can simply
+add a ft wide lock.  the point ops take that lock when concurrent with a bulk.
+the reference counter decides if this lock is needed.  no upwalk needed."*
+
+★ **AND THE LOCK ALREADY EXISTS.**  `ft_writer_lock_scope_enter` DROPS the
+FT-wide writer lock for a FINE trie -- unconditionally, all-at-once, since the
+§11 drop.  So this is not a new mechanism but a one-line *un*-drop:
+
+    if (ft->lock_fine &&
+            !(FT_BULK_WIDE_LOCK && caa_unlikely(ft_bulk_active(ft))))
+            return;                 /* steady state: still dropped */
+
+⇒ **the entire remaining problem list evaporates**: no ancestor ledger to
+consume, no up-walk to date members, no reservation to size, and -- the one that
+actually blocked coverage -- **NO RELEASE-OWNER PROBLEM AT ALL**.  A scoped mutex
+has no registry, so "the four sites acquire before their txn exists" (G5.24)
+simply does not arise.
+★ **AND IT QUEUES.**  The widened DLM acquire spins `URCU_TXN_WAIT_PATIENCE` and
+then ABORTS -- the retry-storm hazard (E) inherited; `cds_fair_mutex` is FIFO.
+★ **Seam rule: free.**  `ft_writer_lock_gp_wait` already DROPS this lock across
+every grace period ("the GP always sits at a seam BETWEEN two distinct commits,
+so releasing there costs no atomicity").
+★ **The sample races nothing**: a point op that read the gate clear is inside the
+read section `urcu_txn_begin` took, which is what the gate's publish-then-one-GP
+waits for -- the same argument the widening uses.
+
+**MEASURED, three reps per arm:**
+
+    arm                    wide lock OFF          wide lock ON        ratio
+    deep    (junction d=12) 885,578/801,744/823,702  95,148/93,144/98,570  8.66x
+    shallow (junction d=1)   77,366/71,127            12,780/13,063        5.8x
+
+☑☑ **WHERE THE TWO MECHANISMS ARE COMPARABLE THEY COST THE SAME.**  On the
+SHALLOW arm the widening also costs 5.8x (G5.15) -- and it must, because there
+"take every ancestor up to the root" IS a trie-wide lock.  The measurement agrees
+to within noise.
+☠ **DO NOT READ THE DEEP ARM AS "the widening is 6x cheaper".**  Its 1.48x was
+measured at **1.2% COVERAGE** (G5.24) -- cheap largely because it barely fires,
+against a wide lock giving COMPLETE exclusion.  The honest statement is
+*complete bulk-vs-point exclusion costs 8.66x on the deep arm*; the widening has
+never been measured complete, and cannot be until its four blocked sites are
+restructured.
+☞ The mechanism of the gap is nonetheless real and worth knowing: the widening
+holds the root's DLM lock across the ACQUIRE COMMIT, while the FT-wide lock is
+held across the WHOLE OP BODY -- descent, build and commit.  A complete widening
+would still have the shorter critical section.
+
+⇒ **THE TRADE, stated plainly:** the FT-wide lock buys the SAME exclusion the
+widening was built for, at the same cost where comparable, with none of the
+machinery and better liveness -- and it is COMPLETE today, which the widening is
+not.  Its cost is a longer critical section, which a complete widening would
+avoid at the price of the ledger, the owner plumbing and the abort-retry regime.
+
 ☞ **THE FORK THIS LEAVES**, and it needs a decision rather than a default:
 1. **DECLARE + ENFORCE + RE-ENTER.**  The op declares from its key; an acquire
    ABOVE the declared level REFUSES; the op then drops its locks, leaves the
