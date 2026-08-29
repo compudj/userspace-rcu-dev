@@ -3733,6 +3733,7 @@ enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
 		const uint8_t *src_key, size_t src_key_len)
 {
 #ifdef FEATURE_FT_MERGE
+	FT_BW_OP(FT_BW_MERGE_AT);
 	return ft_merge_at_inner(dst_ft, dst_key, dst_key_len, src_ft,
 			src_key, src_key_len, NULL);
 #else

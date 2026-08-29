@@ -6046,6 +6046,7 @@ enum cds_ft_status cds_ft_rekey_graft(struct cds_ft *ft,
 		const uint8_t *src_key, size_t src_key_len)
 {
 #ifdef FEATURE_FT_MERGE
+	FT_BW_OP(FT_BW_REKEY_GRAFT);
 	return ft_rekey_dispatch(ft, dst_key, dst_key_len, src_key, src_key_len,
 			FT_REKEY_GRAFT);
 #else
@@ -6060,6 +6061,7 @@ enum cds_ft_status cds_ft_rekey_merge(struct cds_ft *ft,
 		const uint8_t *src_key, size_t src_key_len)
 {
 #ifdef FEATURE_FT_MERGE
+	FT_BW_OP(FT_BW_REKEY_MERGE);
 	return ft_rekey_dispatch(ft, dst_key, dst_key_len, src_key, src_key_len,
 			FT_REKEY_MERGE);
 #else

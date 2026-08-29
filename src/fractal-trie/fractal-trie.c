@@ -131,6 +131,13 @@
  * count nothing.
  */
 #include "ft-txn-rec-dbg.h"
+/*
+ * The bulk-window dump belongs to the TU that owns the FT bodies.
+ * fractal-trie-alloc.c includes the same header and would otherwise emit a
+ * second, permanently EMPTY report that reads exactly like a configuration
+ * miss -- the one misread the instrument exists to prevent.
+ */
+#define FT_BW_OWNS_DUMP
 #include "fractal-trie-internal.h"
 
 #ifdef FEATURE_FT_PROBE_REANCHOR

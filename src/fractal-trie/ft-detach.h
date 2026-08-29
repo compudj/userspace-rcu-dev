@@ -615,6 +615,7 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 {
 	size_t key_len;
 	enum cds_ft_status status;
+	FT_BW_OP(FT_BW_DETACH);
 
 	FT_TP_KEY(detach_enter, ft, _key, _key_len);
 

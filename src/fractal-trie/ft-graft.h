@@ -2554,6 +2554,7 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
 {
 	size_t key_len;
 	enum cds_ft_status status;
+	FT_BW_OP(FT_BW_GRAFT);
 
 	FT_TP_KEY(graft_enter, dst_ft, _key, _key_len);
 
@@ -2801,6 +2802,7 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
 		struct cds_ft *swap_ft)
 {
 	size_t key_len, swap_max;
+	FT_BW_OP(FT_BW_GRAFT_SWAP);
 
 	FT_TP_KEY(graft_swap_enter, dst_ft, _key, _key_len);
 

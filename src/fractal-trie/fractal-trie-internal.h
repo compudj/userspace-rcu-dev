@@ -1762,6 +1762,28 @@ struct cds_ft {
 	pthread_cond_t move_gate_cond;
 	unsigned long move_gate_nr;	/* movers holding the gate */
 	bool move_gate_gp;		/* the 0->1 owner is inside its GP */
+#ifdef FT_DEBUG_BULK_WINDOW
+	/*
+	 * Bulk-window measurement state.  PER-TRIE, because the gate is: two
+	 * tries can be inside ft_move_gate_enter at once (every cross-trie
+	 * scenario does exactly that), and a process-wide @t_open would be
+	 * clobbered by the other trie's window.  Written only under
+	 * @move_gate_lock, so it inherits the gate's own serialization.
+	 */
+	uint64_t bw_t_open;		/* when this trie's window opened (0->1) */
+	uint64_t bw_t_close;		/* when it last closed (1->0), for the gap */
+	/*
+	 * Counted PER TRIE and folded into the global histograms once per
+	 * WINDOW, not once per ENTER.  Atomics on process-wide counters inside
+	 * this lock cost 2x throughput here (measured, 8 movers): the critical
+	 * section is already contended, and a shared line bounced between
+	 * sockets lengthens it enough to convoy every mover behind it.  These
+	 * are plain increments of trie-local words under @move_gate_lock.
+	 */
+	unsigned long bw_enters;
+	unsigned long bw_piggyback;
+	unsigned long bw_peak;
+#endif
 
 	/*
 	 * In-progress compaction state (cds_ft_compact_begin), or NULL.
@@ -2627,7 +2649,319 @@ static inline uint64_t ft_dbg_gp_clock(void)
 }
 #endif
 
+#ifdef FT_DEBUG_BULK_WINDOW
+/*
+ * =====================================================================
+ * MEASUREMENT (opt-in: -DFT_DEBUG_BULK_WINDOW).  NOT part of the library.
+ * =====================================================================
+ *
+ * PRICES G5.5.  Under G5.5 a point op, while a bulk op holds the move gate,
+ * ADDS every ancestor lock up to the ROOT -- so the trie serializes for as
+ * long as the gate is held.  The number that decides whether that is
+ * affordable is the UNION WINDOW: the interval during which move_gate_nr > 0.
+ *
+ * ☠ IT IS NOT per-op duration x rate.  The gate is REFCOUNTED, so concurrent
+ * movers COALESCE: a burst can hold ONE window open end to end, and the 0->1
+ * owner's grace period is paid ONCE for all of them.  Multiplying a per-op
+ * duration by a rate therefore overcounts windows and undercounts their
+ * length.  Only the transitions can answer it, so that is what is recorded:
+ *
+ *   WINDOW  0->1 .. 1->0, the interval point ops would pay for;
+ *   GAP     1->0 .. next 0->1, the trie's free time between windows;
+ *   GP      the 0->1 owner's own update_synchronize_rcu().
+ *
+ * The GP split is the ACTIONABLE half: if a window is nearly all GP, G5.5's
+ * cost is grace-period latency and the lever is opening fewer windows, not
+ * shortening bulk bodies.  Attribution is exact -- the GP is timed by the
+ * owner around its own call, never inferred across threads.
+ *
+ * Both transitions already happen under @move_gate_lock and there is exactly
+ * one 0->1 and one 1->0 per window, so the open/close pairing is TOTAL and
+ * needs no lock of its own.  @bw_t_open lives in struct cds_ft, not here,
+ * because the gate is per-trie.
+ *
+ * ☠☠ THE GATE ALONE MEASURES THE CHEAPEST MEMBER OF THE FAMILY, so it is NOT
+ * reported alone.  Only rekey enters the gate today (ft-rekey.h:3667, :5991,
+ * plus the ft_unit-only hold-open shim at fractal-trie.c:303, whose windows are
+ * a test fixture and not a measurement).  G5.5 must extend it to the other six
+ * public bulk entries -- and THOSE have the long windows: exactly two functions
+ * in the FT reach update_synchronize_rcu (ft-merge.h:2587), and the second,
+ * ft_writer_lock_gp_wait, is called from INSIDE bulk bodies -- graft 4 sites,
+ * detach 3, and rekey's own staged fallback 2.  The rekey ONE-DECIDE path the
+ * gate hook does see was built to avoid mid-op GPs entirely (ft-rekey.h:3543),
+ * so measuring it and calling it the family would bias the answer toward the
+ * shortest member, in the direction that flatters G5.5.
+ *
+ * So the gate hook is the CALIBRATION POINT, and the number G5.5 actually needs
+ * is the PER-CLASS BODY: a wall-clock bracket around each of the 7 public bulk
+ * entries, which is the window each would open once the gate is extended over
+ * it.  BODY already contains that op's in-body GPs; BODY_GP reports how much of
+ * it they are.  A run without a given class records ZERO for it, which is a
+ * CONFIGURATION MISS, not "that op has no window" -- so the dump says which
+ * classes ran, in words.  Read the n= line before reading anything else.
+ *
+ * ☠ AND IT PRICES ONE HALF ONLY.  This measures EXPOSURE (how often, how long
+ * the trie is serialized).  It cannot price the LIVENESS risk -- point ops
+ * widened to the root spin-abort-retrying on a queueless acquire -- because
+ * that regime DOES NOT EXIST in this binary: point ops do not widen yet.  No
+ * hook on today's gate can observe it, and duration does not bound it (a
+ * starving lane is on record here: the remove retry lane does not drain under
+ * lock-holder preemption, and acquire backoff was refuted).  Liveness is the
+ * first gate on the G5.5 BUILD, not a measurement that precedes it.
+ */
+#include <stdio.h>
+#include <time.h>
+
+#define FT_BW_BUCKETS	40
+static unsigned long ft_bw_win[FT_BW_BUCKETS];
+static unsigned long ft_bw_gap[FT_BW_BUCKETS];
+static unsigned long ft_bw_gp[FT_BW_BUCKETS];
+static unsigned long ft_bw_win_n, ft_bw_gap_n, ft_bw_gp_n;
+static unsigned long ft_bw_win_sum, ft_bw_gap_sum, ft_bw_gp_sum;
+static unsigned long ft_bw_win_max, ft_bw_gap_max, ft_bw_gp_max;
+static unsigned long ft_bw_opens;	/* 0->1 transitions */
+static unsigned long ft_bw_enters;	/* every enter: /opens = PIGGYBACK */
+static unsigned long ft_bw_peak;	/* max movers coalesced in one window */
+static unsigned long ft_bw_piggyback;	/* movers that WAITED on the owner's GP */
+static uint64_t ft_bw_first_open, ft_bw_last_close;
+
+/*
+ * PER-CLASS BODY.  One bracket per public bulk entry; the index order is the
+ * order they are declared in include/urcu/fractal-trie.h.
+ */
+enum ft_bw_class {
+	FT_BW_GRAFT, FT_BW_GRAFT_SWAP, FT_BW_DETACH,
+	FT_BW_MERGE_AT, FT_BW_REKEY_GRAFT, FT_BW_REKEY_MERGE, FT_BW_NR_CLASS,
+};
+/*
+ * cds_ft_merge has no class of its own: it is the same-prefix case and
+ * delegates to cds_ft_merge_at (ft-merge.h:3822), so it is counted there.
+ * Bracketing both would count one op twice.
+ */
+static const char * const ft_bw_class_name[FT_BW_NR_CLASS] = {
+	"graft", "graft_swap", "detach", "merge_at",
+	"rekey_graft", "rekey_merge",
+};
+static unsigned long ft_bw_body[FT_BW_NR_CLASS][FT_BW_BUCKETS];
+static unsigned long ft_bw_body_n[FT_BW_NR_CLASS];
+static unsigned long ft_bw_body_sum[FT_BW_NR_CLASS];
+static unsigned long ft_bw_body_max[FT_BW_NR_CLASS];
+static unsigned long ft_bw_body_gp_sum[FT_BW_NR_CLASS];
+static unsigned long ft_bw_body_gp_n[FT_BW_NR_CLASS];	/* ops with >=1 in-body GP */
+
+/*
+ * IN-BODY GRACE PERIODS, accumulated by the calling thread at BOTH sites that
+ * reach update_synchronize_rcu (ft_writer_lock_gp_wait and the gate's own 0->1
+ * wait).  __thread is correct HERE -- an op's body GPs are run by the op's own
+ * thread -- whereas the window's open/close are routinely DIFFERENT threads,
+ * which is why @bw_t_open is per-trie instead.
+ */
+static __thread uint64_t ft_bw_gp_acc;
+static __thread unsigned long ft_bw_gp_acc_n;
+
+static inline
+uint64_t ft_bw_now(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t) ts.tv_sec * 1000000000ULL + (uint64_t) ts.tv_nsec;
+}
+
+static inline
+void ft_bw_record(unsigned long *hist, unsigned long *n, unsigned long *sum,
+		unsigned long *max, uint64_t ns)
+{
+	unsigned int b = 0;
+	uint64_t v = ns;
+
+	while (v >>= 1)
+		b++;
+	if (b >= FT_BW_BUCKETS)
+		b = FT_BW_BUCKETS - 1;
+	uatomic_inc(&hist[b]);
+	uatomic_inc(n);
+	uatomic_add(sum, (unsigned long) ns);
+	if (ns > uatomic_load(max, CMM_RELAXED))
+		uatomic_store(max, (unsigned long) ns, CMM_RELAXED);
+}
+
+static __attribute__((unused))
+void ft_bw_dump_one(const char *tag, const unsigned long *hist,
+		unsigned long n, unsigned long sum, unsigned long max)
+{
+	unsigned long cum = 0, p50 = 0, p90 = 0, p99 = 0;
+	unsigned int i;
+
+	fprintf(stderr, "FT BULKWIN %s: n=%lu mean=%luns max=%luns\n",
+		tag, n, n ? sum / n : 0UL, max);
+	for (i = 0; i < FT_BW_BUCKETS; i++) {
+		if (!hist[i])
+			continue;
+		cum += hist[i];
+		if (!p50 && cum * 100 >= n * 50)
+			p50 = 1UL << i;
+		if (!p90 && cum * 100 >= n * 90)
+			p90 = 1UL << i;
+		if (!p99 && cum * 100 >= n * 99)
+			p99 = 1UL << i;
+		fprintf(stderr, "  >=2^%-2u (%12lu ns) %10lu\n",
+			i, 1UL << i, hist[i]);
+	}
+	/* log2 buckets: each percentile is a LOWER bound, exact to 2x. */
+	fprintf(stderr, "FT BULKWIN %s: p50>=%luns p90>=%luns p99>=%luns\n",
+		tag, p50, p90, p99);
+}
+
+/*
+ * The bracket.  Wall clock plus the GP time this thread accumulated inside the
+ * body, so BODY and BODY_GP are reported against the same interval.
+ */
+struct ft_bw_op {
+	uint64_t t0;
+	uint64_t gp0;
+	unsigned long gpn0;
+	enum ft_bw_class cls;
+};
+
+static inline
+void ft_bw_op_begin(struct ft_bw_op *op, enum ft_bw_class cls)
+{
+	op->cls = cls;
+	op->gp0 = ft_bw_gp_acc;
+	op->gpn0 = ft_bw_gp_acc_n;
+	op->t0 = ft_bw_now();
+}
+
+static inline
+void ft_bw_op_end(struct ft_bw_op *op)
+{
+	uint64_t d = ft_bw_now() - op->t0;
+
+	ft_bw_record(ft_bw_body[op->cls], &ft_bw_body_n[op->cls],
+			&ft_bw_body_sum[op->cls], &ft_bw_body_max[op->cls], d);
+	uatomic_add(&ft_bw_body_gp_sum[op->cls],
+			(unsigned long) (ft_bw_gp_acc - op->gp0));
+	if (ft_bw_gp_acc_n != op->gpn0)
+		uatomic_inc(&ft_bw_body_gp_n[op->cls]);
+}
+
+static inline
+void ft_bw_op_cleanup(struct ft_bw_op *op)
+{
+	ft_bw_op_end(op);
+}
+
+/*
+ * Scoped so that EVERY return path is covered: these entries reject bad
+ * arguments with early returns, and a bracket that only wrapped the success
+ * path would silently omit them.  Rejections land in the low buckets (they do
+ * no work); the workloads here pass valid arguments, so they are cold.
+ */
+#ifdef FT_BW_ISOLATE_GATE
+/* Perturbation A/B only: gate hooks armed, per-class body bracket removed. */
+# define FT_BW_OP(cls)		do { } while (0)
+#else
+#define FT_BW_OP(cls)							\
+	struct ft_bw_op ft_bw_op__					\
+		__attribute__((cleanup(ft_bw_op_cleanup)));		\
+	ft_bw_op_begin(&ft_bw_op__, (cls))
+#endif
+
+#ifdef FT_BW_OWNS_DUMP
+__attribute__((destructor))
+static
+void ft_bw_dump(void)
+{
+	uint64_t span;
+
+	unsigned int c;
+	unsigned long any_body = 0;
+
+	for (c = 0; c < FT_BW_NR_CLASS; c++)
+		any_body += ft_bw_body_n[c];
+	/*
+	 * THE PER-CLASS BODY IS THE G5.5 NUMBER: the window each op would open
+	 * once the gate is extended over it.  Printed FIRST, and printed even
+	 * when the gate itself was never entered, because a graft-only or
+	 * detach-only run has no windows today and still has the windows G5.5
+	 * would create.
+	 */
+	if (any_body) {
+		fprintf(stderr, "FT BULKWIN: --- PER-CLASS BODY (the PREDICTED "
+			"G5.5 window per bulk op) ---\n");
+		for (c = 0; c < FT_BW_NR_CLASS; c++) {
+			if (!ft_bw_body_n[c]) {
+				fprintf(stderr, "FT BULKWIN BODY %-12s: NOT "
+					"EXERCISED (configuration miss, not a "
+					"zero window)\n", ft_bw_class_name[c]);
+				continue;
+			}
+			ft_bw_dump_one(ft_bw_class_name[c], ft_bw_body[c],
+					ft_bw_body_n[c], ft_bw_body_sum[c],
+					ft_bw_body_max[c]);
+			fprintf(stderr, "FT BULKWIN BODY %-12s: in-body GP "
+				"%.2f%% of body time, %lu/%lu ops took >=1 GP\n",
+				ft_bw_class_name[c],
+				ft_bw_body_sum[c] ? 100.0 *
+					(double) ft_bw_body_gp_sum[c] /
+					(double) ft_bw_body_sum[c] : 0.0,
+				ft_bw_body_gp_n[c], ft_bw_body_n[c]);
+		}
+	} else {
+		fprintf(stderr, "FT BULKWIN: NO BULK OP RAN AT ALL -- "
+			"CONFIGURATION MISS, not a measurement.\n");
+	}
+	if (!ft_bw_opens) {
+		fprintf(stderr, "FT BULKWIN: NO WINDOWS -- the move gate was "
+			"never entered.  Only rekey enters it today "
+			"(ft-rekey.h:3667,:5991); a graft/detach/merge run "
+			"legitimately shows zero here while still having the "
+			"per-class bodies above.  CONFIGURATION MISS, not a "
+			"measurement.\n");
+		return;
+	}
+	ft_bw_dump_one("WINDOW", ft_bw_win, ft_bw_win_n, ft_bw_win_sum,
+			ft_bw_win_max);
+	ft_bw_dump_one("GP", ft_bw_gp, ft_bw_gp_n, ft_bw_gp_sum, ft_bw_gp_max);
+	ft_bw_dump_one("GAP", ft_bw_gap, ft_bw_gap_n, ft_bw_gap_sum,
+			ft_bw_gap_max);
+	/*
+	 * COALESCING, the reason a rate cannot stand in for this: @enters
+	 * movers were served by @opens windows and @opens grace periods.
+	 */
+	fprintf(stderr, "FT BULKWIN: enters=%lu opens=%lu movers_per_window=%.2f "
+		"waited_on_owner_GP=%lu peak_concurrent=%lu\n",
+		ft_bw_enters, ft_bw_opens,
+		ft_bw_opens ? (double) ft_bw_enters / (double) ft_bw_opens : 0.0,
+		ft_bw_piggyback, ft_bw_peak);
+	if (ft_bw_win_n != ft_bw_opens)
+		fprintf(stderr, "FT BULKWIN: %lu window(s) STILL OPEN at exit "
+			"and therefore NOT counted -- duty cycle is a LOWER "
+			"bound.\n", ft_bw_opens - ft_bw_win_n);
+	/*
+	 * DUTY CYCLE over the measured span (first open .. last close), which
+	 * is the fraction of the time a point op would have been serialized
+	 * trie-wide.  Over the SPAN, not over process lifetime: setup and
+	 * teardown are not workload.
+	 */
+	span = ft_bw_last_close - ft_bw_first_open;
+	fprintf(stderr, "FT BULKWIN: span=%luns open=%luns DUTY=%.2f%% "
+		"(GP share of open time=%.2f%%)\n",
+		(unsigned long) span, ft_bw_win_sum,
+		span ? 100.0 * (double) ft_bw_win_sum / (double) span : 0.0,
+		ft_bw_win_sum ? 100.0 * (double) ft_bw_gp_sum /
+				(double) ft_bw_win_sum : 0.0);
+}
+#endif /* FT_BW_OWNS_DUMP */
+#endif /* FT_DEBUG_BULK_WINDOW */
+
+#ifndef FT_DEBUG_BULK_WINDOW
+# define FT_BW_OP(cls)		do { } while (0)
+#endif
+
 #ifdef FEATURE_FT_HOLD_TRACE
+
 /*
  * THE SEAM-RULE ARM: no NODE lock may be held across a grace period.  Defined
  * with the hold ledger in ft-mutation-helpers.h, which is included long after
@@ -2671,7 +3005,17 @@ void ft_writer_lock_gp_wait(struct cds_ft *ft)
 #ifdef FEATURE_FT_HOLD_TRACE
 	ft_seam_check("ft_writer_lock_gp_wait");
 #endif
+#ifdef FT_DEBUG_BULK_WINDOW
+	{
+		uint64_t t0__ = ft_bw_now();
+
+		ft->group->flavor->update_synchronize_rcu();
+		ft_bw_gp_acc += ft_bw_now() - t0__;
+		ft_bw_gp_acc_n++;
+	}
+#else
 	ft->group->flavor->update_synchronize_rcu();
+#endif
 	if (held) {
 		/*
 		 * OFFLINE for the re-acquire, or the drop above buys nothing when
@@ -2785,10 +3129,28 @@ extern __thread unsigned long ft_dbg_free_via;
 #endif
 
 
+
 static inline
 void ft_move_gate_enter(struct cds_ft *ft)
 {
 	pthread_mutex_lock(&ft->move_gate_lock);
+#ifdef FT_DEBUG_BULK_WINDOW
+	/*
+	 * Under @move_gate_lock, so the counts and the open stamp inherit the
+	 * gate's own serialization.  PIGGYBACK is counted as movers that
+	 * actually WAITED on the owner's GP (@move_gate_gp still true), not as
+	 * every non-owner: a mover arriving after the GP completed waits for
+	 * nothing and would overstate "a burst pays one GP".
+	 */
+	ft->bw_enters++;
+	if (ft->move_gate_nr == 0) {
+		ft->bw_t_open = ft_bw_now();
+	} else if (ft->move_gate_gp) {
+		ft->bw_piggyback++;
+	}
+	if (ft->move_gate_nr + 1 > ft->bw_peak)
+		ft->bw_peak = ft->move_gate_nr + 1;
+#endif
 	if (ft->move_gate_nr++ == 0) {
 		CMM_STORE_SHARED(ft->move_active, 1);
 		ft->move_gate_gp = true;
@@ -2809,6 +3171,17 @@ void ft_move_gate_enter(struct cds_ft *ft)
 			ft->group->flavor->update_synchronize_rcu();
 			ft_dbg_gp_ns += ft_dbg_gp_clock() - t0__;
 			ft_dbg_gp_calls++;
+		}
+#elif defined(FT_DEBUG_BULK_WINDOW)
+		{
+			uint64_t t0__ = ft_bw_now(), d__;
+
+			ft->group->flavor->update_synchronize_rcu();
+			d__ = ft_bw_now() - t0__;
+			ft_bw_record(ft_bw_gp, &ft_bw_gp_n, &ft_bw_gp_sum,
+					&ft_bw_gp_max, d__);
+			ft_bw_gp_acc += d__;
+			ft_bw_gp_acc_n++;
 		}
 #else
 		ft->group->flavor->update_synchronize_rcu();
@@ -2853,8 +3226,35 @@ static inline
 void ft_move_gate_exit(struct cds_ft *ft)
 {
 	pthread_mutex_lock(&ft->move_gate_lock);
-	if (--ft->move_gate_nr == 0)
+	if (--ft->move_gate_nr == 0) {
 		CMM_STORE_SHARED(ft->move_active, 0);
+#ifdef FT_DEBUG_BULK_WINDOW
+		{
+			uint64_t now__ = ft_bw_now();
+
+			ft_bw_record(ft_bw_win, &ft_bw_win_n, &ft_bw_win_sum,
+					&ft_bw_win_max, now__ - ft->bw_t_open);
+			uatomic_inc(&ft_bw_opens);
+			if (ft->bw_t_close)
+				ft_bw_record(ft_bw_gap, &ft_bw_gap_n,
+						&ft_bw_gap_sum, &ft_bw_gap_max,
+						ft->bw_t_open - ft->bw_t_close);
+			/* Fold this window's per-trie tallies into the globals. */
+			uatomic_add(&ft_bw_enters, ft->bw_enters);
+			uatomic_add(&ft_bw_piggyback, ft->bw_piggyback);
+			if (ft->bw_peak > uatomic_load(&ft_bw_peak, CMM_RELAXED))
+				uatomic_store(&ft_bw_peak, ft->bw_peak,
+						CMM_RELAXED);
+			ft->bw_enters = 0;
+			ft->bw_piggyback = 0;
+			ft->bw_peak = 0;
+			if (!ft_bw_first_open)
+				ft_bw_first_open = ft->bw_t_open;
+			ft->bw_t_close = now__;
+			ft_bw_last_close = now__;
+		}
+#endif
+	}
 	pthread_mutex_unlock(&ft->move_gate_lock);
 }
 
