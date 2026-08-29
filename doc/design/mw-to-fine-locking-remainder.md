@@ -1204,6 +1204,90 @@ ground 2 cites.  ☐ It does not by itself answer the overlapping-window problem
 of ground 1: shared flags would have to be COUNTERS or owner-stamped, not bits.
 ☐ UNDECIDED — this is a direction, not a third protocol.
 
+### G5.9 — ☠☠ THE BULK WINDOW IS MEASURED, AND IT HAS NO DURATION: DUTY ~99.9% (@`8034fe5f`)
+
+G5.5's accepted cost — "point ops serialize trie-wide FOR THE WINDOW" — reads
+as a bounded burst.  **It is not bounded.**  `-DFT_DEBUG_BULK_WINDOW` measures
+the UNION window (the interval `move_gate_nr > 0`), FINE trie, `-O2 -DNDEBUG`,
+8 movers + 6 insert/remove + 8 readers, 2.0 s runs, 3 reps each:
+
+    arm                       moves/2s   body p50   body mean  WINDOWS   DUTY
+    contended (ONE junction)   527-584   >=2-4 ms    28-31 ms      2    99.91-99.92%
+    fine (disjoint bands)    15980-17075 >=524 us  0.94-1.00 ms    2    99.76-99.92%
+
+**TWO windows in a two-second run, in all six runs.**  The gate brackets the
+WHOLE rekey op (`ft-rekey.h:5991..6040`), so a mover in a loop is inside it
+essentially always; with 8 movers the refcount never returns to 0.  Wherever
+bulk ops OVERLAP IN TIME, the window IS the workload, and under G5.5 point ops
+would widen to the root permanently.
+
+★★ **AND THE CAUSE IS THE PROPERTY THE DESIGN LEANED ON.**  "The gate amortizes
+ONE GP across a burst" (G5.5, G5.8) is TRUE and then some: only **7** movers out
+of up to **17,076** enters ever waited on the owner's GP, and the GP is
+0.05-0.09% of open time.  But AMORTIZING THE GP *IS* KEEPING THE GATE OPEN.  The
+property that makes the gate cheap for READERS is exactly what makes it maximally
+expensive for G5.5's POINT OPS — one fact read from two ends.
+
+☠ **"duty = duration x rate" IS REFUTED**, and that was the reporting plan an
+adversarial review killed before the run.  Windows COALESCE (movers per window
+264-8,538), so duty SATURATES rather than accumulating.  The threshold is
+OVERLAP, not rate: strictly serial bulk ops one every T give duty ~ d/T; bulk
+ops ever CONCURRENT give duty -> 100%.  At the measured uncontended body
+d ~ 1 ms, ONE bulk producer above ~1000 ops/s pins the gate open by itself.
+
+**GP is not the cost; CONTENTION is.**  In-body GP is 0.01% of rekey body time
+(1 op in ~16,000).  The same op is ~1 ms disjoint and ~30 ms when 14 writers
+share one junction — **30x**.  Shortening grace periods buys nothing here.
+
+**PER-CLASS BODY** (full suite, 120 scenarios, 0 failures) — the window each op
+WOULD open once the gate is extended past rekey:
+
+    class          n          mean      in-body GP   ops taking >=1 GP
+    graft          312,854    9.7 us    0.00%        0 / 312,854
+    graft_swap   1,134,935   11.9 us   80.59%        1,102,270 / 1,134,935
+    detach             317    1.83 ms   7.08%        275 / 317
+    merge_at       185,438   12.4 us    0.00%        0 / 185,438
+    rekey_graft     72,705     915 us   0.24%        2,981 / 72,705
+    rekey_merge          —    NOT EXERCISED (configuration miss)
+
+★ This REFUTES the structural prediction that graft/detach carry the family's
+LONGEST windows because their bodies hold 4 and 3 `ft_writer_lock_gp_wait`
+sites.  **CALL SITES ARE NOT EXECUTED GPs**: graft took ZERO in-body GPs in
+312,854 ops, merge_at zero in 185,438.  `graft_swap` takes one in ~97% of ops
+but they are CHEAP (80% of an 11.9 us body).  rekey is not the cheapest member
+of the family — it is among the most expensive; only detach is longer.
+
+☠ **WHAT THIS DOES NOT PRICE — and it cannot, before the build.**  This is
+EXPOSURE only.  G5.5's second risk — point ops widened to the root
+spin-abort-retrying on a queueless ABORTING acquire — lives in a regime THAT
+DOES NOT EXIST IN THIS BINARY, because point ops do not widen yet.  Duration
+does not bound it: a starving lane is already on record (remove's retry lane
+does not drain under lock-holder preemption; acquire backoff REFUTED;
+escalation rescues a COMMIT, never an ACQUIRE).  ⇒ Liveness must be the FIRST
+GATE ON THE G5.5 BUILD, behind its own flag, with per-point-op abort/age
+histograms sampled INSIDE the attempt.  ★ And this result makes that risk
+WORSE, not better: the widened-acquire regime would not be an occasional window
+a point op waits out — it would be the STEADY STATE.
+
+☐ **THE QUESTION FOR MATHIEU, and the plan is NOT changed pending it.**  G5.5
+was chosen as the deliberately coarsest point on the axis, to be refined later
+ON MEASUREMENT.  This is that measurement, and it says the coarse point costs
+~100% point-op serialization under any overlapping bulk load rather than a
+bounded burst.  Three ways forward, none taken here:
+  1. accept it (bulk-op load in real workloads may simply be sparse and
+     NON-OVERLAPPING — the duty cycle is a property of the WORKLOAD's bulk
+     concurrency, not of the library);
+  2. refine now rather than later — G5.6's tier-2 was refuted on its WORD, not
+     on its principle (G5.7), and the counter principle survives;
+  3. narrow the WINDOW instead of the lock set — the gate currently brackets
+     the whole op, and most of the body is contention, not publication.
+
+☐ LIMITS: WINDOW percentiles are meaningless at n=2 (the finding is "2 windows
+cover 99.9% of the span").  Instrument perturbation 1.23x, so body durations are
+inflated by about that.  Per-class bodies aggregate a mostly low-contention
+suite.  ft_unit's 3 rekey/merge failures are PRE-EXISTING (proven against a
+pristine control build), not instrument-induced.
+
 ---
 
 ## 3. Phase A — arm COARSE, then exclusive
