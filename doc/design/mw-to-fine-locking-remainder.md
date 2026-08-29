@@ -2298,6 +2298,38 @@ machinery and better liveness -- and it is COMPLETE today, which the widening is
 not.  Its cost is a longer critical section, which a complete widening would
 avoid at the price of the ledger, the owner plumbing and the abort-retry regime.
 
+### G5.27 — ☑ THE WIDENING IS REMOVED (Mathieu, 2026-08-29)
+
+`-DFT_FEATURE_WIDEN` and everything that existed only to serve it are DELETED:
+`ft_widen_owner`, `ft_held_set::widen_txn` and its `holds()` arm, the widened
+selection / take loop / release hand-off in `ft_dlm_acquire_set_at`, the
+`nr_widen` accounting in its bound and heap split, `ft_node_recompact`'s chained
+owner frame, and the `ft_wd_*` counters.  **309 lines out, 10 in.**
+
+★ **KEPT AS A DEAD OPTION IT IS NOT.**  A flag that stays behind "in case" is a
+second exclusion mechanism nobody exercises: it would rot against every later
+change to the acquire, and the one thing this section establishes is that where
+the two are COMPARABLE they cost the SAME (G5.25).  The FT-wide lock is the
+exclusion; there is no second one.
+
+☠ **AND THE PER-SITE `no_owner` COUNTER WENT WITH IT.**  With nothing to widen it
+could only ever print 0, and a permanently-zero counter beside live ones reads as
+"this class does not occur" rather than "this class is not measured" -- the
+silent-zero trap this section has paid for more than once.
+
+☞ **WHAT SURVIVES, and why it is not orphaned:**
+* the BULK GATE and its packed `{refcount, level}` word -- `ft_bulk_active()` is
+  what the FT-wide lock is gated on;
+* the ANCESTOR LEDGER and its generation/trie stamp -- ☐ its only consumer was
+  the widening, so it is now UNCONSUMED library code.  Kept for the moment
+  because the `-DFT_DEBUG_WIDEN_OWNER` instrument still reads it and because its
+  credential split documents a real hazard, but it is a candidate for removal.
+* `_cds_ft_remove_locked`'s bulk-live anchor descent (@`3acd5488`) -- same
+  status: it exists to fill the ledger.
+☞ Removing those two is a SEPARATE call: they are landed library code with their
+own correctness argument, and the instrument that proves the gate behaves is
+built on them.
+
 ### G5.26 — ☐ FOUND, NOT CHASED: a DEEP rekey is starved ~12,000x by point-op traffic, INSIDE one call
 
 Isolating `inv_widen_deep_junction`'s movers to explain their tiny bulk-side

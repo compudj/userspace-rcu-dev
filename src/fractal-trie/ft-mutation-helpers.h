@@ -3347,9 +3347,6 @@ struct ft_held_set {
 	 * the default build carries neither the field nor the scan, rather than
 	 * an always-false branch nobody measured.
 	 */
-#ifdef FT_FEATURE_WIDEN
-	struct ft_flip_txn *widen_txn;
-#endif
 	const struct ft_held_anchor *extra;	/* marks held outside it */
 	unsigned int nr_extra;
 	const struct ft_glue *glue;		/* marks the glue names by field */
@@ -3430,15 +3427,6 @@ bool ft_held_set_snap(const struct ft_held_set *h,
 				*snap = h->txn->locks[i].snap;
 				return true;
 			}
-#ifdef FT_FEATURE_WIDEN
-	/* the widened ancestors this op holds; see @widen_txn */
-	if (h->widen_txn && h->widen_txn != h->txn)
-		for (i = 0; i < h->widen_txn->nr_locks; i++)
-			if (h->widen_txn->locks[i].meta == meta) {
-				*snap = h->widen_txn->locks[i].snap;
-				return true;
-			}
-#endif
 	for (i = 0; i < h->nr_extra; i++)
 		if (h->extra[i].lock == meta && !h->extra[i].shared) {
 #ifdef FEATURE_FT_HOLD_TRACE
@@ -3607,9 +3595,6 @@ void ft_lock_ctx_init(struct ft_lock_ctx *ctx, const struct ft_descent *d,
 {
 	ctx->d = d;
 	ctx->held.txn = txn;
-#ifdef FT_FEATURE_WIDEN
-	ctx->held.widen_txn = NULL;
-#endif
 	ctx->held.extra = NULL;
 	ctx->held.nr_extra = 0;
 	ctx->held.glue = NULL;
@@ -5116,7 +5101,6 @@ struct ft_wo_site {
 	int line;
 	unsigned long live, txn_top, txn_chain, txn_none;
 	unsigned long led_ok, led_bad;
-	unsigned long no_owner;		/* could widen; no release owner wired */
 	unsigned long fine, spacing;	/* the trie this site was seen on */
 };
 extern struct ft_wo_site ft_wo_site_tbl[FT_WO_SITES];
@@ -5334,35 +5318,6 @@ void ft_wo_observe(const char *fn, int line, const struct cds_ft *ft,
 	if (site) {
 		uatomic_inc(&site->live);
 		uatomic_inc(led_ok ? &site->led_ok : &site->led_bad);
-#ifdef FT_FEATURE_WIDEN
-		/*
-		 * ☠ WHICH SITES DECLINE, AND HOW OFTEN.  An acquire that could
-		 * widen and has no owner wired takes the same locks it always
-		 * did -- an exclusion gap that succeeds at everything it does.
-		 * Ranking the sites is what turns "wire them all" into a work
-		 * list; the global total alone says only that a hole exists.
-		 */
-		{
-			const struct ft_held_set *hs__;
-			bool own__ = false;
-
-			/*
-			 * ☠ THE SAME PREDICATE ft_widen_owner USES, including the
-			 * @txn fallback -- a site counter that asked only about
-			 * @widen_txn would keep reporting sites the fallback now
-			 * covers, i.e. would answer for a rule the code no longer
-			 * follows.
-			 */
-			for (hs__ = ctx ? &ctx->held : NULL; hs__;
-					hs__ = hs__->outer)
-				if (hs__->widen_txn || hs__->txn) {
-					own__ = true;
-					break;
-				}
-			if (!own__)
-				uatomic_inc(&site->no_owner);
-		}
-#endif
 		uatomic_store(&site->fine, ft->lock_fine, CMM_RELAXED);
 		uatomic_store(&site->spacing, ft->lock_spacing, CMM_RELAXED);
 	}
@@ -5382,82 +5337,6 @@ void ft_wo_observe(const char *fn, int line, const struct cds_ft *ft,
 }
 #endif /* FT_DEBUG_WIDEN_OWNER */
 
-#ifdef FT_FEATURE_WIDEN
-/*
- * G5.5's WIDENING.  While a bulk op is live, a point op ADDS to its lock set
- * every ancestor from the published min level DOWN, so bulk and point writers
- * arbitrate on a shared word instead of on none.
- *
- * ☠☠ ADD, NEVER SUBSTITUTE.  In the window point ops split into OBSERVERS and
- * NON-OBSERVERS (the latter built their set before the word was visible).  If
- * an observer REPLACED its leaf lock L with an ancestor J, an observer holding
- * {J} and a non-observer holding {L} on ONE leaf would share NO WORD -- two
- * point ops excluding nothing, and quietly.  With ADD, L is never surrendered,
- * so point-vs-point exclusion is identical throughout and the gate's grace
- * period has to cover only the non-observers.  It is also what makes the EXIT
- * free: a stale observer holding {L,J} against a fresh {L} is still excluded
- * on L, so no second grace period is owed.
- *
- * ☠ OFF BY DEFAULT.  G5.9 established that the queueless-aborting-acquire
- * regime this creates cannot be measured until it exists, and that LIVENESS --
- * not correctness -- is the first gate on it.  So it ships behind its own flag,
- * with counters, until that gate has run.
- */
-
-/*
- * The txn that will own a widened hold's release, from anywhere in the op's
- * held-set chain.  NULL means this site was given none: the acquire then does
- * not widen, which is exactly today's behaviour, and the miss is COUNTED
- * rather than silent -- an unwidened acquire is an exclusion gap that succeeds
- * at everything it does.
- */
-/*
- * Defined below (the release recorders sit past this choke point); the widened
- * hand-off is its only caller from up here.
- */
-static inline
-void ft_flip_txn_record_anchor_release_held(struct ft_flip_txn *t,
-		struct cds_ft_metadata *lock);
-
-static inline
-struct ft_flip_txn *ft_widen_owner(const struct ft_lock_ctx *ctx)
-{
-	const struct ft_held_set *hs;
-
-	/*
-	 * ★ @txn IS THE DEFAULT OWNER, and not as a convenience: it is defined
-	 * as "the commit's lock registry" -- the txn whose TERMINAL releases
-	 * this op's locks.  A widened hold registered there is therefore given
-	 * back by exactly the terminal that gives back every other word the op
-	 * took: a recorded {LOCK|s -> s} on commit, or the registry's CAS-clear
-	 * on abort / memory error / a pre-commit bail.  Nothing about a widened
-	 * hold wants a different lifetime.
-	 *
-	 * @widen_txn overrides it for the sites where the two DIFFER -- notably
-	 * ft_node_recompact, whose owner is its @retire_txn PARAMETER and sits
-	 * in no ctx frame at all.  Checked FIRST for that reason.
-	 */
-	for (hs = ctx ? &ctx->held : NULL; hs; hs = hs->outer)
-		if (hs->widen_txn)
-			return hs->widen_txn;
-	for (hs = ctx ? &ctx->held : NULL; hs; hs = hs->outer)
-		if (hs->txn)
-			return hs->txn;
-	return NULL;
-}
-
-#ifdef FT_DEBUG_WIDEN_OWNER
-extern unsigned long ft_wd_acq, ft_wd_locks, ft_wd_dedup;
-extern unsigned long ft_wd_no_owner, ft_wd_no_ledger, ft_wd_locks_max;
-# define FT_WD_INC(c)		uatomic_inc(&(c))
-# define FT_WD_ADD(c, v)	uatomic_add(&(c), (v))
-# define FT_WD_MAX(c, v)	ft_wo_max(&(c), (v))
-#else
-# define FT_WD_INC(c)		do { } while (0)
-# define FT_WD_ADD(c, v)	do { } while (0)
-# define FT_WD_MAX(c, v)	do { } while (0)
-#endif
-#endif /* FT_FEATURE_WIDEN */
 
 static inline
 int ft_dlm_acquire_set_at(const char *fn, int line,
@@ -5482,12 +5361,6 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 	unsigned int nr_taken = 0;
 	struct ft_flip_txn *acq;
 	int i, nr_present = 0;
-#ifdef FT_FEATURE_WIDEN
-	struct ft_flip_txn *widen_owner = NULL;
-	unsigned int w0 = 0, nr_widen = 0, nr_taken_own = 0, wi;
-#else
-	const unsigned int nr_widen = 0;
-#endif
 
 	for (i = 0; i < nr; i++)
 		if (set[i].nf)
@@ -5570,41 +5443,6 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 #endif
 	if (ft_removeall_fault_refuse_acquire())
 		return -EAGAIN;		/* test-only; nothing acquired */
-#ifdef FT_FEATURE_WIDEN
-	{
-		unsigned int min_lvl;
-
-		/*
-		 * ☠ ONE LOAD for the pair: a live refcount read with a stale
-		 * DEEPER level widens from too far down, which is an exclusion
-		 * gap that reports nothing (ft_bulk_sample).
-		 */
-		if (caa_unlikely(ft_bulk_sample(ft, &min_lvl)) &&
-				!ft_bulk_self_depth) {
-			widen_owner = ft_widen_owner(ctx);
-			if (!widen_owner) {
-				FT_WD_INC(ft_wd_no_owner);
-			} else if (!ft_anc_ledger_valid(ft,
-					ft_lock_ctx_descent(ctx))) {
-				FT_WD_INC(ft_wd_no_ledger);
-				widen_owner = NULL;
-			} else {
-				/*
-				 * The ledger is ROOT-FIRST and STRICTLY
-				 * DEEPENING (measured over 4.1M entries), so
-				 * "from the min level down" is a SUFFIX and
-				 * needs no copy -- nothing runs a descent
-				 * between here and the takes below.
-				 */
-				while (w0 < ft_anc_ledger.nr &&
-						ft_anc_ledger.e[w0].depth <
-							min_lvl)
-					w0++;
-				nr_widen = ft_anc_ledger.nr - w0;
-			}
-		}
-	}
-#endif
 	/*
 	 * ☠ A RUNTIME REFUSAL, NOT AN ASSERT.  The old assert is compiled out
 	 * under NDEBUG, and the bound it named is CALLER-DRIVEN and reachable:
@@ -5616,15 +5454,15 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 	 * NOTHING IS ACQUIRED YET, so there is no word whose release we would be
 	 * orphaning, and the caller's retry loop already handles -ENOMEM.
 	 */
-	if (caa_unlikely(nr_present + (int) nr_widen > FT_DLM_ACQUIRE_MAX_SET))
+	if (caa_unlikely(nr_present > FT_DLM_ACQUIRE_MAX_SET))
 		return -ENOMEM;			/* nothing acquired */
-	if (caa_unlikely(nr_present + (int) nr_widen > FT_ACQ_EMBED_LOCKS)) {
-		taken_heap = malloc(((size_t) nr_present + nr_widen) *
+	if (caa_unlikely(nr_present > FT_ACQ_EMBED_LOCKS)) {
+		taken_heap = malloc((size_t) nr_present *
 				(sizeof(*taken) + sizeof(*taken_snap)));
 		if (!taken_heap)
 			return -ENOMEM;		/* nothing acquired */
 		taken = taken_heap;
-		taken_snap = (uintptr_t *) (taken + nr_present + nr_widen);
+		taken_snap = (uintptr_t *) (taken + nr_present);
 #ifdef FT_DEBUG_FORCE_ACQ_HEAP
 		uatomic_inc(&ft_acq_heap_taken);
 #endif
@@ -5642,24 +5480,7 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 	 * its descriptor and its install lane, which measured WORSE (median 9.5
 	 * starving removes against 4 for aging alone, complete separation).
 	 */
-#ifdef FT_FEATURE_WIDEN
-	/*
-	 * SIZE THE OWNER'S RESERVATION BEFORE ANYTHING IS ACQUIRED.  Each
-	 * widened hold needs a RELEASE EDGE in the txn that will drop it, and
-	 * that edge is recorded after the acquire commits -- where a failure to
-	 * grow would leave a word LOCKED with no recorded release, i.e. a
-	 * permanent lock leak.  Reserving here instead makes the failure an
-	 * ordinary -ENOMEM with NOTHING ACQUIRED.  An over-reservation when the
-	 * takes below dedupe is wasted capacity, never a correctness problem.
-	 */
-	if (nr_widen && !ft_flip_txn_reserve_extra(widen_owner, nr_widen)) {
-		free(taken_heap);
-		return -ENOMEM;			/* nothing acquired */
-	}
-	acq = ft_flip_txn_acquire_bounded(3 * nr_present + nr_widen);
-#else
 	acq = ft_flip_txn_acquire_bounded(3 * nr_present);
-#endif
 	if (!acq) {
 		free(taken_heap);	/* allocated above; nothing acquired yet */
 		return -ENOMEM;
@@ -5970,53 +5791,6 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 		set[i].held.oracle_skip = false;
 #endif
 	}
-#ifdef FT_FEATURE_WIDEN
-	/*
-	 * THE WIDENED ANCESTORS, taken in the SAME all-or-none commit as the
-	 * members.  They carry no guard and no node snapshot: a widened hold is
-	 * pure exclusion -- nothing retires it, nothing validates a back-edge
-	 * through it -- so the only thing owed for it is a RELEASE, recorded
-	 * below.  Deduping against the op's held set and against this set's own
-	 * takes is mandatory, not an economy: a second ft_dlm_lock on a word the
-	 * op already holds aborts -EAGAIN and the op waits on itself for ever.
-	 */
-	nr_taken_own = nr_taken;
-	for (wi = 0; wi < nr_widen; wi++) {
-		struct cds_ft_inode_flag *wnf = ft_anc_ledger.e[w0 + wi].nf;
-		struct cds_ft_metadata *wnode, *wlock;
-		uintptr_t wsnap, wheld = 0;
-		bool wratified, wdup = false;
-		unsigned int k;
-
-		/* an external head carries no state word to lock */
-		if (!wnf || ft_node_external(wnf))
-			continue;
-		wnode = ft_flag_to_metadata(ft, wnf);
-		if (!wnode)
-			continue;
-		wlock = ft_anchor_meta(ft, ft_lock_ctx_descent(ctx), wnf,
-				wnode, ft_anc_ledger.e[w0 + wi].depth);
-		if (ft_lock_ctx_holds(ctx, wlock, &wheld, &wratified)) {
-			FT_WD_INC(ft_wd_dedup);
-			continue;	/* already excluded by this op */
-		}
-		for (k = 0; k < nr_taken; k++)
-			if (taken[k] == wlock) {
-				wdup = true;
-				break;
-			}
-		if (wdup) {
-			FT_WD_INC(ft_wd_dedup);
-			continue;
-		}
-		if (ft_dlm_lock(acq, wlock, &wsnap)) {
-			ft_hold_trace_refused(wlock, fn, line);
-			goto eagain;
-		}
-		taken_snap[nr_taken] = wsnap;
-		taken[nr_taken++] = wlock;
-	}
-#endif
 	if (ft_flip_txn_commit((struct cds_ft *) ft, acq) != URCU_TXN_STATUS_OK) {
 #ifdef FT_DEBUG_REMOVE_RETRY_CAP
 		ft_dbg_acq_cabort++;
@@ -6024,33 +5798,6 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 		free(taken_heap);
 		return -EAGAIN;		/* commit freed @acq; nothing acquired */
 	}
-#ifdef FT_FEATURE_WIDEN
-	/*
-	 * PREREQUISITE 2: hand each widened hold's release to the owner.  The
-	 * caller sweeps its release out of @set[i].held and cannot see anything
-	 * appended in here, so without this the word stays LOCKED for ever and
-	 * one widened commit livelocks the trie.
-	 *
-	 * REGISTER THEN RECORD, in that order: the registry is what makes every
-	 * NON-commit terminal (abort, memory error, a pre-commit bail) CAS-clear
-	 * the word, and the record is what makes the COMMIT consume it.  The
-	 * release is the RYW form, which reads this txn's pending value -- so it
-	 * chains onto whatever the op has already written to that word and needs
-	 * no placement rule beyond "past the last acquire".  Both are infallible
-	 * here: the registry grows or fail-stops, and the edge was reserved
-	 * above.
-	 */
-	for (wi = nr_taken_own; wi < nr_taken; wi++) {
-		ft_flip_txn_lock_register(widen_owner, taken[wi],
-				taken_snap[wi]);
-		ft_flip_txn_record_anchor_release_held(widen_owner, taken[wi]);
-	}
-	if (nr_taken > nr_taken_own) {
-		FT_WD_INC(ft_wd_acq);
-		FT_WD_ADD(ft_wd_locks, nr_taken - nr_taken_own);
-		FT_WD_MAX(ft_wd_locks_max, nr_taken - nr_taken_own);
-	}
-#endif
 	for (i = 0; i < nr; i++) {
 		if (!set[i].nf)
 			continue;

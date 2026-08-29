@@ -2565,8 +2565,9 @@ void ft_writer_lock_park(struct cds_ft *ft)
 /*
  * G5.25: while a bulk op is live, a FINE trie RE-TAKES the FT-wide writer lock
  * instead of widening every point op's lock-set to the root.  On by default --
- * it is the shipping bulk-vs-point exclusion; set to 0 for the pre-G5.25
- * behaviour (no bulk/point exclusion unless -DFT_FEATURE_WIDEN is on).
+ * it is the shipping bulk-vs-point exclusion, and the ONLY one -- the
+ * per-op lock-set widening it replaced was removed once this landed.  Set to 0
+ * only to measure its cost; a 0 build has NO bulk-vs-point exclusion at all.
  */
 #ifndef FT_BULK_WIDE_LOCK
 # define FT_BULK_WIDE_LOCK	1
@@ -3352,7 +3353,9 @@ void ft_bulk_gate_enter(struct cds_ft *ft, enum ft_bulk_kind kind,
 	 * same discipline -- publish, one full GP, only THEN mutate -- because
 	 * a peer that sampled the word as clear before the store is still
 	 * running on the old rule: a reader on the fast path for @move_active,
-	 * a point op with an UNWIDENED lock set for @bulk_active.
+	 * a point op that has NOT taken the FT-wide writer lock for
+	 * @bulk_active (G5.25 -- it sampled the gate clear at its writer scope
+	 * and skipped the lock, so it is not excluded against this op yet).
 	 */
 	ft->bulk_level_nr[level]++;
 	if (ft->bulk_gate_nr++ == 0) {
