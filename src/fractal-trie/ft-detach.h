@@ -642,7 +642,7 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
 	}
 
 	{
-		/* G5.5: point ops on @ft widen to the root for this window. */
+		/* G5.5: point ops on @ft take the FT-wide lock for this window. */
 		CDS_FT_SCOPED_BULK_GATE(ft, FT_BULK_WRITER_ONLY, 0);
 
 		status = ft_detach_keylen(ft, _key, key_len, result_ft);

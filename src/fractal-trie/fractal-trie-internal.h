@@ -3215,9 +3215,10 @@ unsigned long ft_bulk_pack(unsigned long nr, unsigned int level)
 
 /*
  * Is any BULK op live?  The writer-side tier-1 gate G5.5 turns on: false in
- * steady state, ONE trie-level load, and when true a point op ADDS the
- * ancestors from ft_bulk_min_level() DOWN to its own member -- never above,
- * because no bulk op locks there.
+ * steady state, ONE trie-level load, and when true a FINE trie's point op
+ * RE-TAKES the FT-wide writer lock instead of dropping it.  Its ONE consumer is
+ * ft_writer_lock_scope_enter (G5.25), which is where the whole bulk-vs-point
+ * exclusion lives.
  */
 static inline
 bool ft_bulk_active(const struct cds_ft *ft)
@@ -3565,8 +3566,8 @@ void ft_bulk_gate_scope_end(struct ft_bulk_gate_scope *s)
 /*
  * Scoped, because the public bulk entries reject arguments with EARLY RETURNS
  * and a bracket that only covered the success path would leak the gate --
- * leaving @bulk_active set for the life of the trie and every point op widened
- * to the root forever.
+ * leaving @bulk_active set for the life of the trie and every point op
+ * serialized on the FT-wide writer lock forever.
  *
  * PLACE IT AFTER the cheap argument checks and BEFORE any lock or read section:
  * the gate BLOCKS on a grace period, so a caller already inside an RCU read
