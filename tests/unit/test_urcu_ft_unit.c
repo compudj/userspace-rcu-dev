@@ -73,9 +73,9 @@
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (357 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (358 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (306 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (307 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -12949,6 +12949,124 @@ static unsigned int ft_test_dup_count(struct cds_ft *ft, const char *k)
  * memory pressure).  Verify every merged key survives, each collided key as a
  * 2-node duplicate chain (kept dst head + demoted src).
  */
+/*
+ * ORDER STATISTICS + same-trie rekey: THE MOVE'S TWO COUNT WALKS MEET.
+ *
+ * A same-trie move unlinks the subtree on the src side (-cnt) and attaches it on
+ * the dst side (+cnt), and each propagates its delta up its own ancestors TO THE
+ * ROOT -- which every same-trie move shares.  Both walks record into the ONE
+ * decide, and that decide publishes nothing until it commits, so the shared
+ * ancestors' nr_keys words still read PRE-TXN when the second walk arrives.
+ *
+ * Deriving the second walk's expected-old from the WORD therefore claimed an old
+ * the first walk had already superseded, and urcu_txn_record_chain answers a
+ * same-slot value mismatch by POISONING the descriptor.  The commit then aborted
+ * having published nothing, the caller re-descended onto the identical shape,
+ * and -- single-threaded, so nothing could ever change what it re-read -- the
+ * public call NEVER RETURNED (measured: 3.7M attempts in 20 s, ~20 MB/s of
+ * arena per retry).  The cure is read-your-own-writes in
+ * ft_flip_txn_record_count_parent: chain onto the record this op already has.
+ *
+ * ☠ THE FAILURE MODE IS A HANG, NOT A FAILED ASSERTION.  Reverting the fix does
+ * not turn this test red, it stops the suite here.
+ *
+ * The src ("abc") and dst ("zq") subtrees are DISJOINT below the root, so the
+ * root is the only ancestor the two walks share -- the minimal shape, which is
+ * also every same-trie move.  "zx" makes the dst diverge inside a compressed
+ * run (the GLUE prep, whose +count walk is ft_glue_txn_commit_edges'), and
+ * "abdp"/"aep" keep the src junctions off the root.  BOTH list modes: the
+ * ordered list adds cell edges to the same commit, and neither mode was green.
+ *
+ * cds_ft_count_keys is the count oracle and cds_ft_verify checks the per-node
+ * nr_keys invariant, so a commit that merely stops poisoning but lands a WRONG
+ * aggregate is still caught: the move is count-neutral, so 5 keys before and
+ * 5 after.
+ */
+static int rekey_rankstats_shared_ancestor_run(bool ordered_list)
+{
+	static const char *const moved[] = { "zqm", "zqn", NULL };
+	static const char *const kept[] = { "abdp", "aep", "zx", NULL };
+	static const char *const gone[] = { "abcm", "abcn", NULL };
+	static const char *const keys[] = { "abcm", "abcn", "abdp", "aep",
+					    "zx", NULL };
+	struct cds_ft_group *group = NULL;
+	struct cds_ft *ft = create_varlen_rankstats_list_ft(ordered_list, &group);
+	const char *lm = ordered_list ? "list-on" : "list-off";
+	int ret = -1, i;
+	enum cds_ft_status s;
+
+	rcu_read_lock();
+	for (i = 0; keys[i]; i++) {
+		if (cds_ft_insert(ft, (const uint8_t *) keys[i],
+				strlen(keys[i]), &node_alloc((uint64_t) i + 1)->node)
+				!= CDS_FT_STATUS_OK) {
+			fprintf(stderr, "rekey_rank(%s): insert %s failed\n",
+				lm, keys[i]);
+			goto out;
+		}
+	}
+	if (cds_ft_count_keys(ft) != 5) {
+		fprintf(stderr, "rekey_rank(%s): pre-move count %lu != 5\n",
+			lm, cds_ft_count_keys(ft));
+		goto out;
+	}
+	/* Moves {abcm,abcn} to {zqm,zqn}: count-neutral, root shared. */
+	s = ft_rekey(ft, "zq", "abc");
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "rekey_rank(%s): rekey failed (%s)\n", lm,
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "rekey_rank(%s): verify failed\n", lm);
+		goto out;
+	}
+	if (cds_ft_count_keys(ft) != 5) {
+		fprintf(stderr, "rekey_rank(%s): post-move count %lu != 5\n",
+			lm, cds_ft_count_keys(ft));
+		goto out;
+	}
+	for (i = 0; moved[i]; i++) {
+		if (!ft_test_has_key(ft, moved[i])) {
+			fprintf(stderr, "rekey_rank(%s): moved key %s missing\n",
+				lm, moved[i]);
+			goto out;
+		}
+	}
+	for (i = 0; kept[i]; i++) {
+		if (!ft_test_has_key(ft, kept[i])) {
+			fprintf(stderr, "rekey_rank(%s): kept key %s missing\n",
+				lm, kept[i]);
+			goto out;
+		}
+	}
+	for (i = 0; gone[i]; i++) {
+		if (ft_test_has_key(ft, gone[i])) {
+			fprintf(stderr, "rekey_rank(%s): stale key %s\n",
+				lm, gone[i]);
+			goto out;
+		}
+	}
+	ret = 0;
+out:
+	rcu_read_unlock();
+	if (drain_and_destroy(ft, group) < 0)
+		ret = -1;
+	return ret;
+}
+
+static int test_rekey_rankstats_shared_ancestor(void)
+{
+	if (!cds_ft_merge_enabled()) {
+		diag("test_rekey_rankstats_shared_ancestor: skipped, merge "
+			"compiled out (-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
+	if (rekey_rankstats_shared_ancestor_run(false) < 0)
+		return -1;
+	return rekey_rankstats_shared_ancestor_run(true);
+}
+
 static int test_merge_rekey_same_trie_listoff_collision(void)
 {
 	if (!cds_ft_merge_enabled()) {
@@ -33887,6 +34005,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_rekey_colocated_external);
 	RUN_TEST(test_merge_rekey_same_trie_ordered);
 	RUN_TEST(test_merge_rekey_same_trie_listoff_collision);
+	RUN_TEST(test_rekey_rankstats_shared_ancestor);
 	RUN_TEST(test_rekey_root_junction);
 	RUN_TEST(test_graft_inplace_exclusive);
 	RUN_TEST(test_nonidentity_bulk_ops);

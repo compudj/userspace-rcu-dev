@@ -9866,6 +9866,9 @@ void ft_set_parent_raw(struct cds_ft *ft, struct cds_ft_inode_flag *child,
  * depth, never FT_MAX_DEPTH).  Under the retained writer exclusion no proxy is
  * parked on these ancestors pre-commit, so ft_nr_keys_get reads the committed
  * count for the CAS old value; the new value re-applies the (count << 1) shift.
+ *
+ * ...but the WORD IS NOT THE OP'S OWN ANSWER.  See the read-your-own-writes
+ * paragraph in the loop: one txn may walk an ancestor TWICE.
  */
 static
 void ft_flip_txn_record_count_parent(struct cds_ft *ft, struct ft_flip_txn *t,
@@ -9878,8 +9881,49 @@ void ft_flip_txn_record_count_parent(struct cds_ft *ft, struct ft_flip_txn *t,
 	while (cur) {
 		struct cds_ft_metadata *m =
 			cds_ft_item_to_metadata(ft_node_ptr(cur));
-		unsigned long old_raw = ft_nr_keys_get(m) << 1;
-		unsigned long new_raw = (ft_nr_keys_get(m) + delta) << 1;
+		unsigned long base = ft_nr_keys_get(m);
+		unsigned long old_raw, new_raw;
+
+		/*
+		 * ☠ READ-YOUR-OWN-WRITES, NOT THE LIVE WORD.  A SAME-TRIE move
+		 * walks the SHARED ancestors TWICE inside ONE txn -- -@cnt for
+		 * the src unlink, +@cnt for the dst attach -- and the one decide
+		 * publishes nothing until the end, so the word still holds the
+		 * PRE-TXN count for the whole of it.  Deriving the expected-old
+		 * from that word makes the second walk claim an old the first
+		 * walk has already superseded, and urcu_txn_record_chain answers
+		 * a same-slot value mismatch by POISONING the descriptor: the
+		 * commit ABORTS having published nothing, the caller re-descends
+		 * onto the identical shape, and it does so FOREVER -- the op is
+		 * single-threaded, so no peer can ever change what it re-reads.
+		 *
+		 * MEASURED before this: on a rank-stats trie
+		 * cds_ft_rekey_merge() never returned (3.7M attempts in 20 s,
+		 * ~20 MB/s of arena per retry), and the ancestor the two walks
+		 * met on is the ROOT -- which every same-trie move shares, so it
+		 * was every such move, not a corner.  --enable-rcu-debug is
+		 * SILENT on it: the poison is a documented release-mode answer,
+		 * not an assert.
+		 *
+		 * So ask the DESCRIPTOR first and chain onto what this op has
+		 * already recorded for the word; fall back to the live count
+		 * only where it recorded nothing.  The paragraph above still
+		 * describes that fallback exactly -- it was only ever a
+		 * statement about PEERS, never about the op meeting itself.
+		 */
+		{
+			struct urcu_txn_desc *desc = t->mtxn ?
+				t->mtxn->desc : NULL;
+			const struct urcu_txn_record *r = NULL;
+
+			if (desc && desc != URCU_TXN_ENOMEM)
+				r = urcu_txn_find(desc,
+					(void **) &m->nr_keys);
+			if (r)
+				base = (unsigned long) r->new_ptr >> 1;
+		}
+		old_raw = base << 1;
+		new_raw = (base + delta) << 1;
 
 		/*
 		 * The count propagates up UNLOCKED ancestors, so a peer writer
