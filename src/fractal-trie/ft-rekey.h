@@ -2955,6 +2955,19 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 			 */
 			/* NULL on the merge path: no COW */
 			ft_rekey_free_stop_prime(ft, s_top_prime);
+			/*
+			 * The graft ALWAYS relocates the attach node, and that copy
+			 * comes from ft_node_recompact -- NOT glue-tracked -- so the
+			 * ft_glue_abort below does not reach it.  Every other bail in
+			 * this function frees it; this one did not have to, because a
+			 * record-only NOSPLIT commit had NO failure path until the
+			 * re-parent acquire above gave it one.  An in-place recompact
+			 * leaves @dest == the LIVE node, which @old_recompacted_node is
+			 * exactly the flag for.
+			 */
+			if (gst_st.old_recompacted_node)
+				free_cds_ft_node_unpublished(ft,
+					ft_node_ptr(gst_st.dest));
 			ft_glue_abort(ft, &glue);
 	if (src_glue_live) {		/* merged cluster's src side */
 		ft_glue_abort(ft, &src_glue);

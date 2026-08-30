@@ -796,6 +796,37 @@ enum urcu_txn_status ft_store_at_graft_point_commit(struct cds_ft *ft,
 		struct cds_ft_inode_flag *count_base = NULL;
 		unsigned int rn = 0;
 
+		/*
+		 * THE RE-PARENT ACQUIRE.  ft_glue_txn_commit runs this for the
+		 * displaced arm above; THIS arm commits by calling
+		 * ft_glue_apply_deferred directly, so without it the acquire never
+		 * runs at all -- and then every deferred entry reaches
+		 * ft_reparent_record_meta with @child_marked false (this acquire is
+		 * what sets @held_lock) and @hold_ctx NULL, which is the whole SW/MW
+		 * dispatch.  The child's parent word is then recorded MW even when
+		 * this op HOLDS it, and an SW park by the SAME txn --
+		 * ft_rekey_cow_stop's, on a cut source -- collides on kind: the
+		 * engine asserts on a debug build (rcu-txn-mcas.h, `r->kind ==
+		 * kind`) and resolves it fail-safe by promoting to MW on a release
+		 * one, after which the op re-attempts forever.
+		 *
+		 * Placed BEFORE the ft_set_parent below so the bail is clean, and
+		 * gated exactly as ft_glue_txn_commit gates it.  @record_only is
+		 * what makes returning ABORT from here legitimate -- the txn is the
+		 * CALLER's and the caller's single commit is still ahead -- so it is
+		 * TESTED rather than asserted: a caller reaching this arm without it
+		 * has no clean bail, and keeps its present behaviour untouched.
+		 */
+		if (ft->lock_fine && st->glue->txn &&
+				st->glue->txn->structural_sw) {
+			if (ft->exclusive) {
+				ft_glue_assert_reparent_unheld(ft, st->glue);
+			} else if (st->glue->record_only &&
+					ft_glue_acquire_reparent_marks(ft,
+						st->glue)) {
+				return URCU_TXN_STATUS_ABORT;
+			}
+		}
 		ft_node_get_nth_skip(st->dest, &slot, st->slot_byte, FT_PF_NONE);
 		assert(slot);
 		ft_set_parent(ft, st->attached, st->dest, slot);
