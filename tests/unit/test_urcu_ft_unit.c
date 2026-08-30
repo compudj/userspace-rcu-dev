@@ -12568,6 +12568,20 @@ static int rekey_skip_slot_bp_atomic_or_refused(const char *nw,
 		fprintf(stderr, "rekey %s<-%s: refusal (%s) mutated the trie\n",
 			nw, old, cds_ft_status_to_string(s));
 		goto out;
+	} else {
+		/*
+		 * A CLEAN refusal, and still a REGRESSION.  The NOSPLIT
+		 * re-parent acquire put every shape here in scope, so all four
+		 * complete; single-threaded there is no peer that could make a
+		 * refusal legitimate.  The clean-refusal check above is kept
+		 * deliberately AHEAD of this one so the test keeps reporting
+		 * the worse failure first: a future narrowing that has to
+		 * refuse again still may not corrupt on its way out.
+		 */
+		fprintf(stderr, "rekey %s<-%s: REFUSED (%s) -- in scope since "
+			"the NOSPLIT re-parent acquire\n", nw, old,
+			cds_ft_status_to_string(s));
+		goto out;
 	}
 	ret = 0;
 out:
@@ -12629,6 +12643,12 @@ static int rekey_skip_slot_bp_internal_child(const char *nw, const char *old)
 			"mutated the trie\n", nw, old,
 			cds_ft_status_to_string(s));
 		goto out;
+	} else {
+		/* A clean refusal is still a regression -- see the leaf helper. */
+		fprintf(stderr, "rekey %s<-%s (internal child): REFUSED (%s) -- "
+			"in scope since the NOSPLIT re-parent acquire\n",
+			nw, old, cds_ft_status_to_string(s));
+		goto out;
 	}
 	ret = 0;
 out:
@@ -12655,10 +12675,12 @@ static int test_rekey_skip_slot_bp_atomic_or_refused(void)
 		return -1;
 	if (rekey_skip_slot_bp_atomic_or_refused("zw", "zh", "zwello"))
 		return -1;
-	/* CUT source over an INTERNAL run child: asserts / livelocks unfixed. */
+	/* CUT source over an INTERNAL run child: the shape that asserted on a
+	 * debug build and livelocked on a release one until the NOSPLIT
+	 * re-parent acquire landed (ft-graft.h). */
 	if (rekey_skip_slot_bp_internal_child("zwe", "zhe"))
 		return -1;
-	/* UNCUT over the same internal child: this one is genuinely cured. */
+	/* UNCUT over the same internal child. */
 	return rekey_skip_slot_bp_internal_child("zw", "zh");
 }
 

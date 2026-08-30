@@ -2530,22 +2530,30 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		goto bail_build;
 	}
 	/*
-	 * ☠ A CUT RUN WHOSE CHILD CARRIES A STATE WORD IS OUT OF THIS CUT.
+	 * ☠ A CUT RUN WHOSE CHILD CARRIES A STATE WORD IS OUT OF THIS CUT ON THE
+	 * MODES THE RE-PARENT ACQUIRE CANNOT COVER.
 	 *
-	 * Cutting the run makes ft_rekey_cow_stop copy it and PARK the child's
-	 * state word SW; the NOSPLIT branch below then re-parents that displaced
-	 * child through ft_glue_apply_deferred, which records the same word MW.
-	 * The engine's kind check fires (rcu-txn-mcas.h, `r->kind == kind`) on a
-	 * debug build and a release build POISONS the descriptor instead, so the
-	 * retry loop absorbs it and the call never returns.
+	 * Cutting the run makes ft_rekey_cow_stop park the child's parent word
+	 * SW, and the NOSPLIT commit re-parents that displaced child through
+	 * ft_glue_apply_deferred.  Whether that second record is SW or MW is
+	 * decided by @held_lock, and only ft_glue_acquire_reparent_marks sets it
+	 * -- a function that returns 0 immediately unless the trie is FINE and
+	 * non-exclusive.  On every other mode the entry therefore stays unmarked
+	 * and the word is recorded MW: measured on a COARSE trie at the apply,
+	 * nr_deferred=1, live=1, held_lock=0, structural_sw=true.  Two kinds on
+	 * one slot abort the engine's kind check (rcu-txn-mcas.h) on a debug
+	 * build and promote SW->MW fail-safe on a release one, after which the op
+	 * re-attempts forever.
 	 *
-	 * The GLUE-prep branch hands its mark over via @glue.caller_holder; the
-	 * NOSPLIT branch a cut source takes has no equivalent, so refuse until it
-	 * does.  ft_child_state_meta is NULL exactly for an external head -- the
-	 * leaf-child shape, which has nothing to park and is in scope.
+	 * The FINE non-exclusive path is CURED -- ft_store_at_graft_point_commit
+	 * runs the acquire, and all four cut/uncut x leaf/internal shapes
+	 * complete -- so this keeps the refusal exactly where the cure cannot
+	 * reach, which is where it already applied.  ft_child_state_meta is NULL
+	 * exactly for an external head: the leaf-child shape, always in scope.
 	 */
-	if (src_cut && ft_child_state_meta(ft,
-			rcu_dereference(ft_compressed_node_ptr(s_top)->child))) {
+	if ((!ft->lock_fine || ft->exclusive) && src_cut &&
+			ft_child_state_meta(ft, rcu_dereference(
+				ft_compressed_node_ptr(s_top)->child))) {
 		ret = FT_REKEY_UNCOVERED;
 		goto bail_build;
 	}
@@ -2961,9 +2969,9 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 			 * ft_glue_abort below does not reach it.  Every other bail in
 			 * this function frees it; this one did not have to, because a
 			 * record-only NOSPLIT commit had NO failure path until the
-			 * re-parent acquire above gave it one.  An in-place recompact
-			 * leaves @dest == the LIVE node, which @old_recompacted_node is
-			 * exactly the flag for.
+			 * re-parent acquire (ft-graft.h) gave it one.  An in-place
+			 * recompact leaves @dest == the LIVE node, which
+			 * @old_recompacted_node is exactly the flag for.
 			 */
 			if (gst_st.old_recompacted_node)
 				free_cds_ft_node_unpublished(ft,
