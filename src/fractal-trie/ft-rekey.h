@@ -2530,6 +2530,26 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		goto bail_build;
 	}
 	/*
+	 * ☠ A CUT RUN WHOSE CHILD CARRIES A STATE WORD IS OUT OF THIS CUT.
+	 *
+	 * Cutting the run makes ft_rekey_cow_stop copy it and PARK the child's
+	 * state word SW; the NOSPLIT branch below then re-parents that displaced
+	 * child through ft_glue_apply_deferred, which records the same word MW.
+	 * The engine's kind check fires (rcu-txn-mcas.h, `r->kind == kind`) on a
+	 * debug build and a release build POISONS the descriptor instead, so the
+	 * retry loop absorbs it and the call never returns.
+	 *
+	 * The GLUE-prep branch hands its mark over via @glue.caller_holder; the
+	 * NOSPLIT branch a cut source takes has no equivalent, so refuse until it
+	 * does.  ft_child_state_meta is NULL exactly for an external head -- the
+	 * leaf-child shape, which has nothing to park and is in scope.
+	 */
+	if (src_cut && ft_child_state_meta(ft,
+			rcu_dereference(ft_compressed_node_ptr(s_top)->child))) {
+		ret = FT_REKEY_UNCOVERED;
+		goto bail_build;
+	}
+	/*
 	 * The ALIASING terms are -EINVAL: they say the src junction IS the node
 	 * the graft retires, which no fallback writer expresses -- and two DLM
 	 * tests pin that code as the "refused cleanly, permanently, before any
@@ -2843,8 +2863,54 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 				&& 0	/* red control: see fractal-trie-internal.h */
 #endif
 		   ) {
+			/*
+			 * ☠ THE EXPECTED-OLD IS THE RAW WORD, NOT @s_top.
+			 *
+			 * The fold's compare is `*pending_del_slot ==
+			 * pending_del_expected`, so it must be given what the
+			 * SLOT holds.  @s_top is that word RESOLVED, and the two
+			 * differ whenever the slot is skip-encoded -- the common
+			 * case, since a default group carries
+			 * CDS_FT_FLAG_SKIP_COMPRESSED.  Pairing them made the
+			 * compare unsatisfiable from the moment of capture, and
+			 * ft_node_recompact's -EAGAIN then became a SELF-refusal
+			 * no re-descent could clear: the op spun forever and the
+			 * public call never returned.
+			 *
+			 * @nf_raw comes from the same load as @s_top, so the pair
+			 * is coherent.  RE-READING the slot here instead would
+			 * defeat the guard the compare exists for: a peer that
+			 * republished between the descent and this point would be
+			 * silently adopted, and the fold would drop a subtree the
+			 * plan never examined.  So the re-read below is a
+			 * VALIDATION, not the captured value -- it fails closed.
+			 *
+			 * A parked flip proxy still refuses, as it did when the
+			 * expected-old was resolved: raw-vs-raw could otherwise
+			 * MATCH a proxy and fold against a transient word.
+			 */
+			if (ft_node_flip_proxy(d_src.nf_raw) ||
+					rcu_dereference(*d_src.nfp) !=
+						d_src.nf_raw) {
+				/*
+				 * -EAGAIN, NOT a shape refusal: both halves are
+				 * TRANSIENT.  A parked proxy settles, and a slot
+				 * that moved since the descent is a peer, not a
+				 * property of the trie -- BP's word is never held
+				 * before this point, so the window is open under
+				 * MW.  Answering UNCOVERED terminally would send
+				 * a delayed move to a worker that refuses every
+				 * same-trie rekey, i.e. report NOT_SUPPORTED for
+				 * a call a re-descent completes (the measured
+				 * lesson at the bracket check's -1 arm above).
+				 * A re-descent recaptures @nf_raw with its slot,
+				 * so this cannot self-livelock.
+				 */
+				ret = -EAGAIN;
+				goto bail_build;
+			}
 			txn->pending_del_slot = d_src.nfp;
-			txn->pending_del_expected = s_top;
+			txn->pending_del_expected = d_src.nf_raw;
 		}
 		cds_ft_alloc_reserve_activate(ft, &reserve);
 		{

@@ -236,6 +236,17 @@ struct ft_descent {
 	struct cds_ft_inode_flag **nfp;		/* Slot that holds @nf. */
 	struct cds_ft_inode_flag *pnf;		/* Parent node-flag value. */
 	struct cds_ft_inode_flag **pnfp;	/* Slot that holds @pnf. */
+	/*
+	 * The RAW word @nfp held at the load that produced @nf.
+	 *
+	 * @nf is that word RESOLVED (flip proxy stripped, skip-compression
+	 * reanchored); the two differ exactly when the slot is skip-encoded,
+	 * where the raw is (target | skip_len << FT_SKIP_LEN_SHIFT) and no
+	 * resolved pointer can ever equal it.  A consumer that must compare
+	 * against what the SLOT holds -- an expected-old -- needs this one, and
+	 * it comes from the SAME load as @nf so the pair is coherent.
+	 */
+	struct cds_ft_inode_flag *nf_raw;
 	struct cds_ft_inode_flag *ppnf;		/* Grandparent node-flag value. */
 	struct cds_ft_inode_flag **ppnfp;	/* Slot that holds @ppnf. */
 	struct cds_ft_inode_flag *pppnf;	/* Great-grandparent node-flag value. */
@@ -836,7 +847,8 @@ void ft_descent_init(struct ft_descent *d, struct cds_ft *ft)
 	 * d->nfp still names the raw slot; only the snapshot d->nf is resolved
 	 * (mirrors ft_node_get_nth).
 	 */
-	d->nf = ft_resolve_flip_proxy(rcu_dereference(ft->root));
+	d->nf_raw = rcu_dereference(ft->root);
+	d->nf = ft_resolve_flip_proxy(d->nf_raw);
 	d->nfp = &ft->root;
 	d->pnf = NULL;
 	d->pnfp = NULL;
@@ -884,7 +896,8 @@ void ft_descent_traverse_compressed(struct cds_ft *ft, struct ft_descent *d,
 	 * (peer chain-merge moved the position shallower) that slot is at the
 	 * wrong level -- flagged so a mutating caller re-descends.
 	 */
-	d->nf    = ft_reanchor_flag(ft, ft_resolve_flip_proxy(cn->child), &rewind);
+	d->nf_raw = rcu_dereference(cn->child);
+	d->nf    = ft_reanchor_flag(ft, ft_resolve_flip_proxy(d->nf_raw), &rewind);
 	MRG_REANCHOR_PROBE(0, rewind);
 	if (caa_unlikely(rewind != 0))
 		d->skip_conflict = true;
@@ -927,7 +940,7 @@ struct cds_ft_inode_flag *ft_descent_step(struct cds_ft *ft, struct ft_descent *
 	 * mutating caller re-descends (see struct ft_descent.skip_conflict).
 	 */
 	d->nf    = ft_node_get_nth_reanchor_slot(ft, d->pnf, &d->nfp,
-			key_value, FT_PF_NONE, &rewind);
+			&d->nf_raw, key_value, FT_PF_NONE, &rewind);
 	MRG_REANCHOR_PROBE(1, rewind);
 	if (caa_unlikely(rewind != 0))
 		d->skip_conflict = true;

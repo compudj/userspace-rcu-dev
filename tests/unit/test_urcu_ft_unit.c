@@ -73,9 +73,9 @@
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (356 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (357 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (305 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (306 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -12515,6 +12515,153 @@ out:
  * because removing the slot would collapse the junction rather than delete in
  * place.
  */
+/*
+ * A src key that ends INSIDE a compressed run -- the run is CUT -- whose branch
+ * point is ALSO the node the destination grafts onto (BP == graft_c == Z, with
+ * Z a real branch node so the root-junction gate does not answer first).
+ *
+ * This shape LIVELOCKED: the pending-del fold captured @pending_del_slot from
+ * @d_src.nfp and @pending_del_expected from @s_top, which a cut run does NOT
+ * make the same edge, so ft_node_recompact's expected-old compare could never
+ * match and the writer retried a SELF-refusal forever -- a public rekey call
+ * that never returned.
+ *
+ * Written "atomic or refused" like the fixed-length case above: whichever
+ * answer the writer gives, the call must RETURN, the trie must verify, and the
+ * moved key must be at exactly one of its two names.  A refusal must leave the
+ * structure untouched.
+ */
+static int rekey_skip_slot_bp_atomic_or_refused(const char *nw,
+		const char *old, const char *moved)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	int ret = -1;
+	enum cds_ft_status s;
+
+	ft = create_varlen_ft(&group);
+	rcu_read_lock();
+	/* "zq" keeps Z a branch node: root -> Z -> { 'h' -> run "ello", 'q' }. */
+	cds_ft_insert(ft, (const uint8_t *) "zhello", 6, &node_alloc(1)->node);
+	cds_ft_insert(ft, (const uint8_t *) "zq", 2, &node_alloc(2)->node);
+
+	s = ft_rekey(ft, nw, old);
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "rekey %s<-%s: trie corrupt after %s\n", nw, old,
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+	if (!ft_test_has_key(ft, "zq")) {
+		fprintf(stderr, "rekey %s<-%s: bystander key lost\n", nw, old);
+		goto out;
+	}
+	if (s == CDS_FT_STATUS_OK) {
+		if (!ft_test_has_key(ft, moved) ||
+		    ft_test_has_key(ft, "zhello")) {
+			fprintf(stderr,
+				"rekey %s<-%s: moved key at neither/both names\n",
+				nw, old);
+			goto out;
+		}
+	} else if (ft_test_has_key(ft, moved) ||
+			!ft_test_has_key(ft, "zhello")) {
+		fprintf(stderr, "rekey %s<-%s: refusal (%s) mutated the trie\n",
+			nw, old, cds_ft_status_to_string(s));
+		goto out;
+	}
+	ret = 0;
+out:
+	rcu_read_unlock();
+	drain_trie(ft);
+	rcu_barrier();
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
+ * Same shape, but the run's child is an INTERNAL branch {a,b} rather than an
+ * external leaf.  Cutting the run parks that child's state word SW, and the
+ * NOSPLIT re-parent records it MW -- a kind conflict that ABORTS an
+ * --enable-rcu-debug build and LIVELOCKS a release one, because the poisoned
+ * descriptor is absorbed by the op's retry loop.  ft_child_state_meta is what
+ * separates this from the leaf case, so both belong in the gate.
+ */
+static int rekey_skip_slot_bp_internal_child(const char *nw, const char *old)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	int ret = -1;
+	enum cds_ft_status s;
+	bool moved;
+
+	ft = create_varlen_ft(&group);
+	rcu_read_lock();
+	cds_ft_insert(ft, (const uint8_t *) "zhelloa", 7, &node_alloc(1)->node);
+	cds_ft_insert(ft, (const uint8_t *) "zhellob", 7, &node_alloc(2)->node);
+	cds_ft_insert(ft, (const uint8_t *) "zq", 2, &node_alloc(3)->node);
+	cds_ft_insert(ft, (const uint8_t *) "za", 2, &node_alloc(4)->node);
+
+	s = ft_rekey(ft, nw, old);
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "rekey %s<-%s (internal child): trie corrupt "
+			"after %s\n", nw, old, cds_ft_status_to_string(s));
+		goto out;
+	}
+	if (!ft_test_has_key(ft, "zq") || !ft_test_has_key(ft, "za")) {
+		fprintf(stderr, "rekey %s<-%s (internal child): bystander lost\n",
+			nw, old);
+		goto out;
+	}
+	moved = ft_test_has_key(ft, "zwelloa") || ft_test_has_key(ft, "zwellob");
+	if (s == CDS_FT_STATUS_OK) {
+		if (!ft_test_has_key(ft, "zwelloa") ||
+		    !ft_test_has_key(ft, "zwellob") ||
+		    ft_test_has_key(ft, "zhelloa") ||
+		    ft_test_has_key(ft, "zhellob")) {
+			fprintf(stderr, "rekey %s<-%s (internal child): keys at "
+				"neither/both names\n", nw, old);
+			goto out;
+		}
+	} else if (moved || !ft_test_has_key(ft, "zhelloa") ||
+			!ft_test_has_key(ft, "zhellob")) {
+		fprintf(stderr, "rekey %s<-%s (internal child): refusal (%s) "
+			"mutated the trie\n", nw, old,
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+	ret = 0;
+out:
+	rcu_read_unlock();
+	drain_trie(ft);
+	rcu_barrier();
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+static int test_rekey_skip_slot_bp_atomic_or_refused(void)
+{
+	if (!cds_ft_merge_enabled()) {
+		diag("test_rekey_skip_slot_bp_atomic_or_refused: skipped, "
+			"merge compiled out (-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
+	/*
+	 * BOTH shapes, because @src_cut is NOT the discriminator: the cut one
+	 * ends inside the run, the uncut one stops on it, and BOTH livelocked.
+	 */
+	if (rekey_skip_slot_bp_atomic_or_refused("zwe", "zhe", "zwello"))
+		return -1;
+	if (rekey_skip_slot_bp_atomic_or_refused("zw", "zh", "zwello"))
+		return -1;
+	/* CUT source over an INTERNAL run child: asserts / livelocks unfixed. */
+	if (rekey_skip_slot_bp_internal_child("zwe", "zhe"))
+		return -1;
+	/* UNCUT over the same internal child: this one is genuinely cured. */
+	return rekey_skip_slot_bp_internal_child("zw", "zh");
+}
+
 static int test_rekey_fixed_len_atomic_or_refused(void)
 {
 	struct cds_ft_group *group;
@@ -33705,6 +33852,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_merge_rekey_same_trie);
 	RUN_TEST(test_merge_rekey_same_trie_speculative_rejected);
 	RUN_TEST(test_rekey_graft_vs_merge);
+	RUN_TEST(test_rekey_skip_slot_bp_atomic_or_refused);
 	RUN_TEST(test_rekey_fixed_len_atomic_or_refused);
 	RUN_TEST(test_rekey_varlen_ordered_splice);
 	RUN_TEST(test_rekey_abutting_dst_keeps_list_order);

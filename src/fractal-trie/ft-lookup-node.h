@@ -1796,6 +1796,10 @@ struct cds_ft_inode_flag *ft_node_get_nth(const struct cds_ft *ft, struct cds_ft
  * THIS primitive instead of a bespoke writer resolver.  The update side differs
  * from a reader only in capturing the mutable publish slot via @slot_ret.
  *
+ * @raw_ret:    out (may be NULL) -- the raw word that slot held at THIS load,
+ *              unresolved.  Callers comparing against slot contents (an
+ *              expected-old) need it; the resolved return value never equals a
+ *              skip-encoded word.
  * @slot_ret:   out (may be NULL) -- the RAW slot the child sits in (the skip
  *              slot itself under skip-compression, unresolved: the update
  *              side's publish target, the value ft_split_compressed_insert's
@@ -1818,11 +1822,19 @@ static inline_lookup
 struct cds_ft_inode_flag *ft_node_get_nth_reanchor_slot(struct cds_ft *ft,
 		struct cds_ft_inode_flag *node_flag,
 		struct cds_ft_inode_flag ***slot_ret,
+		struct cds_ft_inode_flag **raw_ret,
 		uint8_t n, enum ft_pf_target pf_hint,
 		unsigned int *rewind_ret)
 {
 	struct cds_ft_inode_flag *child =
 		ft_node_get_nth_skip(node_flag, slot_ret, n, pf_hint);
+
+	/*
+	 * The UNRESOLVED word, from this one load -- coherent with the resolved
+	 * value returned below, which a second read of the slot would not be.
+	 */
+	if (raw_ret)
+		*raw_ret = child;
 
 	/*
 	 * Resolve a type-7 flip proxy transiently occupying the slot (a
@@ -1855,7 +1867,7 @@ struct cds_ft_inode_flag *ft_node_get_nth_reanchor(struct cds_ft *ft,
 		struct cds_ft_inode_flag *node_flag, uint8_t n,
 		unsigned int *rewind_ret)
 {
-	return ft_node_get_nth_reanchor_slot(ft, node_flag, NULL, n,
+	return ft_node_get_nth_reanchor_slot(ft, node_flag, NULL, NULL, n,
 			FT_PF_NONE, rewind_ret);
 }
 
