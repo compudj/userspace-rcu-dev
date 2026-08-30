@@ -1128,7 +1128,17 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	struct ft_merge_counts mcnt = { 0, 0, 0, 0, 0 };
 #endif
 	struct cds_ft_inode_flag *merged_nf = NULL;
+	struct cds_ft_inode_flag *merged_pub = NULL;	/* @merged_nf, wrapped */
+	struct ft_held_anchor ks_held = { 0 };	/* KEY_SHORTER run's overlap fence */
+	bool ks_fenced = false;
 	struct cds_ft_inode_flag *probe_D = NULL;	/* occupied dst merge point */
+	/*
+	 * KEY_SHORTER destination: bytes of the COMPRESSED run @probe_D that the dst
+	 * key consumes, so the merge point sits @dst_off_d bytes INSIDE it.  0 is the
+	 * EXACT dst (the merge point IS a node).  ft_merge_build takes it as @off_d
+	 * and splits the run there; ft_merge_wrap_prefix re-creates the bytes above.
+	 */
+	unsigned int probe_off_d = 0, dst_off_d = 0;
 	/*
 	 * The interleave's DROPPED src heads' cells (an occupied dst whose merge
 	 * collides on a suffix).  The edges that route every surviving link around
@@ -1574,9 +1584,33 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 				unsigned int remaining =
 					(unsigned int) (dst_len - d_probe.depth);
 
-				if ((unsigned int) cn->len > remaining ||
-						ft_match_compressed_key(pk, cn,
-							(unsigned int) cn->len)
+				if ((unsigned int) cn->len > remaining) {
+					/*
+					 * KEY_SHORTER dst: the key ends INSIDE this
+					 * run, so the merge point is @remaining bytes
+					 * into it.  Match only THOSE bytes -- comparing
+					 * cn->len of them reads past the dst key -- and
+					 * stop AT the run rather than breaking out: the
+					 * run IS the destination, ft_merge_build splits
+					 * it at @off_d.
+					 *
+					 * ☠ The match is NOT optional.  The old arm
+					 * short-circuited on the length alone and never
+					 * compared a byte, so a run that DIVERGES from
+					 * the dst key reaches here too -- and adopting it
+					 * would union under a prefix the caller never
+					 * named (and make an empty-dst GRAFT report
+					 * -EEXIST).  A diverging run means the
+					 * destination really is empty: break.
+					 */
+					if (ft_match_compressed_key(pk, cn,
+							remaining) != remaining)
+						break;
+					probe_off_d = remaining;
+					break;
+				}
+				if (ft_match_compressed_key(pk, cn,
+						(unsigned int) cn->len)
 						!= (unsigned int) cn->len)
 					break;
 				ft_descent_traverse_compressed(ft, &d_probe, cn, &pk);
@@ -1584,7 +1618,8 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 			}
 			ft_descent_step(ft, &d_probe, *(pk++));
 		}
-		merge_dst = (d_probe.depth == dst_len && d_probe.nf != NULL);
+		merge_dst = (d_probe.depth + probe_off_d == dst_len &&
+				d_probe.nf != NULL);
 		probe_D = merge_dst ? d_probe.nf : NULL;
 		/*
 		 * @require_empty is the GRAFT caller's semantics (cds_ft_rekey_graft
@@ -2017,9 +2052,24 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 				unsigned int remaining =
 					(unsigned int) (dst_len - d_dst.depth);
 
-				if ((unsigned int) cn->len > remaining ||
-						ft_match_compressed_key(dk, cn,
-							(unsigned int) cn->len)
+				if ((unsigned int) cn->len > remaining) {
+					/*
+					 * KEY_SHORTER dst, mirroring the probe: stop AT
+					 * the run and carry the offset.  Only a run that
+					 * MATCHES the remaining dst bytes is the
+					 * destination; a diverging one is the empty-dst
+					 * shape and belongs to the splice arm.
+					 */
+					if (ft_match_compressed_key(dk, cn,
+							remaining) != remaining) {
+						ret = -EINVAL;
+						goto bail_build;
+					}
+					dst_off_d = remaining;
+					break;
+				}
+				if (ft_match_compressed_key(dk, cn,
+						(unsigned int) cn->len)
 						!= (unsigned int) cn->len) {
 					ret = -EINVAL;
 					goto bail_build;
@@ -2030,15 +2080,17 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 			ft_descent_step(ft, &d_dst, *(dk++));
 		}
 		/*
-		 * The merge point itself must be a PLAIN INTERNAL node: a compressed,
-		 * skip or external D is the KEY_SHORTER / Edge-D / leaf-splice family,
-		 * which belongs to ft_merge_spine_copy.  d_dst.nf is non-NULL by the
-		 * probe, but re-checked because the probe ran outside this txn.
+		 * The merge point must be a PLAIN INTERNAL node -- OR, with
+		 * @dst_off_d > 0, the COMPRESSED run the dst key ends inside.  A skip
+		 * or external D remains the Edge-D / leaf-splice family, which belongs
+		 * to ft_merge_spine_copy.  d_dst.nf is non-NULL by the probe, but
+		 * re-checked because the probe ran outside this txn.
 		 */
-		if (d_dst.depth != dst_len || !d_dst.nf ||
+		if (d_dst.depth + dst_off_d != dst_len || !d_dst.nf ||
 				ft_node_flip_proxy(d_dst.nf) ||
 				ft_node_external(d_dst.nf) ||
-				ft_node_compressed(d_dst.nf) ||
+				(dst_off_d == 0 && ft_node_compressed(d_dst.nf)) ||
+				(dst_off_d != 0 && !ft_node_compressed(d_dst.nf)) ||
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 				ft_node_skip_compressed(d_dst.nf) ||
 #endif
@@ -2046,7 +2098,13 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 			ret = -EINVAL;
 			goto bail_build;
 		}
-		{
+		/*
+		 * The type-class gate asks whether the node SCANNER can read D's body,
+		 * which is a question only an internal merge point raises: entered at
+		 * @off_d > 0, ft_merge_build dispatches on cn_d->key_bytes[off_d] and
+		 * never scans a slot array, so a compressed D has no class to check.
+		 */
+		if (dst_off_d == 0) {
 			unsigned int dti = ft_node_type(d_dst.nf);
 
 			if (ft_types[dti].type_class != FT_POPCOUNT &&
@@ -2273,7 +2331,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		 */
 		glue.peer = &src_glue;
 		src_glue.peer = &glue;
-		ft_merge_count(ft, s_top, 0, d_dst.nf, 0, &mcnt);
+		ft_merge_count(ft, s_top, 0, d_dst.nf, dst_off_d, &mcnt);
 		if (ft_glue_reserve(&glue, mcnt.nb + 8, mcnt.nd + 8,
 					mcnt.nf_dst + 8, mcnt.ns + 8) ||
 		    ft_glue_reserve(&src_glue, 0, 0, mcnt.nf_src + 8, 0)) {
@@ -2319,9 +2377,54 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		 * enters both sides at offset 0, so each base is its descent's
 		 * own cursor depth.
 		 */
-		mctx.dst_base_depth = d_dst.depth;
+		/*
+		 * @dst_base_depth dates the dst spine's fences ABSOLUTELY, so a
+		 * KEY_SHORTER merge point -- which sits @dst_off_d bytes below the
+		 * cursor, not at it -- has to add them or every fence below is dated
+		 * one run short.
+		 */
+		mctx.dst_base_depth = d_dst.depth + dst_off_d;
 		mctx.src_base_depth = d_src.depth;
-		merged_nf = ft_merge_build(&mctx, s_top, 0, d_dst.nf, 0, 0,
+		/*
+		 * ☠ FENCE THE KEY_SHORTER RUN OURSELVES.  ft_merge_build fences a
+		 * compressed D only at @off_d == 0, on the stated argument that "a run
+		 * re-entered at off_d > 0 by the shared-run RECURSION was already
+		 * fenced by the frame that entered it at 0".  That premise does not
+		 * hold for a TOP-LEVEL entry at off_d > 0: no frame ever entered this
+		 * run at 0, so nothing fenced it and its retire would ride the plain
+		 * free list.
+		 *
+		 * Plain is what ft_merge_spine_copy uses for the same wrap, and it is
+		 * sound THERE because that txn is not structural_sw, so the tombstone
+		 * is recorded MW and validates.  THIS txn is structural_sw
+		 * unconditionally, and an unfenced free-list entry is tombstoned with
+		 * an SW PARK -- a plain store on a state word this op does not hold,
+		 * which is precisely the step-2-without-step-1 defect the STATE-WORD
+		 * PROTOCOL names, and which strips a peer's in-force LOCK bit.
+		 * Measured: -DFT_REKEY_CLAIM aborts single-threaded at
+		 * ft_flip_txn_record_tag_ctx's owner assert without this, and is clean
+		 * with it.
+		 *
+		 * Take it BEFORE the build reads @D -- the acquire and the retire that
+		 * ratifies it must bracket the same world -- and date the run at its
+		 * OWN start depth, not the merge point's.
+		 */
+		if (dst_off_d && mctx.fence_overlap) {
+			struct ft_lock_ctx dctx;
+
+			ft_glue_lock_ctx(&glue, &dctx);
+			if (ft_merge_lock_overlap(ft, &dctx, d_dst.nf,
+					(unsigned int) d_dst.depth,
+					ft_compressed_node_ptr(d_dst.nf),
+					&ks_held)) {
+				ret = -EAGAIN;
+				goto bail_build;
+			}
+			ft_glue_defer_free_fenced(&glue,
+				ft_compressed_node_ptr(d_dst.nf), true, &ks_held);
+			ks_fenced = true;
+		}
+		merged_nf = ft_merge_build(&mctx, s_top, 0, d_dst.nf, dst_off_d, 0,
 				d_dst.pdepth, &merged_keys);
 		if (merged_nf == FT_MERGE_OOM) {
 			merged_nf = NULL;
@@ -2329,12 +2432,54 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 			goto bail_build;
 		}
 		/*
+		 * KEY_SHORTER dst: the merge point is INSIDE the run, so what replaces
+		 * the run at its own slot is @merged_nf wrapped under the run's leading
+		 * [0, @dst_off_d) bytes.  ft_merge_build ENTERED that run rather than
+		 * copying it, so it recorded no free for it -- the retire is the
+		 * caller's, exactly as ft_merge_spine_copy's ks lane does it.
+		 */
+		merged_pub = merged_nf;
+		if (dst_off_d) {
+			struct cds_ft_compressed_node *wrap_cn =
+				ft_compressed_node_ptr(d_dst.nf);
+			uint8_t kbuf[FT_MAX_KEY_LEN];
+			unsigned int wrap_depth = (unsigned int) d_dst.depth;
+
+			if (!ks_fenced)
+				ft_glue_defer_free(&glue, wrap_cn, true);
+			memcpy(&kbuf[wrap_depth], wrap_cn->key_bytes, dst_off_d);
+			merged_pub = ft_merge_wrap_prefix(&mctx, kbuf,
+					wrap_depth, wrap_depth + dst_off_d,
+					merged_nf, merged_keys);
+			if (merged_pub == FT_MERGE_OOM) {
+				merged_pub = NULL;
+				ret = -ENOMEM;
+				goto bail_build;
+			}
+			/*
+			 * SLOT-CANONICAL, as every other lane publishes it: both
+			 * wrap arms hand back the PLAIN compressed flag, and the
+			 * glue commit stores @top RAW (_ft_publish_to_parent
+			 * re-encodes only the compressed-PARENT dual, never the
+			 * child).  Without this the slot that held skip(run) ends
+			 * holding a plain flag at a skip-encodable length -- a form
+			 * readers tolerate but nothing else produces, and the skip
+			 * optimisation is silently lost on that edge.  Mirrors
+			 * ft_graft_swap's KEY_SHORTER publish and
+			 * ft_merge_spine_copy's M_slot.
+			 */
+			if (ft_node_compressed(merged_pub))
+				merged_pub = ft_publish_compressed(ft,
+					ft_compressed_node_ptr(merged_pub),
+					merged_pub);
+		}
+		/*
 		 * The merged top replaces D in the publish parent's slot.  Recorded, not
 		 * stored: ft_glue_txn_commit_edges runs at step 3c below, after the
 		 * detach, like the GLUE arm.
 		 */
-		ft_glue_set_publish(ft, &glue, d_dst.pnf, d_dst.nfp, merged_nf);
-		glue.attached_nf = merged_nf;
+		ft_glue_set_publish(ft, &glue, d_dst.pnf, d_dst.nfp, merged_pub);
+		glue.attached_nf = merged_pub;
 		glue.count_delta = (long) cnt;
 		/*
 		 * COLLIDED KEYS: a full key present on BOTH sides makes ft_merge_build
@@ -2351,7 +2496,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 			ret = -EAGAIN;
 			goto bail_build;
 		}
-		attached_nf = merged_nf;
+		attached_nf = merged_pub;
 		adepth = (unsigned int) dst_len;
 		prep = FT_GRAFT_PREP_NOSPLIT;	/* not a graft; keeps the arms below off */
 #endif /* FEATURE_FT_MERGE */
