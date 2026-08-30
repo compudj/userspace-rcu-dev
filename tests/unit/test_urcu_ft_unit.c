@@ -73,9 +73,9 @@
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (358 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (359 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (307 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (308 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -13116,6 +13116,98 @@ static int test_rekey_rankstats_shared_ancestor(void)
 	if (rekey_rankstats_shared_ancestor_run(false) < 0)
 		return -1;
 	return rekey_rankstats_shared_ancestor_run(true);
+}
+
+/*
+ * ROOT JUNCTION: the destination's publish parent IS the root node.
+ *
+ * The graft's recompaction then republishes into &ft->root -- a slot that holds
+ * no node, hence carries no word to park an SW record under -- and this writer
+ * declined every such move.  It is IN SCOPE exactly where the detach's slot
+ * drop RIDES the graft's own recompaction of BP (BP == the node the NOSPLIT
+ * graft recompacts): the move is a slot RENAME inside ONE node, the root is
+ * superseded exactly once, the detach never runs at all, and the single edge
+ * that does land in &ft->root is recorded MW and arbitrated by the root-slot
+ * CAS.  "he" -> "we" over {hello} is that shape: both keys are root-level, and
+ * the source ends INSIDE the compressed run so the run is cut.
+ *
+ * The second half is the NEGATIVE, and it is why the gate is NARROWED rather
+ * than removed.  With the fold UNARMED -- BP below the root, so the detach
+ * really runs -- the same root-level destination owes a SECOND, independent
+ * republish into &ft->root, and attempting it aborts the transaction engine's
+ * SW/MW kind check (measured).  That shape must still answer NOT_SUPPORTED and
+ * leave the trie exactly as it was.  The discriminating control lives in the
+ * commit message: the same unarmed source one level BELOW the root is fine, so
+ * it is the root junction that is refused, not the shape of the detach.
+ */
+static int test_rekey_root_junction_folded(void)
+{
+	if (!cds_ft_merge_enabled()) {
+		diag("test_rekey_root_junction_folded: skipped, merge compiled "
+			"out (-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
+	static const char *const un_keys[] = { "abcm", "abcn", "abdp", "aep",
+					       NULL };
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	int ret = -1, i;
+	enum cds_ft_status s;
+
+	ft = create_varlen_ft(&group);
+	rcu_read_lock();
+
+	/* FOLDED: src BP == the graft's publish parent == the root. */
+	cds_ft_insert(ft, (const uint8_t *) "hello", 5, &node_alloc(1)->node);
+	s = ft_rekey(ft, "we", "he");
+	if (s != CDS_FT_STATUS_OK ||
+	    cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK ||
+	    !ft_test_has_key(ft, "wello") || ft_test_has_key(ft, "hello")) {
+		fprintf(stderr, "root_junction: folded move failed (%s)\n",
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+
+	/* UNARMED: BP sits at depth 2, so the shape stays DECLINED. */
+	for (i = 0; un_keys[i]; i++) {
+		if (cds_ft_insert(ft, (const uint8_t *) un_keys[i],
+				strlen(un_keys[i]),
+				&node_alloc((uint64_t) i + 2)->node)
+				!= CDS_FT_STATUS_OK) {
+			fprintf(stderr, "root_junction: insert %s failed\n",
+				un_keys[i]);
+			goto out;
+		}
+	}
+	s = ft_rekey(ft, "q", "abc");
+	if (s != CDS_FT_STATUS_NOT_SUPPORTED) {
+		fprintf(stderr, "root_junction: unarmed root dst not declined "
+			"(%s)\n", cds_ft_status_to_string(s));
+		goto out;
+	}
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "root_junction: refusal disturbed the trie\n");
+		goto out;
+	}
+	for (i = 0; un_keys[i]; i++) {
+		if (!ft_test_has_key(ft, un_keys[i])) {
+			fprintf(stderr, "root_junction: %s lost to a refusal\n",
+				un_keys[i]);
+			goto out;
+		}
+	}
+	if (ft_test_has_key(ft, "qm") || !ft_test_has_key(ft, "wello")) {
+		fprintf(stderr, "root_junction: post-refusal key set wrong\n");
+		goto out;
+	}
+	ret = 0;
+out:
+	rcu_read_unlock();
+	drain_trie(ft);
+	rcu_barrier();
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return ret;
 }
 
 static int test_merge_rekey_same_trie_listoff_collision(void)
@@ -34057,6 +34149,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_merge_rekey_same_trie_ordered);
 	RUN_TEST(test_merge_rekey_same_trie_listoff_collision);
 	RUN_TEST(test_rekey_rankstats_shared_ancestor);
+	RUN_TEST(test_rekey_root_junction_folded);
 	RUN_TEST(test_rekey_root_junction);
 	RUN_TEST(test_graft_inplace_exclusive);
 	RUN_TEST(test_nonidentity_bulk_ops);

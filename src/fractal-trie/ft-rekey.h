@@ -1178,6 +1178,13 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	unsigned int nr_marks = 0, adepth = 0, i, ti;
 	bool marks_consumed = false;
 	bool src_parent_held;
+	/*
+	 * Does the detach's slot drop RIDE the graft's own recompaction of BP?
+	 * (the @pending_del_slot arming below) -- and, separately, may the graft
+	 * therefore publish into &ft->root.  Two names because the second adds a
+	 * BUILD condition the first must not inherit.
+	 */
+	bool del_folds_into_graft, root_pub_ok;
 	enum ft_graft_prep prep;
 	enum cds_ft_status gst;
 	enum urcu_txn_status gcst = URCU_TXN_STATUS_OK, st;
@@ -2708,6 +2715,43 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	}
 	src_parent_held = d_src.ppnf == graft_p;
 	/*
+	 * BP IS THE NODE THE NOSPLIT GRAFT RECOMPACTS, so the move is a slot
+	 * RENAME inside ONE node: BP is superseded exactly once -- born holding
+	 * the grafted child and no longer holding S_top -- and the detach below
+	 * is skipped entirely.  This is the arming condition of @pending_del_slot
+	 * further down, hoisted HERE because the root-junction gate needs the
+	 * same answer; one expression, so the two cannot drift.
+	 *
+	 * @merge_dst is load-bearing and is NOT redundant with @prep: the merge
+	 * arm sets prep = FT_GRAFT_PREP_NOSPLIT deliberately ("not a graft; keeps
+	 * the arms below off"), so testing @prep alone would arm the fold on a
+	 * merge.
+	 */
+	del_folds_into_graft = !merge_dst &&
+		prep == FT_GRAFT_PREP_NOSPLIT &&
+		d_src.pnf == graft_c;
+	/*
+	 * ...and may that folded shape publish into &ft->root?  Only where ARMED
+	 * also means FOLDED.
+	 *
+	 * ☠ ft_node_set_nth_rec HAS AN IN-PLACE ARM THAT NEVER RUNS THE COPY
+	 * LOOP -- and that loop is what consumes the drop and sets
+	 * @pending_del_folded.  So on an EXCLUSIVE trie built with
+	 * FEATURE_FT_INSERT_IN_PLACE the graft can reserve BP's slot without
+	 * relocating BP, the drop is never consumed, and the detach runs after
+	 * all.  Refusing that at PLAN TIME is the point: by the time the detach
+	 * could notice, the in-place reserve has already set BP's bitmap bit and
+	 * appended a NULL pointer to the LIVE node, and no bail path takes those
+	 * back -- so a late refusal would leave a permanent reserved hole instead
+	 * of a trie byte-for-byte as it was.  The term costs nothing on the
+	 * default build, where ft_in_place_ok is a compile-time false.
+	 *
+	 * It gates ONLY the root admission, never @del_folds_into_graft itself:
+	 * disarming the fold would send the detach at a copy the prepare retires,
+	 * which is the very bug the arming exists to prevent.
+	 */
+	root_pub_ok = del_folds_into_graft && !ft_in_place_ok(ft);
+	/*
 	 * A ROOT-LEVEL JUNCTION is a SHAPE this cut declines, and it owes
 	 * FT_REKEY_UNCOVERED rather than -EINVAL.  The two are not
 	 * interchangeable: -EINVAL is TERMINAL ("no state of the trie would make
@@ -2722,8 +2766,42 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 * destination, so this arm was a corner; with the lengths free, "move the
 	 * subtree at a depth-1 key" is a normal call, and answering it INVALID
 	 * ARGUMENT would be a wrong answer rather than a narrow one.
+	 *
+	 * ☑ NARROWED to the shape where the move is a slot RENAME inside the root
+	 * itself.  The republish does land in &ft->root -- and needs no word
+	 * there: _ft_publish_to_parent_meta marks a @parent_slot == &ft->root edge
+	 * ROOT-owned and the engine records it MW, arbitrated by the root-slot CAS
+	 * (concurrent root relocations collide on old == current_root), so nothing
+	 * SW-parks there.  And because the drop FOLDS, the detach, the
+	 * chain-compress collapse and the count walk are all skipped, leaving no
+	 * SECOND edit that would need a word of its own.
+	 *
+	 * MEASURED under --enable-rcu-debug.  The folded root shape completes and
+	 * cds_ft_verify is clean, across five geometries (cut run / plain BP, dst
+	 * landing exact / short, root left one-child) and both list and rank-stats
+	 * modes.  The SAME src shape with the fold UNARMED and the dst still at
+	 * the root ABORTS the engine's SW/MW kind check -- while that same unarmed
+	 * shape one level BELOW the root is green, which is what attributes the
+	 * abort to the root junction rather than to the collapse both of them run.
+	 *
+	 * ☐ ONE GUARD IS ABSENT HERE, KNOWINGLY.  With @graft_p NULL the prepare's
+	 * parent_guard records nothing -- there is no parent metadata to key it on
+	 * -- and the commit takes its expected-old from a FRESH read of the root
+	 * slot, which is the plan-then-ratify shape ft_pub_rec_add's own header
+	 * warns about.  TWO things exclude a peer from that window, and BOTH are
+	 * load-bearing:
+	 *   - the root-slot CAS itself, which a concurrent root relocation loses;
+	 *   - BULK SERIALIZATION.  ☠ Do NOT write this off as "a root node is only
+	 *     ever retired, never re-homed" -- that is FALSE: cds_ft_detach_tree
+	 *     re-homes the LIVE root with a plain parent_word rewrite and no
+	 *     retire (ft-detach.h).  What keeps it out is that detach_tree runs
+	 *     under CDS_FT_SCOPED_BULK_GATE and this move under ft_move_gate_enter
+	 *     (FT_BULK_COHERENT), and an active bulk window makes every writer
+	 *     scope re-take the FT-wide mutex.
+	 * Nothing here DETECTS a future producer that re-homes a root outside that
+	 * serialization; it would have to be caught by review.
 	 */
-	if (!graft_p || !graft_c) {
+	if (!graft_c || (!graft_p && !root_pub_ok)) {
 		ret = FT_REKEY_UNCOVERED;
 		goto bail_build;
 	}
@@ -3064,7 +3142,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		 * ft_rekey_cow_stop retires S_top's own state word and builds
 		 * S_top', but leaves BP's slot holding S_top until the commit.
 		 */
-		if (d_src.pnf == graft_c
+		if (del_folds_into_graft
 #ifdef FT_RED_NO_DEL_FOLD
 				&& 0	/* red control: see fractal-trie-internal.h */
 #endif
@@ -3259,6 +3337,35 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		 * steps earlier.
 		 */
 		lctx_src.held.glue = &glue;
+		/*
+		 * ☠ A ROOT-LEVEL BP-PARENT HAS NO WORD TO PARK THE REPUBLISH UNDER.
+		 *
+		 * The shape gate admits @graft_p == NULL only for the FOLDED move,
+		 * so reaching here with it NULL means the drop was ARMED and NOT
+		 * consumed.  The detach would then be handed @parent == NULL with
+		 * @parent_held TRUE -- true only because @src_parent_held compares
+		 * two NULLs -- and its recompaction would park a republish into
+		 * &ft->root as an unguarded plain store.
+		 *
+		 * FT_REKEY_UNCOVERED, NEVER -EAGAIN.  The retry loop re-runs -EAGAIN
+		 * unconditionally, and whatever made the copy loop skip the drop is
+		 * a property of the build and the shape rather than a transient, so
+		 * -EAGAIN here would spin forever with no peer able to clear it.
+		 *
+		 * The refusal is clean: the store commit above ran record_only, so
+		 * nothing is published, and the bail below already reclaims every
+		 * fresh copy this attempt built.
+		 *
+		 * Believed UNREACHABLE -- the in-place tier is the one that can
+		 * reserve BP without relocating it, and the gate refuses the root
+		 * shape on exactly that tier -- but kept as a guard rather than an
+		 * assert because that reasoning is BUILD-CONDITIONAL, and a release
+		 * build must not answer it with a wild store.
+		 */
+		if (!graft_p) {
+			ret = FT_REKEY_UNCOVERED;
+			goto detach_bail;
+		}
 		ret = ft_detach_node(ft, &lctx_src, d_src.nfp, d_src.pnfp, d_src.depth,
 				false /*free_detached_subtree: S_top is retired by cow_stop*/,
 				NULL /*fuse_cell: list off*/, &pub, NULL /*run*/,
@@ -3270,6 +3377,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 					.parent_held = src_parent_held,
 					.parent_guard = true },
 				&detach_rc /*old + fresh BP copies, reclaimed post-commit*/);
+detach_bail:
 		if (ret) {
 			/*
 			 * Pre-commit bail.  Reclaim EVERY unpublished fresh copy built so far --
