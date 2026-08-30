@@ -13047,6 +13047,57 @@ static int rekey_rankstats_shared_ancestor_run(bool ordered_list)
 			goto out;
 		}
 	}
+	/*
+	 * PHASE 2 -- a NON-CANCELLING pair of walks.  Above, the move is a pure
+	 * relocation, so the shared root sees -cnt then +cnt and the chained sum
+	 * is zero however the arithmetic is done: it proves the poison is gone
+	 * but not that the running total is RIGHT.  An OCCUPIED destination
+	 * UNIONS instead, and a collision means the dst side adds FEWER keys
+	 * than the src side removed -- so the two deltas no longer cancel and
+	 * the chained base must actually carry.
+	 *
+	 * So move a SECOND subtree onto the destination the first move created:
+	 * "zq" now holds {zqm,zqn}, and {wm,wn} moved onto it collides on BOTH
+	 * keys.  ft_merge_build splices each src leaf onto the dst head's
+	 * duplicate chain, so the union adds ZERO distinct keys while the src
+	 * side removes two -- the deltas cannot cancel, and the dst walk must
+	 * charge (merged_keys - what D held), never the source's own count.
+	 * Regression: charging the source count left the depth-1 ancestor at
+	 * `stored 5, computed 3`.
+	 *
+	 * The expected total is NOT hard-coded: cds_ft_verify RECOMPUTES every
+	 * subtree count bottom-up and compares it against the stored aggregate
+	 * (gated on rank stats), so it is the oracle for the arithmetic -- a
+	 * commit that stops poisoning but lands a wrong aggregate still fails
+	 * here.  cds_ft_count_keys is then read only for self-consistency.
+	 */
+	if (cds_ft_insert(ft, (const uint8_t *) "wm", 2,
+			&node_alloc(101)->node) != CDS_FT_STATUS_OK ||
+	    cds_ft_insert(ft, (const uint8_t *) "wn", 2,
+			&node_alloc(102)->node) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "rekey_rank(%s): phase-2 insert failed\n", lm);
+		goto out;
+	}
+	s = ft_rekey(ft, "zq", "w");	/* "wm" collides with the moved "zqm" */
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "rekey_rank(%s): occupied-dst move failed (%s)\n",
+			lm, cds_ft_status_to_string(s));
+		goto out;
+	}
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "rekey_rank(%s): phase-2 verify failed\n", lm);
+		goto out;
+	}
+	if (!ft_test_has_key(ft, "zqm") || !ft_test_has_key(ft, "zqn") ||
+	    ft_test_has_key(ft, "wm") || ft_test_has_key(ft, "wn")) {
+		fprintf(stderr, "rekey_rank(%s): phase-2 key set wrong\n", lm);
+		goto out;
+	}
+	if (cds_ft_count_keys(ft) != 5) {
+		fprintf(stderr, "rekey_rank(%s): phase-2 count %lu != 5\n",
+			lm, cds_ft_count_keys(ft));
+		goto out;
+	}
 	ret = 0;
 out:
 	rcu_read_unlock();

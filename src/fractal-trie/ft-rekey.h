@@ -2480,7 +2480,60 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		 */
 		ft_glue_set_publish(ft, &glue, d_dst.pnf, d_dst.nfp, merged_pub);
 		glue.attached_nf = merged_pub;
-		glue.count_delta = (long) cnt;
+		/*
+		 * ☠ THE DST DELTA IS WHAT THE UNION ADDED, NOT WHAT THE SRC HELD.
+		 *
+		 * A COLLIDED key is present on BOTH sides, and ft_merge_build
+		 * splices the src leaf onto the dst head's DUPLICATE CHAIN (see
+		 * the holder acquire just below) -- so the merged node holds ONE
+		 * key where the two sides held two.  Charging the publish
+		 * parent's ancestors @cnt therefore OVER-COUNTS by exactly the
+		 * number of collisions, everywhere that walk lands.
+		 * @merged_keys is the union's own answer for the
+		 * node that replaces D, and D's aggregate is what that slot held
+		 * before, so the net this walk owes is their DIFFERENCE -- the
+		 * identical form the cross-trie lane already records
+		 * (@merged_keys - @cnt_dst, ft_rekey_merge_spine's step 3).
+		 *
+		 * The KEY_SHORTER arm is covered unchanged: it replaces the WHOLE
+		 * run at that same slot with @merged_pub, and ft_merge_wrap_prefix
+		 * carries @merged_keys onto the wrapper, so both sides of the
+		 * subtraction still describe exactly one slot.
+		 *
+		 * MEASURED, rank stats on, either list mode: moving "w" {wm,wn}
+		 * onto an occupied "zq" {zqm,zqn} -- BOTH keys collide -- left the
+		 * depth-1 ancestor reading `stored 5, computed 3`.  The structure
+		 * and the key set were already right; only the aggregate was
+		 * wrong, so nothing but cds_ft_verify and the rank/select queries
+		 * could see it.  It could not be reached at all until the count
+		 * walk stopped poisoning the descriptor
+		 * (ft_flip_txn_record_count_parent's read-your-own-writes).
+		 *
+		 * ☐ THIS FIXES THE VALUE, NOT THE WALK'S BASE.  A SIBLING move --
+		 * src and dst under the SAME parent, so the publish parent IS the
+		 * src junction BP -- has a SEPARATE, PRE-EXISTING defect: the
+		 * detach DEL-recompacts BP and the structural publish is
+		 * redirected into that fresh copy (@pending_pub_slot), but the
+		 * count walk below still starts from @publish_parent, the
+		 * SUPERSEDED copy, so the live BP never receives this delta.
+		 * MEASURED with and WITHOUT this change, identically: over
+		 * {q,wam,wan,wbx,wby,wcz}, rekey("wa" -> "wb") leaves that node
+		 * at `stored 3, computed 5`.  The store lane already solves it
+		 * (ft_graft.h bakes the delta into the fresh copy and walks from
+		 * the STABLE grandparent); the glue lane has no equivalent, which
+		 * also contradicts ft_flip_txn_record_count_parent's own header.
+		 * Out of scope here -- it is not what this line got wrong.
+		 */
+		{
+			struct cds_ft_metadata *d_meta =
+				ft_node_compressed(d_dst.nf) ?
+				cds_ft_item_to_metadata((struct cds_ft_inode *)
+					ft_compressed_node_ptr(d_dst.nf)) :
+				cds_ft_item_to_metadata(ft_node_ptr(d_dst.nf));
+
+			glue.count_delta = (long) merged_keys -
+				(long) ft_nr_keys_get(d_meta);
+		}
 		/*
 		 * COLLIDED KEYS: a full key present on BOTH sides makes ft_merge_build
 		 * splice the src leaf onto the dst head's DUPLICATE CHAIN.  That append
