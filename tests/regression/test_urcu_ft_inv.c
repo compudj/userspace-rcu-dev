@@ -752,6 +752,28 @@ static void report_violation(const char *test, const char *fmt, ...)
 /* Macro: run a test, emit TAP ok/not-ok, skip if filtered out.       */
 /* ------------------------------------------------------------------ */
 
+/*
+ * MERGE-DEPENDENT ORACLE PROLOGUE.
+ *
+ * ft_unit gates every merge test on cds_ft_merge_enabled(); ft_inv gated
+ * NOTHING, so on -DNO_FEATURE_FT_MERGE every merge oracle ran against an API
+ * that answers NOT_SUPPORTED and the first root-swap one SIGABRTed -- ft_inv
+ * had never been runnable on that arm at all, and the gate matrix therefore
+ * never ran it there.  Measured at eb254035: 52 ok, `not ok 39`, then SIGABRT
+ * at inv_merge_root_swap_cross_view.
+ *
+ * Skip rather than #ifdef, and name the reason, so the log says what is not
+ * being checked instead of the test silently vanishing.
+ */
+#define INV_NEED_MERGE(name)						\
+	do {								\
+		if (!cds_ft_merge_enabled()) {				\
+			fprintf(stderr, "# " name ": skipped, merge "	\
+				"compiled out (-DNO_FEATURE_FT_MERGE)\n"); \
+			return 0;					\
+		}							\
+	} while (0)
+
 #define RUN_TEST(fn)							\
 	do {								\
 		if (filter && strcmp(filter, #fn) != 0) {		\
@@ -2083,6 +2105,7 @@ static int rkm_run(const char *name, int nsib, int churn)
 
 static int inv_rekey_merge_occupied_dst(void)
 {
+	INV_NEED_MERGE("inv_rekey_merge_occupied_dst");
 	return rkm_run("inv_rekey_merge_occupied_dst", 4, 0);
 }
 
@@ -2103,6 +2126,7 @@ static int inv_rekey_merge_occupied_dst(void)
  */
 static int inv_rekey_merge_compressed_dst(void)
 {
+	INV_NEED_MERGE("inv_rekey_merge_compressed_dst");
 	return rkm_run("inv_rekey_merge_compressed_dst", 2, 0);
 }
 
@@ -2128,6 +2152,7 @@ static int inv_rekey_merge_compressed_dst(void)
  */
 static int inv_rekey_merge_compressed_dst_rootchurn(void)
 {
+	INV_NEED_MERGE("inv_rekey_merge_compressed_dst_rootchurn");
 	return rkm_run("inv_rekey_merge_compressed_dst_rootchurn", 2, 1);
 }
 
@@ -2306,6 +2331,7 @@ out:
 
 static int inv_rekey_merge_shared_dst(void)
 {
+	INV_NEED_MERGE("inv_rekey_merge_shared_dst");
 	struct cds_ft_group *group;
 	struct cds_ft *ft;
 	struct rkms_writer_arg *w;
@@ -8506,6 +8532,7 @@ static int inv_concurrent_crosstrie_fine_lock(void)
  */
 static int inv_concurrent_crosstrie_merge_fine_lock(void)
 {
+	INV_NEED_MERGE("inv_concurrent_crosstrie_merge_fine_lock");
 	return mw_xt_oracle("inv_concurrent_crosstrie_merge_fine_lock",
 		MW_XT_ATTACH_MERGE_SUBPOS, /*list_on=*/ false, /*rank_on=*/ false);
 }
@@ -8538,6 +8565,7 @@ static int inv_concurrent_crosstrie_graft_nilkey_fine_lock(void)
  */
 static int inv_concurrent_crosstrie_merge_nilkey_fine_lock(void)
 {
+	INV_NEED_MERGE("inv_concurrent_crosstrie_merge_nilkey_fine_lock");
 	return mw_xt_oracle("inv_concurrent_crosstrie_merge_nilkey_fine_lock",
 		MW_XT_ATTACH_MERGE_NILKEY, /*list_on=*/ false, /*rank_on=*/ false);
 }
@@ -11650,6 +11678,7 @@ static int inv_graft_root_swap_cross_view(void)
  */
 static int inv_merge_root_swap_cross_view(void)
 {
+	INV_NEED_MERGE("inv_merge_root_swap_cross_view");
 	struct cds_ft_group *group;
 	struct cds_ft *probe = create_varlen_ord_ft(&group);
 	struct inv_rootswap_ctx ctx;
@@ -12225,12 +12254,14 @@ static int inv_empty_dst_root_graft_peer_nolist(void)
 
 static int inv_empty_dst_root_merge_peer(void)
 {
+	INV_NEED_MERGE("inv_empty_dst_root_merge_peer");
 	return empty_dst_oracle("inv_empty_dst_root_merge_peer",
 		EMPTY_DST_MODE_MERGE, /*list_on=*/ true);
 }
 
 static int inv_empty_dst_root_merge_peer_nolist(void)
 {
+	INV_NEED_MERGE("inv_empty_dst_root_merge_peer_nolist");
 	return empty_dst_oracle("inv_empty_dst_root_merge_peer_nolist",
 		EMPTY_DST_MODE_MERGE, /*list_on=*/ false);
 }
@@ -13545,6 +13576,7 @@ out:
 
 static int inv_writer_progress_chainmerge(void)
 {
+	INV_NEED_MERGE("inv_writer_progress_chainmerge");
 	const char *tname = "inv_writer_progress_chainmerge";
 	enum cds_ft_writer_strategy ws = CDS_FT_WRITER_LOCK_FINE;
 	struct cm_ctx c;
@@ -13692,6 +13724,7 @@ static int inv_writer_progress_chainmerge(void)
 
 static int inv_merge_root_src_cross_view(void)
 {
+	INV_NEED_MERGE("inv_merge_root_src_cross_view");
 	struct cds_ft_group *group;
 	struct cds_ft *dst = create_varlen_ord_ft(&group);
 	struct inv_rootswap_ctx ctx;
@@ -13824,6 +13857,7 @@ static int inv_merge_root_src_cross_view(void)
 
 static int inv_merge_cross_view(void)
 {
+	INV_NEED_MERGE("inv_merge_cross_view");
 	struct cds_ft_group *group;
 	struct cds_ft *ft = create_varlen_ord_ft(&group);
 	struct inv_lookup_ctx ctx;
@@ -13920,6 +13954,7 @@ cds_ft_make_exclusive(src);	/* DLM: cross-trie src must be exclusive */
  */
 static int inv_merge_spinecopy_cross_view(void)
 {
+	INV_NEED_MERGE("inv_merge_spinecopy_cross_view");
 	struct cds_ft_group *group;
 	struct cds_ft *ft = create_varlen_ord_ft(&group);
 	struct inv_lookup_ctx ctx;
@@ -14204,6 +14239,7 @@ static int inv_detach_root_cross_view(void)
 
 static int inv_merge_src_cross_view(void)
 {
+	INV_NEED_MERGE("inv_merge_src_cross_view");
 	struct cds_ft_group *group;
 	struct cds_ft *src = create_varlen_ord_ft(&group);
 	struct cds_ft *dst;
@@ -14317,6 +14353,7 @@ static int inv_merge_src_cross_view(void)
  */
 static int inv_merge_src_spinecopy_cross_view(void)
 {
+	INV_NEED_MERGE("inv_merge_src_spinecopy_cross_view");
 	struct cds_ft_group *group;
 	struct cds_ft *src = create_varlen_ord_ft(&group);
 	struct cds_ft *dst;
@@ -17617,6 +17654,7 @@ static void *inv_no_escape_writer(void *arg)
 
 static int inv_ordered_no_escape_graft(void)
 {
+	INV_NEED_MERGE("inv_ordered_no_escape_graft");
 	struct cds_ft_group_attr *gattr;
 	struct cds_ft_group *group;
 	struct cds_ft *T, *S;
@@ -17927,6 +17965,7 @@ static void *inv_merge_no_escape_writer(void *arg)
 
 static int inv_merge_no_escape(void)
 {
+	INV_NEED_MERGE("inv_merge_no_escape");
 	static const char *const base_keys[] = { "Taa", "Tab", "Tba", "Tbb" };
 	struct cds_ft_group_attr *gattr;
 	struct cds_ft_group *group;
@@ -18111,6 +18150,7 @@ static void *inv_merge_nonroot_dst_writer(void *arg)
 
 static int inv_merge_nonroot_dst_no_escape(void)
 {
+	INV_NEED_MERGE("inv_merge_nonroot_dst_no_escape");
 	struct cds_ft_group_attr *gattr;
 	struct cds_ft_group *group;
 	struct cds_ft *dst, *src;
@@ -18508,6 +18548,7 @@ static int inv_merge_rerooted_run(int shape, const char *name)
 
 static int inv_merge_rerooted_glue_no_escape(void)
 {
+	INV_NEED_MERGE("inv_merge_rerooted_glue_no_escape");
 	if (inv_merge_rerooted_run(0, "inv_merge_rerooted_glue_ext") < 0)
 		return -1;
 	if (inv_merge_rerooted_run(1, "inv_merge_rerooted_glue_compressed") < 0)
@@ -18783,6 +18824,7 @@ static void *inv_merge_compressed_dst_writer(void *arg)
 
 static int inv_merge_compressed_dst_no_escape(void)
 {
+	INV_NEED_MERGE("inv_merge_compressed_dst_no_escape");
 	struct cds_ft_group_attr *gattr;
 	struct cds_ft_group *group;
 	struct cds_ft *dst, *src;
@@ -18991,6 +19033,7 @@ static void *inv_merge_key_shorter_dst_writer(void *arg)
 
 static int inv_merge_key_shorter_dst_no_escape(void)
 {
+	INV_NEED_MERGE("inv_merge_key_shorter_dst_no_escape");
 	struct cds_ft_group_attr *gattr;
 	struct cds_ft_group *group;
 	struct cds_ft *dst, *src;
@@ -19212,6 +19255,7 @@ static void *inv_merge_compressed_parent_dst_writer(void *arg)
 
 static int inv_merge_compressed_parent_dst_no_escape(void)
 {
+	INV_NEED_MERGE("inv_merge_compressed_parent_dst_no_escape");
 	struct cds_ft_group_attr *gattr;
 	struct cds_ft_group *group;
 	struct cds_ft *dst, *src;
@@ -19409,6 +19453,7 @@ static void *inv_merge_atomic_reader(void *arg)
 
 static int inv_merge_atomic_completeness(void)
 {
+	INV_NEED_MERGE("inv_merge_atomic_completeness");
 	struct timespec t0;
 	int ret = 0;
 
@@ -19600,6 +19645,7 @@ static void *inv_merge_atomic_deep_reader(void *arg)
 
 static int inv_merge_atomic_completeness_deep(void)
 {
+	INV_NEED_MERGE("inv_merge_atomic_completeness_deep");
 	struct timespec t0;
 	int ret = 0;
 
