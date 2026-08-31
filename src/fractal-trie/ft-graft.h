@@ -919,6 +919,51 @@ enum urcu_txn_status ft_store_at_graft_point_commit(struct cds_ft *ft,
 			ft_flip_txn_record_pub_rec(st->glue->txn,
 				&st->reserve_rec);
 			/*
+			 * ANNOUNCE THE PENDING PUBLISH, exactly as the GLUE split
+			 * builder and the merge do through ft_glue_set_publish
+			 * (ft-mutation-helpers.h).  Until this existed the NOSPLIT
+			 * forward publish was the ONLY one that went unannounced,
+			 * and the shape-gate comment claiming such a publish "rides
+			 * the recompaction instead (@pending_pub_slot)" was true for
+			 * GLUE and MERGE and FALSE here.
+			 *
+			 * ☠ WHAT IT FIXES.  A same-trie rekey's src detach
+			 * recompacts THIS publish parent before the caller's single
+			 * commit.  @pending_pub_slot is not predicate-armed against
+			 * any node -- the recompaction copy loop consumes it BY SLOT
+			 * ADDRESS (ft-mutation-node.h) -- so without the announcement
+			 * the loop resolves this slot through ft_flip_txn_resolve_prio,
+			 * which deliberately does NOT read the txn's own writes, reads
+			 * the COMMITTED old child, and the fresh parent is born holding
+			 * it.  The moved subtree is then reachable only from a body
+			 * nothing descends into: the op reports OK and the keys are
+			 * gone.  Measured 4 -> 3 and 5 -> 3 keys before this line.
+			 *
+			 * The edge recorded just above still commits into that
+			 * superseded body once the fold takes the value across.  That
+			 * is harmless and is NOT dead-node resurrection: the copy loop
+			 * only reads the old body, the retire lands on the state word
+			 * and never on this slot word, so the edge's expected-old still
+			 * holds at commit and the write lands in a node already retired
+			 * by the same flip.  Both children agree on the value.  (The
+			 * GLUE lane instead defers its publish record to commit-edges
+			 * time and skips it via @pending_pub_folded; the NOSPLIT record
+			 * is already in the txn by then, so it cannot take that route.)
+			 *
+			 * ☞ NO COUNT RE-BASE HERE, deliberately.  The order-statistics
+			 * walk below is the only consumer that would need one, and
+			 * ft_flip_txn_record_count_parent returns immediately unless
+			 * ft->rank_stats (ft-mutation-helpers.h) -- while every
+			 * rank-stats trie reaching this fold LIVELOCKS today for an
+			 * unrelated, pre-existing reason (rank stats coerce COARSE).
+			 * A re-base here would therefore be untestable code in the one
+			 * lane whose bugs keep shipping, so it waits for that livelock.
+			 */
+			if (st->glue->record_only && st->glue->txn) {
+				st->glue->txn->pending_pub_slot = pub_slot;
+				st->glue->txn->pending_pub_val = st->dest;
+			}
+			/*
 			 * Order-statistics fold (BULK): the reserve relocated the
 			 * attach parent to the fresh @st->dest, recompacted with
 			 * only the OLD subtree count (the payload slot read

@@ -12917,6 +12917,7 @@ static int test_rekey_graft_publish_survives_detach(void)
 	static const char *k2[] = { "zhab", "zhac", "zq", "zwa", "zwb", NULL };
 	static const char *k3[] = { "zq", "zwabcd", NULL };
 	static const char *k4[] = { "baaa", "abaaba", "abab", "a", "b", NULL };
+	static const char *k5[] = { "hello", "q", "wa", "wb", NULL };
 	int bad = 0;
 
 	if (!cds_ft_merge_enabled()) {
@@ -12943,6 +12944,13 @@ static int test_rekey_graft_publish_survives_detach(void)
 	 * the three legs above are not.
 	 */
 	bad |= rekey_keeps_keys("publish/colocated-src", k4, "bbbba", "a") ? 1 : 0;
+	/*
+	 * ROOT-LEVEL sibling: the publish parent is the root itself, so the
+	 * announced slot is &ft->root.  Silently destroyed "weello" until the
+	 * NOSPLIT publish was announced; kept as the regression guard for the
+	 * root geometry, which no other leg here covers.
+	 */
+	bad |= rekey_keeps_keys("publish/root-sibling", k5, "we", "h") ? 1 : 0;
 	if (!_cds_ft_debug_compress_enabled()) {
 		diag("test_rekey_graft_publish_survives_detach: deep-chain leg "
 			"skipped, path compression compiled out "

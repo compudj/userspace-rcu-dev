@@ -825,8 +825,9 @@ void ft_chain_compress_register_retire(struct ft_flip_txn *txn,
  *
  * @pending_child (FOLD, pending-publish): non-NULL ONLY on the record_only fold
  * when the boundary slot @surviving_byte names is the caller txn's OWN pending
- * forward publish target (@pending_pub_slot, armed by ft_glue_set_publish
- * before this fold runs).  It is the FRESH, UNPUBLISHED cluster top that same
+ * forward publish target (@pending_pub_slot -- armed before this fold runs by
+ * ft_glue_set_publish on the GLUE and merge lanes, or directly by the NOSPLIT
+ * store commit in ft-graft.h).  It is the FRESH, UNPUBLISHED cluster top that same
  * commit installs there, and it -- not the committed occupant -- is the child
  * the merged node must be built around: fusing around the committed value
  * builds new_cn on a node the same commit retires and lets the commit publish
@@ -2924,8 +2925,11 @@ int ft_detach_node(struct cds_ft *ft,
 				/*
 				 * ☠ THE SURVIVOR SLOT MAY BE THIS TXN'S OWN
 				 * PENDING FORWARD PUBLISH (@pending_pub_slot,
-				 * armed by ft_glue_set_publish before the fold
-				 * ran): a same-trie SIBLING move's shared parent
+				 * armed before the fold ran -- by
+				 * ft_glue_set_publish on the GLUE and merge
+				 * lanes, or directly by the NOSPLIT store
+				 * commit, ft-graft.h): a same-trie SIBLING
+				 * move's shared parent
 				 * holds exactly the detached child and the
 				 * destination.  @s_child is then the COMMITTED
 				 * occupant -- a node the SAME commit retires and
@@ -2956,9 +2960,10 @@ int ft_detach_node(struct cds_ft *ft,
 					 * uncovered: refuse the whole move,
 					 * before any side-effect, with the
 					 * rekey's own carve-out code
-					 * (FT_REKEY_UNCOVERED == -EDOM; only
-					 * the rekey fold can reach this, no
-					 * other caller arms @pending_pub_slot).
+					 * (FT_REKEY_UNCOVERED == -EDOM).  Only
+					 * the rekey fold can reach this: BOTH
+					 * armers are gated on @record_only, and
+					 * ft-rekey.h is its only setter.
 					 */
 					if (ft_node_compressed(fold_pending) ||
 							ft_node_skip_compressed(fold_pending)) {
