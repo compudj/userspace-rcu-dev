@@ -69,13 +69,13 @@
 #endif
 
 /*
- * 303 unconditional + 51 fault-injection-only RUN_TEST registrations, on top of
+ * 305 unconditional + 51 fault-injection-only RUN_TEST registrations, on top of
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (361 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (363 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (310 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (312 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -12682,6 +12682,245 @@ static int test_rekey_skip_slot_bp_atomic_or_refused(void)
 		return -1;
 	/* UNCUT over the same internal child. */
 	return rekey_skip_slot_bp_internal_child("zw", "zh");
+}
+
+/*
+ * SHARED PIN HELPER for the two rekey key-loss families below.
+ *
+ * Inserts @keys, runs the same-trie rekey @nw <- @old, and demands the ONLY
+ * correct outcome: every key in @after present, nothing else left, verify
+ * clean.  The checks are ORDERED WORST-FIRST so the report names the actual
+ * failure mode rather than the first assertion that happens to trip:
+ *
+ *   1. a CORRUPT trie,
+ *   2. a REFUSAL -- reported separately, and separately again depending on
+ *      whether the refusal was TOTAL, because a clean refusal is a coverage
+ *      gap while a mutating one is a soundness bug,
+ *   3. an "OK" that lost or stranded keys -- the SILENT DATA LOSS these pins
+ *      exist for.
+ *
+ * ☠ @after must list the keys the move PRODUCES, spelled out.  Getting one
+ * wrong reads as a key loss that is not there: "zhab" stripped of the src
+ * prefix "zh" is "ab", so it lands at "zw" || "ab" == "zwab", NOT "zwb".
+ */
+static int rekey_keeps_keys(const char *what, const char *const *keys,
+		const char *nw, const char *old, const char *const *after)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	enum cds_ft_status s;
+	unsigned long n_after = 0, n_keys = 0;
+	char missing[256] = "";
+	int i, ret = -1, intact = 1;
+
+	ft = create_varlen_ft(&group);
+	rcu_read_lock();
+	for (i = 0; keys[i]; i++) {
+		if (cds_ft_insert(ft, (const uint8_t *) keys[i],
+				strlen(keys[i]),
+				&node_alloc((uint64_t) i + 1)->node)
+				!= CDS_FT_STATUS_OK) {
+			fprintf(stderr, "%s: setup insert %s failed\n", what,
+				keys[i]);
+			goto out;
+		}
+		n_keys++;
+	}
+	for (i = 0; after[i]; i++)
+		n_after++;
+
+	s = ft_rekey(ft, nw, old);
+
+	/*
+	 * The census FIRST, and reported by every branch below.  A corrupt trie
+	 * and a lost key are both fatal here, and the corruption check has to
+	 * come before any lookup can be trusted -- but reporting only "CORRUPT"
+	 * would bury the headline, which is that the call said OK and the keys
+	 * are gone.
+	 */
+	for (i = 0; after[i]; i++) {
+		if (!ft_test_has_key(ft, after[i])) {
+			if (missing[0])
+				strncat(missing, " ",
+					sizeof(missing) - strlen(missing) - 1);
+			strncat(missing, after[i],
+				sizeof(missing) - strlen(missing) - 1);
+		}
+	}
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "%s: rekey %s<-%s (%s) left the trie CORRUPT "
+			"(%lu of %lu keys, missing: %s)\n", what, nw, old,
+			cds_ft_status_to_string(s), cds_ft_count_keys(ft),
+			n_after, missing[0] ? missing : "-");
+		goto out;
+	}
+	if (s != CDS_FT_STATUS_OK) {
+		for (i = 0; keys[i]; i++)
+			if (!ft_test_has_key(ft, keys[i]))
+				intact = 0;
+		if (!intact || cds_ft_count_keys(ft) != n_keys) {
+			fprintf(stderr, "%s: rekey %s<-%s refusal (%s) MUTATED "
+				"the trie\n", what, nw, old,
+				cds_ft_status_to_string(s));
+		} else {
+			fprintf(stderr, "%s: rekey %s<-%s REFUSED (%s) -- "
+				"total, but the shape is a coverage gap\n",
+				what, nw, old, cds_ft_status_to_string(s));
+		}
+		goto out;
+	}
+	if (missing[0]) {
+		fprintf(stderr, "%s: rekey %s<-%s reported OK but SILENTLY LOST "
+			"keys (%lu of %lu left, missing: %s)\n", what, nw, old,
+			cds_ft_count_keys(ft), n_after, missing);
+		goto out;
+	}
+	if (cds_ft_count_keys(ft) != n_after) {
+		fprintf(stderr, "%s: rekey %s<-%s reported OK with %lu keys, "
+			"expected %lu\n", what, nw, old,
+			cds_ft_count_keys(ft), n_after);
+		goto out;
+	}
+	ret = 0;
+out:
+	rcu_read_unlock();
+	drain_trie(ft);
+	rcu_barrier();
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
+ * ☠☠☠ PIN (RED on every COMPRESSED build): a same-trie rekey whose DESTINATION
+ * key diverges INSIDE the very compressed run the SOURCE key ends in returns
+ * CDS_FT_STATUS_OK and DESTROYS the moved subtree.
+ *
+ * Two API calls and a three-byte key are enough:
+ *
+ *      insert "zha";  cds_ft_rekey_merge(ft, "zw", 2, "zh", 2);
+ *      -> OK, cds_ft_count_keys 1 -> 0, "zwa" gone, cds_ft_verify red.
+ *
+ * THE SHAPE.  The trie is root --'z'--> RUN --> leaf.  The src key ends inside
+ * RUN (src_cut > 0) and the dst key diverges from RUN at an earlier offset, so
+ * BOTH descents resolve to that ONE node and the GLUE prep must SPLIT the very
+ * node that is also the source top: s_top == d_src.nf == d_dst.nf == graft_c.
+ *
+ * WHY NOTHING CATCHES IT.  The shape-gate's aliasing terms (ft-rekey.h, the
+ * guard whose comment says the src junction "IS the node the graft retires")
+ * test d_src.pnf and d_src.ppnf -- BP and BP's parent -- and never d_src.nf.
+ * The old-direction drop that would otherwise cover it is armed on
+ * @drop_old_dir_of = d_src.pnf, the same wrong field, so the cut shape sails
+ * between both cures.  The two publishes then land on DISTINCT slots (&ft->root
+ * versus a slot in the retired body), which is why the txn engine is silent:
+ * it publishes REACHABILITY, not interiors, so no --enable-rcu-debug self-check
+ * fires.  cds_ft_verify sees it only with the ordered list ON; with the list
+ * OFF the key is destroyed and verify passes.
+ *
+ * ☑ Every leg below returns CLEANLY on every build -- no abort, no hang -- so
+ * they are all safe to run on every gate arm.  They are GREEN under
+ * -DNO_FEATURE_FT_COMPRESS, where there is no run to alias.
+ *
+ * ☞ MEASURED PRE-EXISTING at 593c932f; this is not a regression of the branch.
+ */
+static int test_rekey_cut_run_dst_split_keeps_keys(void)
+{
+	static const char *k1[] = { "zha", NULL };
+	static const char *a1[] = { "zwa", NULL };
+	static const char *k2[] = { "zhab", "zhac", NULL };
+	static const char *a2[] = { "zwab", "zwac", NULL };
+	static const char *k3[] = { "zhelloworld", NULL };
+	static const char *a3[] = { "zhelpoworld", NULL };
+	static const char *k4[] = { "abzhello", "abq", "abr", "k", "kx", NULL };
+	static const char *a4[] = { "abzwello", "abq", "abr", "k", "kx", NULL };
+
+	if (!cds_ft_merge_enabled()) {
+		diag("test_rekey_cut_run_dst_split_keeps_keys: skipped, merge "
+			"compiled out (-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
+	/* The minimal shape: ONE key, one rekey, the whole trie destroyed. */
+	if (rekey_keeps_keys("cut-run/minimal", k1, "zw", "zh", a1))
+		return -1;
+	/* A MULTI-KEY subtree dies whole: 2 -> 0. */
+	if (rekey_keeps_keys("cut-run/two-key-subtree", k2, "zw", "zh", a2))
+		return -1;
+	/* The divergence need not be at the run's first byte. */
+	if (rekey_keeps_keys("cut-run/mid-run", k3, "zhelp", "zhell", a3))
+		return -1;
+	/* Deeper, and with bystanders: only the moved subtree dies. */
+	return rekey_keeps_keys("cut-run/deep-populated", k4, "abzw", "abzh", a4);
+}
+
+/*
+ * ☠☠☠ PIN (RED on every build): the graft's forward publish is lost when the
+ * DETACH recompacts the node the graft publishes into.
+ *
+ * A distinct route from the cut-run pin above, and it needs no compressed run:
+ * the NOSPLIT graft's forward publish is recorded straight into the shared txn
+ * and is NEVER announced as the txn's @pending_pub_slot -- that announcement
+ * has only ever been made by the GLUE/MERGE builders.  So when the detach then
+ * recompacts the publish PARENT, the copy loop resolves that slot through the
+ * deliberately not-read-your-own-writes prio resolver, reads the COMMITTED old
+ * child, and the fresh parent is born holding it.  The forward-publish edge
+ * afterwards commits into a body nothing can reach, and validates, because the
+ * dead word still holds the value it expects.
+ *
+ * ☠ The first leg has NO ELEVATION at all -- the branch point simply IS the
+ * publish parent -- so this is not an "elevating detach" story; the arming is
+ * missing outright.  The shape-gate comment that says such a publish "rides the
+ * recompaction instead (@pending_pub_slot)" is true for GLUE and MERGE and
+ * FALSE for NOSPLIT.
+ *
+ * ☠☠ THE LEG THAT MAY NOT RUN EVERYWHERE.  The fourth shape below is red the
+ * same way on a compressed build, but under -DNO_FEATURE_FT_COMPRESS it does
+ * not fail -- it ABORTS the engine's SW/MW kind check on an --enable-rcu-debug
+ * build (urcu_txn_record_chain) and LIVELOCKS forever on a release one, leaking
+ * memory while it spins.  A libtap failure cannot absorb either, so it is
+ * gated on the BUILD FLAG, by name, and its absence is announced.
+ *
+ * ☞ MEASURED PRE-EXISTING at 593c932f.
+ */
+static int test_rekey_graft_publish_survives_detach(void)
+{
+	static const char *k0[] = { "zhello", "zq", "zwa", NULL };
+	static const char *a0[] = { "zwello", "zq", "zwa", NULL };
+	static const char *k1[] = { "zhello", "zq", "zwa", "zwb", NULL };
+	static const char *a1[] = { "zweello", "zq", "zwa", "zwb", NULL };
+	static const char *k2[] = { "zhab", "zhac", "zq", "zwa", "zwb", NULL };
+	static const char *a2[] = { "zweb", "zwec", "zq", "zwa", "zwb", NULL };
+	static const char *k3[] = { "zq", "zwabcd", NULL };
+	static const char *a3[] = { "zq", "zwed", NULL };
+
+	if (!cds_ft_merge_enabled()) {
+		diag("test_rekey_graft_publish_survives_detach: skipped, merge "
+			"compiled out (-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
+	/*
+	 * An intermediate one-child node between the branch point and the
+	 * publish parent.  Compression collapses it, so this leg is RED only
+	 * under -DNO_FEATURE_FT_COMPRESS -- keep it, it is the cheapest witness
+	 * that the loss does not need the run.
+	 */
+	if (rekey_keeps_keys("publish/elevating", k0, "zwe", "zhe", a0))
+		return -1;
+	/* NO elevation: the branch point IS the publish parent. */
+	if (rekey_keeps_keys("publish/direct", k1, "zwe", "zh", a1))
+		return -1;
+	/* Two keys, and the branch point is a run's one child. */
+	if (rekey_keeps_keys("publish/two-key-subtree", k2, "zwe", "zha", a2))
+		return -1;
+	if (!_cds_ft_debug_compress_enabled()) {
+		diag("test_rekey_graft_publish_survives_detach: deep-chain leg "
+			"skipped, path compression compiled out "
+			"(-DNO_FEATURE_FT_COMPRESS): that build ABORTS the "
+			"txn kind check / LIVELOCKS on this shape, and a "
+			"libtap failure absorbs neither");
+		return 0;
+	}
+	/* A deep one-child src chain under the graft's own target. */
+	return rekey_keeps_keys("publish/deep-chain", k3, "zwe", "zwabc", a3);
 }
 
 static int test_rekey_fixed_len_atomic_or_refused(void)
@@ -34421,6 +34660,8 @@ int main(int argc, char **argv)
 	RUN_TEST(test_merge_rekey_same_trie_speculative_rejected);
 	RUN_TEST(test_rekey_graft_vs_merge);
 	RUN_TEST(test_rekey_skip_slot_bp_atomic_or_refused);
+	RUN_TEST(test_rekey_cut_run_dst_split_keeps_keys);
+	RUN_TEST(test_rekey_graft_publish_survives_detach);
 	RUN_TEST(test_rekey_fixed_len_atomic_or_refused);
 	RUN_TEST(test_rekey_varlen_ordered_splice);
 	RUN_TEST(test_rekey_abutting_dst_keeps_list_order);
