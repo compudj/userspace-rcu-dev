@@ -2588,7 +2588,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		 * Set unconditionally -- the build only ever splits a compressed
 		 * node, so a plain BP can never match and needs no test here.
 		 */
-		glue.drop_old_dir_of = d_src.pnf;
+		glue.drop_old_dir_of = src_cut ? d_src.nf : d_src.pnf;
 		prep = ft_graft_build(ft, dst_ord, dst_len, s_top_prime, cnt,
 			&d_dst, &glue, &bctx.held);
 	}
@@ -3819,12 +3819,26 @@ cells_done:
 		/* Likewise an ELEVATING detach's orphan chain. */
 		ft_rekey_detach_free_orphans(ft, &detach_rc);
 		/*
-		 * Old S_top after the grace period -- but ONLY on the cow_stop path.
-		 * The merge retires S_top through @src_glue's free list, so
-		 * ft_glue_free_old above already owns that reclaim; doing it here too
-		 * is a double free.
+		 * Old S_top after the grace period -- but ONLY when nothing else
+		 * already owns its reclaim.  TWO other owners exist:
+		 *
+		 *  - the MERGE retires S_top through @src_glue's free list, so
+		 *    ft_glue_free_old above already owns it;
+		 *  - a CUT source whose old direction was DROPPED: there S_top IS
+		 *    the compressed node the split retires (@src_cut > 0 makes
+		 *    d_src.nf the run itself, which is what arms the drop), so the
+		 *    build put it on the GLUE free list -- again ft_glue_free_old's.
+		 *
+		 * Freeing it here as well call_rcu's ONE rcu_head TWICE.  The second
+		 * enqueue self-links the wfcq node, after which the call_rcu worker
+		 * spins at 100% CPU and every later rcu barrier hangs -- and it is
+		 * INVISIBLE to the suite, to ASAN (arena-allocated) and to the
+		 * DEBUG_COUNTERS balance (cds_ft_free_item_deferred bumps no
+		 * counter), because the damage lands in the callback queue long
+		 * after the op returns.  Measured: one cut rekey, 3 s idle, then
+		 * urcu_qsbr_barrier() never returns.
 		 */
-		if (!merge_dst)
+		if (!merge_dst && !(src_cut && glue.old_dir_dropped))
 			cds_ft_free_item_deferred(ft, s_top_meta);
 		ret = 0;
 	} else {
