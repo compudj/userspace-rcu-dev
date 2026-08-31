@@ -13616,10 +13616,34 @@ publish_done:
 		if (g->txn && g->txn->pending_pub_folded &&
 				g->txn->pending_pub_node &&
 				g->publish_slot == g->txn->pending_pub_slot) {
-			struct cds_ft_metadata *sm = cds_ft_item_to_metadata(
-				ft_node_ptr(g->txn->pending_pub_node));
-			struct cds_ft_metadata *om = cds_ft_item_to_metadata(
-				ft_node_ptr(g->publish_parent));
+			/*
+			 * ☠ DECODE COMPRESSED-AWARE, though nothing produces a
+			 * compressed node here TODAY.  @pending_pub_node is set
+			 * only by ft_node_recompact, whose fresh body is always
+			 * a plain ft_node_flag() -- so ft_node_ptr() happens to
+			 * be right, and is right for no reason the next producer
+			 * will inherit.  The obvious next one is the shape-D
+			 * fused collapse, whose whole product is a merged
+			 * COMPRESSED node; wiring it to this fold with a
+			 * plain-only decode would read metadata off the wrong
+			 * address, silently, on the very path that fold exists
+			 * to make safe.  Same idiom the source side already uses
+			 * for S_top.
+			 */
+			struct cds_ft_metadata *sm =
+				ft_node_compressed(g->txn->pending_pub_node) ?
+				cds_ft_item_to_metadata((struct cds_ft_inode *)
+					ft_compressed_node_ptr(
+						g->txn->pending_pub_node)) :
+				cds_ft_item_to_metadata(
+					ft_node_ptr(g->txn->pending_pub_node));
+			struct cds_ft_metadata *om =
+				ft_node_compressed(g->publish_parent) ?
+				cds_ft_item_to_metadata((struct cds_ft_inode *)
+					ft_compressed_node_ptr(
+						g->publish_parent)) :
+				cds_ft_item_to_metadata(
+					ft_node_ptr(g->publish_parent));
 
 			ft_nr_keys_store(ft, sm,
 				ft_nr_keys_get(sm) + g->count_delta,
