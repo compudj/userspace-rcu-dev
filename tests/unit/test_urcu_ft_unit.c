@@ -69,13 +69,13 @@
 #endif
 
 /*
- * 305 unconditional + 51 fault-injection-only RUN_TEST registrations, on top of
+ * 307 unconditional + 51 fault-injection-only RUN_TEST registrations, on top of
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (363 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (365 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (312 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (314 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -12699,21 +12699,39 @@ static int test_rekey_skip_slot_bp_atomic_or_refused(void)
  *   3. an "OK" that lost or stranded keys -- the SILENT DATA LOSS these pins
  *      exist for.
  *
- * ☠ @after must list the keys the move PRODUCES, spelled out.  Getting one
- * wrong reads as a key loss that is not there: "zhab" stripped of the src
- * prefix "zh" is "ab", so it lands at "zw" || "ab" == "zwab", NOT "zwb".
+ * ☠ THE EXPECTED KEYS ARE DERIVED, NEVER HAND-LISTED.  A rename maps every key
+ * that starts with @old to @nw || (key + strlen(old)) and leaves the rest
+ * alone -- three separate hand-written lists were WRONG during this
+ * investigation ("zhab" stripped of "zh" is "ab", so it lands at "zwab", not
+ * "zwb"), and each wrong list read as a key loss that was not there.  A
+ * derivation cannot make that mistake, so the caller only supplies the inputs
+ * the API itself takes.
  */
-static int rekey_keeps_keys(const char *what, const char *const *keys,
-		const char *nw, const char *old, const char *const *after)
+static int rekey_keeps_keys_cfg(const char *what, const char *const *keys,
+		const char *nw, const char *old, int rank_stats)
 {
 	struct cds_ft_group *group;
 	struct cds_ft *ft;
 	enum cds_ft_status s;
 	unsigned long n_after = 0, n_keys = 0;
+	char after[8][96];
 	char missing[256] = "";
+	size_t oldlen = strlen(old);
 	int i, ret = -1, intact = 1;
 
-	ft = create_varlen_ft(&group);
+	for (i = 0; keys[i]; i++) {
+		if ((size_t) i >= CAA_ARRAY_SIZE(after))
+			abort();	/* grow @after, not the key list */
+		if (!strncmp(keys[i], old, oldlen))
+			snprintf(after[i], sizeof(after[i]), "%s%s", nw,
+				keys[i] + oldlen);
+		else
+			snprintf(after[i], sizeof(after[i]), "%s", keys[i]);
+	}
+	n_after = (unsigned long) i;
+
+	ft = rank_stats ? create_varlen_rankstats_list_ft(true, &group) :
+			create_varlen_ft(&group);
 	rcu_read_lock();
 	for (i = 0; keys[i]; i++) {
 		if (cds_ft_insert(ft, (const uint8_t *) keys[i],
@@ -12726,8 +12744,6 @@ static int rekey_keeps_keys(const char *what, const char *const *keys,
 		}
 		n_keys++;
 	}
-	for (i = 0; after[i]; i++)
-		n_after++;
 
 	s = ft_rekey(ft, nw, old);
 
@@ -12738,7 +12754,7 @@ static int rekey_keeps_keys(const char *what, const char *const *keys,
 	 * would bury the headline, which is that the call said OK and the keys
 	 * are gone.
 	 */
-	for (i = 0; after[i]; i++) {
+	for (i = 0; (unsigned long) i < n_after; i++) {
 		if (!ft_test_has_key(ft, after[i])) {
 			if (missing[0])
 				strncat(missing, " ",
@@ -12791,6 +12807,19 @@ out:
 	return ret;
 }
 
+static int rekey_keeps_keys(const char *what, const char *const *keys,
+		const char *nw, const char *old)
+{
+	return rekey_keeps_keys_cfg(what, keys, nw, old, 0);
+}
+
+/* Rank stats coerce COARSE, which is a different writer path entirely. */
+static int rekey_rankstats_keeps_keys(const char *what, const char *const *keys,
+		const char *nw, const char *old)
+{
+	return rekey_keeps_keys_cfg(what, keys, nw, old, 1);
+}
+
 /*
  * ☠☠☠ PIN (RED on every COMPRESSED build): a same-trie rekey whose DESTINATION
  * key diverges INSIDE the very compressed run the SOURCE key ends in returns
@@ -12826,30 +12855,30 @@ out:
 static int test_rekey_cut_run_dst_split_keeps_keys(void)
 {
 	static const char *k1[] = { "zha", NULL };
-	static const char *a1[] = { "zwa", NULL };
 	static const char *k2[] = { "zhab", "zhac", NULL };
-	static const char *a2[] = { "zwab", "zwac", NULL };
 	static const char *k3[] = { "zhelloworld", NULL };
-	static const char *a3[] = { "zhelpoworld", NULL };
 	static const char *k4[] = { "abzhello", "abq", "abr", "k", "kx", NULL };
-	static const char *a4[] = { "abzwello", "abq", "abr", "k", "kx", NULL };
+	int bad = 0;
 
 	if (!cds_ft_merge_enabled()) {
 		diag("test_rekey_cut_run_dst_split_keeps_keys: skipped, merge "
 			"compiled out (-DNO_FEATURE_FT_MERGE)");
 		return 0;
 	}
+	/*
+	 * EVERY leg runs, and the test fails if ANY did: stopping at the first
+	 * failure hides which shapes a partial fix actually closed, and leaves
+	 * the legs after it never executed at all.
+	 */
 	/* The minimal shape: ONE key, one rekey, the whole trie destroyed. */
-	if (rekey_keeps_keys("cut-run/minimal", k1, "zw", "zh", a1))
-		return -1;
+	bad |= rekey_keeps_keys("cut-run/minimal", k1, "zw", "zh") ? 1 : 0;
 	/* A MULTI-KEY subtree dies whole: 2 -> 0. */
-	if (rekey_keeps_keys("cut-run/two-key-subtree", k2, "zw", "zh", a2))
-		return -1;
+	bad |= rekey_keeps_keys("cut-run/two-key-subtree", k2, "zw", "zh") ? 1 : 0;
 	/* The divergence need not be at the run's first byte. */
-	if (rekey_keeps_keys("cut-run/mid-run", k3, "zhelp", "zhell", a3))
-		return -1;
+	bad |= rekey_keeps_keys("cut-run/mid-run", k3, "zhelp", "zhell") ? 1 : 0;
 	/* Deeper, and with bystanders: only the moved subtree dies. */
-	return rekey_keeps_keys("cut-run/deep-populated", k4, "abzw", "abzh", a4);
+	bad |= rekey_keeps_keys("cut-run/deep-populated", k4, "abzw", "abzh") ? 1 : 0;
+	return bad ? -1 : 0;
 }
 
 /*
@@ -12884,13 +12913,11 @@ static int test_rekey_cut_run_dst_split_keeps_keys(void)
 static int test_rekey_graft_publish_survives_detach(void)
 {
 	static const char *k0[] = { "zhello", "zq", "zwa", NULL };
-	static const char *a0[] = { "zwello", "zq", "zwa", NULL };
 	static const char *k1[] = { "zhello", "zq", "zwa", "zwb", NULL };
-	static const char *a1[] = { "zweello", "zq", "zwa", "zwb", NULL };
 	static const char *k2[] = { "zhab", "zhac", "zq", "zwa", "zwb", NULL };
-	static const char *a2[] = { "zweb", "zwec", "zq", "zwa", "zwb", NULL };
 	static const char *k3[] = { "zq", "zwabcd", NULL };
-	static const char *a3[] = { "zq", "zwed", NULL };
+	static const char *k4[] = { "baaa", "abaaba", "abab", "a", "b", NULL };
+	int bad = 0;
 
 	if (!cds_ft_merge_enabled()) {
 		diag("test_rekey_graft_publish_survives_detach: skipped, merge "
@@ -12903,24 +12930,150 @@ static int test_rekey_graft_publish_survives_detach(void)
 	 * under -DNO_FEATURE_FT_COMPRESS -- keep it, it is the cheapest witness
 	 * that the loss does not need the run.
 	 */
-	if (rekey_keeps_keys("publish/elevating", k0, "zwe", "zhe", a0))
-		return -1;
+	bad |= rekey_keeps_keys("publish/elevating", k0, "zwe", "zhe") ? 1 : 0;
 	/* NO elevation: the branch point IS the publish parent. */
-	if (rekey_keeps_keys("publish/direct", k1, "zwe", "zh", a1))
-		return -1;
+	bad |= rekey_keeps_keys("publish/direct", k1, "zwe", "zh") ? 1 : 0;
 	/* Two keys, and the branch point is a run's one child. */
-	if (rekey_keeps_keys("publish/two-key-subtree", k2, "zwe", "zha", a2))
-		return -1;
+	bad |= rekey_keeps_keys("publish/two-key-subtree", k2, "zwe", "zha") ? 1 : 0;
+	/*
+	 * A five-key trie whose SOURCE PREFIX IS ITSELF A KEY: "a" moves to
+	 * "bbbba" and the two keys below it move with it.  Found by random
+	 * shape fuzzing over the same route; it destroys THREE keys (5 -> 2)
+	 * and is red on every arm including -DNO_FEATURE_FT_COMPRESS, which
+	 * the three legs above are not.
+	 */
+	bad |= rekey_keeps_keys("publish/colocated-src", k4, "bbbba", "a") ? 1 : 0;
 	if (!_cds_ft_debug_compress_enabled()) {
 		diag("test_rekey_graft_publish_survives_detach: deep-chain leg "
 			"skipped, path compression compiled out "
 			"(-DNO_FEATURE_FT_COMPRESS): that build ABORTS the "
 			"txn kind check / LIVELOCKS on this shape, and a "
 			"libtap failure absorbs neither");
-		return 0;
+		return bad ? -1 : 0;
 	}
 	/* A deep one-child src chain under the graft's own target. */
-	return rekey_keeps_keys("publish/deep-chain", k3, "zwe", "zwabc", a3);
+	bad |= rekey_keeps_keys("publish/deep-chain", k3, "zwe", "zwabc") ? 1 : 0;
+	return bad ? -1 : 0;
+}
+
+/*
+ * ☠☠☠ OPT-IN REPRODUCER (FT_UNIT_KNOWN_BAD=1): same-trie rekeys that NEVER
+ * RETURN on the default build.  Two inserts and one call is enough:
+ *
+ *      insert "zhab", "zhabbb";  cds_ft_rekey_merge(ft, "zg", 2, "zh", 2);
+ *
+ * A retry loop inside ft_rekey_graft_simple_attempt -- five live `gdb -p`
+ * samples land on a DIFFERENT frame each time (ft_descent_step,
+ * ft_skip_reanchor, ft_ineq_descend, __popcountdi2), so it is the attempt
+ * being re-entered, not one stuck loop.  ★ VmRSS is FLAT (21388 kB over the
+ * whole spin), so unlike the older rekey livelocks this one does NOT leak and
+ * a plain timeout bounds it -- but a libtap failure still absorbs neither a
+ * hang nor an abort, which is why this is opt-in rather than a live leg.
+ *
+ * The last two legs are the SAME shapes the publish pin exercises, with rank
+ * stats ON: rank stats coerce COARSE, and there the shapes that merely lose
+ * keys with rank OFF hang instead.  That is what makes the count half of any
+ * publish-fold fix untestable today.
+ *
+ * ☞ Registered unconditionally, never #ifdef'd: a test that vanishes reads as
+ * coverage.  Remove the gate when the hangs are fixed.
+ */
+static int test_rekey_known_nonterminating(void)
+{
+	static const char *h1[] = { "zhab", "zhabbb", NULL };
+	static const char *h2[] = { "abaab", "abaabbb", NULL };
+	static const char *r1[] = { "zhello", "zq", "zwa", "zwb", NULL };
+	static const char *r2[] = { "zhab", "zhac", "zq", "zwa", "zwb", NULL };
+
+	if (!cds_ft_merge_enabled()) {
+		diag("test_rekey_known_nonterminating: skipped, merge compiled "
+			"out (-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
+	if (!getenv("FT_UNIT_KNOWN_BAD")) {
+		diag("test_rekey_known_nonterminating: skipped -- these rekeys "
+			"NEVER RETURN (retry loop in ft_rekey_graft_simple_attempt, "
+			"RSS flat); set FT_UNIT_KNOWN_BAD=1 to run them");
+		return 0;
+	}
+	if (rekey_keeps_keys("hang/dst-below-run", h1, "zg", "zh"))
+		return -1;
+	if (rekey_keeps_keys("hang/dst-below-run-deep", h2, "aab", "ab"))
+		return -1;
+	if (rekey_rankstats_keeps_keys("hang/rankstats-direct", r1, "zwe", "zh"))
+		return -1;
+	return rekey_rankstats_keeps_keys("hang/rankstats-two-key", r2, "zwe",
+			"zha");
+}
+
+/*
+ * ☠☠☠☠ OPT-IN REPRODUCER (FT_UNIT_KNOWN_BAD=1): after the publish-lost rekey
+ * destroys a key, an EXCLUSIVE trie SEGFAULTS on the next drain.
+ *
+ *      insert "zq", "zwabcd";  cds_ft_make_exclusive(ft);
+ *      cds_ft_rekey_merge(ft, "zwe", 3, "zwabc", 5);   -> OK, key destroyed
+ *      cds_ft_lookup_first + cds_ft_remove_all         -> SEGV
+ *
+ * ★ cds_ft_make_exclusive is the DISCRIMINATOR, not FEATURE_FT_INSERT_IN_PLACE:
+ * measured on the plain default build with and without exclusivity (crashes
+ * only with) and on -DFEATURE_FT_INSERT_IN_PLACE (identical), so this is
+ * memory-unsafety reachable from a documented public entry point on the
+ * shipping build, not an opt-in-feature artifact.
+ *
+ * ☞ The publish pin above stops at the first bad answer and never drains, so
+ * the suite never reaches this: a pin that stops at the wrong ANSWER does not
+ * exercise what the corruption DOES NEXT.
+ */
+static int test_rekey_exclusive_drain_after_loss(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	struct cds_ft_iter *iter;
+	enum cds_ft_status s;
+	int ret = -1;
+
+	if (!cds_ft_merge_enabled()) {
+		diag("test_rekey_exclusive_drain_after_loss: skipped, merge "
+			"compiled out (-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
+	if (!getenv("FT_UNIT_KNOWN_BAD")) {
+		diag("test_rekey_exclusive_drain_after_loss: skipped -- SEGFAULTS "
+			"on the drain after the move destroys a key; set "
+			"FT_UNIT_KNOWN_BAD=1 to run it");
+		return 0;
+	}
+	ft = create_varlen_ft(&group);
+	cds_ft_make_exclusive(ft);
+	rcu_read_lock();
+	cds_ft_insert(ft, (const uint8_t *) "zq", 2, &node_alloc(1)->node);
+	cds_ft_insert(ft, (const uint8_t *) "zwabcd", 6, &node_alloc(2)->node);
+	s = cds_ft_rekey_merge(ft, (const uint8_t *) "zwe", 3,
+			(const uint8_t *) "zwabc", 5);
+	if (s == CDS_FT_STATUS_OK && !ft_test_has_key(ft, "zwed")) {
+		fprintf(stderr, "exclusive-drain: rekey zwe<-zwabc reported OK "
+			"but lost the key (%lu of 2 left) -- the drain below is "
+			"what crashes\n", cds_ft_count_keys(ft));
+	}
+	if (cds_ft_iter_create(ft, &iter) == CDS_FT_STATUS_OK) {
+		struct cds_ft_node *head, *tmp;
+
+		while (cds_ft_lookup_first(ft, iter) == CDS_FT_STATUS_OK) {
+			if (cds_ft_remove_all(ft, iter, &head) !=
+					CDS_FT_STATUS_OK)
+				break;
+			cds_ft_for_each_duplicate_safe_rcu(head, tmp)
+				node_free_rcu(to_test_node(head));
+		}
+		cds_ft_iter_destroy(iter);
+	}
+	ret = (s == CDS_FT_STATUS_OK && ft_test_has_key(ft, "zwed")) ? 0 : -1;
+	rcu_read_unlock();
+	drain_trie(ft);
+	rcu_barrier();
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return ret;
 }
 
 static int test_rekey_fixed_len_atomic_or_refused(void)
@@ -34662,6 +34815,8 @@ int main(int argc, char **argv)
 	RUN_TEST(test_rekey_skip_slot_bp_atomic_or_refused);
 	RUN_TEST(test_rekey_cut_run_dst_split_keeps_keys);
 	RUN_TEST(test_rekey_graft_publish_survives_detach);
+	RUN_TEST(test_rekey_known_nonterminating);
+	RUN_TEST(test_rekey_exclusive_drain_after_loss);
 	RUN_TEST(test_rekey_fixed_len_atomic_or_refused);
 	RUN_TEST(test_rekey_varlen_ordered_splice);
 	RUN_TEST(test_rekey_abutting_dst_keeps_list_order);
