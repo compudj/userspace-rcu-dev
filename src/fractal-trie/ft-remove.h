@@ -822,6 +822,27 @@ void ft_chain_compress_register_retire(struct ft_flip_txn *txn,
  * what confined ft_detach_node's fold to the SIMPLE shape (BP above min_child)
  * -- which is what the rekey's `nr_child < 3` gate restated.
  * @reclaim is REQUIRED when @record_only.
+ *
+ * @pending_child (FOLD, pending-publish): non-NULL ONLY on the record_only fold
+ * when the boundary slot @surviving_byte names is the caller txn's OWN pending
+ * forward publish target (@pending_pub_slot, armed by ft_glue_set_publish
+ * before this fold runs).  It is the FRESH, UNPUBLISHED cluster top that same
+ * commit installs there, and it -- not the committed occupant -- is the child
+ * the merged node must be built around: fusing around the committed value
+ * builds new_cn on a node the same commit retires and lets the commit publish
+ * the cluster into a slot of the boundary this collapse replaces, stranding
+ * the whole moved subtree (the shape the sibling two-child-BP pin measures).
+ * The COMMITTED value stays in @surviving_child: the plan re-validation and
+ * the lock-set are about what the trie holds NOW, and the committed occupant's
+ * retire belongs to the GLUE (its free list), never to this collapse -- which
+ * is also what keeps the two from colliding on one state word (the measured
+ * MW-PSO-vs-SW-tombstone chain conflict).  The collapse then reports the fold
+ * (@pending_pub_folded / @pending_pub_node) so the glue commit skips its
+ * forward publish and re-bases its count delta onto the merged node.
+ * A COMPRESSED @pending_child is refused by the CALLER up front (see the
+ * shape-D gate): absorbing a fresh unpublished compressed top would retire a
+ * node that was never published and re-aim its cluster's deferred edges -- an
+ * ownership question this primitive deliberately does not take on.
  */
 static
 int ft_chain_compress_fused(struct cds_ft *ft,
@@ -844,6 +865,7 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		unsigned int count_reserve,
 		struct ft_flip_txn *shared_txn,
 		bool record_only,
+		struct cds_ft_inode_flag *pending_child,
 		struct ft_chain_compress_reclaim *reclaim)
 {
 	struct cds_ft_compressed_node *parent_cn, *child_cn;
@@ -871,8 +893,21 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 	 * below must read).
 	 */
 	struct ft_held_anchor iter_held, pcn_held, ccn_held;
+	/*
+	 * The child the merged node is BUILT around: the pending cluster top
+	 * under the fold's substitution (see @pending_child at the header),
+	 * else the committed survivor.  Every plan-facing read (the lock-set,
+	 * the re-validation) keeps @surviving_child.
+	 */
+	struct cds_ft_inode_flag *build_child =
+		pending_child ? pending_child : surviving_child;
 
 	assert(surviving_child);
+	/* The substitution exists only on the fold; the caller gates both. */
+	assert(!pending_child || record_only);
+	/* A compressed pending top is refused by the caller (see the header). */
+	assert(!pending_child || (!ft_node_compressed(pending_child) &&
+			!ft_node_skip_compressed(pending_child)));
 	/*
 	 * Pre-reserve the commit flip-txn BEFORE any pre-flip side-effect.  The
 	 * surviving child's (parent, parent-slot-offset) pair is RECORDED into
@@ -970,8 +1005,15 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		parent_cn_meta_l = parent_cn
 			? cds_ft_item_to_metadata((struct cds_ft_inode *) parent_cn)
 			: NULL;
-		child_cn = ft_node_compressed(surviving_child)
-			? ft_compressed_node_ptr(surviving_child) : NULL;
+		/*
+		 * Derived from the BUILD child: absorption is about the run the
+		 * merged node will actually hold.  Under the substitution the
+		 * build child is never compressed (caller-refused), so no
+		 * below-pivot member is taken -- the committed occupant's fate
+		 * (retire) belongs to the glue, which holds its own lock on it.
+		 */
+		child_cn = ft_node_compressed(build_child)
+			? ft_compressed_node_ptr(build_child) : NULL;
 		if (child_cn)
 			child_cn_meta_l = cds_ft_item_to_metadata(
 				(struct cds_ft_inode *) child_cn);
@@ -1101,8 +1143,9 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 			ft_chain_compress_register_retire(txn, &pcn_held,
 				parent_cn_meta);
 		}
-		child_cn = ft_node_compressed(surviving_child)
-			? ft_compressed_node_ptr(surviving_child)
+		/* BUILD child, as in the DLM arm above. */
+		child_cn = ft_node_compressed(build_child)
+			? ft_compressed_node_ptr(build_child)
 			: NULL;
 		if (child_cn) {
 			/* The §7.1 below-pivot member: one hop past the boundary. */
@@ -1182,7 +1225,7 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		}
 		new_cn->child = child_child;
 	} else {
-		new_cn->child = surviving_child;
+		new_cn->child = build_child;
 	}
 	ft_meta_nr_child_set(new_cn_meta, 1);
 	/*
@@ -1191,6 +1234,14 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 	 * top node's count minus the disappearing key.  @count_delta 0 (a
 	 * count-neutral canonicalize, or a leaf-detach whose -1 the caller still
 	 * pre-decrements) copies it verbatim, as before.  No-op when !rank_stats.
+	 *
+	 * ONE OWNER EACH under the @pending_child fold: this store owns ONLY the
+	 * DETACH's side (the boundary's committed count + @count_delta, i.e.
+	 * minus the moved-out subtree), and the GLUE's count arm owns the
+	 * ATTACH's side -- it adds g->count_delta to @pending_pub_node (this
+	 * merged node) at commit-record time and walks the shared stable parent
+	 * (ft_glue_txn_commit_edges' folded-publish arm).  Baking the attach's
+	 * delta here too would double-count it.
 	 */
 	ft_nr_keys_store(ft,new_cn_meta,
 		ft_nr_keys_get(parent_cn_meta
@@ -1301,8 +1352,26 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		 * the pre-reserved @txn (ft_ord_cell_flip_into), so it is
 		 * allocation-free past this point and cannot fail.
 		 */
-		ft_record_child_back_edge(ft, txn, new_cn->child,
-			new_cn_flag, &new_cn->child);
+		if (pending_child) {
+			/*
+			 * FOLD substitution: the child is the FRESH, UNPUBLISHED
+			 * cluster top -- build-invisible until the caller's one
+			 * commit -- so its back edge is a PLAIN STORE, exactly
+			 * the store ft_glue_defer_edge's fresh-child fast path
+			 * made when it aimed it at the boundary this collapse
+			 * replaces (that fast path stores and does NOT queue, so
+			 * nothing re-applies the old parent over this).  A
+			 * RECORDED re-parent here would plant an MW parent+PSO
+			 * pair on a node the glue's free-list retire also
+			 * settles -- the measured record_chain collision that
+			 * poisons (release) or asserts (rcu-debug).
+			 */
+			ft_set_parent(ft, new_cn->child, new_cn_flag,
+				&new_cn->child);
+		} else {
+			ft_record_child_back_edge(ft, txn, new_cn->child,
+				new_cn_flag, &new_cn->child);
+		}
 		new_cn_pub = ft_publish_compressed(ft, new_cn, new_cn_flag);
 		/* VALIDATE (§4.B): lock (or guard-fallback) the LIVE
 		 * (great-)grandparent publish_parent -- value-swap target (§10.5).
@@ -1423,6 +1492,22 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		 * every bail above frees it and returns.)
 		 */
 		reclaim->new_cn = new_cn;
+		/*
+		 * REPORT THE FOLD, at the tail where nothing can bail any more:
+		 * the caller's pending forward publish is now live in the merged
+		 * node, so the glue commit must SKIP its own publish (it would
+		 * install into the boundary this collapse just recorded retired)
+		 * and must re-base its order-statistics delta onto the merged
+		 * node (@pending_pub_node; the count arm decodes it
+		 * compressed-aware).  Flags live on the caller's txn and die
+		 * with it: every abort path destroys the txn before (or with)
+		 * reclaiming @new_cn, and each retry creates a fresh txn with
+		 * these fields cleared.
+		 */
+		if (pending_child) {
+			txn->pending_pub_folded = true;
+			txn->pending_pub_node = new_cn_flag;
+		}
 		return 0;
 	}
 	free_cds_ft_node(ft, ft_node_ptr(iter_node_flag));
@@ -1463,7 +1548,7 @@ void ft_canonicalize_chain_compress(struct cds_ft *ft,
 		1 /* already-committed 1-child boundary */, NULL, NULL,
 		NULL, 0, NULL, NULL, 0 /* no orphan chain */,
 		NULL, 0 /* count-neutral canonicalize */, 0,
-				NULL, false, NULL);
+				NULL, false, NULL /* no pending publish */, NULL);
 }
 #endif
 
@@ -2818,6 +2903,8 @@ int ft_detach_node(struct cds_ft *ft,
 			    !bmeta->external_nodes &&
 			    ft_parent_node(bmeta->parent_word) != NULL) {
 				struct cds_ft_inode_flag *s_child = NULL;
+				struct cds_ft_inode_flag **s_slot = NULL;
+				struct cds_ft_inode_flag *fold_pending = NULL;
 				uint8_t s_byte = 0;
 				unsigned int b;
 
@@ -2827,11 +2914,56 @@ int ft_detach_node(struct cds_ft *ft,
 					if ((uint8_t) b == n)
 						continue;
 					c = ft_node_get_nth(ft, iter_node_flag,
-						NULL, (uint8_t) b, FT_PF_NONE);
+						&s_slot, (uint8_t) b, FT_PF_NONE);
 					if (c) {
 						s_child = c;
 						s_byte = (uint8_t) b;
 						break;
+					}
+				}
+				/*
+				 * ☠ THE SURVIVOR SLOT MAY BE THIS TXN'S OWN
+				 * PENDING FORWARD PUBLISH (@pending_pub_slot,
+				 * armed by ft_glue_set_publish before the fold
+				 * ran): a same-trie SIBLING move's shared parent
+				 * holds exactly the detached child and the
+				 * destination.  @s_child is then the COMMITTED
+				 * occupant -- a node the SAME commit retires and
+				 * replaces with the merged cluster -- and fusing
+				 * around it strands the whole moved subtree
+				 * (measured: the sibling two-child-BP pin, all
+				 * four faces).  Build around the PENDING value
+				 * instead (@pending_child at the collapse), the
+				 * exact substitution ft_node_recompact's copy
+				 * loops make by identity on this same slot.
+				 */
+				if (s_child && record_only && shared_txn &&
+						shared_txn->pending_pub_slot &&
+						s_slot == shared_txn->pending_pub_slot) {
+					fold_pending = shared_txn->pending_pub_val;
+					/*
+					 * A COMPRESSED cluster top cannot be
+					 * fused: absorbing it would retire a
+					 * fresh node that was never published
+					 * and re-aim its cluster's deferred
+					 * edges (an ownership question the
+					 * collapse does not take on), while
+					 * falling back to the recompaction
+					 * would publish a 1-child internal that
+					 * skip mode's canonical form -- enforced
+					 * at every writer-scope exit -- does not
+					 * allow to persist.  So the SHAPE is
+					 * uncovered: refuse the whole move,
+					 * before any side-effect, with the
+					 * rekey's own carve-out code
+					 * (FT_REKEY_UNCOVERED == -EDOM; only
+					 * the rekey fold can reach this, no
+					 * other caller arms @pending_pub_slot).
+					 */
+					if (ft_node_compressed(fold_pending) ||
+							ft_node_skip_compressed(fold_pending)) {
+						ret = -EDOM;
+						goto end;
 					}
 				}
 				if (s_child) {
@@ -2867,6 +2999,7 @@ int ft_detach_node(struct cds_ft *ft,
 				 * caller to reclaim on the right side of its commit.
 				 */
 				record_only ? shared_txn : NULL, record_only,
+				fold_pending,
 				record_only && recompact_out ?
 					&recompact_out->collapse : NULL);
 
@@ -3641,7 +3774,24 @@ int ft_detach_node(struct cds_ft *ft,
 		 * no external_nodes attached, fold it via the chain-compress
 		 * 4-case merge (canonical form under SKIP_COMPRESSED).
 		 */
-		if (ft_meta_nr_child(iter_meta) == 1 &&
+		/*
+		 * ☠ NEVER ON THE FOLD (@record_only): this is a STANDALONE
+		 * SECOND FLIP, and under the fold the caller's one-decide txn
+		 * has NOT COMMITTED yet -- canonicalizing here publishes over a
+		 * plan the caller still holds (measured: ft_skip_reanchor's
+		 * assert(0), the up-walk landing on a mid-plan parent chain).
+		 * Reachable on the fold only through the out-of-bound residue
+		 * (merged_len > FT_SKIP_LEN_MAX falls back to the recompaction
+		 * above; the pending-publish sibling shape is either FUSED with
+		 * the @pending_child substitution or refused whole): that rare
+		 * geometry -- a near-max compressed parent run over a 2-child
+		 * boundary -- then keeps its 1-child internal past the op, which
+		 * skip mode's verifier flags at the writer-scope exit.  KNOWN
+		 * INCOMPLETE: closing it needs the caller to own a post-commit
+		 * canonicalize, which is a rekey-side change, not this frame's.
+		 */
+		if (!record_only &&
+		    ft_meta_nr_child(iter_meta) == 1 &&
 		    !iter_meta->external_nodes &&
 		    ft_parent_node(iter_meta->parent_word) != NULL) {
 			/*
@@ -4799,7 +4949,8 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 					fuse_cell, NULL,
 					NULL, 0, NULL, NULL, 0 /* no orphan chain */, node,
 					-1, ft->rank_stats ? key_len + 1 : 0,
-					NULL, false, NULL);
+					NULL, false,
+					NULL /* no pending publish */, NULL);
 
 				if (cret == 0) {
 					/*
@@ -5598,7 +5749,8 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 					ft->ordered_list ? dead_cell : NULL,
 					NULL, NULL, 0, NULL, NULL, 0 /* no orphan chain */, NULL,
 					-1, ft->rank_stats ? key_len + 1 : 0,
-					NULL, false, NULL);
+					NULL, false,
+					NULL /* no pending publish */, NULL);
 
 				if (cret == 0) {
 					ft_chain_mark_removed_flip(ft, chain_head);

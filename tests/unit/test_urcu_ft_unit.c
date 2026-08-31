@@ -3227,34 +3227,6 @@ out:
 		ok((fn)() == 0 && leak_check() == 0, "%s", #fn);	\
 	} while (0)
 
-/*
- * A test that PINS AN OPEN DEFECT: it asserts the CORRECT behaviour, fails
- * today, and is reported TODO.  libtap prints the failure and its diag but does
- * NOT count it (tap.c decrements @failures inside a todo block), so the shape
- * stays exercised on every run and in every build without wedging the gate on a
- * bug nobody has fixed yet.
- *
- * ☞ WHEN IT STARTS PASSING, DELETE THE TODO.  libtap still prints "# TODO" on a
- * PASSING todo test, so a green line here means nothing until the marker is
- * gone -- grep the output for "# TODO" rather than trusting "^ok".
- */
-#define RUN_TEST_TODO(fn, why)						\
-	do {								\
-		if (filter && strcmp(filter, #fn) != 0) {		\
-			skip(1, "filtered out: " #fn);			\
-			break;						\
-		}							\
-		if (exclude && strstr(exclude, #fn)) {			\
-			skip(1, "excluded: " #fn);			\
-			break;						\
-		}							\
-		leak_reset();						\
-		rcu_quiescent_state();					\
-		todo_start("%s", (why));				\
-		ok((fn)() == 0 && leak_check() == 0, "%s", #fn);	\
-		todo_end();						\
-	} while (0)
-
 static int drain_trie(struct cds_ft *ft);
 
 /* ================================================================== */
@@ -13301,61 +13273,63 @@ static int test_rekey_rankstats_sibling(void)
 }
 
 /*
- * ☠☠ OPEN DEFECT, PINNED HERE: a SIBLING move whose shared parent has exactly
- * TWO children SILENTLY DESTROYS THE MOVED KEYS.
+ * A SIBLING move whose shared parent has exactly TWO children.
  *
- * Over {q,wam,wan,wbx,wby} the parent "w" has exactly the two children the move
- * touches, 'a' and 'b'.  cds_ft_rekey_merge("wa" -> "wb") then returns OK and
- * "wbm"/"wbn" are NOT THERE -- the moved subtree is gone, and so is the source.
- * cds_ft_verify fails with cell-parent errors below the junction.
+ * Over {q,wam,wan,wbx,wby} the parent "w" holds exactly the two children the
+ * move touches, so the src detach drops it from two children to one and the
+ * boundary is canonicalized by the shape-D FUSED COLLAPSE -- which merges the
+ * boundary into a compressed node rather than recompacting it.  The dst attach
+ * has meanwhile armed its forward publish on the surviving 'b' slot, so both
+ * halves of the one decide want that slot, and the collapse is the half that
+ * has to honour the other's pending publish: it builds around the cluster and
+ * reports the fold, so the attach's own publish is skipped.
  *
- * ft_detach_node routes a boundary that drops to one child through the shape-D
- * FUSED COLLAPSE (ft_chain_compress_fused), which bypasses ft_node_recompact
- * altogether -- so the op's pending forward publish is never folded into the
- * surviving copy, and nothing sets @pending_pub_folded.  The attach then
- * publishes its merged cluster into a slot of the node this same commit
- * replaces, and the subtree is stranded.  Both the publish skip and the
- * order-statistics re-base in ft_glue_txn_commit_edges are keyed on that fold,
- * so neither fires.
+ * REGRESSION: it did neither.  Its survivor scan read the slot's COMMITTED
+ * value, so the merged node pointed at the OLD child, and nothing set
+ * @pending_pub_folded, so the attach also published into the slot of the node
+ * the same commit retires.  Either half strands the subtree alone: the move
+ * returned OK with "wbm"/"wbn" simply GONE.  It also collided with the attach's
+ * retire on the old child's state word, which -- depending only on lock mode
+ * and build -- committed the strand (order statistics coerce COARSE), poisoned
+ * the descriptor into an unbounded retry, tripped the engine's kind assert, or
+ * surfaced as an ASAN leak.  One defect, four faces.
  *
- * ★ IT IS ONE CHILD AWAY FROM A COVERED SHAPE.  test_rekey_rankstats_sibling
- * runs the same move with the parent at arity THREE (its "wcz" key), which
- * takes the recompaction path and is correct.  Removing that one key is the
- * whole difference, which is exactly why this deserves its own pin rather than
- * a line in a comment.
+ * ★ ONE CHILD OF THE ADJACENT SHAPE.  test_rekey_rankstats_sibling runs the
+ * same move with the parent at arity THREE, which takes the recompaction path
+ * and always folded correctly.  That is why this arity is worth its own test.
  *
- * ☠☠ THE DEFECT WEARS FOUR FACES, AND ONLY ONE OF THEM IS TESTABLE.  Measured:
- *
- *   rank stats ON, plain build   returns OK, keys silently gone   <- run here
- *   rank stats OFF               NEVER RETURNS (both list modes)
- *   --enable-rcu-debug           abort: urcu_txn_record_chain
- *                                "r->kind == kind" -- the collapse also
- *                                collides SW/MW on one slot
- *   ASAN + detect_leaks          abort: the stranded subtree's app nodes are
- *                                unreachable, so the loss surfaces as a leak
- *
- * A TODO marker suppresses a FAILURE COUNT; it cannot suppress an abort() or
- * un-hang a hang -- either would stop the suite rather than fail one test.  So
- * this runs on the plain build only, with order statistics ON, and the other
- * three are named here and SKIPPED below rather than pretended away.  Whoever
- * fixes this should delete the skip and the TODO together and add the rank-off
- * arm.
- *
- * PRE-EXISTING: measured byte-identical before and after the count fixes that
- * surround it, so it is not fallout from any of them.
+ * All four mode combinations run: order statistics decide whether the trie is
+ * COARSE or LOCK_FINE, which is what selected between the silent-loss face and
+ * the livelock face, and the ordered list adds its cell edges to the same
+ * commit.  cds_ft_verify adjudicates the aggregate, so a commit that publishes
+ * the right shape with a wrong count still fails here.
  */
-static int rekey_sibling_two_child_bp_run(bool ordered_list)
+static int rekey_sibling_two_child_bp_run(bool ordered_list, bool rank_stats)
 {
 	static const char *const keys[] = { "q", "wam", "wan", "wbx", "wby",
 					    NULL };
 	static const char *const want[] = { "q", "wbm", "wbn", "wbx", "wby",
 					    NULL };
 	static const char *const gone[] = { "wam", "wan", NULL };
-	struct cds_ft_group *group = NULL;
-	struct cds_ft *ft = create_varlen_rankstats_list_ft(ordered_list, &group);
-	const char *lm = ordered_list ? "list-on" : "list-off";
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	char lm[32];
 	int ret = -1, i;
 	enum cds_ft_status s;
+
+	snprintf(lm, sizeof lm, "%s/%s", ordered_list ? "list-on" : "list-off",
+		rank_stats ? "rank-on" : "rank-off");
+	if (cds_ft_group_attr_create(&attr) < 0)
+		abort();
+	if (cds_ft_group_attr_set_ordered_list(attr, ordered_list) < 0 ||
+	    cds_ft_group_attr_set_rank_stats(attr, rank_stats) < 0)
+		abort();
+	if (cds_ft_group_create(attr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &ft) < 0)
+		abort();
 
 	rcu_read_lock();
 	for (i = 0; keys[i]; i++) {
@@ -13413,9 +13387,11 @@ static int test_rekey_sibling_two_child_bp_keeps_keys(void)
 			"merge compiled out (-DNO_FEATURE_FT_MERGE)");
 		return 0;
 	}
-	if (rekey_sibling_two_child_bp_run(false) < 0)
+	if (rekey_sibling_two_child_bp_run(false, true) < 0 ||
+	    rekey_sibling_two_child_bp_run(true, true) < 0 ||
+	    rekey_sibling_two_child_bp_run(false, false) < 0)
 		return -1;
-	return rekey_sibling_two_child_bp_run(true);
+	return rekey_sibling_two_child_bp_run(true, false);
 }
 
 static int test_rekey_root_junction_folded(void)
@@ -13435,15 +13411,46 @@ static int test_rekey_root_junction_folded(void)
 	ft = create_varlen_ft(&group);
 	rcu_read_lock();
 
-	/* FOLDED: src BP == the graft's publish parent == the root. */
-	cds_ft_insert(ft, (const uint8_t *) "hello", 5, &node_alloc(1)->node);
-	s = ft_rekey(ft, "we", "he");
+	/*
+	 * FOLDED, PLAIN: src BP == the graft's publish parent == the root, with
+	 * no compressed run anywhere on the move's path -- so this arm carries
+	 * the gate in EVERY build, including -DNO_FEATURE_FT_COMPRESS.
+	 */
+	cds_ft_insert(ft, (const uint8_t *) "am", 2, &node_alloc(1)->node);
+	cds_ft_insert(ft, (const uint8_t *) "an", 2, &node_alloc(2)->node);
+	cds_ft_insert(ft, (const uint8_t *) "zp", 2, &node_alloc(3)->node);
+	s = ft_rekey(ft, "b", "a");
 	if (s != CDS_FT_STATUS_OK ||
 	    cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK ||
-	    !ft_test_has_key(ft, "wello") || ft_test_has_key(ft, "hello")) {
-		fprintf(stderr, "root_junction: folded move failed (%s)\n",
+	    !ft_test_has_key(ft, "bm") || !ft_test_has_key(ft, "bn") ||
+	    !ft_test_has_key(ft, "zp") ||
+	    ft_test_has_key(ft, "am") || ft_test_has_key(ft, "an")) {
+		fprintf(stderr, "root_junction: plain folded move failed (%s)\n",
 			cds_ft_status_to_string(s));
 		goto out;
+	}
+
+	/*
+	 * FOLDED, CUT RUN: the source key ends INSIDE a compressed run, which is
+	 * the shape test_merge_rekey_same_trie's key-shorter step takes.  ASKED
+	 * OF THE LIBRARY, never a test-side #ifdef: without compression there is
+	 * no run to end inside, so the shape does not exist to test.
+	 */
+	if (_cds_ft_debug_compress_enabled()) {
+		cds_ft_insert(ft, (const uint8_t *) "hello", 5,
+			&node_alloc(4)->node);
+		s = ft_rekey(ft, "we", "he");
+		if (s != CDS_FT_STATUS_OK ||
+		    cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK ||
+		    !ft_test_has_key(ft, "wello") ||
+		    ft_test_has_key(ft, "hello")) {
+			fprintf(stderr, "root_junction: cut-run folded move "
+				"failed (%s)\n", cds_ft_status_to_string(s));
+			goto out;
+		}
+	} else {
+		diag("test_rekey_root_junction_folded: cut-run arm skipped, "
+			"compression compiled out (-DNO_FEATURE_FT_COMPRESS)");
 	}
 
 	/* UNARMED: BP sits at depth 2, so the shape stays DECLINED. */
@@ -13474,7 +13481,7 @@ static int test_rekey_root_junction_folded(void)
 			goto out;
 		}
 	}
-	if (ft_test_has_key(ft, "qm") || !ft_test_has_key(ft, "wello")) {
+	if (ft_test_has_key(ft, "qm") || !ft_test_has_key(ft, "bm")) {
 		fprintf(stderr, "root_junction: post-refusal key set wrong\n");
 		goto out;
 	}
@@ -34429,22 +34436,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_rekey_rankstats_shared_ancestor);
 	RUN_TEST(test_rekey_root_junction_folded);
 	RUN_TEST(test_rekey_rankstats_sibling);
-	/*
-	 * Runs on the plain build only: on the debug and sanitizer legs this
-	 * pinned defect ABORTS the process, which a TODO cannot absorb.  See
-	 * the four-faces table at the test.
-	 */
-#if defined(CONFIG_RCU_DEBUG) || defined(DEBUG_RCU) || \
-		defined(__SANITIZE_ADDRESS__)
-	skip(1, "test_rekey_sibling_two_child_bp_keeps_keys: the pinned defect "
-		"aborts this build (kind conflict / leak), so it is run on the "
-		"plain build only");
-#else
-	RUN_TEST_TODO(test_rekey_sibling_two_child_bp_keeps_keys,
-		"open defect: a 2-child sibling BP takes the shape-D fused "
-		"collapse, which bypasses the pending-publish fold and strands "
-		"the moved subtree");
-#endif
+	RUN_TEST(test_rekey_sibling_two_child_bp_keeps_keys);
 	RUN_TEST(test_rekey_root_junction);
 	RUN_TEST(test_graft_inplace_exclusive);
 	RUN_TEST(test_nonidentity_bulk_ops);
