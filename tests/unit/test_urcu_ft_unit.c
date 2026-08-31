@@ -73,9 +73,9 @@
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (360 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (361 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (309 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (310 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -3225,6 +3225,34 @@ out:
 		leak_reset();						\
 		rcu_quiescent_state();					\
 		ok((fn)() == 0 && leak_check() == 0, "%s", #fn);	\
+	} while (0)
+
+/*
+ * A test that PINS AN OPEN DEFECT: it asserts the CORRECT behaviour, fails
+ * today, and is reported TODO.  libtap prints the failure and its diag but does
+ * NOT count it (tap.c decrements @failures inside a todo block), so the shape
+ * stays exercised on every run and in every build without wedging the gate on a
+ * bug nobody has fixed yet.
+ *
+ * ☞ WHEN IT STARTS PASSING, DELETE THE TODO.  libtap still prints "# TODO" on a
+ * PASSING todo test, so a green line here means nothing until the marker is
+ * gone -- grep the output for "# TODO" rather than trusting "^ok".
+ */
+#define RUN_TEST_TODO(fn, why)						\
+	do {								\
+		if (filter && strcmp(filter, #fn) != 0) {		\
+			skip(1, "filtered out: " #fn);			\
+			break;						\
+		}							\
+		if (exclude && strstr(exclude, #fn)) {			\
+			skip(1, "excluded: " #fn);			\
+			break;						\
+		}							\
+		leak_reset();						\
+		rcu_quiescent_state();					\
+		todo_start("%s", (why));				\
+		ok((fn)() == 0 && leak_check() == 0, "%s", #fn);	\
+		todo_end();						\
 	} while (0)
 
 static int drain_trie(struct cds_ft *ft);
@@ -13270,6 +13298,124 @@ static int test_rekey_rankstats_sibling(void)
 	if (rekey_rankstats_sibling_run(false, false, true) < 0)
 		return -1;
 	return rekey_rankstats_sibling_run(true, false, true);
+}
+
+/*
+ * ☠☠ OPEN DEFECT, PINNED HERE: a SIBLING move whose shared parent has exactly
+ * TWO children SILENTLY DESTROYS THE MOVED KEYS.
+ *
+ * Over {q,wam,wan,wbx,wby} the parent "w" has exactly the two children the move
+ * touches, 'a' and 'b'.  cds_ft_rekey_merge("wa" -> "wb") then returns OK and
+ * "wbm"/"wbn" are NOT THERE -- the moved subtree is gone, and so is the source.
+ * cds_ft_verify fails with cell-parent errors below the junction.
+ *
+ * ft_detach_node routes a boundary that drops to one child through the shape-D
+ * FUSED COLLAPSE (ft_chain_compress_fused), which bypasses ft_node_recompact
+ * altogether -- so the op's pending forward publish is never folded into the
+ * surviving copy, and nothing sets @pending_pub_folded.  The attach then
+ * publishes its merged cluster into a slot of the node this same commit
+ * replaces, and the subtree is stranded.  Both the publish skip and the
+ * order-statistics re-base in ft_glue_txn_commit_edges are keyed on that fold,
+ * so neither fires.
+ *
+ * ★ IT IS ONE CHILD AWAY FROM A COVERED SHAPE.  test_rekey_rankstats_sibling
+ * runs the same move with the parent at arity THREE (its "wcz" key), which
+ * takes the recompaction path and is correct.  Removing that one key is the
+ * whole difference, which is exactly why this deserves its own pin rather than
+ * a line in a comment.
+ *
+ * ☠☠ THE DEFECT WEARS FOUR FACES, AND ONLY ONE OF THEM IS TESTABLE.  Measured:
+ *
+ *   rank stats ON, plain build   returns OK, keys silently gone   <- run here
+ *   rank stats OFF               NEVER RETURNS (both list modes)
+ *   --enable-rcu-debug           abort: urcu_txn_record_chain
+ *                                "r->kind == kind" -- the collapse also
+ *                                collides SW/MW on one slot
+ *   ASAN + detect_leaks          abort: the stranded subtree's app nodes are
+ *                                unreachable, so the loss surfaces as a leak
+ *
+ * A TODO marker suppresses a FAILURE COUNT; it cannot suppress an abort() or
+ * un-hang a hang -- either would stop the suite rather than fail one test.  So
+ * this runs on the plain build only, with order statistics ON, and the other
+ * three are named here and SKIPPED below rather than pretended away.  Whoever
+ * fixes this should delete the skip and the TODO together and add the rank-off
+ * arm.
+ *
+ * PRE-EXISTING: measured byte-identical before and after the count fixes that
+ * surround it, so it is not fallout from any of them.
+ */
+static int rekey_sibling_two_child_bp_run(bool ordered_list)
+{
+	static const char *const keys[] = { "q", "wam", "wan", "wbx", "wby",
+					    NULL };
+	static const char *const want[] = { "q", "wbm", "wbn", "wbx", "wby",
+					    NULL };
+	static const char *const gone[] = { "wam", "wan", NULL };
+	struct cds_ft_group *group = NULL;
+	struct cds_ft *ft = create_varlen_rankstats_list_ft(ordered_list, &group);
+	const char *lm = ordered_list ? "list-on" : "list-off";
+	int ret = -1, i;
+	enum cds_ft_status s;
+
+	rcu_read_lock();
+	for (i = 0; keys[i]; i++) {
+		if (cds_ft_insert(ft, (const uint8_t *) keys[i],
+				strlen(keys[i]),
+				&node_alloc((uint64_t) i + 1)->node)
+				!= CDS_FT_STATUS_OK) {
+			fprintf(stderr, "sib2(%s): insert %s failed\n", lm,
+				keys[i]);
+			goto out;
+		}
+	}
+	/* "wa" -> "wb": BP "w" holds exactly these two children. */
+	s = ft_rekey(ft, "wb", "wa");
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "sib2(%s): move failed (%s)\n", lm,
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+	for (i = 0; want[i]; i++) {
+		if (!ft_test_has_key(ft, want[i])) {
+			fprintf(stderr, "sib2(%s): KEY LOST: %s\n", lm,
+				want[i]);
+			goto out;
+		}
+	}
+	for (i = 0; gone[i]; i++) {
+		if (ft_test_has_key(ft, gone[i])) {
+			fprintf(stderr, "sib2(%s): stale key %s\n", lm,
+				gone[i]);
+			goto out;
+		}
+	}
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "sib2(%s): verify failed\n", lm);
+		goto out;
+	}
+	if (cds_ft_count_keys(ft) != 5) {
+		fprintf(stderr, "sib2(%s): count %lu != 5\n", lm,
+			cds_ft_count_keys(ft));
+		goto out;
+	}
+	ret = 0;
+out:
+	rcu_read_unlock();
+	if (drain_and_destroy(ft, group) < 0)
+		ret = -1;
+	return ret;
+}
+
+static int test_rekey_sibling_two_child_bp_keeps_keys(void)
+{
+	if (!cds_ft_merge_enabled()) {
+		diag("test_rekey_sibling_two_child_bp_keeps_keys: skipped, "
+			"merge compiled out (-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
+	if (rekey_sibling_two_child_bp_run(false) < 0)
+		return -1;
+	return rekey_sibling_two_child_bp_run(true);
 }
 
 static int test_rekey_root_junction_folded(void)
@@ -34283,6 +34429,22 @@ int main(int argc, char **argv)
 	RUN_TEST(test_rekey_rankstats_shared_ancestor);
 	RUN_TEST(test_rekey_root_junction_folded);
 	RUN_TEST(test_rekey_rankstats_sibling);
+	/*
+	 * Runs on the plain build only: on the debug and sanitizer legs this
+	 * pinned defect ABORTS the process, which a TODO cannot absorb.  See
+	 * the four-faces table at the test.
+	 */
+#if defined(CONFIG_RCU_DEBUG) || defined(DEBUG_RCU) || \
+		defined(__SANITIZE_ADDRESS__)
+	skip(1, "test_rekey_sibling_two_child_bp_keeps_keys: the pinned defect "
+		"aborts this build (kind conflict / leak), so it is run on the "
+		"plain build only");
+#else
+	RUN_TEST_TODO(test_rekey_sibling_two_child_bp_keeps_keys,
+		"open defect: a 2-child sibling BP takes the shape-D fused "
+		"collapse, which bypasses the pending-publish fold and strands "
+		"the moved subtree");
+#endif
 	RUN_TEST(test_rekey_root_junction);
 	RUN_TEST(test_graft_inplace_exclusive);
 	RUN_TEST(test_nonidentity_bulk_ops);
