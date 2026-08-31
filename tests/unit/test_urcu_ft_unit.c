@@ -73,9 +73,9 @@
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (359 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (360 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (308 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (309 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -13140,6 +13140,138 @@ static int test_rekey_rankstats_shared_ancestor(void)
  * commit message: the same unarmed source one level BELOW the root is fine, so
  * it is the root junction that is refused, not the shape of the detach.
  */
+/*
+ * ORDER STATISTICS + a SIBLING move: the count must land on the SURVIVOR.
+ *
+ * Source and destination under ONE parent.  The src detach then DEL-recompacts
+ * the very node the dst attach publishes into, and the publish RIDES that copy
+ * (ft_flip_txn @pending_pub_slot) -- so by the time the attach records its
+ * order-statistics delta, the node it names has already been superseded.
+ * Charging the walk from it put the delta on a node no reader reaches, while
+ * the surviving copy -- which the detach had already baked its own -cnt into --
+ * never received it.  Exactly ONE node came out short; ancestors were always
+ * right, because the retired copy's back-edge still names the same parent.
+ *
+ * ☠ NOTHING BUT cds_ft_verify AND THE RANK QUERIES CAN SEE THIS.  The move
+ * returns OK, the shape is right, every lookup is right and cds_ft_count_keys
+ * (a root read) is right -- so a test that checked keys and the total would
+ * sail past it.  verify recomputes every subtree count bottom-up and compares
+ * it against the stored aggregate, which is what adjudicates it.
+ *
+ * Both list modes, and both a DISJOINT move and one that COLLIDES on a key --
+ * the collide arm makes the two deltas differ, so the surviving copy cannot
+ * come out right by the deltas happening to cancel.
+ */
+static int rekey_rankstats_sibling_run(bool ordered_list, bool collide,
+		bool wide)
+{
+	static const char *const base[] = { "q", "wam", "wan", "wcz", NULL };
+	struct cds_ft_group *group = NULL;
+	struct cds_ft *ft = create_varlen_rankstats_list_ft(ordered_list, &group);
+	const char *lm = ordered_list ? "list-on" : "list-off";
+	const char *cm = collide ? "collide" : "disjoint";
+	/* "wbm" collides with the moved "wam"; "wbx" does not. */
+	const char *dst_first = collide ? "wbm" : "wbx";
+	unsigned long want = collide ? 5 : 6;
+	int ret = -1, i;
+	enum cds_ft_status s;
+	unsigned int c;
+
+	rcu_read_lock();
+	/*
+	 * WIDE arm: fatten BP past the popcount classes so the recompaction
+	 * runs its PIGEON copy loop instead.  The fold is implemented once per
+	 * loop, so the two arms are separate code and the narrow arm alone does
+	 * not pin this one.  The extra children are pure ballast -- they keep
+	 * BP's arity up and are checked only through the count.
+	 */
+	if (wide) {
+		for (c = 0x21; c < 0xc0; c++) {
+			char kb[4];
+
+			if (c == 'a' || c == 'b' || c == 'c')
+				continue;	/* src, dst, and the ballast key */
+			kb[0] = 'w';
+			kb[1] = (char) c;
+			kb[2] = 'z';
+			if (cds_ft_insert(ft, (const uint8_t *) kb, 3,
+					&node_alloc(1000 + c)->node)
+					!= CDS_FT_STATUS_OK)
+				goto ins_failed;
+			want++;
+		}
+	}
+	for (i = 0; base[i]; i++) {
+		if (cds_ft_insert(ft, (const uint8_t *) base[i],
+				strlen(base[i]),
+				&node_alloc((uint64_t) i + 1)->node)
+				!= CDS_FT_STATUS_OK)
+			goto ins_failed;
+	}
+	if (cds_ft_insert(ft, (const uint8_t *) dst_first, 3,
+			&node_alloc(90)->node) != CDS_FT_STATUS_OK ||
+	    cds_ft_insert(ft, (const uint8_t *) "wby", 3,
+			&node_alloc(91)->node) != CDS_FT_STATUS_OK)
+		goto ins_failed;
+	if (cds_ft_count_keys(ft) != want + (collide ? 1 : 0)) {
+		fprintf(stderr, "rekey_sib(%s/%s): pre-move count %lu != %lu\n",
+			lm, cm, cds_ft_count_keys(ft),
+			want + (collide ? 1 : 0));
+		goto out;
+	}
+	/* "wa" and "wb" are SIBLINGS: BP == the graft's publish parent. */
+	s = ft_rekey(ft, "wb", "wa");
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "rekey_sib(%s/%s): move failed (%s)\n", lm, cm,
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "rekey_sib(%s/%s): verify failed -- the "
+			"surviving parent's nr_keys missed the delta\n", lm, cm);
+		goto out;
+	}
+	if (cds_ft_count_keys(ft) != want) {
+		fprintf(stderr, "rekey_sib(%s/%s): count %lu != %lu\n", lm, cm,
+			cds_ft_count_keys(ft), want);
+		goto out;
+	}
+	if (!ft_test_has_key(ft, "wbm") || !ft_test_has_key(ft, "wbn") ||
+	    !ft_test_has_key(ft, "wby") || !ft_test_has_key(ft, "wcz") ||
+	    !ft_test_has_key(ft, "q") ||
+	    ft_test_has_key(ft, "wam") || ft_test_has_key(ft, "wan")) {
+		fprintf(stderr, "rekey_sib(%s/%s): key set wrong\n", lm, cm);
+		goto out;
+	}
+	ret = 0;
+	goto out;
+ins_failed:
+	fprintf(stderr, "rekey_sib(%s/%s): insert failed\n", lm, cm);
+out:
+	rcu_read_unlock();
+	if (drain_and_destroy(ft, group) < 0)
+		ret = -1;
+	return ret;
+}
+
+static int test_rekey_rankstats_sibling(void)
+{
+	if (!cds_ft_merge_enabled()) {
+		diag("test_rekey_rankstats_sibling: skipped, merge compiled "
+			"out (-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
+	if (rekey_rankstats_sibling_run(false, false, false) < 0 ||
+	    rekey_rankstats_sibling_run(false, true, false) < 0 ||
+	    rekey_rankstats_sibling_run(true, false, false) < 0 ||
+	    rekey_rankstats_sibling_run(true, true, false) < 0)
+		return -1;
+	/* ...and the PIGEON copy loop, which is a second implementation. */
+	if (rekey_rankstats_sibling_run(false, false, true) < 0)
+		return -1;
+	return rekey_rankstats_sibling_run(true, false, true);
+}
+
 static int test_rekey_root_junction_folded(void)
 {
 	if (!cds_ft_merge_enabled()) {
@@ -34150,6 +34282,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_merge_rekey_same_trie_listoff_collision);
 	RUN_TEST(test_rekey_rankstats_shared_ancestor);
 	RUN_TEST(test_rekey_root_junction_folded);
+	RUN_TEST(test_rekey_rankstats_sibling);
 	RUN_TEST(test_rekey_root_junction);
 	RUN_TEST(test_graft_inplace_exclusive);
 	RUN_TEST(test_nonidentity_bulk_ops);

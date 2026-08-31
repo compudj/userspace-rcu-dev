@@ -1757,6 +1757,16 @@ int ft_node_recompact(enum ft_recompact mode,
 						src_slot == retire_txn->pending_pub_slot) {
 					iter = retire_txn->pending_pub_val;
 					retire_txn->pending_pub_folded = true;
+					/*
+					 * NAME THE SURVIVOR.  The publish is now
+					 * live in THIS copy, so anything the op
+					 * still owes the published-into node --
+					 * the order-statistics delta above all --
+					 * owes it HERE, not to the copy this
+					 * commit retires.
+					 */
+					retire_txn->pending_pub_node =
+						new_node_flag;
 				}
 			} else if (caa_unlikely(ft_node_flip_proxy(iter))) {
 				/*
@@ -1896,6 +1906,16 @@ int ft_node_recompact(enum ft_recompact mode,
 						src_slot == retire_txn->pending_pub_slot) {
 					iter = retire_txn->pending_pub_val;
 					retire_txn->pending_pub_folded = true;
+					/*
+					 * NAME THE SURVIVOR.  The publish is now
+					 * live in THIS copy, so anything the op
+					 * still owes the published-into node --
+					 * the order-statistics delta above all --
+					 * owes it HERE, not to the copy this
+					 * commit retires.
+					 */
+					retire_txn->pending_pub_node =
+						new_node_flag;
 				}
 			} else if (caa_unlikely(ft_node_flip_proxy(iter))) {
 				/* Copied-slot latch (unpublished arm): see popcount. */
@@ -2447,6 +2467,24 @@ abandon_fresh:
 	 * yet registered with @retire_txn (registration happens only on the
 	 * success path above); -EAGAIN re-descends after the peer settles.
 	 */
+	/*
+	 * ☠ THE FOLD DID NOT HAPPEN, so un-say it.  The copy loop may have
+	 * folded the op's pending publish into this body on an EARLIER slot and
+	 * only then hit the latch bail on a later one -- and the body is freed
+	 * on the next line.  Leaving @pending_pub_node set would hand
+	 * ft_glue_txn_commit_edges a pointer into reclaimed memory to bake the
+	 * order-statistics delta into, and leaving @pending_pub_folded set would
+	 * make it skip a forward publish that never took effect.
+	 *
+	 * Cleared BY IDENTITY, never unconditionally: another recompaction in
+	 * this same transaction may legitimately own a fold of its own, and this
+	 * bail must not speak for it.
+	 */
+	if (retire_txn && new_node_flag &&
+			retire_txn->pending_pub_node == new_node_flag) {
+		retire_txn->pending_pub_node = NULL;
+		retire_txn->pending_pub_folded = false;
+	}
 	free_cds_ft_node_unpublished(ft, new_node);
 	ft_unlock_held(rel_held, nr_rel);
 	if (fenced && !c_held.shared)

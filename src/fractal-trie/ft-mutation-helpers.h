@@ -1357,6 +1357,13 @@ struct ft_flip_txn {
 	 */
 	bool pending_pub_folded;
 	/*
+	 * ...and WHICH node it folded into.  The publish is live in that copy,
+	 * so a delta the op still owes the published-into node -- the
+	 * order-statistics count above all -- must land there and not on
+	 * @publish_parent, which this commit retires.  NULL until a fold.
+	 */
+	struct cds_ft_inode_flag *pending_pub_node;
+	/*
 	 * THE OP'S PENDING SLOT DROP, carried so a recompaction of the node the
 	 * drop targets folds it into the copy it makes.  The mirror of
 	 * @pending_pub_slot above, reachable on the same geometry.
@@ -1772,6 +1779,7 @@ struct ft_flip_txn *ft_flip_txn_create_at(FT_TK_SITE_PARAM struct cds_ft *ft)
 	t->pending_pub_slot = NULL;
 	t->pending_pub_val = NULL;
 	t->pending_pub_folded = false;
+	t->pending_pub_node = NULL;
 	t->pending_del_slot = NULL;
 	t->pending_del_expected = NULL;
 	t->pending_del_folded = false;
@@ -1995,6 +2003,7 @@ struct ft_flip_txn *ft_flip_txn_create_on_at(FT_TK_SITE_PARAM
 	t->pending_pub_slot = NULL;
 	t->pending_pub_val = NULL;
 	t->pending_pub_folded = false;
+	t->pending_pub_node = NULL;
 	t->pending_del_slot = NULL;
 	t->pending_del_expected = NULL;
 	t->pending_del_folded = false;
@@ -2051,6 +2060,7 @@ struct ft_flip_txn *ft_flip_txn_create_bounded_on_at(FT_TK_SITE_PARAM
 	t->pending_pub_slot = NULL;
 	t->pending_pub_val = NULL;
 	t->pending_pub_folded = false;
+	t->pending_pub_node = NULL;
 	t->pending_del_slot = NULL;
 	t->pending_del_expected = NULL;
 	t->pending_del_folded = false;
@@ -13567,9 +13577,58 @@ publish_done:
 	 * glue commit) or the trie does not maintain rank stats; @publish_parent
 	 * NULL (a root splice, the whole cluster becomes the root) records nothing.
 	 */
-	if (g->count_delta)
-		ft_flip_txn_record_count_parent(ft, g->txn, g->publish_parent,
+	if (g->count_delta) {
+		struct cds_ft_inode_flag *count_base = g->publish_parent;
+
+		/*
+		 * ☠ THE PUBLISH PARENT MAY ALREADY BE SUPERSEDED, and then it is
+		 * the WRONG BASE -- which is exactly the case
+		 * ft_flip_txn_record_count_parent's own header calls out ("when
+		 * that owner is itself relocated by the same commit, the owner's
+		 * stable parent").
+		 *
+		 * A SAME-TRIE SIBLING MOVE reaches it: source and destination
+		 * under ONE parent, so the src detach DEL-recompacts the very
+		 * node the dst attach publishes into, and the publish rides that
+		 * copy (@pending_pub_slot, skipped above).  @publish_parent is
+		 * then the copy this commit RETIRES.  Walking from it puts
+		 * @count_delta on a node no reader will ever reach, while the
+		 * SURVIVING copy -- which the detach already baked its own -cnt
+		 * into -- never receives it.  ANCESTORS were never the problem:
+		 * the retired copy's parent_word still names the same stable
+		 * parent, so they were charged correctly all along, which is why
+		 * only ONE node came out wrong.
+		 *
+		 * MEASURED, order statistics on, both list modes: over
+		 * {q,wam,wan,wbx,wby,wcz}, rekey("wa" -> "wb") returned OK with
+		 * the right shape and the right key set, and cds_ft_verify then
+		 * reported `depth 1: nr_keys mismatch: stored 3, computed 5` --
+		 * short by exactly the moved count.  Nothing but verify and the
+		 * rank and select queries could observe it.
+		 *
+		 * So bake the delta into the survivor -- a build-invisible plain
+		 * store on a node this commit has not published yet, the same
+		 * thing the store lane does for its own relocation
+		 * (ft_store_at_graft_point's reserve arm) -- and start the walk
+		 * at the STABLE PARENT both copies share, taking it from the
+		 * retired copy, whose back-edge is the one still wired.
+		 */
+		if (g->txn && g->txn->pending_pub_folded &&
+				g->txn->pending_pub_node &&
+				g->publish_slot == g->txn->pending_pub_slot) {
+			struct cds_ft_metadata *sm = cds_ft_item_to_metadata(
+				ft_node_ptr(g->txn->pending_pub_node));
+			struct cds_ft_metadata *om = cds_ft_item_to_metadata(
+				ft_node_ptr(g->publish_parent));
+
+			ft_nr_keys_store(ft, sm,
+				ft_nr_keys_get(sm) + g->count_delta,
+				CMM_RELAXED);
+			count_base = ft_parent_node(om->parent_word);
+		}
+		ft_flip_txn_record_count_parent(ft, g->txn, count_base,
 			g->count_delta);
+	}
 
 	/*
 	 * FOLD (coherent rekey one-decide writer): the whole dst-attach is now
