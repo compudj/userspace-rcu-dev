@@ -12708,7 +12708,7 @@ static int test_rekey_skip_slot_bp_atomic_or_refused(void)
  * the API itself takes.
  */
 static int rekey_keeps_keys_cfg(const char *what, const char *const *keys,
-		const char *nw, const char *old, int rank_stats)
+		const char *nw, const char *old, int rank_stats, int excl)
 {
 	struct cds_ft_group *group;
 	struct cds_ft *ft;
@@ -12732,6 +12732,8 @@ static int rekey_keeps_keys_cfg(const char *what, const char *const *keys,
 
 	ft = rank_stats ? create_varlen_rankstats_list_ft(true, &group) :
 			create_varlen_ft(&group);
+	if (excl)
+		cds_ft_make_exclusive(ft);
 	rcu_read_lock();
 	for (i = 0; keys[i]; i++) {
 		if (cds_ft_insert(ft, (const uint8_t *) keys[i],
@@ -12810,14 +12812,24 @@ out:
 static int rekey_keeps_keys(const char *what, const char *const *keys,
 		const char *nw, const char *old)
 {
-	return rekey_keeps_keys_cfg(what, keys, nw, old, 0);
+	return rekey_keeps_keys_cfg(what, keys, nw, old, 0, 0);
 }
 
 /* Rank stats coerce COARSE, which is a different writer path entirely. */
 static int rekey_rankstats_keeps_keys(const char *what, const char *const *keys,
 		const char *nw, const char *old)
 {
-	return rekey_keeps_keys_cfg(what, keys, nw, old, 1);
+	return rekey_keeps_keys_cfg(what, keys, nw, old, 1, 0);
+}
+
+/*
+ * cds_ft_make_exclusive is a documented public entry point ("the offline
+ * staging trie" pattern) and NO other test in this file rekeys on one.
+ */
+static int rekey_exclusive_keeps_keys(const char *what, const char *const *keys,
+		const char *nw, const char *old)
+{
+	return rekey_keeps_keys_cfg(what, keys, nw, old, 0, 1);
 }
 
 /*
@@ -12978,6 +12990,14 @@ static int test_rekey_graft_publish_survives_detach(void)
  * a plain timeout bounds it -- but a libtap failure still absorbs neither a
  * hang nor an abort, which is why this is opt-in rather than a live leg.
  *
+ * ★★ THE TOOL FOR THESE ALREADY EXISTS -- build with
+ * -DFT_DEBUG_REKEY_RETRY_CAP (the gate's "audit" config carries it) and every
+ * leg below stops hanging and ABORTS instead, printing "FT REKEY LIVELOCK:
+ * 50001 attempts" plus the instruction that "a refusal that is a property of
+ * the STRUCTURE owes FT_REKEY_UNCOVERED, not a retry".  Verified: all three
+ * families abort at 50001 under it.  The detector is NOT missing from the
+ * gate -- the SHAPES are, which is what these legs exist to fix.
+ *
  * The last two legs are the SAME shapes the publish pin exercises, with rank
  * stats ON: rank stats coerce COARSE, and there the shapes that merely lose
  * keys with rank OFF hang instead.  That is what makes the count half of any
@@ -12992,6 +13012,7 @@ static int test_rekey_known_nonterminating(void)
 	static const char *h2[] = { "abaab", "abaabbb", NULL };
 	static const char *r1[] = { "zhello", "zq", "zwa", "zwb", NULL };
 	static const char *r2[] = { "zhab", "zhac", "zq", "zwa", "zwb", NULL };
+	static const char *x1[] = { "axm", "axn", "aqq", "bym", "byn", NULL };
 
 	if (!cds_ft_merge_enabled()) {
 		diag("test_rekey_known_nonterminating: skipped, merge compiled "
@@ -13001,7 +13022,9 @@ static int test_rekey_known_nonterminating(void)
 	if (!getenv("FT_UNIT_KNOWN_BAD")) {
 		diag("test_rekey_known_nonterminating: skipped -- these rekeys "
 			"NEVER RETURN (retry loop in ft_rekey_graft_simple_attempt, "
-			"RSS flat); set FT_UNIT_KNOWN_BAD=1 to run them");
+			"RSS flat); set FT_UNIT_KNOWN_BAD=1 to run them, and "
+			"build -DFT_DEBUG_REKEY_RETRY_CAP to get a loud abort "
+			"instead of a hang");
 		return 0;
 	}
 	if (rekey_keeps_keys("hang/dst-below-run", h1, "zg", "zh"))
@@ -13010,8 +13033,21 @@ static int test_rekey_known_nonterminating(void)
 		return -1;
 	if (rekey_rankstats_keeps_keys("hang/rankstats-direct", r1, "zwe", "zh"))
 		return -1;
-	return rekey_rankstats_keeps_keys("hang/rankstats-two-key", r2, "zwe",
-			"zha");
+	if (rekey_rankstats_keeps_keys("hang/rankstats-two-key", r2, "zwe",
+			"zha"))
+		return -1;
+	/*
+	 * THE THIRD TRIGGER, and the only one on an ordinary shape: an
+	 * EXCLUSIVE trie hangs on a CROSS-parent move (src under 'a', dst under
+	 * 'b') on the DEFAULT build -- FEATURE_FT_INSERT_IN_PLACE is not
+	 * involved and is compiled out here.  Measured: the same-parent move
+	 * completes, an occupied dst is refused, and only cross-parent + empty
+	 * dst spins.  Pre-existing at the pushed base.  cds_ft_make_exclusive
+	 * is a documented public entry point, and this is the third defect
+	 * found behind it -- an axis no other test in this file exercises.
+	 */
+	return rekey_exclusive_keeps_keys("hang/exclusive-cross-parent", x1,
+			"bz", "ax");
 }
 
 /*
