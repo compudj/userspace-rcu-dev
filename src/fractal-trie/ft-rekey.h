@@ -1818,29 +1818,42 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		if (s_top_external && !merge_dst)
 			return FT_REKEY_UNCOVERED;
 		/*
-		 * ☠ AND NOT ON A RANK-STATS TRIE, until the count walk's BASE is
-		 * fixed.  The union's +count walk starts above the publish parent,
-		 * and where the source's branch point sits ON that chain the walk
-		 * charges its delta into a copy the publish supersedes, so the
-		 * root aggregate ends ONE key light: MEASURED on exactly the shape
-		 * this admission opens -- insert {azm,azn,ayp,q,azq}, then move
-		 * "q" onto the occupied "az" -- cds_ft_count_keys answers 4 for 5
-		 * keys and cds_ft_verify goes RED ("stored 4, computed 5").
+		 * ☠☠ AND NOT ON A RANK-STATS TRIE.  The COUNT half of this
+		 * refusal IS now fixed -- ft_flip_txn_record_count_parent
+		 * follows the survivor of a same-commit relocation, so the
+		 * union's +count no longer lands on the copy the src detach
+		 * retires -- but the count was never the only thing this
+		 * refusal was holding back, and lifting it on that evidence
+		 * alone loses a KEY.
 		 *
-		 * ★ THE DEFECT IS NOT THIS ADMISSION'S.  An INTERNAL src whose BP
-		 * is the root loses the count identically at the parent commit, so
-		 * the walk base is a standing bug with its own fix owed (see the
-		 * count-walk note at the merge publish, and the sibling-move twin
-		 * that was fixed at @85c8c8e6).  What IS this admission's is the
-		 * EXPOSURE: before it, this call answered NOT_SUPPORTED and left
-		 * the trie byte-for-byte correct; after it, the same call SUCCEEDS
-		 * and silently corrupts the aggregate.  Trading a clean refusal
-		 * for silent corruption is never a widening worth taking, and a
-		 * count that is merely low reddens no test the user runs -- so the
-		 * refusal stays until the base is right.
+		 * ONE KEY-BYTE DEEPER, the src detach empties a junction whose
+		 * SURVIVOR SIDE IS A MULTI-LEVEL CHAIN, so the collapse absorbs
+		 * several nodes into one run.  ft_chain_compress_fused then
+		 * records the surviving child's re-parent MW onto a word an
+		 * earlier lane of the same one-decide already recorded SW; a
+		 * debug build aborts on the engine's kind check, and a RELEASE
+		 * build absorbs it through the documented MW-domination
+		 * fail-safe -- which DROPS that re-parent edge.
 		 *
-		 * Rank-stats OFF -- the default, and test 110's own trie -- keeps
-		 * no aggregate to lose and is unaffected.
+		 * MEASURED, both list modes, default features, single-threaded:
+		 * insert {"xq","xabzm","xabzn"} then rekey "xabz" <- "xq"
+		 * returns OK, cds_ft_count_keys answers 3, cds_ft_verify is RED,
+		 * and the moved key is reachable at NEITHER "xabz" NOR "xq" --
+		 * the application's node is ORPHANED.  At the commit before this
+		 * one the same call answered NOT_SUPPORTED and left the trie
+		 * byte-for-byte intact.  Clean on -DNO_FEATURE_FT_COMPRESS and
+		 * -DNO_FEATURE_FT_SKIP_COMPRESSED: it is the skip/collapse lane.
+		 *
+		 * ★ THE KIND CONFLICT IS OLDER THAN THIS ADMISSION -- an
+		 * INTERNAL src reaches it too, and aborts a debug build as far
+		 * back as @77a635ff -- so the fix owed is in the collapse, not
+		 * here.  What is THIS gate's business is that admitting the bare
+		 * head hands that defect a NEW REACHABLE SHAPE, and a silent key
+		 * loss returning OK is not a trade a clean refusal ever loses.
+		 * ☞ WHEN ft_chain_compress_fused RECORDS ONE KIND: drop this,
+		 * flip test_rekey_bare_head_rankstats_refused's rank arm to
+		 * expect OK + count 5, and delete the DEBUG_RCU #if that hides
+		 * test_rekey_count_root_relocation's mid-chain arms.
 		 */
 		if (s_top_external && ft->rank_stats)
 			return FT_REKEY_UNCOVERED;
@@ -2736,20 +2749,20 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		 * walk stopped poisoning the descriptor
 		 * (ft_flip_txn_record_count_parent's read-your-own-writes).
 		 *
-		 * ☐ THIS FIXES THE VALUE, NOT THE WALK'S BASE.  A SIBLING move --
-		 * src and dst under the SAME parent, so the publish parent IS the
-		 * src junction BP -- has a SEPARATE, PRE-EXISTING defect: the
-		 * detach DEL-recompacts BP and the structural publish is
-		 * redirected into that fresh copy (@pending_pub_slot), but the
-		 * count walk below still starts from @publish_parent, the
-		 * SUPERSEDED copy, so the live BP never receives this delta.
-		 * MEASURED with and WITHOUT this change, identically: over
-		 * {q,wam,wan,wbx,wby,wcz}, rekey("wa" -> "wb") leaves that node
-		 * at `stored 3, computed 5`.  The store lane already solves it
-		 * (ft_graft.h bakes the delta into the fresh copy and walks from
-		 * the STABLE grandparent); the glue lane has no equivalent, which
-		 * also contradicts ft_flip_txn_record_count_parent's own header.
-		 * Out of scope here -- it is not what this line got wrong.
+		 * ☑ THIS FIXES THE VALUE; THE WALK'S BASE was its own defect and
+		 * is fixed too, in two halves.  A SIBLING move -- src and dst
+		 * under the SAME parent, so the publish parent IS the src
+		 * junction BP the detach DEL-recompacts -- charged this delta
+		 * into the SUPERSEDED copy (MEASURED then: over
+		 * {q,wam,wan,wbx,wby,wcz}, rekey("wa" -> "wb") left that node
+		 * at `stored 3, computed 5`); @85c8c8e6 gave the glue lane the
+		 * equivalent the store lane already had -- bake into the named
+		 * survivor (@pending_pub_node), walk from the shared stable
+		 * parent (ft_glue_txn_commit_edges' folded-publish arm).  And
+		 * where the relocated node is an ANCESTOR of the base -- the
+		 * root above all -- no caller-side re-base can name it, so the
+		 * walk itself now follows the survivor through the descriptor
+		 * (ft_flip_txn_record_count_parent's chain resolution).
 		 */
 		{
 			struct cds_ft_metadata *d_meta =

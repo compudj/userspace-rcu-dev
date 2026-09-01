@@ -9923,6 +9923,14 @@ void ft_set_parent_raw(struct cds_ft *ft, struct cds_ft_inode_flag *child,
  * post-commit-chain attempt lacked (it climbed a re-parented node's stale chain,
  * so some deltas never reached the root: a parity undercount).
  *
+ * ...the chain is UNCHANGED, but a NODE ON IT may not survive the commit: a
+ * same-trie move's src detach DEL-recompacts its branch point, and where that
+ * branch point is an ANCESTOR of @stable_base (the root above all -- every
+ * depth-1 junction has it there) the walk would charge @delta into the copy
+ * this same commit RETIRES, while the survivor -- born from a copy of the
+ * still-uncharged word -- never receives it.  The loop below FOLLOWS THE
+ * SURVIVOR: see the "chain is not the op's own answer" paragraph in it.
+ *
  * A no-op when order statistics are off.  The caller must have reserved one txn
  * edge per node on the @stable_base -> root path (bounded by the ACTUAL descent
  * depth, never FT_MAX_DEPTH).  Under the retained writer exclusion no proxy is
@@ -9932,19 +9940,169 @@ void ft_set_parent_raw(struct cds_ft *ft, struct cds_ft_inode_flag *child,
  * ...but the WORD IS NOT THE OP'S OWN ANSWER.  See the read-your-own-writes
  * paragraph in the loop: one txn may walk an ancestor TWICE.
  */
+/*
+ * ft_count_walk_survivor_meta: the metadata of the node @new_raw -- a slot
+ * value THIS txn recorded -- will place at a chain position, resolved WITHOUT
+ * trusting any back-pointer the same txn still owes a rewrite.
+ *
+ * A plain internal or compressed flag names its body directly.  A
+ * SKIP-COMPRESSED value does not: it names the run's CHILD, and the run itself
+ * is recovered through that child's back-pointer (ft_skip_to_compressed's
+ * one-hop) -- which, mid-record, still names the node the run REPLACES,
+ * because the child's re-parent edge rides this very commit.  MEASURED: on the
+ * mid-chain move ({xazm,xazn,xayp,xq,xazq}, "xq" onto the occupied "xaz") the
+ * detach's chain-compress collapse replaces the emptied junction with a run
+ * whose slot value is skip-encoded; the one-hop decode landed the count bake
+ * on the SUPERSEDED body and the run shipped `stored 4, computed 5`.  So
+ * resolve the child's parent through the DESCRIPTOR first -- the collapse
+ * records that re-parent before any count walk runs -- and fall back to the
+ * physical word only where the txn recorded nothing (then the one-hop is the
+ * pre-op truth and correct).  NULL means "no survivor derivable": the caller
+ * falls through to charging the recorded value's position as before, which is
+ * today's behaviour and never bakes into a wrong body.
+ *
+ * The EXTERNAL-child skip shape (a run over a single head) is refused here:
+ * a chain hop always has charged nodes below it, so a head below the run
+ * cannot carry them -- and its back-channel (head->prev / cell->parent) has
+ * mode-dependent indirection this walk has no business decoding.  A parked
+ * peer proxy on the physical fallback is refused the same way: rank-stats
+ * tries run COARSE (writer exclusion, ft-lifecycle.h), so none is expected,
+ * and falling through beats resolving through a word mid-flip.
+ */
+static
+struct cds_ft_metadata *ft_count_walk_survivor_meta(struct cds_ft *ft,
+		struct urcu_txn_desc *desc, void *new_raw)
+{
+	struct cds_ft_inode_flag *nf = (struct cds_ft_inode_flag *) new_raw;
+
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+	if (ft_node_skip_compressed(nf)) {
+		struct cds_ft_inode_flag *child = ft_skip_child_ptr(nf);
+		struct cds_ft_metadata *cm;
+		const struct urcu_txn_record *pr;
+		struct cds_ft_inode_flag *pw;
+
+		if (!child || ft_node_external(child))
+			return NULL;
+		cm = cds_ft_item_to_metadata(ft_node_ptr(child));
+		pr = urcu_txn_find(desc, (void **) &cm->parent_word);
+		pw = pr ? (struct cds_ft_inode_flag *) pr->new_ptr :
+			rcu_dereference(cm->parent_word);
+		if (ft_node_flip_proxy(pw))
+			return NULL;
+		pw = ft_parent_node(pw);
+		if (!pw || ft_node_external(pw) ||
+				ft_node_skip_compressed(pw))
+			return NULL;
+		return ft_flag_to_metadata(ft, pw);
+	}
+#else
+	(void) desc;
+#endif
+	return ft_flag_to_metadata(ft, nf);
+}
+
 static
 void ft_flip_txn_record_count_parent(struct cds_ft *ft, struct ft_flip_txn *t,
 		struct cds_ft_inode_flag *stable_base, long delta)
 {
 	struct cds_ft_inode_flag *cur = stable_base;
+	struct urcu_txn_desc *desc = NULL;
 
 	if (!ft->rank_stats)
 		return;
+	if (t->mtxn && t->mtxn->desc != URCU_TXN_ENOMEM)
+		desc = t->mtxn->desc;
 	while (cur) {
 		struct cds_ft_metadata *m =
 			cds_ft_item_to_metadata(ft_node_ptr(cur));
-		unsigned long base = ft_nr_keys_get(m);
+		unsigned long base;
 		unsigned long old_raw, new_raw;
+
+		/*
+		 * ☠ THE CHAIN IS NOT THE OP'S OWN ANSWER EITHER -- FOLLOW THE
+		 * SURVIVOR.  A node on this walk may be one THIS SAME COMMIT
+		 * supersedes: a same-trie move's src detach DEL-recompacts its
+		 * branch point, and when that branch point sits ON the chain --
+		 * ABOVE @stable_base, so no caller-side re-base can name it --
+		 * the walk would record its CAS on the RETIRED copy's word.
+		 * That edge still commits (the copy's word is untouched by the
+		 * retire), but into a body no reader reaches, while the
+		 * SURVIVING copy was built from the still-uncharged word: the
+		 * delta is silently lost one level up.
+		 *
+		 * MEASURED, rank stats on, at the base fix's own control shape
+		 * (insert {azm,azn,azx,qp,qw}, then move the internal "q"
+		 * subtree onto the occupied "az"): the detach recompacts the
+		 * ROOT, the union's +2 walk lands on the retired root copy, and
+		 * cds_ft_verify answers `depth 0: nr_keys mismatch: stored 3,
+		 * computed 5` -- short by exactly the union's delta.  The bare
+		 * external head at a depth-1 junction (test 110's step-3 shape
+		 * on a rank-stats trie) loses ONE the same way; a branch point
+		 * OFF the chain (deep src, disjoint dst spine) counts exactly,
+		 * which is what convicts the walk's blindness to the
+		 * relocation rather than the relocation itself.
+		 *
+		 * So ask the DESCRIPTOR about the STRUCTURE, exactly as the
+		 * block below asks it about the VALUE: resolve the slot that
+		 * holds @cur (the root resolves to &ft->root -- the same walk
+		 * covers a relocated root and a relocated interior ancestor)
+		 * and, when this op has recorded a replacement there, bake
+		 * @delta into the survivor instead -- a build-invisible plain
+		 * store on a copy nothing reaches until this commit flips, the
+		 * same store the detach used to bake its own -cnt -- and keep
+		 * climbing the retired copy's back-edge, which still names the
+		 * stable parent.  No new txn state and no producer inventory:
+		 * any lane that records its relocation into the shared txn
+		 * BEFORE this walk runs is covered, which the one-decide
+		 * drivers guarantee by ordering (detach at step 3, count walks
+		 * at step 3c).  The folded-publish guard at the GLUE lane's
+		 * commit (ft_glue_txn_commit_edges) remains as the BASE-node
+		 * special case of the same rule: it re-bases before this walk
+		 * ever sees the superseded copy, so the two never double-bake.
+		 *
+		 * Identity is compared through ft_flag_to_metadata for the OLD
+		 * value (whose back-pointers are still physically pre-op, so
+		 * the one-hop skip decode is the truth), and through
+		 * ft_count_walk_survivor_meta for the NEW one (whose skip
+		 * decode must go through the descriptor -- see its header for
+		 * the measured mid-chain miss).  A skip re-encode or a wrap
+		 * that names the SAME body falls through to the normal record
+		 * below -- only a genuine replacement diverts.  A record whose
+		 * new value is NULL, external, or unresolvable carries no
+		 * survivor to charge; falling through keeps today's behaviour
+		 * for it.
+		 */
+		if (desc
+#ifdef FT_RED_NO_COUNT_SURVIVOR
+				&& 0	/* red control: the walk charges the retired copy again */
+#endif
+		   ) {
+			const struct urcu_txn_record *sr = urcu_txn_find(desc,
+				(void **) ft_resolve_parent_slot(m, ft, NULL));
+
+			if (sr && sr->old_ptr && sr->new_ptr &&
+					!ft_node_external((struct cds_ft_inode_flag *)
+						sr->old_ptr) &&
+					!ft_node_external((struct cds_ft_inode_flag *)
+						sr->new_ptr) &&
+					ft_flag_to_metadata(ft,
+						(struct cds_ft_inode_flag *)
+							sr->old_ptr) == m) {
+				struct cds_ft_metadata *sm =
+					ft_count_walk_survivor_meta(ft, desc,
+						sr->new_ptr);
+
+				if (sm && sm != m) {
+					ft_nr_keys_store(ft, sm,
+						ft_nr_keys_get(sm) + delta,
+						CMM_RELAXED);
+					cur = ft_parent_node(m->parent_word);
+					continue;
+				}
+			}
+		}
+		base = ft_nr_keys_get(m);
 
 		/*
 		 * ☠ READ-YOUR-OWN-WRITES, NOT THE LIVE WORD.  A SAME-TRIE move
@@ -9973,14 +10131,10 @@ void ft_flip_txn_record_count_parent(struct cds_ft *ft, struct ft_flip_txn *t,
 		 * describes that fallback exactly -- it was only ever a
 		 * statement about PEERS, never about the op meeting itself.
 		 */
-		{
-			struct urcu_txn_desc *desc = t->mtxn ?
-				t->mtxn->desc : NULL;
-			const struct urcu_txn_record *r = NULL;
+		if (desc) {
+			const struct urcu_txn_record *r = urcu_txn_find(desc,
+				(void **) &m->nr_keys);
 
-			if (desc && desc != URCU_TXN_ENOMEM)
-				r = urcu_txn_find(desc,
-					(void **) &m->nr_keys);
 			if (r)
 				base = (unsigned long) r->new_ptr >> 1;
 		}
@@ -13664,10 +13818,26 @@ publish_done:
 		 * (ft_store_at_graft_point's reserve arm) -- and start the walk
 		 * at the STABLE PARENT both copies share, taking it from the
 		 * retired copy, whose back-edge is the one still wired.
+		 *
+		 * ★ NOW A SPECIAL CASE, kept as the measured committed form:
+		 * ft_flip_txn_record_count_parent itself follows the survivor
+		 * of a same-commit relocation at EVERY hop (it resolves the
+		 * chain through the descriptor), so with this arm ablated
+		 * (-DFT_RED_NO_PUB_FOLD_COUNT_REBASE) the walk's first hop
+		 * meets the superseded @publish_parent, finds the recompact's
+		 * forward record, and bakes into the same @pending_pub_node --
+		 * MEASURED equivalent on the sibling-move suite, both list
+		 * modes, disjoint and collide, narrow and PIGEON-wide.  The
+		 * red-control exists so the gate can re-verify that
+		 * equivalence, not to be shipped.
 		 */
 		if (g->txn && g->txn->pending_pub_folded &&
 				g->txn->pending_pub_node &&
-				g->publish_slot == g->txn->pending_pub_slot) {
+				g->publish_slot == g->txn->pending_pub_slot
+#ifdef FT_RED_NO_PUB_FOLD_COUNT_REBASE
+				&& 0	/* red control: the walk must divert on its own */
+#endif
+		   ) {
 			/*
 			 * ☠ DECODE COMPRESSED-AWARE, though nothing produces a
 			 * compressed node here TODAY.  @pending_pub_node is set

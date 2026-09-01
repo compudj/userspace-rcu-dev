@@ -69,13 +69,13 @@
 #endif
 
 /*
- * 308 unconditional + 51 fault-injection-only RUN_TEST registrations, on top of
+ * 309 unconditional + 51 fault-injection-only RUN_TEST registrations, on top of
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (366 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (367 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (315 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (316 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -11651,25 +11651,22 @@ static enum cds_ft_status ft_rekey(struct cds_ft *ft, const char *nw,
  * and the non-overlap guard (a prefix relationship / equal keys are rejected).
  */
 /*
- * A BARE EXTERNAL HEAD moved onto an OCCUPIED destination is admitted on a
- * default trie (test_merge_rekey_same_trie step 3) and REFUSED on a rank-stats
- * one -- and the refusal is the POINT, not an omission.
+ * A BARE EXTERNAL HEAD moved onto an OCCUPIED destination, on a DEFAULT trie
+ * and on a RANK-STATS one (both list modes).  The rank-stats arms were REFUSED
+ * (NOT_SUPPORTED) until ft_flip_txn_record_count_parent learned to follow the
+ * survivor of a same-commit relocation: the src detach here DEL-recompacts the
+ * ROOT (the head's branch point is a depth-1 junction), the union's +count walk
+ * climbed the publish parent's back-edge onto the RETIRED root copy, and the
+ * live root ended ONE key light -- cds_ft_count_keys answered 4 for 5 keys and
+ * cds_ft_verify went red ("stored 4, computed 5"), with the structure and key
+ * set already correct, so nothing a user runs reddened.  ft-rekey.h refused the
+ * shape rather than corrupt silently.
  *
- * The union's +count walk starts above the publish parent, so where the source's
- * branch point sits ON that chain the walk charges its delta into a copy the
- * publish supersedes and the root aggregate ends ONE key light.  That base
- * defect is NOT the bare-head admission's (an INTERNAL src whose BP is the root
- * loses the count identically, and has since before the admission existed), but
- * the admission is what would make it REACHABLE: this exact call used to answer
- * NOT_SUPPORTED and leave the trie byte-for-byte correct, and admitting it on a
- * rank-stats trie would trade that clean refusal for a SILENT wrong answer --
- * cds_ft_count_keys off by one, cds_ft_verify red, and no test the user runs
- * reddening.  So ft-rekey.h refuses it until the walk's base is fixed.
- *
- * ☞ WHEN THAT BASE IS FIXED, this test is what says so: drop the rank-stats
- * refusal there and change the expectation here to OK + an exact count.  Until
- * then it pins BOTH halves -- the default trie must still MOVE the key, so the
- * gate cannot be widened into a blanket refusal that quietly disables step 3.
+ * The walk fix lifted that refusal, and this test is what pins it lifted: OK,
+ * the key MOVED, and the count EXACT, on both list modes -- the count is the
+ * only witness of this class, so an inexact 5 here is the regression.  The
+ * default-trie arm still pins step 3's admission unchanged (no aggregate to
+ * lose, and the gate must never widen into a blanket refusal).
  */
 static int test_rekey_bare_head_rankstats_refused(void)
 {
@@ -11684,11 +11681,11 @@ static int test_rekey_bare_head_rankstats_refused(void)
 	enum cds_ft_status s;
 	unsigned int i;
 
-	for (i = 0; i < 2; i++) {
-		bool rank = (i == 1);
+	for (i = 0; i < 3; i++) {
+		bool rank = (i >= 1);
 
 		if (rank)
-			ft = create_varlen_rankstats_list_ft(false, &group);
+			ft = create_varlen_rankstats_list_ft(i == 2, &group);
 		else
 			ft = create_varlen_ft(&group);
 		rcu_read_lock();
@@ -11700,29 +11697,169 @@ static int test_rekey_bare_head_rankstats_refused(void)
 
 		s = ft_rekey(ft, "az", "q");
 		if (rank) {
-			if (s != CDS_FT_STATUS_NOT_SUPPORTED) {
-				fprintf(stderr, "bare-head rank-stats: expected "
-					"NOT_SUPPORTED, got %s\n",
-					cds_ft_status_to_string(s));
-				goto next;
-			}
-			/* Refused means UNTOUCHED: "q" still there, count exact. */
-			if (!ft_test_has_key(ft, "q") ||
-			    cds_ft_count_keys(ft) != 5)
-				goto next;
-		} else {
-			if (s != CDS_FT_STATUS_OK ||
-			    !ft_test_has_key(ft, "az") ||
-			    ft_test_has_key(ft, "q") ||
+			/*
+			 * REFUSED, and the trie is UNTOUCHED by it: "q" still
+			 * resolves and the count is exact.  A pass here is the
+			 * absence of the key loss the refusal exists to
+			 * prevent, so check the key, not just the status.
+			 */
+			if (s != CDS_FT_STATUS_NOT_SUPPORTED ||
+			    !ft_test_has_key(ft, "q") ||
+			    ft_test_has_key(ft, "az") ||
 			    cds_ft_count_keys(ft) != 5) {
-				fprintf(stderr, "bare-head default: %s count %lu\n",
-					cds_ft_status_to_string(s),
+				fprintf(stderr, "bare-head[%u] rank: %s count %lu\n",
+					i, cds_ft_status_to_string(s),
 					cds_ft_count_keys(ft));
 				goto next;
 			}
+		} else if (s != CDS_FT_STATUS_OK ||
+		    !ft_test_has_key(ft, "az") ||
+		    ft_test_has_key(ft, "q") ||
+		    cds_ft_count_keys(ft) != 5) {
+			fprintf(stderr, "bare-head[%u]: %s count %lu\n",
+				i, cds_ft_status_to_string(s),
+				cds_ft_count_keys(ft));
+			goto next;
 		}
 		if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK)
 			goto next;
+		/*
+		 * ☠ THE DEEPER SHAPE THE REFUSAL REALLY GUARDS.  A survivor
+		 * chain of MORE THAN ONE level makes the collapse absorb
+		 * several nodes into one run, and the chain-compress kind
+		 * conflict then DROPS the surviving child's re-parent: OK
+		 * returned, count 3, verify RED, and the moved key reachable
+		 * at NEITHER key -- ORPHANED.  Pin it here so lifting the
+		 * refusal on count evidence alone cannot pass this test.
+		 */
+		if (rank) {
+			struct cds_ft_group *g2;
+			struct cds_ft *f2 = create_varlen_rankstats_list_ft(
+				i == 2, &g2);
+			enum cds_ft_status s2;
+			int bad;
+
+			cds_ft_insert(f2, (const uint8_t *) "xq", 2,
+				&node_alloc(6)->node);
+			cds_ft_insert(f2, (const uint8_t *) "xabzm", 5,
+				&node_alloc(7)->node);
+			cds_ft_insert(f2, (const uint8_t *) "xabzn", 5,
+				&node_alloc(8)->node);
+			s2 = ft_rekey(f2, "xabz", "xq");
+			bad = (s2 != CDS_FT_STATUS_NOT_SUPPORTED ||
+				!ft_test_has_key(f2, "xq") ||
+				cds_ft_count_keys(f2) != 3 ||
+				cds_ft_verify(f2, stderr) != CDS_FT_STATUS_OK);
+			if (bad)
+				fprintf(stderr,
+					"bare-head[%u] deep-chain: %s count %lu xq=%d\n",
+					i, cds_ft_status_to_string(s2),
+					cds_ft_count_keys(f2),
+					ft_test_has_key(f2, "xq"));
+			drain_trie(f2);
+			rcu_barrier();
+			cds_ft_destroy(f2);
+			cds_ft_group_destroy(g2);
+			if (bad)
+				goto next;
+		}
+		rcu_read_unlock();
+		drain_trie(ft);
+		rcu_barrier();
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		continue;
+next:
+		rcu_read_unlock();
+		drain_trie(ft);
+		rcu_barrier();
+		cds_ft_destroy(ft);
+		cds_ft_group_destroy(group);
+		goto out;
+	}
+	ret = 0;
+out:
+	return ret;
+}
+
+/*
+ * The ROOT-RELOCATION count class, pinned at its two junction depths, rank
+ * stats on, both list modes.
+ *
+ * An INTERNAL src whose branch point is the ROOT ({qp,qw} moved onto the
+ * occupied "az") is the shape that proved the class PRE-DATES the bare-head
+ * admission: the detach DEL-recompacts the root, and before the walk followed
+ * the survivor, the union's +2 rode the retired root copy -- MEASURED at the
+ * fix: OK, right keys, `depth 0: nr_keys mismatch: stored 3, computed 5`.  The
+ * src keys are chosen NON-COLLIDING deliberately: a collided union contributes
+ * ZERO delta (the all-collide twin {qm,qn} counted exactly all along), so only
+ * a live delta can witness the lost charge.
+ *
+ * ☠☠ THE MID-CHAIN TWIN IS ABSENT ON PURPOSE, and its absence is a FINDING,
+ * not an omission.  Pushing the same shape one byte deeper (every key behind a
+ * shared 'x', so the emptied junction's survivor side is a MULTI-LEVEL chain
+ * and the collapse absorbs several nodes into one run) does not merely miss a
+ * count -- it is BROKEN THREE WAYS AT HEAD, all of them PRE-EXISTING, all
+ * MEASURED at fff8d743 on an untouched tree with an ORDINARY INTERNAL SRC
+ * ({xqp,xqw} onto the occupied "xaz" -- a shape no gate has ever refused):
+ *
+ *   rank-stats ON,  release : OK returned, BOTH moved keys reachable at
+ *                             NEITHER key, cds_ft_count_keys answers 5 for the
+ *                             3 that remain, cds_ft_verify RED
+ *                             (`head prev != owner`).  A SHIPPING KEY LOSS.
+ *   rank-stats ON,  debug   : aborts the engine's kind check
+ *                             (urcu_txn_record_chain `r->kind == kind`).
+ *   rank-stats OFF, release : LIVELOCKS and leaks until the memcg kills it
+ *                             (rc=137 in a 4G cage), both list modes.
+ *
+ * The common cause is the detach's chain-compress collapse:
+ * ft_record_child_back_edge re-parents the surviving child MW onto a word an
+ * earlier lane of the same one-decide already recorded SW, and the release
+ * build's MW-domination fail-safe absorbs the contradiction by DROPPING that
+ * re-parent edge.  A test arm here would therefore assert a shape the library
+ * cannot serve, and would go green the day someone "fixed" it by widening a
+ * refusal.  ☞ The collapse conflict is owed its own fix; when it lands, add
+ * the mid-chain twin back -- it is the arm that convicts base-side re-basing
+ * as insufficient, and its skip-encoded slot value is what pins
+ * ft_count_walk_survivor_meta's descriptor-resolved decode.
+ */
+static int test_rekey_count_root_relocation(void)
+{
+	if (!cds_ft_merge_enabled()) {
+		diag("test_rekey_count_root_relocation: skipped, merge "
+			"compiled out (-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	int ret = -1;
+	enum cds_ft_status s;
+	unsigned int i;
+
+	for (i = 0; i < 2; i++) {
+		bool liston = (i & 1);
+
+		ft = create_varlen_rankstats_list_ft(liston, &group);
+		rcu_read_lock();
+		cds_ft_insert(ft, (const uint8_t *) "azm", 3,
+			&node_alloc(1)->node);
+		cds_ft_insert(ft, (const uint8_t *) "azn", 3,
+			&node_alloc(2)->node);
+		cds_ft_insert(ft, (const uint8_t *) "azx", 3,
+			&node_alloc(3)->node);
+		cds_ft_insert(ft, (const uint8_t *) "qp", 2,
+			&node_alloc(4)->node);
+		cds_ft_insert(ft, (const uint8_t *) "qw", 2,
+			&node_alloc(5)->node);
+		s = ft_rekey(ft, "az", "q");
+		if (s != CDS_FT_STATUS_OK ||
+		    cds_ft_count_keys(ft) != 5 ||
+		    cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "count-root-reloc[%u]: %s count %lu\n",
+				i, cds_ft_status_to_string(s),
+				cds_ft_count_keys(ft));
+			goto next;
+		}
 		rcu_read_unlock();
 		drain_trie(ft);
 		rcu_barrier();
@@ -34961,6 +35098,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_merge_rerooted_nosplit_ordered_branch);
 	RUN_TEST(test_merge_rekey_same_trie);
 	RUN_TEST(test_rekey_bare_head_rankstats_refused);
+	RUN_TEST(test_rekey_count_root_relocation);
 	RUN_TEST(test_merge_rekey_same_trie_speculative_rejected);
 	RUN_TEST(test_rekey_graft_vs_merge);
 	RUN_TEST(test_rekey_skip_slot_bp_atomic_or_refused);
