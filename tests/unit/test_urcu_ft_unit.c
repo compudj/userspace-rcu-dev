@@ -13051,22 +13051,33 @@ static int test_rekey_known_nonterminating(void)
 }
 
 /*
- * ☠☠☠☠ OPT-IN REPRODUCER (FT_UNIT_KNOWN_BAD=1): after the publish-lost rekey
- * destroys a key, an EXCLUSIVE trie SEGFAULTS on the next drain.
+ * ☑ REGRESSION GUARD (was an opt-in crasher; FIXED by the old-direction drop
+ * arming).  An EXCLUSIVE trie used to SEGFAULT on the drain that follows this
+ * rekey -- because the rekey destroyed a key first and left a dangling ordered
+ * cell behind, which the next cds_ft_remove_all then dereferenced.
  *
  *      insert "zq", "zwabcd";  cds_ft_make_exclusive(ft);
  *      cds_ft_rekey_merge(ft, "zwe", 3, "zwabc", 5);   -> OK, key destroyed
  *      cds_ft_lookup_first + cds_ft_remove_all         -> SEGV
  *
- * ★ cds_ft_make_exclusive is the DISCRIMINATOR, not FEATURE_FT_INSERT_IN_PLACE:
- * measured on the plain default build with and without exclusivity (crashes
- * only with) and on -DFEATURE_FT_INSERT_IN_PLACE (identical), so this is
- * memory-unsafety reachable from a documented public entry point on the
- * shipping build, not an opt-in-feature artifact.
+ * ★ cds_ft_make_exclusive was the DISCRIMINATOR, not FEATURE_FT_INSERT_IN_PLACE:
+ * measured on the plain default build with and without exclusivity (crashed
+ * only with) and on -DFEATURE_FT_INSERT_IN_PLACE (identical) -- memory-unsafety
+ * reachable from a documented public entry point on the shipping build, not an
+ * opt-in-feature artifact.
  *
- * ☞ The publish pin above stops at the first bad answer and never drains, so
- * the suite never reaches this: a pin that stops at the wrong ANSWER does not
- * exercise what the corruption DOES NEXT.
+ * ☞ WHY IT NEEDED ITS OWN TEST.  The publish pin above stops at the first bad
+ * ANSWER and never drains: a pin that stops at the wrong answer does not
+ * exercise what the corruption DOES NEXT.  Keeping this leg after the fix is
+ * the point -- it guards the consequence, not just the answer.
+ *
+ * ☠ The key check must come BEFORE the drain.  It did not when this test was
+ * written, which was harmless while the drain crashed and made the test
+ * unpassable the moment it stopped.
+ *
+ * Skipped under -DNO_FEATURE_FT_COMPRESS: without a run to cut, this shape is
+ * the deep-chain one that still LIVELOCKS there (see the publish pin's own
+ * gated leg), and a libtap failure absorbs neither a hang nor an abort.
  */
 static int test_rekey_exclusive_drain_after_loss(void)
 {
@@ -13081,10 +13092,10 @@ static int test_rekey_exclusive_drain_after_loss(void)
 			"compiled out (-DNO_FEATURE_FT_MERGE)");
 		return 0;
 	}
-	if (!getenv("FT_UNIT_KNOWN_BAD")) {
-		diag("test_rekey_exclusive_drain_after_loss: skipped -- SEGFAULTS "
-			"on the drain after the move destroys a key; set "
-			"FT_UNIT_KNOWN_BAD=1 to run it");
+	if (!_cds_ft_debug_compress_enabled()) {
+		diag("test_rekey_exclusive_drain_after_loss: skipped, path "
+			"compression compiled out (-DNO_FEATURE_FT_COMPRESS): "
+			"this shape LIVELOCKS there");
 		return 0;
 	}
 	ft = create_varlen_ft(&group);
@@ -13094,10 +13105,28 @@ static int test_rekey_exclusive_drain_after_loss(void)
 	cds_ft_insert(ft, (const uint8_t *) "zwabcd", 6, &node_alloc(2)->node);
 	s = cds_ft_rekey_merge(ft, (const uint8_t *) "zwe", 3,
 			(const uint8_t *) "zwabc", 5);
-	if (s == CDS_FT_STATUS_OK && !ft_test_has_key(ft, "zwed")) {
-		fprintf(stderr, "exclusive-drain: rekey zwe<-zwabc reported OK "
-			"but lost the key (%lu of 2 left) -- the drain below is "
-			"what crashes\n", cds_ft_count_keys(ft));
+	if (s != CDS_FT_STATUS_OK || !ft_test_has_key(ft, "zwed") ||
+			!ft_test_has_key(ft, "zq") ||
+			cds_ft_count_keys(ft) != 2 ||
+			cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "exclusive-drain: rekey zwe<-zwabc (%s) left "
+			"%lu of 2 keys -- the drain below is what used to "
+			"crash\n", cds_ft_status_to_string(s),
+			cds_ft_count_keys(ft));
+		/*
+		 * ☠ DO NOT TOUCH A TRIE THIS TEST HAS JUST PROVEN CORRUPT.  The
+		 * drain is precisely what used to SEGV, and the ordinary
+		 * cleanup below drains too -- so on a regression the crash
+		 * would kill the whole suite before libtap could report the
+		 * failure, which is the one outcome worse than the bug.  Leak
+		 * the trie deliberately instead: the leak check adds its own
+		 * red, and a REPORTED failure beats a dead harness.
+		 * (Verified: with the old-direction drop arming reverted, this
+		 * arm reports and the suite survives; without it the process
+		 * exits 139 mid-run.)
+		 */
+		rcu_read_unlock();
+		return -1;
 	}
 	if (cds_ft_iter_create(ft, &iter) == CDS_FT_STATUS_OK) {
 		struct cds_ft_node *head, *tmp;
@@ -13111,7 +13140,12 @@ static int test_rekey_exclusive_drain_after_loss(void)
 		}
 		cds_ft_iter_destroy(iter);
 	}
-	ret = (s == CDS_FT_STATUS_OK && ft_test_has_key(ft, "zwed")) ? 0 : -1;
+	/* The drain SURVIVED and emptied the trie: that is the guard. */
+	ret = (cds_ft_count_keys(ft) == 0 &&
+		cds_ft_verify(ft, stderr) == CDS_FT_STATUS_OK) ? 0 : -1;
+	if (ret)
+		fprintf(stderr, "exclusive-drain: the drain left %lu keys\n",
+			cds_ft_count_keys(ft));
 	rcu_read_unlock();
 	drain_trie(ft);
 	rcu_barrier();
