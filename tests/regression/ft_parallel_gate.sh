@@ -285,19 +285,16 @@ ALL_CONFIGS=(
 	# that leak sit unseen: the unit suite never builds the concurrent
 	# ordered view the leak showed up in.
 	#
-	# ☠ imw is DELIBERATELY NOT ARMED HERE.  Measured at 3167ea40 (control,
-	# before the bulk fix): nomerge + FT_INV_MW=1 is 112/120, with SEVEN
-	# PRE-EXISTING reds -- inv_rekey_{coarse,fine,contended}_mixed_writers,
-	# inv_rekey_coarse_contended_writers and the three
-	# inv_rekey_public_atomic_no_gap* -- all reporting "no moves (livelock?)"
-	# because cds_ft_rekey_graft answers NOT_SUPPORTED (-7) on this arm.
-	# That is an OPEN QUESTION, not a test bug to paper over: ft-rekey.h:4266
-	# states that under -DNO_FEATURE_FT_MERGE "only the rekey GRAFT -- the
-	# empty-dst shape -- remains available", and cds_ft_rekey_graft's public
-	# contract (fractal-trie.h:2106) does not list NOT_SUPPORTED among its
-	# returns -- yet the entry point at ft-rekey.h:6561 is wrapped whole in
-	# #ifdef FEATURE_FT_MERGE.  Arm imw only once that is settled.
-	"nomerge|-DNO_FEATURE_FT_MERGE|u ion ioff"
+	# imw is armed too, and it is the leg that pays for itself here: it was
+	# 112/120 when first run, with SEVEN reds -- the three
+	# inv_rekey_public_atomic_no_gap* and four inv_rekey_*_writers -- all
+	# reporting "no moves (livelock?)" because cds_ft_rekey_graft answered
+	# NOT_SUPPORTED on this arm.  It should not have: an empty destination is
+	# a GRAFT, not a union, and none of the merge subsystem is on its path.
+	# The entry point was gated anyway, contradicting both its own public
+	# contract and the comment on ft_rekey_spine_copy.  Un-gated; these seven
+	# are the only thing that checks it stays that way.
+	"nomerge|-DNO_FEATURE_FT_MERGE|u ion ioff imw"
 )
 
 # Optional positional filter: run only the named configs.

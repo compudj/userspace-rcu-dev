@@ -2127,6 +2127,18 @@ enum cds_ft_status cds_ft_merge_at(struct cds_ft *dst_ft,
  * than a fixed-length group's one key length.  A fixed-length group is refused
  * with CDS_FT_STATUS_INVALID_ARGUMENT_ERROR and the trie is left untouched.
  *
+ * COMPILED IN ON EVERY BUILD, including -DNO_FEATURE_FT_MERGE: an empty
+ * destination makes this a graft, not a union, so none of the merge subsystem
+ * is on its path and the build configuration never takes this call away.  Its
+ * sibling cds_ft_rekey_merge, whose whole purpose is the occupied destination,
+ * IS taken away by that flag -- see there.
+ *
+ * ☞ It can still answer CDS_FT_STATUS_NOT_SUPPORTED, but for a reason that has
+ * nothing to do with the build: a same-trie move is served by the atomic writer
+ * or not at all (staging one through a detached subtree would hide live keys
+ * from readers for a grace period), so a SHAPE outside that writer's cut is
+ * refused with NOT_SUPPORTED on every configuration alike.
+ *
  * Returns CDS_FT_STATUS_OK (including when @src_key is absent -- a no-op),
  * CDS_FT_STATUS_POPULATED_ERROR if @dst_key is occupied, CDS_FT_STATUS_MEMORY_ERROR,
  * or CDS_FT_STATUS_INVALID_ARGUMENT_ERROR (NULL @ft, a key length exceeding the
@@ -2154,6 +2166,14 @@ enum cds_ft_status cds_ft_rekey_graft(struct cds_ft *ft,
  * variable-length-group requirements.  Returns the same statuses as
  * cds_ft_rekey_graft except it never returns CDS_FT_STATUS_POPULATED_ERROR (an
  * occupied @dst_key is merged into).
+ *
+ * ONE FURTHER DIFFERENCE FROM ITS GRAFT SIBLING: the union into an occupied
+ * destination is built out of the merge subsystem, so a library compiled with
+ * -DNO_FEATURE_FT_MERGE answers CDS_FT_STATUS_NOT_SUPPORTED for EVERY call
+ * here, as cds_ft_merge and cds_ft_merge_at do.  cds_ft_rekey_graft stays
+ * compiled in on such a build; query cds_ft_merge_enabled() to tell the two
+ * configurations apart rather than inferring it from a NOT_SUPPORTED, which
+ * either entry can also return for an uncovered SHAPE.
  */
 enum cds_ft_status cds_ft_rekey_merge(struct cds_ft *ft,
 		const uint8_t *dst_key, size_t dst_key_len,
@@ -3091,10 +3111,13 @@ bool cds_ft_excl_validate_enabled(void);
 /*
  * cds_ft_merge_enabled - Query whether the merge subsystem is compiled in.
  *
- * The merge family (cds_ft_merge, cds_ft_merge_at and the graft paths
- * that reuse them) can be compiled out with -DNO_FEATURE_FT_MERGE,
- * which drops ~20 KiB of .text for a deployment that never merges;
- * cds_ft_merge then returns CDS_FT_STATUS_NOT_SUPPORTED.
+ * The merge family (cds_ft_merge, cds_ft_merge_at, cds_ft_rekey_merge
+ * and the graft paths that reuse them) can be compiled out with
+ * -DNO_FEATURE_FT_MERGE, which drops ~20 KiB of .text for a deployment
+ * that never merges; those entries then return
+ * CDS_FT_STATUS_NOT_SUPPORTED.  ☞ cds_ft_rekey_GRAFT is NOT in that
+ * family and stays available on such a build: an empty destination is a
+ * graft, not a union.
  *
  * Returns false in such a build, true otherwise.
  *

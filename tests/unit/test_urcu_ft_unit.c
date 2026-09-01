@@ -11902,11 +11902,6 @@ static int test_rekey_colocated_external(void)
 	size_t prev_len = 0;
 	int i, nr = 0, ret = -1;
 
-	if (!cds_ft_merge_enabled()) {
-		diag("test_rekey_colocated_external: skipped, merge compiled out "
-			"(-DNO_FEATURE_FT_MERGE)");
-		return 0;
-	}
 	if (cds_ft_group_attr_create(&gattr) < 0)
 		return -1;
 	if (cds_ft_group_attr_set_max_key_len(gattr, 8) < 0 ||
@@ -12063,11 +12058,6 @@ static int test_rekey_compressed_stop(void)
 	enum cds_ft_status s;
 	int i, ret = -1;
 
-	if (!cds_ft_merge_enabled()) {
-		diag("test_rekey_compressed_stop: skipped, merge compiled out "
-			"(-DNO_FEATURE_FT_MERGE)");
-		return 0;
-	}
 	{
 		/* EAGER: what a rekey requires, and what makes the run PLAIN. */
 		struct cds_ft_group_attr *gattr;
@@ -12196,11 +12186,6 @@ static int test_rekey_abutting_dst_keeps_list_order(void)
 	uint8_t at_bp[2] = { 0x10, 0x09 }, at_dp[2] = { 0x11, 0x01 };
 	int dir, ret = -1;
 
-	if (!cds_ft_merge_enabled()) {
-		diag("test_rekey_abutting_dst_keeps_list_order: skipped, merge "
-			"compiled out (-DNO_FEATURE_FT_MERGE)");
-		return 0;
-	}
 	ft = create_fixed_ord_rekey_ft(4, &group);	/* fixed, ordered list ON */
 	if (cds_ft_iter_create(ft, &iter) < 0)
 		abort();
@@ -12351,11 +12336,6 @@ static int test_rekey_varlen_ordered_splice(void)
 	size_t prev_len = 0;
 	int i, ret = -1, nr = 0;
 
-	if (!cds_ft_merge_enabled()) {
-		diag("test_rekey_varlen_ordered_splice: skipped, merge compiled "
-			"out (-DNO_FEATURE_FT_MERGE)");
-		return 0;
-	}
 	if (cds_ft_group_attr_create(&gattr) < 0)
 		return -1;
 	if (cds_ft_group_attr_set_max_key_len(gattr, 8) < 0 ||

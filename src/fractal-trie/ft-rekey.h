@@ -6558,21 +6558,38 @@ out:
 	return status;
 }
 
+/*
+ * COMPILED IN ON EVERY BUILD, INCLUDING -DNO_FEATURE_FT_MERGE.  The empty-dst
+ * move is a GRAFT, not a union, so none of the merge subsystem's machinery
+ * (ft_merge_ctx, ft_merge_build, ft_merge_ord_interleave_collect) is on its
+ * path -- and that is a fact about the CALLER, not a hope about the callee:
+ * @require_empty is true for FT_REKEY_GRAFT, and ft_rekey_one_decide answers an
+ * occupied destination with -EEXIST (POPULATED_ERROR) BEFORE any merge_dst arm
+ * runs.  Every #ifdef FEATURE_FT_MERGE region below that point -- the
+ * ft_merge_build union, the interleave splice, the reservation term -- is
+ * therefore unreachable from this entry on EVERY build, not merely on this one.
+ *
+ * Gating the entry itself contradicted the comment on ft_rekey_spine_copy
+ * ("only the rekey GRAFT -- the empty-dst shape -- remains available") and the
+ * public contract, and it cost the whole same-trie move on a merge-less build
+ * for nothing.  ☞ This does NOT make the call infallible: ft_rekey_at_inner
+ * still refuses any rekey shape the atomic writer's cut misses, on every build.
+ */
 enum cds_ft_status cds_ft_rekey_graft(struct cds_ft *ft,
 		const uint8_t *dst_key, size_t dst_key_len,
 		const uint8_t *src_key, size_t src_key_len)
 {
-#ifdef FEATURE_FT_MERGE
 	FT_BW_OP(FT_BW_REKEY_GRAFT);
 	return ft_rekey_dispatch(ft, dst_key, dst_key_len, src_key, src_key_len,
 			FT_REKEY_GRAFT);
-#else
-	(void) ft; (void) dst_key; (void) dst_key_len;
-	(void) src_key; (void) src_key_len;
-	return CDS_FT_STATUS_NOT_SUPPORTED;
-#endif
 }
 
+/*
+ * MERGE-ONLY, unlike its graft sibling above: this entry's whole purpose is the
+ * OCCUPIED destination, which is a union built out of the merge subsystem.
+ * With -DNO_FEATURE_FT_MERGE it answers NOT_SUPPORTED, as cds_ft_merge and
+ * cds_ft_merge_at do.
+ */
 enum cds_ft_status cds_ft_rekey_merge(struct cds_ft *ft,
 		const uint8_t *dst_key, size_t dst_key_len,
 		const uint8_t *src_key, size_t src_key_len)
