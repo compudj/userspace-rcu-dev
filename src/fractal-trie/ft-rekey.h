@@ -161,6 +161,30 @@ int ft_rekey_cow_lock_child(const struct cds_ft *ft,
 	return ft_acquire_member(ft, ctx, child, cm, child_depth, held);
 }
 
+/*
+ * Does this op hold @cm's OWN word, or did coarsening land the acquire on an
+ * ANCHOR above it?  @h is the mark ft_rekey_cow_lock_child just took for @cm.
+ *
+ * This is the predicate that decides the re-parent's state-edge KIND, and it is
+ * the SAME one ft_glue_acquire_reparent_marks computes for @held_lock -- see the
+ * law written there (ft-mutation-helpers.h): the SW park is a plain store that
+ * validates nothing, legal only because the op holds the very word it parks.
+ * Take an ANCESTOR's word instead and a peer's ft_meta_nr_child_inc from an
+ * insert BELOW the child sees a CLEAN word, does not honour
+ * FT_STATE_INPLACE_WAIT_MASK, and the park CLOBBERS its count.  A coarsened
+ * member therefore keeps the MW guard and lets the peer abort the commit.
+ *
+ * ☞ Under CDS_FT_LOCK_SPACING_PER_NODE anchor and node are ONE word, so this is
+ * true whenever a mark was taken and the arms below are byte-identical to the
+ * unconditional form they replace.
+ */
+static inline
+bool ft_rekey_mark_holds_child_word(const struct ft_held_anchor *h,
+		const struct cds_ft_metadata *cm)
+{
+	return h->lock == cm || h->node_held;
+}
+
 /* Defined below; ft_rekey_cow_stop hands it the marks it takes. */
 static
 void ft_rekey_marks_to_txn(struct ft_flip_txn *txn,
@@ -340,7 +364,10 @@ int ft_rekey_cow_stop(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 			ft_rekey_marks_to_txn(txn, marks, nm);
 		}
 		ft_reparent_record(ft, txn, child, new_flag, &new_cn->child,
-			/*child_marked=*/ cm != NULL, /*hold_ctx=*/ NULL);
+			/*child_marked=*/ cm != NULL &&
+				ft_rekey_mark_holds_child_word(&marks[nm - 1],
+					cm),
+			/*hold_ctx=*/ NULL);
 		/*
 		 * 5'. Retire @stop and hand back the NODE flag, not the skip-encoded
 		 *     slot form.
@@ -507,7 +534,9 @@ int ft_rekey_cow_stop(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 				ft_rekey_marks_to_txn(txn, marks, nm);
 			}
 			ft_reparent_record(ft, txn, iter, new_flag, slot,
-				/*child_marked=*/ true,		/* marked above */
+				/*child_marked=*/ cm != NULL &&
+					ft_rekey_mark_holds_child_word(
+						&marks[nm - 1], cm),
 				/*hold_ctx=*/ NULL);
 		}
 	} else {	/* FT_PIGEON */
@@ -536,7 +565,9 @@ int ft_rekey_cow_stop(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 				ft_rekey_marks_to_txn(txn, marks, nm);
 			}
 			ft_reparent_record(ft, txn, iter, new_flag, slot,
-				/*child_marked=*/ true,		/* marked above */
+				/*child_marked=*/ cm != NULL &&
+					ft_rekey_mark_holds_child_word(
+						&marks[nm - 1], cm),
 				/*hold_ctx=*/ NULL);
 		}
 	}
