@@ -364,8 +364,42 @@ sync_src() {	# $1=name -- refresh live sources into the (already-configured) tre
 	rsync -a "$ROOT/include/" "$dir/include/" 2>/dev/null
 }
 
-run_leg() {	# $1=cwd $2=timeout-secs ; $3.. = the command -- run it, echo its output
-	local d=$1 tmo=$2; shift 2
+# ---------------------------------------------------------------------------
+# THE MEMORY CAGE.  Mathieu's standing order is that every test and repro runs
+# in its own memcg; the gate was the one harness that did not, and it is the one
+# that runs 25 legs at once.
+#
+# Defaults are ~3x the MEASURED peak RSS of a HEALTHY leg on the default config
+# (VmHWM, per-node): ft_unit 5648 MiB, ft_inv on 4551, ft_inv off 5134,
+# ft_inv mw 7948, txn settle ~0.  ☞ The MW leg peaks just OVER 8 GiB, which is
+# why an 8G cage SIGKILLs it at ~test 105 with no `not ok` -- a truncation that
+# reads as green.  Do not lower these without re-measuring; a cap that is too
+# small does not corrupt anything, but it reports as INCOMPLETE (signal 9) and
+# costs a bisect.
+#
+# WORST-CASE CONCURRENCY, since these multiply: legs are SEQUENTIAL within a
+# spacing and the spacings and configs are not, so the bound is one leg per
+# (config, spacing) pair -- 25 today -- of which at most 18 can be on imw.
+# 18*24G + 7*16G = 544 GiB, which leaves headroom on this 755 GiB box for the
+# 15 concurrent builds and the page cache.  Re-do that sum before raising a cap.
+FT_GATE_MEM_U=${FT_GATE_MEM_U:-16G}
+FT_GATE_MEM_INV=${FT_GATE_MEM_INV:-16G}
+FT_GATE_MEM_IMW=${FT_GATE_MEM_IMW:-24G}
+FT_GATE_MEM_SP=${FT_GATE_MEM_SP:-4G}
+
+# Probed, never assumed: a gate that silently ran uncaged would be exactly the
+# configuration that took the machine down, so say so loudly instead.
+if systemd-run --user --scope -q -p MemoryMax=64M -p MemorySwapMax=0 \
+		-- true >/dev/null 2>&1; then
+	CAGE=1
+else
+	CAGE=0
+	echo "WARNING: systemd-run --user --scope unavailable -- legs run UNCAGED." >&2
+	echo "WARNING: a LEAKING livelock can then take the whole machine down." >&2
+fi
+
+run_leg() {	# $1=cwd $2=timeout-secs $3=MemoryMax ; $4.. = the command
+	local d=$1 tmo=$2 mem=$3; shift 3
 	( cd "$d" || exit 99
 	  # A crash is an EXPECTED outcome for this harness, so let it dump...
 	  ulimit -c unlimited 2>/dev/null
@@ -374,7 +408,20 @@ run_leg() {	# $1=cwd $2=timeout-secs ; $3.. = the command -- run it, echo its ou
 	  # the harness itself failing.  The command's own stderr is folded into
 	  # stdout below and is not affected by this.
 	  exec 2>/dev/null
-	  timeout "$tmo" "$@" 2>&1 )
+	  # ★ A TIMEOUT IS NOT A MEMORY BOUND.  Some FT livelocks spin with a FLAT
+	  # RSS and some LEAK while they spin, and the gate cannot tell which it
+	  # is holding: measured at ~46 MB/s for one of them, which over the
+	  # 900 s ft_unit timeout is ~42 GB -- times the ten coarse-spacing legs
+	  # that run concurrently.  That took a 755 GB machine down (and with it
+	  # the whole gate run, which reports NOTHING).  Cage every leg so a
+	  # leaking one dies alone as signal 9, which the INCOMPLETE check below
+	  # already reports legibly, instead of taking its 24 siblings with it.
+	  if [ "$CAGE" = 1 ]; then
+		timeout "$tmo" systemd-run --user --scope -q \
+			-p MemoryMax="$mem" -p MemorySwapMax=0 -- "$@" 2>&1
+	  else
+		timeout "$tmo" "$@" 2>&1
+	  fi )
 }
 
 run_leg_multi() {	# $1=name $2=cdir $3=spacing $4=bin $5=lib $6=outfile
@@ -403,7 +450,8 @@ run_leg_multi() {	# $1=name $2=cdir $3=spacing $4=bin $5=lib $6=outfile
 	for i in $(seq 1 "$n"); do
 		mkdir -p "$cdir/copy-$i"
 		dirs+=("$cdir/copy-$i")
-		( run_leg "$cdir/copy-$i" 1800 env LD_LIBRARY_PATH="$lib" \
+		( run_leg "$cdir/copy-$i" 1800 "$FT_GATE_MEM_IMW" \
+			env LD_LIBRARY_PATH="$lib" \
 			CDS_FT_LOCK_SPACING="$sp" FT_INV_MW=1 "$bin" \
 			> "$cdir/copy-$i.out" 2>&1; echo $? > "$cdir/copy-$i.rc" ) &
 		pids+=($!)
@@ -559,7 +607,7 @@ run_spacing() {	# $1=name $2=tests $3=spacing $4=outfile -- every leg at ONE spa
 	local I=$dir/tests/regression/.libs/test_urcu_ft_inv
 	local SP=$dir/tests/unit/.libs/test_rcu_txn_settle_premise
 	local cores=$GATE/$name.cores
-	local t o ok notok abrt lbl rc plan ran rep cdir bin tmo c
+	local t o ok notok abrt lbl rc plan ran rep cdir bin tmo c mem
 	local env_x
 	: > "$out"
 	# REPEAT: an intermittent defect is a coin flip at one run.  The two
@@ -577,23 +625,23 @@ run_spacing() {	# $1=name $2=tests $3=spacing $4=outfile -- every leg at ONE spa
 			continue
 		fi
 		case $t in
-		u)    bin=$U; tmo=900;  lbl="ft_unit   "; env_x=() ;;
-		ion)  bin=$I; tmo=300;  lbl="ft_inv on "; env_x=() ;;
-		ioff) bin=$I; tmo=300;  lbl="ft_inv off"; env_x=(FT_INV_NO_ORDERED_LIST=1) ;;
+		u)    bin=$U; tmo=900;  lbl="ft_unit   "; env_x=() mem=$FT_GATE_MEM_U ;;
+		ion)  bin=$I; tmo=300;  lbl="ft_inv on "; env_x=() mem=$FT_GATE_MEM_INV ;;
+		ioff) bin=$I; tmo=300;  lbl="ft_inv off"; env_x=(FT_INV_NO_ORDERED_LIST=1) mem=$FT_GATE_MEM_INV ;;
 		# The concurrent-writer oracles (MW writers, coherent rekey) all
 		# gate on FT_INV_MW at runtime and are otherwise skipped, so ion
 		# / ioff never exercise them.  They are the long leg -- hence the
 		# larger timeout.
-		imw)  bin=$I; tmo=1800; lbl="ft_inv mw "; env_x=(FT_INV_MW=1) ;;
+		imw)  bin=$I; tmo=1800; lbl="ft_inv mw "; env_x=(FT_INV_MW=1) mem=$FT_GATE_MEM_IMW ;;
 		# The settle-premise DETECTOR's own validation.  It belongs to a
 		# config that DEFINES -DURCU_TXN_DEBUG_SETTLE and nowhere else:
 		# without the flag it skips, and a detector whose self-test only
 		# ever skips is indistinguishable from one that is blind.  It
 		# constructs its violation rather than waiting for one, so it is
 		# ~20 ms and carries no spacing dependence.
-		sp)   bin=$SP; tmo=120; lbl="txn settle"; env_x=() ;;
+		sp)   bin=$SP; tmo=120; lbl="txn settle"; env_x=() mem=$FT_GATE_MEM_SP ;;
 		esac
-		o=$(run_leg "$cdir" "$tmo" env LD_LIBRARY_PATH="$LIB" \
+		o=$(run_leg "$cdir" "$tmo" "$mem" env LD_LIBRARY_PATH="$LIB" \
 			CDS_FT_LOCK_SPACING="$sp" \
 			${env_x[@]+"${env_x[@]}"} "$bin"); rc=$?
 		# The SPACING rides every label below: a red that names only the
