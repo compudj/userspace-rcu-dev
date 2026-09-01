@@ -7182,6 +7182,58 @@ void ft_flip_txn_record_retire_anchored_arms(struct ft_flip_txn *t,
 	 * contract this arm exists for.  Per-node granularity never reaches here
 	 * (@h->lock is always @node), so the default stays byte-identical.
 	 */
+	/*
+	 * ☠ BUT FIRST, ASK THE DESCRIPTOR WHETHER THIS OP ALREADY SEALED
+	 * @node's FATE.  @h->node_snap is ONE member's pre-txn snapshot, and
+	 * under a coarse spacing two steps of one op can reach the SAME node:
+	 * the rekey fold's ft_rekey_cow_stop retires @stop, and the graft
+	 * glue separately retires its split_cn -- which, on a cut-run dst
+	 * split, IS that node.  Per-node granularity resolves the collapse in
+	 * the held branch above (the second member arrives @shared and reads
+	 * its own writes); this arm was the one place that still trusted the
+	 * snapshot, so both retires named the SAME pre-txn value, the second
+	 * failed urcu_txn_record_chain's value reconcile, and the descriptor
+	 * was POISONED -- an ABORT with no losing record and no peer, which
+	 * the retry loop replays identically forever (measured: ft_unit 114
+	 * leak-hangs on both coarse spacings while per-node stays green).
+	 *
+	 * ☠☠ urcu_txn_load cannot carry this dedupe: with no record for the
+	 * slot it falls through to a PHYSICAL read, and ratifying a fresh
+	 * read here would bless a peer's change -- the exact thing the
+	 * snapshot's fenced contract exists to abort.  So ask urcu_txn_find,
+	 * the descriptor and nothing else (the ft_flip_txn_guard_parent
+	 * carve-out is the same idiom), and keep the snapshot whenever the
+	 * txn holds no record.
+	 *
+	 * A staged value already carrying TOMBSTONE is the op's OWN terminal:
+	 * ONE WORD TAKES ONE TERMINAL (the law ft_flip_txn_record_anchor_
+	 * release yields to, in the other order), so this retire owes NOTHING
+	 * -- not even the idempotent {v -> v} re-record, which adds an edge
+	 * for no value and re-opens the slot's KIND question.
+	 *
+	 * ★ AND IT DEDUPES, IT DOES NOT RATIFY.  Every OTHER staged value
+	 * falls through to the arms below deliberately, because they already
+	 * answer it and they answer it more tightly.  An earlier RELEASE on
+	 * @node's own word stages {LOCK|s -> s}, and the snapshot fallback's
+	 * expected old IS that @s, so urcu_txn_record_chain reconciles the
+	 * pair with no help from here.  Anything else is a word this op did
+	 * not put there, and the snapshot is what turns that into the ABORT
+	 * the fenced contract owes -- chaining from the staged value instead
+	 * would RATIFY a world that moved, which is the one thing this arm
+	 * exists to refuse.  (Measured: the chain case is unreached -- 0 on
+	 * every spacing across ft_unit and ft_inv -- so this costs nothing
+	 * and removes a path nothing covers.)
+	 */
+	{
+		struct urcu_txn_desc *desc = t->mtxn->desc;
+		const struct urcu_txn_record *r = NULL;
+
+		if (desc && desc != URCU_TXN_ENOMEM)
+			r = urcu_txn_find(desc, (void **) &node->state);
+		if (caa_unlikely(r != NULL &&
+				((uintptr_t) r->new_ptr & FT_STATE_TOMBSTONE)))
+			return;		/* the terminal is already recorded */
+	}
 	{
 		uintptr_t pending = (uintptr_t) urcu_txn_load(t->mtxn,
 				(void **) &node->state, FT_STATE_PROXY);
