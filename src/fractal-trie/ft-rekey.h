@@ -3162,8 +3162,35 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 				 * entry -- without this it would fail against our own
 				 * fence and bail -EAGAIN on every attempt.  Read-only
 				 * to the glue: @marks below stays its sole release.
+				 *
+				 * ☠ ONLY when the mark holds the CHILD'S OWN word.
+				 * @caller_holder claims exactly that -- it is what
+				 * ft_glue_acquire_reparent_marks' @held_lock reads
+				 * through ft_lock_ctx_holds -- and @held_lock picks
+				 * the re-parent's record KIND.  Under a coarse
+				 * spacing this acquire lands on an ANCESTOR anchor,
+				 * the child's own word stays unheld, and the law at
+				 * ft_rekey_mark_holds_child_word applies unchanged:
+				 * a coarsened member keeps the MW guard.  The
+				 * blanket handoff overclaimed it, so on one fold
+				 * ft_rekey_cow_stop's re-parent of this same child
+				 * recorded MW (its own predicate is honest) while
+				 * the glue's deferred re-parent recorded SW -- ONE
+				 * slot, TWO kinds, the contradiction the engine's
+				 * record police refuses (measured on ft_unit 114 at
+				 * root-only: the child's parent_word chain hits
+				 * `r->kind == kind`, and release fail-safes it into
+				 * an MW promotion nothing audited).  The glue does
+				 * not need the handoff for exclusion there: the
+				 * ANCHOR is registered on the shared fold txn
+				 * (ft_rekey_marks_to_txn just above), so its own
+				 * acquire dedupes through the registry instead of
+				 * self-refusing.  Per-node is byte-identical -- the
+				 * mark is on the child and the predicate is true.
 				 */
-				glue.caller_holder = cm;
+				if (ft_rekey_mark_holds_child_word(
+						&marks[nr_marks - 1], cm))
+					glue.caller_holder = cm;
 			}
 		}
 		/*
