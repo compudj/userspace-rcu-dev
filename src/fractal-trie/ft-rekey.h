@@ -3257,15 +3257,42 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 			txn->pending_del_expected = d_src.nf_raw;
 		}
 		cds_ft_alloc_reserve_activate(ft, &reserve);
+		/*
+		 * THE SRC DESCENT, for the deferred re-parents still on the src
+		 * path -- the same hand-off the fold arm makes at its own
+		 * glue.lock_d_src, for the same stated reason: nothing else can
+		 * date a member reached from the BUILD, and a glue with no descent
+		 * for it leaves it undatable forever.
+		 *
+		 * ft_store_at_graft_point_prepare sets @glue's lock_d from the DST
+		 * descent it is handed (ft-graft.h), and a rekey GRAFT's
+		 * destination is EMPTY BY DEFINITION -- d_dst.nf is NULL -- so a
+		 * @dst_origin=false member resolved through it has no cursor node
+		 * to take a span from and ft_lock_ctx_depth_of_cursor_child
+		 * refuses.  ft_glue_acquire_reparent_marks then returns -EAGAIN,
+		 * the commit answers URCU_TXN_STATUS_ABORT (ft-graft.h), this
+		 * function returns -EIO, and the caller's retry loop re-descends
+		 * into an IDENTICAL attempt: a livelock with no contention in it,
+		 * certain single-threaded.
+		 *
+		 * Only the EXPONENTIAL schedule reads the depth at all
+		 * (ft_lock_ctx_depth_of_at answers per-node and root-only from the
+		 * spacing alone), which is why it was the only arm that hung.
+		 */
+		glue.lock_d_src = &d_src;
 		{
 			/*
 			 * The op's outstanding marks -- ft_rekey_cow_stop's @stop
 			 * fence and one per COW'd child -- reach no registry until
 			 * the sweep below, so the store's own recompactions can
-			 * only see them through this frame.  Under a coarse spacing
-			 * they collapse onto one word and the store refuses its own
-			 * fence: the CDS_FT_STATUS_BUSY_ERROR that "is not expected
-			 * single-threaded".
+			 * only see them through this frame.
+			 *
+			 * ☞ The refusal this frame is here to prevent is the STORE's
+			 * own-fence one.  It is NOT what the failure branch below
+			 * catches on the shape measured here: that arrives with
+			 * gst == CDS_FT_STATUS_OK and gcst == URCU_TXN_STATUS_ABORT,
+			 * from the re-parent acquire above -- not a BUSY_ERROR from
+			 * this prepare.
 			 */
 			struct ft_lock_ctx octx;
 
