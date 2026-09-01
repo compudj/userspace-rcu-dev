@@ -20039,6 +20039,7 @@ static void *bulk_writer(void *arg)
 	struct bulk_ctx *ctx = (struct bulk_ctx *) arg;
 	struct cds_ft_iter *iter;
 	unsigned long iters = 0;
+	bool do_merge = cds_ft_merge_enabled();
 
 	rcu_register_thread();
 	if (cds_ft_iter_create(ctx->A, &iter) < 0)
@@ -20049,6 +20050,19 @@ static void *bulk_writer(void *arg)
 
 	while (!test_stop) {
 		unsigned int op = iters % 3;
+
+		/*
+		 * Op 2 is the only merge-dependent one.  Ops 0 and 1 drive
+		 * detach/graft and the re-prefixing non-root graft_swap, which
+		 * are core bulk API and stay compiled in under
+		 * -DNO_FEATURE_FT_MERGE -- so gate the ONE op rather than
+		 * skipping the whole oracle, which would drop the ordered-view
+		 * coverage of those two on that arm entirely.
+		 */
+		if (op == 2 && !do_merge) {
+			iters++;
+			continue;
+		}
 
 		if (op == 0) {
 			/* detach + graft-back round-trip (run move, multi-key) */
@@ -20097,6 +20111,7 @@ static void *bulk_writer(void *arg)
 		} else {
 			/* merge a fresh donor into A (interleave), then reset */
 			struct cds_ft *C;
+			enum cds_ft_status st;
 			unsigned int i;
 
 			if (cds_ft_create(ctx->group, NULL, &C) < 0)
@@ -20107,8 +20122,30 @@ static void *bulk_writer(void *arg)
 					| (2 * i + 1));
 			pthread_mutex_lock(&ctx->lock);
 			cds_ft_make_exclusive(C);	/* DLM: cross-trie src must be exclusive */
-			cds_ft_merge(ctx->A, NULL, 0, C);	/* C -> A, C empty */
+			st = cds_ft_merge(ctx->A, NULL, 0, C);	/* C -> A, C empty */
 			pthread_mutex_unlock(&ctx->lock);
+			if (st != CDS_FT_STATUS_OK) {
+				/*
+				 * A refused merge leaves C's keys in C, and the
+				 * compensating remove loop below only looks in
+				 * A -- so an UNCHECKED status silently strands
+				 * BULK_NMERGE nodes per iteration and surfaces
+				 * as a bogus "node leak alloc != freed" at the
+				 * end of the test rather than naming the
+				 * refusal.  Name it, and drain C so the leak
+				 * balance still answers the question it is
+				 * there to answer.
+				 */
+				report_violation(ctx->test_name,
+					"cds_ft_merge refused: status %d "
+					"(iter #%lu)", (int) st, iters);
+				rcu_quiescent_state();
+				bulk_drain(C);
+				cds_ft_destroy(C);
+				rcu_quiescent_state();
+				iters++;
+				continue;
+			}
 			rcu_quiescent_state();
 
 			pthread_mutex_lock(&ctx->lock);
@@ -20157,6 +20194,18 @@ static int inv_ordered_bulk_consistency(void)
 	ctx.group = group;
 	ctx.test_name = "inv_ordered_bulk_consistency";
 	pthread_mutex_init(&ctx.lock, NULL);
+
+	/*
+	 * Partial skip, named: this oracle is not merge-NAMED and stays useful
+	 * without merge, so it runs on -DNO_FEATURE_FT_MERGE with one of its
+	 * three writer ops gated off.  Say so, rather than let the log read as
+	 * full coverage.
+	 */
+	if (!cds_ft_merge_enabled())
+		fprintf(stderr, "# inv_ordered_bulk_consistency: merge "
+			"interleave op skipped, merge compiled out "
+			"(-DNO_FEATURE_FT_MERGE); detach/graft and the "
+			"re-prefixing graft_swap still covered\n");
 
 	test_go = 0;
 	test_stop = 0;
