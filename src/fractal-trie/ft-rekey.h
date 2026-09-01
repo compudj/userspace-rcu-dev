@@ -1141,6 +1141,37 @@ void ft_rekey_marks_to_txn(struct ft_flip_txn *txn,
 	}
 }
 
+#if defined(DEBUG_RCU) || defined(CONFIG_RCU_DEBUG)
+/*
+ * THE DST-FRESHNESS OBLIGATION'S REACH COUNTERS, because a SILENT DETECTOR IS
+ * NOT COVERAGE (three zeros hide behind one).  The publish-time asserts below
+ * pin the invariant the BARE-HEAD src leg rests on -- "every move publishes a
+ * fresh library node at the destination attach point" -- and an assert that is
+ * compiled in but never REACHED proves nothing about it.  Count each arm's
+ * consultations and report at exit, so a green run can state "asked N times,
+ * never wrong" instead of "never failed".  [0] the MERGE arm's union node M,
+ * [1] the NOSPLIT graft's recompacted attach parent.  Guarded on the same pair
+ * urcu_assert_debug itself is, so the counters exist exactly where the asserts
+ * can fire.
+ */
+static unsigned long ft_rekey_dst_fresh_reach[2];
+
+static void ft_rekey_dst_fresh_fini(void) __attribute__((destructor));
+static void ft_rekey_dst_fresh_fini(void)
+{
+	if (!ft_rekey_dst_fresh_reach[0] && !ft_rekey_dst_fresh_reach[1])
+		return;
+	fprintf(stderr, "FT REKEY DST-FRESHNESS REACH: merge_union=%lu "
+		"graft_recompact=%lu\n",
+		ft_rekey_dst_fresh_reach[0], ft_rekey_dst_fresh_reach[1]);
+	fflush(stderr);
+}
+
+# define FT_REKEY_DST_FRESH_REACH(arm) uatomic_inc(&ft_rekey_dst_fresh_reach[arm])
+#else
+# define FT_REKEY_DST_FRESH_REACH(arm) do { } while (0)
+#endif
+
 static
 int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		const uint8_t *src_key, size_t src_len,
@@ -1216,6 +1247,15 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 */
 	bool run_keeps_pos = false;
 	bool s_top_compressed = false;	/* the moved top is a compressed run */
+	/*
+	 * THE BARE-HEAD SRC: @src_key's whole content is ONE key ending exactly
+	 * there, so S_top is the app-owned external head itself -- no library
+	 * node, no metadata, no children.  @s_top_meta is NULL for it and every
+	 * consumer below dispatches on this flag.  Only the MERGE (occupied-dst)
+	 * arm consumes the shape today; see the admission gate for why that is
+	 * sound and what the empty-dst graft arm still owes.
+	 */
+	bool s_top_external = false;
 	/*
 	 * The src key ends INSIDE a run, @src_cut bytes into it.  Then S_top is
 	 * not a node: it is the run's TAIL, and ft_rekey_cow_stop manufactures it
@@ -1428,7 +1468,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 * exhausted exactly here.
 	 */
 	if (!s_top || d_src.depth + src_cut != src_len ||
-			ft_node_flip_proxy(s_top) || ft_node_external(s_top))
+			ft_node_flip_proxy(s_top))
 		return FT_REKEY_UNCOVERED;
 	/*
 	 * A COMPRESSED S_top is in scope: ft_rekey_cow_stop copies the run and its
@@ -1444,8 +1484,43 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 * it is cheap, and it is what stops the accessor mismatch below from becoming
 	 * a wild read if that coupling ever changes.
 	 */
+	/*
+	 * AN EXTERNAL S_top -- the BARE HEAD, @src_key's whole content being one
+	 * key ending exactly there -- is ADMITTED, and the old refusal's stated
+	 * reason is gone.  It argued that the rekey-coherent reader's two-descent
+	 * witness (ft_lookup_two_descents) was built on ft_rekey_cow_stop giving
+	 * the moved top a FRESH ADDRESS, which an app-owned head cannot get.
+	 * That premise was ADJUDICATED FALSE (2026-08-31): the witness is carried
+	 * by DST-SIDE freshness -- every move publishes a fresh library node at
+	 * the destination attach point (the recompacted attach parent on the
+	 * graft arm, ft_merge_build's union node M on the merge arm; the
+	 * _ft_node_set_nth -ERANGE and replace_ptr -EFBIG arms are what force it
+	 * for every in-place mutation, ft-mutation-node.h) -- so no torn-but-
+	 * unperturbed descent is constructible for a head: it has no interior,
+	 * hence no second commit-sensitive read below the junction.  ABA on the
+	 * head itself is closed by the public reuse contract (fractal-trie.h:
+	 * re-initialize after a grace period before re-insert).
+	 *
+	 * KIND DISPATCH ORDER is load-bearing here: a skip pointer ONTO an
+	 * external leaf has low tag bits 0, so ft_node_external() matches it on
+	 * the raw value (the probe's note below).  The descent resolves skip
+	 * words, so a skip-encoded S_top should not reach this line -- but the
+	 * internal arm keeps its cheap belt-and-braces refusal, and the external
+	 * arm must not weaken it: test SKIP first, and refuse it.
+	 *
+	 * ☠ A SYNTHESISED CARRIER NODE WAS CONSIDERED AND REJECTED: wrapping the
+	 * head in a manufactured one-child internal violates the arity invariant
+	 * (a one-child no-external internal is path-compressed away) and buys a
+	 * freshness nothing consumes.
+	 */
 	if (ft_node_compressed(s_top)) {
 		s_top_compressed = true;
+	} else if (
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+			!ft_node_skip_compressed(s_top) &&
+#endif
+			ft_node_external(s_top)) {
+		s_top_external = true;
 	} else {
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 		if (ft_node_skip_compressed(s_top))
@@ -1460,14 +1535,17 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 * A key ending exactly AT @src_key -- @s_top's co-located external chain --
 	 * moves with the subtree: ft_rekey_cow_stop carries the forward pointer and
 	 * records the head's back edge.  The head itself is app-owned and is never
-	 * copied, which is also why an S_top that IS an external head stays out:
-	 * there would be no library node to give a fresh address to, and the
-	 * coherent reader's witness is built on that freshness.
+	 * copied.  For the BARE-HEAD shape there is no metadata at all: cow_stop's
+	 * duties collapse to {child re-parent, child marks: VACUOUS -- a head has
+	 * no children; the head's OWN back edge: OWED, and recorded by the merge
+	 * arm's deferred-edge machinery through ft_reparent_record's external arm;
+	 * retire: MUST NOT HAPPEN -- the node is app-owned}, so @s_top_meta is
+	 * NULL and every consumer below dispatches on @s_top_external.
 	 */
-	s_top_meta = s_top_compressed ?
+	s_top_meta = s_top_external ? NULL : (s_top_compressed ?
 		cds_ft_item_to_metadata((struct cds_ft_inode *)
 			ft_compressed_node_ptr(s_top)) :
-		cds_ft_item_to_metadata(ft_node_ptr(s_top));
+		cds_ft_item_to_metadata(ft_node_ptr(s_top)));
 
 	/*
 	 * BP (= S_top's parent).  A COMPRESSED BP is in scope: a run is a node
@@ -1715,9 +1793,56 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		 * A co-located external chain is carried by ft_rekey_cow_stop, which
 		 * the MERGE arm skips -- ft_merge_build would have to union that key
 		 * into the destination's own chain, and nothing here has tested it.
-		 * The graft arm takes it.
+		 * The graft arm takes it.  (An INTERNAL S_top's shape only:
+		 * @s_top_meta is NULL for the bare head, whose one key IS the head --
+		 * there is no second, co-located one to union.)
 		 */
-		if (merge_dst && s_top_meta->external_nodes)
+		if (merge_dst && s_top_meta && s_top_meta->external_nodes)
+			return FT_REKEY_UNCOVERED;
+		/*
+		 * THE BARE HEAD IS MERGE-ARM ONLY, deliberately.  An occupied dst
+		 * consumes it with machinery that already speaks external-src:
+		 * ft_merge_build takes S_ext (the head contributes no slots, lands
+		 * as M's external_nodes, and its LIVE back edge rides the commit as
+		 * a deferred edge -> ft_reparent_record's external arm), records NO
+		 * retire for it (app-owned), and returns a fresh union M -- the
+		 * dst-side freshness the coherent reader's witness rests on.  The
+		 * EMPTY-dst graft arm has none of that: it runs ft_rekey_cow_stop
+		 * (nothing to COW here) and ft_store_at_graft_point, whose payload
+		 * back edge is a PLAIN store on the premise the payload is a fresh
+		 * invisible copy -- reader-visible and abort-surviving for a live
+		 * head.  That arm's bare-head leg (record the back edge, skip the
+		 * retire) is a separate increment; until it lands, the shape owes
+		 * UNCOVERED, never a wrong-witness publish.
+		 */
+		if (s_top_external && !merge_dst)
+			return FT_REKEY_UNCOVERED;
+		/*
+		 * ☠ AND NOT ON A RANK-STATS TRIE, until the count walk's BASE is
+		 * fixed.  The union's +count walk starts above the publish parent,
+		 * and where the source's branch point sits ON that chain the walk
+		 * charges its delta into a copy the publish supersedes, so the
+		 * root aggregate ends ONE key light: MEASURED on exactly the shape
+		 * this admission opens -- insert {azm,azn,ayp,q,azq}, then move
+		 * "q" onto the occupied "az" -- cds_ft_count_keys answers 4 for 5
+		 * keys and cds_ft_verify goes RED ("stored 4, computed 5").
+		 *
+		 * ★ THE DEFECT IS NOT THIS ADMISSION'S.  An INTERNAL src whose BP
+		 * is the root loses the count identically at the parent commit, so
+		 * the walk base is a standing bug with its own fix owed (see the
+		 * count-walk note at the merge publish, and the sibling-move twin
+		 * that was fixed at @85c8c8e6).  What IS this admission's is the
+		 * EXPOSURE: before it, this call answered NOT_SUPPORTED and left
+		 * the trie byte-for-byte correct; after it, the same call SUCCEEDS
+		 * and silently corrupts the aggregate.  Trading a clean refusal
+		 * for silent corruption is never a widening worth taking, and a
+		 * count that is merely low reddens no test the user runs -- so the
+		 * refusal stays until the base is right.
+		 *
+		 * Rank-stats OFF -- the default, and test 110's own trie -- keeps
+		 * no aggregate to lose and is unaffected.
+		 */
+		if (s_top_external && ft->rank_stats)
 			return FT_REKEY_UNCOVERED;
 #ifndef FEATURE_FT_MERGE
 		/*
@@ -1947,7 +2072,14 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 			run_keeps_pos = true;
 	}
 
-	cnt = ft_nr_keys_get(s_top_meta);	/* subtree key count (count edges no-op if rank off) */
+	/*
+	 * Subtree key count (count edges no-op if rank off).  A BARE HEAD carries
+	 * exactly ONE key -- a dup chain holds duplicates of that same key, and
+	 * nr_keys counts distinct keys -- which is also what ft_merge_build
+	 * answers for it (*nr_keys_ret = 1 on the leaf arms) and what the
+	 * detach's -@cnt walk must take back from the src ancestors.
+	 */
+	cnt = s_top_external ? 1 : ft_nr_keys_get(s_top_meta);
 
 	/*
 	 * ON the op's persistent handle, not a standalone one: retry aging and
@@ -2547,6 +2679,34 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		 */
 		ft_glue_set_publish(ft, &glue, d_dst.pnf, d_dst.nfp, merged_pub);
 		glue.attached_nf = merged_pub;
+		/*
+		 * ☠ THE DST-FRESHNESS OBLIGATION, STATED AND ASSERTED AT THE
+		 * PUBLISH.  The rekey-coherent reader's two-descent witness
+		 * (ft_lookup_two_descents) rests on every move publishing a FRESH
+		 * library node at the destination attach point -- on this arm the
+		 * union node M ft_merge_build returns -- and that is what licenses
+		 * the BARE-HEAD src admitted above (an app-owned head gets no fresh
+		 * address of its own).  Today the freshness holds by construction:
+		 * the two ft_merge_build exits that return a LIVE node need both
+		 * sides compressed (refused: merge_dst && s_top_compressed) or both
+		 * external (refused: the merge-point gate takes no external D), so
+		 * M is always this op's own allocation.  But the guarantee is
+		 * TEMPORARY BY STATED INTENT: the pigeon -ERANGE arm carries a
+		 * planned sticky-bitmap future (ft-mutation-node.h), and the
+		 * standing direction is to RE-ALLOW IN-PLACE MUTATIONS WITHOUT COW
+		 * with rekey special-cased to COW the parent -- and if that
+		 * special-case is ever missed, the breakage is SILENT (a torn
+		 * descent that matches a clean one returns a wrong answer and no
+		 * gate leg reddens).  So the obligation is pinned HERE, where the
+		 * publish is decided: the record's expected-old validates at the
+		 * flip, so a value that is fresh at record time is fresh at publish
+		 * time or the commit aborts.  ft_glue_is_fresh matches by
+		 * underlying identity, so the KEY_SHORTER wrap and the skip
+		 * re-encode both still answer true.
+		 */
+		FT_REKEY_DST_FRESH_REACH(0);
+		urcu_assert_debug(merged_pub != d_dst.nf &&
+			ft_glue_is_fresh(ft, &glue, merged_pub));
 		/*
 		 * ☠ THE DST DELTA IS WHAT THE UNION ADDED, NOT WHAT THE SRC HELD.
 		 *
@@ -3375,6 +3535,22 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 			ret = -EIO;
 			goto sweep;
 		}
+		/*
+		 * ☠ THE DST-FRESHNESS OBLIGATION, the graft arm's half (the merge
+		 * arm states the full reasoning at its own publish).  Here the
+		 * fresh node at the destination attach point is the RECOMPACTED
+		 * ATTACH PARENT: the reserve recompaction ALWAYS relocates it, and
+		 * @old_recompacted_node is the witness that it did.  The one
+		 * documented exception is the in-place tier -- ft_in_place_ok
+		 * requires @ft->exclusive, "single-writer, NO CONCURRENT READERS",
+		 * so there is no reader to owe a fresh visited-node set to.  If a
+		 * future in-place widening ever reaches this arm outside that
+		 * carve-out, this is the line that turns the silent witness loss
+		 * into a loud one.
+		 */
+		FT_REKEY_DST_FRESH_REACH(1);
+		urcu_assert_debug(gst_st.old_recompacted_node != NULL ||
+			ft_in_place_ok(ft));
 	}
 
 	/*
