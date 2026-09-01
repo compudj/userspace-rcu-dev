@@ -790,6 +790,36 @@ int ft_pigeon_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 	 * That keeps pigeon's O(1) insert/delete; deferred to avoid bundling
 	 * too many changes here (it also needs the verify cross-check and the
 	 * delete bit-clear relaxed for the sticky semantics).
+	 *
+	 * ☠☠ AND IT WOULD BREAK THE IN-TRIE MOVE'S READER COHERENCE, WHICH
+	 * NOTHING HERE SAYS.  The -ERANGE below reads as a purely local
+	 * torn-read concern (bitmap vs nr_child), but a same-trie rekey leans
+	 * on it for something else entirely: the coherent reader validates a
+	 * lookup by running TWO descents and comparing a fold of the node
+	 * ADDRESSES it visited (ft_lookup_two_descents, ft-lookup.h; the folds
+	 * at ft-descent.h).  That is sound only because every move perturbs
+	 * that fold -- and what guarantees the perturbation is THIS arm: the
+	 * destination attach parent gains an occupancy, so it relocates.  Make
+	 * the bitmap sticky and a move whose dst parent is a pigeon node can
+	 * publish no fresh address anywhere on the graft arm, and a torn
+	 * descent becomes indistinguishable from a clean one.
+	 *
+	 * ★ AND THIS IS A PLANNED DIRECTION, not a hypothetical: in-place
+	 * mutation without a COW is meant to be RE-ALLOWED more widely (the
+	 * sticky-hint arm here is one instance; ft_in_place_ok's exclusive-only
+	 * gate is another).  The move's coherence must therefore stop being a
+	 * free ride on this arm BEFORE that happens.  The agreed shape is to
+	 * SPECIAL-CASE THE REKEY so it COWs the parent itself: the destination
+	 * attach parent is the load-bearing one (the src side relocates too but
+	 * is not what the witness needs), and on the merge arm the carrier is
+	 * instead ft_merge_build's fresh union node.  Whoever re-allows in-place
+	 * owes that special case in the same change, plus a publish-time assert
+	 * that the attach node really was superseded by this op -- otherwise the
+	 * breakage is silent, and the gate cannot see it (a torn descent that
+	 * matches a clean one produces no failure, only a wrong answer).
+	 *
+	 * The delete side carries the same dependency
+	 * (ft_popcount_node_replace_ptr / ft_pigeon_node_replace_ptr, -EFBIG).
 	 */
 	if (!ft_in_place_ok(ft) && !defer_parent && !*ptr)
 		return -ERANGE;

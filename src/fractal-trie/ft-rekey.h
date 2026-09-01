@@ -40,6 +40,35 @@
 /* ------------- moved from ft-mutation-node.h ------------- */
 
 /*
+ * ☞ WHAT ACTUALLY GUARANTEES READER COHERENCE FOR A MOVE, and it is NOT this
+ * function.  The coherent reader validates a lookup with TWO descents and a fold
+ * of the node ADDRESSES visited (ft_lookup_two_descents, ft-lookup.h; folds at
+ * ft-descent.h).  That is sound only if every move perturbs the fold -- and the
+ * perturbation is already guaranteed by the RECOMPACT INVARIANTS, on the
+ * DESTINATION side: an occupancy ADD relocates the attach parent (-ERANGE on all
+ * four layout arms of _ft_node_set_nth, pigeon included) and, on the merge arm,
+ * ft_merge_build returns a fresh union node by construction.  The src side
+ * relocates too (a delete recompacts, -EFBIG), though it is not load-bearing.
+ * The single exception is ft_in_place_ok = FEATURE_FT_INSERT_IN_PLACE &&
+ * ft->exclusive -- and an exclusive trie has NO CONCURRENT READERS by contract.
+ *
+ * So the fresh address this function gives @stop is REDUNDANT FOR THE WITNESS.
+ * What it is not redundant for is everything else below: re-parenting @stop's
+ * children, marking the children whose state words the commit parks into,
+ * retiring @stop, and manufacturing a tail for a CUT source (@cut), which has no
+ * node at that depth to copy.  Read the "@stop is retired WHOLE" contract and the
+ * SCOPE note with that split in mind -- and see the ☠☠ warning at the pigeon
+ * -ERANGE arm (ft-mutation-node.h) before assuming the destination-side
+ * guarantee is free.
+ *
+ * ★ IT WILL NOT STAY FREE.  In-place mutation without a COW is a PLANNED
+ * direction, and when it is re-allowed the rekey must be SPECIAL-CASED to COW
+ * the destination attach parent ITSELF rather than inherit it from the mutation
+ * path -- with a publish-time assert that the attach node was superseded by this
+ * op, so the obligation is checked and not merely intended.  Until then this
+ * function's copy is what a CUT source and the child duties need, and the
+ * destination side is what the reader needs.
+ *
  * ft_rekey_cow_stop: identity-preserving COW of a LIVE published node @stop_flag
  * (the "S_top" of a same-trie rekey) into a FRESH-address copy returned UNPUBLISHED
  * in *@stop_prime_ret, re-parenting @stop's direct children onto the copy and
