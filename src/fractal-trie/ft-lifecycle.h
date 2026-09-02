@@ -1100,13 +1100,28 @@ struct cds_ft_stats {
 	struct cds_ft_stats_level level[FT_MAX_DEPTH];
 };
 
-enum cds_ft_status cds_ft_recompute_stats(struct cds_ft *ft)
+/*
+ * The recompute proper, WITHOUT the writer scope: the exact maximum key length
+ * of the keys the trie holds RIGHT NOW, stored over the conservative hint.
+ *
+ * Split out because a caller that is ALREADY inside the writer scope needs it
+ * -- ft_rekey_graft_simple_locked repairs the hint from here before its shape
+ * gate reads it.  CDS_FT_SCOPED_WRITER nests on one trie (@ft_wlock_depth), so
+ * that caller could take it again; the split says which of the two things a
+ * call site wants rather than relying on the nesting.
+ *
+ * ☠ THE EXCLUSION IS THE CALLER'S, and the store LOWERS: a walk that misses a
+ * key (a peer writer inserting a longer one under it) under-states the hint,
+ * and the hint is what bounds the key buffers.  That is the same requirement
+ * cds_ft_recompute_stats documents to its own callers.
+ */
+static
+enum cds_ft_status ft_recompute_max_used_key_len(struct cds_ft *ft)
 {
 	struct cds_ft_iter *iter;
 	enum cds_ft_status status;
 	size_t max_len = 0;
 
-	CDS_FT_SCOPED_WRITER(ft);
 	status = cds_ft_iter_create(ft, &iter);
 	if (status != CDS_FT_STATUS_OK)
 		return status;
@@ -1121,7 +1136,20 @@ enum cds_ft_status cds_ft_recompute_stats(struct cds_ft *ft)
 	if (status < 0)
 		return status;
 	uatomic_store(&ft->max_used_key_len, max_len, CMM_RELAXED);
+	/*
+	 * HINT FIRST, THEN THE WATERMARK OF THE WALK.  A peer raise that lands
+	 * between the two leaves them unequal, which buys one extra walk later
+	 * and never skips a needed one; the reverse order could record "already
+	 * exact" over a value the walk never saw.
+	 */
+	uatomic_store(&ft->max_used_key_len_walked, max_len, CMM_RELAXED);
 	return CDS_FT_STATUS_OK;
+}
+
+enum cds_ft_status cds_ft_recompute_stats(struct cds_ft *ft)
+{
+	CDS_FT_SCOPED_WRITER(ft);
+	return ft_recompute_max_used_key_len(ft);
 }
 
 static

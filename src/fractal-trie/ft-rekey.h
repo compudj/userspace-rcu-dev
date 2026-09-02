@@ -1172,6 +1172,40 @@ static void ft_rekey_dst_fresh_fini(void)
 # define FT_REKEY_DST_FRESH_REACH(arm) do { } while (0)
 #endif
 
+/*
+ * ft-lifecycle.h is included AFTER this unit, and the repair below needs the
+ * scope-less form.  One declaration, one definition, one TU.
+ */
+static enum cds_ft_status ft_recompute_max_used_key_len(struct cds_ft *ft);
+
+/*
+ * WOULD THE LENGTH CHANGE PUSH A MOVED KEY PAST THE GROUP'S LIMIT?
+ *
+ * A moved key K becomes @dst_key || (K minus the @src_key prefix), so its new
+ * length is dst_len + (len(K) - src_len).  len(K) is not known here; the trie's
+ * max_used_key_len HINT bounds it, which makes this a CONSERVATIVE refusal --
+ * it can refuse a move that no real key would overflow, never admit one that
+ * would.
+ *
+ * ★ ONE PLACE DEFINES THE ANSWER.  Two call sites ask this: the shape gate in
+ * ft_rekey_graft_simple_attempt, which refuses on it, and the hint repair in
+ * ft_rekey_graft_simple_locked, which pays for an exact answer when it says
+ * yes.  A second copy of the arithmetic would let the two drift, and a repair
+ * that does not fire on exactly the cases the gate refuses is a repair that
+ * either never runs or runs on every move.
+ */
+static
+bool ft_rekey_len_change_overflows(const struct cds_ft *ft,
+		size_t src_len, size_t dst_len)
+{
+	size_t src_max = uatomic_load(&ft->max_used_key_len, CMM_RELAXED);
+
+	if (dst_len > ft->group->max_key_len)
+		return true;		/* no headroom at all; never underflow below */
+	return src_max > src_len &&
+		src_max - src_len > ft->group->max_key_len - dst_len;
+}
+
 static
 int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		const uint8_t *src_key, size_t src_len,
@@ -1398,14 +1432,9 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 * They were written as rejections, not asserts, for exactly this day.
 	 */
 	if (src_len != dst_len) {
-		size_t src_max;
-
 		if (ft->group->key_len != CDS_FT_LEN_VARIABLE)
 			return FT_REKEY_UNCOVERED;
-		src_max = uatomic_load(&ft->max_used_key_len, CMM_RELAXED);
-		if (src_max > src_len &&
-				src_max - src_len >
-				ft->group->max_key_len - dst_len)
+		if (ft_rekey_len_change_overflows(ft, src_len, dst_len))
 			return FT_REKEY_UNCOVERED;
 	}
 
@@ -4336,6 +4365,68 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 	 */
 	CDS_FT_SCOPED_WRITER(ft);
 
+	/*
+	 * ☠☠ REPAIR THE HINT BEFORE THE SHAPE GATE READS IT -- OR THE TRIE
+	 * BRICKS.
+	 *
+	 * The raise at the bottom of this function is a CONSERVATIVE bound, and
+	 * a conservative bound whose own previous value is its input ACCUMULATES:
+	 * with dst_len > src_len it stores cur + (dst_len - src_len) on EVERY
+	 * committed move, referencing no key that exists.  MEASURED: a loop that
+	 * rekeys the same two 3-byte keys drove max_used_key_len 0 -> 256 in 253
+	 * calls, after which ft_rekey_len_change_overflows refused every further
+	 * unequal-length move FOREVER (ok=253 overflow=147), with the longest key
+	 * in the trie 3 bytes the whole time.
+	 *
+	 * The bound cannot be made both cheap and tight: len(K) for the moved
+	 * subtree is not derivable in O(1) from anything the trie stores, and any
+	 * O(1) bound that is SOUND has to feed on the hint it just wrote.  So pay
+	 * for the exact answer, and pay ONLY where the loose one would refuse --
+	 * one walk per saturation (~1 in 253 moves in the measurement above)
+	 * instead of one per move.  ft_recompute_max_used_key_len is the trie's
+	 * own repair, the one cds_ft_recompute_stats documents for exactly this
+	 * ("when the caller needs an accurate max_used_key_len for a subsequent
+	 * graft validation"); this call site simply stops making the caller ask.
+	 *
+	 * ☠ IT LOWERS, so it needs exclusion -- AND IT HAS IT ON BOTH LOCK MODES,
+	 * which is not what a reading of CDS_FT_SCOPED_WRITER alone suggests.  On
+	 * a COARSE trie that scope is the FT-wide mutex.  On a FINE trie it looks
+	 * inert, but this op entered ft_move_gate_enter first, so ft_bulk_active
+	 * is TRUE and ft_writer_lock_scope_enter RE-TAKES the FT-wide lock
+	 * (fractal-trie-internal.h, G5.25: "while a BULK op is live, a FINE trie
+	 * re-takes the FT-wide lock, so bulk and point writers arbitrate on one
+	 * word again").  Verified under gdb on a default FINE trie at this call:
+	 * ft_wlock_held == ft, ft_wlock_depth == 1, lock_fine true, bulk_state 1.
+	 * A point writer either takes that lock too or sampled the gate clear and
+	 * is covered by its grace period, so the walk sees every key.
+	 *
+	 * ☠☠ AND IT MUST NOT RUN ON EVERY CALL.  The predicate is ALSO true when
+	 * the trie genuinely holds a long key, and a REFUSED move raises nothing
+	 * -- so an unguarded repair re-walks the whole trie under that FT-wide
+	 * lock for a refusal that was correct the first time.  MEASURED at 300k
+	 * keys plus one 255-byte key: 0.005 ms/call unrepaired, 232.6 ms/call
+	 * repaired, and four concurrent point inserters fell from 16,841/s to
+	 * 562/s waiting behind it.  @max_used_key_len_walked is the discriminator:
+	 * a hint still at the value the last walk produced cannot have been
+	 * inflated since, so the refusal is TRUE and there is nothing to repair.
+	 *
+	 * Placement: OUTSIDE the retry loop (the hint does not change under us,
+	 * so re-walking per attempt would be pure cost) and OUTSIDE the txn and
+	 * the per-attempt read pin.  The walk needs a read section of its own --
+	 * it dereferences -- and takes no grace period, so it cannot deadlock
+	 * against the move gate the caller already passed.
+	 */
+	if (src_len != dst_len &&
+			ft->group->key_len == CDS_FT_LEN_VARIABLE &&
+			uatomic_load(&ft->max_used_key_len, CMM_RELAXED) !=
+				uatomic_load(&ft->max_used_key_len_walked,
+					CMM_RELAXED) &&
+			ft_rekey_len_change_overflows(ft, src_len, dst_len)) {
+		flavor->read_lock();
+		(void) ft_recompute_max_used_key_len(ft);
+		flavor->read_unlock();
+	}
+
 #ifdef FT_DEBUG_REKEY_RETRY_CAP
 	ft_rekey_attempts = 0;		/* per MOVE, not per thread lifetime */
 #endif
@@ -4410,12 +4501,17 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 	 * further in between is not lowered.
 	 *
 	 * ★ WHY IT IS SAFE TO DO THIS AFTER THE ONE DECIDE rather than inside it:
-	 * the field is a HINT -- measured, no lookup / inequality / iteration path
-	 * consumes it, only the mutators that maintain it and the public accessor
-	 * cds_ft_max_used_key_len -- so a reader between the flip and this store
-	 * sees the moved keys and a stale hint, not an inconsistency it can act on.
-	 * The keys' own lengths are a property of where the subtree hangs, and that
-	 * moved atomically.
+	 * no lookup / inequality / iteration path consumes the field -- so a reader
+	 * between the flip and this store sees the moved keys and a stale hint, not
+	 * an inconsistency it can act on.  The keys' own lengths are a property of
+	 * where the subtree hangs, and that moved atomically.
+	 *
+	 * ☠ IT IS NOT AN UNCONSUMED HINT, though this comment said so: THIS
+	 * WRITER'S OWN unequal-length gate reads it four thousand lines up
+	 * (ft_rekey_len_change_overflows), and so do the graft / merge overflow
+	 * validations.  Because the store's input is its own previous output it
+	 * ACCUMULATES -- see the repair at the top of this function, which is what
+	 * keeps that accumulation from refusing every later move.
 	 */
 	if (ret == 0 && dst_len > src_len) {
 		size_t cur = uatomic_load(&ft->max_used_key_len, CMM_RELAXED);

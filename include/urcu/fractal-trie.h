@@ -2451,10 +2451,16 @@ unsigned long cds_ft_count_entries(struct cds_ft *ft);
  * cds_ft_max_used_key_len - Return the maximum key length inserted.
  * @ft: The Fractal Trie.
  *
- * Returns the maximum key length that has been successfully inserted
- * into this trie instance. This is a conservative (over-)estimate:
- * it is updated on insert but not decremented on remove or detach.
+ * Returns a bound on the maximum key length currently held by this
+ * trie instance. This is a conservative (over-)estimate: it is
+ * updated on insert but not decremented on remove or detach.
  * Use cds_ft_recompute_stats() to obtain the exact value.
+ *
+ * One case does lower it: a same-trie rekey whose own overflow gate
+ * finds the estimate too coarse to answer recomputes it exactly
+ * first, so a successful unequal-length cds_ft_rekey_* may leave a
+ * SMALLER value than it found. The result is still an upper bound on
+ * every key present, which is all any caller may rely on.
  *
  * Returns 0 if the trie is empty or has never had a key inserted.
  *

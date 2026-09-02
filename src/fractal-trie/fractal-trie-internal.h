@@ -1660,6 +1660,28 @@ struct cds_ft {
 	cds_ft_lookup_iter_fn lookup_gt_fn;
 
 	size_t max_used_key_len;		/* Maximum key length inserted (conservative). */
+	/*
+	 * The value @max_used_key_len held immediately after the last EXACT walk
+	 * (ft_recompute_max_used_key_len), so a repair can tell an INFLATED hint
+	 * from a merely LARGE one.  Equal means "already walked at this value":
+	 * nothing has raised the hint since, so a walk would recompute the same
+	 * number and the refusal it feeds is TRUE, not an artifact.
+	 *
+	 * ☠ WITHOUT IT THE REPAIR IS AN O(n) STALL PER CALL.  The same-trie
+	 * rekey's unequal-length gate is also true whenever the trie genuinely
+	 * HOLDS a long key, and a refused move raises nothing -- so every
+	 * repeated call walked the whole trie under the FT-wide lock, for a
+	 * refusal that was correct the first time.  MEASURED at 300k keys plus
+	 * one 255-byte key: 0.005 ms/call before the repair existed, 232.6
+	 * ms/call with the unguarded repair, and concurrent point inserters fell
+	 * from 16,841/s to 562/s behind the lock.
+	 *
+	 * Written only where @max_used_key_len is written by that same walk, hint
+	 * first: a peer raise landing between the two stores leaves them UNEQUAL,
+	 * which costs one extra walk and never skips a needed one.  Both are
+	 * relaxed; the pair is a heuristic about the hint, not a lock.
+	 */
+	size_t max_used_key_len_walked;
 
 	/*
 	 * The active node-allocation reserve (the bulk-op OOM-avoidance pool for
