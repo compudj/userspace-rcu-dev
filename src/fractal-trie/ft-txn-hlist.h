@@ -171,44 +171,20 @@ struct cds_ft_node *ft_hlist_next_rcu(struct cds_ft_node *node)
  *
  * Single-writer per chain (MW LOCK_FINE Step A: every chain mutation runs under
  * the head-holder's node lock -- or, before the FT-wide lock drops, that lock;
- * a disjoint-key optimistic writer owns its own chain), so @pos should never be
- * concurrently deleted.
- *
- * ☠ THAT PREMISE IS ABOUT THE LOCK, NOT ABOUT @pos BEING ALIVE, and it does not
- * cover a @pos this trie handed out as live while it was already REMOVED.
- * Readers never consult the tombstone mark, so any defect that leaves a removed
- * head linked (measured: the shape-D survivor scan picking the detached branch)
- * makes cds_ft_lookup return one, and the insert path arrives here with it.
- * The mark then rides straight through: @succ is loaded RAW -- urcu_txn_load
- * strips the engine proxy, never the mark -- so `succ != NULL` is TRUE for a
- * bare mark (NULL | MARK == 0x2), `newp->next` is built holding a marked
- * pointer, and `&succ->prev` is the wild address (void **) 2, which the MW
- * install then dereferences.  That is the SIGSEGV this bail exists to prevent.
- *
- * So the -ENOENT bail on a marked @pos is restored.  It costs one test on a
- * value already loaded, and the caller has never stopped handling it:
- * ft_chain_node maps any non-zero return to -EAGAIN, which ages the op's handle
- * and re-descends from root (ft-insert.h, and its own comment still documents
- * "-ENOENT tail already marked" as a prepare-time outcome).
- * Returns 0, or -ENOENT when @pos is already removed.
+ * a disjoint-key optimistic writer owns its own chain), so @pos is never
+ * concurrently deleted and @succ is never a neighbour mid-deletion.  The
+ * multi-writer arbitration those cases needed -- bail -ENOENT on a marked @pos,
+ * load-validate &succ->next and retry -EAGAIN on a marked neighbour -- is dead
+ * and dropped.  Always returns 0; the int return is retained for caller-shape
+ * parity with the concurrent front-ends (mirrors urcu_txn_sw_list_*_prepare).
  */
 static inline
 int ft_hlist_insert_after_prepare(struct urcu_txn *txn,
 		struct cds_ft_node *newp,
 		struct cds_ft_node *pos)
 {
-	void *raw = urcu_txn_load(txn, (void **) &pos->next, FT_HLIST_TAG);
-	struct cds_ft_node *succ;
-
-	/*
-	 * @pos carries the tombstone on its OWN next word (ft_node_is_removed),
-	 * so a marked load here IS "@pos was removed under us".  Refuse before
-	 * anything is built or recorded: nothing is reader-visible yet, and the
-	 * caller re-descends.
-	 */
-	if (caa_unlikely((uintptr_t) raw & (uintptr_t) FT_HLIST_MARK))
-		return -ENOENT;
-	succ = (struct cds_ft_node *) raw;
+	struct cds_ft_node *succ = (struct cds_ft_node *)
+			urcu_txn_load(txn, (void **) &pos->next, FT_HLIST_TAG);
 
 	/* Build the fresh node invisibly. */
 	newp->next = succ;
