@@ -549,13 +549,81 @@ enum cds_ft_status ft_ineq_descend(struct cds_ft *ft,
 				(struct cds_ft_inode_flag *) iter->node;
 			struct cds_ft_inode_flag *holder =
 				ft_get_parent_rcu(ft, cur);
+			unsigned int cont_rewind = 0;
 
 			if (holder && !ft_node_external(holder) &&
 			    ft_node_external_nodes(holder) ==
-					(struct cds_ft_node *) iter->node)
+					(struct cds_ft_node *) iter->node) {
 				node_flag = holder;
-			else
+			} else if (holder && !ft_node_external(holder) &&
+					!ft_node_compressed(holder) &&
+					!ft_node_skip_compressed(holder) &&
+					(ft_node_get_nth_reanchor(ft, holder,
+						input_key[key_depth - 2],
+						&cont_rewind) != cur ||
+					 cont_rewind)) {
+				/*
+				 * ☠ NEITHER SHAPE: DO NOT INFER "SLOT LEAF"
+				 * FROM THE FAILED external_nodes EQUALITY.
+				 *
+				 * The arm below reads a failed equality as "then
+				 * @cur is a leaf child", which is a negative
+				 * inference over two DIFFERENT shapes.  It is
+				 * wrong for a PREFIX-KEY HEAD whose holder has
+				 * just had its external_nodes cleared by a
+				 * concurrent remove (ft-remove.h, the in-place
+				 * one-key clear): the head is still linked and
+				 * still reachable, the equality fails, and the
+				 * head is then treated as a leaf.  A leaf's
+				 * holder sits one level ABOVE it; a prefix-key
+				 * head's holder sits AT its own depth.  So the
+				 * going-up seed below is planted one level too
+				 * shallow, and every key the iteration
+				 * reconstructs from there is short by one or
+				 * more LEADING bytes -- on the correct node,
+				 * with CDS_FT_STATUS_OK, and cached so the next
+				 * step inherits it.
+				 *
+				 * Ask the POSITIVE question instead: a genuine
+				 * slot leaf is the value the holder's slot for
+				 * this key's last byte actually holds -- asked
+				 * with the READER accessor
+				 * (ft_node_get_nth_reanchor; ft_node_get_nth is
+				 * documented writer/debug-only), and a non-zero
+				 * @rewind is itself a "cannot classify", handled
+				 * exactly as the descent's own reanchor call
+				 * below handles it.
+				 *
+				 * ☠ THE INDEX IS @key_depth - 2, NOT - 1.
+				 * @key_depth is key_len + 1 (see its assignment),
+				 * and the slow-path loop consumes
+				 * input_key[level - 1] for level in
+				 * 1 .. key_depth - 1, so the DEEPEST dispatched
+				 * byte -- the one a leaf's holder keys on -- is
+				 * input_key[key_depth - 2].  @key_depth - 1 is
+				 * one PAST the key: it reads the buffer's
+				 * FT_KEY_READABLE_PAD on the buffer source and
+				 * runs off the allocation on the IN-LEAF source
+				 * (ASAN heap-buffer-overflow), and its stale byte
+				 * mismatches most live leaves, dumping ~70% of
+				 * leaf continuations onto slow_path.  When
+				 * neither shape answers, the cached position
+				 * cannot be classified at all -- re-descend from
+				 * the root, which is authoritative.
+				 *
+				 * Compressed / skip-compressed holders keep the
+				 * old arm verbatim: they are not implicated
+				 * (measured zero on the failing leg) and the
+				 * slot question is not asked the same way of a
+				 * run.  A holder that is absent or external
+				 * likewise falls through unchanged.
+				 */
+				node_flag = ft_root_dereference_prefetch(ft);
+				iter_key = input_key;
+				goto slow_path;
+			} else {
 				node_flag = cur;
+			}
 		}
 		/*
 		 * If the cached path entry is a compressed node, the
