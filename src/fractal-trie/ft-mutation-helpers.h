@@ -6046,21 +6046,25 @@ int ft_flip_txn_resolve_prio(struct ft_flip_txn *t, void **src, void **out)
  * the flight-recorder ring, abort -- the last events before the abort walk
  * to whoever published the edge (skill: lttng-tracing-root-cause-analysis).
  */
+/*
+ * ONE OBSERVATION of the round trip.  True when @cn looks WIRED: its parent's
+ * slot holds its plain flag or its SKIP form, or it is already tombstoned (a
+ * dead-but-RCU-live target is legal to hold).  Hands the words back for the
+ * report.
+ */
 static __attribute__((unused))
-void ft_trace_miswire_check(struct cds_ft *ft,
-		struct cds_ft_inode_flag *edge, unsigned int site)
+bool ft_trace_miswire_observe(struct cds_ft *ft,
+		struct cds_ft_compressed_node *cn, uintptr_t *state_out,
+		struct cds_ft_inode_flag **rt_parent_out,
+		struct cds_ft_inode_flag **rt_val_out)
 {
-	struct cds_ft_compressed_node *cn;
-	struct cds_ft_metadata *meta;
-	uintptr_t state;
+	struct cds_ft_metadata *meta =
+		cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
 	struct cds_ft_inode_flag *rt_parent, *rt_val = NULL;
 	struct cds_ft_inode_flag **rt_slotp;
-	bool bad;
+	uintptr_t state;
+	bool self_rt = false;
 
-	if (!ft_node_compressed(edge))
-		return;
-	cn = ft_compressed_node_ptr(edge);
-	meta = cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
 	state = (uintptr_t) urcu_txn_read((void **) &meta->state,
 			FT_STATE_PROXY);
 	rt_parent = ft_resolve_flip_proxy(ft_parent_node(
@@ -6069,20 +6073,13 @@ void ft_trace_miswire_check(struct cds_ft *ft,
 	if (rt_slotp)
 		rt_val = ft_resolve_flip_proxy(rcu_dereference(*rt_slotp));
 	/*
-	 * NOT a criterion: a set tombstone alone.  Trace analysis (2026-07-06)
-	 * proved that catch benign: a descent that read the slot just before a
-	 * peer's retire flip legally holds the dead-but-RCU-live target for a
-	 * few hundred ns, and its own commit then aborts on the expected-old
-	 * CAS.  A LIVE legit cn must round-trip to ITSELF: its parent's slot
-	 * holds either its plain flag or its SKIP form (which names the
-	 * external head -- resolve it back to the cn to compare).  A live
-	 * target that round-trips ANYWHERE ELSE is corruption: a mis-tagged
-	 * edge to an internal node, or recycled memory whose metadata walks
-	 * off into the weeds (the len byte alone cannot discriminate --
-	 * uint8_t never exceeds FT_MAX_KEY_LEN).
+	 * A LIVE legit cn round-trips to ITSELF: its parent's slot holds its
+	 * plain flag or its SKIP form (which names the external head -- resolve
+	 * it back to compare).  A TOMBSTONE alone is not a criterion: a descent
+	 * that read the slot just before a peer's retire flip legally holds the
+	 * dead-but-RCU-live target, and its own commit aborts on the
+	 * expected-old CAS.
 	 */
-	bool self_rt = false;
-
 	if (rt_val) {
 		if (ft_node_ptr(rt_val) == (void *) cn &&
 		    ft_node_compressed(rt_val))
@@ -6093,17 +6090,82 @@ void ft_trace_miswire_check(struct cds_ft *ft,
 			self_rt = true;
 #endif
 	}
-	bad = cn->len == 0 ||
-		(!(state & FT_STATE_TOMBSTONE) && !self_rt);
-	if (caa_likely(!bad))
+	*state_out = state;
+	*rt_parent_out = rt_parent;
+	*rt_val_out = rt_val;
+	return self_rt || (state & FT_STATE_TOMBSTONE);
+}
+
+/*
+ * ☠☠ THIS DETECTOR USED TO ABORT ON ITS OWN TORN READ, on every default
+ * tracing build -- 321 times in one ft_inv suite, the first of them killing the
+ * run.  It was therefore unrunnable, and the mis-wire campaign it was built for
+ * had no instrument.
+ *
+ * The round trip is FIVE SEPARATE LOADS (state, parent word, offset word,
+ * parent slot, and for a skip form the child's back edge).  A compressed split
+ * moves ALL of them in ONE flip, so an observation straddling that commit sees
+ * a mixture of old and new words and can conclude anything.  Its own tombstone
+ * exemption cannot cover this: the state word carrying the tombstone is
+ * LATE-TAGGED (urcu_txn_desc_set_late_tag(..., FT_STATE_PROXY)) and
+ * urcu_txn_settle writes late words in a SECOND pass -- so the structural words
+ * read here already say NEW while the bit that would forgive them is still
+ * unsettled.  The exemption is blind to exactly its own failure window.
+ *
+ * ☞ MEASURED (2026-09-02, each arm in its own memcg): 1,115 detections on test
+ * 26 and 321 over the full suite, and EVERY one converged on the FIRST re-read
+ * -- mean 379 ns, max 1.26 us, ZERO stuck.  Every settled state was
+ * TOMBSTONE|nr_child=1: the node really was being retired.  213 of the 1,115
+ * caught the parent slot holding a PARKED PROXY -- the straddle in the act.
+ * And nothing writes through the edge: both consumption sites acquire the
+ * node's lock (refused on PROXY|TOMBSTONE|LOCK) or carry an expected-old that
+ * re-validates.
+ *
+ * So RE-OBSERVE until the words agree, and report only a PERSISTENT
+ * disagreement.  A real mis-wire -- a compressed edge onto a live internal
+ * node, or recycled metadata -- never settles, so it still fires.  The cap is
+ * generous against the measured microsecond and is a CAP, not a spin: a
+ * detector that hangs reports nothing at all.
+ */
+#define FT_MISWIRE_SETTLE_TRIES	10000
+
+static __attribute__((unused))
+void ft_trace_miswire_check(struct cds_ft *ft,
+		struct cds_ft_inode_flag *edge, unsigned int site)
+{
+	struct cds_ft_compressed_node *cn;
+	struct cds_ft_inode_flag *rt_parent = NULL, *rt_val = NULL;
+	uintptr_t state = 0;
+	unsigned int tries;
+
+	if (!ft_node_compressed(edge))
 		return;
+	cn = ft_compressed_node_ptr(edge);
+	/* len == 0 is never a valid path and never settles into one. */
+	if (caa_likely(cn->len != 0 && ft_trace_miswire_observe(ft, cn, &state,
+			&rt_parent, &rt_val)))
+		return;
+	for (tries = 0; tries < FT_MISWIRE_SETTLE_TRIES; tries++) {
+		caa_cpu_relax();
+		if (cn->len != 0 && ft_trace_miswire_observe(ft, cn, &state,
+				&rt_parent, &rt_val))
+			return;		/* a straddled commit, now settled */
+	}
+	/*
+	 * ☞ FREEZE BEFORE THE SNAPSHOT.  Without it the peers keep tracing while
+	 * `lttng snapshot record` runs and wrap every per-CPU ring: the one
+	 * capture taken that way put the miswire at line 3,073 of 43,338 with
+	 * nothing left on the culprit's addresses.
+	 */
+	FT_TRACE_FREEZE();
 	FT_TP(miswire, site, (const void *) edge, (const void *) cn,
 		(unsigned int) cn->len, state, (const void *) rt_parent,
 		(const void *) rt_val);
 	fprintf(stderr, "FT MISWIRE site %u edge %p target %p len %u "
-		"state %#lx rt_parent %p rt_val %p\n",
+		"state %#lx rt_parent %p rt_val %p (persisted %u re-reads)\n",
 		site, (void *) edge, (void *) cn, (unsigned int) cn->len,
-		(unsigned long) state, (void *) rt_parent, (void *) rt_val);
+		(unsigned long) state, (void *) rt_parent, (void *) rt_val,
+		tries);
 	(void) system("lttng snapshot record 1>&2");
 	abort();
 }

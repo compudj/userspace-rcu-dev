@@ -2245,6 +2245,12 @@ void ft_trace_pub_check(struct cds_ft *ft,
 	if (caa_likely(cn->len != 0 && !(state & FT_STATE_TOMBSTONE) &&
 			rt_slotp == slot))
 		return;
+	/*
+	 * ☞ FREEZE BEFORE THE SNAPSHOT, as ft_trace_miswire_check does: peers
+	 * that keep tracing while `lttng snapshot record` runs wrap every
+	 * per-CPU ring and leave the culprit's window overwritten.
+	 */
+	FT_TRACE_FREEZE();
 	FT_TP(miswire, site, (const void *) nf, (const void *) cn,
 		(unsigned int) cn->len, state, (const void *) rt_parent,
 		(const void *) rt_slotp);

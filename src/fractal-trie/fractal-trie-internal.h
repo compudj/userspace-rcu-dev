@@ -1002,8 +1002,11 @@ struct ft_pub_rec {
 /*
  * Per-node MCAS state word (struct cds_ft_metadata.state) bit layout.
  * bit 0 = proxy (in-band flip marker), bit 1 = tombstone (LIVE->DEAD),
- * bits 2-10 = nr_child, bits 11-18 = parent_slot_offset, bit 19 = LOCK
+ * bits 2-10 = nr_child, bits 11-18 FREE, bit 19 = LOCK
  * (the reversible per-node writer lock; bits 20+ free).
+ * ☞ bits 11-18 no longer hold parent_slot_offset -- it moved to its own word
+ * (cds_ft_metadata::parent_slot_offset); see the FT_PSO_* block below, which is
+ * where that split and its reason are recorded.
  * See doc/design/mcas-multiwriter-readiness.md §4.2 and, for bit 19,
  * doc/design/mw-writer-lock-escalation-model.md §0/§2.
  */
@@ -1172,10 +1175,12 @@ struct cds_ft_metadata {
 	 *                                 lets the scalar ride the flip-latch).
 	 *   bit 1   FT_STATE_TOMBSTONE -- one-way LIVE->DEAD deleted latch (§4.B).
 	 *   bits 2-10  nr_child        -- live-child count (max 256, 9 bits).
-	 *   bits 11-18 parent_slot_offset -- pointer-stride offset of this node's
-	 *                                 slot in its parent body (8 bits), so a
-	 *                                 re-home commits parent + offset as one
-	 *                                 atomic state edge.
+	 *   bits 11-18 FREE -- they used to hold parent_slot_offset, which now
+	 *                                 lives in its OWN word (@parent_slot_offset
+	 *                                 below): a word cannot be owned by two
+	 *                                 locks, and the offset is PARENT-owned
+	 *                                 while this word is node-owned.
+	 *   bit 19     FT_STATE_LOCK  -- the reversible per-node writer lock.
 	 * Access nr_child / parent_slot_offset ONLY via the ft_meta_nr_child* /
 	 * ft_meta_parent_slot_offset* helpers -- they mask their own field and
 	 * preserve the others; never read/write the word directly.
