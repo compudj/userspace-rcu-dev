@@ -13859,18 +13859,41 @@ publish_done:
 						g->txn->pending_pub_node)) :
 				cds_ft_item_to_metadata(
 					ft_node_ptr(g->txn->pending_pub_node));
-			struct cds_ft_metadata *om =
-				ft_node_compressed(g->publish_parent) ?
-				cds_ft_item_to_metadata((struct cds_ft_inode *)
-					ft_compressed_node_ptr(
-						g->publish_parent)) :
-				cds_ft_item_to_metadata(
-					ft_node_ptr(g->publish_parent));
-
 			ft_nr_keys_store(ft, sm,
 				ft_nr_keys_get(sm) + g->count_delta,
 				CMM_RELAXED);
-			count_base = ft_parent_node(om->parent_word);
+			/*
+			 * ☠ START THE WALK ABOVE THE NODE JUST CREDITED, and
+			 * take that parent from the SURVIVOR (@sm), never from
+			 * the retired @publish_parent.  The direct store above
+			 * has already accounted for @pending_pub_node itself;
+			 * the walk exists only to charge its ANCESTORS, so it
+			 * must begin at the survivor's own stable parent.
+			 *
+			 * Deriving it from the retired copy instead assumes that
+			 * copy's parent SURVIVES this commit -- true for the
+			 * recompaction producer (both copies hang off one
+			 * unchanged parent) and FALSE for the chain-compress
+			 * fold, where @publish_parent's parent is the very
+			 * boundary the collapse absorbs into @pending_pub_node.
+			 * The walk then follows that boundary to its survivor
+			 * (ft_flip_txn_record_count_parent resolves a
+			 * same-commit relocation at every hop) and lands back on
+			 * the node the store above already credited -- charging
+			 * @count_delta TWICE.
+			 *
+			 * MEASURED both ways, order statistics on, both list
+			 * modes: on the recompaction shape ({q,wam,wan,wbx,wby,
+			 * wcz}, rekey "wb" <- "wa") the two bases are the SAME
+			 * ADDRESS, so this is byte-identical there; on the
+			 * chain-compress fold they DIFFER, and the retired-copy
+			 * base makes the merged node store 7 where verify
+			 * computes 5 -- over by exactly the moved count.
+			 *
+			 * (Dropping that derivation is what retired the local
+			 * @om metadata decode this arm used to keep.)
+			 */
+			count_base = ft_parent_node(sm->parent_word);
 		}
 		ft_flip_txn_record_count_parent(ft, g->txn, count_base,
 			g->count_delta);

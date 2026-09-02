@@ -810,6 +810,43 @@ void ft_chain_compress_register_retire(struct ft_flip_txn *txn,
 }
 
 /*
+ * The DEEP pending-publish shape, asked identically by the caller's shape-D gate
+ * and by the collapse itself so the two can never drift apart.
+ *
+ * The shallow shape @pending_child covers is "the BOUNDARY's own survivor slot
+ * IS the caller txn's pending forward publish target".  This is the same
+ * collision ONE COMPRESSED LEVEL DEEPER: the survivor is a compressed node whose
+ * OWN child slot is that target.  The collapse absorbs that node's run into the
+ * merged node, so the merged node's child is taken from @child_cn->child -- and
+ * that is precisely the slot the caller's commit is about to overwrite with its
+ * fresh cluster top.  Fusing around the COMMITTED occupant there builds the
+ * merged run on a node the same commit retires and publishes the moved cluster
+ * into a slot of the node this collapse replaces, stranding the whole moved
+ * subtree (measured: rekey_merge over a multi-level survivor chain loses both
+ * moved keys, and the committed occupant's re-parent collides with the glue's
+ * free-list tombstone on one state word -- MW here, SW there).
+ *
+ * Deliberately asked on the RESOLVED compressed pointer rather than on the slot
+ * the boundary holds: the boundary's flag may be the skip-encoded spelling of
+ * the same node, and it is the node's own child WORD ADDRESS that the caller
+ * armed.  A build without FEATURE_FT_COMPRESS has no compressed survivor and so
+ * never takes this arm -- which is why the ablated builds never showed the loss.
+ */
+static inline
+bool ft_chain_compress_deep_pending(struct cds_ft_inode_flag *survivor,
+		const struct ft_flip_txn *txn)
+{
+	struct cds_ft_compressed_node *cn;
+
+	if (!survivor || !txn || !txn->pending_pub_slot)
+		return false;
+	if (!ft_node_compressed(survivor))
+		return false;
+	cn = ft_compressed_node_ptr(survivor);
+	return &cn->child == txn->pending_pub_slot;
+}
+
+/*
  * @iter_depth is the boundary's byte-depth and @ctx the op's lock context: the
  * whole collapsed chain is a lock-set, and its members anchor by depth.  The set
  * straddles the boundary -- parent_CN and pp lie ABOVE it, the surviving child
@@ -902,6 +939,14 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 	 */
 	struct cds_ft_inode_flag *build_child =
 		pending_child ? pending_child : surviving_child;
+	/*
+	 * The DEEP spelling of the same substitution (see
+	 * ft_chain_compress_deep_pending): set once the lock-set arm has derived
+	 * @child_cn and the plan re-validation has ratified the survivor, and
+	 * from there it steers three things -- the merged node's child value, the
+	 * PLAIN back edge that value takes, and the fold report to the glue.
+	 */
+	bool deep_fold = false;
 
 	assert(surviving_child);
 	/* The substitution exists only on the fold; the caller gates both. */
@@ -1181,6 +1226,18 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 			ft_flip_txn_destroy(txn);
 		return -EAGAIN;
 	}
+	/*
+	 * Ask the DEEP shape only now: @child_cn is derived by whichever lock-set
+	 * arm ran, and the re-validation immediately above is what makes
+	 * @surviving_child (hence @build_child) the value the trie still holds.
+	 * The two substitutions are mutually exclusive by construction -- one
+	 * pending slot cannot be both the boundary's survivor slot and the
+	 * survivor's own child slot -- and the caller gates them as one if/else.
+	 */
+	deep_fold = record_only && child_cn &&
+		ft_chain_compress_deep_pending(build_child, shared_txn);
+	assert(!(deep_fold && pending_child));
+
 	parent_len = parent_cn ? parent_cn->len : 0;
 	child_len = child_cn ? child_cn->len : 0;
 	merged_len = parent_len + 1 + child_len;
@@ -1224,7 +1281,16 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 				ft_flip_txn_destroy(txn);
 			return -EAGAIN;
 		}
-		new_cn->child = child_child;
+		/*
+		 * DEEP FOLD: @child_cn->child IS the caller's pending forward
+		 * publish target, so the value the merged node must carry is the
+		 * cluster top that commit installs there -- never @child_child,
+		 * the occupant the same commit retires.  The proxy check above is
+		 * kept unconditionally: a peer parked on this word is contention
+		 * whichever value we are about to take.
+		 */
+		new_cn->child = deep_fold ? shared_txn->pending_pub_val
+					  : child_child;
 	} else {
 		new_cn->child = build_child;
 	}
@@ -1353,7 +1419,7 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		 * the pre-reserved @txn (ft_ord_cell_flip_into), so it is
 		 * allocation-free past this point and cannot fail.
 		 */
-		if (pending_child) {
+		if (pending_child || deep_fold) {
 			/*
 			 * FOLD substitution: the child is the FRESH, UNPUBLISHED
 			 * cluster top -- build-invisible until the caller's one
@@ -1505,7 +1571,7 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		 * reclaiming @new_cn, and each retry creates a fresh txn with
 		 * these fields cleared.
 		 */
-		if (pending_child) {
+		if (pending_child || deep_fold) {
 			txn->pending_pub_folded = true;
 			txn->pending_pub_node = new_cn_flag;
 		}
@@ -2967,6 +3033,41 @@ int ft_detach_node(struct cds_ft *ft,
 					 */
 					if (ft_node_compressed(fold_pending) ||
 							ft_node_skip_compressed(fold_pending)) {
+						ret = -EDOM;
+						goto end;
+					}
+				} else if (s_child && record_only && shared_txn &&
+						ft_chain_compress_deep_pending(
+							s_child, shared_txn)) {
+					/*
+					 * The SAME collision ONE COMPRESSED LEVEL
+					 * DEEPER: the survivor is a compressed node
+					 * whose own child slot is this txn's pending
+					 * publish target, so the merged node's child
+					 * -- normally taken from that very slot --
+					 * must come from the pending value instead.
+					 * The collapse does that substitution itself
+					 * (it is the only frame that has @child_cn);
+					 * what MUST happen here, before any
+					 * side-effect, is the same refusal the
+					 * shallow arm makes.
+					 *
+					 * ☠ A COMPRESSED pending value cannot be the
+					 * merged node's child: the merged node IS
+					 * compressed, and two adjacent compressed
+					 * nodes are not a canonical form (cds_ft_verify
+					 * rejects it).  The committed occupant this
+					 * substitutes for can never be compressed for
+					 * exactly that reason, so the substitution
+					 * would be the only way to produce the shape.
+					 * Refuse the whole move terminally with the
+					 * rekey's carve-out code, as the shallow arm
+					 * does -- never publish it.
+					 */
+					if (ft_node_compressed(
+							shared_txn->pending_pub_val) ||
+							ft_node_skip_compressed(
+							shared_txn->pending_pub_val)) {
 						ret = -EDOM;
 						goto end;
 					}
