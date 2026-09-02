@@ -3316,7 +3316,13 @@ const char *cds_ft_status_to_string(enum cds_ft_status status)
 	case CDS_FT_STATUS_INTEGRITY_ERROR:
 		return "Integrity verification failure";
 	case CDS_FT_STATUS_NOT_SUPPORTED:
-		return "Feature not compiled in";
+		/*
+		 * The enum documents BOTH halves ("unavailable for this trie's
+		 * configuration ... or feature not compiled in"); the string used
+		 * to name only the second, so a SHAPE refusal read as a build
+		 * problem and sent the reader looking for a missing -D.
+		 */
+		return "Unsupported for this trie or shape";
 
 	default:
 		return "Unknown status value";

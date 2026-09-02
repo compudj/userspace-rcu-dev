@@ -3096,10 +3096,33 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		goto bail_build;
 	}
 	/*
-	 * The ALIASING terms are -EINVAL: they say the src junction IS the node
-	 * the graft retires, which no fallback writer expresses -- and two DLM
-	 * tests pin that code as the "refused cleanly, permanently, before any
-	 * mutation" answer.  BP == the graft's publish PARENT is NOT among them:
+	 * ☠ THESE TERMS ARE NOT ARGUMENT ERRORS, AND THEY USED TO ANSWER LIKE
+	 * ONE.  They say the src junction IS the node the graft retires, which no
+	 * fallback writer expresses -- so the answer must be TERMINAL (no
+	 * fallback), and -EINVAL was reached for that property.  But -EINVAL is
+	 * this file's ARGUMENT code, documented above as "the caller got it wrong
+	 * and NO STATE OF THE TRIE would make the call legal", and that is
+	 * demonstrably false here: `rekey_merge(dst="zwe", src="zhe")` on
+	 * {zhelloa,zhellob,zq,za} refuses on -DNO_FEATURE_FT_COMPRESS and SUCCEEDS
+	 * on the default build, same arguments.  Compression collapses the
+	 * one-child chain so the src junction sits one level below the boundary;
+	 * without it the detach must elevate and term 4 (d_src.ppnf == graft_c)
+	 * fires.  The condition is a property of the SHAPE, not of the arguments.
+	 *
+	 * -ENOTSUP is the code that carries both halves: TERMINAL in the
+	 * dispatcher exactly as -EINVAL was (no fallback is attempted), and
+	 * surfaced as CDS_FT_STATUS_NOT_SUPPORTED -- which is already what the
+	 * sibling shape at the root-junction gate answers.  What is served is
+	 * UNCHANGED; only the name of the refusal is.
+	 *
+	 * ☞ The old comment claimed "two DLM tests pin that code".  Checked, twice
+	 * and independently: test_rekey_merge_colocated_chain_refused and
+	 * test_rekey_colocated_external pin the MERGE arm's co-located -EINVAL,
+	 * and the only other INVALID_ARGUMENT rekey assertions are the genuine
+	 * argument ones (overlapping / prefix keys, and the speculative-trie
+	 * attribute gate on an EMPTY trie).  Nothing pins these four terms.
+	 *
+	 * BP == the graft's publish PARENT is NOT among them:
 	 * the recompaction fold carries that shape (see @pending_pub_slot).
 	 *
 	 * NEITHER IS BP == the graft CHILD.  Under a NOSPLIT prep the graft
@@ -3129,7 +3152,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 				prep != FT_GRAFT_PREP_NOSPLIT &&
 				!glue.old_dir_dropped) ||
 			d_src.ppnf == graft_c) {
-		ret = -EINVAL;
+		ret = -ENOTSUP;		/* shape, terminal -- see above */
 		goto bail_build;
 	}
 	/*
