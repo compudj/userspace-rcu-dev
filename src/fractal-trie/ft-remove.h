@@ -2177,10 +2177,49 @@ int ft_detach_node(struct cds_ft *ft,
 			 * Find the key byte for replace_ptr.  Only needed
 			 * for internal parents (compressed handled
 			 * separately below).
+			 *
+			 * ☠ A MISS IS A STALE PLAN, NOT A CAN'T-HAPPEN.  The
+			 * reverse lookup compares the slot's live value against
+			 * @*detach_node_flag_ptr by RAW IDENTITY across two
+			 * separate loads of the same word, and this climb runs
+			 * PRE-FENCE: a peer commit on that slot lands between
+			 * them and every slot mismatches, so the lookup returns
+			 * false.  Its header calls that "should not happen on a
+			 * well-formed trie" -- true single-writer, and why the
+			 * result went unchecked.
+			 *
+			 * Left unchecked it is SILENT AND FATAL: @n keeps its
+			 * initialiser 0, and the shape-D survivor scan below
+			 * skips byte @n to exclude the child being detached.
+			 * With @n == 0 it excludes nothing and takes the FIRST
+			 * live child -- the detached branch itself.  The
+			 * post-fence re-validation cannot catch it (it only asks
+			 * that @surviving_byte still maps to @surviving_child,
+			 * which is trivially true of the detached child), so the
+			 * collapse fuses around the very head this commit
+			 * freezes: the real sibling's key is ORPHANED and a
+			 * REMOVED node stays reachable.  Readers never consult
+			 * the removed mark, so cds_ft_lookup returns that
+			 * tombstone as live; the next insert onto it records
+			 * slot (void **) 2 from a marked `next`, and the MW
+			 * install dereferences it.
+			 *
+			 * Do NOT retry the lookup in place: a retried find_child
+			 * succeeds (measured 50,590 of 50,590 misses are
+			 * transient) but then names the PEER'S NEW child, a
+			 * subtree this climb never counted.  Abandoning the plan
+			 * is the only correct response.
+			 *
+			 * MEASURED on a build that widens the miss-to-scan window
+			 * (a 10,000-iteration cpu_relax on the miss path, nothing
+			 * else), exponential spacing, two arms differing by this
+			 * bail alone: 64 of 96 runs SEGV without it, 0 of 96
+			 * with it.
 			 */
-			if (!ft_node_compressed(cur))
-				ft_node_find_child(ft, cur, *detach_node_flag_ptr,
-					&n, NULL);
+			if (!ft_node_compressed(cur) &&
+					caa_unlikely(!ft_node_find_child(ft, cur,
+						*detach_node_flag_ptr, &n, NULL)))
+				return -EAGAIN;	/* stale plan: re-descend */
 			/*
 			 * PLAN -> COMMIT window (-DFT_DELAY_INJECT only, no-op
 			 * otherwise).  The decision "this ancestor keeps a child,
