@@ -8699,7 +8699,7 @@ unsigned int ft_ord_cell_swap_edges(struct cds_ft *ft,
  * back-edges + the retired cell's deletion mark + the head/tail endpoint
  * repairs).  A caller that must pre-reserve its flip-txn sizes it to this.
  */
-#define FT_ORD_CELL_SWAP_PUBLISH_MAX_EDGES	7
+#define FT_ORD_CELL_SWAP_PUBLISH_MAX_EDGES	8	/* + the retired prefix head's detached-prefix mark */
 
 /*
  * Replace touching up to 2 reader-visible structural slots, fused with the head
@@ -8738,6 +8738,76 @@ int ft_ord_cell_swap_publish_multi(struct cds_ft *ft,
 		edges[n++] = sedges[i];
 	if (new_cell)
 		n = ft_ord_cell_swap_edges(ft, old_cell, new_cell, edges, n);
+	/*
+	 * The swapped-out head leaves the trie (a promote's removed head, a
+	 * replace's old head) while parked readers still hold @old_cell.  When
+	 * that head was the holder's PREFIX head -- the forward edge is the
+	 * holder's own external_nodes word -- the holder's external_nodes now
+	 * names the swapped-in head, and the up-walk from @old_cell could no
+	 * longer tell it was a prefix head: mark the retired cell's parent word
+	 * in this same flip (FT_ORD_PARENT_DETACHED_PREFIX; see
+	 * ft_rebuild_key_upwalk).  A slot head (a body slot, a compressed
+	 * cn->child) needs no mark: its byte is right either way.
+	 */
+	if (new_cell && n_sedge >= 1) {
+		/*
+		 * The holder is derived from the retired cell itself, not from
+		 * the edge's @owner (a replace's hand-built sedge names none):
+		 * a prefix head hangs at an INTERNAL holder, whose
+		 * external_nodes word is then the forward edge's slot.
+		 */
+		struct cds_ft_inode_flag *old = txn ?
+			(struct cds_ft_inode_flag *) urcu_txn_load(
+				ft_flip_txn_handle(txn),
+				(void **) &old_cell->parent, FT_FLIP_PROXY_TAG) :
+			ft_resolve_flip_proxy(rcu_dereference(old_cell->parent));
+		struct cds_ft_inode_flag *holder = ft_parent_node(old);
+		/*
+		 * ☠ THE MARK IS A BIT IN A POINTER, so it may only ever be OR'ed
+		 * into a word that IS an internal-node flag: bit 4 is ADDRESS on a
+		 * compressed node (FT_ALLOC_ORDER_MIN, 16 B) and on the trie stamp.
+		 * @holder establishes that for the node; ask @old too, because the
+		 * OR below is on @old.
+		 *
+		 * ☠ AND AN ALREADY-MARKED @old IS A STALE PLAN, not an invariant
+		 * violation.  This word is PEER-MUTABLE, so asserting on it would
+		 * turn a lost race into an abort() the day the FT-wide writer lock
+		 * drops.  Decline to record instead: the forward edge in this same
+		 * flip carries its own expected-old and fails the attempt cleanly.
+		 */
+		bool prefix_head = holder && !ft_node_external(holder) &&
+			!ft_node_compressed(holder) &&
+			(void *) sedges[0].slot == (void *)
+				&ft_flag_to_metadata(ft, holder)->external_nodes &&
+			((uintptr_t) old & FT_INTERNAL_MASK) &&
+			!ft_ord_parent_detached_prefix(old);
+
+		if (prefix_head && txn) {
+			ft_flip_txn_record_head_back_edge(txn,
+				(void **) &old_cell->parent, (void *) old,
+				(void *) ((uintptr_t) old |
+					FT_ORD_PARENT_DETACHED_PREFIX));
+		} else if (prefix_head) {
+			/*
+			 * ☠ CURRENTLY UNREACHED -- all four callers of this
+			 * function pass a @txn (measured: swap_mark_txn accounts
+			 * for every mark ft_unit and ft_inv take).  It is kept, and
+			 * not deleted, because this function supports @txn == NULL
+			 * for its OTHER edges (the ft_ord_cell_flip_try tail
+			 * below); a mark that existed only on the txn path would
+			 * make the non-txn form silently drop it and emit exactly
+			 * the wrong key this whole edge exists to prevent.  Read
+			 * its greenness as "never executed", not as coverage.
+			 */
+			edges[n].slot = (struct ft_ord_cell **) &old_cell->parent;
+			edges[n].old_target = (struct ft_ord_cell *) old;
+			edges[n].new_target = (struct ft_ord_cell *)
+				((uintptr_t) old | FT_ORD_PARENT_DETACHED_PREFIX);
+			edges[n].owner = sedges[0].owner;
+			edges[n].owner_held = false;	/* MW, as every head back edge */
+			n++;
+		}
+	}
 	if (txn)
 		return ft_flip_status_to_errno(
 			ft_ord_cell_flip_into(ft, txn, edges, n));
@@ -8873,6 +8943,39 @@ int ft_remove_one_commit(struct cds_ft *ft,
 			ft_state_edge(&edges[n], &state_meta->state, old,
 				old - FT_STATE_NR_CHILD_ONE);
 			n++;
+		}
+		/*
+		 * A PREFIX head's key-disappearing clear (@struct_slot IS the
+		 * holder's external_nodes word): the holder stays and its
+		 * external_nodes reads NULL from here on, while parked readers
+		 * still hold @dead_cell and rebuild its key from that holder.
+		 * Mark the dead cell's parent word IN THIS FLIP
+		 * (FT_ORD_PARENT_DETACHED_PREFIX) so the up-walk keeps telling a
+		 * dead prefix head from a slot head -- see ft_rebuild_key_upwalk.
+		 * The expected-old is a WAITING load (the word enters this txn's
+		 * write set; a raw read could take a peer's parked proxy).  Always
+		 * MW (ft_flip_txn_record_head_back_edge), like every head back
+		 * edge.  A body-slot / cn->child clear is a slot head: no mark.
+		 */
+		if (dead_cell && slot_owner && (void *) struct_slot ==
+				(void *) &slot_owner->external_nodes) {
+			void *old = urcu_txn_load(ft_flip_txn_handle(txn),
+				(void **) &dead_cell->parent, FT_FLIP_PROXY_TAG);
+
+			/*
+			 * Internal flag only (bit 4 is ADDRESS on a compressed
+			 * node and on the trie stamp), and an already-marked word
+			 * is a STALE PLAN this attempt must not build on -- see
+			 * the same pair in ft_ord_cell_swap_publish_multi.  Both
+			 * decline to record rather than assert, because the word
+			 * is peer-mutable and the forward edge aborts the attempt.
+			 */
+			if (old && ((uintptr_t) old & FT_INTERNAL_MASK) &&
+					!ft_ord_parent_detached_prefix(old))
+				ft_flip_txn_record_head_back_edge(txn,
+					(void **) &dead_cell->parent, old,
+					(void *) ((uintptr_t) old |
+						FT_ORD_PARENT_DETACHED_PREFIX));
 		}
 		/*
 		 * FOLD (coherent rekey one-decide writer): record the SW structural
@@ -9031,7 +9134,7 @@ void ft_record_child_back_edge(struct cds_ft *ft, struct ft_flip_txn *txn,
  * was installed (all fused edges discarded); a retry-enabled caller unwinds
  * and re-descends.  The @txn-NULL lone-store path cannot abort (returns OK).
  */
-#define FT_REMOVE_COMMIT_REC_MAX_EDGES	10	/* <=3 structural (+back-edge) + <=5 cell/run (unsplice = 2 back-edges + deletion mark) + 1 DEL-recompact tombstone + 1 promote head re-parent */
+#define FT_REMOVE_COMMIT_REC_MAX_EDGES	11	/* <=3 structural (+back-edge) + <=5 cell/run (unsplice = 2 back-edges + deletion mark) + 1 DEL-recompact tombstone + 1 promote head re-parent + 1 detached-prefix mark on the dead cell */
 static
 enum urcu_txn_status ft_remove_commit_rec(struct cds_ft *ft,
 		struct ft_pub_rec *rec,

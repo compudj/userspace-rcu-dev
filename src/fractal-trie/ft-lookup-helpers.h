@@ -82,9 +82,15 @@ struct cds_ft_inode_flag *ft_resolve_head_prev(const struct cds_ft *ft, void *pr
 		 * passes through, so a concurrent reader mid-commit sees the
 		 * view-appropriate parent, not the raw descriptor.  Identity when no
 		 * commit is in flight (ft_resolve_flip_proxy no-ops a plain pointer).
+		 *
+		 * A DEAD prefix head's cell carries the detached-prefix mark on
+		 * this word (FT_ORD_PARENT_DETACHED_PREFIX); the holder it names is
+		 * unchanged, so strip the mark for every caller that wants the
+		 * node.  ft_rebuild_key_upwalk reads the word itself: the mark is
+		 * its answer.
 		 */
-		return ft_resolve_flip_proxy(
-			rcu_dereference(ft_ord_cell_ptr(prev)->parent));
+		return ft_ord_parent_strip(ft_resolve_flip_proxy(
+			rcu_dereference(ft_ord_cell_ptr(prev)->parent)));
 	return (struct cds_ft_inode_flag *) prev;
 }
 

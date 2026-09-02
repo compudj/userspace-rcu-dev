@@ -78,7 +78,7 @@
  * compares the run count against this plan, so retiring a test means
  * decrementing here in the same commit.
  */
-#define NR_TESTS	(98 + NR_TESTS_REKEY_DLM)
+#define NR_TESTS	(102 + NR_TESTS_REKEY_DLM)	/* +4: inv_prefix_head_*_key_identity */
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -20289,6 +20289,370 @@ static int inv_ordered_bulk_consistency(void)
 	return ret;
 }
 
+/* ================================================================== */
+/* 18. A retired PREFIX head's key still names its own node           */
+/* ================================================================== */
+
+/*
+ * THE KEY->NODE ORACLE, and it exists because a UNIVERSE ORACLE IS BLIND HERE.
+ *
+ * A prefix head's ordered cell carries incoming_byte == its key's last byte --
+ * which is ALSO its holder's own incoming edge.  When the up-walk misclassifies
+ * such a head as a SLOT head it writes that byte twice, so "Bd" comes back as
+ * "Bdd": a key that IS in the trie, carried on the node for "Bd".  Every check
+ * of the form "is the emitted key one I inserted?" passes on it.  So this
+ * oracle pins each key to the NODE it must name (@value, stamped at insert) and
+ * compares them -- the only shape of check that can see the defect at all.
+ *
+ * The writer churns the prefix key through the retire paths that leave the
+ * HOLDER ALIVE, which is the precondition: the reader is parked on a cell whose
+ * head is gone while the node it hangs under is still there and still walked.
+ *   RETIRE_CLEAR    -- remove_all: the holder's external_nodes goes to NULL.
+ *   RETIRE_PROMOTE  -- remove the HEAD of a 2-deep duplicate chain: the
+ *                      successor is promoted into the head's place (swap).
+ *   RETIRE_REPLACE  -- cds_ft_replace: the same swap, driven by the public API.
+ *   RETIRE_NIL      -- the same clear on the NIL key at the ROOT, whose holder
+ *                      is the root node.  Its failure is a BAD KEY, not a wrong
+ *                      node: "" comes back length 1.
+ * A 1-CHILD holder is deliberately NOT in the list: there the fused
+ * chain-compress REPLACES the holder, the retired copy keeps its
+ * external_nodes, and the arm is not reachable.  That is a real control, not an
+ * omission -- it is the one shape of this family measured clean on BOTH a
+ * pristine and a fixed library.
+ *
+ * ☞ AND IT DOES NOT DUPLICATE inv_prefix_key_park_vs_holder_churn, which drives
+ * the same park/churn race with the ORDERED LIST OFF (create_varlen_nolist_ft_ws)
+ * and only writers.  ft_rebuild_key_upwalk is ordered-list-only, so that oracle
+ * cannot reach the arm this one exists for; measured, its reader-side arms
+ * execute ZERO times across the whole suite.  List ON plus a key-reading reader
+ * is what makes the arm reachable at all.
+ */
+enum inv_prefix_retire {
+	INV_PREFIX_RETIRE_CLEAR,
+	INV_PREFIX_RETIRE_PROMOTE,
+	INV_PREFIX_RETIRE_REPLACE,
+	INV_PREFIX_RETIRE_NIL,
+	INV_PREFIX_RETIRE_NR,
+};
+
+struct inv_prefix_key {
+	const char *key;
+	uint64_t tag;
+};
+
+struct inv_prefix_ctx {
+	struct cds_ft *ft;
+	const struct inv_prefix_key *universe;	/* NULL-key terminated */
+	const char *churn;			/* the prefix key, churned */
+	size_t churn_len;
+	const char *test_name;
+	enum inv_prefix_retire retire;
+	unsigned long cycles;
+	unsigned long keys_read;
+};
+
+/* The tag the churned key's nodes carry; distinct from every static key's. */
+#define INV_PREFIX_CHURN_TAG	9
+
+static uint64_t inv_prefix_expected_tag(const struct inv_prefix_key *universe,
+		const uint8_t *key, size_t key_len)
+{
+	unsigned int i;
+
+	for (i = 0; universe[i].key; i++)
+		if (strlen(universe[i].key) == key_len &&
+				!memcmp(universe[i].key, key, key_len))
+			return universe[i].tag;
+	return 0;			/* not a key of the trie at all */
+}
+
+static void *inv_prefix_reader(void *arg)
+{
+	struct inv_prefix_ctx *ctx = arg;
+	struct cds_ft_iter *iter;
+	unsigned long keys = 0;
+
+	rcu_register_thread();
+	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
+		abort();
+	while (!CMM_LOAD_SHARED(test_go))
+		caa_cpu_relax();
+	while (!CMM_LOAD_SHARED(test_stop)) {
+		enum cds_ft_status status;
+
+		rcu_read_lock();
+		for (status = cds_ft_lookup_first(ctx->ft, iter);
+				status == CDS_FT_STATUS_OK;
+				status = cds_ft_next(ctx->ft, iter)) {
+			uint8_t kbuf[64];
+			size_t klen = 0;
+			struct cds_ft_node *node;
+			uint64_t carried, expected;
+
+			if (cds_ft_iter_get_key(iter, kbuf, sizeof(kbuf),
+					&klen) != CDS_FT_STATUS_OK)
+				continue;
+			keys++;
+			node = cds_ft_iter_node(iter);
+			if (!node)
+				continue;
+			carried = to_test_node(node)->value;
+			expected = inv_prefix_expected_tag(ctx->universe,
+					kbuf, klen);
+			/*
+			 * TWO distinct failures, reported apart because they
+			 * name different halves of the walk: a key that is not
+			 * in the universe at all (the NIL shape's stale trailing
+			 * byte), and a legal key delivered on the wrong node
+			 * (the prefix shape's doubled byte).  The second is the
+			 * one a universe check cannot see.
+			 */
+			if (!expected)
+				report_violation(ctx->test_name,
+					"key '%.*s' (len %zu) is not a key of "
+					"the trie; node carries tag %llu",
+					(int) klen, (const char *) kbuf, klen,
+					(unsigned long long) carried);
+			else if (carried != expected)
+				report_violation(ctx->test_name,
+					"key '%.*s' (len %zu) delivered on the "
+					"node for tag %llu, expected tag %llu",
+					(int) klen, (const char *) kbuf, klen,
+					(unsigned long long) carried,
+					(unsigned long long) expected);
+		}
+		rcu_read_unlock();
+		rcu_quiescent_state();
+	}
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	__atomic_add_fetch(&ctx->keys_read, keys, __ATOMIC_RELAXED);
+	return NULL;
+}
+
+/* Free a whole duplicate chain returned by cds_ft_remove_all. */
+static void inv_prefix_free_chain(struct cds_ft_node *head)
+{
+	struct cds_ft_node *node, *next;
+
+	for (node = head; node; node = next) {
+		next = cds_ft_node_next_rcu(node);
+		node_free_rcu(to_test_node(node));
+	}
+}
+
+static struct ft_test_node *inv_prefix_node_alloc(uint64_t tag)
+{
+	struct ft_test_node *n = node_alloc(tag);
+
+	n->value = tag;
+	return n;
+}
+
+static void *inv_prefix_writer(void *arg)
+{
+	struct inv_prefix_ctx *ctx = arg;
+	const uint8_t *ckey = (const uint8_t *) ctx->churn;
+	struct cds_ft_iter *iter;
+
+	rcu_register_thread();
+	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
+		abort();
+	while (!CMM_LOAD_SHARED(test_go))
+		caa_cpu_relax();
+	while (!CMM_LOAD_SHARED(test_stop)) {
+		struct ft_test_node *first = inv_prefix_node_alloc(
+			INV_PREFIX_CHURN_TAG);
+		struct cds_ft_node *chain = NULL;
+
+		rcu_read_lock();
+		if (cds_ft_insert(ctx->ft, ckey, ctx->churn_len, &first->node)
+				!= CDS_FT_STATUS_OK)
+			abort();
+		if (ctx->retire == INV_PREFIX_RETIRE_PROMOTE) {
+			struct ft_test_node *dup = inv_prefix_node_alloc(
+				INV_PREFIX_CHURN_TAG);
+
+			if (cds_ft_insert(ctx->ft, ckey, ctx->churn_len,
+					&dup->node) != CDS_FT_STATUS_OK)
+				abort();
+		}
+		rcu_read_unlock();
+		rcu_quiescent_state();
+
+		rcu_read_lock();
+		cds_ft_iter_set_key(iter, ckey, ctx->churn_len);
+		if (cds_ft_lookup(ctx->ft, iter) != CDS_FT_STATUS_OK)
+			abort();
+		if (ctx->retire == INV_PREFIX_RETIRE_PROMOTE) {
+			/* Retire the HEAD; the chain's successor is promoted. */
+			if (cds_ft_remove(ctx->ft, iter, &first->node)
+					!= CDS_FT_STATUS_OK)
+				abort();
+			node_free_rcu(first);
+		} else if (ctx->retire == INV_PREFIX_RETIRE_REPLACE) {
+			struct ft_test_node *fresh = inv_prefix_node_alloc(
+				INV_PREFIX_CHURN_TAG);
+
+			if (cds_ft_replace(ctx->ft, iter, &first->node,
+					&fresh->node) != CDS_FT_STATUS_OK)
+				abort();
+			node_free_rcu(first);
+		}
+		if (ctx->retire == INV_PREFIX_RETIRE_PROMOTE ||
+				ctx->retire == INV_PREFIX_RETIRE_REPLACE) {
+			/* The swap moved the position; re-find before clearing. */
+			rcu_read_unlock();
+			rcu_quiescent_state();
+			rcu_read_lock();
+			cds_ft_iter_set_key(iter, ckey, ctx->churn_len);
+			if (cds_ft_lookup(ctx->ft, iter) != CDS_FT_STATUS_OK)
+				abort();
+		}
+		if (cds_ft_remove_all(ctx->ft, iter, &chain) < 0)
+			abort();
+		rcu_read_unlock();
+		rcu_quiescent_state();
+		inv_prefix_free_chain(chain);
+		ctx->cycles++;
+	}
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static int inv_prefix_head_retire_run(enum inv_prefix_retire retire,
+		const char *name)
+{
+	/*
+	 * {Bdd, Bds} give the holder for "Bd" TWO children, so a remove of
+	 * "Bd" clears its external_nodes and LEAVES THE HOLDER -- the shape the
+	 * up-walk has to classify.  With one child the holder would be fused
+	 * away instead and the arm is unreachable, which is why the arity is
+	 * fixed here rather than left to chance.  "Bs" keeps the parent of the
+	 * holder branching, so the walk has a real path to rebuild.
+	 */
+	static const struct inv_prefix_key universe_prefix[] = {
+		{ "Bdd", 1 }, { "Bds", 2 }, { "Bs", 3 },
+		{ "Bd", INV_PREFIX_CHURN_TAG }, { NULL, 0 }
+	};
+	/* The NIL key hangs at the ROOT: its holder is the root node. */
+	static const struct inv_prefix_key universe_nil[] = {
+		{ "a", 1 }, { "b", 2 },
+		{ "", INV_PREFIX_CHURN_TAG }, { NULL, 0 }
+	};
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	struct inv_prefix_ctx ctx;
+	struct timespec t0;
+	pthread_t readers[NR_READERS_DEFAULT], writer;
+	unsigned int i;
+	int ret = 0;
+
+	ft = create_varlen_ord_ft(&group);
+
+	memset(&ctx, 0, sizeof(ctx));
+	ctx.ft = ft;
+	ctx.universe = retire == INV_PREFIX_RETIRE_NIL ?
+		universe_nil : universe_prefix;
+	ctx.churn = retire == INV_PREFIX_RETIRE_NIL ? "" : "Bd";
+	ctx.churn_len = strlen(ctx.churn);
+	ctx.test_name = name;
+	ctx.retire = retire;
+
+	rcu_read_lock();
+	for (i = 0; ctx.universe[i].key; i++) {
+		struct ft_test_node *n;
+
+		if (ctx.universe[i].tag == INV_PREFIX_CHURN_TAG)
+			continue;		/* the writer owns this one */
+		n = inv_prefix_node_alloc(ctx.universe[i].tag);
+		if (cds_ft_insert(ft, (const uint8_t *) ctx.universe[i].key,
+				strlen(ctx.universe[i].key), &n->node)
+					!= CDS_FT_STATUS_OK)
+			abort();
+	}
+	rcu_read_unlock();
+	rcu_quiescent_state();
+
+	test_go = 0;
+	test_stop = 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	for (i = 0; i < NR_READERS_DEFAULT; i++)
+		pthread_create(&readers[i], NULL, inv_prefix_reader, &ctx);
+	pthread_create(&writer, NULL, inv_prefix_writer, &ctx);
+
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	test_go = 1;
+
+	rcu_thread_offline();
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
+		usleep(1000);
+
+	test_stop = 1;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	pthread_join(writer, NULL);
+	for (i = 0; i < NR_READERS_DEFAULT; i++)
+		pthread_join(readers[i], NULL);
+	rcu_thread_online();
+
+	/*
+	 * ★ THE ARM MUST HAVE RUN.  A zero from an oracle whose writer never
+	 * completed a churn cycle, or whose readers never walked a key, is not
+	 * evidence of anything -- and this whole class was first reported clean
+	 * by a probe that never armed.  Fail rather than pass silently.
+	 */
+	if (!ctx.cycles || !ctx.keys_read) {
+		fprintf(stderr, "%s: oracle never armed (cycles=%lu keys=%lu)\n",
+			name, ctx.cycles, ctx.keys_read);
+		ret = -1;
+	}
+	if (atomic_load(&violation_count) > 0) {
+		fprintf(stderr, "%s: %lu violation(s) over %lu churn cycles, "
+			"%lu keys read\n", name,
+			(unsigned long) atomic_load(&violation_count),
+			ctx.cycles, ctx.keys_read);
+		ret = -1;
+	}
+
+	/*
+	 * The suite's standard teardown, not a hand-rolled one: it runs
+	 * teardown_walk_check (a verify plus a BOUNDED ordered walk) before
+	 * draining, so a trie this oracle left structurally broken is REPORTED
+	 * here rather than torn down quietly.
+	 */
+	if (drain_and_destroy(ft, group) < 0)
+		ret = -1;
+	return ret;
+}
+
+static int inv_prefix_head_clear_key_identity(void)
+{
+	return inv_prefix_head_retire_run(INV_PREFIX_RETIRE_CLEAR,
+		"inv_prefix_head_clear_key_identity");
+}
+
+static int inv_prefix_head_promote_key_identity(void)
+{
+	return inv_prefix_head_retire_run(INV_PREFIX_RETIRE_PROMOTE,
+		"inv_prefix_head_promote_key_identity");
+}
+
+static int inv_prefix_head_replace_key_identity(void)
+{
+	return inv_prefix_head_retire_run(INV_PREFIX_RETIRE_REPLACE,
+		"inv_prefix_head_replace_key_identity");
+}
+
+static int inv_prefix_head_nil_key_identity(void)
+{
+	return inv_prefix_head_retire_run(INV_PREFIX_RETIRE_NIL,
+		"inv_prefix_head_nil_key_identity");
+}
+
 int main(int argc, char **argv)
 {
 	const char *filter = (argc >= 2) ? argv[1] : NULL;
@@ -20503,6 +20867,12 @@ int main(int argc, char **argv)
 
 	diag("17. Merge is atomic across a deep (recursive) overlap");
 	RUN_TEST(inv_merge_atomic_completeness_deep);
+
+	diag("18. A retired prefix head's key still names its own node");
+	RUN_TEST(inv_prefix_head_clear_key_identity);
+	RUN_TEST(inv_prefix_head_promote_key_identity);
+	RUN_TEST(inv_prefix_head_replace_key_identity);
+	RUN_TEST(inv_prefix_head_nil_key_identity);
 
 	rcu_barrier();
 	rcu_unregister_thread();

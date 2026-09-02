@@ -661,6 +661,78 @@ struct ft_ord_cell {
 	struct cds_ft_inode_flag *parent;
 };
 
+/*
+ * DETACHED-PREFIX-HEAD mark on @cell->parent.
+ *
+ * A head's key is reconstructed structurally (ft_rebuild_key_upwalk) from its
+ * cell's parent, and the ONE fact the cell does not carry is which of two
+ * shapes the head has: a SLOT head (key = path(parent) + its own edge byte) or
+ * a PREFIX head sitting at the parent's external_nodes (key = path(parent),
+ * the key ENDS at the parent).  The walk infers that from the parent's LIVE
+ * external_nodes -- which a key-disappearing remove CLEARS while a parked
+ * reader still holds the dead cell, so the dead prefix head then reads as a
+ * slot head and its key gains a spurious trailing byte (a LEGAL key of the
+ * trie, on the wrong node).
+ *
+ * The remove that clears (or swaps away) a prefix head's external_nodes
+ * therefore sets this bit on the retired cell's parent word IN THE SAME FLIP,
+ * so a reader that observed the clear observes the mark too: "this head WAS
+ * the prefix head of that parent; write no edge byte".  A live cell never
+ * carries it (cds_ft_verify's raw parent compare asserts that); every reader
+ * of a possibly-dead cell's parent strips it (ft_ord_parent_strip) before
+ * treating the word as a node flag.
+ *
+ * Bit 4: above the four in-band tag bits (FT_PARENT_TAG_MASK) and below the
+ * smallest internal node's alignment (order 5, 32 bytes) -- and a prefix head
+ * only ever hangs at an INTERNAL node (a compressed node carries no
+ * external_nodes), so the bit never aliases a compressed node's 16-byte
+ * alignment.
+ */
+#define FT_ORD_PARENT_DETACHED_PREFIX	\
+	((uintptr_t) (FT_INTERNAL_MASK | FT_TYPE_MASK) + 1)
+
+urcu_static_assert(!(FT_ORD_PARENT_DETACHED_PREFIX &
+			(FT_INTERNAL_MASK | FT_TYPE_MASK | FT_COMPRESSED_MASK)),
+		"the detached-prefix mark must not overlap the parent tag nibble",
+		ft_ord_parent_detached_prefix_above_tag);
+/*
+ * ★ AND THE ALIGNMENT PREMISE IS MACHINE-CHECKED, not left to the comment
+ * above.  The mark is only sound because every INTERNAL node is allocated at
+ * ft_types[].order >= FT_INTERNAL_ORDER_MIN (5 = 32 B) and the allocator hands
+ * out order-aligned items (item = range_base + (n << order), range_base page-
+ * or 2 MiB-aligned), so bit 4 is never part of an internal node's address.
+ * FT_ALLOC_ORDER_MIN (4 = 16 B) is the COMPRESSED tier, which is exactly why
+ * the helpers below refuse to touch a compressed flag.  Raising the mark or
+ * lowering FT_INTERNAL_ORDER_MIN breaks this and must fail the build.
+ */
+urcu_static_assert(FT_ORD_PARENT_DETACHED_PREFIX <
+			((uintptr_t) 1 << FT_INTERNAL_ORDER_MIN),
+		"the detached-prefix mark must fit below the smallest internal node's alignment",
+		ft_ord_parent_detached_prefix_below_internal_align);
+
+/*
+ * Both helpers take a RESOLVED parent word (no flip proxy: a descriptor
+ * pointer's bit 4 is address) and read the bit ONLY on an INTERNAL flag: a
+ * compressed node is 16-byte aligned, so bit 4 of a compressed parent flag is
+ * part of its address and must never be tested or cleared.
+ */
+static inline
+bool ft_ord_parent_detached_prefix(const struct cds_ft_inode_flag *parent)
+{
+	return ((uintptr_t) parent & (FT_INTERNAL_MASK |
+			FT_ORD_PARENT_DETACHED_PREFIX)) ==
+		(FT_INTERNAL_MASK | FT_ORD_PARENT_DETACHED_PREFIX);
+}
+
+static inline
+struct cds_ft_inode_flag *ft_ord_parent_strip(struct cds_ft_inode_flag *parent)
+{
+	if (!((uintptr_t) parent & FT_INTERNAL_MASK))
+		return parent;
+	return (struct cds_ft_inode_flag *)
+		((uintptr_t) parent & ~FT_ORD_PARENT_DETACHED_PREFIX);
+}
+
 /* Recover the cell owning an embedded ordered-list link node, and vice versa. */
 static inline
 struct ft_ord_cell *ft_ord_cell_of(const struct urcu_txn_list_node *lnode)
