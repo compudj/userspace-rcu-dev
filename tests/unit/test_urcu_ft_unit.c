@@ -13042,9 +13042,15 @@ static int rekey_exclusive_keeps_keys(const char *what, const char *const *keys,
 }
 
 /*
- * ☠☠☠ PIN (RED on every COMPRESSED build): a same-trie rekey whose DESTINATION
- * key diverges INSIDE the very compressed run the SOURCE key ends in returns
- * CDS_FT_STATUS_OK and DESTROYS the moved subtree.
+ * ☑ WAS A PIN, NOW A REGRESSION GUARD (2026-09-02): every leg below is GREEN on
+ * the default, -DNO_FEATURE_FT_COMPRESS and --enable-rcu-debug builds.  The
+ * defect it was pinned for is FIXED; the shape is kept because it is the
+ * cheapest witness for it, and because a route this short -- two API calls and
+ * a three-byte key -- is trivial to re-break.
+ *
+ * ☞ WHAT IT PINNED: a same-trie rekey whose DESTINATION key diverges INSIDE the
+ * very compressed run the SOURCE key ends in returned CDS_FT_STATUS_OK and
+ * DESTROYED the moved subtree.
  *
  * Two API calls and a three-byte key are enough:
  *
@@ -13103,8 +13109,13 @@ static int test_rekey_cut_run_dst_split_keeps_keys(void)
 }
 
 /*
- * ☠☠☠ PIN (RED on every build): the graft's forward publish is lost when the
- * DETACH recompacts the node the graft publishes into.
+ * ☑ WAS A PIN, NOW A REGRESSION GUARD (2026-09-02): green on the default,
+ * -DNO_FEATURE_FT_COMPRESS and --enable-rcu-debug builds.  The missing arming
+ * described below was added at @dc33aa0bb ("the NOSPLIT graft ANNOUNCES its
+ * publish") -- precisely the omission this text names.
+ *
+ * ☞ WHAT IT PINNED: the graft's forward publish was lost when the DETACH
+ * recompacted the node the graft publishes into.
  *
  * A distinct route from the cut-run pin above, and it needs no compressed run:
  * the NOSPLIT graft's forward publish is recorded straight into the shared txn
@@ -13122,12 +13133,18 @@ static int test_rekey_cut_run_dst_split_keeps_keys(void)
  * recompaction instead (@pending_pub_slot)" is true for GLUE and MERGE and
  * FALSE for NOSPLIT.
  *
- * ☠☠ THE LEG THAT MAY NOT RUN EVERYWHERE.  The fourth shape below is red the
- * same way on a compressed build, but under -DNO_FEATURE_FT_COMPRESS it does
- * not fail -- it ABORTS the engine's SW/MW kind check on an --enable-rcu-debug
- * build (urcu_txn_record_chain) and LIVELOCKS forever on a release one, leaking
- * memory while it spins.  A libtap failure cannot absorb either, so it is
- * gated on the BUILD FLAG, by name, and its absence is announced.
+ * ☠☠ THE LEG THAT MAY NOT RUN EVERYWHERE -- AND THIS GATE STILL STANDS.  The
+ * deep-chain shape is fine on a compressed build, but under
+ * -DNO_FEATURE_FT_COMPRESS it ABORTS the engine's SW/MW kind check on an
+ * --enable-rcu-debug build and LIVELOCKS forever on a release one.  A libtap
+ * failure cannot absorb either, so it is gated on the BUILD FLAG, by name, and
+ * its absence is announced.
+ * ☑ RE-MEASURED 2026-09-02, STANDALONE -- outside the suite, so that neither
+ * outcome costs the tests after it: insert {"zq","zwabcd"} then
+ * cds_ft_rekey_merge(dst="zwe", src="zwabc").  Release nocompress does not
+ * return in 60 s (rc 124); nocompress + --enable-rcu-debug aborts on
+ * urcu_txn_record_chain "r->kind == kind" (rcu-txn-mcas.h:1000, rc 134).
+ * BOTH halves of this gate are still true, so it is kept as written.
  *
  * ☞ MEASURED PRE-EXISTING at 593c932f.
  */
