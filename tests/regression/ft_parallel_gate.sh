@@ -295,6 +295,32 @@ ALL_CONFIGS=(
 	# contract and the comment on ft_rekey_spine_copy.  Un-gated; these seven
 	# are the only thing that checks it stays that way.
 	"nomerge|-DNO_FEATURE_FT_MERGE|u ion ioff imw"
+	# ★ THE TRACING BUILD.  -DFT_ENABLE_TRACING was compiled by NO CONFIGURATION
+	# AT ALL, and the cost of that is measured: the flight-recorder mis-wire
+	# detector -- code that exists only in this build -- carried a defect for two
+	# months (it aborted on its own torn read, @9d50ce91) because nothing ever
+	# built it, let alone ran it.  A detector no configuration compiles is one
+	# nobody runs.
+	#
+	# It RUNS the suites rather than merely building.  Compiling is the weak
+	# claim -- the same lesson nomerge above records -- and it is the weaker one
+	# here specifically: the detector's defect was an abort at RUNTIME on a shape
+	# a green build says nothing about.  imw is in the list for the usual reason
+	# (the torn read it aborted on is BY CONSTRUCTION a peer writer's), and it is
+	# affordable: measured 2026-09-02, u 45 s, ion 80, ioff 79, imw 98 -- 302 s
+	# sequential, inside the 365 s the swept anchorval config already costs, so
+	# the gate's wall clock does not move.
+	#
+	# @TREE@ expands to this config's own tree (setup_tree), and it is MANDATORY,
+	# not decoration: cds_ft_tp.h sets LTTNG_UST_TRACEPOINT_INCLUDE to
+	# "./cds_ft_tp.h", which lttng re-includes from its own header directory, so
+	# "./" needs an explicit -I pointing at the directory that actually holds it.
+	# It must be THIS tree's copy -- the main tree's would compile the wrong
+	# headers against this config's sources.
+	# @LTTNG_CFLAGS@ expands to the probed lttng-ust include flags (see the
+	# prerequisite probe below); the config is DROPPED, loudly, on a box without
+	# lttng-ust rather than reported as a spurious CONFIG ERROR.
+	"tracing|-DFT_ENABLE_TRACING -I@TREE@/src/fractal-trie @LTTNG_CFLAGS@|u ion ioff imw"
 )
 
 # Optional positional filter: run only the named configs.
@@ -310,8 +336,57 @@ else
 	CONFIGS=("${ALL_CONFIGS[@]}")
 fi
 
+# ---------------------------------------------------------------------------
+# THE TRACING CONFIG'S PREREQUISITE PROBE.
+#
+# -DFT_ENABLE_TRACING needs LTTng-UST headers, and lttng-ust is NOT a build
+# dependency of liburcu -- so on a box without it the tracing config would fail
+# at BUILD time and read exactly like a real regression.  Probe instead, and
+# DROP the config with a loud line: an absent toolchain must not be reported as
+# a red gate, and a red gate must not be explained away as an absent toolchain.
+#
+# ☠ Dropping it must NOT be able to empty the matrix.  `ft_parallel_gate.sh
+# tracing` on a box with no lttng-ust would otherwise run ZERO configs and the
+# results loop -- which iterates over CONFIGS -- would print nothing and exit 0.
+# A GATE PASS over no configs is the worst false green there is, so that case
+# exits 2 instead.
+FT_GATE_LTTNG_CFLAGS=${FT_GATE_LTTNG_CFLAGS:-$(
+	PKG_CONFIG_PATH="${PKG_CONFIG_PATH:-}:/usr/local/lib/pkgconfig" \
+		pkg-config --cflags lttng-ust 2>/dev/null)}
+: "${FT_GATE_LTTNG_CFLAGS:=-I/usr/local/include}"
+lttng_ust_available() {
+	# Compile-probe, not a file test: the header that must resolve is the one
+	# the tracepoint provider includes, through whatever -I the box needs.
+	printf '#include <lttng/tracepoint.h>\n' | \
+		${CC:-cc} $FT_GATE_LTTNG_CFLAGS -E -x c - >/dev/null 2>&1
+}
+if ! lttng_ust_available; then
+	_kept=()
+	for c in "${CONFIGS[@]}"; do
+		if [ "${c%%|*}" = tracing ]; then
+			echo "WARNING: config 'tracing' DROPPED -- <lttng/tracepoint.h> does not" >&2
+			echo "WARNING: resolve with CFLAGS [$FT_GATE_LTTNG_CFLAGS].  Install lttng-ust" >&2
+			echo "WARNING: or set FT_GATE_LTTNG_CFLAGS.  -DFT_ENABLE_TRACING is NOT covered." >&2
+		else
+			_kept+=("$c")
+		fi
+	done
+	CONFIGS=("${_kept[@]}")
+	if [ "${#CONFIGS[@]}" -eq 0 ]; then
+		echo "ft_parallel_gate: every requested config was dropped -- nothing to run." >&2
+		exit 2
+	fi
+fi
+
 setup_tree() {	# $1=name $2=cppflags -- one-time: copy source + configure WITH flags
 	local dir=$GATE/$1 flags=$2
+	# Per-tree tokens.  @TREE@ cannot be written literally in ALL_CONFIGS
+	# because the path depends on $GATE, and @LTTNG_CFLAGS@ because it depends
+	# on the box.  Substituted HERE, before the cache check, so .gate_flags
+	# records the flags that were actually passed to configure -- comparing the
+	# unsubstituted form would make every tree look correctly configured.
+	flags=${flags//@TREE@/$dir}
+	flags=${flags//@LTTNG_CFLAGS@/${FT_GATE_LTTNG_CFLAGS:-}}
 	if [ -f "$dir/config.status" ] && \
 	   grep -qxF "CPPFLAGS=$flags" "$dir/.gate_flags" 2>/dev/null; then
 		return 0	# already configured with these exact flags
