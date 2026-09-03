@@ -6910,6 +6910,62 @@ void ft_flip_txn_record_nr_child_inc(struct ft_flip_txn *t,
 }
 
 /*
+ * THE ORDERING RULE'S THIRD CASE: guard THEN terminal, RE-BASED.
+ *
+ * ft_flip_txn_record_release_lock states the rule -- a §4.B guard planted on a
+ * word BEFORE this txn records a terminal on it poisons the descriptor
+ * permanently -- and adds "no site does today".  ONE does, as soon as a
+ * same-trie rekey folds its detach into the graft's commit.  The graft's
+ * ADD-recompaction sweep re-homes every surviving child of the node it copies
+ * and records the §4.B {live_state -> live_state} validate on each; the detach
+ * then ACQUIRES one of those children and owes it a terminal -- the collapse's
+ * TOMBSTONE (ft_chain_compress_fused) or the promote's RELEASE
+ * (ft_detach_node_replace_compressed_parent).  The two used to sit in DIFFERENT
+ * descriptors, which is precisely why nothing ever detected them; folding them
+ * into one commit is what makes the collision real, and it is the same
+ * collision either way.  MEASURED single-threaded on both terminals.
+ *
+ * THE STALE HALF IS THE GUARD'S EXPECTED-OLD, AND OUR OWN ACQUIRE STALED IT:
+ * the word it expects clean now carries our LOCK, so its install CAS can never
+ * match and every retry rebuilds the identical shape.  Re-base it onto the
+ * value we hold and the terminal chains off it as off any earlier edge.
+ *
+ * Dropping the guard's QUESTION costs nothing, and that is the whole argument:
+ * it asks whether a peer froze this child between the copy loop's read and the
+ * sweep, and our take both EXCLUDES that peer and FAILS OUTRIGHT if it got
+ * there first.  It is the same subsumption ft_reparent_record_meta already
+ * makes for a child found in the op's held set ("a word this op holds cannot be
+ * frozen by a peer at all") -- only reached one step later, because the acquire
+ * happens after the sweep has run.
+ *
+ * WHY HERE AND NOT AT THE SWEEP.  ft_reparent_record_meta's two safe
+ * dispositions (in the held set -> no state edge; @child_marked -> the
+ * release-shaped SW form) both need the child NAMEABLE BEFORE the copy sweep,
+ * and the detach's boundary is chosen by an up-prune walk the graft's plan
+ * cannot predict: measured, the promote's @cn is d_src.ppnf for a one-branch
+ * shape and a SHALLOWER node once the run carries a branch.  The rule is
+ * slot-shaped, not site-shaped, so it is answered at the terminal.
+ *
+ * @state_snapshot is the mark's acquire-time value, which is exactly what the
+ * sweep's masked read produced.  If the record says otherwise -- a real
+ * transition (old != new), or a different value -- the re-base DECLINES and
+ * today's behaviour stands: this must never move a record the caller has not
+ * reasoned about.
+ */
+static inline
+void ft_flip_txn_rebase_state_guard(struct ft_flip_txn *t,
+		struct cds_ft_metadata *meta, uintptr_t state_snapshot)
+{
+	if (!t || !t->mtxn)
+		return;
+	(void) urcu_txn_rebase_validate(t->mtxn, (void **) &meta->state,
+			(void *) state_snapshot,
+			(void *) (state_snapshot | FT_STATE_LOCK),
+			t->structural_sw ? URCU_TXN_KIND_SW :
+				URCU_TXN_KIND_MW);
+}
+
+/*
  * The FENCED variant for a node the op marked with ft_meta_lock_acquire: the
  * expected old is the mark's CLEAN snapshot with the fence bit -- NOT a fresh
  * raw read -- so the commit ratifies exactly the world the copy plan was
@@ -6927,6 +6983,7 @@ void ft_flip_txn_record_tombstone_locked_ctx(struct ft_flip_txn *t,
 		const struct ft_lock_ctx *dbg_ctx,
 		struct cds_ft_metadata *meta, uintptr_t state_snapshot)
 {
+	ft_flip_txn_rebase_state_guard(t, meta, state_snapshot);
 	ft_flip_txn_record_state_kind_ctx(t, dbg_ctx, meta,
 			(void *) (state_snapshot | FT_STATE_LOCK),
 			(void *) (state_snapshot | FT_STATE_TOMBSTONE), 1);
@@ -6988,6 +7045,7 @@ void ft_flip_txn_record_release_lock(struct ft_flip_txn *t,
 {
 	/* The commit owns this release now; the op no longer owes one. */
 	ft_hold_trace_drop(meta);
+	ft_flip_txn_rebase_state_guard(t, meta, state_snapshot);
 	ft_flip_txn_record_state(t, meta,
 			(void *) (state_snapshot | FT_STATE_LOCK),
 			(void *) state_snapshot);

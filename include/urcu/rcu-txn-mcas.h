@@ -974,6 +974,57 @@ struct urcu_txn_record *urcu_txn_find(struct urcu_txn_desc *t,
 }
 
 /*
+ * urcu_txn_desc_rebase_validate: an op that has SINCE TAKEN @slot re-bases the
+ * VALIDATE it recorded on that same slot EARLIER IN THIS DESCRIPTOR onto the
+ * value it now holds, and hands the record the @kind the terminal it owes will
+ * use.
+ *
+ * WHY A VALIDATE CAN GO STALE AGAINST ITS OWN OP.  A validate is {v -> v}: an
+ * expected-old and nothing else.  It is recorded against the word as the op
+ * READ it.  If the SAME op later ACQUIRES that word, its own take sets a bit in
+ * it, and the validate's expected-old no longer describes the word anybody will
+ * find at commit: the install CAS cannot match, so every attempt aborts and
+ * every retry rebuilds the identical shape -- a livelock with no contention.
+ * Nor can the terminal simply be appended: the reconcile below finds
+ * r->new_ptr == v against an expected-old of v|TAKEN and POISONS instead.
+ *
+ * ⇒ THE TAKE IS WHAT MAKES THE VALIDATE REDUNDANT, WHICH IS WHY IT MAY BE
+ * MOVED.  A validate asks "is this word still the live value I read?"; the take
+ * ANSWERS it, and more strongly -- it excludes the peer the validate was
+ * watching for, and it fails outright if that peer got there first.  So the
+ * validate is not dropped on a guess: it is subsumed by an exclusion the op
+ * went on to acquire.  Anything ELSE on the slot is left alone -- a record with
+ * old != new is a real transition, and moving its expected-old would silently
+ * change what commits.
+ *
+ * @expect guards exactly that: the caller states the value it believes the
+ * validate carries, and a disagreement (some other edge has since moved the
+ * word) means this is not the record the caller reasoned about, so nothing
+ * moves.  Returns true iff a validate was re-based.
+ */
+static inline
+bool urcu_txn_desc_rebase_validate(struct urcu_txn_desc *t, void **slot,
+		void *expect, void *held, unsigned int kind)
+{
+	struct urcu_txn_record *r = urcu_txn_find(t, slot);
+
+	if (r == NULL)
+		return false;
+	if (r->old_ptr != r->new_ptr || r->new_ptr != expect)
+		return false;		/* a real transition, or not the one meant */
+	if (r->kind != kind) {
+		if (kind == URCU_TXN_KIND_MW)
+			t->nr_mw++;
+		else
+			t->nr_mw--;
+		r->kind = kind;
+	}
+	r->old_ptr = held;
+	r->new_ptr = held;
+	return true;
+}
+
+/*
  * Record edge {*slot: old -> new} of kind @kind under read-your-own-writes: a
  * same-slot reconcile matches against new_ptr and CHAINS (keeps the original
  * old_ptr, advances new_ptr).  A value mismatch poisons the descriptor (commit

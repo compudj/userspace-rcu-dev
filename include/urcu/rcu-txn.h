@@ -964,6 +964,21 @@ int urcu_txn__record(struct urcu_txn *txn, void **slot,
 	return 0;
 }
 
+/*
+ * Front end for urcu_txn_desc_rebase_validate(): re-base a validate this handle
+ * recorded on @slot onto @held, the value the op now holds, and give it @kind.
+ * A handle with no descriptor yet recorded nothing, so there is nothing to move.
+ */
+static inline
+bool urcu_txn_rebase_validate(struct urcu_txn *txn, void **slot,
+		void *expect, void *held, unsigned int kind)
+{
+	if (txn == NULL || txn->desc == NULL || txn->desc == URCU_TXN_ENOMEM)
+		return false;
+	return urcu_txn_desc_rebase_validate(txn->desc, slot, expect, held,
+			kind);
+}
+
 static inline
 void *urcu_txn__load(struct urcu_txn *txn, void **slot,
 		uintptr_t tag, int optimistic, int committed)
