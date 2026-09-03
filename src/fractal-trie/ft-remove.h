@@ -76,6 +76,7 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 		struct ft_remove_pub *pub,
 		struct ft_detach_run *run,
 		struct ft_flip_txn *txn,
+		bool record_only,
 		long count_delta)
 {
 	/*
@@ -115,7 +116,8 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 		 * it here or leak the descriptor.  (Pre-existing on this rewind bail;
 		 * the DLM acquire-miss bails below share the same contract.)
 		 */
-		ft_flip_txn_destroy(txn);
+		if (!record_only)
+			ft_flip_txn_destroy(txn);
 		return -EAGAIN;
 	}
 	if (topmost_external_nodes) {
@@ -146,7 +148,8 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 					iter_depth, &cn_held)) {
 				/* Pre-commit -EAGAIN: destroy the caller-owned txn
 				 * (its cleanup skips destroy on -EAGAIN). */
-				ft_flip_txn_destroy(txn);
+				if (!record_only)
+					ft_flip_txn_destroy(txn);
 				return -EAGAIN;
 			}
 			/*
@@ -213,7 +216,11 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 		 * flip proxy now -- and signal it via pub->armed.
 		 */
 		if ((fuse_cell || run) && pub && !pub->armed) {
-			struct ft_pub_rec rec = { .n = 0 };
+			struct ft_pub_rec rec = { .n = 0,
+				.mtxn = txn ? txn->mtxn : NULL };
+
+			/* The caller folds only with neither. */
+			urcu_assert_debug(!record_only);
 
 			/* VALIDATE (§4.B): guard the LIVE kept compressed node cn.
 			 * DLM: cn's RELEASE was acquired + recorded up front under
@@ -231,7 +238,8 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 				return -EAGAIN;
 			pub->armed = true;
 		} else {
-			struct ft_pub_rec rec = { .n = 0 };
+			struct ft_pub_rec rec = { .n = 0,
+				.mtxn = txn ? txn->mtxn : NULL };
 
 			/*
 			 * Non-fused external-promote (no cell to unsplice -- list
@@ -252,7 +260,8 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 				&cn->child,
 				(struct cds_ft_inode_flag *) topmost_external_nodes,
 				elevated_old_child, &rec, false);
-			if (ft_remove_commit_rec(ft, &rec, NULL, NULL, txn, false) > 0)
+			if (ft_remove_commit_rec(ft, &rec, NULL, NULL, txn,
+					record_only) > 0)
 				/* Peer won: nothing installed (txn consumed). */
 				return -EAGAIN;
 		}
@@ -314,7 +323,8 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 		 */
 		if (pub_parent != NULL) {
 			free_cds_ft_node_unpublished(ft, fresh);
-			ft_flip_txn_destroy(txn);
+			if (!record_only)
+				ft_flip_txn_destroy(txn);
 			return -EAGAIN;
 		}
 
@@ -343,7 +353,8 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 		if (pub_parent && !ft_lock_ctx_depth_of(ft, ctx, pub_parent,
 				&pp_depth)) {
 			free_cds_ft_node_unpublished(ft, fresh);
-			ft_flip_txn_destroy(txn);
+			if (!record_only)
+				ft_flip_txn_destroy(txn);
 			return -EAGAIN;
 		}
 		if (ft->lock_fine) {
@@ -369,7 +380,8 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 				 * -ENOMEM the caller destroys it (its != -EAGAIN arm).
 				 */
 				if (dret == -EAGAIN)
-					ft_flip_txn_destroy(txn);
+					if (!record_only)
+						ft_flip_txn_destroy(txn);
 				return dret;	/* nothing acquired (all-or-none) */
 			}
 			src_held = set[0].held;
@@ -410,7 +422,8 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			ft_meta_parent_slot_offset(src_meta));
 #endif
 		{
-			struct ft_pub_rec rec = { .n = 0 };
+			struct ft_pub_rec rec = { .n = 0,
+				.mtxn = txn ? txn->mtxn : NULL };
 
 			/*
 			 * Compressed -> fresh-internal recompaction publish: route
@@ -460,7 +473,8 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			if (count_delta)
 				ft_flip_txn_record_count_parent(ft, txn,
 					pub_parent, count_delta);
-			if (ft_remove_commit_rec(ft, &rec, NULL, NULL, txn, false) > 0) {
+			if (ft_remove_commit_rec(ft, &rec, NULL, NULL, txn,
+					record_only) > 0) {
 				/*
 				 * Peer won: the fresh internal never published;
 				 * the retired compressed node stays live and
@@ -2564,7 +2578,20 @@ int ft_detach_node(struct cds_ft *ft,
 		 * is read-only), and on the replace failing we destroy it here.
 		 */
 		{
-			struct ft_flip_txn *orphan_txn =
+			/*
+			 * FOLD: ride the CALLER's commit.  Its own txn commits
+			 * strictly earlier, and this arm publishes a SKIP_X dual
+			 * whose home the publish resolves against the descriptor
+			 * it is handed -- a private one cannot see the caller's
+			 * pending re-parent of the compressed node, so the dual
+			 * was written into the parent the caller's commit then
+			 * retired.  Refused when the caller brought a cell or a
+			 * run: ft_remove_commit_rec's record-only arm asserts
+			 * !run && !dead_cell.
+			 */
+			bool fold_replace = record_only && shared_txn &&
+					!fuse_cell && !run;
+			struct ft_flip_txn *orphan_txn = fold_replace ? shared_txn :
 				ft_flip_txn_create_bounded(ft,
 					FT_REMOVE_COMMIT_REC_MAX_EDGES
 					+ 1 /* §4.B parent guard (Sites 3+4 excl.) */
@@ -2623,14 +2650,15 @@ int ft_detach_node(struct cds_ft *ft,
 				detach_parent_flag_ptr,
 				topmost_external_nodes, elevated_old_child,
 				&nr_clear, fuse_cell,
-				pub, run, orphan_txn, count_delta);
+				pub, run, orphan_txn, fold_replace,
+				count_delta);
 			if (ret) {
 				/*
 				 * -EAGAIN: the commit CONSUMED @orphan_txn (a
 				 * peer won mid-flip); only a pre-commit failure
 				 * (-ENOMEM before the commit) leaves it live.
 				 */
-				if (ret != -EAGAIN)
+				if (ret != -EAGAIN && !fold_replace)
 					ft_flip_txn_destroy(orphan_txn);
 				goto end;
 			}

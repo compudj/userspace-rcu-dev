@@ -69,13 +69,13 @@
 #endif
 
 /*
- * 309 unconditional + 51 fault-injection-only RUN_TEST registrations, on top of
+ * 310 unconditional + 51 fault-injection-only RUN_TEST registrations, on top of
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (367 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (368 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (316 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (317 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -12891,6 +12891,123 @@ static int test_rekey_skip_slot_bp_atomic_or_refused(void)
 		return -1;
 	/* UNCUT over the same internal child. */
 	return rekey_skip_slot_bp_internal_child("zw", "zh");
+}
+
+/*
+ * THE EXTERNAL-PROMOTE'S SKIP_X DUAL MUST NAME THE CHILD IT PUBLISHED.
+ *
+ * A same-trie rekey whose detach dissolves a junction under a COMPRESSED parent
+ * takes ft_detach_node_replace_compressed_parent's external-promote arm, which
+ * publishes into cn->child AND refreshes the SKIP_X dual in cn's own parent
+ * slot.  Those two must be one flip: the dual is the second path to the same
+ * child, and a candidate reader takes it.
+ *
+ * They were not.  The arm committed on a txn of its OWN, strictly earlier than
+ * the rekey's, and its ft_pub_rec carried no txn handle -- so the publish
+ * resolved the dual's home RAW, from a parent_word the rekey's own commit was
+ * about to supersede.  The refreshed dual landed in the copy nobody reads and
+ * the live trie kept one naming a RETIRED child.
+ *
+ * ☠ WHAT THAT COSTS, both measured on the shipping default build, single
+ * threaded, from these three keys and this one call:
+ *   - cds_ft_lookup_candidate_key("zhabbb") -- the key's OLD name -- answers OK
+ *     BEFORE and AFTER a grace period, having walked the stale encoding into a
+ *     node the rekey freed.  The eager lookup says not-found, so only the
+ *     candidate path reaches it, which is exactly the path the dual exists for.
+ *   - inserting under the old src prefix afterwards never returns: every attempt
+ *     plans its expected-old as the dual's live value, the slot holds the stale
+ *     one, MCAS aborts, and the identical plan is re-derived forever -- building
+ *     a node per pass until the process is killed.
+ *
+ * ☞ WHAT THIS TEST ASSERTS is the CHEAP witness -- cds_ft_verify -- and
+ * deliberately not the wedge.  A test that reproduced the wedge would hang the
+ * suite, and a libtap TODO does not absorb a hang.  The verify RED is the same
+ * defect one step earlier: an enumeration of 744 shapes of this family found
+ * ZERO that were RED and still able to take a follow-up insert.
+ *
+ * Skipped without path compression: there is no compressed parent, so the arm
+ * is never entered -- and that build LIVELOCKS on this shape for an unrelated
+ * reason in the graft (ft_bulk_node_reserve_fill re-filling per retry).
+ */
+static int rekey_promote_skipx_dual_coherent(const char *colocated,
+		const char *deep, const char *nw, const char *old,
+		const char *moved)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	int ret = -1;
+	enum cds_ft_status s;
+
+	ft = create_varlen_ft(&group);
+	rcu_read_lock();
+	/* @colocated blocks the run's collapse; "zq" keeps the top a branch. */
+	cds_ft_insert(ft, (const uint8_t *) colocated, strlen(colocated),
+		&node_alloc(1)->node);
+	cds_ft_insert(ft, (const uint8_t *) deep, strlen(deep),
+		&node_alloc(2)->node);
+	cds_ft_insert(ft, (const uint8_t *) "zq", 2, &node_alloc(3)->node);
+
+	s = ft_rekey(ft, nw, old);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "rekey %s<-%s: %s (this shape is served)\n",
+			nw, old, cds_ft_status_to_string(s));
+		goto out;
+	}
+	/*
+	 * THE ASSERTION.  Every key can be correct and the trie still carry two
+	 * disagreeing paths to one child, which is what this shape did: the
+	 * key checks below ALL PASSED while the dual was stale.  So verify runs
+	 * FIRST and its failure is the one reported.
+	 */
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "rekey %s<-%s: stale SKIP_X dual (the promote's "
+			"publish did not ride the rekey's commit)\n", nw, old);
+		goto out;
+	}
+	if (!ft_test_has_key(ft, "zq") || !ft_test_has_key(ft, colocated)) {
+		fprintf(stderr, "rekey %s<-%s: bystander key lost\n", nw, old);
+		goto out;
+	}
+	if (!ft_test_has_key(ft, moved) || ft_test_has_key(ft, deep)) {
+		fprintf(stderr, "rekey %s<-%s: moved key at neither/both names\n",
+			nw, old);
+		goto out;
+	}
+	ret = 0;
+out:
+	rcu_read_unlock();
+	drain_trie(ft);
+	rcu_barrier();
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+static int test_rekey_promote_skipx_dual_coherent(void)
+{
+	if (!cds_ft_merge_enabled()) {
+		diag("test_rekey_promote_skipx_dual_coherent: skipped, merge "
+			"compiled out (-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
+	if (!_cds_ft_debug_compress_enabled()) {
+		diag("test_rekey_promote_skipx_dual_coherent: skipped, path "
+			"compression compiled out (-DNO_FEATURE_FT_COMPRESS): "
+			"no compressed parent, and this shape LIVELOCKS there");
+		return 0;
+	}
+	/*
+	 * TWO CUTS of the same run.  The co-located key sits INSIDE the run and
+	 * the src cut is deeper than it -- that pair is what leaves the junction
+	 * to dissolve under a compressed parent.  An enumeration of the family
+	 * put every hit at cut > coloc, so both relations are covered here:
+	 * cut = coloc + 1 and cut = coloc + 2.
+	 */
+	if (rekey_promote_skipx_dual_coherent("zha", "zhabbb", "zwe", "zhab",
+			"zwebb"))
+		return -1;
+	return rekey_promote_skipx_dual_coherent("zhab", "zhabbb", "zwe",
+			"zhabb", "zweb");
 }
 
 /*
@@ -35119,6 +35236,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_merge_rekey_same_trie_speculative_rejected);
 	RUN_TEST(test_rekey_graft_vs_merge);
 	RUN_TEST(test_rekey_skip_slot_bp_atomic_or_refused);
+	RUN_TEST(test_rekey_promote_skipx_dual_coherent);
 	RUN_TEST(test_rekey_cut_run_dst_split_keeps_keys);
 	RUN_TEST(test_rekey_graft_publish_survives_detach);
 	RUN_TEST(test_rekey_known_nonterminating);

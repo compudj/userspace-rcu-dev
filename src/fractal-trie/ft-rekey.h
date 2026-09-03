@@ -3532,6 +3532,59 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		 * spacing alone), which is why it was the only arm that hung.
 		 */
 		glue.lock_d_src = &d_src;
+		/*
+		 * ☠ HOLD THE DETACH'S COMPRESSED BOUNDARY PARENT BEFORE THE GRAFT
+		 * RECOMPACTS, OR THE TWO WRITE ITS STATE WORD WITH DIFFERENT KINDS.
+		 *
+		 * The graft's ADD-recompaction sweep re-homes every surviving child
+		 * of the node it copies, and for each one ft_reparent_record_meta
+		 * records the §4.B MW {live_state -> live_state} validate.  The
+		 * detach below then takes that same word for a TERMINAL -- the
+		 * external-promote arm acquires the compressed parent it publishes
+		 * into and records its SW {LOCK|s -> s} release.  One word, two
+		 * kinds: the engine's kind check aborts a debug build and the
+		 * poisoned descriptor is absorbed by this function's own retry
+		 * loop on a release one.  Measured, single-threaded, on the fold.
+		 *
+		 * ft_reparent_record_meta already answers this, and its comment
+		 * spells out both halves: a child found in the op's HELD SET takes
+		 * NO state edge at all ("the mark is the stronger statement
+		 * anyway"), while one recorded MW against a word the op holds gives
+		 * "a deterministic abort on every attempt, which presents as a
+		 * livelock with no contention".  The recompact sweep already passes
+		 * @ctx for exactly this.  What it cannot do is see a lock taken
+		 * AFTER it ran -- so the acquire has to move ahead of the copy.
+		 *
+		 * The node is nameable here: measured, the promote's @cn is
+		 * d_src.ppnf (ft_compressed_node_flag(cn) == d_src.ppnf, at
+		 * d_src.ppdepth).  Only a COMPRESSED one can reach that arm, and a
+		 * word the op already holds comes back @shared and adds no mark.
+		 * The release is owed by the marks sweep, exactly as cow_stop's are.
+		 */
+		if (ft->lock_fine && d_src.ppnf &&
+				!ft_node_external(d_src.ppnf) &&
+				ft_node_compressed(d_src.ppnf) &&
+				nr_marks < FT_ENTRY_PER_NODE + 2) {
+			struct cds_ft_compressed_node *bcn =
+				ft_compressed_node_ptr(d_src.ppnf);
+			struct cds_ft_metadata *bm = cds_ft_item_to_metadata(
+				(struct cds_ft_inode *) bcn);
+			struct ft_lock_ctx bpctx;
+
+			ft_lock_ctx_init(&bpctx, &d_src, txn, optxn);
+			bpctx.held.extra = marks;
+			bpctx.held.nr_extra = nr_marks;
+			bpctx.held.glue = &glue;
+			if (ft_acquire_member(ft, &bpctx, d_src.ppnf, bm,
+					d_src.ppdepth, &marks[nr_marks])) {
+				ret = -EAGAIN;
+				goto bail_build;
+			}
+			if (!marks[nr_marks].shared) {
+				nr_marks++;
+				ft_rekey_marks_to_txn(txn, marks, nr_marks);
+			}
+		}
 		{
 			/*
 			 * The op's outstanding marks -- ft_rekey_cow_stop's @stop
