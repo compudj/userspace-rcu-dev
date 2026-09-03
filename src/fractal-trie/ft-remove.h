@@ -131,6 +131,85 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 		 * NOT have metadata->external_nodes set.
 		 */
 		struct cds_ft_compressed_node *cn = src_cn;
+		const struct ft_glue *split_g = record_only ?
+			ft_glue_that_split(ctx, cn) : NULL;
+
+		/*
+		 * ☠ @cn IS A NODE THIS VERY COMMIT DESTROYS -- so do not write it.
+		 *
+		 * A same-trie rekey whose graft SPLIT @cn arrives here with @cn on
+		 * the glue's retire list and @cn's one live child @cn_child already
+		 * re-homed, by a deferred edge, into the fresh cluster the forward
+		 * publish installs.  The promote below would then write @cn twice
+		 * over: into @cn->child, a body nothing will read after the flip;
+		 * and, through _ft_publish_to_parent's SKIP_X arm, into @cn's own
+		 * home slot -- which is the WORD THE GLUE'S PUBLISH REPOINTS.  Two
+		 * records on one word whose expected-olds disagree: the dual chains
+		 * {skip(cn_child) -> skip(head)} and the glue then chains
+		 * {skip(cn_child) -> top}, urcu_txn_record_chain finds
+		 * r->new_ptr != old_ptr, POISONS the descriptor, the commit aborts
+		 * and the op re-plans the identical shape.  MEASURED on the
+		 * shipping build: 310,024 poisons in 40 s on one such shape, a
+		 * fresh cluster allocated per attempt.
+		 *
+		 * ☠ AND CURING ONLY THAT COLLISION COMMITS A WRONG TRIE.  MEASURED
+		 * with the collision cured (a read-your-own-writes expected-old on
+		 * the glue's publish): the call returns, cds_ft_verify is RED --
+		 * "head cell {parent <cn>} != expected {owner <branch>}" -- and the
+		 * next insert wedges.  The glue's build wired the branch's old
+		 * direction to @cn_child, believing it survives; the promote
+		 * DISSOLVES @cn_child and puts the external head in its place.  So
+		 * the two steps disagree about what lives under that branch, and
+		 * the collision is the first SYMPTOM of that disagreement, not the
+		 * defect.
+		 *
+		 * RE-HOME instead of publishing: hand the promoted head to the
+		 * deferred edge that was going to move @cn_child, and store it into
+		 * the fresh cluster's own slot.  The edge is where BOTH of the
+		 * promote's writes belong once @cn is retired -- the forward one
+		 * because the fresh slot is @cn->child's successor, and the head's
+		 * back-edge because ft_reparent_record records it against the fresh
+		 * owner with a read-your-own-writes expected-old, atomically with
+		 * the publish.  @cn's home slot is then written ONCE, by the glue,
+		 * and its raw expected-old is correct because nothing else touched
+		 * the word.
+		 *
+		 * The store into the fresh slot is a PLAIN one: that cluster is
+		 * build-invisible until the forward publish, and the txn publishes
+		 * reachability, not interiors.
+		 */
+		if (split_g) {
+			struct ft_glue *g = (struct ft_glue *) split_g;
+			int idx = g->old_dir_deferred;
+
+			/*
+			 * The drop-old-direction arm leaves the caller no detach
+			 * to run (@old_dir_dropped), so reaching here with it set
+			 * would mean two steps both claiming the old direction.
+			 */
+			urcu_assert_debug(!g->old_dir_dropped);
+			/*
+			 * REFUSE, do not guess, on every shape the re-home is not
+			 * written for: a re-home through a fresh suffix node
+			 * (whose parent slot holds a SKIP form this frame cannot
+			 * re-encode), a build that re-homed nothing, a rank-stats
+			 * trie (the fresh cluster was sized with @cn_child's key
+			 * count, which the promote changes), and the fused arm
+			 * (its cell unsplice rides the publish we are removing).
+			 * Terminal -- the shape is deterministic, so -EAGAIN would
+			 * spin -- and BEFORE ANY SIDE-EFFECT: nothing is acquired,
+			 * recorded or stored above this point.
+			 */
+			if (g->old_dir_via_suffix || idx < 0 || ft->rank_stats ||
+					count_delta || fuse_cell || run)
+				return -EDOM;
+			g->deferred[idx].child =
+				(struct cds_ft_inode_flag *) topmost_external_nodes;
+			CMM_STORE_SHARED(*g->deferred[idx].slot,
+				(struct cds_ft_inode_flag *) topmost_external_nodes);
+			*nr_clear = 0;
+			return 0;
+		}
 		/*
 		 * DLM Step 1: @cn is the value-swap RELEASE target this external-
 		 * promote publishes into (its child slot); acquire it (hard, no guard-
@@ -1419,6 +1498,35 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 			 * enumerated shapes of this family.
 			 */
 			if (caa_unlikely(publish_parent != raw_parent)) {
+				free_compressed_node_unpublished(ft, new_cn);
+				return -EDOM;
+			}
+			/*
+			 * ☠ THE SAME DISAGREEMENT AS THE PROMOTE ARM'S, ONE ARM
+			 * OVER.  When the caller's graft SPLIT @parent_cn, this
+			 * collapse absorbs a node that commit RETIRES and
+			 * republishes it at @parent_cn's home -- the word the
+			 * glue's forward publish repoints -- while the split has
+			 * already re-homed @parent_cn's child under its fresh
+			 * cluster.  Two steps, one word, incompatible plans.
+			 *
+			 * ☠ AND --enable-rcu-debug CANNOT SEE IT HERE.  MEASURED
+			 * on a release probe build: this shape poisons the
+			 * descriptor THREE times per attempt and every one is
+			 * SW-against-SW -- the kind assert never fires, @cn's
+			 * state word is retired twice, and a {live -> live}
+			 * validate chains after a tombstone.  The livelock is the
+			 * only detector, which is why the refusal is what makes
+			 * the shape reportable at all.
+			 *
+			 * Serving it needs the merged node re-based BELOW the
+			 * split point -- a different product from the one this
+			 * function builds -- so refuse terminally with the
+			 * rekey's carve-out code, exactly as the arm above does,
+			 * and for the same stated meaning.
+			 */
+			if (caa_unlikely(ft_glue_that_split(ctx, parent_cn) !=
+					NULL)) {
 				free_compressed_node_unpublished(ft, new_cn);
 				return -EDOM;
 			}

@@ -73,9 +73,9 @@
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (368 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (369 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (317 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (318 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -13008,6 +13008,239 @@ static int test_rekey_promote_skipx_dual_coherent(void)
 		return -1;
 	return rekey_promote_skipx_dual_coherent("zhab", "zhabbb", "zwe",
 			"zhabb", "zweb");
+}
+
+/*
+ * ☠ PER-NODE SPACING, PINNED, and not because the shape needs a knob.
+ *
+ * The two pins below assert a property of the PER-NODE lock spacing, and both
+ * their shapes LIVELOCK at a coarser one -- MEASURED, on the parent commit AND
+ * on this one, identically: 192 of the 4328 enumerated shapes of this family
+ * hang under CDS_FT_LOCK_SPACING=exponential, these among them, and the
+ * per-shape diff between the two commits there is EMPTY.  That is a
+ * pre-existing coarse-spacing defect this change does not touch.
+ *
+ * create_varlen_ft() would inherit the ENV knob (ft_lock_spacing_default), so a
+ * gate leg that sets it would not fail these tests -- it would HANG THE SUITE
+ * inside them, and a libtap plan absorbs a hang no better than a TODO does.
+ * Pin the attribute instead of skipping, so the assertion still runs on every
+ * configuration rather than silently evaporating on the one leg that sets it.
+ */
+static struct cds_ft *create_varlen_pernode_ft(struct cds_ft_group **group_out)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+
+	if (cds_ft_group_attr_create(&attr) < 0)
+		abort();
+	if (cds_ft_group_attr_set_lock_spacing(attr,
+			CDS_FT_LOCK_SPACING_PER_NODE) != CDS_FT_STATUS_OK)
+		abort();
+	if (cds_ft_group_create(attr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &ft) < 0)
+		abort();
+	*group_out = group;
+	return ft;
+}
+
+/*
+ * A PROMOTE MUST NOT WRITE A NODE ITS OWN COMMIT IS SPLITTING.
+ *
+ * A same-trie rekey whose graft SPLITS a compressed node @cn, and whose detach
+ * then takes ft_detach_node_replace_compressed_parent's external-promote arm on
+ * that SAME @cn, has two steps with incompatible plans for one word.  The split
+ * retires @cn and re-homes @cn's live child under its fresh cluster; the promote
+ * publishes into @cn->child and refreshes @cn's SKIP_X dual -- and that dual's
+ * home is the very slot the split's forward publish repoints.
+ *
+ * ☠ WHAT THAT COSTS, measured on the shipping default build, single threaded,
+ * from these four keys and this one call: the dual chains
+ * {skip(child) -> skip(head)} and the glue then chains {skip(child) -> top},
+ * urcu_txn_record_chain finds r->new_ptr != old_ptr, POISONS the descriptor,
+ * the commit aborts and the identical plan is re-derived for ever -- 310,024
+ * poisons in 40 s, a fresh cluster allocated per attempt.  The call NEVER
+ * RETURNS.
+ *
+ * ☠ AND CURING ONLY THE COLLISION IS WORSE, not better.  Measured with a
+ * read-your-own-writes expected-old on the glue's publish and nothing else: the
+ * call returns, cds_ft_verify reports "head cell {parent <cn>} != expected
+ * {owner <branch>}", and the next insert wedges.  The split had wired the
+ * branch's old direction to a junction the promote DISSOLVES, so the collision
+ * is the first symptom of that disagreement and not the defect.
+ *
+ * ☞ WHAT THIS TEST ASSERTS is cds_ft_verify plus the keys, the same cheap
+ * witness the dual pin above uses and for the same reason: a test that
+ * reproduced the wedge would hang the suite.  ☠ Note what "red at the parent"
+ * means for this one -- at the parent commit it HANGS rather than printing
+ * `not ok`, because the defect IS the livelock.
+ *
+ * Skipped without path compression: there is no compressed node to split, and
+ * that build spins on this shape for the unrelated graft reason the dual pin
+ * names.
+ */
+static int rekey_promote_into_split_cn(const char *colocated, const char *deep,
+		const char *branch, const char *nw, const char *old,
+		const char *moved, const char *moved_branch)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	int ret = -1;
+	enum cds_ft_status s;
+
+	ft = create_varlen_pernode_ft(&group);
+	rcu_read_lock();
+	/* @colocated blocks the run's collapse; "q" keeps the top a branch. */
+	cds_ft_insert(ft, (const uint8_t *) colocated, strlen(colocated),
+		&node_alloc(1)->node);
+	cds_ft_insert(ft, (const uint8_t *) deep, strlen(deep),
+		&node_alloc(2)->node);
+	/*
+	 * ★ THE BRANCH IS THE DISCRIMINATOR.  Without a second key under the
+	 * run there is no junction for the detach to dissolve, and the graft
+	 * takes an arm that never meets the promote.  An enumeration of 4328
+	 * shapes put every hit at branch-count >= 1.
+	 */
+	cds_ft_insert(ft, (const uint8_t *) branch, strlen(branch),
+		&node_alloc(3)->node);
+	cds_ft_insert(ft, (const uint8_t *) "q", 1, &node_alloc(4)->node);
+
+	s = ft_rekey(ft, nw, old);
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "rekey %s<-%s: %s (this shape is served)\n",
+			nw, old, cds_ft_status_to_string(s));
+		goto out;
+	}
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "rekey %s<-%s: the promote wrote the node the "
+			"split retires\n", nw, old);
+		goto out;
+	}
+	if (!ft_test_has_key(ft, "q") || !ft_test_has_key(ft, colocated)) {
+		fprintf(stderr, "rekey %s<-%s: bystander key lost\n", nw, old);
+		goto out;
+	}
+	if (!ft_test_has_key(ft, moved) || ft_test_has_key(ft, deep)) {
+		fprintf(stderr, "rekey %s<-%s: moved key at neither/both names\n",
+			nw, old);
+		goto out;
+	}
+	if (!ft_test_has_key(ft, moved_branch) ||
+			ft_test_has_key(ft, branch)) {
+		fprintf(stderr, "rekey %s<-%s: branch key at neither/both "
+			"names\n", nw, old);
+		goto out;
+	}
+	ret = 0;
+out:
+	rcu_read_unlock();
+	drain_trie(ft);
+	rcu_barrier();
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
+ * THE SAME DISAGREEMENT ONE ARM OVER, WHICH IS REFUSED RATHER THAN SERVED.
+ *
+ * With the co-located key at the src cut, the detach reaches the CHAIN-COLLAPSE
+ * arm instead of the promote: it absorbs the node the split retires and
+ * republishes it at that node's home -- the word the split's publish repoints.
+ * Serving it needs the merged node re-based below the split point, which is a
+ * different product from the one ft_chain_compress_fused builds, so it is
+ * refused terminally with the rekey's carve-out code.
+ *
+ * ☠ --enable-rcu-debug CANNOT SEE THIS ONE.  Measured on a release probe build:
+ * three poisons per attempt and every one is SW-against-SW, so no kind assert
+ * fires; the livelock is the only detector.  That is why the refusal is what
+ * makes the shape reportable at all -- and why, at the parent commit, this test
+ * HANGS instead of failing.
+ */
+static int rekey_promote_split_collapse_refused(const char *colocated,
+		const char *deep, const char *branch, const char *nw,
+		const char *old)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	int ret = -1;
+	enum cds_ft_status s;
+	unsigned long before;
+
+	ft = create_varlen_pernode_ft(&group);
+	rcu_read_lock();
+	cds_ft_insert(ft, (const uint8_t *) colocated, strlen(colocated),
+		&node_alloc(1)->node);
+	cds_ft_insert(ft, (const uint8_t *) deep, strlen(deep),
+		&node_alloc(2)->node);
+	cds_ft_insert(ft, (const uint8_t *) branch, strlen(branch),
+		&node_alloc(3)->node);
+	cds_ft_insert(ft, (const uint8_t *) "q", 1, &node_alloc(4)->node);
+	before = cds_ft_count_entries(ft);
+
+	s = ft_rekey(ft, nw, old);
+	if (s == CDS_FT_STATUS_OK) {
+		fprintf(stderr, "rekey %s<-%s: SERVED -- the collapse arm now "
+			"has a product for this shape; assert it instead of "
+			"the refusal\n", nw, old);
+		goto out;
+	}
+	if (s != CDS_FT_STATUS_NOT_SUPPORTED) {
+		fprintf(stderr, "rekey %s<-%s: refused as %s -- a deterministic "
+			"shape must take the carve-out code, never a retryable "
+			"one\n", nw, old, cds_ft_status_to_string(s));
+		goto out;
+	}
+	/*
+	 * ★ A REFUSAL IS A CLAIM ABOUT THE TRIE, not about the return code.
+	 * Check the claim: the key count is unchanged and verify is clean.
+	 */
+	if (cds_ft_count_entries(ft) != before) {
+		fprintf(stderr, "rekey %s<-%s: refused and the count MOVED\n",
+			nw, old);
+		goto out;
+	}
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "rekey %s<-%s: refused on a BROKEN trie\n",
+			nw, old);
+		goto out;
+	}
+	ret = 0;
+out:
+	rcu_read_unlock();
+	drain_trie(ft);
+	rcu_barrier();
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+static int test_rekey_promote_into_split_cn(void)
+{
+	if (!cds_ft_merge_enabled()) {
+		diag("test_rekey_promote_into_split_cn: skipped, merge "
+			"compiled out (-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
+	if (!_cds_ft_debug_compress_enabled()) {
+		diag("test_rekey_promote_into_split_cn: skipped, path "
+			"compression compiled out (-DNO_FEATURE_FT_COMPRESS): "
+			"nothing to split, and this shape SPINS there");
+		return 0;
+	}
+	/* run "abbb" under 'w', co-located at 1, branch at 3, src cut at 3. */
+	if (rekey_promote_into_split_cn("wa", "wabbb", "wabby", "we", "wabb",
+			"web", "wey"))
+		return -1;
+	/* The same run with a SECOND branch key under it. */
+	if (rekey_promote_into_split_cn("wa", "wabbb", "wabbz", "we", "wabb",
+			"web", "wez"))
+		return -1;
+	/* Co-located AT the cut: the collapse arm, refused. */
+	return rekey_promote_split_collapse_refused("wabb", "wabbb", "way",
+			"we", "wabb");
 }
 
 /*
@@ -35237,6 +35470,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_rekey_graft_vs_merge);
 	RUN_TEST(test_rekey_skip_slot_bp_atomic_or_refused);
 	RUN_TEST(test_rekey_promote_skipx_dual_coherent);
+	RUN_TEST(test_rekey_promote_into_split_cn);
 	RUN_TEST(test_rekey_cut_run_dst_split_keeps_keys);
 	RUN_TEST(test_rekey_graft_publish_survives_detach);
 	RUN_TEST(test_rekey_known_nonterminating);

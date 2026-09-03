@@ -11152,6 +11152,48 @@ struct ft_glue {
 	/* OUT: the build took that path, so the caller owes NO detach. */
 	bool old_dir_dropped;
 	/*
+	 * ☠ WHAT THIS BUILD REPLACED, so a LATER step of the same op can see it.
+	 *
+	 * A split RETIRES @cn and re-homes @cn's one live child under the fresh
+	 * cluster.  A same-commit detach that then edits @cn -- publishing into
+	 * @cn->child and refreshing @cn's SKIP_X dual -- writes a node this
+	 * commit destroys AND collides on the word the forward publish repoints,
+	 * which the engine reports as a value mismatch on that word: the
+	 * descriptor poisons, the commit aborts, and the op re-plans the
+	 * identical shape for ever.
+	 *
+	 * The detach cannot derive any of this: it is handed @cn and a lock ctx,
+	 * and the split is a step it never sees.  So the BUILD names it, exactly
+	 * as @pending_pub_slot names a publish a recompaction superseded.
+	 *
+	 * @split_cn is the node handed to ft_glue_defer_free -- NOT
+	 * @split_cn_holder, which is @cn's ANCHOR and is a DIFFERENT node under
+	 * a coarser lock spacing, and not @split_cn_node either, which the
+	 * lock_fine fence leaves NULL on a txn-less build.  Recorded
+	 * unconditionally so the predicate is a property of the SHAPE and not of
+	 * the lock mode.
+	 *
+	 * @old_dir_deferred is the index of the deferred edge that re-homes
+	 * @cn's child: its @slot is the word in the FRESH cluster that now holds
+	 * that child (the branch's old-direction slot when the suffix is empty,
+	 * the fresh suffix node's own child slot otherwise), and its @parent is
+	 * that slot's owner.  -1 when the build re-homed nothing (the
+	 * drop-old-direction arm, or a child the glue itself built).  Captured
+	 * AFTER the branch is final: the second ft_node_set_nth may reallocate
+	 * it, which would leave a captured slot pointing into a freed body.
+	 */
+	const void *split_cn;
+	int old_dir_deferred;
+	/*
+	 * The re-home goes through a FRESH SUFFIX NODE rather than straight into
+	 * the branch, so the slot above it holds that node's SKIP form and a
+	 * later step that changes the suffix's child owes a re-encode there too.
+	 * No shape reaches it today (a split with a non-empty suffix is refused
+	 * upstream), and a store this file cannot exercise is one nobody tests:
+	 * the consumer refuses instead of writing it blind.
+	 */
+	bool old_dir_via_suffix;
+	/*
 	 * Node whose nr_keys == the grafted payload's key count, and from
 	 * whose parent the external-count propagation starts at commit.
 	 */
@@ -11293,6 +11335,9 @@ void ft_glue_init(struct ft_glue *g)
 	g->fence_split_cn = false;
 	g->drop_old_dir_of = NULL;
 	g->old_dir_dropped = false;
+	g->split_cn = NULL;
+	g->old_dir_deferred = -1;
+	g->old_dir_via_suffix = false;
 	g->attached_nf = NULL;
 	g->txn = NULL;
 	g->fuse_free_list = false;
@@ -12776,6 +12821,55 @@ bool ft_glue_op_holds(const struct ft_glue *g,
 	bool ratified;
 
 	return ft_glue_held_snap(g, meta, &snap, &ratified);
+}
+
+/*
+ * DID THIS OP ALREADY BUILD THE SPLIT THAT REPLACES @cn?  Returns the glue that
+ * did, or NULL.
+ *
+ * Asked by a LATER step of the same op that is about to edit @cn -- and the
+ * answer decides whether that edit is an ordinary publish or a write into a
+ * node the same commit destroys.  Identity, not lock state: @split_cn is the
+ * node the build handed to ft_glue_defer_free, so the question is answered the
+ * same way at every lock spacing, which the held-set sources are not (an anchor
+ * is a different node once the spacing coarsens).
+ *
+ * ☠ THE CHAIN, not the frame.  MEASURED: the detach runs on a NESTED frame
+ * whose own @glue is NULL, and the glue that split @cn is the CALLER's, one
+ * frame out -- so a lookup that stopped at ctx->held would answer NULL for
+ * every shape this exists to catch.  The peer glue is asked for the same reason
+ * ft_glue_held_snap asks it: a cross-trie op carries two.
+ */
+static
+const struct ft_glue *ft_glue_that_split(const struct ft_lock_ctx *ctx,
+		const void *cn)
+{
+	const struct ft_held_set *h;
+
+	if (!ctx || !cn)
+		return NULL;
+	for (h = &ctx->held; h; h = h->outer) {
+		if (!h->glue)
+			continue;
+		if (h->glue->split_cn == cn)
+			return h->glue;
+		if (h->glue->peer && h->glue->peer->split_cn == cn)
+			return h->glue->peer;
+	}
+	return NULL;
+}
+
+/* The deferred entry that re-parents @child, or -1: see @old_dir_deferred. */
+static
+int ft_glue_deferred_index(const struct ft_glue *g,
+		const struct cds_ft_inode_flag *child)
+{
+	int i;
+
+	for (i = 0; i < g->nr_deferred; i++)
+		if (g->deferred[i].child == child)
+			return i;
+	return -1;
 }
 
 /*

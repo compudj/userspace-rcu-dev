@@ -145,6 +145,15 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 			return -ENOMEM;
 		ft_glue_set_publish(ft, glue, d->pnf, d->nfp, top);
 		ft_glue_defer_free(glue, cn, true);
+		/*
+		 * Named for the SAME reason the two-armed split names it (see
+		 * @split_cn): a later step of this op that edits @cn is editing a
+		 * node this commit destroys.  @old_dir_deferred stays -1 -- this
+		 * arm re-homes nothing, it leaves the old direction behind -- so a
+		 * consumer that needs the re-home refuses rather than inventing
+		 * one.
+		 */
+		glue->split_cn = cn;
 		glue->attached_nf = top;
 		glue->old_dir_dropped = true;
 		return 0;
@@ -348,6 +357,26 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 	 */
 	ft_glue_defer_edge_origin(ft, glue, old_suffix_flag, branch_flag, slot,
 		suffix_len == 0 && glue->txn != NULL);
+	/*
+	 * ☠ NAME WHAT THIS BUILD REPLACED (see @split_cn), and name it HERE.
+	 *
+	 * @cn is retired by this commit and its one live child @cn_child is
+	 * re-homed under the fresh cluster -- two facts a LATER step of the same
+	 * op cannot derive from the arguments it is handed.  The step that needs
+	 * them is the detach's external-promote, which otherwise publishes into
+	 * @cn->child and refreshes @cn's SKIP_X dual at the very word the
+	 * forward publish below repoints: two records on one slot whose
+	 * expected-olds disagree, which poisons the descriptor and re-plans for
+	 * ever (ft-remove.h's promote arm carries the measurement).
+	 *
+	 * AFTER the branch is final, never at the defer above: the second
+	 * ft_node_set_nth may reallocate the branch, and a slot captured before
+	 * that points into a body already freed.  The index survives the move
+	 * because ft_glue_defer_edge_origin rewrites the entry in place.
+	 */
+	glue->split_cn = cn;
+	glue->old_dir_via_suffix = (suffix_len != 0);
+	glue->old_dir_deferred = ft_glue_deferred_index(glue, cn_child);
 	/* Wire the NEW direction. */
 	ft_node_get_nth_skip(branch_flag, &slot, new_ordinal, FT_PF_NONE);
 	if (ft_node_compressed(new_dir) && slot) {
