@@ -1736,6 +1736,66 @@ struct cds_ft_compressed_node *ft_skip_to_compressed(const struct cds_ft *ft,
 
 
 /*
+ * ft_upwalk_edge_bytes: the key bytes an up-walk consumes on the hop from @cur
+ * to its INTERNAL @parent.
+ *
+ * One byte for a child in a branch slot -- and ZERO for a PREFIX head: an
+ * external head hanging at @parent's external_nodes, whose key ENDS at
+ * @parent, so it sits AT @parent's position and no edge byte separates them.
+ *
+ * That is the same SLOT-head / PREFIX-head shape question ft_rebuild_key_upwalk
+ * asks, answered from the same two places -- the holder's live external_nodes
+ * (ft_node_external_nodes) and, once the holder has been cleared, the retired
+ * cell's FT_ORD_PARENT_DETACHED_PREFIX mark.
+ *
+ * A skip slot never NAMES a prefix head at rest (it names the compressed node's
+ * child, whose parent is that compressed node), so these arms are reached only
+ * through a STALE slot whose target a concurrent split has re-homed as a fresh
+ * internal node's prefix head -- exactly the case ft_skip_reanchor exists to
+ * resolve.
+ *
+ * Only an EXTERNAL @cur can be a prefix head, so an internal / compressed @cur
+ * takes the constant-1 arm with no extra load.
+ */
+static inline
+unsigned int ft_upwalk_edge_bytes(const struct cds_ft *ft,
+		struct cds_ft_inode_flag *cur,
+		struct cds_ft_inode_flag *parent)
+{
+	void *prev;
+
+	if (!ft_node_external(cur))
+		return 1U;
+	if (ft_node_external_nodes(parent) == (struct cds_ft_node *) cur)
+		return 0U;
+	/*
+	 * The holder does not name @cur.  That is NOT "@cur hangs off a slot":
+	 * a key-disappearing remove of a PREFIX head whose holder keeps its
+	 * other children CLEARS the holder's external_nodes in place (and a
+	 * replace / re-insert leaves it naming a DIFFERENT head), so a dead or
+	 * displaced prefix head reads exactly like a slot head from here -- and
+	 * charging it a byte is the very mis-anchor this helper exists to stop.
+	 *
+	 * The answer the holder can no longer give comes from the CELL: that
+	 * same remove marks the retired cell's parent word
+	 * (FT_ORD_PARENT_DETACHED_PREFIX) in the SAME flip that clears the
+	 * holder.  Reading the mark AFTER the external_nodes load is what makes
+	 * the pair race-free without a re-read: a load that missed the clear
+	 * already answered 0 above, and one that saw it sees the mark too.
+	 *
+	 * ☠ With the ordered list OFF there is no cell and no mark, so this
+	 * window stays open there; see ft_rebuild_key_upwalk, which is
+	 * ordered-list-only for the same reason.
+	 */
+	if (!ft->ordered_list)
+		return 1U;
+	prev = ft_dereference_prev_resolved((struct cds_ft_node *) cur);
+	return ft_ord_parent_detached_prefix(ft_resolve_flip_proxy(
+			rcu_dereference(ft_ord_cell_ptr(prev)->parent))) ?
+		0U : 1U;
+}
+
+/*
  * ft_skip_reanchor: the single concurrency-handling mechanism for skip-
  * compressed pointers.  A skip slot encodes a length (skip_len), but the live
  * compressed node recovered via the skip child's back-pointer may no longer
@@ -1750,8 +1810,9 @@ struct cds_ft_compressed_node *ft_skip_to_compressed(const struct cds_ft *ft,
  * @G, however, is reachable in the LIVE trie (a live leaf or live internal), so
  * its parent chain runs through live nodes that converge.  Walk it up,
  * accumulating consumed path length (a compressed spans its len, an internal
- * one byte), until the accumulated length reaches the slot's skip_len: that
- * locates the live tree position the failing slot encoded.
+ * one byte -- or NONE when the child is that internal node's PREFIX head, see
+ * ft_upwalk_edge_bytes), until the accumulated length reaches the slot's
+ * skip_len: that locates the live tree position the failing slot encoded.
  *
  *   - split (live path lengthened into prefix+branch+suffix at the same total
  *     length): the accumulation lands exactly, @*rewind == 0; re-anchor at the
@@ -1832,7 +1893,8 @@ struct cds_ft_inode_flag *ft_skip_reanchor(struct cds_ft *ft,
 			(void *) ft_compressed_node_ptr(parent) :
 			(void *) ft_node_ptr(parent);
 		acc += ft_node_compressed(parent) ?
-			ft_compressed_node_ptr(parent)->len : 1U;
+			ft_compressed_node_ptr(parent)->len :
+			ft_upwalk_edge_bytes(ft, cur, parent);
 		if (acc >= want) {
 			/*
 			 * @parent is the node spanning (rewind > 0, a merge) or
