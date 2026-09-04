@@ -425,31 +425,54 @@ MCAS would arbitrate it" describes the safety net being removed, not a design.
 (The state-word bit is also only half a fix — a bit meaning "has an external
 head" says nothing about which body slot holds what.)
 
-**Q1b — and what does a failed re-read DO?**  Much smaller than it looked:
+**Q1b — ☑ MOSTLY ANSWERED, by building it.**  The headline is settled and
+shipped; what is left is four named residuals, not a design choice.
 
-* Under **(b)** it largely cannot arise — the plan is derived under the mark, so
-  it is simply correct.  What remains is the **acquire MISS**, which already has
-  a settled answer: `t->acquire_miss` is recorded and the commit ABORTS,
-  all-or-none, and the op re-plans (`ft-mutation-helpers.h`, the
-  `lock_or_guard_parent` miss path — *"Deliberately not a spin"*).
-* Under **(a)** the bail is `-EAGAIN`, and **refutation (4) measured no
-  livelock**: the caller's own gate re-evaluates on the retry and stops
-  selecting the collapse, because the boundary genuinely is no longer a collapse
-  candidate.  The 8/8 `rc=137` in refutation (2) came from a predicate that
-  could be permanently false, not from bailing as such.
-* ☠ **Skipping is refuted** (§6): the canonical form is enforced by
-  `cds_ft_verify` and by an `abort()` at the writer-scope exit.
-* ☐ Two residuals, both flagged in §6: the `record_only` fold arm, where
-  `-EAGAIN` is safe only because the caller destroys the shared txn (INFERRED,
-  not measured); and the SECOND defect (§3.3.1), where `*need_retry` eliminated
-  the shape but produced **one `rc=137` in 24** — there a bounded re-derivation
-  or a re-descent is probably needed instead of a plain retry.
+**Settled by implementation + measurement:**
 
-★ For the second defect the same lock reading applies and points somewhere
-specific: `cds_ft_remove`'s four-way branch reads a `holder_flag` derived from
-`node->prev` far above any mark, so **derive the holder under the mark and the
-whole arm-selection stops being able to go stale** — which is cheaper than
-patching each arm's refusal, and closes `ft-remove.h:5308` and `:5520` together.
+* the **chain compress** returns `-EAGAIN` (@`b0995d2c`, @`6792267b`).  No
+  livelock — the caller's own gate re-evaluates and stops selecting the
+  collapse.  Yield over 20 seeds: 22 head + 9 detach refusals.
+* the **orphan walk** returns `-EAGAIN; goto end` instead of `break`
+  (@`f1888262`, @`9b5d2c60`); `ft_unit` 43 s, yield 4 refusals across 18 runs.
+* **skipping stays dead** (§6): `cds_ft_verify` rejects the residue and the
+  writer-scope verifier `abort()`s on it.
+* the **acquire miss** was never in question — `t->acquire_miss` aborts the
+  commit all-or-none and the op re-plans, *"deliberately not a spin"*.
+* **the gate agrees**: 60/62 at @`e36c5a3e`, the two reds byte-identical to the
+  baseline.
+
+**☐ The four residuals, most load-bearing first:**
+
+1. **The `record_only` fold arm — VERIFIED IN CODE, ZERO MEASURED COVERAGE.**
+   Its sole caller is `ft-rekey.h:3724`; the `detach_bail:` block handles
+   `if (ret)` generically and calls `ft_flip_txn_destroy(txn)`, whose sweep
+   releases the registrations *through each node's own metadata*, ordered before
+   the unpublished frees.  The path is ALREADY reachable for `-EAGAIN` from two
+   pre-existing sources (the up-front lock-set acquire; the `parent_guard`
+   read-set validation), so the new refusal is a third source of an
+   already-handled return — not new handler code.  ☠ But `record_only` is set
+   only by the REKEY lane, so the two-writer reproducer cannot reach it:
+   **measured `fold=0` in 8 of 8 runs**, every refusal on the standalone arm.
+   The gate exercises rekey but single-writer, where the check never fires.  ☞
+   Real coverage needs a CONCURRENT REKEY workload.
+2. **The second defect's disposition (§3.3.1) — untouched.**  The bogus
+   `NOT_FOUND` at `ft-remove.h:5308` / `:5520` is exactly as it was.  The one
+   probe (`*need_retry` on holder movement) eliminated the shape 4/24 → 0/24
+   **and produced one `rc=137` in 24**, so a plain retry there can spin — unlike
+   the two dispositions that landed.  ☞ The lock reading points at deriving the
+   holder UNDER THE MARK so the four-way arm selection cannot go stale, closing
+   both sites at once.
+3. **Is a terminal refusal from `cds_ft_remove` contractually acceptable?**
+   Only bites if (2) lands that way, and no measurement decides it.
+4. **Liveness under sustained contention — nobody has measured it.**  Every
+   `-EAGAIN` added here is "one retry per peer event" BY ARGUMENT (the mismatch
+   is a committed peer write already in the op's locked snapshot, so the
+   re-descend sees a settled tree).  The evidence is 5-second two-writer runs
+   and a single-config gate.  This trie has a starvation history — a deep rekey
+   starved ~12,000x inside one call, the remove retry lane not draining — and
+   these refusals sit on the hottest op.  ★ The argument is sound and
+   unmeasured, and those are different things.
 
 **Q2 — (only under Q1(a)) what value does the re-read compare against, per
 caller?**  §3.1 says two callers assume NULL and two assume "the head I am

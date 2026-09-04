@@ -835,6 +835,9 @@ int ft_detach_orphan_planlock(const struct cds_ft *ft,
 unsigned long ft_dbg_plan_stale_ext, ft_dbg_plan_stale_detach;
 /* ...and the orphan walk's own stale-plan refusal. */
 unsigned long ft_dbg_orphan_walk_stale;
+/* ...split by arm: the record_only FOLD path is the one whose abort
+ * safety rests on the CALLER destroying the shared txn. */
+unsigned long ft_dbg_plan_stale_fold, ft_dbg_plan_stale_alone;
 #endif
 
 /*
@@ -1437,6 +1440,12 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 				surviving_byte, FT_PF_NONE)
 					!= surviving_child ||
 			ft_chain_compress_plan_stale(iter_node_flag, intent))) {
+#ifdef FT_ENABLE_TRACING
+		if (record_only)
+			uatomic_inc(&ft_dbg_plan_stale_fold);
+		else
+			uatomic_inc(&ft_dbg_plan_stale_alone);
+#endif
 		if (!record_only)
 			ft_flip_txn_destroy(txn);
 		return -EAGAIN;

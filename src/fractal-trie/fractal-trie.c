@@ -960,7 +960,7 @@ void cds_ft_debug_ext_violation(unsigned int kind, struct cds_ft *ft,
 	 */
 	fprintf(stderr, "EXTVIOL kind=%u node=%p prev=%p holder=%p hext=%p "
 		"hstate=0x%lx rmsite=%u tomb=%d headis=%s anctomb=%d ancroot=%d "
-		"stale_ext=%lu stale_det=%lu stale_orph=%lu\n",
+		"stale_ext=%lu stale_det=%lu stale_orph=%lu fold=%lu alone=%lu\n",
 		kind, (void *) node, prev, (void *) holder, (void *) hext,
 		(unsigned long) hstate, ft_dbg_rm_site,
 		(hstate & FT_STATE_TOMBSTONE) ? 1 : 0,
@@ -968,7 +968,9 @@ void cds_ft_debug_ext_violation(unsigned int kind, struct cds_ft *ft,
 		anc_tomb, anc_root,
 		uatomic_load(&ft_dbg_plan_stale_ext, CMM_RELAXED),
 		uatomic_load(&ft_dbg_plan_stale_detach, CMM_RELAXED),
-		uatomic_load(&ft_dbg_orphan_walk_stale, CMM_RELAXED));
+		uatomic_load(&ft_dbg_orphan_walk_stale, CMM_RELAXED),
+		uatomic_load(&ft_dbg_plan_stale_fold, CMM_RELAXED),
+		uatomic_load(&ft_dbg_plan_stale_alone, CMM_RELAXED));
 	ft_trace_capture();
 }
 #endif
