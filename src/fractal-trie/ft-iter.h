@@ -210,7 +210,7 @@ size_t ft_rebuild_key_upwalk(const struct cds_ft *ft, struct ft_ord_cell *cell,
 	struct cds_ft_inode_flag *nf;
 	struct cds_ft_inode_flag *from = NULL;	/* whose parent_word gave @nf */
 	unsigned int level = 0;
-	bool detached_prefix;
+	bool is_prefix;
 #ifdef FT_DEBUG_PARENT_VIOLATION
 	struct ft_upwalk_hist hist[FT_UPWALK_HIST];
 	struct ft_upwalk_hist *histp = hist;
@@ -251,14 +251,14 @@ size_t ft_rebuild_key_upwalk(const struct cds_ft *ft, struct ft_ord_cell *cell,
 	 */
 	nf = ft_resolve_flip_proxy(ft_parent_node(rcu_dereference(cell->parent)));
 	/*
-	 * A DEAD prefix head's cell carries the detached-prefix mark on its
-	 * parent word (FT_ORD_PARENT_DETACHED_PREFIX, set by the remove that
-	 * cleared or swapped away the holder's external_nodes, in that same
-	 * flip).  It is the head-shape answer the arm below can no longer get
-	 * from the holder; the node the word names is unchanged.
+	 * A PREFIX head's parent word says so on the word itself
+	 * (FT_PARENT_PREFIX_HEAD, set when the head was installed at the
+	 * holder's external_nodes and carried by every re-home since).  It is
+	 * the head-shape answer, and it stays right on a DEAD head, whose
+	 * holder no longer names it; the node the word names is unchanged.
 	 */
-	detached_prefix = ft_ord_parent_detached_prefix(nf);
-	nf = ft_ord_parent_strip(nf);
+	is_prefix = ft_parent_prefix_head(nf);
+	nf = ft_parent_prefix_strip(nf);
 	/*
 	 * A parent link names an INTERNAL or COMPRESSED node, never an external
 	 * one -- the same invariant ft_get_parent_rcu asserts on its own load,
@@ -312,54 +312,47 @@ size_t ft_rebuild_key_upwalk(const struct cds_ft *ft, struct ft_ord_cell *cell,
 		 * byte IS the parent's own incoming edge (written when the parent is
 		 * processed below) and must not be double-counted here.  Fixed-length
 		 * tries have no prefix keys, so this is always a slot head there.
-		 */
-		struct cds_ft_metadata *nmeta = ft_flag_to_metadata(ft, nf);
-
-		/*
-		 * ☠ "Not the parent's external_nodes" is NOT "hangs off a slot".
-		 * A parked reader legitimately holds the cell of a head whose key a
-		 * concurrent remove has already taken out -- and the key-
-		 * disappearing remove of a PREFIX head is an in-place clear of the
-		 * holder's external_nodes: the holder stays, its external_nodes
-		 * reads NULL (or a re-inserted head of the same key), and this
-		 * inference then turns the dead prefix head into a slot head,
-		 * appending its own last byte a second time.  MEASURED (a key->node
-		 * oracle over {Bdd,Bds,Bs} with "Bd" churned): ~1.5 M keys per
-		 * 8 s run spelling "Bdd" on the "Bd" node, 100% of them from a
-		 * node whose removal had started, the parent's slot for the byte
-		 * holding a DIFFERENT node -- a legal key on the wrong node, which
-		 * a universe check cannot see.
 		 *
-		 * The shape answer therefore comes from the CELL when the holder
-		 * can no longer give it: the remove that clears (or swaps away) a
-		 * prefix head's external_nodes marks the retired cell's parent
-		 * word in that same flip (FT_ORD_PARENT_DETACHED_PREFIX).  The
-		 * mark was read above; when it is absent and the head is not the
-		 * holder's external_nodes either, RE-READ the parent word: the
-		 * clear and the mark are one commit, so a reader whose two loads
-		 * straddled it -- parent before, external_nodes after -- sees the
-		 * mark on the re-read (measured: ~20% of the bad keys came from
-		 * exactly that straddle).  A slot head costs one extra L1-hot load.
+		 * ★ ONE WORD ANSWERS IT, and it is the word already loaded above.
+		 * The head's back edge carries its own shape (FT_PARENT_PREFIX_HEAD),
+		 * so the parent it names and the shape it has come from a SINGLE
+		 * load and cannot disagree.  Both inferences this replaces were
+		 * two-word reads, and both were measurably wrong:
 		 *
-		 * ☞ Deliberately NOT "is the head in the parent's slot for its
-		 * byte": that is a two-word read too, and a concurrent re-home
-		 * (a glue commit wrapping a slot head "m" under a fresh internal
-		 * node as its prefix head -- inv_merge_rerooted_nosplit_branch)
-		 * tears it into "in neither place" for a LIVE head, whose byte
-		 * this inference is right to write (path(old parent) + byte IS the
-		 * key under both placements).  Measured 39/39 such failures torn.
+		 *  - "not the parent's external_nodes" is NOT "hangs off a slot".  A
+		 *    parked reader legitimately holds the cell of a head whose key a
+		 *    concurrent remove has already taken out -- and the key-
+		 *    disappearing remove of a PREFIX head is an IN-PLACE clear of the
+		 *    holder's external_nodes: the holder stays, its external_nodes
+		 *    reads NULL (or a re-inserted head of the same key), and the
+		 *    inference turns the dead prefix head into a slot head, appending
+		 *    its own last byte a second time.  MEASURED (a key->node oracle
+		 *    over {Bdd,Bds,Bs} with "Bd" churned): ~1.5 M keys per 8 s run
+		 *    spelling "Bdd" on the "Bd" node, 100% from a node whose removal
+		 *    had started, the parent's slot for that byte holding a DIFFERENT
+		 *    node -- a legal key on the wrong node, which a universe check
+		 *    cannot see.
+		 *  - "is the head in the parent's slot for its byte" tears the same
+		 *    way: a glue commit wrapping a slot head "m" under a fresh
+		 *    internal node as its prefix head (inv_merge_rerooted_nosplit_
+		 *    branch) leaves it "in neither place" for a LIVE head, 39/39.
+		 *
+		 * ☠ AND A RE-READ OF THIS WORD IS NOT A REPAIR, it is a second
+		 * straddle.  The re-read that used to back the holder query took the
+		 * SHAPE from a later load while the climb below kept the PARENT from
+		 * the earlier one; once the shape lives on the word, a re-home
+		 * committed between the two hands back "prefix head" for a parent
+		 * that is no longer the one being walked, and the key comes out a
+		 * byte short (inv_merge_rerooted_glue_no_escape, len-0 keys).  Read
+		 * it ONCE.
 		 */
-		if (!detached_prefix && cell->node !=
-				ft_dereference_external(nmeta->external_nodes)) {
+		if (!is_prefix) {
 			struct cds_ft_metadata *hmeta =
 				cds_ft_item_to_metadata(cell);
 
-			if (!ft_ord_parent_detached_prefix(ft_resolve_flip_proxy(
-					rcu_dereference(cell->parent)))) {
-				if (pos == 0)
-					return 0;
-				out[--pos] = (uint8_t) hmeta->incoming_byte;
-			}
+			if (pos == 0)
+				return 0;
+			out[--pos] = (uint8_t) hmeta->incoming_byte;
 		}
 	}
 	/* else parent compressed: the head byte is covered by its key_bytes. */

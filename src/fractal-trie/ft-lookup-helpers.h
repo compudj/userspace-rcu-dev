@@ -69,6 +69,28 @@ void *ft_dereference_prev_resolved(struct cds_ft_node *node)
  * for a head; a non-head dup's prev is the preceding node (callers gate on
  * ft_node_external like before).
  */
+/*
+ * ft_head_parent_word_raw: an external head's back-edge word, RAW -- the parent
+ * it names AND the prefix-head bit that says which shape it has
+ * (FT_PARENT_PREFIX_HEAD), from one load, in either list mode.  A parked flip
+ * proxy is resolved (its bit 4 is address); the prefix bit is NOT stripped.
+ *
+ * ft_resolve_head_prev is the same load for callers that only want the node.
+ * An up-walk wants both halves and must not take them from two observations of
+ * a live re-home, so it starts here and strips for itself.
+ */
+static inline_lookup
+struct cds_ft_inode_flag *ft_head_parent_word_raw(const struct cds_ft *ft,
+		struct cds_ft_node *head)
+{
+	void *prev = ft_dereference_prev_resolved(head);
+
+	if (!ft->ordered_list)
+		return (struct cds_ft_inode_flag *) prev;
+	return ft_resolve_flip_proxy(
+		rcu_dereference(ft_ord_cell_ptr(prev)->parent));
+}
+
 static inline_lookup
 struct cds_ft_inode_flag *ft_resolve_head_prev(const struct cds_ft *ft, void *prev)
 {
@@ -83,15 +105,15 @@ struct cds_ft_inode_flag *ft_resolve_head_prev(const struct cds_ft *ft, void *pr
 		 * view-appropriate parent, not the raw descriptor.  Identity when no
 		 * commit is in flight (ft_resolve_flip_proxy no-ops a plain pointer).
 		 *
-		 * A DEAD prefix head's cell carries the detached-prefix mark on
-		 * this word (FT_ORD_PARENT_DETACHED_PREFIX); the holder it names is
-		 * unchanged, so strip the mark for every caller that wants the
-		 * node.  ft_rebuild_key_upwalk reads the word itself: the mark is
-		 * its answer.
+		 * A PREFIX head's parent word carries FT_PARENT_PREFIX_HEAD in
+		 * BOTH modes -- cell->parent here, prev below -- and the holder
+		 * it names is unchanged, so strip the bit for every caller that
+		 * wants the node.  ft_rebuild_key_upwalk / ft_upwalk_edge_bytes
+		 * read the word itself: the bit is their answer.
 		 */
-		return ft_ord_parent_strip(ft_resolve_flip_proxy(
+		return ft_parent_prefix_strip(ft_resolve_flip_proxy(
 			rcu_dereference(ft_ord_cell_ptr(prev)->parent)));
-	return (struct cds_ft_inode_flag *) prev;
+	return ft_parent_prefix_strip((struct cds_ft_inode_flag *) prev);
 }
 
 /*

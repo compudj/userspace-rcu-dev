@@ -946,7 +946,16 @@ int ft_popcount_node_replace_ptr(struct cds_ft *ft, const struct cds_ft_type *ty
 				&ft_ord_cell_ptr(en->prev)->parent :
 				(struct cds_ft_inode_flag **) &en->prev;
 			pub->head_parent_old = *pub->head_parent_field;
-			pub->head_parent_new = node_flag;
+			/*
+			 * An external PROMOTE moves the head into @node_flag's
+			 * child SLOT @node_flag_ptr, so it is a SLOT head:
+			 * clear any prefix-head answer it carried at its old
+			 * home (FT_PARENT_PREFIX_HEAD).  The non-fused arm
+			 * below reaches the same value through ft_set_parent's
+			 * non-NULL @slot.
+			 */
+			pub->head_parent_new = ft_head_parent_word(node_flag,
+				/*prefix=*/ false);
 		}
 		pub->slot = node_flag_ptr;
 		/* @slot is a child slot of THIS node, promote or delete alike. */
@@ -1025,7 +1034,16 @@ int ft_pigeon_node_replace_ptr(struct cds_ft *ft, const struct cds_ft_type *type
 				&ft_ord_cell_ptr(en->prev)->parent :
 				(struct cds_ft_inode_flag **) &en->prev;
 			pub->head_parent_old = *pub->head_parent_field;
-			pub->head_parent_new = node_flag;
+			/*
+			 * An external PROMOTE moves the head into @node_flag's
+			 * child SLOT @node_flag_ptr, so it is a SLOT head:
+			 * clear any prefix-head answer it carried at its old
+			 * home (FT_PARENT_PREFIX_HEAD).  The non-fused arm
+			 * below reaches the same value through ft_set_parent's
+			 * non-NULL @slot.
+			 */
+			pub->head_parent_new = ft_head_parent_word(node_flag,
+				/*prefix=*/ false);
 		}
 		pub->slot = node_flag_ptr;
 		/* @slot is a child slot of THIS node, promote or delete alike. */
@@ -1618,8 +1636,18 @@ int ft_node_recompact(enum ft_recompact mode,
 						ft_meta_lock_release(c_held.lock);
 					return -EAGAIN;
 				}
+				/*
+				 * @ext_snapshot is the node's external_nodes,
+				 * installed as @new_node_flag's own a few lines
+				 * above (ft_metadata_set_external_nodes), so the
+				 * word this edge flips is a PREFIX-HEAD one --
+				 * the recorded twin of the plain-store arm's
+				 * ft_publish_external_nodes_prev below.
+				 */
 				ft_flip_txn_record_head_back_edge(retire_txn,
-					bc_slot, bc_old, new_node_flag FT_BE_SITE(FT_BE_RECOMPACT));
+					bc_slot, bc_old,
+					ft_head_parent_word(new_node_flag,
+						/*prefix=*/ true) FT_BE_SITE(FT_BE_RECOMPACT));
 			} else {
 				/*
 				 * Build-invisible / legacy no-txn arm: the

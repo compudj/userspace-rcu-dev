@@ -799,6 +799,55 @@ bool ft_node_flip_proxy(struct cds_ft_inode_flag *node)
 }
 
 /*
+ * ft_head_parent_word: the value to store into an external head's back-edge
+ * word (cell->parent list-on, node->prev list-off) so the head names @parent_nf
+ * and answers the shape question itself (FT_PARENT_PREFIX_HEAD).
+ *
+ * @prefix: true iff the head is, or is becoming, @parent_nf's external_nodes.
+ *
+ * ☠ THE BIT ONLY EXISTS ON AN INTERNAL NODE'S FLAG.  An internal flag is the
+ * one form whose low nibble has bit 0 set and is not the type-7 flip proxy;
+ * everything else that can sit in a parent word -- a COMPRESSED node (bit 0
+ * clear, 16-byte aligned), a root-position TRIE stamp, a parked PROXY -- uses
+ * bit 4 as address or tag, so the bit is DROPPED for those forms rather than
+ * refused.  The drop is the right answer: a head under a compressed node is
+ * never a prefix head (a compressed node carries no external_nodes), a proxy
+ * is transient and the real re-parent that replaces it re-derives the answer,
+ * and every reader resolves a proxy before reading the bit.
+ *
+ * ☠ AND THE TEST IS bit 0, NOT (tag == FT_INTERNAL_MASK).  Bits 1..3 are the
+ * node's TYPE, not spare: an internal node of type 1 carries 0b011, which a
+ * whole-nibble compare against FT_INTERNAL_MASK rejects.  That mistake silently
+ * drops the bit on every non-type-0 holder -- caught, on the first run, by
+ * cds_ft_verify's at-rest check.
+ */
+static inline
+struct cds_ft_inode_flag *ft_head_parent_word(struct cds_ft_inode_flag *parent_nf,
+		bool prefix)
+{
+	if (!prefix || !((uintptr_t) parent_nf & FT_INTERNAL_MASK) ||
+	    ft_node_flip_proxy(parent_nf))
+		return ft_parent_prefix_strip(parent_nf);
+	return (struct cds_ft_inode_flag *)
+		((uintptr_t) parent_nf | FT_PARENT_PREFIX_HEAD);
+}
+
+/*
+ * ft_head_parent_word_carry: the same value for a park or a restore -- a write
+ * that does NOT decide the shape, so the head keeps whatever it was.  Takes the
+ * answer from @old_word, the head's current back-edge value (RESOLVED: the
+ * callers that read a transacted word read it through urcu_txn_load, and the
+ * plain-store ones resolve a parked proxy first).
+ */
+static inline
+struct cds_ft_inode_flag *ft_head_parent_word_carry(
+		struct cds_ft_inode_flag *parent_nf, const void *old_word)
+{
+	return ft_head_parent_word(parent_nf,
+		ft_parent_prefix_head((const struct cds_ft_inode_flag *) old_word));
+}
+
+/*
  * RESOLVED-POINTER CONTRACT.
  *
  * A slot under an in-flight commit does not hold a node: it holds a pointer to
@@ -1389,20 +1438,90 @@ struct cds_ft_inode_flag *ft_chain_head_holder(struct cds_ft *ft,
 }
 
 /*
+ * ft_head_parent_word_slot: the generic re-parent form -- ft_set_parent and its
+ * two transacted twins, which every restructure funnels its child re-homes
+ * through, and which already carry the answer in @slot.
+ *
+ * ★ @slot IS THE SHAPE, so no site has to be told it twice.  @slot is the
+ * address of the word in @parent_nf that holds the head:
+ *
+ *   - &parent_meta->external_nodes: a PREFIX head, key = path(parent), the key
+ *     ENDS at the parent.  The rekey S_top COW, the remove head-slot resolver
+ *     and the insert replace arms all name that word explicitly.
+ *   - NULL: also a prefix head.  ft-remove.h's head-slot resolver spells the
+ *     convention out in as many words ("external_nodes, not a body slot"), and
+ *     every re-parent that hands a head to its new holder as external_nodes
+ *     passes NULL: the insert attach and its cluster-leaf branch
+ *     (ic->live_slot), the merge's M_ext, the graft's displaced external.
+ *   - any other word: a BODY SLOT, so a slot head, key = path(parent) + its
+ *     own edge byte.
+ *
+ * The three NULL-slot sites with a NON-external child (a junction, a branch, a
+ * compressed node's own child) never reach here: this form is consulted only on
+ * the external branch of those dispatchers, and a compressed @parent_nf drops
+ * the bit by construction anyway.
+ */
+static inline
+struct cds_ft_inode_flag *ft_head_parent_word_slot(
+		struct cds_ft_inode_flag *parent_nf,
+		struct cds_ft_inode_flag **slot)
+{
+	bool prefix = true;
+
+	if (slot && ((uintptr_t) parent_nf & FT_INTERNAL_MASK) &&
+	    !ft_node_flip_proxy(parent_nf))
+		prefix = ((void *) slot == (void *)
+			&cds_ft_item_to_metadata(ft_node_ptr(parent_nf))->external_nodes);
+	return ft_head_parent_word(parent_nf, prefix);
+}
+
+/*
+ * ft_head_is_prefix: the head's OWN answer to the shape question -- is it the
+ * prefix head (external_nodes) of the parent its back-edge word names?  Read
+ * from that one word in both modes (cell->parent list-on, prev list-off), so
+ * it stays consistent with the pointer it rides on; a parked flip proxy is
+ * resolved first, its bit 4 being address.
+ *
+ * Write-side use: a REPLACE installs a new head in the old one's place and
+ * must inherit the shape rather than re-derive it from a holder mid-op.
+ */
+static inline
+bool ft_head_is_prefix(const struct cds_ft *ft, struct cds_ft_node *head)
+{
+	void *prev;
+
+	if (!head)
+		return false;
+	prev = ft_dereference_prev_resolved(head);
+	if (!ft->ordered_list)
+		return ft_parent_prefix_head((struct cds_ft_inode_flag *) prev);
+	return ft_parent_prefix_head(ft_resolve_flip_proxy(
+		rcu_dereference(ft_ord_cell_ptr(prev)->parent)));
+}
+
+/*
  * Record a fresh head's flagged parent.  Non-cell builds store it directly
  * into the (pre-publish) head's prev; cell builds store it into the head's
  * pre-wired cell (node->prev already carries the cell), leaving prev intact.
  * For the fresh-head wiring sites only (the subsequent forward publish
  * orders this store); existing-head re-parents use ft_set_parent / the
  * external-nodes choke point, which resolve the cell themselves.
+ *
+ * @prefix says which SHAPE the head is being wired into: true when it is
+ * becoming @parent's external_nodes (its key ENDS at @parent), false for a
+ * body slot.  The word carries that answer from here on -- see
+ * FT_PARENT_PREFIX_HEAD -- so a site that gets it wrong is caught at rest by
+ * cds_ft_verify rather than as a rare wrong-node lookup.
  */
-#define ft_external_head_set_parent(ft, node, parent)			\
+#define ft_external_head_set_parent(ft, node, parent, prefix)		\
 	do {								\
+		struct cds_ft_inode_flag *_hpw = ft_head_parent_word(	\
+			(struct cds_ft_inode_flag *) (parent), (prefix)); \
+									\
 		if ((ft)->ordered_list)					\
-			ft_ord_cell_set_parent((node),			\
-				(struct cds_ft_inode_flag *) (parent));	\
+			ft_ord_cell_set_parent((node), _hpw);		\
 		else							\
-			(node)->prev = (parent);			\
+			(node)->prev = _hpw;				\
 	} while (0)
 
 /*
@@ -1428,12 +1547,22 @@ void ft_publish_external_nodes_prev(struct cds_ft *ft,
 		struct cds_ft_inode_flag *node_flag,
 		struct cds_ft_node *external_nodes)
 {
+	struct cds_ft_inode_flag *word;
+
 	if (!external_nodes)
 		return;
+	/*
+	 * By definition of this helper @external_nodes is @node_flag's
+	 * external_nodes, so the word it publishes is a PREFIX-HEAD one: the
+	 * head's key ENDS at @node_flag and no edge byte separates them
+	 * (FT_PARENT_PREFIX_HEAD).  Every caller pairs this with the matching
+	 * ft_metadata_set_external_nodes.
+	 */
+	word = ft_head_parent_word(node_flag, /*prefix=*/ true);
 	if (ft->ordered_list)
-		ft_ord_cell_set_parent(external_nodes, node_flag);
+		ft_ord_cell_set_parent(external_nodes, word);
 	else
-		rcu_assign_pointer(external_nodes->prev, node_flag);
+		rcu_assign_pointer(external_nodes->prev, word);
 }
 
 static
@@ -1737,62 +1866,43 @@ struct cds_ft_compressed_node *ft_skip_to_compressed(const struct cds_ft *ft,
 
 /*
  * ft_upwalk_edge_bytes: the key bytes an up-walk consumes on the hop from @cur
- * to its INTERNAL @parent.
+ * to its INTERNAL parent.
  *
  * One byte for a child in a branch slot -- and ZERO for a PREFIX head: an
- * external head hanging at @parent's external_nodes, whose key ENDS at
- * @parent, so it sits AT @parent's position and no edge byte separates them.
+ * external head hanging at the parent's external_nodes, whose key ENDS at the
+ * parent, so it sits AT the parent's position and no edge byte separates them.
  *
- * That is the same SLOT-head / PREFIX-head shape question ft_rebuild_key_upwalk
- * asks, answered from the same two places -- the holder's live external_nodes
- * (ft_node_external_nodes) and, once the holder has been cleared, the retired
- * cell's FT_ORD_PARENT_DETACHED_PREFIX mark.
+ * ★ THE HEAD ANSWERS FOR ITSELF, from @head_parent_word -- the very word the
+ * caller loaded to find the parent (FT_PARENT_PREFIX_HEAD).  Parent and shape
+ * therefore come from ONE load, in BOTH list modes, and cannot disagree.
+ *
+ * ☠ What this replaces was the holder's LIVE external_nodes, and that answer
+ * is DESTROYED IN PLACE by the very removes an up-walk must survive: a
+ * key-disappearing remove of a prefix head clears the holder's external_nodes
+ * while a parked reader still holds the head, and a replace leaves it naming a
+ * DIFFERENT head.  The dead prefix head then read as a SLOT head, was charged a
+ * byte it never consumed, and the descent resumed one level off -- a present
+ * key answering NOT_FOUND, and a key ABSENT at every instant answering with a
+ * NEIGHBOUR'S NODE.  The ordered list could patch it with a mark on the retired
+ * cell; list-off had no cell and no patch, which is why the answer had to move
+ * onto the head's own word.
  *
  * A skip slot never NAMES a prefix head at rest (it names the compressed node's
- * child, whose parent is that compressed node), so these arms are reached only
- * through a STALE slot whose target a concurrent split has re-homed as a fresh
- * internal node's prefix head -- exactly the case ft_skip_reanchor exists to
- * resolve.
+ * child, whose parent is that compressed node), so a non-zero answer here is
+ * reached only through a STALE slot whose target a concurrent split has
+ * re-homed as a fresh internal node's prefix head -- exactly the case
+ * ft_skip_reanchor exists to resolve.
  *
  * Only an EXTERNAL @cur can be a prefix head, so an internal / compressed @cur
- * takes the constant-1 arm with no extra load.
+ * takes the constant-1 arm without consulting the word at all.
  */
 static inline
-unsigned int ft_upwalk_edge_bytes(const struct cds_ft *ft,
-		struct cds_ft_inode_flag *cur,
-		struct cds_ft_inode_flag *parent)
+unsigned int ft_upwalk_edge_bytes(struct cds_ft_inode_flag *cur,
+		struct cds_ft_inode_flag *head_parent_word)
 {
-	void *prev;
-
 	if (!ft_node_external(cur))
 		return 1U;
-	if (ft_node_external_nodes(parent) == (struct cds_ft_node *) cur)
-		return 0U;
-	/*
-	 * The holder does not name @cur.  That is NOT "@cur hangs off a slot":
-	 * a key-disappearing remove of a PREFIX head whose holder keeps its
-	 * other children CLEARS the holder's external_nodes in place (and a
-	 * replace / re-insert leaves it naming a DIFFERENT head), so a dead or
-	 * displaced prefix head reads exactly like a slot head from here -- and
-	 * charging it a byte is the very mis-anchor this helper exists to stop.
-	 *
-	 * The answer the holder can no longer give comes from the CELL: that
-	 * same remove marks the retired cell's parent word
-	 * (FT_ORD_PARENT_DETACHED_PREFIX) in the SAME flip that clears the
-	 * holder.  Reading the mark AFTER the external_nodes load is what makes
-	 * the pair race-free without a re-read: a load that missed the clear
-	 * already answered 0 above, and one that saw it sees the mark too.
-	 *
-	 * ☠ With the ordered list OFF there is no cell and no mark, so this
-	 * window stays open there; see ft_rebuild_key_upwalk, which is
-	 * ordered-list-only for the same reason.
-	 */
-	if (!ft->ordered_list)
-		return 1U;
-	prev = ft_dereference_prev_resolved((struct cds_ft_node *) cur);
-	return ft_ord_parent_detached_prefix(ft_resolve_flip_proxy(
-			rcu_dereference(ft_ord_cell_ptr(prev)->parent))) ?
-		0U : 1U;
+	return ft_parent_prefix_head(head_parent_word) ? 0U : 1U;
 }
 
 /*
@@ -1860,15 +1970,26 @@ struct cds_ft_inode_flag *ft_skip_reanchor(struct cds_ft *ft,
 	FT_TP(reanchor_enter, (const void *) skip_ptr, (const void *) cur, want);
 	for (guard = 0; guard < (int) FT_MAX_DEPTH + 2; guard++) {
 		struct cds_ft_inode_flag *parent;
+		struct cds_ft_inode_flag *head_word = NULL;
 		void *pitem;
 
-		if (ft_node_external(cur))
-			parent = ft_resolve_head_prev(ft,
-				ft_dereference_prev_resolved((struct cds_ft_node *) cur));
-		else
+		if (ft_node_external(cur)) {
+			/*
+			 * ONE load gives both halves of this hop: the parent @cur
+			 * names AND whether @cur is that parent's prefix head
+			 * (ft_upwalk_edge_bytes).  Keep the raw word -- stripping
+			 * is what ft_resolve_head_prev does for callers that only
+			 * want the node -- so the two cannot be taken from
+			 * different observations of a live re-home.
+			 */
+			head_word = ft_head_parent_word_raw(ft,
+				(struct cds_ft_node *) cur);
+			parent = ft_parent_prefix_strip(head_word);
+		} else {
 			parent = ft_parent_node(rcu_dereference(
 				cds_ft_item_to_metadata(
 				ft_node_ptr(cur))->parent_word));
+		}
 		/* A picked child's parent may be a flip-proxy mid-merge. */
 		parent = ft_resolve_flip_proxy(parent);
 		FT_TP(reanchor_walk, (const void *) cur, (const void *) parent, acc);
@@ -1894,7 +2015,7 @@ struct cds_ft_inode_flag *ft_skip_reanchor(struct cds_ft *ft,
 			(void *) ft_node_ptr(parent);
 		acc += ft_node_compressed(parent) ?
 			ft_compressed_node_ptr(parent)->len :
-			ft_upwalk_edge_bytes(ft, cur, parent);
+			ft_upwalk_edge_bytes(cur, head_word);
 		if (acc >= want) {
 			/*
 			 * @parent is the node spanning (rewind > 0, a merge) or
@@ -3044,13 +3165,20 @@ void ft_set_parent(struct cds_ft *ft, struct cds_ft_inode_flag *child_nf,
 		 * the parent is the head's prev directly.  rcu_assign either way:
 		 * ft_set_parent re-parents live heads on the restructure path.
 		 */
+		struct cds_ft_node *en = (struct cds_ft_node *) child_nf;
+		/*
+		 * @slot settles the head's shape: a BODY SLOT in @parent_nf
+		 * makes it a slot head, the external_nodes word (named, or NULL)
+		 * a prefix head -- ft_head_parent_word_slot's header for why
+		 * NULL means that here (FT_PARENT_PREFIX_HEAD).
+		 */
+		struct cds_ft_inode_flag *word =
+			ft_head_parent_word_slot(parent_nf, slot);
+
 		if (ft->ordered_list)
-			ft_ord_cell_set_parent((struct cds_ft_node *) child_nf,
-				parent_nf);
+			ft_ord_cell_set_parent(en, word);
 		else
-			rcu_assign_pointer(
-				((struct cds_ft_node *) child_nf)->prev,
-				parent_nf);
+			rcu_assign_pointer(en->prev, word);
 		return;
 	}
 	{

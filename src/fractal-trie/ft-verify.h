@@ -250,6 +250,50 @@ int ft_verify_speculative_key(const struct cds_ft *ft, FILE *out,
 	return 0;
 }
 
+/*
+ * THE PREFIX-HEAD BIT, CHECKED AT REST (FT_PARENT_PREFIX_HEAD).
+ *
+ * A head's back-edge word answers the shape question the up-walks ask -- am I
+ * @owner_flag's external_nodes (my key ENDS there), or a child in one of its
+ * body slots?  The answer must travel with the head because a remove destroys
+ * the holder's copy of it in place; that is precisely what makes it
+ * unverifiable from the reader side, and enumerable from here:
+ *
+ *	bit(head's parent word) == (owner->external_nodes == head)
+ *
+ * on every LIVE head, in both list modes.  An install site that forgets to set
+ * the bit, or a re-home that carries a stale one, is a structural error at the
+ * next cds_ft_verify -- not a rare wrong-node lookup under a parked reader.
+ *
+ * A COMPRESSED owner is skipped: it has no external_nodes, its flag's bit 4 is
+ * address, and ft_head_parent_word drops the bit into it by construction.
+ */
+static
+int ft_verify_head_prefix_bit(FILE *out, struct cds_ft_inode_flag *owner_flag,
+		const struct cds_ft_node *head,
+		struct cds_ft_inode_flag *parent_word, unsigned int depth)
+{
+	const struct cds_ft_metadata *ometa;
+	bool bit, is_prefix;
+
+	if (!owner_flag || ft_node_external(owner_flag) ||
+	    ft_node_compressed(owner_flag))
+		return 0;
+	ometa = cds_ft_item_to_metadata(ft_node_ptr(owner_flag));
+	bit = ft_parent_prefix_head(parent_word);
+	is_prefix = (const struct cds_ft_node *) ometa->external_nodes == head;
+	if (bit != is_prefix) {
+		if (out)
+			fprintf(out, "ft_verify: depth %u: head %p parent word %p says prefix-head=%d, owner %p external_nodes %p says %d\n",
+				depth, (const void *) head, (void *) parent_word,
+				(int) bit, (void *) owner_flag,
+				(const void *) ometa->external_nodes,
+				(int) is_prefix);
+		return -1;
+	}
+	return 0;
+}
+
 static
 int ft_verify_external_chain(const struct cds_ft *ft, FILE *out,
 		struct ft_visited_set *visited,
@@ -303,7 +347,8 @@ int ft_verify_external_chain(const struct cds_ft *ft, FILE *out,
 			struct ft_ord_cell *cell = ft_ord_cell_ptr(node->prev);
 
 			if (ft_node_external((struct cds_ft_inode_flag *) node->prev) ||
-			    (void *) cell->parent != (void *) owner_flag ||
+			    (void *) ft_parent_prefix_strip(cell->parent) !=
+					(void *) owner_flag ||
 			    cell->node != node) {
 				if (out)
 					fprintf(out, "ft_verify: depth %u: head %p cell %p {parent %p, node %p} != expected {owner %p, node %p}\n",
@@ -313,14 +358,23 @@ int ft_verify_external_chain(const struct cds_ft *ft, FILE *out,
 						(void *) owner_flag, (void *) node);
 				return -1;
 			}
+			if (ft_verify_head_prefix_bit(out, owner_flag, node,
+					cell->parent, depth) < 0)
+				return -1;
 		} else if (prev == NULL) {
 			/* List off: a head's prev is the owner (flagged parent) directly. */
-			if ((void *) node->prev != (void *) owner_flag) {
+			if ((void *) ft_parent_prefix_strip(
+					(struct cds_ft_inode_flag *) node->prev) !=
+					(void *) owner_flag) {
 				if (out)
 					fprintf(out, "ft_verify: depth %u: head %p prev %p != owner %p\n",
 						depth, node, node->prev, (void *) owner_flag);
 				return -1;
 			}
+			if (ft_verify_head_prefix_bit(out, owner_flag, node,
+					(struct cds_ft_inode_flag *) node->prev,
+					depth) < 0)
+				return -1;
 		} else if (node->prev != expected_prev) {
 			if (out)
 				fprintf(out, "ft_verify: depth %u: external chain node %p prev %p != predecessor %p\n",

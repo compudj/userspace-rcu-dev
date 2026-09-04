@@ -20715,6 +20715,7 @@ struct inv_splitpt_ctx {
 	unsigned long lookups;
 	unsigned long not_found;	/* a stable key answered NOT_FOUND */
 	unsigned long wrong_node;	/* a stable key came back on another's node */
+	bool pinned;			/* the preemption amplifier is armed */
 };
 
 static void *inv_splitpt_reader(void *arg)
@@ -20926,6 +20927,67 @@ static int inv_split_point_lookup_run(bool ordered_list, const char *name)
  * under `taskset -c 0` with a dwell after the remove -- see the commit
  * message.  Do not read this test's green as coverage of the mark arm.
  */
+/*
+ * ☞ MEASURED, not guessed (control at 30bbccf1, 3 s, wrong answers a run):
+ *
+ *	cpus  readers  dead_us   cycles   wrong
+ *	  1        4      2000      284       3
+ *	  1        8      2000      153       2
+ *	  2        4      2000      574       8
+ *	  2        8       500      747      17
+ *	  2        8       200     1330      21
+ *	  3        8       200     2226      40
+ *
+ * The signal tracks CHURN CYCLES, not dead-window microseconds: what has to
+ * coincide is a reader parked on a stale skip slot ACROSS the split, so more
+ * short cycles beat fewer long ones.  Hence a dead window just wide enough to
+ * be preempted in, and the cycle count spent on cycles.
+ */
+#define INV_ABSENT_CPUS		3
+#define INV_ABSENT_READERS	8
+#define INV_ABSENT_PRE_US	200
+#define INV_ABSENT_DEAD_US	200
+#define INV_ABSENT_DURATION_MS	3000
+
+/*
+ * ★ PREEMPTION, NOT CPU SHORTAGE, IS THE AMPLIFIER.
+ *
+ * This oracle needs a reader PARKED between the load of a skip slot and the
+ * up-walk that resolves it -- that is the whole shape of the defect.  On an
+ * idle 192-core machine the readers and the writer never preempt each other,
+ * and the oracle stays green on a KNOWN-BROKEN build no matter how long it
+ * runs: measured 3/3 GREEN on the control at 30bbccf1 over 3 s, ~95 M lookups
+ * a run, with the dead-window dwell below already in place.  Crowding this
+ * test's threads onto INV_ABSENT_CPUS is what turns it into a test -- 35-46
+ * wrong answers a run on that same control (5/5 red), 0 on the fixed build
+ * (5/5 green).
+ *
+ * ☞ The cpus come from the process's CURRENT affinity mask, so an outer
+ * taskset or cpuset still decides which cpus the suite may use, and a 2-cpu box
+ * simply gets both.  Failing to pin is not fatal -- the oracle is merely weak
+ * -- but it is REPORTED, so a green here is never silently a green on an
+ * unarmed detector.
+ */
+static bool inv_absent_pin_self(void)
+{
+	cpu_set_t cur, few;
+	int i, got = 0;
+
+	CPU_ZERO(&cur);
+	if (sched_getaffinity(0, sizeof(cur), &cur) != 0)
+		return false;
+	CPU_ZERO(&few);
+	for (i = 0; i < CPU_SETSIZE && got < INV_ABSENT_CPUS; i++) {
+		if (!CPU_ISSET(i, &cur))
+			continue;
+		CPU_SET(i, &few);
+		got++;
+	}
+	if (!got)
+		return false;
+	return sched_setaffinity(0, sizeof(few), &few) == 0;
+}
+
 static const char * const inv_absent_never_keys[] = {
 	"a", "ab", "ac", "aabb", NULL
 };
@@ -20941,6 +21003,8 @@ static void *inv_absent_reader(void *arg)
 	bool reported = false;
 
 	rcu_register_thread();
+	if (!inv_absent_pin_self())
+		CMM_STORE_SHARED(ctx->pinned, false);
 	while (!CMM_LOAD_SHARED(test_go))
 		caa_cpu_relax();
 	while (!CMM_LOAD_SHARED(test_stop)) {
@@ -21031,24 +21095,69 @@ static void inv_absent_rem(struct cds_ft *ft, struct cds_ft_iter *iter,
 	node_free_rcu(to_test_node(node));
 }
 
+/*
+ * Dwell @us microseconds, YIELDING the cpu rather than spinning on it.
+ *
+ * The writer runs inside an RCU read-side critical section, so it must not
+ * block -- but it shares one cpu with the readers (inv_absent_pin_self), and a
+ * spin here would hold that cpu for the whole window and starve the very
+ * lookups the oracle is made of.  Yielding hands the window to the readers,
+ * which is the point.
+ */
+static void inv_absent_dwell(unsigned long us)
+{
+	struct timespec a, b;
+
+	clock_gettime(CLOCK_MONOTONIC, &a);
+	do {
+		sched_yield();
+		clock_gettime(CLOCK_MONOTONIC, &b);
+	} while ((unsigned long) ((b.tv_sec - a.tv_sec) * 1000000L +
+			(b.tv_nsec - a.tv_nsec) / 1000) < us);
+}
+
+/*
+ * ★ THE DWELL IS THE ORACLE'S ARM, not a slowdown.
+ *
+ * The defect lives in the window where the holder's external_nodes has been
+ * cleared but a parked reader still holds the dead head, and a reader must take
+ * BOTH of its loads inside it.  Without a dwell that window is the width of two
+ * stores -- measured at ~1 wrong answer per 21 M lookups, which at the suite's
+ * 200 ms per test is a coin the oracle almost never gets to flip, and an arm
+ * that cannot fail on a KNOWN-BROKEN build is not coverage.  Holding the dead
+ * state open for INV_ABSENT_DEAD_US makes the same oracle deterministic.
+ */
+
 static void *inv_absent_writer(void *arg)
 {
 	struct inv_splitpt_ctx *ctx = arg;
 	struct cds_ft_iter *iter;
 
 	rcu_register_thread();
+	if (!inv_absent_pin_self())
+		CMM_STORE_SHARED(ctx->pinned, false);
 	if (cds_ft_iter_create(ctx->ft, &iter) < 0)
 		abort();
 	while (!CMM_LOAD_SHARED(test_go))
 		caa_cpu_relax();
 	while (!CMM_LOAD_SHARED(test_stop)) {
 		rcu_read_lock();
+		/*
+		 * Let readers settle on the at-rest shape (a skip slot naming
+		 * the compressed run) before the split re-homes "aa" as a fresh
+		 * internal node's PREFIX head: a stale slot held across that
+		 * split is what the re-anchor has to resolve.
+		 */
+		inv_absent_dwell(INV_ABSENT_PRE_US);
 		inv_absent_ins(ctx->ft, "aab", 2);
 		inv_absent_ins(ctx->ft, "aac", 3);
 		/* "aa" is now the holder's PREFIX head; clear it in place ... */
 		inv_absent_rem(ctx->ft, iter, "aa");
+		/* ... hold the DEAD window open (see the comment above) ... */
+		inv_absent_dwell(INV_ABSENT_DEAD_US);
 		/* ... and re-fill the holder with a DIFFERENT node. */
 		inv_absent_ins(ctx->ft, "aa", 1);
+		inv_absent_dwell(INV_ABSENT_DEAD_US / 4);
 		inv_absent_rem(ctx->ft, iter, "aab");
 		inv_absent_rem(ctx->ft, iter, "aac");
 		rcu_read_unlock();
@@ -21066,7 +21175,7 @@ static int inv_absent_key_run(bool ordered_list, const char *name)
 	struct cds_ft *ft;
 	struct inv_splitpt_ctx ctx;
 	struct timespec t0;
-	pthread_t readers[NR_READERS_DEFAULT], writer;
+	pthread_t readers[INV_ABSENT_READERS], writer;
 	unsigned int i;
 	int ret = 0;
 
@@ -21078,6 +21187,7 @@ static int inv_absent_key_run(bool ordered_list, const char *name)
 	ctx.ft = ft;
 	ctx.stable = inv_absent_present_keys;
 	ctx.test_name = name;
+	ctx.pinned = true;		/* cleared by any thread that cannot pin */
 
 	rcu_read_lock();
 	inv_absent_ins(ft, "aa", 1);
@@ -21089,7 +21199,7 @@ static int inv_absent_key_run(bool ordered_list, const char *name)
 	test_stop = 0;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-	for (i = 0; i < NR_READERS_DEFAULT; i++)
+	for (i = 0; i < INV_ABSENT_READERS; i++)
 		pthread_create(&readers[i], NULL, inv_absent_reader, &ctx);
 	pthread_create(&writer, NULL, inv_absent_writer, &ctx);
 
@@ -21098,14 +21208,18 @@ static int inv_absent_key_run(bool ordered_list, const char *name)
 
 	rcu_thread_offline();
 	clock_gettime(CLOCK_MONOTONIC, &t0);
-	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
+	/*
+	 * Longer than the suite default: each cycle now costs ~2.7 ms of dwell
+	 * (see inv_absent_writer), and this oracle needs CYCLES, not wall clock.
+	 */
+	while (elapsed_ms(&t0) < INV_ABSENT_DURATION_MS)
 		usleep(1000);
 
 	test_stop = 1;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	pthread_join(writer, NULL);
-	for (i = 0; i < NR_READERS_DEFAULT; i++)
+	for (i = 0; i < INV_ABSENT_READERS; i++)
 		pthread_join(readers[i], NULL);
 	rcu_thread_online();
 
@@ -21114,6 +21228,10 @@ static int inv_absent_key_run(bool ordered_list, const char *name)
 			"lookups=%lu)\n", name, ctx.cycles, ctx.lookups);
 		ret = -1;
 	}
+	if (!ctx.pinned)
+		fprintf(stderr, "# %s: could not pin to one cpu -- the "
+			"preemption amplifier is OFF and this arm is WEAK\n",
+			name);
 	if (ctx.not_found || ctx.wrong_node) {
 		fprintf(stderr, "%s: %lu absent-key FOUND + %lu wrong-node over "
 			"%lu churn cycles, %lu lookups\n", name, ctx.not_found,
@@ -21133,31 +21251,19 @@ static int inv_absent_key_never_found(void)
 }
 
 /*
- * ☠ NOT ARMED, AND THE REASON IS A KNOWN OPEN DEFECT, NOT A FLAKE.
+ * ★ ARMED.  This arm was SKIPPED while the shape answer lived on the holder:
+ * with the ordered list OFF there was no ft_ord_cell to carry the mark a remove
+ * left behind, so a DEAD prefix head read as a slot head, the re-anchor charged
+ * it a byte it never consumed, the descent resumed one level off, and a key
+ * ABSENT at every instant came back with a NEIGHBOUR'S NODE.
  *
- * With the ordered list OFF there is no ft_ord_cell, so the head carries no
- * FT_ORD_PARENT_DETACHED_PREFIX mark and ft_upwalk_edge_bytes cannot tell a
- * DEAD prefix head from a slot head: the re-anchor charges it a byte, the
- * descent resumes one level off, and an absent key answers with a neighbour's
- * node.  MEASURED at ~1 per 21 M lookups under gate load -- so arming this arm
- * would make the suite intermittently red against a defect that is understood,
- * recorded, and awaiting a design decision (carry the shape answer on the
- * head's own parent word in BOTH modes, set at re-home time).
- *
- * Skip rather than delete, and NAME the reason, exactly as INV_NEED_MERGE does:
- * a test that vanishes silently is a gap nobody can grep for.  Set
- * FT_INV_LISTOFF_PREFIX=1 to run it as an instrument -- it reproduces the open
- * window in seconds.
+ * The answer now rides the head's own back-edge word in BOTH modes
+ * (FT_PARENT_PREFIX_HEAD), so this arm and its list-on sibling test the same
+ * mechanism, and the same oracle discriminates: 35-46 wrong answers a run at
+ * 30bbccf1, 0 after.
  */
 static int inv_absent_key_never_found_nolist(void)
 {
-	if (!getenv("FT_INV_LISTOFF_PREFIX")) {
-		fprintf(stderr, "# inv_absent_key_never_found_nolist: skipped, "
-			"the list-off dead-prefix-head re-anchor window is OPEN "
-			"(no cell, so no DETACHED_PREFIX mark); set "
-			"FT_INV_LISTOFF_PREFIX=1 to run it\n");
-		return 0;
-	}
 	return inv_absent_key_run(false, "inv_absent_key_never_found_nolist");
 }
 

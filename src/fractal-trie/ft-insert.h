@@ -268,10 +268,17 @@ void ft_park_live_parent_edge(struct cds_ft *ft,
 	 * records a value no reader ever sees otherwise.  ft_record_child_back_edge
 	 * reads the same class of word the same way.
 	 */
+	/*
+	 * @slot settles the head's shape (ft_head_parent_word_slot): the split's
+	 * deferred live child arrives with its slot, the attach and cluster-leaf
+	 * arms with NULL -- there the head becomes the fresh cluster top's
+	 * external_nodes.
+	 */
 	ft_flip_txn_record_head_back_edge(txn, (void **) field,
 		urcu_txn_load(ft_flip_txn_handle(txn), (void **) field,
 			FT_FLIP_PROXY_TAG),
-		new_parent FT_BE_SITE(FT_BE_PARK_LIVE_PARENT));
+		ft_head_parent_word_slot(new_parent, slot)
+		FT_BE_SITE(FT_BE_PARK_LIVE_PARENT));
 }
 
 /*
@@ -2730,7 +2737,7 @@ int ft_insert_compressed_key_shorter(struct cds_ft *ft,
 	 * still invisible, so the parked one-commit publish below makes the
 	 * structural attach and the ordered-list splice atomic.
 	 */
-	ft_external_head_set_parent(ft, node, jct_flag);
+	ft_external_head_set_parent(ft, node, jct_flag, /*prefix=*/ true);
 	node->next = NULL;
 	/* Cluster-internal store: the junction is unpublished. */
 	jct_meta->external_nodes = node;
@@ -3221,7 +3228,7 @@ restart_attempt:
 					goto insert_done;
 			} else {
 				/* New key at this internal node. */
-				ft_external_head_set_parent(ft, node, d.nf);
+				ft_external_head_set_parent(ft, node, d.nf, /*prefix=*/ true);
 				node->next = NULL;
 				/*
 				 * Park the external_nodes publish into the one-commit
@@ -3772,7 +3779,7 @@ restart_replace_attempt:
 						external_nodes);
 				/* Replace existing chain: key count unchanged. */
 				*old_node_ret = external_nodes;
-				ft_external_head_set_parent(ft, node, d.nf);
+				ft_external_head_set_parent(ft, node, d.nf, /*prefix=*/ true);
 				node->next = NULL;
 				/*
 				 * Ordered list on: publish the new head into
@@ -3872,7 +3879,7 @@ restart_replace_attempt:
 				}
 			} else {
 				/* No external nodes yet. New key at this node. */
-				ft_external_head_set_parent(ft, node, d.nf);
+				ft_external_head_set_parent(ft, node, d.nf, /*prefix=*/ true);
 				node->next = NULL;
 				/*
 				 * Park external_nodes -- readers resolve the proxy via
@@ -3901,7 +3908,15 @@ restart_replace_attempt:
 					ft_node_ptr(d.nf));
 			/* External node at end of key. Replace chain: key count unchanged. */
 			*old_node_ret = (struct cds_ft_node *) ft_node_ptr(d.nf);
-			ft_external_head_set_parent(ft, node, d.pnf);
+			/*
+			 * Replacing the head of an EXTERNAL chain: @node takes the
+			 * old head's place, whichever shape that was, so INHERIT the
+			 * old head's own answer instead of re-deriving it from @d.pnf
+			 * mid-op (FT_PARENT_PREFIX_HEAD).
+			 */
+			ft_external_head_set_parent(ft, node, d.pnf,
+				ft_head_is_prefix(ft, (struct cds_ft_node *)
+					ft_node_ptr(d.nf)));
 			node->next = NULL;
 			{
 				/*

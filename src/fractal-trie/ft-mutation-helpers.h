@@ -4398,7 +4398,7 @@ void ft_flip_txn_record_root(struct ft_flip_txn *t, void **slot,
  *
  * @parent_word is the value the edge INSTALLS -- the parent the head is moving
  * TO -- taken raw, so it launders the trie stamp (ft_parent_node) and the
- * detached-prefix mark (ft_ord_parent_strip) exactly as every other reader of
+ * detached-prefix mark (ft_parent_prefix_strip) exactly as every other reader of
  * a parent word does.  A parent word never holds a skip-encoded flag: the skip
  * form is a SLOT encoding, not a way to name a parent.
  *
@@ -4411,7 +4411,7 @@ void ft_flip_txn_record_root(struct ft_flip_txn *t, void **slot,
 static inline __attribute__((unused))
 struct cds_ft_metadata *ft_back_edge_owner(void *parent_word)
 {
-	struct cds_ft_inode_flag *nf = ft_ord_parent_strip(
+	struct cds_ft_inode_flag *nf = ft_parent_prefix_strip(
 		ft_parent_node((struct cds_ft_inode_flag *) parent_word));
 
 	if (!nf || ft_node_external(nf))
@@ -9047,7 +9047,7 @@ int ft_ord_cell_swap_publish_multi(struct cds_ft *ft,
 	 * holder's own external_nodes word -- the holder's external_nodes now
 	 * names the swapped-in head, and the up-walk from @old_cell could no
 	 * longer tell it was a prefix head: mark the retired cell's parent word
-	 * in this same flip (FT_ORD_PARENT_DETACHED_PREFIX; see
+	 * in this same flip (FT_PARENT_PREFIX_HEAD; see
 	 * ft_rebuild_key_upwalk).  A slot head (a body slot, a compressed
 	 * cn->child) needs no mark: its byte is right either way.
 	 */
@@ -9082,13 +9082,13 @@ int ft_ord_cell_swap_publish_multi(struct cds_ft *ft,
 			(void *) sedges[0].slot == (void *)
 				&ft_flag_to_metadata(ft, holder)->external_nodes &&
 			((uintptr_t) old & FT_INTERNAL_MASK) &&
-			!ft_ord_parent_detached_prefix(old);
+			!ft_parent_prefix_head(old);
 
 		if (prefix_head && txn) {
 			ft_flip_txn_record_head_back_edge(txn,
 				(void **) &old_cell->parent, (void *) old,
 				(void *) ((uintptr_t) old |
-					FT_ORD_PARENT_DETACHED_PREFIX) FT_BE_SITE(FT_BE_CELL_SWAP_MARK));
+					FT_PARENT_PREFIX_HEAD) FT_BE_SITE(FT_BE_CELL_SWAP_MARK));
 		} else if (prefix_head) {
 			/*
 			 * ☠ CURRENTLY UNREACHED -- all four callers of this
@@ -9104,7 +9104,7 @@ int ft_ord_cell_swap_publish_multi(struct cds_ft *ft,
 			edges[n].slot = (struct ft_ord_cell **) &old_cell->parent;
 			edges[n].old_target = (struct ft_ord_cell *) old;
 			edges[n].new_target = (struct ft_ord_cell *)
-				((uintptr_t) old | FT_ORD_PARENT_DETACHED_PREFIX);
+				((uintptr_t) old | FT_PARENT_PREFIX_HEAD);
 			edges[n].owner = sedges[0].owner;
 			edges[n].owner_held = false;	/* MW, as every head back edge */
 			n++;
@@ -9252,7 +9252,7 @@ int ft_remove_one_commit(struct cds_ft *ft,
 		 * external_nodes reads NULL from here on, while parked readers
 		 * still hold @dead_cell and rebuild its key from that holder.
 		 * Mark the dead cell's parent word IN THIS FLIP
-		 * (FT_ORD_PARENT_DETACHED_PREFIX) so the up-walk keeps telling a
+		 * (FT_PARENT_PREFIX_HEAD) so the up-walk keeps telling a
 		 * dead prefix head from a slot head -- see ft_rebuild_key_upwalk.
 		 * The expected-old is a WAITING load (the word enters this txn's
 		 * write set; a raw read could take a peer's parked proxy).  Always
@@ -9273,11 +9273,11 @@ int ft_remove_one_commit(struct cds_ft *ft,
 			 * is peer-mutable and the forward edge aborts the attempt.
 			 */
 			if (old && ((uintptr_t) old & FT_INTERNAL_MASK) &&
-					!ft_ord_parent_detached_prefix(old))
+					!ft_parent_prefix_head(old))
 				ft_flip_txn_record_head_back_edge(txn,
 					(void **) &dead_cell->parent, old,
 					(void *) ((uintptr_t) old |
-						FT_ORD_PARENT_DETACHED_PREFIX) FT_BE_SITE(FT_BE_REMOVE_ONE_MARK));
+						FT_PARENT_PREFIX_HEAD) FT_BE_SITE(FT_BE_REMOVE_ONE_MARK));
 		}
 		/*
 		 * FOLD (coherent rekey one-decide writer): record the SW structural
@@ -9411,7 +9411,8 @@ void ft_record_child_back_edge(struct cds_ft *ft, struct ft_flip_txn *txn,
 	 */
 	ft_flip_txn_record_head_back_edge(txn, (void **) field,
 		urcu_txn_load(txn->mtxn, (void **) field, FT_FLIP_PROXY_TAG),
-		new_parent FT_BE_SITE(FT_BE_CHILD_BACK_EDGE));
+		ft_head_parent_word_slot(new_parent, slot)
+		FT_BE_SITE(FT_BE_CHILD_BACK_EDGE));
 }
 
 /*
@@ -10282,10 +10283,23 @@ void ft_set_parent_raw(struct cds_ft *ft, struct cds_ft_inode_flag *child,
 		 * replaces it with the real parent.  List off / non-cell: the head's
 		 * prev IS the flagged parent, so store the proxy directly there.
 		 */
-		if (ft->ordered_list)
-			ft_ord_cell_set_parent((struct cds_ft_node *) child, value);
-		else
-			((struct cds_ft_node *) child)->prev = value;
+		/*
+		 * A park or a restore, never a shape decision: carry the head's
+		 * own prefix-head answer across (FT_PARENT_PREFIX_HEAD).  A
+		 * proxy @value cannot hold the bit -- its bit 4 is address --
+		 * and the real re-parent that replaces it re-derives the answer.
+		 */
+		if (ft->ordered_list) {
+			struct ft_ord_cell *cell = ft_ord_cell_ptr(
+				((struct cds_ft_node *) child)->prev);
+
+			ft_ord_cell_set_parent((struct cds_ft_node *) child,
+				ft_head_parent_word_carry(value, cell->parent));
+		} else {
+			struct cds_ft_node *en = (struct cds_ft_node *) child;
+
+			en->prev = ft_head_parent_word_carry(value, en->prev);
+		}
 		return;
 	}
 	cds_ft_item_to_metadata(ft_node_ptr(child))->parent_word = value;
@@ -12065,10 +12079,14 @@ void ft_glue_record_back_edge(struct cds_ft *ft, struct ft_flip_txn *txn,
 			struct ft_ord_cell *cell = ft_ord_cell_ptr(en->prev);
 
 			ft_flip_txn_record_head_back_edge(txn,
-				(void **) &cell->parent, cell->parent, parent_nf FT_BE_SITE(FT_BE_PARENT_WORD));
+				(void **) &cell->parent, cell->parent,
+				ft_head_parent_word_slot(parent_nf, slot)
+				FT_BE_SITE(FT_BE_PARENT_WORD));
 		} else {
 			ft_flip_txn_record_head_back_edge(txn,
-				(void **) &en->prev, en->prev, parent_nf FT_BE_SITE(FT_BE_PARENT_WORD));
+				(void **) &en->prev, en->prev,
+				ft_head_parent_word_slot(parent_nf, slot)
+				FT_BE_SITE(FT_BE_PARENT_WORD));
 		}
 		return;
 	}
@@ -12402,13 +12420,15 @@ void ft_reparent_record(struct cds_ft *ft, struct ft_flip_txn *txn,
 				(void **) &cell->parent,
 				urcu_txn_load(txn->mtxn, (void **) &cell->parent,
 					FT_FLIP_PROXY_TAG),
-				parent_nf FT_BE_SITE(FT_BE_REPARENT_META));
+				ft_head_parent_word_slot(parent_nf, slot)
+				FT_BE_SITE(FT_BE_REPARENT_META));
 		} else {
 			ft_flip_txn_record_head_back_edge(txn,
 				(void **) &en->prev,
 				urcu_txn_load(txn->mtxn, (void **) &en->prev,
 					FT_FLIP_PROXY_TAG),
-				parent_nf FT_BE_SITE(FT_BE_REPARENT_META));
+				ft_head_parent_word_slot(parent_nf, slot)
+				FT_BE_SITE(FT_BE_REPARENT_META));
 		}
 		return;
 	}
