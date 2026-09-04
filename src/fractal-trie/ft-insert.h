@@ -271,7 +271,7 @@ void ft_park_live_parent_edge(struct cds_ft *ft,
 	ft_flip_txn_record_head_back_edge(txn, (void **) field,
 		urcu_txn_load(ft_flip_txn_handle(txn), (void **) field,
 			FT_FLIP_PROXY_TAG),
-		new_parent);
+		new_parent FT_BE_SITE(FT_BE_PARK_LIVE_PARENT));
 }
 
 /*

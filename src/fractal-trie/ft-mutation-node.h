@@ -1619,7 +1619,7 @@ int ft_node_recompact(enum ft_recompact mode,
 					return -EAGAIN;
 				}
 				ft_flip_txn_record_head_back_edge(retire_txn,
-					bc_slot, bc_old, new_node_flag);
+					bc_slot, bc_old, new_node_flag FT_BE_SITE(FT_BE_RECOMPACT));
 			} else {
 				/*
 				 * Build-invisible / legacy no-txn arm: the

@@ -4434,6 +4434,46 @@ struct cds_ft_metadata *ft_back_edge_owner(void *parent_word)
  * the word's lock on an anchor ANCESTOR the registry holds while @owner itself
  * is absent, so read `peer` as an UPPER bound anywhere else.
  */
+/*
+ * WHICH SITE produced a back-edge record.  Mirrors the FT_TK_MWA idiom that
+ * C.1(b) used to decompose MW_ALWAYS -- "a CLASS naming the population its
+ * caller joins, required in the instrumented build, absent from every other
+ * one" -- because one number for the whole lane is what a decomposition exists
+ * to stop.  The lane's 57.8% "op holds nothing" needs a site breakdown before
+ * anyone can say whether it is one path or eleven.
+ */
+#ifdef FT_DEBUG_BACK_EDGE_OWNER
+enum ft_be_site {
+	FT_BE_PARK_LIVE_PARENT = 0,	/* ft_park_live_parent_edge (insert) */
+	FT_BE_RECOMPACT,		/* ft_node_recompact */
+	FT_BE_DETACH_CN_PARENT,		/* ft_detach_node_replace_compressed_parent */
+	FT_BE_DETACH_UNCHAIN,		/* ft_detach_node, unchain publish */
+	FT_BE_CELL_SWAP_MARK,		/* ft_ord_cell_swap_edges, DETACHED_PREFIX */
+	FT_BE_REMOVE_ONE_MARK,		/* ft_remove_one_commit, DETACHED_PREFIX */
+	FT_BE_CHILD_BACK_EDGE,		/* ft_record_child_back_edge */
+	FT_BE_PARENT_WORD,		/* ft_flip_txn_record_parent_word */
+	FT_BE_REPARENT_META,		/* ft_reparent_record_meta */
+	FT_BE_SITE_NR,
+};
+# define FT_BE_SITE_PARAM	, enum ft_be_site dbg_be_site
+# define FT_BE_SITE(s)		, (s)
+extern const char *const ft_be_site_name[FT_BE_SITE_NR];
+const char *const ft_be_site_name[FT_BE_SITE_NR] = {
+	"park_live_parent", "recompact", "detach_cn_parent", "detach_unchain",
+	"cell_swap_mark", "remove_one_mark", "child_back_edge",
+	"parent_word", "reparent_meta",
+};
+extern unsigned long ft_be_s_total[FT_BE_SITE_NR],
+	ft_be_s_old[FT_BE_SITE_NR], ft_be_s_nolocks[FT_BE_SITE_NR],
+	ft_be_s_gp[FT_BE_SITE_NR], ft_be_s_gp_none[FT_BE_SITE_NR];
+unsigned long ft_be_s_total[FT_BE_SITE_NR],
+	ft_be_s_old[FT_BE_SITE_NR], ft_be_s_nolocks[FT_BE_SITE_NR],
+	ft_be_s_gp[FT_BE_SITE_NR], ft_be_s_gp_none[FT_BE_SITE_NR];
+#else
+# define FT_BE_SITE_PARAM
+# define FT_BE_SITE(s)
+#endif
+
 #ifdef FT_DEBUG_BACK_EDGE_OWNER
 extern unsigned long ft_be_total, ft_be_new, ft_be_old, ft_be_both,
 	ft_be_neither, ft_be_nolocks, ft_be_same, ft_be_noowner;
@@ -4459,6 +4499,38 @@ unsigned long ft_be_total, ft_be_new, ft_be_old, ft_be_both,
 		bool h_old = ft_flip_txn_owns((t), o_old);		\
 									\
 		__atomic_fetch_add(&ft_be_total, 1, __ATOMIC_RELAXED);	\
+		__atomic_fetch_add(&ft_be_s_total[dbg_be_site], 1,	\
+			__ATOMIC_RELAXED);				\
+		if (h_old)						\
+			__atomic_fetch_add(&ft_be_s_old[dbg_be_site], 1,\
+				__ATOMIC_RELAXED);			\
+		if (!(t)->nr_locks)					\
+			__atomic_fetch_add(				\
+				&ft_be_s_nolocks[dbg_be_site], 1,	\
+				__ATOMIC_RELAXED);			\
+		/*							\
+		 * MATHIEU'S INVARIANT: recompacting or freeing a child	\
+		 * needs its PARENT's lock, because the parent's child	\
+		 * pointer moves -- so the lock that excludes a		\
+		 * concurrent recompaction of the holder is the holder's	\
+		 * OWN parent, one level ABOVE the back edge's owner.	\
+		 * Counted independently of @h_old: the two are not	\
+		 * alternatives, and an `else` here would hide whichever	\
+		 * one it ran second.					\
+		 */							\
+		if (o_old) {						\
+			struct cds_ft_metadata *gp =			\
+				ft_back_edge_owner(o_old->parent_word);	\
+									\
+			if (!gp)					\
+				__atomic_fetch_add(			\
+					&ft_be_s_gp_none[dbg_be_site],	\
+					1, __ATOMIC_RELAXED);		\
+			else if (ft_flip_txn_owns((t), gp))		\
+				__atomic_fetch_add(			\
+					&ft_be_s_gp[dbg_be_site], 1,	\
+					__ATOMIC_RELAXED);		\
+		}							\
 		if (o_new && o_new == o_old)				\
 			__atomic_fetch_add(&ft_be_same, 1,		\
 				__ATOMIC_RELAXED);			\
@@ -4518,7 +4590,7 @@ unsigned long ft_be_total, ft_be_new, ft_be_old, ft_be_both,
  */
 static inline
 void ft_flip_txn_record_head_back_edge(struct ft_flip_txn *t, void **slot,
-		void *old_ptr, void *new_ptr)
+		void *old_ptr, void *new_ptr FT_BE_SITE_PARAM)
 {
 	FT_BACK_EDGE_CLAIM(t, old_ptr, new_ptr);
 	ft_flip_txn_record_tag_mw(t, slot, old_ptr, new_ptr,
@@ -9016,7 +9088,7 @@ int ft_ord_cell_swap_publish_multi(struct cds_ft *ft,
 			ft_flip_txn_record_head_back_edge(txn,
 				(void **) &old_cell->parent, (void *) old,
 				(void *) ((uintptr_t) old |
-					FT_ORD_PARENT_DETACHED_PREFIX));
+					FT_ORD_PARENT_DETACHED_PREFIX) FT_BE_SITE(FT_BE_CELL_SWAP_MARK));
 		} else if (prefix_head) {
 			/*
 			 * ☠ CURRENTLY UNREACHED -- all four callers of this
@@ -9205,7 +9277,7 @@ int ft_remove_one_commit(struct cds_ft *ft,
 				ft_flip_txn_record_head_back_edge(txn,
 					(void **) &dead_cell->parent, old,
 					(void *) ((uintptr_t) old |
-						FT_ORD_PARENT_DETACHED_PREFIX));
+						FT_ORD_PARENT_DETACHED_PREFIX) FT_BE_SITE(FT_BE_REMOVE_ONE_MARK));
 		}
 		/*
 		 * FOLD (coherent rekey one-decide writer): record the SW structural
@@ -9339,7 +9411,7 @@ void ft_record_child_back_edge(struct cds_ft *ft, struct ft_flip_txn *txn,
 	 */
 	ft_flip_txn_record_head_back_edge(txn, (void **) field,
 		urcu_txn_load(txn->mtxn, (void **) field, FT_FLIP_PROXY_TAG),
-		new_parent);
+		new_parent FT_BE_SITE(FT_BE_CHILD_BACK_EDGE));
 }
 
 /*
@@ -11993,10 +12065,10 @@ void ft_glue_record_back_edge(struct cds_ft *ft, struct ft_flip_txn *txn,
 			struct ft_ord_cell *cell = ft_ord_cell_ptr(en->prev);
 
 			ft_flip_txn_record_head_back_edge(txn,
-				(void **) &cell->parent, cell->parent, parent_nf);
+				(void **) &cell->parent, cell->parent, parent_nf FT_BE_SITE(FT_BE_PARENT_WORD));
 		} else {
 			ft_flip_txn_record_head_back_edge(txn,
-				(void **) &en->prev, en->prev, parent_nf);
+				(void **) &en->prev, en->prev, parent_nf FT_BE_SITE(FT_BE_PARENT_WORD));
 		}
 		return;
 	}
@@ -12330,13 +12402,13 @@ void ft_reparent_record(struct cds_ft *ft, struct ft_flip_txn *txn,
 				(void **) &cell->parent,
 				urcu_txn_load(txn->mtxn, (void **) &cell->parent,
 					FT_FLIP_PROXY_TAG),
-				parent_nf);
+				parent_nf FT_BE_SITE(FT_BE_REPARENT_META));
 		} else {
 			ft_flip_txn_record_head_back_edge(txn,
 				(void **) &en->prev,
 				urcu_txn_load(txn->mtxn, (void **) &en->prev,
 					FT_FLIP_PROXY_TAG),
-				parent_nf);
+				parent_nf FT_BE_SITE(FT_BE_REPARENT_META));
 		}
 		return;
 	}
