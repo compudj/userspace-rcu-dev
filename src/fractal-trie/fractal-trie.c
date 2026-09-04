@@ -900,6 +900,21 @@ void cds_ft_debug_ext_violation(unsigned int kind, struct cds_ft *ft,
 	FT_TP(ext_violation, kind, node, prev, holder, hext, (uint64_t) hstate,
 		ft_dbg_rm_site, (const void *) &cds_ft_debug_ext_violation,
 		key0);
+	/*
+	 * ALSO ON STDERR.  The shape of a loss is (holder tombstoned?, is the
+	 * node still its head?, which refusal site?) and all three are right
+	 * here -- so a plain un-traced run can be classified too.  That matters
+	 * because the reproducer cannot go GREEN while any shape remains, so
+	 * the metric for a candidate fix is a SHAPE HISTOGRAM over many runs,
+	 * and paying for a flight-recorder session per sample would cost more
+	 * than the samples are worth.
+	 */
+	fprintf(stderr, "EXTVIOL kind=%u node=%p prev=%p holder=%p hext=%p "
+		"hstate=0x%lx rmsite=%u tomb=%d headis=%s\n",
+		kind, (void *) node, prev, (void *) holder, (void *) hext,
+		(unsigned long) hstate, ft_dbg_rm_site,
+		(hstate & FT_STATE_TOMBSTONE) ? 1 : 0,
+		hext == node ? "node" : (hext ? "other" : "null"));
 	ft_trace_capture();
 }
 #endif

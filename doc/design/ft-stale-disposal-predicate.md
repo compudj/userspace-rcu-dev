@@ -160,21 +160,55 @@ and where to stop: `ft-remove.h:2332` (collect), `:2352` (stop the climb),
 the commit runs, and `ft-remove.h:4234`–`:4239` frees them.  The uncovered word
 here is a **body slot** as well as `external_nodes`.
 
-### 3.3 ☠ THE ROUTE DISTRIBUTION — the compress is a MINORITY of losses
+### 3.3 ☠ THE SHAPE HISTOGRAM — the disposal class is 2/3 of losses, not all
 
-Five classifiable losses (`cds_ft:chain_compress_enter` on the violation's own
-holder is the discriminator; the sixth run SEGV'd before the hook):
+☠☠ **AN EARLIER VERSION OF THIS TABLE WAS WRONG.** It reported a row as
+"holder ALIVE, node ORPHANED (`hext != node`)" having **never compared `hext`
+to the node**. Corrected below, from 24 samples classified out of the violation
+record itself (`EXTVIOL` on stderr: `tomb`, `headis`, `rmsite`).
 
-| route | count | evidence |
+| shape | n/24 | reading |
 |---|---|---|
-| `ft_chain_compress_fused`, shape-D fold | **2/5** | a compress entered on the holder; `hstate` carries TOMBSTONE |
-| `ft_detach_node`'s climb | **1/5** | retire's inline chain is `… <- ft_walk_extend <- ft_detach_node` |
-| **☐ neither — holder ALIVE, node ORPHANED** | **2/5** | `hstate` 0x8 / 0x4 (no tombstone), no retire in window, and `hext != node`: the node's back edge names a holder that does not hold it |
+| `tomb=1 headis=node` | **15** | THE DISPOSAL CLASS (§3.1, §3.2): the key rode a holder that was retired under it |
+| `tomb=0 headis=other` | **4** | ☐ live holder, some OTHER node is its head — unexplained |
+| `tomb=0 headis=node`, `rmsite` = the body-child arm | **4** | ★ **THE BOGUS REFUSAL — root-caused in §3.3.1** |
+| `tomb=1 headis=null` | **1** | ☐ retired holder, head word already cleared |
 
-★ So **fixing §3.1 alone cannot cure the defect**, and that is exactly what the
-third refutation in §4 measured.  The **☐ third sub-shape is not root-caused**;
-it is a live-holder orphaning, not a disposal, and it may not belong to this
-brief's class at all.
+★ So **§3.1 alone cannot cure the defect** — which is exactly what the third and
+fourth refutations in §4 measured.
+
+#### 3.3.1 ★ ROOT-CAUSED: the bogus NOT_FOUND from the body-child arm
+
+`cds_ft_remove` picks between four arms on how `@node` hangs off its holder
+(`ft-remove.h:5267`): a non-head duplicate, a compressed holder's single child,
+an internal holder whose **head word is `@node`** (the PREFIX-key arm,
+`ft_node_external_nodes(holder_flag) == node`), else *"internal holder, @node is
+a body child"* — which looks `@node` up at `holder_body[key[key_len-1]]` and, on
+a mismatch, returns **`CDS_FT_STATUS_NOT_FOUND`**.
+
+MEASURED at that exact return: `tomb=0 headis=node`. A **fresh**
+`ft_node_holder(@node)` says the node IS its holder's external head, and the
+holder is **alive and untombstoned**. So the four-way branch tested the head word
+of a **STALE `holder_flag`** — derived from `@node->prev` far above (`:5054`) and
+never re-validated — took the wrong arm, and reported a **permanent, key-losing
+answer to a transient race**.
+
+☞ Not the flip proxy: the prefix arm's read goes through
+`ft_node_external_nodes` → `ft_dereference_external`, which resolves proxies
+(`ft-helpers.h:1147`). The staleness is in **which holder**, not in the value.
+
+☞ The op ALREADY has the escape it needs — the dead-forward-holder arm sets
+`*need_retry` (`ft-remove.h:5165`) — and the tombstoned and coarse-spacing cases
+are ALREADY re-derived (`:5081`, `:5103`). This case (holder replaced, not yet
+tombstoned, per-node spacing) is the hole between them.
+
+**A/B (24 seeds each, mechanism-derived):** re-derive `ft_node_holder(@node)` at
+that return and hand the op to `*need_retry` when it moved →
+**4/24 → 0/24, the shape eliminated.**
+☠ **But one run came back `rc=137`** — the memcg SIGKILLing a livelock — and two
+moved to `tomb=0 headis=node` with **no** `rmsite` (the lookup misses before the
+remove is ever reached). So the retry is the right *diagnosis* and NOT yet the
+right *disposition*: this is Q1b again, on a different site.
 
 ☠ **Instrument caveat**: `item_retire`'s `__builtin_return_address(0)` is
 UNRELIABLE at -O2 — two attributions landed on `ft-remove.h:1197` (a DLM
@@ -272,13 +306,20 @@ and a lock.  So G4 need not be decided to fix the shipping key loss — but the
 answer to **Q1(c)** is adjacent to it and the two should not be decided in
 opposite directions.
 
-**Q5b — the ☐ THIRD SUB-SHAPE (§3.3) — same brief or a different one?**  2 of 5
-losses have a holder that is **alive and untombstoned** whose `external_nodes`
-is some *other* node, with no disposal anywhere in the window.  That is not a
-stale disposal predicate; it looks like the node's back edge naming a holder it
-was never (or is no longer) in.  It needs its own root-cause pass before it can
-be scoped — and until it is closed, **no fix in this brief can turn the
-reproducer green**, which is worth knowing before anyone measures a candidate.
+**Q5b — the BOGUS REFUSAL (§3.3.1) is root-caused: what disposition?**  It is
+NOT the disposal class — the holder is alive, nothing was retired, and the op
+simply took the wrong arm on a stale `holder_flag` and answered NOT_FOUND.  The
+diagnosis is settled (4/24 → 0/24 on a targeted probe).  What is not settled is
+the same question as Q1b: `*need_retry` alone produced **one `rc=137` livelock**
+in 24, so a bounded re-derivation, a re-descent, or a different arm-selection
+that cannot go stale all need weighing.  ☞ It may be cheaper to make the
+FOUR-WAY BRANCH ITSELF robust — re-derive the holder immediately before it,
+under the same mark that protects the arms — than to patch each arm's refusal.
+
+**Q5c — the ☐ REMAINING 5/24.**  `tomb=0 headis=other` (4) and
+`tomb=1 headis=null` (1) are still unexplained.  Until they are, **no fix in
+this brief can turn the reproducer green** — worth knowing before anyone
+measures a candidate on a red/green criterion instead of the shape histogram.
 
 **Q5 — Scope.**  Is the deliverable the two measured instances, or a sweep for
 the class?  The class is: *"an op that DISPOSES of a node on the strength of a
