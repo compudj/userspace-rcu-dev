@@ -4384,6 +4384,115 @@ void ft_flip_txn_record_root(struct ft_flip_txn *t, void **slot,
 }
 
 /*
+ * ft_back_edge_owner: the HOLDER a head's back edge names, as the metadata the
+ * ownership machinery speaks in.
+ *
+ * Decision of record (Mathieu, 2026-09-03): a head's back edge is owned by the
+ * PARENT (P), which is what mw-writer-lock-escalation-model.md §8.2
+ * "Field-by-field ownership" already assigns the `parent` pointer -- against
+ * the code, which keyed the edge kind on holding the CHILD
+ * (ft_flip_txn_record_parent_word's @child_held, ft_reparent_record_meta's
+ * owner = meta) and therefore had no owner to name for an EXTERNAL child.
+ * That closes FT_OWNER_NONE_EXTERNAL_HEAD's design question in favour of the
+ * model; externals do NOT grow a state word for it.
+ *
+ * @parent_word is the value the edge INSTALLS -- the parent the head is moving
+ * TO -- taken raw, so it launders the trie stamp (ft_parent_node) and the
+ * detached-prefix mark (ft_ord_parent_strip) exactly as every other reader of
+ * a parent word does.  A parent word never holds a skip-encoded flag: the skip
+ * form is a SLOT encoding, not a way to name a parent.
+ *
+ * ☠ NAMING AN OWNER IS NOT PROVING EXCLUSION.  The plan's open box is explicit
+ * -- "owner-AVAILABLE is not owner-SUFFICIENT ... nobody has yet shown the
+ * holder's lock EXCLUDES every writer of a chain member's ->prev" -- so this
+ * feeds a COUNTER first (FT_BACK_EDGE_CLAIM) and an assert only once the
+ * distribution says the claim holds.
+ */
+static inline __attribute__((unused))
+struct cds_ft_metadata *ft_back_edge_owner(void *parent_word)
+{
+	struct cds_ft_inode_flag *nf = ft_ord_parent_strip(
+		ft_parent_node((struct cds_ft_inode_flag *) parent_word));
+
+	if (!nf || ft_node_external(nf))
+		return NULL;		/* root position, or not a node */
+	assert(!ft_node_skip_compressed(nf));
+	return cds_ft_item_to_metadata(ft_node_compressed(nf) ?
+		(struct cds_ft_inode *) ft_compressed_node_ptr(nf) :
+		ft_node_ptr(nf));
+}
+
+/*
+ * THE BACK-EDGE OWNERSHIP CLAIM, counted before it is armed.
+ *
+ * Deliberately WITHOUT the `|| !t->nr_locks` escape that
+ * FT_OWNER_ASSERT_OWNED_CTX carries: an op that holds NOTHING is the very
+ * population this claim is about (measured 26-65% of back-edge records), and a
+ * predicate that excuses it would be green and meaningless.
+ *
+ * ☠ ft_flip_txn_owns is EXACT ONLY AT PER-NODE SPACING -- coarser spacing puts
+ * the word's lock on an anchor ANCESTOR the registry holds while @owner itself
+ * is absent, so read `peer` as an UPPER bound anywhere else.
+ */
+#ifdef FT_DEBUG_BACK_EDGE_OWNER
+extern unsigned long ft_be_total, ft_be_new, ft_be_old, ft_be_both,
+	ft_be_neither, ft_be_nolocks, ft_be_same, ft_be_noowner;
+unsigned long ft_be_total, ft_be_new, ft_be_old, ft_be_both,
+	ft_be_neither, ft_be_nolocks, ft_be_same, ft_be_noowner;
+/*
+ * ☞ WHICH P?  A back edge is a TRANSITION -- the head leaves @old_ptr's node
+ * and joins @new_ptr's -- and §8.2 says "the parent pointer is owned by P"
+ * without saying which end of a re-home.  So count BOTH ends: the word being
+ * written belongs to the HEAD, and the head is peer-visible under its OLD
+ * parent, so the old end is the one a peer's reader resolves through.  A
+ * fresh, unpublished NEW holder does not make the write private -- the head
+ * is live either way -- which is why "published vs private holder" is NOT the
+ * discriminator here.
+ */
+# define FT_BACK_EDGE_CLAIM(t, old_ptr, new_ptr)			\
+	do {								\
+		struct cds_ft_metadata *o_new =				\
+			ft_back_edge_owner(new_ptr);			\
+		struct cds_ft_metadata *o_old =				\
+			ft_back_edge_owner(old_ptr);			\
+		bool h_new = ft_flip_txn_owns((t), o_new);		\
+		bool h_old = ft_flip_txn_owns((t), o_old);		\
+									\
+		__atomic_fetch_add(&ft_be_total, 1, __ATOMIC_RELAXED);	\
+		if (o_new && o_new == o_old)				\
+			__atomic_fetch_add(&ft_be_same, 1,		\
+				__ATOMIC_RELAXED);			\
+		if (!o_new && !o_old)					\
+			__atomic_fetch_add(&ft_be_noowner, 1,		\
+				__ATOMIC_RELAXED);			\
+		else if (h_new && h_old)				\
+			__atomic_fetch_add(&ft_be_both, 1,		\
+				__ATOMIC_RELAXED);			\
+		else if (h_new)						\
+			__atomic_fetch_add(&ft_be_new, 1,		\
+				__ATOMIC_RELAXED);			\
+		else if (h_old)						\
+			__atomic_fetch_add(&ft_be_old, 1,		\
+				__ATOMIC_RELAXED);			\
+		else if (!(t)->nr_locks)				\
+			__atomic_fetch_add(&ft_be_nolocks, 1,		\
+				__ATOMIC_RELAXED);			\
+		else							\
+			__atomic_fetch_add(&ft_be_neither, 1,		\
+				__ATOMIC_RELAXED);			\
+	} while (0)
+#else
+/*
+ * ☠ The OFF form must not evaluate the pointers through ft_back_edge_owner:
+ * the resolver walks tag bits and asserts, and this helper sits on the
+ * mutation path.  Taking them raw keeps the shipping build byte-identical
+ * (verified: .text and .rodata unchanged).
+ */
+# define FT_BACK_EDGE_CLAIM(t, old_ptr, new_ptr)			\
+	do { (void) (t); (void) (old_ptr); (void) (new_ptr); } while (0)
+#endif
+
+/*
  * An EXTERNAL HEAD's BACK CHANNEL re-pointed at a new parent: cell->parent with
  * the ordered list on, en->prev with it off.  ALWAYS MW, for the reason
  * ft_flip_txn_record_parent_word decides per record on @child_held -- a
@@ -4411,6 +4520,7 @@ static inline
 void ft_flip_txn_record_head_back_edge(struct ft_flip_txn *t, void **slot,
 		void *old_ptr, void *new_ptr)
 {
+	FT_BACK_EDGE_CLAIM(t, old_ptr, new_ptr);
 	ft_flip_txn_record_tag_mw(t, slot, old_ptr, new_ptr,
 		FT_FLIP_PROXY_TAG FT_TK_MWA(FT_TK_MWA_HEAD_BACK));
 }
