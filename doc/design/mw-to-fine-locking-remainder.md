@@ -2724,6 +2724,16 @@ are a SEPARATE lane, MW_ALWAYS by design and out of scope (the G4 decision).
 Naming an owner only makes a site *eligible*; the exclusion argument is what
 the arm needs, and it gets its own adversarial skeptic.
 
+☞ **A NEIGHBOURING exclusion gap is now MEASURED and written up**:
+`doc/design/ft-stale-disposal-predicate.md` (2026-09-04).  It does not close the
+box above — its words are a holder's `external_nodes` and its body slots, not
+`->prev` — but it settles the *shape* of the answer for those: both writers hold
+the node's lock and the acquires are ordered by it (the second takes it 110 ns
+after the first's commit released it) and the key is still lost, because the DISPOSAL PREDICATE the retire rests on is never carried
+into the commit's read set.  So "an owner is available and the op holds it" is
+measured to be insufficient on its own, and the shipping two-writer key loss
+does NOT need G4 decided first.
+
 `FT_OWNER_UNPLUMBED` (1 site, `ft-compact.h`) is the other marker: the owner
 exists and is simply not in scope. Both are greppable.
 
