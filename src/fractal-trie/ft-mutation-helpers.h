@@ -4448,8 +4448,6 @@ enum ft_be_site {
 	FT_BE_RECOMPACT,		/* ft_node_recompact */
 	FT_BE_DETACH_CN_PARENT,		/* ft_detach_node_replace_compressed_parent */
 	FT_BE_DETACH_UNCHAIN,		/* ft_detach_node, unchain publish */
-	FT_BE_CELL_SWAP_MARK,		/* ft_ord_cell_swap_edges, DETACHED_PREFIX */
-	FT_BE_REMOVE_ONE_MARK,		/* ft_remove_one_commit, DETACHED_PREFIX */
 	FT_BE_CHILD_BACK_EDGE,		/* ft_record_child_back_edge */
 	FT_BE_PARENT_WORD,		/* ft_flip_txn_record_parent_word */
 	FT_BE_REPARENT_META,		/* ft_reparent_record_meta */
@@ -4460,8 +4458,7 @@ enum ft_be_site {
 extern const char *const ft_be_site_name[FT_BE_SITE_NR];
 const char *const ft_be_site_name[FT_BE_SITE_NR] = {
 	"park_live_parent", "recompact", "detach_cn_parent", "detach_unchain",
-	"cell_swap_mark", "remove_one_mark", "child_back_edge",
-	"parent_word", "reparent_meta",
+	"child_back_edge", "parent_word", "reparent_meta",
 };
 extern unsigned long ft_be_s_total[FT_BE_SITE_NR],
 	ft_be_s_old[FT_BE_SITE_NR], ft_be_s_nolocks[FT_BE_SITE_NR],
@@ -9041,75 +9038,17 @@ int ft_ord_cell_swap_publish_multi(struct cds_ft *ft,
 	if (new_cell)
 		n = ft_ord_cell_swap_edges(ft, old_cell, new_cell, edges, n);
 	/*
-	 * The swapped-out head leaves the trie (a promote's removed head, a
-	 * replace's old head) while parked readers still hold @old_cell.  When
-	 * that head was the holder's PREFIX head -- the forward edge is the
-	 * holder's own external_nodes word -- the holder's external_nodes now
-	 * names the swapped-in head, and the up-walk from @old_cell could no
-	 * longer tell it was a prefix head: mark the retired cell's parent word
-	 * in this same flip (FT_PARENT_PREFIX_HEAD; see
-	 * ft_rebuild_key_upwalk).  A slot head (a body slot, a compressed
-	 * cn->child) needs no mark: its byte is right either way.
+	 * ☞ NO MARK HERE ANY MORE.  A swapped-out PREFIX head used to have its
+	 * retired cell's parent word marked in this same flip, because the
+	 * holder's external_nodes now names the swapped-in head and the up-walk
+	 * could no longer tell the dead head's shape.  The head carries that
+	 * answer itself from the moment it was INSTALLED
+	 * (FT_PARENT_PREFIX_HEAD), and a retired cell is never written again,
+	 * so the word a parked reader finds is already right.  MEASURED before
+	 * removal, over ft_unit + ft_inv: 269,807 reaches, 87,409 genuine
+	 * prefix-head candidates, ALL 87,409 already carrying the bit, and the
+	 * mark recorded 0 times.
 	 */
-	if (new_cell && n_sedge >= 1) {
-		/*
-		 * The holder is derived from the retired cell itself, not from
-		 * the edge's @owner (a replace's hand-built sedge names none):
-		 * a prefix head hangs at an INTERNAL holder, whose
-		 * external_nodes word is then the forward edge's slot.
-		 */
-		struct cds_ft_inode_flag *old = txn ?
-			(struct cds_ft_inode_flag *) urcu_txn_load(
-				ft_flip_txn_handle(txn),
-				(void **) &old_cell->parent, FT_FLIP_PROXY_TAG) :
-			ft_resolve_flip_proxy(rcu_dereference(old_cell->parent));
-		struct cds_ft_inode_flag *holder = ft_parent_node(old);
-		/*
-		 * ☠ THE MARK IS A BIT IN A POINTER, so it may only ever be OR'ed
-		 * into a word that IS an internal-node flag: bit 4 is ADDRESS on a
-		 * compressed node (FT_ALLOC_ORDER_MIN, 16 B) and on the trie stamp.
-		 * @holder establishes that for the node; ask @old too, because the
-		 * OR below is on @old.
-		 *
-		 * ☠ AND AN ALREADY-MARKED @old IS A STALE PLAN, not an invariant
-		 * violation.  This word is PEER-MUTABLE, so asserting on it would
-		 * turn a lost race into an abort() the day the FT-wide writer lock
-		 * drops.  Decline to record instead: the forward edge in this same
-		 * flip carries its own expected-old and fails the attempt cleanly.
-		 */
-		bool prefix_head = holder && !ft_node_external(holder) &&
-			!ft_node_compressed(holder) &&
-			(void *) sedges[0].slot == (void *)
-				&ft_flag_to_metadata(ft, holder)->external_nodes &&
-			((uintptr_t) old & FT_INTERNAL_MASK) &&
-			!ft_parent_prefix_head(old);
-
-		if (prefix_head && txn) {
-			ft_flip_txn_record_head_back_edge(txn,
-				(void **) &old_cell->parent, (void *) old,
-				(void *) ((uintptr_t) old |
-					FT_PARENT_PREFIX_HEAD) FT_BE_SITE(FT_BE_CELL_SWAP_MARK));
-		} else if (prefix_head) {
-			/*
-			 * ☠ CURRENTLY UNREACHED -- all four callers of this
-			 * function pass a @txn (measured: swap_mark_txn accounts
-			 * for every mark ft_unit and ft_inv take).  It is kept, and
-			 * not deleted, because this function supports @txn == NULL
-			 * for its OTHER edges (the ft_ord_cell_flip_try tail
-			 * below); a mark that existed only on the txn path would
-			 * make the non-txn form silently drop it and emit exactly
-			 * the wrong key this whole edge exists to prevent.  Read
-			 * its greenness as "never executed", not as coverage.
-			 */
-			edges[n].slot = (struct ft_ord_cell **) &old_cell->parent;
-			edges[n].old_target = (struct ft_ord_cell *) old;
-			edges[n].new_target = (struct ft_ord_cell *)
-				((uintptr_t) old | FT_PARENT_PREFIX_HEAD);
-			edges[n].owner = sedges[0].owner;
-			edges[n].owner_held = false;	/* MW, as every head back edge */
-			n++;
-		}
-	}
 	if (txn)
 		return ft_flip_status_to_errno(
 			ft_ord_cell_flip_into(ft, txn, edges, n));
@@ -9247,38 +9186,15 @@ int ft_remove_one_commit(struct cds_ft *ft,
 			n++;
 		}
 		/*
-		 * A PREFIX head's key-disappearing clear (@struct_slot IS the
-		 * holder's external_nodes word): the holder stays and its
-		 * external_nodes reads NULL from here on, while parked readers
-		 * still hold @dead_cell and rebuild its key from that holder.
-		 * Mark the dead cell's parent word IN THIS FLIP
-		 * (FT_PARENT_PREFIX_HEAD) so the up-walk keeps telling a
-		 * dead prefix head from a slot head -- see ft_rebuild_key_upwalk.
-		 * The expected-old is a WAITING load (the word enters this txn's
-		 * write set; a raw read could take a peer's parked proxy).  Always
-		 * MW (ft_flip_txn_record_head_back_edge), like every head back
-		 * edge.  A body-slot / cn->child clear is a slot head: no mark.
+		 * ☞ NO MARK HERE ANY MORE, for the reason spelled out in
+		 * ft_ord_cell_swap_publish_multi: a PREFIX head's
+		 * key-disappearing clear leaves the holder's external_nodes
+		 * reading NULL, but the dead head's own parent word still says
+		 * it WAS the prefix head (FT_PARENT_PREFIX_HEAD, set at
+		 * install), so the up-walk needs nothing written here.
+		 * MEASURED over ft_unit + ft_inv: 357,939 reaches, every one
+		 * already carrying the bit, the mark recorded 0 times.
 		 */
-		if (dead_cell && slot_owner && (void *) struct_slot ==
-				(void *) &slot_owner->external_nodes) {
-			void *old = urcu_txn_load(ft_flip_txn_handle(txn),
-				(void **) &dead_cell->parent, FT_FLIP_PROXY_TAG);
-
-			/*
-			 * Internal flag only (bit 4 is ADDRESS on a compressed
-			 * node and on the trie stamp), and an already-marked word
-			 * is a STALE PLAN this attempt must not build on -- see
-			 * the same pair in ft_ord_cell_swap_publish_multi.  Both
-			 * decline to record rather than assert, because the word
-			 * is peer-mutable and the forward edge aborts the attempt.
-			 */
-			if (old && ((uintptr_t) old & FT_INTERNAL_MASK) &&
-					!ft_parent_prefix_head(old))
-				ft_flip_txn_record_head_back_edge(txn,
-					(void **) &dead_cell->parent, old,
-					(void *) ((uintptr_t) old |
-						FT_PARENT_PREFIX_HEAD) FT_BE_SITE(FT_BE_REMOVE_ONE_MARK));
-		}
 		/*
 		 * FOLD (coherent rekey one-decide writer): record the SW structural
 		 * slot + nr_child-- + cell unsplice into the caller's SHARED mixed txn
