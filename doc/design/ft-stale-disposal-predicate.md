@@ -160,62 +160,95 @@ and where to stop: `ft-remove.h:2332` (collect), `:2352` (stop the climb),
 the commit runs, and `ft-remove.h:4234`–`:4239` frees them.  The uncovered word
 here is a **body slot** as well as `external_nodes`.
 
-### 3.3 ☠ THE SHAPE HISTOGRAM — the disposal class is 2/3 of losses, not all
+### 3.3 THE SHAPE HISTOGRAM — 79% is ONE defect, and two "shapes" were my instrument
 
-☠☠ **AN EARLIER VERSION OF THIS TABLE WAS WRONG.** It reported a row as
-"holder ALIVE, node ORPHANED (`hext != node`)" having **never compared `hext`
-to the node**. Corrected below, from 24 samples classified out of the violation
-record itself (`EXTVIOL` on stderr: `tomb`, `headis`, `rmsite`).
+☠☠ **TWO EARLIER VERSIONS OF THIS TABLE WERE WRONG, BOTH BECAUSE OF THE
+INSTRUMENT, NOT THE TRIE.**
 
-| shape | n/24 | reading |
-|---|---|---|
-| `tomb=1 headis=node` | **15** | THE DISPOSAL CLASS (§3.1, §3.2): the key rode a holder that was retired under it |
-| `tomb=0 headis=other` | **4** | ☐ live holder, some OTHER node is its head — unexplained |
-| `tomb=0 headis=node`, `rmsite` = the body-child arm | **4** | ★ **THE BOGUS REFUSAL — root-caused in §3.3.1** |
-| `tomb=1 headis=null` | **1** | ☐ retired holder, head word already cleared |
+1. A row was reported as "holder ALIVE, node ORPHANED (`hext != node`)" having
+   **never compared `hext` to the node**.
+2. `headis=null` was a whole invented shape: a **COMPRESSED** holder keeps its
+   single external child in `cn->child`, and `meta->external_nodes` is
+   legitimately NULL there.  Reading the metadata field unconditionally
+   manufactured it.
+3. And the classifier looked only at the **HOLDER**.  When the disposal happens
+   **one level up**, the holder is alive, correctly wired and holding the key —
+   while the node it hangs off was retired under it.
 
-★ So **§3.1 alone cannot cure the defect** — which is exactly what the third and
-fourth refutations in §4 measured.
+Final, with the head field dispatched on holder kind and the **PARENT's**
+tombstone in the record (24 samples, `EXTVIOL` on stderr):
 
-#### 3.3.1 ★ ROOT-CAUSED: the bogus NOT_FOUND from the body-child arm
+| kind | htomb | headis | ptomb | rmsite | n |
+|---|---|---|---|---|---|
+| RM-LOOKUP-MISS | 1 | node | 0 | — | 10 |
+| RM-LOOKUP-MISS | 1 | node | **1** | — | 4 |
+| RM-FAIL | 0 | node | 0 | **body-child arm** | 3 |
+| RM-LOOKUP-MISS | 0 | other | **1** | — | 2 |
+| RM-LOOKUP-MISS | 0 | node | 0 | — | 2 |
+| RM-LOOKUP-MISS | 1 | null | **1** | — | 1 |
+| RM-LOOKUP-MISS | 0 | null | **1** | — | 1 |
+| RM-LOOKUP-MISS | 0 | node | **1** | — | 1 |
+
+★★ **A RETIRED ANCESTOR — the holder OR its parent — accounts for 19 of 24
+(79%).**  The bogus refusal is 3/24.  Only **2/24** have no retired ancestor and
+no refusal site, and those are the whole remaining residue.
+
+#### 3.3.1 ★ ROOT-CAUSED: the bogus NOT_FOUND from an identity-compare arm
 
 `cds_ft_remove` picks between four arms on how `@node` hangs off its holder
-(`ft-remove.h:5267`): a non-head duplicate, a compressed holder's single child,
-an internal holder whose **head word is `@node`** (the PREFIX-key arm,
+(`ft-remove.h:5267`): a non-head duplicate, a **compressed** holder's single
+child, an internal holder whose **head word is `@node`** (the PREFIX-key arm,
 `ft_node_external_nodes(holder_flag) == node`), else *"internal holder, @node is
-a body child"* — which looks `@node` up at `holder_body[key[key_len-1]]` and, on
-a mismatch, returns **`CDS_FT_STATUS_NOT_FOUND`**.
+a body child"*.  The last two each end in an identity compare that answers
+**`CDS_FT_STATUS_NOT_FOUND`** on a mismatch — `ft-remove.h:5308` (compressed,
+`*head_slot != node`) and `:5520` (body child,
+`holder_body[key[key_len-1]] != node`).  Both fire in the histogram.
 
-MEASURED at that exact return: `tomb=0 headis=node`. A **fresh**
-`ft_node_holder(@node)` says the node IS its holder's external head, and the
-holder is **alive and untombstoned**. So the four-way branch tested the head word
-of a **STALE `holder_flag`** — derived from `@node->prev` far above (`:5054`) and
-never re-validated — took the wrong arm, and reported a **permanent, key-losing
-answer to a transient race**.
+MEASURED at those returns: `htomb=0 headis=node`.  A **fresh**
+`ft_node_holder(@node)` says the node IS its holder's head, and the holder is
+**alive and untombstoned**.  So the branch tested a **STALE `holder_flag`** —
+derived from `@node->prev` at `:5054` and never re-validated — took the wrong
+arm, and returned a **permanent, key-losing answer to a transient race**.
 
-☞ Not the flip proxy: the prefix arm's read goes through
-`ft_node_external_nodes` → `ft_dereference_external`, which resolves proxies
-(`ft-helpers.h:1147`). The staleness is in **which holder**, not in the value.
+☞ Not the flip proxy: the prefix arm reads through `ft_node_external_nodes` →
+`ft_dereference_external`, which resolves them (`ft-helpers.h:1147`).  The
+staleness is in **which holder**.  ☞ And `:5308`'s own comment reassures that
+*"a peer republished the holder … is caught by the commit's expected-value CAS
+… as ABORT -> retry"* — but this return happens **before any commit**, so the
+reassurance does not cover the exit it is written on.
 
-☞ The op ALREADY has the escape it needs — the dead-forward-holder arm sets
-`*need_retry` (`ft-remove.h:5165`) — and the tombstoned and coarse-spacing cases
-are ALREADY re-derived (`:5081`, `:5103`). This case (holder replaced, not yet
-tombstoned, per-node spacing) is the hole between them.
+☞ The op ALREADY has the escape (`*need_retry`, `:5165`) and the tombstoned
+(`:5081`) and coarse-spacing (`:5103`) cases are ALREADY re-derived.  Holder
+replaced, **not yet tombstoned**, per-node spacing is the hole between them.
 
-**A/B (24 seeds each, mechanism-derived):** re-derive `ft_node_holder(@node)` at
-that return and hand the op to `*need_retry` when it moved →
-**4/24 → 0/24, the shape eliminated.**
-☠ **But one run came back `rc=137`** — the memcg SIGKILLing a livelock — and two
-moved to `tomb=0 headis=node` with **no** `rmsite` (the lookup misses before the
-remove is ever reached). So the retry is the right *diagnosis* and NOT yet the
-right *disposition*: this is Q1b again, on a different site.
+**A/B, 24 seeds each:** re-derive at the `:5520` return and `*need_retry` when
+the holder moved → **4/24 → 0/24, eliminated.**  ☠ But one run returned
+`rc=137` (a memcg-SIGKILLed livelock) and two moved to a lookup miss that never
+reaches the remove.  Right diagnosis, **not yet the right disposition** — Q1b.
 
-☠ **Instrument caveat**: `item_retire`'s `__builtin_return_address(0)` is
-UNRELIABLE at -O2 — two attributions landed on `ft-remove.h:1197` (a DLM
-member-set line) and `ft-mutation-helpers.h:383` (a descent loop), neither of
-which frees anything.  `addr2line -i` recovers the useful outer frames.  Trust
-the `chain_compress_enter` event, which is emitted at a known site, over any
-return address.
+#### 3.3.2 ★ THE `headis=other` SHAPE IS §3.1's DEFECT, ONE LEVEL UP
+
+Caught in the act (`trace-o-s5`), on the parent `P = 0x7FF93EC39341`:
+
+```
+.989065371  A  chain_compress_enter  boundary=P  plan_nr_child=2  ext=0x0
+.989066052  B  edge_record  slot = a BODY SLOT of P:  head -> B's fresh junction
+.989069387  B  txn_commit status = 0                     ← B's publish INSTALLED
+.989069307  A  chain_compress_enter  boundary=P          ← re-attempt, AFTER B
+.989071630  A  chain_compress_exit   status = 0          ← A's collapse COMMITTED
+.989071750  A  item_retire item = P                      ← the parent B published into
+```
+
+B's fresh junction is **alive, correctly wired, and holds the key** — and hangs
+off a node A freed.  ★ `ext = 0x0` throughout, so §3.1's `external_nodes`
+re-validation would never have fired here.  What went stale is **`plan_nr_child`
+plus the identity of the slot A is DETACHING**, and `ft-remove.h:1314` re-reads
+**only the SURVIVOR's slot** — B wrote the *other* one, as a **same-slot value
+swap**, so `nr_child` did not move either.
+
+☞ So §3.1 and this are ONE defect with two uncovered words, and
+`ft_node_recompact`'s DEL arm already carries the fix shape for the second one:
+`@nullify_expected`, a plan expected-old on the slot being dropped.
 
 ### 3.4 Already correct — the model to copy
 
@@ -316,10 +349,12 @@ that cannot go stale all need weighing.  ☞ It may be cheaper to make the
 FOUR-WAY BRANCH ITSELF robust — re-derive the holder immediately before it,
 under the same mark that protects the arms — than to patch each arm's refusal.
 
-**Q5c — the ☐ REMAINING 5/24.**  `tomb=0 headis=other` (4) and
-`tomb=1 headis=null` (1) are still unexplained.  Until they are, **no fix in
-this brief can turn the reproducer green** — worth knowing before anyone
-measures a candidate on a red/green criterion instead of the shape histogram.
+**Q5c — the ☐ REMAINING 2/24.**  Two samples have no retired ancestor and no
+refusal site: the holder is alive, untombstoned, holds the node, its parent is
+alive — and the lookup missed anyway.  That residue is unexplained.  Until it
+is closed, **no fix in this brief can turn the reproducer green** — worth
+knowing before anyone measures a candidate on a red/green criterion instead of
+the shape histogram.
 
 **Q5 — Scope.**  Is the deliverable the two measured instances, or a sweep for
 the class?  The class is: *"an op that DISPOSES of a node on the strength of a

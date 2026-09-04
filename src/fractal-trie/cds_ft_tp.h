@@ -1163,27 +1163,42 @@ LTTNG_UST_TRACEPOINT_EVENT(cds_ft, chain_compress_exit,
  * STOP (FT_TRACE_FREEZE) runs before the fork+exec of `lttng snapshot record`.
  * @kind names the oracle shape (0 RM-LOOKUP-MISS, 1 RM-FAIL, 2 STALE-FOUND,
  * 3 RM-WRONG-NODE, 4 DUP-CHAINED), @node the key's own external node.
+ *
+ * ☠ TEN ARGUMENT PAIRS IS THE LTTNG-UST CEILING for LTTNG_UST_TP_ARGS, and
+ * exceeding it fails as an implicit-declaration error on the generated
+ * callback, not as anything that names the limit.  @prev (the head's cell) was
+ * dropped for @parent: the cell is derivable from @holder, the parent is not
+ * derivable from anything else in the record.
  */
 LTTNG_UST_TRACEPOINT_EVENT(cds_ft, ext_violation,
 	LTTNG_UST_TP_ARGS(
 		unsigned int, kind,
 		const void *, node,
-		const void *, prev,
 		const void *, holder,
 		const void *, hext,
 		uint64_t, hstate,
 		unsigned int, rmsite,
+		const void *, parent,
+		uint64_t, pstate,
 		const void *, self,
 		uint64_t, key0
 	),
 	LTTNG_UST_TP_FIELDS(
 		lttng_ust_field_integer(unsigned int, kind, kind)
 		lttng_ust_field_integer_hex(uintptr_t, node, (uintptr_t) node)
-		lttng_ust_field_integer_hex(uintptr_t, prev, (uintptr_t) prev)
 		lttng_ust_field_integer_hex(uintptr_t, holder, (uintptr_t) holder)
 		lttng_ust_field_integer_hex(uintptr_t, hext, (uintptr_t) hext)
 		lttng_ust_field_integer_hex(uint64_t, hstate, hstate)
 		lttng_ust_field_integer(unsigned int, rmsite, rmsite)
+		/*
+		 * ☠ THE HOLDER IS THE WRONG PLACE TO LOOK when the disposal
+		 * happened one level up: the holder can be alive, correctly
+		 * wired and holding the key, while the node it hangs off was
+		 * retired under it.  A classifier without @parent calls that
+		 * "holder alive, some other head" and invents a shape.
+		 */
+		lttng_ust_field_integer_hex(uintptr_t, parent, (uintptr_t) parent)
+		lttng_ust_field_integer_hex(uint64_t, pstate, pstate)
 		lttng_ust_field_integer_hex(uintptr_t, self, (uintptr_t) self)
 		lttng_ust_field_integer_hex(uint64_t, key0, key0)
 	)
