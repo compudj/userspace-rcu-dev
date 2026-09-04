@@ -1104,6 +1104,61 @@ LTTNG_UST_TRACEPOINT_EVENT(cds_ft, recompact_head_snap,
 )
 
 /*
+ * Every entry into ft_chain_compress_fused, with the ARGUMENTS that identify
+ * which of its four callers ran -- the boundary free (ft-remove.h) is a single
+ * line shared by all four, so item_retire's return address cannot tell them
+ * apart.  @ext is @iter_meta->external_nodes read AT ENTRY: it is the plan-time
+ * value of the word the disposal predicate rests on and never re-validates, so
+ * pairing it with the peer's park in the same trace is what dates the loss.
+ *
+ * Caller discriminators: plan_nr_child 2 => the shape-D detach fold;
+ * otherwise dead_cell/freeze_leaf both NULL => ft_canonicalize_chain_compress,
+ * freeze_leaf set => the leaf-removal collapse, dead_cell alone => the prefix
+ * chain-head collapse.
+ */
+LTTNG_UST_TRACEPOINT_EVENT(cds_ft, chain_compress_enter,
+	LTTNG_UST_TP_ARGS(
+		const void *, boundary,
+		const void *, meta,
+		const void *, ext,
+		const void *, freeze_leaf,
+		const void *, dead_cell,
+		unsigned int, plan_nr_child,
+		int, record_only
+	),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_integer_hex(uintptr_t, boundary, (uintptr_t) boundary)
+		lttng_ust_field_integer_hex(uintptr_t, meta, (uintptr_t) meta)
+		lttng_ust_field_integer_hex(uintptr_t, ext, (uintptr_t) ext)
+		lttng_ust_field_integer_hex(uintptr_t, freeze_leaf, (uintptr_t) freeze_leaf)
+		lttng_ust_field_integer_hex(uintptr_t, dead_cell, (uintptr_t) dead_cell)
+		lttng_ust_field_integer(unsigned int, plan_nr_child, plan_nr_child)
+		lttng_ust_field_integer(int, record_only, record_only)
+	)
+)
+
+/*
+ * The same op at its COMMIT boundary: @ext_now is the word re-read just before
+ * the merged node is published, so a pair (enter.ext, exit.ext_now) that
+ * DIFFERS is the stale predicate caught in the act.  @status 0 == the collapse
+ * committed and the boundary was retired.
+ */
+LTTNG_UST_TRACEPOINT_EVENT(cds_ft, chain_compress_exit,
+	LTTNG_UST_TP_ARGS(
+		const void *, boundary,
+		const void *, meta,
+		const void *, ext_now,
+		int, status
+	),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_integer_hex(uintptr_t, boundary, (uintptr_t) boundary)
+		lttng_ust_field_integer_hex(uintptr_t, meta, (uintptr_t) meta)
+		lttng_ust_field_integer_hex(uintptr_t, ext_now, (uintptr_t) ext_now)
+		lttng_ust_field_integer(int, status, status)
+	)
+)
+
+/*
  * Harness-side violation, emitted through the library so the in-process FAST
  * STOP (FT_TRACE_FREEZE) runs before the fork+exec of `lttng snapshot record`.
  * @kind names the oracle shape (0 RM-LOOKUP-MISS, 1 RM-FAIL, 2 STALE-FOUND,

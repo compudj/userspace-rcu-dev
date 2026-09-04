@@ -1104,6 +1104,11 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 	 */
 	ft_flip_txn_claim_per_op_armable(ft, txn);
 #endif
+	FT_TP(chain_compress_enter, (const void *) iter_node_flag,
+		(const void *) iter_meta,
+		(const void *) CMM_LOAD_SHARED(iter_meta->external_nodes),
+		(const void *) freeze_leaf, (const void *) dead_cell,
+		plan_nr_child, (int) record_only);
 	/*
 	 * F2 node lock (doc at ft_meta_lock_acquire): fence the whole
 	 * collapsed chain -- the boundary and the two compressed nodes whose
@@ -1741,6 +1746,17 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		if (count_delta)
 			ft_flip_txn_record_count_parent(ft, txn, publish_parent,
 				count_delta);
+		/*
+		 * The predicate's word, re-read at the LAST instant before the
+		 * collapse commits.  A pair (chain_compress_enter.ext,
+		 * chain_compress_exit.ext_now) that DIFFERS is the stale
+		 * predicate caught in the act, in one event pair, without
+		 * having to reconstruct it from edge_records.
+		 */
+		FT_TP(chain_compress_exit, (const void *) iter_node_flag,
+			(const void *) iter_meta,
+			(const void *) CMM_LOAD_SHARED(iter_meta->external_nodes),
+			-1);
 		if (ft_remove_commit_rec(ft, &rec, dead_cell, run, txn,
 				record_only) > 0) {
 			/*
@@ -1792,6 +1808,9 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		}
 		return 0;
 	}
+	FT_TP(chain_compress_exit, (const void *) iter_node_flag,
+		(const void *) iter_meta,
+		(const void *) CMM_LOAD_SHARED(iter_meta->external_nodes), 0);
 	free_cds_ft_node(ft, ft_node_ptr(iter_node_flag));
 	if (parent_cn)
 		free_compressed_node(ft, parent_cn);

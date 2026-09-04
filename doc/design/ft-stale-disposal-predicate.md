@@ -125,6 +125,22 @@ state word.
 
 ### 3.1 `ft_chain_compress_fused` — the boundary's `external_nodes`
 
+★ **MEASURED, not inferred** (`cds_ft:chain_compress_enter/exit`, 2026-09-04):
+the losing caller is the **shape-D detach fold** (`ft-remove.h:3356`,
+`plan_nr_child == 2`), and the losing op **enters the callee with
+`external_nodes` ALREADY non-NULL** — equal to the lost key's own node — and
+carries it **unchanged** through the commit.  So the window is not
+plan-vs-commit inside the callee at all: the peer's park lands between the
+caller's **pre-fence gate** (`ft-remove.h:3258`, a plain read of
+`!bmeta->external_nodes`) and the call ~120 lines later, and **nothing between
+there and the retire ever looks at the word again** — not the callee's entry,
+not the `:1314` re-validation under the fence, not the commit.
+
+☠ This corrects the framing in §0: the predicate does not go stale *during* the
+disposal, it is **already false when the disposal begins**.  A probe that
+watched for the word CHANGING between entry and commit found **zero** such
+pairs across three runs.
+
 The header (`ft-remove.h:599`) lists `@iter_meta->external_nodes == NULL` as a
 **precondition the caller asserts**.  Four callers, and they do **not** agree on
 what the word should be:
@@ -144,7 +160,30 @@ and where to stop: `ft-remove.h:2332` (collect), `:2352` (stop the climb),
 the commit runs, and `ft-remove.h:4234`–`:4239` frees them.  The uncovered word
 here is a **body slot** as well as `external_nodes`.
 
-### 3.3 Already correct — the model to copy
+### 3.3 ☠ THE ROUTE DISTRIBUTION — the compress is a MINORITY of losses
+
+Five classifiable losses (`cds_ft:chain_compress_enter` on the violation's own
+holder is the discriminator; the sixth run SEGV'd before the hook):
+
+| route | count | evidence |
+|---|---|---|
+| `ft_chain_compress_fused`, shape-D fold | **2/5** | a compress entered on the holder; `hstate` carries TOMBSTONE |
+| `ft_detach_node`'s climb | **1/5** | retire's inline chain is `… <- ft_walk_extend <- ft_detach_node` |
+| **☐ neither — holder ALIVE, node ORPHANED** | **2/5** | `hstate` 0x8 / 0x4 (no tombstone), no retire in window, and `hext != node`: the node's back edge names a holder that does not hold it |
+
+★ So **fixing §3.1 alone cannot cure the defect**, and that is exactly what the
+third refutation in §4 measured.  The **☐ third sub-shape is not root-caused**;
+it is a live-holder orphaning, not a disposal, and it may not belong to this
+brief's class at all.
+
+☠ **Instrument caveat**: `item_retire`'s `__builtin_return_address(0)` is
+UNRELIABLE at -O2 — two attributions landed on `ft-remove.h:1197` (a DLM
+member-set line) and `ft-mutation-helpers.h:383` (a descent loop), neither of
+which frees anything.  `addr2line -i` recovers the useful outer frames.  Trust
+the `chain_compress_enter` event, which is emitted at a known site, over any
+return address.
+
+### 3.4 Already correct — the model to copy
 
 `ft_node_recompact`'s DEL arm carries `@nullify_expected`
 (`ft-mutation-node.h:1707`): it re-reads the slot
@@ -169,7 +208,13 @@ peer's subtree whole"*).  That is the shape a fix has to generalise.
    !dead_cell` — the callers that are not themselves removing an external
    entry): no livelock, **still 8/8 red**.
 
-★ (2) and (3) together say the cure is **not** a NULL test at one site.  It has
+4. **The re-validation, corrected to cover the caller that actually loses the
+   key** — `plan_nr_child == 2 || (!freeze_leaf && !dead_cell)`, i.e. shape-D
+   plus canonicalize.  **No livelock this time** (the caller's own gate
+   re-evaluates on the retry and skips the shape-D branch), but **8/8 still
+   red** — because the compress is only 2/5 of the routes (§3.3).
+
+★ (2), (3) and (4) together say the cure is **not** a NULL test at one site.  It has
 to be an **expected-old** — the value the *caller's* plan assumed — and it has
 to cover §3.2 as well, where the word is a body slot.
 
@@ -226,6 +271,14 @@ a holder's `external_nodes` or a body slot, both of which already have an owner
 and a lock.  So G4 need not be decided to fix the shipping key loss — but the
 answer to **Q1(c)** is adjacent to it and the two should not be decided in
 opposite directions.
+
+**Q5b — the ☐ THIRD SUB-SHAPE (§3.3) — same brief or a different one?**  2 of 5
+losses have a holder that is **alive and untombstoned** whose `external_nodes`
+is some *other* node, with no disposal anywhere in the window.  That is not a
+stale disposal predicate; it looks like the node's back edge naming a holder it
+was never (or is no longer) in.  It needs its own root-cause pass before it can
+be scoped — and until it is closed, **no fix in this brief can turn the
+reproducer green**, which is worth knowing before anyone measures a candidate.
 
 **Q5 — Scope.**  Is the deliverable the two measured instances, or a sweep for
 the class?  The class is: *"an op that DISPOSES of a node on the strength of a
@@ -302,7 +355,8 @@ lttng enable-channel -u --overwrite --subbuf-size 1M --num-subbuf 8 mutator
 lttng enable-event -u -c mutator \
   cds_ft:ext_violation,cds_ft:recompact_head_snap,cds_ft:edge_record,\
 cds_ft:txn_commit,cds_ft:metadata_set_external_nodes,cds_ft:set_parent,\
-cds_ft:item_retire,cds_ft:node_recompact,cds_ft:unchain_node
+cds_ft:item_retire,cds_ft:node_recompact,cds_ft:unchain_node,\
+cds_ft:chain_compress_enter,cds_ft:chain_compress_exit
 lttng add-context -u -t vpid -t vtid && lttng start
 FT_TRACE_SESSION=$S CHK=1 WRITERS=2 ALPHA=2 MAXLEN=8 NSTABLE=100 NCHURN=100 \
   SECS=5 READERS=4 NOFREE=1 ./stab5_tr
