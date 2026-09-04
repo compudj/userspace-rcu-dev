@@ -340,6 +340,27 @@ not from bailing.
 
 ## 5. The questions for Mathieu
 
+**Q1 — ☑ ANSWERED AND IMPLEMENTED for `ft_chain_compress_fused`** (@`b0995d2c`
++ @`6792267b`), by shape (b): `struct ft_chain_compress_intent` carries what the
+OP intends, `ft_chain_compress_plan_stale()` reads the trie under the boundary's
+own mark, and all four callers name their target.  Both uncovered words are now
+checked there — the external head, and the child the commit detaches (the pair
+the climb condemned, `@elevated_old_child` at byte `@n`, compared **raw** via
+`ft_node_get_nth_skip`).  ★ Arm yield over 20 seeds of the two-writer
+reproducer: **7 detach refusals across 17 runs, 5 head refusals** — races that
+previously proceeded and now abort.  ☠ It does NOT claim a measurable loss-rate
+drop: the compress is one route, §3.2 is untouched, and n=30 cannot resolve it.
+
+☠ **Two wrong targets on the way, both caught by measurement, not review**: the
+raw slot word compared against `ft_node_get_nth` wedged ft_unit at test 2
+(`ft_node_get_nth` RESOLVES a skip-compressed word to a different address, so
+the compare was shape-determined, not racy — the 347-vs-441 split); and
+re-reading the boundary at `@n` at the call site named the right node too late
+to be a plan value and was **inert**, 0 refusals in ~100k armings.
+
+☐ **Still open for `ft_detach_node`'s orphan climb** (§3.2), which is the
+question below.  The original three-option Q1 is kept for the record:
+
 **Q1 — where is the plan formed, relative to the mark?**  In the lock frame
 this is a **code-motion** question, not a choice of mechanism.  §1 measured that
 every writer of both words already holds the node's lock, so the mark is the
