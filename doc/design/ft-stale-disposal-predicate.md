@@ -473,20 +473,31 @@ and `-EAGAIN; goto end` — byte-for-byte clean (the walk is read-only,
 and it cannot livelock because the mismatch is a **committed** peer write in the
 op's own locked snapshot, so the re-descend sees a settled tree.
 
-☠ **Keying the first-orphan exemption on IDENTITY is REFUTED.**  Tolerating a
-head there only when it IS `topmost_external_nodes` **wedges `ft_unit` entering
-`test_density_stress` (252) — SINGLE-WRITER**, RSS flat, a spin not a leak.
-Bisected: restoring the `nr_child` exemption alone does not fix it; dropping the
-head test does.  So the first orphan's head legitimately differs from the
-promoted one in some shape this walk allows, and `topmost_external_nodes` is
-**not** the comparand the design assumed.  ☐ Establish that shape before trying
-again — it is now the only thing standing between this walk and the same intent
-check the chain compress carries.
+☑ **And the exemption IS now keyed on identity — the RIGHT one** (@`9b5d2c60`).
+The first attempt required `ext_nodes == topmost_external_nodes` and wedged
+`ft_unit` entering `test_density_stress` (252) **single-writer**, RSS flat, a
+spin not a leak.  A probe that RECORDS instead of refusing found the shape in
+one run: in **every one of 24 samples** the first orphan's own head is
+`ext_nodes == NULL` while `topmost_external_nodes` is **non-NULL**, all in
+branch 2, `nr_child == 1`, `prev_external_nodes_found` already set.  `topmost`
+was promoted from an ancestor **above** this node and is simply not this node's
+head — so the design's premise ("`elevated_old_child` is always the promoted-from
+node") is false for branch 2, and the old predicate refused the NORMAL shape.
 
-★ Arm yield, 20 seeds: the orphan refusal fires **once across 16 classifiable
-runs** (with 15 head and 4 detach refusals from the compress).  Rare, armed,
-non-zero.  ☞ 2 of 20 runs also completed GREEN, which no control run ever did —
-at that n it is not evidence and is not claimed as any.
+★ What the climb actually believes about the first orphan is weaker: it carries
+**no head of its own, OR the one head the climb lifted off it**.  Anything else
+arrived after the plan.  So the test is
+`phase2_first && ext_nodes && ext_nodes != topmost_external_nodes`.
+
+★ Arm yield, 20 seeds: the orphan refusal fires **4 times across 18 classifiable
+runs** (3 runs with ≥1, one seed showing 5 in a single run) — up from 1 across
+16 with the position-keyed version, which is the point of tightening it.  Head
+and detach refusals from the compress run alongside at 22 and 9.
+
+☞ One run returned `rc=137`.  Re-running that seed five times gives the ordinary
+oracle abort every time, and the same rate appears in runs of the UNMODIFIED
+library, so it is the known background livelock — not attributable here, and not
+claimed clean either.
 
 **Q4 — Does this retire G4?**  G4 asks whether ordered cells and dup-chain
 splices keep a narrow MW lane or grow a state word, and the plan defers it to a
