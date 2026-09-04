@@ -4460,12 +4460,41 @@ const char *const ft_be_site_name[FT_BE_SITE_NR] = {
 	"park_live_parent", "recompact", "detach_cn_parent", "detach_unchain",
 	"child_back_edge", "parent_word", "reparent_meta",
 };
+/*
+ * ★ THE LEDGER COLUMNS -- the second witness, and the one the registry cannot
+ * be.  ft_hold_trace_holds() reads the per-thread hold ledger, which is
+ * maintained AT THE ACQUIRE PRIMITIVES rather than at a registry choke point,
+ * "so it sees every hold regardless of which registry (if any) the op filed it
+ * in -- that mismatch is the defect being measured".  That is exactly the
+ * question a "nothing held" cell leaves open: did the op NOT TAKE the lock, or
+ * did it take one into a FUNCTION-LOCAL anchor it registers only later (the
+ * register-before-record class)?
+ *
+ * @ft_be_s_led_old  the ledger says this thread holds the OLD parent;
+ * @ft_be_s_led_gp   ... the GRANDPARENT (Mathieu's invariant);
+ * @ft_be_s_led_only the ledger says OLD parent AND the txn registry does not --
+ *                   the instrument-limit column, i.e. the share of a site's
+ *                   "nothing" that is blindness rather than exposure.
+ *
+ * ☠ THE LEDGER HAS ITS OWN BIAS AND IT IS NOT HIDDEN: it drops an entry on a
+ * RECORDED release and can leak one, so it OVER-reports as readily as the
+ * registry UNDER-reports.  Neither is exclusion evidence on its own
+ * (ft_back_edge_owner's header: "NAMING AN OWNER IS NOT PROVING EXCLUSION").
+ * Read the pair as a BRACKET around the truth, never either as the answer.
+ * Requires -DFEATURE_FT_HOLD_TRACE; without it ft_hold_trace_holds is a stub
+ * returning false and these columns are identically 0 -- which is why the
+ * report prints whether the ledger is compiled in at all.
+ */
 extern unsigned long ft_be_s_total[FT_BE_SITE_NR],
 	ft_be_s_old[FT_BE_SITE_NR], ft_be_s_nolocks[FT_BE_SITE_NR],
-	ft_be_s_gp[FT_BE_SITE_NR], ft_be_s_gp_none[FT_BE_SITE_NR];
+	ft_be_s_gp[FT_BE_SITE_NR], ft_be_s_gp_none[FT_BE_SITE_NR],
+	ft_be_s_led_old[FT_BE_SITE_NR], ft_be_s_led_gp[FT_BE_SITE_NR],
+	ft_be_s_led_only[FT_BE_SITE_NR];
 unsigned long ft_be_s_total[FT_BE_SITE_NR],
 	ft_be_s_old[FT_BE_SITE_NR], ft_be_s_nolocks[FT_BE_SITE_NR],
-	ft_be_s_gp[FT_BE_SITE_NR], ft_be_s_gp_none[FT_BE_SITE_NR];
+	ft_be_s_gp[FT_BE_SITE_NR], ft_be_s_gp_none[FT_BE_SITE_NR],
+	ft_be_s_led_old[FT_BE_SITE_NR], ft_be_s_led_gp[FT_BE_SITE_NR],
+	ft_be_s_led_only[FT_BE_SITE_NR];
 #else
 # define FT_BE_SITE_PARAM
 # define FT_BE_SITE(s)
@@ -4476,6 +4505,47 @@ extern unsigned long ft_be_total, ft_be_new, ft_be_old, ft_be_both,
 	ft_be_neither, ft_be_nolocks, ft_be_same, ft_be_noowner;
 unsigned long ft_be_total, ft_be_new, ft_be_old, ft_be_both,
 	ft_be_neither, ft_be_nolocks, ft_be_same, ft_be_noowner;
+
+/*
+ * THE PER-SITE REPORT.  The counters above were previously readable only from a
+ * debugger, which is why the lane's first decomposition had to be transcribed
+ * by hand.  Print them.
+ *
+ * ★ AND PRINT WHETHER THE SECOND WITNESS IS COMPILED IN.  Without
+ * -DFEATURE_FT_HOLD_TRACE, ft_hold_trace_holds() is a stub returning false and
+ * every ledger column is identically 0 -- a shape indistinguishable from "the
+ * ledger looked and found nothing".  A zero whose detector was never built is
+ * the failure mode this project has paid for more than once, so the header line
+ * says which build produced the table.
+ */
+static void ft_be_site_report(void) __attribute__((destructor));
+static void ft_be_site_report(void)
+{
+	int i;
+
+	if (!ft_be_total)
+		return;
+	fprintf(stderr, "FT_BACK_EDGE_CLAIM  ledger=%s  total=%lu\n",
+#ifdef FEATURE_FT_HOLD_TRACE
+		"ON",
+#else
+		"OFF (columns below are structurally 0, not measured)",
+#endif
+		ft_be_total);
+	fprintf(stderr, "%-18s %10s %8s %8s %8s %8s %8s %8s\n",
+		"site", "total", "oldP", "GRANDpar", "nolocks",
+		"led_old", "led_gp", "led_only");
+	for (i = 0; i < FT_BE_SITE_NR; i++) {
+		if (!ft_be_s_total[i])
+			continue;
+		fprintf(stderr, "%-18s %10lu %8lu %8lu %8lu %8lu %8lu %8lu\n",
+			ft_be_site_name[i], ft_be_s_total[i],
+			ft_be_s_old[i], ft_be_s_gp[i], ft_be_s_nolocks[i],
+			ft_be_s_led_old[i], ft_be_s_led_gp[i],
+			ft_be_s_led_only[i]);
+	}
+}
+
 /*
  * ☞ WHICH P?  A back edge is a TRANSITION -- the head leaves @old_ptr's node
  * and joins @new_ptr's -- and §8.2 says "the parent pointer is owned by P"
@@ -4501,6 +4571,15 @@ unsigned long ft_be_total, ft_be_new, ft_be_old, ft_be_both,
 		if (h_old)						\
 			__atomic_fetch_add(&ft_be_s_old[dbg_be_site], 1,\
 				__ATOMIC_RELAXED);			\
+		/* THE SECOND WITNESS -- see the ledger-column note above. */ \
+		if (o_old && ft_hold_trace_holds(o_old)) {		\
+			__atomic_fetch_add(&ft_be_s_led_old[dbg_be_site],\
+				1, __ATOMIC_RELAXED);			\
+			if (!h_old)					\
+				__atomic_fetch_add(			\
+					&ft_be_s_led_only[dbg_be_site],	\
+					1, __ATOMIC_RELAXED);		\
+		}							\
 		if (!(t)->nr_locks)					\
 			__atomic_fetch_add(				\
 				&ft_be_s_nolocks[dbg_be_site], 1,	\
@@ -4526,6 +4605,10 @@ unsigned long ft_be_total, ft_be_new, ft_be_old, ft_be_both,
 			else if (ft_flip_txn_owns((t), gp))		\
 				__atomic_fetch_add(			\
 					&ft_be_s_gp[dbg_be_site], 1,	\
+					__ATOMIC_RELAXED);		\
+			if (gp && ft_hold_trace_holds(gp))		\
+				__atomic_fetch_add(			\
+					&ft_be_s_led_gp[dbg_be_site], 1,\
 					__ATOMIC_RELAXED);		\
 		}							\
 		if (o_new && o_new == o_old)				\
