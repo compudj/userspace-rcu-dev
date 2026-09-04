@@ -467,7 +467,9 @@ shipped; what is left is four named residuals, not a design choice.
    **measured `fold=0` in 8 of 8 runs**, every refusal on the standalone arm.
    The gate exercises rekey but single-writer, where the check never fires.  ☞
    Real coverage needs a CONCURRENT REKEY workload.
-2. **The second defect's disposition (§3.3.1) — untouched.**  The bogus
+2. **The second defect's disposition — ☑ DIAGNOSED AND MEASURED (@`14de2ecf`),
+   ☐ THE CONVERGENT FORM IS DESIGNED AND UNBUILT.**  See §5.1 below.
+   *(historical framing kept:)*  The bogus
    `NOT_FOUND` at `ft-remove.h:5308` / `:5520` is exactly as it was.  The one
    probe (`*need_retry` on holder movement) eliminated the shape 4/24 → 0/24
    **and produced one `rc=137` in 24**, so a plain retry there can spin — unlike
@@ -484,6 +486,67 @@ shipped; what is left is four named residuals, not a design choice.
    starved ~12,000x inside one call, the remove retry lane not draining — and
    these refusals sit on the hottest op.  ★ The argument is sound and
    unmeasured, and those are different things.
+
+
+### 5.1 ☐ THE CONVERGENT DISPOSITION FOR `cds_ft_remove` — designed, not built
+
+The contract ruling makes "retry then concede" illegal, so the disposition must
+converge.  The measured spin is not bad luck, it is structural:
+
+> the recheck's escape is a **pre-commit bail**, which **forfeits the op's lane
+> turn** (`rcu-txn.h:1225`), so every restart re-derives against a moving tree
+> with **no exclusion ever held across derive → select → compare**.
+
+★ So the answer is not to retry more cleverly.  It is to **hold the exclusion
+across those three steps**: acquire the holder BEFORE the four-way branch, and
+on a moved holder re-derive IN PLACE under a local loop rather than restarting
+the op.  This is the same shape already landed for `ft_chain_compress_fused`.
+
+**Why it converges.**  The peer that re-homes `@node` is a holder copier: it
+holds H's `FT_STATE_LOCK` from mark to commit and retires H in that commit
+(`ft-mutation-helpers.h:2925`).  Once our `ft_acquire_member` on H succeeds
+(untombstoned) and `ft_node_holder(node) == H` is re-read AFTER the CAS, nothing
+can move: a publish into H fails the §4.B guard, and a copy of H needs the lock
+we hold.  The branch and both compares then read FROZEN words, so a mismatch
+under that lock is a TRIE FACT — `ft_node_is_removed(node)`, or corruption —
+which is a legal refusal.  Peers are throttled at their OP boundary once we take
+the lane: op handles are domain-bound (`ft_txn_op_init` → `&ft->txn_domain`),
+so a peer mid-op finishes at most one commit and then queues.
+
+**✓ VERIFIED HERE, not taken on trust:**
+
+* **cost is zero extra CAS** — every arm ALREADY acquires the holder
+  (`ft_unchain_node` asserts it never falls through unlocked; the other arms go
+  through `ft_flip_txn_lock_or_guard_parent` / `ft_remove_one_commit` /
+  `ft_detach_node`).  The hoist MOVES that acquire; the choke point dedupes
+  against the ctx's held set and returns `held.shared`.
+* **no count pre-decrement precedes the branch**, so a re-derive has nothing to
+  undo.
+* **the convergence premise holds**: op handles are domain-bound, while all 13
+  per-arm txns are standalone (`_on`: zero) — the deliberate choice that stops
+  them manufacturing the conflicts their retry loops absorb.
+
+**What must move**: the block that builds `cell_was_head` / `dead_cell` /
+`cell_succ` / `fuse_remove` / `pub` / `unsplice_txn` goes BELOW the new acquire
+(`cell_succ` must be read under the lock, and the txn then never needs
+destroying on a re-derive); the loop label goes above the two existing
+correction arms so `holder_depth` and the descent re-derive; the EXTERNAL-holder
+arm is skipped (a non-head duplicate has no state word — `ft_unchain_node` locks
+`ft_chain_head_holder` itself), and the two NOT_FOUND compares live only in the
+compressed and body-child arms anyway.
+
+**☠ How to measure it — NOT attempt count.**  `-DFT_DEBUG_REMOVE_RETRY_CAP` is
+blind (it reports at 100/1000/10000 and this arm never passes 100 while 5/20
+runs died).  Use: the per-op MAX of in-place iterations paired with
+`optxn.in_fallback` (prediction: ≤ #writers − 1 once in the lane — a violation
+refutes the bound); `ft_dbg_rm_site` at the two compares must be **0** on
+oracle-present keys; and the outcome-level signals `rc=124` / `rc=137`, which
+are what actually caught the spin.
+
+☞ **This is a lock HOIST on the hottest op.**  It adds no acquire, but it moves
+one, and the plan's economics say that class of change wants explicit agreement
+before it lands.  Recommended, and not started.
+
 
 **Q2 — (only under Q1(a)) what value does the re-read compare against, per
 caller?**  §3.1 says two callers assume NULL and two assume "the head I am
