@@ -2874,17 +2874,30 @@ int ft_detach_node(struct cds_ft *ft,
 				 * settled tree: one retry per peer event, never a
 				 * conflict the op manufactures for itself.
 				 *
-				 * ☐ The FIRST orphan stays exempt.  Keying that
-				 * exemption on IDENTITY instead of position -- head
-				 * tolerated only when it IS @topmost_external_nodes
-				 * -- is REFUTED as written: ft_unit wedges entering
-				 * test_density_stress (252), SINGLE-WRITER, so the
-				 * first orphan's head legitimately differs from the
-				 * promoted one in some shape this walk allows.  ☞
-				 * Establish that shape before trying again.
+				 *
+				 * ★ AND THE EXEMPTION IS NOW KEYED ON IDENTITY, not
+				 * position -- but NOT on the identity the first
+				 * design assumed.  MEASURED (ft_unit, single-writer,
+				 * probe at this line): the first orphan's own head is
+				 * @ext_nodes == NULL while @topmost_external_nodes is
+				 * NON-NULL, in every one of 24 samples, all in branch
+				 * 2.  @topmost was promoted from an ancestor ABOVE
+				 * this node (@prev_external_nodes_found is already
+				 * set), so it is simply not THIS node's head.
+				 * Requiring @ext_nodes == @topmost therefore refuses
+				 * the NORMAL shape and wedges ft_unit entering
+				 * test_density_stress.
+				 *
+				 * What the climb actually believes about the first
+				 * orphan is weaker: it carries NO head of its own, OR
+				 * the one head the climb lifted off it.  Anything
+				 * else is a head that arrived after the plan -- a
+				 * peer's park -- and freeing this node would take the
+				 * key with it.
 				 */
-				if (!phase2_first &&
-				    (nr_child > 1 || ext_nodes)) {
+				if ((!phase2_first && (nr_child > 1 || ext_nodes)) ||
+				    (phase2_first && ext_nodes &&
+					    ext_nodes != topmost_external_nodes)) {
 					if (ft->lock_fine && !owalk.shared)
 						ft_meta_lock_release(owalk.lock);
 #ifdef FT_ENABLE_TRACING
@@ -3321,8 +3334,10 @@ int ft_detach_node(struct cds_ft *ft,
 					/* Branch 2's twin of the walk above: same
 					 * belief, same identity key, same refusal.
 					 */
-					if (!phase2_first &&
-					    (nr_child > 1 || ext_nodes)) {
+					if ((!phase2_first &&
+					     (nr_child > 1 || ext_nodes)) ||
+					    (phase2_first && ext_nodes &&
+						ext_nodes != topmost_external_nodes)) {
 						if (ft->lock_fine && !owalk.shared)
 							ft_meta_lock_release(
 								owalk.lock);
