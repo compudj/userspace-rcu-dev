@@ -1021,11 +1021,20 @@ LTTNG_UST_TRACEPOINT_EVENT(cds_ft, node_recompact,
 	LTTNG_UST_TP_ARGS(
 		const void *, old_node,
 		const void *, new_node,
+		const void *, new_meta,
 		int, new_type
 	),
 	LTTNG_UST_TP_FIELDS(
 		lttng_ust_field_integer_hex(uintptr_t, old_node, (uintptr_t) old_node)
 		lttng_ust_field_integer_hex(uintptr_t, new_node, (uintptr_t) new_node)
+		/*
+		 * @new_meta MAPS THE LOCK WORD TO THE NODE.  Every acquire and
+		 * release in the trace is an edge on &meta->state, and without
+		 * this pairing a lock take cannot be attributed to the node it
+		 * protects -- which is exactly the question when two writers
+		 * serialize correctly and the key is lost anyway.
+		 */
+		lttng_ust_field_integer_hex(uintptr_t, new_meta, (uintptr_t) new_meta)
 		lttng_ust_field_integer(int, new_type, new_type)
 	)
 )
@@ -1070,6 +1079,58 @@ LTTNG_UST_TRACEPOINT_EVENT(cds_ft, metadata_set_external_nodes,
 	LTTNG_UST_TP_FIELDS(
 		lttng_ust_field_integer_hex(uintptr_t, node, (uintptr_t) node)
 		lttng_ust_field_integer_hex(uintptr_t, external_nodes, (uintptr_t) external_nodes)
+	)
+)
+
+/*
+ * Two-writer external-head campaign (2026-09-04).  ft_node_recompact's COW of
+ * the retiring holder's FORWARD head word: a PLAIN read of
+ * @old_meta->external_nodes stored with a PLAIN store into the unpublished
+ * copy @new_nf -- in no txn at all, so no edge_record covers it.  This is the
+ * one place the exclusion argument has a code-fact hole; pairing it with the
+ * edge_record/txn_commit of the peer's head write is what dates the loss.
+ */
+LTTNG_UST_TRACEPOINT_EVENT(cds_ft, recompact_head_snap,
+	LTTNG_UST_TP_ARGS(
+		const void *, old_meta,
+		const void *, new_nf,
+		const void *, val
+	),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_integer_hex(uintptr_t, old_meta, (uintptr_t) old_meta)
+		lttng_ust_field_integer_hex(uintptr_t, new_nf, (uintptr_t) new_nf)
+		lttng_ust_field_integer_hex(uintptr_t, val, (uintptr_t) val)
+	)
+)
+
+/*
+ * Harness-side violation, emitted through the library so the in-process FAST
+ * STOP (FT_TRACE_FREEZE) runs before the fork+exec of `lttng snapshot record`.
+ * @kind names the oracle shape (0 RM-LOOKUP-MISS, 1 RM-FAIL, 2 STALE-FOUND,
+ * 3 RM-WRONG-NODE, 4 DUP-CHAINED), @node the key's own external node.
+ */
+LTTNG_UST_TRACEPOINT_EVENT(cds_ft, ext_violation,
+	LTTNG_UST_TP_ARGS(
+		unsigned int, kind,
+		const void *, node,
+		const void *, prev,
+		const void *, holder,
+		const void *, hext,
+		uint64_t, hstate,
+		unsigned int, rmsite,
+		const void *, self,
+		uint64_t, key0
+	),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_integer(unsigned int, kind, kind)
+		lttng_ust_field_integer_hex(uintptr_t, node, (uintptr_t) node)
+		lttng_ust_field_integer_hex(uintptr_t, prev, (uintptr_t) prev)
+		lttng_ust_field_integer_hex(uintptr_t, holder, (uintptr_t) holder)
+		lttng_ust_field_integer_hex(uintptr_t, hext, (uintptr_t) hext)
+		lttng_ust_field_integer_hex(uint64_t, hstate, hstate)
+		lttng_ust_field_integer(unsigned int, rmsite, rmsite)
+		lttng_ust_field_integer_hex(uintptr_t, self, (uintptr_t) self)
+		lttng_ust_field_integer_hex(uint64_t, key0, key0)
 	)
 )
 

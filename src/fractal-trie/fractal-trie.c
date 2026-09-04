@@ -846,3 +846,60 @@ int _cds_ft_debug_empty_holder(struct cds_ft *ft, struct cds_ft_node *leaf,
 	*out_n = n;
 	return 0;
 }
+
+#ifdef FT_ENABLE_TRACING
+/*
+ * Harness-facing violation hook (two-writer external-head campaign, 2026-09-04).
+ *
+ * A standalone reproducer cannot reach FT_TRACE_FREEZE, and a bare
+ * `lttng snapshot record` from the harness is a fork+exec -- MILLISECONDS, in
+ * which the ring wraps past the very window the violation names (see the FAST
+ * STOP note in fractal-trie-trace.h).  So route it through the library: emit
+ * the violation FIRST, then freeze, stop and snapshot.
+ *
+ * It lives HERE, not in fractal-trie-alloc.c, because the question the trace has
+ * to answer is "where is this node hanging" -- and the resolvers that answer it
+ * (ft_node_holder across the cell indirection, the metadata behind a tagged
+ * flag) are in this translation unit.  @node's own words say nothing on their
+ * own: a lost key's node is typically untouched, and it is the HOLDER's history
+ * that carries the loss.
+ *
+ * Defensive by construction: a lost key's holder may be retired, so every
+ * dereference past @node->prev is guarded and reports 0 rather than faulting --
+ * a fault here would take the snapshot with it.
+ */
+void cds_ft_debug_ext_violation(unsigned int kind, struct cds_ft *ft,
+		struct cds_ft_node *node, uint64_t key0);
+void cds_ft_debug_ext_violation(unsigned int kind, struct cds_ft *ft,
+		struct cds_ft_node *node, uint64_t key0)
+{
+	void *prev = NULL;
+	struct cds_ft_inode_flag *holder = NULL;
+	struct cds_ft_node *hext = NULL;
+	uintptr_t hstate = 0;
+
+	if (node) {
+		prev = CMM_LOAD_SHARED(node->prev);
+		holder = ft_node_holder(ft, node);
+	}
+	if (holder && !ft_node_external(holder)) {
+		struct cds_ft_metadata *hm = ft_flag_to_metadata(ft, holder);
+
+		if (hm) {
+			hext = hm->external_nodes;
+			hstate = CMM_LOAD_SHARED(hm->state);
+		}
+	}
+	/*
+	 * @self ANCHORS THE ADDRESS SPACE.  item_retire and friends carry a raw
+	 * __builtin_return_address, and ASLR makes that unresolvable after the
+	 * process is gone.  Emitting this function's own address lets the
+	 * analysis recover the .so load base (self - nm offset) and turn every
+	 * caller in the trace into a file:line.
+	 */
+	FT_TP(ext_violation, kind, node, prev, holder, hext, (uint64_t) hstate,
+		ft_dbg_rm_site, (const void *) &cds_ft_debug_ext_violation,
+		key0);
+	ft_trace_capture();
+}
+#endif

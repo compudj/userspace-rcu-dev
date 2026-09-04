@@ -5043,6 +5043,9 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 	if (ft_node_is_removed(node)) {
 		dbg_printf("cds_ft_remove: node %p already removed\n", node);
 		FT_TP(remove_exit, (int) CDS_FT_STATUS_NOT_FOUND);
+#ifdef FT_ENABLE_TRACING
+		ft_dbg_rm_site = __LINE__;
+#endif
 		return CDS_FT_STATUS_NOT_FOUND;
 	}
 
@@ -5056,6 +5059,9 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 		/* Never inserted (a freshly-initialized node). */
 		dbg_printf("cds_ft_remove: node %p has no parent\n", node);
 		FT_TP(remove_exit, (int) CDS_FT_STATUS_NOT_FOUND);
+#ifdef FT_ENABLE_TRACING
+		ft_dbg_rm_site = __LINE__;
+#endif
 		return CDS_FT_STATUS_NOT_FOUND;
 	}
 	/*
@@ -5086,6 +5092,9 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 				ft_flag_tombstoned(ft, d.pnf)) {
 			/* The key is not reachable either: idempotent miss. */
 			FT_TP(remove_exit, (int) CDS_FT_STATUS_NOT_FOUND);
+#ifdef FT_ENABLE_TRACING
+			ft_dbg_rm_site = __LINE__;
+#endif
 			return CDS_FT_STATUS_NOT_FOUND;
 		}
 		holder_flag = d.pnf;
@@ -5276,6 +5285,9 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 			if (unsplice_txn)
 				ft_flip_txn_destroy(unsplice_txn);
 			FT_TP(remove_exit, (int) CDS_FT_STATUS_NOT_FOUND);
+#ifdef FT_ENABLE_TRACING
+			ft_dbg_rm_site = __LINE__;
+#endif
 			return CDS_FT_STATUS_NOT_FOUND;
 		}
 		if (!ft_node_next(node)) {
@@ -5485,6 +5497,9 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 			if (unsplice_txn)
 				ft_flip_txn_destroy(unsplice_txn);
 			FT_TP(remove_exit, (int) CDS_FT_STATUS_NOT_FOUND);
+#ifdef FT_ENABLE_TRACING
+			ft_dbg_rm_site = __LINE__;
+#endif
 			return CDS_FT_STATUS_NOT_FOUND;
 		}
 		if (!ft_node_next(node)) {
@@ -5934,6 +5949,9 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 		external_nodes = metadata->external_nodes;
 		if (!external_nodes) {
 			*result_node = NULL;
+#ifdef FT_ENABLE_TRACING
+			ft_dbg_rm_site = __LINE__;
+#endif
 			return CDS_FT_STATUS_NOT_FOUND;
 		}
 		*result_node = external_nodes;
@@ -6032,6 +6050,9 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 		    !ft_locate_chain_head(ft, iter->node, iter_key, key_len,
 			    &holder_flag, &head_slot, &is_prefix)) {
 			*result_node = NULL;
+#ifdef FT_ENABLE_TRACING
+			ft_dbg_rm_site = __LINE__;
+#endif
 			return CDS_FT_STATUS_NOT_FOUND;
 		}
 		chain_head = iter->node;

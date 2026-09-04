@@ -1386,6 +1386,17 @@ void ft_speculative_keycopy_unconditional(const struct cds_ft *ft,
  * read node->prev as the holder route through this so the cell indirection
  * is transparent.  Identity in non-cell builds.
  */
+#ifdef FT_ENABLE_TRACING
+/*
+ * WHICH refusal.  cds_ft_remove has six distinct "not found" exits and the
+ * status code cannot tell them apart -- and a refusal is a CLAIM ABOUT THE
+ * TRIE, not a return value: an idempotent miss and a derivation that lost its
+ * holder to a peer report the same thing to the caller.  Each site stamps its
+ * own __LINE__ here and the violation event carries it.
+ */
+static __thread unsigned int ft_dbg_rm_site;
+#endif
+
 static inline
 struct cds_ft_inode_flag *ft_node_holder(struct cds_ft *ft,
 		const struct cds_ft_node *node)
@@ -1563,6 +1574,7 @@ void ft_publish_external_nodes_prev(struct cds_ft *ft,
 		ft_ord_cell_set_parent(external_nodes, word);
 	else
 		rcu_assign_pointer(external_nodes->prev, word);
+	FT_TP(set_parent, (const void *) external_nodes, (const void *) word);
 }
 
 static

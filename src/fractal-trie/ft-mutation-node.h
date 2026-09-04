@@ -1604,6 +1604,9 @@ int ft_node_recompact(enum ft_recompact mode,
 			}
 			ft_metadata_set_external_nodes(new_node_flag,
 				new_metadata, ext_snapshot);
+			FT_TP(recompact_head_snap, (const void *) metadata,
+				(const void *) new_node_flag,
+				(const void *) ext_snapshot);
 			if (retire_txn && !cluster_leaf && ext_snapshot) {
 				/*
 				 * Live retire: the external head's back-channel
@@ -2399,7 +2402,8 @@ skip_copy:
 	}
 
 	FT_TP(node_recompact, (const void *) *old_node_flag_ptr,
-		(const void *) new_node_flag, (int) new_type_index);
+		(const void *) new_node_flag, (const void *) new_metadata,
+		(int) new_type_index);
 
 	/*
 	 * Return the new recompacted node through old_node_flag_ptr.  For the
