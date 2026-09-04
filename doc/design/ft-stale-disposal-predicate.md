@@ -459,22 +459,34 @@ second is tempting and refutation (3) shows it is **not sufficient on its own**.
 ★ Q1(b) deletes this question entirely: a plan derived under the mark has no
 "value the caller assumed" to thread.
 
-**Q3 — the FIRST-ORPHAN exemption: position or identity?**  §3.2 narrows this
-a long way.  The orphan down-walk already acquires before it reads, so it needs
-no hoist; what it has instead is an exemption (`ft-remove.h:2853`) that lets the
-first orphan be collected *whatever* head it carries, on the grounds that the
-head there is the one the up-climb promoted.  The climb read that head
-**unlocked** (`:2609`); the walk holds the orphan's lock when it re-reads it
-(`:2838`).  So the question is whether to turn the exemption into the same
-INTENT comparison the chain compress now uses — tolerate a head on the first
-orphan only when it IS `topmost_external_nodes`, else stop the walk.
+**Q3 — ☑ HALF ANSWERED @`f1888262`, ☠ HALF REFUTED.**
 
-★ It would cost one comparison, no acquire, and the disposition already exists
-(the walk simply `break`s, which is not a retry and cannot livelock).  ☐ Open:
-is `topmost_external_nodes` guaranteed to name the head promoted from *that*
-node, is an empty `to_free[]` a legal state for the caller, and do `:2481` /
-`:2501` need the same treatment or does the per-orphan lock already re-derive
-what they decide?
+☑ **The bail was not a refusal, and now is.**  The down-walk's `break` stopped
+collecting but let everything after it run: the replace unlinks the whole chain
+while `to_free` holds only `[0, k)`, so orphan `k` was unlinked and **never
+freed** — leaked with whatever a peer put on it, and invisible to
+`cds_ft_verify` because the node is unlinked rather than live-and-linked.
+Single-writer the walk always reaches the leaf, so the arm fires only on a plan
+a peer invalidated, and that must abort the op.  Both walks now release the mark
+and `-EAGAIN; goto end` — byte-for-byte clean (the walk is read-only,
+`orphan_txn` does not exist yet, the sweep at `end` releases every held mark),
+and it cannot livelock because the mismatch is a **committed** peer write in the
+op's own locked snapshot, so the re-descend sees a settled tree.
+
+☠ **Keying the first-orphan exemption on IDENTITY is REFUTED.**  Tolerating a
+head there only when it IS `topmost_external_nodes` **wedges `ft_unit` entering
+`test_density_stress` (252) — SINGLE-WRITER**, RSS flat, a spin not a leak.
+Bisected: restoring the `nr_child` exemption alone does not fix it; dropping the
+head test does.  So the first orphan's head legitimately differs from the
+promoted one in some shape this walk allows, and `topmost_external_nodes` is
+**not** the comparand the design assumed.  ☐ Establish that shape before trying
+again — it is now the only thing standing between this walk and the same intent
+check the chain compress carries.
+
+★ Arm yield, 20 seeds: the orphan refusal fires **once across 16 classifiable
+runs** (with 15 head and 4 detach refusals from the compress).  Rare, armed,
+non-zero.  ☞ 2 of 20 runs also completed GREEN, which no control run ever did —
+at that n it is not evidence and is not claimed as any.
 
 **Q4 — Does this retire G4?**  G4 asks whether ordered cells and dup-chain
 splices keep a narrow MW lane or grow a state word, and the plan defers it to a
