@@ -823,6 +823,73 @@ int ft_detach_orphan_planlock(const struct cds_ft *ft,
  * and that struct exists in every build.  A build with skip-compression off has
  * no collapse to run, but it still needs the type to be complete.
  */
+/*
+ * What the OP INTENDS, as opposed to what the TRIE currently holds.
+ *
+ * ☠ THE DISTINCTION IS THE WHOLE POINT.  A collapse rests on a picture of the
+ * boundary -- how many children it has, which one survives, whether it carries
+ * an external head -- and that picture used to be read by the CALLER, before
+ * the callee took the boundary's lock.  Under fine locking the mark IS the
+ * exclusion, so a fact read before it is worth nothing at commit time: a peer
+ * that legally holds the same lock changes the node in between, and the
+ * collapse ratifies a picture that is already false.  Measured: a peer
+ * published a fresh junction carrying a live key into a body slot of the
+ * boundary and committed; this collapse re-entered, retired the boundary, and
+ * freed the key with it.
+ *
+ * So the callee DERIVES every trie fact under its own mark and trusts none from
+ * the caller.  What it cannot derive is the op's TARGET -- you can hoist a
+ * QUERY, you cannot hoist a TARGET: only the op knows which child it came to
+ * remove.  That, and only that, is what this carries.
+ *
+ * @detach_child / @detach_byte: the body child this commit removes from the
+ *   boundary, and its byte.  NULL when the op removes no body child (the
+ *   post-removal collapses, whose entry is the EXTERNAL one).
+ *   ☐ AND NULL AT THE SHAPE-D FOLD TOO, WHICH IS A GAP, NOT A DESIGN.  That
+ *   caller detaches the boundary's child at byte @n, and the obvious target --
+ *   the climb's *detach_node_flag_ptr -- is NOT that child: MEASURED, the two
+ *   are either identical (441, 1132 per run) or DIFFERENT NODES ENTIRELY (347,
+ *   451), and never merely differently tagged, because the climb elevates
+ *   @detach_node_flag_ptr as it walks.  Re-reading the boundary at @n instead
+ *   names the right node but names it too LATE to be a plan value: the check
+ *   then compares a value to itself and was measured INERT (0 refusals in
+ *   ~100k armings).  A target that is wrong is worse than no check, so this
+ *   stays NULL until the climb's contract is established.
+ * @expect_ext: the external head the op's shape says the boundary carries --
+ *   the head it is itself removing, or NULL for the callers whose gate asserts
+ *   there is none.  Never a value read speculatively from the trie: each caller
+ *   names the head it came to unlink.
+ */
+struct ft_chain_compress_intent {
+	struct cds_ft_inode_flag *detach_child;
+	struct cds_ft_node *expect_ext;
+	uint8_t detach_byte;
+};
+
+/*
+ * The fact the collapse rests on that the boundary's own mark did not use to
+ * cover: its EXTERNAL HEAD.  Read HERE, under that mark, and compared against
+ * the head the op named -- never against a picture the caller took before it.
+ * True == the plan no longer describes the trie, so the caller must bail.
+ *
+ * ☐ The SECOND uncovered fact -- the child this commit DETACHES -- is not
+ * checked yet; @detach_child is NULL at every caller today.  See the struct.
+ */
+static inline
+bool ft_chain_compress_plan_stale(struct cds_ft *ft,
+		struct cds_ft_inode_flag *iter_node_flag,
+		const struct ft_chain_compress_intent *intent)
+{
+	if (ft_node_external_nodes(iter_node_flag) != intent->expect_ext)
+		return true;
+	if (intent->detach_child &&
+			ft_node_get_nth(ft, iter_node_flag, NULL,
+				intent->detach_byte, FT_PF_NONE)
+					!= intent->detach_child)
+		return true;
+	return false;
+}
+
 struct ft_chain_compress_reclaim {
 	/*
 	 * TWO LIFETIMES, and mixing them frees a live node.  The first three are
@@ -997,6 +1064,7 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		struct ft_flip_txn *shared_txn,
 		bool record_only,
 		struct cds_ft_inode_flag *pending_child,
+		const struct ft_chain_compress_intent *intent,
 		struct ft_chain_compress_reclaim *reclaim)
 {
 	struct cds_ft_compressed_node *parent_cn, *child_cn;
@@ -1307,19 +1375,38 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		}
 	}
 	/*
-	 * Re-validate the caller's PRE-fence plan under the fence: the
-	 * boundary must still have the child population the plan was derived
-	 * from (@plan_nr_child: 2 for the shape-D fold that retires one of the
-	 * two, 1 for the post-removal collapses), and @surviving_byte must
-	 * still map to @surviving_child -- a peer commit between the caller's
-	 * derivation and the mark (an insert into the boundary, a child
-	 * republish) is exactly what the mark snapshot cannot vouch for.
+	 * ★ THE PLAN, UNDER THE FENCE.  Everything the collapse rests on is read
+	 * HERE, on the far side of the boundary's own mark, and compared against
+	 * what the OP said it came to do (@intent) -- never against a picture the
+	 * caller took before the mark, which a peer holding the same lock is
+	 * entitled to invalidate.  Four things, and the last two are why keys
+	 * were being lost:
+	 *
+	 *  1. the child COUNT (@plan_nr_child: 2 for the shape-D fold that
+	 *     retires one of the two, 1 for the post-removal collapses).  Free:
+	 *     nr_child lives inside the state word, so the acquire's own snapshot
+	 *     carries it.
+	 *  2. the SURVIVOR still at @surviving_byte.  ☞ This one cannot be
+	 *     derived instead of compared: when the survivor is compressed it is
+	 *     a member of the lock-set above, so it has to be named to be locked.
+	 *     A mismatch bails, which is equivalent.
+	 *  3. the EXTERNAL HEAD.  ☠ Never checked before.  A peer's
+	 *     ft_insert_park_external_nodes writes exactly this word, under this
+	 *     same lock, and moves neither nr_child nor any slot above -- so
+	 *     (1) and (2) both pass and the collapse retires a boundary that is
+	 *     holding a live key.
+	 *  4. the child THIS COMMIT DETACHES.  ☠ Never checked before.  A peer's
+	 *     publish into that slot is a SAME-SLOT VALUE SWAP: the count does
+	 *     not move, the survivor does not move, and the collapse drops a
+	 *     freshly published subtree.  MEASURED as the loss, in the act.
+	 *
 	 * Never fires single-writer.
 	 */
 	if (caa_unlikely(ft_state_nr_child(iter_held.node_snap) != plan_nr_child ||
 			ft_node_get_nth(ft, iter_node_flag, NULL,
 				surviving_byte, FT_PF_NONE)
-					!= surviving_child)) {
+					!= surviving_child ||
+			ft_chain_compress_plan_stale(ft, iter_node_flag, intent))) {
 		if (!record_only)
 			ft_flip_txn_destroy(txn);
 		return -EAGAIN;
@@ -1843,13 +1930,28 @@ void ft_canonicalize_chain_compress(struct cds_ft *ft,
 		false /* writer; no validation */);
 	if (!surviving_child)
 		return;
-	(void) ft_chain_compress_fused(ft, iter_node_flag, iter_depth, ctx,
-		iter_meta,
-		surviving_child, surviving_byte,
-		1 /* already-committed 1-child boundary */, NULL, NULL,
-		NULL, 0, NULL, NULL, 0 /* no orphan chain */,
-		NULL, 0 /* count-neutral canonicalize */, 0,
-				NULL, false, NULL /* no pending publish */, NULL);
+	/*
+	 * INTENT: this is a pure canonicalize.  It removes nothing -- the
+	 * caller's gate (ft-remove.h, the post-detach fold) has already asserted
+	 * the boundary carries NO external head, so that is what the callee must
+	 * still find under the mark, and there is no body child to detach.
+	 */
+	{
+		const struct ft_chain_compress_intent intent = {
+			.detach_child = NULL,
+			.expect_ext = NULL,
+			.detach_byte = 0,
+		};
+
+		(void) ft_chain_compress_fused(ft, iter_node_flag, iter_depth, ctx,
+			iter_meta,
+			surviving_child, surviving_byte,
+			1 /* already-committed 1-child boundary */, NULL, NULL,
+			NULL, 0, NULL, NULL, 0 /* no orphan chain */,
+			NULL, 0 /* count-neutral canonicalize */, 0,
+			NULL, false, NULL /* no pending publish */,
+			&intent, NULL);
+	}
 }
 #endif
 
@@ -3372,6 +3474,41 @@ int ft_detach_node(struct cds_ft *ft,
 						lctx.held.txn = NULL;
 					lctx.held.nr_extra =
 						(unsigned int) nr_orphan_locked;
+					/*
+					 * INTENT: the boundary carries no external
+					 * head (the gate above asserts it), and this
+					 * commit detaches exactly the child at @n --
+					 * the one the climb is pruning.  @n is the
+					 * boundary's own byte for it: the survivor scan
+					 * just above skips @n while scanning
+					 * @iter_node_flag, which is what makes them the
+					 * same node.  Naming the target is the one
+					 * thing the callee cannot derive for itself.
+					 *
+					 * ☠ LIKE FOR LIKE.  Name it the way the callee
+					 * will READ it -- through ft_node_get_nth on
+					 * the boundary, the accessor the survivor scan
+					 * uses -- not by dereferencing the climb's slot
+					 * pointer.  A raw slot value and a get_nth
+					 * result are not the same encoding, so one
+					 * never compares equal to the other: measured
+					 * as a PERMANENT -EAGAIN, ft_unit wedged at
+					 * test 2 and the memcg SIGKILLing the leak.
+					 */
+					/*
+					 * ☐ INTENT, HALF-SUPPLIED.  The head is
+					 * named (the gate above asserts NONE), the
+					 * detached child is NOT -- see the note on
+					 * @detach_child in the struct.  Naming it
+					 * needs a fact about this climb I have not
+					 * established, and a check whose target is
+					 * wrong is worse than no check.
+					 */
+					const struct ft_chain_compress_intent intent = {
+						.detach_child = NULL,
+						.expect_ext = NULL,
+						.detach_byte = 0,
+					};
 					int cret = ft_chain_compress_fused(ft,
 						iter_node_flag, cur_depth, &lctx,
 						bmeta,
@@ -3393,7 +3530,7 @@ int ft_detach_node(struct cds_ft *ft,
 				 * caller to reclaim on the right side of its commit.
 				 */
 				record_only ? shared_txn : NULL, record_only,
-				fold_pending,
+				fold_pending, &intent,
 				record_only && recompact_out ?
 					&recompact_out->collapse : NULL);
 
@@ -5383,6 +5520,19 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 				 * retired key's -1 and records the ancestor -1 walk into its
 				 * OWN commit (count_delta -1), so no pre-decrement here.
 				 */
+				/*
+				 * INTENT: no body child is detached -- the entry
+				 * being removed is the EXTERNAL one, and this arm
+				 * is the one whose branch condition established
+				 * that the head IS @node.  So @node is what the
+				 * callee must still find under the mark.
+				 */
+				const struct ft_chain_compress_intent intent = {
+					.detach_child = NULL,
+					.expect_ext = node,
+					.detach_byte = 0,
+				};
+
 				cret = ft_chain_compress_fused(ft,
 					holder_flag, holder_depth, &lctx,
 					holder_meta,
@@ -5392,7 +5542,7 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 					NULL, 0, NULL, NULL, 0 /* no orphan chain */, node,
 					-1, ft->rank_stats ? key_len + 1 : 0,
 					NULL, false,
-					NULL /* no pending publish */, NULL);
+					NULL /* no pending publish */, &intent, NULL);
 
 				if (cret == 0) {
 					/*
@@ -6192,6 +6342,18 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 				 * retired key's -1 and records the ancestor -1 walk into its
 				 * OWN commit (count_delta -1), so no pre-decrement here.
 				 */
+				/*
+				 * INTENT: as above -- no body child detached, and
+				 * the external entry this op clears is
+				 * @chain_head, the head the is_prefix arm derived
+				 * and is about to unlink.
+				 */
+				const struct ft_chain_compress_intent intent = {
+					.detach_child = NULL,
+					.expect_ext = chain_head,
+					.detach_byte = 0,
+				};
+
 				cret = ft_chain_compress_fused(ft,
 					holder_flag, holder_depth, &lctx,
 					holder_meta,
@@ -6201,7 +6363,7 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 					NULL, NULL, 0, NULL, NULL, 0 /* no orphan chain */, NULL,
 					-1, ft->rank_stats ? key_len + 1 : 0,
 					NULL, false,
-					NULL /* no pending publish */, NULL);
+					NULL /* no pending publish */, &intent, NULL);
 
 				if (cret == 0) {
 					ft_chain_mark_removed_flip(ft, chain_head);
