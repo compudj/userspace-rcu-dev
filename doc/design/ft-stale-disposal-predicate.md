@@ -160,38 +160,46 @@ and where to stop: `ft-remove.h:2332` (collect), `:2352` (stop the climb),
 the commit runs, and `ft-remove.h:4234`–`:4239` frees them.  The uncovered word
 here is a **body slot** as well as `external_nodes`.
 
-### 3.3 THE SHAPE HISTOGRAM — 79% is ONE defect, and two "shapes" were my instrument
+### 3.3 THE TAXONOMY IS COMPLETE — two defects, discriminated exactly
 
-☠☠ **TWO EARLIER VERSIONS OF THIS TABLE WERE WRONG, BOTH BECAUSE OF THE
-INSTRUMENT, NOT THE TRIE.**
+☠☠ **THREE SUCCESSIVE VERSIONS OF THIS TABLE WERE THE INSTRUMENT, NOT THE
+TRIE**, and every correction moved samples INTO a known defect:
 
-1. A row was reported as "holder ALIVE, node ORPHANED (`hext != node`)" having
-   **never compared `hext` to the node**.
-2. `headis=null` was a whole invented shape: a **COMPRESSED** holder keeps its
-   single external child in `cn->child`, and `meta->external_nodes` is
-   legitimately NULL there.  Reading the metadata field unconditionally
-   manufactured it.
-3. And the classifier looked only at the **HOLDER**.  When the disposal happens
-   **one level up**, the holder is alive, correctly wired and holding the key —
-   while the node it hangs off was retired under it.
+1. a row labelled "`hext != node`" that **never compared them**;
+2. `headis=null` invented whole — a **COMPRESSED** holder keeps its single
+   external child in `cn->child`, and `meta->external_nodes` is legitimately
+   NULL there;
+3. the record described the **HOLDER**, then the holder **and its parent** —
+   while the disposal that loses a key can be at **any** ancestor.  A classifier
+   that inspects a fixed number of levels invents a residual shape for every
+   defect that happens one level higher than it looks.
 
-Final, with the head field dispatched on holder kind and the **PARENT's**
-tombstone in the record (24 samples, `EXTVIOL` on stderr):
+The fix is to stop counting levels: walk **up to the trie root** and report
+`anc_tomb` (hops to the nearest TOMBSTONED ancestor, 0 == the holder, -1 == none)
+and `anc_root` (hops to reach the trie, -1 == the up-walk never does).
 
-| kind | htomb | headis | ptomb | rmsite | n |
-|---|---|---|---|---|---|
-| RM-LOOKUP-MISS | 1 | node | 0 | — | 10 |
-| RM-LOOKUP-MISS | 1 | node | **1** | — | 4 |
-| RM-FAIL | 0 | node | 0 | **body-child arm** | 3 |
-| RM-LOOKUP-MISS | 0 | other | **1** | — | 2 |
-| RM-LOOKUP-MISS | 0 | node | 0 | — | 2 |
-| RM-LOOKUP-MISS | 1 | null | **1** | — | 1 |
-| RM-LOOKUP-MISS | 0 | null | **1** | — | 1 |
-| RM-LOOKUP-MISS | 0 | node | **1** | — | 1 |
+**42 samples** (30 + a 12-sample `RETRY=1` control):
 
-★★ **A RETIRED ANCESTOR — the holder OR its parent — accounts for 19 of 24
-(79%).**  The bogus refusal is 3/24.  Only **2/24** have no retired ancestor and
-no refusal site, and those are the whole remaining residue.
+| oracle shape | n | `anc_tomb` | reading |
+|---|---|---|---|
+| **RM-LOOKUP-MISS** (the lost key) | **31** | **≥ 0 in EVERY ONE** | a RETIRED ANCESTOR — §3.1 / §3.2 / §3.3.2, ONE defect |
+| **RM-FAIL** | **6** | **-1 in EVERY ONE**, and every one carries an `rmsite` | the bogus refusal — §3.3.1, a SECOND defect |
+| STALE-FOUND | 2 | -1 | ☐ a removed key still found; not investigated here |
+| `rc=124` / `rc=137` | 3 | — | ☐ liveness: two timeouts and one memcg-SIGKILLed leak |
+
+★★ `anc_tomb` **discriminates the two defects exactly**: not one lost key
+without a retired ancestor, not one refusal with one.  `anc_root` was ≥ 4 in
+every sample, so no cluster was detached from the trie — the losses are
+ancestors retired *under* a correctly wired subtree, not broken links.
+
+★ **The losses are HARD, not transient.**  A key can be momentarily unreachable
+to the exact path while a peer splits or re-merges the run it sits under
+(measured previously at ~1400 per 3000 cycles, with an immediate retry always
+succeeding).  `RETRY=1` asks a second time **in the same read section** and only
+a second failure aborts: **10 of 12 still aborted on RM-LOOKUP-MISS.**
+☠ The `wtransient` counter itself printed nothing — the run aborts before its
+summary, the atexit-detector trap — so the evidence here is the abort surviving
+the retry, not the counter.
 
 #### 3.3.1 ★ ROOT-CAUSED: the bogus NOT_FOUND from an identity-compare arm
 
@@ -349,18 +357,13 @@ that cannot go stale all need weighing.  ☞ It may be cheaper to make the
 FOUR-WAY BRANCH ITSELF robust — re-derive the holder immediately before it,
 under the same mark that protects the arms — than to patch each arm's refusal.
 
-**Q5c — the ☐ REMAINING 2/24.**  Two samples have no retired ancestor and no
-refusal site: the holder is alive, untombstoned, holds the node, its parent is
-alive — and the lookup missed anyway.  That residue is unexplained.  Until it
-is closed, **no fix in this brief can turn the reproducer green** — worth
-knowing before anyone measures a candidate on a red/green criterion instead of
-the shape histogram.
-
-**Q5 — Scope.**  Is the deliverable the two measured instances, or a sweep for
-the class?  The class is: *"an op that DISPOSES of a node on the strength of a
-predicate over words it does not carry into its commit"*.  A sweep would start
-at every `item_retire` / `free_*_node` reachable from a mutator and ask, for
-each, which words its decision read.
+**Q5c — ☑ CLOSED.**  There is no residue: with the up-walk in the record,
+**every** RM-LOOKUP-MISS in 42 samples has a tombstoned ancestor and **every**
+RM-FAIL has none.  What is left outside the two defects is 2 STALE-FOUND (a
+removed key still found — a different oracle check, uninvestigated) and 3
+liveness events (two `rc=124` timeouts, one `rc=137`).  ☞ So a candidate fix
+CAN now be measured: the metric is "RM-LOOKUP-MISS count with `anc_tomb >= 0`",
+and it does not need the reproducer to go green.
 
 ---
 

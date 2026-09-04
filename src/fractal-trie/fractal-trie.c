@@ -876,8 +876,8 @@ void cds_ft_debug_ext_violation(unsigned int kind, struct cds_ft *ft,
 	void *prev = NULL;
 	struct cds_ft_inode_flag *holder = NULL;
 	struct cds_ft_node *hext = NULL;
-	uintptr_t hstate = 0, pstate = 0;
-	struct cds_ft_inode_flag *parent = NULL;
+	uintptr_t hstate = 0;
+	int anc_tomb = -1, anc_root = -1;
 
 	if (node) {
 		prev = CMM_LOAD_SHARED(node->prev);
@@ -919,22 +919,35 @@ void cds_ft_debug_ext_violation(unsigned int kind, struct cds_ft *ft,
 	 * analysis recover the .so load base (self - nm offset) and turn every
 	 * caller in the trace into a file:line.
 	 */
+	/*
+	 * Bounded up-walk.  Runs at abort time on a structure a peer may be
+	 * mutating, so it must not fault and must not spin: every dereference
+	 * is guarded and the hop count is capped at FT_MAX_DEPTH.
+	 */
 	if (holder && !ft_node_external(holder)) {
-		struct cds_ft_metadata *hm = ft_flag_to_metadata(ft, holder);
+		struct cds_ft_inode_flag *nf = holder;
+		int hops;
 
-		if (hm) {
-			parent = ft_parent_node(hm->parent_word);
-			if (parent && !ft_node_external(parent)) {
-				struct cds_ft_metadata *pm =
-					ft_flag_to_metadata(ft, parent);
+		for (hops = 0; hops <= FT_MAX_DEPTH; hops++) {
+			struct cds_ft_metadata *m;
 
-				if (pm)
-					pstate = CMM_LOAD_SHARED(pm->state);
+			if (!nf || ft_node_external(nf))
+				break;
+			m = ft_flag_to_metadata(ft, nf);
+			if (!m)
+				break;
+			if (anc_tomb < 0 &&
+			    (CMM_LOAD_SHARED(m->state) & FT_STATE_TOMBSTONE))
+				anc_tomb = hops;
+			if (ft_parent_is_trie(CMM_LOAD_SHARED(m->parent_word))) {
+				anc_root = hops;
+				break;
 			}
+			nf = ft_parent_node(CMM_LOAD_SHARED(m->parent_word));
 		}
 	}
 	FT_TP(ext_violation, kind, node, holder, hext, (uint64_t) hstate,
-		ft_dbg_rm_site, (const void *) parent, (uint64_t) pstate,
+		ft_dbg_rm_site, anc_tomb, anc_root,
 		(const void *) &cds_ft_debug_ext_violation, key0);
 	/*
 	 * ALSO ON STDERR.  The shape of a loss is (holder tombstoned?, is the
@@ -946,12 +959,12 @@ void cds_ft_debug_ext_violation(unsigned int kind, struct cds_ft *ft,
 	 * than the samples are worth.
 	 */
 	fprintf(stderr, "EXTVIOL kind=%u node=%p prev=%p holder=%p hext=%p "
-		"hstate=0x%lx rmsite=%u tomb=%d headis=%s ptomb=%d\n",
+		"hstate=0x%lx rmsite=%u tomb=%d headis=%s anctomb=%d ancroot=%d\n",
 		kind, (void *) node, prev, (void *) holder, (void *) hext,
 		(unsigned long) hstate, ft_dbg_rm_site,
 		(hstate & FT_STATE_TOMBSTONE) ? 1 : 0,
 		hext == node ? "node" : (hext ? "other" : "null"),
-		parent ? ((pstate & FT_STATE_TOMBSTONE) ? 1 : 0) : -1);
+		anc_tomb, anc_root);
 	ft_trace_capture();
 }
 #endif

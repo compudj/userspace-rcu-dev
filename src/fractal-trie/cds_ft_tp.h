@@ -1178,8 +1178,8 @@ LTTNG_UST_TRACEPOINT_EVENT(cds_ft, ext_violation,
 		const void *, hext,
 		uint64_t, hstate,
 		unsigned int, rmsite,
-		const void *, parent,
-		uint64_t, pstate,
+		int, anc_tomb,
+		int, anc_root,
 		const void *, self,
 		uint64_t, key0
 	),
@@ -1191,14 +1191,21 @@ LTTNG_UST_TRACEPOINT_EVENT(cds_ft, ext_violation,
 		lttng_ust_field_integer_hex(uint64_t, hstate, hstate)
 		lttng_ust_field_integer(unsigned int, rmsite, rmsite)
 		/*
-		 * ☠ THE HOLDER IS THE WRONG PLACE TO LOOK when the disposal
-		 * happened one level up: the holder can be alive, correctly
-		 * wired and holding the key, while the node it hangs off was
-		 * retired under it.  A classifier without @parent calls that
-		 * "holder alive, some other head" and invents a shape.
+		 * ☠ ONE LEVEL IS NOT ENOUGH.  The disposal that loses a key can
+		 * be at the holder, at its parent, or anywhere above: the whole
+		 * cluster below a retired node is alive, correctly wired and
+		 * holding the key, and unreachable.  A classifier that inspects
+		 * a fixed number of levels invents a residual shape for every
+		 * defect that happens one level higher than it looks.
+		 *
+		 * @anc_tomb: hops from the holder to the nearest TOMBSTONED
+		 * ancestor (0 == the holder itself), -1 if none up to the root.
+		 * @anc_root: hops for the up-walk to reach the trie, -1 if it
+		 * never does -- which is the direct statement that the cluster
+		 * is DETACHED, and so exactly what a lookup miss means.
 		 */
-		lttng_ust_field_integer_hex(uintptr_t, parent, (uintptr_t) parent)
-		lttng_ust_field_integer_hex(uint64_t, pstate, pstate)
+		lttng_ust_field_integer(int, anc_tomb, anc_tomb)
+		lttng_ust_field_integer(int, anc_root, anc_root)
 		lttng_ust_field_integer_hex(uintptr_t, self, (uintptr_t) self)
 		lttng_ust_field_integer_hex(uint64_t, key0, key0)
 	)
