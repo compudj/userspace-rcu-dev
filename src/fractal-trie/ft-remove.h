@@ -3677,6 +3677,27 @@ int ft_detach_node(struct cds_ft *ft,
 				 * the pre-fusion timing: apply it just before the lone
 				 * forward store (single writer, cannot abort).
 				 */
+				/*
+				 * ☞ THE BACK-EDGE CLAIM READS ZERO ON EVERY OWNER
+				 * COLUMN HERE, AND THE OP DOES HOLD THE OWNER.
+				 *
+				 * FT_BE_DETACH_UNCHAIN is the one site where the txn
+				 * registry, the per-thread hold ledger AND the CALLER's
+				 * @op_ctx all report "holds nothing".  MEASURED: the
+				 * owner's state word carries FT_STATE_LOCK (0x80004,
+				 * tombstone clear) in 5/5 samples of a SINGLE-writer
+				 * run, and @lctx -- THIS function's own lock context --
+				 * answers held in 5/5.
+				 *
+				 * The marks live in @orphan_held, a fn-scope array
+				 * rather than the txn locks[] registry (the orphan chain
+				 * reaches FT_MAX_DEPTH, past FT_FLIP_TXN_MAX_LOCKS; see
+				 * the DLM orphan plan-lock note at the top), so they are
+				 * the `extra[]` arm of the held set: reachable from
+				 * @lctx, invisible to @op_ctx and to the registry by
+				 * construction.  Do not read the claim's zeros here as
+				 * an unowned write -- ask @lctx.
+				 */
 				if (pub->head_parent_field) {
 					if (commit_txn) {
 						ft_flip_txn_record_head_back_edge(commit_txn,
