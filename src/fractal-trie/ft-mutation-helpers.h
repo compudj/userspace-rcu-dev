@@ -2226,6 +2226,13 @@ struct ft_hold_trace_ent {
 static __thread struct ft_hold_trace_ent ft_hold_trace[FT_HOLD_TRACE_MAX];
 static __thread unsigned int ft_hold_trace_n;
 
+/* How many words this thread holds right now -- 0 distinguishes "the op holds
+ * NOTHING anywhere" from "it holds other nodes, just not this one". */
+static inline unsigned int ft_hold_trace_count(void)
+{
+	return ft_hold_trace_n;
+}
+
 /*
  * A refusal a RETRY LOOP re-derives fires once per attempt, so an unbounded
  * report is not a report -- it is a disk filling at the speed of the loop
@@ -2885,6 +2892,11 @@ bool ft_hold_trace_holds(const struct cds_ft_metadata *lock)
 {
 	(void) lock;
 	return false;
+}
+
+static inline unsigned int ft_hold_trace_count(void)
+{
+	return 0;
 }
 
 static inline
@@ -4489,12 +4501,16 @@ extern unsigned long ft_be_s_total[FT_BE_SITE_NR],
 	ft_be_s_old[FT_BE_SITE_NR], ft_be_s_nolocks[FT_BE_SITE_NR],
 	ft_be_s_gp[FT_BE_SITE_NR], ft_be_s_gp_none[FT_BE_SITE_NR],
 	ft_be_s_led_old[FT_BE_SITE_NR], ft_be_s_led_gp[FT_BE_SITE_NR],
-	ft_be_s_led_only[FT_BE_SITE_NR];
+	ft_be_s_led_only[FT_BE_SITE_NR], ft_be_s_noowner[FT_BE_SITE_NR],
+	ft_be_s_new[FT_BE_SITE_NR], ft_be_s_led_new[FT_BE_SITE_NR],
+	ft_be_s_led_none[FT_BE_SITE_NR];
 unsigned long ft_be_s_total[FT_BE_SITE_NR],
 	ft_be_s_old[FT_BE_SITE_NR], ft_be_s_nolocks[FT_BE_SITE_NR],
 	ft_be_s_gp[FT_BE_SITE_NR], ft_be_s_gp_none[FT_BE_SITE_NR],
 	ft_be_s_led_old[FT_BE_SITE_NR], ft_be_s_led_gp[FT_BE_SITE_NR],
-	ft_be_s_led_only[FT_BE_SITE_NR];
+	ft_be_s_led_only[FT_BE_SITE_NR], ft_be_s_noowner[FT_BE_SITE_NR],
+	ft_be_s_new[FT_BE_SITE_NR], ft_be_s_led_new[FT_BE_SITE_NR],
+	ft_be_s_led_none[FT_BE_SITE_NR];
 #else
 # define FT_BE_SITE_PARAM
 # define FT_BE_SITE(s)
@@ -4532,17 +4548,19 @@ static void ft_be_site_report(void)
 		"OFF (columns below are structurally 0, not measured)",
 #endif
 		ft_be_total);
-	fprintf(stderr, "%-18s %10s %8s %8s %8s %8s %8s %8s\n",
+	fprintf(stderr, "%-18s %10s %8s %8s %8s %8s %8s %8s %8s %8s %8s %8s\n",
 		"site", "total", "oldP", "GRANDpar", "nolocks",
-		"led_old", "led_gp", "led_only");
+		"led_old", "led_gp", "led_only", "NOowner", "newP", "led_new", "HOLDS0");
 	for (i = 0; i < FT_BE_SITE_NR; i++) {
 		if (!ft_be_s_total[i])
 			continue;
-		fprintf(stderr, "%-18s %10lu %8lu %8lu %8lu %8lu %8lu %8lu\n",
+		fprintf(stderr, "%-18s %10lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu\n",
 			ft_be_site_name[i], ft_be_s_total[i],
 			ft_be_s_old[i], ft_be_s_gp[i], ft_be_s_nolocks[i],
 			ft_be_s_led_old[i], ft_be_s_led_gp[i],
-			ft_be_s_led_only[i]);
+			ft_be_s_led_only[i], ft_be_s_noowner[i],
+			ft_be_s_new[i], ft_be_s_led_new[i],
+			ft_be_s_led_none[i]);
 	}
 }
 
@@ -4571,6 +4589,32 @@ static void ft_be_site_report(void)
 		if (h_old)						\
 			__atomic_fetch_add(&ft_be_s_old[dbg_be_site], 1,\
 				__ATOMIC_RELAXED);			\
+		/*							\
+		 * ☠ A ZERO IN THE OWNER COLUMNS IS AMBIGUOUS UNTIL THIS \
+		 * ONE IS READ.  ft_back_edge_owner() returns NULL at a	\
+		 * root position or for a non-node word, and EVERY owner \
+		 * column below is guarded on @o_old -- so "not held" and \
+		 * "there was nothing to hold" are the same 0.  Count the \
+		 * second case separately, per site.			\
+		 */							\
+		/* The op holds NOTHING AT ALL, anywhere -- the strongest	\
+		 * form of "unowned", and the one an exclusion argument	\
+		 * must answer for by construction rather than by lock.	*/ \
+		if (!ft_hold_trace_count())				\
+			__atomic_fetch_add(&ft_be_s_led_none[dbg_be_site],\
+				1, __ATOMIC_RELAXED);			\
+		if (!o_old)						\
+			__atomic_fetch_add(&ft_be_s_noowner[dbg_be_site],\
+				1, __ATOMIC_RELAXED);			\
+		/* The NEW end, per site: a re-parent's exclusion may	\
+		 * live on the holder the head is JOINING (the node whose \
+		 * slot receives it), not the one it leaves. */		\
+		if (h_new)						\
+			__atomic_fetch_add(&ft_be_s_new[dbg_be_site], 1,\
+				__ATOMIC_RELAXED);			\
+		if (o_new && ft_hold_trace_holds(o_new))		\
+			__atomic_fetch_add(&ft_be_s_led_new[dbg_be_site],\
+				1, __ATOMIC_RELAXED);			\
 		/* THE SECOND WITNESS -- see the ledger-column note above. */ \
 		if (o_old && ft_hold_trace_holds(o_old)) {		\
 			__atomic_fetch_add(&ft_be_s_led_old[dbg_be_site],\
