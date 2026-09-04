@@ -5220,6 +5220,65 @@ int ft_unchain_node(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
  *         with an internal node. Unlink the node from its list, leaving
  *         the external nodes list empty.
  */
+
+#ifdef FT_ENABLE_TRACING
+/* How often a NOT_FOUND was withdrawn because the holder had moved. */
+unsigned long ft_dbg_rm_stale_holder;
+#endif
+
+/*
+ * ☠ A REFUSAL IS A CLAIM ABOUT THE TRIE, NOT A RETURN CODE.
+ *
+ * The four-way branch below picks its arm from @holder_flag, derived from
+ * @node->prev far above any mark.  When a peer re-homes the head in that
+ * window the branch tests the WRONG node's words, the arm's identity compare
+ * fails, and the op answers CDS_FT_STATUS_NOT_FOUND -- a PERMANENT, key-losing
+ * answer to a TRANSIENT race.  MEASURED: at that exact return a fresh
+ * ft_node_holder(@node) says the node IS its holder's head and the holder is
+ * alive and untombstoned.
+ *
+ * So before conceding, ask the question again.  If the holder moved, the
+ * refusal was about a node this op no longer has any business reading: hand it
+ * back to the op's own retry (@need_retry, the escape the dead-forward-holder
+ * arm already uses) instead of reporting the key gone.
+ *
+ * ☠☠ AND THE DISPOSITION IS WRONG, WHICH IS WHY THIS IS OPT-IN
+ * (-DFT_RM_HOLDER_RECHECK), DEFAULT OFF.  A/B over 20 seeds of the two-writer
+ * reproducer, identical source, only this arm differing:
+ *
+ *     RM-FAIL (the shape it targets)   11/20  ->   1/20
+ *     SEGV                              2/20  ->   2/20   (unchanged: it does
+ *                                                          NOT create these)
+ *     timeout or memcg kill             0/20  ->   5/20   ☠
+ *
+ * So the diagnosis is confirmed -- withdrawing the refusal all but eliminates
+ * the shape -- and handing the op back to @need_retry SPINS: the caller's loop
+ * is an unbounded for(;;), and under sustained churn @node->prev keeps moving,
+ * so each retry re-derives a holder that has moved again.  -DFT_DEBUG_REMOVE_
+ * RETRY_CAP does NOT catch it (it reports at 100/1000/10000 attempts and the
+ * arm never passes 100); the failure is wall-clock and RSS, not attempt count.
+ *
+ * ☞ WHAT IT NEEDS: a BOUNDED disposition -- re-derive and re-run the arm
+ * selection IN PLACE a bounded number of times, rather than restarting the op
+ * -- or a bound on the outer loop.  Conceding NOT_FOUND after a bound is still
+ * strictly better than today, where the wrong answer is unconditional.  That is
+ * a contract question (may a remove refuse?) and is not settled here.
+ */
+static inline
+bool ft_rm_holder_moved(struct cds_ft *ft, const struct cds_ft_node *node,
+		struct cds_ft_inode_flag *holder_flag)
+{
+	struct cds_ft_inode_flag *fresh = ft_node_holder(ft,
+			(struct cds_ft_node *) node);
+
+	if (!fresh || fresh == holder_flag)
+		return false;
+#ifdef FT_ENABLE_TRACING
+	uatomic_inc(&ft_dbg_rm_stale_holder);
+#endif
+	return true;
+}
+
 static
 enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 		struct cds_ft_iter *iter,
@@ -5538,6 +5597,14 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 			/* Drop the pre-reserved unsplice txn (nothing published yet). */
 			if (unsplice_txn)
 				ft_flip_txn_destroy(unsplice_txn);
+#ifdef FT_RM_HOLDER_RECHECK
+			/* ☐ OPT-IN, NOT DEFAULT.  See ft_rm_holder_moved: the
+			 * diagnosis is right and this disposition is not. */
+			if (ft_rm_holder_moved(ft, node, holder_flag)) {
+				*need_retry = true;
+				return CDS_FT_STATUS_OK;
+			}
+#endif
 			FT_TP(remove_exit, (int) CDS_FT_STATUS_NOT_FOUND);
 #ifdef FT_ENABLE_TRACING
 			ft_dbg_rm_site = __LINE__;
@@ -5763,6 +5830,14 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 			/* Drop the pre-reserved unsplice txn (nothing published yet). */
 			if (unsplice_txn)
 				ft_flip_txn_destroy(unsplice_txn);
+#ifdef FT_RM_HOLDER_RECHECK
+			/* ☐ OPT-IN, NOT DEFAULT.  See ft_rm_holder_moved: the
+			 * diagnosis is right and this disposition is not. */
+			if (ft_rm_holder_moved(ft, node, holder_flag)) {
+				*need_retry = true;
+				return CDS_FT_STATUS_OK;
+			}
+#endif
 			FT_TP(remove_exit, (int) CDS_FT_STATUS_NOT_FOUND);
 #ifdef FT_ENABLE_TRACING
 			ft_dbg_rm_site = __LINE__;
