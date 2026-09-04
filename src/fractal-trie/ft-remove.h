@@ -833,6 +833,8 @@ int ft_detach_orphan_planlock(const struct cds_ft *ft,
  * counter cannot tell that apart from a race that simply did not happen.
  */
 unsigned long ft_dbg_plan_stale_ext, ft_dbg_plan_stale_detach;
+/* ...and the orphan walk's own stale-plan refusal. */
+unsigned long ft_dbg_orphan_walk_stale;
 #endif
 
 /*
@@ -2850,11 +2852,46 @@ int ft_detach_node(struct cds_ft *ft,
 					}
 				}
 
+				/*
+				 * ☠☠ A `break` HERE IS NOT A REFUSAL.  The walk
+				 * stops, but everything after it runs: the replace
+				 * unlinks this whole chain from its parent while
+				 * @to_free holds only [0, k), so orphan @k is
+				 * unlinked and NEVER FREED -- leaked, together with
+				 * whatever a peer put on it.  Single-writer the walk
+				 * always reaches the leaf (every chain node passed
+				 * the climb's 1-child/no-ext tests), so this arm
+				 * fires ONLY on a plan the peer has invalidated --
+				 * and a stale plan must ABORT the op, not truncate
+				 * its free list.
+				 *
+				 * Nothing is built, recorded or reserved yet (the
+				 * walk is read-only and @orphan_txn does not exist),
+				 * so `goto end` is byte-for-byte clean and the sweep
+				 * there releases every mark this op still holds.
+				 * The mismatch is a COMMITTED peer write sitting in
+				 * our own locked snapshot, so the re-descend sees a
+				 * settled tree: one retry per peer event, never a
+				 * conflict the op manufactures for itself.
+				 *
+				 * ☐ The FIRST orphan stays exempt.  Keying that
+				 * exemption on IDENTITY instead of position -- head
+				 * tolerated only when it IS @topmost_external_nodes
+				 * -- is REFUTED as written: ft_unit wedges entering
+				 * test_density_stress (252), SINGLE-WRITER, so the
+				 * first orphan's head legitimately differs from the
+				 * promoted one in some shape this walk allows.  ☞
+				 * Establish that shape before trying again.
+				 */
 				if (!phase2_first &&
 				    (nr_child > 1 || ext_nodes)) {
 					if (ft->lock_fine && !owalk.shared)
 						ft_meta_lock_release(owalk.lock);
-					break;
+#ifdef FT_ENABLE_TRACING
+					uatomic_inc(&ft_dbg_orphan_walk_stale);
+#endif
+					ret = -EAGAIN;
+					goto end;
 				}
 				phase2_first = false;
 				to_free[nr_to_free++] = walk_nf;
@@ -3281,12 +3318,19 @@ int ft_detach_node(struct cds_ft *ft,
 						}
 					}
 
+					/* Branch 2's twin of the walk above: same
+					 * belief, same identity key, same refusal.
+					 */
 					if (!phase2_first &&
 					    (nr_child > 1 || ext_nodes)) {
 						if (ft->lock_fine && !owalk.shared)
 							ft_meta_lock_release(
 								owalk.lock);
-						break;
+#ifdef FT_ENABLE_TRACING
+						uatomic_inc(&ft_dbg_orphan_walk_stale);
+#endif
+						ret = -EAGAIN;
+						goto end;
 					}
 					phase2_first = false;
 					to_free[nr_to_free++] = walk_nf;
