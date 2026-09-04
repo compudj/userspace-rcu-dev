@@ -823,6 +823,18 @@ int ft_detach_orphan_planlock(const struct cds_ft *ft,
  * and that struct exists in every build.  A build with skip-compression off has
  * no collapse to run, but it still needs the type to be complete.
  */
+#ifdef FT_ENABLE_TRACING
+/*
+ * ARM YIELD, not arm presence.  "The check compiled in" and "the check ever
+ * REFUSED anything" are different facts, and only the second says whether a
+ * guard is doing work: the first attempt at the detach arm was armed ~100k
+ * times per run and refused NOTHING, because its target had been re-read so
+ * late that it was comparing a value against itself.  A guard without a yield
+ * counter cannot tell that apart from a race that simply did not happen.
+ */
+unsigned long ft_dbg_plan_stale_ext, ft_dbg_plan_stale_detach;
+#endif
+
 /*
  * What the OP INTENDS, as opposed to what the TRIE currently holds.
  *
@@ -845,16 +857,13 @@ int ft_detach_orphan_planlock(const struct cds_ft *ft,
  * @detach_child / @detach_byte: the body child this commit removes from the
  *   boundary, and its byte.  NULL when the op removes no body child (the
  *   post-removal collapses, whose entry is the EXTERNAL one).
- *   ☐ AND NULL AT THE SHAPE-D FOLD TOO, WHICH IS A GAP, NOT A DESIGN.  That
- *   caller detaches the boundary's child at byte @n, and the obvious target --
- *   the climb's *detach_node_flag_ptr -- is NOT that child: MEASURED, the two
- *   are either identical (441, 1132 per run) or DIFFERENT NODES ENTIRELY (347,
- *   451), and never merely differently tagged, because the climb elevates
- *   @detach_node_flag_ptr as it walks.  Re-reading the boundary at @n instead
- *   names the right node but names it too LATE to be a plan value: the check
- *   then compares a value to itself and was measured INERT (0 refusals in
- *   ~100k armings).  A target that is wrong is worse than no check, so this
- *   stays NULL until the climb's contract is established.
+ *   ★ At the SHAPE-D fold it is the climb's own @elevated_old_child with its
+ *   byte @n -- the pair the climb condemned, both fixed BEFORE the boundary is
+ *   acquired.  @n is set once (ft_node_find_child on @cur) after the last
+ *   elevation, and @detach_node_flag_ptr is a slot INSIDE @cur throughout, so
+ *   the pair names the boundary's own edge.  ☞ ft-remove.h already enforces it
+ *   PRE-fence (@plan_old_child); carrying it here is that same predicate moved
+ *   past the acquire, which is the only place it can speak for the commit.
  * @expect_ext: the external head the op's shape says the boundary carries --
  *   the head it is itself removing, or NULL for the callers whose gate asserts
  *   there is none.  Never a value read speculatively from the trie: each caller
@@ -872,21 +881,40 @@ struct ft_chain_compress_intent {
  * the head the op named -- never against a picture the caller took before it.
  * True == the plan no longer describes the trie, so the caller must bail.
  *
- * ☐ The SECOND uncovered fact -- the child this commit DETACHES -- is not
- * checked yet; @detach_child is NULL at every caller today.  See the struct.
+ * ...and the second: the child this commit DETACHES.  A peer's publish into
+ * that slot is a SAME-SLOT VALUE SWAP -- it moves neither the count nor the
+ * survivor -- so this is the only word that can see it.
  */
 static inline
-bool ft_chain_compress_plan_stale(struct cds_ft *ft,
-		struct cds_ft_inode_flag *iter_node_flag,
+bool ft_chain_compress_plan_stale(struct cds_ft_inode_flag *iter_node_flag,
 		const struct ft_chain_compress_intent *intent)
 {
-	if (ft_node_external_nodes(iter_node_flag) != intent->expect_ext)
+	if (ft_node_external_nodes(iter_node_flag) != intent->expect_ext) {
+#ifdef FT_ENABLE_TRACING
+		uatomic_inc(&ft_dbg_plan_stale_ext);
+#endif
 		return true;
+	}
+	/*
+	 * ☠ RAW, like for like.  @detach_child is the climb's own slot WORD
+	 * (@elevated_old_child), so it must be compared against the slot word --
+	 * ft_node_get_nth_skip, "the slot value as-is, including skip-compressed
+	 * pointers".  ft_node_get_nth RESOLVES a skip-compressed word to the
+	 * compressed node reached through its child's back-pointer, which is a
+	 * DIFFERENT address, so comparing the two forms is unequal for every
+	 * chain-shaped branch and equal for every plain one: measured 347 vs 441
+	 * per run, a shape-determined constant, i.e. a PERMANENT -EAGAIN.  That
+	 * is what wedged ft_unit at test 2 on the first attempt.
+	 */
 	if (intent->detach_child &&
-			ft_node_get_nth(ft, iter_node_flag, NULL,
+			ft_node_get_nth_skip(iter_node_flag, NULL,
 				intent->detach_byte, FT_PF_NONE)
-					!= intent->detach_child)
+					!= intent->detach_child) {
+#ifdef FT_ENABLE_TRACING
+		uatomic_inc(&ft_dbg_plan_stale_detach);
+#endif
 		return true;
+	}
 	return false;
 }
 
@@ -1406,7 +1434,7 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 			ft_node_get_nth(ft, iter_node_flag, NULL,
 				surviving_byte, FT_PF_NONE)
 					!= surviving_child ||
-			ft_chain_compress_plan_stale(ft, iter_node_flag, intent))) {
+			ft_chain_compress_plan_stale(iter_node_flag, intent))) {
 		if (!record_only)
 			ft_flip_txn_destroy(txn);
 		return -EAGAIN;
@@ -3496,18 +3524,20 @@ int ft_detach_node(struct cds_ft *ft,
 					 * test 2 and the memcg SIGKILLing the leak.
 					 */
 					/*
-					 * ☐ INTENT, HALF-SUPPLIED.  The head is
-					 * named (the gate above asserts NONE), the
-					 * detached child is NOT -- see the note on
-					 * @detach_child in the struct.  Naming it
-					 * needs a fact about this climb I have not
-					 * established, and a check whose target is
-					 * wrong is worse than no check.
+					 * INTENT: the boundary carries no external
+					 * head (the gate above asserts it), and this
+					 * commit detaches the pair the climb
+					 * condemned -- @elevated_old_child at byte
+					 * @n, both fixed before the boundary is
+					 * acquired, and already enforced against the
+					 * plan PRE-fence (@plan_old_child).  Carrying
+					 * them here is that predicate moved past the
+					 * acquire, where it can speak for the commit.
 					 */
 					const struct ft_chain_compress_intent intent = {
-						.detach_child = NULL,
+						.detach_child = elevated_old_child,
 						.expect_ext = NULL,
-						.detach_byte = 0,
+						.detach_byte = n,
 					};
 					int cret = ft_chain_compress_fused(ft,
 						iter_node_flag, cur_depth, &lctx,
