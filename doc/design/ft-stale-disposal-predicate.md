@@ -189,13 +189,33 @@ what the word should be:
 | `ft-remove.h:5367` | **the head this op removes** (non-NULL) | *"sole body child; the removed entry is external"* |
 | `ft-remove.h:6176` | **the chain head this op removes** (non-NULL) | same |
 
-### 3.2 `ft_detach_node`'s upward prune — the orphan set
+### 3.2 `ft_detach_node` — ☠ AN EARLIER VERSION OF THIS SECTION BLAMED THE WRONG WALK
 
-The climb reads `metadata->external_nodes` three times to decide the orphan set
-and where to stop: `ft-remove.h:2332` (collect), `:2352` (stop the climb),
-`:2460` (promote the chain).  The orphans are then locked into `orphan_held[]`,
-the commit runs, and `ft-remove.h:4234`–`:4239` frees them.  The uncovered word
-here is a **body slot** as well as `external_nodes`.
+It said "the climb reads `external_nodes` to decide the orphan set and the
+orphan acquires happen later".  That conflates **two different walks**, and the
+one it named is not the one that picks the orphans:
+
+* the **ORPHAN DOWN-WALK** (`ft-remove.h:2790`+) picks the set to free, and it
+  is **ALREADY CORRECT**: it acquires each orphan (`ft_detach_orphan_acquire`,
+  `:2826`) *before* reading its `nr_child` (`:2836`) and `ext_nodes` (`:2838`),
+  and its own comment states the discipline — *"§9.2 plan-lock: lock acquire the
+  orphan BEFORE reading its nr_child for the collapse decision, so the 'retire
+  it' verdict is derived from a FROZEN word"*.  This is Q1(b) done natively.
+* the **UP-CLIMB** (`:2400`–`:2660`) has **no acquires at all**.  It reads
+  `ft_meta_nr_child_load` (`:2467`) and `metadata->external_nodes` at `:2481`
+  (the `nr_clear` tally), `:2501` (the BOUNDARY STOP test) and `:2609` (the
+  promote into `topmost_external_nodes`) — every one of them unlocked, feeding
+  a plan whose nodes are locked later or not at all.
+
+☞ So the open question here is narrower than the section claimed, and it sits
+at the seam between the two walks: the down-walk's stop test is
+`if (!phase2_first && (nr_child > 1 || ext_nodes))` (`:2853`), which **exempts
+the FIRST orphan** because *"the target itself may carry residual content
+(external_nodes) that was promoted as topmost_external_nodes"* (`:2766`).  That
+exemption is keyed on POSITION, while the thing that makes it safe is
+IDENTITY — the head there being the one the climb promoted, read unlocked at
+`:2609`.  ☐ Whether a peer can park a different head in that window, and
+whether `topmost_external_nodes` is the right comparand, is Q3.
 
 ### 3.3 THE TAXONOMY IS COMPLETE — two defects, discriminated exactly
 
@@ -439,15 +459,22 @@ second is tempting and refutation (3) shows it is **not sufficient on its own**.
 ★ Q1(b) deletes this question entirely: a plan derived under the mark has no
 "value the caller assumed" to thread.
 
-**Q3 — is `ft_detach_node`'s climb the same fix, or a lock-set change?**  This
-is the one place the answer may not be code motion.  The climb reads
-`metadata->external_nodes` at `ft-remove.h:2332` / `:2352` / `:2460` to choose
-its orphan set and acquires the orphans later, and it collects up to
-`FT_MAX_DEPTH` of them.  Re-reading every body slot of every orphan under its
-mark is a different cost class from re-reading one word per boundary.  Is there
-a cheaper *lock* statement — e.g. climb-and-acquire in one pass, so each level
-is read only after its own mark is taken?  ★ Note that anything that grows the
-lock-set, rather than moving a read, costs liveness on the hottest op.
+**Q3 — the FIRST-ORPHAN exemption: position or identity?**  §3.2 narrows this
+a long way.  The orphan down-walk already acquires before it reads, so it needs
+no hoist; what it has instead is an exemption (`ft-remove.h:2853`) that lets the
+first orphan be collected *whatever* head it carries, on the grounds that the
+head there is the one the up-climb promoted.  The climb read that head
+**unlocked** (`:2609`); the walk holds the orphan's lock when it re-reads it
+(`:2838`).  So the question is whether to turn the exemption into the same
+INTENT comparison the chain compress now uses — tolerate a head on the first
+orphan only when it IS `topmost_external_nodes`, else stop the walk.
+
+★ It would cost one comparison, no acquire, and the disposition already exists
+(the walk simply `break`s, which is not a retry and cannot livelock).  ☐ Open:
+is `topmost_external_nodes` guaranteed to name the head promoted from *that*
+node, is an empty `to_free[]` a legal state for the caller, and do `:2481` /
+`:2501` need the same treatment or does the per-orphan lock already re-derive
+what they decide?
 
 **Q4 — Does this retire G4?**  G4 asks whether ordered cells and dup-chain
 splices keep a narrow MW lane or grow a state word, and the plan defers it to a
