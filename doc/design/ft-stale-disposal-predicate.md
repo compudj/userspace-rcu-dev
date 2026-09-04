@@ -425,6 +425,17 @@ MCAS would arbitrate it" describes the safety net being removed, not a design.
 (The state-word bit is also only half a fix — a bit meaning "has an external
 head" says nothing about which body slot holds what.)
 
+**☑ CONTRACT RULING (Mathieu, 2026-09-04) — the rule the disposition must obey:**
+
+> *"a remove may refuse if the key is not found, but should not refuse due to a
+> transient condition"*
+
+★ That settles Q1b(3) and it **rules out the fallback this brief proposed**:
+"concede `NOT_FOUND` after a bound" is refusing for a transient reason.  The
+terminal answer must be a fact about the TRIE — "the key is genuinely absent" —
+never a fact about CONTENTION.  So the disposition must keep working until it
+can make a true statement, which means it must **converge**, not give up.
+
 **Q1b — ☑ MOSTLY ANSWERED, by building it.**  The headline is settled and
 shipped; what is left is four named residuals, not a design choice.
 
