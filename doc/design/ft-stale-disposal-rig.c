@@ -51,6 +51,13 @@
  *      NOFREE=1  leak retired nodes instead of recycling them.  Set this for
  *                any pointer-level analysis: a reused malloc chunk makes a live
  *                node and a long-dead one read identically.
+ *                ☠ RUN BOTH ARMS.  It is also a BLIND SPOT: no address is ever
+ *                reused, so any defect whose mechanism needs a RECLAIMED node
+ *                cannot occur under it.  MEASURED: 160 seeds at NOFREE=1
+ *                produced ZERO kind-3 RM-WRONG-NODE; the same 160 at NOFREE=0
+ *                produced two.  It also suppresses the memory cost of a lane
+ *                that spins inside a read-side bracket, since leaking means
+ *                call_rcu never has a backlog to defer (memcg kills 2 -> 8).
  *      NOREM=1   insert only, never remove
  *      PFX=1     every churn key is a PROPER PREFIX of a stable key, so each
  *                insert/remove creates and destroys a PREFIX HEAD directly on
