@@ -945,6 +945,34 @@ run, with no memcg.  Both outcomes are decisive:
 It is a claim without an arm (no behaviour change), it is single-threaded, and
 it is the cheapest thing in this file that can move the question.
 
+##### ☠ AMENDED IMMEDIATELY: THAT FALSIFIER AS WRITTEN IS CIRCULAR
+
+`cds_ft_verify` already carries most of the predicate — `:484` and `:779` check
+`parent_word == expected_parent` against a TOP-DOWN walk, `:626` round-trips
+`parent_slot_offset`, `:908-926` checks that a slot holding `skip(cn)` is the
+very slot `cn` records — **but its skip path cannot see a stale skip edge,
+because it REACHES the skipped node through that edge**:
+`ft_resolve_skip_compressed` (`ft-helpers.h:2527`) is `ft_skip_to_compressed`,
+which reads the child's `prev` / `parent_word` (`:1850-1863`). Every fact the
+verifier then asserts about that compressed node is derived from the word it
+would have to validate. A walk cannot validate the edge it walks.
+
+★ **And the reason is structural, not an oversight.** `ft-compact.h:278-283`
+states it for the skip form: *"the skip pointer addresses the TARGET, so the
+child's back-reference redirect IS the lone structural edge publishing the
+relocation — a single atomic store, no two-step window."* In a SKIP_X dual
+**no forward word names the compressed node at all**; the child's back-edge is
+its publish edge, updated atomically by the producer. So for this shape
+"the back-edge is stale, trust the forward path instead" is not a repair —
+**there is no forward path to be authoritative**, and §5.3's framing needs
+restating in those terms.
+
+☞ A non-circular check therefore cannot be a walk. It has to compare each
+compressed node's own recorded `skip_slot` against that slot's CURRENT content,
+over an enumeration of compressed nodes obtained INDEPENDENTLY of the trie's
+edges (an allocator/arena inventory). Whether such an enumeration is available
+is the open question, and it is a design question, not a coding one.
+
 ---
 
 ## 6. What the fix must not break
