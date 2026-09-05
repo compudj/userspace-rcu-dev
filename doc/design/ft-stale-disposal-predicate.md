@@ -1440,9 +1440,26 @@ commits are all on standalone flip txns** -- there is no `create_on` /
 1, and every lap runs `exit_fallback` (`:784-791`), clears `domain->active`,
 unlocks the fair mutex and RE-QUEUES AT THE TAIL.  That is disposition A's
 measured failure (`:5255-5259`, "the failure is wall-clock and RSS, not attempt
-count") explained structurally.  ☞ **Any fix must either BIND its commits to
-the op handle so the turn is kept, or not retry.**  This single fact retires
-the termination story of A, F and this design at once.
+count") explained structurally.
+
+☞ ☠ **CORRECTED, by reading `rcu-txn.h` directly rather than trusting the
+skeptic's phrasing.**  The forfeit is DELIBERATE, and `rcu-txn.h:1225-1235`
+states the intent: *"Why a pre-commit retry must not keep the turn.  @retrying
+exists so that [a commit abort keeps the turn] ... begin() clears @retrying, and
+only the [commit path] keeps the turn ... while an attempt that never reached a
+commit [forfeits]."*  So the rule is NOT "remove can never keep its turn":
+
+* **A PRE-COMMIT BAIL FORFEITS THE TURN BY DESIGN; A COMMIT ABORT KEEPS IT.**
+* Remove's retries are ALL pre-commit bails, which is why A, F and the window
+  died the same way.
+* ★ **The escape route therefore EXISTS**: a refusal converted into a
+  COMMIT-TIME expected-old failure keeps the turn and re-attempts.
+* ☠ But BINDING is not that route: `ft-mutation-helpers.h:5831-5836` records it
+  MEASURED WORSE -- "median 9.5 starving removes against 4 for aging alone" --
+  because binding shares the op's descriptor and install lane.
+
+This retires the termination story of A, F and this design, and points the
+eighth disposition at the COMMIT rather than at a pre-commit window.
 
 **3. THE WINDOW NARROWS, IT DOES NOT CLOSE.**  The peer's conversion needs H's
 word only AT COMMIT (`ft-insert.h:2099-2102`, all-or-none
