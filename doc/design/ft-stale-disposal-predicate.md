@@ -975,6 +975,73 @@ is the open question, and it is a design question, not a coding one.
 
 ---
 
+### 5.7 ☠☠☠ IT REPRODUCES WITH SKIP-COMPRESSION COMPILED OUT — MORE, NOT LESS
+
+**Mathieu asked the question `CLAUDE.md` opens with and this file had never
+answered: does it still reproduce with the feature disabled?**  Nothing in §1-§5.6
+records a skip-off arm.  Run 2026-09-05, both arms at the same commit, on the
+same box, same 160 seeds, `CHK=1 WRITERS=2 ALPHA=2 MAXLEN=8 NSTABLE=100
+NCHURN=100 SECS=5 READERS=4 NOFREE=1`, 8 concurrent, each seed in its own 8G
+memcg.  Control `build-sfdisc`; arm `build-sfnoskip`, identical but for
+`-DNO_FEATURE_FT_SKIP_COMPRESSED`.  Proven disabled, not assumed:
+`nm liburcu-cds.so.8.2.0 | grep -c skip_reanchor` is 1 in the control and **0**
+in the arm.
+
+| oracle | skip ON | skip OFF |
+|---|---|---|
+| **RM-FAIL (defect 2)** | 47 | **74** |
+| RM-LOOKUP-MISS (defect 1) | 26 | 28 |
+| STALE-FOUND | 41 | 27 |
+| RM-WRONG-NODE | 0 | 0 |
+
+rc: control 103x134 / 41x139 / 9x124 / 7x137; arm 124x134 / 29x139 / 4x124 /
+3x137.
+
+★ **And it is the SAME population, not a lookalike.**  The `anctomb`
+discriminator holds in both arms: RM-FAIL carries `anctomb=-1` in **47/47** and
+**74/74**; RM-LOOKUP-MISS carries a tombstoned ancestor in 24/26 and 25/28.
+
+#### What this retires
+
+* ☠ **`ft_skip_reanchor`'s back-edge up-walk is NOT the mechanism of RM-FAIL.**
+  The function is not compiled into the arm that produces 74 of them.
+* ☠ **The SKIP_X-dual argument does not apply.**  With skip off, the parent's
+  slot names the compressed node DIRECTLY — the forward path to the holder
+  EXISTS — and the defect fires MORE.  "The holder is unnameable forward" cannot
+  be the cause of a failure that is worse when the holder is nameable forward.
+* ☠ **The retire-time namer detector of §5.6 is aimed at nothing**, and was
+  independently REFUTED on its own terms the same day: its singleton premise is
+  false (ordered-list cells, parked proxies and six writer-side ledgers also
+  name a `cn`); it false-positives on correct code at `ft-mutation-helpers.h:13851`,
+  which tombstones BEFORE the re-home by design (`:13861-13867`), and in the
+  top-down orphan loop at `ft-remove.h:692-704`; and `ft-remove.h:4484-4486`
+  frees a retired trailing `cn` by resolving it THROUGH the child's back-edge
+  after the tombstone, so the proposed invariant is the negation of a
+  load-bearing contract.
+* ☞ **§5.3 is not wrong, it is IRRELEVANT here.**  The up-walk does read
+  back-edges; that remains true and remains a hazard for other lanes.  It is not
+  what makes `cds_ft_remove` answer `NOT_FOUND` for a present key.
+
+#### Where the evidence now points
+
+The one thing common to both arms is that the holder is derived from
+`node->prev` (`ft-remove.h:5388`, `ft_node_holder`) and never re-validated
+before the identity compares.  What survives as a mechanism is a back-edge
+naming **a LIVE but WRONG node** — not a retired one: a non-retired sibling
+copy, an internal node, a node re-parented into a detached trie
+(`ft-detach.h:150`, `:546`), a dst-spine node that "stays reachable via the old
+dst spine until the forward publish" (`ft-mutation-helpers.h:13870-13877`), or a
+recycled address.  Every one of those mis-anchors identically with skip on or
+off, and none of them involves a compressed-node retire.  That is the next
+hypothesis, and it is testable the same way this was.
+
+☠ **A caveat on the counts.**  Run-to-run variance is large: the control arm
+here reads RM-FAIL 47 / STALE-FOUND 41 where §5.4's corpus, same commit and same
+workload, read 81 / 25.  Treat the ABSOLUTE numbers as noisy and the
+BETWEEN-ARM comparison and the discriminator ratios as the result.
+
+---
+
 ## 6. What the fix must not break
 
 * **Liveness — and ☠ SKIPPING IS NOT AN OPTION.**  Refutation (2) is the
