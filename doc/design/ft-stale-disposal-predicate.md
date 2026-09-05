@@ -1188,6 +1188,121 @@ says nothing directly about the supported per-node path.
 
 ---
 
+### 5.10 ★★★★★ ROOT CAUSE — A COARSE-LOCK PREMISE LEFT BEHIND BY THE FINE-LOCKING MIGRATION
+
+**In one sentence:** `_cds_ft_remove_locked` selects its arm from TWO UNLOCKED
+READS TAKEN IN DIFFERENT EPOCHS -- `node->prev` at `ft-remove.h:5388` and the
+holder's key-selected body slot at `:5972` -- under a comment that still asserts
+the FT-wide writer mutex is held; under fine locking a peer's IN-PLACE
+leaf-to-prefix-head conversion flips BOTH words between those two reads while
+retiring NOTHING, so the identity compare at `:5977` fails and the op answers
+`NOT_FOUND` for a key that is present throughout.
+
+#### The premise, still in the source
+
+`ft-remove.h:5354-5359`:
+
+> *"No top-down descent.  @node is application-owned and, with the RCU
+> read-side lock held continuously since it was obtained, stays alive;
+> **the writer mutex held here freezes the structure**, so node->prev is a
+> settled live pointer to the node's holder and the slot that holds @node can
+> be derived directly"*
+
+That was TRUE under `CDS_FT_WRITER_LOCK_COARSE`.  It is FALSE under the
+fine-grained DLM default, and the whole no-descent derivation rests on it.
+`ft_excl_writer_enter` (`fractal-trie-internal.h:3623-3660`) only bumps a
+counter when `lock_fine`; `ft_writer_lock_scope_enter` returns early at
+`:2735-2741` for `lock_fine` and reaches `cds_fair_mutex_lock(&ft->writer_lock)`
+only otherwise.  Between `:5388` and `:5977` the op holds **no word at all** --
+the per-node acquire happens inside `ft_detach_node`, AFTER the compare.
+
+#### The interleaving
+
+Victim key K owned by writer A; peer writer B owns K' = K + one more byte;
+H is K's holder with K in `H.body[b]`, b = K's last byte.
+
+1. B inserts K'.  Its descent breaks on the external leaf K with key bytes
+   remaining (`ft-insert.h:3064-3065`) and takes the "transform this external
+   node into an internal node with associated external node" branch (`:3366-3386`)
+   -> `ft_attach_node(..., &H.body[b], K, ..., external_nodes = K)`.
+2. B builds the new internal N invisibly with `N.external_nodes = K`
+   (`ft-insert.h:1943-1944`).  The publish is IN PLACE on the LIVE H: for a
+   displaced external no set_nth/reserve runs (`:2020-2022`); the slot edge
+   `H.body[b]: K -> N` is recorded under H's state word alone (`:2099-2113`),
+   and K's back-edge `cell->parent`/`prev`: `H -> N` is parked into the SAME
+   one-commit (`:2136-2141`, "must flip ATOMICALLY with the forward publish").
+   **Nothing is retired.  H keeps its identity and its tier.**
+3. A, still in the read section of its successful lookup, reads
+   `ft_node_holder(node)` at `:5388` BEFORE B's flip -> `holder_flag = H`.
+   `:5418` H is live, so no tombstone re-descent.  `:5434` per-node, so no
+   depth descent.  `ft_lock_ctx_init` at `:5535` acquires NOTHING.
+   `:5671-5705` does a cell capture and a `ft_flip_txn_create_bounded` malloc,
+   widening the window.
+4. B's MCAS commits: `H.body[b] = N` and `K.prev -> N`, atomically.
+5. A reaches the body arm, reads `ft_node_get_nth_skip(H, key[len-1])` at
+   `:5972` -- now N -- resolves the proxy, and `ft_node_ptr(N) != node` at
+   `:5977` -> `rmsite=5993`, `CDS_FT_STATUS_NOT_FOUND`.
+
+#### FOUR independent lines of evidence
+
+1. **The key-length signature.**  Across **450** RM-FAIL samples the victim key
+   is NEVER of length MAXLEN (8):
+
+   | victim key length | RM-FAIL | RM-LOOKUP-MISS (sibling defect, SAME runs, same key pool) |
+   |---|---|---|
+   | 5 | 49 | 2 |
+   | 6 | 235 | 33 |
+   | 7 | 166 | 40 |
+   | **8 = MAXLEN** | **0** | **95 (its LARGEST bucket)** |
+
+   A MAXLEN key cannot be EXTENDED, so it can never be converted into a prefix
+   head.  Length-8 keys are not rare -- they dominate the sibling defect in the
+   very same runs.  This is a PREDICTION of the mechanism, not a fit.
+2. **The `PFX=1` falsifier.**  With every churn key a proper prefix of a
+   permanent stable key, the path node always exists and the conversion cannot
+   occur, while two writers still churn under shared ancestors:
+   **0 / 48 seeds, all rc=0, 87.6 M churn ops** (1.83 M per run -- MORE work
+   than the control, so not a wrong zero) versus **20 / 48** in the control
+   arm at the same seeds.
+3. **The coarse arm** (§5.9): 0/160 over 156 M churn ops -- the exclusion the
+   premise assumes, restored.
+4. **The site stamp**: `rmsite=5993` (the body arm) in 324/329 classified
+   samples, `rmsite=5757` (its compressed twin) in the other 5.
+
+#### Why `anctomb = -1` in 281/281
+
+The conversion is an in-place slot replacement on the LIVE holder plus one NEW
+node.  Nothing on K's path is retired, so no ancestor is ever tombstoned -- and
+every tombstone-guarded recovery arm (`:5418`, `:5486-5508`) is bypassed by
+construction.  ☞ This also corrects `ft-remove.h:5552-5555`, whose
+`FT_RM_ACQUIRE_FIRST` rationale assumes the re-homer is "a holder copier" that
+"retires H in that same commit".  It is not, and `anctomb=-1` always said so.
+
+☠ **My own prime suspect was WRONG.**  I briefed tier promotion / holder COW as
+the likely edit.  It is impossible in this workload: the holder tag nibble is 1
+(smallest tier) in 329/329 samples, and with `ALPHA=2` an internal node never
+exceeds two body children.  The evidence eliminated my hypothesis, not the
+hypothesis the evidence.
+
+#### Confidence
+
+**High for the forward mechanism** (leaf -> prefix-head conversion), which the
+length signature and the `PFX=1` arm both single out.  **Moderate** for the
+mirror image -- a peer REMOVING K', collapsing N and hoisting K back into
+`H.body[b]` via `pub->head_parent_field` (`ft-mutation-node.h:940-968`) -- as
+the account of the 46/329 samples where `headis` is `other`/`null` rather than
+`node`.  Cheapest settling probe: stamp `holder_flag` and `*head_slot` beside
+`ft_dbg_rm_site` at `:5977`.
+
+☞ **THE SHAPE OF ANY FIX.**  The defect is not a missing validation to bolt on;
+it is a derivation whose stated precondition no longer holds.  Either the two
+reads must be made in ONE epoch (hold the holder's word across derive -> select
+-> compare), or the derivation must stop claiming a frozen structure.  Note
+that the previously-refuted dispositions A-E were all attempts to patch the
+CONSEQUENCE; this is the first statement of the CAUSE.
+
+---
+
 ## 6. What the fix must not break
 
 * **Liveness — and ☠ SKIPPING IS NOT AN OPTION.**  Refutation (2) is the
