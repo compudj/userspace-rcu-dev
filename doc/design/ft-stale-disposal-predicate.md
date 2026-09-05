@@ -1342,6 +1342,65 @@ proper EXTENSION of the key writer A is removing.
 
 ---
 
+### 5.12 ★★★★★ THE INTERLEAVING, CAPTURED — LTTng FLIGHT RECORDER
+
+§5.10 derived the mechanism from code plus statistics.  This is the mechanism
+OBSERVED, in one window, with nanosecond timestamps and per-CPU attribution.
+
+**Setup** (the standing methodology): `lttng create ftrd --snapshot`, one
+userspace channel at `--subbuf-size=64K --num-subbuf=4`, and events enabled BY
+HYPOTHESIS rather than `cds_ft:*` -- `remove_enter`, `attach_node_enter`,
+`tree_edge_set`, `set_parent`, `metadata_set_external_nodes`, `ext_violation`
+(all six confirmed enabled; a typo enables nothing silently).  The violation
+path already freezes, stops and snapshots before aborting (`ft_trace_capture`,
+`fractal-trie-trace.h:90`), so the window survives.  Reproducer: the §5.11 split
+arm -- `CHK=1 ROLES=1 WRITERS=2 READERS=0 ORD=0 ALPHA=2 MAXLEN=8 NSTABLE=100
+NCHURN=100 SECS=3 NOFREE=1 SEED=13`.  8,170 events captured.
+
+**The window.**  Victim `K = 0x7FA41C00D5C0` (key `"ababab"`, 6 bytes);
+old holder `H = 0x7FA42660BB21`; the fresh internal node `N = 0x7FA42660BBA1`;
+the peer's extending key `K' = 0x7FA41C00D620`.  Times are `14:27:45.618...`.
+
+| time | cpu | event |
+|---|---|---|
+| `083135` | 251 | `set_parent` child=**K** parent=**H** |
+| `083345` | 251 | `tree_edge_set` parent=**H** key_byte=`98 'b'` -- K sits in `H.body['b']` |
+| `090716` | 251 | **`attach_node_enter`** attach=**H** old_node=**K** level=6 -- the leaf->internal conversion |
+| `091177` | 251 | `set_parent` child=**K'** parent=**N** |
+| `091267` | 251 | `tree_edge_set` parent=**N** key_byte=`97 'a'` -- K' installed in N |
+| `091387` | 251 | **`metadata_set_external_nodes`** node=**N** external_nodes=**K** -- **K becomes N's PREFIX HEAD** |
+| `091547` | 251 | `set_parent` child=**N** parent=**H** |
+| **`092118`** | **71** | **`remove_enter`** key_len=6 key=`61 62 61 62 61 62` -- THE REMOVER ENTERS |
+| **`092128`** | **251** | **`tree_edge_set` parent=H key_byte=`98 'b'`** -> **`H.body['b'] = N`** |
+| `105999` | 71 | `ext_violation` node=**K** holder=**N** hext=**K** rmsite=6090 **anctomb=-1** |
+
+★★ **THE WINDOW IS TEN NANOSECONDS.**  The remover enters
+`_cds_ft_remove_locked` at `092118`; the peer's forward publish into the very
+slot it is about to read lands at `092128`.  The two-epoch gap of §5.10 is no
+longer an inference.
+
+**Every prediction confirmed, independently of the statistics:**
+
+* the peer's edit is `ft_attach_node` on the victim's own leaf
+  (`attach_node_enter old_node = K`) -- the conversion §5.10 named;
+* the inserted key is a ONE-BYTE EXTENSION of the victim (`K'` under N at byte
+  `'a'`, i.e. `"abababa"` extending `"ababab"`), which is why a MAXLEN victim
+  can never be hit (§5.10's key-length signature, 0 of 450);
+* `metadata_set_external_nodes(N, K)` is the in-place conversion of the victim
+  into a prefix head;
+* H keeps its identity and NOTHING is retired -- hence `anctomb=-1`, and hence
+  every tombstone-guarded recovery arm is bypassed;
+* at the abort a fresh holder read returns N, whose `external_nodes` IS the
+  victim: `hext == node`.
+
+☞ The trace was read the way the methodology prescribes: the violation is the
+last event; the events immediately before it are on a DIFFERENT cpu (251 vs
+71), which is the cross-thread interleaving no static reading could show; and
+grepping by the victim's and the holder's addresses across all CPUs in time
+order reconstructs the whole conversion.
+
+---
+
 ## 6. What the fix must not break
 
 * **Liveness — and ☠ SKIPPING IS NOT AN OPTION.**  Refutation (2) is the

@@ -94,6 +94,8 @@ static struct cds_ft *ft;
 static volatile int stop;
 static struct key *stable, *churn;
 static int norem = 0, chk = 0, nofree = 0;
+static int roles = 0;	/* ROLES=1: writer0 INSERTS ONLY, writer1 REMOVES ONLY */
+static int own = 1;	/* per-key single ownership holds (false under ROLES) */
 static int nstable = 200, nchurn = 200, alpha = 3, maxlen = 6, nreaders = 6, nwriters = 1, secs = 10, ord_walk = 1;
 static unsigned long transient, hardmiss, wrongid, reads, churn_ops, walks;
 static void alrm(int s){(void)s; _exit(11);}
@@ -214,21 +216,22 @@ static void *writer(void *a)
 	rcu_register_thread();
 	if (cds_ft_iter_create(ft,&it) != CDS_FT_STATUS_OK) _exit(5);
 	lo = id * (nchurn/nwriters); hi = (id==nwriters-1) ? nchurn : lo + nchurn/nwriters;
+	if (roles) { lo = 0; hi = nchurn; }	/* shared set; roles split the ops */
 	while (!stop) {
-		for (i = lo; i < hi && !stop; i++) {
+		for (i = lo; i < hi && !stop && !(roles && id != 0); i++) {
 			struct key *k = &churn[i];
 			enum cds_ft_status st;
 			rcu_read_lock();
 			if (chk) {
 				struct cds_ft_node *o = NULL;
 				enum cds_ft_status ls = cds_ft_eager_lookup_key(ft, k->b, k->len, 0, &o);
-				if (ls == CDS_FT_STATUS_OK && !k->present) {
+				if (own && ls == CDS_FT_STATUS_OK && !k->present) {
 					fprintf(stderr,"STALE-FOUND writer%d key=%.*s node=%p last_rm=%p same=%d next=%p\n",
 						id,(int)k->len,k->b,(void*)o,(void*)k->last_rm,o==k->last_rm,(void*)o->next);
 					VIOL(2, o, k->last_rm, k->b, k->len);
 					abort();
 				}
-				if (ls != CDS_FT_STATUS_OK && k->present) {
+				if (own && ls != CDS_FT_STATUS_OK && k->present) {
 					fprintf(stderr,"PRESENT-MISSING writer%d key=%.*s cur=%p\n",
 						id,(int)k->len,k->b,(void*)k->cur);
 					VIOL(5, k->cur, NULL, k->b, k->len);
@@ -238,7 +241,7 @@ static void *writer(void *a)
 			{ struct tnode *tn = na(k->tag);
 			  st = cds_ft_insert(ft, k->b, k->len, &tn->node);
 			  if (st != CDS_FT_STATUS_OK) free(tn);
-			  else { if (chk && k->present) { fprintf(stderr,"DUP-CHAINED writer%d key=%.*s\n",id,(int)k->len,k->b); VIOL(4, k->cur, NULL, k->b, k->len); abort(); }
+			  else { if (chk && own && k->present) { fprintf(stderr,"DUP-CHAINED writer%d key=%.*s\n",id,(int)k->len,k->b); VIOL(4, k->cur, NULL, k->b, k->len); abort(); }
 			         k->present = 1; k->cur = &tn->node; } }
 			rcu_read_unlock();
 			rcu_quiescent_state();
@@ -247,7 +250,7 @@ static void *writer(void *a)
 			__atomic_fetch_add(&churn_ops,1,__ATOMIC_RELAXED);
 			(void) rnd(&s);
 		}
-		for (i = lo; i < hi && !stop && !norem; i++) {
+		for (i = lo; i < hi && !stop && !norem && !(roles && id != 1); i++) {
 			struct key *k = &churn[i];
 			rcu_read_lock();
 			if (cds_ft_iter_set_key(it,k->b,k->len) == CDS_FT_STATUS_OK &&
@@ -255,7 +258,7 @@ static void *writer(void *a)
 				struct cds_ft_node *nd = cds_ft_iter_node(it);
 				enum cds_ft_status rs;
 
-				if (chk && nd != k->cur) { fprintf(stderr,"RM-WRONG-NODE writer%d key=%.*s nd=%p cur=%p\n",id,(int)k->len,k->b,(void*)nd,(void*)k->cur); VIOL(3, nd, k->cur, k->b, k->len); abort(); }
+				if (chk && own && nd != k->cur) { fprintf(stderr,"RM-WRONG-NODE writer%d key=%.*s nd=%p cur=%p\n",id,(int)k->len,k->b,(void*)nd,(void*)k->cur); VIOL(3, nd, k->cur, k->b, k->len); abort(); }
 				rs = cds_ft_remove(ft,it,nd);
 				if (rs == CDS_FT_STATUS_OK) {
 					k->present = 0; k->last_rm = nd; k->cur = NULL;
@@ -271,7 +274,7 @@ static void *writer(void *a)
 						call_rcu(&caa_container_of(nd,struct tnode,node)->rh,
 							tn_free);
 				} else if (chk) { fprintf(stderr,"RM-FAIL writer%d key=%.*s st=%s\n",id,(int)k->len,k->b,cds_ft_status_to_string(rs)); VIOL(1, nd, k->cur, k->b, k->len); abort(); }
-			} else if (chk && k->present) { fprintf(stderr,"RM-LOOKUP-MISS writer%d key=%.*s cur=%p\n",id,(int)k->len,k->b,(void*)k->cur); VIOL(0, k->cur, NULL, k->b, k->len); abort(); }
+			} else if (chk && own && k->present) { fprintf(stderr,"RM-LOOKUP-MISS writer%d key=%.*s cur=%p\n",id,(int)k->len,k->b,(void*)k->cur); VIOL(0, k->cur, NULL, k->b, k->len); abort(); }
 			rcu_read_unlock();
 			rcu_quiescent_state();
 			__atomic_fetch_add(&churn_ops,1,__ATOMIC_RELAXED);
@@ -313,6 +316,26 @@ int main(void)
 	nstable=geti("NSTABLE",200); nchurn=geti("NCHURN",200); alpha=geti("ALPHA",3);
 	maxlen=geti("MAXLEN",6); nreaders=geti("READERS",6); nwriters=geti("WRITERS",1);
 	secs=geti("SECS",10); ord_walk=geti("ORD",1); norem=geti("NOREM",0); chk=geti("CHK",0); nofree=geti("NOFREE",0);
+	/*
+	 * ROLES=1 SPLITS THE TWO OPERATIONS ACROSS THREADS: writer 0 only
+	 * inserts, writer 1 only removes, and BOTH cover the whole churn set.
+	 * They must SHARE the keys -- a pure inserter over a disjoint set
+	 * saturates, its inserts turning into DUPLICATE_FOUND that change no
+	 * structure -- so per-key single ownership is gone and every oracle that
+	 * depends on it (STALE-FOUND, PRESENT-MISSING, DUP-CHAINED,
+	 * RM-WRONG-NODE, RM-LOOKUP-MISS) is disarmed here.
+	 *
+	 * RM-FAIL stays armed because it needs NO ownership: a lookup that
+	 * returns OK followed by a remove of that very node answering NOT_FOUND,
+	 * inside ONE read section, is a contradiction whoever else touches the
+	 * key.
+	 */
+	roles = geti("ROLES",0);
+	own = !roles;
+	if (roles && nwriters != 2) {
+		fprintf(stderr,"ROLES=1 needs WRITERS=2 (0 inserts, 1 removes)\n");
+		_exit(5);
+	}
 	if (maxlen > MAXK) maxlen = MAXK;
 	s = (uint64_t)geti("SEED",1) * 6364136223846793005ULL + 1442695040888963407ULL;
 	rnd_state = s;
@@ -342,7 +365,7 @@ int main(void)
 		} else if (w && strcmp(w, "fine")) {
 			fprintf(stderr, "WRITER must be fine or coarse\n"); _exit(5);
 		}
-		fprintf(stderr, "ARM writer=%s spacing_env=%s\n",
+		fprintf(stderr, "ARM roles=%d writer=%s spacing_env=%s\n", roles,
 			(w && !strcmp(w, "coarse")) ? "coarse" : "fine",
 			sp ? sp : "unset(per-node)");
 	}
