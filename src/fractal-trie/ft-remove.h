@@ -4944,6 +4944,16 @@ int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 	return 0;
 }
 
+#ifdef FT_ENABLE_TRACING
+/*
+ * How often the chain arm's DERIVED holder had been re-homed between the
+ * unlocked ft_chain_head_holder walk and the acquire -- i.e. how often the
+ * re-derive below actually saves a LOST UPDATE.  A fix that never fires is not
+ * a fix; this counter is how that claim is checked.
+ */
+unsigned long ft_dbg_unchain_rehomed;
+#endif
+
 static
 int ft_unchain_node(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		struct cds_ft_inode_flag *parent_nf, unsigned int parent_depth,
@@ -5016,6 +5026,44 @@ int ft_unchain_node(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 			if (!h.shared) {
 				hmeta = h.lock;
 				hsnap = h.lock_snap;
+			}
+			/*
+			 * ★ RE-DERIVE AFTER THE ACQUIRE, for a DERIVED holder.
+			 *
+			 * @lock_nf came from ft_chain_head_holder (ft-helpers.h),
+			 * a walk of @node->prev, taken with NO exclusion held --
+			 * and a peer that inserts a key EXTENDING this chain's key
+			 * re-homes the head onto a fresh junction in one commit,
+			 * retiring nothing (ft-insert.h:2099-2141; the same edit
+			 * doc/design/ft-stale-disposal-predicate.md §5.10 roots the
+			 * bogus NOT_FOUND in).  Nothing below re-reads the holder,
+			 * and the commit "never touches holder->state", so a stale
+			 * @lock_nf is not arbitrated anywhere: this op and the next
+			 * chain op would hold DIFFERENT words and relink one chain.
+			 * The comment above already names the cost -- "once these
+			 * become sw it is a LOST UPDATE".
+			 *
+			 * The engine's own splice-holder acquire does exactly this
+			 * check (ft_glue_acquire_splice_holders,
+			 * ft-mutation-helpers.h:14748: "re-parented under us: stale
+			 * lock" -> -EAGAIN).  Mirrored here, INCLUDING its skip on a
+			 * @shared hold: a word the op already held was validated by
+			 * the acquire that took it, and re-testing it here would
+			 * refuse on an outer frame's still-correct derivation.
+			 *
+			 * Release only what THIS acquire took (@shared / @txn_owned
+			 * belong to another owner -- the predicate ft_unchain_node
+			 * already uses for @hmeta above and the remove wrapper uses
+			 * on its own exits).
+			 */
+			if (!parent_nf && !h.shared &&
+			    ft_chain_head_holder(ft, node) != lock_nf) {
+#ifdef FT_ENABLE_TRACING
+				uatomic_inc(&ft_dbg_unchain_rehomed);
+#endif
+				if (!h.txn_owned)
+					ft_meta_lock_release_if_held(h.lock);
+				return -EAGAIN;
 			}
 		}
 	}
