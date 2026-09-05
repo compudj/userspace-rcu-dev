@@ -626,6 +626,41 @@ liveness events (two `rc=124` timeouts, one `rc=137`).  ☞ So a candidate fix
 CAN now be measured: the metric is "RM-LOOKUP-MISS count with `anc_tomb >= 0`",
 and it does not need the reproducer to go green.
 
+### 5.2 ☠ BOTH DISPOSITIONS FOR DEFECT 2 ARE REFUTED BY MEASUREMENT
+
+The DIAGNOSIS is confirmed: an acquire-first hoist takes RM-FAIL from **11 of 20
+seeds to 1 of 20**.  The order inversion is the cause.  What has failed twice is
+the DISPOSITION.
+
+**A — plain retry (`*need_retry = true`).**  REFUTED: 5 of 20 seeds now time out
+or are killed by the 8G memcg.  The wrapper re-derives the same anchor and spins.
+It is also refused on contract: Mathieu's ruling is that *a remove may refuse if
+the key is not found, but must not refuse due to a transient condition*, and
+"retry N times, then concede NOT_FOUND" is exactly a transient refusal.
+
+**B — acquire the holder before planning** (`-DFT_RM_ACQUIRE_FIRST`, default OFF,
+`ft-remove.h` ~:5545).  REFUTED: `ft_inv` HANGS deterministically at test 44
+(`inv_insert_replace_splice_window`).  gdb on the hung process puts the spinning
+thread at `ft-remove.h:5608`, inside the hoist's own `ft_anchor_descend`.  The
+loop ALTERNATES: descend finds the LIVE holder, the acquire takes it, the
+validation asks `ft_node_holder(ft, node)` -- the BACK-POINTER -- which still
+names the RETIRED holder, so it mismatches, releases, re-aims at the dead word,
+is refused as a TOMBSTONE, descends again.
+
+★ **The lesson is one this file already carried.**  The STALE BACK-EDGE note at
+`ft-remove.h` ~:5081 documents this same livelock at 2,000,000+ consecutive
+attempts with 11 of 12 writers parked, and states the rule: *a tombstone is
+permanent, not contention*, and *the FORWARD path is authoritative*.  Disposition
+B obeys that rule in its REFUSAL arm and then breaks it in its VALIDATION arm.
+Any third disposition must not consult `node->prev` as an authority anywhere.
+
+☠ A contributing cause worth naming separately: `ft_acquire_member` folds three
+facts into one `-EAGAIN` -- a peer LOCK and a mid-flip PROXY (both transient) and
+a TOMBSTONE (permanent).  A caller that cannot tell them apart cannot write a
+terminating loop.
+
+---
+
 ---
 
 ## 6. What the fix must not break
