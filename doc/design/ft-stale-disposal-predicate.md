@@ -1303,6 +1303,45 @@ CONSEQUENCE; this is the first statement of the CAUSE.
 
 ---
 
+### 5.11 ☑ THE MINIMAL OPERATION SET — TWO WRITERS, INSERT + REMOVE, NOTHING ELSE
+
+Which concurrent operations are actually required?  80 seeds per arm, same
+build and workload as §5.9 (`CHK=1 ALPHA=2 MAXLEN=8 NSTABLE=100 NCHURN=100
+SECS=3 NOFREE=1`), one variable changed at a time.
+
+★ **No bulk operation is involved at all**: the rig issues NONE (`grep -c bulk`
+= 0).  Its entire API surface is `cds_ft_insert`, `cds_ft_lookup` /
+`cds_ft_iter_*`, `cds_ft_remove` on the writers, and `cds_ft_eager_lookup_key`
+plus a 1-in-16 ordered walk (`cds_ft_lookup_first` / `cds_ft_next`) on the
+readers.
+
+| arm | configuration | RM-FAIL | RM-LOOKUP-MISS | STALE-FOUND | rc |
+|---|---|---|---|---|---|
+| A | 2 writers, 4 readers, walk | 23 | 9 | 20 | 48 abort, 25 SEGV, 4 memcg, 3 timeout |
+| **B** | **2 writers, NO readers** | **35** | 15 | 13 | 58 abort, 15 SEGV, 7 timeout |
+| C | 2 writers, 4 readers, NO walk | 34 | 14 | 11 | 53 abort, 23 SEGV |
+| **D** | **1 writer**, 4 readers, walk | **0** | **0** | **0** | **80 x rc=0** |
+
+**THE MINIMAL SET IS TWO CONCURRENT WRITERS DOING ONLY INSERT AND REMOVE, ON
+DISJOINT KEYS.**
+
+* **Readers are not needed.**  Arm B removes them entirely and reproduces MORE
+  (35 vs 23) -- readers were merely slowing the writers down.  This also
+  re-confirms §5.9 from the other side: the defect is not reader/writer.
+* **The ordered walk is not needed** (arm C).
+* **A bulk op is not needed**, and cannot be: none is issued.
+* **One writer is clean**, 80/80 rc=0, with readers and walks still running.
+
+☞ **WHY THIS MATTERS FOR THE FIX.**  A targeted regression test needs no
+reader threads, no ordered list traffic, no bulk lane and no third operation:
+two threads, `insert` then `remove` of their own partitioned keys, is the whole
+reproducer.  Combined with §5.10's key-length signature -- the victim key must
+be EXTENDABLE, i.e. shorter than MAXLEN -- and the `PFX=1` result, a
+deterministic two-thread unit case is now specifiable: writer B inserts a
+proper EXTENSION of the key writer A is removing.
+
+---
+
 ## 6. What the fix must not break
 
 * **Liveness — and ☠ SKIPPING IS NOT AN OPTION.**  Refutation (2) is the
