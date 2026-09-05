@@ -65,6 +65,13 @@
  *                AND a library built with -DFEATURE_FT_LOCK_SPACING_ENV.  The
  *                rig echoes an "ARM writer=... spacing_env=..." line so a
  *                mislabelled arm is visible instead of silently per-node.
+ *      DETERM=1  the two-key DETERMINISTIC case (§5.10/§5.12): writer 1 owns
+ *                the victim "ab", writer 0 owns its one-byte extension "aba",
+ *                so the leaf->prefix-head conversion that causes RM-FAIL is
+ *                built rather than waited for.  Pair with a -DFT_DELAY_INJECT
+ *                library and FT_DELAY_MODE=writer FT_DELAY_US=N to make it
+ *                fire every time.  Needs WRITERS=2; all oracles stay armed
+ *                (one key per writer, so ownership is intact).
  *      NOREM=1   insert only, never remove
  *      PFX=1     every churn key is a PROPER PREFIX of a stable key, so each
  *                insert/remove creates and destroys a PREFIX HEAD directly on
@@ -95,6 +102,7 @@ static volatile int stop;
 static struct key *stable, *churn;
 static int norem = 0, chk = 0, nofree = 0;
 static int roles = 0;	/* ROLES=1: writer0 INSERTS ONLY, writer1 REMOVES ONLY */
+static int determ = 0;	/* DETERM=1: the two-key deterministic RM-FAIL case */
 static int own = 1;	/* per-key single ownership holds (false under ROLES) */
 static int nstable = 200, nchurn = 200, alpha = 3, maxlen = 6, nreaders = 6, nwriters = 1, secs = 10, ord_walk = 1;
 static unsigned long transient, hardmiss, wrongid, reads, churn_ops, walks;
@@ -217,6 +225,7 @@ static void *writer(void *a)
 	if (cds_ft_iter_create(ft,&it) != CDS_FT_STATUS_OK) _exit(5);
 	lo = id * (nchurn/nwriters); hi = (id==nwriters-1) ? nchurn : lo + nchurn/nwriters;
 	if (roles) { lo = 0; hi = nchurn; }	/* shared set; roles split the ops */
+	if (determ) { lo = (id == 0) ? 1 : 0; hi = lo + 1; }	/* w0 extends, w1 is the victim */
 	while (!stop) {
 		for (i = lo; i < hi && !stop && !(roles && id != 0); i++) {
 			struct key *k = &churn[i];
@@ -330,7 +339,38 @@ int main(void)
 	 * inside ONE read section, is a contradiction whoever else touches the
 	 * key.
 	 */
+	/*
+	 * DETERM=1 -- THE DETERMINISTIC CASE, from §5.10/§5.12.
+	 *
+	 * The defect needs exactly two things: a victim key that is EXTENDABLE,
+	 * and a peer inserting a ONE-BYTE EXTENSION of it while the remover sits
+	 * between its two reads.  The statistical rig finds that by chance (53 of
+	 * 80 seeds, minutes); this builds it directly:
+	 *
+	 *   churn[0] = "ab"   the VICTIM, owned by writer 1 (insert/lookup/remove)
+	 *   churn[1] = "aba"  the EXTENSION, owned by writer 0 (insert/remove)
+	 *
+	 * Writer 0's insert of "aba" converts "ab"'s leaf into a PREFIX HEAD in
+	 * place on the live holder.  Pair this with a library built
+	 * -DFT_DELAY_INJECT and run with FT_DELAY_MODE=writer FT_DELAY_US=N: the
+	 * hook in _cds_ft_remove_locked sits exactly at the epoch boundary, so
+	 * the conversion lands INSIDE the remover's window every time and RM-FAIL
+	 * fires in milliseconds instead of minutes.
+	 *
+	 * Ownership is intact here (one key per writer), so EVERY oracle stays
+	 * armed -- unlike ROLES=1, which shares the set and disarms the
+	 * ownership-dependent ones.
+	 */
+	determ = geti("DETERM",0);
+	if (determ && nwriters != 2) {
+		fprintf(stderr,"DETERM=1 needs WRITERS=2 (0 extends, 1 is the victim)\n");
+		_exit(5);
+	}
 	roles = geti("ROLES",0);
+	if (determ && roles) {
+		fprintf(stderr,"DETERM=1 and ROLES=1 are alternative writer layouts\n");
+		_exit(5);
+	}
 	own = !roles;
 	if (roles && nwriters != 2) {
 		fprintf(stderr,"ROLES=1 needs WRITERS=2 (0 inserts, 1 removes)\n");
@@ -365,7 +405,7 @@ int main(void)
 		} else if (w && strcmp(w, "fine")) {
 			fprintf(stderr, "WRITER must be fine or coarse\n"); _exit(5);
 		}
-		fprintf(stderr, "ARM roles=%d writer=%s spacing_env=%s\n", roles,
+		fprintf(stderr, "ARM roles=%d determ=%d writer=%s spacing_env=%s\n", roles, determ,
 			(w && !strcmp(w, "coarse")) ? "coarse" : "fine",
 			sp ? sp : "unset(per-node)");
 	}
@@ -376,7 +416,15 @@ int main(void)
 	stable = calloc((size_t)nstable,sizeof(*stable));
 	churn  = calloc((size_t)nchurn,sizeof(*churn));
 	mkkeys(stable,nstable,NULL,0,&s);
-	if (geti("PFX",0)) {
+	if (determ) {
+		/* churn[0] = victim "ab"; churn[1] = its one-byte extension "aba". */
+		nchurn = 2;
+		memset(churn, 0, 2 * sizeof(*churn));
+		churn[0].b[0] = 'a'; churn[0].b[1] = 'b'; churn[0].len = 2;
+		churn[0].tag = 0xdeadbeefULL;
+		churn[1].b[0] = 'a'; churn[1].b[1] = 'b'; churn[1].b[2] = 'a';
+		churn[1].len = 3; churn[1].tag = 0xfeedfaceULL;
+	} else if (geti("PFX",0)) {
 		/*
 		 * PREFIX mode: every churn key is a PROPER PREFIX of a stable
 		 * key, so each insert/remove creates and destroys a PREFIX HEAD

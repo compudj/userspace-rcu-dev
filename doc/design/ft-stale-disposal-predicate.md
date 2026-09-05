@@ -1546,6 +1546,56 @@ act is only as good as the act's own validation.
 
 ---
 
+### 5.14 ☑ THE FAST REPRODUCER — TWO KEYS, TWO THREADS, 253 ms
+
+Seven dispositions have died partly for want of a cheap falsifier: the only
+reproducer was statistical (80 seeds x 5 s, 53 hits), and its failures were
+entangled with SEGVs and memcg kills.  §5.10 and §5.12 specify a much smaller
+one, so the rig gained `DETERM=1`:
+
+    churn[0] = "ab"    the VICTIM,    owned by writer 1 (insert / lookup / remove)
+    churn[1] = "aba"   the EXTENSION, owned by writer 0 (insert / remove)
+
+Two writers, ONE key each, no readers, no ordered walk, no bulk lane, 10 stable
+keys.  Ownership is intact (one key per writer), so unlike `ROLES=1` **every
+oracle stays armed**.
+
+| reproducer | hit rate | time per attempt | trie |
+|---|---|---|---|
+| the §5.4 corpus | 53 / 80 seeds | ~5 s | 200 keys |
+| **`DETERM=1`** | **13 / 20** | **253 ms mean** | **2 churn keys** |
+
+Same hit rate (66% vs 65%), **20x faster**, on a trie small enough to reason
+about.  Five runs give >99% detection in ~1.3 s.  The signature is the expected
+one: `RM-FAIL writer1 key=ab`, `rmsite=6146` (the body arm), `anctomb=-1`,
+`headis=node`, `hext == node`.
+
+☞ It is FAST-PROBABILISTIC, not deterministic.  Do not put it in `ft_unit` /
+`ft_inv` as-is; it would be flaky.  It is a FALSIFIER for fix work, and it is
+the shape the eventual regression test should take once a fix makes it green.
+
+★ A second oracle fires here too: `RM-FAIL writer0 key=aba`, i.e. the EXTENSION
+key is also a victim -- inserting `"ab"` while `"aba"` exists creates the
+junction the same way.  The defect is symmetric in the pair.
+
+#### ☠ AND A NEGATIVE RESULT: DELAY INJECTION MAKES IT WORSE
+
+A `ft_delay_writer()` hook was added at the epoch boundary in
+`_cds_ft_remove_locked` (byte-neutral without `-DFT_DELAY_INJECT`), on the
+theory that widening a 10 ns window would make the case deterministic.  It does
+the opposite:
+
+    no delay        13/20      FT_DELAY_US=5     5/10
+    FT_DELAY_US=1    6/10      FT_DELAY_US=20    5/10
+                              FT_DELAY_US=200    3/5
+
+**The race is SELF-HEALING under a long enough delay**: the peer's insert of the
+extension AND its own removal both fit inside the sleep, so the holder's slot is
+back to `@node` by the time the compare runs.  The hook is kept with these
+numbers at the site so the next reader does not repeat the experiment.
+
+---
+
 ## 6. What the fix must not break
 
 * **Liveness — and ☠ SKIPPING IS NOT AN OPTION.**  Refutation (2) is the

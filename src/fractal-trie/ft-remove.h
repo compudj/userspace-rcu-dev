@@ -5792,6 +5792,41 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 #endif
 
 	/*
+	 * ★ DERIVE -> SELECT -> COMPARE window (-DFT_DELAY_INJECT only; a no-op
+	 * in every shipping build, fractal-trie-internal.h:4236).
+	 *
+	 * @holder_flag is now fully derived and NOTHING is held.  Every word the
+	 * four arms below read -- the cell capture, the kind dispatch and the two
+	 * identity compares -- belongs to that holder, and a peer INSERT of a key
+	 * that EXTENDS @node's converts @node's leaf into a PREFIX HEAD in place
+	 * on it, flipping the holder's slot and @node's back-edge in one commit
+	 * while retiring nothing (doc/design/ft-stale-disposal-predicate.md
+	 * §5.10).  Measured on the wire, that window is TEN NANOSECONDS wide
+	 * (§5.12), which is why the defect needs 80 seeds of a concurrent rig to
+	 * show up 53 times.
+	 *
+	 * Placed AFTER the whole derivation and BEFORE the first read of a
+	 * holder-owned word, i.e. exactly at the epoch boundary the defect
+	 * straddles.
+	 *
+	 * ☠ MEASURED NOT TO HELP FOR THIS DEFECT, recorded so the next reader
+	 * does not repeat it.  Against the rig's DETERM=1 case, 10 seeds each:
+	 *
+	 *     no delay        13/20 fired, mean 253 ms
+	 *     FT_DELAY_US=1    6/10
+	 *     FT_DELAY_US=5    5/10
+	 *     FT_DELAY_US=20   5/10
+	 *     FT_DELAY_US=200  3/5, two runs clean for a full 10 s
+	 *
+	 * Widening the window makes it WORSE, and the reason is instructive: the
+	 * peer's insert of the extension and its own removal both fit inside a
+	 * sleep, so the holder's slot is back to @node by the time the compare
+	 * runs.  The race is self-healing under a long enough delay.  What buys
+	 * the speed is the KEY SHAPE (DETERM=1), not the timing.
+	 */
+	ft_delay_writer();
+
+	/*
 	 * Cell-always: @node heads its chain iff its prev is the cell (not an
 	 * external predecessor).  Capture the head's cell + successor BEFORE the
 	 * unlink: a head promotion retargets the cell at the successor (done in
