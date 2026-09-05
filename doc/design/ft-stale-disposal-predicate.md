@@ -726,8 +726,17 @@ your build tree rather than an installed `liburcu`.  Its header documents the
 six `CHK=1` writer oracles and every env knob.  ☞ The counts in §3 and §5 were
 taken with it; without it in the tree they could not be re-derived.
 
+☠ **`CHK=1` NEEDS `-DFT_ENABLE_TRACING` IN THE LIBRARY.**  The hook, the
+`ft_dbg_*` counters and the rm-site stamp are one subsystem behind that flag,
+and the rig reaches the hook by a WEAK reference -- so against a default build
+it resolves to NULL and every violation is classified as nothing, silently.
+MEASURED: a 120-seed sweep against `build-pfxbit` fired 42 writer oracles and
+produced ZERO discriminator lines.  The rig now refuses to start rather than
+report that zero.  An LTTng session is NOT needed for the stderr classifier --
+only the build flag is.
+
 ```sh
-# the rig itself (no tracing needed for the CHK oracles)
+# the rig itself (the stderr classifier needs no LTTng session, only the flag)
 gcc -O0 -g -I<top>/include -I<build>/include -I<top>/src -I<top> \
     doc/design/ft-stale-disposal-rig.c -o /tmp/ftrig \
     -L<build>/src/.libs -lurcu-qsbr -lurcu-cds -lurcu-common \

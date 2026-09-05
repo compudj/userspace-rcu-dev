@@ -5,6 +5,15 @@
  * NOT BUILT.  It is not in any _SOURCES and the build system never sees it.
  * It is kept in the tree because §5 of that document reports MEASURED counts,
  * and a measured table whose workload is not in the tree cannot be re-derived.
+ * ☠ THE LIBRARY MUST BE BUILT WITH -DFT_ENABLE_TRACING for CHK=1 to mean
+ * anything.  The violation hook, the ft_dbg_* counters and the rm-site stamp
+ * are one subsystem behind that flag; without it the weak reference below is
+ * NULL and every violation is recorded SILENTLY as nothing.  An LTTng session
+ * is NOT required -- the classifier prints to stderr -- only the build flag is.
+ * The rig refuses to start in that configuration rather than hand back a wrong
+ * zero, but the refusal only exists because a 120-seed sweep already produced
+ * one: 42 oracles fired, 0 discriminator lines.
+ *
  * Build it by hand against a configured tree -- never against an installed
  * liburcu, which would silently shadow the tree you meant to test:
  *
@@ -266,6 +275,26 @@ int main(void)
 	struct cds_ft_group *g; struct cds_ft_group_attr *at = NULL;
 	pthread_t *rt, *wt; int i;
 	uint64_t s;
+
+	/*
+	 * ☠ THE HOOK IS WEAK, SO ITS ABSENCE IS SILENT.  cds_ft_debug_ext_violation
+	 * lives behind FT_ENABLE_TRACING together with the ft_dbg_* counters and
+	 * the rm-site stamp it prints; against a library built without that flag
+	 * the weak reference resolves to NULL and every VIOL() below is skipped
+	 * with no diagnostic at all.  MEASURED: a 120-seed sweep against a default
+	 * build fired 42 writer oracles and produced ZERO discriminator lines.
+	 * The oracles still abort, so the run LOOKS like it worked -- you just get
+	 * no anctomb/ancroot, which is the only thing that separates the two
+	 * defects.  Refuse to start rather than hand back a wrong zero.
+	 */
+	if (geti("CHK",0) && !cds_ft_debug_ext_violation) {
+		fprintf(stderr,
+			"CHK=1 but cds_ft_debug_ext_violation is absent: this library "
+			"was built WITHOUT -DFT_ENABLE_TRACING, so no violation would "
+			"be classified.  Rebuild the library with it (an LTTng session "
+			"is NOT required -- the classifier prints to stderr).\n");
+		_exit(7);
+	}
 
 	nstable=geti("NSTABLE",200); nchurn=geti("NCHURN",200); alpha=geti("ALPHA",3);
 	maxlen=geti("MAXLEN",6); nreaders=geti("READERS",6); nwriters=geti("WRITERS",1);
