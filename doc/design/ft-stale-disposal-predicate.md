@@ -1770,6 +1770,63 @@ produced a wrong first reading here.
 
 ---
 
+### 5.17 ☑ THE SEGV LANE SPLITS IN TWO — ONE SITE FIXED, THE OTHER NAMED
+
+The rc=139 lane has been unaccounted since §5.4 and now GATES the one
+disposition that works (§5.16).  §5.9 already said it is writer-writer and
+cured by coarse writers.  With the two-key reproducer it is cheap to sample:
+`CHK=0 DETERM=1 WRITERS=2 READERS=0 ORD=0 NSTABLE=10 SECS=2 NOFREE=0`, ~2 s per
+seed, under `gdb -batch -ex run -ex bt`.
+
+**FIVE backtraces, TWO clusters:**
+
+| cluster | n | crash |
+|---|---|---|
+| **A** | 3/5 | `urcu_txn_install_mw_depth` `rcu-txn-mcas.h:566` <- `urcu_txn_desc_commit:1200` <- `ft_flip_txn_commit` |
+| **B** | 2/5 | `cds_ft_item_to_metadata` <- `ft_flag_to_metadata` <- **`ft_detach_node` `ft-remove.h:2304`** |
+
+#### ☑ CLUSTER B — ROOT-CAUSED AND FIXED: a RAW slot read that skips the flip-proxy resolve
+
+`ft_detach_node`'s `free_detached_subtree` block loads its slot RAW
+(`detach_child = *detach_node_flag_ptr`), resolves ONLY skip-compression, and
+then calls `ft_flag_to_metadata` on the result.  A concurrent one-commit splice
+parks a type-7 MCAS DESCRIPTOR in that slot; its low nibble 0xF fails
+`ft_node_external`, so the type check admits it and the metadata address is
+computed from a descriptor pointer.
+
+★ **Both neighbours already knew.**  The comment on the very next statement
+says *"the SKIP_X form dispatches the 0xF flag as a node (ft_node_external
+fails -> item_to_metadata FAULTS)"* -- but it guards `child_meta->external_nodes`,
+not `detach_child` itself.  And the sibling parent-slot read twenty lines below
+says a raw load *"feeds that proxy to cds_ft_item_to_metadata() ... and FAULTS.
+Resolve it exactly as cds_ft_remove does"*, then does
+`ft_reanchor_flag(ft, ft_resolve_flip_proxy(raw), ...)`.  One slot is guarded
+because a raw load faults; the other was not.
+
+**The fix is the documented RESOLVE-THEN-SKIP order** (`ft-helpers.h:1870`):
+`ft_resolve_skip_compressed(ft, ft_resolve_flip_proxy(detach_child))`.  Sound
+because `@detach_child` is only ever DEREFERENCED here, never a CAS
+expected-old -- the same argument the sibling read makes for `@cur`.
+
+**VERIFIED BY THE CRASH SITE MOVING.**  Seeds 10 and 12 crashed in cluster B
+before the fix and in cluster A after it; all 6 re-sampled backtraces are now
+cluster A.  ☠ **The rc=139 RATE IS UNCHANGED (10/30)** -- cluster A dominates,
+and the runs that used to die at B now reach A.  Do not read this as a liveness
+or stability win; it removes one fault SITE, proven by relocation, not a fault
+RATE.  Suites green with it in: ft_unit 331/331, ft_inv 128/128 x3.
+
+#### ☞ CLUSTER A IS THE REMAINING LANE, and it is precisely located
+
+`rcu-txn-mcas.h:566` is `v = uatomic_load(r->slot, CMM_ACQUIRE)` -- the crash is
+on **the RECORD'S OWN SLOT POINTER**, inside the engine's MW install, reached
+from `ft_flip_txn_commit`.  So a committed descriptor is carrying a slot address
+that is not mapped: a record planted against a word that has since been freed,
+or a descriptor reused/torn.  It reproduces at 10/30 seeds, 2 s each, on a
+two-key trie -- by far the cheapest engine-level bug this file has ever had --
+and it is now the gate on §5.16.
+
+---
+
 ## 6. What the fix must not break
 
 * **Liveness — and ☠ SKIPPING IS NOT AN OPTION.**  Refutation (2) is the

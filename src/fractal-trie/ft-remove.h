@@ -2292,12 +2292,37 @@ int ft_detach_node(struct cds_ft *ft,
 		struct cds_ft_inode_flag *detach_child = *detach_node_flag_ptr;
 
 		/*
-		 * Resolve skip-compressed before type checks: a skip
-		 * pointer with an external child has low bits == 0,
+		 * RESOLVE-THEN-SKIP, in that order (ft-helpers.h:1870, and the
+		 * entry-holder read below at :2373 does exactly this:
+		 * ft_reanchor_flag(ft, ft_resolve_flip_proxy(raw), ...)).
+		 *
+		 * ☠ THE FLIP-PROXY HALF WAS MISSING HERE, AND IT FAULTS.  This
+		 * slot is loaded RAW above, and a concurrent one-commit splice
+		 * parks a type-7 MCAS descriptor in it; the low nibble 0xF then
+		 * fails ft_node_external, so the type check below admits it and
+		 * ft_flag_to_metadata computes a metadata address from a
+		 * DESCRIPTOR pointer.  The comment on the very next statement
+		 * already names that outcome -- "the SKIP_X form dispatches the
+		 * 0xF flag as a node (ft_node_external fails -> item_to_metadata
+		 * faults)" -- and the sibling parent-slot read twenty lines down
+		 * says a raw load "feeds that proxy to cds_ft_item_to_metadata()
+		 * ... and faults".  Both guard their slot; this one did not, and
+		 * it is a measured SEGV site: 2 of 5 sampled rc=139 backtraces
+		 * crash at the ft_flag_to_metadata below
+		 * (doc/design/ft-stale-disposal-predicate.md §5.17).
+		 *
+		 * Skip-compressed must still be resolved before the type checks:
+		 * a skip pointer with an external child has low bits == 0,
 		 * falsely matching ft_node_external and skipping the
 		 * external_nodes preservation entirely.
+		 *
+		 * Sound to resolve: @detach_child is only ever DEREFERENCED here
+		 * (its metadata read for external_nodes preservation), never used
+		 * as a CAS expected-old -- the same argument the entry-holder
+		 * read below makes for @cur.
 		 */
-		detach_child = ft_resolve_skip_compressed(ft, detach_child);
+		detach_child = ft_resolve_skip_compressed(ft,
+			ft_resolve_flip_proxy(detach_child));
 
 		if (detach_child && !ft_node_external(detach_child)) {
 			struct cds_ft_metadata *child_meta =
