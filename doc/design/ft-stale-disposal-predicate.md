@@ -1401,6 +1401,134 @@ order reconstructs the whole conversion.
 
 ---
 
+### 5.13 ☠☠☠ THE SELECTION-WINDOW DESIGN — REFUTED 3/3, AND WHAT THE THREE AGREE ON
+
+The seventh disposition.  Designed after §5.12, put to three adversarial
+skeptics (exclusion / termination+peer-progress / arm-side+blast-radius).
+**All three refuted.**  Do not build it.
+
+**The design.**  A bounded SELECTION WINDOW in `_cds_ft_remove_locked`: derive
+candidate holder H from `node->prev` (or by descent when that holder is
+tombstoned), take H's own state word via `ft_acquire_member`, do ONLY LOADS
+under it (re-check removed, select the arm, read H's key-selected word, compare
+to `@node`), release with a bare CAS BEFORE any allocation / txn / arm /
+commit, never publish into `@lctx`.  Then thread the decided value into the
+arm's slot EXPECTED-OLD so a later peer move is an ABORT, not silent adoption.
+
+#### ★★★ THE THREE CONVERGENT FINDINGS — these outlive the design
+
+**1. `node->prev` CANNOT be a derivation source in any loop that also
+descends.**  The file's own measured fact, `ft-remove.h:5403-5407`: a
+back-pointer is updated LAZILY, so a peer that replaced the holder leaves
+`node->prev` naming the RETIRED one while the forward path resolves `@node`
+correctly -- **78%** of tombstone-arm entries.  Any design that derives from
+`prev` and validates/re-aims by DESCENT alternates between the two answers.
+Disposition B died on exactly this; F plausibly did; and this design does too:
+its lap T fires on "the fresh prev is dead -> re-descend", so descent yields
+live H', the hold reads `prev` = dead H, T fires again -- **forever, every lap
+charged to the SAME retire commit.**  ☞ THE RULE: derive by ONE authority, and
+never consult the other inside the same loop.
+
+**2. ☠☠ REMOVE CANNOT USE `need_retry` AS A CONVERGENCE MECHANISM AT ALL.**
+The FIFO-lane argument that every retry-based disposition here has leaned on is
+CIRCULAR for this op.  `urcu_txn_conflict` only bumps `retry`
+(`rcu-txn.h:1239-1243`); the lane turn is KEPT only while `retrying == 1`
+(`:1225-1236`, `urcu_txn_end:1272-1273`), which is cleared at every `begin`
+(`:822`) and set only by commit paths of the txn's OWN handle.  **Remove's
+commits are all on standalone flip txns** -- there is no `create_on` /
+`create_bounded_on` anywhere in `ft-remove.h` -- so `optxn->retrying` is NEVER
+1, and every lap runs `exit_fallback` (`:784-791`), clears `domain->active`,
+unlocks the fair mutex and RE-QUEUES AT THE TAIL.  That is disposition A's
+measured failure (`:5255-5259`, "the failure is wall-clock and RSS, not attempt
+count") explained structurally.  ☞ **Any fix must either BIND its commits to
+the op handle so the turn is kept, or not retry.**  This single fact retires
+the termination story of A, F and this design at once.
+
+**3. THE WINDOW NARROWS, IT DOES NOT CLOSE.**  The peer's conversion needs H's
+word only AT COMMIT (`ft-insert.h:2099-2102`, all-or-none
+`ft-mutation-helpers.h:7967-7984`), so it is refused during the window and
+succeeds THE INSTANT THE RELEASE LANDS -- and the arm acts after that release.
+The design's answer was the expected-old threading, and that is refuted
+separately (below).  A decision made under a lock that is dropped before the
+act is only as good as the act's own validation.
+
+#### The per-skeptic refutations
+
+* **Exclusion (P1/P2).**  P1 (every writer of H's slots takes or guards H's
+  word) SURVIVED for H's body slots under enumeration.  **P2 is FALSE as a code
+  invariant** -- the recompact UNFENCED arm (`ft-mutation-node.h:1417-1423`)
+  fences only when `retire_txn && !cluster_leaf` and plain-stores live
+  children's back-edges (`ft-helpers.h:3191/3193`, `:1574/1576`); "copies only
+  build-invisible nodes" is asserted in comments (`:2098-2100`), never enforced.
+  ☠ And the gate `!ft_node_external(cand)` **leaves a second copy of the defect
+  unfixed**: the chain arm at `ft-remove.h:4974-5008` derives
+  `ft_chain_head_holder` (an unlocked prev walk), acquires it at `:5005`, and
+  commits at `:5050-5062` with NO re-derivation -- while
+  `ft-mutation-helpers.h:14748` already does re-check
+  `ft_chain_head_holder(...) != hf` after acquiring.  The site's own comment
+  (`:4983-4985`) calls the result a LOST UPDATE.
+  ☠ The BARE RELEASE is unsafe: `ft_dlm_acquire_set_at` DEDUPES when the ctx
+  already holds H (`:5933-5945`, `held.shared = true`, nothing taken), so a bare
+  release clears a bit owned by an outer frame.  `ft_unchain_node` guards this
+  (`ft-remove.h:5016`, `if (!h.shared)`); the design does not.
+* **Termination / peer progress.**  Beyond finding 1: lap T's premise ("unlink
+  and tombstone are one commit") is FALSE for at least four retire paths, and
+  `ft-compact.h:299` places the tombstone **explicitly AFTER the unlink** -- so
+  there is a window where a node is unlinked but its state word is CLEAN, the
+  acquire SUCCEEDS, `fresh == cand`, the dead node's slot still names `@node`,
+  and the compare PASSES.  **The window then makes a confident decision against
+  an unreachable holder** -- worse than a lap.  Peer progress is degraded:
+  clean->dirty->clean transitions per remove go 2 -> 4, window-vs-window
+  refusals between two removes are new in kind, and the peer site F measured
+  being refused (`ft_insert_dlm_acquire_split`) is the TURN-FORFEITING one.
+  Cost is understated: a descriptor alloc + full single-record MCAS + deferred
+  free + CAS per remove, where `ft-mutation-helpers.h:5831-5836` records that
+  binding "measured WORSE".  ☠ And the hold does not freeze what it claims:
+  `ft-mutation-helpers.h:13700-13708` states "THE FENCE DOES NOT STOP A PEER
+  RETIRE".
+* **Arm-side / blast radius.**  The expected-old threading reaches only
+  `_ft_node_replace_ptr` (`ft-mutation-node.h:963`, `:1051`), which **the
+  COMPRESSED-HOLDER ARM NEVER CALLS**: that arm commits via
+  `ft_detach_node_replace_compressed_parent`, which validates the GRANDPARENT's
+  word and never `cn->child` (`:102`).  So a conversion between decision and
+  commit is SILENTLY ADOPTED there -- `cn` is dropped with the peer's new
+  prefix head inside it, which is KEY LOSS, worse than the NOT_FOUND being
+  cured.  The "no-op for other callers" claim is also false: `pub->old_val` at
+  `:963` is a LATER load than the one `:2746` pins, and the new `-EAGAIN`
+  becomes `CDS_FT_STATUS_MEMORY_ERROR` in `ft-detach.h:445-457` and `-ENOMEM`
+  in `ft-merge.h:189-196`.
+
+#### ★ WHAT SURVIVED — do not re-litigate
+
+* **P1 for H's body slots**: every enumerated writer of `cn->child`,
+  `external_nodes` and an internal node's body slot routes through a recorded
+  edge owned by that node, or is a same-value republish.
+* **The anchor**: under PER_NODE, H's own word IS the word a peer must take to
+  write `H.body[b]` (`ft-mutation-helpers.h:644-645`).
+* **The seam rule**: `ft-remove.h` contains no `ft_writer_lock_gp_wait` call at
+  all, and the window holds no word across a GP.
+* **No ledger residue**: `ft_meta_lock_release` calls `ft_hold_trace_drop`, so
+  the op-init LEAK CANARY has nothing to catch.
+* **C3's holder pick does NOT cause a wrong-word detach**: `d.depth` means the
+  same at both sites, `d.nf` is never skip-encoded there, and every arm
+  identity-checks `@node` before touching a word (`:5870`, `:5919`, `:6106`).
+
+#### ☞ THREE INDEPENDENT DEFECTS SURFACED, worth their own work
+
+1. **The chain arm** (`ft-remove.h:4974-5062`) has the SAME unlocked derivation
+   with no re-validation, and the correct pattern already exists at
+   `ft-mutation-helpers.h:14748`.
+2. **`ft-compact.h:299` unlinks before tombstoning**, so a node can be
+   unreachable with a CLEAN state word -- which defeats any acquire-based
+   validation, not just this one.
+3. **`ft-remove.h:5429` refuses on a TRANSIENT** (the forward holder retired
+   between the descent's read and the test) -- a contract violation that exists
+   TODAY, independent of any fix.  And `d.skip_conflict` still has ZERO
+   consumers in `ft-remove.h` while the descent sets it to mean "a mutating
+   caller must re-descend".
+
+---
+
 ## 6. What the fix must not break
 
 * **Liveness — and ☠ SKIPPING IS NOT AN OPTION.**  Refutation (2) is the
