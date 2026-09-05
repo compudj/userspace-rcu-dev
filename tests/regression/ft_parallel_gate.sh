@@ -114,6 +114,44 @@ ALL_CONFIGS=(
 	# is where every rekey shape the tests can reach gets driven.  A detector
 	# compiled into no configuration is not coverage.
 	"audit|-DFT_DEBUG_TOMBSTONE_AUDIT -DFT_DEBUG_REKEY_RETRY_CAP|u ion ioff"
+	# ★ THE REMOVE RETRY CAP.  Its rekey twin rides on "audit" above; this one
+	# could not, and the gap was VERIFIED: none of the 15 legs armed
+	# -DFT_DEBUG_REMOVE_RETRY_CAP, so the gate had NO WAY TO TELL A REMOVE
+	# LIVELOCK FROM CPU CONTENTION.  Both read as rc=124 (or rc=137 once the
+	# spinning lane leaks into its cage), and "the box was busy" is the reading
+	# a tired reviewer reaches for -- which is exactly the confound that cost a
+	# session.  Armed, the same run aborts with "FT REMOVE LIVELOCK: %u attempts
+	# on one remove" at 50,000 attempts, which is a CLAIM ABOUT THE TRIE and not
+	# about the schedule.  A detector compiled into no configuration is not
+	# coverage; a timeout it cannot be distinguished from is worse, because it
+	# reads as a result.
+	#
+	# imw is the leg that pays for this one.  The livelock this cap exists to
+	# catch is a CONCURRENT-writer phenomenon -- the shipping instance was
+	# 2,000,000+ consecutive attempts re-deriving one dead holder with 11 of 12
+	# writer threads parked behind the FIFO lane (ft-remove.h, the STALE
+	# BACK-EDGE arm) -- and a single-writer leg cannot reach it at all.  u/ion/
+	# ioff ride along because, measured, they cost nothing to add.
+	#
+	# -DFT_REMOVE_SLOW_NS=0 compiles out the per-op tail diagnostics and leaves
+	# ONLY the abort.  -DFT_REMOVE_TAIL_QUIET alone does not do that: it keeps
+	# the >1 ms "FT REMOVE SLOW" metric on purpose (it is the metric §D.3's A/B
+	# was measured with), and on imw that metric printed 9,799 pairs and 1.9 MB
+	# of stderr in 30 s -- into the very stream this harness greps for its
+	# verdict.  The knob defaults to 1 ms, so every other user compiles what it
+	# always compiled.
+	#
+	# COST, MEASURED (idle 384-core box, one leg per suite at a time, each in
+	# its own memcg, default per-node spacing, armed vs the default config at
+	# the same commit): unit 48 s vs 46, ion 88 vs 87, ioff 88 vs 87, imw 105 vs
+	# 105; every leg green on both arms (331/331, 128/128 x3) and the captured
+	# output byte-comparable.  The residual is one getrusage per remove.
+	#
+	# NOT swept across lock spacings, unlike txndbg/proxyassert: those sweep
+	# because the class they detect HIDES IN ONE spacing.  This one detects
+	# non-termination, which the coarse spacings already surface as their own
+	# hangs; the sweep is a separate question from arming the detector at all.
+	"rmcap|-DFT_DEBUG_REMOVE_RETRY_CAP -DFT_REMOVE_TAIL_QUIET -DFT_REMOVE_SLOW_NS=0|u ion ioff imw"
 	"vam|-DFEATURE_FT_VERIFY_AT_MUTATION|u"
 	# The TRANSACTION ENGINE's own debug features.  Every other config
 	# compiles them out, so an engine-contract violation the FT commits is

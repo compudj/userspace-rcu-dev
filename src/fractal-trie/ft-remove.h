@@ -6113,6 +6113,27 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 # ifndef FT_REMOVE_RETRY_CAP
 #  define FT_REMOVE_RETRY_CAP	50000
 # endif
+/*
+ * The wall-clock threshold for the per-op "FT REMOVE SLOW" diagnostics below,
+ * in nanoseconds.  0 compiles them out entirely, leaving only the RETRY CAP's
+ * livelock abort.
+ *
+ * This knob exists because the two existing modes cannot express what a GATE
+ * LEG needs.  The gate arms this detector for ONE reason: a remove LIVELOCK
+ * must abort loudly instead of expiring as a timeout, because rc=124 cannot be
+ * told apart from CPU contention on a box running 25 legs at once.  It does not
+ * want the per-op tail data.  And -DFT_REMOVE_TAIL_QUIET cannot silence that
+ * data: it deliberately keeps the >1ms metric, which is the metric D.3's A/B
+ * measured (doc/design/mw-to-fine-locking-remainder.md §D.3 -- the milestone
+ * dump is what biases a control arm, not this).  MEASURED on the imw leg of
+ * this very config: 9,799 SLOW pairs and 1.9 MB of stderr in the first 30 s,
+ * which drowns the TAP stream the gate greps for its verdict.
+ *
+ * Default 1 ms, i.e. byte-identical to what every existing user compiled.
+ */
+# ifndef FT_REMOVE_SLOW_NS
+#  define FT_REMOVE_SLOW_NS	1000000
+# endif
 #endif
 
 enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
@@ -6310,7 +6331,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 	{
 		uint64_t wall = ft_dbg_now_ns() - ft_remove_t0;
 
-		if (caa_unlikely(wall > 1000000))
+		if (FT_REMOVE_SLOW_NS && caa_unlikely(wall > FT_REMOVE_SLOW_NS))
 			fprintf(stderr, "FT REMOVE SLOW: wall_us=%llu "
 				"attempts=%u dirtyLOCK=%u dirtyOTHER=%u "
 				"cabort=%u begin_us=%llu body_us=%llu "
@@ -6323,7 +6344,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 				(unsigned long long) (ft_acc_bail / 1000),
 				(unsigned long long) ((wall - ft_acc_begin -
 					ft_acc_body - ft_acc_bail) / 1000));
-		if (caa_unlikely(wall > 1000000)) {
+		if (FT_REMOVE_SLOW_NS && caa_unlikely(wall > FT_REMOVE_SLOW_NS)) {
 			struct rusage ru;
 
 			getrusage(RUSAGE_THREAD, &ru);
@@ -6339,7 +6360,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 					ft_remove_ru0.ru_nivcsw));
 		}
 #ifdef CDS_FAIR_MUTEX_DBG_POLL
-		if (caa_unlikely(wall > 1000000))
+		if (FT_REMOVE_SLOW_NS && caa_unlikely(wall > FT_REMOVE_SLOW_NS))
 			fprintf(stderr, "FT REMOVE SLOW POLLS: fmtx=%lu "
 				"wfcq=%lu\n",
 				cds_fmtx_dbg_polls - ft_fmtx0,
