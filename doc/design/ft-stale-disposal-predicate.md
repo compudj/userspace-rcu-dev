@@ -1452,14 +1452,26 @@ commit [forfeits]."*  So the rule is NOT "remove can never keep its turn":
 * **A PRE-COMMIT BAIL FORFEITS THE TURN BY DESIGN; A COMMIT ABORT KEEPS IT.**
 * Remove's retries are ALL pre-commit bails, which is why A, F and the window
   died the same way.
-* ★ **The escape route therefore EXISTS**: a refusal converted into a
-  COMMIT-TIME expected-old failure keeps the turn and re-attempts.
+* ☠☠ **AND THAT IS STILL WRONG -- corrected a SECOND time, verified from the
+  code.**  `retrying` is PER-HANDLE and set ONLY inside that handle's own
+  commit (`urcu_txn_commit_flavor` / `_commit` / `_commit_sw_flavor`,
+  `rcu-txn.h:1147,1156,1201,1210`).  **Remove's `optxn` is NEVER COMMITTED** --
+  it receives only `begin`, `urcu_txn_conflict` (which sets `retry++`, NOT
+  `retrying`, `:1239-1243`) and `end`; every actual commit runs on a private
+  flip-txn handle.  So a COMMIT ABORT does not keep remove's turn either:
+  **every lap forfeits, wherever the failure is detected.**
+* ☞ The escape therefore needs an EXPLICIT mechanism -- something that sets
+  `op->retrying = 1` on the coordination handle -- not a change of where the
+  failure is noticed.  ★ I got this wrong twice: first by repeating a skeptic's
+  phrasing unverified, then by over-correcting it.  The rule is simply: **remove
+  cannot keep its FIFO turn today by any route.**
 * ☠ But BINDING is not that route: `ft-mutation-helpers.h:5831-5836` records it
   MEASURED WORSE -- "median 9.5 starving removes against 4 for aging alone" --
   because binding shares the op's descriptor and install lane.
 
-This retires the termination story of A, F and this design, and points the
-eighth disposition at the COMMIT rather than at a pre-commit window.
+This retires the termination story of A, F and this design.  It does NOT point
+the eighth at the commit -- it says any eighth must ADD a keep-turn mechanism,
+or terminate without needing the turn.
 
 **3. THE WINDOW NARROWS, IT DOES NOT CLOSE.**  The peer's conversion needs H's
 word only AT COMMIT (`ft-insert.h:2099-2102`, all-or-none
