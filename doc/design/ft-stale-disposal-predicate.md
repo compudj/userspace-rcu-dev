@@ -1717,6 +1717,59 @@ theoretical one.
 
 ---
 
+### 5.16 ★★ THE ONE DISPOSITION THAT WORKS WAS ALREADY IN THE TREE — RE-MEASURED
+
+Nine designed dispositions have been refuted.  The fast reproducer (§5.14) made
+it cheap to re-ask a question that was answered on the WRONG WORKLOAD:
+`-DFT_RM_HOLDER_RECHECK` (`ft-remove.h`, default OFF) withdraws the refusal when
+a fresh `ft_node_holder(@node)` says the holder MOVED, handing the op to
+`need_retry` instead of reporting the key gone.  Its docstring shelved it on
+liveness, measured on the 200-key statistical rig: RM-FAIL 11/20 -> 1/20 but
+timeout/memcg 0/20 -> **5/20**.
+
+**Re-measured on the 2-key DETERM reproducer, 30 seeds, `CHK=1 SECS=5
+NOFREE=1`:**
+
+| arm | RM-FAIL | timeout | memcg | SEGV | clean |
+|---|---|---|---|---|---|
+| control | **20/30** | 0 | 0 | 1 | 4 |
+| **recheck** | **0/30** | 1 | 0 | 5 | 14 |
+
+★ **RM-FAIL goes to ZERO**, and the liveness cost that shelved it reads 1/30,
+not 5/20.  That cost looks like a property of the OLD WORKLOAD -- 200 churn
+keys across two writers is a far more contended tree than the two keys the
+defect actually needs -- rather than of the disposition.
+
+**The SEGV question, at EQUAL EXPOSURE** (`CHK=0`, so neither arm aborts early;
+`SECS=2 NOFREE=0` so neither is memcg-bound by the rig's own leak), 30 seeds:
+
+| arm | clean | timeout | memcg | SEGV |
+|---|---|---|---|---|
+| control | 7 | 9 | 12 | **2** |
+| **recheck** | **14** | 4 | 2 | **10** |
+
+☞ **The recheck UNWEDGES the workload**: stuck runs (timeout + memcg) fall
+21 -> 6 and clean runs double 7 -> 14.  ☠ But among runs that PROGRESS the SEGV
+rate still roughly doubles (2 of 9 vs 10 of 24), so censoring explains part of
+the rise and NOT all of it.  **Whether the recheck CREATES SEGVs or merely
+reaches a pre-existing hazard more often is NOT settled by this data.**
+
+☞ **THIS IS NOW THE GATING QUESTION.**  The rc=139 lane has been unattributed
+since §5.4 and §5.9 showed it is writer-writer and CURED BY COARSE WRITERS --
+the same axis as RM-FAIL.  It has to be root-caused before this disposition can
+ship, and it is now the cheapest thing in the file to reproduce: 10 of 30 seeds,
+2 s each, on a two-key trie.
+
+☠ **A measurement note that cost two runs.**  `CHK=0` equal-exposure comparisons
+are MEMCG-BOUND with `NOFREE=1`: the rig leaks by design, so a full 5 s run
+walks into a 6 G cap (7 of 19 control runs died `rc=137`).  And even at
+`NOFREE=0` the CONTROL still takes 12/30 memcg kills, because a wedged remove
+allocates while it spins.  A liveness comparison on this workload must report
+`rc=137` as a first-class outcome, not fold it into "other" -- doing so is what
+produced a wrong first reading here.
+
+---
+
 ## 6. What the fix must not break
 
 * **Liveness — and ☠ SKIPPING IS NOT AN OPTION.**  Refutation (2) is the
