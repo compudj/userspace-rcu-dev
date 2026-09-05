@@ -58,6 +58,13 @@
  *                produced two.  It also suppresses the memory cost of a lane
  *                that spins inside a read-side bracket, since leaking means
  *                call_rcu never has a backlog to defer (memcg kills 2 -> 8).
+ *      WRITER=coarse  serialise all structural writers on the FT-wide lock
+ *                (default fine).  ☞ The coarser lock SPACINGS are NOT settable
+ *                here: cds_ft_group_attr_set_lock_spacing REFUSES exponential
+ *                and root-only by design, so they need CDS_FT_LOCK_SPACING=...
+ *                AND a library built with -DFEATURE_FT_LOCK_SPACING_ENV.  The
+ *                rig echoes an "ARM writer=... spacing_env=..." line so a
+ *                mislabelled arm is visible instead of silently per-node.
  *      NOREM=1   insert only, never remove
  *      PFX=1     every churn key is a PROPER PREFIX of a stable key, so each
  *                insert/remove creates and destroys a PREFIX HEAD directly on
@@ -314,6 +321,31 @@ int main(void)
 	if (cds_ft_group_attr_create(&at) != CDS_FT_STATUS_OK) _exit(5);
 	if (geti("LIST",1)==0 && cds_ft_group_attr_set_ordered_list(at,false)!=CDS_FT_STATUS_OK) _exit(5);
 	if (geti("LIST",1)==0) ord_walk = 0;
+	/*
+	 * WRITER=coarse serialises every structural writer on the one FT-wide
+	 * lock.  It is a SUPPORTED attribute, unlike the coarser lock SPACINGS
+	 * (exponential / root-only), which cds_ft_group_attr_set_lock_spacing
+	 * REFUSES outright until every acquire site maps its members through the
+	 * anchor -- those are reachable only through the CDS_FT_LOCK_SPACING env
+	 * back door, and ONLY against a library built with
+	 * -DFEATURE_FT_LOCK_SPACING_ENV.  Without that flag the variable is never
+	 * read and the run is PER-NODE under whatever label you gave it, so the
+	 * arm is echoed below rather than assumed.
+	 */
+	{
+		const char *w = getenv("WRITER"), *sp = getenv("CDS_FT_LOCK_SPACING");
+
+		if (w && !strcmp(w, "coarse")) {
+			if (cds_ft_group_attr_set_writer_strategy(at,
+					CDS_FT_WRITER_LOCK_COARSE) != CDS_FT_STATUS_OK)
+				_exit(5);
+		} else if (w && strcmp(w, "fine")) {
+			fprintf(stderr, "WRITER must be fine or coarse\n"); _exit(5);
+		}
+		fprintf(stderr, "ARM writer=%s spacing_env=%s\n",
+			(w && !strcmp(w, "coarse")) ? "coarse" : "fine",
+			sp ? sp : "unset(per-node)");
+	}
 	if (cds_ft_group_create(at,&g) < 0) _exit(5);
 	cds_ft_group_attr_destroy(at);
 	if (cds_ft_create(g,NULL,&ft) < 0) _exit(5);

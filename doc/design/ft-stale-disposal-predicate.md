@@ -1117,6 +1117,77 @@ accumulated, one per aborting seed.
 
 ---
 
+### 5.9 ★★★ COARSE WRITER STRATEGY IS TOTALLY CLEAN — EVERY ORACLE IS A WRITER-WRITER RACE
+
+§5.7 and §5.8 switched off the structural FEATURES and nothing moved.  This
+switches off writer CONCURRENCY, and everything moves at once.
+
+`CDS_FT_WRITER_LOCK_COARSE` serialises every structural writer on the one
+FT-wide lock; readers stay fully concurrent.  Selected through the SUPPORTED
+attribute `cds_ft_group_attr_set_writer_strategy` (the rig gained a `WRITER=`
+knob and now echoes an `ARM writer=... spacing_env=...` line so an arm cannot be
+mislabelled).  160 seeds per arm, same rig binary, same seeds, same workload,
+same concurrency (4) and same 6G cap -- the ONLY difference is the strategy.
+
+| arm | seeds | RM-FAIL | RM-LOOKUP-MISS | STALE-FOUND | exit codes |
+|---|---|---|---|---|---|
+| fine (per-node, default) | 160 | 48 | 27 | 28 | 96 abort, **42 SEGV**, 10 memcg, 10 timeout, 2 wrongid |
+| **coarse** | 160 | **0** | **0** | **0** | **160 x rc=0** |
+
+★ **NOT A WRONG ZERO.**  The coarse arm ran the oracles armed (`CHK=1`; the rig
+refuses to start when the classifier hook is absent) and completed
+**156,657,174 churn operations and 6.33 billion reads** across its 160 runs,
+every one reaching its final line.  The fine arm reports no `churn_ops` at all
+because its runs abort before the summary -- which is itself the contrast.
+
+#### What this establishes
+
+**Every oracle in this rig is a WRITER-WRITER race.**  Serialising writers
+removes not only RM-FAIL but the 42 SEGVs, the 10 memcg kills and the 10
+timeouts -- the whole rc=139 lane §5.4 left unaccounted, and the liveness lane
+with it.  Readers remained concurrent throughout (6.33 billion of them), so
+reader/writer concurrency alone does NOT produce any of it.  **Two concurrent
+STRUCTURAL WRITERS are necessary.**
+
+☠ **This REFUTES the closing suggestion of §5.8.**  That section ended by
+proposing a "minimal, possibly SINGLE-THREADED reproducer", on the reasoning
+that the defect needs no optional structure.  It needs no optional structure
+AND it needs two writers: those are independent axes, and I conflated
+"structurally simple" with "reachable with one writer".  A single-threaded
+`ft_unit` case cannot reach this.  The cheap reproducer to build is a
+TWO-WRITER one, and the rig already is it.
+
+☞ So the target narrows to the intersection: `ft_node_holder(node)`
+(`ft-remove.h:5388`) reads `node->prev` and the body arm compares against it,
+in a trie with NO optional structure, while a PEER STRUCTURAL WRITER is running
+-- and nothing in the fine-grained path gives that read the exclusion the coarse
+lock supplies for free.
+
+#### ☠ The coarser lock SPACINGS could not be measured at all
+
+`CDS_FT_LOCK_SPACING_EXPONENTIAL` and `_ROOT_ONLY` are REFUSED by
+`cds_ft_group_attr_set_lock_spacing` by design (`fractal-trie.h:2952-2956`:
+"Anchoring is ALL-OR-NOTHING ... rather than offered as a setting that silently
+excludes nothing").  Reached anyway through the `CDS_FT_LOCK_SPACING` env back
+door on a `-DFEATURE_FT_LOCK_SPACING_ENV` build, BOTH **SEGV within two seconds**
+on a 20-key workload where per-node completes 567k ops.  So no RM-FAIL
+statistics exist for those spacings; the configuration dies first.
+
+★ The crash is worth recording because of WHERE it lands:
+
+    #0 cds_ft_item_to_metadata   fractal-trie-internal.h:3985
+    #1 ft_detach_node            ft-remove.h:3437
+    #2 _cds_ft_remove_locked     ft-remove.h:6003   <-- the BODY ARM
+    #3 cds_ft_remove             ft-remove.h:6205
+
+`:6003` is the detach in the same body arm whose identity compare at `:5976`
+produces RM-FAIL.  Under root-only that arm dereferences garbage instead of
+answering NOT_FOUND.  ☠ Treat this as a LEAD, not evidence: the configuration is
+one the library itself refuses as incomplete, so a crash there is expected and
+says nothing directly about the supported per-node path.
+
+---
+
 ## 6. What the fix must not break
 
 * **Liveness — and ☠ SKIPPING IS NOT AN OPTION.**  Refutation (2) is the
