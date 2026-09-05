@@ -720,7 +720,20 @@ terminating loop.
 
 ## 7. Reproducing and re-measuring
 
+★ **THE RIG IS IN THE TREE**: `doc/design/ft-stale-disposal-rig.c`.  It is not
+built by anything -- build it by hand, and `ldd` it to PROVE it resolved into
+your build tree rather than an installed `liburcu`.  Its header documents the
+six `CHK=1` writer oracles and every env knob.  ☞ The counts in §3 and §5 were
+taken with it; without it in the tree they could not be re-derived.
+
 ```sh
+# the rig itself (no tracing needed for the CHK oracles)
+gcc -O0 -g -I<top>/include -I<build>/include -I<top>/src -I<top> \
+    doc/design/ft-stale-disposal-rig.c -o /tmp/ftrig \
+    -L<build>/src/.libs -lurcu-qsbr -lurcu-cds -lurcu-common \
+    -Wl,-rpath,<build>/src/.libs
+ldd /tmp/ftrig | grep urcu          # MUST name <build>, not /usr
+
 # tracing tree
 CPPFLAGS="-DFT_ENABLE_TRACING -DFT_LIGHT_TRACING -I<tree>/src/fractal-trie -I/usr/local/include" \
 LDFLAGS="-L/usr/local/lib -Wl,-rpath=/usr/local/lib" CFLAGS="-O2 -g -DNDEBUG" ../configure
@@ -736,7 +749,7 @@ cds_ft:item_retire,cds_ft:node_recompact,cds_ft:unchain_node,\
 cds_ft:chain_compress_enter,cds_ft:chain_compress_exit
 lttng add-context -u -t vpid -t vtid && lttng start
 FT_TRACE_SESSION=$S CHK=1 WRITERS=2 ALPHA=2 MAXLEN=8 NSTABLE=100 NCHURN=100 \
-  SECS=5 READERS=4 NOFREE=1 ./stab5_tr
+  SECS=5 READERS=4 NOFREE=1 ./ftrig_traced
 ```
 
 ☠ Four traps, all paid for once:
