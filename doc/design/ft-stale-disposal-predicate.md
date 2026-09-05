@@ -811,6 +811,142 @@ memory cost once `call_rcu` is actually in play.
 
 ---
 
+### 5.6 ☠☠☠ THE FULL DESCENT CONTRACT — DESIGNED, REFUTED 3/3, AND THE DILEMMA IT EXPOSED
+
+Mathieu's scope call (2026-09-04) on the §5.3 conclusion was **FULL**: make
+`ft_skip_reanchor` / `ft_reanchor_flag` never hand back an unvalidated up-walk
+result, so every one of the ~17 call sites gets a CLASSIFIED result.  A Fable
+agent designed it; three adversarial skeptics, one per load-bearing claim, were
+run against it.  **All three refuted.**  Do not build it.
+
+**The design in one paragraph.**  Four outcome classes returned in place of a
+bare pointer: `LIVE` (landing node untombstoned, claims the caller's forward
+slot, `*fwd_slot` unchanged, `len`/`child` match), `MERGED` (today's
+`rewind > 0`), `WITNESS` (all `LIVE` shape checks pass but the landing node is
+TOMBSTONED — "a dead node consistent with the live slot"), `TORN` (anything
+else).  Termination by a LAP RULE: a lap is permitted only if the witness set
+`{*fwd_slot, A, A->state, A->(parent,pso), G's back-edge}` changed; since those
+words are written only by committed transactions, a changed set IS a distinct
+peer commit and an unchanged one is terminal.  Plus a second, remove-side
+proposal (below).
+
+#### The three verdicts
+
+* **The LAP RULE: REFUTED.**  Three independent breaks.  (1) The BOUND
+  `laps <= FALLBACK + #writers` has no mechanism: `ft_txn_attempt_bail`
+  (`ft-mutation-helpers.h:1584`) is `urcu_txn_conflict` + `urcu_txn_end`, and
+  `urcu_txn_end` EXITS the fallback lane (`rcu-txn.h:1272`, `exit_fallback`
+  clears `domain->active` at `:784`) — so every lap that ages also forfeits the
+  turn and re-queues behind every peer it just released.  (2) "Every listed word
+  is written only by a committed transaction" is FALSE: `ft_set_parent`
+  (`ft-helpers.h:3114`) is a plain `rcu_assign_pointer` writer of `parent_word`
+  reached with `retire_txn == NULL` from the recompact child sweep
+  (`ft-mutation-node.h:2359`), and `ft-detach.h:546` plain-stores `parent_word`
+  outright.  (3) Cross-trie ops init on `dst_ft`'s domain (`ft-graft.h:1465`),
+  so peers mutating the same nodes never queue in this trie's lane at all.
+* **The WITNESS class: REFUTED, both halves.**  Soundness: at rest there is no
+  bound on staleness but a hard one on the body — retire tombstones then
+  `cds_ft_free_item_deferred`, and one grace period later the up-walk's
+  `ft_compressed_node_ptr(parent)->len` (`ft-helpers.h:2029`) reads freed
+  memory.  The state word that would carry TOMBSTONE is in that same freed body,
+  so **there is no pre-check that is not itself the UAF**.  Per-site: the
+  precise-lookup terminal is `NOT_FOUND` for a present key — the defect renamed;
+  externals carry no key (`fractal-trie.h:509`) so the skipped bytes are
+  unrecoverable.  The five ORDERED-QUERY accumulators are worse than the design
+  claims: "an undercount is tolerated" is a comment on `ft_subtree_key_count`
+  (`ft-mutation-helpers.h:10689`), which backs COUNT queries; the SELECT path
+  picks a subtree by `remaining < child_keys` (`ft-ordered-query.h:369`), so an
+  undercount returns the WRONG KEY, or `NOT_FOUND` for a valid rank.
+* **The remove-side proposal: REFUTED**, and it reproduces disposition C's
+  failure modes (a), (b) and (d).  Its SKIP branch defers to
+  `ft_skip_reanchor(SKIP word, slot)` — which starts at `cur = G` and takes
+  `ft_head_parent_word_raw(G)` (`ft-helpers.h:1997`), i.e. **`node->prev`, the
+  very back-edge whose use was the stated reason to delete
+  `FT_RM_ACQUIRE_FIRST` and `FT_RM_HOLDER_RECHECK`**.  It also returns the node
+  HOLDING the slot (P, the dual's owner), not G's holder, so the body arm
+  detaches through P's dual slot with `holder_meta` = P's — C's wrong-word
+  detach, one hop later.  And `holder_depth` is dated only by the coarse arm at
+  `:5434-5509`; the proposal fires after it and specifies no replacement, which
+  `:5653` already names as "a MIS-ANCHOR the moment that gate widens".
+
+#### ★★ WHAT SURVIVED, AND IT IS THE IMPORTANT PART
+
+**F2 SURVIVED** (verified independently by reading every path from `:5388`):
+under the default PER_NODE spacing the remove NEVER calls the up-walk before its
+arms.  The pre-arm descents are `:5418` (tombstoned holder) and `:5434`
+(non-PER_NODE) only; `:5537` is compiled out by default.  In the arms, `:5727`
+`ft_skip_to_compressed` reads `child->prev` and `:5972` `ft_node_get_nth_skip`
+is a slot scan — neither is the up-walk.  **So a contract on `ft_skip_reanchor`
+alone can never reach the RM-FAIL return path.**  That is why the full scope had
+to grow a remove-side half, and the remove-side half is what got refuted for the
+fourth time.
+
+**☠ AND A MEASUREMENT CORRECTION.**  `htomb` / `headis` / `anc_tomb` are
+computed AT ABORT from a FRESH `ft_node_holder(node)` (`fractal-trie.c:871-975`)
+— i.e. AFTER the `NOT_FOUND` return.  So "the holder is ALIVE **at the
+compare**" was never measured, only inferred; the record cannot order the peer
+commit against the compare.  The `anc_tomb` discriminator between defect 1 and
+defect 2 is unaffected (it is a property of the trie at abort either way), but
+every timing reading built on `htomb=0 headis=node` must be restated as an
+inference.
+
+#### ☞ THE DILEMMA — two skeptics converged on it independently
+
+> If `G->prev` can be stale AT REST for a SKIP_X child, then `cn'` is reachable
+> by NO path and the trie is not "actually fine" — the bug is a lost node, not a
+> misread one.  If it cannot, the WITNESS class never arises on a SKIP_X hop and
+> the design is curing a shape that does not exist.
+
+**VERIFIED BY READING, and it is the second horn.**  The one same-shape producer
+in the tree, `ft_compact_relocate_compressed`, re-homes the child's back-edge to
+the NEW node — `ft_set_parent(ft, cn2->child, cn2_flag, &cn2->child)`,
+`ft-compact.h:283` — and only THEN tombstones the old one
+(`ft_meta_tombstone_set_flip`, `:299`) and defers its free (`:311`).  Its own
+comment says the result plainly: the retired node "is already detached
+(unreachable via its child's back-pointer / grandparent slot) and merely
+awaiting its grace period, **exactly the transient `ft_skip_reanchor` already
+tolerates**."  The other producers record the child edge IN the retire txn —
+`ft_reparent_record` (`ft-mutation-node.h:2355`), `ft_record_child_back_edge`
+(`ft-remove.h:1783`).
+
+**So the SKIP_X shape §5.3 built its refutations on — a `G` reachable from a
+LIVE slot whose `prev` names a retired node AT REST — has no producer that
+three readings could name.**  What the corpus does measure, per the WITNESS
+skeptic, are stale edges on **orphans not named by any live slot, reachable only
+from an application-held node handle across a grace period** — which is exactly
+`cds_ft_remove(iter, node)`'s own entry condition.  That is a different defect
+in a different place, and it would explain why four dispositions aimed at the
+DESCENT have now all failed.
+
+☠ **This does not retire §5.3.**  §5.3's verified half stands: `ft_skip_reanchor`
+DOES resolve skip hops by walking up back-edges, so "the forward path is
+authoritative" is false as a general rule.  What is now in doubt is the SECOND,
+load-bearing half — that the shape is a REST state for a slot-reachable node.
+Three readings failing to find a producer is not a proof that none exists.
+
+#### ☞ THE NEXT STEP, and it needs no scope call
+
+Decide the dilemma by MEASUREMENT, not by more reading.  Extend `cds_ft_verify`'s
+head back-edge check (`ft-verify.h:342-370`, which already compares
+`cell->parent` to the owner) with one predicate: **for every external head and
+every compressed node behind a SKIP_X dual, the node its back-edge names is
+UNTOMBSTONED and its forward slot resolves back to it.**  Run it under
+`-DFEATURE_FT_VERIFY_AT_MUTATION` on the `*_spec` ft_inv tests (`:21182` — the
+only place skip mode survives) and on the rig at `WRITERS=1 CHK=1 NOFREE=1`.
+Single-writer, so a hit is attributable to the op that just committed, in one
+run, with no memcg.  Both outcomes are decisive:
+
+* **a hit** — the at-rest shape is real, the offending producer is NAMED, and
+  the cure is at that producer's retire, not in the descent;
+* **no hit, ever** — the at-rest shape for slot-reachable nodes is a myth, and
+  the whole investigation moves to the application-handle path, where the
+  orphan edges actually live.
+
+It is a claim without an arm (no behaviour change), it is single-threaded, and
+it is the cheapest thing in this file that can move the question.
+
+---
+
 ## 6. What the fix must not break
 
 * **Liveness — and ☠ SKIPPING IS NOT AN OPTION.**  Refutation (2) is the
