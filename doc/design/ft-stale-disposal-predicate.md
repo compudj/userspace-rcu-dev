@@ -1608,6 +1608,115 @@ numbers at the site so the next reader does not repeat the experiment.
 
 ---
 
+### 5.15 ☠☠☠ THE EIGHTH DISPOSITION — "INTENT-CARRIED REMOVE", REFUTED 3/3
+
+Designed after §5.14, three adversarial skeptics (intent equivalence /
+keep-turn / refusal predicate + fold steady state).  **All three refuted.**
+
+**The design.**  The derivation stops producing a VERDICT and produces an
+INTENT `{holder H, slot S, expected raw value V}`; nothing is held while
+deciding; each arm RE-ASSERTS `S == V` where it already holds S's owner; the
+only refusal is `@node`'s own removed mark; every other mismatch is a lap
+re-derived BY DESCENT.  Plus a new engine primitive `urcu_txn_keep_turn()` to
+retain the FIFO turn on value laps.
+
+#### ★★★ TWO SKEPTICS INDEPENDENTLY WALKED IT INTO THE SAME RECORDED WEDGE
+
+Its new terminal after `ft-remove.h:3368` --
+`if (freeze_leaf && walk_nf != flag-of(freeze_leaf)) -EAGAIN` -- is a
+**PERMANENT `-EAGAIN` on every skip-compressed leaf**.  `walk_nf` carries the
+skip LENGTH in the high bits (`ft_node_skip_compressed`, `ft-helpers.h:1774`)
+while `flag-of(freeze_leaf)` is the bare external pointer, and
+`ft_node_external` tests only the LOW tag bits (`:615-618`) -- the very
+distinction `ft-remove.h:2295-2298` spells out.  Deterministic shape, so
+re-derivation reproduces it forever.
+
+☞ **AND THE FILE ALREADY RECORDS THIS EXACT CLASS**, `ft-remove.h:3584-3592`:
+*"A raw slot value and a get_nth result are not the same encoding, so one never
+compares equal ... measured as a PERMANENT -EAGAIN, ft_unit wedged at test 2."*
+★ THE DURABLE RULE: **any new comparison in this file must state which
+ENCODING each side is in.**  Raw slot word, accessor result and bare pointer
+are three different things here, and mixing them is a measured wedge, not a
+theoretical one.
+
+#### The three refutations
+
+* **Intent equivalence — REFUTED.**  The claim is only as good as its
+  placements, and (a) two of them are under NO hold at all: `:2291-2321` and
+  `:2404-2406` sit where `:2397` says *"Nothing is built, locked or reserved
+  yet"*, so they cannot "speak for the commit" by the design's own logic; (b)
+  it enumerated three `ft_flip_txn_arm_per_op` sites and there are SEVEN
+  (`ft-remove.h:1855, 4021, 4204, 4352, 4835, 4920, 5188`); (c) a WHOLE LANE
+  has no placement -- the compressed-boundary lane `:2763-3089` with its own
+  orphan walk (`:2794-2979`, not the one at `:3133`); (d) the support bullet
+  "only hlist/cell/root edges stay MW" is incomplete --
+  `ft-mutation-helpers.h:8574-8592` names **the unheld SKIP_X DUAL**, the
+  reader-facing copy of `cn->child` owned by the GRANDPARENT, which the promote
+  arms never acquire (`ft-remove.h:4753-4760`).
+  ☠ And the precedent it leaned on is weaker than claimed:
+  `ft_chain_compress_plan_stale` compares the op's NAMED node -- `:872-875`
+  *"Never a value read speculatively from the trie"* -- whereas the design's V
+  IS a speculative raw slot word.  That precedent's own header (`:904-912`)
+  records the raw-vs-accessor compare as a permanent `-EAGAIN`.
+  ☠ The `ft-mutation-helpers.h:14748` precedent is also misread: it sits AFTER
+  `if (sh.shared) continue;`, so it SKIPS the re-check on a shared hold.
+  Copied literally, the re-assert is silently skipped exactly when the word is
+  deduped against a caller's txn.
+* **The keep-turn primitive — REFUTED.**  It contradicts the field's contract
+  by construction (`rcu-txn.h:319`, *"a COMMIT aborted and asks to re-attempt"*,
+  justified at `:1226-1228` because the op "re-runs a plan it already carried
+  all the way to install"; remove's `optxn` never reaches install, so every
+  kept lap is the re-descent `:1228-1231` forbids).  Its gate is INCOMPLETE:
+  three zero-refusal lap classes mean "a peer holds", not "a value moved" --
+  the acquire set's own lost commit returns `-EAGAIN` directly, BYPASSING the
+  `eagain:` label (`ft-mutation-helpers.h:6149-6155` vs `:6236`); a
+  `ft_lock_ctx_depth_of` miss sets `acquire_miss` with no acquire attempted
+  (`:7905-7913`) and is shape-determined for remove, which passes
+  `have_descent ? &d : NULL` = NULL (`ft-remove.h:5539`); and guard-validation
+  failures abort on the flip handle.  All collapse into one arm at `:6257-6267`,
+  and `lap_reason` does not exist -- `need_retry` is a bare bool.  Peer
+  starvation is NOT bounded by W: with `fb_published == 0` the kept turn holds
+  the fair mutex while `active == 0`, so fresh peers never park and the one
+  self-qualified peer waits up to `fallback_at` (64..4096) attempts.  And it is
+  unmeasured, where the closest measurement (the superset) was negative.
+* **The refusal predicate — REFUTED.**  "Marked ⇔ absent, one linearization
+  point" is false.  `ft_node_mark_removed_flip`
+  (`ft-mutation-helpers.h:8110-8132`) is a bare `uatomic_cmpxchg` whose own
+  header says *"a standalone mark is the bridge"* (`:8100-8102`), and
+  `_cds_ft_remove_all_locked` marks AFTER a separately committed unlink at
+  `ft-remove.h:6705, :6882, :6960, :6994`, as does `ft_detach_node`'s fallback
+  at `:4617-4618`.  So a leaf can be unreachable AND unmarked.  Also `-EDOM`
+  reaches `default: abort()` at `:6248-6271`, so an "everything else is a lap"
+  catch-all would turn a deliberately terminal refusal into a spin.
+
+#### ★★ WHAT THIS ROUND ADDED THAT OUTLIVES THE DESIGN
+
+1. **`cn->child` AS A RECORDED EDGE WAS DECLINED ON A FALSE BASIS** -- so it
+   is still OPEN, and may be the right closure.  Two of the three grounds are
+   wrong: the `ft-remove.h:138` "@cn IS A NODE THIS VERY COMMIT DESTROYS"
+   hazard is about a REKEY's graft SPLIT (`split_g = record_only ? ... : NULL`,
+   NULL for a plain remove) and `:145-146` names the write into `cn->child` as
+   **the harmless one**; and "an armed txn parks it blind" is false because
+   records planted BEFORE arming stay MW -- `ft-remove.h:4004-4009`, *"stay MW,
+   which is stricter and always sound"*.  Only the COST ground stands: +1 in an
+   11-edge budget (`ft-mutation-helpers.h:9483`) and +1 CAS per compressed
+   remove.
+2. ☠ **AN INDEPENDENT LATENT KEY LOSS, with ZERO test coverage.**  The
+   compressed-boundary lane's sub-case 2 (compressed ROOT retire,
+   `ft-remove.h:380-382`) locks `{src_cn}` (`:443-453`), never re-reads
+   `cn->child` under that hold, and its root edge's expected-old is a FRESH
+   `*pub_slot` (`:519-522`) -- **a value compared against itself**, the
+   anti-pattern the file names at `:831-832`.  A peer converting the sole key's
+   leaf into a prefix head before the remover's DLM acquire passes the root CAS,
+   `cn` is tombstoned, and the peer's key is dropped SILENTLY.  `:529-531`
+   records that this sub-case has ZERO test hits.
+3. **The fold arm cannot distinguish a value refusal from an acquire refusal**:
+   both return `-EAGAIN` (`ft-remove.h:1318` acquire, `:1451` re-validation),
+   folded at `:6034-6036`.  Any future design keying on that distinction is
+   already refuted.
+
+---
+
 ## 6. What the fix must not break
 
 * **Liveness — and ☠ SKIPPING IS NOT AN OPTION.**  Refutation (2) is the
