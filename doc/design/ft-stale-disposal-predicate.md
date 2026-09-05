@@ -765,6 +765,50 @@ its own root cause.  ☠ Also unaccounted: **20 of 160 runs SEGV**.
 
 ---
 
+### 5.5 ☠ THE `NOFREE=1` ARM WAS HIDING A KIND — RM-WRONG-NODE
+
+§5.3's soundness skeptic marked its worst shape SUSPECTED rather than PROVED
+because *the reproducer's own `NOFREE=1` hides it*: with retired nodes leaked,
+an address is never reused, so a holder recovered through a stale `prev` can
+never be a RECLAIMED node.  Every seed of §5.4 ran that way.  So the arm was
+re-run with the ONLY change being `NOFREE=0` (retired nodes go through
+`call_rcu`), same 160 seeds, same everything else.
+
+| oracle | NOFREE=1 (leak) | NOFREE=0 (recycle) |
+|---|---|---|
+| RM-FAIL, `anc_tomb >= 0` | 0/81 | **0/68** |
+| RM-LOOKUP-MISS, `anc_tomb >= 0` | 28/28 | **37/37** |
+| STALE-FOUND, `anc_tomb >= 0` | 19/25 (76%) | 14/23 (61%) |
+| **RM-WRONG-NODE (kind 3)** | **0** | **2** |
+
+★ **The two-defect discriminator now stands at 214/214 across both arms**
+(RM-FAIL 0/149 with a tombstoned ancestor, RM-LOOKUP-MISS 65/65 with one).
+§3.3's taxonomy is as solid as this rig can make it.
+
+☠ **A KIND THAT NEVER APPEARED WITH LEAKING ON.**  `RM-WRONG-NODE` fires when a
+writer looks up its OWN key and is handed a node it never inserted -- and the
+churn set is PARTITIONED per writer, so `k->cur` has exactly one owner and
+cannot race:
+
+```
+RM-WRONG-NODE writer1 key=aaabab nd=0x7f61042f2260 cur=0x7f6104301f80
+RM-WRONG-NODE writer0 key=aaaaba nd=0x7ff6fc1811a0 cur=0x7ff6fc194700
+```
+
+Both carry `anctomb=-1`, `tomb=0`, `hstate=0x8`, `stale_ext=1`, `alone=1` -- so
+neither is defect 1's retired-ancestor shape.  ☐ **UNDIAGNOSED, and only 2
+samples**: it needs its own reproduction before it is called a fourth defect.
+☞ The methodological point is the durable one: `NOFREE=1` is required for
+POINTER-LEVEL analysis and is a BLIND SPOT for anything whose mechanism needs
+an address to be reused.  Run both arms.
+
+☞ One more difference, consistent with (not proof of) §5.3's read-side finding:
+memcg kills rose 2 -> 8 between the arms.  Freeing is what a blocked grace
+period defers, so a lane that spins inside a read-side bracket only shows its
+memory cost once `call_rcu` is actually in play.
+
+---
+
 ---
 
 ## 6. What the fix must not break
