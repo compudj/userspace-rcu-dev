@@ -1042,6 +1042,81 @@ BETWEEN-ARM comparison and the discriminator ratios as the result.
 
 ---
 
+### 5.8 ☑ THE FULL FEATURE MATRIX — RM-FAIL IS INVARIANT
+
+§5.7 answered one feature.  This answers the rest.  Same rig, same workload
+(`CHK=1 WRITERS=2 ALPHA=2 MAXLEN=8 NSTABLE=100 NCHURN=100 SECS=5 READERS=4
+NOFREE=1`), 160 seeds per arm, 8 concurrent, each seed in its own 8G memcg,
+2026-09-05, all arms at this commit on one box.
+
+**Every feature was proven off at the PREPROCESSOR**, not assumed -- a two-line
+TU including `fractal-trie-internal.h` with the build's own `CPPFLAGS` and
+`config.h`, emitting `#warning PROBE COMPRESS/SKIP/MERGE=ON|OFF`.  Recorded so
+the arms can be re-derived:
+
+    build-sfdisc        COMPRESS=ON   SKIP=ON   MERGE=ON    (control)
+    build-sfnoskip      COMPRESS=ON   SKIP=OFF  MERGE=ON
+    build-sfnocompress  COMPRESS=OFF  SKIP=OFF  MERGE=ON
+    build-sfnomerge     COMPRESS=ON   SKIP=ON   MERGE=OFF
+
+The ordered-cell index has no build knob -- it is a per-group runtime flag -- so
+that arm is the rig's `LIST=0`.
+
+| arm | what is off | RM-FAIL | RM-LOOKUP-MISS | STALE-FOUND |
+|---|---|---|---|---|
+| ctrlA | nothing | 60 | 29 | 24 |
+| noskip (§5.7) | skip-compression | 74 | 28 | 27 |
+| **nocompress** | **path compression entirely** | **64** | 42 | 23 |
+| **list0** | **the ordered-list cell indirection** | **61** | 38 | 46 |
+| nomerge | the merge subsystem | 71 | 31 | 28 |
+| ctrlB ☠ | nothing (50 seeds only) | 25 | 3 | 12 |
+
+★ `anctomb=-1` on RM-FAIL: **281/281 across every arm.**  One population
+throughout; no arm is producing a lookalike.
+
+☠ **The trailing bracket control is INCOMPLETE** -- 50 of 160 seeds -- because
+the run was killed under system memory pressure (see below).  So the intended
+"control at both ends" bound is weaker than planned: ctrlA gives 60 per 160 and
+ctrlB's partial rate scales to roughly 80, i.e. a control band of about 60-80.
+**Every arm falls inside or beside that band.**  The honest reading is therefore
+NOT that some feature slightly raises RM-FAIL, but that **no feature moves it
+outside control variance at all.**
+
+#### What this leaves
+
+`nocompress` is the decisive arm: with path compression compiled out there are
+**no compressed nodes in the trie at all**, so every holder is a plain internal
+node or an external chain -- and the defect fires 64 times.  `list0` removes the
+cell indirection from `ft_node_holder` (a head's `prev` is then the owner
+directly) -- 61.
+
+**So the defect lives in the PLAINEST configuration the structure has**: an
+external head whose `prev` names an internal owner directly, no compression, no
+skip encoding, no cell, and the identity compare at the body arm fails anyway.
+Every mechanism this document has proposed -- the up-walk, the SKIP_X dual, the
+compressed-holder arm, the retire-time namer -- needs a feature that can be
+switched off without touching the defect.
+
+☞ What survives is exactly one sentence: **`ft_node_holder(node)` at
+`ft-remove.h:5388` returns a LIVE but WRONG internal node, and nothing
+re-validates it before the compare.**  That is now a small enough claim to hunt
+directly, and -- because it needs none of the optional structure -- a MINIMAL,
+possibly single-threaded reproducer should exist.  That is the next step.
+
+#### ☠ An operational note, because it cost the bracket control
+
+`/tmp` on this box is **tmpfs, i.e. RAM**.  It was holding ~90 GB: the gate's
+per-config source trees (~40 GB, ~16 configs at ~2.4-2.7 GB each, accumulated
+across sessions) plus assorted session scratch.  Add 8 concurrent `NOFREE=1`
+rigs -- which LEAK retired nodes by design -- at an 8 GB cap each, and an
+unrelated 24 GB VM, and the box shed background jobs mid-arm.  The memcg cage
+did its job per seed; what was unbounded was the SUM.  Two follow-ups for any
+future sweep: bound `concurrency * cap` against free RAM *minus the tmpfs*, and
+`systemctl --user reset-failed` afterwards -- 405 failed transient scopes had
+accumulated, one per aborting seed.
+
+---
+
 ## 6. What the fix must not break
 
 * **Liveness — and ☠ SKIPPING IS NOT AN OPTION.**  Refutation (2) is the
