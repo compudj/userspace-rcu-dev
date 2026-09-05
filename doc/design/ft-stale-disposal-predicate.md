@@ -661,6 +661,110 @@ terminating loop.
 
 ---
 
+### 5.3 ☠☠☠ THE THIRD DISPOSITION IS REFUTED TOO — and on a premise the whole file shares
+
+Three adversarial skeptics were run against the forward-slot design (§5.2's
+successor: acquire a candidate holder, then validate by reading the
+key-selected slot INSIDE it under its own lock, with a one-way ratchet that
+forbids the back-pointer as a candidate source after lap 0).  **All three
+returned REFUTED.**  Two of them, working independently on different questions,
+converged on the same root cause.
+
+★★★★★ **THE FORWARD PATH IS NOT FORWARD.**  `ft_anchor_descend` resolves every
+SKIP-COMPRESSED hop through `ft_descent_step` -> `ft_reanchor_flag` ->
+`ft_skip_reanchor` (`ft-helpers.h` ~:1970-2060), **which walks UP BACK-EDGES**:
+it reads `ft_head_parent_word_raw(...)` (== `G->prev`) and
+`metadata->parent_word`, accumulates upward, and returns `*at_pos = parent` as
+the descent's own result.  VERIFIED by reading.  The stronger form: under
+default config a compressed holder `cn` is **not forward-reachable at all** --
+the grandparent's slot holds `SKIP(node, len)` aimed straight at the external,
+and `cn` is recoverable ONLY through `node->prev`.
+
+☞ So *"The FORWARD path is authoritative, so re-derive the holder by a
+key-guided descent"* -- the rule this file states at `ft-remove.h` ~:5081, and
+the rule BOTH refuted dispositions were built to obey -- is false exactly where
+the defect lives.  A "re-descend" lap re-derives the same dead holder with zero
+peer commits, which is the §5.2 hang with the roles swapped.
+`ft_skip_reanchor`'s own comment (~:1935) cures its non-convergent case on the
+premise *"@G's parent chain runs through live nodes"*; that premise is what
+fails.
+
+☠ **The suites cannot see it.**  `tests/regression/test_urcu_ft_inv.c:21182` --
+*"only `*_spec` keeps `CDS_FT_FLAG_SKIP_COMPRESSED` set"*.  ft_inv 128/128 is
+largely blind to the shape that breaks the design.
+
+**Further defects found, each verified in the tree:**
+
+* ☠ **Class (a) would DETACH THE WRONG WORD.**  The predicate
+  `ft_node_external(v) && ft_node_ptr(v) == node` is satisfied by a SKIP_X
+  dual: `ft_node_external` is only `(v & FT_TAG_MASK) == 0`, a skip word is
+  `child | (len << FT_SKIP_LEN_SHIFT)` with the child's tag bits asserted zero,
+  and `_ft_node_mask_ptr` strips the length.  The tree already names this trap
+  in `ft_slot_in_node` (`ft-helpers.h` ~:2388): *"Skip before external: a skip
+  pointer's low bits read as external."*  Test `ft_node_skip_compressed` FIRST.
+  ★ A wrong (a) is KEY LOSS, strictly worse than the bogus refusal being cured.
+* ☠ **A RECLAIMED holder passes the lock test.**  If the stale `prev` names a
+  freed-and-recycled node, the reanchor reads its `len`/`parent_word`, the lap
+  LOCKS it -- its word is clean, it is live, merely not ours -- finds
+  `->child != node`, and answers NOT_FOUND **at a genuine linearization point
+  about the wrong node**.  ☞ `NOFREE=1` HIDES THIS, and every seed of the
+  corpus below ran with it.
+* ☐ **A root-attached holder has nothing to lock.**  `d.pnf == NULL` names no
+  state word (`ft-mutation-node.h`:1579, *"no node to lock, auto-guarded by the
+  root-slot CAS"*), so the validation has no meaning there.
+* ☠ **Dropping the PER_NODE gate is an EXCLUSION LOSS**, in the tree's own
+  words: the re-aim assigns `holder_flag` without re-deriving `holder_depth`,
+  and `ft-remove.h`:5655 says *"it becomes a MIS-ANCHOR"* when that gate widens.
+* ☠ **HOLD DURATION.**  The mark would be held across the unsplice reservation
+  malloc, the branch txn malloc, the arm, its commit, AND the post-commit
+  UN-ABORTABLE unsplice loop (~:6040), which spins on OOM.  Pre-hoist the
+  holder's release rode the structural commit and nothing was held there.
+* ☠ **`-ENOMEM` is folded into `*need_retry`**, though the arms deliberately
+  distinguish it (*"-ENOMEM is not a peer ... does NOT age the handle"*).  Under
+  memory pressure the remove retries forever instead of returning MEMORY_ERROR.
+* ☠ **"No extra CAS" is false**: the op runs TWO acquire commits where it ran
+  one -- a standalone acquire txn plus the arm's own set, the dedupe only
+  removing the holder from the latter.  Cost, not safety.
+* ★ **The laps run inside ONE read-side bracket**, so each lap blocks peers'
+  deferred frees: obstruction-free with unbounded RSS.  ☞ **This finally
+  accounts for §5.2's Disposition A**, whose 5-of-20 memcg kills had no
+  explanation.
+
+**What SURVIVED scrutiny** (so it need not be re-litigated): no deadlock (the
+acquire is a try-lock and the set acquire is all-or-none, so a cycle degrades
+to ping-pong plus aging, not a wait); release is total (all 10 post-hoist exits
+carry it, no `goto`, no double release); no `MAX_LOCKS` overflow (extras never
+enter `t->locks[]`); the lock DOES exclude peer writers of the slot; and the
+GP-starvation line is not made worse.  ☞ The `shared`/`txn_owned` guard terms
+on the anchor are DEAD code.
+
+### 5.4 ☑ THE TAXONOMY RE-MEASURED AT 3.2x — and a THIRD population
+
+**Workload** (without it the table cannot be re-derived): the in-tree rig
+against a `-DFT_ENABLE_TRACING` build (`-O2 -g -DNDEBUG`), `CHK=1 WRITERS=2
+ALPHA=2 MAXLEN=8 NSTABLE=100 NCHURN=100 SECS=5 READERS=4 NOFREE=1`, seeds
+1..160, 8 concurrent, each in its own 8G memcg, default feature flags.
+160 seeds -> **134 classified violations** (129 rc=134, 20 rc=139, 5 rc=0,
+4 rc=124, 2 rc=137).
+
+| oracle | n | `anc_tomb >= 0` | dominant `headis` |
+|---|---|---|---|
+| RM-FAIL (defect 2) | 81 | **0/81 — 0.0%** | `node` (72) |
+| RM-LOOKUP-MISS (defect 1) | 28 | **28/28 — 100%** | `null` (14) |
+| STALE-FOUND | 25 | **19/25 — 76%** | `other` (21) |
+
+★ **The two-defect discriminator is 109/109 PERFECT** at 3.2x the 42 samples
+§3.3 was written on.  The taxonomy holds.
+
+☐ **STALE-FOUND IS A THIRD POPULATION.**  It straddles the discriminator and is
+marked by `headis=other` (21/25) -- the holder's external head names a DIFFERENT
+node than the lookup found.  Every sample carries `rmsite=0`, because the oracle
+fires in a LOOKUP, not a remove; and `stale_ext`/`stale_det`/`alone` are
+non-zero, i.e. the defect-1 fixes are firing and this happens anyway.  It owes
+its own root cause.  ☠ Also unaccounted: **20 of 160 runs SEGV**.
+
+---
+
 ---
 
 ## 6. What the fix must not break
