@@ -5319,6 +5319,32 @@ unsigned long ft_dbg_rm_stale_holder;
  * (-DFT_RM_HOLDER_RECHECK), DEFAULT OFF.  A/B over 20 seeds of the two-writer
  * reproducer, identical source, only this arm differing:
  *
+ * ☠☠☠ AND MULTI-WRITER STRESS SAYS IT IS NOT A FIX.  MEASURED 2026-09-06:
+ *
+ *   - ft_unit 331/331 and ft_inv LIST-OFF 128/128 pass, but ft_inv LIST-ON and
+ *     the FT_INV_MW concurrent-writer leg BOTH HANG at test 44
+ *     (inv_insert_replace_splice_window, rc=124 after `ok 43`) -- the very test
+ *     FT_RM_ACQUIRE_FIRST hangs, by the same alternation moved up to the
+ *     wrapper: the tombstone arm runs a DESCENT precisely when @node->prev is
+ *     lazily stale, so @holder_flag is descent-derived while @fresh here is
+ *     prev-derived, the two disagree PERMANENTLY, every attempt reports
+ *     "moved", and the op never converges.  Test 44 serialises its writers, so
+ *     that hang is never contention.
+ *
+ *   - ☠ AND THE OBVIOUS GATE TRADES THE CURE FOR THE HANG.  Adding
+ *     `!have_descent &&` here (ask @prev only about a holder that came from
+ *     @prev) clears BOTH hangs -- ft_unit 331/331, ft_inv on/off/mw 128/128,
+ *     all rc=0 -- and RM-FAIL then reads 21/30 on the two-key reproducer
+ *     against 21/30 for the control.  THE CURE IS GONE.  So the cure and the
+ *     hang are ONE code path: this arm withdraws the refusal only by retrying
+ *     on exactly the condition that does not always terminate.
+ *
+ *     ☞ Which is why a bare double-read cannot be the fix.  It re-reads
+ *     @node->prev with NO LOCK HELD, so it stabilises nothing and compares
+ *     across two derivations.  A sound version must take the candidate's lock
+ *     FIRST and re-read @prev under it -- prev against prev, never prev
+ *     against a descent -- so that "unchanged" means "cannot change".
+ *
  *     RM-FAIL (the shape it targets)   11/20  ->   1/20
  *     SEGV                              2/20  ->   2/20   (unchanged: it does
  *                                                          NOT create these)
