@@ -2021,6 +2021,44 @@ note the owner ASSERT still fires 2/12 with the flag on, and that is expected,
 not a failure: it is placed BEFORE the dispatch and reports the arm's coverage,
 which the flag does not change.
 
+#### ☠☠☠ CORRECTION — THE CHAIN ABOVE IS BROKEN AT ITS CRUCIAL LINK
+
+Mathieu asked whether the cure is "an extra lock".  Chasing that refuted my own
+mechanism, and the correction matters more than the mechanism did.
+
+The publish target is not meant to be locked by a NEW acquire: the design
+already tries.  `ft_flip_txn_lock_or_guard_parent` attempts
+`ft_acquire_member(parent_nf)` and skips it ONLY when the parent's byte-depth
+cannot be derived from the descent -- `parent_depth == FT_DEPTH_FROM_DESCENT &&
+!ft_lock_ctx_depth_of(...)` -> `t->acquire_miss = true; goto guard;`.  Verified
+at the faulting op: **`acquire_miss = true`, `nr_locks = 1`,
+`structural_sw = true`.**
+
+☠ **And `acquire_miss` makes the commit DISCARD ITSELF UNPUBLISHED**
+(`ft-mutation-helpers.h:4114-4120`): *"A lock-set member was not acquired, so
+this attempt writes a slot it does not own: discard it unpublished and report
+the reason... **Nothing was parked either way.**"*
+
+**So the unowned record NEVER LANDS.**  The blind-write step of §5.19 does not
+happen, `late_tag` never has to protect anything, and no peer value is
+overwritten.  That also explains cleanly why `-DFT_SW_REQUIRES_OWNER` moved
+nothing: the records it downgraded to MW were being thrown away regardless.
+
+**What actually survives:**
+
+* The owner ASSERT is doing its designed job -- it fires at RECORD time and
+  answers *"would arming this site be legal?"* (its own header says so).  A
+  2/12 hit rate is a real **CONVERSION-SURFACE GAP** for the Phase B arm.  It
+  is NOT evidence of a live memory-safety bug.
+* The cost of the miss is **LIVENESS, not safety**: the op aborts and
+  re-descends.  Making the depth derivable on this path would turn an abort
+  into progress -- which points at the rc=124 / rc=137 wedging measured in
+  §5.16, not at the SEGVs.
+* ☠ **CLUSTER A IS THEREFORE UNEXPLAINED AGAIN.**  §5.18's descriptor
+  use-after-free evidence stands on its own (the `rcu_head` already carrying
+  `urcu_txn_free_rcu`, the record mutating between fault and inspection); what
+  is withdrawn is the attribution of it to the owner miss.
+
 ☞ **Status: LOCATED, NOT FIXED.**  What is established: the site, the arguments,
 that the txn is armed with one unrelated lock, and that the record it then parks
 is SW and unvalidated.  What is NOT established: that this specific park is the
