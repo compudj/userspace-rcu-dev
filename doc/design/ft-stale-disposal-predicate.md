@@ -1949,6 +1949,48 @@ it to SW on the strength of a DIFFERENT node's lock.  So this is not an ordering
 bug that a barrier or a re-order could fix; it is a COVERAGE bug, and ordering
 cannot protect a word the op never excluded.
 
+#### ★★★★★ THE ENGINE ALREADY NAMES THIS EXACT CORRUPTION -- and its defence needs the lock
+
+Two more questions from Mathieu, both answered from the code, and together they
+close the mechanism.
+
+**Is the lock TAKE in the same txn as the structural commit?  NO -- separate.**
+`ft_dlm_acquire_set` allocates a STANDALONE acquire txn
+(`ft_flip_txn_acquire_bounded(3 * nr_present)`, `ft-mutation-helpers.h:5838`);
+binding it to the op handle was measured WORSE (`:5831-5836`).  Insert reaches
+it at `ft-insert.h:778`.  So the lock is taken in one descriptor and released by
+a terminal in another, held across both.
+
+**At settle, are SW fields settled before MW?  NO -- that is not the axis.**
+`urcu_txn_settle` (`rcu-txn-mcas.h:713-744`) is TWO-PASS: pass 1 stores every
+record whose `proxy_tag != late_tag`, pass 2 stores the `late_tag` records.  The
+split is not MW/SW at all -- it is **STRUCTURAL WORDS FIRST, OWNERSHIP WORDS
+LAST**.  And `ft-mutation-helpers.h:4095-4102` sets `late_tag = FT_STATE_PROXY`
+with the reason spelled out:
+
+> *"THE FT'S OWNERSHIP WORDS ARE ITS STATE WORDS.  A node's lock lives in
+> meta->state (FT_STATE_PROXY), and this commit's release of that lock must
+> become visible only after every structural word the lock protects is plain --
+> otherwise **a peer acquires on the strength of the release while our SW parks
+> are still parked, and OUR OWN SETTLE OVERWRITES WHAT IT THEN PUBLISHES.**"*
+
+★★ **That final clause is the corruption in §5.18, described in the tree as a
+hazard the engine already defends against.**  The defence is `late_tag`, and it
+is keyed on THE LOCK BEING IN THE DESCRIPTOR: pass 2 can only hold back a
+release the commit actually carries.
+
+**The unowned SW park has no ownership word for its node.**  So `late_tag`
+orders nothing for it -- there is no release to defer, no peer excluded -- and
+the commit's settle stores into a word no lock protected, overwriting whatever a
+peer published there.  The peer's descriptor then references a word carrying our
+value, and its walker faults in `urcu_txn_install_mw_depth`.
+
+☞ So the engine's ordering is SOUND and the arm's coverage is not.  Every
+protection in this path -- the decide as one linearization point, the two-pass
+settle -- is conditioned on the record's owner being held.  §5.19's arm grants
+SW conversion on the strength of a DIFFERENT node's lock, which is precisely the
+condition all of it assumes.
+
 ☞ **Status: LOCATED, NOT FIXED.**  What is established: the site, the arguments,
 that the txn is armed with one unrelated lock, and that the record it then parks
 is SW and unvalidated.  What is NOT established: that this specific park is the
