@@ -1879,6 +1879,66 @@ of an owner miss -- on the 2 s two-key reproducer.
 
 ---
 
+### 5.19 ★★★★★ THE OWNER MISS, LOCATED — arming is gated on "a lock", not "the right lock"
+
+Entering through §5.18's assert instead of the SEGV names the site in one
+backtrace.  It is the **INSERT**, not the remove:
+
+    #6  __ft_flip_txn_record_tag_ctx     ft-mutation-helpers.h:4284  <- assert
+    #8  ft_flip_txn_record_reserved      :4986
+    #9  ft_flip_txn_record_pub_rec       :5052
+    #10 ft_insert_publish_or_park        ft-insert.h:691
+    #11 ft_insert_compressed_past_child  ft-insert.h:2592
+
+That is the peer performing the EXTENSION INSERT -- the very edit §5.10 roots
+the whole defect in.  Its arguments at the abort:
+
+    owner   = 0x7ffff4a00058     slot    = 0x7ffff4800000
+    old_ptr = 0x55555556ff20     <- HEAP: an application-owned cds_ft_node
+    new_ptr = 0x7ffff5c003e1     tag     = 15 (0xF, the flip-proxy tag)
+    dbg_ctx = 0                  <- no retire-witness supplied
+    t->nr_locks = 1   t->dbg_arm_per_op = true   t->structural_sw = TRUE
+
+#### The mechanism
+
+`ft_insert_publish_or_park` (ft-insert.h:689-693) does, in order:
+
+    ft_flip_txn_arm_per_op(ft, ic->txn);      /* -> structural_sw = true */
+    _ft_publish_to_parent(ft, parent_nf, slot, new_top, expected_old, &rec, false);
+    ft_flip_txn_record_pub_rec(ic->txn, &rec);   /* the assert fires here */
+
+The arm's own comment states the premise it is supposed to enforce: it *"refuses
+an empty registry, a non-FINE trie, and a trie whose constructor already armed it
+trie-wide -- so a shape that acquired nothing keeps today's all-MW behaviour
+rather than PARKING ON AN EXCLUSION IT NEVER TOOK."*
+
+☠ **But the gate is "the registry is NON-EMPTY", not "the registry COVERS this
+record's owner."**  Here `nr_locks == 1` and that one lock is not the owner of
+the slot being published.  The arm therefore fires, `structural_sw` goes true,
+and the edge becomes an **SW park -- which by contract CANNOT FAIL: no CAS, no
+expected-old validation** (`ft-mutation-helpers.h:7967-7984`).
+
+**An unowned SW park is a blind write to a word another writer may own.**  That
+is a sufficient mechanism for §5.18's descriptor use-after-free: a blind store
+into a word some other op's record points at leaves that op's `r->slot`
+referencing something it does not control, and the walker faults in
+`urcu_txn_install_mw_depth`.
+
+★ **Holding A lock is not holding THE lock.**  The predicate the arm needs is
+per-RECORD (does the registry cover THIS owner?), and the one it has is
+per-TXN (did we acquire anything at all?).  The assert at `:4284` asks the
+per-record question and is what caught the difference.
+
+☞ **Status: LOCATED, NOT FIXED.**  What is established: the site, the arguments,
+that the txn is armed with one unrelated lock, and that the record it then parks
+is SW and unvalidated.  What is NOT established: that this specific park is the
+one that corrupts the descriptor in §5.18's faulting op -- the chain is coherent
+and each link is verified, but the two have not been tied together in one trace.
+LTTng with the slot address as the grep key is the way to close that, and the
+reproducer is 2 s.
+
+---
+
 ## 6. What the fix must not break
 
 * **Liveness — and ☠ SKIPPING IS NOT AN OPTION.**  Refutation (2) is the
