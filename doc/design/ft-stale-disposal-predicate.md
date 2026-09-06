@@ -1929,6 +1929,26 @@ per-RECORD (does the registry cover THIS owner?), and the one it has is
 per-TXN (did we acquire anything at all?).  The assert at `:4284` asks the
 per-record question and is what caught the difference.
 
+#### ☞ IT IS NOT AN ORDERING BUG (Mathieu's question, answered from the code)
+
+*Does the insert's txn perform the SW structural updates before the MW lock
+release?*  **No -- not within one commit.**  `urcu_txn_partition`
+(`rcu-txn-mcas.h:469-478`) puts every MW record before every SW record, but that
+orders the PROXY PLANT, not the value: a parked word resolves to `old_ptr` while
+`status != SUCCEEDED` and to `new_ptr` only after (`:261-262`), and settle is
+"write the direct new into every slot" (`:61`).  So the DECIDE is the single
+linearization point, the lock word reads HELD for the whole install phase, and
+the release and the structural writes become visible together.
+`ft-mutation-helpers.h:4131` states it from the other side: *"the release
+terminals consume the locks AT the commit's linearization."*
+
+★★ **Which is exactly what this defect does NOT get.**  The safety above is a
+property of a lock that is IN THE DESCRIPTOR.  The unowned SW park has no
+corresponding lock and therefore no release record at all -- the arm converted
+it to SW on the strength of a DIFFERENT node's lock.  So this is not an ordering
+bug that a barrier or a re-order could fix; it is a COVERAGE bug, and ordering
+cannot protect a word the op never excluded.
+
 ☞ **Status: LOCATED, NOT FIXED.**  What is established: the site, the arguments,
 that the txn is armed with one unrelated lock, and that the record it then parks
 is SW and unvalidated.  What is NOT established: that this specific park is the
