@@ -1991,6 +1991,36 @@ settle -- is conditioned on the record's owner being held.  §5.19's arm grants
 SW conversion on the strength of a DIFFERENT node's lock, which is precisely the
 condition all of it assumes.
 
+#### ☠ THE OBVIOUS CURE WAS BUILT AND REFUTED: MW is a VALIDATION, not an EXCLUSION
+
+The fix the analysis points at is to ask the arm's question PER RECORD: keep the
+arm, but plant a record MW rather than SW when the registry does not cover THAT
+record's owner.  Built as `-DFT_SW_REQUIRES_OWNER` (default OFF; a new
+non-debug `sw_per_op` flag distinguishes the per-op arm from a trie-wide one, so
+coarse/exclusive tries are untouched).
+
+**MEASURED, DETERM reproducer, 30 seeds, `CHK=0 SECS=2 NOFREE=0`:**
+
+| | rc=139 |
+|---|---|
+| flag OFF | 3/30 |
+| flag ON | 4/30 |
+
+**Unchanged.**  ☠ And the reason refutes the intuition the whole idea rested on
+-- including the tree's own "stricter and always sound" (`ft-remove.h:4004-4009`),
+which is true about SOUNDNESS and irrelevant here:
+
+★ **MW is a VALIDATION, not an EXCLUSION.**  An MW record still STORES its new
+value into the slot at settle.  The kind buys an expected-old check at install,
+and when no peer is contending that exact word at that instant the CAS succeeds
+and the settle writes anyway -- into a word this op never owned.  **Downgrading
+the record KIND cannot close an OWNERSHIP gap.**
+
+☞ So the cure must make the op ACQUIRE the word, or not record it at all.  Also
+note the owner ASSERT still fires 2/12 with the flag on, and that is expected,
+not a failure: it is placed BEFORE the dispatch and reports the arm's coverage,
+which the flag does not change.
+
 ☞ **Status: LOCATED, NOT FIXED.**  What is established: the site, the arguments,
 that the txn is armed with one unrelated lock, and that the record it then parks
 is SW and unvalidated.  What is NOT established: that this specific park is the

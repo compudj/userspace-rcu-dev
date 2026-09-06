@@ -1411,6 +1411,17 @@ struct ft_flip_txn {
 	 */
 	bool structural_sw;
 	/*
+	 * TRUE only when @structural_sw was set by the PER-OP arm
+	 * (ft_flip_txn_arm_per_op), never by a trie-wide constructor arm.  The
+	 * two justify SW parks on different exclusions: the trie-wide arm rests
+	 * on the FT-wide mutex or an exclusive trie, which excludes every peer
+	 * whatever this txn holds, while the per-op arm rests on THIS op's own
+	 * per-node lock registry -- which is a claim about specific owners.
+	 * Only the second can be wrong for a given record, so only the second is
+	 * worth re-asking per record (-DFT_SW_REQUIRES_OWNER).
+	 */
+	bool sw_per_op;
+	/*
 	 * --enable-rcu-debug only: the NAMED trie's root slot, for the
 	 * assertion in ft_flip_txn_record_tag that no generic structural
 	 * record ever aims at it (ft_flip_txn_record_root is the only legal
@@ -4282,7 +4293,58 @@ void __ft_flip_txn_record_tag_ctx(struct ft_flip_txn *t,
 	 * number to interpret.
 	 */
 	FT_OWNER_ASSERT_OWNED_CTX(t, dbg_ctx, owner, slot, new_ptr);
+	/*
+	 * ☐ OPT-IN, DEFAULT OFF (-DFT_SW_REQUIRES_OWNER).  ASK THE ARM'S
+	 * QUESTION PER RECORD.
+	 *
+	 * ft_flip_txn_arm_per_op refuses an empty registry so a shape that
+	 * acquired nothing "keeps today's all-MW behaviour rather than parking
+	 * on an exclusion it never took" -- but its gate is "the registry is
+	 * NON-EMPTY", not "the registry covers THIS record's owner".  An op that
+	 * locked one node and then records an edge on another therefore parks it
+	 * SW, and an SW park CANNOT FAIL: no CAS, no expected-old (:7967-7984).
+	 * That is a blind write to a word this op never excluded, and the
+	 * two-pass settle cannot protect it either -- @late_tag can only hold
+	 * back a release the commit CARRIES, and there is no lock for that node
+	 * in this descriptor (doc/design/ft-stale-disposal-predicate.md §5.19).
+	 * MEASURED at ft_insert_publish_or_park (ft-insert.h:691) with
+	 * nr_locks == 1 on an unrelated owner.
+	 *
+	 * Falling back to MW is STRICTER AND ALWAYS SOUND -- the same argument
+	 * ft-remove.h:4004-4009 makes for records planted before an arm.
+	 *
+	 * ☠ WHY IT IS OPT-IN.  ft_flip_txn_owns is a LOWER BOUND: its own header
+	 * says it "only ever refuses a park, never permits one", because
+	 * resolving a coarser spacing's ANCHOR would need the op's descent,
+	 * which a record helper does not have.  So under anchored lock-sets this
+	 * downgrades LEGITIMATE SW parks to MW -- sound, but a hot-path
+	 * behaviour change that must be measured before it is a default.
+	 *
+	 * ☠☠☠ AND IT DOES NOT FIX THE DEFECT.  MEASURED on the DETERM
+	 * reproducer, 30 seeds, CHK=0 SECS=2 NOFREE=0:
+	 *
+	 *     flag OFF   rc=139: 3/30
+	 *     flag ON    rc=139: 4/30
+	 *
+	 * Unchanged.  The reason is worth keeping, because it refutes the
+	 * "stricter and always sound" intuition this arm was built on: MW is a
+	 * VALIDATION, not an EXCLUSION.  An MW record still STORES its new value
+	 * into the slot at settle; all the kind buys is an expected-old check at
+	 * install, and when no peer happens to be contending that exact word at
+	 * that instant the CAS succeeds and the settle writes anyway -- into a
+	 * word this op never owned.  Downgrading the KIND cannot close an
+	 * OWNERSHIP gap.
+	 *
+	 * ☞ So the cure for §5.19 has to make the op ACQUIRE the word (or not
+	 * record it), not merely validate it.  Kept compiled-out with its
+	 * numbers so the next reader does not re-derive the same dead end.
+	 */
+#ifdef FT_SW_REQUIRES_OWNER
+	if (t->structural_sw &&
+	    (!t->sw_per_op || ft_flip_txn_owns(t, owner))) {
+#else
 	if (t->structural_sw) {
+#endif
 		FT_TK_COUNT_REC(t, FT_TK_SW);
 		FT_AB_ARM(FT_AB_SW, FT_AB_OWN_NA);
 		ret = urcu_txn_store_sw(t->mtxn, slot, old_ptr, new_ptr, tag);
@@ -4929,6 +4991,7 @@ void ft_flip_txn_arm_per_op_at(const struct cds_ft *ft, struct ft_flip_txn *t,
 	}
 	ft_flip_txn_claim_per_op(t);
 	ft_flip_txn_set_structural_sw(t, true);
+	t->sw_per_op = true;	/* this arm's exclusion is the lock registry */
 	FT_ARM_REACH_HIT(rs, armed);
 }
 
