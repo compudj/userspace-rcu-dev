@@ -1827,6 +1827,58 @@ and it is now the gate on §5.16.
 
 ---
 
+### 5.18 ☞ CLUSTER A IS AN OWNER MISS — the engine's own asserts name it
+
+§5.17 left cluster A precisely located but unexplained:
+`urcu_txn_install_mw_depth`, `rcu-txn-mcas.h:566`, i.e.
+`v = uatomic_load(r->slot)` faulting on **the record's own slot pointer**.
+
+**The descriptor dump says use-after-free, not corruption.**  At the fault:
+
+    r      = 0x7fffe7800060
+    *r     = { slot = 0x2, old_ptr = 0x7fffe0000ff0, new_ptr = 0x7fffe0001020,
+               proxy_tag = 1, desc = 0x7fffe7800020, kind = 1 }
+    *desc  = { status = 1, nr = 11, nr_mw = 11, cap = 32, retry = 1,
+               poisoned = 0, slab = 1, late_tag = 1, recs = 0x7fffe7800060,
+               rcu_head = { next = 0x7ffff5e02dc8, func = urcu_txn_free_rcu } }
+
+Three things at once: only `slot` is non-pointer (`0x2`) while `old_ptr`,
+`new_ptr` and `desc` are plausible arena addresses; the descriptor's
+**`rcu_head` already carries `urcu_txn_free_rcu`**, so it has been QUEUED FOR
+RECLAMATION while being committed; and `slab = 1`, so it is recyclable.  ★ On a
+re-run, inspecting the SAME record address post-mortem showed a VALID slot
+pointer and 11 sane slots -- **the value changed between the faulting load and
+the inspection**, which is a concurrent mutation of a descriptor another thread
+is walking.
+
+#### ★ WITH THE ENGINE SELF-CHECKS ARMED, THE SEGV IS REPLACED BY AN ASSERT
+
+Built `-DDEBUG_RCU -DURCU_TXN_DEBUG_RESERVE -DURCU_TXN_DEBUG_READ_POLICY`
+(armed proof by a two-line TU: `PROBE ENGINE_ASSERTS=ON`).  12 seeds of the
+DETERM case: **zero rc=139**, and instead 2/12 abort on
+
+    ft-mutation-helpers.h:4284  __ft_flip_txn_record_tag_ctx:
+    Assertion `!(t)->dbg_arm_per_op || !(t)->nr_locks || ...'
+
+That is `FT_OWNER_ASSERT_OWNED_CTX` (`:1067`): **a txn that has CLAIMED per-op
+ownership is recording an edge on a node it does NOT own**, and no
+`ft_owner_retire_witnessed` covers it.  The classic OWNER MISS -- which splits
+into a FINDING (the txn owns the clearing) and a VISIBILITY gap (a caller's
+sweep does), and only the second may widen the predicate.
+
+☞ **THIS IS THE DEFAULT PATH.**  The build carries NO `FT_RM_HOLDER_RECHECK`
+and no other disposition; it is stock `cds_ft_remove` under two writers.  So
+the rc=139 lane is not a property of any proposed fix -- it is an ownership
+violation the engine has been able to detect all along, in a configuration
+nothing in this investigation had armed until now.
+
+☞ **NEXT**: take the assert as the entry point rather than the SEGV.  It fires
+EARLIER and names the offending record, where the SEGV only names the walker.
+Ask `ft_flip_txn_owns` WHICH owner missed and WHO CLEARS it -- the two halves
+of an owner miss -- on the 2 s two-key reproducer.
+
+---
+
 ## 6. What the fix must not break
 
 * **Liveness — and ☠ SKIPPING IS NOT AN OPTION.**  Refutation (2) is the
