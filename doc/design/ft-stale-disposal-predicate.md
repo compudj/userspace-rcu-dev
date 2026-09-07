@@ -2177,3 +2177,436 @@ FT_TRACE_SESSION=$S CHK=1 WRITERS=2 ALPHA=2 MAXLEN=8 NSTABLE=100 NCHURN=100 \
    ambiguous and the whole analysis is "what happened to *this* node".
 4. Resolve `item_retire`'s caller as `caller - (self - nm_offset(cds_ft_debug_ext_violation))`;
    `@self` on `ext_violation` is the ASLR anchor.
+
+### 5.20 ★★★★★ THE DEFECT IS ONE HOP OF ARM SELECTION — NOT A LOCK, NOT A RACE
+
+☞ **This section retires the whole locking lane.**  Every disposition from 5.13
+through 5.19 asked *which lock makes the derivation safe*.  Measurement says the
+derivation was never unsafe: the premise that goes stale is **"@node sits
+DIRECTLY in the holder's body slot"**, and it goes stale by ONE HOP.
+
+Build `-DFT_RM_REVALIDATE -DFT_RM_REVAL_COUNT` (counters default OFF, dumped by
+a destructor -- ☠ the writer oracle's `abort()` and the reader oracles' `_exit()`
+SKIP it, so run `CHK=0`).  Workloads: `ft_unit`, `ft_inv on`, `ft_inv mw`, and
+the §5.14 two-key rig (`CHK=0 DETERM=1 WRITERS=2 READERS=0 SECS=1`, memcg 6-10G).
+
+#### (a) ALL failures leave by ONE return, and ALL of them took the tombstone descent
+
+Every bogus NOT_FOUND leaves by the internal-holder body-slot arm
+(`node %p not at key slot`).  The other six `CDS_FT_STATUS_NOT_FOUND` returns
+count **0** in every run.  And the failure count equals the `have_descent`
+count EXACTLY, three seeds running:
+
+| seed | `desc` (have_descent) | bogus NOT_FOUND | `nodesc` |
+|---|---|---|---|
+| 1  | 1,862 | **1,862** | 131,378 |
+| 4  | 1,810 | **1,810** | 146,925 |
+| 17 | 1,873 | **1,873** | 144,649 |
+
+So the failing population is precisely: *holder derived from `node->prev` was
+TOMBSTONED → the tombstone arm re-derived it by a forward descent → the arm then
+refused.*
+
+#### (b) THE HOP — 5,136+ samples, 100% unanimous, 0 exceptions
+
+Probed at that return, every one with the holder's lock HELD:
+
+| probe | seed1 | seed4 | seed17 |
+|---|---|---|---|
+| forward descent reaches `node`       | 0 | 0 | 0 |
+| ... reaches a DIFFERENT node         | **1,579** | **1,810** | **1,749** |
+| ... key unreachable (truly gone)     | 0 | 0 | 0 |
+| descended holder == the locked one   | 100% | 100% | 100% |
+| holder's lock was held               | 100% | 100% | 100% |
+| slot child is INTERNAL (ext/null 0)  | 100% | 100% | 100% |
+| slot child == the descent's TERMINAL | 100% | 100% | 100% |
+| **`node` IS A MEMBER of slot child** | **100%** | **100%** | **100%** |
+| `node` NOT a member                  | 0 | 0 | 0 |
+
+**The mechanism.**  A peer inserting a key that EXTENDS @node's converts @node's
+leaf into a **PREFIX HEAD in place** at the holder's body slot, retiring nothing.
+Afterwards the key is still present, the holder is still right, and `node` is
+still LIVE -- it is a **member of the head that took its slot**, exactly one hop
+below where this arm looks.  The arm compares the slot's occupant to `node`, sees
+a different pointer, and returns the PERMANENT, key-losing NOT_FOUND of §1.
+
+★ The descent ALREADY KNEW: `slot_child == fd.nf` at 100%.  The tombstone arm
+keeps `d.pnf` (the head's PARENT) as the holder when the answer -- the head
+itself -- is sitting in `d.nf`.
+
+#### (c) THE LOAD / LOCK / RELOAD HAS NO COVERAGE HERE, AND CANNOT HAVE
+
+`-DFT_RM_REVALIDATE` re-reads `ft_node_holder(node)` under the holder's lock and
+retries the whole op on a mismatch.  Measured, ungated, split by population,
+just after the acquire:
+
+| population | share | back edge MOVED | SAME |
+|---|---|---|---|
+| `!have_descent` (the 98.8%) | 146,925 | **0** | 146,925 |
+| `have_descent` (**100% of failures**) | 1,810 | 1,810 | **0** |
+
+* For the **no-descent** population the back edge genuinely never moves --
+  9.7 M evaluations across `ft_unit` (11,277), `ft_inv on` (4,727,848),
+  `ft_inv mw` (4,778,712) and the rig (158,701), MISMATCH **0** in all four.
+  ☞ Positive-controlled: the SAME expression's other outcome tracks the
+  evaluation count TO THE UNIT with control flow untouched, so this is a fact,
+  not [[feedback_a_weak_hook_resolves_to_null_silently]].
+* For the **descent** population the compare is unequal **by construction, from
+  the instant the arm runs** -- the tombstone arm REPLACED `holder_flag` with
+  `d.pnf` while `node->prev` still names the retired holder.  Nothing moved:
+  `moved` at the acquire (1,810) equals `moved` at the failing site (1,810)
+  equals the population (1,810).  Comparing a descent-derived holder against a
+  back edge is a category error, and un-gating it reproduces the alternation
+  livelock this file already documents for the broken acquire-hoist.
+
+☞ **Therefore the `!have_descent` gate is correct AND the check is blind to
+every failure.**  The approach is not mis-implemented; it is structurally
+incapable of seeing this defect.
+
+★ This also explains `FT_RM_HOLDER_RECHECK`'s measured RM-FAIL 20/30 → 0/30:
+`ft_rm_holder_moved()` is trivially TRUE for exactly the failing population, so
+it converts that refusal into a retry **carrying no information**.  That is why
+the site says the diagnosis is right and the disposition is not.
+
+#### (d) The contention lane, for completeness
+
+Rig, per 1 s: `entered` 2,005,003 · `-EAGAIN` 1,856,268 (`lock` 1,790,938 ·
+`proxy` 30,074 · `tomb` 14,025 · `other` 21,231) · `held` 148,735.  92% of
+acquires refuse, 97% of those on a peer's node LOCK.  A contention lane, not the
+defect.  ☞ `-DFT_RM_KEEP_TURN` (keep the FIFO turn on the revalidate-mismatch
+bail; the engine forfeits it by design, `rcu-txn.h` §"Why a pre-commit retry
+must not keep the turn") measured **byte-identical to control on 30 seeds** --
+because the mismatch it hangs off never fires for the failing population.
+
+#### What this does and does not license
+
+* It does **not** re-open §5.13.  That was refused for accepting a word by SHAPE
+  (`ft_node_external` passes a SKIP_X dual) and then DETACHING it.  The probe
+  above accepts nothing and detaches nothing: it is an **exact pointer-identity
+  membership walk** over the head's own list.
+* ☐ **The open design question, now narrow and no longer about locks**: when the
+  descent's terminal is an internal node whose member list contains @node BY
+  IDENTITY, the op must follow the hop -- re-aim at that terminal as the holder
+  and take the EXTERNAL-holder arm -- instead of refusing.
+* ☐ **It owes a skeptic** on the hop's own locking (the head is a second node,
+  so this is a two-level relationship), on termination, and on whether the head
+  can be re-converted underneath the re-aim.
+
+### 5.21 ☠ THE HOP IS REFUTED ON LOCUS — the arm ALREADY HELD the answer, and the tree already has the rule
+
+An adversarial skeptic was run on §5.20's proposed compare-site hop.  **Verdict:
+REFUTED**, not on soundness but on LOCUS — and the refutation is measured twice,
+independently (the skeptic in its own worktree, then re-derived here with a
+separate probe).
+
+#### The refutation
+
+The value the hop goes hunting for at the compare **is already in the op's hands
+800 lines earlier**, in the tombstone arm's own descent, and that arm throws it
+away.  At the instant `ft_anchor_descend` returns inside the tombstone arm
+(`ft-remove.h`:5575), `d.nf` IS the internal head that owns @node, at
+`d.depth == key_len` -- and :5586 unconditionally takes `holder_flag = d.pnf`
+(the head's PARENT) instead.
+
+| measurement | samples | `d.nf` == the head | == @node | other |
+|---|---|---|---|---|
+| skeptic, 4 rig runs | 10,225 | **10,224** | 0 | 1 |
+| re-derived here, 3 seeds (20 + 148 + 2,058) | 2,226 | **2,226** | 0 | 0 |
+
+The one outlier is a head recompacted between descent and acquire, which the
+arm's own tombstone test already answers as -EAGAIN.  The population the hop
+exists to serve -- a conversion landing BETWEEN the descent and the compare, the
+only case where a compare-site test sees something the descent did not -- is
+**ZERO in 12,451 samples**.
+
+#### ★ THE TREE ALREADY NAMED THE BUG IN A RULE
+
+The same function documents the derivation as TWO bullets (`ft-remove.h`
+:5613-5617):
+
+> *"UNDER the leaf: it broke on an external @d.nf, so the holder is @d.pnf at
+> @d.pdepth.  **ON the holder: the key ended at an internal node and the leaf
+> hangs off its external_nodes (a prefix key), so the holder is @d.nf at
+> @d.depth.**"*
+
+and IMPLEMENTS both at :5641-5643:
+
+    bool prefix = d.nf && !ft_node_external(d.nf) && d.depth == key_len;
+    struct cds_ft_inode_flag *fwd = prefix ? d.nf : d.pnf;
+
+☞ but that is the **coarse-spacing** arm, which does not run under the default
+`CDS_FT_LOCK_SPACING_PER_NODE`.  The TOMBSTONE arm -- the one that does run, and
+the one 100% of the failures take -- implements **bullet one only**.  This is a
+derivation inconsistency between two arms of ONE rule, not a missing mechanism.
+
+Re-derived here: that existing `prefix` predicate **would have fired on every
+single failing sample** (2,226/2,226, `would_not = 0`).
+
+#### Why the compare-site hop is WORSE, not merely redundant
+
+* It re-derives, lock-free, a fact the op already derived -- and it does so
+  AFTER the cell capture (:6069) and AFTER the pre-reserved unsplice txn.
+* Under `-DFT_RM_REVALIDATE` it acquires **the wrong word**: `holder_flag ==
+  d.pnf`, so the op takes `P`'s state word while every write in the re-aimed arm
+  touches `H`'s.  That is exactly the §5.19 shape ("arm gates on A lock, not THE
+  lock"), and it is the hold measured as peer-INSERT starvation.  Selecting
+  `d.nf` at :5586 makes the op acquire `H` and never touch `P` at all.
+
+#### Gaps the skeptic found in the hop's accept predicate (kept, so they are not repeated)
+
+1. **"Owns @node as one of its members" is too broad.**  A non-head member has an
+   EXTERNAL holder and belongs to the first arm (:6117).  Re-aiming it at the
+   head fails the ext-members arm's condition (`ft_node_external_nodes(holder)
+   == node`, :6222) and falls into the body-slot arm on `H` indexed by
+   `iter_key[key_len-1]` -- a byte `P` consumed, not `H`.  Not reachable today
+   (dups append at the tail, `ft-insert.h`:3222-3224), but the predicate admits
+   it.  The sound test is the ONE load the branch already makes.
+2. **A raw `external_nodes` walk is unsafe**: an insert of a duplicate parks a
+   flip proxy on that very slot (`ft-insert.h`:932), so a raw read dereferences
+   a descriptor.  Any such walk owes `ft_dereference_external`
+   (`ft-helpers.h`:1147).
+3. The walk is bounded only by an instrument cap while chain length is
+   caller-driven -- O(dups) per remove.
+4. **Residual, common to BOTH repairs**: with no word held across derive ->
+   select -> compare, a conversion landing in the ~100 ns window still yields
+   NOT_FOUND.  Measured floor for the [derive, acquire] half is 0 in 9.7 M
+   (§5.20c), which is not provably zero.  Only a hold across the compare closes
+   it, and that hold measured as starvation.  ☐ UNRESOLVED, and it is NOT this
+   defect's mechanism.
+
+#### What SURVIVED the attack — recorded so it is not re-litigated
+
+* **The ext-members arm IS the right arm for this shape** (:6222-6227): it is
+  written for "a prefix key (the key terminates at an internal node that also
+  has longer-key children)", which is exactly what an internal node's
+  `external_nodes` is.  The `!have_descent` population takes it ~137 k/s in this
+  rig with 0 failures.
+* **No wrong-word detach.**  Exact identity detaches nothing at the test, and
+  the arm never operates on a compressed word by shape, so the §5.13 SKIP_X-dual
+  objection does not transfer.
+* **No alternation livelock.**  A re-aim derived ONLY from the forward path
+  mixes no authorities -- unlike `FT_RM_ACQUIRE_FIRST` (:5722-5730), which
+  alternated because it mixed `node->prev` against the descent.
+* **The cell captures survive a re-aim**: `cell_was_head` / `dead_cell` /
+  `cell_succ` (:6069-6074) are properties of @node's own cell and chain, not of
+  the holder.
+* **Lock ordering `P` -> `H` is top-down and consistent**; the skip-compressed
+  fold's `H`-then-`P` is pre-existing in the same arm, not introduced.
+
+#### ☐ THE REPAIR, RELOCATED
+
+At `ft-remove.h`:5576-5586: select `d.nf` when `d.nf` is internal at
+`d.depth == key_len` -- **the rule already written at :5641-5643** -- with the
+tombstone test applied to the node actually selected, and `holder_depth =
+d.depth`.  The four-way branch then reaches the ext-members arm by its own
+existing, proxy-resolved condition: no new walk, no new predicate, no fifth
+derivation site, and the op acquires the word its writes touch.
+
+### 5.22 ☑ THE REPAIR IS IN, AND THE GATE IS GREEN — with one residual named
+
+The §5.21 repair is applied at `ft-remove.h`'s tombstone arm: the descent's two
+bullets, both of them, selecting `d.nf` at `d.depth` for a PREFIX KEY, with the
+tombstone test applied to the node actually selected.
+
+#### The reproducer
+
+30 seeds, `CHK=1 DETERM=1 WRITERS=2 READERS=0 SECS=5 NOFREE=1`, memcg 6G:
+
+| | RM-FAIL | timeout | clean | other |
+|---|---|---|---|---|
+| before | 13 | 8 | 4 | 5 |
+| after  | **2** | 9 | **14** | 5 |
+
+★ **The targeted site is CLOSED**: the body-slot arm, which was 100% of the
+failures at ~1,800/s, now returns **ZERO** NOT_FOUND on every seed measured.
+
+★ Two independent corroborations that `d.nf` is the RIGHT holder, not merely a
+different one:
+* `have_descent[moved=0 same=532]` -- `node->prev` now AGREES with the derived
+  holder.  Before the repair it was `moved=1810 same=0`, disagreeing by
+  construction because the arm aimed at the head's PARENT.
+* `MISMATCH=1504` -- the load/lock/reload, inert at 0 in 9.7 M evaluations
+  (§5.20c), now FIRES and does real work, because the holder it revalidates is
+  finally the one the back edge names.
+
+#### The gate: 17 configs, 16 PASS, 1 pre-existing red
+
+`tests/regression/ft_parallel_gate.sh`, `FT_GATE_DIR` on disk, `FT_GATE_J=8`,
+run in pairs.  All `notok=0 abrt=0` unless stated:
+
+| config | legs |
+|---|---|
+| default | unit 331 · inv on/off/mw 128 · **mwx 4 copies, 0 red** |
+| fault-audit | unit 385 · inv off 128 |
+| audit / rmcap / nokeymap / excl / nomerge / tracing | unit 331 · inv legs 128 |
+| in-place | unit 331 · inv on/off 128 |
+| vam / noskip | unit 331 (+ inv off 128 for noskip) |
+| **txndbg** | unit 331 · inv on/off/mw 128 · txn settle 1 -- **at ALL THREE spacings** (per-node, exponential, root-only) |
+| proxyassert / holdtrace / anchorval / spacingenv | unit 331 · inv on/off/mw 128 -- **at all three spacings** |
+| **nocompress** | unit **329, notok=2** -- 110 `test_merge_rekey_same_trie`, 115 `test_rekey_skip_slot_bp_atomic_or_refused` |
+
+☞ **The nocompress red is PRE-EXISTING, proven by a control run**, not asserted
+from memory: a detached worktree at HEAD `125d2bf1` WITHOUT the repair, its own
+`FT_GATE_DIR`, produces the IDENTICAL `ok=329 notok=2` on the same two tests.
+They are the known missing feature (a PLAIN-interior rekey src), not a
+regression.  [[project_ft_plain_interior_src_should_be_served]]
+
+Default build, measured directly, wall times unchanged from history: unit 44 s
+(hist ~46), ion 86 (88), ioff 84 (87), imw 103 (105).
+
+#### ☐ THE RESIDUAL — 2/30, and it is a DIFFERENT ARM
+
+The two survivors do NOT come from the repaired site.  Measured per-site:
+
+* seed21 -> the **compressed-holder** arm (`cn->child` identity compare) --
+  structurally the SAME class: a slot-identity compare answering PERMANENTLY.
+* one run -> the tombstone arm's own idempotent-miss guard.
+
+Rate fell ~1000x (from ~1,800/s to ~1 per 5 s run), but a permanent NOT_FOUND
+for a live key is key loss at ANY rate.  ☐ This is consistent with the
+skeptic's gap 4 (the residual derive->compare window it said NEITHER repair
+closes) but that is NOT proven -- it may equally be the same one-hop shape at
+the compressed arm.  It owes its own measurement before any cure.
+
+☞ Also still open, unchanged by this repair: the 9/30 rig timeouts (the
+contention lane of §5.20d, 92% of acquires refusing on a peer LOCK).
+
+### 5.23 ☑ THE RESIDUAL SPLIT IN TWO — one was the SAME inconsistency, one is the RACE
+
+Chasing §5.22's 2/30 residual with per-site counters over 49 dumping runs
+(80 seeds, `CHK=0 DETERM=1 WRITERS=2 SECS=5 NOFREE=1`, memcg 12G) split it
+cleanly.  ☠ Note `NOFREE=1` at 8G loses ~40% of runs to the memcg; 12G keeps
+them.
+
+| site | count | what it was |
+|---|---|---|
+| body-slot arm | 4 | **the derive -> compare RACE** |
+| tombstone-arm guard | 2 | **`tombstoned(fwd)`, both of them** -- the SAME two-arm inconsistency, second half |
+| compressed arm | 0 | did not fire in this corpus |
+
+#### (a) The tombstone guard: a dead forward holder is a RETRY, not a miss
+
+Both refusals were `ft_flag_tombstoned(ft, fwd)`; NEITHER was `!d.nf`.  The
+coarse arm answers exactly that predicate with `*need_retry` -- *"nothing is
+reserved or published yet, so re-derive the whole position against the settled
+tree"* -- while the tombstone arm answered it with a PERMANENT NOT_FOUND.  A
+tombstone on the freshly descended holder is a racing writer retiring it RIGHT
+NOW: transient, and the contract forbids refusing for a transient reason.
+
+★ So the two-arm inconsistency of §5.21 had TWO halves, and §5.22 fixed only
+the first.  Only `!d.nf` -- the genuinely unreachable key -- keeps the refusal.
+
+**Re-measured after the fix: `tombdesc` 2 -> 0**, over 35 dumping runs.
+
+#### (b) What remains is the RACE, and it is now positively identified
+
+The surviving body-slot refusals are a DIFFERENT population from the 5,136 of
+§5.20, and the arm's own descent proves it:
+
+| | the FIXED population | the survivors |
+|---|---|---|
+| arm's own `d.nf` == the head | 12,450 / 12,451 | **0** |
+| arm's own `d.nf` == **`node` ITSELF** | 0 | **100%** (4/4, then 1/1) |
+| the prefix rule would fire | 2,226 / 2,226 | **0** (`would_not`, 100%) |
+
+So the descent reached `node` DIRECTLY -- `d.pnf` was the correct holder at that
+instant and the prefix rule rightly did not fire -- and the conversion landed
+AFTERWARDS, between the descent and the compare.  ☞ That is the skeptic's gap 4
+exactly, the window it measured at 0/10,225 while the structural bug dominated.
+With the structural bug gone (`==head` 12,450 -> 0) it is what is left.
+
+#### Where that leaves the defect
+
+* Rig 30 seeds, oracle armed: RM-FAIL **13 -> 2** (the 2 are this race).
+* Default build green after BOTH repairs: unit 331 / inv on 128 / off 128 /
+  mw 128, walls 44/85/85/103 s -- unchanged, so the added retry did not
+  introduce a livelock.
+* Gate re-run on `default` + `txndbg`: PASS, including mwx 4/4 red=0 and
+  txndbg's nine engine self-checks at ALL THREE spacings.
+
+#### ☐ THE OPEN FORK — it needs a decision, not more measurement
+
+A permanent NOT_FOUND for a live key is key loss at ANY rate, so this residual
+is not acceptable as-is.  The options, and their known costs:
+
+1. **Hold a word across derive -> select -> compare.**  The skeptic's stated
+   position ("only a hold across the compare does").  ☠ MEASURED to starve
+   peers: the §5.20d contention lane, 92% of acquires refusing, and §5.22's
+   9/30 timeouts.
+2. **Retry on the mismatch instead of refusing**, gated on a predicate that
+   actually carries information -- e.g. the key is still reachable AND @node is
+   not removed.  This is NOT `FT_RM_HOLDER_RECHECK` (whose predicate was the
+   inert back-edge double-read, §5.20c); post-repair a real predicate exists.
+   ☐ Its convergence is unproven: each lap is charged to a peer's conversion
+   commit, which is progress, but that is an argument, not a measurement.
+3. Accept the race and document it.  ☠ Refused by the contract.
+
+☞ (2) is the only untried one, and it owes a skeptic on convergence before it
+is written.
+
+### 5.24 ☑ THE RACE IS CLOSED — the retry needed a predicate, not a bound
+
+Mathieu's call: **retry the whole op on mismatch**.  The obstacle was that the
+tree had already MEASURED the bare retry and it turned the wrong answer into a
+HANG (§ the `FT_RM_HOLDER_RECHECK` note: RM-FAIL 11/20 -> 1/20 but timeout/memcg
+0/20 -> **5/20**), and concluded it "NEEDS a BOUNDED disposition".
+
+☞ **That conclusion indicted the wrong half.**  The defect was the PREDICATE,
+not the retry.  `fresh != holder_flag` folds two causes and only one is
+transient:
+
+| @fresh | meaning | right answer |
+|---|---|---|
+| **TOMBSTONED** | the back edge is merely STALE, naming a RETIRED holder the descent already replaced | **proceed** -- permanent, no retry can change it |
+| **LIVE** | a peer RE-HOMED @node under a different live holder (an extending key converted its leaf into a prefix head) | **retry** -- charged to that peer's COMMITTED conversion |
+
+The bare double-read fired on BOTH.  And the tombstone case is UNCONDITIONAL
+for the entire tombstone-arm population -- that arm deliberately replaces
+@holder_flag with a descent result while `node->prev` goes on naming the
+retired one -- so it retried on every single lap.  **That is the 5/20 spin**,
+and no bound was ever needed: adding the liveness test removes the spinning
+population outright.
+
+`ft_rm_holder_rehomed()` (default ON, both mismatch arms): a genuinely unlinked
+node is a real miss and is tested FIRST; then a mismatch retries only when
+@fresh is live.
+
+#### Measured
+
+| | RM-FAIL | timeout | clean |
+|---|---|---|---|
+| baseline (no repair) | 13/30 | 8 | 4 |
+| after the two d.nf repairs (§5.22, §5.23a) | 2/30 | 9 | 14 |
+| **+ retry-on-rehome** | **0/30** | 9 | 16 |
+| **+ 90 more seeds (31-120)** | **0/90** | 23 | 47 |
+
+**120 seeds, ZERO RM-FAIL.**  ★ And the spin did NOT return: timeouts flat at
+9/30 (baseline 8/30), suite walls unchanged -- unit 45 s, ion 86, ioff 86,
+imw 103 (history 46/88/87/105).  The 23/90 is the same contention lane measured
+under load (that batch ran alongside the suites).
+
+#### The gate, all 17 configs, with all three fixes in
+
+**16 PASS.**  `default` incl. mwx 4 copies red=0 · `txndbg` and `proxyassert`
+and `holdtrace` and `anchorval` and `spacingenv` at ALL THREE spacings ·
+`fault-audit` · `audit` · `rmcap` · `vam` · `noskip` · `in-place` · `nokeymap` ·
+`excl` · `nomerge` · `tracing`.
+
+The single red is `nocompress` 110 + 115, **PROVEN pre-existing by a control
+worktree at HEAD `125d2bf1` without any of the repairs**, which produces the
+identical `ok=329 notok=2` on the same two tests.
+[[project_ft_plain_interior_src_should_be_served]]
+
+#### The three fixes, all one defect, all in ft-remove.h
+
+1. **Tombstone arm, holder selection** -- apply BOTH bullets of the descent
+   rule (`prefix ? d.nf : d.pnf`), the rule the coarse arm already implements
+   at :5641-5643.  Structural half: 5,136 samples -> 0.
+2. **Tombstone arm, dead-holder guard** -- `tombstoned(fwd)` is a RETRY, not an
+   idempotent miss; again the coarse arm's own answer.  `tombdesc` 2 -> 0.
+3. **`ft_rm_holder_rehomed`** -- retry the whole op when the back edge names a
+   LIVE different holder.  The race: 2/30 -> 0/120.
+
+(1) and (2) are the two halves of ONE two-arm inconsistency.  ★ In all three
+cases the tree already contained the correct rule; what was missing was
+applying it in the arm that actually runs under the default per-node spacing.

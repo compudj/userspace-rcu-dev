@@ -5315,9 +5315,13 @@ unsigned long ft_dbg_rm_stale_holder;
  * back to the op's own retry (@need_retry, the escape the dead-forward-holder
  * arm already uses) instead of reporting the key gone.
  *
- * ☠☠ AND THE DISPOSITION IS WRONG, WHICH IS WHY THIS IS OPT-IN
- * (-DFT_RM_HOLDER_RECHECK), DEFAULT OFF.  A/B over 20 seeds of the two-writer
- * reproducer, identical source, only this arm differing:
+ * ☞ HISTORICAL, AND STILL LOAD-BEARING -- READ IT WITH ITS RESOLUTION.  What
+ * follows is what this disposition measured WITH THE OLD PREDICATE (a bare
+ * pointer double-read), which is why it was opt-in (-DFT_RM_HOLDER_RECHECK)
+ * and DEFAULT OFF.  It is now DEFAULT ON, because the predicate -- not the
+ * retry -- was the defect; the resolution is at ft_rm_holder_rehomed() below,
+ * and each objection recorded here is answered inline.  A/B over 20 seeds of
+ * the two-writer reproducer, identical source, only this arm differing:
  *
  * ☠☠☠ AND MULTI-WRITER STRESS SAYS IT IS NOT A FIX.  MEASURED 2026-09-06:
  *
@@ -5330,6 +5334,15 @@ unsigned long ft_dbg_rm_stale_holder;
  *     prev-derived, the two disagree PERMANENTLY, every attempt reports
  *     "moved", and the op never converges.  Test 44 serialises its writers, so
  *     that hang is never contention.
+ *
+ *     ☑ RESOLVED, and this paragraph is its own proof: the permanently
+ *     disagreeing population is EXACTLY the one where @node->prev is lazily
+ *     stale -- which means the holder it names is TOMBSTONED, which is WHY the
+ *     tombstone arm ran at all.  ft_rm_holder_rehomed() returns false on a
+ *     tombstoned @fresh, so that population never retries and the alternation
+ *     cannot form.  Gate with it default ON: 17 configs, ft_inv on/off/mw
+ *     128/128 everywhere, test 44 included, plus five configs at all three
+ *     lock spacings.
  *
  *   - ☠ AND THE OBVIOUS GATE TRADES THE CURE FOR THE HANG.  Adding
  *     `!have_descent &&` here (ask @prev only about a holder that came from
@@ -5344,6 +5357,14 @@ unsigned long ft_dbg_rm_stale_holder;
  *     across two derivations.  A sound version must take the candidate's lock
  *     FIRST and re-read @prev under it -- prev against prev, never prev
  *     against a descent -- so that "unchanged" means "cannot change".
+ *
+ *     ☠ THAT PRESCRIPTION WAS REFUTED BY MEASUREMENT (§5.20c): a load -> lock
+ *     -> re-load of ft_node_holder() fires ZERO times in 9.7 M evaluations
+ *     (ft_unit + ft_inv on + mw + the reproducer), positive-controlled to the
+ *     unit.  For the !have_descent population the back edge simply never
+ *     moves; for the descent population the compare is unequal BY
+ *     CONSTRUCTION.  A lock cannot stabilise what was never moving.  What the
+ *     predicate needed was not stability but the LIVENESS of @fresh.
  *
  *     RM-FAIL (the shape it targets)   11/20  ->   1/20
  *     SEGV                              2/20  ->   2/20   (unchanged: it does
@@ -5363,15 +5384,53 @@ unsigned long ft_dbg_rm_stale_holder;
  * strictly better than today, where the wrong answer is unconditional.  That is
  * a contract question (may a remove refuse?) and is not settled here.
  */
+/*
+ * ★ WHAT THE BARE DOUBLE-READ LACKED WAS A PREDICATE, NOT A BOUND.
+ *
+ * Everything measured above stands, and it indicts the PREDICATE.
+ * `fresh != holder_flag` folds TWO causes together and only one is transient:
+ *
+ *  - @fresh is TOMBSTONED.  The back edge is merely STALE: it names a RETIRED
+ *    holder the forward descent above already replaced.  That is PERMANENT --
+ *    no retry changes it -- and it is UNCONDITIONAL for the whole
+ *    tombstone-arm population, because that arm deliberately replaces
+ *    @holder_flag with a descent result while @node->prev goes on naming the
+ *    retired one.  ☠ THAT is the 5/20 wall-clock/RSS spin recorded above: the
+ *    old predicate fired on every single lap.  So no bound was ever needed --
+ *    testing liveness removes the spinning population outright.
+ *
+ *  - @fresh is LIVE.  A peer RE-HOMED @node under a different, live holder: an
+ *    insert of a key that EXTENDS @node's converted its leaf into a PREFIX HEAD
+ *    in place, chaining @node into the new head's external_nodes (ft-insert.h,
+ *    ft_attach_node -- "the external node we are replacing at the attachment
+ *    location ... chain this external node in the topmost internal node
+ *    external node list").  @node is LIVE and REACHABLE one hop lower, so
+ *    refusing is the §1 key loss.  This IS transient, and it is charged to that
+ *    peer's COMMITTED conversion: the retry re-derives against a tree that has
+ *    already moved on, reads @node->prev = the head (live, so the tombstone arm
+ *    does not fire), and the branch reaches @node by its own external-member
+ *    condition.
+ *
+ * MEASURED with the liveness test in (doc/design/ft-stale-disposal-predicate.md
+ * §5.24): RM-FAIL 2/30 -> 0/30, and 0 across 90 further seeds -- 120 seeds,
+ * ZERO.  The spin did NOT return: timeouts flat at 9/30 against a baseline of
+ * 8/30, suite walls unchanged (unit 45 s, ion 86, ioff 86, imw 103).
+ *
+ * ☞ A genuinely unlinked node is a REAL miss and must NOT retry: tested first.
+ */
 static inline
-bool ft_rm_holder_moved(struct cds_ft *ft, const struct cds_ft_node *node,
+bool ft_rm_holder_rehomed(struct cds_ft *ft, const struct cds_ft_node *node,
 		struct cds_ft_inode_flag *holder_flag)
 {
-	struct cds_ft_inode_flag *fresh = ft_node_holder(ft,
-			(struct cds_ft_node *) node);
+	struct cds_ft_inode_flag *fresh;
 
+	if (ft_node_is_removed((struct cds_ft_node *) node))
+		return false;		/* genuinely gone: the miss is real */
+	fresh = ft_node_holder(ft, (struct cds_ft_node *) node);
 	if (!fresh || fresh == holder_flag)
 		return false;
+	if (ft_flag_tombstoned(ft, fresh))
+		return false;		/* stale back edge, not a re-home */
 #ifdef FT_ENABLE_TRACING
 	uatomic_inc(&ft_dbg_rm_stale_holder);
 #endif
@@ -5520,19 +5579,65 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 	 */
 	if (caa_unlikely(ft_flag_tombstoned(ft, holder_flag))) {
 		const uint8_t *ik = iter_key;
+		struct cds_ft_inode_flag *fwd;
+		unsigned int fwd_depth;
+		bool prefix;
 
 		ft_anchor_descend(ft, &d, iter_key, key_len, &ik);
-		if (!d.nf || d.pnf == NULL ||
-				ft_flag_tombstoned(ft, d.pnf)) {
-			/* The key is not reachable either: idempotent miss. */
+		/*
+		 * ★ THE DESCENT STOPS IN ONE OF TWO PLACES, and this arm knew
+		 * only one of them.  These are the SAME two bullets the coarse
+		 * arm below states and applies (its `prefix` test): the key can
+		 * end AT an internal node whose external_nodes carry the leaf --
+		 * a PREFIX KEY -- and then the holder is @d.nf at @d.depth, not
+		 * @d.pnf.
+		 *
+		 * ☠ TAKING @d.pnf UNCONDITIONALLY IS A KEY LOSS.  A peer
+		 * inserting a key that EXTENDS @node's converts @node's leaf
+		 * into a PREFIX HEAD in place, retiring nothing, and chains
+		 * @node into that head's external_nodes (ft-insert.h,
+		 * ft_attach_node).  @node stays LIVE, one hop lower.  Aiming at
+		 * the head's PARENT sends the four-way branch into the
+		 * body-slot arm, whose slot then holds the HEAD and not @node,
+		 * and it answers a PERMANENT NOT_FOUND for a key that exists.
+		 *
+		 * MEASURED (doc/design/ft-stale-disposal-predicate.md §5.20,
+		 * §5.21): at that refusal @d.nf IS the head in 12,450 of 12,451
+		 * samples (0 were @node), and this `prefix` test fires on every
+		 * failing sample, 2,226/2,226.  Selecting @d.nf also makes the
+		 * op acquire the word its writes actually touch -- the head's,
+		 * not its parent's.
+		 */
+		prefix = d.nf && !ft_node_external(d.nf) &&
+			d.depth == key_len;
+		fwd = prefix ? d.nf : d.pnf;
+		fwd_depth = prefix ? d.depth : d.pdepth;
+		/*
+		 * ☞ A DEAD FORWARD HOLDER IS A RETRY, NOT A MISS -- the second
+		 * half of the same two-arm inconsistency.  The coarse arm below
+		 * answers this very predicate with *need_retry ("nothing is
+		 * reserved or published yet, so re-derive the whole position
+		 * against the settled tree"); this arm answered it with a
+		 * PERMANENT NOT_FOUND.  A tombstone on the freshly descended
+		 * holder means a peer is retiring it RIGHT NOW: transient, and
+		 * the contract forbids refusing for a transient reason.
+		 * MEASURED: 2 of the residual refusals left by this guard and
+		 * BOTH were tombstoned(fwd); neither was !d.nf (§5.23).
+		 */
+		if (fwd != NULL && ft_flag_tombstoned(ft, fwd)) {
+			*need_retry = true;
+			return CDS_FT_STATUS_OK;	/* wrapper retries */
+		}
+		/* Only an unreachable key is an idempotent miss. */
+		if (!d.nf || fwd == NULL) {
 			FT_TP(remove_exit, (int) CDS_FT_STATUS_NOT_FOUND);
 #ifdef FT_ENABLE_TRACING
 			ft_dbg_rm_site = __LINE__;
 #endif
 			return CDS_FT_STATUS_NOT_FOUND;
 		}
-		holder_flag = d.pnf;
-		holder_depth = d.pdepth;
+		holder_flag = fwd;
+		holder_depth = fwd_depth;
 		have_descent = true;
 	} else if (ft->lock_spacing != CDS_FT_LOCK_SPACING_PER_NODE) {
 		/*
@@ -6007,15 +6112,16 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 			/* Drop the pre-reserved unsplice txn (nothing published yet). */
 			if (unsplice_txn)
 				ft_flip_txn_destroy(unsplice_txn);
-#ifdef FT_RM_HOLDER_RECHECK
-			/* ☐ OPT-IN, NOT DEFAULT.  See ft_rm_holder_moved: the
-			 * diagnosis is right and this disposition is not. */
-			if (ft_rm_holder_moved(ft, node, holder_flag)) {
+			/*
+			 * RE-HOMED UNDER A LIVE HOLDER -> RETRY THE WHOLE OP.
+			 * See ft_rm_holder_rehomed: the liveness test is what
+			 * makes this terminate where the bare double-read spun.
+			 */
+			if (ft_rm_holder_rehomed(ft, node, holder_flag)) {
 				*need_retry = true;
 				FT_RM_RELEASE();
 				return CDS_FT_STATUS_OK;
 			}
-#endif
 			FT_TP(remove_exit, (int) CDS_FT_STATUS_NOT_FOUND);
 #ifdef FT_ENABLE_TRACING
 			ft_dbg_rm_site = __LINE__;
@@ -6243,15 +6349,16 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 			/* Drop the pre-reserved unsplice txn (nothing published yet). */
 			if (unsplice_txn)
 				ft_flip_txn_destroy(unsplice_txn);
-#ifdef FT_RM_HOLDER_RECHECK
-			/* ☐ OPT-IN, NOT DEFAULT.  See ft_rm_holder_moved: the
-			 * diagnosis is right and this disposition is not. */
-			if (ft_rm_holder_moved(ft, node, holder_flag)) {
+			/*
+			 * RE-HOMED UNDER A LIVE HOLDER -> RETRY THE WHOLE OP.
+			 * See ft_rm_holder_rehomed: the liveness test is what
+			 * makes this terminate where the bare double-read spun.
+			 */
+			if (ft_rm_holder_rehomed(ft, node, holder_flag)) {
 				*need_retry = true;
 				FT_RM_RELEASE();
 				return CDS_FT_STATUS_OK;
 			}
-#endif
 			FT_TP(remove_exit, (int) CDS_FT_STATUS_NOT_FOUND);
 #ifdef FT_ENABLE_TRACING
 			ft_dbg_rm_site = __LINE__;
