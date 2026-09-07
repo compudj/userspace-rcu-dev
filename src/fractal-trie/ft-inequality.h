@@ -367,6 +367,16 @@ enum cds_ft_status ft_ineq_descend(struct cds_ft *ft,
 	size_t key_len = 0;
 	bool going_up = false, skip_eq_external_nodes;
 	/*
+	 * Did the key walk already step STRICTLY PAST the search key before
+	 * entering the min/max descent?  A compressed divergence does exactly
+	 * that: ft_inequality_compressed() answers DESCEND_CHILDREN having
+	 * followed cn->child on the greater side of the mismatch, so every key
+	 * at or below that child -- INCLUDING the child's own external_nodes --
+	 * is already strictly greater than the search key.  Distinct from
+	 * @going_up, which records the same fact for the backtracking route.
+	 */
+	bool descended_past_key = false;
+	/*
 	 * Parent-pointer going-up cursor (structural up_node form,
 	 * mirroring the iter_skip walk-up).  @up_node is the deepest live
 	 * node descent established; @up_node_lo is the shallowest depth it
@@ -696,8 +706,16 @@ slow_path:
 			 */
 			up_node = node_flag;
 			up_node_lo = level;
-			if (act == FT_DESCENT_DESCEND_CHILDREN)
+			if (act == FT_DESCENT_DESCEND_CHILDREN) {
+				/*
+				 * A DIVERGENCE, not an end-of-key stop: the helper
+				 * already cleared @skip_eq_external_nodes for this
+				 * exact reason.  Record it so the assignment at the
+				 * descent entry does not put the skip back.
+				 */
+				descended_past_key = true;
 				goto descend_children;
+			}
 			if (act == FT_DESCENT_BREAK)
 				break;
 			if (level + 1 >= key_depth) {
@@ -1457,7 +1475,19 @@ descend_children:
 	 * greater. Skip them on the first iteration so the descent
 	 * continues to a proper child.
 	 */
-	skip_eq_external_nodes = (!going_up && mode == FT_LOOKUP_GT);
+	/*
+	 * ☠ @descended_past_key is the third case, and leaving it out SKIPPED A
+	 * LIVE KEY.  The skip is only correct when this node's external_nodes
+	 * sit AT the search key -- the end-of-key stop, and the compressed
+	 * FULL MATCH that lands on cn->child.  After a compressed DIVERGENCE
+	 * the descent is already strictly past the key, so the first node's
+	 * external_nodes are the GT answer and skipping them returns the next
+	 * key instead: cds_ft_lookup_gt("aa") over {"ab","abb"} answered
+	 * "abb".  ft_inequality_compressed() had cleared the flag on that
+	 * path; this assignment used to overwrite the answer.
+	 */
+	skip_eq_external_nodes = (!going_up && !descended_past_key &&
+			mode == FT_LOOKUP_GT);
 	switch (mode) {
 	case FT_LOOKUP_LE:
 	case FT_LOOKUP_LT:
