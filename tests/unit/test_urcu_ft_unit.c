@@ -12719,10 +12719,25 @@ out:
  * PHASE 1 (in the cut, list off) is the atomic writer's single-threaded coverage
  * through the PUBLIC entry -- the concurrent side is inv_rekey_public_atomic_no_gap
  * -- and reuses test_rekey_graft_simple's depth-2 geometry, whose whole point is
- * that BP and the dst parent are different nodes.  PHASE 2 (out of the cut) hands
- * it a source junction with a single child, which the atomic writer refuses
- * because removing the slot would collapse the junction rather than delete in
- * place.
+ * that BP and the dst parent are different nodes.  PHASE 2 hands it a source
+ * junction with a SINGLE CHILD, where removing the slot collapses the junction
+ * rather than deleting in place.
+ *
+ * ☠ PHASE 2 MUST NOT PIN THE REFUSAL, and it used to.  Which side of the cut
+ * that shape falls on is a property of the BUILD, not of the entry: with path
+ * compression the two prefix bytes are ONE run and the move is refused, and
+ * without it (-DNO_FEATURE_FT_COMPRESS) they are plain one-child interiors and
+ * the climb-armed fold (@bp_folds_into_graft_c, ft-rekey.h) MOVES the subtree --
+ * measured, all four leaves at the destination, none at the source, count 4,
+ * ordered list in key order, verify clean.  Pinning INVALID_ARGUMENT there
+ * asserted a gap rather than a contract, and went red the day the gap closed.
+ *
+ * So phase 2 asserts what the test is NAMED for on both answers -- the subtree
+ * is at EXACTLY ONE of its two names, the count is intact and the trie verifies
+ * -- which is the property the refusal half was added for in the first place
+ * (see the 4 -> 0 measurement above).  Each entry gets its OWN trie, because a
+ * served graft empties the source and would make the merge that follows a
+ * different question.
  */
 /*
  * A src key that ends INSIDE a compressed run -- the run is CUT -- whose branch
@@ -13483,18 +13498,16 @@ static int test_rekey_cut_run_dst_split_keeps_keys(void)
  * recompaction instead (@pending_pub_slot)" is true for GLUE and MERGE and
  * FALSE for NOSPLIT.
  *
- * ☠☠ THE LEG THAT MAY NOT RUN EVERYWHERE -- AND THIS GATE STILL STANDS.  The
- * deep-chain shape is fine on a compressed build, but under
- * -DNO_FEATURE_FT_COMPRESS it ABORTS the engine's SW/MW kind check on an
- * --enable-rcu-debug build and LIVELOCKS forever on a release one.  A libtap
- * failure cannot absorb either, so it is gated on the BUILD FLAG, by name, and
- * its absence is announced.
- * ☑ RE-MEASURED 2026-09-02, STANDALONE -- outside the suite, so that neither
- * outcome costs the tests after it: insert {"zq","zwabcd"} then
- * cds_ft_rekey_merge(dst="zwe", src="zwabc").  Release nocompress does not
- * return in 60 s (rc 124); nocompress + --enable-rcu-debug aborts on
- * urcu_txn_record_chain "r->kind == kind" (rcu-txn-mcas.h:1000, rc 134).
- * BOTH halves of this gate are still true, so it is kept as written.
+ * ☑ THE DEEP-CHAIN LEG NOW RUNS EVERYWHERE, and the build gate that used to
+ * skip it is GONE.  It was skipped under -DNO_FEATURE_FT_COMPRESS because that
+ * build ABORTED the engine's SW/MW kind check on --enable-rcu-debug and
+ * LIVELOCKED on a release one -- neither of which a libtap failure absorbs.
+ * The livelock closed when the climb refusal landed, and the shape itself is
+ * SERVED since the climb-armed fold (@bp_folds_into_graft_c, ft-rekey.h):
+ * re-measured standalone on -DNO_FEATURE_FT_COMPRESS, release AND
+ * --enable-rcu-debug, both answering OK with "zwed" present, "zq" kept, count
+ * 2 and cds_ft_verify clean.  Keeping the skip after that would hide the one
+ * leg that pins the new arm on the build it was written for.
  *
  * ☞ MEASURED PRE-EXISTING at 593c932f.
  */
@@ -13539,15 +13552,11 @@ static int test_rekey_graft_publish_survives_detach(void)
 	 * root geometry, which no other leg here covers.
 	 */
 	bad |= rekey_keeps_keys("publish/root-sibling", k5, "we", "h") ? 1 : 0;
-	if (!_cds_ft_debug_compress_enabled()) {
-		diag("test_rekey_graft_publish_survives_detach: deep-chain leg "
-			"skipped, path compression compiled out "
-			"(-DNO_FEATURE_FT_COMPRESS): that build ABORTS the "
-			"txn kind check / LIVELOCKS on this shape, and a "
-			"libtap failure absorbs neither");
-		return bad ? -1 : 0;
-	}
-	/* A deep one-child src chain under the graft's own target. */
+	/*
+	 * A deep one-child src chain under the graft's own target -- TWO climb
+	 * steps, so on -DNO_FEATURE_FT_COMPRESS it is the climb-armed fold's
+	 * own shape and no longer the build-gated leg it used to be.
+	 */
 	bad |= rekey_keeps_keys("publish/deep-chain", k3, "zwe", "zwabc") ? 1 : 0;
 	return bad ? -1 : 0;
 }
@@ -13651,9 +13660,14 @@ static int test_rekey_known_nonterminating(void)
  * written, which was harmless while the drain crashed and made the test
  * unpassable the moment it stopped.
  *
- * Skipped under -DNO_FEATURE_FT_COMPRESS: without a run to cut, this shape is
- * the deep-chain one that still LIVELOCKS there (see the publish pin's own
- * gated leg), and a libtap failure absorbs neither a hang nor an abort.
+ * ☑ NO LONGER SKIPPED under -DNO_FEATURE_FT_COMPRESS.  Without a run to cut
+ * this is the deep-chain shape, which that build used to LIVELOCK on; it is
+ * now SERVED by the climb-armed fold (@bp_folds_into_graft_c, ft-rekey.h) --
+ * measured there, exclusive and not, on release and --enable-rcu-debug alike:
+ * OK, "zwed" present, "zq" kept, and the drain below completes and empties the
+ * trie.  That drain is the whole point of the leg, and skipping the one build
+ * where the rekey arm is new would have left it unguarded exactly where it
+ * matters.
  */
 static int test_rekey_exclusive_drain_after_loss(void)
 {
@@ -13666,12 +13680,6 @@ static int test_rekey_exclusive_drain_after_loss(void)
 	if (!cds_ft_merge_enabled()) {
 		diag("test_rekey_exclusive_drain_after_loss: skipped, merge "
 			"compiled out (-DNO_FEATURE_FT_MERGE)");
-		return 0;
-	}
-	if (!_cds_ft_debug_compress_enabled()) {
-		diag("test_rekey_exclusive_drain_after_loss: skipped, path "
-			"compression compiled out (-DNO_FEATURE_FT_COMPRESS): "
-			"this shape LIVELOCKS there");
 		return 0;
 	}
 	ft = create_varlen_ft(&group);
@@ -13730,13 +13738,79 @@ static int test_rekey_exclusive_drain_after_loss(void)
 	return ret;
 }
 
-static int test_rekey_fixed_len_atomic_or_refused(void)
+/*
+ * PHASE 2's body, once per entry point and on its own trie: four leaves under a
+ * two-byte prefix whose junction has a SINGLE child.  Whichever answer the
+ * dispatcher gives, the subtree must end up at EXACTLY ONE of its two names,
+ * the count must be 4 and the trie must verify -- the refusal must not have
+ * consumed it, and the move must not have half-happened.
+ */
+static int rekey_fixed_len_single_child_junction(bool merge)
 {
 	struct cds_ft_group *group;
 	struct cds_ft *ft;
 	struct cds_ft_node *found = NULL;
 	uint8_t src_key[2] = { 1, 9 }, dst_key[2] = { 2, 1 };
-	int c, ret = -1;
+	const char *which = merge ? "merge" : "graft";
+	enum cds_ft_status s;
+	int c, at_src = 0, at_dst = 0, ret = -1;
+
+	ft = create_fixed_ord_rekey_ft(4, &group);
+	rcu_read_lock();
+	for (c = 1; c <= 4; c++) {
+		uint64_t k = (1ULL << 24) | (9ULL << 16) | ((uint64_t) c << 8);
+
+		if (insert_u64(ft, k, node_alloc(k)) != CDS_FT_STATUS_OK)
+			abort();
+	}
+	s = merge ? cds_ft_rekey_merge(ft, dst_key, 2, src_key, 2)
+		  : cds_ft_rekey_graft(ft, dst_key, 2, src_key, 2);
+	if (s != CDS_FT_STATUS_OK &&
+			s != CDS_FT_STATUS_INVALID_ARGUMENT_ERROR &&
+			s != CDS_FT_STATUS_NOT_SUPPORTED) {
+		fprintf(stderr, "rekey_fixed: %s answered %s\n", which,
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+	for (c = 1; c <= 4; c++) {
+		uint64_t k_src = (1ULL << 24) | (9ULL << 16) | ((uint64_t) c << 8);
+		uint64_t k_dst = (2ULL << 24) | (1ULL << 16) | ((uint64_t) c << 8);
+
+		at_src += lookup_u64(ft, k_src, &found) == CDS_FT_STATUS_OK;
+		at_dst += lookup_u64(ft, k_dst, &found) == CDS_FT_STATUS_OK;
+	}
+	/* EXACTLY ONE name, all four leaves, whichever answer came back. */
+	if (!((s == CDS_FT_STATUS_OK && at_dst == 4 && at_src == 0) ||
+	      (s != CDS_FT_STATUS_OK && at_src == 4 && at_dst == 0))) {
+		fprintf(stderr, "rekey_fixed: %s (%s) left %d leaves at the "
+			"source and %d at the destination\n", which,
+			cds_ft_status_to_string(s), at_src, at_dst);
+		goto out;
+	}
+	if (cds_ft_count_keys(ft) != 4) {
+		fprintf(stderr, "rekey_fixed: %s (%s) left %lu keys of 4\n",
+			which, cds_ft_status_to_string(s),
+			cds_ft_count_keys(ft));
+		goto out;
+	}
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "rekey_fixed: %s (%s) verify failed\n", which,
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+	ret = 0;
+out:
+	rcu_read_unlock();
+	drain_trie(ft);
+	rcu_barrier();
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+static int test_rekey_fixed_len_atomic_or_refused(void)
+{
+	struct cds_ft_node *found = NULL;
 
 	if (!cds_ft_merge_enabled()) {
 		diag("test_rekey_fixed_len_atomic_or_refused: skipped, merge "
@@ -13812,57 +13886,10 @@ static int test_rekey_fixed_len_atomic_or_refused(void)
 		cds_ft_group_destroy(g1);
 	}
 
-	/* PHASE 2: out of the cut -> refused, and the subtree is still there. */
-	ft = create_fixed_ord_rekey_ft(4, &group);
-	rcu_read_lock();
-	for (c = 1; c <= 4; c++) {
-		uint64_t k = (1ULL << 24) | (9ULL << 16) | ((uint64_t) c << 8);
-
-		if (insert_u64(ft, k, node_alloc(k)) != CDS_FT_STATUS_OK)
-			abort();
-	}
-
-	if (cds_ft_rekey_graft(ft, dst_key, 2, src_key, 2) !=
-			CDS_FT_STATUS_INVALID_ARGUMENT_ERROR) {
-		fprintf(stderr, "rekey_fixed: graft not refused\n");
-		goto out;
-	}
-	if (cds_ft_rekey_merge(ft, dst_key, 2, src_key, 2) !=
-			CDS_FT_STATUS_INVALID_ARGUMENT_ERROR) {
-		fprintf(stderr, "rekey_fixed: merge not refused\n");
-		goto out;
-	}
-	if (cds_ft_count_keys(ft) != 4) {
-		fprintf(stderr, "rekey_fixed: %lu keys left of 4 -- the refusal "
-			"consumed the subtree\n", cds_ft_count_keys(ft));
-		goto out;
-	}
-	for (c = 1; c <= 4; c++) {
-		uint64_t at_src = (1ULL << 24) | (9ULL << 16) | ((uint64_t) c << 8);
-		uint64_t at_dst = (2ULL << 24) | (1ULL << 16) | ((uint64_t) c << 8);
-
-		if (lookup_u64(ft, at_src, &found) != CDS_FT_STATUS_OK) {
-			fprintf(stderr, "rekey_fixed: leaf %d lost from the source\n",
-				c);
-			goto out;
-		}
-		if (lookup_u64(ft, at_dst, &found) == CDS_FT_STATUS_OK) {
-			fprintf(stderr, "rekey_fixed: leaf %d moved anyway\n", c);
-			goto out;
-		}
-	}
-	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
-		fprintf(stderr, "rekey_fixed: verify failed\n");
-		goto out;
-	}
-	ret = 0;
-out:
-	rcu_read_unlock();
-	drain_trie(ft);
-	rcu_barrier();
-	cds_ft_destroy(ft);
-	cds_ft_group_destroy(group);
-	return ret;
+	/* PHASE 2: a single-child source junction -- ATOMIC, or refused intact. */
+	if (rekey_fixed_len_single_child_junction(false /*merge*/))
+		return -1;
+	return rekey_fixed_len_single_child_junction(true /*merge*/);
 }
 
 /*
