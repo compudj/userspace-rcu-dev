@@ -964,6 +964,56 @@ int ft_rekey_run_vs_region(struct cds_ft *ft,
  * here" -- therefore does not hold, and the caller must answer the miss with a
  * SHAPE refusal the dispatcher can fall back on.
  */
+/*
+ * DOES THE DETACH'S ELEVATION CLIMB REACH THE NODE THE GRAFT REPUBLISHES?
+ *
+ * A detach that empties its parent does not stop there: it ELEVATES, and keeps
+ * elevating while each ancestor's only remaining child is the one just cleared.
+ * @graft_c is the junction the graft ADD-recompacts (it gains the dst slot) and
+ * republishes as a fresh copy.  If the climb reaches @graft_c it evaluates
+ * emptiness against the SUPERSEDED original -- which still has only its old
+ * child -- so it sees an empty node where the graft's copy holds two children,
+ * and walks on past the junction, clearing edges that the graft's freshly
+ * published subtree hangs from.
+ *
+ * Returns the number of levels the climb would rise, and sets @reached when the
+ * walk arrives at @graft_c or runs out of trie (the root).  Pure plan-time
+ * arithmetic over the ancestors' arities; the caller holds the locks that keep
+ * them still.  A compressed ancestor stops the walk (this cut never elevates
+ * through one), which is the conservative answer.
+ */
+static
+int ft_rekey_climb_reaches_graft(struct cds_ft *ft,
+		struct cds_ft_inode_flag *bp,
+		struct cds_ft_inode_flag *graft_c,
+		bool *reached,
+		struct cds_ft_inode_flag **rest_out)
+{
+	struct cds_ft_inode_flag *n = bp;
+	int steps = 0;
+
+	*reached = false;
+	if (rest_out)
+		*rest_out = bp;
+	while (n && ft_node_internal(n) && steps < FT_MAX_KEY_LEN + 1) {
+		struct cds_ft_metadata *m = ft_flag_to_metadata(ft, n);
+
+		/* Survives the drop -- it keeps a child or a co-located key. */
+		if (ft_meta_nr_child(m) != 1 || m->external_nodes)
+			break;			/* @n is where the climb RESTS */
+		n = ft_parent_node(rcu_dereference(cds_ft_item_to_metadata(
+			ft_node_ptr(n))->parent_word));
+		steps++;
+		if (rest_out)
+			*rest_out = n;
+		if (!n || n == graft_c) {	/* the root, or the graft's node */
+			*reached = true;
+			break;
+		}
+	}
+	return steps;
+}
+
 static
 int ft_rekey_splice_pos_brackets(struct cds_ft *ft, const uint8_t *dst_ord,
 		size_t dst_len, struct ft_ord_cell *pred,
@@ -1319,6 +1369,12 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 * BUILD condition the first must not inherit.
 	 */
 	bool del_folds_into_graft, root_pub_ok;
+	/* the detach's climb walks up INTO the node the graft republishes */
+	bool climb_reaches_graft = false;
+	struct cds_ft_inode_flag *climb_rest = NULL;
+	/* the climb rests on a child of @graft_c: the republish lands in its OLD body */
+	bool climb_rest_under_graft = false;
+	int climb_steps;
 	enum ft_graft_prep prep;
 	enum cds_ft_status gst;
 	enum urcu_txn_status gcst = URCU_TXN_STATUS_OK, st;
@@ -3146,12 +3202,72 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 * climb clears rides @detach_rc and is freed on the far side of the
 	 * one commit.
 	 */
+	/*
+	 * ☠ AND TERM 4 IS THE HEIGHT-1 INSTANCE OF A CLASS WITH NO HEIGHT BOUND.
+	 * `d_src.ppnf == graft_c` sees only the climb that arrives in ONE step.
+	 * Two steps up, the same arrival is admitted, and on a build where a
+	 * one-child chain survives as plain interiors (-DNO_FEATURE_FT_COMPRESS)
+	 * it DESTROYS THE TRIE:
+	 *
+	 *     cds_ft_insert(ft, "zwabcd", 6, n);
+	 *     cds_ft_rekey_merge(ft, "zwe", 3, "zwabc", 5);   -> STATUS_OK
+	 *
+	 * returned SUCCESS and left the ROOT NODE EMPTY.  Traced (LTTng, whole
+	 * run): the graft ADD-recompacts the junction and republishes it holding
+	 * BOTH the old child and the new dst slot, and the detach then recompacts
+	 * the ROOT and clears its only edge -- because the climb evaluated every
+	 * ancestor against the SUPERSEDED originals, never seeing the copy that
+	 * holds the moved subtree.  The node the graft superseded is retired
+	 * TWICE in the same commit.
+	 *
+	 * MEASURED over 338 same-trie moves that reach this gate: the climb
+	 * reaching @graft_c in >= 2 steps selects EVERY key-loss and EVERY
+	 * nontermination (5/5) and NOTHING else -- all 30 one-step arrivals are
+	 * served correctly, which is what the existing fold (@del_folds_into_graft
+	 * / @root_pub_ok) is for.  So refuse the class ABOVE the height the fold
+	 * covers, and leave the height-1 case exactly as it was.
+	 *
+	 * ☞ A REFUSAL, not the cure: serving a plain-interior src is a missing
+	 * feature, and closing it means arming the fold FROM THIS CLIMB rather
+	 * than from a fixed depth.  Until then NOT_SUPPORTED is what every
+	 * sibling shape answers, and it leaves the trie byte-for-byte intact.
+	 */
+	/*
+	 * ☞ ONLY WHEN THE DETACH ACTUALLY RUNS.  @del_folds_into_graft means BP
+	 * IS the node the NOSPLIT graft recompacts, so the drop is a slot rename
+	 * inside one node and the detach is SKIPPED (see its own comment above) --
+	 * there is no climb to model, and modelling one refuses the shapes
+	 * test_rekey_cut_run_dst_split_keeps_keys pins as SERVED.
+	 */
+	climb_steps = del_folds_into_graft ? 0 :
+		ft_rekey_climb_reaches_graft(ft, d_src.pnf, graft_c,
+			&climb_reaches_graft, &climb_rest);
+	/*
+	 * ☠ AND THE SAME STALENESS ONE LEVEL SHALLOWER: the climb can come to
+	 * REST on a node whose PARENT is @graft_c, and then the detach publishes
+	 * its recompacted copy into @graft_c's OLD body -- the one the graft has
+	 * already superseded.  The live trie keeps the stale child, the ordered
+	 * cell is updated to the fresh one, and ft_verify reports
+	 * "cell {parent X} != expected {owner Y}"; worse, the stale node the live
+	 * trie still reaches through is RETIRED by the same commit.
+	 *
+	 * Only when the climb actually MOVED (@climb_steps >= 1).  At zero steps
+	 * BP itself is the node being recompacted and its parent being @graft_c
+	 * is term 4's own shape, which is already answered above.
+	 */
+	if (!del_folds_into_graft && climb_steps >= 1 && climb_rest &&
+			ft_node_internal(climb_rest))
+		climb_rest_under_graft = ft_parent_node(rcu_dereference(
+			cds_ft_item_to_metadata(ft_node_ptr(climb_rest))
+				->parent_word)) == graft_c;
 	if ((ft_node_compressed(graft_p) && !merge_dst) ||
 			ft_node_skip_compressed(graft_p) ||
 			(d_src.pnf == graft_c &&
 				prep != FT_GRAFT_PREP_NOSPLIT &&
 				!glue.old_dir_dropped) ||
-			d_src.ppnf == graft_c) {
+			d_src.ppnf == graft_c ||
+			(climb_reaches_graft && climb_steps >= 2) ||
+			climb_rest_under_graft) {
 		ret = -ENOTSUP;		/* shape, terminal -- see above */
 		goto bail_build;
 	}
