@@ -807,14 +807,24 @@ int ft_verify_node_recursive(const struct cds_ft *ft, FILE *out,
 			}
 		}
 #ifdef FT_IMMEDIATE_FREE
-		/* Check parent target is not poisoned (freed). */
-		if (ft_parent_node(metadata->parent)) {
+		/*
+		 * Check parent target is not poisoned (freed).
+		 *
+		 * ☠ THIS BLOCK DID NOT COMPILE, so the whole testing mode did
+		 * not: it still named @metadata->parent, a field that became
+		 * @parent_word.  Nothing else reads the field under this ifdef,
+		 * so the rename passed every build the gate runs and took the
+		 * POISON-ON-FREE DETECTOR with it -- a use-after-free class the
+		 * arena's 0xfe fill exists to catch had no way to be seen.
+		 */
+		if (ft_parent_node(metadata->parent_word)) {
 			unsigned char *p = (unsigned char *) ft_node_ptr(
-				ft_parent_node(metadata->parent));
+				ft_parent_node(metadata->parent_word));
 			if (*p == 0xfe) {
 				if (out)
 					fprintf(out, "ft_verify: depth %u: internal node %p parent %p points to freed (poisoned) node\n",
-						depth, node_flag, metadata->parent);
+						depth, node_flag,
+						(void *) metadata->parent_word);
 				return -1;
 			}
 		}
