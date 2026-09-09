@@ -1398,6 +1398,19 @@ struct ft_flip_txn {
 	 */
 	bool pending_del_folded;
 	/*
+	 * ...and what the slot takes INSTEAD, when the drop does not empty it.
+	 *
+	 * NULL is the plain drop: the copy is born without the child.  Non-NULL
+	 * makes the same fold a SUBSTITUTION -- the copy is born holding this
+	 * value, and it is re-parented onto the fresh node like any other child.
+	 * The detach's promoted key chain is the one producer today.
+	 *
+	 * It rides @pending_del_slot rather than @pending_pub_slot deliberately:
+	 * the drop's expected-old validates the pairing, and the publish slot is
+	 * already spoken for by the NOSPLIT graft's own forward publish.
+	 */
+	struct cds_ft_inode_flag *pending_del_replace;
+	/*
 	 * MIXED sw/mw commit (DLM lock_fine): when true, the STRUCTURAL record
 	 * helpers (every ft_flip_txn_record_tag edge) plant SW-kind records -- a
 	 * plain locked park that CANNOT fail -- because the op holds the DLM
@@ -1794,6 +1807,7 @@ struct ft_flip_txn *ft_flip_txn_create_at(FT_TK_SITE_PARAM struct cds_ft *ft)
 	t->pending_del_slot = NULL;
 	t->pending_del_expected = NULL;
 	t->pending_del_folded = false;
+	t->pending_del_replace = NULL;
 	t->structural_sw = false;	/* all-MW until a caller opts in under lock_fine */
 	FT_ROOT_ASSERT_INIT(t, ft);
 	FT_OWNER_ASSERT_INIT(t);
@@ -2018,6 +2032,7 @@ struct ft_flip_txn *ft_flip_txn_create_on_at(FT_TK_SITE_PARAM
 	t->pending_del_slot = NULL;
 	t->pending_del_expected = NULL;
 	t->pending_del_folded = false;
+	t->pending_del_replace = NULL;
 	t->structural_sw = false;
 	FT_ROOT_ASSERT_INIT(t, ft);
 	FT_OWNER_ASSERT_INIT(t);
@@ -2075,6 +2090,7 @@ struct ft_flip_txn *ft_flip_txn_create_bounded_on_at(FT_TK_SITE_PARAM
 	t->pending_del_slot = NULL;
 	t->pending_del_expected = NULL;
 	t->pending_del_folded = false;
+	t->pending_del_replace = NULL;
 	t->structural_sw = false;	/* all-MW until a caller opts in under lock_fine */
 	FT_ROOT_ASSERT_INIT(t, ft);
 	FT_OWNER_ASSERT_INIT(t);

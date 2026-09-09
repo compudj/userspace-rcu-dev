@@ -1739,6 +1739,8 @@ int ft_node_recompact(enum ft_recompact mode,
 
 		for (i = 0; i < nr_child; i++) {
 			struct cds_ft_inode_flag *iter;
+			/* the drop folded a REPLACEMENT into this slot */
+			bool substituted = false;
 			uint8_t v;
 
 			ft_popcount_node_get_ith_pos(old_type, old_node, i, &v, &iter);
@@ -1794,16 +1796,42 @@ int ft_node_recompact(enum ft_recompact mode,
 						goto abandon_fresh;
 					}
 					retire_txn->pending_del_folded = true;
-					continue;
+					/*
+					 * ...OR A SUBSTITUTION.  The same edit on
+					 * the same slot, one field apart: a detach
+					 * whose target is left childless but KEYED
+					 * publishes the promoted key chain INTO this
+					 * slot rather than clearing it, and folding
+					 * that here is what stops it publishing into
+					 * the body this recompaction supersedes.
+					 *
+					 * ☠ @pending_pub_slot CANNOT EXPRESS IT.
+					 * The NOSPLIT graft already announces its own
+					 * forward publish there (ft-graft.h), so a
+					 * second announcer silently overwrites the
+					 * first -- measured: the fold rode the
+					 * GRAFT's slot and the op's own edit was
+					 * dropped on the floor, and the op then
+					 * refused itself.  This arm reuses the drop's
+					 * VALIDATED expected-old instead of adding a
+					 * second unchecked announcement.
+					 */
+					if (!retire_txn->pending_del_replace)
+						continue;
+					substituted = true;
+					iter = retire_txn->pending_del_replace;
 				}
-				if (!ft_flip_txn_resolve_prio(retire_txn,
+				if (!substituted &&
+						!ft_flip_txn_resolve_prio(retire_txn,
 						(void **) src_slot, &resolved)) {
 					ret = -EAGAIN;	/* CAP: retry higher-priority */
 					goto abandon_fresh;
 				}
-				iter = (struct cds_ft_inode_flag *) resolved;
-				if (!iter)
-					continue;	/* peer removed the child */
+				if (!substituted) {
+					iter = (struct cds_ft_inode_flag *) resolved;
+					if (!iter)
+						continue;	/* peer removed the child */
+				}
 				/*
 				 * FOLD the op's own pending forward publish
 				 * into the copy (see @pending_pub_slot): this
@@ -1814,7 +1842,8 @@ int ft_node_recompact(enum ft_recompact mode,
 				 * resolve deliberately reads COMMITTED values,
 				 * and must keep doing so for every other slot.
 				 */
-				if (retire_txn && retire_txn->pending_pub_slot &&
+				if (!substituted && retire_txn &&
+						retire_txn->pending_pub_slot &&
 						src_slot == retire_txn->pending_pub_slot) {
 					iter = retire_txn->pending_pub_val;
 					retire_txn->pending_pub_folded = true;
@@ -1900,6 +1929,8 @@ int ft_node_recompact(enum ft_recompact mode,
 			);
 		for (i = 0; i < FT_ENTRY_PER_NODE; i++) {
 			struct cds_ft_inode_flag *iter;
+			/* the drop folded a REPLACEMENT into this slot */
+			bool substituted = false;
 
 			iter = ft_pigeon_node_get_ith_pos(old_type, old_node, i);
 			if (!iter)
@@ -1943,16 +1974,42 @@ int ft_node_recompact(enum ft_recompact mode,
 						goto abandon_fresh;
 					}
 					retire_txn->pending_del_folded = true;
-					continue;
+					/*
+					 * ...OR A SUBSTITUTION.  The same edit on
+					 * the same slot, one field apart: a detach
+					 * whose target is left childless but KEYED
+					 * publishes the promoted key chain INTO this
+					 * slot rather than clearing it, and folding
+					 * that here is what stops it publishing into
+					 * the body this recompaction supersedes.
+					 *
+					 * ☠ @pending_pub_slot CANNOT EXPRESS IT.
+					 * The NOSPLIT graft already announces its own
+					 * forward publish there (ft-graft.h), so a
+					 * second announcer silently overwrites the
+					 * first -- measured: the fold rode the
+					 * GRAFT's slot and the op's own edit was
+					 * dropped on the floor, and the op then
+					 * refused itself.  This arm reuses the drop's
+					 * VALIDATED expected-old instead of adding a
+					 * second unchecked announcement.
+					 */
+					if (!retire_txn->pending_del_replace)
+						continue;
+					substituted = true;
+					iter = retire_txn->pending_del_replace;
 				}
-				if (!ft_flip_txn_resolve_prio(retire_txn,
+				if (!substituted &&
+						!ft_flip_txn_resolve_prio(retire_txn,
 						(void **) src_slot, &resolved)) {
 					ret = -EAGAIN;
 					goto abandon_fresh;
 				}
-				iter = (struct cds_ft_inode_flag *) resolved;
-				if (!iter)
-					continue;
+				if (!substituted) {
+					iter = (struct cds_ft_inode_flag *) resolved;
+					if (!iter)
+						continue;
+				}
 				/*
 				 * FOLD the op's own pending forward publish
 				 * into the copy (see @pending_pub_slot): this
@@ -1963,7 +2020,8 @@ int ft_node_recompact(enum ft_recompact mode,
 				 * resolve deliberately reads COMMITTED values,
 				 * and must keep doing so for every other slot.
 				 */
-				if (retire_txn && retire_txn->pending_pub_slot &&
+				if (!substituted && retire_txn &&
+						retire_txn->pending_pub_slot &&
 						src_slot == retire_txn->pending_pub_slot) {
 					iter = retire_txn->pending_pub_val;
 					retire_txn->pending_pub_folded = true;

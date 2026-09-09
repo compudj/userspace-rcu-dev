@@ -1090,6 +1090,127 @@ int ft_rekey_splice_pos_brackets(struct cds_ft *ft, const uint8_t *dst_ord,
  */
 #define FT_REKEY_UNCOVERED	(-EDOM)
 
+/*
+ * WHAT THE CLIMB-ARMED FOLD WRITES INTO @graft_c'S ONE SLOT.
+ *
+ * Both modes remove the same second edit -- a detach republishing into a body
+ * this flip retires -- and they differ only in the VALUE the fresh copy is born
+ * holding in that slot.  Naming them apart keeps the freeze, the count and the
+ * detach skip reading one variable instead of re-deriving the shape.
+ */
+enum ft_rekey_fold_mode {
+	FT_REKEY_FOLD_NONE = 0,
+	FT_REKEY_FOLD_DROP,	/* the slot goes: the drop empties all of it */
+	FT_REKEY_FOLD_PROMOTE,	/* the slot takes the resting node's key chain */
+	FT_REKEY_FOLD_REPLACE,	/* the slot takes a DEL-recompacted copy of it */
+};
+
+
+/*
+ * DID THE ONE STRUCTURAL EDIT ACTUALLY RIDE THE GRAFT'S COPY?
+ *
+ * Two things hang on the answer and BOTH must read it the same way: the graft's
+ * key-count delta (a folded move is net ZERO -- the subtree leaves and re-enters
+ * the same node) and whether the detach runs at all.  The copy loop that
+ * consumes the fold is what sets these flags, never the arming, so a shape that
+ * was armed and NOT consumed answers false here and is refused rather than
+ * detached into a superseded body.
+ *
+ * ONE flag answers for all three modes, because all three ride the SAME fold:
+ * the height-0 drop (@del_folds_into_graft, where BP IS the recompacted node),
+ * the climb-armed drop, and the promote -- which is that drop carrying a
+ * replacement value (@pending_del_replace).  @mode and @slot are taken so the
+ * signature still says what the question is ABOUT, and so a future mode that
+ * does need its own witness has a place to say so.
+ */
+static inline
+bool ft_rekey_move_folded(const struct ft_flip_txn *txn,
+		enum ft_rekey_fold_mode mode, struct cds_ft_inode_flag **slot)
+{
+	(void) mode;
+	(void) slot;
+	return txn->pending_del_folded;
+}
+
+/*
+ * MAY A FOLD THAT *WRITES A VALUE* INTO @graft_c'S SLOT RUN ON THIS BUILD?
+ *
+ * ☠ NOT WITH PATH COMPRESSION, and it is ONE reason for BOTH value-writing
+ * modes -- a CONTRACT, not a preference.  A slot on a compressed build may owe
+ * a SKIP_X DUAL: a second, skip-encoded path to the same child, which the
+ * PUBLISH that installs the value is what records.
+ *
+ *   - REPLACE's value comes from ft_node_recompact's DEL arm, whose own header
+ *     says it "defers the dual entirely" BECAUSE its caller republishes through
+ *     _ft_publish_to_parent and that is what records it.
+ *   - PROMOTE's value is an external chain head, and ft_detach_node's own
+ *     promote arm records the dual explicitly for exactly that case
+ *     (ft-remove.h, the compressed-parent external promote).
+ *
+ * This fold makes NO publish: the copy loop stores the value into @graft_c's
+ * body verbatim.  So a dual either mode owes is simply never written.
+ *
+ * ☞ THE DROP MODE IS UNAFFECTED and stays armed everywhere: it writes NOTHING
+ * into the slot, and a slot that is gone owes no encoding.  That asymmetry is
+ * the whole rule -- the debt belongs to the VALUE, not to the fold.
+ *
+ * MEASURED, and neither is subtle.  REPLACE admitted on the default build:
+ * single-threaded, the op retries for ever, re-filling the node reserve each
+ * attempt, RSS climbing ~20 MB/s.  PROMOTE admitted there: single-threaded it
+ * looks CLEAN and passes every suite -- and under the documented-safe COARSE
+ * writer strategy with four concurrent point writers it never returns, at
+ * 6.3 GB after 12 seconds.  Both are CLEANLY REFUSED without this guard, so
+ * admitting either trades a refusal for a hang.
+ *
+ * Producing the SKIP_X-encoded slot word FROM the fold is the piece of work
+ * that lifts this, and it is the same open item the fused chain-compress
+ * collapse needs -- both want a fold whose value is a compressed encoding
+ * rather than a plain node pointer.  Until then the value-writing modes serve
+ * the builds that own no dual, which is where the uncollapsed chains this whole
+ * feature is about actually live.
+ */
+static inline
+bool ft_rekey_fold_value_ok(const struct cds_ft *ft)
+{
+	(void) ft;
+#ifdef FEATURE_FT_COMPRESS
+	return false;
+#else
+	return true;
+#endif
+}
+
+/*
+ * THE SHAPE BOTH FOLD MODES REQUIRE, in one expression so they cannot drift.
+ *
+ * @edited is the node whose slot in @graft_c the fold will write -- the topmost
+ * node the drop empties (DROP) or the node the walk rests on (PROMOTE).  Both
+ * need the SAME three things:
+ *
+ *   - a NOSPLIT, non-merge, uncut move.  A merge sets the prep deliberately and
+ *     a cut source makes "the drop empties BP" untrue -- neither is this shape.
+ *   - @graft_c and @edited PLAIN.  A compressed or skip-encoded link puts a
+ *     SECOND path on the same child (the SKIP_X dual), and refreshing that dual
+ *     is a publish this cut has no owner for.
+ *   - NOT the in-place tier.  ft_node_set_nth_rec's in-place arm never runs the
+ *     copy loop that consumes the fold, so the drop would go unconsumed and the
+ *     detach would run after all -- into the body the graft superseded.
+ *     Refused at PLAN time, before the reserve sets a bit no bail takes back.
+ */
+static inline
+bool ft_rekey_fold_shape_ok(struct cds_ft *ft,
+		struct cds_ft_inode_flag *graft_c,
+		struct cds_ft_inode_flag *edited,
+		enum ft_graft_prep prep, bool merge_dst, unsigned int src_cut)
+{
+	return !merge_dst && !src_cut &&
+		prep == FT_GRAFT_PREP_NOSPLIT &&
+		!ft_in_place_ok(ft) &&
+		ft_node_internal(graft_c) && !ft_node_compressed(graft_c) &&
+		!ft_node_skip_compressed(graft_c) &&
+		ft_node_internal(edited) && !ft_node_compressed(edited) &&
+		!ft_node_skip_compressed(edited);
+}
 
 /*
  * THE CHAIN A CLIMB-ARMED FOLD ORPHANS -- freeze it into the SAME commit.
@@ -1138,6 +1259,9 @@ int ft_rekey_fold_freeze_orphans(struct cds_ft *ft,
 		struct ft_lock_ctx *ctx, struct ft_flip_txn *txn,
 		struct cds_ft_inode_flag *bp, unsigned int bp_depth,
 		struct cds_ft_inode_flag *top,
+		struct cds_ft_inode_flag *promoted,
+		struct cds_ft_inode_flag *promote_val,
+		struct cds_ft_inode_flag *edited,
 		struct cds_ft_inode_flag *graft_c, int steps,
 		struct ft_detach_recompact_out *rc,
 		struct ft_held_anchor *held, int *nr_held)
@@ -1148,6 +1272,14 @@ int ft_rekey_fold_freeze_orphans(struct cds_ft *ft,
 	int i;
 
 	rc->nr_orphans = 0;
+	/*
+	 * A PROMOTE whose walk never moved (@steps == 0) empties no chain at all:
+	 * the node the slot names IS @bp, and the loop below has nothing to
+	 * collect before it.  Skipping it is not an optimisation -- entering with
+	 * @steps == 0 would refuse on its own bound.
+	 */
+	if (steps == 0)
+		goto chain_done;
 	for (;;) {
 		struct cds_ft_metadata *m;
 
@@ -1195,17 +1327,60 @@ int ft_rekey_fold_freeze_orphans(struct cds_ft *ft,
 	}
 	if (rc->nr_orphans != steps)
 		goto refuse;
+chain_done:
 	/*
-	 * ...and @top must still hang off the node the fold drops its slot FROM.
-	 * The arming read that pair; this is the re-read that keeps the walk and
-	 * the drop naming ONE edge.
+	 * THE PROMOTED NODE dies too, and it dies LAST: the drop leaves it with
+	 * no child, and the fold has published its key chain in its place, so
+	 * nothing reaches it after this flip.  Its premise -- exactly one child,
+	 * which the drop takes -- is re-validated ON the marked snapshot by the
+	 * same plan-lock the chain uses.
+	 */
+	if (promoted) {
+		struct cds_ft_metadata *pm;
+
+		if (!ft_node_internal(promoted) || ft_node_compressed(promoted) ||
+				ft_node_skip_compressed(promoted) ||
+				ft_node_flip_proxy(promoted)) {
+			ret = FT_REKEY_UNCOVERED;
+			goto refuse;
+		}
+		if (rc->nr_orphans >= FT_MAX_DEPTH || depth == 0)
+			goto refuse;
+		pm = cds_ft_item_to_metadata(ft_node_ptr(promoted));
+		if (ft_meta_nr_child(pm) != 1 || !pm->external_nodes)
+			goto refuse;
+		/*
+		 * ☠ AND IT MUST STILL BE THE SAME HEAD.  @promote_val was read
+		 * at the gate and is already baked into the fresh body by the
+		 * copy loop; a peer that spliced a NEW head onto this chain in
+		 * between would have that fresh body publish a STALE one.
+		 * ft_detach_node's own walk makes exactly this check against its
+		 * @topmost_external_nodes and bails -EAGAIN, and this arm is that
+		 * walk re-derived -- so it owes the same check.  Transient by
+		 * construction: a re-descent reads the new head.
+		 */
+		if (promote_val && (struct cds_ft_inode_flag *)
+				ft_dereference_external(pm->external_nodes) !=
+				promote_val)
+			goto refuse;
+		ctx->held.nr_extra = (unsigned int) *nr_held;
+		if (ft->lock_fine && ft_detach_orphan_planlock(ft, ctx, promoted,
+				depth, pm, true /*require_single_child*/,
+				held, nr_held))
+			goto refuse;
+		rc->orphans[rc->nr_orphans++] = promoted;
+	}
+	/*
+	 * ...and the edited node must still hang off the node the fold writes its
+	 * slot IN.  The arming read that pair; this is the re-read that keeps the
+	 * walk and the slot naming ONE edge.
 	 */
 	{
-		struct cds_ft_inode_flag *top_parent = NULL;
+		struct cds_ft_inode_flag *edited_parent = NULL;
 
 		if (!ft_resolve_parent_slot(cds_ft_item_to_metadata(
-				ft_node_ptr(top)), ft, &top_parent) ||
-				top_parent != graft_c)
+				ft_node_ptr(edited)), ft, &edited_parent) ||
+				edited_parent != graft_c)
 			goto refuse;
 	}
 	/*
@@ -1577,9 +1752,41 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 * one coherent pair.
 	 */
 	bool bp_folds_into_graft_c = false;
+	enum ft_rekey_fold_mode fold_mode = FT_REKEY_FOLD_NONE;
 	struct cds_ft_inode_flag *climb_top = NULL;
 	struct cds_ft_inode_flag **fold_top_slot = NULL;
+	/* PROMOTE only: the external chain head that takes the slot. */
+	struct cds_ft_inode_flag *fold_promote_val = NULL;
 	unsigned int fold_bp_depth = 0;
+	unsigned int fold_rest_depth = 0;	/* REPLACE: the resting node's depth */
+	/*
+	 * REPLACE: the child the RESTING node loses, and the slot holding it.
+	 *
+	 * ☠ IT IS NOT ALWAYS THE SOURCE SUBTREE.  Only a climb that never moved
+	 * loses S_top; every step the climb takes means the resting node loses
+	 * the TOPMOST CLEARED node instead, and the chain below it dies with it.
+	 * Deriving this from @d_src alone is right for exactly the height-0 case
+	 * and wedges the writer for every other -- measured: 745,069 attempts on
+	 * one two-step seed, all bailing -EAGAIN before the graft, because
+	 * ft_node_find_child looked for a grandchild.
+	 */
+	struct cds_ft_inode_flag *fold_drop_child = NULL;
+	struct cds_ft_inode_flag **fold_drop_slot = NULL;
+	struct cds_ft_inode_flag *fold_drop_expected = NULL;
+	struct cds_ft_inode *fold_rest_old = NULL;	/* its retired body */
+	/*
+	 * REPLACE's FRESH copy, and the flag that says the commit took it.
+	 *
+	 * ☠ IT IS BUILT BEFORE THE RESERVE IS ACTIVATED, so nothing else owns
+	 * it: not the reserve drain, not @gst_st.dest, not @detach_rc.  Every
+	 * path that does not COMMIT must hand it back, and there are five of
+	 * them -- so the free lives at @sweep, which all five reach, guarded by
+	 * the one flag the commit sets.  MEASURED before that guard existed: 50
+	 * forced commit-aborts leaked exactly 50 nodes, silently, while the op
+	 * recovered and the trie verified clean.
+	 */
+	struct cds_ft_inode_flag *fold_rest_new = NULL;
+	bool fold_rest_published = false;
 	/*
 	 * The chain's plan-locks, OUT of the txn registry for the reason
 	 * ft_detach_node states for its own (the chain reaches FT_MAX_DEPTH, past
@@ -3346,16 +3553,11 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 * refusal has to unwind a graft.  None of them is a place to hang new
 	 * meaning: the walk is where the chain's shape is decided.
 	 */
-	if (!del_folds_into_graft && climb_reaches_graft && climb_steps >= 1 &&
-			climb_rest == graft_c && climb_top && graft_c &&
-			!merge_dst && !src_cut &&
-			prep == FT_GRAFT_PREP_NOSPLIT &&
-			!ft_in_place_ok(ft) &&
-			ft_node_internal(graft_c) && !ft_node_compressed(graft_c) &&
-			!ft_node_skip_compressed(graft_c) &&
-			ft_node_internal(climb_top) &&
-			!ft_node_compressed(climb_top) &&
-			!ft_node_skip_compressed(climb_top) &&
+	if (!del_folds_into_graft && climb_top && graft_c &&
+			climb_reaches_graft && climb_rest == graft_c &&
+			climb_steps >= 1 &&
+			ft_rekey_fold_shape_ok(ft, graft_c, climb_top, prep,
+				merge_dst, src_cut) &&
 			(unsigned int) climb_steps <= d_src.pdepth) {
 		struct cds_ft_inode_flag *top_parent = NULL;
 		struct cds_ft_inode_flag **slot = ft_resolve_parent_slot(
@@ -3365,8 +3567,104 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		if (slot && top_parent == graft_c &&
 				rcu_dereference(*slot) == climb_top) {
 			bp_folds_into_graft_c = true;
+			fold_mode = FT_REKEY_FOLD_DROP;
 			fold_top_slot = slot;
 			fold_bp_depth = d_src.pdepth;
+		}
+	}
+	/*
+	 * ...AND THE SECOND MODE, on the SAME slot: the walk comes to REST on a
+	 * node the drop does NOT empty, and that node is a child of @graft_c.
+	 *
+	 * The detach would then edit the RESTING node and republish it into
+	 * @graft_c -- which is the same second edit against a superseded body the
+	 * DROP mode above exists to remove, arriving one level shallower.  The
+	 * fold absorbs it identically: @graft_c's copy is born holding, in that
+	 * one slot, whatever the detach would have published there.  DROP writes
+	 * NOTHING in the slot (@pending_del_slot); PROMOTE writes the resting
+	 * node's EXTERNAL CHAIN HEAD (@pending_pub_slot), which is exactly what
+	 * ft_detach_node does for a node the drop leaves childless but KEYED.
+	 *
+	 * Only the childless-but-keyed shape here.  A resting node that keeps a
+	 * CHILD needs a DEL-recompacted copy of itself as the published value,
+	 * and building one is a separate piece of work -- it stays refused, by
+	 * the same @climb_rest_under_graft term as before.
+	 *
+	 * @climb_rest is BP itself when the climb never moved (@climb_steps == 0),
+	 * and the topmost cleared node's parent when it did; both are handled by
+	 * the one expression, because the walk reports where it STOPPED, not how
+	 * far it got.
+	 */
+	if (!del_folds_into_graft && !bp_folds_into_graft_c && graft_c &&
+			climb_rest && !climb_reaches_graft &&
+			ft_rekey_fold_shape_ok(ft, graft_c, climb_rest, prep,
+				merge_dst, src_cut) &&
+			(unsigned int) climb_steps < d_src.pdepth) {
+		struct cds_ft_metadata *rm = cds_ft_item_to_metadata(
+			ft_node_ptr(climb_rest));
+		struct cds_ft_inode_flag *rest_parent = NULL;
+		struct cds_ft_inode_flag **slot;
+
+		slot = ft_resolve_parent_slot(rm, ft, &rest_parent);
+		if (slot && rest_parent == graft_c &&
+				rcu_dereference(*slot) == climb_rest &&
+				ft_meta_nr_child(rm) >= 2 &&
+				ft_rekey_fold_value_ok(ft)) {
+			/*
+			 * REPLACE: the resting node SURVIVES the drop, so the
+			 * value the slot takes is a DEL-recompacted copy of it.
+			 * Built below, before the graft prepare, because the copy
+			 * loop needs it in hand.
+			 */
+			struct cds_ft_inode_flag **dslot = d_src.nfp;
+			struct cds_ft_inode_flag *dchild = d_src.nf;
+			struct cds_ft_inode_flag *dexp = d_src.nf_raw;
+
+			if (climb_steps >= 1) {
+				struct cds_ft_inode_flag *tp = NULL;
+
+				dchild = climb_top;
+				dexp = climb_top;
+				dslot = climb_top ? ft_resolve_parent_slot(
+					cds_ft_item_to_metadata(ft_node_ptr(
+						climb_top)), ft, &tp) : NULL;
+				if (!dslot || tp != climb_rest ||
+						rcu_dereference(*dslot) != climb_top)
+					dslot = NULL;	/* stale: leave unarmed */
+			}
+			if (dslot) {
+				bp_folds_into_graft_c = true;
+				fold_mode = FT_REKEY_FOLD_REPLACE;
+				fold_top_slot = slot;
+				fold_bp_depth = d_src.pdepth;
+				fold_rest_depth = d_src.pdepth -
+					(unsigned int) climb_steps;
+				fold_drop_child = dchild;
+				fold_drop_slot = dslot;
+				fold_drop_expected = dexp;
+			}
+		} else if (slot && rest_parent == graft_c &&
+				rcu_dereference(*slot) == climb_rest &&
+				ft_meta_nr_child(rm) == 1 && rm->external_nodes &&
+				ft_rekey_fold_value_ok(ft)) {
+			struct cds_ft_node *head =
+				ft_dereference_external(rm->external_nodes);
+
+			/*
+			 * The head IS the slot value -- an external carries tag
+			 * 0, so ft_node_external() reads the cast pointer -- and
+			 * its own back edge rides the copy loop's re-parent
+			 * sweep, the same arm that re-homes every other child of
+			 * the fresh node.
+			 */
+			if (head) {
+				bp_folds_into_graft_c = true;
+				fold_mode = FT_REKEY_FOLD_PROMOTE;
+				fold_top_slot = slot;
+				fold_bp_depth = d_src.pdepth;
+				fold_promote_val =
+					(struct cds_ft_inode_flag *) head;
+			}
 		}
 	}
 	root_pub_ok = (del_folds_into_graft || bp_folds_into_graft_c) &&
@@ -3555,8 +3853,8 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 				!glue.old_dir_dropped) ||
 			(!bp_folds_into_graft_c &&
 				(d_src.ppnf == graft_c ||
-				 (climb_reaches_graft && climb_steps >= 2))) ||
-			climb_rest_under_graft) {
+				 (climb_reaches_graft && climb_steps >= 2) ||
+				 climb_rest_under_graft))) {
 		ret = -ENOTSUP;		/* shape, terminal -- see above */
 		goto bail_build;
 	}
@@ -3912,6 +4210,90 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 			}
 			txn->pending_del_slot = d_src.nfp;
 			txn->pending_del_expected = d_src.nf_raw;
+		} else if (bp_folds_into_graft_c &&
+				fold_mode == FT_REKEY_FOLD_REPLACE) {
+			/*
+			 * REPLACE: build the resting node's DEL-recompacted copy
+			 * HERE, before the graft's copy loop needs it.
+			 *
+			 * ☞ ft_node_replace_ptr's DEL arm writes the fresh flag
+			 * into the @parent_node_flag_ptr the caller hands it and
+			 * PUBLISHES NOTHING -- its header says so ("a LOCAL
+			 * out-param re-published by the caller") -- which is
+			 * exactly the seam this fold needs: the detach's version
+			 * of this same edit publishes into @graft_c, the body the
+			 * graft is about to supersede, and that publish is the
+			 * defect.  Here the caller that re-publishes it is the
+			 * copy loop, into the fresh body, atomically.
+			 *
+			 * The old copy is retired by the recompaction's own
+			 * record and reclaimed on the far side of the commit.
+			 */
+			struct cds_ft_inode_flag *fresh = climb_rest;
+			struct ft_remove_pub rpub;
+			struct ft_lock_ctx rctx;
+			uint8_t rn = 0;
+
+			if (rcu_dereference(*fold_top_slot) != climb_rest) {
+				ret = -EAGAIN;
+				goto bail_build;
+			}
+			if (!ft_node_find_child(ft, climb_rest, fold_drop_child,
+					&rn, NULL)) {
+				ret = -EAGAIN;	/* stale plan: re-descend */
+				goto bail_build;
+			}
+			memset(&rpub, 0, sizeof(rpub));
+			ft_lock_ctx_init(&rctx, &d_src, txn, optxn);
+			rctx.held.extra = marks;
+			rctx.held.nr_extra = nr_marks;
+			ret = ft_node_replace_ptr(ft, fold_drop_slot,
+					fold_drop_expected,
+					&fresh, &fold_rest_old,
+					ft_flag_to_metadata(ft, climb_rest),
+					rn, NULL /*delete*/,
+					false /*is_root: a child of @graft_c*/,
+					fold_rest_depth, &rpub, txn,
+					NULL /*held_hint: no publish to guard*/,
+					&rctx);
+			if (ret || fresh == climb_rest) {
+				/*
+				 * A recompaction that did not relocate leaves
+				 * nothing to fold and would send the detach at
+				 * the superseded body after all.
+				 */
+				if (!ret)
+					ret = FT_REKEY_UNCOVERED;
+				goto bail_build;
+			}
+			txn->pending_del_slot = fold_top_slot;
+			txn->pending_del_expected = climb_rest;
+			txn->pending_del_replace = fresh;
+			fold_rest_new = fresh;
+		} else if (bp_folds_into_graft_c &&
+				fold_mode == FT_REKEY_FOLD_PROMOTE) {
+			/*
+			 * PROMOTE: the fresh copy is born holding the resting
+			 * node's key chain in that slot, so the copy loop's
+			 * @pending_pub_slot arm carries it -- the same field the
+			 * GLUE and MERGE builders announce, used here by the one
+			 * writer that never did.
+			 *
+			 * ☠ THAT ARM VALIDATES NO EXPECTED-OLD (it substitutes
+			 * whatever the slot resolved to), so the pairing is
+			 * checked HERE and RATIFIED at the freeze below, which
+			 * re-reads the resting node's parent under its own lock.
+			 * -EAGAIN, never a shape refusal: the slot is unheld
+			 * until then, so a peer is a transient a re-descent
+			 * clears.
+			 */
+			if (rcu_dereference(*fold_top_slot) != climb_rest) {
+				ret = -EAGAIN;
+				goto bail_build;
+			}
+			txn->pending_del_slot = fold_top_slot;
+			txn->pending_del_expected = climb_rest;
+			txn->pending_del_replace = fold_promote_val;
 		} else if (bp_folds_into_graft_c) {
 			/*
 			 * THE SAME ARMING ONE OR MORE LEVELS UP.  The slot is
@@ -3993,7 +4375,8 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 			 */
 			gcst = ft_store_at_graft_point_commit(ft, &attached_nf, &adepth,
 					NULL /*run*/, &gst_st,
-					txn->pending_del_folded ? 0 : (long) cnt);
+					ft_rekey_move_folded(txn, fold_mode,
+						fold_top_slot) ? 0 : (long) cnt);
 		cds_ft_alloc_reserve_deactivate(ft);
 		cds_ft_alloc_reserve_drain(ft, &reserve);
 		if (gst != CDS_FT_STATUS_OK || gcst != URCU_TXN_STATUS_OK) {
@@ -4115,7 +4498,8 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 * nothing and must not be judged by a stale one.
 	 */
 	ret = 0;
-	if (!txn->pending_del_folded && !glue.old_dir_dropped) {
+	if (!ft_rekey_move_folded(txn, fold_mode, fold_top_slot) &&
+			!glue.old_dir_dropped) {
 		ft_lock_ctx_init(&lctx_src, &d_src, txn, optxn);
 		lctx_src.held.extra = marks;
 		lctx_src.held.nr_extra = nr_marks;
@@ -4213,8 +4597,13 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		lctx_src.held.nr_extra = 0;
 		lctx_src.held.outer = &fold_octx.held;
 		ret = ft_rekey_fold_freeze_orphans(ft, &lctx_src, txn,
-				d_src.pnf, fold_bp_depth, climb_top, graft_c,
-				climb_steps, &detach_rc, fold_held,
+				d_src.pnf, fold_bp_depth, climb_top,
+				fold_mode == FT_REKEY_FOLD_PROMOTE ?
+					climb_rest : NULL,
+				fold_promote_val,
+				fold_mode == FT_REKEY_FOLD_DROP ?
+					climb_top : climb_rest,
+				graft_c, climb_steps, &detach_rc, fold_held,
 				&nr_fold_held);
 	}
 detach_bail:
@@ -4600,6 +4989,8 @@ cells_done:
 		 * must NOT run -- see its own comment.
 		 */
 		marks_consumed = true;
+		/* The copy loop published it into @graft_c's fresh body. */
+		fold_rest_published = true;
 		/*
 		 * SCRUB the frames that listed those marks: the commit
 		 * consumed their fences and freed the txn's descriptor, so an
@@ -4667,6 +5058,14 @@ cells_done:
 		 */
 		ft_rekey_fold_sweep_orphan_marks(fold_held, &nr_fold_held);
 		ft_rekey_detach_free_orphans(ft, &detach_rc);
+		/*
+		 * REPLACE's retired body.  Not an orphan -- the resting node
+		 * SURVIVES as its fresh copy, and this is the copy the fold's
+		 * recompaction superseded, retired by that recompaction's own
+		 * record and unlinked by this commit.
+		 */
+		if (fold_rest_old)
+			free_cds_ft_node(ft, fold_rest_old);
 		/*
 		 * Old S_top after the grace period -- but ONLY when nothing else
 		 * already owns its reclaim.  TWO other owners exist:
@@ -4770,6 +5169,14 @@ bail_build:
 		free_cds_ft_node_unpublished(ft, ft_node_ptr(gst_st.dest));
 
 sweep:
+	/*
+	 * REPLACE's fresh copy, on every path the commit did NOT take.  Placed
+	 * here because all five bails reach this label and none of them owns it:
+	 * it is built before the reserve is activated, so the reserve drain does
+	 * not cover it either.
+	 */
+	if (fold_rest_new && !fold_rest_published)
+		free_cds_ft_node_unpublished(ft, ft_node_ptr(fold_rest_new));
 	/*
 	 * The collided-cell ARRAY belongs to this frame whatever the outcome; the
 	 * CELLS in it are freed only on the committed path above, since an abort
