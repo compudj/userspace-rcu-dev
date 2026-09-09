@@ -2049,12 +2049,58 @@ void cds_ft_free_item_unpublished(struct cds_ft *ft __attribute__((unused)),
  * compactor must never free synchronously.  (FT_IMMEDIATE_FREE testing
  * mode keeps its poison-now behavior, like cds_ft_free_item.)
  */
+/*
+ * ☠ THE LEAK BALANCE IS THIS FUNCTION'S JOB, NOT ITS CALLERS'.
+ *
+ * The counted free paths are WRAPPERS -- free_cds_ft_node and
+ * free_compressed_node bump the balance around cds_ft_free_item -- but this
+ * entry has no wrapper, so for a long time each caller was expected to bump it
+ * by hand.  Three of the five did not (the rekey's old S_top, the old root, and
+ * one compaction site), which made cds_ft_group_destroy report a leak of
+ * EXACTLY ONE NODE PER SERVED REKEY: allocated, genuinely reclaimed, and never
+ * counted.  It cost a full flight-recorder hunt to find that the node in the
+ * report was not lost at all.
+ *
+ * A balance nobody owns drifts, so this owns it.  The arena knows which kind of
+ * item it hands out, so the kind needs no parameter and no caller can get it
+ * wrong.  ☞ The two callers that used to count themselves no longer do.
+ */
+static
+void ft_free_item_account(struct cds_ft_metadata *metadata)
+{
+	struct cds_ft_alloc_range *range;
+	struct cds_ft_alloc_arena *arena;
+	struct cds_ft_group *group;
+
+	/*
+	 * The predicate FIRST: this sits on the deferred-free hot path, and the
+	 * range/arena/group walk is three dependent loads that a build without
+	 * counters must not pay for.
+	 */
+	if (!ft_debug_counters())
+		return;
+	range = cds_ft_metadata_to_range(metadata);
+	arena = range->arena;
+	group = arena->ft_group;
+	if (arena->cell) {
+		uatomic_inc(&group->nr_cells_freed);
+		return;
+	}
+	uatomic_inc(&group->nr_nodes_freed);
+	if (arena->compressed)
+		uatomic_inc(&group->nr_compressed_freed);
+	else
+		uatomic_inc(&group->nr_internal_freed);
+}
+
 void cds_ft_free_item_deferred(struct cds_ft *ft __attribute__((unused)),
 		struct cds_ft_metadata *metadata)
 {
+	ft_free_item_account(metadata);
 #ifdef FT_IMMEDIATE_FREE
 	cds_ft_do_free_item(metadata);
 #else
+	{
 	struct cds_ft_metadata_alloc *metadata_alloc =
 		caa_container_of(metadata, struct cds_ft_metadata_alloc, metadata);
 	struct cds_ft_alloc_range *range =
@@ -2063,6 +2109,7 @@ void cds_ft_free_item_deferred(struct cds_ft *ft __attribute__((unused)),
 	const struct rcu_flavor_struct *flavor = arena->ft_group->flavor;
 
 	flavor->update_call_rcu(&metadata_alloc->rcu_head, cds_ft_free_item_rcu);
+	}
 #endif
 }
 

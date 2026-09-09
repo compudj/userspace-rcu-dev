@@ -308,11 +308,8 @@ struct cds_ft_compressed_node *ft_compact_relocate_compressed(struct cds_ft *ft,
 #endif
 	/* Always-deferred free: see ft_compact_relocate_at. */
 	FT_TP(compressed_free, (const void *) ft_compressed_node_flag(cn));
+	/* cds_ft_free_item_deferred owns the balance (fractal-trie-alloc.c). */
 	cds_ft_free_item_deferred(ft, cn_meta);
-	if (ft_debug_counters()) {
-		uatomic_inc(&ft->group->nr_nodes_freed);
-		uatomic_inc(&ft->group->nr_compressed_freed);
-	}
 	return cn2;
 }
 
@@ -409,8 +406,7 @@ struct ft_ord_cell *ft_compact_relocate_cell(struct cds_ft *ft,
 		ft_ord_cell_flip_one(&edge);
 	}
 	/* Always-deferred free: see ft_compact_relocate_at. */
-	if (ft_debug_counters())
-		uatomic_inc(&ft->group->nr_cells_freed);
+	/* cds_ft_free_item_deferred owns the balance (fractal-trie-alloc.c). */
 	cds_ft_free_item_deferred(ft, cds_ft_item_to_metadata(old));
 	return new_cell;
 }
