@@ -139,6 +139,7 @@ static int drain_and_destroy(struct cds_ft *ft, struct cds_ft_group *group)
 {
 	struct cds_ft_iter *iter;
 	enum cds_ft_status s;
+	unsigned long drained = 0;
 	int ret = 0;
 
 	s = cds_ft_iter_create(ft, &iter);
@@ -163,6 +164,13 @@ static int drain_and_destroy(struct cds_ft *ft, struct cds_ft_group *group)
 		}
 		cds_ft_for_each_duplicate_safe_rcu(head, tmp) {
 			node_free_rcu(to_test_node(head));
+		}
+		/* Let grace periods run: see dense_drain's note. */
+		if ((drained++ & 8191) == 8191) {
+			cds_ft_iter_bind_key(iter);
+			rcu_read_unlock();
+			rcu_quiescent_state();
+			rcu_read_lock();
 		}
 #ifdef FT_IMMEDIATE_FREE
 		s = cds_ft_verify(ft, stderr);
@@ -3212,8 +3220,31 @@ out:
 /* Macro: run a test, emit TAP ok/not-ok, skip if filtered out.       */
 /* ------------------------------------------------------------------ */
 
+/*
+ * A RANGE FILTER, because "run this one test" and "run the whole suite" are not
+ * the only two questions worth asking.
+ *
+ * ☞ WHY IT EARNS ITS KEEP.  test_compact_dense_full_node is BIMODAL in the
+ * suite -- 26 s alone, 8 runs out of 8, and intermittently ~10x that when the
+ * suite reaches it -- so the cost is not in the test, it is in the CONTEXT the
+ * preceding tests leave behind (arena occupancy, deferred-free backlog, thread
+ * pool).  Neither existing knob can express "reproduce that context": @filter
+ * is one exact name, and @exclude would need the other 320 names spelled out.
+ * A half-open index range lets a bisection walk the window backwards until the
+ * bimodality appears, which is what names the responsible predecessor.
+ *
+ * 1-based and inclusive, matching the TAP numbers the report prints, so a leg
+ * that failed at "309 tests done" is re-run with FT_TEST_FROM=300 FT_TEST_TO=310
+ * straight from the log.
+ */
 #define RUN_TEST(fn)							\
 	do {								\
+		ft_test_index++;					\
+		if ((range_from && ft_test_index < range_from) ||	\
+		    (range_to && ft_test_index > range_to)) {		\
+			skip(1, "out of range: " #fn);			\
+			break;						\
+		}							\
 		if (filter && strcmp(filter, #fn) != 0) {		\
 			skip(1, "filtered out: " #fn);			\
 			break;						\
@@ -15866,6 +15897,7 @@ out:
  */
 static int drain_trie(struct cds_ft *ft)
 {
+	unsigned long drained = 0;
 	struct cds_ft_iter *iter;
 	enum cds_ft_status s;
 	int ret = 0;
@@ -15885,6 +15917,13 @@ static int drain_trie(struct cds_ft *ft)
 		}
 		cds_ft_for_each_duplicate_safe_rcu(head, tmp) {
 			node_free_rcu(to_test_node(head));
+		}
+		/* Let grace periods run: see dense_drain's note. */
+		if ((drained++ & 8191) == 8191) {
+			cds_ft_iter_bind_key(iter);
+			rcu_read_unlock();
+			rcu_quiescent_state();
+			rcu_read_lock();
 		}
 	}
 	rcu_read_unlock();
@@ -24431,6 +24470,7 @@ static uint32_t xorshift32(uint32_t *state)
 
 static int test_density_stress(void)
 {
+	unsigned long drained = 0;
 	struct cds_ft_group *group;
 	struct cds_ft *ft;
 	struct cds_ft_iter *iter;
@@ -24548,6 +24588,13 @@ static int test_density_stress(void)
 		}
 		cds_ft_for_each_duplicate_safe_rcu(head, tmp) {
 			node_free_rcu(to_test_node(head));
+		}
+		/* Let grace periods run: see dense_drain's note. */
+		if ((drained++ & 8191) == 8191) {
+			cds_ft_iter_bind_key(iter);
+			rcu_read_unlock();
+			rcu_quiescent_state();
+			rcu_read_lock();
 		}
 	}
 	rcu_read_unlock();
@@ -28255,6 +28302,7 @@ static int dense_populate(struct cds_ft *ft, unsigned int N)
 static int dense_drain(struct cds_ft *ft)
 {
 	struct cds_ft_iter *iter;
+	unsigned long drained = 0;
 	int ret = 0;
 
 	if (cds_ft_iter_create(ft, &iter) < 0)
@@ -28269,6 +28317,33 @@ static int dense_drain(struct cds_ft *ft)
 		}
 		cds_ft_for_each_duplicate_safe_rcu(head, tmp)
 			node_free_rcu(to_test_node(head));
+		/*
+		 * ☠ REPORT A QUIESCENT STATE, OR NOTHING IS EVER RECLAIMED.
+		 *
+		 * Under QSBR a thread inside a read-side critical section never
+		 * reports quiescence, so NO grace period can complete while this
+		 * loop runs -- and the loop queues one node_free_rcu per key plus
+		 * every internal node the trie retires.  Draining a dense 300k
+		 * keyspace under one unbroken read lock therefore piles up the
+		 * whole reclaim backlog: measured at 4.7-5.3 GB RSS, and the
+		 * suite's own test_compact_dense_full_node went BIMODAL because
+		 * of it -- 26 s run alone, intermittently ~10x that once the
+		 * preceding tests had already loaded the heap, which is what
+		 * repeatedly timed the gate's ft_unit legs out at that test.
+		 *
+		 * ☞ BIND THE ITERATOR BEFORE DROPPING THE LOCK.  A CACHED
+		 * iterator holds a cached node AND -- with the library-owned
+		 * ordered list -- a LIVE REFERENCE to the matched leaf's key,
+		 * both valid only under the lock.  cds_ft_iter_bind_key copies
+		 * the key out while it is still safe; without it the re-descent
+		 * after the grace period reads a leaf this very loop freed.
+		 */
+		if ((drained++ & 8191) == 8191) {
+			cds_ft_iter_bind_key(iter);
+			rcu_read_unlock();
+			rcu_quiescent_state();
+			rcu_read_lock();
+		}
 	}
 	rcu_read_unlock();
 	rcu_barrier();		/* drain node_free_rcu + internal-node reclaim */
@@ -35339,6 +35414,11 @@ int main(int argc, char **argv)
 {
 	const char *filter = (argc >= 2) ? argv[1] : NULL;
 	const char *exclude = getenv("FT_TEST_EXCLUDE");
+	const char *from_env = getenv("FT_TEST_FROM");
+	const char *to_env = getenv("FT_TEST_TO");
+	unsigned int range_from = from_env ? (unsigned int) atoi(from_env) : 0;
+	unsigned int range_to = to_env ? (unsigned int) atoi(to_env) : 0;
+	unsigned int ft_test_index = 0;
 	int err;
 
 	err = create_all_cpu_call_rcu_data(0);
