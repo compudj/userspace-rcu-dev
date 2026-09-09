@@ -69,13 +69,13 @@
 #endif
 
 /*
- * 315 unconditional + 51 fault-injection-only RUN_TEST registrations, on top of
+ * 316 unconditional + 51 fault-injection-only RUN_TEST registrations, on top of
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (374 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (375 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (323 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (324 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -11988,6 +11988,86 @@ out:
 	cds_ft_destroy(ft);
 	cds_ft_group_destroy(group);
 	return ret;
+}
+
+/*
+ * THE +count WALK RAN BEFORE THE DETACH THAT MOVED ITS BASE.
+ *
+ * ft_flip_txn_record_count_parent resolves every ancestor against the
+ * relocations the descriptor ALREADY carries, and its header states the
+ * ordering the one-decide drivers owe it: "detach at step 3, count walks at
+ * step 3c".  The GLUE and MERGE lanes keep that promise -- their walk is inside
+ * ft_glue_txn_commit_edges, which the driver runs after the detach.  The
+ * NOSPLIT STORE lane did not: ft_store_at_graft_point_commit walked inline at
+ * step 3a, and the src detach -- which can RELOCATE THE ROOT -- is step 3.  So
+ * the walk charged its delta into a root copy the same commit retired, and the
+ * live root never received it.
+ *
+ * MEASURED, rank stats on, both list modes, single-threaded:
+ *
+ *     insert "ab", "bcab", "b";  rekey_merge(dst "bbaaca", src "a")
+ *     -> OK, every key at the right name, and
+ *        cds_ft_count_keys answers 2 for THREE keys,
+ *        ft_verify: depth 0: nr_keys mismatch: stored 2, computed 3
+ *
+ * ☠ AND THE COUNT IS PUBLIC.  This is not an internal-consistency nit that
+ * only cds_ft_verify sees: cds_ft_count_keys is the caller's own answer and it
+ * is WRONG, which is why the assertion below is on the count and not on
+ * verify alone.
+ *
+ * ☞ WHY A RANK-STATS TRIE IS THE ONLY WITNESS: a rank_stats-OFF trie keeps no
+ * subtree aggregate, so the whole class is invisible on the default build --
+ * which is how it survived.  Over a 3000-shape corpus this face was 178 of the
+ * rank lane's failures; it is 6 after the fix.
+ *
+ * The src is a PREFIX rather than a whole key so the move is an ordinary
+ * subtree graft, and the dst descends from the OTHER root byte so the root is
+ * genuinely the node the detach relocates.
+ */
+static int rekey_count_walk_after_detach(int ordered_list)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	enum cds_ft_status s;
+	int ret = -1;
+
+	if (!cds_ft_merge_enabled()) {
+		diag("rekey_count_walk_after_detach: skipped, merge compiled "
+			"out (-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
+	ft = create_varlen_rankstats_list_ft(ordered_list, &group);
+	rcu_read_lock();
+	cds_ft_insert(ft, (const uint8_t *) "ab", 2, &node_alloc(1)->node);
+	cds_ft_insert(ft, (const uint8_t *) "bcab", 4, &node_alloc(2)->node);
+	cds_ft_insert(ft, (const uint8_t *) "b", 1, &node_alloc(3)->node);
+
+	s = ft_rekey(ft, "bbaaca", "a");
+	if (s != CDS_FT_STATUS_OK ||
+	    !ft_test_has_key(ft, "bbaacab") || ft_test_has_key(ft, "ab") ||
+	    !ft_test_has_key(ft, "bcab") || !ft_test_has_key(ft, "b") ||
+	    cds_ft_count_keys(ft) != 3 ||
+	    cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr,
+			"count_walk_after_detach(list=%d): %s count %lu (want 3)\n",
+			ordered_list, cds_ft_status_to_string(s),
+			cds_ft_count_keys(ft));
+		goto out;
+	}
+	ret = 0;
+out:
+	rcu_read_unlock();
+	drain_trie(ft);
+	rcu_barrier();
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+static int test_rekey_count_walk_after_detach(void)
+{
+	return rekey_count_walk_after_detach(0) ||
+		rekey_count_walk_after_detach(1);
 }
 
 /*
@@ -35985,6 +36065,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_rekey_bare_head_graft_branch);
 	RUN_TEST(test_rekey_compressed_bp_atomic_or_refused);
 	RUN_TEST(test_rekey_collapse_one_slot_two_kinds);
+	RUN_TEST(test_rekey_count_walk_after_detach);
 	RUN_TEST(test_rekey_count_root_relocation);
 	RUN_TEST(test_merge_rekey_same_trie_speculative_rejected);
 	RUN_TEST(test_rekey_graft_vs_merge);

@@ -2485,31 +2485,36 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		 * named ({"xq","xabzm","xabzn"}, rekey "xabz" <- "xq") is served
 		 * correctly.
 		 *
-		 * ☠ THE GATE IS STILL LOAD-BEARING, FOR A DIFFERENT DEFECT.
-		 * Ablating it turns 178 failing seeds into 222 -- 44 NEW ones,
-		 * none fixed -- and every one of the 44 is the SAME face as the
-		 * 178 that fail WITH the gate in place: OK returned, every key
-		 * at the right name, cds_ft_count_keys exact, and cds_ft_verify
-		 * RED with `nr_keys mismatch: stored N, computed N`.  A
-		 * rank-stats trie is the only observer of that class, and the
-		 * class is NOT this gate's shape: it already fires on 178/3000
-		 * ORDINARY internal-src rekeys, which this gate does not touch.
-		 * Rank OFF over the same corpus: 0/3000.
-		 * ☞ [[project_ft_count_walk_base_and_iter_fabrication]] names
-		 * the mechanism (the union's +count walk BASE).
+		 * ☠ THE GATE IS STILL LOAD-BEARING, FOR A DIFFERENT DEFECT:
+		 * the rank lane's nr_keys ACCOUNTING.  Its failures are OK
+		 * returned, every key at the right name, and cds_ft_verify RED
+		 * with `nr_keys mismatch: stored N, computed N` -- sometimes
+		 * with cds_ft_count_keys itself wrong, so it is not merely an
+		 * internal-consistency nit.  A rank-stats trie is the only
+		 * observer (rank OFF keeps no aggregate: 0/3000 over the same
+		 * corpus), which is how the class survived.
 		 *
-		 * ⇒ SO THE THING TO FIX IS THE COUNT ACCOUNTING, NOT THIS GATE,
-		 * and dropping the gate first would add 44 instances of a defect
-		 * that is already the rank lane's dominant failure.  A refusal
-		 * whose stated reason has expired is still a refusal that holds
-		 * something back; what changed is WHAT, and this comment now
-		 * says which.
+		 * ☞ MEASURED OVER 3000 GENERATED SHAPES x BOTH LIST MODES, and
+		 * the numbers move as the accounting is repaired:
 		 *
-		 * ☞ WHEN THE nr_keys ACCOUNTING IS RIGHT: re-run the ablation
-		 * above (it must go 178 -> 0, not 222 -> 44), then drop this,
-		 * flip test_rekey_bare_head_rankstats_refused's rank arm to
-		 * expect OK + count 5, and delete the DEBUG_RCU #if that hides
-		 * test_rekey_count_root_relocation's mid-chain arms.
+		 *   gate ACTIVE   178 -> 6     after the count-walk ordering fix
+		 *   gate ABLATED  222 -> 12    (so the gate still covers 6)
+		 *
+		 * The class is NOT this gate's shape -- most of it fires on
+		 * ORDINARY internal-src rekeys the gate never touches -- so the
+		 * gate only ever clipped one corner of it.
+		 * ☞ [[project_ft_count_walk_base_and_iter_fabrication]] and
+		 * [[project_ft_rank_stats_nr_keys_is_the_lane_defect]].
+		 *
+		 * ⇒ SO THE THING TO FIX IS THE REST OF THE ACCOUNTING, NOT THIS
+		 * GATE.  A refusal whose stated reason has expired is still a
+		 * refusal that holds something back; what changed is WHAT.
+		 *
+		 * ☞ WHEN THE REMAINING 6 ARE GONE: re-run the ablation above (it
+		 * must go 6 -> 0 with the gate and 12 -> 0 without), then drop
+		 * this, flip test_rekey_bare_head_rankstats_refused's rank arm
+		 * to expect OK + count 5, and delete the DEBUG_RCU #if that
+		 * hides test_rekey_count_root_relocation's mid-chain arms.
 		 */
 		if (s_top_external && ft->rank_stats)
 			return FT_REKEY_UNCOVERED;
@@ -4927,6 +4932,25 @@ detach_bail:
 			free_cds_ft_node_unpublished(ft, ft_node_ptr(gst_st.dest));
 		goto sweep;
 	}
+
+	/*
+	 * 3a'. THE STORE LANE'S +count WALK, run HERE and not where it was
+	 * derived.  ft_flip_txn_record_count_parent resolves each ancestor
+	 * against the relocations the descriptor ALREADY carries, so it has to
+	 * run AFTER the detach above -- which is the step that can relocate the
+	 * ROOT.  The GLUE and MERGE lanes get this for free (their walk is inside
+	 * ft_glue_txn_commit_edges at step 3c); the NOSPLIT store lane walked
+	 * inline at step 3a and charged the delta into a root copy this commit
+	 * retires.  ☞ @deferred_count_base.
+	 *
+	 * Placed before 3b rather than beside the glue commit because it belongs
+	 * to the DETACH's ordering, not to the publish's: everything from here on
+	 * only adds edges, so any later position would be equally correct and
+	 * this one is the earliest that is.
+	 */
+	if (glue.deferred_count_base && glue.deferred_count_delta)
+		ft_flip_txn_record_count_parent(ft, txn,
+			glue.deferred_count_base, glue.deferred_count_delta);
 
 	/*
 	 * 3b. Cell-fold (list on): record the six ordered-cell run boundary edges into

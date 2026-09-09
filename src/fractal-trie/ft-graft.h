@@ -1386,9 +1386,40 @@ enum urcu_txn_status ft_store_at_graft_point_commit(struct cds_ft *ft,
 		if (st->old_recompacted_node && !ft->lock_fine)
 			ft_flip_txn_record_tombstone(st->glue->txn,
 				cds_ft_item_to_metadata(st->old_recompacted_node));
-		if (count_delta)
-			ft_flip_txn_record_count_parent(ft, st->glue->txn,
-				count_base, count_delta);
+		if (count_delta) {
+			/*
+			 * ☠ THE FOLD MUST NOT WALK HERE.  This runs at the driver's
+			 * step 3a, and the src detach -- which can RELOCATE THE ROOT
+			 * -- is step 3.  Walking now resolves every ancestor against
+			 * the pre-detach structure, so the delta is charged into a
+			 * root copy this same commit retires and the live root never
+			 * receives it.  MEASURED, rank stats on: insert
+			 * {"ab","bcab","b"} then rekey "bbaaca" <- "a" returns OK
+			 * with every key at the right name, and
+			 * cds_ft_count_keys answers 2 for 3 keys with
+			 * `ft_verify: depth 0: nr_keys mismatch: stored 2,
+			 * computed 3` -- the base and ft->root were ONE address at
+			 * this line and a DIFFERENT one after the detach.
+			 *
+			 * ft_flip_txn_record_count_parent already follows the
+			 * survivor of a relocation, but only one the descriptor
+			 * ALREADY carries; its header names the ordering the
+			 * one-decide drivers owe it.  So hand the walk to the driver,
+			 * which runs it after the detach -- exactly where the GLUE
+			 * and MERGE lanes' walk already runs
+			 * (ft_glue_txn_commit_edges at step 3c).
+			 *
+			 * A non-fold caller has no detach to order against and keeps
+			 * walking inline, byte-identically.
+			 */
+			if (st->glue->record_only) {
+				st->glue->deferred_count_base = count_base;
+				st->glue->deferred_count_delta = count_delta;
+			} else {
+				ft_flip_txn_record_count_parent(ft, st->glue->txn,
+					count_base, count_delta);
+			}
+		}
 		if (st->glue->record_only) {
 			/*
 			 * FOLD (coherent rekey one-decide writer): the whole dst-attach

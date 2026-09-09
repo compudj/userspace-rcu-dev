@@ -11768,6 +11768,29 @@ struct ft_glue {
 	 */
 	bool payload_live;
 	/*
+	 * THE FOLD'S +count WALK, HELD BACK UNTIL AFTER THE DETACH.
+	 *
+	 * ft_flip_txn_record_count_parent follows the survivor of a relocation
+	 * THIS SAME COMMIT records -- but only one already IN the descriptor when
+	 * the walk runs.  Its own header states the precondition: "any lane that
+	 * records its relocation into the shared txn BEFORE this walk runs is
+	 * covered, which the one-decide drivers guarantee by ordering (detach at
+	 * step 3, count walks at step 3c)."
+	 *
+	 * The GLUE and MERGE lanes keep that promise -- their walk is inside
+	 * ft_glue_txn_commit_edges, which the driver runs at step 3c.  The NOSPLIT
+	 * STORE lane did not: ft_store_at_graft_point_commit walked immediately,
+	 * at step 3a, and the src detach that RELOCATES THE ROOT is step 3.  So the
+	 * walk resolved every ancestor against the pre-detach structure and charged
+	 * the delta into a root copy the same commit retired.
+	 *
+	 * These two fields carry the walk to the driver, which runs it after the
+	 * detach.  Zero for every non-fold caller -- a cross-trie graft has no
+	 * detach to order against, so it keeps walking inline.
+	 */
+	struct cds_ft_inode_flag *deferred_count_base;
+	long deferred_count_delta;
+	/*
 	 * Inline floor backing.  ft_glue_init points the three arrays
 	 * here; graft / graft_swap never outgrow it.  ft_glue_reserve
 	 * repoints to a malloc'd buffer when a count would exceed its floor.
@@ -11833,6 +11856,16 @@ void ft_glue_init(struct ft_glue *g)
 	g->nr_splices = 0;
 	g->cap_splices = FT_GLUE_FLOOR_SPLICE;
 	g->publish_parent = NULL;
+	/*
+	 * ☠ THIS INITIALISER IS FIELD-BY-FIELD AND @glue IS AN UNINITIALISED
+	 * LOCAL, so a field added to the struct and not added HERE reads as
+	 * whatever was on the stack.  Adding these two without this line cost an
+	 * INTERMITTENT SIGSEGV (3 runs in 5) in the deferred count walk, on a
+	 * garbage base -- the shape of bug that looks like a memory-ordering
+	 * defect and is a missing assignment.
+	 */
+	g->deferred_count_base = NULL;
+	g->deferred_count_delta = 0;
 	g->lock_d = NULL;
 	g->lock_d_src = NULL;
 	g->peer = NULL;
