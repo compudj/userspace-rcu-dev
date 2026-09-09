@@ -69,13 +69,13 @@
 #endif
 
 /*
- * 318 unconditional + 51 fault-injection-only RUN_TEST registrations, on top of
+ * 319 unconditional + 51 fault-injection-only RUN_TEST registrations, on top of
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (377 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (378 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (326 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (327 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -12260,6 +12260,122 @@ static int test_rekey_merge_cut_source(void)
 	for (r = 0; r < 2; r++)
 		for (l = 0; l < 2; l++)
 			if (rekey_merge_cut_source(r, l))
+				return -1;
+	return 0;
+}
+
+/*
+ * ☑ THE DESTINATION IS A COMPRESSED RUN ENTERED AT ITS START.
+ *
+ * The dst key ends exactly WHERE a run begins, so D at @dst_len is that run
+ * with @dst_off_d == 0 -- the sibling of the KEY_SHORTER shape (@dst_off_d > 0,
+ * the dst key ending INSIDE the run), which was already served.
+ *
+ * It used to be refused by the merge arm's post-loop validation, and the
+ * refusal was propping up the TYPE-CLASS GATE two lines below it: that gate
+ * asked `dst_off_d == 0` as a PROXY for "D is a plain internal", which held
+ * only because the validation refused the other way of being at offset 0.
+ * Ablating the validation alone aborts at once, in
+ * `ft_node_type: Assertion !ft_node_compressed(node)` -- inside that very gate,
+ * whose own comment already said a compressed D "has no class to check".  The
+ * two were holding each other up; asking the node's KIND serves the shape.
+ *
+ * MEASURED over 3000 generated shapes x rank on/off x both list modes, on
+ * --enable-rcu-debug and release: 238 more calls commit, failure count
+ * unchanged.
+ *
+ * "bxyz" is the ONLY key under 'b', so that path compresses and D really is a
+ * run -- asserted below, because if a build stopped compressing it the test
+ * would pass while testing the plain-internal shape instead.  "am"/"an" make
+ * the source a genuine internal node with two children to move.
+ */
+static int rekey_merge_dst_run_start(int rank, int ordered_list)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	enum cds_ft_status s;
+	void *d_before;
+	int ret = -1;
+
+	if (!cds_ft_merge_enabled()) {
+		diag("rekey_merge_dst_run_start: skipped, merge compiled out "
+			"(-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
+	/*
+	 * Without path compression "bxyz" is a chain of plain internal nodes and
+	 * D is not a run at all, so the shape cannot be built.  Skip on the BUILD
+	 * FLAG, not on observing an uncompressed D.
+	 */
+	if (!_cds_ft_debug_compress_enabled()) {
+		diag("rekey_merge_dst_run_start: skipped, path compression "
+			"compiled out (-DNO_FEATURE_FT_COMPRESS)");
+		return 0;
+	}
+	if (rank) {
+		ft = create_varlen_rankstats_list_ft(ordered_list, &group);
+	} else {
+		struct cds_ft_group_attr *attr;
+
+		if (cds_ft_group_attr_create(&attr) < 0)
+			return -1;
+		if (cds_ft_group_attr_set_ordered_list(attr, ordered_list) < 0 ||
+		    cds_ft_group_create(attr, &group) < 0) {
+			cds_ft_group_attr_destroy(attr);
+			return -1;
+		}
+		cds_ft_group_attr_destroy(attr);
+		if (cds_ft_create(group, NULL, &ft) < 0) {
+			cds_ft_group_destroy(group);
+			return -1;
+		}
+	}
+	rcu_read_lock();
+	cds_ft_insert(ft, (const uint8_t *) "bxyz", 4, &node_alloc(1)->node);
+	cds_ft_insert(ft, (const uint8_t *) "am", 2, &node_alloc(2)->node);
+	cds_ft_insert(ft, (const uint8_t *) "an", 2, &node_alloc(3)->node);
+
+	/* Both halves of the shape must be present or the test proves nothing. */
+	d_before = _cds_ft_debug_child_at(ft, (const uint8_t *) "b", 1);
+	if (!d_before || !_cds_ft_debug_flag_is_compressed(d_before)) {
+		fprintf(stderr, "merge_dst_run_start: D at \"b\" is NOT a run (%p) "
+			"-- a single-key subtree should have path-compressed\n",
+			d_before);
+		goto out;
+	}
+	s = ft_rekey(ft, "b", "a");
+	if (s != CDS_FT_STATUS_OK ||
+	    !ft_test_has_key(ft, "bxyz") ||	/* the run's own key survives */
+	    !ft_test_has_key(ft, "bm") || !ft_test_has_key(ft, "bn") ||
+	    ft_test_has_key(ft, "am") || ft_test_has_key(ft, "an") ||
+	    cds_ft_count_keys(ft) != 3 ||
+	    cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr,
+			"merge_dst_run_start(rank=%d list=%d): %s count %lu "
+			"bxyz=%d bm=%d bn=%d am=%d\n",
+			rank, ordered_list, cds_ft_status_to_string(s),
+			cds_ft_count_keys(ft), ft_test_has_key(ft, "bxyz"),
+			ft_test_has_key(ft, "bm"), ft_test_has_key(ft, "bn"),
+			ft_test_has_key(ft, "am"));
+		goto out;
+	}
+	ret = 0;
+out:
+	rcu_read_unlock();
+	drain_trie(ft);
+	rcu_barrier();
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+static int test_rekey_merge_dst_run_start(void)
+{
+	int r, l;
+
+	for (r = 0; r < 2; r++)
+		for (l = 0; l < 2; l++)
+			if (rekey_merge_dst_run_start(r, l))
 				return -1;
 	return 0;
 }
@@ -36342,6 +36458,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_rekey_count_walk_after_detach);
 	RUN_TEST(test_rekey_merge_colocated_chain);
 	RUN_TEST(test_rekey_merge_cut_source);
+	RUN_TEST(test_rekey_merge_dst_run_start);
 	RUN_TEST(test_rekey_count_root_relocation);
 	RUN_TEST(test_merge_rekey_same_trie_speculative_rejected);
 	RUN_TEST(test_rekey_graft_vs_merge);

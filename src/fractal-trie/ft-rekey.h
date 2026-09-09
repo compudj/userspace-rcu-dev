@@ -3062,16 +3062,37 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 			ft_descent_step(ft, &d_dst, *(dk++));
 		}
 		/*
-		 * The merge point must be a PLAIN INTERNAL node -- OR, with
-		 * @dst_off_d > 0, the COMPRESSED run the dst key ends inside.  A skip
-		 * or external D remains the Edge-D / leaf-splice family, which belongs
-		 * to ft_merge_spine_copy.  d_dst.nf is non-NULL by the probe, but
-		 * re-checked because the probe ran outside this txn.
+		 * The merge point must be a PLAIN INTERNAL node, or a COMPRESSED run
+		 * -- entered at its START (@dst_off_d == 0, the dst key ends exactly
+		 * where the run begins) or PARTWAY IN (@dst_off_d > 0, the dst key
+		 * ends inside it).  A skip or external D remains the Edge-D /
+		 * leaf-splice family, which belongs to ft_merge_spine_copy.
+		 * d_dst.nf is non-NULL by the probe, but re-checked because the probe
+		 * ran outside this txn.
+		 *
+		 * ☑ THE START-OF-RUN ARM USED TO BE REFUSED HERE
+		 * (`dst_off_d == 0 && ft_node_compressed(d_dst.nf)`), and it was
+		 * refusing a shape NOTHING BELOW THIS LINE OBJECTED TO.  Ablated over
+		 * 3000 generated shapes it aborted at once -- but in
+		 * `ft_node_type: Assertion !ft_node_compressed(node)`, i.e. in the
+		 * TYPE-CLASS GATE just below, whose own comment already says a
+		 * compressed D "has no class to check".  That gate asked
+		 * `dst_off_d == 0`, using the offset as a PROXY for "D is a plain
+		 * internal" -- true only because THIS line refused the other way of
+		 * being at offset 0.  The two gates were holding each other up.
+		 *
+		 * With the type-class gate asking the node's KIND instead, the shape
+		 * is served: over the same corpus, on --enable-rcu-debug AND release
+		 * and in both list modes, 238 more calls commit and the failure count
+		 * is UNCHANGED (0 rank off, 6 rank on -- the rank lane's own residue).
+		 * ft_merge_build already dispatches on a compressed D at @off_d == 0;
+		 * there is no KEY_SHORTER prefix to re-wrap, so @merged_pub replaces
+		 * the run at its own slot, and the dst-freshness gate at the publish
+		 * checks the result the same way it does for every other merge point.
 		 */
 		if (d_dst.depth + dst_off_d != dst_len || !d_dst.nf ||
 				ft_node_flip_proxy(d_dst.nf) ||
 				ft_node_external(d_dst.nf) ||
-				(dst_off_d == 0 && ft_node_compressed(d_dst.nf)) ||
 				(dst_off_d != 0 && !ft_node_compressed(d_dst.nf)) ||
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 				ft_node_skip_compressed(d_dst.nf) ||
@@ -3082,11 +3103,20 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		}
 		/*
 		 * The type-class gate asks whether the node SCANNER can read D's body,
-		 * which is a question only an internal merge point raises: entered at
-		 * @off_d > 0, ft_merge_build dispatches on cn_d->key_bytes[off_d] and
-		 * never scans a slot array, so a compressed D has no class to check.
+		 * which is a question only a PLAIN INTERNAL merge point raises:
+		 * ft_merge_build dispatches a compressed D on cn_d->key_bytes[off_d]
+		 * and never scans a slot array, so a compressed D has no class to
+		 * check -- at EITHER offset.
+		 *
+		 * ☞ ASK THE NODE'S KIND, NOT THE OFFSET.  This read `dst_off_d == 0`,
+		 * which is EQUIVALENT today -- the validation above refuses
+		 * `dst_off_d != 0 && !ft_node_compressed(D)`, so past it a non-zero
+		 * offset implies a compressed D -- but equivalent only by way of a
+		 * refusal, and it was the offset form that made ft_node_type() assert
+		 * the moment the start-of-run arm was admitted.  The kind is the fact
+		 * this gate is actually about.
 		 */
-		if (dst_off_d == 0) {
+		if (!ft_node_compressed(d_dst.nf)) {
 			unsigned int dti = ft_node_type(d_dst.nf);
 
 			if (ft_types[dti].type_class != FT_POPCOUNT &&
