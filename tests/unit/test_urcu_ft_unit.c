@@ -69,13 +69,13 @@
 #endif
 
 /*
- * 314 unconditional + 51 fault-injection-only RUN_TEST registrations, on top of
+ * 315 unconditional + 51 fault-injection-only RUN_TEST registrations, on top of
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (373 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (374 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (322 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (323 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -11987,6 +11987,105 @@ out:
 	cds_ft_destroy(ft);
 	cds_ft_group_destroy(group);
 	return ret;
+}
+
+/*
+ * ONE SLOT, TWO KINDS: the collapse's back-edge record versus the op's own lock.
+ *
+ * A rekey whose src detach empties a junction runs ft_chain_compress_fused,
+ * which re-parents the surviving child through ft_record_child_back_edge.  That
+ * site passed hold_ctx = NULL, so ft_reparent_record_meta took its
+ * @child_marked == false arm and recorded a §4.B MW VALIDATE on the child's
+ * state word -- a word the SAME op had already acquired SW and recorded a
+ * release for.  Three records reach that one word, in order:
+ *
+ *     sw {s -> LOCK|s}   ft_acquire_member_at
+ *     sw {LOCK|s -> s}   the op's own release
+ *     MW {s -> s}        the collapse   -> `r->kind == kind`
+ *
+ * ☠ WHAT THIS TEST IS WORTH, AND WHERE.  On a RELEASE build the shape is
+ * benign: the engine's documented MW-domination fail-safe promotes the SW park
+ * to a CAS and the move completes correctly -- so the assertions below pass
+ * with or without the fix, and this test does NOT pin it here.  It pins it on
+ * an --enable-rcu-debug build, where urcu_txn_record_chain's kind check ABORTS
+ * the suite outright.  That is the gate's txndbg leg, and it is the only
+ * configuration in which this defect is observable at all.
+ * ☞ So: run the gate's debug leg, or this test is decoration.
+ *
+ * The shape is minimised from an rkfuzz seed; the src "bcb" is a bare external
+ * head, which is why it took admitting that shape to reach this defect -- but
+ * the defect itself is NOT the bare head's.  An INTERNAL src reaches it too
+ * (bcbx/bcby below), and that spelling is served on every build.
+ */
+static int rekey_collapse_one_slot_two_kinds(int internal_src)
+{
+	static const char *const bare[] = { "cb", "accba", "aaaab", "bcb",
+		"bbab", "acabc", "bbcba", NULL };
+	static const char *const inter[] = { "cb", "accba", "aaaab", "bcbx",
+		"bcby", "bbab", "acabc", "bbcba", NULL };
+	const char *const *keys = internal_src ? inter : bare;
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	enum cds_ft_status s;
+	unsigned long n = 0;
+	int ret = -1, i, moved;
+
+	if (!cds_ft_merge_enabled()) {
+		diag("rekey_collapse_one_slot_two_kinds: skipped, merge "
+			"compiled out (-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
+	ft = create_varlen_ft(&group);
+	rcu_read_lock();
+	for (i = 0; keys[i]; i++) {
+		cds_ft_insert(ft, (const uint8_t *) keys[i], strlen(keys[i]),
+			&node_alloc((unsigned long) i + 1)->node);
+		n++;
+	}
+	s = ft_rekey(ft, "bbccc", "bcb");
+	moved = (s == CDS_FT_STATUS_OK);
+	if (s != CDS_FT_STATUS_OK && s != CDS_FT_STATUS_NOT_SUPPORTED)
+		goto out;
+	if (internal_src) {
+		/* the INTERNAL spelling is served on every build */
+		if (!moved ||
+		    !ft_test_has_key(ft, "bbcccx") ||
+		    !ft_test_has_key(ft, "bbcccy") ||
+		    ft_test_has_key(ft, "bcbx") || ft_test_has_key(ft, "bcby"))
+			goto out;
+	} else if (moved) {
+		if (!ft_test_has_key(ft, "bbccc") || ft_test_has_key(ft, "bcb"))
+			goto out;
+	} else if (!ft_test_has_key(ft, "bcb")) {
+		goto out;
+	}
+	for (i = 0; keys[i]; i++) {
+		int is_src = !strncmp(keys[i], "bcb", 3);
+
+		if (!is_src && !ft_test_has_key(ft, keys[i]))
+			goto out;
+	}
+	if (cds_ft_count_keys(ft) != n ||
+	    cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK)
+		goto out;
+	ret = 0;
+out:
+	if (ret)
+		fprintf(stderr, "collapse_one_slot_two_kinds(internal=%d): %s "
+			"count %lu\n", internal_src,
+			cds_ft_status_to_string(s), cds_ft_count_keys(ft));
+	rcu_read_unlock();
+	drain_trie(ft);
+	rcu_barrier();
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+static int test_rekey_collapse_one_slot_two_kinds(void)
+{
+	return rekey_collapse_one_slot_two_kinds(0) ||
+		rekey_collapse_one_slot_two_kinds(1);
 }
 
 /*
@@ -35884,6 +35983,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_rekey_bare_head_graft_nosplit);
 	RUN_TEST(test_rekey_bare_head_graft_branch);
 	RUN_TEST(test_rekey_compressed_bp_atomic_or_refused);
+	RUN_TEST(test_rekey_collapse_one_slot_two_kinds);
 	RUN_TEST(test_rekey_count_root_relocation);
 	RUN_TEST(test_merge_rekey_same_trie_speculative_rejected);
 	RUN_TEST(test_rekey_graft_vs_merge);

@@ -1782,8 +1782,15 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 			ft_set_parent(ft, new_cn->child, new_cn_flag,
 				&new_cn->child);
 		} else {
+			/*
+			 * @ctx is the op's held set, and handing it over is what
+			 * keeps this site from recording a §4.B MW validate on a
+			 * word the op already holds SW -- see the call in
+			 * ft_record_child_back_edge for the three records that
+			 * collide without it.
+			 */
 			ft_record_child_back_edge(ft, txn, new_cn->child,
-				new_cn_flag, &new_cn->child);
+				new_cn_flag, &new_cn->child, ctx);
 		}
 		new_cn_pub = ft_publish_compressed(ft, new_cn, new_cn_flag);
 		/* VALIDATE (§4.B): lock (or guard-fallback) the LIVE

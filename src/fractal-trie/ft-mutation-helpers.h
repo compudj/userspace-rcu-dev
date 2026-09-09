@@ -9570,7 +9570,8 @@ static
 void ft_record_child_back_edge(struct cds_ft *ft, struct ft_flip_txn *txn,
 		struct cds_ft_inode_flag *child,
 		struct cds_ft_inode_flag *new_parent,
-		struct cds_ft_inode_flag **slot)
+		struct cds_ft_inode_flag **slot,
+		const struct ft_lock_ctx *hold_ctx)
 {
 	struct cds_ft_metadata *meta = NULL;
 	struct cds_ft_inode_flag **field;
@@ -9602,8 +9603,49 @@ void ft_record_child_back_edge(struct cds_ft *ft, struct ft_flip_txn *txn,
 		 * skipped here (the new parent is always compressed), matching
 		 * the "no incoming_byte write" contract above.
 		 */
+		/*
+		 * @hold_ctx, NOT NULL: the op's whole held set, so a child whose
+		 * word this op ALREADY HOLDS takes ft_reparent_record_meta's
+		 * third arm and records NO state edge at all.
+		 *
+		 * ☠ WITHOUT IT THIS SITE IS ONE HALF OF A ONE-SLOT-TWO-KINDS
+		 * CONTRADICTION.  @child_marked false records the §4.B MW
+		 * validate, whose expected-old is the word CLEAN -- and the
+		 * collapse's only caller is a lock-set op that has already
+		 * ACQUIRED that word (SW) and RECORDED ITS RELEASE (SW) in the
+		 * same descriptor.  MEASURED on the three records that reach one
+		 * state word, in order:
+		 *
+		 *   sw {s -> LOCK|s}   ft_acquire_member_at
+		 *   sw {LOCK|s -> s}   the op's own release
+		 *   MW {s -> s}        HERE  -> urcu_txn_record_chain's
+		 *                              `r->kind == kind` assert
+		 *
+		 * A debug build aborts; a release build takes the documented
+		 * MW-domination fail-safe, which promotes the op's SW park to a
+		 * CAS install.  Where no release precedes it the expected-old is
+		 * the clean word while the live word carries the op's own LOCK,
+		 * so the install can never match -- a deterministic abort that
+		 * presents as a livelock with no contention.
+		 *
+		 * ☑ AND THE PRECONDITION HOLDS, which is the only thing that
+		 * makes passing a @hold_ctx legal here.  ft_reparent_record_meta
+		 * documents it as "only a caller that is NEVER THE ACQUIRER may
+		 * pass one", and this collapse IS sometimes the acquirer -- the
+		 * surviving child is a member of its own lock-set (§7.1, the one
+		 * member below the pivot).  What makes it safe is that skipping
+		 * the state edge here cannot drop a release: the collapse's
+		 * acquire path ALREADY records one for every member it took
+		 * (ft_chain_compress_register_retire ->
+		 * ft_flip_txn_record_anchor_release), and a member that DEDUPED
+		 * owes both the lock and its clearing to the acquire that first
+		 * took it.  So the word's release is recorded before this line on
+		 * both routes, and the §4.B validate was never the thing carrying
+		 * it -- unlike the @child_marked arm, where the edge IS the
+		 * mark's release.
+		 */
 		ft_reparent_record_meta(ft, txn, meta, new_parent, slot,
-			/*child_marked=*/ false, /*hold_ctx=*/ NULL);
+			/*child_marked=*/ false, hold_ctx);
 		return;
 	} else if (ft->ordered_list) {
 		field = &ft_ord_cell_ptr(
