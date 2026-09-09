@@ -47,7 +47,9 @@
  * perturbation is already guaranteed by the RECOMPACT INVARIANTS, on the
  * DESTINATION side: an occupancy ADD relocates the attach parent (-ERANGE on all
  * four layout arms of _ft_node_set_nth, pigeon included) and, on the merge arm,
- * ft_merge_build returns a fresh union node by construction.  The src side
+ * ft_merge_build's union node -- CHECKED at that arm's publish rather than
+ * argued from construction, since a compressed S_top is admitted there now and
+ * the shared-run collapse can hand back a live node.  The src side
  * relocates too (a delete recompacts, -EFBIG), though it is not load-bearing.
  * The single exception is ft_in_place_ok = FEATURE_FT_INSERT_IN_PLACE &&
  * ft->exclusive -- and an exclusive trie has NO CONCURRENT READERS by contract.
@@ -2272,12 +2274,18 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 * ★ WHY THE MERGE PATH DOES NOT COW S_top, and it is not an oversight.
 	 * ft_rekey_cow_stop exists to give the moved subtree's top a FRESH ADDRESS, so
 	 * the coherent reader's two-descent witness sees the move as a changed visited
-	 * -node set.  A merge already does that BY CONSTRUCTION: entered with an
-	 * internal, non-compressed S_top, ft_merge_build cannot take either of the two
-	 * exits that return a live node (the shared-run collapse needs both sides
-	 * compressed; the leaf-splice needs both external), so it falls to its tail and
-	 * returns a freshly allocated M -- and it retires S_top outright on the way.
-	 * Interposing a COW would allocate a copy for the merge to consume and free.
+	 * -node set.  A merge does that ALMOST ALWAYS: ft_merge_build has exactly two
+	 * exits that return a LIVE node (the shared-run collapse needs both sides
+	 * compressed; the leaf-splice needs both external), and everywhere else it
+	 * falls to its tail and returns a freshly allocated M -- retiring S_top
+	 * outright on the way.  Interposing a COW would allocate a copy for the merge
+	 * to consume and free.
+	 *
+	 * ☞ "ALMOST" IS WHY THE PUBLISH ASKS ft_glue_is_fresh RATHER THAN TRUSTING
+	 * THIS.  This used to read "cannot take either exit", resting on a plan-time
+	 * refusal of a compressed S_top; that refusal is gone (MEASURED: it refused
+	 * 215 shapes over the corpus where 2 take a live exit), and what stands in
+	 * its place is a decidable test at the one point that can answer it.
 	 * cow_stop's OTHER job -- marking the children whose state words the commit
 	 * parks into -- is NOT redundant, and is done by the glue's own acquire.
 	 *
@@ -2394,36 +2402,44 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		if (merge_dst && require_empty)
 			return -EEXIST;
 		/*
-		 * A COMPRESSED S_top is in scope for the GRAFT arm only.  The merge arm
-		 * skips ft_rekey_cow_stop on the argument that ft_merge_build gives the
-		 * moved top a fresh address BY CONSTRUCTION -- and that argument names
-		 * its premise: "entered with an internal, non-compressed S_top,
-		 * ft_merge_build cannot take either of the two exits that return a live
-		 * node (the shared-run collapse needs BOTH SIDES COMPRESSED...)".  A
-		 * compressed S_top is exactly what unlocks that exit, so the freshness
-		 * the coherent reader's witness depends on would be gone.
+		 * ☑ A COMPRESSED S_top IS NOW IN SCOPE ON THE MERGE ARM TOO, and the
+		 * refusal that used to stand here named a real obligation with the
+		 * wrong SCOPE.  It argued that the merge arm skips ft_rekey_cow_stop
+		 * because ft_merge_build gives the moved top a fresh address BY
+		 * CONSTRUCTION -- "entered with an internal, non-compressed S_top,
+		 * ft_merge_build cannot take either of the two exits that return a
+		 * live node (the shared-run collapse needs BOTH SIDES COMPRESSED...)"
+		 * -- and that a compressed S_top unlocks that exit.  True; but it is
+		 * a PLAN-TIME PROXY for a PUBLISH-TIME fact, and the proxy is two
+		 * orders coarser than the fact.
 		 *
-		 * ☑ AND THAT IS MEASURED, NOT ONLY ARGUED.  Ablated over 3000 generated
-		 * shapes (the gate fires 860 times there), the run ABORTS on this
-		 * driver's own dst-freshness obligation --
-		 * `merged_pub != d_dst.nf && ft_glue_is_fresh(ft, &glue, merged_pub)`
-		 * -- and a release-semantics run LOSES A KEY (rkfuzz seed 712,
-		 * `missing=1`).  So the premise still holds and this refusal is not the
-		 * stale kind.
-		 * ☞ WHAT WOULD SERVE IT, located: the live node comes from
+		 * ☑ MEASURED, 3000 generated shapes x rank on/off x both list modes,
+		 * on --enable-rcu-debug AND on a release build.  The gate fired 215
+		 * times (rank off).  Letting the shape BUILD and recording what
+		 * ft_merge_build actually handed back -- a probe that records, not a
+		 * guard that refuses -- 86 of those reach the publish and exactly
+		 * TWO produce a top ft_glue_is_fresh does not match.  Both are the
+		 * shape the premise describes and nothing else: BOTH SIDES a
+		 * compressed run ({abaca,aab,ccb,bc} + rekey_merge(dst "cc", src
+		 * "aa"), and {abcccc,cacaa,accca,caaaca,aaa} + dst "accc" src "aa").
+		 * The other 213 were refused for a reason that does not apply to
+		 * them.
+		 *
+		 * ☑ SO THE OBLIGATION MOVES TO WHERE IT IS DECIDABLE -- the publish
+		 * below, which asks ft_glue_is_fresh directly.  That is strictly
+		 * stronger than the plan-time proxy in both directions: it admits
+		 * every shape whose top really is fresh, and it refuses a live top
+		 * on a RELEASE build, where the obligation used to rest on a
+		 * urcu_assert_debug that a release build compiles out.
+		 *
+		 * ☞ WHAT IS STILL OWED, for those two: a COW of the merged top when
+		 * ft_merge_build hands back a node ft_glue_is_fresh does not match --
+		 * the same copy-plus-reparent-plus-retire ft_rekey_cow_stop already
+		 * does for the graft arm's S_top.  The live node comes from
 		 * ft_merge_materialize_suffix's `suffix_len == 0` exit, which returns
-		 * `cn->child` -- the run's own child, live -- because there is no
-		 * suffix left to materialise.  That is RIGHT for a subtree (the src
-		 * children are re-parented live by construction) and wrong only when
-		 * this helper is what produces the merge's TOP.  So the cure is not in
-		 * that exit: it is a COW of the merged top when ft_merge_build hands
-		 * back a node ft_glue_is_fresh does not match -- the same thing
-		 * ft_rekey_cow_stop does for the graft arm's S_top, and the same
-		 * re-parent-plus-retire bookkeeping.  Nothing else about the shape is
-		 * missing; it is one fresh copy short.
+		 * `cn->child`: right for a subtree, wrong only when that helper is
+		 * what produces the merge's TOP.
 		 */
-		if (merge_dst && s_top_compressed)
-			return FT_REKEY_UNCOVERED;
 		/*
 		 * ☑ A CO-LOCATED EXTERNAL CHAIN IS SERVED ON THE MERGE ARM TOO.
 		 * It used to be refused here, and the refusal's whole reason was
@@ -3390,7 +3406,35 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 				ft_compressed_node_ptr(d_dst.nf), true, &ks_held);
 			ks_fenced = true;
 		}
-		merged_nf = ft_merge_build(&mctx, s_top, 0, d_dst.nf, dst_off_d, 0,
+		/*
+		 * ☠ @src_cut, NOT 0, IS THE SOURCE-SIDE OFFSET.  @off_s is where the
+		 * SRC KEY ends inside S_top, and for a run the src key ends INSIDE
+		 * (@src_cut > 0) the two are different depths: 0 is the RUN'S OWN
+		 * start, and the bytes in [0, @src_cut) belong to the src key's
+		 * prefix, not to the subtree being moved.  Passing 0 moved the WHOLE
+		 * run, so every moved key arrived at `dst || whole-run` instead of
+		 * `dst || run-tail` -- and since the old name is cleared by the same
+		 * commit, the key was reachable at NEITHER name the caller knows.
+		 *
+		 * The graft arm never had to say this: ft_rekey_cow_stop MANUFACTURES
+		 * the tail (its own @cut parameter, fed @src_cut at the call below),
+		 * so by the time the graft publishes, offset 0 IS the cut.  The merge
+		 * arm skips cow_stop, so nothing had cut the run and this argument is
+		 * the only place the cut can be expressed.
+		 *
+		 * MEASURED, single-threaded on a quiet trie, all four rank/list
+		 * modes, both builds: {acbaab,bba,ab,cacab} + rekey_merge(dst "a",
+		 * src "cac") landed "cacab" at "aacab" -- dst + the whole run
+		 * "acab" -- where the contract says "aab".  cds_ft_count_keys and
+		 * cds_ft_verify were both CLEAN over it: only a lookup at the two
+		 * names the caller can name could see it.
+		 *
+		 * ☞ INERT UNTIL THE GATE ABOVE LIFTED.  @src_cut is non-zero only
+		 * when the descent stopped ON a run, which is exactly what sets
+		 * @s_top_compressed -- so for every shape this arm served before, it
+		 * is 0 and this reads byte for byte as it did.
+		 */
+		merged_nf = ft_merge_build(&mctx, s_top, src_cut, d_dst.nf, dst_off_d, 0,
 				d_dst.pdepth, &merged_keys);
 		if (merged_nf == FT_MERGE_OOM) {
 			merged_nf = NULL;
@@ -3440,40 +3484,55 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 					merged_pub);
 		}
 		/*
+		 * ☠ THE DST-FRESHNESS OBLIGATION, AND IT IS A GATE, NOT AN ASSERT.
+		 * The rekey-coherent reader's two-descent witness
+		 * (ft_lookup_two_descents) rests on every move publishing a FRESH
+		 * library node at the destination attach point -- on this arm the
+		 * union node M ft_merge_build returns -- and that is what licenses
+		 * the BARE-HEAD src admitted above (an app-owned head gets no fresh
+		 * address of its own).
+		 *
+		 * ☑ IT USED TO BE A urcu_assert_debug HERE, GUARDED BY A PLAN-TIME
+		 * PROXY UPSTREAM (`merge_dst && s_top_compressed`, and the merge
+		 * point taking no external D).  Both halves of that were wrong for
+		 * the job: the proxy refused 215 shapes over the 3000-shape corpus
+		 * where only TWO ever produce a live top, and the assert -- the only
+		 * thing standing behind it -- COMPILES OUT of a release build, so on
+		 * the build that ships the obligation was unchecked.  Asking
+		 * ft_glue_is_fresh HERE is decidable, exact and unconditional, and
+		 * it costs one walk of @glue.built on the arm that is already
+		 * committing.
+		 *
+		 * ☠ AND THE OBLIGATION IS TEMPORARY BY STATED INTENT, which is why
+		 * it must not rest on construction: the pigeon -ERANGE arm carries a
+		 * planned sticky-bitmap future (ft-mutation-node.h), and the
+		 * standing direction is to RE-ALLOW IN-PLACE MUTATIONS WITHOUT COW
+		 * with rekey special-cased to COW the parent -- and if that
+		 * special-case is ever missed, the breakage is SILENT (a torn
+		 * descent that matches a clean one returns a wrong answer and no
+		 * gate leg reddens).  A refusal is loud.
+		 *
+		 * REFUSING HERE IS A CLEAN NO-OP: this is upstream of
+		 * ft_glue_set_publish, so nothing is recorded and nothing is stored
+		 * -- the same point the -ENOMEM arm above already bails from -- and
+		 * @bail_build reclaims every fresh copy this attempt built.
+		 *
+		 * ft_glue_is_fresh matches by underlying identity, so the
+		 * KEY_SHORTER wrap and the skip re-encode both still answer true.
+		 */
+		FT_REKEY_DST_FRESH_REACH(0);
+		if (merged_pub == d_dst.nf ||
+				!ft_glue_is_fresh(ft, &glue, merged_pub)) {
+			ret = FT_REKEY_UNCOVERED;
+			goto bail_build;
+		}
+		/*
 		 * The merged top replaces D in the publish parent's slot.  Recorded, not
 		 * stored: ft_glue_txn_commit_edges runs at step 3c below, after the
 		 * detach, like the GLUE arm.
 		 */
 		ft_glue_set_publish(ft, &glue, d_dst.pnf, d_dst.nfp, merged_pub);
 		glue.attached_nf = merged_pub;
-		/*
-		 * ☠ THE DST-FRESHNESS OBLIGATION, STATED AND ASSERTED AT THE
-		 * PUBLISH.  The rekey-coherent reader's two-descent witness
-		 * (ft_lookup_two_descents) rests on every move publishing a FRESH
-		 * library node at the destination attach point -- on this arm the
-		 * union node M ft_merge_build returns -- and that is what licenses
-		 * the BARE-HEAD src admitted above (an app-owned head gets no fresh
-		 * address of its own).  Today the freshness holds by construction:
-		 * the two ft_merge_build exits that return a LIVE node need both
-		 * sides compressed (refused: merge_dst && s_top_compressed) or both
-		 * external (refused: the merge-point gate takes no external D), so
-		 * M is always this op's own allocation.  But the guarantee is
-		 * TEMPORARY BY STATED INTENT: the pigeon -ERANGE arm carries a
-		 * planned sticky-bitmap future (ft-mutation-node.h), and the
-		 * standing direction is to RE-ALLOW IN-PLACE MUTATIONS WITHOUT COW
-		 * with rekey special-cased to COW the parent -- and if that
-		 * special-case is ever missed, the breakage is SILENT (a torn
-		 * descent that matches a clean one returns a wrong answer and no
-		 * gate leg reddens).  So the obligation is pinned HERE, where the
-		 * publish is decided: the record's expected-old validates at the
-		 * flip, so a value that is fresh at record time is fresh at publish
-		 * time or the commit aborts.  ft_glue_is_fresh matches by
-		 * underlying identity, so the KEY_SHORTER wrap and the skip
-		 * re-encode both still answer true.
-		 */
-		FT_REKEY_DST_FRESH_REACH(0);
-		urcu_assert_debug(merged_pub != d_dst.nf &&
-			ft_glue_is_fresh(ft, &glue, merged_pub));
 		/*
 		 * ☠ THE DST DELTA IS WHAT THE UNION ADDED, NOT WHAT THE SRC HELD.
 		 *
