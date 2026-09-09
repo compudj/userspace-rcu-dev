@@ -6512,6 +6512,7 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 		struct cds_ft_node *node)
 {
 	struct urcu_txn optxn;
+	struct ft_op_retry op_retry;
 	enum cds_ft_status s;
 	bool need_retry;
 #ifdef FT_DEBUG_REMOVE_RETRY_CAP
@@ -6559,9 +6560,11 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 	 * terminates (no livelock).  Exclusive trie: the bracket opens nothing
 	 * and no conflict ever fires.
 	 */
+	ft_op_retry_init(&op_retry, FT_OP_REMOVE, NULL, 0);
 	ft_txn_op_init(ft, &optxn);
 	for (;;) {
 		need_retry = false;
+		ft_op_retry_tick(ft, &op_retry, 0);
 #ifdef FT_DEBUG_REMOVE_RETRY_CAP
 		ft_tA = ft_dbg_now_ns();
 #endif

@@ -128,6 +128,60 @@ LTTNG_UST_TRACEPOINT_ENUM(cds_ft, ft_tp_node_kind,
  * Event classes for common signatures to avoid boilerplate.
  */
 
+/*
+ * A MUTATION OP RETRIED PAST ITS CAP -- the livelock violation event.
+ *
+ * @op is the mutation entry point (ft_op_kind), @attempts the count that
+ * tripped the cap, @last_ret the code the last attempt returned.  -EAGAIN
+ * PROMISES that retrying can help, i.e. that a PEER is responsible; a count
+ * that runs away therefore names a SELF-refusal, which no re-descent can
+ * clear.  @nr_writers separates the two readings at the event: with one
+ * writer it is certain, with peers it is a hypothesis.
+ *
+ * Self-diagnosing by design (the enter/step events around it may have scrolled
+ * out of a 64K ring): the key that could not be moved travels WITH the
+ * violation, so the shape is recoverable from this one event.
+ */
+LTTNG_UST_TRACEPOINT_EVENT(cds_ft, op_retry_violation,
+	LTTNG_UST_TP_ARGS(
+		const void *, ft,
+		unsigned int, op,
+		unsigned int, attempts,
+		int, last_ret,
+		unsigned int, nr_writers,
+		const uint8_t *, key,
+		size_t, key_len
+	),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_integer_hex(uintptr_t, ft, (uintptr_t) ft)
+		lttng_ust_field_integer(unsigned int, op, op)
+		lttng_ust_field_integer(unsigned int, attempts, attempts)
+		lttng_ust_field_integer(int, last_ret, last_ret)
+		lttng_ust_field_integer(unsigned int, nr_writers, nr_writers)
+		lttng_ust_field_sequence_hex(uint8_t, key, key, size_t, key_len)
+	)
+)
+
+/*
+ * One per retry of a mutation op, carrying the loop variable.  High rate by
+ * construction -- enable it only when the violation alone has not named the
+ * site (see the tracing skill's "enable by hypothesis").
+ */
+LTTNG_UST_TRACEPOINT_EVENT(cds_ft, op_retry_step,
+	LTTNG_UST_TP_ARGS(
+		const void *, ft,
+		unsigned int, op,
+		unsigned int, attempts,
+		int, last_ret
+	),
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_integer_hex(uintptr_t, ft, (uintptr_t) ft)
+		lttng_ust_field_integer(unsigned int, op, op)
+		lttng_ust_field_integer(unsigned int, attempts, attempts)
+		lttng_ust_field_integer(int, last_ret, last_ret)
+	)
+)
+
 LTTNG_UST_TRACEPOINT_EVENT_CLASS(cds_ft, ft_key_event_class,
 	LTTNG_UST_TP_ARGS(
 		const void *, ft,

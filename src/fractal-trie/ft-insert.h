@@ -4720,11 +4720,14 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
 	struct urcu_txn optxn;
 	enum cds_ft_status s;
 	bool need_retry;
+	struct ft_op_retry retry;
 
 	CDS_FT_SCOPED_WRITER(ft);
+	ft_op_retry_init(&retry, FT_OP_REPLACE, NULL, 0);
 	ft_txn_op_init(ft, &optxn);
 	for (;;) {
 		need_retry = false;
+		ft_op_retry_tick(ft, &retry, 0);
 		urcu_txn_begin(&optxn);
 		s = _cds_ft_replace_locked(ft, iter, old_node, new_node,
 				&need_retry, &optxn);

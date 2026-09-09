@@ -5268,8 +5268,14 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 		const uint8_t *dst_key, size_t dst_len, bool require_empty)
 {
 	const struct rcu_flavor_struct *flavor = ft->group->flavor;
+	struct ft_op_retry op_retry;
+	/*
+	 * The FIRST tick reports the code the PREVIOUS attempt returned, and on
+	 * attempt one there is none -- so seed it rather than read an
+	 * indeterminate local into a trace field.
+	 */
 	struct urcu_txn optxn;
-	int ret;
+	int ret = 0;
 
 	/*
 	 * JOIN THE PEER EXCLUSION PROTOCOL.  This writer parks its structural
@@ -5377,7 +5383,15 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 	 * from wedging the peers that wait on one.
 	 */
 	urcu_txn_set_park_quiescent(&optxn, 1);
+	ft_op_retry_init(&op_retry, FT_OP_REKEY, src_key, src_len);
 	for (;;) {
+		/*
+		 * The GENERIC cap, beside the rekey's own older one.  This is
+		 * the arm that TRACES: it fires the violation event and records
+		 * the flight-recorder snapshot, so the window that led to the
+		 * spin survives the spin.
+		 */
+		ft_op_retry_tick(ft, &op_retry, ret);
 #ifdef FT_DEBUG_REKEY_RETRY_CAP
 		/*
 		 * A LIVELOCK DETECTOR, and it is cheap because of what -EAGAIN

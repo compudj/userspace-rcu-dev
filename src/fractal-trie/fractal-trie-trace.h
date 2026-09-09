@@ -151,4 +151,105 @@ void ft_trace_capture(void)
 #define FT_TP_ITER_KEY(name, iter)		do {} while (0)
 #endif
 
+/*
+ * THE PER-OP RETRY CAP: one counter, every mutation entry, one loud failure.
+ *
+ * ☠ WHY A COUNTER IS A CORRECTNESS INSTRUMENT AND NOT A PERFORMANCE ONE.
+ * -EAGAIN in this tree carries a PROMISE: "retrying can help, because a PEER is
+ * responsible for this refusal".  A retry count that runs away therefore does
+ * not mean the machine is busy -- it means the op is refusing ITSELF, on a
+ * condition no re-descent can change.  Single-threaded that reading is certain;
+ * with peers it is a hypothesis the event's @nr_writers lets the reader judge.
+ *
+ * The rekey writer already had a private version of this (FT_DEBUG_REKEY_RETRY_
+ * CAP), and it found three self-refusals by hand.  This is that detector made
+ * GENERIC -- insert, remove, replace and rekey share it -- and made TRACEABLE:
+ * instead of only printing, it fires an LTTng violation event, records the
+ * flight-recorder snapshot, and aborts, so the window that led to the spin is
+ * on disk instead of being overwritten by the spin itself.
+ *
+ * ☞ IT IS PER OP, NOT PER THREAD.  Reset at every entry: a thread that does a
+ * million ordinary mutations must not accumulate its way into a false positive,
+ * and the question is always "did THIS call converge".
+ *
+ * The cap is deliberately far above real contention -- a saturated multi-writer
+ * arm re-attempts in single digits, so five figures cannot be a peer.
+ */
+#ifdef FT_DEBUG_OP_RETRY_CAP
+# include <stdio.h>
+# include <stdlib.h>
+# ifndef FT_OP_RETRY_CAP
+#  define FT_OP_RETRY_CAP	50000
+# endif
+
+enum ft_op_kind {
+	FT_OP_INSERT = 1,
+	FT_OP_REMOVE,
+	FT_OP_REPLACE,
+	FT_OP_REKEY,
+};
+
+struct ft_op_retry {
+	unsigned int attempts;
+	unsigned int op;
+	const uint8_t *key;
+	size_t key_len;
+};
+
+/*
+ * @nr_writers is what separates "certain" from "hypothesis" at the event, and
+ * it is sampled rather than tracked: the trie knows how many writer scopes are
+ * open.  Zero when the build cannot answer, which reads as "unknown", never as
+ * "single".
+ */
+static inline
+unsigned int ft_op_retry_nr_writers(const struct cds_ft *ft)
+{
+	(void) ft;
+	return 0;
+}
+
+static inline
+void ft_op_retry_init(struct ft_op_retry *r, unsigned int op,
+		const uint8_t *key, size_t key_len)
+{
+	r->attempts = 0;
+	r->op = op;
+	r->key = key;
+	r->key_len = key_len;
+}
+
+/*
+ * Called once per attempt.  Emits the per-retry step event (low value until the
+ * violation has named a site, high rate -- enable by name), and on the cap
+ * fires the violation, records the snapshot and aborts.
+ *
+ * ☠ THE SNAPSHOT MUST BE TAKEN BEFORE THE ABORT AND AFTER THE VIOLATION: the
+ * ring is overwritten by the spin itself, so the event that explains the window
+ * has to be IN the window it explains.
+ */
+static inline
+void ft_op_retry_tick(const struct cds_ft *ft, struct ft_op_retry *r, int last_ret)
+{
+	FT_TP(op_retry_step, (const void *) ft, r->op, r->attempts, last_ret);
+	if (caa_likely(++r->attempts <= FT_OP_RETRY_CAP))
+		return;
+	FT_TP(op_retry_violation, (const void *) ft, r->op, r->attempts,
+		last_ret, ft_op_retry_nr_writers(ft),
+		r->key, r->key ? r->key_len : 0);
+	fprintf(stderr,
+		"FT OP RETRY LIVELOCK: op=%u attempts=%u last_ret=%d -- an "
+		"-EAGAIN no re-descent can clear.  Single-threaded this is "
+		"certain; under peers it is the leading hypothesis.\n",
+		r->op, r->attempts, last_ret);
+	if (system("lttng snapshot record 1>&2") == -1)
+		fprintf(stderr, "FT OP RETRY: snapshot record failed\n");
+	abort();
+}
+#else
+struct ft_op_retry { int unused; };
+# define ft_op_retry_init(r, op, key, key_len)	do { (void) (r); } while (0)
+# define ft_op_retry_tick(ft, r, last_ret)	do { (void) (r); } while (0)
+#endif	/* FT_DEBUG_OP_RETRY_CAP */
+
 #endif /* _URCU_FT_TRACE_H */
