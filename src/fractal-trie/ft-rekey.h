@@ -653,12 +653,27 @@ int ft_rekey_prefix_range_cmp(const uint8_t *kb, size_t klen,
  * Free the UNPUBLISHED S_top copy ft_rekey_cow_stop made, whichever kind it is.
  * The two kinds come from different arenas, and the compressed one is handed back
  * as a plain node flag precisely so this inversion is safe (see cow_stop).
+ *
+ * ☠ ONLY A COPY -- AND THE CHECK IS HERE, NOT AT THE SEVEN BAIL SITES.  The
+ * BARE-EXTERNAL-HEAD leg skips ft_rekey_cow_stop entirely (there is nothing to
+ * copy) and leaves @s_top_prime naming the LIVE, APP-OWNED head, so on that
+ * shape this must free NOTHING.  cow_stop never produces an external copy, so
+ * "external" is an exact discriminator, and putting it at this ONE choke point
+ * covers every bail -- including a future one someone adds without reading
+ * this.  A per-site guard would be a site list, and a site list cannot cover a
+ * rule this shape.
+ *
+ * What it prevents: the dispatch below has no external arm, so the head would
+ * take the plain-node one and the APPLICATION'S OWN memory would go back to a
+ * library arena, while the trie still points at it from the destination.
  */
 static
 void ft_rekey_free_stop_prime(struct cds_ft *ft, struct cds_ft_inode_flag *nf)
 {
 	if (!nf)
 		return;
+	if (ft_node_external(nf))
+		return;		/* the live head: not ours, see above */
 	if (ft_node_compressed(nf))
 		free_compressed_node_unpublished(ft, ft_compressed_node_ptr(nf));
 	else
@@ -2401,20 +2416,66 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		if (merge_dst && s_top_meta && s_top_meta->external_nodes)
 			return FT_REKEY_UNCOVERED;
 		/*
-		 * THE BARE HEAD IS MERGE-ARM ONLY, deliberately.  An occupied dst
-		 * consumes it with machinery that already speaks external-src:
-		 * ft_merge_build takes S_ext (the head contributes no slots, lands
-		 * as M's external_nodes, and its LIVE back edge rides the commit as
-		 * a deferred edge -> ft_reparent_record's external arm), records NO
-		 * retire for it (app-owned), and returns a fresh union M -- the
-		 * dst-side freshness the coherent reader's witness rests on.  The
-		 * EMPTY-dst graft arm has none of that: it runs ft_rekey_cow_stop
-		 * (nothing to COW here) and ft_store_at_graft_point, whose payload
-		 * back edge is a PLAIN store on the premise the payload is a fresh
-		 * invisible copy -- reader-visible and abort-surviving for a live
-		 * head.  That arm's bare-head leg (record the back edge, skip the
-		 * retire) is a separate increment; until it lands, the shape owes
-		 * UNCOVERED, never a wrong-witness publish.
+		 * ☑ THE BARE HEAD IS NOW BOTH ARMS.  It used to be merge-arm only:
+		 * an occupied dst consumes it with machinery that already speaks
+		 * external-src (ft_merge_build takes S_ext -- the head contributes
+		 * no slots, lands as M's external_nodes, its LIVE back edge rides
+		 * the commit as a deferred edge -> ft_reparent_record's external
+		 * arm -- records NO retire for it, app-owned, and returns a fresh
+		 * union M).  The EMPTY-dst graft arm had none of that: it runs
+		 * ft_rekey_cow_stop and ft_store_at_graft_point, whose payload back
+		 * edge was a PLAIN store on the premise the payload is a fresh
+		 * invisible copy -- reader-visible AND abort-surviving for a live
+		 * head.
+		 *
+		 * The leg that closes it is exactly the two things the old comment
+		 * named, and nothing else: RECORD THE BACK EDGE (@glue.payload_live
+		 * routes ft_store_at_graft_point's NOSPLIT arm through
+		 * ft_glue_defer_edge_origin, which reaches the same external arm the
+		 * merge side uses) and SKIP THE RETIRE (there is nothing to COW, so
+		 * ft_rekey_cow_stop is not called at all -- its own header keeps the
+		 * shape out of scope -- and cow_stop is the only thing that would
+		 * have recorded a retire for S_top).
+		 *
+		 * ☠ AND SKIPPING cow_stop MEANS @s_top_prime IS THE LIVE HEAD, not a
+		 * copy this frame owns -- so ft_rekey_free_stop_prime refuses an
+		 * external node at its own choke point (every bail path calls it),
+		 * and the post-commit reclaim of the old S_top skips this shape too.
+		 * Without either, the APPLICATION'S OWN NODE goes to the node arena.
+		 *
+		 * The DST-side freshness the coherent reader's witness rests on is
+		 * unaffected -- the graft's attach parent is recompacted (relocated)
+		 * by the reserve, which is a fresh library node -- and that is the
+		 * same adjudication (2026-08-31) the external S_top admission above
+		 * already rests on.
+		 *
+		 * ☠☠ AND IT IS STILL REFUSED, FOR A REASON THAT IS NOT THIS LEG'S.
+		 * The leg above is WRITTEN AND MEASURED -- with it armed, the head
+		 * moves on the NOSPLIT, BRANCH and root-sibling destinations, both
+		 * list modes, count exact and cds_ft_verify clean -- and it is one
+		 * line from being re-armed (`glue.payload_live = s_top_external`
+		 * below, and deleting this return).  What blocks it is the defect
+		 * the RANK-STATS gate twenty lines down already names:
+		 * ft_chain_compress_fused records the surviving child's re-parent MW
+		 * onto a word an earlier lane of the same one-decide recorded SW.
+		 *
+		 * ☑ VERIFIED PRE-EXISTING, not a cost of this leg, by the twin shape:
+		 *
+		 *     insert "cb","accba","aaaab","bcbx","bcby","bbab","acabc","bbcba"
+		 *     cds_ft_rekey_merge(ft, dst "bbccc", src "bcb")
+		 *
+		 * -- an INTERNAL src, which HEAD serves -- aborts
+		 * `urcu_txn_record_chain: r->kind == kind` at @4c8ac7fe on a clean
+		 * detached worktree under --enable-rcu-debug.  A RELEASE build
+		 * absorbs it through the MW-domination fail-safe, which DROPS that
+		 * re-parent edge and loses the key.  Admitting the bare head only
+		 * hands that defect ONE MORE REACHABLE SHAPE, and a silent key loss
+		 * returning OK is not a trade a clean refusal ever loses.
+		 *
+		 * ☞ WHEN ft_chain_compress_fused RECORDS ONE KIND: delete this
+		 * return, and the rank-stats one below with it -- they are waiting on
+		 * the SAME fix -- then flip test_rekey_bare_head_graft_{nosplit,branch}
+		 * from their refusal arm to OK.
 		 */
 		if (s_top_external && !merge_dst)
 			return FT_REKEY_UNCOVERED;
@@ -2752,7 +2813,39 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 */
 	ft_flip_txn_claim_per_op_armable(ft, txn);
 #endif
-	if (!merge_dst) {
+	if (!merge_dst && s_top_external) {
+		/*
+		 * THE BARE HEAD: there is NOTHING TO COW.  ft_rekey_cow_stop's own
+		 * header keeps this shape out of scope, and its three duties all
+		 * collapse -- a head has no children to re-parent and no body to
+		 * fence, its retire MUST NOT happen (the node is app-owned), and the
+		 * FRESH ADDRESS the copy exists to give is not owed here: the
+		 * coherent reader's two-descent witness rests on DST-SIDE freshness
+		 * (adjudicated 2026-08-31, see the S_top admission above), and a head
+		 * has no interior, hence no second commit-sensitive read below the
+		 * junction.
+		 *
+		 * So the payload IS the live head.  Two consequences, and both are
+		 * carried explicitly rather than left to a shape argument:
+		 *
+		 *  - no bail path may free it.  ft_rekey_free_stop_prime refuses an
+		 *    external @nf at its own choke point for exactly this reason:
+		 *    otherwise the APPLICATION'S OWN node goes back to the node arena
+		 *    (its kind dispatch has no external arm, so it would take the
+		 *    plain one on a node that never came from it).
+		 *  - @glue.payload_live is set below, so the graft's NOSPLIT arm
+		 *    RECORDS the head's back edge into the fold's txn instead of
+		 *    plain-storing it ahead of the publish.
+		 *
+		 * @marks stays empty, which is correct and not merely convenient:
+		 * cow_stop's fences exist to protect the BODY it reads and the
+		 * children it re-parents.  Nothing here reads a body.  What covers
+		 * the head disappearing under us is the src junction's own
+		 * expected-old on the slot that holds it, which the detach records
+		 * into this same commit.
+		 */
+		s_top_prime = s_top;
+	} else if (!merge_dst) {
 		ft_lock_ctx_init(&lctx_src, &d_src, txn, optxn);
 		/*
 		 * NOT bound to @optxn.  ft_flip_txn_create_*_on sets t->mtxn =
@@ -2834,10 +2927,36 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		 * tree: a wholly-consumed compressed run is decoded, and every reading
 		 * the probe stops on (divergence, an overshooting run, a skip or
 		 * external node) bails here too.  A disagreement is therefore a PEER
-		 * changing the shape between the probe and this descent; it keeps the
-		 * pre-existing terminal answer rather than a retry, because a probe
-		 * and a descent that disagree on a QUIET tree would be a defect this
-		 * op cannot retry its way out of.
+		 * changing the shape between the probe and this descent; it keeps a
+		 * TERMINAL answer rather than a retry, because a probe and a descent
+		 * that disagree on a QUIET tree would be a defect this op cannot retry
+		 * its way out of.
+		 *
+		 * ☠ AND THE MIRROR IS NOT TOTAL: the probe stops its WALK on the same
+		 * readings, but it never inspects the node AT @dst_len -- it only asks
+		 * `merge_dst = (depth + off == dst_len && nf != NULL)`.  So an EXTERNAL
+		 * D (the dst key is itself a bare head), a COMPRESSED D at offset 0, a
+		 * skip-encoded D, a parked flip proxy and a ROOT D all PASS the probe
+		 * and are refused by the post-loop validation below -- on a QUIET tree,
+		 * single-threaded, with no peer anywhere.  Those are UNIMPLEMENTED
+		 * SHAPES, not caller mistakes and not disagreements.
+		 *
+		 * ★ HENCE FT_REKEY_UNCOVERED, NOT -EINVAL, AT EVERY EXIT IN THIS BLOCK.
+		 * The three kinds of refusal are deliberately distinct (their header
+		 * sits above FT_REKEY_UNCOVERED): -EINVAL is ARGUMENT -- "the caller got
+		 * it wrong and NO STATE of the trie would make the call legal" -- and
+		 * not one of these exits is that.  Answering it here surfaced
+		 * CDS_FT_STATUS_INVALID_ARGUMENT_ERROR for a well-formed call, i.e. it
+		 * blamed the caller for this writer's own cut.
+		 *
+		 * MEASURED before the change, single-threaded on a quiet trie: insert
+		 * {"az","bcm","bcn"} and then rekey_merge(dst "az", src "bc") answered
+		 * "Invalid argument" -- because D at "az" is a bare external head --
+		 * while correctly leaving the trie untouched and verifying clean.  It
+		 * now answers NOT_SUPPORTED.  Terminal either way: the same-trie
+		 * fallback refuses by design (a staged move hides a live key for a
+		 * grace period), so this changes what the caller is TOLD, not what the
+		 * writer does.
 		 *
 		 * @d_dst then names {D, publish parent, publish slot, grandparent},
 		 * where the publish parent may now be the compressed node itself and
@@ -2856,7 +2975,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 					|| ft_node_skip_compressed(d_dst.nf)
 #endif
 					|| ft_node_external(d_dst.nf)) {
-				ret = -EINVAL;
+				ret = FT_REKEY_UNCOVERED;
 				goto bail_build;
 			}
 			if (ft_node_compressed(d_dst.nf)) {
@@ -2875,7 +2994,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 					 */
 					if (ft_match_compressed_key(dk, cn,
 							remaining) != remaining) {
-						ret = -EINVAL;
+						ret = FT_REKEY_UNCOVERED;
 						goto bail_build;
 					}
 					dst_off_d = remaining;
@@ -2884,7 +3003,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 				if (ft_match_compressed_key(dk, cn,
 						(unsigned int) cn->len)
 						!= (unsigned int) cn->len) {
-					ret = -EINVAL;
+					ret = FT_REKEY_UNCOVERED;
 					goto bail_build;
 				}
 				ft_descent_traverse_compressed(ft, &d_dst, cn, &dk);
@@ -2908,7 +3027,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 				ft_node_skip_compressed(d_dst.nf) ||
 #endif
 				!d_dst.pnf || !d_dst.nfp) {
-			ret = -EINVAL;
+			ret = FT_REKEY_UNCOVERED;
 			goto bail_build;
 		}
 		/*
@@ -2922,7 +3041,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 
 			if (ft_types[dti].type_class != FT_POPCOUNT &&
 					ft_types[dti].type_class != FT_PIGEON) {
-				ret = -EINVAL;
+				ret = FT_REKEY_UNCOVERED;
 				goto bail_build;
 			}
 		}
@@ -3412,6 +3531,22 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		bctx.held.extra = marks;
 		bctx.held.nr_extra = nr_marks;
 		/*
+		 * THE PAYLOAD IS THE LIVE HEAD, not a COW copy -- so the NOSPLIT
+		 * arm of ft_store_at_graft_point must RECORD its back edge rather
+		 * than plain-store it ahead of the publish.  ☞ @payload_live.
+		 * The BRANCH arm needs nothing: there the payload is the branch's
+		 * leaf and ft_build_branch already defers a live leaf in glue mode.
+		 *
+		 * ☞ INERT TODAY AND KEPT ON PURPOSE: @s_top_external is false here
+		 * while the bare-head gate above still refuses (it waits on the
+		 * chain-compress kind conflict, see there).  This assignment, the
+		 * cow_stop skip, the app-owned reclaim skip and
+		 * ft_rekey_free_stop_prime's external guard are the whole leg, they
+		 * were measured working together, and re-arming is deleting one
+		 * `return`.  Leaving them out would mean re-deriving all four.
+		 */
+		glue.payload_live = s_top_external;
+		/*
 		 * ARM THE OLD-DIRECTION DROP.  When the dst key diverges inside
 		 * the very run S_top hangs off, that run's one child IS S_top --
 		 * the subtree @s_top_prime is the copy of -- so the split has no
@@ -3500,9 +3635,12 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		 * not prove (a compressed or skip-encoded occupant it declines to
 		 * walk).  For a GRAFT that is the destination-occupied answer its
 		 * caller documents; for a MERGE it is a dst shape this cut leaves to
-		 * ft_merge_spine_copy.
+		 * ft_merge_spine_copy -- which is the definition of UNCOVERED, and
+		 * was answered with the ARGUMENT code by the same slip as the dst
+		 * descent above.  The sentence "a dst shape this cut leaves to
+		 * ft_merge_spine_copy" was already there; only the code disagreed.
 		 */
-		ret = require_empty ? -EEXIST : -EINVAL;
+		ret = require_empty ? -EEXIST : FT_REKEY_UNCOVERED;
 		goto bail_build;
 	}
 	/*
@@ -5244,7 +5382,20 @@ cells_done:
 		 * after the op returns.  Measured: one cut rekey, 3 s idle, then
 		 * urcu_qsbr_barrier() never returns.
 		 */
-		if (!merge_dst && !(src_cut && glue.old_dir_dropped))
+		/*
+		 *  - and the BARE EXTERNAL HEAD is APP-OWNED: it is not a library
+		 *    node, it was never copied, and the very same object is now
+		 *    live at the DESTINATION.  Reclaiming it here would hand the
+		 *    application's node back to the arena while the trie points
+		 *    at it.  (@s_top_meta is NULL for it in any case, which is how
+		 *    this first showed itself: a SIGSEGV in
+		 *    cds_ft_free_item_deferred on a NULL metadata, one line in.)
+		 *    This is the second half of the "skip the retire" duty the old
+		 *    bare-head refusal named -- skipping ft_rekey_cow_stop drops
+		 *    the RECORDED retire, and this drops the post-commit RECLAIM.
+		 */
+		if (!merge_dst && !s_top_external &&
+				!(src_cut && glue.old_dir_dropped))
 			cds_ft_free_item_deferred(ft, s_top_meta);
 		ret = 0;
 	} else {
@@ -5671,9 +5822,11 @@ int _cds_ft_debug_rekey_graft_simple(struct cds_ft *ft,
  * move atomically -- a reader sees the subtree at the source XOR the
  * destination, with no instant where it is at neither, which is the property
  * the staged writer (a committed detach, then a merge back) cannot provide.
- * -EINVAL means the shape is outside this writer's cut and the caller should
- * fall back; -EEXIST is a GRAFT caller's occupied destination; -ENOMEM and
- * -ENOTSUP are terminal.  The transient contention codes never surface: the
+ * FT_REKEY_UNCOVERED means the shape is outside this writer's cut and the caller
+ * should fall back; -EINVAL is an ARGUMENT error and is terminal (the two were
+ * one code once, and this sentence still said so long after they were split --
+ * see the three-kinds-of-refusal header above FT_REKEY_UNCOVERED); -EEXIST is a
+ * GRAFT caller's occupied destination; -ENOMEM and -ENOTSUP are terminal.  The transient contention codes never surface: the
  * retry wrapper absorbs them.
  *
  * It takes the READ LOCK the body needs but NOT the move gate, so one gate

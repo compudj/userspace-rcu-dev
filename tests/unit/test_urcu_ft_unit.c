@@ -69,13 +69,13 @@
 #endif
 
 /*
- * 311 unconditional + 51 fault-injection-only RUN_TEST registrations, on top of
+ * 314 unconditional + 51 fault-injection-only RUN_TEST registrations, on top of
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (370 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (373 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (319 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (322 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -11814,6 +11814,182 @@ out:
 }
 
 /*
+ * A dst shape this writer does not cover must NOT come back as
+ * INVALID_ARGUMENT_ERROR.
+ *
+ * ft-rekey.h states three deliberately distinct refusals: -EINVAL is ARGUMENT
+ * ("the caller got it wrong and NO STATE of the trie would make the call
+ * legal"), FT_REKEY_UNCOVERED is SHAPE/MODE, -ENOTSUP is BUILD.  The merge
+ * arm's dst descent answered the ARGUMENT code at every one of its exits,
+ * including the ones its own up-front probe cannot screen: the probe walks
+ * while `depth < dst_len` and so never inspects the node AT dst_len, which
+ * lets an EXTERNAL D, a COMPRESSED D at offset 0, a skip-encoded D, a parked
+ * proxy and a ROOT D all reach a refusal that blames the caller.
+ *
+ * MEASURED before the fix, single-threaded, quiet trie: this exact call
+ * answered "Invalid argument" while correctly leaving the trie untouched.
+ *
+ * ☞ WHY THIS PINS A CONTRACT AND NOT A GAP.  It does NOT assert
+ * NOT_SUPPORTED: whether the shape is served is a property of the WRITER'S
+ * CUT and is expected to change (a bare-head destination is a union the merge
+ * arm could learn).  What must hold on either answer is that the caller is
+ * never told its ARGUMENTS were wrong, that the call RETURNS, that the moved
+ * key is at exactly one of its two names, and that the trie verifies -- the
+ * same "atomic or refused" shape as the fixed-length and skip-slot cases
+ * above.  Pinning the refusal code itself is what
+ * rekey_skip_slot_bp_atomic_or_refused's header warns went red the day a gap
+ * closed.
+ */
+static int test_rekey_uncovered_dst_is_not_an_argument_error(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	enum cds_ft_status s;
+	int ret = -1;
+	int moved;
+
+	if (!cds_ft_merge_enabled()) {
+		diag("test_rekey_uncovered_dst_is_not_an_argument_error: "
+			"skipped, merge compiled out (-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
+	ft = create_varlen_ft(&group);
+	rcu_read_lock();
+	/* "az" is a BARE EXTERNAL HEAD: D at dst_len is an external node. */
+	cds_ft_insert(ft, (const uint8_t *) "az", 2, &node_alloc(1)->node);
+	cds_ft_insert(ft, (const uint8_t *) "bcm", 3, &node_alloc(2)->node);
+	cds_ft_insert(ft, (const uint8_t *) "bcn", 3, &node_alloc(3)->node);
+
+	s = ft_rekey(ft, "az", "bc");
+	if (s == CDS_FT_STATUS_INVALID_ARGUMENT_ERROR) {
+		fprintf(stderr, "uncovered dst reported as an ARGUMENT error\n");
+		goto out;
+	}
+	/* Served or refused, the keys are at exactly one of their two names. */
+	moved = (s == CDS_FT_STATUS_OK);
+	if (ft_test_has_key(ft, "azm") != moved ||
+	    ft_test_has_key(ft, "azn") != moved ||
+	    ft_test_has_key(ft, "bcm") == moved ||
+	    ft_test_has_key(ft, "bcn") == moved ||
+	    !ft_test_has_key(ft, "az") ||
+	    cds_ft_count_keys(ft) != 3 ||
+	    cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "uncovered dst: %s count %lu\n",
+			cds_ft_status_to_string(s), cds_ft_count_keys(ft));
+		goto out;
+	}
+	ret = 0;
+out:
+	rcu_read_unlock();
+	drain_trie(ft);
+	rcu_barrier();
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
+ * A BARE EXTERNAL HEAD moved onto an EMPTY destination -- the GRAFT arm.
+ *
+ * The merge (occupied-dst) arm has taken this source for a while; the graft arm
+ * refused it, and its refusal named exactly what it owed: "that arm's bare-head
+ * leg (record the back edge, skip the retire) is a separate increment".  Both
+ * halves are what this pins.
+ *
+ * WHY THE BACK EDGE IS THE WHOLE PROBLEM.  ft_store_at_graft_point publishes
+ * the payload itself into the destination slot and wired its back-pointer with
+ * a PLAIN ft_set_parent -- sound while the payload is a fresh invisible copy
+ * (the cross-trie graft's drained source, the fold's COW'd S_top'), and wrong
+ * for a head, which is app-owned, cannot be copied, and stays reachable at the
+ * SOURCE for the whole build window: the store is reader-visible ahead of the
+ * publish and survives an abort.  @glue.payload_live routes it through the same
+ * deferred-edge path the merge arm uses (ft_reparent_record's external arm).
+ *
+ * AND THE RETIRE HAS TWO HALVES, which is how this first went wrong: skipping
+ * ft_rekey_cow_stop drops the RECORDED retire, but the post-commit reclaim of
+ * the old S_top is a SEPARATE statement, and it fired -- SIGSEGV inside
+ * cds_ft_free_item_deferred on a NULL metadata, because a bare head has none.
+ * Had the head carried metadata it would instead have returned the
+ * APPLICATION'S OWN node to the arena while the trie pointed at it.  Both the
+ * reclaim and ft_rekey_free_stop_prime (seven bail sites, guarded at its own
+ * choke point) now refuse the shape.
+ *
+ * TWO DESTINATION ARMS, deliberately, because they are different code: "ax"
+ * lands NOSPLIT (the parent at depth 1 exists and the slot is free, so the head
+ * goes straight into it -- the arm that plain-stored), and "zzz" builds a
+ * BRANCH (where ft_build_branch already defers a live leaf, so it should have
+ * been right all along and this pins that it is).  Both list modes: the head
+ * carries an ordered cell whose ->parent is the word that rides the commit.
+ *
+ * ☞ RANK STATS ARE ABSENT ON PURPOSE.  The bare head is still refused there,
+ * and test_rekey_bare_head_rankstats_refused owns that refusal and says why
+ * (the chain-compress kind conflict drops a re-parent and orphans a key).
+ * Serving the graft arm must not quietly widen into that.
+ */
+static int rekey_bare_head_graft(const char *dst, int ordered_list)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	enum cds_ft_status s;
+	int ret = -1;
+	int moved;
+
+	if (cds_ft_group_attr_create(&attr) < 0)
+		return -1;
+	if (cds_ft_group_attr_set_ordered_list(attr, ordered_list) < 0 ||
+	    cds_ft_group_create(attr, &group) < 0) {
+		cds_ft_group_attr_destroy(attr);
+		return -1;
+	}
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &ft) < 0) {
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	rcu_read_lock();
+	/* "q" is a whole key ending at depth 1 with nothing below: a BARE HEAD. */
+	cds_ft_insert(ft, (const uint8_t *) "q", 1, &node_alloc(1)->node);
+	cds_ft_insert(ft, (const uint8_t *) "am", 2, &node_alloc(2)->node);
+	cds_ft_insert(ft, (const uint8_t *) "an", 2, &node_alloc(3)->node);
+
+	s = ft_rekey(ft, dst, "q");
+	/*
+	 * ATOMIC OR REFUSED, and today it is REFUSED -- see the gate.  What must
+	 * hold on EITHER answer is that the key is at exactly one of its two
+	 * names, the count is intact and the trie verifies; a refusal must leave
+	 * the structure byte-for-byte as it was.  Written this way, not pinned to
+	 * NOT_SUPPORTED, because the refusal is waiting on a fix ELSEWHERE
+	 * (ft_chain_compress_fused) and pinning it would go red the day that
+	 * lands -- which is exactly how rekey_skip_slot_bp_atomic_or_refused's
+	 * header says this test family gets it wrong.
+	 */
+	moved = (s == CDS_FT_STATUS_OK);
+	if ((s != CDS_FT_STATUS_OK && s != CDS_FT_STATUS_NOT_SUPPORTED) ||
+	    ft_test_has_key(ft, "q") == moved ||
+	    ft_test_has_key(ft, dst) != moved ||
+	    !ft_test_has_key(ft, "am") || !ft_test_has_key(ft, "an") ||
+	    cds_ft_count_keys(ft) != 3 ||
+	    cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr,
+			"bare_head_graft(%s, list=%d): %s q=%d dst=%d count %lu\n",
+			dst, ordered_list, cds_ft_status_to_string(s),
+			ft_test_has_key(ft, "q"), ft_test_has_key(ft, dst),
+			cds_ft_count_keys(ft));
+		goto out;
+	}
+	ret = 0;
+out:
+	rcu_read_unlock();
+	drain_trie(ft);
+	rcu_barrier();
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
  * A src junction whose parent BP is a COMPRESSED RUN, moved to an empty dst.
  *
  * ☠☠☠ THIS RETURNED OK AND CORRUPTED THE TRIE at @4c8ac7fe, single-threaded,
@@ -11933,6 +12109,16 @@ static int test_rekey_compressed_bp_atomic_or_refused(void)
 {
 	return rekey_compressed_bp_atomic_or_refused(0) ||
 		rekey_compressed_bp_atomic_or_refused(1);
+}
+
+static int test_rekey_bare_head_graft_nosplit(void)
+{
+	return rekey_bare_head_graft("ax", 0) || rekey_bare_head_graft("ax", 1);
+}
+
+static int test_rekey_bare_head_graft_branch(void)
+{
+	return rekey_bare_head_graft("zzz", 0) || rekey_bare_head_graft("zzz", 1);
 }
 
 /*
@@ -35694,6 +35880,9 @@ int main(int argc, char **argv)
 	RUN_TEST(test_merge_rerooted_nosplit_ordered_branch);
 	RUN_TEST(test_merge_rekey_same_trie);
 	RUN_TEST(test_rekey_bare_head_rankstats_refused);
+	RUN_TEST(test_rekey_uncovered_dst_is_not_an_argument_error);
+	RUN_TEST(test_rekey_bare_head_graft_nosplit);
+	RUN_TEST(test_rekey_bare_head_graft_branch);
 	RUN_TEST(test_rekey_compressed_bp_atomic_or_refused);
 	RUN_TEST(test_rekey_count_root_relocation);
 	RUN_TEST(test_merge_rekey_same_trie_speculative_rejected);

@@ -1098,7 +1098,25 @@ enum urcu_txn_status ft_store_at_graft_point_commit(struct cds_ft *ft,
 		}
 		ft_node_get_nth_skip(st->dest, &slot, st->slot_byte, FT_PF_NONE);
 		assert(slot);
-		ft_set_parent(ft, st->attached, st->dest, slot);
+		/*
+		 * THE PAYLOAD'S BACK EDGE.  A plain store, because the payload is
+		 * invisible until the forward publish below -- the cross-trie graft
+		 * drained its source, the rekey fold hands over a fresh COW copy.
+		 *
+		 * @payload_live says it is NOT: a BARE EXTERNAL HEAD is app-owned,
+		 * cannot be copied, and stays reachable at the SOURCE for the whole
+		 * build window, so the store would be reader-visible ahead of the
+		 * publish and would survive an abort.  Defer it instead, and
+		 * ft_glue_apply_deferred one line down RECORDS it
+		 * (live = dst_origin || record_only, and the fold sets record_only)
+		 * through ft_reparent_record's external arm, so the head's parent
+		 * flips with the slot that adopts it.  ☞ @glue->payload_live.
+		 */
+		if (st->glue->payload_live)
+			ft_glue_defer_edge_origin(ft, st->glue, st->attached,
+				st->dest, slot, /*dst_origin=*/ false);
+		else
+			ft_set_parent(ft, st->attached, st->dest, slot);
 		ft_glue_apply_deferred(ft, st->glue);
 		if (st->old_recompacted_node) {
 			/*

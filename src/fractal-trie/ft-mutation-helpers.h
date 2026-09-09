@@ -11700,6 +11700,32 @@ struct ft_glue {
 	 */
 	bool record_only;
 	/*
+	 * THE GRAFTED PAYLOAD IS A LIVE, READER-REACHABLE NODE, not the fresh
+	 * invisible copy every other caller hands over.
+	 *
+	 * ft_store_at_graft_point's NOSPLIT arm (@d->depth == key_len) publishes
+	 * the payload ITSELF into the destination slot, and its commit wires the
+	 * payload's back edge with a PLAIN ft_set_parent.  That is sound on the
+	 * premise the payload is invisible until the forward publish -- true for
+	 * the cross-trie graft (source drained) and for the rekey fold's COW'd
+	 * S_top' (a fresh copy) -- and FALSE for the one payload that cannot be
+	 * copied: a BARE EXTERNAL HEAD, which is app-owned and stays reachable at
+	 * the source for the whole build window.  For it the store is
+	 * reader-visible ahead of the publish AND survives an abort, leaving the
+	 * head naming a parent it does not hang under.
+	 *
+	 * When set, that arm routes the payload's back edge through
+	 * ft_glue_defer_edge_origin instead, so ft_glue_apply_deferred records it
+	 * (ft_reparent_record's external arm ->
+	 * ft_flip_txn_record_head_back_edge) and it flips with the forward
+	 * publish.  ☠ IT MUST BE A FLAG AND NOT A `ft_glue_is_fresh` TEST: that
+	 * helper answers false for EVERY external ("externals are never
+	 * glue-tracked") AND for the COW'd S_top' (cow_stop takes no glue, so its
+	 * copy never reaches @built), so it cannot tell the two apart and would
+	 * silently convert the ordinary rekey's plain store into a recorded edge.
+	 */
+	bool payload_live;
+	/*
 	 * Inline floor backing.  ft_glue_init points the three arrays
 	 * here; graft / graft_swap never outgrow it.  ft_glue_reserve
 	 * repoints to a malloc'd buffer when a count would exceed its floor.
