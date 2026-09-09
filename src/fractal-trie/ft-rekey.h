@@ -2410,11 +2410,17 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		 * -- and a release-semantics run LOSES A KEY (rkfuzz seed 712,
 		 * `missing=1`).  So the premise still holds and this refusal is not the
 		 * stale kind.
-		 * ☞ WHAT WOULD SERVE IT: ft_merge_build must not hand back a LIVE node
-		 * for a compressed S_top -- either by COW-ing the moved top the way the
-		 * graft arm's ft_rekey_cow_stop does, or by making the shared-run
-		 * collapse exit build a fresh run.  Nothing else about the shape is
-		 * missing.
+		 * ☞ WHAT WOULD SERVE IT, located: the live node comes from
+		 * ft_merge_materialize_suffix's `suffix_len == 0` exit, which returns
+		 * `cn->child` -- the run's own child, live -- because there is no
+		 * suffix left to materialise.  That is RIGHT for a subtree (the src
+		 * children are re-parented live by construction) and wrong only when
+		 * this helper is what produces the merge's TOP.  So the cure is not in
+		 * that exit: it is a COW of the merged top when ft_merge_build hands
+		 * back a node ft_glue_is_fresh does not match -- the same thing
+		 * ft_rekey_cow_stop does for the graft arm's S_top, and the same
+		 * re-parent-plus-retire bookkeeping.  Nothing else about the shape is
+		 * missing; it is one fresh copy short.
 		 */
 		if (merge_dst && s_top_compressed)
 			return FT_REKEY_UNCOVERED;
