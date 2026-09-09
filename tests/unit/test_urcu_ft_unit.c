@@ -11956,17 +11956,18 @@ static int rekey_bare_head_graft(const char *dst, int ordered_list)
 
 	s = ft_rekey(ft, dst, "q");
 	/*
-	 * ATOMIC OR REFUSED, and today it is REFUSED -- see the gate.  What must
-	 * hold on EITHER answer is that the key is at exactly one of its two
-	 * names, the count is intact and the trie verifies; a refusal must leave
-	 * the structure byte-for-byte as it was.  Written this way, not pinned to
-	 * NOT_SUPPORTED, because the refusal is waiting on a fix ELSEWHERE
-	 * (ft_chain_compress_fused) and pinning it would go red the day that
-	 * lands -- which is exactly how rekey_skip_slot_bp_atomic_or_refused's
-	 * header says this test family gets it wrong.
+	 * ☑ SERVED NOW.  This was written atomic-or-refused while the gate stood
+	 * -- the refusal was waiting on ft_chain_compress_fused, not on this leg
+	 * -- and the fix landed one commit before the admission.  It keeps the
+	 * moved/not-moved form rather than hard-asserting OK, because the shape
+	 * IS still refused on builds where the leg cannot apply, and because the
+	 * property worth pinning is the one that holds either way: the key is at
+	 * exactly ONE of its two names.  What is asserted unconditionally is that
+	 * the answer is not an error, so a regression that re-refuses it shows up
+	 * as the OK below going missing rather than as a silent skip.
 	 */
 	moved = (s == CDS_FT_STATUS_OK);
-	if ((s != CDS_FT_STATUS_OK && s != CDS_FT_STATUS_NOT_SUPPORTED) ||
+	if (s != CDS_FT_STATUS_OK ||
 	    ft_test_has_key(ft, "q") == moved ||
 	    ft_test_has_key(ft, dst) != moved ||
 	    !ft_test_has_key(ft, "am") || !ft_test_has_key(ft, "an") ||

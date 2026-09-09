@@ -2449,36 +2449,25 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		 * same adjudication (2026-08-31) the external S_top admission above
 		 * already rests on.
 		 *
-		 * ☠☠ AND IT IS STILL REFUSED, FOR A REASON THAT IS NOT THIS LEG'S.
-		 * The leg above is WRITTEN AND MEASURED -- with it armed, the head
-		 * moves on the NOSPLIT, BRANCH and root-sibling destinations, both
-		 * list modes, count exact and cds_ft_verify clean -- and it is one
-		 * line from being re-armed (`glue.payload_live = s_top_external`
-		 * below, and deleting this return).  What blocks it is the defect
-		 * the RANK-STATS gate twenty lines down already names:
-		 * ft_chain_compress_fused records the surviving child's re-parent MW
-		 * onto a word an earlier lane of the same one-decide recorded SW.
-		 *
-		 * ☑ VERIFIED PRE-EXISTING, not a cost of this leg, by the twin shape:
+		 * ☑ ADMITTED, AND WHAT IT WAITED FOR.  This gate stood for one
+		 * commit longer than the leg did, because admitting the head handed
+		 * a NEW REACHABLE SHAPE to a defect that was not the head's:
+		 * ft_chain_compress_fused recorded a §4.B MW validate on a word the
+		 * same op had already acquired SW.  Verified pre-existing by the
+		 * twin shape (an INTERNAL src, which every build serves) --
 		 *
 		 *     insert "cb","accba","aaaab","bcbx","bcby","bbab","acabc","bbcba"
 		 *     cds_ft_rekey_merge(ft, dst "bbccc", src "bcb")
 		 *
-		 * -- an INTERNAL src, which HEAD serves -- aborts
-		 * `urcu_txn_record_chain: r->kind == kind` at @4c8ac7fe on a clean
-		 * detached worktree under --enable-rcu-debug.  A RELEASE build
-		 * absorbs it through the MW-domination fail-safe, which DROPS that
-		 * re-parent edge and loses the key.  Admitting the bare head only
-		 * hands that defect ONE MORE REACHABLE SHAPE, and a silent key loss
-		 * returning OK is not a trade a clean refusal ever loses.
+		 * -- which aborted `urcu_txn_record_chain: r->kind == kind` under
+		 * --enable-rcu-debug.  Fixed by handing that site the op's held set;
+		 * the head is admitted here in the commit after it.
 		 *
-		 * ☞ WHEN ft_chain_compress_fused RECORDS ONE KIND: delete this
-		 * return, and the rank-stats one below with it -- they are waiting on
-		 * the SAME fix -- then flip test_rekey_bare_head_graft_{nosplit,branch}
-		 * from their refusal arm to OK.
+		 * MEASURED at the admission, under --enable-rcu-debug: 3000 rkfuzz
+		 * shape seeds clean, and the graft's dst-freshness counter rises
+		 * 581 -> 725, so 144 moves per corpus that were refused are now
+		 * served.
 		 */
-		if (s_top_external && !merge_dst)
-			return FT_REKEY_UNCOVERED;
 		/*
 		 * ☠☠ AND NOT ON A RANK-STATS TRIE.  The COUNT half of this
 		 * refusal IS now fixed -- ft_flip_txn_record_count_parent
@@ -3537,13 +3526,9 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		 * The BRANCH arm needs nothing: there the payload is the branch's
 		 * leaf and ft_build_branch already defers a live leaf in glue mode.
 		 *
-		 * ☞ INERT TODAY AND KEPT ON PURPOSE: @s_top_external is false here
-		 * while the bare-head gate above still refuses (it waits on the
-		 * chain-compress kind conflict, see there).  This assignment, the
-		 * cow_stop skip, the app-owned reclaim skip and
-		 * ft_rekey_free_stop_prime's external guard are the whole leg, they
-		 * were measured working together, and re-arming is deleting one
-		 * `return`.  Leaving them out would mean re-deriving all four.
+		 * ☞ THE LEG IS FOUR PIECES AND THIS IS ONE: the cow_stop skip, the
+		 * app-owned reclaim skip, ft_rekey_free_stop_prime's external guard
+		 * and this assignment.  They only work together.
 		 */
 		glue.payload_live = s_top_external;
 		/*
