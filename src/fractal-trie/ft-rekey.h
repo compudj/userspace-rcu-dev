@@ -2469,39 +2469,44 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		 * served.
 		 */
 		/*
-		 * ☠☠ AND NOT ON A RANK-STATS TRIE.  The COUNT half of this
-		 * refusal IS now fixed -- ft_flip_txn_record_count_parent
-		 * follows the survivor of a same-commit relocation, so the
-		 * union's +count no longer lands on the copy the src detach
-		 * retires -- but the count was never the only thing this
-		 * refusal was holding back, and lifting it on that evidence
-		 * alone loses a KEY.
-		 *
-		 * ONE KEY-BYTE DEEPER, the src detach empties a junction whose
-		 * SURVIVOR SIDE IS A MULTI-LEVEL CHAIN, so the collapse absorbs
-		 * several nodes into one run.  ft_chain_compress_fused then
+		 * ☠☠ AND NOT ON A RANK-STATS TRIE -- BUT NO LONGER FOR THE
+		 * REASON THIS COMMENT USED TO GIVE.  It said the gate was
+		 * holding back a KEY LOSS: the src detach empties a junction
+		 * whose survivor side is a multi-level chain, the collapse
 		 * records the surviving child's re-parent MW onto a word an
-		 * earlier lane of the same one-decide already recorded SW; a
-		 * debug build aborts on the engine's kind check, and a RELEASE
-		 * build absorbs it through the documented MW-domination
-		 * fail-safe -- which DROPS that re-parent edge.
+		 * earlier lane recorded SW, and a release build's MW-domination
+		 * fail-safe drops that edge and ORPHANS the moved node.  That
+		 * collision is FIXED (ft_record_child_back_edge now takes the
+		 * op's held set), and the key-loss face is GONE.
 		 *
-		 * MEASURED, both list modes, default features, single-threaded:
-		 * insert {"xq","xabzm","xabzn"} then rekey "xabz" <- "xq"
-		 * returns OK, cds_ft_count_keys answers 3, cds_ft_verify is RED,
-		 * and the moved key is reachable at NEITHER "xabz" NOR "xq" --
-		 * the application's node is ORPHANED.  At the commit before this
-		 * one the same call answered NOT_SUPPORTED and left the trie
-		 * byte-for-byte intact.  Clean on -DNO_FEATURE_FT_COMPRESS and
-		 * -DNO_FEATURE_FT_SKIP_COMPRESSED: it is the skip/collapse lane.
+		 * ☑ RE-MEASURED WITH THE GATE ABLATED, 3000 generated rekey
+		 * shapes x both list modes, rank stats ON, --enable-rcu-debug:
+		 * ZERO key losses, ZERO engine asserts.  The shape this comment
+		 * named ({"xq","xabzm","xabzn"}, rekey "xabz" <- "xq") is served
+		 * correctly.
 		 *
-		 * ★ THE KIND CONFLICT IS OLDER THAN THIS ADMISSION -- an
-		 * INTERNAL src reaches it too, and aborts a debug build as far
-		 * back as @77a635ff -- so the fix owed is in the collapse, not
-		 * here.  What is THIS gate's business is that admitting the bare
-		 * head hands that defect a NEW REACHABLE SHAPE, and a silent key
-		 * loss returning OK is not a trade a clean refusal ever loses.
-		 * ☞ WHEN ft_chain_compress_fused RECORDS ONE KIND: drop this,
+		 * ☠ THE GATE IS STILL LOAD-BEARING, FOR A DIFFERENT DEFECT.
+		 * Ablating it turns 178 failing seeds into 222 -- 44 NEW ones,
+		 * none fixed -- and every one of the 44 is the SAME face as the
+		 * 178 that fail WITH the gate in place: OK returned, every key
+		 * at the right name, cds_ft_count_keys exact, and cds_ft_verify
+		 * RED with `nr_keys mismatch: stored N, computed N`.  A
+		 * rank-stats trie is the only observer of that class, and the
+		 * class is NOT this gate's shape: it already fires on 178/3000
+		 * ORDINARY internal-src rekeys, which this gate does not touch.
+		 * Rank OFF over the same corpus: 0/3000.
+		 * ☞ [[project_ft_count_walk_base_and_iter_fabrication]] names
+		 * the mechanism (the union's +count walk BASE).
+		 *
+		 * ⇒ SO THE THING TO FIX IS THE COUNT ACCOUNTING, NOT THIS GATE,
+		 * and dropping the gate first would add 44 instances of a defect
+		 * that is already the rank lane's dominant failure.  A refusal
+		 * whose stated reason has expired is still a refusal that holds
+		 * something back; what changed is WHAT, and this comment now
+		 * says which.
+		 *
+		 * ☞ WHEN THE nr_keys ACCOUNTING IS RIGHT: re-run the ablation
+		 * above (it must go 178 -> 0, not 222 -> 44), then drop this,
 		 * flip test_rekey_bare_head_rankstats_refused's rank arm to
 		 * expect OK + count 5, and delete the DEBUG_RCU #if that hides
 		 * test_rekey_count_root_relocation's mid-chain arms.
