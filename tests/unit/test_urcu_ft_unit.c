@@ -69,13 +69,13 @@
 #endif
 
 /*
- * 310 unconditional + 51 fault-injection-only RUN_TEST registrations, on top of
+ * 311 unconditional + 51 fault-injection-only RUN_TEST registrations, on top of
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (369 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (370 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (318 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (319 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -11811,6 +11811,128 @@ next:
 	ret = 0;
 out:
 	return ret;
+}
+
+/*
+ * A src junction whose parent BP is a COMPRESSED RUN, moved to an empty dst.
+ *
+ * ☠☠☠ THIS RETURNED OK AND CORRUPTED THE TRIE at @4c8ac7fe, single-threaded,
+ * with --enable-rcu-debug armed and SILENT:
+ *
+ *     insert "bcbab", "bcacbx", "bcacby", "bb"
+ *     cds_ft_rekey_merge(ft, dst "bab", src "bcacb")   -> STATUS_OK
+ *     babx=1 baby=1 bcacbx=1 bcacby=1   <-- the moved keys at BOTH names
+ *
+ * cds_ft_verify said "external chain node reached twice"; the same commit
+ * RETIRED nodes the live trie still reached through, so after the grace period
+ * and 4000 unrelated inserts the UNTOUCHED key "bcbab" -- never named by the
+ * call -- was GONE.
+ *
+ * THE CAUSE was one word in ft_rekey_climb_reaches_graft: its walk stopped at
+ * a compressed ancestor, calling that "the conservative answer".  A run has
+ * exactly one child by construction, so it is the one ancestor the drop is
+ * GUARANTEED to empty and the climb ALWAYS passes through -- the walk reported
+ * "no climb" for a climb that always happens, and every staleness term below
+ * it is gated on that count.  The detach then really did climb, and
+ * republished into the graft's SUPERSEDED attach-node body.
+ *
+ * ☞ Pinned as ATOMIC-OR-REFUSED rather than as the refusal, because serving
+ * this shape is a legitimate future increment; what may never come back is OK
+ * plus a key at two names.  The third assertion is the load-bearing one: a
+ * key the CALL NEVER NAMED must still be there afterwards.
+ */
+static int rekey_compressed_bp_atomic_or_refused(int ordered_list)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	enum cds_ft_status s;
+	int ret = -1, moved, i;
+
+	if (!cds_ft_merge_enabled()) {
+		diag("rekey_compressed_bp_atomic_or_refused: skipped, merge "
+			"compiled out (-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
+	if (cds_ft_group_attr_create(&attr) < 0)
+		return -1;
+	if (cds_ft_group_attr_set_ordered_list(attr, ordered_list) < 0 ||
+	    cds_ft_group_create(attr, &group) < 0) {
+		cds_ft_group_attr_destroy(attr);
+		return -1;
+	}
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &ft) < 0) {
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	rcu_read_lock();
+	/* "bcacb" is reached through the compressed run "cb" -- that is BP. */
+	cds_ft_insert(ft, (const uint8_t *) "bcbab", 5, &node_alloc(1)->node);
+	cds_ft_insert(ft, (const uint8_t *) "bcacbx", 6, &node_alloc(2)->node);
+	cds_ft_insert(ft, (const uint8_t *) "bcacby", 6, &node_alloc(3)->node);
+	cds_ft_insert(ft, (const uint8_t *) "bb", 2, &node_alloc(4)->node);
+
+	s = ft_rekey(ft, "bab", "bcacb");
+	moved = (s == CDS_FT_STATUS_OK);
+	if ((s != CDS_FT_STATUS_OK && s != CDS_FT_STATUS_NOT_SUPPORTED) ||
+	    /* at exactly ONE of the two names, never both */
+	    ft_test_has_key(ft, "babx") != moved ||
+	    ft_test_has_key(ft, "baby") != moved ||
+	    ft_test_has_key(ft, "bcacbx") == moved ||
+	    ft_test_has_key(ft, "bcacby") == moved ||
+	    /* ...and the bystanders are untouched */
+	    !ft_test_has_key(ft, "bcbab") || !ft_test_has_key(ft, "bb") ||
+	    cds_ft_count_keys(ft) != 4 ||
+	    cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr,
+			"compressed_bp(list=%d): %s babx=%d bcacbx=%d bcbab=%d count %lu\n",
+			ordered_list, cds_ft_status_to_string(s),
+			ft_test_has_key(ft, "babx"),
+			ft_test_has_key(ft, "bcacbx"),
+			ft_test_has_key(ft, "bcbab"),
+			cds_ft_count_keys(ft));
+		goto out;
+	}
+	/*
+	 * THE RETIRE HALF, which the status and the key set both miss: the old
+	 * defect handed live-reachable nodes to call_rcu, and only reusing that
+	 * memory showed it.  Cross a grace period, churn the arena, then ask for
+	 * a key the move never named.
+	 */
+	rcu_read_unlock();
+	rcu_quiescent_state();
+	rcu_barrier();
+	rcu_read_lock();
+	for (i = 0; i < 2000; i++) {
+		char kb[8];
+
+		snprintf(kb, sizeof(kb), "z%04d", i);
+		cds_ft_insert(ft, (const uint8_t *) kb, strlen(kb),
+			&node_alloc(100 + i)->node);
+	}
+	if (!ft_test_has_key(ft, "bcbab") || !ft_test_has_key(ft, "bb")) {
+		fprintf(stderr,
+			"compressed_bp(list=%d): a key the move never named was LOST "
+			"after the grace period (bcbab=%d bb=%d)\n", ordered_list,
+			ft_test_has_key(ft, "bcbab"), ft_test_has_key(ft, "bb"));
+		goto out;
+	}
+	ret = 0;
+out:
+	rcu_read_unlock();
+	drain_trie(ft);
+	rcu_barrier();
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+static int test_rekey_compressed_bp_atomic_or_refused(void)
+{
+	return rekey_compressed_bp_atomic_or_refused(0) ||
+		rekey_compressed_bp_atomic_or_refused(1);
 }
 
 /*
@@ -35572,6 +35694,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_merge_rerooted_nosplit_ordered_branch);
 	RUN_TEST(test_merge_rekey_same_trie);
 	RUN_TEST(test_rekey_bare_head_rankstats_refused);
+	RUN_TEST(test_rekey_compressed_bp_atomic_or_refused);
 	RUN_TEST(test_rekey_count_root_relocation);
 	RUN_TEST(test_merge_rekey_same_trie_speculative_rejected);
 	RUN_TEST(test_rekey_graft_vs_merge);

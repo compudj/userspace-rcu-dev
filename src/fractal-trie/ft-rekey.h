@@ -979,8 +979,64 @@ int ft_rekey_run_vs_region(struct cds_ft *ft,
  * Returns the number of levels the climb would rise, and sets @reached when the
  * walk arrives at @graft_c or runs out of trie (the root).  Pure plan-time
  * arithmetic over the ancestors' arities; the caller holds the locks that keep
- * them still.  A compressed ancestor stops the walk (this cut never elevates
- * through one), which is the conservative answer.
+ * them still.
+ *
+ * ☠ A COMPRESSED ANCESTOR IS THE ONE THE CLIMB ALWAYS PASSES THROUGH, and this
+ * walk used to STOP at it, calling that "the conservative answer".  It is the
+ * opposite of conservative, and the file already said so twenty lines from
+ * here: "a run is a node like any other to the detach -- it just has exactly
+ * one child, so dropping S_top empties it and the detach's upward walk
+ * ELEVATES past it".  A run has exactly one child BY CONSTRUCTION and can
+ * never carry external_nodes, so it is the only ancestor kind that is
+ * GUARANTEED to be emptied by the drop.  Stopping there reported steps == 0 --
+ * "no climb" -- for a climb that always happens, and every staleness term
+ * below is gated on that count.
+ *
+ * ☠☠ WHAT THAT COST, measured at @4c8ac7fe on a clean detached worktree
+ * (single-threaded, --enable-rcu-debug armed and SILENT throughout):
+ *
+ *     insert "bcbab", "bcacbx", "bcacby", "bb"
+ *     cds_ft_rekey_merge(ft, dst "bab", src "bcacb")   -> STATUS_OK
+ *
+ * returns SUCCESS with the moved keys reachable at BOTH names (babx, baby,
+ * bcacbx, bcacby all found), because the real detach climbs the run and then
+ * republishes into the graft's SUPERSEDED attach-node body -- the src junction
+ * keeps its old slot while the subtree is also installed under the relocated
+ * copy.  cds_ft_verify says "external chain node reached twice"; the same
+ * commit RETIRES nodes the live trie still reaches through, so once the arena
+ * hands them out again an UNTOUCHED key is silently gone (measured: "bcbab",
+ * never named by the call, absent after 4000 unrelated inserts).
+ *
+ * Clean under -DNO_FEATURE_FT_COMPRESS, red under
+ * -DNO_FEATURE_FT_SKIP_COMPRESSED: the path-compression lane, not the
+ * encoding.
+ *
+ * @compressed_link reports that the walk crossed a run, because two things
+ * stop being true when it does: the fold's orphan freeze is PLAIN INTERIORS
+ * ONLY (ft_rekey_fold_freeze_orphans), and @steps stops equalling the BYTE
+ * depth the climb rises -- a run of length L spans L depths in one step, which
+ * the fold's `climb_steps <= d_src.pdepth` arithmetic assumes it does not.
+ * The callers disarm the fold on it; the staleness terms, which only ask
+ * WHETHER the climb arrives, use the honest count.
+ *
+ * ☞ @walk_runs, AND WHY IT IS THE NOSPLIT ARM ONLY.  The staleness this whole
+ * walk predicts is "the detach republishes into a body the graft SUPERSEDED",
+ * and a body is superseded exactly when the graft RELOCATED it -- which is the
+ * NOSPLIT arm's reserve recompaction (ft_node_set_nth_rec ->
+ * ft_node_recompact).  The GLUE arm does not relocate the attach node; it
+ * builds a fresh cluster, and the gate below already carries its own term for
+ * that shape (`d_src.pnf == graft_c && prep != NOSPLIT`).
+ *
+ * ☠ MEASURED, and it is why this is a switch rather than always-on: walking
+ * runs unconditionally REFUSED test_rekey_promote_into_split_cn's first arm
+ * (`rekey we<-wabb` on {wa,wabbb,wabby,q}), a GLUE-prep shape that is SERVED
+ * CORRECTLY -- verify clean, keys right.  Its climb vector is IDENTICAL to the
+ * corrupting one in every field the gate reads (bp compressed, steps 1,
+ * reached 0, rest_under 1, no fold armed) and differs ONLY in @prep.  That is
+ * the discriminator, and it is the mechanism's own.
+ * ☐ NOT ESTABLISHED: that a run-crossing climb is safe under GLUE in general.
+ * One shape is served correctly; nothing here proves the rest are.  If a GLUE
+ * corruption of this family ever turns up, this switch is where it lives.
  */
 static
 int ft_rekey_climb_reaches_graft(struct cds_ft *ft,
@@ -988,7 +1044,9 @@ int ft_rekey_climb_reaches_graft(struct cds_ft *ft,
 		struct cds_ft_inode_flag *graft_c,
 		bool *reached,
 		struct cds_ft_inode_flag **rest_out,
-		struct cds_ft_inode_flag **top_out)
+		struct cds_ft_inode_flag **top_out,
+		bool *compressed_link,
+		bool walk_runs)
 {
 	struct cds_ft_inode_flag *n = bp;
 	int steps = 0;
@@ -998,12 +1056,37 @@ int ft_rekey_climb_reaches_graft(struct cds_ft *ft,
 		*rest_out = bp;
 	if (top_out)
 		*top_out = NULL;
-	while (n && ft_node_internal(n) && steps < FT_MAX_KEY_LEN + 1) {
-		struct cds_ft_metadata *m = ft_flag_to_metadata(ft, n);
+	if (compressed_link)
+		*compressed_link = false;
+	while (n && steps < FT_MAX_KEY_LEN + 1) {
+		struct cds_ft_metadata *m;
+		bool run;
 
-		/* Survives the drop -- it keeps a child or a co-located key. */
-		if (ft_meta_nr_child(m) != 1 || m->external_nodes)
+		/*
+		 * SKIP FIRST: a skip word's low tag bits are 0, so the external
+		 * and internal predicates both read it wrong.  A parent_word
+		 * names the node itself and is never skip-encoded, so this is a
+		 * belt-and-braces stop rather than a modelled case -- and it is
+		 * the pre-existing behaviour for anything that is not a plain
+		 * interior.
+		 */
+		if (ft_node_skip_compressed(n))
+			break;
+		run = ft_node_compressed(n);
+		if (run && !walk_runs)
 			break;			/* @n is where the climb RESTS */
+		if (!run && !ft_node_internal(n))
+			break;			/* @n is where the climb RESTS */
+		m = ft_flag_to_metadata(ft, n);
+		/*
+		 * Survives the drop -- it keeps a child or a co-located key.
+		 * A RUN never does: exactly one child by construction, and a
+		 * compressed node cannot carry external_nodes at all.
+		 */
+		if (!run && (ft_meta_nr_child(m) != 1 || m->external_nodes))
+			break;			/* @n is where the climb RESTS */
+		if (run && compressed_link)
+			*compressed_link = true;
 		/*
 		 * @n is CLEARED by the drop.  The LAST one so cleared is the
 		 * node whose slot in the node above must go, which is what the
@@ -1013,8 +1096,12 @@ int ft_rekey_climb_reaches_graft(struct cds_ft *ft,
 		 */
 		if (top_out)
 			*top_out = n;
-		n = ft_parent_node(rcu_dereference(cds_ft_item_to_metadata(
-			ft_node_ptr(n))->parent_word));
+		/*
+		 * @m, not a re-derivation: it is the same metadata, and it is
+		 * the only form that is right for BOTH kinds now that a run can
+		 * be @n.
+		 */
+		n = ft_parent_node(rcu_dereference(m->parent_word));
 		steps++;
 		if (rest_out)
 			*rest_out = n;
@@ -1742,6 +1829,14 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	struct cds_ft_inode_flag *climb_rest = NULL;
 	/* the climb rests on a child of @graft_c: the republish lands in its OLD body */
 	bool climb_rest_under_graft = false;
+	/*
+	 * The climb crossed a compressed run.  It does NOT change whether the
+	 * climb arrives at @graft_c -- the staleness terms below use the honest
+	 * count either way -- but it DISARMS the fold, whose orphan freeze is
+	 * plain-interiors-only and whose depth arithmetic assumes one step is one
+	 * byte.  ☞ ft_rekey_climb_reaches_graft.
+	 */
+	bool climb_compressed = false;
 	int climb_steps;
 	/*
 	 * ...and the SAME climb, ARMED instead of refused: the drop rides the
@@ -3555,7 +3650,9 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 */
 	climb_steps = del_folds_into_graft ? 0 :
 		ft_rekey_climb_reaches_graft(ft, d_src.pnf, graft_c,
-			&climb_reaches_graft, &climb_rest, &climb_top);
+			&climb_reaches_graft, &climb_rest, &climb_top,
+			&climb_compressed,
+			/*walk_runs=*/ prep == FT_GRAFT_PREP_NOSPLIT);
 	/*
 	 * ARM THE FOLD FROM THE CLIMB, not from a fixed depth.
 	 *
@@ -3607,7 +3704,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 */
 	if (!del_folds_into_graft && climb_top && graft_c &&
 			climb_reaches_graft && climb_rest == graft_c &&
-			climb_steps >= 1 &&
+			climb_steps >= 1 && !climb_compressed &&
 			ft_rekey_fold_shape_ok(ft, graft_c, climb_top, prep,
 				merge_dst, src_cut) &&
 			(unsigned int) climb_steps <= d_src.pdepth) {
@@ -3648,7 +3745,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 * far it got.
 	 */
 	if (!del_folds_into_graft && !bp_folds_into_graft_c && graft_c &&
-			climb_rest && !climb_reaches_graft &&
+			climb_rest && !climb_reaches_graft && !climb_compressed &&
 			ft_rekey_fold_shape_ok(ft, graft_c, climb_rest, prep,
 				merge_dst, src_cut) &&
 			(unsigned int) climb_steps < d_src.pdepth) {
