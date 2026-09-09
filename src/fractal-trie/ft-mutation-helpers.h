@@ -2169,7 +2169,7 @@ bool ft_flip_txn_reserve(struct ft_flip_txn *t, unsigned int cap)
 }
 
 /*
- * Widen @t's reservation by @extra records beyond its current capacity.  A
+ * Widen @t's reservation by @extra records beyond what it already owes.  A
  * single-commit op (the insert recompact reparent sweep) that discovers extra
  * edges mid-build grows its txn here.  Unlike a two-commit graft/merge SECOND
  * commit -- which must pre-reserve so its post-detach publish cannot fail -- a
@@ -2179,11 +2179,30 @@ bool ft_flip_txn_reserve(struct ft_flip_txn *t, unsigned int cap)
  * the grown descriptor; proxies form from the final address only at install).
  * Returns false on OOM (nothing new recorded -> caller aborts).
  */
+/*
+ * ☠ THE BASE IS WHAT THE TXN OWES, NEVER THE DESCRIPTOR'S @cap.  @cap is the
+ * ALLOCATED size, not the promise: urcu_txn_grow DOUBLES it and
+ * urcu_txn_alloc_cap rounds that up to a slab, so widening from @cap re-inflates
+ * the reservation by the whole slack on every call.  Three widens per attempt
+ * then multiply it ~8x per attempt, and since the engine resets the promise
+ * (@min_alloc = m->nr) only AT COMMIT, an op whose attempts keep failing
+ * ratchets EXPONENTIALLY: a two-key rekey_merge under exponential lock spacing
+ * reached cap == 2.8 BILLION records, every later attempt spending its whole
+ * time zeroing gigabytes.  That reads as a hang, and it also HIDES the real
+ * non-convergence underneath -- attempt N costs 2^N, so a retry cap counted in
+ * attempts is never reached and the livelock detector stays silent.
+ *
+ * @min_alloc is the outstanding reservation (it still covers records promised
+ * but not yet recorded); @nr is what is already recorded.  The floor is the
+ * larger of the two, since a caller may widen either before or after spending
+ * what it first asked for.
+ */
 static inline
 bool ft_flip_txn_reserve_extra(struct ft_flip_txn *t, unsigned int extra)
 {
-	unsigned int cur = (t->mtxn->desc && t->mtxn->desc != URCU_TXN_ENOMEM) ?
-			t->mtxn->desc->cap : 0;
+	unsigned int nr = (t->mtxn->desc && t->mtxn->desc != URCU_TXN_ENOMEM) ?
+			t->mtxn->desc->nr : 0;
+	unsigned int cur = t->mtxn->min_alloc > nr ? t->mtxn->min_alloc : nr;
 
 	return ft_flip_txn_reserve(t, cur + extra);
 }
@@ -3875,6 +3894,84 @@ bool ft_lock_ctx_depth_of_cursor_child(const struct cds_ft *ft,
 		return false;
 	*depth = d->depth + ft_node_span(ft, d->nf);
 	return true;
+}
+
+/*
+ * Date @nf -- an INTERNAL or COMPRESSED node the op reached below the descent's
+ * cursor and more than one hop down -- by climbing its LIVE parent chain to the
+ * first ancestor the descent DOES date, summing the node-local spans on the way
+ * back down.  FALSE means no dated ancestor was found within the trie's depth
+ * bound, and the caller must re-plan.
+ *
+ * WHY THIS EXISTS.  ft_lock_ctx_depth_of_cursor_child is exact for ONE hop and
+ * refuses beyond it, on the argument that the cursor spans the whole gap so the
+ * child's own start is the only boundary inside it.  That argument describes the
+ * one-hop case; it is not a reason the two-hop case is underivable.  An occupied
+ * -destination rekey_merge re-parents children of the MERGE POINT, which sits
+ * inside the destination subtree -- below where a descent to the destination KEY
+ * stops.  Measured: `insert "bbaca","abba"; rekey_merge(dst "b", src "a")` under
+ * exponential spacing re-parents a child exactly two hops under the dst cursor,
+ * the one-hop rule refuses it, and the refusal is reported as -EAGAIN -- so the
+ * op re-descends, builds the identical plan, and refuses again, FOREVER.  It is
+ * a self-refusal: single-threaded, with no peer that a retry could outlast.
+ *
+ * WHY IT IS NOT THE UP-WALK §5.3 FORBIDS.  That one walks up to FIND the anchor,
+ * making the anchor a RELATIVE offset (C's H-th ancestor and P's H-th ancestor
+ * are different nodes, so the collapse breaks).  This walk finds an absolute
+ * BYTE DEPTH and then anchors from the schedule exactly as every other member
+ * does, so two ops that reach @nf still agree (§1).  It is the same licence
+ * ft_lock_ctx_depth_of_parent already carries -- "a node's span is a property of
+ * the node itself" -- applied transitively instead of for a single hop, and it
+ * terminates at a node the descent DATED rather than starting undated.
+ */
+static inline
+bool ft_lock_ctx_depth_of_climb(const struct cds_ft *ft,
+		const struct ft_lock_ctx *ctx,
+		struct cds_ft_inode_flag *nf, unsigned int *depth)
+{
+	const struct ft_descent *d = ft_lock_ctx_descent(ctx);
+	unsigned int acc = 0, hops;
+
+	if (ft->lock_spacing == CDS_FT_LOCK_SPACING_PER_NODE) {
+		*depth = 0;
+		return true;
+	}
+	if (ft->lock_spacing == CDS_FT_LOCK_SPACING_ROOT_ONLY) {
+		*depth = 1;		/* as ft_lock_ctx_depth_of_at: never read */
+		return true;
+	}
+	for (hops = 0; hops <= FT_MAX_DEPTH; hops++) {
+		struct cds_ft_inode_flag *parent = NULL;
+		struct cds_ft_metadata *meta;
+		unsigned int dd;
+
+		if (!nf || ft_node_flip_proxy(nf) || ft_node_external(nf))
+			return false;
+		if (ft_descent_depth_of(d, nf, &dd)) {
+			*depth = dd + acc;
+			return true;
+		}
+		meta = ft_node_compressed(nf) ?
+			cds_ft_item_to_metadata((struct cds_ft_inode *)
+				ft_compressed_node_ptr(nf)) :
+			cds_ft_item_to_metadata(ft_node_ptr(
+				ft_resolve_skip_compressed(ft, nf)));
+		if (!meta)
+			return false;
+		(void) ft_resolve_parent_slot(meta, ft, &parent);
+		/*
+		 * No parent: @nf is the ROOT, which sits at depth 0 under every
+		 * spacing (§2) -- the same answer ft_lock_ctx_depth_of_cursor_child
+		 * gives a parentless member.
+		 */
+		if (!parent) {
+			*depth = acc;
+			return true;
+		}
+		acc += ft_node_span(ft, parent);
+		nf = parent;
+	}
+	return false;
 }
 
 /*
@@ -11470,6 +11567,48 @@ struct ft_glue {
 	/* OUT: the build took that path, so the caller owes NO detach. */
 	bool old_dir_dropped;
 	/*
+	 * REPLACE THE OLD DIRECTION (@old_dir_replace): the sibling of the drop
+	 * above, for the case where the run's one child is a node this decide
+	 * moves only PART of.
+	 *
+	 * @drop_old_dir_of answers "the run's whole child is going, build no old
+	 * half at all".  When the child instead KEEPS siblings -- the src junction
+	 * BP is the run's child and the move takes one of BP's arms -- the old
+	 * half must still exist, holding BP MINUS that arm.  The detach is what
+	 * used to produce that, and it produced it in the WRONG BODY: a split
+	 * retires the run, so the detach's republish landed in a node this same
+	 * flip supersedes, the live trie kept the stale child, and the node it
+	 * still reached through was retired by the same commit.  That is the
+	 * shape ft_rekey_graft_simple_attempt refused as `d_src.ppnf == graft_c`.
+	 *
+	 * ☠ THE RECOMPACTION RUNS INSIDE THE SPLIT, NOT BEFORE IT.  Only the
+	 * split knows whether it will actually split @cn, and building BP' up
+	 * front would leave a speculative retire record in the txn on every shape
+	 * that turns out not to split.  So the caller hands the split the
+	 * INTENT -- which child, which slot of it to drop, its expected old and
+	 * its byte depth -- and the split calls ft_node_replace_ptr itself, at the
+	 * one point where the answer is known and the fresh node can be wired
+	 * before the SKIP_X dual is encoded from it.
+	 *
+	 * The counts need no special case: @old_child_nr_keys is read from the
+	 * SUBSTITUTED child, so the branch's `old_child_nr_keys + src_count` is
+	 * BP's original total and the cluster's net delta is zero, exactly as it
+	 * is for the drop.
+	 */
+	struct {
+		struct cds_ft_inode_flag *of;		/* the live child: BP */
+		struct cds_ft_inode_flag **drop_slot;	/* BP's slot to clear */
+		struct cds_ft_inode_flag *drop_expected;/* its raw expected old */
+		struct cds_ft_inode_flag *drop_child;	/* the moved arm, for the
+							 * ordinal lookup */
+		unsigned int depth;			/* BP's byte depth */
+		/* OUT */
+		struct cds_ft_inode *old_body;		/* BP's retired body */
+		struct cds_ft_inode_flag *fresh;	/* BP' */
+		bool done;				/* the split took it */
+		bool collapsed;				/* ...as ONE fused run */
+	} old_dir_replace;
+	/*
 	 * ☠ WHAT THIS BUILD REPLACED, so a LATER step of the same op can see it.
 	 *
 	 * A split RETIRES @cn and re-homes @cn's one live child under the fresh
@@ -11653,6 +11792,7 @@ void ft_glue_init(struct ft_glue *g)
 	g->fence_split_cn = false;
 	g->drop_old_dir_of = NULL;
 	g->old_dir_dropped = false;
+	memset(&g->old_dir_replace, 0, sizeof(g->old_dir_replace));
 	g->split_cn = NULL;
 	g->old_dir_deferred = -1;
 	g->old_dir_via_suffix = false;
@@ -13196,48 +13336,6 @@ int ft_glue_deferred_index(const struct ft_glue *g,
 	return -1;
 }
 
-/*
- * ☠ THE EXCLUSIVE SKIP'S ONE OBLIGATION.
- *
- * Not taking the mark also means not DETECTING one: @held_lock stays false for
- * every deferred entry, so a live re-parent records the §4.B MW guard, whose
- * expected-old is the child's CLEAN live_state.  That is the right record iff
- * the word really is clean -- and it is not if this op ALREADY holds the
- * child's own word through one of its other lock sets.  The guard would then
- * validate against a fence we planted ourselves and mismatch on every attempt:
- * the deterministic self-abort ft_reparent_record_meta documents.
- *
- * No exclusive shape reaches here holding a re-parented child's word, so this
- * STATES that instead of paying for a detection walk to discover it.  A claim
- * with no behaviour attached is what makes it an assert and not a branch
- * (FT_OWNER_ASSERT_OWNED is the same shape), and it is armed exactly where a
- * violation would otherwise be absorbed by a retry loop.
- *
- * Both sets are asked because a word can be held from either: the glue's own
- * lock sets (and its peer's, cross-trie) and the flip-txn registry.
- */
-static
-void ft_glue_assert_reparent_unheld(struct cds_ft *ft, struct ft_glue *g)
-{
-#if defined(DEBUG_RCU) || defined(CONFIG_RCU_DEBUG)
-	int i;
-
-	for (i = 0; i < g->nr_deferred; i++) {
-		struct cds_ft_metadata *cm;
-
-		if (!g->deferred[i].live)
-			continue;
-		cm = ft_glue_reparent_park_meta(ft, g->deferred[i].child);
-		if (!cm)
-			continue;
-		urcu_assert_debug(!ft_glue_op_holds(g, cm));
-		urcu_assert_debug(!ft_flip_txn_owns(g->txn, cm));
-	}
-#else
-	(void) ft;
-	(void) g;
-#endif
-}
 
 /*
  * Acquire the lock acquire on every LIVE child this commit will re-parent.
@@ -13283,10 +13381,37 @@ void ft_glue_assert_reparent_unheld(struct cds_ft *ft, struct ft_glue *g)
 static
 int ft_glue_acquire_reparent_marks(struct cds_ft *ft, struct ft_glue *g)
 {
+	/*
+	 * ☠ TAKING A MARK AND DETECTING ONE ARE TWO JOBS, AND ONE PREDICATE USED
+	 * TO TURN OFF BOTH.  The header above argues only that the mark has no
+	 * peer to arbitrate against on a COARSE or EXCLUSIVE trie -- true, and it
+	 * licenses skipping the ACQUIRE.  It says nothing about @held_lock, which
+	 * is not about arbitration at all: it reports whether THIS OP ALREADY
+	 * HOLDS the child's own word, and it is what picks the re-parent's record
+	 * KIND downstream (ft_reparent_record_meta, ft_flip_txn_record_parent_word).
+	 *
+	 * Returning 0 early left that flag false on a word the op DOES hold, and
+	 * ft_dlm_acquire_set_at carries no mode gate -- so on the cut-run shape
+	 * ft_rekey_cow_stop really does take the displaced child's FT_STATE_LOCK
+	 * under COARSE too, registers it in the txn, and records the child's state
+	 * and parent_word SW.  The glue then re-recorded the SAME two slots MW.
+	 * Two kinds on one slot: urcu_txn_record_chain asserts on a debug build
+	 * and promotes SW->MW fail-safe on a release one, after which the op
+	 * re-attempts the identical store sequence forever.  Measured as
+	 * `expected_old=0x4 seen=0x80004` -- the op losing against its OWN lock
+	 * bit -- and it was refused by a gate in ft_rekey_graft_simple_attempt
+	 * rather than fixed here.
+	 *
+	 * So: DETECT on every mode, TAKE only where a peer exists.  Detection
+	 * needs no anchor and no byte-depth -- dating exists to decide WHICH word
+	 * to lock, and we are locking nothing -- so the detect-only pass is
+	 * INFALLIBLE.  That matters: the non-@record_only callers reach this
+	 * function past their source unlink, where an abort is no longer
+	 * available, and a detection that could refuse would hand them one.
+	 */
+	bool detect_only = !ft->lock_fine || ft->exclusive;
 	int i, j;
 
-	if (!ft->lock_fine || ft->exclusive)
-		return 0;
 	if (!g->txn || !g->txn->structural_sw)
 		return 0;
 	for (i = 0; i < g->nr_deferred; i++) {
@@ -13315,6 +13440,25 @@ int ft_glue_acquire_reparent_marks(struct cds_ft *ft, struct ft_glue *g)
 			continue;
 		if (!cm)
 			continue;
+		if (detect_only) {
+			/*
+			 * @lock_word stays NULL and @marked false: this pass took
+			 * nothing, so it owes no release and
+			 * ft_glue_release_reparent_marks skips the entry on every
+			 * path.  ft_lock_ctx_holds reads the WHOLE held set the
+			 * exclusion logic already trusts for dedupe -- txn
+			 * registry, extras, the glue's own marks, outer frames --
+			 * which is where ft_rekey_marks_to_txn put cow_stop's
+			 * fence.  It asks about the CHILD'S OWN word, never an
+			 * anchor: an ancestor's lock does not make the child's
+			 * park safe, and coarsening is exactly what splits the two.
+			 */
+			ft_glue_lock_ctx_origin(g, &gctx,
+				g->deferred[i].dst_origin);
+			g->deferred[i].held_lock = ft_lock_ctx_holds(&gctx, cm,
+				&cm_snap, &cm_rat);
+			continue;
+		}
 		/*
 		 * §7.2 fan-out: every child of one node shares a byte-depth, so
 		 * a coarse spacing either collapses them all onto one anchor --
@@ -13333,11 +13477,26 @@ int ft_glue_acquire_reparent_marks(struct cds_ft *ft, struct ft_glue *g)
 		ft_glue_lock_ctx_origin(g, &gctx, g->deferred[i].dst_origin);
 		if (!ft_lock_ctx_depth_of(ft, &gctx, g->deferred[i].child, &cd)) {
 			struct cds_ft_inode_flag *live_parent = NULL;
+			unsigned int pd;
 
 			(void) ft_resolve_parent_slot(cm, ft, &live_parent);
 			if (!ft_lock_ctx_depth_of_cursor_child(ft, &gctx,
-					live_parent, &cd))
-				return -EAGAIN;
+					live_parent, &cd)) {
+				/*
+				 * MORE THAN ONE HOP under the cursor: an
+				 * occupied-destination merge re-parents children
+				 * of the MERGE POINT, which lies inside the dst
+				 * subtree rather than at the node a descent to
+				 * the dst KEY stops on.  Climb to a dated
+				 * ancestor rather than refusing -- the refusal
+				 * here is structural, so the -EAGAIN below is a
+				 * spin, not a retry.
+				 */
+				if (!ft_lock_ctx_depth_of_climb(ft, &gctx,
+						live_parent, &pd))
+					return -EAGAIN;
+				cd = pd + ft_node_span(ft, live_parent);
+			}
 		}
 		anchor = ft_anchor_meta(ft, ft_lock_ctx_descent(&gctx),
 			g->deferred[i].child, cm, cd);
@@ -14112,14 +14271,18 @@ enum urcu_txn_status ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue 
 	 * admitting them: the assert keeps naming exactly the state it was written
 	 * for, an ARMED committer whose bail must be clean.
 	 */
-	if (ft->lock_fine && g->txn && g->txn->structural_sw) {
-		if (ft->exclusive) {
-			ft_glue_assert_reparent_unheld(ft, g);
-		} else {
+	if (g->txn && g->txn->structural_sw) {
+		/*
+		 * The @record_only assert keeps its ORIGINAL scope -- an ARMED
+		 * committer, i.e. FINE and non-exclusive, whose bail must be clean.
+		 * Every other mode now runs the same call for its DETECT-ONLY pass,
+		 * which cannot refuse, so admitting them here adds no bail to a
+		 * caller that has none.
+		 */
+		if (ft->lock_fine && !ft->exclusive)
 			assert(g->record_only);
-			if (ft_glue_acquire_reparent_marks(ft, g))
-				return URCU_TXN_STATUS_ABORT;
-		}
+		if (ft_glue_acquire_reparent_marks(ft, g))
+			return URCU_TXN_STATUS_ABORT;
 	}
 
 	/*

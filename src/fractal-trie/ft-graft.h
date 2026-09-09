@@ -45,6 +45,60 @@
  * Returns 0 (glue holds the cluster, its publish, and attached_nf), or
  * -ENOMEM (caller runs ft_glue_abort).
  */
+/*
+ * The ONE child of @parent_nf that is not @exclude -- the raw slot word and its
+ * ordinal.  Used by the split's old-direction COLLAPSE, where the src junction
+ * has exactly two children and one of them is the subtree being moved away.
+ *
+ * Raw, never resolved: the caller wires the value back into a slot (and matches
+ * it against one), so a skip-encoded form must survive the round trip -- the
+ * same reason ft_node_find_child compares raw words.
+ */
+static
+bool ft_node_other_child(struct cds_ft_inode_flag *parent_nf,
+		const struct cds_ft_inode_flag *exclude,
+		uint8_t *n_ret, struct cds_ft_inode_flag **child_ret)
+{
+	struct cds_ft_inode *node = ft_node_ptr(parent_nf);
+	unsigned int type_index = ft_node_type(parent_nf);
+	const struct cds_ft_type *type = &ft_types[type_index];
+	unsigned int i;
+
+	switch (type->type_class) {
+	case FT_POPCOUNT:
+	{
+		uint8_t nr_child = ft_popcount_node_get_nr_child(type, node);
+
+		for (i = 0; i < nr_child; i++) {
+			struct cds_ft_inode_flag *iter;
+			uint8_t v;
+
+			ft_popcount_node_get_ith_pos(type, node, i, &v, &iter);
+			if (!iter || iter == exclude)
+				continue;
+			*n_ret = v;
+			*child_ret = iter;
+			return true;
+		}
+		return false;
+	}
+	case FT_PIGEON:
+		for (i = 0; i < FT_ENTRY_PER_NODE; i++) {
+			struct cds_ft_inode_flag *iter =
+				ft_pigeon_node_get_ith_pos(type, node, i);
+
+			if (!iter || iter == exclude)
+				continue;
+			*n_ret = (uint8_t) i;
+			*child_ret = iter;
+			return true;
+		}
+		return false;
+	default:
+		return false;
+	}
+}
+
 static
 int ft_split_compressed_graft_build(struct cds_ft *ft,
 		struct ft_descent *d,
@@ -187,6 +241,175 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 
 	(void) branch_cluster_leaf;	/* documents intent; both set_nth defer */
 
+	/*
+	 * SUBSTITUTE THE OLD DIRECTION'S CHILD (@glue->old_dir_replace), before
+	 * anything reads it.  See the field's header: the run's one child keeps
+	 * siblings, so the old half must hold that child MINUS the moved arm, and
+	 * producing it HERE is what keeps the edit out of the body this split
+	 * retires.
+	 *
+	 * Everything downstream then treats BP' as the displaced child and needs
+	 * no further special case: @old_child_nr_keys is read from it (so the
+	 * branch's total is BP's original count), the fresh suffix wires it before
+	 * ft_publish_compressed encodes the SKIP_X dual FROM it, and
+	 * ft_glue_deferred_index reports -1 for it exactly as the drop arm leaves
+	 * @old_dir_deferred -- BP is RETIRED here, not re-homed, so there is no
+	 * re-parent for a later step to find.
+	 *
+	 * ☠ ITS BACK EDGE IS A PLAIN STORE, NOT A DEFERRED ONE.  BP' is a FRESH
+	 * node no reader can reach until the forward publish, so its parent word
+	 * is a build-invisible interior write -- the txn publishes reachability,
+	 * not interiors.  Deferring it instead would record a re-parent for a node
+	 * the commit has no live edge to, and the drop arm makes the same call.
+	 */
+	if (glue->old_dir_replace.of && glue->old_dir_replace.of == cn_child &&
+			ft_node_internal(cn_child) &&
+			ft_meta_nr_child(ft_flag_to_metadata(ft, cn_child)) == 2 &&
+			!ft_flag_to_metadata(ft, cn_child)->external_nodes) {
+		/*
+		 * COLLAPSE, not replace.  BP has exactly two children and no keys
+		 * of its own, so dropping the moved arm would leave a ONE-CHILD
+		 * internal -- which is not a legal shape in skip mode
+		 * (ft_verify: "1 child and no external_nodes (should be a 1-byte
+		 * compressed)").  Copying BP minus the arm is therefore the wrong
+		 * answer here; the old direction is ONE RUN and BP goes away
+		 * entirely:
+		 *
+		 *   [cn suffix] ++ [surviving ordinal] (++ [absorbed run]) -> subtree
+		 *
+		 * ft_build_branch lays that canonically and ft_try_compress_chain
+		 * ABSORBS a compressed surviving child into the same run -- the
+		 * "no two adjacent compresseds" invariant is why the fusion has to
+		 * happen here rather than by stacking a suffix node on a collapsed
+		 * BP' -- deferring the final child's back-pointer and the absorbed
+		 * node's retire on the way.  That is the fused chain-compress the
+		 * plain REPLACE below cannot express.
+		 *
+		 * ☠ BP IS RETIRED FENCED.  Its body is READ here (the surviving
+		 * ordinal and child) and the run is built from what was read; a
+		 * plain retire takes no lock over that window, so a peer adding a
+		 * child to BP in it would be retired along with BP -- silent key
+		 * loss, the exact gap ft_glue_defer_free_fenced was written for.
+		 */
+		struct cds_ft_metadata *bpm = ft_flag_to_metadata(ft, cn_child);
+		struct cds_ft_compressed_node *scn = NULL;
+		struct cds_ft_inode_flag *surv = NULL;
+		uint8_t buf[FT_MAX_KEY_LEN];
+		unsigned int plen, plen_total;
+		uint8_t sb = 0;
+
+		if (!glue->txn)
+			return -EAGAIN;
+		if (!ft_node_other_child(cn_child,
+				glue->old_dir_replace.drop_child, &sb, &surv))
+			return -EAGAIN;		/* stale plan: re-descend */
+		if (ft_node_skip_compressed(surv))
+			scn = ft_skip_to_compressed(ft, surv);
+		else if (ft_node_compressed(surv))
+			scn = ft_compressed_node_ptr(surv);
+		plen = suffix_len + 1U;
+		plen_total = plen + (scn ? (unsigned int) scn->len : 0U);
+		/*
+		 * ☞ AN OVERLONG RUN IS NOT REFUSED HERE.  A refusal inside the
+		 * build could only answer -EAGAIN, and the shape is deterministic,
+		 * so the op would re-plan onto it for ever.  Leave the replace
+		 * UNARMED instead and let the caller's own shape gate answer
+		 * terminally, exactly as it did before this arm existed.
+		 */
+		if (plen > sizeof(buf) ||
+				(ft_group_skip_compressed(ft->group) &&
+					plen_total > FT_SKIP_LEN_MAX))
+			goto no_old_dir_replace;
+		if (suffix_len)
+			memcpy(buf, &cn->key_bytes[diverge_pos + 1], suffix_len);
+		buf[suffix_len] = sb;
+		/*
+		 * The surviving subtree's key count: BP held the moved arm and
+		 * this one, and the moved arm's @src_count leaves.  The branch
+		 * below then takes @old_child_nr_keys + src_count -- BP's original
+		 * total -- so the cluster's net delta stays zero.
+		 */
+		old_child_nr_keys = ft_nr_keys_get(bpm) - src_count;
+		old_suffix_flag = ft_build_branch(ft, buf, 0, plen, surv,
+			old_child_nr_keys, false, glue);
+		if (!old_suffix_flag)
+			return -ENOMEM;
+		if (ft_node_compressed(old_suffix_flag))
+			sfx_skip_flag = ft_publish_compressed(ft,
+				ft_compressed_node_ptr(old_suffix_flag),
+				old_suffix_flag);
+		/*
+		 * ☞ THE PLAIN RETIRE, on the SAME footing the rest of this build
+		 * uses.  A fenced free-list entry records its {LOCK|s ->
+		 * TOMBSTONE|s} terminal INTO @txn and therefore asserts
+		 * @fuse_free_list -- which promotes EVERY entry to a txn record,
+		 * including @split_cn and the compressed node ft_try_compress_chain
+		 * absorbs, both of which this build owns through the GLUE rather
+		 * than the txn registry.  They would then fail the record-time
+		 * owner check.  So BP is retired exactly as @cn and the absorbed
+		 * run are: a standalone tombstone flip.
+		 *
+		 * ☐ RESIDUAL, and it is the one ft_glue_defer_free_fenced's header
+		 * names: the plain retire takes no lock across the window in which
+		 * this build READ BP's body (the surviving ordinal and child), so a
+		 * peer adding a THIRD child to BP inside that window would be
+		 * retired with it.  Closing it needs every free-list node owned by
+		 * the txn, which is a change to the glue's ownership model rather
+		 * than to this arm.
+		 */
+		ft_glue_defer_free(glue, ft_node_ptr(cn_child), false);
+		glue->old_dir_replace.done = true;
+		glue->old_dir_replace.collapsed = true;
+		goto old_dir_built;
+	}
+	if (glue->old_dir_replace.of && glue->old_dir_replace.of == cn_child) {
+		struct cds_ft_inode_flag *fresh = cn_child;
+		struct ft_remove_pub rpub;
+		struct ft_lock_ctx rctx;
+		uint8_t rn = 0;
+
+		if (!glue->txn)
+			return -EAGAIN;		/* no txn to retire BP into */
+		if (!ft_node_find_child(ft, cn_child,
+				glue->old_dir_replace.drop_child, &rn, NULL))
+			return -EAGAIN;		/* stale plan: re-descend */
+		memset(&rpub, 0, sizeof(rpub));
+		ft_glue_lock_ctx(glue, &rctx);
+		/*
+		 * The slot being cleared is on the SRC path, so the descent that
+		 * dates BP is the one that walked it.  @outer carries the rest of
+		 * the op's held set, exactly as the fence acquire above uses it.
+		 */
+		if (glue->lock_d_src)
+			rctx.d = glue->lock_d_src;
+		rctx.held.outer = outer;
+		ret = ft_node_replace_ptr(ft, glue->old_dir_replace.drop_slot,
+				glue->old_dir_replace.drop_expected,
+				&fresh, &glue->old_dir_replace.old_body,
+				ft_flag_to_metadata(ft, cn_child),
+				rn, NULL /*delete*/,
+				false /*is_root: a child of @cn*/,
+				glue->old_dir_replace.depth, &rpub, glue->txn,
+				NULL /*held_hint: no publish to guard*/,
+				&rctx);
+		if (ret)
+			return ret == -ENOMEM ? -ENOMEM : -EAGAIN;
+		/*
+		 * An IN-PLACE recompaction leaves the live node in hand, so there
+		 * is no fresh body to wire and BP would be edited where it stands
+		 * -- under a node this flip retires.  Refuse rather than publish
+		 * that; the caller's tier gate keeps it away, and this is the
+		 * guard that does not depend on the gate being right.
+		 */
+		if (fresh == cn_child)
+			return -EAGAIN;
+		glue->old_dir_replace.fresh = fresh;
+		glue->old_dir_replace.done = true;
+		ft_glue_track(glue, fresh);
+		cn_child = fresh;
+	}
+
+no_old_dir_replace:
 	/* Compute old child's nr_keys. */
 	if (!ft_node_external(cn_child)) {
 		struct cds_ft_metadata *cm =
@@ -233,8 +456,13 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 		 * on an external's parent.  The merge-rekey path has no txn (glue->txn
 		 * NULL); there it stays on the legacy fresh-before-live immediate store.
 		 */
-		ft_glue_defer_edge_origin(ft, glue, cn_child, old_suffix_flag,
-			&sfx->child, glue->txn != NULL);
+		if (glue->old_dir_replace.done)
+			ft_set_parent(ft, cn_child, old_suffix_flag,
+				&sfx->child);
+		else
+			ft_glue_defer_edge_origin(ft, glue, cn_child,
+				old_suffix_flag, &sfx->child,
+				glue->txn != NULL);
 	} else if (suffix_len == 1) {
 		struct cds_ft_inode_flag *dest = NULL;
 
@@ -252,12 +480,16 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 		ft_node_get_nth_skip(dest, &slot,
 			cn->key_bytes[diverge_pos + 1], FT_PF_NONE);
 		/* Displaced child: LIVE, ride the txn -- see the suffix_len>1 case. */
-		ft_glue_defer_edge_origin(ft, glue, cn_child, dest, slot,
-			glue->txn != NULL);
+		if (glue->old_dir_replace.done)
+			ft_set_parent(ft, cn_child, dest, slot);
+		else
+			ft_glue_defer_edge_origin(ft, glue, cn_child, dest,
+				slot, glue->txn != NULL);
 	} else {
 		old_suffix_flag = cn_child;	/* suffix_len == 0 */
 	}
 
+old_dir_built:
 	/*
 	 * 2. Build the NEW-direction subtree: canonicalize the payload, then
 	 * (when the key extends past the branch) a path down to it.  All
@@ -356,7 +588,8 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 	 * @old_suffix_flag is the fresh sfx/dest, a hidden edge (src-origin).
 	 */
 	ft_glue_defer_edge_origin(ft, glue, old_suffix_flag, branch_flag, slot,
-		suffix_len == 0 && glue->txn != NULL);
+		suffix_len == 0 && !glue->old_dir_replace.done &&
+			glue->txn != NULL);
 	/*
 	 * ☠ NAME WHAT THIS BUILD REPLACED (see @split_cn), and name it HERE.
 	 *
@@ -846,13 +1079,20 @@ enum urcu_txn_status ft_store_at_graft_point_commit(struct cds_ft *ft,
 		 * TESTED rather than asserted: a caller reaching this arm without it
 		 * has no clean bail, and keeps its present behaviour untouched.
 		 */
-		if (ft->lock_fine && st->glue->txn &&
-				st->glue->txn->structural_sw) {
-			if (ft->exclusive) {
-				ft_glue_assert_reparent_unheld(ft, st->glue);
-			} else if (st->glue->record_only &&
+		if (st->glue->txn && st->glue->txn->structural_sw) {
+			/*
+			 * DETECT on every mode, TAKE only under FINE
+			 * non-exclusive (ft_glue_acquire_reparent_marks decides
+			 * which, and its detect-only pass cannot refuse).
+			 * @record_only still gates the ARMED call alone: that is
+			 * what makes returning ABORT from here legitimate, and a
+			 * caller reaching this arm without it has no clean bail.
+			 */
+			bool armed = ft->lock_fine && !ft->exclusive;
+
+			if ((!armed || st->glue->record_only) &&
 					ft_glue_acquire_reparent_marks(ft,
-						st->glue)) {
+						st->glue) && armed) {
 				return URCU_TXN_STATUS_ABORT;
 			}
 		}

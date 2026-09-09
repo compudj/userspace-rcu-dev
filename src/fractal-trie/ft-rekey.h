@@ -3328,6 +3328,58 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		 * node, so a plain BP can never match and needs no test here.
 		 */
 		glue.drop_old_dir_of = src_cut ? d_src.nf : d_src.pnf;
+		/*
+		 * ARM THE OLD-DIRECTION REPLACE -- the drop's sibling, for a run
+		 * whose child KEEPS siblings.  Like the drop it is armed
+		 * unconditionally and consumed only if the build actually splits
+		 * that very child's parent; unlike the drop it names a slot as well
+		 * as a node, because the old half survives and must be born without
+		 * exactly one arm.  ft_split_compressed_graft_build does the
+		 * recompaction itself, at the one point where it knows it is
+		 * splitting -- see @old_dir_replace.
+		 *
+		 * ☑ TWO SHAPES, AND THE SPLIT PICKS BETWEEN THEM.  With three or
+		 * more children (or keys of its own) BP survives the drop as a
+		 * DEL-recompacted copy.  With exactly two and no keys it does not
+		 * survive at all: the copy would be a one-child internal, which is
+		 * not a legal shape in skip mode, so the split COLLAPSES the old
+		 * direction into one fused run and retires BP whole.  Both are
+		 * armed by the same @nr_child >= 2 -- the split reads BP itself and
+		 * chooses, because only it knows the suffix length the fused run
+		 * has to fit in.
+		 *
+		 * The remaining terms keep the fresh-body seam the whole design
+		 * rests on: a CUT source has no BP to recompact, and the in-place
+		 * tier can reserve a slot WITHOUT relocating, which would edit BP
+		 * where it stands -- under the node this flip retires.
+		 */
+		if (!src_cut && d_src.pnf && d_src.nfp && !ft_in_place_ok(ft) &&
+				ft_node_internal(d_src.pnf) &&
+				!ft_node_compressed(d_src.pnf) &&
+				!ft_node_skip_compressed(d_src.pnf)) {
+			struct cds_ft_metadata *bpm =
+				ft_flag_to_metadata(ft, d_src.pnf);
+			unsigned int nc = ft_meta_nr_child(bpm);
+
+			if (nc >= 2) {
+				glue.old_dir_replace.of = d_src.pnf;
+				glue.old_dir_replace.drop_slot = d_src.nfp;
+				glue.old_dir_replace.drop_expected = d_src.nf_raw;
+				/*
+				 * ☠ THE RAW SLOT WORD, NOT THE RESOLVED FLAG.
+				 * ft_node_find_child matches what the slot HOLDS
+				 * (`iter == child_nf`), and on a compressed build
+				 * a skip-encoded slot holds a word the resolve
+				 * turns into something else -- so passing
+				 * @d_src.nf finds nothing, and the split answers
+				 * -EAGAIN on a shape no re-descent can change.
+				 * The plain builds hid it: there the two are the
+				 * same word.
+				 */
+				glue.old_dir_replace.drop_child = d_src.nf_raw;
+				glue.old_dir_replace.depth = d_src.pdepth;
+			}
+		}
 		prep = ft_graft_build(ft, dst_ord, dst_len, s_top_prime, cnt,
 			&d_dst, &glue, &bctx.held);
 	}
@@ -3724,67 +3776,30 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		goto bail_build;
 	}
 	/*
-	 * ☠ A CUT RUN WHOSE CHILD CARRIES A STATE WORD IS OUT OF THIS CUT ON THE
-	 * MODES THE RE-PARENT ACQUIRE CANNOT COVER.
+	 * ☑ THE CUT-RUN / SPLIT-RUN SHAPES ARE NOW SERVED ON EVERY MODE, and the
+	 * gate that used to refuse them here is gone.  Keeping the measurement,
+	 * because it names the mechanism and the fix is elsewhere:
 	 *
-	 * Cutting the run makes ft_rekey_cow_stop park the child's parent word
-	 * SW, and the NOSPLIT commit re-parents that displaced child through
-	 * ft_glue_apply_deferred.  Whether that second record is SW or MW is
-	 * decided by @held_lock, and only ft_glue_acquire_reparent_marks sets it
-	 * -- a function that returns 0 immediately unless the trie is FINE and
-	 * non-exclusive.  On every other mode the entry therefore stays unmarked
-	 * and the word is recorded MW: measured on a COARSE trie at the apply,
-	 * nr_deferred=1, live=1, held_lock=0, structural_sw=true.  Two kinds on
-	 * one slot abort the engine's kind check (rcu-txn-mcas.h) on a debug
-	 * build and promote SW->MW fail-safe on a release one, after which the op
-	 * re-attempts forever.
+	 *   insert "zwa", "zwabq", "zwabcd";  rekey_merge(dst "zwe", src "zwabc")
 	 *
-	 * The FINE non-exclusive path is CURED -- ft_store_at_graft_point_commit
-	 * runs the acquire, and all four cut/uncut x leaf/internal shapes
-	 * complete -- so this keeps the refusal exactly where the cure cannot
-	 * reach, which is where it already applied.  ft_child_state_meta is NULL
-	 * exactly for an external head: the leaf-child shape, always in scope.
+	 * never returned on a COARSE trie.  Cutting the run makes
+	 * ft_rekey_cow_stop SW-park the displaced child's state word, and the
+	 * commit re-parents that child through ft_glue_apply_deferred, whose
+	 * record kind is picked by the deferred edge's @held_lock.  That flag was
+	 * left FALSE on every mode but FINE non-exclusive, because
+	 * ft_glue_acquire_reparent_marks returned 0 before setting it -- yet
+	 * ft_dlm_acquire_set_at has no mode gate, so the op really did hold the
+	 * word it was about to record MW.  The engine saw an SW record and an MW
+	 * record on ONE slot (`expected_old=0x4 seen=0x80004`, the op losing
+	 * against its own LOCK bit) and the retry loop re-ran the identical
+	 * sequence forever.
+	 *
+	 * ☞ The cure is to DETECT the hold on every mode and only TAKE a fresh
+	 * mark where a peer exists -- see ft_glue_acquire_reparent_marks.  The
+	 * refusal was never a property of the trie: the SAME shape under FINE
+	 * committed cleanly all along, which is what dated it as a missing arm
+	 * rather than an unexpressible move.
 	 */
-	/*
-	 * ☠ AND THE SPLIT REACHES THE SAME HAZARD WITHOUT A CUT.  The term above
-	 * asks about the SOURCE run because that is the shape it was found on,
-	 * but the hazard belongs to the DISPLACED CHILD, and a GLUE prep
-	 * displaces one whether or not the source was cut: splitting the
-	 * destination's compressed run re-parents that run's child through the
-	 * same ft_glue_apply_deferred, with the same unmarked entry, recorded
-	 * the same MW way.
-	 *
-	 * MEASURED, single-threaded, three keys and one call, on the DEFAULT
-	 * (compressed) build with the COARSE writer strategy:
-	 *
-	 *     insert "zwa", "zwabq", "zwabcd";
-	 *     cds_ft_rekey_merge(ft, "zwe", 3, "zwabc", 5);
-	 *
-	 * never returns.  @src_cut is 0 there -- the source ends ON the run, not
-	 * inside it -- so the cut term does not see it, while @prep is GLUE and
-	 * @graft_c is the compressed run the destination splits.  The engine
-	 * reports the SAME losing record on every attempt (a §4.B validate whose
-	 * expected-old masks the LOCK bit this very op is holding,
-	 * `expected_old=0x4 seen=0x80004`), and behind that sits the two-kinds-
-	 * on-one-slot conflict this whole term exists to keep out: with the
-	 * validate satisfied by hand the engine's kind check fires instead.
-	 *
-	 * Under the FINE strategy the same shape COMPLETES, because there
-	 * ft_glue_acquire_reparent_marks actually takes the mark.  So this stays
-	 * exactly where the cure cannot reach -- and it turns an unbounded spin
-	 * that grows the node reserve until the process is killed into the clean
-	 * NOT_SUPPORTED every sibling shape answers.
-	 */
-	if ((!ft->lock_fine || ft->exclusive) &&
-			((src_cut && ft_child_state_meta(ft, rcu_dereference(
-				ft_compressed_node_ptr(s_top)->child))) ||
-			 (prep == FT_GRAFT_PREP_GLUE && graft_c &&
-				ft_node_compressed(graft_c) &&
-				ft_child_state_meta(ft, rcu_dereference(
-					ft_compressed_node_ptr(graft_c)->child))))) {
-		ret = FT_REKEY_UNCOVERED;
-		goto bail_build;
-	}
 	/*
 	 * ☠ THESE TERMS ARE NOT ARGUMENT ERRORS, AND THEY USED TO ANSWER LIKE
 	 * ONE.  They say the src junction IS the node the graft retires, which no
@@ -3885,7 +3900,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 			(d_src.pnf == graft_c &&
 				prep != FT_GRAFT_PREP_NOSPLIT &&
 				!glue.old_dir_dropped) ||
-			(!bp_folds_into_graft_c &&
+			(!bp_folds_into_graft_c && !glue.old_dir_replace.done &&
 				(d_src.ppnf == graft_c ||
 				 (climb_reaches_graft && climb_steps >= 2) ||
 				 climb_rest_under_graft))) {
@@ -4167,7 +4182,8 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		 * ancestor's key count moves -- the fresh path already carries the
 		 * moved count from build, and there is no detach to walk it back.
 		 */
-		glue.count_delta = glue.old_dir_dropped ? 0 : (long) cnt;
+		glue.count_delta = (glue.old_dir_dropped ||
+			glue.old_dir_replace.done) ? 0 : (long) cnt;
 		cds_ft_alloc_reserve_drain(ft, &reserve);	/* GLUE builds its own cluster */
 	} else {
 		/*
@@ -4533,7 +4549,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 */
 	ret = 0;
 	if (!ft_rekey_move_folded(txn, fold_mode, fold_top_slot) &&
-			!glue.old_dir_dropped) {
+			!glue.old_dir_dropped && !glue.old_dir_replace.done) {
 		ft_lock_ctx_init(&lctx_src, &d_src, txn, optxn);
 		lctx_src.held.extra = marks;
 		lctx_src.held.nr_extra = nr_marks;
@@ -5100,6 +5116,17 @@ cells_done:
 		 */
 		if (fold_rest_old)
 			free_cds_ft_node(ft, fold_rest_old);
+		/*
+		 * ...and the OLD-DIRECTION REPLACE's, for the same reason: BP
+		 * survives as the copy the split wired under the fresh suffix, and
+		 * this is the body that copy superseded.  Retired by the
+		 * recompaction's own record inside the build, unlinked by this
+		 * commit, so it is reclaimed here rather than through the glue's
+		 * free list (which owns what the SPLIT retired, not what a
+		 * recompaction did).
+		 */
+		if (glue.old_dir_replace.old_body)
+			free_cds_ft_node(ft, glue.old_dir_replace.old_body);
 		/*
 		 * Old S_top after the grace period -- but ONLY when nothing else
 		 * already owns its reclaim.  TWO other owners exist:
