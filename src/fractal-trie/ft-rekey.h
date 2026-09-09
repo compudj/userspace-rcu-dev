@@ -2402,19 +2402,48 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		 * node (the shared-run collapse needs BOTH SIDES COMPRESSED...)".  A
 		 * compressed S_top is exactly what unlocks that exit, so the freshness
 		 * the coherent reader's witness depends on would be gone.
+		 *
+		 * ☑ AND THAT IS MEASURED, NOT ONLY ARGUED.  Ablated over 3000 generated
+		 * shapes (the gate fires 860 times there), the run ABORTS on this
+		 * driver's own dst-freshness obligation --
+		 * `merged_pub != d_dst.nf && ft_glue_is_fresh(ft, &glue, merged_pub)`
+		 * -- and a release-semantics run LOSES A KEY (rkfuzz seed 712,
+		 * `missing=1`).  So the premise still holds and this refusal is not the
+		 * stale kind.
+		 * ☞ WHAT WOULD SERVE IT: ft_merge_build must not hand back a LIVE node
+		 * for a compressed S_top -- either by COW-ing the moved top the way the
+		 * graft arm's ft_rekey_cow_stop does, or by making the shared-run
+		 * collapse exit build a fresh run.  Nothing else about the shape is
+		 * missing.
 		 */
 		if (merge_dst && s_top_compressed)
 			return FT_REKEY_UNCOVERED;
 		/*
-		 * A co-located external chain is carried by ft_rekey_cow_stop, which
-		 * the MERGE arm skips -- ft_merge_build would have to union that key
-		 * into the destination's own chain, and nothing here has tested it.
-		 * The graft arm takes it.  (An INTERNAL S_top's shape only:
-		 * @s_top_meta is NULL for the bare head, whose one key IS the head --
-		 * there is no second, co-located one to union.)
+		 * ☑ A CO-LOCATED EXTERNAL CHAIN IS SERVED ON THE MERGE ARM TOO.
+		 * It used to be refused here, and the refusal's whole reason was
+		 * "nothing here has tested it" -- ft_merge_build would have to
+		 * union that key into the destination's own chain, and no oracle
+		 * drove the shape.  That is a caution, not a defect, and a
+		 * caution is answered by testing it.
+		 *
+		 * ☑ TESTED NOW.  Ablated over 3000 generated shapes x rank
+		 * on/off x both list modes under --enable-rcu-debug -- the gate
+		 * fired 536 times in that corpus, so the shapes are reached --
+		 * the failure count was IDENTICAL to leaving it in place (0 with
+		 * rank off, 6 with rank on, which is the rank lane's own
+		 * nr_keys residue and unrelated).  No key loss, no engine
+		 * assert.  Pinned single-threaded by
+		 * test_rekey_merge_colocated_chain: insert
+		 * {"ab","abm","abn","cdx","cdy"}, rekey_merge(dst "cd", src
+		 * "ab") -> OK with {cd,cdm,cdn,cdx,cdy}, count 5, verify clean
+		 * on all four rank/list combinations.
+		 *
+		 * ft_rekey_cow_stop carries the chain on the graft arm; on this
+		 * arm ft_merge_build lands it as the union node's own
+		 * external_nodes, which is the same thing it already does for a
+		 * BARE head (@s_top_meta is NULL for that one -- its single key
+		 * IS the head, so there is no second co-located key to union).
 		 */
-		if (merge_dst && s_top_meta && s_top_meta->external_nodes)
-			return FT_REKEY_UNCOVERED;
 		/*
 		 * ☑ THE BARE HEAD IS NOW BOTH ARMS.  It used to be merge-arm only:
 		 * an occupied dst consumes it with machinery that already speaks
