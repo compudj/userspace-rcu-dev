@@ -3758,8 +3758,44 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		 * error, terminal.  ABOVE it the slot holds an EXTERNAL leaf, a key
 		 * ending on the path, which the attach would DISPLACE into the
 		 * fresh branch's metadata; that is a legal move this cut does not
-		 * express (the displaced shape carries a second publish the fold
-		 * has no owner for), so it owes UNCOVERED, not -EINVAL.
+		 * express, so it owes UNCOVERED, not -EINVAL.
+		 *
+		 * ☞ MEASURED, 4 modes x 3000 generated shapes: the AT-@dst_len arm
+		 * fires ZERO times and the ABOVE arm 279 (rank off) / 200 (rank on),
+		 * every one of them an EXTERNAL.  So the -EINVAL half is unwitnessed
+		 * and the whole refusal is, in practice, ONE shape: the displaced
+		 * external.
+		 *
+		 * ☠ AND IT IS LOAD-BEARING.  Ablated on a RELEASE build the corpus
+		 * goes 0 -> 38 failures (rank off) and 6 -> 89 (rank on): twelve of
+		 * them LOSE KEYS, the rest corrupt structure ("skip-encoded slot
+		 * slen != cn->len", "ord-cell list longer than trie").
+		 *
+		 * ☞ WHAT IS ACTUALLY OWED -- root-caused, and it is NOT the "second
+		 * publish" the old sentence blamed.  ft_glue_txn_commit_edges is
+		 * already record_only-aware, so the fold CAN own the publish.  What
+		 * breaks is the SKIP_X DUAL: with a COMPRESSED publish parent (the
+		 * displaced external is a run's child), _ft_publish_to_parent_meta
+		 * re-encodes the grandparent's skip word -- and it records that edge
+		 * against the grandparent AS IT STANDS AT STEP 3a, which the src
+		 * detach at step 3 then RELOCATES.  The fresh copy is born from the
+		 * live (stale) word, so the relocated grandparent keeps a skip word
+		 * naming the OLD child.  MEASURED on {"aa","cab","cba","b"} +
+		 * rekey_merge(dst "aac", src "b"): the dual is emitted against root
+		 * 0x..0a1 while the live root afterwards is 0x..141.
+		 *
+		 * Folding that pending edge into the recompaction's copy takes the
+		 * ablated corpus 38 -> 5 (rank off) and leaves rank on UNCHANGED at
+		 * 89.  So serving this shape needs THREE things, not one:
+		 *   1. the dual folded into the copy -- by a NAMED announcement, the
+		 *      way @pending_del_slot and @pending_pub_slot already are
+		 *      (ft-mutation-node.h's copy loops read COMMITTED values by
+		 *      design and must keep doing so for every other slot, so a
+		 *      blanket read-your-own-writes is not the fix);
+		 *   2. whatever the residual 5 are;
+		 *   3. this shape's own rank-stats count accounting (the +83 above
+		 *      the rank lane's standing 6).
+		 * ☞ [[project_ft_rekey_displaced_external_refusal]]
 		 */
 		if (d_dst.nf) {
 			ret = d_dst.depth == dst_len ?
