@@ -3745,9 +3745,43 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 * reach, which is where it already applied.  ft_child_state_meta is NULL
 	 * exactly for an external head: the leaf-child shape, always in scope.
 	 */
-	if ((!ft->lock_fine || ft->exclusive) && src_cut &&
-			ft_child_state_meta(ft, rcu_dereference(
-				ft_compressed_node_ptr(s_top)->child))) {
+	/*
+	 * ☠ AND THE SPLIT REACHES THE SAME HAZARD WITHOUT A CUT.  The term above
+	 * asks about the SOURCE run because that is the shape it was found on,
+	 * but the hazard belongs to the DISPLACED CHILD, and a GLUE prep
+	 * displaces one whether or not the source was cut: splitting the
+	 * destination's compressed run re-parents that run's child through the
+	 * same ft_glue_apply_deferred, with the same unmarked entry, recorded
+	 * the same MW way.
+	 *
+	 * MEASURED, single-threaded, three keys and one call, on the DEFAULT
+	 * (compressed) build with the COARSE writer strategy:
+	 *
+	 *     insert "zwa", "zwabq", "zwabcd";
+	 *     cds_ft_rekey_merge(ft, "zwe", 3, "zwabc", 5);
+	 *
+	 * never returns.  @src_cut is 0 there -- the source ends ON the run, not
+	 * inside it -- so the cut term does not see it, while @prep is GLUE and
+	 * @graft_c is the compressed run the destination splits.  The engine
+	 * reports the SAME losing record on every attempt (a §4.B validate whose
+	 * expected-old masks the LOCK bit this very op is holding,
+	 * `expected_old=0x4 seen=0x80004`), and behind that sits the two-kinds-
+	 * on-one-slot conflict this whole term exists to keep out: with the
+	 * validate satisfied by hand the engine's kind check fires instead.
+	 *
+	 * Under the FINE strategy the same shape COMPLETES, because there
+	 * ft_glue_acquire_reparent_marks actually takes the mark.  So this stays
+	 * exactly where the cure cannot reach -- and it turns an unbounded spin
+	 * that grows the node reserve until the process is killed into the clean
+	 * NOT_SUPPORTED every sibling shape answers.
+	 */
+	if ((!ft->lock_fine || ft->exclusive) &&
+			((src_cut && ft_child_state_meta(ft, rcu_dereference(
+				ft_compressed_node_ptr(s_top)->child))) ||
+			 (prep == FT_GRAFT_PREP_GLUE && graft_c &&
+				ft_node_compressed(graft_c) &&
+				ft_child_state_meta(ft, rcu_dereference(
+					ft_compressed_node_ptr(graft_c)->child))))) {
 		ret = FT_REKEY_UNCOVERED;
 		goto bail_build;
 	}
