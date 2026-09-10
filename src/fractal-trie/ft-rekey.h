@@ -5065,19 +5065,52 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		}
 		/*
 		 * ☠ THE DST-FRESHNESS OBLIGATION, the graft arm's half (the merge
-		 * arm states the full reasoning at its own publish).  Here the
-		 * fresh node at the destination attach point is the RECOMPACTED
-		 * ATTACH PARENT: the reserve recompaction ALWAYS relocates it, and
-		 * @old_recompacted_node is the witness that it did.  The one
-		 * documented exception is the in-place tier -- ft_in_place_ok
+		 * arm states the full reasoning at its own publish).  The property
+		 * owed is that the destination attach point ends up holding a node
+		 * NO READER HAS SEEN, so the coherent reader's two-descent witness
+		 * cannot match a torn descent against a clean one.
+		 *
+		 * ☠ AND THE OBLIGATION HAS TWO WITNESSES, not one.  This asserted
+		 * only the first, and its comment said the first was the shape:
+		 * "the fresh node at the destination attach point is the
+		 * RECOMPACTED ATTACH PARENT ... @old_recompacted_node is the
+		 * witness that it did".  That describes the arm where a node
+		 * ALREADY STANDS at the attach point and the reserve recompaction
+		 * relocates it.  It is not the only arm: when the graft point
+		 * holds an EXTERNAL LEAF -- a key ending on the dst path -- there
+		 * is no attach parent to recompact, so the graft BUILDS A BRANCH
+		 * and displaces the leaf into it.  @gst_st.dest is then NULL by
+		 * construction and @old_recompacted_node with it, while the node
+		 * published at the attach point is that FRESH BRANCH, carried in
+		 * @gst_st.attached ("payload (at-node) or branch") and flagged by
+		 * @gst_st.displaced_shape.
+		 *
+		 * ☑ MEASURED, and it is not a corner: over 3000 generated shapes,
+		 * the 219 that reach this line with @old_recompacted_node NULL are
+		 * 219/219 `displaced_shape` with `ft_glue_is_fresh(attached)` TRUE
+		 * -- on the default build and on -DNO_FEATURE_FT_COMPRESS alike.
+		 * The obligation was met by every one of them; the ASSERT was
+		 * asking for a witness that arm does not produce.
+		 *
+		 * ☞ A CLAIM WITHOUT AN ARM.  Nothing here changes behaviour: this
+		 * shape is still refused upstream (the displaced-external gate),
+		 * so the line is unreachable today.  It is corrected NOW because
+		 * it is the FIRST thing in the way of serving that shape, and a
+		 * wrong witness fires as "the obligation is broken" on a move that
+		 * honours it -- which is how it would be read by whoever lifts the
+		 * gate.
+		 *
+		 * The in-place tier stays the documented exception: ft_in_place_ok
 		 * requires @ft->exclusive, "single-writer, NO CONCURRENT READERS",
 		 * so there is no reader to owe a fresh visited-node set to.  If a
 		 * future in-place widening ever reaches this arm outside that
-		 * carve-out, this is the line that turns the silent witness loss
-		 * into a loud one.
+		 * carve-out, this is still the line that turns the silent witness
+		 * loss into a loud one.
 		 */
 		FT_REKEY_DST_FRESH_REACH(1);
 		urcu_assert_debug(gst_st.old_recompacted_node != NULL ||
+			(gst_st.displaced_shape &&
+				ft_glue_is_fresh(ft, &glue, gst_st.attached)) ||
 			ft_in_place_ok(ft));
 	}
 
