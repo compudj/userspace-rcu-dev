@@ -16520,7 +16520,17 @@ static int test_rekey_root_junction_folded(void)
 			"compression compiled out (-DNO_FEATURE_FT_COMPRESS)");
 	}
 
-	/* UNARMED: BP sits at depth 2, so the shape stays DECLINED. */
+	/*
+	 * ☑ UNFOLDED, AND SERVED SINCE THE ROOT PUBLISH WIDENED.  BP sits at
+	 * depth 2, so the drop does NOT fold into the graft's copy and the src
+	 * detach runs on its own -- which used to be the whole refusal ("a
+	 * root-level junction republishes into &ft->root, a slot with no node
+	 * word to lock").  It does not: the detach republishes into BP's OWN
+	 * parent, a real node one level down, and the only write to &ft->root is
+	 * the graft's forward publish, which the engine records as a ROOT edge
+	 * (arbitrated by the root-slot CAS) exactly as it does for the folded
+	 * move above.  This arm pinned the refusal; it now pins the move.
+	 */
 	for (i = 0; un_keys[i]; i++) {
 		if (cds_ft_insert(ft, (const uint8_t *) un_keys[i],
 				strlen(un_keys[i]),
@@ -16532,24 +16542,22 @@ static int test_rekey_root_junction_folded(void)
 		}
 	}
 	s = ft_rekey(ft, "q", "abc");
-	if (s != CDS_FT_STATUS_NOT_SUPPORTED) {
-		fprintf(stderr, "root_junction: unarmed root dst not declined "
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "root_junction: unfolded root dst not served "
 			"(%s)\n", cds_ft_status_to_string(s));
 		goto out;
 	}
 	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
-		fprintf(stderr, "root_junction: refusal disturbed the trie\n");
+		fprintf(stderr, "root_junction: unfolded move left the trie red\n");
 		goto out;
 	}
-	for (i = 0; un_keys[i]; i++) {
-		if (!ft_test_has_key(ft, un_keys[i])) {
-			fprintf(stderr, "root_junction: %s lost to a refusal\n",
-				un_keys[i]);
-			goto out;
-		}
-	}
-	if (ft_test_has_key(ft, "qm") || !ft_test_has_key(ft, "bm")) {
-		fprintf(stderr, "root_junction: post-refusal key set wrong\n");
+	/* the moved pair at its NEW name, the untouched siblings still there */
+	if (!ft_test_has_key(ft, "qm") || !ft_test_has_key(ft, "qn") ||
+	    ft_test_has_key(ft, "abcm") || ft_test_has_key(ft, "abcn") ||
+	    !ft_test_has_key(ft, "abdp") || !ft_test_has_key(ft, "aep") ||
+	    !ft_test_has_key(ft, "bm") || !ft_test_has_key(ft, "bn") ||
+	    !ft_test_has_key(ft, "zp")) {
+		fprintf(stderr, "root_junction: post-move key set wrong\n");
 		goto out;
 	}
 	ret = 0;

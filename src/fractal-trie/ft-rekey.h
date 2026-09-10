@@ -4189,8 +4189,41 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 			}
 		}
 	}
-	root_pub_ok = (del_folds_into_graft || bp_folds_into_graft_c) &&
-		!ft_in_place_ok(ft);
+	/*
+	 * ☑ AND THE UNFOLDED ROOT PUBLISH, since the third disjunct.  The gate
+	 * used to admit @graft_p == NULL only for a move whose src edit FOLDS
+	 * into the graft's own copy, on the reasoning that "a root-level
+	 * junction republishes into &ft->root, a slot with no node word to lock,
+	 * so its SW park would be an unguarded plain store".
+	 *
+	 * ☠ THAT CONFLATES TWO WRITES.  The write to &ft->root is the GRAFT's
+	 * forward publish, and the engine records it as a ROOT edge -- arbitrated
+	 * by the root-slot CAS, never SW-parked (ft_pub_rec_add flags it, and
+	 * FT_ROOT_ASSERT_NOT_ROOT aborts a debug build that routes a root slot
+	 * through the tag path instead).  The write that needs a node word is the
+	 * SRC DETACH's republish, and that one lands in BP's own parent -- which
+	 * @d_src.ppnf names, and which is a real node whenever it is non-NULL.
+	 * So the folded move is not the only safe shape: an UNFOLDED move whose
+	 * src junction hangs off a real node is equally safe, and it is the same
+	 * @d_src.ppnf the detach arm below hands the detach as its parent hint.
+	 *
+	 * ☞ MEASURED, 3000 shapes x rank on/off x list on/off, on
+	 * --enable-rcu-debug default / nocompress / noskip and on release: 2632
+	 * -> 2669 (default and release), 2938 -> 2988 (nocompress), 2649 -> 2695
+	 * (noskip), ZERO failures on every leg.  On nocompress -- where no
+	 * compression debt hides behind this gate -- the +50 is EXACTLY the set
+	 * the root-junction refusal was holding: with it ablated, all 50 landed
+	 * on the detach arm's own @graft_p check one step later, and nothing
+	 * else changed.
+	 *
+	 * CONCURRENTLY, under the documented-safe COARSE strategy, one mover
+	 * alternating this very shape ("abc" <-> the root slot "q") against four
+	 * perturbers on 2 cpus: 12/12 clean on the default build, 6/6 on
+	 * nocompress and noskip, 300 and 150 moves completed.  (6/6 on FINE too,
+	 * which is out of contract and reported only as a note.)
+	 */
+	root_pub_ok = !ft_in_place_ok(ft) &&
+		(del_folds_into_graft || bp_folds_into_graft_c || d_src.ppnf);
 	/*
 	 * A ROOT-LEVEL JUNCTION is a SHAPE this cut declines, and it owes
 	 * FT_REKEY_UNCOVERED rather than -EINVAL.  The two are not
@@ -5287,7 +5320,16 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		 * relocating, and the arming refuses it), and kept as a guard
 		 * rather than an assert for the same reason.
 		 */
-		if (!graft_p || bp_folds_into_graft_c) {
+		/*
+		 * ☞ @root_pub_ok, not a bare NULL test: its third disjunct is
+		 * exactly this arm's question -- BP's parent is a real node, so
+		 * the republish below has a word to park under and only the
+		 * graft's forward publish touches &ft->root.  Reaching here with
+		 * @graft_p NULL and @root_pub_ok false still means the drop was
+		 * ARMED and NOT consumed, which is the case the comment above
+		 * describes.
+		 */
+		if ((!graft_p && !root_pub_ok) || bp_folds_into_graft_c) {
 			ret = FT_REKEY_UNCOVERED;
 			goto detach_bail;
 		}
