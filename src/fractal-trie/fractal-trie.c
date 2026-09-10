@@ -1017,15 +1017,3 @@ void cds_ft_debug_ext_violation(unsigned int kind, struct cds_ft *ft,
 	ft_trace_capture();
 }
 #endif
-#ifdef FT_TMP_TALLY
-unsigned long ft_tmp_tally[60000];
-__attribute__((destructor)) static void ft_tmp_tally_dump(void)
-{
-	unsigned int i;
-	fprintf(stderr, "TALLY-DUMP running\n");
-	for (i = 0; i < 60000; i++)
-		if (ft_tmp_tally[i])
-			fprintf(stderr, "TALLY ft-rekey.h:%u %lu\n", i,
-				ft_tmp_tally[i]);
-}
-#endif
