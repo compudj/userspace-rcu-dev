@@ -1843,6 +1843,19 @@ int ft_node_recompact(enum ft_recompact mode,
 				 * and must keep doing so for every other slot.
 				 */
 				if (!substituted && retire_txn &&
+						retire_txn->pending_dual_slot &&
+						src_slot == retire_txn->pending_dual_slot) {
+					/*
+					 * FOLD THE PUBLISH'S SKIP_X DUAL, for the
+					 * same reason and by the same rule as the
+					 * publish below: the refreshed skip word was
+					 * recorded against the node THIS recompaction
+					 * supersedes, so the copy must be born holding
+					 * it or the live trie keeps the stale one.
+					 * ☞ @pending_dual_slot.
+					 */
+					iter = retire_txn->pending_dual_val;
+				} else if (!substituted && retire_txn &&
 						retire_txn->pending_pub_slot &&
 						src_slot == retire_txn->pending_pub_slot) {
 					iter = retire_txn->pending_pub_val;
@@ -2021,6 +2034,19 @@ int ft_node_recompact(enum ft_recompact mode,
 				 * and must keep doing so for every other slot.
 				 */
 				if (!substituted && retire_txn &&
+						retire_txn->pending_dual_slot &&
+						src_slot == retire_txn->pending_dual_slot) {
+					/*
+					 * FOLD THE PUBLISH'S SKIP_X DUAL, for the
+					 * same reason and by the same rule as the
+					 * publish below: the refreshed skip word was
+					 * recorded against the node THIS recompaction
+					 * supersedes, so the copy must be born holding
+					 * it or the live trie keeps the stale one.
+					 * ☞ @pending_dual_slot.
+					 */
+					iter = retire_txn->pending_dual_val;
+				} else if (!substituted && retire_txn &&
 						retire_txn->pending_pub_slot &&
 						src_slot == retire_txn->pending_pub_slot) {
 					iter = retire_txn->pending_pub_val;

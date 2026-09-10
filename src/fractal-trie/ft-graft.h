@@ -1039,6 +1039,24 @@ enum urcu_txn_status ft_store_at_graft_point_commit(struct cds_ft *ft,
 		st->glue->publish_slot = st->nfp;
 		st->glue->top = st->attached;
 		/*
+		 * ☠ ANNOUNCE THE PENDING PUBLISH.  This arm sets the three glue
+		 * fields directly instead of going through ft_glue_set_publish,
+		 * which is the ONLY thing that arms @pending_pub_slot -- so the
+		 * copy loop's publish fold, the chain-compress boundary and deep
+		 * folds and the commit-edges skip all stayed INERT for it, and a
+		 * recompaction of @st->pnf later in the same commit built its
+		 * fresh copy from COMMITTED words and dropped this publish on the
+		 * floor.  MEASURED: 12 of 3000 shapes LOST KEYS that way, 7
+		 * through the copy loop and 5 through the chain-compress collapse.
+		 * Announced by hand rather than by calling ft_glue_set_publish,
+		 * because that also defers a back edge for @top and this arm wires
+		 * its own (the displaced leaf, just above).
+		 */
+		if (st->glue->txn) {
+			st->glue->txn->pending_pub_slot = st->nfp;
+			st->glue->txn->pending_pub_val = st->attached;
+		}
+		/*
 		 * Order-statistics fold (BULK): the fresh @branch (which
 		 * absorbs the displaced external) raises @st->pnf's subtree by
 		 * +count_delta; @publish_parent == st->pnf, so the glue commit

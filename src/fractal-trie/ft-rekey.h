@@ -3948,6 +3948,30 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		 *      the rank lane's standing 6).
 		 * ☞ [[project_ft_rekey_displaced_external_refusal]]
 		 */
+		/*
+		 * ☑ THE DISPLACED EXTERNAL IS SERVED.  Above @dst_len the slot
+		 * holds an EXTERNAL LEAF -- a key ending on the destination path
+		 * -- which the attach DISPLACES into the fresh branch's metadata.
+		 * That was refused as a legal move this cut did not express; it
+		 * expresses it now, and the two things in the way were both the
+		 * same shape of defect: a reader-visible write RECORDED against a
+		 * node the src detach later SUPERSEDES, whose fresh copy is built
+		 * from committed words.
+		 *   - the FORWARD PUBLISH: this arm never announced it, because it
+		 *     sets the glue's publish fields directly instead of through
+		 *     ft_glue_set_publish.  12 shapes LOST KEYS.  ☞ ft-graft.h.
+		 *   - the SKIP_X DUAL the publish owes when the publish parent is
+		 *     compressed: nothing announced it at all.  26 shapes kept a
+		 *     stale skip word.  ☞ @pending_dual_slot.
+		 * With both announced the corpus is CLEAN on this shape: 279 more
+		 * calls commit and the failure count does not move.
+		 *
+		 * AT @dst_len the point is OCCUPIED and that is still an argument
+		 * error, terminal -- the caller asked to move a subtree onto a
+		 * position that already holds one.  It fires zero times over the
+		 * corpus, and is kept because it is the one reading here that no
+		 * state of the trie makes legal.
+		 */
 		if (d_dst.nf) {
 			ret = d_dst.depth == dst_len ?
 				-EINVAL : FT_REKEY_UNCOVERED;

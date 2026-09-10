@@ -1348,6 +1348,26 @@ struct ft_flip_txn {
 	 * then ride ONE flip, which is what keeps the move atomic to readers.
 	 */
 	struct cds_ft_inode_flag **pending_pub_slot;
+	/*
+	 * ☠ AND THE SKIP_X DUAL THAT PUBLISH OWES, announced the same way and
+	 * for the same reason.  When the publish parent is COMPRESSED the
+	 * publish refreshes a SECOND word -- the skip form in the GRANDPARENT's
+	 * slot -- recorded against the grandparent AS IT STANDS AT RECORD TIME.
+	 * A recompaction of that grandparent later in the same commit (the
+	 * rekey's src detach is one) builds its fresh copy from COMMITTED words
+	 * and carries the OLD skip word over, so the refreshed dual lands in the
+	 * body this flip retires and the live trie keeps the stale one.
+	 * MEASURED: 26 of 3000 shapes, every one of them structure-only --
+	 * cds_ft_verify "skip-encoded slot slen N != cn->len N", because the
+	 * stale word resolves through a child back-pointer onto a node that is
+	 * not a compressed node at all.
+	 *
+	 * Folded by SLOT IDENTITY in the copy loop, exactly as @pending_pub_slot
+	 * is.  A blanket read-your-own-writes there is ruled out by that loop's
+	 * design: it reads COMMITTED values on purpose, for every other slot.
+	 */
+	struct cds_ft_inode_flag **pending_dual_slot;
+	struct cds_ft_inode_flag *pending_dual_val;
 	struct cds_ft_inode_flag *pending_pub_val;
 	/*
 	 * Set by the recompaction that FOLDED the publish above into its copy.
@@ -1826,6 +1846,8 @@ struct ft_flip_txn *ft_flip_txn_create_at(FT_TK_SITE_PARAM struct cds_ft *ft)
 	t->acquire_miss = false;
 	t->acquire_enomem = false;
 	t->pending_pub_slot = NULL;
+	t->pending_dual_slot = NULL;
+	t->pending_dual_val = NULL;
 	t->pending_pub_val = NULL;
 	t->pending_pub_folded = false;
 	t->pending_pub_node = NULL;
@@ -2053,6 +2075,8 @@ struct ft_flip_txn *ft_flip_txn_create_on_at(FT_TK_SITE_PARAM
 	t->acquire_miss = false;
 	t->acquire_enomem = false;
 	t->pending_pub_slot = NULL;
+	t->pending_dual_slot = NULL;
+	t->pending_dual_val = NULL;
 	t->pending_pub_val = NULL;
 	t->pending_pub_folded = false;
 	t->pending_pub_node = NULL;
@@ -2113,6 +2137,8 @@ struct ft_flip_txn *ft_flip_txn_create_bounded_on_at(FT_TK_SITE_PARAM
 	t->acquire_miss = false;
 	t->acquire_enomem = false;
 	t->pending_pub_slot = NULL;
+	t->pending_dual_slot = NULL;
+	t->pending_dual_val = NULL;
 	t->pending_pub_val = NULL;
 	t->pending_pub_folded = false;
 	t->pending_pub_node = NULL;
@@ -14620,6 +14646,24 @@ enum urcu_txn_status ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue 
 	FT_AB_COUNT_PUB_PAIR(ft_slot_in_node(g->publish_parent, g->publish_slot));
 	_ft_publish_to_parent(ft, g->publish_parent, g->publish_slot, g->top,
 		ft_glue_publish_expected_old(g), &rec, false);
+	/*
+	 * ANNOUNCE THE DUAL, if this publish produced one.  @rec's first edge is
+	 * the publish itself; a COMPRESSED publish parent adds the SKIP_X dual
+	 * against the grandparent as a further edge.  Naming it lets a
+	 * recompaction of that grandparent later in this commit FOLD it, the way
+	 * @pending_pub_slot already lets one fold the publish.  ☞ @pending_dual_slot.
+	 */
+	if (g->txn) {
+		unsigned int ri;
+
+		for (ri = 0; ri < 3; ri++) {
+			if (!rec.slot[ri] || rec.slot[ri] == g->publish_slot)
+				continue;
+			g->txn->pending_dual_slot = rec.slot[ri];
+			g->txn->pending_dual_val = rec.new_val[ri];
+			break;
+		}
+	}
 	ft_flip_txn_record_pub_rec(g->txn, &rec);
 publish_done:
 	/*
