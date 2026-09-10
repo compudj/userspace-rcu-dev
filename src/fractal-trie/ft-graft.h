@@ -403,6 +403,32 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 		 */
 		if (fresh == cn_child)
 			return -EAGAIN;
+		/*
+		 * ☠ BAKE THE POST-REMOVAL COUNT, exactly as the COLLAPSED arm
+		 * above computes @old_child_nr_keys.  @fresh is BP minus the
+		 * moved arm and it SURVIVES with every other key, while the
+		 * caller's net-zero (`old_dir_replace.done ? 0 : cnt`) speaks
+		 * only for the publish parent: the subtree leaves the run and
+		 * re-enters under the same slot, so no ANCESTOR moves -- and BP
+		 * is not an ancestor of the destination, it is the node the
+		 * subtree left.  @fresh came out of ft_node_recompact carrying
+		 * BP's OLD total, and the detach that normally bakes -@cnt into
+		 * such a copy is skipped for this shape.
+		 *
+		 * A build-invisible plain store on a copy nothing reaches until
+		 * the flip, and a no-op when order statistics are off.
+		 *
+		 * MEASURED, rank stats on: insert {"abaccb","abcc","ba"} then
+		 * rekey_merge(dst "aacac", src "abc") returned OK with every key
+		 * at the right name, cds_ft_count_keys 3, and cds_ft_verify
+		 * `depth 1: nr_keys mismatch: stored 3, computed 2`.  This is the
+		 * COMPRESSING-build half of the same defect the rekey driver's
+		 * FT_REKEY_FOLD_REPLACE arm had (@7000b65e): 6 of 3000 shapes on
+		 * the default build, and the last of the rank lane's residue.
+		 */
+		ft_nr_keys_store(ft, ft_flag_to_metadata(ft, fresh),
+			ft_nr_keys_get(ft_flag_to_metadata(ft, fresh)) -
+				src_count, CMM_RELAXED);
 		glue->old_dir_replace.fresh = fresh;
 		glue->old_dir_replace.done = true;
 		ft_glue_track(glue, fresh);
@@ -567,12 +593,29 @@ old_dir_built:
 	}
 	/*
 	 * Order-statistics fold (BULK): build the fresh cluster's junction /
-	 * prefix with their FULL post-commit count -- the old span's keys PLUS
-	 * the +src_count payload -- so the graft/merge attach fold records only
-	 * the +src_count walk from the STABLE @publish_parent above the cluster
-	 * (a build-invisible plain store; a no-op when rank stats are off).  The
-	 * OLD-direction suffix nodes keep old_child_nr_keys (they hold no
-	 * payload).
+	 * prefix with their FULL post-commit count -- the old direction's
+	 * SURVIVING keys PLUS the +src_count payload -- so the graft/merge
+	 * attach fold records only the +src_count walk from the STABLE
+	 * @publish_parent above the cluster (a build-invisible plain store; a
+	 * no-op when rank stats are off).  The OLD-direction suffix nodes keep
+	 * old_child_nr_keys (they hold no payload).
+	 *
+	 * ☠ @old_child_nr_keys, NEVER @cn_meta's OWN count, and the prefix arms
+	 * below say the same.  The two are the same number for an ordinary
+	 * split -- @cn carries no external heads on this path, so the run's
+	 * count IS its child's -- and they DIVERGE for exactly one shape: a
+	 * same-trie move whose SOURCE lives inside the run being split.  The
+	 * old direction is then rebuilt WITHOUT the moved arm
+	 * (@old_dir_replace, either the collapsed or the recompacted arm), so
+	 * it sheds @src_count while @cn_meta still reads the pre-op total, and
+	 * the junction is born holding the moved keys TWICE.
+	 *
+	 * MEASURED, rank stats on: insert {"abaccb","abcc","ba"} then
+	 * rekey_merge(dst "aacac", src "abc") returned OK with every key at the
+	 * right name and cds_ft_count_keys 3, and cds_ft_verify answered
+	 * `depth 1: nr_keys mismatch: stored 3, computed 2`.  Traced store by
+	 * store, the junction is written 2 here and then OVERWRITTEN with 3 by
+	 * the @diverge_pos == 0 arm below re-deriving it from @cn_meta.
 	 */
 	ft_nr_keys_store(ft, cds_ft_item_to_metadata(ft_node_ptr(branch_flag)),
 		old_child_nr_keys + src_count, CMM_RELAXED);
@@ -642,7 +685,7 @@ old_dir_built:
 		memcpy(pfx->key_bytes, cn->key_bytes, diverge_pos);
 		ft_meta_nr_child_set(pfx_meta, 1);
 		ft_nr_keys_store(ft, pfx_meta,
-			ft_nr_keys_get(cn_meta) + src_count, CMM_RELAXED);
+			old_child_nr_keys + src_count, CMM_RELAXED);
 		top_flag = ft_compressed_node_flag(pfx);
 		ft_set_parent(ft, branch_flag, top_flag, NULL);
 		/* Track the PLAIN form; the skip form is for the publish. */
@@ -662,7 +705,7 @@ old_dir_built:
 			pfx->key_bytes[0] = cn->key_bytes[0];
 			ft_meta_nr_child_set(pfx_meta, 1);
 			ft_nr_keys_store(ft, pfx_meta,
-				ft_nr_keys_get(cn_meta) + src_count, CMM_RELAXED);
+				old_child_nr_keys + src_count, CMM_RELAXED);
 			top_flag = ft_compressed_node_flag(pfx);
 			ft_set_parent(ft, branch_flag, top_flag, &pfx->child);
 			/* Track the PLAIN form; skip form for the publish. */
@@ -681,7 +724,7 @@ old_dir_built:
 			return -ENOMEM;
 		pfx_meta = cds_ft_item_to_metadata(ft_node_ptr(dest));
 		ft_nr_keys_store(ft, pfx_meta,
-			ft_nr_keys_get(cn_meta) + src_count, CMM_RELAXED);
+			old_child_nr_keys + src_count, CMM_RELAXED);
 		top_flag = dest;
 		ft_glue_track(glue, dest);
 		}
@@ -692,7 +735,7 @@ old_dir_built:
 	} else {
 		/* diverge_pos == 0: branch IS the top. */
 		ft_nr_keys_store(ft, cds_ft_item_to_metadata(ft_node_ptr(branch_flag)),
-			ft_nr_keys_get(cn_meta) + src_count, CMM_RELAXED);
+			old_child_nr_keys + src_count, CMM_RELAXED);
 		top_flag = branch_flag;
 	}
 

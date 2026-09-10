@@ -69,13 +69,13 @@
 #endif
 
 /*
- * 325 unconditional + 51 fault-injection-only RUN_TEST registrations, on top of
+ * 326 unconditional + 51 fault-injection-only RUN_TEST registrations, on top of
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (384 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (385 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (333 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (334 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -13302,6 +13302,99 @@ out:
 	rcu_barrier();
 	cds_ft_destroy(ft);
 	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
+ * THE SPLIT CLUSTER'S COUNT MUST SPEAK FOR THE SURVIVING OLD DIRECTION.
+ * Rank stats only.
+ *
+ * A move whose destination DIVERGES INSIDE a compressed run splits it: the
+ * builder makes a fresh junction holding the old direction under one byte and
+ * the moved payload under another, and gives it the old span's keys plus the
+ * moved count.  When the SOURCE also lives inside that span the old direction
+ * is rebuilt WITHOUT the moved arm, so it sheds those keys -- and the junction,
+ * born from the compressed node's own pre-op total, counts them TWICE.
+ *
+ * Two spellings, because the split's old direction is rebuilt by two different
+ * arms and only one of them subtracts on its own:
+ *
+ *  A. the old direction COLLAPSES into one run (it had two children, one of
+ *     them the moved arm).  Its own count is right; the junction above it was
+ *     then OVERWRITTEN from the run's pre-op total by the diverge_pos == 0 arm.
+ *     `depth 1: nr_keys mismatch: stored 3, computed 2`.
+ *
+ *  B. no rebuild at all: the src detach runs, and its -cnt walk climbs the
+ *     PRE-OP chain -- charging the compressed node this commit retires, while
+ *     the fresh junction built at step 3a keeps what it no longer holds.  The
+ *     walk cannot see the cluster's publish because the GLUE lane records it at
+ *     step 3c, AFTER the detach; @pending_pub_slot is what makes it visible.
+ *     `depth 1: nr_keys mismatch: stored 4, computed 3`.
+ *
+ * Both return OK with every key at the right name and cds_ft_count_keys right:
+ * only cds_ft_verify and the rank/select queries can see the damage.
+ */
+static int rekey_split_cluster_count(int ordered_list, int spelling)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	enum cds_ft_status s;
+	const char *const a_keys[] = { "abaccb", "abcc", "ba", NULL };
+	const char *const b_keys[] = { "cb", "acbbaa", "bab", "acac",
+		"acabca", "bcbca", NULL };
+	const char *const *keys = spelling ? b_keys : a_keys;
+	const char *dst = spelling ? "aacc" : "aacac";
+	const char *src = spelling ? "acabc" : "abc";
+	const char *moved_to = spelling ? "aacca" : "aacacc";
+	const char *moved_from = spelling ? "acabca" : "abcc";
+	unsigned long n = 0;
+	int ret = -1, i, moved;
+
+	if (!cds_ft_merge_enabled()) {
+		diag("rekey_split_cluster_count: skipped, merge compiled out "
+			"(-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
+	ft = create_varlen_rankstats_list_ft(ordered_list, &group);
+	rcu_read_lock();
+	for (i = 0; keys[i]; i++) {
+		cds_ft_insert(ft, (const uint8_t *) keys[i],
+			strlen(keys[i]), &node_alloc((unsigned long) i + 1)->node);
+		n++;
+	}
+	/* Served or refused, the aggregate must be right either way. */
+	s = ft_rekey(ft, dst, src);
+	moved = (s == CDS_FT_STATUS_OK);
+	if ((s != CDS_FT_STATUS_OK && s != CDS_FT_STATUS_NOT_SUPPORTED) ||
+	    ft_test_has_key(ft, moved_to) != moved ||
+	    ft_test_has_key(ft, moved_from) == moved ||
+	    cds_ft_count_keys(ft) != n ||
+	    cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr,
+			"split_cluster_count(list=%d spelling=%d): %s count %lu (want %lu)\n",
+			ordered_list, spelling, cds_ft_status_to_string(s),
+			cds_ft_count_keys(ft), n);
+		goto out;
+	}
+	ret = 0;
+out:
+	rcu_read_unlock();
+	drain_trie(ft);
+	rcu_barrier();
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+static int test_rekey_split_cluster_count(void)
+{
+	int ret = 0;
+
+	/* Every leg runs: the two spellings pin two different arms. */
+	ret |= rekey_split_cluster_count(0, 0);
+	ret |= rekey_split_cluster_count(1, 0);
+	ret |= rekey_split_cluster_count(0, 1);
+	ret |= rekey_split_cluster_count(1, 1);
 	return ret;
 }
 
@@ -37330,6 +37423,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_rekey_count_walk_after_detach);
 	RUN_TEST(test_rekey_displaced_external_dst);
 	RUN_TEST(test_rekey_fold_replace_count);
+	RUN_TEST(test_rekey_split_cluster_count);
 	RUN_TEST(test_rekey_merge_colocated_chain);
 	RUN_TEST(test_rekey_merge_cut_source);
 	RUN_TEST(test_rekey_merge_dst_run_start);

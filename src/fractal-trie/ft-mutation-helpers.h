@@ -10839,6 +10839,44 @@ void ft_flip_txn_record_count_parent(struct cds_ft *ft, struct ft_flip_txn *t,
 				}
 			}
 		}
+		/*
+		 * ...AND THE OP'S OWN PENDING PUBLISH IS NOT IN THE DESCRIPTOR
+		 * YET.  The arm above diverts onto a relocation the descriptor
+		 * ALREADY carries, which the one-decide drivers arrange by
+		 * ORDERING -- and the GLUE lane cannot: its cluster's publish is
+		 * recorded at step 3c, AFTER the src detach at step 3 whose
+		 * -@cnt walk runs here.  The walk then climbs the PRE-OP chain,
+		 * charges the split compressed node this commit RETIRES, and the
+		 * fresh cluster -- built at 3a from the pre-detach count -- keeps
+		 * the moved keys it no longer holds.
+		 *
+		 * @pending_pub_slot is that publish, announced by
+		 * ft_glue_set_publish precisely so a step running before the
+		 * commit can see it (the src detach's recompaction reads it the
+		 * same way).  Asking it here makes the walk's answer independent
+		 * of WHICH step records first.
+		 *
+		 * MEASURED, rank stats on, --enable-rcu-debug: insert
+		 * {"cb","acbbaa","bab","acac","acabca","bcbca"} then
+		 * rekey_merge(dst "aacc", src "acabc") returned OK with every key
+		 * at the right name and cds_ft_verify answered `depth 1: nr_keys
+		 * mismatch: stored 4, computed 3`.  Traced hop by hop, the -1
+		 * walk charged the retired run and skipped the fresh junction.
+		 */
+		if (t->pending_pub_slot && t->pending_pub_val &&
+				ft_resolve_parent_slot(m, ft, NULL) ==
+					t->pending_pub_slot) {
+			struct cds_ft_metadata *sm = ft_flag_to_metadata(ft,
+				t->pending_pub_val);
+
+			if (sm && sm != m) {
+				ft_nr_keys_store(ft, sm,
+					ft_nr_keys_get(sm) + delta,
+					CMM_RELAXED);
+				cur = ft_parent_node(m->parent_word);
+				continue;
+			}
+		}
 		base = ft_nr_keys_get(m);
 
 		/*
