@@ -690,6 +690,26 @@ int _cds_ft_debug_flag_is_compressed(void *flag)
 	return ft_node_compressed(nf) ? 1 : 0;
 }
 
+/*
+ * Is @flag (a value from _cds_ft_debug_child_at) an EXTERNAL head?
+ *
+ * The SKIP test comes first and is load-bearing: a skip pointer onto an
+ * external leaf carries low tag bits 0, which ft_node_external() matches on the
+ * raw value -- the same dispatch order every kind-testing site in the trie uses.
+ */
+int _cds_ft_debug_flag_is_external(void *flag)
+{
+	struct cds_ft_inode_flag *nf = (struct cds_ft_inode_flag *) flag;
+
+	if (!nf)
+		return 0;
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+	if (ft_node_skip_compressed(nf))
+		return 0;
+#endif
+	return ft_node_external(nf) ? 1 : 0;
+}
+
 void *_cds_ft_debug_child_at(struct cds_ft *ft, const uint8_t *key,
 		size_t key_len)
 {

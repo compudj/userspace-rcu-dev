@@ -3092,7 +3092,6 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		 */
 		if (d_dst.depth + dst_off_d != dst_len || !d_dst.nf ||
 				ft_node_flip_proxy(d_dst.nf) ||
-				ft_node_external(d_dst.nf) ||
 				(dst_off_d != 0 && !ft_node_compressed(d_dst.nf)) ||
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 				ft_node_skip_compressed(d_dst.nf) ||
@@ -3116,7 +3115,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		 * the moment the start-of-run arm was admitted.  The kind is the fact
 		 * this gate is actually about.
 		 */
-		if (!ft_node_compressed(d_dst.nf)) {
+		if (!ft_node_compressed(d_dst.nf) && !ft_node_external(d_dst.nf)) {
 			unsigned int dti = ft_node_type(d_dst.nf);
 
 			if (ft_types[dti].type_class != FT_POPCOUNT &&
@@ -3608,14 +3607,30 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		 * (ft_flip_txn_record_count_parent's chain resolution).
 		 */
 		{
-			struct cds_ft_metadata *d_meta =
-				ft_node_compressed(d_dst.nf) ?
-				cds_ft_item_to_metadata((struct cds_ft_inode *)
-					ft_compressed_node_ptr(d_dst.nf)) :
-				cds_ft_item_to_metadata(ft_node_ptr(d_dst.nf));
+			unsigned long d_keys;
 
-			glue.count_delta = (long) merged_keys -
-				(long) ft_nr_keys_get(d_meta);
+			/*
+			 * ☠ THREE KINDS, NOT TWO.  An EXTERNAL D has NO node
+			 * metadata at all -- ft_node_ptr() on it yields the
+			 * APPLICATION's leaf, which never came from the arena, and
+			 * cds_ft_item_to_metadata SEGVs on it.  ft_node_key_count
+			 * is the kind-complete answer ("One for an external leaf;
+			 * the maintained nr_keys when the trie keeps order
+			 * statistics, else a structural recount") and is what the
+			 * merge itself uses via ft_merge_child_count.
+			 */
+			if (ft_node_external(d_dst.nf))
+				d_keys = ft_node_key_count(ft, d_dst.nf);
+			else {
+				struct cds_ft_metadata *d_meta =
+					ft_node_compressed(d_dst.nf) ?
+					cds_ft_item_to_metadata((struct cds_ft_inode *)
+						ft_compressed_node_ptr(d_dst.nf)) :
+					cds_ft_item_to_metadata(ft_node_ptr(d_dst.nf));
+
+				d_keys = ft_nr_keys_get(d_meta);
+			}
+			glue.count_delta = (long) merged_keys - (long) d_keys;
 		}
 		/*
 		 * COLLIDED KEYS: a full key present on BOTH sides makes ft_merge_build

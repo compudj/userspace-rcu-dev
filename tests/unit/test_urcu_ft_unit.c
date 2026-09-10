@@ -69,13 +69,13 @@
 #endif
 
 /*
- * 321 unconditional + 51 fault-injection-only RUN_TEST registrations, on top of
+ * 322 unconditional + 51 fault-injection-only RUN_TEST registrations, on top of
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (380 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (381 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (329 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (330 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -287,6 +287,7 @@ extern void _cds_ft_debug_move_gate_exit(struct cds_ft *ft);
 extern void *_cds_ft_debug_root(struct cds_ft *ft);
 extern int _cds_ft_debug_cow_replace_root(struct cds_ft *ft);
 extern int _cds_ft_debug_flag_is_compressed(void *flag);
+extern int _cds_ft_debug_flag_is_external(void *flag);
 extern int _cds_ft_debug_compress_enabled(void);
 extern int _cds_ft_debug_in_place_enabled(void);
 extern int _cds_ft_debug_flag_has_external_chain(struct cds_ft *ft, void *flag);
@@ -12612,6 +12613,110 @@ out:
  * {"ab" a bare head, "b", "bc"} + rekey_merge(dst "b", src "ab"), which leaves
  * "b" a two-entry chain (3 entries, 2 keys).
  */
+/*
+ * ☑ THE DESTINATION KEY IS ITSELF A BARE EXTERNAL HEAD (the "Edge-D" shape).
+ *
+ * D at @dst_len is then an EXTERNAL node, and the union has to keep D's OWN key
+ * and take the moved subtree alongside it.  The merge arm's post-loop validation
+ * refused it outright, and the refusal's stated reason was that an external D
+ * "remains the Edge-D / leaf-splice family, which belongs to ft_merge_spine_copy".
+ *
+ * ☠ ft_merge_build HANDLES IT.  What did not was the count-delta two lines
+ * later, a TWO-WAY kind dispatch (compressed / plain) that fed
+ * cds_ft_item_to_metadata(ft_node_ptr(D)) -- and for an external D that is the
+ * APPLICATION's leaf, which never came from the arena.  Ablating the refusal
+ * SEGVs there; giving the dispatch its third kind serves the shape.  The
+ * type-class gate needed the same third kind: ft_node_type() on an external
+ * reads the type index out of the app pointer's ALIGNMENT BITS and happened to
+ * return a class that passed, which is luck, not correctness.
+ *
+ * MEASURED: 49 more calls commit over 3000 generated shapes, failure count
+ * unchanged, on --enable-rcu-debug / release / -DNO_FEATURE_FT_COMPRESS /
+ * -DNO_FEATURE_FT_SKIP_COMPRESSED.
+ *
+ * The trie is the smallest that carries the shape: "c" is a whole key with
+ * NOTHING below it, so D at "c" really is a bare head (asserted), and "bab"
+ * gives the source a subtree to move.
+ */
+static int rekey_merge_dst_bare_head(int rank, int ordered_list)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	enum cds_ft_status s;
+	void *d_before;
+	int ret = -1;
+
+	if (!cds_ft_merge_enabled()) {
+		diag("rekey_merge_dst_bare_head: skipped, merge compiled out "
+			"(-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
+	if (rank) {
+		ft = create_varlen_rankstats_list_ft(ordered_list, &group);
+	} else {
+		struct cds_ft_group_attr *attr;
+
+		if (cds_ft_group_attr_create(&attr) < 0)
+			return -1;
+		if (cds_ft_group_attr_set_ordered_list(attr, ordered_list) < 0 ||
+		    cds_ft_group_create(attr, &group) < 0) {
+			cds_ft_group_attr_destroy(attr);
+			return -1;
+		}
+		cds_ft_group_attr_destroy(attr);
+		if (cds_ft_create(group, NULL, &ft) < 0) {
+			cds_ft_group_destroy(group);
+			return -1;
+		}
+	}
+	rcu_read_lock();
+	cds_ft_insert(ft, (const uint8_t *) "bab", 3, &node_alloc(1)->node);
+	cds_ft_insert(ft, (const uint8_t *) "c", 1, &node_alloc(2)->node);
+
+	/* The shape must be present or the test proves nothing. */
+	d_before = _cds_ft_debug_child_at(ft, (const uint8_t *) "c", 1);
+	if (!d_before || !_cds_ft_debug_flag_is_external(d_before)) {
+		fprintf(stderr, "merge_dst_bare_head: D at \"c\" is NOT an external "
+			"head (%p) -- a lone key should have stayed a bare head\n",
+			d_before);
+		goto out;
+	}
+	s = ft_rekey(ft, "c", "b");
+	if (s != CDS_FT_STATUS_OK ||
+	    !ft_test_has_key(ft, "cab") ||	/* the moved key at its new name */
+	    !ft_test_has_key(ft, "c") ||	/* D's OWN key survives the union */
+	    ft_test_has_key(ft, "bab") ||
+	    cds_ft_count_keys(ft) != 2 ||
+	    cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr,
+			"merge_dst_bare_head(rank=%d list=%d): %s count %lu "
+			"cab=%d c=%d bab=%d\n",
+			rank, ordered_list, cds_ft_status_to_string(s),
+			cds_ft_count_keys(ft), ft_test_has_key(ft, "cab"),
+			ft_test_has_key(ft, "c"), ft_test_has_key(ft, "bab"));
+		goto out;
+	}
+	ret = 0;
+out:
+	rcu_read_unlock();
+	drain_trie(ft);
+	rcu_barrier();
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+static int test_rekey_merge_dst_bare_head(void)
+{
+	int r, l;
+
+	for (r = 0; r < 2; r++)
+		for (l = 0; l < 2; l++)
+			if (rekey_merge_dst_bare_head(r, l))
+				return -1;
+	return 0;
+}
+
 static int test_rekey_bare_head_collide_walk(void)
 {
 	struct cds_ft_group_attr *attr;
@@ -36820,6 +36925,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_rekey_merge_colocated_chain);
 	RUN_TEST(test_rekey_merge_cut_source);
 	RUN_TEST(test_rekey_merge_dst_run_start);
+	RUN_TEST(test_rekey_merge_dst_bare_head);
 	RUN_TEST(test_rekey_bare_head_upwalk_key);
 	RUN_TEST(test_rekey_bare_head_collide_walk);
 	RUN_TEST(test_rekey_count_root_relocation);
