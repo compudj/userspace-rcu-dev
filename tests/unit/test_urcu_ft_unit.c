@@ -69,13 +69,13 @@
 #endif
 
 /*
- * 322 unconditional + 51 fault-injection-only RUN_TEST registrations, on top of
+ * 323 unconditional + 51 fault-injection-only RUN_TEST registrations, on top of
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (381 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (382 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (330 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (331 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -288,6 +288,7 @@ extern void *_cds_ft_debug_root(struct cds_ft *ft);
 extern int _cds_ft_debug_cow_replace_root(struct cds_ft *ft);
 extern int _cds_ft_debug_flag_is_compressed(void *flag);
 extern int _cds_ft_debug_flag_is_external(void *flag);
+extern int _cds_ft_debug_skip_compressed_enabled(void);
 extern int _cds_ft_debug_compress_enabled(void);
 extern int _cds_ft_debug_in_place_enabled(void);
 extern int _cds_ft_debug_flag_has_external_chain(struct cds_ft *ft, void *flag);
@@ -12713,6 +12714,150 @@ static int test_rekey_merge_dst_bare_head(void)
 	for (r = 0; r < 2; r++)
 		for (l = 0; l < 2; l++)
 			if (rekey_merge_dst_bare_head(r, l))
+				return -1;
+	return 0;
+}
+
+/*
+ * ☑ THE TWO-CHILD KEYLESS RESTING NODE: the fold COLLAPSES it, it does not copy it.
+ *
+ * The rekey fold rewrites one slot of @graft_c inside the copy the graft is
+ * already making, so the src detach never runs a second edit against a body this
+ * flip retires.  Its REPLACE mode writes a DEL-recompacted copy of the resting
+ * node -- correct while that copy is a legal shape.  It is not when the resting
+ * node has EXACTLY TWO CHILDREN AND NO KEYS: dropping the moved arm leaves a
+ * ONE-CHILD internal, which skip mode does not allow (cds_ft_verify: "1 child
+ * and no external_nodes (should be a 1-byte compressed)").
+ *
+ * ft_detach_node already refuses to publish such a node -- its shape-D gate
+ * folds the chain-compress prune into the same commit -- and ft-graft.h's
+ * old-direction COLLAPSE does the same thing one lane over, on this very shape.
+ * The fold's arming had no such gate: `nr_child >= 2` is right for three or more
+ * children and for two WITH keys, and wrong for exactly this one.
+ *
+ * MEASURED over 3000 generated shapes: 55 of them are this, every one with NO
+ * key loss and the single verify complaint above.  Serving them adds 55
+ * committed calls with the failure count unchanged.
+ *
+ * The trie below is the smallest that carries it.  "bbbc" and "baaab" give the
+ * node at "b" exactly two children and no key of its own; moving "bb" away drops
+ * one of them, so "b" must become the run "ba..." and the node must GO AWAY --
+ * which is what the test asserts structurally, not just by key membership: a
+ * REPLACE would leave a plain internal there and still answer every lookup.
+ */
+static int rekey_fold_collapse_two_child(int rank, int ordered_list)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	enum cds_ft_status s;
+	void *b_before, *b_after;
+	int ret = -1;
+
+	if (!cds_ft_merge_enabled()) {
+		diag("rekey_fold_collapse_two_child: skipped, merge compiled out "
+			"(-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
+	/*
+	 * SKIP mode is the whole point, and it is a DIFFERENT question from
+	 * path compression: without skip a one-child internal is a legal
+	 * resting shape, the plain REPLACE is correct, and the collapse must
+	 * not arm.  Asking _cds_ft_debug_compress_enabled here would let this
+	 * FAIL on -DNO_FEATURE_FT_SKIP_COMPRESSED, which keeps runs and spells
+	 * every slot plainly -- measured, that is exactly what it did.
+	 */
+	if (!_cds_ft_debug_skip_compressed_enabled()) {
+		diag("rekey_fold_collapse_two_child: skipped, skip-compressed "
+			"encoding compiled out (-DNO_FEATURE_FT_SKIP_COMPRESSED)");
+		return 0;
+	}
+	if (!_cds_ft_debug_compress_enabled()) {
+		diag("rekey_fold_collapse_two_child: skipped, path compression "
+			"compiled out (-DNO_FEATURE_FT_COMPRESS)");
+		return 0;
+	}
+	if (rank) {
+		ft = create_varlen_rankstats_list_ft(ordered_list, &group);
+	} else {
+		struct cds_ft_group_attr *attr;
+
+		if (cds_ft_group_attr_create(&attr) < 0)
+			return -1;
+		if (cds_ft_group_attr_set_ordered_list(attr, ordered_list) < 0 ||
+		    cds_ft_group_create(attr, &group) < 0) {
+			cds_ft_group_attr_destroy(attr);
+			return -1;
+		}
+		cds_ft_group_attr_destroy(attr);
+		if (cds_ft_create(group, NULL, &ft) < 0) {
+			cds_ft_group_destroy(group);
+			return -1;
+		}
+	}
+	rcu_read_lock();
+	cds_ft_insert(ft, (const uint8_t *) "bbbc", 4, &node_alloc(1)->node);
+	cds_ft_insert(ft, (const uint8_t *) "baaab", 5, &node_alloc(2)->node);
+	cds_ft_insert(ft, (const uint8_t *) "ca", 2, &node_alloc(3)->node);
+
+	/*
+	 * The resting node must really be a two-child keyless INTERNAL, or the
+	 * test passes without reaching the arm it exists for.
+	 */
+	b_before = _cds_ft_debug_child_at(ft, (const uint8_t *) "b", 1);
+	if (!b_before || _cds_ft_debug_flag_is_compressed(b_before) ||
+			_cds_ft_debug_flag_is_external(b_before)) {
+		fprintf(stderr, "fold_collapse: the node at \"b\" is not a plain "
+			"internal (%p)\n", b_before);
+		goto out;
+	}
+	s = ft_rekey(ft, "aacbcc", "bb");
+	if (s != CDS_FT_STATUS_OK ||
+	    !ft_test_has_key(ft, "aacbccbc") ||	/* the moved key at its new name */
+	    !ft_test_has_key(ft, "baaab") ||	/* the SURVIVOR, now under a run */
+	    !ft_test_has_key(ft, "ca") ||
+	    ft_test_has_key(ft, "bbbc") ||
+	    cds_ft_count_keys(ft) != 3 ||
+	    cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr,
+			"fold_collapse(rank=%d list=%d): %s count %lu "
+			"moved=%d surv=%d ca=%d old=%d\n",
+			rank, ordered_list, cds_ft_status_to_string(s),
+			cds_ft_count_keys(ft), ft_test_has_key(ft, "aacbccbc"),
+			ft_test_has_key(ft, "baaab"), ft_test_has_key(ft, "ca"),
+			ft_test_has_key(ft, "bbbc"));
+		goto out;
+	}
+	/*
+	 * ☞ THE STRUCTURAL ASSERTION, and it is the one that separates a
+	 * COLLAPSE from a REPLACE: the node at "b" must be GONE, replaced by a
+	 * run.  A REPLACE leaves a one-child internal there which answers every
+	 * lookup above identically and only cds_ft_verify would complain.
+	 */
+	b_after = _cds_ft_debug_child_at(ft, (const uint8_t *) "b", 1);
+	if (!b_after || !_cds_ft_debug_flag_is_compressed(b_after)) {
+		fprintf(stderr, "fold_collapse(rank=%d list=%d): the slot at \"b\" "
+			"holds %p, which is not a run -- the drop left a one-child "
+			"internal instead of collapsing it\n",
+			rank, ordered_list, b_after);
+		goto out;
+	}
+	ret = 0;
+out:
+	rcu_read_unlock();
+	drain_trie(ft);
+	rcu_barrier();
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+static int test_rekey_fold_collapse_two_child(void)
+{
+	int r, l;
+
+	for (r = 0; r < 2; r++)
+		for (l = 0; l < 2; l++)
+			if (rekey_fold_collapse_two_child(r, l))
 				return -1;
 	return 0;
 }
@@ -36928,6 +37073,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_rekey_merge_dst_bare_head);
 	RUN_TEST(test_rekey_bare_head_upwalk_key);
 	RUN_TEST(test_rekey_bare_head_collide_walk);
+	RUN_TEST(test_rekey_fold_collapse_two_child);
 	RUN_TEST(test_rekey_count_root_relocation);
 	RUN_TEST(test_merge_rekey_same_trie_speculative_rejected);
 	RUN_TEST(test_rekey_graft_vs_merge);

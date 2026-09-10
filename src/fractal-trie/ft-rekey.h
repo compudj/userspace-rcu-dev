@@ -1207,6 +1207,18 @@ enum ft_rekey_fold_mode {
 	FT_REKEY_FOLD_DROP,	/* the slot goes: the drop empties all of it */
 	FT_REKEY_FOLD_PROMOTE,	/* the slot takes the resting node's key chain */
 	FT_REKEY_FOLD_REPLACE,	/* the slot takes a DEL-recompacted copy of it */
+	/*
+	 * ...and the slot takes ONE FRESH RUN, because the resting node had
+	 * exactly two children and no keys of its own: dropping the moved arm
+	 * would leave a ONE-CHILD internal, which skip mode does not allow
+	 * (cds_ft_verify: "1 child and no external_nodes (should be a 1-byte
+	 * compressed)").  Copying it minus the arm is the WRONG answer there --
+	 * the survivor becomes a run and the resting node goes away entirely.
+	 * Its own mode rather than a REPLACE sub-case because the abort
+	 * ownership differs: the value is a COMPRESSED fresh node, and a LIVE
+	 * node is absorbed into it.
+	 */
+	FT_REKEY_FOLD_COLLAPSE,
 };
 
 
@@ -1301,6 +1313,38 @@ bool ft_rekey_fold_value_ok(const struct cds_ft *ft)
  *     detach would run after all -- into the body the graft superseded.
  *     Refused at PLAN time, before the reserve sets a bit no bail takes back.
  */
+/*
+ * THE TWO-CHILD KEYLESS RESTING NODE: the shape whose REPLACE is not a replace.
+ *
+ * Dropping the moved arm from a node with exactly two children and no keys of
+ * its own leaves a ONE-CHILD internal, which skip mode does not allow
+ * (cds_ft_verify: "1 child and no external_nodes (should be a 1-byte
+ * compressed)").  ft_detach_node already refuses to publish such a node -- its
+ * shape-D gate folds the chain-compress prune into the same commit -- and
+ * ft-graft.h's old-direction COLLAPSE does the same thing one lane over, on this
+ * very shape, and says so.  The fold's REPLACE arm had no such gate: its
+ * `nr_child >= 2` is right for three or more children (the drop leaves two) and
+ * for two WITH keys (the drop leaves one child plus keys, which verify exempts),
+ * and wrong for exactly this one.
+ *
+ * ☞ ONLY ON A SKIP GROUP.  Without it a one-child internal is a legal resting
+ * shape, the plain REPLACE is correct, and this must stay false so that arm
+ * reads exactly as it did.
+ *
+ * ☞ AND IT DOES NOT CONSULT ft_rekey_fold_value_ok.  That guard exists for a
+ * SKIP_X dual, and a dual only arises when the PUBLISH PARENT is compressed --
+ * which ft_rekey_fold_shape_ok already refuses for both @graft_c and @edited.
+ * The collapsed run's slot is in @graft_c, so no dual is owed and the guard has
+ * nothing to say about this mode.
+ */
+static inline
+bool ft_rekey_collapse_shape(const struct cds_ft *ft,
+		const struct cds_ft_metadata *rm)
+{
+	return ft_group_skip_compressed(ft->group) &&
+		ft_meta_nr_child(rm) == 2 && !rm->external_nodes;
+}
+
 static inline
 bool ft_rekey_fold_shape_ok(struct cds_ft *ft,
 		struct cds_ft_inode_flag *graft_c,
@@ -1883,6 +1927,9 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 * ft_node_find_child looked for a grandchild.
 	 */
 	struct cds_ft_inode_flag *fold_drop_child = NULL;
+	/* COLLAPSE: the child that SURVIVES the drop, captured RAW, and its ordinal. */
+	struct cds_ft_inode_flag *fold_surv = NULL;
+	uint8_t fold_surv_byte = 0;
 	struct cds_ft_inode_flag **fold_drop_slot = NULL;
 	struct cds_ft_inode_flag *fold_drop_expected = NULL;
 	struct cds_ft_inode *fold_rest_old = NULL;	/* its retired body */
@@ -4066,7 +4113,8 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		if (slot && rest_parent == graft_c &&
 				rcu_dereference(*slot) == climb_rest &&
 				ft_meta_nr_child(rm) >= 2 &&
-				ft_rekey_fold_value_ok(ft)) {
+				(ft_rekey_collapse_shape(ft, rm) ||
+					ft_rekey_fold_value_ok(ft))) {
 			/*
 			 * REPLACE: the resting node SURVIVES the drop, so the
 			 * value the slot takes is a DEL-recompacted copy of it.
@@ -4089,9 +4137,44 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 						rcu_dereference(*dslot) != climb_top)
 					dslot = NULL;	/* stale: leave unarmed */
 			}
+			/*
+			 * COLLAPSE instead of REPLACE for the two-child keyless
+			 * shape, and the survivor is captured RAW: a
+			 * skip-encoded form must survive the round trip -- the
+			 * same reading ft_node_other_child's own header states,
+			 * and the same one @fold_drop_expected already carries.
+			 * An over-long fused run leaves the arm UNARMED rather
+			 * than refusing here: a refusal inside the build could
+			 * only answer -EAGAIN on a DETERMINISTIC shape, so the
+			 * op would re-plan onto it for ever; unarmed, the
+			 * caller's own shape gate answers it terminally.
+			 */
+			if (dslot && ft_rekey_collapse_shape(ft, rm)) {
+				struct cds_ft_compressed_node *scn = NULL;
+				struct cds_ft_inode_flag *surv = NULL;
+				uint8_t sb = 0;
+
+				if (!ft_node_other_child(climb_rest, dexp,
+						&sb, &surv)) {
+					dslot = NULL;	/* stale: leave unarmed */
+				} else {
+					if (ft_node_skip_compressed(surv))
+						scn = ft_skip_to_compressed(ft, surv);
+					else if (ft_node_compressed(surv))
+						scn = ft_compressed_node_ptr(surv);
+					if (1U + (scn ? (unsigned int) scn->len : 0U) >
+							FT_SKIP_LEN_MAX) {
+						dslot = NULL;	/* unarmed */
+					} else {
+						fold_surv = surv;
+						fold_surv_byte = sb;
+					}
+				}
+			}
 			if (dslot) {
 				bp_folds_into_graft_c = true;
-				fold_mode = FT_REKEY_FOLD_REPLACE;
+				fold_mode = fold_surv ? FT_REKEY_FOLD_COLLAPSE :
+					FT_REKEY_FOLD_REPLACE;
 				fold_top_slot = slot;
 				fold_bp_depth = d_src.pdepth;
 				fold_rest_depth = d_src.pdepth -
@@ -4665,6 +4748,120 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 			}
 			txn->pending_del_slot = d_src.nfp;
 			txn->pending_del_expected = d_src.nf_raw;
+		} else if (bp_folds_into_graft_c &&
+				fold_mode == FT_REKEY_FOLD_COLLAPSE) {
+			/*
+			 * COLLAPSE: the resting node had exactly two children
+			 * and no keys, so the drop does not leave a NODE at all
+			 * -- it leaves ONE RUN:
+			 *
+			 *   [surviving ordinal] (++ [absorbed run]) -> subtree
+			 *
+			 * ft_build_branch lays that canonically and
+			 * ft_try_compress_chain ABSORBS a compressed survivor
+			 * into the same run, which is what the "no two adjacent
+			 * compresseds" invariant requires -- stacking a 1-byte
+			 * node on a compressed survivor would violate it.  On
+			 * the way it DEFERS the final child's back edge (that
+			 * child is reader-visible, so the edge must flip with
+			 * the graft) and DEFERS the absorbed node's free, and it
+			 * hands back the PLAIN flag, because a fresh run's skip
+			 * form cannot resolve while that back edge is deferred.
+			 *
+			 * ☞ MIRRORS ft-graft.h's old-direction COLLAPSE, which
+			 * is this same shape one lane over.
+			 */
+			uint8_t buf[FT_MAX_KEY_LEN];
+			unsigned long surv_keys;
+			struct cds_ft_inode_flag *coll;
+			struct cds_ft_inode_flag *surv2 = NULL;
+			uint8_t sb2 = 0;
+
+			if (rcu_dereference(*fold_top_slot) != climb_rest) {
+				ret = -EAGAIN;
+				goto bail_build;
+			}
+			/*
+			 * RE-VALIDATE the survivor against the drop's own RAW
+			 * expected-old.  Both are raw words, and this is the
+			 * only statement that the body read at PLAN time is the
+			 * body still there at BUILD time.
+			 */
+			if (!ft_node_other_child(climb_rest, fold_drop_expected,
+					&sb2, &surv2) || surv2 != fold_surv ||
+					sb2 != fold_surv_byte) {
+				ret = -EAGAIN;	/* stale plan: re-descend */
+				goto bail_build;
+			}
+			buf[0] = fold_surv_byte;
+			/*
+			 * The survivor's key count: the resting node held the
+			 * moved arm and this one, and @cnt leaves with the move.
+			 * The graft's own +count walk then stays net zero
+			 * (ft_rekey_move_folded).
+			 */
+			surv_keys = ft_nr_keys_get(cds_ft_item_to_metadata(
+				ft_node_ptr(climb_rest))) - cnt;
+			coll = ft_build_branch(ft, buf, 0, 1, fold_surv,
+				surv_keys, false, &glue);
+			if (!coll) {
+				ret = -ENOMEM;
+				goto bail_build;
+			}
+			/*
+			 * ☠ NOT @fold_rest_new / @fold_rest_old.  Those are
+			 * freed by this function's own bail and commit paths,
+			 * with free_cds_ft_node_unpublished -- the wrong freer
+			 * for a COMPRESSED node -- and @coll is GLUE-TRACKED
+			 * (ft_build_branch took @glue), so ft_glue_abort already
+			 * reclaims it.  Naming it in both places frees it twice:
+			 * measured, cds_ft_do_free_item's `range->nr_live > 0`.
+			 *
+			 * ☞ THE PLAIN RETIRE for the resting node, on the same
+			 * footing the rest of this build uses, and ft-graft.h's
+			 * twin says why: a FENCED free-list entry records its
+			 * {LOCK|s -> TOMBSTONE|s} into @txn and so asserts
+			 * @fuse_free_list, which promotes EVERY entry to a txn
+			 * record -- including the run ft_try_compress_chain just
+			 * absorbed, which this build owns through the GLUE and
+			 * which would then fail the record-time owner check.
+			 * Measured: asserting exactly that.
+			 *
+			 * ☐ RESIDUAL, inherited knowingly and identical to the
+			 * twin's: the plain retire holds no lock across the
+			 * window in which this build READ the resting node's
+			 * body, so a peer adding a THIRD child inside it would
+			 * be retired with it.  Closing it needs every free-list
+			 * node owned by the txn -- a change to the glue's
+			 * ownership model, not to this arm.
+			 */
+			ft_glue_defer_free(&glue, ft_node_ptr(climb_rest), false);
+			/*
+			 * ☠ THE SUBSTITUTION IS ON @graft_c'S SLOT, not on the
+			 * resting node's.  The fold's whole shape is "one slot
+			 * in @graft_c changes value inside the copy the graft is
+			 * already making": the slot that HELD the resting node
+			 * now holds the collapsed run.  Arming @fold_drop_slot
+			 * instead names a slot INSIDE the resting node, which
+			 * the copy loop never visits, so the drop goes
+			 * unconsumed and the detach guard below refuses the move
+			 * -- measured, 55 shapes landing on `!graft_p ||
+			 * bp_folds_into_graft_c`.  REPLACE and PROMOTE arm the
+			 * same pair; only the value differs.
+			 */
+			txn->pending_del_slot = fold_top_slot;
+			txn->pending_del_expected = climb_rest;
+			txn->pending_del_replace = coll;
+			/*
+			 * ...and the CANONICAL word for the slot the copy loop
+			 * will wire.  The sweep needs the PLAIN flag to reach
+			 * the right node; the slot then takes the skip form.
+			 */
+			if (ft_node_compressed(coll))
+				txn->pending_del_replace_pub =
+					ft_publish_compressed(ft,
+						ft_compressed_node_ptr(coll),
+						coll);
 		} else if (bp_folds_into_graft_c &&
 				fold_mode == FT_REKEY_FOLD_REPLACE) {
 			/*

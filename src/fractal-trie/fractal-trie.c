@@ -650,6 +650,28 @@ int _cds_ft_debug_compress_enabled(void)
 }
 
 /*
+ * Is the SKIP-COMPRESSED encoding compiled in?
+ *
+ * Distinct from path compression: a build can keep compressed runs and still
+ * spell every slot plainly.  Shapes whose legality DEPENDS on skip mode -- a
+ * one-child keyless internal is canonical without it and illegal with it -- must
+ * ask this and not _cds_ft_debug_compress_enabled, which answers a different
+ * question and would let such a test skip silently on the wrong build.
+ *
+ * Test-only, and asked of the LIBRARY rather than reproduced as a
+ * #ifdef in the test: the test object and the library can be compiled with
+ * different flags.
+ */
+int _cds_ft_debug_skip_compressed_enabled(void)
+{
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+	return 1;
+#else
+	return 0;
+#endif
+}
+
+/*
  * Is the in-place occupancy-bitmap tier compiled in?
  *
  * Test-only, and it must be ASKED OF THE LIBRARY rather than reproduced as a

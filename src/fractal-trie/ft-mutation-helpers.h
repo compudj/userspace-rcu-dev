@@ -1411,6 +1411,16 @@ struct ft_flip_txn {
 	 */
 	struct cds_ft_inode_flag *pending_del_replace;
 	/*
+	 * ...and the CANONICAL SLOT WORD for it, when the two differ.  A fresh
+	 * COMPRESSED replacement is handed over as the PLAIN flag -- its child's
+	 * back-pointer is still deferred, so the skip form would not resolve
+	 * during the build (ft_try_compress_chain's own header says so) -- and
+	 * the copy loop's re-parent sweep needs the plain form to reach the
+	 * right node.  The slot the sweep just wired then takes THIS word, which
+	 * is what keeps the edge skip-encoded.  NULL when no re-encode is owed.
+	 */
+	struct cds_ft_inode_flag *pending_del_replace_pub;
+	/*
 	 * MIXED sw/mw commit (DLM lock_fine): when true, the STRUCTURAL record
 	 * helpers (every ft_flip_txn_record_tag edge) plant SW-kind records -- a
 	 * plain locked park that CANNOT fail -- because the op holds the DLM
@@ -1808,6 +1818,7 @@ struct ft_flip_txn *ft_flip_txn_create_at(FT_TK_SITE_PARAM struct cds_ft *ft)
 	t->pending_del_expected = NULL;
 	t->pending_del_folded = false;
 	t->pending_del_replace = NULL;
+	t->pending_del_replace_pub = NULL;
 	t->structural_sw = false;	/* all-MW until a caller opts in under lock_fine */
 	FT_ROOT_ASSERT_INIT(t, ft);
 	FT_OWNER_ASSERT_INIT(t);
@@ -2033,6 +2044,7 @@ struct ft_flip_txn *ft_flip_txn_create_on_at(FT_TK_SITE_PARAM
 	t->pending_del_expected = NULL;
 	t->pending_del_folded = false;
 	t->pending_del_replace = NULL;
+	t->pending_del_replace_pub = NULL;
 	t->structural_sw = false;
 	FT_ROOT_ASSERT_INIT(t, ft);
 	FT_OWNER_ASSERT_INIT(t);
@@ -2091,6 +2103,7 @@ struct ft_flip_txn *ft_flip_txn_create_bounded_on_at(FT_TK_SITE_PARAM
 	t->pending_del_expected = NULL;
 	t->pending_del_folded = false;
 	t->pending_del_replace = NULL;
+	t->pending_del_replace_pub = NULL;
 	t->structural_sw = false;	/* all-MW until a caller opts in under lock_fine */
 	FT_ROOT_ASSERT_INIT(t, ft);
 	FT_OWNER_ASSERT_INIT(t);

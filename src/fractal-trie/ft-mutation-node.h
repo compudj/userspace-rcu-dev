@@ -2410,6 +2410,31 @@ skip_copy:
 					 * the step that took the word still owes
 					 * its release.
 					 */
+				if (retire_txn->pending_del_replace &&
+						iter == retire_txn->pending_del_replace) {
+					/*
+					 * ☠ A SUBSTITUTED FRESH CLUSTER: its back
+					 * edge is a PLAIN STORE.  No reader can reach
+					 * it until this copy is published, and the txn
+					 * publishes REACHABILITY, not interiors.  A
+					 * recorded re-parent would plant an MW
+					 * parent+PSO pair on a node the same commit's
+					 * free list also settles -- the rule
+					 * ft-remove.h's fused collapse states for its
+					 * own @pending_child.
+					 *
+					 * Then the slot takes the CANONICAL word.
+					 * ft_set_parent has just given the fresh run
+					 * its parent and slot offset, which is what a
+					 * skip form is DERIVED through, so the
+					 * re-encode is correct only in this order.  An
+					 * interior write into an unpublished body:
+					 * nothing to record.
+					 */
+					ft_set_parent(ft, iter, new_node_flag, slot);
+					if (retire_txn->pending_del_replace_pub)
+						*slot = retire_txn->pending_del_replace_pub;
+				} else
 					ft_reparent_record(ft, retire_txn, iter,
 							new_node_flag, slot,
 							/*child_marked=*/ false,
@@ -2444,6 +2469,31 @@ skip_copy:
 					 * never in the DLM set" is true of this
 					 * recompaction and false of the op.
 					 */
+				if (retire_txn->pending_del_replace &&
+						iter == retire_txn->pending_del_replace) {
+					/*
+					 * ☠ A SUBSTITUTED FRESH CLUSTER: its back
+					 * edge is a PLAIN STORE.  No reader can reach
+					 * it until this copy is published, and the txn
+					 * publishes REACHABILITY, not interiors.  A
+					 * recorded re-parent would plant an MW
+					 * parent+PSO pair on a node the same commit's
+					 * free list also settles -- the rule
+					 * ft-remove.h's fused collapse states for its
+					 * own @pending_child.
+					 *
+					 * Then the slot takes the CANONICAL word.
+					 * ft_set_parent has just given the fresh run
+					 * its parent and slot offset, which is what a
+					 * skip form is DERIVED through, so the
+					 * re-encode is correct only in this order.  An
+					 * interior write into an unpublished body:
+					 * nothing to record.
+					 */
+					ft_set_parent(ft, iter, new_node_flag, slot);
+					if (retire_txn->pending_del_replace_pub)
+						*slot = retire_txn->pending_del_replace_pub;
+				} else
 					ft_reparent_record(ft, retire_txn, iter,
 							new_node_flag, slot,
 							/*child_marked=*/ false,
