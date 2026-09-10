@@ -4967,6 +4967,33 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 					ret = FT_REKEY_UNCOVERED;
 				goto bail_build;
 			}
+			/*
+			 * ☠ AND BAKE THE POST-REMOVAL COUNT INTO IT, exactly as
+			 * the COLLAPSE arm above computes @surv_keys and as the
+			 * detach's own recompaction arm does (ft-remove.h, "the
+			 * fresh copy carried the OLD node's count out of
+			 * ft_node_recompact").  @fresh IS the resting node minus
+			 * the moved arm, and it is a SURVIVOR -- it keeps every
+			 * other key -- so the net-zero the fold claims holds at
+			 * @graft_c and NOT one level down.  A build-invisible
+			 * plain store on a copy nothing reaches until the flip,
+			 * and a no-op when order statistics are off
+			 * (ft_nr_keys_store checks @rank_stats).
+			 *
+			 * Without it the detach that would have baked -@cnt is
+			 * skipped by ft_rekey_move_folded and NOTHING charges
+			 * @fresh.  MEASURED, rank stats on, over 1200 generated
+			 * shapes on -DNO_FEATURE_FT_COMPRESS: the fold shape
+			 * `folded && mode == REPLACE` is an EXACT discriminator
+			 * for the residue -- 40 of 40 such moves answer OK with
+			 * every key at the right name and cds_ft_verify RED
+			 * (`nr_keys mismatch: stored N, computed N-cnt`), and 0
+			 * of the other 1160 moves fail.  Two-key repro:
+			 * {"bca","baccc"} + rekey_merge(dst "a", src "bc").
+			 */
+			ft_nr_keys_store(ft, ft_flag_to_metadata(ft, fresh),
+				ft_nr_keys_get(ft_flag_to_metadata(ft, fresh)) -
+					cnt, CMM_RELAXED);
 			txn->pending_del_slot = fold_top_slot;
 			txn->pending_del_expected = climb_rest;
 			txn->pending_del_replace = fresh;

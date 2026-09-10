@@ -69,13 +69,13 @@
 #endif
 
 /*
- * 324 unconditional + 51 fault-injection-only RUN_TEST registrations, on top of
+ * 325 unconditional + 51 fault-injection-only RUN_TEST registrations, on top of
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (383 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (384 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (332 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (333 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -13225,6 +13225,92 @@ out:
 	rcu_barrier();
 	cds_ft_destroy(ft);
 	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
+ * THE REPLACE FOLD'S NET-ZERO CLAIM STOPS ONE LEVEL SHORT.  Rank stats only.
+ *
+ * When the src junction is not the node the graft rebuilds, the move can still
+ * fold: @graft_c's fresh copy is born holding a DEL-recompacted copy of the
+ * RESTING NODE in that slot (FT_REKEY_FOLD_REPLACE), and the detach that would
+ * have republished into the superseded body is skipped
+ * (ft_rekey_move_folded).  The count then rides on that skip: the graft passes
+ * delta 0 because the subtree leaves and re-enters @graft_c.
+ *
+ * True at @graft_c -- and FALSE one level down.  The resting node's copy is a
+ * SURVIVOR that keeps its other keys and must lose the moved count, exactly as
+ * the COLLAPSE arm beside it computes @surv_keys and as the detach's own
+ * recompaction arm bakes -@cnt.  Nothing charged it, so the survivor stores
+ * @cnt too many: OK returned, every key at the right name,
+ * cds_ft_count_keys right, and cds_ft_verify RED.
+ *
+ * ☠ THIS PINS ON -DNO_FEATURE_FT_COMPRESS AND NOWHERE ELSE.  The value-writing
+ * folds are refused on a compressing build (ft_rekey_fold_value_ok), so the
+ * shape below never reaches the REPLACE arm there and passes with or without
+ * the fix.  MEASURED on that config: the fold shape is an exact discriminator
+ * over 1200 generated shapes -- 40 of 40 REPLACE folds RED, 0 of the other
+ * 1160 moves -- and the corpus goes 106 -> 0 at rank on.
+ */
+static int rekey_fold_replace_count(int ordered_list)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	enum cds_ft_status s;
+	int ret = -1, moved;
+
+	if (!cds_ft_merge_enabled()) {
+		diag("rekey_fold_replace_count: skipped, merge compiled out "
+			"(-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
+	/*
+	 * "b" holds two arms: 'c' (the src subtree, one key) and 'a' (the key
+	 * that stays).  The move lands at the ROOT's own 'a' slot, so the
+	 * resting node under 'b' survives and owes -1.
+	 */
+	ft = create_varlen_rankstats_list_ft(ordered_list, &group);
+	rcu_read_lock();
+	cds_ft_insert(ft, (const uint8_t *) "bca", 3, &node_alloc(1)->node);
+	cds_ft_insert(ft, (const uint8_t *) "baccc", 5, &node_alloc(2)->node);
+
+	/*
+	 * SERVED OR REFUSED: `-DNO_FEATURE_FT_SKIP_COMPRESSED` answers
+	 * NOT_SUPPORTED for this shape, and a refusal must leave the trie
+	 * exactly as it was.  Either way the aggregate must be right -- which
+	 * is the whole point here, since the wrong aggregate came with a
+	 * correct key set and a correct cds_ft_count_keys.
+	 */
+	s = ft_rekey(ft, "a", "bc");
+	moved = (s == CDS_FT_STATUS_OK);
+	if ((s != CDS_FT_STATUS_OK && s != CDS_FT_STATUS_NOT_SUPPORTED) ||
+	    ft_test_has_key(ft, "aa") != moved ||
+	    ft_test_has_key(ft, "bca") == moved ||
+	    !ft_test_has_key(ft, "baccc") ||
+	    cds_ft_count_keys(ft) != 2 ||
+	    cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr,
+			"fold_replace_count(list=%d): %s count %lu (want 2)\n",
+			ordered_list, cds_ft_status_to_string(s),
+			cds_ft_count_keys(ft));
+		goto out;
+	}
+	ret = 0;
+out:
+	rcu_read_unlock();
+	drain_trie(ft);
+	rcu_barrier();
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+static int test_rekey_fold_replace_count(void)
+{
+	int ret = 0;
+
+	ret |= rekey_fold_replace_count(0);
+	ret |= rekey_fold_replace_count(1);
 	return ret;
 }
 
@@ -37243,6 +37329,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_rekey_collapse_one_slot_two_kinds);
 	RUN_TEST(test_rekey_count_walk_after_detach);
 	RUN_TEST(test_rekey_displaced_external_dst);
+	RUN_TEST(test_rekey_fold_replace_count);
 	RUN_TEST(test_rekey_merge_colocated_chain);
 	RUN_TEST(test_rekey_merge_cut_source);
 	RUN_TEST(test_rekey_merge_dst_run_start);
