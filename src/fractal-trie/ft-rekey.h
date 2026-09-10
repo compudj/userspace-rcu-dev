@@ -4782,14 +4782,26 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 				goto bail_build;
 			}
 			/*
-			 * RE-VALIDATE the survivor against the drop's own RAW
-			 * expected-old.  Both are raw words, and this is the
-			 * only statement that the body read at PLAN time is the
-			 * body still there at BUILD time.
+			 * RE-VALIDATE the body read at PLAN time.
+			 *
+			 * ☠ THE SURVIVOR IDENTITY IS NOT ENOUGH ON ITS OWN, and
+			 * an earlier version of this comment claimed it was.
+			 * ft_node_other_child returns the FIRST child that is not
+			 * the excluded one, so a THIRD child added at a higher
+			 * ordinal -- or a co-located KEY added to the resting
+			 * node -- leaves `surv2 == fold_surv && sb2 ==
+			 * fold_surv_byte` perfectly true while the collapse
+			 * premise (exactly two children, no keys) has gone.  So
+			 * the SHAPE is re-asserted here too, and only now is
+			 * "the body read at plan time is the body still there"
+			 * something this block actually establishes.
 			 */
 			if (!ft_node_other_child(climb_rest, fold_drop_expected,
 					&sb2, &surv2) || surv2 != fold_surv ||
-					sb2 != fold_surv_byte) {
+					sb2 != fold_surv_byte ||
+					!ft_rekey_collapse_shape(ft,
+						cds_ft_item_to_metadata(
+							ft_node_ptr(climb_rest)))) {
 				ret = -EAGAIN;	/* stale plan: re-descend */
 				goto bail_build;
 			}
@@ -4853,9 +4865,25 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 			txn->pending_del_expected = climb_rest;
 			txn->pending_del_replace = coll;
 			/*
+			 * ...and SAY it is fresh.  The sweep must not infer that
+			 * from "there is a substitution": PROMOTE substitutes a
+			 * live app-owned head and owes a RECORDED re-parent.
+			 */
+			txn->pending_del_replace_fresh = true;
+			/*
 			 * ...and the CANONICAL word for the slot the copy loop
-			 * will wire.  The sweep needs the PLAIN flag to reach
-			 * the right node; the slot then takes the skip form.
+			 * will wire.
+			 *
+			 * ☞ WHY THE SWEEP NEEDS THE PLAIN FLAG, correctly stated:
+			 * NOT because the skip spelling depends on the parent or
+			 * slot offset -- ft_publish_compressed is
+			 * ft_skip_compressed_flag(cn->child, cn->len), computed
+			 * here and independent of both.  It is because RESOLVING
+			 * a skip word goes through its child's BACK EDGE, and
+			 * this run's child edge is DEFERRED until the flip: a
+			 * sweep handed the skip form would resolve it to
+			 * whatever that child still points at.  So the sweep
+			 * gets the plain flag and the SLOT takes the skip form.
 			 */
 			if (ft_node_compressed(coll))
 				txn->pending_del_replace_pub =

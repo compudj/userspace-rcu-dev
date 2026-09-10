@@ -2410,11 +2410,18 @@ skip_copy:
 					 * the step that took the word still owes
 					 * its release.
 					 */
-				if (retire_txn->pending_del_replace &&
+				if (retire_txn->pending_del_replace_fresh &&
+						retire_txn->pending_del_replace &&
 						iter == retire_txn->pending_del_replace) {
 					/*
-					 * ☠ A SUBSTITUTED FRESH CLUSTER: its back
-					 * edge is a PLAIN STORE.  No reader can reach
+					 * ☠ A SUBSTITUTED FRESH CLUSTER -- and
+					 * @pending_del_replace_fresh is what says
+					 * so, because the FOLD'S OTHER modes
+					 * substitute values that are NOT fresh
+					 * (PROMOTE hands over a LIVE, app-owned
+					 * external head).  Only for a cluster this
+					 * build owns is the back edge a PLAIN
+					 * STORE.  No reader can reach
 					 * it until this copy is published, and the txn
 					 * publishes REACHABILITY, not interiors.  A
 					 * recorded re-parent would plant an MW
@@ -2469,11 +2476,18 @@ skip_copy:
 					 * never in the DLM set" is true of this
 					 * recompaction and false of the op.
 					 */
-				if (retire_txn->pending_del_replace &&
+				if (retire_txn->pending_del_replace_fresh &&
+						retire_txn->pending_del_replace &&
 						iter == retire_txn->pending_del_replace) {
 					/*
-					 * ☠ A SUBSTITUTED FRESH CLUSTER: its back
-					 * edge is a PLAIN STORE.  No reader can reach
+					 * ☠ A SUBSTITUTED FRESH CLUSTER -- and
+					 * @pending_del_replace_fresh is what says
+					 * so, because the FOLD'S OTHER modes
+					 * substitute values that are NOT fresh
+					 * (PROMOTE hands over a LIVE, app-owned
+					 * external head).  Only for a cluster this
+					 * build owns is the back edge a PLAIN
+					 * STORE.  No reader can reach
 					 * it until this copy is published, and the txn
 					 * publishes REACHABILITY, not interiors.  A
 					 * recorded re-parent would plant an MW
