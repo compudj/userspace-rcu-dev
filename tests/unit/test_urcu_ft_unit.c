@@ -69,13 +69,13 @@
 #endif
 
 /*
- * 326 unconditional + 51 fault-injection-only RUN_TEST registrations, on top of
+ * 327 unconditional + 51 fault-injection-only RUN_TEST registrations, on top of
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (385 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (386 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (334 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (335 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -13381,6 +13381,107 @@ out:
 	rcu_barrier();
 	cds_ft_destroy(ft);
 	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
+ * THE FOLD'S TWO VALUE-WRITING MODES, on a COMPRESSING build.
+ *
+ * A same-trie move can fold its src-side drop into the graft's own copy of
+ * @graft_c.  Three of the four modes write something into the dropped slot, and
+ * two of them -- PROMOTE (the slot takes the resting node's external chain
+ * head) and REPLACE (it takes a DEL-recompacted copy of the resting node) --
+ * were refused wherever FEATURE_FT_COMPRESS was on, by a predicate that no
+ * longer exists.  Its stated reason was a SKIP_X dual that only a publish can
+ * record; the fold makes no publish.
+ *
+ * ☠ THE REASON WAS ALREADY FALSE: a dual arises only when the PUBLISH PARENT is
+ * compressed, and ft_rekey_fold_shape_ok refuses a compressed or skip-encoded
+ * @graft_c outright.  What the guard was really holding back was a LIVELOCK --
+ * the REPLACE arm looked its drop slot up with the RESOLVED child flag while
+ * the slot holds the SKIP-ENCODED word, so "stale plan: re-descend" could never
+ * clear.  Both are fixed; these are the shapes that prove it.
+ *
+ * Drawn from the corpus: arming the modes turned exactly 35 of 3000 generated
+ * shapes from NOT_SUPPORTED to OK on the default build and none the other way,
+ * and 14 + 21 of them are these two modes' own consumption counts.  A
+ * regression to the guard turns both legs into NOT_SUPPORTED; a regression to
+ * the lookup HANGS them, which is why the suite's own timeout is the second
+ * witness here.
+ */
+static int rekey_fold_writes_value(int ordered_list, int mode)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	enum cds_ft_status s;
+	/* PROMOTE: "b" is a co-located key at the resting node. */
+	const char *const promote[] = { "bbbab", "b", NULL };
+	/* REPLACE: the resting node keeps a child, so its copy survives. */
+	const char *const replace[] = { "bac", "bb", "b", NULL };
+	const char *const *keys = mode ? replace : promote;
+	const char *dst = mode ? "ca" : "a";
+	const char *src = "bb";
+	const char *moved_to = mode ? "ca" : "abab";
+	const char *moved_from = mode ? "bb" : "bbbab";
+	unsigned long n = 0;
+	int ret = -1, i;
+
+	if (!cds_ft_merge_enabled()) {
+		diag("rekey_fold_writes_value: skipped, merge compiled out "
+			"(-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
+	if (cds_ft_group_attr_create(&attr) < 0)
+		return -1;
+	if (cds_ft_group_attr_set_ordered_list(attr, ordered_list) < 0 ||
+	    cds_ft_group_create(attr, &group) < 0) {
+		cds_ft_group_attr_destroy(attr);
+		return -1;
+	}
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &ft) < 0) {
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	rcu_read_lock();
+	for (i = 0; keys[i]; i++) {
+		cds_ft_insert(ft, (const uint8_t *) keys[i], strlen(keys[i]),
+			&node_alloc((unsigned long) i + 1)->node);
+		n++;
+	}
+	s = ft_rekey(ft, dst, src);
+	if (s != CDS_FT_STATUS_OK ||
+	    !ft_test_has_key(ft, moved_to) ||
+	    ft_test_has_key(ft, moved_from) ||
+	    !ft_test_has_key(ft, "b") ||
+	    (mode && !ft_test_has_key(ft, "bac")) ||
+	    cds_ft_count_keys(ft) != n ||
+	    cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr,
+			"fold_writes_value(list=%d mode=%s): %s count %lu (want %lu)\n",
+			ordered_list, mode ? "REPLACE" : "PROMOTE",
+			cds_ft_status_to_string(s), cds_ft_count_keys(ft), n);
+		goto out;
+	}
+	ret = 0;
+out:
+	rcu_read_unlock();
+	drain_trie(ft);
+	rcu_barrier();
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+static int test_rekey_fold_writes_value(void)
+{
+	int ret = 0;
+
+	ret |= rekey_fold_writes_value(0, 0);
+	ret |= rekey_fold_writes_value(1, 0);
+	ret |= rekey_fold_writes_value(0, 1);
+	ret |= rekey_fold_writes_value(1, 1);
 	return ret;
 }
 
@@ -37443,6 +37544,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_rekey_displaced_external_dst);
 	RUN_TEST(test_rekey_fold_replace_count);
 	RUN_TEST(test_rekey_split_cluster_count);
+	RUN_TEST(test_rekey_fold_writes_value);
 	RUN_TEST(test_rekey_merge_colocated_chain);
 	RUN_TEST(test_rekey_merge_cut_source);
 	RUN_TEST(test_rekey_merge_dst_run_start);

@@ -1249,52 +1249,41 @@ bool ft_rekey_move_folded(const struct ft_flip_txn *txn,
 }
 
 /*
- * MAY A FOLD THAT *WRITES A VALUE* INTO @graft_c'S SLOT RUN ON THIS BUILD?
+ * ☑ THE VALUE-WRITING FOLDS RUN ON EVERY BUILD.  There used to be a predicate
+ * here -- ft_rekey_fold_value_ok, false wherever FEATURE_FT_COMPRESS was on --
+ * refusing the two modes whose fold WRITES a value into @graft_c's slot
+ * (REPLACE, PROMOTE) on the grounds that such a slot may owe a SKIP_X DUAL: a
+ * second, skip-encoded path to the same child, which only a PUBLISH records,
+ * and this fold makes no publish.
  *
- * ☠ NOT WITH PATH COMPRESSION, and it is ONE reason for BOTH value-writing
- * modes -- a CONTRACT, not a preference.  A slot on a compressed build may owe
- * a SKIP_X DUAL: a second, skip-encoded path to the same child, which the
- * PUBLISH that installs the value is what records.
+ * ☠ THE PREMISE WAS ALREADY FALSE, and the tree said so one predicate down: a
+ * dual arises only when the PUBLISH PARENT is compressed, and
+ * ft_rekey_fold_shape_ok below refuses a compressed or skip-encoded @graft_c
+ * and @edited outright.  The fold's slot lives in @graft_c.  No dual is owed.
+ * (ft_rekey_collapse_shape's header states exactly this argument for the
+ * COLLAPSE mode -- which has been armed on compressing builds since @b60510f3,
+ * 55 times per corpus, committing cleanly -- and the argument never depended on
+ * which mode was asking.)
  *
- *   - REPLACE's value comes from ft_node_recompact's DEL arm, whose own header
- *     says it "defers the dual entirely" BECAUSE its caller republishes through
- *     _ft_publish_to_parent and that is what records it.
- *   - PROMOTE's value is an external chain head, and ft_detach_node's own
- *     promote arm records the dual explicitly for exactly that case
- *     (ft-remove.h, the compressed-parent external promote).
+ * ☠ WHAT THE GUARD WAS REALLY HOLDING BACK was a LIVELOCK, and it is fixed
+ * below: the REPLACE arm looked its drop slot up with @fold_drop_child, the
+ * RESOLVED flag, while the slot holds the SKIP-ENCODED word -- so
+ * ft_node_find_child, which compares RAW WORDS, could never match, "stale plan:
+ * re-descend" could never clear, and the op spun for ever refilling its
+ * reserve.  ATTRIBUTED, not assumed: armed with that argument reverted, the
+ * 3000-shape corpus wedges at seed ~324 (rc=124 in a 4G cage); with it, the
+ * corpus completes.
  *
- * This fold makes NO publish: the copy loop stores the value into @graft_c's
- * body verbatim.  So a dual either mode owes is simply never written.
- *
- * ☞ THE DROP MODE IS UNAFFECTED and stays armed everywhere: it writes NOTHING
- * into the slot, and a slot that is gone owes no encoding.  That asymmetry is
- * the whole rule -- the debt belongs to the VALUE, not to the fold.
- *
- * MEASURED, and neither is subtle.  REPLACE admitted on the default build:
- * single-threaded, the op retries for ever, re-filling the node reserve each
- * attempt, RSS climbing ~20 MB/s.  PROMOTE admitted there: single-threaded it
- * looks CLEAN and passes every suite -- and under the documented-safe COARSE
- * writer strategy with four concurrent point writers it never returns, at
- * 6.3 GB after 12 seconds.  Both are CLEANLY REFUSED without this guard, so
- * admitting either trades a refusal for a hang.
- *
- * Producing the SKIP_X-encoded slot word FROM the fold is the piece of work
- * that lifts this, and it is the same open item the fused chain-compress
- * collapse needs -- both want a fold whose value is a compressed encoding
- * rather than a plain node pointer.  Until then the value-writing modes serve
- * the builds that own no dual, which is where the uncollapsed chains this whole
- * feature is about actually live.
+ * MEASURED at the arming, 3000 shapes x rank on/off x list on/off, on
+ * --enable-rcu-debug default / nocompress / noskip and on release: default and
+ * release 2597 -> 2632 served, noskip 2557 -> 2649, nocompress unchanged (it
+ * never had the guard), and ZERO failures on every leg.  The +35 on the default
+ * build is exactly the two modes' own counts -- PROMOTE armed and consumed 14,
+ * REPLACE 21 -- so the modes are not merely admitted, they FIRE.
+ * Concurrently, on the default build under the documented-safe COARSE strategy
+ * with four perturbers on 2 cpus, 12 x 5 s: 12/12 clean on both arms, and the
+ * armed arm completes MORE moves (214 vs 195).
  */
-static inline
-bool ft_rekey_fold_value_ok(const struct cds_ft *ft)
-{
-	(void) ft;
-#ifdef FEATURE_FT_COMPRESS
-	return false;
-#else
-	return true;
-#endif
-}
 
 /*
  * THE SHAPE BOTH FOLD MODES REQUIRE, in one expression so they cannot drift.
@@ -1331,11 +1320,12 @@ bool ft_rekey_fold_value_ok(const struct cds_ft *ft)
  * shape, the plain REPLACE is correct, and this must stay false so that arm
  * reads exactly as it did.
  *
- * ☞ AND IT DOES NOT CONSULT ft_rekey_fold_value_ok.  That guard exists for a
- * SKIP_X dual, and a dual only arises when the PUBLISH PARENT is compressed --
- * which ft_rekey_fold_shape_ok already refuses for both @graft_c and @edited.
- * The collapsed run's slot is in @graft_c, so no dual is owed and the guard has
- * nothing to say about this mode.
+ * ☞ AND IT ASKED NO BUILD QUESTION.  A SKIP_X dual arises only when the PUBLISH
+ * PARENT is compressed -- which ft_rekey_fold_shape_ok refuses for both
+ * @graft_c and @edited -- and the collapsed run's slot is in @graft_c, so no
+ * dual is owed.  That argument was written here for this mode and it is what
+ * later retired the build guard for the OTHER two (see above): it never
+ * depended on which mode was asking.
  */
 static inline
 bool ft_rekey_collapse_shape(const struct cds_ft *ft,
@@ -4107,9 +4097,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		slot = ft_resolve_parent_slot(rm, ft, &rest_parent);
 		if (slot && rest_parent == graft_c &&
 				rcu_dereference(*slot) == climb_rest &&
-				ft_meta_nr_child(rm) >= 2 &&
-				(ft_rekey_collapse_shape(ft, rm) ||
-					ft_rekey_fold_value_ok(ft))) {
+				ft_meta_nr_child(rm) >= 2) {
 			/*
 			 * REPLACE: the resting node SURVIVES the drop, so the
 			 * value the slot takes is a DEL-recompacted copy of it.
@@ -4180,8 +4168,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 			}
 		} else if (slot && rest_parent == graft_c &&
 				rcu_dereference(*slot) == climb_rest &&
-				ft_meta_nr_child(rm) == 1 && rm->external_nodes &&
-				ft_rekey_fold_value_ok(ft)) {
+				ft_meta_nr_child(rm) == 1 && rm->external_nodes) {
 			struct cds_ft_node *head =
 				ft_dereference_external(rm->external_nodes);
 
@@ -4913,7 +4900,25 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 				ret = -EAGAIN;
 				goto bail_build;
 			}
-			if (!ft_node_find_child(ft, climb_rest, fold_drop_child,
+			/*
+			 * ☠ THE ENCODED WORD, NOT THE RESOLVED FLAG.
+			 * ft_node_find_child compares RAW WORDS (ft-lookup-node.h
+			 * says so), and this slot may hold the SKIP-ENCODED form
+			 * of the same child.  @fold_drop_child is the resolved
+			 * flag; the arming already kept the word the slot
+			 * actually holds in @fold_drop_expected.  Handed the
+			 * resolved one, the two can never be equal on a skip
+			 * group: "stale plan: re-descend" NEVER clears, and the
+			 * op spins for ever re-filling its node reserve -- the
+			 * hang that kept both value-writing modes refused on a
+			 * compressing build.  ☞ the note at
+			 * ft_rekey_fold_shape_ok for the attribution run.
+			 *
+			 * ★ Same law as the glue's skip identity: SPEAK THE
+			 * SLOT'S ENCODED WORD when comparing or storing, and the
+			 * node it DENOTES when reasoning about identity.
+			 */
+			if (!ft_node_find_child(ft, climb_rest, fold_drop_expected,
 					&rn, NULL)) {
 				ret = -EAGAIN;	/* stale plan: re-descend */
 				goto bail_build;
