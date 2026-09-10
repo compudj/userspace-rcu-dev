@@ -3148,17 +3148,37 @@ struct cds_ft_inode_flag *ft_publish_compressed(struct cds_ft *ft,
  * already argues for at its own stamp ("Publish the up-walk key byte BEFORE the
  * parent pointer ... a concurrent up-walk that follows the new parent would read
  * the still-stale byte"): a reader that reaches the head through its NEW parent
- * must not find the OLD byte.  The converse window -- a reader still on the OLD
- * parent reading the NEW byte -- is what the two CROSS-TRIE stamp sites avoid by
- * stamping while the cell is "in NEITHER list and structurally invisible"
- * (ft-merge.h, ft-rekey.h's subpos_inplace).  An IN-TRIE move has no such
- * moment: its cells are live in the very list being rebuilt.  So this placement
- * inherits exactly the window every LIVE re-parent through
- * ft_reparent_record_meta already carries, and it replaces a PERMANENTLY wrong
- * key with a transiently wrong one.  Closing the window needs the byte to ride
- * the commit, which its own word cannot do today: it shares a 32-bit word with
- * @alloc_index, with no room for a parked descriptor pointer, and the up-walk
- * reads it raw.
+ * must not find the OLD byte.
+ *
+ * ★★★ WHY A PLAIN STORE IS THE RIGHT SHAPE HERE, AND WHY THE BYTE MUST NOT BE
+ * PUT IN THE TXN.  THE RULE A REKEY WORKS BY IS THAT THE MOVED TOP GETS A FRESH
+ * ADDRESS -- ft_rekey_cow_stop's whole purpose -- so every back edge written on
+ * it, the parent word and this byte alike, is a plain store into an object NO
+ * READER CAN SEE YET, published atomically by the one commit.  That is what
+ * makes txn membership unnecessary, and ft_store_at_graft_point_commit states
+ * it at the sibling store: "A plain store, because the payload is INVISIBLE
+ * until the forward publish below -- ... the rekey fold hands over a fresh COW
+ * copy."  A byte that rode the commit would be solving a problem the COW has
+ * already solved for every top that gets one.
+ *
+ * ☠ THE ONE TOP THAT GETS NO COPY IS THE BARE EXTERNAL HEAD: it is APP-OWNED,
+ * so @s_top_prime == @s_top and the writes land on a LIVE object that stays
+ * reachable at the SOURCE for the whole build window.  That is exactly what
+ * @payload_live exists for -- it routes the head's PARENT word through the txn
+ * instead of plain-storing it (ft-graft.h) -- and the byte has no such route.
+ * So for a bare head, and ONLY for it, this store is reader-visible ahead of the
+ * publish and is not undone by an abort.
+ *
+ * ☞ AND THE CURE IS THE SAME RULE ONE LEVEL DOWN, not a transacted byte.  The
+ * byte does not live in the application's cds_ft_node: it lives in the head's
+ * ORDERED CELL, which is LIBRARY-allocated (ft_ord_cell_alloc) and therefore
+ * CAN be copied.  Giving the moved head a FRESH CELL -- stamped while invisible,
+ * published by the same commit that re-parents it, the old cell retired after a
+ * grace period -- restores the fresh-address property for the one word that
+ * lacks it, and rides the ordered-list splice the rekey already performs for
+ * that cell.  Transacting @incoming_byte would not work anyway: it shares a
+ * 32-bit word with @alloc_index, with no room for a parked descriptor pointer,
+ * and the up-walk reads it raw.
  */
 static inline
 void ft_head_stamp_incoming_byte(const struct cds_ft *ft,
@@ -3213,7 +3233,12 @@ void ft_head_stamp_incoming_byte(const struct cds_ft *ft,
 				parent, slot);
 	}
 	prev = ft_dereference_prev_resolved(en);
-	if (!prev)
+	/*
+	 * FT_ORD_CELL_TAG: only a duplicate-chain HEAD owns a cell.  A demoted
+	 * duplicate's prev names its chain predecessor LEAF and must not be read
+	 * as one -- see the same guard at the rekey's own head stamp.
+	 */
+	if (!prev || !((uintptr_t) prev & FT_ORD_CELL_TAG))
 		return;
 	cds_ft_item_to_metadata(ft_ord_cell_ptr(prev))->incoming_byte = byte;
 }

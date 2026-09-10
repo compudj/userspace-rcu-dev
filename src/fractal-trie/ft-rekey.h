@@ -5379,6 +5379,77 @@ cells_done:
 #endif
 	}
 
+	/*
+	 * ☠ THE MOVED HEAD'S KEY CHANGED, so its cell's edge byte is re-stamped
+	 * HERE, from the DESTINATION KEY, for BOTH arms and EVERY landing.
+	 *
+	 * @incoming_byte's invariant is "the last byte of this head's KEY", and
+	 * INSERT establishes it that way unconditionally (ft-insert.h,
+	 * `= key[key_len - 1]`) -- for a PREFIX head just as much as for a slot
+	 * head, even though the up-walk reads it only for the latter.  Every
+	 * KEY-INVARIANT re-home downstream RELIES on that: ft_park_live_parent_edge
+	 * (a split), the remove's DETACH_UNCHAIN and DETACH_CN_PARENT promote, and
+	 * ft_record_child_back_edge all move a head between a prefix position and a
+	 * body slot carrying the byte along, and re-derive nothing -- correctly,
+	 * because the key did not change.
+	 *
+	 * ft_head_stamp_incoming_byte cannot serve this one.  It derives the byte
+	 * from (@parent_nf, @slot), which answers the question only for a BODY
+	 * SLOT; for a prefix landing the head's key is path(parent), whose last
+	 * byte is NOT derivable there -- the parent's own @incoming_byte is
+	 * documented UNUSED under a compressed grandparent (ft_set_parent), so the
+	 * generic placement primitive would have to climb.  This site has the
+	 * answer outright, which is exactly why the two CROSS-TRIE sites stamp
+	 * `okey_dst[dst_key_len - 1]` directly (ft-merge.h, ft_rekey_subpos_inplace)
+	 * instead of going through a placement helper.
+	 *
+	 * ☞ AND IT IS A PLAIN STORE ON PURPOSE.  A rekey gives its moved top a
+	 * FRESH ADDRESS (ft_rekey_cow_stop), which is what makes every back-edge
+	 * write on it a plain store into something invisible and removes any need
+	 * to put this byte in the txn.  The BARE EXTERNAL HEAD is the one top that
+	 * gets no copy -- it is app-owned -- so here alone the store is
+	 * reader-visible ahead of the publish; @payload_live already routes the
+	 * head's PARENT word through the txn for that reason and there is no such
+	 * route for a byte.  The cure is the same rule one level down -- the head's
+	 * ORDERED CELL is library-allocated and CAN be copied -- not a transacted
+	 * byte.  ☞ ft_head_stamp_incoming_byte's header.
+	 *
+	 * ☠ MEASURED, all four builds, and the SLOT-only stamp is what left it:
+	 *     insert "q","am","an","z1";  rekey_merge(dst "z", src "q")  -> OK
+	 *     remove "z1"                       -> count 3, cds_ft_verify CLEAN
+	 *     the walk then emits "q", which is NOT IN THE TRIE
+	 * The head lands as the PREFIX head of z1's holder, keeps 'q', and the
+	 * remove's promote carries it into a body slot where the walk reads it.
+	 * Same shape as the compressed-parent case one commit earlier: the byte is
+	 * unread AT THE LANDING and read after the next ordinary mutation, so
+	 * "does this landing read it" is never the right question.
+	 */
+	if (s_top_external && ft->ordered_list) {
+		void *head_prev = ft_dereference_prev_resolved(
+			(struct cds_ft_node *) s_top);
+
+		/*
+		 * ☠ ONLY A DUPLICATE-CHAIN HEAD OWNS A CELL.  The order links live
+		 * in a cell "hung off each duplicate-chain head's cds_ft_node.prev"
+		 * (fractal-trie-internal.h, @ordered_list_set); a head that COLLIDED
+		 * with a key already at the destination is spliced onto that key's
+		 * chain and DEMOTED, and its prev then names its chain predecessor,
+		 * not a cell.  It needs no byte either -- the walk materialises the
+		 * whole chain from the CHAIN HEAD's cell.
+		 *
+		 * FT_ORD_CELL_TAG decides it and is unambiguous by construction: the
+		 * cell arena is 1<<FT_ORD_CELL_ALLOC_ORDER-aligned so a cell keeps
+		 * bits 0-2 clear, and a leaf pointer has bit 0 clear.
+		 *
+		 * MEASURED: without this, {"ab" a bare head, "b" already a key} +
+		 * rekey_merge(dst "b", src "ab") SEGVs in cds_ft_item_to_metadata --
+		 * prev was the predecessor LEAF (tag 0), read as a cell.  Found by a
+		 * 3000-shape corpus walk oracle, not by the unit tests.
+		 */
+		if (head_prev && ((uintptr_t) head_prev & FT_ORD_CELL_TAG))
+			cds_ft_item_to_metadata(ft_ord_cell_ptr(head_prev))
+				->incoming_byte = dst_ord[dst_len - 1];
+	}
 	/* 4. ONE commit of the whole stitch (consumes txn). */
 #ifdef FEATURE_FT_FAULT_INJECT
 	/*

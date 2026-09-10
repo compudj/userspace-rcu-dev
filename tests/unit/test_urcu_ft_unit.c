@@ -69,13 +69,13 @@
 #endif
 
 /*
- * 320 unconditional + 51 fault-injection-only RUN_TEST registrations, on top of
+ * 321 unconditional + 51 fault-injection-only RUN_TEST registrations, on top of
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (379 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (380 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (328 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (329 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -12419,14 +12419,15 @@ static int test_rekey_merge_dst_run_start(void)
  * node, re-homing nothing it would have to stamp, and the same trie starts
  * spelling "axq".  Both halves are asserted below.
  */
-static int rekey_bare_head_upwalk_key(const char *dst, const char *splitter)
+static int rekey_bare_head_upwalk_key(const char *dst, const char *extra,
+		const char *post)
 {
 	struct cds_ft_group_attr *attr;
 	struct cds_ft_group *group;
 	struct cds_ft *ft;
 	struct cds_ft_iter *iter = NULL;
 	enum cds_ft_status s;
-	int pass, ret = -1;
+	int pass, nexp, ret = -1;
 
 	if (!cds_ft_merge_enabled()) {
 		diag("rekey_bare_head_upwalk_key: skipped, merge compiled out "
@@ -12451,6 +12452,15 @@ static int rekey_bare_head_upwalk_key(const char *dst, const char *splitter)
 	cds_ft_insert(ft, (const uint8_t *) "q", 1, &node_alloc(1)->node);
 	cds_ft_insert(ft, (const uint8_t *) "am", 2, &node_alloc(2)->node);
 	cds_ft_insert(ft, (const uint8_t *) "an", 2, &node_alloc(3)->node);
+	/*
+	 * @extra makes @dst a PROPER PREFIX of a key that already exists, so the
+	 * moved head lands as that holder's PREFIX head instead of in a body slot
+	 * -- the landing whose byte the up-walk does NOT read, and which a later
+	 * key-invariant re-home then carries into a slot where it does.
+	 */
+	if (extra)
+		cds_ft_insert(ft, (const uint8_t *) extra, strlen(extra),
+			&node_alloc(4)->node);
 
 	s = ft_rekey(ft, dst, "q");
 	if (s != CDS_FT_STATUS_OK) {
@@ -12465,12 +12475,37 @@ static int rekey_bare_head_upwalk_key(const char *dst, const char *splitter)
 	 * ordinary insert that splits whatever the head now hangs under, which
 	 * is what exposes a byte the first walk had no reason to read.
 	 */
+	nexp = extra ? 4 : 3;
 	for (pass = 0; pass < 2; pass++) {
 		int nr = 0;
 
 		if (pass == 1) {
-			cds_ft_insert(ft, (const uint8_t *) splitter,
-				strlen(splitter), &node_alloc(4)->node);
+			/*
+			 * '+key' SPLITS whatever the head hangs under; '-key'
+			 * REMOVES a sibling, promoting the head out of its prefix
+			 * position into a body slot.  Either way the walk now reads
+			 * a byte it had no reason to read before.
+			 */
+			if (post[0] == '+') {
+				cds_ft_insert(ft, (const uint8_t *) post + 1,
+					strlen(post + 1), &node_alloc(5)->node);
+				nexp++;
+			} else {
+				struct cds_ft_node *victim;
+
+				cds_ft_iter_set_key(iter, (const uint8_t *) post + 1,
+					strlen(post + 1));
+				if (cds_ft_lookup(ft, iter) != CDS_FT_STATUS_OK ||
+						(victim = cds_ft_iter_node(iter)) == NULL ||
+						cds_ft_remove(ft, iter, victim) !=
+							CDS_FT_STATUS_OK) {
+					fprintf(stderr, "bare_head_upwalk(%s): could "
+						"not remove \"%s\"\n", dst, post + 1);
+					goto out;
+				}
+				node_free_rcu(to_test_node(victim));
+				nexp--;
+			}
 		}
 		for (s = cds_ft_lookup_first(ft, iter); s == CDS_FT_STATUS_OK;
 				s = cds_ft_next(ft, iter)) {
@@ -12502,10 +12537,10 @@ static int rekey_bare_head_upwalk_key(const char *dst, const char *splitter)
 			}
 			nr++;
 		}
-		if (nr != 3 + pass || cds_ft_count_keys(ft) != (unsigned long) nr) {
+		if (nr != nexp || cds_ft_count_keys(ft) != (unsigned long) nr) {
 			fprintf(stderr, "bare_head_upwalk(%s) pass %d: walked %d, "
 				"count %lu, expected %d\n", dst, pass, nr,
-				cds_ft_count_keys(ft), 3 + pass);
+				cds_ft_count_keys(ft), nexp);
 			goto out;
 		}
 		if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
@@ -12561,6 +12596,109 @@ out:
 	return ret;
 }
 
+/*
+ * ☠ A MOVED BARE HEAD THAT COLLIDES IS DEMOTED, AND A DEMOTED HEAD OWNS NO CELL.
+ *
+ * The ordered list's links live in a cell "hung off each duplicate-chain head's
+ * cds_ft_node.prev" (fractal-trie-internal.h, @ordered_list_set).  A head moved
+ * onto a key that ALREADY EXISTS is spliced onto that key's chain and demoted,
+ * and its prev then names its chain PREDECESSOR LEAF -- not a cell.  Reading it
+ * as one SEGVs in cds_ft_item_to_metadata.
+ *
+ * That is what the head-byte stamp did before it tested FT_ORD_CELL_TAG, and it
+ * is worth its own test because the failure mode is a CRASH and because the
+ * whole upwalk-key test above drives non-colliding destinations only.  Found by
+ * a 3000-shape corpus walk oracle, not by any unit test; measured shape:
+ * {"ab" a bare head, "b", "bc"} + rekey_merge(dst "b", src "ab"), which leaves
+ * "b" a two-entry chain (3 entries, 2 keys).
+ */
+static int test_rekey_bare_head_collide_walk(void)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	struct cds_ft_iter *iter = NULL;
+	enum cds_ft_status s;
+	int nr = 0, ret = -1;
+
+	if (!cds_ft_merge_enabled()) {
+		diag("test_rekey_bare_head_collide_walk: skipped, merge compiled "
+			"out (-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
+	if (cds_ft_group_attr_create(&attr) < 0)
+		return -1;
+	if (cds_ft_group_attr_set_ordered_list(attr, 1) < 0 ||
+	    cds_ft_group_create(attr, &group) < 0) {
+		cds_ft_group_attr_destroy(attr);
+		return -1;
+	}
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &ft) < 0) {
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	rcu_read_lock();
+	/* "ab" is a whole key with nothing below: a BARE HEAD. */
+	cds_ft_insert(ft, (const uint8_t *) "ab", 2, &node_alloc(1)->node);
+	cds_ft_insert(ft, (const uint8_t *) "b", 1, &node_alloc(2)->node);
+	cds_ft_insert(ft, (const uint8_t *) "bc", 2, &node_alloc(3)->node);
+
+	/* dst "b" ALREADY EXISTS: the moved head collides and is DEMOTED. */
+	s = ft_rekey(ft, "b", "ab");
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "bare_head_collide: rekey refused (%s)\n",
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+	if (!ft_test_has_key(ft, "b") || !ft_test_has_key(ft, "bc") ||
+			ft_test_has_key(ft, "ab") ||
+			cds_ft_count_entries(ft) != 3 ||
+			cds_ft_count_keys(ft) != 2) {
+		fprintf(stderr, "bare_head_collide: b=%d bc=%d ab=%d entries %lu "
+			"keys %lu\n", ft_test_has_key(ft, "b"),
+			ft_test_has_key(ft, "bc"), ft_test_has_key(ft, "ab"),
+			cds_ft_count_entries(ft), cds_ft_count_keys(ft));
+		goto out;
+	}
+	if (cds_ft_iter_create(ft, &iter) != CDS_FT_STATUS_OK)
+		goto out;
+	for (s = cds_ft_lookup_first(ft, iter); s == CDS_FT_STATUS_OK;
+			s = cds_ft_next(ft, iter)) {
+		uint8_t k[64];
+		char emitted[sizeof k + 1];
+		size_t l = 0;
+
+		if (cds_ft_iter_get_key(iter, k, sizeof k, &l) !=
+				CDS_FT_STATUS_OK || l > sizeof k)
+			goto out;
+		memcpy(emitted, k, l);
+		emitted[l] = '\0';
+		if (!ft_test_has_key(ft, emitted)) {
+			fprintf(stderr, "bare_head_collide: the walk emitted "
+				"\"%s\", which is NOT IN THE TRIE\n", emitted);
+			goto out;
+		}
+		nr++;
+	}
+	/* Two distinct KEYS survive: "b" (now a 2-entry chain) and "bc". */
+	if (nr != 2 || cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "bare_head_collide: walked %d (expected 2)\n", nr);
+		goto out;
+	}
+	ret = 0;
+out:
+	rcu_read_unlock();
+	if (iter)
+		cds_ft_iter_destroy(iter);
+	if (drain_trie(ft) < 0)
+		ret = -1;
+	rcu_barrier();
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
 static int test_rekey_bare_head_upwalk_key(void)
 {
 	/*
@@ -12569,17 +12707,36 @@ static int test_rekey_bare_head_upwalk_key(void)
 	 * new chain, and a run the move has to BRANCH.  Each splitter splits
 	 * whatever that geometry left the head under.
 	 */
-	static const char *const cases[][2] = {
-		{ "z",    "zq"   },	/* root slot                      */
-		{ "ax",   "axq"  },	/* slot of an existing node       */
-		{ "axy",  "axz"  },	/* inside a run -> LATENT case    */
-		{ "zzz",  "zzq"  },	/* deep new chain                 */
-		{ "zqp",  "zqr"  },	/* long dst off the root          */
+	static const char *const cases[][3] = {
+		/* dst    extra key   what to do before the SECOND walk */
+
+		/* SLOT landings: the head goes straight into a body slot. */
+		{ "z",    NULL,       "+zq"    },	/* root slot                */
+		{ "ax",   NULL,       "+axq"   },	/* slot of an existing node */
+		{ "axy",  NULL,       "+axz"   },	/* inside a run: LATENT     */
+		{ "zzz",  NULL,       "+zzq"   },	/* deep new chain           */
+		{ "zqp",  NULL,       "+zqr"   },	/* long dst off the root    */
+
+		/*
+		 * PREFIX landings, and they are the ones a SLOT-only stamp
+		 * misses: @dst is a proper prefix of @extra, so the head becomes
+		 * that holder's PREFIX head -- a position whose byte the up-walk
+		 * does not read.  Removing the sibling PROMOTES the head into a
+		 * body slot, and a key-invariant promote re-derives nothing, so a
+		 * byte left stale at the landing surfaces there.
+		 */
+		{ "z",    "z1",       "-z1"    },	/* prefix of a root child   */
+		{ "ax",   "ax1",      "-ax1"   },	/* prefix at depth 2        */
+		{ "a",    "ab",       "-ab"    },	/* prefix of an existing node */
+		{ "z",    "zz",       "-zz"    },	/* prefix of a bare head    */
+		{ "axy",  "axyz",     "-axyz"  },	/* prefix inside a run      */
+		{ "axy",  "axyz",     "+axz"   },	/* prefix, then SPLIT it    */
 	};
 	unsigned int i;
 
 	for (i = 0; i < CAA_ARRAY_SIZE(cases); i++)
-		if (rekey_bare_head_upwalk_key(cases[i][0], cases[i][1]))
+		if (rekey_bare_head_upwalk_key(cases[i][0], cases[i][1],
+				cases[i][2]))
 			return -1;
 	return 0;
 }
@@ -36664,6 +36821,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_rekey_merge_cut_source);
 	RUN_TEST(test_rekey_merge_dst_run_start);
 	RUN_TEST(test_rekey_bare_head_upwalk_key);
+	RUN_TEST(test_rekey_bare_head_collide_walk);
 	RUN_TEST(test_rekey_count_root_relocation);
 	RUN_TEST(test_merge_rekey_same_trie_speculative_rejected);
 	RUN_TEST(test_rekey_graft_vs_merge);
