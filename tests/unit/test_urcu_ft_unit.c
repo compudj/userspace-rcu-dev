@@ -11757,11 +11757,18 @@ static enum cds_ft_status ft_rekey(struct cds_ft *ft, const char *nw,
  * only witness of this class, so an inexact 5 here is the regression.  The
  * default-trie arm still pins step 3's admission unchanged (no aggregate to
  * lose, and the gate must never widen into a blanket refusal).
+ *
+ * ☑ THE RANK-STATS ARMS ARE SERVED SINCE @8608ed06 and expect the SAME answer
+ * as the default one.  They were NOT_SUPPORTED for two successive reasons --
+ * a chain-compress key loss (@148b0f71) and then the nr_keys accounting, whose
+ * last two faces were the split cluster's count and the walk that charges it.
+ * Every arm now checks the aggregate, because the aggregate is the only thing
+ * that ever went wrong here while the key set stayed right.
  */
-static int test_rekey_bare_head_rankstats_refused(void)
+static int test_rekey_bare_head_rankstats(void)
 {
 	if (!cds_ft_merge_enabled()) {
-		diag("test_rekey_bare_head_rankstats_refused: skipped, merge "
+		diag("test_rekey_bare_head_rankstats: skipped, merge "
 			"compiled out (-DNO_FEATURE_FT_MERGE)");
 		return 0;
 	}
@@ -11786,41 +11793,28 @@ static int test_rekey_bare_head_rankstats_refused(void)
 		cds_ft_insert(ft, (const uint8_t *) "azq", 3, &node_alloc(5)->node);
 
 		s = ft_rekey(ft, "az", "q");
-		if (rank) {
-			/*
-			 * REFUSED, and the trie is UNTOUCHED by it: "q" still
-			 * resolves and the count is exact.  A pass here is the
-			 * absence of the key loss the refusal exists to
-			 * prevent, so check the key, not just the status.
-			 */
-			if (s != CDS_FT_STATUS_NOT_SUPPORTED ||
-			    !ft_test_has_key(ft, "q") ||
-			    ft_test_has_key(ft, "az") ||
-			    cds_ft_count_keys(ft) != 5) {
-				fprintf(stderr, "bare-head[%u] rank: %s count %lu\n",
-					i, cds_ft_status_to_string(s),
-					cds_ft_count_keys(ft));
-				goto next;
-			}
-		} else if (s != CDS_FT_STATUS_OK ||
+		if (s != CDS_FT_STATUS_OK ||
 		    !ft_test_has_key(ft, "az") ||
 		    ft_test_has_key(ft, "q") ||
 		    cds_ft_count_keys(ft) != 5) {
-			fprintf(stderr, "bare-head[%u]: %s count %lu\n",
-				i, cds_ft_status_to_string(s),
+			fprintf(stderr, "bare-head[%u] rank=%d: %s count %lu\n",
+				i, (int) rank, cds_ft_status_to_string(s),
 				cds_ft_count_keys(ft));
 			goto next;
 		}
 		if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK)
 			goto next;
 		/*
-		 * ☠ THE DEEPER SHAPE THE REFUSAL REALLY GUARDS.  A survivor
-		 * chain of MORE THAN ONE level makes the collapse absorb
-		 * several nodes into one run, and the chain-compress kind
-		 * conflict then DROPS the surviving child's re-parent: OK
-		 * returned, count 3, verify RED, and the moved key reachable
-		 * at NEITHER key -- ORPHANED.  Pin it here so lifting the
-		 * refusal on count evidence alone cannot pass this test.
+		 * ☑ THE DEEPER SHAPE THE REFUSAL USED TO GUARD, now SERVED and
+		 * pinned as served.  A survivor chain of MORE THAN ONE level
+		 * makes the collapse absorb several nodes into one run, and the
+		 * chain-compress kind conflict used to DROP the surviving
+		 * child's re-parent: OK returned, count 3, verify RED, and the
+		 * moved key reachable at NEITHER name -- ORPHANED.  That is
+		 * @148b0f71's defect; what this arm asserts now is the whole
+		 * answer -- OK, the key at its NEW name and gone from the old,
+		 * the count exact and verify clean -- so a regression to either
+		 * the orphan or the aggregate reddens it.
 		 */
 		if (rank) {
 			struct cds_ft_group *g2;
@@ -11836,16 +11830,20 @@ static int test_rekey_bare_head_rankstats_refused(void)
 			cds_ft_insert(f2, (const uint8_t *) "xabzn", 5,
 				&node_alloc(8)->node);
 			s2 = ft_rekey(f2, "xabz", "xq");
-			bad = (s2 != CDS_FT_STATUS_NOT_SUPPORTED ||
-				!ft_test_has_key(f2, "xq") ||
+			bad = (s2 != CDS_FT_STATUS_OK ||
+				ft_test_has_key(f2, "xq") ||
+				!ft_test_has_key(f2, "xabz") ||
+				!ft_test_has_key(f2, "xabzm") ||
+				!ft_test_has_key(f2, "xabzn") ||
 				cds_ft_count_keys(f2) != 3 ||
 				cds_ft_verify(f2, stderr) != CDS_FT_STATUS_OK);
 			if (bad)
 				fprintf(stderr,
-					"bare-head[%u] deep-chain: %s count %lu xq=%d\n",
+					"bare-head[%u] deep-chain: %s count %lu xq=%d xabz=%d\n",
 					i, cds_ft_status_to_string(s2),
 					cds_ft_count_keys(f2),
-					ft_test_has_key(f2, "xq"));
+					ft_test_has_key(f2, "xq"),
+					ft_test_has_key(f2, "xabz"));
 			drain_trie(f2);
 			rcu_barrier();
 			cds_ft_destroy(f2);
@@ -11980,10 +11978,10 @@ out:
  * been right all along and this pins that it is).  Both list modes: the head
  * carries an ordered cell whose ->parent is the word that rides the commit.
  *
- * ☞ RANK STATS ARE ABSENT ON PURPOSE.  The bare head is still refused there,
- * and test_rekey_bare_head_rankstats_refused owns that refusal and says why
- * (the chain-compress kind conflict drops a re-parent and orphans a key).
- * Serving the graft arm must not quietly widen into that.
+ * ☞ RANK STATS ARE ABSENT HERE, and since @8608ed06 that is a division of
+ * labour rather than a refusal: test_rekey_bare_head_rankstats covers the
+ * bare head on a rank-stats trie, where it is now SERVED.  This test stays
+ * rank-off so a break in the aggregate cannot mask a break in the graft.
  */
 static int rekey_bare_head_graft(const char *dst, int ordered_list)
 {
@@ -13669,13 +13667,13 @@ static int test_rekey_bare_head_graft_branch(void)
  * ZERO delta (the all-collide twin {qm,qn} counted exactly all along), so only
  * a live delta can witness the lost charge.
  *
- * ☠☠ THE MID-CHAIN TWIN IS ABSENT ON PURPOSE, and its absence is a FINDING,
- * not an omission.  Pushing the same shape one byte deeper (every key behind a
- * shared 'x', so the emptied junction's survivor side is a MULTI-LEVEL chain
- * and the collapse absorbs several nodes into one run) does not merely miss a
- * count -- it is BROKEN THREE WAYS AT HEAD, all of them PRE-EXISTING, all
- * MEASURED at fff8d743 on an untouched tree with an ORDINARY INTERNAL SRC
- * ({xqp,xqw} onto the occupied "xaz" -- a shape no gate has ever refused):
+ * ☑ THE MID-CHAIN TWIN IS BACK, and it is the second arm below.  Its absence
+ * used to be a FINDING: pushing the same shape one byte deeper (every key
+ * behind a shared 'x', so the emptied junction's survivor side is a MULTI-LEVEL
+ * chain and the collapse absorbs several nodes into one run) did not merely
+ * miss a count -- it was BROKEN THREE WAYS, all PRE-EXISTING, all MEASURED at
+ * fff8d743 on an untouched tree with an ORDINARY INTERNAL SRC ({xqp,xqw} onto
+ * the occupied "xaz" -- a shape no gate has ever refused):
  *
  *   rank-stats ON,  release : OK returned, BOTH moved keys reachable at
  *                             NEITHER key, cds_ft_count_keys answers 5 for the
@@ -13686,16 +13684,17 @@ static int test_rekey_bare_head_graft_branch(void)
  *   rank-stats OFF, release : LIVELOCKS and leaks until the memcg kills it
  *                             (rc=137 in a 4G cage), both list modes.
  *
- * The common cause is the detach's chain-compress collapse:
- * ft_record_child_back_edge re-parents the surviving child MW onto a word an
- * earlier lane of the same one-decide already recorded SW, and the release
- * build's MW-domination fail-safe absorbs the contradiction by DROPPING that
- * re-parent edge.  A test arm here would therefore assert a shape the library
- * cannot serve, and would go green the day someone "fixed" it by widening a
- * refusal.  ☞ The collapse conflict is owed its own fix; when it lands, add
- * the mid-chain twin back -- it is the arm that convicts base-side re-basing
- * as insufficient, and its skip-encoded slot value is what pins
- * ft_count_walk_survivor_meta's descriptor-resolved decode.
+ * The common cause was the detach's chain-compress collapse:
+ * ft_record_child_back_edge re-parented the surviving child MW onto a word an
+ * earlier lane of the same one-decide had already recorded SW, and the release
+ * build's MW-domination fail-safe absorbed the contradiction by DROPPING that
+ * re-parent edge.  Fixed @148b0f71 (the guard on a word the op already held),
+ * and the aggregate that remained fell with the rank lane's last two faces
+ * (@7000b65e, @8608ed06).  The twin is the arm that convicts base-side
+ * re-basing as insufficient, and its skip-encoded slot value is what pins
+ * ft_count_walk_survivor_meta's descriptor-resolved decode -- which is why it
+ * checks the moved keys AT THEIR NEW NAMES, not just the count: the shape's
+ * worst face was an ORPHAN that left the count looking plausible.
  */
 static int test_rekey_count_root_relocation(void)
 {
@@ -13710,23 +13709,43 @@ static int test_rekey_count_root_relocation(void)
 	enum cds_ft_status s;
 	unsigned int i;
 
-	for (i = 0; i < 2; i++) {
+	for (i = 0; i < 4; i++) {
 		bool liston = (i & 1);
+		bool mid = (i >= 2);	/* the deeper junction: one byte down */
+		const char *pfx = mid ? "x" : "";
+		char k[6][8], dst[8], src[8];
+		unsigned int j;
 
+		/*
+		 * The SAME five keys at two junction depths: at the root
+		 * ({qp,qw} onto "az") and one byte down ({xqp,xqw} onto "xaz",
+		 * where the emptied junction's survivor side is a multi-level
+		 * chain the collapse absorbs into one run).
+		 */
+		snprintf(k[0], sizeof(k[0]), "%sazm", pfx);
+		snprintf(k[1], sizeof(k[1]), "%sazn", pfx);
+		snprintf(k[2], sizeof(k[2]), "%sazx", pfx);
+		snprintf(k[3], sizeof(k[3]), "%sqp", pfx);
+		snprintf(k[4], sizeof(k[4]), "%sqw", pfx);
+		snprintf(dst, sizeof(dst), "%saz", pfx);
+		snprintf(src, sizeof(src), "%sq", pfx);
 		ft = create_varlen_rankstats_list_ft(liston, &group);
 		rcu_read_lock();
-		cds_ft_insert(ft, (const uint8_t *) "azm", 3,
-			&node_alloc(1)->node);
-		cds_ft_insert(ft, (const uint8_t *) "azn", 3,
-			&node_alloc(2)->node);
-		cds_ft_insert(ft, (const uint8_t *) "azx", 3,
-			&node_alloc(3)->node);
-		cds_ft_insert(ft, (const uint8_t *) "qp", 2,
-			&node_alloc(4)->node);
-		cds_ft_insert(ft, (const uint8_t *) "qw", 2,
-			&node_alloc(5)->node);
-		s = ft_rekey(ft, "az", "q");
+		for (j = 0; j < 5; j++)
+			cds_ft_insert(ft, (const uint8_t *) k[j],
+				strlen(k[j]), &node_alloc(j + 1)->node);
+		s = ft_rekey(ft, dst, src);
+		/*
+		 * Both moved keys AT THEIR NEW NAMES: the mid-chain shape's
+		 * worst face orphaned them while the count still looked
+		 * plausible.
+		 */
+		snprintf(k[5], sizeof(k[5]), "%sazp", pfx);
 		if (s != CDS_FT_STATUS_OK ||
+		    !ft_test_has_key(ft, k[5]) ||
+		    ft_test_has_key(ft, k[3]) || ft_test_has_key(ft, k[4]) ||
+		    !ft_test_has_key(ft, k[0]) || !ft_test_has_key(ft, k[1]) ||
+		    !ft_test_has_key(ft, k[2]) ||
 		    cds_ft_count_keys(ft) != 5 ||
 		    cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
 			fprintf(stderr, "count-root-reloc[%u]: %s count %lu\n",
@@ -37414,7 +37433,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_merge_rerooted_nosplit_ordered_atnode);
 	RUN_TEST(test_merge_rerooted_nosplit_ordered_branch);
 	RUN_TEST(test_merge_rekey_same_trie);
-	RUN_TEST(test_rekey_bare_head_rankstats_refused);
+	RUN_TEST(test_rekey_bare_head_rankstats);
 	RUN_TEST(test_rekey_uncovered_dst_is_not_an_argument_error);
 	RUN_TEST(test_rekey_bare_head_graft_nosplit);
 	RUN_TEST(test_rekey_bare_head_graft_branch);

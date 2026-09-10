@@ -2567,55 +2567,29 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		 * served.
 		 */
 		/*
-		 * ☠☠ AND NOT ON A RANK-STATS TRIE -- BUT NO LONGER FOR THE
-		 * REASON THIS COMMENT USED TO GIVE.  It said the gate was
-		 * holding back a KEY LOSS: the src detach empties a junction
-		 * whose survivor side is a multi-level chain, the collapse
-		 * records the surviving child's re-parent MW onto a word an
-		 * earlier lane recorded SW, and a release build's MW-domination
-		 * fail-safe drops that edge and ORPHANS the moved node.  That
-		 * collision is FIXED (ft_record_child_back_edge now takes the
-		 * op's held set), and the key-loss face is GONE.
+		 * ☑ AND ON A RANK-STATS TRIE TOO, since @8608ed06.  This arm
+		 * refused a bare external head there for two successive reasons,
+		 * BOTH now retired: first a key loss through the chain-compress
+		 * collapse's one-slot-two-kinds (@148b0f71), then the rank lane's
+		 * nr_keys ACCOUNTING -- OK returned, every key at the right name,
+		 * and cds_ft_verify RED with `nr_keys mismatch`, sometimes with
+		 * cds_ft_count_keys itself wrong.
 		 *
-		 * ☑ RE-MEASURED WITH THE GATE ABLATED, 3000 generated rekey
-		 * shapes x both list modes, rank stats ON, --enable-rcu-debug:
-		 * ZERO key losses, ZERO engine asserts.  The shape this comment
-		 * named ({"xq","xabzm","xabzn"}, rekey "xabz" <- "xq") is served
-		 * correctly.
+		 * The accounting was never THIS shape's: most of the class fired
+		 * on ordinary internal-src rekeys the gate never touched, and it
+		 * fell in four steps -- the +count walk's ordering (@375d65ab,
+		 * 178 -> 6), the REPLACE fold's survivor (@7000b65e, 106 -> 0 on
+		 * nocompress), and the split cluster's count plus the walk that
+		 * charges it (@8608ed06, 6 -> 0).
 		 *
-		 * ☠ THE GATE IS STILL LOAD-BEARING, FOR A DIFFERENT DEFECT:
-		 * the rank lane's nr_keys ACCOUNTING.  Its failures are OK
-		 * returned, every key at the right name, and cds_ft_verify RED
-		 * with `nr_keys mismatch: stored N, computed N` -- sometimes
-		 * with cds_ft_count_keys itself wrong, so it is not merely an
-		 * internal-consistency nit.  A rank-stats trie is the only
-		 * observer (rank OFF keeps no aggregate: 0/3000 over the same
-		 * corpus), which is how the class survived.
-		 *
-		 * ☞ MEASURED OVER 3000 GENERATED SHAPES x BOTH LIST MODES, and
-		 * the numbers move as the accounting is repaired:
-		 *
-		 *   gate ACTIVE   178 -> 6     after the count-walk ordering fix
-		 *   gate ABLATED  222 -> 12    (so the gate still covers 6)
-		 *
-		 * The class is NOT this gate's shape -- most of it fires on
-		 * ORDINARY internal-src rekeys the gate never touches -- so the
-		 * gate only ever clipped one corner of it.
-		 * ☞ [[project_ft_count_walk_base_and_iter_fabrication]] and
-		 * [[project_ft_rank_stats_nr_keys_is_the_lane_defect]].
-		 *
-		 * ⇒ SO THE THING TO FIX IS THE REST OF THE ACCOUNTING, NOT THIS
-		 * GATE.  A refusal whose stated reason has expired is still a
-		 * refusal that holds something back; what changed is WHAT.
-		 *
-		 * ☞ WHEN THE REMAINING 6 ARE GONE: re-run the ablation above (it
-		 * must go 6 -> 0 with the gate and 12 -> 0 without), then drop
-		 * this, flip test_rekey_bare_head_rankstats_refused's rank arm
-		 * to expect OK + count 5, and delete the DEBUG_RCU #if that
-		 * hides test_rekey_count_root_relocation's mid-chain arms.
+		 * ☞ MEASURED WITH THE GATE ABLATED, 3000 generated shapes x both
+		 * list modes x rank on, on --enable-rcu-debug default /
+		 * nocompress / noskip and on release: 0 failures on EVERY leg,
+		 * and ~600 more calls per corpus commit (default 1999 -> 2597,
+		 * nocompress 2176 -> 2938, noskip 1980 -> 2557) -- rank on now
+		 * serves exactly what rank off does.  So the gate is gone.
+		 * ☞ [[project_ft_rank_stats_nr_keys_is_the_lane_defect]]
 		 */
-		if (s_top_external && ft->rank_stats)
-			return FT_REKEY_UNCOVERED;
 #ifndef FEATURE_FT_MERGE
 		/*
 		 * An OCCUPIED destination IS a merge (INCREMENT 3 unions S_top
