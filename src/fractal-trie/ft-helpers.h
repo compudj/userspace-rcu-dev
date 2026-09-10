@@ -3100,6 +3100,125 @@ struct cds_ft_inode_flag *ft_publish_compressed(struct cds_ft *ft,
  * Write-side only (mutex-held).
  */
 /*
+ * ft_head_stamp_incoming_byte: maintain an EXTERNAL head's up-walk edge byte at
+ * a child placement -- the external counterpart of what ft_set_parent's plain
+ * internal branch and ft_reparent_record_meta already do for a node.
+ *
+ * ☠ THE FIELD'S CONTRACT IS "MAINTAINED AT EVERY CHILD PLACEMENT"
+ * (fractal-trie-internal.h, @incoming_byte), and for a head the record is its
+ * CELL -- "external head: stored in the head's CELL metadata ... set to the
+ * key's last byte at insert".  Both placement primitives used to set only the
+ * head's PARENT word and leave the byte at whatever the INSERT stamped, on the
+ * argument written at ft_reparent_record's external arm that a head has "no
+ * metadata / offset".  It has no NODE metadata; the cell is its metadata, and
+ * ft_rebuild_key_upwalk reads exactly this field out of it.
+ *
+ * MEASURED, single-threaded on a quiet trie, ordered list ON, default build,
+ * release included: move a BARE EXTERNAL HEAD "q" with cds_ft_rekey_merge onto
+ * an empty destination and a plain forward walk (cds_ft_lookup_first +
+ * cds_ft_next) emits a key THAT IS NOT IN THE TRIE -- the destination's bytes
+ * for every level but the last, and the SOURCE's last byte at the end:
+ * dst "z" -> "q", dst "ax" -> "aq", dst "axy" -> "axq".  cds_ft_verify is
+ * CLEAN and cds_ft_count_keys is right, so only a lookup of the emitted key can
+ * see it.  Five of the six graft legs did it, the BRANCH leg included, and the
+ * survivors were LATENT rather than correct: dst "axy" walks fine on the default
+ * build only because the head hangs under a COMPRESSED parent, whose key_bytes
+ * cover the byte -- insert "axz" to split that run and the same trie starts
+ * spelling "axq".
+ *
+ * ☠ STAMP IT WHETHER OR NOT THE CURRENT PARENT READS IT.  Under a COMPRESSED
+ * parent the walk takes the byte from key_bytes and never looks -- but the run
+ * can be SPLIT later by an ordinary insert, which drops the head into a body
+ * slot of a fresh internal node and re-homes nothing it would have to stamp, so
+ * the walk then reads whatever was left behind.  That is not hypothetical: with
+ * only the plain-parent arm stamped, dst "axy" walked clean and then
+ * `insert "axz"` made the same trie spell "axq".  The value is the last byte of
+ * the head's KEY in both cases -- the run's last key byte under a run, the slot
+ * byte under a plain parent -- which is what the two cross-trie sites stamp
+ * directly as okey_dst[dst_key_len - 1].
+ *
+ * The two real exclusions: @ft->ordered_list, because with the list off there is
+ * no cell to hold the byte (and the walk uses the iterator's own descent buffer
+ * instead); and a PREFIX head, whose key ends AT the parent so it HAS no edge
+ * byte -- the same @slot-is-the-shape reading ft_head_parent_word_slot makes,
+ * kept in one predicate here so the two cannot disagree about which placement
+ * they are describing.
+ *
+ * ☞ BYTE BEFORE PARENT, which is the order ft_set_parent's internal branch
+ * already argues for at its own stamp ("Publish the up-walk key byte BEFORE the
+ * parent pointer ... a concurrent up-walk that follows the new parent would read
+ * the still-stale byte"): a reader that reaches the head through its NEW parent
+ * must not find the OLD byte.  The converse window -- a reader still on the OLD
+ * parent reading the NEW byte -- is what the two CROSS-TRIE stamp sites avoid by
+ * stamping while the cell is "in NEITHER list and structurally invisible"
+ * (ft-merge.h, ft-rekey.h's subpos_inplace).  An IN-TRIE move has no such
+ * moment: its cells are live in the very list being rebuilt.  So this placement
+ * inherits exactly the window every LIVE re-parent through
+ * ft_reparent_record_meta already carries, and it replaces a PERMANENTLY wrong
+ * key with a transiently wrong one.  Closing the window needs the byte to ride
+ * the commit, which its own word cannot do today: it shares a 32-bit word with
+ * @alloc_index, with no room for a parked descriptor pointer, and the up-walk
+ * reads it raw.
+ */
+static inline
+void ft_head_stamp_incoming_byte(const struct cds_ft *ft,
+		struct cds_ft_node *en,
+		struct cds_ft_inode_flag *parent_nf,
+		struct cds_ft_inode_flag **slot)
+{
+	struct cds_ft_inode *parent;
+	void *prev;
+
+	struct cds_ft_compressed_node *cn = NULL;
+	uint8_t byte;
+
+	if (!ft->ordered_list || !slot || !parent_nf)
+		return;
+	if (ft_node_flip_proxy(parent_nf))
+		return;
+	/*
+	 * KIND DISPATCH, SKIP FIRST and BEFORE the FT_INTERNAL_MASK test: a
+	 * compressed flag has that bit CLEAR, so testing it up front would drop
+	 * exactly the run-parent arm below.
+	 */
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+	if (ft_node_skip_compressed(parent_nf))
+		cn = ft_skip_to_compressed(ft, parent_nf);
+	else
+#endif
+	if (ft_node_compressed(parent_nf))
+		cn = ft_compressed_node_ptr(parent_nf);
+	else if (!((uintptr_t) parent_nf & FT_INTERNAL_MASK))
+		return;
+	if (cn) {
+		/*
+		 * A COMPRESSED parent's key_bytes already cover this byte, so the
+		 * walk does not read it HERE -- but it will the moment a plain
+		 * insert SPLITS the run and drops the head into a body slot of the
+		 * fresh internal node, and that split re-homes nothing it would
+		 * have to stamp: the value it finds is whatever was left behind.
+		 * So the byte is maintained at every placement whether or not the
+		 * CURRENT parent consults it.  It is the last byte of the head's
+		 * key either way, which under a run is the run's last key byte.
+		 */
+		if (!cn->len)
+			return;
+		byte = cn->key_bytes[cn->len - 1];
+	} else {
+		parent = ft_node_ptr(parent_nf);
+		if ((void *) slot == (void *)
+				&cds_ft_item_to_metadata(parent)->external_nodes)
+			return;		/* a PREFIX head: its key ends AT the parent */
+		byte = ft_slot_to_byte(&ft_types[ft_node_type(parent_nf)],
+				parent, slot);
+	}
+	prev = ft_dereference_prev_resolved(en);
+	if (!prev)
+		return;
+	cds_ft_item_to_metadata(ft_ord_cell_ptr(prev))->incoming_byte = byte;
+}
+
+/*
  * ft_set_parent: set the parent pointer in child's metadata,
  * and optionally set skip_slot for skip-compressed children.
  *
@@ -3187,6 +3306,8 @@ void ft_set_parent(struct cds_ft *ft, struct cds_ft_inode_flag *child_nf,
 		struct cds_ft_inode_flag *word =
 			ft_head_parent_word_slot(parent_nf, slot);
 
+		/* The up-walk edge byte, BEFORE the parent word: see the helper. */
+		ft_head_stamp_incoming_byte(ft, en, parent_nf, slot);
 		if (ft->ordered_list)
 			ft_ord_cell_set_parent(en, word);
 		else

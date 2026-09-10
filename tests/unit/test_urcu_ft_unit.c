@@ -69,13 +69,13 @@
 #endif
 
 /*
- * 319 unconditional + 51 fault-injection-only RUN_TEST registrations, on top of
+ * 320 unconditional + 51 fault-injection-only RUN_TEST registrations, on top of
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (378 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (379 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (327 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (328 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -12377,6 +12377,210 @@ static int test_rekey_merge_dst_run_start(void)
 		for (l = 0; l < 2; l++)
 			if (rekey_merge_dst_run_start(r, l))
 				return -1;
+	return 0;
+}
+
+/*
+ * ☠ A MOVED BARE HEAD KEPT THE SOURCE KEY'S LAST BYTE, so the ordered-list
+ * walk emitted a key THAT IS NOT IN THE TRIE.
+ *
+ * @incoming_byte is the edge byte an UPWARD key rebuild reads for each level,
+ * and its contract (fractal-trie-internal.h) is "maintained at every child
+ * placement"; for an external head the record is the head's CELL.  Both
+ * placement primitives set only the head's PARENT word -- ft_set_parent's
+ * external branch and ft_reparent_record's external arm, the latter on the
+ * stated argument that a head has "no metadata / offset".  It has no NODE
+ * metadata; the cell IS its metadata, and ft_rebuild_key_upwalk reads the byte
+ * out of it.  So a head moved by a graft kept whatever the INSERT stamped.
+ *
+ * MEASURED before the fix, single-threaded on a quiet trie, DEFAULT build,
+ * release included -- a plain forward walk, no removal and no concurrency:
+ *
+ *     insert "q" (a BARE EXTERNAL HEAD), "am", "an"
+ *     cds_ft_rekey_merge(dst, src "q")  -> OK, count 3, cds_ft_verify CLEAN
+ *     dst "z" -> the walk emits "q"; dst "ax" -> "aq"; dst "axy" -> "axq"
+ *
+ * always the destination's bytes for every level but the last, and the SOURCE's
+ * last byte at the end.  cds_ft_verify and cds_ft_count_keys BOTH pass over it,
+ * so only a lookup of the emitted key can see it -- which is why this test
+ * looks the key up rather than only counting.
+ *
+ * ☠ AND ITS CONSEQUENCE WAS A HANG, which is how it was found: a drain loop
+ * (`while (lookup_first) remove_all`) looks up the emitted key, gets NOT_FOUND,
+ * removes nothing, and gets the same key again forever.  test_rekey_bare_head_
+ * graft_nosplit's own teardown spun there on -DNO_FEATURE_FT_COMPRESS and
+ * -DNO_FEATURE_FT_SKIP_COMPRESSED.
+ *
+ * ☞ THE SECOND CASE IS LATENT, and it is why the stamp is not conditioned on
+ * the current parent reading the byte.  With the head under a COMPRESSED
+ * parent the walk takes the byte from key_bytes and never looks -- so dst
+ * "axy" WALKED CLEAN while carrying a stale 'q'.  An ordinary insert that
+ * SPLITS that run then drops the head into a body slot of a fresh internal
+ * node, re-homing nothing it would have to stamp, and the same trie starts
+ * spelling "axq".  Both halves are asserted below.
+ */
+static int rekey_bare_head_upwalk_key(const char *dst, const char *splitter)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	struct cds_ft_iter *iter = NULL;
+	enum cds_ft_status s;
+	int pass, ret = -1;
+
+	if (!cds_ft_merge_enabled()) {
+		diag("rekey_bare_head_upwalk_key: skipped, merge compiled out "
+			"(-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
+	if (cds_ft_group_attr_create(&attr) < 0)
+		return -1;
+	/* The ordered list is the whole point: the byte lives in the CELL. */
+	if (cds_ft_group_attr_set_ordered_list(attr, 1) < 0 ||
+	    cds_ft_group_create(attr, &group) < 0) {
+		cds_ft_group_attr_destroy(attr);
+		return -1;
+	}
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &ft) < 0) {
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	rcu_read_lock();
+	/* "q" is a whole key at depth 1 with nothing below: a BARE HEAD. */
+	cds_ft_insert(ft, (const uint8_t *) "q", 1, &node_alloc(1)->node);
+	cds_ft_insert(ft, (const uint8_t *) "am", 2, &node_alloc(2)->node);
+	cds_ft_insert(ft, (const uint8_t *) "an", 2, &node_alloc(3)->node);
+
+	s = ft_rekey(ft, dst, "q");
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "bare_head_upwalk(%s): rekey refused (%s)\n",
+			dst, cds_ft_status_to_string(s));
+		goto out;
+	}
+	if (cds_ft_iter_create(ft, &iter) != CDS_FT_STATUS_OK)
+		goto out;
+	/*
+	 * PASS 0 walks right after the move; PASS 1 walks again after an
+	 * ordinary insert that splits whatever the head now hangs under, which
+	 * is what exposes a byte the first walk had no reason to read.
+	 */
+	for (pass = 0; pass < 2; pass++) {
+		int nr = 0;
+
+		if (pass == 1) {
+			cds_ft_insert(ft, (const uint8_t *) splitter,
+				strlen(splitter), &node_alloc(4)->node);
+		}
+		for (s = cds_ft_lookup_first(ft, iter); s == CDS_FT_STATUS_OK;
+				s = cds_ft_next(ft, iter)) {
+			uint8_t k[64];
+			char emitted[sizeof k + 1];
+			size_t l = 0;
+
+			if (cds_ft_iter_get_key(iter, k, sizeof k, &l) !=
+					CDS_FT_STATUS_OK || l > sizeof k) {
+				fprintf(stderr, "bare_head_upwalk(%s) pass %d: "
+					"iter_get_key failed\n", dst, pass);
+				goto out;
+			}
+			memcpy(emitted, k, l);
+			emitted[l] = '\0';
+			/*
+			 * THE ASSERTION: every key the walk MATERIALIZES must be
+			 * a key the trie actually HOLDS.  A wrong edge byte
+			 * spells an out-of-namespace key that verify and the
+			 * count both accept.
+			 */
+			if (!ft_test_has_key(ft, emitted)) {
+				fprintf(stderr, "bare_head_upwalk(%s) pass %d: the "
+					"walk emitted \"%s\", which is NOT IN "
+					"THE TRIE -- the moved head kept the "
+					"source key's last byte\n",
+					dst, pass, emitted);
+				goto out;
+			}
+			nr++;
+		}
+		if (nr != 3 + pass || cds_ft_count_keys(ft) != (unsigned long) nr) {
+			fprintf(stderr, "bare_head_upwalk(%s) pass %d: walked %d, "
+				"count %lu, expected %d\n", dst, pass, nr,
+				cds_ft_count_keys(ft), 3 + pass);
+			goto out;
+		}
+		if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "bare_head_upwalk(%s) pass %d: verify\n",
+				dst, pass);
+			goto out;
+		}
+	}
+	ret = 0;
+out:
+	rcu_read_unlock();
+	if (iter)
+		cds_ft_iter_destroy(iter);
+	/*
+	 * ☠ THE DRAIN IS THE SECOND ASSERTION, and it is BOUNDED ON PURPOSE.
+	 * The defect's own signature is that this loop NEVER TERMINATES -- the
+	 * walk hands back a key remove_all cannot find, so nothing is removed
+	 * and the next lookup_first returns it again -- and a test that HANGS
+	 * is far worse in a gate than one that fails: it takes the whole config
+	 * out and reports nothing.  Cap it above the key count and FAIL instead.
+	 */
+	rcu_read_lock();
+	{
+		struct cds_ft_iter *dit = NULL;
+		unsigned int rounds = 0;
+
+		if (cds_ft_iter_create(ft, &dit) != CDS_FT_STATUS_OK) {
+			ret = -1;
+		} else {
+			while (cds_ft_lookup_first(ft, dit) == CDS_FT_STATUS_OK) {
+				struct cds_ft_node *head = NULL, *tmp;
+
+				if (cds_ft_remove_all(ft, dit, &head) < 0 ||
+						++rounds > 16) {
+					fprintf(stderr, "bare_head_upwalk(%s): the "
+						"drain made no progress in %u rounds "
+						"on a 4-key trie -- the walk is "
+						"handing back a key remove_all "
+						"cannot find\n", dst, rounds);
+					ret = -1;
+					break;
+				}
+				cds_ft_for_each_duplicate_safe_rcu(head, tmp)
+					node_free_rcu(to_test_node(head));
+			}
+			cds_ft_iter_destroy(dit);
+		}
+	}
+	rcu_read_unlock();
+	rcu_barrier();
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+static int test_rekey_bare_head_upwalk_key(void)
+{
+	/*
+	 * The destination geometries the head can land in: a ROOT slot, a slot
+	 * of an EXISTING internal node, INSIDE a run the graft builds, a deep
+	 * new chain, and a run the move has to BRANCH.  Each splitter splits
+	 * whatever that geometry left the head under.
+	 */
+	static const char *const cases[][2] = {
+		{ "z",    "zq"   },	/* root slot                      */
+		{ "ax",   "axq"  },	/* slot of an existing node       */
+		{ "axy",  "axz"  },	/* inside a run -> LATENT case    */
+		{ "zzz",  "zzq"  },	/* deep new chain                 */
+		{ "zqp",  "zqr"  },	/* long dst off the root          */
+	};
+	unsigned int i;
+
+	for (i = 0; i < CAA_ARRAY_SIZE(cases); i++)
+		if (rekey_bare_head_upwalk_key(cases[i][0], cases[i][1]))
+			return -1;
 	return 0;
 }
 
@@ -36459,6 +36663,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_rekey_merge_colocated_chain);
 	RUN_TEST(test_rekey_merge_cut_source);
 	RUN_TEST(test_rekey_merge_dst_run_start);
+	RUN_TEST(test_rekey_bare_head_upwalk_key);
 	RUN_TEST(test_rekey_count_root_relocation);
 	RUN_TEST(test_merge_rekey_same_trie_speculative_rejected);
 	RUN_TEST(test_rekey_graft_vs_merge);

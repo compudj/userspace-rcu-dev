@@ -12776,6 +12776,17 @@ void ft_reparent_record(struct cds_ft *ft, struct ft_flip_txn *txn,
 		 * self-check (an --enable-rcu-debug abort; a release build
 		 * POISONS the descriptor instead and the retry loop absorbs it).
 		 */
+		/*
+		 * The up-walk edge byte, BEFORE the parent edge is recorded --
+		 * ft_head_stamp_incoming_byte's header has the measurement and
+		 * the ordering argument.  The comment above ("no metadata /
+		 * offset") is right about the NODE metadata a head does not
+		 * have and wrong about the byte: the head's CELL is its
+		 * metadata record, and ft_rebuild_key_upwalk reads
+		 * @incoming_byte out of it.  Leaving it unmaintained here is
+		 * what let a moved bare head keep the SOURCE key's last byte.
+		 */
+		ft_head_stamp_incoming_byte(ft, en, parent_nf, slot);
 		if (ft->ordered_list) {
 			struct ft_ord_cell *cell = ft_ord_cell_ptr(en->prev);
 
