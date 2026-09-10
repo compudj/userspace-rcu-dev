@@ -69,13 +69,13 @@
 #endif
 
 /*
- * 323 unconditional + 51 fault-injection-only RUN_TEST registrations, on top of
+ * 324 unconditional + 51 fault-injection-only RUN_TEST registrations, on top of
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (382 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (383 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (331 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (332 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -13069,6 +13069,181 @@ static int test_rekey_count_walk_after_detach(void)
 {
 	return rekey_count_walk_after_detach(0) ||
 		rekey_count_walk_after_detach(1);
+}
+
+/*
+ * A DISPLACED EXTERNAL DESTINATION: the dst path runs THROUGH a key.
+ *
+ * rekey_merge's dst descent stops ABOVE @dst_len on a slot holding an EXTERNAL
+ * LEAF -- a shorter key that ends on the destination path.  The attach builds
+ * the branch down to @dst_len and DISPLACES that leaf into the fresh branch's
+ * metadata, which is a legal move; the writer refused it (FT_REKEY_UNCOVERED)
+ * until every piece it needs was in place.  It is the single most common rekey
+ * refusal in a generated corpus: serving it commits 210 more of 3000 shapes on
+ * the default build (279 on nocompress) with no failure count moving.
+ *
+ * TWO SHAPES, and they need OPPOSITE trie attributes.  Neither covers the
+ * other, and a single spelling would have pinned only one of the two defects
+ * that stood in the way.
+ */
+
+/*
+ * SHAPE A -- THE COUNT WALK.  RANK STATS ON, or this pins nothing.
+ *
+ * This is the one NOSPLIT shape whose attach commits its own glue at the rekey
+ * driver's step 3a -- BEFORE the src detach at step 3, which can recompact (and
+ * so relocate) any ancestor on the +count walk, the ROOT included.
+ * ft_flip_txn_record_count_parent follows the survivor of a relocation the
+ * descriptor ALREADY carries, and at step 3a it carries none: the delta lands
+ * on the copy that commit retires and the surviving copy is born uncharged.
+ *
+ * Without the deferral this returns OK with both keys at the right names and
+ * cds_ft_verify answers `depth 0: nr_keys mismatch: stored 1, computed 2`.
+ * The key set, the lookups and the structure are all correct -- only the
+ * subtree aggregate is wrong -- so the whole class is INVISIBLE on a
+ * rank-stats-off trie, which is every other test here.
+ */
+static int rekey_displaced_external_count(int ordered_list)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	enum cds_ft_status s;
+	int ret = -1;
+
+	if (!cds_ft_merge_enabled()) {
+		diag("rekey_displaced_external_count: skipped, merge compiled "
+			"out (-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
+	/* dst "cbba" runs through the key "c"; src "a" holds "aba". */
+	ft = create_varlen_rankstats_list_ft(ordered_list, &group);
+	rcu_read_lock();
+	cds_ft_insert(ft, (const uint8_t *) "c", 1, &node_alloc(1)->node);
+	cds_ft_insert(ft, (const uint8_t *) "aba", 3, &node_alloc(2)->node);
+
+	s = ft_rekey(ft, "cbba", "a");
+	if (s != CDS_FT_STATUS_OK ||
+	    !ft_test_has_key(ft, "cbbaba") || ft_test_has_key(ft, "aba") ||
+	    !ft_test_has_key(ft, "c") ||
+	    cds_ft_count_keys(ft) != 2 ||
+	    cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr,
+			"displaced_external_count(list=%d): %s count %lu (want 2)\n",
+			ordered_list, cds_ft_status_to_string(s),
+			cds_ft_count_keys(ft));
+		goto out;
+	}
+	ret = 0;
+out:
+	rcu_read_unlock();
+	drain_trie(ft);
+	rcu_barrier();
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
+ * SHAPE B -- THE LOCK PLAN.  RANK STATS OFF, and it only speaks on an
+ * --enable-rcu-debug build.
+ *
+ * The displaced attach publishes into @d_dst.pnf's EXISTING slot and never
+ * touches @d_dst.ppnf, so this move's @graft_p is one level DOWN from every
+ * other landing's.  Named a level too high, @src_parent_held tells the src
+ * detach "your recompaction's parent is already held by an earlier step of this
+ * op" about a node no step of the op ever takes, and the detach's republish
+ * SW-parks on an unowned word: __ft_flip_txn_record_tag_ctx's owner assert
+ * ABORTS the suite.  A release build is SILENT -- the park is a plain store
+ * into a live word, harmless single-threaded -- which is how a release-only
+ * measurement once read this whole shape as served.
+ *
+ * ☠ RANK STATS MUST BE OFF HERE.  MEASURED with the plan ablated: this shape
+ * aborts on both list modes with rank stats OFF and completes CLEAN with them
+ * ON -- the rank lane's own ancestor bookkeeping puts the node the park needs
+ * into the registry, and the assert then has nothing to say.  Spelled with the
+ * rank-stats creator above, this leg is decoration.
+ *
+ * ☞ And it needs the gate's debug configs at all: on a release build it passes
+ * with or without the fix.
+ */
+static int rekey_displaced_external_plan(int ordered_list)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	enum cds_ft_status s;
+	int ret = -1;
+
+	if (!cds_ft_merge_enabled()) {
+		diag("rekey_displaced_external_plan: skipped, merge compiled "
+			"out (-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
+	if (cds_ft_group_attr_create(&attr) < 0)
+		return -1;
+	if (cds_ft_group_attr_set_ordered_list(attr, ordered_list) < 0 ||
+	    cds_ft_group_create(attr, &group) < 0) {
+		cds_ft_group_attr_destroy(attr);
+		return -1;
+	}
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &ft) < 0) {
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	/*
+	 * dst "bcccaa" runs through the key "bc"; src "bbb" holds "bbbb", and
+	 * BP's parent is the ROOT NODE -- the word the mis-named plan claimed
+	 * was held.
+	 */
+	rcu_read_lock();
+	cds_ft_insert(ft, (const uint8_t *) "aaca", 4, &node_alloc(1)->node);
+	cds_ft_insert(ft, (const uint8_t *) "aaacb", 5, &node_alloc(2)->node);
+	cds_ft_insert(ft, (const uint8_t *) "bc", 2, &node_alloc(3)->node);
+	cds_ft_insert(ft, (const uint8_t *) "baabaa", 6, &node_alloc(4)->node);
+	cds_ft_insert(ft, (const uint8_t *) "b", 1, &node_alloc(5)->node);
+	cds_ft_insert(ft, (const uint8_t *) "bbbb", 4, &node_alloc(6)->node);
+
+	s = ft_rekey(ft, "bcccaa", "bbb");
+	if (s != CDS_FT_STATUS_OK ||
+	    !ft_test_has_key(ft, "bcccaab") || ft_test_has_key(ft, "bbbb") ||
+	    !ft_test_has_key(ft, "aaca") || !ft_test_has_key(ft, "aaacb") ||
+	    !ft_test_has_key(ft, "bc") || !ft_test_has_key(ft, "baabaa") ||
+	    !ft_test_has_key(ft, "b") ||
+	    cds_ft_count_keys(ft) != 6 ||
+	    cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr,
+			"displaced_external_plan(list=%d): %s count %lu (want 6)\n",
+			ordered_list, cds_ft_status_to_string(s),
+			cds_ft_count_keys(ft));
+		goto out;
+	}
+	ret = 0;
+out:
+	rcu_read_unlock();
+	drain_trie(ft);
+	rcu_barrier();
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+static int test_rekey_displaced_external_dst(void)
+{
+	int ret = 0;
+
+	/*
+	 * EVERY LEG RUNS.  The two shapes pin different defects on different
+	 * builds, and `||` hides whichever comes second: with the lock plan
+	 * ablated the COUNT leg fails first (its @graft_p goes NULL and the
+	 * root-junction gate refuses the shape), so the leg that would have
+	 * caught the actual defect never executes.
+	 */
+	ret |= rekey_displaced_external_count(0);
+	ret |= rekey_displaced_external_count(1);
+	ret |= rekey_displaced_external_plan(0);
+	ret |= rekey_displaced_external_plan(1);
+	return ret;
 }
 
 /*
@@ -37067,6 +37242,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_rekey_compressed_bp_atomic_or_refused);
 	RUN_TEST(test_rekey_collapse_one_slot_two_kinds);
 	RUN_TEST(test_rekey_count_walk_after_detach);
+	RUN_TEST(test_rekey_displaced_external_dst);
 	RUN_TEST(test_rekey_merge_colocated_chain);
 	RUN_TEST(test_rekey_merge_cut_source);
 	RUN_TEST(test_rekey_merge_dst_run_start);

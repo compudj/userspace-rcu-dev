@@ -1061,8 +1061,40 @@ enum urcu_txn_status ft_store_at_graft_point_commit(struct cds_ft *ft,
 		 * absorbs the displaced external) raises @st->pnf's subtree by
 		 * +count_delta; @publish_parent == st->pnf, so the glue commit
 		 * records that +count_delta walk into the same flip.
+		 *
+		 * ☠ EXCEPT UNDER @record_only, WHERE THIS COMMIT RUNS TOO EARLY.
+		 * This arm is the one NOSPLIT shape that calls ft_glue_txn_commit
+		 * itself, at the rekey driver's step 3a -- BEFORE the src detach
+		 * at step 3, which can RECOMPACT (and so relocate) any ancestor on
+		 * the walk, the ROOT included.
+		 * ft_flip_txn_record_count_parent follows the survivor of a
+		 * relocation the descriptor ALREADY carries, and at step 3a it
+		 * carries none: the walk charges the copy this same commit
+		 * retires, and the surviving copy is born from the uncharged word.
+		 *
+		 * MEASURED, rank stats on, both list modes: insert {"c","aba"}
+		 * then rekey_merge(dst "cbba", src "a") returns OK with both keys
+		 * at the right names and cds_ft_verify answers `depth 0: nr_keys
+		 * mismatch: stored 1, computed 2` -- short by exactly the moved
+		 * count.  Over 3000 generated shapes it is 117 of them on the
+		 * default build and 248 on nocompress; deferring takes both back
+		 * to the rank lane's standing residue (6 / 106), which is the
+		 * count with this shape refused entirely.
+		 *
+		 * So hand the walk to the driver, which runs it at step 3a' after
+		 * the detach -- the same deferral, and the same field, the other
+		 * NOSPLIT arm already uses (@deferred_count_base).  The base is
+		 * the publish parent, which is what @g->count_delta would have
+		 * walked from.  A non-fold caller (the cross-trie graft) has no
+		 * detach to order against and keeps walking inline, byte-identically.
 		 */
-		st->glue->count_delta = count_delta;
+		if (st->glue->record_only && count_delta) {
+			st->glue->deferred_count_base = st->pnf;
+			st->glue->deferred_count_delta = count_delta;
+			st->glue->count_delta = 0;
+		} else {
+			st->glue->count_delta = count_delta;
+		}
 		cst = ft_glue_txn_commit(ft, st->glue, run);
 		if (st->tp_i >= 1)
 			FT_TP(tree_edge_set, (const void *) ft,

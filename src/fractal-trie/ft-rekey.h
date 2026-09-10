@@ -3891,6 +3891,58 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		cn_flag = d_dst.nf;		/* the compressed node the build split */
 		graft_c = cn_flag;
 		graft_p = glue.publish_parent;
+	} else if (d_dst.nf && d_dst.depth != dst_len &&
+			ft_node_external(d_dst.nf)) {
+		/*
+		 * THE DISPLACED EXTERNAL, and it is a PAIR ONE LEVEL DOWN from
+		 * the arm below.  The slot at @d_dst.depth holds an EXTERNAL LEAF
+		 * -- a key ending on the destination path -- which the attach
+		 * DISPLACES into the fresh branch's metadata
+		 * (ft_store_at_graft_point_prepare's displaced arm).  That arm
+		 * publishes the branch INTO @d_dst.pnf's existing slot: the slot
+		 * is already occupied, so nothing is resized, nothing is
+		 * recompacted, and @d_dst.ppnf is never touched.
+		 *
+		 * ☠ WHICH IS WHY THE PAIR MUST SHIFT.  @graft_p is not decoration:
+		 * @src_parent_held below is DERIVED from it (`d_src.ppnf ==
+		 * graft_p`), and it tells the src detach "your recompaction's
+		 * parent is already LOCK-held by an earlier step of this op, so do
+		 * not acquire it".  Name @d_dst.ppnf here and that claim is FALSE
+		 * for this arm -- no step of the op ever takes it -- and the
+		 * detach's recompaction then republishes into a node it does not
+		 * hold, an SW park on an unowned word.
+		 *
+		 * MEASURED (@d_dst.ppnf, i.e. the arm below's pair, with this
+		 * shape served): --enable-rcu-debug ABORTS at
+		 * __ft_flip_txn_record_tag_ctx's owner assert on {aaca, aaacb, bc,
+		 * baabaa, b, bbbb} + rekey_merge(dst "bcccaa", src "bbb") -- the
+		 * detach republishes the recompacted depth-1 node into the ROOT
+		 * node's slot while the op holds only {that node, the src top}.
+		 * A release build is SILENT: the park is a plain store into a live
+		 * word, harmless single-threaded, which is exactly how a
+		 * release-only measurement once read this shape as served.
+		 *
+		 * @graft_c is the EXTERNAL, and it is not a retire: the leaf stays
+		 * LIVE, re-parented under the fresh branch by a recorded edge.  It
+		 * is named because the gates below ask whether the detach's
+		 * junctions ARE the node the graft supersedes at that slot, and an
+		 * external answers no to all of them -- @d_src.pnf / @d_src.ppnf
+		 * are internal nodes, and nothing hangs under a leaf.  The one
+		 * junction alias this arm CAN meet -- BP == the graft's publish
+		 * parent -- is the supported one: the pending publish rides the
+		 * detach's recompaction (@pending_pub_slot, announced by hand in
+		 * ft-graft.h's displaced arm).
+		 *
+		 * ☞ MEASURED, 4 modes x 3000 generated shapes, on the
+		 * --enable-rcu-debug default and nocompress builds and on release:
+		 * 210 more calls commit at rank off (2387 -> 2597) and 155 at rank
+		 * on (1844 -> 1999), and every failure count is UNCHANGED against
+		 * the same corpus with the shape refused (0 at rank off, 6 / 106
+		 * at rank on -- the rank lane's standing residue).
+		 * ☞ [[project_ft_rekey_displaced_external_refusal]]
+		 */
+		graft_c = d_dst.nf;
+		graft_p = d_dst.pnf;
 	} else {
 		graft_c = d_dst.pnf;
 		graft_p = d_dst.ppnf;
@@ -3904,73 +3956,18 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		 * fresh branch carrying it.  Neither changes which nodes this move
 		 * locks, so @graft_c / @graft_p keep their meaning.
 		 *
-		 * @d_dst.nf still refuses, and it means two different things at the
-		 * two depths.  AT @dst_len the point is OCCUPIED -- an argument
-		 * error, terminal.  ABOVE it the slot holds an EXTERNAL leaf, a key
-		 * ending on the path, which the attach would DISPLACE into the
-		 * fresh branch's metadata; that is a legal move this cut does not
-		 * express, so it owes UNCOVERED, not -EINVAL.
-		 *
-		 * ☞ MEASURED, 4 modes x 3000 generated shapes: the AT-@dst_len arm
-		 * fires ZERO times and the ABOVE arm 279 (rank off) / 200 (rank on),
-		 * every one of them an EXTERNAL.  So the -EINVAL half is unwitnessed
-		 * and the whole refusal is, in practice, ONE shape: the displaced
-		 * external.
-		 *
-		 * ☠ AND IT IS LOAD-BEARING.  Ablated on a RELEASE build the corpus
-		 * goes 0 -> 38 failures (rank off) and 6 -> 89 (rank on): twelve of
-		 * them LOSE KEYS, the rest corrupt structure ("skip-encoded slot
-		 * slen != cn->len", "ord-cell list longer than trie").
-		 *
-		 * ☞ WHAT IS ACTUALLY OWED -- root-caused, and it is NOT the "second
-		 * publish" the old sentence blamed.  ft_glue_txn_commit_edges is
-		 * already record_only-aware, so the fold CAN own the publish.  What
-		 * breaks is the SKIP_X DUAL: with a COMPRESSED publish parent (the
-		 * displaced external is a run's child), _ft_publish_to_parent_meta
-		 * re-encodes the grandparent's skip word -- and it records that edge
-		 * against the grandparent AS IT STANDS AT STEP 3a, which the src
-		 * detach at step 3 then RELOCATES.  The fresh copy is born from the
-		 * live (stale) word, so the relocated grandparent keeps a skip word
-		 * naming the OLD child.  MEASURED on {"aa","cab","cba","b"} +
-		 * rekey_merge(dst "aac", src "b"): the dual is emitted against root
-		 * 0x..0a1 while the live root afterwards is 0x..141.
-		 *
-		 * Folding that pending edge into the recompaction's copy takes the
-		 * ablated corpus 38 -> 5 (rank off) and leaves rank on UNCHANGED at
-		 * 89.  So serving this shape needs THREE things, not one:
-		 *   1. the dual folded into the copy -- by a NAMED announcement, the
-		 *      way @pending_del_slot and @pending_pub_slot already are
-		 *      (ft-mutation-node.h's copy loops read COMMITTED values by
-		 *      design and must keep doing so for every other slot, so a
-		 *      blanket read-your-own-writes is not the fix);
-		 *   2. whatever the residual 5 are;
-		 *   3. this shape's own rank-stats count accounting (the +83 above
-		 *      the rank lane's standing 6).
-		 * ☞ [[project_ft_rekey_displaced_external_refusal]]
-		 */
-		/*
-		 * ☑ THE DISPLACED EXTERNAL IS SERVED.  Above @dst_len the slot
-		 * holds an EXTERNAL LEAF -- a key ending on the destination path
-		 * -- which the attach DISPLACES into the fresh branch's metadata.
-		 * That was refused as a legal move this cut did not express; it
-		 * expresses it now, and the two things in the way were both the
-		 * same shape of defect: a reader-visible write RECORDED against a
-		 * node the src detach later SUPERSEDES, whose fresh copy is built
-		 * from committed words.
-		 *   - the FORWARD PUBLISH: this arm never announced it, because it
-		 *     sets the glue's publish fields directly instead of through
-		 *     ft_glue_set_publish.  12 shapes LOST KEYS.  ☞ ft-graft.h.
-		 *   - the SKIP_X DUAL the publish owes when the publish parent is
-		 *     compressed: nothing announced it at all.  26 shapes kept a
-		 *     stale skip word.  ☞ @pending_dual_slot.
-		 * With both announced the corpus is CLEAN on this shape: 279 more
-		 * calls commit and the failure count does not move.
-		 *
-		 * AT @dst_len the point is OCCUPIED and that is still an argument
-		 * error, terminal -- the caller asked to move a subtree onto a
-		 * position that already holds one.  It fires zero times over the
-		 * corpus, and is kept because it is the one reading here that no
-		 * state of the trie makes legal.
+		 * @d_dst.nf REACHING HERE now means one of two things, and the
+		 * common one -- an EXTERNAL leaf above @dst_len -- is served by the
+		 * arm above rather than refused.  What is left:
+		 *   AT @dst_len the point is OCCUPIED: the caller asked to move a
+		 *   subtree onto a position that already holds one.  An argument
+		 *   error, terminal, and the one reading here that no state of the
+		 *   trie makes legal.  It fires ZERO times over 4 modes x 3000
+		 *   generated shapes -- kept for the contract, not for a witness.
+		 *   ABOVE @dst_len and NOT external: a descent that stopped short on
+		 *   an internal node.  Also unwitnessed in that corpus, so it owes
+		 *   UNCOVERED rather than an argument error -- nothing here has
+		 *   established it is the caller's mistake.
 		 */
 		if (d_dst.nf) {
 			ret = d_dst.depth == dst_len ?
