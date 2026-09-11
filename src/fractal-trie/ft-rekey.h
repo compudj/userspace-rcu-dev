@@ -3803,21 +3803,23 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 *
 	 *  - NOSPLIT: an absent, append-in-place dst point.  The reserve
 	 *    recompaction retires and RELOCATES the dst parent d_dst.pnf, holding
-	 *    its parent d_dst.ppnf and releasing it at the flip.  (Its optional
-	 *    third member, the SKIP_X great-grandparent, is excluded by requiring a
-	 *    PLAIN d_dst.ppnf -- which the pre-lift gate got for free from the src
-	 *    descent's own plainness checks, ppnf being shared.)
+	 *    its parent d_dst.ppnf and releasing it at the flip.  Its optional
+	 *    third member, the SKIP_X great-grandparent, is taken by that same
+	 *    reserve recompaction whenever d_dst.ppnf is COMPRESSED
+	 *    (ft_store_at_graft_point_prepare's hint names it), and the dual it
+	 *    records there is announced as @pending_dual_slot at the commit so a
+	 *    src detach that recompacts the great-grandparent folds it.  ☞ The
+	 *    gate below no longer refuses a compressed publish parent.
 	 *  - GLUE: the dst key diverges INSIDE a compressed node, so the build
 	 *    assembled the whole split cluster invisibly.  It holds the split node
 	 *    @cn (fenced by the build, retired by our commit) and -- fenced just
 	 *    below -- @glue.publish_parent, the live node whose slot the forward
-	 *    publish replaces.  A COMPRESSED publish_parent is refused: the publish
-	 *    would then also rewrite the SKIP_X dual, a slot in a THIRD node this
-	 *    arm does not hold.  ★ The MERGE arm DOES hold it (@publish_gp_holder,
-	 *    taken with the publish parent above), so a compressed publish parent
-	 *    is in scope there and only there -- which is what routes an occupied
-	 *    destination reached through a path-compressed run to this arm instead
-	 *    of to the empty-dst splice.
+	 *    publish replaces.  A COMPRESSED publish_parent cannot arise here: @cn
+	 *    is itself compressed and the trie admits no two adjacent compressed
+	 *    nodes, so the split node's parent is plain.  The MERGE arm, whose
+	 *    publish parent CAN be compressed, holds the grandparent
+	 *    (@publish_gp_holder, taken with the publish parent above) and
+	 *    announces the dual through ft_glue_txn_commit_edges.
 	 *
 	 * Against that pair, the src junction BP (= d_src.pnf) and its parent:
 	 *   - BP's parent IS the graft-held node: REUSE the held lock
@@ -4398,8 +4400,23 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		climb_rest_under_graft = ft_parent_node(rcu_dereference(
 			cds_ft_item_to_metadata(ft_node_ptr(climb_rest))
 				->parent_word)) == graft_c;
-	if ((ft_node_compressed(graft_p) && !merge_dst) ||
-			ft_node_skip_compressed(graft_p) ||
+	/*
+	 * ☑ A COMPRESSED PUBLISH PARENT IS NO LONGER A TERM HERE.  It refused 98
+	 * of 3000 corpus shapes on the default build, and only 17 of them were
+	 * ever wrong -- every one with the GRANDPARENT (the node holding the
+	 * SKIP_X dual) DEL-recompacted as a plain copy by the src detach in the
+	 * same commit: BP itself, or the node a one-step elevation lands on.  The
+	 * NOSPLIT reserve recompaction already held that grandparent and
+	 * recorded the dual; what it never did was ANNOUNCE it, so the detach's
+	 * copy of the grandparent was born with the committed skip word and
+	 * cds_ft_verify reported "stale SKIP_X dual".  The announcement now
+	 * lives in ft_store_at_graft_point_commit's relocated arm
+	 * (@pending_dual_slot), the mirror of the one ft_glue_txn_commit_edges
+	 * makes for the GLUE and MERGE publishes.  The other 81 were refused for
+	 * nothing: the grandparent was untouched, or the chain-compress collapse
+	 * had fused it into a run built around the pending forward value.
+	 */
+	if (ft_node_skip_compressed(graft_p) ||
 			(d_src.pnf == graft_c &&
 				prep != FT_GRAFT_PREP_NOSPLIT &&
 				!glue.old_dir_dropped) ||
@@ -4421,6 +4438,18 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 * the trie keeps rank stats.
 	 */
 	if (!ft_flip_txn_reserve_extra(txn, FT_REMOVE_COMMIT_REC_MAX_EDGES + 4 +
+			/*
+			 * A COMPRESSED publish parent on the NOSPLIT arm costs the
+			 * same TWO records the merge arm counts below -- the SKIP_X
+			 * dual the reserve recompaction re-encodes in the grandparent
+			 * and the {LOCK|s -> s} release of that grandparent -- now
+			 * that the shape gate admits it.  Counted unconditionally,
+			 * for the reason stated there.  (A -DURCU_TXN_DEBUG_RESERVE
+			 * build ran the 3000-shape corpus silent WITHOUT this term,
+			 * so today's headroom absorbs it; the term is the plan
+			 * saying what it holds rather than the slack doing so.)
+			 */
+			2 +
 			(ft->ordered_list ? FT_ORD_CELL_RUN_DETACH_MAX_EDGES +
 				FT_ORD_CELL_RUN_RESPLICE_MAX_EDGES : 0) +
 			/*

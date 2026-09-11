@@ -1340,8 +1340,42 @@ enum urcu_txn_status ft_store_at_graft_point_commit(struct cds_ft *ft,
 			 * lane whose bugs keep shipping, so it waits for that livelock.
 			 */
 			if (st->glue->record_only && st->glue->txn) {
+				unsigned int ri;
+
 				st->glue->txn->pending_pub_slot = pub_slot;
 				st->glue->txn->pending_pub_val = st->dest;
+				/*
+				 * AND ANNOUNCE THE SKIP_X DUAL, when the reserve recorded
+				 * one.  @reserve_rec holds the forward edge just added
+				 * above plus, for a COMPRESSED publish parent, the
+				 * re-encoded skip word in the GRANDPARENT's slot -- recorded
+				 * against that grandparent as it stood.  A recompaction of
+				 * the grandparent later in the caller's commit (the rekey's
+				 * src detach when BP IS that grandparent, or an elevating
+				 * detach landing on it) builds its copy from COMMITTED words
+				 * and would carry the OLD skip word over; naming the slot
+				 * lets the copy loop fold the refreshed value BY IDENTITY,
+				 * exactly as ft_glue_txn_commit_edges does for the GLUE and
+				 * MERGE publishes.  ☞ ft_flip_txn @pending_dual_slot.
+				 *
+				 * MEASURED before this line, on the 3000-shape rekey corpus
+				 * with the compressed-publish-parent refusal lifted: 17
+				 * shapes returned OK with cds_ft_verify reporting "stale
+				 * SKIP_X dual" -- every one of them with the grandparent
+				 * DEL-recompacted as a plain copy by the detach.  The 24
+				 * shapes where the detach instead FUSED the grandparent into
+				 * a run were already right, because ft_chain_compress_fused
+				 * builds around the pending forward value.
+				 */
+				for (ri = 0; ri < st->reserve_rec.n; ri++) {
+					if (st->reserve_rec.slot[ri] == pub_slot)
+						continue;
+					st->glue->txn->pending_dual_slot =
+						st->reserve_rec.slot[ri];
+					st->glue->txn->pending_dual_val =
+						st->reserve_rec.new_val[ri];
+					break;
+				}
 			}
 			/*
 			 * Order-statistics fold (BULK): the reserve relocated the

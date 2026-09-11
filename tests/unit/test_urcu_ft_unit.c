@@ -69,13 +69,13 @@
 #endif
 
 /*
- * 327 unconditional + 51 fault-injection-only RUN_TEST registrations, on top of
+ * 328 unconditional + 51 fault-injection-only RUN_TEST registrations, on top of
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (386 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (387 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (335 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (336 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -13482,6 +13482,154 @@ static int test_rekey_fold_writes_value(void)
 	ret |= rekey_fold_writes_value(1, 0);
 	ret |= rekey_fold_writes_value(0, 1);
 	ret |= rekey_fold_writes_value(1, 1);
+	return ret;
+}
+
+/*
+ * A COMPRESSED PUBLISH PARENT on the NOSPLIT graft arm, with the GRANDPARENT
+ * recompacted by the src detach in the same commit.
+ *
+ * The dst attach point sits in a node whose PARENT is a compressed run, so the
+ * graft's reserve recompaction publishes TWO words: the run's child word and,
+ * one level up, the SKIP_X dual in the GRANDPARENT's slot that lets a candidate
+ * reader bypass the run.  The reserve records both (ft_pub_rec) against the
+ * grandparent AS IT STANDS.  When the src junction IS that grandparent (shapes
+ * A and C: the moved key hangs straight off it), or when the drop empties BP and
+ * the detach ELEVATES onto it (shape B), the detach DEL-recompacts the
+ * grandparent in the same commit -- and its copy loop reads COMMITTED words, so
+ * without an announcement the fresh grandparent is born holding the OLD skip
+ * word.  cds_ft_verify: "compressed ... stale SKIP_X dual: slot ... encodes
+ * child X but cn->child is Y".  Every key is still reachable; the structure is
+ * not.
+ *
+ * The cure is the one ft_glue_txn_commit_edges already applies to the GLUE and
+ * MERGE publishes: name the dual as @pending_dual_slot so the copy loop folds
+ * the refreshed word by identity.  ft_store_at_graft_point_commit's relocated
+ * arm now does the same for the reserve's rec, and the shape gate's
+ * compressed-publish-parent term is gone.
+ *
+ * TWO RED ARMS, both run: the gate term restored answers all three shapes
+ * NOT_SUPPORTED; the gate lifted with the announcement ablated answers OK and
+ * leaves cds_ft_verify red on all three.  Drawn from the 3000-shape corpus,
+ * where the term refused 98 shapes and exactly 17 of them were wrong -- all
+ * with the grandparent recompacted as a plain copy; the 24 whose grandparent
+ * the chain-compress collapse FUSED into a run were already right, because
+ * that collapse builds around the pending forward value.
+ *
+ * On a build without path compression the same calls are ordinary moves and
+ * must still commit; on one without skip pointers there is no dual to go stale
+ * and the shapes commit as well.  So OK is required on every build.
+ *
+ * SHAPE D IS THE ONE THE FIRST SKEPTIC PASS FOUND, and it runs with RANK
+ * STATS ON.  The grandparent X is BELOW the root and the drop leaves it with
+ * ONE child -- the compressed publish parent -- so the detach's chain-compress
+ * collapse FUSES X and that run into one new run (skip mode only).  The
+ * deferred +count walk then reaches that one survivor from TWO chain levels
+ * (the publish parent's and X's) and, until ft_flip_txn_record_count_parent
+ * learned to bake once per survivor body, charged it twice: OK, keys right,
+ * `depth 1: compressed node nr_keys mismatch: stored 4, computed 3`.  Only
+ * the rank lane sees it, and only with skip pointers; the same call is clean
+ * on the other builds, which is what keeps OK required everywhere here too.
+ *
+ * SHAPE E is D one level down, so the fuse also absorbs X's COMPRESSED PARENT
+ * (the run "q" above it) into the same new run.  The fuse then publishes into
+ * that parent's slot and records nothing at X's own, so the walk meets the
+ * survivor at the publish parent's level, FALLS THROUGH at X's, and meets the
+ * survivor again at the parent's -- two non-consecutive hits.  The dedupe
+ * must be by identity over the whole walk, and this is the shape that says so
+ * (a second skeptic pass traced it: survivor, plain, survivor).
+ */
+static int rekey_compressed_publish_parent(int ordered_list, int shape)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	enum cds_ft_status s;
+	/* A: BP is the grandparent (root), the moved key hangs off it. */
+	static const char *const a_keys[] = { "ab", "abac", "ccc", NULL };
+	/* B: BP is emptied; the elevating detach lands on the grandparent. */
+	static const char *const b_keys[] = { "acaa", "ba", "ac", NULL };
+	/* C: as A, with the run one level deeper. */
+	static const char *const c_keys[] = { "cbcc", "bb", "bbbcaa", NULL };
+	/* D: X below the root, left one-child -> FUSED; rank stats ON. */
+	static const char *const d_keys[] = { "xab", "xabac", "xccc", NULL };
+	/* E: as D under a compressed parent -> a THREE-node fuse; rank ON. */
+	static const char *const e_keys[] = { "qxab", "qxabac", "qxccc", NULL };
+	static const struct {
+		const char *const *keys;
+		const char *dst, *src, *moved_from, *moved_to;
+		bool rank_stats;
+	} shapes[] = {
+		{ a_keys, "abb", "c", "ccc", "abbcc", false },
+		{ b_keys, "acbab", "ba", "ba", "acbab", false },
+		{ c_keys, "bba", "cb", "cbcc", "bbacc", false },
+		{ d_keys, "xabb", "xc", "xccc", "xabbcc", true },
+		{ e_keys, "qxabb", "qxc", "qxccc", "qxabbcc", true },
+	};
+	const char *const *keys = shapes[shape].keys;
+	unsigned long n = 0;
+	int ret = -1, i;
+
+	if (!cds_ft_merge_enabled()) {
+		diag("rekey_compressed_publish_parent: skipped, merge compiled "
+			"out (-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
+	if (cds_ft_group_attr_create(&attr) < 0)
+		return -1;
+	if (cds_ft_group_attr_set_ordered_list(attr, ordered_list) < 0 ||
+	    (shapes[shape].rank_stats &&
+	     cds_ft_group_attr_set_rank_stats(attr, true) < 0) ||
+	    cds_ft_group_create(attr, &group) < 0) {
+		cds_ft_group_attr_destroy(attr);
+		return -1;
+	}
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &ft) < 0) {
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	rcu_read_lock();
+	for (i = 0; keys[i]; i++) {
+		cds_ft_insert(ft, (const uint8_t *) keys[i], strlen(keys[i]),
+			&node_alloc((unsigned long) i + 1)->node);
+		n++;
+	}
+	s = ft_rekey(ft, shapes[shape].dst, shapes[shape].src);
+	if (s != CDS_FT_STATUS_OK ||
+	    !ft_test_has_key(ft, shapes[shape].moved_to) ||
+	    ft_test_has_key(ft, shapes[shape].moved_from))
+		goto out;
+	for (i = 0; keys[i]; i++)
+		if (strcmp(keys[i], shapes[shape].moved_from) &&
+		    !ft_test_has_key(ft, keys[i]))
+			goto out;
+	if (cds_ft_count_keys(ft) != n ||
+	    cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK)
+		goto out;
+	ret = 0;
+out:
+	if (ret)
+		fprintf(stderr,
+			"compressed_publish_parent(list=%d shape=%c): %s count %lu "
+			"(want %lu)\n", ordered_list, 'A' + shape,
+			cds_ft_status_to_string(s), cds_ft_count_keys(ft), n);
+	rcu_read_unlock();
+	drain_trie(ft);
+	rcu_barrier();
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+static int test_rekey_compressed_publish_parent(void)
+{
+	int ret = 0, shape, list;
+
+	/* EVERY LEG RUNS: `|=`, so a first red never hides the others. */
+	for (shape = 0; shape < 5; shape++)
+		for (list = 0; list < 2; list++)
+			ret |= rekey_compressed_publish_parent(list, shape);
 	return ret;
 }
 
@@ -37553,6 +37701,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_rekey_fold_replace_count);
 	RUN_TEST(test_rekey_split_cluster_count);
 	RUN_TEST(test_rekey_fold_writes_value);
+	RUN_TEST(test_rekey_compressed_publish_parent);
 	RUN_TEST(test_rekey_merge_colocated_chain);
 	RUN_TEST(test_rekey_merge_cut_source);
 	RUN_TEST(test_rekey_merge_dst_run_start);

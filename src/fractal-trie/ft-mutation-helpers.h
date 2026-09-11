@@ -10745,6 +10745,12 @@ void ft_flip_txn_record_count_parent(struct cds_ft *ft, struct ft_flip_txn *t,
 {
 	struct cds_ft_inode_flag *cur = stable_base;
 	struct urcu_txn_desc *desc = NULL;
+	/*
+	 * The survivor bodies this walk has already charged.  Bounded by the
+	 * walk itself: one level of the chain adds at most one body.
+	 */
+	struct cds_ft_metadata *charged[FT_MAX_DEPTH];
+	unsigned int nr_charged = 0, ci;
 
 	if (!ft->rank_stats)
 		return;
@@ -10831,9 +10837,59 @@ void ft_flip_txn_record_count_parent(struct cds_ft *ft, struct ft_flip_txn *t,
 						sr->new_ptr);
 
 				if (sm && sm != m) {
-					ft_nr_keys_store(ft, sm,
-						ft_nr_keys_get(sm) + delta,
-						CMM_RELAXED);
+					/*
+					 * ☠ ONE BAKE PER SURVIVOR BODY, NOT PER
+					 * CHAIN LEVEL.  A chain-compress collapse
+					 * that FUSES the recompacted junction with
+					 * its surviving compressed child and/or its
+					 * compressed parent replaces TWO OR THREE
+					 * levels of this chain with ONE run, built
+					 * from ONE top count (ft_chain_compress_fused).
+					 * Every absorbed level whose slot the txn
+					 * recorded resolves here to that same run,
+					 * and baking @delta at each of them charges
+					 * the run once per level it absorbed.
+					 *
+					 * MEASURED, rank stats on, skip-compressed
+					 * build: insert {xab, xabac, xccc} then
+					 * rekey_merge(dst "xabb", src "xc").  The
+					 * dst publish parent is the run under the
+					 * depth-1 junction X, the src detach empties
+					 * X to that one child and fuses X + run into
+					 * one run born with X's count minus the
+					 * moved key (3 - 1); this walk then arrived
+					 * at the run FROM the publish parent's level
+					 * AND from X's level, and the run shipped
+					 * `stored 4, computed 3`.  Without skip
+					 * pointers the collapse does not run and the
+					 * levels stay one-to-one, which is why only
+					 * the skip-compressed build showed it.
+					 *
+					 * ☞ THE HITS ARE NOT CONSECUTIVE.  With a
+					 * compressed PARENT absorbed too, the fuse
+					 * publishes into the parent's slot and
+					 * records nothing at the junction's own, so
+					 * the junction's level FALLS THROUGH to the
+					 * plain record below (a CAS on a body this
+					 * commit retires -- harmless, and the
+					 * pre-existing behaviour) and the run is met
+					 * again one level up.  Measured on
+					 * {qxab, qxabac, qxccc} + rekey_merge(dst
+					 * "qxabb", src "qxc"): survivor, plain,
+					 * survivor.  So the dedupe is by IDENTITY over
+					 * the whole walk, not against the last hit;
+					 * the climb itself still steps every level.
+					 */
+					for (ci = 0; ci < nr_charged; ci++)
+						if (charged[ci] == sm)
+							break;
+					if (ci == nr_charged) {
+						ft_nr_keys_store(ft, sm,
+							ft_nr_keys_get(sm) + delta,
+							CMM_RELAXED);
+						if (nr_charged < FT_MAX_DEPTH)
+							charged[nr_charged++] = sm;
+					}
 					cur = ft_parent_node(m->parent_word);
 					continue;
 				}
@@ -10870,9 +10926,17 @@ void ft_flip_txn_record_count_parent(struct cds_ft *ft, struct ft_flip_txn *t,
 				t->pending_pub_val);
 
 			if (sm && sm != m) {
-				ft_nr_keys_store(ft, sm,
-					ft_nr_keys_get(sm) + delta,
-					CMM_RELAXED);
+				/* the same one-bake-per-body rule as above */
+				for (ci = 0; ci < nr_charged; ci++)
+					if (charged[ci] == sm)
+						break;
+				if (ci == nr_charged) {
+					ft_nr_keys_store(ft, sm,
+						ft_nr_keys_get(sm) + delta,
+						CMM_RELAXED);
+					if (nr_charged < FT_MAX_DEPTH)
+						charged[nr_charged++] = sm;
+				}
 				cur = ft_parent_node(m->parent_word);
 				continue;
 			}
