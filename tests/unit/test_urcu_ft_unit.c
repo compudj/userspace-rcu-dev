@@ -73,9 +73,9 @@
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (390 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (391 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (339 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (340 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -11730,6 +11730,180 @@ static enum cds_ft_status ft_rekey(struct cds_ft *ft, const char *nw,
 {
 	return cds_ft_rekey_merge(ft, (const uint8_t *) nw, strlen(nw),
 			(const uint8_t *) old, strlen(old));
+}
+
+/*
+ * THE SAME-PATH MERGE: src and dst sharing the internal node above them.
+ *
+ * `rekey_merge(dst "ac", src "ab")` over {ab, ac} is the LAST-BYTE move -- the
+ * shape the rekey-coherent reader's two-descent witness exists for, because it
+ * is the one where the rekey need not change the internal path leading to the
+ * destination at all.  Three geometries: at the root, one level below it, and
+ * with the shared parent keeping a sibling the move does not touch.
+ *
+ * ☠ WHY IT IS FORKED UNDER AN ALARM, AND NOT AN ORDINARY TEST.  The failure
+ * this pins is a HANG.  A same-path move that reaches the dst-attach COW has
+ * TWO owners relocating one node in a single commit -- this frame's copy and
+ * the detach's own recompaction of the src junction -- and the op then SPINS,
+ * allocating as it spins.  Written inline, a regression would hang the whole
+ * suite and report nothing (and, uncaged, take the machine's memory with it).
+ * The child bounds its own loop; the parent reports.
+ *
+ * ☠ AND THE 3000-SHAPE GENERATED CORPUS CANNOT SEE THIS CLASS: it is 13/14
+ * `same_parent = 0` at the exit in question, and its one exception is refused
+ * for an unrelated reason.  Twenty-eight green corpus legs certified the change
+ * that introduced the hang.  A generated corpus is a sample, not a cover, which
+ * is the whole reason these three cases were named by hand.
+ *
+ * ☞ IT DOES NOT ASSERT WHICH ANSWER COMES BACK.  Whether the class is SERVED is
+ * a property of the writer's cut and is expected to change: the attach point
+ * gets no fresh address of its own here (ft_merge_build splices the src leaf
+ * onto the dst head's duplicate chain and hands the head back), so today it is
+ * refused.  What must hold on EITHER answer is the "atomic or refused" shape --
+ * the call RETURNS, the moved key is at exactly ONE of its two names, the count
+ * is exact, and cds_ft_verify is clean.
+ */
+static const char *const same_path_keys[3][3] = {
+	{ "ab",  "ac",  NULL },		/* at the root */
+	{ "xab", "xac", NULL },		/* one level below it */
+	{ "ab",  "ac",  "az" },		/* the shared parent keeps a sibling */
+};
+
+static int same_path_one(struct cds_ft *ft, const char *const *keys,
+		const char *dst, const char *src)
+{
+	unsigned long want = 0, n;
+	enum cds_ft_status s;
+	unsigned int i;
+
+	for (i = 0; i < 3 && keys[i]; i++) {
+		cds_ft_insert(ft, (const uint8_t *) keys[i],
+			strlen(keys[i]), &node_alloc((int) i + 1)->node);
+		want++;
+	}
+	s = ft_rekey(ft, dst, src);
+	if (s != CDS_FT_STATUS_OK && s != CDS_FT_STATUS_NOT_SUPPORTED) {
+		fprintf(stderr, "same_path(dst %s src %s): %s\n", dst, src,
+			cds_ft_status_to_string(s));
+		return -1;
+	}
+	/*
+	 * The moved key is at exactly ONE of its two names: gone from @src on a
+	 * served move, still at @src on a refused one -- and @dst present either
+	 * way, since it was inserted.  A merge onto an occupied dst consumes one
+	 * name, so the key count drops by one exactly when the move happened.
+	 */
+	if (!ft_test_has_key(ft, dst) ||
+	    ft_test_has_key(ft, src) != (s != CDS_FT_STATUS_OK)) {
+		fprintf(stderr, "same_path(dst %s src %s): %s but dst=%d src=%d\n",
+			dst, src, cds_ft_status_to_string(s),
+			ft_test_has_key(ft, dst), ft_test_has_key(ft, src));
+		return -1;
+	}
+	n = cds_ft_count_keys(ft);
+	if (n != (s == CDS_FT_STATUS_OK ? want - 1 : want)) {
+		fprintf(stderr, "same_path(dst %s src %s): %s count %lu want %lu\n",
+			dst, src, cds_ft_status_to_string(s), n,
+			s == CDS_FT_STATUS_OK ? want - 1 : want);
+		return -1;
+	}
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "same_path(dst %s src %s): verify RED\n",
+			dst, src);
+		return -1;
+	}
+	return 0;
+}
+
+__attribute__((noreturn))
+static void same_path_child(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	unsigned int g, m;
+
+	/*
+	 * The bound.  A hang here is the regression; SIGALRM is how the parent
+	 * learns about it, and a core of the spinning process is not evidence.
+	 */
+	{
+		struct rlimit rl = { .rlim_cur = 0, .rlim_max = 0 };
+
+		(void) setrlimit(RLIMIT_CORE, &rl);
+	}
+	alarm(60);
+	for (g = 0; g < 3; g++) {
+		for (m = 0; m < 4; m++) {	/* rank x ordered-list */
+			bool rank = (m >= 2), list = (m & 1) != 0;
+			int bad;
+
+			if (rank)
+				ft = create_varlen_rankstats_list_ft(list,
+					&group);
+			else
+				ft = create_varlen_ft(&group);
+			rcu_read_lock();
+			bad = same_path_one(ft, same_path_keys[g],
+				same_path_keys[g][1], same_path_keys[g][0]);
+			rcu_read_unlock();
+			/*
+			 * ☠ NO drain / rcu_barrier / destroy HERE, and that is
+			 * not laziness.  fork() duplicates only the calling
+			 * thread, so the CHILD HAS NO call_rcu WORKER -- a
+			 * grace period started in it never completes and
+			 * rcu_barrier() blocks forever.  Measured: the first
+			 * version of this test hung in its own teardown and
+			 * reported the library's move as the hang, on a tree
+			 * where all twelve moves return cleanly.  The child
+			 * _exit()s; reclamation is the kernel's job.
+			 */
+			(void) group;
+			if (bad) {
+				fprintf(stderr,
+					"same_path: geometry %u mode %u failed\n",
+					g, m);
+				_exit(1);
+			}
+		}
+	}
+	_exit(0);
+}
+
+static int test_rekey_same_path_atomic_or_refused(void)
+{
+	pid_t pid;
+	int status;
+
+	if (!cds_ft_merge_enabled()) {
+		diag("test_rekey_same_path_atomic_or_refused: skipped, merge "
+			"compiled out (-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
+	pid = fork();
+	if (pid < 0) {
+		fprintf(stderr, "same_path: fork failed\n");
+		return -1;
+	}
+	if (pid == 0)
+		same_path_child();
+	if (waitpid(pid, &status, 0) != pid) {
+		fprintf(stderr, "same_path: waitpid failed\n");
+		return -1;
+	}
+	if (WIFSIGNALED(status)) {
+		fprintf(stderr, "same_path: child killed by signal %d%s\n",
+			WTERMSIG(status),
+			WTERMSIG(status) == SIGALRM ?
+				" (HANG -- the same-path move did not return)" :
+				"");
+		return -1;
+	}
+	if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+		fprintf(stderr, "same_path: child exited %d\n",
+			WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+		return -1;
+	}
+	return 0;
 }
 
 /*
@@ -38198,6 +38372,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_merge_rerooted_nosplit_ordered_atnode);
 	RUN_TEST(test_merge_rerooted_nosplit_ordered_branch);
 	RUN_TEST(test_merge_rekey_same_trie);
+	RUN_TEST(test_rekey_same_path_atomic_or_refused);
 	RUN_TEST(test_rekey_bare_head_rankstats);
 	RUN_TEST(test_rekey_uncovered_dst_is_not_an_argument_error);
 	RUN_TEST(test_rekey_bare_head_graft_nosplit);
