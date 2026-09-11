@@ -2338,6 +2338,12 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 * ft_glue_abort frees it; kept here only to carry the count bake.
 	 */
 	struct cds_ft_inode_flag *dst_pp_prime = NULL;
+	/*
+	 * The OLD body of the dst publish parent that @dst_pp_prime replaces:
+	 * retired by cow_stop's record at the flip, unlinked by this commit, and
+	 * -- per cow_stop's own contract -- the CALLER's to free afterwards.
+	 */
+	struct cds_ft_inode *dst_pp_old = NULL;
 	struct ft_held_anchor ks_held = { 0 };	/* KEY_SHORTER run's overlap fence */
 	bool ks_fenced = false;
 	struct cds_ft_inode_flag *probe_D = NULL;	/* occupied dst merge point */
@@ -4168,8 +4174,30 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 					merged_pub);
 				witness_by_detach = true;
 				ret = 0;
-			} else if (ret)
+			} else if (ret) {
 				goto bail_build;
+			} else if (dst_pp_prime) {
+				/*
+				 * ☠ THE COPY'S ORIGINAL HAS NO OTHER OWNER.  cow_stop's
+				 * contract: "the caller ... frees the OLD @stop via
+				 * call_rcu after the grace period once the commit
+				 * succeeds".  The src lane does that for its S_top
+				 * (cds_ft_free_item_deferred(s_top_meta) below); this
+				 * lane never did for @d_dst.pnf -- MEASURED with the
+				 * drain oracle: every move served by this arm leaked
+				 * exactly one internal node (4 of 4 corpus seeds, the
+				 * non-drain balance's floor having hidden it).  Named
+				 * here, freed in the post-commit reclaim block.
+				 *
+				 * ft_node_ptr is right ONLY because the helper admits a
+				 * plain POPCOUNT/PIGEON parent and nothing else; widen
+				 * that arm to a compressed or skip-encoded parent and
+				 * this line would decode the wrong body.  Pinned.
+				 */
+				urcu_assert_debug(!ft_node_external(d_dst.pnf) &&
+					!ft_node_compressed(d_dst.pnf));
+				dst_pp_old = ft_node_ptr(d_dst.pnf);
+			}
 		} else {
 		/*
 		 * The merged top replaces D in the publish parent's slot.  Recorded, not
@@ -6788,6 +6816,19 @@ cells_done:
 			free_cds_ft_node(ft, gst_st.old_recompacted_node);
 		if (detach_rc.old_node)
 			free_cds_ft_node(ft, detach_rc.old_node);	/* old BP copy */
+		/*
+		 * The dst publish parent's OLD body, superseded by the COW the
+		 * merge arm made of it (@dst_pp_old): retired by cow_stop's record,
+		 * unlinked by this commit, owned by nobody else -- not the glue's
+		 * free list (the copy is glue-BUILT, the original never joins it;
+		 * ft_glue_defer_free's callers name src-side and D-side nodes only)
+		 * and not the detach, on two grounds that are both load-bearing:
+		 * the arm refuses a src path through P, so no detach set is built
+		 * from it, AND what the detach's collapse retires -- a one-child
+		 * src-path boundary and compressed runs -- are kinds P cannot be.
+		 */
+		if (dst_pp_old)
+			free_cds_ft_node(ft, dst_pp_old);
 		/* The folded collapse's retired chain: this commit unlinked it. */
 		ft_rekey_collapse_free_retired(ft, &detach_rc.collapse);
 		/*
