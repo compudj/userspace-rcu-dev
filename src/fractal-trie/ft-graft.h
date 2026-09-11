@@ -256,12 +256,89 @@ int ft_split_compressed_graft_build(struct cds_ft *ft,
 	 * @old_dir_deferred -- BP is RETIRED here, not re-homed, so there is no
 	 * re-parent for a later step to find.
 	 *
+	 * ☠ THAT LAST SENTENCE IS TRUE OF THESE TWO ARMS ONLY.  The PROMOTE arm
+	 * below substitutes a LIVE external head, whose re-parent IS deferred --
+	 * so @old_dir_deferred comes back as a VALID INDEX there, naming the
+	 * head's edge.  Its one consumer is ft_detach_node's external-promote
+	 * (ft-remove.h), which refuses on `idx < 0` and would otherwise CLOBBER
+	 * that entry with its own head.  Unreachable today -- the rekey driver
+	 * runs no detach when @old_dir_replace.done (a conditional breakpoint on
+	 * that consumer never fired across the 3000-shape corpus) -- so the
+	 * consumer now ASSERTS the exclusion rather than resting on it.
+	 *
 	 * ☠ ITS BACK EDGE IS A PLAIN STORE, NOT A DEFERRED ONE.  BP' is a FRESH
 	 * node no reader can reach until the forward publish, so its parent word
 	 * is a build-invisible interior write -- the txn publishes reachability,
 	 * not interiors.  Deferring it instead would record a re-parent for a node
 	 * the commit has no live edge to, and the drop arm makes the same call.
 	 */
+	/*
+	 * PROMOTE, and it is neither of the two below: the drop takes BP's ONLY
+	 * child and BP KEEPS a co-located key chain, so the old direction is that
+	 * HEAD and BP goes away entirely.  ft_detach_node publishes the promoted
+	 * chain for exactly this shape, and the rekey fold's own
+	 * FT_REKEY_FOLD_PROMOTE writes exactly this value into @graft_c's slot;
+	 * this is that answer one lane over, where the slot lives in the cluster
+	 * the split is building.
+	 *
+	 * ☠ AND THE SUBSTITUTED CHILD IS LIVE AND APP-OWNED, which is why
+	 * @live is set and the suffix build below must DEFER its back edge.  The
+	 * COLLAPSE and REPLACE arms substitute a node this build just created and
+	 * may plain-store it; a head is reachable through BP until the forward
+	 * publish flips, and an abort after a plain store would leave the
+	 * application's node naming a body this attempt abandoned.
+	 */
+	if (glue->old_dir_replace.of && glue->old_dir_replace.of == cn_child &&
+			ft_node_internal(cn_child) &&
+			ft_meta_nr_child(ft_flag_to_metadata(ft, cn_child)) == 1 &&
+			ft_flag_to_metadata(ft, cn_child)->external_nodes) {
+		struct cds_ft_metadata *bpm = ft_flag_to_metadata(ft, cn_child);
+		struct cds_ft_node *head;
+		uint8_t rn = 0;
+
+		if (!glue->txn)
+			return -EAGAIN;		/* no txn to retire BP into */
+		/*
+		 * RE-VALIDATE the plan against the body as it stands: the slot the
+		 * drop names must still be BP's, and BP must still be the shape the
+		 * caller armed -- one child, and a key chain to promote.  -EAGAIN,
+		 * never a shape refusal: BP is unheld here, so a peer is a
+		 * transient a re-descent clears.
+		 */
+		if (!ft_node_find_child(ft, cn_child,
+				glue->old_dir_replace.drop_child, &rn, NULL))
+			return -EAGAIN;		/* stale plan: re-descend */
+		if (ft_meta_nr_child(bpm) != 1 || !bpm->external_nodes)
+			return -EAGAIN;		/* BP grew or lost its keys */
+		head = ft_dereference_external(bpm->external_nodes);
+		if (!head)
+			return -EAGAIN;
+		/*
+		 * ☐ RESIDUAL, INHERITED KNOWINGLY AND IDENTICAL TO THE COLLAPSE
+		 * ARM'S BELOW -- and stated here because this arm widens it to a
+		 * new object class.  The re-reads above are UNLOCKED: nothing holds
+		 * BP across the window between them and the commit, so a peer that
+		 * splices a NEW head onto this chain, or adds a second child, in
+		 * that window is retired along with BP.  The rekey FOLD's own
+		 * PROMOTE closes exactly this with @promote_val plus
+		 * ft_detach_orphan_planlock(require_single_child) -- it can, because
+		 * it freezes the node in a later phase; this arm IS the build and
+		 * has no such phase.  Closing it needs the split to plan-lock BP,
+		 * which is a change to the glue's ownership model rather than to
+		 * this arm (the same sentence the COLLAPSE arm carries).
+		 */
+		/*
+		 * BP is RETIRED, not recompacted: nothing is left of it once its
+		 * one child leaves and its keys move up.  The plain retire, on the
+		 * same footing @cn and the COLLAPSE arm's BP use -- ☞ the header
+		 * there for why a FENCED free-list entry cannot be used here.
+		 */
+		ft_glue_defer_free(glue, ft_node_ptr(cn_child), false);
+		cn_child = (struct cds_ft_inode_flag *) head;
+		glue->old_dir_replace.done = true;
+		glue->old_dir_replace.live = true;
+		goto no_old_dir_replace;
+	}
 	if (glue->old_dir_replace.of && glue->old_dir_replace.of == cn_child &&
 			ft_node_internal(cn_child) &&
 			ft_meta_nr_child(ft_flag_to_metadata(ft, cn_child)) == 2 &&
@@ -482,7 +559,7 @@ no_old_dir_replace:
 		 * on an external's parent.  The merge-rekey path has no txn (glue->txn
 		 * NULL); there it stays on the legacy fresh-before-live immediate store.
 		 */
-		if (glue->old_dir_replace.done)
+		if (glue->old_dir_replace.done && !glue->old_dir_replace.live)
 			ft_set_parent(ft, cn_child, old_suffix_flag,
 				&sfx->child);
 		else
@@ -506,7 +583,7 @@ no_old_dir_replace:
 		ft_node_get_nth_skip(dest, &slot,
 			cn->key_bytes[diverge_pos + 1], FT_PF_NONE);
 		/* Displaced child: LIVE, ride the txn -- see the suffix_len>1 case. */
-		if (glue->old_dir_replace.done)
+		if (glue->old_dir_replace.done && !glue->old_dir_replace.live)
 			ft_set_parent(ft, cn_child, dest, slot);
 		else
 			ft_glue_defer_edge_origin(ft, glue, cn_child, dest,
@@ -629,9 +706,22 @@ old_dir_built:
 	 * under the branch (no fresh suffix node), so this edge re-parents a
 	 * reader-reachable node -- dst_origin (ride the txn).  suffix_len > 0:
 	 * @old_suffix_flag is the fresh sfx/dest, a hidden edge (src-origin).
+	 *
+	 * ☠ AND @old_dir_replace.done DOES NOT MEAN "FRESH".  It did while the
+	 * only two arms substituted a node this build had just created (BP'
+	 * recompacted, or the collapsed run), and the term above reads that way.
+	 * The PROMOTE arm substitutes the app's OWN EXTERNAL HEAD -- live,
+	 * reader-reachable through BP until this commit flips -- so its edge
+	 * must ride the txn exactly as an unsubstituted @cn_child's does.
+	 * @live is what separates the two, and it is checked here as well as at
+	 * the two suffix sites: MEASURED, 4 of the 5 promote shapes in the
+	 * 3000-shape corpus reach the branch through suffix_len == 0 and touch
+	 * NEITHER of those, so this is the site that actually decides them.
 	 */
 	ft_glue_defer_edge_origin(ft, glue, old_suffix_flag, branch_flag, slot,
-		suffix_len == 0 && !glue->old_dir_replace.done &&
+		suffix_len == 0 &&
+			(!glue->old_dir_replace.done ||
+				glue->old_dir_replace.live) &&
 			glue->txn != NULL);
 	/*
 	 * ☠ NAME WHAT THIS BUILD REPLACED (see @split_cn), and name it HERE.

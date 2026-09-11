@@ -69,13 +69,13 @@
 #endif
 
 /*
- * 330 unconditional + 51 fault-injection-only RUN_TEST registrations, on top of
+ * 331 unconditional + 51 fault-injection-only RUN_TEST registrations, on top of
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (389 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (390 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (338 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (339 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -13923,6 +13923,167 @@ out:
 	rcu_barrier();
 	cds_ft_destroy(ft);
 	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
+ * THE SPLIT'S OLD DIRECTION, WHEN THE DROP LEAVES THE JUNCTION KEYED.
+ *
+ * A GLUE prep splits the compressed node @cn the dst diverges inside, and @cn's
+ * one live child is the src junction BP.  ft_split_compressed_graft_build
+ * already builds the old half two ways -- COLLAPSE when BP has exactly two
+ * children and no keys, REPLACE when it keeps two or more -- and the caller
+ * armed both with one `nr_child >= 2`.  Neither expresses the third shape: BP
+ * has ONE child (the moved arm) and a CO-LOCATED KEY CHAIN, so the drop empties
+ * it of children and the old direction is that HEAD, with BP gone entirely.
+ * That is the PROMOTE ft_detach_node performs for a node the drop leaves
+ * childless but keyed, and the one the rekey fold's own FT_REKEY_FOLD_PROMOTE
+ * writes into @graft_c's slot; it was simply missing on this lane.  With the
+ * cut source admitted beside it (the same reasoning as
+ * test_rekey_fold_cut_source), that is 9 of the 3000 generated shapes -- 5
+ * PROMOTE and 4 cut -- and it takes the -ENOTSUP shape gate to firing ZERO
+ * times over the corpus.
+ *
+ * ☠ THE PROMOTED CHILD IS LIVE AND APP-OWNED, which is the one thing this arm
+ * does not share with its two siblings.  They substitute a node the build just
+ * created, so the suffix wiring may PLAIN-STORE its back edge -- BP' is fresh
+ * and no reader can reach it before the forward publish.  A head is reachable
+ * through BP for the whole build window, so its re-parent must RIDE the commit:
+ * @old_dir_replace.live says so, and both suffix sites consult it.  Exactly the
+ * distinction @pending_del_replace_fresh draws for the fold's own PROMOTE, and
+ * NOT derivable from "there is a substitution".
+ *
+ * A/D are the corpus's own shapes (seeds 1227 and 2890); E/F are the CUT x
+ * {PROMOTE, REPLACE} combinations the corpus never produces.  B/C carry
+ * @src_count == 2 through the promote, because at 1 the branch's
+ * `old_child_nr_keys + src_count` cannot tell a sum from a constant; C puts the
+ * split BELOW the root with rank statistics ON, so cds_ft_verify actually
+ * checks the stored nr_keys.  On a build without path compression there is no
+ * run for the dst to split, so these are ordinary moves that must still commit.
+ */
+static int rekey_split_old_dir_promote(int ordered_list, int shape)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	enum cds_ft_status s;
+	/* A: PROMOTE, one moved key (corpus seed 1227). */
+	static const char *const a_keys[] = { "ccccc", "cc", NULL };
+	/* B: PROMOTE, TWO moved keys -- the count is a sum, not a constant. */
+	static const char *const b_keys[] = { "cc", "cccca", "ccccb", NULL };
+	/* C: B with the split BELOW the root, rank statistics ON. */
+	static const char *const c_keys[] = { "q", "za", "zbcc", "zbcccca",
+		"zbccccb", NULL };
+	/* D: a CUT source on the same lane -> the COLLAPSE arm (seed 2890). */
+	static const char *const d_keys[] = { "a", "bbbacc", "bbcc", NULL };
+	/*
+	 * ☠ E AND F ARE THE COMBINATION, and the 3000-shape corpus does not
+	 * produce it: lifting `!src_cut` arms the cut for ALL THREE old-direction
+	 * arms, not just the COLLAPSE its four corpus seeds happen to take.  A cut
+	 * whose BP is one-child-and-keyed reaches the PROMOTE arm, and one whose
+	 * BP keeps two children plus a key reaches REPLACE.  Both answer
+	 * NOT_SUPPORTED at @088ec182 and are served here.  (The gap was found by
+	 * this change's adversarial skeptic.)
+	 */
+	static const char *const e_keys[] = { "cc", "ccxyz", NULL };
+	static const char *const f_keys[] = { "ccaxy", "ccb", "ccd", NULL };
+	static const char *const a_from[] = { "ccccc", NULL };
+	static const char *const a_to[]   = { "cacc", NULL };
+	static const char *const b_from[] = { "cccca", "ccccb", NULL };
+	static const char *const b_to[]   = { "caca", "cacb", NULL };
+	static const char *const c_from[] = { "zbcccca", "zbccccb", NULL };
+	static const char *const c_to[]   = { "zbcaca", "zbcacb", NULL };
+	static const char *const d_from[] = { "bbbacc", NULL };
+	static const char *const d_to[]   = { "bac", NULL };
+	static const char *const e_from[] = { "ccxyz", NULL };
+	static const char *const e_to[]   = { "cayz", NULL };
+	static const char *const f_from[] = { "ccaxy", NULL };
+	static const char *const f_to[]   = { "cqy", NULL };
+	static const struct {
+		const char *const *keys;
+		const char *dst, *src;
+		const char *const *moved_from;
+		const char *const *moved_to;
+		bool rank_stats;
+	} shapes[] = {
+		{ a_keys, "ca",   "ccc",   a_from, a_to, false },
+		{ b_keys, "ca",   "ccc",   b_from, b_to, true },
+		{ c_keys, "zbca", "zbccc", c_from, c_to, true },
+		{ d_keys, "ba",   "bbbac", d_from, d_to, true },
+		{ e_keys, "ca",   "ccx",   e_from, e_to, true },
+		{ f_keys, "cq",   "ccax",  f_from, f_to, true },
+	};
+	const char *const *keys = shapes[shape].keys;
+	unsigned long n = 0;
+	int ret = -1, i;
+
+	if (!cds_ft_merge_enabled()) {
+		diag("rekey_split_old_dir_promote: skipped, merge compiled out "
+			"(-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
+	if (cds_ft_group_attr_create(&attr) < 0)
+		return -1;
+	if (cds_ft_group_attr_set_ordered_list(attr, ordered_list) < 0 ||
+	    (shapes[shape].rank_stats &&
+	     cds_ft_group_attr_set_rank_stats(attr, true) < 0) ||
+	    cds_ft_group_create(attr, &group) < 0) {
+		cds_ft_group_attr_destroy(attr);
+		return -1;
+	}
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &ft) < 0) {
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	rcu_read_lock();
+	for (i = 0; keys[i]; i++) {
+		cds_ft_insert(ft, (const uint8_t *) keys[i], strlen(keys[i]),
+			&node_alloc((unsigned long) i + 1)->node);
+		n++;
+	}
+	s = ft_rekey(ft, shapes[shape].dst, shapes[shape].src);
+	if (s != CDS_FT_STATUS_OK)
+		goto out;
+	for (i = 0; shapes[shape].moved_to[i]; i++)
+		if (!ft_test_has_key(ft, shapes[shape].moved_to[i]) ||
+		    ft_test_has_key(ft, shapes[shape].moved_from[i]))
+			goto out;
+	for (i = 0; keys[i]; i++) {
+		int moved = 0, j;
+
+		for (j = 0; shapes[shape].moved_from[j]; j++)
+			if (!strcmp(keys[i], shapes[shape].moved_from[j]))
+				moved = 1;
+		if (!moved && !ft_test_has_key(ft, keys[i]))
+			goto out;
+	}
+	if (cds_ft_count_keys(ft) != n ||
+	    cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK)
+		goto out;
+	ret = 0;
+out:
+	if (ret)
+		fprintf(stderr,
+			"split_old_dir_promote(list=%d shape=%c): %s count %lu "
+			"(want %lu)\n", ordered_list, 'A' + shape,
+			cds_ft_status_to_string(s), cds_ft_count_keys(ft), n);
+	rcu_read_unlock();
+	drain_trie(ft);
+	rcu_barrier();
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+static int test_rekey_split_old_dir_promote(void)
+{
+	int ret = 0, shape, list;
+
+	/* EVERY LEG RUNS: `|=`, so a first red never hides the others. */
+	for (shape = 0; shape < 6; shape++)
+		for (list = 0; list < 2; list++)
+			ret |= rekey_split_old_dir_promote(list, shape);
 	return ret;
 }
 
@@ -38030,6 +38191,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_rekey_compressed_publish_parent);
 	RUN_TEST(test_rekey_fold_compressed_chain);
 	RUN_TEST(test_rekey_fold_cut_source);
+	RUN_TEST(test_rekey_split_old_dir_promote);
 	RUN_TEST(test_rekey_merge_colocated_chain);
 	RUN_TEST(test_rekey_merge_cut_source);
 	RUN_TEST(test_rekey_merge_dst_run_start);

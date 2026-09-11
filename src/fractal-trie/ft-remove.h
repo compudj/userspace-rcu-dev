@@ -189,6 +189,18 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			 */
 			urcu_assert_debug(!g->old_dir_dropped);
 			/*
+			 * ...AND THE SAME FOR A SUBSTITUTED OLD DIRECTION.  Two of
+			 * the three substitutions leave @old_dir_deferred at -1 and
+			 * are caught by the refusal below; the PROMOTE arm defers a
+			 * LIVE head and so hands back a VALID index, which this
+			 * frame would clobber with its own promoted chain.  The
+			 * caller that arms @old_dir_replace runs no detach (the
+			 * `!done` guard at its step 3), so this is unreachable --
+			 * asserted rather than assumed, because the refusal below
+			 * cannot see it.
+			 */
+			urcu_assert_debug(!g->old_dir_replace.done);
+			/*
 			 * REFUSE, do not guess, on every shape the re-home is not
 			 * written for: a re-home through a fresh suffix node
 			 * (whose parent slot holds a SKIP form this frame cannot

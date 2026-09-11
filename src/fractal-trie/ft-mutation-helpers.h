@@ -11808,6 +11808,24 @@ struct ft_glue {
 		struct cds_ft_inode_flag *fresh;	/* BP' */
 		bool done;				/* the split took it */
 		bool collapsed;				/* ...as ONE fused run */
+		/*
+		 * ☠ ...AND THE SUBSTITUTED CHILD IS THE APP'S OWN LIVE HEAD.
+		 *
+		 * The PROMOTE arm: the drop leaves BP childless but KEYED, so what
+		 * takes its place in the fresh cluster is BP's EXTERNAL CHAIN HEAD
+		 * -- a node the application owns, that is LIVE, and that a reader
+		 * still reaches through BP for the whole build window.  The other
+		 * two arms substitute a node this build just created, which is why
+		 * they may plain-store its back edge; this one may NOT.  Its
+		 * re-parent has to RIDE the commit like any other live edge, or an
+		 * abort after the wiring leaves the head's parent word naming a
+		 * body this attempt abandoned.
+		 *
+		 * Exactly the distinction @pending_del_replace_fresh draws for the
+		 * rekey fold's own PROMOTE, and for the same measured reason; it is
+		 * NOT derivable from "there is a substitution".
+		 */
+		bool live;
 	} old_dir_replace;
 	/*
 	 * ☠ WHAT THIS BUILD REPLACED, so a LATER step of the same op can see it.

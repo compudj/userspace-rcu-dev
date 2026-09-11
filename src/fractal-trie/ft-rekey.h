@@ -3915,7 +3915,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		 * tier can reserve a slot WITHOUT relocating, which would edit BP
 		 * where it stands -- under the node this flip retires.
 		 */
-		if (!src_cut && d_src.pnf && d_src.nfp && !ft_in_place_ok(ft) &&
+		if (d_src.pnf && d_src.nfp && !ft_in_place_ok(ft) &&
 				ft_node_internal(d_src.pnf) &&
 				!ft_node_compressed(d_src.pnf) &&
 				!ft_node_skip_compressed(d_src.pnf)) {
@@ -3923,7 +3923,24 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 				ft_flag_to_metadata(ft, d_src.pnf);
 			unsigned int nc = ft_meta_nr_child(bpm);
 
-			if (nc >= 2) {
+			/*
+			 * ☑ ...AND THE ONE-CHILD-BUT-KEYED SHAPE, which is the
+			 * old direction's PROMOTE.  The drop empties BP of
+			 * CHILDREN and leaves its co-located key chain, so the
+			 * old half is that HEAD and BP goes away -- the same
+			 * answer ft_detach_node gives a node the drop leaves
+			 * childless but keyed, and the same one the rekey fold's
+			 * own FT_REKEY_FOLD_PROMOTE writes into @graft_c's slot.
+			 * The split reads BP and picks between the three arms;
+			 * this only says the shape is expressible.
+			 */
+			if (nc == 1 && bpm->external_nodes) {
+				glue.old_dir_replace.of = d_src.pnf;
+				glue.old_dir_replace.drop_slot = d_src.nfp;
+				glue.old_dir_replace.drop_expected = d_src.nf_raw;
+				glue.old_dir_replace.drop_child = d_src.nf_raw;
+				glue.old_dir_replace.depth = d_src.pdepth;
+			} else if (nc >= 2) {
 				glue.old_dir_replace.of = d_src.pnf;
 				glue.old_dir_replace.drop_slot = d_src.nfp;
 				glue.old_dir_replace.drop_expected = d_src.nf_raw;
