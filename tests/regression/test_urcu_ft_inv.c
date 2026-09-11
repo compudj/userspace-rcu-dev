@@ -3898,15 +3898,34 @@ static int inv_rekey_graft_coherent_readers(void)
  * reader's lookup of M may answer miss or the mover -- NEVER the fresh node,
  * never D's head.
  *
- * GEOMETRY, per writer w (private root child @bp, 4-byte fixed keys):
- *   P  = (bp,3,0): children 1 (fixed sib), 5 (fixed sib), 2 (resident head
- *        D), 4 (the mover M).  Four children, so the detach DEL-recompacts P
- *        -- the recompaction producer of the fold.
- *   P2 = (bp,3,1): children 2 (resident D2), 4 (mover M2) only.  Two
+ * GEOMETRY, per writer w (private root child @bp, 4-byte fixed keys), four
+ * flavours f, one per iteration in turn:
+ *   f=0  P  = (bp,3,0): children 1 (fixed sib), 5 (fixed sib), 2 (resident
+ *        head D), 4 (the mover M).  Four children, so the detach
+ *        DEL-recompacts P -- the recompaction producer of the fold.
+ *   f=1  P2 = (bp,3,1): children 2 (resident D2), 4 (mover M2) only.  Two
  *        children, so the detach leaves P2 one-child keyless and COLLAPSES it
  *        into a run -- the fused-collapse producer -- and the next insert at
  *        M2 SPLITS that run again.
- * Iterations alternate P and P2.  Junctions are writer-private, so the only
+ *   f=2  THROUGH RUNS, parent KEPT: D3 = (bp,3,6,2) and M3 = (bp,3,7,4) are
+ *        each the only key under their third byte, so each hangs off a run
+ *        of its own and their shared PLAIN ancestor is Q = (bp,3), which also
+ *        holds P and P2.  The node that moves is Q (FT_REKEY_WITNESS_BY_DETACH
+ *        through a run); the detach DEL-recompacts Q, and the publish -- armed
+ *        in D3's run, one level below -- is SUBSUMED by that copy.
+ *   f=3  THROUGH RUNS, parent COLLAPSED: D4 = (bp,4,6,2) and M4 = (bp,4,7,4)
+ *        under Q2 = (bp,4), which holds nothing else, so the detach collapses
+ *        Q2 into D4's run -- the DEEP fold of a live top.
+ *   f=4  NOT same-parent: the mover M5 = (bp,5,7,4) hangs off a run under
+ *        Q3 = (bp,5), which keeps a fixed sibling (bp,5,1,1); the dst is
+ *        f=0's resident D = (bp,3,0,2).  This is the merge arm's COW of the
+ *        dst parent (ft_rekey_merge_cow_publish_parent), the src detached from
+ *        a junction of its own -- the shape the corpus serves, with the one
+ *        property the others share: the mover is a SKIP TARGET that the
+ *        splice turns into a non-head chain member.
+ * RKSP_FLAVOURS (env, bitmask) selects the flavours run; the default is 0x3
+ * -- see the ☠ note at the mask for why 2, 3 and 4 are opt-in.
+ * Junctions are writer-private, so the only
  * peers of a move are the readers: a refusal here is a finding, not
  * contention, and is fatal.
  *
@@ -3939,13 +3958,16 @@ static int inv_rekey_graft_coherent_readers(void)
 #define RKSP_NR		8		/* coherent readers */
 #define RKSP_KLEN	4		/* fixed key length, bytes */
 
+#define RKSP_NF		5		/* flavours, see the header */
+
 struct rksp_writer_arg {
 	struct cds_ft *ft;
 	uint8_t bp;			/* the writer's private root-child byte */
-	struct ft_test_node *sib[2];	/* (bp,3,0,1) (bp,3,0,5): never absent */
-	struct ft_test_node *res[2];	/* (bp,3,f,2): resident heads, never absent */
-	struct ft_test_node *mov[2];	/* (bp,3,f,4) -> spliced under (bp,3,f,2) */
-	struct ft_test_node *fresh[2];	/* inserted at (bp,3,f,2) AFTER the move */
+	unsigned int flavours;		/* bitmask of flavours to run */
+	struct ft_test_node *sib[3];	/* (bp,3,0,1) (bp,3,0,5) (bp,5,1,1): never absent */
+	struct ft_test_node *res[RKSP_NF];	/* resident heads, never absent */
+	struct ft_test_node *mov[RKSP_NF];	/* the mover, spliced under res */
+	struct ft_test_node *fresh[RKSP_NF];	/* inserted at res's key AFTER the move */
 	unsigned long ops, busy;
 	int failed;
 };
@@ -3961,6 +3983,25 @@ struct rksp_reader_arg {
 static uint64_t rksp_key(uint8_t bp, uint8_t f, uint8_t u)
 {
 	return ((uint64_t) bp << 24) | (3ULL << 16) | ((uint64_t) f << 8) | u;
+}
+
+/* The resident (@mover false) or mover key of flavour @f; see the header. */
+static uint64_t rksp_fkey(uint8_t bp, int f, bool mover)
+{
+	switch (f) {
+	case 0:
+	case 1:
+		return rksp_key(bp, (uint8_t) f, mover ? 4 : 2);
+	case 2:
+		return ((uint64_t) bp << 24) | (3ULL << 16) |
+			((uint64_t) (mover ? 7 : 6) << 8) | (mover ? 4 : 2);
+	case 3:
+		return ((uint64_t) bp << 24) | (4ULL << 16) |
+			((uint64_t) (mover ? 7 : 6) << 8) | (mover ? 4 : 2);
+	default:	/* f=4: the mover under Q3 = (bp,5); the dst is f=0's */
+		return mover ? (((uint64_t) bp << 24) | (5ULL << 16) |
+				(7ULL << 8) | 4) : rksp_key(bp, 0, 2);
+	}
 }
 
 /* Remove @n, stored at key @v, by IDENTITY (a chain member); no free. */
@@ -3995,9 +4036,15 @@ static void *rksp_writer(void *arg)
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 
 	while (!test_stop) {
-		int f = (int) (iters & 1);
-		uint64_t mk = rksp_key(w->bp, (uint8_t) f, 4);
-		uint64_t dk = rksp_key(w->bp, (uint8_t) f, 2);
+		int f = (int) (iters % RKSP_NF);
+		uint64_t mk, dk;
+
+		if (!(w->flavours & (1u << f))) {
+			iters++;
+			continue;
+		}
+		mk = rksp_fkey(w->bp, f, true);
+		dk = rksp_fkey(w->bp, f, false);
 		uint8_t mkey[8] = { 0 }, dkey[8] = { 0 };
 		enum cds_ft_status st;
 		const char *step;
@@ -4092,6 +4139,7 @@ static void *rksp_reader(void *arg)
 		int wi = rand_r(&seed) % r->nw;
 		struct rksp_writer_arg *w = &r->w[wi];
 		int pick = rand_r(&seed) % 8, f = pick & 1;
+		int fl = rand_r(&seed) % RKSP_NF;	/* flavour for the res/mov probes */
 		struct cds_ft_node *found;
 		enum cds_ft_status st;
 		uint64_t key;
@@ -4100,7 +4148,9 @@ static void *rksp_reader(void *arg)
 
 		if (pick < 2) {
 			/* FIXED sib: present at every instant, must be found. */
-			key = rksp_key(w->bp, 0, f ? 5 : 1);
+			f = rand_r(&seed) % 3;
+			key = f < 2 ? rksp_key(w->bp, 0, f ? 5 : 1) :
+				(((uint64_t) w->bp << 24) | (5ULL << 16) | (1ULL << 8) | 1);
 			cds_ft_u64_to_key(r->ft, key, k, CDS_FT_LEN_DEFAULT);
 			rcu_read_lock();
 			cds_ft_iter_set_key(iter, k, CDS_FT_LEN_DEFAULT);
@@ -4132,22 +4182,22 @@ static void *rksp_reader(void *arg)
 			 * holds the mover and the fresh node at times, so any of
 			 * the three is a legitimate answer; a miss is not.
 			 */
-			key = rksp_key(w->bp, (uint8_t) f, 2);
+			key = rksp_fkey(w->bp, fl, false);
 			cds_ft_u64_to_key(r->ft, key, k, CDS_FT_LEN_DEFAULT);
 			rcu_read_lock();
 			cds_ft_iter_set_key(iter, k, CDS_FT_LEN_DEFAULT);
 			cds_ft_lookup(r->ft, iter);
 			found = cds_ft_iter_node(iter);
-			bad = found != &w->res[f]->node &&
-				found != &w->mov[f]->node &&
-				found != &w->fresh[f]->node;
+			bad = found != &w->res[fl]->node &&
+				found != &w->mov[fl]->node &&
+				found != &w->fresh[fl]->node;
 			if (bad)
 				fprintf(stderr, "rksp_reader: resident %#llx -> %p "
 					"(expect head %p, mover %p or fresh %p)\n",
 					(unsigned long long) key, (void *) found,
-					(void *) &w->res[f]->node,
-					(void *) &w->mov[f]->node,
-					(void *) &w->fresh[f]->node);
+					(void *) &w->res[fl]->node,
+					(void *) &w->mov[fl]->node,
+					(void *) &w->fresh[fl]->node);
 		} else {
 			/*
 			 * THE ORIGINAL SRC KEY: miss XOR the mover.  The fresh
@@ -4156,22 +4206,22 @@ static void *rksp_reader(void *arg)
 			 * exists to prevent; the resident head here is a torn
 			 * descent that resolved the dst chain under the src name.
 			 */
-			key = rksp_key(w->bp, (uint8_t) f, 4);
+			key = rksp_fkey(w->bp, fl, true);
 			cds_ft_u64_to_key(r->ft, key, k, CDS_FT_LEN_DEFAULT);
 			rcu_read_lock();
 			cds_ft_iter_set_key(iter, k, CDS_FT_LEN_DEFAULT);
 			cds_ft_lookup(r->ft, iter);
 			found = cds_ft_iter_node(iter);
-			bad = found && found != &w->mov[f]->node;
+			bad = found && found != &w->mov[fl]->node;
 			if (bad)
 				fprintf(stderr, "rksp_reader: src key %#llx -> %p "
 					"(%s; expect miss or mover %p)\n",
 					(unsigned long long) key, (void *) found,
-					found == &w->fresh[f]->node ?
+					found == &w->fresh[fl]->node ?
 						"THE FRESH DST-CHAIN NODE" :
-					found == &w->res[f]->node ?
+					found == &w->res[fl]->node ?
 						"the resident dst head" : "a foreign node",
-					(void *) &w->mov[f]->node);
+					(void *) &w->mov[fl]->node);
 		}
 		if (bad) {
 			r->failed = 1;
@@ -4231,22 +4281,61 @@ static void rksp_child(void)
 		w[i].ft = ft;
 		w[i].bp = (uint8_t) (i + 1);
 		rcu_read_lock();
-		for (f = 0; f < 2; f++) {
-			uint64_t sk = rksp_key(w[i].bp, 0, f ? 5 : 1);
-			uint64_t rk = rksp_key(w[i].bp, (uint8_t) f, 2);
+		/*
+		 * ☠ FLAVOUR 4 IS A KNOWN-RED REPRODUCER, opt-in (RKSP_FLAVOURS=16).
+		 * It reaches a pre-existing READER defect: the precise lookup
+		 * re-anchors at every skip-encoded slot by walking up from the
+		 * skip word's child, reading that child's prev as a HEAD's parent
+		 * word -- and the splice has made the mover an interior member of
+		 * the destination's duplicate chain (prev = its predecessor, an
+		 * hlist-transacted word).  A reader on the retired copy of the
+		 * source junction follows the copy's stale skip word into it and
+		 * hits ft_skip_reanchor's NULL-parent assert.  Any served merge
+		 * whose source head is a skip target has it; the HEAD-of-handoff
+		 * control asserts on this flavour identically.  A first cure --
+		 * hop from the member to its head -- was refuted: the member's
+		 * prev carries the txn engine's tag the prev resolver does not
+		 * resolve, the source head's prev is a plain pre-commit store,
+		 * and a MOVED node's head sits at the destination key, so the
+		 * walk would return a holder on the wrong path.  The re-anchor's
+		 * contract under a MOVE (walk vs. restart from the root) is a
+		 * reader design decision; until it is made this flavour stays
+		 * off by default so the gate stays green and honest.
+		 *
+		 * Flavours 2 and 3 (through a run, same parent) need the merge
+		 * arm's through-a-run frame, parked behind that same decision.
+		 */
+		w[i].flavours = getenv("RKSP_FLAVOURS") ?
+			(unsigned int) strtoul(getenv("RKSP_FLAVOURS"), NULL, 0) :
+			0x3u;
+		for (f = 0; f < 3; f++) {
+			uint64_t sk = f < 2 ? rksp_key(w[i].bp, 0, f ? 5 : 1) :
+				(((uint64_t) w[i].bp << 24) | (5ULL << 16) |
+					(1ULL << 8) | 1);
 
 			w[i].sib[f] = node_alloc(sk);
 			if (insert_u64(ft, sk, w[i].sib[f]) != CDS_FT_STATUS_OK)
 				abort();
+		}
+		for (f = 0; f < RKSP_NF; f++) {
+			uint64_t rk = rksp_fkey(w[i].bp, f, false);
+
+			if (f == 4) {
+				/* f=4 merges into f=0's resident: same head, own mover */
+				w[i].res[f] = w[i].res[0];
+				w[i].fresh[f] = w[i].fresh[0];
+				w[i].mov[f] = node_alloc(rksp_fkey(w[i].bp, f, true));
+				continue;
+			}
 			w[i].res[f] = node_alloc(rk);
 			if (insert_u64(ft, rk, w[i].res[f]) != CDS_FT_STATUS_OK)
 				abort();
 			/* Allocated once; keyed only while a cycle is in flight. */
-			w[i].mov[f] = node_alloc(rksp_key(w[i].bp, (uint8_t) f, 4));
+			w[i].mov[f] = node_alloc(rksp_fkey(w[i].bp, f, true));
 			w[i].fresh[f] = node_alloc(rk);
 		}
 		rcu_read_unlock();
-		live += 4;
+		live += 3 + (RKSP_NF - 1);
 	}
 	for (i = 0; i < RKSP_NR; i++) {
 		r[i].ft = ft;
@@ -4291,20 +4380,25 @@ static void rksp_child(void)
 	synchronize_rcu();
 	rcu_read_lock();
 	for (i = 0; i < RKSP_NW; i++) {
-		for (f = 0; f < 2; f++) {
+		for (f = 0; f < 3; f++) {
 			struct cds_ft_node *found = NULL;
+			uint64_t sk = f < 2 ? rksp_key(w[i].bp, 0, f ? 5 : 1) :
+				(((uint64_t) w[i].bp << 24) | (5ULL << 16) |
+					(1ULL << 8) | 1);
 
-			if (lookup_u64(ft, rksp_key(w[i].bp, 0, f ? 5 : 1),
-					&found) != CDS_FT_STATUS_OK ||
+			if (lookup_u64(ft, sk, &found) != CDS_FT_STATUS_OK ||
 					found != &w[i].sib[f]->node)
 				ret = -1;
-			found = NULL;
-			if (lookup_u64(ft, rksp_key(w[i].bp, (uint8_t) f, 2),
+		}
+		for (f = 0; f < RKSP_NF; f++) {
+			struct cds_ft_node *found = NULL;
+
+			if (lookup_u64(ft, rksp_fkey(w[i].bp, f, false),
 					&found) != CDS_FT_STATUS_OK ||
 					found != &w[i].res[f]->node)
 				ret = -1;
 			found = NULL;
-			if (lookup_u64(ft, rksp_key(w[i].bp, (uint8_t) f, 4),
+			if (lookup_u64(ft, rksp_fkey(w[i].bp, f, true),
 					&found) == CDS_FT_STATUS_OK)
 				ret = -1;	/* a mover left behind */
 		}
