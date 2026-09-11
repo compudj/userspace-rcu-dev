@@ -1933,6 +1933,274 @@ bool ft_rekey_len_change_overflows(const struct cds_ft *ft,
 		src_max - src_len > ft->group->max_key_len - dst_len;
 }
 
+#ifdef FEATURE_FT_MERGE
+/*
+ * W5: the destination attach point did not move, so MOVE ITS PARENT.
+ *
+ * COW @d_dst->pnf -- the immediate internal parent of the node the merge
+ * attached to -- to a fresh address and republish the copy one level up, at
+ * (@d_dst->ppnf, @d_dst->pnfp).  The interior is untouched: the copy is
+ * verbatim, every child keeps its address, and the only thing that changes is
+ * the identity of the node a descent passes THROUGH on its way to the merged
+ * chain.  That identity is the whole product -- it is what the rekey-coherent
+ * reader's two-descent witness observes.
+ *
+ * ☞ WHY THE WITNESS IS OWED HERE AT ALL.  The caller's exit is taken exactly
+ * when the union produced nothing fresh (a duplicate-chain splice onto a live
+ * app-owned head).  Without a fresh address anywhere on the dst path, a later
+ * insert on that same chain could be found by a reader looking up the ORIGINAL
+ * SRC key at a location the move was supposed to have vacated: a torn descent
+ * would match a clean one and the two-descent scheme would have nothing to
+ * disagree about.
+ *
+ * ☠ THE PRIMITIVE IS ft_rekey_cow_stop, AND THE TWO OBVIOUS ALTERNATIVES BOTH
+ * FAIL -- measured, not reasoned:
+ *  - ft_node_replace_ptr DOES NOT RELOCATE HERE.  It rebuilds a node only when
+ *    the node's SHAPE must change; replacing one slot with the value it already
+ *    holds (which is this shape, @merged_pub == the old child) has nothing to
+ *    do, so it returns 0 with the LIVE node back and serves zero.
+ *  - FT_RECOMPACT_RELOCATE publishes and re-parents children EAGERLY, by its own
+ *    contract a "point of no return", so it cannot build a copy for a commit
+ *    that has not happened yet.
+ * cow_stop is the one that fits: a fresh address, the children's back edges
+ * RECORDED rather than stored, @stop retired, and the caller doing the publish.
+ *
+ * SCOPE, and every term is a shape cow_stop or the publish cannot take TODAY:
+ *  - a PLAIN INTERNAL parent (POPCOUNT / PIGEON).  A COMPRESSED one is a run,
+ *    and republishing a run means re-encoding the SKIP_X dual in ITS parent and
+ *    handing the glue a skip-encoded top -- whose back edge inverts to the node
+ *    this commit retires (☞ ft_glue_is_fresh's header).
+ *  - a NON-ROOT parent: &ft->root is a slot with no node word to lock, so the
+ *    forward publish's SW park would be unguarded.  The same refusal the
+ *    compressed-dual arm above makes, for the same reason.
+ *  - a NON-COMPRESSED grandparent, so the publish into it is ONE store and not
+ *    also a SKIP_X dual re-encode.
+ *
+ * @marks is this frame's -- the merge arm reaches here having taken none (the
+ * src-side cow_stop runs only on the !merge_dst arms), so cow_stop starts at
+ * index 0 and the caller's sweep covers what it takes.
+ */
+static
+int ft_rekey_merge_cow_publish_parent(struct cds_ft *ft,
+		struct ft_descent *d_dst, struct ft_flip_txn *txn,
+		struct urcu_txn *optxn, struct ft_glue *glue,
+		struct cds_ft_inode_flag *merged_pub,
+		const uint8_t *src_ord, size_t src_len, const uint8_t *dst_ord,
+		struct ft_held_anchor *marks, unsigned int *nr_marks,
+		struct cds_ft_inode_flag **pp_prime_ret)
+{
+	struct ft_lock_ctx gctx, cctx;
+	struct ft_held_anchor gph;
+	struct cds_ft_metadata *gp_meta, *pp_meta;
+	struct cds_ft_inode_flag *pp_prime = NULL;
+	int ret;
+
+	if (!d_dst->pnf || !d_dst->nfp || !d_dst->pnfp)
+		return FT_REKEY_UNCOVERED;
+	/*
+	 * ☐ A ROOT PUBLISH PARENT IS REFUSED, AND THE OBVIOUS REASON IS NOT THE
+	 * ONE.  &ft->root has no node word to park an SW store under -- but it
+	 * needs none: _ft_publish_to_parent_meta marks a @parent_slot ==
+	 * &ft->root edge ROOT-OWNED and the engine records it MW, arbitrated by
+	 * the root-slot CAS, which is the reasoning the root-junction gate below
+	 * already carries for its own republish.  So the publish itself is fine
+	 * and this looked like a one-line relaxation.
+	 *
+	 * ☠ MEASURED, admitting it (@ppnf NULL with @pnfp == &ft->root, the glue
+	 * told the publish parent is NULL): +3 shapes served and then the corpus
+	 * breaks about 1200 seeds in, on TWO signatures -- the engine's
+	 * `r->kind == kind` SW/MW conflict, and a LOOKUP aborting afterwards in
+	 * ft_skip_reanchor's `holder != NULL` on a key that has nothing to do
+	 * with the move.  The second one is the real report: relocating the root
+	 * leaves a SKIP word in the trie whose holder can no longer be recovered,
+	 * i.e. the copy's skip-encoded children are not fully re-anchored.  That
+	 * is a second mechanism, not a corner of this one.
+	 */
+	if (!d_dst->ppnf)
+		return FT_REKEY_UNCOVERED;
+	/*
+	 * ☠ THE COPY IS VERBATIM, so the attach slot must ALREADY hold what the
+	 * merge wants published there.  That is the splice shape and only the
+	 * splice shape: @merged_pub == the value the slot has.  The other way of
+	 * reaching this exit -- a merge that DID build a node but whose freshness
+	 * this gate cannot see -- would have the copy carry the SUPERSEDED child
+	 * and drop the built one on the floor, so it keeps the refusal.
+	 */
+	if (merged_pub != d_dst->nf)
+		return FT_REKEY_UNCOVERED;
+	/*
+	 * ☠ THE RELOCATED NODE MUST NOT BE ON THE SOURCE PATH.  Every node the
+	 * src key descends through belongs to the DETACH: it DEL-recompacts the
+	 * src junction and climbs from there, so a node this frame has COW'd and
+	 * RETIRED would be relocated a second time, by another owner, inside the
+	 * same commit.
+	 *
+	 * ☠ AND THE CORPUS CANNOT SEE THIS.  Its 3000 shapes are 13/14
+	 * `same_parent = 0` at this exit and the one exception is refused for
+	 * another reason -- so the whole class was untested until Mathieu's own
+	 * dedicated case ran: {ab, ac} + rekey_merge(dst "ac", src "ab"), the
+	 * LAST-BYTE move he named as the shape the witness exists for.  It is a
+	 * clean refusal before this change and SPINS after it, allocating as it
+	 * goes.  Generated corpora are a sample, not a cover.
+	 *
+	 * The test is the KEYS, not the nodes: a descent is deterministic, so the
+	 * src path reaches @pnf exactly when the src key is long enough to get to
+	 * @pnf's depth and agrees with the dst key on every byte down to it.  That
+	 * subsumes the same-parent case (@d_src.pnf == @d_dst.pnf) and also catches
+	 * the deeper src that merely PASSES THROUGH @pnf on its way down.
+	 *
+	 * A src ENDING above @pnf is left in: its junction is an ancestor, the
+	 * detach climbs AWAY from @pnf, and a recompaction of the publish
+	 * grandparent is already handled -- ft_glue_set_publish announces the
+	 * pending publish so that copy carries it (@pending_pub_slot).
+	 */
+	if ((size_t) d_dst->pdepth <= src_len &&
+			!memcmp(src_ord, dst_ord, (size_t) d_dst->pdepth))
+		return FT_REKEY_UNCOVERED;
+	if (ft_node_external(d_dst->pnf) || ft_node_compressed(d_dst->pnf))
+		return FT_REKEY_UNCOVERED;
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+	if (ft_node_skip_compressed(d_dst->pnf) ||
+			ft_node_skip_compressed(d_dst->ppnf))
+		return FT_REKEY_UNCOVERED;
+#endif
+	if (ft_node_compressed(d_dst->ppnf) || ft_node_external(d_dst->ppnf))
+		return FT_REKEY_UNCOVERED;
+	{
+		unsigned int pti = ft_node_type(d_dst->pnf);
+
+		if (ft_types[pti].type_class != FT_POPCOUNT &&
+				ft_types[pti].type_class != FT_PIGEON)
+			return FT_REKEY_UNCOVERED;
+	}
+	pp_meta = ft_flag_to_metadata(ft, d_dst->pnf);
+	if (!pp_meta)
+		return -EAGAIN;
+	/*
+	 * ☑ A CO-LOCATED EXTERNAL CHAIN ON THE PARENT IS IN SCOPE, and this is
+	 * the first caller that ever reached cow_stop's arm for one -- so its two
+	 * statements about itself could finally be adjudicated.  The SCOPE note
+	 * lists "a co-located external list" under the TODO that "still needs
+	 * recompact's extra arms"; the inline comment at the arm says it is in
+	 * scope, "one forward pointer to copy plus one back edge to record, the
+	 * same shape as a child".  MEASURED: the INLINE one is right -- the key
+	 * set, the chain and cds_ft_verify are clean on {acbb,cb,a,c,abc,cc} +
+	 * rekey_merge(dst "cc", src "acbb"), all four rank/list modes.
+	 *
+	 * ☠ AND I BRIEFLY BELIEVED THE OPPOSITE ON A CONFOUNDED TEST.  Refusing a
+	 * co-located parent here made a `head prev != owner` red disappear, which
+	 * looked like a mechanism; it was not.  That red came from the
+	 * @pending_pub_folded misuse below -- the OLD parent stayed published, so
+	 * verify walked it and found the chain naming the copy -- and refusing
+	 * the co-located shape merely removed the only SEED that reached it from
+	 * this side.  A refusal that deletes the one seed in a class tests the
+	 * seed, not the mechanism.
+	 */
+	/*
+	 * The copy and its publish edge both need room; take it BEFORE the COW so
+	 * a full glue is a clean refusal rather than a copy with nowhere to go.
+	 */
+	if (glue->nr_built + 1 > glue->cap_built ||
+			glue->nr_deferred + 1 > glue->cap_deferred) {
+		if (ft_glue_reserve(glue, glue->nr_built + 1,
+				glue->nr_deferred + 1, glue->cap_free,
+				glue->cap_splices))
+			return -ENOMEM;
+	}
+	/*
+	 * ☠ THE PUBLISH PARENT MOVES UP WITH THE PUBLISH.  The forward store now
+	 * lands in a slot of the GRANDPARENT, and this txn is structural_sw, so
+	 * that store PARKS -- and a park does not arbitrate.  The op must hold
+	 * the word behind the slot it parks, which is now @ppnf's and no longer
+	 * @pnf's.  ft_glue_take_publish_parent is re-made here rather than
+	 * amended: it is the one place that owns the fence into the txn and links
+	 * the terminal silencer.
+	 *
+	 * @pnf's own fence, taken by the caller when @pnf WAS the publish parent,
+	 * stays exactly where it is: the txn owns it (@publish_parent_txn_owned
+	 * was set for it), its release is already recorded, and cow_stop's retire
+	 * chains onto that same word behind the same fence.
+	 *
+	 * ☠ CHAIN THE GLUE, or a COARSE spacing livelocks the move -- the same
+	 * reading as the compressed-dual acquire above: @pnf's mark reaches no
+	 * txn registry until ft_glue_txn_commit_edges, so the glue is the only
+	 * witness that this op holds it, and a spacing that collapses @pnf and
+	 * @ppnf onto ONE word would otherwise read the op's OWN fence as
+	 * contention and re-derive the identical plan forever.
+	 */
+	gp_meta = ft_flag_to_metadata(ft, d_dst->ppnf);
+	if (!gp_meta)
+		return -EAGAIN;
+	ft_lock_ctx_init(&gctx, d_dst, txn, optxn);
+	gctx.held.glue = glue;
+	if (ft_acquire_member(ft, &gctx, d_dst->ppnf, gp_meta, d_dst->ppdepth,
+			&gph))
+		return -EAGAIN;
+	ft_glue_take_publish_parent(glue, gph.lock, gph.lock_snap, gph.shared);
+
+	ft_lock_ctx_init(&cctx, d_dst, txn, optxn);
+	cctx.held.glue = glue;
+	ret = ft_rekey_cow_stop(ft, &cctx, txn, d_dst->pnf, d_dst->pdepth,
+			/*cut=*/ 0, &pp_prime, marks, nr_marks);
+	if (ret)
+		return ret;
+	ft_rekey_marks_to_txn(txn, marks, *nr_marks);
+	/*
+	 * ☠ TRACK THE COPY, AND IT IS NOT MERELY BOOKKEEPING.  An untracked child
+	 * takes ft_glue_defer_edge's DEFERRED arm, so the copy's own parent word
+	 * is RECORDED at apply time instead of stored -- and that word already
+	 * carries a record of a different KIND from the forward publish, which
+	 * urcu_txn_record_chain refuses (`r->kind == kind`, measured: an abort on
+	 * rekey_merge(dst "ba", src "aab")).  Every other glue publish top is
+	 * glue-built and therefore takes the FRESH arm, a plain store into an
+	 * unpublished body; tracking puts this copy on the same path.
+	 *
+	 * It also hands the copy's RECLAIM to the glue, which is where it belongs:
+	 * ft_glue_abort frees the built set, and every bail below it routes
+	 * through ft_glue_abort -- so the copy needs no free of its own.
+	 */
+	ft_glue_track(glue, pp_prime);
+	/*
+	 * The COPY is what the grandparent's slot must hold.  @merged_pub is
+	 * already in the copy's own slot -- cow_stop copied the parent verbatim
+	 * and the merge changed nothing at that slot -- and cow_stop recorded the
+	 * external head's back edge onto the copy along with every other child's,
+	 * so the attach point needs no publish of its own.
+	 */
+	ft_glue_set_publish(ft, glue, d_dst->ppnf, d_dst->pnfp, pp_prime);
+	/*
+	 * ☠ AND THE COUNT DELTA MUST BE BAKED INTO THE COPY, because the walk no
+	 * longer reaches it.  @glue->count_delta is charged from the publish
+	 * parent UP, and the publish parent is now the GRANDPARENT -- so the copy,
+	 * which sits between it and the merged chain, is the one node on the path
+	 * the walk skips.  @pending_pub_node is the hook the glue commit already
+	 * has for exactly this ("bake into the named survivor, walk from the
+	 * shared stable parent"): it stores the delta directly into the named node
+	 * and then starts the ancestor walk at THAT node's own parent.
+	 */
+	/*
+	 * ☠ AND THE COUNT DELTA MUST BE BAKED INTO THE COPY, because the walk no
+	 * longer reaches it.  @glue->count_delta is charged from the PUBLISH
+	 * PARENT up, and the publish parent is now the GRANDPARENT -- so the copy,
+	 * which sits between it and the merged chain, is the one node on the path
+	 * the walk skips.  The caller bakes it where @count_delta is computed, a
+	 * build-invisible plain store into a node this commit has not published.
+	 *
+	 * ☠ NOT @pending_pub_folded, which is the obvious-looking hook and is the
+	 * WRONG one: its FIRST consumer makes ft_glue_txn_commit_edges SKIP the
+	 * forward publish outright ("a recompaction already folded this publish
+	 * into the node that replaced @publish_parent"), and @pending_pub_slot is
+	 * the slot ft_glue_set_publish just armed, so the guard always matches.
+	 * MEASURED: the copy is built, the old node stays published, the keys come
+	 * out right through it and cds_ft_verify reports a DANGLING SKIP SLOT --
+	 * the copy's re-parents landed on children the old node still holds.
+	 */
+	*pp_prime_ret = pp_prime;
+	return 0;
+}
+
+#endif /* FEATURE_FT_MERGE */
+
 static
 int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		const uint8_t *src_key, size_t src_len,
@@ -1981,6 +2249,12 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 #endif
 	struct cds_ft_inode_flag *merged_nf = NULL;
 	struct cds_ft_inode_flag *merged_pub = NULL;	/* @merged_nf, wrapped */
+	/*
+	 * W5: the COW of the dst attach point's PARENT, when the merge itself
+	 * produces nothing fresh there.  Glue-tracked, so every bail's
+	 * ft_glue_abort frees it; kept here only to carry the count bake.
+	 */
+	struct cds_ft_inode_flag *dst_pp_prime = NULL;
 	struct ft_held_anchor ks_held = { 0 };	/* KEY_SHORTER run's overlap fence */
 	bool ks_fenced = false;
 	struct cds_ft_inode_flag *probe_D = NULL;	/* occupied dst merge point */
@@ -3759,15 +4033,55 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		FT_REKEY_DST_FRESH_REACH(0);
 		if (merged_pub == d_dst.nf ||
 				!ft_glue_is_fresh(ft, &glue, merged_pub)) {
-			ret = FT_REKEY_UNCOVERED;
-			goto bail_build;
-		}
+			/*
+			 * ☑ THE UNION PRODUCED NOTHING FRESH -- SO MOVE THE PARENT.
+			 *
+			 * MEASURED over 3000 shapes, every arrival here: a
+			 * DUPLICATE-CHAIN SPLICE.  One key on each side and no
+			 * internal node under either, so ft_merge_build appends the
+			 * src leaf to the dst head's dup chain and hands the head
+			 * BACK -- the attach slot keeps the value it had and nothing
+			 * structural is created on either side.  A COW of the merged
+			 * top is IMPOSSIBLE, not merely unhelpful: the top is the
+			 * APPLICATION's own external head, live at the destination,
+			 * and ft_glue_is_fresh answers false for any external
+			 * outright ("externals are never glue-tracked").
+			 *
+			 * What CAN move is the head's immediate internal parent, and
+			 * moving it is enough: the reader's second descent reaches
+			 * the chain THROUGH that node, so relocating it is the
+			 * address-witness the two-descent scheme needs.
+			 *
+			 * ☞ AND IT IS DONE UNCONDITIONALLY ON THIS EXIT, not on a
+			 * runtime "did the path change" test.  Such a test is not
+			 * computable here -- the check runs during the merge BUILD,
+			 * before the detach has planned anything -- and the shape it
+			 * would have to catch is precisely the one where the rekey
+			 * does NOT change the internal path to the head (it moves
+			 * only the last byte of the key, so the last-level internal
+			 * node is the same node).  Today every internal mutation
+			 * relocates because ft_in_place_ok is a compile-time false,
+			 * so a gate written now would read "changed" for the wrong
+			 * reason and flip silently when the in-place tier returns.
+			 * The predicate this exit already stands on -- the attach
+			 * point got no fresh address -- is the decidable half, and it
+			 * fails SAFE: an in-place ft_merge_build handing back a
+			 * mutated D answers "not fresh" MORE often, never less.
+			 */
+			ret = ft_rekey_merge_cow_publish_parent(ft, &d_dst, txn,
+					optxn, &glue, merged_pub, src_ord,
+					src_len, dst_ord, marks, &nr_marks,
+					&dst_pp_prime);
+			if (ret)
+				goto bail_build;
+		} else {
 		/*
 		 * The merged top replaces D in the publish parent's slot.  Recorded, not
 		 * stored: ft_glue_txn_commit_edges runs at step 3c below, after the
 		 * detach, like the GLUE arm.
 		 */
 		ft_glue_set_publish(ft, &glue, d_dst.pnf, d_dst.nfp, merged_pub);
+		}
 		glue.attached_nf = merged_pub;
 		/*
 		 * ☠ THE DST DELTA IS WHAT THE UNION ADDED, NOT WHAT THE SRC HELD.
@@ -3838,6 +4152,22 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 				d_keys = ft_nr_keys_get(d_meta);
 			}
 			glue.count_delta = (long) merged_keys - (long) d_keys;
+			/*
+			 * W5: the relocated publish parent is BELOW the node
+			 * the walk starts from, so it takes its share here --
+			 * a plain store into an unpublished body.
+			 */
+			if (dst_pp_prime && glue.count_delta) {
+				struct cds_ft_metadata *ppm =
+					cds_ft_item_to_metadata(
+						ft_node_ptr(dst_pp_prime));
+
+				ft_nr_keys_store(ft, ppm,
+					ft_nr_keys_get(ppm) +
+						(unsigned long)
+						glue.count_delta,
+					CMM_RELAXED);
+			}
 		}
 		/*
 		 * COLLIDED KEYS: a full key present on BOTH sides makes ft_merge_build
@@ -5970,7 +6300,7 @@ detach_bail:
 				if (detach_rc.new_flag)
 					free_cds_ft_node_unpublished(ft,
 						ft_node_ptr(detach_rc.new_flag));
-				ft_rekey_collapse_free_unpublished(ft,
+					ft_rekey_collapse_free_unpublished(ft,
 					&detach_rc.collapse);
 				ft_glue_abort(ft, &glue);
 				if (src_glue_live) {
