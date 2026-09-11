@@ -2075,6 +2075,15 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 * whose slot goes; @fold_top_slot is that slot, taken with its parent as
 	 * one coherent pair.
 	 */
+	/*
+	 * THE CLIMB THE GLUE'S OLD-DIRECTION ARMING USED, when the drop empties
+	 * BP and the split holds the node the walk RESTS on: the chain the drop
+	 * orphans is frozen into this same commit, exactly as the NOSPLIT fold's
+	 * is.  Zero means the arming named BP itself and there is no chain.
+	 */
+	int climb_split_steps = 0;
+	struct cds_ft_inode_flag *climb_split_top = NULL;
+	struct cds_ft_inode_flag *climb_split_rest = NULL;
 	bool bp_folds_into_graft_c = false;
 	enum ft_rekey_fold_mode fold_mode = FT_REKEY_FOLD_NONE;
 	struct cds_ft_inode_flag *climb_top = NULL;
@@ -3959,6 +3968,97 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 				glue.old_dir_replace.depth = d_src.pdepth;
 			}
 		}
+		/*
+		 * ☑ ...AND THE SAME THREE ARMS ONE LEVEL UP, when the drop EMPTIES
+		 * BP and the split's run holds the node the climb RESTS on.
+		 *
+		 * Everything above names BP -- @d_src.pnf -- as the child whose
+		 * copy the split wires under its fresh suffix.  That is the whole
+		 * shape only while BP SURVIVES the drop.  When BP is one-child and
+		 * keyless the drop empties it, the detach's walk ELEVATES, and the
+		 * node the split actually holds is the one the walk comes to REST
+		 * on: @cn_child is then R, never BP, so none of the three arms
+		 * matches and the collapse is left to publish at the split node's
+		 * own home -- the word the glue's forward publish repoints.  Two
+		 * plans, one word; ft-remove.h's fused-collapse -EDOM is that
+		 * collision, and the narrowed landing-parent guard beside it is the
+		 * same family wearing a second exit.
+		 *
+		 * ☞ THE PRODUCT IS ALREADY BUILT.  `[cn suffix] ++ [surviving
+		 * ordinal] ++ [absorbed run]` inside the fresh cluster is exactly
+		 * what ft_split_compressed_graft_build's old-direction arms make
+		 * for the UN-CLIMBED twin, and the two differ in nothing but which
+		 * node is named.  So this arms the same field on R and adds no
+		 * builder: the split picks COLLAPSE / REPLACE / PROMOTE by reading
+		 * R, exactly as it does for BP.
+		 *
+		 * ☞ BP MAY BE A RUN HERE, and usually is: the shape is "the drop
+		 * EMPTIES BP", and a run is the one ancestor kind emptied BY
+		 * CONSTRUCTION (exactly one child, never any external_nodes).  The
+		 * arming above requires BP PLAIN because it writes a value into
+		 * BP's own copy; this one never touches BP -- BP is orphaned with
+		 * the rest of the cleared chain -- so it asks only that BP be a
+		 * node the climb can walk.
+		 *
+		 * ☠ A SECOND, READ-ONLY CLIMB, and it feeds THIS ARMING ONLY.  The
+		 * gate's own climb runs after ft_graft_build (it needs @graft_c,
+		 * which the prep produces), and ft_rekey_climb_reaches_graft's
+		 * header records that walking runs on the GLUE lane refused a shape
+		 * that is SERVED CORRECTLY, the discriminator being @prep itself.
+		 * Nothing here may reach the staleness terms.
+		 */
+		if (!src_cut && !ft_in_place_ok(ft) && d_src.pnf && d_src.nfp &&
+				(ft_node_internal(d_src.pnf) ||
+					ft_node_compressed(d_src.pnf)) &&
+				!ft_node_skip_compressed(d_src.pnf) &&
+				!glue.old_dir_replace.of) {
+			struct cds_ft_metadata *bpm2 =
+				ft_flag_to_metadata(ft, d_src.pnf);
+
+			if (ft_meta_nr_child(bpm2) == 1 && !bpm2->external_nodes) {
+				bool reach2 = false;
+				struct cds_ft_inode_flag *rest2 = NULL, *top2 = NULL;
+				bool comp2 = false;
+				unsigned int bytes2 = 0;
+				int steps2 = ft_rekey_climb_reaches_graft(ft,
+					d_src.pnf, NULL, &reach2, &rest2, &top2,
+					&comp2, &bytes2, /*walk_runs=*/ true);
+
+				if (steps2 >= 1 && rest2 && top2 && !reach2 &&
+						ft_node_internal(rest2) &&
+						!ft_node_compressed(rest2) &&
+						!ft_node_skip_compressed(rest2) &&
+						bytes2 < d_src.pdepth) {
+					struct cds_ft_inode_flag *tp2 = NULL;
+					struct cds_ft_inode_flag **dslot2 =
+						ft_resolve_parent_slot(
+							ft_flag_to_metadata(ft, top2),
+							ft, &tp2);
+					struct cds_ft_inode_flag *raw2 = dslot2 ?
+						rcu_dereference(*dslot2) : NULL;
+
+					/*
+					 * ONE coherent (parent, slot) pair, and
+					 * the RAW word it holds -- a run is
+					 * spelled SKIP_X there, and the split's
+					 * ft_node_find_child compares WORDS
+					 * (☞ ft_rekey_slot_names).
+					 */
+					if (dslot2 && tp2 == rest2 &&
+							ft_rekey_slot_names(raw2, top2)) {
+						glue.old_dir_replace.of = rest2;
+						glue.old_dir_replace.drop_slot = dslot2;
+						glue.old_dir_replace.drop_expected = raw2;
+						glue.old_dir_replace.drop_child = raw2;
+						glue.old_dir_replace.depth =
+							d_src.pdepth - bytes2;
+						climb_split_steps = steps2;
+						climb_split_top = top2;
+						climb_split_rest = rest2;
+					}
+				}
+			}
+		}
 		prep = ft_graft_build(ft, dst_ord, dst_len, s_top_prime, cnt,
 			&d_dst, &glue, &bctx.held);
 	}
@@ -5666,6 +5766,41 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 					climb_top : climb_rest,
 				graft_c, climb_steps, &detach_rc, fold_held,
 				&nr_fold_held);
+	} else if (glue.old_dir_replace.done && climb_split_steps >= 1) {
+		/*
+		 * THE SPLIT'S OLD DIRECTION OWES THE SAME HALF.  Arming
+		 * @old_dir_replace on the climb's RESTING node makes the split
+		 * build the old half without the moved arm -- and skips the
+		 * detach, which is what would otherwise have frozen the chain the
+		 * drop emptied.  Nothing else reclaims it: BP and every one-child
+		 * keyless node between it and @climb_top are unlinked by THIS
+		 * commit and nothing names them afterwards.
+		 *
+		 * ☠ MEASURED before this arm existed: the 7 shapes served on the
+		 * default build leaked EXACTLY ONE NODE each (the orphaned run BP)
+		 * -- `alloc=N freed=N-1` on every one -- and the 3000-shape corpus
+		 * was GREEN THROUGHOUT.  A leak is invisible to a correctness
+		 * oracle; only the -DDEBUG_COUNTERS build's node balance sees it.
+		 *
+		 * The bound is @climb_split_rest (R), not @graft_c: R is the node
+		 * the split holds and the chain stops below it.  Everything else
+		 * is the fold's arm verbatim, for the reasons stated there.
+		 */
+		ft_lock_ctx_init(&fold_octx, &d_src, txn, optxn);
+		fold_octx.held.extra = marks;
+		fold_octx.held.nr_extra = nr_marks;
+		fold_octx.held.glue = &glue;
+		ft_lock_ctx_init(&lctx_src, &d_src, txn, optxn);
+		lctx_src.held.extra = fold_held;
+		lctx_src.held.nr_extra = 0;
+		lctx_src.held.outer = &fold_octx.held;
+		ret = ft_rekey_fold_freeze_orphans(ft, &lctx_src, txn,
+				d_src.pnf, d_src.pdepth, climb_split_top,
+				NULL /*promoted: the split owns R*/,
+				NULL /*promote_val*/,
+				climb_split_top /*edited: the dropped chain top*/,
+				climb_split_rest, climb_split_steps,
+				&detach_rc, fold_held, &nr_fold_held);
 	}
 detach_bail:
 	if (ret) {

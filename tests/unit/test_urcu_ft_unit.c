@@ -15788,24 +15788,31 @@ out:
 }
 
 /*
- * THE SAME DISAGREEMENT ONE ARM OVER, WHICH IS REFUSED RATHER THAN SERVED.
+ * ☑ THE SAME DISAGREEMENT ONE ARM OVER -- SERVED NOW, and this test pinned its
+ * refusal until it was.
  *
  * With the co-located key at the src cut, the detach reaches the CHAIN-COLLAPSE
- * arm instead of the promote: it absorbs the node the split retires and
- * republishes it at that node's home -- the word the split's publish repoints.
- * Serving it needs the merged node re-based below the split point, which is a
- * different product from the one ft_chain_compress_fused builds, so it is
- * refused terminally with the rekey's carve-out code.
+ * arm instead of the promote: it absorbs the node the split retires and would
+ * republish it at that node's home -- the word the split's publish repoints.
+ * The refusal's stated price was "the merged node re-based below the split
+ * point, a different product from the one ft_chain_compress_fused builds", and
+ * that reading was right about the PRODUCT and wrong about who owes it.  The
+ * product already existed: it is what ft_split_compressed_graft_build's
+ * old-direction arms make for the twin whose drop does NOT empty BP.  What was
+ * missing was the ARMING -- @old_dir_replace named BP, and BP is not the node
+ * the split holds once the drop empties it and the walk elevates.  Arming it on
+ * the climb's RESTING node serves this shape with no new builder.
  *
  * ☠ --enable-rcu-debug CANNOT SEE THIS ONE.  Measured on a release probe build:
  * three poisons per attempt and every one is SW-against-SW, so no kind assert
- * fires; the livelock is the only detector.  That is why the refusal is what
- * makes the shape reportable at all -- and why, at the parent commit, this test
- * HANGS instead of failing.
+ * fires; the LIVELOCK is the only detector.  So this test asserting OK is worth
+ * more than it looks -- it asserts the call RETURNS at all, which is what the
+ * refusal was buying, and it is why the arms below re-check the claim (count and
+ * cds_ft_verify) rather than trusting the status.
  */
-static int rekey_promote_split_collapse_refused(const char *colocated,
+static int rekey_promote_split_collapse_served(const char *colocated,
 		const char *deep, const char *branch, const char *nw,
-		const char *old)
+		const char *old, const char *moved_deep)
 {
 	struct cds_ft_group *group;
 	struct cds_ft *ft;
@@ -15825,30 +15832,43 @@ static int rekey_promote_split_collapse_refused(const char *colocated,
 	before = cds_ft_count_entries(ft);
 
 	s = ft_rekey(ft, nw, old);
-	if (s == CDS_FT_STATUS_OK) {
-		fprintf(stderr, "rekey %s<-%s: SERVED -- the collapse arm now "
-			"has a product for this shape; assert it instead of "
-			"the refusal\n", nw, old);
-		goto out;
-	}
-	if (s != CDS_FT_STATUS_NOT_SUPPORTED) {
-		fprintf(stderr, "rekey %s<-%s: refused as %s -- a deterministic "
-			"shape must take the carve-out code, never a retryable "
-			"one\n", nw, old, cds_ft_status_to_string(s));
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "rekey %s<-%s: %s -- this shape is served since "
+			"the old direction is armed on the climb's resting "
+			"node\n", nw, old, cds_ft_status_to_string(s));
 		goto out;
 	}
 	/*
-	 * ★ A REFUSAL IS A CLAIM ABOUT THE TRIE, not about the return code.
-	 * Check the claim: the key count is unchanged and verify is clean.
+	 * ★ A SERVED MOVE IS A CLAIM ABOUT THE TRIE TOO, and the same two
+	 * questions answer it: the key count is conserved (this move collides
+	 * nothing) and cds_ft_verify is clean.
 	 */
 	if (cds_ft_count_entries(ft) != before) {
-		fprintf(stderr, "rekey %s<-%s: refused and the count MOVED\n",
+		fprintf(stderr, "rekey %s<-%s: served and the count MOVED\n",
 			nw, old);
 		goto out;
 	}
 	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
-		fprintf(stderr, "rekey %s<-%s: refused on a BROKEN trie\n",
+		fprintf(stderr, "rekey %s<-%s: served on a BROKEN trie\n",
 			nw, old);
+		goto out;
+	}
+	/*
+	 * The co-located key IS the src here, so it moves to @nw; the deep key
+	 * moves with it; the branch key and "q" are bystanders.
+	 */
+	if (!ft_test_has_key(ft, nw) || ft_test_has_key(ft, old)) {
+		fprintf(stderr, "rekey %s<-%s: moved key at neither/both "
+			"names\n", nw, old);
+		goto out;
+	}
+	if (!ft_test_has_key(ft, moved_deep) || ft_test_has_key(ft, deep)) {
+		fprintf(stderr, "rekey %s<-%s: deep key at neither/both "
+			"names\n", nw, old);
+		goto out;
+	}
+	if (!ft_test_has_key(ft, branch) || !ft_test_has_key(ft, "q")) {
+		fprintf(stderr, "rekey %s<-%s: bystander key lost\n", nw, old);
 		goto out;
 	}
 	ret = 0;
@@ -15882,9 +15902,10 @@ static int test_rekey_promote_into_split_cn(void)
 	if (rekey_promote_into_split_cn("wa", "wabbb", "wabbz", "we", "wabb",
 			"web", "wez"))
 		return -1;
-	/* Co-located AT the cut: the collapse arm, refused. */
-	return rekey_promote_split_collapse_refused("wabb", "wabbb", "way",
-			"we", "wabb");
+	/* Co-located AT the cut: the collapse arm, served since the old
+	 * direction is armed on the climb's resting node. */
+	return rekey_promote_split_collapse_served("wabb", "wabbb", "way",
+			"we", "wabb", "web");
 }
 
 /*

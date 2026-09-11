@@ -3872,18 +3872,55 @@ int ft_detach_node(struct cds_ft *ft,
 			 * SKIP_X dual would need a great-grandparent this frame has
 			 * not derived, is refused above.
 			 */
-			if (climbed && src_held_hint &&
-					boundary_parent_nf &&
-					ft_node_compressed(boundary_parent_nf)) {
-				/*
-				 * A COMPRESSED landing parent carries a SKIP_X dual the
-				 * recompact re-encodes into its OWN parent's slot, and
-				 * this walk has not derived that great-grandparent pair.
-				 * Deriving it from a back-pointer has exactly the
-				 * staleness the hint exists to avoid.  A shape this frame
-				 * cannot express, not a peer: -EDOM, so the caller
-				 * reports it uncovered instead of retrying forever.
-				 */
+			/*
+			 * ☑ A COMPRESSED LANDING PARENT IS NOT, BY ITSELF, A SHAPE
+			 * THIS FRAME CANNOT EXPRESS -- and the refusal that said so
+			 * was VACUOUS for two thirds of what it caught.
+			 *
+			 * It read: "a COMPRESSED landing parent carries a SKIP_X dual
+			 * the recompact re-encodes into its OWN parent's slot, and
+			 * this walk has not derived that great-grandparent pair."
+			 * Every clause is true and none of them bites.  The recompact
+			 * takes GP only when the hint's @gp is non-NULL; a DEL never
+			 * re-encodes the dual itself; and the detach's own republish
+			 * records the dual from @cn_meta as MW (@dual_owner_held
+			 * false, the arm below).  ☞ THE UN-CLIMBED REKEY PATH IS THE
+			 * SHIPPED PRECEDENT: ft-rekey.h's own elevated hint passes
+			 * `.gp = NULL, .gp_slot = NULL` under a compressed parent and
+			 * has done all along.
+			 *
+			 * MEASURED by ablating it: 19 of the 26 shapes it refused on
+			 * -DNO_FEATURE_FT_SKIP_COMPRESSED (4 of 5 on the default
+			 * build) are then SERVED, cds_ft_verify CLEAN, keys right, on
+			 * every rank x list arm and on --enable-rcu-debug and
+			 * -DFT_REKEY_CLAIM -- including the shapes where the
+			 * great-grandparent is an INTERNAL node, which the 3000-shape
+			 * corpus cannot even produce.
+			 *
+			 * ☠ WHAT IT WAS REALLY CATCHING is one sub-family and nothing
+			 * else: the resting node's run parent is the very node the
+			 * CALLER's graft SPLIT.  That is the collapse-vs-split
+			 * collision the arm at the top of this function refuses, wearing
+			 * a second exit -- ablate this one on that sub-family and the
+			 * engine aborts on `r->kind == kind` (rcu-debug) or the op
+			 * livelocks (noskip).  So the predicate is narrowed to the
+			 * thing that is actually red, and stays terminal: the shape is
+			 * deterministic, so -EAGAIN would spin.
+			 */
+			/*
+			 * ☠ @split_cn IS THE COMPRESSED NODE POINTER, NOT THE FLAG --
+			 * the arm at the top of this function passes @parent_cn for
+			 * the same lookup.  Handing it the flag compares a tagged word
+			 * against an untagged one, matches nothing, and lets the one
+			 * shape this guard exists for straight through: MEASURED, the
+			 * engine then aborts on `r->kind == kind` at seed 2919.
+			 */
+			if (climbed && src_held_hint && boundary_parent_nf &&
+					!topmost_external_nodes &&
+					ft_node_compressed(boundary_parent_nf) &&
+					ft_glue_that_split(&lctx,
+						ft_compressed_node_ptr(
+							boundary_parent_nf)) != NULL) {
 				ret = -EDOM;
 				goto end;
 			}
