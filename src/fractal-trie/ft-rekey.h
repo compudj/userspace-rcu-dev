@@ -1241,6 +1241,7 @@ enum ft_rekey_fold_mode {
 
 
 
+
 /*
  * DID THE ONE STRUCTURAL EDIT ACTUALLY RIDE THE GRAFT'S COPY?
  *
@@ -1435,14 +1436,29 @@ bool ft_rekey_slot_names(struct cds_ft_inode_flag *raw,
  * of parent_words, which are never skip-encoded, so it is a fail-closed test
  * rather than a modelled case.
  */
+/*
+ * @cut_ok: the caller's arm can express a CUT SOURCE.
+ *
+ * A cut means the src key ends INSIDE a run: @d_src.nf is the run, S_top is the
+ * tail ft_rekey_cow_stop manufactures, and the run is retired WHOLE by that COW.
+ * BP is then not "emptied by the drop" -- the whole SLOT goes, because every key
+ * under a run passes through all of its bytes, so everything below that slot
+ * moves.  That is the right product for the value-writing modes, where BP
+ * SURVIVES as a copy born without the run's slot, and it is not DROP's shape at
+ * all (DROP's premise is that the chain ABOVE BP is emptied).
+ *
+ * The tree already serves this one level down and has done all along:
+ * @del_folds_into_graft -- BP IS @graft_c -- carries no @src_cut term, and its
+ * build arm arms the very same pair (@d_src.nfp, @d_src.nf_raw) this one does.
+ */
 static inline
 bool ft_rekey_fold_shape_ok(struct cds_ft *ft,
 		struct cds_ft_inode_flag *graft_c,
 		struct cds_ft_inode_flag *edited,
 		enum ft_graft_prep prep, bool merge_dst, unsigned int src_cut,
-		bool edited_dropped)
+		bool edited_dropped, bool cut_ok)
 {
-	return !merge_dst && !src_cut &&
+	return !merge_dst && (!src_cut || cut_ok) &&
 		prep == FT_GRAFT_PREP_NOSPLIT &&
 		!ft_in_place_ok(ft) &&
 		ft_node_internal(graft_c) && !ft_node_compressed(graft_c) &&
@@ -4233,7 +4249,8 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 			climb_steps >= 1 &&
 			ft_rekey_fold_shape_ok(ft, graft_c, climb_top, prep,
 				merge_dst, src_cut,
-				true /*@climb_top is DROPPED, not edited*/) &&
+				true /*@climb_top is DROPPED, not edited*/,
+				false /*a cut is not this arm's shape*/) &&
 			climb_bytes <= d_src.pdepth) {
 		struct cds_ft_inode_flag *top_parent = NULL;
 		struct cds_ft_inode_flag **slot = ft_resolve_parent_slot(
@@ -4285,7 +4302,8 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 			climb_rest && !climb_reaches_graft &&
 			ft_rekey_fold_shape_ok(ft, graft_c, climb_rest, prep,
 				merge_dst, src_cut,
-				false /*@climb_rest is EDITED*/) &&
+				false /*@climb_rest is EDITED*/,
+				climb_steps == 0 /*BP itself: see @cut_ok*/) &&
 			climb_bytes < d_src.pdepth) {
 		struct cds_ft_metadata *rm = cds_ft_item_to_metadata(
 			ft_node_ptr(climb_rest));

@@ -69,13 +69,13 @@
 #endif
 
 /*
- * 329 unconditional + 51 fault-injection-only RUN_TEST registrations, on top of
+ * 330 unconditional + 51 fault-injection-only RUN_TEST registrations, on top of
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (388 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (389 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (337 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (338 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -13751,6 +13751,189 @@ out:
 	rcu_barrier();
 	cds_ft_destroy(ft);
 	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
+ * A CUT SOURCE WHOSE BRANCH POINT SURVIVES.
+ *
+ * When the src key ends INSIDE a path-compressed run -- @src_cut > 0 --
+ * @d_src.nf is the RUN, S_top is the tail ft_rekey_cow_stop manufactures, and
+ * that COW retires the run WHOLE.  ft_rekey_fold_shape_ok refused every such
+ * move outright (`!src_cut`), which cost 51 of the 3000 generated shapes.
+ *
+ * The refusal carried DROP's reason -- "the src slot holds the RUN and S_top is
+ * a COW'd tail, so 'BP is emptied by the drop' is not the shape at all" -- and
+ * that is true of DROP and irrelevant to the value-writing modes, where BP
+ * SURVIVES as a copy born without the run's slot.  Dropping the WHOLE slot is
+ * the right product there: every key under a run passes through all of its
+ * bytes, so a cut moves everything below that slot and nothing is stranded.
+ *
+ * ☞ AND THE TREE ALREADY SERVED IT ONE LEVEL DOWN.  @del_folds_into_graft --
+ * the height-0 fold, where BP IS @graft_c -- has never carried an @src_cut
+ * term, and its build arm arms the very same pair this one does
+ * (@d_src.nfp, @d_src.nf_raw).  Same keys, same src, one level apart:
+ *
+ *     insert "ab", "acde";  rekey_merge(dst, src "acd")   -- cut = 1
+ *       dst "aq"  -> BP == graft_c         -> OK, verify clean  (served all along)
+ *       dst "q"   -> BP a child of graft_c -> NOT_SUPPORTED     (this refusal)
+ *
+ * So the refusal was never a property of the trie, and the count follows the
+ * uncut case exactly: @cnt is ft_nr_keys_get(@s_top_meta) and for a cut @s_top
+ * IS the run, so it is the whole subtree the slot held -- which is what the
+ * REPLACE arm subtracts from BP's copy and what COLLAPSE's @surv_keys uses.
+ * R's retire and its post-commit free stay owned by ft_rekey_cow_stop and the
+ * driver's cds_ft_free_item_deferred (@s_top_external is false for a cut).
+ *
+ * DROP keeps the refusal: there the premise really is "the chain ABOVE BP is
+ * emptied", which a cut does not establish.  Measured at the arming over the
+ * corpus, the 51 are PROMOTE 9 + REPLACE 10 + COLLAPSE 32, armed and CONSUMED
+ * 1:1, and DROP 0 -- exactly as the @cut_ok split says.
+ *
+ * A..C put @graft_c at the ROOT, which tests nothing about a grandparent, so
+ * D..F are the same three shapes BELOW the root with rank statistics ON.  On
+ * -DNO_FEATURE_FT_COMPRESS there is no run to cut and the same calls are
+ * ordinary moves through plain interiors; they must still commit, which is what
+ * makes OK required on every build.
+ *
+ * RED ARM: `!src_cut` restored answers 2891/109 again -- all six shapes
+ * NOT_SUPPORTED, trie untouched, 0 bad over the corpus.
+ */
+static int rekey_fold_cut_source(int ordered_list, int shape)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	enum cds_ft_status s;
+	/* A: COLLAPSE -- BP has two children and no keys of its own. */
+	static const char *const a_keys[] = { "ab", "acde", NULL };
+	/* B: REPLACE -- BP keeps a child AND a co-located key. */
+	static const char *const b_keys[] = { "ab", "acde", "a", NULL };
+	/* C: PROMOTE -- the drop leaves BP childless but KEYED. */
+	static const char *const c_keys[] = { "a", "acde", NULL };
+	/* D..F: the same three with @graft_c BELOW the root, rank stats ON. */
+	static const char *const d_keys[] = { "q", "zb", "zab", "zacde", NULL };
+	static const char *const e_keys[] = { "q", "zb", "za", "zab", "zacde",
+		NULL };
+	static const char *const f_keys[] = { "q", "zb", "za", "zacde", NULL };
+	/*
+	 * ☠ G..I MOVE MORE THAN ONE KEY, and A..F all move exactly one.
+	 *
+	 * @cnt == 1 is the one value at which a sign or scale error in the count
+	 * bake is INVISIBLE: REPLACE stores `get(fresh) - cnt` and COLLAPSE
+	 * computes `surv_keys = get(climb_rest) - cnt`, and at 1 a subtraction, a
+	 * decrement and a clear are indistinguishable.  These three carry cnt == 2
+	 * through the same three modes, with rank statistics ON for ALL THREE --
+	 * rank OFF makes cds_ft_verify skip nr_keys entirely, so a cnt>1 shape
+	 * without it is decoration.  MEASURED with the bake ablated (`- cnt`
+	 * replaced by `- 1` at both sites): A..F and a rank-OFF G stay GREEN, and
+	 * only the rank-ON cnt==2 legs redden -- H on the REPLACE bake and G on
+	 * COLLAPSE's @surv_keys.  (The gap was found by this change's adversarial
+	 * skeptic; the ablation is what sized it.)
+	 */
+	static const char *const g_keys[] = { "ab", "acdex", "acdey", NULL };
+	static const char *const h_keys[] = { "q", "zb", "za", "zab", "zacdex",
+		"zacdey", NULL };
+	static const char *const i_keys[] = { "q", "zb", "za", "zacdex",
+		"zacdey", NULL };
+	static const char *const one_de[]   = { "acde", NULL };
+	static const char *const one_zde[]  = { "zacde", NULL };
+	static const char *const to_qe[]    = { "qe", NULL };
+	static const char *const to_zqe[]   = { "zqe", NULL };
+	static const char *const two_de[]   = { "acdex", "acdey", NULL };
+	static const char *const two_zde[]  = { "zacdex", "zacdey", NULL };
+	static const char *const to_qqq[]   = { "qqqex", "qqqey", NULL };
+	static const char *const to_zqq[]   = { "zqqex", "zqqey", NULL };
+	static const struct {
+		const char *const *keys;
+		const char *dst, *src;
+		const char *const *moved_from;
+		const char *const *moved_to;
+		bool rank_stats;
+	} shapes[] = {
+		{ a_keys, "q",   "acd",  one_de,  to_qe,   false },
+		{ b_keys, "q",   "acd",  one_de,  to_qe,   false },
+		{ c_keys, "q",   "acd",  one_de,  to_qe,   false },
+		{ d_keys, "zq",  "zacd", one_zde, to_zqe,  true },
+		{ e_keys, "zq",  "zacd", one_zde, to_zqe,  true },
+		{ f_keys, "zq",  "zacd", one_zde, to_zqe,  true },
+		{ g_keys, "qqq", "acd",  two_de,  to_qqq,  true },
+		{ h_keys, "zqq", "zacd", two_zde, to_zqq,  true },
+		{ i_keys, "zqq", "zacd", two_zde, to_zqq,  true },
+	};
+	const char *const *keys = shapes[shape].keys;
+	unsigned long n = 0;
+	int ret = -1, i;
+
+	if (!cds_ft_merge_enabled()) {
+		diag("rekey_fold_cut_source: skipped, merge compiled out "
+			"(-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
+	if (cds_ft_group_attr_create(&attr) < 0)
+		return -1;
+	if (cds_ft_group_attr_set_ordered_list(attr, ordered_list) < 0 ||
+	    (shapes[shape].rank_stats &&
+	     cds_ft_group_attr_set_rank_stats(attr, true) < 0) ||
+	    cds_ft_group_create(attr, &group) < 0) {
+		cds_ft_group_attr_destroy(attr);
+		return -1;
+	}
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &ft) < 0) {
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	rcu_read_lock();
+	for (i = 0; keys[i]; i++) {
+		cds_ft_insert(ft, (const uint8_t *) keys[i], strlen(keys[i]),
+			&node_alloc((unsigned long) i + 1)->node);
+		n++;
+	}
+	s = ft_rekey(ft, shapes[shape].dst, shapes[shape].src);
+	if (s != CDS_FT_STATUS_OK)
+		goto out;
+	/* every moved key is at its NEW name and gone from its old one */
+	for (i = 0; shapes[shape].moved_to[i]; i++)
+		if (!ft_test_has_key(ft, shapes[shape].moved_to[i]) ||
+		    ft_test_has_key(ft, shapes[shape].moved_from[i]))
+			goto out;
+	/* ...and every key that did NOT move is untouched */
+	for (i = 0; keys[i]; i++) {
+		int moved = 0, j;
+
+		for (j = 0; shapes[shape].moved_from[j]; j++)
+			if (!strcmp(keys[i], shapes[shape].moved_from[j]))
+				moved = 1;
+		if (!moved && !ft_test_has_key(ft, keys[i]))
+			goto out;
+	}
+	if (cds_ft_count_keys(ft) != n ||
+	    cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK)
+		goto out;
+	ret = 0;
+out:
+	if (ret)
+		fprintf(stderr,
+			"fold_cut_source(list=%d shape=%c): %s count %lu "
+			"(want %lu)\n", ordered_list, 'A' + shape,
+			cds_ft_status_to_string(s), cds_ft_count_keys(ft), n);
+	rcu_read_unlock();
+	drain_trie(ft);
+	rcu_barrier();
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+static int test_rekey_fold_cut_source(void)
+{
+	int ret = 0, shape, list;
+
+	/* EVERY LEG RUNS: `|=`, so a first red never hides the others. */
+	for (shape = 0; shape < 9; shape++)
+		for (list = 0; list < 2; list++)
+			ret |= rekey_fold_cut_source(list, shape);
 	return ret;
 }
 
@@ -37846,6 +38029,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_rekey_fold_writes_value);
 	RUN_TEST(test_rekey_compressed_publish_parent);
 	RUN_TEST(test_rekey_fold_compressed_chain);
+	RUN_TEST(test_rekey_fold_cut_source);
 	RUN_TEST(test_rekey_merge_colocated_chain);
 	RUN_TEST(test_rekey_merge_cut_source);
 	RUN_TEST(test_rekey_merge_dst_run_start);
