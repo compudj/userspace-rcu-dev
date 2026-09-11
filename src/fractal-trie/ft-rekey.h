@@ -6395,7 +6395,32 @@ cells_done:
 		 *    bare-head refusal named -- skipping ft_rekey_cow_stop drops
 		 *    the RECORDED retire, and this drops the post-commit RECLAIM.
 		 */
-		if (!merge_dst && !s_top_external &&
+		/*
+		 * ☠ ...AND THE MERGE ONLY OWNS S_top WHEN IT STARTS AT THE RUN'S
+		 * HEAD.  The @merge_dst term above rests on "the MERGE retires
+		 * S_top through @src_glue's free list", and ft_merge_build defers
+		 * it on exactly one condition -- `S_comp && off_s == 0` -- on both
+		 * its fenced and unfenced arms.  A CUT SOURCE enters the merge
+		 * with @off_s = @src_cut, which is non-zero BY DEFINITION, so the
+		 * src glue never takes the node and the term hands it to an owner
+		 * that declined it.  The third candidate, @glue.old_dir_dropped,
+		 * is 0 on this path.  Nobody frees it.
+		 *
+		 * MEASURED with the drain oracle over the 3000-shape corpus on a
+		 * -DDEBUG_COUNTERS build: 98 of 98 `merge_dst && src_cut` seeds
+		 * leak exactly one compressed node, and 0 of the 275 cut seeds
+		 * that are NOT merges do -- those take this free.  100 per cent
+		 * penetrant, and invisible to every other oracle: the keys are
+		 * right and cds_ft_verify is clean on all of them.
+		 *
+		 * A cut is the one case where the merge's premise and this term
+		 * disagree, so it is the one case added back.  No double free is
+		 * possible for the same reason: the src glue's free list never
+		 * received the node (@off_s > 0), so this is its only owner, and
+		 * this site is on the COMMITTED branch alone -- which is what the
+		 * rcu_head warning above is about.
+		 */
+		if ((!merge_dst || src_cut) && !s_top_external &&
 				!(src_cut && glue.old_dir_dropped))
 			cds_ft_free_item_deferred(ft, s_top_meta);
 		ret = 0;

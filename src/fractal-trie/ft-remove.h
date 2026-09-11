@@ -3245,10 +3245,43 @@ int ft_detach_node(struct cds_ft *ft,
 			 */
 			wlctx.held.outer = op_ctx ? &op_ctx->held : NULL;
 
-			/* Phase 1: elevated ancestors. */
+			/*
+			 * Phase 1: elevated ancestors.
+			 *
+			 * ☠ SKIP BEFORE EXTERNAL, and the body two lines down has
+			 * always said so.  ft_node_external tests the LOW TAG BITS
+			 * ONLY, and a SKIP_X word carries its child's tag -- so a
+			 * skip pointer ONTO AN EXTERNAL HEAD reads as external and
+			 * this loop never starts.  The body's own first arm is the
+			 * skip arm; the condition disagreed with it.
+			 *
+			 * What that costs is the skip-TARGET run: the node holding
+			 * the path bytes between the boundary and a bare external
+			 * head.  A move-style detach (@free_detached_subtree false,
+			 * which is what the rekey passes) has no other collector --
+			 * the trailing skip-target arm is nested inside
+			 * `if (free_detached_subtree)` -- and ft_rekey_cow_stop owns
+			 * nothing for a bare head (@s_top_meta is NULL).  So nobody
+			 * frees it.
+			 *
+			 * MEASURED with the drain oracle over the 3000-shape corpus
+			 * on a -DDEBUG_COUNTERS build: 310 of 310 seeds whose src is
+			 * a bare head under a SKIP-encoded boundary slot leak exactly
+			 * one compressed node, and 0 of the 197 bare-head seeds whose
+			 * boundary slot is a plain internal do.  100 per cent
+			 * penetrant, and invisible to every other oracle -- keys
+			 * right, cds_ft_verify clean on all of them.  A point REMOVE
+			 * of the same key is fine: it passes @free_detached_subtree
+			 * true and the trailing arm catches it.
+			 *
+			 * ☞ This is the dispatch-order trap ft-rekey.h's own descent
+			 * comment names ("a skip word's low tag bits are 0, so the
+			 * external and internal predicates both read it wrong").
+			 */
 			while (nr_to_free < nr_clear &&
 			       walk_nf &&
-			       !ft_node_external(walk_nf) &&
+			       (ft_node_skip_compressed(walk_nf) ||
+				!ft_node_external(walk_nf)) &&
 			       nr_to_free < FT_MAX_DEPTH) {
 				struct cds_ft_inode_flag *next = NULL;
 				struct cds_ft_metadata *ometa;
