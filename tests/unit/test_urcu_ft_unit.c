@@ -69,13 +69,13 @@
 #endif
 
 /*
- * 328 unconditional + 51 fault-injection-only RUN_TEST registrations, on top of
+ * 329 unconditional + 51 fault-injection-only RUN_TEST registrations, on top of
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (387 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (388 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (336 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (337 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -13619,6 +13619,149 @@ out:
 	rcu_barrier();
 	cds_ft_destroy(ft);
 	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
+ * A COMPRESSED RUN ON THE CHAIN THE FOLD CLEARS.
+ *
+ * A same-trie rekey whose src branch point is reached through a path-compressed
+ * run used to answer NOT_SUPPORTED -- 127 of the 3000 generated shapes on the
+ * default build, and every one of them SERVED in its plain spelling
+ * (-DNO_FEATURE_FT_COMPRESS).  Two predicates held them back and either one
+ * alone was enough: `!climb_compressed` in both fold armings, and
+ * ft_rekey_fold_freeze_orphans' plain-interiors-only kind test.
+ *
+ * The stated reason was that a run "puts a SECOND path (the SKIP_X dual) on the
+ * same child, and refreshing that dual is a second publish this cut has no owner
+ * for".  Nothing in these shapes REFRESHES a dual.  The run is UNLINKED: the
+ * slot that spells it is dropped from @graft_c's one fresh copy, and the run,
+ * its child word and that spelling all die with the retired chain.  A dual is
+ * owed only where the compressed node SURVIVES and its child is republished --
+ * the compressed publish parent above, a different mechanism.
+ *
+ * Two things had to change with the arming.  The slot @graft_c holds the run in
+ * carries, on a skip group, the run's SKIP_X spelling -- @child | (len << shift),
+ * which names the run's CHILD -- so an identity compare against the climb's
+ * @climb_top (a flag read out of a parent_word, never skip-encoded) can never
+ * hold: the arming asks which NODE the word names (ft_rekey_slot_names) and
+ * carries the RAW word as the drop's expected-old.  And the freeze walk's depth
+ * bookkeeping steps by ft_node_span, because a run rises its whole length in one
+ * step.
+ *
+ * SHAPE A is the bare-external-head spelling: the run's only child is the app's
+ * own node, so the move has no COW at all and the head's back edge must be
+ * re-parented by the fold's copy loop rather than left naming the retired run.
+ * @graft_c is the ROOT there, which tests nothing about a grandparent -- so
+ * B..E are all BELOW the root, with rank statistics ON, and B..E each pin a
+ * different fold MODE: measured at the arming over the corpus, the 127 are 83
+ * DROP + 27 COLLAPSE + 14 REPLACE + 3 PROMOTE, armed and CONSUMED 1:1.
+ *
+ * On a build without path compression these are ordinary plain-chain moves and
+ * were always served; on one without skip pointers the slot holds the run's own
+ * flag and the identity compare degenerates to what it was.  So OK is required
+ * on every build -- which is also what makes this test catch a regression that
+ * only shows up in one encoding.
+ *
+ * RED ARMS, both run and both against the 3000-shape corpus: `!climb_compressed`
+ * restored answers 2764/236 again -- every one of these five NOT_SUPPORTED with
+ * the trie byte-for-byte as it was; the freeze walk's compressed acceptance
+ * ablated ALONE answers the same 2764/236, refusing (FT_REKEY_UNCOVERED,
+ * terminal) after the graft is built and unwinding it clean -- 0 bad, verify
+ * clean on all 3000.
+ */
+static int rekey_fold_compressed_chain(int ordered_list, int shape)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	enum cds_ft_status s;
+	/* A: DROP at the ROOT, and the run's one child is a BARE EXTERNAL HEAD. */
+	static const char *const a_keys[] = { "a", "cb", NULL };
+	/* B: DROP with @graft_c below the root. */
+	static const char *const b_keys[] = { "q", "za", "zcb", NULL };
+	/* C: REPLACE -- the resting node keeps two children and a key. */
+	static const char *const c_keys[] = { "q", "zb", "zc", "zcca",
+		"zcacbaa", NULL };
+	/* D: PROMOTE -- the resting node is left childless but KEYED. */
+	static const char *const d_keys[] = { "q", "zc", "za", "zaaac", NULL };
+	/* E: COLLAPSE -- two children, no keys: the survivor becomes a run. */
+	static const char *const e_keys[] = { "q", "zc", "zabc", "zacac", NULL };
+	static const struct {
+		const char *const *keys;
+		const char *dst, *src, *moved_from, *moved_to;
+		bool rank_stats;
+	} shapes[] = {
+		{ a_keys, "bccc", "cb", "cb", "bccc", false },
+		{ b_keys, "zbccc", "zcb", "zcb", "zbccc", true },
+		{ c_keys, "zaaa", "zcacbaa", "zcacbaa", "zaaa", true },
+		{ d_keys, "zbb", "zaaac", "zaaac", "zbb", true },
+		{ e_keys, "zb", "zacac", "zacac", "zb", true },
+	};
+	const char *const *keys = shapes[shape].keys;
+	unsigned long n = 0;
+	int ret = -1, i;
+
+	if (!cds_ft_merge_enabled()) {
+		diag("rekey_fold_compressed_chain: skipped, merge compiled "
+			"out (-DNO_FEATURE_FT_MERGE)");
+		return 0;
+	}
+	if (cds_ft_group_attr_create(&attr) < 0)
+		return -1;
+	if (cds_ft_group_attr_set_ordered_list(attr, ordered_list) < 0 ||
+	    (shapes[shape].rank_stats &&
+	     cds_ft_group_attr_set_rank_stats(attr, true) < 0) ||
+	    cds_ft_group_create(attr, &group) < 0) {
+		cds_ft_group_attr_destroy(attr);
+		return -1;
+	}
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &ft) < 0) {
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	rcu_read_lock();
+	for (i = 0; keys[i]; i++) {
+		cds_ft_insert(ft, (const uint8_t *) keys[i], strlen(keys[i]),
+			&node_alloc((unsigned long) i + 1)->node);
+		n++;
+	}
+	s = ft_rekey(ft, shapes[shape].dst, shapes[shape].src);
+	if (s != CDS_FT_STATUS_OK ||
+	    !ft_test_has_key(ft, shapes[shape].moved_to) ||
+	    ft_test_has_key(ft, shapes[shape].moved_from))
+		goto out;
+	for (i = 0; keys[i]; i++)
+		if (strcmp(keys[i], shapes[shape].moved_from) &&
+		    !ft_test_has_key(ft, keys[i]))
+			goto out;
+	if (cds_ft_count_keys(ft) != n ||
+	    cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK)
+		goto out;
+	ret = 0;
+out:
+	if (ret)
+		fprintf(stderr,
+			"fold_compressed_chain(list=%d shape=%c): %s count %lu "
+			"(want %lu)\n", ordered_list, 'A' + shape,
+			cds_ft_status_to_string(s), cds_ft_count_keys(ft), n);
+	rcu_read_unlock();
+	drain_trie(ft);
+	rcu_barrier();
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+static int test_rekey_fold_compressed_chain(void)
+{
+	int ret = 0, shape, list;
+
+	/* EVERY LEG RUNS: `|=`, so a first red never hides the others. */
+	for (shape = 0; shape < 5; shape++)
+		for (list = 0; list < 2; list++)
+			ret |= rekey_fold_compressed_chain(list, shape);
 	return ret;
 }
 
@@ -37702,6 +37845,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_rekey_split_cluster_count);
 	RUN_TEST(test_rekey_fold_writes_value);
 	RUN_TEST(test_rekey_compressed_publish_parent);
+	RUN_TEST(test_rekey_fold_compressed_chain);
 	RUN_TEST(test_rekey_merge_colocated_chain);
 	RUN_TEST(test_rekey_merge_cut_source);
 	RUN_TEST(test_rekey_merge_dst_run_start);

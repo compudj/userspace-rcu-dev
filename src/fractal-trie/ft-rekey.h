@@ -1028,13 +1028,15 @@ int ft_rekey_run_vs_region(struct cds_ft *ft,
  * -DNO_FEATURE_FT_SKIP_COMPRESSED: the path-compression lane, not the
  * encoding.
  *
- * @compressed_link reports that the walk crossed a run, because two things
- * stop being true when it does: the fold's orphan freeze is PLAIN INTERIORS
- * ONLY (ft_rekey_fold_freeze_orphans), and @steps stops equalling the BYTE
- * depth the climb rises -- a run of length L spans L depths in one step, which
- * the fold's `climb_steps <= d_src.pdepth` arithmetic assumes it does not.
- * The callers disarm the fold on it; the staleness terms, which only ask
- * WHETHER the climb arrives, use the honest count.
+ * @compressed_link reports that the walk crossed a run.  It used to DISARM the
+ * fold, for two reasons that are both answered now: the orphan freeze was
+ * plain-interiors-only (it retires a run too -- ft_rekey_fold_freeze_orphans),
+ * and @steps stops equalling the BYTE depth the climb rises, a run of length L
+ * spanning L depths in one step (the walk steps by ft_node_span, and
+ * `climb_steps <= d_src.pdepth` survives as the range guard it always was,
+ * every node spanning at least one byte).  It is now a REPORT, not a verdict;
+ * the staleness terms, which only ask WHETHER the climb arrives, always used
+ * the honest count.
  *
  * ☞ @walk_runs, AND WHY IT IS THE NOSPLIT ARM ONLY.  The staleness this whole
  * walk predicts is "the detach republishes into a body the graft SUPERSEDED",
@@ -1063,6 +1065,7 @@ int ft_rekey_climb_reaches_graft(struct cds_ft *ft,
 		struct cds_ft_inode_flag **rest_out,
 		struct cds_ft_inode_flag **top_out,
 		bool *compressed_link,
+		unsigned int *bytes_out,
 		bool walk_runs)
 {
 	struct cds_ft_inode_flag *n = bp;
@@ -1075,6 +1078,8 @@ int ft_rekey_climb_reaches_graft(struct cds_ft *ft,
 		*top_out = NULL;
 	if (compressed_link)
 		*compressed_link = false;
+	if (bytes_out)
+		*bytes_out = 0;
 	while (n && steps < FT_MAX_KEY_LEN + 1) {
 		struct cds_ft_metadata *m;
 		bool run;
@@ -1120,6 +1125,19 @@ int ft_rekey_climb_reaches_graft(struct cds_ft *ft,
 		 */
 		n = ft_parent_node(rcu_dereference(m->parent_word));
 		steps++;
+		/*
+		 * ...AND HOW FAR THAT WAS IN BYTES, which is NOT @steps once a run
+		 * is on the chain: a node's parent sits at @depth - span(PARENT)
+		 * (ft_child_depth_of states the same arithmetic forwards), and a
+		 * run spans its whole @len.  ONE number, produced here and read by
+		 * both the arming's @fold_rest_depth and -- re-derived step by step
+		 * -- the freeze walk, so the two cannot drift.  Identical to
+		 * @steps on any all-plain chain, which is every chain the trie
+		 * actually produces: "no two adjacent compresseds" plus the
+		 * chain-compress fuse mean a cleared chain is at most ONE run.
+		 */
+		if (bytes_out && n)
+			*bytes_out += ft_node_span(ft, n);
 		if (rest_out)
 			*rest_out = n;
 		if (!n || n == graft_c) {	/* the root, or the graft's node */
@@ -1220,6 +1238,7 @@ enum ft_rekey_fold_mode {
 	 */
 	FT_REKEY_FOLD_COLLAPSE,
 };
+
 
 
 /*
@@ -1335,18 +1354,102 @@ bool ft_rekey_collapse_shape(const struct cds_ft *ft,
 		ft_meta_nr_child(rm) == 2 && !rm->external_nodes;
 }
 
+/*
+ * DOES THE WORD A SLOT HOLDS NAME @node?
+ *
+ * ☞ SPEAK THE ENCODED WORD, REASON ABOUT THE NODE IT DENOTES -- the same law
+ * the fold's REPLACE arm already carries for ft_node_find_child.  A slot whose
+ * child is a path-compressed RUN holds, on a skip group, the SKIP_X spelling of
+ * that run: @child | (len << FT_SKIP_LEN_SHIFT), which names the run's CHILD and
+ * so is never equal to the run's own flag.  An identity compare against the
+ * climb's @climb_top -- a flag the climb read from a parent_word, which is never
+ * skip-encoded -- can therefore never hold for a compressed link, which is what
+ * kept every such shape out of the fold.
+ *
+ * ☠ AND IT IS DERIVED FORWARD, FROM THE RUN, NEVER BY RESOLVING THE WORD.
+ * ft_resolve_skip_compressed would read the answer out of the SKIP CHILD'S BACK
+ * POINTER (ft_skip_to_compressed, whose own header says callers "get whatever
+ * the back-pointer currently says", and which for an EXTERNAL child reads
+ * node->prev -- a word this project has measured STALE AT REST, unbounded, on
+ * an idle trie).  A back-pointer may nominate a CANDIDATE; it may never deliver
+ * a VERDICT about where a node lives.  Worse, it would spend a guard that is
+ * not this helper's: the identity compare it replaces carried TWO facts at once
+ * -- that the slot holds @node's word, AND that @slot really is @node's slot --
+ * and only the first is re-checked downstream (the build re-reads the same slot
+ * for the same word; the copy loop matches by slot ADDRESS; the freeze walk
+ * re-resolves @edited's PARENT, not which of its slots).  So a resolver that
+ * accepted the wrong slot would have @graft_c's fresh copy born without some
+ * OTHER child -- that subtree silently unlinked -- and nothing after this point
+ * could tell.
+ *
+ * Comparing the run's own (child, len) against the word's DECODED fields keeps
+ * both facts: two live runs cannot share a child, because a child has one
+ * parent.  It is exactly as strong as the plain-flag identity compare beside
+ * it, it touches no back-pointer, and a torn read of either field answers
+ * false, which costs an -EAGAIN and never a fold.  The spelling rule mirrors
+ * its producer, ft_publish_compressed: a run with no SKIP_X form (skip
+ * compression off for the group, or a run too long to encode) has only the
+ * plain flag, and the identity compare above is then the whole answer.
+ *
+ * NULL, an external word (tag 0) and a peer's parked flip proxy all answer
+ * false: none of them decodes as a skip word naming this run.
+ */
+/* ☞ NO @ft: this reads the two words and nothing else -- no group lookup, no
+ * back-pointer.  The absent parameter is the property, stated in the signature. */
+static inline
+bool ft_rekey_slot_names(struct cds_ft_inode_flag *raw,
+		struct cds_ft_inode_flag *node)
+{
+	const struct cds_ft_compressed_node *cn;
+
+	if (!raw || !node)
+		return false;
+	if (raw == node)
+		return true;		/* the plain spelling */
+	/* Only a RUN has a second spelling. */
+	if (!ft_node_compressed(node) || !ft_node_skip_compressed(raw))
+		return false;
+	cn = ft_compressed_node_ptr(node);
+	return (unsigned int) ft_skip_len(raw) == (unsigned int) cn->len &&
+		ft_skip_child_ptr(raw) == rcu_dereference(cn->child);
+}
+
+/*
+ * @edited_dropped: the fold DROPS @edited's slot rather than writing a value
+ * into it, so @edited is not edited at all -- it is unlinked whole with every
+ * node below it on the cleared chain.  That is the DROP mode, and it is why a
+ * COMPRESSED @edited is admissible there and nowhere else:
+ *
+ *   - The "second path" the plain-interiors rule protects is the SKIP_X dual,
+ *     and a dual is only ever REFRESHED when the compressed node SURVIVES and
+ *     its child is republished.  Here the run and the slot that spells it both
+ *     die inside @graft_c's one fresh copy; there is nothing left to refresh.
+ *     (The surviving-run case is the compressed publish parent, served at
+ *     @088ec182 by ANNOUNCING the reserve's dual -- a different mechanism.)
+ *   - A run has exactly one child BY CONSTRUCTION and can carry no
+ *     external_nodes, so it is the one ancestor kind that is GUARANTEED to be
+ *     emptied by the drop -- which is exactly what the climb's own header
+ *     already says about walking runs.
+ *
+ * A SKIP-ENCODED @edited stays refused on both modes.  The climb reads flags out
+ * of parent_words, which are never skip-encoded, so it is a fail-closed test
+ * rather than a modelled case.
+ */
 static inline
 bool ft_rekey_fold_shape_ok(struct cds_ft *ft,
 		struct cds_ft_inode_flag *graft_c,
 		struct cds_ft_inode_flag *edited,
-		enum ft_graft_prep prep, bool merge_dst, unsigned int src_cut)
+		enum ft_graft_prep prep, bool merge_dst, unsigned int src_cut,
+		bool edited_dropped)
 {
 	return !merge_dst && !src_cut &&
 		prep == FT_GRAFT_PREP_NOSPLIT &&
 		!ft_in_place_ok(ft) &&
 		ft_node_internal(graft_c) && !ft_node_compressed(graft_c) &&
 		!ft_node_skip_compressed(graft_c) &&
-		ft_node_internal(edited) && !ft_node_compressed(edited) &&
+		(ft_node_internal(edited) ||
+			(edited_dropped && ft_node_compressed(edited))) &&
+		(edited_dropped || !ft_node_compressed(edited)) &&
 		!ft_node_skip_compressed(edited);
 }
 
@@ -1375,10 +1478,19 @@ bool ft_rekey_fold_shape_ok(struct cds_ft *ft,
  * neighbourhood moved under the plan, and the plan -- not this walk -- is what
  * @pending_del_slot was armed from.
  *
- * PLAIN INTERIORS ONLY, deliberately.  A compressed or skip-encoded link puts a
- * SECOND path (the SKIP_X dual) on the same child, and that dual's word is not
- * the one the fold's expected-old names; the gate refuses those shapes before
- * anything is built, and this walk fails closed if one appears anyway.
+ * PLAIN INTERIORS AND RUNS.  A SKIP-ENCODED link is still refused: a skip word
+ * names the far end, so it is not the word the fold's expected-old holds, and
+ * the climb never produces one (it reads flags out of parent_words).  A
+ * COMPRESSED one IS admitted, and the three things the walk needs from a node it
+ * retires are all true of a run: its metadata is reached by ft_flag_to_metadata
+ * (the same form the climb itself uses), its state word carries nr_child == 1
+ * (ft_meta_nr_child_set at every creation site) and it can hold no
+ * external_nodes, and ft_detach_freeze_orphans / ft_rekey_detach_free_orphans
+ * ALREADY dispatch on ft_node_compressed for the tombstone and the free.  The
+ * detach's own elevation retires the trailing run the same way (ft-remove.h
+ * ~2985).  What a run does NOT share with a plain interior is its SPAN: it rises
+ * @len bytes in one step, so the depth bookkeeping steps by ft_node_span rather
+ * than by one.
  *
  * ☠ THE TWO REFUSALS ARE NOT THE SAME REFUSAL, and answering both with
  * -EAGAIN is an infinite loop.  A node that MOVED or is HELD is a peer, and a
@@ -1423,14 +1535,31 @@ int ft_rekey_fold_freeze_orphans(struct cds_ft *ft,
 
 		if (!n || ft_node_flip_proxy(n))
 			goto refuse;		/* a peer mid-commit: transient */
-		if (!ft_node_internal(n) || ft_node_compressed(n) ||
+		if ((!ft_node_internal(n) && !ft_node_compressed(n)) ||
 				ft_node_skip_compressed(n)) {
 			ret = FT_REKEY_UNCOVERED;	/* structure, terminal */
 			goto refuse;
 		}
 		if (rc->nr_orphans >= steps || depth == 0)
 			goto refuse;
-		m = cds_ft_item_to_metadata(ft_node_ptr(n));
+		/*
+		 * ft_flag_to_metadata is the form that names the kind it is
+		 * given, and it is what the climb itself uses for its own @m.
+		 * NOT because the old spelling was wrong here -- for a PLAIN
+		 * COMPRESSED flag ft_node_ptr masks ~7UL (bit 0 clear) and
+		 * cds_ft_item_to_metadata(ft_node_ptr(n)) recovers the same
+		 * metadata -- but because it is the one that stays right if a
+		 * skip-encoded @n ever reaches here, and because the tree's own
+		 * kind-dispatcher for this job reads the same way
+		 * (ft_detach_freeze_orphans).
+		 */
+		m = ft_flag_to_metadata(ft, n);
+		/*
+		 * A run answers this from its own construction -- exactly one
+		 * child, never any external_nodes -- so the premise is asserted
+		 * rather than assumed, on the same word a peer would have to
+		 * commit into to break it.
+		 */
 		if (ft_meta_nr_child(m) != 1 || m->external_nodes)
 			goto refuse;
 		/*
@@ -1461,7 +1590,24 @@ int ft_rekey_fold_freeze_orphans(struct cds_ft *ft,
 		 */
 		n = NULL;
 		(void) ft_resolve_parent_slot(m, ft, &n);
-		depth--;
+		/*
+		 * ☠ A NODE'S PARENT SITS AT @depth - span(PARENT), not at
+		 * @depth - 1: a run rises its whole @len in one step
+		 * (ft_child_depth_of states the same arithmetic forwards).  The
+		 * plain chain this walk used to be restricted to made the two
+		 * identical, and the DLM member this depth DATES is the next
+		 * acquire's, so a wrong one is a wrong anchor rather than a
+		 * wrong node.  An underflow means the neighbourhood moved under
+		 * the plan -- the walk's own re-derivation disagreeing with the
+		 * gate's, which is exactly what @steps is checked against below.
+		 */
+		{
+			unsigned int span = n ? ft_node_span(ft, n) : 0;
+
+			if (span > depth)
+				goto refuse;
+			depth -= span;
+		}
 	}
 	if (rc->nr_orphans != steps)
 		goto refuse;
@@ -1476,6 +1622,12 @@ chain_done:
 	if (promoted) {
 		struct cds_ft_metadata *pm;
 
+		/*
+		 * PLAIN ONLY here, and not by inheritance: PROMOTE publishes the
+		 * promoted node's EXTERNAL CHAIN HEAD in its place, and a run
+		 * carries no external_nodes at all -- a compressed @promoted is
+		 * not a shape this mode has.
+		 */
 		if (!ft_node_internal(promoted) || ft_node_compressed(promoted) ||
 				ft_node_skip_compressed(promoted) ||
 				ft_node_flip_proxy(promoted)) {
@@ -1516,9 +1668,12 @@ chain_done:
 	{
 		struct cds_ft_inode_flag *edited_parent = NULL;
 
-		if (!ft_resolve_parent_slot(cds_ft_item_to_metadata(
-				ft_node_ptr(edited)), ft, &edited_parent) ||
-				edited_parent != graft_c)
+		/*
+		 * ft_flag_to_metadata: @edited is the DROPPED node on the DROP
+		 * mode, and that one may be a run.
+		 */
+		if (!ft_resolve_parent_slot(ft_flag_to_metadata(ft, edited), ft,
+				&edited_parent) || edited_parent != graft_c)
 			goto refuse;
 	}
 	/*
@@ -1883,12 +2038,19 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	/*
 	 * The climb crossed a compressed run.  It does NOT change whether the
 	 * climb arrives at @graft_c -- the staleness terms below use the honest
-	 * count either way -- but it DISARMS the fold, whose orphan freeze is
-	 * plain-interiors-only and whose depth arithmetic assumes one step is one
-	 * byte.  ☞ ft_rekey_climb_reaches_graft.
+	 * count either way -- and since the fold learned to speak the encoding it
+	 * no longer DISARMS anything: the orphan freeze retires a run like any
+	 * other cleared ancestor, and its depth arithmetic steps by ft_node_span.
+	 * Kept as the climb's own report of what it walked.
+	 * ☞ ft_rekey_climb_reaches_graft.
 	 */
 	bool climb_compressed = false;
 	int climb_steps;
+	/*
+	 * ...and the BYTE depth that climb rose, which @climb_steps only equals
+	 * while every node it stepped into spans one byte.  ☞ the climb.
+	 */
+	unsigned int climb_bytes = 0;
 	/*
 	 * ...and the SAME climb, ARMED instead of refused: the drop rides the
 	 * graft's copy of @graft_c one or more levels ABOVE BP, and the chain it
@@ -1901,6 +2063,15 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	enum ft_rekey_fold_mode fold_mode = FT_REKEY_FOLD_NONE;
 	struct cds_ft_inode_flag *climb_top = NULL;
 	struct cds_ft_inode_flag **fold_top_slot = NULL;
+	/*
+	 * ...and the RAW WORD that slot held when the arming read it.  Identical
+	 * to @climb_top / @climb_rest on every plain link; a run's SKIP_X spelling
+	 * where the link is compressed.  The copy loop compares
+	 * @pending_del_expected against rcu_dereference(*slot) -- a RAW word --
+	 * so this is the form that has to travel, and the RESOLVED flag is what
+	 * the freeze walk and the shape reasoning use.
+	 */
+	struct cds_ft_inode_flag *fold_top_expected = NULL;
 	/* PROMOTE only: the external chain head that takes the slot. */
 	struct cds_ft_inode_flag *fold_promote_val = NULL;
 	unsigned int fold_bp_depth = 0;
@@ -3993,7 +4164,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	climb_steps = del_folds_into_graft ? 0 :
 		ft_rekey_climb_reaches_graft(ft, d_src.pnf, graft_c,
 			&climb_reaches_graft, &climb_rest, &climb_top,
-			&climb_compressed,
+			&climb_compressed, &climb_bytes,
 			/*walk_runs=*/ prep == FT_GRAFT_PREP_NOSPLIT);
 	/*
 	 * ARM THE FOLD FROM THE CLIMB, not from a fixed depth.
@@ -4022,15 +4193,28 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 *     reasoning @root_pub_ok already carries.
 	 *   - A CUT SOURCE.  There the src slot holds the RUN and S_top is a COW'd
 	 *     tail, so "BP is emptied by the drop" is not the shape at all.
-	 *   - A COMPRESSED OR SKIP-ENCODED LINK anywhere on the chain: the slot
-	 *     word the fold compares is then not the only path to the child (the
-	 *     SKIP_X dual is the other), and refreshing that dual is a second
-	 *     publish this cut has no owner for.
+	 *   - A SKIP-ENCODED @climb_top.  Never produced: the climb reads flags out
+	 *     of parent_words, which name the node itself.
+	 *
+	 * ☑ A COMPRESSED LINK ON THE CHAIN IS NO LONGER REFUSED, and the reason it
+	 * was does not survive being written down.  It said a run "puts a SECOND
+	 * path (the SKIP_X dual) on the same child, and refreshing that dual is a
+	 * second publish this cut has no owner for".  Nothing here REFRESHES a
+	 * dual: the slot that spells the run is DROPPED from a fresh @graft_c, and
+	 * the run, its child word and that spelling all die with the retired chain.
+	 * A dual is owed only where the compressed node SURVIVES and its child is
+	 * republished -- the compressed publish parent, which is a different
+	 * mechanism and was served at @088ec182 by ANNOUNCING the reserve's dual.
+	 * The climb has walked runs since @4c8ac7fe (its own header says a run "is
+	 * the only ancestor kind that is GUARANTEED to be emptied by the drop"); it
+	 * was only the arming that would not use the answer.  MEASURED: 127 of the
+	 * 3000 generated shapes, 83 on this arm and 44 on the one below.
 	 *
 	 * The (parent, slot) pair comes from ONE coherent resolve so a peer
 	 * re-home mid-read cannot pair a fresh offset with a stale parent, and the
-	 * slot is required to still hold @climb_top ITSELF -- which is also what
-	 * excludes a skip-encoded word, since no skip encoding equals its target.
+	 * slot is required to still NAME @climb_top -- by the node it DENOTES, so
+	 * a run's SKIP_X spelling passes, while the RAW word is what the drop
+	 * carries as its expected-old (ft_rekey_slot_names).
 	 *
 	 * ☞ FOUR OF THESE TERMS CANNOT FIRE TODAY, and they are kept on purpose.
 	 * @climb_top non-NULL is implied by `climb_steps >= 1`, its node-kind tests
@@ -4046,20 +4230,23 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 */
 	if (!del_folds_into_graft && climb_top && graft_c &&
 			climb_reaches_graft && climb_rest == graft_c &&
-			climb_steps >= 1 && !climb_compressed &&
+			climb_steps >= 1 &&
 			ft_rekey_fold_shape_ok(ft, graft_c, climb_top, prep,
-				merge_dst, src_cut) &&
-			(unsigned int) climb_steps <= d_src.pdepth) {
+				merge_dst, src_cut,
+				true /*@climb_top is DROPPED, not edited*/) &&
+			climb_bytes <= d_src.pdepth) {
 		struct cds_ft_inode_flag *top_parent = NULL;
 		struct cds_ft_inode_flag **slot = ft_resolve_parent_slot(
-			cds_ft_item_to_metadata(ft_node_ptr(climb_top)), ft,
-			&top_parent);
+			ft_flag_to_metadata(ft, climb_top), ft, &top_parent);
+		struct cds_ft_inode_flag *raw = slot ?
+			rcu_dereference(*slot) : NULL;
 
 		if (slot && top_parent == graft_c &&
-				rcu_dereference(*slot) == climb_top) {
+				ft_rekey_slot_names(raw, climb_top)) {
 			bp_folds_into_graft_c = true;
 			fold_mode = FT_REKEY_FOLD_DROP;
 			fold_top_slot = slot;
+			fold_top_expected = raw;
 			fold_bp_depth = d_src.pdepth;
 		}
 	}
@@ -4086,11 +4273,20 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 * the one expression, because the walk reports where it STOPPED, not how
 	 * far it got.
 	 */
+	/*
+	 * ☑ AND A COMPRESSED LINK ON THE CLEARED CHAIN IS ADMITTED HERE TOO, on
+	 * the DROP arm's reasoning above: the run is unlinked from the RESTING
+	 * node's fresh copy and dies with it.  @climb_rest itself stays PLAIN --
+	 * the fold WRITES a value into its slot, and a value-writing fold into a
+	 * compressed node is the dual-refresh this cut has no owner for.  44 of
+	 * the 3000 generated shapes.
+	 */
 	if (!del_folds_into_graft && !bp_folds_into_graft_c && graft_c &&
-			climb_rest && !climb_reaches_graft && !climb_compressed &&
+			climb_rest && !climb_reaches_graft &&
 			ft_rekey_fold_shape_ok(ft, graft_c, climb_rest, prep,
-				merge_dst, src_cut) &&
-			(unsigned int) climb_steps < d_src.pdepth) {
+				merge_dst, src_cut,
+				false /*@climb_rest is EDITED*/) &&
+			climb_bytes < d_src.pdepth) {
 		struct cds_ft_metadata *rm = cds_ft_item_to_metadata(
 			ft_node_ptr(climb_rest));
 		struct cds_ft_inode_flag *rest_parent = NULL;
@@ -4112,15 +4308,29 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 
 			if (climb_steps >= 1) {
 				struct cds_ft_inode_flag *tp = NULL;
+				struct cds_ft_inode_flag *raw;
 
 				dchild = climb_top;
-				dexp = climb_top;
 				dslot = climb_top ? ft_resolve_parent_slot(
-					cds_ft_item_to_metadata(ft_node_ptr(
-						climb_top)), ft, &tp) : NULL;
-				if (!dslot || tp != climb_rest ||
-						rcu_dereference(*dslot) != climb_top)
+					ft_flag_to_metadata(ft, climb_top),
+					ft, &tp) : NULL;
+				raw = dslot ? rcu_dereference(*dslot) : NULL;
+				/*
+				 * ☠ THE RAW WORD, exactly as the @climb_steps == 0
+				 * leg one line up takes @d_src.nf_raw and for the
+				 * same reason: ft_node_find_child and
+				 * ft_node_other_child below compare WORDS, and a
+				 * compressed @climb_top is spelled SKIP_X in this
+				 * slot.  Handed the resolved flag the two can
+				 * never match -- "stale plan: re-descend" never
+				 * clears and the op spins for ever (the measured
+				 * livelock at ft_rekey_fold_shape_ok's header).
+				 */
+				if (!ft_rekey_slot_names(raw, climb_top) ||
+						tp != climb_rest)
 					dslot = NULL;	/* stale: leave unarmed */
+				else
+					dexp = raw;
 			}
 			/*
 			 * COLLAPSE instead of REPLACE for the two-child keyless
@@ -4162,8 +4372,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 					FT_REKEY_FOLD_REPLACE;
 				fold_top_slot = slot;
 				fold_bp_depth = d_src.pdepth;
-				fold_rest_depth = d_src.pdepth -
-					(unsigned int) climb_steps;
+				fold_rest_depth = d_src.pdepth - climb_bytes;
 				fold_drop_child = dchild;
 				fold_drop_slot = dslot;
 				fold_drop_expected = dexp;
@@ -4520,8 +4729,10 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 			 * Not gated on BP's arity, on the same reasoning the collapse term
 			 * above states: that read is a plan-time snapshot of a word peers
 			 * commit into, and a reservation is where OOM gets ANSWERED.  Nor
-			 * on skip-compression -- the walk elevates through plain nodes
-			 * just the same.
+			 * on skip-compression -- the walk elevates through plain nodes and
+			 * through RUNS alike, and a compressed orphan costs the same one
+			 * tombstone (ft_detach_freeze_one is kind-agnostic), so the bound
+			 * is the chain's LENGTH either way.
 			 */
 			ft_freeze_reserve(ft, (unsigned int) d_src.depth + 1) +
 			0)) {
@@ -5067,10 +5278,13 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 			/*
 			 * THE SAME ARMING ONE OR MORE LEVELS UP.  The slot is
 			 * @graft_c's, holding the topmost node the drop empties,
-			 * and the expected-old is that node ITSELF -- the walk
-			 * that named it refused every compressed and skip-encoded
-			 * link, so the word is a plain flag and identity IS the
-			 * coherent pair @nf_raw buys one level down.
+			 * and the expected-old is THE WORD THAT SLOT HELD AT THE
+			 * ARMING -- @climb_top itself on a plain link, its SKIP_X
+			 * spelling where the link is a run.  ☞ the law at
+			 * ft_rekey_slot_names: the copy loop compares this by
+			 * identity against rcu_dereference(*slot), so it must be
+			 * the encoded word, while the freeze walk below retires
+			 * the NODE @climb_top names.
 			 *
 			 * RE-VALIDATED here, not re-derived: a peer that
 			 * republished @graft_c's slot since the gate holds a
@@ -5080,12 +5294,13 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 			 * neighbourhood is unheld until the freeze below, so the
 			 * window is open under MW and a re-descent recaptures it.
 			 */
-			if (rcu_dereference(*fold_top_slot) != climb_top) {
+			if (!fold_top_expected || rcu_dereference(*fold_top_slot) !=
+					fold_top_expected) {
 				ret = -EAGAIN;
 				goto bail_build;
 			}
 			txn->pending_del_slot = fold_top_slot;
-			txn->pending_del_expected = climb_top;
+			txn->pending_del_expected = fold_top_expected;
 		}
 		cds_ft_alloc_reserve_activate(ft, &reserve);
 		/*
