@@ -56,6 +56,8 @@
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
+#include <sys/wait.h>
+#include <sys/resource.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -67,7 +69,7 @@
 
 #include "tap.h"
 
-#define NR_TESTS_REKEY_DLM	22	/* inv_rekey_graft_{disjoint,cross_junction,run_junction,elevating_junction,glue_dst,coherent_readers,shared}, inv_rekey_linearizability, inv_rekey_public_{atomic_no_gap,atomic_no_gap_varlen,atomic_no_gap_compressed_top}, inv_rekey_coarse_progress, inv_rekey_{coarse,fine,contended}_mixed_writers, inv_rekey_merge_{occupied,compressed,shared}_dst, inv_rekey_merge_compressed_dst_rootchurn */
+#define NR_TESTS_REKEY_DLM	23	/* inv_rekey_graft_{disjoint,cross_junction,run_junction,elevating_junction,glue_dst,coherent_readers,shared}, inv_rekey_merge_same_parent_coherent_readers, inv_rekey_linearizability, inv_rekey_public_{atomic_no_gap,atomic_no_gap_varlen,atomic_no_gap_compressed_top}, inv_rekey_coarse_progress, inv_rekey_{coarse,fine,contended}_mixed_writers, inv_rekey_merge_{occupied,compressed,shared}_dst, inv_rekey_merge_compressed_dst_rootchurn */
 
 /*
  * Base count = the RUN_TEST invocations in main() outside the DLM #ifdef.
@@ -3871,6 +3873,511 @@ static int inv_rekey_graft_coherent_readers(void)
 	if (leak_check() < 0)
 		ret = -1;
 	return ret;
+}
+
+/*
+ * SAME-PARENT SPLICE under concurrent coherent readers.
+ *
+ * Mathieu's own case, {ab, ac} + rekey_merge(dst "ac", src "ab"): one key on
+ * each side, src and dst sharing their last internal node P, so the move
+ * changes only the LAST byte of the key and the internal path to the
+ * destination head is the same path.  ft_merge_build splices the src leaf onto
+ * the dst head's duplicate chain and hands the head back; nothing fresh is
+ * produced at the attach point, and the address-witness the rekey-coherent
+ * reader's two-descent scheme needs is the src DETACH's own relocation of P
+ * (FT_REKEY_WITNESS_BY_DETACH, ft-rekey.h).  Every single-threaded instrument
+ * says the shape is served and clean; this is the only oracle that reaches it
+ * with READERS in flight -- the DST-FRESHNESS reach probe reads
+ * same_parent_detach=0 on every other ft_inv leg.
+ *
+ * THE SCENARIO THE WITNESS EXISTS FOR (Mathieu): "rekey_merge, then an insert
+ * on the destination external node chain.  We would not want a reader looking
+ * up the ORIGINAL SRC KEY to find the inserted node at the wrong location."
+ * So each writer iteration is exactly that: insert the mover at M, merge M
+ * into D's chain, insert a FRESH node at D, then remove both by identity.  A
+ * reader's lookup of M may answer miss or the mover -- NEVER the fresh node,
+ * never D's head.
+ *
+ * GEOMETRY, per writer w (private root child @bp, 4-byte fixed keys):
+ *   P  = (bp,3,0): children 1 (fixed sib), 5 (fixed sib), 2 (resident head
+ *        D), 4 (the mover M).  Four children, so the detach DEL-recompacts P
+ *        -- the recompaction producer of the fold.
+ *   P2 = (bp,3,1): children 2 (resident D2), 4 (mover M2) only.  Two
+ *        children, so the detach leaves P2 one-child keyless and COLLAPSES it
+ *        into a run -- the fused-collapse producer -- and the next insert at
+ *        M2 SPLITS that run again.
+ * Iterations alternate P and P2.  Junctions are writer-private, so the only
+ * peers of a move are the readers: a refusal here is a finding, not
+ * contention, and is fatal.
+ *
+ * SOUND assertions, anchored on keys present at EVERY instant: the fixed sibs
+ * (never moved, but their descent passes through P, which is relocated on
+ * every move) and the resident heads (D never moves; its chain grows and
+ * shrinks around it).  The MOVING key is checked weakly (miss XOR the mover).
+ * Relational probes (ge/le) on the fixed sibs must land exactly, as in
+ * inv_rekey_graft_coherent_readers.
+ *
+ * Nodes are allocated once and REUSED: after the two removals the writer
+ * waits a grace period (a reader may still hold the removed node) before
+ * re-initialising them, so a reader can never see a foreign or freed node
+ * under any name.  Opt-in FT_INV_MW=1.
+ *
+ * ☠ FORKED UNDER AN ALARM, like the unit test for the same class, because the
+ * defect it exists to catch does not REPORT -- it HANGS.  MEASURED with the
+ * defect put back (-DFT_RED_SAME_PATH_STALE_TOP_EDGE: the glue re-applies the
+ * folded top's stale back edge): no reader ever printed a violation.  The
+ * head's parent word then names freed memory, the writer's next insert bails
+ * and retries into the txn engine's fallback mutex, the readers park behind
+ * that mutex inside their read sections, and the other writers wait in
+ * synchronize_rcu for a grace period those readers can never provide -- a
+ * deadlock, silent until the cage's kill.  Inline, that would hang the whole
+ * suite and report nothing.  The child bounds itself; the parent reports.
+ * The child skips drain_and_destroy: a forked child has no call_rcu worker,
+ * so its rcu_barrier would block forever, and the trie dies with the process.
+ */
+#define RKSP_NW		8		/* writers */
+#define RKSP_NR		8		/* coherent readers */
+#define RKSP_KLEN	4		/* fixed key length, bytes */
+
+struct rksp_writer_arg {
+	struct cds_ft *ft;
+	uint8_t bp;			/* the writer's private root-child byte */
+	struct ft_test_node *sib[2];	/* (bp,3,0,1) (bp,3,0,5): never absent */
+	struct ft_test_node *res[2];	/* (bp,3,f,2): resident heads, never absent */
+	struct ft_test_node *mov[2];	/* (bp,3,f,4) -> spliced under (bp,3,f,2) */
+	struct ft_test_node *fresh[2];	/* inserted at (bp,3,f,2) AFTER the move */
+	unsigned long ops, busy;
+	int failed;
+};
+
+struct rksp_reader_arg {
+	struct cds_ft *ft;
+	struct rksp_writer_arg *w;
+	int nw;
+	unsigned long checks;
+	int failed;
+};
+
+static uint64_t rksp_key(uint8_t bp, uint8_t f, uint8_t u)
+{
+	return ((uint64_t) bp << 24) | (3ULL << 16) | ((uint64_t) f << 8) | u;
+}
+
+/* Remove @n, stored at key @v, by IDENTITY (a chain member); no free. */
+static enum cds_ft_status rksp_remove(struct cds_ft *ft, uint64_t v,
+		struct ft_test_node *n)
+{
+	struct cds_ft_iter *iter = NULL;
+	enum cds_ft_status st = CDS_FT_STATUS_NOT_FOUND;
+	uint8_t k[8] = { 0 };
+
+	if (cds_ft_iter_create(ft, &iter) < 0)
+		abort();
+	rcu_read_lock();
+	cds_ft_u64_to_key(ft, v, k, CDS_FT_LEN_DEFAULT);
+	cds_ft_iter_set_key(iter, k, CDS_FT_LEN_DEFAULT);
+	cds_ft_lookup(ft, iter);
+	if (cds_ft_iter_node(iter))
+		st = cds_ft_remove(ft, iter, &n->node);
+	rcu_read_unlock();
+	cds_ft_iter_destroy(iter);
+	return st;
+}
+
+static void *rksp_writer(void *arg)
+{
+	struct rksp_writer_arg *w = (struct rksp_writer_arg *) arg;
+	unsigned long iters = 0;
+
+	rcu_register_thread();
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	while (!test_stop) {
+		int f = (int) (iters & 1);
+		uint64_t mk = rksp_key(w->bp, (uint8_t) f, 4);
+		uint64_t dk = rksp_key(w->bp, (uint8_t) f, 2);
+		uint8_t mkey[8] = { 0 }, dkey[8] = { 0 };
+		enum cds_ft_status st;
+		const char *step;
+
+		cds_ft_u64_to_key(w->ft, mk, mkey, CDS_FT_LEN_DEFAULT);
+		cds_ft_u64_to_key(w->ft, dk, dkey, CDS_FT_LEN_DEFAULT);
+
+		rcu_read_lock();
+		st = insert_u64(w->ft, mk, w->mov[f]);
+		rcu_read_unlock();
+		if (st != CDS_FT_STATUS_OK) {
+			step = "insert mover";
+			goto fail;
+		}
+		/* Explicit lengths: the dispatch bounds them by max_key_len. */
+		st = cds_ft_rekey_merge(w->ft, dkey, RKSP_KLEN, mkey, RKSP_KLEN);
+		if (st == CDS_FT_STATUS_BUSY_ERROR ||
+				st == CDS_FT_STATUS_MEMORY_ERROR) {
+			/* The mover is still at M: take it back out and retry. */
+			w->busy++;
+			st = rksp_remove(w->ft, mk, w->mov[f]);
+			if (st != CDS_FT_STATUS_OK) {
+				step = "remove mover after busy";
+				goto fail;
+			}
+			goto reuse;
+		}
+		if (st != CDS_FT_STATUS_OK) {
+			/*
+			 * NOT_SUPPORTED included: the junction is private, so no
+			 * writer can change the shape under this move -- a refusal
+			 * here is the served arm refusing under READERS only.
+			 */
+			step = "rekey_merge";
+			goto fail;
+		}
+		w->ops++;
+		/* Mathieu's scenario: an insert on the DST chain right after. */
+		rcu_read_lock();
+		st = insert_u64(w->ft, dk, w->fresh[f]);
+		rcu_read_unlock();
+		if (st != CDS_FT_STATUS_OK) {
+			step = "insert fresh at dst";
+			goto fail;
+		}
+		st = rksp_remove(w->ft, dk, w->fresh[f]);
+		if (st != CDS_FT_STATUS_OK) {
+			step = "remove fresh";
+			goto fail;
+		}
+		st = rksp_remove(w->ft, dk, w->mov[f]);
+		if (st != CDS_FT_STATUS_OK) {
+			step = "remove mover from dst chain";
+			goto fail;
+		}
+reuse:
+		/*
+		 * The nodes are reused, not freed: a reader that found one of
+		 * them is entitled to it until a grace period has elapsed.
+		 */
+		synchronize_rcu();
+		cds_ft_node_init(&w->mov[f]->node);
+		cds_ft_node_init(&w->fresh[f]->node);
+		iters++;
+		continue;
+fail:
+		fprintf(stderr, "rksp_writer bp=%u f=%d: %s: %s\n", w->bp, f,
+			step, cds_ft_status_to_string(st));
+		w->failed = 1;
+		mw_violation_snapshot();
+		break;
+	}
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static void *rksp_reader(void *arg)
+{
+	struct rksp_reader_arg *r = (struct rksp_reader_arg *) arg;
+	struct cds_ft_iter *iter;
+	unsigned int seed = (unsigned int) (uintptr_t) r;
+	unsigned long iters = 0;
+
+	rcu_register_thread();
+	if (cds_ft_iter_create(r->ft, &iter) < 0)
+		abort();
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	while (!test_stop) {
+		int wi = rand_r(&seed) % r->nw;
+		struct rksp_writer_arg *w = &r->w[wi];
+		int pick = rand_r(&seed) % 8, f = pick & 1;
+		struct cds_ft_node *found;
+		enum cds_ft_status st;
+		uint64_t key;
+		uint8_t k[8] = { 0 };
+		int bad = 0;
+
+		if (pick < 2) {
+			/* FIXED sib: present at every instant, must be found. */
+			key = rksp_key(w->bp, 0, f ? 5 : 1);
+			cds_ft_u64_to_key(r->ft, key, k, CDS_FT_LEN_DEFAULT);
+			rcu_read_lock();
+			cds_ft_iter_set_key(iter, k, CDS_FT_LEN_DEFAULT);
+			cds_ft_lookup(r->ft, iter);
+			found = cds_ft_iter_node(iter);
+			bad = found != &w->sib[f]->node;
+			if (bad)
+				fprintf(stderr, "rksp_reader: fixed sib %#llx -> %p "
+					"(expect %p)\n", (unsigned long long) key,
+					(void *) found, (void *) &w->sib[f]->node);
+		} else if (pick < 4) {
+			/* RELATIONAL probe on a fixed sib: must land exactly. */
+			key = rksp_key(w->bp, 0, f ? 5 : 1);
+			cds_ft_u64_to_key(r->ft, key, k, CDS_FT_LEN_DEFAULT);
+			rcu_read_lock();
+			cds_ft_iter_set_key(iter, k, CDS_FT_LEN_DEFAULT);
+			st = (rand_r(&seed) & 1) ? cds_ft_lookup_ge(r->ft, iter) :
+				cds_ft_lookup_le(r->ft, iter);
+			found = cds_ft_iter_node(iter);
+			bad = st != CDS_FT_STATUS_OK || found != &w->sib[f]->node;
+			if (bad)
+				fprintf(stderr, "rksp_reader: relational %#llx -> %p "
+					"(%s, expect %p)\n", (unsigned long long) key,
+					(void *) found, cds_ft_status_to_string(st),
+					(void *) &w->sib[f]->node);
+		} else if (pick < 6) {
+			/*
+			 * RESIDENT head: present at every instant.  Its chain
+			 * holds the mover and the fresh node at times, so any of
+			 * the three is a legitimate answer; a miss is not.
+			 */
+			key = rksp_key(w->bp, (uint8_t) f, 2);
+			cds_ft_u64_to_key(r->ft, key, k, CDS_FT_LEN_DEFAULT);
+			rcu_read_lock();
+			cds_ft_iter_set_key(iter, k, CDS_FT_LEN_DEFAULT);
+			cds_ft_lookup(r->ft, iter);
+			found = cds_ft_iter_node(iter);
+			bad = found != &w->res[f]->node &&
+				found != &w->mov[f]->node &&
+				found != &w->fresh[f]->node;
+			if (bad)
+				fprintf(stderr, "rksp_reader: resident %#llx -> %p "
+					"(expect head %p, mover %p or fresh %p)\n",
+					(unsigned long long) key, (void *) found,
+					(void *) &w->res[f]->node,
+					(void *) &w->mov[f]->node,
+					(void *) &w->fresh[f]->node);
+		} else {
+			/*
+			 * THE ORIGINAL SRC KEY: miss XOR the mover.  The fresh
+			 * node -- inserted on the DST chain after the move -- at
+			 * this name is exactly the wrong location the witness
+			 * exists to prevent; the resident head here is a torn
+			 * descent that resolved the dst chain under the src name.
+			 */
+			key = rksp_key(w->bp, (uint8_t) f, 4);
+			cds_ft_u64_to_key(r->ft, key, k, CDS_FT_LEN_DEFAULT);
+			rcu_read_lock();
+			cds_ft_iter_set_key(iter, k, CDS_FT_LEN_DEFAULT);
+			cds_ft_lookup(r->ft, iter);
+			found = cds_ft_iter_node(iter);
+			bad = found && found != &w->mov[f]->node;
+			if (bad)
+				fprintf(stderr, "rksp_reader: src key %#llx -> %p "
+					"(%s; expect miss or mover %p)\n",
+					(unsigned long long) key, (void *) found,
+					found == &w->fresh[f]->node ?
+						"THE FRESH DST-CHAIN NODE" :
+					found == &w->res[f]->node ?
+						"the resident dst head" : "a foreign node",
+					(void *) &w->mov[f]->node);
+		}
+		if (bad) {
+			r->failed = 1;
+			rcu_read_unlock();
+			mw_violation_snapshot();
+			break;
+		}
+		rcu_read_unlock();
+		r->checks++;
+		if ((++iters & 0xff) == 0)
+			rcu_quiescent_state();
+	}
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+__attribute__((noreturn))
+static void rksp_child(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	struct rksp_writer_arg *w;
+	struct rksp_reader_arg *r;
+	pthread_t writers[RKSP_NW], readers[RKSP_NR];
+	struct ft_test_node *guard_lo, *guard_hi;
+	struct timespec t0;
+	unsigned long total_ops = 0, total_busy = 0, total_checks = 0, live = 0;
+	int i, f, ret = 0;
+
+	{
+		struct rlimit rl = { .rlim_cur = 0, .rlim_max = 0 };
+
+		(void) setrlimit(RLIMIT_CORE, &rl);
+	}
+	alarm(60);
+	mw_install_fatal_handler();
+	leak_reset();
+
+	ft = create_fixed_rekey_coherent_ft(RKSP_KLEN, &group);
+	cds_ft_make_concurrent(ft);
+
+	guard_lo = node_alloc(0x00000000ULL);
+	guard_hi = node_alloc(0xff000000ULL);
+	rcu_read_lock();
+	if (insert_u64(ft, 0x00000000ULL, guard_lo) != CDS_FT_STATUS_OK ||
+			insert_u64(ft, 0xff000000ULL, guard_hi) != CDS_FT_STATUS_OK)
+		abort();
+	rcu_read_unlock();
+	live = 2;
+
+	w = (struct rksp_writer_arg *) calloc(RKSP_NW, sizeof(*w));
+	r = (struct rksp_reader_arg *) calloc(RKSP_NR, sizeof(*r));
+	if (!w || !r)
+		abort();
+	for (i = 0; i < RKSP_NW; i++) {
+		w[i].ft = ft;
+		w[i].bp = (uint8_t) (i + 1);
+		rcu_read_lock();
+		for (f = 0; f < 2; f++) {
+			uint64_t sk = rksp_key(w[i].bp, 0, f ? 5 : 1);
+			uint64_t rk = rksp_key(w[i].bp, (uint8_t) f, 2);
+
+			w[i].sib[f] = node_alloc(sk);
+			if (insert_u64(ft, sk, w[i].sib[f]) != CDS_FT_STATUS_OK)
+				abort();
+			w[i].res[f] = node_alloc(rk);
+			if (insert_u64(ft, rk, w[i].res[f]) != CDS_FT_STATUS_OK)
+				abort();
+			/* Allocated once; keyed only while a cycle is in flight. */
+			w[i].mov[f] = node_alloc(rksp_key(w[i].bp, (uint8_t) f, 4));
+			w[i].fresh[f] = node_alloc(rk);
+		}
+		rcu_read_unlock();
+		live += 4;
+	}
+	for (i = 0; i < RKSP_NR; i++) {
+		r[i].ft = ft;
+		r[i].w = w;
+		r[i].nw = RKSP_NW;
+	}
+
+	test_go = 0;
+	test_stop = 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < RKSP_NW; i++)
+		pthread_create(&writers[i], NULL, rksp_writer, &w[i]);
+	for (i = 0; i < RKSP_NR; i++)
+		pthread_create(&readers[i], NULL, rksp_reader, &r[i]);
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	test_go = 1;
+
+	rcu_thread_offline();
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	while (elapsed_ms(&t0) < DEFAULT_DURATION_MS)
+		usleep(1000);
+	test_stop = 1;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	for (i = 0; i < RKSP_NW; i++)
+		pthread_join(writers[i], NULL);
+	for (i = 0; i < RKSP_NR; i++)
+		pthread_join(readers[i], NULL);
+	rcu_thread_online();
+
+	for (i = 0; i < RKSP_NW; i++) {
+		total_ops += w[i].ops;
+		total_busy += w[i].busy;
+		if (w[i].failed)
+			ret = -1;
+	}
+	for (i = 0; i < RKSP_NR; i++) {
+		total_checks += r[i].checks;
+		if (r[i].failed)
+			ret = -1;
+	}
+
+	synchronize_rcu();
+	rcu_read_lock();
+	for (i = 0; i < RKSP_NW; i++) {
+		for (f = 0; f < 2; f++) {
+			struct cds_ft_node *found = NULL;
+
+			if (lookup_u64(ft, rksp_key(w[i].bp, 0, f ? 5 : 1),
+					&found) != CDS_FT_STATUS_OK ||
+					found != &w[i].sib[f]->node)
+				ret = -1;
+			found = NULL;
+			if (lookup_u64(ft, rksp_key(w[i].bp, (uint8_t) f, 2),
+					&found) != CDS_FT_STATUS_OK ||
+					found != &w[i].res[f]->node)
+				ret = -1;
+			found = NULL;
+			if (lookup_u64(ft, rksp_key(w[i].bp, (uint8_t) f, 4),
+					&found) == CDS_FT_STATUS_OK)
+				ret = -1;	/* a mover left behind */
+		}
+	}
+	if (cds_ft_count_keys(ft) != live)
+		ret = -1;
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK)
+		ret = -1;
+	rcu_read_unlock();
+
+	if (total_ops == 0)
+		ret = -1;
+	fprintf(stderr, "# inv_rekey_merge_same_parent_coherent_readers: %d writers "
+		"%d readers, %lu splices, %lu busy, %lu reads, %lu live keys\n",
+		RKSP_NW, RKSP_NR, total_ops, total_busy, total_checks, live);
+	(void) group;
+	_exit(ret ? 1 : 0);
+}
+
+static int inv_rekey_merge_same_parent_coherent_readers(void)
+{
+	pid_t pid;
+	int status;
+
+	INV_NEED_MERGE("inv_rekey_merge_same_parent_coherent_readers");
+	if (!getenv("FT_INV_MW")) {
+		fprintf(stderr, "# inv_rekey_merge_same_parent_coherent_readers: "
+			"skipped (set FT_INV_MW=1 to run the coherent-rekey reader "
+			"oracle)\n");
+		return 0;
+	}
+	/*
+	 * ☠ THE CHILD INHERITS THE PARENT'S READER REGISTRY.  Every call_rcu
+	 * worker is a registered QSBR reader, and one that was running
+	 * callbacks at the instant of the fork stays ONLINE in the child's copy
+	 * of the registry forever -- no thread ever advances it -- so the
+	 * child's first synchronize_rcu (the writers' node-reuse fence) waits
+	 * for a phantom.  MEASURED: the healthy build hung in wait_for_readers
+	 * inside the child, indistinguishable from the defect this oracle
+	 * catches.  call_rcu_before_fork parks every worker UNREGISTERED and
+	 * waits for the acknowledgement; the child then re-creates its own
+	 * default worker, so its deferred frees run as well.
+	 */
+	call_rcu_before_fork();
+	pid = fork();
+	if (pid < 0) {
+		call_rcu_after_fork_parent();
+		fprintf(stderr, "rksp: fork failed\n");
+		return -1;
+	}
+	if (pid == 0) {
+		call_rcu_after_fork_child();
+		rksp_child();
+	}
+	call_rcu_after_fork_parent();
+	if (waitpid(pid, &status, 0) != pid) {
+		fprintf(stderr, "rksp: waitpid failed\n");
+		return -1;
+	}
+	if (WIFSIGNALED(status)) {
+		fprintf(stderr, "rksp: child killed by signal %d%s\n",
+			WTERMSIG(status),
+			WTERMSIG(status) == SIGALRM ?
+				" (HANG -- the same-parent splice oracle did not "
+				"return)" : "");
+		return -1;
+	}
+	if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+		fprintf(stderr, "rksp: child exited %d\n",
+			WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+		return -1;
+	}
+	return 0;
 }
 
 /*
@@ -21322,6 +21829,7 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_rekey_graft_elevating_junction);
 	RUN_TEST(inv_rekey_graft_glue_dst);
 	RUN_TEST(inv_rekey_graft_coherent_readers);
+	RUN_TEST(inv_rekey_merge_same_parent_coherent_readers);
 	RUN_TEST(inv_rekey_graft_shared);
 	RUN_TEST(inv_rekey_linearizability);
 	RUN_TEST(inv_rekey_public_atomic_no_gap);

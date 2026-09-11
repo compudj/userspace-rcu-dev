@@ -14458,8 +14458,16 @@ void ft_glue_apply_deferred(struct cds_ft *ft, struct ft_glue *g)
 			 * the producer's word, which the engine refuses loudly.
 			 */
 			urcu_assert_debug(ft_node_external(g->deferred[i].child));
+#ifndef FT_RED_SAME_PATH_STALE_TOP_EDGE
+			/*
+			 * RED CONTROL (never shipped): with the define, the entry is
+			 * applied anyway -- the measured same-parent defect put back
+			 * -- so inv_rekey_merge_same_parent_coherent_readers can be
+			 * shown to catch it rather than merely pass.
+			 */
 			if (ft_node_external(g->deferred[i].child))
 				continue;
+#endif
 		}
 		/*
 		 * PER EDGE (@live at the struct): "unreachable until the forward
