@@ -1083,10 +1083,30 @@ bool ft_chain_compress_deep_pending(struct cds_ft_inode_flag *survivor,
  * MW-PSO-vs-SW-tombstone chain conflict).  The collapse then reports the fold
  * (@pending_pub_folded / @pending_pub_node) so the glue commit skips its
  * forward publish and re-bases its count delta onto the merged node.
- * A COMPRESSED @pending_child is refused by the CALLER up front (see the
- * shape-D gate): absorbing a fresh unpublished compressed top would retire a
- * node that was never published and re-aim its cluster's deferred edges -- an
- * ownership question this primitive deliberately does not take on.
+ * ☑ A COMPRESSED @pending_child IS ABSORBED, not refused.  The caller used to
+ * turn the whole move away here on the grounds that "absorbing a fresh
+ * unpublished compressed top would retire a node that was never published and
+ * re-aim its cluster's deferred edges".  The first half is the answer, not the
+ * obstacle -- a node that was NEVER PUBLISHED is not retired at all: it is
+ * untracked from the glue and freed outright, with no grace period, because no
+ * reader ever had a path to it.  And there are NO deferred edges to re-aim: a
+ * deferred edge names the branch or the suffix as its parent, and the pending
+ * top's own child is the FRESH cluster node below it, whose back-pointer is a
+ * plain store into a private body.
+ *
+ * So the run simply grows by the pending top's bytes -- @parent_cn ++
+ * @surviving_byte ++ pending->key_bytes -- and takes the pending top's CHILD.
+ * That is the same absorption the DEEP fold already performs one level down,
+ * and it is what keeps the canonical form: fusing AROUND a compressed pending
+ * top would put two adjacent compressed nodes in the trie, which cds_ft_verify
+ * rejects, and falling back to ft_node_replace_ptr would publish a one-child
+ * internal, which skip mode does not allow to persist.  Both alternatives are
+ * illegal; this one is the only legal product.
+ *
+ * The ONE thing that is still refused is a run that cannot be SPELLED:
+ * @merged_len past FT_SKIP_LEN_MAX takes the same `return 1` every other
+ * over-long merge takes, and the caller falls back.  That is a property of the
+ * trie, not of this writer.
  */
 static
 int ft_chain_compress_fused(struct cds_ft *ft,
@@ -1160,13 +1180,44 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 	 * PLAIN back edge that value takes, and the fold report to the glue.
 	 */
 	bool deep_fold = false;
+	/*
+	 * The pending top when it is a RUN: its bytes join the merged run and
+	 * its child becomes the merged node's.  It is FRESH and UNPUBLISHED, so
+	 * it is untracked from the glue and freed outright below -- never
+	 * retired, and never on the free list the commit drains.
+	 */
+	struct cds_ft_compressed_node *pending_cn = NULL;
+	/* ...and the glue that BUILT it, which is the only owner that may free it. */
+	struct ft_glue *pending_glue = NULL;
 
 	assert(surviving_child);
 	/* The substitution exists only on the fold; the caller gates both. */
 	assert(!pending_child || record_only);
-	/* A compressed pending top is refused by the caller (see the header). */
-	assert(!pending_child || (!ft_node_compressed(pending_child) &&
-			!ft_node_skip_compressed(pending_child)));
+	/*
+	 * A COMPRESSED pending top is ABSORBED into the merged run (see the
+	 * header).  Recover its node from either spelling: ft_glue_set_publish
+	 * announces whatever the builder handed it, which is the PLAIN flag for
+	 * a fresh run whose child edge is still deferred, and the SKIP form once
+	 * the split re-encoded it.
+	 */
+	if (pending_child && (ft_node_compressed(pending_child) ||
+			ft_node_skip_compressed(pending_child))) {
+		/*
+		 * ☠ THE OWNER MUST BE IN HAND BEFORE THE ABSORPTION, not looked
+		 * for afterwards.  Freeing the run without untracking it leaves it
+		 * in @built for ft_glue_abort to free a SECOND time on any later
+		 * bail.  The glue is what armed @pending_pub_slot in the first
+		 * place (ft_glue_set_publish), so it is always there for this
+		 * shape -- and if it somehow is not, the absorption does not
+		 * happen and the caller's refusal stands, which is the only answer
+		 * this frame can give without an owner.
+		 */
+		pending_glue = ft_glue_of_ctx(ctx);
+		if (pending_glue)
+			pending_cn = ft_node_skip_compressed(pending_child) ?
+				ft_skip_to_compressed(ft, pending_child) :
+				ft_compressed_node_ptr(pending_child);
+	}
 	/*
 	 * Pre-reserve the commit flip-txn BEFORE any pre-flip side-effect.  The
 	 * surviving child's (parent, parent-slot-offset) pair is RECORDED into
@@ -1271,12 +1322,23 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 			: NULL;
 		/*
 		 * Derived from the BUILD child: absorption is about the run the
-		 * merged node will actually hold.  Under the substitution the
-		 * build child is never compressed (caller-refused), so no
-		 * below-pivot member is taken -- the committed occupant's fate
+		 * merged node will actually hold.  The committed occupant's fate
 		 * (retire) belongs to the glue, which holds its own lock on it.
 		 */
-		child_cn = ft_node_compressed(build_child)
+		/*
+		 * ☠ NEVER THE PENDING TOP.  @child_cn is the LIVE run below the
+		 * boundary, and everything downstream treats it as one: a §7.1
+		 * below-pivot lock member, a retire registration, and a
+		 * @reclaim->child_cn entry the commit frees through a grace
+		 * period.  The pending top is FRESH and UNPUBLISHED -- no reader
+		 * can reach it, so there is nothing to lock, nothing to retire and
+		 * no grace period to wait; it is untracked from the glue and freed
+		 * outright where the run absorbs it.  Routing it here produces the
+		 * right STRUCTURE and the wrong OWNERSHIP.
+		 */
+		child_cn = (ft_node_compressed(build_child) &&
+				(!pending_cn ||
+					ft_compressed_node_ptr(build_child) != pending_cn))
 			? ft_compressed_node_ptr(build_child) : NULL;
 		if (child_cn)
 			child_cn_meta_l = cds_ft_item_to_metadata(
@@ -1408,7 +1470,10 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 				parent_cn_meta);
 		}
 		/* BUILD child, as in the DLM arm above. */
-		child_cn = ft_node_compressed(build_child)
+		/* BUILD child, and never the pending top -- see the DLM arm. */
+		child_cn = (ft_node_compressed(build_child) &&
+				(!pending_cn ||
+					ft_compressed_node_ptr(build_child) != pending_cn))
 			? ft_compressed_node_ptr(build_child)
 			: NULL;
 		if (child_cn) {
@@ -1482,10 +1547,39 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 	assert(!(deep_fold && pending_child));
 
 	parent_len = parent_cn ? parent_cn->len : 0;
-	child_len = child_cn ? child_cn->len : 0;
+	child_len = child_cn ? child_cn->len : pending_cn ? pending_cn->len : 0;
 	merged_len = parent_len + 1 + child_len;
 
 	if (merged_len > FT_SKIP_LEN_MAX) {
+		/*
+		 * ☠ AN OVER-LONG ABSORPTION HAS NO FALLBACK TO FALL BACK TO.
+		 * `return 1` means "merge does not apply, caller falls back",
+		 * and the caller's fallback is ft_node_replace_ptr -- which is
+		 * exactly the product the @pending_child contract above calls
+		 * ILLEGAL for this shape: it publishes a one-child internal that
+		 * skip mode does not allow to persist, and the run it should have
+		 * absorbed is still compressed beneath it.
+		 *
+		 * MEASURED on a release build with a 126-byte run (the boundary
+		 * is exact: merged_len 127 clean, 128 red): the op returns
+		 * SUCCESS and cds_ft_verify answers `compressed node ... node
+		 * lock set at rest (leaked lock)`.  The leaked lock is a
+		 * PRE-EXISTING defect of that fallback -- the same shape with the
+		 * dst placed elsewhere is red at the parent commit too -- but
+		 * REACHING it from here is not: before the absorption existed,
+		 * this shape took the shape-D gate's terminal refusal before any
+		 * side-effect.  A pre-existing root cause is not a
+		 * non-regression; what changed for the caller is a clean
+		 * FT_REKEY_UNCOVERED becoming SUCCESS on a corrupt trie.
+		 *
+		 * So the absorption refuses TERMINALLY instead, which is what a
+		 * run that cannot be spelled deserves: it is a property of the
+		 * trie, not of this writer.  Only the absorbing shape takes this
+		 * exit; an ordinary over-long merge still falls back, because for
+		 * it the fallback IS a legal product.
+		 */
+		if (pending_cn)
+			return -EDOM;
 		/* Merge does not apply: caller falls back (fences cleared). */
 		if (!record_only)
 			ft_flip_txn_destroy(txn);
@@ -1505,6 +1599,9 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 	if (child_cn)
 		memcpy(&new_cn->key_bytes[parent_len + 1],
 			child_cn->key_bytes, child_len);
+	else if (pending_cn)
+		memcpy(&new_cn->key_bytes[parent_len + 1],
+			pending_cn->key_bytes, child_len);
 	new_cn->len = (uint8_t) merged_len;
 	if (child_cn) {
 		struct cds_ft_inode_flag *child_child =
@@ -1534,6 +1631,47 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		 */
 		new_cn->child = deep_fold ? shared_txn->pending_pub_val
 					  : child_child;
+	} else if (pending_cn) {
+		/*
+		 * ABSORBED: the merged run carries the pending top's bytes, so
+		 * the child it must hold is the pending top's OWN child -- the
+		 * fresh cluster node below it, which no reader can reach yet.
+		 *
+		 * Its child needs no special back edge: @pending_child non-NULL
+		 * already routes the wiring to the PLAIN ft_set_parent arm below,
+		 * which is the right one for a fresh, unpublished child.
+		 *
+		 * ☠ AND THE ABSORBED RUN LEAVES THE GLUE'S BUILT SET WITH IT.
+		 * It was never published, so it is not retired and owes no grace
+		 * period -- but the caller's ft_glue_abort frees everything in
+		 * @built on a bail, and this node is about to stop existing, so
+		 * it must be untracked FIRST or that abort double-frees it.  The
+		 * pair is the one ft_glue_untrack's own header names ("chain-merge
+		 * absorbs a freshly-built compressed wrapper").
+		 *
+		 * The order matters: TAKE THE CHILD FIRST, then untrack, then
+		 * free -- and all three before any later bail can run, so no path
+		 * sees the node in a half-owned state.
+		 */
+		new_cn->child = pending_cn->child;
+		/*
+		 * ☠ @built IS NOT THE ONLY NAME THE GLUE KEPT.  ft_glue_set_publish
+		 * stored the same flag in @top, and the txn in @pending_pub_val;
+		 * untracking only the @built entry leaves both naming freed
+		 * memory.  Measured: on the PLAIN spelling the glue reaches
+		 * ft_glue_apply_deferred with @top dangling.  It is LATENT today
+		 * -- the forward-publish consumer is skipped by
+		 * @pending_pub_folded, and the other two consumers are reachable
+		 * only from the legacy KEY_SHORTER graft_swap -- but the fix
+		 * belongs here, beside the free, not in a caller two files away
+		 * that happens to skip the read.
+		 */
+		ft_glue_untrack(ft, pending_glue, pending_cn);
+		if (pending_glue->top == pending_child)
+			pending_glue->top = NULL;
+		if (shared_txn && shared_txn->pending_pub_val == pending_child)
+			shared_txn->pending_pub_val = NULL;
+		free_compressed_node_unpublished(ft, pending_cn);
 	} else {
 		new_cn->child = build_child;
 	}
@@ -3630,8 +3768,36 @@ int ft_detach_node(struct cds_ft *ft,
 					 * armers are gated on @record_only, and
 					 * ft-rekey.h is its only setter.
 					 */
-					if (ft_node_compressed(fold_pending) ||
-							ft_node_skip_compressed(fold_pending)) {
+					/*
+					 * ☑ ABSORBED, not refused.  ☞ the
+					 * @pending_child contract at
+					 * ft_chain_compress_fused: a compressed
+					 * pending top joins the merged run rather
+					 * than sitting under it, which is the only
+					 * legal product -- fusing AROUND it makes
+					 * two adjacent compressed nodes and the
+					 * replace_ptr fallback publishes a
+					 * one-child internal.  An over-long run is
+					 * still refused, by the merge's own
+					 * FT_SKIP_LEN_MAX arm.
+					 *
+					 * ☠ ...BUT ONLY WHERE THE RUN HAS AN OWNER
+					 * TO LEAVE.  The absorption untracks the
+					 * pending top from the glue that BUILT it
+					 * and frees it unpublished; with no glue in
+					 * this frame's chain there is nobody to
+					 * untrack it from, and freeing it anyway
+					 * would leave it in some other owner's
+					 * hands.  The glue is what armed
+					 * @pending_pub_slot (ft_glue_set_publish),
+					 * so it is always present for this shape --
+					 * and where it is not, the old refusal is
+					 * still the only answer available.
+					 */
+					if ((ft_node_compressed(fold_pending) ||
+							ft_node_skip_compressed(
+								fold_pending)) &&
+							!ft_glue_of_ctx(&lctx)) {
 						ret = -EDOM;
 						goto end;
 					}
@@ -3662,6 +3828,32 @@ int ft_detach_node(struct cds_ft *ft,
 					 * Refuse the whole move terminally with the
 					 * rekey's carve-out code, as the shallow arm
 					 * does -- never publish it.
+					 */
+					/*
+					 * ☠ THE ARM IS LIVE; ONLY THIS SUB-CASE IS
+					 * UNOBSERVED.  A counter at the arm fires
+					 * 1 per 3000 shapes (with a PLAIN pending
+					 * value); a counter at the COMPRESSED
+					 * sub-case counts zero over 6000 runs, which
+					 * is evidence for the canonical-form reading
+					 * -- reaching it needs the pending slot to be
+					 * a RUN'S OWN CHILD SLOT, i.e. the dst
+					 * descent ending exactly where a run ends,
+					 * and the graft's product there is an
+					 * INTERNAL node (a displaced head, or a
+					 * recompacted branch), never a run.
+					 *
+					 * ☞ SO IT STAYS A GUARD, not an assert.  An
+					 * assert one branch off a LIVE path buys
+					 * nothing on the build that ships: falling
+					 * through lands on
+					 * `new_cn->child = pending_pub_val`, two
+					 * adjacent compressed nodes, which is the
+					 * form the absorption exists to avoid.  The
+					 * shallow arm absorbs its pending top; this
+					 * one cannot, because the value is the
+					 * merged node's CHILD rather than a run to
+					 * concatenate.
 					 */
 					if (ft_node_compressed(
 							shared_txn->pending_pub_val) ||

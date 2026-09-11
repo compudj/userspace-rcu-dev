@@ -13612,6 +13612,28 @@ const struct ft_glue *ft_glue_that_split(const struct ft_lock_ctx *ctx,
 	return NULL;
 }
 
+/*
+ * The glue this frame is operating under, or NULL.
+ *
+ * ☠ THE CHAIN, not the frame -- the same reading ft_glue_that_split states: a
+ * nested frame's own @glue is NULL and the one that matters is the CALLER's,
+ * one frame out.  Used where a step has to hand a node BACK to the builder that
+ * made it (the chain-merge absorbing a freshly-built compressed wrapper), which
+ * is an ownership question and so must find the owner, not a frame.
+ */
+static
+struct ft_glue *ft_glue_of_ctx(const struct ft_lock_ctx *ctx)
+{
+	const struct ft_held_set *h;
+
+	if (!ctx)
+		return NULL;
+	for (h = &ctx->held; h; h = h->outer)
+		if (h->glue)
+			return h->glue;
+	return NULL;
+}
+
 /* The deferred entry that re-parents @child, or -1: see @old_dir_deferred. */
 static
 int ft_glue_deferred_index(const struct ft_glue *g,
