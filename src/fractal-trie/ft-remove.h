@@ -13,6 +13,7 @@
  */
 #ifndef FRACTAL_TRIE_IMPL
 #error "ft-remove.h is an implementation unit; #include it from fractal-trie.c only"
+
 #endif
 
 /*
@@ -1119,6 +1120,12 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 	struct cds_ft_compressed_node *new_cn;
 	struct cds_ft_inode_flag *new_cn_flag;
 	struct cds_ft_inode_flag **publish_slot;
+	/*
+	 * The publish target is the CALLER's fresh, unpublished body (see the
+	 * arm below): the forward edge is a plain interior store, not a txn
+	 * record, and neither the §4.B guard nor the dating applies to it.
+	 */
+	bool pub_home_private = false;
 	struct cds_ft_inode_flag *publish_parent;
 	unsigned int pub_depth = 0;
 	/*
@@ -1640,9 +1647,36 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 			 * prefix never returns.  MEASURED on 58 of 4328
 			 * enumerated shapes of this family.
 			 */
+			/*
+			 * ☑ SERVED: PUBLISH INTO THE PRIVATE HOME WITH A PLAIN
+			 * STORE.  The two answers disagree exactly when the
+			 * CALLER re-homed @parent_cn in this very txn, so
+			 * @publish_parent is its FRESH, BUILD-INVISIBLE copy --
+			 * a node NO READER CAN REACH until the caller's one
+			 * commit publishes it.  The txn publishes REACHABILITY,
+			 * NOT INTERIORS: a word inside a private body is an
+			 * interior write, so it wants the bare store, and with
+			 * it the §4.B guard and the publish-parent DATING both
+			 * fall away -- neither has anything to say about a node
+			 * no reader can reach, and the dating would refuse
+			 * outright because the descent never saw it.
+			 *
+			 * ☞ THIS IS THE ANSWER THE SKIP_X DUAL ALREADY GIVES
+			 * ONE ARM OVER, and passing @rec = NULL is how it is
+			 * said: _ft_publish_to_parent_meta's forward edge and
+			 * its dual BOTH fall to their `else` store, which is
+			 * the same dispatch ft_dual_home_is_private makes for
+			 * the dual alone.  The refusal here was the last piece
+			 * of that argument left unwritten.
+			 *
+			 * On ABORT the caller frees the fresh copy and the
+			 * store dies with it; a RECORDED edge could not say
+			 * that -- it would aim a CAS at a word the op does not
+			 * hold, which is the owner assert this refusal was
+			 * standing in front of.
+			 */
 			if (caa_unlikely(publish_parent != raw_parent)) {
-				free_compressed_node_unpublished(ft, new_cn);
-				return -EDOM;
+				pub_home_private = true;
 			}
 			/*
 			 * ☠ THE SAME DISAGREEMENT AS THE PROMOTE ARM'S, ONE ARM
@@ -1726,7 +1760,8 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 	 * dates it where the window cannot.  Under the DLM arm the same node was
 	 * already anchored as @pp.
 	 */
-	if (!ft_lock_ctx_depth_of_parent(ft, ctx, publish_parent,
+	if (!pub_home_private &&
+			!ft_lock_ctx_depth_of_parent(ft, ctx, publish_parent,
 			parent_cn ? parent_depth : iter_depth, &pub_depth)) {
 		free_compressed_node_unpublished(ft, new_cn);
 		if (!record_only)
@@ -1809,11 +1844,12 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		 * (great-)grandparent publish_parent -- value-swap target (§10.5).
 		 * DLM: under lock_fine the whole lock-set (incl. publish_parent's
 		 * RELEASE) was acquired up front, so skip the incremental lock here. */
-		if (!ft->lock_fine)
+		if (!ft->lock_fine && !pub_home_private)
 			ft_flip_txn_lock_or_guard_parent(ft, txn, ctx,
 				publish_parent, pub_depth);
 		_ft_publish_to_parent_meta(ft, publish_parent, publish_slot,
-			new_cn_pub, pub_expected_old, new_cn_meta, NULL, &rec,
+			new_cn_pub, pub_expected_old, new_cn_meta, NULL,
+			pub_home_private ? NULL : &rec,
 			/*slot_owner_nf=*/ publish_parent, false);
 		/*
 		 * Freeze-on-free (doc §4.B, atomic detach): the collapsed chain
