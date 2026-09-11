@@ -11738,8 +11738,12 @@ static enum cds_ft_status ft_rekey(struct cds_ft *ft, const char *nw,
  * `rekey_merge(dst "ac", src "ab")` over {ab, ac} is the LAST-BYTE move -- the
  * shape the rekey-coherent reader's two-descent witness exists for, because it
  * is the one where the rekey need not change the internal path leading to the
- * destination at all.  Three geometries: at the root, one level below it, and
- * with the shared parent keeping a sibling the move does not touch.
+ * destination at all.  Ten geometries: at the root, one level below it, with
+ * the shared parent keeping a sibling, a key co-located on it, the parent
+ * hanging off a run, a PIGEON-wide parent, the reverse direction, a sibling at
+ * the grandparent -- and two the tree still refuses by design, the ROOT as the
+ * shared parent and a src that passes THROUGH the dst parent to a deeper
+ * junction.
  *
  * ☠ WHY IT IS FORKED UNDER AN ALARM, AND NOT AN ORDINARY TEST.  The failure
  * this pins is a HANG.  A same-path move that reaches the dst-attach COW has
@@ -11755,28 +11759,50 @@ static enum cds_ft_status ft_rekey(struct cds_ft *ft, const char *nw,
  * that introduced the hang.  A generated corpus is a sample, not a cover, which
  * is the whole reason these three cases were named by hand.
  *
- * ☞ IT DOES NOT ASSERT WHICH ANSWER COMES BACK.  Whether the class is SERVED is
- * a property of the writer's cut and is expected to change: the attach point
- * gets no fresh address of its own here (ft_merge_build splices the src leaf
- * onto the dst head's duplicate chain and hands the head back), so today it is
- * refused.  What must hold on EITHER answer is the "atomic or refused" shape --
- * the call RETURNS, the moved key is at exactly ONE of its two names, the count
- * is exact, and cds_ft_verify is clean.
+ * ☞ WHAT IT ASSERTS.  On EITHER answer the "atomic or refused" shape must hold
+ * -- the call RETURNS, the moved key is at exactly ONE of its two names, the
+ * count is exact, and cds_ft_verify is clean.  The eight same-parent rows are
+ * additionally pinned SERVED: the attach point gets no fresh address of its own
+ * (ft_merge_build splices the src leaf onto the dst head's duplicate chain and
+ * hands the head back), and the witness the two-descent scheme needs is the
+ * src DETACH's own relocation of the shared parent, into which the pending
+ * publish is folded (FT_REKEY_WITNESS_BY_DETACH, ft-rekey.h).  A refusal there
+ * is a regression of that arm, not a permitted answer.
  */
-static const char *const same_path_keys[3][3] = {
-	{ "ab",  "ac",  NULL },		/* at the root */
-	{ "xab", "xac", NULL },		/* one level below it */
-	{ "ab",  "ac",  "az" },		/* the shared parent keeps a sibling */
+/*
+ * dst = keys[1], src = keys[0].  @serve: the tree SERVES this shape today, so
+ * a refusal is a regression (the same-parent splice is witnessed by the src
+ * detach's own relocation of the shared parent -- see
+ * FT_REKEY_WITNESS_BY_DETACH in ft-rekey.h); 0 = served or refused, either
+ * is fine, only a wrong answer or a hang is not.  ☞ If the in-place internal
+ * mutation tier ever returns, that arm refuses BY DESIGN and these rows must
+ * be re-gated, not deleted.
+ */
+static const struct {
+	const char *keys[12];
+	int serve;
+} same_path_cases[] = {
+	{ { "ab",  "ac" }, 1 },			/* at the root */
+	{ { "xab", "xac" }, 1 },		/* one level below it */
+	{ { "ab",  "ac",  "az" }, 1 },		/* the shared parent keeps a sibling */
+	{ { "ab",  "ac",  "a" }, 1 },		/* a key co-located ON the shared parent */
+	{ { "xyzab", "xyzac" }, 1 },		/* the shared parent hangs off a run */
+	{ { "ab", "ac", "ad", "ae", "af", "ag", "ah", "ai", "aj" }, 1 },
+						/* a PIGEON-wide shared parent */
+	{ { "ac", "ab" }, 1 },			/* the reverse direction */
+	{ { "xab", "xac", "xq" }, 1 },		/* the grandparent keeps a sibling */
+	{ { "b", "c" }, 0 },			/* the shared parent is the ROOT */
+	{ { "axy", "ac", "axz" }, 0 },		/* the src passes THROUGH the dst parent */
 };
 
 static int same_path_one(struct cds_ft *ft, const char *const *keys,
-		const char *dst, const char *src)
+		const char *dst, const char *src, int serve)
 {
 	unsigned long want = 0, n;
 	enum cds_ft_status s;
 	unsigned int i;
 
-	for (i = 0; i < 3 && keys[i]; i++) {
+	for (i = 0; i < 12 && keys[i]; i++) {
 		cds_ft_insert(ft, (const uint8_t *) keys[i],
 			strlen(keys[i]), &node_alloc((int) i + 1)->node);
 		want++;
@@ -11784,6 +11810,12 @@ static int same_path_one(struct cds_ft *ft, const char *const *keys,
 	s = ft_rekey(ft, dst, src);
 	if (s != CDS_FT_STATUS_OK && s != CDS_FT_STATUS_NOT_SUPPORTED) {
 		fprintf(stderr, "same_path(dst %s src %s): %s\n", dst, src,
+			cds_ft_status_to_string(s));
+		return -1;
+	}
+	if (serve && s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "same_path(dst %s src %s): REFUSED (%s) a "
+			"same-parent splice the tree serves\n", dst, src,
 			cds_ft_status_to_string(s));
 		return -1;
 	}
@@ -11832,7 +11864,8 @@ static void same_path_child(void)
 		(void) setrlimit(RLIMIT_CORE, &rl);
 	}
 	alarm(60);
-	for (g = 0; g < 3; g++) {
+	for (g = 0; g < sizeof(same_path_cases) / sizeof(same_path_cases[0]);
+			g++) {
 		for (m = 0; m < 4; m++) {	/* rank x ordered-list */
 			bool rank = (m >= 2), list = (m & 1) != 0;
 			int bad;
@@ -11843,8 +11876,10 @@ static void same_path_child(void)
 			else
 				ft = create_varlen_ft(&group);
 			rcu_read_lock();
-			bad = same_path_one(ft, same_path_keys[g],
-				same_path_keys[g][1], same_path_keys[g][0]);
+			bad = same_path_one(ft, same_path_cases[g].keys,
+				same_path_cases[g].keys[1],
+				same_path_cases[g].keys[0],
+				same_path_cases[g].serve);
 			rcu_read_unlock();
 			/*
 			 * ☠ NO drain / rcu_barrier / destroy HERE, and that is

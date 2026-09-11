@@ -1080,7 +1080,11 @@ bool ft_chain_compress_deep_pending(struct cds_ft_inode_flag *survivor,
  * the lock-set are about what the trie holds NOW, and the committed occupant's
  * retire belongs to the GLUE (its free list), never to this collapse -- which
  * is also what keeps the two from colliding on one state word (the measured
- * MW-PSO-vs-SW-tombstone chain conflict).  The collapse then reports the fold
+ * MW-PSO-vs-SW-tombstone chain conflict).  ☞ Except that @pending_child may BE
+ * the committed occupant: a duplicate-chain splice publishes the dst's own
+ * app-owned head back into its slot, so the pending value is live, not fresh,
+ * and its back edge must be RECORDED (see @pending_top_live at the back-edge
+ * arm), never stored.  The collapse then reports the fold
  * (@pending_pub_folded / @pending_pub_node) so the glue commit skips its
  * forward publish and re-bases its count delta onto the merged node.
  * ☑ A COMPRESSED @pending_child IS ABSORBED, not refused.  The caller used to
@@ -1200,7 +1204,17 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 	 * a fresh run whose child edge is still deferred, and the SKIP form once
 	 * the split re-encoded it.
 	 */
-	if (pending_child && (ft_node_compressed(pending_child) ||
+	/*
+	 * ☠ NEVER THE COMMITTED OCCUPANT.  This absorption FREES the pending
+	 * top unpublished, with no grace period, on the premise that it is
+	 * fresh.  A pending value that IS the slot's committed occupant (see
+	 * @pending_top_live below) is live and published; absorbing it would
+	 * free a node readers hold.  No armer hands back a live compressed top
+	 * today (the one live-top armer requires an external head); the
+	 * identity test keeps that a property of this code, not of the callers.
+	 */
+	if (pending_child && pending_child != surviving_child &&
+			(ft_node_compressed(pending_child) ||
 			ft_node_skip_compressed(pending_child))) {
 		/*
 		 * ☠ THE OWNER MUST BE IN HAND BEFORE THE ABSORPTION, not looked
@@ -1950,7 +1964,46 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		 * the pre-reserved @txn (ft_ord_cell_flip_into), so it is
 		 * allocation-free past this point and cannot fail.
 		 */
-		if (pending_child || deep_fold) {
+		/*
+		 * ☠ THE PENDING TOP IS NOT ALWAYS FRESH.  A duplicate-chain
+		 * SPLICE -- one key on each side of a same-parent rekey_merge,
+		 * {ab, ac} + rekey_merge(dst "ac", src "ab") -- hands
+		 * ft_glue_set_publish the dst's own APP-OWNED HEAD, i.e. the
+		 * COMMITTED OCCUPANT of the slot (ft_merge_build appended the src
+		 * leaf to its dup chain and handed it back).  The fold's
+		 * substitution is then BY IDENTITY, and the node this arm wires is
+		 * LIVE: reader-reachable now, its parent word read by every
+		 * ordered up-walk.  Two things go wrong with the plain store on
+		 * it.  It is a reader-visible mutation BEFORE the commit that no
+		 * abort rolls back; and the glue could not take its fresh-child
+		 * fast path for a live top, so it QUEUED the same edge -- aimed at
+		 * the boundary this collapse retires -- and would re-apply the
+		 * dead parent over this store at the flip.  MEASURED, all four
+		 * rank/list modes: `cn->len 16` decoded off the freed boundary
+		 * through the head's back-pointer, and `head prev != owner`.
+		 *
+		 * A live pending top takes the RECORD arm below like every other
+		 * live child, and ft_glue_apply_deferred drops the glue's queued
+		 * entry for it on the strength of @pending_pub_folded.  The
+		 * identity test is exact: a committed occupant is reader-reachable
+		 * and a fresh top is not, so nothing fresh can compare equal.
+		 *
+		 * ☞ ONE PRE-COMMIT STORE REMAINS, AND IT IS A NO-OP HERE.  The
+		 * record arm's external branch stamps the head's incoming byte
+		 * (ft_head_stamp_incoming_byte) before it records, and for a bare
+		 * head that store is reader-visible ahead of the publish and not
+		 * undone by an abort -- its header says so.  On this shape the
+		 * head does not move: it hangs off the same byte of the fresh run
+		 * as it did off the boundary, so the stamped value is the value
+		 * already there.  That stops being true the day this arm serves
+		 * a head that changes slot; it does not today.
+		 */
+		bool pending_top_live =
+			(pending_child && pending_child == surviving_child) ||
+			(deep_fold && child_cn &&
+				new_cn->child == child_cn->child);
+
+		if ((pending_child || deep_fold) && !pending_top_live) {
 			/*
 			 * FOLD substitution: the child is the FRESH, UNPUBLISHED
 			 * cluster top -- build-invisible until the caller's one

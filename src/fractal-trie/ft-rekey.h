@@ -1211,6 +1211,12 @@ int ft_rekey_splice_pos_brackets(struct cds_ft *ft, const uint8_t *dst_ord,
  * that then failed differently, or worse, succeeded.
  */
 #define FT_REKEY_UNCOVERED	(-EDOM)
+/*
+ * ft_rekey_merge_cow_publish_parent's "no COW needed": the src DETACH is what
+ * relocates the dst attach point's parent (same-parent splice), so the caller
+ * publishes normally and checks, after the detach, that the fold happened.
+ */
+#define FT_REKEY_WITNESS_BY_DETACH	1
 
 /*
  * WHAT THE CLIMB-ARMED FOLD WRITES INTO @graft_c'S ONE SLOT.
@@ -1877,20 +1883,24 @@ void ft_rekey_marks_to_txn(struct ft_flip_txn *txn,
  * compiled in but never REACHED proves nothing about it.  Count each arm's
  * consultations and report at exit, so a green run can state "asked N times,
  * never wrong" instead of "never failed".  [0] the MERGE arm's union node M,
- * [1] the NOSPLIT graft's recompacted attach parent.  Guarded on the same pair
+ * [1] the NOSPLIT graft's recompacted attach parent, [2] the same-parent
+ * splice served by the src DETACH's relocation (FT_REKEY_WITNESS_BY_DETACH),
+ * whose witness is a fold the caller re-checks after the detach.  Guarded on the same pair
  * urcu_assert_debug itself is, so the counters exist exactly where the asserts
  * can fire.
  */
-static unsigned long ft_rekey_dst_fresh_reach[2];
+static unsigned long ft_rekey_dst_fresh_reach[3];
 
 static void ft_rekey_dst_fresh_fini(void) __attribute__((destructor));
 static void ft_rekey_dst_fresh_fini(void)
 {
-	if (!ft_rekey_dst_fresh_reach[0] && !ft_rekey_dst_fresh_reach[1])
+	if (!ft_rekey_dst_fresh_reach[0] && !ft_rekey_dst_fresh_reach[1] &&
+			!ft_rekey_dst_fresh_reach[2])
 		return;
 	fprintf(stderr, "FT REKEY DST-FRESHNESS REACH: merge_union=%lu "
-		"graft_recompact=%lu\n",
-		ft_rekey_dst_fresh_reach[0], ft_rekey_dst_fresh_reach[1]);
+		"graft_recompact=%lu same_parent_detach=%lu\n",
+		ft_rekey_dst_fresh_reach[0], ft_rekey_dst_fresh_reach[1],
+		ft_rekey_dst_fresh_reach[2]);
 	fflush(stderr);
 }
 
@@ -1986,6 +1996,7 @@ int ft_rekey_merge_cow_publish_parent(struct cds_ft *ft,
 		struct urcu_txn *optxn, struct ft_glue *glue,
 		struct cds_ft_inode_flag *merged_pub,
 		const uint8_t *src_ord, size_t src_len, const uint8_t *dst_ord,
+		struct cds_ft_inode_flag *src_pnf,
 		struct ft_held_anchor *marks, unsigned int *nr_marks,
 		struct cds_ft_inode_flag **pp_prime_ret)
 {
@@ -2055,8 +2066,74 @@ int ft_rekey_merge_cow_publish_parent(struct cds_ft *ft,
 	 * pending publish so that copy carries it (@pending_pub_slot).
 	 */
 	if ((size_t) d_dst->pdepth <= src_len &&
-			!memcmp(src_ord, dst_ord, (size_t) d_dst->pdepth))
-		return FT_REKEY_UNCOVERED;
+			!memcmp(src_ord, dst_ord, (size_t) d_dst->pdepth)) {
+		/*
+		 * ☑ THE SAME-PARENT SPLICE IS SERVED BY THE DETACH, NOT BY A COW.
+		 * When the src junction IS @pnf (last-byte move: {ab, ac},
+		 * dst "ac", src "ab"), the detach removes the src byte from @pnf
+		 * and, with in-place mutation off, relocates it -- a DEL
+		 * recompaction to a fresh copy, or the skip-mode COLLAPSE of a
+		 * node left with one child and no keys into a fresh run.  Either
+		 * is the address-witness the two-descent scheme needs, and both
+		 * FOLD the caller's pending forward publish into the fresh node
+		 * (@pending_pub_slot), so the caller just publishes normally and
+		 * verifies @pending_pub_folded after the detach.  A COW of @pnf on
+		 * top of that is the measured HANG (two owners relocating one
+		 * node in one commit).
+		 *
+		 * ☠ BOTH EASY READINGS OF THIS ARM WERE WRONG ONCE.  Publishing
+		 * normally was tried and went verify-red in all four modes -- not
+		 * because the witness was missing but because the fold's
+		 * substitution assumed a FRESH top and plain-stored the live
+		 * head's back edge, which the glue's queued entry then re-aimed at
+		 * the dead boundary.  See @pending_top_live at
+		 * ft_chain_compress_fused and the matching skip in
+		 * ft_glue_apply_deferred.
+		 *
+		 * The gate is the in-place predicate, by design: when the in-place
+		 * tier returns, a detach that edits @pnf in place produces no
+		 * witness, the fold never fires, and the post-detach check turns
+		 * this into a loud refusal rather than a silent torn descent.
+		 *
+		 * The DEEPER src that merely passes THROUGH @pnf (its junction is
+		 * below) stays refused: the detach then publishes its fresh
+		 * junction INTO @pnf's slot, and a COW of @pnf would carry the
+		 * superseded child while the detach's store landed in the retired
+		 * copy.  Off-corpus today (0 of 3000 shapes reach it).
+		 */
+		if (src_pnf != d_dst->pnf || ft_in_place_ok(ft))
+			return FT_REKEY_UNCOVERED;
+		/*
+		 * ☞ WHAT THIS ARM ADMITS, STATED RATHER THAN INHERITED.  It returns
+		 * ahead of the COW arm's gates below, and those are the COW's
+		 * (a compressed grandparent, the type class the copy loop
+		 * handles); the detach is type-generic and leaves the grandparent
+		 * alone.  Two things ARE load-bearing here and are pinned:
+		 *
+		 *  - THE TOP IS AN APP-OWNED EXTERNAL HEAD.  That is what a
+		 *    splice hands back, and it is what makes the live-top fold
+		 *    downstream sound: a head carries no state word, so no lock
+		 *    mark rides the glue's queued entry that
+		 *    ft_glue_apply_deferred now drops (asserted there), and no
+		 *    compressed absorption can free it (ft_chain_compress_fused
+		 *    gates its absorb on identity).  A live METADATA-bearing top
+		 *    is not a shape any armer produces; refuse rather than find
+		 *    out.
+		 *  - @pnf IS A PLAIN INTERNAL.  A same-parent junction has at
+		 *    least two children, so it cannot be a run or a run's skip
+		 *    word; vacuous today, stated so the widening is visible.
+		 */
+		if (!ft_node_external(merged_pub))
+			return FT_REKEY_UNCOVERED;
+		if (ft_node_external(d_dst->pnf) ||
+				ft_node_compressed(d_dst->pnf))
+			return FT_REKEY_UNCOVERED;
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+		if (ft_node_skip_compressed(d_dst->pnf))
+			return FT_REKEY_UNCOVERED;
+#endif
+		return FT_REKEY_WITNESS_BY_DETACH;
+	}
 	if (ft_node_external(d_dst->pnf) || ft_node_compressed(d_dst->pnf))
 		return FT_REKEY_UNCOVERED;
 #ifdef FEATURE_FT_SKIP_COMPRESSED
@@ -2213,6 +2290,12 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	struct ft_ord_cell *run_dpred = NULL, *run_dsucc = NULL;
 	struct cds_ft_metadata *s_top_meta, *bp_meta;
 	struct ft_detach_recompact_out detach_rc = { 0 };
+	/*
+	 * The merge arm relied on the src DETACH to relocate the dst attach
+	 * point's parent (same-parent splice, FT_REKEY_WITNESS_BY_DETACH); the
+	 * detach must then have FOLDED the pending publish, or no witness exists.
+	 */
+	bool witness_by_detach = false;
 	struct ft_flip_txn *txn;
 	struct ft_glue glue;
 	struct ft_graft_store_state gst_st = { 0 };	/* GLUE never runs prepare */
@@ -4070,9 +4153,22 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 			 */
 			ret = ft_rekey_merge_cow_publish_parent(ft, &d_dst, txn,
 					optxn, &glue, merged_pub, src_ord,
-					src_len, dst_ord, marks, &nr_marks,
-					&dst_pp_prime);
-			if (ret)
+					src_len, dst_ord, d_src.pnf, marks,
+					&nr_marks, &dst_pp_prime);
+			if (ret == FT_REKEY_WITNESS_BY_DETACH) {
+				/*
+				 * SAME-PARENT SPLICE: the src detach relocates
+				 * @d_dst.pnf itself and folds this publish into
+				 * the fresh node.  Publish normally; the fold is
+				 * verified right after the detach (see
+				 * @witness_by_detach at detach_bail).
+				 */
+				FT_REKEY_DST_FRESH_REACH(2);
+				ft_glue_set_publish(ft, &glue, d_dst.pnf, d_dst.nfp,
+					merged_pub);
+				witness_by_detach = true;
+				ret = 0;
+			} else if (ret)
 				goto bail_build;
 		} else {
 		/*
@@ -6131,6 +6227,45 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 				climb_split_top /*edited: the dropped chain top*/,
 				climb_split_rest, climb_split_steps,
 				&detach_rc, fold_held, &nr_fold_held);
+	}
+	/*
+	 * ☠ THE WITNESS MUST HAVE BEEN PRODUCED.  The same-parent splice
+	 * published normally on the promise that the detach relocates the dst
+	 * attach point's parent and folds the publish into the fresh node.  If no
+	 * producer reported the fold, the parent was edited where it stood (or
+	 * left alone): the glue would store the head back into a slot of the
+	 * node it already sits in, keys and structure would verify clean, and
+	 * the two-descent scheme would be silently unwitnessed.  Refuse -- nothing
+	 * is committed under record_only; detach_bail unwinds the rest.
+	 */
+#ifdef FT_RED_SAME_PATH_NO_FOLD
+	/*
+	 * RED CONTROL, never shipped: pretend no producer reported the fold, so
+	 * the refusal below and its unwind are EXERCISED -- no reachable shape
+	 * takes it today (every same-parent junction relocates and folds), and
+	 * an unwind that is only argued is not measured.  Expected on the
+	 * same-path shapes: NOT_SUPPORTED, every key where it was, count exact,
+	 * cds_ft_verify clean, node and cell balance exact under the drain
+	 * oracle.
+	 */
+	if (!ret && witness_by_detach)
+		txn->pending_pub_folded = false;
+#endif
+	/*
+	 * ☠ AND RECLAIM WHAT THE DETACH BUILT FOR THE COMMIT.  detach_bail was
+	 * written for failures BEFORE or INSIDE the detach; a refusal AFTER a
+	 * successful detach leaves the fresh BP copy (@detach_rc.new_flag) and
+	 * the folded collapse's merged run (@detach_rc.collapse) recorded in
+	 * the txn and owned by nobody once it is destroyed.  MEASURED with the
+	 * red control above: one node leaked per shape until this mirrored the
+	 * glue-commit-refused path below, which reclaims exactly these two.
+	 */
+	if (!ret && witness_by_detach && !txn->pending_pub_folded) {
+		if (detach_rc.new_flag)
+			free_cds_ft_node_unpublished(ft,
+				ft_node_ptr(detach_rc.new_flag));
+		ft_rekey_collapse_free_unpublished(ft, &detach_rc.collapse);
+		ret = FT_REKEY_UNCOVERED;
 	}
 detach_bail:
 	if (ret) {

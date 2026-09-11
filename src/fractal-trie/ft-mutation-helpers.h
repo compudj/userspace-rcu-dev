@@ -14428,6 +14428,40 @@ void ft_glue_apply_deferred(struct cds_ft *ft, struct ft_glue *g)
 		if (g->deferred[i].dst_origin)
 			continue;
 		/*
+		 * ☠ THE FOLDED TOP'S ENTRY NAMES A DEAD PARENT.  ft_glue_set_publish
+		 * queues the top's back edge aimed at @publish_parent -- for a
+		 * LIVE top only: a fresh one takes the fast path and is stored,
+		 * never queued.  When a recompaction or collapse of that parent
+		 * then FOLDS the publish (@pending_pub_folded), the top is live in
+		 * the SURVIVOR and the producer re-homed it there itself
+		 * (ft_reparent_record in the recompact's sweep, the RECORD arm of
+		 * ft_chain_compress_fused's live pending top).  Applying this entry
+		 * would record a SECOND edge on the same word, aimed at the copy
+		 * this commit retires: the head's parent decoded off freed memory
+		 * (measured on the same-parent splice).  The slot identity is the
+		 * exact key: the one child that lives in @pending_pub_slot is the
+		 * top.
+		 */
+		if (g->txn && g->txn->pending_pub_folded &&
+				g->deferred[i].slot == g->txn->pending_pub_slot) {
+			/*
+			 * ☠ ONLY FOR A HEAD.  A metadata-bearing live child's entry
+			 * carries the LOCK the acquire pass above took on it
+			 * (`h.lock == cm`), and this entry's guard edge is documented
+			 * there as the ONLY thing that releases it -- @marked stays
+			 * false so no sweep does.  Dropping such an entry would leave
+			 * a permanent mark on a live node.  An external head has no
+			 * state word, hence no mark, hence nothing to release: it is
+			 * the one child this skip is sound for, and the only live top
+			 * any armer folds (FT_REKEY_WITNESS_BY_DETACH requires it).
+			 * Anything else falls through and records -- a duplicate on
+			 * the producer's word, which the engine refuses loudly.
+			 */
+			urcu_assert_debug(ft_node_external(g->deferred[i].child));
+			if (ft_node_external(g->deferred[i].child))
+				continue;
+		}
+		/*
 		 * PER EDGE (@live at the struct): "unreachable until the forward
 		 * flip" is what licenses the plain store, and a src-origin edge is
 		 * the one place that premise can be false.  A same-trie rekey FOLD
@@ -14615,6 +14649,13 @@ enum urcu_txn_status ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue 
 	for (i = 0; i < g->nr_deferred; i++) {
 		if (!g->deferred[i].dst_origin)
 			continue;
+		/* The folded top's entry: see ft_glue_apply_deferred's src-origin loop. */
+		if (g->txn && g->txn->pending_pub_folded &&
+				g->deferred[i].slot == g->txn->pending_pub_slot) {
+			urcu_assert_debug(ft_node_external(g->deferred[i].child));
+			if (ft_node_external(g->deferred[i].child))
+				continue;
+		}
 		/*
 		 * FOLD (coherent rekey one-decide writer): a live child's re-home must
 		 * be the co-committed (parent, offset) PAIR, not
