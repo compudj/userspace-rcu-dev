@@ -3923,6 +3923,21 @@ static int inv_rekey_graft_coherent_readers(void)
  *        a junction of its own -- the shape the corpus serves, with the one
  *        property the others share: the mover is a SKIP TARGET that the
  *        splice turns into a non-head chain member.
+ *   f=5  THE ROOT FRAME, junction below its child: the resident D6 =
+ *        (bp+0x40,0,0,2) is the only key under its first byte, so it hangs
+ *        straight off the ROOT; the mover M6 = (bp,5,7,5) hangs off Q3, so
+ *        the detach's store lands in (bp) and only its -count walk reaches
+ *        the root.  The merge arm COWs the ROOT -- after the detach
+ *        (ft_rekey_merge_cow_after_detach) -- and every writer here does,
+ *        so the eight of them contend on the root slot's CAS while every
+ *        reader's descent passes through the copy.
+ *   f=6  THE ROOT FRAME, junction a root child: D7 = (bp+0x50,0,0,2) off
+ *        the root as above; the mover M7 = (bp,6,0,4) is the only key under
+ *        (bp,6), so its junction is (bp) itself and the detach publishes
+ *        (bp)' INTO A ROOT SLOT -- the store the post-detach copy must
+ *        carry (a copy taken before it names the retired (bp) and a head's
+ *        back edge the dead root: the red control at the gate that used to
+ *        refuse the root frame).
  * RKSP_FLAVOURS (env, bitmask) selects the flavours run; the default is all.
  * Junctions are writer-private, so the only
  * peers of a move are the readers: a refusal here is a finding, not
@@ -3957,7 +3972,7 @@ static int inv_rekey_graft_coherent_readers(void)
 #define RKSP_NR		8		/* coherent readers */
 #define RKSP_KLEN	4		/* fixed key length, bytes */
 
-#define RKSP_NF		5		/* flavours, see the header */
+#define RKSP_NF		7		/* flavours, see the header */
 
 struct rksp_writer_arg {
 	struct cds_ft *ft;
@@ -3997,9 +4012,16 @@ static uint64_t rksp_fkey(uint8_t bp, int f, bool mover)
 	case 3:
 		return ((uint64_t) bp << 24) | (4ULL << 16) |
 			((uint64_t) (mover ? 7 : 6) << 8) | (mover ? 4 : 2);
-	default:	/* f=4: the mover under Q3 = (bp,5); its own resident under P */
+	case 4:		/* the mover under Q3 = (bp,5); its own resident under P */
 		return mover ? (((uint64_t) bp << 24) | (5ULL << 16) |
 				(7ULL << 8) | 4) : rksp_key(bp, 0, 3);
+	case 5:		/* the root frame; the mover's junction is Q3 */
+		return mover ? (((uint64_t) bp << 24) | (5ULL << 16) |
+				(7ULL << 8) | 5) :
+			(((uint64_t) (bp + 0x40) << 24) | 2);
+	default:	/* f=6: the root frame; the mover's junction is (bp) */
+		return mover ? (((uint64_t) bp << 24) | (6ULL << 16) | 4) :
+			(((uint64_t) (bp + 0x50) << 24) | 2);
 	}
 }
 
@@ -4285,10 +4307,11 @@ static void rksp_child(void)
 		w[i].bp = (uint8_t) (i + 1);
 		rcu_read_lock();
 		/*
-		 * All five by default.  Flavour 4 is the reproducer of the reader
+		 * All seven by default.  Flavour 4 is the reproducer of the reader
 		 * re-anchor defect (a stale skip word into a spliced chain member);
 		 * 2, 3 and 4 all make the mover a skip target, and the positive
-		 * control below proves a reader's hop branch ran.
+		 * control below proves a reader's hop branch ran.  5 and 6 are the
+		 * ROOT frame, every writer relocating the root under every reader.
 		 */
 		w[i].flavours = getenv("RKSP_FLAVOURS") ?
 			(unsigned int) strtoul(getenv("RKSP_FLAVOURS"), NULL, 0) :

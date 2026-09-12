@@ -11792,7 +11792,7 @@ static const struct {
 						/* a PIGEON-wide shared parent */
 	{ { "ac", "ab" }, 1 },			/* the reverse direction */
 	{ { "xab", "xac", "xq" }, 1 },		/* the grandparent keeps a sibling */
-	{ { "b", "c" }, 0 },			/* the shared parent is the ROOT */
+	{ { "b", "c" }, 1 },			/* the shared parent is the ROOT: served since the root frame stopped being refused ahead of this arm */
 	{ { "axy", "ac", "axz" }, 0 },		/* the src passes THROUGH the dst parent */
 	/*
 	 * THROUGH A RUN: the dst head has no sibling at its last byte, so it
@@ -11818,8 +11818,139 @@ static const struct {
 	 */
 	{ { "acc", "ab" }, 2 },
 	{ { "acc", "ab", "az" }, 2 },
-	{ { "b",   "acc" }, 0 },		/* the run hangs off the ROOT */
+	{ { "b",   "acc" }, 2 },		/* the run hangs off the ROOT */
 };
+
+/*
+ * THE ROOT FRAME, AND THE PASS-THROUGH BELOW IT.
+ *
+ * The merge arm's COW of the dst attach point's parent (ft_rekey_merge_cow_
+ * publish_parent) used to refuse a ROOT frame outright and, one level down,
+ * every frame the src key passes THROUGH on its way to a deeper junction.
+ * Both are the same shape: the src detach WRITES INTO the frame (its fresh
+ * junction copy, or the survivor its junction collapsed into, published into
+ * the frame's slot; or only its -count walk), so a copy taken before the
+ * detach carries a retired child and the detach's store lands in the body
+ * the copy retires -- and every source path crosses the root.  The frame is
+ * now copied AFTER the detach, through the descriptor
+ * (ft_rekey_merge_cow_after_detach, ft_rekey_cow_stop's @ryw mode).
+ *
+ * The rows are the six corpus shapes the root class held (seed numbers in
+ * the comments), the one pass-through shape the corpus held, and the
+ * pass-through case the design named ({ac,axy,axz}).  MEASURED on the gate
+ * that used to refuse the root, simply lifted, before the post-detach arm
+ * existed: 1244 and 2520 walked a reader into a NULL parent
+ * (ft_skip_reanchor), 2031 and 1999 left a head's back edge naming the dead
+ * root (`head prev != owner`), and under rank stats every one of them hit
+ * the engine's SW/MW kind conflict.  The oracle is the corpus's: on a served
+ * move every key under @src is at its new name and gone from the old one,
+ * everything else where it was; on a refusal every key where it was; the
+ * key count exact (a moved key that collides joins a chain and counts once);
+ * cds_ft_verify clean.  @serve as same_path_cases.
+ */
+static const struct {
+	const char *keys[8];
+	const char *dst, *src;
+	int serve;
+} root_frame_cases[] = {
+	/* corpus 715: the dst ends inside a run over the head, so the top is a
+	 * glue-built wrapper folded into the copy, not the slot's own head */
+	{ { "abaca", "aab", "ccb", "bc" }, "cc", "aa", 2 },
+	/* 1244: the junction is a root child, DEL-recompacted into a root slot */
+	{ { "abcac", "aabab", "acbb", "c" }, "c", "acbb", 1 },
+	/* 1931: the junction is two levels down; only the -count walk reaches
+	 * the root, and a copy taken before it would carry the stale count.
+	 * ☐ REFUSED for now: the detach PROMOTES the junction's head into the
+	 * run above it and reclaims neither (one node leaked per served move);
+	 * the arm refuses that geometry until the detach's reclaim exists. */
+	{ { "b", "c", "cba", "caaa", "a", "ba", "caa" }, "a", "caaa", 0 },
+	/* 2031: the junction collapses into a run over its last head, whose
+	 * skip word is stored into a root slot (a fresh run under the copy) */
+	{ { "acbba", "baacba", "bbbabb", "c", "aa", "bcacc" }, "c", "aa", 2 },
+	/* 1999: the dst head hangs off a run that hangs off the root.
+	 * ☐ REFUSED for now, as 1931: the src head's junction is left keyed
+	 * and childless, its head promoted into a root slot. */
+	{ { "ac", "c", "bcabbb", "ccc", "babcac" }, "ac", "ccc", 0 },
+	/* 2520 */
+	{ { "cc", "aaba", "bbca", "abcccb", "ac", "abcbaa" }, "cc", "aaba", 1 },
+	/* 1539: a pass-through frame BELOW the root */
+	{ { "cbaa", "b", "cacbc", "aac", "cbcabb", "bccacb" }, "cacbc", "cbcabb", 2 },
+	/* the pass-through the design named: the src junction below the shared parent */
+	{ { "ac", "axy", "axz" }, "ac", "axy", 1 },
+	{ { "b", "c", "d" }, "b", "c", 1 },	/* root frame, the root keeps a sibling */
+	/* one level down the same shape is the same-path arm, served before
+	 * this change too: a regression row, not a row of the post-detach arm */
+	{ { "xab", "xc", "xd" }, "xc", "xab", 1 },
+};
+
+static int root_frame_one(struct cds_ft *ft, const char *const *keys,
+		const char *dst, const char *src, int serve)
+{
+	char want[8][32];
+	unsigned long distinct = 0, n;
+	unsigned int i, j, nk = 0;
+	size_t sl = strlen(src);
+	enum cds_ft_status s;
+
+	for (i = 0; i < 8 && keys[i]; i++) {
+		cds_ft_insert(ft, (const uint8_t *) keys[i], strlen(keys[i]),
+			&node_alloc((int) i + 1)->node);
+		if (!strncmp(keys[i], src, sl))
+			snprintf(want[i], sizeof(want[i]), "%s%s", dst,
+				keys[i] + sl);
+		else
+			snprintf(want[i], sizeof(want[i]), "%s", keys[i]);
+		nk++;
+	}
+	for (i = 0; i < nk; i++) {
+		for (j = 0; j < i; j++)
+			if (!strcmp(want[i], want[j]))
+				break;
+		if (j == i)
+			distinct++;
+	}
+	s = ft_rekey(ft, dst, src);
+	if (s != CDS_FT_STATUS_OK && s != CDS_FT_STATUS_NOT_SUPPORTED) {
+		fprintf(stderr, "root_frame(dst %s src %s): %s\n", dst, src,
+			cds_ft_status_to_string(s));
+		return -1;
+	}
+	if (serve == 2)
+		serve = _cds_ft_debug_compress_enabled();
+	if (serve && s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "root_frame(dst %s src %s): REFUSED (%s) a "
+			"root-frame move the tree serves\n", dst, src,
+			cds_ft_status_to_string(s));
+		return -1;
+	}
+	for (i = 0; i < nk; i++) {
+		const char *k = s == CDS_FT_STATUS_OK ? want[i] : keys[i];
+		int moved = !strncmp(keys[i], src, sl);
+
+		if (!ft_test_has_key(ft, k) ||
+		    (s == CDS_FT_STATUS_OK && moved &&
+		     ft_test_has_key(ft, keys[i]))) {
+			fprintf(stderr, "root_frame(dst %s src %s): %s but %s=%d "
+				"%s=%d\n", dst, src, cds_ft_status_to_string(s),
+				k, ft_test_has_key(ft, k), keys[i],
+				ft_test_has_key(ft, keys[i]));
+			return -1;
+		}
+	}
+	n = cds_ft_count_keys(ft);
+	if (n != (s == CDS_FT_STATUS_OK ? distinct : nk)) {
+		fprintf(stderr, "root_frame(dst %s src %s): %s count %lu want "
+			"%lu\n", dst, src, cds_ft_status_to_string(s), n,
+			s == CDS_FT_STATUS_OK ? distinct : (unsigned long) nk);
+		return -1;
+	}
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "root_frame(dst %s src %s): verify RED\n",
+			dst, src);
+		return -1;
+	}
+	return 0;
+}
 
 static int same_path_one(struct cds_ft *ft, const char *const *keys,
 		const char *dst, const char *src, int serve)
@@ -11924,6 +12055,32 @@ static void same_path_child(void)
 			if (bad) {
 				fprintf(stderr,
 					"same_path: geometry %u mode %u failed\n",
+					g, m);
+				_exit(1);
+			}
+		}
+	}
+	/* The root frame and the pass-through, under the same bound. */
+	for (g = 0; g < sizeof(root_frame_cases) / sizeof(root_frame_cases[0]);
+			g++) {
+		for (m = 0; m < 4; m++) {
+			bool rank = (m >= 2), list = (m & 1) != 0;
+			int bad;
+
+			if (rank)
+				ft = create_varlen_rankstats_list_ft(list,
+					&group);
+			else
+				ft = create_varlen_ft(&group);
+			rcu_read_lock();
+			bad = root_frame_one(ft, root_frame_cases[g].keys,
+				root_frame_cases[g].dst, root_frame_cases[g].src,
+				root_frame_cases[g].serve);
+			rcu_read_unlock();
+			(void) group;
+			if (bad) {
+				fprintf(stderr,
+					"root_frame: geometry %u mode %u failed\n",
 					g, m);
 				_exit(1);
 			}
