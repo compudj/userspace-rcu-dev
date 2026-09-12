@@ -217,6 +217,16 @@ int ft_hlist_insert_after_prepare(struct urcu_txn *txn,
 	struct cds_ft_node *succ = (struct cds_ft_node *)
 			urcu_txn_load(txn, (void **) &pos->next, FT_HLIST_TAG);
 
+	/*
+	 * FT-SLOT-2's RED CONTROL.  @pos->next MARKED means @pos is a RETIRED
+	 * head and this append is building onto a chain that no longer exists:
+	 * MARK(NULL) reads back as the bare value 2, passes `succ != NULL`
+	 * below, and makes the second store record slot
+	 * &((struct cds_ft_node *) 2)->prev.  The interop invariant this file's
+	 * header states is exactly that this case is SEEN here.
+	 */
+	urcu_assert_debug(!((uintptr_t) succ & FT_HLIST_MARK));
+
 	/* Build the fresh node invisibly. */
 	newp->next = succ;
 	newp->prev = pos;

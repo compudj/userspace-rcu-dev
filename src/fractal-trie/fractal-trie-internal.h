@@ -1267,10 +1267,11 @@ struct ft_pub_rec {
  *     load-bearing here TODAY: ft_hlist_freeze_sole_prepare's derived
  *     NULL is the only thing that turns an UNHELD sole-entry derivation into
  *     an abort.  Re-derive under the holder lock before any SW park.
- * (5) ☐ FT-SLOT-4.  ft_promote_head already parks a head's prev SW (owner = the holder)
- *     while ft-txn-hlist.h records the same word class MW.  Not a live race
- *     (every producer holds the holder, or is bulk-gated, or the head is
- *     build-invisible) -- but "genuinely unlocked" is FALSE of this word.
+ * (5) ☑ FT-SLOT-4 (text corrected).  ft_promote_head already parks a head's prev
+ *     SW (owner = the holder) while ft-txn-hlist.h records the same word class
+ *     MW.  Not a live race (every producer holds the holder, or is bulk-gated,
+ *     or the head is build-invisible) -- but "genuinely unlocked" is FALSE of
+ *     this word, and the kind-stats HEAD_BACK entry now says so.
  * (6) The one family whose design-MW is ARGUED rather than asserted.
  *
  * ----------------------------------------------------------------------------
@@ -1298,26 +1299,52 @@ struct ft_pub_rec {
  *              live the day in-place is extended to a concurrent trie.
  *              ☞ ft_state_edge, and the assert beside its caller.
  *
- *   FT-SLOT-2  ☠ DEFECT, code-derived, not reproduced.  The duplicate-chain
- *              MARK CHECK was dropped from ft_hlist_insert_after_prepare
- *              while ft-txn-hlist.h's own header still promises it ("a
- *              concurrent insert_after(H) onto a sole-node chain sees the
- *              mark and aborts").  The remove side upholds its half; the
- *              insert side never looks, and MARK(NULL) reads back as the bare
- *              value 2, which passes `succ != NULL` and makes the second
- *              store record slot &((struct cds_ft_node *) 2)->prev.
- *              ☞ ft_hlist_insert_after_prepare.
+ *   FT-SLOT-2  ☑ ITS ONLY KNOWN PATH IS CLOSED, by the CALLER rather than here.
+ *              The MARK CHECK is still absent from
+ *              ft_hlist_insert_after_prepare while ft-txn-hlist.h's header
+ *              still promises it ("a concurrent insert_after(H) onto a
+ *              sole-node chain sees the mark and aborts"): the remove side
+ *              upholds its half, the prepare never looks, and MARK(NULL) reads
+ *              back as the bare value 2, which passes `succ != NULL` and makes
+ *              the second store record slot &((struct cds_ft_node *) 2)->prev.
+ *              ☞ WHAT CHANGED: both duplicate-append arms now RE-VALIDATE
+ *              under the holder lock and refuse a retired head
+ *              (ft_node_is_removed), so no walk can end on one and @pos can no
+ *              longer arrive marked from that path.  The invariant is therefore
+ *              enforced by the caller, NOT by the prepare -- which is a weaker
+ *              arrangement than the header describes, so the assert stays as
+ *              the detector.  NEVER REPRODUCED: two delay-injection sites and a
+ *              purpose-built rig failed to reach it even before the fix; treat
+ *              it as unproven, not as closed.
+ *              ☞ ft_hlist_insert_after_prepare, and note the sibling shapes
+ *              the survey flagged there -- del_prepare / replace_prepare can
+ *              still carry a marked next into a LIVE pred->next, excluded only
+ *              by the lock and never checked.
  *
- *   FT-SLOT-3  ☐ OPEN QUESTION.  @parent_word / @parent_slot_offset have TWO
- *              ownership predicates -- the model's PARENT and the code's
- *              @child_held -- and ft_glue_record_back_edge passes child_held
- *              true UNCONDITIONALLY, including for a displaced PUBLISHED
- *              child.  FT_RED_PARENT_WORD_SW exists because that shape "is a
- *              REAL defect", but it exercises the other branch, so whether
- *              every glue back-edge child is in the op's lock-set is
- *              unverified.  ☞ ft_glue_record_back_edge.
+ *   FT-SLOT-3  ☑ SOUND, AND NOW THE REASON IS NAMED -- which it was not, and
+ *              that is why it read as a defect.  @parent_word /
+ *              @parent_slot_offset carry two ownership predicates (the model's
+ *              PARENT, the code's @child_held), and ft_glue_record_back_edge
+ *              passes child_held TRUE unconditionally, including for a
+ *              displaced PUBLISHED child (measured, from ft_merge_at_inner) --
+ *              so on an armed txn it PARKS SW on a live node's parent word.
+ *              That is legal, but NOT because the child is in the DLM
+ *              lock-set: it is not.  All three callers are BULK ops (merge,
+ *              rekey, the glue commit), and under lock_fine a POINT op
+ *              RE-TAKES the FT-wide lock while a bulk op is live
+ *              (FT_BULK_WIDE_LOCK + ft_bulk_active), so bulk and point writers
+ *              arbitrate on one word again -- "the whole of G5.5's exclusion".
+ *              The old comment said "by construction" without naming the
+ *              construction, which is how this came to look unverified.
+ *              ☠ SO IT IS A DEPENDENCY, NOT AN INVARIANT.  The day the FT-wide
+ *              lock is relaxed to only flipping the dual-descent state -- the
+ *              recorded direction -- this SW park loses its exclusion and
+ *              @child_held here must become a real answer about the lock-set.
+ *              Revisit it WITH that change, not after.
+ *              ☞ ft_glue_record_back_edge.
  *
- *   FT-SLOT-4  ☐ STALE DOCS, benign but load-bearing for the conversion.
+ *   FT-SLOT-4  ☑ CORRECTED (the texts; the code they described is unchanged
+ *              except for one deletion).
  *              HEAD_BACK is documented "NEVER converts / permanent false
  *              arm" while ft_promote_head parks that same word SW with
  *              owner = the holder, and ft_back_edge_owner names P as its

@@ -5566,17 +5566,32 @@ int ft_unchain_node(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 			ft_chain_head_holder(ft, node);
 
 		/*
-		 * @node is a PUBLISHED chain member being unchained, so it HAS a
-		 * holder -- ASSERT rather than fall through unlocked.  A NULL means
-		 * a never-inserted node (prev NULL), produced only by ft-insert's
-		 * unwind paths on UNPUBLISHED nodes, which never reach an unchain.
-		 * The old tolerance mutated the chain with NO exclusion, which the
-		 * MW store's expected-value CAS still arbitrated; once these become
-		 * sw it is a LOST UPDATE, so the assumption must fail loudly now.
-		 * Measured unreachable: 0 NULL in 491532 ft_chain_head_holder calls
-		 * across ft_unit and ft_inv's three list modes.
+		 * ☠ A NULL HOLDER IS A STALE DERIVATION HERE TOO -- the exact twin
+		 * of the duplicate-append arm in ft-insert.h, down to the refuted
+		 * sentence.  The text that stood here said @node "HAS a holder",
+		 * that NULL came "only by ft-insert's unwind paths on UNPUBLISHED
+		 * nodes, which never reach an unchain", and cited the SAME count:
+		 * "0 NULL in 491532 ft_chain_head_holder calls across ft_unit and
+		 * ft_inv's three list modes".  One wrong zero was used to justify
+		 * both asserts, and it is wrong for one reason: every oracle behind
+		 * that count gives each writer a DISJOINT key range, so no two
+		 * writers ever met on one duplicate chain.
+		 *
+		 * Under LOCK_FINE a same-key cds_ft_insert -- concurrent by
+		 * contract -- retires or re-heads this chain between the descent
+		 * that produced @node and this derivation, and then
+		 * ft_chain_head_holder answers NULL.  MEASURED:
+		 * inv_concurrent_same_key_append_nolist trips this assert on an
+		 * UNPINNED run (full parallelism is the amplifier here -- pinning
+		 * to two cpus HID it).
+		 *
+		 * So bail retriably, as the two acquire failures just below
+		 * already do: the wrapper re-derives against the current tree.
+		 * Asserting was not merely loud -- a release build fell through to
+		 * ft_flag_to_metadata(ft, NULL) and acquired on the result.
 		 */
-		assert(lock_nf);
+		if (caa_unlikely(!lock_nf))
+			return -EAGAIN;
 		{
 			struct ft_held_anchor h;
 			unsigned int lock_depth = parent_depth;

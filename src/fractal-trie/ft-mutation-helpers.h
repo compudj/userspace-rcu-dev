@@ -7188,30 +7188,6 @@ void ft_root_edge_flip(struct cds_ft *ft,
 	ft_ord_cell_flip_one(&edge);
 }
 
-/*
- * Publish a duplicate-chain forward link (@slot transitions @old -> @new) as a
- * single-edge flip descriptor.  @slot is a LIVE chain node's `next' pointer
- * (cds_ft_node.next), read by cds_ft_for_each_duplicate_rcu; @new is either a
- * fully-built leaf being appended (ft_chain_node: NULL -> node) or an
- * already-published successor a remove relinks past (ft_unchain_node: node ->
- * next_node).  Neither exposes any build-invisible cluster -- the appended leaf
- * is complete and the relink target is already reachable -- so a lone-edge flip
- * (one release store, byte-identical to rcu_assign_pointer) is the right and
- * sufficient MCAS-expressible form; no fusion with another edge is needed.
- */
-static
-void ft_chain_next_flip(struct cds_ft *ft, struct cds_ft_node **slot,
-		struct cds_ft_node *old, struct cds_ft_node *new)
-{
-	struct ft_ord_cell_edge edge = {
-		.slot = (struct ft_ord_cell **) slot,
-		.old_target = (struct ft_ord_cell *) old,
-		.new_target = (struct ft_ord_cell *) new,
-	};
-
-	(void) ft;	/* a lone edge commits on an on-stack txn (no reclaim) */
-	ft_ord_cell_flip_one(&edge);
-}
 
 /*
  * Build a flip-latch edge for a per-node STATE WORD transition
@@ -12744,11 +12720,17 @@ void ft_flip_txn_record_parent_word(const struct cds_ft *ft,
  * other nine raw expected-old reads in the tree: zero of 16.4M.)
  */
 /*
- * ☐ FT-SLOT-3: this passes @child_held TRUE for every back edge, including a
- * displaced PUBLISHED child -- an SW park on such a child's parent_word is
- * legal only while that child is in the op's lock-set, which is by
- * construction here rather than by the registry.  FT_RED_PARENT_WORD_SW
- * exercises the other branch, so the claim is unverified.
+ * ☑ FT-SLOT-3, AND ITS EXCLUSION NAMED.  This passes @child_held TRUE for every
+ * back edge, including a displaced PUBLISHED child -- so on an armed txn it
+ * PARKS SW on a live node's parent word.  The child is NOT in this op's DLM
+ * lock-set, and the header's "by construction" never said what the construction
+ * was.  It is the FT-WIDE LOCK: every caller here is a BULK op (merge, rekey,
+ * the glue commit), and under lock_fine a POINT op RE-TAKES the FT-wide lock
+ * while a bulk op is live (FT_BULK_WIDE_LOCK + ft_bulk_active), so the two
+ * arbitrate on one word.
+ * ☠ THAT MAKES IT A DEPENDENCY, NOT AN INVARIANT: when the FT-wide lock is
+ * relaxed to only flipping the dual-descent state, this park loses its
+ * exclusion and @child_held must become a real lock-set answer.
  * ☞ THE TRANSACTED-SLOT REGISTER in fractal-trie-internal.h.
  */
 static

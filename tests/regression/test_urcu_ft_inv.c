@@ -82,7 +82,7 @@
  */
 /* +4 inv_prefix_head_*_key_identity; +2 inv_split_point_lookup_identity*;
  * +2 inv_absent_key_never_found* */
-#define NR_TESTS	(108 + NR_TESTS_REKEY_DLM)
+#define NR_TESTS	(111 + NR_TESTS_REKEY_DLM)
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -22232,6 +22232,305 @@ static int inv_concurrent_same_key_removes_nolist(void)
 		"inv_concurrent_same_key_removes_nolist");
 }
 
+/*
+ * Same-key APPEND vs same-key REMOVE under CDS_FT_WRITER_LOCK_FINE.
+ *
+ * The sibling row above puts three removers and an inserter on one chain, but
+ * its inserter's own node always SURVIVES the round -- so the head an append
+ * lands on is never a head a peer is retiring, and the insert lane's own
+ * derivation is never tested.  Here the chain OSCILLATES: one thread keeps a
+ * resident node X[k] going out and back in, the other appends and removes
+ * Y[k], so an append repeatedly lands on a head the peer is removing.
+ *
+ * That shape made _cds_ft_insert's duplicate append derive a NULL chain holder
+ * (ft_chain_head_holder of a head retired since the descent) and trip
+ * assert(holder_flag) at zero delay injection -- a release build carried on
+ * into ft_flag_to_metadata(ft, NULL) and used the result as a lock word.  The
+ * comment there had called the shape unreachable on the strength of "0 NULL in
+ * 491532 calls", a count taken entirely from DISJOINT-range oracles.
+ *
+ * ☞ WHICH OF THESE WITNESSES WHAT, measured against an ABLATED SNAPSHOT -- a
+ * git worktree with all three fixes removed and the ablation PROVEN by the
+ * assert strings in the built .so.  That distinction is not pedantry: an
+ * earlier pass measured against a build DIRECTORY that had since been rebuilt
+ * from fixed source, read 0/4 red, and concluded these rows were worthless.
+ * They are not.  Unpinned, 3 runs each:
+ *
+ *   ..._append_nolist   THE WITNESS, 2/3 red -- ft-insert.h's holder_flag
+ *                       assert, the append deriving a NULL chain holder.
+ *                       Green fixed, ~5 s.
+ *   ..._append_coarse   THE CONTROL, 0/3 -- serialised writers must be green.
+ *                       If this ever reddens the rig is broken, not the
+ *                       fine-grained contract.
+ *   ..._append (list on) 3/3 red on the ablated snapshot (it reaches
+ *                       ft_unchain_node's lock_nf assert, the remove-side
+ *                       twin) -- the STRONGEST witness of the three, and
+ *                       OPT-IN ONLY, see below.
+ *
+ * ☠ WHY THE LIST-ON ROW IS OPT-IN.  On the FIXED tree it intermittently trips
+ * ft_rebuild_key_upwalk's assert through ft_iter_read_key -- a PRE-EXISTING,
+ * separately-tracked defect in the list=1 up-walk, in code this fix does not
+ * touch (ft-iter.h is untouched; the only ft-remove.h change here is in
+ * ft_unchain_node).  This row is simply the first test that REACHES it, which
+ * became possible only once the NULL-holder asserts stopped firing first.
+ * Registering it by default would redden the gate for a defect this change
+ * neither caused nor claims to fix, so it runs under
+ * FT_INV_SAME_KEY_APPEND_LIST=1 and should go back in the default set the day
+ * that up-walk defect is closed.
+ *
+ * ☞ Pinning is NOT the stronger arm here.  taskset -c 0,1 HID both NULL-holder
+ * defects; the unpinned runs are what found them.  Measure both ways.
+ *
+ * The standalone reproducer is
+ * fractal-trie-review-2026-06/same-key-insert-vs-remove-rig.c, red in BOTH list
+ * modes and the instrument of record for this class.  BOUNDED by an iteration
+ * budget, not wall clock, so a regression aborts instead of hanging the suite.
+ */
+#define SKA_K		8
+#define SKA_R		40
+/*
+ * ☠ THE BURST IS WHAT MAKES THIS A WITNESS.  A barrier every k-sweep let the
+ * two workers fall into lockstep and the row passed on the UNFIXED library --
+ * 1920 iterations per thread caught nothing, while the standalone rig caught it
+ * at 200000.  Keep the keys FEW and the sweeps MANY between barriers so the
+ * appender keeps landing on a head the remover is retiring.
+ */
+#define SKA_BURST	400
+
+struct ska_ctx {
+	struct cds_ft *ft;
+	struct skr_node *resident;		/* [SKA_K], owned by the remover */
+	struct skr_node *guest;			/* [SKA_K], owned by the appender */
+	pthread_barrier_t bar;
+	unsigned long holder_bail;		/* appends that re-descended */
+};
+
+static void *ska_appender(void *arg)
+{
+	struct ska_ctx *c = (struct ska_ctx *) arg;
+	struct cds_ft_iter *iter;
+	unsigned int r, k;
+
+	rcu_register_thread();
+	if (cds_ft_iter_create(c->ft, &iter) != CDS_FT_STATUS_OK)
+		abort();
+	/*
+	 * NO BARRIERS.  Per-round barriers put the two workers in lockstep and
+	 * the row went GREEN ON THE UNFIXED LIBRARY -- it witnessed nothing.
+	 * The standalone rig catches it because both threads run FREE, so every
+	 * phase relationship between "append descends" and "peer retires the
+	 * head" gets sampled.  Bounded by the iteration budget, not by wall
+	 * clock, so a regression aborts instead of hanging the suite.
+	 */
+	for (r = 0; r < SKA_R; r++) {
+		unsigned int burst;
+
+		for (burst = 0; burst < SKA_BURST; burst++)
+		for (k = 0; k < SKA_K; k++) {
+			uint8_t key[8];
+			int in = 0;
+
+			cds_ft_u64_to_key(c->ft, (uint64_t) k, key,
+				CDS_FT_LEN_DEFAULT);
+			rcu_read_lock();
+			cds_ft_node_init(&c->guest[k].node);
+			if (cds_ft_insert(c->ft, key, CDS_FT_LEN_DEFAULT,
+					&c->guest[k].node) == CDS_FT_STATUS_OK)
+				in = 1;
+			rcu_read_unlock();
+			rcu_quiescent_state();
+			/* Take back out ONLY what went in: re-inserting a node
+			 * still in the trie is a test bug that corrupts the
+			 * chain and would frame the library. */
+			if (in) {
+				rcu_read_lock();
+				cds_ft_iter_set_key(iter, key,
+					CDS_FT_LEN_DEFAULT);
+				if (cds_ft_lookup(c->ft, iter) ==
+						CDS_FT_STATUS_OK)
+					(void) cds_ft_remove(c->ft, iter,
+						&c->guest[k].node);
+				rcu_read_unlock();
+				rcu_quiescent_state();
+			}
+		}
+	}
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static void *ska_remover(void *arg)
+{
+	struct ska_ctx *c = (struct ska_ctx *) arg;
+	struct cds_ft_iter *iter;
+	unsigned int r, k;
+
+	rcu_register_thread();
+	if (cds_ft_iter_create(c->ft, &iter) != CDS_FT_STATUS_OK)
+		abort();
+	/*
+	 * NO BARRIERS.  Per-round barriers put the two workers in lockstep and
+	 * the row went GREEN ON THE UNFIXED LIBRARY -- it witnessed nothing.
+	 * The standalone rig catches it because both threads run FREE, so every
+	 * phase relationship between "append descends" and "peer retires the
+	 * head" gets sampled.  Bounded by the iteration budget, not by wall
+	 * clock, so a regression aborts instead of hanging the suite.
+	 */
+	for (r = 0; r < SKA_R; r++) {
+		unsigned int burst;
+
+		for (burst = 0; burst < SKA_BURST; burst++)
+		for (k = 0; k < SKA_K; k++) {
+			uint8_t key[8];
+			int gone = 0;
+
+			cds_ft_u64_to_key(c->ft, (uint64_t) k, key,
+				CDS_FT_LEN_DEFAULT);
+			rcu_read_lock();
+			cds_ft_iter_set_key(iter, key, CDS_FT_LEN_DEFAULT);
+			if (cds_ft_lookup(c->ft, iter) == CDS_FT_STATUS_OK &&
+					cds_ft_remove(c->ft, iter,
+						&c->resident[k].node) ==
+					CDS_FT_STATUS_OK)
+				gone = 1;
+			rcu_read_unlock();
+			rcu_quiescent_state();
+			if (gone) {		/* re-insert only what came out */
+				rcu_read_lock();
+				cds_ft_node_init(&c->resident[k].node);
+				(void) cds_ft_insert(c->ft, key,
+					CDS_FT_LEN_DEFAULT,
+					&c->resident[k].node);
+				rcu_read_unlock();
+				rcu_quiescent_state();
+			}
+		}
+	}
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static int inv_concurrent_same_key_append_run(bool ordered_list, bool coarse,
+		const char *name)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct ska_ctx c;
+	pthread_t th[2];
+	struct cds_ft_iter *iter;
+	unsigned int r, k;
+	int ret = 0;
+
+	if (cds_ft_group_attr_create(&attr) < 0)
+		abort();
+	if (cds_ft_group_attr_set_key_len(attr, 8) < 0)
+		abort();
+	if (cds_ft_group_attr_set_ordered_list(attr, ordered_list) < 0)
+		abort();
+	if (coarse && cds_ft_group_attr_set_writer_strategy(attr,
+			CDS_FT_WRITER_LOCK_COARSE) < 0)
+		abort();
+	inv_maybe_set_rank_stats(attr);
+	if (cds_ft_group_create(attr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(attr);
+	memset(&c, 0, sizeof(c));
+	if (cds_ft_create(group, NULL, &c.ft) < 0)
+		abort();
+	cds_ft_make_concurrent(c.ft);
+	c.resident = (struct skr_node *) calloc(SKA_K, sizeof(*c.resident));
+	c.guest = (struct skr_node *) calloc(SKA_K, sizeof(*c.guest));
+	if (!c.resident || !c.guest)
+		abort();
+	if (cds_ft_iter_create(c.ft, &iter) != CDS_FT_STATUS_OK)
+		abort();
+	pthread_barrier_init(&c.bar, NULL, 3);
+	for (k = 0; k < SKA_K; k++) {
+		uint8_t key[8];
+
+		cds_ft_node_init(&c.resident[k].node);
+		c.resident[k].k = k;
+		c.guest[k].k = k;
+		cds_ft_u64_to_key(c.ft, (uint64_t) k, key, CDS_FT_LEN_DEFAULT);
+		if (cds_ft_insert(c.ft, key, CDS_FT_LEN_DEFAULT,
+				&c.resident[k].node) != CDS_FT_STATUS_OK)
+			abort();
+	}
+	rcu_quiescent_state();
+	pthread_create(&th[0], NULL, ska_appender, &c);
+	pthread_create(&th[1], NULL, ska_remover, &c);
+	(void) r;
+	pthread_join(th[0], NULL);
+	pthread_join(th[1], NULL);
+	/* Quiescent now: verify once, and check nothing foreign got spliced in. */
+	rcu_quiescent_state();
+	rcu_barrier();
+	rcu_read_lock();
+	if (cds_ft_verify(c.ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "%s: verify RED after the run\n", name);
+		ret = -1;
+	}
+	for (k = 0; k < SKA_K; k++) {
+		struct cds_ft_node *h;
+		uint8_t key[8];
+
+		cds_ft_u64_to_key(c.ft, (uint64_t) k, key, CDS_FT_LEN_DEFAULT);
+		cds_ft_iter_set_key(iter, key, CDS_FT_LEN_DEFAULT);
+		if (cds_ft_lookup(c.ft, iter) != CDS_FT_STATUS_OK)
+			continue;
+		for (h = cds_ft_iter_node(iter); h; h = cds_ft_node_next_rcu(h)) {
+			struct skr_node *n = (struct skr_node *) h;
+
+			if (n != &c.resident[k] && n != &c.guest[k]) {
+				fprintf(stderr, "%s: key %u holds a FOREIGN node (k=%u)\n",
+					name, k, n->k);
+				ret = -1;
+			}
+		}
+	}
+	rcu_read_unlock();
+	pthread_barrier_destroy(&c.bar);
+	cds_ft_iter_destroy(iter);
+	rcu_quiescent_state();
+	rcu_barrier();
+	cds_ft_destroy(c.ft);
+	cds_ft_group_destroy(group);
+	free(c.resident);
+	free(c.guest);
+	fprintf(stderr, "# %s: %u rounds x %u keys, appender vs same-key remover (%s) -> %s\n",
+		name, SKA_R, SKA_K, coarse ? "coarse" : "fine",
+		ret ? "RED" : "ok");
+	return ret;
+}
+
+static int inv_concurrent_same_key_append(void)
+{
+	/*
+	 * OPT-IN: reaches the open list=1 ft_iter_read_key up-walk defect on a
+	 * fixed tree (see the header above).  FT_INV_SAME_KEY_APPEND_LIST=1.
+	 */
+	if (!getenv("FT_INV_SAME_KEY_APPEND_LIST")) {
+		diag("inv_concurrent_same_key_append: skipped (set FT_INV_SAME_KEY_APPEND_LIST=1; reaches the open list=1 up-walk defect)");
+		return 0;
+	}
+	return inv_concurrent_same_key_append_run(true, false,
+		"inv_concurrent_same_key_append");
+}
+
+static int inv_concurrent_same_key_append_nolist(void)
+{
+	return inv_concurrent_same_key_append_run(false, false,
+		"inv_concurrent_same_key_append_nolist");
+}
+
+static int inv_concurrent_same_key_append_coarse(void)
+{
+	return inv_concurrent_same_key_append_run(false, true,
+		"inv_concurrent_same_key_append_coarse");
+}
+
 int main(int argc, char **argv)
 {
 	const char *filter = (argc >= 2) ? argv[1] : NULL;
@@ -22461,6 +22760,9 @@ int main(int argc, char **argv)
 	diag("19. Same-key concurrent removes route by a re-validated decision");
 	RUN_TEST(inv_concurrent_same_key_removes);
 	RUN_TEST(inv_concurrent_same_key_removes_nolist);
+	RUN_TEST(inv_concurrent_same_key_append);
+	RUN_TEST(inv_concurrent_same_key_append_nolist);
+	RUN_TEST(inv_concurrent_same_key_append_coarse);
 
 	rcu_barrier();
 	rcu_unregister_thread();

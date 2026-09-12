@@ -3151,6 +3151,16 @@ restart_attempt:
 			assert(!ft_node_compressed(d.nf));
 			metadata = cds_ft_item_to_metadata(ft_node_ptr(d.nf));
 			external_nodes = metadata->external_nodes;
+			/*
+			 * CAPTURE -> ACQUIRE window (-DFT_DELAY_INJECT only).
+			 * @external_nodes is read here with NOTHING held; the holder
+			 * acquire and the tail walk that starts FROM this value are
+			 * both below.  A peer's same-key SOLE remove landing in the
+			 * gap retires this very head, and the walk then ends on a
+			 * RETIRED node -- FT-SLOT-2.  Widen the gap so the shape is
+			 * reachable under test rather than only on paper.
+			 */
+			ft_delay_writer();
 			if (external_nodes) {
 				struct cds_ft_node *iter_node, *last_node = NULL;
 				struct cds_ft_metadata *dup_hmeta = NULL;
@@ -3210,6 +3220,33 @@ restart_attempt:
 							dup_hmeta = hh.lock;
 							dup_hsnap = hh.lock_snap;
 						}
+					}
+					/*
+					 * RE-VALIDATE THE CAPTURE UNDER THE
+					 * LOCK -- the PREFIX-HEAD twin of the
+					 * external-chain arm below, and the same
+					 * window: @external_nodes was read with
+					 * NOTHING held, and a same-key
+					 * cds_ft_remove can have retired that
+					 * head (or emptied the chain) before this
+					 * acquire landed.  The walk would then
+					 * start from a RETIRED head and append
+					 * behind a frozen next.  The holder here
+					 * is @d.nf itself, so there is no NULL
+					 * holder to catch -- only the stale head.
+					 * ☠ FIX BOTH ARMS OR NEITHER: they are
+					 * one defect wearing two shapes.
+					 */
+					if (caa_unlikely(
+							metadata->external_nodes !=
+							external_nodes ||
+							ft_node_is_removed(
+								external_nodes))) {
+						if (dup_hmeta)
+							ft_meta_lock_release(
+								dup_hmeta);
+						ret = -EAGAIN;
+						goto insert_done;
 					}
 				}
 				/* Find last duplicate */
@@ -3273,6 +3310,16 @@ restart_attempt:
 			struct cds_ft_metadata *dup_hmeta = NULL;
 			uintptr_t dup_hsnap = 0;
 
+			/*
+			 * DESCENT -> ACQUIRE window (-DFT_DELAY_INJECT only), the
+			 * EXTERNAL-chain twin of the prefix-head site above:
+			 * @dup_head is the descent's own landing, taken with nothing
+			 * held, and the holder acquire plus the tail walk that starts
+			 * FROM it are both below.  A peer's same-key SOLE remove in
+			 * the gap retires this head -- FT-SLOT-2.
+			 */
+			ft_delay_writer();
+
 			if (unique_node_ret) {
 				*unique_node_ret = dup_head;
 				ret = -EEXIST;
@@ -3288,22 +3335,43 @@ restart_attempt:
 			 * FT-wide lock makes the miss unreachable in soak (fault
 			 * injection drives the bail).
 			 *
-			 * @dup_head is a PUBLISHED head the descent just reached, so
-			 * it has a holder: ASSERT it rather than skipping the lock.
-			 * A NULL means a never-inserted node (prev NULL), produced
-			 * only by ft-insert's own unwind paths on UNPUBLISHED nodes,
-			 * which cannot be here.  The old tolerance silently appended
-			 * UNLOCKED, which the MW store's expected-value CAS still
-			 * arbitrated -- but once these become sw it is a LOST UPDATE,
-			 * so a wrong assumption must fail loudly now.  Measured
-			 * unreachable: 0 NULL in 491532 ft_chain_head_holder calls
-			 * across ft_unit and ft_inv's three list modes.
+			 * ☠ A NULL HOLDER IS A STALE DERIVATION, NOT AN
+			 * IMPOSSIBILITY.  @dup_head is the DESCENT's landing, taken
+			 * with nothing held, and under LOCK_FINE a same-key
+			 * cds_ft_remove -- concurrent by contract
+			 * (fractal-trie.h: "including on the same key") -- can retire
+			 * that head before this resolve runs; its prev then names no
+			 * holder and this walk returns NULL.
+			 *
+			 * The text that stood here said the shape "cannot be here",
+			 * produced "only by ft-insert's own unwind paths on
+			 * UNPUBLISHED nodes", and cited "0 NULL in 491532
+			 * ft_chain_head_holder calls across ft_unit and ft_inv's
+			 * three list modes".  THAT ZERO WAS A WRONG ZERO: every one
+			 * of those oracles gives each writer a DISJOINT key range, so
+			 * no two writers ever met on one duplicate chain and the
+			 * measurement could not see this shape by construction.
+			 * MEASURED now, with one appender and one same-key remover:
+			 * the assert fires at ZERO delay injection, and COARSE
+			 * adjudicates it -- serialised writers are GREEN over 200000
+			 * appends, so the class is the FINE point-vs-point contract.
+			 *
+			 * So BAIL RETRIABLY, the same disposition the remove side's
+			 * routing re-validation takes: -EAGAIN frees the fresh
+			 * cluster, ages the conflict and re-descends against the
+			 * current tree.  Asserting instead was not merely noisy -- a
+			 * release build runs straight on into
+			 * ft_flag_to_metadata(ft, NULL) and hands the result to
+			 * ft_acquire_member as a lock word.
 			 */
 			if (ft->lock_fine) {
 				struct cds_ft_inode_flag *holder_flag =
 					ft_chain_head_holder(ft, dup_head);
 
-				assert(holder_flag);
+				if (caa_unlikely(!holder_flag)) {
+					ret = -EAGAIN;
+					goto insert_done;
+				}
 				{
 					struct cds_ft_metadata *hm =
 						ft_flag_to_metadata(ft, holder_flag);
@@ -3345,6 +3413,35 @@ restart_attempt:
 							dup_hmeta = hh.lock;
 							dup_hsnap = hh.lock_snap;
 						}
+					}
+					/*
+					 * AND RE-VALIDATE THE DERIVATION UNDER
+					 * THE LOCK.  The bail above closes the
+					 * window that had already CLOSED by the
+					 * resolve; this one closes the rest of it
+					 * -- a peer can retire @dup_head between
+					 * that resolve and the moment this
+					 * acquire lands, and then the walk below
+					 * starts from a RETIRED head and appends
+					 * behind a frozen next (the chain the key
+					 * no longer names).  Once the holder is
+					 * ours the chain is stable, so asking
+					 * here is asking once: the head must
+					 * still be live AND still answer with the
+					 * holder we took.  Same disposition and
+					 * same reason as the remove side's
+					 * ft_unchain_kind re-validation.
+					 */
+					if (caa_unlikely(
+							ft_node_is_removed(dup_head) ||
+							ft_chain_head_holder(ft,
+								dup_head) !=
+							holder_flag)) {
+						if (dup_hmeta)
+							ft_meta_lock_release(
+								dup_hmeta);
+						ret = -EAGAIN;
+						goto insert_done;
 					}
 				}
 			}

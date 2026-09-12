@@ -144,14 +144,33 @@ enum ft_tk_rec_class {
  *                to make a park legal -- ft_flip_txn_record_root.  NEVER
  *                converts, whatever G4 decides.
  *   HEAD_BACK    an external head's back channel (cell->parent / en->prev).
- *                Neither an external node nor its cell carries a state word,
- *                so this is that predicate's permanent false arm.  NEVER
- *                converts (kind settled at f79438e7).
+ *                Neither an external node nor its cell carries a state word --
+ *                but that is the wrong question, and this entry used to answer
+ *                it: "that predicate's permanent false arm.  NEVER converts".
+ *                ☠ REFUTED IN THE TREE.  The word has a NAMED single owner --
+ *                the chain HOLDER, which is exactly what ft_back_edge_owner
+ *                returns -- and ft_promote_head ALREADY PARKS IT SW with that
+ *                holder as @owner.  So HEAD_BACK is a LOCK-SET REACH class
+ *                like PARENT_WORD, not a never-converts class like ROOT: its
+ *                MW is debt.  What the missing state word rules out is making
+ *                the EXTERNAL the owner, not conversion.  Read a count here
+ *                as "producers that did not reach the holder", and see THE
+ *                TRANSACTED-SLOT REGISTER in fractal-trie-internal.h.
  *   DUAL         a STRUCTURAL trie edge whose owner the op does not hold: the
  *                SKIP_X dual landing in a grandparent the op never acquired.
  *                THE RECLASSIFIED POPULATION -- it was MW_STRUCT (or, before
  *                af22756b, an unsound SW park) and it is convertible in
  *                principle, by WIDENING THE LOCK-SET, not by arming.
+ *                ☠ AND THIS COLUMN NO LONGER MEASURES THAT DEFINITION.  It is
+ *                the `else` of ft_ord_cell_flip_into's dispatch, so it also
+ *                receives: a FORWARD edge recorded with @owner_held false
+ *                (ft_node_recompact's RELOCATE), an &ft->root edge that
+ *                carried no .root flag (the replace op's sedges), and -- since
+ *                the insert and remove lanes began ACQUIRING the dual's
+ *                grandparent -- duals whose owner the op DOES hold.  So a
+ *                count here is an upper bound on "unheld SKIP_X duals", and
+ *                the G4 / Phase-E readings taken from it are stale in both
+ *                directions.  Split the branch before trusting the number.
  *   CELL         an ordered-cell / duplicate-chain edge (a non-structural tag).
  *                THE G4 LANE.  Convertible only if cells grow a state word and
  *                join lock-sets -- the separately-planned workstream.
@@ -1126,8 +1145,8 @@ void ft_tk_dump(void)
 		};
 		static const char * const mwa_what[FT_TK_MWA_NR] = {
 			"&ft->root -- no node to lock, NEVER converts",
-			"external head back channel -- no state word, NEVER converts",
-			"structural edge, owner NOT held (SKIP_X dual) -- RECLASSIFIED by af22756b; needs a wider lock-set",
+			"external head back channel -- holder-owned; MW is lock-set reach, NOT never-converts",
+			"structural edge via the dispatch else -- SKIP_X duals (held AND unheld), RELOCATE forward edges, flagless roots",
 			"ordered-cell / dup-chain edge -- THE G4 LANE",
 			"nr_keys up unlocked ancestors -- Phase E (root-only spacing)",
 			"child parent_word, child not held (reparent sweep) -- lock-set reach",
