@@ -7251,6 +7251,20 @@ void ft_state_edge(struct ft_ord_cell_edge *edge, uintptr_t *state_slot,
 	edge->slot = (struct ft_ord_cell **) state_slot;
 	edge->old_target = (struct ft_ord_cell *) old_state;
 	edge->new_target = (struct ft_ord_cell *) new_state;
+	/*
+	 * ☞ FT-SLOT-1, FIXED HERE.  NAME THE TAG: leaving it 0 let ft_edge_tag
+	 * default a STATE word to FT_FLIP_PROXY_TAG (0xF), the structural tag,
+	 * while every other producer and every resolver of that word uses
+	 * FT_STATE_PROXY (0x1) -- this very function's caller loads its
+	 * expected-old with 0x1 two lines up.  The tag, like the kind, is a
+	 * property of the SLOT: one tag, globally, across every txn and reader
+	 * that touches it.  A mismatch does not abort, it MISPARSES --
+	 * urcu_txn_is_proxy(desc|0xF, 0x1) is true and urcu_txn_untag then
+	 * yields desc|0xE, a misaligned record pointer the resolve path
+	 * dereferences -- and the engine's debug net covers the record path
+	 * only.
+	 */
+	edge->tag = FT_STATE_PROXY;
 }
 
 /*
@@ -9686,6 +9700,19 @@ int ft_remove_one_commit(struct cds_ft *ft,
 
 			ft_state_edge(&edges[n], &state_meta->state, old,
 				old - FT_STATE_NR_CHILD_ONE);
+			/*
+			 * FT-SLOT-1's RED CONTROL, kept as the regression
+			 * detector (it fired at ft_unit test 24 of the
+			 * -DFEATURE_FT_INSERT_IN_PLACE build, the only config
+			 * that reaches this branch): the load above used
+			 * FT_STATE_PROXY, so the RECORD must too.  One tag per slot, globally -- a
+			 * record planted with a wider tag than a resolver
+			 * strips fabricates a misaligned record pointer instead
+			 * of aborting, and the engine's own debug net covers
+			 * only the record path.
+			 */
+			urcu_assert_debug(ft_edge_tag(&edges[n]) ==
+					FT_STATE_PROXY);
 			n++;
 		}
 		/*

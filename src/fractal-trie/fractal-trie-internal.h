@@ -1227,7 +1227,7 @@ struct ft_pub_rec {
  *   metadata.state  tombstone     ditto               SW armed   MW by constr.
  *   metadata.state  lock release  ditto               SW armed   MW by constr.
  *   metadata.state  nr_child++    ditto               SW armed   MW by constr.
- *   metadata.state  nr_child--    ditto               MW  (2)    MW   [DEFECT]
+ *   metadata.state  nr_child--    ditto               MW  (2)    MW   [DESIGN]
  *   metadata.state  {live->live}  --                  MW         MW   [DESIGN]
  *   metadata.parent_word          parent (3)          SW if held MW by constr.
  *   metadata.parent_slot_offset   parent (3)          SW if held MW by constr.
@@ -1253,7 +1253,7 @@ struct ft_pub_rec {
  *     (ft_insert_lock_skip_dual_gp, ft_lock_skip_dual_gp), so the MW is a
  *     missed conversion; it stays MW until ft_node_recompact's own dual site
  *     (FT_OWNER_UNPLUMBED) and the glue publishes can vouch too.
- * (2) ☠ KNOWN DEFECT FT-SLOT-1, not a conversion question: ft_state_edge leaves .tag 0
+ * (2) ☑ WAS FT-SLOT-1 (fixed), not a conversion question: ft_state_edge leaves .tag 0
  *     and ft_edge_tag defaults an untagged edge to FT_FLIP_PROXY_TAG (0xF),
  *     so the remove's fused nr_child-- parks a 0xF-tagged proxy on a word
  *     every other producer and resolver tags FT_STATE_PROXY (0x1).  is_proxy
@@ -1277,16 +1277,26 @@ struct ft_pub_rec {
  * OPEN DEFECTS AND OPEN QUESTIONS IN THIS TABLE, tagged so they can be found:
  * grep -rn 'FT-SLOT-' src/fractal-trie/
  *
- *   FT-SLOT-1  ☠ DEFECT, code-derived, not reproduced.  A state-word TAG
- *              MISMATCH: ft_state_edge leaves .tag 0 and ft_edge_tag defaults
- *              an untagged edge to FT_FLIP_PROXY_TAG (0xF), so the remove's
- *              fused nr_child-- parks a 0xF-tagged proxy on a word every
- *              other producer and resolver tags FT_STATE_PROXY (0x1).
- *              urcu_txn_is_proxy(v, 0x1) ACCEPTS 0xF and urcu_txn_untag
- *              yields desc|0xE -- a misaligned record pointer, dereferenced.
- *              On the common leaf-delete path.  Debug builds trap tag
- *              aliasing on the RECORD path only, so the resolve path
- *              fabricates silently.  ☞ ft_state_edge.
+ *   FT-SLOT-1  ☑ FIXED.  A state-word TAG MISMATCH: ft_state_edge left .tag 0
+ *              and ft_edge_tag defaults an untagged edge to FT_FLIP_PROXY_TAG
+ *              (0xF), so the remove's fused nr_child-- parked a 0xF-tagged
+ *              proxy on a word every other producer and resolver tags
+ *              FT_STATE_PROXY (0x1) -- including its own caller's
+ *              expected-old load two lines up.  urcu_txn_is_proxy(v, 0x1)
+ *              ACCEPTS 0xF and urcu_txn_untag then yields desc|0xE, a
+ *              misaligned record pointer the resolve path dereferences; the
+ *              engine's debug net covers the RECORD path only.
+ *              ☠ AND ITS REACH WAS NARROWER THAN IT LOOKED, which is the
+ *              part worth keeping: the delete arm returns -EFBIG unless
+ *              ft_in_place_ok(), i.e. -DFEATURE_FT_INSERT_IN_PLACE on an
+ *              EXCLUSIVE trie -- NOT the default, which recompacts on
+ *              remove.  Measured: 0 reaches across ft_unit and ft_inv's four
+ *              list/rank modes with the detector armed, and the assert fires
+ *              at ft_unit test 24 of the in-place build.  So it was LATENT,
+ *              never live: the one config that plants the bad tag has no
+ *              concurrent resolver by that feature's own contract.  It goes
+ *              live the day in-place is extended to a concurrent trie.
+ *              ☞ ft_state_edge, and the assert beside its caller.
  *
  *   FT-SLOT-2  ☠ DEFECT, code-derived, not reproduced.  The duplicate-chain
  *              MARK CHECK was dropped from ft_hlist_insert_after_prepare
