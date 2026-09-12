@@ -12125,6 +12125,47 @@ struct ft_glue {
 	 */
 	bool fuse_free_list;
 	/*
+	 * THE FENCE FOR A LIVE NODE THE BUILD ABSORBS, taken by the CALLER.
+	 *
+	 * ft_try_compress_chain fuses a (skip-)compressed survivor's run into the
+	 * run it builds, and retires the absorbed node -- a LIVE, reader-reachable
+	 * node whose body the build READS.  Unfenced, that is the unlocked-retire
+	 * gap ft_glue_defer_free_fenced exists to close (a peer adding a child in
+	 * the read window is retired with the node), and it also makes the retire
+	 * unrecordable: a fused free list parks the tombstone SW, which is step 2
+	 * of the STATE-WORD PROTOCOL without step 1.
+	 *
+	 * The acquire cannot live at the absorb: that point is mid-build, past
+	 * every clean bail, and the depth it would need to anchor by is a property
+	 * of the node's LIVE path, which only the caller knows (the build is
+	 * handed a local key buffer at offset 0).  So the CALLER takes it and
+	 * leaves the anchor here; the absorb files the fenced entry with it.
+	 *
+	 * @absorb_node is the compressed node the fence covers -- matched by
+	 * IDENTITY at the absorb, so a build that ends up absorbing a different
+	 * node falls back to the unfenced retire rather than filing someone
+	 * else's anchor.  NULL (ft_glue_init default) is every other caller,
+	 * unchanged.
+	 *
+	 * ☞ SOUND ONLY BECAUSE THE FENCE IS ALWAYS CONSUMED HERE.  The rekey
+	 * COLLAPSE arm is armed only when `1 + surv_len <= FT_SKIP_LEN_MAX`
+	 * (ft-rekey.h), which is the same bound the absorb tests -- so an armed
+	 * fold always absorbs, and the caller never leaves a fence that no
+	 * free-list entry owns.  A future caller that cannot promise that must
+	 * give the mark its own release path, as @publish_gp_holder has.
+	 */
+	struct cds_ft_compressed_node *absorb_node;
+	struct ft_held_anchor absorb_held;
+	/*
+	 * ...and the absorb's own REPORT back: it could not fence a live node it
+	 * had to retire, so the caller owes a RETRIABLE failure rather than the
+	 * -ENOMEM its NULL return otherwise means.  Keeping the two apart is the
+	 * engine's own rule (ABORT retries, MEMORY_ERROR propagates); mapping a
+	 * contended acquire to -ENOMEM would report a memory error for what is
+	 * ordinary contention.
+	 */
+	bool absorb_miss;
+	/*
 	 * FOLD (coherent rekey one-decide writer): when set, ft_glue_txn_commit_edges
 	 * RECORDS the dst-attach (live back-edges + forward publish + fenced retires +
 	 * cells + count) into @txn but does NOT commit it -- @txn is the caller's
@@ -12295,6 +12336,9 @@ void ft_glue_init(struct ft_glue *g)
 	g->attached_nf = NULL;
 	g->txn = NULL;
 	g->fuse_free_list = false;
+	g->absorb_node = NULL;
+	memset(&g->absorb_held, 0, sizeof(g->absorb_held));
+	g->absorb_miss = false;
 	g->record_only = false;
 	g->count_delta = 0;
 }
@@ -13529,6 +13573,23 @@ void ft_glue_clear_fenced(struct ft_glue *g)
 			ft_meta_lock_release_if_held(g->free_list[i].holder);
 		g->free_list[i].fenced = false;
 	}
+	/*
+	 * ...AND A HAND-OFF FENCE NO FREE-LIST ENTRY EVER CLAIMED.  A caller that
+	 * pre-fences a node the build will absorb leaves the anchor in
+	 * @absorb_node / @absorb_held (see them), and the absorb CLEARS
+	 * @absorb_node as it files the fenced entry.  Still set here means the
+	 * build bailed before reaching that absorb -- a stale plan, an OOM -- so
+	 * the mark is ours and nothing else will ever release it.  Left behind it
+	 * is worse than a leak: ft_dlm_lock refuses a LOCKED word, so the node
+	 * would be unmutable for the life of the trie.
+	 *
+	 * Shared takes nothing and owes nothing, the same rule as the loop above.
+	 */
+	if (g->absorb_node) {
+		if (!g->absorb_held.shared && g->absorb_held.lock)
+			ft_meta_lock_release_if_held(g->absorb_held.lock);
+		g->absorb_node = NULL;
+	}
 }
 
 /*
@@ -14618,6 +14679,30 @@ void ft_glue_tombstone_free_list(struct ft_glue *g)
 			if (old & FT_STATE_TOMBSTONE)
 				g->free_list[i].retired = false;
 		} else {
+			/*
+			 * ☠ THE STANDALONE ARM IS FOR A RETIRE WHOSE UNLINK IS NOT
+			 * A COMMIT YET -- never for one whose commit is still AHEAD.
+			 *
+			 * This stamps a ONE-WAY LIVE->DEAD mark immediately, outside
+			 * any txn.  That is correct only where the caller's unlink
+			 * has already happened or cannot fail; reached from a glue
+			 * whose committer has not run, it publishes a lie that no
+			 * abort can retract, and because ft_dlm_lock hard-refuses a
+			 * tombstoned word the marked node becomes unlockable
+			 * FOREVER -- a livelock at any spacing that anchors a
+			 * lock-set member on it.  Measured exactly that way once
+			 * (ft-rekey.h's fold, 16.6M marks vs 8.3M self-refusals);
+			 * the cure was to FENCE the retires and fuse them, so the
+			 * one caller that sets @record_only no longer reaches here.
+			 *
+			 * @record_only is that caller's own flag -- "my txn is the
+			 * CALLER's and its single commit is still ahead" -- and it
+			 * is set at exactly one site, so this says what it means
+			 * and cannot fire for anyone else.  Keep it: the defect is
+			 * invisible at per-node (nothing re-locks a retired node
+			 * there) and the suite only fails above it.
+			 */
+			urcu_assert_debug(!g->record_only);
 			ft_meta_tombstone_set_flip(meta);
 		}
 	}

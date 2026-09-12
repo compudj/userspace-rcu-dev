@@ -441,6 +441,8 @@ struct cds_ft_inode_flag *ft_try_compress_chain(struct cds_ft *ft,
 	struct cds_ft_compressed_node *child_cn = NULL;
 	unsigned int child_len = 0;
 	uint8_t merged_len;
+	struct ft_held_anchor absorb_held;
+	bool absorb_fenced = false;
 	int j;
 
 	/*
@@ -491,11 +493,84 @@ struct cds_ft_inode_flag *ft_try_compress_chain(struct cds_ft *ft,
 			child_len = 0;
 		}
 	}
+	/*
+	 * ☠ FENCE A LIVE NODE BEFORE READING ITS BYTES INTO THE RUN.
+	 *
+	 * @child_cn is now final, and when it is LIVE this build is about to copy
+	 * its run into @cn and RETIRE it.  Two things require a lock over that:
+	 * the read window (a peer mutating @child_cn between the copy and the
+	 * commit is retired with it -- ft_glue_defer_free_fenced's own header), and
+	 * the retire's RECORD, because a committer that fuses its free list parks
+	 * the tombstone SW, which the STATE-WORD PROTOCOL permits for step 2 only
+	 * because step 1 took the word.
+	 *
+	 * HERE, and not at the retire below: this is the last point before any
+	 * allocation, so a miss returns with NOTHING to unwind.  @record_only is
+	 * the gate because it names exactly the callers whose commit is still
+	 * AHEAD of this build -- for them an unfenced retire is also a ONE-WAY
+	 * mark an aborting attempt leaves behind, which ft_dlm_lock then refuses
+	 * forever.  Every other caller keeps its existing unfenced retire.
+	 *
+	 * ☞ TWO WAYS TO GET THE DEPTH, and the caller-supplied one is not
+	 * redundant.  @absorb_node means the caller already took this fence with a
+	 * depth it alone could compute -- a node on the op's SRC path, which
+	 * @glue's descent does not describe -- and handing that over is the only
+	 * thing that keeps such a site from missing forever.  Where the node IS on
+	 * the descent's path, FT_DEPTH_FROM_DESCENT lets the acquire date it
+	 * itself, and a lookup miss is the same clean re-descend a contended
+	 * acquire already produces.
+	 */
+	if (child_cn && glue && glue->record_only &&
+			!ft_glue_is_fresh(ft, glue,
+				ft_compressed_node_flag(child_cn))) {
+		if (glue->absorb_node == child_cn) {
+			absorb_held = glue->absorb_held;
+			absorb_fenced = true;
+			/*
+			 * CONSUMED: this function owns the mark from here, and
+			 * the retire below files it.  Clearing the hand-off is
+			 * what tells ft_glue_clear_fenced NOT to release it a
+			 * second time -- and, symmetrically, what lets it release
+			 * a fence the caller took on a build that then bailed
+			 * before ever reaching this absorb.
+			 */
+			glue->absorb_node = NULL;
+		} else {
+			struct ft_lock_ctx actx;
+
+			ft_glue_lock_ctx(glue, &actx);
+			if (ft_acquire_member(ft, &actx,
+					ft_compressed_node_flag(child_cn),
+					cds_ft_item_to_metadata(
+						(struct cds_ft_inode *) child_cn),
+					FT_DEPTH_FROM_DESCENT, &absorb_held)) {
+				glue->absorb_miss = true;
+				return (struct cds_ft_inode_flag *) (long) -ENOMEM;
+			}
+			absorb_fenced = true;
+		}
+	}
 	merged_len = (uint8_t)(path_len + child_len);
 
 	cn = alloc_compressed_node(ft, merged_len, &cn_meta);
-	if (!cn)
+	if (!cn) {
+		/*
+		 * ☠ THE ONLY EXIT BETWEEN THE FENCE AND THE RETIRE THAT FILES IT.
+		 * Until ft_glue_defer_free_fenced below hands the mark to the glue,
+		 * no choke point owns it -- ft_glue_abort's ft_glue_clear_fenced
+		 * sweeps free-list entries, and this one does not exist yet -- so
+		 * bailing here would leave the word LOCKED with nothing left to
+		 * release it, and ft_dlm_lock refuses a locked word: the node would
+		 * be unmutable for the life of the trie.  Release it by hand.
+		 *
+		 * A SHARED anchor took nothing and owes nothing: the acquire that
+		 * first took that word owns its release, exactly as
+		 * ft_glue_clear_fenced reasons.
+		 */
+		if (absorb_fenced && !absorb_held.shared && absorb_held.lock)
+			ft_meta_lock_release_if_held(absorb_held.lock);
 		return (struct cds_ft_inode_flag *) (long) -ENOMEM;
+	}
 	if (child_cn)
 		cn->child = child_cn->child;
 	else
@@ -542,6 +617,17 @@ struct cds_ft_inode_flag *ft_try_compress_chain(struct cds_ft *ft,
 					ft_glue_untrack(ft, glue, child_cn);
 					free_compressed_node_unpublished(ft,
 						child_cn);
+				} else if (absorb_fenced) {
+					/*
+					 * FENCED ABOVE -- by this function, or by a
+					 * caller that handed its anchor over in
+					 * @glue->absorb_node.  Either way the retire
+					 * rides the committer's txn as
+					 * {LOCK|s -> TOMBSTONE|s} instead of a
+					 * standalone one-way mark.
+					 */
+					ft_glue_defer_free_fenced(glue, child_cn,
+						true, &absorb_held);
 				} else {
 					ft_glue_defer_free(glue, child_cn,
 						true);

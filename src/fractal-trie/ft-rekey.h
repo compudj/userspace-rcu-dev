@@ -4226,6 +4226,47 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	glue.txn = txn;
 	glue.record_only = true;
 	/*
+	 * ☠ FUSE THE RETIRES INTO THAT ONE COMMIT, EVERY ARM.  @record_only says
+	 * this glue does not commit: the CALLER's single commit is still ahead of
+	 * every glue step -- the mark acquire in ft_glue_txn_commit_edges and the
+	 * forward publish included -- and that commit can abort.  With the flag
+	 * clear, ft_glue_tombstone_free_list takes its STANDALONE arm instead
+	 * (ft_meta_tombstone_set_flip) and stamps each retired node's one-way
+	 * LIVE->DEAD mark IMMEDIATELY, outside @txn, where nothing rolls it back.
+	 *
+	 * That reads the §4.B freeze-on-free contract backwards.  A glue whose
+	 * unlink IS a flip-txn commit must record the mark as an edge of that
+	 * commit; the lone-edge helper exists for retire sites whose unlink is not
+	 * a commit yet, and this is not one of them.  Fused, the mark lands with
+	 * the unlink or not at all.
+	 *
+	 * MEASURED, and it is a LIVELOCK, not a cosmetic window: the mark is
+	 * ONE-WAY and ft_dlm_lock hard-refuses a tombstoned word with no bail, so
+	 * a mark left by an attempt that then aborted makes that word UNLOCKABLE
+	 * FOREVER.  Above per-node the lock-set maps onto an ANCHOR ANCESTOR, so
+	 * the retired node is the very word the next attempt's acquire needs --
+	 * ft_unit test_rekey_compressed_bp_atomic_or_refused at
+	 * CDS_FT_LOCK_SPACING_EXPONENTIAL wedged at 16.6M immediate marks against
+	 * 8.3M acquires refusing on a word THIS THREAD had marked, in 45 s, with
+	 * no peer in the test at all.  Per-node reaches the same store and is a
+	 * contract violation there too; it just anchors on the node itself, so the
+	 * retired node is never the one a retry re-locks.
+	 *
+	 * ☞ THE FLAG IS ONLY LEGAL BECAUSE EVERY ENTRY IS HELD.  A fused entry
+	 * parks its tombstone SW, which the STATE-WORD PROTOCOL permits for step 2
+	 * only because step 1 took the word -- so an UNHELD entry here would be a
+	 * blind store on a word this op does not own, able to strip a peer's LOCK
+	 * bit, and the record-time owner assert refuses it (-DFT_REKEY_CLAIM
+	 * aborts at __ft_flip_txn_record_tag_ctx, single-threaded).  The fold's
+	 * two unheld producers are both acquired now: the COLLAPSE arm's resting
+	 * node and the survivor run its build absorbs.  ☞ Recording them MW
+	 * instead was tried and REFUTED -- it satisfies the assert and then fails
+	 * to converge at exponential (measured: a descriptor leaked per attempt,
+	 * RSS to 13.8 GB, with the commit returning OK throughout).  Do not
+	 * re-introduce a kind dispatch here; hold the word or do not retire it.
+	 */
+	glue.fuse_free_list = true;
+	/*
 	 * GLUE (compressed-divergence) shape: have the build FENCE the compressed
 	 * node it splits before it reads its plan, so the whole build runs under
 	 * that fence and its retire rides our commit (ft_split_compressed_graft_build).
@@ -4630,14 +4671,16 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 			goto bail_build;
 		}
 		/*
-		 * FUSE both free lists into the shared txn.  The dst side MUST (a fenced
-		 * overlap retire records its {LOCK|s -> TOMBSTONE|s} terminal into
-		 * g->txn and asserts on this flag), and the src side must for the reason
-		 * the whole fold exists: its free list carries S_top, whose retire has to
-		 * flip WITH the publish rather than as a standalone lone-edge store the
-		 * commit could not roll back.  The reserve above sized both.
+		 * FUSE THE SRC FREE LIST TOO.  The dst side already carries the
+		 * flag from the init above (every arm does, and why is stated
+		 * there); this side must for the reason the whole fold exists: its
+		 * free list carries S_top, whose retire has to flip WITH the
+		 * publish rather than as a standalone lone-edge store the commit
+		 * could not roll back.  The reserve above sized both -- and the dst
+		 * side MUST regardless, a fenced overlap retire recording its
+		 * {LOCK|s -> TOMBSTONE|s} terminal into g->txn and asserting on the
+		 * flag.
 		 */
-		glue.fuse_free_list = true;
 		src_glue.txn = txn;
 		src_glue.fuse_free_list = true;
 		mctx.dst_ft = ft;
@@ -6032,6 +6075,28 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 			(prep == FT_GRAFT_PREP_GLUE ?
 				FT_GLUE_FLOOR_DEFERRED + 7 + 1 + FT_GLUE_FLOOR_FREE +
 				(ft->rank_stats ? (unsigned int) dst_len + 1 : 0) : 0) +
+			/*
+			 * ...and THE GLUE'S FREE-LIST TOMBSTONES on every OTHER
+			 * arm, because @glue.fuse_free_list is set for all of them
+			 * (see the init, and the livelock it closes).  cap_free is
+			 * the bound, and no arm reaching here calls ft_glue_reserve
+			 * -- the merge one does, and its own term above counts
+			 * mcnt.nf_dst + nf_src -- so cap_free is exactly
+			 * FT_GLUE_FLOOR_FREE, which is also what
+			 * ft_glue_defer_free asserts against.  DOUBLED, because a
+			 * FENCED entry costs two records where the spacing splits
+			 * its terminal: the tombstone on the retired node plus the
+			 * {LOCK|s -> s} release of the anchor that carried it (one
+			 * record under per-node, where the two words are one).
+			 *
+			 * Counted unconditionally -- it overlaps the GLUE term
+			 * above by one floor -- on that term's own reasoning: a
+			 * reservation is where OOM gets ANSWERED, and once the
+			 * publish has landed the op is past the point where there
+			 * is an answer, so a shortfall surfaces as a sticky -ENOMEM
+			 * at the commit instead.
+			 */
+			2 * FT_GLUE_FLOOR_FREE +
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 			/*
 			 * A FOLDED COLLAPSE.  Dropping S_top can leave BP with a single
@@ -6372,10 +6437,132 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 			struct cds_ft_inode_flag *coll;
 			struct cds_ft_inode_flag *surv2 = NULL;
 			uint8_t sb2 = 0;
+			struct ft_lock_ctx cctx;
+			struct ft_held_anchor cr_held;
+			struct cds_ft_compressed_node *surv_cn = NULL;
 
 			if (rcu_dereference(*fold_top_slot) != climb_rest) {
 				ret = -EAGAIN;
 				goto bail_build;
+			}
+			/*
+			 * ☠ FENCE BOTH LIVE NODES THIS COLLAPSE RETIRES, and do it
+			 * HERE -- ahead of the body re-validation below, which is
+			 * the first read of either one.
+			 *
+			 * The collapse retires TWO live, reader-reachable nodes:
+			 * the resting node, whose two children it reads to lay the
+			 * run, and -- when the survivor is a run itself -- the
+			 * survivor, whose bytes ft_try_compress_chain ABSORBS into
+			 * that run.  Both were retired UNFENCED until now, which
+			 * was two defects in one:
+			 *
+			 *  1. THE UNLOCKED RETIRE (the ☐ RESIDUAL this comment used
+			 *     to record as inherited).  Holding nothing across the
+			 *     window in which the build reads a body means a peer
+			 *     adding a third child inside it is retired along with
+			 *     the node -- silent key loss, the gap
+			 *     ft_glue_defer_free_fenced exists to close.
+			 *
+			 *  2. A ONE-WAY MARK WRITTEN BY AN ATTEMPT THAT CAN STILL
+			 *     ABORT.  An unfenced entry cannot ride the txn: a
+			 *     fused free list parks the tombstone SW, which is step
+			 *     2 of the STATE-WORD PROTOCOL without step 1 and can
+			 *     strip a peer's LOCK bit (and the record-time owner
+			 *     assert says so).  So the sweep took its STANDALONE
+			 *     arm instead and stamped the mark IMMEDIATELY, outside
+			 *     @txn, while this op's single commit was still ahead
+			 *     of it -- and the mark is ONE-WAY, so an attempt that
+			 *     then aborted left the word TOMBSTONE forever.
+			 *     ft_dlm_lock hard-refuses a tombstoned word with no
+			 *     bail, so above per-node spacing -- where the lock-set
+			 *     maps onto an ANCHOR ANCESTOR and the retired node IS
+			 *     the word the next attempt needs -- the op could never
+			 *     converge.  Measured at EXPONENTIAL, single-threaded:
+			 *     16.6M immediate marks against 8.3M acquires refusing
+			 *     on a word THIS THREAD had marked, in 45 s, forever.
+			 *
+			 * Fencing answers both: the acquire brackets the same world
+			 * the retire ratifies, and the fenced entry records its
+			 * {LOCK|s -> TOMBSTONE|s} terminal INTO @txn, so the mark
+			 * lands with the unlink or not at all.
+			 *
+			 * A MISS IS THE CLEAN TRANSIENT: nothing is built, nothing
+			 * published, and ft_glue_abort at @bail_build releases
+			 * whatever this block already filed (ft_glue_clear_fenced).
+			 * -EAGAIN, never a shape refusal -- the same disposition
+			 * the merge arm's own overlap fence takes.
+			 *
+			 * @fold_rest_depth is the ABSOLUTE byte-depth the arming
+			 * already computed for this node (d_src.pdepth -
+			 * climb_bytes, under that arm's climb_bytes < pdepth
+			 * guard).  It has to be absolute and it has to be the
+			 * node's LIVE path: a relative depth anchors the node on a
+			 * different word than every other op computes for it, and
+			 * then the acquire refuses its own fence forever (the
+			 * measured exponential storm at ft_merge_build's @d_prov).
+			 */
+			ft_lock_ctx_init(&cctx, &d_src, txn, optxn);
+			/*
+			 * The rest of the op's held set, as every other acquire in
+			 * this function names it: ft_rekey_cow_stop's marks, plus
+			 * the glue's own named fences.  Under a coarse spacing
+			 * these two nodes anchor onto one of them, and a frame
+			 * naming neither refuses the op's OWN fence.
+			 */
+			cctx.held.extra = marks;
+			cctx.held.nr_extra = nr_marks;
+			cctx.held.glue = &glue;
+			if (ft_acquire_member(ft, &cctx, climb_rest,
+					cds_ft_item_to_metadata(
+						ft_node_ptr(climb_rest)),
+					fold_rest_depth, &cr_held)) {
+				ret = -EAGAIN;
+				goto bail_build;
+			}
+			/*
+			 * FILED NOW, not after the build: from here the fence is
+			 * the glue's, so every bail below -- the re-validation, the
+			 * -ENOMEM, the prepare -- releases it through the one
+			 * choke point instead of each owing its own unlock.
+			 */
+			ft_glue_defer_free_fenced(&glue,
+				ft_node_ptr(climb_rest), false, &cr_held);
+			/*
+			 * ...AND THE SURVIVOR, but only when it is the shape the
+			 * build absorbs: ft_try_compress_chain fuses a
+			 * (skip-)compressed child's run into the one it lays and
+			 * retires it, and leaves a PLAIN or EXTERNAL survivor
+			 * alone (no free-list entry, nothing to fence).  Its depth
+			 * is one span below the resting node, which is what
+			 * ft_parent_depth_of states backwards.
+			 *
+			 * The anchor goes to @glue: the absorb is mid-build, past
+			 * every clean bail, so it cannot take this itself -- see
+			 * @absorb_node.  It is ALWAYS consumed, because this arm is
+			 * armed only under the same `1 + surv_len <=
+			 * FT_SKIP_LEN_MAX` bound the absorb tests.
+			 */
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+			if (ft_node_skip_compressed(fold_surv))
+				surv_cn = ft_skip_to_compressed(ft, fold_surv);
+			else
+#endif
+			if (ft_node_compressed(fold_surv))
+				surv_cn = ft_compressed_node_ptr(fold_surv);
+			if (surv_cn) {
+				if (ft_acquire_member(ft, &cctx, fold_surv,
+						cds_ft_item_to_metadata(
+							(struct cds_ft_inode *)
+								surv_cn),
+						fold_rest_depth +
+							ft_node_span(ft,
+								climb_rest),
+						&glue.absorb_held)) {
+					ret = -EAGAIN;
+					goto bail_build;
+				}
+				glue.absorb_node = surv_cn;
 			}
 			/*
 			 * RE-VALIDATE the body read at PLAN time.
@@ -6413,7 +6600,46 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 			coll = ft_build_branch(ft, buf, 0, 1, fold_surv,
 				surv_keys, false, &glue);
 			if (!coll) {
-				ret = -ENOMEM;
+				/*
+				 * ☞ CONTENTION IS NOT A MEMORY ERROR.  The build
+				 * FENCES a live node it absorbs (@absorb_miss), and
+				 * a missed acquire must retry, not propagate as
+				 * MEMORY_ERROR -- the engine's own rule that the
+				 * two failure spaces stay apart.  The fence this
+				 * arm pre-took above makes the miss unlikely here,
+				 * but the build has a second absorb path of its own.
+				 */
+				ret = glue.absorb_miss ? -EAGAIN : -ENOMEM;
+				goto bail_build;
+			}
+			/*
+			 * ☠ THE HAND-OFF FENCE MUST NOT OUTLIVE THE BUILD THAT
+			 * WAS SUPPOSED TO CONSUME IT.  The absorb clears
+			 * @absorb_node as it files the fenced entry, so a value
+			 * still here means the build took a path that did not
+			 * absorb -- and then nothing downstream ever releases the
+			 * mark: ft_glue_clear_fenced is the net, but the rekey's
+			 * SUCCESS path does not run it, and ft_dlm_lock refuses a
+			 * LOCKED word, so the node would be unmutable for the life
+			 * of the trie.
+			 *
+			 * UNREACHABLE BY THE ARMING -- this arm is armed only under
+			 * the same `1 + surv_len <= FT_SKIP_LEN_MAX` bound the
+			 * absorb tests, so a (skip-)compressed survivor is always
+			 * absorbed -- which is exactly why it is written as a
+			 * RELEASE AND RETRY rather than an assert: the invariant
+			 * lives in a different function's bound, and if someone
+			 * widens one side of it this degrades to a retry instead of
+			 * wedging a node.  @coll is glue-tracked, so ft_glue_abort
+			 * reclaims it on the way out.
+			 */
+			if (caa_unlikely(glue.absorb_node)) {
+				if (!glue.absorb_held.shared &&
+						glue.absorb_held.lock)
+					ft_meta_lock_release_if_held(
+						glue.absorb_held.lock);
+				glue.absorb_node = NULL;
+				ret = -EAGAIN;
 				goto bail_build;
 			}
 			/*
@@ -6425,25 +6651,17 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 			 * reclaims it.  Naming it in both places frees it twice:
 			 * measured, cds_ft_do_free_item's `range->nr_live > 0`.
 			 *
-			 * ☞ THE PLAIN RETIRE for the resting node, on the same
-			 * footing the rest of this build uses, and ft-graft.h's
-			 * twin says why: a FENCED free-list entry records its
-			 * {LOCK|s -> TOMBSTONE|s} into @txn and so asserts
-			 * @fuse_free_list, which promotes EVERY entry to a txn
-			 * record -- including the run ft_try_compress_chain just
-			 * absorbed, which this build owns through the GLUE and
-			 * which would then fail the record-time owner check.
-			 * Measured: asserting exactly that.
-			 *
-			 * ☐ RESIDUAL, inherited knowingly and identical to the
-			 * twin's: the plain retire holds no lock across the
-			 * window in which this build READ the resting node's
-			 * body, so a peer adding a THIRD child inside it would
-			 * be retired with it.  Closing it needs every free-list
-			 * node owned by the txn -- a change to the glue's
-			 * ownership model, not to this arm.
+			 * ☞ THE RESTING NODE'S RETIRE IS ALREADY FILED, fenced,
+			 * at the acquire above -- which is also why this arm may
+			 * set @fuse_free_list at all.  The objection that used to
+			 * stand here was that a fenced entry asserts that flag and
+			 * the flag "promotes EVERY entry to a txn record --
+			 * including the run ft_try_compress_chain just absorbed",
+			 * which would then fail the record-time owner check.  True,
+			 * and now answered at the source: that run is fenced too,
+			 * by the same block, so there is no unheld entry left for
+			 * the flag to promote.
 			 */
-			ft_glue_defer_free(&glue, ft_node_ptr(climb_rest), false);
 			/*
 			 * ☠ THE SUBSTITUTION IS ON @graft_c'S SLOT, not on the
 			 * resting node's.  The fold's whole shape is "one slot
