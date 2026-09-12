@@ -50,8 +50,7 @@
  *     promoted to the compressed node's child slot
  *     (@topmost_external_nodes != NULL): keep the compressed node
  *     (its path is needed for lookups) and replace cn->child with
- *     the external chain head.  Reset *nr_clear so the
- *     free-intermediate walk does not run later.
+ *     the external chain head.
  *
  *   - Otherwise: the compressed parent is no longer needed.
  *     Allocate a fresh empty internal, inherit parent + skip slot
@@ -72,7 +71,6 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 		struct cds_ft_inode_flag **detach_parent_flag_ptr,
 		struct cds_ft_node *topmost_external_nodes,
 		struct cds_ft_inode_flag *elevated_old_child,
-		int *nr_clear,
 		struct ft_ord_cell *fuse_cell,
 		struct ft_remove_pub *pub,
 		struct ft_detach_run *run,
@@ -220,7 +218,6 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 				(struct cds_ft_inode_flag *) topmost_external_nodes;
 			CMM_STORE_SHARED(*g->deferred[idx].slot,
 				(struct cds_ft_inode_flag *) topmost_external_nodes);
-			*nr_clear = 0;
 			return 0;
 		}
 		/*
@@ -357,7 +354,6 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 				/* Peer won: nothing installed (txn consumed). */
 				return -EAGAIN;
 		}
-		*nr_clear = 0;
 		return 0;
 	}
 	{
@@ -2311,6 +2307,17 @@ int ft_detach_node(struct cds_ft *ft,
 	int ret, nr_metadata = 0, nr_clear = 0, nr_branch = 0;
 	uint8_t n = 0;
 	/*
+	 * THE ELEVATED CHAIN: what the climb prunes between the boundary and the
+	 * original detach target.  @nr_clear counts its KEYLESS single-child
+	 * links; @climb_promoted says whether the climb also emptied a KEYED
+	 * single-child junction and lifted its head into the boundary's slot.
+	 * That junction is unlinked by the very same publish, so it is an orphan
+	 * too, and @nr_elevated is the chain's full length -- the budget both
+	 * orphan walks below are bounded on.
+	 */
+	bool climb_promoted = false;
+	int nr_elevated;
+	/*
 	 * Pre-reserved commit flip-txn for the plain-branch key-removal commit
 	 * (in-place delete OR recompaction publish), reserved before
 	 * ft_node_replace_ptr's pre-flip side-effects (nr_child-- / eager child
@@ -2900,9 +2907,23 @@ int ft_detach_node(struct cds_ft *ft,
 		 * stops the climb at the next, surviving level).
 		 */
 		/* Resolve a parked splice proxy before republish (see above). */
-		if (metadata->external_nodes && !topmost_external_nodes)
+		if (metadata->external_nodes && !topmost_external_nodes) {
 			topmost_external_nodes = ft_dereference_external(
 				metadata->external_nodes);
+			/*
+			 * The junction the prune empties.  Its head takes its
+			 * place in the boundary's slot, so the node itself is
+			 * unlinked -- an orphan the walks below must budget for.
+			 * ☠ It is NOT in @nr_clear (that tally is for keyless
+			 * links), and a walk budgeted on @nr_clear alone stops one
+			 * node short.  The plain REMOVE hid that: its target-chain
+			 * walk picks up whatever the elevated budget left behind.
+			 * A MOVE-style detach runs no such walk, and leaked the last
+			 * link of every promote -- the junction under a compressed
+			 * boundary, the run under the junction otherwise.
+			 */
+			climb_promoted = topmost_external_nodes != NULL;
+		}
 		if (topmost_external_nodes)
 			prev_external_nodes_found = true;
 
@@ -2962,9 +2983,23 @@ int ft_detach_node(struct cds_ft *ft,
 				 * pointers at the same slot, breaking the replace which
 				 * assumes detach_node_flag_ptr is WITHIN
 				 * iter_node_flag's child array.
+				 *
+				 * ☠ A STALE PLAN, NOT A BOUNDARY.  The slot recovered
+				 * from @parent_nf's metadata lives in ITS parent's body;
+				 * the slot that holds @cur lives in @parent_nf's own.
+				 * They alias only when the chain this climb read is not
+				 * a tree any more -- a peer's relocation seen through
+				 * reclaimed memory.  Breaking here used to keep the
+				 * level's verdict (its @nr_clear tally, and now its
+				 * promote) while NOT elevating past it, so both orphan
+				 * walks would then reach one link too far: the detach
+				 * target itself, freed while live.  Nothing is built,
+				 * locked or reserved yet: re-descend, as every other
+				 * stale-plan bail in this climb does.
 				 */
-				if (new_parent_flag_ptr == detach_parent_flag_ptr)
-					break;
+				if (caa_unlikely(new_parent_flag_ptr ==
+						detach_parent_flag_ptr))
+					return -EAGAIN;
 				detach_node_flag_ptr = detach_parent_flag_ptr;
 				detach_parent_flag_ptr = new_parent_flag_ptr;
 				/*
@@ -3028,6 +3063,16 @@ int ft_detach_node(struct cds_ft *ft,
 	 */
 	if (caa_unlikely(elevated_old_child != plan_old_child))
 		return -EAGAIN;
+	/*
+	 * The elevated chain from @elevated_old_child down to (excluding) the
+	 * original target: the keyless links the climb counted, plus the keyed
+	 * junction it promoted past -- which always sits at the chain's TOP, the
+	 * climb stopping at the very next level (prev_external_nodes_found).
+	 * Both orphan walks below are budgeted on this, so a promote's junction
+	 * is retired with the rest whether the target's subtree is destroyed
+	 * (remove) or moved (rekey).
+	 */
+	nr_elevated = nr_clear + (climb_promoted ? 1 : 0);
 	/* Plan-snapshot the holder slot before any recompaction overwrite. */
 	holder_old_flag = iter_node_flag;
 
@@ -3048,6 +3093,12 @@ int ft_detach_node(struct cds_ft *ft,
 		struct cds_ft_inode_flag *to_free[FT_MAX_DEPTH];
 		int nr_to_free = 0, fi;
 		struct cds_ft_compressed_node *trailing_skip_cn = NULL;
+		/*
+		 * FOLD: ride the CALLER's commit (see the txn block below); it is
+		 * also what decides who FREES the orphan set, at the bottom.
+		 */
+		bool fold_replace = record_only && shared_txn &&
+				!fuse_cell && !run;
 
 		/*
 		 * Phase 2-style free walk for the orphaned chain below
@@ -3073,8 +3124,18 @@ int ft_detach_node(struct cds_ft *ft,
 		 * the target's external_nodes, tolerated by the phase2_first
 		 * special-case), so the set it builds is identical pre/post commit;
 		 * the actual free is deferred to after the commit.
+		 *
+		 * A MOVE-style detach (@free_detached_subtree false: the target's
+		 * subtree is re-attached elsewhere, not destroyed) still owns the
+		 * ELEVATED chain above the target -- the keyed junction whose head
+		 * the replace below promotes into cn->child, and any keyless link
+		 * under it.  Walk exactly @nr_elevated links for it and stop short
+		 * of the target; the plain remove walks on to the leaf.  A SKIP
+		 * word stops the move's walk (the body reads it as its child): the
+		 * elided run is the chain's last link, claimed by the trailing arm
+		 * below while the budget is unspent.
 		 */
-		if (free_detached_subtree) {
+		if (free_detached_subtree || nr_elevated > 0) {
 			struct cds_ft_inode_flag *walk_nf = elevated_old_child;
 			unsigned int walk_depth = ft_child_depth_of(ft,
 				iter_node_flag, cur_depth);
@@ -3082,7 +3143,10 @@ int ft_detach_node(struct cds_ft *ft,
 
 			while (walk_nf &&
 			       !ft_node_external(walk_nf) &&
-			       nr_to_free < FT_MAX_DEPTH) {
+			       nr_to_free < FT_MAX_DEPTH &&
+			       (free_detached_subtree ||
+				(nr_to_free < nr_elevated &&
+				 !ft_node_skip_compressed(walk_nf)))) {
 				struct cds_ft_inode_flag *next = NULL;
 				unsigned int nr_child;
 				struct cds_ft_node *ext_nodes;
@@ -3209,9 +3273,14 @@ int ft_detach_node(struct cds_ft *ft,
 			 * external leaf at the chain end keeps its path bytes in a
 			 * separate, now-orphaned skip-target compressed node that the
 			 * walk stops short of.  Free it (the external leaf stays
-			 * caller-owned).
+			 * caller-owned).  For a MOVE the skip-target is an orphan
+			 * only while the elevated budget is unspent: at the budget
+			 * the skip word encodes the target's own run, which moves
+			 * with it.
 			 */
-			if (walk_nf && ft_node_skip_compressed(walk_nf)) {
+			if (walk_nf && ft_node_skip_compressed(walk_nf) &&
+					(free_detached_subtree ||
+					 nr_to_free < nr_elevated)) {
 				trailing_skip_cn =
 					ft_skip_to_compressed(ft, walk_nf);
 				if (ft->lock_fine) {
@@ -3281,9 +3350,6 @@ int ft_detach_node(struct cds_ft *ft,
 			 * run: ft_remove_commit_rec's record-only arm asserts
 			 * !run && !dead_cell.
 			 */
-			bool fold_replace = record_only && shared_txn &&
-					!fuse_cell && !run;
-
 			struct ft_flip_txn *orphan_txn = fold_replace ? shared_txn :
 				ft_flip_txn_create_bounded(ft,
 					FT_REMOVE_COMMIT_REC_MAX_EDGES
@@ -3298,6 +3364,19 @@ int ft_detach_node(struct cds_ft *ft,
 				ret = -ENOMEM;
 				goto end;
 			}
+			/*
+			 * PUBLISH THE WALK'S MARKS BEFORE THE FREEZE READS THEM.
+			 * An orphan whose anchor is its OWN word is never registered
+			 * in the txn (its fused tombstone is the terminal, see
+			 * ft_detach_freeze_one), so the record's ownership witness
+			 * is the held set -- and the walk above left @nr_extra one
+			 * short of the last acquire.  Under a per-op-armed CALLER's
+			 * txn (the fold) an unwitnessed tombstone is an abort at the
+			 * record; the plain-parent branch publishes before its
+			 * freeze for the same reason.
+			 */
+			lctx.held.txn = orphan_txn;
+			lctx.held.nr_extra = (unsigned int) nr_orphan_locked;
 			for (fi = 0; fi < nr_to_free; fi++) {
 				struct cds_ft_metadata *m = cds_ft_item_to_metadata(
 					ft_node_compressed(to_free[fi])
@@ -3342,7 +3421,7 @@ int ft_detach_node(struct cds_ft *ft,
 				iter_node_flag, cur_depth, &lctx,
 				detach_parent_flag_ptr,
 				topmost_external_nodes, elevated_old_child,
-				&nr_clear, fuse_cell,
+				fuse_cell,
 				pub, run, orphan_txn, fold_replace,
 				count_delta);
 			if (ret) {
@@ -3356,8 +3435,32 @@ int ft_detach_node(struct cds_ft *ft,
 				goto end;
 			}
 		}
-		/* Orphan chain unlinked: free the set collected above. */
-		if (free_detached_subtree) {
+		/*
+		 * Orphan chain unlinked: free the set collected above -- unless
+		 * this detach committed NOTHING (the FOLD), in which case the chain
+		 * is still live and linked and the CALLER's commit is the unlink.
+		 * Hand it out with the retired copy's lifetime then, exactly as the
+		 * plain-parent branch does: the caller reclaims it after its commit
+		 * lands and leaves it alone when that commit aborts.  The trailing
+		 * skip-target goes out as its PLAIN compressed flag, decoded above
+		 * under the plan -- a post-commit one-hop decode of the skip word
+		 * would run through a back-pointer this very commit re-points (the
+		 * promoted head's).
+		 */
+		if (fold_replace) {
+			if (recompact_out) {
+				for (fi = 0; fi < nr_to_free; fi++)
+					recompact_out->orphans[fi] = to_free[fi];
+				recompact_out->nr_orphans = nr_to_free;
+				if (trailing_skip_cn &&
+						recompact_out->nr_orphans <
+							FT_MAX_DEPTH)
+					recompact_out->orphans[
+						recompact_out->nr_orphans++] =
+						ft_compressed_node_flag(
+							trailing_skip_cn);
+			}
+		} else {
 			if (trailing_skip_cn)
 				free_compressed_node(ft, trailing_skip_cn);
 			for (fi = 0; fi < nr_to_free; fi++) {
@@ -3396,9 +3499,10 @@ int ft_detach_node(struct cds_ft *ft,
 		 *
 		 * Free walk semantics:
 		 *
-		 *   Phase 1 -- elevated ancestors (always single-child no-external
-		 *   by the upward walk's own invariant).  Free @nr_clear nodes
-		 *   unconditionally.
+		 *   Phase 1 -- elevated ancestors (single-child by the upward
+		 *   walk's own invariant: keyless, or the ONE keyed junction the
+		 *   climb promoted past, at the chain's top).  Free @nr_elevated
+		 *   nodes unconditionally.
 		 *
 		 *   Phase 2 -- target and chain below.  For destroy-style detach,
 		 *   walk the target's single-child no-external chain (descent
@@ -3481,7 +3585,7 @@ int ft_detach_node(struct cds_ft *ft,
 			 * comment names ("a skip word's low tag bits are 0, so the
 			 * external and internal predicates both read it wrong").
 			 */
-			while (nr_to_free < nr_clear &&
+			while (nr_to_free < nr_elevated &&
 			       walk_nf &&
 			       (ft_node_skip_compressed(walk_nf) ||
 				!ft_node_external(walk_nf)) &&
@@ -3579,6 +3683,23 @@ int ft_detach_node(struct cds_ft *ft,
 						&wlctx, walk_nf, walk_depth, ometa,
 						require_sc, orphan_held,
 						&nr_orphan_locked)) {
+					ret = -EAGAIN;
+					goto end;
+				}
+				/*
+				 * A HEAD ON A CHAIN LINK THAT ARRIVED AFTER THE PLAN.
+				 * The keyless links carry none, and the chain's top may
+				 * carry exactly the one the climb lifted off it (the
+				 * promoted junction).  Anything else is a peer's park,
+				 * and retiring the link would take that key with it --
+				 * the refusal phase 2 makes on its first orphan, read
+				 * here under the mark taken just above (the plan-lock
+				 * validates the child count alone).
+				 */
+				if (ometa->external_nodes &&
+						(nr_to_free != 0 ||
+						 ometa->external_nodes !=
+							topmost_external_nodes)) {
 					ret = -EAGAIN;
 					goto end;
 				}

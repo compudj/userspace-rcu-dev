@@ -11860,17 +11860,19 @@ static const struct {
 	{ { "abcac", "aabab", "acbb", "c" }, "c", "acbb", 1 },
 	/* 1931: the junction is two levels down; only the -count walk reaches
 	 * the root, and a copy taken before it would carry the stale count.
-	 * ☐ REFUSED for now: the detach PROMOTES the junction's head into the
-	 * run above it and reclaims neither (one node leaked per served move);
-	 * the arm refuses that geometry until the detach's reclaim exists. */
-	{ { "b", "c", "cba", "caaa", "a", "ba", "caa" }, "a", "caaa", 0 },
+	 * The detach PROMOTES the junction's head into the run above it and
+	 * hands the emptied junction out as an orphan (the compressed-parent
+	 * branch's fold hand-off) -- served, and the drain balances. */
+	{ { "b", "c", "cba", "caaa", "a", "ba", "caa" }, "a", "caaa", 1 },
 	/* 2031: the junction collapses into a run over its last head, whose
 	 * skip word is stored into a root slot (a fresh run under the copy) */
 	{ { "acbba", "baacba", "bbbabb", "c", "aa", "bcacc" }, "c", "aa", 2 },
-	/* 1999: the dst head hangs off a run that hangs off the root.
-	 * ☐ REFUSED for now, as 1931: the src head's junction is left keyed
-	 * and childless, its head promoted into a root slot. */
-	{ { "ac", "c", "bcabbb", "ccc", "babcac" }, "ac", "ccc", 0 },
+	/* 1999: the dst head hangs off a run that hangs off the root.  The
+	 * src head's junction is left keyed and childless, its head promoted
+	 * into a root slot; the junction AND the run it hung the head off are
+	 * the elevated chain the detach now budgets (@nr_elevated) and hands
+	 * out -- served, and the drain balances. */
+	{ { "ac", "c", "bcabbb", "ccc", "babcac" }, "ac", "ccc", 1 },
 	/* 2520 */
 	{ { "cc", "aaba", "bbca", "abcccb", "ac", "abcbaa" }, "cc", "aaba", 1 },
 	/* 1539: a pass-through frame BELOW the root */

@@ -7058,25 +7058,35 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 			glue.publish_parent = d_dst.pnf;
 			glue.publish_slot = d_dst.nfp;
 			glue.top = merged_pub;
-		} else if ((pub.armed && pub.new_val) ||
-				(!pub.armed && !detach_rc.new_flag &&
-				 !detach_rc.collapse.new_cn &&
-				 !detach_rc.collapse.boundary &&
-				 !detach_rc.nr_orphans &&
-				 !detach_rc.orphan_trailing)) {
+		} else if (!pub.armed && !detach_rc.new_flag &&
+				!detach_rc.collapse.new_cn &&
+				!detach_rc.collapse.boundary &&
+				!detach_rc.nr_orphans &&
+				!detach_rc.orphan_trailing) {
 			/*
-			 * ☐ THE DETACH PROMOTED A HEAD -- its junction was left
-			 * keyed and childless, so the head took the junction's
-			 * place: the @pub record carries the promoted head, or, into
-			 * a run's child slot, nothing is reported at all.  On that
-			 * arm the record-only detach hands NEITHER the retired
-			 * junction NOR the emptied run above the moved head to
-			 * @detach_rc, and nothing else frees them: MEASURED with the
-			 * drain oracle, one node leaked per served move (corpus
-			 * seeds 1931 and 1999), the same gap behind the 135-seed
-			 * residual population the other arms already carry.  Refuse
-			 * -- a clean refusal, the trie byte-identical -- until that
-			 * reclaim exists; the unwind is the post-detach refusal's.
+			 * A detach that reports NOTHING -- no publish, no copy, no
+			 * collapse, no orphan -- is one the copy below cannot
+			 * reason about: it re-parents on what the descriptor says
+			 * the detach did.  Refuse cleanly (the trie byte-identical;
+			 * the unwind is the post-detach refusal's).  Believed
+			 * unreachable now -- every detach outcome reports one of the
+			 * four -- and kept as a guard rather than an assert.
+			 *
+			 * ☑ THE PROMOTE ARM WAS REFUSED HERE TOO: a keyed junction
+			 * left childless, its head lifted into the frame's slot (the
+			 * @pub record) or into a run's child slot (nothing reported).
+			 * The record-only detach handed NEITHER the retired junction
+			 * NOR the emptied run above the moved head to @detach_rc --
+			 * one node leaked per served move, the mechanism behind the
+			 * drain oracle's residual population.  The detach now
+			 * budgets the promoted junction into its elevated chain
+			 * (ft-remove.h, @nr_elevated) and hands that chain out under
+			 * the fold on BOTH parent shapes, so a promote reports its
+			 * orphans and takes the copy below like every other
+			 * outcome: the promoted head chains by its back-channel
+			 * record (ft_rekey_cow_reparent_child's external arm), and
+			 * the junction and run are reclaimed post-commit by
+			 * ft_rekey_detach_free_orphans.
 			 */
 			if (detach_rc.new_flag)
 				free_cds_ft_node_unpublished(ft,
