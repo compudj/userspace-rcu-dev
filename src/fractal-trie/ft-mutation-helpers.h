@@ -2273,8 +2273,53 @@ bool ft_flip_txn_reserve_extra(struct ft_flip_txn *t, unsigned int extra)
 {
 	unsigned int nr = (t->mtxn->desc && t->mtxn->desc != URCU_TXN_ENOMEM) ?
 			t->mtxn->desc->nr : 0;
-	unsigned int cur = t->mtxn->min_alloc > nr ? t->mtxn->min_alloc : nr;
+	/*
+	 * ☠ WIDEN FROM WHAT THIS ATTEMPT OWES, AND @reserved IS WHAT SAYS SO.
+	 * @min_alloc lives on the OP handle, which outlives an attempt, and the
+	 * engine resets it only AT A COMMIT (urcu_txn_commit: min_alloc = m->nr,
+	 * on the abort path too).  An op that bails PRE-COMMIT therefore carries
+	 * the previous attempt's FLOOR into the next one, and widening from it
+	 * adds @extra again every attempt, without bound.
+	 *
+	 * MEASURED before this line existed, on ft_unit
+	 * test_rekey_compressed_bp_atomic_or_refused at exponential spacing: the
+	 * floor climbed 70,968 -> 95,917,368 over 5.5M calls in 60 s, with
+	 * min_alloc == cur every time and nr only 0..3 -- nothing was ever
+	 * committed, so nothing ever reset it.  At ~1.6M records/s it reaches
+	 * 2^31 in about 22 minutes, and the op then spends its life zeroing and
+	 * munmapping gigabytes: it READS AS A HANG, not as a failure, which is
+	 * why this wedged the suite above per-node spacing rather than failing it.
+	 *
+	 * @t is created PER ATTEMPT (ft_flip_txn_create_on) while @mtxn is the
+	 * op's, so @t->reserved is exactly "this attempt has already promised
+	 * something": true => honour that promise (the bounded creates and an
+	 * earlier widen set it); false => the only thing owed is what this
+	 * attempt has already RECORDED.  A floor from an attempt that bailed is
+	 * owed to nobody.
+	 */
+	unsigned int cur = t->reserved &&
+			t->mtxn->min_alloc > nr ? t->mtxn->min_alloc : nr;
 
+#ifdef FT_DEBUG_RESERVE_RATCHET
+	{
+		/*
+		 * THE RATCHET PROBE.  @cur is taken from @min_alloc, which the
+		 * engine resets only at a COMMIT -- so an op that bails
+		 * PRE-COMMIT and retries adds @extra on top of the PREVIOUS
+		 * attempt's floor, every attempt, without bound.  Print the
+		 * floor as it climbs: a monotone @cur across attempts of one op
+		 * is the ratchet, and a flat one is not.
+		 */
+		static unsigned long n_calls;
+		unsigned long c = uatomic_add_return(&n_calls, 1);
+
+		if ((c & 0xfff) == 0)
+			fprintf(stderr,
+				"FT RESERVE-EXTRA call=%lu cur=%u extra=%u -> %u (min_alloc=%u nr=%u)\n",
+				c, cur, extra, cur + extra,
+				t->mtxn->min_alloc, nr);
+	}
+#endif
 	return ft_flip_txn_reserve(t, cur + extra);
 }
 
@@ -4296,6 +4341,31 @@ enum urcu_txn_status ft_flip_txn_commit(struct cds_ft *ft,
 	 */
 	urcu_txn_desc_set_late_tag(t->mtxn->desc, FT_STATE_PROXY);
 	if (caa_unlikely(t->acquire_miss)) {
+#ifdef FT_DEBUG_RESERVE_RATCHET
+		{
+			/*
+			 * WHICH BAIL IS A LIVELOCK?  With the ratchet gone the
+			 * attempts are cheap, so a non-convergence underneath one
+			 * is finally countable: this separates "the commit was
+			 * discarded because a lock-set member was not acquired"
+			 * from every other abort.
+			 *
+			 * ☞ ITS FIRST USE WAS AN EXCLUSION, which is what a counter
+			 * like this is for: the exponential-spacing rekey livelock
+			 * the ratchet had been masking reads ZERO here over 25M
+			 * attempts, so whatever refuses that op, it is not an
+			 * acquire the commit declined to make.  (It is a tombstone
+			 * the op itself wrote pre-commit, found elsewhere.)  Do not
+			 * re-add a mechanism guess to this comment: the counter
+			 * discriminates, it does not explain.
+			 */
+			static unsigned long n_miss;
+			unsigned long c = uatomic_add_return(&n_miss, 1);
+
+			if ((c & 0xffff) == 0)
+				fprintf(stderr, "FT COMMIT-ACQUIRE-MISS %lu\n", c);
+		}
+#endif
 		/*
 		 * A lock-set member was not acquired, so this attempt writes a
 		 * slot it does not own: discard it unpublished and report the
