@@ -3923,8 +3923,7 @@ static int inv_rekey_graft_coherent_readers(void)
  *        a junction of its own -- the shape the corpus serves, with the one
  *        property the others share: the mover is a SKIP TARGET that the
  *        splice turns into a non-head chain member.
- * RKSP_FLAVOURS (env, bitmask) selects the flavours run; the default is 0x13
- * (0, 1 and 4) -- see the note at the mask.
+ * RKSP_FLAVOURS (env, bitmask) selects the flavours run; the default is all.
  * Junctions are writer-private, so the only
  * peers of a move are the readers: a refusal here is a finding, not
  * contention, and is fatal.
@@ -4286,16 +4285,14 @@ static void rksp_child(void)
 		w[i].bp = (uint8_t) (i + 1);
 		rcu_read_lock();
 		/*
-		 * Flavours 2 and 3 (through a run, same parent) need the merge
-		 * arm's through-a-run frame; until it lands they are opt-in via
-		 * RKSP_FLAVOURS.  Flavour 4 is the reproducer of the reader
-		 * re-anchor defect (a stale skip word into a spliced chain member)
-		 * and runs by default now that the reader hops to the head; the
-		 * positive control below proves the hop branch ran.
+		 * All five by default.  Flavour 4 is the reproducer of the reader
+		 * re-anchor defect (a stale skip word into a spliced chain member);
+		 * 2, 3 and 4 all make the mover a skip target, and the positive
+		 * control below proves a reader's hop branch ran.
 		 */
 		w[i].flavours = getenv("RKSP_FLAVOURS") ?
 			(unsigned int) strtoul(getenv("RKSP_FLAVOURS"), NULL, 0) :
-			0x13u;
+			(1u << RKSP_NF) - 1;
 		for (f = 0; f < 3; f++) {
 			uint64_t sk = f < 2 ? rksp_key(w[i].bp, 0, f ? 5 : 1) :
 				(((uint64_t) w[i].bp << 24) | (5ULL << 16) |

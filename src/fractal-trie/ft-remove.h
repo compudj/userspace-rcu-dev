@@ -1591,8 +1591,18 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		 * trie, not of this writer.  Only the absorbing shape takes this
 		 * exit; an ordinary over-long merge still falls back, because for
 		 * it the fallback IS a legal product.
+		 *
+		 * ☠ AND THE DEEP FOLD TAKES THE SAME EXIT, for the same reason.  It
+		 * was left on the fallback because its live-top case was
+		 * unreachable; the through-a-run merge arm made it reachable
+		 * ({ab, a+128*'c'}, dst the long key, src "ab": the src junction
+		 * collapses into the dst run, the merged run cannot be spelled),
+		 * and the fallback then published the one-child internal, with
+		 * the caller's subsumption reporting a fold that never happened.
+		 * MEASURED: verify RED at 128 bytes, clean at 127; refused clean
+		 * with this line.
 		 */
-		if (pending_cn)
+		if (pending_cn || deep_fold)
 			return -EDOM;
 		/* Merge does not apply: caller falls back (fences cleared). */
 		if (!record_only)

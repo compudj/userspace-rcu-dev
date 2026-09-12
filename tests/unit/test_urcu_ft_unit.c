@@ -11773,8 +11773,9 @@ static enum cds_ft_status ft_rekey(struct cds_ft *ft, const char *nw,
  * dst = keys[1], src = keys[0].  @serve: the tree SERVES this shape today, so
  * a refusal is a regression (the same-parent splice is witnessed by the src
  * detach's own relocation of the shared parent -- see
- * FT_REKEY_WITNESS_BY_DETACH in ft-rekey.h); 0 = served or refused, either
- * is fine, only a wrong answer or a hang is not.  ☞ If the in-place internal
+ * FT_REKEY_WITNESS_BY_DETACH in ft-rekey.h); 2 = served where compression is
+ * compiled in; 0 = served or refused, either is fine, only a wrong answer or
+ * a hang is not.  ☞ If the in-place internal
  * mutation tier ever returns, that arm refuses BY DESIGN and these rows must
  * be re-gated, not deleted.
  */
@@ -11793,6 +11794,31 @@ static const struct {
 	{ { "xab", "xac", "xq" }, 1 },		/* the grandparent keeps a sibling */
 	{ { "b", "c" }, 0 },			/* the shared parent is the ROOT */
 	{ { "axy", "ac", "axz" }, 0 },		/* the src passes THROUGH the dst parent */
+	/*
+	 * THROUGH A RUN: the dst head has no sibling at its last byte, so it
+	 * hangs off a run, and the node that moves is the run's PARENT.  The
+	 * detach either collapses that parent into the run (the deep fold) or,
+	 * when it keeps other children, DEL-recompacts it, which subsumes the
+	 * publish (the slot sits in the untouched run below).
+	 */
+	{ { "ab",  "acc" }, 1 },		/* collapse: parent left with the run only */
+	{ { "abb", "acc" }, 1 },		/* src under a run of its own, too */
+	{ { "ab",  "acc", "azz" }, 1 },		/* DEL recompaction: the parent keeps a child */
+	{ { "abb", "acc", "az" }, 1 },
+	{ { "xab", "xacc" }, 1 },		/* one level down */
+	{ { "xb",  "xacc", "xq" }, 1 },
+	{ { "abb", "accd" }, 1 },		/* a longer run under the shared parent */
+	/*
+	 * The SRC under a run of its own, the dst at the parent: served
+	 * because the src's nearest PLAIN ancestor is the shared parent.  With
+	 * compression compiled out there is no run -- the src hangs off
+	 * one-child plain internals, its junction is below the shared parent,
+	 * and the source-path term refuses it -- so these rows are pinned
+	 * served only where compression is compiled in (@serve == 2).
+	 */
+	{ { "acc", "ab" }, 2 },
+	{ { "acc", "ab", "az" }, 2 },
+	{ { "b",   "acc" }, 0 },		/* the run hangs off the ROOT */
 };
 
 static int same_path_one(struct cds_ft *ft, const char *const *keys,
@@ -11813,6 +11839,8 @@ static int same_path_one(struct cds_ft *ft, const char *const *keys,
 			cds_ft_status_to_string(s));
 		return -1;
 	}
+	if (serve == 2)
+		serve = _cds_ft_debug_compress_enabled();
 	if (serve && s != CDS_FT_STATUS_OK) {
 		fprintf(stderr, "same_path(dst %s src %s): REFUSED (%s) a "
 			"same-parent splice the tree serves\n", dst, src,

@@ -1998,15 +1998,59 @@ int ft_rekey_merge_cow_publish_parent(struct cds_ft *ft,
 		const uint8_t *src_ord, size_t src_len, const uint8_t *dst_ord,
 		struct cds_ft_inode_flag *src_pnf,
 		struct ft_held_anchor *marks, unsigned int *nr_marks,
-		struct cds_ft_inode_flag **pp_prime_ret)
+		struct cds_ft_inode_flag **pp_prime_ret,
+		struct cds_ft_inode **pp_old_ret)
 {
 	struct ft_lock_ctx gctx, cctx;
 	struct ft_held_anchor gph;
 	struct cds_ft_metadata *gp_meta, *pp_meta;
 	struct cds_ft_inode_flag *pp_prime = NULL;
+	/*
+	 * THE FRAME THAT MOVES: the node this arm COWs (@cow_nf, at
+	 * @cow_depth), the parent it is republished into (@cow_pnf, at
+	 * @cow_pdepth) and the slot there (@cow_slot).  See the selection below.
+	 */
+	struct cds_ft_inode_flag *cow_nf, *cow_pnf, **cow_slot;
+	unsigned int cow_depth, cow_pdepth;
+	bool via_run;
 	int ret;
 
 	if (!d_dst->pnf || !d_dst->nfp || !d_dst->pnfp)
+		return FT_REKEY_UNCOVERED;
+	/*
+	 * ☞ THE NODE THAT MOVES IS THE NEAREST PLAIN ANCESTOR OF THE ATTACH
+	 * SLOT, not necessarily the slot's owner.  The reader's two-descent
+	 * witness (struct ft_visit_witness) hashes the PLAIN nodes a descent
+	 * enters; a compressed run is skipped over by its SKIP_X word and never
+	 * visited (and in no-skip mode a fresh run alone would still leave every
+	 * visited node where it was), so relocating the run gives a reader
+	 * nothing to notice.  A leaf with no sibling at its last byte hangs off
+	 * exactly such a run -- the ordinary shape, 4 of the 10 shapes the
+	 * corpus still refused here -- and for it the COW goes ONE LEVEL UP:
+	 * the run's parent, republished into ITS parent's slot.  The run is then
+	 * an ordinary child of the copied node, and its re-parent (parent word
+	 * plus skip anchor) is the same kind-dispatched record every other
+	 * child takes in ft_rekey_cow_stop's sweep.  Everything below is written
+	 * against this frame, never against @pnf directly.
+	 */
+	via_run = ft_node_compressed(d_dst->pnf);
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+	via_run = via_run || ft_node_skip_compressed(d_dst->pnf);
+#endif
+	if (via_run) {
+		cow_nf = d_dst->ppnf;
+		cow_depth = d_dst->ppdepth;
+		cow_pnf = d_dst->pppnf;
+		cow_slot = d_dst->ppnfp;
+		cow_pdepth = d_dst->pppdepth;
+	} else {
+		cow_nf = d_dst->pnf;
+		cow_depth = d_dst->pdepth;
+		cow_pnf = d_dst->ppnf;
+		cow_slot = d_dst->pnfp;
+		cow_pdepth = d_dst->ppdepth;
+	}
+	if (!cow_nf || !cow_slot)
 		return FT_REKEY_UNCOVERED;
 	/*
 	 * ☐ A ROOT PUBLISH PARENT IS REFUSED, AND THE OBVIOUS REASON IS NOT THE
@@ -2027,7 +2071,7 @@ int ft_rekey_merge_cow_publish_parent(struct cds_ft *ft,
 	 * i.e. the copy's skip-encoded children are not fully re-anchored.  That
 	 * is a second mechanism, not a corner of this one.
 	 */
-	if (!d_dst->ppnf)
+	if (!cow_pnf)
 		return FT_REKEY_UNCOVERED;
 	/*
 	 * ☠ THE COPY IS VERBATIM, so the attach slot must ALREADY hold what the
@@ -2065,8 +2109,8 @@ int ft_rekey_merge_cow_publish_parent(struct cds_ft *ft,
 	 * grandparent is already handled -- ft_glue_set_publish announces the
 	 * pending publish so that copy carries it (@pending_pub_slot).
 	 */
-	if ((size_t) d_dst->pdepth <= src_len &&
-			!memcmp(src_ord, dst_ord, (size_t) d_dst->pdepth)) {
+	if ((size_t) cow_depth <= src_len &&
+			!memcmp(src_ord, dst_ord, (size_t) cow_depth)) {
 		/*
 		 * ☑ THE SAME-PARENT SPLICE IS SERVED BY THE DETACH, NOT BY A COW.
 		 * When the src junction IS @pnf (last-byte move: {ab, ac},
@@ -2101,7 +2145,7 @@ int ft_rekey_merge_cow_publish_parent(struct cds_ft *ft,
 		 * superseded child while the detach's store landed in the retired
 		 * copy.  Off-corpus today (0 of 3000 shapes reach it).
 		 */
-		if (src_pnf != d_dst->pnf || ft_in_place_ok(ft))
+		if (src_pnf != cow_nf || ft_in_place_ok(ft))
 			return FT_REKEY_UNCOVERED;
 		/*
 		 * ☞ WHAT THIS ARM ADMITS, STATED RATHER THAN INHERITED.  It returns
@@ -2125,32 +2169,37 @@ int ft_rekey_merge_cow_publish_parent(struct cds_ft *ft,
 		 */
 		if (!ft_node_external(merged_pub))
 			return FT_REKEY_UNCOVERED;
-		if (ft_node_external(d_dst->pnf) ||
-				ft_node_compressed(d_dst->pnf))
+		if (ft_node_external(cow_nf) || ft_node_compressed(cow_nf))
 			return FT_REKEY_UNCOVERED;
 #ifdef FEATURE_FT_SKIP_COMPRESSED
-		if (ft_node_skip_compressed(d_dst->pnf))
+		if (ft_node_skip_compressed(cow_nf))
 			return FT_REKEY_UNCOVERED;
 #endif
+		/*
+		 * Through a run, the src detach COLLAPSES the shared ancestor
+		 * into the run and the pending publish -- armed at the run's
+		 * child slot -- is the DEEP fold (ft_chain_compress_deep_pending),
+		 * whose live-top identity test is the one @pending_top_live
+		 * already carries for it.
+		 */
 		return FT_REKEY_WITNESS_BY_DETACH;
 	}
-	if (ft_node_external(d_dst->pnf) || ft_node_compressed(d_dst->pnf))
+	if (ft_node_external(cow_nf) || ft_node_compressed(cow_nf))
 		return FT_REKEY_UNCOVERED;
 #ifdef FEATURE_FT_SKIP_COMPRESSED
-	if (ft_node_skip_compressed(d_dst->pnf) ||
-			ft_node_skip_compressed(d_dst->ppnf))
+	if (ft_node_skip_compressed(cow_nf) || ft_node_skip_compressed(cow_pnf))
 		return FT_REKEY_UNCOVERED;
 #endif
-	if (ft_node_compressed(d_dst->ppnf) || ft_node_external(d_dst->ppnf))
+	if (ft_node_compressed(cow_pnf) || ft_node_external(cow_pnf))
 		return FT_REKEY_UNCOVERED;
 	{
-		unsigned int pti = ft_node_type(d_dst->pnf);
+		unsigned int pti = ft_node_type(cow_nf);
 
 		if (ft_types[pti].type_class != FT_POPCOUNT &&
 				ft_types[pti].type_class != FT_PIGEON)
 			return FT_REKEY_UNCOVERED;
 	}
-	pp_meta = ft_flag_to_metadata(ft, d_dst->pnf);
+	pp_meta = ft_flag_to_metadata(ft, cow_nf);
 	if (!pp_meta)
 		return -EAGAIN;
 	/*
@@ -2205,19 +2254,18 @@ int ft_rekey_merge_cow_publish_parent(struct cds_ft *ft,
 	 * @ppnf onto ONE word would otherwise read the op's OWN fence as
 	 * contention and re-derive the identical plan forever.
 	 */
-	gp_meta = ft_flag_to_metadata(ft, d_dst->ppnf);
+	gp_meta = ft_flag_to_metadata(ft, cow_pnf);
 	if (!gp_meta)
 		return -EAGAIN;
 	ft_lock_ctx_init(&gctx, d_dst, txn, optxn);
 	gctx.held.glue = glue;
-	if (ft_acquire_member(ft, &gctx, d_dst->ppnf, gp_meta, d_dst->ppdepth,
-			&gph))
+	if (ft_acquire_member(ft, &gctx, cow_pnf, gp_meta, cow_pdepth, &gph))
 		return -EAGAIN;
 	ft_glue_take_publish_parent(glue, gph.lock, gph.lock_snap, gph.shared);
 
 	ft_lock_ctx_init(&cctx, d_dst, txn, optxn);
 	cctx.held.glue = glue;
-	ret = ft_rekey_cow_stop(ft, &cctx, txn, d_dst->pnf, d_dst->pdepth,
+	ret = ft_rekey_cow_stop(ft, &cctx, txn, cow_nf, cow_depth,
 			/*cut=*/ 0, &pp_prime, marks, nr_marks);
 	if (ret)
 		return ret;
@@ -2244,7 +2292,7 @@ int ft_rekey_merge_cow_publish_parent(struct cds_ft *ft,
 	 * external head's back edge onto the copy along with every other child's,
 	 * so the attach point needs no publish of its own.
 	 */
-	ft_glue_set_publish(ft, glue, d_dst->ppnf, d_dst->pnfp, pp_prime);
+	ft_glue_set_publish(ft, glue, cow_pnf, cow_slot, pp_prime);
 	/*
 	 * ☠ AND THE COUNT DELTA MUST BE BAKED INTO THE COPY, because the walk no
 	 * longer reaches it.  @glue->count_delta is charged from the publish
@@ -2273,6 +2321,12 @@ int ft_rekey_merge_cow_publish_parent(struct cds_ft *ft,
 	 * the copy's re-parents landed on children the old node still holds.
 	 */
 	*pp_prime_ret = pp_prime;
+	/*
+	 * The ORIGINAL, for the caller's post-commit free (cow_stop's contract).
+	 * ft_node_ptr is right only because the frame above admits a plain
+	 * POPCOUNT/PIGEON node and nothing else.
+	 */
+	*pp_old_ret = ft_node_ptr(cow_nf);
 	return 0;
 }
 
@@ -2296,6 +2350,13 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 * detach must then have FOLDED the pending publish, or no witness exists.
 	 */
 	bool witness_by_detach = false;
+	/*
+	 * ...and the frame that arm chose was the run's PARENT (the head hangs
+	 * off a run): the pending publish then sits in the run, one level below
+	 * the node the detach relocates, so a DEL recompaction of that node
+	 * cannot fold it -- see the subsumption at detach_bail.
+	 */
+	bool witness_via_run = false;
 	struct ft_flip_txn *txn;
 	struct ft_glue glue;
 	struct ft_graft_store_state gst_st = { 0 };	/* GLUE never runs prepare */
@@ -4157,10 +4218,24 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 			 * fails SAFE: an in-place ft_merge_build handing back a
 			 * mutated D answers "not fresh" MORE often, never less.
 			 */
+			/*
+			 * The src's nearest PLAIN ancestor, for the same-parent test:
+			 * a src leaf with no sibling at its last byte hangs off a run
+			 * of its own, and the node the detach relocates is that run's
+			 * parent, not the run.
+			 */
+			struct cds_ft_inode_flag *src_plain = d_src.pnf;
+
+			if (src_plain && (ft_node_compressed(src_plain)
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+					|| ft_node_skip_compressed(src_plain)
+#endif
+					))
+				src_plain = d_src.ppnf;
 			ret = ft_rekey_merge_cow_publish_parent(ft, &d_dst, txn,
 					optxn, &glue, merged_pub, src_ord,
-					src_len, dst_ord, d_src.pnf, marks,
-					&nr_marks, &dst_pp_prime);
+					src_len, dst_ord, src_plain, marks,
+					&nr_marks, &dst_pp_prime, &dst_pp_old);
 			if (ret == FT_REKEY_WITNESS_BY_DETACH) {
 				/*
 				 * SAME-PARENT SPLICE: the src detach relocates
@@ -4173,31 +4248,28 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 				ft_glue_set_publish(ft, &glue, d_dst.pnf, d_dst.nfp,
 					merged_pub);
 				witness_by_detach = true;
+				witness_via_run = ft_node_compressed(d_dst.pnf)
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+					|| ft_node_skip_compressed(d_dst.pnf)
+#endif
+					;
 				ret = 0;
 			} else if (ret) {
 				goto bail_build;
-			} else if (dst_pp_prime) {
-				/*
-				 * ☠ THE COPY'S ORIGINAL HAS NO OTHER OWNER.  cow_stop's
-				 * contract: "the caller ... frees the OLD @stop via
-				 * call_rcu after the grace period once the commit
-				 * succeeds".  The src lane does that for its S_top
-				 * (cds_ft_free_item_deferred(s_top_meta) below); this
-				 * lane never did for @d_dst.pnf -- MEASURED with the
-				 * drain oracle: every move served by this arm leaked
-				 * exactly one internal node (4 of 4 corpus seeds, the
-				 * non-drain balance's floor having hidden it).  Named
-				 * here, freed in the post-commit reclaim block.
-				 *
-				 * ft_node_ptr is right ONLY because the helper admits a
-				 * plain POPCOUNT/PIGEON parent and nothing else; widen
-				 * that arm to a compressed or skip-encoded parent and
-				 * this line would decode the wrong body.  Pinned.
-				 */
-				urcu_assert_debug(!ft_node_external(d_dst.pnf) &&
-					!ft_node_compressed(d_dst.pnf));
-				dst_pp_old = ft_node_ptr(d_dst.pnf);
 			}
+			/*
+			 * ☠ THE COPY'S ORIGINAL HAS NO OTHER OWNER.  cow_stop's
+			 * contract: "the caller ... frees the OLD @stop via call_rcu
+			 * after the grace period once the commit succeeds".  The src
+			 * lane does that for its S_top (cds_ft_free_item_deferred
+			 * (s_top_meta) below); this lane never did for the node it
+			 * copied -- MEASURED with the drain oracle: every move served
+			 * by this arm leaked exactly one internal node (4 of 4 corpus
+			 * seeds, the non-drain balance's floor having hidden it).  The
+			 * helper names it (@dst_pp_old: the frame it chose, which is
+			 * the run's parent when the head hangs off a run); it is freed
+			 * in the post-commit reclaim block.
+			 */
 		} else {
 		/*
 		 * The merged top replaces D in the publish parent's slot.  Recorded, not
@@ -6288,6 +6360,37 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 * red control above: one node leaked per shape until this mirrored the
 	 * glue-commit-refused path below, which reclaims exactly these two.
 	 */
+	/*
+	 * THROUGH A RUN, A RECOMPACTION OF THE SHARED ANCESTOR SUBSUMES THE
+	 * PUBLISH.  The pending publish is armed at the RUN's child slot, one
+	 * level below the node the detach relocates.  When that node collapses
+	 * into the run, the DEEP fold reports it.  When it keeps other children
+	 * it is DEL-recompacted instead: a fresh copy (@detach_rc.new_flag) that
+	 * carries the run's word verbatim, the run itself untouched -- so nothing
+	 * folds, and there is nothing to store either: the slot already holds
+	 * the head.  Say so the way a fold says it, so the glue commit skips a
+	 * forward store into the run (and the SKIP_X dual that store would
+	 * re-encode into the retired copy) and re-bases its count onto the
+	 * survivor.  The witness is the copy.
+	 */
+	/*
+	 * ☠ TWO CONDITIONS ARE LOAD-BEARING, and both are checked, not assumed.
+	 * The count delta must be ZERO: @pending_pub_node names the fresh
+	 * copy of the run's PARENT, while the node owning @pending_pub_slot is
+	 * the run, which nobody credits -- a splice into an occupied chain is
+	 * zero (the chain counts once), and anything else is refused rather
+	 * than credited one level up.  And the fresh copy must exist because
+	 * the detach RECOMPACTED the shared ancestor; the collapse path
+	 * reports its own fold, and a collapse that cannot be spelled refuses
+	 * terminally (ft_chain_compress_fused) rather than falling back to a
+	 * one-child internal this frame would then have blessed.
+	 */
+	if (!ret && witness_by_detach && witness_via_run &&
+			!txn->pending_pub_folded && detach_rc.new_flag &&
+			!glue.count_delta) {
+		txn->pending_pub_folded = true;
+		txn->pending_pub_node = detach_rc.new_flag;
+	}
 	if (!ret && witness_by_detach && !txn->pending_pub_folded) {
 		if (detach_rc.new_flag)
 			free_cds_ft_node_unpublished(ft,
