@@ -1869,6 +1869,19 @@ struct cds_ft_inode_flag *ft_skip_child_ptr(struct cds_ft_inode_flag *node)
 /*
  * ft_skip_compressed_flag: encode a skip pointer from a child pointer
  * and the compressed path length.
+ *
+ * ☞ THE VALUE THIS BUILDS LIVES IN THE GRANDPARENT'S BODY, and the register in
+ * fractal-trie-internal.h lists that word as GP-owned, recorded MW by every
+ * producer (class DUAL) -- MW as DEBT, because the owner is DERIVED here from
+ * cn's back-pointer and only the op can vouch for holding it.
+ *
+ * ☠ ONE WORD, TWO ROLES.  To an op that holds GP and republishes the slot as
+ * an ordinary FORWARD edge, this is a structural slot of GP and PARKS SW when
+ * armed; to every dual refresh it is a CAS.  SW xor MW is a per-slot,
+ * cross-thread invariant, so a dual refresh that does not hold GP races that
+ * park -- hold GP (ft_lock_skip_dual_gp) before recording here, and remember
+ * that "the recompact took {C,P,GP}" is a PLAN-TIME claim while this owner is
+ * derived at PUBLISH time.
  */
 static
 struct cds_ft_inode_flag *ft_skip_compressed_flag(

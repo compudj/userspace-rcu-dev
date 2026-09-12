@@ -7237,6 +7237,17 @@ static inline
 void ft_state_edge(struct ft_ord_cell_edge *edge, uintptr_t *state_slot,
 		uintptr_t old_state, uintptr_t new_state)
 {
+	/*
+	 * ☠ DEFECT FT-SLOT-1 LIVES HERE.  This leaves @edge->tag at 0, and
+	 * ft_edge_tag defaults an untagged edge to FT_FLIP_PROXY_TAG (0xF) --
+	 * so a STATE word, which every other producer and every resolver tags
+	 * FT_STATE_PROXY (0x1), gets a 0xF-tagged proxy parked on it.
+	 * urcu_txn_is_proxy(v, 0x1) accepts 0xF ((0xF & 0x1) == 0x1) and
+	 * urcu_txn_untag then yields desc|0xE: a misaligned record pointer that
+	 * the resolve path dereferences.  The tag, like the kind, is a property
+	 * of the SLOT and must be the same in every txn and every reader that
+	 * touches it.  ☞ THE TRANSACTED-SLOT REGISTER in fractal-trie-internal.h.
+	 */
 	edge->slot = (struct ft_ord_cell **) state_slot;
 	edge->old_target = (struct ft_ord_cell *) old_state;
 	edge->new_target = (struct ft_ord_cell *) new_state;
@@ -12704,6 +12715,14 @@ void ft_flip_txn_record_parent_word(const struct cds_ft *ft,
  * proxy sees ZERO, over 5541 reaches of the two arms across unit + inv, all
  * three lock spacings, with the MW oracles enabled.  (The same probe over the
  * other nine raw expected-old reads in the tree: zero of 16.4M.)
+ */
+/*
+ * ☐ FT-SLOT-3: this passes @child_held TRUE for every back edge, including a
+ * displaced PUBLISHED child -- an SW park on such a child's parent_word is
+ * legal only while that child is in the op's lock-set, which is by
+ * construction here rather than by the registry.  FT_RED_PARENT_WORD_SW
+ * exercises the other branch, so the claim is unverified.
+ * ☞ THE TRANSACTED-SLOT REGISTER in fractal-trie-internal.h.
  */
 static
 void ft_glue_record_back_edge(struct cds_ft *ft, struct ft_flip_txn *txn,

@@ -191,7 +191,22 @@ struct cds_ft_node *ft_hlist_next_rcu(struct cds_ft_node *node)
  * concurrently deleted and @succ is never a neighbour mid-deletion.  The
  * multi-writer arbitration those cases needed -- bail -ENOENT on a marked @pos,
  * load-validate &succ->next and retry -EAGAIN on a marked neighbour -- is dead
- * and dropped.  Always returns 0; the int return is retained for caller-shape
+ * and dropped.
+ *
+ * ☠ DEFECT FT-SLOT-2: THAT DROP CONTRADICTS THE INTEROP INVARIANT THIS
+ * FILE'S HEADER STATES.
+ * The header promises that a structural head-remove's MARK(H->next) is what
+ * makes "a concurrent insert_after(H) onto a sole-node chain see the mark and
+ * abort" -- but nothing below looks at the mark.  The remove side upholds its
+ * half (ft_hlist_freeze_sole_prepare marks a derived NULL); the insert side no
+ * longer checks, and a MARK(NULL) @pos->next reads back as the bare value 2,
+ * which passes `succ != NULL` and makes the second store record slot
+ * &((struct cds_ft_node *) 2)->prev.  Under LOCK_FINE, where insert and remove
+ * are concurrent on the same key by contract, the append's head is derived
+ * before the holder acquire, so this is reachable in principle -- the mirror of
+ * the remove-side routing defect.  UNPROVEN by test; do not delete the mark
+ * check's obituary without either restoring the check or proving the shape
+ * unreachable.  Always returns 0; the int return is retained for caller-shape
  * parity with the concurrent front-ends (mirrors urcu_txn_sw_list_*_prepare).
  */
 static inline

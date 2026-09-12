@@ -506,6 +506,31 @@ enum cds_ft_iter_cache_mode {
  *
  * This structure is required to be naturally aligned.
  */
+/*
+ * ☞ BOTH WORDS ARE TRANSACTED SLOTS.  src/fractal-trie/fractal-trie-internal.h
+ * carries THE TRANSACTED-SLOT REGISTER, which is authoritative for owner and
+ * record kind; the summary for these two:
+ *
+ * @next -- the duplicate-chain forward link.  EXCLUDED by the chain HOLDER's
+ * node lock (the head's immediate parent), or that holder's ANCHOR under a
+ * coarse spacing; a bulk run-append is excluded by the FT-wide writer lock
+ * instead.  Recorded MW everywhere today, and that MW is currently
+ * LOAD-BEARING: the sole-entry freeze's derived expected-old is the only
+ * thing that turns an UNHELD derivation into an abort rather than a lost key.
+ * Bit 0 is the engine tag, bit 1 the removal MARK.
+ * ☠ A MARKED @next IS TERMINAL, and the append does not check it.
+ *
+ * @prev -- OVERLOADED, and the role decides the encoding: on a chain MEMBER it
+ * names the predecessor NODE (headness is ft_node_external(prev), which is why
+ * this is not a kernel-style pprev); on the HEAD it names the ordered-list
+ * cell (tagged bit 0) when the list is on, else the flagged parent word with
+ * its prefix-head bit.  Owner is the holder either way.  Recorded with the
+ * FLIP-PROXY tag (0xF), never the bit-0 hlist tag, because the resting value
+ * can itself carry bit 0.
+ * ☠ Reading it: a head's prev may carry a PARKED PROXY, and stripping bit 0
+ * alone then yields a misaligned descriptor address.  Resolve through
+ * ft_dereference_prev_resolved unless you hold the holder or the bulk gate.
+ */
 struct cds_ft_node {
 	void *prev;			/* library-internal back-reference; do not access */
 	struct cds_ft_node *next;

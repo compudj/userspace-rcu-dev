@@ -646,6 +646,21 @@ unsigned int ft_lock_level_index(unsigned int depth)
  */
 struct ft_ord_cell {
 	/*
+	 * ☞ THE ONE FAMILY WHOSE MW IS ARGUED, NOT ASSERTED (register note 6):
+	 * @lnode's two links have NO owning node lock at per-node OR exponential
+	 * spacing, because a splice rewrites the cells of the NEIGHBOURING KEYS,
+	 * whose holders this op never acquires.  MW by design, at every spacing;
+	 * only a root-only lock-set or the FT-wide bulk gate would cover them.
+	 * The deletion MARK on a retired cell's next is load-bearing: it is what
+	 * a peer splice that captured that dead cell as pred/succ fails on.
+	 * ☠ Feed expected-olds through the txn handle, not through
+	 * ft_ord_cell_resolve_ord: an optimistic read of a slot this txn also
+	 * WRITES is a doomed install under contention (aborts, not corruption).
+	 *
+	 * @parent, by contrast, HAS a single owner -- the holder P -- and is MW
+	 * only by debt; it is also still written raw on ft_set_parent's path, so
+	 * both paths are legal only while each holds P or the bulk gate.
+	 *
 	 * Key-ordered doubly-linked list links, embedded as the public
 	 * concurrent bidir-list node (<urcu/rcu-txn-list.h>): lnode.next
 	 * is the old ord_next, lnode.prev the old ord_prev.  The cell is recovered
@@ -1152,8 +1167,178 @@ struct ft_pub_rec {
  */
 #define FT_STATE_INPLACE_WAIT_MASK	(FT_STATE_PROXY | FT_STATE_LOCK)
 
+/*
+ * ============================================================================
+ * THE TRANSACTED-SLOT REGISTER: who owns each word, and what KIND it takes
+ * ============================================================================
+ *
+ * Every word below is written through the txn engine, so every one of them
+ * answers three questions -- and they are THREE, not two.  @owner names the
+ * node whose lock excludes other writers (§8.2 "a node's body is its own");
+ * @owner_held says whether THIS op holds it, which picks the record KIND; and
+ * neither is the same as "does this op EXCLUDE the word", which is what a
+ * missing lock or guard loses.  The stale-SKIP_X-dual livelock came from
+ * answering the first two and skipping the third.
+ *
+ * KIND IS A PROPERTY OF THE SLOT, NOT OF THE RECORD.  A slot is SW (parked
+ * under a held lock; the park cannot fail) XOR MW (CAS-arbitrated) -- and it
+ * must be the same kind in EVERY txn and EVERY thread that touches it.  One
+ * thread parking SW while another CASes MW is a lost or torn write the engine
+ * cannot detect.  MW is always safe; SW is a PROMISE of exclusion.  So a
+ * conversion to SW is only legal once EVERY producer of that word holds the
+ * owner -- never one lane at a time.
+ *
+ * WHEN SW IS REACHABLE AT ALL -- three doors, and the second one is why this
+ * table needs a spacing column:
+ *   1. ft_txn_content_sw_ok(): a COARSE or exclusive trie is armed SW
+ *      trie-wide, at EVERY spacing.
+ *   2. ft_flip_txn_arm_per_op(): under LOCK_FINE, and it REFUSES any spacing
+ *      but per-node (ft_txn_per_op_spacing_ok).  So a FINE point op at
+ *      exponential / root-only records every structural slot MW *BY
+ *      CONSTRUCTION* -- which is NOT the same claim as MW by design, and a
+ *      future reader must not take the one for the other.
+ *   3. ft_flip_txn_arm_structural(): the rekey writer and the root-COW driver
+ *      arm SW under FINE at ANY spacing (self-labelled "Phase E's DEBT").
+ *      This is the one door through which an SW park and an MW CAS can meet
+ *      on one structural word; what keeps them apart today is the FT-wide
+ *      bulk gate, not the DLM.
+ *
+ * ☠ OWNERSHIP IS TAKEN, NEVER OBSERVED.  An MW {live->live} VALIDATE on a word
+ * a peer holds is not arbitrated against that peer's SW parks: the validator
+ * is the loser, its proxy overwritten and its settle-back CAS silently failing.
+ * A guard is a weaker representative of a lock only for a word nobody copies
+ * under it; it is NEVER a substitute for the take.  See the state-word
+ * protocol in ft-mutation-helpers.h.
+ *
+ * ☠ AND THE ANCHOR MOVES THE WORD.  Under a coarse spacing ft_anchor_meta maps
+ * a lock-set member to an ANCHOR ANCESTOR, so the word a peer must contend for
+ * is NOT the node's own state word.  A fix that validates a node's own word is
+ * therefore untested above per-node by construction; an ACQUIRE gets §1's
+ * AGREEMENT property (every op resolves the same anchor) and a guard does not.
+ *
+ *   SLOT                          OWNER (§8.2)        per-node   exponential
+ *   ----                          -----------         --------   -----------
+ *   internal body child slot      the node it is in   SW armed   MW by constr.
+ *   cds_ft_compressed_node.child  that cn             SW armed   MW by constr.
+ *   cds_ft.root                   NONE (no node)      MW         MW   [DESIGN]
+ *   SKIP_X dual (GP body word)    the GRANDparent     MW  (1)    MW   [debt]
+ *   cds_ft_metadata.external_nodes the node it is in  SW armed   MW by constr.
+ *   metadata.state  LOCK take     node / its anchor   MW         MW   [DESIGN]
+ *   metadata.state  tombstone     ditto               SW armed   MW by constr.
+ *   metadata.state  lock release  ditto               SW armed   MW by constr.
+ *   metadata.state  nr_child++    ditto               SW armed   MW by constr.
+ *   metadata.state  nr_child--    ditto               MW  (2)    MW   [DEFECT]
+ *   metadata.state  {live->live}  --                  MW         MW   [DESIGN]
+ *   metadata.parent_word          parent (3)          SW if held MW by constr.
+ *   metadata.parent_slot_offset   parent (3)          SW if held MW by constr.
+ *   metadata.nr_keys              NONE (climbs up)    MW         MW   [DESIGN]
+ *   metadata.incoming_byte        not transacted -- see its own comment
+ *   cds_ft_node.next              the chain HOLDER    MW  (4)    MW   [debt]
+ *   cds_ft_node.prev  (member)    the chain HOLDER    MW / SW(5) MW   [debt]
+ *   cds_ft_node.prev  (head)      the holder P        MW / SW(5) MW   [debt]
+ *   ft_ord_cell.lnode.next/prev   NONE (6)            MW         MW   [DESIGN]
+ *   ft_ord_cell.parent            the holder P        MW + raw   MW   [debt]
+ *
+ * ☞ "[DESIGN]" means the word can never convert: it has no single owner (the
+ * root slot lives in no node; nr_keys climbs ancestors nobody locked; an
+ * ordered-list splice rewrites the cells of NEIGHBOURING keys, whose holders
+ * the op never acquires) or it IS the arbitration point (the lock take).
+ * Everything else marked [debt] has a named owner and is on the conversion
+ * surface; "MW by constr." is neither -- it is door 2 above, and it changes
+ * the moment that gate lifts.
+ *
+ * (1) The dual's owner is DERIVED at publish from cn's back-pointer, so only
+ *     the op can vouch for it: every producer passes @owner_held false, the
+ *     insert lane and the remove lane alike.  Both now ACQUIRE it
+ *     (ft_insert_lock_skip_dual_gp, ft_lock_skip_dual_gp), so the MW is a
+ *     missed conversion; it stays MW until ft_node_recompact's own dual site
+ *     (FT_OWNER_UNPLUMBED) and the glue publishes can vouch too.
+ * (2) ☠ KNOWN DEFECT FT-SLOT-1, not a conversion question: ft_state_edge leaves .tag 0
+ *     and ft_edge_tag defaults an untagged edge to FT_FLIP_PROXY_TAG (0xF),
+ *     so the remove's fused nr_child-- parks a 0xF-tagged proxy on a word
+ *     every other producer and resolver tags FT_STATE_PROXY (0x1).  is_proxy
+ *     with 0x1 accepts it and untag yields desc|0xE -- a misaligned record
+ *     pointer.  Debug builds trap tag aliasing on the RECORD path only.
+ * (3) ☐ FT-SLOT-3.  The MODEL owns the back edge by the PARENT (§8.2, decision 09-03); the
+ *     CODE keys its kind on holding the CHILD (@child_held).  Two predicates,
+ *     one word -- do not add a third.  A re-parent that already recorded the
+ *     word chains by the EXISTING record's kind.
+ * (4) ☠ See FT-SLOT-2 for this word's dropped mark check.  And MW is
+ *     load-bearing here TODAY: ft_hlist_freeze_sole_prepare's derived
+ *     NULL is the only thing that turns an UNHELD sole-entry derivation into
+ *     an abort.  Re-derive under the holder lock before any SW park.
+ * (5) ☐ FT-SLOT-4.  ft_promote_head already parks a head's prev SW (owner = the holder)
+ *     while ft-txn-hlist.h records the same word class MW.  Not a live race
+ *     (every producer holds the holder, or is bulk-gated, or the head is
+ *     build-invisible) -- but "genuinely unlocked" is FALSE of this word.
+ * (6) The one family whose design-MW is ARGUED rather than asserted.
+ *
+ * ----------------------------------------------------------------------------
+ * OPEN DEFECTS AND OPEN QUESTIONS IN THIS TABLE, tagged so they can be found:
+ * grep -rn 'FT-SLOT-' src/fractal-trie/
+ *
+ *   FT-SLOT-1  ☠ DEFECT, code-derived, not reproduced.  A state-word TAG
+ *              MISMATCH: ft_state_edge leaves .tag 0 and ft_edge_tag defaults
+ *              an untagged edge to FT_FLIP_PROXY_TAG (0xF), so the remove's
+ *              fused nr_child-- parks a 0xF-tagged proxy on a word every
+ *              other producer and resolver tags FT_STATE_PROXY (0x1).
+ *              urcu_txn_is_proxy(v, 0x1) ACCEPTS 0xF and urcu_txn_untag
+ *              yields desc|0xE -- a misaligned record pointer, dereferenced.
+ *              On the common leaf-delete path.  Debug builds trap tag
+ *              aliasing on the RECORD path only, so the resolve path
+ *              fabricates silently.  ☞ ft_state_edge.
+ *
+ *   FT-SLOT-2  ☠ DEFECT, code-derived, not reproduced.  The duplicate-chain
+ *              MARK CHECK was dropped from ft_hlist_insert_after_prepare
+ *              while ft-txn-hlist.h's own header still promises it ("a
+ *              concurrent insert_after(H) onto a sole-node chain sees the
+ *              mark and aborts").  The remove side upholds its half; the
+ *              insert side never looks, and MARK(NULL) reads back as the bare
+ *              value 2, which passes `succ != NULL` and makes the second
+ *              store record slot &((struct cds_ft_node *) 2)->prev.
+ *              ☞ ft_hlist_insert_after_prepare.
+ *
+ *   FT-SLOT-3  ☐ OPEN QUESTION.  @parent_word / @parent_slot_offset have TWO
+ *              ownership predicates -- the model's PARENT and the code's
+ *              @child_held -- and ft_glue_record_back_edge passes child_held
+ *              true UNCONDITIONALLY, including for a displaced PUBLISHED
+ *              child.  FT_RED_PARENT_WORD_SW exists because that shape "is a
+ *              REAL defect", but it exercises the other branch, so whether
+ *              every glue back-edge child is in the op's lock-set is
+ *              unverified.  ☞ ft_glue_record_back_edge.
+ *
+ *   FT-SLOT-4  ☐ STALE DOCS, benign but load-bearing for the conversion.
+ *              HEAD_BACK is documented "NEVER converts / permanent false
+ *              arm" while ft_promote_head parks that same word SW with
+ *              owner = the holder, and ft_back_edge_owner names P as its
+ *              owner.  Three statements, one slot.  Related drift:
+ *              ft_chain_next_flip is dead code whose header still names
+ *              callers, and the DUAL counter class now receives HELD duals
+ *              plus forward edges plus &ft->root, so readings of that column
+ *              no longer mean what its definition says.
+ * ----------------------------------------------------------------------------
+ *
+ * ☠ AND NO WORD ABOVE MAY BE WRITTEN RAW once it is reachable.  A plain store
+ * does not resolve a peer's parked proxy -- it overwrites the descriptor
+ * pointer and breaks atomicity for every txn naming the slot.  The lone-edge
+ * fast paths (ft_ord_cell_flip_one and its callers) are raw by construction
+ * and are legal only for a bulk op under the FT-wide gate or a node no reader
+ * can reach.  Each remaining raw site must say which of those two it is.
+ * ============================================================================
+ */
 struct cds_ft_metadata {
 	/* 8-byte aligned fields. */
+	/*
+	 * ☞ Register: the MODEL owns this edge by the PARENT (§8.2, decision
+	 * 09-03); the CODE keys its record kind on holding the CHILD
+	 * (@child_held).  Two predicates for one word -- do not add a third, and
+	 * a re-parent that already recorded it chains by the EXISTING record's
+	 * kind.  MW here is a LOCK-SET REACH question (class PARENT_WORD),
+	 * convertible by widening the set, never by arming.
+	 * ☠ The glue passes @child_held true for every back edge, including a
+	 * displaced PUBLISHED child; an SW park there is legal only while that
+	 * child is in the op's lock-set.
+	 */
 	struct cds_ft_inode_flag *parent_word;	/*
 						 * Tagged pointer to parent node.  ☠ A ROOT
 						 * DOES NOT STORE NULL HERE -- it stores the
@@ -1177,6 +1362,20 @@ struct cds_ft_metadata {
 						 * (ft_skip_to_compressed, ft_get_parent_rcu)
 						 * via rcu_dereference.
 						 */
+	/*
+	 * ☞ Register: the PREFIX-HEAD word -- the forward edge a lookup follows
+	 * to the key that ENDS at this node, and the head of its same-key chain.
+	 * A structural slot of THIS node, so the excluding lock is this node's
+	 * state word at per-node spacing and its ANCHOR above; SW on an armed
+	 * txn, MW otherwise (MW by construction for a FINE point op above
+	 * per-node).  The chain links BEHIND it are a different family entirely
+	 * (cds_ft_node.next/prev, owned by the holder).
+	 * ☠ With the ordered list AND rank stats both off, a lone edge on this
+	 * word is committed by the raw lone-store path -- a plain store on a word
+	 * other ops transact, which overwrites a parked proxy.  Every write here
+	 * must resolve through the engine or hold an exclusion covering every
+	 * other writer, list on or off.
+	 */
 	struct cds_ft_node *external_nodes;	/* List of external nodes at this trie location. */
 
 	/*
@@ -1190,11 +1389,31 @@ struct cds_ft_metadata {
 	 * value is stored SHIFTED (FT_PSO_SHIFT) to keep bit 0 clear for the
 	 * engine's in-band proxy tag, as the engine requires of every live value.
 	 */
+	/*
+	 * ☞ Register: same owner and same kind predicate as @parent_word -- the
+	 * model owns it by the PARENT (§8.3 split it out of @state precisely
+	 * because one word cannot be owned by two locks), the code keys its kind
+	 * on holding the CHILD.  Recorded ONLY by a live re-home, into the same
+	 * txn as @parent_word, so the (parent, offset) pair flips atomically; a
+	 * reader must resolve the pair together, never field by field.
+	 * ☠ Its raw setter waits out a parked FT_STATE_PROXY but deliberately NOT
+	 * the LOCK bit; do not "fix" that -- waiting on the lock self-deadlocked.
+	 */
 	uintptr_t parent_slot_offset;
 
 	/*
 	 * Total unique keys in subtree.
 	 * Stored with uatomic_store release, loaded with acquire.
+	 */
+	/*
+	 * ☞ Register: NO lock excludes this word, at any spacing -- the count is
+	 * propagated up the ancestor chain to the root, through nodes the op
+	 * never acquired, so every writer whose key path crosses this node writes
+	 * it.  MW by DESIGN, not debt; only a root-only lock-set would cover the
+	 * whole path.  Stored as (count << 1); bit 0 is FT_NR_KEYS_PROXY_TAG.
+	 * ☠ One txn may walk one ancestor TWICE (-1 then +1): the expected old
+	 * must come from the DESCRIPTOR first, or the second walk poisons the
+	 * commit and the op livelocks with no contention at all.
 	 */
 	unsigned long nr_keys;
 
@@ -1215,6 +1434,24 @@ struct cds_ft_metadata {
 	 * Access nr_child / parent_slot_offset ONLY via the ft_meta_nr_child* /
 	 * ft_meta_parent_slot_offset* helpers -- they mask their own field and
 	 * preserve the others; never read/write the word directly.
+	 */
+	/*
+	 * ☞ THE SLOT REGISTER above is authoritative; this word is the one with
+	 * a PROTOCOL rather than a single kind, and ft-mutation-helpers.h's
+	 * "THE STATE-WORD PROTOCOL" states it step by step: the LOCK TAKE is MW
+	 * at every spacing (it IS the arbitration point -- an SW take would hand
+	 * two ops the same node), while the tombstone, the lock release and a
+	 * recorded nr_child delta are SW on an armed txn.  Under a coarse spacing
+	 * the TAKE and RELEASE land on this node's ANCHOR ANCESTOR's state word
+	 * while the tombstone and nr_child edges land here, unlocked -- what
+	 * excludes them is the anchor plus the agreement that every writer of this
+	 * node resolves the same one.
+	 *
+	 * ☠ DO NOT SUBSTITUTE A GUARD FOR THE TAKE.  An MW {live->live} validate
+	 * on this word is not arbitrated against a peer's SW park: the validator
+	 * loses silently.  Ownership is taken, never observed.
+	 * ☠ A state edge routed through an ft_ord_cell_edge MUST set
+	 * .tag = FT_STATE_PROXY -- see note (2) in the register.
 	 */
 	uintptr_t state;
 
@@ -1240,6 +1477,18 @@ struct cds_ft_metadata {
 	 * with @incoming_byte: it costs no additional word and leaves every field
 	 * above it untouched.  24 bits (16 M) is ample for a 2 MiB block; the top
 	 * 8 bits carry incoming_byte (below), so the tail needs no separate byte.
+	 */
+	/*
+	 * ☞ Register: THIS TAIL WORD IS NOT TRANSACTED.  @alloc_index is written
+	 * once by the allocator; @incoming_byte is a pure function of (parent,
+	 * slot) and is re-stored plainly at every child placement -- a same-value
+	 * write across a recompact, which is what makes an unlocked store legal.
+	 * Its only ordering is the release of the parent pointer that follows it,
+	 * so a reader's up-walk must acquire @parent_word BEFORE reading the byte.
+	 * ☠ IT IS A BITFIELD: every write is a read-modify-write of the whole
+	 * word, so these two fields can only share it because no two writers ever
+	 * race here.  A new field packed in inherits that obligation -- and a
+	 * value that must be coherent with a structural flip belongs in @state.
 	 */
 	uint32_t alloc_index:24;
 	uint32_t incoming_byte:8;
@@ -1463,6 +1712,22 @@ bool ft_meta_tombstone(const struct cds_ft_metadata *meta)
  * Layout: [child pointer] [len] [key_bytes...]
  */
 struct cds_ft_compressed_node {
+	/*
+	 * ☞ Register: @child is this node's OWN body word, so the lock that
+	 * excludes a writer is this cn's state word at per-node spacing and its
+	 * ANCHOR above.  SW on an armed txn, MW otherwise -- and MW by
+	 * construction for a FINE point op above per-node.
+	 *
+	 * ☠ IT NEVER TRAVELS ALONE.  While this cn is reached through a SKIP_X
+	 * word, the GRANDPARENT slot encodes THIS value, and a republish must
+	 * refresh both in ONE commit.  The dual is owned by the GRANDPARENT, not
+	 * by this node: hold GP (ft_lock_skip_dual_gp / ft_insert_lock_skip_dual_gp)
+	 * before recording it.  A recompaction of GP copies its body under GP's
+	 * lock and drops the per-slot read-set on that strength, so a dual
+	 * recorded without holding GP lands in the body being retired while the
+	 * fresh copy keeps the stale word -- and then this field and the
+	 * reachable dual disagree forever.
+	 */
 	struct cds_ft_inode_flag *child;	/* Child at end of compressed path. */
 	uint8_t len;				/* Number of key bytes in path (1-255). */
 	uint8_t key_bytes[];			/* Compressed key path (flexible array). */
@@ -1742,6 +2007,19 @@ struct cds_ft_compact_state;
 struct cds_ft {
 	struct cds_ft_group *group;
 
+	/*
+	 * ☞ Register: THE ROOT SLOT IS THE ONE CAS-ONLY STRUCTURAL WORD.  It
+	 * lives in no node, so no state word can make a plain park legal at ANY
+	 * spacing -- root-only spacing locks the root NODE's state word, which is
+	 * a different word.  Every record of it is MW whatever the txn's mode, so
+	 * route it through ft_flip_txn_record_root or carry the per-edge .root /
+	 * rec->root[] flag so the replays do.  MW by DESIGN: it never converts.
+	 * ☠ The LONE-EDGE fast paths store this word RAW (ft_ord_cell_flip_one
+	 * and its callers).  That is legal only for a bulk op under the FT-wide
+	 * gate: a raw store does not resolve a peer's parked proxy, it overwrites
+	 * the descriptor pointer.  A point op reaching a raw root store has left
+	 * the engine's atomicity for everyone.
+	 */
 	struct cds_ft_inode_flag *root;		/* Root node (arena-allocated, always present, always internal). */
 
 	/*
