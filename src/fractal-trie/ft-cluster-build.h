@@ -648,12 +648,26 @@ struct cds_ft_inode_flag *ft_build_extracted_root_glue(struct cds_ft *ft,
 		return (struct cds_ft_inode_flag *) (long) -ENOMEM;
 	dest = ft_node_flag(root_node, 0);
 	/*
-	 * rest_len == 0: @child is live, so defer its back-pointer (cluster_leaf).
-	 * rest_len >= 1: the slot holds the fresh new_cn, whose own back-pointer
-	 * into @dest is a fresh-to-fresh edge that is safe to set during the build.
+	 * @root_node is a BUILD node, and the set says so (@cluster_leaf true):
+	 * the store lands in place, and the child's back-pointer is this
+	 * frame's -- deferred below when @child is live (rest_len == 0), set
+	 * explicitly below when the slot holds the fresh new_cn (a fresh-to-
+	 * fresh edge, safe during the build).
+	 *
+	 * ☠ IT USED TO SAY "live" FOR rest_len >= 1, and a first occupancy on a
+	 * live popcount node is not stored in place: ft_node_set_nth
+	 * recompacted the empty root into a fresh copy (ADD_SAME) and handed the
+	 * displaced body to nobody (@old_node_ret NULL) -- ONE INTERNAL NODE
+	 * LEAKED per cds_ft_graft_swap / cds_ft_detach whose extracted run was
+	 * two bytes or longer.  MEASURED with the group node balance: the
+	 * six-node "internal node leak" ft_inv's inv_ordered_bulk_consistency
+	 * reported on every DEBUG_COUNTERS run was exactly its six swaps, and a
+	 * one-shot swap or detach of a two-byte run leaks one.  Every other
+	 * fresh-node set_nth in the tree either starts from a NULL target (no
+	 * body to displace) or hands the old body back and frees it.
 	 */
 	ret = ft_node_set_nth(ft, &dest, first_byte, slot_value,
-			NULL, root_meta, 0, rest_len == 0 /* cluster_leaf */);
+			NULL, root_meta, 0, true /* cluster_leaf: build node */);
 	if (ret)
 		return (struct cds_ft_inode_flag *) (long) -ENOMEM;
 	ft_glue_track(glue, dest);

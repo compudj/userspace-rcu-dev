@@ -69,13 +69,13 @@
 #endif
 
 /*
- * 331 unconditional + 51 fault-injection-only RUN_TEST registrations, on top of
+ * 332 unconditional + 51 fault-injection-only RUN_TEST registrations, on top of
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (391 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (392 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (340 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (341 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -19995,6 +19995,142 @@ fail:
  * graft_swap at root: exchange the entire trie content.
  */
 /*
+ * THE EXTRACTED SWAP ROOT IS A BUILD NODE, and it leaked when filled as a live
+ * one.  cds_ft_graft_swap's extract side and cds_ft_detach's root
+ * materialization share ft_build_extracted_root_glue: a displaced compressed
+ * run is peeled into a fresh internal root plus a fresh suffix run.  A first
+ * occupancy stored into that root "as live" is never stored in place, so the
+ * set recompacted the empty root into a copy and dropped the original -- ONE
+ * INTERNAL NODE per swap or detach whose extracted run was two bytes or
+ * longer (ft_inv's inv_ordered_bulk_consistency read six per run, its six
+ * swaps, on every DEBUG_COUNTERS build).  Pin the GROUP node balance across a
+ * swap round-trip and a detach of exactly that run, everything drained and
+ * destroyed, list on and off.  The balance accessor is a weak symbol: NULL on
+ * a build without DEBUG_COUNTERS, where the row still exercises the shapes and
+ * says it could not count.
+ */
+extern void cds_ft_debug_node_balance(const struct cds_ft_group *group,
+		unsigned long *allocated, unsigned long *freed)
+		__attribute__((weak));
+
+static int graft_swap_extract_run_balance_one(bool list)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct cds_ft *live, *swap, *detached = NULL;
+	enum cds_ft_status s;
+	const uint8_t P = 0x50;
+	unsigned long na = 0, nf = 0;
+	unsigned int i;
+	int ret = -1;
+
+	if (cds_ft_group_attr_create(&attr) < 0)
+		return -1;
+	if (cds_ft_group_attr_set_key_len(attr, CDS_FT_LEN_VARIABLE) < 0 ||
+			cds_ft_group_attr_set_max_key_len(attr, 8) < 0 ||
+			cds_ft_group_attr_set_ordered_list(attr, list) < 0) {
+		cds_ft_group_attr_destroy(attr);
+		return -1;
+	}
+	if (cds_ft_group_create(attr, &group) < 0) {
+		cds_ft_group_attr_destroy(attr);
+		return -1;
+	}
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &live) < 0) {
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	if (cds_ft_create(group, NULL, &swap) < 0) {
+		cds_ft_destroy(live);
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+
+	rcu_read_lock();
+	for (i = 0; i < 4; i++) {	/* a static region: the root keeps a sibling */
+		uint8_t k[4] = { 0x40, 0, 0, (uint8_t) i };
+
+		cds_ft_insert(live, k, 4, &node_alloc(i)->node);
+	}
+	for (i = 0; i < 4; i++) {	/* live@0x50 -> a TWO-byte run -> four heads */
+		uint8_t k[4] = { P, 0, 0, (uint8_t) i };
+
+		cds_ft_insert(live, k, 4, &node_alloc(16 + i)->node);
+	}
+	for (i = 0; i < 4; i++) {	/* the donor's 3-byte keys, re-prefixed by the swap */
+		uint8_t k[3] = { 0xAA, 0, (uint8_t) i };
+
+		cds_ft_insert(swap, k, 3, &node_alloc(32 + i)->node);
+	}
+	rcu_read_unlock();
+
+	/* Extract live@0x50 (the run) into the donor, then swap it back. */
+	for (i = 0; i < 2; i++) {
+		rcu_read_lock();
+		cds_ft_make_exclusive(swap);	/* DLM: cross-trie src must be exclusive */
+		s = cds_ft_graft_swap(live, &P, 1, swap);
+		rcu_read_unlock();
+		if (s != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "graft_swap_extract_run_balance(list %d): swap #%u %s\n",
+				(int) list, i, cds_ft_status_to_string(s));
+			goto out;
+		}
+	}
+	/* ...and the detach's root materialization of the same run. */
+	rcu_read_lock();
+	s = cds_ft_detach(live, &P, 1, &detached);
+	rcu_read_unlock();
+	if (s != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "graft_swap_extract_run_balance(list %d): detach %s\n",
+			(int) list, cds_ft_status_to_string(s));
+		goto out;
+	}
+	rcu_read_lock();
+	if (cds_ft_verify(live, stderr) != CDS_FT_STATUS_OK ||
+			cds_ft_verify(swap, stderr) != CDS_FT_STATUS_OK ||
+			cds_ft_verify(detached, stderr) != CDS_FT_STATUS_OK) {
+		rcu_read_unlock();
+		fprintf(stderr, "graft_swap_extract_run_balance(list %d): verify red\n",
+			(int) list);
+		goto out;
+	}
+	rcu_read_unlock();
+	ret = 0;
+out:
+	if (detached)
+		drain_trie(detached);
+	drain_trie(live);
+	drain_trie(swap);
+	rcu_barrier();
+	if (detached)
+		cds_ft_destroy(detached);
+	cds_ft_destroy(live);
+	cds_ft_destroy(swap);
+	if (cds_ft_debug_node_balance) {
+		cds_ft_debug_node_balance(group, &na, &nf);
+		if (na != nf) {
+			fprintf(stderr, "graft_swap_extract_run_balance(list %d): group "
+				"node leak alloc %lu != freed %lu\n",
+				(int) list, na, nf);
+			ret = -1;
+		}
+	} else if (!list) {
+		diag("graft_swap_extract_run_balance: shapes exercised, node "
+			"balance not available (no DEBUG_COUNTERS)");
+	}
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+static int test_graft_swap_extract_run_balance(void)
+{
+	if (graft_swap_extract_run_balance_one(true) < 0)
+		return -1;
+	return graft_swap_extract_run_balance_one(false);
+}
+
+/*
  * Regression: graft_swap that extracts a subtree into an EMPTY swap, where the
  * graft point is the SOLE child of a COMPRESSED node, must PRUNE that parent --
  * not leave it childless.  Before the fix, the empty-swap remove published NULL
@@ -38689,6 +38825,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_graft_swap_basic);
 	RUN_TEST(test_graft_swap_into_empty);
 	RUN_TEST(test_graft_swap_extract_empty_compressed_parent);
+	RUN_TEST(test_graft_swap_extract_run_balance);
 	RUN_TEST(test_graft_swap_at_root);
 	RUN_TEST(test_graft_swap_self_error);
 	RUN_TEST(test_graft_swap_different_group_error);
