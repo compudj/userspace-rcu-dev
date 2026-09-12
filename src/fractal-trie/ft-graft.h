@@ -1188,6 +1188,7 @@ enum urcu_txn_status ft_store_at_graft_point_commit(struct cds_ft *ft,
 		if (st->glue->txn) {
 			st->glue->txn->pending_pub_slot = st->nfp;
 			st->glue->txn->pending_pub_val = st->attached;
+			st->glue->txn->pending_pub_plain = NULL;
 		}
 		/*
 		 * Order-statistics fold (BULK): the fresh @branch (which
@@ -1434,6 +1435,7 @@ enum urcu_txn_status ft_store_at_graft_point_commit(struct cds_ft *ft,
 
 				st->glue->txn->pending_pub_slot = pub_slot;
 				st->glue->txn->pending_pub_val = st->dest;
+				st->glue->txn->pending_pub_plain = NULL;
 				/*
 				 * AND ANNOUNCE THE SKIP_X DUAL, when the reserve recorded
 				 * one.  @reserve_rec holds the forward edge just added

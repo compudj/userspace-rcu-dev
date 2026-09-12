@@ -2436,7 +2436,23 @@ skip_copy:
 					 * the step that took the word still owes
 					 * its release.
 					 */
-				if (retire_txn->pending_del_replace_fresh &&
+				if (retire_txn->pending_pub_plain &&
+						iter == retire_txn->pending_pub_val) {
+					/*
+					 * THE FOLDED PUBLISH IS A GLUE-BUILT WRAPPER
+					 * in its skip form (@pending_pub_plain): an
+					 * unpublished node, so its back edge is a
+					 * plain store -- through the PLAIN flag,
+					 * because the skip word inverts through the
+					 * spliced head's back-pointer, which still
+					 * names the run this wrapper replaces until
+					 * the commit flips (the parked child_ident
+					 * shape: seed 2069).  The slot keeps the
+					 * skip word the fold put there.
+					 */
+					ft_set_parent(ft, retire_txn->pending_pub_plain,
+						new_node_flag, slot);
+				} else if (retire_txn->pending_del_replace_fresh &&
 						retire_txn->pending_del_replace &&
 						iter == retire_txn->pending_del_replace) {
 					/*
@@ -2502,7 +2518,23 @@ skip_copy:
 					 * never in the DLM set" is true of this
 					 * recompaction and false of the op.
 					 */
-				if (retire_txn->pending_del_replace_fresh &&
+				if (retire_txn->pending_pub_plain &&
+						iter == retire_txn->pending_pub_val) {
+					/*
+					 * THE FOLDED PUBLISH IS A GLUE-BUILT WRAPPER
+					 * in its skip form (@pending_pub_plain): an
+					 * unpublished node, so its back edge is a
+					 * plain store -- through the PLAIN flag,
+					 * because the skip word inverts through the
+					 * spliced head's back-pointer, which still
+					 * names the run this wrapper replaces until
+					 * the commit flips (the parked child_ident
+					 * shape: seed 2069).  The slot keeps the
+					 * skip word the fold put there.
+					 */
+					ft_set_parent(ft, retire_txn->pending_pub_plain,
+						new_node_flag, slot);
+				} else if (retire_txn->pending_del_replace_fresh &&
 						retire_txn->pending_del_replace &&
 						iter == retire_txn->pending_del_replace) {
 					/*

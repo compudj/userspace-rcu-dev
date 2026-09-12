@@ -2695,9 +2695,34 @@ int ft_rekey_merge_cow_publish_parent(struct cds_ft *ft,
 		 * corpus, dst "accc" src "aa": a dangling skip slot, a reader
 		 * walking off the root, a kind conflict under rank stats).
 		 */
-		if (merged_pub != d_dst->nf)
-			return FT_REKEY_UNCOVERED;
-		if (!ft_node_external(merged_pub))
+		if (merged_pub != d_dst->nf) {
+			struct cds_ft_metadata *fm;
+
+			/*
+			 * ...OR A GLUE-BUILT WRAPPER over the spliced head (the dst
+			 * ends inside a run over it: seed 2069, dst "accc" src
+			 * "aa"), folded into the DEL recompaction of the frame and
+			 * re-homed there by its PLAIN flag (@pending_pub_plain).
+			 * The frame must be DEL-RECOMPACTED, not collapsed: a
+			 * collapse takes the folded word as a run's child, and a
+			 * skip word is not a node.  So it keeps another child or a
+			 * key after the src byte leaves.  A run frame stays
+			 * refused (the deep fold), as does anything the glue did
+			 * not build -- and so does a frame ABOVE the attach slot's
+			 * parent (the climb past a run off the root): the fold
+			 * cannot reach a slot two levels down, and the subsumption
+			 * that then stands in for it skips the forward store, which
+			 * is right only when the slot already holds the top.
+			 */
+			if (*frame_above_pnf || ft_node_skip_compressed(merged_plain) ||
+					ft_node_external(merged_plain) ||
+					!ft_glue_is_fresh(ft, glue, merged_plain))
+				return FT_REKEY_UNCOVERED;
+			fm = ft_flag_to_metadata(ft, cow_nf);
+			if (!fm || (ft_meta_nr_child_load(fm) <= 2 &&
+					!fm->external_nodes))
+				return FT_REKEY_UNCOVERED;
+		} else if (!ft_node_external(merged_pub))
 			return FT_REKEY_UNCOVERED;
 		if (ft_node_external(cow_nf) || ft_node_compressed(cow_nf))
 			return FT_REKEY_UNCOVERED;
@@ -4875,6 +4900,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 				FT_REKEY_DST_FRESH_REACH(3);
 				txn->pending_pub_slot = d_dst.nfp;
 				txn->pending_pub_val = merged_pub;
+				txn->pending_pub_plain = NULL;
 				ret = 0;
 			} else if (ret == FT_REKEY_WITNESS_BY_DETACH) {
 				/*
@@ -4885,8 +4911,27 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 				 * @witness_by_detach at detach_bail).
 				 */
 				FT_REKEY_DST_FRESH_REACH(2);
-				ft_glue_set_publish(ft, &glue, d_dst.pnf, d_dst.nfp,
-					merged_pub);
+				if (merged_pub != d_dst.nf) {
+					/*
+					 * A GLUE-BUILT top: the glue's publish fields
+					 * and the announcement by hand, its parent a
+					 * plain store NOW (it is unpublished, and the
+					 * frame is still its live parent) -- no
+					 * deferred edge, which would be aimed at the
+					 * node the detach retires.  The recompaction's
+					 * sweep re-homes it through @pending_pub_plain.
+					 */
+					glue.publish_parent = d_dst.pnf;
+					glue.publish_slot = d_dst.nfp;
+					glue.top = merged_pub;
+					txn->pending_pub_slot = d_dst.nfp;
+					txn->pending_pub_val = merged_pub;
+					txn->pending_pub_plain = merged_plain;
+					ft_set_parent(ft, merged_plain, d_dst.pnf,
+						d_dst.nfp);
+				} else
+					ft_glue_set_publish(ft, &glue, d_dst.pnf,
+						d_dst.nfp, merged_pub);
 				witness_by_detach = true;
 				ret = 0;
 			} else if (ret) {
@@ -7086,7 +7131,8 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 * one-child internal this frame would then have blessed.
 	 */
 	if (!ret && witness_by_detach && witness_above &&
-			!txn->pending_pub_folded && !glue.count_delta) {
+			!txn->pending_pub_folded && !txn->pending_pub_plain &&
+			!glue.count_delta) {
 		struct cds_ft_inode_flag *survivor = detach_rc.new_flag;
 
 		/*

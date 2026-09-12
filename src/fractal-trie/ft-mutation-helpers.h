@@ -1456,6 +1456,17 @@ struct ft_flip_txn {
 	 */
 	bool pending_del_replace_fresh;
 	/*
+	 * @pending_pub_val's PLAIN flag when the announced top is a GLUE-BUILT
+	 * node published in its skip form (a wrapper the merge built over a
+	 * spliced head): the recompaction that folds the publish re-homes the
+	 * top through THIS flag with a plain store -- the node is unpublished,
+	 * and the skip word's one-hop inversion still names the run the wrapper
+	 * replaces.  NULL when the top is the slot's own live value, or any
+	 * node the ordinary re-parent can name.  The same idiom as
+	 * @pending_del_replace / @pending_del_replace_pub.
+	 */
+	struct cds_ft_inode_flag *pending_pub_plain;
+	/*
 	 * MIXED sw/mw commit (DLM lock_fine): when true, the STRUCTURAL record
 	 * helpers (every ft_flip_txn_record_tag edge) plant SW-kind records -- a
 	 * plain locked park that CANNOT fail -- because the op holds the DLM
@@ -1856,6 +1867,7 @@ struct ft_flip_txn *ft_flip_txn_create_at(FT_TK_SITE_PARAM struct cds_ft *ft)
 	t->pending_del_folded = false;
 	t->pending_del_replace = NULL;
 	t->pending_del_replace_pub = NULL;
+	t->pending_pub_plain = NULL;
 	t->pending_del_replace_fresh = false;
 	t->structural_sw = false;	/* all-MW until a caller opts in under lock_fine */
 	FT_ROOT_ASSERT_INIT(t, ft);
@@ -2085,6 +2097,7 @@ struct ft_flip_txn *ft_flip_txn_create_on_at(FT_TK_SITE_PARAM
 	t->pending_del_folded = false;
 	t->pending_del_replace = NULL;
 	t->pending_del_replace_pub = NULL;
+	t->pending_pub_plain = NULL;
 	t->pending_del_replace_fresh = false;
 	t->structural_sw = false;
 	FT_ROOT_ASSERT_INIT(t, ft);
@@ -2147,6 +2160,7 @@ struct ft_flip_txn *ft_flip_txn_create_bounded_on_at(FT_TK_SITE_PARAM
 	t->pending_del_folded = false;
 	t->pending_del_replace = NULL;
 	t->pending_del_replace_pub = NULL;
+	t->pending_pub_plain = NULL;
 	t->pending_del_replace_fresh = false;
 	t->structural_sw = false;	/* all-MW until a caller opts in under lock_fine */
 	FT_ROOT_ASSERT_INIT(t, ft);
@@ -13084,6 +13098,7 @@ void ft_glue_set_publish(struct cds_ft *ft, struct ft_glue *g,
 	if (g->txn) {
 		g->txn->pending_pub_slot = parent_slot;
 		g->txn->pending_pub_val = top;
+		g->txn->pending_pub_plain = NULL;
 	}
 	ft_glue_defer_edge(ft, g, top, parent_nf, parent_slot);
 }

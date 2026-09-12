@@ -1693,8 +1693,10 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		ft_glue_untrack(ft, pending_glue, pending_cn);
 		if (pending_glue->top == pending_child)
 			pending_glue->top = NULL;
-		if (shared_txn && shared_txn->pending_pub_val == pending_child)
+		if (shared_txn && shared_txn->pending_pub_val == pending_child) {
 			shared_txn->pending_pub_val = NULL;
+			shared_txn->pending_pub_plain = NULL;
+		}
 		free_compressed_node_unpublished(ft, pending_cn);
 	} else {
 		new_cn->child = build_child;

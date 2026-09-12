@@ -11883,6 +11883,16 @@ static const struct {
 	 * whose DEL recompaction is the witness, the publish two levels below
 	 * it subsumed by the copy (the run and the head's parent untouched) */
 	{ { "acc", "cbc", "ac", "b" }, "acc", "b", 1 },
+	/* corpus 2069, the parked child_ident shape: the dst ends inside a run
+	 * over the head, so the top is a glue-built wrapper in skip form, and
+	 * the shared parent's DEL recompaction folds it in and re-homes it by
+	 * its PLAIN flag (@pending_pub_plain) */
+	{ { "abcccc", "cacaa", "accca", "caaaca", "aaa" }, "accc", "aa", 2 },
+	/* the COMPOSITION of the two: a glue-built wrapper top AND a frame
+	 * climbed past a run off the root.  The fold cannot reach a slot two
+	 * levels down and the subsumption would skip the wrapper's store, so
+	 * the wrapper arm refuses a climbed frame: atomic-or-refused */
+	{ { "zaccca", "zabcccc", "ya", "x" }, "zaccc", "y", 0 },
 	/* one level down the same shape is the same-path arm, served before
 	 * this change too: a regression row, not a row of the post-detach arm */
 	{ { "xab", "xc", "xd" }, "xc", "xab", 1 },
@@ -11947,6 +11957,16 @@ static int root_frame_one(struct cds_ft *ft, const char *const *keys,
 		fprintf(stderr, "root_frame(dst %s src %s): %s count %lu want "
 			"%lu\n", dst, src, cds_ft_status_to_string(s), n,
 			s == CDS_FT_STATUS_OK ? distinct : (unsigned long) nk);
+		return -1;
+	}
+	/*
+	 * And every ENTRY: a moved key that collides joins a chain, so a
+	 * presence probe cannot see a dropped duplicate -- the entry count can.
+	 */
+	n = cds_ft_count_entries(ft);
+	if (n != nk) {
+		fprintf(stderr, "root_frame(dst %s src %s): %s entries %lu want "
+			"%u\n", dst, src, cds_ft_status_to_string(s), n, nk);
 		return -1;
 	}
 	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
