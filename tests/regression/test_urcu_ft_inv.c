@@ -82,7 +82,7 @@
  */
 /* +4 inv_prefix_head_*_key_identity; +2 inv_split_point_lookup_identity*;
  * +2 inv_absent_key_never_found* */
-#define NR_TESTS	(106 + NR_TESTS_REKEY_DLM)
+#define NR_TESTS	(108 + NR_TESTS_REKEY_DLM)
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -21906,6 +21906,332 @@ static int inv_split_point_lookup_identity_nolist(void)
 		"inv_split_point_lookup_identity_nolist");
 }
 
+/*
+ * Same-key concurrent REMOVES under CDS_FT_WRITER_LOCK_FINE (in contract:
+ * "cds_ft_remove may run concurrently with cds_ft_insert and cds_ft_remove on
+ * the same trie, including on the same key").  Every other concurrent-writer
+ * oracle here gives each writer a DISJOINT key range, so no two writers ever
+ * touched one duplicate chain at once -- and the point remove derives its
+ * routing (interior member / head with a successor / head without one) from
+ * node->prev and node->next with NOTHING held, then takes the holder lock
+ * and trusts that routing.  Two removes on adjacent duplicates of one key
+ * cross those lines: the head goes and the member is now the head (the held
+ * arm's assert(parent_nf)); the only other duplicate goes and a promote finds
+ * no successor (the clear lane on a compressed holder, whose no-dual detector
+ * fired; a release build would publish a compressed node with a NULL child).
+ * Both aborted within a second at the HEAD this was written against.
+ *
+ * Shape: K keys, each a chain of D duplicates inserted by this thread in
+ * order (dup 0 is the head); T == D writers each remove dup t of every key,
+ * concurrently, walking the keys in different orders.  After the round every
+ * key must be gone, the trie verifies, and the count is 0.  BOUNDED: R rounds,
+ * no wall-clock loop, so a regression fails or aborts instead of hanging the
+ * suite.  Coarse strategy is the control (serialized writers: green before
+ * the fix).
+ */
+#define SKR_T		3
+#define SKR_D		3
+#define SKR_K		64
+#define SKR_R		150
+
+struct skr_node {
+	struct cds_ft_node node;
+	unsigned int k, d;
+};
+
+struct skr_ctx {
+	struct cds_ft *ft;
+	struct skr_node *nodes;			/* [SKR_K][SKR_D] */
+	struct skr_node *fresh;			/* [SKR_K]: the inserter's node per key */
+	pthread_barrier_t bar;
+	unsigned long fail;			/* removes that did not return OK */
+	unsigned long ins_fail;			/* inserts that did not return OK */
+};
+
+struct skr_arg {
+	struct skr_ctx *c;
+	unsigned int t;
+};
+
+/*
+ * Two holder shapes, alternating by round: an even round's keys differ in
+ * their LAST byte, so each chain heads a body slot of an internal holder;
+ * an odd round's keys share a trailing byte, so each chain hangs under a
+ * one-byte compressed holder (cn->child), the shape whose emptied chain is
+ * a detach and whose promote must never fall into the clear lane.
+ */
+static uint64_t skr_u64(unsigned int r, unsigned int k)
+{
+	return (r & 1) ? (((uint64_t) k << 8) | 0x7f) : (uint64_t) k;
+}
+
+static void skr_bwait(pthread_barrier_t *bar)
+{
+	rcu_thread_offline();
+	pthread_barrier_wait(bar);
+	rcu_thread_online();
+}
+
+static void *skr_writer(void *arg)
+{
+	struct skr_arg *a = (struct skr_arg *) arg;
+	struct skr_ctx *c = a->c;
+	struct cds_ft_iter *iter;
+	unsigned int r, i;
+
+	rcu_register_thread();
+	if (cds_ft_iter_create(c->ft, &iter) != CDS_FT_STATUS_OK)
+		abort();
+	for (r = 0; r < SKR_R; r++) {
+		skr_bwait(&c->bar);		/* inserted */
+		/*
+		 * Every writer walks the keys in the SAME order: the point is
+		 * to have all T removers on one chain at once.
+		 */
+		for (i = 0; i < SKR_K; i++) {
+			unsigned int k = i;
+			struct skr_node *n = &c->nodes[k * SKR_D + a->t];
+			uint8_t key[8];
+			enum cds_ft_status st;
+
+			cds_ft_u64_to_key(c->ft, skr_u64(r, k), key,
+				CDS_FT_LEN_DEFAULT);
+			rcu_read_lock();
+			cds_ft_iter_set_key(iter, key, CDS_FT_LEN_DEFAULT);
+			cds_ft_lookup(c->ft, iter);
+			st = cds_ft_remove(c->ft, iter, &n->node);
+			rcu_read_unlock();
+			rcu_quiescent_state();
+			if (st != CDS_FT_STATUS_OK) {
+				fprintf(stderr, "skr: writer %u round %u key %u dup %u: remove -> %s\n",
+					a->t, r, k, a->t,
+					cds_ft_status_to_string(st));
+				uatomic_inc(&c->fail);
+			}
+		}
+		skr_bwait(&c->bar);		/* removed */
+		skr_bwait(&c->bar);		/* verified */
+	}
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+/*
+ * The INSERTER: while the removers empty each chain, insert one fresh node
+ * per key -- the same key -- so a removal that believed the chain had no
+ * successor meets an append between its derivation and its commit.  The
+ * orphan oracle after the round: every key must resolve, to a chain holding
+ * exactly this node.  (A freeze recorded with the successor RE-LOADED at
+ * record time marks the appended node into the tombstone and prunes the
+ * branch around it: an OK insert whose key then never resolves.)
+ */
+static void *skr_inserter(void *arg)
+{
+	struct skr_arg *a = (struct skr_arg *) arg;
+	struct skr_ctx *c = a->c;
+	unsigned int r, k;
+
+	rcu_register_thread();
+	for (r = 0; r < SKR_R; r++) {
+		skr_bwait(&c->bar);		/* inserted */
+		for (k = 0; k < SKR_K; k++) {
+			struct skr_node *n = &c->fresh[k];
+			uint8_t key[8];
+
+			cds_ft_node_init(&n->node);
+			n->k = k;
+			n->d = SKR_D;
+			cds_ft_u64_to_key(c->ft, skr_u64(r, k), key,
+				CDS_FT_LEN_DEFAULT);
+			rcu_read_lock();
+			if (cds_ft_insert(c->ft, key, CDS_FT_LEN_DEFAULT,
+					&n->node) != CDS_FT_STATUS_OK)
+				uatomic_inc(&c->ins_fail);
+			rcu_read_unlock();
+			rcu_quiescent_state();
+		}
+		skr_bwait(&c->bar);		/* removed */
+		skr_bwait(&c->bar);		/* verified */
+	}
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static int inv_concurrent_same_key_removes_run(bool ordered_list,
+		const char *name)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct skr_ctx c;
+	struct skr_arg args[SKR_T + 1];
+	pthread_t th[SKR_T + 1];
+	struct cds_ft_iter *iter;
+	unsigned int r, k, d, t;
+	int ret = 0;
+
+	if (cds_ft_group_attr_create(&attr) < 0)
+		abort();
+	if (cds_ft_group_attr_set_key_len(attr, 8) < 0)
+		abort();
+	if (cds_ft_group_attr_set_ordered_list(attr, ordered_list) < 0)
+		abort();
+	inv_maybe_set_rank_stats(attr);
+	if (cds_ft_group_create(attr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(attr);
+	memset(&c, 0, sizeof(c));
+	if (cds_ft_create(group, NULL, &c.ft) < 0)
+		abort();
+	cds_ft_make_concurrent(c.ft);
+	c.nodes = (struct skr_node *) calloc((size_t) SKR_K * SKR_D,
+			sizeof(*c.nodes));
+	c.fresh = (struct skr_node *) calloc(SKR_K, sizeof(*c.fresh));
+	if (!c.nodes || !c.fresh)
+		abort();
+	if (cds_ft_iter_create(c.ft, &iter) != CDS_FT_STATUS_OK)
+		abort();
+	pthread_barrier_init(&c.bar, NULL, SKR_T + 2);
+	for (t = 0; t < SKR_T; t++) {
+		args[t].c = &c;
+		args[t].t = t;
+		pthread_create(&th[t], NULL, skr_writer, &args[t]);
+	}
+	args[SKR_T].c = &c;
+	args[SKR_T].t = SKR_T;
+	pthread_create(&th[SKR_T], NULL, skr_inserter, &args[SKR_T]);
+	for (r = 0; r < SKR_R; r++) {
+		unsigned long fail_before = uatomic_read(&c.fail);
+
+		rcu_read_lock();
+		for (k = 0; k < SKR_K; k++) {
+			for (d = 0; d < SKR_D; d++) {
+				struct skr_node *n = &c.nodes[k * SKR_D + d];
+				uint8_t key[8];
+
+				cds_ft_node_init(&n->node);
+				n->k = k;
+				n->d = d;
+				cds_ft_u64_to_key(c.ft, skr_u64(r, k), key,
+					CDS_FT_LEN_DEFAULT);
+				if (cds_ft_insert(c.ft, key, CDS_FT_LEN_DEFAULT,
+						&n->node) != CDS_FT_STATUS_OK) {
+					fprintf(stderr, "%s: insert key %u dup %u failed\n",
+						name, k, d);
+					abort();
+				}
+			}
+		}
+		rcu_read_unlock();
+		rcu_quiescent_state();
+		skr_bwait(&c.bar);		/* inserted */
+		skr_bwait(&c.bar);		/* removed */
+		rcu_read_lock();
+		if (cds_ft_verify(c.ft, stderr) != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "%s: round %u: verify RED after the concurrent removes\n",
+				name, r);
+			ret = -1;
+		}
+		/*
+		 * Every original duplicate is gone and the inserter's node is
+		 * what each key resolves to: a chain of exactly that node.
+		 */
+		for (k = 0; k < SKR_K; k++) {
+			struct cds_ft_node *h;
+			unsigned int len = 0;
+			uint8_t key[8];
+
+			cds_ft_u64_to_key(c.ft, skr_u64(r, k), key,
+				CDS_FT_LEN_DEFAULT);
+			cds_ft_iter_set_key(iter, key, CDS_FT_LEN_DEFAULT);
+			if (cds_ft_lookup(c.ft, iter) != CDS_FT_STATUS_OK ||
+					!(h = cds_ft_iter_node(iter))) {
+				fprintf(stderr, "%s: round %u: key %u LOST after an OK concurrent insert\n",
+					name, r, k);
+				ret = -1;
+				continue;
+			}
+			for (; h; h = cds_ft_node_next_rcu(h)) {
+				struct skr_node *n = (struct skr_node *) h;
+
+				len++;
+				if (n != &c.fresh[k]) {
+					fprintf(stderr, "%s: round %u: key %u still holds dup %u after every duplicate was removed\n",
+						name, r, k, n->d);
+					ret = -1;
+				}
+			}
+			if (len != 1) {
+				fprintf(stderr, "%s: round %u: key %u chain length %u != 1\n",
+					name, r, k, len);
+				ret = -1;
+			}
+		}
+		if (cds_ft_count_keys(c.ft) != SKR_K) {
+			fprintf(stderr, "%s: round %u: count_keys %lu != %u\n",
+				name, r, cds_ft_count_keys(c.ft), SKR_K);
+			ret = -1;
+		}
+		/* Drain the inserter's nodes: the next round starts empty. */
+		for (k = 0; k < SKR_K; k++) {
+			uint8_t key[8];
+
+			cds_ft_u64_to_key(c.ft, skr_u64(r, k), key,
+				CDS_FT_LEN_DEFAULT);
+			cds_ft_iter_set_key(iter, key, CDS_FT_LEN_DEFAULT);
+			cds_ft_lookup(c.ft, iter);
+			if (cds_ft_remove(c.ft, iter, &c.fresh[k].node) !=
+					CDS_FT_STATUS_OK) {
+				fprintf(stderr, "%s: round %u: drain of key %u failed\n",
+					name, r, k);
+				ret = -1;
+			}
+		}
+		if (cds_ft_count_keys(c.ft) != 0) {
+			fprintf(stderr, "%s: round %u: count_keys %lu != 0 after the drain\n",
+				name, r, cds_ft_count_keys(c.ft));
+			ret = -1;
+		}
+		rcu_read_unlock();
+		rcu_quiescent_state();
+		if (uatomic_read(&c.fail) != fail_before ||
+				uatomic_read(&c.ins_fail))
+			ret = -1;
+		if (ret) {
+			fprintf(stderr, "%s: RED at round %u\n", name, r);
+			/* let the writers run out their bounded loop */
+		}
+		rcu_barrier();		/* the nodes are re-inserted next round: retire the freezes first */
+		skr_bwait(&c.bar);		/* verified */
+	}
+	for (t = 0; t < SKR_T + 1; t++)
+		pthread_join(th[t], NULL);
+	pthread_barrier_destroy(&c.bar);
+	cds_ft_iter_destroy(iter);
+	rcu_quiescent_state();
+	rcu_barrier();
+	cds_ft_destroy(c.ft);
+	cds_ft_group_destroy(group);
+	free(c.nodes);
+	free(c.fresh);
+	fprintf(stderr, "# %s: %u rounds x %u keys x %u concurrent removers + 1 inserter, %lu failed removes, %lu failed inserts -> %s\n",
+		name, SKR_R, SKR_K, SKR_T, uatomic_read(&c.fail),
+		uatomic_read(&c.ins_fail), ret ? "RED" : "ok");
+	return ret;
+}
+
+static int inv_concurrent_same_key_removes(void)
+{
+	return inv_concurrent_same_key_removes_run(true,
+		"inv_concurrent_same_key_removes");
+}
+
+static int inv_concurrent_same_key_removes_nolist(void)
+{
+	return inv_concurrent_same_key_removes_run(false,
+		"inv_concurrent_same_key_removes_nolist");
+}
+
 int main(int argc, char **argv)
 {
 	const char *filter = (argc >= 2) ? argv[1] : NULL;
@@ -22131,6 +22457,10 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_split_point_lookup_identity_nolist);
 	RUN_TEST(inv_absent_key_never_found);
 	RUN_TEST(inv_absent_key_never_found_nolist);
+
+	diag("19. Same-key concurrent removes route by a re-validated decision");
+	RUN_TEST(inv_concurrent_same_key_removes);
+	RUN_TEST(inv_concurrent_same_key_removes_nolist);
 
 	rcu_barrier();
 	rcu_unregister_thread();

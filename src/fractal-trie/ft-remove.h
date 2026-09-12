@@ -2115,7 +2115,8 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		 * retiring a leaf through this merge.
 		 */
 		if (freeze_leaf)
-			ft_hlist_freeze_prepare(ft_flip_txn_handle(txn), freeze_leaf);
+			ft_hlist_freeze_sole_prepare(ft_flip_txn_handle(txn),
+				freeze_leaf);
 		/*
 		 * R3 fold: the retired key's -1 walk from the merged node's stable
 		 * parent (publish_parent) up to root rides THIS commit atomically
@@ -3405,8 +3406,8 @@ int ft_detach_node(struct cds_ft *ft,
 			 * one MARK edge into @orphan_txn, the +1 reserved above.
 			 */
 			if (freeze_leaf) {
-				ft_hlist_freeze_prepare(ft_flip_txn_handle(orphan_txn),
-					freeze_leaf);
+				ft_hlist_freeze_sole_prepare(
+					ft_flip_txn_handle(orphan_txn), freeze_leaf);
 				freeze_leaf_fused = true;
 			}
 			/*
@@ -4408,8 +4409,8 @@ int ft_detach_node(struct cds_ft *ft,
 			 * froze it in its merge flip.
 			 */
 			if (!boundary_fused && freeze_leaf && pub && commit_txn) {
-				ft_hlist_freeze_prepare(ft_flip_txn_handle(commit_txn),
-					freeze_leaf);
+				ft_hlist_freeze_sole_prepare(
+					ft_flip_txn_handle(commit_txn), freeze_leaf);
 				freeze_leaf_fused = true;
 			}
 			/*
@@ -5248,7 +5249,8 @@ int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		}
 		txn = ft_flip_txn_create_bounded(ft,
 			FT_ORD_CELL_SWAP_PUBLISH_MAX_EDGES +
-			FT_HLIST_FREEZE_MAX_EDGES + 2);	/* +1 §4.B parent guard, +1 next_node->prev fold */
+			FT_HLIST_FREEZE_MAX_EDGES + 3);	/* +1 §4.B parent guard, +1 next_node->prev fold,
+							 * +1 the SKIP_X dual GP's release-or-guard */
 		if (!txn) {
 			ft_ord_cell_free_unpublished(ft,
 				ft_ord_cell_ptr(new_cell_flag));
@@ -5343,6 +5345,18 @@ int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		 */
 		ft_flip_txn_hold_or_lock_parent(ft, txn, ctx, parent_nf,
 			parent_depth, held_holder, held_snap);
+		/*
+		 * §9.3's THIRD MEMBER: this publish's SKIP_X dual lands in the
+		 * GRANDPARENT's body, so acquire GP -- the promote lane never
+		 * took it, and a §4.B guard on GP's OWN word does not stand in
+		 * for the acquire above per-node spacing.  ☞ ft_lock_skip_dual_gp.
+		 * A no-op unless a dual will actually be recorded; @mtxn NULL
+		 * mirrors this producer's @rec, which carries none.  Placed with
+		 * the holder's fence, ABOVE the arm, because it is a
+		 * ft_flip_txn_lock_register and the arm's contract is "after the
+		 * op's LAST register".
+		 */
+		ft_lock_skip_dual_gp(ft, ctx, txn, parent_nf, NULL);
 		ft_flip_txn_record_reserved(txn,
 			ft_flag_to_metadata(ft, parent_nf),
 			(void **) &next_node->prev,
@@ -5403,7 +5417,8 @@ int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		 */
 		struct ft_flip_txn *txn =
 			ft_flip_txn_create_bounded(ft, FT_PUB_SEDGE_MAX_EDGES +
-				FT_HLIST_FREEZE_MAX_EDGES + 2);	/* +1 §4.B parent guard, +1 prev fold */
+				FT_HLIST_FREEZE_MAX_EDGES + 3);	/* +1 §4.B parent guard, +1 prev fold,
+								 * +1 the SKIP_X dual GP's release-or-guard */
 
 		void *prev_save;
 		void *inherit;
@@ -5439,6 +5454,18 @@ int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		/* The holder's fence FIRST -- see the cell arm above for why. */
 		ft_flip_txn_hold_or_lock_parent(ft, txn, ctx, parent_nf,
 			parent_depth, held_holder, held_snap);
+		/*
+		 * §9.3's THIRD MEMBER: this publish's SKIP_X dual lands in the
+		 * GRANDPARENT's body, so acquire GP -- the promote lane never
+		 * took it, and a §4.B guard on GP's OWN word does not stand in
+		 * for the acquire above per-node spacing.  ☞ ft_lock_skip_dual_gp.
+		 * A no-op unless a dual will actually be recorded; @mtxn NULL
+		 * mirrors this producer's @rec, which carries none.  Placed with
+		 * the holder's fence, ABOVE the arm, because it is a
+		 * ft_flip_txn_lock_register and the arm's contract is "after the
+		 * op's LAST register".
+		 */
+		ft_lock_skip_dual_gp(ft, ctx, txn, parent_nf, NULL);
 		ft_flip_txn_record_reserved(txn,
 			ft_flag_to_metadata(ft, parent_nf),
 			(void **) &next_node->prev, prev_save, inherit);
@@ -5480,12 +5507,37 @@ int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
  * a fix; this counter is how that claim is checked.
  */
 unsigned long ft_dbg_unchain_rehomed;
+/*
+ * How often the caller's ROUTING (member / promote / clear) had been overtaken
+ * by a peer remove on the same chain between the unlocked derivation and the
+ * acquire -- the ft_unchain_kind re-validation's firing count.
+ */
+unsigned long ft_dbg_unchain_rerouted;
 #endif
+
+/*
+ * The ROUTING DECISION _cds_ft_remove_locked took for @node, derived from
+ * node->prev / node->next with NOTHING held, and re-validated by
+ * ft_unchain_node under the holder lock before any arm trusts it:
+ *   INTERIOR  @node is a non-head duplicate (prev is a node): relink past it.
+ *   PROMOTE   @node heads its chain and has a successor: promote the successor.
+ *   CLEAR     @node heads its chain with no successor, the holder is an
+ *             INTERNAL node and neither the ordered list nor rank stats are on:
+ *             clear the head slot.  (A compressed holder's emptied chain is a
+ *             DETACH; a list-on / rank-on disappearance is the fused
+ *             ft_remove_one_commit -- neither routes here.)
+ */
+enum ft_unchain_kind {
+	FT_UNCHAIN_INTERIOR,
+	FT_UNCHAIN_PROMOTE,
+	FT_UNCHAIN_CLEAR,
+};
 
 static
 int ft_unchain_node(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		struct cds_ft_inode_flag *parent_nf, unsigned int parent_depth,
-		struct cds_ft_node **head_slot, struct cds_ft_node *node)
+		struct cds_ft_node **head_slot, struct cds_ft_node *node,
+		enum ft_unchain_kind kind)
 {
 	struct cds_ft_metadata *hmeta = NULL;	/* MW LOCK_FINE holder lock */
 	uintptr_t hsnap = 0;
@@ -5593,6 +5645,64 @@ int ft_unchain_node(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 					ft_meta_lock_release_if_held(h.lock);
 				return -EAGAIN;
 			}
+			/*
+			 * ★ RE-VALIDATE THE CALLER'S ROUTING, under the lock.
+			 * @kind was chosen from node->prev / node->next read with
+			 * NOTHING held (see ft_unchain_kind), and the arms below
+			 * trust it: the promote arm has no head slot for a member,
+			 * and the clear arm is legal only for an internal holder
+			 * with the list and rank stats off.  A peer REMOVE on the
+			 * SAME chain -- in contract under LOCK_FINE -- moves the op
+			 * across those lines between the derivation and this
+			 * acquire: it removes the head and @node, a member, is now
+			 * the head; or it removes the only other duplicate and a
+			 * promote finds no successor.  MEASURED: two writers
+			 * removing adjacent duplicates of one key aborted in under
+			 * a second in both list modes (the held arm's
+			 * assert(parent_nf) for the first; the clear lane's no-dual
+			 * detector on a compressed holder for the second, which a
+			 * release build would have turned into a compressed node
+			 * with a NULL child).
+			 * Both words are FROZEN here -- every chain mutation holds
+			 * this word, and a commit's lock release settles AFTER its
+			 * structural words (ft_flip_txn_commit's late tag) -- so a
+			 * mismatch is a fact about the trie: hand the whole op back
+			 * and let the wrapper derive once, cleanly, exactly as the
+			 * holder re-derive above does.  A hold this op already had
+			 * (@h.shared) was validated by the acquire that took it and
+			 * is not released here.
+			 */
+			{
+				bool member = ft_node_external(
+					(struct cds_ft_inode_flag *)
+					rcu_dereference(node->prev));
+				bool succ = ft_node_next(node) != NULL;
+
+				/*
+				 * A peer removed @node itself since the derivation
+				 * (its MARK is on node->next): the interior lane
+				 * would otherwise unlink a ghost -- its prev still
+				 * names a member, and ft_hlist_del_prepare would
+				 * read a marked next as a neighbour.  Hand it back
+				 * as gone; the wrapper's re-derivation answers
+				 * NOT_FOUND from the top-of-op tombstone test.
+				 */
+				if (ft_node_is_removed(node)) {
+					if (!h.shared && !h.txn_owned)
+						ft_meta_lock_release_if_held(h.lock);
+					return -ENOENT;
+				}
+				if ((kind == FT_UNCHAIN_INTERIOR) != member ||
+				    (kind == FT_UNCHAIN_PROMOTE && !succ) ||
+				    (kind == FT_UNCHAIN_CLEAR && succ)) {
+#ifdef FT_ENABLE_TRACING
+					uatomic_inc(&ft_dbg_unchain_rerouted);
+#endif
+					if (!h.shared && !h.txn_owned)
+						ft_meta_lock_release_if_held(h.lock);
+					return -EAGAIN;
+				}
+			}
 		}
 	}
 
@@ -5691,7 +5801,9 @@ int ft_unchain_node(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		unsigned int n_s;
 
 		txn = ft_flip_txn_create_bounded(ft, FT_PUB_SEDGE_MAX_EDGES +
-			FT_HLIST_FREEZE_MAX_EDGES + 1);
+			FT_HLIST_FREEZE_MAX_EDGES +
+			1 /* §4.B parent guard */ +
+			1 /* the SKIP_X dual GP's release-or-guard */);
 		if (!txn) {
 			/* Early fence held but not yet handed to the txn. */
 			if (hmeta)
@@ -5718,6 +5830,16 @@ int ft_unchain_node(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		 */
 		ft_flip_txn_hold_or_lock_parent(ft, txn, ctx, parent_nf,
 			parent_depth, hmeta, hsnap);
+		/*
+		 * §9.3's third member, for the same reason as the promote arms.
+		 * A NO-OP today by the routing the detector below asserts -- a
+		 * compressed holder never reaches the head clear, so no dual is
+		 * recorded and the helper's own condition returns early -- and
+		 * wired anyway, because that detector exists precisely because
+		 * "a ROUTING INVARIANT IS A CODE FACT, AND CODE MOVES".
+		 * ☞ ft_lock_skip_dual_gp.
+		 */
+		ft_lock_skip_dual_gp(ft, ctx, txn, parent_nf, NULL);
 		_ft_publish_to_parent(ft, parent_nf,
 			(struct cds_ft_inode_flag **) head_slot, NULL,
 			(struct cds_ft_inode_flag *) node, &rec, false);
@@ -6540,11 +6662,42 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 	 * ft_unchain_node), and a key disappearance (no successor) frees the
 	 * cell after the removal commits (ret == 0).
 	 */
+	/*
+	 * ONE load of node->prev, RESOLVED, and the successor through the hlist
+	 * resolver: nothing is held here, and a peer remove on the same chain
+	 * can have a flip proxy parked on either word (its promote records the
+	 * successor's prev; its member unlink records the successor's next and
+	 * the predecessor's next).  Two raw loads of prev could disagree with
+	 * each other and with the resolved holder derivation above -- and a raw
+	 * ft_ord_cell_ptr() of a parked proxy is a wild cell.  Resolved, each
+	 * value is the word before or after that peer's commit, never a
+	 * descriptor; a STALE-but-valid routing is what ft_unchain_node's
+	 * under-lock re-validation (ft_unchain_kind) catches and retries.
+	 */
+	void *node_prev = ft_dereference_prev_resolved(node);
+	/*
+	 * ONE read of the successor, for BOTH decisions that depend on it:
+	 * the lane dispatch below (a head with a successor is promoted, one
+	 * without is pruned / cleared) and the fuse decision here (a key that
+	 * disappears takes its cell with it).  Read twice, at two instants,
+	 * the two disagreed under a same-key peer: a successor appended
+	 * between the reads sent a "sole entry" (@fuse_remove, unsplice txn
+	 * reserved) down the PROMOTE lane, which swapped the head's cell for
+	 * a fresh one -- and the two-commit tail then drove the unsplice of
+	 * the swapped-out cell forward forever (its expected-olds can never
+	 * match; measured as a memcg kill within seconds).  A successor
+	 * removed between the reads did the mirror image: a key pruned with
+	 * its cell left in the list (ft_verify "ord-cell list longer than
+	 * trie").  Staleness of this ONE read is what the lanes then catch:
+	 * the promote's under-lock re-validation (ft_unchain_kind) and the
+	 * sole-entry freeze's derived expected-old both retry the op.
+	 */
+	struct cds_ft_node *succ_node = ft_hlist_next_rcu(node);
 	bool cell_was_head = ft->ordered_list &&
-		!ft_node_external((struct cds_ft_inode_flag *) node->prev);
+		!ft_node_external((struct cds_ft_inode_flag *) node_prev);
 	struct ft_ord_cell *dead_cell = cell_was_head ?
-		ft_ord_cell_ptr(node->prev) : NULL;
-	struct cds_ft_node *cell_succ = cell_was_head ? ft_node_next(node) : NULL;
+		ft_ord_cell_ptr(node_prev) : NULL;
+	struct cds_ft_node *cell_succ = cell_was_head ? succ_node : NULL;
 	/*
 	 * Key-disappearing detach (head with no successor) + ordered list on:
 	 * fuse the structural unlink with @dead_cell's unsplice in one flip.
@@ -6585,7 +6738,8 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 		 * any grandparent skip pointer to it -- is untouched, so no head
 		 * slot is needed.
 		 */
-		ret = ft_unchain_node(ft, &lctx, NULL, 0, NULL, node);
+		ret = ft_unchain_node(ft, &lctx, NULL, 0, NULL, node,
+			FT_UNCHAIN_INTERIOR);
 	} else if (ft_node_compressed(holder_flag) ||
 		   ft_node_skip_compressed(holder_flag)) {
 		/*
@@ -6632,7 +6786,7 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 			FT_RM_RELEASE();
 			return CDS_FT_STATUS_NOT_FOUND;
 		}
-		if (!ft_node_next(node)) {
+		if (!succ_node) {
 			/*
 			 * Last/only entry: prune the now-empty branch.
 			 * ft_detach_node bootstraps from the holder slot (recovered
@@ -6657,7 +6811,8 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 			 */
 			ret = ft_unchain_node(ft, &lctx,
 				ft_compressed_node_flag(cn), holder_depth,
-				(struct cds_ft_node **) head_slot, node);
+				(struct cds_ft_node **) head_slot, node,
+				FT_UNCHAIN_PROMOTE);
 		}
 	} else if (ft_node_external_nodes(holder_flag) ==
 			(struct cds_ft_node *) node) {
@@ -6669,7 +6824,7 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 		 * last entry (the chain becomes empty).
 		 */
 		holder_meta = cds_ft_item_to_metadata(ft_node_ptr(holder_flag));
-		if (!ft_node_next(node)) {
+		if (!succ_node) {
 			/*
 			 * Last entry: the external chain empties, so the prefix
 			 * key disappears (the holder KEEPS its longer-key children
@@ -6809,7 +6964,7 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 					ret = ft_unchain_node(ft, &lctx, holder_flag,
 						holder_depth,
 						(struct cds_ft_node **) &holder_meta->external_nodes,
-						node);
+						node, FT_UNCHAIN_CLEAR);
 				}
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 				/*
@@ -6832,7 +6987,7 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 			/* Duplicates remain: head promotion (fresh-cell swap). */
 			ret = ft_unchain_node(ft, &lctx, holder_flag, holder_depth,
 				(struct cds_ft_node **) &holder_meta->external_nodes,
-				node);
+				node, FT_UNCHAIN_PROMOTE);
 		}
 	} else {
 		/*
@@ -6869,7 +7024,7 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 			FT_RM_RELEASE();
 			return CDS_FT_STATUS_NOT_FOUND;
 		}
-		if (!ft_node_next(node)) {
+		if (!succ_node) {
 			/*
 			 * Last/only entry: prune the now-empty branch.
 			 * Propagate -1 before detach, which may free internal nodes.
@@ -6883,7 +7038,8 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 		} else {
 			/* Removing the head, duplicates remain: key count unchanged. */
 			ret = ft_unchain_node(ft, &lctx, holder_flag, holder_depth,
-				(struct cds_ft_node **) head_slot, node);
+				(struct cds_ft_node **) head_slot, node,
+				FT_UNCHAIN_PROMOTE);
 		}
 	}
 

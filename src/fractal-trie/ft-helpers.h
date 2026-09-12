@@ -2841,6 +2841,66 @@ bool ft_dual_home_is_private(struct cds_ft *ft, const struct ft_pub_rec *rec,
 	return true;
 }
 
+#ifdef FT_DEBUG_DUAL_DROP
+/*
+ * THE SKIP_X DUAL INVARIANT DETECTOR (build knob; -DFT_DEBUG_DUAL_DROP).
+ *
+ * THE INVARIANT: while a compressed node @cn is reached through a SKIP_X word
+ * in its own parent, that word encodes cn->child.  Every op that republishes
+ * cn->child must refresh BOTH -- the forward slot and the dual -- in ONE
+ * commit, and into the LIVE home.
+ *
+ * DUAL-STALE: the dual is about to be emitted and the word ALREADY names a
+ * child other than the plan's expected old.  The invariant is broken, every
+ * later attempt on this chain can only abort, and the op then retries
+ * obstruction-free forever, allocating a descriptor per attempt.  ABORTS,
+ * because that is the shape a regression takes and a livelock reports nothing.
+ *
+ * ☞ THIS PREDICATE IS SPACING-INDEPENDENT: it reads the DUAL WORD itself, not
+ * a lock word.  An earlier version of this probe also counted "the dual was
+ * recorded while GP's own state word carried FT_STATE_LOCK" as the exposure
+ * figure -- and that IS a wrong zero above per-node spacing, where the lock
+ * the op would contend for lives on GP's ANCHOR and GP's own word reads clean.
+ * The arm yield for the exclusion now lives where the exclusion does:
+ * ft_lock_skip_dual_gp.
+ */
+# include <stdio.h>
+# include <stdlib.h>
+# include <execinfo.h>
+
+static
+void ft_dbg_dual_probe(struct cds_ft *ft,
+		struct cds_ft_compressed_node *cn,
+		struct cds_ft_metadata *cn_meta,
+		struct cds_ft_inode_flag **skip_slot,
+		struct cds_ft_inode_flag *skip_owner_nf,
+		struct cds_ft_inode_flag *expected_old,
+		struct cds_ft_inode_flag *new_child)
+{
+	struct cds_ft_inode_flag *raw = skip_slot ? *skip_slot : NULL;
+
+	(void) ft;
+	if (!skip_slot || !ft_node_skip_compressed(raw))
+		return;			/* no dual is emitted */
+	if (ft_skip_child_ptr(raw) == expected_old)
+		return;			/* the invariant holds */
+	fprintf(stderr,
+		"FT DUAL-STALE cn=%p len=%u child=%p slot=%p raw=%p owner=%p exp_old=%p new=%p pw=%p off=%u\n",
+		(void *) cn, cn->len, (void *) cn->child, (void *) skip_slot,
+		(void *) raw, (void *) skip_owner_nf, (void *) expected_old,
+		(void *) new_child, (void *) cn_meta->parent_word,
+		ft_meta_parent_slot_offset_load(cn_meta));
+	{
+		void *bt[24];
+		int n = backtrace(bt, 24);
+
+		backtrace_symbols_fd(bt, n, 2);
+	}
+	fflush(stderr);
+	abort();
+}
+#endif /* FT_DEBUG_DUAL_DROP */
+
 static
 void _ft_publish_to_parent_meta(struct cds_ft *ft,
 		struct cds_ft_inode_flag *parent_nf,
@@ -3019,6 +3079,10 @@ void _ft_publish_to_parent_meta(struct cds_ft *ft,
 				ft_txn_parent_slot_at(cn_meta, ft,
 					rec ? rec->mtxn : NULL,
 					&skip_owner_nf);
+#ifdef FT_DEBUG_DUAL_DROP
+			ft_dbg_dual_probe(ft, cn, cn_meta, skip_slot,
+				skip_owner_nf, expected_old, new_child);
+#endif
 			if (skip_slot &&
 			    ft_node_skip_compressed(*skip_slot)) {
 				struct cds_ft_inode_flag *skip_new =

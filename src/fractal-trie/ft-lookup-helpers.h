@@ -52,6 +52,19 @@ struct ft_ord_cell *ft_ord_cell_ptr(const void *prev)
  * byte-identical; it becomes load-bearing only once the prev stores fold onto
  * the txn (Phase 4.3).  Writer-owned / quiescent prev reads keep the direct
  * rcu_dereference -- the ft_meta_nr_child vs ft_meta_nr_child_load split.
+ *
+ * WHEN A WRITER'S PREV READ IS OWNED (the 2026-09-12 sweep's rule).  Every
+ * producer of a parked value on a head's or a member's prev -- a head
+ * promote, a member unlink, a re-parent, the merge's demotion record, the
+ * plain park -- holds the chain holder's lock, or is a bulk op under the
+ * FT-wide writer lock with point ops parked.  A point op therefore owns a
+ * prev word from its acquire of that holder on: a peer's commit settles its
+ * lock release AFTER every structural word (ft_flip_txn_commit's late tag),
+ * so nothing is parked when the acquire succeeds.  A read taken BEFORE the
+ * acquire is not owned and must come through here -- cds_ft_remove's cell
+ * capture -- and the routing it derives is re-validated under the lock
+ * (ft_unchain_kind), since a stale-but-valid value is the other half of the
+ * same window.
  */
 static inline_lookup
 void *ft_dereference_prev_resolved(struct cds_ft_node *node)

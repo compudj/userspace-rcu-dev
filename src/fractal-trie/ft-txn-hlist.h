@@ -351,4 +351,31 @@ void ft_hlist_freeze_prepare(struct urcu_txn *txn, struct cds_ft_node *node)
 	(void) ret;
 }
 
+/*
+ * ft_hlist_freeze_sole_prepare: the freeze of a head the caller DERIVED to be
+ * its key's SOLE entry -- the key-disappearing lanes (a detach, the fused
+ * ft_remove_one_commit), which prune the branch around it.  The expected-old
+ * is that derivation, NULL, never the slot re-loaded here: the derivation was
+ * made with nothing held, and a same-key cds_ft_insert -- concurrent with a
+ * remove in contract under LOCK_FINE -- can have APPENDED a duplicate to
+ * @node since.  Re-loading would mark that duplicate into the tombstone
+ * (MARK(N)) and the prune would orphan it behind a retired head: an OK insert
+ * whose key never resolves again, and a later remove of it that never
+ * terminates (measured: "key LOST after an OK concurrent insert", both list
+ * modes).  Recorded against NULL, the append fails this commit's install CAS
+ * instead -- the record is MW, so a mismatch is an ABORT, which every
+ * key-disappearing caller already routes to a re-derivation that then finds
+ * the successor and PROMOTES it.
+ */
+static inline
+void ft_hlist_freeze_sole_prepare(struct urcu_txn *txn, struct cds_ft_node *node)
+{
+	int ret;
+
+	ret = ft_hlist_store_mw(txn, (void **) &node->next, NULL,
+			ft_hlist_set_mark(NULL), FT_HLIST_TAG);
+	assert(!ret);			/* caller reserved the edge up front */
+	(void) ret;
+}
+
 #endif	/* _FT_TXN_HLIST_H */

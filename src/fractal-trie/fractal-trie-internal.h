@@ -956,10 +956,25 @@ struct ft_pub_rec {
 	 * caller's own @slot_owner_nf declaration; the SKIP_X DUAL cannot, and
 	 * that is the whole reason this field exists -- its owner is the
 	 * GRANDPARENT, DERIVED inside the publish helper from a back-pointer,
-	 * so only the op can say whether it acquired it.  ft_detach_node's
-	 * republish does (the recompact takes {C,P,GP} exactly when P is
-	 * compressed, which is exactly when the dual arises); ft_promote_head
-	 * does not.
+	 * so only the op can say whether it acquired it.
+	 *
+	 * ☠ AND TODAY EVERY PRODUCER SAYS FALSE -- all twelve
+	 * _ft_publish_to_parent callers plus ft_node_recompact's own dual site,
+	 * the insert lane included.  The text that used to stand here, "
+	 * ft_detach_node's republish does (the recompact takes {C,P,GP} exactly
+	 * when P is compressed)", was a STALE CLAIM: that site passes false and
+	 * says why in capitals, because the acquire is a PLAN-TIME fact while
+	 * the dual's owner is DERIVED FRESH at publish (ft-remove.h, the
+	 * "☠ FALSE, AND `old_recompacted_node != NULL` WAS NOT SOUND" note).
+	 *
+	 * ☞ SO THIS FIELD IS ABOUT KIND ONLY, AND NEVER ABOUT EXCLUSION.  The
+	 * dual's home is an MW slot globally; holding GP is what EXCLUDES a peer
+	 * recompaction from copying that body out from under the record, and
+	 * that is ft_lock_skip_dual_gp's job (§9.3's third lock-set member), not
+	 * this word's.  A reader of this field who concludes "false, so the
+	 * record is MW, so it is safe" has answered the kind question and left
+	 * the exclusion one open -- which is exactly how the stale-dual livelock
+	 * got in.
 	 */
 	bool owner_held[3];
 	unsigned int n;

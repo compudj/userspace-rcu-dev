@@ -8247,6 +8247,116 @@ guard:
 		(ctx), (parent_nf), (parent_depth))
 
 /*
+ * §9.3's THIRD LOCK-SET MEMBER: "{C, P} (+ {GP} iff P compressed)".
+ *
+ * A publish under a COMPRESSED parent writes TWO reader-visible words, because
+ * a skip pointer is a shortcut naming the FAR END: @parent_nf's own child slot,
+ * and the SKIP_X DUAL that _ft_publish_to_parent re-encodes -- and the dual
+ * lives in the GRANDPARENT's BODY, so §8.2 makes GP its owner.  The op must
+ * therefore HOLD GP, not merely write through it.
+ *
+ * ☠ WHY A §4.B GUARD ON GP IS NOT ENOUGH, measured.  The guard validates GP's
+ * OWN state word; the DLM resolves every lock-set member to its ANCHOR, so at
+ * any spacing but per-node a peer holds GP through an ANCESTOR and GP's own
+ * word reads CLEAN.  ft_node_recompact then copies GP's body under that
+ * anchor -- its reparent sweep drops the per-slot COPY_SLOT read-set on exactly
+ * that strength ("the node-level node lock already froze every source slot of
+ * the retiring node") -- and a dual that neither holds nor agrees with the
+ * anchor lands in the body the recompaction RETIRES, while the fresh copy keeps
+ * the PRE-DUAL skip word.  cn->child and the reachable dual then disagree
+ * forever and every later dual records an expected-old the word can never
+ * hold: an obstruction-free retry that allocates a descriptor per attempt.
+ * What the acquire has and the guard has not is §1's AGREEMENT property: an op
+ * that could retire GP resolves it to the SAME anchor, so the two contend for
+ * one word at every spacing.  ft_flip_txn_lock_or_guard_parent_at is the choke
+ * point that provides it -- it dedupes against the op's WHOLE held set (not the
+ * txn registry alone, which is exact only at per-node), derives the byte-depth
+ * from the descent, records the RELEASE terminal on a hit, and keeps its
+ * all-or-none abort on a miss.
+ *
+ * ☠ THE CONDITION MIRRORS THE PRODUCER EXACTLY, @mtxn included: the dual's home
+ * is resolved read-your-own-writes when the producer's @rec carries a handle
+ * (ft_txn_parent_slot_at), and an acquire taken on a different derivation than
+ * the record locks the wrong word -- while one taken where no dual is recorded
+ * is pure contention.  Pass the same handle the producer's rec will carry.
+ *
+ * A COMPRESSED ROOT's dual slot IS &ft->root, which has no owning node and
+ * takes the always-MW root route: nothing to acquire.
+ *
+ * ☞ THIS IS EXCLUSION, NOT KIND -- AND THE DUAL'S MW IS BOOKKEEPING, NOT
+ * DESIGN.  The records that stay MW by design are the DLM lock TAKE (the
+ * arbitration point; ft_dlm_lock asserts it), &ft->root (a root lives in no
+ * node, so there is no lock word that could make a park legal), the
+ * duplicate-chain splices and ordered-cell interleave, and rank-count
+ * propagation.  The SKIP_X dual is none of those: it is FT_TK_MWA_DUAL, which
+ * ft-txn-kind-stats.h's header names as the family "unheld only because THIS
+ * op's lock-set does not reach them", and calls the column's rise
+ * "BOOKKEEPING".
+ *
+ * ☞ SO WHAT THIS HELPER REMOVES IS THE REASON FOR THAT DEBT.  ft_detach_node's
+ * own note said what the conversion needed -- "the ANSWER must be publish-time:
+ * the acquired GP compared against the derived dual owner, not the plan's
+ * intent" -- and acquiring the DERIVED owner HERE, at publish, from the same
+ * derivation the record will name, is that answer.  An acquire MISS sets
+ * @acquire_miss, and ft_flip_txn_commit then discards the attempt UNPUBLISHED,
+ * so on every path that actually publishes the op HOLDS GP and an SW park on
+ * that body word would be legal.
+ *
+ * ☠ IT IS STILL NOT FLIPPED HERE, and the reason is sequencing, not doubt: the
+ * same word is recorded MW by producers that have NOT been plumbed --
+ * ft_node_recompact's own dual site (FT_OWNER_UNPLUMBED, though its DLM set
+ * does take gp_meta) and the glue publishes.  One lane parking SW while another
+ * CASes the same slot is the cross-thread kind disagreement the engine cannot
+ * check, so @dual_owner_held flips only when every producer can vouch for the
+ * owner.  That is the G4 conversion ft-txn-kind-stats.h measures, and MW costs
+ * only speed meanwhile.
+ */
+static
+void ft_lock_skip_dual_gp(struct cds_ft *ft,
+		const struct ft_lock_ctx *ctx,
+		struct ft_flip_txn *txn,
+		struct cds_ft_inode_flag *parent_nf,
+		struct urcu_txn *mtxn)
+{
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+	struct cds_ft_compressed_node *cn;
+	struct cds_ft_metadata *cn_meta;
+	struct cds_ft_inode_flag *gp_nf = NULL;
+	struct cds_ft_inode_flag **skip_slot;
+
+	if (!txn || !parent_nf || !ft_node_compressed(parent_nf))
+		return;
+	cn = ft_compressed_node_ptr(parent_nf);
+	cn_meta = cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
+	skip_slot = ft_txn_parent_slot_at(cn_meta, ft, mtxn, &gp_nf);
+	if (!skip_slot || !ft_node_skip_compressed(*skip_slot))
+		return;			/* no dual edge will be recorded */
+	if (skip_slot == &ft->root || !gp_nf)
+		return;			/* root dual: no owning node */
+#ifdef FT_DEBUG_DUAL_DROP
+	{
+		/*
+		 * THE ARM YIELD, and it belongs HERE rather than at the
+		 * detector: this counts every dual whose owner this op now
+		 * contends for, at EVERY spacing, so a green run cannot be read
+		 * as "the fix works" when it is really "the site never ran".
+		 * Zero means the workload does not reach §9.3's third member.
+		 */
+		static unsigned long n_acq;
+		unsigned long n = uatomic_add_return(&n_acq, 1);
+
+		if ((n & 0xff) == 0)
+			fprintf(stderr, "FT DUAL-GP-ACQUIRE %lu\n", n);
+	}
+#endif
+	ft_flip_txn_lock_or_guard_parent(ft, txn, ctx, gp_nf,
+		FT_DEPTH_FROM_DESCENT);
+#else
+	(void) ft; (void) ctx; (void) txn; (void) parent_nf; (void) mtxn;
+#endif
+}
+
+/*
  * Holder-lock variant of ft_flip_txn_lock_or_guard_parent (MW LOCK_FINE Step A):
  * when the op ALREADY holds @parent_nf's node lock -- acquired before the
  * chain read, @held_snap the clean pre-mark word -- record the {LOCK|s -> s}
@@ -9514,12 +9624,20 @@ int ft_remove_one_commit(struct cds_ft *ft,
 	 * chained).  NULL when the caller is not retiring a leaf here.
 	 */
 	if (freeze_leaf) {
-		void *cur = freeze_leaf->next;
-
+		/*
+		 * The expected-old is the caller's DERIVATION -- a sole entry,
+		 * next NULL -- not the slot re-loaded here: a same-key insert can
+		 * have appended a duplicate since that unheld derivation, and
+		 * re-loading would mark it into the tombstone and prune the branch
+		 * around it (an OK insert whose key never resolves again).  Against
+		 * NULL, the append fails this MW edge's install CAS: ABORT, which
+		 * the caller routes to a re-derivation that promotes the successor
+		 * instead.  See ft_hlist_freeze_sole_prepare.
+		 */
 		edges[n].slot = (struct ft_ord_cell **) &freeze_leaf->next;
-		edges[n].old_target = (struct ft_ord_cell *) cur;
+		edges[n].old_target = NULL;
 		edges[n].new_target = (struct ft_ord_cell *)
-			ft_hlist_set_mark((struct cds_ft_node *) cur);
+			ft_hlist_set_mark(NULL);
 		edges[n].tag = FT_HLIST_TAG;
 		n++;
 	}
@@ -9771,7 +9889,7 @@ void ft_record_child_back_edge(struct cds_ft *ft, struct ft_flip_txn *txn,
  * was installed (all fused edges discarded); a retry-enabled caller unwinds
  * and re-descends.  The @txn-NULL lone-store path cannot abort (returns OK).
  */
-#define FT_REMOVE_COMMIT_REC_MAX_EDGES	11	/* <=3 structural (+back-edge) + <=5 cell/run (unsplice = 2 back-edges + deletion mark) + 1 DEL-recompact tombstone + 1 promote head re-parent + 1 detached-prefix mark on the dead cell */
+#define FT_REMOVE_COMMIT_REC_MAX_EDGES	12	/* <=3 structural (+back-edge) + <=5 cell/run (unsplice = 2 back-edges + deletion mark) + 1 DEL-recompact tombstone + 1 promote head re-parent + 1 detached-prefix mark on the dead cell + 1 the SKIP_X dual GP's release-or-guard (ft_lock_skip_dual_gp, §9.3's third member) */
 static
 enum urcu_txn_status ft_remove_commit_rec(struct cds_ft *ft,
 		struct ft_pub_rec *rec,
@@ -15453,8 +15571,24 @@ void ft_glue_record_splices(struct cds_ft *ft, struct ft_glue *g,
 		 * head promote already creates by parking its own proxy on a
 		 * head's prev, met by the resolver every reader uses and, since
 		 * this change, by the four writer sites that resolve a cell from a
-		 * head's prev on the paths a merge shares; the other raw prev reads
-		 * in the tree are a ☐ sweep, not argued here.
+		 * head's prev on the paths a merge shares.
+		 * THE OTHER RAW PREV READS, swept 2026-09-12 (the rule is stated
+		 * on ft_dereference_prev_resolved): a MOVING bulk op's reads
+		 * (rekey, merge, graft, detach, the ordered-run helpers) run
+		 * under the FT-wide writer lock with point ops parked by the bulk
+		 * gate, or on a caller-exclusive source, so no peer can park
+		 * anything -- this record included, which only such an op plants;
+		 * cds_ft_compact takes no gate and owns its reads through the
+		 * relocated node's lock under the caller exclusion its contract
+		 * requires, and the verifier runs quiescent.  A POINT op's reads
+		 * are owned once it holds the chain holder's lock (every chain
+		 * mutation holds it, and a
+		 * commit's lock release settles AFTER its structural words:
+		 * ft_flip_txn_commit's late tag), and the one prologue that read
+		 * a chain word with nothing held (cds_ft_remove's cell capture)
+		 * now resolves, with its routing re-validated under the lock
+		 * (ft_unchain_kind).  cds_ft_replace / insert_replace / remove_all
+		 * read raw under the caller exclusion their contract requires.
 		 */
 		{
 			struct urcu_txn *h = ft_flip_txn_handle(txn);
@@ -15509,6 +15643,12 @@ static
 enum urcu_txn_status ft_glue_publish(struct cds_ft *ft, struct ft_flip_txn *txn,
 		struct ft_glue *g)
 {
+	/*
+	 * NO ft_lock_skip_dual_gp here: a glue publish is a BULK op (graft /
+	 * merge / rekey), which runs under the FT-wide writer lock with point
+	 * ops parked by the bulk gate, so no peer recompaction can be copying
+	 * the SKIP_X dual's owner under it.  ☞ ft_lock_skip_dual_gp.
+	 */
 	struct ft_pub_rec rec = { .n = 0, .mtxn = txn ? txn->mtxn : NULL };
 	struct ft_ord_cell_edge sedges[2] = { 0 };	/* forward slot + compressed SKIP_X dual */
 	unsigned int n;
