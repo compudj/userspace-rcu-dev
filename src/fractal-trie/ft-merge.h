@@ -1731,7 +1731,7 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 			}
 			if (txn && !ft_flip_txn_reserve(txn,
 					nr_dst + 1 + ms_cap + gd.cap_free
-						+ gd.nr_splices
+						+ 2 * gd.nr_splices /* forward link + the head's prev */
 						+ 1 /* §4.B parent guard */
 						/* + count walk: the (merged_keys - cnt_dst) nr_keys ancestor
 						 * edges (BULK fold), bounded by the merge-point depth */

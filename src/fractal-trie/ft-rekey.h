@@ -5261,7 +5261,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 #ifdef FEATURE_FT_MERGE
 			(merge_dst ? 3 * (unsigned int) (mcnt.nd + 8) +
 				(unsigned int) (mcnt.nf_dst + mcnt.nf_src + 16) + 8 +
-				(unsigned int) (mcnt.ns + 8) +	/* dup-chain splices */
+				2 * (unsigned int) (mcnt.ns + 8) +	/* dup-chain splices: forward link + the head's prev */
 				/*
 				 * A COMPRESSED publish parent -- the destination
 				 * behind a path-compressed run -- costs TWO more
@@ -6695,7 +6695,25 @@ cells_done:
 		 * prev was the predecessor LEAF (tag 0), read as a cell.  Found by a
 		 * 3000-shape corpus walk oracle, not by the unit tests.
 		 */
-		if (head_prev && ((uintptr_t) head_prev & FT_ORD_CELL_TAG))
+		/*
+		 * ☠ AND NOT FOR A HEAD THIS COMMIT DEMOTES.  The tag test used to
+		 * decide that by itself, because the splice STORED the demotion
+		 * (prev = its chain predecessor, a leaf) at prepare time; now the
+		 * demotion is a RECORD, so prev still resolves to the cell here
+		 * and the tag test passes.  Stamping that cell would put the DST
+		 * key's byte on a head that, if this commit aborts, stays a head
+		 * at its SOURCE key -- the walk then emits a key not in the trie.
+		 * The splice list is the record of who is demoted.
+		 */
+		bool demoted = false;
+		int si;
+
+		for (si = 0; si < glue.nr_splices; si++)
+			if (glue.splices[si].src_head ==
+					(struct cds_ft_node *) s_top)
+				demoted = true;
+		if (!demoted && head_prev &&
+				((uintptr_t) head_prev & FT_ORD_CELL_TAG))
 			cds_ft_item_to_metadata(ft_ord_cell_ptr(head_prev))
 				->incoming_byte = dst_ord[dst_len - 1];
 	}
@@ -7671,7 +7689,7 @@ enum cds_ft_status ft_rekey_spine_copy(struct cds_ft *dst_ft,
 			txn = ft_flip_txn_create(dst_ft);
 			if (txn && !ft_flip_txn_reserve(txn,
 					nr_dst + 1 + ms_cap + gd.cap_free
-						+ gd.nr_splices
+						+ 2 * gd.nr_splices /* forward link + the head's prev */
 						+ 1 /* §4.B parent guard */
 						/* + count walk: the (merged_keys - cnt_dst) nr_keys ancestor
 						 * edges (BULK fold), bounded by the merge-point depth */

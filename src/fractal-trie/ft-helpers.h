@@ -1676,6 +1676,79 @@ static void ft_parent_rcu_violation(struct cds_ft *ft,
  * and basic accessors): kept here, ahead of the FEATURE_FT_SKIP_COMPRESSED
  * block, so cds_ft_merge_at can use it in all build configs.
  */
+/*
+ * Member-to-head hops an up-walk tolerates before declaring the chain
+ * pathological.  A duplicate chain is unbounded; a cycle is not a shape any
+ * writer publishes, so this is a defensive bound, not a design limit.
+ */
+#define FT_EXT_CHAIN_HOPS_MAX	(1UL << 20)
+
+/*
+ * ft_ext_head_word: from an external @ext, the RAW parent word of its chain's
+ * HEAD (the prefix-head bit kept, a parked flip proxy resolved at the load) --
+ * NULL for a never-inserted node, or a chain the hop bound gave up on.
+ * *@head_ret (optional) is the head itself.
+ *
+ * ☠ AN UP-WALK MAY START ON A MEMBER, NOT A HEAD.  A skip word names a head at
+ * the instant it is encoded, and every up-walk from an external assumed it
+ * still was one.  cds_ft_rekey_merge SPLICES a moved head onto the
+ * destination's duplicate chain, where it is an interior member whose prev is
+ * its PREDECESSOR NODE; a reader still on the retired copy of the source
+ * junction follows that copy's stale skip word straight to it, and reading
+ * the predecessor as a parent word decoded it as a cell (list mode) or as an
+ * internal, and walked into a NULL parent: ft_skip_reanchor's assert, in a
+ * reader thread, on every served merge whose source head is a skip target.
+ * The discriminator is the chain's own (ft_chain_head_holder): a head's prev
+ * is a cell or a flagged internal, never an external; a member's prev is an
+ * external.  Hop to the head first.  A member and its head carry the SAME
+ * key, so the head's position is the member's; a MOVED head's chain runs up
+ * the destination path, and the descent that continues from there is a torn
+ * pass the two-descent witness discards -- exactly what it already does for a
+ * grafted internal node.  Every prev load resolves a parked record: a prev
+ * record carries the flip-proxy tag (FT_HLIST_PREV_TAG), so the one resolver
+ * covers the head's word and a member's alike, and no parked value is
+ * bit-identical to a cell.
+ */
+/*
+ * @count: bump the DEBUG_COUNTERS member-hop counter when a hop happened.  ONLY
+ * the read-side skip re-anchor passes true: the counter is the same-parent
+ * splice oracle's positive control ("a READER walked up from a spliced
+ * member"), and the write path takes these up-walks too (ft_reanchor_flag,
+ * the count walk, the builders' ft_skip_to_compressed), whose hops would make
+ * a non-zero count prove nothing about readers.
+ */
+static inline
+struct cds_ft_inode_flag *ft_ext_head_word(const struct cds_ft *ft,
+		struct cds_ft_node *ext, struct cds_ft_node **head_ret, bool count)
+{
+	struct cds_ft_node *cur = ext;
+	void *prev = ft_dereference_prev_resolved(cur);
+	unsigned long hops = 0;
+
+	while (prev && ft_node_external((struct cds_ft_inode_flag *) prev)) {
+		if (++hops > FT_EXT_CHAIN_HOPS_MAX) {
+			prev = NULL;
+			break;
+		}
+		cur = (struct cds_ft_node *) prev;
+		prev = ft_dereference_prev_resolved(cur);
+	}
+#ifdef DEBUG_COUNTERS
+	if (hops && count)
+		uatomic_inc(&ft->group->nr_ext_member_hops);
+#else
+	(void) count;
+#endif
+	if (head_ret)
+		*head_ret = cur;
+	if (!prev)
+		return NULL;
+	if (ft->ordered_list)
+		return ft_resolve_flip_proxy(rcu_dereference(
+			ft_ord_cell_ptr(prev)->parent));
+	return (struct cds_ft_inode_flag *) prev;
+}
+
 static inline
 struct cds_ft_inode_flag *ft_get_parent_rcu(struct cds_ft *ft,
 		struct cds_ft_inode_flag *node)
@@ -1683,8 +1756,8 @@ struct cds_ft_inode_flag *ft_get_parent_rcu(struct cds_ft *ft,
 	struct cds_ft_inode_flag *parent;
 
 	if (ft_node_external(node))
-		parent = ft_resolve_head_prev(ft,
-			ft_dereference_prev_resolved((struct cds_ft_node *) node));
+		parent = ft_parent_prefix_strip(ft_ext_head_word(ft,
+			(struct cds_ft_node *) node, NULL, false));
 	else if (ft_node_compressed(node))
 		/*
 		 * A compressed node's metadata lives at a FT_TAG_MASK-cleared
@@ -1856,8 +1929,8 @@ struct cds_ft_compressed_node *ft_skip_to_compressed(const struct cds_ft *ft,
 		 * head's parent an internal node -- FT_INTERNAL_MASK, bit 0, the same
 		 * tag a cell carries -- so only the mode flag disambiguates safely.
 		 */
-		parent = ft_resolve_head_prev(ft,
-			ft_dereference_prev_resolved((struct cds_ft_node *) child));
+		parent = ft_parent_prefix_strip(ft_ext_head_word(ft,
+			(struct cds_ft_node *) child, NULL, false));
 	else
 		parent = ft_parent_node(rcu_dereference(cds_ft_item_to_metadata(
 			ft_node_ptr(child))->parent_word));
@@ -1967,9 +2040,10 @@ unsigned int ft_upwalk_edge_bytes(struct cds_ft_inode_flag *cur,
  * an RCU read-side critical section.
  */
 static
-struct cds_ft_inode_flag *ft_skip_reanchor(struct cds_ft *ft,
+struct cds_ft_inode_flag *ft_skip_reanchor_impl(struct cds_ft *ft,
 		struct cds_ft_inode_flag *skip_ptr,
-		unsigned int *rewind, struct cds_ft_inode_flag **at_pos)
+		unsigned int *rewind, struct cds_ft_inode_flag **at_pos,
+		bool reader)
 {
 	unsigned int want = ft_skip_len(skip_ptr);
 	unsigned int acc = 0;
@@ -1987,15 +2061,20 @@ struct cds_ft_inode_flag *ft_skip_reanchor(struct cds_ft *ft,
 
 		if (ft_node_external(cur)) {
 			/*
-			 * ONE load gives both halves of this hop: the parent @cur
-			 * names AND whether @cur is that parent's prefix head
+			 * From the chain HEAD -- @cur may be an interior member
+			 * (ft_ext_head_word); the head's position is the member's.
+			 * ONE load gives both halves of this hop: the parent the
+			 * head names AND whether it is that parent's prefix head
 			 * (ft_upwalk_edge_bytes).  Keep the raw word -- stripping
 			 * is what ft_resolve_head_prev does for callers that only
 			 * want the node -- so the two cannot be taken from
 			 * different observations of a live re-home.
 			 */
-			head_word = ft_head_parent_word_raw(ft,
-				(struct cds_ft_node *) cur);
+			struct cds_ft_node *head;
+
+			head_word = ft_ext_head_word(ft,
+				(struct cds_ft_node *) cur, &head, reader);
+			cur = (struct cds_ft_inode_flag *) head;
 			parent = ft_parent_prefix_strip(head_word);
 		} else {
 			parent = ft_parent_node(rcu_dereference(
@@ -2018,6 +2097,20 @@ struct cds_ft_inode_flag *ft_skip_reanchor(struct cds_ft *ft,
 			 * and the accumulation reaches @want at or below it -- there
 			 * are no root-level skip pointers -- so the walk never steps
 			 * onto it.
+			 *
+			 * ☐ ...as long as the skip child stays at its DEPTH.  Two
+			 * producers of a shallower child: a rekey to a SHORTER key
+			 * moves an internal child up, and the member hop above
+			 * substitutes a chain HEAD that sits on the destination path,
+			 * shallower than the encoded position when the destination
+			 * key is shorter.  Either way the new chain is shorter than
+			 * the encoded length and this walk would step onto the root.
+			 * Reasoned, not measured (the fixed-key oracles keep every
+			 * head at one depth), and handing the root back here was
+			 * refuted: with @rewind 0 the write-path ft_reanchor_flag,
+			 * the detach source resolve and the count walk would accept
+			 * it without a witness.  The variable-length oracle is owed,
+			 * and the answer for those callers with it.
 			 */
 			assert(0);
 			return NULL;		/* defensive under NDEBUG */
@@ -2058,6 +2151,15 @@ struct cds_ft_inode_flag *ft_skip_reanchor(struct cds_ft *ft,
 		cur = parent;
 	}
 	return NULL;	/* pathological (cycle?): caller re-descends from root */
+}
+
+/* The read-side entry: the descent, the inequality and ordered-query walkers. */
+static
+struct cds_ft_inode_flag *ft_skip_reanchor(struct cds_ft *ft,
+		struct cds_ft_inode_flag *skip_ptr,
+		unsigned int *rewind, struct cds_ft_inode_flag **at_pos)
+{
+	return ft_skip_reanchor_impl(ft, skip_ptr, rewind, at_pos, true);
 }
 
 static inline
@@ -2562,7 +2664,9 @@ struct cds_ft_inode_flag *ft_reanchor_flag(struct cds_ft *ft,
 	if (caa_unlikely(child && ft_node_skip_compressed(child))) {
 		struct cds_ft_inode_flag *at_pos, *anchor;
 
-		anchor = ft_skip_reanchor(ft, child, rewind_ret, &at_pos);
+		/* Write path: its hops are not the oracle's positive control. */
+		anchor = ft_skip_reanchor_impl(ft, child, rewind_ret, &at_pos,
+				false);
 		assert(anchor != NULL);
 		return at_pos;
 	}

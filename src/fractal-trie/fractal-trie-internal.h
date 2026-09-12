@@ -1599,6 +1599,8 @@ struct cds_ft_group {
 	unsigned long nr_nodes_allocated, nr_nodes_freed;
 	unsigned long nr_internal_alloc, nr_internal_freed;
 	unsigned long nr_compressed_alloc, nr_compressed_freed;
+	/* up-walks that started on a duplicate-chain MEMBER (ft_ext_head_word) */
+	unsigned long nr_ext_member_hops;
 	pthread_mutex_t arena_lock;	/* Protects lazy arena creation. */
 	struct cds_ft_key_map key_map;
 	unsigned long nr_ft_instances;	/* Number of Fractal Trie instances in the group. */

@@ -4227,10 +4227,10 @@ retry_swap:
 		 * sub-points below so the existing per-side syncs drain each side.
 		 */
 		if (gs_ord) {
-			gs_d_first = ft_ord_cell_ptr(rcu_dereference(
-				ft_subtree_minmax_head(dst_ft, old_child, false)->prev));
-			gs_d_last = ft_ord_cell_ptr(rcu_dereference(
-				ft_subtree_minmax_head(dst_ft, old_child, true)->prev));
+			gs_d_first = ft_ord_cell_ptr(ft_dereference_prev_resolved(
+				ft_subtree_minmax_head(dst_ft, old_child, false)));
+			gs_d_last = ft_ord_cell_ptr(ft_dereference_prev_resolved(
+				ft_subtree_minmax_head(dst_ft, old_child, true)));
 			gs_s_first = ft_ord_first(swap_ft);	/* NULL if swap empty */
 			gs_s_last = ft_ord_last(swap_ft);
 		}

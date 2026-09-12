@@ -90,6 +90,22 @@
 
 /* Logical-deletion mark: the public cds_ft_node removal tombstone (bit 1). */
 #define FT_HLIST_MARK	CDS_FT_NODE_REMOVED_FLAG
+/*
+ * ☠ A prev WORD IS READ BY READERS, and a record parked on it must not be
+ * bit-identical to a value it can legitimately hold.  Every up-walk from an
+ * external -- the skip re-anchor, ft_skip_to_compressed, ft_get_parent_rcu --
+ * loads prev through ft_dereference_prev_resolved, which resolves the FT
+ * flip-proxy tag (low nibble 0xF) and nothing else; and in list mode a HEAD's
+ * prev is an ordinal cell pointer tagged FT_ORD_CELL_TAG, which is BIT 0 --
+ * the same bit as URCU_TXN_TAG.  A prev record with the hlist tag would
+ * therefore read as a cell to a reader hopping a duplicate chain (a member's
+ * prev is its predecessor, a raw external pointer; the hop stops at the first
+ * non-external value and takes it for the head's word).  So prev-word records
+ * carry the flip-proxy tag, which no prev value has (nodes and cells are
+ * 16-byte aligned), and the reader's one resolver covers them.  next-word
+ * records keep the hlist tag: next is read through ft_hlist_resolve.
+ */
+#define FT_HLIST_PREV_TAG	FT_FLIP_PROXY_TAG
 
 /*
  * Worst-case MCAS edge counts, for the caller's txn reservation.  A tail append
@@ -193,7 +209,7 @@ int ft_hlist_insert_after_prepare(struct urcu_txn *txn,
 	/* pos->next: succ -> newp ; succ->prev: pos -> newp. */
 	ft_hlist_store_mw(txn, (void **) &pos->next, succ, newp, FT_HLIST_TAG);
 	if (succ != NULL)
-		ft_hlist_store_mw(txn, (void **) &succ->prev, pos, newp, FT_HLIST_TAG);
+		ft_hlist_store_mw(txn, (void **) &succ->prev, pos, newp, FT_HLIST_PREV_TAG);
 	return 0;
 }
 
@@ -208,24 +224,21 @@ int ft_hlist_insert_after_prepare(struct urcu_txn *txn,
  * concurrent freeze of the tail fails this commit), so only the tail carries a
  * proxy while the commit is in flight; the interior of neither run is disturbed.
  *
- * ★ @run_head->prev = tail is a PLAIN store, and the caller owns undoing it.
- * The claim that used to stand here -- "writer-only; readers never read prev,
- * and @run_head is unreachable to readers because a merge detaches and drains
- * the src side before appending it" -- describes ft_merge_spine_copy, the only
- * caller when it was written.  It is FALSE for the one-decide fold, which
- * records the src detach and this splice into ONE txn: the src side is still
- * LIVE here.  And prev IS read -- under SKIP_COMPRESSED a parent slot encodes
- * the skip onto the head itself and ft_skip_to_compressed recovers the
- * compressed node through prev.
- *
- * So this store is reader-visible and, unlike the recorded edge beside it,
- * survives an aborted commit.  The caller must be able to put it back:
- * ft_glue_record_splices snapshots the old value unconditionally and
- * ft_glue_abort restores it.  Do not re-derive "prev is writer-only" here, and
- * do not make that undo conditional on which caller you think can still abort
- * -- ft_merge_spine_copy's own commit (ft-merge.h, after the record) can return
- * non-OK too, and the next bail added anywhere after a record must be covered
- * by default rather than by a decision frozen at the call site.
+ * ★ @run_head->prev IS RECORDED BY THE CALLER, not stored here.  It used to
+ * be a plain store on the claim "writer-only; readers never read prev, and
+ * @run_head is unreachable to readers because a merge detaches and drains the
+ * src side before appending it" -- true of ft_merge_spine_copy, the only
+ * caller when it was written, FALSE for the one-decide fold, which records
+ * the src detach and this splice into ONE txn with the src side still LIVE.
+ * And prev IS read: every up-walk from an external starts at it, and a reader
+ * on the retired copy of the src junction follows that copy's stale skip word
+ * straight to @run_head.  A plain store there was the one torn state the
+ * reader's two-descent witness cannot repair -- BOTH descents see the same
+ * half-moved head before the flip -- and it survived an abort, which the
+ * caller had to undo by hand.  Recorded (FT_HLIST_PREV_TAG, beside the
+ * forward link, in ft_glue_record_splices) it flips atomically with the rest
+ * of the move and is discarded with an abort; the reservation is two records
+ * per splice.
  */
 static inline
 void ft_hlist_append_run_prepare(struct urcu_txn *txn,
@@ -234,7 +247,6 @@ void ft_hlist_append_run_prepare(struct urcu_txn *txn,
 {
 	int ret;
 
-	run_head->prev = tail;		/* writer-only plain store */
 	ret = ft_hlist_store_mw(txn, (void **) &tail->next, NULL, run_head,
 			FT_HLIST_TAG);
 	assert(!ret);			/* caller reserved the edge up front */
@@ -262,7 +274,7 @@ int ft_hlist_del_prepare(struct urcu_txn *txn, struct cds_ft_node *elem)
 	struct cds_ft_node *next = (struct cds_ft_node *)
 			urcu_txn_load(txn, (void **) &elem->next, FT_HLIST_TAG);
 	struct cds_ft_node *pred = (struct cds_ft_node *)
-			urcu_txn_load(txn, (void **) &elem->prev, FT_HLIST_TAG);
+			urcu_txn_load(txn, (void **) &elem->prev, FT_HLIST_PREV_TAG);
 
 	/*
 	 * Mark elem (logical delete), unlink forward (pred->next: elem -> next)
@@ -276,7 +288,7 @@ int ft_hlist_del_prepare(struct urcu_txn *txn, struct cds_ft_node *elem)
 			ft_hlist_set_mark(next), FT_HLIST_TAG);
 	ft_hlist_store_mw(txn, (void **) &pred->next, elem, next, FT_HLIST_TAG);
 	if (next != NULL)
-		ft_hlist_store_mw(txn, (void **) &next->prev, elem, pred, FT_HLIST_TAG);
+		ft_hlist_store_mw(txn, (void **) &next->prev, elem, pred, FT_HLIST_PREV_TAG);
 	return 0;
 }
 
@@ -300,7 +312,7 @@ int ft_hlist_replace_prepare(struct urcu_txn *txn,
 	struct cds_ft_node *next = (struct cds_ft_node *)
 			urcu_txn_load(txn, (void **) &old->next, FT_HLIST_TAG);
 	struct cds_ft_node *pred = (struct cds_ft_node *)
-			urcu_txn_load(txn, (void **) &old->prev, FT_HLIST_TAG);
+			urcu_txn_load(txn, (void **) &old->prev, FT_HLIST_PREV_TAG);
 
 	/* Build @newp's links invisibly, then swing pred->next and next->prev. */
 	newp->next = next;
@@ -310,7 +322,7 @@ int ft_hlist_replace_prepare(struct urcu_txn *txn,
 			ft_hlist_set_mark(next), FT_HLIST_TAG);
 	ft_hlist_store_mw(txn, (void **) &pred->next, old, newp, FT_HLIST_TAG);
 	if (next != NULL)
-		ft_hlist_store_mw(txn, (void **) &next->prev, old, newp, FT_HLIST_TAG);
+		ft_hlist_store_mw(txn, (void **) &next->prev, old, newp, FT_HLIST_PREV_TAG);
 	return 0;
 }
 

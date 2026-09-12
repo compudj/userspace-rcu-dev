@@ -3917,14 +3917,14 @@ static int inv_rekey_graft_coherent_readers(void)
  *        under Q2 = (bp,4), which holds nothing else, so the detach collapses
  *        Q2 into D4's run -- the DEEP fold of a live top.
  *   f=4  NOT same-parent: the mover M5 = (bp,5,7,4) hangs off a run under
- *        Q3 = (bp,5), which keeps a fixed sibling (bp,5,1,1); the dst is
- *        f=0's resident D = (bp,3,0,2).  This is the merge arm's COW of the
+ *        Q3 = (bp,5), which keeps a fixed sibling (bp,5,1,1); the dst is its
+ *        own resident D5 = (bp,3,0,3) under P.  This is the merge arm's COW of the
  *        dst parent (ft_rekey_merge_cow_publish_parent), the src detached from
  *        a junction of its own -- the shape the corpus serves, with the one
  *        property the others share: the mover is a SKIP TARGET that the
  *        splice turns into a non-head chain member.
- * RKSP_FLAVOURS (env, bitmask) selects the flavours run; the default is 0x3
- * -- see the ☠ note at the mask for why 2, 3 and 4 are opt-in.
+ * RKSP_FLAVOURS (env, bitmask) selects the flavours run; the default is 0x13
+ * (0, 1 and 4) -- see the note at the mask.
  * Junctions are writer-private, so the only
  * peers of a move are the readers: a refusal here is a finding, not
  * contention, and is fatal.
@@ -3998,11 +3998,15 @@ static uint64_t rksp_fkey(uint8_t bp, int f, bool mover)
 	case 3:
 		return ((uint64_t) bp << 24) | (4ULL << 16) |
 			((uint64_t) (mover ? 7 : 6) << 8) | (mover ? 4 : 2);
-	default:	/* f=4: the mover under Q3 = (bp,5); the dst is f=0's */
+	default:	/* f=4: the mover under Q3 = (bp,5); its own resident under P */
 		return mover ? (((uint64_t) bp << 24) | (5ULL << 16) |
-				(7ULL << 8) | 4) : rksp_key(bp, 0, 2);
+				(7ULL << 8) | 4) : rksp_key(bp, 0, 3);
 	}
 }
+
+/* DEBUG_COUNTERS-only hook (no public declaration); weak so every build links. */
+extern void cds_ft_debug_ext_member_hops(const struct cds_ft_group *group,
+		unsigned long *hops) __attribute__((weak));
 
 /* Remove @n, stored at key @v, by IDENTITY (a chain member); no free. */
 static enum cds_ft_status rksp_remove(struct cds_ft *ft, uint64_t v,
@@ -4282,32 +4286,16 @@ static void rksp_child(void)
 		w[i].bp = (uint8_t) (i + 1);
 		rcu_read_lock();
 		/*
-		 * ☠ FLAVOUR 4 IS A KNOWN-RED REPRODUCER, opt-in (RKSP_FLAVOURS=16).
-		 * It reaches a pre-existing READER defect: the precise lookup
-		 * re-anchors at every skip-encoded slot by walking up from the
-		 * skip word's child, reading that child's prev as a HEAD's parent
-		 * word -- and the splice has made the mover an interior member of
-		 * the destination's duplicate chain (prev = its predecessor, an
-		 * hlist-transacted word).  A reader on the retired copy of the
-		 * source junction follows the copy's stale skip word into it and
-		 * hits ft_skip_reanchor's NULL-parent assert.  Any served merge
-		 * whose source head is a skip target has it; the HEAD-of-handoff
-		 * control asserts on this flavour identically.  A first cure --
-		 * hop from the member to its head -- was refuted: the member's
-		 * prev carries the txn engine's tag the prev resolver does not
-		 * resolve, the source head's prev is a plain pre-commit store,
-		 * and a MOVED node's head sits at the destination key, so the
-		 * walk would return a holder on the wrong path.  The re-anchor's
-		 * contract under a MOVE (walk vs. restart from the root) is a
-		 * reader design decision; until it is made this flavour stays
-		 * off by default so the gate stays green and honest.
-		 *
 		 * Flavours 2 and 3 (through a run, same parent) need the merge
-		 * arm's through-a-run frame, parked behind that same decision.
+		 * arm's through-a-run frame; until it lands they are opt-in via
+		 * RKSP_FLAVOURS.  Flavour 4 is the reproducer of the reader
+		 * re-anchor defect (a stale skip word into a spliced chain member)
+		 * and runs by default now that the reader hops to the head; the
+		 * positive control below proves the hop branch ran.
 		 */
 		w[i].flavours = getenv("RKSP_FLAVOURS") ?
 			(unsigned int) strtoul(getenv("RKSP_FLAVOURS"), NULL, 0) :
-			0x3u;
+			0x13u;
 		for (f = 0; f < 3; f++) {
 			uint64_t sk = f < 2 ? rksp_key(w[i].bp, 0, f ? 5 : 1) :
 				(((uint64_t) w[i].bp << 24) | (5ULL << 16) |
@@ -4320,13 +4308,6 @@ static void rksp_child(void)
 		for (f = 0; f < RKSP_NF; f++) {
 			uint64_t rk = rksp_fkey(w[i].bp, f, false);
 
-			if (f == 4) {
-				/* f=4 merges into f=0's resident: same head, own mover */
-				w[i].res[f] = w[i].res[0];
-				w[i].fresh[f] = w[i].fresh[0];
-				w[i].mov[f] = node_alloc(rksp_fkey(w[i].bp, f, true));
-				continue;
-			}
 			w[i].res[f] = node_alloc(rk);
 			if (insert_u64(ft, rk, w[i].res[f]) != CDS_FT_STATUS_OK)
 				abort();
@@ -4335,7 +4316,7 @@ static void rksp_child(void)
 			w[i].fresh[f] = node_alloc(rk);
 		}
 		rcu_read_unlock();
-		live += 3 + (RKSP_NF - 1);
+		live += 3 + RKSP_NF;
 	}
 	for (i = 0; i < RKSP_NR; i++) {
 		r[i].ft = ft;
@@ -4414,7 +4395,32 @@ static void rksp_child(void)
 	fprintf(stderr, "# inv_rekey_merge_same_parent_coherent_readers: %d writers "
 		"%d readers, %lu splices, %lu busy, %lu reads, %lu live keys\n",
 		RKSP_NW, RKSP_NR, total_ops, total_busy, total_checks, live);
-	(void) group;
+	/*
+	 * POSITIVE CONTROL.  A merge flavour's whole point is the reader that
+	 * follows a stale skip word into a spliced chain member; if no up-walk
+	 * ever started on a member, this run exercised nothing of that.  The
+	 * counter is DEBUG_COUNTERS-only, so the hook is weak -- and a weak hook
+	 * resolves to NULL SILENTLY, so say which case this is.
+	 */
+	if (cds_ft_debug_ext_member_hops) {
+		unsigned long hops = 0;
+
+		cds_ft_debug_ext_member_hops(group, &hops);
+		fprintf(stderr, "# inv_rekey_merge_same_parent_coherent_readers: "
+			"%lu up-walks started on a chain member (positive control%s)\n",
+			hops, (w[0].flavours & 0x1cu) ? "" : ": no merge flavour ran");
+		/* 0x1c: the flavours whose MOVER is a SKIP TARGET (a head under a
+		 * run) -- the only ones that can put a member under a stale skip
+		 * word; 0 and 1 splice heads reached through plain slots. */
+		if ((w[0].flavours & 0x1cu) && total_ops && hops == 0) {
+			fprintf(stderr, "rksp: merge flavours ran but no up-walk ever "
+				"started on a member -- the shape is not built\n");
+			ret = -1;
+		}
+	} else {
+		fprintf(stderr, "# inv_rekey_merge_same_parent_coherent_readers: "
+			"no DEBUG_COUNTERS hook (positive control BLIND on this build)\n");
+	}
 	_exit(ret ? 1 : 0);
 }
 

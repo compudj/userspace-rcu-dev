@@ -287,5 +287,14 @@ static inline
 void ft_ord_cell_set_parent(struct cds_ft_node *head,
 		struct cds_ft_inode_flag *parent)
 {
-	rcu_assign_pointer(ft_ord_cell_ptr(head->prev)->parent, parent);
+	/*
+	 * Resolve, do not read raw: a head's prev can carry a parked flip
+	 * proxy -- a head promote parks its own there, and a merge's recorded
+	 * demotion of the head (ft_glue_record_splices, FT_HLIST_PREV_TAG) is
+	 * a second producer.  The resolve costs one predicted branch.  Other
+	 * writer sites still read a head's prev raw; whether each is excluded
+	 * from meeting a parked proxy is not argued anywhere yet (☐ sweep).
+	 */
+	rcu_assign_pointer(ft_ord_cell_ptr(
+		ft_dereference_prev_resolved(head))->parent, parent);
 }

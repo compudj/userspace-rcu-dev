@@ -240,8 +240,8 @@ void ft_park_live_parent_edge(struct cds_ft *ft,
 		 * External head, ordered list ON: its parent lives in the cell
 		 * carried by node->prev.
 		 */
-		field = &ft_ord_cell_ptr(
-			((struct cds_ft_node *) child)->prev)->parent;
+		field = &ft_ord_cell_ptr(ft_dereference_prev_resolved(
+			(struct cds_ft_node *) child))->parent;	/* resolved: see ft_ord_cell_set_parent */
 	} else {
 		/*
 		 * External head, ordered list OFF: there is no cell -- the

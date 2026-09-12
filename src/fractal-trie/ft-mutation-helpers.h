@@ -9705,8 +9705,10 @@ void ft_record_child_back_edge(struct cds_ft *ft, struct ft_flip_txn *txn,
 			/*child_marked=*/ false, hold_ctx);
 		return;
 	} else if (ft->ordered_list) {
-		field = &ft_ord_cell_ptr(
-			((struct cds_ft_node *) child)->prev)->parent;
+		/* Resolved: a parked demotion record may sit on prev (see
+		 * ft_ord_cell_set_parent). */
+		field = &ft_ord_cell_ptr(ft_dereference_prev_resolved(
+			(struct cds_ft_node *) child))->parent;
 	} else {
 		field = (struct cds_ft_inode_flag **)
 			&((struct cds_ft_node *) child)->prev;
@@ -11062,7 +11064,8 @@ unsigned long ft_subtree_key_count(struct cds_ft *ft,
 			 * live node AT the encoded position; an accumulator descends INTO
 			 * @at_pos for both rewind cases.
 			 */
-			(void) ft_skip_reanchor(ft, child, &rewind, &at_pos);
+			(void) ft_skip_reanchor_impl(ft, child, &rewind, &at_pos,
+					false);	/* write path, see @count */
 			rchild = at_pos;	/* live self-consistent node (may be NULL on a
 					   pathological reanchor -- skip that subtree,
 					   an undercount is already tolerated here) */
@@ -11388,9 +11391,8 @@ struct ft_glue_splice {
 	 * would silently skip the undo for any bail added between the record and
 	 * the commit -- the arming decision must not be frozen at the call site.
 	 */
-	void *src_prev;
-	void *src_demoted_to;
-	bool src_demoted;
+	/* (src_prev / src_demoted_to / src_demoted: gone -- the demotion is a
+	 * recorded edge now, see ft_glue_record_splices.) */
 	/*
 	 * The demoted @src_head's ordered-list cell, captured by
 	 * ft_glue_record_splices.  It stays REACHABLE through its src-run
@@ -14056,25 +14058,13 @@ void ft_glue_abort(struct cds_ft *ft, struct ft_glue *g)
 	 * A committed merge must not reach here (same contract as the re-parent
 	 * marks below), so the demotion it made is never undone.
 	 */
-	for (i = 0; i < g->nr_splices; i++) {
-		if (!g->splices[i].src_demoted)
-			continue;
-		/*
-		 * CAS, not a store: undo OUR write and only while it is still ours.
-		 * ft_glue_acquire_splice_holders locks the DST head's chain holder
-		 * only (ft_chain_head_holder(ft, dst_head)); the SRC head's holder is
-		 * never acquired, so between the append and here a peer may
-		 * legitimately retarget src_head->prev -- a src-side recompact, or a
-		 * head promote swapping a fresh cell in.  A blind store would then
-		 * install our STALE snapshot over the peer's current value, which is
-		 * the same wrong-back-pointer corruption this undo exists to prevent,
-		 * merely pointing the other way.  If the CAS fails the peer owns the
-		 * field now and its value must stand.
-		 */
-		(void) uatomic_cmpxchg(&g->splices[i].src_head->prev,
-			g->splices[i].src_demoted_to, g->splices[i].src_prev);
-		g->splices[i].src_demoted = false;
-	}
+	/*
+	 * ☞ NO src_head->prev UNDO ANY MORE: the demotion is a RECORDED edge
+	 * (ft_glue_record_splices), discarded with the aborted commit like the
+	 * forward link beside it.  The paragraph above describes the plain store
+	 * this replaced; it stays as the record of why a plain store there was
+	 * wrong twice over (torn for readers, undone by hand on abort).
+	 */
 
 	/*
 	 * Dup-chain holder locks (MW LOCK_FINE): a merge that acquired its
@@ -15193,9 +15183,6 @@ void ft_glue_record_splice(struct ft_glue *g,
 	 * ft_glue_abort with the splice already in the array, and the undo loop
 	 * there must see false rather than whatever the buffer last held.
 	 */
-	g->splices[g->nr_splices].src_prev = NULL;
-	g->splices[g->nr_splices].src_demoted_to = NULL;
-	g->splices[g->nr_splices].src_demoted = false;
 	g->splices[g->nr_splices].holder = NULL;
 	g->splices[g->nr_splices].holder_snap = 0;
 	g->nr_splices++;
@@ -15414,30 +15401,64 @@ void ft_glue_record_splices(struct cds_ft *ft, struct ft_glue *g,
 		 * List off: src_head->prev is the flagged parent, no cell.
 		 */
 		g->splices[i].src_cell = ft->ordered_list ?
-			ft_ord_cell_ptr(src_head->prev) : NULL;
-		/*
-		 * Snapshot the back-pointer the append is about to overwrite, so an
-		 * abort can put it back (see @src_prev).  Taken here, before the
-		 * prepare, because the prepare is where the plain store happens.
-		 */
-		g->splices[i].src_prev = src_head->prev;
+			ft_ord_cell_ptr(ft_dereference_prev_resolved(src_head)) :
+			NULL;	/* resolved: a peer's promote can park a proxy here */
 
 		while (ft_node_next(tail))
 			tail = ft_node_next(tail);
 		/*
-		 * @src_head (an already-published, detached+drained src head)
-		 * becomes a duplicate at the tail of @dst_head's chain.  Record
-		 * the reader-visible forward link tail->next: NULL -> src_head
-		 * into the bulk merge @txn (the run rides along via src_head->next,
-		 * which is untouched; src_head->prev = tail is a writer-only plain
-		 * store inside the primitive).  The tail-walk above reads unmodified
-		 * slots -- recorded edges do not install until the commit -- so it
-		 * always finds the true pre-merge tail.
+		 * @src_head becomes a duplicate at the tail of @dst_head's chain.
+		 * TWO recorded edges, both reader-visible: the forward link
+		 * tail->next: NULL -> src_head, and the head's own back-pointer
+		 * src_head->prev: <its holder's word> -> tail, which demotes it
+		 * from head to member.  The prev edge used to be a plain store
+		 * at prepare time (undone by hand on abort); under the one-decide
+		 * fold the src side is still LIVE here, every up-walk from an
+		 * external starts at prev, and a reader on the retired copy of the
+		 * src junction follows that copy's stale skip word straight to this
+		 * head -- so a plain store was the one torn state the two-descent
+		 * witness cannot repair (both descents see it before the flip).
+		 * Recorded, it flips with the move and vanishes with an abort.
+		 * FT_HLIST_PREV_TAG: a prev record carries the flip-proxy tag, the
+		 * one tag the readers' prev loads resolve (see ft-txn-hlist.h).
+		 * The tail-walk above reads unmodified slots -- recorded edges do
+		 * not install until the commit -- so it always finds the true
+		 * pre-merge tail.
+		 *
+		 * ☞ WHAT THIS DOES AND DOES NOT EXCLUDE.  This op holds the DST
+		 * head's chain holder only (ft_glue_acquire_splice_holders); the
+		 * SRC head's is not acquired here, and under the fold a peer may
+		 * still act on that head between this record and the commit.  A
+		 * peer WRITE to its prev (a src-side recompaction re-homing it, a
+		 * head promote swapping a fresh cell in) now fails THIS commit --
+		 * the record's expected-old no longer matches -- and the op
+		 * retries against the peer's result; the plain store this replaced
+		 * would have clobbered the peer's word or been clobbered.  A peer
+		 * RAW READ of the parked record is the residue: the same class a
+		 * head promote already creates by parking its own proxy on a
+		 * head's prev, met by the resolver every reader uses and, since
+		 * this change, by the four writer sites that resolve a cell from a
+		 * head's prev on the paths a merge shares; the other raw prev reads
+		 * in the tree are a ☐ sweep, not argued here.
 		 */
+		{
+			struct urcu_txn *h = ft_flip_txn_handle(txn);
+			void *prev_old = urcu_txn_load(h, (void **) &src_head->prev,
+					FT_HLIST_PREV_TAG);
+			int ret;
+
+			ret = ft_hlist_store_mw(h, (void **) &src_head->prev,
+					prev_old, (void *) tail, FT_HLIST_PREV_TAG);
+			/*
+			 * Reserved up front (two edges per splice), so this cannot
+			 * fail; and if it ever did, -ENOMEM is STICKY to the commit
+			 * (rcu-txn.h): the whole flip fails, the forward link beside
+			 * it never installs, and no member is left with a head's word.
+			 */
+			assert(!ret);
+			(void) ret;
+		}
 		ft_hlist_append_run_prepare(ft_flip_txn_handle(txn), tail, src_head);
-		/* The value the prepare just stored: the undo's CAS expected-old. */
-		g->splices[i].src_demoted_to = tail;
-		g->splices[i].src_demoted = true;
 	}
 }
 

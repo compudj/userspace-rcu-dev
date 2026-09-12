@@ -700,6 +700,19 @@ void cds_ft_debug_node_balance(const struct cds_ft_group *group,
 	if (freed)
 		*freed = group->nr_nodes_freed;
 }
+
+/*
+ * How many up-walks started on a duplicate-chain MEMBER and hopped to its head
+ * (ft_ext_head_word) -- the positive control for the same-parent splice
+ * oracle: a run of its merge flavours that never took that branch has not
+ * exercised what it claims to.  Test-only, no public header declaration.
+ */
+void cds_ft_debug_ext_member_hops(const struct cds_ft_group *group,
+		unsigned long *hops)
+{
+	if (hops)
+		*hops = group->nr_ext_member_hops;
+}
 #endif
 
 /*
