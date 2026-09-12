@@ -11878,6 +11878,11 @@ static const struct {
 	/* the pass-through the design named: the src junction below the shared parent */
 	{ { "ac", "axy", "axz" }, "ac", "axy", 1 },
 	{ { "b", "c", "d" }, "b", "c", 1 },	/* root frame, the root keeps a sibling */
+	/* corpus 1424: the dst head's parent hangs off a RUN off the root, so
+	 * the frame climbs past the run to the root -- the src junction itself,
+	 * whose DEL recompaction is the witness, the publish two levels below
+	 * it subsumed by the copy (the run and the head's parent untouched) */
+	{ { "acc", "cbc", "ac", "b" }, "acc", "b", 1 },
 	/* one level down the same shape is the same-path arm, served before
 	 * this change too: a regression row, not a row of the post-detach arm */
 	{ { "xab", "xc", "xd" }, "xc", "xab", 1 },

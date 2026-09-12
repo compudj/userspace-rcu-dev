@@ -2485,7 +2485,7 @@ int ft_rekey_merge_cow_publish_parent(struct cds_ft *ft,
 		const uint8_t *src_ord, size_t src_len, const uint8_t *dst_ord,
 		struct cds_ft_inode_flag *src_pnf,
 		struct cds_ft_inode_flag *merged_plain,
-		struct ft_rekey_cow_after *after,
+		struct ft_rekey_cow_after *after, bool *frame_above_pnf,
 		struct ft_held_anchor *marks, unsigned int *nr_marks,
 		struct cds_ft_inode_flag **pp_prime_ret,
 		struct cds_ft_inode **pp_old_ret)
@@ -2504,6 +2504,7 @@ int ft_rekey_merge_cow_publish_parent(struct cds_ft *ft,
 	bool via_run, on_src_path;
 	int ret;
 
+	*frame_above_pnf = false;
 	if (!d_dst->pnf || !d_dst->nfp || !d_dst->pnfp)
 		return FT_REKEY_UNCOVERED;
 	/*
@@ -2541,6 +2542,32 @@ int ft_rekey_merge_cow_publish_parent(struct cds_ft *ft,
 	}
 	if (!cow_nf || !cow_slot)
 		return FT_REKEY_UNCOVERED;
+	/*
+	 * ☞ AND PAST A COMPRESSED GRANDPARENT, for the same reason.  A frame
+	 * whose own parent is a run cannot be republished by one store (the
+	 * run's child slot plus the SKIP_X dual re-encoded in the run's parent,
+	 * recorded at commit time -- after the detach may have relocated that
+	 * parent), but nothing requires THIS frame: the witness is any plain
+	 * node on the dst path getting a fresh address.  So climb once more, to
+	 * the run's parent -- known to the descent only when it is the ROOT
+	 * (@pppdepth 0, its slot &ft->root, no parent to fence); a deeper one
+	 * stays refused, its parent slot being outside the descent frame.
+	 * Corpus seed 1424: `{acc,cbc,ac,b}` dst acc src b, the dst head's
+	 * parent under a run off the root, the src junction the root itself.
+	 */
+	if (!via_run && cow_pnf && (ft_node_compressed(cow_pnf)
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+			|| ft_node_skip_compressed(cow_pnf)
+#endif
+			) && d_dst->pppnf && d_dst->pppdepth == 0 &&
+			d_dst->pppnfp == &ft->root) {
+		cow_nf = d_dst->pppnf;
+		cow_depth = 0;
+		cow_pnf = NULL;
+		cow_slot = d_dst->pppnfp;
+		cow_pdepth = 0;
+	}
+	*frame_above_pnf = cow_nf != d_dst->pnf;
 	/*
 	 * ☑ A ROOT FRAME (@cow_pnf NULL, the slot &ft->root) IS NOT REFUSED
 	 * HERE: it is on every source path, so it takes the post-detach arm
@@ -2949,7 +2976,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 * the node the detach relocates, so a DEL recompaction of that node
 	 * cannot fold it -- see the subsumption at detach_bail.
 	 */
-	bool witness_via_run = false;
+	bool witness_above = false;
 	struct ft_flip_txn *txn;
 	struct ft_glue glue;
 	struct ft_graft_store_state gst_st = { 0 };	/* GLUE never runs prepare */
@@ -4833,8 +4860,8 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 			ret = ft_rekey_merge_cow_publish_parent(ft, &d_dst, txn,
 					optxn, &glue, merged_pub, src_ord,
 					src_len, dst_ord, src_plain, merged_plain,
-					&cow_after, marks, &nr_marks, &dst_pp_prime,
-					&dst_pp_old);
+					&cow_after, &witness_above, marks, &nr_marks,
+					&dst_pp_prime, &dst_pp_old);
 			if (ret == FT_REKEY_COW_AFTER_DETACH) {
 				/*
 				 * ON THE SOURCE PATH: announce the publish for
@@ -4861,11 +4888,6 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 				ft_glue_set_publish(ft, &glue, d_dst.pnf, d_dst.nfp,
 					merged_pub);
 				witness_by_detach = true;
-				witness_via_run = ft_node_compressed(d_dst.pnf)
-#ifdef FEATURE_FT_SKIP_COMPRESSED
-					|| ft_node_skip_compressed(d_dst.pnf)
-#endif
-					;
 				ret = 0;
 			} else if (ret) {
 				goto bail_build;
@@ -7063,11 +7085,23 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 * terminally (ft_chain_compress_fused) rather than falling back to a
 	 * one-child internal this frame would then have blessed.
 	 */
-	if (!ret && witness_by_detach && witness_via_run &&
-			!txn->pending_pub_folded && detach_rc.new_flag &&
-			!glue.count_delta) {
-		txn->pending_pub_folded = true;
-		txn->pending_pub_node = detach_rc.new_flag;
+	if (!ret && witness_by_detach && witness_above &&
+			!txn->pending_pub_folded && !glue.count_delta) {
+		struct cds_ft_inode_flag *survivor = detach_rc.new_flag;
+
+		/*
+		 * The relocated ancestor may also have COLLAPSED into a run
+		 * (left with the dst side only and no key): the merged run then
+		 * carries the path below it verbatim, and it is the survivor
+		 * the count re-base names -- decoded compressed-aware there.
+		 */
+		if (!survivor && detach_rc.collapse.new_cn)
+			survivor = ft_compressed_node_flag(
+				detach_rc.collapse.new_cn);
+		if (survivor) {
+			txn->pending_pub_folded = true;
+			txn->pending_pub_node = survivor;
+		}
 	}
 	if (!ret && witness_by_detach && !txn->pending_pub_folded) {
 		if (detach_rc.new_flag)
