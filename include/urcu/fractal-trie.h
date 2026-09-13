@@ -2966,25 +2966,63 @@ enum cds_ft_status cds_ft_group_attr_set_optimize(
  *                       than carried by one commit (☐ confirm whether it needs
  *                       more than the acquire+revalidate the other three do).
  *
- * ☐ THE CROSS-TRIE OPS ARE THE SAME ITEM, NOT A BIGGER ONE -- and cds_ft_merge_at
- * is the proof, because it is already CONVERTED.  Its note reads: "the DESTINATION
- * may be a live trie carrying concurrent writers -- several cross-trie attaches
- * concurrently on the same destination.  The SOURCE must be EXCLUSIVE", and the
- * attach arbitrates against those peers on the destination.
+ * THE CROSS-TRIE / BULK OPS: the SOURCE side is settled, and the destination's
+ * story is NOT the per-node conversion an earlier version of this note claimed.
  *
- * ⇒ SO THE SOURCE SIDE IS ALREADY SETTLED BY CONTRACT, EVERYWHERE: cds_ft_graft
- * and cds_ft_graft_swap require an EXCLUSIVE source under FINE, cds_ft_merge
- * likewise, and cds_ft_detach hands back a trie that is exclusive by
- * construction.  An exclusive trie has no concurrent writer to coordinate with,
- * so there is nothing to lock there.  What remains unconverted in cds_ft_graft,
- * cds_ft_merge and cds_ft_detach is the DESTINATION (for detach, the live trie it
- * cuts from) -- the same per-node lock-set coordination the point ops owe, on one
- * trie, with merge_at's arbitration as the worked example.
+ * Settled: cds_ft_graft and cds_ft_graft_swap require an EXCLUSIVE source under
+ * FINE, cds_ft_merge_at likewise (its code returns BUSY for a concurrent source),
+ * and cds_ft_detach hands back a trie exclusive by construction.  An exclusive
+ * trie has no concurrent writer to coordinate with, so nothing is owed there.
  *
- * ☠ DO NOT re-describe these as "a two-trie exclusion question".  That reading
- * treats the exclusive-source requirement as if it were still open and makes a
- * bounded conversion look like a research problem; an earlier version of this
- * note said exactly that and was wrong.
+ * What their FINE paragraphs actually promise is BULK-vs-BULK: "several cross-trie
+ * attaches (cds_ft_graft, cds_ft_graft_swap, cds_ft_merge_at) may run concurrently
+ * on the same destination", while "exclusion against the point-update operations
+ * remains the caller's responsibility".
+ *
+ * ☠ AND BULK-vs-POINT IS NOT THE CALLER'S -- G5.25 ALREADY DOES IT, WITH THE
+ * FT-WIDE LOCK.  A FINE trie RE-TAKES the FT-wide writer lock for the whole window
+ * a bulk op is live (ft_writer_scope_enter's `ft->lock_fine &&
+ * !(FT_BULK_WIDE_LOCK && ft_bulk_active(ft))` test), so bulk and point writers
+ * arbitrate on one word again -- "the whole of G5.5's exclusion".  The sentences
+ * above therefore UNDER-describe what the library provides, and the point ops'
+ * own notes say nothing about bulk ops at all.
+ *
+ * ⇒ SO "merge_at already converted its destination" IS WRONG, and an earlier
+ * version of this note said it.  merge_at's live-destination safety IS that
+ * interim FT-wide lock; the converted/unconverted wording across graft,
+ * graft_swap, merge_at, cds_ft_merge and cds_ft_detach corresponds to NO
+ * difference in how they exclude a point writer.  FT-SLOT-3 states the
+ * consequence where it bites: the glue's unconditional SW park on a live node's
+ * parent word is sound ONLY because of this re-take -- "☠ SO IT IS A DEPENDENCY,
+ * NOT AN INVARIANT.  The day the FT-wide lock is relaxed to only flipping the
+ * dual-descent state -- the recorded direction -- this SW park loses its
+ * exclusion."  ⇒ THE BULK DESTINATION'S REAL CONVERSION IS THAT RELAXATION, and
+ * it has no worked example in tree.  Do not cite merge_at as one.
+ *
+ * ☐ TWO HEADER BUGS FOUND WHILE ENUMERATING, both still present:
+ *   - cds_ft_merge says "NOT concurrency-safe" yet its body is one line:
+ *     `return cds_ft_merge_at(dst_ft, key, key_len, src_ft, key, key_len);`.
+ *     Both notes cannot be right; the code says merge_at's is.
+ *   - cds_ft_merge_at says "@src_ft ... May be in either exclusive or concurrent
+ *     mode" in one paragraph and "The SOURCE must be EXCLUSIVE" in the next,
+ *     while the code refuses a concurrent source with BUSY.
+ *
+ * ☐ AND FOUR MUTATORS THIS ENUMERATION FIRST MISSED -- a reminder that the list is
+ * the declarations, not the ones with a writer-strategy block:
+ *   - cds_ft_rekey_graft / cds_ft_rekey_merge have NO writer-strategy paragraph at
+ *     all, against this section's own promise that "each operation below states
+ *     the caller's mutual-exclusion requirement".  In code they arm the COHERENT
+ *     bulk gate and then take a writer scope, so G5.25 excludes them exactly as it
+ *     does the other bulk ops.  A DOCUMENTATION gap, not a code gap.
+ *   - cds_ft_compact and cds_ft_compact_step say the caller must exclude, and mean
+ *     it: the one-shot takes a writer scope, _step takes NO scope and NO bulk
+ *     gate.  Its per-relocation -EAGAIN -> CDS_FT_COMPACT_BUSY plumbing is already
+ *     there for the conversion, unused.
+ *   - cds_ft_recompute_stats likewise, and the rekey path calls it internally
+ *     inside its own bulk window.
+ *
+ * ☑ EXEMPT, not unconverted: a group that maintains order statistics is coerced to
+ * CDS_FT_WRITER_LOCK_COARSE, so the FINE question does not arise for any op on it.
  *
  * ⇒ THE RECIPE EXISTS IN-TREE.  The point remove was converted exactly this way:
  * derive the holder, acquire it, RE-VALIDATE that it still names what the plan

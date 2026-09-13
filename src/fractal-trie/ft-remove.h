@@ -6165,9 +6165,33 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 	/*
 	 * No top-down descent.  @node is application-owned and, with the RCU
 	 * read-side lock held continuously since it was obtained, stays
-	 * alive; the writer mutex held here freezes the structure, so
-	 * node->prev is a settled live pointer to the node's holder and the
-	 * slot that holds @node can be derived directly:
+	 * alive; node->prev names the node's holder and the slot that holds
+	 * @node can be derived from it directly:
+	 *
+	 * ☠ BUT NOT BECAUSE A WRITER MUTEX FREEZES ANYTHING, and this comment
+	 * used to say it did -- "the writer mutex held here freezes the
+	 * structure, so node->prev is a settled live pointer".  That was true
+	 * under CDS_FT_WRITER_LOCK_COARSE and is FALSE under the fine-grained
+	 * default, where cds_ft_remove's own header promises it may run
+	 * concurrently with another remove ON THE SAME KEY: there is no mutex
+	 * here, and a back-pointer is stale at rest, unbounded.  A false
+	 * premise on a CONVERTED path is worse than an unconverted op that
+	 * says so, because nothing marks it as owed.
+	 *
+	 * ☞ WHAT ACTUALLY CARRIES IT is the derivation being RE-VALIDATED under
+	 * the holder's lock once taken, with a RETRIABLE bail when the holder
+	 * moved -- ft_chain_head_holder's re-check and ft_unchain_kind's
+	 * under-lock routing, plus the txn's own expected-old.  The derivation
+	 * here is a PLAN, not a conclusion.
+	 *
+	 * ☐ AND THE ALTERNATIVE DISPOSITIONS OF THIS SAME DEFECT ARE DEAD CODE:
+	 * the FT_RM_ACQUIRE_FIRST and FT_RM_REVALIDATE arms below are reachable
+	 * from no build -- neither macro is defined anywhere in the tree, so
+	 * their measurements ("48/160 seeds") describe a path nothing compiles.
+	 * Decide them or delete them; left as-is they read like live coverage.
+	 */
+	/*
+	 * The slot derivation itself:
 	 *
 	 *  - INTERNAL ancestors recover their parent slot from their own
 	 *    metadata (parent + parent_slot_offset), used by ft_detach_node's
