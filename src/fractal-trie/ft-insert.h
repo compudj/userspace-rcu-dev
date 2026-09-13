@@ -3798,6 +3798,14 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 	 * one (cds_ft_insert, cds_ft_remove, cds_ft_replace, cds_ft_remove_all).
 	 */
 	struct ft_op_retry op_retry;
+	/*
+	 * ☠ WHAT THIS OP DISPLACED, and it is NOT the same as @old_node_ret.
+	 * The compressed key-shorter arm sets @old_node_ret to a chain it left
+	 * IN THE TRIE (it reports the key already present and leaves @node
+	 * uninstalled), so tombstoning @old_node_ret blindly would freeze a
+	 * LIVE chain.  Only the two arms that actually unlink one record here.
+	 */
+	struct cds_ft_node *displaced = NULL;
 	struct ft_insert_commit ic = { 0 };
 	/*
 	 * The attach's recompactions lock {C, P, GP}; @d dates them and @ic.txn
@@ -3869,6 +3877,7 @@ restart_replace_attempt:
 	ret = 0;
 	nr_snapshot = 0;
 	*old_node_ret = NULL;
+	displaced = NULL;
 	node->prev = cell;		/* NULL when the list is off */
 	node->next = NULL;
 	if (precell && key_len)
@@ -3968,6 +3977,7 @@ restart_replace_attempt:
 						external_nodes);
 				/* Replace existing chain: key count unchanged. */
 				*old_node_ret = external_nodes;
+				displaced = external_nodes;
 				ft_external_head_set_parent(ft, node, d.nf, /*prefix=*/ true);
 				node->next = NULL;
 				/*
@@ -4097,6 +4107,7 @@ restart_replace_attempt:
 					ft_node_ptr(d.nf));
 			/* External node at end of key. Replace chain: key count unchanged. */
 			*old_node_ret = (struct cds_ft_node *) ft_node_ptr(d.nf);
+			displaced = *old_node_ret;
 			/*
 			 * Replacing the head of an EXTERNAL chain: @node takes the
 			 * old head's place, whichever shape that was, so INHERIT the
@@ -4405,6 +4416,29 @@ insert_replace_done:
 		ret = -ENOMEM;
 	}
 	if (ret == 0) {
+		/*
+		 * ☠ TOMBSTONE THE CHAIN THIS OP DISPLACED.  Its sibling
+		 * _cds_ft_replace_locked freezes the ONE node it displaces (three
+		 * sites); this op displaced a whole CHAIN and used to freeze none of
+		 * it, so a caller still holding one of those nodes had no way to
+		 * learn it had left the trie -- and neither did cds_ft_remove, whose
+		 * ft_node_is_removed() escape exists precisely for "a peer removed
+		 * @node itself since the derivation: the interior lane would
+		 * otherwise unlink a ghost".  With that escape defeated, remove took
+		 * the interior lane on the ghost, derived @pred from a stale prev and
+		 * recorded `pred->next: elem -> next` against a slot that can never
+		 * hold @elem -- 50001 attempts and no exit.  Reproducible in FIVE
+		 * single-threaded calls: insert A at K, insert B at K,
+		 * insert_replace C at K, re-init A and insert it elsewhere, remove B.
+		 *
+		 * AFTER the publish, not fused with it: the marks are sound only once
+		 * the chain is unreachable, and ft_chain_mark_removed_flip leaves the
+		 * successor pointers intact so the caller can still walk what it was
+		 * handed in order to reclaim it.  Same ordering cds_ft_remove_all
+		 * uses (mark on ret == 0).
+		 */
+		if (displaced)
+			ft_chain_mark_removed_flip(ft, displaced);
 		if (key_len > uatomic_load(&ft->max_used_key_len, CMM_RELAXED))
 			uatomic_store(&ft->max_used_key_len, key_len, CMM_RELAXED);
 	}

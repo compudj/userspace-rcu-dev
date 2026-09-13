@@ -73,9 +73,9 @@
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (392 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (393 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (341 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (342 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -28693,6 +28693,110 @@ static int excl_neg_expect_sigabrt(void (*child_fn)(void))
 	return 0;
 }
 
+/*
+ * cds_ft_insert_replace must TOMBSTONE THE CHAIN IT DISPLACES.
+ *
+ * Its sibling _cds_ft_replace_locked freezes the single node it displaces, at
+ * three sites.  This op displaces a whole CHAIN and used to freeze none of it,
+ * so a caller still holding one of those nodes could not learn it had left the
+ * trie -- and neither could cds_ft_remove, whose ft_node_is_removed() escape
+ * exists precisely for "a peer removed @node itself since the derivation: the
+ * interior lane would otherwise unlink a ghost".  With the escape defeated,
+ * remove took the interior lane on the ghost, derived @pred from a stale prev
+ * and recorded `pred->next: elem -> next` against a slot that can never hold
+ * @elem: 50001 attempts and NO EXIT.
+ *
+ * ☞ THE RACE IS IN CONTRACT (under FINE, cds_ft_remove promises same-key
+ * concurrency, so "look up K, get B, remove B while a peer replaces K" is
+ * exactly what the escape is for) but the SHAPE needs no concurrency at all --
+ * which is what makes this a five-call deterministic test instead of a soak.
+ *
+ * ☠ A REGRESSION HERE HANGS RATHER THAN FAILS, because the defect is an
+ * unbounded retry inside cds_ft_remove and no caller-side bound can interrupt
+ * it.  So the sequence runs in a FORKED CHILD under alarm(): a regression
+ * becomes SIGALRM, which this reports as a failure, instead of wedging the
+ * suite.  Same reason test_rekey_same_path_atomic_or_refused forks.
+ */
+static void insert_replace_ghost_child(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_fixed_fine_lock_ft(8, &group);
+	struct ft_test_node *A = node_alloc(1), *B = node_alloc(2),
+		*C = node_alloc(3);
+	struct cds_ft_node *old = NULL, *res = NULL;
+	struct cds_ft_iter *it;
+	uint8_t K[8], K2[8];
+	enum cds_ft_status s;
+
+	cds_ft_u64_to_key(ft, 7, K, CDS_FT_LEN_DEFAULT);
+	cds_ft_u64_to_key(ft, 9, K2, CDS_FT_LEN_DEFAULT);
+	if (cds_ft_iter_create(ft, &it) != CDS_FT_STATUS_OK)
+		_exit(3);
+
+	rcu_read_lock();
+	if (cds_ft_insert(ft, K, CDS_FT_LEN_DEFAULT, &A->node) !=
+			CDS_FT_STATUS_OK)
+		_exit(3);
+	if (cds_ft_insert(ft, K, CDS_FT_LEN_DEFAULT, &B->node) !=
+			CDS_FT_STATUS_OK)
+		_exit(3);
+	/* Displaces {A, B} and hands them back, still linked. */
+	if (cds_ft_insert_replace(ft, K, CDS_FT_LEN_DEFAULT, &C->node, &old) !=
+			CDS_FT_STATUS_DUPLICATE_FOUND || old != &A->node)
+		_exit(3);
+	/* Legal: A is out of the trie, so it may be re-armed and re-inserted.
+	 * A->next becomes NULL while B->prev still names A. */
+	cds_ft_node_init(&A->node);
+	if (cds_ft_insert(ft, K2, CDS_FT_LEN_DEFAULT, &A->node) !=
+			CDS_FT_STATUS_OK)
+		_exit(3);
+	/* B is a ghost.  This must ANSWER, and answer NOT_FOUND. */
+	cds_ft_iter_set_key(it, K, CDS_FT_LEN_DEFAULT);
+	(void) cds_ft_lookup(ft, it);
+	s = cds_ft_remove(ft, it, &B->node);
+	rcu_read_unlock();
+
+	cds_ft_iter_destroy(it);
+	(void) res;
+	_exit(s == CDS_FT_STATUS_NOT_FOUND ? 42 : 4);
+}
+
+static int test_insert_replace_tombstones_displaced_chain(void)
+{
+	pid_t pid;
+	int status;
+
+	pid = fork();
+	if (pid < 0) {
+		fprintf(stderr, "insert_replace ghost: fork failed\n");
+		return -1;
+	}
+	if (pid == 0) {
+		alarm(30);		/* a regression spins forever */
+		insert_replace_ghost_child();
+		_exit(5);		/* unreachable */
+	}
+	if (waitpid(pid, &status, 0) != pid) {
+		fprintf(stderr, "insert_replace ghost: waitpid failed\n");
+		return -1;
+	}
+	if (WIFSIGNALED(status)) {
+		fprintf(stderr, "insert_replace ghost: child killed by signal "
+			"%d%s\n", WTERMSIG(status),
+			WTERMSIG(status) == SIGALRM ?
+				" (SIGALRM -- cds_ft_remove did not return: the "
+				"displaced chain was not tombstoned)" : "");
+		return -1;
+	}
+	if (!WIFEXITED(status) || WEXITSTATUS(status) != 42) {
+		fprintf(stderr, "insert_replace ghost: child exit %d, expected "
+			"42 (remove must answer NOT_FOUND for a displaced node)\n",
+			WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+		return -1;
+	}
+	return 0;
+}
+
 static int test_excl_validate_writer_writer(void)
 {
 	if (!cds_ft_excl_validate_enabled()) {
@@ -39002,6 +39106,7 @@ int main(int argc, char **argv)
 
 	/* 18. FEATURE_FT_EXCL_VALIDATE negative tests (SKIP if absent) */
 	diag("Exclusive-access validator tests");
+	RUN_TEST(test_insert_replace_tombstones_displaced_chain);
 	RUN_TEST(test_excl_validate_writer_writer);
 	RUN_TEST(test_excl_validate_excl_reader_writer);
 	RUN_TEST(test_excl_validate_concurrent_reader_writer_no_rcu);

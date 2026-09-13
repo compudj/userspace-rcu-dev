@@ -24928,38 +24928,65 @@ static int inv_concurrent_insert_replace_run(bool coarse, const char *name)
 }
 
 /*
- * ☐ BOTH ARMS ARE OPT-IN, and the reason is NOT the op under test.  They reach
- * an open livelock in cds_ft_remove: with the retry cap armed
- * (-DFT_DEBUG_OP_RETRY_CAP) this row fires
+ * ☑ BOTH ARMS ARE IN THE DEFAULT SET, and the history is worth keeping because
+ * what they caught was not the op they name.  They were opt-in and RED while
+ * cds_ft_insert_replace displaced a chain WITHOUT TOMBSTONING IT: a holder of a
+ * displaced node could not learn it had left the trie, cds_ft_remove's
+ * ft_node_is_removed() escape could not fire, and remove spun 50001 times on
+ * the ghost -- 48 GB of it, since each attempt allocates.  With the retry cap
+ * armed (-DFT_DEBUG_OP_RETRY_CAP) that read
  *
  *   FT OP RETRY LIVELOCK: op=2 attempts=50001 last_ret=0
- *   FT OP RETRY SITE: line=7226 consecutive=50000
- *   FT OP PROXY PARKER: streak=1 switches=259 nr_mw=2 rec_old=0x20 rec_new=0x20
+ *   FT OP EAGAIN SITE: line=5822 consecutive=50000
  *
- * -- op 2 is cds_ft_REMOVE, and {0x20 -> 0x20} all-MW with a DIFFERENT
- * descriptor per refusal is ft_flip_txn_guard_parent's §4.B {live -> live}
- * state guard.  Uncaged it costs 48 GB (measured peak RSS 49041 MB against a
- * 48 G cap, while a non-spinning run of the SAME row finishes under 8 G): the
- * leaking-livelock family, so an ungated row does not fail politely, it
- * memcg-kills the suite.
+ * and the URCU_TXN_REC_LOST hook named the losing edge as
+ * `pred->next: elem -> next` against a slot holding NULL.
  *
- * ☠ AND THE COARSE ARM SPINS TOO, which is what makes it interesting rather
- * than merely blocked.  Under COARSE every writer serialises on the FT-wide
- * mutex, so no peer can be parking the word remove is refused on -- it is a
- * SELF-REFUSAL, a property of the shape alone, and COARSE is the IN-CONTRACT
- * arm.  That is the same class as the standing default+COARSE two-writer
- * livelock, whose remaining route is ft_detach_node's chain-compress collapse.
+ * ★ THE COARSE ARM SPINNING IS WHAT GAVE IT AWAY.  Under COARSE every writer
+ * serialises on the FT-wide mutex, so no peer could be parking the word remove
+ * was refused on -- a SELF-refusal, i.e. a property of the SHAPE, which is what
+ * made it reproducible in five single-threaded calls
+ * (test_insert_replace_tombstones_displaced_chain in ft_unit is that sequence).
  *
- * ⇒ set FT_INV_INSERT_REPLACE=1 to run them.  They are the reproducer for that
- * livelock and the regression guard for the parked-proxy expected-old fixed
- * alongside them; they go back in the default set when the livelock closes.
+ * Measured across the fix: the reusing arm wedged 7 of 8 runs before and 0 of 8
+ * after.  ☞ The three compile-time control arms below
+ * (FT_INV_SIR_{FRESH_NODES,SOUND_REUSE,NO_GHOST_REMOVE}) are what established
+ * the fault was the library's and not this row's node recycling; keep them.
+ */
+/*
+ * ☐ THE FINE ARM IS OPT-IN, on a defect the tombstone fix above MADE VISIBLE
+ * rather than introduced:
+ *
+ *   ft-txn-hlist.h:228: ft_hlist_insert_after_prepare:
+ *     Assertion `!((uintptr_t) succ & 2UL)' failed.
+ *
+ * That assert is FT-SLOT-2's own RED CONTROL, and its comment says what it is
+ * for in as many words: "@pos->next MARKED means @pos is a RETIRED head and
+ * this append is building onto a chain that no longer exists ... The interop
+ * invariant this file's header states is exactly that this case is SEEN here."
+ *
+ * ★ IT COULD NEVER FIRE BEFORE.  cds_ft_insert_replace displaced chains without
+ * marking them, so an append onto one looked exactly like an append onto a live
+ * chain -- a SILENTLY LOST INSERT.  Marking the displaced chain is what turned
+ * that silence into this assert.  ⇒ the finding is that cds_ft_insert's append
+ * derives its position and does not re-validate that the chain is still live,
+ * and a concurrent cds_ft_insert_replace can displace it in between.  That is
+ * the unconverted-op gap for insert_replace, now with a detector on it.
+ *
+ * The COARSE arm below is clean (8 runs, 0 asserts) because serialised writers
+ * cannot open that window, which is also what says the gap is the FINE one.
+ *
+ * ⇒ FT_INV_INSERT_REPLACE=1 to run it; it goes back in the default set when the
+ * append re-validates.
  */
 static int inv_concurrent_insert_replace_nolist(void)
 {
 	if (!getenv("FT_INV_INSERT_REPLACE")) {
 		diag("inv_concurrent_insert_replace_nolist: skipped (set "
-			"FT_INV_INSERT_REPLACE=1; reaches an open cds_ft_remove "
-			"livelock -- op=2, 50001 attempts, 48 GB)");
+			"FT_INV_INSERT_REPLACE=1; reaches an append onto a "
+			"RETIRED chain -- cds_ft_insert does not re-validate "
+			"its append position against a concurrent "
+			"insert_replace)");
 		return 0;
 	}
 	return inv_concurrent_insert_replace_run(false,
@@ -24968,12 +24995,6 @@ static int inv_concurrent_insert_replace_nolist(void)
 
 static int inv_concurrent_insert_replace_coarse(void)
 {
-	if (!getenv("FT_INV_INSERT_REPLACE")) {
-		diag("inv_concurrent_insert_replace_coarse: skipped (set "
-			"FT_INV_INSERT_REPLACE=1; the COARSE arm spins too -- a "
-			"SELF-refusal, and coarse is the in-contract arm)");
-		return 0;
-	}
 	return inv_concurrent_insert_replace_run(true,
 		"inv_concurrent_insert_replace_coarse");
 }
