@@ -3166,11 +3166,6 @@ restart_attempt:
 				struct cds_ft_metadata *dup_hmeta = NULL;
 				uintptr_t dup_hsnap = 0;
 
-				if (unique_node_ret) {
-					*unique_node_ret = external_nodes;
-					ret = -EEXIST;
-					goto insert_done;
-				}
 				/*
 				 * MW LOCK_FINE (Step A, holder lock): the chain walk
 				 * + tail append serialise on @metadata (the internal
@@ -3202,6 +3197,10 @@ restart_attempt:
 						if (ft_acquire_member(ft, &hctx,
 								d.nf, metadata,
 								d.depth, &hh)) {
+							FT_DBG_UNIQUE_ACQFAIL(
+								unique_node_ret,
+								metadata,
+								external_nodes);
 							ret = -EAGAIN;
 							goto insert_done;
 						}
@@ -3237,17 +3236,74 @@ restart_attempt:
 					 * ☠ FIX BOTH ARMS OR NEITHER: they are
 					 * one defect wearing two shapes.
 					 */
-					if (caa_unlikely(
+					{
+						bool stale__ =
 							metadata->external_nodes !=
 							external_nodes ||
 							ft_node_is_removed(
-								external_nodes))) {
-						if (dup_hmeta)
-							ft_meta_lock_release(
-								dup_hmeta);
-						ret = -EAGAIN;
-						goto insert_done;
+								external_nodes);
+
+						/*
+						 * The one place the question is
+						 * DECIDABLE: under the lock, was
+						 * the unheld capture already wrong?
+						 */
+						FT_DBG_UNIQUE(stale__,
+							unique_node_ret);
+						if (caa_unlikely(stale__)) {
+							if (dup_hmeta)
+								ft_meta_lock_release(
+									dup_hmeta);
+							ret = -EAGAIN;
+							goto insert_done;
+						}
 					}
+				}
+				/*
+				 * ★ THE -EEXIST VERDICT, TAKEN UNDER THE LOCK.
+				 *
+				 * This return used to sit at the CAPTURE above,
+				 * beside "@external_nodes is read here with NOTHING
+				 * held" -- so cds_ft_insert_unique answered "a
+				 * duplicate exists, here it is" from a word no
+				 * exclusion covered, and jumped out BEFORE the
+				 * acquire and the re-validate the plain-insert path
+				 * goes on to make.  Nothing new had to be written to
+				 * fix it: the re-validation the walk already needs
+				 * (@external_nodes unmoved AND not retired) is
+				 * exactly the proof this verdict needs, so the
+				 * verdict simply moved BELOW it.
+				 *
+				 * MEASURED before: ~40 DUPLICATE_FOUND per run whose
+				 * node was not on the key's chain, against COARSE's
+				 * zero from a sample at least as large
+				 * (inv_concurrent_insert_unique_nolist).  A peer's
+				 * same-key sole remove retires the captured head in
+				 * the gap, and the caller is handed "your insert
+				 * failed, here is the existing node" for a node that
+				 * has left the trie.
+				 *
+				 * ☞ AND UNIQUENESS WAS NEVER THE BROKEN PART -- that
+				 * was measured too, with a red control that forced
+				 * the detector to fire, so the zero means something.
+				 * The empty-key race is already arbitrated: the
+				 * loser's parent-slot CAS fails and its retry then
+				 * sees the duplicate.  Which is why this is a
+				 * re-validation and NOT new exclusion around the
+				 * insert.
+				 *
+				 * A stale capture now answers -EAGAIN from the
+				 * re-validate above and the wrapper re-descends, so
+				 * the verdict a caller receives is one the holder
+				 * lock stood behind.  ☠ FIX BOTH ARMS OR NEITHER:
+				 * the external-chain twin below is the same defect.
+				 */
+				if (unique_node_ret) {
+					*unique_node_ret = external_nodes;
+					ret = -EEXIST;
+					if (dup_hmeta)
+						ft_meta_lock_release(dup_hmeta);
+					goto insert_done;
 				}
 				/* Find last duplicate */
 				iter_node = external_nodes;
@@ -3320,11 +3376,6 @@ restart_attempt:
 			 */
 			ft_delay_writer();
 
-			if (unique_node_ret) {
-				*unique_node_ret = dup_head;
-				ret = -EEXIST;
-				goto insert_done;
-			}
 			/*
 			 * MW LOCK_FINE (Step A, holder lock): serialise the chain
 			 * walk + tail append on the external head's holder (its
@@ -3405,6 +3456,9 @@ restart_attempt:
 								&hctx,
 								holder_flag,
 								hm, hd, &hh)) {
+							FT_DBG_UNIQUE_ACQFAIL(
+								unique_node_ret, hm,
+								dup_head);
 							ret = -EAGAIN;
 							goto insert_done;
 						}
@@ -3432,18 +3486,43 @@ restart_attempt:
 					 * same reason as the remove side's
 					 * ft_unchain_kind re-validation.
 					 */
-					if (caa_unlikely(
+					{
+						bool stale__ =
 							ft_node_is_removed(dup_head) ||
 							ft_chain_head_holder(ft,
 								dup_head) !=
-							holder_flag)) {
-						if (dup_hmeta)
-							ft_meta_lock_release(
-								dup_hmeta);
-						ret = -EAGAIN;
-						goto insert_done;
+							holder_flag;
+
+						/* Decidable here, and only here. */
+						FT_DBG_UNIQUE(stale__,
+							unique_node_ret);
+						if (caa_unlikely(stale__)) {
+							if (dup_hmeta)
+								ft_meta_lock_release(
+									dup_hmeta);
+							ret = -EAGAIN;
+							goto insert_done;
+						}
 					}
 				}
+			}
+			/*
+			 * ★ THE -EEXIST VERDICT, TAKEN UNDER THE LOCK -- the
+			 * external-chain twin of the prefix-head arm above, moved
+			 * for the same reason and carrying the same proof.  @dup_head
+			 * was the DESCENT's landing, taken with nothing held; the
+			 * re-validate just above establishes that it is neither
+			 * retired nor re-homed (it also re-derives the holder, which
+			 * the prefix arm has no need of -- there the holder is @d.nf
+			 * itself).  Below it, the verdict is one the holder lock
+			 * stood behind; above it, it was a guess.
+			 */
+			if (unique_node_ret) {
+				*unique_node_ret = dup_head;
+				ret = -EEXIST;
+				if (dup_hmeta)
+					ft_meta_lock_release(dup_hmeta);
+				goto insert_done;
 			}
 			/* Find last duplicate */
 			iter_node = dup_head;

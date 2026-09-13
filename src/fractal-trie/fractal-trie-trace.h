@@ -20,10 +20,125 @@
  * Included by fractal-trie.c AFTER fractal-trie-internal.h.
  */
 
+#include <stdio.h>
+#include <urcu/uatomic.h>
+
+/*
+ * ★ WAS THE UNHELD CAPTURE ALREADY WRONG BY THE TIME THE LOCK LANDED?
+ *
+ * cds_ft_insert_unique used to answer -EEXIST from the descent's landing, a word
+ * no exclusion covered.  Whether that cost anything cannot be measured FROM A
+ * TEST: the only observable is "the returned node is not on the key's chain",
+ * and a peer may legitimately remove the key between the call and the check, so
+ * the count mixes the defect with a benign race.  ☠ AND THE COARSE ARM DOES NOT
+ * DISCRIMINATE IT -- the FT-wide lock serialises the TEST'S OWN follow-up walk
+ * too (the peer must be woken and scheduled after the release), so coarse draws
+ * a near-zero for a reason that has nothing to do with the verdict.  A control
+ * that differs from the arm in more ways than the one being measured is not a
+ * control.
+ *
+ * The honest instrument lives INSIDE the op, where the question is decided under
+ * the holder lock and the answer cannot change under it: compare the capture
+ * against the re-read the walk already performs.  A mismatch, or a retired
+ * capture, means the verdict taken at the OLD position WOULD HAVE BEEN WRONG --
+ * and that is a fact, not a sample.  Costs one increment on a path that is
+ * already aborting.
+ */
+#ifdef FT_DEBUG_UNIQUE_VERDICT
+static unsigned long ft_dbg_unique_stale;	/* capture wrong under the lock */
+static unsigned long ft_dbg_unique_ok;		/* capture still good */
+/*
+ * ☠ AND THE OTHER HALF, or the zero above is a WRONG ZERO.  @stale is counted
+ * AFTER the holder acquire, and the acquire itself refuses a PROXY | TOMBSTONE |
+ * LOCK word -- so the very cases the verdict most needs protecting from (a
+ * same-key SOLE remove that RETIRED the holder) bail out BEFORE the re-validate
+ * runs and are invisible there.  Counted here, they are the rest of the window.
+ */
+static unsigned long ft_dbg_unique_acqfail;
+/*
+ * ★ AND SPLIT THAT REFUSAL BY ITS BIT, or it over-claims.  ft_dlm_lock refuses
+ * PROXY | TOMBSTONE | LOCK as one test, and only one of the three says the
+ * VERDICT is wrong:
+ *   LOCK       a peer merely holds the word.  The captured head may be perfectly
+ *              live -- this is exposure, not error.
+ *   PROXY      a commit is mid-flight on the holder: in doubt.
+ *   TOMBSTONE  the holder is RETIRED.  One-way, so observing it is a FACT: the
+ *              captured chain is gone, and the unheld verdict would have named a
+ *              dead head.  THIS is the defect population.
+ */
+static unsigned long ft_dbg_unique_af_lock, ft_dbg_unique_af_proxy,
+		ft_dbg_unique_af_tomb;
+/*
+ * ★★ AND THE ONE COUNTER THAT NEEDS NO CONTROL AT ALL.  Everything above is an
+ * upper bound on something:
+ *   - a LOCK refusal is exposure, not error;
+ *   - a TOMBSTONED HOLDER means the capture's ROUTING is stale, but a
+ *     recompaction can re-home the chain with the SAME head still live, and then
+ *     "-EEXIST, here is the head" was arguably still TRUE;
+ *   - and the COARSE arm cannot bound any of it, because ft->lock_fine is false
+ *     there so this code never runs.  ☠ Twice in one investigation the coarse arm
+ *     was reached for as a control; the second time it was not even executing the
+ *     measured path.
+ *
+ * The question that is decidable on its own is whether the RETURNED HEAD has left
+ * the trie: a removal mark is ONE-WAY, so a marked head is marked forever and a
+ * single observation is a fact about that verdict -- no peer schedule can make it
+ * innocent, and no control is needed to interpret it.
+ */
+static unsigned long ft_dbg_unique_head_gone;
+# define FT_DBG_UNIQUE(stale, is_unique)				\
+	do {								\
+		if (is_unique)						\
+			uatomic_inc((stale) ? &ft_dbg_unique_stale :	\
+				&ft_dbg_unique_ok);			\
+	} while (0)
+# define FT_DBG_UNIQUE_ACQFAIL(is_unique, meta, head)			\
+	do {								\
+		if (is_unique) {					\
+			uintptr_t s__ = CMM_LOAD_SHARED((meta)->state);	\
+									\
+			uatomic_inc(&ft_dbg_unique_acqfail);		\
+			if (ft_node_is_removed(head))			\
+				uatomic_inc(&ft_dbg_unique_head_gone);	\
+			if (s__ & FT_STATE_TOMBSTONE)			\
+				uatomic_inc(&ft_dbg_unique_af_tomb);	\
+			else if (s__ & FT_STATE_PROXY)			\
+				uatomic_inc(&ft_dbg_unique_af_proxy);	\
+			else						\
+				uatomic_inc(&ft_dbg_unique_af_lock);	\
+		}							\
+	} while (0)
+static __attribute__((destructor))
+void ft_dbg_unique_dump(void)
+{
+	unsigned long st = uatomic_read(&ft_dbg_unique_stale);
+	unsigned long ok = uatomic_read(&ft_dbg_unique_ok);
+	unsigned long af = uatomic_read(&ft_dbg_unique_acqfail);
+
+	if (!(st | ok | af))
+		return;
+	fprintf(stderr, "FT UNIQUE VERDICT: capture_good=%lu capture_stale=%lu "
+		"acquire_refused=%lu (tomb=%lu proxy=%lu lock=%lu)\n"
+		"  ** HEAD_GONE=%lu ** = the captured head is MARKED REMOVED, so the "
+		"unheld verdict named a node that HAS LEFT THE TRIE.  One-way mark: "
+		"a fact per observation, no control needed.  tomb/proxy/lock above "
+		"are upper bounds only (see the note at the counters).\n",
+		ok, st, af, uatomic_read(&ft_dbg_unique_af_tomb),
+		uatomic_read(&ft_dbg_unique_af_proxy),
+		uatomic_read(&ft_dbg_unique_af_lock),
+		uatomic_read(&ft_dbg_unique_head_gone));
+}
+#else
+# define FT_DBG_UNIQUE(stale, is_unique)	do { } while (0)
+# define FT_DBG_UNIQUE_ACQFAIL(is_unique, meta, head)	do { } while (0)
+#endif
+
 #ifdef FT_ENABLE_TRACING
 #include <stdio.h>
 #include <stdlib.h>
 #include "cds_ft_tp.h"
+
+
 
 /*
  * FAST STOP.  `lttng stop` is a round trip to the session daemon and

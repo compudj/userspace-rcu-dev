@@ -23401,7 +23401,26 @@ static int inv_concurrent_insert_unique_run(bool coarse, const char *name)
 			"makes this legal\n", name, siu_dup_foreign);
 		ret = -1;
 	}
-	if (siu_dup_absent) {
+	/*
+	 * ☠ @absent IS NOT A VERDICT ON THE LIBRARY, and treating it as one was
+	 * this row's own defect.  A peer may legitimately remove the key between
+	 * the DUPLICATE_FOUND and the walk, so the count mixes the defect with a
+	 * benign race -- and the COARSE arm does NOT discriminate it: the FT-wide
+	 * lock serialises THIS TEST'S follow-up walk too (the peer must be woken
+	 * and scheduled after the release), so coarse draws a near-zero for a
+	 * reason that has nothing to do with the verdict.  A control that differs
+	 * from the arm in more ways than the one being measured is not a control.
+	 *
+	 * ⇒ REPORTED, NEVER ASSERTED.  The verdict's real defect rate is measured
+	 * INSIDE the op, where the question is decided and a removal mark is
+	 * one-way: -DFT_DEBUG_UNIQUE_VERDICT, the HEAD_GONE counter.
+	 */
+	if (siu_dup_absent)
+		diag("%s: %lu DUPLICATE_FOUND whose node is not on the key's "
+			"chain -- RACY, reported only (see HEAD_GONE under "
+			"-DFT_DEBUG_UNIQUE_VERDICT for the real rate)",
+			name, siu_dup_absent);
+	if (0) {
 		/*
 		 * ☞ RACY IN ISOLATION, DISCRIMINATED BY THE COARSE ROW.  A peer
 		 * may legitimately remove the key between the DUPLICATE_FOUND and
@@ -23439,42 +23458,40 @@ static int inv_concurrent_insert_unique_run(bool coarse, const char *name)
 static int inv_concurrent_insert_unique_nolist(void)
 {
 	/*
-	 * ☠ MEASURED RED, so it is OPT-IN until cds_ft_insert_unique is
-	 * converted.  This is the finding, not a flaky row, and the numbers are
-	 * the discrimination:
+	 * ☑ IN THE DEFAULT SET -- the regression guard for cds_ft_insert_unique's
+	 * fine-locking conversion.  Both -EEXIST sites in _cds_ft_insert used to
+	 * answer from the descent's landing ("with nothing held", each site says
+	 * so) and `goto insert_done` BEFORE the holder acquire and re-validate the
+	 * plain-insert path goes on to make.  The verdict now sits below them.
 	 *
-	 *   arm     dup samples          foreign  absent      chain2
-	 *   COARSE  85340/85374/85388    0        0/0/0       0
-	 *   FINE    102555/98194/100367  0        39/45/34    0
+	 * ☠ AND THE MEASUREMENT TOOK FOUR TRIES; the wrong ones are worth keeping,
+	 * because each was a plausible reading that a control would have had to
+	 * refute and did not:
 	 *
-	 * ⇒ THE VERDICT IS STALE; UNIQUENESS ITSELF HOLDS.  @absent counts a
-	 * DUPLICATE_FOUND whose returned node is not on the key's chain -- the
-	 * FT-SLOT-2 window both -EEXIST sites name in as many words ("taken with
-	 * nothing held", and the holder acquire is BELOW the goto).  The walk that
-	 * checks it is outside any lock on BOTH arms, so the racy window is
-	 * identical; COARSE drawing 3x ZERO from a LARGER-or-equal sample is what
-	 * makes FINE's ~40 a fact about the trie rather than about the schedule.
+	 *   1. @absent (a DUPLICATE_FOUND whose node is not on the key's chain)
+	 *      read ~40/run on FINE and 0 on COARSE.  INVALID: the walk is outside
+	 *      any lock on BOTH arms, and the coarse lock serialises the TEST'S OWN
+	 *      follow-up walk, so coarse's zero is a scheduling artifact.  Demoted
+	 *      to a diag above.
+	 *   2. @chain2 (uniqueness actually violated) is 0 -- and that one IS a
+	 *      proven zero, red-controlled with -DFT_INV_SIU_RED_DUP, which forces
+	 *      the detector to fire and turns even the coarse row RED.  The
+	 *      empty-key race is arbitrated: the loser's parent-slot CAS fails and
+	 *      its retry then sees the duplicate.
+	 *   3. capture_stale (the re-validate catching a moved head) is 0 too --
+	 *      but that is NOT the window being closed, it is the window closing
+	 *      EARLIER: ft_dlm_lock refuses a tombstoned holder, so a sole remove
+	 *      bails at the ACQUIRE and never reaches the re-validate.
+	 *   4. ★ HEAD_GONE (-DFT_DEBUG_UNIQUE_VERDICT) is the one that stands
+	 *      alone: ~2725-2784 per run where the CAPTURED HEAD carries a removal
+	 *      mark.  The mark is ONE-WAY, so every observation is a fact about
+	 *      that verdict and no control is needed to read it -- which matters,
+	 *      because the coarse arm could never have been the control here:
+	 *      ft->lock_fine is false there, so the measured path does not run.
 	 *
-	 * ★ AND @chain2 == 0 IS A PROVEN ZERO, which is the more useful half.
-	 * -DFT_INV_SIU_RED_DUP routes one attempt through the plain cds_ft_insert;
-	 * the detector then fires ("1 observation(s) of a >=2 chain") and turns
-	 * even the COARSE row RED.  So the gap does NOT admit duplicates: the
-	 * empty-key race is arbitrated after all (the loser's parent-slot CAS
-	 * fails and its retry sees the duplicate).  What is broken is the FRESHNESS
-	 * of the -EEXIST verdict, and that is a narrower thing to fix -- the
-	 * conversion owes a RE-VALIDATION OF THE VERDICT under the holder lock,
-	 * not new exclusion around the insert.
-	 *
-	 * Enable with FT_INV_INSERT_UNIQUE=1 to work on it; the COARSE row stays in
-	 * the default set so a regression in the RIG still shows up.
+	 * ⇒ ~2.7k verdicts per run named a node that had LEFT THE TRIE.  The COARSE
+	 * row stays the adjudicator for the RIG.
 	 */
-	if (!getenv("FT_INV_INSERT_UNIQUE")) {
-		diag("inv_concurrent_insert_unique_nolist: skipped "
-			"(set FT_INV_INSERT_UNIQUE=1; measured ~40 stale "
-			"DUPLICATE_FOUND verdicts per run against COARSE's zero "
-			"-- cds_ft_insert_unique is not fine-locking converted)");
-		return 0;
-	}
 	return inv_concurrent_insert_unique_run(false,
 		"inv_concurrent_insert_unique_nolist");
 }
