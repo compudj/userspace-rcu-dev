@@ -9073,6 +9073,54 @@ void ft_flip_txn_guard_installed_child(struct cds_ft *ft, struct ft_flip_txn *t,
 	if (ft_flip_txn_holds(t, meta)) {
 		return;
 	}
+	/*
+	 * ☠ AND SKIP IT WHEN THIS COMMIT ALREADY WRITES THAT WORD, which the
+	 * hold test above cannot tell you.
+	 *
+	 * THE HOLD TEST IS WORD-KEYED, AND COVERAGE IS NOT.  ft_flip_txn_holds
+	 * asks whether @meta itself is in the registry; above per-node spacing
+	 * the op holds the word's ANCHOR ANCESTOR instead, so a word that IS
+	 * excluded -- and that this same txn has already RECORDED -- reads as
+	 * unheld here and gets a guard planted beside that record.  The guard is
+	 * always-MW by design; the record it lands beside is SW on an armed txn.
+	 * ONE SLOT, TWO KINDS: --enable-rcu-debug aborts at
+	 * urcu_txn_record_chain's `r->kind == kind`, and a release build takes
+	 * the MW-domination fail-safe, which turns the park into a CAS whose
+	 * expected-old cannot match -- the commit aborts, the op re-descends,
+	 * and the next attempt is identical.
+	 *
+	 * MEASURED: ft_unit test_rekey_collapse_one_slot_two_kinds at
+	 * CDS_FT_LOCK_SPACING_ROOT_ONLY spun 50,001 attempts on one move
+	 * (-DFT_DEBUG_REKEY_RETRY_CAP), final ret -EAGAIN, and aborted on that
+	 * engine assert under --enable-rcu-debug.  The SW side is
+	 * ft_chain_compress_fused's fused nr_child, via ft_detach_node out of
+	 * the rekey fold; this guard arrives from ft_remove_commit_rec one frame
+	 * below it.  ☞ that pairing is Phase E's named residual γ.
+	 *
+	 * ASK THE DESCRIPTOR, NOT THE REGISTRY.  "Does this commit already write
+	 * this slot" is spacing-INDEPENDENT -- it needs no anchor resolution and
+	 * no descent -- and it is the right question anyway: a record already
+	 * there carries a real expected-old (a release, a retire, a fused count),
+	 * every one of which constrains the word at least as tightly as a
+	 * {live -> live} validate.  So the guard is redundant, not merely
+	 * unsafe, which is the rule ft_flip_txn_record_nr_child_inc states for
+	 * its own fused edge: "THIS EDGE *IS* THE §4.B GUARD -- do not plant one
+	 * beside it", and ft_flip_txn_record_release_lock for the release.
+	 *
+	 * It also costs nothing to skip: the load below is a READ-YOUR-WRITES
+	 * load, so beside an existing record the guard's old would resolve to
+	 * that record's pending new and the edge would chain to a no-op --
+	 * paying a second touch of the slot for nothing.  A same-slot
+	 * coincidence is exactly what the engine's age-0 fast path refuses to
+	 * resolve, so the no-op would force an extra commit attempt too.
+	 */
+	{
+		struct urcu_txn_desc *desc = t->mtxn ? t->mtxn->desc : NULL;
+
+		if (desc && desc != URCU_TXN_ENOMEM &&
+				urcu_txn_find(desc, (void **) &meta->state))
+			return;
+	}
 	if (!ft_flip_txn_reserve_extra(t, 1)) {
 		return;
 	}
