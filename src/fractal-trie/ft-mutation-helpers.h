@@ -7994,9 +7994,50 @@ void ft_flip_txn_record_retire_anchored_arms(struct ft_flip_txn *t,
 			return;
 		}
 	}
-	ft_flip_txn_record_state_ctx(t, ctx, node,
+	/*
+	 * ☠ MW, BECAUSE THIS ARM IS BY CONSTRUCTION THE ONE WHERE THE OP DOES
+	 * NOT HOLD @node'S OWN WORD.
+	 *
+	 * The branch above took every shape where it does (@h->lock == node, or
+	 * an earlier member anchored on @node) and those retire SW legitimately:
+	 * step 1 won the word, so step 2 may park.  Reaching HERE means the
+	 * acquire went to an ANCHOR ANCESTOR and the held set does not report
+	 * @node either -- so an SW park would be step 2 WITHOUT step 1, a blind
+	 * store on a word this op never excluded.  This function's own header
+	 * says as much: "Holding the ANCHOR does not exclude every mutator of
+	 * @node either: a peer whose descent dates @node differently -- across a
+	 * graft, a merge, or any move that puts the node on a second path --
+	 * anchors it elsewhere and locks it legitimately", and it names the MW
+	 * snapshot expected-old as the defence.  The record has to BE MW for
+	 * that defence to exist: an SW park has no expected-old at all.
+	 *
+	 * ☞ AND IT IS THE SAME PREDICATE THE GUARD SIDE ALREADY USES.
+	 * ft_flip_txn_lock_or_guard_parent_at plants a §4.B guard on exactly
+	 * `held.lock != node_meta && !held.node_held` -- this arm's condition --
+	 * because the op does not hold the word.  With the retire recorded SW the
+	 * two halves of ONE op contradicted each other on ONE word: an MW
+	 * {live -> live} validate from the guard, then an SW {s -> s|TOMBSTONE}
+	 * here.  ONE SLOT, TWO KINDS: --enable-rcu-debug aborts at
+	 * urcu_txn_record_chain's `r->kind == kind`, and a release build takes the
+	 * MW-domination fail-safe -- which is to say it already behaves as this
+	 * line now does, only by luck and without the debug build agreeing.
+	 *
+	 * MEASURED: ft_unit test_rekey_displaced_external_dst at
+	 * CDS_FT_LOCK_SPACING_ROOT_ONLY, aborting on that assert with the pair
+	 * caught in order on one slot -- MW {0xc->0xc} from
+	 * ft_glue_txn_commit_edges' coarsened-shared guard, then SW {0xc->0xe}
+	 * from here via ft_node_recompact(FT_RECOMPACT_DEL) out of the detach.
+	 * The acquire did NOT miss: it returned shared, anchor != node,
+	 * node_held == 0.
+	 *
+	 * Byte-neutral wherever the txn is not structural_sw -- such a txn
+	 * records MW whatever @sw_ok says -- and at PER-NODE spacing, where the
+	 * anchor IS the node and this arm is unreachable.
+	 */
+	ft_flip_txn_record_state_kind_ctx(t, ctx, node,
 			(void *) h->node_snap,
-			(void *) (h->node_snap | FT_STATE_TOMBSTONE));
+			(void *) (h->node_snap | FT_STATE_TOMBSTONE),
+			/*sw_ok=*/ 0);
 }
 
 /*
