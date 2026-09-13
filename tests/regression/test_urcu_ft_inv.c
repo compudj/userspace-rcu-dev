@@ -24440,6 +24440,7 @@ struct sir_node {
 	struct cds_ft_node node;
 	unsigned int k;
 	unsigned int owner;		/* which lane last installed it */
+	unsigned int slot;		/* which of its lane's pair it is */
 };
 
 struct sir_ctx {
@@ -24455,12 +24456,28 @@ struct sir_ctx {
 	 */
 	struct sir_node *rep[2];	/* [2][2 * SIR_K] */
 	unsigned char *cur[2];		/* [2][SIR_K]: which of the pair is installed */
+#ifdef FT_INV_SIR_FRESH_NODES
+	struct sir_node *pool[2];	/* [2][SIR_R * SIR_BURST * SIR_K + 1] */
+	size_t pool_n[2];
+#endif
 	struct sir_node *peer;		/* [SIR_K]: the insert/remove peer's node */
 	unsigned char *peer_in;		/* [SIR_K] */
 	unsigned long ops[3];		/* completed ops per lane -- THE PROGRESS ORACLE */
 	unsigned long busy;		/* CDS_FT_STATUS_BUSY_ERROR (expected dead) */
 	unsigned long other;
 	unsigned long handed;		/* chains handed back */
+	unsigned long reuse_live;	/* re-inits of a node STILL in the trie */
+#ifdef FT_INV_SIR_SOUND_REUSE
+	/*
+	 * PROVABLY-SOUND REUSE.  A replacer node leaves the trie by exactly one
+	 * route: some insert_replace displaces it and HANDS IT BACK.  So a node
+	 * is safe to re-initialise iff a lane has actually SEEN it in an @old
+	 * chain (or it was never installed).  Marked GLOBALLY, because the node
+	 * one lane installed is handed back to whichever lane displaces it.
+	 */
+	unsigned char *out[2];		/* [2][2 * SIR_K]: seen handed back */
+	unsigned long sound_stall;	/* neither of the pair was provably out */
+#endif
 	unsigned long foreign;		/* a hand-back naming a node of another key */
 	int stop;
 };
@@ -24489,16 +24506,85 @@ static void *sir_replacer(void *arg)
 		for (k = 0; k < SIR_K; k++) {
 			struct cds_ft_node *old = NULL;
 			unsigned int slot = c->cur[id][k] ^ 1u;
+#ifdef FT_INV_SIR_SOUND_REUSE
+			/*
+			 * Use a node only once it is PROVEN out.  If neither of
+			 * the pair is, skip rather than guess -- guessing is
+			 * precisely what is under suspicion.
+			 */
+			if (!c->out[id][k * 2 + slot]) {
+				slot ^= 1u;
+				if (!c->out[id][k * 2 + slot]) {
+					uatomic_inc(&c->sound_stall);
+					rcu_read_unlock();
+					rcu_quiescent_state();
+					continue;
+				}
+			}
 			struct sir_node *n = &c->rep[id][k * 2 + slot];
+#elif defined(FT_INV_SIR_FRESH_NODES)
+			/*
+			 * ☞ THE TEST-FAULT CONTROL for the stale back-edge.
+			 * The alternation below re-initialises a node the lane
+			 * BELIEVES the trie no longer holds; if that belief is
+			 * ever wrong, cds_ft_node_init zeroes a LIVE node's
+			 * links and manufactures exactly the corruption under
+			 * investigation (a pred whose next is NULL while its
+			 * successor still points back at it).  This arm takes a
+			 * never-reused node from a pool instead, so the hazard
+			 * cannot exist.  If the livelock survives THIS, it is
+			 * not the test.
+			 */
+			struct sir_node *n = &c->pool[id][c->pool_n[id]++];
+#else
+			struct sir_node *n = &c->rep[id][k * 2 + slot];
+#endif
 			uint8_t key[8];
 			enum cds_ft_status s;
 
 			cds_ft_u64_to_key(c->ft, (uint64_t) k, key,
 				CDS_FT_LEN_DEFAULT);
 			rcu_read_lock();
+#ifdef FT_INV_SIR_REUSE_AUDIT
+			/*
+			 * ☞ IS THE NODE I AM ABOUT TO RE-INITIALISE STILL IN
+			 * THE TRIE?  The alternation assumes the intervening
+			 * install displaced it.  cds_ft_node_init zeroes prev
+			 * and next, so if the assumption is EVER wrong this
+			 * test manufactures a pred whose next is NULL while its
+			 * successor still points back at it -- which is exactly
+			 * the stale back-edge the remove livelock turned out to
+			 * spin on.  A single hit here proves the fault is the
+			 * TEST's, not the library's.  Racy by nature; a
+			 * positive is conclusive, a zero is not.
+			 */
+			{
+				struct cds_ft_iter *ai;
+
+				if (cds_ft_iter_create(c->ft, &ai) ==
+						CDS_FT_STATUS_OK) {
+					struct cds_ft_node *h;
+
+					cds_ft_iter_set_key(ai, key,
+						CDS_FT_LEN_DEFAULT);
+					if (cds_ft_lookup(c->ft, ai) ==
+							CDS_FT_STATUS_OK)
+						for (h = cds_ft_iter_node(ai);
+								h;
+								h = cds_ft_node_next_rcu(h))
+							if (h == &n->node)
+								uatomic_inc(&c->reuse_live);
+					cds_ft_iter_destroy(ai);
+				}
+			}
+#endif
 			cds_ft_node_init(&n->node);
 			n->k = k;
 			n->owner = id;
+#ifdef FT_INV_SIR_SOUND_REUSE
+			n->slot = slot;
+			c->out[id][k * 2 + slot] = 0;	/* about to be live */
+#endif
 			s = cds_ft_insert_replace(c->ft, key, CDS_FT_LEN_DEFAULT,
 				&n->node, &old);
 			rcu_read_unlock();
@@ -24519,9 +24605,19 @@ static void *sir_replacer(void *arg)
 					 * that displaced the wrong chain.
 					 */
 					rcu_read_lock();
-					for (; old; old = cds_ft_node_next_rcu(old))
-						if (((struct sir_node *) old)->k != k)
+					for (; old; old = cds_ft_node_next_rcu(old)) {
+						struct sir_node *o =
+							(struct sir_node *) old;
+
+						if (o->k != k)
 							uatomic_inc(&c->foreign);
+#ifdef FT_INV_SIR_SOUND_REUSE
+						/* Definitively out of the trie. */
+						if (o->owner < 2)
+							c->out[o->owner][o->k * 2 +
+								o->slot] = 1;
+#endif
+					}
 					rcu_read_unlock();
 				}
 				break;
@@ -24653,6 +24749,24 @@ static int inv_concurrent_insert_replace_run(bool coarse, const char *name)
 		c.cur[i] = (unsigned char *) calloc(SIR_K, 1);
 		if (!c.rep[i] || !c.cur[i])
 			abort();
+#ifdef FT_INV_SIR_SOUND_REUSE
+		{
+			unsigned int q;
+
+			c.out[i] = (unsigned char *) calloc((size_t) SIR_K * 2, 1);
+			if (!c.out[i])
+				abort();
+			for (q = 0; q < (unsigned int) SIR_K * 2; q++)
+				c.out[i][q] = 1;	/* never installed => out */
+		}
+#endif
+#ifdef FT_INV_SIR_FRESH_NODES
+		c.pool[i] = (struct sir_node *) calloc(
+			(size_t) SIR_R * SIR_BURST * SIR_K + 1,
+			sizeof(*c.pool[i]));
+		if (!c.pool[i])
+			abort();
+#endif
 	}
 	c.peer = (struct sir_node *) calloc(SIR_K, sizeof(*c.peer));
 	c.peer_in = (unsigned char *) calloc(SIR_K, 1);
@@ -24765,6 +24879,12 @@ static int inv_concurrent_insert_replace_run(bool coarse, const char *name)
 	for (i = 0; i < 2; i++) {
 		free(c.rep[i]);
 		free(c.cur[i]);
+#ifdef FT_INV_SIR_FRESH_NODES
+		free(c.pool[i]);
+#endif
+#ifdef FT_INV_SIR_SOUND_REUSE
+		free(c.out[i]);
+#endif
 	}
 	free(c.peer);
 	free(c.peer_in);
@@ -24775,6 +24895,14 @@ static int inv_concurrent_insert_replace_run(bool coarse, const char *name)
 		uatomic_read(&c.ops[2]), uatomic_read(&c.handed),
 		uatomic_read(&c.busy), uatomic_read(&c.other),
 		ret ? "RED" : "ok");
+#ifdef FT_INV_SIR_SOUND_REUSE
+	fprintf(stderr, "# %s: SOUND REUSE: stalls (no provably-out node) = %lu\n",
+		name, uatomic_read(&c.sound_stall));
+#endif
+#ifdef FT_INV_SIR_REUSE_AUDIT
+	fprintf(stderr, "# %s: REUSE AUDIT: re-init of a node STILL IN THE TRIE = %lu\n",
+		name, uatomic_read(&c.reuse_live));
+#endif
 	return ret;
 }
 
