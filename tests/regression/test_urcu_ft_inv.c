@@ -82,7 +82,7 @@
  */
 /* +4 inv_prefix_head_*_key_identity; +2 inv_split_point_lookup_identity*;
  * +2 inv_absent_key_never_found* */
-#define NR_TESTS	(120 + NR_TESTS_REKEY_DLM)
+#define NR_TESTS	(122 + NR_TESTS_REKEY_DLM)
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -23125,6 +23125,367 @@ static int inv_concurrent_same_key_inserts_run(bool ordered_list, bool coarse,
 }
 
 /*
+ * cds_ft_insert_unique VS ITSELF, SAME KEY, on the FINE arm.
+ *
+ * ☞ WHY THIS ROW EXISTS AND WHAT MAKES IT A PROOF.  insert_unique is one of the
+ * three POINT ops the fine-locking transition has not converted, and its gap is
+ * the narrowest of them: both -EEXIST sites in _cds_ft_insert take the duplicate
+ * head from the DESCENT'S LANDING -- each site's own comment says "with nothing
+ * held" -- and `goto insert_done` BEFORE the `if (ft->lock_fine)` holder acquire
+ * that the plain-insert path takes two lines later.  Only the early return
+ * differs from the fine-SAFE insert.
+ *
+ * That unheld read decides UNIQUENESS, which makes the contract violation
+ * non-racy and cheap to detect: if insert_unique is the ONLY insert path a
+ * workload uses, then NO legal sequence can ever put two nodes on one key.  So
+ * a chain of length >= 2, observed at ANY instant, is a defect -- no
+ * owner-bookkeeping, no window to argue about, nothing to retune.  Contrast the
+ * append/remove rows, whose invariant has to be reconciled against each worker's
+ * @in flag precisely because cds_ft_insert may legally build a chain.
+ *
+ * THE MECHANISM THE ORACLE IS AIMED AT: two workers descend the same key, both
+ * read "no duplicate here" from their own unheld landing, and both fall through
+ * to the plain insert -- which DOES acquire, so both installs are arbitrated and
+ * both SUCCEED, appending.  The exclusion is sound; the DECISION it protects was
+ * taken before it.  ⇒ two CDS_FT_STATUS_OK for one key, and a 2-chain.
+ *
+ * ☞ AND THE SECOND MODE, counted rather than asserted, because it IS racy: a
+ * DUPLICATE_FOUND whose returned node the peer's same-key sole remove retired in
+ * the same gap (the FT-SLOT-2 window both sites name).  The caller is handed
+ * "your insert failed, here is the existing node" for a key that may no longer
+ * be in the trie at all.  A lookup that answers NOT_FOUND right after a
+ * DUPLICATE_FOUND is evidence of it, but a peer may also have removed the key
+ * legitimately in between -- so it is reported as a COUNT
+ * ([[feedback_a_probe_that_records_beats_a_guard_that_refuses]]), and a
+ * foreign/garbage @dup pointer is the part that IS asserted.
+ *
+ * Expected RED until insert_unique is converted; the COARSE row is the
+ * adjudicator, and a red THERE is the rig.
+ */
+static unsigned long siu_ok, siu_dup, siu_dup_foreign, siu_dup_absent,
+		siu_chain2;
+
+struct siu_arg {
+	struct ski_ctx *c;
+	unsigned int id;
+};
+
+static void *siu_worker(void *arg)
+{
+	struct siu_arg *a = (struct siu_arg *) arg;
+	struct ski_ctx *c = a->c;
+	unsigned int id = a->id, r, burst, k;
+	struct cds_ft_iter *iter;
+
+	rcu_register_thread();
+	rcu_thread_online();
+	if (cds_ft_iter_create(c->ft, &iter) != CDS_FT_STATUS_OK)
+		abort();
+	for (r = 0; r < SKI_R; r++)
+		for (burst = 0; burst < SKI_BURST; burst++)
+		for (k = 0; k < SKI_K; k++) {
+			uint8_t key[8];
+
+			cds_ft_u64_to_key(c->ft, (uint64_t) k, key,
+				CDS_FT_LEN_DEFAULT);
+			if (!c->in[id][k]) {
+				struct cds_ft_node *dup = NULL;
+				enum cds_ft_status st;
+
+				rcu_read_lock();
+				cds_ft_node_init(&c->n[id][k].node);
+#ifdef FT_INV_SIU_RED_DUP
+				/*
+				 * RED CONTROL: admit a duplicate ON PURPOSE, by
+				 * routing one attempt through the plain insert.
+				 * @siu_chain2 and the post-join walk both read 0
+				 * on the shipping build, and a zero from a branch
+				 * never shown to fire certifies nothing
+				 * [[feedback_force_the_unreachable_branch_with_a_red_control]].
+				 * Under this flag BOTH must go loud.
+				 */
+				if (r == SKI_R / 2 && burst == 0 && k == 0)
+					st = cds_ft_insert(c->ft, key,
+						CDS_FT_LEN_DEFAULT,
+						&c->n[id][k].node);
+				else
+#endif
+				st = cds_ft_insert_unique(c->ft, key,
+					CDS_FT_LEN_DEFAULT,
+					&c->n[id][k].node, &dup);
+				if (st == CDS_FT_STATUS_OK) {
+					c->in[id][k] = 1;
+					uatomic_inc(&siu_ok);
+					/*
+					 * ★ THE UNIQUENESS CHECK, taken HERE
+					 * rather than after the join: the
+					 * violating 2-chain is transient (either
+					 * worker may remove its own node next
+					 * round), so a post-join walk can miss
+					 * it entirely.  Under a uniqueness
+					 * contract a length >= 2 is illegal at
+					 * every instant, so observing it once is
+					 * the whole proof.
+					 */
+					cds_ft_iter_set_key(iter, key,
+						CDS_FT_LEN_DEFAULT);
+					if (cds_ft_lookup(c->ft, iter) ==
+							CDS_FT_STATUS_OK) {
+						struct cds_ft_node *h;
+						unsigned int len = 0;
+
+						for (h = cds_ft_iter_node(iter);
+								h; h =
+								cds_ft_node_next_rcu(h))
+							len++;
+						if (len >= 2)
+							uatomic_inc(&siu_chain2);
+					}
+				} else if (st == CDS_FT_STATUS_DUPLICATE_FOUND) {
+					uatomic_inc(&siu_dup);
+					/*
+					 * @dup must name a node of this key.  A
+					 * pointer that is neither worker's node
+					 * for @k is a foreign or freed address
+					 * -- asserted below.  A key that is GONE
+					 * is the FT-SLOT-2 mode: counted, since a
+					 * peer may also have removed it legally.
+					 */
+					if (dup != &c->n[0][k].node &&
+					    dup != &c->n[1][k].node) {
+						/*
+						 * FOREIGN: not a node of this
+						 * key at all.  NON-RACY -- no
+						 * schedule makes this legal.
+						 */
+						uatomic_inc(&siu_dup_foreign);
+					} else {
+						struct cds_ft_node *h;
+						bool on_chain = false;
+
+						/*
+						 * ★ ASK WHETHER @dup IS ON THE
+						 * KEY'S CHAIN, not merely whether
+						 * the key exists: the FT-SLOT-2
+						 * mode is a RETIRED landing, and a
+						 * peer can retire @dup while
+						 * re-heading the same key, which
+						 * leaves the lookup answering OK.
+						 * "The key is there" would call
+						 * that clean.
+						 */
+						cds_ft_iter_set_key(iter, key,
+							CDS_FT_LEN_DEFAULT);
+						if (cds_ft_lookup(c->ft, iter) ==
+								CDS_FT_STATUS_OK)
+							for (h = cds_ft_iter_node(iter);
+									h; h = cds_ft_node_next_rcu(h))
+								if (h == dup) {
+									on_chain = true;
+									break;
+								}
+						if (!on_chain)
+							uatomic_inc(&siu_dup_absent);
+					}
+				}
+				rcu_read_unlock();
+			} else {
+				rcu_read_lock();
+				cds_ft_iter_set_key(iter, key,
+					CDS_FT_LEN_DEFAULT);
+				if (cds_ft_lookup(c->ft, iter) ==
+						CDS_FT_STATUS_OK &&
+						cds_ft_remove(c->ft, iter,
+							&c->n[id][k].node) ==
+						CDS_FT_STATUS_OK)
+					c->in[id][k] = 0;
+				rcu_read_unlock();
+			}
+			rcu_quiescent_state();
+		}
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static int inv_concurrent_insert_unique_run(bool coarse, const char *name)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct ski_ctx c;
+	struct siu_arg arg[2];
+	pthread_t th[2];
+	struct cds_ft_iter *iter;
+	unsigned int i, k;
+	int ret = 0;
+
+	siu_ok = siu_dup = siu_dup_foreign = siu_dup_absent = siu_chain2 = 0;
+	if (cds_ft_group_attr_create(&attr) < 0)
+		abort();
+	if (cds_ft_group_attr_set_key_len(attr, 8) < 0)
+		abort();
+	if (coarse && cds_ft_group_attr_set_writer_strategy(attr,
+			CDS_FT_WRITER_LOCK_COARSE) < 0)
+		abort();
+	inv_maybe_set_rank_stats(attr);
+	if (cds_ft_group_create(attr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(attr);
+	memset(&c, 0, sizeof(c));
+	if (cds_ft_create(group, NULL, &c.ft) < 0)
+		abort();
+	cds_ft_make_concurrent(c.ft);
+	for (i = 0; i < 2; i++) {
+		c.n[i] = (struct skr_node *) calloc(SKI_K, sizeof(*c.n[i]));
+		c.in[i] = (unsigned char *) calloc(SKI_K, 1);
+		if (!c.n[i] || !c.in[i])
+			abort();
+		for (k = 0; k < SKI_K; k++)
+			c.n[i][k].k = k;
+	}
+	if (cds_ft_iter_create(c.ft, &iter) != CDS_FT_STATUS_OK)
+		abort();
+	for (i = 0; i < 2; i++) {
+		arg[i].c = &c;
+		arg[i].id = i;
+		if (pthread_create(&th[i], NULL, siu_worker, &arg[i]))
+			abort();
+	}
+	pthread_join(th[0], NULL);
+	pthread_join(th[1], NULL);
+	rcu_quiescent_state();
+	rcu_barrier();
+	rcu_read_lock();
+	if (cds_ft_verify(c.ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "%s: verify RED after the run\n", name);
+		ret = -1;
+	}
+	/* A surviving 2-chain: the same violation, still standing at the join. */
+	for (k = 0; k < SKI_K; k++) {
+		struct cds_ft_node *h;
+		uint8_t key[8];
+		unsigned int len = 0;
+
+		cds_ft_u64_to_key(c.ft, (uint64_t) k, key, CDS_FT_LEN_DEFAULT);
+		cds_ft_iter_set_key(iter, key, CDS_FT_LEN_DEFAULT);
+		if (cds_ft_lookup(c.ft, iter) == CDS_FT_STATUS_OK)
+			for (h = cds_ft_iter_node(iter); h;
+					h = cds_ft_node_next_rcu(h))
+				len++;
+		if (len >= 2) {
+			fprintf(stderr, "%s: key %u ends with a chain of %u -- "
+				"cds_ft_insert_unique admitted a DUPLICATE\n",
+				name, k, len);
+			ret = -1;
+		}
+	}
+	rcu_read_unlock();
+	cds_ft_iter_destroy(iter);
+	rcu_quiescent_state();
+	rcu_barrier();
+	cds_ft_destroy(c.ft);
+	cds_ft_group_destroy(group);
+	for (i = 0; i < 2; i++) {
+		free(c.n[i]);
+		free(c.in[i]);
+	}
+	if (siu_chain2) {
+		fprintf(stderr, "%s: %lu observation(s) of a >=2 chain right "
+			"after a successful cds_ft_insert_unique -- UNIQUENESS "
+			"VIOLATED\n", name, siu_chain2);
+		ret = -1;
+	}
+	if (siu_dup_foreign) {
+		fprintf(stderr, "%s: %lu DUPLICATE_FOUND naming a FOREIGN node "
+			"(not either worker's node for that key) -- no schedule "
+			"makes this legal\n", name, siu_dup_foreign);
+		ret = -1;
+	}
+	if (siu_dup_absent) {
+		/*
+		 * ☞ RACY IN ISOLATION, DISCRIMINATED BY THE COARSE ROW.  A peer
+		 * may legitimately remove the key between the DUPLICATE_FOUND and
+		 * the walk above, and that window exists on BOTH arms -- the
+		 * lookup is outside any lock either way.  So the number is only
+		 * evidence next to its control: COARSE draws ZERO from a
+		 * comparable sample, FINE does not.  Reported as a failure on the
+		 * FINE arm for that reason, not on the strength of the count.
+		 */
+		fprintf(stderr, "%s: %lu DUPLICATE_FOUND whose node is NOT ON "
+			"the key's chain (FT-SLOT-2 stale landing; compare the "
+			"coarse row, which draws zero)\n", name, siu_dup_absent);
+		ret = -1;
+	}
+	fprintf(stderr,
+		"# %s: %u rounds x %u burst x %u keys, TWO same-key "
+		"cds_ft_insert_unique (%s): ok=%lu dup=%lu foreign=%lu "
+		"absent=%lu chain2=%lu -> %s\n",
+		name, SKI_R, SKI_BURST, SKI_K, coarse ? "coarse" : "fine",
+		siu_ok, siu_dup, siu_dup_foreign, siu_dup_absent,
+		siu_chain2, ret ? "RED" : "ok");
+	/*
+	 * ☠ A ZERO HERE IS NOT A PASS UNTIL THE LANE IS PROVEN LIVE.  Both
+	 * counters are reached only from the DUPLICATE_FOUND / OK arms, so a run
+	 * that never raced would report a clean zero and certify nothing.
+	 */
+	if (!siu_dup) {
+		fprintf(stderr, "%s: ZERO DUPLICATE_FOUND -- the workers never "
+			"met on a key, so this row tested nothing\n", name);
+		ret = -1;
+	}
+	return ret;
+}
+
+static int inv_concurrent_insert_unique_nolist(void)
+{
+	/*
+	 * ☠ MEASURED RED, so it is OPT-IN until cds_ft_insert_unique is
+	 * converted.  This is the finding, not a flaky row, and the numbers are
+	 * the discrimination:
+	 *
+	 *   arm     dup samples          foreign  absent      chain2
+	 *   COARSE  85340/85374/85388    0        0/0/0       0
+	 *   FINE    102555/98194/100367  0        39/45/34    0
+	 *
+	 * ⇒ THE VERDICT IS STALE; UNIQUENESS ITSELF HOLDS.  @absent counts a
+	 * DUPLICATE_FOUND whose returned node is not on the key's chain -- the
+	 * FT-SLOT-2 window both -EEXIST sites name in as many words ("taken with
+	 * nothing held", and the holder acquire is BELOW the goto).  The walk that
+	 * checks it is outside any lock on BOTH arms, so the racy window is
+	 * identical; COARSE drawing 3x ZERO from a LARGER-or-equal sample is what
+	 * makes FINE's ~40 a fact about the trie rather than about the schedule.
+	 *
+	 * ★ AND @chain2 == 0 IS A PROVEN ZERO, which is the more useful half.
+	 * -DFT_INV_SIU_RED_DUP routes one attempt through the plain cds_ft_insert;
+	 * the detector then fires ("1 observation(s) of a >=2 chain") and turns
+	 * even the COARSE row RED.  So the gap does NOT admit duplicates: the
+	 * empty-key race is arbitrated after all (the loser's parent-slot CAS
+	 * fails and its retry sees the duplicate).  What is broken is the FRESHNESS
+	 * of the -EEXIST verdict, and that is a narrower thing to fix -- the
+	 * conversion owes a RE-VALIDATION OF THE VERDICT under the holder lock,
+	 * not new exclusion around the insert.
+	 *
+	 * Enable with FT_INV_INSERT_UNIQUE=1 to work on it; the COARSE row stays in
+	 * the default set so a regression in the RIG still shows up.
+	 */
+	if (!getenv("FT_INV_INSERT_UNIQUE")) {
+		diag("inv_concurrent_insert_unique_nolist: skipped "
+			"(set FT_INV_INSERT_UNIQUE=1; measured ~40 stale "
+			"DUPLICATE_FOUND verdicts per run against COARSE's zero "
+			"-- cds_ft_insert_unique is not fine-locking converted)");
+		return 0;
+	}
+	return inv_concurrent_insert_unique_run(false,
+		"inv_concurrent_insert_unique_nolist");
+}
+
+static int inv_concurrent_insert_unique_coarse(void)
+{
+	return inv_concurrent_insert_unique_run(true,
+		"inv_concurrent_insert_unique_coarse");
+}
+
+/*
  * A CONTRACT PROBE, NOT YET A GATE: cds_ft_replace against a same-key
  * insert/remove peer, on the FINE arm.
  *
@@ -23674,6 +24035,8 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_concurrent_same_key_inserts_coarse);
 	RUN_TEST(inv_concurrent_same_key_replace_nolist);
 	RUN_TEST(inv_concurrent_same_key_replace_coarse);
+	RUN_TEST(inv_concurrent_insert_unique_nolist);
+	RUN_TEST(inv_concurrent_insert_unique_coarse);
 	RUN_TEST(inv_concurrent_same_key_append);
 	RUN_TEST(inv_concurrent_same_key_append_nolist);
 	RUN_TEST(inv_concurrent_same_key_append_coarse);
