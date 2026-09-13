@@ -82,7 +82,7 @@
  */
 /* +4 inv_prefix_head_*_key_identity; +2 inv_split_point_lookup_identity*;
  * +2 inv_absent_key_never_found* */
-#define NR_TESTS	(111 + NR_TESTS_REKEY_DLM)
+#define NR_TESTS	(113 + NR_TESTS_REKEY_DLM)
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -22505,6 +22505,261 @@ static int inv_concurrent_same_key_append_run(bool ordered_list, bool coarse,
 	return ret;
 }
 
+/*
+ * TWO WRITERS ON ONE KEY, BOTH INSERTING -- the same-key contract clause the
+ * rows above do not reach.
+ *
+ * inv_concurrent_same_key_append pairs an APPENDER against a REMOVER, so every
+ * interleaving it samples has one of each.  The insert/insert pairing is a
+ * different shape: two ops racing to APPEND to the same duplicate chain, which
+ * is where they contend for the chain HEAD and its holder rather than for a
+ * head one of them is retiring.  ☞ Naming the instrument per contract clause is
+ * the rule a disjoint-range oracle taught expensively: a rig that never puts two
+ * inserts on one key tests nothing about two inserts on one key, however much
+ * concurrency it otherwise has.
+ *
+ * THE SHAPE.  Each worker owns ONE node per key and cycles it: insert while it
+ * is out, remove it while it is in.  Both workers run the same loop over the
+ * same keys, so the run samples insert/insert, insert/remove and remove/remove
+ * on one chain -- and insert/insert is the pairing no existing row produces.
+ * Bounded by construction: two nodes per key, never more.
+ *
+ * ☠ A WORKER ONLY EVER TOUCHES ITS OWN NODE.  cds_ft_insert on a node still in
+ * the trie corrupts the chain and would frame the library for a test bug (the
+ * same trap ska_appender's comment names), so the insert is gated on this
+ * worker's own @in flag -- never on a lookup, which the peer can invalidate
+ * between the test and the call.
+ *
+ * NO BARRIERS, for the reason the append row states: per-round barriers put the
+ * workers in lockstep and such a row goes GREEN ON AN UNFIXED LIBRARY.
+ *
+ * THE INVARIANT IS EXACT, AND THAT IS THE POINT.  Both workers have finished
+ * their last operation when the joins return, so each worker's @in flag is
+ * authoritative for its own node.  The chain for every key must then hold
+ * EXACTLY the nodes whose owners say "in" -- no more (a lost remove, or a
+ * foreign node spliced in) and no fewer (a LOST INSERT, the failure an
+ * append-vs-remove row cannot distinguish from a successful remove).
+ */
+#define SKI_K		8
+#define SKI_R		40
+#define SKI_BURST	400
+
+struct ski_ctx {
+	struct cds_ft *ft;
+	struct skr_node *n[2];		/* [2][SKI_K]: one node array per worker */
+	unsigned char *in[2];		/* [2][SKI_K]: MY node is currently in */
+};
+
+struct ski_arg {
+	struct ski_ctx *c;
+	unsigned int id;
+};
+#ifdef FT_INV_SKI_COVERAGE
+static unsigned long ski_dup_appends, ski_solo_appends;
+#endif
+
+static void *ski_worker(void *arg)
+{
+	struct ski_arg *a = (struct ski_arg *) arg;
+	struct ski_ctx *c = a->c;
+	unsigned int id = a->id, r, burst, k;
+	struct cds_ft_iter *iter;
+
+	rcu_register_thread();
+	rcu_thread_online();
+	if (cds_ft_iter_create(c->ft, &iter) != CDS_FT_STATUS_OK)
+		abort();
+	for (r = 0; r < SKI_R; r++)
+		for (burst = 0; burst < SKI_BURST; burst++)
+		for (k = 0; k < SKI_K; k++) {
+			uint8_t key[8];
+
+			cds_ft_u64_to_key(c->ft, (uint64_t) k, key,
+				CDS_FT_LEN_DEFAULT);
+			if (!c->in[id][k]) {
+				rcu_read_lock();
+				cds_ft_node_init(&c->n[id][k].node);
+#ifdef FT_INV_SKI_RED_LOST_INSERT
+				/* RED CONTROL: claim the insert without making
+				 * it -- the LOST INSERT signature. */
+				if (r == SKI_R - 1 && burst == 0 && k == 0)
+					c->in[id][k] = 1;
+				else
+#endif
+				if (cds_ft_insert(c->ft, key,
+						CDS_FT_LEN_DEFAULT,
+						&c->n[id][k].node) ==
+						CDS_FT_STATUS_OK) {
+					c->in[id][k] = 1;
+#ifdef FT_INV_SKI_COVERAGE
+					/* Did this insert APPEND to a chain the
+					 * PEER already owns?  That is the
+					 * insert/insert product. */
+					if (c->in[1 - id][k])
+						uatomic_inc(&ski_dup_appends);
+					else
+						uatomic_inc(&ski_solo_appends);
+#endif
+				}
+				rcu_read_unlock();
+			} else {
+				rcu_read_lock();
+				cds_ft_iter_set_key(iter, key,
+					CDS_FT_LEN_DEFAULT);
+				/*
+				 * The iter positions the key; the NODE says
+				 * which of the chain's entries to unlink, so
+				 * this cannot take the peer's.
+				 */
+				if (cds_ft_lookup(c->ft, iter) ==
+						CDS_FT_STATUS_OK &&
+						cds_ft_remove(c->ft, iter,
+							&c->n[id][k].node) ==
+						CDS_FT_STATUS_OK)
+					c->in[id][k] = 0;
+				rcu_read_unlock();
+			}
+			rcu_quiescent_state();
+		}
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static int inv_concurrent_same_key_inserts_run(bool ordered_list, bool coarse,
+		const char *name)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct ski_ctx c;
+	struct ski_arg arg[2];
+	pthread_t th[2];
+	struct cds_ft_iter *iter;
+	unsigned int i, k;
+	int ret = 0;
+
+	if (cds_ft_group_attr_create(&attr) < 0)
+		abort();
+	if (cds_ft_group_attr_set_key_len(attr, 8) < 0)
+		abort();
+	if (cds_ft_group_attr_set_ordered_list(attr, ordered_list) < 0)
+		abort();
+	if (coarse && cds_ft_group_attr_set_writer_strategy(attr,
+			CDS_FT_WRITER_LOCK_COARSE) < 0)
+		abort();
+	inv_maybe_set_rank_stats(attr);
+	if (cds_ft_group_create(attr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(attr);
+	memset(&c, 0, sizeof(c));
+	if (cds_ft_create(group, NULL, &c.ft) < 0)
+		abort();
+	cds_ft_make_concurrent(c.ft);
+	for (i = 0; i < 2; i++) {
+		c.n[i] = (struct skr_node *) calloc(SKI_K, sizeof(*c.n[i]));
+		c.in[i] = (unsigned char *) calloc(SKI_K, 1);
+		if (!c.n[i] || !c.in[i])
+			abort();
+		for (k = 0; k < SKI_K; k++)
+			c.n[i][k].k = k;
+	}
+	if (cds_ft_iter_create(c.ft, &iter) != CDS_FT_STATUS_OK)
+		abort();
+	/*
+	 * The trie starts EMPTY: both workers' first touch of a key is an
+	 * insert, so the very first sample of every key is the insert/insert
+	 * pairing this row exists for.
+	 */
+	for (i = 0; i < 2; i++) {
+		arg[i].c = &c;
+		arg[i].id = i;
+	}
+	pthread_create(&th[0], NULL, ski_worker, &arg[0]);
+	pthread_create(&th[1], NULL, ski_worker, &arg[1]);
+	pthread_join(th[0], NULL);
+	pthread_join(th[1], NULL);
+	rcu_quiescent_state();
+	rcu_barrier();
+	rcu_read_lock();
+	if (cds_ft_verify(c.ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "%s: verify RED after the run\n", name);
+		ret = -1;
+	}
+	for (k = 0; k < SKI_K; k++) {
+		struct cds_ft_node *h;
+		uint8_t key[8];
+		unsigned int seen[2] = { 0, 0 }, extra = 0;
+
+		cds_ft_u64_to_key(c.ft, (uint64_t) k, key, CDS_FT_LEN_DEFAULT);
+		cds_ft_iter_set_key(iter, key, CDS_FT_LEN_DEFAULT);
+		if (cds_ft_lookup(c.ft, iter) == CDS_FT_STATUS_OK) {
+			for (h = cds_ft_iter_node(iter); h;
+					h = cds_ft_node_next_rcu(h)) {
+				if (h == &c.n[0][k].node)
+					seen[0]++;
+				else if (h == &c.n[1][k].node)
+					seen[1]++;
+				else
+					extra++;
+			}
+		}
+		/*
+		 * EXACTLY the nodes their owners say are in.  A missing one is a
+		 * LOST INSERT or a phantom remove; a duplicate is a node linked
+		 * twice; @extra is a foreign splice.
+		 */
+		for (i = 0; i < 2; i++)
+			if (seen[i] != (unsigned int) c.in[i][k]) {
+				fprintf(stderr,
+					"%s: key %u worker %u: chain has %u, owner says %u\n",
+					name, k, i, seen[i],
+					(unsigned int) c.in[i][k]);
+				ret = -1;
+			}
+		if (extra) {
+			fprintf(stderr, "%s: key %u holds %u FOREIGN node(s)\n",
+				name, k, extra);
+			ret = -1;
+		}
+	}
+	rcu_read_unlock();
+	cds_ft_iter_destroy(iter);
+	rcu_quiescent_state();
+	rcu_barrier();
+	cds_ft_destroy(c.ft);
+	cds_ft_group_destroy(group);
+	for (i = 0; i < 2; i++) {
+		free(c.n[i]);
+		free(c.in[i]);
+	}
+#ifdef FT_INV_SKI_COVERAGE
+	fprintf(stderr, "# %s COVERAGE: appends onto the PEER's chain=%lu, onto an empty key=%lu\n",
+		name, ski_dup_appends, ski_solo_appends);
+#endif
+	fprintf(stderr,
+		"# %s: %u rounds x %u burst x %u keys, TWO same-key inserters (%s) -> %s\n",
+		name, SKI_R, SKI_BURST, SKI_K, coarse ? "coarse" : "fine",
+		ret ? "RED" : "ok");
+	return ret;
+}
+
+static int inv_concurrent_same_key_inserts_nolist(void)
+{
+	return inv_concurrent_same_key_inserts_run(false, false,
+		"inv_concurrent_same_key_inserts_nolist");
+}
+
+static int inv_concurrent_same_key_inserts_coarse(void)
+{
+	/*
+	 * THE ADJUDICATOR.  A fine-grained red is only a library finding if the
+	 * COARSE arm -- one writer lock, every interleaving serialised -- is
+	 * green on the same shape; otherwise the rig itself is wrong.
+	 */
+	return inv_concurrent_same_key_inserts_run(false, true,
+		"inv_concurrent_same_key_inserts_coarse");
+}
+
 static int inv_concurrent_same_key_append(void)
 {
 	/*
@@ -22760,6 +23015,8 @@ int main(int argc, char **argv)
 	diag("19. Same-key concurrent removes route by a re-validated decision");
 	RUN_TEST(inv_concurrent_same_key_removes);
 	RUN_TEST(inv_concurrent_same_key_removes_nolist);
+	RUN_TEST(inv_concurrent_same_key_inserts_nolist);
+	RUN_TEST(inv_concurrent_same_key_inserts_coarse);
 	RUN_TEST(inv_concurrent_same_key_append);
 	RUN_TEST(inv_concurrent_same_key_append_nolist);
 	RUN_TEST(inv_concurrent_same_key_append_coarse);
