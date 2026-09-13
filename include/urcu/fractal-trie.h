@@ -1491,7 +1491,11 @@ enum cds_ft_status cds_ft_insert(struct cds_ft *ft,
  * Update concurrency depends on the group's writer strategy
  * (cds_ft_group_attr_set_writer_strategy):
  *
- *   CDS_FT_WRITER_LOCK_FINE (the default): NOT concurrency-safe.  Mutual
+ *   CDS_FT_WRITER_LOCK_FINE (the default): NOT concurrency-safe -- ☐ a TODO,
+ *   NOT a design decision.  See "THE FINE-LOCKING TRANSITION IS INCOMPLETE" at
+ *   enum cds_ft_writer_strategy: this op derives something with nothing held and
+ *   then trusts it, where insert/remove go on to acquire and re-validate, and
+ *   the recipe to convert it is already in-tree.  Until then, mutual
  *   exclusion against every update operation (cds_ft_insert,
  *   cds_ft_insert_unique, cds_ft_insert_replace, cds_ft_replace,
  *   cds_ft_remove, cds_ft_remove_all) is the caller's responsibility.
@@ -1537,7 +1541,11 @@ enum cds_ft_status cds_ft_insert_unique(struct cds_ft *ft,
  * Update concurrency depends on the group's writer strategy
  * (cds_ft_group_attr_set_writer_strategy):
  *
- *   CDS_FT_WRITER_LOCK_FINE (the default): NOT concurrency-safe.  Mutual
+ *   CDS_FT_WRITER_LOCK_FINE (the default): NOT concurrency-safe -- ☐ a TODO,
+ *   NOT a design decision.  See "THE FINE-LOCKING TRANSITION IS INCOMPLETE" at
+ *   enum cds_ft_writer_strategy: this op derives something with nothing held and
+ *   then trusts it, where insert/remove go on to acquire and re-validate, and
+ *   the recipe to convert it is already in-tree.  Until then, mutual
  *   exclusion against every update operation (cds_ft_insert,
  *   cds_ft_insert_unique, cds_ft_insert_replace, cds_ft_replace,
  *   cds_ft_remove, cds_ft_remove_all) is the caller's responsibility.
@@ -1583,7 +1591,11 @@ enum cds_ft_status cds_ft_insert_replace(struct cds_ft *ft,
  * Update concurrency depends on the group's writer strategy
  * (cds_ft_group_attr_set_writer_strategy):
  *
- *   CDS_FT_WRITER_LOCK_FINE (the default): NOT concurrency-safe.  Mutual
+ *   CDS_FT_WRITER_LOCK_FINE (the default): NOT concurrency-safe -- ☐ a TODO,
+ *   NOT a design decision.  See "THE FINE-LOCKING TRANSITION IS INCOMPLETE" at
+ *   enum cds_ft_writer_strategy: this op derives something with nothing held and
+ *   then trusts it, where insert/remove go on to acquire and re-validate, and
+ *   the recipe to convert it is already in-tree.  Until then, mutual
  *   exclusion against every update operation (cds_ft_insert,
  *   cds_ft_insert_unique, cds_ft_insert_replace, cds_ft_replace,
  *   cds_ft_remove, cds_ft_remove_all) is the caller's responsibility.
@@ -1671,7 +1683,11 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
  * Update concurrency depends on the group's writer strategy
  * (cds_ft_group_attr_set_writer_strategy):
  *
- *   CDS_FT_WRITER_LOCK_FINE (the default): NOT concurrency-safe.  Mutual
+ *   CDS_FT_WRITER_LOCK_FINE (the default): NOT concurrency-safe -- ☐ a TODO,
+ *   NOT a design decision.  See "THE FINE-LOCKING TRANSITION IS INCOMPLETE" at
+ *   enum cds_ft_writer_strategy: this op derives something with nothing held and
+ *   then trusts it, where insert/remove go on to acquire and re-validate, and
+ *   the recipe to convert it is already in-tree.  Until then, mutual
  *   exclusion against every update operation (cds_ft_insert,
  *   cds_ft_insert_unique, cds_ft_insert_replace, cds_ft_replace,
  *   cds_ft_remove, cds_ft_remove_all) is the caller's responsibility.
@@ -2914,6 +2930,58 @@ enum cds_ft_status cds_ft_group_attr_set_optimize(
  *   also maintains order statistics is coerced to CDS_FT_WRITER_LOCK_COARSE
  *   (every count-changing writer updates the shared root, so there are no
  *   disjoint writers for fine locking to parallelize).
+ *
+ * ☐ TODO -- THE FINE-LOCKING TRANSITION IS INCOMPLETE, AND FOUR OPERATIONS ARE
+ * STILL WAITING ON IT.  cds_ft_insert and cds_ft_remove are converted: their
+ * per-op notes say they may run concurrently with each other "including on the
+ * same key".  Four others say instead that "mutual exclusion against every
+ * update operation is the caller's responsibility":
+ *
+ *     cds_ft_insert_unique   cds_ft_insert_replace
+ *     cds_ft_replace         cds_ft_remove_all
+ *
+ * ☠ READ THOSE SENTENCES AS A TODO, NOT AS A CONTRACT.  They describe work not
+ * yet done, not a property anyone wants: there is no design reason these four
+ * cannot coordinate through the same per-node lock-sets as insert and remove,
+ * and a caller-side mutex around them defeats the point of the default strategy.
+ * Documented here, once, because four identically-worded per-op notes read like
+ * four deliberate decisions.
+ *
+ * ★ THEY ARE ALSO ALL ONE DEFECT SHAPE, which is what makes the conversion
+ * tractable: each derives something with NOTHING HELD and then trusts it, where
+ * the converted sibling goes on to ACQUIRE the owning node and RE-VALIDATE.
+ *
+ *   cds_ft_replace      derives the holder from @old_node->prev and trusts it --
+ *                       "the writer mutex held here freezes the structure".  A
+ *                       back-pointer is stale at rest, unbounded.
+ *   cds_ft_remove_all   validates the chain head against the holder and trusts
+ *                       the result "under the writer mutex".
+ *   cds_ft_insert_unique  takes the duplicate head from the descent's landing --
+ *                       the code says "with nothing held" -- and RETURNS the
+ *                       -EEXIST verdict from it, BEFORE the holder acquire that
+ *                       the plain insert goes on to make.  Same read, same
+ *                       landing; only the early return differs.
+ *   cds_ft_insert_replace  replaces the whole duplicate chain, composed rather
+ *                       than carried by one commit (☐ confirm whether it needs
+ *                       more than the acquire+revalidate the other three do).
+ *
+ * ☐ RELATED BUT NOT THE SAME ITEM: cds_ft_detach and cds_ft_merge carry the
+ * identical "NOT concurrency-safe" sentence, but theirs says "every other update
+ * operation on the affected TRIES" -- they move a whole subtree BETWEEN tries, so
+ * their exclusion question is about two tries rather than one key's holder.  That
+ * conversion is a separate and larger question; it is named here only so the
+ * enumeration above is not mistaken for the complete list of unconverted ops.
+ *
+ * ⇒ THE RECIPE EXISTS IN-TREE.  The point remove was converted exactly this way:
+ * derive the holder, acquire it, RE-VALIDATE that it still names what the plan
+ * read, and bail RETRIABLY when it does not -- see ft_chain_head_holder's
+ * re-validation and its callers.  Reuse that rather than inventing a new rule.
+ *
+ * ☞ AND TEST IT IN-CONTRACT.  A concurrency row for an unconverted op belongs on
+ * the FINE arm and is expected RED until the conversion lands; writing it
+ * COARSE-only would bless the gap as the contract.  COARSE stays the adjudicator
+ * for a shape that IS converted (tests/regression/test_urcu_ft_inv.c's same-key
+ * rows).
  */
 enum cds_ft_writer_strategy {
 	CDS_FT_WRITER_LOCK_COARSE = 1,
