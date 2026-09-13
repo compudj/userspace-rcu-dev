@@ -3052,8 +3052,19 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 * -- per cow_stop's own contract -- the CALLER's to free afterwards.
 	 */
 	struct cds_ft_inode *dst_pp_old = NULL;
-	/* The W5 frame the src detach must run before (on the source path). */
+#ifdef FEATURE_FT_MERGE
+	/*
+	 * The W5 frame the src detach must run before (on the source path).
+	 *
+	 * ☠ GUARDED, because its TYPE is: struct ft_rekey_cow_after is defined
+	 * inside this file's merge region, and W5 is a merge-only frame (the COW
+	 * of the dst attach point's parent when the MERGE produces nothing fresh
+	 * there).  Declaring it unconditionally made -DNO_FEATURE_FT_MERGE fail to
+	 * COMPILE -- "has initializer but incomplete type" -- which is how that
+	 * whole configuration went dark on this branch.
+	 */
 	struct ft_rekey_cow_after cow_after = { .armed = false };
+#endif
 	struct ft_held_anchor ks_held = { 0 };	/* KEY_SHORTER run's overlap fence */
 	bool ks_fenced = false;
 	struct cds_ft_inode_flag *probe_D = NULL;	/* occupied dst merge point */
@@ -7305,7 +7316,18 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 	 *
 	 * A bail after a successful detach owns the detach's products, exactly
 	 * as the refusal below this block does.
+	 *
+	 * ☠ THE WHOLE BLOCK IS MERGE-ONLY, and guarded for the same reason its
+	 * @cow_after is: W5 is the COW of the dst attach point's PARENT for a
+	 * MERGE that produced nothing fresh there, so with no merge compiled in
+	 * nothing ever arms the frame and `cow_after.armed` is unreachably false.
+	 * Left unguarded it referenced a merge-only TYPE from unconditional code
+	 * and -DNO_FEATURE_FT_MERGE did not COMPILE -- which is how that whole
+	 * configuration went dark on this branch (since @2b7d8eec).  Guarding the
+	 * block rather than its interior keeps the nomerge build free of a dead
+	 * arm that would need its own refusal and its own cleanup.
 	 */
+#ifdef FEATURE_FT_MERGE
 	if (!ret && cow_after.armed) {
 		if (txn->pending_pub_folded) {
 			/*
@@ -7366,6 +7388,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 			}
 		}
 	}
+#endif /* FEATURE_FT_MERGE: W5's frame is a merge-only shape */
 	/*
 	 * ☠ AND RECLAIM WHAT THE DETACH BUILT FOR THE COMMIT.  detach_bail was
 	 * written for failures BEFORE or INSIDE the detach; a refusal AFTER a
