@@ -12432,7 +12432,26 @@ static int rekey_bare_head_graft(const char *dst, int ordered_list)
 	cds_ft_insert(ft, (const uint8_t *) "am", 2, &node_alloc(2)->node);
 	cds_ft_insert(ft, (const uint8_t *) "an", 2, &node_alloc(3)->node);
 
-	s = ft_rekey(ft, dst, "q");
+	/*
+	 * ☞ THE GRAFT ENTRY, NOT ft_rekey()'s MERGE ONE, and the reason is this
+	 * shape's own contract: @dst is EMPTY by construction here (the trie holds
+	 * only q/am/an), which is exactly what cds_ft_rekey_graft's @require_empty
+	 * states, and an empty destination needs no merge at all.
+	 *
+	 * ☠ IT ALSO MAKES THIS TEST RUN ON -DNO_FEATURE_FT_MERGE, where it used to
+	 * FAIL rather than skip.  ft_rekey() reaches cds_ft_rekey_merge, which
+	 * answers NOT_SUPPORTED with the merge compiled out; every other
+	 * merge-API test guards itself with cds_ft_merge_enabled() and skips, and
+	 * this one simply lacked the guard.  Adding the guard would have been the
+	 * smaller change and the worse one: it buys a skip that prints `ok` and
+	 * covers nothing, for a merge this shape never needed.  The same call was
+	 * made at @69ccdac4 for four other tests -- "skipped for a merge they
+	 * never needed" -- after Mathieu's ruling that on nomerge the rekey GRAFT
+	 * is the supported entry.  Measured: served on BOTH builds, so nomerge
+	 * gains real coverage of the bare-head graft instead of a silent skip.
+	 */
+	s = cds_ft_rekey_graft(ft, (const uint8_t *) dst, strlen(dst),
+			(const uint8_t *) "q", 1);
 	/*
 	 * ☑ SERVED NOW.  This was written atomic-or-refused while the gate stood
 	 * -- the refusal was waiting on ft_chain_compress_fused, not on this leg
