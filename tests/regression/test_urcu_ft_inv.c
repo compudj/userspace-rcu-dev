@@ -23351,17 +23351,46 @@ static int inv_concurrent_same_key_replace_nolist(void)
 	 * RETRY LOOP at its public entry, ft_chain_head_holder for the chain head,
 	 * an ft_acquire_member on the holder with a need_retry bail, and a publish
 	 * through _ft_publish_to_parent with @old_node as the EXPECTED-OLD -- and it
-	 * is still not enough.  Something in the derivation is used before it is
-	 * covered.  That is worth knowing precisely, because it means the conversion
-	 * is NOT the one-line template the point remove was.
+	 * is still not enough.
+	 *
+	 * ☞ TWO DEFECTS NAMED SO FAR, and they are in DIFFERENT OPS.
+	 *
+	 * 1. ☑ FIXED -- the SIGSEGV was _cds_ft_replace_locked reading
+	 *    @old_node->prev RAW, three times, on a premise its own comment stated
+	 *    and that is false under FINE ("the writer mutex held here freezes the
+	 *    structure").  A peer's prev store folded onto a commit flip-txn leaves
+	 *    the type-7 proxy in that word; ft_ord_cell_ptr strips only the cell
+	 *    bit, and cds_ft_item_to_metadata then builds a range header from the
+	 *    descriptor.  Caught at p=0x7fff348003de -- low nibble 0xe, i.e. 0xf
+	 *    with the cell bit already masked off, which is exactly why the assert
+	 *    at that site (it tests the WHOLE tag) cannot fire.  Cure: ONE
+	 *    ft_dereference_prev_resolved observation for the whole arm.
+	 *
+	 * 2. ☐ OPEN -- with that fixed, this row LIVELOCKS, and the livelock is in
+	 *    cds_ft_REMOVE, not replace.  Under -DFT_DEBUG_OP_RETRY_CAP
+	 *    -DFT_DEBUG_REMOVE_RETRY_CAP, 3 runs of 3:
+	 *      FT OP RETRY LIVELOCK: op=2 attempts=50001
+	 *      FT OP RETRY SITE: line=7187 consecutive=50002 other_line=0
+	 *      FT REMOVE RETRY WHY: eagain=10002 enoent=0
+	 *      FT REMOVE RETRY TAIL: ... in_fallback=1 active=1
+	 *                            dirtyLOCK=217 dirtyOTHER=261 cabort=0
+	 *    So: ONE exit, never any other; always -EAGAIN and never -ENOENT; ZERO
+	 *    commit aborts; already escalated into the FIFO fallback lane (which
+	 *    the retry loop's own comment names as the reason it "terminates (no
+	 *    livelock)" -- that premise fails here); and the two acquire-refusal
+	 *    counters explain only ~5% of attempts, so the -EAGAIN has a third
+	 *    source.  A converted op cannot converge while an UNCONVERTED peer
+	 *    mutates its chain without holding the holder -- which is the cost of
+	 *    the gap, paid by the op that did convert.
 	 *
 	 * Enable with FT_INV_SAME_KEY_REPLACE=1 to work on it; the COARSE row stays
 	 * in the default set so a regression in the RIG still shows up.
 	 */
 	if (!getenv("FT_INV_SAME_KEY_REPLACE")) {
 		diag("inv_concurrent_same_key_replace_nolist: skipped "
-			"(set FT_INV_SAME_KEY_REPLACE=1; measured SIGSEGV -- "
-			"cds_ft_replace is not fine-locking converted)");
+			"(set FT_INV_SAME_KEY_REPLACE=1; measured LIVELOCK in "
+			"cds_ft_remove -- cds_ft_replace is not fine-locking "
+			"converted, and the converted peer pays for it)");
 		return 0;
 	}
 	return inv_concurrent_same_key_replace_run(false,

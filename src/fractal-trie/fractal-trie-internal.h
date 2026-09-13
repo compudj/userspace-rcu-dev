@@ -3206,6 +3206,12 @@ void ft_writer_lock_scope_exit(struct cds_ft *ft)
  * (or outside any writer scope) this is a plain synchronize_rcu.
  */
 #ifdef FT_DEBUG_REMOVE_RETRY_CAP
+/* ★ See the remove retry exit: -EAGAIN (contention) vs -ENOENT (dead derivation). */
+static __thread unsigned long ft_dbg_rm_eagain;
+static __thread unsigned long ft_dbg_rm_enoent;
+#endif
+
+#ifdef FT_DEBUG_REMOVE_RETRY_CAP
 # include <time.h>
 static __thread uint64_t ft_dbg_gp_ns;
 static __thread unsigned int ft_dbg_gp_calls;

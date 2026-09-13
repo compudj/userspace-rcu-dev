@@ -189,6 +189,32 @@ enum ft_op_kind {
 	FT_OP_REKEY,
 };
 
+/*
+ * ★ WHICH RETRY SITE.  The cap says an op spun; it does not say WHERE, and an
+ * op with four distinct "publishes nothing, retry" exits has four different
+ * diagnoses.  Mirrors ft_dbg_rm_site (ft-helpers.h): each site stamps its own
+ * __LINE__, and the livelock report names the line that spun, how many times
+ * consecutively, and the last OTHER line seen -- so a single spinning exit is
+ * distinguishable from a cycle between two.
+ */
+static __thread unsigned int ft_dbg_retry_line;
+static __thread unsigned long ft_dbg_retry_line_nr;
+static __thread unsigned int ft_dbg_retry_line_other;
+
+static inline
+void ft_dbg_retry_stamp(unsigned int line)
+{
+	if (line == ft_dbg_retry_line) {
+		ft_dbg_retry_line_nr++;
+		return;
+	}
+	if (ft_dbg_retry_line)
+		ft_dbg_retry_line_other = ft_dbg_retry_line;
+	ft_dbg_retry_line = line;
+	ft_dbg_retry_line_nr = 1;
+}
+# define FT_DBG_RETRY_SITE()	ft_dbg_retry_stamp(__LINE__)
+
 struct ft_op_retry {
 	unsigned int attempts;
 	unsigned int op;
@@ -242,6 +268,10 @@ void ft_op_retry_tick(const struct cds_ft *ft, struct ft_op_retry *r, int last_r
 		"-EAGAIN no re-descent can clear.  Single-threaded this is "
 		"certain; under peers it is the leading hypothesis.\n",
 		r->op, r->attempts, last_ret);
+	fprintf(stderr,
+		"FT OP RETRY SITE: line=%u consecutive=%lu other_line=%u\n",
+		ft_dbg_retry_line, ft_dbg_retry_line_nr,
+		ft_dbg_retry_line_other);
 	if (system("lttng snapshot record 1>&2") == -1)
 		fprintf(stderr, "FT OP RETRY: snapshot record failed\n");
 	abort();
@@ -250,6 +280,7 @@ void ft_op_retry_tick(const struct cds_ft *ft, struct ft_op_retry *r, int last_r
 struct ft_op_retry { int unused; };
 # define ft_op_retry_init(r, op, key, key_len)	do { (void) (r); } while (0)
 # define ft_op_retry_tick(ft, r, last_ret)	do { (void) (r); } while (0)
+# define FT_DBG_RETRY_SITE()			do { } while (0)
 #endif	/* FT_DEBUG_OP_RETRY_CAP */
 
 #endif /* _URCU_FT_TRACE_H */

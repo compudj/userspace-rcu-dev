@@ -4381,9 +4381,25 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 	/*
 	 * No top-down descent.  As in cds_ft_remove, @old_node is
 	 * application-owned and -- with the RCU read-side lock held
-	 * continuously since it was obtained -- alive; the writer mutex held
-	 * here freezes the structure, so @old_node->prev is a settled live
-	 * pointer to its holder.  @new_node takes @old_node's exact place in
+	 * continuously since it was obtained -- alive.
+	 *
+	 * ☠ AND NOTHING FREEZES THE STRUCTURE.  This comment used to claim "the
+	 * writer mutex held here freezes the structure, so @old_node->prev is a
+	 * settled live pointer to its holder".  That premise is FALSE under
+	 * CDS_FT_WRITER_LOCK_FINE: the FT-wide mutex is dropped for a FINE trie,
+	 * this op acquires NO node lock, and cds_ft_replace is one of the point
+	 * ops the fine-locking transition has not converted (see the TODO at
+	 * enum cds_ft_writer_strategy).  So @old_node->prev is a LIVE word with
+	 * concurrent writers, and the only safe reads of it are (a) through
+	 * ft_dereference_prev_resolved, which strips a parked flip proxy, and
+	 * (b) ONCE -- two observations of a live re-home disagree.  Both rules
+	 * are now obeyed below (@old_prev); what is NOT yet obeyed is the third
+	 * half of the same rule (ft_dereference_prev_resolved's sweep note): a
+	 * read taken before the holder acquire is STALE-POSSIBLE and the routing
+	 * it derives must be re-validated under that lock.  That re-validation
+	 * is the conversion, and it is owed.
+	 *
+	 * @new_node takes @old_node's exact place in
 	 * the duplicate chain, so the key count and trie shape are unchanged:
 	 * only the chain link (or head slot) that points at @old_node is
 	 * repointed at @new_node.  That slot is derived from the holder -- the
@@ -4455,12 +4471,45 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 	 * parent and flips the structural + SKIP_X dual.  Mirrors ft_promote_head.
 	 */
 	{
+		/*
+		 * ONE RESOLVED OBSERVATION of @old_node->prev for this whole arm.
+		 *
+		 * Three raw reads used to live here -- the @is_head test, the
+		 * @old_cell derivation, and the list-off head's
+		 * "new_node->prev = old_node->prev" inherit -- on the strength of
+		 * the freeze premise refuted above.  Each was a defect of its own
+		 * under FINE:
+		 *
+		 *   - RAW.  A head-promote / swap / prev-retarget folds its prev
+		 *     store onto the commit flip-txn, so this word transiently
+		 *     carries FT's type-7 proxy (all of FT_PARENT_TAG_MASK set).
+		 *     ft_ord_cell_ptr strips only FT_ORD_CELL_TAG (bit 0), leaving
+		 *     a descriptor-record pointer with bits 1-3 still set, and
+		 *     cds_ft_item_to_metadata then builds a range header from
+		 *     foreign memory -> SIGSEGV.  MEASURED, not theorised: a
+		 *     same-key replace against an insert/remove peer faults inside
+		 *     a second, at cds_ft_item_to_metadata(p=0x7fff348003de) -- the
+		 *     0xe low nibble is 0xf with the cell bit already masked off,
+		 *     which is why the assert at that very site (it tests the
+		 *     WHOLE tag, and the caller has already broken it) cannot fire.
+		 *     ft_dereference_prev_resolved exists for exactly this; the
+		 *     holder derivation above (ft_node_holder) already used it,
+		 *     so one function was resolving the word and then re-reading
+		 *     it raw three times.
+		 *   - TWICE.  @is_head said "head, so prev is a cell" from read 1
+		 *     while read 2 could already be a peer's new value, so the two
+		 *     halves of one decision came from different trie states.
+		 *   - INHERITED.  The list-off arm stored the raw word into the
+		 *     fresh head's prev, publishing a parked proxy as a live
+		 *     back-edge.
+		 */
+		void *old_prev = ft_dereference_prev_resolved(old_node);
 		bool is_head = !ft_node_external(
-			(struct cds_ft_inode_flag *) old_node->prev);
+			(struct cds_ft_inode_flag *) old_prev);
 		struct cds_ft_inode_flag *parent_nf = cn ?
 			ft_compressed_node_flag(cn) : holder_flag;
 		struct ft_ord_cell *old_cell = (ft->ordered_list && is_head) ?
-			ft_ord_cell_ptr(old_node->prev) : NULL;
+			ft_ord_cell_ptr(old_prev) : NULL;
 		void *new_cell_flag = NULL;
 		struct ft_pub_rec rec = { .n = 0 };
 		struct ft_ord_cell_edge sedges[2] = { 0 };
@@ -4587,6 +4636,7 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 								hm, hdep, &hh) ||
 							hh.shared) {
 						new_node->next = NULL;
+						FT_DBG_RETRY_SITE();
 						*need_retry = true;
 						s = CDS_FT_STATUS_OK;	/* discarded by the retry loop */
 						FT_TP(replace_exit, (int) s);
@@ -4637,6 +4687,7 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 				 */
 				new_node->next = NULL;
 				new_node->prev = NULL;
+				FT_DBG_RETRY_SITE();
 				*need_retry = true;
 				s = CDS_FT_STATUS_OK;	/* discarded by the retry loop */
 				FT_TP(replace_exit, (int) s);
@@ -4713,6 +4764,7 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 				new_node->prev = NULL;
 				ft_ord_cell_free_unpublished(ft, new_cell);
 				if (r == -EAGAIN) {
+					FT_DBG_RETRY_SITE();
 					*need_retry = true;
 					s = CDS_FT_STATUS_OK;	/* discarded by the retry loop */
 				} else {
@@ -4745,7 +4797,7 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 			}
 			if (new_node->next)
 				new_node->next->prev = new_node;
-			new_node->prev = old_node->prev;
+			new_node->prev = old_prev;	/* resolved, see @old_prev */
 			/* VALIDATE (§4.B): guard the LIVE holder parent_nf. */
 			ft_flip_txn_guard_parent(ft, txn, parent_nf);
 			_ft_publish_to_parent(ft, parent_nf, pub_slot,
@@ -4767,6 +4819,7 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 					new_node->next->prev = old_node;
 				new_node->next = NULL;
 				new_node->prev = NULL;
+				FT_DBG_RETRY_SITE();
 				*need_retry = true;
 				s = CDS_FT_STATUS_OK;	/* discarded by the retry loop */
 				FT_TP(replace_exit, (int) s);

@@ -6298,6 +6298,7 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 		 * BOTH were tombstoned(fwd); neither was !d.nf (§5.23).
 		 */
 		if (fwd != NULL && ft_flag_tombstoned(ft, fwd)) {
+			FT_DBG_RETRY_SITE();
 			*need_retry = true;
 			return CDS_FT_STATUS_OK;	/* wrapper retries */
 		}
@@ -6381,6 +6382,7 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 				 * the retry the tail takes for a peer-won
 				 * commit, reached before any of the work.
 				 */
+				FT_DBG_RETRY_SITE();
 				*need_retry = true;
 				return CDS_FT_STATUS_OK;
 			}
@@ -6513,6 +6515,7 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 					continue;
 				}
 				/* A peer LOCK/PROXY: genuinely in progress. */
+				FT_DBG_RETRY_SITE();
 				*need_retry = true;
 				FT_RM_RELEASE();
 				return CDS_FT_STATUS_OK;
@@ -6642,6 +6645,7 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 			 * is released, and the re-derivation above sorts a dead
 			 * holder out through its own recovery arm.
 			 */
+			FT_DBG_RETRY_SITE();
 			*need_retry = true;
 			return CDS_FT_STATUS_OK;	/* value unused: wrapper retries */
 		}
@@ -6652,6 +6656,7 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 			 */
 			if (!rm_held.shared && !rm_held.txn_owned)
 				ft_meta_lock_release_if_held(rm_held.lock);
+			FT_DBG_RETRY_SITE();
 			*need_retry = true;
 			return CDS_FT_STATUS_OK;	/* value unused: wrapper retries */
 		}
@@ -6823,6 +6828,7 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 			 * makes this terminate where the bare double-read spun.
 			 */
 			if (ft_rm_holder_rehomed(ft, node, holder_flag)) {
+				FT_DBG_RETRY_SITE();
 				*need_retry = true;
 				FT_RM_RELEASE();
 				return CDS_FT_STATUS_OK;
@@ -7061,6 +7067,7 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 			 * makes this terminate where the bare double-read spun.
 			 */
 			if (ft_rm_holder_rehomed(ft, node, holder_flag)) {
+				FT_DBG_RETRY_SITE();
 				*need_retry = true;
 				FT_RM_RELEASE();
 				return CDS_FT_STATUS_OK;
@@ -7177,6 +7184,21 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 		 * (freeze, count, tombstone) was discarded with it.  Signal the
 		 * wrapper's retry loop to re-derive and re-attempt.
 		 */
+		FT_DBG_RETRY_SITE();
+#ifdef FT_DEBUG_REMOVE_RETRY_CAP
+		/*
+		 * ★ WHICH of the two.  The exit fuses -EAGAIN (a peer won a
+		 * commit, or a lock acquire refused) with -ENOENT (the derived
+		 * position emptied / retyped pre-commit).  They have different
+		 * cures -- one is contention, the other a derivation that can be
+		 * STABLY dead -- so a livelock here is undiagnosable until they
+		 * are counted apart.
+		 */
+		if (ret == -EAGAIN)
+			ft_dbg_rm_eagain++;
+		else
+			ft_dbg_rm_enoent++;
+#endif
 		*need_retry = true;
 		FT_RM_RELEASE();
 		return CDS_FT_STATUS_OK;	/* value unused: wrapper retries */
@@ -7308,6 +7330,9 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 					: -1,
 				ft_dbg_acq_dirty_lock, ft_dbg_acq_dirty_other,
 				ft_dbg_acq_cabort);
+			fprintf(stderr, "FT REMOVE RETRY WHY: eagain=%lu "
+				"enoent=%lu\n", ft_dbg_rm_eagain,
+				ft_dbg_rm_enoent);
 #ifdef FT_ENABLE_TRACING
 			/*
 			 * The traced build's milestone IS the violation: emit
