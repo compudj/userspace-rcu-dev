@@ -82,7 +82,7 @@
  */
 /* +4 inv_prefix_head_*_key_identity; +2 inv_split_point_lookup_identity*;
  * +2 inv_absent_key_never_found* */
-#define NR_TESTS	(113 + NR_TESTS_REKEY_DLM)
+#define NR_TESTS	(115 + NR_TESTS_REKEY_DLM)
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -22547,7 +22547,10 @@ static int inv_concurrent_same_key_append_run(bool ordered_list, bool coarse,
 struct ski_ctx {
 	struct cds_ft *ft;
 	struct skr_node *n[2];		/* [2][SKI_K]: one node array per worker */
-	unsigned char *in[2];		/* [2][SKI_K]: MY node is currently in */
+	unsigned char *in[2];		/* [2][SKI_K]: MY node is currently in.  For
+					 * the REPLACE row's worker 1 this names
+					 * WHICH of its pair is installed (0/1/2). */
+	struct skr_node *alt;		/* [SKI_K]: worker 1's second node, replace row */
 };
 
 struct ski_arg {
@@ -22743,10 +22746,254 @@ static int inv_concurrent_same_key_inserts_run(bool ordered_list, bool coarse,
 	return ret;
 }
 
+/*
+ * A CONTRACT PROBE, NOT YET A GATE: cds_ft_replace against a same-key
+ * insert/remove peer, on the FINE arm.
+ *
+ * ☞ WHY THE FINE ARM, for an op whose header says "NOT concurrency-safe.  Mutual
+ * exclusion ... is the caller's responsibility".  That sentence is a TODO
+ * recording an unfinished transition, not a property anyone wants (see "THE
+ * FINE-LOCKING TRANSITION IS INCOMPLETE" at enum cds_ft_writer_strategy).  A
+ * COARSE-only row would bless the gap as the contract and witness nothing.  So
+ * this row runs where the conversion is owed, and its RESULT is the information:
+ *
+ *   RED   -> the gap is real, and this row is the reproducer the conversion needs.
+ *   GREEN -> the header UNDER-describes the code, which for this op is the live
+ *            question: _cds_ft_replace_locked already has a need_retry RETRY LOOP
+ *            at its public entry, resolves the chain head through
+ *            ft_chain_head_holder, takes ft_acquire_member on the holder with a
+ *            need_retry bail, and publishes through _ft_publish_to_parent with
+ *            @old_node as the EXPECTED-OLD -- so a slot that moved aborts the
+ *            commit and the loop re-derives.  That is the same recipe the point
+ *            remove was converted with.  A green here does not PROVE the op
+ *            converted, but it is the first evidence either way, and there was
+ *            none before.
+ *
+ * THE SHAPE.  Worker A cycles insert/remove of its own node (both CONVERTED ops,
+ * so A is in-contract by itself).  Worker B owns TWO nodes per key and keeps
+ * exactly one installed, replacing it with the other -- so every B operation is a
+ * cds_ft_replace on a key A is concurrently inserting into and removing from.
+ * B seeds its first node with an insert, because replace needs something to
+ * replace.
+ *
+ * ☠ B ONLY EVER NAMES ITS OWN NODE.  cds_ft_replace takes @old_node explicitly
+ * and dereferences it via ->prev, so it must be live: B holds the RCU read lock
+ * across the lookup and the call, and A never touches B's nodes.  Passing a node
+ * the peer may have removed would be a test bug that frames the library.
+ *
+ * The invariant is the exact one the insert/insert row uses: at the join, each
+ * worker's own flags are authoritative, so the chain must hold EXACTLY the nodes
+ * their owners say are in.
+ */
+static void *skrp_replacer(void *arg)
+{
+	struct ski_ctx *c = (struct ski_ctx *) arg;
+	unsigned int r, burst, k;
+	struct cds_ft_iter *iter;
+
+	rcu_register_thread();
+	rcu_thread_online();
+	if (cds_ft_iter_create(c->ft, &iter) != CDS_FT_STATUS_OK)
+		abort();
+	for (r = 0; r < SKI_R; r++)
+		for (burst = 0; burst < SKI_BURST; burst++)
+		for (k = 0; k < SKI_K; k++) {
+			uint8_t key[8];
+			/* in[1][k] is 0 while neither of B's nodes is in, else
+			 * 1 or 2 naming WHICH of the pair is installed. */
+			unsigned int cur = c->in[1][k];
+
+			cds_ft_u64_to_key(c->ft, (uint64_t) k, key,
+				CDS_FT_LEN_DEFAULT);
+			rcu_read_lock();
+			if (!cur) {
+				cds_ft_node_init(&c->n[1][k].node);
+				if (cds_ft_insert(c->ft, key,
+						CDS_FT_LEN_DEFAULT,
+						&c->n[1][k].node) ==
+						CDS_FT_STATUS_OK)
+					c->in[1][k] = 1;
+			} else {
+				struct cds_ft_node *old = cur == 1 ?
+					&c->n[1][k].node : &c->alt[k].node;
+				struct cds_ft_node *nw = cur == 1 ?
+					&c->alt[k].node : &c->n[1][k].node;
+
+				cds_ft_iter_set_key(iter, key,
+					CDS_FT_LEN_DEFAULT);
+				cds_ft_node_init(nw);
+				if (cds_ft_lookup(c->ft, iter) ==
+						CDS_FT_STATUS_OK &&
+						cds_ft_replace(c->ft, iter,
+							old, nw) ==
+						CDS_FT_STATUS_OK)
+					c->in[1][k] = cur == 1 ? 2 : 1;
+			}
+			rcu_read_unlock();
+			rcu_quiescent_state();
+		}
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static int inv_concurrent_same_key_replace_run(bool coarse, const char *name)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct ski_ctx c;
+	struct ski_arg arg0;
+	pthread_t th[2];
+	struct cds_ft_iter *iter;
+	unsigned int i, k;
+	int ret = 0;
+
+	if (cds_ft_group_attr_create(&attr) < 0)
+		abort();
+	if (cds_ft_group_attr_set_key_len(attr, 8) < 0)
+		abort();
+	if (coarse && cds_ft_group_attr_set_writer_strategy(attr,
+			CDS_FT_WRITER_LOCK_COARSE) < 0)
+		abort();
+	inv_maybe_set_rank_stats(attr);
+	if (cds_ft_group_create(attr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(attr);
+	memset(&c, 0, sizeof(c));
+	if (cds_ft_create(group, NULL, &c.ft) < 0)
+		abort();
+	cds_ft_make_concurrent(c.ft);
+	for (i = 0; i < 2; i++) {
+		c.n[i] = (struct skr_node *) calloc(SKI_K, sizeof(*c.n[i]));
+		c.in[i] = (unsigned char *) calloc(SKI_K, 1);
+		if (!c.n[i] || !c.in[i])
+			abort();
+		for (k = 0; k < SKI_K; k++)
+			c.n[i][k].k = k;
+	}
+	c.alt = (struct skr_node *) calloc(SKI_K, sizeof(*c.alt));
+	if (!c.alt)
+		abort();
+	for (k = 0; k < SKI_K; k++)
+		c.alt[k].k = k;
+	if (cds_ft_iter_create(c.ft, &iter) != CDS_FT_STATUS_OK)
+		abort();
+	arg0.c = &c;
+	arg0.id = 0;
+	pthread_create(&th[0], NULL, ski_worker, &arg0);	/* insert/remove peer */
+	pthread_create(&th[1], NULL, skrp_replacer, &c);	/* the replace lane */
+	pthread_join(th[0], NULL);
+	pthread_join(th[1], NULL);
+	rcu_quiescent_state();
+	rcu_barrier();
+	rcu_read_lock();
+	if (cds_ft_verify(c.ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "%s: verify RED after the run\n", name);
+		ret = -1;
+	}
+	for (k = 0; k < SKI_K; k++) {
+		struct cds_ft_node *h;
+		uint8_t key[8];
+		unsigned int seen_a = 0, seen_b = 0, extra = 0;
+		unsigned int want_b = c.in[1][k] ? 1 : 0;
+
+		cds_ft_u64_to_key(c.ft, (uint64_t) k, key, CDS_FT_LEN_DEFAULT);
+		cds_ft_iter_set_key(iter, key, CDS_FT_LEN_DEFAULT);
+		if (cds_ft_lookup(c.ft, iter) == CDS_FT_STATUS_OK) {
+			for (h = cds_ft_iter_node(iter); h;
+					h = cds_ft_node_next_rcu(h)) {
+				if (h == &c.n[0][k].node)
+					seen_a++;
+				else if (h == &c.n[1][k].node ||
+						h == &c.alt[k].node)
+					seen_b++;
+				else
+					extra++;
+			}
+		}
+		if (seen_a != (unsigned int) c.in[0][k]) {
+			fprintf(stderr,
+				"%s: key %u inserter: chain has %u, owner says %u\n",
+				name, k, seen_a, (unsigned int) c.in[0][k]);
+			ret = -1;
+		}
+		/*
+		 * EXACTLY ONE of the replacer's pair, and only while it says so.
+		 * Two would mean a replace INSTALLED without unlinking; zero
+		 * with want_b set would mean the swap lost the node.
+		 */
+		if (seen_b != want_b) {
+			fprintf(stderr,
+				"%s: key %u replacer: chain has %u of its pair, owner says %u\n",
+				name, k, seen_b, want_b);
+			ret = -1;
+		}
+		if (extra) {
+			fprintf(stderr, "%s: key %u holds %u FOREIGN node(s)\n",
+				name, k, extra);
+			ret = -1;
+		}
+	}
+	rcu_read_unlock();
+	cds_ft_iter_destroy(iter);
+	rcu_quiescent_state();
+	rcu_barrier();
+	cds_ft_destroy(c.ft);
+	cds_ft_group_destroy(group);
+	for (i = 0; i < 2; i++) {
+		free(c.n[i]);
+		free(c.in[i]);
+	}
+	free(c.alt);
+	fprintf(stderr,
+		"# %s: %u rounds x %u burst x %u keys, cds_ft_replace vs same-key insert/remove (%s) -> %s\n",
+		name, SKI_R, SKI_BURST, SKI_K, coarse ? "coarse" : "fine",
+		ret ? "RED" : "ok");
+	return ret;
+}
+
 static int inv_concurrent_same_key_inserts_nolist(void)
 {
 	return inv_concurrent_same_key_inserts_run(false, false,
 		"inv_concurrent_same_key_inserts_nolist");
+}
+
+static int inv_concurrent_same_key_replace_nolist(void)
+{
+	/*
+	 * ☠☠ MEASURED RED -- AND IT SEGFAULTS, so it is OPT-IN rather than in the
+	 * default set.  This is the finding, not a flaky row:
+	 *
+	 *   COARSE arm (the adjudicator, below): GREEN, 40x400x8 -- so the RIG IS
+	 *     SOUND and the invariant is satisfiable on this shape.
+	 *   FINE arm (this one):  SIGSEGV inside the library.
+	 *
+	 * ⇒ cds_ft_replace's "NOT concurrency-safe" header is NOT merely stale
+	 * documentation.  The op already carries most of the recipe -- a need_retry
+	 * RETRY LOOP at its public entry, ft_chain_head_holder for the chain head,
+	 * an ft_acquire_member on the holder with a need_retry bail, and a publish
+	 * through _ft_publish_to_parent with @old_node as the EXPECTED-OLD -- and it
+	 * is still not enough.  Something in the derivation is used before it is
+	 * covered.  That is worth knowing precisely, because it means the conversion
+	 * is NOT the one-line template the point remove was.
+	 *
+	 * Enable with FT_INV_SAME_KEY_REPLACE=1 to work on it; the COARSE row stays
+	 * in the default set so a regression in the RIG still shows up.
+	 */
+	if (!getenv("FT_INV_SAME_KEY_REPLACE")) {
+		diag("inv_concurrent_same_key_replace_nolist: skipped "
+			"(set FT_INV_SAME_KEY_REPLACE=1; measured SIGSEGV -- "
+			"cds_ft_replace is not fine-locking converted)");
+		return 0;
+	}
+	return inv_concurrent_same_key_replace_run(false,
+		"inv_concurrent_same_key_replace_nolist");
+}
+
+static int inv_concurrent_same_key_replace_coarse(void)
+{
+	return inv_concurrent_same_key_replace_run(true,
+		"inv_concurrent_same_key_replace_coarse");
 }
 
 static int inv_concurrent_same_key_inserts_coarse(void)
@@ -23017,6 +23264,8 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_concurrent_same_key_removes_nolist);
 	RUN_TEST(inv_concurrent_same_key_inserts_nolist);
 	RUN_TEST(inv_concurrent_same_key_inserts_coarse);
+	RUN_TEST(inv_concurrent_same_key_replace_nolist);
+	RUN_TEST(inv_concurrent_same_key_replace_coarse);
 	RUN_TEST(inv_concurrent_same_key_append);
 	RUN_TEST(inv_concurrent_same_key_append_nolist);
 	RUN_TEST(inv_concurrent_same_key_append_coarse);
