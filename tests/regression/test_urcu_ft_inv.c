@@ -23339,75 +23339,56 @@ static int inv_concurrent_same_key_inserts_nolist(void)
 static int inv_concurrent_same_key_replace_nolist(void)
 {
 	/*
-	 * ☠☠ MEASURED RED -- AND IT SEGFAULTS, so it is OPT-IN rather than in the
-	 * default set.  This is the finding, not a flaky row:
+	 * ☑ IN THE DEFAULT SET, and it is the regression guard for
+	 * cds_ft_replace's FINE-LOCKING CONVERSION.  It was opt-in and RED --
+	 * SIGSEGV, then LIVELOCK -- for as long as replace was unconverted; all
+	 * THREE defects are fixed, and the history is worth keeping because each
+	 * one was a different lesson about the same false premise.
 	 *
-	 *   COARSE arm (the adjudicator, below): GREEN, 40x400x8 -- so the RIG IS
-	 *     SOUND and the invariant is satisfiable on this shape.
-	 *   FINE arm (this one):  SIGSEGV inside the library.
-	 *
-	 * ⇒ cds_ft_replace's "NOT concurrency-safe" header is NOT merely stale
-	 * documentation.  The op already carries most of the recipe -- a need_retry
-	 * RETRY LOOP at its public entry, ft_chain_head_holder for the chain head,
-	 * an ft_acquire_member on the holder with a need_retry bail, and a publish
-	 * through _ft_publish_to_parent with @old_node as the EXPECTED-OLD -- and it
-	 * is still not enough.
-	 *
-	 * ☞ TWO DEFECTS NAMED SO FAR, and they are in DIFFERENT OPS.
-	 *
-	 * 1. ☑ FIXED -- the SIGSEGV was _cds_ft_replace_locked reading
-	 *    @old_node->prev RAW, three times, on a premise its own comment stated
-	 *    and that is false under FINE ("the writer mutex held here freezes the
-	 *    structure").  A peer's prev store folded onto a commit flip-txn leaves
-	 *    the type-7 proxy in that word; ft_ord_cell_ptr strips only the cell
-	 *    bit, and cds_ft_item_to_metadata then builds a range header from the
+	 * 1. ☑ the SIGSEGV was _cds_ft_replace_locked reading @old_node->prev RAW,
+	 *    three times, on a premise its own comment stated and that is false
+	 *    under FINE ("the writer mutex held here freezes the structure").  A
+	 *    peer's prev store folded onto a commit flip-txn leaves the type-7
+	 *    proxy in that word; ft_ord_cell_ptr strips only the cell bit, and
+	 *    cds_ft_item_to_metadata then builds a range header from the
 	 *    descriptor.  Caught at p=0x7fff348003de -- low nibble 0xe, i.e. 0xf
 	 *    with the cell bit already masked off, which is exactly why the assert
 	 *    at that site (it tests the WHOLE tag) cannot fire.  Cure: ONE
 	 *    ft_dereference_prev_resolved observation for the whole arm.
 	 *
-	 * 2. ☐ OPEN -- with that fixed, this row LIVELOCKS, and the livelock is in
-	 *    cds_ft_REMOVE, not replace.  Under -DFT_DEBUG_OP_RETRY_CAP
-	 *    -DFT_DEBUG_REMOVE_RETRY_CAP, 3 runs of 3:
-	 *      FT OP RETRY LIVELOCK: op=2 attempts=50001
-	 *      FT OP RETRY SITE: line=7187 consecutive=50002 other_line=0
-	 *      FT REMOVE RETRY WHY: eagain=10002 enoent=0
-	 *      FT REMOVE RETRY TAIL: ... in_fallback=1 active=1
-	 *                            dirtyLOCK=217 dirtyOTHER=261 cabort=0
-	 *    So: ONE exit, never any other; always -EAGAIN and never -ENOENT; ZERO
-	 *    commit aborts; already escalated into the FIFO fallback lane (which
-	 *    the retry loop's own comment names as the reason it "terminates (no
-	 *    livelock)" -- that premise fails here); and the two acquire-refusal
-	 *    counters explain only ~5% of attempts -- which was MY ERROR, not a
-	 *    third source: the TAIL prints at attempt 10,000 and the SITE stamps at
-	 *    50,001, so they are different instants of one call.
+	 * 2. ☑ behind it, cds_ft_REMOVE livelocked -- 50,001 attempts, ONE exit,
+	 *    always -EAGAIN, never -ENOENT, ZERO commit aborts, already escalated
+	 *    into the FIFO fallback lane whose drain the retry loop cites as why it
+	 *    "terminates (no livelock)".  The stamps chained three levels down to
+	 *    ft_dlm_lock refusing the chain holder's state word, and the PROXY
+	 *    PARKER discriminator named the parker: every refusal saw a DIFFERENT
+	 *    descriptor (streak=1, switches == the refusal count), all-MW, carrying
+	 *    a {0x20 -> 0x20} record on that word -- i.e.
+	 *    ft_flip_txn_guard_parent's §4.B state guard, parked once per replace
+	 *    commit.  Replace's HEAD arms VALIDATED the word remove HOLDS.  A
+	 *    validator that parks a word a locker must find CLEAN starves that
+	 *    locker forever, and symmetrically the guard loses to remove's
+	 *    {LOCK|s -> s} release, so replace starved too (op=3, same row).  MW
+	 *    settles the record KIND, never the EXCLUSION.  Cure: replace takes the
+	 *    holder's lock ONCE, above its routing derivation, so both ops queue on
+	 *    one primitive and the op txn's aging drains it.
 	 *
-	 *    DRILLED DOWN (the stamps chain three levels):
-	 *      FT OP RETRY SITE:    line=7187  <- remove's fused -EAGAIN/-ENOENT exit
-	 *      FT OP ACQUIRE SITE:  line=6471  <- ft_dlm_lock refused, other_line=0
-	 *      FT OP LOCK REFUSE:   lock=609 proxy=3588 tombstone=0
-	 *                           last_state=0x7f2a139ded31
-	 *      FT OP LOCK REFUSE WORD: streak=3588 switches=2
-	 *    So the terminal state is NOT an immortal tombstone (0 of them) and not
-	 *    mostly contention for a lock: it is the holder's state word PARKED with
-	 *    a flip proxy (bit 0 set on a descriptor pointer), on ONE word -- two
-	 *    switches across thousands of refusals.  ft_dlm_lock refuses a parked
-	 *    word outright, and the engine's rule is that only the PARKER's owner
-	 *    ever settles it.  An UNCONVERTED replace peer is under no obligation to
-	 *    settle it on a FINE trie, so remove's acquire can refuse forever: a
-	 *    converted op cannot converge while an unconverted peer parks its
-	 *    chain's holder.  The cost of the gap is paid by the op that converted.
+	 * 3. ☑ and THAT exposed the third: with the hold in place the §4.B guard
+	 *    aborted 100% of commits (49966 of 49974, -DFT_WINNER_DBG attributing
+	 *    every abort to the VALIDATE class).  The guard's expectation is
+	 *    clean-LIVE -- it masks FT_STATE_LOCK out of the value it validates --
+	 *    so it cannot be satisfied on a word the op itself locked.  The guard
+	 *    and the hold cannot coexist on ONE word; the hold subsumes it.
 	 *
-	 * Enable with FT_INV_SAME_KEY_REPLACE=1 to work on it; the COARSE row stays
-	 * in the default set so a regression in the RIG still shows up.
+	 * ⇒ the shape is DELIBERATELY SMALLER than cds_ft_remove's conversion: no
+	 * routing re-validation, because replace has ONE transform in every arm and
+	 * _ft_publish_to_parent records it with expected_old == @old_node, so a
+	 * stale slot ABORTS rather than mis-publishing.  See the {L} block in
+	 * ft-insert.h for the full argument.
+	 *
+	 * The COARSE row below stays the adjudicator: a red there is the RIG, not
+	 * the conversion.
 	 */
-	if (!getenv("FT_INV_SAME_KEY_REPLACE")) {
-		diag("inv_concurrent_same_key_replace_nolist: skipped "
-			"(set FT_INV_SAME_KEY_REPLACE=1; measured LIVELOCK in "
-			"cds_ft_remove -- cds_ft_replace is not fine-locking "
-			"converted, and the converted peer pays for it)");
-		return 0;
-	}
 	return inv_concurrent_same_key_replace_run(false,
 		"inv_concurrent_same_key_replace_nolist");
 }

@@ -4336,6 +4336,31 @@ enum cds_ft_status cds_ft_insert_replace(struct cds_ft *ft,
 	return CDS_FT_STATUS_OK;
 }
 
+/*
+ * cds_ft_replace's SINGLE EXIT for the holder hold {L}.
+ *
+ * The hold is taken ONCE, above the routing derivation, and every one of this
+ * op's exits is past it -- three NOT_FOUNDs from the kind dispatch, an OOM on
+ * the fresh cell, and each arm's MEMORY_ERROR and retriable ABORT.  One missed
+ * release is a word nobody will ever clear, which is the livelock this
+ * conversion exists to remove, wearing the other bit.  So no exit spells the
+ * release itself: they all return through here, and it is idempotent (@*hm is
+ * cleared) so the arm that must release EARLY -- the non-head swap, whose
+ * commit has settled its links before the status plumbing runs -- composes
+ * with it.
+ */
+static inline
+enum cds_ft_status ft_replace_exit(struct cds_ft_metadata **hm,
+		enum cds_ft_status s)
+{
+	if (*hm) {
+		ft_meta_lock_release(*hm);
+		*hm = NULL;
+	}
+	FT_TP(replace_exit, (int) s);
+	return s;
+}
+
 static
 enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 		struct cds_ft_iter *iter,
@@ -4347,6 +4372,8 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 	struct cds_ft_inode_flag *holder_flag;
 	struct cds_ft_inode_flag **pub_slot;
 	struct cds_ft_compressed_node *cn = NULL;
+	struct cds_ft_inode_flag *lock_nf = NULL;	/* the word {L} holds */
+	struct cds_ft_metadata *hm = NULL;		/* the hold, released once */
 	const uint8_t *iter_key;
 	size_t key_len = ft_key_len(ft, ft_iter_resolve_key_len(iter));
 	enum cds_ft_status s;
@@ -4364,14 +4391,12 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 	if (!valid_external_node(old_node) || !valid_external_node(new_node)
 			|| !valid_key_len(ft, key_len)) {
 		s = CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
-		FT_TP(replace_exit, (int) s);
-		return s;
+		return ft_replace_exit(&hm, s);
 	}
 	/* Expect zeroed next and prev pointers on new_node. */
 	if (ft_node_next(new_node) || new_node->prev) {
 		s = CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
-		FT_TP(replace_exit, (int) s);
-		return s;
+		return ft_replace_exit(&hm, s);
 	}
 
 	iter_key = ft_iter_read_key(iter);
@@ -4411,15 +4436,176 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 	if (ft_node_is_removed(old_node)) {
 		/* Already unlinked from the trie. */
 		s = CDS_FT_STATUS_NOT_FOUND;
-		FT_TP(replace_exit, (int) s);
-		return s;
+		return ft_replace_exit(&hm, s);
 	}
 	holder_flag = ft_node_holder(ft, old_node);
 	if (!holder_flag) {
 		/* Never inserted (a freshly-initialized node). */
 		s = CDS_FT_STATUS_NOT_FOUND;
-		FT_TP(replace_exit, (int) s);
-		return s;
+		return ft_replace_exit(&hm, s);
+	}
+
+	/*
+	 * {L} THE LOCALIZED HOLDER LOCK -- TAKEN FIRST, SO THE ROUTING IS
+	 * DERIVED UNDER IT AND NEEDS NO RE-VALIDATION.
+	 *
+	 * This is the fine-locking conversion the header TODO at
+	 * enum cds_ft_writer_strategy owed for cds_ft_replace, and it is
+	 * DELIBERATELY SMALLER THAN cds_ft_remove's.  Remove re-validates its
+	 * ROUTING under the lock (★ RE-VALIDATE THE CALLER'S ROUTING,
+	 * ft-remove.h) because its three arms are three DIFFERENT structural
+	 * transforms -- interior relink / promote / clear-and-nr_child-- -- so a
+	 * decision taken from an unheld read publishes an ILLEGAL SHAPE (a
+	 * one-child internal, a compressed node with a NULL child).  Replace has
+	 * ONE transform in every arm: repoint the single slot that holds
+	 * @old_node.  _ft_publish_to_parent records that edge as a value-CAS with
+	 * expected_old == @old_node, so a stale @pub_slot whose VALUE moved
+	 * simply ABORTS the commit -- the expected-old IS the routing validation,
+	 * and nothing needs re-deriving for it.  No descent, either: neither this
+	 * nor remove's check is a re-validation from the root.
+	 *
+	 * What the value-CAS canNOT catch is a stale slot ADDRESS: a recompaction
+	 * COWs the holder and retires the old copy, whose body STILL CONTAINS
+	 * @old_node -- so the CAS succeeds, into a dead node, and the update is
+	 * lost with no abort anywhere.  That is a TOMBSTONE question, not a
+	 * routing question, and two things answer it:
+	 *
+	 *   - ft_dlm_lock hard-refuses PROXY | TOMBSTONE | LOCK, so the acquire
+	 *     below IS the holder's tombstone validate; and once the word carries
+	 *     this op's LOCK no peer can retire it or edit its body in place.
+	 *   - @old_node's OWN tombstone is re-tested under the lock (the pre-lock
+	 *     test above is only the fast path), because a peer remove can freeze
+	 *     it between that read and this acquire.
+	 *
+	 * AND WHY IT HAD TO BE A HOLD, not the §4.B guard the head arms used to
+	 * carry alone.  MEASURED on inv_concurrent_same_key_replace_nolist (FINE):
+	 * a same-key cds_ft_remove livelocked 50,001 attempts, and every one of
+	 * its ft_dlm_lock refusals was a PROXY on the holder's state word from a
+	 * DIFFERENT descriptor (streak=1, switches == the refusal count) carrying
+	 * an all-MW {0x20 -> 0x20} record -- i.e. ft_flip_txn_guard_parent's
+	 * {live -> live} state guard, parked once per replace commit.  A validator
+	 * that parks the word a locker must find CLEAN starves that locker
+	 * forever, and symmetrically the guard loses to remove's {LOCK|s -> s}, so
+	 * replace livelocked too (op=3, same row).  MW settles the record KIND,
+	 * never the EXCLUSION: the two ops have to queue on ONE primitive, and
+	 * then the op txn's aging and the per-trie FIFO fallback drain it.
+	 *
+	 * Bulk peers need nothing here: G5.25 has a FINE trie RE-TAKE the FT-wide
+	 * lock for the whole window a bulk op is live, so bulk-vs-point is already
+	 * arbitrated (see the enum cds_ft_writer_strategy TODO).
+	 */
+	if (ft->lock_fine) {
+		struct ft_descent hd;
+		struct ft_lock_ctx hctx;
+		struct ft_held_anchor hh;
+		unsigned int hdep = 0;
+		bool have_hd = false, descended = false;
+
+		/*
+		 * The PLAN's only job is to name a word to lock.  Walk prev to
+		 * the chain's trie holder -- the single lockable state word every
+		 * op on this chain serialises on, the same one the duplicate
+		 * append (ft_chain_node's caller) and the interior unchain
+		 * (ft_unchain_node) take.
+		 *
+		 * ☠ A NULL HERE IS A STALE DERIVATION, NOT A NEVER-INSERTED
+		 * NODE -- @old_node's own never-inserted case already returned
+		 * NOT_FOUND above, off its own prev word.  A same-key peer that
+		 * re-heads or retires this chain between that read and this walk
+		 * makes the walk end on a NULL prev; bail retriably, exactly as
+		 * ft_unchain_node does for the same shape (its assert was a wrong
+		 * zero from disjoint-range oracles).
+		 */
+		lock_nf = ft_chain_head_holder(ft, old_node);
+		if (caa_unlikely(!lock_nf)) {
+			FT_DBG_RETRY_SITE();
+			*need_retry = true;
+			s = CDS_FT_STATUS_OK;	/* discarded by the retry loop */
+			return ft_replace_exit(&hm, s);
+		}
+		/*
+		 * ANCHORED LOCK-SETS need a byte-depth, and this path derives its
+		 * holder from a back-pointer.  Descend for it under the same
+		 * opt-in the remove side takes (§5.3): per-node anchors the holder
+		 * on itself and keeps replace handle-derived.
+		 */
+		if (ft->lock_spacing != CDS_FT_LOCK_SPACING_PER_NODE) {
+			const uint8_t *ik = iter_key;
+
+			ft_anchor_descend(ft, &hd, iter_key, key_len, &ik);
+			descended = true;
+			if (hd.nf == lock_nf) {
+				hdep = hd.depth;
+				have_hd = true;
+			} else if (hd.pnf == lock_nf) {
+				hdep = hd.pdepth;
+				have_hd = true;
+			}
+		} else
+			have_hd = true;
+		ft_lock_ctx_init(&hctx, descended ? &hd : NULL, NULL, op);
+		/*
+		 * @hh.shared is DEAD here, not defensive: this context is built
+		 * with a NULL txn and fills in no extra / glue / outer, so its
+		 * held set is EMPTY and the acquire has nothing to dedupe
+		 * against.  Should this path ever gain a registry -- a txn, a
+		 * glue -- the fold below turns into the self-refusal livelock it
+		 * is elsewhere in this file, and @shared must then become the
+		 * "held, owing no release" arm the two dup-chain acquires take.
+		 */
+		if (!have_hd ||
+				ft_acquire_member(ft, &hctx, lock_nf,
+					ft_flag_to_metadata(ft, lock_nf),
+					hdep, &hh) ||
+				hh.shared) {
+			FT_DBG_RETRY_SITE();
+			*need_retry = true;
+			s = CDS_FT_STATUS_OK;	/* discarded by the retry loop */
+			return ft_replace_exit(&hm, s);
+		}
+		hm = hh.lock;
+		FT_DBG_HELD_AT(hm);
+
+		/* @old_node's OWN tombstone, now that a peer cannot set it. */
+		if (caa_unlikely(ft_node_is_removed(old_node))) {
+			s = CDS_FT_STATUS_NOT_FOUND;
+			return ft_replace_exit(&hm, s);
+		}
+		/*
+		 * ★ THE ONE CHECK THE HOLD ITSELF CANNOT MAKE: that the word
+		 * locked is still the word this chain serialises on.  @lock_nf
+		 * came off an unheld prev walk, and a peer that inserts a key
+		 * EXTENDING this chain's key re-homes the head onto a fresh
+		 * junction in one commit, retiring nothing -- so the acquire can
+		 * succeed on a live, untombstoned word that now arbitrates a
+		 * DIFFERENT chain.  Hold the wrong word and the peer holds the
+		 * right one: both publish into one slot, one in the lock-holder's
+		 * plain-store lane and one as an MW value-CAS, and the engine's
+		 * "SW xor MW per slot" rule arbitrates neither -> LOST UPDATE.
+		 * Mirrors ft_unchain_node's ★ RE-DERIVE and the engine's own
+		 * ft_glue_acquire_splice_holders ("re-parented under us: stale
+		 * lock").  One prev hop, not a descent.
+		 */
+		if (caa_unlikely(ft_chain_head_holder(ft, old_node) != lock_nf)) {
+			FT_DBG_RETRY_SITE();
+			*need_retry = true;
+			s = CDS_FT_STATUS_OK;	/* discarded by the retry loop */
+			return ft_replace_exit(&hm, s);
+		}
+		/*
+		 * FROM HERE THE DERIVATION IS A FACT, not a plan: @old_node's
+		 * prev / next and the holder's body are frozen by @hm, so
+		 * re-deriving the holder is the last word on it and everything
+		 * below -- the kind dispatch, @pub_slot's address, @is_head,
+		 * @old_cell -- is computed once, under the lock.
+		 */
+		holder_flag = ft_node_holder(ft, old_node);
+		if (caa_unlikely(!holder_flag)) {
+			FT_DBG_RETRY_SITE();
+			*need_retry = true;
+			s = CDS_FT_STATUS_OK;	/* discarded by the retry loop */
+			return ft_replace_exit(&hm, s);
+		}
 	}
 
 	if (ft_node_external(holder_flag)) {
@@ -4434,8 +4620,7 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 			ft_compressed_node_ptr(holder_flag);
 		if ((struct cds_ft_node *) ft_node_ptr(cn->child) != old_node) {
 			s = CDS_FT_STATUS_NOT_FOUND;
-			FT_TP(replace_exit, (int) s);
-			return s;
+			return ft_replace_exit(&hm, s);
 		}
 		pub_slot = &cn->child;
 	} else if (ft_node_external_nodes(holder_flag) ==
@@ -4452,8 +4637,7 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 		if (!child ||
 		    (struct cds_ft_node *) ft_node_ptr(child) != old_node) {
 			s = CDS_FT_STATUS_NOT_FOUND;
-			FT_TP(replace_exit, (int) s);
-			return s;
+			return ft_replace_exit(&hm, s);
 		}
 	}
 
@@ -4525,8 +4709,7 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 				old_cell->parent);
 			if (!new_cell_flag) {
 				s = CDS_FT_STATUS_MEMORY_ERROR;
-				FT_TP(replace_exit, (int) s);
-				return s;
+				return ft_replace_exit(&hm, s);
 			}
 		}
 		/* @new_node's successor link is build-invisible (it is fresh). */
@@ -4546,126 +4729,49 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 			 * on a txn-alloc OOM nothing is published and @old_node /
 			 * @new_node are intact.
 			 */
-			struct cds_ft_inode_flag *lock_nf;
-			struct cds_ft_metadata *hm = NULL;
-			uintptr_t hsnap = 0;
 			struct ft_flip_txn *txn;
 			enum urcu_txn_status cst;
 
 			/*
-			 * {L}: a duplicate chain is owned by its HEAD-HOLDER's
-			 * node lock -- ft_hlist_replace_prepare states that
-			 * contract and DROPPED its multi-writer arbitration on the
-			 * strength of it, so acquire the holder here exactly as the
-			 * duplicate append does (ft_chain_node's caller) and as the
-			 * interior unchain does (ft_unchain_node).  Released after
-			 * the commit: this txn writes only hlist links, never the
-			 * holder's state word, so a plain clear composes.
+			 * {L}: a duplicate chain is owned by its HEAD-HOLDER's node
+			 * lock -- ft_hlist_replace_prepare states that contract and
+			 * DROPPED its multi-writer arbitration on the strength of it.
+			 * That acquire USED TO LIVE HERE, in this arm alone; it is now
+			 * hoisted above the routing derivation and covers every arm
+			 * (see the {L} block there).  @hm is the hold, or NULL on an
+			 * exclusive trie.  This txn writes only hlist links, never the
+			 * holder's state word, so the plain clear after the commit
+			 * composes.
 			 */
-			/*
-			 * The holder must be DERIVED, not taken from @parent_nf:
-			 * for a NON-head duplicate @parent_nf does not name the
-			 * chain's anchor (it can be an entry with no metadata at
-			 * all, which is a straight SIGSEGV in
-			 * cds_ft_item_to_metadata).  Walk prev to the head's holder
-			 * exactly as the interior unchain does -- ft_unchain_node is
-			 * called with a NULL holder for this same case and derives
-			 * it the same way.  
-			 *
-			 * @old_node is a PUBLISHED chain member here -- the removed
-			 * and never-inserted cases both returned NOT_FOUND above --
-			 * so it HAS a holder: ASSERT it rather than proceeding
-			 * unlocked.  Under sw an unlocked chain replace is a LOST
-			 * UPDATE, not the benign degradation the MW store's
-			 * expected-value CAS made it.  Measured unreachable: 0 NULL
-			 * in 491532 ft_chain_head_holder calls.
-			 */
-			if (ft->lock_fine) {
-				lock_nf = ft_chain_head_holder(ft, old_node);
-				assert(lock_nf);
-				hm = ft_flag_to_metadata(ft, lock_nf);
-				{
-					struct ft_descent hd;
-					struct ft_lock_ctx hctx;
-					struct ft_held_anchor hh;
-					unsigned int hdep = 0;
-					bool have_hd = false, descended = false;
-
-					/*
-					 * ANCHORED LOCK-SETS need a byte-depth,
-					 * and this path derives its holder from a
-					 * back-pointer.  Descend for it under the
-					 * same opt-in the remove side takes
-					 * (§5.3): per-node anchors the holder on
-					 * itself and keeps replace handle-derived.
-					 */
-					if (ft->lock_spacing !=
-							CDS_FT_LOCK_SPACING_PER_NODE) {
-						const uint8_t *ik = iter_key;
-
-						ft_anchor_descend(ft, &hd,
-							iter_key, key_len, &ik);
-						descended = true;
-						if (hd.nf == lock_nf) {
-							hdep = hd.depth;
-							have_hd = true;
-						} else if (hd.pnf == lock_nf) {
-							hdep = hd.pdepth;
-							have_hd = true;
-						}
-					} else
-						have_hd = true;
-					ft_lock_ctx_init(&hctx,
-						descended ? &hd : NULL, NULL, op);
-					/*
-					 * @hh.shared is DEAD here, not defensive:
-					 * this context is built with a NULL txn and
-					 * fills in no extra / glue / outer, so its
-					 * held set is EMPTY and the acquire has
-					 * nothing to dedupe against.  Should this
-					 * path ever gain a registry -- a txn, a
-					 * glue -- the fold below turns into the
-					 * self-refusal livelock it is elsewhere in
-					 * this file, and @shared must then become
-					 * the "held, owing no release" arm the two
-					 * dup-chain acquires above take.
-					 */
-					if (!have_hd ||
-							ft_acquire_member(ft,
-								&hctx, lock_nf,
-								hm, hdep, &hh) ||
-							hh.shared) {
-						new_node->next = NULL;
-						FT_DBG_RETRY_SITE();
-						*need_retry = true;
-						s = CDS_FT_STATUS_OK;	/* discarded by the retry loop */
-						FT_TP(replace_exit, (int) s);
-						return s;
-					}
-					hm = hh.lock;
-					hsnap = hh.lock_snap;
-				}
-			}
 			txn = ft_flip_txn_create_bounded(ft,
 					FT_HLIST_REPLACE_MAX_EDGES);
+			FT_DBG_HELD_AT(hm);
 			if (!txn) {
-				if (hm)
-					ft_meta_lock_release(hm);
 				new_node->next = NULL;
 				s = CDS_FT_STATUS_MEMORY_ERROR;
-				FT_TP(replace_exit, (int) s);
-				return s;
+				return ft_replace_exit(&hm, s);
 			}
 			(void) ft_hlist_replace_prepare(ft_flip_txn_handle(txn),
 				old_node, new_node);
+			FT_DBG_HELD_AT(hm);
 			cst = ft_flip_txn_commit(ft, txn);
-			if (hm)
+			FT_DBG_HELD_AT(hm);
+			/*
+			 * EARLY, and CLEARED: the commit has settled every link
+			 * this arm writes, so the chain is consistent and the
+			 * next chain op may have the word back without waiting
+			 * for the status plumbing below.  ft_replace_exit then
+			 * finds @hm NULL and releases nothing.
+			 */
+			if (hm) {
 				ft_meta_lock_release(hm);
+				hm = NULL;
+			}
+			FT_DBG_HELD_AT(hm);
 			if (cst < 0) {
 				new_node->next = NULL;
 				s = CDS_FT_STATUS_MEMORY_ERROR;
-				FT_TP(replace_exit, (int) s);
-				return s;
+				return ft_replace_exit(&hm, s);
 			}
 			if (cst > 0) {
 				/*
@@ -4690,8 +4796,7 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 				FT_DBG_RETRY_SITE();
 				*need_retry = true;
 				s = CDS_FT_STATUS_OK;	/* discarded by the retry loop */
-				FT_TP(replace_exit, (int) s);
-				return s;
+				return ft_replace_exit(&hm, s);
 			}
 		} else if (old_cell) {
 			/*
@@ -4714,8 +4819,7 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 				new_node->next = NULL;
 				ft_ord_cell_free_unpublished(ft, new_cell);
 				s = CDS_FT_STATUS_MEMORY_ERROR;
-				FT_TP(replace_exit, (int) s);
-				return s;
+				return ft_replace_exit(&hm, s);
 			}
 			if (new_node->next)
 				new_node->next->prev = new_node;
@@ -4723,8 +4827,39 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 				cds_ft_item_to_metadata(old_cell)->incoming_byte;
 			/* Fresh @new_node -> cell: build-invisible. */
 			new_node->prev = new_cell_flag;
-			/* VALIDATE (§4.B): guard the LIVE holder parent_nf. */
-			ft_flip_txn_guard_parent(ft, txn, parent_nf);
+			/*
+			 * VALIDATE (§4.B): guard the LIVE holder parent_nf --
+			 * UNLESS {L} ALREADY HOLDS THAT WORD.
+			 *
+			 * ☠ THE GUARD AND THE HOLD CANNOT COEXIST ON ONE WORD.
+			 * ft_flip_txn_guard_parent's expectation is clean-LIVE:
+			 * it masks FT_STATE_LOCK out of the value it validates,
+			 * so once this op has set that very bit the guard names a
+			 * value the word has not carried since the mark landed
+			 * and the commit aborts UNCONDITIONALLY.  MEASURED, the
+			 * moment {L} was hoisted: 49966 of 49974 aborts on
+			 * inv_concurrent_same_key_replace_nolist attributed to
+			 * the VALIDATE class, 100.0%, and replace livelocked at
+			 * this arm's ABORT exit (-DFT_WINNER_DBG names the losing
+			 * record's class; the retry cap now exit()s so its
+			 * destructor dump survives).
+			 *
+			 * The predicate is the one ft_flip_txn_lock_or_guard_
+			 * parent_at already applies on its @held.shared path,
+			 * spelled against @hm because {L} lives on the acquire
+			 * txn rather than this content txn: the guard is owed
+			 * only where the hold does NOT cover this word.  It
+			 * subsumes the guard where it does -- a retire needs this
+			 * word's lock, and the acquire refused a TOMBSTONE, so
+			 * neither the "retired during the window" nor the
+			 * "already retired" case the guard exists for can arise.
+			 * At a COARSER spacing the hold anchors on an ANCESTOR,
+			 * so @hm names a different word, the guard IS planted,
+			 * and its clean-LIVE expectation is satisfied because
+			 * this op set no LOCK on @parent_nf itself.
+			 */
+			if (!hm || ft_flag_to_metadata(ft, parent_nf) != hm)
+				ft_flip_txn_guard_parent(ft, txn, parent_nf);
 			_ft_publish_to_parent(ft, parent_nf, pub_slot,
 				(struct cds_ft_inode_flag *) new_node,
 				(struct cds_ft_inode_flag *) old_node, &rec, false);
@@ -4770,8 +4905,7 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 				} else {
 					s = CDS_FT_STATUS_MEMORY_ERROR;
 				}
-				FT_TP(replace_exit, (int) s);
-				return s;
+				return ft_replace_exit(&hm, s);
 			}
 			ft_ord_cell_free(ft, old_cell);
 		} else {
@@ -4792,14 +4926,44 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 			if (!txn) {
 				new_node->next = NULL;
 				s = CDS_FT_STATUS_MEMORY_ERROR;
-				FT_TP(replace_exit, (int) s);
-				return s;
+				return ft_replace_exit(&hm, s);
 			}
 			if (new_node->next)
 				new_node->next->prev = new_node;
 			new_node->prev = old_prev;	/* resolved, see @old_prev */
-			/* VALIDATE (§4.B): guard the LIVE holder parent_nf. */
-			ft_flip_txn_guard_parent(ft, txn, parent_nf);
+			/*
+			 * VALIDATE (§4.B): guard the LIVE holder parent_nf --
+			 * UNLESS {L} ALREADY HOLDS THAT WORD.
+			 *
+			 * ☠ THE GUARD AND THE HOLD CANNOT COEXIST ON ONE WORD.
+			 * ft_flip_txn_guard_parent's expectation is clean-LIVE:
+			 * it masks FT_STATE_LOCK out of the value it validates,
+			 * so once this op has set that very bit the guard names a
+			 * value the word has not carried since the mark landed
+			 * and the commit aborts UNCONDITIONALLY.  MEASURED, the
+			 * moment {L} was hoisted: 49966 of 49974 aborts on
+			 * inv_concurrent_same_key_replace_nolist attributed to
+			 * the VALIDATE class, 100.0%, and replace livelocked at
+			 * this arm's ABORT exit (-DFT_WINNER_DBG names the losing
+			 * record's class; the retry cap now exit()s so its
+			 * destructor dump survives).
+			 *
+			 * The predicate is the one ft_flip_txn_lock_or_guard_
+			 * parent_at already applies on its @held.shared path,
+			 * spelled against @hm because {L} lives on the acquire
+			 * txn rather than this content txn: the guard is owed
+			 * only where the hold does NOT cover this word.  It
+			 * subsumes the guard where it does -- a retire needs this
+			 * word's lock, and the acquire refused a TOMBSTONE, so
+			 * neither the "retired during the window" nor the
+			 * "already retired" case the guard exists for can arise.
+			 * At a COARSER spacing the hold anchors on an ANCESTOR,
+			 * so @hm names a different word, the guard IS planted,
+			 * and its clean-LIVE expectation is satisfied because
+			 * this op set no LOCK on @parent_nf itself.
+			 */
+			if (!hm || ft_flag_to_metadata(ft, parent_nf) != hm)
+				ft_flip_txn_guard_parent(ft, txn, parent_nf);
 			_ft_publish_to_parent(ft, parent_nf, pub_slot,
 				(struct cds_ft_inode_flag *) new_node,
 				(struct cds_ft_inode_flag *) old_node, &rec, false);
@@ -4822,8 +4986,7 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 				FT_DBG_RETRY_SITE();
 				*need_retry = true;
 				s = CDS_FT_STATUS_OK;	/* discarded by the retry loop */
-				FT_TP(replace_exit, (int) s);
-				return s;
+				return ft_replace_exit(&hm, s);
 			}
 		}
 	}
@@ -4839,8 +5002,7 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 	 */
 	iter_auto_invalidate_cache(iter);
 	s = CDS_FT_STATUS_OK;
-	FT_TP(replace_exit, (int) s);
-	return s;
+	return ft_replace_exit(&hm, s);
 }
 
 /*
