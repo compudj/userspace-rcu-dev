@@ -23378,10 +23378,25 @@ static int inv_concurrent_same_key_replace_nolist(void)
 	 *    commit aborts; already escalated into the FIFO fallback lane (which
 	 *    the retry loop's own comment names as the reason it "terminates (no
 	 *    livelock)" -- that premise fails here); and the two acquire-refusal
-	 *    counters explain only ~5% of attempts, so the -EAGAIN has a third
-	 *    source.  A converted op cannot converge while an UNCONVERTED peer
-	 *    mutates its chain without holding the holder -- which is the cost of
-	 *    the gap, paid by the op that did convert.
+	 *    counters explain only ~5% of attempts -- which was MY ERROR, not a
+	 *    third source: the TAIL prints at attempt 10,000 and the SITE stamps at
+	 *    50,001, so they are different instants of one call.
+	 *
+	 *    DRILLED DOWN (the stamps chain three levels):
+	 *      FT OP RETRY SITE:    line=7187  <- remove's fused -EAGAIN/-ENOENT exit
+	 *      FT OP ACQUIRE SITE:  line=6471  <- ft_dlm_lock refused, other_line=0
+	 *      FT OP LOCK REFUSE:   lock=609 proxy=3588 tombstone=0
+	 *                           last_state=0x7f2a139ded31
+	 *      FT OP LOCK REFUSE WORD: streak=3588 switches=2
+	 *    So the terminal state is NOT an immortal tombstone (0 of them) and not
+	 *    mostly contention for a lock: it is the holder's state word PARKED with
+	 *    a flip proxy (bit 0 set on a descriptor pointer), on ONE word -- two
+	 *    switches across thousands of refusals.  ft_dlm_lock refuses a parked
+	 *    word outright, and the engine's rule is that only the PARKER's owner
+	 *    ever settles it.  An UNCONVERTED replace peer is under no obligation to
+	 *    settle it on a FINE trie, so remove's acquire can refuse forever: a
+	 *    converted op cannot converge while an unconverted peer parks its
+	 *    chain's holder.  The cost of the gap is paid by the op that converted.
 	 *
 	 * Enable with FT_INV_SAME_KEY_REPLACE=1 to work on it; the COARSE row stays
 	 * in the default set so a regression in the RIG still shows up.

@@ -5510,6 +5510,22 @@ int ft_dlm_lock(struct ft_flip_txn *t, struct cds_ft_metadata *meta,
 #else
 	if (caa_unlikely(s & (FT_STATE_PROXY | FT_STATE_TOMBSTONE |
 			FT_STATE_LOCK))) {
+#ifdef FT_DEBUG_OP_RETRY_CAP
+		ft_dbg_lock_refuse_state = (unsigned long) s;
+		if (meta == ft_dbg_lock_refuse_meta) {
+			ft_dbg_lock_refuse_streak++;
+		} else {
+			ft_dbg_lock_refuse_meta = meta;
+			ft_dbg_lock_refuse_streak = 1;
+			ft_dbg_lock_refuse_switches++;
+		}
+		if (s & FT_STATE_TOMBSTONE)
+			ft_dbg_lock_refuse_tomb++;
+		else if (s & FT_STATE_PROXY)
+			ft_dbg_lock_refuse_proxy++;
+		else
+			ft_dbg_lock_refuse_lock++;
+#endif
 #ifdef FT_DLM_LINGER
 		if (s & FT_STATE_LOCK)
 			ft_linger_word = meta;
@@ -6203,7 +6219,7 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 		 * real acquire.
 		 */
 		if (!ft_dlm_member_linked(ft, node)) {
-			goto eagain;
+			do { FT_DBG_ACQ_SITE(); goto eagain; } while (0);
 		}
 #endif
 		lock = ft_anchor_meta(ft, ft_lock_ctx_descent(ctx), set[i].nf,
@@ -6220,7 +6236,7 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 		if (coarsened) {
 			if (ft_member_node_snap(ctx, node, &node_snap,
 					&node_held))
-				goto eagain;
+				do { FT_DBG_ACQ_SITE(); goto eagain; } while (0);
 			/*
 			 * A word this op already HOLDS needs no such guard: the
 			 * mark is the exclusion the guard approximates, it is
@@ -6388,7 +6404,7 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 					fn, line, lane, depth, towned);
 			}
 #endif
-			goto eagain;
+			do { FT_DBG_ACQ_SITE(); goto eagain; } while (0);
 		}
 		if (deduped) {
 			if (!coarsened) {
@@ -6452,7 +6468,7 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 		}
 		if (ft_dlm_lock(acq, lock, &lock_snap)) {
 			ft_hold_trace_refused(lock, fn, line);
-			goto eagain;
+			do { FT_DBG_ACQ_SITE(); goto eagain; } while (0);
 		}
 		taken_snap[nr_taken] = lock_snap;
 		taken[nr_taken++] = lock;

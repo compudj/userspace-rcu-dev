@@ -215,6 +215,83 @@ void ft_dbg_retry_stamp(unsigned int line)
 }
 # define FT_DBG_RETRY_SITE()	ft_dbg_retry_stamp(__LINE__)
 
+/*
+ * ★ WHICH -EAGAIN.  The retry-exit stamp above names the EXIT; on an op whose
+ * body has forty-odd -EAGAIN producers that is still a whole file.  This stamps
+ * the PRODUCER, as an expression so it is safe in a braceless `if` and in both
+ * `return -EAGAIN;` and `ret = -EAGAIN;` forms.
+ *
+ * NOT applied at rest: wrapping fifty-odd returns costs more readability in a
+ * shipping header than it is worth once the ACQUIRE stamp below exists, and the
+ * two ends of the path usually pin the middle.  Re-apply mechanically when they
+ * do not -- sed 's/return -EAGAIN;/return FT_DBG_EAGAIN(-EAGAIN);/' over the op's
+ * file, plus the same for `<var> = -EAGAIN;` -- which is how ft-remove.h's
+ * line 5622 (the holder acquire) was named.
+ */
+static __thread unsigned int ft_dbg_eagain_line;
+static __thread unsigned long ft_dbg_eagain_line_nr;
+static __thread unsigned int ft_dbg_eagain_line_other;
+
+static inline
+int ft_dbg_eagain_stamp(int v, unsigned int line)
+{
+	if (line == ft_dbg_eagain_line) {
+		ft_dbg_eagain_line_nr++;
+		return v;
+	}
+	if (ft_dbg_eagain_line)
+		ft_dbg_eagain_line_other = ft_dbg_eagain_line;
+	ft_dbg_eagain_line = line;
+	ft_dbg_eagain_line_nr = 1;
+	return v;
+}
+# define FT_DBG_EAGAIN(v)	ft_dbg_eagain_stamp((v), __LINE__)
+
+/*
+ * ★ AND WHICH REFUSAL INSIDE THE ACQUIRE.  One -EAGAIN producer in the caller
+ * can be four in ft_dlm_acquire_set_at, which funnels every refusal through one
+ * `eagain:` label -- so the label erases the reason.  Stamp at the GOTO, in a
+ * do/while so it stays one statement inside a braceless `if`.
+ */
+static __thread unsigned int ft_dbg_acq_line;
+static __thread unsigned long ft_dbg_acq_line_nr;
+static __thread unsigned int ft_dbg_acq_line_other;
+
+static inline
+void ft_dbg_acq_stamp(unsigned int line)
+{
+	if (line == ft_dbg_acq_line) {
+		ft_dbg_acq_line_nr++;
+		return;
+	}
+	if (ft_dbg_acq_line)
+		ft_dbg_acq_line_other = ft_dbg_acq_line;
+	ft_dbg_acq_line = line;
+	ft_dbg_acq_line_nr = 1;
+}
+# define FT_DBG_ACQ_SITE()	ft_dbg_acq_stamp(__LINE__)
+
+/*
+ * ★ AND WHICH BIT.  ft_dlm_lock refuses on PROXY | TOMBSTONE | LOCK as one
+ * test, and the three have different cures: LOCK is contention (it clears when
+ * the holder commits), PROXY is a parked flip that settles, but TOMBSTONE is
+ * PERMANENT -- a retired word whose expected-old can never recur, which is the
+ * immortal-old livelock, not contention.  Counted apart, with the last refused
+ * word kept so the report can name the state.
+ */
+static __thread unsigned long ft_dbg_lock_refuse_lock;
+static __thread unsigned long ft_dbg_lock_refuse_proxy;
+static __thread unsigned long ft_dbg_lock_refuse_tomb;
+static __thread unsigned long ft_dbg_lock_refuse_state;
+/*
+ * ★ LEAKED OR CHURNING.  A LOCK refusal that is always the SAME word is a lock
+ * nobody will release (a peer's bail path lost it); one that moves is ordinary
+ * contention the op is losing.  Same cure-splitting question as the bit above.
+ */
+static __thread const void *ft_dbg_lock_refuse_meta;
+static __thread unsigned long ft_dbg_lock_refuse_streak;
+static __thread unsigned long ft_dbg_lock_refuse_switches;
+
 struct ft_op_retry {
 	unsigned int attempts;
 	unsigned int op;
@@ -272,6 +349,22 @@ void ft_op_retry_tick(const struct cds_ft *ft, struct ft_op_retry *r, int last_r
 		"FT OP RETRY SITE: line=%u consecutive=%lu other_line=%u\n",
 		ft_dbg_retry_line, ft_dbg_retry_line_nr,
 		ft_dbg_retry_line_other);
+	fprintf(stderr,
+		"FT OP EAGAIN SITE: line=%u consecutive=%lu other_line=%u\n",
+		ft_dbg_eagain_line, ft_dbg_eagain_line_nr,
+		ft_dbg_eagain_line_other);
+	fprintf(stderr,
+		"FT OP ACQUIRE SITE: line=%u consecutive=%lu other_line=%u\n",
+		ft_dbg_acq_line, ft_dbg_acq_line_nr, ft_dbg_acq_line_other);
+	fprintf(stderr,
+		"FT OP LOCK REFUSE: lock=%lu proxy=%lu tombstone=%lu "
+		"last_state=0x%lx\n",
+		ft_dbg_lock_refuse_lock, ft_dbg_lock_refuse_proxy,
+		ft_dbg_lock_refuse_tomb, ft_dbg_lock_refuse_state);
+	fprintf(stderr,
+		"FT OP LOCK REFUSE WORD: meta=%p streak=%lu switches=%lu\n",
+		ft_dbg_lock_refuse_meta, ft_dbg_lock_refuse_streak,
+		ft_dbg_lock_refuse_switches);
 	if (system("lttng snapshot record 1>&2") == -1)
 		fprintf(stderr, "FT OP RETRY: snapshot record failed\n");
 	abort();
@@ -281,6 +374,8 @@ struct ft_op_retry { int unused; };
 # define ft_op_retry_init(r, op, key, key_len)	do { (void) (r); } while (0)
 # define ft_op_retry_tick(ft, r, last_ret)	do { (void) (r); } while (0)
 # define FT_DBG_RETRY_SITE()			do { } while (0)
+# define FT_DBG_EAGAIN(v)			(v)
+# define FT_DBG_ACQ_SITE()			do { } while (0)
 #endif	/* FT_DEBUG_OP_RETRY_CAP */
 
 #endif /* _URCU_FT_TRACE_H */
