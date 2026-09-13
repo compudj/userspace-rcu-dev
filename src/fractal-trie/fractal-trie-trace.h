@@ -520,6 +520,19 @@ void ft_op_retry_tick(const struct cds_ft *ft, struct ft_op_retry *r, int last_r
 		ft_dbg_proxy_switches, ft_dbg_proxy_nr, ft_dbg_proxy_nr_mw,
 		ft_dbg_proxy_poisoned, ft_dbg_proxy_retry,
 		ft_dbg_proxy_rec_old, ft_dbg_proxy_rec_new);
+#ifdef FT_DEBUG_RETRY_CAP_SHOW
+	/*
+	 * ★ THE SHAPE, not just the word.  A cap says an op cannot converge and
+	 * the refusal stamps say WHICH word it keeps losing; neither says what
+	 * the trie LOOKS LIKE, and that is what a single-threaded replay needs.
+	 * Under COARSE this dump is safe by construction -- the spinning writer
+	 * HOLDS the FT-wide mutex, so every peer is parked in
+	 * cds_fair_mutex_park and the structure cannot move under the walk --
+	 * which is exactly the arm a self-refusal lives on.
+	 */
+	fprintf(stderr, "FT OP RETRY SHAPE:\n");
+	cds_ft_show(ft, stderr, CDS_FT_SHOW_PRETTY);
+#endif
 	if (system("lttng snapshot record 1>&2") == -1)
 		fprintf(stderr, "FT OP RETRY: snapshot record failed\n");
 	/*
