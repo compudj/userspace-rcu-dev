@@ -784,18 +784,19 @@ unsigned int ft_walk_extend(struct ft_descent *d, bool valid,
  *
  * The walk moves BELOW the descent's cursor, so @depth comes from the walk
  * itself -- ft_walk_extend has entered every node above this one, so the anchor
- * table covers it.  Refusing here instead would be costly rather than merely
- * slow: remove_all has NO retry loop (cds_ft_remove_all calls
- * _cds_ft_remove_all_locked exactly once), so an -EAGAIN from here is the whole
- * CALL failing and the caller's to retry.
+ * table covers it.
  *
- * ☞ IT IS NO LONGER A MEMORY_ERROR, and this comment used to say it was.  The
- * tail now maps the two apart -- `-EAGAIN` to BUSY_ERROR, `-ENOMEM` to
- * MEMORY_ERROR -- which only became trustworthy once @acquire_enomem gave an
- * allocation failure inside the acquire its own channel, instead of arriving as
- * an -EAGAIN no peer produced.  Corrected because the stale sentence reads as an
- * open bug ("remove_all misreports contention as OOM") and sends the next reader
- * after something already fixed.
+ * ☞ AN -EAGAIN FROM HERE IS NO LONGER THE WHOLE CALL FAILING, and this comment
+ * used to say it was ("remove_all has NO retry loop ... so an -EAGAIN from here
+ * is the whole CALL failing and the caller's to retry").  cds_ft_remove_all now
+ * loops: the refusal ages a conflict on the op's persistent txn and the attempt
+ * is re-derived, so refusing here costs an ATTEMPT rather than the CALL.  It is
+ * not a MEMORY_ERROR either -- the tail maps `-EAGAIN` to that retry and
+ * `-ENOMEM` to MEMORY_ERROR -- which only became trustworthy once
+ * @acquire_enomem gave an allocation failure inside the acquire its own channel,
+ * instead of arriving as an -EAGAIN no peer produced.  Both sentences are
+ * corrected rather than deleted: each read as an open bug, and sends the next
+ * reader after something already fixed.
  */
 static inline
 int ft_detach_orphan_acquire_at(const char *fn, int line,
@@ -841,6 +842,43 @@ int ft_detach_orphan_planlock(const struct cds_ft *ft,
  * and that struct exists in every build.  A build with skip-compression off has
  * no collapse to run, but it still needs the type to be complete.
  */
+#ifdef FT_DBG_RA_UNSPLICE
+/*
+ * ARM and YIELD for cds_ft_remove_all's TWO-COMMIT ordered-list tail, and it
+ * was built because a RED CONTROL LIED.  Restoring the discarded-status form of
+ * that unsplice left inv_concurrent_remove_all_list GREEN, which reads as "the
+ * drive-forward buys nothing" -- and is instead "the branch never ran": every
+ * removal in that row's LEAF shapes fuses the unsplice into its structural
+ * flip, so @pub is always armed and the two-commit tail is dead code there.
+ * Measured with this counter: two_commit_arm=0 over 150 rounds x 64 keys x 3
+ * lanes.  Arm presence and arm YIELD are different facts, and only the counter
+ * tells a green control apart from an unexecuted one.
+ */
+unsigned long ft_dbg_ra_unsplice_arm, ft_dbg_ra_unsplice_abort;
+unsigned long ft_dbg_ra_unsplice_fused;
+/* ...and the back-pointer/descent disagreement the exponential bail refuses. */
+unsigned long ft_dbg_ra_stale_descent;
+
+__attribute__((destructor))
+static void ft_dbg_ra_unsplice_report(void)
+{
+	fprintf(stderr, "FT RA UNSPLICE: two_commit_arm=%lu abort=%lu fused=%lu\n",
+		ft_dbg_ra_unsplice_arm, ft_dbg_ra_unsplice_abort,
+		ft_dbg_ra_unsplice_fused);
+	fprintf(stderr, "FT RA STALE DESCENT: exponential_bail=%lu\n",
+		ft_dbg_ra_stale_descent);
+}
+# define FT_DBG_RA_UNSPLICE_ARM()	uatomic_inc(&ft_dbg_ra_unsplice_arm)
+# define FT_DBG_RA_UNSPLICE_ABORT()	uatomic_inc(&ft_dbg_ra_unsplice_abort)
+# define FT_DBG_RA_UNSPLICE_FUSED()	uatomic_inc(&ft_dbg_ra_unsplice_fused)
+# define FT_DBG_RA_STALE_DESCENT()	uatomic_inc(&ft_dbg_ra_stale_descent)
+#else
+# define FT_DBG_RA_UNSPLICE_ARM()	do { } while (0)
+# define FT_DBG_RA_UNSPLICE_ABORT()	do { } while (0)
+# define FT_DBG_RA_UNSPLICE_FUSED()	do { } while (0)
+# define FT_DBG_RA_STALE_DESCENT()	do { } while (0)
+#endif
+
 #ifdef FT_ENABLE_TRACING
 /*
  * ARM YIELD, not arm presence.  "The check compiled in" and "the check ever
@@ -2382,8 +2420,9 @@ int ft_detach_node(struct cds_ft *ft,
 	 * Sized for the chain PLUS the trailing skip-target, which is one more
 	 * orphan and belongs in the same array: a mark kept in a variable of its
 	 * own is a mark no later acquire can see, and a coarse spacing then lands
-	 * the next member's anchor on it (the op waits on itself; remove_all has
-	 * no retry loop, so that surfaces as MEMORY_ERROR).
+	 * the next member's anchor on it (the op waits on itself, and a self-refusal
+	 * is the one -EAGAIN no peer will ever clear -- so under remove_all's retry
+	 * loop it does not surface as an error at all, it SPINS).
 	 */
 	struct ft_held_anchor orphan_held[FT_MAX_DEPTH + 1];
 	int nr_orphan_locked = 0;
@@ -7541,6 +7580,7 @@ static
 enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 		struct cds_ft_iter *iter,
 		struct cds_ft_node **result_node,
+		bool *need_retry,
 		struct urcu_txn *op)
 {
 	struct cds_ft_node *chain_head;
@@ -7626,13 +7666,25 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 			 * may reclaim while the root still points at it -- and
 			 * frees @dead while it is still spliced into the list.
 			 */
+			/*
+			 * PRE-RESERVED => the commit cannot fail to allocate,
+			 * so its only non-zero is -EAGAIN: a peer won this
+			 * flip and NOTHING was installed (the fused cell and
+			 * count edges were discarded with it).  Reporting that
+			 * as MEMORY_ERROR sent the caller freeing memory over a
+			 * lock it merely lost; it is the NIL key's copy of the
+			 * mislabel the tail below fixed for every other shape.
+			 * Retriable: re-read external_nodes and re-attempt.
+			 */
 			if (ft_remove_one_commit(ft,
 					(struct cds_ft_inode_flag **) &metadata->external_nodes,
 					metadata,
 					(struct cds_ft_inode_flag *) external_nodes, NULL,
 					NULL, dead, NULL, txn, NULL, false)) {
 				*result_node = NULL;
-				return CDS_FT_STATUS_MEMORY_ERROR;
+				FT_DBG_RETRY_SITE();
+				*need_retry = true;
+				return CDS_FT_STATUS_OK;	/* discarded by the retry loop */
 			}
 			if (dead)
 				ft_ord_cell_free(ft, dead);
@@ -7722,6 +7774,39 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 	if (!have_descent && ft_bulk_active(ft))
 		uatomic_inc(&ft_wo_nod_chain_head);
 #endif
+	/*
+	 * ☠ THE TWO DERIVATIONS DISAGREED, and under EXPONENTIAL spacing that is
+	 * not survivable.  @holder_flag comes from the chain head's BACK POINTER
+	 * (ft_locate_chain_head); the descent just above re-derives the same
+	 * position TOP-DOWN by @iter_key.  @have_descent false means the walk by
+	 * the key did not arrive at the holder the back pointer named -- i.e. the
+	 * position moved between the two reads, so the plan is STALE.
+	 *
+	 * Under exclusion the two could not disagree and this was simply never
+	 * false; converting the op makes it reachable, and what it reached was an
+	 * ABORT: an exponential lock-set needs a byte-depth per member, and a
+	 * member whose depth is not itself a lock level has no anchor without the
+	 * descent table -- ft_anchor_meta asserts `d` for exactly that case.
+	 * (Measured: ft_inv is 148/148 at per-node and root-only, and aborts here
+	 * at exponential.  Neither of those two needs the table -- per-node takes
+	 * no descent at all, and root-only names the trie root directly -- which
+	 * is why the gate is on the one spacing that does.)
+	 *
+	 * Bail RETRIABLY: nothing is reserved yet and nothing is published, and
+	 * the cache is dropped so the next attempt re-seeds through a fresh
+	 * lookup rather than re-deriving from the same stale @iter->node.
+	 */
+	if (!have_descent &&
+	    ft->lock_spacing == CDS_FT_LOCK_SPACING_EXPONENTIAL) {
+		iter->cache_valid = false;
+		iter_debug_path_clear(iter);
+		iter->path_len = 0;
+		*result_node = NULL;
+		FT_DBG_RA_STALE_DESCENT();
+		FT_DBG_RETRY_SITE();
+		*need_retry = true;
+		return CDS_FT_STATUS_OK;	/* discarded by the retry loop */
+	}
 	ft_lock_ctx_init(&lctx, have_descent ? &d : NULL, NULL, op);
 
 	/*
@@ -7941,10 +8026,17 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 	}
 
 	/*
-	 * detach should not replace a NULL pointer because it has been
-	 * found by a mutex-protected traversal within this function.
+	 * -ENOENT (detach's replace reached an emptied FT_NULL slot) is a PEER,
+	 * not a bug, and this used to assert it away on the premise that the
+	 * position "has been found by a mutex-protected traversal within this
+	 * function".  No mutex exists here under LOCK_FINE: @head_slot is
+	 * derived by ft_locate_chain_head with NOTHING HELD, so a peer's
+	 * recompaction can retype or empty that slot between the derivation and
+	 * the replace -- exactly the window cds_ft_remove documents at its own
+	 * tail.  The path publishes nothing, so it joins -EAGAIN in the retry
+	 * below instead of aborting a debug build (and, under NDEBUG, falling
+	 * through to a MEMORY_ERROR no allocation produced).
 	 */
-	assert(ret != -ENOENT);
 
 	/* Ordered list on: the whole key left the trie: its head's cell is
 	 * unspliced and freed (deferred).  chain_head->prev still carries the cell
@@ -7957,14 +8049,38 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 			/* An in-place / fused structural commit already carried the
 			 * unsplice (pub.armed); otherwise commit it now through the
 			 * txn pre-reserved before the structural change. */
-			if (!pub.armed)
-				/* remove_all: not yet retry-enabled (whole-chain
-				 * standalone marks block it); ABORT unreachable
-				 * under its current exclusion. */
-				(void) ft_ord_cell_unsplice(ft, unsplice_txn,
-					dead_cell);
-			else
+			if (!pub.armed) {
+				/*
+				 * ☠ THIS DISCARDED THE STATUS on the premise
+				 * that an "ABORT [is] unreachable under its
+				 * current exclusion" -- a premise the fine
+				 * locking conversion DELETES.  The op's whole-
+				 * chain standalone marks are already public here,
+				 * so the removal cannot be retried and the
+				 * unsplice MUST complete: an aborted one left the
+				 * key gone from the structural index but present
+				 * in the ordered list, and then freed @dead_cell
+				 * while it was still spliced into that list.
+				 * DRIVE IT FORWARD instead -- each ABORT means a
+				 * peer committed (obstruction-free), and the
+				 * aborted commit consumed the txn, so the small
+				 * bounded reservation is retried too.  Byte-for-
+				 * byte the tail cds_ft_remove already runs.
+				 */
+				FT_DBG_RA_UNSPLICE_ARM();
+				while (ft_ord_cell_unsplice(ft, unsplice_txn,
+						dead_cell) > 0) {
+					FT_DBG_RA_UNSPLICE_ABORT();
+					do {
+						unsplice_txn =
+							ft_flip_txn_create_bounded(ft,
+							FT_ORD_CELL_UNSPLICE_MAX_EDGES);
+					} while (caa_unlikely(!unsplice_txn));
+				}
+			} else {
+				FT_DBG_RA_UNSPLICE_FUSED();
 				ft_flip_txn_destroy(unsplice_txn);
+			}
 			ft_ord_cell_free(ft, dead_cell);
 		} else {
 			/* Removal aborted: the cell stays in the list -- release the
@@ -7989,41 +8105,88 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 		 * still-reachable chain.
 		 *
 		 * -EAGAIN is a peer, -ENOMEM is memory, and the two report
-		 * differently: BUSY_ERROR sends the caller back to retry,
-		 * MEMORY_ERROR tells it to free something first.  The
-		 * distinction is only as good as the sources, which is what
-		 * blocked this mapping before -- an acquire that could not
-		 * allocate its own lock txn used to reach the commit as
-		 * @acquire_miss and abort, arriving here as -EAGAIN with no
+		 * differently.  The distinction is only as good as the sources,
+		 * which is what blocked this mapping before -- an acquire that
+		 * could not allocate its own lock txn used to reach the commit
+		 * as @acquire_miss and abort, arriving here as -EAGAIN with no
 		 * allocation failure anywhere in the errno.  That path now
 		 * carries @acquire_enomem and commits MEMORY_ERROR instead, so
 		 * every -EAGAIN landing here is a peer.
+		 *
+		 * ⇒ A PEER IS NOW THIS OP'S OWN PROBLEM, not the caller's.  It
+		 * used to be reported as BUSY_ERROR and handed back, which is
+		 * why 91% of remove_all calls FAILED under a same-key peer
+		 * (measured: BUSY 25634 vs OK 2473 over 150 rounds) -- the
+		 * caller's own retry cannot fix that, because a fresh urcu_txn
+		 * per attempt ages NO conflict and so never escalates into the
+		 * FIFO lane that drains the contention.  Signal the wrapper's
+		 * retry loop instead: it re-derives the chain head against the
+		 * current tree on the PERSISTENT @optxn.  Nothing was published
+		 * on either errno, so re-attempting is sound (@iter's cache is
+		 * invalidated just above, so the next attempt re-seeds through
+		 * a fresh lookup).
 		 */
 		*result_node = NULL;
-		return ret == -EAGAIN ? CDS_FT_STATUS_BUSY_ERROR :
-			CDS_FT_STATUS_MEMORY_ERROR;
+		if (ret == -EAGAIN || ret == -ENOENT) {
+			FT_DBG_RETRY_SITE();
+			*need_retry = true;
+			return CDS_FT_STATUS_OK;	/* discarded by the retry loop */
+		}
+		return CDS_FT_STATUS_MEMORY_ERROR;
 	}
 
 	return CDS_FT_STATUS_OK;
 }
 
+/*
+ * Public entry: FT-owned per-op read-side bracket + retry identity, mirroring
+ * cds_ft_remove and cds_ft_replace.
+ *
+ * WHAT THIS OP WAS MISSING, and it is not what the other three were.  remove_all
+ * already ACQUIRES and RE-VALIDATES everything it derives: the leaf arm goes
+ * through ft_detach_node (the same primitive the converted point remove uses),
+ * and the prefix arm through ft_flip_txn_lock_or_guard_parent plus a commit
+ * whose expected-old IS the re-validation.  Measured against a same-key peer,
+ * the structure was never corrupted -- 150 rounds x 64 keys x 3 duplicates lost
+ * no node, double-owned no node and verified green every round.  What it lacked
+ * was PROGRESS: the body ran EXACTLY ONCE, so every one of those correct,
+ * published-nothing aborts was handed to the caller as BUSY_ERROR.  91% of the
+ * calls failed that way.
+ *
+ * ⇒ the conversion is the LOOP, not new exclusion.  Aging is carried on the
+ * PERSISTENT @optxn via urcu_txn_conflict (ft_txn_attempt_bail): after
+ * URCU_TXN_FALLBACK conflicts the domain escalates this writer into the per-trie
+ * FIFO fair-mutex lane, which drains the contention so the retry TERMINATES.
+ * That is also why a caller looping on BUSY_ERROR was never an adequate
+ * substitute -- a fresh txn per attempt ages nothing and can starve.  An
+ * exclusive trie opens nothing and never conflicts.
+ *
+ * @iter is re-seeded by the body itself: every retriable exit runs after the
+ * cache invalidation, so the next attempt re-descends through a fresh lookup.
+ */
 enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
 		struct cds_ft_iter *iter,
 		struct cds_ft_node **result_node)
 {
 	struct urcu_txn optxn;
+	struct ft_op_retry op_retry;
 	enum cds_ft_status s;
+	bool need_retry;
 
 	CDS_FT_SCOPED_WRITER(ft);
-	/*
-	 * FT-owned per-op read-side bracket (doc §11 Phase A) -- see
-	 * cds_ft_remove.  Internal txns are still standalone (no retry loop
-	 * to carry aging across yet); exclusive trie: the bracket opens
-	 * nothing.
-	 */
+	ft_op_retry_init(&op_retry, FT_OP_REMOVE_ALL, NULL, 0);
 	ft_txn_op_init(ft, &optxn);
-	urcu_txn_begin(&optxn);
-	s = _cds_ft_remove_all_locked(ft, iter, result_node, &optxn);
+	for (;;) {
+		need_retry = false;
+		ft_op_retry_tick(ft, &op_retry, 0);
+		urcu_txn_begin(&optxn);
+		s = _cds_ft_remove_all_locked(ft, iter, result_node,
+				&need_retry, &optxn);
+		if (!need_retry)
+			break;
+		/* Age the conflict, keep the FIFO turn, close the attempt. */
+		ft_txn_attempt_bail(&optxn, true);
+	}
 	urcu_txn_end(&optxn);
 	return s;
 }

@@ -82,7 +82,7 @@
  */
 /* +4 inv_prefix_head_*_key_identity; +2 inv_split_point_lookup_identity*;
  * +2 inv_absent_key_never_found* */
-#define NR_TESTS	(122 + NR_TESTS_REKEY_DLM)
+#define NR_TESTS	(127 + NR_TESTS_REKEY_DLM)
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -23865,6 +23865,555 @@ static int inv_concurrent_same_key_append_coarse(void)
 		"inv_concurrent_same_key_append_coarse");
 }
 
+/*
+ * cds_ft_remove_all vs a same-key peer, under CDS_FT_WRITER_LOCK_FINE.
+ *
+ * WHY THIS ROW EXISTS.  remove_all is the fourth point op of the fine-locking
+ * transition (see "THE FINE-LOCKING TRANSITION IS INCOMPLETE" at enum
+ * cds_ft_writer_strategy) and the one whose gap is PROGRESS rather than
+ * derivation: cds_ft_remove_all called _cds_ft_remove_all_locked exactly ONCE,
+ * so every contention event surfaced to the caller as CDS_FT_STATUS_BUSY_ERROR
+ * with no aging and no escalation into the per-trie FIFO lane.  Its failure tail
+ * had never run: measured over both suites, ZERO times in 4,807,509 calls,
+ * because the op required caller writer-exclusion and no peer could refuse it a
+ * lock-set.  Nothing in the tree drove it against a peer.
+ *
+ * ★ THE PRIMARY READING IS THE BUSY_ERROR COUNT, AND IT IS MONOTONE.  The call
+ * either reported failure to its caller or it did not, so this row needs no
+ * control arm to interpret: @busy > 0 IS the defect, at any magnitude, and
+ * @busy == 0 is the claim the conversion makes.  (A coarse arm would not be a
+ * control here -- it serialises the writers, so the contended path never runs
+ * at all, and its green says nothing about the fine one.)
+ *
+ * THE STRUCTURAL ORACLE, layered on top, is an exact accounting rather than a
+ * spot check.  Each round pre-seeds D duplicates on each of K keys, T lanes
+ * then race to remove_all every key while an inserter APPENDS one fresh node
+ * per key -- so a removal that derived a chain meets an append between its
+ * derivation and its commit.  At the join every ORIGINAL node must be in
+ * exactly one of two places:
+ *
+ *   returned exactly once  ..  the chain that removed it handed it back, and
+ *                              the caller may reclaim it;
+ *   still in the trie      ..  no remove_all claimed it.
+ *
+ * Both at once is a chain handed to a caller while the trie still points at it
+ * (a double-reclaim); NEITHER is a LOST NODE.  Returned TWICE is two callers
+ * each told they own the same node -- the double-free the whole-chain hand-back
+ * makes possible and that a per-node remove cannot produce.  The fresh node is
+ * the only survivor a key may legally hold, and only one of it.
+ */
+#define SKRA_T		3	/* remove_all lanes racing on every key */
+#define SKRA_D		3	/* duplicates pre-seeded per key */
+#define SKRA_K		64
+#define SKRA_R		150
+
+struct skra_node {
+	struct cds_ft_node node;
+	unsigned int k, d;
+	unsigned int returned;	/* times a remove_all handed this node back */
+};
+
+struct skra_ctx {
+	struct cds_ft *ft;
+	bool prefix_shape;		/* guard+target keys: reaches the two-commit tail */
+	unsigned int round;		/* the key generation both peers must agree on */
+	struct skra_node *nodes;	/* [SKRA_K][SKRA_D]: the pre-seeded chain */
+	struct skra_node *fresh;	/* [SKRA_K]: the appender's node per key */
+	struct cds_ft_node **ret;	/* [SKRA_T][SKRA_K]: heads handed back */
+	pthread_barrier_t bar;
+	unsigned long busy;		/* ★ BUSY_ERROR: the progress oracle */
+	unsigned long other;		/* any other non-OK, non-NOT_FOUND status */
+	unsigned long ok;
+	unsigned long notfound;
+	unsigned long ins_fail;
+};
+
+struct skra_arg {
+	struct skra_ctx *c;
+	unsigned int t;
+};
+
+/*
+ * Two holder shapes, alternating by round, exactly as the same-key remove row:
+ * an even round's keys differ in their last byte (each chain heads a body slot
+ * of an internal holder), an odd round's share a trailing byte (each hangs
+ * under a one-byte compressed holder, cn->child) -- the shape whose emptied
+ * chain is a detach rather than a slot clear.
+ */
+static uint64_t skra_u64(unsigned int r, unsigned int k)
+{
+	return (r & 1) ? (((uint64_t) k << 8) | 0x3f) : (uint64_t) k;
+}
+
+/*
+ * THE PREFIX SHAPE, and why the row needs a second one.  In the leaf shape
+ * above every key is a full fixed-width key, so a removal that empties its slot
+ * is an IN-PLACE leaf detach and fuses the dead cell's unsplice into its own
+ * structural flip.  remove_all's TWO-COMMIT tail -- publish the removal first,
+ * unsplice second -- is then dead code: measured with the FT_DBG_RA_UNSPLICE
+ * arm counter, two_commit_arm == 0 over 150 rounds x 64 keys x 3 lanes, which
+ * is why restoring the tail's discarded-status form left the row GREEN.
+ *
+ * @guard "Bk" is a strict PREFIX of the target "Bkd", so the node at "Bk" is an
+ * internal holder carrying external_nodes (the guard's own chain) with exactly
+ * ONE body child (the target's chain).  Emptying that child leaves the holder
+ * childless-with-externals, so the detach PROMOTES the guard's chain to the
+ * parent -- @topmost_external_nodes, the non-fused publish, @pub unarmed, and
+ * the two-commit tail runs.
+ */
+static size_t skra_key(struct cds_ft *ft, unsigned int r, unsigned int k,
+		bool prefix_shape, bool guard, uint8_t *buf)
+{
+	if (!prefix_shape) {
+		cds_ft_u64_to_key(ft, skra_u64(r, k), buf,
+			CDS_FT_LEN_DEFAULT);
+		return CDS_FT_LEN_DEFAULT;
+	}
+	buf[0] = 0x42;				/* 'B' */
+	buf[1] = (uint8_t) k;
+	buf[2] = (uint8_t) (0x64 + (r & 1));	/* 'd' / 'e', by round */
+	return guard ? 2 : 3;
+}
+
+/*
+ * A remove_all lane: race every key, and KEEP what the call handed back.  The
+ * returned head is not walked here -- the chain is the caller's only after a
+ * grace period, and walking it under the peers would be reading nodes another
+ * lane may still be unlinking.  The accounting runs at the join.
+ */
+static void *skra_lane(void *arg)
+{
+	struct skra_arg *a = (struct skra_arg *) arg;
+	struct skra_ctx *c = a->c;
+	struct cds_ft_iter *iter;
+	unsigned int r, i;
+
+	rcu_register_thread();
+	rcu_thread_online();
+	if (cds_ft_iter_create(c->ft, &iter) != CDS_FT_STATUS_OK)
+		abort();
+	for (r = 0; r < SKRA_R; r++) {
+		skr_bwait(&c->bar);		/* seeded */
+		for (i = 0; i < SKRA_K; i++) {
+			/* Walk the keys in a lane-specific order so the lanes
+			 * collide on different keys at different instants. */
+			unsigned int k = (i + a->t * (SKRA_K / SKRA_T)) % SKRA_K;
+			struct cds_ft_node *res = NULL;
+			uint8_t key[8];
+			size_t klen;
+			enum cds_ft_status s;
+
+			klen = skra_key(c->ft, r, k, c->prefix_shape, false,
+				key);
+			rcu_read_lock();
+			cds_ft_iter_set_key(iter, key, klen);
+			if (cds_ft_lookup(c->ft, iter) != CDS_FT_STATUS_OK) {
+				rcu_read_unlock();
+				rcu_quiescent_state();
+				continue;
+			}
+			s = cds_ft_remove_all(c->ft, iter, &res);
+			rcu_read_unlock();
+			switch (s) {
+			case CDS_FT_STATUS_OK:
+				uatomic_inc(&c->ok);
+				c->ret[a->t * SKRA_K + k] = res;
+				break;
+			case CDS_FT_STATUS_NOT_FOUND:
+				uatomic_inc(&c->notfound);
+				break;
+			case CDS_FT_STATUS_BUSY_ERROR:
+				/* ★ THE ORACLE.  A peer took a lock this op
+				 * wanted and the op gave up instead of aging
+				 * the conflict and re-attempting. */
+				uatomic_inc(&c->busy);
+				break;
+			default:
+				uatomic_inc(&c->other);
+				break;
+			}
+			rcu_quiescent_state();
+		}
+		skr_bwait(&c->bar);		/* removed */
+		skr_bwait(&c->bar);		/* verified */
+	}
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+/*
+ * The APPENDER: one fresh node per key while the lanes empty the chains, so a
+ * remove_all that derived its chain head meets an append before it commits.
+ */
+static void *skra_appender(void *arg)
+{
+	struct skra_ctx *c = ((struct skra_arg *) arg)->c;
+	unsigned int r, k;
+
+	rcu_register_thread();
+	rcu_thread_online();
+	for (r = 0; r < SKRA_R; r++) {
+		skr_bwait(&c->bar);		/* seeded */
+		for (k = 0; k < SKRA_K; k++) {
+			struct skra_node *n = &c->fresh[k];
+			uint8_t key[8];
+			size_t klen;
+
+			cds_ft_node_init(&n->node);
+			n->k = k;
+			n->d = SKRA_D;
+			klen = skra_key(c->ft, r, k, c->prefix_shape, false,
+				key);
+			rcu_read_lock();
+			if (cds_ft_insert(c->ft, key, klen,
+					&n->node) != CDS_FT_STATUS_OK)
+				uatomic_inc(&c->ins_fail);
+			rcu_read_unlock();
+			rcu_quiescent_state();
+		}
+		skr_bwait(&c->bar);		/* removed */
+		skr_bwait(&c->bar);		/* verified */
+	}
+	rcu_unregister_thread();
+	return NULL;
+}
+
+static int inv_concurrent_remove_all_run(bool ordered_list, bool coarse,
+		bool prefix_shape, const char *name)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct skra_ctx c;
+	struct skra_arg args[SKRA_T + 1];
+	pthread_t th[SKRA_T + 1];
+	struct cds_ft_iter *iter;
+	struct skra_node *guard = NULL;
+	unsigned int r, k, d, t;
+	int ret = 0;
+
+	memset(&c, 0, sizeof(c));
+	c.prefix_shape = prefix_shape;
+	if (prefix_shape) {
+		/*
+		 * Variable-length keys, ordered list ON: both are required.  A
+		 * strict prefix needs per-call key lengths, and the two-commit
+		 * tail this shape exists to reach only exists with the list on.
+		 */
+		enum cds_ft_writer_strategy ws = coarse ?
+			CDS_FT_WRITER_LOCK_COARSE : CDS_FT_WRITER_LOCK_FINE;
+
+		c.ft = create_varlen_ord_ft_ws(&group, &ws);
+		guard = (struct skra_node *) calloc(SKRA_K, sizeof(*guard));
+		if (!guard)
+			abort();
+	} else {
+		if (cds_ft_group_attr_create(&attr) < 0)
+			abort();
+		if (cds_ft_group_attr_set_key_len(attr, 8) < 0)
+			abort();
+		if (cds_ft_group_attr_set_ordered_list(attr, ordered_list) < 0)
+			abort();
+		if (coarse && cds_ft_group_attr_set_writer_strategy(attr,
+				CDS_FT_WRITER_LOCK_COARSE) < 0)
+			abort();
+		inv_maybe_set_rank_stats(attr);
+		if (cds_ft_group_create(attr, &group) < 0)
+			abort();
+		cds_ft_group_attr_destroy(attr);
+		if (cds_ft_create(group, NULL, &c.ft) < 0)
+			abort();
+	}
+	cds_ft_make_concurrent(c.ft);
+	c.nodes = (struct skra_node *) calloc((size_t) SKRA_K * SKRA_D,
+			sizeof(*c.nodes));
+	c.fresh = (struct skra_node *) calloc(SKRA_K, sizeof(*c.fresh));
+	c.ret = (struct cds_ft_node **) calloc((size_t) SKRA_T * SKRA_K,
+			sizeof(*c.ret));
+	if (!c.nodes || !c.fresh || !c.ret)
+		abort();
+	if (cds_ft_iter_create(c.ft, &iter) != CDS_FT_STATUS_OK)
+		abort();
+	pthread_barrier_init(&c.bar, NULL, SKRA_T + 2);
+	for (t = 0; t < SKRA_T; t++) {
+		args[t].c = &c;
+		args[t].t = t;
+		pthread_create(&th[t], NULL, skra_lane, &args[t]);
+	}
+	args[SKRA_T].c = &c;
+	args[SKRA_T].t = SKRA_T;
+	pthread_create(&th[SKRA_T], NULL, skra_appender, &args[SKRA_T]);
+	for (r = 0; r < SKRA_R; r++) {
+		unsigned long busy_before = uatomic_read(&c.busy);
+
+		memset(c.ret, 0, (size_t) SKRA_T * SKRA_K * sizeof(*c.ret));
+		rcu_read_lock();
+		for (k = 0; k < SKRA_K; k++) {
+			uint8_t key[8];
+			size_t klen;
+
+			/*
+			 * The guard key goes in FIRST: it is what makes the
+			 * target's holder carry external_nodes, so a removal
+			 * that empties the target slot has a chain to PROMOTE.
+			 * Seeded fresh each round because the round's drain
+			 * takes it out again.
+			 */
+			if (prefix_shape) {
+				cds_ft_node_init(&guard[k].node);
+				guard[k].k = k;
+				guard[k].d = 0xff;
+				klen = skra_key(c.ft, r, k, true, true, key);
+				if (cds_ft_insert(c.ft, key, klen,
+						&guard[k].node) !=
+						CDS_FT_STATUS_OK) {
+					fprintf(stderr, "%s: seed guard key %u failed\n",
+						name, k);
+					abort();
+				}
+			}
+			for (d = 0; d < SKRA_D; d++) {
+				struct skra_node *n = &c.nodes[k * SKRA_D + d];
+
+				cds_ft_node_init(&n->node);
+				n->k = k;
+				n->d = d;
+				n->returned = 0;
+				klen = skra_key(c.ft, r, k, prefix_shape,
+					false, key);
+				if (cds_ft_insert(c.ft, key, klen,
+						&n->node) != CDS_FT_STATUS_OK) {
+					fprintf(stderr, "%s: seed key %u dup %u failed\n",
+						name, k, d);
+					abort();
+				}
+			}
+		}
+		for (k = 0; k < SKRA_K; k++)
+			c.fresh[k].returned = 0;
+		rcu_read_unlock();
+		rcu_quiescent_state();
+		skr_bwait(&c.bar);		/* seeded */
+		skr_bwait(&c.bar);		/* removed */
+
+		/*
+		 * Exclusive again: the lanes and the appender are parked on the
+		 * barrier, so the returned chains are settled and the trie is
+		 * quiescent.  Count where every seeded node ended up.
+		 */
+		rcu_read_lock();
+		if (cds_ft_verify(c.ft, stderr) != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "%s: round %u: verify RED after the concurrent remove_alls\n",
+				name, r);
+			ret = -1;
+		}
+		/* Every node a lane was handed back, marked once per hand-back. */
+		for (t = 0; t < SKRA_T; t++) {
+			for (k = 0; k < SKRA_K; k++) {
+				struct cds_ft_node *h = c.ret[t * SKRA_K + k];
+
+				for (; h; h = cds_ft_node_next_rcu(h)) {
+					struct skra_node *n =
+						(struct skra_node *) h;
+
+					if (n->k != k) {
+						fprintf(stderr, "%s: round %u: lane %u key %u was handed a node belonging to key %u\n",
+							name, r, t, k, n->k);
+						ret = -1;
+						break;
+					}
+					n->returned++;
+				}
+			}
+		}
+		/* ...and every node the trie still holds. */
+		for (k = 0; k < SKRA_K; k++) {
+			struct cds_ft_node *h;
+			unsigned int len = 0;
+			uint8_t key[8];
+			size_t klen;
+
+			/*
+			 * THE GUARD MUST HAVE SURVIVED.  It shares the target's
+			 * holder, and the removal that empties that holder
+			 * PROMOTES the guard's chain to the parent.  A promote
+			 * that loses it -- or a two-commit tail that unspliced
+			 * its cell and freed it -- shows up here and nowhere
+			 * else: the guard is not part of the target's chain, so
+			 * the accounting below would never miss it.
+			 */
+			if (prefix_shape) {
+				klen = skra_key(c.ft, r, k, true, true, key);
+				cds_ft_iter_set_key(iter, key, klen);
+				if (cds_ft_lookup(c.ft, iter) !=
+						CDS_FT_STATUS_OK ||
+						cds_ft_iter_node(iter) !=
+						&guard[k].node) {
+					fprintf(stderr, "%s: round %u: key %u GUARD lost by the target's removal\n",
+						name, r, k);
+					ret = -1;
+				}
+			}
+			klen = skra_key(c.ft, r, k, prefix_shape, false, key);
+			cds_ft_iter_set_key(iter, key, klen);
+			if (cds_ft_lookup(c.ft, iter) != CDS_FT_STATUS_OK)
+				continue;
+			for (h = cds_ft_iter_node(iter); h;
+					h = cds_ft_node_next_rcu(h)) {
+				struct skra_node *n = (struct skra_node *) h;
+
+				len++;
+				if (n->returned) {
+					fprintf(stderr, "%s: round %u: key %u dup %u was HANDED BACK and is STILL IN THE TRIE\n",
+						name, r, k, n->d);
+					ret = -1;
+				} else if (n != &c.fresh[k]) {
+					fprintf(stderr, "%s: round %u: key %u dup %u SURVIVED every remove_all\n",
+						name, r, k, n->d);
+					ret = -1;
+				}
+				n->returned++;	/* accounted: in the trie */
+			}
+			if (len > 1) {
+				fprintf(stderr, "%s: round %u: key %u chain length %u > 1\n",
+					name, r, k, len);
+				ret = -1;
+			}
+		}
+		/*
+		 * The accounting closes here: a seeded node accounted ZERO times
+		 * is gone from the trie and was handed to nobody -- a LOST NODE;
+		 * accounted TWICE is two owners for one node.
+		 */
+		for (k = 0; k < SKRA_K; k++) {
+			for (d = 0; d < SKRA_D; d++) {
+				struct skra_node *n = &c.nodes[k * SKRA_D + d];
+
+				if (n->returned == 1)
+					continue;
+				fprintf(stderr, "%s: round %u: key %u dup %u accounted %u times (expected 1: LOST at 0, DOUBLE-OWNED above 1)\n",
+					name, r, k, d, n->returned);
+				ret = -1;
+			}
+			if (c.fresh[k].returned > 1) {
+				fprintf(stderr, "%s: round %u: key %u fresh node accounted %u times\n",
+					name, r, k, c.fresh[k].returned);
+				ret = -1;
+			}
+		}
+		/* Drain whatever survived: the next round starts empty. */
+		for (k = 0; k < SKRA_K; k++) {
+			unsigned int pass;
+
+			for (pass = 0; pass < (prefix_shape ? 2u : 1u); pass++) {
+				struct cds_ft_node *res = NULL;
+				uint8_t key[8];
+				size_t klen = skra_key(c.ft, r, k, prefix_shape,
+					pass == 1, key);
+
+				cds_ft_iter_set_key(iter, key, klen);
+				if (cds_ft_lookup(c.ft, iter) !=
+						CDS_FT_STATUS_OK)
+					continue;
+				if (cds_ft_remove_all(c.ft, iter, &res) !=
+						CDS_FT_STATUS_OK) {
+					fprintf(stderr, "%s: round %u: drain of key %u (%s) failed\n",
+						name, r, k,
+						pass ? "guard" : "target");
+					ret = -1;
+				}
+			}
+		}
+		if (cds_ft_count_keys(c.ft) != 0) {
+			fprintf(stderr, "%s: round %u: count_keys %lu != 0 after the drain\n",
+				name, r, cds_ft_count_keys(c.ft));
+			ret = -1;
+		}
+		rcu_read_unlock();
+		rcu_quiescent_state();
+		if (uatomic_read(&c.busy) != busy_before) {
+			fprintf(stderr, "%s: round %u: %lu remove_all call(s) reported BUSY_ERROR -- the op has no retry\n",
+				name, r, uatomic_read(&c.busy) - busy_before);
+			ret = -1;
+		}
+		if (uatomic_read(&c.other) || uatomic_read(&c.ins_fail))
+			ret = -1;
+		if (ret)
+			fprintf(stderr, "%s: RED at round %u\n", name, r);
+		/* The nodes are re-seeded next round: retire the freezes first. */
+		rcu_barrier();
+		skr_bwait(&c.bar);		/* verified */
+	}
+	for (t = 0; t < SKRA_T + 1; t++)
+		pthread_join(th[t], NULL);
+	pthread_barrier_destroy(&c.bar);
+	cds_ft_iter_destroy(iter);
+	rcu_quiescent_state();
+	rcu_barrier();
+	cds_ft_destroy(c.ft);
+	cds_ft_group_destroy(group);
+	free(c.nodes);
+	free(c.fresh);
+	free(c.ret);
+	free(guard);
+	fprintf(stderr,
+		"# %s: %u rounds x %u keys x %u dups, %u remove_all lanes + 1 appender (%s, %s): ok=%lu notfound=%lu BUSY=%lu other=%lu insfail=%lu -> %s\n",
+		name, SKRA_R, SKRA_K, SKRA_D, SKRA_T,
+		coarse ? "coarse" : "fine",
+		prefix_shape ? "prefix+promote" : "leaf", uatomic_read(&c.ok),
+		uatomic_read(&c.notfound), uatomic_read(&c.busy),
+		uatomic_read(&c.other), uatomic_read(&c.ins_fail),
+		ret ? "RED" : "ok");
+	return ret;
+}
+
+static int inv_concurrent_remove_all_nolist(void)
+{
+	return inv_concurrent_remove_all_run(false, false, false,
+		"inv_concurrent_remove_all_nolist");
+}
+
+static int inv_concurrent_remove_all_coarse(void)
+{
+	return inv_concurrent_remove_all_run(false, true, false,
+		"inv_concurrent_remove_all_coarse");
+}
+
+/*
+ * The PREFIX+PROMOTE arm: the only one of the four that reaches remove_all's
+ * two-commit ordered-list tail (verified with -DFT_DBG_RA_UNSPLICE, which
+ * counts the arm and its aborts -- the leaf arms report two_commit_arm == 0).
+ */
+static int inv_concurrent_remove_all_prefix(void)
+{
+	return inv_concurrent_remove_all_run(true, false, true,
+		"inv_concurrent_remove_all_prefix");
+}
+
+static int inv_concurrent_remove_all_prefix_coarse(void)
+{
+	return inv_concurrent_remove_all_run(true, true, true,
+		"inv_concurrent_remove_all_prefix_coarse");
+}
+
+/*
+ * The ORDERED-LIST arm, and it is not a duplicate of the row above: it is the
+ * only one that reaches remove_all's TWO-COMMIT TAIL.  With the list on, a
+ * shape that could not fuse the dead head cell's unsplice into its structural
+ * flip (@pub unarmed -- the prefix, recompaction and compressed-parent shapes)
+ * publishes the removal FIRST and unsplices SECOND.  That second commit used to
+ * have its status discarded, on the premise that an "ABORT [is] unreachable
+ * under its current exclusion" -- true only while remove_all demanded caller
+ * writer-exclusion.  Converting it deletes the premise, and an aborted unsplice
+ * leaves the key gone from the structural index but still in the ordered list,
+ * then frees its cell while the list still points at it.
+ */
+static int inv_concurrent_remove_all_list(void)
+{
+	return inv_concurrent_remove_all_run(true, false, false,
+		"inv_concurrent_remove_all_list");
+}
+
 int main(int argc, char **argv)
 {
 	const char *filter = (argc >= 2) ? argv[1] : NULL;
@@ -24108,6 +24657,11 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_concurrent_same_key_append);
 	RUN_TEST(inv_concurrent_same_key_append_nolist);
 	RUN_TEST(inv_concurrent_same_key_append_coarse);
+	RUN_TEST(inv_concurrent_remove_all_nolist);
+	RUN_TEST(inv_concurrent_remove_all_coarse);
+	RUN_TEST(inv_concurrent_remove_all_list);
+	RUN_TEST(inv_concurrent_remove_all_prefix);
+	RUN_TEST(inv_concurrent_remove_all_prefix_coarse);
 
 	rcu_barrier();
 	rcu_unregister_thread();

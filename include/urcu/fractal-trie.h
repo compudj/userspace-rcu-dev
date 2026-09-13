@@ -1451,10 +1451,11 @@ enum cds_ft_status cds_ft_prev(struct cds_ft *ft,
  * (cds_ft_group_attr_set_writer_strategy):
  *
  *   CDS_FT_WRITER_LOCK_FINE (the default): may run concurrently with
- *   cds_ft_insert, cds_ft_remove and cds_ft_replace on the same trie,
- *   including on the same key.  Mutual exclusion against the remaining
- *   update operations (cds_ft_insert_unique, cds_ft_insert_replace,
- *   cds_ft_remove_all) is the caller's responsibility.
+ *   cds_ft_insert, cds_ft_insert_unique, cds_ft_replace, cds_ft_remove and
+ *   cds_ft_remove_all on the same trie, including on the same key.  Mutual
+ *   exclusion against cds_ft_insert_replace -- the one point op the
+ *   fine-locking transition has not converted -- is the caller's
+ *   responsibility.
  *
  *   CDS_FT_WRITER_LOCK_COARSE: writers serialize on one FT-wide writer
  *   lock, so any mix of update operations may be called concurrently.
@@ -1492,10 +1493,11 @@ enum cds_ft_status cds_ft_insert(struct cds_ft *ft,
  * (cds_ft_group_attr_set_writer_strategy):
  *
  *   CDS_FT_WRITER_LOCK_FINE (the default): may run concurrently with
- *   cds_ft_insert, cds_ft_remove and cds_ft_replace on the same trie,
- *   including on the same key.  Mutual exclusion against the remaining
- *   update operations (cds_ft_insert_unique, cds_ft_insert_replace,
- *   cds_ft_remove_all) is the caller's responsibility.
+ *   cds_ft_insert, cds_ft_insert_unique, cds_ft_replace, cds_ft_remove and
+ *   cds_ft_remove_all on the same trie, including on the same key.  Mutual
+ *   exclusion against cds_ft_insert_replace -- the one point op the
+ *   fine-locking transition has not converted -- is the caller's
+ *   responsibility.
  *
  *   ☞ The op takes the duplicate chain's HOLDER lock and derives its routing
  *   under it.  That conversion is deliberately SMALLER than cds_ft_remove's,
@@ -1601,14 +1603,13 @@ enum cds_ft_status cds_ft_insert_replace(struct cds_ft *ft,
  * Update concurrency depends on the group's writer strategy
  * (cds_ft_group_attr_set_writer_strategy):
  *
- *   CDS_FT_WRITER_LOCK_FINE (the default): NOT concurrency-safe -- ☐ a TODO,
- *   NOT a design decision.  See "THE FINE-LOCKING TRANSITION IS INCOMPLETE" at
- *   enum cds_ft_writer_strategy: this op derives something with nothing held and
- *   then trusts it, where insert/remove go on to acquire and re-validate, and
- *   the recipe to convert it is already in-tree.  Until then, mutual
- *   exclusion against every update operation (cds_ft_insert,
- *   cds_ft_insert_unique, cds_ft_insert_replace, cds_ft_replace,
- *   cds_ft_remove, cds_ft_remove_all) is the caller's responsibility.
+ *   CDS_FT_WRITER_LOCK_FINE (the default): may run concurrently with
+ *   cds_ft_insert, cds_ft_insert_unique, cds_ft_replace, cds_ft_remove and
+ *   cds_ft_remove_all on the same trie, including on the same key.  The
+ *   chain holder is acquired before the routing is derived, and @expected_old
+ *   IS the routing re-validation (a stale slot aborts the commit); an attempt
+ *   that loses either publishes nothing and is re-derived.  Mutual exclusion
+ *   against cds_ft_insert_replace is the caller's responsibility.
  *
  *   CDS_FT_WRITER_LOCK_COARSE: writers serialize on one FT-wide writer
  *   lock, so any mix of update operations may be called concurrently.
@@ -1642,10 +1643,11 @@ enum cds_ft_status cds_ft_replace(struct cds_ft *ft,
  * (cds_ft_group_attr_set_writer_strategy):
  *
  *   CDS_FT_WRITER_LOCK_FINE (the default): may run concurrently with
- *   cds_ft_insert, cds_ft_remove and cds_ft_replace on the same trie,
- *   including on the same key.  Mutual exclusion against the remaining
- *   update operations (cds_ft_insert_unique, cds_ft_insert_replace,
- *   cds_ft_remove_all) is the caller's responsibility.
+ *   cds_ft_insert, cds_ft_insert_unique, cds_ft_replace, cds_ft_remove and
+ *   cds_ft_remove_all on the same trie, including on the same key.  Mutual
+ *   exclusion against cds_ft_insert_replace -- the one point op the
+ *   fine-locking transition has not converted -- is the caller's
+ *   responsibility.
  *
  *   CDS_FT_WRITER_LOCK_COARSE: writers serialize on one FT-wide writer
  *   lock, so any mix of update operations may be called concurrently.
@@ -1680,27 +1682,35 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
  * Returns CDS_FT_STATUS_OK on success, CDS_FT_STATUS_NOT_FOUND if
  * no node is found at the iterator position, or a negative
  * cds_ft_status on error.  CDS_FT_STATUS_MEMORY_ERROR reports an
- * allocation failure, and CDS_FT_STATUS_BUSY_ERROR a lock lost to a
- * concurrent writer, while restructuring the trie around the removed
- * key.  Both leave the key NOT removed (the chain is still reachable;
- * *@result_node is NULL) and both may be retried -- but only the
- * BUSY_ERROR retry can succeed without the caller first freeing memory.  An allocation
+ * allocation failure while restructuring the trie around the removed
+ * key; it leaves the key NOT removed (the chain is still reachable;
+ * *@result_node is NULL) and may be retried once the caller has freed
+ * memory.  An allocation
  * failure while pruning an already-emptied internal holder is NOT an
  * error: the key's removal is published before the holder is pruned, so
  * the removal has already succeeded (CDS_FT_STATUS_OK).  Completing the
  * prune is deferred to a later mutation through that slot.
  *
+ * CDS_FT_STATUS_BUSY_ERROR is NO LONGER RETURNED: a lock lost to a
+ * concurrent writer is absorbed by this op's own retry loop, which ages
+ * the conflict so a contended caller escalates into the trie's FIFO
+ * writer lane instead of spinning.  Callers that tested for it may keep
+ * doing so -- the value is still declared -- but the branch is dead.
+ *
  * Update concurrency depends on the group's writer strategy
  * (cds_ft_group_attr_set_writer_strategy):
  *
- *   CDS_FT_WRITER_LOCK_FINE (the default): NOT concurrency-safe -- ☐ a TODO,
- *   NOT a design decision.  See "THE FINE-LOCKING TRANSITION IS INCOMPLETE" at
- *   enum cds_ft_writer_strategy: this op derives something with nothing held and
- *   then trusts it, where insert/remove go on to acquire and re-validate, and
- *   the recipe to convert it is already in-tree.  Until then, mutual
- *   exclusion against every update operation (cds_ft_insert,
- *   cds_ft_insert_unique, cds_ft_insert_replace, cds_ft_replace,
- *   cds_ft_remove, cds_ft_remove_all) is the caller's responsibility.
+ *   CDS_FT_WRITER_LOCK_FINE (the default): may run concurrently with
+ *   cds_ft_insert, cds_ft_insert_unique, cds_ft_replace, cds_ft_remove and
+ *   cds_ft_remove_all, INCLUDING ON THE SAME KEY.  The chain head is derived
+ *   with nothing held, then re-validated: the leaf shape under
+ *   ft_detach_node's lock-set (as the point remove), the prefix shape under
+ *   the holder's lock with the clear's expected-old as the check.  An attempt
+ *   that loses either publishes nothing and is re-derived.
+ *   ☐ Mutual exclusion against cds_ft_insert_replace, cds_ft_compact_step and
+ *   cds_ft_recompute_stats is still the caller's responsibility -- those three
+ *   remain unconverted; see "THE FINE-LOCKING TRANSITION IS INCOMPLETE" at
+ *   enum cds_ft_writer_strategy.
  *
  *   CDS_FT_WRITER_LOCK_COARSE: writers serialize on one FT-wide writer
  *   lock, so any mix of update operations may be called concurrently.
@@ -2941,27 +2951,33 @@ enum cds_ft_status cds_ft_group_attr_set_optimize(
  *   (every count-changing writer updates the shared root, so there are no
  *   disjoint writers for fine locking to parallelize).
  *
- * ☐ TODO -- THE FINE-LOCKING TRANSITION IS INCOMPLETE, AND THREE OPERATIONS ARE
- * STILL WAITING ON IT -- and they are all POINT ops.  cds_ft_insert,
- * cds_ft_remove and cds_ft_replace are converted: their notes say they may run
- * concurrently with each other "including on the same key".  The BULK ops (graft,
- * graft_swap, merge_at, merge, detach, the rekeys) are NOT in the waiting set at
- * all -- see the mode-flip paragraph below.  Three POINT ops say instead that
- * "mutual exclusion against every update operation is the caller's
- * responsibility":
+ * ☐ TODO -- THE FINE-LOCKING TRANSITION IS INCOMPLETE, AND ONE POINT OPERATION
+ * IS STILL WAITING ON IT.  cds_ft_insert, cds_ft_remove, cds_ft_replace,
+ * cds_ft_insert_unique and cds_ft_remove_all are converted: their notes say they
+ * may run concurrently with each other "including on the same key".  The BULK
+ * ops (graft, graft_swap, merge_at, merge, detach, the rekeys) are NOT in the
+ * waiting set at all -- see the mode-flip paragraph below.  What remains:
  *
- *     cds_ft_insert_unique   cds_ft_insert_replace   cds_ft_remove_all
+ *     cds_ft_insert_replace   (+ cds_ft_compact_step and cds_ft_recompute_stats,
+ *                              which carry no writer-strategy paragraph at all)
  *
  * ☠ READ THOSE SENTENCES AS A TODO, NOT AS A CONTRACT.  They describe work not
- * yet done, not a property anyone wants: there is no design reason these three
+ * yet done, not a property anyone wants: there is no design reason the rest
  * cannot coordinate through the same per-node lock-sets as insert and remove,
  * and a caller-side mutex around them defeats the point of the default strategy.
  * Documented here, once, because identically-worded per-op notes read like
  * deliberate decisions.
  *
- * ★ THEY ARE ALSO ALL ONE DEFECT SHAPE, which is what makes the conversion
- * tractable: each derives something with NOTHING HELD and then trusts it, where
- * the converted sibling goes on to ACQUIRE the owning node and RE-VALIDATE.
+ * ★ THEY ARE NOT ALL ONE DEFECT SHAPE, and assuming they were is the trap this
+ * note used to set.  Most derive something with NOTHING HELD and then trust it,
+ * where the converted sibling goes on to ACQUIRE the owning node and
+ * RE-VALIDATE -- but cds_ft_remove_all did not: it already acquired and
+ * re-validated everything it derived, and what it lacked was PROGRESS.  Its body
+ * ran EXACTLY ONCE, so every correct, published-nothing abort was handed to the
+ * caller as BUSY_ERROR: 91% of its calls failed that way under a same-key peer
+ * (measured 25634 BUSY vs 2473 OK), while losing NO node and corrupting NOTHING.
+ * ⇒ ASK WHAT AN OP IS MISSING BEFORE APPLYING THE RECIPE.  Three of the four
+ * needed exclusion; the fourth needed a loop.
  *
  * ☑ cds_ft_replace WAS THE FIRST OF THE FOUR CONVERTED, and it is the worked
  * example to copy -- with one lesson that generalises.  ITS CONVERSION IS
@@ -2986,16 +3002,21 @@ enum cds_ft_status cds_ft_group_attr_set_optimize(
  * -DFT_WINNER_DBG).  ft_flip_txn_lock_or_guard_parent_at already encodes the
  * skip on its @held.shared path; a hand-rolled acquire must spell it itself.
  *
- *   cds_ft_remove_all   validates the chain head against the holder and trusts
- *                       the result "under the writer mutex".
- *   cds_ft_insert_unique  takes the duplicate head from the descent's landing --
- *                       the code says "with nothing held" -- and RETURNS the
- *                       -EEXIST verdict from it, BEFORE the holder acquire that
- *                       the plain insert goes on to make.  Same read, same
- *                       landing; only the early return differs.
  *   cds_ft_insert_replace  replaces the whole duplicate chain, composed rather
  *                       than carried by one commit (☐ confirm whether it needs
- *                       more than the acquire+revalidate the other three do).
+ *                       more than the acquire+revalidate the others did).
+ *
+ * ☑ cds_ft_remove_all WAS CONVERTED BY ADDING ITS RETRY LOOP, and the three
+ * premises that died with its exclusion are worth naming, because each was a
+ * comment asserting something the conversion falsifies: an "-EAGAIN from here is
+ * the whole CALL failing" in the orphan acquire; an assert that detach cannot
+ * return -ENOENT "because it has been found by a mutex-protected traversal
+ * within this function" (no mutex exists there under FINE); and a discarded
+ * unsplice status justified by "ABORT unreachable under its current exclusion".
+ * A FOURTH was only reachable at EXPONENTIAL spacing: the op derives its holder
+ * from the chain head's BACK POINTER and then re-derives it TOP-DOWN by the key
+ * for the lock-set depths, and under a peer the two can disagree -- which used
+ * to be impossible, and now bails retriably instead of asserting.
  *
  * THE CROSS-TRIE / BULK OPS: the SOURCE side is settled, and the destination's
  * story is NOT the per-node conversion an earlier version of this note claimed.

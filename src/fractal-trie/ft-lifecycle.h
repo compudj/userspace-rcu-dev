@@ -932,8 +932,10 @@ enum cds_ft_status cds_ft_create(struct cds_ft_group *ft_group,
 	 * remaining acquires are the F2 body-copy fences, taken one at a time
 	 * with no set to dedupe against, so a coarsened anchor there only
 	 * collapses an op's OWN marks onto one word -- the op then refuses
-	 * itself, and on a path with no retry (remove_all) that is a hard
-	 * MEMORY_ERROR.
+	 * itself, and a self-refusal is the one -EAGAIN no peer will ever clear:
+	 * under a retry loop (every point op has one now, remove_all included)
+	 * that is not an error but a SPIN, which is why it is made inert here
+	 * rather than left to the ops to survive.
 	 */
 	ft->lock_spacing = ft->lock_fine ? ft_group->lock_spacing :
 			CDS_FT_LOCK_SPACING_PER_NODE;

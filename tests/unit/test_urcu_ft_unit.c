@@ -32153,13 +32153,23 @@ extern long cds_ft_fault_removeall_countdown;
  * mode, because 99.95% of remove_all's commits go through ft_detach_node, which
  * builds its txn internally (measured: detach 697,344 of 697,675).
  *
- * ASSERTED: the refused arm reports CDS_FT_STATUS_BUSY_ERROR (a peer, so the
- * caller retries -- not MEMORY_ERROR, which would send it freeing memory over a
- * lock it merely lost), the chain is still reachable (nothing was published),
- * and *@result_node is NULL so the caller cannot reclaim a chain the trie still
- * points at.  The paired witness for the other class is
+ * ☞ WHAT IT ASSERTS CHANGED WITH THE FINE-LOCKING CONVERSION, and the knob is
+ * now a RED CONTROL for the retry loop rather than a witness for a status.  It
+ * used to assert CDS_FT_STATUS_BUSY_ERROR -- a peer handed back to the caller.
+ * cds_ft_remove_all now absorbs a peer itself: the refusal is ONE-SHOT (the
+ * countdown disarms as it fires), so an op that re-attempts MUST succeed, and
+ * one that does not re-attempt cannot.  That makes this the sharpest available
+ * test of the loop: no workload can force remove_all's contention arm (measured
+ * ZERO times in 4,807,509 calls before the knob existed), so without it the
+ * retry would be exercised only by the concurrent ft_inv rows, which cannot say
+ * WHICH attempt succeeded.
+ *
+ * ASSERTED: the refused arm still reports OK, the key is GONE, and the chain is
+ * handed back for reclaim -- i.e. the forced -EAGAIN cost an attempt, not the
+ * call.  The paired witness for the other class is
  * test_remove_prefix_siblings_oom, which drives an allocation failure through
- * the same tail and must keep reporting MEMORY_ERROR.
+ * the same tail and must keep reporting MEMORY_ERROR: an allocation failure is
+ * NOT retried, and keeping the two apart is what the conversion rests on.
  */
 static int test_remove_all_contended_bail(void)
 {
@@ -32217,28 +32227,41 @@ static int test_remove_all_contended_bail(void)
 
 		if (this_fired) {
 			fired++;
-			if (s != CDS_FT_STATUS_BUSY_ERROR) {
+			/*
+			 * The refusal is one-shot, so the SECOND attempt runs
+			 * unrefused: the retry loop must have turned this into
+			 * an ordinary success.  A BUSY_ERROR here is the
+			 * pre-conversion behaviour and means the loop is gone.
+			 */
+			if (s != CDS_FT_STATUS_OK) {
 				fprintf(stderr, "remove_all contended: key %u "
-					"reported %d, expected BUSY_ERROR (%d)\n",
-					i, (int) s,
-					(int) CDS_FT_STATUS_BUSY_ERROR);
+					"reported %d, expected OK -- a one-shot "
+					"refusal was NOT absorbed by the retry\n",
+					i, (int) s);
 				rc = -1;
 				break;
 			}
 			busy++;
-			/* Nothing published: the chain stays live and unowned. */
-			if (!still_there) {
+			if (still_there) {
 				fprintf(stderr, "remove_all contended: key %u "
-					"vanished on a refused removal\n", i);
+					"reported OK but is still present\n", i);
 				rc = -1;
 				break;
 			}
-			if (res != NULL) {
+			if (res == NULL) {
 				fprintf(stderr, "remove_all contended: key %u "
-					"handed back a chain it did not remove\n", i);
+					"removed the chain but handed back NULL\n",
+					i);
 				rc = -1;
 				break;
 			}
+			{
+				struct cds_ft_node *h = res, *tmp;
+
+				cds_ft_for_each_duplicate_safe_rcu(h, tmp)
+					node_free_rcu(to_test_node(h));
+			}
+			base[i] = NULL;
 		} else if (s == CDS_FT_STATUS_OK) {
 			ok++;
 			if (still_there) {
@@ -32269,9 +32292,8 @@ static int test_remove_all_contended_bail(void)
 		}
 	}
 
-	diag("remove_all contended: %lu refusals forced (all reported as the "
-		"known MEMORY_ERROR mislabel: %lu), %lu uncontended removals",
-		fired, busy, ok);
+	diag("remove_all contended: %lu refusals forced and ABSORBED by the "
+		"retry (%lu), %lu uncontended removals", fired, busy, ok);
 	/* A sweep that never refused an acquire proves nothing -- say so. */
 	if (!rc && fired == 0) {
 		fprintf(stderr, "remove_all contended: the knob never refused "
