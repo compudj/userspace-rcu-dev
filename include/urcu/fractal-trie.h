@@ -2932,10 +2932,11 @@ enum cds_ft_status cds_ft_group_attr_set_optimize(
  *   disjoint writers for fine locking to parallelize).
  *
  * ☐ TODO -- THE FINE-LOCKING TRANSITION IS INCOMPLETE, AND FOUR OPERATIONS ARE
- * STILL WAITING ON IT.  Converted so far: cds_ft_insert and cds_ft_remove, whose
- * notes say they may run concurrently with each other "including on the same
- * key", and cds_ft_merge_at, whose destination may be a live trie carrying
- * concurrent writers.  Four POINT ops say instead that "mutual exclusion against
+ * STILL WAITING ON IT -- and they are all POINT ops.  cds_ft_insert and
+ * cds_ft_remove are converted: their notes say they may run concurrently with each
+ * other "including on the same key".  The BULK ops (graft, graft_swap, merge_at,
+ * merge, detach, the rekeys) are NOT in the waiting set at all -- see the mode-flip
+ * paragraph below.  Four POINT ops say instead that "mutual exclusion against
  * every update operation is the caller's responsibility":
  *
  *     cds_ft_insert_unique   cds_ft_insert_replace
@@ -2979,25 +2980,39 @@ enum cds_ft_status cds_ft_group_attr_set_optimize(
  * on the same destination", while "exclusion against the point-update operations
  * remains the caller's responsibility".
  *
- * ☠ AND BULK-vs-POINT IS NOT THE CALLER'S -- G5.25 ALREADY DOES IT, WITH THE
- * FT-WIDE LOCK.  A FINE trie RE-TAKES the FT-wide writer lock for the whole window
- * a bulk op is live (ft_writer_scope_enter's `ft->lock_fine &&
- * !(FT_BULK_WIDE_LOCK && ft_bulk_active(ft))` test), so bulk and point writers
- * arbitrate on one word again -- "the whole of G5.5's exclusion".  The sentences
- * above therefore UNDER-describe what the library provides, and the point ops'
- * own notes say nothing about bulk ops at all.
+ * ☑ AND BULK-vs-POINT IS NOT THE CALLER'S, NOR IS IT OWED: THE MODE FLIP IS THE
+ * DESIGN.  A bulk op publishes the gate and waits a GP; from then on a FINE point
+ * op FLIPS MODE and takes the FT-wide writer lock instead of skipping it
+ * (ft_writer_scope_enter's `ft->lock_fine && !(FT_BULK_WIDE_LOCK &&
+ * ft_bulk_active(ft))` test, G5.25), so bulk and point writers arbitrate on one
+ * word.  That mode flip -- the FT-wide lock protecting the bulk-op mode
+ * transition, which is also the reader dual-descent transition -- IS the target
+ * design for bulk-vs-point, not a placeholder for per-node work.  ⇒ The per-op
+ * sentences above that hand point exclusion to the CALLER therefore
+ * UNDER-describe the library, and the point ops' own notes do not mention bulk
+ * ops at all.
  *
- * ⇒ SO "merge_at already converted its destination" IS WRONG, and an earlier
- * version of this note said it.  merge_at's live-destination safety IS that
- * interim FT-wide lock; the converted/unconverted wording across graft,
- * graft_swap, merge_at, cds_ft_merge and cds_ft_detach corresponds to NO
- * difference in how they exclude a point writer.  FT-SLOT-3 states the
- * consequence where it bites: the glue's unconditional SW park on a live node's
- * parent word is sound ONLY because of this re-take -- "☠ SO IT IS A DEPENDENCY,
- * NOT AN INVARIANT.  The day the FT-wide lock is relaxed to only flipping the
- * dual-descent state -- the recorded direction -- this SW park loses its
- * exclusion."  ⇒ THE BULK DESTINATION'S REAL CONVERSION IS THAT RELAXATION, and
- * it has no worked example in tree.  Do not cite merge_at as one.
+ * ☐ WHAT *IS* INTERIM IS THE HOLD, NOT THE MECHANISM -- and it is an optimization,
+ * not a conversion.  Today a bulk op holds that lock for its WHOLE BODY (every
+ * attempt; only ft_writer_lock_gp_wait drops it across a GP).  The intended role
+ * is narrower: use the lock to FLIP the dual-descent state and relax it in FINE
+ * mode thereafter.  Known issues get stabilised first; this is deliberately later.
+ *
+ * ⇒ THE RULE THAT FOLLOWS, for anyone adding exclusion arguments here: do NOT
+ * build a new one that depends on a bulk op holding the FT-wide lock for its whole
+ * body -- it will not survive the relaxation.  State it on the per-node lock-set
+ * or on the gate flip.  FT-SLOT-3 is an EXISTING instance, flagged as such:
+ * ft_glue_record_back_edge passes @child_held TRUE unconditionally and so parks SW
+ * on a live node's parent word the op does not hold, sound only because every
+ * caller is a bulk op -- "☠ SO IT IS A DEPENDENCY, NOT AN INVARIANT".  It is debt
+ * against the relaxation, NOT a missing destination conversion.
+ *
+ * ☠ SO DO NOT CALL THE BULK OPS "UNCONVERTED FOR FINE DESTINATION LOCKING", as an
+ * earlier version of this note did.  Their bulk-vs-point story is finished by
+ * design.  The unconverted list is the POINT ops above (plus compact /
+ * compact_step / recompute_stats, which are caller-excluded by their own
+ * contracts).  And do not cite merge_at as a destination-conversion template:
+ * there is nothing there to copy that graft and detach do not already do.
  *
  * ☐ TWO HEADER BUGS FOUND WHILE ENUMERATING, both still present:
  *   - cds_ft_merge says "NOT concurrency-safe" yet its body is one line:
