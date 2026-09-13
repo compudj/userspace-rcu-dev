@@ -7395,13 +7395,18 @@ enum cds_ft_status cds_ft_remove(struct cds_ft *ft,
 						"HOLDER: streak=%u "
 						"held=%u/%u trans=%u "
 						"taker=%s:%d op_bound=%d "
-						"tid=%lx take_age_us=%llu\n",
+						"tid=%lx take_age_us=%llu "
+						"phase=%d phase_age_us=%llu\n",
 						ft_dbg_refused_streak,
 						held, total, trans,
 						sl->fn, sl->line,
 						sl->op_bound, sl->tid,
 						(unsigned long long)
-						(t0 - sl->ts_ns) / 1000);
+						(t0 - sl->ts_ns) / 1000,
+						sl->phase_line,
+						sl->phase_ns ?
+						(unsigned long long)
+						(t0 - sl->phase_ns) / 1000 : 0);
 				} else {
 					fprintf(stderr, "FT REMOVE RETRY "
 						"HOLDER: streak=%u "

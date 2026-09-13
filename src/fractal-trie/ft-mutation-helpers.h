@@ -1640,6 +1640,16 @@ struct ft_dbg_take_slot {
 	uint64_t ts_ns;
 	long nvcsw;
 	long nivcsw;
+	/*
+	 * WHERE the taker is, INSIDE its held window.  fn:line above names the
+	 * acquire; it cannot tell "stuck in the commit" from "returned without
+	 * releasing", and those need different cures.  A holder that means to be
+	 * diagnosable re-stamps this at each step it takes while holding; the
+	 * victim prints line + how long that step has been current.  Plain
+	 * stores, same racy contract as the rest of the slot.
+	 */
+	int phase_line;
+	uint64_t phase_ns;
 };
 static struct ft_dbg_take_slot ft_dbg_take_map[64];
 static __thread const struct cds_ft_metadata *ft_dbg_last_refused;
@@ -1658,6 +1668,27 @@ static inline struct ft_dbg_take_slot *ft_dbg_take_slot_of(
 {
 	return &ft_dbg_take_map[(((uintptr_t) meta) >> 6) & 63];
 }
+
+/*
+ * Stamp the CURRENT step of a held window.  Only the slot this thread's own
+ * take owns is written (@meta must match), so a re-hashed or re-taken slot is
+ * left to its owner.
+ */
+static inline void ft_dbg_held_at(const struct cds_ft_metadata *meta, int line)
+{
+	struct ft_dbg_take_slot *sl;
+
+	if (!meta)
+		return;
+	sl = ft_dbg_take_slot_of(meta);
+	if (sl->meta != meta)
+		return;
+	sl->phase_line = line;
+	sl->phase_ns = ft_dbg_now_ns();
+}
+# define FT_DBG_HELD_AT(meta)	ft_dbg_held_at((meta), __LINE__)
+#else
+# define FT_DBG_HELD_AT(meta)	do { (void) (meta); } while (0)
 #endif
 
 static inline
@@ -5521,9 +5552,36 @@ int ft_dlm_lock(struct ft_flip_txn *t, struct cds_ft_metadata *meta,
 		}
 		if (s & FT_STATE_TOMBSTONE)
 			ft_dbg_lock_refuse_tomb++;
-		else if (s & FT_STATE_PROXY)
+		else if (s & FT_STATE_PROXY) {
+			const struct urcu_txn_record *r =
+				(const struct urcu_txn_record *)
+				(s & ~FT_STATE_PROXY);
+			const struct urcu_txn_desc *d = r->desc;
+
 			ft_dbg_lock_refuse_proxy++;
-		else
+			/*
+			 * ASK THE DESCRIPTOR (see the PROXY PARKER note in
+			 * fractal-trie-trace.h): a settle is an act, and a word
+			 * that stays proxied is a claim that it never ran.
+			 * Racy by construction -- the parker may settle under
+			 * this read and free the descriptor; the descriptor is
+			 * RCU-freed and this site runs inside the op's read-side
+			 * section, so the load cannot fault.
+			 */
+			if (d != ft_dbg_proxy_desc) {
+				ft_dbg_proxy_desc = d;
+				ft_dbg_proxy_streak = 1;
+				ft_dbg_proxy_switches++;
+			} else
+				ft_dbg_proxy_streak++;
+			ft_dbg_proxy_status = urcu_txn_desc_status(d);
+			ft_dbg_proxy_nr = d->nr;
+			ft_dbg_proxy_nr_mw = d->nr_mw;
+			ft_dbg_proxy_poisoned = d->poisoned;
+			ft_dbg_proxy_retry = d->retry;
+			ft_dbg_proxy_rec_old = (unsigned long) r->old_ptr;
+			ft_dbg_proxy_rec_new = (unsigned long) r->new_ptr;
+		} else
 			ft_dbg_lock_refuse_lock++;
 #endif
 #ifdef FT_DLM_LINGER
@@ -6551,6 +6609,15 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 		sl->op_bound = !!(ctx && ctx->op && ctx->op->domain);
 		sl->tid = (unsigned long) pthread_self();
 		sl->ts_ns = ft_dbg_now_ns();
+		/*
+		 * A NEW take owns a FRESH phase: the previous owner of this word
+		 * left its last step stamped, and printing that against this
+		 * take's age reads as "the holder has been at ft-insert.h:4668
+		 * for 41 ms" about a holder that never ran that line.  Clear it
+		 * so an unstamped holder reports phase=0, not someone else's.
+		 */
+		sl->phase_line = 0;
+		sl->phase_ns = 0;
 #ifdef FT_ENABLE_TRACING
 		{
 			struct rusage ru;

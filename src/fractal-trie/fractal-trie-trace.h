@@ -291,6 +291,36 @@ static __thread unsigned long ft_dbg_lock_refuse_state;
 static __thread const void *ft_dbg_lock_refuse_meta;
 static __thread unsigned long ft_dbg_lock_refuse_streak;
 static __thread unsigned long ft_dbg_lock_refuse_switches;
+/*
+ * ★ AND FOR A PROXY, ASK THE DESCRIPTOR.  "PROXY settles" is the reason the
+ * split above gives for not worrying about a proxy refusal -- but a settle is
+ * an ACT, performed by the parking commit's owner, and a word that stays
+ * proxied across thousands of refusals says that act never happened.  Only the
+ * descriptor can tell the two apart:
+ *
+ *   UNDECIDED, one descriptor, forever  the parker is stuck mid-commit (it is
+ *                                       blocked on something this op holds, or
+ *                                       on a word of its own).
+ *   SUCCEEDED / FAILED, still parked     the DECIDE ran and the SETTLE did not
+ *                                       -- an abandoned descriptor; the word is
+ *                                       readable (resolve) but unlockable
+ *                                       forever, which is the immortal-old
+ *                                       livelock wearing a proxy.
+ *   a CHURN of descriptors               ordinary contention this op is losing.
+ *
+ * Captured at the refusal, reported at the cap.  @poisoned is carried too: a
+ * poisoned descriptor can never commit, so it can never settle by committing.
+ */
+static __thread const void *ft_dbg_proxy_desc;
+static __thread unsigned long ft_dbg_proxy_status;
+static __thread unsigned long ft_dbg_proxy_streak;
+static __thread unsigned long ft_dbg_proxy_switches;
+static __thread unsigned long ft_dbg_proxy_nr;
+static __thread unsigned long ft_dbg_proxy_nr_mw;
+static __thread unsigned long ft_dbg_proxy_poisoned;
+static __thread unsigned long ft_dbg_proxy_retry;
+static __thread unsigned long ft_dbg_proxy_rec_old;
+static __thread unsigned long ft_dbg_proxy_rec_new;
 
 struct ft_op_retry {
 	unsigned int attempts;
@@ -365,9 +395,31 @@ void ft_op_retry_tick(const struct cds_ft *ft, struct ft_op_retry *r, int last_r
 		"FT OP LOCK REFUSE WORD: meta=%p streak=%lu switches=%lu\n",
 		ft_dbg_lock_refuse_meta, ft_dbg_lock_refuse_streak,
 		ft_dbg_lock_refuse_switches);
+	fprintf(stderr,
+		"FT OP PROXY PARKER: desc=%p status=%lu streak=%lu "
+		"switches=%lu nr=%lu nr_mw=%lu poisoned=%lu retry=%lu "
+		"rec_old=0x%lx rec_new=0x%lx\n",
+		ft_dbg_proxy_desc, ft_dbg_proxy_status, ft_dbg_proxy_streak,
+		ft_dbg_proxy_switches, ft_dbg_proxy_nr, ft_dbg_proxy_nr_mw,
+		ft_dbg_proxy_poisoned, ft_dbg_proxy_retry,
+		ft_dbg_proxy_rec_old, ft_dbg_proxy_rec_new);
 	if (system("lttng snapshot record 1>&2") == -1)
 		fprintf(stderr, "FT OP RETRY: snapshot record failed\n");
+	/*
+	 * ☠ abort() RUNS NO DESTRUCTOR, so it silently voids every exit-time
+	 * dump in the tree -- ft_tk_dump_at_exit (the which-record-lost report,
+	 * -DFT_WINNER_DBG) among them.  That is the report you WANT at a retry
+	 * cap: the cap says an op cannot converge, and the dump says which
+	 * record kept losing.  Arming both and getting nothing reads as "the
+	 * instrument found nothing", which is the wrong zero
+	 * [[feedback_an_instrument_can_be_armed_firing_and_blind]].
+	 * -DFT_RETRY_CAP_EXIT trades the core for the destructors.
+	 */
+#ifdef FT_RETRY_CAP_EXIT
+	exit(2);
+#else
 	abort();
+#endif
 }
 #else
 struct ft_op_retry { int unused; };
