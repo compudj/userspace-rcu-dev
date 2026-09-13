@@ -784,9 +784,18 @@ unsigned int ft_walk_extend(struct ft_descent *d, bool valid,
  *
  * The walk moves BELOW the descent's cursor, so @depth comes from the walk
  * itself -- ft_walk_extend has entered every node above this one, so the anchor
- * table covers it.  Refusing here instead would be fatal rather than merely
- * costly: remove_all has NO retry loop, so its -EAGAIN surfaces as a hard
- * MEMORY_ERROR.
+ * table covers it.  Refusing here instead would be costly rather than merely
+ * slow: remove_all has NO retry loop (cds_ft_remove_all calls
+ * _cds_ft_remove_all_locked exactly once), so an -EAGAIN from here is the whole
+ * CALL failing and the caller's to retry.
+ *
+ * ☞ IT IS NO LONGER A MEMORY_ERROR, and this comment used to say it was.  The
+ * tail now maps the two apart -- `-EAGAIN` to BUSY_ERROR, `-ENOMEM` to
+ * MEMORY_ERROR -- which only became trustworthy once @acquire_enomem gave an
+ * allocation failure inside the acquire its own channel, instead of arriving as
+ * an -EAGAIN no peer produced.  Corrected because the stale sentence reads as an
+ * open bug ("remove_all misreports contention as OOM") and sends the next reader
+ * after something already fixed.
  */
 static inline
 int ft_detach_orphan_acquire_at(const char *fn, int line,
