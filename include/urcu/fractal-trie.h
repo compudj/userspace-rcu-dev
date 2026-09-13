@@ -2992,20 +2992,40 @@ enum cds_ft_status cds_ft_group_attr_set_optimize(
  * UNDER-describe the library, and the point ops' own notes do not mention bulk
  * ops at all.
  *
- * ☐ WHAT *IS* INTERIM IS THE HOLD, NOT THE MECHANISM -- and it is an optimization,
- * not a conversion.  Today a bulk op holds that lock for its WHOLE BODY (every
- * attempt; only ft_writer_lock_gp_wait drops it across a GP).  The intended role
- * is narrower: use the lock to FLIP the dual-descent state and relax it in FINE
- * mode thereafter.  Known issues get stabilised first; this is deliberately later.
+ * ☐ THE HOLD IS WHAT MAY BE RELAXED -- BUT THAT IS NOT A FREE OPTIMIZATION, AND
+ * BULK-vs-BULK IS THE REASON.  Today a bulk op holds that lock for its whole body
+ * (every attempt), and THE FT-WIDE LOCK IS ALSO WHAT MAKES CONCURRENT BULK OPS ON
+ * ONE DESTINATION CORRECT -- not only what excludes point ops.  The intended role
+ * is narrower (flip the dual-descent state, then relax in FINE mode), so relaxing
+ * it OWES A NEW BULK-vs-BULK ARGUMENT; it is not established that the per-node
+ * lock-sets alone carry it.
+ *
+ * ☠ AND THE LOCK IS ALREADY TORN OPEN MID-BODY, so "the lock serializes bulk ops"
+ * is not even true end-to-end today: ft_writer_lock_gp_wait UNCONDITIONALLY drops
+ * writer_lock at seven live sites inside the bulk bodies (detach, graft, rekey), so
+ * a peer bulk op can enter at any drain seam.  doc/design/mw-to-fine-locking-
+ * remainder.md works that gap through and concludes "bulk-vs-bulk falls out of the
+ * lock" is FALSE at every drain seam; what carries it instead is the REFCOUNTED
+ * gate (overlapping windows compose, with no per-node bit for a peer's clear to
+ * erase) plus each op's own acquire/validate machinery.
+ *
+ * ⇒ SO THE OPEN QUESTION IS NARROW AND NAMED: under the relaxation, what keeps two
+ * bulk ops editing ONE destination correct?  FT-SLOT-3's justification answers only
+ * the POINT half -- "every caller here is a BULK op ... so the two arbitrate on one
+ * word" is bulk-vs-point -- so that site is dependent twice over, and two bulk ops
+ * both parking SW on one live parent word have nothing stated to separate them once
+ * the whole-body hold goes.  Known issues get stabilised first; this is later.
  *
  * ⇒ THE RULE THAT FOLLOWS, for anyone adding exclusion arguments here: do NOT
  * build a new one that depends on a bulk op holding the FT-wide lock for its whole
- * body -- it will not survive the relaxation.  State it on the per-node lock-set
+ * body -- it may not survive the relaxation, and at a drain seam it is not true
+ * today.  State it on the per-node lock-set
  * or on the gate flip.  FT-SLOT-3 is an EXISTING instance, flagged as such:
  * ft_glue_record_back_edge passes @child_held TRUE unconditionally and so parks SW
  * on a live node's parent word the op does not hold, sound only because every
  * caller is a bulk op -- "☠ SO IT IS A DEPENDENCY, NOT AN INVARIANT".  It is debt
- * against the relaxation, NOT a missing destination conversion.
+ * against the relaxation, NOT a missing destination conversion -- and it is debt on
+ * the BULK-vs-BULK side as much as the point side.
  *
  * ☠ SO DO NOT CALL THE BULK OPS "UNCONVERTED FOR FINE DESTINATION LOCKING", as an
  * earlier version of this note did.  Their bulk-vs-point story is finished by
