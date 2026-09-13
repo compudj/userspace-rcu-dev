@@ -24617,6 +24617,27 @@ static void *sir_replacer(void *arg)
 							c->out[o->owner][o->k * 2 +
 								o->slot] = 1;
 #endif
+#ifdef FT_INV_SIR_NO_GHOST_REMOVE
+						/*
+						 * ☞ MECHANISM TEST.  cds_ft_insert_replace
+						 * freezes NOTHING (its sibling
+						 * _cds_ft_replace_locked freezes the one node
+						 * it displaces, at three sites; this op
+						 * displaces a whole CHAIN and marks none of
+						 * it).  So a holder of a displaced node cannot
+						 * tell it left the trie, cds_ft_remove's
+						 * ft_node_is_removed() escape cannot fire, and
+						 * remove takes the INTERIOR lane on a ghost --
+						 * deriving pred from a stale prev whose next is
+						 * NULL, which is the edge that spins forever.
+						 *
+						 * This arm tells the peer out-of-band what the
+						 * tombstone would have told it.  If the livelock
+						 * vanishes, that IS the mechanism.
+						 */
+						if (o->owner == 2)
+							c->peer_in[o->k] = 0;
+#endif
 					}
 					rcu_read_unlock();
 				}
