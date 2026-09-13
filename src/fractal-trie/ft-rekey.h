@@ -6167,22 +6167,64 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		 */
 		{
 			struct ft_held_anchor pph;
+			struct ft_lock_ctx ppctx;
 
-			ft_lock_ctx_init(&lctx_src, &d_src, txn, optxn);
+			/*
+			 * ☠ DATE THE PUBLISH PARENT FROM THE DESCENT WHOSE PATH IT
+			 * IS ON, WHICH IS THE DST ONE.
+			 *
+			 * @glue.publish_parent is the node the built cluster
+			 * publishes INTO, so it sits on the DESTINATION path by
+			 * construction -- measured here as exactly @d_dst.pnf at
+			 * @d_dst.pdepth.  This acquire used a ctx built from
+			 * @d_src, and the src descent's window does not describe
+			 * it, so ft_lock_ctx_depth_of returned FALSE and the bail
+			 * below fired.  Nothing about that is transient: the next
+			 * attempt re-descends, re-derives the same publish parent,
+			 * and asks the same wrong window again.
+			 *
+			 * MEASURED, and it is a HANG, not a slowdown: ft_unit
+			 * test_rekey_collapse_one_slot_two_kinds at
+			 * CDS_FT_LOCK_SPACING_EXPONENTIAL spun 50,001 attempts on
+			 * one move (the -DFT_DEBUG_REKEY_RETRY_CAP detector's
+			 * cap) on the BARE-HEAD spelling, rekey dst "bbccc" src
+			 * "bcb", single-threaded with no peer in the test.
+			 *
+			 * ☞ INVISIBLE AT PER-NODE BY CONSTRUCTION, which is why it
+			 * survived: ft_lock_ctx_depth_of returns a DUMMY depth and
+			 * always succeeds there (a member anchors on itself, so no
+			 * descent is required), and only the exponential schedule
+			 * reads the depth at all.
+			 *
+			 * ☞ THE GLUE ALREADY CARRIES THE RIGHT DESCENT.  ft-graft.h
+			 * hands it over at both build entry points for precisely
+			 * this acquire -- "the glue's own acquires -- its publish
+			 * parent above all -- fire from commit helpers that never
+			 * see @d, and an acquire with no depth under a coarse
+			 * spacing MISSES ... That is a livelock, not a failure" --
+			 * and the merge arm repeats it at its own glue.lock_d.  So
+			 * take the ctx FROM THE GLUE rather than re-deriving it
+			 * from the wrong side.
+			 *
+			 * NO FALLBACK to the src descent on a miss.  Anchoring one
+			 * node from two different paths is what §1's agreement rule
+			 * forbids: two ops would compute different words for it and
+			 * exclude nothing.  One descent, the node's own.
+			 */
+			ft_glue_lock_ctx(&glue, &ppctx);
 			/*
 			 * The REST of the op's held set, exactly as the
 			 * store-prepare and detach arms name it:
 			 * ft_rekey_cow_stop's marks are handed to the registry by
 			 * ft_rekey_marks_to_txn right after the stop (and again
 			 * after the dst take), and the glue holds the split-CN
-			 * fence.  Under a
+			 * fence (ft_glue_lock_ctx carries that one).  Under a
 			 * coarse spacing this publish parent anchors onto one of
 			 * them -- the trie root, for an in-trie move -- and a
 			 * frame naming neither refuses the op's own fence.
 			 */
-			lctx_src.held.extra = marks;
-			lctx_src.held.nr_extra = nr_marks;
-			lctx_src.held.glue = &glue;
+			ppctx.held.extra = marks;
+			ppctx.held.nr_extra = nr_marks;
 			pp_meta = ft_flag_to_metadata(ft, glue.publish_parent);
 			unsigned int ppd;
 
@@ -6191,9 +6233,9 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 			 * descent step, so the window is what dates it; a node
 			 * this descent never passed voids the attempt.
 			 */
-			if (!ft_lock_ctx_depth_of(ft, &lctx_src,
+			if (!ft_lock_ctx_depth_of(ft, &ppctx,
 						glue.publish_parent, &ppd) ||
-					ft_acquire_member(ft, &lctx_src,
+					ft_acquire_member(ft, &ppctx,
 						glue.publish_parent, pp_meta,
 						ppd, &pph)) {
 				pp_meta = NULL;
