@@ -82,7 +82,7 @@
  */
 /* +4 inv_prefix_head_*_key_identity; +2 inv_split_point_lookup_identity*;
  * +2 inv_absent_key_never_found* */
-#define NR_TESTS	(115 + NR_TESTS_REKEY_DLM)
+#define NR_TESTS	(120 + NR_TESTS_REKEY_DLM)
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -8802,6 +8802,8 @@ static struct cds_ft *create_varlen_fine_lock_cfg_ft(
  * the live total, and cds_ft_verify passes (a node lock leaked by a dropped
  * bail path surfaces here).
  */
+static void drain_trie_local(struct cds_ft *ft);	/* defined below */
+
 #define MW_XT_NR_WRITERS	16
 #define MW_XT_PREFIXES		64	/* shared prefix byte p in [0, this) */
 #define MW_XT_SUFFIXES		4	/* keys grafted per prefix */
@@ -8833,14 +8835,50 @@ static struct cds_ft *create_varlen_fine_lock_cfg_ft(
 #define MW_XT_ATTACH_MERGE_SUBPOS	2
 #define MW_XT_ATTACH_GRAFT_NILKEY	3
 #define MW_XT_ATTACH_MERGE_NILKEY	4
+
+/*
+ * POINT writers (mw_xt_point_writer), spawned ALONGSIDE the bulk writers above
+ * when @nr_point > 0.  They carry writer ids MW_XT_NR_WRITERS .. +MW_XT_NR_POINT
+ * so their middle key byte is disjoint from every bulk writer's, but their keys
+ * {p, w, s} share the SAME {p} spine node -- so a point INSERT splits /
+ * recompacts the very node a live bulk attach or detach is locking.
+ *
+ * That is the bulk-vs-point arbitration the G5.25 gate exists for: a bulk op
+ * holds CDS_FT_SCOPED_BULK_GATE for its whole body, and a FINE point op's
+ * ft_writer_scope_enter sees ft_bulk_active() and ELEVATES to the FT-wide
+ * writer lock for that op (the "mode flip").  The existing bulk-only rows
+ * exercise point-REMOVE against an attach; insert is the harder direction
+ * (it SPLITS and PROMOTES, where remove only collapses), and @detach_teardown
+ * puts cds_ft_detach -- the other gate-holding bulk op -- on the other side.
+ *
+ * Point writers own their band exactly, so the oracle's per-writer shadow check
+ * is unchanged: their keys have the MW_XT_ATTACH_GRAFT shape ({p,w,s}) whatever
+ * the bulk writers' attach mode is, which is why @attach_mode lives per-writer.
+ */
+#define MW_XT_NR_POINT		8
+
 struct mw_xt_arg {
 	struct cds_ft *ft;			/* the shared LIVE dst */
 	struct cds_ft_group *group;
 	unsigned int w;				/* writer id (middle key byte) */
 	int attach_mode;			/* MW_XT_ATTACH_* */
+	bool point;				/* a mw_xt_point_writer, not a bulk one */
+	bool detach_teardown;			/* bulk: cds_ft_detach, not point-remove */
+	/*
+	 * The key band this writer owns: middle byte @mid, suffixes
+	 * [@sbase, @sbase + nsuffix).  Normally @mid == @w and @sbase == 0, so
+	 * every writer owns a whole middle byte.  An OVERLAP point writer
+	 * instead borrows a BULK writer's middle byte and takes the suffixes
+	 * above it, so the two share the {p,mid} node itself -- the node whose
+	 * child set the bulk attach rewrites wholesale -- not merely the {p}
+	 * node above it.
+	 */
+	unsigned int mid;
+	unsigned int sbase;
 	uint8_t present[MW_XT_PREFIXES];	/* 1 = {p,w,*} currently grafted */
 	struct ft_test_node *node[MW_XT_PREFIXES][MW_XT_SUFFIXES];
 	unsigned long ops;
+	unsigned long bulk_ops;			/* the attach / detach legs only */
 	int failed;
 };
 
@@ -8888,7 +8926,7 @@ static void *mw_xt_writer(void *arg)
 
 	while (!test_stop) {
 		unsigned int p = (unsigned int)(rand_r(&seed) % MW_XT_PREFIXES);
-		uint8_t prefix[2] = { (uint8_t) p, (uint8_t) x->w };
+		uint8_t prefix[2] = { (uint8_t) p, (uint8_t) x->mid };
 		unsigned int s;
 
 		if (!x->present[p]) {
@@ -8916,13 +8954,14 @@ static void *mw_xt_writer(void *arg)
 			if (cds_ft_create(x->group, NULL, &src) < 0)
 				abort();
 			for (s = 0; s < mw_xt_nsuffix(x->attach_mode); s++) {
-				uint8_t suffix[1] = { (uint8_t) s };
-				uint8_t sub_suffix[2] = { 0, (uint8_t) s };
+				unsigned int sk = x->sbase + s;
+				uint8_t suffix[1] = { (uint8_t) sk };
+				uint8_t sub_suffix[2] = { 0, (uint8_t) sk };
 				uint8_t full[3] = { (uint8_t) p,
-					(uint8_t) x->w, (uint8_t) s };
+					(uint8_t) x->mid, (uint8_t) sk };
 				struct ft_test_node *n = node_alloc(
 					((uint64_t) p << 16)
-					| ((uint64_t) x->w << 8) | s);
+					| ((uint64_t) x->mid << 8) | sk);
 
 				memcpy(n->okey, full, 3);
 				/*
@@ -8982,12 +9021,47 @@ static void *mw_xt_writer(void *arg)
 			}
 			cds_ft_destroy(src);		/* emptied by the graft */
 			x->present[p] = 1;
+			x->bulk_ops++;
+		} else if (x->detach_teardown) {
+			/*
+			 * Tear the prefix down with cds_ft_detach -- the OTHER
+			 * gate-holding bulk op -- instead of the point-remove
+			 * loop, so both halves of this writer's cycle are bulk
+			 * ops and a concurrent mw_xt_point_writer meets a detach
+			 * as well as an attach.  Detaching at {p,w} takes every
+			 * landed key of the prefix whatever the attach mode
+			 * (the nil-key modes land the lone {p,w} itself).
+			 */
+			struct cds_ft *detached = NULL;
+
+			if (cds_ft_detach(x->ft, prefix, 2, &detached)
+					!= CDS_FT_STATUS_OK || !detached) {
+				fprintf(stderr, "xt writer %u prefix p=%u: detach "
+					"failed on its own present prefix\n",
+					x->w, p);
+				x->failed = 1;
+				mw_violation_snapshot();
+				break;
+			}
+			/*
+			 * The detached trie is EXCLUSIVE and unreachable to any
+			 * peer, so draining it locally is safe; node_free_rcu
+			 * still defers the nodes past any in-flight reader that
+			 * resolved them before the detach.
+			 */
+			drain_trie_local(detached);
+			cds_ft_destroy(detached);
+			x->bulk_ops++;
+			for (s = 0; s < mw_xt_nsuffix(x->attach_mode); s++)
+				x->node[p][s] = NULL;
+			x->present[p] = 0;
 		} else {
 			/* Point-remove every key of this prefix, then re-arm. */
 			for (s = 0; s < mw_xt_nsuffix(x->attach_mode); s++) {
 				uint8_t full[3];
 				size_t full_len = mw_xt_landed_key(
-					x->attach_mode, p, x->w, s, full);
+					x->attach_mode, p, x->mid,
+					x->sbase + s, full);
 				struct cds_ft_node *found;
 
 				rcu_read_lock();
@@ -9024,22 +9098,139 @@ out:
 }
 
 /*
+ * A POINT writer running against the bulk writers above (see MW_XT_NR_POINT).
+ * Its band is {p, w, s} with w >= MW_XT_NR_WRITERS, so its shadow is exact, but
+ * the {p} spine node it splits and collapses is shared with every bulk writer's
+ * attach / detach point.
+ *
+ * The step alternates per prefix exactly as the bulk writer does -- absent =>
+ * INSERT the S keys, present => point-REMOVE them -- so both point directions
+ * run while a peer holds the bulk gate.  The insert leg is the one the bulk-only
+ * rows never exercised: an append/split under a live attach, where the bulk op's
+ * lock set was computed from a descent this split can invalidate.
+ */
+static void *mw_xt_point_writer(void *arg)
+{
+	struct mw_xt_arg *x = (struct mw_xt_arg *) arg;
+	struct cds_ft_iter *iter;
+	unsigned int seed = (unsigned int)(uintptr_t) x + 0x85ebca6bu;
+
+	rcu_register_thread();
+	if (cds_ft_iter_create(x->ft, &iter) < 0)
+		abort();
+	while (!test_go)
+		;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	while (!test_stop) {
+		unsigned int p = (unsigned int)(rand_r(&seed) % MW_XT_PREFIXES);
+		unsigned int s;
+
+		if (!x->present[p]) {
+			for (s = 0; s < MW_XT_SUFFIXES; s++) {
+				unsigned int sk = x->sbase + s;
+				uint8_t full[3] = { (uint8_t) p,
+					(uint8_t) x->mid, (uint8_t) sk };
+				struct ft_test_node *n = node_alloc(
+					((uint64_t) p << 16)
+					| ((uint64_t) x->mid << 8) | sk);
+
+				memcpy(n->okey, full, 3);
+				rcu_read_lock();
+				if (cds_ft_insert(x->ft, full, 3, &n->node)
+						!= CDS_FT_STATUS_OK) {
+					rcu_read_unlock();
+					/*
+					 * {p,w,s} is this writer's own and was
+					 * absent, so the insert cannot legally
+					 * fail: a refusal here means a bulk peer's
+					 * unserialized edit was visible mid-insert
+					 * (the elevation did not happen).  Leave
+					 * @n unfreed rather than risk a teardown
+					 * UAF on the error path -- the message is
+					 * the reported violation.
+					 */
+					fprintf(stderr, "xt point writer %u key "
+						"{%u,%u,%u}: insert failed on an "
+						"absent own key\n", x->w, p,
+						x->mid, sk);
+					x->failed = 1;
+					mw_violation_snapshot();
+					goto out;
+				}
+				rcu_read_unlock();
+				x->node[p][s] = n;
+			}
+			x->present[p] = 1;
+		} else {
+			for (s = 0; s < MW_XT_SUFFIXES; s++) {
+				unsigned int sk = x->sbase + s;
+				uint8_t full[3] = { (uint8_t) p,
+					(uint8_t) x->mid, (uint8_t) sk };
+				struct cds_ft_node *found;
+
+				rcu_read_lock();
+				cds_ft_iter_set_key(iter, full, 3);
+				cds_ft_lookup(x->ft, iter);
+				found = cds_ft_iter_node(iter);
+				if (found != &x->node[p][s]->node) {
+					fprintf(stderr, "xt point writer %u key "
+						"{%u,%u,%u}: live but found %p "
+						"!= mine %p\n", x->w, p, x->mid, sk,
+						(void *) found,
+						(void *) &x->node[p][s]->node);
+					x->failed = 1;
+					rcu_read_unlock();
+					mw_violation_snapshot();
+					goto out;
+				}
+				if (cds_ft_remove(x->ft, iter, found)
+						== CDS_FT_STATUS_OK)
+					node_free_rcu(to_test_node(found));
+				rcu_read_unlock();
+				x->node[p][s] = NULL;
+			}
+			x->present[p] = 0;
+		}
+		x->ops++;
+		if ((seed & 0x3f) == 0)
+			rcu_quiescent_state();
+	}
+out:
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+/*
  * See the block comment on mw_xt_writer.  Endpoints checked at quiescence: no
  * grafted key lost (resolves to the owning writer's node), count_keys equals
  * the live total, and cds_ft_verify reports no leaked node lock.
  */
 static int mw_xt_oracle(const char *tname, int attach_mode, bool list_on,
-		bool rank_on)
+		bool rank_on, unsigned int nr_point, bool detach_teardown,
+		bool overlap)
 {
 	struct cds_ft_group *group;
 	struct cds_ft *ft;
 	struct mw_xt_arg *x;
 	struct cds_ft_iter *iter;
-	pthread_t writers[MW_XT_NR_WRITERS];
+	pthread_t writers[MW_XT_NR_WRITERS + MW_XT_NR_POINT];
 	struct timespec t0;
-	unsigned long total_ops = 0, live = 0;
+	unsigned long total_ops = 0, total_bulk = 0, live = 0;
+	unsigned int nr_total = MW_XT_NR_WRITERS + nr_point;
 	unsigned int i, p, s;
 	int ret = 0;
+
+	assert(nr_point <= MW_XT_NR_POINT);
+	/*
+	 * An OVERLAP point writer shares a bulk writer's middle byte, so there
+	 * must be a bulk writer per point writer, and the two bands together must
+	 * fit one suffix byte.  Detaching {p,mid} would take the point writer's
+	 * keys with it, so the two are mutually exclusive.
+	 */
+	assert(!overlap || (nr_point <= MW_XT_NR_WRITERS && !detach_teardown
+			&& 2 * MW_XT_SUFFIXES <= 256));
 
 	if (!getenv("FT_INV_MW")) {
 		fprintf(stderr, "# %s: skipped "
@@ -9062,21 +9253,43 @@ static int mw_xt_oracle(const char *tname, int attach_mode, bool list_on,
 
 	leak_reset();
 
-	x = (struct mw_xt_arg *) calloc(MW_XT_NR_WRITERS, sizeof(*x));
+	x = (struct mw_xt_arg *) calloc(nr_total, sizeof(*x));
 	if (!x)
 		abort();
-	for (i = 0; i < MW_XT_NR_WRITERS; i++) {
+	for (i = 0; i < nr_total; i++) {
 		x[i].ft = ft;
 		x[i].group = group;
 		x[i].w = i;
-		x[i].attach_mode = attach_mode;
+		/*
+		 * A point writer's keys are always {p,w,s} (the GRAFT shape)
+		 * whatever the bulk writers attach, so every shape helper and
+		 * the verify loop read the mode off the WRITER, not off this
+		 * oracle's argument.
+		 */
+		x[i].point = i >= MW_XT_NR_WRITERS;
+		x[i].attach_mode = x[i].point ? MW_XT_ATTACH_GRAFT : attach_mode;
+		x[i].detach_teardown = !x[i].point && detach_teardown;
+		/*
+		 * Disjoint bands by default (one middle byte each).  @overlap
+		 * instead aims point writer j at bulk writer j's own {p,j}, one
+		 * suffix block higher, so the bulk attach rewrites the very node
+		 * the point keys hang off.
+		 */
+		if (x[i].point && overlap) {
+			x[i].mid = i - MW_XT_NR_WRITERS;
+			x[i].sbase = MW_XT_SUFFIXES;
+		} else {
+			x[i].mid = i;
+			x[i].sbase = 0;
+		}
 	}
 
 	test_go = 0;
 	test_stop = 0;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	for (i = 0; i < MW_XT_NR_WRITERS; i++)
-		pthread_create(&writers[i], NULL, mw_xt_writer, &x[i]);
+	for (i = 0; i < nr_total; i++)
+		pthread_create(&writers[i], NULL,
+			x[i].point ? mw_xt_point_writer : mw_xt_writer, &x[i]);
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 	test_go = 1;
 
@@ -9086,7 +9299,7 @@ static int mw_xt_oracle(const char *tname, int attach_mode, bool list_on,
 		usleep(1000);
 	test_stop = 1;
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
-	for (i = 0; i < MW_XT_NR_WRITERS; i++)
+	for (i = 0; i < nr_total; i++)
 		pthread_join(writers[i], NULL);
 	rcu_thread_online();
 
@@ -9095,17 +9308,19 @@ static int mw_xt_oracle(const char *tname, int attach_mode, bool list_on,
 	if (cds_ft_iter_create(ft, &iter) < 0)
 		abort();
 	rcu_read_lock();
-	for (i = 0; i < MW_XT_NR_WRITERS; i++) {
+	for (i = 0; i < nr_total; i++) {
 		total_ops += x[i].ops;
+		total_bulk += x[i].bulk_ops;
 		if (x[i].failed)
 			ret = -1;
 		for (p = 0; p < MW_XT_PREFIXES; p++) {
 			if (!x[i].present[p])
 				continue;
-			for (s = 0; s < mw_xt_nsuffix(attach_mode); s++) {
+			for (s = 0; s < mw_xt_nsuffix(x[i].attach_mode); s++) {
 				uint8_t full[3];
 				size_t full_len = mw_xt_landed_key(
-					attach_mode, p, i, s, full);
+					x[i].attach_mode, p, x[i].mid,
+					x[i].sbase + s, full);
 				struct cds_ft_node *found;
 
 				live++;
@@ -9115,7 +9330,8 @@ static int mw_xt_oracle(const char *tname, int attach_mode, bool list_on,
 				if (found != &x[i].node[p][s]->node) {
 					fprintf(stderr, "xt final: writer %u key "
 						"{%u,%u,%u} lost (found %p != "
-						"%p)\n", i, p, i, s,
+						"%p)\n", i, p, x[i].mid,
+						x[i].sbase + s,
 						(void *) found,
 						(void *) &x[i].node[p][s]->node);
 					ret = -1;
@@ -9135,8 +9351,17 @@ static int mw_xt_oracle(const char *tname, int attach_mode, bool list_on,
 	rcu_read_unlock();
 	cds_ft_iter_destroy(iter);
 
-	fprintf(stderr, "# %s: %d writers, %lu ops, %lu live keys\n",
-		tname, MW_XT_NR_WRITERS, total_ops, live);
+	/*
+	 * ★ REPORT THE BULK OP COUNT SEPARATELY.  A mixed total hides the bulk
+	 * leg: a bulk op builds and consumes a whole source trie and passes
+	 * through the gate, so it is far more expensive than a point op, and a row
+	 * can look busy on @total_ops while having opened only a handful of bulk
+	 * windows.  @total_bulk is the number the bulk-vs-point coverage claim
+	 * actually rests on.
+	 */
+	fprintf(stderr, "# %s: %d bulk + %u point writers, %lu ops "
+		"(%lu bulk), %lu live keys\n", tname, MW_XT_NR_WRITERS,
+		nr_point, total_ops, total_bulk, live);
 
 	free(x);
 	if (drain_and_destroy(ft, group) < 0)
@@ -9150,7 +9375,9 @@ static int mw_xt_oracle(const char *tname, int attach_mode, bool list_on,
 static int inv_concurrent_crosstrie_fine_lock(void)
 {
 	return mw_xt_oracle("inv_concurrent_crosstrie_fine_lock",
-		MW_XT_ATTACH_GRAFT, /*list_on=*/ false, /*rank_on=*/ false);
+		MW_XT_ATTACH_GRAFT, /*list_on=*/ false, /*rank_on=*/ false,
+		/*nr_point=*/ 0, /*detach_teardown=*/ false,
+		/*overlap=*/ false);
 }
 
 /*
@@ -9163,7 +9390,9 @@ static int inv_concurrent_crosstrie_merge_fine_lock(void)
 {
 	INV_NEED_MERGE("inv_concurrent_crosstrie_merge_fine_lock");
 	return mw_xt_oracle("inv_concurrent_crosstrie_merge_fine_lock",
-		MW_XT_ATTACH_MERGE_SUBPOS, /*list_on=*/ false, /*rank_on=*/ false);
+		MW_XT_ATTACH_MERGE_SUBPOS, /*list_on=*/ false, /*rank_on=*/ false,
+		/*nr_point=*/ 0, /*detach_teardown=*/ false,
+		/*overlap=*/ false);
 }
 
 /*
@@ -9180,7 +9409,9 @@ static int inv_concurrent_crosstrie_merge_fine_lock(void)
 static int inv_concurrent_crosstrie_graft_nilkey_fine_lock(void)
 {
 	return mw_xt_oracle("inv_concurrent_crosstrie_graft_nilkey_fine_lock",
-		MW_XT_ATTACH_GRAFT_NILKEY, /*list_on=*/ false, /*rank_on=*/ false);
+		MW_XT_ATTACH_GRAFT_NILKEY, /*list_on=*/ false, /*rank_on=*/ false,
+		/*nr_point=*/ 0, /*detach_teardown=*/ false,
+		/*overlap=*/ false);
 }
 
 /*
@@ -9196,7 +9427,9 @@ static int inv_concurrent_crosstrie_merge_nilkey_fine_lock(void)
 {
 	INV_NEED_MERGE("inv_concurrent_crosstrie_merge_nilkey_fine_lock");
 	return mw_xt_oracle("inv_concurrent_crosstrie_merge_nilkey_fine_lock",
-		MW_XT_ATTACH_MERGE_NILKEY, /*list_on=*/ false, /*rank_on=*/ false);
+		MW_XT_ATTACH_MERGE_NILKEY, /*list_on=*/ false, /*rank_on=*/ false,
+		/*nr_point=*/ 0, /*detach_teardown=*/ false,
+		/*overlap=*/ false);
 }
 
 /*
@@ -9212,7 +9445,9 @@ static int inv_concurrent_crosstrie_merge_nilkey_fine_lock(void)
 static int inv_concurrent_crosstrie_graft_ord_fine_lock(void)
 {
 	return mw_xt_oracle("inv_concurrent_crosstrie_graft_ord_fine_lock",
-		MW_XT_ATTACH_GRAFT, /*list_on=*/ true, /*rank_on=*/ false);
+		MW_XT_ATTACH_GRAFT, /*list_on=*/ true, /*rank_on=*/ false,
+		/*nr_point=*/ 0, /*detach_teardown=*/ false,
+		/*overlap=*/ false);
 }
 
 /*
@@ -9229,7 +9464,150 @@ static int inv_concurrent_crosstrie_graft_ord_fine_lock(void)
 static int inv_concurrent_crosstrie_graft_rank_coarse_lock(void)
 {
 	return mw_xt_oracle("inv_concurrent_crosstrie_graft_rank_coarse_lock",
-		MW_XT_ATTACH_GRAFT, /*list_on=*/ false, /*rank_on=*/ true);
+		MW_XT_ATTACH_GRAFT, /*list_on=*/ false, /*rank_on=*/ true,
+		/*nr_point=*/ 0, /*detach_teardown=*/ false,
+		/*overlap=*/ false);
+}
+
+/*
+ * INVARIANT (G5.25 bulk gate): POINT writers and BULK writers mutate one shared
+ * LIVE FINE trie concurrently without losing a key or corrupting the structure.
+ *
+ * This is the bulk-vs-point half of the writer-strategy contract, and it is the
+ * one the rows above do NOT cover.  They pair a bulk ATTACH with a point REMOVE
+ * inside the SAME writer, so every writer is serialized against itself and the
+ * only cross-writer pair soaked is attach-vs-attach (plus attach-vs-remove of a
+ * disjoint band).  Here 16 bulk writers cycle attach/teardown while 8 separate
+ * point writers INSERT and REMOVE keys under the same {p} spine nodes, so the
+ * soaked pairs include point-insert-vs-attach -- the direction where the point
+ * op SPLITS and PROMOTES the node the bulk op's lock set was computed over.
+ *
+ * The mechanism under test is the mode flip: a bulk op holds
+ * CDS_FT_SCOPED_BULK_GATE for its whole body, and a FINE point op's
+ * ft_writer_scope_enter sees ft_bulk_active() and takes the FT-wide writer lock
+ * for that op instead of descending under per-node DLM locks alone.  Point and
+ * bulk writers therefore arbitrate on ONE word -- and the gate holder elevates
+ * too, so both sides really are on that word (measured: every FT-wide take in
+ * these rows is gate-driven, and self-takes == gate entries exactly).
+ *
+ * ★ MEASURE THE BULK LEG, NOT THE OP TOTAL.  A bulk op builds and consumes a
+ * whole source trie and passes the gate, so it is ~100x a point op: a 200 ms
+ * row runs ~6500 point ops but only ~32 BULK ops (two per bulk writer).  The
+ * reported "(N bulk)" is the coverage number -- the ~6100 point ops that
+ * elevated inside those 32 windows are what is soaked, not 6500 bulk windows.
+ * Raising the elevation's cost is visible here too: at FT_BULK_WIDE_LOCK=0 the
+ * same rows run ~80 bulk ops, so the flip costs ~2.5x of the bulk leg.
+ *
+ * ★ AND WHICH ROW ADJUDICATES.  Built and measured against the no-elevation
+ * red control (a -DFT_BULK_WIDE_LOCK=0 build, which by its own comment has "NO
+ * bulk-vs-point exclusion at all"):
+ *   _detach   4/5 runs RED   <- this is the discriminating row
+ *   _overlap  1/6 runs RED
+ *   _graft    0/6, _merge 0/6, _ord 0/6
+ * So graft / merge_at against point ops SOAK the pairing without adjudicating
+ * it -- for those shapes the per-node DLM lock-sets already arbitrate, and the
+ * elevation is a conservative cover.  Keep them for the soak, but read a green
+ * on them as "no regression", never as "the gate is load-bearing here".
+ */
+static int inv_concurrent_point_vs_bulk_graft(void)
+{
+	return mw_xt_oracle("inv_concurrent_point_vs_bulk_graft",
+		MW_XT_ATTACH_GRAFT, /*list_on=*/ false, /*rank_on=*/ false,
+		/*nr_point=*/ MW_XT_NR_POINT, /*detach_teardown=*/ false,
+		/*overlap=*/ false);
+}
+
+/*
+ * As above, but each bulk writer tears its prefix down with cds_ft_detach
+ * instead of point-removing the landed keys, so BOTH legs of every bulk
+ * writer's cycle hold the bulk gate and the point writers meet a detach as well
+ * as a graft.  cds_ft_detach is the other CDS_FT_SCOPED_BULK_GATE holder
+ * (ft-detach.h), and it differs from the attach in what it does to the spine:
+ * it EXCISES a subtree and can collapse / recompact the {p} node the point
+ * writers' own keys hang off, where the graft only adds a child.  A point
+ * insert that derived its descent before such a collapse is exactly what the
+ * elevation has to exclude.
+ *
+ * ★ THE RED CONTROL FIRES HERE, and only here: on a -DFT_BULK_WIDE_LOCK=0 build
+ * this row fails 4 runs in 5, while the shipping build passed 8 for 8.  The
+ * signature is the bulk op failing on its OWN live region --
+ *   xt writer 3 prefix p=59: detach failed on its own present prefix
+ * -- several writers per run, which is a detach walking a spine an unserialized
+ * point insert/remove is restructuring underneath it.  That makes this row the
+ * regression guard for the G5.25 elevation itself, not just a soak.
+ */
+static int inv_concurrent_point_vs_bulk_detach(void)
+{
+	return mw_xt_oracle("inv_concurrent_point_vs_bulk_detach",
+		MW_XT_ATTACH_GRAFT, /*list_on=*/ false, /*rank_on=*/ false,
+		/*nr_point=*/ MW_XT_NR_POINT, /*detach_teardown=*/ true,
+		/*overlap=*/ false);
+}
+
+/*
+ * As inv_concurrent_point_vs_bulk_graft but the bulk side is cds_ft_merge_at
+ * moving a src SUB-position: the merge's build -> unlink -> commit carries a
+ * longer gate-held body than cds_ft_graft's whole-source delegate, so the point
+ * writers' elevation window is correspondingly wider.
+ */
+static int inv_concurrent_point_vs_bulk_merge(void)
+{
+	INV_NEED_MERGE("inv_concurrent_point_vs_bulk_merge");
+	return mw_xt_oracle("inv_concurrent_point_vs_bulk_merge",
+		MW_XT_ATTACH_MERGE_SUBPOS, /*list_on=*/ false,
+		/*rank_on=*/ false,
+		/*nr_point=*/ MW_XT_NR_POINT, /*detach_teardown=*/ false,
+		/*overlap=*/ false);
+}
+
+/*
+ * As inv_concurrent_point_vs_bulk_graft with the ordered list ON: the trie stays
+ * FINE (rank stats off), so every point insert and remove also splices the
+ * ordered-list cells that the bulk attach's GLUE commit folds in.  Those cell
+ * edges are the one place a point op and a bulk op write slots neither of them
+ * owns by key band, so if the elevation were missing here the failure would be
+ * an ordered-list divergence rather than a lost key -- teardown_walk_check and
+ * cds_ft_verify catch it.
+ */
+static int inv_concurrent_point_vs_bulk_ord(void)
+{
+	return mw_xt_oracle("inv_concurrent_point_vs_bulk_ord",
+		MW_XT_ATTACH_GRAFT, /*list_on=*/ true, /*rank_on=*/ false,
+		/*nr_point=*/ MW_XT_NR_POINT, /*detach_teardown=*/ false,
+		/*overlap=*/ false);
+}
+
+/*
+ * The SHARP bulk-vs-point arm: the point writers' keys hang directly off the
+ * node the bulk op rewrites.
+ *
+ * The rows above separate the two classes by middle key byte, so their only
+ * shared node is the {p} spine ABOVE the attach point, where a bulk op adds or
+ * removes a single child edge -- work the {p} node's own DLM lock already
+ * serializes against a point op's descent.  That is why they soak the pairing
+ * without adjudicating it.  Here point writer j borrows bulk writer j's middle
+ * byte and takes the suffix block above it ({p,j,4..7} against the bulk band
+ * {p,j,0..3}), so the bulk cds_ft_merge_at at {p,j} rewrites the CHILD SET the
+ * point writer is concurrently splitting and collapsing.  The keys stay
+ * disjoint, so each writer's shadow is still exact.
+ *
+ * cds_ft_merge_at is the attach for this arm because the target is OCCUPIED by
+ * construction whenever the point writer holds keys there -- cds_ft_graft wants
+ * a free position.  The teardown stays a point-remove of the bulk band alone:
+ * detaching {p,j} would carry the point writer's keys off with it.
+ *
+ * Measured against the no-elevation red control: 1 run in 6 RED -- sharper than
+ * the disjoint-band attach rows (0 in 6) and far blunter than _detach (4 in 5),
+ * so treat _detach as the guard and this as a second, weaker witness.
+ */
+static int inv_concurrent_point_vs_bulk_overlap(void)
+{
+	INV_NEED_MERGE("inv_concurrent_point_vs_bulk_overlap");
+	return mw_xt_oracle("inv_concurrent_point_vs_bulk_overlap",
+		MW_XT_ATTACH_MERGE_SUBPOS, /*list_on=*/ false,
+		/*rank_on=*/ false,
+		/*nr_point=*/ MW_XT_NR_POINT, /*detach_teardown=*/ false,
+		/*overlap=*/ true);
 }
 
 /*
@@ -23101,6 +23479,11 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_concurrent_crosstrie_graft_ord_fine_lock);
 	RUN_TEST(inv_concurrent_crosstrie_graft_rank_coarse_lock);
 	RUN_TEST(inv_concurrent_crosstrie_graft_swap_fine_lock);
+	RUN_TEST(inv_concurrent_point_vs_bulk_graft);
+	RUN_TEST(inv_concurrent_point_vs_bulk_detach);
+	RUN_TEST(inv_concurrent_point_vs_bulk_merge);
+	RUN_TEST(inv_concurrent_point_vs_bulk_ord);
+	RUN_TEST(inv_concurrent_point_vs_bulk_overlap);
 	RUN_TEST(inv_bind_resume_order);
 	RUN_TEST(inv_ordered_bulk_consistency);
 	RUN_TEST(inv_compact_keycopy_terminates);

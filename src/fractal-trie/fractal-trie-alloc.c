@@ -2580,3 +2580,27 @@ static void ft_red_rekey_nolock_report(void)
 		uatomic_load(&ft_red_rekey_nolock_taken, CMM_RELAXED));
 }
 #endif
+
+#ifdef FT_DEBUG_BULK_ELEV
+unsigned long ft_bulk_elev_self;
+unsigned long ft_bulk_elev_peer;
+unsigned long ft_bulk_take_self;
+unsigned long ft_bulk_take_peer;
+unsigned long ft_bulk_gate_calls;
+unsigned long ft_bulk_scope_under_gate;
+
+__attribute__((destructor))
+static void ft_bulk_elev_report(void)
+{
+	fprintf(stderr, "# FT_DEBUG_BULK_ELEV elev self=%lu peer=%lu  "
+		"wide_lock_taken self=%lu peer=%lu\n",
+		uatomic_load(&ft_bulk_elev_self, CMM_RELAXED),
+		uatomic_load(&ft_bulk_elev_peer, CMM_RELAXED),
+		uatomic_load(&ft_bulk_take_self, CMM_RELAXED),
+		uatomic_load(&ft_bulk_take_peer, CMM_RELAXED));
+	fprintf(stderr, "# FT_DEBUG_BULK_ELEV gate_calls=%lu "
+		"outer_scopes_under_own_gate=%lu\n",
+		uatomic_load(&ft_bulk_gate_calls, CMM_RELAXED),
+		uatomic_load(&ft_bulk_scope_under_gate, CMM_RELAXED));
+}
+#endif

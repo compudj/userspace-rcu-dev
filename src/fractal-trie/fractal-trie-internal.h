@@ -2735,6 +2735,40 @@ static __thread int ft_red_rekey_nolock;
 extern unsigned long ft_red_rekey_nolock_taken;	/* GLOBAL: outlives the writers */
 #endif
 
+#ifdef FT_DEBUG_BULK_ELEV
+/*
+ * ★ COUNT THE ARM (G5.25 bulk gate).  A test that mixes bulk and point writers
+ * is only testing the bulk-vs-point pairing if the point ops actually LAND in a
+ * bulk window; otherwise its green says nothing about the gate.  These count
+ * every writer scope that took the FT-wide lock BECAUSE the gate was up, split
+ * by who is asking:
+ *
+ *   @ft_bulk_elev_self  the bulk op's OWN scope, inside its own gate.  Nonzero
+ *                       says the gate-holder elevates too -- i.e. the FT-wide
+ *                       lock really is the word both sides meet on.  Zero says
+ *                       the bulk op opted out and the gate only serializes
+ *                       point ops against each other for its duration.
+ *   @ft_bulk_elev_peer  a PEER op that found the gate up and elevated.  This is
+ *                       the coverage number: it is how many point ops ran
+ *                       inside a bulk window.
+ *
+ * Debug-only, and the thread depth is the only way to tell the two apart (the
+ * gate word itself cannot say who raised it -- it is refcounted).
+ */
+extern unsigned long ft_bulk_elev_self;
+extern unsigned long ft_bulk_elev_peer;
+static __thread unsigned long ft_bulk_gate_depth;
+/*
+ * And the same split over the OUTERMOST scopes that actually TAKE the FT-wide
+ * lock (reentrant nested scopes are excluded -- they hold it already).  These
+ * say who is on the lock, where the pair above says who was asked to elevate.
+ */
+extern unsigned long ft_bulk_take_self;
+extern unsigned long ft_bulk_take_peer;
+extern unsigned long ft_bulk_gate_calls;	/* ft_bulk_gate_enter calls */
+extern unsigned long ft_bulk_scope_under_gate;	/* outer scopes with depth > 0 */
+#endif
+
 /*
  * The access validator's writer OWNER word follows the FT-WIDE LOCK, not the
  * writer scope, and ft_writer_lock_gp_wait is why.  That function drops the lock
@@ -3050,6 +3084,14 @@ void ft_writer_lock_scope_enter(struct cds_ft *ft)
 		return;
 	}
 #endif
+#ifdef FT_DEBUG_BULK_ELEV
+	if (ft_bulk_gate_depth)
+		uatomic_inc(&ft_bulk_scope_under_gate);
+	if (ft->lock_fine && FT_BULK_WIDE_LOCK
+			&& caa_unlikely(ft_bulk_active(ft)))
+		uatomic_inc(ft_bulk_gate_depth ? &ft_bulk_elev_self
+			: &ft_bulk_elev_peer);
+#endif
 	if (ft->lock_fine &&
 			!(FT_BULK_WIDE_LOCK && caa_unlikely(ft_bulk_active(ft)))) {
 		/*
@@ -3111,6 +3153,10 @@ void ft_writer_lock_scope_enter(struct cds_ft *ft)
 		fflush(stderr);
 		abort();
 	}
+#ifdef FT_DEBUG_BULK_ELEV
+	uatomic_inc(ft_bulk_gate_depth ? &ft_bulk_take_self
+		: &ft_bulk_take_peer);
+#endif
 	ft_writer_lock_take(ft);
 	ft_wlock_held = ft;
 	ft_wlock_depth = 1;
@@ -3696,6 +3742,11 @@ void ft_bulk_gate_enter(struct cds_ft *ft, enum ft_bulk_kind kind)
 {
 	bool own_gp = false;
 
+#ifdef FT_DEBUG_BULK_ELEV
+	ft_bulk_gate_depth++;		/* see @ft_bulk_elev_self */
+	uatomic_inc(&ft_bulk_gate_calls);
+#endif
+
 #ifdef FT_DEBUG_WIDEN_OWNER
 	/*
 	 * ☠ THE CONTROL FOR THE OTHER ZERO, and it must live under THIS flag.
@@ -3835,6 +3886,9 @@ static inline
 void ft_bulk_gate_exit(struct cds_ft *ft, enum ft_bulk_kind kind)
 {
 	ft_bulk_self_depth--;
+#ifdef FT_DEBUG_BULK_ELEV
+	ft_bulk_gate_depth--;		/* see @ft_bulk_elev_self */
+#endif
 	pthread_mutex_lock(&ft->move_gate_lock);
 	/*
 	 * Each word clears on ITS OWN refcount reaching zero.  No grace period
