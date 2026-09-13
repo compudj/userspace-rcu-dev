@@ -3783,10 +3783,21 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 	struct cds_ft_inode_flag *snapshot[FT_MAX_DEPTH];
 	unsigned int snapshot_depth[FT_MAX_DEPTH];
 	int nr_snapshot = 0;
-	int ret;
+	/* 0, not indeterminate: the retry tick at the loop head reads it as the
+	 * PREVIOUS attempt's outcome, and the first attempt has no predecessor. */
+	int ret = 0;
 	struct ft_ord_cell *precell;
 	void *cell = NULL;		/* @precell's carrier; reused across retries */
 	struct urcu_txn optxn;
+	/*
+	 * ★ THE LOOP BELOW WAS UNINSTRUMENTED, and that is why nothing has ever
+	 * reported a livelock in it.  restart_replace_attempt carried no
+	 * ft_op_retry_tick, so an attempt that can never converge is an INVISIBLE
+	 * SPIN -- no cap, no violation event, no descriptor dump; it presents as
+	 * the suite simply never finishing.  Every other retrying point op has
+	 * one (cds_ft_insert, cds_ft_remove, cds_ft_replace, cds_ft_remove_all).
+	 */
+	struct ft_op_retry op_retry;
 	struct ft_insert_commit ic = { 0 };
 	/*
 	 * The attach's recompactions lock {C, P, GP}; @d dates them and @ic.txn
@@ -3797,6 +3808,7 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 	enum urcu_txn_status cst = URCU_TXN_STATUS_OK;	/* one-commit outcome */
 
 	*old_node_ret = NULL;
+	ft_op_retry_init(&op_retry, FT_OP_INSERT_REPLACE, _key, key_len);
 
 	if (!valid_external_node(node) || !valid_key_len(ft, key_len))
 		return -EINVAL;
@@ -3844,6 +3856,7 @@ int _cds_ft_insert_replace(struct cds_ft *ft,
 	ft_txn_op_init(ft, &optxn);
 
 restart_replace_attempt:
+	ft_op_retry_tick(ft, &op_retry, ret);
 	urcu_txn_begin(&optxn);
 	/*
 	 * Per-attempt state.  A bailed attempt published nothing and its fresh
@@ -4130,11 +4143,36 @@ restart_replace_attempt:
 						ft_get_parent_slot(cn_meta, ft);
 
 					if (sslot && ft_node_skip_compressed(*sslot)) {
-						/* edge 0: grandparent SKIP_X dual. */
+						/*
+						 * ☠ BOTH EXPECTED-OLDS ARE RESOLVED, and both
+						 * used to be RAW loads.  Nothing is held here:
+						 * this pair is derived before the commit, and a
+						 * same-key peer's commit can have a flip proxy
+						 * PARKED on either word at the instant it is
+						 * read.  Handing that descriptor to the engine
+						 * as an expected-old trips its own
+						 * raw-read-of-a-parked-slot self-check --
+						 * measured, `urcu_txn_add: Assertion
+						 * `!urcu_txn_is_proxy(old_ptr, tag)' failed`
+						 * (tag 15, kind MW), reproducible in ~2.5 min by
+						 * inv_concurrent_insert_replace_nolist.
+						 *
+						 * ☠ AND A RELEASE BUILD HAS NO SUCH ASSERT: the
+						 * op would POISON the descriptor and its own
+						 * retry loop would absorb it, so the arm reads
+						 * green and is wrong.  Resolved, each value is
+						 * the word before or after that peer's commit
+						 * and never a descriptor; a STALE-but-valid one
+						 * simply fails this MW edge's install CAS, which
+						 * is an ABORT the retry loop re-derives from --
+						 * the same discipline cds_ft_remove's cell
+						 * capture and ft_graft's publish slot follow.
+						 */
 						sedges[0].slot =
 							(struct ft_ord_cell **) sslot;
 						sedges[0].old_target =
-							(struct ft_ord_cell *) *sslot;
+							(struct ft_ord_cell *)
+							ft_resolve_flip_proxy(*sslot);
 						sedges[0].new_target =
 							(struct ft_ord_cell *)
 							ft_skip_compressed_flag(
@@ -4144,7 +4182,8 @@ restart_replace_attempt:
 						sedges[1].slot =
 							(struct ft_ord_cell **) &cn->child;
 						sedges[1].old_target =
-							(struct ft_ord_cell *) cn->child;
+							(struct ft_ord_cell *)
+							ft_resolve_flip_proxy(cn->child);
 						sedges[1].new_target =
 							(struct ft_ord_cell *) node;
 						n_sedge = 2;

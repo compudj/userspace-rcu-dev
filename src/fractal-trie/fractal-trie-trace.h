@@ -303,6 +303,7 @@ enum ft_op_kind {
 	FT_OP_REPLACE,
 	FT_OP_REKEY,
 	FT_OP_REMOVE_ALL,
+	FT_OP_INSERT_REPLACE,
 };
 
 /*

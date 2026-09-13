@@ -82,7 +82,7 @@
  */
 /* +4 inv_prefix_head_*_key_identity; +2 inv_split_point_lookup_identity*;
  * +2 inv_absent_key_never_found* */
-#define NR_TESTS	(127 + NR_TESTS_REKEY_DLM)
+#define NR_TESTS	(129 + NR_TESTS_REKEY_DLM)
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -24397,6 +24397,439 @@ static int inv_concurrent_remove_all_prefix_coarse(void)
 }
 
 /*
+ * cds_ft_insert_replace vs a same-key peer, under CDS_FT_WRITER_LOCK_FINE.
+ *
+ * WHY THIS ROW EXISTS, AND WHY IT IS NOT SHAPED LIKE THE OTHER FOUR.
+ * cds_ft_insert_replace is the LAST point op of the fine-locking transition,
+ * and it is the MIRROR of cds_ft_remove_all: remove_all had the exclusion and
+ * lacked the loop, this one HAS the loop.  Enumerating its exits says so --
+ * `_cds_ft_insert_replace` has three entry `return`s and ONE tail `return ret`,
+ * every `ret = -EAGAIN` is set BEFORE `insert_replace_done:`, and the handler
+ * there re-attempts on a PERSISTENT urcu_txn that ages the conflict.  So the
+ * public `if (ret == -EAGAIN) return CDS_FT_STATUS_BUSY_ERROR` is dead code.
+ *
+ * ⇒ ★ A BUSY COUNT CANNOT BE THIS ROW'S ORACLE, the way it was remove_all's.
+ * The op will never report BUSY; if its exclusion is wrong it SPINS instead.
+ * The suspicion is concrete: its replace arms take `ft_flip_txn_guard_parent`
+ * -- a §4.B VALIDATE -- where the converted cds_ft_replace now hoists a real
+ * ACQUIRE above its routing derivation.  That asymmetry is what produced the
+ * MUTUAL STARVATION between replace and remove (@9e62dc3b): a validator parks a
+ * word a locker must find CLEAN, and each starves the other.
+ *
+ * So this row measures THREE things, and the first is the one that would be
+ * missed by an accounting-only oracle:
+ *
+ *   1. PROGRESS -- per-lane completed-operation counts and a wall-clock budget.
+ *      A starving lane finishes far fewer ops than its peer while the trie
+ *      stays perfectly consistent, so a pure key-accounting row reads GREEN
+ *      through a livelock.  The in-library witness is the retry cap, newly
+ *      added to that loop (it had NONE, so a spin there was invisible).
+ *   2. OWNERSHIP -- insert_replace hands back the WHOLE displaced chain, so the
+ *      same exact accounting remove_all needed applies: every node is either
+ *      handed back exactly once or still in the trie, never both and never
+ *      neither.
+ *   3. UNIQUENESS -- after a replace the key must hold EXACTLY the installed
+ *      node; two of them means a replace that appended instead of displacing.
+ */
+#define SIR_K		8
+#define SIR_R		40
+#define SIR_BURST	200
+#define SIR_BUDGET_S	120	/* wall-clock guard: a livelock must FAIL, not hang */
+
+struct sir_node {
+	struct cds_ft_node node;
+	unsigned int k;
+	unsigned int owner;		/* which lane last installed it */
+};
+
+struct sir_ctx {
+	struct cds_ft *ft;
+	/*
+	 * TWO nodes per lane per key, used alternately.  A node cannot be
+	 * re-initialised while the trie still holds it, and a lane's node stays
+	 * in the trie until something displaces it -- so the lane uses the
+	 * OTHER one next, and only advances the alternation when a call
+	 * actually succeeded.  By the time a node comes round again the
+	 * intervening successful install has displaced the whole chain it was
+	 * in (or a peer lane already did), so it is out.
+	 */
+	struct sir_node *rep[2];	/* [2][2 * SIR_K] */
+	unsigned char *cur[2];		/* [2][SIR_K]: which of the pair is installed */
+	struct sir_node *peer;		/* [SIR_K]: the insert/remove peer's node */
+	unsigned char *peer_in;		/* [SIR_K] */
+	unsigned long ops[3];		/* completed ops per lane -- THE PROGRESS ORACLE */
+	unsigned long busy;		/* CDS_FT_STATUS_BUSY_ERROR (expected dead) */
+	unsigned long other;
+	unsigned long handed;		/* chains handed back */
+	unsigned long foreign;		/* a hand-back naming a node of another key */
+	int stop;
+};
+
+struct sir_arg {
+	struct sir_ctx *c;
+	unsigned int id;
+};
+
+/*
+ * A replace lane: install its own node at every key, over and over.  Each call
+ * either creates the key (OK) or displaces whatever chain is there
+ * (DUPLICATE_FOUND + the old head).  The displaced chain is accounted at the
+ * join, not walked here -- it is only the caller's after a grace period.
+ */
+static void *sir_replacer(void *arg)
+{
+	struct sir_arg *a = (struct sir_arg *) arg;
+	struct sir_ctx *c = a->c;
+	unsigned int id = a->id, r, burst, k;
+
+	rcu_register_thread();
+	rcu_thread_online();
+	for (r = 0; r < SIR_R && !uatomic_read(&c->stop); r++)
+		for (burst = 0; burst < SIR_BURST; burst++)
+		for (k = 0; k < SIR_K; k++) {
+			struct cds_ft_node *old = NULL;
+			unsigned int slot = c->cur[id][k] ^ 1u;
+			struct sir_node *n = &c->rep[id][k * 2 + slot];
+			uint8_t key[8];
+			enum cds_ft_status s;
+
+			cds_ft_u64_to_key(c->ft, (uint64_t) k, key,
+				CDS_FT_LEN_DEFAULT);
+			rcu_read_lock();
+			cds_ft_node_init(&n->node);
+			n->k = k;
+			n->owner = id;
+			s = cds_ft_insert_replace(c->ft, key, CDS_FT_LEN_DEFAULT,
+				&n->node, &old);
+			rcu_read_unlock();
+			if (s == CDS_FT_STATUS_OK ||
+					s == CDS_FT_STATUS_DUPLICATE_FOUND)
+				c->cur[id][k] = (unsigned char) slot;
+			switch (s) {
+			case CDS_FT_STATUS_OK:
+			case CDS_FT_STATUS_DUPLICATE_FOUND:
+				uatomic_inc(&c->ops[id]);
+				if (old) {
+					uatomic_inc(&c->handed);
+					/*
+					 * The displaced chain is the caller's.
+					 * Walk it under the read lock and check
+					 * it belongs to THIS key: a hand-back
+					 * naming another key's node is a replace
+					 * that displaced the wrong chain.
+					 */
+					rcu_read_lock();
+					for (; old; old = cds_ft_node_next_rcu(old))
+						if (((struct sir_node *) old)->k != k)
+							uatomic_inc(&c->foreign);
+					rcu_read_unlock();
+				}
+				break;
+			case CDS_FT_STATUS_BUSY_ERROR:
+				uatomic_inc(&c->busy);
+				break;
+			default:
+				uatomic_inc(&c->other);
+				break;
+			}
+			rcu_quiescent_state();
+			if (uatomic_read(&c->stop))
+				break;
+		}
+	rcu_unregister_thread();
+	return NULL;
+}
+
+/*
+ * The PEER: same-key cds_ft_insert / cds_ft_remove.  cds_ft_remove is the op
+ * whose holder LOCK the replace arms' §4.B guard is suspected of parking
+ * against, so it is the lane that would starve -- and be starved.
+ */
+static void *sir_peer(void *arg)
+{
+	struct sir_ctx *c = ((struct sir_arg *) arg)->c;
+	unsigned int r, burst, k;
+	struct cds_ft_iter *iter;
+
+	rcu_register_thread();
+	rcu_thread_online();
+	if (cds_ft_iter_create(c->ft, &iter) != CDS_FT_STATUS_OK)
+		abort();
+	for (r = 0; r < SIR_R && !uatomic_read(&c->stop); r++)
+		for (burst = 0; burst < SIR_BURST; burst++)
+		for (k = 0; k < SIR_K; k++) {
+			uint8_t key[8];
+
+			cds_ft_u64_to_key(c->ft, (uint64_t) k, key,
+				CDS_FT_LEN_DEFAULT);
+			rcu_read_lock();
+			if (!c->peer_in[k]) {
+				cds_ft_node_init(&c->peer[k].node);
+				c->peer[k].k = k;
+				c->peer[k].owner = 2;
+				if (cds_ft_insert(c->ft, key, CDS_FT_LEN_DEFAULT,
+						&c->peer[k].node) ==
+						CDS_FT_STATUS_OK) {
+					c->peer_in[k] = 1;
+					uatomic_inc(&c->ops[2]);
+				}
+			} else {
+				cds_ft_iter_set_key(iter, key, CDS_FT_LEN_DEFAULT);
+				if (cds_ft_lookup(c->ft, iter) == CDS_FT_STATUS_OK) {
+					enum cds_ft_status s = cds_ft_remove(
+						c->ft, iter, &c->peer[k].node);
+
+					if (s == CDS_FT_STATUS_OK) {
+						c->peer_in[k] = 0;
+						uatomic_inc(&c->ops[2]);
+					} else if (s == CDS_FT_STATUS_NOT_FOUND) {
+						/* A replace displaced it: the
+						 * node is the replacer's to
+						 * account, not ours. */
+						c->peer_in[k] = 0;
+					}
+				} else {
+					c->peer_in[k] = 0;
+				}
+			}
+			rcu_read_unlock();
+			rcu_quiescent_state();
+			if (uatomic_read(&c->stop))
+				break;
+		}
+	cds_ft_iter_destroy(iter);
+	rcu_unregister_thread();
+	return NULL;
+}
+
+/* The wall-clock guard: a livelock must FAIL the row, not hang the suite. */
+static void *sir_timer(void *arg)
+{
+	struct sir_ctx *c = ((struct sir_arg *) arg)->c;
+	unsigned int i;
+
+	for (i = 0; i < SIR_BUDGET_S * 10 && !uatomic_read(&c->stop); i++) {
+		struct timespec ts = { .tv_sec = 0, .tv_nsec = 100000000L };
+
+		(void) nanosleep(&ts, NULL);
+	}
+	uatomic_set(&c->stop, 1);
+	return NULL;
+}
+
+static int inv_concurrent_insert_replace_run(bool coarse, const char *name)
+{
+	struct cds_ft_group_attr *attr;
+	struct cds_ft_group *group;
+	struct sir_ctx c;
+	struct sir_arg args[3];
+	pthread_t th[3], timer;
+	struct cds_ft_iter *iter;
+	unsigned int i, k;
+	unsigned long lo, hi;
+	int ret = 0;
+	bool timed_out;
+
+	if (cds_ft_group_attr_create(&attr) < 0)
+		abort();
+	if (cds_ft_group_attr_set_key_len(attr, 8) < 0)
+		abort();
+	if (cds_ft_group_attr_set_ordered_list(attr, false) < 0)
+		abort();
+	if (coarse && cds_ft_group_attr_set_writer_strategy(attr,
+			CDS_FT_WRITER_LOCK_COARSE) < 0)
+		abort();
+	inv_maybe_set_rank_stats(attr);
+	if (cds_ft_group_create(attr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(attr);
+	memset(&c, 0, sizeof(c));
+	if (cds_ft_create(group, NULL, &c.ft) < 0)
+		abort();
+	cds_ft_make_concurrent(c.ft);
+	for (i = 0; i < 2; i++) {
+		c.rep[i] = (struct sir_node *) calloc((size_t) SIR_K * 2,
+				sizeof(*c.rep[i]));
+		c.cur[i] = (unsigned char *) calloc(SIR_K, 1);
+		if (!c.rep[i] || !c.cur[i])
+			abort();
+	}
+	c.peer = (struct sir_node *) calloc(SIR_K, sizeof(*c.peer));
+	c.peer_in = (unsigned char *) calloc(SIR_K, 1);
+	if (!c.peer || !c.peer_in)
+		abort();
+	if (cds_ft_iter_create(c.ft, &iter) != CDS_FT_STATUS_OK)
+		abort();
+	for (i = 0; i < 3; i++) {
+		args[i].c = &c;
+		args[i].id = i;
+	}
+	pthread_create(&timer, NULL, sir_timer, &args[0]);
+	pthread_create(&th[0], NULL, sir_replacer, &args[0]);
+	pthread_create(&th[1], NULL, sir_replacer, &args[1]);
+	pthread_create(&th[2], NULL, sir_peer, &args[2]);
+	for (i = 0; i < 3; i++)
+		pthread_join(th[i], NULL);
+	timed_out = uatomic_read(&c.stop) != 0;
+	uatomic_set(&c.stop, 1);
+	pthread_join(timer, NULL);
+	rcu_quiescent_state();
+	rcu_barrier();
+
+	/*
+	 * ★ PROGRESS FIRST.  The lanes run identical bounded loops, so a healthy
+	 * run has all three finishing them; a starved lane is one that did not.
+	 */
+	if (timed_out) {
+		fprintf(stderr, "%s: BUDGET EXHAUSTED (%us): ops lane0=%lu lane1=%lu peer=%lu -- a lane is not converging\n",
+			name, SIR_BUDGET_S, uatomic_read(&c.ops[0]),
+			uatomic_read(&c.ops[1]), uatomic_read(&c.ops[2]));
+		ret = -1;
+	}
+	lo = hi = uatomic_read(&c.ops[0]);
+	for (i = 1; i < 3; i++) {
+		unsigned long v = uatomic_read(&c.ops[i]);
+
+		if (v < lo)
+			lo = v;
+		if (v > hi)
+			hi = v;
+	}
+	/*
+	 * A STARVATION RATIO, not a hang test: the mutual-starvation defect this
+	 * row exists for showed up as one lane completing a small fraction of
+	 * its peer's work while everything stayed consistent.  100x apart is far
+	 * outside scheduling noise for three lanes running the same loop.
+	 */
+	if (hi > 100 * (lo + 1)) {
+		fprintf(stderr, "%s: STARVATION: lane ops %lu / %lu / %lu (max/min > 100x)\n",
+			name, uatomic_read(&c.ops[0]), uatomic_read(&c.ops[1]),
+			uatomic_read(&c.ops[2]));
+		ret = -1;
+	}
+
+	rcu_read_lock();
+	if (cds_ft_verify(c.ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "%s: verify RED after the run\n", name);
+		ret = -1;
+	}
+	/* UNIQUENESS + OWNERSHIP: each key holds exactly one node, and every
+	 * node is EITHER in the trie OR handed back once, never both/neither. */
+	for (k = 0; k < SIR_K; k++) {
+		struct cds_ft_node *h;
+		unsigned int len = 0;
+		uint8_t key[8];
+
+		cds_ft_u64_to_key(c.ft, (uint64_t) k, key, CDS_FT_LEN_DEFAULT);
+		cds_ft_iter_set_key(iter, key, CDS_FT_LEN_DEFAULT);
+		if (cds_ft_lookup(c.ft, iter) == CDS_FT_STATUS_OK) {
+			for (h = cds_ft_iter_node(iter); h;
+					h = cds_ft_node_next_rcu(h)) {
+				struct sir_node *n = (struct sir_node *) h;
+
+				len++;
+				if (n->k != k) {
+					fprintf(stderr, "%s: key %u holds a node of key %u\n",
+						name, k, n->k);
+					ret = -1;
+				}
+			}
+		}
+		/*
+		 * The peer appends, so a chain of 2 is legal (replacer node +
+		 * peer node).  What is NOT legal is BOTH replacers' nodes being
+		 * present: a replace that appended instead of displacing.
+		 */
+		if (len > 2) {
+			fprintf(stderr, "%s: key %u chain length %u > 2\n",
+				name, k, len);
+			ret = -1;
+		}
+	}
+	rcu_read_unlock();
+	if (uatomic_read(&c.foreign)) {
+		fprintf(stderr, "%s: %lu hand-back(s) named a node of another key\n",
+			name, uatomic_read(&c.foreign));
+		ret = -1;
+	}
+	if (uatomic_read(&c.other)) {
+		fprintf(stderr, "%s: %lu unexpected status(es)\n", name,
+			uatomic_read(&c.other));
+		ret = -1;
+	}
+	cds_ft_iter_destroy(iter);
+	rcu_quiescent_state();
+	rcu_barrier();
+	cds_ft_destroy(c.ft);
+	cds_ft_group_destroy(group);
+	for (i = 0; i < 2; i++) {
+		free(c.rep[i]);
+		free(c.cur[i]);
+	}
+	free(c.peer);
+	free(c.peer_in);
+	fprintf(stderr,
+		"# %s: %u rounds x %u burst x %u keys, 2 insert_replace lanes + 1 same-key insert/remove peer (%s): ops=%lu/%lu/%lu handed=%lu BUSY=%lu other=%lu -> %s\n",
+		name, SIR_R, SIR_BURST, SIR_K, coarse ? "coarse" : "fine",
+		uatomic_read(&c.ops[0]), uatomic_read(&c.ops[1]),
+		uatomic_read(&c.ops[2]), uatomic_read(&c.handed),
+		uatomic_read(&c.busy), uatomic_read(&c.other),
+		ret ? "RED" : "ok");
+	return ret;
+}
+
+/*
+ * ☐ BOTH ARMS ARE OPT-IN, and the reason is NOT the op under test.  They reach
+ * an open livelock in cds_ft_remove: with the retry cap armed
+ * (-DFT_DEBUG_OP_RETRY_CAP) this row fires
+ *
+ *   FT OP RETRY LIVELOCK: op=2 attempts=50001 last_ret=0
+ *   FT OP RETRY SITE: line=7226 consecutive=50000
+ *   FT OP PROXY PARKER: streak=1 switches=259 nr_mw=2 rec_old=0x20 rec_new=0x20
+ *
+ * -- op 2 is cds_ft_REMOVE, and {0x20 -> 0x20} all-MW with a DIFFERENT
+ * descriptor per refusal is ft_flip_txn_guard_parent's §4.B {live -> live}
+ * state guard.  Uncaged it costs 48 GB (measured peak RSS 49041 MB against a
+ * 48 G cap, while a non-spinning run of the SAME row finishes under 8 G): the
+ * leaking-livelock family, so an ungated row does not fail politely, it
+ * memcg-kills the suite.
+ *
+ * ☠ AND THE COARSE ARM SPINS TOO, which is what makes it interesting rather
+ * than merely blocked.  Under COARSE every writer serialises on the FT-wide
+ * mutex, so no peer can be parking the word remove is refused on -- it is a
+ * SELF-REFUSAL, a property of the shape alone, and COARSE is the IN-CONTRACT
+ * arm.  That is the same class as the standing default+COARSE two-writer
+ * livelock, whose remaining route is ft_detach_node's chain-compress collapse.
+ *
+ * ⇒ set FT_INV_INSERT_REPLACE=1 to run them.  They are the reproducer for that
+ * livelock and the regression guard for the parked-proxy expected-old fixed
+ * alongside them; they go back in the default set when the livelock closes.
+ */
+static int inv_concurrent_insert_replace_nolist(void)
+{
+	if (!getenv("FT_INV_INSERT_REPLACE")) {
+		diag("inv_concurrent_insert_replace_nolist: skipped (set "
+			"FT_INV_INSERT_REPLACE=1; reaches an open cds_ft_remove "
+			"livelock -- op=2, 50001 attempts, 48 GB)");
+		return 0;
+	}
+	return inv_concurrent_insert_replace_run(false,
+		"inv_concurrent_insert_replace_nolist");
+}
+
+static int inv_concurrent_insert_replace_coarse(void)
+{
+	if (!getenv("FT_INV_INSERT_REPLACE")) {
+		diag("inv_concurrent_insert_replace_coarse: skipped (set "
+			"FT_INV_INSERT_REPLACE=1; the COARSE arm spins too -- a "
+			"SELF-refusal, and coarse is the in-contract arm)");
+		return 0;
+	}
+	return inv_concurrent_insert_replace_run(true,
+		"inv_concurrent_insert_replace_coarse");
+}
+
+/*
  * The ORDERED-LIST arm, and it is not a duplicate of the row above: it is the
  * only one that reaches remove_all's TWO-COMMIT TAIL.  With the list on, a
  * shape that could not fuse the dead head cell's unsplice into its structural
@@ -24662,6 +25095,8 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_concurrent_remove_all_list);
 	RUN_TEST(inv_concurrent_remove_all_prefix);
 	RUN_TEST(inv_concurrent_remove_all_prefix_coarse);
+	RUN_TEST(inv_concurrent_insert_replace_nolist);
+	RUN_TEST(inv_concurrent_insert_replace_coarse);
 
 	rcu_barrier();
 	rcu_unregister_thread();
