@@ -2932,10 +2932,11 @@ enum cds_ft_status cds_ft_group_attr_set_optimize(
  *   disjoint writers for fine locking to parallelize).
  *
  * ☐ TODO -- THE FINE-LOCKING TRANSITION IS INCOMPLETE, AND FOUR OPERATIONS ARE
- * STILL WAITING ON IT.  cds_ft_insert and cds_ft_remove are converted: their
- * per-op notes say they may run concurrently with each other "including on the
- * same key".  Four others say instead that "mutual exclusion against every
- * update operation is the caller's responsibility":
+ * STILL WAITING ON IT.  Converted so far: cds_ft_insert and cds_ft_remove, whose
+ * notes say they may run concurrently with each other "including on the same
+ * key", and cds_ft_merge_at, whose destination may be a live trie carrying
+ * concurrent writers.  Four POINT ops say instead that "mutual exclusion against
+ * every update operation is the caller's responsibility":
  *
  *     cds_ft_insert_unique   cds_ft_insert_replace
  *     cds_ft_replace         cds_ft_remove_all
@@ -2965,12 +2966,25 @@ enum cds_ft_status cds_ft_group_attr_set_optimize(
  *                       than carried by one commit (☐ confirm whether it needs
  *                       more than the acquire+revalidate the other three do).
  *
- * ☐ RELATED BUT NOT THE SAME ITEM: cds_ft_detach and cds_ft_merge carry the
- * identical "NOT concurrency-safe" sentence, but theirs says "every other update
- * operation on the affected TRIES" -- they move a whole subtree BETWEEN tries, so
- * their exclusion question is about two tries rather than one key's holder.  That
- * conversion is a separate and larger question; it is named here only so the
- * enumeration above is not mistaken for the complete list of unconverted ops.
+ * ☐ THE CROSS-TRIE OPS ARE THE SAME ITEM, NOT A BIGGER ONE -- and cds_ft_merge_at
+ * is the proof, because it is already CONVERTED.  Its note reads: "the DESTINATION
+ * may be a live trie carrying concurrent writers -- several cross-trie attaches
+ * concurrently on the same destination.  The SOURCE must be EXCLUSIVE", and the
+ * attach arbitrates against those peers on the destination.
+ *
+ * ⇒ SO THE SOURCE SIDE IS ALREADY SETTLED BY CONTRACT, EVERYWHERE: cds_ft_graft
+ * and cds_ft_graft_swap require an EXCLUSIVE source under FINE, cds_ft_merge
+ * likewise, and cds_ft_detach hands back a trie that is exclusive by
+ * construction.  An exclusive trie has no concurrent writer to coordinate with,
+ * so there is nothing to lock there.  What remains unconverted in cds_ft_graft,
+ * cds_ft_merge and cds_ft_detach is the DESTINATION (for detach, the live trie it
+ * cuts from) -- the same per-node lock-set coordination the point ops owe, on one
+ * trie, with merge_at's arbitration as the worked example.
+ *
+ * ☠ DO NOT re-describe these as "a two-trie exclusion question".  That reading
+ * treats the exclusive-source requirement as if it were still open and makes a
+ * bounded conversion look like a research problem; an earlier version of this
+ * note said exactly that and was wrong.
  *
  * ⇒ THE RECIPE EXISTS IN-TREE.  The point remove was converted exactly this way:
  * derive the holder, acquire it, RE-VALIDATE that it still names what the plan
