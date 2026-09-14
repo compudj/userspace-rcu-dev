@@ -73,9 +73,9 @@
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (394 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (395 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (343 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (344 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -20414,6 +20414,175 @@ static int test_graft_swap_different_group_error(void)
  * Without a row that reaches it the hold audit reports nothing for that half of
  * the class, and "0 violations" there would be a WRONG ZERO rather than a pass.
  */
+/*
+ * I-4b: an insert whose PUBLISH PARENT is a COMPRESSED node.
+ *
+ * ☞ WHY THIS SHAPE NEEDS DEPTH.  ft_insert_lock_skip_dual_gp -- the insert
+ * lane's acquire of the SKIP_X dual's grandparent -- returns at its FIRST guard
+ * unless @parent_nf is compressed, and THE ROOT NODE IS NEVER COMPRESSED.  With
+ * short keys every insert publishes into the root or a shallow internal, so the
+ * site was called 886 times in inv_concurrent_same_key_inserts_nolist and
+ * exited at that guard EVERY time (measured, -DFT_DEBUG_DUAL_DROP).  A long
+ * single-child RUN below a non-root node is what creates a compressed node that
+ * can be a publish parent at all.
+ *
+ * Build: two keys sharing a 60-byte run under 'a' collapse that run into a
+ * compressed node CN at depth 1; inserting a key that matches CN's whole span
+ * and continues PAST it publishes into CN itself -- the I-4b "past-child
+ * publish", whose @parent_nf IS compressed.
+ */
+static int test_insert_publish_into_compressed_parent(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft;
+	struct cds_ft_node *found;
+	enum cds_ft_status s;
+	uint8_t k1[64], k2[64], k3[64];
+	unsigned int i;
+
+	ft = create_varlen_ft(&group);
+
+	/* k1 = 'a' + 60 x 'x'  -- the run that compresses. */
+	k1[0] = 'a';
+	for (i = 1; i < 61; i++)
+		k1[i] = 'x';
+	/* k2 = k1 + '1' -- matches CN's whole span, then diverges PAST it. */
+	memcpy(k2, k1, 61);
+	k2[61] = '1';
+	/* k3 = k1 + '2' -- a second past-child, so the publish is a real split. */
+	memcpy(k3, k1, 61);
+	k3[61] = '2';
+
+	{
+		struct ft_test_node *n1 = node_alloc(0);
+		struct ft_test_node *n2 = node_alloc(0);
+		struct ft_test_node *n3 = node_alloc(0);
+
+		n1->value = 1;
+		n2->value = 2;
+		n3->value = 3;
+		rcu_read_lock();
+		if (cds_ft_insert(ft, k1, 61, &n1->node) != CDS_FT_STATUS_OK) {
+			rcu_read_unlock();
+			fprintf(stderr, "publish_into_cn: insert k1\n");
+			goto fail;
+		}
+		if (cds_ft_insert(ft, k2, 62, &n2->node) != CDS_FT_STATUS_OK) {
+			rcu_read_unlock();
+			fprintf(stderr, "publish_into_cn: insert k2\n");
+			goto fail;
+		}
+		if (cds_ft_insert(ft, k3, 62, &n3->node) != CDS_FT_STATUS_OK) {
+			rcu_read_unlock();
+			fprintf(stderr, "publish_into_cn: insert k3\n");
+			goto fail;
+		}
+		rcu_read_unlock();
+	}
+
+	/* All three resolve: the run survived the past-child publishes. */
+	rcu_read_lock();
+	s = cds_ft_eager_lookup_key(ft, k1, 61, 0, &found);
+	if (s != CDS_FT_STATUS_OK || to_test_node(found)->value != 1) {
+		rcu_read_unlock();
+		fprintf(stderr, "publish_into_cn: k1 lost\n");
+		goto fail;
+	}
+	s = cds_ft_eager_lookup_key(ft, k2, 62, 0, &found);
+	if (s != CDS_FT_STATUS_OK || to_test_node(found)->value != 2) {
+		rcu_read_unlock();
+		fprintf(stderr, "publish_into_cn: k2 lost\n");
+		goto fail;
+	}
+	s = cds_ft_eager_lookup_key(ft, k3, 62, 0, &found);
+	rcu_read_unlock();
+	if (s != CDS_FT_STATUS_OK || to_test_node(found)->value != 3) {
+		fprintf(stderr, "publish_into_cn: k3 lost\n");
+		goto fail;
+	}
+	if (cds_ft_count_entries(ft) != 3) {
+		fprintf(stderr, "publish_into_cn: count %lu, expected 3\n",
+			cds_ft_count_entries(ft));
+		goto fail;
+	}
+
+	/*
+	 * ☞ ONE PAST-CHILD PUBLISH PER RUN, which is why these are SEPARATE
+	 * runs rather than more keys on one.  The first divergence past CN
+	 * creates an internal node at that position, and every later key there
+	 * publishes into THAT node -- not into CN -- so a second suffix on the
+	 * same run exits at the not-compressed guard.  Six independent runs give
+	 * six compressed publish parents.
+	 */
+	{
+		uint8_t d1[64], d2[64];
+		unsigned int j, m;
+
+		for (j = 0; j < 6; j++) {
+			struct ft_test_node *nb = node_alloc(0);
+			struct ft_test_node *np = node_alloc(0);
+
+			d1[0] = (uint8_t) ('b' + j);
+			for (m = 1; m < 57; m++)
+				d1[m] = 'q';
+			memcpy(d2, d1, 57);
+			d2[57] = 'Z';
+			nb->value = 100 + j;
+			np->value = 200 + j;
+			rcu_read_lock();
+			if (cds_ft_insert(ft, d1, 57, &nb->node) !=
+					CDS_FT_STATUS_OK ||
+			    cds_ft_insert(ft, d2, 58, &np->node) !=
+					CDS_FT_STATUS_OK) {
+				rcu_read_unlock();
+				fprintf(stderr, "publish_into_cn: run %u\n", j);
+				goto fail;
+			}
+			rcu_read_unlock();
+		}
+		rcu_read_lock();
+		for (j = 0; j < 6; j++) {
+			d1[0] = (uint8_t) ('b' + j);
+			for (m = 1; m < 57; m++)
+				d1[m] = 'q';
+			memcpy(d2, d1, 57);
+			d2[57] = 'Z';
+			s = cds_ft_eager_lookup_key(ft, d1, 57, 0, &found);
+			if (s != CDS_FT_STATUS_OK ||
+					to_test_node(found)->value != 100 + j) {
+				rcu_read_unlock();
+				fprintf(stderr, "publish_into_cn: run %u base lost\n", j);
+				goto fail;
+			}
+			s = cds_ft_eager_lookup_key(ft, d2, 58, 0, &found);
+			if (s != CDS_FT_STATUS_OK ||
+					to_test_node(found)->value != 200 + j) {
+				rcu_read_unlock();
+				fprintf(stderr, "publish_into_cn: run %u past lost\n", j);
+				goto fail;
+			}
+		}
+		rcu_read_unlock();
+	}
+	if (cds_ft_count_entries(ft) != 15) {
+		fprintf(stderr, "publish_into_cn: count %lu, expected 15\n",
+			cds_ft_count_entries(ft));
+		goto fail;
+	}
+
+	drain_trie(ft);
+	rcu_barrier();
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return 0;
+fail:
+	drain_trie(ft);
+	rcu_barrier();
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return -1;
+}
+
 static int test_detach_leaf_head_reparent(void)
 {
 	struct cds_ft_group *group;
@@ -39082,6 +39251,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_fixed_detach_nonroot_error);
 	RUN_TEST(test_detach_basic);
 	RUN_TEST(test_detach_leaf_head_reparent);
+	RUN_TEST(test_insert_publish_into_compressed_parent);
 	RUN_TEST(test_detach_at_root);
 	RUN_TEST(test_detach_not_found);
 	RUN_TEST(test_detach_empty_trie);
