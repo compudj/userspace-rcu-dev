@@ -3262,8 +3262,24 @@ void ft_ch_audit_ctx_at(const char *fn, int line, const struct cds_ft *ft,
 		 * therefore the work the relaxation owes.
 		 */
 		{
-			struct cds_ft_inode_flag *wh =
-				ft_chain_head_holder((struct cds_ft *) ft, node);
+			struct cds_ft_inode_flag *wh;
+
+			/*
+			 * ☠ AND NOT ON A COARSE TRIE, where the question is
+			 * meaningless and the answer is 100% BARE BY
+			 * CONSTRUCTION.  A coarse writer serializes on this very
+			 * lock and never takes a per-node holder at all -- the
+			 * word's kind is [DESIGN], not [debt].  Measured before
+			 * this guard, on inv_concurrent_same_key_replace_coarse:
+			 * _cds_ft_replace_locked BARE=127992 of 127992,
+			 * ft_chain_node BARE=64000 of 64000.  That is the audit's
+			 * own false-positive class 2 ("no WLOCK bucket condemns
+			 * every COARSE arm") reappearing in a new column, so the
+			 * guard belongs here exactly as it does above.
+			 */
+			if (!ft->lock_fine)
+				return;
+			wh = ft_chain_head_holder((struct cds_ft *) ft, node);
 			struct cds_ft_metadata *wm;
 			uintptr_t snap;
 			bool ratified;
