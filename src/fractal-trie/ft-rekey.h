@@ -10087,6 +10087,9 @@ static enum cds_ft_status ft_rekey_at_inner(struct cds_ft *dst_ft,
 		const uint8_t *src_key, size_t src_key_len,
 		struct ft_flip_txn **pre_txn, enum ft_rekey_mode rekey)
 {
+#ifdef FT_DEBUG_SPLICE_SEAM
+	uatomic_inc(&ft_ss_at_inner);
+#endif
 	struct cds_ft *subtree = NULL;
 	enum cds_ft_status status;
 	struct ft_descent d_src, d_dst;
@@ -10463,6 +10466,9 @@ merge_spine_retry:
 		return CDS_FT_STATUS_NOT_SUPPORTED;
 #else
 		md_contended = false;
+#ifdef FT_DEBUG_SPLICE_SEAM
+		uatomic_inc(&ft_ss_spine_gate);
+#endif
 		status = ft_rekey_spine_copy(dst_ft, src_ft, &d_src,
 				okey_src, src_key_len, cnt_src, off_src,
 				&d_dst, cnt_dst, off_dst, dst_key_len,

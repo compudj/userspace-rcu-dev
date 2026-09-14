@@ -16270,7 +16270,8 @@ unsigned long ft_ss_site_merge_calls, ft_ss_site_rekey_atomic_calls,
  * ft_glue_record_splices (:9532) in the SAME function; the entry counter is what
  * says whether that straight-line order was ever actually walked.
  */
-unsigned long ft_ss_spine_entry, ft_ss_seam_spine, ft_ss_seam_subpos;
+unsigned long ft_ss_spine_entry, ft_ss_seam_spine, ft_ss_seam_subpos,
+	ft_ss_at_inner, ft_ss_spine_gate;
 static void ft_ss_report(void) __attribute__((destructor));
 static void ft_ss_report(void)
 {
@@ -16295,6 +16296,9 @@ static void ft_ss_report(void)
 		uatomic_read(&ft_ss_spine_entry),
 		uatomic_read(&ft_ss_seam_spine),
 		uatomic_read(&ft_ss_seam_subpos));
+	fprintf(stderr, "FT SPLICE-SEAM at_inner=%lu spine_gate=%lu\n",
+		uatomic_read(&ft_ss_at_inner),
+		uatomic_read(&ft_ss_spine_gate));
 }
 #endif
 
@@ -16590,14 +16594,24 @@ void ft_glue_record_splices(struct cds_ft *ft, struct ft_glue *g,
 		 * MW expected-old backstops cds_ft_compact_step, which takes no
 		 * gate and whose contract still demands caller exclusion.
 		 *
+		 * Under the FT_INV_MW rekey-merge oracles -- 8 contending writers,
+		 * every merge splicing a duplicate chain -- the same reading holds
+		 * over 5,382 more stores (occupied_dst 2571, compressed_dst 2206,
+		 * rootchurn 605), again 100% wlock + bulk with IN-WINDOW=0.
+		 *
 		 * ☠ ONE ZERO IN THAT REPORT IS A WRONG ZERO, and the probe says
 		 * so itself: ft_rekey_spine_copy -- the ONLY caller with a
 		 * ft_writer_lock_gp_wait anywhere under it -- is never ENTERED by
-		 * ft_unit (spine_entry=0, seam_spine=0).  For that path the
-		 * argument is still STATIC, but it is now LOCAL rather than a
-		 * claim about the call graph: its seam sits ABOVE its
-		 * ft_glue_record_splices call in the same function, and the only
-		 * thing between that call and ft_flip_txn_commit is
+		 * ANY test in the tree (spine_entry=0 across ft_unit and every
+		 * rekey oracle).  Its enclosing staged fallback ft_rekey_at_inner
+		 * IS reached, 3 times in ft_unit, but every one of those returns
+		 * BEFORE the occupied-dst gate (spine_gate=0): the staged
+		 * OCCUPIED-DESTINATION rekey has NO coverage at all.
+		 *
+		 * For that path the argument is therefore still STATIC -- but it
+		 * is now LOCAL rather than a claim about the call graph: its seam
+		 * sits ABOVE its ft_glue_record_splices call in the same function,
+		 * and the only thing between that call and ft_flip_txn_commit is
 		 * ft_flip_txn_record_count_parent, which records and does not
 		 * wait.  A
 		 * peer WRITE to its prev (a src-side recompaction re-homing it, a
