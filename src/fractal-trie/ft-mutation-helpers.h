@@ -9011,6 +9011,17 @@ guard:
  * owner.  That is the G4 conversion ft-txn-kind-stats.h measures, and MW costs
  * only speed meanwhile.
  */
+#ifdef FT_DEBUG_DUAL_DROP
+/* Total at exit, not a threshold print: see the insert twin for why. */
+unsigned long ft_dual_gp_acq_remove;
+static void ft_dual_gp_acq_rm_report(void) __attribute__((destructor));
+static void ft_dual_gp_acq_rm_report(void)
+{
+	fprintf(stderr, "FT DUAL-GP-ACQUIRE-REMOVE total=%lu\n",
+		uatomic_read(&ft_dual_gp_acq_remove));
+}
+#endif
+
 static
 bool ft_lock_skip_dual_gp(struct cds_ft *ft,
 		const struct ft_lock_ctx *ctx,
@@ -9042,11 +9053,7 @@ bool ft_lock_skip_dual_gp(struct cds_ft *ft,
 		 * as "the fix works" when it is really "the site never ran".
 		 * Zero means the workload does not reach §9.3's third member.
 		 */
-		static unsigned long n_acq;
-		unsigned long n = uatomic_add_return(&n_acq, 1);
-
-		if ((n & 0xff) == 0)
-			fprintf(stderr, "FT DUAL-GP-ACQUIRE %lu\n", n);
+		uatomic_inc(&ft_dual_gp_acq_remove);
 	}
 #endif
 	ft_flip_txn_lock_or_guard_parent(ft, txn, ctx, gp_nf,

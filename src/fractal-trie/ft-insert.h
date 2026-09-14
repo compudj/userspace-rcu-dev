@@ -580,6 +580,37 @@ bool ft_probe_internal_is_empty(struct cds_ft *ft,
  * destroys the txn clears it; a miss sets @acquire_miss and the commit aborts
  * all-or-none, exactly as the P acquire beside it does.
  */
+#ifdef FT_DEBUG_DUAL_DROP
+/*
+ * ☠ A THRESHOLD PRINT IS NOT A COUNT.  This started as a
+ * "print every 256th acquire" line copied from ft_lock_skip_dual_gp, and a run
+ * with 1..255 acquires printed NOTHING -- which reads exactly like zero and is
+ * how the insert lane was first reported as inert.  Report the TOTAL at exit so
+ * a small non-zero cannot hide.
+ */
+unsigned long ft_dual_gp_acq_insert;
+/*
+ * WHERE it returns, not just whether it acquires.  "0 acquires" has four very
+ * different causes here and they are not the same finding: never called at all;
+ * called with a non-compressed publish parent; called but the parent's own slot
+ * is not skip-encoded; or a ROOT dual.  Only the first would mean the site is
+ * dead code.
+ */
+unsigned long ft_dual_ins_calls, ft_dual_ins_notcomp, ft_dual_ins_noskip,
+	ft_dual_ins_root;
+static void ft_dual_gp_acq_report(void) __attribute__((destructor));
+static void ft_dual_gp_acq_report(void)
+{
+	fprintf(stderr, "FT DUAL-GP-INSERT calls=%lu notcompressed=%lu "
+		"noskipslot=%lu rootdual=%lu ACQUIRED=%lu\n",
+		uatomic_read(&ft_dual_ins_calls),
+		uatomic_read(&ft_dual_ins_notcomp),
+		uatomic_read(&ft_dual_ins_noskip),
+		uatomic_read(&ft_dual_ins_root),
+		uatomic_read(&ft_dual_gp_acq_insert));
+}
+#endif
+
 /*
  * Returns TRUE iff it actually ACQUIRED the dual's grandparent -- which is what
  * the publish must pass as @dual_owner_held.  Every early return below is a
@@ -601,15 +632,30 @@ bool ft_insert_lock_skip_dual_gp(struct cds_ft *ft,
 	struct cds_ft_inode_flag *gp_nf = NULL;
 	struct cds_ft_inode_flag **skip_slot;
 
-	if (!parent_nf || !ft_node_compressed(parent_nf))
+#ifdef FT_DEBUG_DUAL_DROP
+	uatomic_inc(&ft_dual_ins_calls);
+#endif
+	if (!parent_nf || !ft_node_compressed(parent_nf)) {
+#ifdef FT_DEBUG_DUAL_DROP
+		uatomic_inc(&ft_dual_ins_notcomp);
+#endif
 		return false;
+	}
 	cn = ft_compressed_node_ptr(parent_nf);
 	cn_meta = cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
 	skip_slot = ft_txn_parent_slot_at(cn_meta, ft, NULL, &gp_nf);
-	if (!skip_slot || !ft_node_skip_compressed(*skip_slot))
+	if (!skip_slot || !ft_node_skip_compressed(*skip_slot)) {
+#ifdef FT_DEBUG_DUAL_DROP
+		uatomic_inc(&ft_dual_ins_noskip);
+#endif
 		return false;		/* no dual edge will be recorded */
-	if (skip_slot == &ft->root || !gp_nf)
+	}
+	if (skip_slot == &ft->root || !gp_nf) {
+#ifdef FT_DEBUG_DUAL_DROP
+		uatomic_inc(&ft_dual_ins_root);
+#endif
 		return false;		/* root dual: no owning node */
+	}
 #ifdef FT_DEBUG_DUAL_DROP
 	{
 		/*
@@ -621,11 +667,7 @@ bool ft_insert_lock_skip_dual_gp(struct cds_ft *ft,
 		 * counter, same reason: "a green run cannot be read as 'the fix
 		 * works' when it is really 'the site never ran'".
 		 */
-		static unsigned long n_acq;
-		unsigned long n = uatomic_add_return(&n_acq, 1);
-
-		if ((n & 0xff) == 0)
-			fprintf(stderr, "FT DUAL-GP-ACQUIRE-INSERT %lu\n", n);
+		uatomic_inc(&ft_dual_gp_acq_insert);
 	}
 #endif
 	ft_flip_txn_lock_or_guard_parent(ft, ic->txn, ctx, gp_nf,
