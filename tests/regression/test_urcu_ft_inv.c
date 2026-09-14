@@ -24460,7 +24460,14 @@ struct sir_ctx {
 	struct sir_node *pool[2];	/* [2][SIR_R * SIR_BURST * SIR_K + 1] */
 	size_t pool_n[2];
 #endif
-	struct sir_node *peer;		/* [SIR_K]: the insert/remove peer's node */
+	struct sir_node *peer;		/* [SIR_K]: the peer lane's node */
+	/*
+	 * A SECOND node per key, so the peer can drive cds_ft_replace -- which
+	 * needs an old node it owns AND a distinct new one.  @peer_which says
+	 * which of the pair the trie currently holds; replace swaps it.
+	 */
+	struct sir_node *peer2;		/* [SIR_K] */
+	unsigned char *peer_which;	/* [SIR_K]: 0 = @peer, 1 = @peer2 */
 	unsigned char *peer_in;		/* [SIR_K] */
 	unsigned long ops[3];		/* completed ops per lane -- THE PROGRESS ORACLE */
 	unsigned long busy;		/* CDS_FT_STATUS_BUSY_ERROR (expected dead) */
@@ -24485,6 +24492,9 @@ struct sir_ctx {
 	 * insert_replace for the key, @iu_dup the refusal.
 	 */
 	unsigned long iu_ok, iu_dup;
+	/* remove_all outcomes, so its arm cannot be green-by-never-running. */
+	unsigned long ra_ok, ra_miss;
+	unsigned long rp_ok, rp_miss, rp_nf;	/* cds_ft_replace outcomes */
 	int stop;
 };
 
@@ -24668,6 +24678,12 @@ static void *sir_replacer(void *arg)
  * whose holder LOCK the replace arms' §4.B guard is suspected of parking
  * against, so it is the lane that would starve -- and be starved.
  */
+/* The peer node the trie currently holds (or the one it will install next). */
+static struct sir_node *sir_peer_node(struct sir_ctx *c, unsigned int k)
+{
+	return c->peer_which[k] ? &c->peer2[k] : &c->peer[k];
+}
+
 static void *sir_peer(void *arg)
 {
 	struct sir_ctx *c = ((struct sir_arg *) arg)->c;
@@ -24681,8 +24697,18 @@ static void *sir_peer(void *arg)
 	 * are counted.  Count the insert ATTEMPTS instead; that is the sequence
 	 * that actually alternates.
 	 */
-	unsigned long ins_attempt = 0;
+	unsigned long ins_attempt = 0, rem_attempt = 0;
+	/*
+	 * ☠ AND DO NOT ALTERNATE ON A GLOBAL VISIT COUNTER EITHER -- SAME TRAP,
+	 * ONE LEVEL UP.  It advances by SIR_K per visit OF ONE KEY, so with
+	 * SIR_K == 8 every `visit & 3` / `visit & 7` is CONSTANT per key: the
+	 * remove_all arm ran on exactly 2 of the 8 keys (16000 of 16000 calls)
+	 * and a `visit & 7` replace arm on 1, which is not "1/8 of the traffic"
+	 * but "one key, never the others".  Count PER KEY.
+	 */
+	unsigned long kvisit[SIR_K];
 
+	memset(kvisit, 0, sizeof(kvisit));
 	rcu_register_thread();
 	rcu_thread_online();
 	if (cds_ft_iter_create(c->ft, &iter) != CDS_FT_STATUS_OK)
@@ -24695,12 +24721,89 @@ static void *sir_peer(void *arg)
 			cds_ft_u64_to_key(c->ft, (uint64_t) k, key,
 				CDS_FT_LEN_DEFAULT);
 			rcu_read_lock();
-			if (!c->peer_in[k]) {
+			if ((kvisit[k]++ & 3) == 3) {
+				/*
+				 * ☞ REMOVE_ALL, the third peer the flipped
+				 * contract would claim -- and the only thing
+				 * that EMPTIES the key.  Without it the two
+				 * replacer lanes keep every key occupied and
+				 * insert_unique can only ever be refused, so
+				 * this arm is what gives its inserting path a
+				 * window to race a displacement in.
+				 *
+				 * The handed-back chain is accounted exactly as
+				 * the replacer accounts a displaced one: walk
+				 * it under the read lock, charge a hand-back
+				 * naming another key, and mark each replacer
+				 * node provably OUT so its lane may re-init it.
+				 * @peer_in[k] drops unconditionally on OK --
+				 * peer[k] only ever lives at key k, so
+				 * remove_all took it if it was there.
+				 */
+				struct cds_ft_node *chain = NULL;
+
+				cds_ft_iter_set_key(iter, key, CDS_FT_LEN_DEFAULT);
+				if (cds_ft_lookup(c->ft, iter) ==
+						CDS_FT_STATUS_OK &&
+				    cds_ft_remove_all(c->ft, iter, &chain) ==
+						CDS_FT_STATUS_OK) {
+					uatomic_inc(&c->ra_ok);
+					uatomic_inc(&c->ops[2]);
+					c->peer_in[k] = 0;
+					for (; chain;
+					     chain = cds_ft_node_next_rcu(chain)) {
+						struct sir_node *o =
+							(struct sir_node *) chain;
+
+						if (o->k != k)
+							uatomic_inc(&c->foreign);
+#ifdef FT_INV_SIR_SOUND_REUSE
+						if (o->owner < 2)
+							c->out[o->owner][o->k * 2 +
+								o->slot] = 1;
+#endif
+					}
+					/*
+					 * ☞ AND RACE INSERT_UNIQUE INTO THE KEY
+					 * WE JUST EMPTIED.  This is the tightest
+					 * window there is: the replacer lanes are
+					 * refilling the key right now, so the
+					 * INSERTING arm of insert_unique meets a
+					 * concurrent displacement here or nowhere.
+					 * Left to the ordinary alternation it fired
+					 * 0-3 times a run; the key is simply never
+					 * empty otherwise.  @peer[k] is provably out
+					 * (remove_all just handed back whatever was
+					 * at k), so re-initialising it is sound.
+					 */
+					{
+						struct cds_ft_node *iu2 = NULL;
+
+						cds_ft_node_init(&sir_peer_node(c, k)->node);
+						sir_peer_node(c, k)->k = k;
+						sir_peer_node(c, k)->owner = 2;
+						if (cds_ft_insert_unique(c->ft,
+								key,
+								CDS_FT_LEN_DEFAULT,
+								&sir_peer_node(c, k)->node,
+								&iu2) ==
+								CDS_FT_STATUS_OK) {
+							c->peer_in[k] = 1;
+							uatomic_inc(&c->iu_ok);
+							uatomic_inc(&c->ops[2]);
+						} else {
+							uatomic_inc(&c->iu_dup);
+						}
+					}
+				} else {
+					uatomic_inc(&c->ra_miss);
+				}
+			} else if (!c->peer_in[k]) {
 				enum cds_ft_status is;
 
-				cds_ft_node_init(&c->peer[k].node);
-				c->peer[k].k = k;
-				c->peer[k].owner = 2;
+				cds_ft_node_init(&sir_peer_node(c, k)->node);
+				sir_peer_node(c, k)->k = k;
+				sir_peer_node(c, k)->owner = 2;
 				/*
 				 * ☞ ALTERNATE INSERT AND INSERT_UNIQUE.  The
 				 * contract cds_ft_insert_replace would claim if
@@ -24732,7 +24835,7 @@ static void *sir_peer(void *arg)
 					 */
 					is = cds_ft_insert_unique(c->ft, key,
 						CDS_FT_LEN_DEFAULT,
-						&c->peer[k].node, &iu_ret);
+						&sir_peer_node(c, k)->node, &iu_ret);
 					if (is == CDS_FT_STATUS_OK)
 						uatomic_inc(&c->iu_ok);
 					else
@@ -24740,25 +24843,76 @@ static void *sir_peer(void *arg)
 				} else
 					is = cds_ft_insert(c->ft, key,
 						CDS_FT_LEN_DEFAULT,
-						&c->peer[k].node);
+						&sir_peer_node(c, k)->node);
 				if (is == CDS_FT_STATUS_OK) {
 					c->peer_in[k] = 1;
 					uatomic_inc(&c->ops[2]);
 				}
 			} else {
+				/*
+				 * ☞ ALTERNATE REMOVE AND REPLACE -- on the
+				 * REMOVE ATTEMPT count, for the same reason the
+				 * insert arm alternates on @ins_attempt: this is
+				 * the sequence that actually alternates, where
+				 * any function of @k or of the visit index does
+				 * not.
+				 *
+				 * replace is the fifth and last peer the flipped
+				 * contract would claim.  It needs an old node
+				 * this lane OWNS and a distinct new one -- hence
+				 * the node PAIR and @peer_which, toggled on OK.
+				 * The node stays in the trie either way, so
+				 * @peer_in[k] survives an OK replace and only a
+				 * refusal clears it.
+				 */
 				cds_ft_iter_set_key(iter, key, CDS_FT_LEN_DEFAULT);
 				if (cds_ft_lookup(c->ft, iter) == CDS_FT_STATUS_OK) {
-					enum cds_ft_status s = cds_ft_remove(
-						c->ft, iter, &c->peer[k].node);
+					enum cds_ft_status s;
 
-					if (s == CDS_FT_STATUS_OK) {
-						c->peer_in[k] = 0;
-						uatomic_inc(&c->ops[2]);
-					} else if (s == CDS_FT_STATUS_NOT_FOUND) {
-						/* A replace displaced it: the
-						 * node is the replacer's to
-						 * account, not ours. */
-						c->peer_in[k] = 0;
+					if (rem_attempt++ & 1) {
+						struct sir_node *newp =
+							c->peer_which[k] ?
+							&c->peer[k] : &c->peer2[k];
+
+						cds_ft_node_init(&newp->node);
+						newp->k = k;
+						newp->owner = 2;
+						s = cds_ft_replace(c->ft, iter,
+							&sir_peer_node(c, k)->node,
+							&newp->node);
+						if (s == CDS_FT_STATUS_OK) {
+							c->peer_which[k] ^= 1;
+							uatomic_inc(&c->rp_ok);
+							uatomic_inc(&c->ops[2]);
+						} else {
+							uatomic_inc(&c->rp_miss);
+							if (s == CDS_FT_STATUS_NOT_FOUND)
+								uatomic_inc(&c->rp_nf);
+							/*
+							 * An insert_replace
+							 * displaced the chain
+							 * between the lookup and
+							 * the swap: the old node
+							 * is the replacer's to
+							 * account, not ours.
+							 */
+							c->peer_in[k] = 0;
+						}
+					} else {
+						s = cds_ft_remove(c->ft, iter,
+							&sir_peer_node(c, k)->node);
+						if (s == CDS_FT_STATUS_OK) {
+							c->peer_in[k] = 0;
+							uatomic_inc(&c->ops[2]);
+						} else if (s == CDS_FT_STATUS_NOT_FOUND) {
+							/*
+							 * A replace displaced
+							 * it: the node is the
+							 * replacer's to account,
+							 * not ours.
+							 */
+							c->peer_in[k] = 0;
+						}
 					}
 				} else {
 					c->peer_in[k] = 0;
@@ -24845,6 +24999,8 @@ static int inv_concurrent_insert_replace_run(bool coarse, const char *name)
 #endif
 	}
 	c.peer = (struct sir_node *) calloc(SIR_K, sizeof(*c.peer));
+	c.peer2 = (struct sir_node *) calloc(SIR_K, sizeof(*c.peer2));
+	c.peer_which = (unsigned char *) calloc(SIR_K, 1);
 	c.peer_in = (unsigned char *) calloc(SIR_K, 1);
 	if (!c.peer || !c.peer_in)
 		abort();
@@ -24963,14 +25119,19 @@ static int inv_concurrent_insert_replace_run(bool coarse, const char *name)
 #endif
 	}
 	free(c.peer);
+	free(c.peer2);
+	free(c.peer_which);
 	free(c.peer_in);
 	fprintf(stderr,
-		"# %s: %u rounds x %u burst x %u keys, 2 insert_replace lanes + 1 same-key insert/insert_unique/remove peer (%s): ops=%lu/%lu/%lu handed=%lu BUSY=%lu other=%lu insert_unique=%lu ok/%lu dup -> %s\n",
+		"# %s: %u rounds x %u burst x %u keys, 2 insert_replace lanes + 1 same-key insert/insert_unique/replace/remove/remove_all peer (%s): ops=%lu/%lu/%lu handed=%lu BUSY=%lu other=%lu insert_unique=%lu ok/%lu dup remove_all=%lu ok/%lu miss replace=%lu ok/%lu miss (%lu nf) -> %s\n",
 		name, SIR_R, SIR_BURST, SIR_K, coarse ? "coarse" : "fine",
 		uatomic_read(&c.ops[0]), uatomic_read(&c.ops[1]),
 		uatomic_read(&c.ops[2]), uatomic_read(&c.handed),
 		uatomic_read(&c.busy), uatomic_read(&c.other),
 		uatomic_read(&c.iu_ok), uatomic_read(&c.iu_dup),
+		uatomic_read(&c.ra_ok), uatomic_read(&c.ra_miss),
+		uatomic_read(&c.rp_ok), uatomic_read(&c.rp_miss),
+		uatomic_read(&c.rp_nf),
 		ret ? "RED" : "ok");
 #ifdef FT_INV_SIR_SOUND_REUSE
 	fprintf(stderr, "# %s: SOUND REUSE: stalls (no provably-out node) = %lu\n",
