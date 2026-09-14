@@ -2327,6 +2327,29 @@ struct cds_ft {
 	 */
 	struct cds_fair_mutex writer_lock;
 	/*
+	 * ☑ BULK-vs-BULK, AND IT IS A SECOND LOCK ON PURPOSE.  @writer_lock
+	 * cannot carry this: ft_writer_lock_gp_wait DROPS it across every
+	 * mid-body grace period (seven live sites in detach / graft / rekey), so
+	 * two bulk ops meet at any drain seam.  It cannot simply be HELD across
+	 * those GPs either -- since G5.25 a point op takes @writer_lock too
+	 * while a bulk op is live, and that wait stays ONLINE by contract
+	 * (ft_writer_lock_take: the caller may hold reader-derived references
+	 * across it), so a holder waiting on a GP would be waiting on the very
+	 * readers it is blocking.
+	 *
+	 * This lock restores that property BY CONSTRUCTION instead of assuming
+	 * it: ONLY bulk ops ever wait here, and a bulk entry forbids a
+	 * read-section caller (fractal-trie.h: "Do NOT call these operations
+	 * from within an RCU read-side critical section"), so its waiters park
+	 * OFFLINE and never hold a grace period up.  It is therefore held
+	 * CONTINUOUSLY across the drain seams, which is what closes them.
+	 *
+	 * ORDER: strictly OUTSIDE @writer_lock.  Taken after the bulk gate (so
+	 * the gate keeps its refcounted one-GP-per-burst piggyback) and before
+	 * any writer scope; never taken while holding @writer_lock.
+	 */
+	struct cds_fair_mutex bulk_lock;
+	/*
 	 * Hot-path gate: writer_strategy == CDS_FT_WRITER_LOCK_FINE.  The
 	 * fine-grained (per-node lock-set) conversions read THIS:
 	 * COARSE deliberately derives no lock-set (§10.5 -- one FT-wide lock, no
@@ -2709,6 +2732,52 @@ struct cds_ft_inode_flag *ft_parent_word(const struct cds_ft *ft,
  * the outermost enter and released once at the outermost exit.
  */
 static __thread struct cds_fair_mutex_node ft_wlock_waiter;
+/*
+ * The same, for @bulk_lock.  A SEPARATE node because one thread holds both at
+ * once (bulk_lock outside, writer_lock inside) and a FIFO node serves one queue
+ * at a time.  @ft_bulk_lock_held / @ft_bulk_lock_depth make the take reentrant:
+ * bulk bodies NEST (a rekey's staged fallback re-enters the gate), which is why
+ * ft_bulk_self_depth is depth-counted, and a non-reentrant take here would wedge
+ * the op on its own lock.
+ */
+static __thread struct cds_fair_mutex_node ft_bulk_lock_waiter;
+extern __thread unsigned long ft_bulk_self_depth;
+static __thread struct cds_ft *ft_bulk_lock_held;
+static __thread unsigned long ft_bulk_lock_depth;
+
+#ifdef FT_DEBUG_BULK_LOCK
+/*
+ * TEMPORARY: is the bulk-vs-bulk lock actually EXERCISED, and is it HELD across
+ * the drain seams it exists to close?  A green run proves nothing if the lock
+ * is never taken.  @seam_under is the number that matters: gp_waits reached
+ * while holding it -- each one is a seam a peer bulk op can no longer enter.
+ */
+/* Weak: this header is an impl unit included by more than one TU. */
+__attribute__((weak)) unsigned long ft_bl_takes;
+__attribute__((weak)) unsigned long ft_bl_nested;
+__attribute__((weak)) unsigned long ft_bl_seam_under;
+__attribute__((weak)) unsigned long ft_bl_seam_all;
+__attribute__((weak)) unsigned long ft_bl_seam_excl;
+__attribute__((weak)) unsigned long ft_bl_seam_selfdepth;
+__attribute__((weak)) unsigned long ft_bl_seam_selfdepth;
+__attribute__((weak)) unsigned long ft_bl_reported;
+static void ft_bl_report(void) __attribute__((destructor));
+static void ft_bl_report(void)
+{
+	if (!ft_bl_takes && !ft_bl_seam_all)
+		return;
+	if (__atomic_fetch_add(&ft_bl_reported, 1, __ATOMIC_RELAXED))
+		return;			/* one destructor per TU; print once */
+	fprintf(stderr, "FT_BULK_LOCK  takes=%lu nested=%lu | gp_wait seams: "
+		"total=%lu UNDER the bulk lock=%lu (of the rest: "
+		"exclusive=%lu in-a-bulk-body=%lu)\n",
+		ft_bl_takes, ft_bl_nested, ft_bl_seam_all, ft_bl_seam_under,
+		ft_bl_seam_excl, ft_bl_seam_selfdepth);
+}
+# define FT_BL_TALLY(c)	__atomic_fetch_add(&(c), 1, __ATOMIC_RELAXED)
+#else
+# define FT_BL_TALLY(c)	do { } while (0)
+#endif
 static __thread struct cds_ft *ft_wlock_held;
 static __thread unsigned long ft_wlock_depth;
 
@@ -3562,6 +3631,17 @@ void ft_writer_lock_gp_wait(struct cds_ft *ft)
 	uint64_t ft_dbg_gp_t0 = ft_dbg_gp_clock();
 #endif
 	struct cds_ft *held = ft_wlock_held;
+
+	FT_BL_TALLY(ft_bl_seam_all);
+	if (ft_bulk_lock_held != NULL) {
+		FT_BL_TALLY(ft_bl_seam_under);
+	} else {
+		if (ft->exclusive)
+			FT_BL_TALLY(ft_bl_seam_excl);
+		if (ft_bulk_self_depth)
+			FT_BL_TALLY(ft_bl_seam_selfdepth);
+
+	}
 	unsigned long depth = ft_wlock_depth;
 	unsigned long own = 0;
 
@@ -3750,7 +3830,7 @@ extern __thread unsigned long ft_dbg_free_via;
 
 
 static inline
-void ft_bulk_gate_enter(struct cds_ft *ft, enum ft_bulk_kind kind)
+void ft_bulk_gate_enter_gp(struct cds_ft *ft, enum ft_bulk_kind kind)
 {
 	bool own_gp = false;
 
@@ -3881,6 +3961,84 @@ void ft_bulk_gate_enter(struct cds_ft *ft, enum ft_bulk_kind kind)
 }
 
 /*
+ * Take @bulk_lock: the BULK-vs-BULK serializer, held continuously across the
+ * drain seams.  Parks OFFLINE, which is legal here and NOT at the writer
+ * scope's entry: every waiter on this lock is another bulk op, and a bulk entry
+ * forbids a read-section caller, so no reader-derived reference is exposed by
+ * quiescing and no grace period is held up by a waiter.
+ *
+ * Reentrant on the same trie (bulk bodies nest).  An EXCLUSIVE trie skips it
+ * for the same reason it skips the writer lock: no concurrent writer exists.
+ */
+
+static inline
+void ft_bulk_lock_enter(struct cds_ft *ft)
+{
+	const struct rcu_flavor_struct *flavor = ft->group->flavor;
+
+	if (ft->exclusive)
+		return;
+	if (ft_bulk_lock_held == ft) {
+		ft_bulk_lock_depth++;
+		FT_BL_TALLY(ft_bl_nested);
+		return;
+	}
+	if (caa_unlikely(ft_bulk_lock_held != NULL)) {
+		/*
+		 * Two bulk locks at once: a bulk op gates ONE live trie (a
+		 * cross-trie op's source is exclusive and skips this), so a
+		 * second live trie here would be a lock-order inversion waiting
+		 * to deadlock.  Same disposition as the FT-wide lock's nest
+		 * check above: refuse loudly rather than leak a lock in a
+		 * release build, where an assert would be compiled out.
+		 */
+		fprintf(stderr, "[Fatal] Fractal Trie: bulk lock already held "
+				"on %p while entering %p\n",
+			(void *) ft_bulk_lock_held, (void *) ft);
+		abort();
+	}
+	flavor->thread_offline();
+	cds_fair_mutex_lock(&ft->bulk_lock, &ft_bulk_lock_waiter);
+	flavor->thread_online();
+	ft_bulk_lock_held = ft;
+	ft_bulk_lock_depth = 1;
+	FT_BL_TALLY(ft_bl_takes);
+}
+
+static inline
+void ft_bulk_lock_exit(struct cds_ft *ft)
+{
+	/*
+	 * Keys off HOLDER IDENTITY, never off @ft->exclusive -- exactly as
+	 * ft_writer_lock_scope_exit does.  Re-reading @exclusive here would
+	 * LEAK the lock if it flipped between enter and exit: the op took the
+	 * lock on a live trie and would then decline to release it.
+	 */
+	if (ft_bulk_lock_held != ft)
+		return;
+	if (--ft_bulk_lock_depth)
+		return;
+	ft_bulk_lock_held = NULL;
+	(void) cds_fair_mutex_unlock(&ft->bulk_lock, &ft_bulk_lock_waiter);
+}
+
+/*
+ * Enter the bulk window: the GATE first, then the BULK-vs-BULK lock.
+ *
+ * ORDER IS THE POINT.  The gate is refcounted and owns the grace period, so
+ * entering it first keeps the piggyback that makes "a burst of concurrent moves
+ * pays about ONE grace period between them, not one each" true -- peers share
+ * the GP inside the gate and only then queue on @bulk_lock.  Taking the lock
+ * first would serialize the GPs and make the burst pay one EACH.
+ */
+static inline
+void ft_bulk_gate_enter(struct cds_ft *ft, enum ft_bulk_kind kind)
+{
+	ft_bulk_gate_enter_gp(ft, kind);
+	ft_bulk_lock_enter(ft);
+}
+
+/*
  * The rekey spelling, unchanged for its callers: a move needs BOTH words.
  */
 static inline
@@ -3897,6 +4055,8 @@ void ft_move_gate_enter(struct cds_ft *ft)
 static inline
 void ft_bulk_gate_exit(struct cds_ft *ft, enum ft_bulk_kind kind)
 {
+	/* Reverse of the acquire order: @bulk_lock is INSIDE the gate. */
+	ft_bulk_lock_exit(ft);
 	ft_bulk_self_depth--;
 #ifdef FT_DEBUG_BULK_ELEV
 	ft_bulk_gate_depth--;		/* see @ft_bulk_elev_self */

@@ -940,6 +940,7 @@ enum cds_ft_status cds_ft_create(struct cds_ft_group *ft_group,
 	ft->lock_spacing = ft->lock_fine ? ft_group->lock_spacing :
 			CDS_FT_LOCK_SPACING_PER_NODE;
 	cds_fair_mutex_init(&ft->writer_lock);
+	cds_fair_mutex_init(&ft->bulk_lock);
 	/* Move mode gate (struct cds_ft::move_active): movers only. */
 	pthread_mutex_init(&ft->move_gate_lock, NULL);
 	pthread_cond_init(&ft->move_gate_cond, NULL);
