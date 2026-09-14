@@ -3190,7 +3190,7 @@ struct ft_ch_site {
 	unsigned long total, wlock, held, led, unheld, nolocks, noholder,
 		coarse_mode, aborting, some, ctxheld,
 		ctx_txn, ctx_extra, ctx_glue, ctx_outer,
-		wlock_pernode, wlock_bare, anchored;
+		wlock_pernode, wlock_bare, anchored, headword;
 };
 
 extern struct ft_ch_site ft_ch_sites[FT_CH_SITE_MAX];
@@ -3222,9 +3222,9 @@ struct ft_ch_site *ft_ch_site_of(const char *fn, int line, bool coarse)
  * nothing to say and the ledger is the only witness -- recorded as such.
  */
 static inline
-void ft_ch_audit_ctx_at(const char *fn, int line, const struct cds_ft *ft,
+void ft_ch_audit_owner_at(const char *fn, int line, const struct cds_ft *ft,
 		const struct ft_flip_txn *t, const struct ft_lock_ctx *ctx,
-		struct cds_ft_node *node)
+		struct cds_ft_node *node, struct cds_ft_inode_flag *owner_flag)
 {
 	struct ft_ch_site *s = ft_ch_site_of(fn, line, false);
 	struct cds_ft_inode_flag *h;
@@ -3322,6 +3322,37 @@ void ft_ch_audit_ctx_at(const char *fn, int line, const struct cds_ft *ft,
 	 */
 	if (t && t->acquire_miss) {
 		s->aborting++;
+		return;
+	}
+	/*
+	 * ☠ DO NOT DERIVE THE OWNER FROM THE WORD BEING WRITTEN.  For a head's
+	 * PARENT word (ft_ord_cell.parent, or cds_ft_node.prev of a head) the
+	 * owner IS the parent this store is installing, and
+	 * ft_chain_head_holder derives it by walking prev -- the very word in
+	 * flight.  That is circular, and it shows: every such site scored
+	 * NOHOLDER, 100,001 of 100,001 on inv_remove_cross_view, which is "no
+	 * verdict", not a pass.  Those callers pass @owner_flag and the
+	 * derivation is skipped.
+	 */
+	/*
+	 * ☠ THE HEAD PARENT-WORD CLASS IS COUNTED, NOT SCORED -- YET.  These
+	 * sites (ft_ord_cell.parent with the list on, a head's cds_ft_node.prev
+	 * with it off) are written by ft_set_parent, which wires a FRESH
+	 * cluster's back-edge as well as re-parenting a LIVE head.  A fresh node
+	 * is build-invisible and owes no exclusion at all -- note (5) of the
+	 * word-kind table says exactly that ("or the head is build-invisible").
+	 * Scoring without that discriminator reads 100% UNHELD by construction:
+	 * measured 100,001 of 100,001 on inv_remove_cross_view, 50,791 on
+	 * same_key_inserts.  Those are NOT violations, and this bucket exists so
+	 * no one reads them as such.
+	 *
+	 * ⇒ TO MAKE IT A VERDICT the CALLER must say whether the target is
+	 * published; ft_set_parent does not know, and the head's prev cannot
+	 * answer it either (with the list on a fresh head already carries its
+	 * cell).  That is the next step for this word class.
+	 */
+	if (owner_flag) {
+		s->headword++;
 		return;
 	}
 	h = ft_chain_head_holder((struct cds_ft *) ft, node);
@@ -3470,8 +3501,30 @@ void ft_ch_audit_coarse_at(const char *fn, int line)
 		s->some++;
 }
 
+static inline
+void ft_ch_audit_ctx_at(const char *fn, int line, const struct cds_ft *ft,
+		const struct ft_flip_txn *t, const struct ft_lock_ctx *ctx,
+		struct cds_ft_node *node)
+{
+	ft_ch_audit_owner_at(fn, line, ft, t, ctx, node, NULL);
+}
+
 #define ft_ch_audit(ft, t, node)					\
 	ft_ch_audit_ctx_at(__func__, __LINE__, (ft), (t), NULL, (node))
+
+/*
+ * The head-word arm declared in ft-helpers.h: a RAW store to a head's parent
+ * word -- ft_ord_cell.parent with the list on, cds_ft_node.prev of a head with
+ * it off.  No txn, so @t is NULL and there is no abort to hide behind; no ctx
+ * is in scope at those helpers either, so a MISS here is a LOWER bound on
+ * ownership exactly as ft_flip_txn_owns' header describes.
+ */
+static
+void ft_ch_audit_head_at(const char *fn, int line, const struct cds_ft *ft,
+		struct cds_ft_node *head, struct cds_ft_inode_flag *owner_flag)
+{
+	ft_ch_audit_owner_at(fn, line, ft, NULL, NULL, head, owner_flag);
+}
 #define ft_ch_audit_ctx(ft, t, ctx, node)				\
 	ft_ch_audit_ctx_at(__func__, __LINE__, (ft), (t), (ctx), (node))
 #define ft_ch_audit_at(fn, line, ft, t, node)				\
@@ -3493,10 +3546,10 @@ static void ft_ch_audit_report(void)
 		"OFF -- EVERY ROW BELOW IS A WRONG ZERO, NOT A MEASUREMENT "
 		"(rebuild with -DFEATURE_FT_HOLD_TRACE)");
 #endif
-	fprintf(stderr, "%-34s %6s %10s %9s %8s %8s %8s %8s %8s %7s %8s %8s %8s %6s\n",
+	fprintf(stderr, "%-34s %6s %10s %9s %8s %8s %8s %8s %8s %7s %8s %8s %8s %6s %7s\n",
 		"site (fn:line)", "kind", "total", "WLOCK", "HELD(reg)",
 		"HELD(led)", "HELD(ctx)", "anchored", "UNHELD", "nolocks",
-		"noholder", "coarseFT", "aborting", "SOME");
+		"noholder", "coarseFT", "aborting", "SOME", "headwd");
 	for (i = 0; i < ft_ch_site_n; i++) {
 		struct ft_ch_site *s = &ft_ch_sites[i];
 		char nm[35];
@@ -3504,11 +3557,11 @@ static void ft_ch_audit_report(void)
 		if (!s->total)
 			continue;
 		snprintf(nm, sizeof(nm), "%s:%d", s->fn, s->line);
-		fprintf(stderr, "%-34s %6s %10lu %9lu %8lu %8lu %8lu %8lu %8lu %7lu %8lu %8lu %8lu %6lu\n",
+		fprintf(stderr, "%-34s %6s %10lu %9lu %8lu %8lu %8lu %8lu %8lu %7lu %8lu %8lu %8lu %6lu %7lu\n",
 			nm, s->coarse ? "COARSE" : "FULL", s->total, s->wlock,
 			s->held, s->led, s->ctxheld, s->anchored, s->unheld,
 			s->nolocks, s->noholder, s->coarse_mode, s->aborting,
-			s->some);
+			s->some, s->headword);
 		if (s->wlock)
 			fprintf(stderr, "%-34s %6s   WLOCK breakdown: also-per-node=%lu  BARE(only the FT-wide hold)=%lu\n",
 				nm, "", s->wlock_pernode, s->wlock_bare);

@@ -15,6 +15,22 @@
 #error "ft-helpers.h is an implementation unit; #include it from fractal-trie.c only"
 #endif
 
+#ifdef FT_DEBUG_CHAIN_HOLD
+/*
+ * The duplicate-chain hold audit lives in ft-mutation-helpers.h (it needs the
+ * per-thread hold ledger defined there), which is included AFTER this file.
+ * Declare the head-word arm here and let the single TU resolve it -- the same
+ * arrangement ft_hlist_store_mw_at already uses for the audit's coarse arm.
+ */
+static void ft_ch_audit_head_at(const char *fn, int line,
+		const struct cds_ft *ft, struct cds_ft_node *head,
+		struct cds_ft_inode_flag *owner_flag);
+# define ft_ch_audit_head(ft, head, owner)				\
+	ft_ch_audit_head_at(__func__, __LINE__, (ft), (head), (owner))
+#else
+# define ft_ch_audit_head(ft, head, owner)	do { } while (0)
+#endif
+
 static inline __attribute__((unused))
 void static_array_size_check(void)
 {
@@ -1616,6 +1632,17 @@ void ft_publish_external_nodes_prev(struct cds_ft *ft,
 	 * ft_metadata_set_external_nodes.
 	 */
 	word = ft_head_parent_word(node_flag, /*prefix=*/ true);
+	/*
+	 * ☞ THE SECOND [debt] WORD CLASS, and this site writes BOTH spellings
+	 * of it: ft_ord_cell.parent (list on) and cds_ft_node.prev of a HEAD
+	 * (list off).  Owner is "the holder P" in the word-kind table -- the
+	 * node this head hangs under -- which is exactly what
+	 * ft_chain_head_holder derives, so the chain audit's predicate answers
+	 * for it unchanged.  Both stores are RAW rcu_assign_pointer with no txn
+	 * ("MW + raw" in the table), so nothing can abort them: if the holder is
+	 * not held here, the write lands regardless.
+	 */
+	ft_ch_audit_head(ft, external_nodes, node_flag);
 	if (ft->ordered_list)
 		ft_ord_cell_set_parent(external_nodes, word);
 	else
@@ -3560,6 +3587,8 @@ void ft_set_parent(struct cds_ft *ft, struct cds_ft_inode_flag *child_nf,
 
 		/* The up-walk edge byte, BEFORE the parent word: see the helper. */
 		ft_head_stamp_incoming_byte(ft, en, parent_nf, slot);
+		/* Same word class as the prefix-head store above. */
+		ft_ch_audit_head(ft, en, parent_nf);
 		if (ft->ordered_list)
 			ft_ord_cell_set_parent(en, word);
 		else
