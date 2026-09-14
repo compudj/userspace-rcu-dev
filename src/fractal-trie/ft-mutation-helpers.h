@@ -3190,7 +3190,7 @@ struct ft_ch_site {
 	unsigned long total, wlock, held, led, unheld, nolocks, noholder,
 		coarse_mode, aborting, some, ctxheld,
 		ctx_txn, ctx_extra, ctx_glue, ctx_outer,
-		wlock_pernode, wlock_bare;
+		wlock_pernode, wlock_bare, anchored;
 };
 
 extern struct ft_ch_site ft_ch_sites[FT_CH_SITE_MAX];
@@ -3372,6 +3372,76 @@ void ft_ch_audit_ctx_at(const char *fn, int line, const struct cds_ft *ft,
 			return;
 		}
 	}
+	/*
+	 * ☠ AND ABOVE PER-NODE SPACING THE OWNER IS NOT THE WORD.  Under
+	 * exponential / root-only, ft_anchor_meta maps a lock-set member to an
+	 * ANCHOR ANCESTOR, so every witness above -- all of which match by EXACT
+	 * owner identity -- misses a word that IS excluded.  Scoring that as
+	 * UNHELD condemns those spacings wholesale: measured at 33,238 /
+	 * 99,839 / 66,740 "violations" on rows that are CLEAN at per-node.
+	 *
+	 * The audit cannot resolve the exact anchor here (ft_anchor_meta needs
+	 * the op's descent and the holder's BYTE-depth, and a chain holder is
+	 * reached by walking prev, which yields neither).  So ask the weaker
+	 * question that is sound in the direction that matters: is ANY ancestor
+	 * of the holder held?  The anchor, whatever it is, IS an ancestor -- so
+	 * "no ancestor held" means no anchor can be covering this word, and only
+	 * that is scored UNHELD.  A hit is bucketed separately (@anchored)
+	 * because it is weaker than the per-node verdict: it proves an ancestor
+	 * is held, not that it is THE anchor.
+	 */
+	if (ft->lock_spacing == CDS_FT_LOCK_SPACING_ROOT_ONLY) {
+		/*
+		 * Root-only anchors EVERY member on the trie's root, which is
+		 * nameable directly -- the same slot, read the same way, as
+		 * ft_anchor_meta's own descent-less arm.  Exact here, and it
+		 * avoids walking parent words at all (see below).
+		 */
+		struct cds_ft_metadata *rm = ft_flag_to_metadata(ft,
+			ft_resolve_flip_proxy(rcu_dereference(ft->root)));
+		uintptr_t snap;
+		bool ratified;
+
+		if (rm && ((t && ft_flip_txn_owns(t, rm)) ||
+				ft_hold_trace_holds(rm) ||
+				(ctx && ft_lock_ctx_holds(ctx, rm, &snap,
+					&ratified)))) {
+			s->anchored++;
+			return;
+		}
+	} else if (ft->lock_spacing != CDS_FT_LOCK_SPACING_PER_NODE) {
+		struct cds_ft_inode_flag *af = ft_resolve_flip_proxy(
+			ft_parent_node(hm->parent_word));
+		unsigned int guard = 0;
+
+		/*
+		 * ☠ RESOLVE THE PROXY AND STOP AT AN EXTERNAL.  A parent word
+		 * can carry a peer's parked flip proxy, and ft_flag_to_metadata
+		 * on an EXTERNAL flag reads a metadata that is not there -- both
+		 * SEGV'd this walk before these two guards (measured: root-only
+		 * crashed 2 of 4 rows).  An instrument that faults is worse than
+		 * one that over-reports.
+		 */
+		while (af && guard++ < FT_MAX_DEPTH &&
+				!ft_node_external(af)) {
+			struct cds_ft_metadata *am =
+				ft_flag_to_metadata(ft, af);
+			uintptr_t snap;
+			bool ratified;
+
+			if (!am)
+				break;
+			if ((t && ft_flip_txn_owns(t, am)) ||
+					ft_hold_trace_holds(am) ||
+					(ctx && ft_lock_ctx_holds(ctx, am,
+						&snap, &ratified))) {
+				s->anchored++;
+				return;
+			}
+			af = ft_resolve_flip_proxy(
+				ft_parent_node(am->parent_word));
+		}
+	}
 	s->unheld++;
 	if (!ft_hold_trace_count())
 		s->nolocks++;	/* strictly worse: holds nothing whatsoever */
@@ -3423,10 +3493,10 @@ static void ft_ch_audit_report(void)
 		"OFF -- EVERY ROW BELOW IS A WRONG ZERO, NOT A MEASUREMENT "
 		"(rebuild with -DFEATURE_FT_HOLD_TRACE)");
 #endif
-	fprintf(stderr, "%-34s %6s %10s %9s %8s %8s %8s %8s %7s %8s %8s %8s %6s\n",
+	fprintf(stderr, "%-34s %6s %10s %9s %8s %8s %8s %8s %8s %7s %8s %8s %8s %6s\n",
 		"site (fn:line)", "kind", "total", "WLOCK", "HELD(reg)",
-		"HELD(led)", "HELD(ctx)", "UNHELD", "nolocks", "noholder",
-		"coarseFT", "aborting", "SOME");
+		"HELD(led)", "HELD(ctx)", "anchored", "UNHELD", "nolocks",
+		"noholder", "coarseFT", "aborting", "SOME");
 	for (i = 0; i < ft_ch_site_n; i++) {
 		struct ft_ch_site *s = &ft_ch_sites[i];
 		char nm[35];
@@ -3434,10 +3504,11 @@ static void ft_ch_audit_report(void)
 		if (!s->total)
 			continue;
 		snprintf(nm, sizeof(nm), "%s:%d", s->fn, s->line);
-		fprintf(stderr, "%-34s %6s %10lu %9lu %8lu %8lu %8lu %8lu %7lu %8lu %8lu %8lu %6lu\n",
+		fprintf(stderr, "%-34s %6s %10lu %9lu %8lu %8lu %8lu %8lu %8lu %7lu %8lu %8lu %8lu %6lu\n",
 			nm, s->coarse ? "COARSE" : "FULL", s->total, s->wlock,
-			s->held, s->led, s->ctxheld, s->unheld, s->nolocks,
-			s->noholder, s->coarse_mode, s->aborting, s->some);
+			s->held, s->led, s->ctxheld, s->anchored, s->unheld,
+			s->nolocks, s->noholder, s->coarse_mode, s->aborting,
+			s->some);
 		if (s->wlock)
 			fprintf(stderr, "%-34s %6s   WLOCK breakdown: also-per-node=%lu  BARE(only the FT-wide hold)=%lu\n",
 				nm, "", s->wlock_pernode, s->wlock_bare);
