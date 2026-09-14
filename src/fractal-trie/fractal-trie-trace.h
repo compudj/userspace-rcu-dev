@@ -463,6 +463,42 @@ static inline
 void ft_op_retry_init(struct ft_op_retry *r, unsigned int op,
 		const uint8_t *key, size_t key_len)
 {
+	/*
+	 * ☠ PER OP, NOT PER THREAD.  The refusal and parker counters are
+	 * `static __thread` and nothing used to clear them, so the cap's
+	 * fingerprint summed every refusal the thread had EVER suffered.  A
+	 * `streak=15878 switches=2` read as "one word refused 15878 times in
+	 * this op" when it was the thread's lifetime total across a workload
+	 * whose eight keys all hang off ONE junction -- i.e. it said nothing.
+	 * The cap's whole question is "did THIS call converge", so its evidence
+	 * has to have THIS call's scope.
+	 */
+	ft_dbg_lock_refuse_lock = 0;
+	ft_dbg_lock_refuse_proxy = 0;
+	ft_dbg_lock_refuse_tomb = 0;
+	ft_dbg_lock_refuse_state = 0;
+	ft_dbg_lock_refuse_meta = NULL;
+	ft_dbg_lock_refuse_streak = 0;
+	ft_dbg_lock_refuse_switches = 0;
+	ft_dbg_proxy_desc = NULL;
+	ft_dbg_proxy_status = 0;
+	ft_dbg_proxy_streak = 0;
+	ft_dbg_proxy_switches = 0;
+	ft_dbg_proxy_nr = 0;
+	ft_dbg_proxy_nr_mw = 0;
+	ft_dbg_proxy_poisoned = 0;
+	ft_dbg_proxy_retry = 0;
+	ft_dbg_proxy_rec_old = 0;
+	ft_dbg_proxy_rec_new = 0;
+	ft_dbg_retry_line = 0;
+	ft_dbg_retry_line_nr = 0;
+	ft_dbg_retry_line_other = 0;
+	ft_dbg_eagain_line = 0;
+	ft_dbg_eagain_line_nr = 0;
+	ft_dbg_eagain_line_other = 0;
+	ft_dbg_acq_line = 0;
+	ft_dbg_acq_line_nr = 0;
+	ft_dbg_acq_line_other = 0;
 	r->attempts = 0;
 	r->op = op;
 	r->key = key;

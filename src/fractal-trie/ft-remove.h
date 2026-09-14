@@ -5769,6 +5769,38 @@ int ft_unchain_node(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		}
 	}
 
+	/*
+	 * ☑ IS @node's CHAIN RETIRED, though @node itself is not?  Asked HERE --
+	 * after the lock_fine acquire block and before any edge is derived --
+	 * because this is the one point where the prev walk is stable in BOTH
+	 * writer modes: FINE holds the chain holder by now, COARSE holds the
+	 * FT-wide writer lock throughout.
+	 *
+	 * ☠ INSIDE the `if (ft->lock_fine)` block it does not run under COARSE at
+	 * all, and COARSE then has NO protection: a whole-chain displacement
+	 * freezes only the HEAD (a txn is bounded, a chain is not), so a member
+	 * of a displaced chain is retired and UNMARKED, the interior lane derives
+	 * @pred from a stale prev, and the edge it records has an expected-old
+	 * the slot can never hold -- 50001 laps and a memcg kill.  Measured:
+	 * inv_concurrent_insert_replace_coarse died at ft_inv test 152.
+	 *
+	 * ☠ AND AT THE ENTRY ARM IT IS UNHELD, which is worse than useless: the
+	 * walk then catches the window where a head remove has marked H but not
+	 * yet relinked the members onto the promoted successor, and calls a chain
+	 * that is merely losing its head "retired" -- a FALSE NOT_FOUND that
+	 * LOSES A KEY (inv_concurrent_same_key_removes, count_keys 65 != 64).
+	 * ft_chain_head_is_removed says HOLDER-LOCK CALLERS ONLY for this reason.
+	 *
+	 * -ESTALE, not -ENOENT: the wrapper routes -EAGAIN/-ENOENT to RETRY, and
+	 * a retry only terminates if the ENTRY arm can answer the same question,
+	 * which it cannot.  -ESTALE is definitive and answers NOT_FOUND.
+	 */
+	if (ft_chain_head_is_removed(node)) {
+		if (hmeta)
+			ft_meta_lock_release(hmeta);
+		return -ESTALE;
+	}
+
 	next_node = ft_node_next(node);
 
 	FT_TP(unchain_node, (const void *) head_slot, (const void *) node,
@@ -6252,6 +6284,49 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 		ft_dbg_rm_site = __LINE__;
 #endif
 		return CDS_FT_STATUS_NOT_FOUND;
+	}
+	/*
+	 * ...AND A MEMBER WHOSE PREDECESSOR NO LONGER OWNS IT IS EQUALLY GONE,
+	 * with no tombstone anywhere to say so.
+	 *
+	 * The mark above is a PER-NODE fact, and a whole-chain displacement
+	 * cannot write it on every member: cds_ft_insert_replace swings the
+	 * anchor slot to a fresh head and freezes only the OLD HEAD in that
+	 * commit, because a txn is bounded and a chain is not.  Asking the head
+	 * instead does not work either -- the head is a CALLER-OWNED node, and
+	 * re-arming it for reuse (cds_ft_node_init, which the API permits the
+	 * moment the chain is handed back) erases the very mark the question
+	 * reads.
+	 *
+	 * So ask the structure, not a flag: an interior member is in a live
+	 * chain iff its predecessor still points AT it.  A displaced member's
+	 * @prev names a node that has been recycled or relinked, whose next is
+	 * NULL or someone else -- exactly the condition under which the interior
+	 * lane would record `pred->next: elem -> next` against a slot that can
+	 * never hold @elem, and spin forever (50001 attempts, then a memcg kill;
+	 * five single-threaded calls reproduce it).
+	 *
+	 * Both loads are proxy-resolved and mark-masked, so a peer mid-commit
+	 * reads as the word before or after it, never as a descriptor: a peer
+	 * unlinking @pred has already relinked ITS predecessor at @node, and a
+	 * peer removing @node itself is caught by the mark above.  Unheld, like
+	 * the mark test it follows -- both are statements about the node the
+	 * CALLER handed us, and the answer is NOT_FOUND either way.
+	 */
+	{
+		void *nprev = ft_dereference_prev_resolved(node);
+
+		if (nprev &&
+		    ft_node_external((struct cds_ft_inode_flag *) nprev) &&
+		    ft_hlist_next_rcu((struct cds_ft_node *) nprev) != node) {
+			dbg_printf("cds_ft_remove: node %p is not in its predecessor's chain\n",
+				node);
+			FT_TP(remove_exit, (int) CDS_FT_STATUS_NOT_FOUND);
+#ifdef FT_ENABLE_TRACING
+			ft_dbg_rm_site = __LINE__;
+#endif
+			return CDS_FT_STATUS_NOT_FOUND;
+		}
 	}
 
 	/*
@@ -7213,6 +7288,20 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 		FT_TP(remove_exit, (int) CDS_FT_STATUS_MEMORY_ERROR);
 		FT_RM_RELEASE();
 		return CDS_FT_STATUS_MEMORY_ERROR;
+	case -ESTALE:
+		/*
+		 * @node's CHAIN left the trie (a whole-chain displacement
+		 * freezes only its head), established UNDER THE HOLDER by
+		 * ft_unchain_node.  Definitive, so it answers NOT_FOUND rather
+		 * than joining the retry cases below: re-deriving would find the
+		 * same retired chain every lap.
+		 */
+		FT_TP(remove_exit, (int) CDS_FT_STATUS_NOT_FOUND);
+#ifdef FT_ENABLE_TRACING
+		ft_dbg_rm_site = __LINE__;
+#endif
+		FT_RM_RELEASE();
+		return CDS_FT_STATUS_NOT_FOUND;
 	case -EAGAIN:
 	case -ENOENT:
 		/*

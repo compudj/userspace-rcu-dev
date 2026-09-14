@@ -4000,7 +4000,8 @@ restart_replace_attempt:
 					};
 					struct ft_flip_txn *txn =
 						ft_flip_txn_create_bounded(ft,
-						FT_ORD_CELL_SWAP_PUBLISH_MAX_EDGES + 1);
+						FT_ORD_CELL_SWAP_PUBLISH_MAX_EDGES + 1 +
+						FT_HLIST_FREEZE_MAX_EDGES);
 
 					/*
 					 * The flip is the op's sole side-effect (the
@@ -4018,7 +4019,33 @@ restart_replace_attempt:
 						ret = -ENOMEM;
 						goto insert_replace_done;
 					}
-					ft_flip_txn_guard_parent(ft, txn, d.nf);
+					/*
+					 * ★ ACQUIRE THE NEAREST ANCHOR LOCK, do not merely VALIDATE it.
+					 *
+					 * This op used to §4.B-guard the holder at all four of its publish
+					 * sites and never take it.  Its converted siblings ACQUIRE:
+					 * cds_ft_replace hoists the chain holder above its routing
+					 * derivation (@9e62dc3b), and cds_ft_remove's INTERIOR unlink holds
+					 * it too (ft_chain_head_holder + ft_acquire_member, dated
+					 * FT_DEPTH_FROM_DESCENT through ft_lock_ctx_depth_of).
+					 *
+					 * ☠ A VALIDATOR AND A LOCKER ON ONE WORD DO NOT EXCLUDE EACH OTHER.
+					 * So remove could be relinking a chain's interior under the holder's
+					 * lock while this op displaced the whole chain out from under it.
+					 * Two symptoms came of that: a remove that spun forever on a stale
+					 * back-edge, and an append onto a chain that no longer existed.
+					 * Tombstoning the displaced chain is the interop invariant
+					 * ft-txn-hlist.h demands and it makes those states DETECTABLE;
+					 * holding this word is what makes them not happen.
+					 *
+					 * FT_DEPTH_FROM_DESCENT: the descent window dates it, exactly as the
+					 * plain insert's publish does.  BEFORE the record, never after --
+					 * the record asks ft_flip_txn_owns who owns the word it writes, so
+					 * the registry has to name the holder already.
+					 */
+					ft_lock_ctx_init(&actx, &d, txn, &optxn);
+					ft_flip_txn_lock_or_guard_parent(ft, txn, &actx, d.nf,
+						FT_DEPTH_FROM_DESCENT);
 					ft_replace_fault_arm_abort(txn);
 					/*
 					 * On a peer-conflict ABORT the commit installs
@@ -4030,6 +4057,33 @@ restart_replace_attempt:
 					 * @precell (nothing was published, so it is still
 					 * ours), exactly as the head arms below do.
 					 */
+					/*
+					 * ☑ FREEZE THE DISPLACED HEAD **IN THIS COMMIT**, while the holder is
+					 * held -- do not sweep it afterwards.
+					 *
+					 * ft_hlist_freeze_prepare's own doc gives the reason: folding the mark
+					 * into the head op's structural flip-txn "makes the freeze and the
+					 * anchor edge commit atomically -- a reader is never shown @node's head
+					 * anchor promoted away while @node is still unmarked".  cds_ft_replace
+					 * has always done this for the one node it displaces; this op displaces
+					 * a whole chain and did neither, then marked it with a BARE CAS after
+					 * the commit had already released the holder.
+					 *
+					 * ☠ THAT SWEEP WAS THE UNHELD PRODUCER.  cds_ft_node.next is owned by
+					 * the chain HOLDER (the word-kind table, fractal-trie-internal.h), and
+					 * an unheld bare CAS on an owned word is the "ownership OBSERVED, never
+					 * TAKEN" case that table forbids: it can land underneath a del_prepare
+					 * that already passed its entry validate, turning the loaded next into
+					 * MARK(NULL) -- the bare value 2 -- so the backward edge records slot
+					 * &((struct cds_ft_node *) 2)->prev and the commit faults.  Measured 8/8.
+					 * It is also what stands between cds_ft_node.next/.prev and the SW park
+					 * their [debt] row is destined for.
+					 *
+					 * One edge (FT_HLIST_FREEZE_MAX_EDGES), reserved above.  The HEAD only:
+					 * a chain is unbounded and a txn is not.
+					 */
+					if (displaced)
+						ft_hlist_freeze_prepare(ft_flip_txn_handle(txn), displaced);
 					if (ft_ord_cell_swap_publish_multi(ft, old_cell,
 							precell, &sedge, 1, txn) != 0) {
 						ret = -EAGAIN;
@@ -4059,17 +4113,71 @@ restart_replace_attempt:
 							node,
 					};
 					struct ft_flip_txn *txn =
-						ft_flip_txn_create_bounded(ft, 2);
+						ft_flip_txn_create_bounded(ft, 2 +
+							FT_HLIST_FREEZE_MAX_EDGES);
 
 					if (!txn) {
 						ret = -ENOMEM;
 						goto insert_replace_done;
 					}
-					ft_flip_txn_guard_parent(ft, txn, d.nf);
+					/*
+					 * ★ ACQUIRE THE NEAREST ANCHOR LOCK, do not merely VALIDATE it.
+					 *
+					 * This op used to §4.B-guard the holder at all four of its publish
+					 * sites and never take it.  Its converted siblings ACQUIRE:
+					 * cds_ft_replace hoists the chain holder above its routing
+					 * derivation (@9e62dc3b), and cds_ft_remove's INTERIOR unlink holds
+					 * it too (ft_chain_head_holder + ft_acquire_member, dated
+					 * FT_DEPTH_FROM_DESCENT through ft_lock_ctx_depth_of).
+					 *
+					 * ☠ A VALIDATOR AND A LOCKER ON ONE WORD DO NOT EXCLUDE EACH OTHER.
+					 * So remove could be relinking a chain's interior under the holder's
+					 * lock while this op displaced the whole chain out from under it.
+					 * Two symptoms came of that: a remove that spun forever on a stale
+					 * back-edge, and an append onto a chain that no longer existed.
+					 * Tombstoning the displaced chain is the interop invariant
+					 * ft-txn-hlist.h demands and it makes those states DETECTABLE;
+					 * holding this word is what makes them not happen.
+					 *
+					 * FT_DEPTH_FROM_DESCENT: the descent window dates it, exactly as the
+					 * plain insert's publish does.  BEFORE the record, never after --
+					 * the record asks ft_flip_txn_owns who owns the word it writes, so
+					 * the registry has to name the holder already.
+					 */
+					ft_lock_ctx_init(&actx, &d, txn, &optxn);
+					ft_flip_txn_lock_or_guard_parent(ft, txn, &actx, d.nf,
+						FT_DEPTH_FROM_DESCENT);
 					ft_replace_fault_arm_abort(txn);
 					/* Installs nothing on either failure, as the
 					 * head arm: ABORT -> -EAGAIN (retry),
 					 * MEMORY_ERROR -> -ENOMEM (do not). */
+					/*
+					 * ☑ FREEZE THE DISPLACED HEAD **IN THIS COMMIT**, while the holder is
+					 * held -- do not sweep it afterwards.
+					 *
+					 * ft_hlist_freeze_prepare's own doc gives the reason: folding the mark
+					 * into the head op's structural flip-txn "makes the freeze and the
+					 * anchor edge commit atomically -- a reader is never shown @node's head
+					 * anchor promoted away while @node is still unmarked".  cds_ft_replace
+					 * has always done this for the one node it displaces; this op displaces
+					 * a whole chain and did neither, then marked it with a BARE CAS after
+					 * the commit had already released the holder.
+					 *
+					 * ☠ THAT SWEEP WAS THE UNHELD PRODUCER.  cds_ft_node.next is owned by
+					 * the chain HOLDER (the word-kind table, fractal-trie-internal.h), and
+					 * an unheld bare CAS on an owned word is the "ownership OBSERVED, never
+					 * TAKEN" case that table forbids: it can land underneath a del_prepare
+					 * that already passed its entry validate, turning the loaded next into
+					 * MARK(NULL) -- the bare value 2 -- so the backward edge records slot
+					 * &((struct cds_ft_node *) 2)->prev and the commit faults.  Measured 8/8.
+					 * It is also what stands between cds_ft_node.next/.prev and the SW park
+					 * their [debt] row is destined for.
+					 *
+					 * One edge (FT_HLIST_FREEZE_MAX_EDGES), reserved above.  The HEAD only:
+					 * a chain is unbounded and a txn is not.
+					 */
+					if (displaced)
+						ft_hlist_freeze_prepare(ft_flip_txn_handle(txn), displaced);
 					ret = ft_flip_status_to_errno(
 						ft_ord_cell_flip_into(ft, txn,
 							&sedge, 1));
@@ -4222,14 +4330,40 @@ restart_replace_attempt:
 					struct ft_flip_txn *txn =
 						ft_flip_txn_create_bounded(ft,
 							FT_ORD_CELL_SWAP_PUBLISH_MAX_EDGES +
-							1 /* §4.B parent guard */);
+							1 /* §4.B parent guard */ +
+							FT_HLIST_FREEZE_MAX_EDGES);
 
 					if (!txn) {
 						ret = -ENOMEM;
 						goto insert_replace_done;
 					}
-					/* VALIDATE (§4.B): guard the LIVE holder @d.pnf. */
-					ft_flip_txn_guard_parent(ft, txn, d.pnf);
+					/*
+					 * ★ ACQUIRE THE NEAREST ANCHOR LOCK, do not merely VALIDATE it.
+					 *
+					 * This op used to §4.B-guard the holder at all four of its publish
+					 * sites and never take it.  Its converted siblings ACQUIRE:
+					 * cds_ft_replace hoists the chain holder above its routing
+					 * derivation (@9e62dc3b), and cds_ft_remove's INTERIOR unlink holds
+					 * it too (ft_chain_head_holder + ft_acquire_member, dated
+					 * FT_DEPTH_FROM_DESCENT through ft_lock_ctx_depth_of).
+					 *
+					 * ☠ A VALIDATOR AND A LOCKER ON ONE WORD DO NOT EXCLUDE EACH OTHER.
+					 * So remove could be relinking a chain's interior under the holder's
+					 * lock while this op displaced the whole chain out from under it.
+					 * Two symptoms came of that: a remove that spun forever on a stale
+					 * back-edge, and an append onto a chain that no longer existed.
+					 * Tombstoning the displaced chain is the interop invariant
+					 * ft-txn-hlist.h demands and it makes those states DETECTABLE;
+					 * holding this word is what makes them not happen.
+					 *
+					 * FT_DEPTH_FROM_DESCENT: the descent window dates it, exactly as the
+					 * plain insert's publish does.  BEFORE the record, never after --
+					 * the record asks ft_flip_txn_owns who owns the word it writes, so
+					 * the registry has to name the holder already.
+					 */
+					ft_lock_ctx_init(&actx, &d, txn, &optxn);
+					ft_flip_txn_lock_or_guard_parent(ft, txn, &actx, d.pnf,
+						FT_DEPTH_FROM_DESCENT);
 					ft_replace_fault_arm_abort(txn);
 					/*
 					 * On a peer-conflict ABORT the commit installs
@@ -4239,6 +4373,33 @@ restart_replace_attempt:
 					 * attempt -- and do NOT free @old_cell (the swap did
 					 * not happen).
 					 */
+					/*
+					 * ☑ FREEZE THE DISPLACED HEAD **IN THIS COMMIT**, while the holder is
+					 * held -- do not sweep it afterwards.
+					 *
+					 * ft_hlist_freeze_prepare's own doc gives the reason: folding the mark
+					 * into the head op's structural flip-txn "makes the freeze and the
+					 * anchor edge commit atomically -- a reader is never shown @node's head
+					 * anchor promoted away while @node is still unmarked".  cds_ft_replace
+					 * has always done this for the one node it displaces; this op displaces
+					 * a whole chain and did neither, then marked it with a BARE CAS after
+					 * the commit had already released the holder.
+					 *
+					 * ☠ THAT SWEEP WAS THE UNHELD PRODUCER.  cds_ft_node.next is owned by
+					 * the chain HOLDER (the word-kind table, fractal-trie-internal.h), and
+					 * an unheld bare CAS on an owned word is the "ownership OBSERVED, never
+					 * TAKEN" case that table forbids: it can land underneath a del_prepare
+					 * that already passed its entry validate, turning the loaded next into
+					 * MARK(NULL) -- the bare value 2 -- so the backward edge records slot
+					 * &((struct cds_ft_node *) 2)->prev and the commit faults.  Measured 8/8.
+					 * It is also what stands between cds_ft_node.next/.prev and the SW park
+					 * their [debt] row is destined for.
+					 *
+					 * One edge (FT_HLIST_FREEZE_MAX_EDGES), reserved above.  The HEAD only:
+					 * a chain is unbounded and a txn is not.
+					 */
+					if (displaced)
+						ft_hlist_freeze_prepare(ft_flip_txn_handle(txn), displaced);
 					if (ft_ord_cell_swap_publish_multi(ft, old_cell,
 							precell, sedges, n_sedge,
 							txn) != 0) {
@@ -4261,17 +4422,70 @@ restart_replace_attempt:
 					struct ft_flip_txn *txn =
 						ft_flip_txn_create_bounded(ft,
 							FT_PUB_SEDGE_MAX_EDGES +
-							1 /* §4.B parent guard */);
+							1 /* §4.B parent guard */ +
+							FT_HLIST_FREEZE_MAX_EDGES);
 
 					if (!txn) {
 						ret = -ENOMEM;
 						goto insert_replace_done;
 					}
-					/* VALIDATE (§4.B): guard the LIVE holder @d.pnf. */
-					ft_flip_txn_guard_parent(ft, txn, d.pnf);
+					/*
+					 * ★ ACQUIRE THE NEAREST ANCHOR LOCK, do not merely VALIDATE it.
+					 *
+					 * This op used to §4.B-guard the holder at all four of its publish
+					 * sites and never take it.  Its converted siblings ACQUIRE:
+					 * cds_ft_replace hoists the chain holder above its routing
+					 * derivation (@9e62dc3b), and cds_ft_remove's INTERIOR unlink holds
+					 * it too (ft_chain_head_holder + ft_acquire_member, dated
+					 * FT_DEPTH_FROM_DESCENT through ft_lock_ctx_depth_of).
+					 *
+					 * ☠ A VALIDATOR AND A LOCKER ON ONE WORD DO NOT EXCLUDE EACH OTHER.
+					 * So remove could be relinking a chain's interior under the holder's
+					 * lock while this op displaced the whole chain out from under it.
+					 * Two symptoms came of that: a remove that spun forever on a stale
+					 * back-edge, and an append onto a chain that no longer existed.
+					 * Tombstoning the displaced chain is the interop invariant
+					 * ft-txn-hlist.h demands and it makes those states DETECTABLE;
+					 * holding this word is what makes them not happen.
+					 *
+					 * FT_DEPTH_FROM_DESCENT: the descent window dates it, exactly as the
+					 * plain insert's publish does.  BEFORE the record, never after --
+					 * the record asks ft_flip_txn_owns who owns the word it writes, so
+					 * the registry has to name the holder already.
+					 */
+					ft_lock_ctx_init(&actx, &d, txn, &optxn);
+					ft_flip_txn_lock_or_guard_parent(ft, txn, &actx, d.pnf,
+						FT_DEPTH_FROM_DESCENT);
 					ft_replace_fault_arm_abort(txn);
 					/* -EAGAIN on a peer-conflict ABORT (nothing
 					 * installed); the op's own retry loop re-descends. */
+					/*
+					 * ☑ FREEZE THE DISPLACED HEAD **IN THIS COMMIT**, while the holder is
+					 * held -- do not sweep it afterwards.
+					 *
+					 * ft_hlist_freeze_prepare's own doc gives the reason: folding the mark
+					 * into the head op's structural flip-txn "makes the freeze and the
+					 * anchor edge commit atomically -- a reader is never shown @node's head
+					 * anchor promoted away while @node is still unmarked".  cds_ft_replace
+					 * has always done this for the one node it displaces; this op displaces
+					 * a whole chain and did neither, then marked it with a BARE CAS after
+					 * the commit had already released the holder.
+					 *
+					 * ☠ THAT SWEEP WAS THE UNHELD PRODUCER.  cds_ft_node.next is owned by
+					 * the chain HOLDER (the word-kind table, fractal-trie-internal.h), and
+					 * an unheld bare CAS on an owned word is the "ownership OBSERVED, never
+					 * TAKEN" case that table forbids: it can land underneath a del_prepare
+					 * that already passed its entry validate, turning the loaded next into
+					 * MARK(NULL) -- the bare value 2 -- so the backward edge records slot
+					 * &((struct cds_ft_node *) 2)->prev and the commit faults.  Measured 8/8.
+					 * It is also what stands between cds_ft_node.next/.prev and the SW park
+					 * their [debt] row is destined for.
+					 *
+					 * One edge (FT_HLIST_FREEZE_MAX_EDGES), reserved above.  The HEAD only:
+					 * a chain is unbounded and a txn is not.
+					 */
+					if (displaced)
+						ft_hlist_freeze_prepare(ft_flip_txn_handle(txn), displaced);
 					if (ft_ord_cell_flip_into(ft, txn, sedges,
 							n_sedge) != 0) {
 						ret = -EAGAIN;
@@ -4417,28 +4631,27 @@ insert_replace_done:
 	}
 	if (ret == 0) {
 		/*
-		 * ☠ TOMBSTONE THE CHAIN THIS OP DISPLACED.  Its sibling
-		 * _cds_ft_replace_locked freezes the ONE node it displaces (three
-		 * sites); this op displaced a whole CHAIN and used to freeze none of
-		 * it, so a caller still holding one of those nodes had no way to
-		 * learn it had left the trie -- and neither did cds_ft_remove, whose
-		 * ft_node_is_removed() escape exists precisely for "a peer removed
-		 * @node itself since the derivation: the interior lane would
-		 * otherwise unlink a ghost".  With that escape defeated, remove took
-		 * the interior lane on the ghost, derived @pred from a stale prev and
-		 * recorded `pred->next: elem -> next` against a slot that can never
-		 * hold @elem -- 50001 attempts and no exit.  Reproducible in FIVE
-		 * single-threaded calls: insert A at K, insert B at K,
-		 * insert_replace C at K, re-init A and insert it elsewhere, remove B.
+		 * ☞ NO TOMBSTONE SWEEP HERE, DELIBERATELY -- the displaced HEAD's
+		 * freeze rides the displacing commit instead, under the holder.
 		 *
-		 * AFTER the publish, not fused with it: the marks are sound only once
-		 * the chain is unreachable, and ft_chain_mark_removed_flip leaves the
-		 * successor pointers intact so the caller can still walk what it was
-		 * handed in order to reclaim it.  Same ordering cds_ft_remove_all
-		 * uses (mark on ret == 0).
+		 * A sweep here was the first cure and it was the wrong one: it ran
+		 * AFTER the commit had released the holder, so it was a bare CAS by a
+		 * non-owner on cds_ft_node.next -- a word the word-kind table gives to
+		 * the chain HOLDER.  That is "ownership OBSERVED, never TAKEN", and it
+		 * landed underneath del_prepare / replace_prepare calls that had
+		 * already passed their entry validate: 8/8 SEGV.
+		 *
+		 * ☐ WHAT THIS LEAVES OWED.  Only the head is marked, so a displaced
+		 * MEMBER still reads as live by ft_node_is_removed (which is a
+		 * per-node test of node->next).  Under the holder the head is always
+		 * reachable from a member -- ft_chain_head_holder already walks prev
+		 * to it -- so the paired half is a liveness predicate that answers
+		 * "own next marked OR HEAD marked", called at the validate points
+		 * that already hold the holder.  Until that lands, an op handed a
+		 * displaced member can still act on a chain that has left the trie.
+		 * That is a smaller and quieter wrong than an unheld writer on an
+		 * owned word, but it is not nothing, and it is the next step.
 		 */
-		if (displaced)
-			ft_chain_mark_removed_flip(ft, displaced);
 		if (key_len > uatomic_load(&ft->max_used_key_len, CMM_RELAXED))
 			uatomic_store(&ft->max_used_key_len, key_len, CMM_RELAXED);
 	}

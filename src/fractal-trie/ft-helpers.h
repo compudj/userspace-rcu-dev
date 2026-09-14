@@ -1416,6 +1416,52 @@ struct cds_ft_inode_flag *ft_node_holder(struct cds_ft *ft,
 }
 
 /*
+ * ft_chain_head_is_removed: is @node's CHAIN retired, as opposed to @node
+ * itself?  Walks prev to the head (the same walk ft_chain_head_holder does) and
+ * asks ft_node_is_removed of THAT.
+ *
+ * ★ WHY A CHAIN NEEDS A LIVENESS ANSWER ITS MEMBERS CANNOT GIVE.  A whole-chain
+ * displacement -- cds_ft_insert_replace swinging the anchor slot to a fresh head
+ * -- retires every node at once, but a txn is bounded and a chain is not, so
+ * only the HEAD's freeze can ride the displacing commit
+ * (ft_hlist_freeze_prepare).  The members are therefore RETIRED BUT UNMARKED,
+ * and ft_node_is_removed -- a per-node test of node->next -- answers "live" for
+ * every one of them.  An op that believes it goes on to unlink a ghost: its
+ * @pred comes from a stale prev, and the `pred->next: elem -> next` edge it
+ * records can never match, which is a livelock, not an error.
+ *
+ * ☠ MARKING THE MEMBERS INSTEAD IS THE WRONG CURE, and was tried: a post-commit
+ * sweep is a BARE CAS by a non-owner on cds_ft_node.next, a word the word-kind
+ * table gives to the chain HOLDER.  It lands underneath ops that already
+ * validated and turns their loaded next into MARK(NULL) -- the bare value 2 --
+ * so a backward edge records slot &((struct cds_ft_node *) 2)->prev.  Measured
+ * 8/8 SEGV.  Asking the head costs a walk the caller is already making and
+ * writes nothing.
+ *
+ * HOLDER-LOCK CALLERS ONLY, exactly as ft_chain_head_holder: the prev walk is
+ * not stable under a concurrent relink.  Returns false for a never-inserted
+ * node (prev NULL).
+ */
+static inline
+bool ft_chain_head_is_removed(struct cds_ft_node *node)
+{
+	struct cds_ft_node *cur = node;
+
+	for (;;) {
+		void *prev = (void *) ft_resolve_flip_proxy(
+			(struct cds_ft_inode_flag *)
+			rcu_dereference(cur->prev));
+
+		if (!prev)
+			return false;
+		if (!ft_node_external((struct cds_ft_inode_flag *) prev))
+			break;			/* @cur is the head */
+		cur = (struct cds_ft_node *) prev;
+	}
+	return ft_node_is_removed(cur);
+}
+
+/*
  * ft_chain_head_holder: resolve the trie HOLDER (the head's IMMEDIATE PARENT)
  * of @node's duplicate chain -- the single lockable state-word node every op on
  * the chain serialises on (MW LOCK_FINE holder lock).  @node may be the head

@@ -197,17 +197,18 @@ struct cds_ft_node *ft_hlist_next_rcu(struct cds_ft_node *node)
  * FILE'S HEADER STATES.
  * The header promises that a structural head-remove's MARK(H->next) is what
  * makes "a concurrent insert_after(H) onto a sole-node chain see the mark and
- * abort" -- but nothing below looks at the mark.  The remove side upholds its
+ * abort" -- and the check below was deleted, so for a while nothing looked at
+ * the mark.  The remove side upholds its
  * half (ft_hlist_freeze_sole_prepare marks a derived NULL); the insert side no
  * longer checks, and a MARK(NULL) @pos->next reads back as the bare value 2,
  * which passes `succ != NULL` and makes the second store record slot
  * &((struct cds_ft_node *) 2)->prev.  Under LOCK_FINE, where insert and remove
  * are concurrent on the same key by contract, the append's head is derived
  * before the holder acquire, so this is reachable in principle -- the mirror of
- * the remove-side routing defect.  UNPROVEN by test; do not delete the mark
- * check's obituary without either restoring the check or proving the shape
- * unreachable.  Always returns 0; the int return is retained for caller-shape
- * parity with the concurrent front-ends (mirrors urcu_txn_sw_list_*_prepare).
+ * the remove-side routing defect.  ☑ IT IS NO LONGER "UNPROVEN BY TEST": the
+ * shape is reachable, inv_concurrent_insert_replace_nolist reaches it, and the
+ * check is RESTORED below as a refusal.  Returns 0, or -ENOENT when @pos is a
+ * retired head; the int return was retained for exactly this.
  */
 static inline
 int ft_hlist_insert_after_prepare(struct urcu_txn *txn,
@@ -218,14 +219,32 @@ int ft_hlist_insert_after_prepare(struct urcu_txn *txn,
 			urcu_txn_load(txn, (void **) &pos->next, FT_HLIST_TAG);
 
 	/*
-	 * FT-SLOT-2's RED CONTROL.  @pos->next MARKED means @pos is a RETIRED
-	 * head and this append is building onto a chain that no longer exists:
-	 * MARK(NULL) reads back as the bare value 2, passes `succ != NULL`
-	 * below, and makes the second store record slot
-	 * &((struct cds_ft_node *) 2)->prev.  The interop invariant this file's
-	 * header states is exactly that this case is SEEN here.
+	 * ☑ THE MARK CHECK IS BACK, and it is a REFUSAL now, not an assert.
+	 *
+	 * @pos->next MARKED means @pos is a RETIRED head and this append is
+	 * building onto a chain that no longer exists.  Left unchecked it is a
+	 * LOST INSERT: MARK(NULL) reads back as the bare value 2, passes
+	 * `succ != NULL` below, and makes the second store record slot
+	 * &((struct cds_ft_node *) 2)->prev.  This file's header states the
+	 * interop invariant in as many words -- the structural head-remove marks
+	 * H->next in its own commit "so a concurrent insert_after(H) onto a
+	 * sole-node chain sees the mark and ABORTS".  Seeing it is this line.
+	 *
+	 * ☠ IT WAS UNPROVEN AND IS NOW PROVEN.  The obituary above asked for
+	 * "either restoring the check or proving the shape unreachable"; the
+	 * shape is reachable, and cds_ft_insert_replace is the producer -- it
+	 * displaces a whole chain, and once it TOMBSTONES what it displaces (as
+	 * its sibling always did for the single node it displaces) an append
+	 * that derived @pos before the displacement lands here every time.
+	 * Reached by inv_concurrent_insert_replace_nolist.
+	 *
+	 * -ENOENT is the caller's documented code for "tail already marked"; it
+	 * maps the refusal to -EAGAIN and re-descends from the root, which is
+	 * the correct answer -- the chain this append aimed at is gone, so the
+	 * position must be derived again.
 	 */
-	urcu_assert_debug(!((uintptr_t) succ & FT_HLIST_MARK));
+	if (caa_unlikely((uintptr_t) succ & FT_HLIST_MARK))
+		return -ENOENT;
 
 	/* Build the fresh node invisibly. */
 	newp->next = succ;
@@ -300,6 +319,26 @@ int ft_hlist_del_prepare(struct urcu_txn *txn, struct cds_ft_node *elem)
 			urcu_txn_load(txn, (void **) &elem->next, FT_HLIST_TAG);
 	struct cds_ft_node *pred = (struct cds_ft_node *)
 			urcu_txn_load(txn, (void **) &elem->prev, FT_HLIST_PREV_TAG);
+
+	/*
+	 * ☠ ALREADY MARKED means @elem is ALREADY logically deleted, and building
+	 * this delete on top of it is not merely redundant -- it FAULTS.  A
+	 * MARK(NULL) @elem->next reads back as the bare value 2, which passes the
+	 * `next != NULL` test below and makes the backward edge record slot
+	 * &((struct cds_ft_node *) 2)->prev; the commit then installs into
+	 * address 2 and SEGVs.  Byte-for-byte the failure
+	 * ft_hlist_insert_after_prepare's mark check exists to stop, one function
+	 * over -- and it became reachable here for the same reason: nothing used
+	 * to tombstone a chain displaced by cds_ft_insert_replace, so a marked
+	 * node could not arrive at a del.  Now one can.
+	 *
+	 * -ENOENT: the caller's comment already names this case ("@node or a
+	 * NEIGHBOUR mid-deletion"), destroys the txn and retries from a fresh
+	 * position derivation, where the wrapper's tombstone test answers
+	 * NOT_FOUND.  Nothing is recorded, so nothing installs.
+	 */
+	if (caa_unlikely((uintptr_t) next & FT_HLIST_MARK))
+		return -ENOENT;
 
 	/*
 	 * Mark elem (logical delete), unlink forward (pred->next: elem -> next)

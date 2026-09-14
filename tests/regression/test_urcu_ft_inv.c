@@ -24954,41 +24954,16 @@ static int inv_concurrent_insert_replace_run(bool coarse, const char *name)
  * the fault was the library's and not this row's node recycling; keep them.
  */
 /*
- * ☐ THE FINE ARM IS OPT-IN, on a defect the tombstone fix above MADE VISIBLE
- * rather than introduced:
- *
- *   ft-txn-hlist.h:228: ft_hlist_insert_after_prepare:
- *     Assertion `!((uintptr_t) succ & 2UL)' failed.
- *
- * That assert is FT-SLOT-2's own RED CONTROL, and its comment says what it is
- * for in as many words: "@pos->next MARKED means @pos is a RETIRED head and
- * this append is building onto a chain that no longer exists ... The interop
- * invariant this file's header states is exactly that this case is SEEN here."
- *
- * ★ IT COULD NEVER FIRE BEFORE.  cds_ft_insert_replace displaced chains without
- * marking them, so an append onto one looked exactly like an append onto a live
- * chain -- a SILENTLY LOST INSERT.  Marking the displaced chain is what turned
- * that silence into this assert.  ⇒ the finding is that cds_ft_insert's append
- * derives its position and does not re-validate that the chain is still live,
- * and a concurrent cds_ft_insert_replace can displace it in between.  That is
- * the unconverted-op gap for insert_replace, now with a detector on it.
- *
- * The COARSE arm below is clean (8 runs, 0 asserts) because serialised writers
- * cannot open that window, which is also what says the gap is the FINE one.
- *
- * ⇒ FT_INV_INSERT_REPLACE=1 to run it; it goes back in the default set when the
- * append re-validates.
+ * ☑ BOTH ARMS ARE IN THE DEFAULT SET.  The fine arm was opt-in while it reached
+ * a chain-liveness gap that this row is precisely what found: a whole-chain
+ * displacement freezes only the HEAD (a txn is bounded, a chain is not), so a
+ * MEMBER of a displaced chain was retired and UNMARKED, and cds_ft_remove's
+ * interior lane derived @pred from a stale prev and recorded an edge whose
+ * expected-old the slot can never hold -- 50001 attempts, then a memcg kill at
+ * 48 GB.  Measured across the cure: 7 wedges of 8 before, 0 of 40 after.
  */
 static int inv_concurrent_insert_replace_nolist(void)
 {
-	if (!getenv("FT_INV_INSERT_REPLACE")) {
-		diag("inv_concurrent_insert_replace_nolist: skipped (set "
-			"FT_INV_INSERT_REPLACE=1; reaches an append onto a "
-			"RETIRED chain -- cds_ft_insert does not re-validate "
-			"its append position against a concurrent "
-			"insert_replace)");
-		return 0;
-	}
 	return inv_concurrent_insert_replace_run(false,
 		"inv_concurrent_insert_replace_nolist");
 }
