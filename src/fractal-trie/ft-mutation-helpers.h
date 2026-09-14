@@ -3337,6 +3337,7 @@ static void ft_ch_audit_report(void)
 }
 #else
 # define ft_ch_audit(ft, t, node)	do { } while (0)
+# define ft_ch_audit_at(fn, line, ft, t, node)	do { } while (0)
 # define ft_ch_audit_coarse()	do { } while (0)
 #endif	/* FT_DEBUG_CHAIN_HOLD */
 

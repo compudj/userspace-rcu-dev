@@ -7675,6 +7675,114 @@ bool ft_locate_chain_head(struct cds_ft *ft, struct cds_ft_node *head,
 	return (struct cds_ft_node *) ft_node_ptr(**head_slot_p) == head;
 }
 
+#ifdef FT_DEBUG_CHAIN_HOLD
+/* TEMPORARY: why does the sweep's acquire not take?  skipped / refused / ok. */
+static unsigned long ft_ra_ok, ft_ra_refused, ft_ra_skipped, ft_ra_eagain,
+	ft_ra_other;
+# define FT_RA_SWEEP_TALLY(kind, ar) do {				\
+		if ((kind) == 0) ft_ra_ok++;				\
+		else if ((kind) == 1) { ft_ra_refused++;		\
+			if ((ar) == -EAGAIN) ft_ra_eagain++;		\
+			else ft_ra_other++; }				\
+		else ft_ra_skipped++;					\
+	} while (0)
+static void ft_ra_sweep_report(void) __attribute__((destructor));
+static void ft_ra_sweep_report(void)
+{
+	if (!(ft_ra_ok | ft_ra_refused | ft_ra_skipped))
+		return;
+	fprintf(stderr, "FT_RA_SWEEP  ok=%lu refused=%lu (EAGAIN=%lu other=%lu)"
+		" guard_skipped=%lu\n", ft_ra_ok, ft_ra_refused, ft_ra_eagain,
+		ft_ra_other, ft_ra_skipped);
+}
+#else
+# define FT_RA_SWEEP_TALLY(kind, ar)	do { } while (0)
+#endif
+
+/*
+ * ft_ra_sweep_held: tombstone a duplicate chain that has ALREADY LEFT THE TRIE,
+ * under the holder word every peer on that chain also serialises on.
+ *
+ * ☠ WHAT THIS CLOSES.  cds_ft_remove_all unlinked the chain in a commit and
+ * then swept it with ft_chain_mark_removed_flip -- a bare CAS per node on
+ * cds_ft_node.next, a word the chain HOLDER owns, with the op holding NOTHING:
+ * the commit's release rides the commit, so the holder is gone by the time the
+ * sweep runs.  Measured by the -DFT_DEBUG_CHAIN_HOLD audit at 100% UNHELD over
+ * every remove_all row, and these are bare CASes with no txn, so unlike a
+ * recorded edge there is no abort that could discard them -- they LAND.
+ *
+ * The chain being off-trie does NOT make it private: a peer holding a node
+ * pointer (the API hands them out) still derives this same holder by walking
+ * @node->prev to the head, and cds_ft_remove's arms acquire it.  Taking it here
+ * is therefore what serialises the sweep against that peer.
+ *
+ * ☐ RESIDUAL, deliberately not closed here: the window between the unlink
+ * commit (which released the holder) and this re-acquire.  Closing it needs the
+ * freeze to ride the unlink commit itself, which is the structural step -- and
+ * a chain is unbounded where a txn is not, so it is not a one-line change.  The
+ * acquire cannot be hoisted above the commit either: on the LEAF arm the detach
+ * may FREE the holder, and on every arm a hold spanning the detach is the scope
+ * that -DFT_RM_REVALIDATE was MEASURED AND REFUTED for (20/41 hangs, reader-
+ * visible key loss) -- it re-creates the FT-wide writer lock one node at a time
+ * and violates the seam rule (no node lock across a grace period, ft_seam_check).
+ * So: strictly smaller window, never a larger hold.
+ *
+ * An acquire that MISSES sweeps anyway, exactly as today -- never worse than the
+ * status quo, and the audit keeps counting those so the residue stays visible
+ * rather than becoming a silent zero.
+ *
+ * ☐ PER-NODE SPACING ONLY: a coarser anchor needs a byte-depth for the holder
+ * that this path never derives, and anchoring on a wrong word excludes nobody
+ * (ft-remove.h's holder-depth note).
+ */
+static
+void ft_ra_sweep_held_at(const char *fn, int line, struct cds_ft *ft,
+		struct ft_lock_ctx *ctx, struct cds_ft_inode_flag *holder_flag,
+		unsigned int holder_depth, struct cds_ft_node *chain_head)
+{
+	struct ft_held_anchor held = { 0 };
+	bool got = false;
+
+	if (!chain_head)
+		return;
+	/*
+	 * ☠ A RETIRED HOLDER IS NOT CONTENTION, AND ASKING COSTS.  MEASURED on
+	 * inv_concurrent_remove_all_prefix: ok=0, refused=22007, of which 22005
+	 * are -EAGAIN on a word whose state reads FT_STATE_TOMBSTONE.  The leaf
+	 * and compress arms retire the holder IN the very commit that unlinks
+	 * the chain, so by the time the sweep runs there is no live word left to
+	 * take -- the lock is not lost, it is GONE.  Short-circuit rather than
+	 * issue a doomed acquire per node, and let the audit keep reporting the
+	 * sweep as unheld, because it is.  Only folding the freeze INTO that
+	 * commit reaches these two arms.
+	 */
+	if (ft->lock_fine &&
+	    ft->lock_spacing == CDS_FT_LOCK_SPACING_PER_NODE &&
+	    holder_flag && !ft_node_external(holder_flag) &&
+	    !ft_flag_tombstoned(ft, holder_flag)) {
+		int ar = ft_acquire_member(ft, ctx, holder_flag,
+				ft_flag_to_metadata(ft, holder_flag),
+				holder_depth, &held);
+
+		got = !ar;
+		FT_RA_SWEEP_TALLY(got ? 0 : 1, ar);
+	} else {
+		FT_RA_SWEEP_TALLY(2, 0);
+	}
+	ft_ch_audit_at(fn, line, ft, NULL, chain_head);
+	ft_chain_mark_removed_flip(ft, chain_head);
+	/*
+	 * @held is NOT published into @ctx: that is precisely what made
+	 * -DFT_RM_REVALIDATE span the whole op.  It is taken and dropped here.
+	 */
+	if (got && !held.shared && !held.txn_owned)
+		ft_meta_lock_release_if_held(held.lock);
+}
+
+/* @fn/@line are the ARM's, so each sweep site keeps its own audit row. */
+#define ft_ra_sweep_held(ft, ctx, hf, hd, ch)				\
+	ft_ra_sweep_held_at(__func__, __LINE__, (ft), (ctx), (hf), (hd), (ch))
+
 static
 enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 		struct cds_ft_iter *iter,
@@ -7798,9 +7906,20 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 
 			ft_ord_cell_flip_one(&edge);
 		}
-		/* The whole chain has left the trie: tombstone every node. */
-		ft_ch_audit(ft, NULL, external_nodes);
-		ft_chain_mark_removed_flip(ft, external_nodes);
+		/*
+		 * The whole chain has left the trie: tombstone every node --
+		 * under the holder, which for the NIL key is the ROOT and so
+		 * always survives the commit above (it is never pruned).  @lctx
+		 * is not initialised this early, and this arm returns without
+		 * reaching it, so the sweep gets its own ctx.
+		 */
+		{
+			struct ft_lock_ctx nilctx;
+
+			ft_lock_ctx_init(&nilctx, NULL, NULL, op);
+			ft_ra_sweep_held(ft, &nilctx, ft->root, 0,
+				external_nodes);
+		}
 		/* The mutation invalidates the cached position (general-path parity). */
 		iter->cache_valid = false;
 		iter_debug_path_clear(iter);
@@ -8010,8 +8129,19 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 					NULL /* no pending publish */, &intent, NULL);
 
 				if (cret == 0) {
-					ft_ch_audit(ft, NULL, chain_head);
-					ft_chain_mark_removed_flip(ft, chain_head);
+					/*
+					 * The fuse may RETIRE @holder_flag (it
+					 * collapses it into its parent).  Sweep
+					 * under it anyway: a peer reaches this
+					 * chain only by deriving the same word
+					 * from chain_head->prev, so the two agree
+					 * even when it is dead -- and an acquire
+					 * that refuses a tombstone degrades to
+					 * exactly today's unheld sweep, never
+					 * worse.  The audit keeps counting those.
+					 */
+					ft_ra_sweep_held(ft, &lctx, holder_flag,
+						holder_depth, chain_head);
 					if (ft->ordered_list)
 						pub.armed = true;
 					ret = 0;
@@ -8089,8 +8219,14 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 					 */
 					if (ft->ordered_list)
 						pub.armed = true;
-					ft_ch_audit(ft, NULL, chain_head);
-					ft_chain_mark_removed_flip(ft, chain_head);
+					/*
+					 * The holder demonstrably SURVIVES this
+					 * commit -- the assert below is the
+					 * existing statement of it -- so it is
+					 * still a lock word to take.
+					 */
+					ft_ra_sweep_held(ft, &lctx, holder_flag,
+						holder_depth, chain_head);
 					assert(ft_meta_nr_child(holder_meta) > 0);
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 					/*
@@ -8124,8 +8260,22 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 			NULL, false, NULL, NULL);
 		ft_removeall_fault_scope_exit();
 		if (!ret) {
-			ft_ch_audit(ft, NULL, chain_head);
-			ft_chain_mark_removed_flip(ft, chain_head);
+			/*
+			 * ☐ The detach may have PRUNED @holder_flag, and
+			 * ft_acquire_member refuses a tombstone -- so this
+			 * recovers the hold only when the branch survived.  The
+			 * lock CANNOT be hoisted above the detach to cover the
+			 * rest: unpublished it would miss against the op's OWN
+			 * hold (detach climbs from holder_meta) and wait on
+			 * itself forever; published into @lctx it becomes the
+			 * whole-op scope -DFT_RM_REVALIDATE was measured and
+			 * refuted for.  The residue closes structurally, by
+			 * passing @chain_head as ft_detach_node's freeze_leaf so
+			 * the freeze rides the detach commit under the holder
+			 * that commit already owns -- next phase.
+			 */
+			ft_ra_sweep_held(ft, &lctx, holder_flag, holder_depth,
+				chain_head);
 		}
 	}
 

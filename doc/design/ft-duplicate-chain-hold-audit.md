@@ -130,6 +130,43 @@ tombstones the chain **without holding it** 70.5% of the time, so there is no
 serialization point at which the two loads a predicate needs are consistent.
 The fix is upstream of every predicate — make the seven sites hold the holder.
 
+## Locks added (phase 1, per-node spacing)
+
+`ft_ra_sweep_held()` takes the chain holder across `remove_all`'s tombstone
+sweep and releases it immediately, **never publishing into `@lctx`** -- that
+scope is what got `FT_RM_REVALIDATE` refuted. Measured over the full ft_inv
+suite:
+
+| arm | writes | verdict |
+|---|---|---|
+| prefix (`:8209`) | 139,741 | **all HELD** (was 100% unheld) |
+| NIL key (`:7901`) | 63,525 | **all HELD** (was 100% unheld) |
+| leaf (`:8258`) | 3,774,910 | still unheld -- see below |
+
+`FT_RA_SWEEP ok=203266 refused=0`: every acquire attempted SUCCEEDED, and
+203266 = 139741 + 63525 exactly. ft_unit 355/355, ft_inv 152/152.
+
+### ☠ The leaf and compress arms CANNOT be locked, and the reason is not contention
+
+MEASURED on `inv_concurrent_remove_all_prefix` before the short-circuit went in:
+`ok=0, refused=22007`, of which **22005 are -EAGAIN on a word whose state reads
+`FT_STATE_TOMBSTONE`** (state=6 = TOMBSTONE | nr_child 1). Those two arms retire
+the holder IN the very commit that unlinks the chain, so by sweep time there is
+no live word left to take -- **the lock is not lost, it is GONE.**
+
+Nor can the acquire be hoisted above that commit:
+
+- unpublished, `ft_detach_node` climbs from `holder_meta` and its own acquire
+  misses **against the op's own hold** -- "the op waits on itself, forever";
+- published into `@lctx`, it becomes the whole-op scope that `FT_RM_REVALIDATE`
+  was measured and refuted for (20/41 hangs, reader-visible key loss), and
+  violates the seam rule (no node lock across a grace period).
+
+⇒ **These two arms are a STRUCTURAL item, not a lock item.** The lever already
+exists: `ft_detach_node` takes a `freeze_leaf` parameter -- the mechanism its own
+3459/4463 sites use to fuse a leaf freeze into their commit, under the holder
+that commit still owns -- and `_cds_ft_remove_all_locked`'s leaf arm passes NULL.
+
 ## Order of work
 
 1. Force the three `_cds_ft_remove_all_locked` lone chain marks through a txn
