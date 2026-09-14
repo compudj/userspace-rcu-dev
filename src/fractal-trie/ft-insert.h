@@ -580,8 +580,17 @@ bool ft_probe_internal_is_empty(struct cds_ft *ft,
  * destroys the txn clears it; a miss sets @acquire_miss and the commit aborts
  * all-or-none, exactly as the P acquire beside it does.
  */
+/*
+ * Returns TRUE iff it actually ACQUIRED the dual's grandparent -- which is what
+ * the publish must pass as @dual_owner_held.  Every early return below is a
+ * shape where no owned dual edge follows: no compressed parent, no skip-encoded
+ * slot ("no dual edge will be recorded"), or a ROOT dual, whose record names no
+ * owner at all.  Claiming ownership on those paths would hand
+ * FT_OWNER_ASSERT_OWNED a NULL owner, which ft_flip_txn_owns answers false --
+ * an assert failure on a shape that is perfectly correct.
+ */
 static
-void ft_insert_lock_skip_dual_gp(struct cds_ft *ft,
+bool ft_insert_lock_skip_dual_gp(struct cds_ft *ft,
 		const struct ft_lock_ctx *ctx,
 		struct cds_ft_inode_flag *parent_nf,
 		struct ft_insert_commit *ic)
@@ -593,18 +602,20 @@ void ft_insert_lock_skip_dual_gp(struct cds_ft *ft,
 	struct cds_ft_inode_flag **skip_slot;
 
 	if (!parent_nf || !ft_node_compressed(parent_nf))
-		return;
+		return false;
 	cn = ft_compressed_node_ptr(parent_nf);
 	cn_meta = cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
 	skip_slot = ft_txn_parent_slot_at(cn_meta, ft, NULL, &gp_nf);
 	if (!skip_slot || !ft_node_skip_compressed(*skip_slot))
-		return;			/* no dual edge will be recorded */
+		return false;		/* no dual edge will be recorded */
 	if (skip_slot == &ft->root || !gp_nf)
-		return;			/* root dual: no owning node */
+		return false;		/* root dual: no owning node */
 	ft_flip_txn_lock_or_guard_parent(ft, ic->txn, ctx, gp_nf,
 		FT_DEPTH_FROM_DESCENT);
+	return true;
 #else
 	(void) ft; (void) ctx; (void) parent_nf; (void) ic;
+	return false;
 #endif
 }
 
@@ -619,6 +630,7 @@ void ft_insert_publish_or_park(struct cds_ft *ft,
 		struct ft_insert_commit *ic)
 {
 	struct ft_pub_rec rec = { .n = 0 };
+	bool dual_gp_held;
 
 	/*
 	 * @expected_old: the plan-snapshot value of *slot (the old subtree this
@@ -662,7 +674,7 @@ void ft_insert_publish_or_park(struct cds_ft *ft,
 		ft_flip_txn_hold_or_lock_parent(ft, ic->txn, ctx, parent_nf,
 			parent_depth, ic->parent_locked_holder,
 			ic->parent_locked_snap);
-	ft_insert_lock_skip_dual_gp(ft, ctx, parent_nf, ic);
+	dual_gp_held = ft_insert_lock_skip_dual_gp(ft, ctx, parent_nf, ic);
 	/*
 	 * PHASE B, STEP B1 -- THE ARM, and this is the only point in the op where
 	 * it is legal.  ft_flip_txn_arm_per_op's contract is "after the op's LAST
@@ -712,7 +724,8 @@ void ft_insert_publish_or_park(struct cds_ft *ft,
 	 * by @structural_sw -- so this hands the arm a true answer rather than
 	 * forcing anything.
 	 */
-	_ft_publish_to_parent(ft, parent_nf, slot, new_top, expected_old, &rec, true);
+	_ft_publish_to_parent(ft, parent_nf, slot, new_top, expected_old, &rec,
+		dual_gp_held);
 	ft_flip_txn_record_pub_rec(ic->txn, &rec);
 	ic->slot = slot;	/* sentinel: one-commit forward recorded */
 	ic->publish_to_parent = true;
