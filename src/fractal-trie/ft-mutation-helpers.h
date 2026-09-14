@@ -1031,9 +1031,17 @@ extern unsigned long cds_ft_probe_promote_guarded;
  * surface Phase B closes -- so it is a MISS, never a pass.
  */
 #if defined(DEBUG_RCU) || defined(CONFIG_RCU_DEBUG)
-# define FT_OWNER_ASSERT_TXN_FIELD	bool dbg_arm_per_op;
+/*
+ * @dbg_txn_ft is carried ONLY for the wide-exclusion arm below: the assert must
+ * ask whether the op holds THIS trie's FT-wide writer lock, and "the thread
+ * holds some FT-wide lock" would be a looser claim than it is making.
+ */
+# define FT_OWNER_ASSERT_TXN_FIELD	bool dbg_arm_per_op;		\
+					struct cds_ft *dbg_txn_ft;
 # define FT_OWNER_ASSERT_INIT(t)					\
-	do { (t)->dbg_arm_per_op = false; } while (0)
+	do { (t)->dbg_arm_per_op = false; (t)->dbg_txn_ft = NULL; } while (0)
+# define FT_OWNER_ASSERT_SET_FT(t, ft_)					\
+	do { (t)->dbg_txn_ft = (ft_); } while (0)
 # define FT_OWNER_ASSERT_SET_PER_OP(t)					\
 	do { (t)->dbg_arm_per_op = true; } while (0)
 /*
@@ -1047,9 +1055,25 @@ extern unsigned long cds_ft_probe_promote_guarded;
  * finished, and this is what stops that from reporting every pre-acquire record
  * as a miss.
  */
+/*
+ * ☠ AND A PER-NODE QUESTION CANNOT SEE A BULK OP'S EXCLUSION.  A BULK op's
+ * writers are excluded by the FT-WIDE WRITER LOCK, not by a registry entry:
+ * during a bulk window point ops FLIP MODE and take that same lock
+ * (ft_writer_lock_scope_enter's ft_bulk_active test) and bulk peers queue on it,
+ * which is the design's bulk-vs-everything mechanism, not a placeholder.  So a
+ * glue publish holding it owns its words as surely as a point op holding a node
+ * lock -- and ft_flip_txn_owns, which only reads @locks[], answers false and
+ * would abort a correctly excluded op.
+ *
+ * Accept that exclusion explicitly, keyed on the txn's OWN trie so the claim is
+ * "this op holds THIS trie's FT-wide lock" rather than the weaker "the thread
+ * holds one somewhere".
+ */
 # define FT_OWNER_ASSERT_OWNED(t, owner)				\
 	urcu_assert_debug(!(t)->dbg_arm_per_op || !(t)->nr_locks ||	\
-			ft_flip_txn_owns((t), (owner)))
+			ft_flip_txn_owns((t), (owner)) ||		\
+			((t)->dbg_txn_ft &&				\
+			 ft_wlock_held == (t)->dbg_txn_ft))
 /*
  * THE SAME QUESTION, ASKED OF A RECORD THAT CARRIES ITS OWN WITNESS.
  *
@@ -1066,12 +1090,15 @@ extern unsigned long cds_ft_probe_promote_guarded;
 # define FT_OWNER_ASSERT_OWNED_CTX(t, ctx, owner, slot, new_ptr)	\
 	urcu_assert_debug(!(t)->dbg_arm_per_op || !(t)->nr_locks ||	\
 			ft_flip_txn_owns((t), (owner)) ||		\
+			((t)->dbg_txn_ft &&				\
+			 ft_wlock_held == (t)->dbg_txn_ft) ||		\
 			ft_owner_retire_witnessed((ctx), (owner),	\
 					(slot), (new_ptr)))
 #else
 # define FT_OWNER_ASSERT_TXN_FIELD
 # define FT_OWNER_ASSERT_INIT(t)	do { } while (0)
 # define FT_OWNER_ASSERT_SET_PER_OP(t)	do { } while (0)
+# define FT_OWNER_ASSERT_SET_FT(t, ft_)	do { (void) (ft_); } while (0)
 # define FT_OWNER_ASSERT_OWNED(t, owner)				\
 	do { (void) (t); (void) (owner); } while (0)
 # define FT_OWNER_ASSERT_OWNED_CTX(t, ctx, owner, slot, new_ptr)	\
@@ -1887,6 +1914,7 @@ struct ft_flip_txn *ft_flip_txn_create_at(FT_TK_SITE_PARAM struct cds_ft *ft)
 	t->cap_locks = FT_FLIP_TXN_FLOOR_LOCKS;
 	t->acquire_miss = false;
 	t->acquire_enomem = false;
+	FT_OWNER_ASSERT_SET_FT(t, ft);
 	t->pending_pub_slot = NULL;
 	t->pending_dual_slot = NULL;
 	t->pending_dual_val = NULL;
@@ -2117,6 +2145,7 @@ struct ft_flip_txn *ft_flip_txn_create_on_at(FT_TK_SITE_PARAM
 	t->cap_locks = FT_FLIP_TXN_FLOOR_LOCKS;
 	t->acquire_miss = false;
 	t->acquire_enomem = false;
+	FT_OWNER_ASSERT_SET_FT(t, ft);
 	t->pending_pub_slot = NULL;
 	t->pending_dual_slot = NULL;
 	t->pending_dual_val = NULL;
@@ -2180,6 +2209,7 @@ struct ft_flip_txn *ft_flip_txn_create_bounded_on_at(FT_TK_SITE_PARAM
 	t->cap_locks = FT_FLIP_TXN_FLOOR_LOCKS;
 	t->acquire_miss = false;
 	t->acquire_enomem = false;
+	FT_OWNER_ASSERT_SET_FT(t, ft);
 	t->pending_pub_slot = NULL;
 	t->pending_dual_slot = NULL;
 	t->pending_dual_val = NULL;
@@ -15827,8 +15857,27 @@ enum urcu_txn_status ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue 
 	 * for; asked here only to be COUNTED.
 	 */
 	FT_AB_COUNT_PUB_PAIR(ft_slot_in_node(g->publish_parent, g->publish_slot));
+	/*
+	 * ☑ @dual_owner_held TRUE: a glue publish is a BULK op (graft / merge /
+	 * rekey) and its exclusion over the SKIP_X dual's grandparent is the
+	 * FT-WIDE WRITER LOCK -- this function's own header says so ("no peer
+	 * recompaction can be copying the SKIP_X dual's owner under it"), which
+	 * is exactly why it deliberately does NOT call ft_lock_skip_dual_gp.
+	 * That is the design's bulk-vs-everything mechanism, not an absence of
+	 * ownership, so recording MW here understated what the op holds.
+	 *
+	 * ☠ IT NEEDED THE ASSERT TAUGHT FIRST.  FT_OWNER_ASSERT_OWNED asked a
+	 * PER-NODE question (ft_flip_txn_owns reads @locks[] only), so a true
+	 * here would have aborted a correctly excluded op under
+	 * --enable-rcu-debug.  It now also accepts "this op holds THIS trie's
+	 * FT-wide lock", keyed on the txn's own trie.
+	 *
+	 * ☞ ft_glue_txn_commit_edges' publish is NOT flipped with it: it carries
+	 * no such statement of its exclusion, and a shared helper is not a
+	 * shared argument.
+	 */
 	_ft_publish_to_parent(ft, g->publish_parent, g->publish_slot, g->top,
-		ft_glue_publish_expected_old(g), &rec, false);
+		ft_glue_publish_expected_old(g), &rec, true);
 	/*
 	 * ANNOUNCE THE DUAL, if this publish produced one.  @rec's first edge is
 	 * the publish itself; a COMPRESSED publish parent adds the SKIP_X dual
