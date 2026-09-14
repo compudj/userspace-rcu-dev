@@ -189,6 +189,9 @@ void ft_compact_relocate_at(struct cds_ft *ft, struct cds_ft_inode_flag **holder
  * no change.
  *
  * @gp_slot: grandparent slot holding the cn flag (traditional), or NULL (skip).
+ * @gp_nf:   the node that CONTAINS @gp_slot -- the dual's owner.  Passed so the
+ *           record can NAME it; see the record below for why that is worth
+ *           plumbing and why it changes no behaviour.
  * Returns the new compressed node (or @cn unchanged on allocation failure, with
  * *@oom set so the caller can stop the pass).
  */
@@ -196,6 +199,7 @@ static
 struct cds_ft_compressed_node *ft_compact_relocate_compressed(struct cds_ft *ft,
 		struct cds_ft_compressed_node *cn,
 		struct cds_ft_inode_flag **gp_slot,
+		struct cds_ft_inode_flag *gp_nf,
 		int *bail)
 {
 	struct cds_ft_metadata *cn_meta =
@@ -258,13 +262,30 @@ struct cds_ft_compressed_node *ft_compact_relocate_compressed(struct cds_ft *ft,
 		ft_reparent_record(ft, t, cn2->child, cn2_flag, &cn2->child,
 			/*child_marked=*/ false, /*hold_ctx=*/ NULL);
 		/*
-		 * @gp_slot's owner is the GRANDPARENT node that contains it;
-		 * this helper is handed the bare slot (see its @gp_slot
-		 * parameter), so the meta is not in scope -- plumbing, not a
-		 * missing lock.  The compaction pass runs under whole-trie
-		 * exclusion, so it never reaches a per-op arm anyway.
+		 * ☑ THE DUAL'S OWNER IS NAMED NOW.  It is the GRANDPARENT node
+		 * that contains @gp_slot, and this helper used to be handed the
+		 * bare slot, so the meta was not in scope and the record said
+		 * FT_OWNER_UNPLUMBED -- "plumbing, not a missing lock", since
+		 * the compaction pass runs under whole-trie exclusion.  The
+		 * caller has that node in hand (it is the one it read the slot
+		 * out of), so it passes it.
+		 *
+		 * ☠ AND THIS CHANGES NO BEHAVIOUR, deliberately.  The record's
+		 * KIND is decided by @t->structural_sw, never by @owner, so
+		 * naming the owner cannot park anything SW -- which matters,
+		 * because the SKIP_X dual must stay MW until EVERY producer can
+		 * vouch (one lane parking SW while another CASes the same slot
+		 * is the cross-thread kind disagreement the engine cannot
+		 * check).  FT_OWNER_ASSERT_OWNED is likewise inert here: it is
+		 * guarded on dbg_arm_per_op && nr_locks, and this bounded txn is
+		 * neither armed nor lock-carrying.  What the name buys is that
+		 * the edge stops counting as UNPLUMBED -- one of the two
+		 * producers note (1) of the word-kind table names as blocking
+		 * the dual's conversion.
 		 */
-		ft_flip_txn_record_reserved(t, FT_OWNER_UNPLUMBED,
+		ft_flip_txn_record_reserved(t,
+			gp_nf ? ft_flag_to_metadata(ft, gp_nf) :
+				FT_OWNER_UNPLUMBED,
 			(void **) gp_slot, *gp_slot, cn2_flag);
 		cst = ft_flip_txn_commit(ft, t);
 		if (cst != URCU_TXN_STATUS_OK) {
@@ -513,7 +534,7 @@ void ft_compact_descend(struct cds_ft *ft, const uint8_t *key,
 			 */
 			if (!cds_ft_metadata_in_recompact_private(
 					cds_ft_item_to_metadata((struct cds_ft_inode *) cn))) {
-				cn = ft_compact_relocate_compressed(ft, cn, NULL, bail);
+				cn = ft_compact_relocate_compressed(ft, cn, NULL, NULL, bail);
 				(*relocated)++;
 				if (*bail)
 					return;		/* memory pressure: stop the descent */
@@ -534,7 +555,8 @@ void ft_compact_descend(struct cds_ft *ft, const uint8_t *key,
 			/* Traditional: the grandparent slot (child_slot) holds the cn flag. */
 			if (!cds_ft_metadata_in_recompact_private(
 					cds_ft_item_to_metadata((struct cds_ft_inode *) cn))) {
-				cn = ft_compact_relocate_compressed(ft, cn, child_slot, bail);
+				cn = ft_compact_relocate_compressed(ft, cn, child_slot,
+					nf, bail);
 				(*relocated)++;
 				if (*bail)
 					return;		/* memory pressure: stop the descent */

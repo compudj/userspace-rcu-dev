@@ -29,6 +29,9 @@ static void ft_ch_audit_head_at(const char *fn, int line,
 	ft_ch_audit_head_at(__func__, __LINE__, (ft), (head), (owner))
 #else
 # define ft_ch_audit_head(ft, head, owner)	do { } while (0)
+/* The _at spelling is called directly by ft_set_parent_at, which forwards its
+ * caller's location -- so it needs a no-op too, or a non-debug build breaks. */
+# define ft_ch_audit_head_at(fn, line, ft, head, owner)	do { } while (0)
 #endif
 
 static inline __attribute__((unused))
