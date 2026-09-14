@@ -3114,6 +3114,234 @@ void ft_hold_trace_bad_release(const struct cds_ft_metadata *lock, uintptr_t s)
 #endif	/* FEATURE_FT_HOLD_TRACE */
 
 /*
+ * ☞ THE DUPLICATE-CHAIN HOLD AUDIT  (-DFT_DEBUG_CHAIN_HOLD)
+ *
+ * ft-txn-hlist.h's header states the invariant the SW migration depends on:
+ * "every chain mutation runs under the head-holder's node lock".  Nothing
+ * CHECKS it.  Converting cds_ft_node.next/.prev from MW to SW one op at a time
+ * cannot work, because an SW record is only sound once EVERY writer of those
+ * words is excluded -- a single unheld producer anywhere makes the whole word
+ * MW again, and it will do so silently.
+ *
+ * So audit the words, not the ops.  Every site that writes a duplicate-chain
+ * word reports here, and the destructor prints one row per site:
+ *
+ *   HELD      the thread holds ft_chain_head_holder(node) -- the right lock
+ *   UNHELD    it holds locks, but NOT that one          ☠ a violation
+ *   NOLOCKS   it holds nothing at all                   ☠ a violation
+ *   NOHOLDER  the holder is not derivable (prev NULL: never-inserted, or the
+ *             chain already unlinked) -- undecidable here, not a verdict
+ *   SOME      COARSE sites only: holds something, which this site cannot
+ *             prove is the right word (no @ft in hand to derive the holder)
+ *
+ * ☠ A COARSE "SOME" IS NOT A PASS.  It is the absence of a verdict.  Only
+ * NOLOCKS is decidable without @ft, and it is decidable with NO false
+ * positives: a thread holding nothing certainly does not hold the holder.
+ *
+ * ☠ AND THE WHOLE TABLE IS A WRONG ZERO WITHOUT -DFEATURE_FT_HOLD_TRACE,
+ * where ft_hold_trace_holds() is a stub returning false and
+ * ft_hold_trace_count() returns 0 -- every row would read NOLOCKS.  The
+ * header line says which build produced the table, and the audit REFUSES to
+ * score rather than print a fabricated verdict.
+ *
+ * Sites are interned by (fn, line) so a new one costs a single call, with no
+ * enum to keep in sync.
+ */
+#ifdef FT_DEBUG_CHAIN_HOLD
+
+/*
+ * The REGISTRY witness, defined below this block.  Both witnesses are needed:
+ * the ledger drops its entry the moment a release is RECORDED, while the word
+ * keeps FT_STATE_LOCK until that commit lands, and in that window the registry
+ * is the only witness that the lock is still held.  Scoring on the ledger
+ * alone would report that window as a violation -- a FALSE POSITIVE, and
+ * precisely the over-report ft_hold_trace_holds' own header warns about.
+ */
+static inline bool ft_flip_txn_owns(const struct ft_flip_txn *t,
+		const struct cds_ft_metadata *owner);
+
+#define FT_CH_SITE_MAX	48
+
+struct ft_ch_site {
+	const char *fn;
+	int line;
+	bool coarse;
+	unsigned long total, wlock, held, led, unheld, nolocks, noholder,
+		coarse_mode, aborting, some;
+};
+
+extern struct ft_ch_site ft_ch_sites[FT_CH_SITE_MAX];
+extern unsigned int ft_ch_site_n;
+struct ft_ch_site ft_ch_sites[FT_CH_SITE_MAX];
+unsigned int ft_ch_site_n;
+
+static
+struct ft_ch_site *ft_ch_site_of(const char *fn, int line, bool coarse)
+{
+	unsigned int i;
+
+	for (i = 0; i < ft_ch_site_n; i++)
+		if (ft_ch_sites[i].line == line && ft_ch_sites[i].fn == fn)
+			return &ft_ch_sites[i];
+	if (ft_ch_site_n == FT_CH_SITE_MAX)
+		return NULL;
+	i = ft_ch_site_n++;
+	ft_ch_sites[i].fn = fn;
+	ft_ch_sites[i].line = line;
+	ft_ch_sites[i].coarse = coarse;
+	return &ft_ch_sites[i];
+}
+
+/*
+ * FULL verdict: @ft is in hand, so the chain's holder is derivable and the
+ * question "is THIS word's lock held?" has an answer.  @t may be NULL (a
+ * standalone lone-edge store outside any txn), in which case the registry has
+ * nothing to say and the ledger is the only witness -- recorded as such.
+ */
+static inline
+void ft_ch_audit_at(const char *fn, int line, const struct cds_ft *ft,
+		const struct ft_flip_txn *t, struct cds_ft_node *node)
+{
+	struct ft_ch_site *s = ft_ch_site_of(fn, line, false);
+	struct cds_ft_inode_flag *h;
+	struct cds_ft_metadata *hm;
+
+	if (!s || !node)
+		return;
+	s->total++;
+	/*
+	 * ☠ WITNESS 0, AND WITHOUT IT EVERY COARSE ARM READS AS A VIOLATION.
+	 * A thread inside a writer scope on THIS trie excludes every other
+	 * writer through the FT-wide mutex, so no per-node holder is taken and
+	 * neither the registry nor the ledger has anything to say.  Scoring
+	 * those as UNHELD would condemn the coarse arm by construction -- the
+	 * inverse of the trap in
+	 * [[feedback_a_control_that_differs_in_more_than_one_way]].
+	 */
+	if (ft_wlock_held == (struct cds_ft *) ft) {
+		s->wlock++;
+		return;
+	}
+	/*
+	 * A COARSE trie outside a writer scope is a DIFFERENT question (who
+	 * excludes here at all?) and not the one this audit answers.  Bucketed,
+	 * never scored, so the FINE verdict below stays clean.
+	 */
+	if (!ft->lock_fine) {
+		s->coarse_mode++;
+		return;
+	}
+	/*
+	 * ☠ THIS PROBE FIRES AT PREPARE TIME AND THE VERDICT IS SETTLED AT
+	 * COMMIT.  ft_flip_txn_lock_or_guard_parent is ALL-OR-NONE: an acquire
+	 * that misses sets @acquire_miss, and ft_flip_txn_commit then DISCARDS
+	 * the whole descriptor before the engine sees it.  A record made
+	 * without the holder under that bit therefore never installs -- it is
+	 * not a violation, it is the abort working.  Scoring it as one
+	 * over-reported the four insert_replace displacing arms wholesale.
+	 *
+	 * Only a store that can still INSTALL counts.  (Sites whose miss is
+	 * set AFTER this point are not covered by the test; the lone-edge
+	 * sites, which pass @t == NULL, have no abort to hide behind and are
+	 * scored unconditionally -- correctly, since a bare CAS always lands.)
+	 */
+	if (t && t->acquire_miss) {
+		s->aborting++;
+		return;
+	}
+	h = ft_chain_head_holder((struct cds_ft *) ft, node);
+	if (!h) {
+		s->noholder++;
+		return;
+	}
+	hm = ft_flag_to_metadata(ft, h);
+	/* Registry first: it is the cheap witness and a shipped build has it. */
+	if (t && ft_flip_txn_owns(t, hm)) {
+		s->held++;
+		return;
+	}
+	if (ft_hold_trace_holds(hm)) {
+		s->led++;
+		return;
+	}
+	s->unheld++;
+	if (!ft_hold_trace_count())
+		s->nolocks++;	/* strictly worse: holds nothing whatsoever */
+}
+
+/*
+ * COARSE verdict: no @ft, so only "holds nothing" is decidable.  Everything
+ * else lands in SOME, which is explicitly NOT a pass.
+ */
+static inline
+void ft_ch_audit_coarse_at(const char *fn, int line)
+{
+	struct ft_ch_site *s = ft_ch_site_of(fn, line, true);
+
+	if (!s)
+		return;
+	s->total++;
+	/*
+	 * No @ft here, so this arm cannot tell a FINE trie from a COARSE one,
+	 * nor see the FT-wide mutex.  It therefore scores NOTHING: its rows are
+	 * a cross-check on the FULL row at the caller, never a verdict.
+	 */
+	if (!ft_hold_trace_count())
+		s->nolocks++;
+	else
+		s->some++;
+}
+
+#define ft_ch_audit(ft, t, node)					\
+	ft_ch_audit_at(__func__, __LINE__, (ft), (t), (node))
+#define ft_ch_audit_coarse()	ft_ch_audit_coarse_at(__func__, __LINE__)
+
+static void ft_ch_audit_report(void) __attribute__((destructor));
+static void ft_ch_audit_report(void)
+{
+	unsigned int i;
+	unsigned long viol = 0;
+
+	if (!ft_ch_site_n)
+		return;
+	fprintf(stderr, "\nFT_CHAIN_HOLD_AUDIT  ledger=%s\n",
+#ifdef FEATURE_FT_HOLD_TRACE
+		"ON");
+#else
+		"OFF -- EVERY ROW BELOW IS A WRONG ZERO, NOT A MEASUREMENT "
+		"(rebuild with -DFEATURE_FT_HOLD_TRACE)");
+#endif
+	fprintf(stderr, "%-34s %6s %10s %9s %8s %8s %8s %7s %8s %8s %8s %6s\n",
+		"site (fn:line)", "kind", "total", "WLOCK", "HELD(reg)",
+		"HELD(led)", "UNHELD", "nolocks", "noholder", "coarseFT",
+		"aborting", "SOME");
+	for (i = 0; i < ft_ch_site_n; i++) {
+		struct ft_ch_site *s = &ft_ch_sites[i];
+		char nm[35];
+
+		if (!s->total)
+			continue;
+		snprintf(nm, sizeof(nm), "%s:%d", s->fn, s->line);
+		fprintf(stderr, "%-34s %6s %10lu %9lu %8lu %8lu %8lu %7lu %8lu %8lu %8lu %6lu\n",
+			nm, s->coarse ? "COARSE" : "FULL", s->total, s->wlock,
+			s->held, s->led, s->unheld, s->nolocks, s->noholder,
+			s->coarse_mode, s->aborting, s->some);
+		viol += s->unheld;
+	}
+	fprintf(stderr, "FT_CHAIN_HOLD_AUDIT  %lu VIOLATION%s (UNHELD: FINE trie, no writer scope,\n"
+		"                     and NEITHER the registry NOR the ledger holds the chain's holder)"
+		" -- the duplicate chain is %sready for SW\n",
+		viol, viol == 1 ? "" : "S", viol ? "NOT " : "");
+	if (ft_ch_site_n == FT_CH_SITE_MAX)
+		fprintf(stderr, "FT_CHAIN_HOLD_AUDIT  ☠ SITE TABLE FULL -- sites were DROPPED\n");
+}
+#else
+# define ft_ch_audit(ft, t, node)	do { } while (0)
+# define ft_ch_audit_coarse()	do { } while (0)
+#endif	/* FT_DEBUG_CHAIN_HOLD */
+
+
+/*
  * FT_STATE_LOCK, ACQUIRE side (MW F2, Option A --
  * fractal-trie-internal.h at the bit's definition, CORE_682870 fix plan).  A
  * body copier (recompact retire / chain-compress collapse) CASes
@@ -15962,6 +16190,7 @@ void ft_glue_record_splices(struct cds_ft *ft, struct ft_glue *g,
 			assert(!ret);
 			(void) ret;
 		}
+		ft_ch_audit(ft, txn, tail);
 		ft_hlist_append_run_prepare(ft_flip_txn_handle(txn), tail, src_head);
 	}
 }

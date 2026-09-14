@@ -2444,6 +2444,7 @@ int ft_chain_node(struct cds_ft *ft, struct cds_ft_node *last_node,
 	t = ft_flip_txn_create_bounded(ft, FT_HLIST_INSERT_AFTER_MAX_EDGES);
 	if (!t)
 		return -ENOMEM;
+	ft_ch_audit(ft, t, last_node);
 	if (ft_hlist_insert_after_prepare(ft_flip_txn_handle(t), node,
 			last_node)) {
 		ft_flip_txn_destroy(t);
@@ -4082,8 +4083,10 @@ restart_replace_attempt:
 					 * One edge (FT_HLIST_FREEZE_MAX_EDGES), reserved above.  The HEAD only:
 					 * a chain is unbounded and a txn is not.
 					 */
-					if (displaced)
+					if (displaced) {
+						ft_ch_audit(ft, txn, displaced);
 						ft_hlist_freeze_prepare(ft_flip_txn_handle(txn), displaced);
+					}
 					if (ft_ord_cell_swap_publish_multi(ft, old_cell,
 							precell, &sedge, 1, txn) != 0) {
 						ret = -EAGAIN;
@@ -4176,8 +4179,10 @@ restart_replace_attempt:
 					 * One edge (FT_HLIST_FREEZE_MAX_EDGES), reserved above.  The HEAD only:
 					 * a chain is unbounded and a txn is not.
 					 */
-					if (displaced)
+					if (displaced) {
+						ft_ch_audit(ft, txn, displaced);
 						ft_hlist_freeze_prepare(ft_flip_txn_handle(txn), displaced);
+					}
 					ret = ft_flip_status_to_errno(
 						ft_ord_cell_flip_into(ft, txn,
 							&sedge, 1));
@@ -4398,8 +4403,10 @@ restart_replace_attempt:
 					 * One edge (FT_HLIST_FREEZE_MAX_EDGES), reserved above.  The HEAD only:
 					 * a chain is unbounded and a txn is not.
 					 */
-					if (displaced)
+					if (displaced) {
+						ft_ch_audit(ft, txn, displaced);
 						ft_hlist_freeze_prepare(ft_flip_txn_handle(txn), displaced);
+					}
 					if (ft_ord_cell_swap_publish_multi(ft, old_cell,
 							precell, sedges, n_sedge,
 							txn) != 0) {
@@ -4484,8 +4491,10 @@ restart_replace_attempt:
 					 * One edge (FT_HLIST_FREEZE_MAX_EDGES), reserved above.  The HEAD only:
 					 * a chain is unbounded and a txn is not.
 					 */
-					if (displaced)
+					if (displaced) {
+						ft_ch_audit(ft, txn, displaced);
 						ft_hlist_freeze_prepare(ft_flip_txn_handle(txn), displaced);
+					}
 					if (ft_ord_cell_flip_into(ft, txn, sedges,
 							n_sedge) != 0) {
 						ret = -EAGAIN;
@@ -5116,6 +5125,7 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 				s = CDS_FT_STATUS_MEMORY_ERROR;
 				return ft_replace_exit(&hm, s);
 			}
+			ft_ch_audit(ft, txn, old_node);
 			(void) ft_hlist_replace_prepare(ft_flip_txn_handle(txn),
 				old_node, new_node);
 			FT_DBG_HELD_AT(hm);
@@ -5234,6 +5244,7 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 			 * preserved) into the swap commit (doc §4.B); the reservation
 			 * above carries the extra edge.
 			 */
+			ft_ch_audit(ft, txn, old_node);
 			ft_hlist_freeze_prepare(ft_flip_txn_handle(txn), old_node);
 			ft_replace_fault_arm_abort(txn);
 			r = ft_ord_cell_swap_publish_multi(ft, old_cell, new_cell,
@@ -5334,6 +5345,7 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 				(struct cds_ft_inode_flag *) old_node, &rec, false);
 			n_s = ft_pub_rec_sedges(&rec, sedges);
 			/* Fuse @old_node's freeze into the structural publish (doc §4.B). */
+			ft_ch_audit(ft, txn, old_node);
 			ft_hlist_freeze_prepare(ft_flip_txn_handle(txn), old_node);
 			ft_replace_fault_arm_abort(txn);
 			if (caa_unlikely(ft_ord_cell_flip_into(ft, txn, sedges, n_s)

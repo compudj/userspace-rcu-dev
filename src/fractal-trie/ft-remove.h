@@ -2161,9 +2161,11 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		 * edge, the +1 reserved above.  NULL when the caller is not
 		 * retiring a leaf through this merge.
 		 */
-		if (freeze_leaf)
+		if (freeze_leaf) {
+			ft_ch_audit(ft, txn, freeze_leaf);
 			ft_hlist_freeze_sole_prepare(ft_flip_txn_handle(txn),
 				freeze_leaf);
+		}
 		/*
 		 * R3 fold: the retired key's -1 walk from the merged node's stable
 		 * parent (publish_parent) up to root rides THIS commit atomically
@@ -3454,6 +3456,7 @@ int ft_detach_node(struct cds_ft *ft,
 			 * one MARK edge into @orphan_txn, the +1 reserved above.
 			 */
 			if (freeze_leaf) {
+				ft_ch_audit(ft, orphan_txn, freeze_leaf);
 				ft_hlist_freeze_sole_prepare(
 					ft_flip_txn_handle(orphan_txn), freeze_leaf);
 				freeze_leaf_fused = true;
@@ -4457,6 +4460,7 @@ int ft_detach_node(struct cds_ft *ft,
 			 * froze it in its merge flip.
 			 */
 			if (!boundary_fused && freeze_leaf && pub && commit_txn) {
+				ft_ch_audit(ft, commit_txn, freeze_leaf);
 				ft_hlist_freeze_sole_prepare(
 					ft_flip_txn_handle(commit_txn), freeze_leaf);
 				freeze_leaf_fused = true;
@@ -5191,8 +5195,10 @@ end:
 	 * abort (ret != 0) leave it chained.  Behaviour-identical to the old
 	 * caller-side mark; a no-op under one writer.
 	 */
-	if (!ret && freeze_leaf && !freeze_leaf_fused)
+	if (!ret && freeze_leaf && !freeze_leaf_fused) {
+		ft_ch_audit(ft, NULL, freeze_leaf);
 		ft_node_mark_removed_flip(ft, freeze_leaf);
+	}
 	/*
 	 * A fused @retire_glue->txn now points at the commit_txn its commit
 	 * reclaimed above -- clear it so a future free-path reader of the glue
@@ -5435,6 +5441,7 @@ int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		 * while @node is still unmarked (doc §4.B).  The reservation above
 		 * carries the extra edge.
 		 */
+		ft_ch_audit(ft, txn, node);
 		ft_hlist_freeze_prepare(ft_flip_txn_handle(txn), node);
 		if (ft_ord_cell_swap_publish_multi(ft, old_cell, new_cell,
 				sedges, n_s, txn)) {
@@ -5529,6 +5536,7 @@ int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 			/*slot_owner_nf=*/ parent_nf, false);
 		n_s = ft_pub_rec_sedges(&rec, sedges);
 		/* Fuse @node's freeze into the structural publish (doc §4.B). */
+		ft_ch_audit(ft, txn, node);
 		ft_hlist_freeze_prepare(ft_flip_txn_handle(txn), node);
 		int cret = ft_flip_status_to_errno(
 			ft_ord_cell_flip_into(ft, txn, sedges, n_s));
@@ -5828,6 +5836,7 @@ int ft_unchain_node(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 				ft_meta_lock_release(hmeta);
 			return -ENOMEM;
 		}
+		ft_ch_audit(ft, txn, node);
 		if (ft_hlist_del_prepare(ft_flip_txn_handle(txn), node)) {
 			/*
 			 * Peer conflict observed at prepare time (@node or a
@@ -5979,6 +5988,7 @@ int ft_unchain_node(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		 * FT_INV_MW=1 both.
 		 */
 		ft_flip_txn_arm_per_op(ft, txn);
+		ft_ch_audit(ft, txn, node);
 		ft_hlist_freeze_prepare(ft_flip_txn_handle(txn), node);
 		int cret = ft_flip_status_to_errno(
 			ft_ord_cell_flip_into(ft, txn, sedges, n_s));
@@ -7789,6 +7799,7 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 			ft_ord_cell_flip_one(&edge);
 		}
 		/* The whole chain has left the trie: tombstone every node. */
+		ft_ch_audit(ft, NULL, external_nodes);
 		ft_chain_mark_removed_flip(ft, external_nodes);
 		/* The mutation invalidates the cached position (general-path parity). */
 		iter->cache_valid = false;
@@ -7999,6 +8010,7 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 					NULL /* no pending publish */, &intent, NULL);
 
 				if (cret == 0) {
+					ft_ch_audit(ft, NULL, chain_head);
 					ft_chain_mark_removed_flip(ft, chain_head);
 					if (ft->ordered_list)
 						pub.armed = true;
@@ -8077,6 +8089,7 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 					 */
 					if (ft->ordered_list)
 						pub.armed = true;
+					ft_ch_audit(ft, NULL, chain_head);
 					ft_chain_mark_removed_flip(ft, chain_head);
 					assert(ft_meta_nr_child(holder_meta) > 0);
 #ifdef FEATURE_FT_SKIP_COMPRESSED
@@ -8110,8 +8123,10 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 			NULL, -1 /* leaf key removed: detach owns the -1 */,
 			NULL, false, NULL, NULL);
 		ft_removeall_fault_scope_exit();
-		if (!ret)
+		if (!ret) {
+			ft_ch_audit(ft, NULL, chain_head);
 			ft_chain_mark_removed_flip(ft, chain_head);
+		}
 	}
 
 	/*

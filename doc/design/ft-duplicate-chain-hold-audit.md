@@ -1,0 +1,142 @@
+# The duplicate-chain hold audit — every MW writer, and whether it holds the lock
+
+**Status 2026-09-14.** Measured on `ft/unpub-free-audit`, working tree, with
+`-DFT_DEBUG_CHAIN_HOLD -DFEATURE_FT_HOLD_TRACE`.
+
+## Why this replaces the per-op conversion
+
+Converting `cds_ft_node.next/.prev` from MW to SW one operation at a time does
+not work. An SW record is sound only once **every** writer of those words is
+excluded: a single unheld producer anywhere makes the word MW again, and it
+does so silently — the engine poisons the descriptor and the op's retry loop
+absorbs it. So the unit of work is THE WORD, not the op.
+
+`ft-txn-hlist.h`'s own header already states the invariant:
+
+> Single-writer per chain (MW LOCK_FINE Step A: **every chain mutation runs
+> under the head-holder's node lock**).
+
+Nothing checked it. `-DFT_DEBUG_CHAIN_HOLD` checks it, at every site.
+
+## The predicate, and its three witnesses
+
+At each write of a duplicate-chain word, ask: does this thread hold
+`ft_chain_head_holder(node)`?
+
+    WLOCK      inside a writer scope on this trie -- the FT-wide mutex
+               excludes everyone, no per-node holder is taken   -> not a violation
+    HELD(reg)  ft_flip_txn_owns(): the op's txn owns the holder
+    HELD(led)  ft_hold_trace_holds(): the per-thread hold ledger sees it
+    UNHELD     FINE trie, no writer scope, and NEITHER witness  -> ☠ VIOLATION
+    coarseFT   a COARSE trie outside a writer scope -- a different question,
+               bucketed and never scored
+
+☠ **ALL THREE ARE REQUIRED.** Scoring on the ledger alone reported 423,154
+violations in one row that the registry then showed were all held: the ledger
+drops its entry the moment a release is RECORDED, while the word keeps
+`FT_STATE_LOCK` until that commit lands. The witnesses split by MECHANISM —
+ops that take the holder directly report via the ledger, ops that fold the
+release into their commit report via the registry. Because both witnesses can
+only ever OVER-report a hold, **UNHELD is a floor, not a ceiling.**
+
+## ☠ THREE false-positive classes the probe had to grow past
+
+Recorded because each one produced a confident, wrong number first:
+
+1. **Ledger-only scoring** — 423,154 "violations" in one row that the registry
+   showed were all held. The ledger drops on a RECORDED release while the word
+   keeps `FT_STATE_LOCK` until commit.
+2. **No WLOCK / coarse bucket** — every COARSE arm reads as a violation by
+   construction, since exclusion there is the FT-wide mutex and no per-node
+   holder is ever taken.
+3. **Prepare is not commit** — `ft_flip_txn_lock_or_guard_parent` is ALL-OR-NONE:
+   an acquire miss sets `acquire_miss` and `ft_flip_txn_commit` DISCARDS the
+   descriptor before the engine sees it. A record made without the holder under
+   that bit never installs. This alone accounted for 294,754 false violations at
+   `_cds_ft_insert_replace`, which is in fact CLEAN (365,779 records: 128,588
+   held, 248,315 aborting, 0 unheld). ☞ the stale header on
+   `ft_flip_txn_lock_or_guard_parent_at` still describes the OLD degrade-to-guard
+   behaviour that the ALL-OR-NONE block replaced; do not reason from it.
+
+## Result — the violations that survive
+
+Measured per row (the whole-suite run cannot be used: test 152
+`inv_concurrent_insert_replace_coarse` grows without bound and the memcg SIGKILL
+takes the destructor with it — a separate, pre-existing defect).
+
+**A. Definitive — a bare CAS with no txn, so nothing can abort it.**
+
+| site | rows | UNHELD |
+|---|---|---|
+| `_cds_ft_remove_all_locked:8108` | remove_all nolist/list/prefix | 50,517 of 50,517 = **100%** |
+| `_cds_ft_remove_all_locked:8073` | (full suite) | **100%** |
+| `_cds_ft_remove_all_locked:7783` | NIL-key arm | **100%** |
+
+All three are `ft_chain_mark_removed_flip` called with **no txn at all** — the
+"lone-store residual ... to be closed once the lone edge is forced through a
+txn" their own comment names. They install unconditionally. **This is the debt.**
+
+**B. Strong candidates — unheld at prepare, and NOT aborting via
+`acquire_miss`; their commits were not separately proven to install.**
+
+| site | total | held | UNHELD |
+|---|---|---|---|
+| `ft_detach_node:4463` | 9,751 | 4,922 | 4,829 = **49.5%** |
+| `ft_chain_compress_fused:2165` | 150 | 75 | 75 = **50%** |
+| `ft_detach_node:3459` | 48,852 | 0 | **100%** |
+
+The near-exact 50/50 splits suggest two code paths through one site rather than
+a race — worth resolving before fixing.
+
+**C. Clean.** `_cds_ft_insert_replace` (all four displacing arms),
+`ft_chain_node`, `ft_unchain_node`, `ft_promote_head`, `_cds_ft_replace_locked`,
+`ft_glue_record_splices`.
+
+## Clean — 0 violations, and high volume, so this is coverage not silence
+
+    ft_chain_node:2447            2,958,769   the APPEND (ledger; holder taken directly)
+    ft_promote_head:5539          2,222,725   (registry)
+    ft_unchain_node:6015          1,684,402   (registry)
+    ft_unchain_node:5863            280,868   the interior unlink (ledger)
+    _cds_ft_replace_locked:5243     260,826   (ledger)
+    ft_promote_head:5444            139,628   (registry)
+    ft_glue_record_splices:16175      4,442   (WLOCK)
+    _cds_ft_insert_replace:4405       3,924   (registry)
+
+Both appends derive the holder, acquire it, and RE-VALIDATE
+(`ft_node_is_removed(head) || ft_chain_head_holder(head) != holder_flag`)
+before walking the chain. That is the pattern the seven above are missing.
+
+## Reached by no test — unproven, not clean
+
+`ft-remove.h:5199` (the standalone `ft_node_mark_removed_flip` fallback in
+`ft_detach_node`, "a no-op under one writer"), `ft-remove.h:7994`,
+`ft-insert.h:4087`, `ft-insert.h:4182`, `ft-insert.h:5344`.
+
+## Instrumented by no probe yet — static reading only
+
+`ft-helpers.h:1622` and `ft-helpers.h:3566` (raw `rcu_assign_pointer(en->prev,
+word)` back-edge stores, list-off); the four `new_node->next->prev = …` plain
+stores to a LIVE neighbour in `ft-insert.h`; `ft-compact.h:400` (a cell edge on
+`&head->prev`); `ft-mutation-helpers.h:9880` (a freeze edge on
+`&freeze_leaf->next`).
+
+## Why the per-op predicates could not have worked
+
+`ft_member_pred_lost` and the `-ESTALE` chain-retired check were both attempts
+to let a reader of the chain DETECT a displacement after the fact. The audit
+says why neither can: at `_cds_ft_insert_replace:4492` the displacing writer
+tombstones the chain **without holding it** 70.5% of the time, so there is no
+serialization point at which the two loads a predicate needs are consistent.
+The fix is upstream of every predicate — make the seven sites hold the holder.
+
+## Order of work
+
+1. Force the three `_cds_ft_remove_all_locked` lone chain marks through a txn
+   that owns the holder. This is class A -- the only part proven to install.
+2. Settle class B: instrument the COMMIT, not the prepare, so "recorded unheld"
+   and "installed unheld" stop being the same column. Then fix what remains.
+3. `_cds_ft_insert_replace` needs NOTHING here -- it was a probe artifact.
+4. Instrument the five never-reached sites and the six static-only shapes;
+   add rows that reach them.
+5. Only then convert the words to SW. The audit reading 0 is the gate.

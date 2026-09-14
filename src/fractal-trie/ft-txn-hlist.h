@@ -129,14 +129,47 @@
  * need to be: a chain edge is MW ON PURPOSE (the chain is not covered by the
  * structural node locks) and is not part of the conservative-MW conversion.
  */
+/*
+ * The duplicate-chain hold audit lives in ft-mutation-helpers.h (it needs the
+ * per-thread hold ledger, which is defined there, and this header is included
+ * well before it).  Declare the coarse arm so ft_hlist_store_mw_at can report;
+ * one TU, so the later definition resolves it.
+ */
+#ifdef FT_DEBUG_CHAIN_HOLD
+static inline void ft_ch_audit_coarse_at(const char *fn, int line);
+# define FT_CH_COARSE(fn, line)	ft_ch_audit_coarse_at((fn), (line))
+#else
+# define FT_CH_COARSE(fn, line)	do { (void) (fn); (void) (line); } while (0)
+#endif
+
 static inline
-int ft_hlist_store_mw(struct urcu_txn *txn, void **slot, void *old_ptr,
-		void *new_ptr, uintptr_t tag)
+int ft_hlist_store_mw_at(const char *fn, int line, struct urcu_txn *txn,
+		void **slot, void *old_ptr, void *new_ptr, uintptr_t tag)
 {
+	/*
+	 * ☠ THE KIND COUNTER SAYS "CELL" AND THIS IS NOT A CELL.  Every store
+	 * below writes a DUPLICATE-CHAIN word (cds_ft_node.next/.prev), which is
+	 * [debt] -- a named owner, bound for SW under the nearest ancestor lock.
+	 * The ordinal CELL list (ft_ord_cell.lnode) is [DESIGN] MW forever.
+	 * Sharing one bucket means no instrument can tell them apart, and any
+	 * "MW is correct here" reasoning earned by the cell list reads as though
+	 * it covered the chain.  Left as-is for now so the counter's history
+	 * stays comparable; the audit below is keyed per SITE precisely so the
+	 * two are separable without disturbing it.
+	 */
 	FT_TK_COUNT_CELL_MW();
 	FT_AB_ARM(FT_AB_CELL_HANDLE, FT_AB_OWN_NA);
+	/*
+	 * @fn/@line are the CALLER's, so every chain-word store gets its own
+	 * audit row -- the whole point, since the question is per SITE.
+	 */
+	FT_CH_COARSE(fn, line);
 	return urcu_txn_store_mw(txn, slot, old_ptr, new_ptr, tag);
 }
+
+#define ft_hlist_store_mw(txn, slot, old_ptr, new_ptr, tag)		\
+	ft_hlist_store_mw_at(__func__, __LINE__, (txn), (slot),		\
+		(old_ptr), (new_ptr), (tag))
 
 static inline
 void *ft_hlist_set_mark(struct cds_ft_node *n)
