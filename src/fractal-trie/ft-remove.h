@@ -6310,7 +6310,7 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 	if (ft_node_is_removed(node)) {
 		dbg_printf("cds_ft_remove: node %p already removed\n", node);
 		FT_TP(remove_exit, (int) CDS_FT_STATUS_NOT_FOUND);
-#ifdef FT_ENABLE_TRACING
+#if defined(FT_ENABLE_TRACING) || defined(FT_DEBUG_RM_SITE)
 		ft_dbg_rm_site = __LINE__;
 #endif
 		return CDS_FT_STATUS_NOT_FOUND;
@@ -6346,13 +6346,50 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 	{
 		void *nprev = ft_dereference_prev_resolved(node);
 
+		/*
+		 * ☠ AND THE TWO LOADS ARE NOT MUTUALLY CONSISTENT, so the
+		 * predicate needs a THIRD one.  @node->prev and @pred->next are
+		 * read unheld and a PROMOTION writes both: a same-key
+		 * cds_ft_remove that retires the head promotes @node in its
+		 * place, clearing the old head's next and re-homing @node->prev
+		 * onto the flagged parent.  Read @node->prev BEFORE that
+		 * re-home and @pred->next AFTER the clear and the structure
+		 * says "your predecessor does not point at you" about a node
+		 * that is not displaced at all -- it is the new HEAD.
+		 *
+		 * MEASURED, 3/3 runs of inv_concurrent_same_key_append_nolist:
+		 * at the refusal @pred->next was NULL while an immediate
+		 * re-read of @node->prev already carried the flagged parent
+		 * (tag != external), with no tombstone on @node.  The op then
+		 * answered NOT_FOUND -- a TERMINAL claim -- for a LIVE node,
+		 * sometimes one that still had successors of its own.
+		 *
+		 * ☠ WHY A FALSE NOT_FOUND IS NOT A HARMLESS REFUSAL: the caller
+		 * is entitled to conclude the node left the trie and to re-arm
+		 * it (cds_ft_node_init, which the API permits the moment the
+		 * chain is handed back).  That wipes prev/next on a node STILL
+		 * LINKED, and the next cds_ft_insert of it descends onto
+		 * ITSELF: ft_chain_head_holder walks a NULL prev, the append
+		 * bails -EAGAIN and re-descends onto the same node forever
+		 * (measured: 230,977,777 retries in ONE call, inside the
+		 * escalation fallback, which then stalls every grace period).
+		 *
+		 * So RE-VALIDATE @node->prev after the @pred->next load and
+		 * refuse only when it is UNCHANGED: a genuine displacement is
+		 * STABLE (nobody relinks a displaced member), while a promotion
+		 * moves @node->prev off the predecessor exactly when it clears
+		 * the predecessor's next.  A prev that moved under us means the
+		 * node was relinked, not dropped -- fall through and let
+		 * ft_node_holder re-derive it from the word it now carries.
+		 */
 		if (nprev &&
 		    ft_node_external((struct cds_ft_inode_flag *) nprev) &&
-		    ft_hlist_next_rcu((struct cds_ft_node *) nprev) != node) {
+		    ft_hlist_next_rcu((struct cds_ft_node *) nprev) != node &&
+		    ft_dereference_prev_resolved(node) == nprev) {
 			dbg_printf("cds_ft_remove: node %p is not in its predecessor's chain\n",
 				node);
 			FT_TP(remove_exit, (int) CDS_FT_STATUS_NOT_FOUND);
-#ifdef FT_ENABLE_TRACING
+#if defined(FT_ENABLE_TRACING) || defined(FT_DEBUG_RM_SITE)
 			ft_dbg_rm_site = __LINE__;
 #endif
 			return CDS_FT_STATUS_NOT_FOUND;
@@ -6369,7 +6406,7 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 		/* Never inserted (a freshly-initialized node). */
 		dbg_printf("cds_ft_remove: node %p has no parent\n", node);
 		FT_TP(remove_exit, (int) CDS_FT_STATUS_NOT_FOUND);
-#ifdef FT_ENABLE_TRACING
+#if defined(FT_ENABLE_TRACING) || defined(FT_DEBUG_RM_SITE)
 		ft_dbg_rm_site = __LINE__;
 #endif
 		return CDS_FT_STATUS_NOT_FOUND;
@@ -6449,7 +6486,7 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 		/* Only an unreachable key is an idempotent miss. */
 		if (!d.nf || fwd == NULL) {
 			FT_TP(remove_exit, (int) CDS_FT_STATUS_NOT_FOUND);
-#ifdef FT_ENABLE_TRACING
+#if defined(FT_ENABLE_TRACING) || defined(FT_DEBUG_RM_SITE)
 			ft_dbg_rm_site = __LINE__;
 #endif
 			return CDS_FT_STATUS_NOT_FOUND;
@@ -6978,7 +7015,7 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 				return CDS_FT_STATUS_OK;
 			}
 			FT_TP(remove_exit, (int) CDS_FT_STATUS_NOT_FOUND);
-#ifdef FT_ENABLE_TRACING
+#if defined(FT_ENABLE_TRACING) || defined(FT_DEBUG_RM_SITE)
 			ft_dbg_rm_site = __LINE__;
 #endif
 			FT_RM_RELEASE();
@@ -7219,7 +7256,7 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 				return CDS_FT_STATUS_OK;
 			}
 			FT_TP(remove_exit, (int) CDS_FT_STATUS_NOT_FOUND);
-#ifdef FT_ENABLE_TRACING
+#if defined(FT_ENABLE_TRACING) || defined(FT_DEBUG_RM_SITE)
 			ft_dbg_rm_site = __LINE__;
 #endif
 			FT_RM_RELEASE();
@@ -7330,7 +7367,7 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 		 * same retired chain every lap.
 		 */
 		FT_TP(remove_exit, (int) CDS_FT_STATUS_NOT_FOUND);
-#ifdef FT_ENABLE_TRACING
+#if defined(FT_ENABLE_TRACING) || defined(FT_DEBUG_RM_SITE)
 		ft_dbg_rm_site = __LINE__;
 #endif
 		FT_RM_RELEASE();
@@ -7847,7 +7884,7 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 		external_nodes = metadata->external_nodes;
 		if (!external_nodes) {
 			*result_node = NULL;
-#ifdef FT_ENABLE_TRACING
+#if defined(FT_ENABLE_TRACING) || defined(FT_DEBUG_RM_SITE)
 			ft_dbg_rm_site = __LINE__;
 #endif
 			return CDS_FT_STATUS_NOT_FOUND;
@@ -7972,7 +8009,7 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 		    !ft_locate_chain_head(ft, iter->node, iter_key, key_len,
 			    &holder_flag, &head_slot, &is_prefix)) {
 			*result_node = NULL;
-#ifdef FT_ENABLE_TRACING
+#if defined(FT_ENABLE_TRACING) || defined(FT_DEBUG_RM_SITE)
 			ft_dbg_rm_site = __LINE__;
 #endif
 			return CDS_FT_STATUS_NOT_FOUND;

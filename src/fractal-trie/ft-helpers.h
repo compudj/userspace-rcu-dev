@@ -1386,7 +1386,7 @@ void ft_speculative_keycopy_unconditional(const struct cds_ft *ft,
  * read node->prev as the holder route through this so the cell indirection
  * is transparent.  Identity in non-cell builds.
  */
-#ifdef FT_ENABLE_TRACING
+#if defined(FT_ENABLE_TRACING) || defined(FT_DEBUG_RM_SITE)
 /*
  * WHICH refusal.  cds_ft_remove has six distinct "not found" exits and the
  * status code cannot tell them apart -- and a refusal is a CLAIM ABOUT THE
