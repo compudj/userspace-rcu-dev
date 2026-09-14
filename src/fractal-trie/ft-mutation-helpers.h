@@ -3189,7 +3189,8 @@ struct ft_ch_site {
 	bool coarse;
 	unsigned long total, wlock, held, led, unheld, nolocks, noholder,
 		coarse_mode, aborting, some, ctxheld,
-		ctx_txn, ctx_extra, ctx_glue, ctx_outer;
+		ctx_txn, ctx_extra, ctx_glue, ctx_outer,
+		wlock_pernode, wlock_bare;
 };
 
 extern struct ft_ch_site ft_ch_sites[FT_CH_SITE_MAX];
@@ -3243,6 +3244,41 @@ void ft_ch_audit_ctx_at(const char *fn, int line, const struct cds_ft *ft,
 	 */
 	if (ft_wlock_held == (struct cds_ft *) ft) {
 		s->wlock++;
+		/*
+		 * ☠ AND "WLOCK" IS NOT AN ANSWER TO THE QUESTION THAT MATTERS
+		 * NEXT.  This bucket used to return here, so a write inside a
+		 * writer scope was never asked whether it ALSO holds the chain's
+		 * per-node lock -- it was simply excused.  The bulk ops sit
+		 * almost entirely in this bucket, and the design note at
+		 * enum cds_ft_writer_strategy forbids resting an exclusion
+		 * argument on the FT-wide hold: it is meant to narrow to a
+		 * dual-descent mode flip, and ft_writer_lock_gp_wait already
+		 * drops it at seven drain seams inside the bulk bodies.
+		 *
+		 * So score the per-node witnesses HERE TOO, into their own
+		 * counters, and leave the FINE verdict columns untouched.
+		 * wlock_pernode = would still be covered if the whole-body hold
+		 * went away; wlock_bare = covered by NOTHING but that hold, and
+		 * therefore the work the relaxation owes.
+		 */
+		{
+			struct cds_ft_inode_flag *wh =
+				ft_chain_head_holder((struct cds_ft *) ft, node);
+			struct cds_ft_metadata *wm;
+			uintptr_t snap;
+			bool ratified;
+
+			if (!wh)
+				return;
+			wm = ft_flag_to_metadata(ft, wh);
+			if ((t && ft_flip_txn_owns(t, wm)) ||
+					ft_hold_trace_holds(wm) ||
+					(ctx && ft_lock_ctx_holds(ctx, wm, &snap,
+						&ratified)))
+				s->wlock_pernode++;
+			else
+				s->wlock_bare++;
+		}
 		return;
 	}
 	/*
@@ -3386,6 +3422,9 @@ static void ft_ch_audit_report(void)
 			nm, s->coarse ? "COARSE" : "FULL", s->total, s->wlock,
 			s->held, s->led, s->ctxheld, s->unheld, s->nolocks,
 			s->noholder, s->coarse_mode, s->aborting, s->some);
+		if (s->wlock)
+			fprintf(stderr, "%-34s %6s   WLOCK breakdown: also-per-node=%lu  BARE(only the FT-wide hold)=%lu\n",
+				nm, "", s->wlock_pernode, s->wlock_bare);
 		if (s->ctxheld)
 			fprintf(stderr, "%-34s %6s   HELD(ctx) breakdown: txn=%lu extra=%lu glue=%lu outer=%lu\n",
 				nm, "", s->ctx_txn, s->ctx_extra, s->ctx_glue,
