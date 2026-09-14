@@ -687,7 +687,32 @@ void ft_insert_publish_or_park(struct cds_ft *ft,
 	 * exclusion it never took.
 	 */
 	ft_flip_txn_arm_per_op(ft, ic->txn);
-	_ft_publish_to_parent(ft, parent_nf, slot, new_top, expected_old, &rec, false);
+	/*
+	 * ☑ @dual_owner_held TRUE: this lane HOLDS the SKIP_X dual's
+	 * grandparent.  ft_insert_lock_skip_dual_gp above acquires the DERIVED
+	 * owner -- the same derivation _ft_publish_to_parent will name -- and an
+	 * acquire MISS sets @acquire_miss, so ft_flip_txn_commit discards the
+	 * attempt UNPUBLISHED.  ft_lock_skip_dual_gp's own header draws the
+	 * conclusion: "on every path that actually publishes the op HOLDS GP and
+	 * an SW park on that body word would be legal."  Saying false here was
+	 * the record disagreeing with the acquire two lines up.
+	 *
+	 * ☠ WHY THIS IS SAFE TO FLIP NOW, when the word-kind table's note (1)
+	 * says the dual waits for every producer.  The producers that share this
+	 * word are: the remove lane (acquires GP the same way), the GLUE
+	 * publishes (a BULK op -- FT-wide writer lock with point ops parked by
+	 * the bulk gate, so "no peer recompaction can be copying the SKIP_X
+	 * dual's owner under it"), and the COMPACTION lane.  Compaction is NOT in
+	 * the validated set and its concurrency is the LAST step of the
+	 * transition, after rekey (see enum cds_ft_writer_strategy): it requires
+	 * the caller's exclusion today, so it never runs beside this op and the
+	 * two cannot disagree about a word's kind.
+	 *
+	 * The park still only happens where the txn is ARMED -- kind is decided
+	 * by @structural_sw -- so this hands the arm a true answer rather than
+	 * forcing anything.
+	 */
+	_ft_publish_to_parent(ft, parent_nf, slot, new_top, expected_old, &rec, true);
 	ft_flip_txn_record_pub_rec(ic->txn, &rec);
 	ic->slot = slot;	/* sentinel: one-commit forward recorded */
 	ic->publish_to_parent = true;

@@ -3003,6 +3003,15 @@ enum cds_ft_status cds_ft_group_attr_set_optimize(
  *     cds_ft_insert_replace   (+ cds_ft_compact_step and cds_ft_recompute_stats,
  *                              which carry no writer-strategy paragraph at all)
  *
+ * ★ AND THE ORDER IS PART OF THE PLAN, not an accident of what got done first:
+ * point ops, then BULK, then REKEY, and CONCURRENT COMPACTION LAST -- after
+ * rekey, as the final step.  Until then cds_ft_compact / cds_ft_compact_step
+ * require the caller's exclusion and are NOT in the validated set, which is
+ * what lets a conversion land while a compaction producer of the same word is
+ * still MW: the two never run concurrently, so they cannot disagree on a
+ * word's kind.  ⇒ Do NOT hold a conversion back on account of a compaction-only
+ * producer, and do NOT read "compaction still CASes it MW" as a blocker.
+ *
  * ☠ READ THOSE SENTENCES AS A TODO, NOT AS A CONTRACT.  They describe work not
  * yet done, not a property anyone wants: there is no design reason the rest
  * cannot coordinate through the same per-node lock-sets as insert and remove,
