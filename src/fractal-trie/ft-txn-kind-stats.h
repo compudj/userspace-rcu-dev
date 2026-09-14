@@ -201,7 +201,10 @@ enum ft_tk_rec_class {
 enum ft_tk_mwa_class {
 	FT_TK_MWA_ROOT = 0,
 	FT_TK_MWA_HEAD_BACK,
-	FT_TK_MWA_DUAL,
+	FT_TK_MWA_DUAL,		/* residual: none of the three below */
+	FT_TK_MWA_DUAL_ROOT,
+	FT_TK_MWA_DUAL_NAMED,
+	FT_TK_MWA_DUAL_UNNAMED,
 	FT_TK_MWA_CELL,
 	FT_TK_MWA_RANK,
 	FT_TK_MWA_PARENT_WORD,
@@ -1139,14 +1142,18 @@ void ft_tk_dump(void)
 	 */
 	{
 		static const char * const mwa_name[FT_TK_MWA_NR] = {
-			"ROOT", "HEAD_BACK", "DUAL", "CELL",
+			"ROOT", "HEAD_BACK", "DUAL", "DUAL_ROOT",
+			"DUAL_NAMED", "DUAL_UNNAMED", "CELL",
 			"RANK", "PARENT_WORD", "PSO", "STATE",
 			"GUARD",
 		};
 		static const char * const mwa_what[FT_TK_MWA_NR] = {
 			"&ft->root -- no node to lock, NEVER converts",
 			"external head back channel -- holder-owned; MW is lock-set reach, NOT never-converts",
-			"structural edge via the dispatch else -- SKIP_X duals (held AND unheld), RELOCATE forward edges, flagless roots",
+			"dispatch else, unclassified -- should read 0 now that the three below split it",
+			"the slot IS &ft->root -- no node owns it, [DESIGN], never converts",
+			"owner NAMED but not held -- THE CONVERSION SURFACE: a producer that could vouch if it acquired",
+			"owner UNNAMED (NULL) -- FT_OWNER_UNPLUMBED or genuinely ownerless: plumbing, not a lock",
 			"ordered-cell / dup-chain edge -- THE G4 LANE",
 			"nr_keys up unlocked ancestors -- Phase E (root-only spacing)",
 			"child parent_word, child not held (reparent sweep) -- lock-set reach",

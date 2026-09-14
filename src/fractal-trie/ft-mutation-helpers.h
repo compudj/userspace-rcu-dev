@@ -5926,11 +5926,21 @@ void ft_flip_txn_record_pub_rec(struct ft_flip_txn *t,
 			 * back-pointer and only the op can vouch for.  MW,
 			 * whatever the txn's mode.
 			 */
+			/*
+			 * NAMED vs UNNAMED, not one "DUAL" bucket: a producer
+			 * that derived the owner and merely does not hold it is
+			 * the CONVERSION SURFACE, while one that named nothing
+			 * is a PLUMBING job.  The root case never reaches here
+			 * (the branch above takes it), so DUAL_ROOT is not a
+			 * possible answer at this site.
+			 */
 			ft_flip_txn_record_tag_mw(t, (void **) rec->slot[i],
 				(void *) rec->old_val[i],
 				(void *) rec->new_val[i],
 				FT_FLIP_PROXY_TAG
-				FT_TK_MWA(FT_TK_MWA_DUAL));
+				FT_TK_MWA(rec->owner[i] ?
+					FT_TK_MWA_DUAL_NAMED :
+					FT_TK_MWA_DUAL_UNNAMED));
 		else
 			ft_flip_txn_record_reserved(t, rec->owner[i],
 				(void **) rec->slot[i],
@@ -9674,18 +9684,37 @@ enum urcu_txn_status ft_ord_cell_flip_into(struct cds_ft *ft,
 				(void *) edges[i].new_target, tag);
 		else
 			/*
-			 * TWO POPULATIONS IN ONE BRANCH: a non-structural tag is
-			 * a CELL edge, a structural one that got here is the
-			 * unheld SKIP_X DUAL.  Split for the counter rather than
-			 * by splitting the branch -- the class argument does not
-			 * exist outside the instrumented build, so this costs
-			 * that build nothing at all.
+			 * FOUR POPULATIONS IN ONE BRANCH, and ft-txn-kind-stats.h
+			 * says the merged DUAL column is "an upper bound ...
+			 * stale in both directions.  Split the branch before
+			 * trusting the number."  A non-structural tag is a CELL
+			 * edge; a structural one that got here is a dual, and
+			 * the three kinds of dual answer different questions:
+			 *
+			 *   DUAL_ROOT     the slot IS &ft->root -- no node owns
+			 *                 it, [DESIGN], never converts;
+			 *   DUAL_NAMED    the producer NAMED an owner and said
+			 *                 it does not hold it -- the conversion
+			 *                 surface, closable by acquiring;
+			 *   DUAL_UNNAMED  no owner named at all -- plumbing
+			 *                 (FT_OWNER_UNPLUMBED) or genuinely
+			 *                 ownerless.
+			 *
+			 * Split for the COUNTER rather than by splitting the
+			 * branch: the class argument does not exist outside the
+			 * instrumented build, so this costs that build nothing.
 			 */
 			ft_flip_txn_record_tag_mw(t, (void **) edges[i].slot,
 				(void *) edges[i].old_target,
 				(void *) edges[i].new_target, tag
-				FT_TK_MWA(tag == FT_FLIP_PROXY_TAG ?
-					FT_TK_MWA_DUAL : FT_TK_MWA_CELL));
+				FT_TK_MWA(tag != FT_FLIP_PROXY_TAG ?
+					FT_TK_MWA_CELL :
+					(void *) edges[i].slot ==
+						(void *) &ft->root ?
+					FT_TK_MWA_DUAL_ROOT :
+					edges[i].owner ?
+					FT_TK_MWA_DUAL_NAMED :
+					FT_TK_MWA_DUAL_UNNAMED));
 	}
 	return ft_flip_txn_commit(ft, t);
 }
@@ -9838,12 +9867,15 @@ void ft_ord_cell_record_into_ft(struct cds_ft *ft, struct ft_flip_txn *t,
 				 * SKIP_X dual into a grandparent it never
 				 * acquired): MW, whatever the txn's mode.
 				 */
+				/* NAMED vs UNNAMED; the root branch is above. */
 				ft_flip_txn_record_tag_mw(t,
 					(void **) edges[i].slot,
 					(void *) edges[i].old_target,
 					(void *) edges[i].new_target,
 					ft_edge_tag(&edges[i])
-					FT_TK_MWA(FT_TK_MWA_DUAL));
+					FT_TK_MWA(edges[i].owner ?
+						FT_TK_MWA_DUAL_NAMED :
+						FT_TK_MWA_DUAL_UNNAMED));
 			else
 				ft_flip_txn_record_tag(t, edges[i].owner,
 					(void **) edges[i].slot,
