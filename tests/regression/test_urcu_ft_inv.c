@@ -24479,6 +24479,12 @@ struct sir_ctx {
 	unsigned long sound_stall;	/* neither of the pair was provably out */
 #endif
 	unsigned long foreign;		/* a hand-back naming a node of another key */
+	/*
+	 * Both outcomes of the peer's insert_unique, so "green" cannot mean the
+	 * call never inserted: @iu_ok is the arm that actually races an
+	 * insert_replace for the key, @iu_dup the refusal.
+	 */
+	unsigned long iu_ok, iu_dup;
 	int stop;
 };
 
@@ -24667,6 +24673,15 @@ static void *sir_peer(void *arg)
 	struct sir_ctx *c = ((struct sir_arg *) arg)->c;
 	unsigned int r, burst, k;
 	struct cds_ft_iter *iter;
+	/*
+	 * ☠ DO NOT ALTERNATE ON @burst.  @peer_in[k] flips on EVERY visit, so a
+	 * given key reaches the insert branch only on every OTHER burst -- always
+	 * the same parity -- and `burst & 1` there is never true.  Measured: the
+	 * insert_unique arm ran 0 times, ok AND dup, which is why both outcomes
+	 * are counted.  Count the insert ATTEMPTS instead; that is the sequence
+	 * that actually alternates.
+	 */
+	unsigned long ins_attempt = 0;
 
 	rcu_register_thread();
 	rcu_thread_online();
@@ -24681,12 +24696,52 @@ static void *sir_peer(void *arg)
 				CDS_FT_LEN_DEFAULT);
 			rcu_read_lock();
 			if (!c->peer_in[k]) {
+				enum cds_ft_status is;
+
 				cds_ft_node_init(&c->peer[k].node);
 				c->peer[k].k = k;
 				c->peer[k].owner = 2;
-				if (cds_ft_insert(c->ft, key, CDS_FT_LEN_DEFAULT,
-						&c->peer[k].node) ==
-						CDS_FT_STATUS_OK) {
+				/*
+				 * ☞ ALTERNATE INSERT AND INSERT_UNIQUE.  The
+				 * contract cds_ft_insert_replace would claim if
+				 * it were declared converted names FIVE peers --
+				 * insert, insert_unique, replace, remove and
+				 * remove_all -- and this oracle drove only
+				 * insert and remove, so three of them had NO
+				 * concurrent coverage at all.
+				 *
+				 * insert_unique shares this lane's lifetime
+				 * discipline exactly: OK means the node went in,
+				 * DUPLICATE_FOUND means it did not, and either
+				 * way @peer_in[k] says whether the trie holds
+				 * it.  (remove_all does NOT share it -- it hands
+				 * back the whole chain, including the replacer
+				 * lanes' nodes, so it needs the reuse
+				 * bookkeeping and is not added here on the
+				 * strength of looking similar.)
+				 */
+				if (ins_attempt++ & 1) {
+					struct cds_ft_node *iu_ret = NULL;
+
+					/*
+					 * @result_node is written on the
+					 * DUPLICATE path (it names the existing
+					 * node), so it is not optional: passing
+					 * NULL SEGV'd 3/3 here, and every other
+					 * caller in the tree passes a real one.
+					 */
+					is = cds_ft_insert_unique(c->ft, key,
+						CDS_FT_LEN_DEFAULT,
+						&c->peer[k].node, &iu_ret);
+					if (is == CDS_FT_STATUS_OK)
+						uatomic_inc(&c->iu_ok);
+					else
+						uatomic_inc(&c->iu_dup);
+				} else
+					is = cds_ft_insert(c->ft, key,
+						CDS_FT_LEN_DEFAULT,
+						&c->peer[k].node);
+				if (is == CDS_FT_STATUS_OK) {
 					c->peer_in[k] = 1;
 					uatomic_inc(&c->ops[2]);
 				}
@@ -24910,11 +24965,12 @@ static int inv_concurrent_insert_replace_run(bool coarse, const char *name)
 	free(c.peer);
 	free(c.peer_in);
 	fprintf(stderr,
-		"# %s: %u rounds x %u burst x %u keys, 2 insert_replace lanes + 1 same-key insert/remove peer (%s): ops=%lu/%lu/%lu handed=%lu BUSY=%lu other=%lu -> %s\n",
+		"# %s: %u rounds x %u burst x %u keys, 2 insert_replace lanes + 1 same-key insert/insert_unique/remove peer (%s): ops=%lu/%lu/%lu handed=%lu BUSY=%lu other=%lu insert_unique=%lu ok/%lu dup -> %s\n",
 		name, SIR_R, SIR_BURST, SIR_K, coarse ? "coarse" : "fine",
 		uatomic_read(&c.ops[0]), uatomic_read(&c.ops[1]),
 		uatomic_read(&c.ops[2]), uatomic_read(&c.handed),
 		uatomic_read(&c.busy), uatomic_read(&c.other),
+		uatomic_read(&c.iu_ok), uatomic_read(&c.iu_dup),
 		ret ? "RED" : "ok");
 #ifdef FT_INV_SIR_SOUND_REUSE
 	fprintf(stderr, "# %s: SOUND REUSE: stalls (no provably-out node) = %lu\n",
