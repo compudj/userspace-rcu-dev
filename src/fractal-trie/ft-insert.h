@@ -3999,10 +3999,12 @@ restart_replace_attempt:
 						.new_target = (struct ft_ord_cell *)
 							node,
 					};
+					unsigned int nr_disp = displaced ?
+						ft_hlist_chain_len(displaced) : 0;
 					struct ft_flip_txn *txn =
 						ft_flip_txn_create_bounded(ft,
 						FT_ORD_CELL_SWAP_PUBLISH_MAX_EDGES + 1 +
-						FT_HLIST_FREEZE_MAX_EDGES);
+						nr_disp * FT_HLIST_FREEZE_MAX_EDGES);
 
 					/*
 					 * The flip is the op's sole side-effect (the
@@ -4080,12 +4082,36 @@ restart_replace_attempt:
 					 * It is also what stands between cds_ft_node.next/.prev and the SW park
 					 * their [debt] row is destined for.
 					 *
-					 * One edge (FT_HLIST_FREEZE_MAX_EDGES), reserved above.  The HEAD only:
-					 * a chain is unbounded and a txn is not.
+					 * ☑ THE WHOLE CHAIN, not the head only.  This used to read
+					 * "the HEAD only: a chain is unbounded and a txn is not" --
+					 * and that premise is FALSE: ft_flip_txn_create_bounded takes
+					 * a RUNTIME cap, so @nr_disp edges are reservable, exactly as
+					 * cds_ft_remove_all's leaf and prefix arms now reserve theirs.
+					 *
+					 * ☠ WHAT FREEZING THE HEAD ALONE COST.  Every further member
+					 * was left LIVE and UNREACHABLE with no tombstone anywhere,
+					 * so its removal had to be INFERRED -- cds_ft_remove's "does
+					 * my predecessor still point at me?" test exists for exactly
+					 * these nodes, and names this op as the reason.  That
+					 * inference is fallible: it read @node->prev and @pred->next
+					 * unheld and answered a TERMINAL NOT_FOUND for a live node a
+					 * peer was PROMOTING, which leaked the node and livelocked the
+					 * next insert of it (230,977,777 retries in one call).
+					 * MEASURED exposure before this change, on
+					 * inv_concurrent_insert_replace_nolist: 233,577 displacements
+					 * left 50,661 members unmarked -- 21.7%.
+					 *
+					 * @nr_disp is the DERIVATION and the walk is BOUND by it, so
+					 * a duplicate appended since tears the derived tail's NULL and
+					 * ABORTS this commit for the retry to re-derive -- where the
+					 * head-only freeze would have marked the head and orphaned
+					 * that fresh duplicate behind it.
 					 */
 					if (displaced) {
 						ft_ch_audit(ft, txn, displaced);
-						ft_hlist_freeze_prepare(ft_flip_txn_handle(txn), displaced);
+						ft_hlist_freeze_chain_prepare(
+							ft_flip_txn_handle(txn),
+							displaced, nr_disp);
 					}
 					if (ft_ord_cell_swap_publish_multi(ft, old_cell,
 							precell, &sedge, 1, txn) != 0) {
@@ -4115,9 +4141,11 @@ restart_replace_attempt:
 						.new_target = (struct ft_ord_cell *)
 							node,
 					};
+					unsigned int nr_disp = displaced ?
+						ft_hlist_chain_len(displaced) : 0;
 					struct ft_flip_txn *txn =
 						ft_flip_txn_create_bounded(ft, 2 +
-							FT_HLIST_FREEZE_MAX_EDGES);
+							nr_disp * FT_HLIST_FREEZE_MAX_EDGES);
 
 					if (!txn) {
 						ret = -ENOMEM;
@@ -4176,12 +4204,36 @@ restart_replace_attempt:
 					 * It is also what stands between cds_ft_node.next/.prev and the SW park
 					 * their [debt] row is destined for.
 					 *
-					 * One edge (FT_HLIST_FREEZE_MAX_EDGES), reserved above.  The HEAD only:
-					 * a chain is unbounded and a txn is not.
+					 * ☑ THE WHOLE CHAIN, not the head only.  This used to read
+					 * "the HEAD only: a chain is unbounded and a txn is not" --
+					 * and that premise is FALSE: ft_flip_txn_create_bounded takes
+					 * a RUNTIME cap, so @nr_disp edges are reservable, exactly as
+					 * cds_ft_remove_all's leaf and prefix arms now reserve theirs.
+					 *
+					 * ☠ WHAT FREEZING THE HEAD ALONE COST.  Every further member
+					 * was left LIVE and UNREACHABLE with no tombstone anywhere,
+					 * so its removal had to be INFERRED -- cds_ft_remove's "does
+					 * my predecessor still point at me?" test exists for exactly
+					 * these nodes, and names this op as the reason.  That
+					 * inference is fallible: it read @node->prev and @pred->next
+					 * unheld and answered a TERMINAL NOT_FOUND for a live node a
+					 * peer was PROMOTING, which leaked the node and livelocked the
+					 * next insert of it (230,977,777 retries in one call).
+					 * MEASURED exposure before this change, on
+					 * inv_concurrent_insert_replace_nolist: 233,577 displacements
+					 * left 50,661 members unmarked -- 21.7%.
+					 *
+					 * @nr_disp is the DERIVATION and the walk is BOUND by it, so
+					 * a duplicate appended since tears the derived tail's NULL and
+					 * ABORTS this commit for the retry to re-derive -- where the
+					 * head-only freeze would have marked the head and orphaned
+					 * that fresh duplicate behind it.
 					 */
 					if (displaced) {
 						ft_ch_audit(ft, txn, displaced);
-						ft_hlist_freeze_prepare(ft_flip_txn_handle(txn), displaced);
+						ft_hlist_freeze_chain_prepare(
+							ft_flip_txn_handle(txn),
+							displaced, nr_disp);
 					}
 					ret = ft_flip_status_to_errno(
 						ft_ord_cell_flip_into(ft, txn,
@@ -4332,11 +4384,13 @@ restart_replace_attempt:
 					 */
 					struct ft_ord_cell *old_cell =
 						ft_ord_cell_ptr((*old_node_ret)->prev);
+					unsigned int nr_disp = displaced ?
+						ft_hlist_chain_len(displaced) : 0;
 					struct ft_flip_txn *txn =
 						ft_flip_txn_create_bounded(ft,
 							FT_ORD_CELL_SWAP_PUBLISH_MAX_EDGES +
 							1 /* §4.B parent guard */ +
-							FT_HLIST_FREEZE_MAX_EDGES);
+							nr_disp * FT_HLIST_FREEZE_MAX_EDGES);
 
 					if (!txn) {
 						ret = -ENOMEM;
@@ -4400,12 +4454,36 @@ restart_replace_attempt:
 					 * It is also what stands between cds_ft_node.next/.prev and the SW park
 					 * their [debt] row is destined for.
 					 *
-					 * One edge (FT_HLIST_FREEZE_MAX_EDGES), reserved above.  The HEAD only:
-					 * a chain is unbounded and a txn is not.
+					 * ☑ THE WHOLE CHAIN, not the head only.  This used to read
+					 * "the HEAD only: a chain is unbounded and a txn is not" --
+					 * and that premise is FALSE: ft_flip_txn_create_bounded takes
+					 * a RUNTIME cap, so @nr_disp edges are reservable, exactly as
+					 * cds_ft_remove_all's leaf and prefix arms now reserve theirs.
+					 *
+					 * ☠ WHAT FREEZING THE HEAD ALONE COST.  Every further member
+					 * was left LIVE and UNREACHABLE with no tombstone anywhere,
+					 * so its removal had to be INFERRED -- cds_ft_remove's "does
+					 * my predecessor still point at me?" test exists for exactly
+					 * these nodes, and names this op as the reason.  That
+					 * inference is fallible: it read @node->prev and @pred->next
+					 * unheld and answered a TERMINAL NOT_FOUND for a live node a
+					 * peer was PROMOTING, which leaked the node and livelocked the
+					 * next insert of it (230,977,777 retries in one call).
+					 * MEASURED exposure before this change, on
+					 * inv_concurrent_insert_replace_nolist: 233,577 displacements
+					 * left 50,661 members unmarked -- 21.7%.
+					 *
+					 * @nr_disp is the DERIVATION and the walk is BOUND by it, so
+					 * a duplicate appended since tears the derived tail's NULL and
+					 * ABORTS this commit for the retry to re-derive -- where the
+					 * head-only freeze would have marked the head and orphaned
+					 * that fresh duplicate behind it.
 					 */
 					if (displaced) {
 						ft_ch_audit(ft, txn, displaced);
-						ft_hlist_freeze_prepare(ft_flip_txn_handle(txn), displaced);
+						ft_hlist_freeze_chain_prepare(
+							ft_flip_txn_handle(txn),
+							displaced, nr_disp);
 					}
 					if (ft_ord_cell_swap_publish_multi(ft, old_cell,
 							precell, sedges, n_sedge,
@@ -4426,11 +4504,13 @@ restart_replace_attempt:
 					 * create failure nothing is applied, the old head is
 					 * NOT freed and the replace aborts retriably.
 					 */
+					unsigned int nr_disp = displaced ?
+						ft_hlist_chain_len(displaced) : 0;
 					struct ft_flip_txn *txn =
 						ft_flip_txn_create_bounded(ft,
 							FT_PUB_SEDGE_MAX_EDGES +
 							1 /* §4.B parent guard */ +
-							FT_HLIST_FREEZE_MAX_EDGES);
+							nr_disp * FT_HLIST_FREEZE_MAX_EDGES);
 
 					if (!txn) {
 						ret = -ENOMEM;
@@ -4488,12 +4568,36 @@ restart_replace_attempt:
 					 * It is also what stands between cds_ft_node.next/.prev and the SW park
 					 * their [debt] row is destined for.
 					 *
-					 * One edge (FT_HLIST_FREEZE_MAX_EDGES), reserved above.  The HEAD only:
-					 * a chain is unbounded and a txn is not.
+					 * ☑ THE WHOLE CHAIN, not the head only.  This used to read
+					 * "the HEAD only: a chain is unbounded and a txn is not" --
+					 * and that premise is FALSE: ft_flip_txn_create_bounded takes
+					 * a RUNTIME cap, so @nr_disp edges are reservable, exactly as
+					 * cds_ft_remove_all's leaf and prefix arms now reserve theirs.
+					 *
+					 * ☠ WHAT FREEZING THE HEAD ALONE COST.  Every further member
+					 * was left LIVE and UNREACHABLE with no tombstone anywhere,
+					 * so its removal had to be INFERRED -- cds_ft_remove's "does
+					 * my predecessor still point at me?" test exists for exactly
+					 * these nodes, and names this op as the reason.  That
+					 * inference is fallible: it read @node->prev and @pred->next
+					 * unheld and answered a TERMINAL NOT_FOUND for a live node a
+					 * peer was PROMOTING, which leaked the node and livelocked the
+					 * next insert of it (230,977,777 retries in one call).
+					 * MEASURED exposure before this change, on
+					 * inv_concurrent_insert_replace_nolist: 233,577 displacements
+					 * left 50,661 members unmarked -- 21.7%.
+					 *
+					 * @nr_disp is the DERIVATION and the walk is BOUND by it, so
+					 * a duplicate appended since tears the derived tail's NULL and
+					 * ABORTS this commit for the retry to re-derive -- where the
+					 * head-only freeze would have marked the head and orphaned
+					 * that fresh duplicate behind it.
 					 */
 					if (displaced) {
 						ft_ch_audit(ft, txn, displaced);
-						ft_hlist_freeze_prepare(ft_flip_txn_handle(txn), displaced);
+						ft_hlist_freeze_chain_prepare(
+							ft_flip_txn_handle(txn),
+							displaced, nr_disp);
 					}
 					if (ft_ord_cell_flip_into(ft, txn, sedges,
 							n_sedge) != 0) {
