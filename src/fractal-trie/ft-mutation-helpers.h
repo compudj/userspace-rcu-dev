@@ -16316,6 +16316,37 @@ void ft_glue_record_splices(struct cds_ft *ft, struct ft_glue *g,
 					FT_HLIST_PREV_TAG);
 			int ret;
 
+			/*
+			 * ☠ AUDIT THE SRC HEAD, NOT THE TAIL.  The FULL audit a
+			 * few lines down asks about @tail -- the DST chain, whose
+			 * holder this op DID acquire.  This store is to
+			 * @src_head->prev, whose owner is a DIFFERENT node and
+			 * whose holder ft_glue_acquire_splice_holders does NOT
+			 * take (the paragraph above says so).  Without a FULL row
+			 * of its own the only thing reporting here was the COARSE
+			 * arm, which cannot derive a holder and is explicitly not
+			 * a verdict -- so the one chain word in this function that
+			 * is VALIDATED rather than HELD was the one the audit
+			 * never asked about.
+			 */
+			{
+				/*
+				 * ☠ AND IT MUST BE ASKED WITH THE GLUE IN HAND.
+				 * ft_glue_acquire_splice_holders keeps its fences
+				 * in the GLUE's named fields and DELIBERATELY does
+				 * not register them with the flip-txn (its own
+				 * header says so), so a registry+ledger-only query
+				 * here cannot see a holder this op really took and
+				 * would report a bare write that is not bare.
+				 * ft_held_set_snap consults @glue; hand it one.
+				 */
+				struct ft_lock_ctx gctx = { 0 };
+
+				gctx.held.txn = txn;
+				gctx.held.glue = g;
+				ft_ch_audit_ctx(ft, txn, &gctx, src_head);
+			}
+
 			ret = ft_hlist_store_mw(h, (void **) &src_head->prev,
 					prev_old, (void *) tail, FT_HLIST_PREV_TAG);
 			/*
