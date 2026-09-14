@@ -8297,12 +8297,26 @@ int ft_rekey_graft_simple_locked(struct cds_ft *ft,
 	 * JOIN THE PEER EXCLUSION PROTOCOL.  This writer parks its structural
 	 * edges SW (ft_flip_txn_set_structural_sw), and an SW park CANNOT FAIL:
 	 * it does not arbitrate.  That is legal only where the op excludes every
-	 * peer writer over those slots.  On a FINE trie the per-node DLM LOCK
-	 * try-locks are that protocol and this scope is INERT
-	 * (ft_writer_lock_scope_enter returns early on @lock_fine).  On a COARSE
-	 * trie the protocol is the FT-WIDE MUTEX, which every other writer takes
-	 * through exactly this scope and which this op used to take nowhere --
-	 * so its unfailable parks arbitrated against nobody.
+	 * peer writer over those slots.  On a COARSE trie the protocol is the
+	 * FT-WIDE MUTEX, which every other writer takes through exactly this
+	 * scope and which this op used to take nowhere -- so its unfailable parks
+	 * arbitrated against nobody.
+	 *
+	 * ☠ AND ON A FINE TRIE THIS SCOPE IS NOT INERT ANY MORE.  It used to say
+	 * so ("ft_writer_lock_scope_enter returns early on @lock_fine"), and that
+	 * was true before G5.25.  It is now false HERE IN PARTICULAR: the early
+	 * return is conditioned on `!ft_bulk_active(ft)`, ft_bulk_active is a
+	 * plain load of the trie-level @bulk_state with NO self-exclusion, and
+	 * this op is itself a bulk holder by the time it arrives -- a rekey
+	 * enters the gate as FT_BULK_COHERENT (@bulk_gate_nr counts "ALL bulk
+	 * holders, rekey included") and the PLACEMENT rule below puts the gate
+	 * strictly before this scope.  So @bulk_state is non-zero, the early
+	 * return does not fire, and this scope TAKES the FT-wide lock.
+	 *
+	 * That is the design, not an accident: bulk ops -- rekey among them --
+	 * mutually exclude on the FT-wide lock, and the bulk-in-progress state
+	 * flips the point ops onto that same lock for the window.  The per-node
+	 * DLM try-locks are what this op uses BENEATH that, not instead of it.
 	 *
 	 * PLACEMENT.  After the move gate, never before it: ft_move_gate_enter
 	 * waits a GRACE PERIOD, and a peer parked on this mutex is an ONLINE,
