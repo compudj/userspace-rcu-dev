@@ -1299,23 +1299,29 @@ struct ft_pub_rec {
  *              live the day in-place is extended to a concurrent trie.
  *              ☞ ft_state_edge, and the assert beside its caller.
  *
- *   FT-SLOT-2  ☑ ITS ONLY KNOWN PATH IS CLOSED, by the CALLER rather than here.
- *              The MARK CHECK is still absent from
- *              ft_hlist_insert_after_prepare while ft-txn-hlist.h's header
- *              still promises it ("a concurrent insert_after(H) onto a
- *              sole-node chain sees the mark and aborts"): the remove side
- *              upholds its half, the prepare never looks, and MARK(NULL) reads
- *              back as the bare value 2, which passes `succ != NULL` and makes
- *              the second store record slot &((struct cds_ft_node *) 2)->prev.
- *              ☞ WHAT CHANGED: both duplicate-append arms now RE-VALIDATE
- *              under the holder lock and refuse a retired head
- *              (ft_node_is_removed), so no walk can end on one and @pos can no
- *              longer arrive marked from that path.  The invariant is therefore
- *              enforced by the caller, NOT by the prepare -- which is a weaker
- *              arrangement than the header describes, so the assert stays as
- *              the detector.  NEVER REPRODUCED: two delay-injection sites and a
- *              purpose-built rig failed to reach it even before the fix; treat
- *              it as unproven, not as closed.
+ *   FT-SLOT-2  ☑ CLOSED IN BOTH PLACES.  The MARK CHECK is BACK in
+ *              ft_hlist_insert_after_prepare -- as a REFUSAL (-ENOENT), not an
+ *              assert -- so the prepare once again enforces what
+ *              ft-txn-hlist.h's header has always promised ("a concurrent
+ *              insert_after(H) onto a sole-node chain sees the mark and
+ *              aborts").  Unchecked it is a LOST INSERT: MARK(NULL) reads back
+ *              as the bare value 2, which passes `succ != NULL` and makes the
+ *              second store record slot &((struct cds_ft_node *) 2)->prev.
+ *              ft_hlist_del_prepare carries the SAME refusal, where the shape
+ *              reproduced 8/8 as a SEGV once _cds_ft_insert_replace began
+ *              tombstoning the chains it displaces.
+ *              ☞ THE CALLER-SIDE HALF STANDS TOO: both duplicate-append arms
+ *              RE-VALIDATE under the holder lock and refuse a retired head
+ *              (ft_node_is_removed), so no walk can END on one.  Two
+ *              enforcement points, which is what the header describes.
+ *              ☠ AND THE PREPARE-SIDE REFUSAL IS UNEXERCISED BY THE SUITE: a
+ *              counter on both arms (-DFT_DEBUG_MARK_REFUSAL) reads 0 across
+ *              every point-op row measured 2026-09-14 (insert_replace,
+ *              same_key append / inserts / removes / replace, insert_unique,
+ *              remove_all nolist/list/prefix).  It is a GUARD with no witness,
+ *              not a path with coverage -- do not read its presence as
+ *              evidence the shape is reachable today, and do not delete it on
+ *              the strength of that zero either.
  *              ☞ ft_hlist_insert_after_prepare, and note the sibling shapes
  *              the survey flagged there -- del_prepare / replace_prepare can
  *              still carry a marked next into a LIVE pred->next, excluded only

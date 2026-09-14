@@ -208,6 +208,30 @@ struct cds_ft_node *ft_hlist_next_rcu(struct cds_ft_node *node)
 	return ft_hlist_resolve((void *) rcu_dereference(node->next));
 }
 
+#ifdef FT_DEBUG_MARK_REFUSAL
+/*
+ * TEMPORARY (validated-set probe): which test rows actually REACH the two
+ * FT_HLIST_MARK refusals?  A row with a non-zero count here is a row that must
+ * be in the validated set for this site; a row reading 0 proves nothing about
+ * the refusal and does not belong in the set.
+ */
+static unsigned long ft_mark_refuse_ins, ft_mark_refuse_del;
+# define FT_MARK_REFUSE_TALLY(which)	do {				\
+		if ((which) == 0) __atomic_fetch_add(&ft_mark_refuse_ins,\
+				1, __ATOMIC_RELAXED);			\
+		else __atomic_fetch_add(&ft_mark_refuse_del, 1,		\
+				__ATOMIC_RELAXED);			\
+	} while (0)
+static void ft_mark_refuse_report(void) __attribute__((destructor));
+static void ft_mark_refuse_report(void)
+{
+	fprintf(stderr, "FT_MARK_REFUSE  insert_after=%lu  del=%lu\n",
+		ft_mark_refuse_ins, ft_mark_refuse_del);
+}
+#else
+# define FT_MARK_REFUSE_TALLY(which)	do { } while (0)
+#endif
+
 /*
  * ft_hlist_insert_after_prepare: record an insert of @newp immediately after
  * @pos, WITHOUT committing.  @pos is the predecessor NODE (the head node H for a
@@ -276,8 +300,10 @@ int ft_hlist_insert_after_prepare(struct urcu_txn *txn,
 	 * the correct answer -- the chain this append aimed at is gone, so the
 	 * position must be derived again.
 	 */
-	if (caa_unlikely((uintptr_t) succ & FT_HLIST_MARK))
+	if (caa_unlikely((uintptr_t) succ & FT_HLIST_MARK)) {
+		FT_MARK_REFUSE_TALLY(0);
 		return -ENOENT;
+	}
 
 	/* Build the fresh node invisibly. */
 	newp->next = succ;
@@ -338,12 +364,17 @@ void ft_hlist_append_run_prepare(struct urcu_txn *txn,
  * (next->prev: elem -> pred).  On a committed OK THIS call removed @elem; reclaim
  * it after a grace period.  OOM is sticky to the commit.
  *
- * Single-writer per chain (see ft_hlist_insert_after_prepare): @elem is never
- * already deleted and @next is never a neighbour mid-deletion, so the
- * multi-writer arbitration (-ENOENT on a marked @elem, load-validate &next->next
- * and retry -EAGAIN on a marked successor) is dead and dropped, and @pred read
- * this attempt is stable (no peer re-links it).  Always returns 0 (int retained
- * for caller-shape parity).
+ * Single-writer per chain (see ft_hlist_insert_after_prepare) covers the
+ * NEIGHBOURS: @next is never a neighbour mid-deletion and @pred read this
+ * attempt is stable (no peer re-links it), so that half of the multi-writer
+ * arbitration (load-validate &next->next, retry -EAGAIN on a marked successor)
+ * stays dropped.
+ *
+ * ☠ IT DOES NOT COVER @elem ITSELF.  A structural head-remove marks a head it
+ * retires from OUTSIDE this chain's holder -- and since cds_ft_insert_replace
+ * tombstones the chain it displaces, an already-marked @elem does arrive here.
+ * The -ENOENT refusal below is therefore LIVE, not dead: this function returns
+ * 0, or -ENOENT when @elem is already logically deleted.
  */
 static inline
 int ft_hlist_del_prepare(struct urcu_txn *txn, struct cds_ft_node *elem)
@@ -370,8 +401,10 @@ int ft_hlist_del_prepare(struct urcu_txn *txn, struct cds_ft_node *elem)
 	 * position derivation, where the wrapper's tombstone test answers
 	 * NOT_FOUND.  Nothing is recorded, so nothing installs.
 	 */
-	if (caa_unlikely((uintptr_t) next & FT_HLIST_MARK))
+	if (caa_unlikely((uintptr_t) next & FT_HLIST_MARK)) {
+		FT_MARK_REFUSE_TALLY(1);
 		return -ENOENT;
+	}
 
 	/*
 	 * Mark elem (logical delete), unlink forward (pred->next: elem -> next)
