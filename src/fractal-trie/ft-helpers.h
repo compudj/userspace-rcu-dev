@@ -3509,10 +3509,18 @@ void ft_head_stamp_incoming_byte(const struct cds_ft *ft,
  *             Pass NULL when the slot is unknown or irrelevant.
  */
 static
-void ft_set_parent(struct cds_ft *ft, struct cds_ft_inode_flag *child_nf,
+void ft_set_parent_at(const char *fn, int line, struct cds_ft *ft,
+		struct cds_ft_inode_flag *child_nf,
 		struct cds_ft_inode_flag *parent_nf,
 		struct cds_ft_inode_flag **slot)
 {
+	/*
+	 * @fn/@line are the CALLER's, so the head parent-word audit below gets
+	 * one row per CALL SITE.  ft_set_parent has 34 callers but the external
+	 * arm -- the only one that writes a head's parent word -- is reached by
+	 * far fewer, and which ones they are is a question to MEASURE rather
+	 * than classify by inspection.
+	 */
 	/*
 	 * A NULL @parent_nf is the root position (the publish goes into
 	 * &ft->root): store the OWNING TRIE there rather than NULL, so the
@@ -3588,7 +3596,7 @@ void ft_set_parent(struct cds_ft *ft, struct cds_ft_inode_flag *child_nf,
 		/* The up-walk edge byte, BEFORE the parent word: see the helper. */
 		ft_head_stamp_incoming_byte(ft, en, parent_nf, slot);
 		/* Same word class as the prefix-head store above. */
-		ft_ch_audit_head(ft, en, parent_nf);
+		ft_ch_audit_head_at(fn, line, ft, en, parent_nf);
 		if (ft->ordered_list)
 			ft_ord_cell_set_parent(en, word);
 		else
@@ -3628,6 +3636,10 @@ void ft_set_parent(struct cds_ft *ft, struct cds_ft_inode_flag *child_nf,
 		ft_set_parent_slot(meta, parent_nf, slot);
 	}
 }
+
+#define ft_set_parent(ft, child_nf, parent_nf, slot)			\
+	ft_set_parent_at(__func__, __LINE__, (ft), (child_nf),		\
+		(parent_nf), (slot))
 
 /*
  * Return codes for compressed node traversal helpers.
