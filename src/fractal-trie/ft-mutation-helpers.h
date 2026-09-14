@@ -16575,12 +16575,24 @@ void ft_glue_record_splices(struct cds_ft *ft, struct ft_glue *g,
 		 * one tag the readers' prev loads resolve (see ft-txn-hlist.h).
 		 * The tail-walk above reads unmodified slots -- recorded edges do
 		 * not install until the commit -- so it always finds the true
-		 * pre-merge tail.
+		 * pre-merge tail.  @prev_old is still read and still passed: an SW
+		 * record needs it to RESTORE the slot on abort, it just no longer
+		 * gates the install.
 		 *
 		 * ☞ WHAT THIS DOES AND DOES NOT EXCLUDE.  This op holds the DST
 		 * head's chain holder only (ft_glue_acquire_splice_holders); the
-		 * SRC head's is not acquired here, and under the fold a peer may
-		 * still act on that head between this record and the commit.
+		 * SRC head's is not acquired here.
+		 *
+		 * ☑ AND THE RECORD IS SW, NOT MW -- the expected-old no longer
+		 * arbitrates anything here, because nothing it could arbitrate
+		 * against is in the validated op set.  The paragraph below used to
+		 * justify MW with "a peer WRITE to its prev now fails THIS
+		 * commit"; the only peer that can still be that writer is
+		 * cds_ft_compact_step, which takes no gate, whose contract demands
+		 * caller exclusion, and which the plan converts LAST.  Keeping a
+		 * multi-writer CAS to survive an op the contract excludes is how a
+		 * [debt] word stays MW forever ⇒ the word-kind table,
+		 * fractal-trie-internal.h.
 		 *
 		 * ☑ AND THE PEER THAT PARAGRAPH MEANS IS COMPACTION, not a point
 		 * op -- measured, not read off the call graph (-DFT_DEBUG_SPLICE_SEAM,
@@ -16613,12 +16625,17 @@ void ft_glue_record_splices(struct cds_ft *ft, struct ft_glue *g,
 		 * sits ABOVE its ft_glue_record_splices call in the same function,
 		 * and the only thing between that call and ft_flip_txn_commit is
 		 * ft_flip_txn_record_count_parent, which records and does not
-		 * wait.  A
-		 * peer WRITE to its prev (a src-side recompaction re-homing it, a
-		 * head promote swapping a fresh cell in) now fails THIS commit --
-		 * the record's expected-old no longer matches -- and the op
-		 * retries against the peer's result; the plain store this replaced
-		 * would have clobbered the peer's word or been clobbered.  A peer
+		 * wait.
+		 *
+		 * A peer WRITE to its prev (a src-side recompaction re-homing it,
+		 * a head promote swapping a fresh cell in) is what the MW record
+		 * used to catch: it failed THIS commit and the op retried against
+		 * the peer's result.  Under the validated op set no such peer
+		 * exists, and the SW park is the STATEMENT that none does -- if
+		 * one ever appears, this park CLOBBERS it silently instead of
+		 * aborting.  ⇒ The day cds_ft_compact_step is converted, this site
+		 * must be RE-ARGUED, not re-measured: a green run proves only that
+		 * the peer did not run.  A peer
 		 * RAW READ of the parked record is the residue: the same class a
 		 * head promote already creates by parking its own proxy on a
 		 * head's prev, met by the resolver every reader uses and, since
@@ -16688,7 +16705,7 @@ void ft_glue_record_splices(struct cds_ft *ft, struct ft_glue *g,
 			if (ft->exclusive)
 				uatomic_inc(&ft_ss_store_excl);
 #endif
-			ret = ft_hlist_store_mw(h, (void **) &src_head->prev,
+			ret = ft_hlist_store_sw(h, (void **) &src_head->prev,
 					prev_old, (void *) tail, FT_HLIST_PREV_TAG);
 			/*
 			 * Reserved up front (two edges per splice), so this cannot

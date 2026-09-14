@@ -1272,6 +1272,21 @@ struct ft_pub_rec {
  *     MW.  Not a live race (every producer holds the holder, or is bulk-gated,
  *     or the head is build-invisible) -- but "genuinely unlocked" is FALSE of
  *     this word, and the kind-stats HEAD_BACK entry now says so.
+ *
+ *     ☑ AND A SECOND PRODUCER HAS NOW CONVERTED: ft_glue_record_splices' store
+ *     to @src_head->prev, via ft_hlist_store_sw.  Its MW was a BACKSTOP against
+ *     cds_ft_compact_step -- the one peer the bulk gate does not park -- and
+ *     compaction is LAST in the plan and excluded by its own contract, so the
+ *     CAS was arbitrating against nobody.  Measured before flipping: 5401 of
+ *     5401 stores with the FT-wide writer lock held inside a bulk body, 0 drain
+ *     seams in-window (-DFT_DEBUG_SPLICE_SEAM).  ⇒ Keeping an MW CAS to survive
+ *     an op the contract excludes is how a [debt] word stays MW forever.
+ *
+ *     ☠ The REST of the class is NOT converted, and must not be flipped site by
+ *     site: rcu-txn.h makes a slot SW xor MW GLOBALLY, and the point-op chain
+ *     sites run against each other under per-node holder locks with RAW
+ *     producers beside them (ft_set_parent's external arm).  That is one
+ *     whole-class step, not six small ones.
  * (6) The one family whose design-MW is ARGUED rather than asserted.
  *
  * ----------------------------------------------------------------------------

@@ -266,6 +266,7 @@ struct ft_tk_tls {
 	unsigned long created[FT_TK_MAX_SITES];
 	unsigned long armed[FT_TK_MAX_SITES];
 	unsigned long cell_mw;	/* not site-attributed, see the header comment */
+	unsigned long cell_sw;	/* the chain edges converted OFF MW; same caveat */
 	unsigned long mwa[FT_TK_MWA_NR];
 #ifdef FT_ABORT_ATTRIB
 	/*
@@ -427,6 +428,18 @@ static inline
 void ft_tk_count_cell_mw(void)
 {
 	ft_tk_tls_get()->cell_mw++;
+}
+
+/*
+ * The SW twin.  A chain edge used to be MW without exception, so one counter
+ * was enough; once a site converts, a single bucket would report the
+ * conversion as a DROP in cell_mw and nothing else -- indistinguishable from
+ * the site no longer running.  Count both and the pair moves visibly.
+ */
+static inline
+void ft_tk_count_cell_sw(void)
+{
+	ft_tk_tls_get()->cell_sw++;
 }
 
 /*
@@ -963,7 +976,7 @@ void ft_tk_dump(void)
 {
 	struct ft_tk_row *rows;
 	struct ft_tk_tls *tls;
-	unsigned long cell_mw = 0;
+	unsigned long cell_mw = 0, cell_sw = 0;
 	unsigned long mwa[FT_TK_MWA_NR];
 	unsigned long mwa_tot = 0;
 #ifdef FT_ABORT_ATTRIB
@@ -1013,6 +1026,7 @@ void ft_tk_dump(void)
 
 		threads++;
 		cell_mw += tls->cell_mw;
+		cell_sw += tls->cell_sw;
 		for (i = 0; i < FT_TK_MWA_NR; i++)
 			mwa[i] += tls->mwa[i];
 #ifdef FT_ABORT_ATTRIB
@@ -1130,8 +1144,8 @@ void ft_tk_dump(void)
 		tot.end[FT_TK_MEMERR], tot.end[FT_TK_MISS],
 		tot.end[FT_TK_BAILED]);
 	fprintf(stderr,
-"    cell/hlist MW stores (recorded straight on the engine handle, not site-attributed): %lu\n",
-		cell_mw);
+"    cell/hlist stores (recorded straight on the engine handle, not site-attributed): MW=%lu SW=%lu\n",
+		cell_mw, cell_sw);
 
 	/*
 	 * MW_ALWAYS, SPLIT BY THE BRANCH THAT RECORDED IT.  The classes sum to
@@ -1313,7 +1327,8 @@ void ft_tk_dump(void)
 	}
 #endif
 	fprintf(stderr,
-"    MW_STRUCT is the conversion surface; MW_ALWAYS + MW_LOCK + the cell/hlist line stay MW by design.\n"
+"    MW_STRUCT is the conversion surface; MW_ALWAYS + MW_LOCK stay MW by design.\n"
+"    The cell/hlist line is SPLIT: the ordinal CELL list is MW forever, the duplicate CHAIN is [debt] and converting -- read the SW column, not a fall in MW.\n"
 "    OWN_HELD/OWN_LEDGER/OWN_MISS split MW_STRUCT (the surface) by whether the op holds the word's owner; they sum to it:\n"
 "      OWN_HELD   the txn registry names it.  OWN_LEDGER  only this thread's hold ledger does (a REGISTRY gap;\n"
 "      needs -DFEATURE_FT_HOLD_TRACE or it reads 0).  OWN_MISS  neither: a real exclusion gap.\n"
@@ -1371,6 +1386,7 @@ void ft_tk_dump_at_exit(void)
 			FT_TK_OWN_MISS))
 #define FT_TK_COUNT_ARMED(t)		ft_tk_count_armed((t)->dbg_site)
 #define FT_TK_COUNT_CELL_MW()		ft_tk_count_cell_mw()
+#define FT_TK_COUNT_CELL_SW()		ft_tk_count_cell_sw()
 /*
  * THE CLASS ARGUMENT EXISTS ONLY IN THE INSTRUMENTED BUILD, for the reason the
  * site parameter does (see FT_TK_SITE_PARAM): an extra always-constant argument
@@ -1447,6 +1463,7 @@ struct ft_tk_site;	/* incomplete: the NULL the constructors take */
 #define FT_TK_COUNT_END(t, c)		do { } while (0)
 #define FT_TK_COUNT_ARMED(t)		do { } while (0)
 #define FT_TK_COUNT_CELL_MW()		do { } while (0)
+#define FT_TK_COUNT_CELL_SW()		do { } while (0)
 #define FT_TK_MWA_PARAM
 #define FT_TK_MWA(c)
 #define FT_TK_COUNT_MWA(c)		do { } while (0)

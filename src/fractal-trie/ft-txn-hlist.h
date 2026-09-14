@@ -126,8 +126,15 @@
  * these records carry no back-pointer to the flip-txn they fold into, so the
  * per-creation-site table in ft-txn-kind-stats.h cannot attribute them.  This
  * is where they are counted instead -- as one global class, which is all they
- * need to be: a chain edge is MW ON PURPOSE (the chain is not covered by the
- * structural node locks) and is not part of the conservative-MW conversion.
+ * need to be: a chain edge is MW because the chain is not covered by the
+ * structural node locks.
+ *
+ * ☞ "MW ON PURPOSE ... not part of the conservative-MW conversion" is what this
+ * used to say, and it is no longer true: cds_ft_node.next/.prev are [debt] in
+ * the word-kind table -- a named owner, bound for SW under the nearest ancestor
+ * lock -- and ft_hlist_store_sw below is the first site to make the trip.  The
+ * counter is split MW/SW for the same reason, or a conversion would read as the
+ * site going quiet.
  */
 /*
  * The duplicate-chain hold audit lives in ft-mutation-helpers.h (it needs the
@@ -169,6 +176,39 @@ int ft_hlist_store_mw_at(const char *fn, int line, struct urcu_txn *txn,
 
 #define ft_hlist_store_mw(txn, slot, old_ptr, new_ptr, tag)		\
 	ft_hlist_store_mw_at(__func__, __LINE__, (txn), (slot),		\
+		(old_ptr), (new_ptr), (tag))
+
+/*
+ * THE SW TWIN -- for a chain word whose exclusion is ESTABLISHED, not merely
+ * arbitrated by the expected-old.
+ *
+ * rcu-txn.h states the rule this has to answer: "a slot is SW xor MW,
+ * GLOBALLY.  If any other transaction may store_mw() the same slot, this park
+ * races that CAS."  So a site may spell itself SW only where no peer writer of
+ * that slot can be running -- which is a claim about the OP's exclusion, not
+ * about this word.  ft_glue_record_splices is the first such site: it writes a
+ * head's prev inside a BULK WINDOW, where the FT-wide writer lock is held and
+ * the gate has flipped every point op onto that same lock (measured: 5401 of
+ * 5401 stores wlock-held and inside a bulk body, 0 drain seams in-window).
+ *
+ * ☠ DO NOT COPY THIS SPELLING TO A POINT-OP CHAIN SITE.  Those run against each
+ * other under per-node holder locks, and the duplicate list's migration to SW
+ * is a SEPARATE, WHOLE-CLASS step that also has to account for the RAW
+ * producers (ft_set_parent's external arm).  Converting one point-op site alone
+ * is exactly the SW-park-races-an-MW-CAS the rule above forbids.
+ */
+static inline
+int ft_hlist_store_sw_at(const char *fn, int line, struct urcu_txn *txn,
+		void **slot, void *old_ptr, void *new_ptr, uintptr_t tag)
+{
+	FT_TK_COUNT_CELL_SW();
+	FT_AB_ARM(FT_AB_CELL_HANDLE, FT_AB_OWN_NA);
+	FT_CH_COARSE(fn, line);
+	return urcu_txn_store_sw(txn, slot, old_ptr, new_ptr, tag);
+}
+
+#define ft_hlist_store_sw(txn, slot, old_ptr, new_ptr, tag)		\
+	ft_hlist_store_sw_at(__func__, __LINE__, (txn), (slot),		\
 		(old_ptr), (new_ptr), (tag))
 
 static inline
