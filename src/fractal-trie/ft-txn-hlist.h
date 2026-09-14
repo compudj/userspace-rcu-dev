@@ -508,4 +508,93 @@ void ft_hlist_freeze_sole_prepare(struct urcu_txn *txn, struct cds_ft_node *node
 	(void) ret;
 }
 
+
+/*
+ * ft_hlist_chain_len: how many nodes a freeze of the chain at @head would
+ * record -- ONE edge each (FT_HLIST_FREEZE_MAX_EDGES), so this is the caller's
+ * reservation.
+ *
+ * ☠ CALL IT UNDER THE CHAIN HOLDER.  That is what makes a walked count safe to
+ * size a reservation with: every producer that could APPEND takes the holder
+ * first, so the chain cannot grow between this count and the record walk.
+ * Counted without it the freeze would under-reserve and trip
+ * ft_hlist_store_mw's assert at the extra node.  Already-marked members are
+ * counted too -- they still cost the edge that re-records their mark.
+ */
+static inline
+unsigned int ft_hlist_chain_len(struct cds_ft_node *head)
+{
+	unsigned int n = 0;
+
+	while (head) {
+		n++;
+		head = ft_hlist_resolve((void *) CMM_LOAD_SHARED(head->next));
+	}
+	return n;
+}
+
+/*
+ * ft_hlist_freeze_chain_prepare: freeze the chain at @head into @txn -- one
+ * {v -> MARK(v)} edge for each of @len nodes -- WITHOUT committing.  The
+ * whole-key counterpart of ft_hlist_freeze_sole_prepare, for the lane that
+ * retires a chain ENTIRE (cds_ft_remove_all) rather than its last entry.
+ *
+ * For @len == 1 this is byte-identical to ft_hlist_freeze_sole_prepare: the one
+ * node is the tail, and its record is {NULL -> MARK(NULL)}.
+ *
+ * ☠ @len IS THE CALLER'S DERIVATION, AND THE WALK MUST NOT OUTRUN IT.  That is
+ * the whole arbitration, and it is the same one ft_hlist_freeze_sole_prepare
+ * spells out for its derived NULL: the derivation is made with NOTHING HELD, so
+ * a same-key cds_ft_insert -- concurrent with a remove in contract under
+ * LOCK_FINE -- can APPEND a duplicate before this commit.  Stopping at @len
+ * records the derived tail against NULL, so that append fails this commit's
+ * install CAS and the whole detach ABORTS, and the caller re-derives and finds
+ * the longer chain.
+ *
+ * RE-LOADING THE TAIL INSTEAD WOULD LOSE THE KEY.  A fresh load would find the
+ * appended node, mark it into the tombstone with the rest and prune the branch
+ * around it -- an insert that returned OK whose key never resolves again
+ * ("key LOST after an OK concurrent insert", measured in both list modes).  So
+ * @len is a BOUND, never a hint: do not re-walk to the real end.
+ *
+ * The successor is UNMARKED before advancing: a member already logically
+ * deleted carries the mark in its own next, and following the raw value would
+ * walk off by FT_HLIST_MARK into nothing.  Such a member owes no second mark.
+ */
+static inline
+void ft_hlist_freeze_chain_prepare(struct urcu_txn *txn,
+		struct cds_ft_node *head, unsigned int len)
+{
+	unsigned int i;
+
+	for (i = 0; i < len && head; i++) {
+		struct cds_ft_node *succ;
+		struct cds_ft_node *next;
+		int ret;
+
+		/*
+		 * THE LAST NODE OF THE DERIVATION IS THE APPEND POINT, and its
+		 * expected-old is the derived NULL -- not a load.  Every earlier
+		 * node is interior, where no append can land, so its successor
+		 * is read here.
+		 */
+		if (i + 1 == len) {
+			succ = NULL;
+			next = NULL;
+		} else {
+			succ = (struct cds_ft_node *) urcu_txn_load(txn,
+				(void **) &head->next, FT_HLIST_TAG);
+			next = ft_hlist_unmark(succ);
+		}
+		if (!((uintptr_t) succ & FT_HLIST_MARK)) {
+			ret = ft_hlist_store_mw(txn, (void **) &head->next,
+					succ, ft_hlist_set_mark(succ),
+					FT_HLIST_TAG);
+			assert(!ret);	/* caller reserved one edge per node */
+			(void) ret;
+		}
+		head = next;
+	}
+}
+
 #endif	/* _FT_TXN_HLIST_H */

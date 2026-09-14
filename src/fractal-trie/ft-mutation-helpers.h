@@ -3159,6 +3159,27 @@ void ft_hold_trace_bad_release(const struct cds_ft_metadata *lock, uintptr_t s)
  */
 static inline bool ft_flip_txn_owns(const struct ft_flip_txn *t,
 		const struct cds_ft_metadata *owner);
+/*
+ * ☠ WITNESS 3, AND WITHOUT IT THE THREE freeze_sole SITES READ AS VIOLATIONS BY
+ * CONSTRUCTION.  ft_flip_txn_owns is the NARROW witness -- the commit's lock
+ * registry alone -- and its own header says so in as many words: "a miss here
+ * is ... a VISIBILITY gap at the sites whose clearing stays with a sweep.  Read
+ * it as 'the registry cannot see this hold', never as 'the op does not hold
+ * it'."  The orphan freeze is the documented counterexample: where the anchor
+ * IS the retired node, ft_detach_freeze_one records the fused terminal and
+ * REGISTERS NOTHING, because a tombstoned word is unclaimable forever and the
+ * caller's release sweep covers both outcomes.  An op's marks also live in
+ * @extra (an orphan chain is FT_MAX_DEPTH long, past the registry's size), in
+ * the glue's named fields, and in OUTER frames.  ft_lock_ctx_holds consults all
+ * four.  A site that has the op's ctx in hand must be scored on it.
+ */
+struct ft_lock_ctx;
+static inline bool ft_lock_ctx_holds(const struct ft_lock_ctx *ctx,
+		const struct cds_ft_metadata *meta, uintptr_t *snap,
+		bool *ratified);
+/* 0 = txn registry, 1 = extras, 2 = glue, 3 = an outer frame. */
+static int ft_ch_ctx_source(const struct ft_lock_ctx *ctx,
+		const struct cds_ft_metadata *meta);
 
 #define FT_CH_SITE_MAX	48
 
@@ -3167,7 +3188,8 @@ struct ft_ch_site {
 	int line;
 	bool coarse;
 	unsigned long total, wlock, held, led, unheld, nolocks, noholder,
-		coarse_mode, aborting, some;
+		coarse_mode, aborting, some, ctxheld,
+		ctx_txn, ctx_extra, ctx_glue, ctx_outer;
 };
 
 extern struct ft_ch_site ft_ch_sites[FT_CH_SITE_MAX];
@@ -3199,8 +3221,9 @@ struct ft_ch_site *ft_ch_site_of(const char *fn, int line, bool coarse)
  * nothing to say and the ledger is the only witness -- recorded as such.
  */
 static inline
-void ft_ch_audit_at(const char *fn, int line, const struct cds_ft *ft,
-		const struct ft_flip_txn *t, struct cds_ft_node *node)
+void ft_ch_audit_ctx_at(const char *fn, int line, const struct cds_ft *ft,
+		const struct ft_flip_txn *t, const struct ft_lock_ctx *ctx,
+		struct cds_ft_node *node)
 {
 	struct ft_ch_site *s = ft_ch_site_of(fn, line, false);
 	struct cds_ft_inode_flag *h;
@@ -3264,6 +3287,39 @@ void ft_ch_audit_at(const char *fn, int line, const struct cds_ft *ft,
 		s->led++;
 		return;
 	}
+	/*
+	 * ☠ THE WIDE WITNESS, LAST BECAUSE IT IS THE EXPENSIVE ONE -- but it is
+	 * the only one that can see a mark the op keeps OUTSIDE the registry:
+	 * an orphan-chain extra, a glue field, an outer frame, or the anchor of
+	 * a node this very commit retires (which ft_detach_freeze_one registers
+	 * NOWHERE, by design).  Scoring UNHELD without asking it condemns the
+	 * freeze_sole sites by construction, and "fixing" one by adding an
+	 * acquire on a word the op ALREADY holds is not harmless: the second
+	 * acquire returns -EAGAIN, the site reads its OWN mark as contention,
+	 * and the op waits on itself forever (struct ft_held_set's header).
+	 */
+	{
+		uintptr_t snap;
+		bool ratified;
+
+		if (ctx && ft_lock_ctx_holds(ctx, hm, &snap, &ratified)) {
+			s->ctxheld++;
+			/*
+			 * WHICH SOURCE ANSWERED.  "The op holds it" is only
+			 * worth acting on once you can name where the mark
+			 * lives -- a txn registry and an orphan-chain extra are
+			 * both genuine holds, but they are cleared by different
+			 * owners, so a later change has to know which.
+			 */
+			switch (ft_ch_ctx_source(ctx, hm)) {
+			case 0: s->ctx_txn++; break;
+			case 1: s->ctx_extra++; break;
+			case 2: s->ctx_glue++; break;
+			default: s->ctx_outer++; break;
+			}
+			return;
+		}
+	}
 	s->unheld++;
 	if (!ft_hold_trace_count())
 		s->nolocks++;	/* strictly worse: holds nothing whatsoever */
@@ -3293,7 +3349,11 @@ void ft_ch_audit_coarse_at(const char *fn, int line)
 }
 
 #define ft_ch_audit(ft, t, node)					\
-	ft_ch_audit_at(__func__, __LINE__, (ft), (t), (node))
+	ft_ch_audit_ctx_at(__func__, __LINE__, (ft), (t), NULL, (node))
+#define ft_ch_audit_ctx(ft, t, ctx, node)				\
+	ft_ch_audit_ctx_at(__func__, __LINE__, (ft), (t), (ctx), (node))
+#define ft_ch_audit_at(fn, line, ft, t, node)				\
+	ft_ch_audit_ctx_at((fn), (line), (ft), (t), NULL, (node))
 #define ft_ch_audit_coarse()	ft_ch_audit_coarse_at(__func__, __LINE__)
 
 static void ft_ch_audit_report(void) __attribute__((destructor));
@@ -3311,10 +3371,10 @@ static void ft_ch_audit_report(void)
 		"OFF -- EVERY ROW BELOW IS A WRONG ZERO, NOT A MEASUREMENT "
 		"(rebuild with -DFEATURE_FT_HOLD_TRACE)");
 #endif
-	fprintf(stderr, "%-34s %6s %10s %9s %8s %8s %8s %7s %8s %8s %8s %6s\n",
+	fprintf(stderr, "%-34s %6s %10s %9s %8s %8s %8s %8s %7s %8s %8s %8s %6s\n",
 		"site (fn:line)", "kind", "total", "WLOCK", "HELD(reg)",
-		"HELD(led)", "UNHELD", "nolocks", "noholder", "coarseFT",
-		"aborting", "SOME");
+		"HELD(led)", "HELD(ctx)", "UNHELD", "nolocks", "noholder",
+		"coarseFT", "aborting", "SOME");
 	for (i = 0; i < ft_ch_site_n; i++) {
 		struct ft_ch_site *s = &ft_ch_sites[i];
 		char nm[35];
@@ -3322,10 +3382,14 @@ static void ft_ch_audit_report(void)
 		if (!s->total)
 			continue;
 		snprintf(nm, sizeof(nm), "%s:%d", s->fn, s->line);
-		fprintf(stderr, "%-34s %6s %10lu %9lu %8lu %8lu %8lu %7lu %8lu %8lu %8lu %6lu\n",
+		fprintf(stderr, "%-34s %6s %10lu %9lu %8lu %8lu %8lu %8lu %7lu %8lu %8lu %8lu %6lu\n",
 			nm, s->coarse ? "COARSE" : "FULL", s->total, s->wlock,
-			s->held, s->led, s->unheld, s->nolocks, s->noholder,
-			s->coarse_mode, s->aborting, s->some);
+			s->held, s->led, s->ctxheld, s->unheld, s->nolocks,
+			s->noholder, s->coarse_mode, s->aborting, s->some);
+		if (s->ctxheld)
+			fprintf(stderr, "%-34s %6s   HELD(ctx) breakdown: txn=%lu extra=%lu glue=%lu outer=%lu\n",
+				nm, "", s->ctx_txn, s->ctx_extra, s->ctx_glue,
+				s->ctx_outer);
 		viol += s->unheld;
 	}
 	fprintf(stderr, "FT_CHAIN_HOLD_AUDIT  %lu VIOLATION%s (UNHELD: FINE trie, no writer scope,\n"
@@ -3337,7 +3401,9 @@ static void ft_ch_audit_report(void)
 }
 #else
 # define ft_ch_audit(ft, t, node)	do { } while (0)
+# define ft_ch_audit_ctx(ft, t, ctx, node)	do { } while (0)
 # define ft_ch_audit_at(fn, line, ft, t, node)	do { } while (0)
+# define ft_ch_audit_ctx_at(fn, line, ft, t, ctx, node)	do { } while (0)
 # define ft_ch_audit_coarse()	do { } while (0)
 #endif	/* FT_DEBUG_CHAIN_HOLD */
 
@@ -3963,6 +4029,37 @@ bool ft_lock_ctx_holds(const struct ft_lock_ctx *ctx,
 	*ratified = true;
 	return ctx && ft_held_set_snap(&ctx->held, meta, snap, ratified);
 }
+
+#ifdef FT_DEBUG_CHAIN_HOLD
+/*
+ * Audit support: ft_lock_ctx_holds said yes -- say WHERE the mark lives.  Walks
+ * the same four sources in the same order as ft_held_set_snap, so the answer is
+ * the one that function actually returned on.
+ */
+static
+int ft_ch_ctx_source(const struct ft_lock_ctx *ctx,
+		const struct cds_ft_metadata *meta)
+{
+	const struct ft_held_set *h = &ctx->held;
+	unsigned int k;
+
+	if (h->txn)
+		for (k = 0; k < h->txn->nr_locks; k++)
+			if (h->txn->locks[k].meta == meta)
+				return 0;
+	for (k = 0; k < h->nr_extra; k++)
+		if (h->extra[k].lock == meta && !h->extra[k].shared)
+			return 1;
+	if (h->glue) {
+		uintptr_t gs;
+		bool gr;
+
+		if (ft_glue_held_snap(h->glue, meta, &gs, &gr))
+			return 2;
+	}
+	return 3;
+}
+#endif
 
 /*
  * MAY THIS RECORD BE JUDGED ON THE OP'S WHOLE HELD SET RATHER THAN THE TXN

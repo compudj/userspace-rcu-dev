@@ -7192,7 +7192,7 @@ int ft_rekey_graft_simple_attempt(struct cds_ft *ft,
 		ret = ft_detach_node(ft, &lctx_src, d_src.nfp, d_src.pnfp, d_src.depth,
 				false /*free_detached_subtree: S_top is retired by cow_stop*/,
 				NULL /*fuse_cell: list off*/, &pub, NULL /*run*/,
-				NULL /*retire_glue*/, NULL /*freeze_leaf*/,
+				NULL /*retire_glue*/, NULL /*freeze_leaf*/, 0,
 				-(long) cnt, txn /*shared_txn*/, true /*record_only*/,
 				&(const struct ft_parent_hint){	/* BP's parent: held or acquired */
 					.parent = d_src.ppnf, .slot = d_src.pnfp,

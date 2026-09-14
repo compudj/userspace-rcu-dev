@@ -438,7 +438,7 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 				urcu_txn_begin(&optxn);
 				ft_lock_ctx_init(&lctx, &d, NULL, &optxn);
 				ret = ft_detach_node(ft, &lctx, d.nfp, d.pnfp, d.depth,
-						false, NULL, pubp, runp, NULL, NULL,
+						false, NULL, pubp, runp, NULL, NULL, 0,
 						-(long) detached_count, NULL, false,
 						NULL, NULL);
 				urcu_txn_end(&optxn);

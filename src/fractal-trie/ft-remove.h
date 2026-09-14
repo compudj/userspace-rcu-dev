@@ -1172,6 +1172,7 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		struct ft_held_anchor *orphan_held,
 		struct ft_held_anchor *trailing_orphan_held,
 		struct cds_ft_node *freeze_leaf,
+		unsigned int freeze_len,
 		long count_delta,
 		unsigned int count_reserve,
 		struct ft_flip_txn *shared_txn,
@@ -1304,7 +1305,7 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 				+ 1 /* back-edge (parent, offset) pair: the state-word edge */
 				+ ft_freeze_reserve(ft, (unsigned int) nr_orphans
 					+ (trailing_orphan ? 1 : 0))
-				+ (freeze_leaf ? FT_HLIST_FREEZE_MAX_EDGES : 0)
+				+ freeze_len * FT_HLIST_FREEZE_MAX_EDGES
 				+ count_reserve /* nr_keys walk from publish_parent (R3 fold) */);
 	}
 	if (!txn)
@@ -2162,9 +2163,9 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		 * retiring a leaf through this merge.
 		 */
 		if (freeze_leaf) {
-			ft_ch_audit(ft, txn, freeze_leaf);
-			ft_hlist_freeze_sole_prepare(ft_flip_txn_handle(txn),
-				freeze_leaf);
+			ft_ch_audit_ctx(ft, txn, ctx, freeze_leaf);
+			ft_hlist_freeze_chain_prepare(ft_flip_txn_handle(txn),
+				freeze_leaf, freeze_len);
 		}
 		/*
 		 * R3 fold: the retired key's -1 walk from the merged node's stable
@@ -2291,7 +2292,8 @@ void ft_canonicalize_chain_compress(struct cds_ft *ft,
 			surviving_child, surviving_byte,
 			1 /* already-committed 1-child boundary */, NULL, NULL,
 			NULL, 0, NULL, NULL, 0 /* no orphan chain */,
-			NULL, 0 /* count-neutral canonicalize */, 0,
+			NULL, 0 /* no freeze_leaf */,
+			0 /* count-neutral canonicalize */, 0,
 			NULL, false, NULL /* no pending publish */,
 			&intent, NULL);
 	}
@@ -2345,6 +2347,7 @@ int ft_detach_node(struct cds_ft *ft,
 		struct ft_detach_run *run,
 		struct ft_glue *retire_glue,
 		struct cds_ft_node *freeze_leaf,
+		unsigned int freeze_len,
 		long count_delta,
 		struct ft_flip_txn *shared_txn,
 		bool record_only,
@@ -3409,7 +3412,7 @@ int ft_detach_node(struct cds_ft *ft,
 						+ (trailing_skip_cn ? 1 : 0))
 					+ (topmost_external_nodes ? 1 : 0) /* folded external back-edge */
 					+ (ft->rank_stats ? detach_depth + 1 : 0) /* nr_keys fold walk */
-					+ (freeze_leaf ? FT_HLIST_FREEZE_MAX_EDGES : 0));
+					+ freeze_len * FT_HLIST_FREEZE_MAX_EDGES);
 
 			if (!orphan_txn) {
 				ret = -ENOMEM;
@@ -3456,9 +3459,10 @@ int ft_detach_node(struct cds_ft *ft,
 			 * one MARK edge into @orphan_txn, the +1 reserved above.
 			 */
 			if (freeze_leaf) {
-				ft_ch_audit(ft, orphan_txn, freeze_leaf);
-				ft_hlist_freeze_sole_prepare(
-					ft_flip_txn_handle(orphan_txn), freeze_leaf);
+				ft_ch_audit_ctx(ft, orphan_txn, &lctx, freeze_leaf);
+				ft_hlist_freeze_chain_prepare(
+					ft_flip_txn_handle(orphan_txn),
+					freeze_leaf, freeze_len);
 				freeze_leaf_fused = true;
 			}
 			/*
@@ -4160,7 +4164,7 @@ int ft_detach_node(struct cds_ft *ft,
 						trailing_skip_cn_flag,
 						ft->lock_fine ? orphan_held : NULL,
 						orphan_trailing_held,
-						freeze_leaf,
+						freeze_leaf, freeze_len,
 						count_delta,
 						ft->rank_stats ? detach_depth + 1 : 0,
 				/*
@@ -4271,7 +4275,7 @@ int ft_detach_node(struct cds_ft *ft,
 						+ (trailing_skip_cn_flag ? 1 : 0))
 					+ (retire_glue ? retire_glue->cap_free : 0)
 					+ (ft->rank_stats ? detach_depth + 1 : 0) /* nr_keys fold walk */
-					+ (freeze_leaf ? FT_HLIST_FREEZE_MAX_EDGES : 0));
+					+ freeze_len * FT_HLIST_FREEZE_MAX_EDGES);
 				if (!commit_txn) {
 					ret = -ENOMEM;
 					goto end;
@@ -4460,9 +4464,10 @@ int ft_detach_node(struct cds_ft *ft,
 			 * froze it in its merge flip.
 			 */
 			if (!boundary_fused && freeze_leaf && pub && commit_txn) {
-				ft_ch_audit(ft, commit_txn, freeze_leaf);
-				ft_hlist_freeze_sole_prepare(
-					ft_flip_txn_handle(commit_txn), freeze_leaf);
+				ft_ch_audit_ctx(ft, commit_txn, &lctx, freeze_leaf);
+				ft_hlist_freeze_chain_prepare(
+					ft_flip_txn_handle(commit_txn),
+					freeze_leaf, freeze_len);
 				freeze_leaf_fused = true;
 			}
 			/*
@@ -5196,8 +5201,23 @@ end:
 	 * caller-side mark; a no-op under one writer.
 	 */
 	if (!ret && freeze_leaf && !freeze_leaf_fused) {
-		ft_ch_audit(ft, NULL, freeze_leaf);
-		ft_node_mark_removed_flip(ft, freeze_leaf);
+		unsigned int fi;
+		struct cds_ft_node *fn = freeze_leaf;
+
+		/*
+		 * Bounded by @freeze_len for the same reason the txn arm is: a
+		 * duplicate appended since the caller's derivation is NOT this
+		 * op's to retire (ft_hlist_freeze_chain_prepare).  This arm has
+		 * no commit to abort, so the bound is the only thing holding
+		 * that line.
+		 */
+		for (fi = 0; fi < freeze_len && fn; fi++) {
+			struct cds_ft_node *fnext;
+
+			ft_ch_audit(ft, NULL, fn);
+			fnext = ft_node_mark_removed_flip(ft, fn);
+			fn = fnext;
+		}
 	}
 	/*
 	 * A fused @retire_glue->txn now points at the commit_txn its commit
@@ -6975,6 +6995,7 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 			ret = ft_detach_node(ft, &lctx, head_slot,
 				ft_get_parent_slot(holder_meta, ft),
 				key_len, true, fuse_cell, pubp, NULL, NULL, node,
+				1 /* @node is this key's SOLE entry */,
 				-1 /* leaf key removed: detach owns the -1 */,
 				NULL, false, NULL, NULL);
 			/* @node's freeze rode the detach commit (freeze_leaf). */
@@ -7059,6 +7080,7 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 					1 /* sole body child; the removed entry is external */,
 					fuse_cell, NULL,
 					NULL, 0, NULL, NULL, 0 /* no orphan chain */, node,
+					1 /* @node is this key's SOLE entry */,
 					-1, ft->rank_stats ? key_len + 1 : 0,
 					NULL, false,
 					NULL /* no pending publish */, &intent, NULL);
@@ -7211,6 +7233,7 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 			ret = ft_detach_node(ft, &lctx, head_slot,
 				ft_get_parent_slot(holder_meta, ft),
 				key_len, true, fuse_cell, pubp, NULL, NULL, node,
+				1 /* @node is this key's SOLE entry */,
 				-1 /* leaf key removed: detach owns the -1 */,
 				NULL, false, NULL, NULL);
 			/* @node's freeze rode the detach commit (freeze_leaf). */
@@ -8124,6 +8147,7 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 					1 /* sole body child; the removed entry is external */,
 					ft->ordered_list ? dead_cell : NULL,
 					NULL, NULL, 0, NULL, NULL, 0 /* no orphan chain */, NULL,
+					0 /* no freeze_leaf */,
 					-1, ft->rank_stats ? key_len + 1 : 0,
 					NULL, false,
 					NULL /* no pending publish */, &intent, NULL);
@@ -8252,31 +8276,41 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 		 * the holder (it climbs via metadata->parent).  Propagate -1
 		 * before detach (which may free internal nodes).
 		 */
+		/*
+		 * ☑ THE WHOLE CHAIN'S FREEZE RIDES THE DETACH COMMIT, under the
+		 * holder that commit already owns.  It used to be a bare
+		 * ft_chain_mark_removed_flip sweep AFTER the detach returned --
+		 * one unlocked uatomic_cmpxchg per chain node, holding NOTHING
+		 * (the hold audit's only surviving class-A violation: 100%
+		 * NOLOCKS at every row that reached it).
+		 *
+		 * ☠ AND IT COULD NOT BE FIXED BY TAKING A LOCK, which is why it
+		 * waited for the structural phase.  By sweep time the holder is
+		 * GONE, not contended: the detach retires it IN the very commit
+		 * that unlinks the chain, so the acquire found FT_STATE_TOMBSTONE
+		 * (measured: ok=0, refused=22007, of which 22005 were -EAGAIN on
+		 * a tombstoned word).  Nor could the acquire be hoisted above the
+		 * detach -- unpublished it misses against the op's OWN hold
+		 * (ft_detach_node climbs from holder_meta) and waits on itself
+		 * forever; published into @lctx it becomes the whole-op scope
+		 * -DFT_RM_REVALIDATE was measured and refuted for (20/41 hangs,
+		 * reader-visible key loss).  The lock was never the answer.
+		 *
+		 * @nr_frozen is the DERIVATION, and ft_hlist_freeze_chain_prepare
+		 * treats it as a BOUND, not a hint: a duplicate appended since is
+		 * not this op's to retire, and tearing the derived tail's NULL
+		 * aborts the commit so the retry re-derives the longer chain.
+		 */
+		unsigned int nr_frozen = ft_hlist_chain_len(chain_head);
+
 		ft_removeall_fault_scope_enter();
 		ret = ft_detach_node(ft, &lctx, head_slot,
 			ft_get_parent_slot(holder_meta, ft), key_len, true,
 			dead_cell, ft->ordered_list ? &pub : NULL, NULL, NULL,
-			NULL, -1 /* leaf key removed: detach owns the -1 */,
+			chain_head, nr_frozen,
+			-1 /* leaf key removed: detach owns the -1 */,
 			NULL, false, NULL, NULL);
 		ft_removeall_fault_scope_exit();
-		if (!ret) {
-			/*
-			 * ☐ The detach may have PRUNED @holder_flag, and
-			 * ft_acquire_member refuses a tombstone -- so this
-			 * recovers the hold only when the branch survived.  The
-			 * lock CANNOT be hoisted above the detach to cover the
-			 * rest: unpublished it would miss against the op's OWN
-			 * hold (detach climbs from holder_meta) and wait on
-			 * itself forever; published into @lctx it becomes the
-			 * whole-op scope -DFT_RM_REVALIDATE was measured and
-			 * refuted for.  The residue closes structurally, by
-			 * passing @chain_head as ft_detach_node's freeze_leaf so
-			 * the freeze rides the detach commit under the holder
-			 * that commit already owns -- next phase.
-			 */
-			ft_ra_sweep_held(ft, &lctx, holder_flag, holder_depth,
-				chain_head);
-		}
 	}
 
 	/*

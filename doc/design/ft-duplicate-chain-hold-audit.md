@@ -76,17 +76,34 @@ All three are `ft_chain_mark_removed_flip` called with **no txn at all** — the
 "lone-store residual ... to be closed once the lone edge is forced through a
 txn" their own comment names. They install unconditionally. **This is the debt.**
 
-**B. Strong candidates — unheld at prepare, and NOT aborting via
-`acquire_miss`; their commits were not separately proven to install.**
+**B. ☑ NOT VIOLATIONS — the FOURTH false-positive class (settled 2026-09-14).**
 
-| site | total | held | UNHELD |
+These three read UNHELD only because the audit asked the NARROW witness. They
+hold the chain holder in the op's ORPHAN PLAN-LOCK ARRAY (`@extra`), which
+`ft_flip_txn_owns` cannot see **by design**.
+
+| site | narrow witness | four witnesses | source |
 |---|---|---|---|
-| `ft_detach_node:4463` | 9,751 | 4,922 | 4,829 = **49.5%** |
-| `ft_chain_compress_fused:2165` | 150 | 75 | 75 = **50%** |
-| `ft_detach_node:3459` | 48,852 | 0 | **100%** |
+| `ft_detach_node:3459` | 100% UNHELD | **0 UNHELD** | extra=3,114 |
+| `ft_detach_node:4463` | 49.5% UNHELD | **0 UNHELD** | extra=4,823 |
+| `ft_chain_compress_fused:2165` | 50% UNHELD | **0 UNHELD** | extra=75 |
 
-The near-exact 50/50 splits suggest two code paths through one site rather than
-a race — worth resolving before fixing.
+Every ctx hit is `extra=` — zero via txn / glue / outer. `FT EXTRAS STALE` (the
+tree's own over-report detector) fired 0 times in 10 runs. Rows:
+`inv_remove_cross_view_compressed_parent`, `inv_concurrent_same_key_removes_nolist`,
+`inv_remove_cross_view`.
+
+The 50/50 split flagged above as "two code paths rather than a race" was exactly
+that: one path registers in the txn, the other keeps its mark in `@extra`.
+
+☠ **AND "FIXING" THEM WOULD HAVE BEEN THE DEFECT.** A second acquire on a word
+the op already holds returns `-EAGAIN`, `ft_meta_lock_acquire` cannot tell the
+op's own mark from a peer's, the site reads it as contention and re-plans, and
+the op waits on ITSELF forever (`struct ft_held_set`'s header). That is exactly
+how `FT_RM_ACQUIRE_FIRST` hung test 44 deterministically.
+
+The witness is now the fourth column of the audit (`HELD(ctx)`), with a
+breakdown naming which of the four sources answered.
 
 **C. Clean.** `_cds_ft_insert_replace` (all four displacing arms),
 `ft_chain_node`, `ft_unchain_node`, `ft_promote_head`, `_cds_ft_replace_locked`,
@@ -162,10 +179,44 @@ Nor can the acquire be hoisted above that commit:
   was measured and refuted for (20/41 hangs, reader-visible key loss), and
   violates the seam rule (no node lock across a grace period).
 
-⇒ **These two arms are a STRUCTURAL item, not a lock item.** The lever already
-exists: `ft_detach_node` takes a `freeze_leaf` parameter -- the mechanism its own
-3459/4463 sites use to fuse a leaf freeze into their commit, under the holder
-that commit still owns -- and `_cds_ft_remove_all_locked`'s leaf arm passes NULL.
+⇒ **These two arms are a STRUCTURAL item, not a lock item.**
+
+## ☑ THE LEAF ARM IS CONVERTED (2026-09-14)
+
+`ft_detach_node`'s `freeze_leaf` now carries a LENGTH (`freeze_len`), and
+`ft_hlist_freeze_chain_prepare` records one `{v -> MARK(v)}` edge per chain node
+into the detach's own commit. `_cds_ft_remove_all_locked`'s leaf arm passes
+`chain_head` + `ft_hlist_chain_len(chain_head)` and the post-detach
+`ft_ra_sweep_held` call is GONE.
+
+For `freeze_len == 1` the new primitive is byte-identical to
+`ft_hlist_freeze_sole_prepare`, which is what keeps `cds_ft_remove` unchanged.
+
+☠ **@freeze_len IS A BOUND, NOT A HINT.** The walk stops at the caller's
+derivation so the derived tail is recorded against NULL — a duplicate appended
+since tears that expected-old and ABORTS the whole detach, and the caller
+re-derives. Re-walking to the real end instead would mark the fresh duplicate
+into the tombstone and prune the branch around it: "key LOST after an OK
+concurrent insert", the defect `ft_hlist_freeze_sole_prepare`'s header was
+written for.
+
+Measured, 9 rows (`inv_detach_cross_view`, `inv_remove_cross_view*`,
+`inv_concurrent_remove_all_{nolist,list,prefix}`):
+
+| row | UNHELD before | UNHELD after |
+|---|---|---|
+| `inv_remove_cross_view` | 92,668 | **0** |
+| `inv_remove_cross_view_compressed` | 74,671 | **0** |
+| `inv_remove_cross_view_prefix_siblings_all` | 20,000 | **0** |
+| `inv_detach_cross_view` | 18,000 | **0** |
+| `inv_remove_cross_view_compressed_parent` | 16,874 | **0** |
+| `inv_concurrent_remove_all_nolist` | 14,151 | **0** |
+
+☞ **COUNTED ON BOTH SIDES**, because a site that merely stops reporting proves
+nothing: the writes MOVED. `inv_detach_cross_view` went from 18,000 unheld
+sweeps to `ft_detach_node:4467` total 18,000 / 0 UNHELD with
+`ft_hlist_freeze_chain_prepare` showing 18,000 — the same volume, now inside the
+commit.
 
 ## Order of work
 

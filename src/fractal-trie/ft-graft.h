@@ -4498,7 +4498,7 @@ retry_swap:
 			ft_lock_ctx_init(&lctx, &d, NULL, &optxn);
 			dret = ft_detach_node(dst_ft, &lctx, d.nfp, d.pnfp, d.depth,
 					false, NULL, gs_ord ? &dpub : NULL,
-					gs_ord ? &drun : NULL, NULL, NULL,
+					gs_ord ? &drun : NULL, NULL, NULL, 0,
 					-(long) old_count /* fold -old_count onto the detach commit */,
 					NULL, false, NULL, NULL);
 			cds_ft_alloc_reserve_deactivate(dst_ft);
