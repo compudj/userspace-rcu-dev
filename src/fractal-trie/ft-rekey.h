@@ -7777,8 +7777,14 @@ cells_done:
 		 * edges, exactly as ft_merge_spine_copy orders it.
 		 */
 #ifdef FEATURE_FT_MERGE
-		if (merge_dst)
+		if (merge_dst) {
+#ifdef FT_DEBUG_SPLICE_SEAM
+			uatomic_inc(&ft_ss_site_rekey_atomic_calls);
+			if (glue.nr_splices)
+				uatomic_inc(&ft_ss_site_rekey_atomic);
+#endif
 			ft_glue_record_splices(ft, &glue, txn);
+		}
 #endif
 	}
 
@@ -8634,6 +8640,10 @@ enum cds_ft_status ft_rekey_spine_copy(struct cds_ft *dst_ft,
 	struct ft_glue gd, gs;
 	struct ft_merge_ctx ctx = { .dst_ft = dst_ft, .gd = &gd, .gs = &gs };
 	struct ft_merge_counts cnt = { 0, 0, 0, 0, 0 };
+
+#ifdef FT_DEBUG_SPLICE_SEAM
+	uatomic_inc(&ft_ss_spine_entry);
+#endif
 	bool root_src = (src_key_len == 0);
 	bool ks_dst = (off_dst > 0);
 	bool ed;
@@ -9372,8 +9382,12 @@ enum cds_ft_status ft_rekey_spine_copy(struct cds_ft *dst_ft,
 	/* Reserved but unused: a non-root run whose unlink already fused it. */
 	if (src_side_txn)
 		ft_flip_txn_destroy(src_side_txn);
-	if (!src_ft->exclusive)
+	if (!src_ft->exclusive) {
+#ifdef FT_DEBUG_SPLICE_SEAM
+		uatomic_inc(&ft_ss_seam_spine);
+#endif
 		ft_writer_lock_gp_wait(src_ft);
+	}
 
 	/*
 	 * 2. Re-parent the SRC-origin referenced subtrees directly: the src
@@ -9529,6 +9543,13 @@ enum cds_ft_status ft_rekey_spine_copy(struct cds_ft *dst_ft,
 	 *    released after the commit below -- so the walk to the tail cannot race
 	 *    a peer's append/unchain/promote on the same chain.
 	 */
+#ifdef FT_DEBUG_SPLICE_SEAM
+	{
+		uatomic_inc(&ft_ss_site_rekey_staged_calls);
+		if (gd.nr_splices)
+			uatomic_inc(&ft_ss_site_rekey_staged);
+	}
+#endif
 	ft_glue_record_splices(dst_ft, &gd, txn);
 
 	/*
@@ -9898,8 +9919,12 @@ retry_merge:
 			run_unlink_txn = NULL;
 		}
 
-		if (!src_ft->exclusive)
+		if (!src_ft->exclusive) {
+#ifdef FT_DEBUG_SPLICE_SEAM
+			uatomic_inc(&ft_ss_seam_subpos);
+#endif
 			ft_writer_lock_gp_wait(src_ft);
+		}
 
 		/*
 		 * An EXTERNAL payload's edge byte changes (src_key's last byte ->

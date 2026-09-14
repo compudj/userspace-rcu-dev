@@ -2411,6 +2411,13 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	 *    released after the commit below -- so the walk to the tail cannot race
 	 *    a peer's append/unchain/promote on the same chain.
 	 */
+#ifdef FT_DEBUG_SPLICE_SEAM
+	{
+		uatomic_inc(&ft_ss_site_merge_calls);
+		if (gd.nr_splices)
+			uatomic_inc(&ft_ss_site_merge);
+	}
+#endif
 	ft_glue_record_splices(dst_ft, &gd, txn);
 
 	/*

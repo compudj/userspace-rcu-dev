@@ -15040,6 +15040,10 @@ void ft_glue_release_splice_holders(struct ft_glue *g)
 		g->splices[i].holder = NULL;
 		g->splices[i].holder_snap = 0;
 	}
+#ifdef FT_DEBUG_SPLICE_SEAM
+	if (ft_splice_window == g)
+		ft_splice_window = NULL;
+#endif
 }
 
 /*
@@ -16241,6 +16245,59 @@ enum urcu_txn_status ft_glue_txn_commit_replace(struct cds_ft *ft,
 	return cst;
 }
 
+#ifdef FT_DEBUG_SPLICE_SEAM
+unsigned long ft_ss_store_all, ft_ss_store_wlock, ft_ss_store_bulk,
+	ft_ss_store_excl;
+/*
+ * ☠ PER CALL SITE.  ft_glue_record_splices has THREE callers -- the merge, the
+ * same-trie ATOMIC rekey and the cross-trie STAGED rekey -- and only the staged
+ * one has a ft_writer_lock_gp_wait anywhere under it (ft-rekey.h:9376, :9902,
+ * both on @src_ft).  An aggregate "IN-WINDOW=0" that never ran the staged path
+ * is a wrong zero about the only path that could have been non-zero.
+ */
+unsigned long ft_ss_site_merge, ft_ss_site_rekey_atomic, ft_ss_site_rekey_staged;
+/*
+ * ☠ AND COUNT THE CALLS SEPARATELY FROM THE COLLISIONS.  "rekey_staged=0" has
+ * two causes that are not the same finding: the path never RAN, or it ran and
+ * no key COLLIDED (nr_splices == 0, nothing recorded, no window opened).  Only
+ * the first makes the in-window zero a wrong zero.
+ */
+unsigned long ft_ss_site_merge_calls, ft_ss_site_rekey_atomic_calls,
+	ft_ss_site_rekey_staged_calls;
+/*
+ * ft_rekey_spine_copy ENTRIES, and the two ft_writer_lock_gp_wait sites of
+ * ft-rekey.h by site.  The staged path's seam (ft-rekey.h:9376) sits BEFORE its
+ * ft_glue_record_splices (:9532) in the SAME function; the entry counter is what
+ * says whether that straight-line order was ever actually walked.
+ */
+unsigned long ft_ss_spine_entry, ft_ss_seam_spine, ft_ss_seam_subpos;
+static void ft_ss_report(void) __attribute__((destructor));
+static void ft_ss_report(void)
+{
+	fprintf(stderr, "FT SPLICE-SEAM stores=%lu wlock=%lu bulkdepth=%lu "
+		"excl=%lu | seams=%lu IN-WINDOW=%lu\n",
+		uatomic_read(&ft_ss_store_all),
+		uatomic_read(&ft_ss_store_wlock),
+		uatomic_read(&ft_ss_store_bulk),
+		uatomic_read(&ft_ss_store_excl),
+		uatomic_read(&ft_ss_seam_all),
+		uatomic_read(&ft_ss_seam_in_window));
+	fprintf(stderr, "FT SPLICE-SEAM sites (collided/called): merge=%lu/%lu "
+		"rekey_atomic=%lu/%lu rekey_staged=%lu/%lu\n",
+		uatomic_read(&ft_ss_site_merge),
+		uatomic_read(&ft_ss_site_merge_calls),
+		uatomic_read(&ft_ss_site_rekey_atomic),
+		uatomic_read(&ft_ss_site_rekey_atomic_calls),
+		uatomic_read(&ft_ss_site_rekey_staged),
+		uatomic_read(&ft_ss_site_rekey_staged_calls));
+	fprintf(stderr, "FT SPLICE-SEAM spine_entry=%lu seam_spine=%lu "
+		"seam_subpos=%lu\n",
+		uatomic_read(&ft_ss_spine_entry),
+		uatomic_read(&ft_ss_seam_spine),
+		uatomic_read(&ft_ss_seam_subpos));
+}
+#endif
+
 /*
  * Record a deferred duplicate-chain splice (cds_ft_merge_at, same full key in
  * both tries): the @src_head chain is to be appended to @dst_head's chain.
@@ -16269,6 +16326,14 @@ void ft_glue_record_splice(struct ft_glue *g,
 	g->splices[g->nr_splices].holder = NULL;
 	g->splices[g->nr_splices].holder_snap = 0;
 	g->nr_splices++;
+#ifdef FT_DEBUG_SPLICE_SEAM
+	/*
+	 * Open the window HERE, not at the acquire: two callers skip the acquire
+	 * entirely (`!unfailable && ft_glue_acquire_splice_holders(...)`), and a
+	 * window that skips them measures the easy half.
+	 */
+	ft_splice_window = g;
+#endif
 }
 
 /*
@@ -16511,7 +16576,30 @@ void ft_glue_record_splices(struct cds_ft *ft, struct ft_glue *g,
 		 * ☞ WHAT THIS DOES AND DOES NOT EXCLUDE.  This op holds the DST
 		 * head's chain holder only (ft_glue_acquire_splice_holders); the
 		 * SRC head's is not acquired here, and under the fold a peer may
-		 * still act on that head between this record and the commit.  A
+		 * still act on that head between this record and the commit.
+		 *
+		 * ☑ AND THE PEER THAT PARAGRAPH MEANS IS COMPACTION, not a point
+		 * op -- measured, not read off the call graph (-DFT_DEBUG_SPLICE_SEAM,
+		 * ft_ss_report).  Over ft_unit every one of this store's 19
+		 * executions ran with the FT-WIDE WRITER LOCK held on @ft and
+		 * inside a BULK BODY (stores=19 wlock=19 bulkdepth=19), and NO
+		 * drain seam landed between a recorded splice and its commit
+		 * (178 ft_writer_lock_gp_wait calls, IN-WINDOW=0).  The bulk gate
+		 * flips point ops onto that same FT-wide lock, so under the
+		 * currently validated op set no point op can reach this head; the
+		 * MW expected-old backstops cds_ft_compact_step, which takes no
+		 * gate and whose contract still demands caller exclusion.
+		 *
+		 * ☠ ONE ZERO IN THAT REPORT IS A WRONG ZERO, and the probe says
+		 * so itself: ft_rekey_spine_copy -- the ONLY caller with a
+		 * ft_writer_lock_gp_wait anywhere under it -- is never ENTERED by
+		 * ft_unit (spine_entry=0, seam_spine=0).  For that path the
+		 * argument is still STATIC, but it is now LOCAL rather than a
+		 * claim about the call graph: its seam sits ABOVE its
+		 * ft_glue_record_splices call in the same function, and the only
+		 * thing between that call and ft_flip_txn_commit is
+		 * ft_flip_txn_record_count_parent, which records and does not
+		 * wait.  A
 		 * peer WRITE to its prev (a src-side recompaction re-homing it, a
 		 * head promote swapping a fresh cell in) now fails THIS commit --
 		 * the record's expected-old no longer matches -- and the op
@@ -16577,6 +16665,15 @@ void ft_glue_record_splices(struct cds_ft *ft, struct ft_glue *g,
 				ft_ch_audit_ctx(ft, txn, &gctx, src_head);
 			}
 
+#ifdef FT_DEBUG_SPLICE_SEAM
+			uatomic_inc(&ft_ss_store_all);
+			if (ft_wlock_held == ft)
+				uatomic_inc(&ft_ss_store_wlock);
+			if (ft_bulk_self_depth)
+				uatomic_inc(&ft_ss_store_bulk);
+			if (ft->exclusive)
+				uatomic_inc(&ft_ss_store_excl);
+#endif
 			ret = ft_hlist_store_mw(h, (void **) &src_head->prev,
 					prev_old, (void *) tail, FT_HLIST_PREV_TAG);
 			/*

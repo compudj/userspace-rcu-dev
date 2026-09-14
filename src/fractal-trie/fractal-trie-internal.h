@@ -3624,9 +3624,38 @@ void ft_bw_dump(void)
 static void ft_seam_check(const char *site);
 #endif
 
+#ifdef FT_DEBUG_SPLICE_SEAM
+/*
+ * THE SPLICE-SEAM PROBE (build knob; -DFT_DEBUG_SPLICE_SEAM).
+ *
+ * ft_glue_record_splices writes @src_head->prev with the SRC head's chain
+ * holder NOT acquired (its own comment says so): the exclusion is the FT-wide
+ * writer lock plus the bulk gate, and the MW expected-old is the backstop.
+ * Converting cds_ft_node.prev to SW removes that backstop, so the question to
+ * answer FIRST is whether a DRAIN SEAM -- ft_writer_lock_gp_wait, which DROPS
+ * the FT-wide lock and lets a point op in -- can land inside the window where a
+ * splice is recorded but not yet committed.
+ *
+ * ☞ The in-tree claim is STATIC ("No ft_writer_lock_gp_wait exists anywhere
+ * under the attempt", ft-rekey.h), and a static claim about a call graph is a
+ * test you can run.  @ft_splice_window is the window; the seam counts it.
+ *
+ * Declared as an opaque pointer because struct ft_glue is defined in
+ * ft-mutation-helpers.h, which this header precedes.
+ */
+static __thread void *ft_splice_window;
+static unsigned long ft_ss_seam_all __attribute__((unused)),
+	ft_ss_seam_in_window __attribute__((unused));
+#endif
+
 static inline
 void ft_writer_lock_gp_wait(struct cds_ft *ft)
 {
+#ifdef FT_DEBUG_SPLICE_SEAM
+	uatomic_inc(&ft_ss_seam_all);
+	if (ft_splice_window)
+		uatomic_inc(&ft_ss_seam_in_window);
+#endif
 #ifdef FT_DEBUG_REMOVE_RETRY_CAP
 	uint64_t ft_dbg_gp_t0 = ft_dbg_gp_clock();
 #endif
