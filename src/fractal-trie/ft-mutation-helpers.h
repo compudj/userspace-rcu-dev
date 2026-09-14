@@ -9098,7 +9098,25 @@ bool ft_lock_skip_dual_gp(struct cds_ft *ft,
 #endif
 	ft_flip_txn_lock_or_guard_parent(ft, txn, ctx, gp_nf,
 		FT_DEPTH_FROM_DESCENT);
-	return true;
+	/*
+	 * ☠ "I CALLED THE ACQUIRE" IS NOT "THE TXN OWNS THE WORD", and returning
+	 * the former is what @6f2e49f8 did.  ft_flip_txn_lock_or_guard_parent
+	 * has THREE exits and only one of them registers a lock: the @shared
+	 * exit (the op already holds it, possibly in a registry this txn cannot
+	 * see) and the MISS exit (acquire_miss set, a GUARD planted, the commit
+	 * due to abort) both come back looking identical from here.  The caller
+	 * feeds this answer to ft_pub_rec_add's @owner_held, which routes the
+	 * dual to the DISPATCHING recorder, whose FT_OWNER_ASSERT_OWNED then
+	 * fires on a word the txn does not own -- silent in a release build,
+	 * an abort under --enable-rcu-debug.
+	 *
+	 * So ANSWER WITH THE ASSERT'S OWN PREDICATE.  ft_flip_txn_owns is the
+	 * narrow registry witness the assert checks first, so the flag and the
+	 * check agree BY CONSTRUCTION; where it is merely narrow (a hold filed
+	 * in @extra, the glue, or an outer frame) it answers false and the edge
+	 * stays MW, which is the safe direction.
+	 */
+	return ft_flip_txn_owns(txn, ft_flag_to_metadata(ft, gp_nf));
 #else
 	(void) ft; (void) ctx; (void) txn; (void) parent_nf; (void) mtxn;
 	return false;

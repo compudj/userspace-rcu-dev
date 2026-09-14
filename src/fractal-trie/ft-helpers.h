@@ -2812,13 +2812,81 @@ struct cds_ft_metadata *ft_skip_to_compressed_meta(struct cds_ft *ft,
  * trace events) still runs.  The public ft_publish_to_parent wrapper passes
  * NULL (direct stores, original behaviour).
  */
+#ifdef FT_DEBUG_DUAL_SITE
+/*
+ * WHICH PRODUCER STILL SAYS "owner NAMED, not held" (build knob;
+ * -DFT_DEBUG_DUAL_SITE).
+ *
+ * The DUAL_NAMED column is the SKIP_X dual's whole conversion surface, and it
+ * is recorded in THREE places that all key on @owner_held -- none of which can
+ * name the PRODUCER that decided the answer.  Editing a producer without first
+ * attributing the population is editing blind, so attribute it: @fn/@line are
+ * the CALLER's, exactly as ft_hlist_store_mw_at does it for chain words.
+ */
+# define FT_DUAL_SITE_MAX	24
+static struct {
+	const char *fn;
+	int line;
+	unsigned long named_unheld, named_held, unnamed, root;
+} ft_dual_site[FT_DUAL_SITE_MAX];
+static unsigned int ft_dual_site_n;
+
 static
-void ft_pub_rec_add(struct ft_pub_rec *rec, struct cds_ft_inode_flag **slot,
+void ft_dual_site_tally(const char *fn, int line, bool root,
+		struct cds_ft_metadata *owner, bool owner_held)
+{
+	unsigned int i;
+
+	for (i = 0; i < ft_dual_site_n; i++)
+		if (ft_dual_site[i].fn == fn && ft_dual_site[i].line == line)
+			break;
+	if (i == ft_dual_site_n) {
+		if (ft_dual_site_n == FT_DUAL_SITE_MAX)
+			return;
+		ft_dual_site[i].fn = fn;
+		ft_dual_site[i].line = line;
+		ft_dual_site_n++;
+	}
+	if (root)
+		uatomic_inc(&ft_dual_site[i].root);
+	else if (!owner)
+		uatomic_inc(&ft_dual_site[i].unnamed);
+	else if (owner_held)
+		uatomic_inc(&ft_dual_site[i].named_held);
+	else
+		uatomic_inc(&ft_dual_site[i].named_unheld);
+}
+
+static void ft_dual_site_report(void) __attribute__((destructor));
+static void ft_dual_site_report(void)
+{
+	unsigned int i;
+
+	fprintf(stderr, "FT DUAL-SITE (per ft_pub_rec_add producer)\n");
+	for (i = 0; i < ft_dual_site_n; i++)
+		fprintf(stderr, "  %-44s:%-5d named_unheld=%lu named_held=%lu "
+			"unnamed=%lu root=%lu\n",
+			ft_dual_site[i].fn, ft_dual_site[i].line,
+			uatomic_read(&ft_dual_site[i].named_unheld),
+			uatomic_read(&ft_dual_site[i].named_held),
+			uatomic_read(&ft_dual_site[i].unnamed),
+			uatomic_read(&ft_dual_site[i].root));
+}
+#endif /* FT_DEBUG_DUAL_SITE */
+
+static
+void ft_pub_rec_add_at(const char *fn, int line,
+		struct ft_pub_rec *rec, struct cds_ft_inode_flag **slot,
 		struct cds_ft_inode_flag *expected_old,
 		struct cds_ft_inode_flag *new_val, bool root,
 		struct cds_ft_metadata *owner, bool owner_held)
 {
 	assert(rec->n < 3);
+#ifdef FT_DEBUG_DUAL_SITE
+	ft_dual_site_tally(fn, line, root, owner, owner_held);
+#else
+	(void) fn; (void) line;
+#endif
 	/*
 	 * @owner_held: does the OP hold @owner's lock?  Separate from @owner
 	 * because a NULL @owner does NOT fail closed -- the dispatching
@@ -2862,6 +2930,11 @@ void ft_pub_rec_add(struct ft_pub_rec *rec, struct cds_ft_inode_flag **slot,
 	rec->new_val[rec->n] = new_val;
 	rec->n++;
 }
+
+#define ft_pub_rec_add(rec, slot, expected_old, new_val, root, owner, held) \
+	ft_pub_rec_add_at(__func__, __LINE__, (rec), (slot), (expected_old), \
+		(new_val), (root), (owner), (held))
+
 
 /*
  * IS THE SKIP_X DUAL'S HOME A NODE THIS COMMIT BUILT?
@@ -2991,7 +3064,8 @@ void ft_dbg_dual_probe(struct cds_ft *ft,
 #endif /* FT_DEBUG_DUAL_DROP */
 
 static
-void _ft_publish_to_parent_meta(struct cds_ft *ft,
+void _ft_publish_to_parent_meta_at(const char *pub_fn, int pub_line,
+		struct cds_ft *ft,
 		struct cds_ft_inode_flag *parent_nf,
 		struct cds_ft_inode_flag **parent_slot,
 		struct cds_ft_inode_flag *new_child,
@@ -3195,7 +3269,15 @@ void _ft_publish_to_parent_meta(struct cds_ft *ft,
 					 * and its default is false, which
 					 * records MW.
 					 */
-					ft_pub_rec_add(rec, skip_slot,
+					/*
+					 * @pub_fn/@pub_line, not this frame's:
+					 * the answer below was DECIDED by the
+					 * caller, so an attribution naming
+					 * _ft_publish_to_parent_meta names the
+					 * messenger.
+					 */
+					ft_pub_rec_add_at(pub_fn, pub_line,
+						rec, skip_slot,
 						ft_skip_compressed_flag(
 							expected_old, cn->len),
 						skip_new,
@@ -3271,7 +3353,8 @@ void _ft_publish_to_parent_meta(struct cds_ft *ft,
  * back-pointer was wired up front) -- the original behaviour.
  */
 static
-void _ft_publish_to_parent(struct cds_ft *ft,
+void _ft_publish_to_parent_at(const char *pub_fn, int pub_line,
+		struct cds_ft *ft,
 		struct cds_ft_inode_flag *parent_nf,
 		struct cds_ft_inode_flag **parent_slot,
 		struct cds_ft_inode_flag *new_child,
@@ -3279,10 +3362,24 @@ void _ft_publish_to_parent(struct cds_ft *ft,
 		struct ft_pub_rec *rec,
 		bool dual_owner_held)
 {
-	_ft_publish_to_parent_meta(ft, parent_nf, parent_slot, new_child,
-		expected_old, NULL, NULL, rec, /*slot_owner_nf=*/ parent_nf,
-		dual_owner_held);
+	_ft_publish_to_parent_meta_at(pub_fn, pub_line, ft, parent_nf,
+		parent_slot, new_child, expected_old, NULL, NULL, rec,
+		/*slot_owner_nf=*/ parent_nf, dual_owner_held);
 }
+
+#define _ft_publish_to_parent(ft, parent_nf, parent_slot, new_child,	\
+		expected_old, rec, dual_owner_held)			\
+	_ft_publish_to_parent_at(__func__, __LINE__, (ft), (parent_nf),	\
+		(parent_slot), (new_child), (expected_old), (rec),	\
+		(dual_owner_held))
+
+#define _ft_publish_to_parent_meta(ft, parent_nf, parent_slot, new_child, \
+		expected_old, new_child_meta, folded_child_prev, rec,	\
+		slot_owner_nf, dual_owner_held)				\
+	_ft_publish_to_parent_meta_at(__func__, __LINE__, (ft),		\
+		(parent_nf), (parent_slot), (new_child), (expected_old),	\
+		(new_child_meta), (folded_child_prev), (rec),		\
+		(slot_owner_nf), (dual_owner_held))
 
 /*
  * Direct publish (original behaviour): perform the stores immediately.

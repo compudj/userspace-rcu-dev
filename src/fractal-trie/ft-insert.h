@@ -672,7 +672,14 @@ bool ft_insert_lock_skip_dual_gp(struct cds_ft *ft,
 #endif
 	ft_flip_txn_lock_or_guard_parent(ft, ic->txn, ctx, gp_nf,
 		FT_DEPTH_FROM_DESCENT);
-	return true;
+	/*
+	 * The assert's OWN predicate, for the reason spelled out at
+	 * ft_lock_skip_dual_gp: lock_or_guard's @shared and MISS exits are
+	 * indistinguishable from here, and "I called the acquire" is not "the
+	 * txn owns the word".  Narrow on purpose -- a hold filed outside this
+	 * txn's registry answers false and the dual stays MW.
+	 */
+	return ft_flip_txn_owns(ic->txn, ft_flag_to_metadata(ft, gp_nf));
 #else
 	(void) ft; (void) ctx; (void) parent_nf; (void) ic;
 	return false;

@@ -1180,6 +1180,17 @@ unsigned int find_nearest_type_index(unsigned int type_index,
  *    here -- see the inline note at the skip slot).
  */
 static
+#ifdef FT_DEBUG_DUAL_SITE
+unsigned long ft_rc_noctx, ft_rc_nogp, ft_rc_held, ft_rc_unheld;
+static void ft_rc_report(void) __attribute__((destructor));
+static void ft_rc_report(void)
+{
+	fprintf(stderr, "FT RECOMPACT-DUAL noctx=%lu nogp=%lu held=%lu unheld=%lu\n",
+		uatomic_read(&ft_rc_noctx), uatomic_read(&ft_rc_nogp),
+		uatomic_read(&ft_rc_held), uatomic_read(&ft_rc_unheld));
+}
+#endif
+
 int ft_node_recompact(enum ft_recompact mode,
 		struct cds_ft *ft,
 		unsigned int old_type_index,
@@ -2342,23 +2353,106 @@ skip_copy:
 								&skip_owner_nf);
 					}
 
-					if (rec)
-						/* SW compaction: *slot == plan old.
-						 * A compressed ROOT's dual slot
-						 * IS &ft->root. */
-						/* Derived owner (the dual's
-						 * grandparent): not held --
-						 * MW.  ft-compact's lane is
-						 * FT_OWNER_UNPLUMBED. */
-						ft_pub_rec_add(rec, skip_slot,
-							*skip_slot, skip_new,
-							skip_slot == &ft->root,
+					if (rec) {
+						/*
+						 * SW compaction: *slot == plan
+						 * old.  A compressed ROOT's dual
+						 * slot IS &ft->root.
+						 *
+						 * ☑ ASK WHETHER THE OP HOLDS THE
+						 * DERIVED OWNER; do not ASSERT
+						 * that it does not.  This said
+						 * "not held -- MW" and hardcoded
+						 * false, while note (1) of the
+						 * word-kind table records that
+						 * this site's DLM set DOES take
+						 * gp_meta when P is compressed --
+						 * so the hardcoded answer was
+						 * wrong in the common case, not
+						 * merely conservative.
+						 *
+						 * The comparison is the one
+						 * ft_detach_node's note demands:
+						 * the ACQUIRED grandparent
+						 * against the DERIVED dual owner,
+						 * at publish.  ft_lock_ctx_holds
+						 * is that comparison; the plan's
+						 * intent is not.
+						 *
+						 * A NULL owner stays false: the
+						 * root dual has no owning node,
+						 * and the always-MW @root route
+						 * is the correct one for it.
+						 */
+						struct cds_ft_metadata *gp_meta =
 							skip_owner_nf ?
 							ft_flag_to_metadata(ft,
 								skip_owner_nf) :
-							NULL, false);
-					else
+							NULL;
+						uintptr_t gp_snap;
+						bool gp_ratified;
+						bool gp_held = gp_meta &&
+							ft_lock_ctx_holds(ctx,
+								gp_meta, &gp_snap,
+								&gp_ratified);
+#ifdef FT_DEBUG_DUAL_SITE
+						/*
+						 * ☠ 100% / 0% IS THE SIGNATURE
+						 * OF A BLIND QUERY, not of a
+						 * measurement.  Split the causes
+						 * before believing either.
+						 */
+						if (!ctx)
+							uatomic_inc(&ft_rc_noctx);
+						else if (!gp_meta)
+							uatomic_inc(&ft_rc_nogp);
+						else if (gp_held)
+							uatomic_inc(&ft_rc_held);
+						else
+							uatomic_inc(&ft_rc_unheld);
+#endif
+
+						/*
+						 * ☠ AND THE ANSWER IS "NO", 9721
+						 * TIMES OUT OF 9721.  Note (1) of
+						 * the word-kind table says this
+						 * site's DLM set "does take
+						 * gp_meta"; asked at publish
+						 * against the DERIVED owner, the
+						 * held set says otherwise EVERY
+						 * time -- @ctx is present and
+						 * @gp_meta is named, so this is
+						 * an answer, not a blind query
+						 * (the noctx / nogp / held /
+						 * unheld split is there to say
+						 * so).
+						 *
+						 * ⇒ THE MISSING PIECE IS AN
+						 * ACQUIRE, not a better question.
+						 * ft_detach_node's republish now
+						 * takes one (ft_lock_skip_dual_gp,
+						 * ft-remove.h) and reads 100%
+						 * held; this producer has no txn
+						 * of its own to register one
+						 * into, which is the work the
+						 * conversion still owes.
+						 *
+						 * Until then @gp_held is recorded
+						 * but NOT passed: a slot is SW xor
+						 * MW GLOBALLY (rcu-txn.h), so no
+						 * producer of this slot may vouch
+						 * while any other still writes it
+						 * without holding.  Flip them
+						 * TOGETHER.
+						 */
+						(void) gp_held;
+						ft_pub_rec_add(rec, skip_slot,
+							*skip_slot, skip_new,
+							skip_slot == &ft->root,
+							gp_meta, false);
+					} else {
 						*skip_slot = skip_new;
+					}
 				}
 			}
 		}
