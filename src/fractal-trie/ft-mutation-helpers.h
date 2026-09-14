@@ -9012,7 +9012,7 @@ guard:
  * only speed meanwhile.
  */
 static
-void ft_lock_skip_dual_gp(struct cds_ft *ft,
+bool ft_lock_skip_dual_gp(struct cds_ft *ft,
 		const struct ft_lock_ctx *ctx,
 		struct ft_flip_txn *txn,
 		struct cds_ft_inode_flag *parent_nf,
@@ -9025,14 +9025,14 @@ void ft_lock_skip_dual_gp(struct cds_ft *ft,
 	struct cds_ft_inode_flag **skip_slot;
 
 	if (!txn || !parent_nf || !ft_node_compressed(parent_nf))
-		return;
+		return false;
 	cn = ft_compressed_node_ptr(parent_nf);
 	cn_meta = cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
 	skip_slot = ft_txn_parent_slot_at(cn_meta, ft, mtxn, &gp_nf);
 	if (!skip_slot || !ft_node_skip_compressed(*skip_slot))
-		return;			/* no dual edge will be recorded */
+		return false;		/* no dual edge will be recorded */
 	if (skip_slot == &ft->root || !gp_nf)
-		return;			/* root dual: no owning node */
+		return false;		/* root dual: no owning node */
 #ifdef FT_DEBUG_DUAL_DROP
 	{
 		/*
@@ -9051,8 +9051,10 @@ void ft_lock_skip_dual_gp(struct cds_ft *ft,
 #endif
 	ft_flip_txn_lock_or_guard_parent(ft, txn, ctx, gp_nf,
 		FT_DEPTH_FROM_DESCENT);
+	return true;
 #else
 	(void) ft; (void) ctx; (void) txn; (void) parent_nf; (void) mtxn;
+	return false;
 #endif
 }
 

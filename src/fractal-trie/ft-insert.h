@@ -610,6 +610,24 @@ bool ft_insert_lock_skip_dual_gp(struct cds_ft *ft,
 		return false;		/* no dual edge will be recorded */
 	if (skip_slot == &ft->root || !gp_nf)
 		return false;		/* root dual: no owning node */
+#ifdef FT_DEBUG_DUAL_DROP
+	{
+		/*
+		 * ☠ THE INSERT LANE HAD NO ARM YIELD, and its absence read as a
+		 * clean zero.  ft_lock_skip_dual_gp carries this counter; this
+		 * function is a SEPARATE copy for the insert path, so a
+		 * -DFT_DEBUG_DUAL_DROP run reported 0 acquires on the insert
+		 * rows and that 0 said nothing about this lane at all.  Same
+		 * counter, same reason: "a green run cannot be read as 'the fix
+		 * works' when it is really 'the site never ran'".
+		 */
+		static unsigned long n_acq;
+		unsigned long n = uatomic_add_return(&n_acq, 1);
+
+		if ((n & 0xff) == 0)
+			fprintf(stderr, "FT DUAL-GP-ACQUIRE-INSERT %lu\n", n);
+	}
+#endif
 	ft_flip_txn_lock_or_guard_parent(ft, ic->txn, ctx, gp_nf,
 		FT_DEPTH_FROM_DESCENT);
 	return true;

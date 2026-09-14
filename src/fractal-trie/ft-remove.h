@@ -5298,6 +5298,15 @@ int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 	struct ft_pub_rec rec = { .n = 0 };
 	struct ft_ord_cell_edge sedges[2] = { 0 };
 	unsigned int n_s;
+	/*
+	 * Did this attempt actually ACQUIRE the SKIP_X dual's grandparent?  The
+	 * publish must say so per ATTEMPT, not per call site:
+	 * ft_lock_skip_dual_gp returns false on the shapes where it acquires
+	 * nothing (no compressed parent, no skip-encoded slot, or a ROOT dual
+	 * whose record names no owner at all), and claiming ownership there
+	 * hands FT_OWNER_ASSERT_OWNED a NULL owner.
+	 */
+	bool dual_gp_held;
 
 	assert(next_node != NULL);
 	if (old_cell) {
@@ -5430,7 +5439,8 @@ int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		 * ft_flip_txn_lock_register and the arm's contract is "after the
 		 * op's LAST register".
 		 */
-		ft_lock_skip_dual_gp(ft, ctx, txn, parent_nf, NULL);
+		dual_gp_held = ft_lock_skip_dual_gp(ft, ctx, txn, parent_nf,
+			NULL);
 		ft_flip_txn_record_reserved(txn,
 			ft_flag_to_metadata(ft, parent_nf),
 			(void **) &next_node->prev,
@@ -5453,7 +5463,8 @@ int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 			(struct cds_ft_inode_flag **) head_slot,
 			(struct cds_ft_inode_flag *) next_node,
 			(struct cds_ft_inode_flag *) node,
-			NULL, new_cell_flag, &rec, /*slot_owner_nf=*/ parent_nf, false);
+			NULL, new_cell_flag, &rec, /*slot_owner_nf=*/ parent_nf,
+			dual_gp_held);
 		n_s = ft_pub_rec_sedges(&rec, sedges);
 		/*
 		 * Fuse @node's freeze (mark node->next, target preserved) into the
@@ -5540,7 +5551,8 @@ int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		 * ft_flip_txn_lock_register and the arm's contract is "after the
 		 * op's LAST register".
 		 */
-		ft_lock_skip_dual_gp(ft, ctx, txn, parent_nf, NULL);
+		dual_gp_held = ft_lock_skip_dual_gp(ft, ctx, txn, parent_nf,
+			NULL);
 		ft_flip_txn_record_reserved(txn,
 			ft_flag_to_metadata(ft, parent_nf),
 			(void **) &next_node->prev, prev_save, inherit);
@@ -5553,7 +5565,7 @@ int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 			(struct cds_ft_inode_flag *) next_node,
 			(struct cds_ft_inode_flag *) node,
 			NULL, inherit /* folded prev: intended parent value */, &rec,
-			/*slot_owner_nf=*/ parent_nf, false);
+			/*slot_owner_nf=*/ parent_nf, dual_gp_held);
 		n_s = ft_pub_rec_sedges(&rec, sedges);
 		/* Fuse @node's freeze into the structural publish (doc §4.B). */
 		ft_ch_audit(ft, txn, node);
@@ -5963,7 +5975,9 @@ int ft_unchain_node(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		 * "a ROUTING INVARIANT IS A CODE FACT, AND CODE MOVES".
 		 * ☞ ft_lock_skip_dual_gp.
 		 */
-		ft_lock_skip_dual_gp(ft, ctx, txn, parent_nf, NULL);
+		/* No dual on this lane (detector below); discard. */
+		(void) ft_lock_skip_dual_gp(ft, ctx, txn, parent_nf,
+			NULL);
 		_ft_publish_to_parent(ft, parent_nf,
 			(struct cds_ft_inode_flag **) head_slot, NULL,
 			(struct cds_ft_inode_flag *) node, &rec, false);
