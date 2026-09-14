@@ -73,9 +73,9 @@
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (393 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (394 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (342 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (343 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -20398,6 +20398,105 @@ static int test_graft_swap_different_group_error(void)
  * verify the detached trie contains the nodes (with stripped keys)
  * and the original trie no longer has them.
  */
+/*
+ * Detach at a LEAF key, where the detached child is an EXTERNAL node.
+ *
+ * ☞ WHY THIS SHAPE EXISTS AS A ROW.  It is the one that reaches
+ * ft_publish_external_nodes_prev -- the documented LIVE re-parent choke point
+ * for a head's PARENT WORD (ft_ord_cell.parent with the ordered list on, a
+ * head's cds_ft_node.prev with it off), a [debt] row of the word-kind table
+ * whose store is a RAW rcu_assign_pointer with no txn.  ft_detach_node's
+ * external arm is reached only when the child at the detach position is an
+ * external chain head rather than an internal subtree, so "abX" is detached,
+ * not "ab": detaching a prefix takes the internal arm instead, which is why
+ * every existing detach row missed this site.
+ *
+ * Without a row that reaches it the hold audit reports nothing for that half of
+ * the class, and "0 violations" there would be a WRONG ZERO rather than a pass.
+ */
+static int test_detach_leaf_head_reparent(void)
+{
+	struct cds_ft_group *group;
+	struct cds_ft *ft, *detached = NULL;
+	struct cds_ft_node *found;
+	enum cds_ft_status s;
+	unsigned long count;
+
+	ft = create_varlen_ft(&group);
+
+	{
+		struct ft_test_node *n1 = node_alloc(0);
+		struct ft_test_node *n2 = node_alloc(0);
+
+		n1->value = 11;
+		n2->value = 22;
+		rcu_read_lock();
+		cds_ft_insert(ft, (const uint8_t *)"abX", 3, &n1->node);
+		cds_ft_insert(ft, (const uint8_t *)"cd", 2, &n2->node);
+		rcu_read_unlock();
+	}
+
+	/* Detach the LEAF key itself: the child there is the external head. */
+	rcu_read_lock();
+	s = cds_ft_detach(ft, (const uint8_t *)"abX", 3, &detached);
+	rcu_read_unlock();
+	if (s != CDS_FT_STATUS_OK || !detached) {
+		fprintf(stderr, "detach_leaf_head: detach: %s\n",
+			cds_ft_status_to_string(s));
+		goto fail;
+	}
+
+	/* The whole key moved: the source keeps only "cd". */
+	rcu_read_lock();
+	count = cds_ft_count_entries(ft);
+	s = cds_ft_eager_lookup_key(ft, (const uint8_t *)"abX", 3, 0, &found);
+	rcu_read_unlock();
+	if (count != 1) {
+		fprintf(stderr, "detach_leaf_head: source count %lu, expected 1\n",
+			count);
+		goto fail;
+	}
+	if (s != CDS_FT_STATUS_NOT_FOUND) {
+		fprintf(stderr, "detach_leaf_head: 'abX' still in source\n");
+		goto fail;
+	}
+
+	/*
+	 * The detached trie holds the entry under the NIL key: the whole "abX"
+	 * was the prefix, so nothing of it remains as a key suffix.  The point
+	 * of the row is the re-parent above, so assert the entry SURVIVED with
+	 * its value rather than asserting a particular spelling of its key.
+	 */
+	rcu_read_lock();
+	count = cds_ft_count_entries(detached);
+	rcu_read_unlock();
+	if (count != 1) {
+		fprintf(stderr, "detach_leaf_head: detached count %lu, expected 1\n",
+			count);
+		goto fail;
+	}
+
+	synchronize_rcu();
+	drain_trie(detached);
+	drain_trie(ft);
+	rcu_barrier();
+	cds_ft_destroy(detached);
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return 0;
+
+fail:
+	if (detached) {
+		drain_trie(detached);
+		cds_ft_destroy(detached);
+	}
+	drain_trie(ft);
+	rcu_barrier();
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return -1;
+}
+
 static int test_detach_basic(void)
 {
 	struct cds_ft_group *group;
@@ -38982,6 +39081,7 @@ int main(int argc, char **argv)
 	RUN_TEST(test_fixed_detach_at_root);
 	RUN_TEST(test_fixed_detach_nonroot_error);
 	RUN_TEST(test_detach_basic);
+	RUN_TEST(test_detach_leaf_head_reparent);
 	RUN_TEST(test_detach_at_root);
 	RUN_TEST(test_detach_not_found);
 	RUN_TEST(test_detach_empty_trie);
