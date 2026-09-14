@@ -8138,6 +8138,13 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 		 */
 		{
 			bool prefix_fused = false;
+			/*
+			 * The DERIVATION both arms below freeze against, taken
+			 * once: ft_hlist_freeze_chain_prepare treats it as a
+			 * BOUND, so a duplicate appended since is not this op's
+			 * to retire and instead tears the derived tail's NULL.
+			 */
+			unsigned int nr_frozen = ft_hlist_chain_len(chain_head);
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 			/*
 			 * Fuse the chain-compress prune INTO the key-removal
@@ -8183,26 +8190,27 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 					s_child, s_byte,
 					1 /* sole body child; the removed entry is external */,
 					ft->ordered_list ? dead_cell : NULL,
-					NULL, NULL, 0, NULL, NULL, 0 /* no orphan chain */, NULL,
-					0 /* no freeze_leaf */,
+					NULL, NULL, 0, NULL, NULL, 0 /* no orphan chain */,
+					chain_head, nr_frozen,
 					-1, ft->rank_stats ? key_len + 1 : 0,
 					NULL, false,
 					NULL /* no pending publish */, &intent, NULL);
 
 				if (cret == 0) {
 					/*
-					 * The fuse may RETIRE @holder_flag (it
-					 * collapses it into its parent).  Sweep
-					 * under it anyway: a peer reaches this
-					 * chain only by deriving the same word
-					 * from chain_head->prev, so the two agree
-					 * even when it is dead -- and an acquire
-					 * that refuses a tombstone degrades to
-					 * exactly today's unheld sweep, never
-					 * worse.  The audit keeps counting those.
+					 * ☑ THE CHAIN'S FREEZE RODE THE FUSED
+					 * COMMIT (freeze_leaf + nr_frozen above),
+					 * under the holder that commit owns.  It
+					 * used to be a post-commit sweep whose own
+					 * comment conceded the point: "the fuse may
+					 * RETIRE @holder_flag ... an acquire that
+					 * refuses a tombstone degrades to exactly
+					 * today's unheld sweep".  A freeze that is
+					 * IN the commit needs no acquire afterwards
+					 * and cannot degrade -- and it is atomic
+					 * with the unlink, so no reader sees the
+					 * key gone with the chain still live.
 					 */
-					ft_ra_sweep_held(ft, &lctx, holder_flag,
-						holder_depth, chain_head);
 					if (ft->ordered_list)
 						pub.armed = true;
 					ret = 0;
@@ -8239,7 +8247,8 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 				 */
 				struct ft_flip_txn *txn = ft_flip_txn_create_bounded(ft,
 					FT_REMOVE_COMMIT_REC_MAX_EDGES + 1 +
-					(ft->rank_stats ? key_len + 1 : 0));
+					(ft->rank_stats ? key_len + 1 : 0) +
+					nr_frozen * FT_HLIST_FREEZE_MAX_EDGES);
 
 				if (!txn) {
 					if (unsplice_txn)
@@ -8254,6 +8263,26 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 					holder_flag, holder_depth);
 				ft_flip_txn_record_count_parent(ft, txn,
 					holder_flag, -1);
+				/*
+				 * ☑ AND THE CHAIN'S FREEZE RIDES THIS SAME FLIP.
+				 * Recorded onto @txn -- which already carries the
+				 * §4.B guard and the count walk -- so
+				 * ft_remove_one_commit's ft_ord_cell_flip_into
+				 * commits the external_nodes clear, the unsplice,
+				 * the count and every {v -> MARK(v)} together.
+				 * The holder is LOCKED by the guard above, so the
+				 * whole chain is frozen under its owner; the
+				 * post-commit ft_ra_sweep_held this replaces had
+				 * to re-acquire that word a second time to say
+				 * the same thing, and was not atomic with the
+				 * unlink.  @nr_frozen is the DERIVATION and the
+				 * walk is BOUND by it: a duplicate appended since
+				 * tears the derived tail's NULL and aborts this
+				 * commit, leaving the key in place for the retry.
+				 */
+				ft_hlist_freeze_chain_prepare(
+					ft_flip_txn_handle(txn), chain_head,
+					nr_frozen);
 				/*
 				 * The commit's status is the ANSWER, not a
 				 * formality: "pre-reserved => infallible" covers
@@ -8280,14 +8309,6 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 					 */
 					if (ft->ordered_list)
 						pub.armed = true;
-					/*
-					 * The holder demonstrably SURVIVES this
-					 * commit -- the assert below is the
-					 * existing statement of it -- so it is
-					 * still a lock word to take.
-					 */
-					ft_ra_sweep_held(ft, &lctx, holder_flag,
-						holder_depth, chain_head);
 					assert(ft_meta_nr_child(holder_meta) > 0);
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 					/*
