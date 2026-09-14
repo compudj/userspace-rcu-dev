@@ -1762,10 +1762,11 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
  *   // exclusive once population is complete:
  *   cds_ft_make_exclusive(staging);
  *   // No writer mutex needed under CDS_FT_WRITER_LOCK_FINE (the
- *   // default): concurrent grafts into one live destination are
- *   // supported, and serializing them here would discard exactly the
- *   // parallelism fine-grained locking exists to provide.  Under
- *   // CDS_FT_WRITER_LOCK_COARSE the library serializes writers itself.
+ *   // default) -- but not because grafts run in parallel: the library
+ *   // SERIALIZES them itself on the FT-wide writer lock, and flips the
+ *   // point ops onto that same lock for the duration (see the bulk
+ *   // paragraph on cds_ft_graft).  Under CDS_FT_WRITER_LOCK_COARSE the
+ *   // library serializes every writer the same way, bulk or not.
  *   cds_ft_graft(live_trie, prefix, prefix_len, staging);
  *   // staging is now empty but still valid; it can be reused
  *   // for the next batch or destroyed with cds_ft_destroy().
@@ -1867,16 +1868,26 @@ enum cds_ft_status cds_ft_remove_all(struct cds_ft *ft,
  * (cds_ft_group_attr_set_writer_strategy):
  *
  *   CDS_FT_WRITER_LOCK_FINE (the default): the DESTINATION may be a live
- *   trie carrying concurrent writers -- several cross-trie attaches
- *   (cds_ft_graft, cds_ft_graft_swap, cds_ft_merge_at) may run
- *   concurrently on the same destination.  The SOURCE must be EXCLUSIVE,
- *   which is what removes the need to exclude writers on it.  Exclusion
- *   against the point-update operations remains the caller's
- *   responsibility.
+ *   trie carrying concurrent writers, and NO caller-side mutex is needed --
+ *   against bulk peers OR against the point-update operations.  The library
+ *   carries both, with ONE mechanism: the FT-WIDE WRITER LOCK.
+ *
+ *   A bulk op first publishes the BULK-IN-PROGRESS state and waits a grace
+ *   period, which drains the point mutations already in flight (each runs
+ *   inside the caller's RCU read-side bracket, so one GP retires them).
+ *   While that state is live every writer entering a writer scope takes the
+ *   FT-wide lock instead of skipping it -- point ops FLIP OUT of fine
+ *   locking for the duration (ft_writer_lock_scope_enter's `ft->lock_fine &&
+ *   !(FT_BULK_WIDE_LOCK && ft_bulk_active(ft))` test), and bulk peers queue
+ *   on the same word.  So cross-trie attaches on one destination SERIALIZE
+ *   rather than interleave; they do not run concurrently, they take turns.
+ *
+ *   The SOURCE must still be EXCLUSIVE, which is what removes the need to
+ *   exclude writers on it.
  *
  *   A ROOT-LEVEL attach into an EMPTY destination (key_len 0 /
- *   dst_key_len 0) arbitrates against those concurrent peers on the
- *   destination's root: a peer that populates the destination first wins,
+ *   dst_key_len 0) arbitrates against the bulk peers waiting their turn on
+ *   the destination's root: a peer that populates the destination first wins,
  *   and this call then reports POPULATED_ERROR (cds_ft_graft) or falls
  *   through to the ordinary merge into a populated destination
  *   (cds_ft_merge_at).  A peer holding the root mid-attach yields
@@ -1956,12 +1967,22 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
  * (cds_ft_group_attr_set_writer_strategy):
  *
  *   CDS_FT_WRITER_LOCK_FINE (the default): the DESTINATION may be a live
- *   trie carrying concurrent writers -- several cross-trie attaches
- *   (cds_ft_graft, cds_ft_graft_swap, cds_ft_merge_at) may run
- *   concurrently on the same destination.  The SOURCE must be EXCLUSIVE,
- *   which is what removes the need to exclude writers on it.  Exclusion
- *   against the point-update operations remains the caller's
- *   responsibility.
+ *   trie carrying concurrent writers, and NO caller-side mutex is needed --
+ *   against bulk peers OR against the point-update operations.  The library
+ *   carries both, with ONE mechanism: the FT-WIDE WRITER LOCK.
+ *
+ *   A bulk op first publishes the BULK-IN-PROGRESS state and waits a grace
+ *   period, which drains the point mutations already in flight (each runs
+ *   inside the caller's RCU read-side bracket, so one GP retires them).
+ *   While that state is live every writer entering a writer scope takes the
+ *   FT-wide lock instead of skipping it -- point ops FLIP OUT of fine
+ *   locking for the duration (ft_writer_lock_scope_enter's `ft->lock_fine &&
+ *   !(FT_BULK_WIDE_LOCK && ft_bulk_active(ft))` test), and bulk peers queue
+ *   on the same word.  So cross-trie attaches on one destination SERIALIZE
+ *   rather than interleave; they do not run concurrently, they take turns.
+ *
+ *   The SOURCE must still be EXCLUSIVE, which is what removes the need to
+ *   exclude writers on it.
  *
  *   CDS_FT_WRITER_LOCK_COARSE: writers serialize on one FT-wide writer
  *   lock per trie, so any mix of update operations may be called
@@ -2011,9 +2032,17 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
  * Update concurrency depends on the group's writer strategy
  * (cds_ft_group_attr_set_writer_strategy):
  *
- *   CDS_FT_WRITER_LOCK_FINE (the default): NOT concurrency-safe.  Mutual
- *   exclusion against every other update operation on the affected tries
- *   is the caller's responsibility.
+ *   CDS_FT_WRITER_LOCK_FINE (the default): no caller-side mutex is needed
+ *   on @ft.  The whole body runs inside the BULK GATE (see cds_ft_graft):
+ *   the op publishes the bulk-in-progress state and waits a grace period to
+ *   drain the point mutations already in flight, and for the duration every
+ *   writer scope on @ft -- point ops included -- takes the FT-wide writer
+ *   lock instead of skipping it, so bulk peers and point ops queue on one
+ *   word.  The DETACHED trie is handed back EXCLUSIVE by construction, so it
+ *   has no concurrent writer to coordinate with either.
+ *   ☐ The drain-seam gap applies: this op drops writer_lock across mid-body
+ *   grace periods, so the hold is not continuous.  See enum
+ *   cds_ft_writer_strategy.
  *
  *   CDS_FT_WRITER_LOCK_COARSE: writers serialize on one FT-wide writer
  *   lock per trie, so any mix of update operations may be called
@@ -2079,9 +2108,12 @@ enum cds_ft_status cds_ft_detach(struct cds_ft *ft,
  * Update concurrency depends on the group's writer strategy
  * (cds_ft_group_attr_set_writer_strategy):
  *
- *   CDS_FT_WRITER_LOCK_FINE (the default): NOT concurrency-safe.  Mutual
- *   exclusion against every other update operation on the affected tries
- *   is the caller's responsibility.
+ *   CDS_FT_WRITER_LOCK_FINE (the default): identical to cds_ft_merge_at,
+ *   which this is a one-line wrapper over (same key on both sides) -- no
+ *   caller-side mutex is needed on @dst_ft, the bulk gate flips its point
+ *   ops onto the FT-wide writer lock for the window, and bulk peers queue on
+ *   that same lock.  @src_ft must be EXCLUSIVE, as there.
+ *   ☐ The drain-seam gap applies.  See enum cds_ft_writer_strategy.
  *
  *   CDS_FT_WRITER_LOCK_COARSE: writers serialize on one FT-wide writer
  *   lock per trie, so any mix of update operations may be called
@@ -2138,16 +2170,26 @@ enum cds_ft_status cds_ft_merge(struct cds_ft *dst_ft,
  * (cds_ft_group_attr_set_writer_strategy):
  *
  *   CDS_FT_WRITER_LOCK_FINE (the default): the DESTINATION may be a live
- *   trie carrying concurrent writers -- several cross-trie attaches
- *   (cds_ft_graft, cds_ft_graft_swap, cds_ft_merge_at) may run
- *   concurrently on the same destination.  The SOURCE must be EXCLUSIVE,
- *   which is what removes the need to exclude writers on it.  Exclusion
- *   against the point-update operations remains the caller's
- *   responsibility.
+ *   trie carrying concurrent writers, and NO caller-side mutex is needed --
+ *   against bulk peers OR against the point-update operations.  The library
+ *   carries both, with ONE mechanism: the FT-WIDE WRITER LOCK.
+ *
+ *   A bulk op first publishes the BULK-IN-PROGRESS state and waits a grace
+ *   period, which drains the point mutations already in flight (each runs
+ *   inside the caller's RCU read-side bracket, so one GP retires them).
+ *   While that state is live every writer entering a writer scope takes the
+ *   FT-wide lock instead of skipping it -- point ops FLIP OUT of fine
+ *   locking for the duration (ft_writer_lock_scope_enter's `ft->lock_fine &&
+ *   !(FT_BULK_WIDE_LOCK && ft_bulk_active(ft))` test), and bulk peers queue
+ *   on the same word.  So cross-trie attaches on one destination SERIALIZE
+ *   rather than interleave; they do not run concurrently, they take turns.
+ *
+ *   The SOURCE must still be EXCLUSIVE, which is what removes the need to
+ *   exclude writers on it.
  *
  *   A ROOT-LEVEL attach into an EMPTY destination (key_len 0 /
- *   dst_key_len 0) arbitrates against those concurrent peers on the
- *   destination's root: a peer that populates the destination first wins,
+ *   dst_key_len 0) arbitrates against the bulk peers waiting their turn on
+ *   the destination's root: a peer that populates the destination first wins,
  *   and this call then reports POPULATED_ERROR (cds_ft_graft) or falls
  *   through to the ordinary merge into a populated destination
  *   (cds_ft_merge_at).  A peer holding the root mid-attach yields
@@ -3026,52 +3068,64 @@ enum cds_ft_status cds_ft_group_attr_set_optimize(
  * and cds_ft_detach hands back a trie exclusive by construction.  An exclusive
  * trie has no concurrent writer to coordinate with, so nothing is owed there.
  *
- * What their FINE paragraphs actually promise is BULK-vs-BULK: "several cross-trie
- * attaches (cds_ft_graft, cds_ft_graft_swap, cds_ft_merge_at) may run concurrently
- * on the same destination", while "exclusion against the point-update operations
- * remains the caller's responsibility".
+ * ☠ THEIR FINE PARAGRAPHS USED TO PROMISE THE OPPOSITE OF THE DESIGN, and were
+ * corrected: they said bulk ops "may run concurrently on the same destination"
+ * and handed point exclusion to the caller.  Neither is the goal, and neither is
+ * what the code does.
  *
  * ☑ AND BULK-vs-POINT IS NOT THE CALLER'S, NOR IS IT OWED: THE MODE FLIP IS THE
  * DESIGN.  A bulk op publishes the gate and waits a GP; from then on a FINE point
  * op FLIPS MODE and takes the FT-wide writer lock instead of skipping it
- * (ft_writer_scope_enter's `ft->lock_fine && !(FT_BULK_WIDE_LOCK &&
+ * (ft_writer_lock_scope_enter's `ft->lock_fine && !(FT_BULK_WIDE_LOCK &&
  * ft_bulk_active(ft))` test, G5.25), so bulk and point writers arbitrate on one
  * word.  That mode flip -- the FT-wide lock protecting the bulk-op mode
  * transition, which is also the reader dual-descent transition -- IS the target
- * design for bulk-vs-point, not a placeholder for per-node work.  ⇒ The per-op
- * sentences above that hand point exclusion to the CALLER therefore
- * UNDER-describe the library, and the point ops' own notes do not mention bulk
- * ops at all.
+ * design for bulk-vs-point, not a placeholder for per-node work.  ⇒ The bulk
+ * ops' own paragraphs now say so; the POINT ops' notes still do not mention bulk
+ * ops at all, which is the remaining under-description.
  *
- * ☐ THE HOLD IS WHAT MAY BE RELAXED -- BUT THAT IS NOT A FREE OPTIMIZATION, AND
- * BULK-vs-BULK IS THE REASON.  Today a bulk op holds that lock for its whole body
- * (every attempt), and THE FT-WIDE LOCK IS ALSO WHAT MAKES CONCURRENT BULK OPS ON
- * ONE DESTINATION CORRECT -- not only what excludes point ops.  The intended role
- * is narrower (flip the dual-descent state, then relax in FINE mode), so relaxing
- * it OWES A NEW BULK-vs-BULK ARGUMENT; it is not established that the per-node
- * lock-sets alone carry it.
+ * ★ THE FT-WIDE LOCK IS THE MECHANISM, NOT AN OVER-HOLD AWAITING RELAXATION.
+ * The goal is one word for both questions: BULK-vs-BULK is the FT-wide writer
+ * lock, and BULK-vs-POINT is the same lock, reached by flipping the point ops
+ * onto it.  The bulk-in-progress state is the flip, not a second mechanism --
+ * publish it, wait a grace period so the point mutations already in flight
+ * drain, and from then on every writer scope takes the lock.  Bulk peers queue
+ * on it for the same reason point ops do.
  *
- * ☠ AND THE LOCK IS ALREADY TORN OPEN MID-BODY, so "the lock serializes bulk ops"
- * is not even true end-to-end today: ft_writer_lock_gp_wait UNCONDITIONALLY drops
- * writer_lock at seven live sites inside the bulk bodies (detach, graft, rekey), so
- * a peer bulk op can enter at any drain seam.  doc/design/mw-to-fine-locking-
- * remainder.md works that gap through and concludes "bulk-vs-bulk falls out of the
- * lock" is FALSE at every drain seam; what carries it instead is the REFCOUNTED
- * gate (overlapping windows compose, with no per-node bit for a peer's clear to
- * erase) plus each op's own acquire/validate machinery.
+ * ⇒ An exclusion argument for a bulk op MAY rest on the FT-wide lock; that is
+ * what it is for.  What it may NOT rest on is the lock being held CONTINUOUSLY
+ * across the whole body, because it is not -- see the drain-seam gap below.
  *
- * ⇒ SO THE OPEN QUESTION IS NARROW AND NAMED: under the relaxation, what keeps two
- * bulk ops editing ONE destination correct?  FT-SLOT-3's justification answers only
- * the POINT half -- "every caller here is a BULK op ... so the two arbitrate on one
- * word" is bulk-vs-point -- so that site is dependent twice over, and two bulk ops
- * both parking SW on one live parent word have nothing stated to separate them once
- * the whole-body hold goes.  Known issues get stabilised first; this is later.
+ * ☐ THE ONE GAP AGAINST THAT GOAL, and it is the bulk op's OWN code:
+ * ft_writer_lock_gp_wait UNCONDITIONALLY drops writer_lock at seven live sites
+ * inside the bulk bodies (ft-detach.h:219/511/575, ft-graft.h:2960/4011,
+ * ft-rekey.h:4510/5035), so the hold is NOT end-to-end and a peer bulk op can
+ * enter at a drain seam.  Read that as a HOLE IN THE MECHANISM to close, not as
+ * a reason to pick a different one: the drop is the COARSE discipline (there,
+ * point ops wait at the ONLINE scope entry, so holding across a GP would wedge
+ * them), while on a FINE trie every waiter on this lock is another BULK op and
+ * bulk entries forbid a read-section caller -- so the GP may be taken while
+ * HOLDING it, with the waiters parked OFFLINE.  The two paths must not share one
+ * acquisition helper by accident.
  *
- * ⇒ THE RULE THAT FOLLOWS, for anyone adding exclusion arguments here: do NOT
- * build a new one that depends on a bulk op holding the FT-wide lock for its whole
- * body -- it may not survive the relaxation, and at a drain seam it is not true
- * today.  State it on the per-node lock-set
- * or on the gate flip.  FT-SLOT-3 is an EXISTING instance, flagged as such:
+ * What covers the seam until then is the REFCOUNTED gate (overlapping windows
+ * compose, with no per-node bit for a peer's clear to erase) plus each op's own
+ * acquire/validate machinery -- a backstop, not the design.
+ * ☞ doc/design/mw-to-fine-locking-remainder.md, G5.3/G5.4/G5.25.
+ *
+ * ⇒ SO THE OPEN QUESTION IS NARROW AND NAMED, and it is the SEAM, not the choice
+ * of mechanism: what separates two bulk ops that meet inside a drain seam, where
+ * the lock is momentarily not held?  FT-SLOT-3 is the live instance -- "every
+ * caller here is a BULK op ... so the two arbitrate on one word" answers
+ * bulk-vs-point, and two bulk ops both parking SW on one live parent word have
+ * nothing stated to separate them across a seam.  Known issues get stabilised
+ * first; this is later.
+ *
+ * ⇒ THE RULE THAT FOLLOWS, for anyone adding exclusion arguments here: you MAY
+ * rest one on the FT-wide lock -- that is the design -- but state WHICH SIDE of a
+ * drain seam it needs.  An argument that needs the lock held CONTINUOUSLY across
+ * a GP is not true today; one that needs it held per-edit is.  Where neither
+ * holds, state it on the per-node lock-set or on the gate flip.  FT-SLOT-3 is an EXISTING instance, flagged as such:
  * ft_glue_record_back_edge passes @child_held TRUE unconditionally and so parks SW
  * on a live node's parent word the op does not hold, sound only because every
  * caller is a bulk op -- "☠ SO IT IS A DEPENDENCY, NOT AN INVARIANT".  It is debt
