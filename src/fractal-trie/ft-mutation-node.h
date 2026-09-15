@@ -2651,23 +2651,41 @@ skip_copy:
 						 * EXCLUSION side of the conversion
 						 * is complete for all eight.
 						 *
-						 * @gp_held is computed but NOT yet
-						 * passed: a slot is SW xor MW
-						 * GLOBALLY (rcu-txn.h), so the
-						 * eight answers flip in ONE commit
-						 * or not at all -- one lane parking
-						 * SW while another CASes the same
-						 * slot is the cross-thread kind
-						 * disagreement the engine cannot
-						 * check.  What this line settles is
-						 * that nothing is left BLOCKING
-						 * that commit.
+						 * ☞ AND @gp_held IS NOW PASSED.
+						 * rcu-txn.h's "a slot is SW xor MW
+						 * GLOBALLY" is a rule about writers
+						 * that can run CONCURRENTLY: an SW
+						 * park races an MW CAS only if both
+						 * reach the slot at once.  THE LOCK
+						 * IS WHAT MAKES THEM NOT CONCURRENT.
+						 * Where this op holds the dual's
+						 * owner it excludes every other
+						 * writer of that word, so spelling
+						 * this record SW cannot race a site
+						 * still spelled MW -- MW-under-lock
+						 * and SW-under-lock serialise
+						 * against each other.  That is what
+						 * lets the eight producers convert
+						 * one at a time instead of in a
+						 * single flip.
+						 *
+						 * ☠ AND WHERE IT DOES NOT HOLD IT
+						 * STAYS MW.  @gp_held is false on an
+						 * undatable (coarse-spacing) lock
+						 * set, and there the op genuinely
+						 * cannot vouch: claiming SW there
+						 * would be asserting an exclusion
+						 * nobody took.  Passing the answer
+						 * rather than a constant is the
+						 * whole change.
 						 */
-						(void) gp_held;
 						ft_pub_rec_add(rec, skip_slot,
 							*skip_slot, skip_new,
 							skip_slot == &ft->root,
-							gp_meta, false);
+							gp_meta,
+							ft_pub_slot_excluded(ft,
+								skip_slot,
+								gp_held));
 					} else {
 						*skip_slot = skip_new;
 					}
@@ -2933,7 +2951,7 @@ skip_copy:
 		ft_pub_rec_add(rec, old_node_flag_ptr, *old_node_flag_ptr,
 			new_node_flag, old_node_flag_ptr == &ft->root,
 			holder_nf ? ft_flag_to_metadata(ft, holder_nf) : NULL,
-			false);
+			ft_pub_slot_excluded(ft, old_node_flag_ptr, false));
 	}
 	else
 		*old_node_flag_ptr = new_node_flag;

@@ -2933,6 +2933,35 @@ static void ft_dual_site_report(void)
 }
 #endif /* FT_DEBUG_DUAL_SITE */
 
+/*
+ * ☞ THE RECORD KIND ASKS ONE QUESTION: is this op EXCLUDED from every other
+ * writer of @slot?  SW is legal exactly when the answer is yes, and the answer
+ * has two independent sources -- a lock this op took, or a mode in which no
+ * peer writer can exist at all.
+ *
+ * ☑ COARSE: excluded ALREADY, whatever the word is.  A coarse trie takes the
+ * FT-wide @writer_lock at its outermost writer scope, so every writer of every
+ * slot is serialised -- INCLUDING &ft->root, which owns no node and can never
+ * be locked.  The root slot's MW is a property of FINE locking, not of the root.
+ *
+ * ☠ FINE / EXPONENTIAL: the FT-wide lock is dropped all-at-once, so exclusion
+ * comes only from the per-node lock the op took -- and &ft->root HAS NO NODE TO
+ * TAKE.  There the root slot stays MW, and every other word answers with the
+ * op's own acquire (@owner_held).
+ *
+ * Passing this rather than a constant is what lets the producers convert
+ * individually: MW-under-lock and SW-under-lock serialise against each other,
+ * so a site spelled SW never races one still spelled MW.
+ */
+static inline
+bool ft_pub_slot_excluded(const struct cds_ft *ft,
+		struct cds_ft_inode_flag **slot, bool owner_held)
+{
+	if (!ft->lock_fine)
+		return true;		/* FT-wide writer lock serialises all */
+	return slot != &ft->root && owner_held;
+}
+
 static
 void ft_pub_rec_add_at(const char *fn, int line,
 		struct ft_pub_rec *rec, struct cds_ft_inode_flag **slot,
@@ -3345,7 +3374,9 @@ void _ft_publish_to_parent_meta_at(const char *pub_fn, int pub_line,
 						!skip_owner_nf ? NULL :
 						ft_flag_to_metadata(ft,
 							skip_owner_nf),
-						dual_owner_held);
+						ft_pub_slot_excluded(ft,
+							skip_slot,
+							dual_owner_held));
 				else if (*skip_slot != skip_new)
 					rcu_assign_pointer(*skip_slot, skip_new);
 			}
@@ -3391,7 +3422,8 @@ void _ft_publish_to_parent_meta_at(const char *pub_fn, int pub_line,
 			parent_slot == &ft->root,
 			parent_slot == &ft->root || !slot_owner_nf ? NULL :
 				ft_flag_to_metadata(ft, slot_owner_nf),
-			parent_slot != &ft->root && slot_owner_nf != NULL);
+			ft_pub_slot_excluded(ft, parent_slot,
+				slot_owner_nf != NULL));
 	else if (*parent_slot != new_child)
 		/*
 		 * Direct (rec == NULL) publish.  The only two callers -- the
