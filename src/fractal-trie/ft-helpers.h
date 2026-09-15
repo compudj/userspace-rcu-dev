@@ -2959,6 +2959,21 @@ bool ft_pub_slot_excluded(const struct cds_ft *ft,
 {
 	if (!ft->lock_fine)
 		return true;		/* FT-wide writer lock serialises all */
+	/*
+	 * ☑ AND A FINE TRIE INSIDE A BULK WINDOW.  G5.25 has a fine trie
+	 * RE-TAKE the FT-wide @writer_lock while a bulk op is live, and point
+	 * ops take it too for the duration, so an op holding it excludes every
+	 * other writer of every slot -- the same exclusion coarse mode has, for
+	 * as long as the window lasts.  This is the statement the glue publish
+	 * makes in prose ("its exclusion over the SKIP_X dual's grandparent is
+	 * the FT-WIDE WRITER LOCK"); asking @ft_wlock_held makes it a QUERY
+	 * every producer answers for itself instead of a per-site claim.
+	 *
+	 * ☞ It is also the exact predicate FT_OWNER_ASSERT_OWNED was taught to
+	 * accept, so a true here is checked by the same test that would trap it.
+	 */
+	if (ft_wlock_held == (struct cds_ft *) ft)
+		return true;
 	return slot != &ft->root && owner_held;
 }
 

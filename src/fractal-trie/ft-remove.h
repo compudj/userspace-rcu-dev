@@ -6211,12 +6211,23 @@ int ft_unchain_node(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		 * "a ROUTING INVARIANT IS A CODE FACT, AND CODE MOVES".
 		 * ☞ ft_lock_skip_dual_gp.
 		 */
-		/* No dual on this lane (detector below); discard. */
-		(void) ft_lock_skip_dual_gp(ft, ctx, txn, parent_nf,
-			txn ? txn->mtxn : NULL);
-		_ft_publish_to_parent(ft, parent_nf,
-			(struct cds_ft_inode_flag **) head_slot, NULL,
-			(struct cds_ft_inode_flag *) node, &rec, false);
+		/*
+		 * ☞ KEEP THE ANSWER even though this lane emits no dual today.
+		 * It costs nothing, and the day the routing above changes the
+		 * publish will already be spelling its own exclusion instead of
+		 * a constant that nobody re-examines.  Measured: ft_unchain_node
+		 * has NO row in the FT_DEBUG_DUAL_SITE census, which is the
+		 * detector's claim restated as a number.
+		 */
+		{
+			bool dual_gp_held = ft_lock_skip_dual_gp(ft, ctx, txn,
+				parent_nf, txn ? txn->mtxn : NULL);
+
+			_ft_publish_to_parent(ft, parent_nf,
+				(struct cds_ft_inode_flag **) head_slot, NULL,
+				(struct cds_ft_inode_flag *) node, &rec,
+				dual_gp_held);
+		}
 		n_s = ft_pub_rec_sedges(&rec, sedges);
 		/*
 		 * THIS LANE EMITS NO SKIP_X DUAL, and the arm below depends on
