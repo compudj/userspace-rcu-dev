@@ -1996,6 +1996,8 @@ int ft_attach_node(struct cds_ft *ft,
 	struct cds_ft_inode_flag *iter_node_flag, *iter_dest_node_flag,
 				*created_nodes[FT_MAX_DEPTH];
 	struct cds_ft_inode *old_recompacted_node = NULL;
+	/* Nested held-set frame for the reserve; see its use below. */
+	struct ft_lock_ctx rctx;
 	int ret, i, nr_created_nodes = 0;
 	const uint8_t *iter_key = key + key_len;
 
@@ -2165,6 +2167,35 @@ int ft_attach_node(struct cds_ft *ft,
 		 * here -- the reserved-byte publish below is unconditional.
 		 */
 		assert(ic && ic->txn);
+		/*
+		 * ★ MAKE THE OP'S HELD SET VISIBLE TO THE RESERVE.  @ctx was
+		 * built by the caller with ft_lock_ctx_init(&actx, &d, ic.txn,
+		 * ...) BEFORE ft_insert_commit_arm created the txn above, so
+		 * @ctx->held.txn is NULL and the commit's registry is invisible
+		 * through it.  The reserve below hands that same @ctx to
+		 * ft_node_recompact, whose lock-set acquire dedupes via
+		 * ft_lock_ctx_holds -- so any word THIS op has already
+		 * registered reads as "held by someone else", ft_dlm_lock
+		 * refuses it, and the op spends an -EAGAIN refusing its OWN
+		 * lock.  Nothing registers before the reserve today, which is
+		 * the only reason that is currently invisible; it is the
+		 * precondition every acquire hoist here has died on
+		 * (@70a1e20f).
+		 *
+		 * Chain a nested frame instead of mutating @ctx (it is const,
+		 * and the caller's frame is still live): @held.outer is exactly
+		 * the documented "CALLER's held set, when this one belongs to a
+		 * nested step of the same op", and ft_held_set_snap /
+		 * ft_dlm_acquire_set already walk it.  So the reserve sees the
+		 * commit registry AND everything the caller held.
+		 *
+		 * No behaviour change on its own: @ic->txn carries no locks at
+		 * this point, so the widened set answers identically -- it makes
+		 * the FUTURE registration visible, which is the whole point.
+		 */
+		ft_lock_ctx_init(&rctx, ft_lock_ctx_descent(ctx), ic->txn,
+			ctx ? ctx->op : NULL);
+		rctx.held.outer = ctx ? &ctx->held : NULL;
 		{
 			struct cds_ft_inode_flag **slot_ptr = NULL;
 			/*
@@ -2210,7 +2241,7 @@ int ft_attach_node(struct cds_ft *ft,
 				ret = ft_node_set_nth_rec(ft, &iter_dest_node_flag,
 					key_value, NULL, &old_recompacted_node,
 					metadata, level - 1, false, &rec, ic->txn,
-					NULL, ctx, &count_deferred);
+					NULL, &rctx, &count_deferred);
 				if (ret) {
 					dbg_printf("branch publish error %d\n", ret);
 					goto check_error;
