@@ -16692,8 +16692,22 @@ static int test_rekey_graft_publish_survives_detach(void)
 }
 
 /*
- * ☠☠☠ OPT-IN REPRODUCER (FT_UNIT_KNOWN_BAD=1): same-trie rekeys that NEVER
- * RETURN on the default build.  Two inserts and one call is enough:
+ * ☑ WAS AN OPT-IN REPRODUCER (FT_UNIT_KNOWN_BAD=1), NOW A LIVE REGRESSION
+ * GUARD.  The five legs below all used to NEVER RETURN; they terminate and
+ * keep their keys today, so the gate is gone and they run by default -- the
+ * block below said "Remove the gate when the hangs are fixed", and they are.
+ *
+ * ☞ THE NAME IS HISTORICAL.  It is kept so the notes, commits and memory that
+ * refer to these five shapes still resolve; what it guards is that they never
+ * go non-terminating again.
+ *
+ * MEASURED GREEN at 14 configurations before the gate came off: default,
+ * --enable-rcu-debug, each of per-node / exponential / root-only spacing in
+ * both, six repeats of the default pair, plus -DNO_FEATURE_FT_COMPRESS and
+ * -DFEATURE_FT_INSERT_IN_PLACE.  ~4.3 s a run.
+ *
+ * ☠ WHAT IT USED TO DO, kept because it is the shape of the regression.  Two
+ * inserts and one call was enough:
  *
  *      insert "zhab", "zhabbb";  cds_ft_rekey_merge(ft, "zg", 2, "zh", 2);
  *
@@ -16701,9 +16715,11 @@ static int test_rekey_graft_publish_survives_detach(void)
  * samples land on a DIFFERENT frame each time (ft_descent_step,
  * ft_skip_reanchor, ft_ineq_descend, __popcountdi2), so it is the attempt
  * being re-entered, not one stuck loop.  ★ VmRSS is FLAT (21388 kB over the
- * whole spin), so unlike the older rekey livelocks this one does NOT leak and
- * a plain timeout bounds it -- but a libtap failure still absorbs neither a
- * hang nor an abort, which is why this is opt-in rather than a live leg.
+ * whole spin), so unlike the older rekey livelocks this one did NOT leak and a
+ * plain timeout bounded it.  ☠ A libtap failure still absorbs neither a hang
+ * nor an abort, so a REGRESSION here hangs the suite rather than reporting:
+ * run the gate under a timeout, and -DFT_DEBUG_REKEY_RETRY_CAP turns it back
+ * into a loud abort.
  *
  * ★★ THE TOOL FOR THESE ALREADY EXISTS -- build with
  * -DFT_DEBUG_REKEY_RETRY_CAP (the gate's "audit" config carries it) and every
@@ -16719,7 +16735,7 @@ static int test_rekey_graft_publish_survives_detach(void)
  * publish-fold fix untestable today.
  *
  * ☞ Registered unconditionally, never #ifdef'd: a test that vanishes reads as
- * coverage.  Remove the gate when the hangs are fixed.
+ * coverage.
  */
 static int test_rekey_known_nonterminating(void)
 {
@@ -16732,14 +16748,6 @@ static int test_rekey_known_nonterminating(void)
 	if (!cds_ft_merge_enabled()) {
 		diag("test_rekey_known_nonterminating: skipped, merge compiled "
 			"out (-DNO_FEATURE_FT_MERGE)");
-		return 0;
-	}
-	if (!getenv("FT_UNIT_KNOWN_BAD")) {
-		diag("test_rekey_known_nonterminating: skipped -- these rekeys "
-			"NEVER RETURN (retry loop in ft_rekey_graft_simple_attempt, "
-			"RSS flat); set FT_UNIT_KNOWN_BAD=1 to run them, and "
-			"build -DFT_DEBUG_REKEY_RETRY_CAP to get a loud abort "
-			"instead of a hang");
 		return 0;
 	}
 	if (rekey_keeps_keys("hang/dst-below-run", h1, "zg", "zh"))
