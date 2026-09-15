@@ -5467,14 +5467,19 @@ enum ft_be_site {
 	FT_BE_SITE_NR,
 };
 # define FT_BE_SITE_PARAM	, enum ft_be_site dbg_be_site,		\
-				const struct ft_lock_ctx *dbg_be_ctx
-# define FT_BE_SITE(s, c)	, (s), (c)
+				const struct ft_lock_ctx *dbg_be_ctx,	\
+				int dbg_be_reloc
+# define FT_BE_SITE(s, c)	, (s), (c), 0
+/* The park replay also says whether this is the RELOCATION shape. */
+# define FT_BE_SITE_R(s, c, r)	, (s), (c), (r)
 /* The producer tag @ic carries to the commit-time park replay. */
 # define FT_BE_SRC_FIELD	int dbg_live_src;
 # define FT_BE_SRC_SET(ic, s)	do { (ic)->dbg_live_src = (s); } while (0)
-# define FT_BE_SRC_PARAM	, int dbg_park_src
-# define FT_BE_SRC_ARG(ic)	, (ic)->dbg_live_src
+# define FT_BE_SRC_PARAM	, int dbg_park_src, int dbg_park_reloc
+# define FT_BE_SRC_ARG(ic)	, (ic)->dbg_live_src,			\
+				(ic)->free_old_node != NULL
 # define FT_BE_SRC_USE		dbg_park_src
+# define FT_BE_SRC_RELOC	dbg_park_reloc
 extern const char *const ft_be_site_name[FT_BE_SITE_NR];
 const char *const ft_be_site_name[FT_BE_SITE_NR] = {
 	"park_live_parent", "recompact", "detach_cn_parent", "detach_unchain",
@@ -5545,10 +5550,12 @@ const char *const ft_be_site_name[FT_BE_SITE_NR] = {
  */
 extern unsigned long ft_be_s_proxy[FT_BE_SITE_NR], ft_be_s_ctx_old[FT_BE_SITE_NR],
 	ft_be_s_ctx_null[FT_BE_SITE_NR], ft_be_s_wlock[FT_BE_SITE_NR],
-	ft_be_s_bare[FT_BE_SITE_NR], ft_be_s_noreg[FT_BE_SITE_NR];
+	ft_be_s_bare[FT_BE_SITE_NR], ft_be_s_noreg[FT_BE_SITE_NR],
+	ft_be_s_noreg_rel[FT_BE_SITE_NR];
 unsigned long ft_be_s_proxy[FT_BE_SITE_NR], ft_be_s_ctx_old[FT_BE_SITE_NR],
 	ft_be_s_ctx_null[FT_BE_SITE_NR], ft_be_s_wlock[FT_BE_SITE_NR],
-	ft_be_s_bare[FT_BE_SITE_NR], ft_be_s_noreg[FT_BE_SITE_NR];
+	ft_be_s_bare[FT_BE_SITE_NR], ft_be_s_noreg[FT_BE_SITE_NR],
+	ft_be_s_noreg_rel[FT_BE_SITE_NR];
 extern unsigned long ft_be_s_total[FT_BE_SITE_NR],
 	ft_be_s_old[FT_BE_SITE_NR], ft_be_s_nolocks[FT_BE_SITE_NR],
 	ft_be_s_gp[FT_BE_SITE_NR], ft_be_s_gp_none[FT_BE_SITE_NR],
@@ -5566,11 +5573,13 @@ unsigned long ft_be_s_total[FT_BE_SITE_NR],
 #else
 # define FT_BE_SITE_PARAM
 # define FT_BE_SITE(s, c)
+# define FT_BE_SITE_R(s, c, r)
 # define FT_BE_SRC_FIELD
 # define FT_BE_SRC_SET(ic, s)	do { } while (0)
 # define FT_BE_SRC_PARAM
 # define FT_BE_SRC_ARG(ic)
 # define FT_BE_SRC_USE		0
+# define FT_BE_SRC_RELOC	0
 #endif
 
 #ifdef FT_DEBUG_BACK_EDGE_OWNER
@@ -5605,14 +5614,14 @@ static void ft_be_site_report(void)
 		"OFF (columns below are structurally 0, not measured)",
 #endif
 		ft_be_total);
-	fprintf(stderr, "%-18s %10s %8s %8s %8s %8s %8s %8s %8s %8s %8s %8s %8s %8s %8s %8s %8s\n",
+	fprintf(stderr, "%-18s %10s %8s %8s %8s %8s %8s %8s %8s %8s %8s %8s %8s %8s %8s %8s %8s %8s\n",
 		"site", "total", "oldP", "GRANDpar", "nolocks",
 		"led_old", "led_gp", "led_only", "NOowner", "newP", "led_new", "HOLDS0",
-		"ctx_old", "ctxNULL", "WLOCK", "BARE", "NOREG");
+		"ctx_old", "ctxNULL", "WLOCK", "BARE", "NOREG", "NOREGrel");
 	for (i = 0; i < FT_BE_SITE_NR; i++) {
 		if (!ft_be_s_total[i])
 			continue;
-		fprintf(stderr, "%-18s %10lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu\n",
+		fprintf(stderr, "%-18s %10lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu\n",
 			ft_be_site_name[i], ft_be_s_total[i],
 			ft_be_s_old[i], ft_be_s_gp[i], ft_be_s_nolocks[i],
 			ft_be_s_led_old[i], ft_be_s_led_gp[i],
@@ -5620,7 +5629,8 @@ static void ft_be_site_report(void)
 			ft_be_s_new[i], ft_be_s_led_new[i],
 			ft_be_s_led_none[i], ft_be_s_ctx_old[i],
 			ft_be_s_ctx_null[i], ft_be_s_wlock[i],
-			ft_be_s_bare[i], ft_be_s_noreg[i]);
+			ft_be_s_bare[i], ft_be_s_noreg[i],
+			ft_be_s_noreg_rel[i]);
 	}
 }
 
@@ -5701,10 +5711,26 @@ static void ft_be_site_report(void)
 					&ft_be_s_bare[dbg_be_site], 1,	\
 					__ATOMIC_RELAXED);		\
 				/* ... and is it owned by the COMMIT? */ \
-				if (!h_old)				\
+				if (!h_old) {				\
 					__atomic_fetch_add(		\
 					    &ft_be_s_noreg[dbg_be_site],\
 					    1, __ATOMIC_RELAXED);	\
+					/*				\
+					 * ... and is this the RECOMPACT- \
+					 * RELOCATION shape?  Only the	\
+					 * in-place arm reaches the	\
+					 * lock_or_guard on the attach	\
+					 * word (iter_dest == attach),	\
+					 * so this says whether the	\
+					 * residue is that skipped arm	\
+					 * or a MISS on the taken one.	\
+					 */				\
+					if (dbg_be_reloc)		\
+						__atomic_fetch_add(	\
+						 &ft_be_s_noreg_rel[	\
+						  dbg_be_site], 1,	\
+						 __ATOMIC_RELAXED);	\
+				}					\
 			}						\
 		}							\
 		if (!o_old)						\
