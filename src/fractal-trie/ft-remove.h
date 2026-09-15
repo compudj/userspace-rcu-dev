@@ -79,9 +79,21 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 		long count_delta)
 {
 	/*
-	 * Does the op hold the SKIP_X dual's derived grandparent?  ASKED, never
-	 * acquired here -- see ft_skip_dual_gp_held for why a second acquire at
-	 * this site hangs.
+	 * Does the op hold the SKIP_X dual's derived grandparent?  ANSWERED BY
+	 * THE ACQUIRE at each of the three publishes below -- the return of
+	 * ft_lock_skip_dual_gp, which is REGISTERED-or-SHARED, i.e. the
+	 * assert's own predicate.
+	 *
+	 * ☠ NOT by ft_skip_dual_gp_held.  That helper asks @ctx, and a
+	 * ft_owner_ctx_holds() miss means "the registry cannot see this hold",
+	 * never "the op does not hold it": an acquire taken through
+	 * ft_dlm_acquire_set_at registers into NO ctx at all (it receives the
+	 * ctx as a const pointer), so its marks are invisible to the ask until
+	 * the owner's commit hands them to a txn.  That is exactly how
+	 * ft_node_recompact's dual site came to record "0 held of 805202" about
+	 * a word it holds on every fine-trie publish.  The ask is kept below as
+	 * a MEASUREMENT of that registry, and its answer must not be wired to a
+	 * record kind.
 	 */
 	bool dual_gp_held = false;
 
@@ -350,20 +362,30 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			 * lock_fine", so this frame is precisely an op that
 			 * arrives holding part of the set.
 			 *
-			 * ☠ AND IT IS NOT "THE OP ALREADY HOLDS IT" EITHER -- that
-			 * theory is REFUTED, 0 held of 40894 asked across all 153
-			 * inv rows (ft_skip_dual_gp_held).  ft_detach_node's
-			 * up-front {C, P, GP} set holds the grandparent of the
-			 * op's ITERATION parent; the dual's owner is derived at
-			 * publish from cn_meta's back-pointer, and they are
-			 * different nodes.  The ask stays because that question
-			 * is one every producer owes and a lock ACQUIRE conflates
-			 * it with taking one.
+			 * ☠ AND "THE OP ALREADY HOLDS IT" MEASURED 0 held of
+			 * 40894 across all 153 inv rows (ft_skip_dual_gp_held) --
+			 * but READ THAT NUMBER AS A REGISTRY ANSWER, NOT AS A
+			 * LOCK ANSWER.  The ask consults @ctx, and an acquire
+			 * taken through ft_dlm_acquire_set_at registers into no
+			 * ctx at all, so a hold that lives in a caller's local
+			 * anchor array is invisible to it.  The identical 100%/0%
+			 * split at ft_node_recompact's dual site was exactly that
+			 * -- 0 of 805202 through @ctx, 490411 of 490411 asked of
+			 * the set the function actually took.  The reading here
+			 * (that ft_detach_node's {C, P, GP} names the grandparent
+			 * of the op's ITERATION parent, a different node from the
+			 * dual's back-pointer-derived owner) may still be right;
+			 * it is simply not what this instrument measured.
+			 *
+			 * It does not matter for the KIND, because the ACQUIRE
+			 * below answers the question properly -- REGISTERED or
+			 * SHARED, the assert's own predicate -- and that is what
+			 * @dual_gp_held now carries.  The ask stays as a
+			 * measurement of the registry's reach.
 			 */
-			dual_gp_held = ft_skip_dual_gp_held(ft, ctx,
+			(void) ft_skip_dual_gp_held(ft, ctx,
 				ft_compressed_node_flag(cn),
-				txn ? txn->mtxn : NULL);
-			(void) dual_gp_held;	/* kind held back: see below */
+				txn ? txn->mtxn : NULL);	/* measurement */
 			/*
 			 * §9.3's THIRD MEMBER, taken here at last.  It used to
 			 * HANG -- and the cause was never this site: on a COARSE
@@ -376,8 +398,9 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			 * With the helper's coarse early-out the same call is
 			 * green.
 			 */
-			(void) ft_lock_skip_dual_gp(ft, ctx, txn,
+			dual_gp_held = ft_lock_skip_dual_gp(ft, ctx, txn,
 				ft_compressed_node_flag(cn), NULL);
+			(void) dual_gp_held;	/* kind flips with all producers */
 			_ft_publish_to_parent(ft, ft_compressed_node_flag(cn),
 				&cn->child,
 				(struct cds_ft_inode_flag *) topmost_external_nodes,
@@ -432,20 +455,30 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			 * lock_fine", so this frame is precisely an op that
 			 * arrives holding part of the set.
 			 *
-			 * ☠ AND IT IS NOT "THE OP ALREADY HOLDS IT" EITHER -- that
-			 * theory is REFUTED, 0 held of 40894 asked across all 153
-			 * inv rows (ft_skip_dual_gp_held).  ft_detach_node's
-			 * up-front {C, P, GP} set holds the grandparent of the
-			 * op's ITERATION parent; the dual's owner is derived at
-			 * publish from cn_meta's back-pointer, and they are
-			 * different nodes.  The ask stays because that question
-			 * is one every producer owes and a lock ACQUIRE conflates
-			 * it with taking one.
+			 * ☠ AND "THE OP ALREADY HOLDS IT" MEASURED 0 held of
+			 * 40894 across all 153 inv rows (ft_skip_dual_gp_held) --
+			 * but READ THAT NUMBER AS A REGISTRY ANSWER, NOT AS A
+			 * LOCK ANSWER.  The ask consults @ctx, and an acquire
+			 * taken through ft_dlm_acquire_set_at registers into no
+			 * ctx at all, so a hold that lives in a caller's local
+			 * anchor array is invisible to it.  The identical 100%/0%
+			 * split at ft_node_recompact's dual site was exactly that
+			 * -- 0 of 805202 through @ctx, 490411 of 490411 asked of
+			 * the set the function actually took.  The reading here
+			 * (that ft_detach_node's {C, P, GP} names the grandparent
+			 * of the op's ITERATION parent, a different node from the
+			 * dual's back-pointer-derived owner) may still be right;
+			 * it is simply not what this instrument measured.
+			 *
+			 * It does not matter for the KIND, because the ACQUIRE
+			 * below answers the question properly -- REGISTERED or
+			 * SHARED, the assert's own predicate -- and that is what
+			 * @dual_gp_held now carries.  The ask stays as a
+			 * measurement of the registry's reach.
 			 */
-			dual_gp_held = ft_skip_dual_gp_held(ft, ctx,
+			(void) ft_skip_dual_gp_held(ft, ctx,
 				ft_compressed_node_flag(cn),
-				txn ? txn->mtxn : NULL);
-			(void) dual_gp_held;	/* kind held back: see below */
+				txn ? txn->mtxn : NULL);	/* measurement */
 			/*
 			 * §9.3's THIRD MEMBER, taken here at last.  It used to
 			 * HANG -- and the cause was never this site: on a COARSE
@@ -458,8 +491,9 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			 * With the helper's coarse early-out the same call is
 			 * green.
 			 */
-			(void) ft_lock_skip_dual_gp(ft, ctx, txn,
+			dual_gp_held = ft_lock_skip_dual_gp(ft, ctx, txn,
 				ft_compressed_node_flag(cn), NULL);
+			(void) dual_gp_held;	/* kind flips with all producers */
 			_ft_publish_to_parent(ft, ft_compressed_node_flag(cn),
 				&cn->child,
 				(struct cds_ft_inode_flag *) topmost_external_nodes,
@@ -645,10 +679,13 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			 * which case this publish also emits its SKIP_X dual into
 			 * a grandparent the op holds nothing of.  Acquire it from
 			 * the same derivation the record names.  (Kind still
-			 * false -- see ft_node_recompact's dual site.)
+			 * false -- the eight producers flip TOGETHER; see
+			 * ft_node_recompact's dual site, where the last of them
+			 * was shown to hold its owner after all.)
 			 */
-			(void) ft_lock_skip_dual_gp(ft, ctx, txn, pub_parent,
-				NULL);
+			dual_gp_held = ft_lock_skip_dual_gp(ft, ctx, txn,
+				pub_parent, NULL);
+			(void) dual_gp_held;	/* kind flips with all producers */
 			_ft_publish_to_parent(ft, pub_parent,
 				pub_slot,
 				ft_node_flag(fresh, 0),
