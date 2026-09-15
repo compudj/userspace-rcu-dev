@@ -154,6 +154,40 @@ a reader's address fold perturb.
    cases of §2.1 become documentation of *why* this is correct, not a per-op
    runtime check in the hot path.
 
+## 4b. MEASURED BLOCKER: the in-place store PRECEDES the acquire (@90b44097)
+
+Step 1 landed as the `move_active` conjunct in `ft_in_place_ok` (@ee12ab22):
+in-place is refused while a move is in flight, using the same gate the reader
+consults, with the mover's existing set-gate-then-GP-then-mutate drain making it
+sound. Observably a no-op until `ft->exclusive` is dropped.
+
+Before dropping it, the refused `-ERANGE` arms were probed — they are exactly
+the population the widening would newly admit — declaring `FT_EXCL_LOCKED` and
+asking the audit whether the op holds the node. With **all three** witnesses
+(registry, hold ledger, wide ctx) plumbed down from `ft_node_set_nth_rec`:
+
+```
+nodebody  total=67699790  WLOCK=1093244  hidden=62565702
+          lockOK=0  lockVIOL=4040923  anchored=0
+```
+
+Nothing holds the node, and no ancestor is held either. **The reason is
+ORDERING, not an absent lock**: in `ft_attach_node` the reserve
+(`ft_node_set_nth_rec(ft, &iter_dest_node_flag, ...)`) is at :2187 and the
+acquire of that same node (`ft_flip_txn_lock_or_guard_parent(..., ctx,
+iter_dest_node_flag, ...)`) is at :2266 — 79 lines later. The op holds the node
+by the time it COMMITS; it does not hold it at the moment the in-place store
+would happen. Harmless today because the reserve is refused; with
+`ft_in_place_ok` returning true it would mutate a LIVE node before locking it.
+
+⇒ **The widening therefore needs the ACQUIRE HOISTED above the reserve, not just
+the predicate relaxed.** That hoist is the known-dangerous move here — a prior
+attempt HUNG 2 of 8 producers when an op re-took a word it already held and read
+its own mark as contention (`struct ft_held_set`'s header: the second acquire
+returns -EAGAIN and the op waits on itself forever). So it is its own step, with
+its own validation, and the dedupe question (does the op already hold this word
+via a lock-set member or an anchor?) must be answered BEFORE adding the acquire.
+
 ## 5. Open items to validate (do not assume)
 
 - Forcing recompact on the dst attach parent perturbs the fold only for readers
