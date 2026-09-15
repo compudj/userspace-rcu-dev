@@ -356,14 +356,28 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			 * up-front {C, P, GP} set holds the grandparent of the
 			 * op's ITERATION parent; the dual's owner is derived at
 			 * publish from cn_meta's back-pointer, and they are
-			 * different nodes.  The acquire really is missing here,
-			 * the hang has no explanation yet, and the ask below is
-			 * the instrument that will not let either be assumed.
+			 * different nodes.  The ask stays because that question
+			 * is one every producer owes and a lock ACQUIRE conflates
+			 * it with taking one.
 			 */
 			dual_gp_held = ft_skip_dual_gp_held(ft, ctx,
 				ft_compressed_node_flag(cn),
 				txn ? txn->mtxn : NULL);
 			(void) dual_gp_held;	/* kind held back: see below */
+			/*
+			 * §9.3's THIRD MEMBER, taken here at last.  It used to
+			 * HANG -- and the cause was never this site: on a COARSE
+			 * trie ft_lock_skip_dual_gp acquired nothing yet still
+			 * fell through to ft_flip_txn_lock_or_guard_parent's
+			 * `guard:` tail and planted a §4.B guard the commit could
+			 * not satisfy, so every attempt aborted and the caller
+			 * retried forever (measured: 8,427,520 calls, ALL
+			 * FT_LOG_EXIT_NOT_FINE, while the row never returned).
+			 * With the helper's coarse early-out the same call is
+			 * green.
+			 */
+			(void) ft_lock_skip_dual_gp(ft, ctx, txn,
+				ft_compressed_node_flag(cn), NULL);
 			_ft_publish_to_parent(ft, ft_compressed_node_flag(cn),
 				&cn->child,
 				(struct cds_ft_inode_flag *) topmost_external_nodes,
@@ -424,14 +438,28 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			 * up-front {C, P, GP} set holds the grandparent of the
 			 * op's ITERATION parent; the dual's owner is derived at
 			 * publish from cn_meta's back-pointer, and they are
-			 * different nodes.  The acquire really is missing here,
-			 * the hang has no explanation yet, and the ask below is
-			 * the instrument that will not let either be assumed.
+			 * different nodes.  The ask stays because that question
+			 * is one every producer owes and a lock ACQUIRE conflates
+			 * it with taking one.
 			 */
 			dual_gp_held = ft_skip_dual_gp_held(ft, ctx,
 				ft_compressed_node_flag(cn),
 				txn ? txn->mtxn : NULL);
 			(void) dual_gp_held;	/* kind held back: see below */
+			/*
+			 * §9.3's THIRD MEMBER, taken here at last.  It used to
+			 * HANG -- and the cause was never this site: on a COARSE
+			 * trie ft_lock_skip_dual_gp acquired nothing yet still
+			 * fell through to ft_flip_txn_lock_or_guard_parent's
+			 * `guard:` tail and planted a §4.B guard the commit could
+			 * not satisfy, so every attempt aborted and the caller
+			 * retried forever (measured: 8,427,520 calls, ALL
+			 * FT_LOG_EXIT_NOT_FINE, while the row never returned).
+			 * With the helper's coarse early-out the same call is
+			 * green.
+			 */
+			(void) ft_lock_skip_dual_gp(ft, ctx, txn,
+				ft_compressed_node_flag(cn), NULL);
 			_ft_publish_to_parent(ft, ft_compressed_node_flag(cn),
 				&cn->child,
 				(struct cds_ft_inode_flag *) topmost_external_nodes,

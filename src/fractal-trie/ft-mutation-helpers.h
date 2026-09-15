@@ -9162,6 +9162,13 @@ static void ft_dual_ask_report(void)
 	fprintf(stderr, "FT DUAL-GP ASK held=%lu unheld=%lu\n",
 		uatomic_read(&ft_dual_ask[1]), uatomic_read(&ft_dual_ask[0]));
 }
+/*
+ * ☞ PERIODIC PRINTING WAS NOT A STYLE CHOICE: the row this instrument was
+ * built for HUNG, its child was killed by SIGALRM, and a destructor never ran.
+ * The 8,427,520 NOT_FINE exits that named the cause were only visible because
+ * the counter printed as it went.  Restored to a plain counter now that the
+ * hang is fixed -- if another one appears, print as you go again.
+ */
 # define FT_DUAL_EXIT_TALLY(ex)	uatomic_inc(&ft_dual_exit[(ex)])
 # define FT_DUAL_ASK_TALLY(h)	uatomic_inc(&ft_dual_ask[(h) ? 1 : 0])
 #else
@@ -9251,6 +9258,23 @@ bool ft_lock_skip_dual_gp(struct cds_ft *ft,
 		return false;		/* no dual edge will be recorded */
 	if (skip_slot == &ft->root || !gp_nf)
 		return false;		/* root dual: no owning node */
+	/*
+	 * ☠ A COARSE TRIE HAS NOTHING TO ACQUIRE -- AND THE HELPER WOULD STILL
+	 * PLANT A GUARD.  ft_flip_txn_lock_or_guard_parent's body is gated on
+	 * @lock_fine, but its `guard:` tail is NOT: on a coarse trie it falls
+	 * straight through and records a §4.B guard on the dual's grandparent.
+	 * That guard is pure cost there (a coarse writer holds the FT-wide lock;
+	 * no peer can move the word) and it is not free -- MEASURED at
+	 * ft_detach_node_replace_compressed_parent: 8,427,520 calls, ALL of them
+	 * FT_LOG_EXIT_NOT_FINE, while test_rekey_same_path_atomic_or_refused
+	 * never returned.  An extra guard whose expectation the commit cannot
+	 * satisfy aborts every attempt, and the caller retries forever.
+	 *
+	 * ⇒ Answer "not held" and plant nothing.  This helper's contract is
+	 * §9.3's third LOCK-SET member; a trie with no lock set owes no member.
+	 */
+	if (!ft->lock_fine)
+		return false;
 #ifdef FT_DEBUG_DUAL_DROP
 	{
 		/*
