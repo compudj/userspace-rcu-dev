@@ -22924,6 +22924,26 @@ static int inv_concurrent_same_key_append_run(bool ordered_list, bool coarse,
 
 struct ski_ctx {
 	struct cds_ft *ft;
+	/*
+	 * ☞ THE INDEX, SEPARATE FROM THE STORAGE.  @cur[i][k] names the node
+	 * worker @i currently has installed for key @k -- which is all the
+	 * oracle needs identity for ("is this chain member worker 0's, worker
+	 * 1's, or FOREIGN?").  The nodes themselves are HEAP allocated per
+	 * insert and freed through node_free_rcu, so no object is ever written
+	 * again inside the grace period cds_ft_remove's contract reserves:
+	 *
+	 *   "A grace period must be observed (e.g., synchronize_rcu, call_rcu)
+	 *    after success before reclaiming @node memory."
+	 *
+	 * The array this replaced conflated the two jobs: it was the index AND
+	 * the allocator, so re-indexing a key meant cds_ft_node_init() wiping
+	 * prev/next on an object a peer could still reach.  Keeping the index
+	 * and heap-allocating the storage costs the updater nothing -- the
+	 * alternative, a synchronize_rcu() between every remove and its reuse,
+	 * would serialise ~64k removes per worker and blunt the contention this
+	 * row exists to create.
+	 */
+	struct ft_test_node **cur[2];	/* [2][SKI_K] */
 	struct skr_node *n[2];		/* [2][SKI_K]: one node array per worker */
 	unsigned char *in[2];		/* [2][SKI_K]: MY node is currently in.  For
 					 * the REPLACE row's worker 1 this names
@@ -22958,19 +22978,25 @@ static void *ski_worker(void *arg)
 			cds_ft_u64_to_key(c->ft, (uint64_t) k, key,
 				CDS_FT_LEN_DEFAULT);
 			if (!c->in[id][k]) {
+				struct ft_test_node *fresh =
+					node_alloc((uint64_t) k);
+
 				rcu_read_lock();
-				cds_ft_node_init(&c->n[id][k].node);
 #ifdef FT_INV_SKI_RED_LOST_INSERT
 				/* RED CONTROL: claim the insert without making
 				 * it -- the LOST INSERT signature. */
-				if (r == SKI_R - 1 && burst == 0 && k == 0)
+				if (r == SKI_R - 1 && burst == 0 && k == 0) {
+					c->cur[id][k] = fresh;
+					fresh = NULL;	/* indexed: not ours to free */
 					c->in[id][k] = 1;
-				else
+				} else
 #endif
 				if (cds_ft_insert(c->ft, key,
 						CDS_FT_LEN_DEFAULT,
-						&c->n[id][k].node) ==
+						&fresh->node) ==
 						CDS_FT_STATUS_OK) {
+					c->cur[id][k] = fresh;
+					fresh = NULL;
 					c->in[id][k] = 1;
 #ifdef FT_INV_SKI_COVERAGE
 					/* Did this insert APPEND to a chain the
@@ -22983,6 +23009,10 @@ static void *ski_worker(void *arg)
 #endif
 				}
 				rcu_read_unlock();
+				/* Refused insert: the node never became
+				 * reachable, so a plain free is correct. */
+				if (fresh)
+					node_free(fresh);
 			} else {
 				rcu_read_lock();
 				cds_ft_iter_set_key(iter, key,
@@ -22994,10 +23024,21 @@ static void *ski_worker(void *arg)
 				 */
 				if (cds_ft_lookup(c->ft, iter) ==
 						CDS_FT_STATUS_OK &&
+						c->cur[id][k] &&
 						cds_ft_remove(c->ft, iter,
-							&c->n[id][k].node) ==
-						CDS_FT_STATUS_OK)
+							&c->cur[id][k]->node) ==
+						CDS_FT_STATUS_OK) {
+					/*
+					 * The node leaves the INDEX here and its
+					 * memory is reclaimed only after a grace
+					 * period -- this worker never writes it
+					 * again.  The next insert for this key
+					 * allocates a fresh one.
+					 */
+					node_free_rcu(c->cur[id][k]);
+					c->cur[id][k] = NULL;
 					c->in[id][k] = 0;
+				}
 				rcu_read_unlock();
 			}
 			rcu_quiescent_state();
@@ -23039,7 +23080,9 @@ static int inv_concurrent_same_key_inserts_run(bool ordered_list, bool coarse,
 	for (i = 0; i < 2; i++) {
 		c.n[i] = (struct skr_node *) calloc(SKI_K, sizeof(*c.n[i]));
 		c.in[i] = (unsigned char *) calloc(SKI_K, 1);
-		if (!c.n[i] || !c.in[i])
+		c.cur[i] = (struct ft_test_node **) calloc(SKI_K,
+			sizeof(*c.cur[i]));
+		if (!c.n[i] || !c.in[i] || !c.cur[i])
 			abort();
 		for (k = 0; k < SKI_K; k++)
 			c.n[i][k].k = k;
@@ -23076,9 +23119,9 @@ static int inv_concurrent_same_key_inserts_run(bool ordered_list, bool coarse,
 		if (cds_ft_lookup(c.ft, iter) == CDS_FT_STATUS_OK) {
 			for (h = cds_ft_iter_node(iter); h;
 					h = cds_ft_node_next_rcu(h)) {
-				if (h == &c.n[0][k].node)
+				if (c.cur[0][k] && h == &c.cur[0][k]->node)
 					seen[0]++;
-				else if (h == &c.n[1][k].node)
+				else if (c.cur[1][k] && h == &c.cur[1][k]->node)
 					seen[1]++;
 				else
 					extra++;
@@ -23110,9 +23153,21 @@ static int inv_concurrent_same_key_inserts_run(bool ordered_list, bool coarse,
 	cds_ft_destroy(c.ft);
 	cds_ft_group_destroy(group);
 	for (i = 0; i < 2; i++) {
+		/*
+		 * Whatever each worker still had installed: the trie is gone, so
+		 * nothing can reach these any more -- but they were handed out
+		 * under RCU, so they leave the same way.
+		 */
+		for (k = 0; k < SKI_K; k++)
+			if (c.cur[i][k])
+				node_free_rcu(c.cur[i][k]);
+		free(c.cur[i]);
 		free(c.n[i]);
 		free(c.in[i]);
 	}
+	/* The deferred frees must land before RUN_TEST's leak_check(). */
+	rcu_quiescent_state();
+	rcu_barrier();
 #ifdef FT_INV_SKI_COVERAGE
 	fprintf(stderr, "# %s COVERAGE: appends onto the PEER's chain=%lu, onto an empty key=%lu\n",
 		name, ski_dup_appends, ski_solo_appends);
@@ -23622,7 +23677,9 @@ static int inv_concurrent_same_key_replace_run(bool coarse, const char *name)
 	for (i = 0; i < 2; i++) {
 		c.n[i] = (struct skr_node *) calloc(SKI_K, sizeof(*c.n[i]));
 		c.in[i] = (unsigned char *) calloc(SKI_K, 1);
-		if (!c.n[i] || !c.in[i])
+		c.cur[i] = (struct ft_test_node **) calloc(SKI_K,
+			sizeof(*c.cur[i]));
+		if (!c.n[i] || !c.in[i] || !c.cur[i])
 			abort();
 		for (k = 0; k < SKI_K; k++)
 			c.n[i][k].k = k;
@@ -23658,7 +23715,7 @@ static int inv_concurrent_same_key_replace_run(bool coarse, const char *name)
 		if (cds_ft_lookup(c.ft, iter) == CDS_FT_STATUS_OK) {
 			for (h = cds_ft_iter_node(iter); h;
 					h = cds_ft_node_next_rcu(h)) {
-				if (h == &c.n[0][k].node)
+				if (c.cur[0][k] && h == &c.cur[0][k]->node)
 					seen_a++;
 				else if (h == &c.n[1][k].node ||
 						h == &c.alt[k].node)
@@ -23697,10 +23754,22 @@ static int inv_concurrent_same_key_replace_run(bool coarse, const char *name)
 	cds_ft_destroy(c.ft);
 	cds_ft_group_destroy(group);
 	for (i = 0; i < 2; i++) {
+		/*
+		 * Whatever the insert/remove peer still had installed: the trie
+		 * is gone, so nothing can reach these any more -- but they were
+		 * handed out under RCU, so they leave the same way.
+		 */
+		for (k = 0; k < SKI_K; k++)
+			if (c.cur[i][k])
+				node_free_rcu(c.cur[i][k]);
+		free(c.cur[i]);
 		free(c.n[i]);
 		free(c.in[i]);
 	}
 	free(c.alt);
+	/* The deferred frees must land before RUN_TEST's leak_check(). */
+	rcu_quiescent_state();
+	rcu_barrier();
 	fprintf(stderr,
 		"# %s: %u rounds x %u burst x %u keys, cds_ft_replace vs same-key insert/remove (%s) -> %s\n",
 		name, SKI_R, SKI_BURST, SKI_K, coarse ? "coarse" : "fine",
