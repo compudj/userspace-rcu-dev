@@ -827,7 +827,7 @@ int ft_rekey_cow_stop(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 			else
 				ret = _ft_node_set_nth(ft, type, new_node, new_flag,
 						new_meta, v, iter, COW_IS_INIT(v),
-						true, NULL);
+						true, NULL FT_CH_TXN_NONE);
 			assert(!ret);
 		}
 	} else {	/* FT_PIGEON */
@@ -856,7 +856,8 @@ int ft_rekey_cow_stop(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 			else
 				ret = _ft_node_set_nth(ft, type, new_node, new_flag,
 						new_meta, i, iter,
-						COW_IS_INIT((uint8_t) i), true, NULL);
+						COW_IS_INIT((uint8_t) i), true,
+						NULL FT_CH_TXN_NONE);
 			assert(!ret);
 		}
 	}

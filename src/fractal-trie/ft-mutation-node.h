@@ -89,7 +89,7 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 		bool *_replace_old_ptr,
 		bool is_init,
 		bool defer_parent,
-		bool *deferred_count)
+		bool *deferred_count FT_CH_TXN_PARAM)
 {
 	assert(ft_type_is_popcount(type->type_class));
 
@@ -147,11 +147,13 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 			 * real workload and WITHOUT changing behaviour: the -ERANGE below still
 			 * fires.  A probe that records beats a guard that refuses.
 			 */
-			ft_ch_audit_body_at(__func__, __LINE__, ft, metadata, FT_EXCL_LOCKED);
+			ft_ch_audit_body_at(__func__, __LINE__, ft, metadata, FT_EXCL_LOCKED,
+			FT_CH_TXN_USE);
 			return -ERANGE;
 		}
 		ft_ch_audit_body_at(__func__, __LINE__, ft, metadata,
-			defer_parent ? FT_EXCL_HIDDEN : FT_EXCL_LOCKED);
+			defer_parent ? FT_EXCL_HIDDEN : FT_EXCL_LOCKED,
+			FT_CH_TXN_USE);
 		if (qp_root >> qp_hi & 1U) {
 			/* hi already present */
 			if ((qp_bms >> qp_p) & 1ULL) {
@@ -327,11 +329,13 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 			 * real workload and WITHOUT changing behaviour: the -ERANGE below still
 			 * fires.  A probe that records beats a guard that refuses.
 			 */
-			ft_ch_audit_body_at(__func__, __LINE__, ft, metadata, FT_EXCL_LOCKED);
+			ft_ch_audit_body_at(__func__, __LINE__, ft, metadata, FT_EXCL_LOCKED,
+			FT_CH_TXN_USE);
 			return -ERANGE;
 		}
 		ft_ch_audit_body_at(__func__, __LINE__, ft, metadata,
-			defer_parent ? FT_EXCL_HIDDEN : FT_EXCL_LOCKED);
+			defer_parent ? FT_EXCL_HIDDEN : FT_EXCL_LOCKED,
+			FT_CH_TXN_USE);
 		if ((qp_root >> qp_hi) & 1ULL) {
 			/* hi already present */
 			if ((qp_bms >> qp_p) & 1ULL) {
@@ -511,12 +515,14 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 				 * real workload and WITHOUT changing behaviour: the -ERANGE below still
 				 * fires.  A probe that records beats a guard that refuses.
 				 */
-				ft_ch_audit_body_at(__func__, __LINE__, ft, metadata, FT_EXCL_LOCKED);
+				ft_ch_audit_body_at(__func__, __LINE__, ft, metadata, FT_EXCL_LOCKED,
+			FT_CH_TXN_USE);
 				return -ERANGE;
 			}
 		}
 		ft_ch_audit_body_at(__func__, __LINE__, ft, metadata,
-			defer_parent ? FT_EXCL_HIDDEN : FT_EXCL_LOCKED);
+			defer_parent ? FT_EXCL_HIDDEN : FT_EXCL_LOCKED,
+			FT_CH_TXN_USE);
 
 		if ((qp_root >> qp_hi) & 1U) {
 			qp_sub = *ft_popcount_2l_sub_bm_addr(node,
@@ -700,11 +706,13 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 			 * real workload and WITHOUT changing behaviour: the -ERANGE below still
 			 * fires.  A probe that records beats a guard that refuses.
 			 */
-			ft_ch_audit_body_at(__func__, __LINE__, ft, metadata, FT_EXCL_LOCKED);
+			ft_ch_audit_body_at(__func__, __LINE__, ft, metadata, FT_EXCL_LOCKED,
+			FT_CH_TXN_USE);
 			return -ERANGE;
 		}
 		ft_ch_audit_body_at(__func__, __LINE__, ft, metadata,
-			defer_parent ? FT_EXCL_HIDDEN : FT_EXCL_LOCKED);
+			defer_parent ? FT_EXCL_HIDDEN : FT_EXCL_LOCKED,
+			FT_CH_TXN_USE);
 		if (word & bit) {
 			/* Case 1: in-place pointer replace. */
 			for (k = 0; k < word_idx; k++)
@@ -807,7 +815,7 @@ int ft_pigeon_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 		uint8_t n,
 		struct cds_ft_inode_flag *child_node_flag,
 		bool defer_parent,
-		bool *deferred_count)
+		bool *deferred_count FT_CH_TXN_PARAM)
 {
 	struct cds_ft_inode_flag **ptr;
 	bool replace_old_ptr = false;
@@ -878,11 +886,13 @@ int ft_pigeon_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 		 * real workload and WITHOUT changing behaviour: the -ERANGE below still
 		 * fires.  A probe that records beats a guard that refuses.
 		 */
-		ft_ch_audit_body_at(__func__, __LINE__, ft, metadata, FT_EXCL_LOCKED);
+		ft_ch_audit_body_at(__func__, __LINE__, ft, metadata, FT_EXCL_LOCKED,
+			FT_CH_TXN_USE);
 		return -ERANGE;
 	}
 	ft_ch_audit_body_at(__func__, __LINE__, ft, metadata,
-		defer_parent ? FT_EXCL_HIDDEN : FT_EXCL_LOCKED);
+		defer_parent ? FT_EXCL_HIDDEN : FT_EXCL_LOCKED,
+		FT_CH_TXN_USE);
 	if (*ptr)
 		replace_old_ptr = true;
 	rcu_assign_pointer(*ptr, child_node_flag);
@@ -928,16 +938,20 @@ int _ft_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 		struct cds_ft_inode_flag *child_node_flag,
 		bool is_init,
 		bool defer_parent,
-		bool *deferred_count)
+		bool *deferred_count FT_CH_TXN_PARAM)
 {
 	int ret;
 
 	switch (type->type_class) {
 	case FT_POPCOUNT:
-		ret = ft_popcount_node_set_nth(ft, type, node, node_flag, metadata, n, child_node_flag, NULL, is_init, defer_parent, deferred_count);
+		ret = ft_popcount_node_set_nth(ft, type, node, node_flag,
+				metadata, n, child_node_flag, NULL, is_init,
+				defer_parent, deferred_count FT_CH_TXN_FWD);
 		break;
 	case FT_PIGEON:
-		ret = ft_pigeon_node_set_nth(ft, type, node, node_flag, metadata, n, child_node_flag, defer_parent, deferred_count);
+		ret = ft_pigeon_node_set_nth(ft, type, node, node_flag,
+				metadata, n, child_node_flag, defer_parent,
+				deferred_count FT_CH_TXN_FWD);
 		break;
 	case FT_NULL:
 		return -ENOSPC;
@@ -2049,7 +2063,8 @@ int ft_node_recompact(enum ft_recompact mode,
 			else
 			ret = _ft_node_set_nth(ft, new_type, new_node, new_node_flag,
 					new_metadata, v, iter,
-					RECOMPACT_IS_INIT(v), true, NULL);
+					RECOMPACT_IS_INIT(v), true, NULL
+					FT_CH_TXN_NONE);
 			assert(!ret);
 		}
 		break;
@@ -2224,7 +2239,8 @@ int ft_node_recompact(enum ft_recompact mode,
 			else
 			ret = _ft_node_set_nth(ft, new_type, new_node, new_node_flag,
 					new_metadata, i, iter,
-					RECOMPACT_IS_INIT((uint8_t)i), true, NULL);
+					RECOMPACT_IS_INIT((uint8_t)i), true, NULL
+					FT_CH_TXN_NONE);
 			assert(!ret);
 		}
 		break;
@@ -2256,7 +2272,8 @@ skip_copy:
 		else
 		ret = _ft_node_set_nth(ft, new_type, new_node, new_node_flag,
 				new_metadata, n, child_node_flag,
-				RECOMPACT_IS_INIT(n), true, NULL);
+				RECOMPACT_IS_INIT(n), true, NULL
+				FT_CH_TXN_NONE);
 		assert(!ret);
 	}
 
@@ -3216,7 +3233,8 @@ int ft_node_set_nth_rec(struct cds_ft *ft,
 	 * ft_node_recompact, which uses is_init internally.
 	 */
 	ret = _ft_node_set_nth(ft, type, node, *node_flag, metadata, n,
-			child_node_flag, false, cluster_leaf, deferred_count);
+			child_node_flag, false, cluster_leaf, deferred_count
+			FT_CH_TXN_ARG(retire_txn, ctx));
 	switch (ret) {
 	case 0:
 	{

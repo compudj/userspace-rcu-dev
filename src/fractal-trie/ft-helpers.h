@@ -77,10 +77,37 @@ enum ft_word_excl {
 static void ft_ch_audit_head_at(const char *fn, int line,
 		const struct cds_ft *ft, struct cds_ft_node *head,
 		struct cds_ft_inode_flag *owner_flag, enum ft_word_excl excl);
-/* The node-body arm: a live node's own bitmap + child-slot words. */
+struct ft_flip_txn;
+struct ft_lock_ctx;
+/*
+ * The node-body arm: a live node's own bitmap + child-slot words.
+ *
+ * ☞ IT TAKES ALL THREE WITNESSES.  Asking only ft_hold_trace_holds() here read
+ * 3,956,849 "violations" on the refused path -- from the witness that DROPS its
+ * entry the moment a release is recorded (@a5e1b0ce), so a site that acquired
+ * and already recorded its release reads EMPTY.  The registry and the wide ctx
+ * live one frame up in ft_node_set_nth_rec; FT_CH_TXN_PARAM carries them down
+ * so the verdict is a bracket rather than one biased witness.
+ */
 static void ft_ch_audit_body_at(const char *fn, int line,
 		const struct cds_ft *ft, struct cds_ft_metadata *owner,
-		enum ft_word_excl excl);
+		enum ft_word_excl excl, const struct ft_flip_txn *t,
+		const struct ft_lock_ctx *ctx);
+/*
+ * Debug-only pass-through of the op's txn + lock ctx, mirroring
+ * FT_BE_SITE_PARAM: release signatures are untouched, so this costs nothing
+ * outside the audit build.
+ */
+# define FT_CH_TXN_PARAM	, const struct ft_flip_txn *dbg_ch_t,	\
+				const struct ft_lock_ctx *dbg_ch_ctx
+# define FT_CH_TXN_ARG(t, c)	, (t), (c)
+/* Forward an already-received pair (cannot go through FT_CH_TXN_ARG: macro
+ * arguments are split before expansion, so a 2-in-1 token is ONE argument). */
+# define FT_CH_TXN_FWD		, dbg_ch_t, dbg_ch_ctx
+/* No witness to offer: the caller builds a FRESH node (defer_parent), so the
+ * audit buckets it HIDDEN and never asks. */
+# define FT_CH_TXN_NONE		, NULL, NULL
+# define FT_CH_TXN_USE		dbg_ch_t, dbg_ch_ctx
 /* The metadata.parent_word arm (the table's FT-SLOT-3 row); same arrangement. */
 static void ft_ch_audit_parent_at(const char *fn, int line,
 		const struct cds_ft *ft, const struct cds_ft_metadata *child_meta,
@@ -92,9 +119,20 @@ static void ft_ch_audit_parent_at(const char *fn, int line,
 # define ft_ch_audit_head(ft, head, owner)	do { } while (0)
 /* The _at spelling is called directly by ft_set_parent_at, which forwards its
  * caller's location -- so it needs a no-op too, or a non-debug build breaks. */
-# define ft_ch_audit_head_at(fn, line, ft, head, owner, excl) do { } while (0)
-# define ft_ch_audit_parent_at(fn, line, ft, cm, owner, excl) do { } while (0)
-# define ft_ch_audit_body_at(fn, line, ft, owner, excl) do { } while (0)
+/*
+ * ☠ VARIADIC ON PURPOSE.  These take a pass-through pair that expands from ONE
+ * macro token (FT_CH_TXN_USE -> "NULL, NULL"): a function call expands then
+ * splits, but a fixed-arity macro splits BEFORE expanding and reports "requires
+ * 7 arguments, but only 6 given".  Variadic keeps the no-op arity-agnostic.
+ */
+# define ft_ch_audit_head_at(...)	do { } while (0)
+# define ft_ch_audit_parent_at(...)	do { } while (0)
+# define ft_ch_audit_body_at(...)	do { } while (0)
+# define FT_CH_TXN_PARAM
+# define FT_CH_TXN_ARG(t, c)
+# define FT_CH_TXN_FWD
+# define FT_CH_TXN_NONE
+# define FT_CH_TXN_USE		NULL, NULL
 #endif
 
 static inline __attribute__((unused))

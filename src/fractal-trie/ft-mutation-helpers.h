@@ -3703,8 +3703,12 @@ void ft_ch_audit_head_at(const char *fn, int line, const struct cds_ft *ft,
  */
 static
 void ft_ch_audit_body_at(const char *fn, int line, const struct cds_ft *ft,
-		struct cds_ft_metadata *owner, enum ft_word_excl excl)
+		struct cds_ft_metadata *owner, enum ft_word_excl excl,
+		const struct ft_flip_txn *t, const struct ft_lock_ctx *ctx)
 {
+	uintptr_t snap;
+	bool ratified;
+
 	struct ft_ch_site *s = ft_ch_site_of(fn, line, false, FT_CH_W_NODEBODY);
 
 	if (!s || !owner)
@@ -3726,7 +3730,11 @@ void ft_ch_audit_body_at(const char *fn, int line, const struct cds_ft *ft,
 		s->hw_mw++;
 		return;
 	case FT_EXCL_LOCKED:
-		if (ft_hold_trace_holds(owner)) {
+		/* Registry, ledger, wide ctx -- a bracket, not one witness. */
+		if ((t && ft_flip_txn_owns(t, owner)) ||
+				ft_hold_trace_holds(owner) ||
+				(ctx && ft_lock_ctx_holds(ctx, owner, &snap,
+					&ratified))) {
 			s->hw_locked_ok++;
 			return;
 		}
@@ -3752,7 +3760,10 @@ void ft_ch_audit_body_at(const char *fn, int line, const struct cds_ft *ft,
 
 				if (!am)
 					break;
-				if (ft_hold_trace_holds(am)) {
+				if ((t && ft_flip_txn_owns(t, am)) ||
+						ft_hold_trace_holds(am) ||
+						(ctx && ft_lock_ctx_holds(ctx,
+							am, &snap, &ratified))) {
 					s->anchored++;
 					return;
 				}
