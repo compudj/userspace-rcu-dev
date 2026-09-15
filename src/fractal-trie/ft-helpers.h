@@ -2971,6 +2971,23 @@ bool ft_pub_slot_excluded(const struct cds_ft *ft,
 	 *
 	 * ☞ It is also the exact predicate FT_OWNER_ASSERT_OWNED was taught to
 	 * accept, so a true here is checked by the same test that would trap it.
+	 *
+	 * ☠☠ AND IT RESTS ON ft_bulk_gate_enter's GRACE PERIOD, not on the flag.
+	 * @bulk_active is a PLAIN LOAD taken by the POINT OP at its writer-scope
+	 * enter, so a point op that sampled the gate CLEAR skipped the FT-wide
+	 * lock and is NOT excluded against the bulk op -- a mixed regime, and
+	 * holding the lock would prove nothing on its own.  What closes it is
+	 * the gate's own discipline: "publish, one full GP, only THEN mutate",
+	 * whose comment names this exact population.  The GP cannot complete
+	 * while such a point op is still inside its read section, so by the time
+	 * a bulk op publishes anything, pre-flip ops have DRAINED and post-flip
+	 * ops OBSERVE the gate and take the lock.
+	 *
+	 * ⇒ If that update_synchronize_rcu() is ever removed, made conditional,
+	 * or moved after the first mutation, THIS CLAUSE SILENTLY BECOMES
+	 * UNSOUND -- an SW park beside a concurrent point op's MW CAS, with no
+	 * assert to catch it.  The dependency is one-way and cross-file, so it
+	 * is written here rather than left to be re-derived.
 	 */
 	if (ft_wlock_held == (struct cds_ft *) ft)
 		return true;
