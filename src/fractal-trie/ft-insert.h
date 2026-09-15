@@ -65,6 +65,21 @@ struct ft_insert_commit {
 	 * deferred) free must be queued only AFTER the commit -- a free queued
 	 * pre-commit would not cover readers that pick the proxy up later.
 	 *
+	 * ☞ @ctx: the op's lock context, for the BACK-EDGE CLAIM's wide witness
+	 * only (ft_park_live_parent_edge -> FT_BACK_EDGE_CLAIM).  NULL unless
+	 * @actx has actually been ft_lock_ctx_init'd on this path -- it is a
+	 * function-scope local declared UNINITIALISED, so handing &actx over
+	 * unconditionally would walk a garbage held set and answer confidently
+	 * from stack noise.  Set beside each init, nowhere else.
+	 */
+	const struct ft_lock_ctx *ctx;
+	/*
+	 * ☞ WHICH BUILDER deferred @live_child, for the back-edge claim's
+	 * per-producer breakdown.  Zero-initialised with @ic, and zero is the
+	 * undifferentiated row -- an untagged producer is visible as such.
+	 */
+	FT_BE_SRC_FIELD
+	/*
 	 * @free_old_cn_held: the lock-set member the split builder acquired at
 	 * ENTRY for this cn (F2 fence extended to the split-retire family) -- the
 	 * word actually CAS'd plus the clean snapshots of it and of the cn.  The
@@ -192,7 +207,8 @@ void ft_park_live_parent_edge(struct cds_ft *ft,
 		struct cds_ft_inode_flag *child,
 		struct cds_ft_inode_flag *new_parent,
 		struct cds_ft_inode_flag **slot,
-		struct ft_flip_txn *txn)
+		struct ft_flip_txn *txn,
+		const struct ft_lock_ctx *ctx FT_BE_SRC_PARAM)
 {
 	struct cds_ft_metadata *meta = NULL;
 	struct cds_ft_inode_flag **field;
@@ -278,7 +294,7 @@ void ft_park_live_parent_edge(struct cds_ft *ft,
 		urcu_txn_load(ft_flip_txn_handle(txn), (void **) field,
 			FT_FLIP_PROXY_TAG),
 		ft_head_parent_word_slot(new_parent, slot)
-		FT_BE_SITE(FT_BE_PARK_LIVE_PARENT, NULL));
+		FT_BE_SITE(FT_BE_SRC_USE, ctx));
 }
 
 /*
@@ -403,7 +419,8 @@ spliced:;
 	 */
 	if (ic->live_child)
 		ft_park_live_parent_edge(ft, ic->live_child,
-			ic->live_parent, ic->live_slot, ic->txn);
+			ic->live_parent, ic->live_slot, ic->txn,
+			ic->ctx FT_BE_SRC_ARG(ic));
 
 	/*
 	 * Freeze-on-free (doc §4.B): the old compressed/internal node this
@@ -1514,6 +1531,7 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 		ic->live_child = deferred_child;
 		ic->live_parent = deferred_parent;
 		ic->live_slot = deferred_slot;
+		FT_BE_SRC_SET(ic, FT_BE_PARK_SPLIT);
 	}
 #ifdef FEATURE_FT_PROBE_EMPTY_INSERT
 	/* A/B: never wire an empty internal under a live parent (see the note). */
@@ -2250,6 +2268,7 @@ int ft_attach_node(struct cds_ft *ft,
 				(struct cds_ft_inode_flag *) external_nodes;
 			ic->live_parent = iter_node_flag;
 			ic->live_slot = NULL;
+			FT_BE_SRC_SET(ic, FT_BE_PARK_ATTACH);
 		}
 		/* Attach branch (unlink the old node from the trie).
 		 * ft_publish_to_parent handles skip pointer update
@@ -2694,6 +2713,7 @@ int ft_insert_compressed_past_child(struct cds_ft *ft,
 	 * external head's cell->parent / prev).
 	 */
 	ic->live_child = old_child_flag;
+	FT_BE_SRC_SET(ic, FT_BE_PARK_PAST);
 	ic->live_parent = branch;
 	ic->live_slot = NULL;
 	/* &cn->child's plan-snapshot old is the displaced child == ic->live_child. */
@@ -2937,6 +2957,7 @@ int ft_insert_compressed_key_shorter(struct cds_ft *ft,
 	ic->live_child = live_child;
 	ic->live_parent = live_parent;
 	ic->live_slot = live_slot;
+	FT_BE_SRC_SET(ic, FT_BE_PARK_KSHORT);
 	{
 		struct ft_lock_ctx pctx;
 
@@ -3228,6 +3249,7 @@ restart_attempt:
 					d.ppnf, d.pnf, d.nfp, d.nf);
 
 			ft_lock_ctx_init(&actx, &d, ic.txn, ic.op);
+	ic.ctx = &actx;
 			ret = ft_attach_node(ft, d.pnfp, d.pnf,
 					d.nfp, d.nf, key, key_len, d.depth, node,
 					NULL, &ic, &actx);
@@ -3668,6 +3690,7 @@ restart_attempt:
 				d.ppnf, d.pnf, d.nfp, d.nf);
 
 		ft_lock_ctx_init(&actx, &d, ic.txn, ic.op);
+	ic.ctx = &actx;
 		ret = ft_attach_node(ft, d.pnfp, d.pnf,
 				d.nfp, d.nf, key, key_len, d.depth, node,
 				(struct cds_ft_node *) ft_node_ptr(d.nf), &ic,
@@ -4046,6 +4069,7 @@ restart_replace_attempt:
 			dbg_printf("_cds_ft_insert_replace NULL at end of key\n");
 
 			ft_lock_ctx_init(&actx, &d, ic.txn, ic.op);
+	ic.ctx = &actx;
 			ret = ft_attach_node(ft, d.pnfp, d.pnf,
 					d.nfp, d.nf, key, key_len, d.depth, node,
 					NULL, &ic, &actx);
@@ -4724,6 +4748,7 @@ restart_replace_attempt:
 		dbg_printf("_cds_ft_insert_replace: attach before end of key\n");
 
 		ft_lock_ctx_init(&actx, &d, ic.txn, ic.op);
+	ic.ctx = &actx;
 		ret = ft_attach_node(ft, d.pnfp, d.pnf,
 				d.nfp, d.nf, key, key_len, d.depth, node,
 				(struct cds_ft_node *) ft_node_ptr(d.nf), &ic,
