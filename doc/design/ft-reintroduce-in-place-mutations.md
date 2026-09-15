@@ -188,6 +188,44 @@ returns -EAGAIN and the op waits on itself forever). So it is its own step, with
 its own validation, and the dedupe question (does the op already hold this word
 via a lock-set member or an anchor?) must be answered BEFORE adding the acquire.
 
+## 4c. THE HOIST IS A MOVE, NOT AN ADDITION — feasibility settled
+
+§4b's "the op holds the node by NO witness" is true *at the reserve* and must not
+be read as "the op never holds it". At `:2266` the op ALREADY acquires
+`iter_dest_node_flag` — the same word, the same op, guarded by
+`if (iter_dest_node_flag == attach_node_flag)`, i.e. exactly the in-place case.
+So hoisting acquires `attach_node_flag` at `:2187` **instead of** at `:2266`; it
+relocates an existing acquire rather than introducing one. The window in which
+the op holds that lock grows by the work between the two points — a CONTENTION
+cost, not a correctness one.
+
+**The self-collision livelock is already prevented, provided registration is
+visible.** `ft_flip_txn_lock_or_guard_parent` acquires through
+`ft_acquire_member` with `lctx.held = { .txn = t, .extra, .glue }`, and
+`ft_dlm_acquire_set`'s contract is explicit: when the op already holds the word
+the member comes back SHARED and "owes NO release and NO terminal — the acquire
+that first took it recorded both". So the later call at `:2266` dedupes instead
+of self-colliding **iff** the hoisted acquire is registered where that lookup
+looks: `ic->txn` (via `ft_flip_txn_lock_register`) or the ctx's extras. The
+historic hang (2 of 8 producers) is the failure mode of registering it
+somewhere else, not of taking it earlier.
+
+Implementation sketch, in order:
+1. Acquire `attach_node_flag` before the reserve and register it in `ic->txn`.
+   Registering before the ARM is legal — the arm's contract is "after the op's
+   LAST ft_flip_txn_lock_register", so earlier is fine.
+2. `:2266`'s `lock_or_guard` then takes the SHARED exit and only plants its
+   guard, which is the no-op ordering (guard after a release on one word reads
+   that record's pending clean value and validates `{s -> s}`).
+3. On the RELOCATION path the hoisted lock sits on a node the op then retires —
+   the existing F2 retire-fence shape (`@free_old_cn_held`), not a new one.
+4. `-EAGAIN` (a peer holds it) must unwind the partially built cluster via the
+   existing `goto check_error`.
+
+☐ Still to validate: the contention cost of the widened hold window, and that
+every path between `:2187` and `:2266` tolerates the lock being held (nothing
+there may take it again outside the dedupe, and nothing may release it early).
+
 ## 5. Open items to validate (do not assume)
 
 - Forcing recompact on the dst attach parent perturbs the fold only for readers
