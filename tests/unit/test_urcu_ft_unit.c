@@ -12126,13 +12126,51 @@ static int test_rekey_same_path_atomic_or_refused(void)
 			"compiled out (-DNO_FEATURE_FT_MERGE)");
 		return 0;
 	}
+	/*
+	 * ☠ THE CHILD INHERITS THE PARENT'S READER REGISTRY, AND ITS call_rcu
+	 * WORKER IS A REGISTERED QSBR READER.  fork() duplicates only the
+	 * calling thread, so a worker that was running callbacks at the instant
+	 * of the fork is frozen ONLINE in the child's copy of the registry and
+	 * no thread ever advances it -- the child's first grace period then
+	 * waits for a phantom, forever.  The child does not have to ASK for one:
+	 * ft_writer_lock_gp_wait() calls update_synchronize_rcu() from inside
+	 * the library, so any move the child makes can reach it.
+	 *
+	 * call_rcu_before_fork() parks every worker UNREGISTERED and waits for
+	 * the acknowledgement; after_fork_child() re-creates the child's own
+	 * worker so its deferred frees run too.  ft_inv's one forking oracle has
+	 * carried this since it measured the same hang.
+	 *
+	 * ☠☠ AND THE CALLER MUST BE OFFLINE FIRST (QSBR).
+	 * call_rcu_before_fork() sets PAUSE and then SPINS in poll() until every
+	 * worker acknowledges -- but the worker tests PAUSE at the TOP of its
+	 * loop, so one already inside synchronize_rcu() must finish that grace
+	 * period first.  A QSBR grace period waits for every ONLINE reader to
+	 * quiesce, and this thread -- registered, online, spinning in poll() --
+	 * is exactly such a reader.  Worker waits for us, we wait for the
+	 * worker.  It is not a corner case either: you fork after doing trie
+	 * work, which is precisely when callbacks are pending and a worker is
+	 * mid-GP.  Go offline across the whole fork, and back online after.
+	 *
+	 * MEASURED HERE, 44 concurrent copies of this row, release build:
+	 * 44/44 "child killed by signal 14 (HANG)" WITHOUT these calls.
+	 */
+	rcu_thread_offline();
+	call_rcu_before_fork();
 	pid = fork();
 	if (pid < 0) {
+		call_rcu_after_fork_parent();
+		rcu_thread_online();
 		fprintf(stderr, "same_path: fork failed\n");
 		return -1;
 	}
-	if (pid == 0)
+	if (pid == 0) {
+		call_rcu_after_fork_child();
+		rcu_thread_online();
 		same_path_child();
+	}
+	call_rcu_after_fork_parent();
+	rcu_thread_online();
 	if (waitpid(pid, &status, 0) != pid) {
 		fprintf(stderr, "same_path: waitpid failed\n");
 		return -1;
@@ -28920,12 +28958,19 @@ static int excl_neg_expect_sigabrt(void (*child_fn)(void))
 	pid_t pid;
 	int status;
 
+	/* Same fork discipline as the other two sites; see same_path's note. */
+	rcu_thread_offline();
+	call_rcu_before_fork();
 	pid = fork();
 	if (pid < 0) {
+		call_rcu_after_fork_parent();
+		rcu_thread_online();
 		fprintf(stderr, "excl_neg: fork failed\n");
 		return -1;
 	}
 	if (pid == 0) {
+		call_rcu_after_fork_child();
+		rcu_thread_online();
 		/*
 		 * The abort below is the PASS condition, so its core dump is
 		 * not evidence -- it is 4 GB of tmpfs (and the time to write
@@ -28941,6 +28986,8 @@ static int excl_neg_expect_sigabrt(void (*child_fn)(void))
 		child_fn();
 		_exit(42);	/* unreachable */
 	}
+	call_rcu_after_fork_parent();
+	rcu_thread_online();
 	if (waitpid(pid, &status, 0) != pid) {
 		fprintf(stderr, "excl_neg: waitpid failed\n");
 		return -1;
@@ -29034,16 +29081,25 @@ static int test_insert_replace_tombstones_displaced_chain(void)
 	pid_t pid;
 	int status;
 
+	/* Same fork discipline as the other two sites; see same_path's note. */
+	rcu_thread_offline();
+	call_rcu_before_fork();
 	pid = fork();
 	if (pid < 0) {
+		call_rcu_after_fork_parent();
+		rcu_thread_online();
 		fprintf(stderr, "insert_replace ghost: fork failed\n");
 		return -1;
 	}
 	if (pid == 0) {
+		call_rcu_after_fork_child();
+		rcu_thread_online();
 		alarm(30);		/* a regression spins forever */
 		insert_replace_ghost_child();
 		_exit(5);		/* unreachable */
 	}
+	call_rcu_after_fork_parent();
+	rcu_thread_online();
 	if (waitpid(pid, &status, 0) != pid) {
 		fprintf(stderr, "insert_replace ghost: waitpid failed\n");
 		return -1;
