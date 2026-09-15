@@ -17049,7 +17049,7 @@ void ft_glue_record_splices(struct cds_ft *ft, struct ft_glue *g,
 			if (ft->exclusive)
 				uatomic_inc(&ft_ss_store_excl);
 #endif
-			ret = ft_hlist_store_sw(h, (void **) &src_head->prev,
+			ret = ft_hlist_store_sw(ft, h, (void **) &src_head->prev,
 					prev_old, (void *) tail, FT_HLIST_PREV_TAG);
 			/*
 			 * Reserved up front (two edges per splice), so this cannot
@@ -17061,7 +17061,7 @@ void ft_glue_record_splices(struct cds_ft *ft, struct ft_glue *g,
 			(void) ret;
 		}
 		ft_ch_audit(ft, txn, tail);
-		ft_hlist_append_run_prepare(ft_flip_txn_handle(txn), tail, src_head);
+		ft_hlist_append_run_prepare(ft, ft_flip_txn_handle(txn), tail, src_head);
 	}
 }
 

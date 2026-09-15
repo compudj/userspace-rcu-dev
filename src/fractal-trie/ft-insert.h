@@ -2556,7 +2556,7 @@ int ft_chain_node(struct cds_ft *ft, struct cds_ft_node *last_node,
 	if (!t)
 		return -ENOMEM;
 	ft_ch_audit(ft, t, last_node);
-	if (ft_hlist_insert_after_prepare(ft_flip_txn_handle(t), node,
+	if (ft_hlist_insert_after_prepare(ft, ft_flip_txn_handle(t), node,
 			last_node)) {
 		ft_flip_txn_destroy(t);
 		return -EAGAIN;
@@ -4220,8 +4220,7 @@ restart_replace_attempt:
 					 */
 					if (displaced) {
 						ft_ch_audit(ft, txn, displaced);
-						ft_hlist_freeze_chain_prepare(
-							ft_flip_txn_handle(txn),
+						ft_hlist_freeze_chain_prepare(ft, ft_flip_txn_handle(txn),
 							displaced, nr_disp);
 					}
 					if (ft_ord_cell_swap_publish_multi(ft, old_cell,
@@ -4342,8 +4341,7 @@ restart_replace_attempt:
 					 */
 					if (displaced) {
 						ft_ch_audit(ft, txn, displaced);
-						ft_hlist_freeze_chain_prepare(
-							ft_flip_txn_handle(txn),
+						ft_hlist_freeze_chain_prepare(ft, ft_flip_txn_handle(txn),
 							displaced, nr_disp);
 					}
 					ret = ft_flip_status_to_errno(
@@ -4592,8 +4590,7 @@ restart_replace_attempt:
 					 */
 					if (displaced) {
 						ft_ch_audit(ft, txn, displaced);
-						ft_hlist_freeze_chain_prepare(
-							ft_flip_txn_handle(txn),
+						ft_hlist_freeze_chain_prepare(ft, ft_flip_txn_handle(txn),
 							displaced, nr_disp);
 					}
 					if (ft_ord_cell_swap_publish_multi(ft, old_cell,
@@ -4706,8 +4703,7 @@ restart_replace_attempt:
 					 */
 					if (displaced) {
 						ft_ch_audit(ft, txn, displaced);
-						ft_hlist_freeze_chain_prepare(
-							ft_flip_txn_handle(txn),
+						ft_hlist_freeze_chain_prepare(ft, ft_flip_txn_handle(txn),
 							displaced, nr_disp);
 					}
 					if (ft_ord_cell_flip_into(ft, txn, sedges,
@@ -5401,7 +5397,7 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 				return ft_replace_exit(&hm, s);
 			}
 			ft_ch_audit(ft, txn, old_node);
-			(void) ft_hlist_replace_prepare(ft_flip_txn_handle(txn),
+			(void) ft_hlist_replace_prepare(ft, ft_flip_txn_handle(txn),
 				old_node, new_node);
 			FT_DBG_HELD_AT(hm);
 			cst = ft_flip_txn_commit(ft, txn);
@@ -5547,7 +5543,7 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 			 * above carries the extra edge.
 			 */
 			ft_ch_audit(ft, txn, old_node);
-			ft_hlist_freeze_prepare(ft_flip_txn_handle(txn), old_node);
+			ft_hlist_freeze_prepare(ft, ft_flip_txn_handle(txn), old_node);
 			ft_replace_fault_arm_abort(txn);
 			r = ft_ord_cell_swap_publish_multi(ft, old_cell, new_cell,
 				sedges, n_s, txn);
@@ -5675,7 +5671,7 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 			n_s = ft_pub_rec_sedges(&rec, sedges);
 			/* Fuse @old_node's freeze into the structural publish (doc §4.B). */
 			ft_ch_audit(ft, txn, old_node);
-			ft_hlist_freeze_prepare(ft_flip_txn_handle(txn), old_node);
+			ft_hlist_freeze_prepare(ft, ft_flip_txn_handle(txn), old_node);
 			ft_replace_fault_arm_abort(txn);
 			if (caa_unlikely(ft_ord_cell_flip_into(ft, txn, sedges, n_s)
 					!= URCU_TXN_STATUS_OK)) {

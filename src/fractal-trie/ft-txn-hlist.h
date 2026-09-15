@@ -142,6 +142,30 @@
  * well before it).  Declare the coarse arm so ft_hlist_store_mw_at can report;
  * one TU, so the later definition resolves it.
  */
+static inline
+int ft_hlist_store_sw_at(const char *fn, int line, const struct cds_ft *ft,
+		struct urcu_txn *txn, void **slot, void *old_ptr, void *new_ptr,
+		uintptr_t tag);
+
+/*
+ * Did the coarse dispatch above actually FIRE?  A green run in which it never
+ * ran is indistinguishable from one where it is wrong, so count both sides.
+ */
+#ifdef FT_DEBUG_DUAL_SITE
+unsigned long ft_hlist_coarse[2];
+static void ft_hlist_coarse_report(void) __attribute__((destructor));
+static void ft_hlist_coarse_report(void)
+{
+	fprintf(stderr, "FT HLIST KIND coarse_sw=%lu fine_mw=%lu\n",
+		uatomic_read(&ft_hlist_coarse[1]),
+		uatomic_read(&ft_hlist_coarse[0]));
+}
+# define FT_HLIST_COARSE_TALLY(c)	uatomic_inc(&ft_hlist_coarse[(c)])
+#else
+# define FT_HLIST_COARSE_TALLY(c)	do { (void) (c); } while (0)
+#endif
+
+
 #ifdef FT_DEBUG_CHAIN_HOLD
 static inline void ft_ch_audit_coarse_at(const char *fn, int line);
 # define FT_CH_COARSE(fn, line)	ft_ch_audit_coarse_at((fn), (line))
@@ -150,9 +174,29 @@ static inline void ft_ch_audit_coarse_at(const char *fn, int line);
 #endif
 
 static inline
-int ft_hlist_store_mw_at(const char *fn, int line, struct urcu_txn *txn,
+int ft_hlist_store_mw_at(const char *fn, int line, const struct cds_ft *ft,
+		struct urcu_txn *txn,
 		void **slot, void *old_ptr, void *new_ptr, uintptr_t tag)
 {
+	/*
+	 * ☞ COARSE RECORDS SW, WHATEVER THE WORD IS.  A coarse trie takes the
+	 * FT-wide @writer_lock at its outermost writer scope, so every writer of
+	 * every chain and cell word is serialised behind one mutex -- there is
+	 * no peer CAS for an SW park to race.  That is true even of the ORDINAL
+	 * CELL list (ft_ord_cell.lnode), which is [DESIGN] MW under FINE because
+	 * a splice rewrites NEIGHBOURING keys' cells whose holders the op never
+	 * acquires: coarse does not need those holders, it excludes everyone.
+	 *
+	 * Under FINE nothing changes here.  The cell list stays MW by design and
+	 * the duplicate chain stays MW until it migrates under the nearest
+	 * ancestor lock -- this dispatch settles only the COARSE half.
+	 */
+	if (ft && !ft->lock_fine) {
+		FT_HLIST_COARSE_TALLY(1);
+		return ft_hlist_store_sw_at(fn, line, ft, txn, slot,
+			old_ptr, new_ptr, tag);
+	}
+	FT_HLIST_COARSE_TALLY(0);
 	/*
 	 * ☠ THE KIND COUNTER SAYS "CELL" AND THIS IS NOT A CELL.  Every store
 	 * below writes a DUPLICATE-CHAIN word (cds_ft_node.next/.prev), which is
@@ -174,8 +218,8 @@ int ft_hlist_store_mw_at(const char *fn, int line, struct urcu_txn *txn,
 	return urcu_txn_store_mw(txn, slot, old_ptr, new_ptr, tag);
 }
 
-#define ft_hlist_store_mw(txn, slot, old_ptr, new_ptr, tag)		\
-	ft_hlist_store_mw_at(__func__, __LINE__, (txn), (slot),		\
+#define ft_hlist_store_mw(ft, txn, slot, old_ptr, new_ptr, tag)		\
+	ft_hlist_store_mw_at(__func__, __LINE__, (ft), (txn), (slot),	\
 		(old_ptr), (new_ptr), (tag))
 
 /*
@@ -198,7 +242,8 @@ int ft_hlist_store_mw_at(const char *fn, int line, struct urcu_txn *txn,
  * is exactly the SW-park-races-an-MW-CAS the rule above forbids.
  */
 static inline
-int ft_hlist_store_sw_at(const char *fn, int line, struct urcu_txn *txn,
+int ft_hlist_store_sw_at(const char *fn, int line, const struct cds_ft *ft,
+		struct urcu_txn *txn,
 		void **slot, void *old_ptr, void *new_ptr, uintptr_t tag)
 {
 	FT_TK_COUNT_CELL_SW();
@@ -207,8 +252,8 @@ int ft_hlist_store_sw_at(const char *fn, int line, struct urcu_txn *txn,
 	return urcu_txn_store_sw(txn, slot, old_ptr, new_ptr, tag);
 }
 
-#define ft_hlist_store_sw(txn, slot, old_ptr, new_ptr, tag)		\
-	ft_hlist_store_sw_at(__func__, __LINE__, (txn), (slot),		\
+#define ft_hlist_store_sw(ft, txn, slot, old_ptr, new_ptr, tag)		\
+	ft_hlist_store_sw_at(__func__, __LINE__, (ft), (txn), (slot),	\
 		(old_ptr), (new_ptr), (tag))
 
 static inline
@@ -308,7 +353,7 @@ static void ft_mark_refuse_report(void)
  * retired head; the int return was retained for exactly this.
  */
 static inline
-int ft_hlist_insert_after_prepare(struct urcu_txn *txn,
+int ft_hlist_insert_after_prepare(const struct cds_ft *ft, struct urcu_txn *txn,
 		struct cds_ft_node *newp,
 		struct cds_ft_node *pos)
 {
@@ -350,9 +395,9 @@ int ft_hlist_insert_after_prepare(struct urcu_txn *txn,
 	newp->prev = pos;
 
 	/* pos->next: succ -> newp ; succ->prev: pos -> newp. */
-	ft_hlist_store_mw(txn, (void **) &pos->next, succ, newp, FT_HLIST_TAG);
+	ft_hlist_store_mw(ft, txn, (void **) &pos->next, succ, newp, FT_HLIST_TAG);
 	if (succ != NULL)
-		ft_hlist_store_mw(txn, (void **) &succ->prev, pos, newp, FT_HLIST_PREV_TAG);
+		ft_hlist_store_mw(ft, txn, (void **) &succ->prev, pos, newp, FT_HLIST_PREV_TAG);
 	return 0;
 }
 
@@ -384,13 +429,13 @@ int ft_hlist_insert_after_prepare(struct urcu_txn *txn,
  * per splice.
  */
 static inline
-void ft_hlist_append_run_prepare(struct urcu_txn *txn,
+void ft_hlist_append_run_prepare(const struct cds_ft *ft, struct urcu_txn *txn,
 		struct cds_ft_node *tail,
 		struct cds_ft_node *run_head)
 {
 	int ret;
 
-	ret = ft_hlist_store_mw(txn, (void **) &tail->next, NULL, run_head,
+	ret = ft_hlist_store_mw(ft, txn, (void **) &tail->next, NULL, run_head,
 			FT_HLIST_TAG);
 	assert(!ret);			/* caller reserved the edge up front */
 	(void) ret;
@@ -417,7 +462,7 @@ void ft_hlist_append_run_prepare(struct urcu_txn *txn,
  * 0, or -ENOENT when @elem is already logically deleted.
  */
 static inline
-int ft_hlist_del_prepare(struct urcu_txn *txn, struct cds_ft_node *elem)
+int ft_hlist_del_prepare(const struct cds_ft *ft, struct urcu_txn *txn, struct cds_ft_node *elem)
 {
 	struct cds_ft_node *next = (struct cds_ft_node *)
 			urcu_txn_load(txn, (void **) &elem->next, FT_HLIST_TAG);
@@ -454,11 +499,11 @@ int ft_hlist_del_prepare(struct urcu_txn *txn, struct cds_ft_node *elem)
 	 * head ops fold it (ft_hlist_freeze_prepare) for atomicity with the
 	 * structural anchor edge.
 	 */
-	ft_hlist_store_mw(txn, (void **) &elem->next, next,
+	ft_hlist_store_mw(ft, txn, (void **) &elem->next, next,
 			ft_hlist_set_mark(next), FT_HLIST_TAG);
-	ft_hlist_store_mw(txn, (void **) &pred->next, elem, next, FT_HLIST_TAG);
+	ft_hlist_store_mw(ft, txn, (void **) &pred->next, elem, next, FT_HLIST_TAG);
 	if (next != NULL)
-		ft_hlist_store_mw(txn, (void **) &next->prev, elem, pred, FT_HLIST_PREV_TAG);
+		ft_hlist_store_mw(ft, txn, (void **) &next->prev, elem, pred, FT_HLIST_PREV_TAG);
 	return 0;
 }
 
@@ -476,7 +521,7 @@ int ft_hlist_del_prepare(struct urcu_txn *txn, struct cds_ft_node *elem)
  * retained for caller-shape parity).
  */
 static inline
-int ft_hlist_replace_prepare(struct urcu_txn *txn,
+int ft_hlist_replace_prepare(const struct cds_ft *ft, struct urcu_txn *txn,
 		struct cds_ft_node *old, struct cds_ft_node *newp)
 {
 	struct cds_ft_node *next = (struct cds_ft_node *)
@@ -488,11 +533,11 @@ int ft_hlist_replace_prepare(struct urcu_txn *txn,
 	newp->next = next;
 	newp->prev = pred;
 
-	ft_hlist_store_mw(txn, (void **) &old->next, next,
+	ft_hlist_store_mw(ft, txn, (void **) &old->next, next,
 			ft_hlist_set_mark(next), FT_HLIST_TAG);
-	ft_hlist_store_mw(txn, (void **) &pred->next, old, newp, FT_HLIST_TAG);
+	ft_hlist_store_mw(ft, txn, (void **) &pred->next, old, newp, FT_HLIST_TAG);
 	if (next != NULL)
-		ft_hlist_store_mw(txn, (void **) &next->prev, old, newp, FT_HLIST_PREV_TAG);
+		ft_hlist_store_mw(ft, txn, (void **) &next->prev, old, newp, FT_HLIST_PREV_TAG);
 	return 0;
 }
 
@@ -510,12 +555,12 @@ int ft_hlist_replace_prepare(struct urcu_txn *txn,
  * FT_HLIST_FREEZE_MAX_EDGES on top of the host op's footprint.
  */
 static inline
-void ft_hlist_freeze_prepare(struct urcu_txn *txn, struct cds_ft_node *node)
+void ft_hlist_freeze_prepare(const struct cds_ft *ft, struct urcu_txn *txn, struct cds_ft_node *node)
 {
 	void *en = urcu_txn_load(txn, (void **) &node->next, FT_HLIST_TAG);
 	int ret;
 
-	ret = ft_hlist_store_mw(txn, (void **) &node->next, en,
+	ret = ft_hlist_store_mw(ft, txn, (void **) &node->next, en,
 			ft_hlist_set_mark((struct cds_ft_node *) en), FT_HLIST_TAG);
 	assert(!ret);			/* caller reserved the edge up front */
 	(void) ret;
@@ -538,11 +583,11 @@ void ft_hlist_freeze_prepare(struct urcu_txn *txn, struct cds_ft_node *node)
  * the successor and PROMOTES it.
  */
 static inline
-void ft_hlist_freeze_sole_prepare(struct urcu_txn *txn, struct cds_ft_node *node)
+void ft_hlist_freeze_sole_prepare(const struct cds_ft *ft, struct urcu_txn *txn, struct cds_ft_node *node)
 {
 	int ret;
 
-	ret = ft_hlist_store_mw(txn, (void **) &node->next, NULL,
+	ret = ft_hlist_store_mw(ft, txn, (void **) &node->next, NULL,
 			ft_hlist_set_mark(NULL), FT_HLIST_TAG);
 	assert(!ret);			/* caller reserved the edge up front */
 	(void) ret;
@@ -602,7 +647,7 @@ unsigned int ft_hlist_chain_len(struct cds_ft_node *head)
  * walk off by FT_HLIST_MARK into nothing.  Such a member owes no second mark.
  */
 static inline
-void ft_hlist_freeze_chain_prepare(struct urcu_txn *txn,
+void ft_hlist_freeze_chain_prepare(const struct cds_ft *ft, struct urcu_txn *txn,
 		struct cds_ft_node *head, unsigned int len)
 {
 	unsigned int i;
@@ -627,7 +672,7 @@ void ft_hlist_freeze_chain_prepare(struct urcu_txn *txn,
 			next = ft_hlist_unmark(succ);
 		}
 		if (!((uintptr_t) succ & FT_HLIST_MARK)) {
-			ret = ft_hlist_store_mw(txn, (void **) &head->next,
+			ret = ft_hlist_store_mw(ft, txn, (void **) &head->next,
 					succ, ft_hlist_set_mark(succ),
 					FT_HLIST_TAG);
 			assert(!ret);	/* caller reserved one edge per node */

@@ -2324,7 +2324,7 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		 */
 		if (freeze_leaf) {
 			ft_ch_audit_ctx(ft, txn, ctx, freeze_leaf);
-			ft_hlist_freeze_chain_prepare(ft_flip_txn_handle(txn),
+			ft_hlist_freeze_chain_prepare(ft, ft_flip_txn_handle(txn),
 				freeze_leaf, freeze_len);
 		}
 		/*
@@ -3627,8 +3627,7 @@ int ft_detach_node(struct cds_ft *ft,
 			 */
 			if (freeze_leaf) {
 				ft_ch_audit_ctx(ft, orphan_txn, &lctx, freeze_leaf);
-				ft_hlist_freeze_chain_prepare(
-					ft_flip_txn_handle(orphan_txn),
+				ft_hlist_freeze_chain_prepare(ft, ft_flip_txn_handle(orphan_txn),
 					freeze_leaf, freeze_len);
 				freeze_leaf_fused = true;
 			}
@@ -4632,8 +4631,7 @@ int ft_detach_node(struct cds_ft *ft,
 			 */
 			if (!boundary_fused && freeze_leaf && pub && commit_txn) {
 				ft_ch_audit_ctx(ft, commit_txn, &lctx, freeze_leaf);
-				ft_hlist_freeze_chain_prepare(
-					ft_flip_txn_handle(commit_txn),
+				ft_hlist_freeze_chain_prepare(ft, ft_flip_txn_handle(commit_txn),
 					freeze_leaf, freeze_len);
 				freeze_leaf_fused = true;
 			}
@@ -5693,7 +5691,7 @@ int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		 * carries the extra edge.
 		 */
 		ft_ch_audit(ft, txn, node);
-		ft_hlist_freeze_prepare(ft_flip_txn_handle(txn), node);
+		ft_hlist_freeze_prepare(ft, ft_flip_txn_handle(txn), node);
 		if (ft_ord_cell_swap_publish_multi(ft, old_cell, new_cell,
 				sedges, n_s, txn)) {
 			/*
@@ -5805,7 +5803,7 @@ int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		n_s = ft_pub_rec_sedges(&rec, sedges);
 		/* Fuse @node's freeze into the structural publish (doc §4.B). */
 		ft_ch_audit(ft, txn, node);
-		ft_hlist_freeze_prepare(ft_flip_txn_handle(txn), node);
+		ft_hlist_freeze_prepare(ft, ft_flip_txn_handle(txn), node);
 		int cret = ft_flip_status_to_errno(
 			ft_ord_cell_flip_into(ft, txn, sedges, n_s));
 
@@ -6105,7 +6103,7 @@ int ft_unchain_node(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 			return -ENOMEM;
 		}
 		ft_ch_audit(ft, txn, node);
-		if (ft_hlist_del_prepare(ft_flip_txn_handle(txn), node)) {
+		if (ft_hlist_del_prepare(ft, ft_flip_txn_handle(txn), node)) {
 			/*
 			 * Peer conflict observed at prepare time (@node or a
 			 * neighbour mid-deletion): nothing was installed
@@ -6270,7 +6268,7 @@ int ft_unchain_node(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		 */
 		ft_flip_txn_arm_per_op(ft, txn);
 		ft_ch_audit(ft, txn, node);
-		ft_hlist_freeze_prepare(ft_flip_txn_handle(txn), node);
+		ft_hlist_freeze_prepare(ft, ft_flip_txn_handle(txn), node);
 		int cret = ft_flip_status_to_errno(
 			ft_ord_cell_flip_into(ft, txn, sedges, n_s));
 
@@ -8100,7 +8098,7 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 			 * which is why it is the cure rather than widening the
 			 * acquire.
 			 */
-			ft_hlist_freeze_chain_prepare(ft_flip_txn_handle(txn),
+			ft_hlist_freeze_chain_prepare(ft, ft_flip_txn_handle(txn),
 				external_nodes, nr_frozen);
 			/*
 			 * Same rule as the prefix clear below: the pre-reserved
@@ -8150,7 +8148,7 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 				*result_node = NULL;
 				return CDS_FT_STATUS_MEMORY_ERROR;
 			}
-			ft_hlist_freeze_chain_prepare(ft_flip_txn_handle(txn),
+			ft_hlist_freeze_chain_prepare(ft, ft_flip_txn_handle(txn),
 				external_nodes, nr_frozen);
 			if (ft_remove_one_commit(ft,
 					(struct cds_ft_inode_flag **) &metadata->external_nodes,
@@ -8468,8 +8466,7 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 				 * tears the derived tail's NULL and aborts this
 				 * commit, leaving the key in place for the retry.
 				 */
-				ft_hlist_freeze_chain_prepare(
-					ft_flip_txn_handle(txn), chain_head,
+				ft_hlist_freeze_chain_prepare(ft, ft_flip_txn_handle(txn), chain_head,
 					nr_frozen);
 				/*
 				 * The commit's status is the ANSWER, not a
