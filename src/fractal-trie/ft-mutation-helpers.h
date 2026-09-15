@@ -3254,7 +3254,15 @@ struct ft_ch_site {
 	unsigned long total, wlock, held, led, unheld, nolocks, noholder,
 		coarse_mode, aborting, some, ctxheld,
 		ctx_txn, ctx_extra, ctx_glue, ctx_outer,
-		wlock_pernode, wlock_bare, anchored, headword;
+		wlock_pernode, wlock_bare, anchored, headword,
+		/*
+		 * The head parent-word class, split by the regime the CALLER
+		 * DECLARED (enum ft_word_excl).  @headword stays the UNDECLARED
+		 * bucket -- the remaining work.  A declaration is not believed:
+		 * LOCKED is put through the witness ladder, and hw_locked_viol
+		 * is the code saying it holds the owner where it does not.
+		 */
+		hw_hidden, hw_mw, hw_locked_ok, hw_locked_viol;
 };
 
 extern struct ft_ch_site ft_ch_sites[FT_CH_SITE_MAX];
@@ -3288,7 +3296,8 @@ struct ft_ch_site *ft_ch_site_of(const char *fn, int line, bool coarse)
 static inline
 void ft_ch_audit_owner_at(const char *fn, int line, const struct cds_ft *ft,
 		const struct ft_flip_txn *t, const struct ft_lock_ctx *ctx,
-		struct cds_ft_node *node, struct cds_ft_inode_flag *owner_flag)
+		struct cds_ft_node *node, struct cds_ft_inode_flag *owner_flag,
+		enum ft_word_excl excl)
 {
 	struct ft_ch_site *s = ft_ch_site_of(fn, line, false);
 	struct cds_ft_inode_flag *h;
@@ -3416,8 +3425,55 @@ void ft_ch_audit_owner_at(const char *fn, int line, const struct cds_ft *ft,
 	 * cell).  That is the next step for this word class.
 	 */
 	if (owner_flag) {
-		s->headword++;
-		return;
+		struct cds_ft_metadata *om;
+		uintptr_t snap;
+		bool ratified;
+
+		switch (excl) {
+		case FT_EXCL_HIDDEN:
+			/*
+			 * Declared build-invisible: unreachable by any reader
+			 * or peer, so there is nothing to exclude and no
+			 * witness to ask.  Counted so the class's shape stays
+			 * visible, never scored.
+			 */
+			s->hw_hidden++;
+			return;
+		case FT_EXCL_MW_CAS:
+			/*
+			 * Declared engine-arbitrated.  ft_set_parent is a BARE
+			 * rcu_assign_pointer, not a record -- so this
+			 * declaration is a category error HERE and is kept
+			 * separate rather than silently accepted.
+			 */
+			s->hw_mw++;
+			return;
+		case FT_EXCL_LOCKED:
+			/*
+			 * ☞ THE DECLARATION IS NOT BELIEVED.  Ask whether the
+			 * op holds the node it is installing the head INTO.
+			 * The OLD parent cannot be asked: deriving it walks the
+			 * very word in flight (circular), and reading it is not
+			 * atomic with the bare store.  So this is the NEW
+			 * parent's ownership -- a real question, and the same
+			 * one ft_flip_txn_lock_or_guard_parent answers for the
+			 * forward publish -- NOT a proof that the re-parent as
+			 * a whole is excluded.  Labelled as what it measures.
+			 */
+			om = ft_flag_to_metadata(ft, owner_flag);
+			if ((t && ft_flip_txn_owns(t, om)) ||
+					ft_hold_trace_holds(om) ||
+					(ctx && ft_lock_ctx_holds(ctx, om,
+						&snap, &ratified)))
+				s->hw_locked_ok++;
+			else
+				s->hw_locked_viol++;
+			return;
+		case FT_EXCL_UNDECLARED:
+		default:
+			s->headword++;
+			return;
+		}
 	}
 	h = ft_chain_head_holder((struct cds_ft *) ft, node);
 	if (!h) {
@@ -3570,7 +3626,8 @@ void ft_ch_audit_ctx_at(const char *fn, int line, const struct cds_ft *ft,
 		const struct ft_flip_txn *t, const struct ft_lock_ctx *ctx,
 		struct cds_ft_node *node)
 {
-	ft_ch_audit_owner_at(fn, line, ft, t, ctx, node, NULL);
+	ft_ch_audit_owner_at(fn, line, ft, t, ctx, node, NULL,
+		FT_EXCL_UNDECLARED);
 }
 
 #define ft_ch_audit(ft, t, node)					\
@@ -3585,9 +3642,10 @@ void ft_ch_audit_ctx_at(const char *fn, int line, const struct cds_ft *ft,
  */
 static
 void ft_ch_audit_head_at(const char *fn, int line, const struct cds_ft *ft,
-		struct cds_ft_node *head, struct cds_ft_inode_flag *owner_flag)
+		struct cds_ft_node *head, struct cds_ft_inode_flag *owner_flag,
+		enum ft_word_excl excl)
 {
-	ft_ch_audit_owner_at(fn, line, ft, NULL, NULL, head, owner_flag);
+	ft_ch_audit_owner_at(fn, line, ft, NULL, NULL, head, owner_flag, excl);
 }
 #define ft_ch_audit_ctx(ft, t, ctx, node)				\
 	ft_ch_audit_ctx_at(__func__, __LINE__, (ft), (t), (ctx), (node))
@@ -3610,10 +3668,11 @@ static void ft_ch_audit_report(void)
 		"OFF -- EVERY ROW BELOW IS A WRONG ZERO, NOT A MEASUREMENT "
 		"(rebuild with -DFEATURE_FT_HOLD_TRACE)");
 #endif
-	fprintf(stderr, "%-34s %6s %10s %9s %8s %8s %8s %8s %8s %7s %8s %8s %8s %6s %7s\n",
+	fprintf(stderr, "%-34s %6s %10s %9s %8s %8s %8s %8s %8s %7s %8s %8s %8s %6s %7s %8s %7s %7s %8s\n",
 		"site (fn:line)", "kind", "total", "WLOCK", "HELD(reg)",
 		"HELD(led)", "HELD(ctx)", "anchored", "UNHELD", "nolocks",
-		"noholder", "coarseFT", "aborting", "SOME", "headwd");
+		"noholder", "coarseFT", "aborting", "SOME", "UNDECL",
+		"hidden", "mwCAS", "lockOK", "lockVIOL");
 	for (i = 0; i < ft_ch_site_n; i++) {
 		struct ft_ch_site *s = &ft_ch_sites[i];
 		char nm[35];
@@ -3621,11 +3680,12 @@ static void ft_ch_audit_report(void)
 		if (!s->total)
 			continue;
 		snprintf(nm, sizeof(nm), "%s:%d", s->fn, s->line);
-		fprintf(stderr, "%-34s %6s %10lu %9lu %8lu %8lu %8lu %8lu %8lu %7lu %8lu %8lu %8lu %6lu %7lu\n",
+		fprintf(stderr, "%-34s %6s %10lu %9lu %8lu %8lu %8lu %8lu %8lu %7lu %8lu %8lu %8lu %6lu %7lu %8lu %7lu %7lu %8lu\n",
 			nm, s->coarse ? "COARSE" : "FULL", s->total, s->wlock,
 			s->held, s->led, s->ctxheld, s->anchored, s->unheld,
 			s->nolocks, s->noholder, s->coarse_mode, s->aborting,
-			s->some, s->headword);
+			s->some, s->headword, s->hw_hidden, s->hw_mw,
+			s->hw_locked_ok, s->hw_locked_viol);
 		if (s->wlock)
 			fprintf(stderr, "%-34s %6s   WLOCK breakdown: also-per-node=%lu  BARE(only the FT-wide hold)=%lu\n",
 				nm, "", s->wlock_pernode, s->wlock_bare);

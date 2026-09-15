@@ -15,6 +15,58 @@
 #error "ft-helpers.h is an implementation unit; #include it from fractal-trie.c only"
 #endif
 
+/*
+ * ★ WHAT MAKES THIS WRITE LEGAL?  Every writer of a shared word in this trie is
+ * covered by exactly one of three regimes, and which one is a FACT ABOUT THE
+ * SITE that the code has until now carried only in prose.  Naming it in the
+ * call makes the answer local and checkable instead of a comment three
+ * functions away:
+ *
+ *   HIDDEN  the target is build-invisible -- freshly allocated by THIS op and
+ *           not yet published, so no reader and no peer can reach it.  A plain
+ *           store is legal because there is nobody to race.  ("An interior
+ *           write into an unpublished body: nothing to record.")
+ *   MW_CAS  the word is arbitrated by the engine: the write is a transacted
+ *           record whose expected-old makes a concurrent change lose.  No lock
+ *           is held and none is needed.
+ *   LOCKED  the op HOLDS the word's owner -- a per-node lock it acquired, or
+ *           the FT-wide writer lock -- and peers are excluded up front.
+ *
+ * ☞ THE DECLARATION IS TESTABLE, which is the point.  The audit does not
+ * believe it: a site that declares LOCKED is put through the witness ladder and
+ * a miss is a REAL violation (the code says it holds the owner and it does
+ * not), while HIDDEN is bucketed as owing nothing.  So the annotation
+ * documents the design AND fails loudly when the design drifts away from it --
+ * the pattern this tree already uses when it writes an invariant as a rule you
+ * can run.
+ *
+ * ☠ THE WORD CANNOT ANSWER THIS, ONLY THE CALLER CAN.  The tempting local test
+ * -- compare what the store is about to overwrite -- is wrong twice: the store
+ * is a bare rcu_assign_pointer, so a read before it is not atomic with it and a
+ * peer may change the word in between; and a fresh node's parent word is NOT
+ * reliably NULL (a cluster wires fresh-to-fresh, and recompact's reparent loop
+ * re-wires a node more than once), so "overwrote something different" does not
+ * mean "live".  At the sites that matter the caller already branches on exactly
+ * this fact (ft_node_recompact tests @pending_del_replace_fresh;
+ * ft_split_compressed_insert stores the fresh top eagerly and PARKS the live
+ * old child) -- the knowledge exists, it is simply not passed on.
+ *
+ * ☠ UNDECLARED IS THE ZERO VALUE ON PURPOSE.  An unconverted site keeps its own
+ * bucket rather than being attributed to a regime it may not belong to, so the
+ * undeclared count is the remaining work, in the open.  Never convert a site by
+ * guessing: a wrong declaration turns the audit into a confident wrong zero,
+ * which is worse than the honest "not yet classified" it replaced.
+ *
+ * Costs nothing: the value is consumed only by the debug audit and compiles out
+ * with it.
+ */
+enum ft_word_excl {
+	FT_EXCL_UNDECLARED = 0,	/* not yet classified -- counted, never scored */
+	FT_EXCL_HIDDEN,		/* unpublished: no reader, no peer, nothing to race */
+	FT_EXCL_MW_CAS,		/* transacted: the record's expected-old arbitrates */
+	FT_EXCL_LOCKED,		/* the op holds the owner (per-node or FT-wide) */
+};
+
 #ifdef FT_DEBUG_CHAIN_HOLD
 /*
  * The duplicate-chain hold audit lives in ft-mutation-helpers.h (it needs the
@@ -24,14 +76,15 @@
  */
 static void ft_ch_audit_head_at(const char *fn, int line,
 		const struct cds_ft *ft, struct cds_ft_node *head,
-		struct cds_ft_inode_flag *owner_flag);
+		struct cds_ft_inode_flag *owner_flag, enum ft_word_excl excl);
 # define ft_ch_audit_head(ft, head, owner)				\
-	ft_ch_audit_head_at(__func__, __LINE__, (ft), (head), (owner))
+	ft_ch_audit_head_at(__func__, __LINE__, (ft), (head), (owner),	\
+		FT_EXCL_UNDECLARED)
 #else
 # define ft_ch_audit_head(ft, head, owner)	do { } while (0)
 /* The _at spelling is called directly by ft_set_parent_at, which forwards its
  * caller's location -- so it needs a no-op too, or a non-debug build breaks. */
-# define ft_ch_audit_head_at(fn, line, ft, head, owner)	do { } while (0)
+# define ft_ch_audit_head_at(fn, line, ft, head, owner, excl) do { } while (0)
 #endif
 
 static inline __attribute__((unused))
@@ -3735,8 +3788,9 @@ static
 void ft_set_parent_at(const char *fn, int line, struct cds_ft *ft,
 		struct cds_ft_inode_flag *child_nf,
 		struct cds_ft_inode_flag *parent_nf,
-		struct cds_ft_inode_flag **slot)
+		struct cds_ft_inode_flag **slot, enum ft_word_excl excl)
 {
+	(void) excl;	/* consumed by the head-word audit only */
 	/*
 	 * @fn/@line are the CALLER's, so the head parent-word audit below gets
 	 * one row per CALL SITE.  ft_set_parent has 34 callers but the external
@@ -3819,7 +3873,7 @@ void ft_set_parent_at(const char *fn, int line, struct cds_ft *ft,
 		/* The up-walk edge byte, BEFORE the parent word: see the helper. */
 		ft_head_stamp_incoming_byte(ft, en, parent_nf, slot);
 		/* Same word class as the prefix-head store above. */
-		ft_ch_audit_head_at(fn, line, ft, en, parent_nf);
+		ft_ch_audit_head_at(fn, line, ft, en, parent_nf, excl);
 		if (ft->ordered_list)
 			ft_ord_cell_set_parent(en, word);
 		else
@@ -3862,7 +3916,15 @@ void ft_set_parent_at(const char *fn, int line, struct cds_ft *ft,
 
 #define ft_set_parent(ft, child_nf, parent_nf, slot)			\
 	ft_set_parent_at(__func__, __LINE__, (ft), (child_nf),		\
-		(parent_nf), (slot))
+		(parent_nf), (slot), FT_EXCL_UNDECLARED)
+/*
+ * The declaring spelling: the caller states WHICH REGIME makes this write legal
+ * (enum ft_word_excl).  Only convert a site whose answer the code ITSELF
+ * establishes.
+ */
+#define ft_set_parent_excl(ft, child_nf, parent_nf, slot, excl)		\
+	ft_set_parent_at(__func__, __LINE__, (ft), (child_nf),		\
+		(parent_nf), (slot), (excl))
 
 /*
  * Return codes for compressed node traversal helpers.

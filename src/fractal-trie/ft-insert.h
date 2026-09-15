@@ -1299,7 +1299,14 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 		ft_meta_nr_child_set(nb_meta, 1);
 		ft_nr_keys_store(ft,nb_meta, 1, CMM_RELAXED);
 		new_branch_flag = ft_compressed_node_flag(nb);
-		ft_set_parent(ft, nb->child, new_branch_flag, NULL);
+		/*
+		 * HIDDEN: @child_node is the caller's "new external node to
+		 * insert" (this function's own parameter comment) and @nb was
+		 * allocated three lines up -- neither is reachable by any
+		 * reader or peer until this cluster publishes.
+		 */
+		ft_set_parent_excl(ft, nb->child, new_branch_flag, NULL,
+			FT_EXCL_HIDDEN);
 		new_branch_flag = ft_publish_compressed(ft, nb, new_branch_flag);
 		created[nr_created++] = new_branch_flag;
 	} else {
@@ -1518,7 +1525,14 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 	 */
 	ft_set_parent(ft, top_flag, cur_parent, parent_slot);
 	if (deferred_child2)
-		ft_set_parent(ft, deferred_child2, deferred_parent, deferred_slot2);
+		/*
+		 * HIDDEN: "deferred_child2 is the FRESH new subtree, observable
+		 * only through the cluster" (the ordering note above).  Its
+		 * sibling @deferred_child is "always the LIVE old child" and is
+		 * NOT stored here -- it is parked into the one-commit below.
+		 */
+		ft_set_parent_excl(ft, deferred_child2, deferred_parent,
+			deferred_slot2, FT_EXCL_HIDDEN);
 	if (deferred_child) {
 		/*
 		 * deferred_child is the LIVE old child (cn->child).  Setting its
@@ -2180,8 +2194,17 @@ int ft_attach_node(struct cds_ft *ft,
 			ft_node_get_nth_skip(iter_dest_node_flag, &slot_ptr,
 				key_value, FT_PF_NONE);
 			assert(slot_ptr);
-			ft_set_parent(ft, iter_node_flag, iter_dest_node_flag,
-				slot_ptr);
+			/*
+			 * HIDDEN: @iter_node_flag is the cluster this function
+			 * builds bottom-up from the caller's unpublished
+			 * @child_node -- Phase 2 below calls it "the fresh
+			 * cluster top".  The LIVE displaced external head is
+			 * the OTHER edge, and it is parked (@ic->live_child),
+			 * not stored here.
+			 */
+			ft_set_parent_excl(ft, iter_node_flag,
+				iter_dest_node_flag, slot_ptr,
+				FT_EXCL_HIDDEN);
 			/*
 			 * §4.B VALIDATE (Phase 4.3, MW): the reserved-byte edge
 			 * below stores @slot_ptr, a slot INSIDE @iter_dest_node_flag.
