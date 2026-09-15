@@ -4950,6 +4950,32 @@ enum cds_ft_status ft_replace_exit(struct cds_ft_metadata **hm,
 	return s;
 }
 
+/*
+ * ★ THE ARM YIELD for the replace lane's §9.3 third member.  A green suite is
+ * not evidence for a site that never ran, and "0 acquires" has FOUR causes --
+ * never called / publish parent not compressed / slot not skip-encoded / root
+ * dual -- of which only the first means dead code.  Split them, and report the
+ * TOTAL at exit rather than every Nth call (a threshold print reads 1..N-1 as
+ * zero).
+ */
+#ifdef FT_DEBUG_DUAL_SITE
+static unsigned long ft_repl_dual_calls, ft_repl_dual_notcompressed,
+	ft_repl_dual_acquired, ft_repl_dual_unheld;
+static void ft_repl_dual_report(void) __attribute__((destructor));
+static void ft_repl_dual_report(void)
+{
+	fprintf(stderr, "FT REPLACE-DUAL calls=%lu notcompressed=%lu "
+		"ACQUIRED=%lu unheld=%lu\n",
+		uatomic_read(&ft_repl_dual_calls),
+		uatomic_read(&ft_repl_dual_notcompressed),
+		uatomic_read(&ft_repl_dual_acquired),
+		uatomic_read(&ft_repl_dual_unheld));
+}
+# define FT_REPL_DUAL_TALLY(parent_nf_, held_)					do {										uatomic_inc(&ft_repl_dual_calls);					if (!(parent_nf_) || !ft_node_compressed(parent_nf_))				uatomic_inc(&ft_repl_dual_notcompressed);			else if (held_)									uatomic_inc(&ft_repl_dual_acquired);				else										uatomic_inc(&ft_repl_dual_unheld);			} while (0)
+#else
+# define FT_REPL_DUAL_TALLY(parent_nf_, held_)					do { (void) (parent_nf_); (void) (held_); } while (0)
+#endif
+
 static
 enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 		struct cds_ft_iter *iter,
@@ -4963,6 +4989,30 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 	struct cds_ft_compressed_node *cn = NULL;
 	struct cds_ft_inode_flag *lock_nf = NULL;	/* the word {L} holds */
 	struct cds_ft_metadata *hm = NULL;		/* the hold, released once */
+	/*
+	 * {L}'s descent, context and held anchor, at FUNCTION scope because the
+	 * PUBLISH needs them: §9.3's third lock-set member (the SKIP_X dual's
+	 * grandparent, below) is acquired down in the two publish arms, and that
+	 * acquire needs BOTH of the things this block already derives.
+	 *
+	 *  - @hctx carries the DESCENT, which is the only source of a byte-depth
+	 *    at EXPONENTIAL spacing.  Without it ft_lock_ctx_depth_of fails, the
+	 *    choke point sets @acquire_miss, the commit aborts and the replace
+	 *    retries into the identical shape forever -- a livelock visible at
+	 *    one spacing only.
+	 *  - @hh must be REACHABLE AS AN EXTRA, so the dual acquire can dedupe
+	 *    against {L}.  At ROOT_ONLY spacing every member anchors on the root,
+	 *    so the dual's anchor IS {L}'s word; an acquire that cannot see the
+	 *    op's own hold misses against itself, which is the same livelock by
+	 *    the other road.  (This is precisely the case the note at the
+	 *    acquire below predicted: "should this path ever gain a registry ...
+	 *    @shared must then become the 'held, owing no release' arm".)
+	 */
+	struct ft_descent hd;
+	struct ft_lock_ctx hctx;
+	struct ft_held_anchor hh;
+	bool have_hctx = false;
+	bool dual_gp_held = false;
 	const uint8_t *iter_key;
 	size_t key_len = ft_key_len(ft, ft_iter_resolve_key_len(iter));
 	enum cds_ft_status s;
@@ -5084,9 +5134,6 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 	 * arbitrated (see the enum cds_ft_writer_strategy TODO).
 	 */
 	if (ft->lock_fine) {
-		struct ft_descent hd;
-		struct ft_lock_ctx hctx;
-		struct ft_held_anchor hh;
 		unsigned int hdep = 0;
 		bool have_hd = false, descended = false;
 
@@ -5154,6 +5201,18 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 		}
 		hm = hh.lock;
 		FT_DBG_HELD_AT(hm);
+		/*
+		 * THE REGISTRY THIS PATH JUST GAINED, and the order matters:
+		 * wired AFTER the acquire above, never before.  The acquire's
+		 * own dedupe must keep seeing an EMPTY held set -- that is what
+		 * makes its @hh.shared bail sound -- while every LATER acquire
+		 * in this op (today: the SKIP_X dual's grandparent, in both
+		 * publish arms) must see {L} and answer SHARED rather than
+		 * miss against a word its own op holds.
+		 */
+		hctx.held.extra = &hh;
+		hctx.held.nr_extra = 1;
+		have_hctx = true;
 
 		/* @old_node's OWN tombstone, now that a peer cannot set it. */
 		if (caa_unlikely(ft_node_is_removed(old_node))) {
@@ -5403,7 +5462,8 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 				ft_flip_txn_create_bounded(ft,
 					FT_ORD_CELL_SWAP_PUBLISH_MAX_EDGES +
 					FT_HLIST_FREEZE_MAX_EDGES +
-					1 /* §4.B parent guard */);
+					1 /* §4.B parent guard */ +
+					1 /* §9.3 dual GP: release-lock XOR guard */);
 
 			if (!txn) {
 				new_node->next = NULL;
@@ -5450,6 +5510,33 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 			 */
 			if (!hm || ft_flag_to_metadata(ft, parent_nf) != hm)
 				ft_flip_txn_guard_parent(ft, txn, parent_nf);
+			/*
+			 * §9.3's THIRD LOCK-SET MEMBER.  A COMPRESSED
+			 * @parent_nf makes this publish write TWO reader-visible
+			 * words -- the holder's own child slot and the SKIP_X
+			 * dual, which lives in the GRANDPARENT's body -- so §8.2
+			 * puts that second word under GP's lock, and {L} alone
+			 * does not cover it.  Acquire it from the SAME derivation
+			 * the record will name (ft_lock_skip_dual_gp), which is
+			 * the only form of the answer that is true at publish
+			 * time rather than at plan time.
+			 *
+			 * @hctx supplies the descent (a depth at EXPONENTIAL
+			 * spacing) and {L} as an extra (the dedupe at ROOT_ONLY);
+			 * see their declaration.  A non-compressed parent, a
+			 * non-skip slot, a root dual or a coarse trie all return
+			 * false having planted nothing.
+			 *
+			 * The kind stays MW here: a slot is SW xor MW GLOBALLY,
+			 * so every producer of this word flips in one commit or
+			 * none does.  This site's job is to stop being the one
+			 * that CANNOT answer.
+			 */
+			dual_gp_held = ft_lock_skip_dual_gp(ft,
+				have_hctx ? &hctx : NULL, txn, parent_nf,
+				txn->mtxn);
+			FT_REPL_DUAL_TALLY(parent_nf, dual_gp_held);
+			(void) dual_gp_held;	/* kind flips with all producers */
 			_ft_publish_to_parent(ft, parent_nf, pub_slot,
 				(struct cds_ft_inode_flag *) new_node,
 				(struct cds_ft_inode_flag *) old_node, &rec, false);
@@ -5512,7 +5599,8 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 			struct ft_flip_txn *txn =
 				ft_flip_txn_create_bounded(ft, FT_PUB_SEDGE_MAX_EDGES +
 					FT_HLIST_FREEZE_MAX_EDGES +
-					1 /* §4.B parent guard */);
+					1 /* §4.B parent guard */ +
+					1 /* §9.3 dual GP: release-lock XOR guard */);
 
 			if (!txn) {
 				new_node->next = NULL;
@@ -5555,6 +5643,33 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 			 */
 			if (!hm || ft_flag_to_metadata(ft, parent_nf) != hm)
 				ft_flip_txn_guard_parent(ft, txn, parent_nf);
+			/*
+			 * §9.3's THIRD LOCK-SET MEMBER.  A COMPRESSED
+			 * @parent_nf makes this publish write TWO reader-visible
+			 * words -- the holder's own child slot and the SKIP_X
+			 * dual, which lives in the GRANDPARENT's body -- so §8.2
+			 * puts that second word under GP's lock, and {L} alone
+			 * does not cover it.  Acquire it from the SAME derivation
+			 * the record will name (ft_lock_skip_dual_gp), which is
+			 * the only form of the answer that is true at publish
+			 * time rather than at plan time.
+			 *
+			 * @hctx supplies the descent (a depth at EXPONENTIAL
+			 * spacing) and {L} as an extra (the dedupe at ROOT_ONLY);
+			 * see their declaration.  A non-compressed parent, a
+			 * non-skip slot, a root dual or a coarse trie all return
+			 * false having planted nothing.
+			 *
+			 * The kind stays MW here: a slot is SW xor MW GLOBALLY,
+			 * so every producer of this word flips in one commit or
+			 * none does.  This site's job is to stop being the one
+			 * that CANNOT answer.
+			 */
+			dual_gp_held = ft_lock_skip_dual_gp(ft,
+				have_hctx ? &hctx : NULL, txn, parent_nf,
+				txn->mtxn);
+			FT_REPL_DUAL_TALLY(parent_nf, dual_gp_held);
+			(void) dual_gp_held;	/* kind flips with all producers */
 			_ft_publish_to_parent(ft, parent_nf, pub_slot,
 				(struct cds_ft_inode_flag *) new_node,
 				(struct cds_ft_inode_flag *) old_node, &rec, false);
