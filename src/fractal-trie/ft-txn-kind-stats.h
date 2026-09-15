@@ -456,7 +456,10 @@ void ft_tk_count_mwa(enum ft_tk_mwa_class c)
 #ifdef FT_ABORT_ATTRIB
 static const char * const ft_ab_names[FT_AB_CLS_NR] = {
 	"UNATTRIB", "SW", "MW_STRUCT", "MW_LOCK", "VALIDATE", "CELL_HANDLE",
-	"mwa:ROOT", "mwa:HEAD_BACK", "mwa:DUAL", "mwa:CELL",
+	/* enum ft_tk_mwa_class order, exactly -- the static assert above only
+	 * checks the COUNT, so a name out of order would mislabel silently. */
+	"mwa:ROOT", "mwa:HEAD_BACK", "mwa:DUAL", "mwa:DUAL_ROOT",
+	"mwa:DUAL_NAMED", "mwa:DUAL_UNNAMED", "mwa:CELL",
 	"mwa:RANK", "mwa:PARENT_WORD", "mwa:PSO", "mwa:STATE", "mwa:GUARD",
 };
 

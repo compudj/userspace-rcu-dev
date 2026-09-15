@@ -9287,8 +9287,59 @@ bool ft_lock_skip_dual_gp(struct cds_ft *ft,
 		uatomic_inc(&ft_dual_gp_acq_remove);
 	}
 #endif
-	ft_flip_txn_lock_or_guard_parent_ex(__func__, __LINE__, ft, txn,
-		ctx, gp_nf, FT_DEPTH_FROM_DESCENT, &ex);
+	/*
+	 * ☠☠ DATE THE MEMBER HERE -- DO NOT HAND THE CHOKE POINT
+	 * FT_DEPTH_FROM_DESCENT AND HOPE.
+	 *
+	 * The dual's grandparent is DERIVED from the compressed publish parent's
+	 * back-pointer, so it is not a node the descent necessarily passed: a
+	 * {C, P, GP} set names three consecutive ancestors while the window holds
+	 * the last four nodes the DESCENT crossed, and GP routinely falls off the
+	 * end.  ft_flip_txn_lock_or_guard_parent_ex answers an undatable
+	 * FT_DEPTH_FROM_DESCENT member by setting @acquire_miss and letting the
+	 * commit ABORT -- correct for a STALE plan, catastrophic for a STRUCTURAL
+	 * one, because the caller's retry re-derives the identical plan.
+	 *
+	 * ★★★★★ MEASURED, AND IT IS A LIVELOCK, NOT A RETRY.
+	 * inv_compact_keycopy_terminates is SINGLE-THREADED, and at exponential
+	 * spacing this site missed on every attempt:
+	 *
+	 *     DUALMISS gp_nf=0x7ff579e00001 datable=0 spacing=2   (every time)
+	 *     ABORT st=1 n=5 acquire_miss=1 nr_locks=0            (no edge mismatched)
+	 *     RMEAGAIN #655360 ret=-11                            (and climbing)
+	 *
+	 * No peer exists to clear it, so cds_ft_remove_all spun ~3.4M attempts,
+	 * leaking a txn per attempt (~500 MB/s) until the memcg killed it.  This
+	 * file already named the shape twice -- "a self-refusal is the one
+	 * -EAGAIN no peer will ever clear ... it SPINS" and "measured as a
+	 * PERMANENT -EAGAIN, ft_unit wedged ... and the memcg SIGKILLing the
+	 * leak".
+	 *
+	 * So resolve the depth with the ONE-HOP derivation the lock-coarseness
+	 * design provides for exactly this shape (§5.3, ft_lock_ctx_depth_of_parent:
+	 * "a node's span is a property of the node itself"): date the publish
+	 * parent, which IS on the descent path, then step one hop up to GP.
+	 *
+	 * And when even that cannot date it, take NOTHING and say so.  A member
+	 * this plan cannot anchor is not a lock this op can hold, and MW is
+	 * always safe (rcu-txn-mcas.h) -- the record is MW here today in any
+	 * case.  Planting an unsatisfiable @acquire_miss instead would abort a
+	 * commit that has nothing wrong with it, forever.
+	 */
+	{
+		unsigned int gp_depth, cn_depth;
+
+		if (!ft_lock_ctx_depth_of(ft, ctx, gp_nf, &gp_depth)) {
+			if (!ft_lock_ctx_depth_of(ft, ctx, parent_nf, &cn_depth) ||
+					!ft_lock_ctx_depth_of_parent(ft, ctx,
+						gp_nf, cn_depth, &gp_depth)) {
+				FT_DUAL_EXIT_TALLY(FT_LOG_EXIT_NOT_FINE);
+				return false;	/* undatable: plant NOTHING */
+			}
+		}
+		ft_flip_txn_lock_or_guard_parent_ex(__func__, __LINE__, ft, txn,
+			ctx, gp_nf, gp_depth, &ex);
+	}
 	FT_DUAL_EXIT_TALLY(ex);
 	/*
 	 * ☠ "I CALLED THE ACQUIRE" IS NOT "THE TXN OWNS THE WORD", and returning

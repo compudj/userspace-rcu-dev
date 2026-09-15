@@ -388,6 +388,65 @@ void iter_debug_path_clear(struct cds_ft_iter *iter __attribute__((unused)))
  * that buffer directly.  Defined after ft_speculative_keycopy_unconditional.
  */
 static inline void ft_iter_materialize_key(struct cds_ft_iter *iter);
+/* Defined in ft-iter.h: is the key a reference INTO @iter->node's leaf? */
+static inline bool ft_iter_key_referenced(const struct cds_ft_iter *iter);
+
+/*
+ * Drop the cached POSITION while preserving the KEY, for a site that is about
+ * to re-descend from that key.
+ */
+static inline
+void ft_iter_drop_position_keep_key(struct cds_ft_iter *iter)
+{
+	/*
+	 * DROP THE CACHED POSITION, KEEP THE KEY.
+	 *
+	 * ☠ A BARE `cache_valid = false` CAN DESTROY THE KEY.  On a keycopy trie
+	 * (ordered list + speculative_key_offset + identity key map) the key is
+	 * not stored in the iterator at all: ft_iter_key_referenced() is true and
+	 * ft_iter_read_key() returns @iter->node + speculative_key_offset.  That
+	 * predicate requires @cache_valid, so clearing it makes read_key fall
+	 * through to iter_key(iter) -- a buffer nothing ever wrote -- and the key
+	 * reads back as ZEROS.  The same applies to the eager ordered-list
+	 * up-walk arm, which also tests @cache_valid.
+	 *
+	 * So any site that drops the position INTENDING to re-descend from the
+	 * key must materialize first.  MEASURED: cds_ft_remove_all's exponential
+	 * retriable bail dropped the cache "so the next attempt re-seeds through
+	 * a fresh lookup", and the next attempt re-seeded from key 0 and reported
+	 * NOT_FOUND for a key that was present and reachable
+	 * (inv_compact_keycopy_terminates, key 248 of 2000, exponential only).
+	 *
+	 * This is the same materialize-then-clear that iter_auto_invalidate_cache
+	 * does for the UNCACHED contract -- the reason is identical, so the order
+	 * is identical.
+	 */
+	/*
+	 * ☠ ONLY THE LEAF-REFERENCED KEY, and the gate is not caution -- it is
+	 * the difference between reading a live leaf and WALKING A DETACHED
+	 * SUBTREE.  ft_iter_read_key has two lazy arms:
+	 *
+	 *  - key REFERENCED (this one): a single load from @iter->node at
+	 *    @speculative_key_offset.  The node is alive here even after a
+	 *    detach -- the caller is handed it to free -- so the read is sound,
+	 *    and it is the only arm whose key the cache drop would destroy.
+	 *  - the eager ordered-list arm: an O(depth) PARENT UP-WALK
+	 *    (ft_rebuild_key_upwalk).  Callers reach this helper AFTER the
+	 *    structure changed, and an up-walk from a node the op has just
+	 *    unlinked runs off an external node -- MEASURED as ft_unit test 187
+	 *    SEGV on release and `Assertion !(nf) || !ft_node_external(nf)` on
+	 *    --enable-rcu-debug, at PER-NODE spacing, when this materialized
+	 *    unconditionally.
+	 *
+	 * The second arm needs no materialize anyway: it derives the key from
+	 * the trie rather than from the dropped position.
+	 */
+	if (ft_iter_key_referenced(iter))
+		ft_iter_materialize_key(iter);
+	iter->cache_valid = false;
+	iter_debug_path_clear(iter);
+	iter->path_len = 0;
+}
 
 /*
  * Discard the cached position if the iterator is in uncached mode.

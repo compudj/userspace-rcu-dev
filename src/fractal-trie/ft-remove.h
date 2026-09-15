@@ -8246,9 +8246,14 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 	 */
 	if (!have_descent &&
 	    ft->lock_spacing == CDS_FT_LOCK_SPACING_EXPONENTIAL) {
-		iter->cache_valid = false;
-		iter_debug_path_clear(iter);
-		iter->path_len = 0;
+		/*
+		 * ☠ MATERIALIZE BEFORE DROPPING.  The next attempt re-seeds
+		 * "through a fresh lookup" -- from @iter's KEY -- and on a
+		 * keycopy trie that key lives in the LEAF, reachable only while
+		 * @cache_valid holds (ft_iter_key_referenced).  Clearing the
+		 * flag first leaves the re-seed searching for key 0.
+		 */
+		ft_iter_drop_position_keep_key(iter);
 		*result_node = NULL;
 		FT_DBG_RA_STALE_DESCENT();
 		FT_DBG_RETRY_SITE();
@@ -8604,9 +8609,17 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 		}
 	}
 
-	iter->cache_valid = false;
-	iter_debug_path_clear(iter);
-	iter->path_len = 0;
+	/*
+	 * ☠ KEEP THE KEY.  The retriable exit below re-attempts on the strength
+	 * of "@iter's cache is invalidated just above, so the next attempt
+	 * re-seeds through a fresh lookup" -- and that re-seed reads @iter's
+	 * KEY, which on a keycopy trie is reachable only WHILE @cache_valid
+	 * holds (ft_iter_key_referenced -> @iter->node + speculative_key_offset).
+	 * A bare clear here hands the retry a zeroed key, and the re-seed then
+	 * reports NOT_FOUND for a key that is present -- MEASURED as
+	 * inv_compact_keycopy_terminates' drain abort, key 248 of 2000.
+	 */
+	ft_iter_drop_position_keep_key(iter);
 
 	if (ret) {
 		/*
