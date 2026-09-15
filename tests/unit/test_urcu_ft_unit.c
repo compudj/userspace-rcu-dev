@@ -12067,6 +12067,7 @@ static void same_path_child(void)
 				same_path_cases[g].keys[0],
 				same_path_cases[g].serve);
 			rcu_read_unlock();
+			rcu_quiescent_state();
 			/*
 			 * ☠ NO drain / rcu_barrier / destroy HERE, and that is
 			 * not laziness.  fork() duplicates only the calling
@@ -12104,6 +12105,7 @@ static void same_path_child(void)
 				root_frame_cases[g].dst, root_frame_cases[g].src,
 				root_frame_cases[g].serve);
 			rcu_read_unlock();
+			rcu_quiescent_state();
 			(void) group;
 			if (bad) {
 				fprintf(stderr,
@@ -28805,6 +28807,7 @@ static void *excl_neg_writer(void *arg)
 		key[3] = 0;
 		if (cds_ft_insert(ctx->ft, key, 4, &n->node) != CDS_FT_STATUS_OK)
 			node_free(n);
+		rcu_quiescent_state();
 	}
 	rcu_unregister_thread();
 	return NULL;
@@ -28824,6 +28827,7 @@ static void *excl_neg_reader(void *arg)
 		rcu_read_lock();
 		(void) cds_ft_eager_lookup_key(ctx->ft, key, 4, 0, &found);
 		rcu_read_unlock();
+		rcu_quiescent_state();
 	}
 	rcu_unregister_thread();
 	return NULL;

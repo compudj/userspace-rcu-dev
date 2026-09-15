@@ -6525,6 +6525,7 @@ static void *wdj_point(void *arg)
 		 * reference and the iter's cached path are valid only inside
 		 * it, and cds_ft_remove consumes both.
 		 */
+		rcu_quiescent_state();
 		rcu_read_lock();
 		if (cds_ft_insert(w->ft, key, WDJ_KLEN, &n->node) !=
 				CDS_FT_STATUS_OK) {
@@ -6571,6 +6572,7 @@ static void *wdj_reader(void *arg)
 		key[0] = (uint8_t) (WDJ_TOP_MOVER +
 				(rand_r(&seed) % WDJ_NW));
 		key[WDJ_JUNCT] = (uint8_t) (1 + (rand_r(&seed) & 1));
+		rcu_quiescent_state();
 		rcu_read_lock();
 		cds_ft_iter_set_key(iter, key, WDJ_KLEN);
 		(void) cds_ft_lookup_ge(r->ft, iter);
@@ -11056,6 +11058,7 @@ static void *inv_remove_xview_reader(void *arg)
 		uint8_t kb[8];
 		bool found;
 
+		rcu_quiescent_state();
 		rcu_read_lock();
 		if (cds_ft_lookup_first(ctx->ft, iter) == CDS_FT_STATUS_OK &&
 		    (n1 = cds_ft_iter_node(iter)) != NULL) {
@@ -11103,6 +11106,7 @@ static void *inv_remove_xview_drainer(void *arg)
 		uint64_t k;
 		uint8_t kb[8];
 
+		rcu_quiescent_state();
 		rcu_read_lock();
 		pthread_mutex_lock(&ctx->lock);
 		if (cds_ft_lookup_first(ctx->ft, iter) == CDS_FT_STATUS_OK &&
@@ -11475,6 +11479,7 @@ static void *inv_remove_xview_reader_max(void *arg)
 		size_t l1, l2;
 		bool found;
 
+		rcu_quiescent_state();
 		rcu_read_lock();
 		if (cds_ft_lookup_last(ctx->ft, iter) == CDS_FT_STATUS_OK &&
 		    (n1 = cds_ft_iter_node(iter)) != NULL) {
@@ -11521,6 +11526,7 @@ static void *inv_remove_xview_drainer_max(void *arg)
 		uint8_t k[8];
 		size_t l;
 
+		rcu_quiescent_state();
 		rcu_read_lock();
 		pthread_mutex_lock(&ctx->lock);
 		if (cds_ft_lookup_last(ctx->ft, iter) == CDS_FT_STATUS_OK &&
@@ -11666,6 +11672,7 @@ static void *inv_remove_xview_drainer_minvl(void *arg)
 		uint8_t k[8];
 		size_t l;
 
+		rcu_quiescent_state();
 		rcu_read_lock();
 		pthread_mutex_lock(&ctx->lock);
 		if (cds_ft_lookup_first(ctx->ft, iter) == CDS_FT_STATUS_OK &&
@@ -11716,6 +11723,7 @@ static void *inv_remove_xview_drainer_minvl_all(void *arg)
 		uint8_t k[8];
 		size_t l;
 
+		rcu_quiescent_state();
 		rcu_read_lock();
 		pthread_mutex_lock(&ctx->lock);
 		if (cds_ft_lookup_first(ctx->ft, iter) == CDS_FT_STATUS_OK &&
