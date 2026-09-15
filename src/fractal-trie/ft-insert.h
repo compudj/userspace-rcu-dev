@@ -702,7 +702,7 @@ void ft_insert_publish_or_park(struct cds_ft *ft,
 		struct cds_ft_inode_flag *expected_old,
 		struct ft_insert_commit *ic)
 {
-	struct ft_pub_rec rec = { .n = 0 };
+	struct ft_pub_rec rec = { .ctx = ctx, .n = 0 };
 	bool dual_gp_held;
 
 	/*
@@ -2067,7 +2067,7 @@ int ft_attach_node(struct cds_ft *ft,
 		 * parent's SKIP_X dual here, and the forward fold below adds the
 		 * grandparent slot edge, so both flip ATOMICALLY in ic->txn.
 		 */
-		struct ft_pub_rec rec = { .n = 0 };
+		struct ft_pub_rec rec = { .ctx = ctx, .n = 0 };
 
 		key_value = *(--iter_key);
 		dbg_printf("publish branch at level %d, key %u\n", level - 1, (unsigned int) key_value);
@@ -5343,7 +5343,8 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 		struct ft_ord_cell *old_cell = (ft->ordered_list && is_head) ?
 			ft_ord_cell_ptr(old_prev) : NULL;
 		void *new_cell_flag = NULL;
-		struct ft_pub_rec rec = { .n = 0 };
+		struct ft_pub_rec rec = { .ctx = have_hctx ? &hctx : NULL,
+			.n = 0 };
 		struct ft_ord_cell_edge sedges[2] = { 0 };
 		unsigned int n_s;
 		int r;			/* head-arm commit outcome */

@@ -926,7 +926,25 @@ struct cds_ft_alloc_arena;
  * (ft_detach_node) can commit them in one flip with the cell edges.  At most
  * two edges: forward slot + skip dual.
  */
+struct ft_lock_ctx;
+
 struct ft_pub_rec {
+	/*
+	 * ☞ THE OP'S LOCK CONTEXT, carried for the SAME reason @root and
+	 * @owner are: the producer is the only frame that has it, and the
+	 * replays are several and far away.  Consumed ONLY by
+	 * FT_OWNER_ASSERT_OWNED_CTX, which needs the WIDE witness --
+	 * ft_flip_txn_owns reads @locks[] alone, so a hold filed in @extra, in
+	 * the glue, or in an OUTER frame answers false and the assert fires on
+	 * a word the op really does own.  ft_lock_ctx_holds consults all four.
+	 *
+	 * MEASURED: the SKIP_X dual's acquire exits SHARED 533642 times against
+	 * REGISTERED 148705 over one ft_inv run -- 78% of the honest "I hold
+	 * this" answers are invisible to the narrow witness.  NULL where the
+	 * producer has no ctx, which leaves the assert exactly as narrow as it
+	 * was.
+	 */
+	const struct ft_lock_ctx *ctx;
 	struct cds_ft_inode_flag **slot[3];
 	struct cds_ft_inode_flag *old_val[3];
 	struct cds_ft_inode_flag *new_val[3];

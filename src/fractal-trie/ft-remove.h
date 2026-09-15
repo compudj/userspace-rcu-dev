@@ -324,7 +324,7 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 		 * flip proxy now -- and signal it via pub->armed.
 		 */
 		if ((fuse_cell || run) && pub && !pub->armed) {
-			struct ft_pub_rec rec = { .n = 0,
+			struct ft_pub_rec rec = { .ctx = ctx, .n = 0,
 				.mtxn = txn ? txn->mtxn : NULL };
 
 			/* The caller folds only with neither. */
@@ -411,7 +411,7 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 				return -EAGAIN;
 			pub->armed = true;
 		} else {
-			struct ft_pub_rec rec = { .n = 0,
+			struct ft_pub_rec rec = { .ctx = ctx, .n = 0,
 				.mtxn = txn ? txn->mtxn : NULL };
 
 			/*
@@ -659,7 +659,7 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			ft_meta_parent_slot_offset(src_meta));
 #endif
 		{
-			struct ft_pub_rec rec = { .n = 0,
+			struct ft_pub_rec rec = { .ctx = ctx, .n = 0,
 				.mtxn = txn ? txn->mtxn : NULL };
 
 			/*
@@ -2139,7 +2139,7 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 
 	new_cn_flag = ft_compressed_node_flag(new_cn);
 	{
-		struct ft_pub_rec rec = { .n = 0 };
+		struct ft_pub_rec rec = { .ctx = ctx, .n = 0 };
 		struct cds_ft_inode_flag *new_cn_pub;
 		/*
 		 * Plan snapshot of publish_slot's old value: it still holds the
@@ -4881,7 +4881,7 @@ int ft_detach_node(struct cds_ft *ft,
 			 * this very commit retires.  Same defect as the
 			 * external-promote arm above, two sites deeper.
 			 */
-			struct ft_pub_rec rec = { .n = 0,
+			struct ft_pub_rec rec = { .ctx = &lctx, .n = 0,
 				.mtxn = commit_txn ? commit_txn->mtxn : NULL };
 
 			/*
@@ -5031,7 +5031,7 @@ int ft_detach_node(struct cds_ft *ft,
 		    (old_recompacted_node || topmost_external_nodes)) {
 			/* @mtxn: as the fused arm above -- the dual's home must
 			 * be resolved against this op's own pending re-parent. */
-			struct ft_pub_rec rec = { .n = 0,
+			struct ft_pub_rec rec = { .ctx = &lctx, .n = 0,
 				.mtxn = commit_txn ? commit_txn->mtxn : NULL };
 
 			/*
@@ -5499,7 +5499,7 @@ int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 {
 	struct ft_ord_cell *old_cell = ft->ordered_list ?
 		ft_ord_cell_ptr(node->prev) : NULL;
-	struct ft_pub_rec rec = { .n = 0 };
+	struct ft_pub_rec rec = { .ctx = ctx, .n = 0 };
 	struct ft_ord_cell_edge sedges[2] = { 0 };
 	unsigned int n_s;
 	/*
@@ -6167,7 +6167,7 @@ int ft_unchain_node(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		 * a txn (no lone-edge on-stack path) -- one extra alloc per head
 		 * clear, the single-writer cost of the atomic detach.
 		 */
-		struct ft_pub_rec rec = { .n = 0 };
+		struct ft_pub_rec rec = { .ctx = ctx, .n = 0 };
 		struct ft_ord_cell_edge sedges[2] = { 0 };
 		struct ft_flip_txn *txn;
 		unsigned int n_s;

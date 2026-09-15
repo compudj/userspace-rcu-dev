@@ -5081,6 +5081,24 @@ enum urcu_txn_status ft_flip_txn_commit(struct cds_ft *ft,
  * existing caller's check changes by a bit.
  */
 static inline
+#ifdef FT_DEBUG_DUAL_SITE
+/*
+ * ☞ IS THE WIDE WITNESS LOAD-BEARING?  Counts records the NARROW witness
+ * (ft_flip_txn_owns, @locks[] only) rejects but the WIDE one
+ * (ft_lock_ctx_holds: registry + extras + glue + outer frame) accepts.  Every
+ * one of these is a word the op REALLY holds that the owner assert could not
+ * see before the ctx was plumbed onto ft_pub_rec -- i.e. the exact population
+ * a SHARED acquire produces.  A zero here means the plumbing bought nothing.
+ */
+unsigned long ft_owner_wide[2];
+static void ft_owner_wide_report(void) __attribute__((destructor));
+static void ft_owner_wide_report(void)
+{
+	fprintf(stderr, "FT OWNER WITNESS narrow_ok=%lu wide_only=%lu\n",
+		uatomic_read(&ft_owner_wide[0]), uatomic_read(&ft_owner_wide[1]));
+}
+#endif
+
 void __ft_flip_txn_record_tag_ctx(struct ft_flip_txn *t,
 		const struct ft_lock_ctx *dbg_ctx,
 		struct cds_ft_metadata *owner, void **slot,
@@ -5146,6 +5164,16 @@ void __ft_flip_txn_record_tag_ctx(struct ft_flip_txn *t,
 	 * site be legal?" into an abort at the offending record instead of a
 	 * number to interpret.
 	 */
+#ifdef FT_DEBUG_DUAL_SITE
+	if (owner) {
+		bool narrow = ft_flip_txn_owns(t, owner);
+
+		if (narrow)
+			uatomic_inc(&ft_owner_wide[0]);
+		else if (ft_owner_ctx_holds(dbg_ctx, owner))
+			uatomic_inc(&ft_owner_wide[1]);
+	}
+#endif
 	FT_OWNER_ASSERT_OWNED_CTX(t, dbg_ctx, owner, slot, new_ptr);
 	/*
 	 * ☐ OPT-IN, DEFAULT OFF (-DFT_SW_REQUIRES_OWNER).  ASK THE ARM'S
@@ -7510,6 +7538,12 @@ struct ft_ord_cell_edge {
 	 * zero-initialized edge is an ordinary in-node slot.
 	 */
 	bool root;
+	/*
+	 * The op's lock context, carried in from ft_pub_rec for the record-time
+	 * owner assert's WIDE witness (extras / glue / outer frames).  NULL
+	 * leaves the assert narrow, exactly as before.
+	 */
+	const struct ft_lock_ctx *ctx;
 	/*
 	 * The node whose DLM lock OWNS @slot (§8), for the record-time owner
 	 * check (FT_OWNER_ASSERT_OWNED).  NULL -- the zero-initialized default
@@ -9974,7 +10008,18 @@ enum urcu_txn_status ft_ord_cell_flip_into(struct cds_ft *ft,
 				(void *) edges[i].old_target,
 				(void *) edges[i].new_target);
 		else if (tag == FT_FLIP_PROXY_TAG && edges[i].owner_held)
-			ft_flip_txn_record_tag(t, edges[i].owner,
+			/*
+			 * ☞ THE _CTX FORM, NOT THE BARE ONE.  This is the arm
+			 * that records an edge the op VOUCHED for, so it is
+			 * exactly where the owner assert runs -- and
+			 * ft_flip_txn_record_tag hardcodes dbg_ctx NULL, which
+			 * switches the wide witness off and leaves the assert
+			 * reading @locks[] alone.  A SHARED acquire (the op
+			 * holds the word, filed in @extra / the glue / an outer
+			 * frame) then reads as unowned.
+			 */
+			__ft_flip_txn_record_tag_ctx(t, edges[i].ctx,
+				edges[i].owner,
 				(void **) edges[i].slot,
 				(void *) edges[i].old_target,
 				(void *) edges[i].new_target, tag);
@@ -10676,6 +10721,7 @@ unsigned int ft_pub_rec_sedges(struct ft_pub_rec *rec,
 		sedges[i].root = rec->root[i];
 		sedges[i].owner = rec->owner[i];
 		sedges[i].owner_held = rec->owner_held[i];
+		sedges[i].ctx = rec->ctx;
 	}
 	return rec->n;
 }
@@ -11034,6 +11080,7 @@ enum urcu_txn_status ft_remove_commit_rec(struct cds_ft *ft,
 		edges[n].root = rec->root[i];
 		edges[n].owner = rec->owner[i];
 		edges[n].owner_held = rec->owner_held[i];
+		edges[n].ctx = rec->ctx;
 		n++;
 	}
 	if (run)
@@ -11745,6 +11792,7 @@ enum urcu_txn_status ft_ord_cell_flip_rec_replace(struct cds_ft *ft,
 		edges[n].root = rec->root[i];
 		edges[n].owner = rec->owner[i];
 		edges[n].owner_held = rec->owner_held[i];
+		edges[n].ctx = rec->ctx;
 		n++;
 	}
 	n = ft_ord_cell_run_replace_edges(ft, run->d_first, run->d_last,
