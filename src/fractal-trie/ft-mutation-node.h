@@ -1182,12 +1182,19 @@ unsigned int find_nearest_type_index(unsigned int type_index,
 static
 #ifdef FT_DEBUG_DUAL_SITE
 unsigned long ft_rc_noctx, ft_rc_nogp, ft_rc_held, ft_rc_unheld;
+unsigned long ft_rc_hint_held, ft_rc_hint_unheld, ft_rc_res_held,
+	ft_rc_res_unheld;
 static void ft_rc_report(void) __attribute__((destructor));
 static void ft_rc_report(void)
 {
-	fprintf(stderr, "FT RECOMPACT-DUAL noctx=%lu nogp=%lu held=%lu unheld=%lu\n",
+	fprintf(stderr, "FT RECOMPACT-DUAL noctx=%lu nogp=%lu held=%lu unheld=%lu"
+		" | hint=%lu/%lu resolved=%lu/%lu (held/unheld)\n",
 		uatomic_read(&ft_rc_noctx), uatomic_read(&ft_rc_nogp),
-		uatomic_read(&ft_rc_held), uatomic_read(&ft_rc_unheld));
+		uatomic_read(&ft_rc_held), uatomic_read(&ft_rc_unheld),
+		uatomic_read(&ft_rc_hint_held),
+		uatomic_read(&ft_rc_hint_unheld),
+		uatomic_read(&ft_rc_res_held),
+		uatomic_read(&ft_rc_res_unheld));
 }
 #endif
 
@@ -2353,6 +2360,49 @@ skip_copy:
 								&skip_owner_nf);
 					}
 
+					/*
+					 * ☠☠ §9.3's THIRD MEMBER CANNOT BE TAKEN
+					 * HERE, and this is the second cure that
+					 * failed -- both tried and both recorded
+					 * so the next reader does not try them a
+					 * third time.
+					 *
+					 * (1) ASK the held set: NO, 0 of 805202.
+					 *     And the provenance split says why:
+					 *     @inh_hint is NEVER present at this
+					 *     site (0/0 across the whole inv
+					 *     suite), so the owner always comes
+					 *     from ft_resolve_parent_slot -- a
+					 *     back-pointer read naming a node
+					 *     this op's DLM set never covers.
+					 *
+					 * (2) ACQUIRE it into @retire_txn (the
+					 *     flip-txn the caller commits @rec
+					 *     into, so ft_flip_txn_owns would see
+					 *     it): ft_unit WEDGES at
+					 *     test_rekey_coherence_lookup, the
+					 *     first insert-variant row, in
+					 *     ft_dlm_acquire_set_at ->
+					 *     ft_dlm_guard_parent ->
+					 *     urcu_txn_validate ->
+					 *     urcu_txn_record_chain, at THIS
+					 *     function's OWN acquire set
+					 *     (ft-mutation-node.h:1423) -- not at
+					 *     the added call.  A dual register in
+					 *     @retire_txn collides with the
+					 *     recompact's own DLM set on the same
+					 *     txn and the record chain never
+					 *     settles.
+					 *
+					 * ⇒ The dual's owner has to enter the
+					 * recompact's OWN lock set, at the top
+					 * with {C, P, GP}, where the set is built
+					 * and reconciled once -- not as a second
+					 * registration half way down.  Until
+					 * then this is the ONE producer of the
+					 * eight that writes the dual without
+					 * holding it, and the dual stays MW.
+					 */
 					if (rec) {
 						/*
 						 * SW compaction: *slot == plan
@@ -2410,6 +2460,27 @@ skip_copy:
 							uatomic_inc(&ft_rc_held);
 						else
 							uatomic_inc(&ft_rc_unheld);
+						/*
+						 * ☞ WHERE THE OWNER CAME FROM.
+						 * @inh_hint->gp is the DESCENT's
+						 * grandparent -- a node the op's
+						 * lock set plausibly covers -- and
+						 * the ft_resolve_parent_slot arm
+						 * is a back-pointer read that
+						 * names whatever is live.  "0
+						 * held" means different things
+						 * for the two, so count them
+						 * apart before prescribing
+						 * anything.
+						 */
+						if (inh_hint)
+							uatomic_inc(gp_held ?
+								&ft_rc_hint_held :
+								&ft_rc_hint_unheld);
+						else
+							uatomic_inc(gp_held ?
+								&ft_rc_res_held :
+								&ft_rc_res_unheld);
 #endif
 
 						/*
