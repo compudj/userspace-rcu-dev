@@ -5364,11 +5364,54 @@ void ft_flip_txn_record_root(struct ft_flip_txn *t, void **slot,
  * feeds a COUNTER first (FT_BACK_EDGE_CLAIM) and an assert only once the
  * distribution says the claim holds.
  */
+/*
+ * ☠ A PARKED PROXY IS NOT A NODE, AND THE ASSERT THAT SAID SO IS COMPILED OUT.
+ * cds_ft_item_to_metadata guards itself with
+ *
+ *     assert(((uintptr_t) p & FT_PARENT_TAG_MASK) != FT_PARENT_TAG_MASK);
+ *
+ * -- "A node, not a parked proxy" -- and EVERY build that carries this
+ * instrument also carries -DNDEBUG (the project's own benchmark CFLAGS do),
+ * which deletes it.  Unguarded, a type-7 proxy (all of FT_PARENT_TAG_MASK set)
+ * is fed to cds_ft_item_to_range and the resulting &range->metadata[index]
+ * lands unmapped: MEASURED, SIGSEGV in ~2 of 3 ft_inv runs, faulting at arena
+ * base + 0x10 (0x7f44cc000010, 0x7f1547600010, 0x7fc315a00010 -- three
+ * independent crashes, same shape), from
+ * ft_reparent_record -> ft_node_recompact(FT_RECOMPACT_DEL) -> cds_ft_remove.
+ *
+ * The OFF form of FT_BACK_EDGE_CLAIM already warned this frame was the hazard:
+ * "the resolver walks tag bits and asserts, and this helper sits on the
+ * mutation path".  So the resolver refuses the proxy ITSELF rather than
+ * trusting an assert the shipping flags disable.
+ *
+ * ☞ AND IT RESOLVES THE PARK, IT DOES NOT REFUSE IT.  The owner is not unknown
+ * when the word is parked -- it is one indirection away, through the record's
+ * MCAS status word, which is exactly what ft_resolve_flip_proxy does for every
+ * reader that loads a parent pointer.  Answering NULL instead would count a
+ * KNOWABLE owner as "there was nothing to hold", and since every owner column
+ * is guarded on that result it would push those records into the unowned
+ * population -- understating ownership in the one number this instrument
+ * exists to produce (the lane's "op holds nothing" share).  A diagnostic that
+ * biases its own measurement is worse than one that crashes loudly.
+ *
+ * @ft_be_s_proxy still counts how often the word was parked AT OBSERVATION, so
+ * the install-to-settle window stays visible -- but the record is classified on
+ * its real owner, not discarded.
+ */
+static inline
+bool ft_back_edge_word_is_proxy(const void *parent_word)
+{
+	return ((uintptr_t) parent_word & FT_PARENT_TAG_MASK)
+		== FT_PARENT_TAG_MASK;
+}
+
 static inline __attribute__((unused))
 struct cds_ft_metadata *ft_back_edge_owner(void *parent_word)
 {
-	struct cds_ft_inode_flag *nf = ft_parent_prefix_strip(
-		ft_parent_node((struct cds_ft_inode_flag *) parent_word));
+	struct cds_ft_inode_flag *nf;
+
+	nf = ft_parent_prefix_strip(ft_parent_node(ft_resolve_flip_proxy(
+		(struct cds_ft_inode_flag *) parent_word)));
 
 	if (!nf || ft_node_external(nf))
 		return NULL;		/* root position, or not a node */
@@ -5441,6 +5484,8 @@ const char *const ft_be_site_name[FT_BE_SITE_NR] = {
  * returning false and these columns are identically 0 -- which is why the
  * report prints whether the ledger is compiled in at all.
  */
+extern unsigned long ft_be_s_proxy[FT_BE_SITE_NR];
+unsigned long ft_be_s_proxy[FT_BE_SITE_NR];
 extern unsigned long ft_be_s_total[FT_BE_SITE_NR],
 	ft_be_s_old[FT_BE_SITE_NR], ft_be_s_nolocks[FT_BE_SITE_NR],
 	ft_be_s_gp[FT_BE_SITE_NR], ft_be_s_gp_none[FT_BE_SITE_NR],
@@ -5530,6 +5575,9 @@ static void ft_be_site_report(void)
 		__atomic_fetch_add(&ft_be_total, 1, __ATOMIC_RELAXED);	\
 		__atomic_fetch_add(&ft_be_s_total[dbg_be_site], 1,	\
 			__ATOMIC_RELAXED);				\
+		if (ft_back_edge_word_is_proxy(old_ptr))		\
+			__atomic_fetch_add(&ft_be_s_proxy[dbg_be_site],	\
+				1, __ATOMIC_RELAXED);			\
 		if (h_old)						\
 			__atomic_fetch_add(&ft_be_s_old[dbg_be_site], 1,\
 				__ATOMIC_RELAXED);			\
