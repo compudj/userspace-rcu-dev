@@ -399,7 +399,8 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			 * green.
 			 */
 			dual_gp_held = ft_lock_skip_dual_gp(ft, ctx, txn,
-				ft_compressed_node_flag(cn), NULL);
+				ft_compressed_node_flag(cn),
+				txn ? txn->mtxn : NULL);
 			(void) dual_gp_held;	/* kind flips with all producers */
 			_ft_publish_to_parent(ft, ft_compressed_node_flag(cn),
 				&cn->child,
@@ -492,7 +493,8 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			 * green.
 			 */
 			dual_gp_held = ft_lock_skip_dual_gp(ft, ctx, txn,
-				ft_compressed_node_flag(cn), NULL);
+				ft_compressed_node_flag(cn),
+				txn ? txn->mtxn : NULL);
 			(void) dual_gp_held;	/* kind flips with all producers */
 			_ft_publish_to_parent(ft, ft_compressed_node_flag(cn),
 				&cn->child,
@@ -684,7 +686,7 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			 * was shown to hold its owner after all.)
 			 */
 			dual_gp_held = ft_lock_skip_dual_gp(ft, ctx, txn,
-				pub_parent, NULL);
+				pub_parent, txn ? txn->mtxn : NULL);
 			(void) dual_gp_held;	/* kind flips with all producers */
 			_ft_publish_to_parent(ft, pub_parent,
 				pub_slot,
@@ -4962,7 +4964,8 @@ int ft_detach_node(struct cds_ft *ft,
 			 * ft_flip_txn_lock_register.
 			 */
 			dual_gp_held = ft_lock_skip_dual_gp(ft, &lctx, commit_txn,
-				ft_parent_node(iter_meta->parent_word), NULL);
+				ft_parent_node(iter_meta->parent_word),
+				commit_txn ? commit_txn->mtxn : NULL);
 			if (commit_txn && !commit_txn_used && !record_only)
 				ft_flip_txn_arm_per_op(ft, commit_txn);
 			_ft_publish_to_parent(ft, ft_parent_node(iter_meta->parent_word),
@@ -5119,7 +5122,8 @@ int ft_detach_node(struct cds_ft *ft,
 			 * register" -- the same placement the promote arms use.
 			 */
 			dual_gp_held = ft_lock_skip_dual_gp(ft, &lctx, commit_txn,
-				ft_parent_node(iter_meta->parent_word), NULL);
+				ft_parent_node(iter_meta->parent_word),
+				commit_txn ? commit_txn->mtxn : NULL);
 			/*
 			 * PHASE B, STEP B2 -- THE ARM, RECOMPACTION PUBLISH
 			 * (non-fused) and the non-in-place external promote.
@@ -5641,7 +5645,7 @@ int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		 * op's LAST register".
 		 */
 		dual_gp_held = ft_lock_skip_dual_gp(ft, ctx, txn, parent_nf,
-			NULL);
+			txn ? txn->mtxn : NULL);
 		ft_flip_txn_record_reserved(txn,
 			ft_flag_to_metadata(ft, parent_nf),
 			(void **) &next_node->prev,
@@ -5769,7 +5773,7 @@ int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		 * op's LAST register".
 		 */
 		dual_gp_held = ft_lock_skip_dual_gp(ft, ctx, txn, parent_nf,
-			NULL);
+			txn ? txn->mtxn : NULL);
 		ft_flip_txn_record_reserved(txn,
 			ft_flag_to_metadata(ft, parent_nf),
 			(void **) &next_node->prev, prev_save, inherit);
@@ -6210,7 +6214,7 @@ int ft_unchain_node(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		 */
 		/* No dual on this lane (detector below); discard. */
 		(void) ft_lock_skip_dual_gp(ft, ctx, txn, parent_nf,
-			NULL);
+			txn ? txn->mtxn : NULL);
 		_ft_publish_to_parent(ft, parent_nf,
 			(struct cds_ft_inode_flag **) head_slot, NULL,
 			(struct cds_ft_inode_flag *) node, &rec, false);

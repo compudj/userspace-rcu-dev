@@ -9236,6 +9236,41 @@ bool ft_skip_dual_gp_held(struct cds_ft *ft,
 #endif
 }
 
+/*
+ * ☠☠ @mtxn IS NOT OPTIONAL: PASS THE TXN THE RECORD IS BUILT ON.
+ *
+ * The dual's home is resolved by ft_txn_parent_slot_at, and with a NULL @mtxn
+ * that resolution reads the compressed node's RAW back-pointer -- which this
+ * op's own pending re-parent has not updated yet, so it names the PRE-REKEY
+ * node, the old copy the same commit retires.  The ft_pub_rec beside every one
+ * of these calls is built with `.mtxn = txn->mtxn` and therefore resolves the
+ * home CORRECTLY, so a NULL here makes the ACQUIRE lock and guard a DIFFERENT
+ * node than the RECORD writes.
+ *
+ * ★★★★★ MEASURED, resolving both ways at the same call:
+ *
+ *     RAW meta=…158 state=8 pending_new=0xa tombstoned=1   <- the acquire's
+ *     RYW meta=…358 state=c pending_new=(nil) tombstoned=0 <- the record's
+ *
+ * The guard then asserts clean-LIVE on a word this very commit tombstones; the
+ * expectation contradicts the pending new, urcu_txn_record_chain POISONS the
+ * descriptor, and the commit aborts with NO losing record -- which the caller's
+ * retry reads as retriable and spins on forever, leaking a txn per attempt.
+ * (Order matters and the "composes ORDER-FREE" note at ft_flip_txn_guard_parent
+ * only holds guard-then-retire; retire-then-guard poisons.)
+ *
+ * ☞ AND THE DEEPER RULE IT BREAKS (Mathieu): during a rekey readers run TWO
+ * DESCENTS, so they can identify the change -- but BOTH the before and the
+ * after state must be structurally correct, and the PRIOR structure must stay
+ * valid until after the grace period following the flip.  Reaching into the
+ * pre-rekey node -- locking it, guarding it, or writing its dual -- is exactly
+ * the mutation of an old copy that readers may still be traversing.  Resolve
+ * through the op's own pending re-parent so the dual lands in the AFTER-state
+ * node and the old one is left byte-for-byte alone until it is freed.
+ *
+ * ☞ The sibling ASK, ft_skip_dual_gp_held, was already called with
+ * `txn ? txn->mtxn : NULL` at every site.  The acquire's NULL was the outlier.
+ */
 bool ft_lock_skip_dual_gp(struct cds_ft *ft,
 		const struct ft_lock_ctx *ctx,
 		struct ft_flip_txn *txn,
