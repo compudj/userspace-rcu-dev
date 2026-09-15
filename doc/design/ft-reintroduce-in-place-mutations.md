@@ -263,6 +263,62 @@ and hand the held anchor to the retire on the arm where the reserve relocates
 anyway. The dedupe reasoning in §4c still holds for the later `:2266` call once
 it becomes reachable.
 
+## 4e. ☠ THE HOIST WAS TRIED AND IT LIVELOCKS — the dedupe is DIRECTIONAL
+
+The §4d shape was implemented (`if (ft_in_place_ok(ft))
+ft_flip_txn_lock_or_guard_parent(ft, ic->txn, ctx, attach_node_flag,
+FT_DEPTH_FROM_DESCENT);` before the reserve), reviewed by an adversarial
+skeptic, **refuted**, and the refutation reproduced. It is REVERTED.
+
+**The mechanism — a permanent self-refusal `-EAGAIN` spin:**
+
+1. `ft_lock_ctx_init(&actx, &d, ic.txn, ic.op)` (ft-insert.h:3369, and the three
+   sibling callers) runs **before** `ft_attach_node` arms the txn
+   (`ft_insert_commit_arm`, :2154). So `actx.held.txn == NULL`, with no extras,
+   glue or outer frame either.
+2. The hoist acquires `attach_node_flag` and registers it in `ic->txn`.
+3. The reserve relocates → `ft_node_recompact(ADD_SAME)`, which under
+   `lock_fine` acquires its own lock-set — the OLD node (= `attach_node_flag`),
+   P and GP — via `ft_dlm_acquire_set(ft, ctx, set, 3)` (ft-mutation-node.h:1445,
+   :1549), passing **the caller's const `ctx`**.
+4. Dedupe consults `ft_lock_ctx_holds(ctx, ...)` → `ft_held_set_snap` walks a
+   NULL registry → **false**. `ft_dlm_lock` then sees `FT_STATE_LOCK` on the
+   word and refuses → `-EAGAIN`.
+5. `-EAGAIN` → `goto check_error` → `ft_flip_txn_destroy(ic->txn)` CAS-clears the
+   hoisted lock → `ic->txn = NULL` → caller re-descends → identical state →
+   forever. On an exclusive trie no peer can change the outcome and the op
+   handle never escalates.
+
+☞ **THE GENERAL LESSON: DEDUPE IS DIRECTIONAL.** It works for
+*lock_or_guard AFTER recompact* because `ft_flip_txn_lock_or_guard_parent` builds
+its OWN `lctx` with `.held.txn = t`, so it sees the recompact's registrations. It
+does NOT work for *recompact AFTER lock_or_guard*: the recompact reaches
+`ft_dlm_acquire_set` through the caller's const ctx, whose registry is NULL at
+every `ft_attach_node` call site. §4c's "ft_acquire_member already dedupes" was
+right about the primitive and wrong about which ctx reaches it.
+
+**Reproduced, not merely argued**: `binplace` (`-DFEATURE_FT_INSERT_IN_PLACE`)
+hung at `test_urcu_ft_unit` row 160 and `test_urcu_ft_inv` row 80, both spinning
+(101% / 297% CPU, no output for 14 minutes). The default build stayed green
+because the predicate is compile-time false there — i.e. the green half of the
+evidence was the half that could not fail.
+
+⇒ **THE REAL PRECONDITION**: the recompact's acquire must be able to SEE the op's
+held set. That means `actx` must carry `ic->txn` — either by creating the txn
+before `ft_lock_ctx_init`, or by re-initialising/refreshing the ctx after the
+arm, or by passing a ctx that chains to the commit's registry. Until one of
+those lands, ANY lock taken before the reserve is invisible to the reserve and
+self-refuses. That is the next step for in-place, and it is a
+plumbing/lifetime change, not a locking one.
+
+Also surfaced by the review, unfixed and worth its own look:
+- Under a COARSE spacing the later site's SHARED exit would plant a §4.B guard on
+  `attach_node_flag`'s own word where the REGISTERED exit never did.
+- On a coarse trie the hoist takes the `guard:` label and plants a guard BEFORE
+  the recompact — the direction `ft_flip_txn_record_release_lock`'s doc forbids
+  and whose comment asserts "No site does today". Benign only because :1445
+  requires `lock_fine`; the stated invariant is nonetheless false.
+
 ## 5. Open items to validate (do not assume)
 
 - Forcing recompact on the dst attach parent perturbs the fold only for readers
