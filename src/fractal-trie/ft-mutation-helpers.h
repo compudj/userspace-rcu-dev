@@ -5551,11 +5551,11 @@ const char *const ft_be_site_name[FT_BE_SITE_NR] = {
 extern unsigned long ft_be_s_proxy[FT_BE_SITE_NR], ft_be_s_ctx_old[FT_BE_SITE_NR],
 	ft_be_s_ctx_null[FT_BE_SITE_NR], ft_be_s_wlock[FT_BE_SITE_NR],
 	ft_be_s_bare[FT_BE_SITE_NR], ft_be_s_noreg[FT_BE_SITE_NR],
-	ft_be_s_noreg_rel[FT_BE_SITE_NR];
+	ft_be_s_noreg_rel[FT_BE_SITE_NR], ft_be_s_noreg_miss[FT_BE_SITE_NR];
 unsigned long ft_be_s_proxy[FT_BE_SITE_NR], ft_be_s_ctx_old[FT_BE_SITE_NR],
 	ft_be_s_ctx_null[FT_BE_SITE_NR], ft_be_s_wlock[FT_BE_SITE_NR],
 	ft_be_s_bare[FT_BE_SITE_NR], ft_be_s_noreg[FT_BE_SITE_NR],
-	ft_be_s_noreg_rel[FT_BE_SITE_NR];
+	ft_be_s_noreg_rel[FT_BE_SITE_NR], ft_be_s_noreg_miss[FT_BE_SITE_NR];
 extern unsigned long ft_be_s_total[FT_BE_SITE_NR],
 	ft_be_s_old[FT_BE_SITE_NR], ft_be_s_nolocks[FT_BE_SITE_NR],
 	ft_be_s_gp[FT_BE_SITE_NR], ft_be_s_gp_none[FT_BE_SITE_NR],
@@ -5614,14 +5614,14 @@ static void ft_be_site_report(void)
 		"OFF (columns below are structurally 0, not measured)",
 #endif
 		ft_be_total);
-	fprintf(stderr, "%-18s %10s %8s %8s %8s %8s %8s %8s %8s %8s %8s %8s %8s %8s %8s %8s %8s %8s\n",
+	fprintf(stderr, "%-18s %10s %8s %8s %8s %8s %8s %8s %8s %8s %8s %8s %8s %8s %8s %8s %8s %8s %8s\n",
 		"site", "total", "oldP", "GRANDpar", "nolocks",
 		"led_old", "led_gp", "led_only", "NOowner", "newP", "led_new", "HOLDS0",
-		"ctx_old", "ctxNULL", "WLOCK", "BARE", "NOREG", "NOREGrel");
+		"ctx_old", "ctxNULL", "WLOCK", "BARE", "NOREG", "NOREGrel", "NOREGmiss");
 	for (i = 0; i < FT_BE_SITE_NR; i++) {
 		if (!ft_be_s_total[i])
 			continue;
-		fprintf(stderr, "%-18s %10lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu\n",
+		fprintf(stderr, "%-18s %10lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu\n",
 			ft_be_site_name[i], ft_be_s_total[i],
 			ft_be_s_old[i], ft_be_s_gp[i], ft_be_s_nolocks[i],
 			ft_be_s_led_old[i], ft_be_s_led_gp[i],
@@ -5630,7 +5630,7 @@ static void ft_be_site_report(void)
 			ft_be_s_led_none[i], ft_be_s_ctx_old[i],
 			ft_be_s_ctx_null[i], ft_be_s_wlock[i],
 			ft_be_s_bare[i], ft_be_s_noreg[i],
-			ft_be_s_noreg_rel[i]);
+			ft_be_s_noreg_rel[i], ft_be_s_noreg_miss[i]);
 	}
 }
 
@@ -5725,6 +5725,30 @@ static void ft_be_site_report(void)
 					 * residue is that skipped arm	\
 					 * or a MISS on the taken one.	\
 					 */				\
+					/*				\
+					 * ☠ AND "UNREGISTERED" IS NOT	\
+					 * "MISSED".  ft_flip_txn_lock_or_ \
+					 * guard_parent has THREE exits	\
+					 * and only REGISTERED makes	\
+					 * ft_flip_txn_owns true: MISS	\
+					 * sets @acquire_miss and the	\
+					 * commit DISCARDS the attempt	\
+					 * unpublished, while SHARED	\
+					 * plants a guard, registers	\
+					 * NOTHING, and RETURNS -- the	\
+					 * commit proceeds, the op	\
+					 * holding the word through an	\
+					 * anchor this txn's registry	\
+					 * cannot see.  Opposite	\
+					 * dispositions, identical zero	\
+					 * in every column above.  So ask \
+					 * the txn whether it missed.	\
+					 */				\
+					if ((t)->acquire_miss)		\
+						__atomic_fetch_add(	\
+						 &ft_be_s_noreg_miss[	\
+						  dbg_be_site], 1,	\
+						 __ATOMIC_RELAXED);	\
 					if (dbg_be_reloc)		\
 						__atomic_fetch_add(	\
 						 &ft_be_s_noreg_rel[	\
@@ -9071,17 +9095,30 @@ extern long cds_ft_fault_lock_countdown;
  * lock and whose OWN nr_child this op does not change (a value swap): its state
  * word carries only the lock, so the RELEASE terminal {LOCK|s -> s} is clean.
  *
- * On an acquire MISS -- a peer already holds @parent_nf -- fall back to the plain
- * guard.  For a value-swap target the guard is a correct, weaker representative:
- * it aborts at commit iff the peer still holds it, else the publish is safe (the
- * body was never copied under the lock, and the forward record_reserved's
- * expected-old catches a peer that changed the slot).  So a miss reuses the
- * existing guard/abort/re-descend teardown with NO new unwind path -- unlike
- * recompact, which copies C's body under C's lock and so must re-descend on a
- * miss.  The clean all-or-none acquire (no fallback) arrives when the op's
- * FT-wide lock drops; under that lock the miss never happens, so normal
- * operation always takes the release and FEATURE_FT_FAULT_INJECT exercises the
- * fallback.
+ * On an acquire MISS -- a peer already holds @parent_nf -- the acquire is
+ * ALL-OR-NONE: set @t->acquire_miss and let ft_flip_txn_commit DISCARD the
+ * attempt unpublished.  The guard below is still planted, but it is NOT the
+ * mechanism: it is redundant (on a true miss the peer's FT_STATE_LOCK makes the
+ * clean-LIVE expectation mismatch anyway) and it is kept only so the record
+ * shape is identical on the hit and miss paths.  See the MISS branch itself for
+ * the why.
+ *
+ * ☠ THIS PARAGRAPH USED TO SAY THE OPPOSITE, and the stale text outlived the
+ * change by long enough to be quoted back as an exclusion argument for a
+ * DIFFERENT word.  What it said was: "fall back to the plain guard ... for a
+ * value-swap target the guard is a correct, weaker representative: it aborts at
+ * commit iff the peer still holds it, else the publish is safe".  The degrade-
+ * and-carry-on it describes was REMOVED because that "else" is a lost update --
+ * a peer that releases between the guard and the commit leaves this op
+ * publishing into a slot it never locked.  Do not restore the reasoning without
+ * restoring the code it described.
+ *
+ * ☠ AND IT NEVER COVERED A BACK EDGE.  "the forward record_reserved's
+ * expected-old catches a peer that changed the slot" is a statement about the
+ * FORWARD slot inside @parent_nf.  The guard validates @parent_nf's own STATE
+ * word; a parked head back edge (ft_park_live_parent_edge) writes the HEAD's
+ * parent word -- a different word on a different object -- which this guard
+ * says nothing about.  An exclusion argument for that word is owed separately.
  *
  * Reservation is net-zero: the release and the guard are each one record on
  * @parent_nf's state word, and the arm already reserved the guard slot.  NULL
