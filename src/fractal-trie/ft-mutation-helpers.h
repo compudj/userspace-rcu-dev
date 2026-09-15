@@ -1030,6 +1030,39 @@ extern unsigned long cds_ft_probe_promote_guarded;
  * an SW-capable record it means the site has not named an owner, which is the
  * surface Phase B closes -- so it is a MISS, never a pass.
  */
+/*
+ * ☞ WITNESS 3, AS THIS FILE'S OWN NOTE DEMANDS.  ft_flip_txn_owns is the NARROW
+ * witness -- the commit's lock registry alone -- and the note at
+ * ft_lock_ctx_holds says to read a miss as "the registry cannot see this hold",
+ * never as "the op does not hold it": an op's marks also live in @extra, in the
+ * glue's named fields, and in OUTER frames.  "A site that has the op's ctx in
+ * hand must be scored on it."
+ *
+ * MEASURED, and this is why it is not a nicety: the SKIP_X dual's acquire exits
+ * SHARED far more often than REGISTERED -- 9549 vs 7259 on
+ * inv_concurrent_same_key_removes_nolist, and 134436 vs 0 on
+ * inv_concurrent_same_key_append_nolist.  Without this clause every one of
+ * those is a hold the assert cannot see, so a producer that vouches honestly
+ * aborts a debug build on a word it really does own.
+ */
+struct ft_lock_ctx;
+static inline bool ft_lock_ctx_holds(const struct ft_lock_ctx *ctx,
+		const struct cds_ft_metadata *meta, uintptr_t *snap,
+		bool *ratified);
+
+static inline
+bool ft_owner_ctx_holds(const struct ft_lock_ctx *ctx,
+		const struct cds_ft_metadata *owner)
+{
+	uintptr_t snap;
+	bool ratified;
+
+	if (!ctx || !owner)
+		return false;
+	return ft_lock_ctx_holds(ctx, owner, &snap, &ratified);
+}
+
+
 #if defined(DEBUG_RCU) || defined(CONFIG_RCU_DEBUG)
 /*
  * @dbg_txn_ft is carried ONLY for the wide-exclusion arm below: the assert must
@@ -1087,38 +1120,6 @@ extern unsigned long cds_ft_probe_promote_guarded;
  * `clear` to forget.  A caller that supplies @ctx on a record of any other
  * shape gets the NARROW predicate back -- misuse fails CLOSED.
  */
-/*
- * ☞ WITNESS 3, AS THIS FILE'S OWN NOTE DEMANDS.  ft_flip_txn_owns is the NARROW
- * witness -- the commit's lock registry alone -- and the note at
- * ft_lock_ctx_holds says to read a miss as "the registry cannot see this hold",
- * never as "the op does not hold it": an op's marks also live in @extra, in the
- * glue's named fields, and in OUTER frames.  "A site that has the op's ctx in
- * hand must be scored on it."
- *
- * MEASURED, and this is why it is not a nicety: the SKIP_X dual's acquire exits
- * SHARED far more often than REGISTERED -- 9549 vs 7259 on
- * inv_concurrent_same_key_removes_nolist, and 134436 vs 0 on
- * inv_concurrent_same_key_append_nolist.  Without this clause every one of
- * those is a hold the assert cannot see, so a producer that vouches honestly
- * aborts a debug build on a word it really does own.
- */
-struct ft_lock_ctx;
-static inline bool ft_lock_ctx_holds(const struct ft_lock_ctx *ctx,
-		const struct cds_ft_metadata *meta, uintptr_t *snap,
-		bool *ratified);
-
-static inline
-bool ft_owner_ctx_holds(const struct ft_lock_ctx *ctx,
-		const struct cds_ft_metadata *owner)
-{
-	uintptr_t snap;
-	bool ratified;
-
-	if (!ctx || !owner)
-		return false;
-	return ft_lock_ctx_holds(ctx, owner, &snap, &ratified);
-}
-
 # define FT_OWNER_ASSERT_OWNED_CTX(t, ctx, owner, slot, new_ptr)	\
 	urcu_assert_debug(!(t)->dbg_arm_per_op || !(t)->nr_locks ||	\
 			ft_flip_txn_owns((t), (owner)) ||		\
@@ -9154,10 +9155,79 @@ static void ft_dual_exit_report(void)
 		uatomic_read(&ft_dual_exit[0]), uatomic_read(&ft_dual_exit[1]),
 		uatomic_read(&ft_dual_exit[2]), uatomic_read(&ft_dual_exit[3]));
 }
+unsigned long ft_dual_ask[2];
+static void ft_dual_ask_report(void) __attribute__((destructor));
+static void ft_dual_ask_report(void)
+{
+	fprintf(stderr, "FT DUAL-GP ASK held=%lu unheld=%lu\n",
+		uatomic_read(&ft_dual_ask[1]), uatomic_read(&ft_dual_ask[0]));
+}
 # define FT_DUAL_EXIT_TALLY(ex)	uatomic_inc(&ft_dual_exit[(ex)])
+# define FT_DUAL_ASK_TALLY(h)	uatomic_inc(&ft_dual_ask[(h) ? 1 : 0])
 #else
 # define FT_DUAL_EXIT_TALLY(ex)	do { (void) (ex); } while (0)
+# define FT_DUAL_ASK_TALLY(h)	do { (void) (h); } while (0)
 #endif
+
+/*
+ * ASK, DO NOT ACQUIRE: does the op ALREADY hold the SKIP_X dual's derived
+ * grandparent?
+ *
+ * ☠☠ THIS PROBE EXISTS BECAUSE IT REFUTED THE THEORY THAT PRODUCED IT.  The
+ * theory was: ft_detach_node's up-front DLM set is {C, P, GP}, its @pp_flag
+ * member IS the compressed parent's own parent, so at
+ * ft_detach_node_replace_compressed_parent's publishes the op ALREADY holds the
+ * dual's owner and the acquire that hangs there is merely a second ask.
+ *
+ * MEASURED ACROSS ALL 153 inv ROWS: held = 0 of 40894.  The op holds NOTHING
+ * of that word.  @pp_flag is the grandparent of the op's ITERATION parent,
+ * while the dual's owner is derived at publish from @cn_meta's back-pointer,
+ * and those are different nodes.  ⇒ The acquire really is MISSING there, and
+ * "the hoist is already done" was wrong.
+ *
+ * ☞ SO THE HANG IS STILL UNEXPLAINED, and this probe is what says so.  Adding
+ * ft_lock_skip_dual_gp at those publishes wedges
+ * test_rekey_same_path_atomic_or_refused (2/2 standalone, HEAD 2/2 green,
+ * bisected to exactly those two calls) -- but NOT because the op re-asks for a
+ * word it holds.  Whatever the mechanism is, it has to be found before that
+ * site can take §9.3's third member, and a green run without it proves nothing.
+ *
+ * Kept because the question "does this op already hold the dual's owner?" is
+ * one every producer has to answer, and answering it with a lock ACQUIRE
+ * conflates it with taking one.
+ */
+bool ft_skip_dual_gp_held(struct cds_ft *ft,
+		const struct ft_lock_ctx *ctx,
+		struct cds_ft_inode_flag *parent_nf,
+		struct urcu_txn *mtxn)
+{
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+	struct cds_ft_compressed_node *cn;
+	struct cds_ft_metadata *cn_meta;
+	struct cds_ft_inode_flag *gp_nf = NULL;
+	struct cds_ft_inode_flag **skip_slot;
+
+	if (!parent_nf || !ft_node_compressed(parent_nf))
+		return false;
+	cn = ft_compressed_node_ptr(parent_nf);
+	cn_meta = cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
+	skip_slot = ft_txn_parent_slot_at(cn_meta, ft, mtxn, &gp_nf);
+	if (!skip_slot || !ft_node_skip_compressed(*skip_slot))
+		return false;		/* no dual edge will be recorded */
+	if (skip_slot == &ft->root || !gp_nf)
+		return false;		/* root dual: no owning node */
+	{
+		bool held = ft_owner_ctx_holds(ctx,
+			ft_flag_to_metadata(ft, gp_nf));
+
+		FT_DUAL_ASK_TALLY(held);
+		return held;
+	}
+#else
+	(void) ft; (void) ctx; (void) parent_nf; (void) mtxn;
+	return false;
+#endif
+}
 
 bool ft_lock_skip_dual_gp(struct cds_ft *ft,
 		const struct ft_lock_ctx *ctx,

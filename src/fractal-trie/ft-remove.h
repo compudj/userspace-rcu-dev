@@ -79,6 +79,13 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 		long count_delta)
 {
 	/*
+	 * Does the op hold the SKIP_X dual's derived grandparent?  ASKED, never
+	 * acquired here -- see ft_skip_dual_gp_held for why a second acquire at
+	 * this site hangs.
+	 */
+	bool dual_gp_held = false;
+
+	/*
 	 * @txn is created and reserved by the caller (ft_detach_node), sized for
 	 * this publish's structural edges PLUS one freeze-on-free tombstone per
 	 * node in the orphaned chain the caller collected below -- so the
@@ -343,12 +350,20 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			 * lock_fine", so this frame is precisely an op that
 			 * arrives holding part of the set.
 			 *
-			 * ⇒ This site needs the acquire HOISTED into the up-front
-			 * lock set beside cn's, not bolted on at the publish.
-			 * Until then it stays as it was, and the dual's KIND
-			 * cannot flip: this producer still writes the slot
-			 * without holding it.
+			 * ☠ AND IT IS NOT "THE OP ALREADY HOLDS IT" EITHER -- that
+			 * theory is REFUTED, 0 held of 40894 asked across all 153
+			 * inv rows (ft_skip_dual_gp_held).  ft_detach_node's
+			 * up-front {C, P, GP} set holds the grandparent of the
+			 * op's ITERATION parent; the dual's owner is derived at
+			 * publish from cn_meta's back-pointer, and they are
+			 * different nodes.  The acquire really is missing here,
+			 * the hang has no explanation yet, and the ask below is
+			 * the instrument that will not let either be assumed.
 			 */
+			dual_gp_held = ft_skip_dual_gp_held(ft, ctx,
+				ft_compressed_node_flag(cn),
+				txn ? txn->mtxn : NULL);
+			(void) dual_gp_held;	/* kind held back: see below */
 			_ft_publish_to_parent(ft, ft_compressed_node_flag(cn),
 				&cn->child,
 				(struct cds_ft_inode_flag *) topmost_external_nodes,
@@ -403,12 +418,20 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			 * lock_fine", so this frame is precisely an op that
 			 * arrives holding part of the set.
 			 *
-			 * ⇒ This site needs the acquire HOISTED into the up-front
-			 * lock set beside cn's, not bolted on at the publish.
-			 * Until then it stays as it was, and the dual's KIND
-			 * cannot flip: this producer still writes the slot
-			 * without holding it.
+			 * ☠ AND IT IS NOT "THE OP ALREADY HOLDS IT" EITHER -- that
+			 * theory is REFUTED, 0 held of 40894 asked across all 153
+			 * inv rows (ft_skip_dual_gp_held).  ft_detach_node's
+			 * up-front {C, P, GP} set holds the grandparent of the
+			 * op's ITERATION parent; the dual's owner is derived at
+			 * publish from cn_meta's back-pointer, and they are
+			 * different nodes.  The acquire really is missing here,
+			 * the hang has no explanation yet, and the ask below is
+			 * the instrument that will not let either be assumed.
 			 */
+			dual_gp_held = ft_skip_dual_gp_held(ft, ctx,
+				ft_compressed_node_flag(cn),
+				txn ? txn->mtxn : NULL);
+			(void) dual_gp_held;	/* kind held back: see below */
 			_ft_publish_to_parent(ft, ft_compressed_node_flag(cn),
 				&cn->child,
 				(struct cds_ft_inode_flag *) topmost_external_nodes,
