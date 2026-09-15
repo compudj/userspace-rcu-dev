@@ -19,6 +19,29 @@
 #error "ft-insert.h is an implementation unit; #include it from fractal-trie.c only"
 #endif
 
+#ifdef FT_DEBUG_INPLACE_HOIST
+/*
+ * Sizing the two halves of the in-place ACQUIRE HOIST
+ * (doc/design/ft-reintroduce-in-place-mutations.md §4c): the reserve staying IN
+ * PLACE makes the hoist a clean MOVE of the :2266 acquire, while a RELOCATION
+ * leaves the hoisted lock on a node the op RETIRES -- which needs the anchored
+ * retire, not a plain one.  Printed at exit.
+ */
+extern unsigned long ft_ip_reserve_inplace, ft_ip_reserve_reloc;
+unsigned long ft_ip_reserve_inplace, ft_ip_reserve_reloc;
+static void ft_ip_reserve_report(void) __attribute__((destructor));
+static void ft_ip_reserve_report(void)
+{
+	unsigned long ip = ft_ip_reserve_inplace, rl = ft_ip_reserve_reloc;
+
+	if (!ip && !rl)
+		return;
+	fprintf(stderr,
+		"\nFT_INPLACE_HOIST  reserve IN PLACE=%lu  RELOCATED=%lu  (reloc %.2f%%)\n",
+		ip, rl, rl * 100.0 / (double) (ip + rl));
+}
+#endif
+
 /*
  * One-commit insert state (ordered-list fresh-head insert): the attach
  * machinery parks a flip proxy in the structural slot (resolving to the OLD
@@ -2192,6 +2215,25 @@ int ft_attach_node(struct cds_ft *ft,
 					dbg_printf("branch publish error %d\n", ret);
 					goto check_error;
 				}
+#ifdef FT_DEBUG_INPLACE_HOIST
+				/*
+				 * WHICH HALF IS THE HOIST?  Moving the :2266
+				 * acquire above this reserve is a clean MOVE
+				 * when the reserve stays IN PLACE (same node,
+				 * same op, just earlier), but on the
+				 * RELOCATION arm the reserve RETIRES the attach
+				 * node -- so a hoisted lock would sit on a node
+				 * the op retires, which needs the anchored
+				 * retire rather than a plain one.  Size the two
+				 * before choosing the shape.
+				 */
+				if (iter_dest_node_flag == attach_node_flag)
+					__atomic_fetch_add(&ft_ip_reserve_inplace,
+						1, __ATOMIC_RELAXED);
+				else
+					__atomic_fetch_add(&ft_ip_reserve_reloc,
+						1, __ATOMIC_RELAXED);
+#endif
 			}
 			/*
 			 * The in-place reserve owes @metadata (the LIVE attach

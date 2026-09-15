@@ -226,6 +226,43 @@ Implementation sketch, in order:
 every path between `:2187` and `:2266` tolerates the lock being held (nothing
 there may take it again outside the dedupe, and nothing may release it early).
 
+## 4d. ☠ THE :2266 ACQUIRE IS UNREACHABLE TODAY — §4c's "move" reading is wrong
+
+Measured the split the hoist's shape depends on (`-DFT_DEBUG_INPLACE_HOIST`,
+counting `iter_dest_node_flag == attach_node_flag` right after the reserve):
+
+```
+FT_INPLACE_HOIST  reserve IN PLACE=0  RELOCATED=3518118  (reloc 100.00%)
+```
+
+☠ **READ THE CONTROL FIRST: this number is CIRCULAR.** With `ft_in_place_ok`
+false, every reserve returns `-ERANGE` and routes through
+`ft_node_recompact(ADD_SAME)`, which builds a fresh node — so relocation is
+forced *by construction*, not observed. It says nothing about the ratio that
+would obtain with in-place enabled, and the honest measurement needs a config
+where the predicate can be true (an EXCLUSIVE trie under
+`-DFEATURE_FT_INSERT_IN_PLACE`), which today's oracles do not drive.
+
+☑ **What it DOES establish, and it matters:** `iter_dest_node_flag` never equals
+`attach_node_flag`, so the guard at `:2265` is never true and **the acquire at
+`:2266` never executes in the default build.** It exists FOR the in-place case
+and is currently dead code.
+
+⇒ So §4c's "the hoist relocates an existing acquire" is **wrong**: today there is
+no acquire on that path at all. The hoist would INTRODUCE a lock — and on the
+relocation arm it would sit on a node the reserve RETIRES, which the comment at
+`:2261` says needs nothing today ("the reserve's recompact already locked the
+grandparent it republishes into"). Introducing one there means the retire must
+become ANCHORED against the held word rather than plain — the exact pairing this
+tree has already been bitten by ("the GUARD and the ANCHORED RETIRE shared a
+predicate and disagreed on the KIND").
+
+**Revised shape**: acquire `attach_node_flag` before the reserve *only when
+`ft_in_place_ok`* (so the relocation-only default is byte-for-byte unchanged),
+and hand the held anchor to the retire on the arm where the reserve relocates
+anyway. The dedupe reasoning in §4c still holds for the later `:2266` call once
+it becomes reachable.
+
 ## 5. Open items to validate (do not assume)
 
 - Forcing recompact on the dst attach parent perturbs the fold only for readers
