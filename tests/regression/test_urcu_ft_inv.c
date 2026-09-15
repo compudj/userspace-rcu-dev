@@ -22579,7 +22579,24 @@ static int inv_concurrent_same_key_removes_run(bool ordered_list,
 			fprintf(stderr, "%s: RED at round %u\n", name, r);
 			/* let the writers run out their bounded loop */
 		}
-		rcu_barrier();		/* the nodes are re-inserted next round: retire the freezes first */
+		/*
+		 * ☞ THE NODE-REUSE FENCE.  The next round re-initialises these
+		 * nodes, and cds_ft_node_init() writes prev/next on objects a
+		 * peer may still hold -- cds_ft_remove's contract reserves a
+		 * GRACE PERIOD before any such write:
+		 *
+		 *   "A grace period must be observed (e.g., synchronize_rcu,
+		 *    call_rcu) after success before reclaiming @node memory."
+		 *
+		 * rcu_barrier() does NOT supply one.  It waits for in-flight
+		 * call_rcu CALLBACKS to run, and this row queues none of its
+		 * own -- with an empty queue it can return having waited for
+		 * nothing at all.  Only synchronize_rcu() fences the readers.
+		 * Every worker is parked in skr_bwait, which goes OFFLINE
+		 * around the wait, so the grace period completes here.
+		 */
+		synchronize_rcu();
+		rcu_barrier();		/* and retire the library's own freezes */
 		skr_bwait(&c.bar);		/* verified */
 	}
 	for (t = 0; t < SKR_T + 1; t++)
@@ -22677,11 +22694,72 @@ static int inv_concurrent_same_key_removes_nolist(void)
 
 struct ska_ctx {
 	struct cds_ft *ft;
-	struct skr_node *resident;		/* [SKA_K], owned by the remover */
-	struct skr_node *guest;			/* [SKA_K], owned by the appender */
+	/*
+	 * ☞ INDEX, NOT STORAGE.  Each slot names the node that lane currently
+	 * has installed for key @k.  The nodes are HEAP allocated per install
+	 * and released through node_free_rcu, so no object is ever written
+	 * again after it leaves the trie -- cds_ft_remove's contract:
+	 *
+	 *   "A grace period must be observed (e.g., synchronize_rcu,
+	 *    call_rcu) after success before reclaiming @node memory."
+	 *
+	 * The arrays this replaced were index AND allocator at once, so each
+	 * reuse opened with cds_ft_node_init() wiping prev/next on an object
+	 * the PEER lane could still be descending through.
+	 */
+	struct ft_test_node **resident;		/* [SKA_K], owned by the remover */
+	struct ft_test_node **guest;		/* [SKA_K], owned by the appender */
 	pthread_barrier_t bar;
 	unsigned long holder_bail;		/* appends that re-descended */
 };
+
+/*
+ * Take this lane's node for @key back out.  On success it has LEFT the trie,
+ * so node_free_rcu reclaims it after a grace period and the slot clears.  On
+ * failure it is STILL LINKED and stays indexed: the caller retries before
+ * installing another, because re-inserting a node still in the trie would
+ * corrupt the chain and frame the library.
+ */
+static void ska_take_out(struct cds_ft *ft, struct cds_ft_iter *iter,
+		struct ft_test_node **slot, const uint8_t *key)
+{
+	if (!*slot)
+		return;
+	rcu_read_lock();
+	cds_ft_iter_set_key(iter, key, CDS_FT_LEN_DEFAULT);
+	if (cds_ft_lookup(ft, iter) == CDS_FT_STATUS_OK &&
+			cds_ft_remove(ft, iter, &(*slot)->node) ==
+			CDS_FT_STATUS_OK) {
+		node_free_rcu(*slot);
+		*slot = NULL;
+	}
+	rcu_read_unlock();
+	rcu_quiescent_state();
+}
+
+/*
+ * Install a FRESH node for @key.  A refused insert never became reachable, so
+ * a plain free is correct there.
+ */
+static void ska_put_in(struct cds_ft *ft, struct ft_test_node **slot,
+		const uint8_t *key, unsigned int k)
+{
+	struct ft_test_node *fresh;
+
+	if (*slot)
+		return;
+	fresh = node_alloc((uint64_t) k);
+	rcu_read_lock();
+	if (cds_ft_insert(ft, key, CDS_FT_LEN_DEFAULT, &fresh->node) ==
+			CDS_FT_STATUS_OK) {
+		*slot = fresh;
+		fresh = NULL;
+	}
+	rcu_read_unlock();
+	if (fresh)
+		node_free(fresh);
+	rcu_quiescent_state();
+}
 
 static void *ska_appender(void *arg)
 {
@@ -22706,31 +22784,15 @@ static void *ska_appender(void *arg)
 		for (burst = 0; burst < SKA_BURST; burst++)
 		for (k = 0; k < SKA_K; k++) {
 			uint8_t key[8];
-			int in = 0;
 
 			cds_ft_u64_to_key(c->ft, (uint64_t) k, key,
 				CDS_FT_LEN_DEFAULT);
-			rcu_read_lock();
-			cds_ft_node_init(&c->guest[k].node);
-			if (cds_ft_insert(c->ft, key, CDS_FT_LEN_DEFAULT,
-					&c->guest[k].node) == CDS_FT_STATUS_OK)
-				in = 1;
-			rcu_read_unlock();
-			rcu_quiescent_state();
-			/* Take back out ONLY what went in: re-inserting a node
-			 * still in the trie is a test bug that corrupts the
-			 * chain and would frame the library. */
-			if (in) {
-				rcu_read_lock();
-				cds_ft_iter_set_key(iter, key,
-					CDS_FT_LEN_DEFAULT);
-				if (cds_ft_lookup(c->ft, iter) ==
-						CDS_FT_STATUS_OK)
-					(void) cds_ft_remove(c->ft, iter,
-						&c->guest[k].node);
-				rcu_read_unlock();
-				rcu_quiescent_state();
-			}
+			/* Anything an earlier attempt failed to retract comes
+			 * out first, then a fresh one goes in and straight back
+			 * out -- the append/retire pair this row exists for. */
+			ska_take_out(c->ft, iter, &c->guest[k], key);
+			ska_put_in(c->ft, &c->guest[k], key, k);
+			ska_take_out(c->ft, iter, &c->guest[k], key);
 		}
 	}
 	cds_ft_iter_destroy(iter);
@@ -22761,28 +22823,13 @@ static void *ska_remover(void *arg)
 		for (burst = 0; burst < SKA_BURST; burst++)
 		for (k = 0; k < SKA_K; k++) {
 			uint8_t key[8];
-			int gone = 0;
 
 			cds_ft_u64_to_key(c->ft, (uint64_t) k, key,
 				CDS_FT_LEN_DEFAULT);
-			rcu_read_lock();
-			cds_ft_iter_set_key(iter, key, CDS_FT_LEN_DEFAULT);
-			if (cds_ft_lookup(c->ft, iter) == CDS_FT_STATUS_OK &&
-					cds_ft_remove(c->ft, iter,
-						&c->resident[k].node) ==
-					CDS_FT_STATUS_OK)
-				gone = 1;
-			rcu_read_unlock();
-			rcu_quiescent_state();
-			if (gone) {		/* re-insert only what came out */
-				rcu_read_lock();
-				cds_ft_node_init(&c->resident[k].node);
-				(void) cds_ft_insert(c->ft, key,
-					CDS_FT_LEN_DEFAULT,
-					&c->resident[k].node);
-				rcu_read_unlock();
-				rcu_quiescent_state();
-			}
+			/* Retire the resident and put a FRESH one back: only
+			 * what came out is replaced. */
+			ska_take_out(c->ft, iter, &c->resident[k], key);
+			ska_put_in(c->ft, &c->resident[k], key, k);
 		}
 	}
 	cds_ft_iter_destroy(iter);
@@ -22818,8 +22865,9 @@ static int inv_concurrent_same_key_append_run(bool ordered_list, bool coarse,
 	if (cds_ft_create(group, NULL, &c.ft) < 0)
 		abort();
 	cds_ft_make_concurrent(c.ft);
-	c.resident = (struct skr_node *) calloc(SKA_K, sizeof(*c.resident));
-	c.guest = (struct skr_node *) calloc(SKA_K, sizeof(*c.guest));
+	c.resident = (struct ft_test_node **) calloc(SKA_K,
+		sizeof(*c.resident));
+	c.guest = (struct ft_test_node **) calloc(SKA_K, sizeof(*c.guest));
 	if (!c.resident || !c.guest)
 		abort();
 	if (cds_ft_iter_create(c.ft, &iter) != CDS_FT_STATUS_OK)
@@ -22828,13 +22876,13 @@ static int inv_concurrent_same_key_append_run(bool ordered_list, bool coarse,
 	for (k = 0; k < SKA_K; k++) {
 		uint8_t key[8];
 
-		cds_ft_node_init(&c.resident[k].node);
-		c.resident[k].k = k;
-		c.guest[k].k = k;
+		struct ft_test_node *n = node_alloc((uint64_t) k);
+
 		cds_ft_u64_to_key(c.ft, (uint64_t) k, key, CDS_FT_LEN_DEFAULT);
 		if (cds_ft_insert(c.ft, key, CDS_FT_LEN_DEFAULT,
-				&c.resident[k].node) != CDS_FT_STATUS_OK)
+				&n->node) != CDS_FT_STATUS_OK)
 			abort();
+		c.resident[k] = n;
 	}
 	rcu_quiescent_state();
 	pthread_create(&th[0], NULL, ska_appender, &c);
@@ -22859,11 +22907,12 @@ static int inv_concurrent_same_key_append_run(bool ordered_list, bool coarse,
 		if (cds_ft_lookup(c.ft, iter) != CDS_FT_STATUS_OK)
 			continue;
 		for (h = cds_ft_iter_node(iter); h; h = cds_ft_node_next_rcu(h)) {
-			struct skr_node *n = (struct skr_node *) h;
+			struct ft_test_node *n = to_test_node(h);
 
-			if (n != &c.resident[k] && n != &c.guest[k]) {
-				fprintf(stderr, "%s: key %u holds a FOREIGN node (k=%u)\n",
-					name, k, n->k);
+			if (n != c.resident[k] && n != c.guest[k]) {
+				fprintf(stderr, "%s: key %u holds a FOREIGN node (k=%llu)\n",
+					name, k,
+					(unsigned long long) n->key);
 				ret = -1;
 			}
 		}
@@ -22875,8 +22924,22 @@ static int inv_concurrent_same_key_append_run(bool ordered_list, bool coarse,
 	rcu_barrier();
 	cds_ft_destroy(c.ft);
 	cds_ft_group_destroy(group);
+	/*
+	 * Whatever each lane still had installed: the trie is gone, so nothing
+	 * can reach these any more -- but they were handed out under RCU, so
+	 * they leave the same way.
+	 */
+	for (k = 0; k < SKA_K; k++) {
+		if (c.resident[k])
+			node_free_rcu(c.resident[k]);
+		if (c.guest[k])
+			node_free_rcu(c.guest[k]);
+	}
 	free(c.resident);
 	free(c.guest);
+	/* The deferred frees must land before RUN_TEST's leak_check(). */
+	rcu_quiescent_state();
+	rcu_barrier();
 	fprintf(stderr, "# %s: %u rounds x %u keys, appender vs same-key remover (%s) -> %s\n",
 		name, SKA_R, SKA_K, coarse ? "coarse" : "fine",
 		ret ? "RED" : "ok");
@@ -22944,11 +23007,22 @@ struct ski_ctx {
 	 * row exists to create.
 	 */
 	struct ft_test_node **cur[2];	/* [2][SKI_K] */
-	struct skr_node *n[2];		/* [2][SKI_K]: one node array per worker */
-	unsigned char *in[2];		/* [2][SKI_K]: MY node is currently in.  For
-					 * the REPLACE row's worker 1 this names
-					 * WHICH of its pair is installed (0/1/2). */
-	struct skr_node *alt;		/* [SKI_K]: worker 1's second node, replace row */
+	/*
+	 * ☞ siu_worker RETAINS every node it removes until teardown rather
+	 * than reclaiming it during the run.  Its oracle asks a HARD question
+	 * about a pointer the LIBRARY hands back (@dup): "is this a node of
+	 * this key?", and @siu_dup_foreign turns the row RED on a no.  That
+	 * question is only answerable while the node's shadow @key is still
+	 * its own.  Reclaim during the run would let a later node_alloc for a
+	 * DIFFERENT key recycle the memory, and a stale @dup -- which this row
+	 * sees 50-90 times a run, counted reported-only as @siu_dup_absent --
+	 * would then read as FOREIGN and turn a merely racy row red.
+	 * Retaining costs a few MB for the run and takes recycling out of the
+	 * question entirely.  Only worker @id touches its own slot.
+	 */
+	struct ft_test_node **ret_v[2];
+	size_t ret_n[2], ret_cap[2];
+	unsigned char *in[2];		/* [2][SKI_K]: MY node is currently in. */
 };
 
 struct ski_arg {
@@ -23078,14 +23152,11 @@ static int inv_concurrent_same_key_inserts_run(bool ordered_list, bool coarse,
 		abort();
 	cds_ft_make_concurrent(c.ft);
 	for (i = 0; i < 2; i++) {
-		c.n[i] = (struct skr_node *) calloc(SKI_K, sizeof(*c.n[i]));
 		c.in[i] = (unsigned char *) calloc(SKI_K, 1);
 		c.cur[i] = (struct ft_test_node **) calloc(SKI_K,
 			sizeof(*c.cur[i]));
-		if (!c.n[i] || !c.in[i] || !c.cur[i])
+		if (!c.in[i] || !c.cur[i])
 			abort();
-		for (k = 0; k < SKI_K; k++)
-			c.n[i][k].k = k;
 	}
 	if (cds_ft_iter_create(c.ft, &iter) != CDS_FT_STATUS_OK)
 		abort();
@@ -23162,7 +23233,6 @@ static int inv_concurrent_same_key_inserts_run(bool ordered_list, bool coarse,
 			if (c.cur[i][k])
 				node_free_rcu(c.cur[i][k]);
 		free(c.cur[i]);
-		free(c.n[i]);
 		free(c.in[i]);
 	}
 	/* The deferred frees must land before RUN_TEST's leak_check(). */
@@ -23225,6 +23295,22 @@ struct siu_arg {
 	unsigned int id;
 };
 
+static void siu_retain(struct ski_ctx *c, unsigned int id,
+		struct ft_test_node *n)
+{
+	if (c->ret_n[id] == c->ret_cap[id]) {
+		size_t cap = c->ret_cap[id] ? c->ret_cap[id] * 2 : 1024;
+		struct ft_test_node **v = (struct ft_test_node **)
+			realloc(c->ret_v[id], cap * sizeof(*v));
+
+		if (!v)
+			abort();
+		c->ret_v[id] = v;
+		c->ret_cap[id] = cap;
+	}
+	c->ret_v[id][c->ret_n[id]++] = n;
+}
+
 static void *siu_worker(void *arg)
 {
 	struct siu_arg *a = (struct siu_arg *) arg;
@@ -23245,10 +23331,11 @@ static void *siu_worker(void *arg)
 				CDS_FT_LEN_DEFAULT);
 			if (!c->in[id][k]) {
 				struct cds_ft_node *dup = NULL;
+				struct ft_test_node *fresh =
+					node_alloc((uint64_t) k);
 				enum cds_ft_status st;
 
 				rcu_read_lock();
-				cds_ft_node_init(&c->n[id][k].node);
 #ifdef FT_INV_SIU_RED_DUP
 				/*
 				 * RED CONTROL: admit a duplicate ON PURPOSE, by
@@ -23262,13 +23349,15 @@ static void *siu_worker(void *arg)
 				if (r == SKI_R / 2 && burst == 0 && k == 0)
 					st = cds_ft_insert(c->ft, key,
 						CDS_FT_LEN_DEFAULT,
-						&c->n[id][k].node);
+						&fresh->node);
 				else
 #endif
 				st = cds_ft_insert_unique(c->ft, key,
 					CDS_FT_LEN_DEFAULT,
-					&c->n[id][k].node, &dup);
+					&fresh->node, &dup);
 				if (st == CDS_FT_STATUS_OK) {
+					CMM_STORE_SHARED(c->cur[id][k], fresh);
+					fresh = NULL;
 					c->in[id][k] = 1;
 					uatomic_inc(&siu_ok);
 					/*
@@ -23306,12 +23395,46 @@ static void *siu_worker(void *arg)
 					 * is the FT-SLOT-2 mode: counted, since a
 					 * peer may also have removed it legally.
 					 */
-					if (dup != &c->n[0][k].node &&
-					    dup != &c->n[1][k].node) {
+#ifdef FT_INV_SIU_RED_FOREIGN
+					/*
+					 * RED CONTROL for the clause below.  The
+					 * shadow-key test is what makes the
+					 * FOREIGN check race-free, and a clause
+					 * that can only ever answer "not foreign"
+					 * would certify nothing.  Substitute a
+					 * node of ANOTHER key once: it must go
+					 * loud.
+					 */
+					if (r == SKI_R / 2 && burst == 0 &&
+							k == 0) {
+						static struct ft_test_node alien;
+
+						alien.key = (uint64_t) k + 1000;
+						dup = &alien.node;
+					}
+#endif
+					if (to_test_node(dup)->key !=
+							(uint64_t) k) {
 						/*
 						 * FOREIGN: not a node of this
 						 * key at all.  NON-RACY -- no
 						 * schedule makes this legal.
+						 *
+						 * ☞ ASK THE NODE, NOT THE INDEX.
+						 * The index slots are heap
+						 * pointers the peer swaps as it
+						 * installs and retires, so
+						 * reading the PEER's slot would
+						 * race and could call its node
+						 * foreign.  @key is stamped once
+						 * by node_alloc and, because
+						 * this row RETAINS every node it
+						 * removes (see ski_ctx), it
+						 * stays that node's key for the
+						 * whole run -- a stale @dup is
+						 * still a node OF THIS KEY, and
+						 * lands in @siu_dup_absent where
+						 * it belongs.
 						 */
 						uatomic_inc(&siu_dup_foreign);
 					} else {
@@ -23344,16 +23467,29 @@ static void *siu_worker(void *arg)
 					}
 				}
 				rcu_read_unlock();
+				/* Refused: never reachable, plain free. */
+				if (fresh)
+					node_free(fresh);
 			} else {
 				rcu_read_lock();
 				cds_ft_iter_set_key(iter, key,
 					CDS_FT_LEN_DEFAULT);
 				if (cds_ft_lookup(c->ft, iter) ==
 						CDS_FT_STATUS_OK &&
+						c->cur[id][k] &&
 						cds_ft_remove(c->ft, iter,
-							&c->n[id][k].node) ==
-						CDS_FT_STATUS_OK)
+							&c->cur[id][k]->node) ==
+						CDS_FT_STATUS_OK) {
+					/*
+					 * Out of the trie and out of the index,
+					 * and never written again -- retained,
+					 * not reclaimed, so its shadow key stays
+					 * answerable for the rest of the run.
+					 */
+					siu_retain(c, id, c->cur[id][k]);
+					CMM_STORE_SHARED(c->cur[id][k], NULL);
 					c->in[id][k] = 0;
+				}
 				rcu_read_unlock();
 			}
 			rcu_quiescent_state();
@@ -23391,12 +23527,11 @@ static int inv_concurrent_insert_unique_run(bool coarse, const char *name)
 		abort();
 	cds_ft_make_concurrent(c.ft);
 	for (i = 0; i < 2; i++) {
-		c.n[i] = (struct skr_node *) calloc(SKI_K, sizeof(*c.n[i]));
 		c.in[i] = (unsigned char *) calloc(SKI_K, 1);
-		if (!c.n[i] || !c.in[i])
+		c.cur[i] = (struct ft_test_node **) calloc(SKI_K,
+			sizeof(*c.cur[i]));
+		if (!c.in[i] || !c.cur[i])
 			abort();
-		for (k = 0; k < SKI_K; k++)
-			c.n[i][k].k = k;
 	}
 	if (cds_ft_iter_create(c.ft, &iter) != CDS_FT_STATUS_OK)
 		abort();
@@ -23441,9 +23576,26 @@ static int inv_concurrent_insert_unique_run(bool coarse, const char *name)
 	cds_ft_destroy(c.ft);
 	cds_ft_group_destroy(group);
 	for (i = 0; i < 2; i++) {
-		free(c.n[i]);
+		/*
+		 * Whatever each worker still had installed: the trie is gone, so
+		 * nothing can reach these any more -- but they were handed out
+		 * under RCU, so they leave the same way.
+		 */
+		size_t j;
+
+		for (k = 0; k < SKI_K; k++)
+			if (c.cur[i][k])
+				node_free_rcu(c.cur[i][k]);
+		/* And everything this worker retired and held onto. */
+		for (j = 0; j < c.ret_n[i]; j++)
+			node_free_rcu(c.ret_v[i][j]);
+		free(c.ret_v[i]);
+		free(c.cur[i]);
 		free(c.in[i]);
 	}
+	/* The deferred frees must land before RUN_TEST's leak_check(). */
+	rcu_quiescent_state();
+	rcu_barrier();
 	if (siu_chain2) {
 		fprintf(stderr, "%s: %lu observation(s) of a >=2 chain right "
 			"after a successful cds_ft_insert_unique -- UNIQUENESS "
@@ -23610,37 +23762,52 @@ static void *skrp_replacer(void *arg)
 		for (burst = 0; burst < SKI_BURST; burst++)
 		for (k = 0; k < SKI_K; k++) {
 			uint8_t key[8];
-			/* in[1][k] is 0 while neither of B's nodes is in, else
-			 * 1 or 2 naming WHICH of the pair is installed. */
-			unsigned int cur = c->in[1][k];
+			/*
+			 * @cur[1][k] names the node this lane currently has
+			 * installed, or NULL.  It replaced a PAIR of array
+			 * nodes alternated slot-by-slot: that alternation
+			 * re-initialised whichever node the previous replace
+			 * had displaced, with no grace period, so it wiped
+			 * prev/next on an object the insert/remove peer could
+			 * still be descending through.  A replace installs a
+			 * FRESH node and the displaced one is reclaimed by
+			 * node_free_rcu, which is what the contract asks for.
+			 */
+			struct ft_test_node *old = c->cur[1][k];
+			struct ft_test_node *nw = node_alloc((uint64_t) k);
 
 			cds_ft_u64_to_key(c->ft, (uint64_t) k, key,
 				CDS_FT_LEN_DEFAULT);
 			rcu_read_lock();
-			if (!cur) {
-				cds_ft_node_init(&c->n[1][k].node);
+			if (!old) {
 				if (cds_ft_insert(c->ft, key,
 						CDS_FT_LEN_DEFAULT,
-						&c->n[1][k].node) ==
-						CDS_FT_STATUS_OK)
+						&nw->node) ==
+						CDS_FT_STATUS_OK) {
+					c->cur[1][k] = nw;
+					nw = NULL;
 					c->in[1][k] = 1;
+				}
 			} else {
-				struct cds_ft_node *old = cur == 1 ?
-					&c->n[1][k].node : &c->alt[k].node;
-				struct cds_ft_node *nw = cur == 1 ?
-					&c->alt[k].node : &c->n[1][k].node;
-
 				cds_ft_iter_set_key(iter, key,
 					CDS_FT_LEN_DEFAULT);
-				cds_ft_node_init(nw);
 				if (cds_ft_lookup(c->ft, iter) ==
 						CDS_FT_STATUS_OK &&
 						cds_ft_replace(c->ft, iter,
-							old, nw) ==
-						CDS_FT_STATUS_OK)
-					c->in[1][k] = cur == 1 ? 2 : 1;
+							&old->node,
+							&nw->node) ==
+						CDS_FT_STATUS_OK) {
+					c->cur[1][k] = nw;
+					nw = NULL;
+					/* Displaced: out of the trie, so it
+					 * leaves after a grace period. */
+					node_free_rcu(old);
+				}
 			}
 			rcu_read_unlock();
+			/* Refused: never reachable, plain free. */
+			if (nw)
+				node_free(nw);
 			rcu_quiescent_state();
 		}
 	cds_ft_iter_destroy(iter);
@@ -23675,20 +23842,12 @@ static int inv_concurrent_same_key_replace_run(bool coarse, const char *name)
 		abort();
 	cds_ft_make_concurrent(c.ft);
 	for (i = 0; i < 2; i++) {
-		c.n[i] = (struct skr_node *) calloc(SKI_K, sizeof(*c.n[i]));
 		c.in[i] = (unsigned char *) calloc(SKI_K, 1);
 		c.cur[i] = (struct ft_test_node **) calloc(SKI_K,
 			sizeof(*c.cur[i]));
-		if (!c.n[i] || !c.in[i] || !c.cur[i])
+		if (!c.in[i] || !c.cur[i])
 			abort();
-		for (k = 0; k < SKI_K; k++)
-			c.n[i][k].k = k;
 	}
-	c.alt = (struct skr_node *) calloc(SKI_K, sizeof(*c.alt));
-	if (!c.alt)
-		abort();
-	for (k = 0; k < SKI_K; k++)
-		c.alt[k].k = k;
 	if (cds_ft_iter_create(c.ft, &iter) != CDS_FT_STATUS_OK)
 		abort();
 	arg0.c = &c;
@@ -23708,7 +23867,7 @@ static int inv_concurrent_same_key_replace_run(bool coarse, const char *name)
 		struct cds_ft_node *h;
 		uint8_t key[8];
 		unsigned int seen_a = 0, seen_b = 0, extra = 0;
-		unsigned int want_b = c.in[1][k] ? 1 : 0;
+		unsigned int want_b = c.cur[1][k] ? 1 : 0;
 
 		cds_ft_u64_to_key(c.ft, (uint64_t) k, key, CDS_FT_LEN_DEFAULT);
 		cds_ft_iter_set_key(iter, key, CDS_FT_LEN_DEFAULT);
@@ -23717,8 +23876,8 @@ static int inv_concurrent_same_key_replace_run(bool coarse, const char *name)
 					h = cds_ft_node_next_rcu(h)) {
 				if (c.cur[0][k] && h == &c.cur[0][k]->node)
 					seen_a++;
-				else if (h == &c.n[1][k].node ||
-						h == &c.alt[k].node)
+				else if (c.cur[1][k] &&
+						h == &c.cur[1][k]->node)
 					seen_b++;
 				else
 					extra++;
@@ -23763,10 +23922,8 @@ static int inv_concurrent_same_key_replace_run(bool coarse, const char *name)
 			if (c.cur[i][k])
 				node_free_rcu(c.cur[i][k]);
 		free(c.cur[i]);
-		free(c.n[i]);
 		free(c.in[i]);
 	}
-	free(c.alt);
 	/* The deferred frees must land before RUN_TEST's leak_check(). */
 	rcu_quiescent_state();
 	rcu_barrier();
@@ -24409,8 +24566,24 @@ static int inv_concurrent_remove_all_run(bool ordered_list, bool coarse,
 			ret = -1;
 		if (ret)
 			fprintf(stderr, "%s: RED at round %u\n", name, r);
-		/* The nodes are re-seeded next round: retire the freezes first. */
-		rcu_barrier();
+		/*
+		 * ☞ THE NODE-REUSE FENCE.  The next round re-initialises these
+		 * nodes, and cds_ft_node_init() writes prev/next on objects a
+		 * peer may still hold -- cds_ft_remove's contract reserves a
+		 * GRACE PERIOD before any such write:
+		 *
+		 *   "A grace period must be observed (e.g., synchronize_rcu,
+		 *    call_rcu) after success before reclaiming @node memory."
+		 *
+		 * rcu_barrier() does NOT supply one.  It waits for in-flight
+		 * call_rcu CALLBACKS to run, and this row queues none of its
+		 * own -- with an empty queue it can return having waited for
+		 * nothing at all.  Only synchronize_rcu() fences the readers.
+		 * Every worker is parked in skr_bwait, which goes OFFLINE
+		 * around the wait, so the grace period completes here.
+		 */
+		synchronize_rcu();
+		rcu_barrier();		/* and retire the library's own freezes */
 		skr_bwait(&c.bar);		/* verified */
 	}
 	for (t = 0; t < SKRA_T + 1; t++)
@@ -24503,13 +24676,19 @@ static int inv_concurrent_remove_all_prefix_coarse(void)
 #define SIR_K		8
 #define SIR_R		40
 #define SIR_BURST	200
+/*
+ * One never-reused node per install.  A replacer lane installs at most once
+ * per (round, burst, key); the peer lane can arm twice in one visit (an
+ * insert-family call and a replace), so it gets twice the budget.
+ */
+#define SIR_POOL_N	((size_t) SIR_R * SIR_BURST * SIR_K + 1)
+#define SIR_PEER_POOL_N	(2 * SIR_POOL_N + 16)
 #define SIR_BUDGET_S	120	/* wall-clock guard: a livelock must FAIL, not hang */
 
 struct sir_node {
 	struct cds_ft_node node;
 	unsigned int k;
 	unsigned int owner;		/* which lane last installed it */
-	unsigned int slot;		/* which of its lane's pair it is */
 };
 
 struct sir_ctx {
@@ -24523,37 +24702,25 @@ struct sir_ctx {
 	 * intervening successful install has displaced the whole chain it was
 	 * in (or a peer lane already did), so it is out.
 	 */
-	struct sir_node *rep[2];	/* [2][2 * SIR_K] */
-	unsigned char *cur[2];		/* [2][SIR_K]: which of the pair is installed */
-#ifdef FT_INV_SIR_FRESH_NODES
-	struct sir_node *pool[2];	/* [2][SIR_R * SIR_BURST * SIR_K + 1] */
-	size_t pool_n[2];
-#endif
-	struct sir_node *peer;		/* [SIR_K]: the peer lane's node */
 	/*
-	 * A SECOND node per key, so the peer can drive cds_ft_replace -- which
-	 * needs an old node it owns AND a distinct new one.  @peer_which says
-	 * which of the pair the trie currently holds; replace swaps it.
+	 * ☞ NEVER-REUSED NODES, ONE POOL PER LANE.  Every lane here used to
+	 * cycle a small set of nodes, re-initialising one on the belief that an
+	 * intervening call had displaced it.  A node that has LEFT the trie is
+	 * still owed to any reader that found it before it left, and
+	 * cds_ft_node_init zeroes prev and next, so the belief is not the test
+	 * the contract sets -- see sir_replacer.  Taking a fresh node each
+	 * install removes the hazard by construction.
 	 */
-	struct sir_node *peer2;		/* [SIR_K] */
-	unsigned char *peer_which;	/* [SIR_K]: 0 = @peer, 1 = @peer2 */
+	struct sir_node *pool[2];	/* [2][SIR_POOL_N] */
+	size_t pool_n[2];
+	struct sir_node *peer_pool;	/* [SIR_PEER_POOL_N] */
+	size_t peer_pool_n;
+	struct sir_node **peer_cur;	/* [SIR_K]: the peer's installed node */
 	unsigned char *peer_in;		/* [SIR_K] */
 	unsigned long ops[3];		/* completed ops per lane -- THE PROGRESS ORACLE */
 	unsigned long busy;		/* CDS_FT_STATUS_BUSY_ERROR (expected dead) */
 	unsigned long other;
 	unsigned long handed;		/* chains handed back */
-	unsigned long reuse_live;	/* re-inits of a node STILL in the trie */
-#ifdef FT_INV_SIR_SOUND_REUSE
-	/*
-	 * PROVABLY-SOUND REUSE.  A replacer node leaves the trie by exactly one
-	 * route: some insert_replace displaces it and HANDS IT BACK.  So a node
-	 * is safe to re-initialise iff a lane has actually SEEN it in an @old
-	 * chain (or it was never installed).  Marked GLOBALLY, because the node
-	 * one lane installed is handed back to whichever lane displaces it.
-	 */
-	unsigned char *out[2];		/* [2][2 * SIR_K]: seen handed back */
-	unsigned long sound_stall;	/* neither of the pair was provably out */
-#endif
 	unsigned long foreign;		/* a hand-back naming a node of another key */
 	/*
 	 * Both outcomes of the peer's insert_unique, so "green" cannot mean the
@@ -24590,92 +24757,43 @@ static void *sir_replacer(void *arg)
 		for (burst = 0; burst < SIR_BURST; burst++)
 		for (k = 0; k < SIR_K; k++) {
 			struct cds_ft_node *old = NULL;
-			unsigned int slot = c->cur[id][k] ^ 1u;
-#ifdef FT_INV_SIR_SOUND_REUSE
 			/*
-			 * Use a node only once it is PROVEN out.  If neither of
-			 * the pair is, skip rather than guess -- guessing is
-			 * precisely what is under suspicion.
+			 * ☞ A NEVER-REUSED NODE PER INSTALL.  This lane used to
+			 * alternate between two nodes per key, re-initialising
+			 * whichever one it believed the trie no longer held.
+			 * "No longer held" is not the test the contract sets:
+			 *
+			 *   "A grace period must be observed (e.g.,
+			 *    synchronize_rcu, call_rcu) after success before
+			 *    reclaiming @node memory."
+			 *
+			 * A node that has LEFT the trie is still owed to any
+			 * reader that found it before it left, and
+			 * cds_ft_node_init zeroes prev and next -- manufacturing
+			 * exactly the stale back-edge this row was built to
+			 * hunt: a pred whose next is NULL while its successor
+			 * still points back at it.  A pool that is never reused
+			 * removes the hazard by construction, and at
+			 * SIR_R * SIR_BURST * SIR_K nodes it costs a few MB for
+			 * the run.
 			 */
-			if (!c->out[id][k * 2 + slot]) {
-				slot ^= 1u;
-				if (!c->out[id][k * 2 + slot]) {
-					uatomic_inc(&c->sound_stall);
-					rcu_read_unlock();
-					rcu_quiescent_state();
-					continue;
-				}
-			}
-			struct sir_node *n = &c->rep[id][k * 2 + slot];
-#elif defined(FT_INV_SIR_FRESH_NODES)
-			/*
-			 * ☞ THE TEST-FAULT CONTROL for the stale back-edge.
-			 * The alternation below re-initialises a node the lane
-			 * BELIEVES the trie no longer holds; if that belief is
-			 * ever wrong, cds_ft_node_init zeroes a LIVE node's
-			 * links and manufactures exactly the corruption under
-			 * investigation (a pred whose next is NULL while its
-			 * successor still points back at it).  This arm takes a
-			 * never-reused node from a pool instead, so the hazard
-			 * cannot exist.  If the livelock survives THIS, it is
-			 * not the test.
-			 */
-			struct sir_node *n = &c->pool[id][c->pool_n[id]++];
-#else
-			struct sir_node *n = &c->rep[id][k * 2 + slot];
-#endif
+			struct sir_node *n;
+
+			if (c->pool_n[id] >= SIR_POOL_N)
+				abort();	/* sized from the loop bounds */
+			n = &c->pool[id][c->pool_n[id]++];
 			uint8_t key[8];
 			enum cds_ft_status s;
 
 			cds_ft_u64_to_key(c->ft, (uint64_t) k, key,
 				CDS_FT_LEN_DEFAULT);
 			rcu_read_lock();
-#ifdef FT_INV_SIR_REUSE_AUDIT
-			/*
-			 * ☞ IS THE NODE I AM ABOUT TO RE-INITIALISE STILL IN
-			 * THE TRIE?  The alternation assumes the intervening
-			 * install displaced it.  cds_ft_node_init zeroes prev
-			 * and next, so if the assumption is EVER wrong this
-			 * test manufactures a pred whose next is NULL while its
-			 * successor still points back at it -- which is exactly
-			 * the stale back-edge the remove livelock turned out to
-			 * spin on.  A single hit here proves the fault is the
-			 * TEST's, not the library's.  Racy by nature; a
-			 * positive is conclusive, a zero is not.
-			 */
-			{
-				struct cds_ft_iter *ai;
-
-				if (cds_ft_iter_create(c->ft, &ai) ==
-						CDS_FT_STATUS_OK) {
-					struct cds_ft_node *h;
-
-					cds_ft_iter_set_key(ai, key,
-						CDS_FT_LEN_DEFAULT);
-					if (cds_ft_lookup(c->ft, ai) ==
-							CDS_FT_STATUS_OK)
-						for (h = cds_ft_iter_node(ai);
-								h;
-								h = cds_ft_node_next_rcu(h))
-							if (h == &n->node)
-								uatomic_inc(&c->reuse_live);
-					cds_ft_iter_destroy(ai);
-				}
-			}
-#endif
 			cds_ft_node_init(&n->node);
 			n->k = k;
 			n->owner = id;
-#ifdef FT_INV_SIR_SOUND_REUSE
-			n->slot = slot;
-			c->out[id][k * 2 + slot] = 0;	/* about to be live */
-#endif
 			s = cds_ft_insert_replace(c->ft, key, CDS_FT_LEN_DEFAULT,
 				&n->node, &old);
 			rcu_read_unlock();
-			if (s == CDS_FT_STATUS_OK ||
-					s == CDS_FT_STATUS_DUPLICATE_FOUND)
-				c->cur[id][k] = (unsigned char) slot;
 			switch (s) {
 			case CDS_FT_STATUS_OK:
 			case CDS_FT_STATUS_DUPLICATE_FOUND:
@@ -24696,12 +24814,6 @@ static void *sir_replacer(void *arg)
 
 						if (o->k != k)
 							uatomic_inc(&c->foreign);
-#ifdef FT_INV_SIR_SOUND_REUSE
-						/* Definitively out of the trie. */
-						if (o->owner < 2)
-							c->out[o->owner][o->k * 2 +
-								o->slot] = 1;
-#endif
 #ifdef FT_INV_SIR_NO_GHOST_REMOVE
 						/*
 						 * ☞ MECHANISM TEST.  cds_ft_insert_replace
@@ -24750,7 +24862,26 @@ static void *sir_replacer(void *arg)
 /* The peer node the trie currently holds (or the one it will install next). */
 static struct sir_node *sir_peer_node(struct sir_ctx *c, unsigned int k)
 {
-	return c->peer_which[k] ? &c->peer2[k] : &c->peer[k];
+	return c->peer_cur[k];
+}
+
+/*
+ * Arm a NEVER-REUSED node as this lane's node for @k.  The pool is sized from
+ * the lane's own loop bounds; an overrun is a test bug, so say so loudly
+ * rather than walk off the end.
+ */
+static struct sir_node *sir_peer_arm(struct sir_ctx *c, unsigned int k)
+{
+	struct sir_node *n;
+
+	if (c->peer_pool_n >= SIR_PEER_POOL_N)
+		abort();
+	n = &c->peer_pool[c->peer_pool_n++];
+	cds_ft_node_init(&n->node);
+	n->k = k;
+	n->owner = 2;
+	c->peer_cur[k] = n;
+	return n;
 }
 
 static void *sir_peer(void *arg)
@@ -24826,11 +24957,6 @@ static void *sir_peer(void *arg)
 
 						if (o->k != k)
 							uatomic_inc(&c->foreign);
-#ifdef FT_INV_SIR_SOUND_REUSE
-						if (o->owner < 2)
-							c->out[o->owner][o->k * 2 +
-								o->slot] = 1;
-#endif
 					}
 					/*
 					 * ☞ AND RACE INSERT_UNIQUE INTO THE KEY
@@ -24848,9 +24974,7 @@ static void *sir_peer(void *arg)
 					{
 						struct cds_ft_node *iu2 = NULL;
 
-						cds_ft_node_init(&sir_peer_node(c, k)->node);
-						sir_peer_node(c, k)->k = k;
-						sir_peer_node(c, k)->owner = 2;
+						(void) sir_peer_arm(c, k);
 						if (cds_ft_insert_unique(c->ft,
 								key,
 								CDS_FT_LEN_DEFAULT,
@@ -24870,9 +24994,7 @@ static void *sir_peer(void *arg)
 			} else if (!c->peer_in[k]) {
 				enum cds_ft_status is;
 
-				cds_ft_node_init(&sir_peer_node(c, k)->node);
-				sir_peer_node(c, k)->k = k;
-				sir_peer_node(c, k)->owner = 2;
+				(void) sir_peer_arm(c, k);
 				/*
 				 * ☞ ALTERNATE INSERT AND INSERT_UNIQUE.  The
 				 * contract cds_ft_insert_replace would claim if
@@ -24928,9 +25050,9 @@ static void *sir_peer(void *arg)
 				 *
 				 * replace is the fifth and last peer the flipped
 				 * contract would claim.  It needs an old node
-				 * this lane OWNS and a distinct new one -- hence
-				 * the node PAIR and @peer_which, toggled on OK.
-				 * The node stays in the trie either way, so
+				 * this lane OWNS and a distinct new one, so it
+				 * installs a FRESH node and @peer_cur[k] follows
+				 * it.  The key stays occupied either way, so
 				 * @peer_in[k] survives an OK replace and only a
 				 * refusal clears it.
 				 */
@@ -24939,18 +25061,23 @@ static void *sir_peer(void *arg)
 					enum cds_ft_status s;
 
 					if (rem_attempt++ & 1) {
-						struct sir_node *newp =
-							c->peer_which[k] ?
-							&c->peer[k] : &c->peer2[k];
+						struct sir_node *old =
+							sir_peer_node(c, k);
+						struct sir_node *newp;
 
+						if (c->peer_pool_n >=
+								SIR_PEER_POOL_N)
+							abort();
+						newp = &c->peer_pool[
+							c->peer_pool_n++];
 						cds_ft_node_init(&newp->node);
 						newp->k = k;
 						newp->owner = 2;
 						s = cds_ft_replace(c->ft, iter,
-							&sir_peer_node(c, k)->node,
+							&old->node,
 							&newp->node);
 						if (s == CDS_FT_STATUS_OK) {
-							c->peer_which[k] ^= 1;
+							c->peer_cur[k] = newp;
 							uatomic_inc(&c->rp_ok);
 							uatomic_inc(&c->ops[2]);
 						} else {
@@ -25043,35 +25170,16 @@ static int inv_concurrent_insert_replace_run(bool coarse, const char *name)
 		abort();
 	cds_ft_make_concurrent(c.ft);
 	for (i = 0; i < 2; i++) {
-		c.rep[i] = (struct sir_node *) calloc((size_t) SIR_K * 2,
-				sizeof(*c.rep[i]));
-		c.cur[i] = (unsigned char *) calloc(SIR_K, 1);
-		if (!c.rep[i] || !c.cur[i])
-			abort();
-#ifdef FT_INV_SIR_SOUND_REUSE
-		{
-			unsigned int q;
-
-			c.out[i] = (unsigned char *) calloc((size_t) SIR_K * 2, 1);
-			if (!c.out[i])
-				abort();
-			for (q = 0; q < (unsigned int) SIR_K * 2; q++)
-				c.out[i][q] = 1;	/* never installed => out */
-		}
-#endif
-#ifdef FT_INV_SIR_FRESH_NODES
-		c.pool[i] = (struct sir_node *) calloc(
-			(size_t) SIR_R * SIR_BURST * SIR_K + 1,
+		c.pool[i] = (struct sir_node *) calloc(SIR_POOL_N,
 			sizeof(*c.pool[i]));
 		if (!c.pool[i])
 			abort();
-#endif
 	}
-	c.peer = (struct sir_node *) calloc(SIR_K, sizeof(*c.peer));
-	c.peer2 = (struct sir_node *) calloc(SIR_K, sizeof(*c.peer2));
-	c.peer_which = (unsigned char *) calloc(SIR_K, 1);
+	c.peer_pool = (struct sir_node *) calloc(SIR_PEER_POOL_N,
+		sizeof(*c.peer_pool));
+	c.peer_cur = (struct sir_node **) calloc(SIR_K, sizeof(*c.peer_cur));
 	c.peer_in = (unsigned char *) calloc(SIR_K, 1);
-	if (!c.peer || !c.peer_in)
+	if (!c.peer_pool || !c.peer_cur || !c.peer_in)
 		abort();
 	if (cds_ft_iter_create(c.ft, &iter) != CDS_FT_STATUS_OK)
 		abort();
@@ -25177,19 +25285,10 @@ static int inv_concurrent_insert_replace_run(bool coarse, const char *name)
 	rcu_barrier();
 	cds_ft_destroy(c.ft);
 	cds_ft_group_destroy(group);
-	for (i = 0; i < 2; i++) {
-		free(c.rep[i]);
-		free(c.cur[i]);
-#ifdef FT_INV_SIR_FRESH_NODES
+	for (i = 0; i < 2; i++)
 		free(c.pool[i]);
-#endif
-#ifdef FT_INV_SIR_SOUND_REUSE
-		free(c.out[i]);
-#endif
-	}
-	free(c.peer);
-	free(c.peer2);
-	free(c.peer_which);
+	free(c.peer_pool);
+	free(c.peer_cur);
 	free(c.peer_in);
 	fprintf(stderr,
 		"# %s: %u rounds x %u burst x %u keys, 2 insert_replace lanes + 1 same-key insert/insert_unique/replace/remove/remove_all peer (%s): ops=%lu/%lu/%lu handed=%lu BUSY=%lu other=%lu insert_unique=%lu ok/%lu dup remove_all=%lu ok/%lu miss replace=%lu ok/%lu miss (%lu nf) -> %s\n",
@@ -25202,14 +25301,6 @@ static int inv_concurrent_insert_replace_run(bool coarse, const char *name)
 		uatomic_read(&c.rp_ok), uatomic_read(&c.rp_miss),
 		uatomic_read(&c.rp_nf),
 		ret ? "RED" : "ok");
-#ifdef FT_INV_SIR_SOUND_REUSE
-	fprintf(stderr, "# %s: SOUND REUSE: stalls (no provably-out node) = %lu\n",
-		name, uatomic_read(&c.sound_stall));
-#endif
-#ifdef FT_INV_SIR_REUSE_AUDIT
-	fprintf(stderr, "# %s: REUSE AUDIT: re-init of a node STILL IN THE TRIE = %lu\n",
-		name, uatomic_read(&c.reuse_live));
-#endif
 	return ret;
 }
 
