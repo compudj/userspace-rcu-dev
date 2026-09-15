@@ -1184,6 +1184,20 @@ static
 unsigned long ft_rc_noctx, ft_rc_nogp, ft_rc_held, ft_rc_unheld;
 unsigned long ft_rc_hint_held, ft_rc_hint_unheld, ft_rc_res_held,
 	ft_rc_res_unheld;
+/*
+ * ☞ THE THIRD QUESTION: is the dual's derived owner a member of THIS
+ * recompact's OWN lock-set, acquired at the top?  ft_lock_ctx_holds cannot
+ * answer it -- ft_dlm_acquire_set_at takes @ctx as a const pointer and so
+ * cannot register anything into ctx->held; the acquire's marks live in the
+ * function-local @rel_held[] until the commit registers them (which happens
+ * BELOW this site).  So a "0 held" from the ctx registry says nothing about
+ * whether the word is locked; it says the registry was never told.  Count the
+ * direct comparison against @rel_held before believing the ctx answer.
+ */
+unsigned long ft_rc_rel_match, ft_rc_rel_shared, ft_rc_rel_miss, ft_rc_rel_none;
+unsigned long ft_rc_plan_same, ft_rc_plan_taken, ft_rc_plan_diff;
+/* ☠ "no own-set member" has FOUR causes -- split before reading any of them. */
+unsigned long ft_rc_nolockfine, ft_rc_nofence;
 static void ft_rc_report(void) __attribute__((destructor));
 static void ft_rc_report(void)
 {
@@ -1195,6 +1209,14 @@ static void ft_rc_report(void)
 		uatomic_read(&ft_rc_hint_unheld),
 		uatomic_read(&ft_rc_res_held),
 		uatomic_read(&ft_rc_res_unheld));
+	fprintf(stderr, "FT RECOMPACT-DUAL own-set match=%lu shared=%lu"
+		" miss=%lu noset=%lu | plan-gp same=%lu taken=%lu diff=%lu\n",
+		uatomic_read(&ft_rc_rel_match), uatomic_read(&ft_rc_rel_shared),
+		uatomic_read(&ft_rc_rel_miss), uatomic_read(&ft_rc_rel_none),
+		uatomic_read(&ft_rc_plan_same), uatomic_read(&ft_rc_plan_taken),
+		uatomic_read(&ft_rc_plan_diff));
+	fprintf(stderr, "FT RECOMPACT-DUAL noset-why coarse=%lu unfenced=%lu\n",
+		uatomic_read(&ft_rc_nolockfine), uatomic_read(&ft_rc_nofence));
 }
 #endif
 
@@ -1288,6 +1310,36 @@ int ft_node_recompact(enum ft_recompact mode,
 	 */
 	struct ft_held_anchor rel_held[2];
 	unsigned int nr_rel = 0, ri;
+	/*
+	 * ☞ THE THIRD MEMBER, REMEMBERED BY IDENTITY.  set[2] is GP -- acquired
+	 * whenever P is compressed, which is exactly the shape the SKIP_X dual
+	 * re-encode below runs in -- and the dual publish must answer "does this
+	 * op hold the word it is writing?".  It cannot ask @ctx: the lock-set is
+	 * taken through ft_dlm_acquire_set_at, which receives @ctx as a CONST
+	 * pointer and so can register nothing into ctx->held; the marks live in
+	 * @rel_held until the commit below hands them to @retire_txn.  A
+	 * ft_lock_ctx_holds() miss here therefore says the registry was never
+	 * told, NEVER that the word is unheld (the note at ft_lock_ctx_holds
+	 * says to read a miss exactly that way).
+	 *
+	 * Held by NODE identity rather than by scanning @rel_held, because
+	 * @rel_held carries the ANCHOR: at a coarse spacing the acquired member
+	 * is an ancestor and a pointer compare against @rel_held[].lock would
+	 * miss a word the op genuinely holds.  Spacing-independent: "set[2]
+	 * named this node and took a lock that protects it".
+	 */
+	struct cds_ft_metadata *acq_gp_meta = NULL;
+#ifdef FT_DEBUG_DUAL_SITE
+	/*
+	 * ☞ The GP the PLAN named at the top, and whether set[2] actually took
+	 * it.  Compared by IDENTITY against the dual site's derived owner below:
+	 * @rel_held carries the ANCHOR (an ancestor under a coarse spacing), so
+	 * a rel_held miss is not by itself "different node" -- this pair says
+	 * which of the two it is.
+	 */
+	struct cds_ft_metadata *dbg_acq_gp = NULL;
+	bool dbg_acq_gp_taken = false;
+#endif
 
 	/*
 	 * F2 node lock, MARK (doc at ft_meta_lock_acquire): a live-retire
@@ -1425,6 +1477,12 @@ int ft_node_recompact(enum ft_recompact mode,
 			return dret == -ENOMEM ? -ENOMEM : -EAGAIN;
 
 		/* Populate the lock-set state -- build/commit/unwind unchanged. */
+#ifdef FT_DEBUG_DUAL_SITE
+		dbg_acq_gp = gp_meta;
+		dbg_acq_gp_taken = set[2].nf != NULL;
+#endif
+		if (set[2].nf)
+			acq_gp_meta = gp_meta;
 		fenced = true;
 		c_held = set[0].held;
 		if (set[1].nf)
@@ -2361,47 +2419,81 @@ skip_copy:
 					}
 
 					/*
-					 * ☠☠ §9.3's THIRD MEMBER CANNOT BE TAKEN
-					 * HERE, and this is the second cure that
-					 * failed -- both tried and both recorded
-					 * so the next reader does not try them a
-					 * third time.
+					 * ☑ §9.3's THIRD MEMBER IS ALREADY IN
+					 * THE SET -- and the two cures that
+					 * "failed" here were answers to a
+					 * question this site was asking WRONG.
+					 * Both are kept below so the next reader
+					 * does not try them a third time, but
+					 * neither is needed.
 					 *
-					 * (1) ASK the held set: NO, 0 of 805202.
-					 *     And the provenance split says why:
-					 *     @inh_hint is NEVER present at this
-					 *     site (0/0 across the whole inv
-					 *     suite), so the owner always comes
-					 *     from ft_resolve_parent_slot -- a
-					 *     back-pointer read naming a node
-					 *     this op's DLM set never covers.
+					 * ★★★★★ THE MEASUREMENT THAT SETTLED IT.
+					 * @acq_gp_meta records, by node identity,
+					 * the GP that set[2] acquired at the top.
+					 * Compared against the owner DERIVED here,
+					 * over the whole inv suite (152 rows):
 					 *
-					 * (2) ACQUIRE it into @retire_txn (the
-					 *     flip-txn the caller commits @rec
-					 *     into, so ft_flip_txn_owns would see
-					 *     it): ft_unit WEDGES at
-					 *     test_rekey_coherence_lookup, the
-					 *     first insert-variant row, in
+					 *   own-set match=490411 shared=0 miss=0
+					 *   plan-gp  same=490411 taken=490411
+					 *   noset=293516, of which coarse=293516
+					 *
+					 * ⇒ On EVERY fine-trie dual publish the op
+					 * already holds the very word it writes,
+					 * acquired by its own lock-set as set[2];
+					 * the entire residue is COARSE tries,
+					 * which derive no lock-set at all (§10.5:
+					 * one FT-wide lock) and are not a
+					 * conversion surface.  A dual whose owner
+					 * the op does not hold does not exist
+					 * here.
+					 *
+					 * ☠ SO WHY DID THE SITE READ "0 of
+					 * 805202"?  Because it asked @ctx.
+					 * ft_dlm_acquire_set_at takes the lock ctx
+					 * as a CONST pointer -- it cannot register
+					 * into ctx->held even in principle -- and
+					 * the acquire's marks sit in the local
+					 * @rel_held until the commit below hands
+					 * them to @retire_txn, which is PAST this
+					 * point.  The query was structurally
+					 * blind, not negative: 0/790068 through
+					 * @ctx, 490411/490411 asked of the set the
+					 * function actually took.
+					 * ⇒ AN INSTRUMENT CAN BE ARMED, FIRING,
+					 * AND BLIND.  A 100%/0% split is the
+					 * signature.
+					 *
+					 * The two dead cures, kept as warnings:
+					 *
+					 * (1) RE-ASK the held set through @ctx --
+					 *     what the site did.  It answers NO
+					 *     unconditionally for the reason
+					 *     above; the provenance split
+					 *     (@inh_hint 0/0, so the owner always
+					 *     comes from ft_resolve_parent_slot)
+					 *     was read as "a node the DLM set
+					 *     never covers", but the TOP resolves
+					 *     GP through the SAME
+					 *     ft_resolve_parent_slot(p_meta) call
+					 *     -- same derivation, same node, and
+					 *     the 490411 pointer-identity matches
+					 *     say so.
+					 *
+					 * (2) ACQUIRE it a SECOND time into
+					 *     @retire_txn: ft_unit WEDGES at
+					 *     test_rekey_coherence_lookup, in
 					 *     ft_dlm_acquire_set_at ->
 					 *     ft_dlm_guard_parent ->
 					 *     urcu_txn_validate ->
 					 *     urcu_txn_record_chain, at THIS
-					 *     function's OWN acquire set
-					 *     (ft-mutation-node.h:1423) -- not at
-					 *     the added call.  A dual register in
-					 *     @retire_txn collides with the
-					 *     recompact's own DLM set on the same
-					 *     txn and the record chain never
-					 *     settles.
-					 *
-					 * ⇒ The dual's owner has to enter the
-					 * recompact's OWN lock set, at the top
-					 * with {C, P, GP}, where the set is built
-					 * and reconciled once -- not as a second
-					 * registration half way down.  Until
-					 * then this is the ONE producer of the
-					 * eight that writes the dual without
-					 * holding it, and the dual stays MW.
+					 *     function's OWN acquire set -- not at
+					 *     the added call.  Of course it does:
+					 *     the word is ALREADY this op's, and a
+					 *     second acquire on a word the op
+					 *     holds aborts by design
+					 *     (ft_lock_ctx_holds' own note).  The
+					 *     wedge was the duplicate, not a
+					 *     plumbing limit.
 					 */
 					if (rec) {
 						/*
@@ -2441,10 +2533,25 @@ skip_copy:
 							NULL;
 						uintptr_t gp_snap;
 						bool gp_ratified;
+						/*
+						 * TWO WITNESSES, own-set FIRST.
+						 * @acq_gp_meta is this function's
+						 * own acquire, which no registry
+						 * can see yet (see its comment);
+						 * @ctx covers the shapes where the
+						 * top block did not run -- a
+						 * caller that locked GP itself and
+						 * handed the hold down.  A NULL
+						 * owner stays false: the root dual
+						 * has no owning node, and the
+						 * always-MW @root route is the
+						 * correct one for it.
+						 */
 						bool gp_held = gp_meta &&
+							(gp_meta == acq_gp_meta ||
 							ft_lock_ctx_holds(ctx,
 								gp_meta, &gp_snap,
-								&gp_ratified);
+								&gp_ratified));
 #ifdef FT_DEBUG_DUAL_SITE
 						/*
 						 * ☠ 100% / 0% IS THE SIGNATURE
@@ -2481,40 +2588,80 @@ skip_copy:
 							uatomic_inc(gp_held ?
 								&ft_rc_res_held :
 								&ft_rc_res_unheld);
+						/*
+						 * ☞ ASK THE OWN LOCK-SET, not
+						 * the ctx registry: is @gp_meta
+						 * the very member set[2] took
+						 * at the top?  @rel_held is
+						 * this function's own array, so
+						 * this comparison cannot be
+						 * blind the way ft_lock_ctx_holds
+						 * is here.
+						 */
+						if (!gp_meta) {
+							/* counted by nogp */
+						} else if (!nr_rel) {
+							uatomic_inc(
+								&ft_rc_rel_none);
+							if (!ft->lock_fine)
+								uatomic_inc(
+								&ft_rc_nolockfine);
+							else if (!fenced)
+								uatomic_inc(
+								&ft_rc_nofence);
+						} else {
+							unsigned int rk;
+							bool m = false, sh = false;
+
+							for (rk = 0; rk < nr_rel;
+									rk++)
+								if (rel_held[rk].lock
+									== gp_meta) {
+									m = true;
+									sh = rel_held[rk]
+										.shared;
+									break;
+								}
+							if (m && sh)
+								uatomic_inc(
+								&ft_rc_rel_shared);
+							else if (m)
+								uatomic_inc(
+								&ft_rc_rel_match);
+							else
+								uatomic_inc(
+								&ft_rc_rel_miss);
+						}
+						if (gp_meta &&
+								gp_meta == dbg_acq_gp) {
+							uatomic_inc(&ft_rc_plan_same);
+							if (dbg_acq_gp_taken)
+								uatomic_inc(
+								&ft_rc_plan_taken);
+						} else if (gp_meta) {
+							uatomic_inc(&ft_rc_plan_diff);
+						}
 #endif
 
 						/*
-						 * ☠ AND THE ANSWER IS "NO", 9721
-						 * TIMES OUT OF 9721.  Note (1) of
-						 * the word-kind table says this
-						 * site's DLM set "does take
-						 * gp_meta"; asked at publish
-						 * against the DERIVED owner, the
-						 * held set says otherwise EVERY
-						 * time -- @ctx is present and
-						 * @gp_meta is named, so this is
-						 * an answer, not a blind query
-						 * (the noctx / nogp / held /
-						 * unheld split is there to say
-						 * so).
+						 * ☑ AND THE ANSWER IS "YES", on
+						 * every fine-trie publish -- this
+						 * producer holds the dual's owner
+						 * like the other seven, so the
+						 * EXCLUSION side of the conversion
+						 * is complete for all eight.
 						 *
-						 * ⇒ THE MISSING PIECE IS AN
-						 * ACQUIRE, not a better question.
-						 * ft_detach_node's republish now
-						 * takes one (ft_lock_skip_dual_gp,
-						 * ft-remove.h) and reads 100%
-						 * held; this producer has no txn
-						 * of its own to register one
-						 * into, which is the work the
-						 * conversion still owes.
-						 *
-						 * Until then @gp_held is recorded
-						 * but NOT passed: a slot is SW xor
-						 * MW GLOBALLY (rcu-txn.h), so no
-						 * producer of this slot may vouch
-						 * while any other still writes it
-						 * without holding.  Flip them
-						 * TOGETHER.
+						 * @gp_held is computed but NOT yet
+						 * passed: a slot is SW xor MW
+						 * GLOBALLY (rcu-txn.h), so the
+						 * eight answers flip in ONE commit
+						 * or not at all -- one lane parking
+						 * SW while another CASes the same
+						 * slot is the cross-thread kind
+						 * disagreement the engine cannot
+						 * check.  What this line settles is
+						 * that nothing is left BLOCKING
+						 * that commit.
 						 */
 						(void) gp_held;
 						ft_pub_rec_add(rec, skip_slot,
