@@ -542,7 +542,7 @@ int ft_rekey_cow_reparent_child(struct cds_ft *ft,
 				ft_flip_txn_record_head_back_edge(txn, field,
 					pr->new_ptr,
 					ft_head_parent_word_slot(new_flag, slot)
-					FT_BE_SITE(FT_BE_REPARENT_META));
+					FT_BE_SITE(FT_BE_REPARENT_META, ctx));
 				return 0;
 			}
 		}

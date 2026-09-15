@@ -1726,7 +1726,7 @@ int ft_node_recompact(enum ft_recompact mode,
 				ft_flip_txn_record_head_back_edge(retire_txn,
 					bc_slot, bc_old,
 					ft_head_parent_word(new_node_flag,
-						/*prefix=*/ true) FT_BE_SITE(FT_BE_RECOMPACT));
+						/*prefix=*/ true) FT_BE_SITE(FT_BE_RECOMPACT, ctx));
 			} else {
 				/*
 				 * Build-invisible / legacy no-txn arm: the

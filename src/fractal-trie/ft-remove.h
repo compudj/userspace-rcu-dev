@@ -296,11 +296,11 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 
 				ft_flip_txn_record_head_back_edge(txn,
 					(void **) &cell->parent,
-					cell->parent, cn_flag FT_BE_SITE(FT_BE_DETACH_CN_PARENT));
+					cell->parent, cn_flag FT_BE_SITE(FT_BE_DETACH_CN_PARENT, ctx));
 			} else {
 				ft_flip_txn_record_head_back_edge(txn,
 					(void **) &topmost_external_nodes->prev,
-					topmost_external_nodes->prev, cn_flag FT_BE_SITE(FT_BE_DETACH_CN_PARENT));
+					topmost_external_nodes->prev, cn_flag FT_BE_SITE(FT_BE_DETACH_CN_PARENT, ctx));
 			}
 		}
 		/*
@@ -4708,7 +4708,7 @@ int ft_detach_node(struct cds_ft *ft,
 						ft_flip_txn_record_head_back_edge(commit_txn,
 							(void **) pub->head_parent_field,
 							pub->head_parent_old,
-							pub->head_parent_new FT_BE_SITE(FT_BE_DETACH_UNCHAIN));
+							pub->head_parent_new FT_BE_SITE(FT_BE_DETACH_UNCHAIN, &lctx));
 					} else {
 						rcu_assign_pointer(*pub->head_parent_field,
 							pub->head_parent_new);

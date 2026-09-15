@@ -5452,8 +5452,9 @@ enum ft_be_site {
 	FT_BE_REPARENT_META,		/* ft_reparent_record_meta */
 	FT_BE_SITE_NR,
 };
-# define FT_BE_SITE_PARAM	, enum ft_be_site dbg_be_site
-# define FT_BE_SITE(s)		, (s)
+# define FT_BE_SITE_PARAM	, enum ft_be_site dbg_be_site,		\
+				const struct ft_lock_ctx *dbg_be_ctx
+# define FT_BE_SITE(s, c)	, (s), (c)
 extern const char *const ft_be_site_name[FT_BE_SITE_NR];
 const char *const ft_be_site_name[FT_BE_SITE_NR] = {
 	"park_live_parent", "recompact", "detach_cn_parent", "detach_unchain",
@@ -5484,8 +5485,8 @@ const char *const ft_be_site_name[FT_BE_SITE_NR] = {
  * returning false and these columns are identically 0 -- which is why the
  * report prints whether the ledger is compiled in at all.
  */
-extern unsigned long ft_be_s_proxy[FT_BE_SITE_NR];
-unsigned long ft_be_s_proxy[FT_BE_SITE_NR];
+extern unsigned long ft_be_s_proxy[FT_BE_SITE_NR], ft_be_s_ctx_old[FT_BE_SITE_NR];
+unsigned long ft_be_s_proxy[FT_BE_SITE_NR], ft_be_s_ctx_old[FT_BE_SITE_NR];
 extern unsigned long ft_be_s_total[FT_BE_SITE_NR],
 	ft_be_s_old[FT_BE_SITE_NR], ft_be_s_nolocks[FT_BE_SITE_NR],
 	ft_be_s_gp[FT_BE_SITE_NR], ft_be_s_gp_none[FT_BE_SITE_NR],
@@ -5502,7 +5503,7 @@ unsigned long ft_be_s_total[FT_BE_SITE_NR],
 	ft_be_s_led_none[FT_BE_SITE_NR];
 #else
 # define FT_BE_SITE_PARAM
-# define FT_BE_SITE(s)
+# define FT_BE_SITE(s, c)
 #endif
 
 #ifdef FT_DEBUG_BACK_EDGE_OWNER
@@ -5537,19 +5538,20 @@ static void ft_be_site_report(void)
 		"OFF (columns below are structurally 0, not measured)",
 #endif
 		ft_be_total);
-	fprintf(stderr, "%-18s %10s %8s %8s %8s %8s %8s %8s %8s %8s %8s %8s\n",
+	fprintf(stderr, "%-18s %10s %8s %8s %8s %8s %8s %8s %8s %8s %8s %8s %8s\n",
 		"site", "total", "oldP", "GRANDpar", "nolocks",
-		"led_old", "led_gp", "led_only", "NOowner", "newP", "led_new", "HOLDS0");
+		"led_old", "led_gp", "led_only", "NOowner", "newP", "led_new", "HOLDS0",
+		"ctx_old");
 	for (i = 0; i < FT_BE_SITE_NR; i++) {
 		if (!ft_be_s_total[i])
 			continue;
-		fprintf(stderr, "%-18s %10lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu\n",
+		fprintf(stderr, "%-18s %10lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu\n",
 			ft_be_site_name[i], ft_be_s_total[i],
 			ft_be_s_old[i], ft_be_s_gp[i], ft_be_s_nolocks[i],
 			ft_be_s_led_old[i], ft_be_s_led_gp[i],
 			ft_be_s_led_only[i], ft_be_s_noowner[i],
 			ft_be_s_new[i], ft_be_s_led_new[i],
-			ft_be_s_led_none[i]);
+			ft_be_s_led_none[i], ft_be_s_ctx_old[i]);
 	}
 }
 
@@ -5592,7 +5594,23 @@ static void ft_be_site_report(void)
 		/* The op holds NOTHING AT ALL, anywhere -- the strongest	\
 		 * form of "unowned", and the one an exclusion argument	\
 		 * must answer for by construction rather than by lock.	*/ \
-		if (!ft_hold_trace_count())				\
+		/*							\
+		 * ☞ ASK THE OP'S CTX TOO, NOT ONLY THE LEDGER.  A hold	\
+		 * filed in @extra -- an orphan chain reaches FT_MAX_DEPTH, \
+		 * past FT_FLIP_TXN_MAX_LOCKS, so ft_detach_node keeps its \
+		 * marks in @orphan_held and says so in as many words:	\
+		 * "reachable from @lctx, invisible to @op_ctx and to the \
+		 * registry by construction ... do not read the claim's	\
+		 * zeros here as an unowned write -- ask @lctx" -- is a	\
+		 * REAL hold that neither @t->locks[] nor the trace count \
+		 * can see.  Counting it as "holds nothing" is the same	\
+		 * wrong zero the owner assert had before @5848bc0f.	\
+		 */							\
+		if (o_old && ft_owner_ctx_holds(dbg_be_ctx, o_old))	\
+			__atomic_fetch_add(&ft_be_s_ctx_old[dbg_be_site],\
+				1, __ATOMIC_RELAXED);			\
+		if (!ft_hold_trace_count()				\
+				&& !ft_owner_ctx_holds(dbg_be_ctx, o_old)) \
 			__atomic_fetch_add(&ft_be_s_led_none[dbg_be_site],\
 				1, __ATOMIC_RELAXED);			\
 		if (!o_old)						\
@@ -11086,7 +11104,7 @@ void ft_record_child_back_edge(struct cds_ft *ft, struct ft_flip_txn *txn,
 	ft_flip_txn_record_head_back_edge(txn, (void **) field,
 		urcu_txn_load(txn->mtxn, (void **) field, FT_FLIP_PROXY_TAG),
 		ft_head_parent_word_slot(new_parent, slot)
-		FT_BE_SITE(FT_BE_CHILD_BACK_EDGE));
+		FT_BE_SITE(FT_BE_CHILD_BACK_EDGE, NULL));
 }
 
 /*
@@ -14037,12 +14055,12 @@ void ft_glue_record_back_edge(struct cds_ft *ft, struct ft_flip_txn *txn,
 			ft_flip_txn_record_head_back_edge(txn,
 				(void **) &cell->parent, cell->parent,
 				ft_head_parent_word_slot(parent_nf, slot)
-				FT_BE_SITE(FT_BE_PARENT_WORD));
+				FT_BE_SITE(FT_BE_PARENT_WORD, NULL));
 		} else {
 			ft_flip_txn_record_head_back_edge(txn,
 				(void **) &en->prev, en->prev,
 				ft_head_parent_word_slot(parent_nf, slot)
-				FT_BE_SITE(FT_BE_PARENT_WORD));
+				FT_BE_SITE(FT_BE_PARENT_WORD, NULL));
 		}
 		return;
 	}
@@ -14388,14 +14406,14 @@ void ft_reparent_record(struct cds_ft *ft, struct ft_flip_txn *txn,
 				urcu_txn_load(txn->mtxn, (void **) &cell->parent,
 					FT_FLIP_PROXY_TAG),
 				ft_head_parent_word_slot(parent_nf, slot)
-				FT_BE_SITE(FT_BE_REPARENT_META));
+				FT_BE_SITE(FT_BE_REPARENT_META, NULL));
 		} else {
 			ft_flip_txn_record_head_back_edge(txn,
 				(void **) &en->prev,
 				urcu_txn_load(txn->mtxn, (void **) &en->prev,
 					FT_FLIP_PROXY_TAG),
 				ft_head_parent_word_slot(parent_nf, slot)
-				FT_BE_SITE(FT_BE_REPARENT_META));
+				FT_BE_SITE(FT_BE_REPARENT_META, NULL));
 		}
 		return;
 	}
