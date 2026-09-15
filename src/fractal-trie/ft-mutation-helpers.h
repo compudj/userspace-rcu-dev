@@ -1087,11 +1087,44 @@ extern unsigned long cds_ft_probe_promote_guarded;
  * `clear` to forget.  A caller that supplies @ctx on a record of any other
  * shape gets the NARROW predicate back -- misuse fails CLOSED.
  */
+/*
+ * ☞ WITNESS 3, AS THIS FILE'S OWN NOTE DEMANDS.  ft_flip_txn_owns is the NARROW
+ * witness -- the commit's lock registry alone -- and the note at
+ * ft_lock_ctx_holds says to read a miss as "the registry cannot see this hold",
+ * never as "the op does not hold it": an op's marks also live in @extra, in the
+ * glue's named fields, and in OUTER frames.  "A site that has the op's ctx in
+ * hand must be scored on it."
+ *
+ * MEASURED, and this is why it is not a nicety: the SKIP_X dual's acquire exits
+ * SHARED far more often than REGISTERED -- 9549 vs 7259 on
+ * inv_concurrent_same_key_removes_nolist, and 134436 vs 0 on
+ * inv_concurrent_same_key_append_nolist.  Without this clause every one of
+ * those is a hold the assert cannot see, so a producer that vouches honestly
+ * aborts a debug build on a word it really does own.
+ */
+struct ft_lock_ctx;
+static inline bool ft_lock_ctx_holds(const struct ft_lock_ctx *ctx,
+		const struct cds_ft_metadata *meta, uintptr_t *snap,
+		bool *ratified);
+
+static inline
+bool ft_owner_ctx_holds(const struct ft_lock_ctx *ctx,
+		const struct cds_ft_metadata *owner)
+{
+	uintptr_t snap;
+	bool ratified;
+
+	if (!ctx || !owner)
+		return false;
+	return ft_lock_ctx_holds(ctx, owner, &snap, &ratified);
+}
+
 # define FT_OWNER_ASSERT_OWNED_CTX(t, ctx, owner, slot, new_ptr)	\
 	urcu_assert_debug(!(t)->dbg_arm_per_op || !(t)->nr_locks ||	\
 			ft_flip_txn_owns((t), (owner)) ||		\
 			((t)->dbg_txn_ft &&				\
 			 ft_wlock_held == (t)->dbg_txn_ft) ||		\
+			ft_owner_ctx_holds((ctx), (owner)) ||		\
 			ft_owner_retire_witnessed((ctx), (owner),	\
 					(slot), (new_ptr)))
 #else
@@ -8858,13 +8891,31 @@ extern long cds_ft_fault_lock_countdown;
  * retries into the identical shape: the op waits on itself, forever.  The choke
  * point dedupes against @ctx's held set instead and leaves only the guard owed.
  */
+/*
+ * WHICH EXIT ft_flip_txn_lock_or_guard_parent TOOK.  The three are not
+ * interchangeable for a caller that has to answer @owner_held: only REGISTERED
+ * makes ft_flip_txn_owns true, SHARED means the op holds the word in a registry
+ * THIS txn cannot see, and MISS means the commit is due to ABORT (so the record
+ * never installs and cannot clobber anyone).  A caller that collapses them into
+ * one bool ships an ownership-assert violation -- see ft_lock_skip_dual_gp.
+ */
+enum ft_lock_or_guard_exit {
+	FT_LOG_EXIT_NOT_FINE = 0,	/* coarse trie / no txn / no parent */
+	FT_LOG_EXIT_REGISTERED,		/* lock taken and registered in @t */
+	FT_LOG_EXIT_SHARED,		/* already held; registry unknown */
+	FT_LOG_EXIT_MISS,		/* acquire_miss set: the commit aborts */
+};
+
 static inline
-void ft_flip_txn_lock_or_guard_parent_at(const char *fn, int line,
+void ft_flip_txn_lock_or_guard_parent_ex(const char *fn, int line,
 		const struct cds_ft *ft,
 		struct ft_flip_txn *t, const struct ft_lock_ctx *ctx,
-		struct cds_ft_inode_flag *parent_nf, unsigned int parent_depth)
+		struct cds_ft_inode_flag *parent_nf, unsigned int parent_depth,
+		enum ft_lock_or_guard_exit *exit_ret)
 {
 	(void) fn; (void) line;
+	if (exit_ret)
+		*exit_ret = FT_LOG_EXIT_NOT_FINE;
 	if (ft->lock_fine && t && parent_nf) {
 		/*
 		 * @t is the registry this record joins, so it is authoritative
@@ -8897,6 +8948,8 @@ void ft_flip_txn_lock_or_guard_parent_at(const char *fn, int line,
 				fprintf(stderr, "  ...from %s:%d\n", fn, line);
 #endif
 			t->acquire_miss = true;
+			if (exit_ret)
+				*exit_ret = FT_LOG_EXIT_MISS;
 			goto guard;
 		}
 		int aret = ft_acquire_member(ft, &lctx, parent_nf,
@@ -8933,6 +8986,8 @@ void ft_flip_txn_lock_or_guard_parent_at(const char *fn, int line,
 						&& !held.node_held)
 					ft_flip_txn_guard_parent(ft, t,
 						parent_nf);
+				if (exit_ret)
+					*exit_ret = FT_LOG_EXIT_SHARED;
 				return;
 			}
 			/*
@@ -8949,6 +9004,8 @@ void ft_flip_txn_lock_or_guard_parent_at(const char *fn, int line,
 			ft_flip_txn_lock_register(t, held.lock, held.lock_snap);
 			ft_flip_txn_record_release_lock(t, held.lock,
 				held.lock_snap);
+			if (exit_ret)
+				*exit_ret = FT_LOG_EXIT_REGISTERED;
 			return;
 		}
 		/*
@@ -8969,6 +9026,8 @@ void ft_flip_txn_lock_or_guard_parent_at(const char *fn, int line,
 		 * shape identical between the hit and miss paths.
 		 */
 		t->acquire_miss = true;
+		if (exit_ret)
+			*exit_ret = FT_LOG_EXIT_MISS;
 		/*
 		 * -ENOMEM is not a peer.  Distinguish it so the commit reports
 		 * MEMORY_ERROR instead of ABORT and does NOT age the handle:
@@ -8980,6 +9039,16 @@ void ft_flip_txn_lock_or_guard_parent_at(const char *fn, int line,
 	}
 guard:
 	ft_flip_txn_guard_parent(ft, t, parent_nf);
+}
+
+static inline
+void ft_flip_txn_lock_or_guard_parent_at(const char *fn, int line,
+		const struct cds_ft *ft,
+		struct ft_flip_txn *t, const struct ft_lock_ctx *ctx,
+		struct cds_ft_inode_flag *parent_nf, unsigned int parent_depth)
+{
+	ft_flip_txn_lock_or_guard_parent_ex(fn, line, ft, t, ctx, parent_nf,
+		parent_depth, NULL);
 }
 
 #define ft_flip_txn_lock_or_guard_parent(ft, t, ctx, parent_nf, parent_depth)	\
@@ -9063,6 +9132,33 @@ static void ft_dual_gp_acq_rm_report(void)
 #endif
 
 static
+#ifdef FT_DEBUG_DUAL_SITE
+/*
+ * ☞ WHY THE EXITS MATTER FOR THE KIND, and not merely for the assert.
+ *
+ * A MISS sets @acquire_miss, so its commit ABORTS and its record never
+ * installs -- it cannot clobber anyone, whatever kind it carries.  A SHARED
+ * exit means the op DOES hold the word, just in a registry ft_flip_txn_owns
+ * cannot see.  Only a REGISTERED exit satisfies the narrow witness.
+ *
+ * So "can this producer vouch?" is answered by REGISTERED + SHARED, while "may
+ * it pass true to the assert TODAY?" is answered by REGISTERED alone.  The gap
+ * between the two columns is exactly the work the class conversion owes.
+ */
+unsigned long ft_dual_exit[4];
+static void ft_dual_exit_report(void) __attribute__((destructor));
+static void ft_dual_exit_report(void)
+{
+	fprintf(stderr, "FT DUAL-GP EXIT notfine=%lu REGISTERED=%lu SHARED=%lu "
+		"MISS=%lu\n",
+		uatomic_read(&ft_dual_exit[0]), uatomic_read(&ft_dual_exit[1]),
+		uatomic_read(&ft_dual_exit[2]), uatomic_read(&ft_dual_exit[3]));
+}
+# define FT_DUAL_EXIT_TALLY(ex)	uatomic_inc(&ft_dual_exit[(ex)])
+#else
+# define FT_DUAL_EXIT_TALLY(ex)	do { (void) (ex); } while (0)
+#endif
+
 bool ft_lock_skip_dual_gp(struct cds_ft *ft,
 		const struct ft_lock_ctx *ctx,
 		struct ft_flip_txn *txn,
@@ -9074,6 +9170,7 @@ bool ft_lock_skip_dual_gp(struct cds_ft *ft,
 	struct cds_ft_metadata *cn_meta;
 	struct cds_ft_inode_flag *gp_nf = NULL;
 	struct cds_ft_inode_flag **skip_slot;
+	enum ft_lock_or_guard_exit ex;
 
 	if (!txn || !parent_nf || !ft_node_compressed(parent_nf))
 		return false;
@@ -9096,8 +9193,9 @@ bool ft_lock_skip_dual_gp(struct cds_ft *ft,
 		uatomic_inc(&ft_dual_gp_acq_remove);
 	}
 #endif
-	ft_flip_txn_lock_or_guard_parent(ft, txn, ctx, gp_nf,
-		FT_DEPTH_FROM_DESCENT);
+	ft_flip_txn_lock_or_guard_parent_ex(__func__, __LINE__, ft, txn,
+		ctx, gp_nf, FT_DEPTH_FROM_DESCENT, &ex);
+	FT_DUAL_EXIT_TALLY(ex);
 	/*
 	 * ☠ "I CALLED THE ACQUIRE" IS NOT "THE TXN OWNS THE WORD", and returning
 	 * the former is what @6f2e49f8 did.  ft_flip_txn_lock_or_guard_parent
@@ -9116,7 +9214,7 @@ bool ft_lock_skip_dual_gp(struct cds_ft *ft,
 	 * in @extra, the glue, or an outer frame) it answers false and the edge
 	 * stays MW, which is the safe direction.
 	 */
-	return ft_flip_txn_owns(txn, ft_flag_to_metadata(ft, gp_nf));
+	return ex == FT_LOG_EXIT_REGISTERED || ex == FT_LOG_EXIT_SHARED;
 #else
 	(void) ft; (void) ctx; (void) txn; (void) parent_nf; (void) mtxn;
 	return false;

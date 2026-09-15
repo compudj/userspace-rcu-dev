@@ -317,6 +317,38 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			if (!ft->lock_fine)
 				ft_flip_txn_lock_or_guard_parent(ft, txn, ctx,
 					ft_compressed_node_flag(cn), iter_depth);
+			/*
+			 * ☠ §9.3's THIRD MEMBER IS **NOT** TAKEN HERE, and the
+			 * attempt HANGS.  This publish parent IS a compressed
+			 * node, so the republish does emit a SKIP_X dual into
+			 * cn's own parent -- exactly the shape the other four
+			 * producers now acquire.  Adding
+			 * ft_lock_skip_dual_gp here wedges
+			 * test_rekey_same_path_atomic_or_refused: "child killed
+			 * by signal 14 (HANG -- the same-path move did not
+			 * return)", 2 of 2, standalone, where HEAD is 2 of 2
+			 * green.  Bisected to THESE TWO CALLS: the other three
+			 * acquires are green with this one removed, and red with
+			 * it alone.
+			 *
+			 * The mechanism is the one the choke-point note at
+			 * ft_flip_txn_lock_or_guard_parent already names -- "an
+			 * op can arrive here holding this publish target's lock
+			 * already, taken for a DIFFERENT member of its own set.
+			 * Re-acquiring then misses against the op's OWN hold,
+			 * which sets @acquire_miss and aborts the commit, and the
+			 * caller retries into the identical shape: the op waits
+			 * on itself, forever."  The line just above says cn's
+			 * lock was "acquired + recorded up front under
+			 * lock_fine", so this frame is precisely an op that
+			 * arrives holding part of the set.
+			 *
+			 * ⇒ This site needs the acquire HOISTED into the up-front
+			 * lock set beside cn's, not bolted on at the publish.
+			 * Until then it stays as it was, and the dual's KIND
+			 * cannot flip: this producer still writes the slot
+			 * without holding it.
+			 */
 			_ft_publish_to_parent(ft, ft_compressed_node_flag(cn),
 				&cn->child,
 				(struct cds_ft_inode_flag *) topmost_external_nodes,
@@ -345,6 +377,38 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			if (!ft->lock_fine)
 				ft_flip_txn_lock_or_guard_parent(ft, txn, ctx,
 					ft_compressed_node_flag(cn), iter_depth);
+			/*
+			 * ☠ §9.3's THIRD MEMBER IS **NOT** TAKEN HERE, and the
+			 * attempt HANGS.  This publish parent IS a compressed
+			 * node, so the republish does emit a SKIP_X dual into
+			 * cn's own parent -- exactly the shape the other four
+			 * producers now acquire.  Adding
+			 * ft_lock_skip_dual_gp here wedges
+			 * test_rekey_same_path_atomic_or_refused: "child killed
+			 * by signal 14 (HANG -- the same-path move did not
+			 * return)", 2 of 2, standalone, where HEAD is 2 of 2
+			 * green.  Bisected to THESE TWO CALLS: the other three
+			 * acquires are green with this one removed, and red with
+			 * it alone.
+			 *
+			 * The mechanism is the one the choke-point note at
+			 * ft_flip_txn_lock_or_guard_parent already names -- "an
+			 * op can arrive here holding this publish target's lock
+			 * already, taken for a DIFFERENT member of its own set.
+			 * Re-acquiring then misses against the op's OWN hold,
+			 * which sets @acquire_miss and aborts the commit, and the
+			 * caller retries into the identical shape: the op waits
+			 * on itself, forever."  The line just above says cn's
+			 * lock was "acquired + recorded up front under
+			 * lock_fine", so this frame is precisely an op that
+			 * arrives holding part of the set.
+			 *
+			 * ⇒ This site needs the acquire HOISTED into the up-front
+			 * lock set beside cn's, not bolted on at the publish.
+			 * Until then it stays as it was, and the dual's KIND
+			 * cannot flip: this producer still writes the slot
+			 * without holding it.
+			 */
 			_ft_publish_to_parent(ft, ft_compressed_node_flag(cn),
 				&cn->child,
 				(struct cds_ft_inode_flag *) topmost_external_nodes,
@@ -525,6 +589,15 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			if (!ft->lock_fine)
 				ft_flip_txn_lock_or_guard_parent(ft, txn, ctx,
 					pub_parent, pp_depth);
+			/*
+			 * §9.3's THIRD MEMBER: @pub_parent may be compressed, in
+			 * which case this publish also emits its SKIP_X dual into
+			 * a grandparent the op holds nothing of.  Acquire it from
+			 * the same derivation the record names.  (Kind still
+			 * false -- see ft_node_recompact's dual site.)
+			 */
+			(void) ft_lock_skip_dual_gp(ft, ctx, txn, pub_parent,
+				NULL);
 			_ft_publish_to_parent(ft, pub_parent,
 				pub_slot,
 				ft_node_flag(fresh, 0),
@@ -4793,6 +4866,15 @@ int ft_detach_node(struct cds_ft *ft,
 			 * not this frame's -- the rekey writer arms it itself,
 			 * so refusing here costs nothing.
 			 */
+			/*
+			 * §9.3's THIRD MEMBER, as on the non-fused twin below:
+			 * the dual's grandparent is DERIVED at publish, so the
+			 * only sound way to hold it is to acquire it from that
+			 * same derivation.  ABOVE the arm -- it is a
+			 * ft_flip_txn_lock_register.
+			 */
+			dual_gp_held = ft_lock_skip_dual_gp(ft, &lctx, commit_txn,
+				ft_parent_node(iter_meta->parent_word), NULL);
 			if (commit_txn && !commit_txn_used && !record_only)
 				ft_flip_txn_arm_per_op(ft, commit_txn);
 			_ft_publish_to_parent(ft, ft_parent_node(iter_meta->parent_word),
@@ -5494,8 +5576,24 @@ int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 			(struct cds_ft_inode_flag **) head_slot,
 			(struct cds_ft_inode_flag *) next_node,
 			(struct cds_ft_inode_flag *) node,
+			/*
+			 * ☐ KIND HELD BACK, DELIBERATELY.  @dual_gp_held is an
+			 * honest answer now (REGISTERED or SHARED, both of which
+			 * mean the op holds the word), but a slot is SW xor MW
+			 * GLOBALLY (rcu-txn.h) and ft_node_recompact's dual
+			 * producer -- 766,522 records across the inv suite, the
+			 * largest of the eight -- still writes the same slot
+			 * class without acquiring.  A producer that vouches while
+			 * that one does not parks SW beside its CAS.
+			 *
+			 * So every dual producer passes false until the LAST one
+			 * acquires, and then they flip TOGETHER.  What changed
+			 * meanwhile is the EXCLUSION, not the kind: five of the
+			 * eight now take §9.3's third member.
+			 */
 			NULL, new_cell_flag, &rec, /*slot_owner_nf=*/ parent_nf,
-			dual_gp_held);
+			/* see above */ false);
+		(void) dual_gp_held;
 		n_s = ft_pub_rec_sedges(&rec, sedges);
 		/*
 		 * Fuse @node's freeze (mark node->next, target preserved) into the
@@ -5596,7 +5694,23 @@ int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 			(struct cds_ft_inode_flag *) next_node,
 			(struct cds_ft_inode_flag *) node,
 			NULL, inherit /* folded prev: intended parent value */, &rec,
-			/*slot_owner_nf=*/ parent_nf, dual_gp_held);
+			/*
+			 * ☐ KIND HELD BACK, DELIBERATELY.  @dual_gp_held is an
+			 * honest answer now (REGISTERED or SHARED, both of which
+			 * mean the op holds the word), but a slot is SW xor MW
+			 * GLOBALLY (rcu-txn.h) and ft_node_recompact's dual
+			 * producer -- 766,522 records across the inv suite, the
+			 * largest of the eight -- still writes the same slot
+			 * class without acquiring.  A producer that vouches while
+			 * that one does not parks SW beside its CAS.
+			 *
+			 * So every dual producer passes false until the LAST one
+			 * acquires, and then they flip TOGETHER.  What changed
+			 * meanwhile is the EXCLUSION, not the kind: five of the
+			 * eight now take §9.3's third member.
+			 */
+			/*slot_owner_nf=*/ parent_nf, /* see above */ false);
+		(void) dual_gp_held;
 		n_s = ft_pub_rec_sedges(&rec, sedges);
 		/* Fuse @node's freeze into the structural publish (doc §4.B). */
 		ft_ch_audit(ft, txn, node);
