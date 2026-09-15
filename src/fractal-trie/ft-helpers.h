@@ -77,6 +77,10 @@ enum ft_word_excl {
 static void ft_ch_audit_head_at(const char *fn, int line,
 		const struct cds_ft *ft, struct cds_ft_node *head,
 		struct cds_ft_inode_flag *owner_flag, enum ft_word_excl excl);
+/* The node-body arm: a live node's own bitmap + child-slot words. */
+static void ft_ch_audit_body_at(const char *fn, int line,
+		const struct cds_ft *ft, struct cds_ft_metadata *owner,
+		enum ft_word_excl excl);
 /* The metadata.parent_word arm (the table's FT-SLOT-3 row); same arrangement. */
 static void ft_ch_audit_parent_at(const char *fn, int line,
 		const struct cds_ft *ft, const struct cds_ft_metadata *child_meta,
@@ -90,6 +94,7 @@ static void ft_ch_audit_parent_at(const char *fn, int line,
  * caller's location -- so it needs a no-op too, or a non-debug build breaks. */
 # define ft_ch_audit_head_at(fn, line, ft, head, owner, excl) do { } while (0)
 # define ft_ch_audit_parent_at(fn, line, ft, cm, owner, excl) do { } while (0)
+# define ft_ch_audit_body_at(fn, line, ft, owner, excl) do { } while (0)
 #endif
 
 static inline __attribute__((unused))

@@ -3267,8 +3267,10 @@ enum ft_ch_wkind {
 	FT_CH_W_CHAIN = 0,	/* duplicate-chain next/prev */
 	FT_CH_W_HEADWORD,	/* ft_ord_cell.parent / a head's cds_ft_node.prev */
 	FT_CH_W_PARENTWORD,	/* metadata.parent_word + parent_slot_offset */
+	FT_CH_W_NODEBODY,	/* a live node's own bitmap + child-slot words */
 };
-static const char *const ft_ch_wkind_name[] = { "chain", "headwd", "parentwd" };
+static const char *const ft_ch_wkind_name[] = {
+	"chain", "headwd", "parentwd", "nodebody" };
 
 struct ft_ch_site {
 	const char *fn;
@@ -3680,6 +3682,91 @@ void ft_ch_audit_head_at(const char *fn, int line, const struct cds_ft *ft,
 {
 	ft_ch_audit_owner_at(fn, line, ft, NULL, NULL, head, owner_flag, excl,
 		FT_CH_W_HEADWORD);
+}
+
+/*
+ * THE NODE-BODY CLASS: a LIVE node's own occupancy bitmap and child-slot words,
+ * written IN PLACE by ft_popcount_node_set_nth / ft_pigeon_node_set_nth.
+ *
+ * ☞ WHY THIS CLASS IS WORTH DECLARING.  Its sites are gated on
+ * `ft_in_place_ok(ft) || defer_parent`, and ft_in_place_ok is today
+ * `ft->exclusive` -- a per-TRIE claim standing in for what is really a per-OP
+ * one ("this op holds the node").  Declaring HIDDEN when @defer_parent and
+ * LOCKED otherwise turns that standing-in into a CHECKED claim: the ladder
+ * below asks whether the op actually holds @owner, so hw_locked_viol is the
+ * code saying it holds the node where it does not.  That is the evidence the
+ * in-place re-introduction needs (doc/design/ft-reintroduce-in-place-mutations.md
+ * §2.1) rather than an assertion about locking modes.
+ *
+ * The owner is the node ITSELF and is handed in, so -- as with the parent-word
+ * class -- nothing is derived and ft_ch_audit_owner_at's body is not reusable.
+ */
+static
+void ft_ch_audit_body_at(const char *fn, int line, const struct cds_ft *ft,
+		struct cds_ft_metadata *owner, enum ft_word_excl excl)
+{
+	struct ft_ch_site *s = ft_ch_site_of(fn, line, false, FT_CH_W_NODEBODY);
+
+	if (!s || !owner)
+		return;
+	s->total++;
+	if (ft_wlock_held == (struct cds_ft *) ft) {
+		s->wlock++;
+		return;
+	}
+	if (!ft->lock_fine) {
+		s->coarse_mode++;
+		return;
+	}
+	switch (excl) {
+	case FT_EXCL_HIDDEN:
+		s->hw_hidden++;
+		return;
+	case FT_EXCL_MW_CAS:
+		s->hw_mw++;
+		return;
+	case FT_EXCL_LOCKED:
+		if (ft_hold_trace_holds(owner)) {
+			s->hw_locked_ok++;
+			return;
+		}
+		/*
+		 * ☠ ABOVE PER-NODE SPACING THE OWNER IS NOT THE WORD -- the same
+		 * caveat the chain arm carries.  Ask the weaker question that is
+		 * sound in the direction that matters: is ANY ancestor held?  The
+		 * anchor, whatever it is, IS an ancestor, so "no ancestor held"
+		 * means no anchor covers this node.  A hit is bucketed as
+		 * @anchored, never as a pass.  Resolve proxies and stop at an
+		 * external: both guards are load-bearing (they crashed this walk
+		 * before).
+		 */
+		if (ft->lock_spacing != CDS_FT_LOCK_SPACING_PER_NODE) {
+			struct cds_ft_inode_flag *af = ft_resolve_flip_proxy(
+				ft_parent_node(owner->parent_word));
+			unsigned int guard = 0;
+
+			while (af && guard++ < FT_MAX_DEPTH &&
+					!ft_node_external(af)) {
+				struct cds_ft_metadata *am =
+					ft_flag_to_metadata(ft, af);
+
+				if (!am)
+					break;
+				if (ft_hold_trace_holds(am)) {
+					s->anchored++;
+					return;
+				}
+				af = ft_resolve_flip_proxy(
+					ft_parent_node(am->parent_word));
+			}
+		}
+		s->hw_locked_viol++;
+		return;
+	case FT_EXCL_UNDECLARED:
+	default:
+		s->headword++;
+		return;
+	}
 }
 
 /*

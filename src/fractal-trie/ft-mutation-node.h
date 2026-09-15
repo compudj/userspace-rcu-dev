@@ -138,8 +138,20 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 		 * child-copy / cluster-leaf) -- build-invisible, so keep the
 		 * in-place store.  See FEATURE_FT_INSERT_IN_PLACE. */
 		if (!ft_in_place_ok(ft) && !defer_parent &&
-		    !((qp_root >> qp_hi & 1U) && ((qp_bms >> qp_p) & 1ULL)))
+		    !((qp_root >> qp_hi & 1U) && ((qp_bms >> qp_p) & 1ULL))) {
+			/*
+			 * ☞ THE REFUSED PATH IS THE MEASUREMENT.  This is the population that
+			 * recompact-on-insert turns away and that widening ft_in_place_ok would
+			 * newly admit.  Declaring LOCKED here asks the ladder the question the
+			 * widening rests on -- "does the op actually hold this node?" -- on the
+			 * real workload and WITHOUT changing behaviour: the -ERANGE below still
+			 * fires.  A probe that records beats a guard that refuses.
+			 */
+			ft_ch_audit_body_at(__func__, __LINE__, ft, metadata, FT_EXCL_LOCKED);
 			return -ERANGE;
+		}
+		ft_ch_audit_body_at(__func__, __LINE__, ft, metadata,
+			defer_parent ? FT_EXCL_HIDDEN : FT_EXCL_LOCKED);
 		if (qp_root >> qp_hi & 1U) {
 			/* hi already present */
 			if ((qp_bms >> qp_p) & 1ULL) {
@@ -306,8 +318,20 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 		 * build-into-unpublished-node insert (defer_parent), stay in
 		 * place. */
 		if (!ft_in_place_ok(ft) && !defer_parent &&
-		    !(((qp_root >> qp_hi) & 1ULL) && ((qp_bms >> qp_p) & 1ULL)))
+		    !(((qp_root >> qp_hi) & 1ULL) && ((qp_bms >> qp_p) & 1ULL))) {
+			/*
+			 * ☞ THE REFUSED PATH IS THE MEASUREMENT.  This is the population that
+			 * recompact-on-insert turns away and that widening ft_in_place_ok would
+			 * newly admit.  Declaring LOCKED here asks the ladder the question the
+			 * widening rests on -- "does the op actually hold this node?" -- on the
+			 * real workload and WITHOUT changing behaviour: the -ERANGE below still
+			 * fires.  A probe that records beats a guard that refuses.
+			 */
+			ft_ch_audit_body_at(__func__, __LINE__, ft, metadata, FT_EXCL_LOCKED);
 			return -ERANGE;
+		}
+		ft_ch_audit_body_at(__func__, __LINE__, ft, metadata,
+			defer_parent ? FT_EXCL_HIDDEN : FT_EXCL_LOCKED);
 		if ((qp_root >> qp_hi) & 1ULL) {
 			/* hi already present */
 			if ((qp_bms >> qp_p) & 1ULL) {
@@ -478,9 +502,21 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 						node, qp_max_lc, qp_slot1);
 				qp_present = ((qp_sub0 >> qp_lo) & 1U) != 0;
 			}
-			if (!qp_present)
+			if (!qp_present) {
+				/*
+				 * ☞ THE REFUSED PATH IS THE MEASUREMENT.  This is the population that
+				 * recompact-on-insert turns away and that widening ft_in_place_ok would
+				 * newly admit.  Declaring LOCKED here asks the ladder the question the
+				 * widening rests on -- "does the op actually hold this node?" -- on the
+				 * real workload and WITHOUT changing behaviour: the -ERANGE below still
+				 * fires.  A probe that records beats a guard that refuses.
+				 */
+				ft_ch_audit_body_at(__func__, __LINE__, ft, metadata, FT_EXCL_LOCKED);
 				return -ERANGE;
+			}
 		}
+		ft_ch_audit_body_at(__func__, __LINE__, ft, metadata,
+			defer_parent ? FT_EXCL_HIDDEN : FT_EXCL_LOCKED);
 
 		if ((qp_root >> qp_hi) & 1U) {
 			qp_sub = *ft_popcount_2l_sub_bm_addr(node,
@@ -655,8 +691,20 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 		 * ADD_SAME via -ERANGE; a replace at an occupied slot, and a
 		 * build-into-unpublished-node insert (defer_parent), stay in
 		 * place. */
-		if (!ft_in_place_ok(ft) && !defer_parent && !(word & bit))
+		if (!ft_in_place_ok(ft) && !defer_parent && !(word & bit)) {
+			/*
+			 * ☞ THE REFUSED PATH IS THE MEASUREMENT.  This is the population that
+			 * recompact-on-insert turns away and that widening ft_in_place_ok would
+			 * newly admit.  Declaring LOCKED here asks the ladder the question the
+			 * widening rests on -- "does the op actually hold this node?" -- on the
+			 * real workload and WITHOUT changing behaviour: the -ERANGE below still
+			 * fires.  A probe that records beats a guard that refuses.
+			 */
+			ft_ch_audit_body_at(__func__, __LINE__, ft, metadata, FT_EXCL_LOCKED);
 			return -ERANGE;
+		}
+		ft_ch_audit_body_at(__func__, __LINE__, ft, metadata,
+			defer_parent ? FT_EXCL_HIDDEN : FT_EXCL_LOCKED);
 		if (word & bit) {
 			/* Case 1: in-place pointer replace. */
 			for (k = 0; k < word_idx; k++)
@@ -821,8 +869,20 @@ int ft_pigeon_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 	 * The delete side carries the same dependency
 	 * (ft_popcount_node_replace_ptr / ft_pigeon_node_replace_ptr, -EFBIG).
 	 */
-	if (!ft_in_place_ok(ft) && !defer_parent && !*ptr)
+	if (!ft_in_place_ok(ft) && !defer_parent && !*ptr) {
+		/*
+		 * ☞ THE REFUSED PATH IS THE MEASUREMENT.  This is the population that
+		 * recompact-on-insert turns away and that widening ft_in_place_ok would
+		 * newly admit.  Declaring LOCKED here asks the ladder the question the
+		 * widening rests on -- "does the op actually hold this node?" -- on the
+		 * real workload and WITHOUT changing behaviour: the -ERANGE below still
+		 * fires.  A probe that records beats a guard that refuses.
+		 */
+		ft_ch_audit_body_at(__func__, __LINE__, ft, metadata, FT_EXCL_LOCKED);
 		return -ERANGE;
+	}
+	ft_ch_audit_body_at(__func__, __LINE__, ft, metadata,
+		defer_parent ? FT_EXCL_HIDDEN : FT_EXCL_LOCKED);
 	if (*ptr)
 		replace_old_ptr = true;
 	rcu_assign_pointer(*ptr, child_node_flag);
