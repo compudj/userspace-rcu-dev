@@ -5536,10 +5536,9 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 				have_hctx ? &hctx : NULL, txn, parent_nf,
 				txn->mtxn);
 			FT_REPL_DUAL_TALLY(parent_nf, dual_gp_held);
-			(void) dual_gp_held;	/* kind flips with all producers */
 			_ft_publish_to_parent(ft, parent_nf, pub_slot,
 				(struct cds_ft_inode_flag *) new_node,
-				(struct cds_ft_inode_flag *) old_node, &rec, false);
+				(struct cds_ft_inode_flag *) old_node, &rec, dual_gp_held);
 			n_s = ft_pub_rec_sedges(&rec, sedges);
 			/*
 			 * Fuse @old_node's freeze (mark old_node->next, target
@@ -5669,10 +5668,9 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 				have_hctx ? &hctx : NULL, txn, parent_nf,
 				txn->mtxn);
 			FT_REPL_DUAL_TALLY(parent_nf, dual_gp_held);
-			(void) dual_gp_held;	/* kind flips with all producers */
 			_ft_publish_to_parent(ft, parent_nf, pub_slot,
 				(struct cds_ft_inode_flag *) new_node,
-				(struct cds_ft_inode_flag *) old_node, &rec, false);
+				(struct cds_ft_inode_flag *) old_node, &rec, dual_gp_held);
 			n_s = ft_pub_rec_sedges(&rec, sedges);
 			/* Fuse @old_node's freeze into the structural publish (doc §4.B). */
 			ft_ch_audit(ft, txn, old_node);

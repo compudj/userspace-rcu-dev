@@ -401,11 +401,10 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			dual_gp_held = ft_lock_skip_dual_gp(ft, ctx, txn,
 				ft_compressed_node_flag(cn),
 				txn ? txn->mtxn : NULL);
-			(void) dual_gp_held;	/* kind flips with all producers */
 			_ft_publish_to_parent(ft, ft_compressed_node_flag(cn),
 				&cn->child,
 				(struct cds_ft_inode_flag *) topmost_external_nodes,
-				elevated_old_child, &rec, false);
+				elevated_old_child, &rec, dual_gp_held);
 			if (ft_remove_commit_rec(ft, &rec, fuse_cell, run,
 					txn, false) > 0)
 				/* Peer won: nothing installed (txn consumed). */
@@ -495,11 +494,10 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			dual_gp_held = ft_lock_skip_dual_gp(ft, ctx, txn,
 				ft_compressed_node_flag(cn),
 				txn ? txn->mtxn : NULL);
-			(void) dual_gp_held;	/* kind flips with all producers */
 			_ft_publish_to_parent(ft, ft_compressed_node_flag(cn),
 				&cn->child,
 				(struct cds_ft_inode_flag *) topmost_external_nodes,
-				elevated_old_child, &rec, false);
+				elevated_old_child, &rec, dual_gp_held);
 			if (ft_remove_commit_rec(ft, &rec, NULL, NULL, txn,
 					record_only) > 0)
 				/* Peer won: nothing installed (txn consumed). */
@@ -687,11 +685,10 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			 */
 			dual_gp_held = ft_lock_skip_dual_gp(ft, ctx, txn,
 				pub_parent, txn ? txn->mtxn : NULL);
-			(void) dual_gp_held;	/* kind flips with all producers */
 			_ft_publish_to_parent(ft, pub_parent,
 				pub_slot,
 				ft_node_flag(fresh, 0),
-				*pub_slot, &rec, false);
+				*pub_slot, &rec, dual_gp_held);
 			/*
 			 * Freeze the retired compressed node dead (§4.B freeze-on-
 			 * free): this compressed->fresh-internal recompaction retires
@@ -5002,7 +4999,7 @@ int ft_detach_node(struct cds_ft *ft,
 				 * publish-time: the acquired GP compared against
 				 * the derived dual owner, not the plan's intent.
 				 */
-				false);
+				dual_gp_held);
 			/*
 			 * nr_keys fold (LEAF Increment 2): the recompaction's -1
 			 * walk from the STABLE grandparent iter_meta->parent (the
@@ -5171,10 +5168,12 @@ int ft_detach_node(struct cds_ft *ft,
 				 * the DERIVED grandparent 0 times in 9721.
 				 * Vouching here alone would park SW beside that
 				 * peer's CAS, which is the one thing the dual's
-				 * rules forbid.  Flip this and the recompact
-				 * producer TOGETHER, never one of them.
+				 * rules forbid.  ☑ SUPERSEDED: the kind is a
+				 * per-op claim, not a global one -- the LOCK
+				 * serialises an SW park against an MW CAS, so
+				 * producers convert INDIVIDUALLY.
 				 */
-				false);
+				dual_gp_held);
 			(void) dual_gp_held;
 			/*
 			 * nr_keys fold (LEAF Increment 2): a non-fused RECOMPACTION
@@ -5684,7 +5683,7 @@ int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 			 * eight now take §9.3's third member.
 			 */
 			NULL, new_cell_flag, &rec, /*slot_owner_nf=*/ parent_nf,
-			/* see above */ false);
+			/* see above */ dual_gp_held);
 		(void) dual_gp_held;
 		n_s = ft_pub_rec_sedges(&rec, sedges);
 		/*
@@ -5801,7 +5800,7 @@ int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 			 * meanwhile is the EXCLUSION, not the kind: five of the
 			 * eight now take §9.3's third member.
 			 */
-			/*slot_owner_nf=*/ parent_nf, /* see above */ false);
+			/*slot_owner_nf=*/ parent_nf, /* see above */ dual_gp_held);
 		(void) dual_gp_held;
 		n_s = ft_pub_rec_sedges(&rec, sedges);
 		/* Fuse @node's freeze into the structural publish (doc §4.B). */
