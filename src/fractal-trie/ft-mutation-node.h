@@ -2819,8 +2819,26 @@ skip_copy:
 							/*child_marked=*/ false,
 							ctx);
 				} else
-					ft_set_parent(ft, iter, new_node_flag,
-							slot);
+					/*
+					 * HIDDEN by the @cluster_leaf contract
+					 * this loop already sits inside.  The
+					 * loop runs only for !cluster_leaf, and
+					 * cluster_leaf is set by EVERY caller
+					 * that puts a LIVE child into the node
+					 * -- ft_build_branch states the rule
+					 * ("Higher internals and the
+					 * compressed-wrapping case have only
+					 * fresh children, whose back-pointers
+					 * are safe to set during the build"),
+					 * and the insert/merge/graft builders
+					 * follow it: the live old child makes
+					 * suffix_len == 0, which IS
+					 * branch_cluster_leaf / jct_cluster_leaf.
+					 * So every @iter reached here is fresh.
+					 */
+					ft_set_parent_excl(ft, iter,
+							new_node_flag, slot,
+							FT_EXCL_HIDDEN);
 			}
 			break;
 		}

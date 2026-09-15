@@ -645,7 +645,23 @@ struct cds_ft_inode_flag *ft_try_compress_chain(struct cds_ft *ft,
 			(void) ft_publish_compressed(ft, cn, cflag);
 			return cflag;
 		}
-		ft_set_parent(ft, cn->child, cflag, &cn->child);
+		/*
+		 * HIDDEN, and the @glue branch above is what proves it.  A LIVE
+		 * @cn->child is the GLUE case -- it says so ("cn->child is LIVE
+		 * ... Record its back-pointer for the post-sync commit instead
+		 * of flipping it now") -- and that branch RETURNS, so this line
+		 * runs only with @glue == NULL.  The absorb fence is likewise
+		 * gated on @glue, so no live child_cn reaches here either.
+		 *
+		 * With @glue NULL there are exactly two entry paths, and both
+		 * carry an unpublished child: ft_attach_node passes the cluster
+		 * it is building from the caller's new external node, and
+		 * ft_build_branch(glue == NULL) -- whose contract says the live
+		 * leaf is the non-NULL-glue mode -- has a single such caller,
+		 * ft_insert_compressed_past_child, passing the fresh @node.
+		 */
+		ft_set_parent_excl(ft, cn->child, cflag, &cn->child,
+			FT_EXCL_HIDDEN);
 		if (child_cn)
 			free_compressed_node_unpublished(ft, child_cn);
 		/* compressed_publish emitted by ft_publish_compressed. */
