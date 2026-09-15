@@ -781,7 +781,15 @@ struct cds_ft_inode_flag *ft_build_extracted_root_glue(struct cds_ft *ft,
 		/* Re-encode the root slot to the skip form (new_cn is compressed). */
 		if (skip_value && skip_value != slot_value && slot)
 			*slot = skip_value;
-		ft_set_parent(ft, slot_value, dest, slot);
+		/*
+		 * HIDDEN: this arm's @slot_value is the FRESH compressed node
+		 * allocated above for the remaining run.  The LIVE case is the
+		 * OTHER branch and the code labels it there -- slot_value =
+		 * child, marked LIVE with its back-pointer deferred -- routing
+		 * it to ft_glue_defer_edge instead of here.
+		 */
+		ft_set_parent_excl(ft, slot_value, dest, slot,
+			FT_EXCL_HIDDEN);
 	}
 	return dest;
 }

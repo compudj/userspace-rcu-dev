@@ -3245,11 +3245,35 @@ static inline bool ft_lock_ctx_holds(const struct ft_lock_ctx *ctx,
 static int ft_ch_ctx_source(const struct ft_lock_ctx *ctx,
 		const struct cds_ft_metadata *meta);
 
-#define FT_CH_SITE_MAX	48
+/*
+ * ☠ RAISED FROM 48, AND THE OVERFLOW IS NOW LOUD.  ft_ch_site_of returns NULL
+ * when the table is full and every caller silently does nothing -- so a class
+ * added after the table filled reads as ZERO CALLS rather than as "no room".
+ * That is exactly what happened when the word kind joined the row key: it
+ * roughly doubles the rows (one call site can write two different word
+ * classes), the table hit 48, and the whole metadata.parent_word class measured
+ * a clean, confident, completely wrong 0.
+ */
+#define FT_CH_SITE_MAX	256
+
+/*
+ * WHICH WORD CLASS a row is about.  ft_set_parent_at forwards its CALLER's
+ * fn/line, and one call site can reach different arms on different calls -- the
+ * external-head arm writes a head's parent word, the others write
+ * metadata.parent_word.  Without this in the key those two classes would share
+ * a row and the counts would be a blend of both.
+ */
+enum ft_ch_wkind {
+	FT_CH_W_CHAIN = 0,	/* duplicate-chain next/prev */
+	FT_CH_W_HEADWORD,	/* ft_ord_cell.parent / a head's cds_ft_node.prev */
+	FT_CH_W_PARENTWORD,	/* metadata.parent_word + parent_slot_offset */
+};
+static const char *const ft_ch_wkind_name[] = { "chain", "headwd", "parentwd" };
 
 struct ft_ch_site {
 	const char *fn;
 	int line;
+	int wkind;
 	bool coarse;
 	unsigned long total, wlock, held, led, unheld, nolocks, noholder,
 		coarse_mode, aborting, some, ctxheld,
@@ -3267,23 +3291,30 @@ struct ft_ch_site {
 
 extern struct ft_ch_site ft_ch_sites[FT_CH_SITE_MAX];
 extern unsigned int ft_ch_site_n;
+extern unsigned long ft_ch_site_overflow;
 struct ft_ch_site ft_ch_sites[FT_CH_SITE_MAX];
 unsigned int ft_ch_site_n;
+unsigned long ft_ch_site_overflow;
 
 static
-struct ft_ch_site *ft_ch_site_of(const char *fn, int line, bool coarse)
+struct ft_ch_site *ft_ch_site_of(const char *fn, int line, bool coarse,
+		int wkind)
 {
 	unsigned int i;
 
 	for (i = 0; i < ft_ch_site_n; i++)
-		if (ft_ch_sites[i].line == line && ft_ch_sites[i].fn == fn)
+		if (ft_ch_sites[i].line == line && ft_ch_sites[i].fn == fn
+				&& ft_ch_sites[i].wkind == wkind)
 			return &ft_ch_sites[i];
-	if (ft_ch_site_n == FT_CH_SITE_MAX)
+	if (ft_ch_site_n == FT_CH_SITE_MAX) {
+		__atomic_fetch_add(&ft_ch_site_overflow, 1, __ATOMIC_RELAXED);
 		return NULL;
+	}
 	i = ft_ch_site_n++;
 	ft_ch_sites[i].fn = fn;
 	ft_ch_sites[i].line = line;
 	ft_ch_sites[i].coarse = coarse;
+	ft_ch_sites[i].wkind = wkind;
 	return &ft_ch_sites[i];
 }
 
@@ -3296,14 +3327,14 @@ struct ft_ch_site *ft_ch_site_of(const char *fn, int line, bool coarse)
 static inline
 void ft_ch_audit_owner_at(const char *fn, int line, const struct cds_ft *ft,
 		const struct ft_flip_txn *t, const struct ft_lock_ctx *ctx,
-		struct cds_ft_node *node, struct cds_ft_inode_flag *owner_flag,
-		enum ft_word_excl excl)
+		const void *item, struct cds_ft_inode_flag *owner_flag,
+		enum ft_word_excl excl, int wkind)
 {
-	struct ft_ch_site *s = ft_ch_site_of(fn, line, false);
+	struct ft_ch_site *s = ft_ch_site_of(fn, line, false, wkind);
 	struct cds_ft_inode_flag *h;
 	struct cds_ft_metadata *hm;
 
-	if (!s || !node)
+	if (!s || !item)
 		return;
 	s->total++;
 	/*
@@ -3352,7 +3383,8 @@ void ft_ch_audit_owner_at(const char *fn, int line, const struct cds_ft *ft,
 			 */
 			if (!ft->lock_fine)
 				return;
-			wh = ft_chain_head_holder((struct cds_ft *) ft, node);
+			wh = ft_chain_head_holder((struct cds_ft *) ft,
+					(struct cds_ft_node *) item);
 			struct cds_ft_metadata *wm;
 			uintptr_t snap;
 			bool ratified;
@@ -3475,7 +3507,8 @@ void ft_ch_audit_owner_at(const char *fn, int line, const struct cds_ft *ft,
 			return;
 		}
 	}
-	h = ft_chain_head_holder((struct cds_ft *) ft, node);
+	h = ft_chain_head_holder((struct cds_ft *) ft,
+			(struct cds_ft_node *) item);
 	if (!h) {
 		s->noholder++;
 		return;
@@ -3605,7 +3638,7 @@ void ft_ch_audit_owner_at(const char *fn, int line, const struct cds_ft *ft,
 static inline
 void ft_ch_audit_coarse_at(const char *fn, int line)
 {
-	struct ft_ch_site *s = ft_ch_site_of(fn, line, true);
+	struct ft_ch_site *s = ft_ch_site_of(fn, line, true, FT_CH_W_CHAIN);
 
 	if (!s)
 		return;
@@ -3627,7 +3660,7 @@ void ft_ch_audit_ctx_at(const char *fn, int line, const struct cds_ft *ft,
 		struct cds_ft_node *node)
 {
 	ft_ch_audit_owner_at(fn, line, ft, t, ctx, node, NULL,
-		FT_EXCL_UNDECLARED);
+		FT_EXCL_UNDECLARED, FT_CH_W_CHAIN);
 }
 
 #define ft_ch_audit(ft, t, node)					\
@@ -3645,7 +3678,89 @@ void ft_ch_audit_head_at(const char *fn, int line, const struct cds_ft *ft,
 		struct cds_ft_node *head, struct cds_ft_inode_flag *owner_flag,
 		enum ft_word_excl excl)
 {
-	ft_ch_audit_owner_at(fn, line, ft, NULL, NULL, head, owner_flag, excl);
+	ft_ch_audit_owner_at(fn, line, ft, NULL, NULL, head, owner_flag, excl,
+		FT_CH_W_HEADWORD);
+}
+
+/*
+ * THE metadata.parent_word CLASS (the table's FT-SLOT-3 row: parent_word +
+ * parent_slot_offset).  Written RAW by ft_set_parent_at's skip-compressed,
+ * plain-compressed and plain-internal arms -- the three siblings of the
+ * external-head arm above, and until now the class had NO probe at all.
+ *
+ * @child_meta is the node whose back edge is being written; @owner_flag is the
+ * PARENT being installed, which §8.2 names as the word's owner.  Passing it
+ * avoids the circularity that made the head arm report 100% NOHOLDER: deriving
+ * an owner from the word in flight cannot answer a question about that word.
+ *
+ * ☠ THIS PROBE DOES NOT ADJUDICATE FT-SLOT-3.  The table's note (3) records the
+ * open incoherence -- the MODEL owns this word by the PARENT, the CODE keys its
+ * record kind on holding the CHILD (@child_held) -- and warns "do not add a
+ * third" predicate.  A regime DECLARATION is not a predicate: it states what the
+ * caller believes makes the write legal, and the ladder checks it.  Where the
+ * two predicates disagree, that shows up as a declared LOCKED row that the
+ * witness cannot confirm, which is the point.
+ */
+static
+void ft_ch_audit_parent_at(const char *fn, int line, const struct cds_ft *ft,
+		const struct cds_ft_metadata *child_meta,
+		struct cds_ft_inode_flag *owner_flag, enum ft_word_excl excl)
+{
+	struct ft_ch_site *s = ft_ch_site_of(fn, line, false,
+			FT_CH_W_PARENTWORD);
+	struct cds_ft_metadata *om;
+	uintptr_t snap;
+	bool ratified;
+
+	if (!s || !child_meta)
+		return;
+	s->total++;
+	/*
+	 * ☠ THIS CLASS CANNOT SHARE ft_ch_audit_owner_at's BODY, and trying cost
+	 * a SEGV.  That function derives the owner with ft_chain_head_holder(),
+	 * which takes a cds_ft_node; our subject is a cds_ft_metadata, so the
+	 * cast walks garbage.  It is not reachable only on odd paths either --
+	 * the WLOCK prologue derives it FIRST, so every bulk writer hit it
+	 * immediately.  The two classes have genuinely different owner
+	 * semantics: a chain word's owner must be DERIVED, this word's owner is
+	 * HANDED IN (§8.2: the parent).  Keep the prologue shape identical so
+	 * the columns stay comparable, and never derive.
+	 */
+	if (ft_wlock_held == (struct cds_ft *) ft) {
+		s->wlock++;
+		return;
+	}
+	if (!ft->lock_fine) {
+		s->coarse_mode++;
+		return;
+	}
+	/*
+	 * A NULL parent is the ROOT position -- the word-kind table's cds_ft.root
+	 * row has "OWNER: NONE (no node)", so there is nothing to ask.
+	 */
+	if (!owner_flag) {
+		s->noholder++;
+		return;
+	}
+	switch (excl) {
+	case FT_EXCL_HIDDEN:
+		s->hw_hidden++;
+		return;
+	case FT_EXCL_MW_CAS:
+		s->hw_mw++;
+		return;
+	case FT_EXCL_LOCKED:
+		om = ft_flag_to_metadata(ft, owner_flag);
+		if (ft_hold_trace_holds(om))
+			s->hw_locked_ok++;
+		else
+			s->hw_locked_viol++;
+		return;
+	case FT_EXCL_UNDECLARED:
+	default:
+		s->headword++;
+		return;
+	}
 }
 #define ft_ch_audit_ctx(ft, t, ctx, node)				\
 	ft_ch_audit_ctx_at(__func__, __LINE__, (ft), (t), (ctx), (node))
@@ -3661,15 +3776,21 @@ static void ft_ch_audit_report(void)
 
 	if (!ft_ch_site_n)
 		return;
-	fprintf(stderr, "\nFT_CHAIN_HOLD_AUDIT  ledger=%s\n",
+	if (ft_ch_site_overflow)
+		fprintf(stderr,
+			"\nFT_CHAIN_HOLD_AUDIT  ☠ SITE TABLE FULL: %lu calls DROPPED "
+			"(FT_CH_SITE_MAX=%d, used=%u) -- rows below are INCOMPLETE\n",
+			ft_ch_site_overflow, FT_CH_SITE_MAX, ft_ch_site_n);
+	fprintf(stderr, "\nFT_CHAIN_HOLD_AUDIT  ledger=%s  sites=%u/%d\n",
 #ifdef FEATURE_FT_HOLD_TRACE
-		"ON");
+		"ON", ft_ch_site_n, FT_CH_SITE_MAX);
 #else
 		"OFF -- EVERY ROW BELOW IS A WRONG ZERO, NOT A MEASUREMENT "
-		"(rebuild with -DFEATURE_FT_HOLD_TRACE)");
+		"(rebuild with -DFEATURE_FT_HOLD_TRACE)", ft_ch_site_n,
+		FT_CH_SITE_MAX);
 #endif
-	fprintf(stderr, "%-34s %6s %10s %9s %8s %8s %8s %8s %8s %7s %8s %8s %8s %6s %7s %8s %7s %7s %8s\n",
-		"site (fn:line)", "kind", "total", "WLOCK", "HELD(reg)",
+	fprintf(stderr, "%-34s %-8s %6s %10s %9s %8s %8s %8s %8s %8s %7s %8s %8s %8s %6s %7s %8s %7s %7s %8s\n",
+		"site (fn:line)", "word", "kind", "total", "WLOCK", "HELD(reg)",
 		"HELD(led)", "HELD(ctx)", "anchored", "UNHELD", "nolocks",
 		"noholder", "coarseFT", "aborting", "SOME", "UNDECL",
 		"hidden", "mwCAS", "lockOK", "lockVIOL");
@@ -3680,8 +3801,9 @@ static void ft_ch_audit_report(void)
 		if (!s->total)
 			continue;
 		snprintf(nm, sizeof(nm), "%s:%d", s->fn, s->line);
-		fprintf(stderr, "%-34s %6s %10lu %9lu %8lu %8lu %8lu %8lu %8lu %7lu %8lu %8lu %8lu %6lu %7lu %8lu %7lu %7lu %8lu\n",
-			nm, s->coarse ? "COARSE" : "FULL", s->total, s->wlock,
+		fprintf(stderr, "%-34s %-8s %6s %10lu %9lu %8lu %8lu %8lu %8lu %8lu %7lu %8lu %8lu %8lu %6lu %7lu %8lu %7lu %7lu %8lu\n",
+			nm, ft_ch_wkind_name[s->wkind],
+			s->coarse ? "COARSE" : "FULL", s->total, s->wlock,
 			s->held, s->led, s->ctxheld, s->anchored, s->unheld,
 			s->nolocks, s->noholder, s->coarse_mode, s->aborting,
 			s->some, s->headword, s->hw_hidden, s->hw_mw,

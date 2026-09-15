@@ -77,6 +77,10 @@ enum ft_word_excl {
 static void ft_ch_audit_head_at(const char *fn, int line,
 		const struct cds_ft *ft, struct cds_ft_node *head,
 		struct cds_ft_inode_flag *owner_flag, enum ft_word_excl excl);
+/* The metadata.parent_word arm (the table's FT-SLOT-3 row); same arrangement. */
+static void ft_ch_audit_parent_at(const char *fn, int line,
+		const struct cds_ft *ft, const struct cds_ft_metadata *child_meta,
+		struct cds_ft_inode_flag *owner_flag, enum ft_word_excl excl);
 # define ft_ch_audit_head(ft, head, owner)				\
 	ft_ch_audit_head_at(__func__, __LINE__, (ft), (head), (owner),	\
 		FT_EXCL_UNDECLARED)
@@ -85,6 +89,7 @@ static void ft_ch_audit_head_at(const char *fn, int line,
 /* The _at spelling is called directly by ft_set_parent_at, which forwards its
  * caller's location -- so it needs a no-op too, or a non-debug build breaks. */
 # define ft_ch_audit_head_at(fn, line, ft, head, owner, excl) do { } while (0)
+# define ft_ch_audit_parent_at(fn, line, ft, cm, owner, excl) do { } while (0)
 #endif
 
 static inline __attribute__((unused))
@@ -3790,7 +3795,7 @@ void ft_set_parent_at(const char *fn, int line, struct cds_ft *ft,
 		struct cds_ft_inode_flag *parent_nf,
 		struct cds_ft_inode_flag **slot, enum ft_word_excl excl)
 {
-	(void) excl;	/* consumed by the head-word audit only */
+	(void) excl;	/* consumed by the word-class audits only */
 	/*
 	 * @fn/@line are the CALLER's, so the head parent-word audit below gets
 	 * one row per CALL SITE.  ft_set_parent has 34 callers but the external
@@ -3828,6 +3833,7 @@ void ft_set_parent_at(const char *fn, int line, struct cds_ft *ft,
 		struct cds_ft_metadata *cn_meta =
 			cds_ft_item_to_metadata(
 				(struct cds_ft_inode *) cn);
+		ft_ch_audit_parent_at(fn, line, ft, cn_meta, parent_nf, excl);
 		rcu_assign_pointer(cn_meta->parent_word, stored_parent);
 		ft_set_parent_slot(cn_meta, parent_nf, slot);
 		return;
@@ -3847,6 +3853,7 @@ void ft_set_parent_at(const char *fn, int line, struct cds_ft *ft,
 		struct cds_ft_metadata *cn_meta =
 			cds_ft_item_to_metadata(
 				(struct cds_ft_inode *) cn);
+		ft_ch_audit_parent_at(fn, line, ft, cn_meta, parent_nf, excl);
 		rcu_assign_pointer(cn_meta->parent_word, stored_parent);
 		ft_set_parent_slot(cn_meta, parent_nf, slot);
 		return;
@@ -3909,6 +3916,7 @@ void ft_set_parent_at(const char *fn, int line, struct cds_ft *ft,
 			meta->incoming_byte = ft_slot_to_byte(
 				&ft_types[ft_node_type(parent_nf)],
 				ft_node_ptr(parent_nf), slot);
+		ft_ch_audit_parent_at(fn, line, ft, meta, parent_nf, excl);
 		rcu_assign_pointer(meta->parent_word, stored_parent);
 		ft_set_parent_slot(meta, parent_nf, slot);
 	}

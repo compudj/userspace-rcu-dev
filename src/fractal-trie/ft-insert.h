@@ -1400,7 +1400,10 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 		ft_meta_nr_child_set(pfx_meta, 1);
 		ft_nr_keys_store(ft,pfx_meta, ft_nr_keys_get(cn_meta) + 1, CMM_RELAXED);
 		pfx_child = ft_compressed_node_flag(pfx);
-		ft_set_parent(ft, branch_flag, pfx_child, &pfx->child);
+		/* HIDDEN: @branch_flag is this split's fresh branch and @pfx was
+		 * allocated seven lines up; the cluster publishes later. */
+		ft_set_parent_excl(ft, branch_flag, pfx_child, &pfx->child,
+			FT_EXCL_HIDDEN);
 		pfx_child = ft_publish_compressed(ft, pfx, pfx_child);
 		created[nr_created++] = pfx_child;
 		top_flag = pfx_child;
@@ -1523,7 +1526,10 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 	 * latch itself).  If the peer re-homes cn AFTER the guard, our forward CAS
 	 * / §4.B guard aborts and this fresh cluster is discarded.
 	 */
-	ft_set_parent(ft, top_flag, cur_parent, parent_slot);
+	/* HIDDEN: @top_flag is this build's fresh cluster top -- the note above
+	 * ends "this fresh cluster is discarded" on the abort path. */
+	ft_set_parent_excl(ft, top_flag, cur_parent, parent_slot,
+		FT_EXCL_HIDDEN);
 	if (deferred_child2)
 		/*
 		 * HIDDEN: "deferred_child2 is the FRESH new subtree, observable
@@ -1826,7 +1832,9 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 		ft_nr_keys_store(ft,pfx_meta, ft_nr_keys_get(cn_meta) + 1,
 			CMM_RELAXED);
 		top_flag = ft_compressed_node_flag(pfx);
-		ft_set_parent(ft, jct_flag, top_flag, NULL);
+		/* HIDDEN: fresh junction under this build's fresh prefix. */
+		ft_set_parent_excl(ft, jct_flag, top_flag, NULL,
+			FT_EXCL_HIDDEN);
 		top_flag = ft_publish_compressed(ft, pfx, top_flag);
 		created[nr_created++] = top_flag;
 	} else if (remaining == 1) {
@@ -1849,7 +1857,9 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 			ft_nr_keys_store(ft,pfx_meta, ft_nr_keys_get(cn_meta) + 1,
 				CMM_RELAXED);
 			top_flag = ft_compressed_node_flag(pfx);
-			ft_set_parent(ft, jct_flag, top_flag, &pfx->child);
+			/* HIDDEN: fresh junction under a prefix allocated here. */
+			ft_set_parent_excl(ft, jct_flag, top_flag, &pfx->child,
+				FT_EXCL_HIDDEN);
 			top_flag = ft_publish_compressed(ft, pfx, top_flag);
 			created[nr_created++] = top_flag;
 		} else
@@ -1896,7 +1906,11 @@ int ft_split_compressed_key_shorter(struct cds_ft *ft,
 		struct cds_ft_inode_flag *cur_parent;
 
 		if (ft_resolve_parent_slot(cn_meta, ft, &cur_parent) == parent_slot)
-			ft_set_parent(ft, top_flag, cur_parent, parent_slot);
+			/* HIDDEN: @top_flag is this build's cluster top; the note
+			 * above says a mismatch leaves "the cluster ...
+			 * build-invisible". */
+			ft_set_parent_excl(ft, top_flag, cur_parent,
+				parent_slot, FT_EXCL_HIDDEN);
 	}
 	/* Return the live edge; the caller defers (parked) or wires (direct). */
 	*live_child_ret = deferred_child;
@@ -2712,7 +2726,10 @@ int ft_insert_compressed_past_child(struct cds_ft *ft,
 		 * below -- otherwise an up-walk from cn->child (still reachable
 		 * through the unmodified cn) lands on branch with parent NULL.
 		 */
-		ft_set_parent(ft, branch, d->nf, &cn->child);
+		/* HIDDEN: the comment above says it -- "Phase 1
+		 * (build-invisible)"; @branch was just built here. */
+		ft_set_parent_excl(ft, branch, d->nf, &cn->child,
+			FT_EXCL_HIDDEN);
 		ft_metadata_set_external_nodes(branch, br_meta,
 			(struct cds_ft_node *) old_child_flag);
 		/*

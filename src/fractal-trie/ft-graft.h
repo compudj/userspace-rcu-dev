@@ -777,7 +777,10 @@ old_dir_built:
 		ft_nr_keys_store(ft, pfx_meta,
 			old_child_nr_keys + src_count, CMM_RELAXED);
 		top_flag = ft_compressed_node_flag(pfx);
-		ft_set_parent(ft, branch_flag, top_flag, NULL);
+		/* HIDDEN: fresh branch under a prefix allocated here; the
+		 * ft_glue_track below registers it as this build's. */
+		ft_set_parent_excl(ft, branch_flag, top_flag, NULL,
+			FT_EXCL_HIDDEN);
 		/* Track the PLAIN form; the skip form is for the publish. */
 		ft_glue_track(glue, top_flag);
 		top_flag = ft_publish_compressed(ft, pfx, top_flag);
@@ -797,7 +800,9 @@ old_dir_built:
 			ft_nr_keys_store(ft, pfx_meta,
 				old_child_nr_keys + src_count, CMM_RELAXED);
 			top_flag = ft_compressed_node_flag(pfx);
-			ft_set_parent(ft, branch_flag, top_flag, &pfx->child);
+			/* HIDDEN: same shape as the diverge_pos > 1 arm above. */
+			ft_set_parent_excl(ft, branch_flag, top_flag,
+				&pfx->child, FT_EXCL_HIDDEN);
 			/* Track the PLAIN form; skip form for the publish. */
 			ft_glue_track(glue, top_flag);
 			top_flag = ft_publish_compressed(ft, pfx, top_flag);
