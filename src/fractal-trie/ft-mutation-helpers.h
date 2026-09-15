@@ -5525,12 +5525,30 @@ const char *const ft_be_site_name[FT_BE_SITE_NR] = {
  * as a plain TLS identity (never a re-read of @exclusive), so it costs nothing
  * and needs no plumbing.
  */
+/*
+ * ☠ AND THE LEDGER IS NOT A HOLD COUNT -- IT IS AN OUTSTANDING-RELEASE COUNT.
+ * ft_flip_txn_record_release_lock calls ft_hold_trace_drop() the moment it
+ * records the release ("the commit owns this release now; the op no longer owes
+ * one"), so a site that acquires a word and immediately records its {LOCK|s->s}
+ * terminal reads as ledger-EMPTY from then on -- while the lock is still set on
+ * the word and still owned, by the commit rather than by the frame.  A park
+ * replayed at COMMIT time therefore sees an empty ledger at every site that
+ * converted, and a FULL one only where the hold is still owed (a split keeps
+ * CN for its RETIRE, recorded after the park).  Reading BARE as exposure would
+ * invert the meaning of the conversion this instrument exists to measure.
+ *
+ * @ft_be_s_noreg  BARE *and* the txn registry does not name the owner either.
+ *                 Release records are registered in locks[] exactly like a
+ *                 retire, so a converted site's word is still OWNED here; what
+ *                 survives this column is owned by nobody, by any witness.
+ *                 THIS is the irreducible number an exclusion argument owes.
+ */
 extern unsigned long ft_be_s_proxy[FT_BE_SITE_NR], ft_be_s_ctx_old[FT_BE_SITE_NR],
 	ft_be_s_ctx_null[FT_BE_SITE_NR], ft_be_s_wlock[FT_BE_SITE_NR],
-	ft_be_s_bare[FT_BE_SITE_NR];
+	ft_be_s_bare[FT_BE_SITE_NR], ft_be_s_noreg[FT_BE_SITE_NR];
 unsigned long ft_be_s_proxy[FT_BE_SITE_NR], ft_be_s_ctx_old[FT_BE_SITE_NR],
 	ft_be_s_ctx_null[FT_BE_SITE_NR], ft_be_s_wlock[FT_BE_SITE_NR],
-	ft_be_s_bare[FT_BE_SITE_NR];
+	ft_be_s_bare[FT_BE_SITE_NR], ft_be_s_noreg[FT_BE_SITE_NR];
 extern unsigned long ft_be_s_total[FT_BE_SITE_NR],
 	ft_be_s_old[FT_BE_SITE_NR], ft_be_s_nolocks[FT_BE_SITE_NR],
 	ft_be_s_gp[FT_BE_SITE_NR], ft_be_s_gp_none[FT_BE_SITE_NR],
@@ -5587,14 +5605,14 @@ static void ft_be_site_report(void)
 		"OFF (columns below are structurally 0, not measured)",
 #endif
 		ft_be_total);
-	fprintf(stderr, "%-18s %10s %8s %8s %8s %8s %8s %8s %8s %8s %8s %8s %8s %8s %8s %8s\n",
+	fprintf(stderr, "%-18s %10s %8s %8s %8s %8s %8s %8s %8s %8s %8s %8s %8s %8s %8s %8s %8s\n",
 		"site", "total", "oldP", "GRANDpar", "nolocks",
 		"led_old", "led_gp", "led_only", "NOowner", "newP", "led_new", "HOLDS0",
-		"ctx_old", "ctxNULL", "WLOCK", "BARE");
+		"ctx_old", "ctxNULL", "WLOCK", "BARE", "NOREG");
 	for (i = 0; i < FT_BE_SITE_NR; i++) {
 		if (!ft_be_s_total[i])
 			continue;
-		fprintf(stderr, "%-18s %10lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu\n",
+		fprintf(stderr, "%-18s %10lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu %8lu\n",
 			ft_be_site_name[i], ft_be_s_total[i],
 			ft_be_s_old[i], ft_be_s_gp[i], ft_be_s_nolocks[i],
 			ft_be_s_led_old[i], ft_be_s_led_gp[i],
@@ -5602,7 +5620,7 @@ static void ft_be_site_report(void)
 			ft_be_s_new[i], ft_be_s_led_new[i],
 			ft_be_s_led_none[i], ft_be_s_ctx_old[i],
 			ft_be_s_ctx_null[i], ft_be_s_wlock[i],
-			ft_be_s_bare[i]);
+			ft_be_s_bare[i], ft_be_s_noreg[i]);
 	}
 }
 
@@ -5678,10 +5696,16 @@ static void ft_be_site_report(void)
 				__atomic_fetch_add(			\
 					&ft_be_s_wlock[dbg_be_site], 1,	\
 					__ATOMIC_RELAXED);		\
-			else						\
+			else {						\
 				__atomic_fetch_add(			\
 					&ft_be_s_bare[dbg_be_site], 1,	\
 					__ATOMIC_RELAXED);		\
+				/* ... and is it owned by the COMMIT? */ \
+				if (!h_old)				\
+					__atomic_fetch_add(		\
+					    &ft_be_s_noreg[dbg_be_site],\
+					    1, __ATOMIC_RELAXED);	\
+			}						\
 		}							\
 		if (!o_old)						\
 			__atomic_fetch_add(&ft_be_s_noowner[dbg_be_site],\
