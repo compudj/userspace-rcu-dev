@@ -3312,7 +3312,19 @@ struct ft_ch_site {
 		 * are populated and the owner is genuinely not among them, the
 		 * only bucket that is owed anything.
 		 */
-		un_noextra, un_shared, un_absent;
+		un_noextra, un_shared, un_absent,
+		/*
+		 * ☞ AND THE QUESTION THE PER-NODE ARM NEVER ASKED.  Above
+		 * per-node this audit already walks ancestors and buckets a hit
+		 * as @anchored; AT per-node it asks only whether the op holds
+		 * the chain's holder ITSELF, then says UNHELD.  But the design
+		 * for this class is SW under the NEAREST ANCESTOR LOCK, so an op
+		 * holding an ancestor already has the exclusion the flip wants
+		 * and "UNHELD" would be the wrong question, not a gap.
+		 * @un_anc_held counts those.  Kept OUT of @anchored so the
+		 * existing column keeps its meaning.
+		 */
+		un_anc_held;
 };
 
 extern struct ft_ch_site ft_ch_sites[FT_CH_SITE_MAX];
@@ -3658,6 +3670,35 @@ void ft_ch_audit_owner_at(const char *fn, int line, const struct cds_ft *ft,
 	case 1: s->un_shared++; break;
 	default: s->un_absent++; break;
 	}
+	{
+		/*
+		 * Does the op hold an ANCESTOR?  Same walk, and the same two
+		 * load-bearing guards, as the coarse arm above: resolve the
+		 * proxy and stop at an external, both of which SEGV'd this walk
+		 * before they were added.  ASK before prescribing a lock.
+		 */
+		struct cds_ft_inode_flag *af = ft_resolve_flip_proxy(
+			ft_parent_node(hm->parent_word));
+		unsigned int guard = 0;
+
+		while (af && guard++ < FT_MAX_DEPTH && !ft_node_external(af)) {
+			struct cds_ft_metadata *am = ft_flag_to_metadata(ft, af);
+			uintptr_t asnap;
+			bool arat;
+
+			if (!am)
+				break;
+			if ((t && ft_flip_txn_owns(t, am)) ||
+					ft_hold_trace_holds(am) ||
+					(ctx && ft_lock_ctx_holds(ctx, am,
+						&asnap, &arat))) {
+				s->un_anc_held++;
+				break;
+			}
+			af = ft_resolve_flip_proxy(
+				ft_parent_node(am->parent_word));
+		}
+	}
 	if (!ft_hold_trace_count())
 		s->nolocks++;	/* strictly worse: holds nothing whatsoever */
 }
@@ -3941,9 +3982,9 @@ static void ft_ch_audit_report(void)
 			fprintf(stderr, "%-34s %6s   WLOCK breakdown: also-per-node=%lu  BARE(only the FT-wide hold)=%lu\n",
 				nm, "", s->wlock_pernode, s->wlock_bare);
 		if (s->unheld)
-			fprintf(stderr, "%-34s %6s   UNHELD breakdown: no_extras=%lu SHARED_extra(invisible hold)=%lu absent(real gap)=%lu\n",
+			fprintf(stderr, "%-34s %6s   UNHELD breakdown: no_extras=%lu SHARED_extra(invisible hold)=%lu absent(real gap)=%lu | ANCESTOR held=%lu\n",
 				nm, "", s->un_noextra, s->un_shared,
-				s->un_absent);
+				s->un_absent, s->un_anc_held);
 		if (s->ctxheld)
 			fprintf(stderr, "%-34s %6s   HELD(ctx) breakdown: txn=%lu extra=%lu glue=%lu outer=%lu\n",
 				nm, "", s->ctx_txn, s->ctx_extra, s->ctx_glue,
