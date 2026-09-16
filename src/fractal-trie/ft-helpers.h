@@ -237,28 +237,7 @@ static inline
 bool ft_in_place_ok(const struct cds_ft *ft)
 {
 #ifdef FEATURE_FT_INSERT_IN_PLACE
-	/*
-	 * ☠ PER-NODE SPACING ONLY, and this is a defect containment, not a
-	 * design limit.  At a COARSER spacing the op's lock anchors on an
-	 * ANCESTOR, so the acquire that protects the in-place store dedupes on
-	 * the anchor and the later lock_or_guard takes its SHARED exit with
-	 * held.lock != C && !node_held -- which plants an MW {s->s} guard on
-	 * C's OWN word where the REGISTERED exit planted none.  The
-	 * nr_child_inc that follows records the same word SW (ft_txn_content_
-	 * sw_ok is !lock_fine || exclusive, and in-place implies exclusive), so
-	 * the two disagree on KIND and urcu_txn_record_chain's
-	 * urcu_assert_debug(r->kind == kind) is the only thing that says so --
-	 * a release build keeps MW silently.  That pairing is the shape
-	 * @7692ad8f already cost this project once.
-	 *
-	 * Until the kind conflict is fixed at its source, keep in-place where
-	 * the anchor IS the node, so the guard is never planted.  Measured: of
-	 * 94 in-place acquisitions in the in-place oracle, 94 were PER_NODE and
-	 * 0 coarse -- so this narrows nothing that runs today, it only stops a
-	 * latent defect from becoming reachable.
-	 */
 	return ft && ft->exclusive &&
-		ft->lock_spacing == CDS_FT_LOCK_SPACING_PER_NODE &&
 		CMM_LOAD_SHARED(ft->move_active) == 0;
 #else
 	(void) ft;

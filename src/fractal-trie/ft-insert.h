@@ -2233,7 +2233,35 @@ int ft_attach_node(struct cds_ft *ft,
 		 * reserve relocates -- is unchanged.  A miss sets @acquire_miss
 		 * and ft_flip_txn_commit discards the attempt: no new unwind.
 		 */
-		if (ft_in_place_ok(ft))
+		/*
+		 * ☠ PER-NODE ONLY, AND THE RESTRICTION IS THIS HOIST'S OWN
+		 * FAULT -- not a pre-existing defect it exposes.  RED CONTROL,
+		 * one variable: the same tree with the hoist compiled out runs
+		 * ft_unit 357/357 at CDS_FT_LOCK_SPACING=exponential; with the
+		 * hoist it ABORTS at row 332 on
+		 * urcu_txn_record_chain's urcu_assert_debug(r->kind == kind).
+		 *
+		 * WHY: at a coarser spacing the hoist registers C's ANCHOR, so
+		 * the lock_or_guard further down stops taking its REGISTERED
+		 * exit -- which plants NOTHING on C -- and takes SHARED instead,
+		 * whose `held.lock != C && !node_held` arm plants an MW {s -> s}
+		 * guard on C's OWN word.  The nr_child_inc that follows records
+		 * that same word SW (ft_txn_content_sw_ok is !lock_fine ||
+		 * exclusive, and in-place implies exclusive), and the two kinds
+		 * collide.  Without the hoist the REGISTERED exit plants no
+		 * guard and there is nothing to collide with.
+		 *
+		 * So gate the HOIST, never ft_in_place_ok: narrowing the feature
+		 * would have hidden a regression of mine behind a restriction on
+		 * something that works.  Where the anchor IS the node the SHARED
+		 * arm cannot fire, which is exactly per-node.
+		 *
+		 * ☐ Extending in-place above per-node needs the guard/count kind
+		 * disagreement fixed first; until then this hoist stays here and
+		 * coarse spacings keep today's behaviour.
+		 */
+		if (ft_in_place_ok(ft) &&
+				ft->lock_spacing == CDS_FT_LOCK_SPACING_PER_NODE)
 			ft_flip_txn_lock_or_guard_parent(ft, ic->txn, ctx,
 				attach_node_flag, FT_DEPTH_FROM_DESCENT);
 		{
