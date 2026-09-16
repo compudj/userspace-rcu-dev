@@ -14663,10 +14663,15 @@ void ft_flip_txn_record_parent_word(const struct cds_ft *ft,
  * back edge, including a displaced PUBLISHED child -- so on an armed txn it
  * PARKS SW on a live node's parent word.  The child is NOT in this op's DLM
  * lock-set, and the header's "by construction" never said what the construction
- * was.  It is the FT-WIDE LOCK: every caller here is a BULK op (merge, rekey,
- * the glue commit), and under lock_fine a POINT op RE-TAKES the FT-wide lock
- * while a bulk op is live (FT_BULK_WIDE_LOCK + ft_bulk_active), so the two
- * arbitrate on one word.
+ * was.  It is the FT-WIDE LOCK: every caller here is a BULK op, and under
+ * lock_fine a POINT op RE-TAKES the FT-wide lock while a bulk op is live
+ * (FT_BULK_WIDE_LOCK + ft_bulk_active), so the two arbitrate on one word.
+ * ☞ THE CALLERS ARE MERGE, REKEY AND GRAFT -- two record the edge directly
+ * (ft-merge.h, ft-rekey.h) and the rest arrive through
+ * ft_glue_txn_commit_edges.  An earlier text said "merge, rekey, the glue
+ * commit", which names the MECHANISM rather than the ops that reach it and so
+ * left GRAFT off the list a reader is meant to re-check.  cds_ft_detach is NOT
+ * a caller: it reaches ft_glue_apply_deferred, a different function.
  * ☠ THAT MAKES IT A DEPENDENCY, NOT AN INVARIANT: when the FT-wide lock is
  * relaxed to only flipping the dual-descent state, this park loses its
  * exclusion and @child_held must become a real lock-set answer.

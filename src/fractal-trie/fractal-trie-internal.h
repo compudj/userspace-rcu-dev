@@ -1262,12 +1262,14 @@ struct ft_pub_rec {
  *   metadata.parent_word          parent (3)          SW if held MW by constr.
  *   metadata.parent_slot_offset   parent (3)          SW if held MW by constr.
  *   metadata.nr_keys              NONE (climbs up)    MW         MW   [DESIGN]
- *   metadata.incoming_byte        not transacted -- see its own comment
+ *   metadata.incoming_byte        not transacted (7)
+ *   metadata.alloc_index          ALLOCATOR-PRIVATE (7) -- never transacted
  *   cds_ft_node.next              the chain HOLDER    MW  (4)    MW   [debt]
  *   cds_ft_node.prev  (member)    the chain HOLDER    MW / SW(5) MW   [debt]
  *   cds_ft_node.prev  (head)      the holder P        MW / SW(5) MW   [debt]
  *   ft_ord_cell.lnode.next/prev   NONE (6)            MW         MW   [DESIGN]
  *   ft_ord_cell.parent            the holder P        MW + raw   MW   [debt]
+ *   ft_ord_cell.node              BUILD-INVISIBLE (8) -- never transacted
  *
  * ☞ "[DESIGN]" means the word can never convert: it has no single owner (the
  * root slot lives in no node; nr_keys climbs ancestors nobody locked; an
@@ -1289,10 +1291,14 @@ struct ft_pub_rec {
  *     every other producer and resolver tags FT_STATE_PROXY (0x1).  is_proxy
  *     with 0x1 accepts it and untag yields desc|0xE -- a misaligned record
  *     pointer.  Debug builds trap tag aliasing on the RECORD path only.
- * (3) ☐ FT-SLOT-3.  The MODEL owns the back edge by the PARENT (§8.2, decision 09-03); the
- *     CODE keys its kind on holding the CHILD (@child_held).  Two predicates,
- *     one word -- do not add a third.  A re-parent that already recorded the
- *     word chains by the EXISTING record's kind.
+ * (3) ☑ FT-SLOT-3 (SOUND, on a DEPENDENCY -- see its entry below; this row read
+ *     ☐ long after that entry closed it, which is the kind of drift the tag
+ *     exists to prevent).  The MODEL owns the back edge by the PARENT (§8.2,
+ *     decision 09-03); the CODE keys its kind on holding the CHILD
+ *     (@child_held).  Two predicates, one word -- do not add a third.  A
+ *     re-parent that already recorded the word chains by the EXISTING record's
+ *     kind.  The two predicates DISAGREE and that is legal only while the
+ *     FT-wide lock stands: the entry names what to revisit, and when.
  * (4) ☠ See FT-SLOT-2 for this word's dropped mark check.  And MW is
  *     load-bearing here TODAY: ft_hlist_freeze_sole_prepare's derived
  *     NULL is the only thing that turns an UNHELD sole-entry derivation into
@@ -1318,6 +1324,31 @@ struct ft_pub_rec {
  *     producers beside them (ft_set_parent's external arm).  That is one
  *     whole-class step, not six small ones.
  * (6) The one family whose design-MW is ARGUED rather than asserted.
+ * (7) ☑ THESE TWO SHARE ONE WORD, AND THAT IS THE CLASSIFICATION.  Neither is
+ *     transacted, so neither took a KIND and neither was listed here -- but
+ *     @incoming_byte IS written on a PLACED node (ft_set_parent_slot, from
+ *     ft_set_parent AND ft_publish_to_parent, i.e. every publish path), and it
+ *     is a BITFIELD: each write is a read-modify-write of the whole tail word,
+ *     @alloc_index included.  A register that lists only transacted words hides
+ *     that, which is why @alloc_index is named here rather than left out.
+ *
+ *     The struct's own note rests the sharing on "no two writers ever race
+ *     here".  The load-bearing half is narrower and checkable: @alloc_index is
+ *     IMMUTABLE while the node is reachable -- written once by the allocator
+ *     (fractal-trie-alloc.c, at alloc; saved and restored around the free-list
+ *     memset, where the item is unreachable) and never again.  So a racing
+ *     @incoming_byte RMW writes the SAME @alloc_index back and cannot lose it,
+ *     whatever the byte does.  ☠ That is what a new field packed into this word
+ *     would have to inherit, and a mutable one could NOT: it would need
+ *     @incoming_byte's writers to exclude each other, which nothing here does.
+ *     A value that must be coherent with a structural flip belongs in @state.
+ * (8) ☑ Written RAW, twice, and both sites are legal by the last rule in this
+ *     block (a node no reader can reach): ft_ord_cell_alloc, and
+ *     ft-compact.h's relocation, which stores into a cell freshly returned by
+ *     cds_ft_alloc_cell_item and published only by the later ft_ord_cell_swap.
+ *     No site writes a LIVE cell's @node, so it never needed a kind -- listed
+ *     because "absent from the register" and "cannot be written" are different
+ *     claims, and only the second one is true here.
  *
  * ----------------------------------------------------------------------------
  * OPEN DEFECTS AND OPEN QUESTIONS IN THIS TABLE, tagged so they can be found:
@@ -1382,11 +1413,22 @@ struct ft_pub_rec {
  *              displaced PUBLISHED child (measured, from ft_merge_at_inner) --
  *              so on an armed txn it PARKS SW on a live node's parent word.
  *              That is legal, but NOT because the child is in the DLM
- *              lock-set: it is not.  All three callers are BULK ops (merge,
- *              rekey, the glue commit), and under lock_fine a POINT op
- *              RE-TAKES the FT-wide lock while a bulk op is live
- *              (FT_BULK_WIDE_LOCK + ft_bulk_active), so bulk and point writers
- *              arbitrate on one word again -- "the whole of G5.5's exclusion".
+ *              lock-set: it is not.  Every caller is a BULK op, and under
+ *              lock_fine a POINT op RE-TAKES the FT-wide lock while a bulk op
+ *              is live (FT_BULK_WIDE_LOCK + ft_bulk_active), so bulk and point
+ *              writers arbitrate on one word again -- "the whole of G5.5's
+ *              exclusion".
+ *              ☞ THE CALLER SET, RE-ENUMERATED FROM THE TREE (an earlier text
+ *              said "merge, rekey, the glue commit", which names a MECHANISM
+ *              rather than the ops that reach it and so omitted GRAFT).  Two
+ *              direct -- ft-merge.h, ft-rekey.h -- plus ft_glue_txn_commit_edges,
+ *              reached from ft_glue_txn_commit (merge, graft x2, rekey),
+ *              ft_glue_txn_commit_replace (graft) and ft-rekey.h directly.  So:
+ *              MERGE, REKEY, GRAFT, all three bulk-gated.  (cds_ft_detach
+ *              reaches ft_glue_apply_deferred, a DIFFERENT function, and does
+ *              not record a back edge.)  This list is what a future reader must
+ *              re-check when the lock below is relaxed -- verify it, do not
+ *              trust it.
  *              The old comment said "by construction" without naming the
  *              construction, which is how this came to look unverified.
  *              ☠ SO IT IS A DEPENDENCY, NOT AN INVARIANT.  The day the FT-wide
