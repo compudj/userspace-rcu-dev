@@ -5511,18 +5511,33 @@ int ft_detach_node(struct cds_ft *ft,
 				 * is ft_lock_skip_dual_gp's job, not this word's".
 				 * So this site now HOLDS the word it writes.
 				 *
-				 * ☠ BUT THE KIND STAYS false, DELIBERATELY, and
-				 * @dual_gp_held is deliberately unused here.  A
-				 * slot is SW xor MW GLOBALLY (rcu-txn.h), and
-				 * ft_node_recompact's dual producer still records
-				 * MW on the same slot class -- MEASURED: it holds
-				 * the DERIVED grandparent 0 times in 9721.
-				 * Vouching here alone would park SW beside that
-				 * peer's CAS, which is the one thing the dual's
-				 * rules forbid.  ☑ SUPERSEDED: the kind is a
-				 * per-op claim, not a global one -- the LOCK
-				 * serialises an SW park against an MW CAS, so
-				 * producers convert INDIVIDUALLY.
+				 * ☑ AND THE KIND NOW FOLLOWS @dual_gp_held.  The
+				 * note that stood here said the flip waited on
+				 * ft_node_recompact ("it holds the DERIVED
+				 * grandparent 0 times in 9721"), then corrected
+				 * itself with "the kind is a per-op claim, not a
+				 * global one -- the LOCK serialises an SW park
+				 * against an MW CAS, so producers convert
+				 * INDIVIDUALLY".
+				 *
+				 * ☠ THAT SECOND SENTENCE IS TRUE ONLY OF AN MW
+				 * THAT HOLDS THE WORD, and stating it unqualified
+				 * is how a body word gets read as lock-bearing.
+				 * An MW record whose op holds nothing arbitrates
+				 * against nothing, so a peer's SW park -- a plain
+				 * store -- genuinely races it.  What makes the
+				 * per-site conversion safe is not that "MW and SW
+				 * serialise": it is that a site which cannot
+				 * vouch answers FALSE and stays MW.  The
+				 * lock-bearing carve-out (an MW record TAKES the
+				 * lock, SW writes follow it) belongs to
+				 * @metadata.state, NOT to a grandparent body
+				 * word, which has no lock in its bits.
+				 *
+				 * The 9721 reading was itself a blind query: that
+				 * site HELD its word and was asked through a
+				 * registry ft_dlm_acquire_set can never populate.
+				 * ☞ THE TRANSACTED-SLOT REGISTER.
 				 */
 				dual_gp_held);
 			(void) dual_gp_held;
@@ -5996,6 +6011,38 @@ int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		 */
 		dual_gp_held = ft_lock_skip_dual_gp(ft, ctx, txn, parent_nf,
 			txn ? txn->mtxn : NULL);
+		/*
+		 * ☠ A PRODUCER THAT CANNOT VOUCH MUST NOT REACH THE PUBLISH --
+		 * AND THE BAIL MUST DO THE COMMIT'S CLEANUP.
+		 *
+		 * On a MISS the arm used to build the publish with @dual_gp_held
+		 * false -- an MW record on a slot every other producer now parks
+		 * SW -- and CALL the commit, relying on @acquire_miss to make it
+		 * fail.  That puts this slot's kind at the mercy of a distant
+		 * function's ordering, and "the abort makes it harmless" is not
+		 * safe to say in any case: an aborted MW txn is not
+		 * side-effect-free, its records being installed and then settled
+		 * back.
+		 *
+		 * ☠ A BARE `return -EAGAIN` HERE WEDGES THE TRIE.  The commit is
+		 * also this arm's CLEANUP -- ft_flip_txn_commit's miss path runs
+		 * ft_flip_txn_destroy, hence ft_flip_txn_lock_release_all -- so
+		 * returning without it keeps the op's OWN locks held and the
+		 * retry then misses against them for ever.  ABLATION-MEASURED on
+		 * inv_concurrent_same_key_removes at per-node spacing: bare bail
+		 * = timeout at 100% CPU, control = 152/152 rc=0.  That is why
+		 * every other -EAGAIN in this function sits AFTER the commit.
+		 *
+		 * So release exactly what the commit would.  @held_holder is NOT
+		 * released here: ft_flip_txn_hold_or_lock_parent above REGISTERED
+		 * it on @txn, so the destroy drops it -- which is why this file
+		 * says every bail releasing it explicitly stays ABOVE that call.
+		 */
+		if (txn->acquire_miss) {
+			ft_flip_txn_destroy(txn);
+			ft_ord_cell_free_unpublished(ft, new_cell);
+			return -EAGAIN;
+		}
 		ft_flip_txn_record_reserved(txn,
 			ft_flag_to_metadata(ft, parent_nf),
 			(void **) &next_node->prev,
@@ -6019,19 +6066,31 @@ int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 			(struct cds_ft_inode_flag *) next_node,
 			(struct cds_ft_inode_flag *) node,
 			/*
-			 * ☐ KIND HELD BACK, DELIBERATELY.  @dual_gp_held is an
-			 * honest answer now (REGISTERED or SHARED, both of which
-			 * mean the op holds the word), but a slot is SW xor MW
-			 * GLOBALLY (rcu-txn.h) and ft_node_recompact's dual
-			 * producer -- 766,522 records across the inv suite, the
-			 * largest of the eight -- still writes the same slot
-			 * class without acquiring.  A producer that vouches while
-			 * that one does not parks SW beside its CAS.
+			 * ☑ THE HONEST ANSWER, AND IT IS NOW THE ONLY ONE LEFT
+			 * THAT CAN SAY NO.  @dual_gp_held is REGISTERED-or-SHARED,
+			 * both of which mean the op holds the word.  This used to
+			 * add "but every dual producer passes false until the LAST
+			 * one acquires, and then they flip TOGETHER", naming
+			 * ft_node_recompact as the holdout -- that is discharged:
+			 * its relocation site always HELD the word and merely
+			 * could not be asked (it answers from its own acquire now),
+			 * and the glue publishes are excluded by the FT-wide lock.
 			 *
-			 * So every dual producer passes false until the LAST one
-			 * acquires, and then they flip TOGETHER.  What changed
-			 * meanwhile is the EXCLUSION, not the kind: five of the
-			 * eight now take §9.3's third member.
+			 * ☞ THESE TWO ARMS -- ft_promote_head's ordered-list-ON
+			 * publish (here) and its list-OFF twin below -- WERE the
+			 * last producers that could answer no, and they did so
+			 * exactly when the acquire MISSED: their MW count equalled
+			 * FT DUAL-GP EXIT MISS to the record.  The bail at the
+			 * acquire above now takes that case, so this publish is
+			 * reached only by an op that HOLDS the word.
+			 *
+			 * MEASURED AFTER IT (-DFT_DEBUG_DUAL_SITE, ft_inv,
+			 * per-node AND exponential): named_unheld = 0 for EVERY
+			 * producer, with 6304 misses per per-node leg taking the
+			 * bail instead of entering the engine.  ⇒ every record on
+			 * this slot class is made by an op that holds it, and that
+			 * is provable HERE rather than from what a later commit
+			 * does with it.
 			 */
 			NULL, new_cell_flag, &rec, /*slot_owner_nf=*/ parent_nf,
 			/* see above */ dual_gp_held);
@@ -6124,6 +6183,37 @@ int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		 */
 		dual_gp_held = ft_lock_skip_dual_gp(ft, ctx, txn, parent_nf,
 			txn ? txn->mtxn : NULL);
+		/*
+		 * ☠ A PRODUCER THAT CANNOT VOUCH MUST NOT REACH THE PUBLISH --
+		 * AND THE BAIL MUST DO THE COMMIT'S CLEANUP.
+		 *
+		 * On a MISS the arm used to build the publish with @dual_gp_held
+		 * false -- an MW record on a slot every other producer now parks
+		 * SW -- and CALL the commit, relying on @acquire_miss to make it
+		 * fail.  That puts this slot's kind at the mercy of a distant
+		 * function's ordering, and "the abort makes it harmless" is not
+		 * safe to say in any case: an aborted MW txn is not
+		 * side-effect-free, its records being installed and then settled
+		 * back.
+		 *
+		 * ☠ A BARE `return -EAGAIN` HERE WEDGES THE TRIE.  The commit is
+		 * also this arm's CLEANUP -- ft_flip_txn_commit's miss path runs
+		 * ft_flip_txn_destroy, hence ft_flip_txn_lock_release_all -- so
+		 * returning without it keeps the op's OWN locks held and the
+		 * retry then misses against them for ever.  ABLATION-MEASURED on
+		 * inv_concurrent_same_key_removes at per-node spacing: bare bail
+		 * = timeout at 100% CPU, control = 152/152 rc=0.  That is why
+		 * every other -EAGAIN in this function sits AFTER the commit.
+		 *
+		 * So release exactly what the commit would.  @held_holder is NOT
+		 * released here: ft_flip_txn_hold_or_lock_parent above REGISTERED
+		 * it on @txn, so the destroy drops it -- which is why this file
+		 * says every bail releasing it explicitly stays ABOVE that call.
+		 */
+		if (txn->acquire_miss) {
+			ft_flip_txn_destroy(txn);
+			return -EAGAIN;
+		}
 		ft_flip_txn_record_reserved(txn,
 			ft_flag_to_metadata(ft, parent_nf),
 			(void **) &next_node->prev, prev_save, inherit);
@@ -6137,19 +6227,31 @@ int ft_promote_head(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 			(struct cds_ft_inode_flag *) node,
 			NULL, inherit /* folded prev: intended parent value */, &rec,
 			/*
-			 * ☐ KIND HELD BACK, DELIBERATELY.  @dual_gp_held is an
-			 * honest answer now (REGISTERED or SHARED, both of which
-			 * mean the op holds the word), but a slot is SW xor MW
-			 * GLOBALLY (rcu-txn.h) and ft_node_recompact's dual
-			 * producer -- 766,522 records across the inv suite, the
-			 * largest of the eight -- still writes the same slot
-			 * class without acquiring.  A producer that vouches while
-			 * that one does not parks SW beside its CAS.
+			 * ☑ THE HONEST ANSWER, AND IT IS NOW THE ONLY ONE LEFT
+			 * THAT CAN SAY NO.  @dual_gp_held is REGISTERED-or-SHARED,
+			 * both of which mean the op holds the word.  This used to
+			 * add "but every dual producer passes false until the LAST
+			 * one acquires, and then they flip TOGETHER", naming
+			 * ft_node_recompact as the holdout -- that is discharged:
+			 * its relocation site always HELD the word and merely
+			 * could not be asked (it answers from its own acquire now),
+			 * and the glue publishes are excluded by the FT-wide lock.
 			 *
-			 * So every dual producer passes false until the LAST one
-			 * acquires, and then they flip TOGETHER.  What changed
-			 * meanwhile is the EXCLUSION, not the kind: five of the
-			 * eight now take §9.3's third member.
+			 * ☞ THESE TWO ARMS -- ft_promote_head's ordered-list-ON
+			 * publish (here) and its list-OFF twin below -- WERE the
+			 * last producers that could answer no, and they did so
+			 * exactly when the acquire MISSED: their MW count equalled
+			 * FT DUAL-GP EXIT MISS to the record.  The bail at the
+			 * acquire above now takes that case, so this publish is
+			 * reached only by an op that HOLDS the word.
+			 *
+			 * MEASURED AFTER IT (-DFT_DEBUG_DUAL_SITE, ft_inv,
+			 * per-node AND exponential): named_unheld = 0 for EVERY
+			 * producer, with 6304 misses per per-node leg taking the
+			 * bail instead of entering the engine.  ⇒ every record on
+			 * this slot class is made by an op that holds it, and that
+			 * is provable HERE rather than from what a later commit
+			 * does with it.
 			 */
 			/*slot_owner_nf=*/ parent_nf, /* see above */ dual_gp_held);
 		(void) dual_gp_held;

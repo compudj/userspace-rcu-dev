@@ -1211,12 +1211,54 @@ struct ft_pub_rec {
  * answering the first two and skipping the third.
  *
  * KIND IS A PROPERTY OF THE SLOT, NOT OF THE RECORD.  A slot is SW (parked
- * under a held lock; the park cannot fail) XOR MW (CAS-arbitrated) -- and it
- * must be the same kind in EVERY txn and EVERY thread that touches it.  One
- * thread parking SW while another CASes MW is a lost or torn write the engine
- * cannot detect.  MW is always safe; SW is a PROMISE of exclusion.  So a
- * conversion to SW is only legal once EVERY producer of that word holds the
- * owner -- never one lane at a time.
+ * under a held lock; the park cannot fail) XOR MW (CAS-arbitrated).  One thread
+ * parking SW while another CASes MW is a lost or torn write the engine cannot
+ * detect.  MW is always safe; SW is a PROMISE of exclusion.
+ *
+ * ☞ AND THERE IS EXACTLY ONE LEGITIMATE MIX ON ONE WORD -- the LOCK-BEARING
+ * WORD PROTOCOL, which the @state rows below USE and which the old blanket
+ * phrasing ("the same kind in EVERY txn and EVERY thread") contradicted:
+ *
+ *     an MW record TAKES the lock, and every write to that word AFTER it, while
+ *     the lock is held, may be SW -- the bit updates, the other sub-fields, and
+ *     the SW release that drops the lock.
+ *
+ * The MW take is what establishes the exclusion, so everything sequenced after
+ * it is already excluded and needs no CAS.
+ *
+ * ☞ AND STAYING MW AFTER THE TAKE IS CORRECT, JUST WASTEFUL.  The protocol
+ * PERMITS the SW writes, it does not require them: a CAS under an exclusion
+ * that already holds simply arbitrates against nobody and still lands the right
+ * value.  So converting these to SW is an EFFICIENCY step, and a producer left
+ * MW is never a correctness bug -- which is why every row here may sit at MW
+ * indefinitely and why MW is the safe default for a new one.  What IS a bug is
+ * the reverse pairing: an SW park on a word some OTHER writer may CAS, because
+ * the park does not arbitrate and the CAS's expected-old was read before it.
+ *
+ * ☠ IT DOES NOT HAVE TO BE ONE TXN:
+ * txn 1 takes the lock, txn 2 changes state under it, txn 3 unlocks, and that is
+ * correct -- the lock, not the txn boundary, is what holds across them.  The
+ * ORDER is the whole content of the rule: MW-then-SW is the protocol, SW-then-MW
+ * is the bug, which is exactly what the engine's debug police now trap
+ * (urcu_txn_record_chain accepts `r->kind == kind || r->kind == MW`).
+ *
+ * ⇒ SO THE RULE SPLITS BY WHETHER THE WORD CARRIES ITS OWN LOCK:
+ *
+ *   - A LOCK-BEARING word (@state): the protocol above.  Its rows legitimately
+ *     read MW for the LOCK take and SW for the tombstone / release / nr_child++
+ *     that follow it on the SAME word.  That is not a kind conflict.
+ *   - Every OTHER word (an internal body child slot, the SKIP_X dual, the chain
+ *     pointers, @external_nodes, the back edge): NOTHING written to the slot
+ *     establishes exclusion over it -- the exclusion lives in ANOTHER word's
+ *     lock -- so there is no MW take to sequence behind, and every writer must
+ *     agree.  A conversion to SW is legal only once EVERY producer holds the
+ *     owner, never one lane at a time.
+ *
+ * ☠ Do not read the first bullet as a licence for the second.  A body word has
+ * no lock bit, so "the lock serialises an SW park against an MW CAS" is FALSE of
+ * it: the peer's CAS is arbitrated against nothing.  See <urcu/rcu-txn.h>
+ * urcu_txn_store_sw -- "a slot is SW xor MW, globally" -- which is the rule for
+ * every word that cannot take a lock in its own bits.
  *
  * WHEN SW IS REACHABLE AT ALL -- three doors, and the second one is why this
  * table needs a spacing column:
@@ -1282,9 +1324,18 @@ struct ft_pub_rec {
  * (1) The dual's owner is DERIVED at publish from cn's back-pointer, so only
  *     the op can vouch for it: every producer passes @owner_held false, the
  *     insert lane and the remove lane alike.  Both now ACQUIRE it
- *     (ft_insert_lock_skip_dual_gp, ft_lock_skip_dual_gp), so the MW is a
- *     missed conversion; it stays MW until ft_node_recompact's own dual site
- *     (FT_OWNER_UNPLUMBED) and the glue publishes can vouch too.
+ *     (ft_insert_lock_skip_dual_gp, ft_lock_skip_dual_gp).
+ *     ☑ AND THE TWO NAMED BLOCKERS ARE DISCHARGED -- this row said it "stays MW
+ *     until ft_node_recompact's own dual site (FT_OWNER_UNPLUMBED) and the glue
+ *     publishes can vouch too".  The glue publishes vouch through the FT-wide
+ *     writer lock, and the relocation site vouches from its own acquire (it
+ *     always HELD the word; it was asked through a registry that structurally
+ *     could not answer).  MEASURED at per-node AND exponential: every record
+ *     that COMMITS is now excluded.  The only producers still answering no were
+ *     ft_promote_head's two arms, and only on an acquire MISS; they now BAIL at
+ *     the miss rather than emit a record they cannot vouch for, so the kind is
+ *     decided where the record is made and not by whether some later commit
+ *     discards it.  @root keeps MW by design.
  * (2) ☑ WAS FT-SLOT-1 (fixed), not a conversion question: ft_state_edge leaves .tag 0
  *     and ft_edge_tag defaults an untagged edge to FT_FLIP_PROXY_TAG (0xF),
  *     so the remove's fused nr_child-- parks a 0xF-tagged proxy on a word

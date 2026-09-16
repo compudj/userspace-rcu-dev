@@ -9693,14 +9693,35 @@ void ft_flip_txn_lock_or_guard_parent_at(const char *fn, int line,
  * so on every path that actually publishes the op HOLDS GP and an SW park on
  * that body word would be legal.
  *
- * ☠ IT IS STILL NOT FLIPPED HERE, and the reason is sequencing, not doubt: the
- * same word is recorded MW by producers that have NOT been plumbed --
- * ft_node_recompact's own dual site (FT_OWNER_UNPLUMBED, though its DLM set
- * does take gp_meta) and the glue publishes.  One lane parking SW while another
- * CASes the same slot is the cross-thread kind disagreement the engine cannot
- * check, so @dual_owner_held flips only when every producer can vouch for the
- * owner.  That is the G4 conversion ft-txn-kind-stats.h measures, and MW costs
- * only speed meanwhile.
+ * ☑ AND EVERY PRODUCER THAT COMMITS NOW VOUCHES.  This said the flip waited on
+ * producers "that have NOT been plumbed -- ft_node_recompact's own dual site
+ * (FT_OWNER_UNPLUMBED, though its DLM set does take gp_meta) and the glue
+ * publishes".  Both are answered: the glue publishes are excluded by the
+ * FT-WIDE WRITER LOCK (ft_pub_slot_excluded asks @ft_wlock_held rather than
+ * taking a site's word for it), and the relocation site answered its own
+ * acquire once it was asked by NODE identity instead of through a registry that
+ * cannot see an ft_dlm_acquire_set hold.
+ *
+ * MEASURED after the flip (-DFT_DEBUG_DUAL_SITE, ft_inv, per-node AND
+ * exponential): the only records that were still MW came from the two
+ * ft_promote_head arms, and their count equalled FT DUAL-GP EXIT MISS exactly
+ * (3927 = 882 + 3045) -- i.e. every one of them was an op whose acquire had
+ * MISSED.  Those arms now BAIL at the miss (-EAGAIN) instead of publishing a
+ * record they cannot vouch for, so no producer emits one.
+ *
+ * ☠ THE EARLIER ARGUMENT FOR LEAVING THEM -- that an @acquire_miss descriptor
+ * is discarded before the engine stores, so the records were harmless -- IS NOT
+ * SOUND and must not be revived: an aborted MW txn is not side-effect-free (its
+ * records are installed and then settled back), and even where the outcome
+ * happens to be benign it makes this slot's kind depend on another function's
+ * ordering instead of on something checkable where the record is made.
+ *
+ * @root stays MW by design (it lives in no node, so there is nothing to have
+ * taken).
+ *
+ * ☞ The cross-thread rule this was protecting is real and unchanged: one lane
+ * parking SW while another CASes the SAME slot is a disagreement the engine
+ * cannot check.  What was stale was the census, not the rule.
  */
 #ifdef FT_DEBUG_DUAL_DROP
 /* Total at exit, not a threshold print: see the insert twin for why. */
@@ -9728,13 +9749,27 @@ static
  * between the two columns is exactly the work the class conversion owes.
  */
 unsigned long ft_dual_exit[4];
+unsigned long ft_dual_undatable;
+unsigned long ft_reloc_hold_match, ft_reloc_hold_selfc, ft_reloc_hold_miss,
+	ft_reloc_hold_noset, ft_reloc_hold_root;
+static void ft_reloc_hold_report(void) __attribute__((destructor));
+static void ft_reloc_hold_report(void)
+{
+	fprintf(stderr, "FT RELOC-HOLD match_P=%lu match_C=%lu MISS=%lu noset=%lu root=%lu\n",
+		uatomic_read(&ft_reloc_hold_match),
+		uatomic_read(&ft_reloc_hold_selfc),
+		uatomic_read(&ft_reloc_hold_miss),
+		uatomic_read(&ft_reloc_hold_noset),
+		uatomic_read(&ft_reloc_hold_root));
+}
 static void ft_dual_exit_report(void) __attribute__((destructor));
 static void ft_dual_exit_report(void)
 {
 	fprintf(stderr, "FT DUAL-GP EXIT notfine=%lu REGISTERED=%lu SHARED=%lu "
-		"MISS=%lu\n",
+		"MISS=%lu UNDATABLE=%lu\n",
 		uatomic_read(&ft_dual_exit[0]), uatomic_read(&ft_dual_exit[1]),
-		uatomic_read(&ft_dual_exit[2]), uatomic_read(&ft_dual_exit[3]));
+		uatomic_read(&ft_dual_exit[2]), uatomic_read(&ft_dual_exit[3]),
+		uatomic_read(&ft_dual_undatable));
 }
 unsigned long ft_dual_ask[2];
 static void ft_dual_ask_report(void) __attribute__((destructor));
@@ -9752,9 +9787,11 @@ static void ft_dual_ask_report(void)
  */
 # define FT_DUAL_EXIT_TALLY(ex)	uatomic_inc(&ft_dual_exit[(ex)])
 # define FT_DUAL_ASK_TALLY(h)	uatomic_inc(&ft_dual_ask[(h) ? 1 : 0])
+# define FT_DUAL_UNDATABLE_TALLY()	uatomic_inc(&ft_dual_undatable)
 #else
 # define FT_DUAL_EXIT_TALLY(ex)	do { (void) (ex); } while (0)
 # define FT_DUAL_ASK_TALLY(h)	do { (void) (h); } while (0)
+# define FT_DUAL_UNDATABLE_TALLY()	do { } while (0)
 #endif
 
 /*
@@ -9949,7 +9986,17 @@ bool ft_lock_skip_dual_gp(struct cds_ft *ft,
 			if (!ft_lock_ctx_depth_of(ft, ctx, parent_nf, &cn_depth) ||
 					!ft_lock_ctx_depth_of_parent(ft, ctx,
 						gp_nf, cn_depth, &gp_depth)) {
-				FT_DUAL_EXIT_TALLY(FT_LOG_EXIT_NOT_FINE);
+				/*
+				 * ☠ NOT the same exit as a coarse trie, and
+				 * tallying it as one HID this population.  A
+				 * coarse trie owes no lock-set member; THIS is a
+				 * FINE trie whose GP could not be dated, so the
+				 * op plants nothing, takes nothing, sets NO
+				 * @acquire_miss -- and the commit PROCEEDS,
+				 * installing an MW record on a slot other
+				 * producers park SW.  Count it on its own.
+				 */
+				FT_DUAL_UNDATABLE_TALLY();
 				return false;	/* undatable: plant NOTHING */
 			}
 		}

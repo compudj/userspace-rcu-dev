@@ -1595,6 +1595,14 @@ int ft_node_recompact(enum ft_recompact mode,
 	 * named this node and took a lock that protects it".
 	 */
 	struct cds_ft_metadata *acq_gp_meta = NULL;
+	/*
+	 * The PARENT member this op actually acquired, recorded by NODE identity
+	 * for the same reason @acq_gp_meta is: @rel_held[].lock is the LOCK WORD,
+	 * which a coarse spacing maps to an ANCHOR ANCESTOR, so comparing a
+	 * holder against it answers no on every trie above per-node -- a blind
+	 * query, not an absent hold.
+	 */
+	struct cds_ft_metadata *acq_p_meta = NULL;
 #ifdef FT_DEBUG_DUAL_SITE
 	/*
 	 * ☞ The GP the PLAN named at the top, and whether set[2] actually took
@@ -1763,8 +1771,10 @@ int ft_node_recompact(enum ft_recompact mode,
 			acq_gp_meta = gp_meta;
 		fenced = true;
 		c_held = set[0].held;
-		if (set[1].nf)
+		if (set[1].nf) {
+			acq_p_meta = p_meta;
 			rel_held[nr_rel++] = set[1].held;
+		}
 		if (set[2].nf)
 			rel_held[nr_rel++] = set[2].held;
 	} else
@@ -3467,6 +3477,7 @@ skip_copy:
 		 * publishes into &ft->root (ft_compact_descend starts its walk
 		 * there), so the holder slot must be asked. */
 		struct cds_ft_inode_flag *holder_nf = NULL;
+		bool holder_held;
 
 		/*
 		 * The holder slot lives in @metadata's PARENT (§8.2: a node's
@@ -3477,14 +3488,68 @@ skip_copy:
 		if (old_node_flag_ptr != &ft->root)
 			(void) ft_resolve_parent_slot(metadata, ft, &holder_nf);
 		/*
-		 * @holder_nf is RESOLVED here, not declared by the caller, so
-		 * this frame cannot vouch that the op holds it: not held -- MW.
-		 * (ft-compact's relocation lane is FT_OWNER_UNPLUMBED.)
+		 * ☑ THE FRAME CAN VOUCH AFTER ALL -- ASK ITS OWN SET.
+		 *
+		 * This said "not held -- MW (ft-compact's relocation lane is
+		 * FT_OWNER_UNPLUMBED)", and it was a BLIND QUERY, not an absent
+		 * lock: @holder_nf is @metadata's PARENT, and a relocation
+		 * reaches here only through ft_node_recompact's own up-front
+		 * ft_dlm_acquire_set, whose {C, P, GP} took exactly that parent
+		 * as its P member.  The marks live in the function-local
+		 * @rel_held[] until the commit hands them to @retire_txn -- which
+		 * is PAST this point -- so every registry-shaped question
+		 * answers no here however firmly the op holds the word.
+		 *
+		 * ☠ SO COMPARE BY NODE IDENTITY, NOT BY LOCK WORD.  @acq_p_meta
+		 * records the NODE set[1] named; @rel_held[].lock is the word it
+		 * locked, which ft_anchor_meta maps to an ANCHOR ANCESTOR under
+		 * any spacing coarser than per-node -- comparing against that
+		 * answers no on exactly the tries this conversion is for.
+		 *
+		 * MEASURED before flipping (FT RELOC-HOLD, -DFT_DEBUG_DUAL_SITE):
+		 * match_P=64 match_C=0 MISS=0 noset=0, identical at per-node AND
+		 * exponential.  Every non-root relocation publish holds its
+		 * holder's parent.
+		 *
+		 * @root keeps MW regardless: ft_pub_slot_excluded's own
+		 * `slot != &ft->root` sees to it, because &ft->root lives in no
+		 * node and there is nothing to have taken.
 		 */
+		holder_held = holder_nf && acq_p_meta &&
+			ft_flag_to_metadata(ft, holder_nf) == acq_p_meta;
+#ifdef FT_DEBUG_DUAL_SITE
+		/*
+		 * ☞ THE WITNESS FOR @holder_held, kept after the flip rather
+		 * than deleted with it.  It is what established that the old
+		 * hardcoded false was a BLIND QUERY and not an absent lock (the
+		 * @2562d77b shape), and it is now the regression alarm: a
+		 * non-zero MISS here means a relocation reached the publish
+		 * WITHOUT its holder in the acquired set, i.e. the flip above
+		 * started vouching for a word the op does not hold.  The
+		 * no-match bucket is split by cause so a one-bucket zero can
+		 * never be read as "the op does not hold it".
+		 */
+		{
+			struct cds_ft_metadata *hm = holder_nf ?
+				ft_flag_to_metadata(ft, holder_nf) : NULL;
+
+			if (old_node_flag_ptr == &ft->root)
+				uatomic_inc(&ft_reloc_hold_root);
+			else if (!fenced)
+				uatomic_inc(&ft_reloc_hold_noset);
+			else if (hm && hm == acq_p_meta)
+				uatomic_inc(&ft_reloc_hold_match);
+			else if (hm && hm == c_held.lock)
+				uatomic_inc(&ft_reloc_hold_selfc);
+			else
+				uatomic_inc(&ft_reloc_hold_miss);
+		}
+#endif
 		ft_pub_rec_add(rec, old_node_flag_ptr, *old_node_flag_ptr,
 			new_node_flag, old_node_flag_ptr == &ft->root,
 			holder_nf ? ft_flag_to_metadata(ft, holder_nf) : NULL,
-			ft_pub_slot_excluded(ft, old_node_flag_ptr, false));
+			ft_pub_slot_excluded(ft, old_node_flag_ptr,
+				holder_held));
 	}
 	else
 		*old_node_flag_ptr = new_node_flag;

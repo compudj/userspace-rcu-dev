@@ -3207,15 +3207,50 @@ static void ft_dual_site_report(void)
  * op's own acquire (@owner_held).
  *
  * Passing this rather than a constant is what lets the producers convert
- * individually: MW-under-lock and SW-under-lock serialise against each other,
- * so a site spelled SW never races one still spelled MW.
+ * individually -- but ONLY because of what it ASKS.  MW-under-lock and
+ * SW-under-lock do serialise, so a site spelled SW never races one still
+ * spelled MW *that holds the word*.
+ *
+ * ☠ THAT QUALIFIER IS THE WHOLE SAFETY ARGUMENT, and dropping it turns this
+ * into a licence it is not.  An MW record whose op holds NOTHING is arbitrated
+ * against nothing: a peer's SW park is a plain store, so the two genuinely
+ * race.  Converting per-site is safe here precisely because a site that cannot
+ * vouch answers false and STAYS MW -- never because "MW and SW serialise" on
+ * its own.  For a word carrying no lock in its own bits, <urcu/rcu-txn.h>
+ * urcu_txn_store_sw is categorical: "a slot is SW xor MW, globally."
  */
+#ifdef FT_DEBUG_DUAL_SITE
+/*
+ * WHY did this slot come out excluded?  The DUAL-SITE table's named_held column
+ * mixes three different answers, and only ONE of them is a fine-trie SW park
+ * earned by @owner_held -- the others are modes in which no peer writer exists
+ * at all.  A conversion argument that reads the merged column cannot tell "this
+ * producer vouches" from "this row happened to run coarse", which is the
+ * one-bucket-zero trap this file has been caught by before.
+ */
+unsigned long ft_pub_excl_coarse, ft_pub_excl_wlock, ft_pub_excl_owner,
+	ft_pub_excl_none;
+static void ft_pub_excl_report(void) __attribute__((destructor));
+static void ft_pub_excl_report(void)
+{
+	fprintf(stderr, "FT PUB-EXCL coarse=%lu wlock=%lu owner_FINE=%lu not_excluded=%lu\n",
+		uatomic_read(&ft_pub_excl_coarse),
+		uatomic_read(&ft_pub_excl_wlock),
+		uatomic_read(&ft_pub_excl_owner),
+		uatomic_read(&ft_pub_excl_none));
+}
+#endif
+
 static inline
 bool ft_pub_slot_excluded(const struct cds_ft *ft,
 		struct cds_ft_inode_flag **slot, bool owner_held)
 {
-	if (!ft->lock_fine)
+	if (!ft->lock_fine) {
+#ifdef FT_DEBUG_DUAL_SITE
+		uatomic_inc(&ft_pub_excl_coarse);
+#endif
 		return true;		/* FT-wide writer lock serialises all */
+	}
 	/*
 	 * ☑ AND A FINE TRIE INSIDE A BULK WINDOW.  G5.25 has a fine trie
 	 * RE-TAKE the FT-wide @writer_lock while a bulk op is live, and point
@@ -3246,8 +3281,18 @@ bool ft_pub_slot_excluded(const struct cds_ft *ft,
 	 * assert to catch it.  The dependency is one-way and cross-file, so it
 	 * is written here rather than left to be re-derived.
 	 */
-	if (ft_wlock_held == (struct cds_ft *) ft)
+	if (ft_wlock_held == (struct cds_ft *) ft) {
+#ifdef FT_DEBUG_DUAL_SITE
+		uatomic_inc(&ft_pub_excl_wlock);
+#endif
 		return true;
+	}
+#ifdef FT_DEBUG_DUAL_SITE
+	if (slot != &ft->root && owner_held)
+		uatomic_inc(&ft_pub_excl_owner);
+	else
+		uatomic_inc(&ft_pub_excl_none);
+#endif
 	return slot != &ft->root && owner_held;
 }
 
