@@ -4858,11 +4858,48 @@ enum ft_delay_mode {
 	FT_DELAY_READER  = (1 << 1),
 	FT_DELAY_BOTH    = FT_DELAY_WRITER | FT_DELAY_READER,
 	FT_DELAY_RANDOM  = (1 << 2),
+	/*
+	 * The ACQUIRE SEAM: a writer loads a pointer / child count BEFORE it
+	 * takes the node's lock and RE-READS it after, and every decision made
+	 * from the first sample (which node to route to, how big the copy must
+	 * be) is only as good as the second.  Widening exactly that gap turns
+	 * the rarest of these races into a reliable reproducer -- see
+	 * ft_delay_seam().  Separate from FT_DELAY_WRITER because a
+	 * blanket writer delay perturbs the whole op and reproduces nothing in
+	 * particular.
+	 */
+	FT_DELAY_ACQUIRE = (1 << 3),
+};
+
+/*
+ * WHICH seam delays.  ☠ ARMING THEM ALL AT ONCE SUPPRESSES THE VERY RACES IT
+ * IS MEANT TO EXPOSE: every thread passes through many acquire sites, so a
+ * delay armed everywhere slows all the racers by a similar total and the SKEW
+ * -- the only thing that widens a window -- averages out.  MEASURED on
+ * inv_concurrent_remove_all_nolist with the NODE_INDEX_NULL refusal ablated:
+ * no delay 3 SIGSEGVs / 100 runs, every site armed at 2us/50% ZERO / 100.
+ * So arm ONE site (FT_DELAY_SITES=recompact), and treat a quieter run under
+ * injection as evidence the injection is wrong, never as evidence of a fix.
+ */
+enum ft_delay_site {
+	FT_DELAY_SITE_ACQUIRE   = (1 << 0),	/* the 3 shared lock helpers */
+	FT_DELAY_SITE_RECOMPACT = (1 << 1),	/* post-lock child-count re-read */
+	FT_DELAY_SITE_INSERT    = (1 << 2),	/* in-place reserve's hoisted lock */
+	/*
+	 * POST-LOCK: after an acquire, before the re-read it protects.  Cannot
+	 * widen a peer's window (the acquire excludes them) -- kept only to
+	 * study an op's OWN ordering, never to reproduce a lost race.
+	 */
+	FT_DELAY_SITE_POSTLOCK  = (1 << 3),
+	FT_DELAY_SITE_ALL       = 0xf,
 };
 
 #ifdef FT_DELAY_INJECT
 extern enum ft_delay_mode ft_delay_mode;
 extern unsigned int ft_delay_us;
+extern unsigned int ft_delay_pct;
+extern unsigned int ft_delay_sites;
+extern unsigned int ft_delay_spin;
 
 static inline
 void ft_delay_writer(void)
@@ -4879,9 +4916,73 @@ void ft_delay_reader(void)
 	    ((ft_delay_mode & FT_DELAY_RANDOM) && (rand() & 1)))
 		usleep(ft_delay_us);
 }
+
+/*
+ * Per-thread xorshift, because the delay must be decided WITHOUT serializing
+ * the threads it is meant to skew: glibc rand() takes a global lock, so using
+ * it here would order the very racers whose interleaving is under test (and
+ * FT_DELAY_RANDOM above has that flaw).  Seeded off the TLS slot's own address.
+ */
+static inline
+unsigned int ft_delay_rand(void)
+{
+	static __thread unsigned int seed;
+
+	if (caa_unlikely(!seed))
+		seed = (unsigned int) (uintptr_t) &seed ^ 0x9e3779b9u;
+	seed ^= seed << 13;
+	seed ^= seed >> 17;
+	seed ^= seed << 5;
+	return seed;
+}
+
+/*
+ * Call between a writer's PRE-LOCK sample and the POST-LOCK re-read that is
+ * supposed to supersede it.
+ *
+ * ☠ DELAY ONLY SOME OF THE CALLERS.  Delaying every one slows all the racers
+ * equally and reproduces nothing: the peer that has to slip INTO the gap is
+ * sitting in the same usleep.  What exposes the race is SKEW -- one thread
+ * pauses at the seam while another runs through at full speed -- so each call
+ * tosses its own coin (FT_DELAY_PCT, default 50).
+ */
+static inline
+void ft_delay_seam(enum ft_delay_site site)
+{
+	if (caa_likely(!(ft_delay_mode & (FT_DELAY_ACQUIRE | FT_DELAY_RANDOM))))
+		return;
+	if (!(ft_delay_sites & (unsigned int) site))
+		return;
+	if (ft_delay_pct < 100 && (ft_delay_rand() % 100u) >= ft_delay_pct)
+		return;
+	/*
+	 * ☠ A SLEEP IS THE WRONG SHAPE FOR A NANOSECOND WINDOW.  usleep() cannot
+	 * resolve below the scheduler's granularity (~50us however small the
+	 * argument) AND it parks the thread, so the racer that was supposed to
+	 * be merely NUDGED is descheduled and the interleaving under test is
+	 * destroyed rather than widened -- MEASURED: with the NODE_INDEX_NULL
+	 * refusal ablated, no delay reproduces 1-3 SIGSEGVs per 100 runs while
+	 * usleep at ANY single site, 5us, reproduces ZERO.
+	 *
+	 * So the default is a SPIN of @ft_delay_spin pause instructions: it stays
+	 * on the CPU, costs tens of nanoseconds to microseconds, and is the only
+	 * form that can widen a window of this size.  FT_DELAY_US is honoured
+	 * only when explicitly asked for (FT_DELAY_SPIN=0), for the rare race
+	 * whose window really is a scheduling event.
+	 */
+	if (caa_likely(ft_delay_spin)) {
+		unsigned int i;
+
+		for (i = 0; i < ft_delay_spin; i++)
+			caa_cpu_relax();
+		return;
+	}
+	usleep(ft_delay_us);
+}
 #else
 static inline void ft_delay_writer(void) { }
 static inline void ft_delay_reader(void) { }
+static inline void ft_delay_seam(enum ft_delay_site site) { (void) site; }
 #endif
 
 #ifdef URCU_FRACTAL_TRIE_DEBUG_LOCKING

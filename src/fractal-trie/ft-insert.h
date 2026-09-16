@@ -2265,6 +2265,18 @@ int ft_attach_node(struct cds_ft *ft,
 			 * passing @rctx would drop the caller's extras.
 			 */
 			if (!old_node_flag && ft_in_place_ok(ft)) {
+				/*
+				 * THE ACQUIRE SEAM (-DFT_DELAY_INJECT,
+				 * FT_DELAY_MODE=acquire).  @old_node_flag and the
+				 * descent that chose this attach node were sampled
+				 * BEFORE the lock taken just below; everything the
+				 * reserve then writes in place stands on that
+				 * sample.  Injecting here lets a peer invalidate it
+				 * while this op is between the two -- the insert
+				 * tier's counterpart to the seam in
+				 * ft_node_recompact.  Inert unless asked for.
+				 */
+				ft_delay_seam(FT_DELAY_SITE_INSERT);
 				if (ft->lock_fine) {
 					enum ft_lock_or_guard_exit ex;
 

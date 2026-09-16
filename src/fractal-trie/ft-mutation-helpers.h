@@ -3969,6 +3969,19 @@ int ft_meta_lock_acquire(struct cds_ft_metadata *meta,
 		uintptr_t *state_snapshot)
 {
 	uintptr_t s;
+
+	/*
+	 * THE ACQUIRE SEAM (-DFT_DELAY_INJECT, FT_DELAY_MODE=acquire).  Every
+	 * caller of this helper follows the same shape -- LOOK UP a node or slot,
+	 * LOCK it, then RE-CHECK that the sample still holds -- and every bug of
+	 * this family lives in the gap between the look-up and the re-check.
+	 * Injecting HERE, in the shared helper, widens that gap for all ~48 call
+	 * sites at once instead of one bespoke probe at a time, and a site that
+	 * forgot its re-check then fails on essentially every attempt.
+	 * Probabilistic by design (FT_DELAY_PCT): delaying every racer equally
+	 * reproduces nothing.  Inert in every build that does not ask for it.
+	 */
+	ft_delay_seam(FT_DELAY_SITE_ACQUIRE);
 	s = CMM_LOAD_SHARED(meta->state);
 
 #ifdef FEATURE_FT_AGREEMENT_RED
@@ -7210,6 +7223,19 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 	struct ft_flip_txn *acq;
 	int i, nr_present = 0;
 
+	/*
+	 * THE ACQUIRE SEAM (-DFT_DELAY_INJECT, FT_DELAY_MODE=acquire).  Every
+	 * caller of this helper follows the same shape -- LOOK UP a node or slot,
+	 * LOCK it, then RE-CHECK that the sample still holds -- and every bug of
+	 * this family lives in the gap between the look-up and the re-check.
+	 * Injecting HERE, in the shared helper, widens that gap for all ~48 call
+	 * sites at once instead of one bespoke probe at a time, and a site that
+	 * forgot its re-check then fails on essentially every attempt.
+	 * Probabilistic by design (FT_DELAY_PCT): delaying every racer equally
+	 * reproduces nothing.  Inert in every build that does not ask for it.
+	 */
+	ft_delay_seam(FT_DELAY_SITE_ACQUIRE);
+
 	for (i = 0; i < nr; i++)
 		if (set[i].nf)
 			nr_present++;
@@ -9458,6 +9484,18 @@ void ft_flip_txn_lock_or_guard_parent_ex(const char *fn, int line,
 		enum ft_lock_or_guard_exit *exit_ret)
 {
 	(void) fn; (void) line;
+	/*
+	 * THE ACQUIRE SEAM (-DFT_DELAY_INJECT, FT_DELAY_MODE=acquire).  Every
+	 * caller of this helper follows the same shape -- LOOK UP a node or slot,
+	 * LOCK it, then RE-CHECK that the sample still holds -- and every bug of
+	 * this family lives in the gap between the look-up and the re-check.
+	 * Injecting HERE, in the shared helper, widens that gap for all ~48 call
+	 * sites at once instead of one bespoke probe at a time, and a site that
+	 * forgot its re-check then fails on essentially every attempt.
+	 * Probabilistic by design (FT_DELAY_PCT): delaying every racer equally
+	 * reproduces nothing.  Inert in every build that does not ask for it.
+	 */
+	ft_delay_seam(FT_DELAY_SITE_ACQUIRE);
 	if (exit_ret)
 		*exit_ret = FT_LOG_EXIT_NOT_FINE;
 	if (ft->lock_fine && t && parent_nf) {

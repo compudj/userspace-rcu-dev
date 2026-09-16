@@ -1738,6 +1738,18 @@ int ft_node_recompact(enum ft_recompact mode,
 			.guard_pf = pf_gp };
 		if (ft_recompact_fault_refuse_acquire(mode))
 			return -EAGAIN;		/* test-only; nothing acquired */
+		/*
+		 * ☠ THE SEAM MUST SIT ON THE UNLOCKED SIDE OF THE ACQUIRE.  A
+		 * delay placed AFTER this call cannot widen anything a peer
+		 * could exploit -- the acquire is what EXCLUDES the peer, so
+		 * past it the node is frozen and the injection only slows this
+		 * op down (MEASURED: armed after the acquire, the ablated
+		 * NODE_INDEX_NULL crash went from 4 per 100 runs to 0, i.e. the
+		 * instrument SUPPRESSED its own target).  The window that
+		 * matters is between the caller's routing sample and this lock,
+		 * so the delay belongs HERE, immediately before it.
+		 */
+		ft_delay_seam(FT_DELAY_SITE_RECOMPACT);
 		dret = ft_dlm_acquire_set(ft, ctx, set, 3);
 		if (dret)
 			return dret == -ENOMEM ? -ENOMEM : -EAGAIN;
@@ -1835,6 +1847,16 @@ int ft_node_recompact(enum ft_recompact mode,
 	 * ☠ NOT hoisted above the fence: this walk must observe the node the
 	 * copy will read, so it belongs on the same side of the acquire.
 	 */
+	/*
+	 * THE ACQUIRE SEAM (-DFT_DELAY_INJECT, FT_DELAY_MODE=acquire).  The
+	 * caller chose this recompaction -- and its MODE -- from a count read
+	 * before the fence above; the walk on the next line is the re-read that
+	 * supersedes it.  Injecting here lets a peer drop another child in the
+	 * gap, which is exactly what turns a DEL the caller routed here into one
+	 * whose last child is its own target (the NODE_INDEX_NULL refusal
+	 * below).  Inert in every build that does not ask for it.
+	 */
+	ft_delay_seam(FT_DELAY_SITE_POSTLOCK);
 	nr_copy_child = ft_node_nonnull_child_count(old_type, old_node);
 
 	/*
