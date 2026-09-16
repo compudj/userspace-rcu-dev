@@ -2196,6 +2196,46 @@ int ft_attach_node(struct cds_ft *ft,
 		ft_lock_ctx_init(&rctx, ft_lock_ctx_descent(ctx), ic->txn,
 			ctx ? ctx->op : NULL);
 		rctx.held.outer = ctx ? &ctx->held : NULL;
+		/*
+		 * ★ IN-PLACE ACQUIRE HOIST.  The reserve below MUTATES
+		 * @attach_node_flag's body -- bitmap bit plus child slot --
+		 * whenever it stays IN PLACE, while the acquire of that same
+		 * node sits ~80 lines down beside the count.  Measured with all
+		 * three witnesses: the op holds it at the reserve 0 times of
+		 * 4,040,923.  Take it FIRST, so an in-place store on the COMMON
+		 * path is made under the lock that protects it.
+		 *
+		 * ☠ AND NOT ON THE MISS PATH -- do not read this as "never
+		 * writes a LIVE node unlocked".  A MISS sets @acquire_miss and
+		 * the commit discards the attempt, but nothing between here and
+		 * the reserve re-checks that bit, so the in-place set_nth still
+		 * performs its RAW bitmap + slot store on the live node, and the
+		 * discard does not undo a raw store (it drops @count_deferred,
+		 * not the bit).  That residue is the pre-existing shape of the
+		 * reserve itself, not something the hoist introduces; on an
+		 * exclusive trie a miss needs -ENOMEM or a depth_of failure to
+		 * arise at all.
+		 *
+		 * ☞ THIS DEPENDS ON @rctx ABOVE.  The first attempt at this hoist
+		 * LIVELOCKED (@70a1e20f): the reserve's recompact dedupes through
+		 * the ctx it is handed, and the caller's ctx carries a NULL
+		 * registry, so the op refused its OWN lock, destroyed the txn,
+		 * re-descended and span forever.  @rctx carries @ic->txn, so the
+		 * registration below is now VISIBLE to that acquire and dedupes
+		 * SHARED instead.  Do not reorder these two.
+		 *
+		 * ☞ @ctx, NOT @rctx, is handed to lock_or_guard: it builds its own
+		 * lctx with .held.txn = t and copies .extra/.glue from what it is
+		 * given but NOT .outer, so passing @rctx would drop the caller's
+		 * extras.
+		 *
+		 * Gated on ft_in_place_ok, so the default build -- where every
+		 * reserve relocates -- is unchanged.  A miss sets @acquire_miss
+		 * and ft_flip_txn_commit discards the attempt: no new unwind.
+		 */
+		if (ft_in_place_ok(ft))
+			ft_flip_txn_lock_or_guard_parent(ft, ic->txn, ctx,
+				attach_node_flag, FT_DEPTH_FROM_DESCENT);
 		{
 			struct cds_ft_inode_flag **slot_ptr = NULL;
 			/*
