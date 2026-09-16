@@ -99,6 +99,10 @@
  *   - a transaction's records must target pairwise-distinct slots.
  */
 
+#ifdef URCU_TXN_DEBUG_PARK_CLOBBER
+#include <execinfo.h>
+#include <stdio.h>
+#endif
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -467,10 +471,50 @@ int urcu_txn_plant(struct urcu_txn_record *r)
  * Park an SW record: a plain RELEASE store of the tagged proxy.  The caller holds
  * a lock over the slot (single-writer), so this cannot be raced and cannot fail.
  */
+#ifdef URCU_TXN_DEBUG_PARK_CLOBBER
+/*
+ * PROBE: invariant 2 says an SW slot is CALLER-EXCLUSIVE from record to settle,
+ * so the word an SW park overwrites MUST still read the record's old value.
+ * Swap instead of store and name every violation: a peer's DECIDED write
+ * (or a peer's parked proxy) sat in the slot, and this park has just erased it.
+ */
+static unsigned long urcu_txn_dbg_park_total, urcu_txn_dbg_park_clobber;
+static void urcu_txn_dbg_park_report(void) __attribute__((destructor));
+static void urcu_txn_dbg_park_report(void)
+{
+	fprintf(stderr, "URCU-TXN PARK total=%lu clobber=%lu\n",
+		uatomic_read(&urcu_txn_dbg_park_total),
+		uatomic_read(&urcu_txn_dbg_park_clobber));
+}
+static
+void urcu_txn_dbg_park_clobbered(struct urcu_txn_record *r, void *prev)
+{
+	unsigned long n = uatomic_add_return(&urcu_txn_dbg_park_clobber, 1);
+
+	if (n <= 12) {
+		void *bt[24];
+		int nbt = backtrace(bt, 24);
+
+		fprintf(stderr, "URCU-TXN PARK-CLOBBER #%lu slot=%p old=%p prev=%p new=%p tag=%#lx kind=%d desc=%p\n",
+			n, (void *) r->slot, r->old_ptr, prev, r->new_ptr,
+			(unsigned long) r->proxy_tag, (int) r->kind, (void *) r->desc);
+		backtrace_symbols_fd(bt, nbt, 2);
+	}
+}
+#endif
+
 static inline
 void urcu_txn_park(struct urcu_txn_record *r)
 {
+#ifdef URCU_TXN_DEBUG_PARK_CLOBBER
+	void *prev = uatomic_xchg(r->slot, urcu_txn_tag(r, r->proxy_tag));
+
+	uatomic_inc(&urcu_txn_dbg_park_total);
+	if (caa_unlikely(prev != r->old_ptr))
+		urcu_txn_dbg_park_clobbered(r, prev);
+#else
 	uatomic_store(r->slot, urcu_txn_tag(r, r->proxy_tag), CMM_RELEASE);
+#endif
 	URCU_TXN_REC_WROTE(r, urcu_txn_tag(r, r->proxy_tag));
 }
 

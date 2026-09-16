@@ -514,6 +514,11 @@ spliced:;
 	ic->ft = ft;
 	st = ft_flip_txn_commit(ft, ic->txn);
 	ic->txn = NULL;
+#ifdef FT_DEBUG_DEL_TOMB
+	if (st == URCU_TXN_STATUS_OK && ft_dt_last_reserve_nf)
+		ft_dt_check_flag("ins-commit", 0, ft_dt_last_reserve_nf, 0, NULL);
+	ft_dt_last_reserve_nf = NULL;
+#endif
 	/*
 	 * Dispatch the commit-outcome cleanup inline (the engine has no
 	 * defer-on-commit/abort mechanism): on OK the retired free_old_* nodes
@@ -2410,6 +2415,17 @@ int ft_attach_node(struct cds_ft *ft,
 				(void *) old_node_flag,
 				(void *) iter_node_flag);
 			ic->slot = slot_ptr;
+#ifdef FT_DEBUG_DEL_TOMB
+			if (iter_dest_node_flag == attach_node_flag)
+				ft_dt_check_flag("ins-reserve-inplace",
+					count_deferred ? 0 : 1, iter_dest_node_flag,
+					key_value, (const void *) attach_node_flag);
+			else
+				ft_dt_check_flag("ins-reserve-reloc", 1,
+					iter_dest_node_flag, key_value,
+					(const void *) attach_node_flag);
+			ft_dt_last_reserve_nf = iter_dest_node_flag;
+#endif
 			FT_TP(tree_edge_set, (const void *) ft,
 				(const void *) iter_dest_node_flag,
 				(unsigned int) (level - 1), (uint8_t) key_value,

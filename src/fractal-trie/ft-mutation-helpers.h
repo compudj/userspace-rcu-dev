@@ -1,3 +1,6 @@
+#ifdef FT_DEBUG_DEL_TOMB
+#include <execinfo.h>
+#endif
 // SPDX-FileCopyrightText: 2012-2026 Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
 //
 // SPDX-License-Identifier: LGPL-2.1-only
@@ -3965,7 +3968,8 @@ static inline
 int ft_meta_lock_acquire(struct cds_ft_metadata *meta,
 		uintptr_t *state_snapshot)
 {
-	uintptr_t s = CMM_LOAD_SHARED(meta->state);
+	uintptr_t s;
+	s = CMM_LOAD_SHARED(meta->state);
 
 #ifdef FEATURE_FT_AGREEMENT_RED
 	/*
@@ -11245,6 +11249,69 @@ unsigned int ft_pub_rec_sedges(struct ft_pub_rec *rec,
  * key; shapes that touch a second reader-visible slot (a compressed parent's
  * SKIP_X dual pointer, a recompacted node's grandparent edge) do NOT use this.
  */
+#ifdef FT_DEBUG_DEL_TOMB
+/*
+ * Can the two new tombstone refusals FIRE?  A zero on either separates "the
+ * shape does not occur" from "the check is blind" -- the distinction the
+ * nr_child witness failed to make.
+ */
+static unsigned long ft_dt_count_reach, ft_dt_count_tomb,
+	ft_dt_climb_reach, ft_dt_climb_tomb,
+	ft_dt_walk_reach, ft_dt_walk_first_multi, ft_dt_walk_first_ident,
+	ft_dt_cap0_reach, ft_dt_cap0_null, ft_dt_cap1_reach, ft_dt_cap1_null,
+	ft_dt_guard_reach, ft_dt_guard_both_null, ft_dt_guard_elev_null_refused,
+	ft_dt_guard_plan_null_refused,
+	ft_dt_holder_reach, ft_dt_holder_null_refused, ft_dt_del_prune_null,
+	ft_dt_arm_reach, ft_dt_arm_mismatch, ft_dt_arm_raw_null, ft_dt_arm_raw_proxy,
+	ft_dt_rc_copied, ft_dt_rc_add, ft_dt_rc_add_skew,
+	ft_dt_rc_entry, ft_dt_rc_entry_skew,
+	ft_dt_chk_prints, ft_dt_chk_unstable,
+	ft_dt_pair_checked, ft_dt_pair_refused, ft_dt_pair_why[5],
+	ft_dt_pair_fresh_ok, ft_dt_pair_fresh_bad;
+static void ft_dt_report(void) __attribute__((destructor));
+static void ft_dt_report(void)
+{
+	fprintf(stderr, "FT DEL-TOMB count_reach=%lu count_tomb=%lu "
+		"climb_reach=%lu climb_tomb=%lu walk_first=%lu "
+		"first_multichild=%lu first_ident_differs=%lu\n",
+		uatomic_read(&ft_dt_count_reach), uatomic_read(&ft_dt_count_tomb),
+		uatomic_read(&ft_dt_climb_reach), uatomic_read(&ft_dt_climb_tomb),
+		uatomic_read(&ft_dt_walk_reach),
+		uatomic_read(&ft_dt_walk_first_multi),
+		uatomic_read(&ft_dt_walk_first_ident));
+	fprintf(stderr, "FT DEL-NULLPLAN cap0=%lu/%lu cap1=%lu/%lu guard=%lu both_null=%lu elev_null_refused=%lu plan_null_refused=%lu\n",
+		uatomic_read(&ft_dt_cap0_null), uatomic_read(&ft_dt_cap0_reach),
+		uatomic_read(&ft_dt_cap1_null), uatomic_read(&ft_dt_cap1_reach),
+		uatomic_read(&ft_dt_guard_reach), uatomic_read(&ft_dt_guard_both_null),
+		uatomic_read(&ft_dt_guard_elev_null_refused),
+		uatomic_read(&ft_dt_guard_plan_null_refused));
+	fprintf(stderr, "FT DEL-HOLDER reach=%lu null_refused=%lu del_prune_null=%lu\n",
+		uatomic_read(&ft_dt_holder_reach),
+		uatomic_read(&ft_dt_holder_null_refused),
+		uatomic_read(&ft_dt_del_prune_null));
+	fprintf(stderr, "FT DEL-ARM reach=%lu raw!=plan=%lu raw_null=%lu raw_proxy=%lu\n",
+		uatomic_read(&ft_dt_arm_reach), uatomic_read(&ft_dt_arm_mismatch),
+		uatomic_read(&ft_dt_arm_raw_null), uatomic_read(&ft_dt_arm_raw_proxy));
+	fprintf(stderr, "FT RC copied=%lu add=%lu add_skew=%lu\n",
+		uatomic_read(&ft_dt_rc_copied), uatomic_read(&ft_dt_rc_add),
+		uatomic_read(&ft_dt_rc_add_skew));
+	fprintf(stderr, "FT RC-ENTRY reach=%lu skew=%lu\n",
+		uatomic_read(&ft_dt_rc_entry), uatomic_read(&ft_dt_rc_entry_skew));
+	fprintf(stderr, "FT DT-CHECK prints=%lu unstable=%lu\n",
+		uatomic_read(&ft_dt_chk_prints), uatomic_read(&ft_dt_chk_unstable));
+	fprintf(stderr, "FT DT-PAIR checked=%lu refused=%lu why1(root)=%lu why2(outside-parent)=%lu why3(bare-ext/NULL)=%lu why4(not-cur)=%lu\n",
+		uatomic_read(&ft_dt_pair_checked), uatomic_read(&ft_dt_pair_refused),
+		uatomic_read(&ft_dt_pair_why[1]), uatomic_read(&ft_dt_pair_why[2]),
+		uatomic_read(&ft_dt_pair_why[3]), uatomic_read(&ft_dt_pair_why[4]));
+	fprintf(stderr, "FT DT-PAIR-WHY2 stale_plan(fresh pair coherent)=%lu torn(fresh pair incoherent)=%lu\n",
+		uatomic_read(&ft_dt_pair_fresh_ok),
+		uatomic_read(&ft_dt_pair_fresh_bad));
+}
+# define FT_DT_INC(c)		uatomic_inc(&(c))
+#else
+# define FT_DT_INC(c)		do { } while (0)
+#endif
+
 static
 int ft_remove_one_commit(struct cds_ft *ft,
 		struct cds_ft_inode_flag **struct_slot,
@@ -11265,6 +11332,36 @@ int ft_remove_one_commit(struct cds_ft *ft,
 	edges[n].old_target = (struct ft_ord_cell *) struct_old;
 	edges[n].new_target = (struct ft_ord_cell *) struct_new;
 	edges[n].owner = slot_owner;
+#ifdef FT_DEBUG_DEL_TOMB
+	/*
+	 * PROBE: the slot this delete clears and the state word it decrements
+	 * must belong to ONE node.  A slot addressing a RETIRED copy while the
+	 * count lands on the LIVE copy leaves the live copy holding a child it
+	 * no longer counts -- the shape every wedged node shows.
+	 */
+	if (state_meta) {
+		char *sn = (char *) cds_ft_metadata_to_item(state_meta);
+		size_t order = cds_ft_item_order(sn);
+		char *sl = (char *) struct_slot;
+		static unsigned long ft_dt_slot_split;
+
+		if (sl < sn || sl >= sn + ((size_t) 1 << order)) {
+			unsigned long c = uatomic_add_return(&ft_dt_slot_split, 1);
+
+			if (c <= 8) {
+				void *bt[24];
+				int nbt = backtrace(bt, 24);
+
+				fprintf(stderr, "FT DEL-SLOT-SPLIT #%lu slot=%p old=%p state_node=%p order=%zu state=%#lx slot_owner=%p state_meta=%p\n",
+					c, (void *) struct_slot, (void *) struct_old,
+					(void *) sn, order,
+					(unsigned long) CMM_LOAD_SHARED(state_meta->state),
+					(void *) slot_owner, (void *) state_meta);
+				backtrace_symbols_fd(bt, nbt, 2);
+			}
+		}
+	}
+#endif
 	/*
 	 * @struct_slot is this commit's SOLE structural edge by contract (see
 	 * the header above: shapes with a SKIP_X dual do not use this helper),
@@ -11338,6 +11435,36 @@ int ft_remove_one_commit(struct cds_ft *ft,
 			 */
 			uintptr_t old = (uintptr_t) urcu_txn_load(txn->mtxn,
 				(void **) &state_meta->state, FT_STATE_PROXY);
+			/*
+			 * ☠ REFUSE A RETIRED HOLDER -- the insert's counterpart
+			 * (ft_flip_txn_record_nr_child_inc) has always done this and
+			 * the remove did not.  A raw @old carries FT_STATE_TOMBSTONE
+			 * when a peer has already retired this node, so the
+			 * expected-old MATCHES a dead holder and the decrement
+			 * commits on it; masking the bit out makes the install CAS
+			 * mismatch instead, which aborts the commit and sends the op
+			 * back to re-derive against the live copy.
+			 *
+			 * The recompacting delete never needed it (ft_dlm_lock
+			 * refuses PROXY|TOMBSTONE|LOCK outright), and the §4.B guard
+			 * that would have caught it is gated to the external PROMOTE
+			 * -- a pure leaf delete sets @state_meta and skips it, on the
+			 * argument that this very CAS "self-guards the holder".  It
+			 * does not: it guards the VALUE, not the node's liveness.
+			 *
+			 * ONLY the tombstone.  FT_STATE_LOCK stays in the expected
+			 * old: the held arm below CHAINS onto the release it already
+			 * recorded ({LOCK|s -> s-1}), and masking the lock out on the
+			 * not-held arm would name a value a word this op holds
+			 * through extras/glue has not carried since its mark landed
+			 * -- a permanent self-refusal (ft_flip_txn_owns is a registry
+			 * LOWER BOUND).  Byte-identical whenever the holder is live.
+			 */
+			uintptr_t live = old & ~(uintptr_t) FT_STATE_TOMBSTONE;
+
+			FT_DT_INC(ft_dt_count_reach);
+			if (caa_unlikely(old & FT_STATE_TOMBSTONE))
+				FT_DT_INC(ft_dt_count_tomb);
 
 			/*
 			 * THE STATE-WORD PROTOCOL'S THIRD STEP, on a word the op
@@ -11369,11 +11496,11 @@ int ft_remove_one_commit(struct cds_ft *ft,
 			 */
 			if (ft_flip_txn_owns(txn, state_meta)) {
 				ft_flip_txn_record_state(txn, state_meta,
-					(void *) old,
-					(void *) (old - FT_STATE_NR_CHILD_ONE));
+					(void *) live,
+					(void *) (live - FT_STATE_NR_CHILD_ONE));
 			} else {
-				ft_state_edge(&edges[n], &state_meta->state, old,
-					old - FT_STATE_NR_CHILD_ONE);
+				ft_state_edge(&edges[n], &state_meta->state, live,
+					live - FT_STATE_NR_CHILD_ONE);
 				/*
 				 * FT-SLOT-1's RED CONTROL, kept as the regression
 				 * detector (it fired at ft_unit test 24 of the
@@ -12470,6 +12597,34 @@ void ft_set_parent_raw(struct cds_ft *ft, struct cds_ft_inode_flag *child,
 		}
 		return;
 	}
+#ifdef FT_DEBUG_DEL_TOMB
+	/*
+	 * PROBE: a parent-word-only raw store onto a node that already has a
+	 * DIFFERENT real parent leaves its offset word describing the OLD body
+	 * until a later store fixes it -- a torn pair for every reader in
+	 * between.  Name the site.
+	 */
+	{
+		struct cds_ft_metadata *dm = cds_ft_item_to_metadata(ft_node_ptr(child));
+		struct cds_ft_inode_flag *oldp = ft_parent_node(
+			(struct cds_ft_inode_flag *) CMM_LOAD_SHARED(dm->parent_word));
+		struct cds_ft_inode_flag *newp = ft_parent_node(value);
+		static unsigned long ft_dt_raw_pw;
+
+		if (oldp && newp && !ft_node_flip_proxy(oldp) &&
+				ft_node_ptr(oldp) != ft_node_ptr(newp) &&
+				uatomic_add_return(&ft_dt_raw_pw, 1) <= 12) {
+			void *bt[20];
+			int nbt = backtrace(bt, 20);
+
+			fprintf(stderr, "FT RAW-REPARENT-WORD meta=%p old_parent=%p new_parent=%p off=%u state=%#lx\n",
+				(void *) dm, (void *) oldp, (void *) newp,
+				(unsigned int) FT_PSO_DECODE(CMM_LOAD_SHARED(dm->parent_slot_offset)),
+				(unsigned long) CMM_LOAD_SHARED(dm->state));
+			backtrace_symbols_fd(bt, nbt, 2);
+		}
+	}
+#endif
 	cds_ft_item_to_metadata(ft_node_ptr(child))->parent_word = value;
 }
 

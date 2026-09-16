@@ -975,6 +975,7 @@ int ft_popcount_node_replace_ptr(struct cds_ft *ft, const struct cds_ft_type *ty
 		struct cds_ft_inode_flag *node_flag,
 		struct cds_ft_metadata *metadata,
 		struct cds_ft_inode_flag **node_flag_ptr,
+		struct cds_ft_inode_flag *node_flag_expected,
 		struct cds_ft_inode_flag *newptr,
 		bool in_place,
 		struct ft_remove_pub *pub)
@@ -1007,7 +1008,14 @@ int ft_popcount_node_replace_ptr(struct cds_ft *ft, const struct cds_ft_type *ty
 			return -EFBIG;
 	}
 	dbg_printf("popcount replace ptr: node %p\n", node);
-	assert(*node_flag_ptr != NULL);
+	/*
+	 * The PLAN's value, not the slot's: with @in_place the holder is not
+	 * held here (the commit's expected-old is the arbitration), so a raw
+	 * `*node_flag_ptr` is a contended word that a peer's in-place delete
+	 * NULLs, or a peer's commit parks a proxy in, between the caller's
+	 * plan and this arm.  See the @pub arm below.
+	 */
+	assert(node_flag_expected != NULL);
 	/*
 	 * Fusion armed: DEFER the forward store into @pub so ft_detach_node
 	 * commits it in one flip with the dead head cell's unsplice.  A delete
@@ -1042,7 +1050,38 @@ int ft_popcount_node_replace_ptr(struct cds_ft *ft, const struct cds_ft_type *ty
 		pub->slot = node_flag_ptr;
 		/* @slot is a child slot of THIS node, promote or delete alike. */
 		pub->slot_owner = metadata;
-		pub->old_val = *node_flag_ptr;
+		/*
+		 * ☠ THE EXPECTED-OLD IS THE PLAN'S VALUE, NEVER A RE-READ OF THE
+		 * SLOT.  @node_flag_expected is the child the caller's climb
+		 * condemned (ft_detach_node's @plan_old_child, enforced against
+		 * its own re-read pre-fence); it is what "this delete drops
+		 * THAT subtree" means, so it is the only value whose mismatch at
+		 * commit says "a peer republished this slot since the plan".
+		 *
+		 * A raw `*node_flag_ptr` here is a SECOND, unheld read of a word
+		 * the in-place tier leaves contended: a peer's in-place delete of
+		 * the same chain NULLs it, and the raw value then RE-PLANS this
+		 * op onto the peer's outcome -- {NULL -> NULL} on the slot with a
+		 * fresh nr_child-- fused on top (the chain freeze's derived NULL
+		 * is what aborted that commit, by accident of the freeze's own
+		 * arbitration, not by design of this one).  A peer's commit in
+		 * flight parks a flip-proxy there instead, and the raw value hands
+		 * the engine a proxy as expected-old (rcu-txn-mcas.h's
+		 * `!urcu_txn_is_proxy` assert -- MEASURED alongside the NULL, on
+		 * inv_concurrent_remove_all_nolist).  The recompacting tier read
+		 * the slot under the {C,P,GP} lock, where the two values could not
+		 * differ; the in-place tier has no such lock, and the plan value
+		 * is the one the commit must speak.
+		 */
+		FT_DT_INC(ft_dt_arm_reach);
+		if (*node_flag_ptr != node_flag_expected) {
+			FT_DT_INC(ft_dt_arm_mismatch);
+			if (!*node_flag_ptr)
+				FT_DT_INC(ft_dt_arm_raw_null);
+			else if (ft_node_flip_proxy(*node_flag_ptr))
+				FT_DT_INC(ft_dt_arm_raw_proxy);
+		}
+		pub->old_val = node_flag_expected;
 		pub->new_val = newptr;
 		pub->armed = true;
 		if (!newptr)
@@ -1074,6 +1113,7 @@ int ft_pigeon_node_replace_ptr(struct cds_ft *ft, const struct cds_ft_type *type
 		struct cds_ft_inode_flag *node_flag,
 		struct cds_ft_metadata *metadata,
 		struct cds_ft_inode_flag **node_flag_ptr,
+		struct cds_ft_inode_flag *node_flag_expected,
 		uint8_t n __attribute__((unused)),
 		struct cds_ft_inode_flag *newptr,
 		bool in_place,
@@ -1094,7 +1134,8 @@ int ft_pigeon_node_replace_ptr(struct cds_ft *ft, const struct cds_ft_type *type
 			return -EFBIG;
 	}
 	dbg_printf("ft_pigeon_node_replace_ptr: replace ptr: %p by %p\n", *node_flag_ptr, newptr);
-	assert(*node_flag_ptr != NULL);
+	/* The plan's value, not a raw re-read: see the popcount variant. */
+	assert(node_flag_expected != NULL);
 	/*
 	 * Fusion armed: DEFER the forward store into @pub (committed in one flip
 	 * with the dead head cell's unsplice).  A DELETE (NULL newptr) fuses its
@@ -1131,7 +1172,16 @@ int ft_pigeon_node_replace_ptr(struct cds_ft *ft, const struct cds_ft_type *type
 		pub->slot = node_flag_ptr;
 		/* @slot is a child slot of THIS node, promote or delete alike. */
 		pub->slot_owner = metadata;
-		pub->old_val = *node_flag_ptr;
+		/* The plan's value as expected-old: see the popcount variant. */
+		FT_DT_INC(ft_dt_arm_reach);
+		if (*node_flag_ptr != node_flag_expected) {
+			FT_DT_INC(ft_dt_arm_mismatch);
+			if (!*node_flag_ptr)
+				FT_DT_INC(ft_dt_arm_raw_null);
+			else if (ft_node_flip_proxy(*node_flag_ptr))
+				FT_DT_INC(ft_dt_arm_raw_proxy);
+		}
+		pub->old_val = node_flag_expected;
 		pub->new_val = newptr;
 		pub->armed = true;
 		if (!newptr)
@@ -1165,6 +1215,7 @@ int _ft_node_replace_ptr(struct cds_ft *ft, const struct cds_ft_type *type,
 		struct cds_ft_inode_flag *node_flag,
 		struct cds_ft_metadata *metadata,
 		struct cds_ft_inode_flag **node_flag_ptr,
+		struct cds_ft_inode_flag *node_flag_expected,
 		uint8_t n, struct cds_ft_inode_flag *newptr,
 		bool in_place,
 		struct ft_remove_pub *pub)
@@ -1174,11 +1225,13 @@ int _ft_node_replace_ptr(struct cds_ft *ft, const struct cds_ft_type *type,
 	switch (type->type_class) {
 	case FT_POPCOUNT:
 		ret = ft_popcount_node_replace_ptr(ft, type, node, node_flag,
-				metadata, node_flag_ptr, newptr, in_place, pub);
+				metadata, node_flag_ptr, node_flag_expected,
+				newptr, in_place, pub);
 		break;
 	case FT_PIGEON:
 		ret = ft_pigeon_node_replace_ptr(ft, type, node, node_flag,
-				metadata, node_flag_ptr, n, newptr, in_place, pub);
+				metadata, node_flag_ptr, node_flag_expected,
+				n, newptr, in_place, pub);
 		break;
 	case FT_NULL:
 		return -ENOENT;
@@ -1226,6 +1279,131 @@ unsigned int find_nearest_type_index(unsigned int type_index,
 	}
 	return type_index;
 }
+
+/*
+ * ft_node_nonnull_child_count: how many children a recompaction's copy loop
+ * will actually PLACE into the replacement node -- this node's NON-NULL child
+ * pointers.
+ *
+ * ☠ NOT the state word's nr_child, and that distinction is the whole point.
+ * The copy loops below iterate the BITMAP (for FT_POPCOUNT the loop bound IS
+ * ft_popcount_node_get_nr_child, a popcount over the occupancy bitmap; the
+ * FT_PIGEON loop scans every slot) and skip a slot whose pointer reads NULL.
+ * So what they place is the non-NULL count, while the capacity was chosen from
+ * the state word -- the node's SIZE and its CONTENTS answering two different
+ * questions.
+ *
+ * The two agree at rest and diverge in exactly the windows this trie is built
+ * out of.  A reserve leaves a bit-set + NULL hole that the bitmap counts and
+ * neither the state word nor the copy does.  The in-place tiers leave the
+ * mirror image: a slot holding a child the state word does not (or no longer)
+ * count, because the pointer and the count go live on different edges.
+ *
+ * UNDER-SIZING IS FATAL, and it is what the state word produces: the copy fills
+ * the replacement to its max_child and the ADD tail then trips
+ * ft_popcount_2l_node_set_nth's `nr_child < max_lc`.  MEASURED on
+ * inv_concurrent_remove_all_nolist at per-node spacing -- a max_child=3 node
+ * whose bitmap popcount was 3 with all three pointers live and whose state word
+ * read 2, so the replacement was sized for 3 and asked to hold 4.
+ *
+ * OVER-SIZING IS MERELY A DENSITY LOSS (the tiers deliberately overlap, so a
+ * node below its tier's min_child is legal and the next delete recompacts it
+ * down).  Asymmetric costs, so the capacity is derived from the count the copy
+ * itself uses and from nothing else.
+ *
+ * ☞ It is a BOUND, not a prediction: the copy can place fewer (a peer's child
+ * resolved away, a DEL's drop, a folded pending delete).  It can never place
+ * more, because every placement comes from a slot counted here.
+ */
+static
+unsigned int ft_node_nonnull_child_count(const struct cds_ft_type *type,
+		struct cds_ft_inode *node)
+{
+	unsigned int nonnull = 0, i;
+
+	if (!node)
+		return 0;
+	switch (type->type_class) {
+	case FT_POPCOUNT:
+	{
+		unsigned int pc = ft_popcount_node_get_nr_child(type, node);
+
+		for (i = 0; i < pc; i++) {
+			struct cds_ft_inode_flag *iter;
+			uint8_t v;
+
+			ft_popcount_node_get_ith_pos(type, node, (uint8_t) i,
+					&v, &iter);
+			if (iter)
+				nonnull++;
+		}
+		return nonnull;
+	}
+	case FT_PIGEON:
+		for (i = 0; i < FT_ENTRY_PER_NODE; i++)
+			if (ft_pigeon_node_get_ith_pos(type, node, (uint8_t) i))
+				nonnull++;
+		return nonnull;
+	default:
+		return 0;
+	}
+}
+
+
+#ifdef FT_DEBUG_DEL_TOMB
+/*
+ * PROBE: does a node's state count agree with its bitmap popcount?  For a
+ * fresh (build-invisible) node the two MUST be equal at every step -- a
+ * reserve hole is counted by both.  Print only disagreements, capped.
+ */
+static __thread struct cds_ft_inode_flag *ft_dt_last_reserve_nf;
+/*
+ * @expect: the count the node SHOULD carry, relative to its NON-NULL child
+ * pointers (count - nonnull).  A bit-set+NULL hole (soft delete, in-flight
+ * reserve) is counted by neither, so a LIVE node reads 0; a FRESH node whose
+ * ADD tail placed a NULL reserve reads +1 (set_nth counted it in place).
+ * The count is read on BOTH sides of the walk and the sample is dropped when
+ * the two disagree: a peer committed on this node mid-walk, and a torn pair
+ * would read as a skew of the probe's own making.
+ */
+static
+void ft_dt_check_node(const char *site, int expect_ct_minus_nonnull,
+		const struct cds_ft_type *type,
+		struct cds_ft_inode *node, struct cds_ft_metadata *meta,
+		unsigned int n, const void *extra)
+{
+	unsigned int pc, nonnull, ct1, ct2;
+
+	if (!node || !meta || !type || type->type_class != FT_POPCOUNT)
+		return;
+	ct1 = ft_meta_nr_child_load(meta);
+	pc = ft_popcount_node_get_nr_child(type, node);
+	nonnull = ft_node_nonnull_child_count(type, node);
+	ct2 = ft_meta_nr_child_load(meta);
+	if (ct1 != ct2) {
+		uatomic_inc(&ft_dt_chk_unstable);
+		return;
+	}
+	if ((int) ct2 - (int) nonnull != expect_ct_minus_nonnull &&
+			uatomic_add_return(&ft_dt_chk_prints, 1) <= 60)
+		fprintf(stderr, "FT DT-CHECK %s node=%p meta=%p pc=%u nonnull=%u count=%u (expect count-nonnull=%d) state=%#lx n=%u extra=%p\n",
+			site, (void *) node, (void *) meta, pc, nonnull, ct2,
+			expect_ct_minus_nonnull,
+			(unsigned long) CMM_LOAD_SHARED(meta->state), n, extra);
+}
+static
+void ft_dt_check_flag(const char *site, int expect_ct_minus_nonnull,
+		struct cds_ft_inode_flag *nf,
+		unsigned int n, const void *extra)
+{
+	if (!nf || ft_node_flip_proxy(nf) || ft_node_external(nf) ||
+			ft_node_compressed(nf) || ft_node_skip_compressed(nf))
+		return;
+	ft_dt_check_node(site, expect_ct_minus_nonnull,
+		&ft_types[ft_node_type(nf)], ft_node_ptr(nf),
+		cds_ft_item_to_metadata(ft_node_ptr(nf)), n, extra);
+}
+#endif
 
 /*
  * ft_node_recompact_add: recompact a node, adding a new child.
@@ -1326,6 +1504,8 @@ int ft_node_recompact(enum ft_recompact mode,
 		const struct ft_lock_ctx *ctx)
 {
 	unsigned int new_type_index;
+	/* Children the copy loop will place: see ft_node_nonnull_child_count. */
+	unsigned int nr_copy_child;
 	struct cds_ft_inode *new_node;
 	struct cds_ft_metadata *new_metadata;
 	const struct cds_ft_type *new_type;
@@ -1584,6 +1764,79 @@ int ft_node_recompact(enum ft_recompact mode,
 		fenced = true;
 	}
 
+#ifdef FT_DEBUG_DEL_TOMB
+	/*
+	 * THE NODE INVARIANT, checked on the LIVE node this recompaction is
+	 * about to copy: the state word's nr_child must equal the number of
+	 * NON-NULL child pointers.  A bit-set+NULL hole is counted by neither,
+	 * so the two agree at rest, and under the FT-wide writer lock no peer
+	 * can be mid-reserve here.  A divergence means some earlier mutation
+	 * left a pointer this node does not count -- exactly what makes the
+	 * copy loop overrun a node sized from the count.
+	 */
+	if (old_node && old_type->type_class == FT_POPCOUNT && metadata) {
+		unsigned int pc = ft_popcount_node_get_nr_child(old_type, old_node);
+		unsigned int nonnull = 0, holes = 0, dead = 0, i;
+		/*
+		 * ☠ THE RESOLVING LOAD, not ft_meta_nr_child: a peer mid-commit
+		 * parks a flip proxy on this word, and the raw read then returns
+		 * the DESCRIPTOR's bits as a child count (measured: 384 and 464
+		 * on a max_child=3 node).  Every skew this probe reports would
+		 * otherwise be the instrument's own torn read.
+		 */
+		unsigned int ct = ft_meta_nr_child_load(metadata);
+
+		for (i = 0; i < pc; i++) {
+			struct cds_ft_inode_flag *it;
+			uint8_t v;
+
+			ft_popcount_node_get_ith_pos(old_type, old_node, i, &v, &it);
+			if (!it) {
+				holes++;
+				continue;
+			}
+			nonnull++;
+			if (!ft_node_flip_proxy(it) && ft_node_external(it) &&
+					ft_node_is_removed((struct cds_ft_node *)
+						ft_node_ptr(it)))
+				dead++;
+		}
+		FT_DT_INC(ft_dt_rc_entry);
+		/*
+		 * ONLY the fatal direction, and capped: `ct > nonnull` is the
+		 * benign in-flight reserve and fires ~1e6 times a run (it is
+		 * present on the GREEN exponential leg too).  `ct < nonnull` is
+		 * a node holding a child it does not count.
+		 */
+		if (nonnull > ct &&
+				uatomic_add_return(&ft_dt_rc_entry_skew, 1) <= 20) {
+			fprintf(stderr, "FT RC-ENTRY-SKEW mode=%d type=%u node=%p pc=%u "
+				"nonnull=%u holes=%u dead_ext=%u count=%u state=%#lx n=%u\n",
+				(int) mode, old_type_index, (void *) old_node, pc,
+				nonnull, holes, dead, ct,
+				(unsigned long) (uintptr_t) urcu_txn_read(
+					(void **) (uintptr_t) &metadata->state,
+					FT_STATE_PROXY),
+				(unsigned int) n);
+		}
+	}
+#endif
+	/*
+	 * THE REPLACEMENT'S CAPACITY COMES FROM THE COUNT THE COPY USES.
+	 *
+	 * ft_node_nonnull_child_count carries the full argument: the copy loops
+	 * below place this node's NON-NULL children, so sizing from the STATE
+	 * word asked the capacity and the contents two different questions, and
+	 * an under-size is an assertion failure in the ADD tail rather than a
+	 * density loss.  ☞ A BOUND, not a prediction -- the copy may place
+	 * fewer (a resolved-away child, the DEL's own drop, a folded pending
+	 * delete), never more.
+	 *
+	 * ☠ NOT hoisted above the fence: this walk must observe the node the
+	 * copy will read, so it belongs on the same side of the acquire.
+	 */
+	nr_copy_child = ft_node_nonnull_child_count(old_type, old_node);
+
 	/*
 	 * Need to find nearest type index even for ADD_SAME, so that
 	 * recompaction can promote/demote across tier boundaries
@@ -1592,9 +1845,9 @@ int ft_node_recompact(enum ft_recompact mode,
 	switch (mode) {
 	case FT_RECOMPACT_ADD_SAME:
 		new_type_index = find_nearest_type_index(old_type_index,
-			ft_meta_nr_child_load(metadata) + 1, false);
+			nr_copy_child + 1, false);
 		dbg_printf("Recompact for node with %u children\n",
-			ft_meta_nr_child_load(metadata) + 1);
+			nr_copy_child + 1);
 		break;
 	case FT_RECOMPACT_ADD_NEXT:
 		if (!metadata || old_type_index == NODE_INDEX_NULL) {
@@ -1602,16 +1855,25 @@ int ft_node_recompact(enum ft_recompact mode,
 			dbg_printf("Recompact for NULL\n");
 		} else {
 			new_type_index = find_nearest_type_index(old_type_index,
-				ft_meta_nr_child_load(metadata) + 1, false);
+				nr_copy_child + 1, false);
 			dbg_printf("Recompact for node with %u children\n",
-				ft_meta_nr_child_load(metadata) + 1);
+				nr_copy_child + 1);
 		}
 		break;
 	case FT_RECOMPACT_DEL:
+		/*
+		 * The drop is one of the counted children (its slot is the
+		 * plan's @nullify_expected, validated non-NULL below), so the
+		 * copy places @nr_copy_child - 1.  A ZERO here is a plan naming
+		 * a child this node does not hold: it sizes to NODE_INDEX_NULL
+		 * and the assert below names it, exactly as a 1-child node has
+		 * always done (a node emptying its last child routes through
+		 * ft_detach_node, never through a DEL recompaction).
+		 */
 		new_type_index = find_nearest_type_index(old_type_index,
-			ft_meta_nr_child_load(metadata) - 1, is_root);
+			nr_copy_child ? nr_copy_child - 1 : 0, is_root);
 		dbg_printf("Recompact for node with %u children\n",
-			ft_meta_nr_child_load(metadata) - 1);
+			nr_copy_child ? nr_copy_child - 1 : 0);
 		break;
 	case FT_RECOMPACT_RELOCATE:
 		new_type_index = old_type_index;	/* same type, pure relocation */
@@ -1836,17 +2098,47 @@ int ft_node_recompact(enum ft_recompact mode,
 
 	assert(mode != FT_RECOMPACT_ADD_NEXT || old_type->type_class != FT_PIGEON);
 
-	/*
-	 * A DEL must never prune the node to NODE_INDEX_NULL: the remove
-	 * paths route a node emptying its last child through ft_detach_node
-	 * (which unlinks the whole branch) instead of a DEL recompact, so
-	 * @new_node below is non-NULL whenever the copy/parent-inherit tail
-	 * dereferences it.  That invariant is enforced several call layers
-	 * away -- catch a regression here, at the dereference site.
-	 */
-	assert(mode != FT_RECOMPACT_DEL || new_type_index != NODE_INDEX_NULL);
-
 	if (mode == FT_RECOMPACT_DEL) {
+		/*
+		 * ☠ A DEL THAT PRUNES TO NODE_INDEX_NULL IS A STALE ROUTE, AND
+		 * UNDER CONCURRENCY IT IS REACHABLE.
+		 *
+		 * This was an assert -- "the remove paths route a node emptying
+		 * its last child through ft_detach_node (which unlinks the whole
+		 * branch) instead of a DEL recompact, so @new_node is non-NULL
+		 * whenever the copy/parent-inherit tail dereferences it".  That
+		 * invariant holds for the ROUTING DECISION, which the caller made
+		 * from a count read BEFORE the acquire.  @nr_copy_child above is
+		 * deliberately re-read AFTER it ("NOT hoisted above the fence"),
+		 * and a peer that drops another child in between turns the
+		 * 2-child node the caller routed here into a 1-child node whose
+		 * last child is this plan's own target.  Sizing then asks for
+		 * zero children, find_nearest_type_index answers NODE_INDEX_NULL,
+		 * and the invariant the assert states is simply false.
+		 *
+		 * ☠ AND -DNDEBUG DELETES THE ASSERT.  In a release build the
+		 * pruned-away copy fell through as @new_node_flag == NULL, was
+		 * written back through the caller's in/out @old_node_flag_ptr,
+		 * and ft_detach_node dereferenced it -- MEASURED: SIGSEGV in
+		 * cds_ft_item_to_metadata at si_addr 0x200010 (the NULL page base
+		 * plus the range's metadata offset), release only, on
+		 * inv_concurrent_remove_all_list and _nolist at all three
+		 * spacings.  The debug gate stayed green because the assert that
+		 * would have named it is not compiled in the build that races.
+		 *
+		 * So answer it the way the two plan checks just below answer
+		 * their own stale samples: nothing is published, nothing is
+		 * recorded, the fresh body (if any) never escaped -- bail through
+		 * the same unwind and let the op re-descend.  The retry re-reads
+		 * the count and routes the emptying node to ft_detach_node, which
+		 * is where it belonged; @nr_copy_child == 0 (a plan naming a
+		 * child this node no longer holds) converges the same way.
+		 */
+		if (caa_unlikely(new_type_index == NODE_INDEX_NULL)) {
+			FT_DT_INC(ft_dt_del_prune_null);
+			ret = -EAGAIN;
+			goto abandon_fresh;
+		}
 		nullify_val = rcu_dereference(*nullify_node_flag_ptr);
 		if (caa_unlikely(ft_node_flip_proxy(nullify_val))) {
 			ret = -EAGAIN;
@@ -2064,6 +2356,7 @@ int ft_node_recompact(enum ft_recompact mode,
 			}
 			if (mode == FT_RECOMPACT_DEL && nullify_val == iter)
 				continue;
+			FT_DT_INC(ft_dt_rc_copied);
 			if (new_type->popcount_2l)
 				ret = ft_popcount_2l_node_set_nth(new_type,
 						new_node, new_metadata, v, iter,
@@ -2271,7 +2564,97 @@ int ft_node_recompact(enum ft_recompact mode,
 	}
 skip_copy:
 
+#ifdef FT_DEBUG_DEL_TOMB
+	ft_dt_check_node("rc-after-copy", 0, new_type, new_node, new_metadata,
+		(unsigned int) n, (const void *) old_node);
+	/*
+	 * PROBE: the fresh node is FULL before the ADD.  Name the disagreement:
+	 * the count the type was chosen from vs the live children the copy
+	 * found vs the count the old node carries NOW.
+	 */
+	if ((mode == FT_RECOMPACT_ADD_NEXT || mode == FT_RECOMPACT_ADD_SAME) &&
+			new_node && new_type->type_class == FT_POPCOUNT &&
+			ft_meta_nr_child(new_metadata) >= new_type->max_child) {
+		fprintf(stderr, "FT RECOMPACT-OVERFLOW mode=%d old_type=%u new_type=%u "
+			"old_bitmap_popcount=%u old_count_now=%u old_count_raw=%u "
+			"fresh_count=%u new_max=%u n=%u fenced=%d old_node=%p\n",
+			(int) mode, old_type_index, new_type_index,
+			old_type->type_class == FT_POPCOUNT ?
+				(unsigned int) ft_popcount_node_get_nr_child(old_type, old_node) : 0,
+			ft_meta_nr_child_load(metadata), ft_meta_nr_child(metadata),
+			ft_meta_nr_child(new_metadata), new_type->max_child,
+			(unsigned int) n, (int) fenced, (void *) old_node);
+		if (old_type->type_class == FT_POPCOUNT) {
+			unsigned int pc = ft_popcount_node_get_nr_child(old_type, old_node);
+			unsigned int i;
+
+			fprintf(stderr, "FT RECOMPACT-OVERFLOW old state=%#lx parent_word=%#lx\n",
+				(unsigned long) CMM_LOAD_SHARED(metadata->state),
+				(unsigned long) CMM_LOAD_SHARED(metadata->parent_word));
+			for (i = 0; i < pc; i++) {
+				struct cds_ft_inode_flag *it;
+				uint8_t v;
+
+				ft_popcount_node_get_ith_pos(old_type, old_node, i, &v, &it);
+				/* Land the (holder, dead head) pair in the trace timeline. */
+				if (it && !ft_node_flip_proxy(it) && ft_node_external(it) &&
+						ft_node_is_removed((struct cds_ft_node *) ft_node_ptr(it)))
+					FT_TP(violation, (uint64_t) (uintptr_t) old_node,
+						(uint64_t) (uintptr_t) ft_node_ptr(it));
+				if (it && !ft_node_flip_proxy(it) && ft_node_external(it))
+					fprintf(stderr, "FT RECOMPACT-OVERFLOW   raw prev=%p\n",
+						(void *) CMM_LOAD_SHARED(((struct cds_ft_node *) ft_node_ptr(it))->prev));
+				fprintf(stderr, "FT RECOMPACT-OVERFLOW   slot[%u] byte=%u ptr=%p proxy=%d ext=%d removed=%d holder=%p next=%p\n",
+					i, (unsigned int) v, (void *) it,
+					it ? (int) ft_node_flip_proxy(it) : -1,
+					(it && !ft_node_flip_proxy(it)) ? (int) ft_node_external(it) : -1,
+					(it && !ft_node_flip_proxy(it) && ft_node_external(it)) ?
+						(int) ft_node_is_removed((struct cds_ft_node *) ft_node_ptr(it)) : -1,
+					(it && !ft_node_flip_proxy(it) && ft_node_external(it)) ?
+						(void *) ft_node_holder(ft, (struct cds_ft_node *) ft_node_ptr(it)) : NULL,
+					(it && !ft_node_flip_proxy(it) && ft_node_external(it)) ?
+						(void *) CMM_LOAD_SHARED(((struct cds_ft_node *) ft_node_ptr(it))->next) : NULL);
+			}
+#ifdef FT_ENABLE_TRACING
+			{
+				char cmd[128];
+
+				(void) snprintf(cmd, sizeof(cmd),
+					"lttng snapshot record -n ovf%ld 1>&2", (long) getpid());
+				(void) system(cmd);
+			}
+#endif
+			{
+				struct cds_ft_inode_flag *pnf = ft_parent_node(
+					CMM_LOAD_SHARED(metadata->parent_word));
+				struct cds_ft_inode_flag **pslot = NULL;
+				struct cds_ft_inode_flag *pchild = NULL;
+
+				if (pnf && !ft_node_compressed(pnf) && !ft_node_skip_compressed(pnf))
+					pchild = ft_node_get_nth_skip(pnf, &pslot,
+						metadata->incoming_byte, FT_PF_NONE);
+				fprintf(stderr, "FT RECOMPACT-OVERFLOW old_flag=%p parent_nf=%p incoming_byte=%u parent_slot=%p parent_slot_val=%p reachable=%d\n",
+					(void *) ft_node_flag(old_node, old_type_index), (void *) pnf,
+					(unsigned int) metadata->incoming_byte, (void *) pslot,
+					(void *) pchild,
+					pchild ? (int) (ft_node_ptr(pchild) == old_node) : -1);
+			}
+		}
+	}
+#endif
 	if (mode == FT_RECOMPACT_ADD_NEXT || mode == FT_RECOMPACT_ADD_SAME) {
+#ifdef FT_DEBUG_DEL_TOMB
+		/*
+		 * THE BUILD INVARIANT, checked where it is still cheap to name
+		 * the producer: a build-invisible fresh node applies every
+		 * nr_child in place, so its state count must equal its bitmap
+		 * popcount at every step.  Snapshot both across the ADD.
+		 */
+		unsigned int dbg_pc_before = (new_node && new_type->type_class == FT_POPCOUNT) ?
+			ft_popcount_node_get_nr_child(new_type, new_node) : 0;
+		unsigned int dbg_ct_before = new_metadata ?
+			ft_meta_nr_child(new_metadata) : 0;
+#endif
 		/* add node */
 		if (new_type->popcount_2l)
 			ret = ft_popcount_2l_node_set_nth(new_type,
@@ -2288,6 +2671,26 @@ skip_copy:
 				/* in_place: build-invisible */ true,
 				NULL FT_CH_TXN_NONE);
 		assert(!ret);
+#ifdef FT_DEBUG_DEL_TOMB
+		if (new_node && new_type->type_class == FT_POPCOUNT && new_metadata) {
+			unsigned int pc = ft_popcount_node_get_nr_child(new_type, new_node);
+			unsigned int ct = ft_meta_nr_child(new_metadata);
+
+			FT_DT_INC(ft_dt_rc_add);
+			if (pc != ct) {
+				FT_DT_INC(ft_dt_rc_add_skew);
+				fprintf(stderr, "FT RC-ADD-SKEW mode=%d old_type=%u new_type=%u "
+					"old_pc=%u old_ct=%u pc_before=%u ct_before=%u "
+					"pc_after=%u ct_after=%u n=%u child=%p fenced=%d\n",
+					(int) mode, old_type_index, new_type_index,
+					(old_node && old_type->type_class == FT_POPCOUNT) ?
+						ft_popcount_node_get_nr_child(old_type, old_node) : 0,
+					metadata ? ft_meta_nr_child(metadata) : 0,
+					dbg_pc_before, dbg_ct_before, pc, ct,
+					(unsigned int) n, (void *) child_node_flag, (int) fenced);
+			}
+		}
+#endif
 	}
 
 #undef RECOMPACT_IS_INIT
@@ -3132,6 +3535,12 @@ skip_copy:
 	}
 
 	ret = 0;
+#ifdef FT_DEBUG_DEL_TOMB
+	ft_dt_check_node("rc-exit", ((mode == FT_RECOMPACT_ADD_NEXT ||
+			mode == FT_RECOMPACT_ADD_SAME) && !child_node_flag) ? 1 : 0,
+		new_type, new_node, new_metadata,
+		(unsigned int) n, (const void *) old_node);
+#endif
 end:
 	return ret;
 
@@ -3343,7 +3752,9 @@ int ft_node_set_nth(struct cds_ft *ft,
  * @node_flag_expected: the child value @node_flag_ptr held when the CALLER built
  * its plan -- the subtree this replace drops (delete) or displaces (external
  * promote).  Threaded to ft_node_recompact's DEL arm as its plan expected-old
- * (see its header); a peer republish of the slot since the plan is -EAGAIN.
+ * (see its header), AND to the in-place arm as the deferred store's expected-old
+ * (@pub->old_val): a peer republish of the slot since the plan is -EAGAIN on
+ * both, and never a value this op adopts from a raw re-read of the slot.
  */
 static
 int ft_node_replace_ptr(struct cds_ft *ft,
@@ -3394,7 +3805,8 @@ int ft_node_replace_ptr(struct cds_ft *ft,
 	type_index = ft_node_type(*parent_node_flag_ptr);
 	type = &ft_types[type_index];
 	ret = _ft_node_replace_ptr(ft, type, node, *parent_node_flag_ptr,
-			metadata, node_flag_ptr, n, newptr, in_place, pub);
+			metadata, node_flag_ptr, node_flag_expected, n, newptr,
+			in_place, pub);
 	if (ret == -EFBIG) {
 		/*
 		 * FOLD (@held_hint): a same-trie rekey folds this delete-recompaction

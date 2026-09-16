@@ -2682,6 +2682,10 @@ int ft_detach_node(struct cds_ft *ft,
 	 */
 	struct cds_ft_inode_flag **entry_holder_slot;
 	struct cds_ft_inode_flag *entry_holder_raw;
+#ifdef FT_DEBUG_DEL_TOMB
+	struct cds_ft_inode_flag **dbg_arg_detach_slot = detach_node_flag_ptr;
+	struct cds_ft_inode_flag **dbg_arg_parent_slot = detach_parent_flag_ptr;
+#endif
 	/*
 	 * Snapshot of the holder slot (@detach_parent_flag_ptr) taken BEFORE
 	 * ft_node_replace_ptr overwrites @iter_node_flag with the fresh
@@ -2907,15 +2911,53 @@ int ft_detach_node(struct cds_ft *ft,
 	 * key I am removing" -- and this is where that premise is checkable.
 	 *
 	 * Nothing is built, locked or reserved yet: re-descend against the
-	 * settled tree.  The invariant holds by construction across an elevation
-	 * below (the new @detach_node_flag_ptr is the slot ft_get_parent_slot
-	 * recovered INSIDE the new @cur), so it is tested once, here.
+	 * settled tree.
+	 *
+	 * ☠ THIS TESTS THE SLOT THE OP READS, NOT THE ONE IT WRITES.  The slot
+	 * an elevation clears -- and a DEL recompaction publishes into -- is
+	 * @detach_parent_flag_ptr, and "it is the slot ft_get_parent_slot
+	 * recovered INSIDE the new @cur" was an assumption: the address was
+	 * derived at an EARLIER instant, and a peer that republishes @cur's
+	 * parent since leaves it pointing into the RETIRED body while @cur's
+	 * word names the fresh copy.  That slot is validated per level inside
+	 * the climb below, against the parent @cur's own word names (MEASURED:
+	 * the elevated clear landed 0x30 past a 32-byte parent, in the
+	 * neighbouring item; and re-resolving the pair at the refusal finds it
+	 * self-coherent EVERY time -- it is a stale plan, not a torn read).
 	 */
 	if (caa_unlikely(!ft_slot_in_node(cur, detach_node_flag_ptr)))
 		return -EAGAIN;
 	/* Plan expected-old for a detach that never elevates (see @plan_old_child). */
 	plan_old_child = (struct cds_ft_inode_flag *)
 		rcu_dereference(*detach_node_flag_ptr);
+	FT_DT_INC(ft_dt_cap0_reach);
+	if (!plan_old_child)
+		FT_DT_INC(ft_dt_cap0_null);
+	/*
+	 * ☠ A NULL PLAN EXPECTED-OLD IS A STALE PLAN, NOT A VALUE.  The slot
+	 * this op came to clear is ALREADY EMPTY: a peer's in-place delete
+	 * landed between the caller's position derivation (ft_locate_chain_head
+	 * / node->prev, both validated against a slot that then held the chain)
+	 * and this capture.  The recompacting tier never produced this state --
+	 * it retired the holder with the delete, so the {C,P,GP} acquire refused
+	 * the tombstone -- and the in-place tier leaves a live holder with a
+	 * NULL hole instead, which is exactly what the equality guard below
+	 * cannot see: it compares the re-read against the plan, and NULL equals
+	 * NULL.  Left through, the plan reaches ft_node_replace_ptr with a NULL
+	 * expected-old (ft_popcount_node_replace_ptr's `*node_flag_ptr != NULL`,
+	 * MEASURED on inv_concurrent_remove_all_nolist: both sides NULL at the
+	 * guard, 1 of ~1000 plans), or -- past min_child -- a DEL recompaction
+	 * that drops a child that is not there and folds -1 a second time.
+	 *
+	 * Nothing is built, locked or reserved yet: re-descend.  The wrapper
+	 * re-seeds through a fresh lookup, which cannot return a chain head
+	 * from an empty slot, so this -EAGAIN clears on the next attempt
+	 * (NOT_FOUND, or a fresh plan against whatever a re-insert put here).
+	 */
+#ifndef FT_DEBUG_NO_NULLPLAN
+	if (caa_unlikely(!plan_old_child))
+		return -EAGAIN;
+#endif
 	/*
 	 * @cur HOLDS the detached child's slot, so it starts a full SPAN above
 	 * it -- one key byte for a bitmap node, the whole run for a compressed
@@ -2964,6 +3006,141 @@ int ft_detach_node(struct cds_ft *ft,
 		is_root = (resolved_parent == NULL);
 		boundary_parent_nf = resolved_parent;	/* always names @cur */
 		/*
+		 * THE PAIR THIS LEVEL WRITES THROUGH MUST BE COHERENT.
+		 *
+		 * @detach_parent_flag_ptr is the slot this plan may CLEAR (an
+		 * elevation) or PUBLISH INTO (a DEL recompaction of @cur).  The
+		 * CALLER derived it from @cur's (parent_word, parent_slot_offset)
+		 * at an earlier instant; by the time this level consumes it, a
+		 * peer may have REPUBLISHED @cur's parent (a recompaction copies
+		 * the parent body and retires the original).  The caller's
+		 * address then points into the RETIRED body while @cur's word
+		 * names the fresh copy -- individually coherent, not a pair.
+		 * ft_resolve_parent_slot cannot see it (its coherence re-read
+		 * only catches a re-home landing on the parent WORD, and that
+		 * word is stable across both loads), and the entry HOLDER
+		 * IDENTITY test cannot either: it checks the slot this op READS
+		 * (@detach_node_flag_ptr inside @cur), not the slot it WRITES.
+		 *
+		 * MEASURED on inv_concurrent_remove_all_nolist, per-node AND
+		 * root-only: the parent word resolved to a 32-byte node while
+		 * the offset read 6 (an order-6 body's), so the elevated clear
+		 * NULLed a word of the NEIGHBOURING item -- which held a live
+		 * external head -- and fused the nr_child-- onto the real parent.
+		 * That parent then carries one non-NULL child its count does not
+		 * cover: every plan built from the count is wrong, every
+		 * validation against the structure fails, and the node WEDGES
+		 * (the memcg-killed legs).
+		 *
+		 * ☞ That signature was FIRST read as a torn two-store re-parent,
+		 * and that reading is REFUTED.  A parent republished between the
+		 * caller's derivation and this use produces the identical
+		 * order-5-word / offset-6 disagreement with no torn read at all,
+		 * and four independent probes agree it is the republish:
+		 * re-resolving the pair AT the refusal finds it self-coherent in
+		 * 100% of why2 hits (28/28 per-node, 119/119 root-only), while
+		 * the three writer-side probes -- an offset store onto a word
+		 * naming a different parent, a parent-word-only re-parent, and a
+		 * plain offset store onto a child that is still REACHABLE
+		 * through its own pair -- all read ZERO on this row.  Nobody
+		 * tears the pair; the plan simply goes stale.  So this block is
+		 * a STALE-PLAN refusal, and no re-parent producer is owed a fix
+		 * on its account.
+		 *
+		 * The witness that is independent of the torn pair is the parent
+		 * @cur's OWN word names, resolved just above: the slot must lie
+		 * INSIDE that parent's body (or be the trie root slot), and what
+		 * it holds must be @cur.  Both are address / identity tests, no
+		 * value this op adopts.  Nothing is built, locked or reserved:
+		 * re-descend, and the retry reads the pair after the re-parent's
+		 * second store has landed.
+		 */
+		{
+			int pair_bad = 0;
+			struct cds_ft_inode_flag *held = NULL, *held_res = NULL;
+
+			if (is_root) {
+				if (caa_unlikely(detach_parent_flag_ptr != &ft->root))
+					pair_bad = 1;
+			} else if (caa_unlikely(!ft_slot_in_node(resolved_parent,
+					detach_parent_flag_ptr))) {
+				pair_bad = 2;
+#ifdef FT_DEBUG_DEL_TOMB
+				/*
+				 * DISCRIMINATOR for why2.  Two different faults
+				 * produce the identical signature "the slot lies
+				 * outside the parent the word names":
+				 *
+				 *  (a) a TORN PAIR -- @cur's own (parent_word,
+				 *      parent_slot_offset) were read one after the
+				 *      other across a two-store re-parent, so the
+				 *      pair NEVER described one real edge; or
+				 *  (b) a STALE PLAN -- the pair is perfectly
+				 *      coherent, but a peer REPUBLISHED the parent
+				 *      since the CALLER derived
+				 *      @detach_parent_flag_ptr, so the caller's
+				 *      address points into the retired body while
+				 *      the word names the fresh copy.
+				 *
+				 * Re-resolving the pair NOW separates them: if the
+				 * fresh slot lands inside the fresh parent, the pair
+				 * is self-coherent and (b) is what happened.  The
+				 * refusal is right either way -- this only says WHICH
+				 * defect the -EAGAIN is absorbing, i.e. whether a
+				 * producer is still owed a fix.
+				 */
+				{
+					struct cds_ft_inode_flag *fresh_parent = NULL;
+					struct cds_ft_inode_flag **fresh_slot =
+						ft_resolve_parent_slot(metadata, ft,
+							&fresh_parent);
+
+					if (fresh_parent && ft_slot_in_node(
+							ft_resolve_flip_proxy(fresh_parent),
+							fresh_slot))
+						FT_DT_INC(ft_dt_pair_fresh_ok);
+					else
+						FT_DT_INC(ft_dt_pair_fresh_bad);
+				}
+#endif
+			} else {
+				held = ft_resolve_flip_proxy(
+					(struct cds_ft_inode_flag *)
+					rcu_dereference(*detach_parent_flag_ptr));
+				/*
+				 * A compressed @cur is named by its parent through
+				 * the SKIP_X form of ITS child (an external head's
+				 * address with the skip bits set), so resolve the
+				 * skip encoding BEFORE asking whether the value is a
+				 * bare external: only a bare one is a foreign word.
+				 */
+				held_res = held ?
+					ft_resolve_skip_compressed(ft, held) : NULL;
+				if (caa_unlikely(!held_res ||
+						ft_node_external(held_res)))
+					pair_bad = 3;
+				else if (caa_unlikely(ft_node_ptr(held_res) !=
+						ft_node_ptr(cur)))
+					pair_bad = 4;
+			}
+			if (caa_unlikely(pair_bad)) {
+#ifdef FT_DEBUG_DEL_TOMB
+				uatomic_inc(&ft_dt_pair_why[pair_bad]);
+				if (uatomic_add_return(&ft_dt_pair_refused, 1) <= 8)
+					fprintf(stderr, "FT DT-PAIR-REFUSE why=%d iter=%d cur=%p cur_meta=%p resolved_parent=%p is_root=%d slot=%p slot_val=%p held=%p held_res=%p entry_slot=%p arg_parent_slot=%p climbed=%d\n",
+						pair_bad, nr_branch, (void *) cur,
+						(void *) metadata, (void *) resolved_parent,
+						(int) is_root, (void *) detach_parent_flag_ptr,
+						(void *) CMM_LOAD_SHARED(*detach_parent_flag_ptr),
+						(void *) held, (void *) held_res,
+						(void *) entry_holder_slot,
+						(void *) dbg_arg_parent_slot, (int) climbed);
+#endif
+				return -EAGAIN;	/* torn plan: re-descend */
+			}
+		}
+		FT_DT_INC(ft_dt_pair_checked);
+		/*
 		 * ONE proxy-resolved snapshot of this ancestor's child count, for
 		 * exactly the same two reasons as @resolved_parent just above --
 		 * and &metadata->state is the SAME kind of parked slot.
@@ -3001,6 +3178,35 @@ int ft_detach_node(struct cds_ft *ft,
 		 */
 		if (caa_unlikely(nr_child == 0))
 			return -EAGAIN;
+		/*
+		 * ☠ AND A RETIRED ANCESTOR VOIDS THE WHOLE PLAN, at EVERY level
+		 * of the climb -- the boundary included, since the stop test
+		 * below runs on this same @cur.
+		 *
+		 * The climb reads every ancestor with NOTHING held, and from
+		 * those reads it decides which slot is cleared, which chain is
+		 * orphaned and where the prune stops.  A peer that RETIRED any
+		 * node on this path has already republished a fresh copy
+		 * elsewhere, so every one of those decisions names a node that
+		 * is no longer in the trie -- and the plan then condemns, frees
+		 * and re-parents around a dead path.  nr_child cannot see it: a
+		 * retired node keeps its body readable (RCU) and its count
+		 * intact; only the TOMBSTONE bit says the node has left.
+		 *
+		 * The recompacting delete never needed this either -- the
+		 * {C,P,GP} acquire refuses PROXY|TOMBSTONE|LOCK outright, so a
+		 * dead ancestor was rejected at the lock.  The in-place tier is
+		 * what removes that acquire from the common path, which is why
+		 * the check has to be stated here instead.
+		 *
+		 * Bail before anything is built, locked or reserved, exactly as
+		 * the nr_child == 0 arm above.
+		 */
+		FT_DT_INC(ft_dt_climb_reach);
+		if (caa_unlikely(ft_meta_tombstone(metadata))) {
+			FT_DT_INC(ft_dt_climb_tomb);
+			return -EAGAIN;
+		}
 		if (!prev_external_nodes_found && (nr_child == 1 && !metadata->external_nodes && !is_root)) {
 			nr_clear++;
 		}
@@ -3240,6 +3446,18 @@ int ft_detach_node(struct cds_ft *ft,
 					entry_holder_raw :
 					(struct cds_ft_inode_flag *)
 						rcu_dereference(*detach_node_flag_ptr);
+				FT_DT_INC(ft_dt_cap1_reach);
+				if (!plan_old_child)
+					FT_DT_INC(ft_dt_cap1_null);
+				/*
+				 * The level just decided to prune is already
+				 * empty: same stale plan as the entry capture,
+				 * same answer (see there).
+				 */
+#ifndef FT_DEBUG_NO_NULLPLAN
+				if (caa_unlikely(!plan_old_child))
+					return -EAGAIN;	/* stale plan: re-descend */
+#endif
 			}
 			/*
 			 * One hop up moves the byte-depth by the PARENT's span,
@@ -3276,6 +3494,35 @@ int ft_detach_node(struct cds_ft *ft,
 			ft_node_flip_proxy(elevated_old_child)))
 		return -EAGAIN;
 	/*
+	 * ☠ AN EMPTY HOLDER SLOT IS A STALE PLAN, NOT A NODE.  The climb
+	 * validated @detach_parent_flag_ptr against its level's @cur (THE PAIR
+	 * THIS LEVEL WRITES THROUGH, above), but that check and this READ are
+	 * two separate instants: the loop exited, and a peer's in-place delete
+	 * can clear the slot in between.  No pair check can close that -- the
+	 * validation cannot be held across the read -- so the empty value has to
+	 * be caught where it is actually observed, exactly as the plan
+	 * expected-old below catches a republished child.
+	 *
+	 * Left through, NULL is not rejected by anything downstream: every
+	 * classifier here asks the node's FLAGS, and ft_node_compressed(NULL) /
+	 * ft_node_skip_compressed(NULL) are both false, so a NULL holder walks
+	 * straight into the internal-node arm and reaches
+	 * cds_ft_item_to_metadata(NULL), which indexes the metadata array of the
+	 * range that would contain address 0 and FAULTS (MEASURED: release
+	 * root-only, inv_concurrent_remove_all_list, SIGSEGV at 0x200010 -- the
+	 * NULL page base plus the range's metadata offset -- with
+	 * iter_node_flag = 0x0 in the frame).  This is the same failure the
+	 * flip-proxy bail above prevents, reached by the other bad value.
+	 *
+	 * Nothing is built, locked or reserved yet: re-descend, exactly as the
+	 * two guards either side of this one do.
+	 */
+	FT_DT_INC(ft_dt_holder_reach);
+	if (caa_unlikely(!iter_node_flag)) {
+		FT_DT_INC(ft_dt_holder_null_refused);
+		return -EAGAIN;	/* holder gone: re-descend */
+	}
+	/*
 	 * PLAN EXPECTED-OLD, enforced (see @plan_old_child): everything below --
 	 * the orphan set walked from @elevated_old_child, the count fold, and the
 	 * drop itself -- names the subtree the climb condemned.  A peer that
@@ -3283,6 +3530,15 @@ int ft_detach_node(struct cds_ft *ft,
 	 * level of the climb ever counted, so the whole plan is void.  Nothing is
 	 * built, locked or reserved yet: re-descend against the settled tree.
 	 */
+	FT_DT_INC(ft_dt_guard_reach);
+	if (!elevated_old_child && !plan_old_child)
+		FT_DT_INC(ft_dt_guard_both_null);
+	if (elevated_old_child != plan_old_child) {
+		if (!elevated_old_child)
+			FT_DT_INC(ft_dt_guard_elev_null_refused);
+		if (!plan_old_child)
+			FT_DT_INC(ft_dt_guard_plan_null_refused);
+	}
 	if (caa_unlikely(elevated_old_child != plan_old_child))
 		return -EAGAIN;
 	/*
@@ -3473,6 +3729,22 @@ int ft_detach_node(struct cds_ft *ft,
 				 * peer's park -- and freeing this node would take the
 				 * key with it.
 				 */
+				/*
+				 * SKEPTIC'S DISCRIMINATOR (probe only, no behaviour
+				 * change): the FIRST orphan is exempted from the
+				 * nr_child > 1 test, and its IDENTITY is never
+				 * compared with the node the climb condemned
+				 * (@elevated_old_child is RE-READ after the climb).
+				 * Count both, on the oracle that loses keys.
+				 */
+				if (phase2_first) {
+					FT_DT_INC(ft_dt_walk_reach);
+					if (nr_child > 1)
+						FT_DT_INC(ft_dt_walk_first_multi);
+					if (nr_branch >= 2 && ometa !=
+							metadata_stack[nr_branch - 2])
+						FT_DT_INC(ft_dt_walk_first_ident);
+				}
 				if ((!phase2_first && (nr_child > 1 || ext_nodes)) ||
 				    (phase2_first && ext_nodes &&
 					    ext_nodes != topmost_external_nodes)) {
@@ -3854,7 +4126,43 @@ int ft_detach_node(struct cds_ft *ft,
 					 */
 					struct cds_ft_compressed_node *cn =
 						ft_skip_to_compressed(ft, walk_nf);
-					/* Skip-target: structurally single-child. */
+					/*
+					 * ☠ THE ONE-HOP RESOLVE IS NOT MW-SAFE, and
+					 * "structurally single-child" was an ASSUMPTION about
+					 * the node this plan MEANS, never a fact about the
+					 * node it just GOT.  ft_skip_to_compressed follows the
+					 * skip child's parent back-pointer, and its own header
+					 * says callers "get whatever the back-pointer
+					 * currently says": a concurrent split re-parents that
+					 * child onto the junction it is publishing, so this
+					 * recovers the PEER'S FRESH JUNCTION instead of the
+					 * elided skip-target.
+					 *
+					 * Queueing it puts a LIVE node into the orphan set,
+					 * which TOMBSTONES it -- killing every key beneath it
+					 * -- and then frees it as a compressed node.  MEASURED
+					 * on inv_sibling_split_compress_unpinned: the collect
+					 * lands 1.7 us AFTER the peer's publish_to_parent,
+					 * the freeze and the free follow, the parent slot is
+					 * never republished, and the key is gone for good.
+					 * ☠ Guarding the FREE does not help -- two predicates
+					 * were measured and both left the oracle red, because
+					 * the TOMBSTONE has already killed the key.
+					 *
+					 * A compressed node holds EXACTLY ONE child, so a
+					 * resolved target whose count says otherwise is not
+					 * the node this plan is about.  This is the trailing
+					 * skip-target's own rule (the guard above, added on
+					 * the same measured key loss) applied at the one site
+					 * that resolves the same way and never checked it.
+					 * Bail to the op's re-descend.
+					 */
+					if (ft_meta_nr_child_load(
+							cds_ft_item_to_metadata(
+							(struct cds_ft_inode *) cn)) != 1) {
+						ret = -EAGAIN;
+						goto end;
+					}
 					wlctx.held.txn = lctx.held.txn;
 					wlctx.held.nr_extra =
 						(unsigned int) nr_orphan_locked;
@@ -4772,6 +5080,47 @@ int ft_detach_node(struct cds_ft *ft,
 				 */
 				if (commit_txn)
 					ft_flip_txn_arm_per_op(ft, commit_txn);
+#ifdef FT_DEBUG_DEL_TOMB
+				/*
+				 * PROBE: name the two derivations when the slot this
+				 * delete clears is not inside the node whose count it
+				 * decrements.
+				 */
+				if (pub->state_meta) {
+					char *sn = (char *) cds_ft_metadata_to_item(
+						pub->state_meta);
+					char *sl = (char *) pub->slot;
+					static unsigned long ft_dt_split_ctx;
+
+					if ((sl < sn || sl >= sn + ((size_t) 1 <<
+							cds_ft_item_order(sn))) &&
+							uatomic_add_return(&ft_dt_split_ctx, 1) <= 8) {
+						unsigned int di;
+
+						fprintf(stderr, "FT DEL-SPLIT-CTX slot=%p state_node=%p nr_branch=%d nr_clear=%d nr_metadata=%d climbed=%d climb_promoted=%d entry_holder_slot=%p entry_holder_raw=%p entry_slot_now=%p holder_old_flag=%p detach_node_flag_ptr=%p detach_parent_flag_ptr=%p iter_node_flag=%p elevated_old_child=%p plan_old_child=%p topmost_ext=%p arg_detach_slot=%p arg_parent_slot=%p\n",
+							(void *) pub->slot, (void *) sn,
+							nr_branch, nr_clear, nr_metadata,
+							(int) climbed, (int) climb_promoted,
+							(void *) entry_holder_slot,
+							(void *) entry_holder_raw,
+							(void *) CMM_LOAD_SHARED(*entry_holder_slot),
+							(void *) holder_old_flag,
+							(void *) detach_node_flag_ptr,
+							(void *) detach_parent_flag_ptr,
+							(void *) iter_node_flag,
+							(void *) elevated_old_child,
+							(void *) plan_old_child,
+							(void *) topmost_external_nodes,
+							(void *) dbg_arg_detach_slot,
+							(void *) dbg_arg_parent_slot);
+						for (di = 0; di < nr_metadata; di++)
+							fprintf(stderr, "FT DEL-SPLIT-CTX   metadata_stack[%u]=%p item=%p state=%#lx\n",
+								di, (void *) metadata_stack[di],
+								cds_ft_metadata_to_item(metadata_stack[di]),
+								(unsigned long) CMM_LOAD_SHARED(metadata_stack[di]->state));
+					}
+				}
+#endif
 				ret = ft_remove_one_commit(ft, pub->slot,
 					pub->slot_owner,
 					pub->old_val, pub->new_val,
@@ -7298,9 +7647,8 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 				1 /* @node is this key's SOLE entry */,
 				-1 /* leaf key removed: detach owns the -1 */,
 				NULL, false, NULL, NULL,
-				/* ☐ in-place DELETE: the exclusive tier until its own
-				 * validation step (ft_in_place_excl_ok's header). */
-				ft_in_place_excl_ok(ft));
+				/* EXPERIMENT: delete tier open, for the trace. */
+				ft_in_place_ok(ft));
 			/* @node's freeze rode the detach commit (freeze_leaf). */
 		} else {
 			/*
@@ -7539,9 +7887,8 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 				1 /* @node is this key's SOLE entry */,
 				-1 /* leaf key removed: detach owns the -1 */,
 				NULL, false, NULL, NULL,
-				/* ☐ in-place DELETE: the exclusive tier until its own
-				 * validation step (ft_in_place_excl_ok's header). */
-				ft_in_place_excl_ok(ft));
+				/* EXPERIMENT: delete tier open, for the trace. */
+				ft_in_place_ok(ft));
 			/* @node's freeze rode the detach commit (freeze_leaf). */
 		} else {
 			/* Removing the head, duplicates remain: key count unchanged. */
@@ -8563,9 +8910,8 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 			chain_head, nr_frozen,
 			-1 /* leaf key removed: detach owns the -1 */,
 			NULL, false, NULL, NULL,
-			/* ☐ in-place DELETE: the exclusive tier until its own
-			 * validation step (ft_in_place_excl_ok's header). */
-			ft_in_place_excl_ok(ft));
+			/* EXPERIMENT: delete tier open, for the trace. */
+			ft_in_place_ok(ft));
 		ft_removeall_fault_scope_exit();
 	}
 

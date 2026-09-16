@@ -1755,11 +1755,24 @@ unsigned int ft_meta_parent_slot_offset(const struct cds_ft_metadata *meta)
  * re-root).  Skip the store when the offset is unchanged -- the in-place
  * reserve's same-value republish is the hot case.
  */
+#ifdef FT_DEBUG_DEL_TOMB
+/*
+ * PROBE: score the rule this setter's header states -- a LIVE, reader-reachable
+ * child must not come through here.  Defined next to ft_slot_in_node in
+ * ft-helpers.h, which is where the predicates it needs live.
+ */
+static inline
+void ft_dt_pso_store_probe(const struct cds_ft_metadata *meta, unsigned int off);
+#endif
+
 static inline
 void ft_meta_parent_slot_offset_set(struct cds_ft_metadata *meta, unsigned int off)
 {
 	uintptr_t n = FT_PSO_ENCODE(off);
 
+#ifdef FT_DEBUG_DEL_TOMB
+	ft_dt_pso_store_probe(meta, off);
+#endif
 	for (;;) {
 		uintptr_t s = CMM_LOAD_SHARED(meta->parent_slot_offset);
 

@@ -7225,7 +7225,7 @@ static uint64_t sibp_key(uint8_t b0, uint8_t b1, uint8_t b2, uint8_t b3)
 
 /* Remove the node @n stored at key @v, by IDENTITY. */
 static enum cds_ft_status sibp_remove(struct cds_ft *ft, uint64_t v,
-		struct ft_test_node *n)
+		struct ft_test_node *n, int *not_found)
 {
 	struct cds_ft_iter *iter = NULL;
 	enum cds_ft_status st = CDS_FT_STATUS_NOT_FOUND;
@@ -7241,6 +7241,14 @@ static enum cds_ft_status sibp_remove(struct cds_ft *ft, uint64_t v,
 		st = cds_ft_remove(ft, iter, &n->node);
 		if (st == CDS_FT_STATUS_OK)
 			node_free_rcu(n);
+	} else if (not_found) {
+		/*
+		 * The key is not findable AT ALL.  Distinct from a remove that
+		 * merely loses a race: this thread is the SOLE writer of @v and
+		 * it confirmed @v readable after publishing it, so no peer is
+		 * entitled to have taken it out.
+		 */
+		*not_found = 1;
 	}
 	rcu_read_unlock();
 	cds_ft_iter_destroy(iter);
@@ -7254,12 +7262,18 @@ struct sibp_arg {
 	struct ft_test_node *inflight;	/* published, not yet taken back */
 	int failed;
 	int *stop_all;
+	/*
+	 * FT_INV_SIBP_LOSS_ABORT: consecutive not-findable take-backs that trip
+	 * the flight-recorder snapshot.  0 disables it (the default).
+	 */
+	unsigned long loss_abort;
 };
 
 static void *sibp_writer(void *arg)
 {
 	struct sibp_arg *w = (struct sibp_arg *) arg;
 	unsigned long iters = 0;
+	unsigned long miss_streak = 0;
 
 	rcu_register_thread();
 	while (!test_go)
@@ -7301,11 +7315,49 @@ static void *sibp_writer(void *arg)
 		w->inflight = n;	/* the run owes this node a reclaim */
 		rcu_read_unlock();
 
-		for (a = 0; a < SIBP_TAKEBACK_TRIES && !test_stop; a++)
-			if (sibp_remove(w->ft, w->key, n) == CDS_FT_STATUS_OK) {
+		for (a = 0; a < SIBP_TAKEBACK_TRIES && !test_stop; a++) {
+			int gone = 0;
+
+			if (sibp_remove(w->ft, w->key, n, &gone) ==
+					CDS_FT_STATUS_OK) {
 				w->inflight = NULL;
 				break;
 			}
+			/*
+			 * ☞ ABORT AT THE MOMENT OF LOSS, not 100000 tries later.
+			 * The ORPHAN report below fires so long after the key
+			 * went missing that the snapshot ring has already
+			 * evicted the write that did it.  Armed with
+			 * FT_INV_SIBP_LOSS_ABORT=N, the N'th CONSECUTIVE
+			 * not-findable take-back snapshots and aborts, so the
+			 * LAST events in the ring are the ones that repointed
+			 * the slot.  Unarmed (0, the default) this is inert and
+			 * the oracle behaves exactly as before.
+			 */
+			if (!gone) {
+				miss_streak = 0;
+				continue;
+			}
+			if (w->loss_abort && ++miss_streak >= w->loss_abort) {
+				char msg[192];
+
+				snprintf(msg, sizeof(msg),
+					"sibp LOST key=%#lx leaf=%p after %lu ops, "
+					"%lu busy, miss_streak=%lu",
+					(unsigned long) w->key,
+					(void *) &n->node, w->ops, w->busy,
+					miss_streak);
+				fprintf(stderr, "%s\n", msg);
+				FT_TEST_TP(inv_violation,
+					"inv_sibling_split_compress_unpinned",
+					msg);
+				w->lost++;
+				w->failed = 1;
+				*w->stop_all = 1;
+				mw_violation_snapshot();
+				goto out;
+			}
+		}
 		if (w->inflight) {
 			struct cds_ft_node *f = NULL;
 
@@ -8074,6 +8126,7 @@ static int sibling_split_compress_body(const char *name, bool pin_prefix)
 	uint64_t seed[SIBP_NW * 3];	/* the static keys, for the checked drain */
 	int i, ret = 0, stop_all = 0;
 	int nstatic = pin_prefix ? 3 : 2;
+	unsigned long sibp_loss_abort;
 
 	mw_install_fatal_handler();
 	leak_reset();
@@ -8084,6 +8137,11 @@ static int sibling_split_compress_body(const char *name, bool pin_prefix)
 	w = (struct sibp_arg *) calloc(SIBP_NW * 2, sizeof(*w));
 	if (!w)
 		abort();
+	{
+		const char *e = getenv("FT_INV_SIBP_LOSS_ABORT");
+
+		sibp_loss_abort = e ? strtoul(e, NULL, 0) : 0;
+	}
 	rcu_read_lock();
 	for (i = 0; i < SIBP_NW; i++) {
 		uint8_t p = (uint8_t) (0x30 + i), m = (uint8_t) (0x10 + i);
@@ -8109,6 +8167,7 @@ static int sibling_split_compress_body(const char *name, bool pin_prefix)
 		w[2 * i].stop_all = w[2 * i + 1].stop_all = &stop_all;
 		w[2 * i].key = sibp_key(p, 3, m, 0x00);
 		w[2 * i + 1].key = sibp_key(p, 3, m, 0x60);
+		w[2 * i].loss_abort = w[2 * i + 1].loss_abort = sibp_loss_abort;
 	}
 	rcu_read_unlock();
 
@@ -8149,7 +8208,8 @@ static int sibling_split_compress_body(const char *name, bool pin_prefix)
 		 * load, reported as a LEAK delta with the trie itself exact
 		 * (0 lost, entries == live).
 		 */
-		if (sibp_remove(ft, w[i].key, w[i].inflight) != CDS_FT_STATUS_OK) {
+		if (sibp_remove(ft, w[i].key, w[i].inflight, NULL) !=
+				CDS_FT_STATUS_OK) {
 			node_free(w[i].inflight);
 		}
 		w[i].inflight = NULL;

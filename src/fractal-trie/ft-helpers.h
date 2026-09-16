@@ -1,3 +1,6 @@
+#ifdef FT_DEBUG_DEL_TOMB
+#include <execinfo.h>
+#endif
 // SPDX-FileCopyrightText: 2012-2026 Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
 //
 // SPDX-License-Identifier: LGPL-2.1-only
@@ -272,10 +275,26 @@ bool ft_node_is_removed(const struct cds_ft_node *node)
 /*
  * Iterate through duplicates returned by cds_ft_lookup*()
  * Receives a struct cds_ft_node * as parameter, which is used as start
- * of duplicate list and loop cursor.  Masks the removal tombstone.
+ * of duplicate list and loop cursor.
+ *
+ * ☠ RESOLVES THE ENGINE PROXY, and must: bit 0 of cds_ft_node.next is the
+ * transactional engine's in-band proxy tag, parked while a concurrent commit is
+ * in flight on this chain -- exactly what CDS_FT_NODE_TXN_PROXY_TAG's own header
+ * describes.  ft_node_next() masks ONLY the removal tombstone (bit 1), so a walk
+ * built on it hands the raw PROXY back as if it were a successor and the next
+ * hop dereferences a DESCRIPTOR as a node.  MEASURED: inv_concurrent_same_key
+ * _removes SEGVs 5/5 in _cds_ft_insert's "find last duplicate" walk, faulting on
+ * a value read out of a descriptor rather than a chain (1 << 57, no node there),
+ * the moment the in-place delete tier makes such a commit overlap the walk.
+ *
+ * cds_ft_node_next_rcu() is the accessor that answers this correctly -- it
+ * resolves a parked proxy to the committed successor and then strips the
+ * tombstone -- and it is what the PUBLIC cds_ft_for_each_duplicate_rcu() has
+ * always used.  ft_node_next() stays for the single-hop liveness tests, where
+ * the question is about THIS node's own word rather than a successor to follow.
  */
 #define cds_ft_for_each_duplicate(pos)				\
-       for (; (pos) != NULL; (pos) = ft_node_next(pos))
+       for (; (pos) != NULL; (pos) = cds_ft_node_next_rcu(pos))
 
 enum ft_recompact {
 	FT_RECOMPACT_ADD_SAME,
@@ -2553,6 +2572,33 @@ void ft_set_parent_slot(struct cds_ft_metadata *meta,
 		ft_meta_parent_slot_offset_set(meta, 0);
 		return;
 	}
+#ifdef FT_DEBUG_DEL_TOMB
+	/*
+	 * PROBE: a RAW offset store onto a node whose parent word already
+	 * names a DIFFERENT real parent is a re-parent that publishes its
+	 * (parent, offset) pair in two separate stores -- the torn-pair
+	 * producer.  Name the site.
+	 */
+	{
+		struct cds_ft_inode_flag *oldp = ft_parent_node(
+			(struct cds_ft_inode_flag *) CMM_LOAD_SHARED(meta->parent_word));
+		static unsigned long ft_dt_raw_reparent;
+
+		if (oldp && !ft_node_flip_proxy(oldp) &&
+				ft_node_ptr(oldp) != ft_node_ptr(parent) &&
+				uatomic_add_return(&ft_dt_raw_reparent, 1) <= 12) {
+			void *bt[20];
+			int nbt = backtrace(bt, 20);
+
+			fprintf(stderr, "FT RAW-REPARENT-OFFSET meta=%p old_parent=%p new_parent=%p old_off=%u new_off=%u state=%#lx\n",
+				(void *) meta, (void *) oldp, (void *) parent,
+				(unsigned int) FT_PSO_DECODE(CMM_LOAD_SHARED(meta->parent_slot_offset)),
+				(unsigned int) (((char *) slot - (char *) ft_node_ptr(parent)) / sizeof(void *)),
+				(unsigned long) CMM_LOAD_SHARED(meta->state));
+			backtrace_symbols_fd(bt, nbt, 2);
+		}
+	}
+#endif
 	ft_meta_parent_slot_offset_set(meta, (unsigned int)((char *) slot -
 		(char *) ft_node_ptr(parent)) / sizeof(void *));
 	/*
@@ -2792,6 +2838,73 @@ bool ft_slot_in_node(struct cds_ft_inode_flag *node_flag,
 		(const char *) slot < body +
 			((size_t) 1 << ft_types[ft_node_type(node_flag)].order);
 }
+
+#ifdef FT_DEBUG_DEL_TOMB
+/*
+ * ft_dt_pso_store_probe: score the rule ft_meta_parent_slot_offset_set's own
+ * header states -- the (parent_word, parent_slot_offset) PAIR may be rewritten
+ * by PLAIN stores only while the child is still INVISIBLE (a fresh recompaction
+ * copy nobody can reach yet).  A live, reader-reachable child re-homes through
+ * ft_reparent_record_meta, which co-commits both words in one flip, precisely so
+ * no reader can observe half of the pair.
+ *
+ * The discriminator is the child's OWN reachability, and it needs no clock: a
+ * fresh copy inherits the pair of the node it REPLACES, so the slot that pair
+ * names still holds the OLD node; a live child's pair names a slot holding
+ * ITSELF.  "The slot already holds me" therefore means "a reader can reach me
+ * through this very pair" -- and rewriting it here, one plain store at a time,
+ * is the window in which that reader sees a parent from before and an offset
+ * from after.
+ *
+ * Silent (returns) whenever the question cannot be asked cleanly: no parent yet,
+ * a re-home already parked on either word, a root child (whose offset is unused),
+ * a same-value republish (the in-place reserve's hot case -- it changes nothing),
+ * or a pair that is ALREADY incoherent (a different probe's business).  So a hit
+ * is a positive answer, never an artefact of the reading.
+ */
+static inline
+void ft_dt_pso_store_probe(const struct cds_ft_metadata *meta, unsigned int off)
+{
+	static unsigned long ft_dt_pso_live;
+	struct cds_ft_inode_flag *praw, *parent, *val;
+	struct cds_ft_inode_flag **slot;
+	uintptr_t cur;
+	void *self;
+	void *bt[24];
+	int nbt;
+
+	praw = (struct cds_ft_inode_flag *) CMM_LOAD_SHARED(meta->parent_word);
+	if (!praw || ft_node_flip_proxy(praw))
+		return;
+	if (ft_parent_is_root_position(praw))
+		return;
+	parent = ft_parent_node(praw);
+	if (!parent)
+		return;
+	cur = CMM_LOAD_SHARED(meta->parent_slot_offset);
+	if (cur & FT_STATE_PROXY)
+		return;
+	if (FT_PSO_DECODE(cur) == (uintptr_t) off)
+		return;			/* same-value republish: the pair does not move */
+	slot = (struct cds_ft_inode_flag **) ((char *) ft_node_ptr(parent) +
+			FT_PSO_DECODE(cur) * sizeof(void *));
+	if (!ft_slot_in_node(parent, slot))
+		return;			/* already torn: not this probe's question */
+	val = (struct cds_ft_inode_flag *) CMM_LOAD_SHARED(*slot);
+	if (!val || ft_node_flip_proxy(val))
+		return;
+	self = cds_ft_metadata_to_item((struct cds_ft_metadata *) meta);
+	if (ft_node_ptr(ft_skip_child_ptr(val)) != self)
+		return;			/* the slot holds someone else: @meta is invisible */
+	if (uatomic_add_return(&ft_dt_pso_live, 1) > 12)
+		return;
+	nbt = backtrace(bt, 24);
+	fprintf(stderr, "FT PSO-LIVE-REPARENT meta=%p self=%p parent=%p slot=%p old_off=%u new_off=%u\n",
+		(void *) meta, self, (void *) parent, (void *) slot,
+		(unsigned int) FT_PSO_DECODE(cur), off);
+	backtrace_symbols_fd(bt, nbt, 2);
+}
+#endif
 
 
 #ifdef FT_ENABLE_TRACING
@@ -4128,6 +4241,17 @@ struct cds_ft_inode *alloc_cds_ft_node(struct cds_ft *ft,
 	}
 	p = cds_ft_metadata_to_item(metadata);
 	FT_TP(item_alloc, (const void *) p, 0, ft_type->order);
+#ifdef FT_DEBUG_DEL_TOMB
+	{
+		static unsigned long ft_dt_alloc_stale;
+
+		if (CMM_LOAD_SHARED(metadata->state) != 0 &&
+				uatomic_add_return(&ft_dt_alloc_stale, 1) <= 20)
+			fprintf(stderr, "FT DT-ALLOC-STALE node=%p meta=%p state=%#lx\n",
+				p, (void *) metadata,
+				(unsigned long) CMM_LOAD_SHARED(metadata->state));
+	}
+#endif
 	/*
 	 * Popcount node data[] starts with a presence bitmap, followed
 	 * by the pointer table.  The allocator returns zeroed memory,
@@ -4177,7 +4301,27 @@ void free_cds_ft_node(struct cds_ft *ft, struct cds_ft_inode *node)
 static
 void free_cds_ft_node_unpublished(struct cds_ft *ft, struct cds_ft_inode *node)
 {
-	struct cds_ft_metadata *metadata = cds_ft_item_to_metadata(node);
+	struct cds_ft_metadata *metadata;
+
+	/*
+	 * ☠ FREEING NOTHING IS NOT FREEING ADDRESS ZERO.  The counter update
+	 * below already guards on @node, so this function was always meant to
+	 * tolerate a NULL -- but the metadata derivation ran first and
+	 * unconditionally, and cds_ft_item_to_metadata(NULL) does not fault on
+	 * the pointer: it indexes the metadata array of the range that WOULD
+	 * contain address 0 and reads 0x200010.
+	 *
+	 * ft_node_recompact's @abandon_fresh unwind reaches here with
+	 * @new_node == NULL whenever the attempt was sized to NODE_INDEX_NULL
+	 * (a DEL whose post-lock re-read leaves the copy no children) and then
+	 * bailed -- the two plan checks in the DEL block bail to it, and so does
+	 * the NODE_INDEX_NULL refusal beside them.  MEASURED: 8 SIGSEGVs in 200
+	 * short runs of inv_concurrent_remove_all_nolist, all at
+	 * cds_ft_item_to_metadata(p=0x0) from this call.
+	 */
+	if (!node)
+		return;
+	metadata = cds_ft_item_to_metadata(node);
 
 	FT_TP(item_free, (const void *) node, 2);
 	cds_ft_free_item_unpublished(ft, metadata);
