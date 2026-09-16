@@ -3247,6 +3247,14 @@ static inline bool ft_lock_ctx_holds(const struct ft_lock_ctx *ctx,
 /* 0 = txn registry, 1 = extras, 2 = glue, 3 = an outer frame. */
 static int ft_ch_ctx_source(const struct ft_lock_ctx *ctx,
 		const struct cds_ft_metadata *meta);
+/*
+ * WHY an UNHELD verdict: 0 = the ctx carries no extras at all, 1 = @meta IS
+ * among them but marked SHARED (ft_held_set_snap deliberately skips those, so
+ * the hold is INVISIBLE, not missing), 2 = extras populated and @meta genuinely
+ * absent -- the only one owed anything.  Defined where ft_lock_ctx is complete.
+ */
+static int ft_ch_unheld_cause(const struct ft_lock_ctx *ctx,
+		const struct cds_ft_metadata *meta);
 
 /*
  * ☠ RAISED FROM 48, AND THE OVERFLOW IS NOW LOUD.  ft_ch_site_of returns NULL
@@ -3291,7 +3299,20 @@ struct ft_ch_site {
 		 * LOCKED is put through the witness ladder, and hw_locked_viol
 		 * is the code saying it holds the owner where it does not.
 		 */
-		hw_hidden, hw_mw, hw_locked_ok, hw_locked_viol;
+		hw_hidden, hw_mw, hw_locked_ok, hw_locked_viol,
+		/*
+		 * WHY the UNHELD verdict, split so it cannot be read as one
+		 * population.  This class has twice produced a false UNHELD from
+		 * a hold the walker could not see, and the prescribed acquire
+		 * would have LIVELOCKED, so the split is the precondition for
+		 * touching anything: @un_noextra the ctx carries no extras at
+		 * all; @un_shared the owner IS among the extras but marked
+		 * SHARED, which ft_held_set_snap deliberately skips -- an
+		 * INVISIBLE HOLD, not an exclusion gap; @un_absent the extras
+		 * are populated and the owner is genuinely not among them, the
+		 * only bucket that is owed anything.
+		 */
+		un_noextra, un_shared, un_absent;
 };
 
 extern struct ft_ch_site ft_ch_sites[FT_CH_SITE_MAX];
@@ -3632,6 +3653,11 @@ void ft_ch_audit_owner_at(const char *fn, int line, const struct cds_ft *ft,
 		}
 	}
 	s->unheld++;
+	switch (ft_ch_unheld_cause(ctx, hm)) {	/* see the struct */
+	case 0: s->un_noextra++; break;
+	case 1: s->un_shared++; break;
+	default: s->un_absent++; break;
+	}
 	if (!ft_hold_trace_count())
 		s->nolocks++;	/* strictly worse: holds nothing whatsoever */
 }
@@ -3914,6 +3940,10 @@ static void ft_ch_audit_report(void)
 		if (s->wlock)
 			fprintf(stderr, "%-34s %6s   WLOCK breakdown: also-per-node=%lu  BARE(only the FT-wide hold)=%lu\n",
 				nm, "", s->wlock_pernode, s->wlock_bare);
+		if (s->unheld)
+			fprintf(stderr, "%-34s %6s   UNHELD breakdown: no_extras=%lu SHARED_extra(invisible hold)=%lu absent(real gap)=%lu\n",
+				nm, "", s->un_noextra, s->un_shared,
+				s->un_absent);
 		if (s->ctxheld)
 			fprintf(stderr, "%-34s %6s   HELD(ctx) breakdown: txn=%lu extra=%lu glue=%lu outer=%lu\n",
 				nm, "", s->ctx_txn, s->ctx_extra, s->ctx_glue,
@@ -4579,6 +4609,19 @@ bool ft_lock_ctx_holds(const struct ft_lock_ctx *ctx,
  * the one that function actually returned on.
  */
 static
+int ft_ch_unheld_cause(const struct ft_lock_ctx *ctx,
+		const struct cds_ft_metadata *meta)
+{
+	unsigned int i, nx = ctx ? ctx->held.nr_extra : 0;
+
+	if (!nx)
+		return 0;
+	for (i = 0; i < nx; i++)
+		if (ctx->held.extra[i].lock == meta)
+			return ctx->held.extra[i].shared ? 1 : 2;
+	return 2;
+}
+
 int ft_ch_ctx_source(const struct ft_lock_ctx *ctx,
 		const struct cds_ft_metadata *meta)
 {
