@@ -1293,7 +1293,7 @@ struct ft_pub_rec {
  *   internal body child slot      the node it is in   SW armed   MW by constr.
  *   cds_ft_compressed_node.child  that cn             SW armed   MW by constr.
  *   cds_ft.root                   NONE (no node)      MW         MW   [DESIGN]
- *   SKIP_X dual (GP body word)    the GRANDparent     MW  (1)    MW   [debt]
+ *   SKIP_X dual (GP body word)    the GRANDparent     SW armed   MW by constr. (1)
  *   cds_ft_metadata.external_nodes the node it is in  SW armed   MW by constr.
  *   metadata.state  LOCK take     node / its anchor   MW         MW   [DESIGN]
  *   metadata.state  tombstone     ditto               SW armed   MW by constr.
@@ -1336,6 +1336,29 @@ struct ft_pub_rec {
  *     the miss rather than emit a record they cannot vouch for, so the kind is
  *     decided where the record is made and not by whether some later commit
  *     discards it.  @root keeps MW by design.
+ *
+ *     ☑ SO THIS ROW IS OFF [debt], MEASURED TWO WAYS, per-node AND exponential:
+ *     (a) -DFT_DEBUG_DUAL_SITE, at the dual's OWN recorder -- named_unheld = 0
+ *     AND unnamed = 0 for EVERY producer; (b) -DFT_DEBUG_TXN_KIND, the G4
+ *     surface -- DUAL, DUAL_ROOT and DUAL_NAMED (the last being "a producer
+ *     that could vouch if it acquired") all read ZERO, so no dual record lands
+ *     in MW_ALWAYS at all.
+ *     ☞ "SW armed" here means what it means in the rows above: SW once the txn
+ *     armed per-op, MW_STRUCT when it did not.  The measurement says the dual
+ *     is no longer MW BY CLASS; it does not claim every record is SW.
+ *
+ *     ☐ DO NOT READ `DUAL_UNNAMED` (~401k per leg) AS THIS ROW'S RESIDUE.  It
+ *     counts a STRUCTURAL edge (FT_FLIP_PROXY_TAG) whose producer named no
+ *     owner, and a dual is never one: every dual is recorded through
+ *     ft_pub_rec_add_at, which reports unnamed = 0 in the SAME RUN.  Those
+ *     edges reach the recorder through the ordered-cell lanes carrying a NULL
+ *     owner, so the bucket names them after a row they do not belong to -- the
+ *     tag-dispatch trap this file already warns about ("a word class is named
+ *     by its PRODUCER SITE, not by a tag bit").  Attributing them wants a
+ *     per-site split keyed on @t->dbg_site.
+ *     ☠ NOT a backtrace at the classification: backtrace_symbols_fd takes the
+ *     loader lock, and from 207 threads inside the commit loop it WEDGED the
+ *     leg -- 0 of 152 tests in 1800 s.
  * (2) ☑ WAS FT-SLOT-1 (fixed), not a conversion question: ft_state_edge leaves .tag 0
  *     and ft_edge_tag defaults an untagged edge to FT_FLIP_PROXY_TAG (0xF),
  *     so the remove's fused nr_child-- parks a 0xF-tagged proxy on a word
