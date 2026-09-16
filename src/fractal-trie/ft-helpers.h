@@ -202,43 +202,11 @@ void static_array_size_check(void)
  * (ft_attach_node's slot_ptr, 303 failures in 480 saturated runs) or, worse,
  * tears a publish quietly.
  */
-/*
- * ★ FORCE RECOMPACT WHILE A MOVE IS IN FLIGHT -- the prerequisite for widening
- * this predicate at all (doc/design/ft-reintroduce-in-place-mutations.md §3/§4).
- *
- * The REKEY's reader-side coherence check (ft_lookup_two_descents) compares a
- * fold of the node ADDRESSES a descent visits, and its soundness rests on COW:
- * "a move COWs its stitch points, so a moved subtree's junction and top get
- * FRESH addresses".  What guarantees the perturbation on the graft arm is that
- * the destination attach parent GAINS AN OCCUPANCY and therefore RELOCATES.  An
- * in-place occupancy gain publishes no fresh address, so a torn descent would
- * become indistinguishable from a clean one -- ft-mutation-node.h names THIS
- * predicate as the change that must not land before the coherence stops
- * free-riding on recompaction.
- *
- * ☞ SO USE THE GATE THE READER ALREADY USES.  @move_active is the same word
- * ft_lookup_two_descents consults to decide whether the witness matters, so
- * reading it here makes the writer stop doing the thing that defeats the
- * witness EXACTLY while a reader is relying on it -- one flag, both sides, and
- * no per-op plumbing to keep in sync.
- *
- * ☠ AND THE EXISTING DRAIN IS WHAT MAKES IT SOUND, not the load's timing: a
- * mover "sets @move_active, then waits a GP, and only THEN mutates the
- * structure" (struct cds_ft::move_active), so a writer that sampled the gate
- * CLEAR has finished its in-place store before the move touches anything, and
- * the move's own occupancy gains necessarily observe the gate SET.
- *
- * Conservative by construction: it also refuses in-place to ops unrelated to
- * the move for the width of the window.  That is a cost, not a correctness
- * question, and moves are rare; a narrower per-op flag would have to cover
- * every occupancy gain on the reader's path anyway.
- */
 static inline
 bool ft_in_place_ok(const struct cds_ft *ft)
 {
 #ifdef FEATURE_FT_INSERT_IN_PLACE
-	return ft && ft->exclusive &&
-		CMM_LOAD_SHARED(ft->move_active) == 0;
+	return ft && ft->exclusive;
 #else
 	(void) ft;
 	return false;

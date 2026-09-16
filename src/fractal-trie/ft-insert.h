@@ -1996,8 +1996,6 @@ int ft_attach_node(struct cds_ft *ft,
 	struct cds_ft_inode_flag *iter_node_flag, *iter_dest_node_flag,
 				*created_nodes[FT_MAX_DEPTH];
 	struct cds_ft_inode *old_recompacted_node = NULL;
-	/* Nested held-set frame for the reserve; see its use below. */
-	struct ft_lock_ctx rctx;
 	int ret, i, nr_created_nodes = 0;
 	const uint8_t *iter_key = key + key_len;
 
@@ -2167,103 +2165,6 @@ int ft_attach_node(struct cds_ft *ft,
 		 * here -- the reserved-byte publish below is unconditional.
 		 */
 		assert(ic && ic->txn);
-		/*
-		 * ★ MAKE THE OP'S HELD SET VISIBLE TO THE RESERVE.  @ctx was
-		 * built by the caller with ft_lock_ctx_init(&actx, &d, ic.txn,
-		 * ...) BEFORE ft_insert_commit_arm created the txn above, so
-		 * @ctx->held.txn is NULL and the commit's registry is invisible
-		 * through it.  The reserve below hands that same @ctx to
-		 * ft_node_recompact, whose lock-set acquire dedupes via
-		 * ft_lock_ctx_holds -- so any word THIS op has already
-		 * registered reads as "held by someone else", ft_dlm_lock
-		 * refuses it, and the op spends an -EAGAIN refusing its OWN
-		 * lock.  Nothing registers before the reserve today, which is
-		 * the only reason that is currently invisible; it is the
-		 * precondition every acquire hoist here has died on
-		 * (@70a1e20f).
-		 *
-		 * Chain a nested frame instead of mutating @ctx (it is const,
-		 * and the caller's frame is still live): @held.outer is exactly
-		 * the documented "CALLER's held set, when this one belongs to a
-		 * nested step of the same op", and ft_held_set_snap /
-		 * ft_dlm_acquire_set already walk it.  So the reserve sees the
-		 * commit registry AND everything the caller held.
-		 *
-		 * No behaviour change on its own: @ic->txn carries no locks at
-		 * this point, so the widened set answers identically -- it makes
-		 * the FUTURE registration visible, which is the whole point.
-		 */
-		ft_lock_ctx_init(&rctx, ft_lock_ctx_descent(ctx), ic->txn,
-			ctx ? ctx->op : NULL);
-		rctx.held.outer = ctx ? &ctx->held : NULL;
-		/*
-		 * ★ IN-PLACE ACQUIRE HOIST.  The reserve below MUTATES
-		 * @attach_node_flag's body -- bitmap bit plus child slot --
-		 * whenever it stays IN PLACE, while the acquire of that same
-		 * node sits ~80 lines down beside the count.  Measured with all
-		 * three witnesses: the op holds it at the reserve 0 times of
-		 * 4,040,923.  Take it FIRST, so an in-place store on the COMMON
-		 * path is made under the lock that protects it.
-		 *
-		 * ☠ AND NOT ON THE MISS PATH -- do not read this as "never
-		 * writes a LIVE node unlocked".  A MISS sets @acquire_miss and
-		 * the commit discards the attempt, but nothing between here and
-		 * the reserve re-checks that bit, so the in-place set_nth still
-		 * performs its RAW bitmap + slot store on the live node, and the
-		 * discard does not undo a raw store (it drops @count_deferred,
-		 * not the bit).  That residue is the pre-existing shape of the
-		 * reserve itself, not something the hoist introduces; on an
-		 * exclusive trie a miss needs -ENOMEM or a depth_of failure to
-		 * arise at all.
-		 *
-		 * ☞ THIS DEPENDS ON @rctx ABOVE.  The first attempt at this hoist
-		 * LIVELOCKED (@70a1e20f): the reserve's recompact dedupes through
-		 * the ctx it is handed, and the caller's ctx carries a NULL
-		 * registry, so the op refused its OWN lock, destroyed the txn,
-		 * re-descended and span forever.  @rctx carries @ic->txn, so the
-		 * registration below is now VISIBLE to that acquire and dedupes
-		 * SHARED instead.  Do not reorder these two.
-		 *
-		 * ☞ @ctx, NOT @rctx, is handed to lock_or_guard: it builds its own
-		 * lctx with .held.txn = t and copies .extra/.glue from what it is
-		 * given but NOT .outer, so passing @rctx would drop the caller's
-		 * extras.
-		 *
-		 * Gated on ft_in_place_ok, so the default build -- where every
-		 * reserve relocates -- is unchanged.  A miss sets @acquire_miss
-		 * and ft_flip_txn_commit discards the attempt: no new unwind.
-		 */
-		/*
-		 * ☠ PER-NODE ONLY, AND THE RESTRICTION IS THIS HOIST'S OWN
-		 * FAULT -- not a pre-existing defect it exposes.  RED CONTROL,
-		 * one variable: the same tree with the hoist compiled out runs
-		 * ft_unit 357/357 at CDS_FT_LOCK_SPACING=exponential; with the
-		 * hoist it ABORTS at row 332 on
-		 * urcu_txn_record_chain's urcu_assert_debug(r->kind == kind).
-		 *
-		 * WHY: at a coarser spacing the hoist registers C's ANCHOR, so
-		 * the lock_or_guard further down stops taking its REGISTERED
-		 * exit -- which plants NOTHING on C -- and takes SHARED instead,
-		 * whose `held.lock != C && !node_held` arm plants an MW {s -> s}
-		 * guard on C's OWN word.  The nr_child_inc that follows records
-		 * that same word SW (ft_txn_content_sw_ok is !lock_fine ||
-		 * exclusive, and in-place implies exclusive), and the two kinds
-		 * collide.  Without the hoist the REGISTERED exit plants no
-		 * guard and there is nothing to collide with.
-		 *
-		 * So gate the HOIST, never ft_in_place_ok: narrowing the feature
-		 * would have hidden a regression of mine behind a restriction on
-		 * something that works.  Where the anchor IS the node the SHARED
-		 * arm cannot fire, which is exactly per-node.
-		 *
-		 * ☐ Extending in-place above per-node needs the guard/count kind
-		 * disagreement fixed first; until then this hoist stays here and
-		 * coarse spacings keep today's behaviour.
-		 */
-		if (ft_in_place_ok(ft) &&
-				ft->lock_spacing == CDS_FT_LOCK_SPACING_PER_NODE)
-			ft_flip_txn_lock_or_guard_parent(ft, ic->txn, ctx,
-				attach_node_flag, FT_DEPTH_FROM_DESCENT);
 		{
 			struct cds_ft_inode_flag **slot_ptr = NULL;
 			/*
@@ -2309,7 +2210,7 @@ int ft_attach_node(struct cds_ft *ft,
 				ret = ft_node_set_nth_rec(ft, &iter_dest_node_flag,
 					key_value, NULL, &old_recompacted_node,
 					metadata, level - 1, false, &rec, ic->txn,
-					NULL, &rctx, &count_deferred);
+					NULL, ctx, &count_deferred);
 				if (ret) {
 					dbg_printf("branch publish error %d\n", ret);
 					goto check_error;
