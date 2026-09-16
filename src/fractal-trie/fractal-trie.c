@@ -679,10 +679,11 @@ int _cds_ft_debug_skip_compressed_enabled(void)
  * test-side #ifdef: a test that maintains its own copy of a build flag reports
  * on its own copy, and a build whose library and tests disagree reads as a pass.
  *
- * ☠ THE FLAG IS ONLY HALF THE CONDITION.  ft_in_place_ok() also requires an
- * EXCLUSIVE trie, so a test that wants the in-place path must ALSO create one
- * -- which is why the gate's `in-place` config alone never reached
- * ft_store_at_graft_point_commit's in-place arm.
+ * ☠ THE FLAG IS ONLY HALF THE CONDITION FOR THE BULK ARMS.  A graft's reserve
+ * vouches ft_in_place_excl_ok(), which also requires an EXCLUSIVE trie, so a
+ * test that wants ft_store_at_graft_point_commit's in-place arm must ALSO
+ * create one -- which is why the gate's `in-place` config alone never reached
+ * it.  The point ops' tier (ft_in_place_ok) is the flag alone.
  */
 int _cds_ft_debug_in_place_enabled(void)
 {

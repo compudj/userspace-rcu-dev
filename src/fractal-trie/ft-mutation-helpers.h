@@ -3689,14 +3689,16 @@ void ft_ch_audit_head_at(const char *fn, int line, const struct cds_ft *ft,
  * written IN PLACE by ft_popcount_node_set_nth / ft_pigeon_node_set_nth.
  *
  * ☞ WHY THIS CLASS IS WORTH DECLARING.  Its sites are gated on
- * `ft_in_place_ok(ft) || defer_parent`, and ft_in_place_ok is today
- * `ft->exclusive` -- a per-TRIE claim standing in for what is really a per-OP
- * one ("this op holds the node").  Declaring HIDDEN when @defer_parent and
- * LOCKED otherwise turns that standing-in into a CHECKED claim: the ladder
- * below asks whether the op actually holds @owner, so hw_locked_viol is the
- * code saying it holds the node where it does not.  That is the evidence the
- * in-place re-introduction needs (doc/design/ft-reintroduce-in-place-mutations.md
- * §2.1) rather than an assertion about locking modes.
+ * `in_place || defer_parent`, where @in_place is the CALLER's vouch that this
+ * op holds the node (ft_in_place_ok's header: the point-op tier takes the
+ * node's lock or anchor BEFORE the reserve, ft_attach_node's hoist).  Declaring
+ * HIDDEN when @defer_parent and LOCKED otherwise turns that vouch into a
+ * CHECKED claim: the ladder below asks whether the op actually holds @owner, so
+ * hw_locked_viol is the code saying it holds the node where it does not.  That
+ * is the measurement the in-place re-introduction rests on
+ * (doc/design/ft-reintroduce-in-place-mutations.md §6) -- it read lockVIOL
+ * 4,040,923 / lockOK 0 on the refused population before the hoist -- rather
+ * than an assertion about locking modes.
  *
  * The owner is the node ITSELF and is handed in, so -- as with the parent-word
  * class -- nothing is derived and ft_ch_audit_owner_at's body is not reusable.
@@ -11337,22 +11339,57 @@ int ft_remove_one_commit(struct cds_ft *ft,
 			uintptr_t old = (uintptr_t) urcu_txn_load(txn->mtxn,
 				(void **) &state_meta->state, FT_STATE_PROXY);
 
-			ft_state_edge(&edges[n], &state_meta->state, old,
-				old - FT_STATE_NR_CHILD_ONE);
 			/*
-			 * FT-SLOT-1's RED CONTROL, kept as the regression
-			 * detector (it fired at ft_unit test 24 of the
-			 * -DFEATURE_FT_INSERT_IN_PLACE build, the only config
-			 * that reaches this branch): the load above used
-			 * FT_STATE_PROXY, so the RECORD must too.  One tag per slot, globally -- a
-			 * record planted with a wider tag than a resolver
-			 * strips fabricates a misaligned record pointer instead
-			 * of aborting, and the engine's own debug net covers
-			 * only the record path.
+			 * THE STATE-WORD PROTOCOL'S THIRD STEP, on a word the op
+			 * may already HOLD: ask the registry.  Where the holder's
+			 * lock -- or, at a coarse spacing, the anchor it collapses
+			 * onto (root-only: the ROOT's own word) -- is registered in
+			 * @txn, its release {LOCK|s -> s} is already recorded SW
+			 * on this very word, and an MW count chained after it is
+			 * the SW-then-MW order the engine's kind check traps
+			 * (measured: ft_unit test_rekey_known_nonterminating, an
+			 * exclusive trie's in-place delete at ROOT-ONLY spacing).
+			 * Held, the count is step 3 of the protocol: record it
+			 * through the state-word recorder, which parks it SW like
+			 * the release whenever the txn is structural_sw, and
+			 * chains it onto that release ({LOCK|s -> s-1}).
+			 *
+			 * ☠ NOT through @edges[] with an owner: the ordered-cell
+			 * tag URCU_TXN_TAG and FT_STATE_PROXY are both bit 0, so a
+			 * recorder cannot tell a state word from a cell edge by tag
+			 * -- and the cell-edge producers leave @owner_held
+			 * uninitialised, which a tag-keyed dispatch read as "held"
+			 * (measured: owner_held == 7 on a rekey's resplice edge,
+			 * inv_rekey_fine_mixed_writers).  Only a structural edge
+			 * (FT_FLIP_PROXY_TAG) carries a meaningful owner.
+			 *
+			 * Not held -- the ordinary in-place delete, whose holder is
+			 * self-guarded by this very CAS -- it rides @edges[] and
+			 * stays MW, as before.
 			 */
-			urcu_assert_debug(ft_edge_tag(&edges[n]) ==
-					FT_STATE_PROXY);
-			n++;
+			if (ft_flip_txn_owns(txn, state_meta)) {
+				ft_flip_txn_record_state(txn, state_meta,
+					(void *) old,
+					(void *) (old - FT_STATE_NR_CHILD_ONE));
+			} else {
+				ft_state_edge(&edges[n], &state_meta->state, old,
+					old - FT_STATE_NR_CHILD_ONE);
+				/*
+				 * FT-SLOT-1's RED CONTROL, kept as the regression
+				 * detector (it fired at ft_unit test 24 of the
+				 * -DFEATURE_FT_INSERT_IN_PLACE build, the only
+				 * config that reaches this branch): the load above
+				 * used FT_STATE_PROXY, so the RECORD must too.  One
+				 * tag per slot, globally -- a record planted with a
+				 * wider tag than a resolver strips fabricates a
+				 * misaligned record pointer instead of aborting,
+				 * and the engine's own debug net covers only the
+				 * record path.
+				 */
+				urcu_assert_debug(ft_edge_tag(&edges[n]) ==
+						FT_STATE_PROXY);
+				n++;
+			}
 		}
 		/*
 		 * ☞ NO MARK HERE ANY MORE, for the reason spelled out in

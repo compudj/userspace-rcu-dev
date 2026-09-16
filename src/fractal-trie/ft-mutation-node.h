@@ -89,6 +89,7 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 		bool *_replace_old_ptr,
 		bool is_init,
 		bool defer_parent,
+		bool in_place,
 		bool *deferred_count FT_CH_TXN_PARAM)
 {
 	assert(ft_type_is_popcount(type->type_class));
@@ -137,15 +138,14 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 		 * means the target is an unpublished build node (recompact
 		 * child-copy / cluster-leaf) -- build-invisible, so keep the
 		 * in-place store.  See FEATURE_FT_INSERT_IN_PLACE. */
-		if (!ft_in_place_ok(ft) && !defer_parent &&
+		if (!in_place && !defer_parent &&
 		    !((qp_root >> qp_hi & 1U) && ((qp_bms >> qp_p) & 1ULL))) {
 			/*
-			 * ☞ THE REFUSED PATH IS THE MEASUREMENT.  This is the population that
-			 * recompact-on-insert turns away and that widening ft_in_place_ok would
-			 * newly admit.  Declaring LOCKED here asks the ladder the question the
-			 * widening rests on -- "does the op actually hold this node?" -- on the
-			 * real workload and WITHOUT changing behaviour: the -ERANGE below still
-			 * fires.  A probe that records beats a guard that refuses.
+			 * @in_place is the CALLER's vouch that it holds this node
+			 * (ft_in_place_ok's header).  A caller that declines the tier -- a
+			 * bulk reserve, the build-path wrapper -- lands here and recompacts;
+			 * the audit still declares LOCKED on this refused arm so that
+			 * population stays measurable.
 			 */
 			ft_ch_audit_body_at(__func__, __LINE__, ft, metadata, FT_EXCL_LOCKED,
 			FT_CH_TXN_USE);
@@ -219,7 +219,7 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 					 * @defer_parent = build-invisible node: keep in
 					 * place (also avoids recompact-within-recompact).
 					 */
-					if (!ft_in_place_ok(ft) && !defer_parent)
+					if (!in_place && !defer_parent)
 						return -ERANGE;
 					if (_replace_old_ptr)
 						*_replace_old_ptr = false;
@@ -319,15 +319,14 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 		 * ADD_SAME via -ERANGE; a replace at an occupied slot, and a
 		 * build-into-unpublished-node insert (defer_parent), stay in
 		 * place. */
-		if (!ft_in_place_ok(ft) && !defer_parent &&
+		if (!in_place && !defer_parent &&
 		    !(((qp_root >> qp_hi) & 1ULL) && ((qp_bms >> qp_p) & 1ULL))) {
 			/*
-			 * ☞ THE REFUSED PATH IS THE MEASUREMENT.  This is the population that
-			 * recompact-on-insert turns away and that widening ft_in_place_ok would
-			 * newly admit.  Declaring LOCKED here asks the ladder the question the
-			 * widening rests on -- "does the op actually hold this node?" -- on the
-			 * real workload and WITHOUT changing behaviour: the -ERANGE below still
-			 * fires.  A probe that records beats a guard that refuses.
+			 * @in_place is the CALLER's vouch that it holds this node
+			 * (ft_in_place_ok's header).  A caller that declines the tier -- a
+			 * bulk reserve, the build-path wrapper -- lands here and recompacts;
+			 * the audit still declares LOCKED on this refused arm so that
+			 * population stays measurable.
 			 */
 			ft_ch_audit_body_at(__func__, __LINE__, ft, metadata, FT_EXCL_LOCKED,
 			FT_CH_TXN_USE);
@@ -401,7 +400,7 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 					 * @defer_parent = build-invisible node: keep in
 					 * place (also avoids recompact-within-recompact).
 					 */
-					if (!ft_in_place_ok(ft) && !defer_parent)
+					if (!in_place && !defer_parent)
 						return -ERANGE;
 					if (_replace_old_ptr)
 						*_replace_old_ptr = false;
@@ -498,7 +497,7 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 		 * ADD_SAME via -ERANGE; a replace at an occupied slot, and a
 		 * build-into-unpublished-node insert (defer_parent), stay in
 		 * place. */
-		if (!ft_in_place_ok(ft) && !defer_parent) {
+		if (!in_place && !defer_parent) {
 			bool qp_present = false;
 
 			if ((qp_root >> qp_hi) & 1U) {
@@ -508,12 +507,11 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 			}
 			if (!qp_present) {
 				/*
-				 * ☞ THE REFUSED PATH IS THE MEASUREMENT.  This is the population that
-				 * recompact-on-insert turns away and that widening ft_in_place_ok would
-				 * newly admit.  Declaring LOCKED here asks the ladder the question the
-				 * widening rests on -- "does the op actually hold this node?" -- on the
-				 * real workload and WITHOUT changing behaviour: the -ERANGE below still
-				 * fires.  A probe that records beats a guard that refuses.
+				 * @in_place is the CALLER's vouch that it holds this node
+				 * (ft_in_place_ok's header).  A caller that declines the tier -- a
+				 * bulk reserve, the build-path wrapper -- lands here and recompacts;
+				 * the audit still declares LOCKED on this refused arm so that
+				 * population stays measurable.
 				 */
 				ft_ch_audit_body_at(__func__, __LINE__, ft, metadata, FT_EXCL_LOCKED,
 			FT_CH_TXN_USE);
@@ -600,7 +598,7 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 					 * @defer_parent = build-invisible node: keep in
 					 * place (also avoids recompact-within-recompact).
 					 */
-					if (!ft_in_place_ok(ft) && !defer_parent)
+					if (!in_place && !defer_parent)
 						return -ERANGE;
 					if (_replace_old_ptr)
 						*_replace_old_ptr = false;
@@ -697,14 +695,13 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 		 * ADD_SAME via -ERANGE; a replace at an occupied slot, and a
 		 * build-into-unpublished-node insert (defer_parent), stay in
 		 * place. */
-		if (!ft_in_place_ok(ft) && !defer_parent && !(word & bit)) {
+		if (!in_place && !defer_parent && !(word & bit)) {
 			/*
-			 * ☞ THE REFUSED PATH IS THE MEASUREMENT.  This is the population that
-			 * recompact-on-insert turns away and that widening ft_in_place_ok would
-			 * newly admit.  Declaring LOCKED here asks the ladder the question the
-			 * widening rests on -- "does the op actually hold this node?" -- on the
-			 * real workload and WITHOUT changing behaviour: the -ERANGE below still
-			 * fires.  A probe that records beats a guard that refuses.
+			 * @in_place is the CALLER's vouch that it holds this node
+			 * (ft_in_place_ok's header).  A caller that declines the tier -- a
+			 * bulk reserve, the build-path wrapper -- lands here and recompacts;
+			 * the audit still declares LOCKED on this refused arm so that
+			 * population stays measurable.
 			 */
 			ft_ch_audit_body_at(__func__, __LINE__, ft, metadata, FT_EXCL_LOCKED,
 			FT_CH_TXN_USE);
@@ -747,7 +744,7 @@ int ft_popcount_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 				 * n).  @defer_parent = build-invisible node: keep in
 				 * place (also avoids recompact-within-recompact).
 				 */
-				if (!ft_in_place_ok(ft) && !defer_parent)
+				if (!in_place && !defer_parent)
 					return -ERANGE;
 				if (_replace_old_ptr)
 					*_replace_old_ptr = false;
@@ -815,6 +812,7 @@ int ft_pigeon_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 		uint8_t n,
 		struct cds_ft_inode_flag *child_node_flag,
 		bool defer_parent,
+		bool in_place,
 		bool *deferred_count FT_CH_TXN_PARAM)
 {
 	struct cds_ft_inode_flag **ptr;
@@ -860,31 +858,33 @@ int ft_pigeon_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 	 * publish no fresh address anywhere on the graft arm, and a torn
 	 * descent becomes indistinguishable from a clean one.
 	 *
-	 * ★ AND THIS IS A PLANNED DIRECTION, not a hypothetical: in-place
-	 * mutation without a COW is meant to be RE-ALLOWED more widely (the
-	 * sticky-hint arm here is one instance; ft_in_place_ok's exclusive-only
-	 * gate is another).  The move's coherence must therefore stop being a
-	 * free ride on this arm BEFORE that happens.  The agreed shape is to
-	 * SPECIAL-CASE THE REKEY so it COWs the parent itself: the destination
-	 * attach parent is the load-bearing one (the src side relocates too but
-	 * is not what the witness needs), and on the merge arm the carrier is
-	 * instead ft_merge_build's fresh union node.  Whoever re-allows in-place
-	 * owes that special case in the same change, plus a publish-time assert
-	 * that the attach node really was superseded by this op -- otherwise the
-	 * breakage is silent, and the gate cannot see it (a torn descent that
-	 * matches a clean one produces no failure, only a wrong answer).
+	 * ★ AND IN-PLACE IS RE-ALLOWED for the POINT ops on every trie type
+	 * (ft_in_place_ok), so this arm is exactly where the move's coherence
+	 * had to stop free-riding.  It does so by SITE, not by predicate: the
+	 * bulk reserves (a graft's / rekey's dst attach parent,
+	 * ft_store_at_graft_point_prepare) and the bulk detaches pass
+	 * ft_in_place_excl_ok -- false on any trie with readers -- so a move's
+	 * dst attach parent still RELOCATES there while a point insert next to
+	 * it appends in place.  The destination attach parent is the
+	 * load-bearing one (the src side relocates too but is not what the
+	 * witness needs), and on the merge arm the carrier is ft_merge_build's
+	 * fresh union node.  ft_rekey_graft_simple_attempt's publish-time
+	 * assert (FT_REKEY_DST_FRESH_REACH) is what turns a silent witness loss
+	 * into a loud one should a bulk caller ever start vouching @in_place.
 	 *
 	 * The delete side carries the same dependency
-	 * (ft_popcount_node_replace_ptr / ft_pigeon_node_replace_ptr, -EFBIG).
+	 * (ft_popcount_node_replace_ptr / ft_pigeon_node_replace_ptr, -EFBIG),
+	 * and the same split through ft_detach_node's @in_place -- ☐ where the
+	 * point removes still vouch ft_in_place_excl_ok until the delete tier
+	 * gets its own validation step.
 	 */
-	if (!ft_in_place_ok(ft) && !defer_parent && !*ptr) {
+	if (!in_place && !defer_parent && !*ptr) {
 		/*
-		 * ☞ THE REFUSED PATH IS THE MEASUREMENT.  This is the population that
-		 * recompact-on-insert turns away and that widening ft_in_place_ok would
-		 * newly admit.  Declaring LOCKED here asks the ladder the question the
-		 * widening rests on -- "does the op actually hold this node?" -- on the
-		 * real workload and WITHOUT changing behaviour: the -ERANGE below still
-		 * fires.  A probe that records beats a guard that refuses.
+		 * @in_place is the CALLER's vouch that it holds this node
+		 * (ft_in_place_ok's header).  A caller that declines the tier -- a
+		 * bulk reserve, the build-path wrapper -- lands here and recompacts;
+		 * the audit still declares LOCKED on this refused arm so that
+		 * population stays measurable.
 		 */
 		ft_ch_audit_body_at(__func__, __LINE__, ft, metadata, FT_EXCL_LOCKED,
 			FT_CH_TXN_USE);
@@ -938,6 +938,7 @@ int _ft_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 		struct cds_ft_inode_flag *child_node_flag,
 		bool is_init,
 		bool defer_parent,
+		bool in_place,
 		bool *deferred_count FT_CH_TXN_PARAM)
 {
 	int ret;
@@ -946,12 +947,13 @@ int _ft_node_set_nth(struct cds_ft *ft, const struct cds_ft_type *type,
 	case FT_POPCOUNT:
 		ret = ft_popcount_node_set_nth(ft, type, node, node_flag,
 				metadata, n, child_node_flag, NULL, is_init,
-				defer_parent, deferred_count FT_CH_TXN_FWD);
+				defer_parent, in_place, deferred_count
+				FT_CH_TXN_FWD);
 		break;
 	case FT_PIGEON:
 		ret = ft_pigeon_node_set_nth(ft, type, node, node_flag,
 				metadata, n, child_node_flag, defer_parent,
-				deferred_count FT_CH_TXN_FWD);
+				in_place, deferred_count FT_CH_TXN_FWD);
 		break;
 	case FT_NULL:
 		return -ENOSPC;
@@ -974,6 +976,7 @@ int ft_popcount_node_replace_ptr(struct cds_ft *ft, const struct cds_ft_type *ty
 		struct cds_ft_metadata *metadata,
 		struct cds_ft_inode_flag **node_flag_ptr,
 		struct cds_ft_inode_flag *newptr,
+		bool in_place,
 		struct ft_remove_pub *pub)
 {
 	assert(ft_type_is_popcount(type->type_class));
@@ -981,20 +984,25 @@ int ft_popcount_node_replace_ptr(struct cds_ft *ft, const struct cds_ft_type *ty
 
 	if (!newptr) {
 		/*
-		 * Recompact-on-remove (default, concurrent-safe): EVERY delete
-		 * rebuilds the node fresh (FT_RECOMPACT_DEL, dropping child n)
-		 * so a consistent (bitmap, nr_child) is published in ONE pointer
-		 * swap.  The in-place alternative below stores NULL into the
-		 * child slot and decrements nr_child IN PLACE on the LIVE node;
-		 * a concurrent lookup reads that torn -- the bitmap and nr_child
-		 * are separate words, so a reader that sampled nr_child before
-		 * the decrement walks a child index i >= the new nr_child and
-		 * trips ft_popcount_node_get_ith_pos's `i < nr_child` assert.
-		 * Under FEATURE_FT_INSERT_IN_PLACE (single writer, no concurrent
-		 * reader mid-mutation) the in-place fast path is retained; there
-		 * we only recompact once the node would shrink below min_child.
+		 * Recompact-on-remove (the build without
+		 * FEATURE_FT_INSERT_IN_PLACE): EVERY delete rebuilds the node
+		 * fresh (FT_RECOMPACT_DEL, dropping child n) so a consistent
+		 * (bitmap, nr_child) is published in ONE pointer swap.
+		 *
+		 * The in-place tier (@in_place, the caller's vouch -- see
+		 * ft_in_place_ok) stores NULL into the child slot and decrements
+		 * nr_child on the LIVE node, and it is sound against readers
+		 * because the bitmap bit stays STICKY: popcount(bitmap) never
+		 * shrinks, so ft_popcount_node_get_ith_pos's bound cannot be
+		 * over-run from either side, and a reader reaching the NULLed
+		 * slot answers "not present" as it does for any reserved hole.
+		 * Against writers it is not a raw store at all: with @pub armed
+		 * both words are RECORDS in the detach commit, so the slot flip
+		 * and the fused nr_child-- are arbitrated on the holder's state
+		 * word (ft_detach_node's pub-armed arm).  Only a delete that
+		 * would shrink the holder below min_child recompacts.
 		 */
-		if (!ft_in_place_ok(ft) ||
+		if (!in_place ||
 		    ft_meta_nr_child_load(metadata) <= type->min_child)
 			return -EFBIG;
 	}
@@ -1068,6 +1076,7 @@ int ft_pigeon_node_replace_ptr(struct cds_ft *ft, const struct cds_ft_type *type
 		struct cds_ft_inode_flag **node_flag_ptr,
 		uint8_t n __attribute__((unused)),
 		struct cds_ft_inode_flag *newptr,
+		bool in_place,
 		struct ft_remove_pub *pub)
 {
 	assert(ft_type_is_pigeon(type->type_class));
@@ -1080,7 +1089,7 @@ int ft_pigeon_node_replace_ptr(struct cds_ft *ft, const struct cds_ft_type *type
 		 * the nr_child change torn against the pointer/bitmap state.  See
 		 * the popcount variant for the full rationale.
 		 */
-		if (!ft_in_place_ok(ft) ||
+		if (!in_place ||
 		    ft_meta_nr_child_load(metadata) <= type->min_child)
 			return -EFBIG;
 	}
@@ -1157,16 +1166,19 @@ int _ft_node_replace_ptr(struct cds_ft *ft, const struct cds_ft_type *type,
 		struct cds_ft_metadata *metadata,
 		struct cds_ft_inode_flag **node_flag_ptr,
 		uint8_t n, struct cds_ft_inode_flag *newptr,
+		bool in_place,
 		struct ft_remove_pub *pub)
 {
 	int ret;
 
 	switch (type->type_class) {
 	case FT_POPCOUNT:
-		ret = ft_popcount_node_replace_ptr(ft, type, node, node_flag, metadata, node_flag_ptr, newptr, pub);
+		ret = ft_popcount_node_replace_ptr(ft, type, node, node_flag,
+				metadata, node_flag_ptr, newptr, in_place, pub);
 		break;
 	case FT_PIGEON:
-		ret = ft_pigeon_node_replace_ptr(ft, type, node, node_flag, metadata, node_flag_ptr, n, newptr, pub);
+		ret = ft_pigeon_node_replace_ptr(ft, type, node, node_flag,
+				metadata, node_flag_ptr, n, newptr, in_place, pub);
 		break;
 	case FT_NULL:
 		return -ENOENT;
@@ -2063,8 +2075,9 @@ int ft_node_recompact(enum ft_recompact mode,
 			else
 			ret = _ft_node_set_nth(ft, new_type, new_node, new_node_flag,
 					new_metadata, v, iter,
-					RECOMPACT_IS_INIT(v), true, NULL
-					FT_CH_TXN_NONE);
+					RECOMPACT_IS_INIT(v), true,
+					/* in_place: build-invisible */ true,
+					NULL FT_CH_TXN_NONE);
 			assert(!ret);
 		}
 		break;
@@ -2078,19 +2091,17 @@ int ft_node_recompact(enum ft_recompact mode,
 
 		/*
 		 * Adding to a pigeon SOURCE happens only under recompact-on-
-		 * insert (the DEFAULT; i.e. not -DFEATURE_FT_INSERT_IN_PLACE): a
-		 * new key for a live pigeon routes here as ADD_SAME to retire the
+		 * insert -- the build without FEATURE_FT_INSERT_IN_PLACE, or a
+		 * caller that declined the in-place tier (@in_place false: a
+		 * bulk reserve on a shared trie, the build-path wrapper): a new
+		 * key for a live pigeon routes here as ADD_SAME to retire the
 		 * in-place bitmap set.  A new-key insert never fills the pigeon
 		 * (an occupied byte is a replace, not an insert), so
-		 * find_nearest_type_index stays within the pigeon tier.  In the
-		 * opt-in in-place build a pigeon never reaches an ADD recompact
-		 * (tighter assert below).
+		 * find_nearest_type_index stays within the pigeon tier.
 		 */
 		assert(mode == FT_RECOMPACT_DEL ||
-			mode == FT_RECOMPACT_RELOCATE
-			|| (!ft_in_place_ok(ft) &&
-			    mode == FT_RECOMPACT_ADD_SAME)
-			);
+			mode == FT_RECOMPACT_RELOCATE ||
+			mode == FT_RECOMPACT_ADD_SAME);
 		for (i = 0; i < FT_ENTRY_PER_NODE; i++) {
 			struct cds_ft_inode_flag *iter;
 			/* the drop folded a REPLACEMENT into this slot */
@@ -2239,8 +2250,9 @@ int ft_node_recompact(enum ft_recompact mode,
 			else
 			ret = _ft_node_set_nth(ft, new_type, new_node, new_node_flag,
 					new_metadata, i, iter,
-					RECOMPACT_IS_INIT((uint8_t)i), true, NULL
-					FT_CH_TXN_NONE);
+					RECOMPACT_IS_INIT((uint8_t)i), true,
+					/* in_place: build-invisible */ true,
+					NULL FT_CH_TXN_NONE);
 			assert(!ret);
 		}
 		break;
@@ -2272,8 +2284,9 @@ skip_copy:
 		else
 		ret = _ft_node_set_nth(ft, new_type, new_node, new_node_flag,
 				new_metadata, n, child_node_flag,
-				RECOMPACT_IS_INIT(n), true, NULL
-				FT_CH_TXN_NONE);
+				RECOMPACT_IS_INIT(n), true,
+				/* in_place: build-invisible */ true,
+				NULL FT_CH_TXN_NONE);
 		assert(!ret);
 	}
 
@@ -3213,6 +3226,7 @@ int ft_node_set_nth_rec(struct cds_ft *ft,
 		struct ft_flip_txn *retire_txn,
 		const struct ft_parent_hint *inh_hint,
 		const struct ft_lock_ctx *ctx,
+		bool in_place,
 		bool *deferred_count)
 {
 	int ret;
@@ -3233,8 +3247,8 @@ int ft_node_set_nth_rec(struct cds_ft *ft,
 	 * ft_node_recompact, which uses is_init internally.
 	 */
 	ret = _ft_node_set_nth(ft, type, node, *node_flag, metadata, n,
-			child_node_flag, false, cluster_leaf, deferred_count
-			FT_CH_TXN_ARG(retire_txn, ctx));
+			child_node_flag, false, cluster_leaf, in_place,
+			deferred_count FT_CH_TXN_ARG(retire_txn, ctx));
 	switch (ret) {
 	case 0:
 	{
@@ -3300,6 +3314,10 @@ int ft_node_set_nth_rec(struct cds_ft *ft,
  * one-commit insert reserve (ft_attach_node) calls ft_node_set_nth_rec directly
  * with its commit rec so a recompact-relocation's compressed-parent SKIP_X dual
  * flips atomically with the forward publish.
+ *
+ * No lock is derived here, so this wrapper stands on the EXCLUSIVE-only
+ * in-place tier (ft_in_place_excl_ok): on a shared trie a new occupancy always
+ * recompacts, exactly as before the point-op tier was widened.
  */
 static
 int ft_node_set_nth(struct cds_ft *ft,
@@ -3316,7 +3334,7 @@ int ft_node_set_nth(struct cds_ft *ft,
 	 */
 	return ft_node_set_nth_rec(ft, node_flag, n, child_node_flag,
 			old_node_ret, metadata, node_depth, cluster_leaf, NULL,
-			NULL, NULL, NULL, NULL);
+			NULL, NULL, NULL, ft_in_place_excl_ok(ft), NULL);
 }
 
 /*
@@ -3336,6 +3354,7 @@ int ft_node_replace_ptr(struct cds_ft *ft,
 		struct cds_ft_metadata *metadata,			/* of parent */
 		uint8_t n,
 		struct cds_ft_inode_flag *newptr,
+		bool in_place,
 		bool is_root,
 		unsigned int node_depth,
 		struct ft_remove_pub *pub,
@@ -3374,7 +3393,8 @@ int ft_node_replace_ptr(struct cds_ft *ft,
 	node = ft_node_ptr(*parent_node_flag_ptr);
 	type_index = ft_node_type(*parent_node_flag_ptr);
 	type = &ft_types[type_index];
-	ret = _ft_node_replace_ptr(ft, type, node, *parent_node_flag_ptr, metadata, node_flag_ptr, n, newptr, pub);
+	ret = _ft_node_replace_ptr(ft, type, node, *parent_node_flag_ptr,
+			metadata, node_flag_ptr, n, newptr, in_place, pub);
 	if (ret == -EFBIG) {
 		/*
 		 * FOLD (@held_hint): a same-trie rekey folds this delete-recompaction

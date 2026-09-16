@@ -1996,6 +1996,8 @@ int ft_attach_node(struct cds_ft *ft,
 	struct cds_ft_inode_flag *iter_node_flag, *iter_dest_node_flag,
 				*created_nodes[FT_MAX_DEPTH];
 	struct cds_ft_inode *old_recompacted_node = NULL;
+	/* Nested held-set frame for the reserve; see its use below. */
+	struct ft_lock_ctx rctx;
 	int ret, i, nr_created_nodes = 0;
 	const uint8_t *iter_key = key + key_len;
 
@@ -2175,6 +2177,106 @@ int ft_attach_node(struct cds_ft *ft,
 			 * copy instead and leaves this false.
 			 */
 			bool count_deferred = false;
+			/*
+			 * May the reserve below write the LIVE attach node IN
+			 * PLACE?  Only once this op HOLDS it -- see the hoist.
+			 */
+			bool in_place = false;
+
+			/*
+			 * ★ THE OP'S HELD SET, MADE VISIBLE TO THE RESERVE.  @ctx
+			 * was built by the caller with ft_lock_ctx_init(&actx, &d,
+			 * ic.txn, ...) BEFORE ft_insert_commit_arm created the txn
+			 * above, so @ctx->held.txn is NULL and the commit's
+			 * registry is invisible through it.  The reserve hands its
+			 * ctx to ft_node_recompact, whose lock-set acquire dedupes
+			 * via ft_lock_ctx_holds -- so a word THIS op registered in
+			 * ic->txn (the hoisted attach-node lock, next) would read
+			 * as "held by someone else", ft_dlm_lock would refuse it,
+			 * and the op would spend an -EAGAIN refusing its OWN lock,
+			 * destroy the txn, re-descend and spin for ever (measured
+			 * at @70a1e20f: unit row 160 / inv row 80, 101% CPU).
+			 *
+			 * Chain a nested frame rather than mutate @ctx (it is
+			 * const, and the caller's frame is still live): @held.outer
+			 * is exactly the documented "CALLER's held set, when this
+			 * one belongs to a nested step of the same op", and
+			 * ft_held_set_snap / ft_dlm_acquire_set already walk it.
+			 * So the reserve sees the commit registry AND everything
+			 * the caller held, as ONE held set.
+			 */
+			ft_lock_ctx_init(&rctx, ft_lock_ctx_descent(ctx), ic->txn,
+				ctx ? ctx->op : NULL);
+			rctx.held.outer = ctx ? &ctx->held : NULL;
+
+			/*
+			 * ★ LOCK BEFORE WRITE: the in-place reserve's acquire.
+			 *
+			 * An in-place reserve mutates @attach_node_flag's LIVE
+			 * body -- a bitmap bit plus a child slot, RAW stores no
+			 * commit can arbitrate or roll back -- so the op must hold
+			 * that node BEFORE the store, not beside the count edge
+			 * ~80 lines down where this acquire used to sit (measured
+			 * there with all three witnesses: held 0 of 4,040,923 at
+			 * the reserve).  Take it FIRST.
+			 *
+			 *  - FINE strategy: the node's own DLM lock (per-node
+			 *    spacing) or its ANCHOR (exponential / root-only),
+			 *    REGISTERED in ic->txn with its {LOCK|s -> s} release,
+			 *    so the commit that publishes the edge is the one that
+			 *    drops the lock.  A MISS (a peer holds it) bails
+			 *    -EAGAIN right here, BEFORE anything is written: the
+			 *    commit would only abort later, and by then the raw
+			 *    store would already have landed unlocked.
+			 *  - COARSE strategy: the FT-wide writer lock this op
+			 *    already holds is the exclusion; nothing per-node is
+			 *    taken, and the §4.B guard below keeps its old place.
+			 *
+			 * ☞ THE RELOCATION ARM IS WHY @rctx EXISTS.  When the
+			 * reserve cannot stay in place (-ERANGE non-tail byte,
+			 * -ENOSPC), ft_node_recompact acquires {C, P, GP} with C
+			 * = this very node: through @rctx that dedupes SHARED, and
+			 * ft_flip_txn_record_retire_anchored's fused arm then
+			 * chains C's tombstone onto the release recorded here
+			 * ({LOCK|s -> s} + {s -> TOMBSTONE|s} = one
+			 * {LOCK|s -> TOMBSTONE|s} record) at per-node spacing,
+			 * or tombstones C's own word beside the anchor's release
+			 * at a coarser one.  So the hoisted lock is either the
+			 * in-place store's protection or the retire's fence --
+			 * never a second acquire on a word this op holds.
+			 *
+			 * ☞ ONE ACQUIRE, NOT TWO.  The later lock_or_guard this
+			 * replaces is GONE for the fine strategy: kept, its SHARED
+			 * exit at a coarse spacing planted an MW {s -> s} guard on
+			 * C's OWN word beside the SW nr_child++ that follows --
+			 * one slot, two kinds (@898c08ce's control).  The count
+			 * edge's own expected-old validates C's word at commit,
+			 * and the anchor excludes every point-op peer of C, which
+			 * is all the guard ever stood for.
+			 *
+			 * @ctx, NOT @rctx, is handed to lock_or_guard: it builds
+			 * its own lctx with .held.txn = ic->txn and copies
+			 * .extra/.glue from what it is given but NOT .outer, so
+			 * passing @rctx would drop the caller's extras.
+			 */
+			if (!old_node_flag && ft_in_place_ok(ft)) {
+				if (ft->lock_fine) {
+					enum ft_lock_or_guard_exit ex;
+
+					ft_flip_txn_lock_or_guard_parent_ex(
+						__func__, __LINE__, ft, ic->txn,
+						ctx, attach_node_flag,
+						FT_DEPTH_FROM_DESCENT, &ex);
+					if (ex == FT_LOG_EXIT_MISS) {
+						ret = -EAGAIN;
+						goto check_error;
+					}
+					/* REGISTERED, or SHARED through the op's own held set. */
+					in_place = true;
+				} else {
+					in_place = true;	/* the FT-wide lock */
+				}
+			}
 
 			/*
 			 * One-commit insert (reserved-byte model): occupy
@@ -2197,6 +2299,10 @@ int ft_attach_node(struct cds_ft *ft,
 			 *    recorded into ic->txn below, so it goes live with
 			 *    the publish and is discarded with an aborted
 			 *    attempt (see ft_flip_txn_record_nr_child_inc).
+			 *    The bitmap bit itself is NOT rolled back by an
+			 *    abort: a bit-set+NULL slot is the same hole a
+			 *    soft-delete leaves, reads as not-present, and the
+			 *    retry refills it in place (Case 1 refill).
 			 *  - displaced external (old_node_flag != NULL): the slot
 			 *    already holds it; no set_nth (a NULL store would drop
 			 *    the live external before the commit).
@@ -2210,22 +2316,15 @@ int ft_attach_node(struct cds_ft *ft,
 				ret = ft_node_set_nth_rec(ft, &iter_dest_node_flag,
 					key_value, NULL, &old_recompacted_node,
 					metadata, level - 1, false, &rec, ic->txn,
-					NULL, ctx, &count_deferred);
+					NULL, &rctx, in_place, &count_deferred);
 				if (ret) {
 					dbg_printf("branch publish error %d\n", ret);
 					goto check_error;
 				}
 #ifdef FT_DEBUG_INPLACE_HOIST
 				/*
-				 * WHICH HALF IS THE HOIST?  Moving the :2266
-				 * acquire above this reserve is a clean MOVE
-				 * when the reserve stays IN PLACE (same node,
-				 * same op, just earlier), but on the
-				 * RELOCATION arm the reserve RETIRES the attach
-				 * node -- so a hoisted lock would sit on a node
-				 * the op retires, which needs the anchored
-				 * retire rather than a plain one.  Size the two
-				 * before choosing the shape.
+				 * The in-place / relocation split of the reserve,
+				 * on the config where in-place can actually fire.
 				 */
 				if (iter_dest_node_flag == attach_node_flag)
 					__atomic_fetch_add(&ft_ip_reserve_inplace,
@@ -2262,52 +2361,43 @@ int ft_attach_node(struct cds_ft *ft,
 				iter_dest_node_flag, slot_ptr,
 				FT_EXCL_HIDDEN);
 			/*
-			 * §4.B VALIDATE (Phase 4.3, MW): the reserved-byte edge
-			 * below stores @slot_ptr, a slot INSIDE @iter_dest_node_flag.
-			 * When the reserve stayed IN PLACE (iter_dest == attach node)
-			 * that slot lives in the LIVE, reader-reachable attach node,
-			 * yet the forward CAS below validates only the slot VALUE
-			 * (NULL for a new byte) -- a peer that recompacts/relocates
-			 * the attach node through its grandparent slot leaves that
-			 * value intact in the retired copy, so the CAS still matches
-			 * and commits the new key into a reclaimed node (UAF + lost
-			 * insert).  Guard the holder's state word so a peer's
-			 * freeze-on-free (LOCK/TOMBSTONE) between this descent and
-			 * the commit ABORTs instead -- symmetric with the split path
-			 * (ft_insert_publish_or_park) and the external-clear guards in
-			 * ft-remove.h.  A RELOCATION reserve publishes a build-
-			 * invisible fresh copy, guarded at its grandparent slot below
-			 * (iter_dest != attach), so it needs no guard here.
-			 */
-			/*
-			 * I-1, closed: @slot_ptr lives INSIDE the attach node, so
-			 * the attach node is this op's lock-set member and a plain
-			 * guard left it merely validated, never held -- the gap the
-			 * lock-set completeness audit quantified (3 slot writes, 0
-			 * acquires).  ACQUIRE it: under lock_fine that records the
-			 * {LOCK|s -> s} release, and since f7cc59f9 a miss is
-			 * all-or-none (abort + re-descend) rather than a silent
-			 * degrade to the guard.  Non-lock_fine still lands on the
-			 * guard, unchanged.
+			 * §4.B VALIDATE (Phase 4.3, MW), COARSE strategy only: the
+			 * reserved-byte edge below stores @slot_ptr, a slot INSIDE
+			 * @iter_dest_node_flag.  When the reserve stayed IN PLACE
+			 * (iter_dest == attach node) that slot lives in the LIVE,
+			 * reader-reachable attach node, yet the forward CAS below
+			 * validates only the slot VALUE (NULL for a new byte) -- a
+			 * peer that recompacts/relocates the attach node through
+			 * its grandparent slot leaves that value intact in the
+			 * retired copy, so the CAS still matches and commits the
+			 * new key into a reclaimed node (UAF + lost insert).  Guard
+			 * the holder's state word so a peer's freeze-on-free
+			 * (LOCK/TOMBSTONE) between this descent and the commit
+			 * ABORTs instead -- symmetric with the split path
+			 * (ft_insert_publish_or_park) and the external-clear guards
+			 * in ft-remove.h.
 			 *
-			 * ORDER IS LOAD-BEARING: the acquire's release must be
-			 * recorded BEFORE @count_deferred's nr_child++ edge, since
-			 * both target this one state word.  release-then-count
-			 * chains to a single {LOCK|s -> s+1} -- release AND
-			 * increment in one record; count-then-release would arrive
-			 * with expected old LOCK|s against a pending s+1 and
-			 * POISON the descriptor (the ordering rule spelled out at
-			 * ft_flip_txn_record_release_lock).  Hence the count
-			 * edge moved down here from just after the reserve.
+			 * Under the FINE strategy the attach node is this op's
+			 * lock-set member and was ACQUIRED above the reserve (the
+			 * hoist), which records the {LOCK|s -> s} release this
+			 * guard would only approximate; a guard here on top of it
+			 * is the mixed-kind shape the hoist's comment names.  A
+			 * RELOCATION reserve publishes a build-invisible fresh copy,
+			 * guarded at its grandparent slot below (iter_dest !=
+			 * attach), so it needs nothing here either.
 			 *
-			 * The RELOCATION arm needs nothing: the reserve's recompact
-			 * already locked the grandparent it republishes into and
-			 * recorded its release (see the !ft->lock_fine guard below).
+			 * ORDER IS LOAD-BEARING: the hoist's release (fine) or this
+			 * guard (coarse) is recorded BEFORE @count_deferred's
+			 * nr_child++ edge, since both target this one state word.
+			 * release-then-count chains to a single {LOCK|s -> s+1} --
+			 * release AND increment in one record; count-then-release
+			 * would arrive with expected old LOCK|s against a pending
+			 * s+1 and POISON the descriptor (the ordering rule spelled
+			 * out at ft_flip_txn_record_release_lock).
 			 */
-			if (iter_dest_node_flag == attach_node_flag)
-				ft_flip_txn_lock_or_guard_parent(ft, ic->txn,
-					ctx, iter_dest_node_flag,
-					FT_DEPTH_FROM_DESCENT);
+			if (iter_dest_node_flag == attach_node_flag && !ft->lock_fine)
+				ft_flip_txn_guard_parent(ft, ic->txn,
+					iter_dest_node_flag);
 			if (count_deferred)
 				ft_flip_txn_record_nr_child_inc(ic->txn, metadata);
 			/*
@@ -2499,36 +2589,63 @@ int ft_attach_node(struct cds_ft *ft,
 			 * store, resurrecting the retired attach node over the peer's
 			 * copy, un-rolled-back by a commit ABORT.  Mirror the
 			 * relocation branch above: re-descend if the attach node
-			 * moved, guard the live grandparent, and record the
-			 * (same-value) reader-visible edges into ic->txn so a peer
-			 * freeze/relocate ABORTS this commit.  ft_set_parent_slot
-			 * still runs immediately (it is not gated by @rec),
-			 * preserving the in-place metadata bookkeeping the direct
-			 * store performed (why dropping the call outright is wrong).
+			 * moved, and ACQUIRE the live grandparent so a peer
+			 * freeze/relocate of it ABORTS this commit.
+			 *
+			 * ☠ AND RESOLVE (GRANDPARENT, SLOT) EXACTLY ONCE, through the
+			 * proxy-aware resolver, reading nothing raw afterwards.  The
+			 * attach node is LIVE and this op holds its state word, but
+			 * that hold does not freeze its PARENT word: a peer
+			 * recompacting the grandparent re-homes the attach node by
+			 * flipping @attach_meta->parent_word, and mid-flip that word
+			 * carries the peer's PROXY.  A raw ft_parent_node() of it
+			 * then hands the acquire, and ft_set_parent_slot's
+			 * ft_slot_to_byte, a txn RECORD in place of a node: measured
+			 * as ft_popcount_node_get_ith_pos's type assert firing in
+			 * inv_writer_progress_chainmerge, with @parent_word settled
+			 * to the peer's fresh copy by the time the core was read.
+			 * ft_resolve_parent_slot answers from ONE coherent snapshot
+			 * (re-home resolved through the descriptor's status), and a
+			 * re-home that lands between it and the acquire is caught
+			 * by the acquire itself -- the grandparent it names is
+			 * either tombstoned (a MISS) or held by the peer (a MISS).
+			 *
+			 * There is NO same-value republish here any more.  The one
+			 * this arm used to mirror from the relocation branch wrote
+			 * nothing (the node did not move, so its parent slot, its
+			 * slot offset, its incoming byte and a compressed
+			 * grandparent's SKIP dual are all unchanged) and existed to
+			 * VALIDATE the grandparent edge at commit -- which the
+			 * acquire below already does, strictly more strongly -- while
+			 * re-reading the live parent word raw inside
+			 * _ft_publish_to_parent_meta_at, which is the read that
+			 * landed on the proxy.
 			 */
 			struct cds_ft_metadata *attach_meta =
 				cds_ft_item_to_metadata(
 					ft_node_ptr(attach_node_flag));
+			struct cds_ft_inode_flag *gp_nf = NULL;
 
-			if (ft_get_parent_slot(attach_meta, ft) !=
+			if (ft_resolve_parent_slot(attach_meta, ft, &gp_nf) !=
 					attach_node_flag_ptr) {
 				ret = -EAGAIN;
 				goto check_error;
 			}
 			/*
-			 * The edges below write @attach_node_flag_ptr, a slot in
-			 * the GRANDPARENT, so the grandparent is a lock-set member
-			 * -- ACQUIRE it rather than merely guarding it (I-1's
-			 * second half).  It is a value-swap target: the op does not
-			 * change its nr_child and never copies its body under the
-			 * lock, so the release terminal is clean and no count edge
-			 * shares the word.  A miss aborts and re-descends
-			 * (f7cc59f9), which is what the ft_get_parent_slot
-			 * mismatch just above already does for the stale-slot case.
+			 * The reserved slot is INSIDE the attach node, whose
+			 * position in the trie is the grandparent's slot: the
+			 * grandparent is a lock-set member, so ACQUIRE it rather
+			 * than merely guard it (I-1's second half).  It is a
+			 * value-swap target: the op does not change its nr_child
+			 * and never copies its body under the lock, so the release
+			 * terminal is clean and no count edge shares the word.  A
+			 * miss aborts and re-descends (f7cc59f9), which is what the
+			 * resolver mismatch just above already does for the
+			 * stale-slot case.  NULL @gp_nf is the root position: no
+			 * node to acquire, the root slot CAS auto-guards it.
 			 */
 			ft_flip_txn_lock_or_guard_parent(ft, ic->txn, ctx,
-				ft_parent_node(attach_meta->parent_word),
-				FT_DEPTH_FROM_DESCENT);
+				gp_nf, FT_DEPTH_FROM_DESCENT);
 #ifdef FEATURE_FT_PROBE_EMPTY_INSERT
 			__atomic_fetch_add(&cds_ft_probe_reach_attach, 1,
 				__ATOMIC_RELAXED);
@@ -2540,10 +2657,6 @@ int ft_attach_node(struct cds_ft *ft,
 				goto check_error;
 			}
 #endif
-			_ft_publish_to_parent(ft, attach_node_flag,
-				attach_node_flag_ptr, iter_dest_node_flag,
-				attach_node_flag, &rec, false);
-			ft_flip_txn_record_pub_rec(ic->txn, &rec);
 			/*
 			 * I6 count fold (rank stats ON): the attach node stays in
 			 * place, so its metadata->parent chain up to the root is

@@ -185,32 +185,75 @@ void static_array_size_check(void)
  * May a mutation write a LIVE node's {child pointer, occupancy bitmap,
  * nr_child} in place, instead of routing through a whole-node recompact?
  *
- * Only on an EXCLUSIVE trie.  Those three words are separate stores, so a
- * concurrent READER can sample them torn, and a concurrent WRITER can rebuild
- * the node from its occupied slots while the mutation is mid-flight -- which
- * drops a reserved (bit set, NULL child) hole from under the writer that
- * reserved it.  cds_ft_attr_set_exclusive declares BOTH away ("single-writer,
- * no concurrent readers"), which is what makes the in-place tier sound rather
- * than merely faster: doc/design/mcas-multiwriter-readiness.md §5.2, "an
- * exclusive trie keeps the in-place store".
+ * TWO predicates, because the tree has two in-place tiers with two different
+ * safety arguments, and a site must say which one it stands on:
  *
- * The build flag is the OPT-IN, this is the SAFETY CONDITION.  Without
- * FEATURE_FT_INSERT_IN_PLACE the answer is always no and every caller behaves
- * exactly as before; with it, a shared trie still recompacts and only an
- * exclusive one takes the O(1) path.  The flag alone used to decide, so an
- * opt-in build applied it to shared tries too -- where it asserts
- * (ft_attach_node's slot_ptr, 303 failures in 480 saturated runs) or, worse,
- * tears a publish quietly.
+ *   ft_in_place_ok(ft)       -- the POINT-OP tier.  The build flag is the
+ *                               OPT-IN; the SAFETY CONDITION is the CALLER's:
+ *                               it must HOLD the node before it writes.  Under
+ *                               a FINE strategy that is the node's own DLM lock
+ *                               (per-node spacing) or its anchor (exponential /
+ *                               root-only), taken BEFORE the reserve and
+ *                               released by the same commit that publishes the
+ *                               edge (ft_attach_node); under COARSE it is the
+ *                               FT-wide writer lock every point op already
+ *                               holds.  ☐ The delete side (ft_detach_node's
+ *                               in-place arm) never stores raw at all -- its
+ *                               slot NULL and nr_child-- are RECORDS in the
+ *                               commit, arbitrated on the holder's state word
+ *                               -- but the point removes still vouch only the
+ *                               exclusive tier below: one op at a time, and
+ *                               the delete's own validation step is next.
+ *                               Answers true on EVERY trie type -- shared or
+ *                               exclusive, coarse or fine -- so it is the
+ *                               build flag alone, and the caller's vouch is
+ *                               what a site passes down as @in_place.
+ *
+ *   ft_in_place_excl_ok(ft)  -- the legacy EXCLUSIVE-ONLY tier, for the sites
+ *                               that have NOT been converted to lock-before-
+ *                               write: the bulk reserves (a graft's / rekey's
+ *                               dst attach parent, ft-graft.h), the build-path
+ *                               wrapper ft_node_set_nth, and the bulk detaches.
+ *                               cds_ft_attr_set_exclusive declares "single-
+ *                               writer, no concurrent readers", which is what
+ *                               makes an unlocked in-place store sound there
+ *                               (mcas-multiwriter-readiness.md §5.2).  It is
+ *                               ALSO what keeps the same-trie move's reader-
+ *                               coherence witness honest: a rekey's dst attach
+ *                               parent must RELOCATE on a shared trie so
+ *                               ft_lookup_two_descents' address fold perturbs
+ *                               (ft-reintroduce-in-place-mutations.md §3), and
+ *                               this predicate is false there.
+ *
+ * WHY THE POINT-OP TIER IS SOUND AGAINST READERS: an in-place mutation NEVER
+ * REMOVES A BITMAP BIT, so no existing entry's rank moves.  The insert refuses
+ * (-ERANGE -> recompact) unless the new bit is strictly the highest, publishes
+ * the slot release-first and the gating bitmap bit last; the delete leaves the
+ * bit STICKY and only NULLs the slot, and every reader already treats a set bit
+ * over a NULL slot as "not present" (the same hole a reserved byte reads as
+ * between its reserve and its commit).  Concurrent readers were supported with
+ * exactly this protocol before the MW-with-CAS model withdrew it; what the
+ * MW model needed -- a whole-node replacement so one CAS could arbitrate every
+ * word -- the DLM locks now provide by exclusion instead.
+ *
+ * Without FEATURE_FT_INSERT_IN_PLACE both answer no and every caller behaves
+ * exactly as before (recompact-on-insert / recompact-on-delete).
  */
 static inline
 bool ft_in_place_ok(const struct cds_ft *ft)
 {
-#ifdef FEATURE_FT_INSERT_IN_PLACE
-	return ft && ft->exclusive;
-#else
 	(void) ft;
+#ifdef FEATURE_FT_INSERT_IN_PLACE
+	return true;
+#else
 	return false;
 #endif
+}
+
+static inline
+bool ft_in_place_excl_ok(const struct cds_ft *ft)
+{
+	return ft_in_place_ok(ft) && ft->exclusive;
 }
 
 static inline

@@ -17770,12 +17770,13 @@ out:
  * byte did NOT have to rebuild the destination's attach node.
  *
  * ★ WHY IT NEEDED ITS OWN TEST.  Reaching it takes BOTH halves of
- * ft_in_place_ok(): the -DFEATURE_FT_INSERT_IN_PLACE build tier AND an
- * EXCLUSIVE destination trie.  The gate carries the flag (its `in-place`
- * config) and still never reached this arm, because nothing else in either
- * suite grafts into an exclusive trie -- so the branch had ZERO coverage in
- * every configuration.  A build flag being in the gate matrix is not the same
- * as the feature's runtime precondition being met.
+ * ft_in_place_excl_ok() -- the bulk reserves' tier: the
+ * -DFEATURE_FT_INSERT_IN_PLACE build flag AND an EXCLUSIVE destination trie.
+ * The gate carries the flag (its `in-place` config) and still never reached
+ * this arm, because nothing else in either suite grafts into an exclusive trie
+ * -- so the branch had ZERO coverage in every configuration.  A build flag
+ * being in the gate matrix is not the same as the feature's runtime
+ * precondition being met.
  *
  * ★ AND IT ASSERTS THE ARM RAN, not merely that the graft worked.  An in-place
  * reserve mutates the attach node's occupancy bitmap where it stands; a

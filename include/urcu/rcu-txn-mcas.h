@@ -247,7 +247,16 @@ enum urcu_txn_desc_status {
  *
  * Recording BOTH kinds on one slot WITHIN one txn is the same contradiction in
  * miniature; urcu_txn_record_chain() resolves it fail-safe (MW dominates) and
- * debug builds trap the likely bug.
+ * debug builds trap the likely bug -- with ONE ordered exception.  An MW
+ * record FIRST (a validate, or the CAS that takes a lock living in that word),
+ * then SW records on the same slot, is the "validate-then-update under
+ * exclusion" shape: the embedder took or checked the word by CAS and then
+ * updates bits of it holding the exclusion it just established.  The record
+ * stays MW -- installed by CAS against the first record's expected old -- which
+ * is exactly right, so this order is accepted.  The other order, an SW park
+ * FIRST and an MW record after it, has no such reading: the SW park claimed an
+ * exclusion the later CAS says the embedder does not trust, and debug builds
+ * still trap it.
  */
 enum urcu_txn_kind {
 	URCU_TXN_KIND_SW = 0,
@@ -1035,9 +1044,14 @@ bool urcu_txn_desc_rebase_validate(struct urcu_txn_desc *t, void **slot,
  * enum urcu_txn_kind).  Resolve it FAIL-SAFE: MW DOMINATES.  Promote the record
  * to the CAS-old install, which is correct whether or not the slot is actually
  * shared, where keeping the plain SW park would race a concurrent MW writer and
- * tear or lose a write.  It is still the embedder's bug, so debug builds assert
- * it (an abort here would only livelock -- the retry re-hits the same store
- * sequence -- so release fails safe rather than poisoning).
+ * tear or lose a write.  In one ORDER it is not a bug at all: an MW record
+ * first (a validate, or the lock take on that very word) followed by SW
+ * updates of the same slot is the validate-then-update-under-exclusion shape
+ * (enum urcu_txn_kind), and the MW-dominant resolve is precisely its
+ * meaning, so it is accepted silently.  The other order -- SW parked first,
+ * MW after -- is still the embedder's bug, so debug builds assert it (an
+ * abort here would only livelock -- the retry re-hits the same store sequence
+ * -- so release fails safe rather than poisoning).
  */
 static inline
 bool urcu_txn_record_chain(struct urcu_txn_desc *t, void **slot,
@@ -1048,7 +1062,9 @@ bool urcu_txn_record_chain(struct urcu_txn_desc *t, void **slot,
 
 	if (r != NULL) {
 		URCU_TXN_REC_DBG_CHAIN(r);
-		urcu_assert_debug(r->kind == kind);
+		/* MW first, SW after: accepted (see above); SW first, MW after: trapped. */
+		urcu_assert_debug(r->kind == kind ||
+				r->kind == URCU_TXN_KIND_MW);
 		if (kind == URCU_TXN_KIND_MW && r->kind != URCU_TXN_KIND_MW) {
 			r->kind = URCU_TXN_KIND_MW;	/* MW dominates: fail-safe to CAS */
 			t->nr_mw++;			/* promoted SW -> MW: now counts */

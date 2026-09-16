@@ -183,7 +183,9 @@ int ft_merge_unlink_src_subtree(struct cds_ft *src_ft,
 				 * -detached_count rides ft_detach_node's own commit (exact
 				 * under concurrent writers; magnitude-agnostic leaf machinery).
 				 */
-				-(long) detached_count, NULL, false, NULL, NULL);
+				-(long) detached_count, NULL, false, NULL, NULL,
+				/* bulk: exclusive-only tier */
+				ft_in_place_excl_ok(src_ft));
 	}
 	if (ret < 0) {
 		/*

@@ -440,7 +440,9 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 				ret = ft_detach_node(ft, &lctx, d.nfp, d.pnfp, d.depth,
 						false, NULL, pubp, runp, NULL, NULL, 0,
 						-(long) detached_count, NULL, false,
-						NULL, NULL);
+						NULL, NULL,
+						/* bulk: exclusive-only tier */
+						ft_in_place_excl_ok(ft));
 				urcu_txn_end(&optxn);
 				assert(ret != -ENOENT);
 				if (ret < 0) {

@@ -2512,7 +2512,8 @@ int ft_detach_node(struct cds_ft *ft,
 		struct ft_flip_txn *shared_txn,
 		bool record_only,
 		const struct ft_parent_hint *src_held_hint,
-		struct ft_detach_recompact_out *recompact_out)
+		struct ft_detach_recompact_out *recompact_out,
+		bool in_place)
 {
 	struct cds_ft_metadata *metadata_stack[FT_MAX_DEPTH];
 	struct cds_ft_inode_flag *iter_node_flag;
@@ -4573,6 +4574,7 @@ int ft_detach_node(struct cds_ft *ft,
 				&old_recompacted_node,
 				metadata_stack[nr_branch - 1],
 				n, (struct cds_ft_inode_flag *) topmost_external_nodes,
+				in_place,
 				detach_parent_flag_ptr == &ft->root,
 				cur_depth, pub, commit_txn, replace_hint,
 				&lctx);
@@ -4917,11 +4919,13 @@ int ft_detach_node(struct cds_ft *ft,
 					ft_parent_node(iter_meta->parent_word));
 			/*
 			 * PHASE B, STEP B2 -- THE ARM, RECOMPACTION PUBLISH
-			 * (fused).  This is where the remove surface commits:
-			 * an in-place delete needs an EXCLUSIVE trie
-			 * (ft_in_place_ok), which the per-op arm refuses
-			 * anyway, so on a shared trie every delete recompacts
-			 * and lands here or on the non-fused twin below.
+			 * (fused).  This is where the remove surface commits
+			 * whenever the delete RECOMPACTED: every delete does on
+			 * a build without FEATURE_FT_INSERT_IN_PLACE, and one
+			 * that would shrink the holder below min_child does on
+			 * any build (@in_place, ft_node_replace_ptr); an
+			 * in-place delete commits through the pub-armed arm
+			 * above instead.
 			 *
 			 * PLACEMENT.  The op's last ft_flip_txn_lock_register
 			 * on @commit_txn is ft_node_recompact's RELEASE-half
@@ -7293,7 +7297,10 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 				key_len, true, fuse_cell, pubp, NULL, NULL, node,
 				1 /* @node is this key's SOLE entry */,
 				-1 /* leaf key removed: detach owns the -1 */,
-				NULL, false, NULL, NULL);
+				NULL, false, NULL, NULL,
+				/* ☐ in-place DELETE: the exclusive tier until its own
+				 * validation step (ft_in_place_excl_ok's header). */
+				ft_in_place_excl_ok(ft));
 			/* @node's freeze rode the detach commit (freeze_leaf). */
 		} else {
 			/*
@@ -7531,7 +7538,10 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 				key_len, true, fuse_cell, pubp, NULL, NULL, node,
 				1 /* @node is this key's SOLE entry */,
 				-1 /* leaf key removed: detach owns the -1 */,
-				NULL, false, NULL, NULL);
+				NULL, false, NULL, NULL,
+				/* ☐ in-place DELETE: the exclusive tier until its own
+				 * validation step (ft_in_place_excl_ok's header). */
+				ft_in_place_excl_ok(ft));
 			/* @node's freeze rode the detach commit (freeze_leaf). */
 		} else {
 			/* Removing the head, duplicates remain: key count unchanged. */
@@ -8552,7 +8562,10 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 			dead_cell, ft->ordered_list ? &pub : NULL, NULL, NULL,
 			chain_head, nr_frozen,
 			-1 /* leaf key removed: detach owns the -1 */,
-			NULL, false, NULL, NULL);
+			NULL, false, NULL, NULL,
+			/* ☐ in-place DELETE: the exclusive tier until its own
+			 * validation step (ft_in_place_excl_ok's header). */
+			ft_in_place_excl_ok(ft));
 		ft_removeall_fault_scope_exit();
 	}
 

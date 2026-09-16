@@ -1,8 +1,10 @@
 # Fractal Trie — re-introducing in-place node mutations (2026-09-15)
 
-Status: DESIGN OF RECORD. No implementation yet. Records why in-place mutation
-was withdrawn, why the reasons no longer apply, the one blocker that survives,
-and the agreed cure.
+Status: **§6 LANDED for the point INSERT (2026-09-15)** — the rest is the design
+of record it was implemented from. §1–§5 record why in-place mutation was
+withdrawn, why the reasons no longer apply, the one blocker that survived, and
+the agreed cure; §4b–§4e are the measured history of the first attempt (reverted
+at @1bbc8570) and are kept because §6 is built on their findings.
 
 Related: `doc/design/mcas-multiwriter-readiness.md` §4 (the disjoint-word
 hazard) and §5.2 ("an exclusive trie keeps the in-place store"),
@@ -335,3 +337,137 @@ Also surfaced by the review, unfixed and worth its own look:
   the occupancy bitmap a sticky hint set with an atomic OR, with a cleanup
   recompact once stale bits (`popcount(bitmap) - nr_child`) get high, keeping
   pigeon's O(1) insert *and* delete. It has the same §3 prerequisite.
+
+
+## 6. LANDED — the point-op insert tier, lock-before-write (2026-09-15)
+
+Mathieu's framing, verbatim: *"we need to make sure the fine and exponential
+locks suffice to protect the node state updated by the in-place mutation ops,
+once we have this, then we can wire up those in place mutation operations
+again."* One op at a time: this section is the INSERT. The delete tier keeps the
+exclusive-only predicate until its own step (§6.5).
+
+### 6.1 The shape
+
+- **Two predicates, not one** (`ft-helpers.h`). `ft_in_place_ok(ft)` is the
+  build flag alone: the safety condition is the CALLER's, and a site passes its
+  own vouch down as `@in_place`. `ft_in_place_excl_ok(ft)` is the legacy
+  exclusive-only tier, kept for every site not yet converted to
+  lock-before-write: the bulk reserves (graft / rekey dst attach parent), the
+  build-path wrapper `ft_node_set_nth`, the bulk detaches, and — for now — the
+  point removes. §3's witness needs exactly that: a same-trie move's dst attach
+  parent still relocates on a shared trie, because its reserve vouches only the
+  exclusive tier. The eight `ft-rekey.h` gates that spelled `ft_in_place_ok`
+  now spell `ft_in_place_excl_ok`, unchanged in meaning.
+- **`@in_place` threaded** through `ft_node_set_nth_rec` → `_ft_node_set_nth` →
+  the popcount / pigeon setters, and `ft_node_replace_ptr` →
+  `_ft_node_replace_ptr` → the two class `replace_ptr`s, and `ft_detach_node`.
+  Build-invisible copies (recompact / COW loops) pass `true`; nothing they write
+  is reader-visible.
+- **The hoist** (`ft_attach_node`). Under the FINE strategy the attach node —
+  its own DLM lock at per-node spacing, its ANCHOR at exponential / root-only —
+  is acquired through `ft_flip_txn_lock_or_guard_parent_ex` BEFORE the reserve,
+  REGISTERED in `ic->txn` with its `{LOCK|s -> s}` release; a MISS bails
+  `-EAGAIN` before any raw store. Under COARSE the FT-wide writer lock is the
+  exclusion and nothing per-node is taken. The reserve then writes the bitmap
+  bit and the slot on a node the op holds.
+- **The nested held-set frame** (`rctx`, `held.outer = &ctx->held`,
+  `held.txn = ic->txn`) is what lets the RELOCATION arm dedupe: when the reserve
+  cannot stay in place, `ft_node_recompact`'s `{C, P, GP}` acquire finds C
+  already held (SHARED) instead of refusing its own mark (§4e's livelock), and
+  the fused retire chains C's tombstone onto the hoist's release —
+  `{LOCK|s -> TOMBSTONE|s}` at per-node, tombstone-beside-anchor-release above.
+- **ONE acquire, not two.** The post-reserve `lock_or_guard` is gone for the
+  fine strategy (its SHARED exit at a coarse spacing planted the MW guard that
+  collided with the SW count, §4e / @898c08ce's control); COARSE keeps its §4.B
+  guard, recorded before the count edge as the ordering rule requires.
+- **The in-place arm resolves (grandparent, slot) ONCE**, through
+  `ft_resolve_parent_slot`, and no longer republishes: holding the attach node's
+  state word does not freeze its PARENT word, and the old same-value republish
+  re-read that word raw inside `_ft_publish_to_parent_meta_at` — measured
+  landing on a peer's re-home PROXY (`ft_popcount_node_get_ith_pos`'s type
+  assert in `inv_writer_progress_chainmerge`, the parent word settled to the
+  peer's fresh copy by the time the core was read). The grandparent ACQUIRE is
+  the validation the republish only approximated.
+
+### 6.2 The engine's kind check, and where a kind mix is fixed
+
+`urcu_txn_record_chain`'s `r->kind == kind` debug police fired on the
+COARSE-strategy insert (an MW §4.B validate on the attach node's state word,
+then the SW `nr_child++`). Mathieu: *"kind conflict between taking the lock and
+updating bits on the same word as the lock with the lock held is benign
+(over-strict check)"* — the release path already resolves it MW-dominant, which
+is exactly right under the exclusion. Decided: relax the check IN THE ENGINE,
+accepting the ordered shape (first record MW — a validate or the lock take on
+that word — then SW updates of it) and still trapping SW-then-MW. Not in the FT:
+an FT-side "inherit the slot's kind" cost a linear `urcu_txn_find` per state
+record and turned the dense-node unit test quadratic (a 2-minute suite ran 15+
+minutes on every build; read as a hang until the timing data said otherwise).
+
+The one SW-then-MW instance was pre-existing (red at HEAD, debug + in-place +
+ROOT-ONLY: an exclusive trie's in-place delete recorded the anchor's release SW
+on the ROOT's word, then `ft_remove_one_commit`'s fused `nr_child--` on the same
+word through the cell-edge loop's always-MW branch). Fixed at the site: when
+`ft_flip_txn_owns(txn, state_meta)` the count records through
+`ft_flip_txn_record_state` (SW under `structural_sw`, chained onto the release);
+otherwise it rides `edges[]` MW as before. ☠ NOT by dispatching `edges[]` on its
+tag: `URCU_TXN_TAG` and `FT_STATE_PROXY` are both bit 0, and the cell-edge
+producers leave `owner_held` uninitialised — that dispatch shipped an SW park of
+a lock-free cell edge (`owner_held == 7`, `inv_rekey_fine_mixed_writers`) before
+the debug owner assert caught it.
+
+### 6.3 Measured: the locks suffice at the store
+
+`-DFT_DEBUG_CHAIN_HOLD -DFEATURE_FT_HOLD_TRACE -DFEATURE_FT_INSERT_IN_PLACE`,
+`test_urcu_ft_inv` (list on, per-node), the node-body class declared LOCKED at
+every in-place store, put through the registry / ledger / wide-ctx ladder:
+
+| site (taken arm) | total | WLOCK | hidden | lockOK | lockVIOL |
+|---|---|---|---|---|---|
+| `ft_popcount_node_set_nth:521` (3-level) | 3977298 | 189701 | 1131980 | 2655927 | **0** |
+| `ft_popcount_node_set_nth:154` (5+3) | 171188 | 108383 | 0 | 62805 | **0** |
+| `ft_popcount_node_set_nth:335` (6+2) | 379739 | 168884 | 0 | 210855 | **0** |
+| `ft_popcount_node_set_nth:710` (1-level) | 176582 | 18514 | 0 | 158068 | **0** |
+| `ft_pigeon_node_set_nth:893` | 34348418 | 391424 | 33796626 | 160368 | **0** |
+
+Before the hoist the same population read `lockOK=0 lockVIOL=4040923` (§4b).
+The one row with violations (`:516`, 19465) is a REFUSED arm: callers that
+declined the tier (the exclusive-only wrapper on a fresh build node) and
+recompact; no store happens there, and the LOCKED declaration on an unpublished
+node is the audit's known false positive.
+
+### 6.4 Validation (all with THP disabled per process — see §6.6)
+
+Release `-O2 -DNDEBUG -DFEATURE_FT_INSERT_IN_PLACE`, debug
+`--enable-rcu-debug` with the same flag (detector verified armed), the audit
+build above, and the default build; each at per-node / exponential / root-only
+(the debug and release in-place trees carry `-DFEATURE_FT_LOCK_SPACING_ENV`):
+ft_unit 357/357 and ft_inv 152/152 in the list-on, list-off and MW modes —
+see the commit message for the leg table.
+
+### 6.5 Open
+
+- **The DELETE tier** (`ft_detach_node`'s `@in_place` from the point removes)
+  is still `ft_in_place_excl_ok`. Its stores are records, arbitrated on the
+  holder's state word by the fused `nr_child--` CAS, so the conversion is a
+  predicate flip plus its own validation step. The first widening attempt (all
+  tiers at once) showed what that step must look at: a duplicate-chain walk
+  into freed memory in `inv_concurrent_same_key_removes` at exponential spacing
+  and a lost key in `inv_sibling_split_compress_unpinned` — neither reproduced
+  once the delete tier was held back, so they belong to that step.
+- The bulk reserves and the build-path wrapper stay exclusive-only; each needs
+  its own lock-before-write before `ft_in_place_excl_ok` can retire.
+- The default build still compiles the tier out. Flipping
+  `FEATURE_FT_INSERT_IN_PLACE` on by default is a gate-wide decision.
+
+### 6.6 Operational: the stall that was not a livelock
+
+Two whole rounds of this validation "hung" box-wide, the unchanged default
+build included. It was transparent-hugepage direct compaction on this host
+(`enabled=always`, a THP-backed arena), seen from inside the stall: 100% system
+time, zero user time, no syscall, zero voluntary context switches, `SIGKILL`
+ignored, and `/proc/vmstat`'s compaction counters FLAT — a fault stuck inside
+one compaction increments nothing until it returns. Both frozen PCs were the
+first touch of a fresh 2 MB-aligned arena region. Every leg here runs with an
+`LD_PRELOAD` constructor calling `prctl(PR_SET_THP_DISABLE, 1)`; the same
+mechanism was root-caused earlier for ft_unit's `same_path` row.

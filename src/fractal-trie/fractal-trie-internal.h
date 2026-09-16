@@ -534,29 +534,41 @@ unsigned int ft_lock_level_index(unsigned int depth)
 #endif
 
 /*
- * FEATURE_FT_INSERT_IN_PLACE: in-place occupancy-bitmap safe-append (the
- * single-writer insert fast path).  OPT-IN; RECOMPACT-ON-INSERT is the DEFAULT.
+ * FEATURE_FT_INSERT_IN_PLACE: in-place occupancy-bitmap safe-append (the O(1)
+ * insert tier) and in-place soft-delete.  OPT-IN; RECOMPACT-ON-INSERT is the
+ * DEFAULT.
  *
- * When enabled (-DFEATURE_FT_INSERT_IN_PLACE), an insert that lands at a node's
- * tail rank with spare tier capacity is applied IN PLACE: the child slot is
- * published and the node's occupancy-bitmap bit is set with a relaxed store on
- * the LIVE node's metadata word (ft_popcount_node_set_nth Cases 2A/2B,
- * ft_pigeon_node_set_nth).  This is the cheap O(1) insert tier, but it mutates a
- * live node's words disjointly, so it is NOT safe against concurrent writers.
+ * When enabled (-DFEATURE_FT_INSERT_IN_PLACE), a POINT insert that lands at a
+ * node's tail rank with spare tier capacity is applied IN PLACE: the child slot
+ * is published and the node's occupancy-bitmap bit is set with a relaxed store
+ * on the LIVE node's body (ft_popcount_node_set_nth Cases 2A/2B,
+ * ft_pigeon_node_set_nth); a point delete that leaves the holder above
+ * min_child NULLs the slot and decrements nr_child through the commit instead
+ * of rebuilding the node (☐ still exclusive-only for the point removes: the
+ * delete tier's own validation step is next).  On EVERY trie type: what makes
+ * the insert store safe
+ * against concurrent WRITERS is that the op HOLDS the node before it writes --
+ * the node's DLM lock, or its anchor at a coarser spacing, or the FT-wide lock
+ * under the coarse strategy (ft_attach_node's acquire hoist; ft_in_place_ok's
+ * header) -- and what makes it safe against concurrent READERS is that an
+ * in-place mutation never removes a bitmap bit, so no existing rank moves.
+ * The bulk ops (graft / merge / rekey reserves and detaches) and the build-path
+ * wrapper stay on the exclusive-only tier (ft_in_place_excl_ok) until each is
+ * converted to lock-before-write; a same-trie move's dst attach parent must
+ * relocate on a shared trie anyway, for the reader-coherence witness.
  *
  * By DEFAULT (the macro undefined) every new-occupancy insert (i.e. not an
  * in-place pointer replace at an already-occupied slot) instead reports -ERANGE,
  * so the setter wrapper (ft_node_set_nth_rec) routes it through
  * ft_node_recompact(ADD_SAME) -- a fresh node carrying the new entry AND its
  * bitmap is built build-invisibly and the parent edge is flipped, exactly as a
- * non-tail insert already does.  This removes the last reader-visible in-place
- * node-word mutation (the Invariant-2 disjoint-word hazard, see
- * doc/design/mcas-multiwriter-readiness.md S4): every node change becomes a
- * whole-node replacement via the parent flip-txn edge -- the multi-writer-safe
- * shape.  Behaviour-identical under a single writer (the recompact path is the
- * same one a non-tail insert takes), at the cost of turning the O(1) in-place
- * insert into an O(node) alloc-and-copy recompact.  Re-enabling the in-place
- * fast path for a single-writer trie (a runtime gate) is a future perf knob.
+ * non-tail insert already does.  That was the shape the MW-with-CAS model
+ * needed (the Invariant-2 disjoint-word hazard, see
+ * doc/design/mcas-multiwriter-readiness.md S4): every node change a whole-node
+ * replacement via the parent flip-txn edge, so one CAS could arbitrate every
+ * word.  The DLM locks now provide that exclusion, at the cost the default
+ * still pays: the O(1) in-place insert turned into an O(node) alloc-and-copy
+ * recompact.  See doc/design/ft-reintroduce-in-place-mutations.md.
  *
  * Both popcount and pigeon nodes recompact uniformly here.  FUTURE (noted,
  * not done -- kept simple for now): a PIGEON slot is direct-indexed, so its
@@ -1328,8 +1340,10 @@ struct ft_pub_rec {
  *              list/rank modes with the detector armed, and the assert fires
  *              at ft_unit test 24 of the in-place build.  So it was LATENT,
  *              never live: the one config that plants the bad tag has no
- *              concurrent resolver by that feature's own contract.  It goes
- *              live the day in-place is extended to a concurrent trie.
+ *              concurrent resolver by that feature's own contract.  In-place
+ *              IS now extended to concurrent tries for the point ops
+ *              (ft_in_place_ok), which is what the assert beside the edge
+ *              is armed for.
  *              ☞ ft_state_edge, and the assert beside its caller.
  *
  *   FT-SLOT-2  ☑ CLOSED IN BOTH PLACES.  The MARK CHECK is BACK in
