@@ -506,3 +506,24 @@ completed in that gap. The step keeps its relocations' node locks (row 4).
   45 in ft_unit.
 - So no bulk-op take provides exclusion or stale-plan detection that per-FT locking
   does not already give.
+
+**Removing those takes is QUEUED AS AN OPTIMIZATION (Mathieu: "having bulk ops
+take fine-grained locking is not a correctness issue").** A first prototype
+answered every bulk-op member at the acquire choke point as already held. It did
+not survive, because bulk bodies are wired to a real take at about 124
+lock-lifecycle call sites:
+- `ft_meta_lock_release` 52, `ft_flip_txn_lock_register` 24,
+  `ft_meta_lock_release_if_held` 16, anchor/held release records 16,
+  `ft_flip_txn_record_release_lock` 9, fenced tombstones that expect `LOCK` 7;
+- `inv_graft_root_swap_cross_view` registered the untaken lock and the commit's
+  release sweep asserted;
+- the rekey fold tests chained an MW record onto an SW one;
+- the rig slowed from 250+ to 1-5 bulk cycles in 20 s.
+
+Two shapes for later:
+- **A (central):** a sentinel `lock_snap` for "held by per-FT exclusion, never
+  taken", honoured by register, the release records, the fenced tombstone, and a
+  bulk-scoped `ft_meta_lock_release`.
+- **B (per site):** each bulk site stops acquiring and drops its lifecycle code.
+
+`doc/design/ft-compact-bulk-rig.c` is the harness for it.
