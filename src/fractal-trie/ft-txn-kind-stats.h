@@ -784,6 +784,222 @@ void ft_win_lookup(const struct urcu_txn_record *r)
 }
 #endif	/* FT_WINNER_DBG */
 
+#ifdef FT_DEBUG_LIVE_VALIDATE
+#ifndef FT_WINNER_DBG
+#error "-DFT_DEBUG_LIVE_VALIDATE needs -DFT_WINNER_DBG (the value the losing CAS observed)"
+#endif
+/*
+ * THE LIVE VALIDATION, MEASURED.  ft_reparent_record_meta records a re-homed
+ * child's state word {live -> live} MW whenever the op does not hold that word:
+ * a read check that aborts the commit if the child was locked, retired or
+ * changed meanwhile.  Per re-home CALL SITE: how many were recorded, whether the
+ * child is its own anchor and whether the op holds the child's anchor (under
+ * -DFT_DEBUG_STRUCT_ANCHOR), and -- when one LOSES -- what beat it, read from
+ * the value the losing CAS observed (URCU_TXN_REC_LOST).
+ */
+enum ft_lv_cause {
+	FT_LV_SEEN_NONE = 0,	/* no observed value */
+	FT_LV_PROXY_LOCKTAKE,	/* a peer's parked lock take (MW_LOCK) */
+	FT_LV_PROXY_STATE,	/* a peer's parked STATE record (validate / MW retire) */
+	FT_LV_PROXY_SW,		/* a holder's SW park */
+	FT_LV_PROXY_OTHER,
+	FT_LV_LOCK_MEMBER,	/* LOCK set, the child is a MEMBER some op claims */
+	FT_LV_LOCK_ANCHOR,	/* LOCK set, nobody claims the child: held as an ANCHOR */
+	FT_LV_TOMB,		/* retired */
+	FT_LV_NRCHILD,		/* only nr_child moved */
+	FT_LV_OTHER,
+	FT_LV_NR,
+};
+static const char * const ft_lv_cause_name[FT_LV_NR] = {
+	"seen_none", "proxy_locktake", "proxy_state", "proxy_sw",
+	"proxy_other", "LOCK_member", "LOCK_anchor", "TOMB", "nr_child",
+	"other",
+};
+#define FT_LV_SITES	64
+static struct ft_lv_site {
+	const void *ra;
+	unsigned long rec, rec_self, rec_notself, rec_held, rec_notheld;
+	unsigned long lost;
+	unsigned long cause[FT_LV_NR];
+} ft_lv_sites[FT_LV_SITES];
+static unsigned long ft_lv_site_overflow;
+/* The holder's acquire site, for LOCK_member. */
+#define FT_LV_FNLINE	32
+static struct {
+	const char *fn;
+	int line;
+	unsigned long n;
+} ft_lv_fnline[FT_LV_FNLINE];
+static pthread_mutex_t ft_lv_lock = PTHREAD_MUTEX_INITIALIZER;
+/* slot -> site, this thread's recent validations (the loser is one of them). */
+#define FT_LV_RING	256
+static __thread struct {
+	void **slot;
+	int site;
+} ft_lv_ring[FT_LV_RING];
+static __thread unsigned int ft_lv_ring_n;
+
+static int ft_lv_site_of(const void *ra)
+{
+	int i;
+
+	for (i = 0; i < FT_LV_SITES; i++) {
+		const void *cur = CMM_LOAD_SHARED(ft_lv_sites[i].ra);
+
+		if (cur == ra)
+			return i;
+		if (!cur)
+			break;
+	}
+	pthread_mutex_lock(&ft_lv_lock);
+	for (i = 0; i < FT_LV_SITES; i++) {
+		if (ft_lv_sites[i].ra == ra)
+			break;
+		if (!ft_lv_sites[i].ra) {
+			CMM_STORE_SHARED(ft_lv_sites[i].ra, ra);
+			break;
+		}
+	}
+	pthread_mutex_unlock(&ft_lv_lock);
+	if (i < FT_LV_SITES)
+		return i;
+	uatomic_inc(&ft_lv_site_overflow);
+	return -1;
+}
+
+/* @self / @held: 1, 0, or -1 when not asked. */
+static void ft_lv_note(void **slot, const void *ra, int self, int held)
+{
+	int si = ft_lv_site_of(ra);
+	struct ft_lv_site *st;
+
+	ft_lv_ring[ft_lv_ring_n % FT_LV_RING].slot = slot;
+	ft_lv_ring[ft_lv_ring_n % FT_LV_RING].site = si;
+	ft_lv_ring_n++;
+	if (si < 0)
+		return;
+	st = &ft_lv_sites[si];
+	uatomic_inc(&st->rec);
+	if (self == 1)
+		uatomic_inc(&st->rec_self);
+	else if (self == 0)
+		uatomic_inc(&st->rec_notself);
+	if (held == 1)
+		uatomic_inc(&st->rec_held);
+	else if (held == 0)
+		uatomic_inc(&st->rec_notheld);
+}
+
+static void ft_lv_lost(const struct urcu_txn_record *r)
+{
+	unsigned int i, n = ft_lv_ring_n < FT_LV_RING ? ft_lv_ring_n : FT_LV_RING;
+	int si = -1, found = 0;
+	void *seen;
+	enum ft_lv_cause c;
+
+	for (i = 0; i < n; i++) {
+		unsigned int k = (ft_lv_ring_n - 1 - i) % FT_LV_RING;
+
+		if (ft_lv_ring[k].slot == r->slot) {
+			si = ft_lv_ring[k].site;
+			found = 1;
+			break;
+		}
+	}
+	if (!found)
+		return;		/* not a live validation this thread recorded */
+	seen = ft_win_seen_tls.valid && ft_win_seen_tls.rec == r ?
+		ft_win_seen_tls.seen : NULL;
+	if (!seen) {
+		c = FT_LV_SEEN_NONE;
+	} else if (urcu_txn_is_proxy(seen, FT_STATE_PROXY)) {
+		const struct urcu_txn_record *wr =
+			urcu_txn_untag(seen, FT_STATE_PROXY);
+		unsigned int wcls = ft_ab_code_cls(
+			CMM_LOAD_SHARED(wr->dbg_embedder));
+
+		c = wcls == FT_AB_MW_LOCK ? FT_LV_PROXY_LOCKTAKE :
+			wcls == FT_AB_SW ? FT_LV_PROXY_SW :
+			wcls == FT_AB_MWA_BASE + FT_TK_MWA_STATE ?
+				FT_LV_PROXY_STATE : FT_LV_PROXY_OTHER;
+	} else {
+		uintptr_t sv = (uintptr_t) seen;
+		uintptr_t diff = sv ^ (uintptr_t) r->old_ptr;
+
+		if (sv & FT_STATE_LOCK) {
+#ifdef FEATURE_FT_HOLD_TRACE
+			const struct cds_ft_metadata *m = caa_container_of(
+				(uintptr_t *) r->slot,
+				struct cds_ft_metadata, state);
+
+			if (CMM_LOAD_SHARED(m->dbg_owner_tid)) {
+				const char *fn = m->dbg_owner_fn;
+				int line = m->dbg_owner_line;
+
+				c = FT_LV_LOCK_MEMBER;
+				pthread_mutex_lock(&ft_lv_lock);
+				for (i = 0; i < FT_LV_FNLINE; i++) {
+					if (!ft_lv_fnline[i].fn) {
+						ft_lv_fnline[i].fn = fn;
+						ft_lv_fnline[i].line = line;
+					}
+					if (ft_lv_fnline[i].fn == fn &&
+							ft_lv_fnline[i].line == line) {
+						ft_lv_fnline[i].n++;
+						break;
+					}
+				}
+				pthread_mutex_unlock(&ft_lv_lock);
+			} else {
+				c = FT_LV_LOCK_ANCHOR;
+			}
+#else
+			c = FT_LV_LOCK_ANCHOR;
+#endif
+		} else if (sv & FT_STATE_TOMBSTONE) {
+			c = FT_LV_TOMB;
+		} else if (!(diff & ~FT_STATE_NR_CHILD_MASK)) {
+			c = FT_LV_NRCHILD;
+		} else {
+			c = FT_LV_OTHER;
+		}
+	}
+	if (si < 0)
+		return;
+	uatomic_inc(&ft_lv_sites[si].lost);
+	uatomic_inc(&ft_lv_sites[si].cause[c]);
+}
+
+static void ft_lv_report(void) __attribute__((destructor));
+static void ft_lv_report(void)
+{
+	int i, j;
+
+	fprintf(stderr, "\n=== FT_LIVE_VALIDATE: {live -> live} child-state checks, per re-home call site (ra base: cds_ft_create=%p) ===\n",
+		(void *) &cds_ft_create);
+	for (i = 0; i < FT_LV_SITES; i++) {
+		const struct ft_lv_site *st = &ft_lv_sites[i];
+
+		if (!st->ra)
+			continue;
+		fprintf(stderr, "FT_LV ra=%p rec=%lu self=%lu notself=%lu "
+			"held=%lu notheld=%lu lost=%lu", st->ra, st->rec,
+			st->rec_self, st->rec_notself, st->rec_held,
+			st->rec_notheld, st->lost);
+		for (j = 0; j < FT_LV_NR; j++)
+			if (st->cause[j])
+				fprintf(stderr, " %s=%lu", ft_lv_cause_name[j],
+					st->cause[j]);
+		fprintf(stderr, "\n");
+	}
+	for (i = 0; i < FT_LV_FNLINE && ft_lv_fnline[i].fn; i++)
+		fprintf(stderr, "FT_LV LOCK_member holder %s:%d n=%lu\n",
+			ft_lv_fnline[i].fn, ft_lv_fnline[i].line,
+			ft_lv_fnline[i].n);
+	fprintf(stderr, "FT_LV site_overflow=%lu\n", ft_lv_site_overflow);
+}
+#endif	/* FT_DEBUG_LIVE_VALIDATE */
+
 static
 void ft_ab_note_lost(const struct urcu_txn_desc *t,
 		const struct urcu_txn_record *r)
@@ -792,6 +1008,10 @@ void ft_ab_note_lost(const struct urcu_txn_desc *t,
 		ft_ab_code(FT_AB_UNSET, FT_AB_OWN_NA);
 	ft_ab_lost_tag = r ? r->proxy_tag : 0;
 	ft_ab_lost_valid = r != NULL;
+#ifdef FT_DEBUG_LIVE_VALIDATE
+	if (r && r->proxy_tag == FT_STATE_PROXY && r->old_ptr == r->new_ptr)
+		ft_lv_lost(r);
+#endif
 #ifdef FT_WINNER_DBG
 	/*
 	 * The winner lookup runs HERE, at the first instant after the lost

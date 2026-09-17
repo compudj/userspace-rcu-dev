@@ -415,3 +415,54 @@ never locks. Every other decision read found:
 | `ft_dlm_acquire_set_at` dedupe | covering hold is LOCK, PROXY or TOMBSTONE | PROXY-inclusive |
 | `ft_flip_txn_record_anchor_release*`, `ft_remove_one_commit`, `ft_glue_tombstone_free_list` | `urcu_txn_load` | resolved through the txn |
 | trace, stats, verify, and the probes themselves | diagnostics | not a decision |
+
+---
+
+## 8. The live validation of a re-homed child, measured (Mathieu: "I worry about the live validation")
+
+When an op re-homes a child whose state word it does not hold,
+`ft_reparent_record_meta` records that word `{live -> live}` MW. This is a read
+check: the commit aborts if the child was locked, retired or changed meanwhile.
+The code gives its purpose as catching "a child a PEER froze mid-recompact".
+`-DFT_DEBUG_LIVE_VALIDATE` (on top of `-DFT_DEBUG_TXN_KIND -DURCU_TXN_REC_DBG
+-DFT_WINNER_DBG`) records, per re-home call site:
+- how many checks were recorded;
+- whether the child is its own anchor, and whether the op holds the child's anchor
+  (with `-DFT_DEBUG_STRUCT_ANCHOR`);
+- for each check that LOSES, what beat it, read from the value the losing CAS
+  observed.
+
+ft_inv, one leg each:
+
+| re-home site | per-node: checks / lost (cause) | exponential: checks / lost (cause) |
+|---|---|---|
+| `ft_reparent_record`, skip-compressed child (its callers: the `ft_node_recompact` sweep, compaction's compressed relocation, the rekey COW, the bulk glue) | 187,662 / 1,910 (LOCK held by a member claim 1,792, all `ft_detach_orphan_planlock`; LOCK unclaimed 118) | 192,304 / **0** |
+| ... internal child | 533,293 / 0 | 518,790 / 0 |
+| ... compressed child | 183,158 / 0 | 197,348 / 0 |
+| chain-compress fuse, the surviving child (`ft_record_child_back_edge`) | 92,772 / 4,839 (LOCK unclaimed 2,545, nr_child 2,141, member claim 153) | 87,110 / 235 (LOCK unclaimed 227) |
+| split's live child (`ft_park_live_parent_edge`) | 20,398 / 77 | 23,714 / 86 (LOCK unclaimed 85) |
+
+At exponential, **every** check on a child that is not its own anchor was made
+by an op that already holds that anchor. That is 220,007 of 220,007 across the
+five sites, where property 2 predicts it (§7). For those children the check is
+redundant.
+
+**RED CONTROL, `FT_LV_RED_DROP=1`:** the check is dropped inside the
+span-preserving re-homes only (`ft_node_recompact`'s sweep and compaction's
+compressed relocation, bracketed by `FT_LV_SPAN`). No anchor moves there, and a
+peer that retires or recompacts a child must rewrite the child's slot, so it holds
+the parent the re-homer holds.
+
+| leg | checks dropped | suite | exclusion violations | dead members | dead-owner writes |
+|---|---|---|---|---|---|
+| ft_inv per-node | 994,183 | 152/152 | 0 | 0 | 0 |
+| ft_inv exponential | 1,056,364 | 152/152 | 0 | 0 | 0 |
+| ft_unit (both spacings) | 18,909 | 358/358 | 0 | 0 | 0 |
+
+The baseline legs without the drop read the same zeros.
+
+The two boundary-moving re-homes (the split's live child, the chain-compress
+fuse) keep the check. The split's is what closes §5's held order (§5.1 red
+control). There the re-homed node is a compressed node's SINGLE child and the
+old anchor of everything below it. Taking its lock instead of validating it
+avoids the fan the reverted lock-the-sweep experiment choked on.

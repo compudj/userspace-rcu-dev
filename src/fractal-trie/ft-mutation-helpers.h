@@ -26,6 +26,34 @@
 #error "ft-mutation-helpers.h is an implementation unit; #include it from fractal-trie.c only"
 #endif
 
+/*
+ * -DFT_DEBUG_LIVE_VALIDATE: a SPAN-PRESERVING re-home (a node copied with every
+ * span unchanged, so no anchor moves) is bracketed, and FT_LV_RED_DROP=1 -- a
+ * RED CONTROL, never shipped -- skips the child-state live validation inside
+ * the bracket.  Everywhere else the bracket is just the statement.
+ */
+#ifdef FT_DEBUG_LIVE_VALIDATE
+static __thread unsigned int ft_lv_span_depth;
+static int ft_lv_red_drop;
+static unsigned long ft_lv_red_dropped;
+static __attribute__((constructor))
+void ft_lv_red_init(void)
+{
+	ft_lv_red_drop = getenv("FT_LV_RED_DROP") != NULL;
+}
+static __attribute__((destructor))
+void ft_lv_red_report(void)
+{
+	if (ft_lv_red_drop)
+		fprintf(stderr, "FT_LV RED_DROP dropped=%lu\n",
+			ft_lv_red_dropped);
+}
+# define FT_LV_SPAN(stmt)						\
+	do { ft_lv_span_depth++; stmt; ft_lv_span_depth--; } while (0)
+#else
+# define FT_LV_SPAN(stmt)	do { stmt; } while (0)
+#endif
+
 #ifdef FT_DEBUG_INTERLEAVE
 /*
  * -DFT_DEBUG_INTERLEAVE: a TEST-ONLY hook called on the op's own thread at
@@ -16233,6 +16261,9 @@ void ft_glue_record_back_edge(struct cds_ft *ft, struct ft_flip_txn *txn,
  * recompact, so its plain store is a same-value write, safe before the commit.
  */
 static
+#ifdef FT_DEBUG_LIVE_VALIDATE
+__attribute__((noinline))	/* the re-home call site is the report's key */
+#endif
 void ft_reparent_record_meta(struct cds_ft *ft, struct ft_flip_txn *txn,
 		struct cds_ft_metadata *meta,
 		struct cds_ft_inode_flag *parent_nf,
@@ -16420,9 +16451,31 @@ void ft_reparent_record_meta(struct cds_ft *ft, struct ft_flip_txn *txn,
 		ft_hold_trace_drop(meta);
 		ft_flip_txn_record_state(txn, meta,
 			(void *) live_state, (void *) live_state);
-	} else
+	} else {
+#ifdef FT_DEBUG_LIVE_VALIDATE
+		int lv_self = -1, lv_held = -1;
+# ifdef FT_DEBUG_STRUCT_ANCHOR
+		struct cds_ft_metadata *lv_a;
+
+		if (ft->lock_fine && !ft->exclusive &&
+				ft_sa_struct_anchor(ft, meta, &lv_a)) {
+			lv_self = lv_a == meta;
+			lv_held = ft_sa_witness(txn, hold_ctx, lv_a);
+		}
+# endif
+		ft_lv_note((void **) &meta->state, __builtin_return_address(0),
+			lv_self, lv_held);
+		if (ft_lv_red_drop && ft_lv_span_depth) {
+			uatomic_inc(&ft_lv_red_dropped);
+			goto lv_dropped;
+		}
+#endif
 		ft_flip_txn_record_state_mw(txn, meta,
 			(void *) live_state, (void *) live_state);
+	}
+#ifdef FT_DEBUG_LIVE_VALIDATE
+lv_dropped:
+#endif
 	/*
 	 * THE OFFSET IS THE THIRD WORD OF THE SAME CHILD, and it takes the same
 	 * kind dispatch as the two above it -- @meta->parent_word

@@ -363,8 +363,9 @@ struct cds_ft_compressed_node *ft_compact_relocate_compressed(struct cds_ft *ft,
 			*bail = -ENOMEM;
 			return cn;
 		}
-		ft_reparent_record(ft, t, cn2->child, cn2_flag, &cn2->child,
-			/*child_marked=*/ false, /*hold_ctx=*/ NULL);
+		FT_LV_SPAN(ft_reparent_record(ft, t, cn2->child, cn2_flag,
+			&cn2->child, /*child_marked=*/ false,
+			/*hold_ctx=*/ NULL));
 		/*
 		 * ☑ THE DUAL'S OWNER IS NAMED NOW.  It is the GRANDPARENT node
 		 * that contains @gp_slot, and this helper used to be handed the
@@ -424,8 +425,9 @@ struct cds_ft_compressed_node *ft_compact_relocate_compressed(struct cds_ft *ft,
 			*bail = -ENOMEM;
 			return cn;
 		}
-		ft_reparent_record(ft, t, cn2->child, cn2_flag, &cn2->child,
-			/*child_marked=*/ false, /*hold_ctx=*/ NULL);
+		FT_LV_SPAN(ft_reparent_record(ft, t, cn2->child, cn2_flag,
+			&cn2->child, /*child_marked=*/ false,
+			/*hold_ctx=*/ NULL));
 		ft_compact_record_terminals(t, ctx, set, cn_meta);
 		cst = ft_flip_txn_commit(ft, t);
 		if (cst != URCU_TXN_STATUS_OK) {
