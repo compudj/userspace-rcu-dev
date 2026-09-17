@@ -4940,6 +4940,38 @@ int ft_detach_node(struct cds_ft *ft,
 			 * froze it in its merge flip.
 			 */
 			if (!boundary_fused && freeze_leaf && pub && commit_txn) {
+#ifdef FT_DEBUG_CHAIN_HOLD
+				/*
+				 * ☞ IS THE CHAIN'S HOLDER ALREADY NAMED BY THIS
+				 * OP'S OWN DESCENT?  One descent from root names
+				 * every ancestor the op needs, so if the holder
+				 * is on it the anchor is soundly resolvable here
+				 * and nothing has to re-descend -- the acquire
+				 * was simply never asked for.  If it is NOT, this
+				 * member was reached by a back-pointer walk and
+				 * ft_descent_anchor_of would answer from the
+				 * WRONG path (the cursor's node, or NULL), which
+				 * is the silent anchor disagreement.
+				 *
+				 * ☠ Only EXPONENTIAL exercises this: per-node
+				 * short-circuits the date to 0 and root-only to
+				 * 1, so a green reading at those spacings proves
+				 * nothing about the window.
+				 */
+				{
+					struct cds_ft_inode_flag *hnf =
+						ft_chain_head_holder(ft, freeze_leaf);
+					unsigned int hd;
+
+					if (!hnf)
+						uatomic_inc(&ft_chdate_noholder);
+					else if (ft_lock_ctx_depth_of(ft, &lctx,
+							hnf, &hd))
+						uatomic_inc(&ft_chdate_ondescent);
+					else
+						uatomic_inc(&ft_chdate_derived);
+				}
+#endif
 				ft_ch_audit_ctx(ft, commit_txn, &lctx, freeze_leaf);
 				ft_hlist_freeze_chain_prepare(ft, ft_flip_txn_handle(commit_txn),
 					freeze_leaf, freeze_len);

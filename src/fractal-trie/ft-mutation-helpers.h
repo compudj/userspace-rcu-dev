@@ -3324,8 +3324,36 @@ struct ft_ch_site {
 		 * @un_anc_held counts those.  Kept OUT of @anchored so the
 		 * existing column keeps its meaning.
 		 */
-		un_anc_held;
+		un_anc_held,
+		/*
+		 * ☞ AND WHICH CONFIG the gap is in.  A cell config has a lock
+		 * already -- the head's CELL is an allocated item, so it carries
+		 * a cds_ft_metadata and therefore a state word with
+		 * FT_STATE_LOCK, one per external head, and NOTHING takes it
+		 * today.  That is the natural owner for a chain.  List-off has
+		 * no cell, so the same gap there can only be closed by the
+		 * holder.  Split the verdict so the two are not planned as one.
+		 */
+		un_liston, un_listoff;
 };
+
+#ifdef FT_DEBUG_CHAIN_HOLD
+/*
+ * Is a CHAIN HOLDER named by the op's OWN descent, or only reachable by a
+ * back-pointer walk?  MATHIEU: one descent from root suffices to name ALL the
+ * ancestors an op must lock, so this decides whether closing the chain gap
+ * needs a re-descent at all, or merely an acquire nobody asked for.
+ */
+unsigned long ft_chdate_ondescent, ft_chdate_derived, ft_chdate_noholder;
+static void ft_chdate_report(void) __attribute__((destructor));
+static void ft_chdate_report(void)
+{
+	fprintf(stderr, "FT CHAIN-DATE on_descent=%lu derived(off-path)=%lu no_holder=%lu\n",
+		uatomic_read(&ft_chdate_ondescent),
+		uatomic_read(&ft_chdate_derived),
+		uatomic_read(&ft_chdate_noholder));
+}
+#endif
 
 extern struct ft_ch_site ft_ch_sites[FT_CH_SITE_MAX];
 extern unsigned int ft_ch_site_n;
@@ -3665,6 +3693,10 @@ void ft_ch_audit_owner_at(const char *fn, int line, const struct cds_ft *ft,
 		}
 	}
 	s->unheld++;
+	if (ft->ordered_list)
+		s->un_liston++;
+	else
+		s->un_listoff++;
 	switch (ft_ch_unheld_cause(ctx, hm)) {	/* see the struct */
 	case 0: s->un_noextra++; break;
 	case 1: s->un_shared++; break;
@@ -3985,6 +4017,9 @@ static void ft_ch_audit_report(void)
 			fprintf(stderr, "%-34s %6s   UNHELD breakdown: no_extras=%lu SHARED_extra(invisible hold)=%lu absent(real gap)=%lu | ANCESTOR held=%lu\n",
 				nm, "", s->un_noextra, s->un_shared,
 				s->un_absent, s->un_anc_held);
+		if (s->unheld)
+			fprintf(stderr, "%-34s %6s   UNHELD config: list-ON(cell exists)=%lu list-OFF(no cell)=%lu\n",
+				nm, "", s->un_liston, s->un_listoff);
 		if (s->ctxheld)
 			fprintf(stderr, "%-34s %6s   HELD(ctx) breakdown: txn=%lu extra=%lu glue=%lu outer=%lu\n",
 				nm, "", s->ctx_txn, s->ctx_extra, s->ctx_glue,
@@ -9936,6 +9971,83 @@ bool ft_skip_dual_gp_held(struct cds_ft *ft,
 	(void) ft; (void) ctx; (void) parent_nf; (void) mtxn;
 	return false;
 #endif
+}
+
+/*
+ * ft_lock_chain_holder: §9.3's member for a DUPLICATE-CHAIN word.
+ *
+ * MATHIEU's design for this class, step 1 of 2: "add the missing lock acquire of
+ * nearest parent.  Note that in some cases those may already be held.  Once this
+ * is thorough, ONLY THEN can we switch the chain mutation ops to SW."  So this
+ * takes the lock and answers whether the op holds it; nothing here changes a
+ * record's KIND.  ANCESTOR EVERYWHERE -- the head's CELL also carries an unused
+ * lock word, but a cell is REPLACED by four different producers (promote,
+ * two insert/replace arms, and ft_compact_relocate_cell, which takes no lock at
+ * all), so a cell lock protects nothing until those are converted.
+ *
+ * The owner is @ft_chain_head_holder: "the single lockable state-word node every
+ * op on the chain serialises on".  ☠ Its header restricts the PREV WALK to
+ * holder-lock callers, because an interior node's walk is unstable under a
+ * concurrent relink -- which is why this is for a HEAD, whose walk is ONE hop
+ * (its prev is the cell / flagged parent, resolved directly).
+ *
+ * ☠ A COARSE TRIE OWES NO MEMBER, and saying otherwise is not free: the twin
+ * helper below planted a §4.B guard on a coarse trie 8,427,520 times and
+ * test_rekey_same_path never returned.  Answer false and plant nothing.
+ *
+ * ☠ AND DATE THE MEMBER -- DO NOT HAND THE CHOKE POINT FT_DEPTH_FROM_DESCENT
+ * AND HOPE.  An undatable member sets @acquire_miss and the commit aborts, which
+ * for a STRUCTURAL plan is a self-refusal the caller's retry re-derives
+ * identically: MEASURED as a livelock, ~3.4M attempts leaking a txn each until
+ * the memcg killed it.  So date it from the descent, else one hop up from a node
+ * that IS on the descent path (§5.3), else TAKE NOTHING and say so.
+ *
+ * ☠☠ AND THAT LAST BRANCH HAS A FUSE ON IT.  "Taking nothing is safe because MW
+ * is always safe" is true of a RECORD IN ISOLATION -- an MW CAS lands correctly
+ * whatever the op holds -- and FALSE OF THE SLOT the day this class converts:
+ * an MW record on a slot whose other producers park SW is exactly the pairing
+ * the engine cannot arbitrate, because the park is a plain store.  So this
+ * fallback is not a benign default, it is a PRODUCER THAT BECOMES WRONG AT THE
+ * FLIP.
+ *
+ * ⇒ STEP 2 IS GATED ON THIS BRANCH BEING MEASURED UNREACHABLE (a counter reading
+ * ZERO across every spacing), never on it being "safe".  That measured zero is
+ * what made the SKIP_X dual's flip defensible -- its twin's UNDATABLE counter
+ * reads 0 -- and it is the same bar this one must clear.
+ */
+static
+bool ft_lock_chain_holder(struct cds_ft *ft,
+		const struct ft_lock_ctx *ctx,
+		struct ft_flip_txn *txn,
+		struct cds_ft_node *node)
+{
+	struct cds_ft_inode_flag *holder_nf;
+	struct cds_ft_metadata *hm;
+	enum ft_lock_or_guard_exit ex;
+	unsigned int hdepth;
+
+	if (!txn || !node)
+		return false;
+	if (!ft->lock_fine)
+		return false;		/* coarse: the FT-wide lock is the exclusion */
+	holder_nf = ft_chain_head_holder(ft, node);
+	if (!holder_nf || ft_node_external(holder_nf))
+		return false;		/* never-inserted, or no lockable holder */
+	hm = ft_flag_to_metadata(ft, holder_nf);
+	if (!hm)
+		return false;
+	if (!ft_lock_ctx_depth_of(ft, ctx, holder_nf, &hdepth))
+		return false;		/* undatable: plant NOTHING (see above) */
+	ft_flip_txn_lock_or_guard_parent_ex(__func__, __LINE__, ft, txn, ctx,
+		holder_nf, hdepth, &ex);
+	/*
+	 * ☠ "I CALLED THE ACQUIRE" IS NOT "THE TXN OWNS THE WORD".  Three exits,
+	 * and only REGISTERED files a lock: SHARED means the op already held it
+	 * (which is the "may already be held" case this design expects, and the
+	 * reason this must never blind-take), while MISS has set @acquire_miss
+	 * and the commit is due to abort.  Answer with the two that mean held.
+	 */
+	return ex == FT_LOG_EXIT_REGISTERED || ex == FT_LOG_EXIT_SHARED;
 }
 
 /*
