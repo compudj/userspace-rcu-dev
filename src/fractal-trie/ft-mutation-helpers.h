@@ -1749,6 +1749,18 @@ struct ft_flip_txn {
 	 */
 	bool sw_body;
 	/*
+	 * DOOR 1's ANSWER, LATCHED AT CONSTRUCTION.  The always-MW lanes consult
+	 * this rather than re-deriving ft_txn_content_sw_ok per record, because
+	 * @ft->exclusive is a PLAIN MUTABLE BOOL (cds_ft_make_exclusive /
+	 * _make_concurrent, and the graft_swap restore): sampled per record it
+	 * could answer differently within ONE txn, and disagree with the
+	 * structural_sw the constructor latched from the same call.  The whole
+	 * argument for parking those lanes is "every writer of every slot in this
+	 * trie gets the SAME answer", which needs the answer fixed for the txn's
+	 * life.
+	 */
+	bool trie_wide_sw;
+	/*
 	 * --enable-rcu-debug only: the NAMED trie's root slot, for the
 	 * assertion in ft_flip_txn_record_tag that no generic structural
 	 * record ever aims at it (ft_flip_txn_record_root is the only legal
@@ -2179,6 +2191,16 @@ struct ft_flip_txn *ft_flip_txn_create_at(FT_TK_SITE_PARAM struct cds_ft *ft)
 	t->cap_locks = FT_FLIP_TXN_FLOOR_LOCKS;
 	t->nr_covered = 0;
 	t->sw_body = false;
+	/*
+	 * ☠ EXPLICITLY, EVERY TIME.  These structs are REUSED and this
+	 * constructor initialises field by field -- there is no memset -- so a
+	 * flag only ever SET would carry a previous op's trie answer into this
+	 * one.  MEASURED while it was missing: a thread that had run one coarse
+	 * op parked the always-MW lanes on every FINE trie it touched
+	 * afterwards, 1,647,382 records in one ft_unit leg instead of 8,444,
+	 * and the leg was GREEN.
+	 */
+	t->trie_wide_sw = false;
 	t->ft = ft;
 	t->acquire_miss = false;
 	t->acquire_enomem = false;
@@ -2205,8 +2227,10 @@ struct ft_flip_txn *ft_flip_txn_create_at(FT_TK_SITE_PARAM struct cds_ft *ft)
 	FT_ROOT_ASSERT_INIT(t, ft);
 	FT_OWNER_ASSERT_INIT(t);
 	FT_TK_TXN_INIT(t, dbg_site);	/* names @t before anything counts against it */
-	if (ft_txn_content_sw_ok(ft))
+	if (ft_txn_content_sw_ok(ft)) {
+		t->trie_wide_sw = true;
 		ft_flip_txn_set_structural_sw(t, true);
+	}
 	return t;
 }
 
@@ -2418,6 +2442,16 @@ struct ft_flip_txn *ft_flip_txn_create_on_at(FT_TK_SITE_PARAM
 	t->cap_locks = FT_FLIP_TXN_FLOOR_LOCKS;
 	t->nr_covered = 0;
 	t->sw_body = false;
+	/*
+	 * ☠ EXPLICITLY, EVERY TIME.  These structs are REUSED and this
+	 * constructor initialises field by field -- there is no memset -- so a
+	 * flag only ever SET would carry a previous op's trie answer into this
+	 * one.  MEASURED while it was missing: a thread that had run one coarse
+	 * op parked the always-MW lanes on every FINE trie it touched
+	 * afterwards, 1,647,382 records in one ft_unit leg instead of 8,444,
+	 * and the leg was GREEN.
+	 */
+	t->trie_wide_sw = false;
 	t->ft = ft;
 	t->acquire_miss = false;
 	t->acquire_enomem = false;
@@ -2444,8 +2478,10 @@ struct ft_flip_txn *ft_flip_txn_create_on_at(FT_TK_SITE_PARAM
 	FT_ROOT_ASSERT_INIT(t, ft);
 	FT_OWNER_ASSERT_INIT(t);
 	FT_TK_TXN_INIT(t, dbg_site);	/* names @t before anything counts against it */
-	if (ft_txn_content_sw_ok(ft))
+	if (ft_txn_content_sw_ok(ft)) {
+		t->trie_wide_sw = true;
 		ft_flip_txn_set_structural_sw(t, true);
+	}
 	return t;
 }
 
@@ -2490,6 +2526,16 @@ struct ft_flip_txn *ft_flip_txn_create_bounded_on_at(FT_TK_SITE_PARAM
 	t->cap_locks = FT_FLIP_TXN_FLOOR_LOCKS;
 	t->nr_covered = 0;
 	t->sw_body = false;
+	/*
+	 * ☠ EXPLICITLY, EVERY TIME.  These structs are REUSED and this
+	 * constructor initialises field by field -- there is no memset -- so a
+	 * flag only ever SET would carry a previous op's trie answer into this
+	 * one.  MEASURED while it was missing: a thread that had run one coarse
+	 * op parked the always-MW lanes on every FINE trie it touched
+	 * afterwards, 1,647,382 records in one ft_unit leg instead of 8,444,
+	 * and the leg was GREEN.
+	 */
+	t->trie_wide_sw = false;
 	t->ft = ft;
 	t->acquire_miss = false;
 	t->acquire_enomem = false;
@@ -2516,8 +2562,10 @@ struct ft_flip_txn *ft_flip_txn_create_bounded_on_at(FT_TK_SITE_PARAM
 	FT_ROOT_ASSERT_INIT(t, ft);
 	FT_OWNER_ASSERT_INIT(t);
 	FT_TK_TXN_INIT(t, dbg_site);	/* names @t before anything counts against it */
-	if (ft_txn_content_sw_ok(ft))
+	if (ft_txn_content_sw_ok(ft)) {
+		t->trie_wide_sw = true;
 		ft_flip_txn_set_structural_sw(t, true);
+	}
 	return t;
 }
 
@@ -7405,12 +7453,114 @@ void ft_flip_txn_record_tag(struct ft_flip_txn *t,
  * ft_flip_txn_record_tag whenever structural_sw is false, so switching a
  * non-lock_fine site to it is byte-neutral.
  */
+/*
+ * ☞ HOW MUCH OF THE ALWAYS-MW SURFACE IS ALREADY ARMED SW BY DOOR 1?
+ *
+ * Mathieu, on the app-provided exclusion mode: "we should be able to entirely
+ * remove the remaining MW updates which were not possible to transition to SW
+ * (except those MW updates which genuinely are meant to be kept MW)."  The
+ * lanes below call this recorder UNCONDITIONALLY, so on a COARSE or EXCLUSIVE
+ * trie -- where door 1 has already armed the rest of the txn SW, and where the
+ * FT-wide mutex means no peer writer of ANY slot exists -- they are CASes that
+ * arbitrate against nobody.
+ *
+ * Measure before converting (doc §12.1): per class, how many records sit on a
+ * trie ft_txn_content_sw_ok already says yes to.  ☠ AND COUNT THE CROSS-TRIE
+ * SHAPE SEPARATELY: a graft/graft_swap txn NAMES one trie and writes another's
+ * root, so "the named trie excludes everyone" does not cover that slot -- which
+ * is the per-slot uniformity trap the CHAIN flip fell into (§11.9).
+ */
+static unsigned long ft_mwa_door1_conv;
+static unsigned long ft_mwa_door1_kept[2];	/* [0] fine trie, [1] a VALIDATE */
+/*
+ * ☠ THE TWO WITNESSES THAT MUST READ ZERO, and the reason they exist: the
+ * predicate is latched off the txn's NAMED trie, so it answers for a slot only
+ * while every slot these lanes record belongs to that trie.
+ *
+ * @foreign: three recorders take a trie ARGUMENT separately from @t->ft
+ * (ft_flip_txn_record_count_parent, ft_ord_cell_flip_into,
+ * ft_ord_cell_record_into_ft) and a cross-trie op could in principle pass one
+ * while the txn names the other -- coarse licensing a park on a FINE trie's
+ * word, which is the per-slot two-kinds violation.
+ *
+ * @root_slot: root pinning is by the PRODUCER's @root flag, not by the slot, so
+ * a producer that forgot the flag used to cost a harmless MW on a root and
+ * would now cost a PARK on one.  The converting arm therefore also tests the
+ * slot itself, and counts when that test is what saved it.
+ */
+static unsigned long ft_mwa_door1_foreign;
+static unsigned long ft_mwa_door1_root_slot;
+
+static void ft_mwa_door1_conv_report(void) __attribute__((destructor));
+static void ft_mwa_door1_conv_report(void)
+{
+	if (!(uatomic_read(&ft_mwa_door1_conv) | uatomic_read(&ft_mwa_door1_kept[0])
+			| uatomic_read(&ft_mwa_door1_kept[1])))
+		return;
+	fprintf(stderr, "FT MWA DOOR1  converted=%lu | kept MW: fine_trie=%lu VALIDATE=%lu | ☠ foreign_ft=%lu root_slot_saved=%lu\n",
+		uatomic_read(&ft_mwa_door1_conv),
+		uatomic_read(&ft_mwa_door1_kept[0]),
+		uatomic_read(&ft_mwa_door1_kept[1]),
+		uatomic_read(&ft_mwa_door1_foreign),
+		uatomic_read(&ft_mwa_door1_root_slot));
+}
+#define FT_MWA_DOOR1_CONV()	uatomic_inc(&ft_mwa_door1_conv)
+#define FT_MWA_DOOR1_KEPT(t, val)					\
+	uatomic_inc(&ft_mwa_door1_kept[(val) ? 1 : 0])
+
+/*
+ * Called by every recorder that carries a trie argument of its own: does it
+ * agree with the trie the txn named?  See @foreign above.
+ */
+static inline
+void ft_mwa_door1_note_ft(const struct cds_ft *ft, const struct ft_flip_txn *t)
+{
+	if (ft && t && t->ft && ft != t->ft)
+		uatomic_inc(&ft_mwa_door1_foreign);
+}
+
+#ifdef FT_DEBUG_MWA_DOOR1
+static unsigned long ft_mwa_door1[FT_TK_MWA_NR][2];
+
+static void ft_mwa_door1_report(void) __attribute__((destructor));
+static void ft_mwa_door1_report(void)
+{
+	unsigned int i;
+	unsigned long y = 0, n = 0;
+
+	for (i = 0; i < FT_TK_MWA_NR; i++) {
+		y += uatomic_read(&ft_mwa_door1[i][1]);
+		n += uatomic_read(&ft_mwa_door1[i][0]);
+	}
+	if (!(y | n))
+		return;
+	fprintf(stderr, "\nFT MWA DOOR1  convertible(trie is coarse/exclusive)=%lu  fine=%lu\n",
+		y, n);
+	for (i = 0; i < FT_TK_MWA_NR; i++)
+		if (uatomic_read(&ft_mwa_door1[i][1]) |
+				uatomic_read(&ft_mwa_door1[i][0]))
+			fprintf(stderr, "FT MWA DOOR1  class %2u  convertible=%-12lu fine=%lu\n",
+				i, uatomic_read(&ft_mwa_door1[i][1]),
+				uatomic_read(&ft_mwa_door1[i][0]));
+}
+
+static inline
+void ft_mwa_door1_ask(const struct ft_flip_txn *t, enum ft_tk_mwa_class c)
+{
+	uatomic_inc(&ft_mwa_door1[c][ft_txn_content_sw_ok(t->ft) ? 1 : 0]);
+}
+# define FT_MWA_DOOR1_ASK(t, c)		ft_mwa_door1_ask((t), (c))
+#else
+# define FT_MWA_DOOR1_ASK(t, c)		do { (void) (t); } while (0)
+#endif
+
 static inline
 #ifdef FT_DEBUG_STRUCT_ANCHOR
 __attribute__((noinline))
 #endif
-void ft_flip_txn_record_tag_mw(struct ft_flip_txn *t, void **slot,
-		void *old_ptr, void *new_ptr, uintptr_t tag FT_TK_MWA_PARAM)
+void __ft_flip_txn_record_tag_mw(struct ft_flip_txn *t, void **slot,
+		void *old_ptr, void *new_ptr, uintptr_t tag,
+		bool pinned FT_TK_MWA_PARAM)
 {
 	int ret;
 
@@ -7423,10 +7573,97 @@ void ft_flip_txn_record_tag_mw(struct ft_flip_txn *t, void **slot,
 #endif
 	FT_TK_COUNT_REC(t, FT_TK_MW_ALWAYS);
 	FT_TK_COUNT_MWA(dbg_mwa);
+	FT_MWA_DOOR1_ASK(t, dbg_mwa);
 	FT_AB_ARM(FT_AB_MWA_BASE + dbg_mwa, FT_AB_OWN_NA);
-	ret = urcu_txn_store_mw(t->mtxn, slot, old_ptr, new_ptr, tag);
+	/*
+	 * ☞ DOOR 1 COVERS THESE LANES TOO (Mathieu, doc §12.1): "in an
+	 * application-provided exclusion, we should be able to entirely remove
+	 * the remaining MW updates which were not possible to transition to SW
+	 * (except those MW updates which genuinely are meant to be kept MW)."
+	 *
+	 * "Always MW" was never a decision about the WORD -- it is this
+	 * recorder being called unconditionally.  On a COARSE trie every writer
+	 * is behind the FT-wide mutex and on an EXCLUSIVE one the caller
+	 * promises a single writer, so there is no peer CAS for a park to race,
+	 * for ANY slot in that trie.  That is the same exclusion door 1 already
+	 * arms the rest of the txn on, and it is a claim about the TRIE, not
+	 * about this op's lock registry -- so unlike a per-op answer it cannot
+	 * give one slot two kinds.
+	 *
+	 * ☠ THE ROOT IS THE EXCEPTION, and it is a real one: a cross-trie dual
+	 * NAMES one trie and writes TWO roots (ft_root_list_swap_publish_dual,
+	 * the graft duals), so @t->ft being coarse says nothing about the other
+	 * trie, which may be fine and have live peer writers.  The tree's own
+	 * detector is "BLIND TO A CROSS-TRIE TXN'S SECOND ROOT" for exactly this
+	 * reason.  Every other lane records only its own trie's slots -- the
+	 * argument door 1 already rests on, both directions, at
+	 * ft_txn_content_sw_ok.
+	 *
+	 * ☠ AND THE LOCK TAKE IS NOT HERE.  It is MW_LOCK, a separate kind and
+	 * a separate recorder: it IS the arbitration point and can never park.
+	 * A coarse trie takes no DLM lock at all; an exclusive FINE trie does,
+	 * and keeps its CAS.
+	 *
+	 * ☠☠ AND A RECORD WHOSE old == new IS A VALIDATE, NOT A WRITE -- IT CAN
+	 * NEVER BE PARKED, ON ANY TRIE.  Two lanes here are pure §4.B guards
+	 * ({live_state -> live_state}: ft_flip_txn_guard_installed_child and the
+	 * recompaction sweep's child validate), whose whole product is the CAS's
+	 * expected-old comparison -- rcu-txn.h calls that shape
+	 * urcu_txn_validate.  Parking one does TWO wrong things, NEITHER of
+	 * which needs a peer writer:
+	 *
+	 *   1. the check disappears (a park cannot fail), and that check is what
+	 *      catches a node ALREADY frozen or locked when the record was made
+	 *      -- the dangling parent slot and the concurrent-recompaction UAF
+	 *      both came through it;
+	 *   2. worse, the value parked is @live_state, the word with TOMBSTONE
+	 *      and LOCK MASKED OUT, so the commit CLEARS a tombstone (on a node
+	 *      whose grace period is running) or a DLM lock the op does not
+	 *      hold.  And settle() writes old_ptr BLIND, so even an ABORTED
+	 *      commit stomps those bits: the abort stops being byte-for-byte
+	 *      clean.
+	 *
+	 * The guard's own header already said it -- "MW kind, unconditionally:
+	 * an SW park validates nothing (it cannot fail), so recording this
+	 * through the structural_sw-dispatching helper would be a guard in name
+	 * only" -- and this recorder BECAME that helper.  So the test is
+	 * STRUCTURAL, not a list of lanes to remember: same value in and out
+	 * means MW.
+	 */
+	if (!pinned && old_ptr != new_ptr && t->trie_wide_sw
+			&& !(t->ft && slot == (void **) &t->ft->root)) {
+		FT_MWA_DOOR1_CONV();
+		ret = urcu_txn_store_sw(t->mtxn, slot, old_ptr, new_ptr, tag);
+	} else {
+		if (!pinned && old_ptr != new_ptr && t->trie_wide_sw)
+			uatomic_inc(&ft_mwa_door1_root_slot);
+		FT_MWA_DOOR1_KEPT(t, old_ptr == new_ptr);
+		ret = urcu_txn_store_mw(t->mtxn, slot, old_ptr, new_ptr, tag);
+	}
 	assert(!ret);
 	(void) ret;	/* reserved up front -> never fails */
+}
+
+static inline
+void ft_flip_txn_record_tag_mw(struct ft_flip_txn *t, void **slot,
+		void *old_ptr, void *new_ptr, uintptr_t tag FT_TK_MWA_PARAM)
+{
+	__ft_flip_txn_record_tag_mw(t, slot, old_ptr, new_ptr, tag,
+		false FT_TK_MWA(dbg_mwa));
+}
+
+/*
+ * THE PINNED TWIN: MW whatever the trie is.  One caller --
+ * ft_flip_txn_record_root -- because a root's rule "is a property of the SLOT,
+ * not of the txn's named trie", which is what lets a cross-trie dual record two
+ * roots MW while its own trie's content parks SW.  See that function.
+ */
+static inline
+void ft_flip_txn_record_tag_mw_pinned(struct ft_flip_txn *t, void **slot,
+		void *old_ptr, void *new_ptr, uintptr_t tag FT_TK_MWA_PARAM)
+{
+	__ft_flip_txn_record_tag_mw(t, slot, old_ptr, new_ptr, tag,
+		true FT_TK_MWA(dbg_mwa));
 }
 
 /*
@@ -7471,7 +7708,7 @@ static inline
 void ft_flip_txn_record_root(struct ft_flip_txn *t, void **slot,
 		void *old_ptr, void *new_ptr)
 {
-	ft_flip_txn_record_tag_mw(t, slot, old_ptr, new_ptr,
+	ft_flip_txn_record_tag_mw_pinned(t, slot, old_ptr, new_ptr,
 		FT_FLIP_PROXY_TAG FT_TK_MWA(FT_TK_MWA_ROOT));
 }
 
@@ -12968,6 +13205,7 @@ enum urcu_txn_status ft_ord_cell_flip_into(struct cds_ft *ft,
 		struct ft_flip_txn *t,
 		struct ft_ord_cell_edge *edges, unsigned int n)
 {
+	ft_mwa_door1_note_ft(ft, t);
 	unsigned int i;
 
 	for (i = 0; i < n; i++) {
@@ -13165,6 +13403,7 @@ static inline
 void ft_ord_cell_record_into_ft(struct cds_ft *ft, struct ft_flip_txn *t,
 		const struct ft_ord_cell_edge *edges, unsigned int n)
 {
+	ft_mwa_door1_note_ft(ft, t);
 	unsigned int i;
 
 	for (i = 0; i < n; i++) {
@@ -15511,6 +15750,19 @@ void ft_flip_txn_record_count_parent(struct cds_ft *ft, struct ft_flip_txn *t,
 		 * detects it and a mixed commit aborts cleanly (re-descend), never
 		 * an SW park that would clobber the peer's delta.  Byte-identical
 		 * to record_tag while no caller has opted structural_sw in.
+		 *
+		 * ☞ "NEVER AN SW PARK" IS A STATEMENT ABOUT A TRIE WITH PEERS.
+		 * ft_flip_txn_record_tag_mw now parks on a COARSE or EXCLUSIVE
+		 * trie (door 1), where the sentence above has no subject: there
+		 * is no peer writer whose delta could be clobbered, because every
+		 * writer is behind the FT-wide mutex or the caller's single-writer
+		 * contract.  MEASURED: this lane is coarse-ONLY -- 4,984
+		 * convertible against 0 on a fine trie per ft_unit leg -- so the
+		 * CAS it kept was arbitrating against nobody every time.  The
+		 * expected-old is a LOAD (@base, or this op's own pending new
+		 * from the descriptor above), never a derivation, which is what
+		 * makes the park safe on the abort path too: settle() writes
+		 * old_ptr BLIND, so a derived old would be published.
 		 */
 		ft_flip_txn_record_tag_mw(t, (void **) &m->nr_keys,
 			(void *) old_raw, (void *) new_raw,

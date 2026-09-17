@@ -1106,6 +1106,11 @@ Two things to pin when it returns:
   none of. The contract to check is "no two writers inside the trie at once",
   i.e. a writer-scope entry counter that must never exceed one.
 
+☑ **THE MW RETIREMENT IS DONE** (the half that does not need the mode to exist):
+`ft_flip_txn_record_tag_mw` now asks `ft_txn_content_sw_ok(t->ft)` and parks
+instead of CASing. See §12.1.1 below; the rest of this section is the mode
+itself, still owed.
+
 ☞ AND IT RETIRES THE REMAINING MW (Mathieu): under app exclusion the always-MW
 lanes can go SW too, except the ones that are genuinely MW by design. They are
 MW today on a COARSE trie as well, and not because anything decided it: the
@@ -1116,6 +1121,121 @@ there and no validate can fail, so one predicate (`ft_txn_content_sw_ok`)
 consulted by those recorders converts the lot. The only record that must stay
 MW is the DLM lock TAKE -- the arbitration point -- and such a trie takes no
 DLM locks at all. Independent of the fine-spacing flip; do it right after.
+
+### 12.1.1 Landed: the always-MW lanes consult door 1
+
+"Always MW" was never a decision about the WORD -- it was this recorder being
+called unconditionally. On a COARSE trie every writer sits behind the FT-wide
+mutex, and on an EXCLUSIVE one the caller promises a single writer, so there is
+no peer CAS for a park to race, **for any slot in that trie**. That is the same
+exclusion door 1 already arms the rest of the txn on.
+
+☞ WHY THIS IS NOT THE TRAP §11.9 FELL INTO. The chain attempt made the kind a
+property of the ASKING TXN (its lock registry), so one slot got two kinds
+depending on which op wrote it. This predicate is a property of the TRIE: every
+writer of every slot in it gets the same answer, so per-slot uniformity is
+automatic.
+
+**Three things had to be true, and each one was wrong first.** An adversarial
+review refuted the first version of this change; these are its findings, fixed.
+
+#### ☠☠ 1. A record whose old == new is a VALIDATE, and can never be parked
+
+Two lanes here are pure §4.B guards -- `ft_flip_txn_guard_installed_child` and
+the recompaction sweep's child validate -- recording `{live_state ->
+live_state}`, which rcu-txn.h calls `urcu_txn_validate`. Parking one does two
+wrong things, **neither of which needs a peer writer**:
+
+1. the check disappears (a park cannot fail), and that check is what catches a
+   node ALREADY frozen or locked when the record was made. The dangling parent
+   slot and the concurrent-recompaction UAF both came through it;
+2. worse, the value parked is `live_state` -- the word with TOMBSTONE and LOCK
+   **masked out** -- so the commit CLEARS a tombstone on a node whose grace
+   period is running, or a DLM lock the op does not hold. `settle()` writes
+   `old_ptr` BLIND, so even an ABORTED commit stomps those bits.
+
+The guard's own header already said it: *"MW kind, unconditionally: an SW park
+validates nothing (it cannot fail), so recording this through the
+structural_sw-dispatching helper would be a guard in name only"* -- and this
+recorder BECAME that helper. The test is therefore STRUCTURAL, not a list of
+lanes to remember: **same value in and out means MW**. (Measured: 293 such
+records per ft_unit leg. The first version parked all of them, and the 18-leg
+gate was green.)
+
+#### ☠ 2. The answer must be LATCHED, because `exclusive` is mutable
+
+`ft->exclusive` is a plain bool that `cds_ft_make_exclusive` /
+`_make_concurrent` and the graft_swap restore assign. Sampled per record it
+could answer differently within ONE txn and disagree with the `structural_sw`
+the constructor latched from the same call -- and the whole argument needs the
+answer fixed for the txn's life. It is now latched into `t->trie_wide_sw` at
+construction.
+
+☠☠ AND THE LATCH MUST BE INITIALISED EXPLICITLY. These txn structs are REUSED
+and the constructors initialise field by field -- there is no memset -- so a
+flag that is only ever SET carries a previous op's trie answer into the next
+one. Measured while that was missing: a thread that had run one coarse op
+parked the always-MW lanes on **every FINE trie it touched afterwards** --
+1,647,382 records in one ft_unit leg instead of 8,298 -- and **the leg was
+GREEN**. Found only because the counter disagreed with the expected magnitude.
+
+#### ☠ 3. The ROOT pin must key on the SLOT, not the producer's flag
+
+A cross-trie dual NAMES one trie and writes TWO roots, so `t->ft` being coarse
+says nothing about the other trie, which may be fine with live peer writers.
+`ft_flip_txn_record_root` calls a PINNED twin that never converts -- its own
+header's rule, "the rule is a property of the SLOT, not of the txn's named
+trie". But that pinning depended entirely on the producer setting `.root`, so
+the converting arm now also refuses any slot that IS the named trie's root, and
+counts when that test is what saved it.
+
+#### The two witnesses, and they read ZERO
+
+| witness | what a non-zero would mean | measured |
+|---|---|---|
+| `foreign_ft` | a recorder carrying its own `ft` argument disagreed with `t->ft` -- a coarse name licensing a park on a fine trie's word | **0** |
+| `root_slot_saved` | a root slot reached the converting arm (a producer forgot `.root`) | **0** |
+
+The first covers the three recorders that take a trie separately from the txn
+(`ft_flip_txn_record_count_parent`, `ft_ord_cell_flip_into`,
+`ft_ord_cell_record_into_ft`). With both at zero, every slot these lanes record
+belongs to the trie the predicate asked about, which is what makes the
+trie-wide argument apply to the slot.
+
+☠ AND THE LOCK TAKE IS NOT IN THIS RECORDER. It is MW_LOCK, a separate kind:
+it IS the arbitration point and can never park. A coarse trie takes no DLM lock
+at all; an EXCLUSIVE FINE trie does, and keeps its CAS.
+
+☞ A BONUS: the guard at `ft_flip_txn_guard_installed_child` is always-MW and its
+header records a ONE SLOT, TWO KINDS livelock from landing beside an SW record
+(ft_unit `test_rekey_collapse_one_slot_two_kinds`, 50,001 attempts). It stays
+MW under rule 1, so that pairing is unchanged.
+
+#### Measured
+
+`-DFT_DEBUG_MWA_DOOR1`, ft_unit per-node leg: of 2,666,930 always-MW records,
+11,804 sit on a trie door 1 says yes to. Four classes are ENTIRELY coarse-only,
+so they retire completely:
+
+| class | convertible | fine |
+|---|---|---|
+| RANK | 4,984 | **0** |
+| NR_CHILD_DEC | 943 | **0** |
+| STATE (incl. the validates) | 78 | **0** |
+| PSO | 15 | **0** |
+| CELL | 3,146 | 2,029,561 |
+| HEAD_BACK | 2,196 | 620,609 |
+| PARENT_WORD | 24 | 2,283 |
+| GUARD | 36 | 61 |
+| DUAL_UNNAMED | 2 | 1,974 |
+| ROOT (pinned) | 380 | 638 |
+
+☠ ft_unit is the wrong place to SIZE it -- that leg is fine-dominated. The
+in-tree counter (`FT MWA DOOR1`, compiled into every build) reads per leg:
+ft_unit 8,298 converted; ft_inv 2.0M-2.7M. And for a user who runs a coarse
+trie, or the app-provided exclusion mode of §12.1 when it returns, this is 100%
+of the always-MW traffic, every record of it a CAS that arbitrates against
+nobody.
 
 ### 12.2 COARSE vs FINE + ROOT_ONLY -- redundant?
 
