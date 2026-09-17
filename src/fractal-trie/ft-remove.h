@@ -3623,6 +3623,26 @@ int ft_detach_node(struct cds_ft *ft,
 			unsigned int walk_depth = ft_child_depth_of(ft,
 				iter_node_flag, cur_depth);
 			bool phase2_first = true;
+			/*
+			 * ☞ ITS OWN DESCENT, EXTENDED PER ORPHAN, and the depth
+			 * ADVANCED with it (doc/design/ft-lockset-inventory.md §2
+			 * row 6).  This walk used to date every orphan at the
+			 * FIRST one's depth and anchor it from the op's descent,
+			 * whose table ends above the chain -- so an orphan past
+			 * the first anchored on ITSELF by ft_anchor_meta's
+			 * on-a-level early return while every other op anchored
+			 * it on an ancestor (88k of 200k acquires at exponential).
+			 * The phase-2 walk below already extends a copy of its
+			 * own; this one does the same, for the same reason: the
+			 * op's descent stays on the KEY path for the acquires that
+			 * resolve after it.
+			 */
+			struct ft_descent fwd;
+			struct ft_lock_ctx flctx = lctx;
+
+			if (wd_valid)
+				fwd = wd;
+			flctx.d = wd_valid ? &fwd : NULL;
 
 			while (walk_nf &&
 			       !ft_node_external(walk_nf) &&
@@ -3665,7 +3685,16 @@ int ft_detach_node(struct cds_ft *ft,
 				if (ft->lock_fine) {
 					lctx.held.nr_extra =
 						(unsigned int) nr_orphan_locked;
-					if (ft_detach_orphan_acquire(ft, &lctx,
+					flctx.held.txn = lctx.held.txn;
+					flctx.held.nr_extra = lctx.held.nr_extra;
+					/*
+					 * The copy anchors the walk only because the
+					 * op's descent already ENTERED the node the walk
+					 * starts under; a cursor still ON it would leave
+					 * its levels uncrossed (skeptic, 2026-09-17).
+					 */
+					assert(!wd_valid || fwd.depth >= walk_depth);
+					if (ft_detach_orphan_acquire(ft, &flctx,
 								walk_nf, walk_depth,
 								ometa, &owalk)) {
 						ret = -EAGAIN;
@@ -3765,6 +3794,8 @@ int ft_detach_node(struct cds_ft *ft,
 				to_free[nr_to_free++] = walk_nf;
 				if (ft->lock_fine)
 					orphan_held[nr_orphan_locked++] = owalk;
+				walk_depth = ft_walk_extend(&fwd, wd_valid, walk_nf,
+					walk_depth, ocn ? ocn->len : 1);
 				walk_nf = next;
 			}
 			/*
@@ -3813,7 +3844,10 @@ int ft_detach_node(struct cds_ft *ft,
 					}
 					lctx.held.nr_extra =
 						(unsigned int) nr_orphan_locked;
-					if (ft_detach_orphan_acquire(ft, &lctx,
+					flctx.held.txn = lctx.held.txn;
+					flctx.held.nr_extra = lctx.held.nr_extra;
+					assert(!wd_valid || fwd.depth >= walk_depth);
+					if (ft_detach_orphan_acquire(ft, &flctx,
 							ft_compressed_node_flag(
 								trailing_skip_cn),
 								walk_depth, tm,

@@ -463,10 +463,24 @@ void ft_descent_enter_node(struct ft_descent *d, struct cds_ft_inode_flag *nf,
  * @clamp is a separate argument because it is NOT always the depth that chose
  * the level: an immediate child of the cursor takes ITS level but clamps at its
  * OWN depth, which lies past the cursor.
+ *
+ * @self is the member starting at @clamp, or NULL when the query names none.
+ *
+ * ☞ A MEMBER STARTING AT A STILL-PENDING BOUNDARY IS THAT BOUNDARY.  A pending
+ * level's boundary is the node starting at @bound_start, and the fallback names
+ * it through the cursor on the premise that the cursor is the not-yet-entered
+ * node at @d->depth.  ft_walk_extend breaks that premise: it leaves @d->nf on
+ * the node it ENTERED and moves @d->depth to that node's END, so the fallback
+ * answered the member's PARENT (doc/design/ft-lockset-inventory.md §2 row 7,
+ * the E.2 oracle's live exclusion violation).  A cursor left SKIP-encoded
+ * breaks it too: `anchor == nf` fails on the encoding and the skip word
+ * resolves to the elided node above (row 8).  Neither is a fact about the
+ * trie: whatever node starts at @bound_start on the member's path is the
+ * member, so answer from the member.
  */
 static inline
 struct cds_ft_inode_flag *ft_descent_anchor_at_level(const struct ft_descent *d,
-		unsigned int lvl, unsigned int clamp)
+		unsigned int lvl, unsigned int clamp, struct cds_ft_inode_flag *self)
 {
 	const struct ft_lock_anchor *a;
 	unsigned int i;
@@ -476,8 +490,13 @@ struct cds_ft_inode_flag *ft_descent_anchor_at_level(const struct ft_descent *d,
 	i = ft_lock_level_index(lvl);
 	a = &d->anchor[i];
 	assert(d->anchor_crossed & (1U << i));
-	if (a->bound_start <= clamp)
-		return a->bound ? a->bound : d->nf;
+	if (a->bound_start <= clamp) {
+		if (a->bound)
+			return a->bound;
+		if (self && a->bound_start == clamp)
+			return self;
+		return d->nf;
+	}
 	return a->cover;
 }
 
@@ -486,7 +505,7 @@ struct cds_ft_inode_flag *ft_descent_anchor(const struct ft_descent *d,
 		unsigned int depth)
 {
 	assert(depth <= d->depth);
-	return ft_descent_anchor_at_level(d, ft_lock_level(depth), depth);
+	return ft_descent_anchor_at_level(d, ft_lock_level(depth), depth, NULL);
 }
 
 /*
@@ -509,7 +528,7 @@ struct cds_ft_inode_flag *ft_descent_anchor_child(const struct ft_descent *d,
 	assert(child_depth > d->depth);
 	if (lvl > d->depth)
 		return child_nf;
-	return ft_descent_anchor_at_level(d, lvl, child_depth);
+	return ft_descent_anchor_at_level(d, lvl, child_depth, child_nf);
 }
 
 /*
@@ -650,7 +669,9 @@ struct cds_ft_inode_flag *ft_descent_anchor_of(const struct ft_descent *d,
 		 */
 		if (depth > d->depth)
 			return ft_descent_anchor_child(d, nf, depth);
-		return ft_descent_anchor(d, depth);
+		assert(depth <= d->depth);
+		return ft_descent_anchor_at_level(d, ft_lock_level(depth),
+			depth, nf);
 	}
 }
 
@@ -5664,6 +5685,19 @@ enum ft_sa_rv {
 	FT_SA_RV_T_DEAD_UNCOV_OK,	/* owner TOMBSTONED, record NOT covered, commit landed */
 	FT_SA_RV_T_DEAD_AB,	/* owner TOMBSTONED, commit aborted/failed */
 	FT_SA_RV_T_OVERFLOW,	/* more records than sa_tpend holds */
+	/*
+	 * A write on a word the op did NOT lock (the anchored retire's
+	 * fall-through, the not-held nr_child--), asked against the trie's
+	 * structural anchor A of the written node (ft_sa_anchor_props).
+	 */
+	FT_SA_RV_P_ASKED,	/* reached the arm, fine non-exclusive trie */
+	FT_SA_RV_P_UNDATED,	/* the climb could not date the node */
+	FT_SA_RV_P_ANCHOR_HELD,	/* the op holds A */
+	FT_SA_RV_P_ANCHOR_NOT_HELD,	/* the op does NOT hold A: disagreement */
+	FT_SA_RV_P_SELF_ANCHORED,	/* A == the node: its word IS a lock word (P1 broken) */
+	FT_SA_RV_P_PARENT_SHARES,	/* the node's parent has anchor A too (P2) */
+	FT_SA_RV_P_PARENT_DIFFERS,	/* ... it does not (P2 broken) */
+	FT_SA_RV_P_WORD_LOCKED,	/* the node's own word carries LOCK right now */
 	FT_SA_RV_MWA_BASE,	/* + always-MW class (declared, no owner) */
 	FT_SA_RV_NR = FT_SA_RV_MWA_BASE + FT_TK_MWA_NR,
 };
@@ -5770,7 +5804,10 @@ void ft_sa_rec_report(void)
 		"held_coarse", "SELF_ONLY", "retire_wit", "undated_held",
 		"UNDATED", "NOLOCKS", "UNHELD", "c_LATE", "c_NEVER_OK",
 		"c_NEVER_AB", "c_OVERFLOW", "T_DEAD_HELD_OK",
-		"T_DEAD_UNCOV_OK", "t_dead_ab", "t_overflow" };
+		"T_DEAD_UNCOV_OK", "t_dead_ab", "t_overflow", "p_asked",
+		"P_UNDATED", "p_anchor_held", "P_ANCHOR_NOT_HELD",
+		"P_SELF_ANCHORED", "p_parent_shares", "P_PARENT_DIFFERS",
+		"P_WORD_LOCKED" };
 	int i, j;
 	struct ft_sa_rec_tls *m;
 	bool any = false;
@@ -5874,6 +5911,80 @@ static bool ft_sa_witness(const struct ft_flip_txn *t,
 {
 	return (t && ft_flip_txn_owns(t, m)) || ft_owner_ctx_holds(ctx, m) ||
 		ft_hold_trace_holds(m);
+}
+
+/*
+ * THE PREMISE OF AN SW WRITE ON A WORD THE OP DID NOT LOCK.  The op locked an
+ * ANCESTOR (the anchor) and writes @node's own state word.  That write can be SW
+ * only if, under exact anchor agreement:
+ *   P1  @node is not its own anchor -- a node that is ANY node's anchor is its
+ *       own, so then no peer ever takes a lock on @node's word;
+ *   P2  @node's parent anchors on the same A -- so the parent re-home's live
+ *       validation, nr_child updates and a peer's retire all hold A too;
+ *   and the op actually holds A.
+ * @lock is the word the op's acquire took for @node (NULL: ask the witness).
+ */
+static unsigned long ft_sa_props_reports;
+
+__attribute__((noinline))
+static void ft_sa_anchor_props(const struct ft_flip_txn *t,
+		const struct ft_lock_ctx *ctx, struct cds_ft_metadata *node,
+		struct cds_ft_metadata *lock)
+{
+	const struct cds_ft *ft = t ? t->sa_ft : NULL;
+	const struct ft_tk_site *site = t ? FT_TK_TXN_SITE(t) : NULL;
+	void *pc0 = __builtin_return_address(0);
+	void *pc1 = FT_SA_CALLER_PC();
+	struct cds_ft_metadata *path[FT_SA_PATH_MAX];
+	struct cds_ft_inode_flag *pflag[FT_SA_PATH_MAX];
+	unsigned int start[FT_SA_PATH_MAX];
+	struct cds_ft_metadata *a, *pa = NULL;
+	unsigned int n;
+	bool held, self, pdiff = false;
+	uintptr_t st;
+
+	if (!ft || !ft->lock_fine || ft->exclusive || !node)
+		return;
+	ft_sa_rec_count(site, pc0, pc1, FT_SA_RV_P_ASKED, false);
+	n = ft_sa_climb(ft, node, path, pflag, start);
+	if (!n || !ft_sa_struct_anchor(ft, node, &a)) {
+		ft_sa_rec_count(site, pc0, pc1, FT_SA_RV_P_UNDATED, false);
+		return;
+	}
+	/* Covered by A however the op came to hold it; @lock only names it. */
+	held = lock == a || ft_sa_witness(t, ctx, a);
+	ft_sa_rec_count(site, pc0, pc1, held ? FT_SA_RV_P_ANCHOR_HELD :
+		FT_SA_RV_P_ANCHOR_NOT_HELD, false);
+	self = a == node;
+	if (self)
+		ft_sa_rec_count(site, pc0, pc1, FT_SA_RV_P_SELF_ANCHORED,
+			false);
+	if (!self && n > 1) {
+		if (ft_sa_struct_anchor(ft, path[1], &pa)) {
+			pdiff = pa != a;
+			ft_sa_rec_count(site, pc0, pc1, pdiff ?
+				FT_SA_RV_P_PARENT_DIFFERS :
+				FT_SA_RV_P_PARENT_SHARES, false);
+		}
+	}
+	st = (uintptr_t) urcu_txn_resolve((void *) CMM_LOAD_SHARED(
+		node->state), FT_STATE_PROXY);
+	if (st & FT_STATE_LOCK)
+		ft_sa_rec_count(site, pc0, pc1, FT_SA_RV_P_WORD_LOCKED, false);
+	if ((!held || self || pdiff) &&
+			uatomic_add_return(&ft_sa_props_reports, 1) <= 8) {
+		char o0[256], o1[256];
+
+		ft_sa_off(pc0, o0, sizeof(o0));
+		ft_sa_off(pc1, o1, sizeof(o1));
+		fprintf(stderr, "FT SA ANCHOR-PROPS %s%s%s pc0=%s pc1=%s node %p "
+			"start %u L %u | trie anchor %p | op lock %p | parent "
+			"anchor %p | state %#lx\n", held ? "" : "NOT_HELD ",
+			self ? "SELF_ANCHORED " : "", pdiff ? "PARENT_DIFFERS" : "",
+			o0, o1, (void *) node, start[0], ft_lock_level(start[0]),
+			(void *) a, (void *) lock, (void *) pa,
+			(unsigned long) st);
+	}
 }
 
 static enum ft_sa_rv ft_sa_rec_verdict(const struct cds_ft *ft,
@@ -10442,6 +10553,9 @@ void ft_flip_txn_record_retire_anchored_arms(struct ft_flip_txn *t,
 	 * records MW whatever @sw_ok says -- and at PER-NODE spacing, where the
 	 * anchor IS the node and this arm is unreachable.
 	 */
+#ifdef FT_DEBUG_STRUCT_ANCHOR
+	ft_sa_anchor_props(t, ctx, node, h->lock);
+#endif
 	ft_flip_txn_record_state_kind_ctx(t, ctx, node,
 			(void *) h->node_snap,
 			(void *) (h->node_snap | FT_STATE_TOMBSTONE),
@@ -12879,6 +12993,9 @@ int ft_remove_one_commit(struct cds_ft *ft,
 					(void *) live,
 					(void *) (live - FT_STATE_NR_CHILD_ONE));
 			} else {
+#ifdef FT_DEBUG_STRUCT_ANCHOR
+				ft_sa_anchor_props(txn, NULL, state_meta, NULL);
+#endif
 				ft_state_edge(&edges[n], &state_meta->state, live,
 					live - FT_STATE_NR_CHILD_ONE);
 				/*

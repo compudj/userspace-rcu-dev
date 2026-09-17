@@ -118,6 +118,59 @@ Two threads cover one node through two words. Probe B cannot see this: each op
 holds *a* covering lock for its own records. Only A and the oracle see an
 agreement failure.
 
+### 2.1 Rows 6-8 fixed; row 9 open (2026-09-17)
+
+**Rows 7 and 8 were one defect in the derivation.** `ft_descent_anchor_at_level`'s
+pending-level fallback, `a->bound ? a->bound : d->nf`, names the node starting at
+`bound_start` through the cursor. It assumes the cursor is the not-yet-entered node
+at `d->depth`. `ft_walk_extend` leaves the cursor on the node it ENTERED (row 7), and
+`ft_node_recompact` left it skip-encoded (row 8). The member passed to the query
+starts at `bound_start`, so it IS that node: the query now takes the member
+(`self`) and answers with it when `bound_start == clamp`.
+
+**Row 6** gives `ft_detach_node`'s first orphan walk its own descent copy, extended
+per orphan with its depth advanced, as the phase-2 walk already did. Re-entering
+key-path nodes in order restores each pending level before a deeper member is
+queried.
+
+Probe A and the anchor-property probe (§7), ft_inv at exponential, before -> after:
+
+| site | before | after |
+|---|---|---|
+| `ft_detach_node` orphan walk (row 6) | 65,290 mismatches of 150,365 | **0** of 171,553 (ft_unit 2 -> 0) |
+| `ft_detach_orphan_planlock` (row 7) | 3,025: 1 above, 1 cursor-is-parent, rest off-path | 2,300, **all off-path** (stale plans: the op anchored on an older copy of the parent) |
+| `ft_node_recompact` (row 8) | 0 (11 at 09-16f) | 0 |
+| `ft_merge_lock_overlap` (row 9) | 29 | 27 -- **not fixed** |
+| non-locked-word writes: op holds A and the parent shares A | 1,090,320 of 1,090,340; 2 SELF_ANCHORED | **1,160,550 of 1,160,552; 0** |
+
+The live E.2 violation above no longer reproduces at HEAD before this change
+(0 of 400 filtered runs; the rows 1-4 conversions changed that test's
+interleavings), so it cannot confirm the fix. The probe rows do.
+
+One on-path mismatch remains at `ft_chain_compress_fused:1614` (1 in 2.46M). Its
+descent dates the compressed parent's end at byte 18 while the member starts at
+byte 12. That is not the pending-boundary case, so it is unaffected by this change.
+Not yet explained.
+
+**Row 9 is not an agreement defect to fix; it is a bulk op that should take no
+DLM lock at all.** Its 27-33 mismatches come from the cross-trie merge
+(`inv_ordered_bulk_consistency`, `inv_merge_root_src_cross_view`): `ft_merge_build`
+fences each dst overlap node through the glue's descent, which ends at the merge
+point. But `cds_ft_merge_at` holds the dst's FT-wide writer lock for its whole
+body (its exclusive source skips every grace-period wait), and while a bulk op is
+live a fine trie's point ops re-take that lock (G5.25). So the fence excludes
+nothing that is not already excluded, whatever word it takes.
+
+Mathieu: the bulk-op transformation is INCOMPLETE -- bulk ops "should not have to
+take _any_ node or exp locks, because they exclude all other ops with per-ft
+locking". Two facts support it:
+- the FT-wide lock is dropped only at `ft_writer_lock_gp_wait` (reader drains in
+  detach, graft, graft_swap and rekey on a live trie);
+- the seam rule forbids holding a node lock across one.
+The one duty a take still performs incidentally is refusing a TOMBSTONE/PROXY
+word for a plan read before a drain seam and used after it. The next step is to
+measure which bulk-op plans cross a seam.
+
 **Stale plans, not defects.** The other ~2,330 mismatches (2,192 at the
 plan-lock, 85 at `ft_chain_compress_fused:1614`, 25 at
 `ft_flip_txn_lock_or_guard_parent_ex`, 13 at `_cds_ft_insert:3812`, 10 at
