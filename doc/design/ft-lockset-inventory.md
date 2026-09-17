@@ -825,7 +825,13 @@ Gate after the batch, clean rebuild: 18/18 GREEN. `bf-nsk`
 (`NO_FEATURE_FT_SKIP_COMPRESSED`): ft_unit and ft_inv at per-node and
 exponential, GREEN.
 
-### 11.4 Queued for the flip (Mathieu, 2026-09-17)
+### 11.4 Queued for the flip (Mathieu, 2026-09-17) -- ☑ CLOSED BY MEASUREMENT
+
+☑ **CLOSED @659bc54f, and by measurement rather than by work.** This item
+assumed the not-held `nr_child--` had a FINE-trie population to convert. It does
+not: NR_CHILD_DEC reads **0 on a fine trie at all three spacings** (§11.6). Every
+one of its records is on a coarse or exclusive trie, where §12.1.1 now parks it.
+The text below is the original statement of the item.
 
 **`ft_remove_one_commit`'s not-held `nr_child--` keeps its MW kind until the
 flip.** Its kind is chosen by `ft_flip_txn_owns` -- the per-node lock registry --
@@ -905,18 +911,46 @@ refused by `cds_ft_group_attr_set_lock_spacing` unless
 `FEATURE_FT_ANCHOR_VALIDATE` (§12.3). The flip makes them correct; graduating
 exponential is a separate decision.
 
-### 11.6 Still owed for the flip
+### 11.6 Still owed for the flip -- MEASURED, not listed from memory
 
-The always-MW LANES are unchanged by §11.5 -- they call
-`ft_flip_txn_record_tag_mw` directly, so they are MW at every spacing:
-`_cds_ft_insert_replace`'s structural edges (DUAL_UNNAMED), the exponential
-anchored retires, RANK, NR_CHILD_DEC (§11.4), and the duplicate CHAIN class
-(`cds_ft_node.next`/`.prev`, `ft_ord_cell.parent`), which Mathieu put in scope.
-Each needs its owner named at the producer and then the ordinary dispatch;
-§11.2-§11.3 is the measurement that says their owners are held. (HEAD_BACK went
-first, §11.8; PARENT_WORD and PSO came with FT-SLOT-3, §11.7. ☠ The CHAIN class
-is NOT one of them -- §11.9 is why the same recipe FAILS there, and the six
-things that must happen before it can be re-asked.)
+This section used to be a list. It is now the per-class FINE-trie residue of
+`ft_flip_txn_record_tag_mw`, which IS the remaining conversion surface:
+everything door 1 retires (§12.1.1) is gone from it by construction, so what is
+left is what a FINE trie still CASes. `-DFT_DEBUG_MWA_DOOR1`, per leg, all four
+legs GREEN:
+
+| class | inv per-node | inv exp | inv root-only | ft_unit | verdict |
+|---|---|---|---|---|---|
+| RANK | **0** | **0** | **0** | **0** | ☑ DISCHARGED -- coarse-only, retired by §12.1.1 |
+| NR_CHILD_DEC | **0** | **0** | **0** | **0** | ☑ DISCHARGED -- ditto (closes §11.4) |
+| PSO | -- | -- | -- | **0** | ☑ DISCHARGED with FT-SLOT-3 (§11.7) |
+| PARENT_WORD | 65 | 65 | 65 | 2,283 | ☑ at its floor: the SAME 65 as §11.7, compaction's own lockless txns |
+| HEAD_BACK | 106,049 | 105,300 | 4,000 | 620,609 | ☑ converted §11.8; this is the not-owned residue |
+| **DUAL_UNNAMED** | **338,783** | **346,689** | **324,799** | 1,974 | ☐ **THE ONE UNBLOCKED CONVERSION LEFT** |
+| STATE | 0 | 678,940 | 5,144,495 | 0 | ✖ a VALIDATE -- must stay MW (§12.1.1 rule 1) |
+| GUARD | -- | -- | -- | 61 | ✖ a VALIDATE -- must stay MW |
+| ROOT | 1,196,702 | 1,026,182 | 1,150,475 | 638 | ✖ [DESIGN] -- a root lives in no node |
+| CELL | 6,983,744 | 7,265,261 | 6,844,722 | 2,029,561 | ✖/☐ ALIASED: see below |
+
+**What this changes.** The old list named RANK and NR_CHILD_DEC as owed; both
+read ZERO on a fine trie at every spacing, because they only ever occur on
+coarse/exclusive tries and §12.1.1 retired them there. §11.4's queued item is
+closed by measurement, not by work.
+
+☞ **DUAL_UNNAMED is the next conversion**, and its legend already says what it
+needs: *"owner UNNAMED (NULL) -- FT_OWNER_UNPLUMBED or genuinely ownerless:
+PLUMBING, not a lock."* ~340k records per leg, flat across all three spacings,
+filed by `_cds_ft_insert_replace` alone (§10.3). Unlike the chain class it needs
+no new acquire -- the owner exists and is not passed.
+
+☠ **CELL IS AN ALIASED BUCKET and its 7M cannot be read as one population.** It
+counts the ordered-cell list (`ft_ord_cell.lnode`, [DESIGN] MW: a splice
+rewrites NEIGHBOURING keys' cells whose holders the op never acquires) TOGETHER
+WITH the duplicate chain (`cds_ft_node.next`/`.prev`, whose conversion is
+§11.9's refuted six-item list). Splitting that counter is the prerequisite for
+sizing either one -- `ft_hlist_store_mw_at` says so itself: *"Sharing one bucket
+means no instrument can tell them apart, and any 'MW is correct here' reasoning
+earned by the cell list reads as though it covered the chain."*
 
 ### 11.7 FT-SLOT-3 settled: the back edge belongs to the PARENT
 
