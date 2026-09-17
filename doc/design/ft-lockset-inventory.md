@@ -926,7 +926,7 @@ legs GREEN:
 | PSO | -- | -- | -- | **0** | ☑ DISCHARGED with FT-SLOT-3 (§11.7) |
 | PARENT_WORD | 65 | 65 | 65 | 2,283 | ☑ at its floor: the SAME 65 as §11.7, compaction's own lockless txns |
 | HEAD_BACK | 106,049 | 105,300 | 4,000 | 620,609 | ☑ converted §11.8; this is the not-owned residue |
-| **DUAL_UNNAMED** | **338,783** | **346,689** | **324,799** | 1,974 | ☐ **THE ONE UNBLOCKED CONVERSION LEFT** |
+| DUAL_UNNAMED | **0** | **0** | **0** | 0 | ☑ DISCHARGED -- the owners are named (below) |
 | STATE | 0 | 678,940 | 5,144,495 | 0 | ✖ a VALIDATE -- must stay MW (§12.1.1 rule 1) |
 | GUARD | -- | -- | -- | 61 | ✖ a VALIDATE -- must stay MW |
 | ROOT | 1,196,702 | 1,026,182 | 1,150,475 | 638 | ✖ [DESIGN] -- a root lives in no node |
@@ -937,11 +937,34 @@ read ZERO on a fine trie at every spacing, because they only ever occur on
 coarse/exclusive tries and §12.1.1 retired them there. §11.4's queued item is
 closed by measurement, not by work.
 
-☞ **DUAL_UNNAMED is the next conversion**, and its legend already says what it
-needs: *"owner UNNAMED (NULL) -- FT_OWNER_UNPLUMBED or genuinely ownerless:
-PLUMBING, not a lock."* ~340k records per leg, flat across all three spacings,
-filed by `_cds_ft_insert_replace` alone (§10.3). Unlike the chain class it needs
-no new acquire -- the owner exists and is not passed.
+☑ **DUAL_UNNAMED IS DISCHARGED**, and it was plumbing in the most literal sense:
+the owners were ALREADY DERIVED in `ft_insert_replace_leaf_sedges` -- but only
+inside `FT_IR_SEDGE_LANE_ASK`, which is compiled out without
+`-DFT_DEBUG_STRUCT_ANCHOR`. Production filed NULL and took the hardcoded-MW arm.
+The three edges now carry their owner ({P} for the in-parent slots,
+`ft_owner_of_parent_word(cn)` for the SKIP_X dual in the grandparent), and both
+leaf arms CAPTURE `ft_lock_skip_dual_gp`'s answer instead of discarding it with a
+`(void)` cast, so `owner_held` is the acquire's verdict rather than an assumption.
+
+☞ NAMING IS SAFE BY CONSTRUCTION, which is what makes this a different shape of
+change from §11.9's: `ft_flip_txn_record_tag` routes to the per-record gate, and
+that gate RE-ASKS `ft_flip_txn_owns`. A named owner the op does not hold answers
+MW exactly as before; `owner_held` selects the route, it does not decide the
+kind. A mis-derived owner costs a conservative MW, never a wrong park.
+
+☞ AND IT MAKES THE SITE AGREE WITH THE SLOT'S OTHER WRITERS. The dual's other
+producers already record it owner-keyed, so it was THIS site's unconditional MW
+that was the odd kind out on a slot the others park -- the reverse of
+introducing a mixed kind. It also retires a "stay MW" branch, which the fuse
+rule says becomes wrong the day the class converts.
+
+Measured at `_cds_ft_insert_replace`'s leaf-replace txn, ft_inv per-node:
+**MW_ALWAYS 433,125 -> 1**, OWN_HELD 128,267 -> 254,834, and the class is ABSENT
+from the census at all three spacings. ☠ The records do NOT park yet -- that
+txn arms SW on 125,111 of 401,153 creations, so the gate mostly answers
+MW_STRUCT. They are now on the ordinary conversion surface, asked and answered,
+instead of hardcoded where no instrument could reach them; parking is door 2's
+business, not this change's.
 
 ☠ **CELL IS AN ALIASED BUCKET and its 7M cannot be read as one population.** It
 counts the ordered-cell list (`ft_ord_cell.lnode`, [DESIGN] MW: a splice

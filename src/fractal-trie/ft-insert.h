@@ -4322,11 +4322,36 @@ static
 unsigned int ft_insert_replace_leaf_sedges(struct cds_ft *ft,
 		struct urcu_txn *mtxn, struct cds_ft_inode_flag *pnf,
 		struct cds_ft_inode_flag **nfp, struct cds_ft_inode_flag *nf,
-		struct cds_ft_node *node, struct ft_ord_cell_edge *sedges)
+		struct cds_ft_node *node, struct ft_ord_cell_edge *sedges,
+		bool gp_held)
 {
+	/*
+	 * ☞ NAME THE OWNER OF EVERY EDGE.  These were the last DUAL_UNNAMED
+	 * records in the tree -- 338,783 / 346,689 / 324,799 per ft_inv leg at
+	 * the three spacings, this producer alone -- and the class legend says
+	 * what that means: "owner UNNAMED (NULL) ... PLUMBING, not a lock."
+	 * The owners were already derived HERE, but only inside the debug-only
+	 * FT_IR_SEDGE_LANE_ASK below; production filed NULL and took the
+	 * hardcoded-MW arm.
+	 *
+	 * ☞ AND NAMING IS SAFE BY CONSTRUCTION: ft_flip_txn_record_tag routes
+	 * to the per-record gate, which RE-ASKS ft_flip_txn_owns.  A named
+	 * owner the op does not hold answers MW, exactly as today; only a held
+	 * one parks.  The producer's @owner_held selects the route, it does not
+	 * decide the kind.
+	 *
+	 * ☞ AND IT MAKES THIS SITE AGREE WITH THE SLOT'S OTHER WRITERS rather
+	 * than diverge from them: the dual's other producers already record it
+	 * owner-keyed (ft_node_recompact's dual holds its owner 490,411 of
+	 * 490,411), so it is THIS site's unconditional MW that was the odd kind
+	 * on a slot the others park.
+	 */
 	sedges[0].slot = (struct ft_ord_cell **) nfp;
 	sedges[0].old_target = (struct ft_ord_cell *) nf;
 	sedges[0].new_target = (struct ft_ord_cell *) node;
+	/* @nfp is a slot in @pnf's body: {P}, taken just above this call. */
+	sedges[0].owner = ft_flag_to_metadata(ft, pnf);
+	sedges[0].owner_held = sedges[0].owner != NULL;
 
 #ifdef FEATURE_FT_SKIP_COMPRESSED
 	if (ft_node_compressed(pnf)) {
@@ -4361,6 +4386,15 @@ unsigned int ft_insert_replace_leaf_sedges(struct cds_ft *ft,
 			 * discipline cds_ft_remove's cell capture and ft_graft's
 			 * publish slot follow.
 			 */
+			/*
+			 * Edge 0 MOVES: its slot is now the SKIP_X dual in the
+			 * GRANDPARENT's body, so its owner is cn's parent, not
+			 * @pnf -- and @gp_held is what ft_lock_skip_dual_gp
+			 * answered for exactly that node.
+			 */
+			sedges[0].owner = ft_owner_of_parent_word(ft,
+				cn_meta->parent_word);
+			sedges[0].owner_held = gp_held && sedges[0].owner;
 			sedges[0].slot = (struct ft_ord_cell **) sslot;
 			sedges[0].old_target = (struct ft_ord_cell *)
 				ft_resolve_flip_proxy(*sslot);
@@ -4368,7 +4402,10 @@ unsigned int ft_insert_replace_leaf_sedges(struct cds_ft *ft,
 				ft_skip_compressed_flag(
 					(struct cds_ft_inode_flag *) node,
 					cn->len);
-			/* edge 1: cn->child forward (exact descent). */
+			/* edge 1: cn->child forward (exact descent) -- the word
+			 * lives in cn, which IS @pnf: {P}. */
+			sedges[1].owner = cn_meta;
+			sedges[1].owner_held = true;
 			sedges[1].slot = (struct ft_ord_cell **) &cn->child;
 			sedges[1].old_target = (struct ft_ord_cell *)
 				ft_resolve_flip_proxy(cn->child);
@@ -4957,6 +4994,7 @@ restart_replace_attempt:
 				 */
 				struct ft_ord_cell_edge sedges[2] = { 0 };
 				unsigned int n_sedge;
+				bool gp_held;
 
 				if (ft->ordered_list) {
 					/*
@@ -5024,13 +5062,16 @@ restart_replace_attempt:
 					 * / 10,279 (exponential) dual records per ft_inv leg
 					 * committed with GP not held, and a GP recompact copies
 					 * that slot trusting its own lock.  The edges are derived
-					 * after both acquires (ft_insert_replace_leaf_sedges).
-					 * The record stays MW: a slot is SW xor MW globally.
+					 * after both acquires (ft_insert_replace_leaf_sedges),
+					 * which NAMES this node as the dual edge's owner and
+					 * passes the acquire's own answer as @gp_held; the
+					 * per-record gate then decides the kind.
 					 */
-					(void) ft_lock_skip_dual_gp(ft, &actx, txn, d.pnf,
+					gp_held = ft_lock_skip_dual_gp(ft, &actx, txn, d.pnf,
 						txn->mtxn);
 					n_sedge = ft_insert_replace_leaf_sedges(ft,
-						txn->mtxn, d.pnf, d.nfp, d.nf, node, sedges);
+						txn->mtxn, d.pnf, d.nfp, d.nf, node, sedges,
+						gp_held);
 					ft_replace_fault_arm_abort(txn);
 					/*
 					 * On a peer-conflict ABORT the commit installs
@@ -5163,13 +5204,16 @@ restart_replace_attempt:
 					 * / 10,279 (exponential) dual records per ft_inv leg
 					 * committed with GP not held, and a GP recompact copies
 					 * that slot trusting its own lock.  The edges are derived
-					 * after both acquires (ft_insert_replace_leaf_sedges).
-					 * The record stays MW: a slot is SW xor MW globally.
+					 * after both acquires (ft_insert_replace_leaf_sedges),
+					 * which NAMES this node as the dual edge's owner and
+					 * passes the acquire's own answer as @gp_held; the
+					 * per-record gate then decides the kind.
 					 */
-					(void) ft_lock_skip_dual_gp(ft, &actx, txn, d.pnf,
+					gp_held = ft_lock_skip_dual_gp(ft, &actx, txn, d.pnf,
 						txn->mtxn);
 					n_sedge = ft_insert_replace_leaf_sedges(ft,
-						txn->mtxn, d.pnf, d.nfp, d.nf, node, sedges);
+						txn->mtxn, d.pnf, d.nfp, d.nf, node, sedges,
+						gp_held);
 					ft_replace_fault_arm_abort(txn);
 					/* -EAGAIN on a peer-conflict ABORT (nothing
 					 * installed); the op's own retry loop re-descends. */
