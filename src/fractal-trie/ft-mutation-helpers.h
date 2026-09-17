@@ -3438,7 +3438,7 @@ struct ft_ch_site {
 	int wkind;
 	bool coarse;
 	unsigned long total, wlock, held, led, unheld, nolocks, noholder,
-		coarse_mode, aborting, some, ctxheld,
+		coarse_mode, excl_trie, aborting, some, ctxheld,
 		ctx_txn, ctx_extra, ctx_glue, ctx_outer,
 		wlock_pernode, wlock_bare, anchored, headword,
 		/*
@@ -3643,6 +3643,18 @@ void ft_ch_audit_owner_at(const char *fn, int line, const struct cds_ft *ft,
 	 */
 	if (!ft->lock_fine) {
 		s->coarse_mode++;
+		return;
+	}
+	/*
+	 * ☠ AN EXCLUSIVE TRIE HAS NO PEER, so there is no exclusion to owe and
+	 * no holder to ask -- door 1 of the register arms it SW trie-wide on
+	 * exactly that argument.  Scoring it read as the whole of this audit's
+	 * residue: the in-place delete's fused freeze_leaf, 57,823 "UNHELD" per
+	 * ft_inv per-node leg and 24 in ft_unit, every one on an exclusive trie
+	 * (a bulk product or source).  Bucketed, never scored.
+	 */
+	if (ft->exclusive) {
+		s->excl_trie++;
 		return;
 	}
 	/*
@@ -4014,6 +4026,10 @@ void ft_ch_audit_body_at(const char *fn, int line, const struct cds_ft *ft,
 		s->coarse_mode++;
 		return;
 	}
+	if (ft->exclusive) {		/* no peer: see ft_ch_audit_owner_at */
+		s->excl_trie++;
+		return;
+	}
 #ifdef FT_DEBUG_STRUCT_ANCHOR
 	if (excl != FT_EXCL_HIDDEN)
 		ft_ch_sa_score(s, ft, t, ctx, owner);
@@ -4128,6 +4144,10 @@ void ft_ch_audit_parent_at(const char *fn, int line, const struct cds_ft *ft,
 		s->coarse_mode++;
 		return;
 	}
+	if (ft->exclusive) {		/* no peer: see ft_ch_audit_owner_at */
+		s->excl_trie++;
+		return;
+	}
 	/*
 	 * A NULL parent is the ROOT position -- the word-kind table's cds_ft.root
 	 * row has "OWNER: NONE (no node)", so there is nothing to ask.
@@ -4188,10 +4208,10 @@ static void ft_ch_audit_report(void)
 		"(rebuild with -DFEATURE_FT_HOLD_TRACE)", ft_ch_site_n,
 		FT_CH_SITE_MAX);
 #endif
-	fprintf(stderr, "%-34s %-8s %6s %10s %9s %8s %8s %8s %8s %8s %7s %8s %8s %8s %6s %7s %8s %7s %7s %8s\n",
+	fprintf(stderr, "%-34s %-8s %6s %10s %9s %8s %8s %8s %8s %8s %7s %8s %8s %8s %8s %6s %7s %8s %7s %7s %8s\n",
 		"site (fn:line)", "word", "kind", "total", "WLOCK", "HELD(reg)",
 		"HELD(led)", "HELD(ctx)", "anchored", "UNHELD", "nolocks",
-		"noholder", "coarseFT", "aborting", "SOME", "UNDECL",
+		"noholder", "coarseFT", "exclTrie", "aborting", "SOME", "UNDECL",
 		"hidden", "mwCAS", "lockOK", "lockVIOL");
 	for (i = 0; i < ft_ch_site_n; i++) {
 		struct ft_ch_site *s = &ft_ch_sites[i];
@@ -4200,11 +4220,12 @@ static void ft_ch_audit_report(void)
 		if (!s->total)
 			continue;
 		snprintf(nm, sizeof(nm), "%s:%d", s->fn, s->line);
-		fprintf(stderr, "%-34s %-8s %6s %10lu %9lu %8lu %8lu %8lu %8lu %8lu %7lu %8lu %8lu %8lu %6lu %7lu %8lu %7lu %7lu %8lu\n",
+		fprintf(stderr, "%-34s %-8s %6s %10lu %9lu %8lu %8lu %8lu %8lu %8lu %7lu %8lu %8lu %8lu %8lu %6lu %7lu %8lu %7lu %7lu %8lu\n",
 			nm, ft_ch_wkind_name[s->wkind],
 			s->coarse ? "COARSE" : "FULL", s->total, s->wlock,
 			s->held, s->led, s->ctxheld, s->anchored, s->unheld,
-			s->nolocks, s->noholder, s->coarse_mode, s->aborting,
+			s->nolocks, s->noholder, s->coarse_mode, s->excl_trie,
+			s->aborting,
 			s->some, s->headword, s->hw_hidden, s->hw_mw,
 			s->hw_locked_ok, s->hw_locked_viol);
 		if (s->wlock)
@@ -6340,11 +6361,14 @@ enum urcu_txn_status ft_flip_txn_commit(struct cds_ft *ft,
 	for (sa_i = 0; sa_i < t->sa_npend; sa_i++) {
 		struct cds_ft_metadata *sa_anchor;
 
-		if (t->sa_pend[sa_i].lane) {
+		if (t->sa_pend[sa_i].lane ||
+				t->sa_pend[sa_i].rv == FT_SA_RV_UNDATED) {
 			/*
 			 * The whole question again, without the site's ctx
 			 * (its frame may be gone): the ledger still answers
-			 * for every hold this thread took.
+			 * for every hold this thread took.  An UNDATED record
+			 * takes it too, so "still undatable" and "not held"
+			 * come apart in the report.
 			 */
 			sa_cv[sa_i] = ft_sa_rec_verdict(t->sa_ft, t, NULL,
 				t->sa_pend[sa_i].owner, NULL, NULL);
@@ -6385,11 +6409,44 @@ enum urcu_txn_status ft_flip_txn_commit(struct cds_ft *ft,
 				FT_SA_RV_C_NEVER_AB);
 
 		ft_sa_rec_count(sp->site, sp->pc0, sp->pc1, cv, false);
-		if (sp->lane && cv != FT_SA_RV_C_NEVER_AB &&
+		if ((sp->lane || sp->rv == FT_SA_RV_UNDATED) &&
+				cv != FT_SA_RV_C_NEVER_AB &&
 				uatomic_add_return(&ft_sa_lane_commit_reports,
 					1) <= 16) {
 			char o0[256], o1[256];
+			/*
+			 * Still undatable at commit: is ANY ancestor held?  The
+			 * anchor, whatever it is, IS an ancestor, so "none held"
+			 * is a gap and "one held" is consistent with coverage
+			 * (not a proof: it may be the wrong ancestor).
+			 */
+			int anc = -1;
 
+			if (sa_cv[sa_i] == FT_SA_RV_UNDATED) {
+				struct cds_ft_inode_flag *af =
+					ft_resolve_flip_proxy(ft_parent_node(
+						sp->owner->parent_word));
+				unsigned int ag = 0;
+
+				anc = 0;
+				while (af && ag++ < FT_MAX_DEPTH &&
+						!ft_node_external(af) &&
+						!ft_parent_is_trie(af)) {
+					struct cds_ft_metadata *am =
+						ft_flag_to_metadata(t->sa_ft,
+							af);
+
+					if (!am)
+						break;
+					if (ft_sa_witness(t, NULL, am)) {
+						anc = 1;
+						break;
+					}
+					af = ft_resolve_flip_proxy(
+						ft_parent_node(
+							am->parent_word));
+				}
+			}
 			ft_sa_off(sp->pc0, o0, sizeof(o0));
 			ft_sa_off(sp->pc1, o1, sizeof(o1));
 			/*
@@ -6397,16 +6454,17 @@ enum urcu_txn_status ft_flip_txn_commit(struct cds_ft *ft,
 			 * came between, so a LATE answer was held at the record
 			 * too and only the record-time climb could not date it.
 			 */
-			fprintf(stderr, "FT SA LANE COMMIT %s site=%s:%d "
+			fprintf(stderr, "FT SA %s COMMIT %s site=%s:%d "
 				"pc0=%s pc1=%s owner %p verdict rec %d commit "
-				"%d locks %u->%u ledger %u->%u owner state "
-				"%#lx\n",
+				"%d locks %u->%u ledger %u->%u ancestor_held "
+				"%d owner state %#lx\n",
+				sp->lane ? "LANE" : "UNDATED",
 				cv == FT_SA_RV_C_LATE ? "LATE" : "NEVER_OK",
 				sp->site ? sp->site->file : "?",
 				sp->site ? sp->site->line : 0, o0, o1,
 				(void *) sp->owner, (int) sp->rv,
 				(int) sa_cv[sa_i], sp->nlocks, t->nr_locks,
-				sp->nhold, sa_nhold,
+				sp->nhold, sa_nhold, anc,
 				(unsigned long) urcu_txn_resolve((void *)
 					CMM_LOAD_SHARED(sp->owner->state),
 					FT_STATE_PROXY));
@@ -6574,8 +6632,13 @@ void __ft_flip_txn_record_tag_ctx(struct ft_flip_txn *t,
 					FT_SA_RV_T_OVERFLOW, false);
 			}
 		}
+		/*
+		 * UNDATED too: the record-time climb could not place the owner
+		 * (a peer's park on its path), which is no verdict at all.
+		 */
 		if (v == FT_SA_RV_NOLOCKS || v == FT_SA_RV_UNHELD ||
-				v == FT_SA_RV_SELF_ONLY) {
+				v == FT_SA_RV_SELF_ONLY ||
+				v == FT_SA_RV_UNDATED) {
 			if (t->sa_npend < CAA_ARRAY_SIZE(t->sa_pend)) {
 				struct ft_sa_pend *sp =
 					&t->sa_pend[t->sa_npend++];
@@ -6586,6 +6649,8 @@ void __ft_flip_txn_record_tag_ctx(struct ft_flip_txn *t,
 				sp->pc1 = pc1;
 				sp->lane = 0;
 				sp->rv = (unsigned char) v;
+				sp->nlocks = t->nr_locks;
+				sp->nhold = ft_hold_trace_count();
 			} else {
 				ft_sa_rec_count(FT_TK_TXN_SITE(t), pc0, pc1,
 					FT_SA_RV_C_OVERFLOW, false);

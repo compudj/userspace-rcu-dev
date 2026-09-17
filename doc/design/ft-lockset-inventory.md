@@ -718,3 +718,72 @@ back edges (txn sites ft-insert.h:1163 and ft-remove.h:4785) and the fuse's
 could not date it past a peer's park. At commit the owner's anchor is held, and no
 lock was taken in between. **No lane record commits uncovered.**
 
+
+## 11. Readiness for the MW→SW flip, measured (2026-09-17)
+
+The flip happens once, after the lock-set transition is complete at FINE and
+EXPONENTIAL (Mathieu). This section records what the instruments say about
+each class that is to become SW, and what is still open.
+
+### 11.1 What the flip changes
+
+Per the register (fractal-trie-internal.h), a structural slot at exponential
+and root-only is MW *by construction*: `ft_flip_txn_arm_per_op` refuses any
+spacing but per-node (`ft_txn_per_op_spacing_ok`, "door 2"). The refusal
+exists because `ft_flip_txn_owns` is exact at per-node and anchor-blind above
+it. So the flip is two changes that must land together:
+- lift door 2, with an owner witness that resolves the anchor (the debug
+  owner assert would otherwise fire on every coarse leg, as it did when
+  measured before);
+- convert the unfinished always-MW lanes (§3, §10) to owner-dispatched records,
+  the exponential anchored retires, and the not-held `nr_child--`.
+
+`-DFT_DEBUG_STRUCT_ANCHOR`'s record-time inventory is the anchor-aware
+witness that door 2 lacks.
+
+### 11.2 Measured, per class (ft_inv, probe trees `blane4` / `bchain3`)
+
+| class | per-node | exponential | root-only |
+|---|---|---|---|
+| owner-bearing records (MW_STRUCT surface) | 0 unheld | 0 unheld; UNDATED re-asked, see 11.3 | 0 unheld; 6 UNDATED, all LATE |
+| unfinished lanes | 0 uncovered | 0 NEVER_OK (§10.3) | 0 |
+| duplicate chain (`-DFT_DEBUG_CHAIN_HOLD`) | 4 unheld | 19 unheld | 1 unheld |
+| anchored retires, P1/P2 (§7, 09-17) | -- | 1,160,550 of 1,160,552, 0 exceptions after rows 6-8 | -- |
+
+ft_unit: 0 at both spacings on every row.
+
+**The chain audit had no exclusive-trie bucket.** It scored an exclusive trie
+(a bulk product or source, no peer) as UNHELD. At the in-place delete's fused
+freeze_leaf that was the entire residue: 57,823 per ft_inv per-node leg and 24
+in ft_unit, confirmed one for one by a probe splitting the same population on
+`ft->exclusive`. Bucketed now (`exclTrie`). The site then reads 0 at every
+spacing (149,152 / 119,208 exclusive records per leg).
+
+☠ A first probe at that site counted "registry and ledger both empty" and
+pointed at the external promote. It was blind to the orphan plan-lock marks
+in `lctx`'s extras, which the audit counts as HELD(ctx). A lock hoist written
+from it closed nothing and was reverted.
+
+### 11.3 Open
+
+1. **Chain, `ft_detach_node:3941`** (compressed-parent branch, list off):
+   freeze_leaf is recorded into `orphan_txn` holding nothing (no extras, no
+   ancestor). {C,P,GP} are taken later, in
+   `ft_detach_node_replace_compressed_parent`. That is sound for the MW record,
+   but it is not lock-before-read. 4 / 19 / 1 per leg.
+2. **Owner-bearing UNDATED records, now re-asked at commit** (they were not):
+   over 14 exponential legs, 40 LATE with `locks 1->1 ledger 0->0`, and 5 still
+   undatable at commit. All 5 are the in-place delete's forward edge at the
+   detach commit, and each has an ancestor held (`ancestor_held 1`). That is
+   consistent with the hoist's descent-dated anchor, but not a proof.
+3. **The fuse's `parent_word` lane** (txn site ft-remove.h:1463): 7 LATE
+   records over 8 legs read `locks 1->2 ledger 3->0`. A lock registered between
+   the record and the commit, so "held when the record was made" (the SW
+   precondition) is not shown for these.
+4. **Not scored:** the hlist helpers' COARSE rows (`SOME` / `UNDECL`, which
+   cannot see `@ft`); the head and parent-word rows' `hidden` declarations
+   (build-invisible claims, counted and not believed); and
+   `ft_popcount_node_set_nth:516` node-body writes the struct-anchor climb
+   cannot date (15,447 per exponential leg).
+5. **CELL-aliased `nr_child--`:** `ft_remove_one_commit`'s not-held state edge
+   is still counted inside CELL (§3), so it is not split out and not asked.
