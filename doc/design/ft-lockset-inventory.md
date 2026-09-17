@@ -153,16 +153,66 @@ coverage.
 
 ---
 
-## 5. An open question the inventory raises, NOT settled
+## 5. SETTLED BY TEST: holding the old anchor does NOT exclude a late acquirer
 
 §3 of the anchor doc argues that *"every change to which-node-covers-byte-L is
 itself a locked mutation of those very nodes"*. Holding the OLD anchor during
-the change excludes ops that hold it *concurrently*. Does it also exclude one
-that planned before the change and acquires the old anchor *after* the release?
+the change excludes ops that hold it *concurrently*. The question was whether it
+also excludes an op that PLANNED before the change and ACQUIRES the old anchor
+after the restructurer released it. It does not.
 
-The acquire's read-set guard is on the MEMBER's back edge. When the anchor is
-an ancestor of the member, that edge is unchanged by a split above it. The
-anchor node's own back edge, which the split did rewrite, is not guarded.
-Reasoned from the code, not measured: probe A would report such an acquire as a
-non-stale mismatch, and none was seen in these suites. Recorded so the
-transition answers it rather than inherits it.
+**The rig** (`doc/design/ft-anchor-move-rig.c`, against a library built with
+`-DFT_DEBUG_INTERLEAVE`, whose test-only hook parks the delete tier's leaf hoist
+before and after its acquire). Exponential spacing:
+
+    root [0,1) -'a'-> cn [1,9) "bcdefghi" -> A @9 -'J'-> X @10, children '1'..'8'
+    anchor(X): depth 10, L = 8, first boundary >= 8 is A          ==> A
+    split: insert "abcdefghQzz" (diverges at byte 8), boundary B @8 ==> anchor(X) = B
+
+The VICTIM removes `abcdefghiJ8` (a leaf directly in X's slot, so it holds
+nothing before its hoist) and is parked at PRE, with its plan -- anchor A --
+already taken. The split commits. The victim then acquires A and is parked at
+POST, holding it. A PEER runs with a 2 s budget.
+
+| mode | peer | peer completed while the victim held its anchor | reading |
+|---|---|---|---|
+| no split | delete `J7` | **no** | CONTROL: both anchor X on A, the peer waits |
+| split | delete `J7` | **YES** | **HOLE**: the victim holds A, the peer holds B, both write X |
+| split | insert `J0` | no | a false negative, see below |
+
+Probe A records the victim's acquire as a LIVE mismatch (neither node
+tombstoned): `op anchor A (start 9), trie anchor B (start 8)`. Both commits
+landed and both keys are gone -- today's MW records arbitrated the two writes to
+X's slot and state word. Under SW parks they would not.
+
+☠ **The insert peer is not a counter-example.** Growing X recompacts it with lock
+set {X, A, ...}: A is X's PARENT and therefore a coarsened MEMBER, whose own word
+the acquire samples -- and A's own word carries the victim's lock. It waits on A
+as a member, not on the anchor it computed. A peer whose lock set is {X} alone
+(the leaf delete) shows the gap.
+
+**What the split does do**, observed on the way: its lock set includes the child
+it re-homes (A), so a victim already HOLDING A blocks the split. The gap is only
+the late acquire: the acquire validates the MEMBER's back edge, and X's edge is
+unchanged by a split above A; nothing re-checks that A is still the first
+boundary at or after L once it is held.
+
+---
+
+## 6. Progress on §1 (ordered by Mathieu: 1, 2, 3, then 4)
+
+| row | commit | after |
+|---|---|---|
+| 1 delete-tier leaf delete | `7e4e9d15` | NOLOCKS 2.7M -> 0 (per-node), 2.6M -> 0 (exponential) |
+| 2 `remove_all` of the empty key | `c4089e33` | both commit rows absent |
+| 3 insert over an occupied slot | `79f0b245` | row absent |
+| 4 compaction (compressed + cell relocation) | `06662abe` | raw writes 1,030 -> 1 (the exclusive-trie test) |
+
+**Found on the way, and a precondition of the flip:** the engine's late settle
+pass selected the words it hands ownership over by PROXY TAG, and the trie's
+duplicate-chain links share tag 1 with its state words. A registered lock's
+release was settled before the chain links it protects, so a peer could take the
+lock while a link was still a proxy. It surfaced as a pre-existing SIGSEGV in
+`inv_concurrent_insert_replace_nolist` (28/1500 filtered runs before row 1,
+40/1200 after -- row 1 put a release next to a chain mark in one more commit),
+and it is 0/1200 once the registered lock words settle last (`8c517957`).
