@@ -1318,7 +1318,7 @@ struct ft_pub_rec {
  *   metadata.alloc_index          ALLOCATOR-PRIVATE (7) -- never transacted
  *   cds_ft_node.next              the chain HOLDER    MW  (4)    MW   [debt]
  *   cds_ft_node.prev  (member)    the chain HOLDER    MW / SW(5) MW   [debt]
- *   cds_ft_node.prev  (head)      the holder P        MW / SW(5) MW   [debt]
+ *   cds_ft_node.prev  (head)      the holder P        SW if parent held (5)
  *   ft_ord_cell.lnode.next/prev   NONE (6)            MW         MW   [DESIGN]
  *   ft_ord_cell.parent            the holder P        MW + raw   MW   [debt]
  *   ft_ord_cell.node              BUILD-INVISIBLE (8) -- never transacted

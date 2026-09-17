@@ -950,6 +950,34 @@ After the switch, per leg at EVERY spacing: **PARENT_WORD 65, PSO 0** (from
 exclusion is trie-wide, where door 1 decides the kind and the named owner does
 not. Both branches record the same kind, so one word can never get two.
 
+### 11.8 A head's back edge joins the SW transition (the same rule)
+
+`ft_back_edge_owner` already names the owner Mathieu decided on 2026-09-03 --
+the PARENT the head hangs from -- which is FT-SLOT-3's rule for a metadata
+child's back edge (§11.7). The lane probe had measured that owner held (0
+uncovered, 0 NEVER_OK). So the lane converts the same way: the record names it
+and the per-record gate parks SW where the op holds it.
+
+☠ THE OWNER IS RESOLVED BY THE CALLER, not inside the recorder, because only
+the caller knows what the word's OLD VALUE IS: at compaction's cell relocation
+it is the CELL, not a parent word, and a derivation inside would misparse it.
+`ft_flip_txn_record_head_back_edge_owned` takes the owner; the old spelling
+passes NULL and stays always-MW (compaction's site keeps it).
+
+Ten producers converted (the re-parent arms, the recompaction back edge, the
+insert's src-use relocation, the child back edge, the glue's two arms, the
+rekey re-parent, the detach's compressed-parent pair and its unchain). Per
+ft_inv leg:
+
+| HEAD_BACK records | before | after |
+|---|---|---|
+| per-node | 6,125,292 | **146,304** |
+| exponential | 5,954,727 | **157,306** |
+| root-only | 5,962,536 | **38,662** |
+
+Gate 18/18 GREEN, probe tree with the owner assert armed 6/6 at the three
+spacings, NO_FEATURE_FT_SKIP_COMPRESSED 6/6.
+
 ## 12. API / design questions queued by Mathieu (2026-09-17)
 
 Not implemented; recorded so the flip does not silently decide them.

@@ -316,13 +316,18 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 				struct ft_ord_cell *cell = ft_ord_cell_ptr(
 					topmost_external_nodes->prev);
 
-				ft_flip_txn_record_head_back_edge(txn,
+				ft_flip_txn_record_head_back_edge_owned(txn,
 					(void **) &cell->parent,
-					cell->parent, cn_flag FT_BE_SITE(FT_BE_DETACH_CN_PARENT, ctx));
+					cell->parent, cn_flag,
+					ft_back_edge_owner(cell->parent)
+					FT_BE_SITE(FT_BE_DETACH_CN_PARENT, ctx));
 			} else {
-				ft_flip_txn_record_head_back_edge(txn,
+				ft_flip_txn_record_head_back_edge_owned(txn,
 					(void **) &topmost_external_nodes->prev,
-					topmost_external_nodes->prev, cn_flag FT_BE_SITE(FT_BE_DETACH_CN_PARENT, ctx));
+					topmost_external_nodes->prev, cn_flag,
+					ft_back_edge_owner(
+						topmost_external_nodes->prev)
+					FT_BE_SITE(FT_BE_DETACH_CN_PARENT, ctx));
 			}
 		}
 		/*
@@ -5220,10 +5225,14 @@ int ft_detach_node(struct cds_ft *ft,
 				 */
 				if (pub->head_parent_field) {
 					if (commit_txn) {
-						ft_flip_txn_record_head_back_edge(commit_txn,
+						ft_flip_txn_record_head_back_edge_owned(
+							commit_txn,
 							(void **) pub->head_parent_field,
 							pub->head_parent_old,
-							pub->head_parent_new FT_BE_SITE(FT_BE_DETACH_UNCHAIN, &lctx));
+							pub->head_parent_new,
+							ft_back_edge_owner(
+								pub->head_parent_old)
+							FT_BE_SITE(FT_BE_DETACH_UNCHAIN, &lctx));
 					} else {
 						rcu_assign_pointer(*pub->head_parent_field,
 							pub->head_parent_new);

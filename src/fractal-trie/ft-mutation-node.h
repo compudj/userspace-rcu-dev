@@ -2103,10 +2103,12 @@ int ft_node_recompact(enum ft_recompact mode,
 				 * the recorded twin of the plain-store arm's
 				 * ft_publish_external_nodes_prev below.
 				 */
-				ft_flip_txn_record_head_back_edge(retire_txn,
+				ft_flip_txn_record_head_back_edge_owned(retire_txn,
 					bc_slot, bc_old,
 					ft_head_parent_word(new_node_flag,
-						/*prefix=*/ true) FT_BE_SITE(FT_BE_RECOMPACT, ctx));
+						/*prefix=*/ true),
+					ft_back_edge_owner(bc_old)
+					FT_BE_SITE(FT_BE_RECOMPACT, ctx));
 			} else {
 				/*
 				 * Build-invisible / legacy no-txn arm: the

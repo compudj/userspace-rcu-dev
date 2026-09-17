@@ -542,9 +542,10 @@ int ft_rekey_cow_reparent_child(struct cds_ft *ft,
 			pr = field ? urcu_txn_find(desc, field) : NULL;
 			if (pr) {
 				ft_head_stamp_incoming_byte(ft, en, new_flag, slot);
-				ft_flip_txn_record_head_back_edge(txn, field,
-					pr->new_ptr,
-					ft_head_parent_word_slot(new_flag, slot)
+				ft_flip_txn_record_head_back_edge_owned(txn,
+					field, pr->new_ptr,
+					ft_head_parent_word_slot(new_flag, slot),
+					ft_back_edge_owner(pr->new_ptr)
 					FT_BE_SITE(FT_BE_REPARENT_META, ctx));
 				return 0;
 			}

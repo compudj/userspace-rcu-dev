@@ -8005,8 +8005,9 @@ static void ft_be_site_report(void)
  * sites looked ownerless and had their holder as a parameter all along.
  */
 static inline
-void ft_flip_txn_record_head_back_edge(struct ft_flip_txn *t, void **slot,
-		void *old_ptr, void *new_ptr FT_BE_SITE_PARAM)
+void ft_flip_txn_record_head_back_edge_owned(struct ft_flip_txn *t, void **slot,
+		void *old_ptr, void *new_ptr, struct cds_ft_metadata *owner
+		FT_BE_SITE_PARAM)
 {
 	FT_BACK_EDGE_CLAIM(t, old_ptr, new_ptr);
 #ifdef FT_DEBUG_STRUCT_ANCHOR
@@ -8030,9 +8031,36 @@ void ft_flip_txn_record_head_back_edge(struct ft_flip_txn *t, void **slot,
 			ow__), NULL);
 	}
 #endif
+	/*
+	 * FT-SLOT-3's RULE, APPLIED TO A HEAD'S BACK EDGE: the word belongs to
+	 * the PARENT whose slot names the head -- Mathieu's decision of record
+	 * (2026-09-03), and ft_back_edge_owner is what names it.  @owner is
+	 * that parent, resolved by the CALLER from the word's OLD value,
+	 * because only the caller knows what that value IS: at compaction's
+	 * cell relocation it is the CELL, not a parent word, so a derivation
+	 * inside here would misparse it.  NULL keeps the always-MW lane.
+	 *
+	 * Held, the record takes the ordinary dispatch and the per-record gate
+	 * parks it SW under an armed txn; not held, it stays MW.  An external
+	 * head has no state word of its own, so this is the one owner it can
+	 * ever have (FT_OWNER_NONE_EXTERNAL_HEAD's design question, closed in
+	 * favour of the model).
+	 */
+	if (owner && ft_flip_txn_owns(t, owner)) {
+		/* The dispatching core, as ft_flip_txn_record_reserved reaches
+		 * it (that spelling is defined further down this file). */
+		__ft_flip_txn_record_tag_ctx(t, /*dbg_ctx=*/ NULL, owner, slot,
+			old_ptr, new_ptr, FT_FLIP_PROXY_TAG);
+		return;
+	}
 	ft_flip_txn_record_tag_mw(t, slot, old_ptr, new_ptr,
 		FT_FLIP_PROXY_TAG FT_TK_MWA(FT_TK_MWA_HEAD_BACK));
 }
+
+/* The unowned spelling: an always-MW head back edge, as before. */
+#define ft_flip_txn_record_head_back_edge(t, slot, old_ptr, new_ptr, ...)	\
+	ft_flip_txn_record_head_back_edge_owned((t), (slot), (old_ptr),		\
+		(new_ptr), NULL __VA_ARGS__)
 
 /*
  * MIXED sw/mw: opt @t's structural edges into SW-kind parks.  A caller holding
@@ -14188,10 +14216,16 @@ void ft_record_child_back_edge(struct cds_ft *ft, struct ft_flip_txn *txn,
 	 * commit, same abort, same reservation -- the rec never added anything
 	 * to this edge, having no per-edge answer that means "always MW".
 	 */
-	ft_flip_txn_record_head_back_edge(txn, (void **) field,
-		urcu_txn_load(txn->mtxn, (void **) field, FT_FLIP_PROXY_TAG),
-		ft_head_parent_word_slot(new_parent, slot)
-		FT_BE_SITE(FT_BE_CHILD_BACK_EDGE, NULL));
+	{
+		/* One load, and the owner FT-SLOT-3 names, derived from it. */
+		void *old_pw = urcu_txn_load(txn->mtxn, (void **) field,
+			FT_FLIP_PROXY_TAG);
+
+		ft_flip_txn_record_head_back_edge_owned(txn, (void **) field,
+			old_pw, ft_head_parent_word_slot(new_parent, slot),
+			ft_back_edge_owner(old_pw)
+			FT_BE_SITE(FT_BE_CHILD_BACK_EDGE, NULL));
+	}
 }
 
 /*
@@ -17384,14 +17418,16 @@ void ft_glue_record_back_edge(struct cds_ft *ft, struct ft_flip_txn *txn,
 		if (ft->ordered_list) {
 			struct ft_ord_cell *cell = ft_ord_cell_ptr(en->prev);
 
-			ft_flip_txn_record_head_back_edge(txn,
+			ft_flip_txn_record_head_back_edge_owned(txn,
 				(void **) &cell->parent, cell->parent,
-				ft_head_parent_word_slot(parent_nf, slot)
+				ft_head_parent_word_slot(parent_nf, slot),
+				ft_back_edge_owner(cell->parent)
 				FT_BE_SITE(FT_BE_PARENT_WORD, NULL));
 		} else {
-			ft_flip_txn_record_head_back_edge(txn,
+			ft_flip_txn_record_head_back_edge_owned(txn,
 				(void **) &en->prev, en->prev,
-				ft_head_parent_word_slot(parent_nf, slot)
+				ft_head_parent_word_slot(parent_nf, slot),
+				ft_back_edge_owner(en->prev)
 				FT_BE_SITE(FT_BE_PARENT_WORD, NULL));
 		}
 		return;
@@ -17786,21 +17822,25 @@ void ft_reparent_record(struct cds_ft *ft, struct ft_flip_txn *txn,
 		 * what let a moved bare head keep the SOURCE key's last byte.
 		 */
 		ft_head_stamp_incoming_byte(ft, en, parent_nf, slot);
-		if (ft->ordered_list) {
-			struct ft_ord_cell *cell = ft_ord_cell_ptr(en->prev);
+		{
+			/*
+			 * ONE load of the old word, and the owner derived from
+			 * it: the parent whose slot names this head today
+			 * (FT-SLOT-3).  With the list on the word lives in the
+			 * head's CELL, with it off in the head's own prev; both
+			 * VALUES are parent words, so ft_back_edge_owner reads
+			 * either.
+			 */
+			void **field = ft->ordered_list ?
+				(void **) &ft_ord_cell_ptr(en->prev)->parent :
+				(void **) &en->prev;
+			void *old_pw = urcu_txn_load(txn->mtxn, field,
+				FT_FLIP_PROXY_TAG);
 
-			ft_flip_txn_record_head_back_edge(txn,
-				(void **) &cell->parent,
-				urcu_txn_load(txn->mtxn, (void **) &cell->parent,
-					FT_FLIP_PROXY_TAG),
-				ft_head_parent_word_slot(parent_nf, slot)
-				FT_BE_SITE(FT_BE_REPARENT_META, NULL));
-		} else {
-			ft_flip_txn_record_head_back_edge(txn,
-				(void **) &en->prev,
-				urcu_txn_load(txn->mtxn, (void **) &en->prev,
-					FT_FLIP_PROXY_TAG),
-				ft_head_parent_word_slot(parent_nf, slot)
+			ft_flip_txn_record_head_back_edge_owned(txn, field,
+				old_pw,
+				ft_head_parent_word_slot(parent_nf, slot),
+				ft_back_edge_owner(old_pw)
 				FT_BE_SITE(FT_BE_REPARENT_META, NULL));
 		}
 		return;
