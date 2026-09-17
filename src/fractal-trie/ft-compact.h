@@ -990,6 +990,27 @@ enum cds_ft_compact_status cds_ft_compact_step(struct cds_ft_compact_state *st,
 	 */
 	ft_recompact_alloc_set_active(&st->ctx);
 	flavor->read_lock();
+	/*
+	 * ☞ THE MODE FLIP, PER STEP.  A fine trie's point op samples the bulk
+	 * gate once per op, from inside a read-side section, so a bulk op's
+	 * publish-then-one-GP drains every op that saw it clear, and every later
+	 * one queues on the FT-wide lock (ft_writer_lock_scope_enter, G5.25).
+	 * Compaction follows the same protocol one STEP at a time: the scope is
+	 * entered inside this step's read-side section, so the gate's grace
+	 * period covers the batch, and a bulk op that starts between two steps
+	 * makes the next one queue.  Sampling once for a whole cds_ft_compact
+	 * pass would not: the pass drops the read lock between steps, the gate's
+	 * grace period completes in that gap, and the bulk body would run beside
+	 * a compaction that holds no FT-wide lock -- which is what lets bulk ops
+	 * take no node lock of their own.
+	 *
+	 * The step's DLM locks (the relocations' lock sets) stay: in bulk mode a
+	 * step takes BOTH, like a point op, because at the gate's two edges it
+	 * meets ops that hold DLM locks only.
+	 */
+	{
+	CDS_FT_SCOPED_WRITER(ft);
+
 	while (relocated < batch) {
 		uint8_t key[FT_MAX_KEY_LEN];
 		size_t key_len;
@@ -1042,6 +1063,7 @@ enum cds_ft_compact_status cds_ft_compact_step(struct cds_ft_compact_state *st,
 		if (st->bail)
 			break;		/* stop the pass; the resume re-attempts */
 	}
+	}	/* the step's writer scope */
 	/*
 	 * Drop the cached path before releasing the read lock: the nodes it
 	 * references become eligible for the grace-period free once unlocked.

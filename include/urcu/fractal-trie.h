@@ -4205,7 +4205,11 @@ struct cds_ft_compact_state *cds_ft_compact_begin(struct cds_ft *ft);
  * @st: State from cds_ft_compact_begin.
  * @batch: Maximum nodes to relocate this step (0 selects a default).
  *
- * The caller must hold its writer exclusion for @ft across this call. Returns:
+ * The caller must hold its writer exclusion for @ft across this call.  On a
+ * CDS_FT_WRITER_LOCK_FINE trie the step also takes part in the bulk-op mode
+ * flip on its own, like a point op: while a bulk op (detach, graft, graft_swap,
+ * merge, rekey) is live on @ft, the step queues on the trie-wide writer lock.
+ * Returns:
  *   CDS_FT_COMPACT_MORE - more work remains; call again.
  *   CDS_FT_COMPACT_DONE - the trie is fully compacted.
  *   CDS_FT_COMPACT_OOM  - stopped early: a relocation hit an allocation failure.

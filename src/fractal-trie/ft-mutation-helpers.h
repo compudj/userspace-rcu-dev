@@ -8445,6 +8445,91 @@ void ft_sa_check(const char *fn, int line, const struct cds_ft *ft,
 }
 #endif /* FT_DEBUG_STRUCT_ANCHOR */
 
+#ifdef FT_DEBUG_BULK_ACQ
+/*
+ * THE BULK-OP LOCK INVENTORY.  Mathieu: a bulk op excludes every other op with
+ * per-FT locking (the bulk lock, and point ops flipped onto the FT-wide writer
+ * lock), so it should take NO node or anchor lock.  Every DLM acquire made from
+ * inside a bulk op, per (fn, line): how many, with how many members, on a trie
+ * whose FT-wide lock this thread holds or not, and whether a drain seam already
+ * happened earlier in the op (the one case where a take may double as a
+ * stale-plan check).
+ */
+#define FT_BA_SITES	128
+static struct ft_ba_site {
+	const char *fn;
+	int line;
+	unsigned long calls, members, wlock, nowlock, excl, seam_before;
+} ft_ba_sites[FT_BA_SITES];
+static unsigned long ft_ba_overflow;
+static pthread_mutex_t ft_ba_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void ft_ba_note(const char *fn, int line, const struct cds_ft *ft,
+		int nr_present)
+{
+	struct ft_ba_site *st = NULL;
+	int i;
+
+	for (i = 0; i < FT_BA_SITES; i++) {
+		const char *cur = CMM_LOAD_SHARED(ft_ba_sites[i].fn);
+
+		if (cur == fn && ft_ba_sites[i].line == line) {
+			st = &ft_ba_sites[i];
+			break;
+		}
+		if (!cur)
+			break;
+	}
+	if (!st) {
+		pthread_mutex_lock(&ft_ba_lock);
+		for (i = 0; i < FT_BA_SITES; i++) {
+			if (ft_ba_sites[i].fn == fn &&
+					ft_ba_sites[i].line == line)
+				break;
+			if (!ft_ba_sites[i].fn) {
+				ft_ba_sites[i].line = line;
+				CMM_STORE_SHARED(ft_ba_sites[i].fn, fn);
+				break;
+			}
+		}
+		pthread_mutex_unlock(&ft_ba_lock);
+		if (i == FT_BA_SITES) {
+			uatomic_inc(&ft_ba_overflow);
+			return;
+		}
+		st = &ft_ba_sites[i];
+	}
+	uatomic_inc(&st->calls);
+	uatomic_add(&st->members, (unsigned long) nr_present);
+	if (ft_wlock_held == ft)
+		uatomic_inc(&st->wlock);
+	else
+		uatomic_inc(&st->nowlock);
+	if (ft->exclusive)
+		uatomic_inc(&st->excl);
+	if (ft_ba_seam_n != ft_ba_seam_at_gate)
+		uatomic_inc(&st->seam_before);
+}
+
+static void ft_ba_report(void) __attribute__((destructor));
+static void ft_ba_report(void)
+{
+	int i;
+
+	fprintf(stderr, "\n=== FT_BULK_ACQ: DLM acquires made INSIDE a bulk op, per site ===\n");
+	for (i = 0; i < FT_BA_SITES && ft_ba_sites[i].fn; i++) {
+		const struct ft_ba_site *st = &ft_ba_sites[i];
+
+		fprintf(stderr, "FT_BA %s:%d calls=%lu members=%lu wlock=%lu "
+			"NOWLOCK=%lu excl=%lu SEAM_BEFORE=%lu\n", st->fn,
+			st->line, st->calls, st->members, st->wlock,
+			st->nowlock, st->excl, st->seam_before);
+	}
+	fprintf(stderr, "FT_BA overflow=%lu seams_in_bulk=%lu\n", ft_ba_overflow,
+		ft_ba_seams_in_bulk);
+}
+#endif
+
 static inline
 int ft_dlm_acquire_set_at(const char *fn, int line,
 		const struct cds_ft *ft, const struct ft_lock_ctx *ctx,
@@ -8487,6 +8572,10 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 			nr_present++;
 	if (!nr_present)
 		return 0;
+#ifdef FT_DEBUG_BULK_ACQ
+	if (ft_bulk_self_depth)
+		ft_ba_note(fn, line, ft, nr_present);
+#endif
 #ifdef FT_DEBUG_WIDEN_OWNER
 	ft_wo_observe(fn, line, ft, ctx);
 	/*

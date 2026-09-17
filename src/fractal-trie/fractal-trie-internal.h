@@ -3833,9 +3833,31 @@ static unsigned long ft_ss_seam_all __attribute__((unused)),
 	ft_ss_seam_in_window __attribute__((unused));
 #endif
 
+#ifdef FT_DEBUG_BULK_ACQ
+/*
+ * -DFT_DEBUG_BULK_ACQ: drain seams this thread has taken, and the count when its
+ * OUTERMOST bulk gate opened -- so an acquire inside a bulk op can say whether a
+ * seam already happened earlier in that op.
+ */
+static __thread unsigned long ft_ba_seam_n, ft_ba_seam_at_gate;
+/* ARM YIELD: seams taken inside a bulk op, and with an acquire after them. */
+static unsigned long ft_ba_seams_in_bulk __attribute__((unused));
+# define FT_BA_GATE_NOTE()						\
+	do {								\
+		if (!ft_bulk_self_depth)				\
+			ft_ba_seam_at_gate = ft_ba_seam_n;		\
+	} while (0)
+#else
+# define FT_BA_GATE_NOTE()	do { } while (0)
+#endif
 static inline
 void ft_writer_lock_gp_wait(struct cds_ft *ft)
 {
+#ifdef FT_DEBUG_BULK_ACQ
+	ft_ba_seam_n++;
+	if (ft_bulk_self_depth)
+		uatomic_inc(&ft_ba_seams_in_bulk);
+#endif
 #ifdef FT_DEBUG_SPLICE_SEAM
 	uatomic_inc(&ft_ss_seam_all);
 	if (ft_splice_window)
@@ -4136,6 +4158,7 @@ void ft_bulk_gate_enter_gp(struct cds_ft *ft, enum ft_bulk_kind kind)
 		ft->gate_gp_nr--;
 		pthread_cond_broadcast(&ft->move_gate_cond);
 		pthread_mutex_unlock(&ft->move_gate_lock);
+		FT_BA_GATE_NOTE();
 		ft_bulk_self_depth++;
 		return;
 	}
@@ -4167,11 +4190,13 @@ void ft_bulk_gate_enter_gp(struct cds_ft *ft, enum ft_bulk_kind kind)
 		} while (ft->gate_gp_nr);
 		pthread_mutex_unlock(&ft->move_gate_lock);
 		ft->group->flavor->thread_online();
+		FT_BA_GATE_NOTE();
 		ft_bulk_self_depth++;
 		return;
 	}
 	pthread_mutex_unlock(&ft->move_gate_lock);
-	ft_bulk_self_depth++;
+	FT_BA_GATE_NOTE();
+		ft_bulk_self_depth++;
 }
 
 /*

@@ -466,3 +466,43 @@ fuse) keep the check. The split's is what closes §5's held order (§5.1 red
 control). There the re-homed node is a compressed node's SINGLE child and the
 old anchor of everything below it. Taking its lock instead of validating it
 avoids the fan the reverted lock-the-sweep experiment choked on.
+
+---
+
+## 9. Bulk ops take no node lock; compaction follows the mode flip (Mathieu, 2026-09-17)
+
+**The rule.** A bulk op excludes every other op through per-FT locking: the bulk
+lock, and point ops flipped onto the FT-wide writer lock while the gate is open
+(G5.25). So it should take no node or anchor lock at all. Point ops and
+compaction take BOTH the FT-wide lock and their nearest-ancestor locks in bulk
+mode, because the regime is mixed at the gate's two edges:
+- while the gate opens, ops that saw it clear hold node locks only until its grace
+  period ends;
+- after it closes, fresh ops are back on node locks while flipped ones may still run.
+
+Only the bulk BODY, strictly inside the gate, may drop them.
+
+**Compaction now takes part in the flip, per step.** `cds_ft_compact_step` enters
+the writer scope inside its own read-side section, as a point op does, so the
+gate's grace period covers a step in flight and a bulk op that starts between two
+steps makes the next one queue. Sampling once per `cds_ft_compact` pass did not
+work: the pass drops the read lock between steps, and the gate's grace period
+completed in that gap. The step keeps its relocations' node locks (row 4).
+
+**The inventory** (`-DFT_DEBUG_BULK_ACQ`): every DLM acquire made inside a bulk op.
+- ft_inv makes 1,201,459 (exponential) / 1,064,667 (per-node) of them, at 12 sites:
+  - `ft_flip_txn_lock_or_guard_parent_ex` 740k;
+  - `ft_node_recompact` 178k;
+  - `ft_root_attach_fence_empty` 89k;
+  - `ft_merge_lock_overlap` 59k;
+  - `ft_graft_keylen` 21k;
+  - `ft_split_compressed_graft_build` 21k;
+  - `ft_rekey_cow_stop` 2.7k;
+  - five sites below 120.
+- ft_unit reaches 26 sites, including the rekey graft attempts and the glue marks.
+- **Every one** is made under the FT-wide lock of its trie, or on an exclusive trie.
+- **None** follows a drain seam (`ft_writer_lock_gp_wait`) earlier in the same op.
+  The arm yield confirms seams occur inside bulk ops: 825,704 / 708,654 in ft_inv,
+  45 in ft_unit.
+- So no bulk-op take provides exclusion or stale-plan detection that per-FT locking
+  does not already give.
