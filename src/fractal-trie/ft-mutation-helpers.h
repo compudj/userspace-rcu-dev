@@ -26,6 +26,35 @@
 #error "ft-mutation-helpers.h is an implementation unit; #include it from fractal-trie.c only"
 #endif
 
+#ifdef FT_DEBUG_INTERLEAVE
+/*
+ * -DFT_DEBUG_INTERLEAVE: a TEST-ONLY hook called on the op's own thread at
+ * named points, so a test can park an op between two steps and interleave a
+ * peer deterministically (doc/design/ft-lockset-inventory.md §5).  NULL, and
+ * the points compile out, everywhere else.
+ */
+void (*cds_ft_dbg_interleave_hook)(int point);
+# define FT_INTERLEAVE(point)						\
+	do {								\
+		void (*_ft_il)(int) =					\
+			CMM_LOAD_SHARED(cds_ft_dbg_interleave_hook);	\
+		if (_ft_il)						\
+			_ft_il(point);					\
+	} while (0)
+#else
+# define FT_INTERLEAVE(point)	do { } while (0)
+#endif
+/* The delete tier's leaf hoist: planned (PRE the acquire), holding (POST). */
+#define FT_IL_LEAF_HOIST_PRE	1
+#define FT_IL_LEAF_HOIST_POST	2
+/*
+ * A commit's settle, after every other record and BEFORE the registered lock
+ * words it hands back (ft_flip_txn_late_last): the committed-but-unsettled
+ * window in which a lock this commit guarded is takeable again while its
+ * tombstones still read as proxies.
+ */
+#define FT_IL_SETTLE_LOCKS_LAST	3
+
 /*
  * One lock level's anchor, captured as the descent crosses it
  * (doc/design/ft-dlm-lock-coarseness.md §4).  @cover is the node whose
@@ -708,6 +737,45 @@ struct cds_ft_metadata *ft_anchor_meta(const struct cds_ft *ft,
 	 * well-formed -- is resolved here.
 	 */
 	return anchor == nf ? node : ft_flag_to_metadata(ft, anchor);
+}
+
+/*
+ * The node ft_anchor_meta's answer for a member at byte-depth @depth DEPENDED
+ * ON without locking it: the node whose span contains the lock level strictly
+ * inside it.  NULL when the answer depended on no such node -- a member starting
+ * on its level, a level some node starts on, or an anchor that IS the coverer
+ * (its own acquire validates it).
+ *
+ * "The first boundary at or after L" is a fact about THIS node: a boundary can
+ * appear in [L, anchor) only by splitting it, and one disappears at the anchor
+ * only by fusing the anchor into it.  A compressed node's span never changes in
+ * place, so both RETIRE it (doc/design/ft-lockset-inventory.md §5).
+ */
+static inline
+struct cds_ft_inode_flag *ft_anchor_coverer(const struct cds_ft *ft,
+		const struct ft_descent *d, unsigned int depth)
+{
+	const struct ft_lock_anchor *a;
+	unsigned int lvl, i;
+
+	if (ft->lock_spacing != CDS_FT_LOCK_SPACING_EXPONENTIAL || !d ||
+			!depth)
+		return NULL;
+	lvl = ft_lock_level(depth);
+	if (lvl == depth)
+		return NULL;
+	/* ft_descent_anchor_child's own arm: the cursor spans the gap. */
+	if (depth > d->depth && lvl > d->depth)
+		return d->nf;
+	if (lvl == d->depth)
+		return NULL;
+	i = ft_lock_level_index(lvl);
+	if (!(d->anchor_crossed & (1U << i)))
+		return NULL;
+	a = &d->anchor[i];
+	if (a->bound_start <= lvl || a->bound_start > depth)
+		return NULL;
+	return a->cover;
 }
 
 /*
@@ -5727,10 +5795,22 @@ static void ft_sa_hoist_exit_count(int hoist, int ex)
 		uatomic_inc(&ft_sa_hoist_exits[hoist][ex]);
 }
 
+/*
+ * The post-acquire COVERER check (ft_dlm_acquire_set_at): members whose anchor
+ * depended on a coverer / refused on a retired coverer / refused on a
+ * skip-encoded coverer the check cannot resolve exactly.
+ */
+static unsigned long ft_sa_cover_exits[3];
+
 static __attribute__((destructor))
 void ft_sa_hoist_report(void)
 {
 	int h;
+
+	if (ft_sa_cover_exits[0])
+		fprintf(stderr, "FT_SA_COVER checked=%lu retired=%lu skip=%lu\n",
+			ft_sa_cover_exits[0], ft_sa_cover_exits[1],
+			ft_sa_cover_exits[2]);
 
 	for (h = 0; h < FT_SA_HOISTS; h++) {
 		unsigned long *e = ft_sa_hoist_exits[h];
@@ -5830,8 +5910,26 @@ static bool ft_flip_txn_late_last(void *arg, void **slot)
 	unsigned int i;
 
 	for (i = 0; i < t->nr_locks; i++)
-		if ((void **) &t->locks[i].meta->state == slot)
+		if ((void **) &t->locks[i].meta->state == slot) {
+#ifdef FT_DEBUG_INTERLEAVE
+			/*
+			 * The engine asks once per record in each late pass, just
+			 * before that record's store.  The first TRUE answer for a
+			 * slot already answered TRUE is the start of the last pass.
+			 */
+			static __thread const void *il_arg;
+			static __thread void **il_first;
+
+			if (il_arg != arg) {
+				il_arg = arg;
+				il_first = slot;
+			} else if (il_first == slot) {
+				il_arg = NULL;
+				FT_INTERLEAVE(FT_IL_SETTLE_LOCKS_LAST);
+			}
+#endif
 			return true;
+		}
 	return false;
 }
 
@@ -8068,13 +8166,20 @@ void ft_sa_check(const char *fn, int line, const struct cds_ft *ft,
 		const struct ft_lock_anchor *la = (d && li < FT_LOCK_LEVEL_MAX) ?
 			&d->anchor[li] : NULL;
 		bool crossed = d && (d->anchor_crossed & (1U << li));
+		/* Raw, and resolved: a SUCCEEDED proxy's raw word has no TOMBSTONE. */
+		unsigned long cover_raw = crossed && la->cover &&
+			!ft_node_external(la->cover) ?
+			(unsigned long) CMM_LOAD_SHARED(
+				ft_flag_to_metadata(ft, la->cover)->state) : 0UL;
+		unsigned long cover_state = (unsigned long) urcu_txn_resolve(
+			(void *) cover_raw, FT_STATE_PROXY);
 
 		fprintf(stderr, "FT STRUCT-ANCHOR MISMATCH at %s:%d: node %p "
 			"nf %p depth(op)=%u depth(trie)=%u L=%u path_len=%u | op "
 			"anchor %p (%s k=%u start=%u) trie anchor %p (k=%u "
 			"start=%u)%s | cursor nf %p depth %u %s | tbl[L] "
 			"crossed=%d pending=%d cover=%p bound=%p bound_start=%u | "
-			"trie path flags k1=%p k2=%p\n",
+			"trie path flags k1=%p k2=%p | cover state %#lx%s\n",
 			fn, line, (void *) node, (void *) nf, op_depth, depth,
 			ft_lock_level(depth), n, (void *) op_anchor,
 			op_on_path ? "on path" : "OFF PATH", op_k,
@@ -8090,7 +8195,9 @@ void ft_sa_check(const char *fn, int line, const struct cds_ft *ft,
 			crossed ? (void *) la->bound : NULL,
 			crossed ? la->bound_start : 0,
 			n > 1 ? (void *) pflag[1] : NULL,
-			n > 2 ? (void *) pflag[2] : NULL);
+			n > 2 ? (void *) pflag[2] : NULL,
+			cover_raw, (cover_state & FT_STATE_TOMBSTONE) ?
+				" = TOMBSTONED" : "");
 	}
 }
 #endif /* FT_DEBUG_STRUCT_ANCHOR */
@@ -8572,6 +8679,63 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 #endif
 		free(taken_heap);
 		return -EAGAIN;		/* commit freed @acq; nothing acquired */
+	}
+	/*
+	 * ☞ A LOCK ON A STALE ANCHOR IS NO LOCK (doc/design/ft-lockset-inventory.md
+	 * §5).  At exponential spacing a member's anchor was derived from a
+	 * COVERER the acquire does not lock (ft_anchor_coverer).  A split of the
+	 * coverer moves the member's anchor to a fresh boundary, and a plan made
+	 * before it still names the old one: that word is free, so the take
+	 * succeeds, and the member's post-split writers lock the NEW anchor.
+	 *
+	 * So validate that the coverer is not retired, now that the locks are
+	 * held.  The retire is the change: a coverer's span never changes in
+	 * place, and TOMBSTONE never clears, so a load after this commit answers
+	 * for the commit -- read LOGICALLY.  A split's commit settles its guard on
+	 * the old anchor BEFORE the tombstone on the coverer (a registered lock
+	 * word settles last), so between the two the anchor is takeable while the
+	 * coverer still carries the split's SUCCEEDED proxy, whose raw word has no
+	 * TOMBSTONE bit.  Resolve it: SUCCEEDED answers new, anything else old,
+	 * and an undecided restructure cannot succeed past the guard the lock
+	 * just taken fails.  Moving a boundary after it re-homes or retires the
+	 * old anchor -- the coverer's child -- and the re-home guards that
+	 * node's clean state word (ft_reparent_record_meta), which the lock just
+	 * taken fails.  So the answer holds for as long as the lock is held.
+	 */
+	for (i = 0; i < nr; i++) {
+		struct cds_ft_inode_flag *cover;
+		bool stale;
+
+		if (!set[i].nf)
+			continue;
+		cover = ft_anchor_coverer(ft, ft_lock_ctx_descent(ctx),
+			set[i].depth);
+		if (!cover || ft_node_external(cover))
+			continue;
+#ifdef FT_DEBUG_STRUCT_ANCHOR
+		uatomic_inc(&ft_sa_cover_exits[0]);
+#endif
+		/*
+		 * A skip word names its node only through the child's back
+		 * pointer, which the very split this guards against re-homes:
+		 * no exact answer, so re-plan.
+		 */
+		stale = ft_node_skip_compressed(cover) ||
+			((uintptr_t) urcu_txn_resolve((void *) CMM_LOAD_SHARED(
+				ft_flag_to_metadata(ft, cover)->state),
+				FT_STATE_PROXY) & FT_STATE_TOMBSTONE);
+		if (caa_likely(!stale))
+			continue;
+#ifdef FT_DEBUG_STRUCT_ANCHOR
+		uatomic_inc(&ft_sa_cover_exits[
+			ft_node_skip_compressed(cover) ? 2 : 1]);
+#endif
+		while (nr_taken)
+			ft_meta_lock_release(taken[--nr_taken]);
+		free(taken_heap);
+		if (ctx && ctx->op)
+			ft_acq_contended++;
+		return -EAGAIN;		/* released: nothing acquired */
 	}
 	for (i = 0; i < nr; i++) {
 		if (!set[i].nf)

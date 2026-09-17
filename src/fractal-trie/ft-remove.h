@@ -16,28 +16,6 @@
 
 #endif
 
-#ifdef FT_DEBUG_INTERLEAVE
-/*
- * -DFT_DEBUG_INTERLEAVE: a TEST-ONLY hook called on the op's own thread at
- * named points, so a test can park an op between two steps and interleave a
- * peer deterministically (doc/design/ft-lockset-inventory.md §5).  NULL, and
- * the points compile out, everywhere else.
- */
-void (*cds_ft_dbg_interleave_hook)(int point);
-# define FT_INTERLEAVE(point)						\
-	do {								\
-		void (*_ft_il)(int) =					\
-			CMM_LOAD_SHARED(cds_ft_dbg_interleave_hook);	\
-		if (_ft_il)						\
-			_ft_il(point);					\
-	} while (0)
-#else
-# define FT_INTERLEAVE(point)	do { } while (0)
-#endif
-/* The delete tier's leaf hoist: planned (PRE the acquire), holding (POST). */
-#define FT_IL_LEAF_HOIST_PRE	1
-#define FT_IL_LEAF_HOIST_POST	2
-
 /*
  * ft_detach_node: detach a node from the trie and prune empty
  * single-child ancestors above it.

@@ -153,7 +153,7 @@ coverage.
 
 ---
 
-## 5. SETTLED BY TEST: holding the old anchor does NOT exclude a late acquirer
+## 5. SETTLED BY TEST, then CLOSED: holding the old anchor did not exclude a late acquirer
 
 §3 of the anchor doc argues that *"every change to which-node-covers-byte-L is
 itself a locked mutation of those very nodes"*. Holding the OLD anchor during
@@ -196,6 +196,56 @@ it re-homes (A), so a victim already HOLDING A blocks the split. The gap is only
 the late acquire: the acquire validates the MEMBER's back edge, and X's edge is
 unchanged by a split above A; nothing re-checks that A is still the first
 boundary at or after L once it is held.
+
+### 5.1 The cure: a missing tombstone validation (Mathieu)
+
+At the victim's stale acquire, the node the plan derived A from -- cn, which
+covers level 8 -- was already `TOMBSTONE` (probe A: `cover state 0x6`), retired
+by the split's fenced tombstone. The anchor answer depends on that node:
+
+- A boundary can appear in `[L, anchor)` only by splitting the node that covers
+  L strictly inside its span.
+- A boundary can disappear at the anchor only by fusing the anchor into that
+  node.
+- A compressed node's span never changes in place, so both changes RETIRE it.
+
+`ft_anchor_coverer` names that node for a member (NULL when the answer
+depended on none). `ft_dlm_acquire_set_at` loads its state after the acquire
+commit. A tombstone releases what was taken and re-plans with `-EAGAIN`.
+TOMBSTONE never clears, so a load after the commit answers for the commit --
+**read logically**.
+
+☠ **The first version read it raw, and the skeptic REFUTED it by running.** A
+split's commit settles its guard on the old anchor A (a plain late record) BEFORE
+the fenced tombstone on cn (a registered lock word settles last, `8c517957`).
+Between the two, A is takeable while cn still holds the split's SUCCEEDED proxy.
+That raw word carries `FT_STATE_PROXY` (bit 0), not `FT_STATE_TOMBSTONE` (bit 1),
+so the check passed and the hole was back. The check now resolves the word
+(`urcu_txn_resolve`: SUCCEEDED answers new, anything else old). An UNDECIDED
+restructure cannot succeed past the guard on A that the lock just taken fails.
+`-DFT_DEBUG_INTERLEAVE` gained `FT_IL_SETTLE_LOCKS_LAST`, fired from
+`ft_flip_txn_late_last` at the start of the last settle pass, so the rig's
+`splitlate` mode parks the split in exactly that window.
+
+A load after the commit is enough only if no split can land while the lock is
+held. That holds because moving the boundary re-homes (or retires) the old
+anchor, and the re-home records a guard on that node's CLEAN state word
+(`ft_reparent_record_meta`), which the victim's lock fails. `splitheld` measures
+that, with a red control:
+
+| mode (peer = delete `J7`) | coverer check | split while held | peer while held | reading |
+|---|---|---|---|---|
+| nosplit | 18 checked, 0 retired | -- | waited | CONTROL OK |
+| split | 17 checked, **1 retired** | -- | **waited** | the stale acquire re-planned onto B: **no hole** |
+| splitheld | 17 checked, 0 retired | waited | waited | the held order was already closed |
+| splitheld, RED: child state guard removed | 17 checked, 0 retired | **completed** | **completed** | the guard is what closes it |
+| splitlate, RED: coverer read raw | 17 checked, 0 retired | -- | **completed** (3/3) | a committed tombstone read as a proxy: **HOLE** |
+| splitlate | 17 checked, **1 retired** | -- | waited (3/3) | resolved: **no hole** |
+
+A skip-encoded coverer names its node only through the child's back pointer --
+which the very split being guarded against re-homes -- so the check re-plans on
+one rather than resolve it. The descents enter resolved flags, so it is not
+expected to occur. `-DFT_DEBUG_STRUCT_ANCHOR` counts it (`FT_SA_COVER ... skip=`).
 
 ---
 

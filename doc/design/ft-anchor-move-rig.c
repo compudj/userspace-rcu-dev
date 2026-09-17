@@ -3,7 +3,8 @@
  *
  * QUESTION: does holding the OLD anchor during a restructure exclude an op
  * that PLANNED before the restructure and ACQUIRES the old anchor after it?
- * ANSWER (measured): no -- see the doc's table.
+ * ANSWER (measured): it did not; the acquire now validates the COVERER the
+ * anchor was derived from -- see the doc's table.
  *
  * Shape, exponential spacing (levels 0,1,2,4,8,16,...):
  *   root [0,1) --'a'--> cn [1,9) "bcdefghi" --> A internal @9 --'J'--> X internal @10
@@ -32,6 +33,12 @@
  *                      A.  Q completing here means the rig cannot see exclusion.
  *   split:             Q completing while P holds its lock means P holds a word
  *                      that no longer excludes X's writers: the hole is real.
+ *   splitheld:         the OTHER order -- the split runs while P already HOLDS
+ *                      A.  Neither the split nor Q may complete until P lets go.
+ *   splitlate:         as split, but the split is parked INSIDE its commit's
+ *                      settle, before the lock words it hands back: A is
+ *                      takeable while cn's committed tombstone still reads as a
+ *                      proxy.  Reads like split.
  *
  * Build against a tree configured with -DFT_DEBUG_INTERLEAVE (add
  * -DFT_DEBUG_STRUCT_ANCHOR -DFT_DEBUG_TXN_KIND for probe A's mismatch line):
@@ -39,7 +46,8 @@
  *     -L<build>/src/.libs -lurcu-memb -lurcu-cds -lurcu-common -lpthread \
  *     -Wl,-rpath,<build>/src/.libs
  *   ./rig nosplit; ./rig split; RIG_PEER=delete ./rig nosplit;
- *   RIG_PEER=delete ./rig split
+ *   RIG_PEER=delete ./rig split; RIG_PEER=delete ./rig splitheld;
+ *   RIG_PEER=delete ./rig splitlate
  */
 #define _GNU_SOURCE
 #include <urcu/urcu-memb.h>
@@ -55,6 +63,7 @@
 extern void (*cds_ft_dbg_interleave_hook)(int point);
 #define FT_IL_LEAF_HOIST_PRE	1
 #define FT_IL_LEAF_HOIST_POST	2
+#define FT_IL_SETTLE_LOCKS_LAST	3
 
 struct tnode {
 	struct cds_ft_node node;
@@ -67,8 +76,33 @@ static int stage;
 static __thread int armed;
 static int pre_hits, post_hits;
 
+/* splitlate: the splitter parks in its commit's settle, before its lock words. */
+static __thread int late_armed;
+static int late_paused, late_release;
+
 static void hook(int point)
 {
+	if (point == FT_IL_SETTLE_LOCKS_LAST) {
+		struct timespec dl;
+
+		if (!late_armed)
+			return;
+		late_armed = 0;
+		/*
+		 * Bounded: a victim whose acquire is refused re-plans, and the
+		 * re-plan may need this settle to finish before it can hold.
+		 */
+		clock_gettime(CLOCK_REALTIME, &dl);
+		dl.tv_sec += 2;
+		pthread_mutex_lock(&mu);
+		late_paused = 1;
+		pthread_cond_broadcast(&cv);
+		while (!late_release)
+			if (pthread_cond_timedwait(&cv, &mu, &dl) == ETIMEDOUT)
+				break;
+		pthread_mutex_unlock(&mu);
+		return;
+	}
 	if (!armed)
 		return;
 	pthread_mutex_lock(&mu);
@@ -199,9 +233,57 @@ static void *peer(void *arg)
 	return NULL;
 }
 
+static int split_done;
+
+static void *splitter(void *arg)
+{
+	late_armed = arg != NULL;
+	urcu_memb_register_thread();
+	if (insert_key("abcdefghQzz") != CDS_FT_STATUS_OK)
+		fprintf(stderr, "split insert failed\n");
+	pthread_mutex_lock(&mu);
+	split_done = 1;
+	pthread_cond_broadcast(&cv);
+	pthread_mutex_unlock(&mu);
+	urcu_memb_unregister_thread();
+	return NULL;
+}
+
+/* Wait up to @secs for *@flag; returns its value. */
+static int wait_flag(int *flag, int secs)
+{
+	struct timespec dl;
+	int v;
+
+	clock_gettime(CLOCK_REALTIME, &dl);
+	dl.tv_sec += secs;
+	pthread_mutex_lock(&mu);
+	while (!*flag)
+		if (pthread_cond_timedwait(&cv, &mu, &dl) == ETIMEDOUT)
+			break;
+	v = *flag;
+	pthread_mutex_unlock(&mu);
+	return v;
+}
+
 int main(int argc, char **argv)
 {
 	int split = argc > 1 && !strcmp(argv[1], "split");
+	/*
+	 * splitheld: the OTHER order -- the victim already HOLDS its anchor
+	 * when the split runs.  The split must not complete while it is held
+	 * (it re-homes A under a guard on A's clean state word).
+	 */
+	int splitheld = argc > 1 && !strcmp(argv[1], "splitheld");
+	/*
+	 * splitlate: the split COMMITS before the victim's acquire but is parked
+	 * in its settle after its guard on A (plain, pass 2) and before its lock
+	 * words (last) -- so A is takeable while cn's committed tombstone is still
+	 * a proxy.  Reads like split.
+	 */
+	int splitlate = argc > 1 && !strcmp(argv[1], "splitlate");
+	int split_during_hold = -1;
+	pthread_t ts;
 	struct cds_ft_group *group;
 	pthread_t tp, tq;
 	struct timespec dl;
@@ -235,8 +317,25 @@ int main(int argc, char **argv)
 	wait_stage(1);			/* P planned, before its acquire */
 	if (split && insert_key("abcdefghQzz") != CDS_FT_STATUS_OK)
 		fprintf(stderr, "split insert failed\n");
+	if (splitlate) {
+		pthread_create(&ts, NULL, splitter, (void *) 1);
+		if (!wait_flag(&late_paused, 5))
+			fprintf(stderr, "splitlate: the split never reached its settle\n");
+	}
 	set_stage(2);
 	wait_stage(3);			/* P holds its lock */
+	if (splitlate) {
+		pthread_mutex_lock(&mu);
+		late_release = 1;
+		pthread_cond_broadcast(&cv);
+		pthread_mutex_unlock(&mu);
+		pthread_join(ts, NULL);	/* settled before the peer plans */
+	}
+	if (splitheld) {
+		pthread_create(&ts, NULL, splitter, NULL);
+		split_during_hold = wait_flag(&split_done,
+			getenv("RIG_WAIT") ? atoi(getenv("RIG_WAIT")) : 2);
+	}
 	pthread_create(&tq, NULL, peer, NULL);
 	clock_gettime(CLOCK_REALTIME, &dl);
 	dl.tv_sec += getenv("RIG_WAIT") ? atoi(getenv("RIG_WAIT")) : 2;
@@ -249,10 +348,13 @@ int main(int argc, char **argv)
 	set_stage(4);			/* release P */
 	pthread_join(tp, NULL);
 	pthread_join(tq, NULL);
+	if (splitheld)
+		pthread_join(ts, NULL);
 
 	printf("mode=%s pre_hits=%d post_hits=%d victim=%d peer=%d "
 		"PEER_COMPLETED_WHILE_VICTIM_HELD=%d | J8=%d J0=%d J7=%d Q=%d K1=%d peer=%s\n",
-		split ? "split" : "nosplit", pre_hits, post_hits,
+		splitheld ? "splitheld" : splitlate ? "splitlate" :
+			split ? "split" : "nosplit", pre_hits, post_hits,
 		(int) victim_status, (int) peer_status, q_during_hold,
 		lookup_key("abcdefghiJ8"), lookup_key("abcdefghiJ0"),
 		lookup_key("abcdefghiJ7"),
@@ -260,7 +362,14 @@ int main(int argc, char **argv)
 		peer_del_node ? "delete J7" : "insert J0");
 	if (!pre_hits || !post_hits)
 		printf("RIG INVALID: the victim never reached the hoist\n");
-	else if (!split)
+	else if (splitheld)
+		printf("SPLITHELD: split %s while the victim held its anchor; "
+			"peer %s\n", split_during_hold ?
+				"COMPLETED -- the split does not wait on the old anchor" :
+				"waited",
+			q_during_hold ? "COMPLETED while held -- HOLE" :
+				"waited");
+	else if (!split && !splitlate)
 		printf("CONTROL %s\n", q_during_hold ?
 			"FAILED: the peer was not excluded by an AGREEING anchor" :
 			"OK: the peer waited on the agreeing anchor");
