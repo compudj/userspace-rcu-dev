@@ -2294,6 +2294,47 @@ int ft_attach_node(struct cds_ft *ft,
 				} else {
 					in_place = true;	/* the FT-wide lock */
 				}
+			} else if (old_node_flag && ft->lock_fine) {
+				/*
+				 * THE OCCUPIED SLOT TAKES THE SAME LOCK
+				 * (doc/design/ft-lockset-inventory.md §1, row 3).
+				 *
+				 * The slot already holds the displaced external head,
+				 * so there is no reserve and the hoist above never
+				 * ran -- yet the record below still rewrites a child
+				 * slot of the LIVE attach node, and until now this op
+				 * recorded and committed it holding nothing but the
+				 * grandparent it acquires later (~13k commits per
+				 * ft_inv run, every spacing).  The attach node is the
+				 * slot's owner, so it is acquired here, before the
+				 * record, whatever the in-place feature says: no store
+				 * happens in place on this path, the lock is owed by
+				 * the record.
+				 *
+				 * Derive, acquire, RE-VALIDATE: @old_node_flag was
+				 * sampled by the descent with nothing held, so re-read
+				 * the slot under the lock and re-descend if a peer
+				 * replaced the head in between.  A registered lock is
+				 * released by check_error's destroy of @ic->txn.
+				 */
+				enum ft_lock_or_guard_exit ex;
+
+				ft_delay_seam(FT_DELAY_SITE_INSERT);
+				ft_flip_txn_lock_or_guard_parent_ex(__func__,
+					__LINE__, ft, ic->txn, ctx,
+					attach_node_flag, FT_DEPTH_FROM_DESCENT,
+					&ex);
+				if (ex == FT_LOG_EXIT_MISS) {
+					ret = -EAGAIN;
+					goto check_error;
+				}
+				if (!old_node_flag_ptr ||
+						ft_node_ptr_raw(rcu_dereference(
+						*old_node_flag_ptr)) !=
+						ft_node_ptr_raw(old_node_flag)) {
+					ret = -EAGAIN;
+					goto check_error;
+				}
 			}
 
 			/*
