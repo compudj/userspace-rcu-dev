@@ -1171,7 +1171,39 @@ it compiled out, 6/6 GREEN), so it is recorded, not attributed.
 
 Not implemented; recorded so the flip does not silently decide them.
 
-### 12.1 An application-provided writer exclusion mode
+### 12.1 An application-provided writer exclusion mode -- ☑ LANDED @f6ab074d
+
+☑ **RESTORED as `CDS_FT_WRITER_EXCL_CALLER`**, the third
+`cds_ft_writer_strategy`. Named for the CONTRACT, not a lock (Mathieu): the
+other two are named for the lock the LIBRARY takes, and here it takes none --
+the caller meets the contract however it likes, a single mutating thread or its
+own mutex around every mutating call.
+
+Implemented as a SEPARATE trie flag, never `exclusive`, so all 71 consumers of
+that flag are untouched and no reader-side shortcut is reachable: `lock_fine` is
+false, so every kind / lock-set / door decision reads as COARSE (door 1 arms it
+SW trie-wide) and only the FT-wide mutex goes away. Two early-outs, both the
+same argument as `exclusive`'s -- `ft_writer_lock_scope_enter` (no mutex to
+take) and `ft_bulk_lock_enter` (nothing to promote: the bulk gate and rekey
+promote FINE locking, and there is none here, nor in COARSE).
+
+☞ RANK STATS NOW COERCE *FINE* ONLY. The coercion read "any strategy !=
+COARSE"; EXCL_CALLER already serialises every structural writer, so coercing it
+would hand back the very lock the caller asked the library not to take.
+
+☑ THE CONTRACT CHECK NEEDED NO NEW CODE. The access validator keeps its
+single-OWNER claim for any non-fine trie, so EXCL_CALLER lands on the owner CAS.
+Measured with a guaranteed-overlap control (two writers, one trie,
+`-DFEATURE_FT_EXCL_VALIDATE`): COARSE **survives** (the mutex serialises them)
+while EXCL_CALLER reports *"writer conflict -- owner 0x…, entering thread 0x…"*
+and aborts -- which is also the proof that the mutex is genuinely skipped, since
+under COARSE those two writers cannot overlap at all.
+
+In contract (`test_urcu_ft -W excl-caller`, 4 readers + 1 writer, 5s):
+380,623,969 reads / 864,142 writes, and the always-MW lanes converted
+(`FT MWA DOOR1 converted=1,107,522`).
+
+The original statement of the item follows.
 
 Planned, removed from the API, to be restored: the app guarantees writer
 exclusion (single-threaded, or its own mutex around every caller). It should
