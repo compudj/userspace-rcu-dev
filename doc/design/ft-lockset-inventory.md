@@ -1,0 +1,168 @@
+# Fractal Trie — lock-set inventory at FINE (per-node) and EXPONENTIAL (2026-09-16)
+
+Mathieu's shape for the work: *"we need to complete the missing lock-set
+transition for fine and exponential. only when it is COMPLETE can we turn MW
+into SW."* This is the inventory that transition starts from: **which mutation
+primitives do not hold their lock set, at per-node and at exponential
+spacing**, measured and attributed to the primitive rather than argued.
+
+It is an inventory, not a plan. No primitive is converted here, and nothing
+below is a proposal to convert one class on its own.
+
+---
+
+## 0. The question, and how it was asked
+
+**"Holds its lock set"** means: at the moment a word is written, the op holds
+the lock that `ft-dlm-lock-coarseness.md` §1/§2 assign to that word — the
+**anchor of the word's owner** (the owner itself at per-node). Two ways to fail
+it, and they need different instruments:
+
+* **Coverage** — the op writes a word and holds no lock covering it.
+* **Agreement** — the op holds *a* lock, but not the one every other op
+  computes for that node, so it excludes nobody (§1).
+
+`-DFT_DEBUG_STRUCT_ANCHOR` (needs `-DFT_DEBUG_TXN_KIND`; build with
+`-fno-omit-frame-pointer`) answers both against an **independent** anchor: it
+climbs the owner's parent words to the root, sums the spans to get the byte
+depth, and applies §2 over that path. This is §5.3's rejected up-walk, used as
+an oracle only. A parked proxy, a NULL parent word (transient re-home) or an
+external on the path reads UNDATED rather than guessed.
+
+| probe | where | question |
+|---|---|---|
+| A | `ft_dlm_acquire_set_at`, after `ft_anchor_meta` | does the anchor the op takes equal the trie's anchor for that member? |
+| B | `__ft_flip_txn_record_tag_ctx` / `ft_flip_txn_record_tag_mw`, re-asked in `ft_flip_txn_commit` | at record time, is the owner's anchor held? If not, is it held by commit (LATE) or never (NEVER)? Keyed by (txn creation site, call site, one frame up), symbolized offline with `addr2line -i` |
+| C | the chain audit arms (`-DFT_DEBUG_CHAIN_HOLD`) | the same exact-anchor verdict for the words that never reach a record helper: hlist stores, raw parent/head words, in-place body writes. Writes the caller declares `FT_EXCL_HIDDEN` are skipped **except chain words**, which carry no declaration and are always scored |
+
+The witness is the union the owner assert uses: the txn registry, the ctx
+frames, the per-thread hold ledger (`-DFEATURE_FT_HOLD_TRACE`), and this trie's
+FT-wide writer lock. COARSE and EXCLUSIVE tries are bucketed out (no peer to
+exclude), as are commits already carrying `@acquire_miss` (discarded before the
+engine).
+
+**Red control, and it fires.** `FT_SA_RED=root` asks every record about the
+ROOT instead of its real anchor, without touching the ops. ft_unit at
+exponential goes from 0 to **2,700,761 SELF_ONLY + 41,617 UNHELD**. The 41,617
+matches the normal run's 41,619 records held through a coarser anchor to within
+2. So the witness can say *no* while the op holds other locks, and the zeros
+below are readings, not a blind instrument.
+
+**Rig.** `-O2 -g -fno-omit-frame-pointer -DFEATURE_FT_INSERT_IN_PLACE
+-DFEATURE_FT_LOCK_SPACING_ENV -DFT_DEBUG_STRUCT_ANCHOR -DFT_DEBUG_TXN_KIND
+-DFEATURE_FT_HOLD_TRACE -DFT_EXCL_REPORT_ONLY -DFT_DEBUG_CHAIN_HOLD`,
+`CDS_FT_LOCK_SPACING=per-node|exponential`, ft_unit 357/357 and ft_inv 152/152
+green in every leg. Numbers are per single leg (one ft_inv run covers its
+list-on, list-off and MW rows).
+
+**Limits.** Only paths the two suites reach (§4). The always-MW lanes name no
+owner, so B can count them but not score them (§3). HIDDEN declarations are
+believed on the raw lanes. Record time asks the SW question on purpose: an SW
+park is legal only if the lock was held when the overwritten value was read.
+
+---
+
+## 1. Coverage: primitives that write while holding NOTHING — both spacings
+
+Probe B puts these in NOLOCKS (registry and ledger both empty), and the commit
+re-check puts them in NEVER: the lock is still not held when the descriptor goes
+to the engine. None of them depends on spacing, because nothing is held.
+
+| # | primitive | ft_inv per-node | ft_inv exponential | ft_unit | what is missing |
+|---|---|---|---|---|---|
+| 1 | **delete tier, pure leaf delete** — `ft_detach_node` → `ft_remove_one_commit` (holder's child slot + the fused `nr_child--`), and its chain word at `ft_detach_node:4975` (freeze_leaf) | 2,745,486 records, **2,585,871 committed never held** (159,615 aborted); chain lane 2,384,879 | 2,609,398, **2,443,766 committed** (165,632 aborted); chain lane 2,247,316 | 655,092 / chain 646,700 | the holder (its anchor). `ft_flip_txn_lock_or_guard_parent` runs only on the promote arm (`commit_txn && !pub->state_meta`); the leaf arm leans on the fused `nr_child--` CAS, the "arbitrated on the holder's state word" of `ft-reintroduce-in-place-mutations.md` §6.5 |
+| 2 | **`cds_ft_remove_all` of the EMPTY key** — root's `external_nodes` (`_cds_ft_remove_all_locked`, both `key_len == 0` commits) | 57,918, all committed | 55,126, all committed | 4 | the root node's lock (the root is its own anchor at every spacing) |
+| 3 | **insert over an OCCUPIED slot** — `_cds_ft_insert`'s "NULL or external node before end of key" arm → `ft_attach_node`'s reserved-slot record, when the slot already holds a displaced external head | 13,359 (13,326 committed) | 13,942 (13,917 committed) | 102 (exponential: 55 LATE, 47 NEVER) | the attach node. The hoist is gated on `!old_node_flag`; the other `ft_attach_node` call site (`_cds_ft_insert:3476`) is fully held |
+| 4 | **compaction** — `ft_compact_relocate_compressed`'s raw parent and head words | — | — | 1,030 | any lock: its exclusion is the "caller's responsibility" TODO, which is not a contract |
+| 5 | bulk glue writes outside the FT-wide lock — `ft_glue_apply_deferred`, `ft_glue_defer_edge_origin`, `ft_store_at_graft_point_commit` | ≤ 45 | ≤ 40 | ≤ 11 | bulk ops are excluded by design by the FT-wide lock; these few rows are writes the lock did not cover at that instant — not yet attributed |
+
+**Everything else that holds a lock holds the right one for the words it
+records.** Across the structural record lane, ft_inv at exponential: HELD
+29,243,068, held through a coarser anchor 1,207,645, **SELF_ONLY 0, UNHELD 0**
+(UNDATED 1,925, 1,923 of them in row 1's commit, racing re-homes). Per-node likewise has
+no UNHELD. On the raw lanes the chain words of `ft_chain_compress_fused:2326`
+and `ft_detach_node:3902`, and the in-place body writes
+(`ft_popcount_node_set_nth` / `ft_pigeon_node_set_nth`), are covered at
+exponential, a large share of them through an ancestor anchor.
+(`ft_popcount_node_set_nth:516` reads UNHELD / UNDATED on an unpublished node
+and is the refused-arm false positive `ft-reintroduce-in-place-mutations.md`
+§6.3 already names.)
+
+---
+
+## 2. Agreement: acquires that take the WRONG word — exponential only
+
+Probe A, ft_inv at exponential (per-node is exact by construction). The
+mismatch is independent of load for rows 6–9: each one also shows up in
+single-threaded ft_unit, or has a mechanism read directly off the anchor table
+in the sample.
+
+| # | acquire site | mismatches | mechanism (from the samples) |
+|---|---|---|---|
+| 6 | `ft_detach_node`'s compressed-parent free walk (`ft_detach_orphan_acquire` in the `free_detached_subtree \|\| nr_elevated` loop) | **88,059 of 199,918**; ft_unit 2 | `walk_depth` is computed once and **never advanced**, so every orphan past the first is dated at the first one's depth. Sample: depth(op) 2, depth(trie) 3, L=2 → `ft_anchor_meta`'s on-a-level early return anchors the node on ITSELF, while its anchor is the parent at byte 2 |
+| 7 | `ft_detach_orphan_planlock` (both orphan walks, via `ft_walk_extend`) | 3 per run, plus ~2,190 stale (below) | `ft_walk_extend` leaves `d->nf` on the node it ENTERED and moves `d->depth` to that node's end, so the cursor is the member's PARENT. Sample: `pending=1 bound=(nil) bound_start=7 == clamp` → `bound ? bound : d->nf` returns the compressed parent instead of the member (SELF). This is the design doc's still-open *"`a->bound ? a->bound : d->nf` substitutes the CURSOR"* |
+| 8 | `ft_node_recompact:1761` | 11 (1 non-stale); ft_unit 6 | the cursor is the member's **SKIP-encoded** flag (`0xa007…f00b` over a member `0x7ff…f00b`). The pending-level fallback returns it, `anchor == nf` fails on the encoding, and `ft_flag_to_metadata` resolves the skip word to the elided compressed node (ABOVE) |
+| 9 | `ft_merge_lock_overlap:523` | 22 | the cursor is at depth 0 and level 2 was never crossed (`crossed=0`); a member three bytes down goes through `ft_descent_anchor_child`, whose rule is exact for ONE hop only, and anchors on itself. Bulk: the FT-wide lock excludes today |
+
+**Live evidence that 7 breaks exclusion.** With the E.2 exclusion oracle armed
+(`FEATURE_FT_HOLD_TRACE` without `FT_EXCL_REPORT_ONLY`), ft_inv at exponential
+aborts in `inv_concurrent_insert_unique_nolist`: **2 of 80** filtered runs, plus
+1 full leg. The shape is identical each time:
+
+    FT EXCLUSION VIOLATION: node X claimed at ft_flip_txn_lock_or_guard_parent_ex
+      by tid B (anchor X=SELF) while owned by tid A (from ft_detach_orphan_planlock:984,
+      anchor <ancestor>) ... ANCHORS DIFFER
+
+Two threads cover one node through two words. Probe B cannot see this: each op
+holds *a* covering lock for its own records. Only A and the oracle see an
+agreement failure.
+
+**Stale plans, not defects.** The other ~2,330 mismatches (2,192 at the
+plan-lock, 85 at `ft_chain_compress_fused:1614`, 25 at
+`ft_flip_txn_lock_or_guard_parent_ex`, 13 at `_cds_ft_insert:3812`, 10 at
+`ft_node_recompact`, 2 at `ft_unchain_node`) are OFF PATH, and **every one**
+has its anchor or its member TOMBSTONED at the check. That is the §2.1
+"planned against the pre-change node hits TOMBSTONE and replans" path working.
+
+---
+
+## 3. The always-MW lanes — counted, not scored
+
+`ft_flip_txn_record_tag_mw` names no owner, so these records carry no coverage
+verdict. They are the part of the surface where the lock-set question has not
+yet been asked per record; asking it needs an owner argument, the way the
+structural lane got one. ft_inv, per-node:
+
+| class | records | producers (call site) |
+|---|---|---|
+| HEAD_BACK | 7,404,358 | `ft_node_recompact` re-homing heads into its copy (insert reserve relocation ~3.3M, detach `ft_node_replace_ptr` ~1.66M), `ft_park_live_parent_edge` 1.25M, `ft_chain_compress_fused`'s child back edge 1.02M, `ft_detach_node_replace_compressed_parent` ~85k, `cds_ft_remove_all` 36k, rekey COW, compaction, merge |
+| PARENT_WORD / STATE | 990,002 each | `ft_reparent_record_meta` from `ft_node_recompact`, `ft_chain_compress_fused`, `ft_park_live_parent_edge`, graft, merge |
+| PSO | 417,404 | the same re-parent sweeps |
+| DUAL_UNNAMED | 410,491 | `_cds_ft_insert_replace`'s ordered-cell lanes (the register already says these are cell edges filed under the dual's name) |
+| CELL / ROOT / RANK | 12.6M / 2.0M / 1.5k | [DESIGN] per the register |
+
+---
+
+## 4. Not reached by either suite
+
+`_cds_ft_remove_locked`'s and `_cds_ft_remove_all_locked`'s ordered-cell
+unsplice RETRY txns, `ft_compact_relocate_compressed`'s own txn, and every
+rekey spine / subpos site. `cds_ft_replace` commits 3 times in ft_unit and not
+enough in ft_inv to score. A primitive missing from §1 is only as clean as its
+coverage.
+
+---
+
+## 5. An open question the inventory raises, NOT settled
+
+§3 of the anchor doc argues that *"every change to which-node-covers-byte-L is
+itself a locked mutation of those very nodes"*. Holding the OLD anchor during
+the change excludes ops that hold it *concurrently*. Does it also exclude one
+that planned before the change and acquires the old anchor *after* the release?
+
+The acquire's read-set guard is on the MEMBER's back edge. When the anchor is
+an ancestor of the member, that edge is unchanged by a split above it. The
+anchor node's own back edge, which the split did rewrite, is not guarded.
+Reasoned from the code, not measured: probe A would report such an acquire as a
+non-stale mismatch, and none was seen in these suites. Recorded so the
+transition answers it rather than inherits it.

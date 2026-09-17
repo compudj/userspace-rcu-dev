@@ -1586,6 +1586,22 @@ struct ft_flip_txn {
 	 * i.e. as convertible, which it is precisely not.
 	 */
 	FT_TK_TXN_FIELDS
+#ifdef FT_DEBUG_STRUCT_ANCHOR
+	const struct cds_ft *sa_ft;	/* the trie whose anchors the record probe asks */
+	/*
+	 * Records that were NOT covered when made, re-asked at COMMIT: a lock
+	 * the op takes after the record is a LATE hold (sound for MW, not for
+	 * an SW park, whose overwritten value was read unlocked); one that is
+	 * still not held when the descriptor goes to the engine is a gap in
+	 * the lock set itself.
+	 */
+	struct ft_sa_pend {
+		struct cds_ft_metadata *owner;
+		const struct ft_tk_site *site;
+		void *pc0, *pc1;
+	} sa_pend[16];
+	unsigned int sa_npend;
+#endif
 };
 
 /*
@@ -1952,6 +1968,10 @@ struct ft_flip_txn *ft_flip_txn_create_at(FT_TK_SITE_PARAM struct cds_ft *ft)
 	t->acquire_miss = false;
 	t->acquire_enomem = false;
 	FT_OWNER_ASSERT_SET_FT(t, ft);
+#ifdef FT_DEBUG_STRUCT_ANCHOR
+	t->sa_ft = ft;
+	t->sa_npend = 0;
+#endif
 	t->pending_pub_slot = NULL;
 	t->pending_dual_slot = NULL;
 	t->pending_dual_val = NULL;
@@ -2183,6 +2203,10 @@ struct ft_flip_txn *ft_flip_txn_create_on_at(FT_TK_SITE_PARAM
 	t->acquire_miss = false;
 	t->acquire_enomem = false;
 	FT_OWNER_ASSERT_SET_FT(t, ft);
+#ifdef FT_DEBUG_STRUCT_ANCHOR
+	t->sa_ft = ft;
+	t->sa_npend = 0;
+#endif
 	t->pending_pub_slot = NULL;
 	t->pending_dual_slot = NULL;
 	t->pending_dual_val = NULL;
@@ -2247,6 +2271,10 @@ struct ft_flip_txn *ft_flip_txn_create_bounded_on_at(FT_TK_SITE_PARAM
 	t->acquire_miss = false;
 	t->acquire_enomem = false;
 	FT_OWNER_ASSERT_SET_FT(t, ft);
+#ifdef FT_DEBUG_STRUCT_ANCHOR
+	t->sa_ft = ft;
+	t->sa_npend = 0;
+#endif
 	t->pending_pub_slot = NULL;
 	t->pending_dual_slot = NULL;
 	t->pending_dual_val = NULL;
@@ -3335,7 +3363,26 @@ struct ft_ch_site {
 		 * holder.  Split the verdict so the two are not planned as one.
 		 */
 		un_liston, un_listoff;
+	/*
+	 * -DFT_DEBUG_STRUCT_ANCHOR: the SAME question the record-side inventory
+	 * asks, for the words that never reach a record helper (hlist stores,
+	 * raw stores, in-place body writes).  The ladder above matches owners
+	 * by EXACT identity and walks "any ancestor" above per-node; this asks
+	 * whether the op holds the owner's STRUCTURAL anchor -- and, separately,
+	 * whether it holds only the owner's own word where the anchor is an
+	 * ancestor (SELF_ONLY), which the ladder scores as HELD.  Asked before
+	 * the declaration switch: a HIDDEN claim is counted, not believed.
+	 */
+	unsigned long sa_asked, sa_noowner, sa_self, sa_anc, sa_selfonly,
+		sa_undated, sa_undated_held, sa_nolocks, sa_unheld;
 };
+
+#if defined(FT_DEBUG_STRUCT_ANCHOR) && defined(FT_DEBUG_CHAIN_HOLD)
+struct ft_flip_txn;
+static void ft_ch_sa_score(struct ft_ch_site *s, const struct cds_ft *ft,
+		const struct ft_flip_txn *t, const struct ft_lock_ctx *ctx,
+		struct cds_ft_metadata *owner);
+#endif
 
 #ifdef FT_DEBUG_CHAIN_HOLD
 /*
@@ -3495,6 +3542,26 @@ void ft_ch_audit_owner_at(const char *fn, int line, const struct cds_ft *ft,
 		s->aborting++;
 		return;
 	}
+#ifdef FT_DEBUG_STRUCT_ANCHOR
+	{
+		struct cds_ft_metadata *sao = NULL;
+
+		if (owner_flag) {
+			/* a build-invisible target owes nothing: not scored */
+			if (excl != FT_EXCL_HIDDEN)
+				sao = ft_flag_to_metadata(ft, owner_flag);
+		} else {
+			struct cds_ft_inode_flag *sh = ft_chain_head_holder(
+				(struct cds_ft *) ft,
+				(struct cds_ft_node *) item);
+
+			if (sh)
+				sao = ft_flag_to_metadata(ft, sh);
+		}
+		if (sao || !owner_flag)
+			ft_ch_sa_score(s, ft, t, ctx, sao);
+	}
+#endif
 	/*
 	 * ☠ DO NOT DERIVE THE OWNER FROM THE WORD BEING WRITTEN.  For a head's
 	 * PARENT word (ft_ord_cell.parent, or cds_ft_node.prev of a head) the
@@ -3826,6 +3893,10 @@ void ft_ch_audit_body_at(const char *fn, int line, const struct cds_ft *ft,
 		s->coarse_mode++;
 		return;
 	}
+#ifdef FT_DEBUG_STRUCT_ANCHOR
+	if (excl != FT_EXCL_HIDDEN)
+		ft_ch_sa_score(s, ft, t, ctx, owner);
+#endif
 	switch (excl) {
 	case FT_EXCL_HIDDEN:
 		s->hw_hidden++;
@@ -3944,6 +4015,11 @@ void ft_ch_audit_parent_at(const char *fn, int line, const struct cds_ft *ft,
 		s->noholder++;
 		return;
 	}
+#ifdef FT_DEBUG_STRUCT_ANCHOR
+	if (excl != FT_EXCL_HIDDEN)
+		ft_ch_sa_score(s, ft, NULL, NULL,
+			ft_flag_to_metadata(ft, owner_flag));
+#endif
 	switch (excl) {
 	case FT_EXCL_HIDDEN:
 		s->hw_hidden++;
@@ -4024,6 +4100,11 @@ static void ft_ch_audit_report(void)
 			fprintf(stderr, "%-34s %6s   HELD(ctx) breakdown: txn=%lu extra=%lu glue=%lu outer=%lu\n",
 				nm, "", s->ctx_txn, s->ctx_extra, s->ctx_glue,
 				s->ctx_outer);
+		if (s->sa_asked)
+			fprintf(stderr, "%-34s %6s   STRUCT-ANCHOR: asked=%lu noowner=%lu HELD(self)=%lu HELD(anc)=%lu SELF_ONLY=%lu undated=%lu undated_held=%lu NOLOCKS=%lu UNHELD=%lu\n",
+				nm, "", s->sa_asked, s->sa_noowner, s->sa_self,
+				s->sa_anc, s->sa_selfonly, s->sa_undated,
+				s->sa_undated_held, s->sa_nolocks, s->sa_unheld);
 		viol += s->unheld;
 	}
 	fprintf(stderr, "FT_CHAIN_HOLD_AUDIT  %lu VIOLATION%s (UNHELD: FINE trie, no writer scope,\n"
@@ -5321,6 +5402,392 @@ void ft_flip_txn_destroy(struct ft_flip_txn *t)
 	ft_flip_txn_free(t);
 }
 
+#ifdef FT_DEBUG_STRUCT_ANCHOR
+#ifndef FT_DEBUG_TXN_KIND
+#error "-DFT_DEBUG_STRUCT_ANCHOR needs -DFT_DEBUG_TXN_KIND (txn site + always-MW class)"
+#endif
+#include <dlfcn.h>
+#include <link.h>
+
+/*
+ * ONE FRAME ABOVE the recorder's caller, so a row names the primitive and not
+ * the shared helper the record was inlined into.  ☠ Build the probe with
+ * -fno-omit-frame-pointer: without it this reads a caller-saved register as a
+ * frame and the pc1 column is noise (the pc0 column stays exact).
+ */
+#define FT_SA_CALLER_PC()						\
+	({								\
+		_Pragma("GCC diagnostic push")				\
+		_Pragma("GCC diagnostic ignored \"-Wframe-address\"")	\
+		void *_pc = __builtin_return_address(1);		\
+		_Pragma("GCC diagnostic pop")				\
+		_pc;							\
+	})
+
+#define FT_SA_PATH_MAX	(FT_MAX_DEPTH + 2)
+
+/*
+ * Climb from @node to the root.  path[0] = @node, path[n-1] = the root;
+ * start[k] = byte-depth where path[k] starts.  Returns n, or 0 if undatable.
+ */
+static unsigned int ft_sa_climb(const struct cds_ft *ft,
+		struct cds_ft_metadata *node,
+		struct cds_ft_metadata **path,
+		struct cds_ft_inode_flag **pflag, unsigned int *start)
+{
+	unsigned int span[FT_SA_PATH_MAX];
+	struct cds_ft_metadata *meta = node;
+	unsigned int n = 0, k, acc = 0;
+
+	path[n] = node;
+	pflag[n] = NULL;
+	span[n] = 0;
+	n++;
+	for (;;) {
+		struct cds_ft_inode_flag *pw, *parent;
+		struct cds_ft_metadata *pm;
+
+		if (n >= FT_SA_PATH_MAX)
+			return 0;
+		pw = rcu_dereference(meta->parent_word);
+		if (!pw || ft_node_flip_proxy(pw))
+			return 0;	/* transient re-home, or a peer's park */
+		if (ft_parent_is_trie(pw))
+			break;		/* @meta is the root */
+		parent = ft_parent_node(pw);
+		if (!parent || ft_node_flip_proxy(parent) ||
+				ft_node_external(parent))
+			return 0;
+		pm = ft_node_compressed(parent) ?
+			cds_ft_item_to_metadata((struct cds_ft_inode *)
+				ft_compressed_node_ptr(parent)) :
+			cds_ft_item_to_metadata(ft_node_ptr(
+				ft_resolve_skip_compressed((struct cds_ft *) ft,
+					parent)));
+		if (!pm)
+			return 0;
+		path[n] = pm;
+		pflag[n] = parent;
+		span[n] = ft_node_span(ft, parent);
+		n++;
+		meta = pm;
+	}
+	/* path[n-1] is the root at 0; walk back down summing spans. */
+	start[n - 1] = 0;
+	for (k = n - 1; k > 0; k--) {
+		acc += span[k];
+		start[k - 1] = acc;
+	}
+	return n;
+}
+
+/*
+ * The anchor §2 assigns @node on the trie AS IT STANDS: the node with the
+ * smallest start at or after L(depth(@node)) on @node's root path.  FALSE when
+ * the climb cannot date it (see ft_sa_climb).
+ */
+/*
+ * RED CONTROL (env FT_SA_RED=root): answer the ROOT for every owner, whatever
+ * the spacing.  The ops are untouched -- only the question changes -- so an op
+ * that holds its real anchor and not the root must read UNHELD / SELF_ONLY.
+ * A run whose UNHELD stays zero under this knob has a witness that cannot say
+ * no, and its green is worth nothing.
+ */
+static int ft_sa_red = -1;
+
+static bool ft_sa_struct_anchor(const struct cds_ft *ft,
+		struct cds_ft_metadata *node, struct cds_ft_metadata **anchor)
+{
+	struct cds_ft_metadata *path[FT_SA_PATH_MAX];
+	struct cds_ft_inode_flag *pflag[FT_SA_PATH_MAX];
+	unsigned int start[FT_SA_PATH_MAX];
+	unsigned int n, k, lvl;
+
+	if (caa_unlikely(ft_sa_red < 0)) {
+		const char *e = getenv("FT_SA_RED");
+
+		ft_sa_red = e && !strcmp(e, "root");
+	}
+	if (ft->lock_spacing == CDS_FT_LOCK_SPACING_PER_NODE && !ft_sa_red) {
+		*anchor = node;
+		return true;
+	}
+	n = ft_sa_climb(ft, node, path, pflag, start);
+	if (!n)
+		return false;
+	if (ft_sa_red ||
+			ft->lock_spacing == CDS_FT_LOCK_SPACING_ROOT_ONLY) {
+		*anchor = path[n - 1];
+		return true;
+	}
+	lvl = ft_lock_level(start[0]);
+	for (k = n; k-- > 0;) {
+		if (start[k] >= lvl) {
+			*anchor = path[k];
+			return true;
+		}
+	}
+	return false;
+}
+
+/*
+ * THE RECORD-SIDE INVENTORY: for every structural record, does the op hold the
+ * lock that §1/§2 say excludes the word -- the STRUCTURAL anchor of its named
+ * owner -- at the moment the record is made?  Keyed by (txn creation site, the
+ * record's call site, one frame above it), so a row names the PRIMITIVE, not
+ * the shared helper.  Asked with the union witness (registry, ctx frames,
+ * ledger), never the registry alone.
+ *
+ * Record time is the SW question on purpose: an SW park is legal only if the
+ * lock was held when the value it overwrites was read, so a record made before
+ * the op's acquire is not covered for that purpose however the commit ends.
+ * NOLOCKS separates "holds nothing at all yet" from a real miss.
+ */
+enum ft_sa_rv {
+	FT_SA_RV_TOTAL = 0,
+	FT_SA_RV_SW,		/* parked SW (armed txn) -- subset of total */
+	FT_SA_RV_WLOCK,		/* FT-wide writer lock on this trie */
+	FT_SA_RV_COARSE,	/* !lock_fine, or an EXCLUSIVE trie (no peer) */
+	FT_SA_RV_MISS,		/* acquire_miss set: commit will discard */
+	FT_SA_RV_NOOWNER,	/* the producer named no owner */
+	FT_SA_RV_HELD,		/* the structural anchor is held */
+	FT_SA_RV_HELD_COARSE,	/* the anchor (an ANCESTOR of the owner) is held */
+	FT_SA_RV_SELF_ONLY,	/* owner's own word held, NOT its anchor */
+	FT_SA_RV_RETIRE_WIT,	/* only ft_owner_retire_witnessed */
+	FT_SA_RV_UNDATED_HELD,	/* climb failed, owner held */
+	FT_SA_RV_UNDATED,	/* climb failed, owner not held */
+	FT_SA_RV_NOLOCKS,	/* holds nothing (registry empty, ledger empty) */
+	FT_SA_RV_UNHELD,	/* holds something, not this */
+	/* the uncovered ones above, re-asked at commit (registry + ledger) */
+	FT_SA_RV_C_LATE,	/* held by commit: acquired AFTER the record */
+	FT_SA_RV_C_NEVER_OK,	/* still not held, and the commit landed */
+	FT_SA_RV_C_NEVER_AB,	/* still not held, commit aborted/failed */
+	FT_SA_RV_C_OVERFLOW,	/* more uncovered records than sa_pend holds */
+	FT_SA_RV_MWA_BASE,	/* + always-MW class (declared, no owner) */
+	FT_SA_RV_NR = FT_SA_RV_MWA_BASE + FT_TK_MWA_NR,
+};
+
+#define FT_SA_REC_ENTRIES	2048
+struct ft_sa_rec_key {
+	const struct ft_tk_site *site;
+	void *pc0, *pc1;
+	int valid;
+};
+static struct ft_sa_rec_key ft_sa_rec_keys[FT_SA_REC_ENTRIES];
+static pthread_mutex_t ft_sa_rec_lock = PTHREAD_MUTEX_INITIALIZER;
+static unsigned long ft_sa_rec_overflow;
+
+struct ft_sa_rec_tls {
+	struct ft_sa_rec_tls *next;
+	unsigned long c[FT_SA_REC_ENTRIES][FT_SA_RV_NR];
+};
+static struct ft_sa_rec_tls *ft_sa_rec_head;
+static __thread struct ft_sa_rec_tls *ft_sa_rec_mine;
+
+static int ft_sa_rec_slot(const struct ft_tk_site *site, void *pc0, void *pc1)
+{
+	unsigned long h = ((unsigned long) site >> 4) ^
+		((unsigned long) pc0 * 0x9E3779B97F4A7C15UL) ^
+		((unsigned long) pc1 >> 3);
+	unsigned int i, idx;
+
+	for (i = 0; i < FT_SA_REC_ENTRIES; i++) {
+		idx = (unsigned int) ((h + i) & (FT_SA_REC_ENTRIES - 1));
+		if (!CMM_LOAD_SHARED(ft_sa_rec_keys[idx].valid))
+			break;
+		if (ft_sa_rec_keys[idx].site == site &&
+				ft_sa_rec_keys[idx].pc0 == pc0 &&
+				ft_sa_rec_keys[idx].pc1 == pc1)
+			return (int) idx;
+	}
+	pthread_mutex_lock(&ft_sa_rec_lock);
+	for (i = 0; i < FT_SA_REC_ENTRIES; i++) {
+		idx = (unsigned int) ((h + i) & (FT_SA_REC_ENTRIES - 1));
+		if (!ft_sa_rec_keys[idx].valid) {
+			ft_sa_rec_keys[idx].site = site;
+			ft_sa_rec_keys[idx].pc0 = pc0;
+			ft_sa_rec_keys[idx].pc1 = pc1;
+			CMM_STORE_SHARED(ft_sa_rec_keys[idx].valid, 1);
+			pthread_mutex_unlock(&ft_sa_rec_lock);
+			return (int) idx;
+		}
+		if (ft_sa_rec_keys[idx].site == site &&
+				ft_sa_rec_keys[idx].pc0 == pc0 &&
+				ft_sa_rec_keys[idx].pc1 == pc1) {
+			pthread_mutex_unlock(&ft_sa_rec_lock);
+			return (int) idx;
+		}
+	}
+	pthread_mutex_unlock(&ft_sa_rec_lock);
+	uatomic_inc(&ft_sa_rec_overflow);
+	return -1;
+}
+
+static void ft_sa_rec_count(const struct ft_tk_site *site, void *pc0,
+		void *pc1, enum ft_sa_rv v, bool sw)
+{
+	struct ft_sa_rec_tls *m = ft_sa_rec_mine;
+	int idx;
+
+	if (caa_unlikely(!m)) {
+		m = calloc(1, sizeof(*m));
+		if (!m)
+			return;
+		pthread_mutex_lock(&ft_sa_rec_lock);
+		m->next = ft_sa_rec_head;
+		ft_sa_rec_head = m;
+		pthread_mutex_unlock(&ft_sa_rec_lock);
+		ft_sa_rec_mine = m;
+	}
+	idx = ft_sa_rec_slot(site, pc0, pc1);
+	if (idx < 0)
+		return;
+	m->c[idx][FT_SA_RV_TOTAL]++;
+	if (sw)
+		m->c[idx][FT_SA_RV_SW]++;
+	m->c[idx][v]++;
+}
+
+static void ft_sa_off(void *pc, char *buf, size_t len)
+{
+	Dl_info info;
+	struct link_map *lm = NULL;
+
+	if (pc && dladdr1(pc, &info, (void **) &lm, RTLD_DI_LINKMAP) && lm)
+		snprintf(buf, len, "%s+0x%lx",
+			info.dli_fname ? info.dli_fname : "?",
+			(unsigned long) ((uintptr_t) pc - lm->l_addr));
+	else
+		snprintf(buf, len, "%p", pc);
+}
+
+static __attribute__((destructor))
+void ft_sa_rec_report(void)
+{
+	static const char *hdr[FT_SA_RV_MWA_BASE] = {
+		"total", "sw", "WLOCK", "coarse", "miss", "NOOWNER", "HELD",
+		"held_coarse", "SELF_ONLY", "retire_wit", "undated_held",
+		"UNDATED", "NOLOCKS", "UNHELD", "c_LATE", "c_NEVER_OK",
+		"c_NEVER_AB", "c_OVERFLOW" };
+	int i, j;
+	struct ft_sa_rec_tls *m;
+	bool any = false;
+
+	for (i = 0; i < FT_SA_REC_ENTRIES; i++) {
+		unsigned long sum[FT_SA_RV_NR] = { 0 };
+		char o0[256], o1[256];
+
+		if (!ft_sa_rec_keys[i].valid)
+			continue;
+		for (m = ft_sa_rec_head; m; m = m->next)
+			for (j = 0; j < FT_SA_RV_NR; j++)
+				sum[j] += m->c[i][j];
+		if (!sum[FT_SA_RV_TOTAL] && !sum[FT_SA_RV_MWA_BASE] &&
+				!any)
+			;
+		if (!any) {
+			fprintf(stderr, "\n=== FT_SA_REC: record-time lock-set "
+				"coverage vs the STRUCTURAL anchor, per (txn "
+				"site, pc0, pc1) ===\n");
+			any = true;
+		}
+		ft_sa_off(ft_sa_rec_keys[i].pc0, o0, sizeof(o0));
+		ft_sa_off(ft_sa_rec_keys[i].pc1, o1, sizeof(o1));
+		fprintf(stderr, "FT_SA_REC site=%s:%d pc0=%s pc1=%s",
+			ft_sa_rec_keys[i].site ? ft_sa_rec_keys[i].site->file :
+				"?",
+			ft_sa_rec_keys[i].site ? ft_sa_rec_keys[i].site->line :
+				0, o0, o1);
+		for (j = 0; j < FT_SA_RV_MWA_BASE; j++)
+			if (sum[j])
+				fprintf(stderr, " %s=%lu", hdr[j], sum[j]);
+		for (j = FT_SA_RV_MWA_BASE; j < FT_SA_RV_NR; j++)
+			if (sum[j])
+				fprintf(stderr, " mwa%d=%lu",
+					j - FT_SA_RV_MWA_BASE, sum[j]);
+		fprintf(stderr, "\n");
+	}
+	if (any)
+		fprintf(stderr, "FT_SA_REC overflow=%lu (mwaN: enum "
+			"ft_tk_mwa_class index)\n", ft_sa_rec_overflow);
+}
+
+static bool ft_sa_witness(const struct ft_flip_txn *t,
+		const struct ft_lock_ctx *ctx, struct cds_ft_metadata *m)
+{
+	return (t && ft_flip_txn_owns(t, m)) || ft_owner_ctx_holds(ctx, m) ||
+		ft_hold_trace_holds(m);
+}
+
+static enum ft_sa_rv ft_sa_rec_verdict(const struct cds_ft *ft,
+		const struct ft_flip_txn *t, const struct ft_lock_ctx *ctx,
+		struct cds_ft_metadata *owner, void **slot, void *new_ptr)
+{
+	struct cds_ft_metadata *anchor;
+
+	if (!ft)
+		return FT_SA_RV_NOOWNER;
+	if (ft_wlock_held == (struct cds_ft *) ft)
+		return FT_SA_RV_WLOCK;
+	if (!ft->lock_fine || ft->exclusive)
+		return FT_SA_RV_COARSE;
+	if (t->acquire_miss)
+		return FT_SA_RV_MISS;
+	if (!owner)
+		return FT_SA_RV_NOOWNER;
+	if (!ft_sa_struct_anchor(ft, owner, &anchor))
+		return ft_sa_witness(t, ctx, owner) ? FT_SA_RV_UNDATED_HELD :
+			FT_SA_RV_UNDATED;
+	if (ft_sa_witness(t, ctx, anchor))
+		return anchor == owner ? FT_SA_RV_HELD : FT_SA_RV_HELD_COARSE;
+	if (anchor != owner && ft_sa_witness(t, ctx, owner))
+		return FT_SA_RV_SELF_ONLY;
+	if (ft_owner_retire_witnessed(ctx, owner, slot, new_ptr))
+		return FT_SA_RV_RETIRE_WIT;
+	if (!t->nr_locks && !ft_hold_trace_count())
+		return FT_SA_RV_NOLOCKS;
+	return FT_SA_RV_UNHELD;
+}
+
+#ifdef FT_DEBUG_CHAIN_HOLD
+static void ft_ch_sa_score(struct ft_ch_site *s, const struct cds_ft *ft,
+		const struct ft_flip_txn *t, const struct ft_lock_ctx *ctx,
+		struct cds_ft_metadata *owner)
+{
+	struct cds_ft_metadata *anchor;
+
+	s->sa_asked++;
+	if (!owner) {
+		s->sa_noowner++;
+		return;
+	}
+	if (!ft_sa_struct_anchor(ft, owner, &anchor)) {
+		if (ft_sa_witness(t, ctx, owner))
+			s->sa_undated_held++;
+		else
+			s->sa_undated++;
+		return;
+	}
+	if (ft_sa_witness(t, ctx, anchor)) {
+		if (anchor == owner)
+			s->sa_self++;
+		else
+			s->sa_anc++;
+		return;
+	}
+	if (anchor != owner && ft_sa_witness(t, ctx, owner)) {
+		s->sa_selfonly++;
+		return;
+	}
+	if (!ft_hold_trace_count() && !(t && t->nr_locks)) {
+		s->sa_nolocks++;
+		return;
+	}
+	s->sa_unheld++;
+}
+#endif
+#endif /* FT_DEBUG_STRUCT_ANCHOR */
+
 /*
  * Commit an FT flip-txn (ft_flip_txn_create*): commit @mtxn -- whose edge set was
  * recorded straight into it as the op built -- then free the handle.  The commit
@@ -5409,6 +5876,18 @@ enum urcu_txn_status ft_flip_txn_commit(struct cds_ft *ft,
 		return miss_st;
 	}
 	FT_AB_LOST_RESET();
+#ifdef FT_DEBUG_STRUCT_ANCHOR
+	bool sa_held[CAA_ARRAY_SIZE(t->sa_pend)];
+	unsigned int sa_i;
+
+	for (sa_i = 0; sa_i < t->sa_npend; sa_i++) {
+		struct cds_ft_metadata *sa_anchor;
+
+		sa_held[sa_i] = ft_sa_struct_anchor(ft, t->sa_pend[sa_i].owner,
+				&sa_anchor) &&
+			ft_sa_witness(t, NULL, sa_anchor);
+	}
+#endif
 	/*
 	 * Drop (and, under the oracle, YIELD) the registered locks' ledger
 	 * entries BEFORE the commit: the release terminals consume the locks
@@ -5428,6 +5907,14 @@ enum urcu_txn_status ft_flip_txn_commit(struct cds_ft *ft,
 			ft_hold_trace_drop(t->locks[drop_i].meta);
 	}
 	st = urcu_txn_commit_flavor(t->mtxn, reclaim);
+#ifdef FT_DEBUG_STRUCT_ANCHOR
+	for (sa_i = 0; sa_i < t->sa_npend; sa_i++)
+		ft_sa_rec_count(t->sa_pend[sa_i].site, t->sa_pend[sa_i].pc0,
+			t->sa_pend[sa_i].pc1,
+			sa_held[sa_i] ? FT_SA_RV_C_LATE :
+			(st == URCU_TXN_STATUS_OK ? FT_SA_RV_C_NEVER_OK :
+				FT_SA_RV_C_NEVER_AB), false);
+#endif
 	FT_TP(txn_commit, (const void *) t->mtxn, (int) st);
 	FT_TK_COUNT_END(t, st == URCU_TXN_STATUS_OK ? FT_TK_OK :
 			(st == URCU_TXN_STATUS_MEMORY_ERROR ? FT_TK_MEMERR :
@@ -5517,6 +6004,9 @@ static void ft_owner_wide_report(void)
 }
 #endif
 
+#ifdef FT_DEBUG_STRUCT_ANCHOR
+__attribute__((noinline))
+#endif
 void __ft_flip_txn_record_tag_ctx(struct ft_flip_txn *t,
 		const struct ft_lock_ctx *dbg_ctx,
 		struct cds_ft_metadata *owner, void **slot,
@@ -5526,6 +6016,32 @@ void __ft_flip_txn_record_tag_ctx(struct ft_flip_txn *t,
 
 	FT_TP(edge_record, (const void *) t->mtxn, (const void *) slot,
 		(const void *) old_ptr, (const void *) new_ptr, tag);
+#ifdef FT_DEBUG_STRUCT_ANCHOR
+	if (!FT_TK_TXN_IS_TAKE(t)) {
+		void *pc0 = __builtin_return_address(0);
+		void *pc1 = FT_SA_CALLER_PC();
+		enum ft_sa_rv v = ft_sa_rec_verdict(t->sa_ft, t, dbg_ctx,
+			owner, slot, new_ptr);
+
+		ft_sa_rec_count(FT_TK_TXN_SITE(t), pc0, pc1, v,
+			t->structural_sw);
+		if (v == FT_SA_RV_NOLOCKS || v == FT_SA_RV_UNHELD ||
+				v == FT_SA_RV_SELF_ONLY) {
+			if (t->sa_npend < CAA_ARRAY_SIZE(t->sa_pend)) {
+				struct ft_sa_pend *sp =
+					&t->sa_pend[t->sa_npend++];
+
+				sp->owner = owner;
+				sp->site = FT_TK_TXN_SITE(t);
+				sp->pc0 = pc0;
+				sp->pc1 = pc1;
+			} else {
+				ft_sa_rec_count(FT_TK_TXN_SITE(t), pc0, pc1,
+					FT_SA_RV_C_OVERFLOW, false);
+			}
+		}
+	}
+#endif
 	/*
 	 * MIXED sw/mw: a STRUCTURAL edge parks SW when the op holds the DLM lock
 	 * over @slot (structural_sw set by the caller under lock_fine) -- a plain
@@ -5696,6 +6212,9 @@ void ft_flip_txn_record_tag(struct ft_flip_txn *t,
  * non-lock_fine site to it is byte-neutral.
  */
 static inline
+#ifdef FT_DEBUG_STRUCT_ANCHOR
+__attribute__((noinline))
+#endif
 void ft_flip_txn_record_tag_mw(struct ft_flip_txn *t, void **slot,
 		void *old_ptr, void *new_ptr, uintptr_t tag FT_TK_MWA_PARAM)
 {
@@ -5703,6 +6222,11 @@ void ft_flip_txn_record_tag_mw(struct ft_flip_txn *t, void **slot,
 
 	FT_TP(edge_record, (const void *) t->mtxn, (const void *) slot,
 		(const void *) old_ptr, (const void *) new_ptr, tag);
+#ifdef FT_DEBUG_STRUCT_ANCHOR
+	ft_sa_rec_count(FT_TK_TXN_SITE(t), __builtin_return_address(0),
+		FT_SA_CALLER_PC(),
+		(enum ft_sa_rv) (FT_SA_RV_MWA_BASE + dbg_mwa), false);
+#endif
 	FT_TK_COUNT_REC(t, FT_TK_MW_ALWAYS);
 	FT_TK_COUNT_MWA(dbg_mwa);
 	FT_AB_ARM(FT_AB_MWA_BASE + dbg_mwa, FT_AB_OWN_NA);
@@ -7317,6 +7841,196 @@ void ft_wo_observe(const char *fn, int line, const struct cds_ft *ft,
 }
 #endif /* FT_DEBUG_WIDEN_OWNER */
 
+#ifdef FT_DEBUG_STRUCT_ANCHOR
+/*
+ * -DFT_DEBUG_STRUCT_ANCHOR: DOES THE ACQUIRE'S ANCHOR AGREE WITH THE TRIE?
+ *
+ * §1's agreement is a property of a FUNCTION -- every op that reaches node X
+ * must lock the same word -- and every acquire site computes that function from
+ * its OWN descent table.  So the only independent answer is the one the table is
+ * supposed to encode: climb X's parent words to the root, sum the spans to get
+ * X's byte-depth, and take §2's rule (the node starting at the first boundary at
+ * or after L(depth)) over that path.  A disagreement between the two is either a
+ * derivation defect (the table answers for the wrong node) or a structure that
+ * changed under the op (a peer's restructure between its descent and the take).
+ * Single-threaded, only the first is possible, so an ft_unit mismatch is a
+ * defect by construction.
+ *
+ * ☠ The climb is §5.3's rejected up-walk -- here as an ORACLE, never a
+ * navigation aid, and debug-only.  It reads live parent words unlocked: a
+ * parked proxy, a NULL (transient re-home) or an external bails as UNDATED
+ * rather than guessing.
+ */
+struct ft_sa_site {
+	const char *fn;
+	int line;
+	unsigned long total, match, mismatch, undated, depth_diff;
+	/* where the op's anchor sits relative to the structural one */
+	unsigned long mis_above, mis_below, mis_offpath;
+	unsigned long mis_cursor_is_parent;	/* d->nf is X's parent, not X */
+	unsigned long mis_anchor_dead;	/* op anchor or member TOMBSTONED now */
+	unsigned long reports[3];	/* sample budget per class: above/below/offpath */
+};
+
+#define FT_SA_MAX_SITES	128
+static struct ft_sa_site ft_sa_sites[FT_SA_MAX_SITES];
+static int ft_sa_nr_sites;
+static pthread_mutex_t ft_sa_lock = PTHREAD_MUTEX_INITIALIZER;
+static unsigned long ft_sa_reports;
+
+static struct ft_sa_site *ft_sa_site_of(const char *fn, int line)
+{
+	struct ft_sa_site *s = NULL;
+	int i;
+
+	for (i = 0; i < uatomic_load(&ft_sa_nr_sites, CMM_RELAXED); i++)
+		if (ft_sa_sites[i].fn == fn && ft_sa_sites[i].line == line)
+			return &ft_sa_sites[i];
+	pthread_mutex_lock(&ft_sa_lock);
+	for (i = 0; i < ft_sa_nr_sites; i++)
+		if (ft_sa_sites[i].fn == fn && ft_sa_sites[i].line == line) {
+			s = &ft_sa_sites[i];
+			goto out;
+		}
+	if (ft_sa_nr_sites < FT_SA_MAX_SITES) {
+		s = &ft_sa_sites[ft_sa_nr_sites];
+		s->fn = fn;
+		s->line = line;
+		uatomic_store(&ft_sa_nr_sites, ft_sa_nr_sites + 1, CMM_RELAXED);
+	}
+out:
+	pthread_mutex_unlock(&ft_sa_lock);
+	return s;
+}
+
+static __attribute__((destructor))
+void ft_sa_report(void)
+{
+	int i;
+
+	if (!ft_sa_nr_sites)
+		return;
+	fprintf(stderr, "\n=== FT_STRUCT_ANCHOR: acquire anchor vs the trie's own "
+		"anchor (up-walk), per acquire SITE ===\n"
+		"%-44s %9s %9s %9s %8s %8s %8s %8s %8s %9s %8s\n",
+		"site", "total", "match", "MISMATCH", "undated", "depthΔ",
+		"above", "below", "offpath", "cur=par", "dead");
+	for (i = 0; i < ft_sa_nr_sites; i++) {
+		struct ft_sa_site *s = &ft_sa_sites[i];
+		char where[64];
+
+		snprintf(where, sizeof(where), "%s:%d", s->fn, s->line);
+		fprintf(stderr, "%-44s %9lu %9lu %9lu %8lu %8lu %8lu %8lu %8lu %9lu %8lu\n",
+			where, s->total, s->match, s->mismatch, s->undated,
+			s->depth_diff, s->mis_above, s->mis_below,
+			s->mis_offpath, s->mis_cursor_is_parent,
+			s->mis_anchor_dead);
+	}
+	fprintf(stderr, "    total == match + MISMATCH + undated.  above/below: "
+		"the op's anchor is a strict ancestor / descendant of the "
+		"structural one.\n");
+}
+
+static inline
+void ft_sa_check(const char *fn, int line, const struct cds_ft *ft,
+		const struct ft_lock_ctx *ctx, struct cds_ft_inode_flag *nf,
+		struct cds_ft_metadata *node, unsigned int op_depth,
+		struct cds_ft_metadata *op_anchor)
+{
+	struct cds_ft_metadata *path[FT_SA_PATH_MAX];
+	struct cds_ft_inode_flag *pflag[FT_SA_PATH_MAX];
+	unsigned int start[FT_SA_PATH_MAX];
+	struct ft_sa_site *s;
+	struct cds_ft_metadata *sa = NULL;
+	unsigned int n, k, depth, lvl, sa_k = 0, op_k = 0;
+	bool op_on_path = false;
+	const struct ft_descent *d;
+
+	if (ft->lock_spacing == CDS_FT_LOCK_SPACING_PER_NODE || !ft->lock_fine)
+		return;
+	s = ft_sa_site_of(fn, line);
+	if (!s)
+		return;
+	uatomic_inc(&s->total);
+	n = ft_sa_climb(ft, node, path, pflag, start);
+	if (!n) {
+		uatomic_inc(&s->undated);
+		return;
+	}
+	depth = start[0];
+	if (depth != op_depth)
+		uatomic_inc(&s->depth_diff);
+	if (ft->lock_spacing == CDS_FT_LOCK_SPACING_ROOT_ONLY) {
+		sa = path[n - 1];
+		sa_k = n - 1;
+	} else {
+		lvl = ft_lock_level(depth);
+		/* the node with the SMALLEST start >= lvl: walk from the root */
+		for (k = n; k-- > 0;) {
+			if (start[k] >= lvl) {
+				sa = path[k];
+				sa_k = k;
+				break;
+			}
+		}
+	}
+	if (sa == op_anchor) {
+		uatomic_inc(&s->match);
+		return;
+	}
+	uatomic_inc(&s->mismatch);
+	for (k = 0; k < n; k++)
+		if (path[k] == op_anchor) {
+			op_on_path = true;
+			op_k = k;
+			break;
+		}
+	if (!op_on_path)
+		uatomic_inc(&s->mis_offpath);
+	else if (op_k > sa_k)
+		uatomic_inc(&s->mis_above);
+	else
+		uatomic_inc(&s->mis_below);
+	d = ft_lock_ctx_descent(ctx);
+	if (d && n > 1 && d->nf == pflag[1])
+		uatomic_inc(&s->mis_cursor_is_parent);
+	if ((CMM_LOAD_SHARED(op_anchor->state) & FT_STATE_TOMBSTONE) ||
+			(CMM_LOAD_SHARED(node->state) & FT_STATE_TOMBSTONE))
+		uatomic_inc(&s->mis_anchor_dead);
+	(void) ft_sa_reports;
+	if (uatomic_add_return(&s->reports[!op_on_path ? 2 :
+			(op_k > sa_k ? 0 : 1)], 1) <= 4)
+	{
+		unsigned int li = ft_lock_level_index(ft_lock_level(op_depth));
+		const struct ft_lock_anchor *la = (d && li < FT_LOCK_LEVEL_MAX) ?
+			&d->anchor[li] : NULL;
+		bool crossed = d && (d->anchor_crossed & (1U << li));
+
+		fprintf(stderr, "FT STRUCT-ANCHOR MISMATCH at %s:%d: node %p "
+			"nf %p depth(op)=%u depth(trie)=%u L=%u path_len=%u | op "
+			"anchor %p (%s k=%u start=%u) trie anchor %p (k=%u "
+			"start=%u)%s | cursor nf %p depth %u %s | tbl[L] "
+			"crossed=%d pending=%d cover=%p bound=%p bound_start=%u | "
+			"trie path flags k1=%p k2=%p\n",
+			fn, line, (void *) node, (void *) nf, op_depth, depth,
+			ft_lock_level(depth), n, (void *) op_anchor,
+			op_on_path ? "on path" : "OFF PATH", op_k,
+			op_on_path ? start[op_k] : 0, (void *) sa, sa_k,
+			start[sa_k], sa == node ? "=SELF" : "",
+			d ? (void *) d->nf : NULL, d ? d->depth : 0,
+			d && d->nf == nf ? "(cursor IS the member)" :
+			(d && n > 1 && d->nf == pflag[1] ?
+				"(cursor is the member's PARENT)" : ""),
+			(int) crossed,
+			d ? !!(d->anchor_pending & (1U << li)) : -1,
+			crossed ? (void *) la->cover : NULL,
+			crossed ? (void *) la->bound : NULL,
+			crossed ? la->bound_start : 0,
+			n > 1 ? (void *) pflag[1] : NULL,
+			n > 2 ? (void *) pflag[2] : NULL);
+	}
+}
+#endif /* FT_DEBUG_STRUCT_ANCHOR */
 
 static inline
 int ft_dlm_acquire_set_at(const char *fn, int line,
@@ -7530,6 +8244,10 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 #endif
 		lock = ft_anchor_meta(ft, ft_lock_ctx_descent(ctx), set[i].nf,
 			node, set[i].depth);
+#ifdef FT_DEBUG_STRUCT_ANCHOR
+		ft_sa_check(fn, line, ft, ctx, set[i].nf, node, set[i].depth,
+			lock);
+#endif
 		coarsened = lock != node;
 		/*
 		 * A coarsened member's OWN word is not the one being CAS'd, so
