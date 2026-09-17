@@ -8612,9 +8612,12 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 	if (!key_len) {
 		struct cds_ft_metadata *metadata;
 		struct cds_ft_node *external_nodes;
+		struct cds_ft_inode_flag *root_nf;
+		struct ft_flip_txn *root_txn = NULL;
 		unsigned int nr_frozen;
 
-		metadata = ft_root_metadata(ft);
+		root_nf = ft_resolve_flip_proxy(rcu_dereference(ft->root));
+		metadata = cds_ft_item_to_metadata(ft_node_ptr(root_nf));
 		external_nodes = metadata->external_nodes;
 		if (!external_nodes) {
 			*result_node = NULL;
@@ -8623,13 +8626,71 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 #endif
 			return CDS_FT_STATUS_NOT_FOUND;
 		}
-		*result_node = external_nodes;
 		/*
 		 * The DERIVATION the freeze below is bounded by; see
 		 * ft_hlist_freeze_chain_prepare.  Taken before either commit
 		 * path so both reserve the same number of edges.
 		 */
 		nr_frozen = ft_hlist_chain_len(external_nodes);
+		/*
+		 * LOCK THE ROOT, THEN RE-READ THE PLAN UNDER IT
+		 * (doc/design/ft-lockset-inventory.md §1, row 2).
+		 *
+		 * Both commits below clear the ROOT's @external_nodes and freeze
+		 * the chain it heads, and until now they did it holding nothing
+		 * -- ~58k commits per ft_inv run, at every spacing.  The root is
+		 * the word's owner and, at depth 0, its own anchor under every
+		 * spacing, so this is one acquire with no descent.  It is
+		 * registered in @root_txn with its release, which the commit
+		 * consumes and an early destroy releases.
+		 *
+		 * Derive, acquire, RE-VALIDATE, bail retriably: a root replaced
+		 * in between (graft_swap, a root recompaction) refuses the
+		 * acquire or fails the identity check, and a chain grown or
+		 * cleared in between fails the head / length check.  Both are
+		 * the retry the callers below already take on an aborted flip.
+		 * An exclusive or COARSE trie has no per-node peer to exclude.
+		 */
+		root_txn = ft_flip_txn_create_bounded(ft,
+			FT_REMOVE_COMMIT_REC_MAX_EDGES +
+			(ft->rank_stats ? 1 : 0) +
+			nr_frozen * FT_HLIST_FREEZE_MAX_EDGES +
+			1 /* the root's {LOCK|s -> s} release */);
+		if (!root_txn) {
+			*result_node = NULL;
+			return CDS_FT_STATUS_MEMORY_ERROR;
+		}
+		if (ft->lock_fine && !ft->exclusive) {
+			struct ft_lock_ctx rctx;
+			enum ft_lock_or_guard_exit rex;
+
+			ft_lock_ctx_init(&rctx, NULL, root_txn, op);
+			ft_flip_txn_lock_or_guard_parent_ex(__func__, __LINE__,
+				ft, root_txn, &rctx, root_nf, 0, &rex);
+			if (rex == FT_LOG_EXIT_MISS) {
+				bool enomem = root_txn->acquire_enomem;
+
+				ft_flip_txn_destroy(root_txn);
+				*result_node = NULL;
+				if (enomem)
+					return CDS_FT_STATUS_MEMORY_ERROR;
+				FT_DBG_RETRY_SITE();
+				*need_retry = true;
+				return CDS_FT_STATUS_OK;
+			}
+			if (ft_resolve_flip_proxy(rcu_dereference(ft->root)) !=
+						root_nf ||
+					metadata->external_nodes != external_nodes ||
+					ft_hlist_chain_len(external_nodes) !=
+						nr_frozen) {
+				ft_flip_txn_destroy(root_txn);
+				*result_node = NULL;
+				FT_DBG_RETRY_SITE();
+				*need_retry = true;
+				return CDS_FT_STATUS_OK;
+			}
+		}
+		*result_node = external_nodes;
 		/*
 		 * Ordered list on: the NIL key is the global minimum (a prefix of
 		 * every key), so its removal is the prefix-with-siblings clear at
@@ -8645,7 +8706,7 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 		if (ft->ordered_list || ft->rank_stats) {
 			struct ft_ord_cell *dead = ft->ordered_list ?
 				ft_ord_cell_ptr(external_nodes->prev) : NULL;
-			struct ft_flip_txn *txn;
+			struct ft_flip_txn *txn = root_txn;
 
 			/*
 			 * R1 count fold: the NIL key lives at the root, so its -1 is a
@@ -8657,14 +8718,6 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 			 * reserved txn commits infallibly and the arm is the only abort.
 			 * A no-op count record when rank stats are off (list-on path).
 			 */
-			txn = ft_flip_txn_create_bounded(ft,
-				FT_REMOVE_COMMIT_REC_MAX_EDGES +
-				(ft->rank_stats ? 1 : 0) +
-				nr_frozen * FT_HLIST_FREEZE_MAX_EDGES);
-			if (!txn) {
-				*result_node = NULL;
-				return CDS_FT_STATUS_MEMORY_ERROR;
-			}
 			ft_flip_txn_record_count_parent(ft, txn, ft->root, -1);
 			/*
 			 * ☑ AND THE CHAIN'S FREEZE RIDES THIS FLIP, like the
@@ -8720,14 +8773,8 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 			 * clear uses for exactly this reason ("no bare lone
 			 * clear even with both flags off").
 			 */
-			struct ft_flip_txn *txn = ft_flip_txn_create_bounded(ft,
-				FT_REMOVE_COMMIT_REC_MAX_EDGES +
-				nr_frozen * FT_HLIST_FREEZE_MAX_EDGES);
+			struct ft_flip_txn *txn = root_txn;
 
-			if (!txn) {
-				*result_node = NULL;
-				return CDS_FT_STATUS_MEMORY_ERROR;
-			}
 			ft_hlist_freeze_chain_prepare(ft, ft_flip_txn_handle(txn),
 				external_nodes, nr_frozen);
 			if (ft_remove_one_commit(ft,
