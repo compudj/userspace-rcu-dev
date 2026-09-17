@@ -198,17 +198,19 @@ int ft_hlist_store_mw_at(const char *fn, int line, const struct cds_ft *ft,
 	}
 	FT_HLIST_COARSE_TALLY(0);
 	/*
-	 * ☠ THE KIND COUNTER SAYS "CELL" AND THIS IS NOT A CELL.  Every store
-	 * below writes a DUPLICATE-CHAIN word (cds_ft_node.next/.prev), which is
-	 * [debt] -- a named owner, bound for SW under the nearest ancestor lock.
-	 * The ordinal CELL list (ft_ord_cell.lnode) is [DESIGN] MW forever.
-	 * Sharing one bucket means no instrument can tell them apart, and any
-	 * "MW is correct here" reasoning earned by the cell list reads as though
-	 * it covered the chain.  Left as-is for now so the counter's history
-	 * stays comparable; the audit below is keyed per SITE precisely so the
-	 * two are separable without disturbing it.
+	 * ☑ THE COUNTER NOW SAYS "CHAIN", BECAUSE THIS IS NOT A CELL.  Every
+	 * store below writes a DUPLICATE-CHAIN word (cds_ft_node.next/.prev),
+	 * which is [debt] -- a named owner, bound for SW under the nearest
+	 * ancestor lock.  The ordinal CELL list (ft_ord_cell.lnode) is [DESIGN]
+	 * MW forever.  They shared @cell_mw, so neither could be sized and any
+	 * "MW is correct here" earned by the cell list read as though it covered
+	 * the chain.  Split.
+	 *
+	 * ☠ AND THE TAG CANNOT DO THIS JOB: FT_HLIST_TAG *IS* URCU_TXN_TAG (1),
+	 * the ordered-cell tag, so a tag test classes a chain word as a cell.
+	 * The PRODUCER is what names the class.
 	 */
-	FT_TK_COUNT_CELL_MW();
+	FT_TK_COUNT_CHAIN_MW();
 	FT_AB_ARM(FT_AB_CELL_HANDLE, FT_AB_OWN_NA);
 	/*
 	 * @fn/@line are the CALLER's, so every chain-word store gets its own
@@ -246,7 +248,7 @@ int ft_hlist_store_sw_at(const char *fn, int line, const struct cds_ft *ft,
 		struct urcu_txn *txn,
 		void **slot, void *old_ptr, void *new_ptr, uintptr_t tag)
 {
-	FT_TK_COUNT_CELL_SW();
+	FT_TK_COUNT_CHAIN_SW();
 	FT_AB_ARM(FT_AB_CELL_HANDLE, FT_AB_OWN_NA);
 	FT_CH_COARSE(fn, line);
 	return urcu_txn_store_sw(txn, slot, old_ptr, new_ptr, tag);

@@ -274,6 +274,19 @@ struct ft_tk_tls {
 	unsigned long armed[FT_TK_MAX_SITES];
 	unsigned long cell_mw;	/* not site-attributed, see the header comment */
 	unsigned long cell_sw;	/* the chain edges converted OFF MW; same caveat */
+	/*
+	 * ☠ AND THE DUPLICATE CHAIN COUNTS APART FROM THE ORDERED CELL LIST.
+	 * Both reach the engine handle directly (no record helper, so no site
+	 * attribution), and both used to land in @cell_mw -- but they are
+	 * different words with OPPOSITE futures: ft_ord_cell.lnode is [DESIGN]
+	 * MW forever (a splice rewrites NEIGHBOURING keys' cells, whose holders
+	 * the op never acquires), while cds_ft_node.next/.prev is [debt], bound
+	 * for SW under the nearest ancestor lock.  Sharing a bucket meant any
+	 * "MW is correct here" earned by the cell list read as though it covered
+	 * the chain, and neither could be SIZED.  ft_hlist_store_mw_at's own
+	 * header asked for this split.
+	 */
+	unsigned long chain_mw, chain_sw;
 	unsigned long mwa[FT_TK_MWA_NR];
 #ifdef FT_ABORT_ATTRIB
 	/*
@@ -447,6 +460,19 @@ static inline
 void ft_tk_count_cell_sw(void)
 {
 	ft_tk_tls_get()->cell_sw++;
+}
+
+/* The duplicate chain's own pair -- see @chain_mw. */
+static inline
+void ft_tk_count_chain_mw(void)
+{
+	ft_tk_tls_get()->chain_mw++;
+}
+
+static inline
+void ft_tk_count_chain_sw(void)
+{
+	ft_tk_tls_get()->chain_sw++;
 }
 
 /*
@@ -1207,7 +1233,7 @@ void ft_tk_dump(void)
 {
 	struct ft_tk_row *rows;
 	struct ft_tk_tls *tls;
-	unsigned long cell_mw = 0, cell_sw = 0;
+	unsigned long cell_mw = 0, cell_sw = 0, chain_mw = 0, chain_sw = 0;
 	unsigned long mwa[FT_TK_MWA_NR];
 	unsigned long mwa_tot = 0;
 #ifdef FT_ABORT_ATTRIB
@@ -1258,6 +1284,8 @@ void ft_tk_dump(void)
 		threads++;
 		cell_mw += tls->cell_mw;
 		cell_sw += tls->cell_sw;
+		chain_mw += tls->chain_mw;
+		chain_sw += tls->chain_sw;
 		for (i = 0; i < FT_TK_MWA_NR; i++)
 			mwa[i] += tls->mwa[i];
 #ifdef FT_ABORT_ATTRIB
@@ -1375,8 +1403,11 @@ void ft_tk_dump(void)
 		tot.end[FT_TK_MEMERR], tot.end[FT_TK_MISS],
 		tot.end[FT_TK_BAILED]);
 	fprintf(stderr,
-"    cell/hlist stores (recorded straight on the engine handle, not site-attributed): MW=%lu SW=%lu\n",
+"    ORDERED-CELL list stores (ft_ord_cell.lnode, [DESIGN] MW; straight on the engine handle, not site-attributed): MW=%lu SW=%lu\n",
 		cell_mw, cell_sw);
+	fprintf(stderr,
+"    DUPLICATE-CHAIN stores (cds_ft_node.next/.prev, [debt]; same caveat):                                          MW=%lu SW=%lu\n",
+		chain_mw, chain_sw);
 
 	/*
 	 * MW_ALWAYS, SPLIT BY THE BRANCH THAT RECORDED IT.  The classes sum to
@@ -1619,6 +1650,8 @@ void ft_tk_dump_at_exit(void)
 #define FT_TK_COUNT_ARMED(t)		ft_tk_count_armed((t)->dbg_site)
 #define FT_TK_COUNT_CELL_MW()		ft_tk_count_cell_mw()
 #define FT_TK_COUNT_CELL_SW()		ft_tk_count_cell_sw()
+#define FT_TK_COUNT_CHAIN_MW()		ft_tk_count_chain_mw()
+#define FT_TK_COUNT_CHAIN_SW()		ft_tk_count_chain_sw()
 /*
  * THE CLASS ARGUMENT EXISTS ONLY IN THE INSTRUMENTED BUILD, for the reason the
  * site parameter does (see FT_TK_SITE_PARAM): an extra always-constant argument
@@ -1696,6 +1729,8 @@ struct ft_tk_site;	/* incomplete: the NULL the constructors take */
 #define FT_TK_COUNT_ARMED(t)		do { } while (0)
 #define FT_TK_COUNT_CELL_MW()		do { } while (0)
 #define FT_TK_COUNT_CELL_SW()		do { } while (0)
+#define FT_TK_COUNT_CHAIN_MW()		do { } while (0)
+#define FT_TK_COUNT_CHAIN_SW()		do { } while (0)
 #define FT_TK_MWA_PARAM
 #define FT_TK_MWA(c)
 #define FT_TK_COUNT_MWA(c)		do { } while (0)

@@ -966,14 +966,45 @@ MW_STRUCT. They are now on the ordinary conversion surface, asked and answered,
 instead of hardcoded where no instrument could reach them; parking is door 2's
 business, not this change's.
 
-☠ **CELL IS AN ALIASED BUCKET and its 7M cannot be read as one population.** It
-counts the ordered-cell list (`ft_ord_cell.lnode`, [DESIGN] MW: a splice
-rewrites NEIGHBOURING keys' cells whose holders the op never acquires) TOGETHER
-WITH the duplicate chain (`cds_ft_node.next`/`.prev`, whose conversion is
-§11.9's refuted six-item list). Splitting that counter is the prerequisite for
-sizing either one -- `ft_hlist_store_mw_at` says so itself: *"Sharing one bucket
-means no instrument can tell them apart, and any 'MW is correct here' reasoning
-earned by the cell list reads as though it covered the chain."*
+☑ **THE CELL ROW IS NOT ALIASED -- I HAD CONFLATED TWO INSTRUMENTS.** This
+table is the MW_ALWAYS class census, filed only by `ft_flip_txn_record_tag_mw`,
+and `FT_TK_MWA_CELL` is chosen there by `tag != FT_FLIP_PROXY_TAG` inside
+`ft_ord_cell_flip_into` -- the ORDERED-CELL list alone, `[DESIGN]` MW. The
+duplicate chain never reaches that recorder: `ft_hlist_store_*` call
+`urcu_txn_store_mw/sw` DIRECTLY. ⇒ with DUAL_UNNAMED discharged, **this table
+has no open conversion item left**.
+
+☠ THE ALIAS WAS IN A DIFFERENT COUNTER, and it is now split (§11.6.1).
+
+### 11.6.1 The duplicate chain, sized at last (the cell alias split)
+
+`ft_hlist_store_mw_at` counted every duplicate-chain store as `cell_mw`, the
+same bucket the ORDERED-CELL list writes from
+`ft_ord_cell_insert_after_prepare`. Its own header asked for the split:
+*"Sharing one bucket means no instrument can tell them apart, and any 'MW is
+correct here' reasoning earned by the cell list reads as though it covered the
+chain."* Both reach the engine handle directly, so neither is site-attributed,
+and neither could be SIZED. They now count apart (`chain_mw`/`chain_sw`).
+
+☠ AND THE TAG CANNOT DO THIS JOB: `FT_HLIST_TAG` **IS** `URCU_TXN_TAG` (1), the
+ordered-cell tag, so a tag test classes a chain word as a cell. The PRODUCER
+names the class ⇒ [[a tag cannot name a word class]].
+
+| per leg | ordered-cell MW | ordered-cell SW | **duplicate chain MW** | chain SW |
+|---|---|---|---|---|
+| ft_inv per-node | 3,189,982 | 0 | **14,558,007** | 1,310,138 |
+| ft_inv exponential | 3,561,002 | 0 | **13,312,744** | 1,361,325 |
+| ft_inv root-only | 2,971,680 | 0 | **7,427,938** | 1,380,789 |
+| ft_unit per-node | 1,350,026 | 0 | **682,006** | 1,514 |
+
+⇒ **The duplicate chain is the LARGEST remaining MW population in the tree** --
+an order of magnitude above every row of §11.6 -- and roughly 4.5x the
+ordered-cell list it was hidden inside. Its already-SW share is the coarse /
+exclusive dispatch plus `ft_glue_record_splices`. The ordered-cell list reads SW
+= 0 at every spacing, as `[DESIGN]` predicts.
+
+This is the size of the prize for §11.9's six-item work list, and the number to
+watch when it is attempted again.
 
 ### 11.7 FT-SLOT-3 settled: the back edge belongs to the PARENT
 
