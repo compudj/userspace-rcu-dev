@@ -860,13 +860,30 @@ struct ft_held_anchor {
  * clear (measured: 200M descents and 9M -EAGAIN from ONE detach site, under a
  * coarse spacing that had anchored an earlier member on this very node).
  */
+#ifdef FT_DEBUG_STRUCT_ANCHOR
+/*
+ * RED CONTROL for the dead-member / dead-owner probes (NOT a shipping
+ * configuration): FT_SA_RED_DEAD=1 lets the acquire take and sample a
+ * TOMBSTONED word, so a stale plan holds a dead node.  The probes must fire.
+ */
+static int ft_sa_red_dead;
+static __attribute__((constructor))
+void ft_sa_red_dead_init(void)
+{
+	ft_sa_red_dead = getenv("FT_SA_RED_DEAD") != NULL;
+}
+# define FT_SA_DEAD_REFUSE	(ft_sa_red_dead ? 0UL : FT_STATE_TOMBSTONE)
+#else
+# define FT_SA_DEAD_REFUSE	FT_STATE_TOMBSTONE
+#endif
+
 static inline
 int ft_held_anchor_sample_node(const struct cds_ft_metadata *node,
 		uintptr_t *node_snap)
 {
 	uintptr_t s = CMM_LOAD_SHARED(node->state);
 
-	if (caa_unlikely(s & (FT_STATE_PROXY | FT_STATE_TOMBSTONE |
+	if (caa_unlikely(s & (FT_STATE_PROXY | FT_SA_DEAD_REFUSE |
 			FT_STATE_LOCK)))
 		return -EAGAIN;
 	*node_snap = s;
@@ -1669,6 +1686,14 @@ struct ft_flip_txn {
 		void *pc0, *pc1;
 	} sa_pend[16];
 	unsigned int sa_npend;
+	/*
+	 * EVERY owner-bearing record, re-asked at commit: was the owner already
+	 * (logically) TOMBSTONED before the commit?  A lock holder that writes
+	 * into a retired node skipped the tombstone check under its lock.
+	 */
+	struct ft_sa_pend sa_tpend[32];
+	unsigned char sa_tpend_v[32];
+	unsigned int sa_ntpend;
 #endif
 };
 
@@ -2039,6 +2064,7 @@ struct ft_flip_txn *ft_flip_txn_create_at(FT_TK_SITE_PARAM struct cds_ft *ft)
 #ifdef FT_DEBUG_STRUCT_ANCHOR
 	t->sa_ft = ft;
 	t->sa_npend = 0;
+	t->sa_ntpend = 0;
 #endif
 	t->pending_pub_slot = NULL;
 	t->pending_dual_slot = NULL;
@@ -2274,6 +2300,7 @@ struct ft_flip_txn *ft_flip_txn_create_on_at(FT_TK_SITE_PARAM
 #ifdef FT_DEBUG_STRUCT_ANCHOR
 	t->sa_ft = ft;
 	t->sa_npend = 0;
+	t->sa_ntpend = 0;
 #endif
 	t->pending_pub_slot = NULL;
 	t->pending_dual_slot = NULL;
@@ -2342,6 +2369,7 @@ struct ft_flip_txn *ft_flip_txn_create_bounded_on_at(FT_TK_SITE_PARAM
 #ifdef FT_DEBUG_STRUCT_ANCHOR
 	t->sa_ft = ft;
 	t->sa_npend = 0;
+	t->sa_ntpend = 0;
 #endif
 	t->pending_pub_slot = NULL;
 	t->pending_dual_slot = NULL;
@@ -5631,6 +5659,11 @@ enum ft_sa_rv {
 	FT_SA_RV_C_NEVER_OK,	/* still not held, and the commit landed */
 	FT_SA_RV_C_NEVER_AB,	/* still not held, commit aborted/failed */
 	FT_SA_RV_C_OVERFLOW,	/* more uncovered records than sa_pend holds */
+	/* every owner-bearing record, owner resolved at commit ENTRY */
+	FT_SA_RV_T_DEAD_HELD_OK,	/* owner TOMBSTONED, record was covered, commit landed */
+	FT_SA_RV_T_DEAD_UNCOV_OK,	/* owner TOMBSTONED, record NOT covered, commit landed */
+	FT_SA_RV_T_DEAD_AB,	/* owner TOMBSTONED, commit aborted/failed */
+	FT_SA_RV_T_OVERFLOW,	/* more records than sa_tpend holds */
 	FT_SA_RV_MWA_BASE,	/* + always-MW class (declared, no owner) */
 	FT_SA_RV_NR = FT_SA_RV_MWA_BASE + FT_TK_MWA_NR,
 };
@@ -5736,7 +5769,8 @@ void ft_sa_rec_report(void)
 		"total", "sw", "WLOCK", "coarse", "miss", "NOOWNER", "HELD",
 		"held_coarse", "SELF_ONLY", "retire_wit", "undated_held",
 		"UNDATED", "NOLOCKS", "UNHELD", "c_LATE", "c_NEVER_OK",
-		"c_NEVER_AB", "c_OVERFLOW" };
+		"c_NEVER_AB", "c_OVERFLOW", "T_DEAD_HELD_OK",
+		"T_DEAD_UNCOV_OK", "t_dead_ab", "t_overflow" };
 	int i, j;
 	struct ft_sa_rec_tls *m;
 	bool any = false;
@@ -5801,6 +5835,13 @@ static void ft_sa_hoist_exit_count(int hoist, int ex)
  * skip-encoded coverer the check cannot resolve exactly.
  */
 static unsigned long ft_sa_cover_exits[3];
+/* DEAD-OWNER WRITE samples printed; owner words asked at a landed commit. */
+static unsigned long ft_sa_tdead_reports, ft_sa_tdead_asked;
+/*
+ * Acquire members whose node reads (logically) TOMBSTONE once the acquire
+ * returned 0: [taken, shared-uncoarsened, shared-coarsened, coarsened-taken].
+ */
+static unsigned long ft_sa_member_dead[4];
 
 static __attribute__((destructor))
 void ft_sa_hoist_report(void)
@@ -5811,6 +5852,12 @@ void ft_sa_hoist_report(void)
 		fprintf(stderr, "FT_SA_COVER checked=%lu retired=%lu skip=%lu\n",
 			ft_sa_cover_exits[0], ft_sa_cover_exits[1],
 			ft_sa_cover_exits[2]);
+	fprintf(stderr, "FT_SA_MEMBER_DEAD taken=%lu shared=%lu "
+		"shared_coarsened=%lu coarsened_taken=%lu | owner words asked "
+		"at a landed commit=%lu%s\n",
+		ft_sa_member_dead[0], ft_sa_member_dead[1],
+		ft_sa_member_dead[2], ft_sa_member_dead[3],
+		ft_sa_tdead_asked, ft_sa_red_dead ? " [RED]" : "");
 
 	for (h = 0; h < FT_SA_HOISTS; h++) {
 		unsigned long *e = ft_sa_hoist_exits[h];
@@ -6037,7 +6084,13 @@ enum urcu_txn_status ft_flip_txn_commit(struct cds_ft *ft,
 	FT_AB_LOST_RESET();
 #ifdef FT_DEBUG_STRUCT_ANCHOR
 	bool sa_held[CAA_ARRAY_SIZE(t->sa_pend)];
+	uintptr_t sa_tstate[CAA_ARRAY_SIZE(t->sa_tpend)];
 	unsigned int sa_i;
+
+	for (sa_i = 0; sa_i < t->sa_ntpend; sa_i++)
+		sa_tstate[sa_i] = (uintptr_t) urcu_txn_resolve((void *)
+			CMM_LOAD_SHARED(t->sa_tpend[sa_i].owner->state),
+			FT_STATE_PROXY);
 
 	for (sa_i = 0; sa_i < t->sa_npend; sa_i++) {
 		struct cds_ft_metadata *sa_anchor;
@@ -6073,6 +6126,37 @@ enum urcu_txn_status ft_flip_txn_commit(struct cds_ft *ft,
 			sa_held[sa_i] ? FT_SA_RV_C_LATE :
 			(st == URCU_TXN_STATUS_OK ? FT_SA_RV_C_NEVER_OK :
 				FT_SA_RV_C_NEVER_AB), false);
+	if (st == URCU_TXN_STATUS_OK && t->sa_ntpend)
+		uatomic_add(&ft_sa_tdead_asked, t->sa_ntpend);
+	for (sa_i = 0; sa_i < t->sa_ntpend; sa_i++) {
+		const struct ft_sa_pend *tp = &t->sa_tpend[sa_i];
+		enum ft_sa_rv tv;
+		bool covered;
+
+		if (!(sa_tstate[sa_i] & FT_STATE_TOMBSTONE))
+			continue;
+		covered = t->sa_tpend_v[sa_i] == FT_SA_RV_HELD ||
+			t->sa_tpend_v[sa_i] == FT_SA_RV_HELD_COARSE ||
+			t->sa_tpend_v[sa_i] == FT_SA_RV_UNDATED_HELD;
+		tv = st != URCU_TXN_STATUS_OK ? FT_SA_RV_T_DEAD_AB :
+			(covered ? FT_SA_RV_T_DEAD_HELD_OK :
+				FT_SA_RV_T_DEAD_UNCOV_OK);
+		ft_sa_rec_count(tp->site, tp->pc0, tp->pc1, tv, false);
+		if (st == URCU_TXN_STATUS_OK &&
+				uatomic_add_return(&ft_sa_tdead_reports, 1) <= 8) {
+			char o0[256], o1[256];
+
+			ft_sa_off(tp->pc0, o0, sizeof(o0));
+			ft_sa_off(tp->pc1, o1, sizeof(o1));
+			fprintf(stderr, "FT SA DEAD-OWNER WRITE site=%s:%d "
+				"pc0=%s pc1=%s owner %p state %#lx verdict %d\n",
+				tp->site ? tp->site->file : "?",
+				tp->site ? tp->site->line : 0, o0, o1,
+				(void *) tp->owner,
+				(unsigned long) sa_tstate[sa_i],
+				(int) t->sa_tpend_v[sa_i]);
+		}
+	}
 #endif
 	FT_TP(txn_commit, (const void *) t->mtxn, (int) st);
 	FT_TK_COUNT_END(t, st == URCU_TXN_STATUS_OK ? FT_TK_OK :
@@ -6184,6 +6268,26 @@ void __ft_flip_txn_record_tag_ctx(struct ft_flip_txn *t,
 
 		ft_sa_rec_count(FT_TK_TXN_SITE(t), pc0, pc1, v,
 			t->structural_sw);
+		/*
+		 * Only verdicts reached THROUGH the owner (the climb read it):
+		 * a WLOCK / COARSE / MISS lane may name a pseudo-owner.
+		 */
+		if (v >= FT_SA_RV_HELD && v <= FT_SA_RV_UNHELD) {
+			if (t->sa_ntpend < CAA_ARRAY_SIZE(t->sa_tpend)) {
+				struct ft_sa_pend *tp =
+					&t->sa_tpend[t->sa_ntpend];
+
+				tp->owner = owner;
+				tp->site = FT_TK_TXN_SITE(t);
+				tp->pc0 = pc0;
+				tp->pc1 = pc1;
+				t->sa_tpend_v[t->sa_ntpend++] =
+					(unsigned char) v;
+			} else {
+				ft_sa_rec_count(FT_TK_TXN_SITE(t), pc0, pc1,
+					FT_SA_RV_T_OVERFLOW, false);
+			}
+		}
 		if (v == FT_SA_RV_NOLOCKS || v == FT_SA_RV_UNHELD ||
 				v == FT_SA_RV_SELF_ONLY) {
 			if (t->sa_npend < CAA_ARRAY_SIZE(t->sa_pend)) {
@@ -7459,7 +7563,7 @@ int ft_dlm_lock(struct ft_flip_txn *t, struct cds_ft_metadata *meta,
 	if (caa_unlikely(s & (FT_STATE_PROXY | FT_STATE_TOMBSTONE)))
 		return -EAGAIN;
 #else
-	if (caa_unlikely(s & (FT_STATE_PROXY | FT_STATE_TOMBSTONE |
+	if (caa_unlikely(s & (FT_STATE_PROXY | FT_SA_DEAD_REFUSE |
 			FT_STATE_LOCK))) {
 #ifdef FT_DEBUG_OP_RETRY_CAP
 		ft_dbg_lock_refuse_state = (unsigned long) s;
@@ -8737,6 +8841,28 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 			ft_acq_contended++;
 		return -EAGAIN;		/* released: nothing acquired */
 	}
+#ifdef FT_DEBUG_STRUCT_ANCHOR
+	/* Does any member the acquire just answered for read DEAD? */
+	for (i = 0; i < nr; i++) {
+		bool co;
+		int arm;
+
+		if (!set[i].nf)
+			continue;
+		if (!((uintptr_t) urcu_txn_resolve((void *) CMM_LOAD_SHARED(
+				set[i].node->state), FT_STATE_PROXY) &
+				FT_STATE_TOMBSTONE))
+			continue;
+		co = set[i].held.lock != set[i].node;
+		arm = set[i].held.shared ? (co ? 2 : 1) : (co ? 3 : 0);
+		if (uatomic_add_return(&ft_sa_member_dead[arm], 1) <= 4)
+			fprintf(stderr, "FT SA DEAD MEMBER at %s:%d arm=%d "
+				"node %p lock %p node_held=%d depth=%u\n",
+				fn, line, arm, (void *) set[i].node,
+				(void *) set[i].held.lock,
+				(int) set[i].held.node_held, set[i].depth);
+	}
+#endif
 	for (i = 0; i < nr; i++) {
 		if (!set[i].nf)
 			continue;

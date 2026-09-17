@@ -266,3 +266,85 @@ lock while a link was still a proxy. It surfaced as a pre-existing SIGSEGV in
 `inv_concurrent_insert_replace_nolist` (28/1500 filtered runs before row 1,
 40/1200 after -- row 1 put a release next to a chain mark in one more commit),
 and it is 0/1200 once the registered lock words settle last (`8c517957`).
+
+---
+
+## 7. Audit: does every fine / exponential lock holder check TOMBSTONE with the lock held? (Mathieu)
+
+### 7.1 Where the check lives
+
+Every DLM take in the tree goes through `ft_dlm_acquire_set_at`:
+- `ft_dlm_lock` has exactly one caller, the acquire loop.
+- `ft_acquire_member` wraps a one-member set.
+- `ft_flip_txn_lock_or_guard_parent_ex` locks through `ft_acquire_member`.
+
+So the check is structural, and it is in the SAME commit that takes the lock:
+
+| what the site's write depends on | where it is checked |
+|---|---|
+| the lock word (per-node: the member itself) | `ft_dlm_lock` refuses `PROXY \| TOMBSTONE \| LOCK` and records `{s -> LOCK\|s}` against that exact `s` |
+| a coarsened member's own word | `ft_held_anchor_sample_node` refuses `PROXY \| TOMBSTONE \| LOCK`; `ft_held_anchor_guard_node` validates the snapshot in the acquire commit |
+| the coverer the anchor was derived from (exponential) | after the commit, resolved (§5.1) |
+| a member deduped onto a word the op already holds | no peer can retire a held word; the op's OWN consumed fence is the designed `TOMBSTONE` dedupe arm |
+
+What the choke point cannot see is a node a site WRITES without naming it as a
+member. That is §1's coverage question, and rows 1-4 closed the measured cases
+(§6).
+
+### 7.2 The measurement
+
+`-DFT_DEBUG_STRUCT_ANCHOR` gains two probes.
+- **DEAD MEMBER.** After `ft_dlm_acquire_set_at` returns 0, a member whose node
+  reads logically TOMBSTONE is counted by arm (taken / shared / shared-coarsened /
+  coarsened-taken) and sampled with the acquire's `fn:line`.
+- **DEAD-OWNER WRITE.** Every owner-bearing record whose verdict was reached
+  through the owner has that owner's state resolved at commit ENTRY, while the
+  op's locks are held. An owner already TOMBSTONE before a commit that lands is
+  a lock holder writing into a retired node. It is counted per (txn site, pc0,
+  pc1) as `T_DEAD_HELD_OK` / `T_DEAD_UNCOV_OK` / `t_dead_ab`, and sampled.
+
+RED CONTROL, `FT_SA_RED_DEAD=1`: the acquire takes and samples TOMBSTONED words.
+
+| leg (probe tree, `bil`) | owner words asked at a landed commit | dead members | dead-owner writes | suite |
+|---|---|---|---|---|
+| ft_inv exponential | 39,899,794 | 0 | 0 | 152/152 |
+| ft_inv per-node | 44,612,485 | 0 | 0 | 152/152 |
+| ft_unit exponential | 5,061,857 | 0 | 0 | 358/358 |
+| ft_unit per-node | 5,105,301 | 0 | 0 | 358/358 |
+| ft_inv exponential, RED | -- | 5 sampled (3 taken, 1 shared, 1 coarsened-taken) | 4 sampled | key loss (`an OK insert is NOT READABLE`), hang in test 27 |
+| ft_inv per-node, RED | -- | 4 sampled (taken) | 5 sampled | key loss (2 reports), hang in test 27 |
+
+The same legs' record verdicts: NOLOCKS 0, UNHELD 0, SELF_ONLY 0 at both
+spacings; HELD 38.3M + held-coarse 1.7M (exponential), HELD 44.7M (per-node).
+
+### 7.3 What the measurement does NOT cover
+
+- **The always-MW lanes carry no owner**, so nothing asks about them: 21.4M
+  (exponential) / 19.8M (per-node) records per ft_inv leg. These are HEAD_BACK,
+  PARENT_WORD/STATE, PSO and DUAL_UNNAMED (§3). They need an owner argument,
+  the same prerequisite §3 names for coverage.
+- **Raw stores outside the record layer** (`ft_hlist_store_*` chain words,
+  `ft_set_parent_excl` HIDDEN) never reach a record.
+- **Bulk ops (WLOCK)** are excluded by design: the FT-wide lock with the point
+  mode flip. The skeptic of §5.1 notes their re-homes carry no state guard, so
+  §5's held-order argument rests on the drain, not the guard.
+- A zero from the suites is not a proof over interleavings the suites never
+  produce.
+
+### 7.4 Raw tombstone reads (the §5.1 lesson)
+
+A raw `state & FT_STATE_TOMBSTONE` can only UNDER-report: a parked record is
+`ptr | FT_STATE_PROXY`, and bit 1 of an aligned pointer is 0. So a raw read is
+sound exactly when its "not tombstoned" branch is followed by a take or a sample
+that refuses PROXY. The coverer check broke that rule: it proceeded on a node it
+never locks. Every other decision read found:
+
+| site | use | verdict |
+|---|---|---|
+| `ft-remove.h` `ft_rm_holder_rehomed`, `_cds_ft_remove_locked` (`ft_flag_tombstoned` x5) | routes the plan (re-descend / retry / miss) before the acquire | conservative: a missed tombstone routes as live, and the acquire refuses the PROXY |
+| `ft-remove.h` `ft_detach_node` climb (`ft_meta_tombstone`) | pre-lock bail of the in-place tier | pre-lock filter; the hoist's acquire re-checks the node it writes |
+| `fractal-trie.c` `_cds_ft_debug_cow_replace_root`, `ft-rekey.h` x3, `ft-remove.h` `ft_detach_node` | scrubbing released marks ("consumed fence keeps answering holds()") | after `ft_meta_lock_release_if_held` waits out PROXY; an under-report scrubs, so the op re-takes and is refused |
+| `ft_glue_held_snap_one` x2 | does a consumed free-list entry answer holds() | under-report answers "not held", so the op takes and is refused |
+| `ft_dlm_acquire_set_at` dedupe | covering hold is LOCK, PROXY or TOMBSTONE | PROXY-inclusive |
+| `ft_flip_txn_record_anchor_release*`, `ft_remove_one_commit`, `ft_glue_tombstone_free_list` | `urcu_txn_load` | resolved through the txn |
+| trace, stats, verify, and the probes themselves | diagnostics | not a decision |
