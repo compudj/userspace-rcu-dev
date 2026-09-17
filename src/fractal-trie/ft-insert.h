@@ -5129,6 +5129,27 @@ restart_replace_attempt:
 						ft_hlist_freeze_chain_prepare(ft, ft_flip_txn_handle(txn),
 							displaced, nr_disp);
 					}
+#ifdef FT_DEBUG_STRUCT_ANCHOR
+					/*
+					 * Owners of the structural edges filed as
+					 * DUAL_UNNAMED: edge 0 lives in @d.pnf, or -- the
+					 * skip variant -- in cn's parent, and edge 1 in cn
+					 * (= @d.pnf).
+					 */
+					if (n_sedge == 1) {
+						ft_sa_lane_ask(txn, &actx,
+							ft_flag_to_metadata(ft, d.pnf), NULL);
+					} else {
+						struct cds_ft_metadata *pm__ =
+							ft_flag_to_metadata(ft, d.pnf);
+
+						ft_sa_lane_ask(txn, &actx,
+							ft_sa_owner_of_parent_word(ft,
+								rcu_dereference(pm__->parent_word)),
+							NULL);
+						ft_sa_lane_ask(txn, &actx, pm__, NULL);
+					}
+#endif
 					if (ft_ord_cell_flip_into(ft, txn, sedges,
 							n_sedge) != 0) {
 						ret = -EAGAIN;

@@ -1880,14 +1880,35 @@ unsigned int ft_meta_parent_slot_offset(const struct cds_ft_metadata *meta)
  * re-root).  Skip the store when the offset is unchanged -- the in-place
  * reserve's same-value republish is the hot case.
  */
-#ifdef FT_DEBUG_DEL_TOMB
+#ifdef FT_DEBUG_PAIR_STORE
+/*
+ * The glue's same-op torn-window ring (ft-helpers.h, ft_dt_glue_check).  Filled
+ * by a bulk op's glue, cleared when its outermost FT-wide writer scope releases,
+ * so an entry never outlives the op that noted it.
+ */
+#define FT_DT_GLUE_RING	128
+static __thread struct {
+	const struct cds_ft_metadata *meta;
+	struct cds_ft_inode_flag *new_parent;
+} ft_dt_glue_ring[FT_DT_GLUE_RING];
+static __thread unsigned int ft_dt_glue_ring_n;
+#endif
+#if defined(FT_DEBUG_DEL_TOMB) || defined(FT_DEBUG_PAIR_STORE)
 /*
  * PROBE: score the rule this setter's header states -- a LIVE, reader-reachable
  * child must not come through here.  Defined next to ft_slot_in_node in
  * ft-helpers.h, which is where the predicates it needs live.
+ * -DFT_DEBUG_PAIR_STORE builds these two probes alone, without the rest of the
+ * FT_DEBUG_DEL_TOMB family.
  */
-static inline
-void ft_dt_pso_store_probe(const struct cds_ft_metadata *meta, unsigned int off);
+static void ft_dt_pso_store_probe(const struct cds_ft_metadata *meta,
+		unsigned int off);
+/* The same question for @incoming_byte, which the up-walk reads beside the parent. */
+static unsigned int ft_dt_ib_store_probe(const struct cds_ft_metadata *meta,
+		unsigned int byte);
+# define FT_DT_IB_STORE(meta, byte)	ft_dt_ib_store_probe((meta), (byte))
+#else
+# define FT_DT_IB_STORE(meta, byte)	(byte)
 #endif
 
 static inline
@@ -1895,7 +1916,7 @@ void ft_meta_parent_slot_offset_set(struct cds_ft_metadata *meta, unsigned int o
 {
 	uintptr_t n = FT_PSO_ENCODE(off);
 
-#ifdef FT_DEBUG_DEL_TOMB
+#if defined(FT_DEBUG_DEL_TOMB) || defined(FT_DEBUG_PAIR_STORE)
 	ft_dt_pso_store_probe(meta, off);
 #endif
 	for (;;) {
@@ -3442,6 +3463,12 @@ void ft_writer_lock_scope_exit(struct cds_ft *ft)
 	if (--ft_wlock_depth != 0)
 		return;			/* nested scope: keep the lock held */
 	ft_wlock_held = NULL;
+#ifdef FT_DEBUG_PAIR_STORE
+	if (ft_dt_glue_ring_n) {
+		memset(ft_dt_glue_ring, 0, sizeof(ft_dt_glue_ring));
+		ft_dt_glue_ring_n = 0;
+	}
+#endif
 #ifdef FT_DEBUG_WLOCK_HOLD
 	ft_wlh_record(ft_wlh_hold, &ft_wlh_hold_n, &ft_wlh_hold_sum,
 			&ft_wlh_hold_max, ft_wlh_now() - ft_wlh_acq_ns);

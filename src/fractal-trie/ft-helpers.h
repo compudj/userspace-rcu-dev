@@ -1,4 +1,4 @@
-#ifdef FT_DEBUG_DEL_TOMB
+#if defined(FT_DEBUG_DEL_TOMB) || defined(FT_DEBUG_PAIR_STORE)
 #include <execinfo.h>
 #endif
 // SPDX-FileCopyrightText: 2012-2026 Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
@@ -2618,8 +2618,8 @@ void ft_set_parent_slot(struct cds_ft_metadata *meta,
 	parent_compressed = parent_compressed || ft_node_skip_compressed(p);
 #endif
 	if (!parent_compressed)
-		meta->incoming_byte = ft_slot_to_byte(
-			&ft_types[ft_node_type(p)], ft_node_ptr(p), slot);
+		meta->incoming_byte = FT_DT_IB_STORE(meta, ft_slot_to_byte(
+			&ft_types[ft_node_type(p)], ft_node_ptr(p), slot));
 }
 
 /*
@@ -2638,6 +2638,61 @@ void ft_set_parent_slot(struct cds_ft_metadata *meta,
  *
  * @ft is needed for the root case (parent == NULL).
  */
+#ifdef FT_DEBUG_PAIR_STORE
+/*
+ * PROBE, SAME-OP TORN WINDOW: ft_glue_record_back_edge stores a LIVE child's
+ * offset PLAIN and only RECORDS its parent word, so until the commit this very
+ * op's non-RYW ft_resolve_parent_slot would pair the OLD parent with the NEW
+ * offset.  Other writers are excluded by the bulk gate; readers never read the
+ * offset.  This ring names the one observer left.
+ */
+/* The ring itself sits in fractal-trie-internal.h: the writer scope clears it. */
+static unsigned long ft_dt_glue_noted, ft_dt_glue_torn_read;
+
+static inline
+void ft_dt_glue_note(const struct cds_ft_metadata *meta,
+		struct cds_ft_inode_flag *new_parent)
+{
+	unsigned int i = ft_dt_glue_ring_n++ % FT_DT_GLUE_RING;
+
+	ft_dt_glue_ring[i].meta = meta;
+	ft_dt_glue_ring[i].new_parent = new_parent;
+	uatomic_inc(&ft_dt_glue_noted);
+}
+
+__attribute__((noinline))
+static void ft_dt_glue_check(const struct cds_ft_metadata *meta,
+		struct cds_ft_inode_flag *parent_seen)
+{
+	unsigned int i;
+
+	for (i = 0; i < FT_DT_GLUE_RING; i++) {
+		if (ft_dt_glue_ring[i].meta != meta)
+			continue;
+		if (ft_node_ptr(ft_parent_node(parent_seen)) ==
+				ft_node_ptr(ft_dt_glue_ring[i].new_parent))
+			return;		/* the window has closed */
+		if (uatomic_add_return(&ft_dt_glue_torn_read, 1) <= 8) {
+			void *bt[24];
+			int nbt = backtrace(bt, 24);
+
+			fprintf(stderr, "FT GLUE-TORN-READ meta=%p seen_parent=%p glue_parent=%p\n",
+				(void *) meta, (void *) parent_seen,
+				(void *) ft_dt_glue_ring[i].new_parent);
+			backtrace_symbols_fd(bt, nbt, 2);
+		}
+		return;
+	}
+}
+
+static void ft_dt_glue_report(void) __attribute__((destructor));
+static void ft_dt_glue_report(void)
+{
+	fprintf(stderr, "FT GLUE-WINDOW noted=%lu torn_read=%lu\n",
+		ft_dt_glue_noted, ft_dt_glue_torn_read);
+}
+#endif
+
 /*
  * ft_resolve_parent_slot: recover a node's parent AND its parent-slot address as
  * a CONSISTENT snapshot, tolerating a mid-commit atomic re-home (Phase 4.3).
@@ -2729,6 +2784,10 @@ struct cds_ft_inode_flag **ft_resolve_parent_slot(
 	 *
 	 * @parent_out is the parent NODE, so a root still yields NULL.
 	 */
+#ifdef FT_DEBUG_PAIR_STORE
+	if (caa_unlikely(ft_dt_glue_ring_n))
+		ft_dt_glue_check(meta, parent);
+#endif
 	if (parent_out)
 		*parent_out = ft_parent_node(parent);
 	if (ft_parent_is_root_position(parent))
@@ -2839,7 +2898,7 @@ bool ft_slot_in_node(struct cds_ft_inode_flag *node_flag,
 			((size_t) 1 << ft_types[ft_node_type(node_flag)].order);
 }
 
-#ifdef FT_DEBUG_DEL_TOMB
+#if defined(FT_DEBUG_DEL_TOMB) || defined(FT_DEBUG_PAIR_STORE)
 /*
  * ft_dt_pso_store_probe: score the rule ft_meta_parent_slot_offset_set's own
  * header states -- the (parent_word, parent_slot_offset) PAIR may be rewritten
@@ -2862,47 +2921,192 @@ bool ft_slot_in_node(struct cds_ft_inode_flag *node_flag,
  * or a pair that is ALREADY incoherent (a different probe's business).  So a hit
  * is a positive answer, never an artefact of the reading.
  */
-static inline
-void ft_dt_pso_store_probe(const struct cds_ft_metadata *meta, unsigned int off)
-{
-	static unsigned long ft_dt_pso_live;
-	struct cds_ft_inode_flag *praw, *parent, *val;
-	struct cds_ft_inode_flag **slot;
-	uintptr_t cur;
-	void *self;
-	void *bt[24];
-	int nbt;
+static unsigned long ft_dt_pso_asked, ft_dt_pso_live, ft_dt_ib_asked,
+	ft_dt_ib_changed, ft_dt_ib_live, ft_dt_pair_undecided, ft_dt_ib_ctl_live;
 
-	praw = (struct cds_ft_inode_flag *) CMM_LOAD_SHARED(meta->parent_word);
-	if (!praw || ft_node_flip_proxy(praw))
-		return;
-	if (ft_parent_is_root_position(praw))
-		return;
-	parent = ft_parent_node(praw);
-	if (!parent)
-		return;
+/*
+ * Is @meta REACHABLE by a reader: does the slot its CURRENT (parent_word,
+ * offset) pair names hold it, and so on up to the root?  One hop is not enough:
+ * a fresh cluster built bottom-up has a fresh parent whose slot holds the fresh
+ * child, and nobody can reach either until the top is published -- the top's
+ * pair names the LIVE parent, whose slot still holds the node being replaced.
+ * False (or undecided) whenever a hop cannot be read cleanly, so a true answer
+ * is a positive one.
+ */
+static inline
+bool ft_dt_live_via_pair(const struct cds_ft_metadata *meta,
+		bool *first_parent_internal)
+{
+	const struct cds_ft_metadata *m = meta;
+	int hops;
+
+	*first_parent_internal = false;
+	for (hops = 0; hops < FT_MAX_DEPTH; hops++) {
+		struct cds_ft_inode_flag *praw, *parent, *val;
+		struct cds_ft_inode_flag **slot;
+		uintptr_t cur;
+
+		praw = (struct cds_ft_inode_flag *) CMM_LOAD_SHARED(m->parent_word);
+		if (!praw || ft_node_flip_proxy(praw))
+			return false;
+		if (ft_parent_is_root_position(praw)) {
+			struct cds_ft *owner;
+			struct cds_ft_inode_flag *rv;
+
+			/*
+			 * Every hop below held its child.  At hop 0 @meta IS
+			 * a root: its offset and byte are unused, so there is
+			 * no question to answer.
+			 */
+			if (!hops)
+				return false;
+			/*
+			 * ☠ A root-position WORD is not a root: a fresh node is
+			 * stamped with its owning trie before anything publishes
+			 * it.  The trie's root slot must hold it, and the trie
+			 * must be one readers can enter.
+			 */
+			owner = ft_parent_trie(praw);
+			if (owner->exclusive)
+				return false;
+			rv = (struct cds_ft_inode_flag *) CMM_LOAD_SHARED(owner->root);
+			return rv && !ft_node_flip_proxy(rv) &&
+				ft_node_ptr(ft_skip_child_ptr(rv)) ==
+				cds_ft_metadata_to_item((struct cds_ft_metadata *) m);
+		}
+		parent = ft_parent_node(praw);
+		if (!parent || ft_node_flip_proxy(parent) ||
+				ft_node_external(parent))
+			return false;
+		if (!hops)
+			*first_parent_internal = !ft_node_compressed(parent)
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+				&& !ft_node_skip_compressed(parent)
+#endif
+				;
+		cur = CMM_LOAD_SHARED(m->parent_slot_offset);
+		if (cur & FT_STATE_PROXY)
+			return false;
+		slot = (struct cds_ft_inode_flag **) ((char *) ft_node_ptr(parent) +
+				FT_PSO_DECODE(cur) * sizeof(void *));
+		if (!ft_slot_in_node(parent, slot))
+			return false;
+		val = (struct cds_ft_inode_flag *) CMM_LOAD_SHARED(*slot);
+		if (!val || ft_node_flip_proxy(val))
+			return false;
+		if (ft_node_ptr(ft_skip_child_ptr(val)) !=
+				cds_ft_metadata_to_item((struct cds_ft_metadata *) m))
+			return false;	/* the slot holds another node: invisible */
+		m = ft_node_compressed(parent) ?
+			cds_ft_item_to_metadata((struct cds_ft_inode *)
+				ft_compressed_node_ptr(parent)) :
+			cds_ft_item_to_metadata(ft_node_ptr(parent));
+	}
+	uatomic_inc(&ft_dt_pair_undecided);
+	return false;
+}
+
+/* Hits per call site: the setter's caller, symbolized offline. */
+#define FT_DT_PAIR_SITES	64
+static struct {
+	const void *ra;
+	int kind;		/* 0 offset, 1 incoming_byte */
+	unsigned long n;
+} ft_dt_pair_sites[FT_DT_PAIR_SITES];
+static pthread_mutex_t ft_dt_pair_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void ft_dt_pair_hit(const void *ra, int kind)
+{
+	int i;
+
+	pthread_mutex_lock(&ft_dt_pair_lock);
+	for (i = 0; i < FT_DT_PAIR_SITES; i++) {
+		if (!ft_dt_pair_sites[i].ra) {
+			ft_dt_pair_sites[i].ra = ra;
+			ft_dt_pair_sites[i].kind = kind;
+		}
+		if (ft_dt_pair_sites[i].ra == ra &&
+				ft_dt_pair_sites[i].kind == kind) {
+			ft_dt_pair_sites[i].n++;
+			break;
+		}
+	}
+	pthread_mutex_unlock(&ft_dt_pair_lock);
+}
+
+__attribute__((noinline))
+static void ft_dt_pso_store_probe(const struct cds_ft_metadata *meta, unsigned int off)
+{
+	uintptr_t cur;
+	bool internal;
+
+	uatomic_inc(&ft_dt_pso_asked);
 	cur = CMM_LOAD_SHARED(meta->parent_slot_offset);
-	if (cur & FT_STATE_PROXY)
-		return;
-	if (FT_PSO_DECODE(cur) == (uintptr_t) off)
+	if (!(cur & FT_STATE_PROXY) && FT_PSO_DECODE(cur) == (uintptr_t) off)
 		return;			/* same-value republish: the pair does not move */
-	slot = (struct cds_ft_inode_flag **) ((char *) ft_node_ptr(parent) +
-			FT_PSO_DECODE(cur) * sizeof(void *));
-	if (!ft_slot_in_node(parent, slot))
-		return;			/* already torn: not this probe's question */
-	val = (struct cds_ft_inode_flag *) CMM_LOAD_SHARED(*slot);
-	if (!val || ft_node_flip_proxy(val))
+	if (!ft_dt_live_via_pair(meta, &internal))
 		return;
-	self = cds_ft_metadata_to_item((struct cds_ft_metadata *) meta);
-	if (ft_node_ptr(ft_skip_child_ptr(val)) != self)
-		return;			/* the slot holds someone else: @meta is invisible */
-	if (uatomic_add_return(&ft_dt_pso_live, 1) > 12)
-		return;
-	nbt = backtrace(bt, 24);
-	fprintf(stderr, "FT PSO-LIVE-REPARENT meta=%p self=%p parent=%p slot=%p old_off=%u new_off=%u\n",
-		(void *) meta, self, (void *) parent, (void *) slot,
-		(unsigned int) FT_PSO_DECODE(cur), off);
-	backtrace_symbols_fd(bt, nbt, 2);
+	uatomic_inc(&ft_dt_pso_live);
+	ft_dt_pair_hit(__builtin_return_address(0), 0);
+}
+
+/*
+ * ft_dt_ib_store_probe: a PLAIN store of @incoming_byte into a REACHABLE node,
+ * CHANGING the byte.  The up-walk loads the parent and this byte separately, and
+ * nothing parks this field.  Returns @byte.
+ */
+__attribute__((noinline))
+static unsigned int ft_dt_ib_store_probe(const struct cds_ft_metadata *meta,
+		unsigned int byte)
+{
+	bool internal;
+
+	uatomic_inc(&ft_dt_ib_asked);
+	if (meta->incoming_byte == byte) {
+		/*
+		 * POSITIVE CONTROL for the climb: a same-value store is often a
+		 * live node's republish, so a climb that can never answer
+		 * "reachable" reads 0 here too.
+		 */
+		if (ft_dt_live_via_pair(meta, &internal) && internal)
+			uatomic_inc(&ft_dt_ib_ctl_live);
+		return byte;		/* same value: nothing a reader can see */
+	}
+	uatomic_inc(&ft_dt_ib_changed);
+	/*
+	 * Only a node reached through an INTERNAL parent: a compressed parent's
+	 * child has no edge byte of its own, and readers skip it there.
+	 */
+	if (!ft_dt_live_via_pair(meta, &internal) || !internal)
+		return byte;
+	uatomic_inc(&ft_dt_ib_live);
+	ft_dt_pair_hit(__builtin_return_address(0), 1);
+	/* WHO: the setter's caller is out of reach of one return address. */
+	if (uatomic_read(&ft_dt_ib_live) <= 8) {
+		void *bt[24];
+		int nbt = backtrace(bt, 24);
+
+		fprintf(stderr, "FT PAIR-STORE-IB meta=%p byte %u -> %u\n",
+			(void *) meta, (unsigned int) meta->incoming_byte, byte);
+		backtrace_symbols_fd(bt, nbt, 2);
+	}
+	return byte;
+}
+
+static void ft_dt_pair_report(void) __attribute__((destructor));
+static void ft_dt_pair_report(void)
+{
+	int i;
+
+	fprintf(stderr, "FT PAIR-STORE offset: asked=%lu LIVE=%lu | incoming_byte: "
+		"asked=%lu changed=%lu LIVE=%lu | undecided=%lu | control: same-value "
+		"ib reachable=%lu (ra base: cds_ft_create=%p)\n", ft_dt_pso_asked,
+		ft_dt_pso_live, ft_dt_ib_asked, ft_dt_ib_changed, ft_dt_ib_live,
+		ft_dt_pair_undecided, ft_dt_ib_ctl_live, (void *) &cds_ft_create);
+	for (i = 0; i < FT_DT_PAIR_SITES && ft_dt_pair_sites[i].ra; i++)
+		fprintf(stderr, "FT PAIR-STORE-SITE kind=%s ra=%p n=%lu\n",
+			ft_dt_pair_sites[i].kind ? "incoming_byte" : "offset",
+			ft_dt_pair_sites[i].ra, ft_dt_pair_sites[i].n);
 }
 #endif
 
@@ -4157,9 +4361,9 @@ void ft_set_parent_at(const char *fn, int line, struct cds_ft *ft,
 				&& !ft_node_skip_compressed(parent_nf)
 #endif
 		   )
-			meta->incoming_byte = ft_slot_to_byte(
+			meta->incoming_byte = FT_DT_IB_STORE(meta, ft_slot_to_byte(
 				&ft_types[ft_node_type(parent_nf)],
-				ft_node_ptr(parent_nf), slot);
+				ft_node_ptr(parent_nf), slot));
 		ft_ch_audit_parent_at(fn, line, ft, meta, parent_nf, excl);
 		rcu_assign_pointer(meta->parent_word, stored_parent);
 		ft_set_parent_slot(meta, parent_nf, slot);

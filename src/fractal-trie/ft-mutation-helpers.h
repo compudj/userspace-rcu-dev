@@ -5698,6 +5698,20 @@ enum ft_sa_rv {
 	FT_SA_RV_P_PARENT_SHARES,	/* the node's parent has anchor A too (P2) */
 	FT_SA_RV_P_PARENT_DIFFERS,	/* ... it does not (P2 broken) */
 	FT_SA_RV_P_WORD_LOCKED,	/* the node's own word carries LOCK right now */
+	/*
+	 * An ALWAYS-MW record of an unfinished lane (head back edge, parent_word,
+	 * parent_slot_offset, insert_replace's structural edges), asked against
+	 * the OWNER the lane should be locked by (ft_sa_lane_ask).
+	 */
+	FT_SA_RV_O_ASKED,
+	FT_SA_RV_O_NOOWNER,	/* no owner to ask (root position, undecodable) */
+	FT_SA_RV_O_WLOCK,	/* bulk: FT-wide writer lock */
+	FT_SA_RV_O_COARSE,	/* coarse or exclusive trie */
+	FT_SA_RV_O_MISS,	/* acquire_miss: the commit discards */
+	FT_SA_RV_O_HELD,	/* the owner's structural anchor is held */
+	FT_SA_RV_O_HELD_COARSE,
+	FT_SA_RV_O_UNCOVERED,	/* SELF_ONLY / UNDATED / NOLOCKS / UNHELD */
+	FT_SA_RV_O_CHILD_ONLY,	/* uncovered, but the op holds the CHILD's anchor */
 	FT_SA_RV_MWA_BASE,	/* + always-MW class (declared, no owner) */
 	FT_SA_RV_NR = FT_SA_RV_MWA_BASE + FT_TK_MWA_NR,
 };
@@ -5807,7 +5821,9 @@ void ft_sa_rec_report(void)
 		"T_DEAD_UNCOV_OK", "t_dead_ab", "t_overflow", "p_asked",
 		"P_UNDATED", "p_anchor_held", "P_ANCHOR_NOT_HELD",
 		"P_SELF_ANCHORED", "p_parent_shares", "P_PARENT_DIFFERS",
-		"P_WORD_LOCKED" };
+		"P_WORD_LOCKED", "o_asked", "O_NOOWNER", "o_wlock", "o_coarse",
+		"o_miss", "o_held", "o_held_coarse", "O_UNCOVERED",
+		"O_CHILD_ONLY" };
 	int i, j;
 	struct ft_sa_rec_tls *m;
 	bool any = false;
@@ -5925,6 +5941,80 @@ static bool ft_sa_witness(const struct ft_flip_txn *t,
  * @lock is the word the op's acquire took for @node (NULL: ask the witness).
  */
 static unsigned long ft_sa_props_reports;
+static unsigned long ft_sa_lane_reports;
+static enum ft_sa_rv ft_sa_rec_verdict(const struct cds_ft *ft,
+		const struct ft_flip_txn *t, const struct ft_lock_ctx *ctx,
+		struct cds_ft_metadata *owner, void **slot, void *new_ptr);
+
+/*
+ * THE UNFINISHED LANES' LOCK-SET QUESTION.  Their records name no owner, so the
+ * record-time inventory counts them and cannot score them.  The caller names
+ * the owner the lane SHOULD be locked by (register, §8.2: a back edge by its
+ * holder / parent, a structural slot by the node containing it) and this asks
+ * the same question every owner-bearing record is asked.  @child, when given,
+ * separates "uncovered" from "covered only because the op holds the child".
+ */
+__attribute__((noinline))
+static void ft_sa_lane_ask(const struct ft_flip_txn *t,
+		const struct ft_lock_ctx *ctx,
+		struct cds_ft_metadata *owner, struct cds_ft_metadata *child)
+{
+	const struct cds_ft *ft = t ? t->sa_ft : NULL;
+	const struct ft_tk_site *site = t ? FT_TK_TXN_SITE(t) : NULL;
+	void *pc0 = __builtin_return_address(0);
+	void *pc1 = FT_SA_CALLER_PC();
+	enum ft_sa_rv v, o;
+	struct cds_ft_metadata *ca;
+
+	if (!ft || FT_TK_TXN_IS_TAKE(t))
+		return;
+	ft_sa_rec_count(site, pc0, pc1, FT_SA_RV_O_ASKED, false);
+	v = ft_sa_rec_verdict(ft, t, ctx, owner, NULL, NULL);
+	switch (v) {
+	case FT_SA_RV_NOOWNER:	o = FT_SA_RV_O_NOOWNER; break;
+	case FT_SA_RV_WLOCK:	o = FT_SA_RV_O_WLOCK; break;
+	case FT_SA_RV_COARSE:	o = FT_SA_RV_O_COARSE; break;
+	case FT_SA_RV_MISS:	o = FT_SA_RV_O_MISS; break;
+	case FT_SA_RV_HELD:	o = FT_SA_RV_O_HELD; break;
+	case FT_SA_RV_HELD_COARSE: o = FT_SA_RV_O_HELD_COARSE; break;
+	default:		o = FT_SA_RV_O_UNCOVERED; break;
+	}
+	ft_sa_rec_count(site, pc0, pc1, o, false);
+	if (o != FT_SA_RV_O_UNCOVERED)
+		return;
+	if (child && ft_sa_struct_anchor(ft, child, &ca) &&
+			ft_sa_witness(t, ctx, ca)) {
+		ft_sa_rec_count(site, pc0, pc1, FT_SA_RV_O_CHILD_ONLY, false);
+		return;
+	}
+	if (uatomic_add_return(&ft_sa_lane_reports, 1) <= 8) {
+		char o0[256], o1[256];
+
+		ft_sa_off(pc0, o0, sizeof(o0));
+		ft_sa_off(pc1, o1, sizeof(o1));
+		fprintf(stderr, "FT SA LANE UNCOVERED verdict %d site=%s:%d pc0=%s "
+			"pc1=%s owner %p child %p\n", (int) v,
+			site ? site->file : "?", site ? site->line : 0, o0, o1,
+			(void *) owner, (void *) child);
+	}
+}
+
+/* The node a parent word names, or NULL (root position, parked, external). */
+static inline
+struct cds_ft_metadata *ft_sa_owner_of_parent_word(const struct cds_ft *ft,
+		void *pw)
+{
+	struct cds_ft_inode_flag *raw = (struct cds_ft_inode_flag *) pw;
+	struct cds_ft_inode_flag *p;
+
+	if (!ft || !raw || ft_node_flip_proxy(raw) ||
+			ft_parent_is_root_position(raw))
+		return NULL;
+	p = ft_parent_node(ft_parent_prefix_strip(raw));
+	if (!p || ft_node_flip_proxy(p) || ft_node_external(p))
+		return NULL;
+	return ft_flag_to_metadata(ft, p);
+}
 
 __attribute__((noinline))
 static void ft_sa_anchor_props(const struct ft_flip_txn *t,
@@ -7189,6 +7279,27 @@ void ft_flip_txn_record_head_back_edge(struct ft_flip_txn *t, void **slot,
 		void *old_ptr, void *new_ptr FT_BE_SITE_PARAM)
 {
 	FT_BACK_EDGE_CLAIM(t, old_ptr, new_ptr);
+#ifdef FT_DEBUG_STRUCT_ANCHOR
+	/* Owner: the chain HOLDER the old back edge names (register, head row). */
+	{
+		void *ow__ = old_ptr;
+		const struct ft_lock_ctx *lc__ = NULL;
+
+# ifdef FT_DEBUG_BACK_EDGE_OWNER
+		/*
+		 * The site's own lock context: some holds live only in its
+		 * extra[] frames.  And compaction's cell relocation rewrites
+		 * head->prev, whose value is the CELL, not a parent word.
+		 */
+		lc__ = dbg_be_ctx;
+		if (dbg_be_site == FT_BE_COMPACT_CELL && ow__ &&
+				!ft_node_flip_proxy(ow__))
+			ow__ = ft_ord_cell_ptr(ow__)->parent;
+# endif
+		ft_sa_lane_ask(t, lc__, ft_sa_owner_of_parent_word(t->sa_ft,
+			ow__), NULL);
+	}
+#endif
 	ft_flip_txn_record_tag_mw(t, slot, old_ptr, new_ptr,
 		FT_FLIP_PROXY_TAG FT_TK_MWA(FT_TK_MWA_HEAD_BACK));
 }
@@ -16173,10 +16284,16 @@ void ft_flip_txn_record_parent_word(const struct cds_ft *ft,
 	if (child_held)
 		ft_flip_txn_record_reserved(txn, /*owner=*/ meta,
 			(void **) &meta->parent_word, old_pw, new_pw);
-	else
+	else {
+#ifdef FT_DEBUG_STRUCT_ANCHOR
+		/* Owner: the parent being replaced (§8.2). */
+		ft_sa_lane_ask(txn, NULL, ft_sa_owner_of_parent_word(ft, old_pw),
+			meta);
+#endif
 		ft_flip_txn_record_tag_mw(txn, (void **) &meta->parent_word,
 			old_pw, new_pw, FT_FLIP_PROXY_TAG
 			FT_TK_MWA(FT_TK_MWA_PARENT_WORD));
+	}
 }
 
 /*
@@ -16202,6 +16319,17 @@ void ft_flip_txn_record_parent_word(const struct cds_ft *ft,
  * only (the converted phase): an external head's parent is its prev directly.
  * Records cannot fail -- the caller reserved @txn to the bounded cluster size
  * up front.
+ *
+ * ☑ "UNOBSERVABLE" MEASURED FOR THE OFFSET (lock-set inventory §10.2).  The
+ * plain store DOES land on reachable children, ~36k-56k per ft_inv leg, so
+ * the claim rests on its observers, not on invisibility:
+ *   - readers never read the offset;
+ *   - other writers are shut out by the bulk gate, which is a DEPENDENCY on the
+ *     FT-wide lock (see FT-SLOT-3 below);
+ *   - this op never resolves the pair non-RYW before its commit: 0 of ~60k-73k
+ *     windows, red 67,880/67,880.
+ * The byte half holds as written: 0 changed bytes on a reachable node, with a
+ * positive control of ~1M same-value stores.
  *
  * ★ WHICH ARM the published-node case reaches matters, and this comment used to
  * leave it open: it is the METADATA arms, and those are exactly the ones that
@@ -16251,6 +16379,12 @@ void ft_glue_record_back_edge(struct cds_ft *ft, struct ft_flip_txn *txn,
 			cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
 
 		ft_set_parent_slot(cn_meta, parent_nf, slot);
+#ifdef FT_DEBUG_PAIR_STORE
+		ft_dt_glue_note(cn_meta, parent_nf);
+# ifdef FT_DT_GLUE_RED
+		(void) ft_resolve_parent_slot(cn_meta, ft, NULL);	/* RED: must count */
+# endif
+#endif
 		ft_flip_txn_record_parent_word(ft, txn, cn_meta, parent_nf,
 		/*child_held=*/ true);
 		return;
@@ -16262,6 +16396,12 @@ void ft_glue_record_back_edge(struct cds_ft *ft, struct ft_flip_txn *txn,
 			cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
 
 		ft_set_parent_slot(cn_meta, parent_nf, slot);
+#ifdef FT_DEBUG_PAIR_STORE
+		ft_dt_glue_note(cn_meta, parent_nf);
+# ifdef FT_DT_GLUE_RED
+		(void) ft_resolve_parent_slot(cn_meta, ft, NULL);	/* RED: must count */
+# endif
+#endif
 		ft_flip_txn_record_parent_word(ft, txn, cn_meta, parent_nf,
 		/*child_held=*/ true);
 		return;
@@ -16312,10 +16452,16 @@ void ft_glue_record_back_edge(struct cds_ft *ft, struct ft_flip_txn *txn,
 				&& !ft_node_skip_compressed(parent_nf)
 #endif
 		   )
-			meta->incoming_byte = ft_slot_to_byte(
+			meta->incoming_byte = FT_DT_IB_STORE(meta, ft_slot_to_byte(
 				&ft_types[ft_node_type(parent_nf)],
-				ft_node_ptr(parent_nf), slot);
+				ft_node_ptr(parent_nf), slot));
 		ft_set_parent_slot(meta, parent_nf, slot);
+#ifdef FT_DEBUG_PAIR_STORE
+		ft_dt_glue_note(meta, parent_nf);
+# ifdef FT_DT_GLUE_RED
+		(void) ft_resolve_parent_slot(meta, ft, NULL);	/* RED: must count */
+# endif
+#endif
 		ft_flip_txn_record_parent_word(ft, txn, meta, parent_nf,
 		/*child_held=*/ true);
 	}
@@ -16446,9 +16592,9 @@ void ft_reparent_record_meta(struct cds_ft *ft, struct ft_flip_txn *txn,
 				&& !ft_node_skip_compressed(parent_nf)
 #endif
 		   )
-			meta->incoming_byte = ft_slot_to_byte(
+			meta->incoming_byte = FT_DT_IB_STORE(meta, ft_slot_to_byte(
 				&ft_types[ft_node_type(parent_nf)],
-				ft_node_ptr(parent_nf), slot);
+				ft_node_ptr(parent_nf), slot));
 	}
 	/*
 	 * @parent_nf stays the parent NODE above -- the offset and incoming-byte
@@ -16472,6 +16618,11 @@ void ft_reparent_record_meta(struct cds_ft *ft, struct ft_flip_txn *txn,
 	 * assert, on the DEFAULT per-node granularity, from
 	 * ft_chain_compress_fused's back-edge fold.
 	 */
+#ifdef FT_DEBUG_STRUCT_ANCHOR
+	struct cds_ft_metadata *sa_pso_owner = ft_sa_owner_of_parent_word(ft,
+		urcu_txn_load(txn->mtxn, (void **) &meta->parent_word,
+			FT_FLIP_PROXY_TAG));
+#endif
 	ft_flip_txn_record_parent_word(ft, txn, meta, parent_nf,
 		child_marked || held_earlier);
 	/*
@@ -16576,12 +16727,16 @@ void ft_reparent_record_meta(struct cds_ft *ft, struct ft_flip_txn *txn,
 				(void **) &meta->parent_slot_offset,
 				(void *) old_pso, (void *) new_pso,
 				FT_STATE_PROXY);
-		else
+		else {
+#ifdef FT_DEBUG_STRUCT_ANCHOR
+			ft_sa_lane_ask(txn, hold_ctx, sa_pso_owner, meta);
+#endif
 			ft_flip_txn_record_tag_mw(txn,
 				(void **) &meta->parent_slot_offset,
 				(void *) old_pso, (void *) new_pso,
 				FT_STATE_PROXY
 				FT_TK_MWA(FT_TK_MWA_PSO));
+		}
 	}
 }
 

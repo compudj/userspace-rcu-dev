@@ -590,3 +590,73 @@ compiled out:
 No starvation signal. Refusals move by run-to-run amounts in both directions, and
 the longest streak is not worse. Only about 2.5% of splits have an internal child
 to lock.
+
+## 10. The unfinished lanes' owners, and the (parent, offset) pair stored plain (2026-09-17)
+
+### 10.1 Who should lock each unfinished lane, and is it held
+
+`-DFT_DEBUG_STRUCT_ANCHOR` now asks each unfinished always-MW lane (`ft_sa_lane_ask`)
+against the owner the register names for it:
+- a head back edge: the chain holder that its old value names (compaction's cell
+  relocation: `cell->parent`);
+- `parent_word` and `parent_slot_offset`: the parent being replaced;
+- `_cds_ft_insert_replace`'s structural edges: the node that contains the slot.
+
+It gives the same verdicts as an owner-bearing record, plus `O_CHILD_ONLY`: not
+covered by the owner, but the op holds the child's anchor. A head back edge is
+asked with the site's own lock context (`-DFT_DEBUG_BACK_EDGE_OWNER`). Some holds
+live only in the context's `extra[]` frames, and without it the probe reads
+93k-310k uncovered records that are in fact held.
+
+| ft_inv | asked | uncovered | child-only |
+|---|---|---|---|
+| per-node | 8,666,129 | **0** | 0 |
+| exponential | 8,381,861 | **4** (1 recompact head back edge, 2 fuse `parent_word`, 1 insert_replace) | 1 |
+
+ft_unit: 0 uncovered at both spacings. ☐ The 4 need a commit-time re-ask (a stale
+plan, or a gap). ☠ The DUAL_UNNAMED hot path is NOT asked: the hook sits on a cold
+`_cds_ft_insert_replace` flip (asked twice per leg). The ~460k records go through
+`ft_pub_rec_sedges` → `ft_ord_cell_flip_into`, where `rec->owner` is NULL.
+
+### 10.2 The pair stored plain on a reachable node
+
+`ft_resolve_parent_slot` treats `parent_word` as a sequence word for the offset.
+So the precondition is: every offset change goes through a parked `parent_word`,
+or the node is invisible. `incoming_byte` is read by the key up-walk beside the
+parent, with nothing parking it.
+
+`-DFT_DEBUG_PAIR_STORE` asks at every store that CHANGES the offset or the byte:
+is the node reachable through its current pair, all the way up to the trie's
+root slot? Hits are counted per call site.
+
+☠ Two earlier versions of the climb read false positives:
+- one hop: a fresh cluster built bottom-up holds its own children;
+- a root-position parent word taken as the root: a fresh node is stamped with its
+  owning trie before it is published. The climb now requires `owner->root` to hold
+  the top, and the owner not to be exclusive.
+
+That second hole alone made up the whole incoming_byte "producer": 295 per ft_inv
+leg, from the merge build and `ft_node_recompact`'s `FT_EXCL_HIDDEN` arm.
+
+| ft_inv, per-node / exponential | result |
+|---|---|
+| incoming_byte changed on a reachable node | **0** / **0** |
+| control: same-value byte stores on reachable nodes | 1,050,066 (per-node) -- the climb answers yes |
+| offset changed on a reachable node | 36,335-56,246 / 42,491-50,947, **one site**: `ft_glue_record_back_edge` → `ft_set_parent_slot` |
+
+ft_unit: 0 and 0.
+
+The glue site stores a live child's offset plain before the commit parks its
+`parent_word`. It is unobservable, for three reasons:
+- **readers** never read the offset: the up-walk and `ft_skip_to_compressed` read
+  `parent_word` only. The one iterator use is an `FT_DEBUG_PARENT_VIOLATION` dump;
+- **other writers** are excluded: every caller is a bulk op, whose gate is
+  published and followed by a grace period, and point ops and compaction steps
+  then take the FT-wide lock (§9). ☠ So this is a DEPENDENCY on the FT-wide lock,
+  the same one `ft_glue_record_back_edge`'s FT-SLOT-3 note names;
+- **the op itself**: a per-thread ring notes each glue store and checks it in
+  `ft_resolve_parent_slot`, cleared when the outermost FT-wide scope releases.
+  0 torn reads of 59,433 (per-node) / 73,167 (exponential) noted.
+  RED `-DFT_DT_GLUE_RED` resolves right after the store: 67,880 of 67,880.
+  `ft_txn_parent_slot_at` reads both words through the txn, so it is coherent by
+  construction.
