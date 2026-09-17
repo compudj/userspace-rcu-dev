@@ -819,6 +819,19 @@ struct cds_ft_inode_flag *ft_anchor_coverer(const struct cds_ft *ft,
  */
 struct ft_held_anchor {
 	struct cds_ft_metadata *lock;
+	/*
+	 * THE MEMBER this lock was taken FOR, which is not @lock once a coarse
+	 * spacing maps it onto an ANCHOR ANCESTOR.  Carried because only the
+	 * acquire knows it: the anchor is resolved from the op's DESCENT
+	 * (ft_anchor_meta), and a record helper has no descent to redo it with.
+	 * That is why ft_flip_txn_owns was exact at per-node and conservative
+	 * above it -- it compared the registry's anchor words against a node
+	 * whose anchor it could not compute -- and why the per-op SW arm had to
+	 * refuse every spacing but per-node (ft_txn_per_op_spacing_ok).
+	 * Remembering the member answers the same question exactly, with no
+	 * arithmetic: "this op took a lock FOR this node".
+	 */
+	struct cds_ft_metadata *member;
 	uintptr_t lock_snap;
 	uintptr_t node_snap;
 	/*
@@ -923,6 +936,7 @@ void ft_held_anchor_set(struct ft_held_anchor *h, struct cds_ft_metadata *lock,
 		uintptr_t node_snap)
 {
 	h->lock = lock;
+	h->member = (struct cds_ft_metadata *) node;
 	h->lock_snap = lock_snap;
 	h->node_snap = lock == node ? lock_snap : node_snap;
 	h->shared = false;
@@ -1158,32 +1172,36 @@ struct ft_lock_ctx;
 static inline bool ft_lock_ctx_holds(const struct ft_lock_ctx *ctx,
 		const struct cds_ft_metadata *meta, uintptr_t *snap,
 		bool *ratified);
+/* The OWNERSHIP form (ft_held_set_covers): also matches a lock-set MEMBER. */
+static inline bool ft_lock_ctx_covers(const struct ft_lock_ctx *ctx,
+		const struct cds_ft_metadata *meta);
 
 static inline
 bool ft_owner_ctx_holds(const struct ft_lock_ctx *ctx,
 		const struct cds_ft_metadata *owner)
 {
-	uintptr_t snap;
-	bool ratified;
-
 	if (!ctx || !owner)
 		return false;
-	return ft_lock_ctx_holds(ctx, owner, &snap, &ratified);
+	return ft_lock_ctx_covers(ctx, owner);
 }
 
 
 #if defined(DEBUG_RCU) || defined(CONFIG_RCU_DEBUG)
 /*
- * @dbg_txn_ft is carried ONLY for the wide-exclusion arm below: the assert must
- * ask whether the op holds THIS trie's FT-wide writer lock, and "the thread
- * holds some FT-wide lock" would be a looser claim than it is making.
+ * The wide-exclusion arm below asks whether the op holds THIS trie's FT-wide
+ * writer lock (@t->ft), because "the thread holds some FT-wide lock" would be
+ * a looser claim than the assert is making.
  */
-# define FT_OWNER_ASSERT_TXN_FIELD	bool dbg_arm_per_op;		\
-					struct cds_ft *dbg_txn_ft;
+# define FT_OWNER_ASSERT_TXN_FIELD	bool dbg_arm_per_op;
 # define FT_OWNER_ASSERT_INIT(t)					\
-	do { (t)->dbg_arm_per_op = false; (t)->dbg_txn_ft = NULL; } while (0)
-# define FT_OWNER_ASSERT_SET_FT(t, ft_)					\
-	do { (t)->dbg_txn_ft = (ft_); } while (0)
+	do { (t)->dbg_arm_per_op = false; } while (0)
+/*
+ * ☞ THE TRIE IS @t->ft NOW, a production field every creator sets, so this
+ * hook is gone: the debug copy could be read NULL at a record (seen in a core
+ * from inv_concurrent_remove_all_prefix), which silently disabled the
+ * FT-wide-lock term of the asserts below for that txn.
+ */
+# define FT_OWNER_ASSERT_SET_FT(t, ft_)	do { (void) (ft_); } while (0)
 # define FT_OWNER_ASSERT_SET_PER_OP(t)					\
 	do { (t)->dbg_arm_per_op = true; } while (0)
 /*
@@ -1214,8 +1232,8 @@ bool ft_owner_ctx_holds(const struct ft_lock_ctx *ctx,
 # define FT_OWNER_ASSERT_OWNED(t, owner)				\
 	urcu_assert_debug(!(t)->dbg_arm_per_op || !(t)->nr_locks ||	\
 			ft_flip_txn_owns((t), (owner)) ||		\
-			((t)->dbg_txn_ft &&				\
-			 ft_wlock_held == (t)->dbg_txn_ft))
+			((t)->ft &&					\
+			 ft_wlock_held == (t)->ft))
 /*
  * THE SAME QUESTION, ASKED OF A RECORD THAT CARRIES ITS OWN WITNESS.
  *
@@ -1232,8 +1250,7 @@ bool ft_owner_ctx_holds(const struct ft_lock_ctx *ctx,
 # define FT_OWNER_ASSERT_OWNED_CTX(t, ctx, owner, slot, new_ptr)	\
 	urcu_assert_debug(!(t)->dbg_arm_per_op || !(t)->nr_locks ||	\
 			ft_flip_txn_owns((t), (owner)) ||		\
-			((t)->dbg_txn_ft &&				\
-			 ft_wlock_held == (t)->dbg_txn_ft) ||		\
+			((t)->ft && ft_wlock_held == (t)->ft) ||	\
 			ft_owner_ctx_holds((ctx), (owner)) ||		\
 			ft_owner_retire_witnessed((ctx), (owner),	\
 					(slot), (new_ptr)))
@@ -1421,6 +1438,17 @@ struct ft_flip_txn {
 	 */
 	struct ft_flip_txn_lock {
 		struct cds_ft_metadata *meta;
+		/*
+		 * The lock-set MEMBER this entry's word was taken for, when the
+		 * acquire knew it (ft_held_anchor's @member).  Above per-node
+		 * @meta is an ANCHOR ANCESTOR of it, so the registry could not
+		 * answer "is this node's word excluded by something I hold?"
+		 * without recomputing the anchor -- which needs the op's
+		 * descent.  NULL where the caller registers a word on its own
+		 * account (a root, a holder, a glue fence), and then @meta is
+		 * the node and the exact match below answers.
+		 */
+		struct cds_ft_metadata *member;
 		uintptr_t snap;
 		/*
 		 * THE SILENCER of the entry that HANDED this word's release to
@@ -1482,6 +1510,21 @@ struct ft_flip_txn {
 	 * of the big members: everything above stays in the first cache lines.
 	 */
 	struct ft_flip_txn_lock locks_floor[FT_FLIP_TXN_FLOOR_LOCKS];
+	/*
+	 * LOCK-SET MEMBERS THIS OP ACQUIRED WHOSE WORD IT REGISTERED UNDER
+	 * ANOTHER NAME, or not at all: a coarse spacing maps several members
+	 * onto ONE anchor word, and the second and later ones dedupe -- they
+	 * owe no release and no terminal, so nothing files them, and the
+	 * registry could not answer "excluded by something I hold?" for them.
+	 * Filed by the acquire itself (ft_dlm_acquire_set_at), which is the one
+	 * place that knows both the member and the word it resolved to.
+	 *
+	 * ☞ NOT a second registry: these entries own NO mark and NO release, so
+	 * no release, drop or scrub loop walks them.  They answer holds() and
+	 * nothing else, and they die with the txn.
+	 */
+	struct cds_ft_metadata *covered[FT_FLIP_TXN_FLOOR_LOCKS];
+	unsigned int nr_covered;
 	/*
 	 * Set when a per-node lock acquire MISSED (see
 	 * ft_flip_txn_lock_or_guard_parent).  The op then structurally writes a
@@ -1660,6 +1703,28 @@ struct ft_flip_txn {
 	 * worth re-asking per record (-DFT_SW_REQUIRES_OWNER).
 	 */
 	bool sw_per_op;
+	/*
+	 * The trie this txn commits into, for the ROOT-ONLY ownership answer
+	 * below (ft_flip_txn_owns): at that spacing every node's anchor IS the
+	 * trie's root, which needs no descent to resolve -- unlike exponential,
+	 * where the anchor comes from the op's descent and a record helper has
+	 * none.  A cross-trie op names one side; the other is covered by the
+	 * FT-wide lock, which the assert tests separately.
+	 */
+	const struct cds_ft *ft;
+	/*
+	 * A WHOLE-BODY SW WRITER (ft_flip_txn_arm_structural: the rekey writer,
+	 * the root-COW driver).  Its exclusion is the writer's own body, not the
+	 * lock registry, so the per-record ownership gate in
+	 * __ft_flip_txn_record_tag_ctx does not apply to it: its edges sit on
+	 * state words the op ITSELF fenced, and an MW edge expecting live_state
+	 * reads its own mark and aborts forever (measured as a livelock, twice
+	 * in that function's header, and again at ft_unit
+	 * test_rekey_collapse_one_slot_two_kinds while this flag was missing --
+	 * such a writer takes the ADDITIVE per-op arm too, which would
+	 * otherwise re-enable the gate).
+	 */
+	bool sw_body;
 	/*
 	 * --enable-rcu-debug only: the NAMED trie's root slot, for the
 	 * assertion in ft_flip_txn_record_tag that no generic structural
@@ -2089,6 +2154,9 @@ struct ft_flip_txn *ft_flip_txn_create_at(FT_TK_SITE_PARAM struct cds_ft *ft)
 	t->nr_locks = 0;
 	t->locks = t->locks_floor;
 	t->cap_locks = FT_FLIP_TXN_FLOOR_LOCKS;
+	t->nr_covered = 0;
+	t->sw_body = false;
+	t->ft = ft;
 	t->acquire_miss = false;
 	t->acquire_enomem = false;
 	FT_OWNER_ASSERT_SET_FT(t, ft);
@@ -2325,6 +2393,9 @@ struct ft_flip_txn *ft_flip_txn_create_on_at(FT_TK_SITE_PARAM
 	t->nr_locks = 0;
 	t->locks = t->locks_floor;
 	t->cap_locks = FT_FLIP_TXN_FLOOR_LOCKS;
+	t->nr_covered = 0;
+	t->sw_body = false;
+	t->ft = ft;
 	t->acquire_miss = false;
 	t->acquire_enomem = false;
 	FT_OWNER_ASSERT_SET_FT(t, ft);
@@ -2394,6 +2465,9 @@ struct ft_flip_txn *ft_flip_txn_create_bounded_on_at(FT_TK_SITE_PARAM
 	t->nr_locks = 0;
 	t->locks = t->locks_floor;
 	t->cap_locks = FT_FLIP_TXN_FLOOR_LOCKS;
+	t->nr_covered = 0;
+	t->sw_body = false;
+	t->ft = ft;
 	t->acquire_miss = false;
 	t->acquire_enomem = false;
 	FT_OWNER_ASSERT_SET_FT(t, ft);
@@ -4781,8 +4855,9 @@ void ft_flip_txn_free(struct ft_flip_txn *t)
 }
 
 static inline
-void ft_flip_txn_lock_register(struct ft_flip_txn *t,
-		struct cds_ft_metadata *meta, uintptr_t snap)
+void ft_flip_txn_lock_register_member(struct ft_flip_txn *t,
+		struct cds_ft_metadata *meta, uintptr_t snap,
+		struct cds_ft_metadata *member)
 {
 	/*
 	 * ☠ FAIL-STOP, NOT AN ASSERT.  The old guard was compiled out under
@@ -4818,6 +4893,7 @@ void ft_flip_txn_lock_register(struct ft_flip_txn *t,
 	}
 #endif
 	t->locks[t->nr_locks].meta = meta;
+	t->locks[t->nr_locks].member = member;
 	t->locks[t->nr_locks].snap = snap;
 	t->locks[t->nr_locks].src_shared = NULL;
 	t->locks[t->nr_locks].tombstone_terminal = false;
@@ -4839,6 +4915,42 @@ void ft_flip_txn_lock_register(struct ft_flip_txn *t,
 	 */
 	ft_flip_txn_claim_per_op(t);
 #endif
+}
+
+/*
+ * FILE A MEMBER THE OP HOLDS BUT REGISTERED UNDER ANOTHER WORD (see @covered).
+ * Idempotent, and silently full: overflow leaves holds() conservative, which
+ * costs an MW record and never a wrong SW park.
+ */
+static inline
+void ft_flip_txn_cover_member(struct ft_flip_txn *t,
+		struct cds_ft_metadata *member)
+{
+	unsigned int i;
+
+	if (!t || !member)
+		return;
+	for (i = 0; i < t->nr_covered; i++)
+		if (t->covered[i] == member)
+			return;
+	if (t->nr_covered < CAA_ARRAY_SIZE(t->covered))
+		t->covered[t->nr_covered++] = member;
+}
+
+/* A word registered on the caller's own account: it IS the node (see @member). */
+static inline
+void ft_flip_txn_lock_register(struct ft_flip_txn *t,
+		struct cds_ft_metadata *meta, uintptr_t snap)
+{
+	ft_flip_txn_lock_register_member(t, meta, snap, NULL);
+}
+
+/* An acquire's own answer: the anchor word, and the member it was taken for. */
+static inline
+void ft_flip_txn_lock_register_held(struct ft_flip_txn *t,
+		const struct ft_held_anchor *h)
+{
+	ft_flip_txn_lock_register_member(t, h->lock, h->lock_snap, h->member);
 }
 
 /*
@@ -4867,6 +4979,14 @@ unsigned int ft_flip_txn_lock_own(struct ft_flip_txn *t,
 	unsigned int slot = ft_flip_txn_lock_own_silenced(t, h->lock,
 			h->lock_snap, &h->shared);
 
+	/*
+	 * The hand-off carries the acquire's whole answer, so the entry keeps
+	 * the MEMBER too: above per-node @lock is that member's ANCHOR, and
+	 * without this the registry could not answer for the node itself
+	 * (measured at the detach's commit -- its one registered word came
+	 * from here, with the member dropped).
+	 */
+	t->locks[slot].member = h->member;
 	h->txn_owned = true;
 	return slot;
 }
@@ -4921,8 +5041,18 @@ bool ft_flip_txn_holds(const struct ft_flip_txn *t,
 {
 	unsigned int i;
 
+	/* Members whose word deduped onto another member's (see @covered). */
+	for (i = 0; i < t->nr_covered; i++)
+		if (t->covered[i] == m)
+			return true;
+
+	/*
+	 * EITHER the word itself, OR a node this op took a lock FOR: above
+	 * per-node the two differ, and the second is what makes this answer
+	 * exact there rather than conservative (@member's header).
+	 */
 	for (i = 0; i < t->nr_locks; i++)
-		if (t->locks[i].meta == m)
+		if (t->locks[i].meta == m || t->locks[i].member == m)
 			return true;
 	return false;
 }
@@ -4970,7 +5100,32 @@ static inline
 bool ft_flip_txn_owns(const struct ft_flip_txn *t,
 		const struct cds_ft_metadata *owner)
 {
-	return owner && ft_flip_txn_holds(t, owner);
+	if (!owner)
+		return false;
+	if (ft_flip_txn_holds(t, owner))
+		return true;
+	/*
+	 * ROOT-ONLY: the anchor of EVERY node is the trie's root
+	 * (ft_anchor_meta's own arm for a descent-less resolution), so a txn
+	 * holding the root's word excludes every writer of every word in that
+	 * trie -- including nodes this op never named as lock-set members.
+	 * MEASURED: without this, a remove_all lane that held the root aborted
+	 * the record-time owner assert on an in-place remove's forward slot
+	 * (core, inv_concurrent_remove_all_prefix at root-only).
+	 *
+	 * ☞ EXPONENTIAL gets no such shortcut: there the anchor comes from the
+	 * op's DESCENT, which a record helper does not have, so the answer
+	 * stays the exact-or-member one and is conservative beyond it.
+	 */
+	if (t->ft && t->ft->lock_spacing == CDS_FT_LOCK_SPACING_ROOT_ONLY) {
+		struct cds_ft_inode_flag *r = ft_resolve_flip_proxy(
+			rcu_dereference(t->ft->root));
+
+		return r && !ft_node_external(r) &&
+			ft_flip_txn_holds(t, ft_flag_to_metadata(
+				(struct cds_ft *) t->ft, r));
+	}
+	return false;
 }
 
 #ifdef FEATURE_FT_FAULT_INJECT
@@ -5144,6 +5299,50 @@ bool ft_held_set_snap(const struct ft_held_set *h,
 	if (h->glue && ft_glue_held_snap(h->glue, meta, snap, ratified))
 		return true;
 	return ft_held_set_snap(h->outer, meta, snap, ratified);
+}
+
+/*
+ * THE OWNERSHIP QUESTION, as opposed to the SNAPSHOT question above: is @meta's
+ * word excluded by something this op holds?  Same sources, and it also matches a
+ * lock-set MEMBER -- above per-node an acquire's word is the member's ANCHOR
+ * ANCESTOR, so ft_held_set_snap's exact match answers false for a node that IS
+ * excluded (@ft_held_anchor's @member).
+ *
+ * ☠ SEPARATE FROM ft_held_set_snap BECAUSE OF THE SNAP.  That function hands
+ * back the matched word's snapshot, which callers use as an expected-old; a
+ * member match would hand them the ANCHOR's snapshot for a DIFFERENT word.  So
+ * ownership widens here and the snapshot path stays exact.
+ */
+static inline
+bool ft_held_set_covers(const struct ft_held_set *h,
+		const struct cds_ft_metadata *meta)
+{
+	unsigned int i;
+	uintptr_t snap;
+	bool ratified;
+
+	if (!h || !meta)
+		return false;
+	if (h->txn)
+		for (i = 0; i < h->txn->nr_locks; i++)
+			if (h->txn->locks[i].meta == meta ||
+					h->txn->locks[i].member == meta)
+				return true;
+	for (i = 0; i < h->nr_extra; i++)
+		if ((h->extra[i].lock == meta ||
+				h->extra[i].member == meta) &&
+				!h->extra[i].shared)
+			return true;
+	if (h->glue && ft_glue_held_snap(h->glue, meta, &snap, &ratified))
+		return true;
+	return ft_held_set_covers(h->outer, meta);
+}
+
+static inline
+bool ft_lock_ctx_covers(const struct ft_lock_ctx *ctx,
+		const struct cds_ft_metadata *meta)
+{
+	return ctx && ft_held_set_covers(&ctx->held, meta);
 }
 
 static inline
@@ -6270,6 +6469,46 @@ static unsigned int ft_sa_held_path(const struct ft_flip_txn *t,
 	return n;
 }
 
+/*
+ * PROBE: the record the owner assert is about to refuse, with the op's whole
+ * held picture.  One-shot per site; the caller is named by its return
+ * addresses (symbolize with addr2line), never by a backtrace from a hot path.
+ */
+static void ft_owner_assert_dump(const struct ft_flip_txn *t,
+		const struct ft_lock_ctx *ctx, struct cds_ft_metadata *owner,
+		void **slot, void *pc0, void *pc1)
+{
+	static unsigned long n;
+	char o0[256], o1[256];
+	unsigned int i;
+
+	if (uatomic_add_return(&n, 1) > 4)
+		return;
+	ft_sa_off(pc0, o0, sizeof(o0));
+	ft_sa_off(pc1, o1, sizeof(o1));
+	fprintf(stderr, "FT OWNER-ASSERT site=%s:%d pc0=%s pc1=%s owner %p "
+		"slot %p sw_body=%d sw_per_op=%d nr_locks=%u nr_covered=%u "
+		"ctx=%p nr_extra=%u\n",
+		t->dbg_site ? t->dbg_site->file : "?",
+		t->dbg_site ? t->dbg_site->line : 0, o0, o1, (void *) owner,
+		(void *) slot, (int) t->sw_body, (int) t->sw_per_op,
+		t->nr_locks, t->nr_covered, (const void *) ctx,
+		ctx ? ctx->held.nr_extra : 0);
+	for (i = 0; i < t->nr_locks; i++)
+		fprintf(stderr, "FT OWNER-ASSERT   locks[%u] word %p member %p\n",
+			i, (void *) t->locks[i].meta,
+			(void *) t->locks[i].member);
+	for (i = 0; i < t->nr_covered; i++)
+		fprintf(stderr, "FT OWNER-ASSERT   covered[%u] %p\n", i,
+			(void *) t->covered[i]);
+	if (ctx)
+		for (i = 0; i < ctx->held.nr_extra; i++)
+			fprintf(stderr, "FT OWNER-ASSERT   extra[%u] word %p member %p shared=%d\n",
+				i, (void *) ctx->held.extra[i].lock,
+				(void *) ctx->held.extra[i].member,
+				(int) ctx->held.extra[i].shared);
+}
+
 /* Uncovered records whose txn never reached the engine (ft_flip_txn_destroy). */
 static void ft_sa_pend_bailed(const struct ft_flip_txn *t)
 {
@@ -7035,59 +7274,64 @@ void __ft_flip_txn_record_tag_ctx(struct ft_flip_txn *t,
 			uatomic_inc(&ft_owner_wide[1]);
 	}
 #endif
+#if defined(FT_DEBUG_STRUCT_ANCHOR) && \
+	(defined(DEBUG_RCU) || defined(CONFIG_RCU_DEBUG))
+	/*
+	 * SELF-DIAGNOSING ASSERT (probe): the same terms the assert below
+	 * tests, and if they all fail, WHO the record was and what the op
+	 * holds -- the abort alone names neither, and the shape is
+	 * timing-dependent (it does not reproduce under gdb).
+	 */
+	if (t->dbg_arm_per_op && t->nr_locks &&
+			!ft_flip_txn_owns(t, owner) &&
+			!(t->ft && ft_wlock_held == t->ft) &&
+			!ft_owner_ctx_holds(dbg_ctx, owner) &&
+			!ft_owner_retire_witnessed(dbg_ctx, owner, slot,
+				new_ptr))
+		ft_owner_assert_dump(t, dbg_ctx, owner, slot,
+			__builtin_return_address(0), FT_SA_CALLER_PC());
+#endif
 	FT_OWNER_ASSERT_OWNED_CTX(t, dbg_ctx, owner, slot, new_ptr);
 	/*
-	 * ☐ OPT-IN, DEFAULT OFF (-DFT_SW_REQUIRES_OWNER).  ASK THE ARM'S
-	 * QUESTION PER RECORD.
+	 * ★ THE ARM'S QUESTION, ASKED PER RECORD (was -DFT_SW_REQUIRES_OWNER,
+	 * default off).  ft_flip_txn_arm_per_op refuses an EMPTY registry, but
+	 * its gate is "the registry is non-empty", not "the registry covers THIS
+	 * record's owner".  An op that locked one node and then records an edge
+	 * on another therefore parked it SW -- and an SW park CANNOT FAIL: no
+	 * CAS, no expected-old.  That is a blind write to a word the op never
+	 * excluded, and the two-pass settle cannot protect it either (@late_tag
+	 * can only hold back a release the commit CARRIES, and there is no lock
+	 * for that node in this descriptor).  MEASURED at
+	 * ft_insert_publish_or_park with nr_locks == 1 on an unrelated owner.
 	 *
-	 * ft_flip_txn_arm_per_op refuses an empty registry so a shape that
-	 * acquired nothing "keeps today's all-MW behaviour rather than parking
-	 * on an exclusion it never took" -- but its gate is "the registry is
-	 * NON-EMPTY", not "the registry covers THIS record's owner".  An op that
-	 * locked one node and then records an edge on another therefore parks it
-	 * SW, and an SW park CANNOT FAIL: no CAS, no expected-old (:7967-7984).
-	 * That is a blind write to a word this op never excluded, and the
-	 * two-pass settle cannot protect it either -- @late_tag can only hold
-	 * back a release the commit CARRIES, and there is no lock for that node
-	 * in this descriptor (doc/design/ft-stale-disposal-predicate.md §5.19).
-	 * MEASURED at ft_insert_publish_or_park (ft-insert.h:691) with
-	 * nr_locks == 1 on an unrelated owner.
+	 * It was left off because the answer was not TRUSTWORTHY above per-node:
+	 * ft_flip_txn_owns compared the registry's words against the record's
+	 * node, while a coarse spacing registers that node's ANCHOR, so it
+	 * downgraded legitimate parks wholesale.  The registry now remembers the
+	 * MEMBER each word was taken for (@ft_held_anchor's @member), so the
+	 * answer is exact wherever the acquire filed it and conservative
+	 * elsewhere -- and a conservative answer costs an MW record, never a
+	 * wrong park.
 	 *
-	 * Falling back to MW is STRICTER AND ALWAYS SOUND -- the same argument
-	 * ft-remove.h:4004-4009 makes for records planted before an arm.
+	 * ⇒ THIS IS WHAT LETS THE PER-OP ARM SERVE A COARSE SPACING
+	 * (ft_txn_per_op_spacing_ok): the kind is now justified record by
+	 * record, so an arm can no longer convert a word the op does not own,
+	 * and the record-time owner assert and the park share ONE predicate.
 	 *
-	 * ☠ WHY IT IS OPT-IN.  ft_flip_txn_owns is a LOWER BOUND: its own header
-	 * says it "only ever refuses a park, never permits one", because
-	 * resolving a coarser spacing's ANCHOR would need the op's descent,
-	 * which a record helper does not have.  So under anchored lock-sets this
-	 * downgrades LEGITIMATE SW parks to MW -- sound, but a hot-path
-	 * behaviour change that must be measured before it is a default.
+	 * ☠ NOT A FIX FOR AN OWNERSHIP GAP, and the numbers that proved it stay
+	 * here: on the §5.19 DETERM reproducer, 30 seeds, rc=139 was 3/30 with
+	 * this off and 4/30 with it on.  MW is a VALIDATION, not an EXCLUSION --
+	 * an MW record still STORES at settle, and all the kind buys is an
+	 * expected-old check at install.  Downgrading a KIND cannot close an
+	 * ownership gap; the op must ACQUIRE the word or not record it.
 	 *
-	 * ☠☠☠ AND IT DOES NOT FIX THE DEFECT.  MEASURED on the DETERM
-	 * reproducer, 30 seeds, CHK=0 SECS=2 NOFREE=0:
-	 *
-	 *     flag OFF   rc=139: 3/30
-	 *     flag ON    rc=139: 4/30
-	 *
-	 * Unchanged.  The reason is worth keeping, because it refutes the
-	 * "stricter and always sound" intuition this arm was built on: MW is a
-	 * VALIDATION, not an EXCLUSION.  An MW record still STORES its new value
-	 * into the slot at settle; all the kind buys is an expected-old check at
-	 * install, and when no peer happens to be contending that exact word at
-	 * that instant the CAS succeeds and the settle writes anyway -- into a
-	 * word this op never owned.  Downgrading the KIND cannot close an
-	 * OWNERSHIP gap.
-	 *
-	 * ☞ So the cure for §5.19 has to make the op ACQUIRE the word (or not
-	 * record it), not merely validate it.  Kept compiled-out with its
-	 * numbers so the next reader does not re-derive the same dead end.
+	 * The OTHER two doors are untouched: a COARSE or exclusive trie (door 1)
+	 * and the rekey / root-COW writers (door 3) set @structural_sw WITHOUT
+	 * @sw_per_op -- their exclusion is the FT-wide lock or the trie's own
+	 * privacy, not the lock registry -- so they keep parking SW throughout.
 	 */
-#ifdef FT_SW_REQUIRES_OWNER
 	if (t->structural_sw &&
-	    (!t->sw_per_op || ft_flip_txn_owns(t, owner))) {
-#else
-	if (t->structural_sw) {
-#endif
+	    (!t->sw_per_op || t->sw_body || ft_flip_txn_owns(t, owner))) {
 		FT_TK_COUNT_REC(t, FT_TK_SW);
 		FT_AB_ARM(FT_AB_SW, FT_AB_OWN_NA);
 		ret = urcu_txn_store_sw(t->mtxn, slot, old_ptr, new_ptr, tag);
@@ -7830,29 +8074,37 @@ void ft_flip_txn_set_structural_sw(struct ft_flip_txn *t, bool v)
  * miss as "this record is planted before its owner is registered" first.
  */
 /*
- * PER-NODE SPACING IS PART OF THE GATE, and it is the predicate's limit rather
- * than a shape the arm cannot serve.
+ * EVERY SPACING, since the registry remembers the MEMBER an acquire took its
+ * word for (@ft_held_anchor's @member, ft_flip_txn_lock_register_held).
  *
- * ft_flip_txn_owns is EXACT at per-node and CONSERVATIVE above it: a coarser
- * spacing puts the word's lock on an ANCHOR ANCESTOR, which the registry holds
- * while @owner itself is absent, so the check reports a MISS for a word that IS
- * excluded.  Resolving the anchor would need the op's descent, which a record
- * helper does not have.
+ * This gate used to be `lock_spacing == PER_NODE`, and the reason was the
+ * PREDICATE, not the spacing: ft_flip_txn_owns compared the registry's words
+ * against the node a record names, and above per-node the word is that node's
+ * ANCHOR ANCESTOR -- so it reported a MISS for a word that IS excluded, and
+ * under an ARM a false miss is fatal.  Recomputing the anchor here is
+ * impossible (it comes from the op's DESCENT, which a record helper does not
+ * have); remembering what the acquire already knew answers the same question
+ * exactly, at every spacing.
  *
- * ☠ MEASURED, not reasoned: arming without this gate keeps every per-node leg
- * green and turns the exponential and root-only legs of the txndbg and
- * anchorval configs RED -- ft_unit dies after 8 tests on the owner assert, at
- * the insert's own ctx-less retire.  A false miss, and under an ARM it is fatal
- * rather than merely noisy.
+ * ☠ MEASURED BEFORE LIFTING IT, because arming on a wrong answer silently
+ * erases a peer's write rather than aborting:
+ *   - -DFT_DEBUG_STRUCT_ANCHOR's record-time inventory, which resolves the
+ *     anchor by CLIMBING (not by the registry): 0 unheld records over 85.7M at
+ *     exponential, 0 at root-only, 0 at per-node;
+ *   - the unfinished lanes: 0 that commit uncovered, and every record re-asked
+ *     at commit had its covering anchor already held AT THE RECORD;
+ *   - the duplicate chain: 0 violations at all three spacings;
+ *   - every "build-invisible" raw store: 0 whose target a reader could reach.
+ * Doc §11.2-§11.3.
  *
- * Refusing leaves those spacings all-MW, which is stricter and always sound.
- * Lifting the gate is Phase E's "spacing certification", not Phase B's to
- * assume.
+ * The other three refusals stand: a COARSE or exclusive trie is armed
+ * trie-wide by its constructor (door 1), a non-fine trie has no registry to
+ * ask, and an EMPTY registry owns nothing.
  */
 static inline
 bool ft_txn_per_op_spacing_ok(const struct cds_ft *ft)
 {
-	return ft && ft->lock_spacing == CDS_FT_LOCK_SPACING_PER_NODE;
+	return ft != NULL;
 }
 
 static inline
@@ -8021,6 +8273,19 @@ void ft_flip_txn_arm_structural(const struct cds_ft *ft, struct ft_flip_txn *t)
 	ft_flip_txn_arm_per_op(ft, t);
 	if (!t->structural_sw && ft && ft->lock_fine && !ft_txn_content_sw_ok(ft))
 		ft_flip_txn_set_structural_sw(t, true);
+	/*
+	 * ☠ AND MARK IT A WHOLE-BODY WRITER, which exempts it from the
+	 * per-record ownership gate (@sw_body, and the gate in
+	 * __ft_flip_txn_record_tag_ctx).  Falling back to MW per record is
+	 * stricter for an op that can take MW and a LIVELOCK for this one: its
+	 * edges sit on words the op ITSELF fenced, so an MW edge expecting
+	 * live_state reads its own mark and the retry replans forever -- the two
+	 * measurements in this function's header, and ft_unit
+	 * test_rekey_collapse_one_slot_two_kinds while the flag was missing.
+	 * The marker cannot be @sw_per_op's absence: this writer ALSO takes the
+	 * additive per-op arm (ft_rekey_cow_stop), for the audit.
+	 */
+	t->sw_body = true;
 }
 
 
@@ -9485,6 +9750,7 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 				node_held = true;
 			}
 			set[i].held.lock = lock;
+			set[i].held.member = node;
 			set[i].held.lock_snap = 0;
 			set[i].held.node_snap = node_snap;
 			set[i].held.shared = true;
@@ -9615,6 +9881,19 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 			ft_acq_contended++;
 		return -EAGAIN;		/* released: nothing acquired */
 	}
+	/*
+	 * EVERY MEMBER IS NOW HELD.  Tell the commit's registry which nodes
+	 * this op took a lock FOR, including the ones whose word deduped onto
+	 * another member's and so file no entry of their own (@covered).  This
+	 * is the one place that knows both sides -- the member and the word
+	 * ft_anchor_meta resolved it to -- and it is what lets the record-time
+	 * ownership question be exact at a coarse spacing.
+	 */
+	if (ctx && ctx->held.txn)
+		for (i = 0; i < nr; i++)
+			if (set[i].nf)
+				ft_flip_txn_cover_member(ctx->held.txn,
+					set[i].node);
 #ifdef FT_DEBUG_STRUCT_ANCHOR
 	/* Does any member the acquire just answered for read DEAD? */
 	for (i = 0; i < nr; i++) {
@@ -11558,7 +11837,7 @@ void ft_flip_txn_lock_or_guard_parent_ex(const char *fn, int line,
 			 * ft_flip_txn_record_release_lock reads no registry, so
 			 * the order is free.
 			 */
-			ft_flip_txn_lock_register(t, held.lock, held.lock_snap);
+			ft_flip_txn_lock_register_held(t, &held);
 			ft_flip_txn_record_release_lock(t, held.lock,
 				held.lock_snap);
 			if (exit_ret)
@@ -12143,7 +12422,15 @@ void ft_flip_txn_hold_or_lock_parent_at(const char *fn, int line,
 		 * snapshot form doubled as -- and that guard was approximating
 		 * an exclusion this arm already has, since we HOLD the word.
 		 */
-		ft_flip_txn_lock_register(t, held_holder, held_snap);
+		/*
+		 * @parent_nf IS the member this word was taken for -- the
+		 * caller threaded the acquire's ANCHOR and its snap, which
+		 * above per-node is an ancestor of it.  Register both, so the
+		 * registry can answer "excluded by something I hold" for the
+		 * node this publish writes (ft_held_anchor's @member).
+		 */
+		ft_flip_txn_lock_register_member(t, held_holder, held_snap,
+			ft_flag_to_metadata((struct cds_ft *) ft, parent_nf));
 		ft_flip_txn_record_anchor_release_held(t, held_holder);
 		return;
 	}

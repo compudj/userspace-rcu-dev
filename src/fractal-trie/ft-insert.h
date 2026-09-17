@@ -186,6 +186,8 @@ struct ft_insert_commit {
 	 * the child's state word -- and is now TAKEN.  One child, not a fan.
 	 */
 	struct cds_ft_metadata *child_locked_holder;
+	/* The member that holder was taken for: the child (ft_held_anchor). */
+	struct cds_ft_metadata *child_locked_member;
 	uintptr_t child_locked_snap;
 };
 
@@ -817,8 +819,17 @@ void ft_insert_publish_or_park(struct cds_ft *ft,
 	 * op's own hold exactly as a re-mark would, and a second release would
 	 * double-record the one word.
 	 */
-	if (ic->parent_lock_shared)
+	if (ic->parent_lock_shared) {
+		/*
+		 * P's word deduped onto CN's anchor, so the acquire filed
+		 * nothing for P -- and that acquire ran before @txn existed, so
+		 * it could not cover it either.  Say so here: the op DOES hold
+		 * the word that excludes P's writers (ft_flip_txn's @covered).
+		 */
+		ft_flip_txn_cover_member(ic->txn,
+			ft_flag_to_metadata(ft, parent_nf));
 		ft_flip_txn_guard_parent(ft, ic->txn, parent_nf);
+	}
 	else
 		ft_flip_txn_hold_or_lock_parent(ft, ic->txn, ctx, parent_nf,
 			parent_depth, ic->parent_locked_holder,
@@ -828,9 +839,12 @@ void ft_insert_publish_or_park(struct cds_ft *ft,
 	 * the txn, whose terminals now own it, BEFORE the arm below (the arm must
 	 * follow the op's last register).  Cleared, so no bail releases it twice.
 	 */
+	/* Held since the lock set, whether or not its word was its own. */
+	ft_flip_txn_cover_member(ic->txn, ic->child_locked_member);
 	if (ic->child_locked_holder) {
-		ft_flip_txn_lock_register(ic->txn, ic->child_locked_holder,
-			ic->child_locked_snap);
+		ft_flip_txn_lock_register_member(ic->txn,
+			ic->child_locked_holder, ic->child_locked_snap,
+			ic->child_locked_member);
 		/*
 		 * Through the txn, as P's is: a fixed {LOCK|snap -> snap} would
 		 * silently abort every commit the day another edge of this txn
@@ -1074,6 +1088,7 @@ int ft_insert_dlm_acquire_split(struct cds_ft *ft,
 	ic->parent_locked_snap = pf_p ? set[1].held.lock_snap : 0;
 	ic->child_locked_holder = (set[2].nf && !set[2].held.shared) ?
 		set[2].held.lock : NULL;
+	ic->child_locked_member = set[2].nf ? set[2].held.member : NULL;
 	ic->child_locked_snap = set[2].nf ? set[2].held.lock_snap : 0;
 	return 0;
 }
@@ -1674,7 +1689,7 @@ int ft_split_compressed_insert(struct cds_ft *ft,
 	 * local error path must NOT clear it (the caller's unwind destroys
 	 * @ic->txn, which drains the registry).
 	 */
-	ft_flip_txn_lock_register(ic->txn, held.lock, held.lock_snap);
+	ft_flip_txn_lock_register_held(ic->txn, &held);
 	ft_flip_txn_record_anchor_release(ic->txn, &held, cn_meta);
 	ic->free_old_cn_held = held;
 	/*
@@ -3311,7 +3326,7 @@ int ft_insert_compressed_key_shorter(struct cds_ft *ft,
 	 * The armed txn now owns the fence outcome (registered clear on every
 	 * non-commit terminal; consumed by the fenced tombstone on commit).
 	 */
-	ft_flip_txn_lock_register(ic->txn, held.lock, held.lock_snap);
+	ft_flip_txn_lock_register_held(ic->txn, &held);
 	ft_flip_txn_record_anchor_release(ic->txn, &held, cn_meta);
 	ic->free_old_cn_held = held;
 	/*

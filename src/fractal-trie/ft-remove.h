@@ -283,8 +283,7 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			 * the single word twice.
 			 */
 			if (!cn_held.shared) {
-				ft_flip_txn_lock_register(txn, cn_held.lock,
-					cn_held.lock_snap);
+				ft_flip_txn_lock_register_held(txn, &cn_held);
 				ft_flip_txn_record_release_lock(txn, cn_held.lock,
 					cn_held.lock_snap);
 			}
@@ -653,13 +652,11 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			 * ordering rule), the node tombstoned below.  A no-op
 			 * where the two words coincide.
 			 */
-			ft_flip_txn_lock_register(txn, src_held.lock,
-				src_held.lock_snap);
+			ft_flip_txn_lock_register_held(txn, &src_held);
 			ft_flip_txn_record_anchor_release(txn, &src_held,
 				src_cn_meta_a);
 			if (pub_parent && !set[1].held.shared) {
-				ft_flip_txn_lock_register(txn, set[1].held.lock,
-					set[1].held.lock_snap);
+				ft_flip_txn_lock_register_held(txn, &set[1].held);
 				ft_flip_txn_record_release_lock(txn,
 					set[1].held.lock, set[1].held.lock_snap);
 			}
@@ -1244,9 +1241,17 @@ static inline
 void ft_chain_compress_register_retire(struct ft_flip_txn *txn,
 		const struct ft_held_anchor *h, struct cds_ft_metadata *node)
 {
-	if (h->shared)
+	if (h->shared) {
+		/*
+		 * Its word was taken by an EARLIER member of this op, so it owes
+		 * no release and no terminal -- but the op DOES hold it, and the
+		 * record-time ownership question is asked against @txn.  Say so
+		 * (ft_flip_txn's @covered).
+		 */
+		ft_flip_txn_cover_member(txn, h->member);
 		return;
-	ft_flip_txn_lock_register(txn, h->lock, h->lock_snap);
+	}
+	ft_flip_txn_lock_register_held(txn, h);
 	ft_flip_txn_record_anchor_release(txn, h, node);
 }
 
@@ -1672,10 +1677,13 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 			 * onto a word the set already took owes neither.
 			 */
 			if (!set[si].held.shared) {
-				ft_flip_txn_lock_register(txn, set[si].held.lock,
-					set[si].held.lock_snap);
+				ft_flip_txn_lock_register_held(txn, &set[si].held);
 				ft_flip_txn_record_release_lock(txn,
 					set[si].held.lock, set[si].held.lock_snap);
+			} else {
+				/* Held via an earlier member; owes no release. */
+				ft_flip_txn_cover_member(txn,
+					set[si].held.member);
 			}
 			si++;
 		}

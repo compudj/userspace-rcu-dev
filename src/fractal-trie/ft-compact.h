@@ -186,15 +186,13 @@ void ft_compact_record_terminals(struct ft_flip_txn *t,
 		struct cds_ft_metadata *retired)
 {
 	if (!set[0].held.shared) {
-		ft_flip_txn_lock_register(t, set[0].held.lock,
-			set[0].held.lock_snap);
+		ft_flip_txn_lock_register_held(t, &set[0].held);
 		(void) ft_flip_txn_record_anchor_release(t, &set[0].held,
 			retired);
 	}
 	ft_flip_txn_record_retire_anchored(t, ctx, &set[0].held, retired);
 	if (set[1].nf && !set[1].held.shared) {
-		ft_flip_txn_lock_register(t, set[1].held.lock,
-			set[1].held.lock_snap);
+		ft_flip_txn_lock_register_held(t, &set[1].held);
 		ft_flip_txn_record_release_lock(t, set[1].held.lock,
 			set[1].held.lock_snap);
 	}
@@ -603,7 +601,7 @@ struct ft_ord_cell *ft_compact_relocate_cell(struct cds_ft *ft,
 			return old;
 		}
 		if (!h.shared) {
-			ft_flip_txn_lock_register(t, h.lock, h.lock_snap);
+			ft_flip_txn_lock_register_held(t, &h);
 			ft_flip_txn_record_release_lock(t, h.lock, h.lock_snap);
 		}
 		/*

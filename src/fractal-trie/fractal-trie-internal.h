@@ -1260,20 +1260,30 @@ struct ft_pub_rec {
  * urcu_txn_store_sw -- "a slot is SW xor MW, globally" -- which is the rule for
  * every word that cannot take a lock in its own bits.
  *
- * WHEN SW IS REACHABLE AT ALL -- three doors, and the second one is why this
- * table needs a spacing column:
+ * WHEN SW IS REACHABLE AT ALL -- three doors:
  *   1. ft_txn_content_sw_ok(): a COARSE or exclusive trie is armed SW
  *      trie-wide, at EVERY spacing.
- *   2. ft_flip_txn_arm_per_op(): under LOCK_FINE, and it REFUSES any spacing
- *      but per-node (ft_txn_per_op_spacing_ok).  So a FINE point op at
- *      exponential / root-only records every structural slot MW *BY
- *      CONSTRUCTION* -- which is NOT the same claim as MW by design, and a
- *      future reader must not take the one for the other.
+ *   2. ft_flip_txn_arm_per_op(): under LOCK_FINE, at EVERY SPACING since
+ *      2026-09-17, and the KIND IS THEN DECIDED PER RECORD -- a record parks
+ *      SW only where the txn owns its owner (__ft_flip_txn_record_tag_ctx),
+ *      and falls back to MW otherwise.
+ *      ☞ This door used to refuse every spacing but per-node, and the reason
+ *      was the PREDICATE: ft_flip_txn_owns compared the registry's words
+ *      against the record's node, while a coarse spacing registers that
+ *      node's ANCHOR.  The acquire's answer now travels with the
+ *      registration (ft_held_anchor's @member, plus @covered for a member
+ *      whose word deduped onto another's, plus the root-only anchor, which
+ *      needs no descent), so the answer is exact where the acquire filed it
+ *      and conservative beyond it.  The old spacing column's "MW by constr."
+ *      rows are therefore SW-capable now; what still decides them is
+ *      ownership, record by record.
  *   3. ft_flip_txn_arm_structural(): the rekey writer and the root-COW driver
  *      arm SW under FINE at ANY spacing (self-labelled "Phase E's DEBT").
  *      This is the one door through which an SW park and an MW CAS can meet
  *      on one structural word; what keeps them apart today is the FT-wide
- *      bulk gate, not the DLM.
+ *      bulk gate, not the DLM.  Such a writer is marked @sw_body and is
+ *      EXEMPT from door 2's per-record gate: its edges sit on words it fenced
+ *      itself, so falling back to MW would abort its own commit forever.
  *
  * ☠ OWNERSHIP IS TAKEN, NEVER OBSERVED.  An MW {live->live} VALIDATE on a word
  * a peer holds is not arbitrated against that peer's SW parks: the validator
@@ -1290,19 +1300,19 @@ struct ft_pub_rec {
  *
  *   SLOT                          OWNER (§8.2)        per-node   exponential
  *   ----                          -----------         --------   -----------
- *   internal body child slot      the node it is in   SW armed   MW by constr.
- *   cds_ft_compressed_node.child  that cn             SW armed   MW by constr.
+ *   internal body child slot      the node it is in   SW armed   SW if owned
+ *   cds_ft_compressed_node.child  that cn             SW armed   SW if owned
  *   cds_ft.root                   NONE (no node)      MW         MW   [DESIGN]
- *   SKIP_X dual (GP body word)    the GRANDparent     SW armed   MW by constr. (1)
- *   cds_ft_metadata.external_nodes the node it is in  SW armed   MW by constr.
+ *   SKIP_X dual (GP body word)    the GRANDparent     SW armed   SW if owned (1)
+ *   cds_ft_metadata.external_nodes the node it is in  SW armed   SW if owned
  *   metadata.state  LOCK take     node / its anchor   MW         MW   [DESIGN]
- *   metadata.state  tombstone     ditto               SW armed   MW by constr.
- *   metadata.state  lock release  ditto               SW armed   MW by constr.
- *   metadata.state  nr_child++    ditto               SW armed   MW by constr.
+ *   metadata.state  tombstone     ditto               SW armed   SW if owned
+ *   metadata.state  lock release  ditto               SW armed   SW if owned
+ *   metadata.state  nr_child++    ditto               SW armed   SW if owned
  *   metadata.state  nr_child--    ditto               MW  (2)    MW   [DESIGN]
  *   metadata.state  {live->live}  --                  MW         MW   [DESIGN]
- *   metadata.parent_word          parent (3)          SW if held MW by constr.
- *   metadata.parent_slot_offset   parent (3)          SW if held MW by constr.
+ *   metadata.parent_word          parent (3)          SW if held SW if held
+ *   metadata.parent_slot_offset   parent (3)          SW if held SW if held
  *   metadata.nr_keys              FT-wide lock (9)    MW         MW   [debt]
  *   metadata.incoming_byte        not transacted (7)
  *   metadata.alloc_index          ALLOCATOR-PRIVATE (7) -- never transacted

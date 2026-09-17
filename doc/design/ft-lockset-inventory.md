@@ -851,3 +851,134 @@ trie's mode AND an anchor-aware ownership answer, and correct the register row
 (`metadata.state nr_child--`), whose "MW [DESIGN]" is not backed by its own
 note (2) -- that note is about the TAG (FT-SLOT-1), not the kind, and the code's
 "self-guarded by this very CAS" comment predates the leaf-delete hoist.
+
+### 11.5 The flip, spacing axis: door 2 opened for exponential and root-only
+
+Mathieu chose both coarse spacings, and the chain class in scope (see §11.6 for
+the rest). What door 2 refused was never the spacing -- it was the PREDICATE.
+`ft_flip_txn_owns` compared the registry's words against the node a record
+names, while a coarse spacing registers that node's ANCHOR, so it answered
+"miss" for a word that IS excluded, and under an arm a false miss is fatal.
+
+Four changes make the answer exact, and one makes a wrong answer harmless:
+
+1. **The acquire's answer travels with the registration.** `ft_held_anchor`
+   carries the MEMBER its word was taken for, `ft_flip_txn_lock_register_held`
+   files both, and `ft_flip_txn_holds` matches either. Only the acquire knows
+   this (the anchor comes from the op's descent).
+2. **Members whose word deduped onto another member's** file no entry at all --
+   they owe no release. The acquire records them in the txn's `@covered` list,
+   and the three sites that hand a shared member on (the split's P and child,
+   the fuse's retire and publish parent) say so explicitly.
+3. **ROOT-ONLY needs no descent:** every node's anchor IS the trie's root, so
+   `ft_flip_txn_owns` resolves it directly from the txn's trie (`@ft`, a
+   production field; the debug copy it replaces was read NULL in a core).
+4. **The kind is decided PER RECORD** (the former `-DFT_SW_REQUIRES_OWNER`): a
+   per-op armed txn parks SW only where it owns the record's owner, and records
+   MW otherwise. So an arm can no longer convert a word the op does not own --
+   the structural weakness that made the arm's "registry is non-empty" gate too
+   coarse -- and the park and the assert share ONE predicate.
+   ☠ A whole-body SW writer (the rekey / root-COW driver, `@sw_body`) is EXEMPT:
+   its edges sit on words it fenced itself, so an MW fallback aborts its own
+   commit forever. Measured as a livelock at ft_unit test 111, then as a 16G
+   leak at test 117, until the flag existed.
+
+**Debug gate, `--enable-rcu-debug` with the owner assert armed, 6 legs GREEN:**
+ft_unit 358/358 and ft_inv 152/152 at per-node, exponential and root-only.
+Each gap was named by that assert, one at a time; the last two needed a
+self-diagnosing dump and a core, because they did not reproduce under gdb.
+
+**Positive control** (same tree, door 2 shut vs open, per ft_inv leg):
+
+| | armSW | SW records | MW_STRUCT | OWN_MISS | ABORT |
+|---|---|---|---|---|---|
+| exponential | 3,531,046 → **9,624,073** | 5,714,002 → **11,662,220** | 39,598,068 → 35,674,503 | 1,620,759 → 1,121,390 | 654,580 → 744,820 |
+| root-only | 3,224,762 → **7,323,652** | 4,435,496 → **8,060,515** | 25,881,500 → 23,443,122 | 5,242,617 → **1,928,817** | 1,782,700 → 1,581,854 |
+| per-node | 10,879,803 → 10,281,676 | 13,579,840 → 12,452,716 | 39,359,409 → 38,564,634 | 1,847,956 → 1,691,751 | 859,505 → 699,931 |
+
+Per-node loses about 8% of its SW parks: that is change 4 refusing to park
+where the registry cannot confirm the owner. MW is correct there, just a CAS
+that arbitrates against nobody, and its aborts fell too.
+
+☞ USER-VISIBLE VALUE STILL WAITS ON THE API: both coarse spacings remain
+refused by `cds_ft_group_attr_set_lock_spacing` unless
+`FEATURE_FT_ANCHOR_VALIDATE` (§12.3). The flip makes them correct; graduating
+exponential is a separate decision.
+
+### 11.6 Still owed for the flip
+
+The always-MW LANES are unchanged by §11.5 -- they call
+`ft_flip_txn_record_tag_mw` directly, so they are MW at every spacing:
+HEAD_BACK, PARENT_WORD, PSO, `_cds_ft_insert_replace`'s structural edges
+(DUAL_UNNAMED), the exponential anchored retires, RANK, NR_CHILD_DEC (§11.4),
+and the duplicate CHAIN class (`cds_ft_node.next`/`.prev`,
+`ft_ord_cell.parent`), which Mathieu put in scope. Each needs its owner named
+at the producer and then the ordinary dispatch; §11.2-§11.3 is the measurement
+that says their owners are held.
+
+## 12. API / design questions queued by Mathieu (2026-09-17)
+
+Not implemented; recorded so the flip does not silently decide them.
+
+### 12.1 An application-provided writer exclusion mode
+
+Planned, removed from the API, to be restored: the app guarantees writer
+exclusion (single-threaded, or its own mutex around every caller). It should
+behave "pretty much as COARSE", except the contract comes from the caller and
+the library takes no writer lock of its own. Debug builds keep the validation
+macros that check the contract.
+
+For the record kinds this costs nothing: `ft_txn_content_sw_ok` is
+`!lock_fine || exclusive`, so such a trie is armed SW trie-wide by door 1, like
+COARSE. The requirement is that the mode be DECLARED, so the library can read
+it; nothing needs to be inferred.
+
+Two things to pin when it returns:
+- it is NOT `cds_ft_attr_set_exclusive`, which additionally promises NO
+  concurrent RCU readers (and so licenses skipping reader-visible publication
+  discipline -- the reachability climb of §11.3 treats an exclusive trie as
+  unreachable by readers). This mode keeps readers, so proxies, tags and grace
+  periods all stay. It is a third writer strategy;
+- the existing hold-ledger oracle polices LOCK collisions, which this mode has
+  none of. The contract to check is "no two writers inside the trie at once",
+  i.e. a writer-scope entry counter that must never exceed one.
+
+☞ AND IT RETIRES THE REMAINING MW (Mathieu): under app exclusion the always-MW
+lanes can go SW too, except the ones that are genuinely MW by design. They are
+MW today on a COARSE trie as well, and not because anything decided it: the
+lanes call `ft_flip_txn_record_tag_mw` UNCONDITIONALLY (the root pointer, the
+cell list, head back edges, parent_word, PSO, state, RANK, NR_CHILD_DEC), so
+door 1 arms the rest of the txn SW and these stay MW. Nothing can race them
+there and no validate can fail, so one predicate (`ft_txn_content_sw_ok`)
+consulted by those recorders converts the lot. The only record that must stay
+MW is the DLM lock TAKE -- the arbitration point -- and such a trie takes no
+DLM locks at all. Independent of the fine-spacing flip; do it right after.
+
+### 12.2 COARSE vs FINE + ROOT_ONLY -- redundant?
+
+As a CONCURRENCY setting, yes: both serialize every structural writer. As
+machinery, no:
+
+| | COARSE | FINE + root-only |
+|---|---|---|
+| `lock_fine` | false | true |
+| what serializes writers | the FT-wide writer lock (a fair mutex) | the ROOT node's state-word LOCK bit, taken by an MW CAS through the engine |
+| lock sets | none derived | derived per op, every member's anchor collapsing onto one word (dedupe everywhere) |
+| on contention | waits | refuses (-EAGAIN), the op re-descends; escalation for fairness |
+| per-op cost | one mutex | an acquire record, a release/retire terminal, dedupe bookkeeping, guards |
+| record kind | door 1, trie-wide | door 2, per record, keyed on ownership |
+| bulk ops | FT-wide lock | FT-wide lock -- common |
+
+Root-only earns its keep as the MAXIMAL-COLLAPSE TEST AXIS for the anchor
+machinery, not as a configuration: every gap this flip had to close (members
+deduping onto one word with nothing filing them, and a record whose owner is
+covered only by the root) was invisible at per-node and exponential.
+
+### 12.3 Gate ROOT_ONLY as non-public (Mathieu)
+
+`cds_ft_group_attr_set_lock_spacing` already refuses EXPONENTIAL and ROOT_ONLY
+unless `FEATURE_FT_ANCHOR_VALIDATE`, but the ENUMERATOR sits in the public
+header, so the option reads as public API. Once the flip makes EXPONENTIAL a
+real setting, the two part ways: exponential graduates, root-only stays a dev
+axis behind its own config gate (its own macro name, not the anchor-validation
+one it shares today).
