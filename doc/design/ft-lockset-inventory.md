@@ -824,3 +824,30 @@ The five open items, in order. Probe trees `blane4` (struct anchor) and
 Gate after the batch, clean rebuild: 18/18 GREEN. `bf-nsk`
 (`NO_FEATURE_FT_SKIP_COMPRESSED`): ft_unit and ft_inv at per-node and
 exponential, GREEN.
+
+### 11.4 Queued for the flip (Mathieu, 2026-09-17)
+
+**`ft_remove_one_commit`'s not-held `nr_child--` keeps its MW kind until the
+flip.** Its kind is chosen by `ft_flip_txn_owns` -- the per-node lock registry --
+so it takes the hardcoded-MW branch wherever the registry is empty, which
+includes the tries that are armed SW trie-wide by door 1:
+
+| per ft_inv leg | per-node | exponential |
+|---|---|---|
+| coarse trie (FT-wide writer lock) | 286,007 | 273,252 |
+| exclusive trie (no peer) | 104,643 | 95,269 |
+| fine, shared (op holds the ANCHOR, an ancestor) | 0 | 536,499 |
+| fine, bulk (FT-wide lock) | 0 | 25 |
+
+Nothing chose MW for the first two rows: the txn around them parks every other
+state-word record SW (`ft_txn_content_sw_ok`), and the other producers of this
+very word (`nr_child++`, the tombstone) park SW there too, so the MW record is
+the odd one out -- harmless only because those tries exclude every peer. MW
+stays correct meanwhile (a CAS that arbitrates against nobody).
+
+The third row is door 2's anchor-blindness: the op holds the holder's anchor and
+`owns()` looks for the holder itself. ⇒ at the flip, pick the kind from the
+trie's mode AND an anchor-aware ownership answer, and correct the register row
+(`metadata.state nr_child--`), whose "MW [DESIGN]" is not backed by its own
+note (2) -- that note is about the TAG (FT-SLOT-1), not the kind, and the code's
+"self-guarded by this very CAS" comment predates the leaf-delete hoist.
