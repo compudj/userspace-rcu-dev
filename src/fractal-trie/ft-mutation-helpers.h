@@ -5819,6 +5819,23 @@ static void ft_ch_sa_score(struct ft_ch_site *s, const struct cds_ft *ft,
 #endif /* FT_DEBUG_STRUCT_ANCHOR */
 
 /*
+ * The engine's late-last predicate for an FT commit: is @slot the state word of
+ * a lock THIS txn registered?  Those are the words whose settle hands a lock
+ * back, so they settle after every other record -- including the same-tagged
+ * duplicate-chain links the lock protects.
+ */
+static bool ft_flip_txn_late_last(void *arg, void **slot)
+{
+	const struct ft_flip_txn *t = (const struct ft_flip_txn *) arg;
+	unsigned int i;
+
+	for (i = 0; i < t->nr_locks; i++)
+		if ((void **) &t->locks[i].meta->state == slot)
+			return true;
+	return false;
+}
+
+/*
  * Commit an FT flip-txn (ft_flip_txn_create*): commit @mtxn -- whose edge set was
  * recorded straight into it as the op built -- then free the handle.  The commit
  * publishes the whole recorded edge set atomically (one status-word flip) and
@@ -5855,6 +5872,20 @@ enum urcu_txn_status ft_flip_txn_commit(struct cds_ft *ft,
 	 * what it then publishes.
 	 */
 	urcu_txn_desc_set_late_tag(t->mtxn->desc, FT_STATE_PROXY);
+	/*
+	 * ☠ AND FT_STATE_PROXY IS NOT ONLY THE STATE WORDS' TAG: the duplicate
+	 * chain's links are tagged FT_HLIST_TAG == URCU_TXN_TAG == 1 too, so the
+	 * late pass alone settled a registered lock's release and the chain
+	 * links that lock protects in PLANT order -- release first.  MEASURED on
+	 * inv_concurrent_insert_replace_nolist: a same-key cds_ft_replace took
+	 * the chain holder while @old_node->next still held the releasing
+	 * commit's proxy (26 of 400 filtered runs), passed its raw
+	 * ft_node_is_removed() test, then loaded MARK(NULL) through its txn and
+	 * recorded &((node *) 0x2)->prev -- the SIGSEGV in
+	 * urcu_txn_install_mw_depth, ~2% of runs before the delete tier took its
+	 * holder lock and ~3.4% after.  Settle the REGISTERED lock words last.
+	 */
+	urcu_txn_desc_set_late_last(t->mtxn->desc, ft_flip_txn_late_last, t);
 	if (caa_unlikely(t->acquire_miss)) {
 #ifdef FT_DEBUG_RESERVE_RATCHET
 		{

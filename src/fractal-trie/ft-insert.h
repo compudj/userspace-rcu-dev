@@ -5500,6 +5500,39 @@ enum cds_ft_status _cds_ft_replace_locked(struct cds_ft *ft,
 		hctx.held.nr_extra = 1;
 		have_hctx = true;
 
+#ifdef FT_DEBUG_LATE_SETTLE
+		/*
+		 * PROBE: does the holder lock ever come back FREE while a word it
+		 * protects still carries the releasing commit's proxy?  The
+		 * engine settles every record tagged like the lock word in ONE
+		 * late pass, in plant order, and FT_HLIST_TAG == FT_STATE_PROXY.
+		 */
+		{
+			static unsigned long ft_ls_checked, ft_ls_proxy,
+				ft_ls_proxy_marked;
+			void *raw = CMM_LOAD_SHARED(old_node->next);
+
+			uatomic_inc(&ft_ls_checked);
+			if (urcu_txn_is_proxy(raw, FT_HLIST_TAG)) {
+				void *res = urcu_txn_resolve(raw, FT_HLIST_TAG);
+				unsigned long c = uatomic_add_return(
+					&ft_ls_proxy, 1);
+
+				if ((uintptr_t) res & CDS_FT_NODE_REMOVED_FLAG)
+					uatomic_inc(&ft_ls_proxy_marked);
+				if (c <= 4 || !(c & (c - 1)))
+					fprintf(stderr, "FT LATE-SETTLE replace: "
+						"holder acquired, old->next still "
+						"a PROXY (resolves %p%s) checked=%lu "
+						"proxy=%lu proxy_marked=%lu\n",
+						res, ((uintptr_t) res &
+						CDS_FT_NODE_REMOVED_FLAG) ?
+						" = MARKED" : "",
+						uatomic_read(&ft_ls_checked), c,
+						uatomic_read(&ft_ls_proxy_marked));
+			}
+		}
+#endif
 		/* @old_node's OWN tombstone, now that a peer cannot set it. */
 		if (caa_unlikely(ft_node_is_removed(old_node))) {
 			s = CDS_FT_STATUS_NOT_FOUND;

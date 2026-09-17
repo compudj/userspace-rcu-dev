@@ -350,6 +350,20 @@ struct urcu_txn_desc {
 	 * urcu_txn_recs_aligned above already asserts.
 	 */
 	uintptr_t late_tag;
+	/*
+	 * AND A TAG CANNOT NAME A WORD CLASS.  An embedder whose lock words
+	 * share their proxy tag with words the lock PROTECTS (the fractal
+	 * trie's state words and its duplicate-chain links are both tagged 1)
+	 * gets both in the late pass, settled in plant order -- and a release
+	 * planted before the words it covers frees the lock while they are
+	 * still proxies, the very window the late pass exists to close.
+	 *
+	 * @late_last, when set, splits the late pass: late-tagged records it
+	 * answers TRUE for settle in a THIRD pass, after every other late-tagged
+	 * record.  NULL keeps the two-pass order exactly.
+	 */
+	bool (*late_last)(void *arg, void **slot);
+	void *late_last_arg;
 	struct urcu_txn_record recs[];	/* frozen at commit */
 };
 
@@ -780,19 +794,28 @@ void urcu_txn_settle(struct urcu_txn_desc *t, unsigned int planted)
 		URCU_TXN_REC_WROTE(r, want);
 	}
 	if (t->late_tag) {
-		for (i = 0; i < planted; i++) {
-			struct urcu_txn_record *r = &t->recs[i];
+		unsigned int pass;
 
-			if (r->proxy_tag != t->late_tag)
-				continue;
-			urcu_txn_dbg_parked_check(t, r, i);
-			uatomic_store(r->slot,
-				st == URCU_TXN_DESC_SUCCEEDED ?
-					r->new_ptr : r->old_ptr,
-				CMM_RELEASE);
-			URCU_TXN_REC_WROTE(r,
-				st == URCU_TXN_DESC_SUCCEEDED ?
-					r->new_ptr : r->old_ptr);
+		/* pass 0: the late class; pass 1: what @late_last keeps for last */
+		for (pass = 0; pass < (t->late_last ? 2U : 1U); pass++) {
+			for (i = 0; i < planted; i++) {
+				struct urcu_txn_record *r = &t->recs[i];
+
+				if (r->proxy_tag != t->late_tag)
+					continue;
+				if (t->late_last &&
+						t->late_last(t->late_last_arg,
+							r->slot) != (pass == 1))
+					continue;
+				urcu_txn_dbg_parked_check(t, r, i);
+				uatomic_store(r->slot,
+					st == URCU_TXN_DESC_SUCCEEDED ?
+						r->new_ptr : r->old_ptr,
+					CMM_RELEASE);
+				URCU_TXN_REC_WROTE(r,
+					st == URCU_TXN_DESC_SUCCEEDED ?
+						r->new_ptr : r->old_ptr);
+			}
 		}
 	}
 }
@@ -811,6 +834,21 @@ void urcu_txn_desc_set_late_tag(struct urcu_txn_desc *t, uintptr_t tag)
 	 */
 	if (t && t != (struct urcu_txn_desc *) -1L)
 		t->late_tag = tag;
+}
+
+/*
+ * Among the late-tagged records, settle those @last answers TRUE for AFTER all
+ * the others (see @late_last).  Call before commit; NULL restores two passes.
+ * @last runs on the committing thread, inside the settle, and must not block.
+ */
+static inline
+void urcu_txn_desc_set_late_last(struct urcu_txn_desc *t,
+		bool (*last)(void *arg, void **slot), void *arg)
+{
+	if (t && t != (struct urcu_txn_desc *) -1L) {
+		t->late_last = last;
+		t->late_last_arg = arg;
+	}
 }
 
 /*
@@ -948,6 +986,8 @@ struct urcu_txn_desc *urcu_txn_create(unsigned int cap,
 	t->nr_mw = 0;
 	t->poisoned = 0;
 	t->late_tag = 0;	/* recycled slab block: declare nothing by default */
+	t->late_last = NULL;
+	t->late_last_arg = NULL;
 	return t;
 }
 
