@@ -110,6 +110,36 @@ struct urcu_slab {
 static struct urcu_slab *urcu_slab_registry[URCU_SLAB_MAX_REG];
 static int urcu_slab_nreg;
 #define URCU_SLAB_STAT(s, f)	uatomic_inc(&(s)->st_##f)
+/*
+ * ☞ THE FOOTPRINT AS IT EVOLVES, not just at exit.  Every carve of a fresh
+ * superblock is 2 MiB of address space this arena will NEVER give back
+ * (urcu_slab_free pushes to the ORIGIN arena's freelist; nothing unmaps), so
+ * the growth curve of @st_sbs IS the growth curve of the process footprint.
+ * Printed every 64 superblocks (128 MiB) so it interleaves with the embedder's
+ * own progress output instead of needing an external sampler.
+ *
+ * @reuse%% is the discriminator: alloc takes from the CURRENT cpu's arena while
+ * free returns to the block's ORIGIN arena, so a migrating thread finds its new
+ * arena empty and CARVES instead of reusing.  A falling reuse%% under load is
+ * that asymmetry, not a leak.
+ */
+#define URCU_SLAB_GROWTH_TRACE(s, a)					\
+	do {								\
+		unsigned long sbs__ = uatomic_read(&(s)->st_sbs);	\
+									\
+		if (!(sbs__ & 63UL))					\
+			fprintf(stderr,					\
+				"# [slab %s] GROWTH sbs=%lu (%.1f MiB) reuse=%lu carve=%lu reuse%%=%.1f cpu=%d\n", \
+				(s)->name, sbs__,			\
+				(double) sbs__ * (double) URCU_SLAB_RANGE \
+					/ (1024.0 * 1024.0),		\
+				uatomic_read(&(s)->st_reuse),		\
+				uatomic_read(&(s)->st_carve),		\
+				100.0 * (double) uatomic_read(&(s)->st_reuse) \
+					/ (double) (uatomic_read(&(s)->st_reuse) \
+						+ uatomic_read(&(s)->st_carve) + 1), \
+				sched_getcpu());			\
+	} while (0)
 static __attribute__((destructor))
 void urcu_slab_stats_dump(void)
 {
@@ -129,6 +159,7 @@ void urcu_slab_stats_dump(void)
 }
 #else
 #define URCU_SLAB_STAT(s, f)	do { } while (0)
+#define URCU_SLAB_GROWTH_TRACE(s, a)	do { (void) (a); } while (0)
 #endif
 
 /* Smallest class that fits @bytes, or -1 if larger than the top class. */
@@ -247,6 +278,7 @@ struct urcu_slab_sb *urcu_slab_sb_new(struct urcu_slab *s, struct urcu_slab_aren
 	sb->bump = (sizeof(*sb) + 15) & ~(size_t) 15;	/* objects start past the header */
 	sb->next = a->sb;
 	URCU_SLAB_STAT(s, sbs);
+	URCU_SLAB_GROWTH_TRACE(s, a);
 	return sb;
 }
 
