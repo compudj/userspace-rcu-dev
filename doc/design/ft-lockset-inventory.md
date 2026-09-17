@@ -764,26 +764,63 @@ pointed at the external promote. It was blind to the orphan plan-lock marks
 in `lctx`'s extras, which the audit counts as HELD(ctx). A lock hoist written
 from it closed nothing and was reverted.
 
-### 11.3 Open
+### 11.3 Closed (2026-09-17)
 
-1. **Chain, `ft_detach_node:3941`** (compressed-parent branch, list off):
-   freeze_leaf is recorded into `orphan_txn` holding nothing (no extras, no
-   ancestor). {C,P,GP} are taken later, in
-   `ft_detach_node_replace_compressed_parent`. That is sound for the MW record,
-   but it is not lock-before-read. 4 / 19 / 1 per leg.
-2. **Owner-bearing UNDATED records, now re-asked at commit** (they were not):
-   over 14 exponential legs, 40 LATE with `locks 1->1 ledger 0->0`, and 5 still
-   undatable at commit. All 5 are the in-place delete's forward edge at the
-   detach commit, and each has an ancestor held (`ancestor_held 1`). That is
-   consistent with the hoist's descent-dated anchor, but not a proof.
-3. **The fuse's `parent_word` lane** (txn site ft-remove.h:1463): 7 LATE
-   records over 8 legs read `locks 1->2 ledger 3->0`. A lock registered between
-   the record and the commit, so "held when the record was made" (the SW
-   precondition) is not shown for these.
-4. **Not scored:** the hlist helpers' COARSE rows (`SOME` / `UNDECL`, which
-   cannot see `@ft`); the head and parent-word rows' `hidden` declarations
-   (build-invisible claims, counted and not believed); and
-   `ft_popcount_node_set_nth:516` node-body writes the struct-anchor climb
-   cannot date (15,447 per exponential leg).
-5. **CELL-aliased `nr_child--`:** `ft_remove_one_commit`'s not-held state edge
-   is still counted inside CELL (§3), so it is not split out and not asked.
+The five open items, in order. Probe trees `blane4` (struct anchor) and
+`bchain3` (chain audit, `-DFEATURE_FT_HOLD_TRACE`). All legs green.
+
+1. **Chain, `ft_detach_node:3941`: fixed.** The freeze sat in the helper's
+   retiring arm (`topmost=0`, no orphans): the leaf hangs straight under `cn`,
+   which only the helper's {src_cn, pub_parent} set takes. Recording the freeze
+   in the caller first was a record made holding nothing. It now happens inside
+   `ft_detach_node_replace_compressed_parent`, after each arm's acquire (and on
+   the bulk split re-home return). Chain audit: 0 violations at every spacing.
+   The moved row reads held: 47,618 per-node (own lock), 69,923 exponential
+   (17,022 own + 52,758 ancestor), 41,800 root-only (ancestor).
+2. **UNDATED owner-bearing records: settled.** The record keeps the owner's held
+   ancestors (`anc_rec`). At commit the report says whether the owner's anchor
+   was among them, or, for an owner still undatable, whether every ancestor held
+   at commit was already held at the record. 8 exponential legs: every LATE
+   record reads `anchor_held_at_record 1`, and the 7 still undatable read
+   `ancestor_held 1`, subset 1. No hold arrived between record and commit on
+   any of them.
+3. **The fuse's `parent_word` lane: settled.** Its `locks 1->2` is an orphan
+   anchor registered after the record, not the owner's. The owner's anchor was
+   already held at the record in every sample (`anchor_held_at_record 1`).
+4. **Unscored rows: scored.**
+   - Every chain-store call site now has a FULL audit row. The three remove_all
+     freezes that had none (the NIL key's two, the prefix clear) read held:
+     registry, or ancestor at root-only.
+   - HIDDEN declarations are now tested. Is the target reachable, through its
+     current (parent, offset) pairs up to a non-exclusive trie's root slot, or
+     for a head through its holder's slot? Per ft_inv leg: 5,616,097 /
+     4,848,829 / 5,042,418 asked (per-node / exponential / root-only), **0
+     reachable**; ft_unit 1,331,448, 0.
+   - Controls: LOCKED in-place body writes read reachable at ~100% (counters
+     are unlocked, so within a few dozen). Live removed leaves (heads) read
+     reachable at 99.95%; the rest are heads moving mid-scan.
+   - ☠ The control first read 3% at two sites. The climb did not resolve a
+     SKIP_X dual, which names cn's child and not cn, so every path through a
+     skip-compressed node read unreachable. The head test also asked a
+     compressed holder by byte. Both are fixed; without the control, the
+     HIDDEN zeros were blind there.
+   - `ft_popcount_node_set_nth:516` is the REFUSED arm (`-ERANGE`, no store).
+     Its `lockVIOL` counts callers that declined the in-place tier, on nodes
+     with no parent word yet. Not a write.
+5. **The not-held `nr_child--`: split and asked.** `ft_remove_one_commit`
+   records it directly, with `FT_STATE_PROXY` spelled out, under its own
+   always-MW class `NR_CHILD_DEC`. It is the same MW record as before, no
+   longer counted in CELL. Per ft_inv leg:
+
+   | | per-node | exponential |
+   |---|---|---|
+   | fine, shared trie | 0 | 536,499, anchor held (`ft_sa_anchor_props`) |
+   | coarse trie, FT-wide lock | 286,007 | 273,252 |
+   | exclusive trie | 104,643 | 95,269 |
+   | fine, bulk (FT-wide lock) | 0 | 25 |
+
+   Root-only: 2,084,317 of 2,084,321 anchor held, 4 undatable.
+
+Gate after the batch, clean rebuild: 18/18 GREEN. `bf-nsk`
+(`NO_FEATURE_FT_SKIP_COMPRESSED`): ft_unit and ft_inv at per-node and
+exponential, GREEN.

@@ -62,6 +62,14 @@
  * @iter_depth is the byte-depth of @iter_node_flag, and @ctx the op's lock
  * context: both acquires below are lock-set members, and a member's acquire
  * goes to its ANCHOR (doc/design/ft-dlm-lock-coarseness.md §2).
+ *
+ * @freeze_leaf (@freeze_len entries), when set, is the removed external leaf
+ * whose chain freezes in @txn.  It is recorded HERE, after each arm's acquire,
+ * because its chain's holder can be @iter_node_flag itself -- a leaf straight
+ * under the compressed parent -- which only these acquires take.  The caller
+ * used to record it first: -DFT_DEBUG_CHAIN_HOLD read it holding nothing
+ * 4 / 19 / 1 times per ft_inv leg (per-node / exponential / root-only), all
+ * in the retiring arm below.
  */
 static
 int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
@@ -76,7 +84,9 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 		struct ft_detach_run *run,
 		struct ft_flip_txn *txn,
 		bool record_only,
-		long count_delta)
+		long count_delta,
+		struct cds_ft_node *freeze_leaf,
+		unsigned int freeze_len)
 {
 	/*
 	 * Does the op hold the SKIP_X dual's derived grandparent?  ANSWERED BY
@@ -233,6 +243,13 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			if (g->old_dir_via_suffix || idx < 0 || ft->rank_stats ||
 					count_delta || fuse_cell || run)
 				return -EDOM;
+			/* A bulk fold: the FT-wide writer lock is the exclusion. */
+			if (freeze_leaf) {
+				ft_ch_audit_ctx(ft, txn, ctx, freeze_leaf);
+				ft_hlist_freeze_chain_prepare(ft,
+					ft_flip_txn_handle(txn), freeze_leaf,
+					freeze_len);
+			}
 			g->deferred[idx].child =
 				(struct cds_ft_inode_flag *) topmost_external_nodes;
 			CMM_STORE_SHARED(*g->deferred[idx].slot,
@@ -271,6 +288,12 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 				ft_flip_txn_record_release_lock(txn, cn_held.lock,
 					cn_held.lock_snap);
 			}
+		}
+		/* After the acquire: see the function header. */
+		if (freeze_leaf) {
+			ft_ch_audit_ctx(ft, txn, ctx, freeze_leaf);
+			ft_hlist_freeze_chain_prepare(ft, ft_flip_txn_handle(txn),
+				freeze_leaf, freeze_len);
 		}
 		/*
 		 * Fold the external head's back-edge -- cell->parent (list on) or
@@ -641,6 +664,15 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 					set[1].held.lock, set[1].held.lock_snap);
 			}
 			dlm_a2 = true;
+		}
+		/*
+		 * After the acquire: the leaf sits straight under @src_cn, which
+		 * this arm retires and has just locked.  See the function header.
+		 */
+		if (freeze_leaf) {
+			ft_ch_audit_ctx(ft, txn, ctx, freeze_leaf);
+			ft_hlist_freeze_chain_prepare(ft, ft_flip_txn_handle(txn),
+				freeze_leaf, freeze_len);
 		}
 		/*
 		 * nr_keys fold (LEAF Increment 2): the fresh internal REPLACES the
@@ -3935,14 +3967,11 @@ int ft_detach_node(struct cds_ft *ft,
 			/*
 			 * The removed external leaf freezes atomically with this
 			 * compressed-parent replace that unlinks its chain (doc §4.B):
-			 * one MARK edge into @orphan_txn, the +1 reserved above.
+			 * one MARK edge into @orphan_txn, the +1 reserved above.  The
+			 * replace records it, after the acquire that holds its chain.
 			 */
-			if (freeze_leaf) {
-				ft_ch_audit_ctx(ft, orphan_txn, &lctx, freeze_leaf);
-				ft_hlist_freeze_chain_prepare(ft, ft_flip_txn_handle(orphan_txn),
-					freeze_leaf, freeze_len);
+			if (freeze_leaf)
 				freeze_leaf_fused = true;
-			}
 			/*
 			 * @cur_depth dates @iter_node_flag: the climb tracks the
 			 * holder's byte-depth alongside the node itself, and
@@ -3957,7 +3986,7 @@ int ft_detach_node(struct cds_ft *ft,
 				topmost_external_nodes, elevated_old_child,
 				fuse_cell,
 				pub, run, orphan_txn, fold_replace,
-				count_delta);
+				count_delta, freeze_leaf, freeze_len);
 			if (ret) {
 				/*
 				 * -EAGAIN: the commit CONSUMED @orphan_txn (a
@@ -5096,6 +5125,17 @@ int ft_detach_node(struct cds_ft *ft,
 					else
 						uatomic_inc(&ft_chdate_derived);
 				}
+#endif
+#ifdef FT_DEBUG_CHAIN_HOLD
+				/*
+				 * THE HEAD-WORD CONTROL: the removed leaf is a LIVE
+				 * head until this commit, so ft_ch_head_reachable must
+				 * read it reachable -- else its HIDDEN zeros are blind.
+				 */
+				if (ft->lock_fine && !ft->exclusive &&
+						ft_wlock_held != ft)
+					ft_ch_head_ctl_count(ft_ch_head_reachable(ft,
+						freeze_leaf));
 #endif
 				ft_ch_audit_ctx(ft, commit_txn, &lctx, freeze_leaf);
 				ft_hlist_freeze_chain_prepare(ft, ft_flip_txn_handle(commit_txn),
@@ -8767,6 +8807,7 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 			 * which is why it is the cure rather than widening the
 			 * acquire.
 			 */
+			ft_ch_audit(ft, txn, external_nodes);
 			ft_hlist_freeze_chain_prepare(ft, ft_flip_txn_handle(txn),
 				external_nodes, nr_frozen);
 			/*
@@ -8811,6 +8852,7 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 			 */
 			struct ft_flip_txn *txn = root_txn;
 
+			ft_ch_audit(ft, txn, external_nodes);
 			ft_hlist_freeze_chain_prepare(ft, ft_flip_txn_handle(txn),
 				external_nodes, nr_frozen);
 			if (ft_remove_one_commit(ft,
@@ -9129,6 +9171,7 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 				 * tears the derived tail's NULL and aborts this
 				 * commit, leaving the key in place for the retry.
 				 */
+				ft_ch_audit_ctx(ft, txn, &lctx, chain_head);
 				ft_hlist_freeze_chain_prepare(ft, ft_flip_txn_handle(txn), chain_head,
 					nr_frozen);
 				/*

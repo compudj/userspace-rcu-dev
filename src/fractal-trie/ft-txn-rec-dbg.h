@@ -76,7 +76,7 @@ enum ft_ab_cls {
 	 * assert to be REACHED, and a config nobody builds never reaches it.
 	 */
 	FT_AB_MWA_BASE,
-	FT_AB_CLS_NR = FT_AB_MWA_BASE + 12,
+	FT_AB_CLS_NR = FT_AB_MWA_BASE + 13,
 };
 
 /* Which witness saw the hold, for the classes where a lock could cover it. */

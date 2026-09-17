@@ -174,9 +174,9 @@ enum ft_tk_rec_class {
  *   CELL         a non-structural-tag edge replayed through ft_ord_cell_flip_into:
  *                the key-ordered CELL LIST (ft_ord_cell.lnode links and the
  *                deletion mark, MW by design) -- NOT the duplicate chain, a
- *                different list stored on the engine handle -- plus the one
- *                ft_state_edge producer (ft_remove_one_commit's not-held
- *                nr_child--), whose FT_STATE_PROXY tag is the same bit 0.
+ *                different list stored on the engine handle.  (The not-held
+ *                nr_child-- of ft_remove_one_commit, whose FT_STATE_PROXY tag
+ *                is the same bit 0, used to land here; it is NR_CHILD_DEC.)
  *                THE G4 LANE.  Convertible only if cells grow a state word and
  *                join lock-sets -- the separately-planned workstream.
  *   RANK         nr_keys propagated up the ancestor chain.  A rank-stats trie
@@ -217,6 +217,7 @@ enum ft_tk_mwa_class {
 	FT_TK_MWA_PSO,
 	FT_TK_MWA_STATE,
 	FT_TK_MWA_GUARD,
+	FT_TK_MWA_NR_CHILD_DEC,	/* the in-place delete's not-held nr_child-- */
 	FT_TK_MWA_NR,
 };
 
@@ -467,6 +468,7 @@ static const char * const ft_ab_names[FT_AB_CLS_NR] = {
 	"mwa:ROOT", "mwa:HEAD_BACK", "mwa:DUAL", "mwa:DUAL_ROOT",
 	"mwa:DUAL_NAMED", "mwa:DUAL_UNNAMED", "mwa:CELL",
 	"mwa:RANK", "mwa:PARENT_WORD", "mwa:PSO", "mwa:STATE", "mwa:GUARD",
+	"mwa:NR_CHILD_DEC",
 };
 
 static
@@ -1388,7 +1390,7 @@ void ft_tk_dump(void)
 			"ROOT", "HEAD_BACK", "DUAL", "DUAL_ROOT",
 			"DUAL_NAMED", "DUAL_UNNAMED", "CELL",
 			"RANK", "PARENT_WORD", "PSO", "STATE",
-			"GUARD",
+			"GUARD", "NR_CHILD_DEC",
 		};
 		static const char * const mwa_what[FT_TK_MWA_NR] = {
 			"&ft->root -- no node to lock, NEVER converts",
@@ -1403,6 +1405,7 @@ void ft_tk_dump(void)
 			"child parent_slot_offset -- §8.3 layout split retires it",
 			"the reparent sweep's own child state {live->live} -- a validate; must stay MW",
 			"§4.B guard on an INSTALLED value node -- a validate; must stay MW",
+			"in-place delete's nr_child--, holder not in the registry -- was counted in CELL (shared bit 0)",
 		};
 
 		for (i = 0; i < FT_TK_MWA_NR; i++)

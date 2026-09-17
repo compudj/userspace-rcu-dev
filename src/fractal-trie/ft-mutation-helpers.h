@@ -1709,6 +1709,12 @@ struct ft_flip_txn {
 		unsigned char lane, rv;
 		/* Holds at the record (registry, ledger): did any arrive since? */
 		unsigned int nlocks, nhold;
+		/*
+		 * The owner and its ancestors the op held AT THE RECORD (any
+		 * witness): the commit asks whether the owner's anchor is one.
+		 */
+		struct cds_ft_metadata *anc_rec[8];
+		unsigned char nanc_rec;
 	} sa_pend[16];
 	unsigned int sa_npend;
 	/*
@@ -3450,6 +3456,15 @@ struct ft_ch_site {
 		 */
 		hw_hidden, hw_mw, hw_locked_ok, hw_locked_viol,
 		/*
+		 * A HIDDEN declaration PUT TO THE TEST: is the target reachable by
+		 * a reader right now, through the words as they stand?  LIVE is a
+		 * false claim -- a raw store on a node readers can see.  The
+		 * control asks the same of LOCKED in-place writes, which are live
+		 * by construction, so a LIVE of zero is not a blind reading.
+		 */
+		hw_hidden_live, hw_hidden_undecided, ctl_locked_asked,
+		ctl_locked_live, ctl_why[8], ctl_why_hop0[8],
+		/*
 		 * WHY the UNHELD verdict, split so it cannot be read as one
 		 * population.  This class has twice produced a false UNHELD from
 		 * a hold the walker could not see, and the prescribed acquire
@@ -3550,6 +3565,221 @@ struct ft_ch_site *ft_ch_site_of(const char *fn, int line, bool coarse,
 	ft_ch_sites[i].coarse = coarse;
 	ft_ch_sites[i].wkind = wkind;
 	return &ft_ch_sites[i];
+}
+
+/*
+ * Can a reader reach @m through the (parent_word, parent_slot_offset) pairs as
+ * they stand, up to a non-exclusive trie's root slot?  1 yes, 0 no, -1 a hop
+ * could not be read cleanly (a parked word).  The climb of ft_dt_live_via_pair,
+ * except that a root node answers too (a body write into the live root is a
+ * question here).
+ */
+/* Why a climb answered 0 (a PROBE on the control; index into the site's reason[]). */
+enum { FT_CH_R_NOPW, FT_CH_R_ROOT_OWNER, FT_CH_R_ROOT_OTHER, FT_CH_R_PEXT,
+	FT_CH_R_SLOT_OUT, FT_CH_R_SLOT_NULL, FT_CH_R_SLOT_OTHER, FT_CH_R_NR };
+static __thread int ft_ch_reach_why, ft_ch_reach_hop;
+
+static int ft_ch_meta_reachable(const struct cds_ft *ft,
+		const struct cds_ft_metadata *m)
+{
+	int hops;
+
+	for (hops = 0; hops <= FT_MAX_DEPTH; hops++) {
+		struct cds_ft_inode_flag *praw, *parent, *val;
+		struct cds_ft_inode_flag **slot;
+		uintptr_t cur;
+
+		ft_ch_reach_hop = hops;
+		praw = (struct cds_ft_inode_flag *) CMM_LOAD_SHARED(m->parent_word);
+		if (!praw) {
+			ft_ch_reach_why = FT_CH_R_NOPW;
+			return 0;
+		}
+		if (ft_node_flip_proxy(praw))
+			return -1;
+		if (ft_parent_is_root_position(praw)) {
+			struct cds_ft *owner = ft_parent_trie(praw);
+			struct cds_ft_inode_flag *rv;
+
+			ft_ch_reach_why = FT_CH_R_ROOT_OWNER;
+			if (!owner || owner->exclusive)
+				return 0;
+			rv = (struct cds_ft_inode_flag *) CMM_LOAD_SHARED(owner->root);
+			if (!rv)
+				return 0;
+			if (ft_node_flip_proxy(rv))
+				return -1;
+			ft_ch_reach_why = FT_CH_R_ROOT_OTHER;
+			return ft_node_ptr(ft_skip_child_ptr(rv)) ==
+				cds_ft_metadata_to_item(
+					(struct cds_ft_metadata *) m);
+		}
+		parent = ft_parent_node(praw);
+		if (!parent || ft_node_flip_proxy(parent))
+			return -1;
+		if (ft_node_external(parent)) {
+			ft_ch_reach_why = FT_CH_R_PEXT;
+			return 0;
+		}
+		cur = CMM_LOAD_SHARED(m->parent_slot_offset);
+		if (cur & FT_STATE_PROXY)
+			return -1;
+		slot = (struct cds_ft_inode_flag **) ((char *) ft_node_ptr(parent) +
+				FT_PSO_DECODE(cur) * sizeof(void *));
+		if (!ft_slot_in_node(parent, slot)) {
+			ft_ch_reach_why = FT_CH_R_SLOT_OUT;
+			return 0;
+		}
+		val = (struct cds_ft_inode_flag *) CMM_LOAD_SHARED(*slot);
+		if (!val) {
+			ft_ch_reach_why = FT_CH_R_SLOT_NULL;
+			return 0;
+		}
+		if (ft_node_flip_proxy(val))
+			return -1;
+		if (ft_node_ptr(ft_skip_child_ptr(val)) !=
+				cds_ft_metadata_to_item((struct cds_ft_metadata *) m)
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+				/*
+				 * A SKIP_X dual names cn's CHILD, not cn: the slot
+				 * reaches @m when the skip resolves to it.  Without
+				 * this the climb read every path through a
+				 * skip-compressed node as unreachable -- ~97% of the
+				 * LOCKED control at two popcount sites.
+				 */
+				&& !(ft_node_skip_compressed(val) &&
+					cds_ft_item_to_metadata(
+						(struct cds_ft_inode *)
+						ft_skip_to_compressed(
+							(struct cds_ft *) ft, val)) ==
+					m)
+#endif
+				) {
+			ft_ch_reach_why = FT_CH_R_SLOT_OTHER;
+			return 0;
+		}
+		m = ft_node_compressed(parent) ?
+			cds_ft_item_to_metadata((struct cds_ft_inode *)
+				ft_compressed_node_ptr(parent)) :
+			cds_ft_item_to_metadata(ft_node_ptr(parent));
+	}
+	return -1;
+}
+
+/*
+ * The same for an external HEAD, through its CURRENT parent word (the head's
+ * prev, or its cell's parent): the holder must be reachable and must still
+ * name the head -- @external_nodes for a prefix head, a child slot otherwise.
+ */
+static __thread int ft_ch_head_why;	/* PROBE: why a head read 0 */
+
+static int ft_ch_head_reachable(const struct cds_ft *ft,
+		struct cds_ft_node *en)
+{
+	struct cds_ft_inode_flag *pw, *holder;
+	void *prev;
+	int r;
+
+	ft_ch_head_why = 0;
+	prev = ft_dereference_prev_resolved(en);
+	if (!prev)
+		return 0;
+	pw = ft->ordered_list ?
+		ft_resolve_flip_proxy(rcu_dereference(
+			ft_ord_cell_ptr(prev)->parent)) :
+		(struct cds_ft_inode_flag *) prev;
+	ft_ch_head_why = 1;
+	if (!pw)
+		return 0;
+	if (ft_node_flip_proxy(pw))
+		return -1;
+	if (ft_parent_is_root_position(pw)) {
+		struct cds_ft *owner = ft_parent_trie(pw);
+		struct cds_ft_inode_flag *rv;
+
+		ft_ch_head_why = 2;
+		if (!owner || owner->exclusive)
+			return 0;
+		rv = (struct cds_ft_inode_flag *) CMM_LOAD_SHARED(owner->root);
+		if (rv && ft_node_flip_proxy(rv))
+			return -1;
+		return rv && (struct cds_ft_node *) ft_node_ptr(rv) == en;
+	}
+	holder = ft_parent_node(ft_parent_prefix_strip(pw));
+	if (!holder || ft_node_flip_proxy(holder))
+		return -1;
+	ft_ch_head_why = 3;
+	if (ft_node_external(holder))
+		return 0;
+	r = ft_ch_meta_reachable(ft, ft_flag_to_metadata((struct cds_ft *) ft,
+		holder));
+	ft_ch_head_why = 4;
+	if (r != 1)
+		return r;
+	ft_ch_head_why = ft_node_compressed(holder) ? 7 : 6;
+	if (ft_parent_prefix_head(pw))
+		ft_ch_head_why = 5;
+	if (ft_parent_prefix_head(pw))
+		return ft_dereference_external(ft_flag_to_metadata(
+			(struct cds_ft *) ft, holder)->external_nodes) == en;
+	if (ft_node_compressed(holder)) {
+		/* One child slot, not addressed by byte. */
+		struct cds_ft_inode_flag *v = ft_resolve_flip_proxy(
+			ft_compressed_node_ptr(holder)->child);
+
+		return v && (struct cds_ft_node *) ft_node_ptr(v) == en;
+	}
+	{
+		unsigned int b;
+
+		for (b = 0; b < 256; b++) {
+			struct cds_ft_inode_flag *v = ft_node_get_nth(ft,
+				holder, NULL, (uint8_t) b, FT_PF_NONE);
+
+			if (v && !ft_node_flip_proxy(v) &&
+					(struct cds_ft_node *) ft_node_ptr(v) == en)
+				return 1;
+		}
+	}
+	return 0;
+}
+
+static unsigned long ft_ch_hidden_live_reports;
+static unsigned long ft_ch_head_ctl[3];	/* [undecided, no, yes] */
+static unsigned long ft_ch_head_ctl_why[8];
+
+static void ft_ch_head_ctl_count(int r)
+{
+	uatomic_inc(&ft_ch_head_ctl[r + 1]);
+	if (!r)
+		uatomic_inc(&ft_ch_head_ctl_why[ft_ch_head_why]);
+}
+
+static void ft_ch_head_ctl_report(void) __attribute__((destructor));
+static void ft_ch_head_ctl_report(void)
+{
+	if (ft_ch_head_ctl[0] | ft_ch_head_ctl[1] | ft_ch_head_ctl[2])
+		fprintf(stderr, "FT CH HEAD-CONTROL live removed leaf: reachable=%lu not=%lu undecided=%lu | not: noprev=%lu nopw=%lu root=%lu holder_ext=%lu holder_unreach=%lu prefix=%lu slot_int=%lu slot_cn=%lu\n",
+			ft_ch_head_ctl[2], ft_ch_head_ctl[1], ft_ch_head_ctl[0],
+			ft_ch_head_ctl_why[0], ft_ch_head_ctl_why[1],
+			ft_ch_head_ctl_why[2], ft_ch_head_ctl_why[3],
+			ft_ch_head_ctl_why[4], ft_ch_head_ctl_why[5],
+			ft_ch_head_ctl_why[6], ft_ch_head_ctl_why[7]);
+}
+
+static void ft_ch_hidden_score(struct ft_ch_site *s, int r, const char *fn,
+		int line, void *target)
+{
+	if (r < 0) {
+		s->hw_hidden_undecided++;
+		return;
+	}
+	if (!r)
+		return;
+	s->hw_hidden_live++;
+	if (uatomic_add_return(&ft_ch_hidden_live_reports, 1) <= 16)
+		fprintf(stderr, "FT CH HIDDEN-LIVE %s:%d target %p\n", fn, line,
+			target);
 }
 
 /*
@@ -3732,10 +3962,13 @@ void ft_ch_audit_owner_at(const char *fn, int line, const struct cds_ft *ft,
 			/*
 			 * Declared build-invisible: unreachable by any reader
 			 * or peer, so there is nothing to exclude and no
-			 * witness to ask.  Counted so the class's shape stays
-			 * visible, never scored.
+			 * witness to ask -- IF the claim holds, which is what
+			 * the reachability test asks.
 			 */
 			s->hw_hidden++;
+			ft_ch_hidden_score(s, ft_ch_head_reachable(ft,
+				(struct cds_ft_node *) item), fn, line,
+				(void *) item);
 			return;
 		case FT_EXCL_MW_CAS:
 			/*
@@ -4037,11 +4270,26 @@ void ft_ch_audit_body_at(const char *fn, int line, const struct cds_ft *ft,
 	switch (excl) {
 	case FT_EXCL_HIDDEN:
 		s->hw_hidden++;
+		ft_ch_hidden_score(s, ft_ch_meta_reachable(ft, owner), fn, line,
+			owner);
 		return;
 	case FT_EXCL_MW_CAS:
 		s->hw_mw++;
 		return;
 	case FT_EXCL_LOCKED:
+		/* The control: an in-place write on a node readers can reach. */
+		s->ctl_locked_asked++;
+		{
+			int cr = ft_ch_meta_reachable(ft, owner);
+
+			if (cr == 1)
+				s->ctl_locked_live++;
+			else if (!cr) {
+				s->ctl_why[ft_ch_reach_why]++;
+				if (!ft_ch_reach_hop)
+					s->ctl_why_hop0[ft_ch_reach_why]++;
+			}
+		}
 		/* Registry, ledger, wide ctx -- a bracket, not one witness. */
 		if ((t && ft_flip_txn_owns(t, owner)) ||
 				ft_hold_trace_holds(owner) ||
@@ -4164,6 +4412,8 @@ void ft_ch_audit_parent_at(const char *fn, int line, const struct cds_ft *ft,
 	switch (excl) {
 	case FT_EXCL_HIDDEN:
 		s->hw_hidden++;
+		ft_ch_hidden_score(s, ft_ch_meta_reachable(ft, child_meta), fn, line,
+			(void *) child_meta);
 		return;
 	case FT_EXCL_MW_CAS:
 		s->hw_mw++;
@@ -4242,6 +4492,20 @@ static void ft_ch_audit_report(void)
 			fprintf(stderr, "%-34s %6s   HELD(ctx) breakdown: txn=%lu extra=%lu glue=%lu outer=%lu\n",
 				nm, "", s->ctx_txn, s->ctx_extra, s->ctx_glue,
 				s->ctx_outer);
+		if (s->hw_hidden || s->ctl_locked_asked)
+			fprintf(stderr, "%-34s %6s   HIDDEN claim: asked=%lu LIVE=%lu undecided=%lu | control LOCKED reachable=%lu/%lu\n",
+				nm, "", s->hw_hidden, s->hw_hidden_live,
+				s->hw_hidden_undecided, s->ctl_locked_live,
+				s->ctl_locked_asked);
+		if (s->ctl_locked_asked > s->ctl_locked_live)
+			fprintf(stderr, "%-34s %6s   control MISS why: nopw=%lu/%lu root_owner=%lu/%lu root_other=%lu/%lu pext=%lu/%lu slot_out=%lu/%lu slot_null=%lu/%lu slot_other=%lu/%lu (all/hop0)\n",
+				nm, "", s->ctl_why[0], s->ctl_why_hop0[0],
+				s->ctl_why[1], s->ctl_why_hop0[1],
+				s->ctl_why[2], s->ctl_why_hop0[2],
+				s->ctl_why[3], s->ctl_why_hop0[3],
+				s->ctl_why[4], s->ctl_why_hop0[4],
+				s->ctl_why[5], s->ctl_why_hop0[5],
+				s->ctl_why[6], s->ctl_why_hop0[6]);
 		if (s->sa_asked)
 			fprintf(stderr, "%-34s %6s   STRUCT-ANCHOR: asked=%lu noowner=%lu HELD(self)=%lu HELD(anc)=%lu SELF_ONLY=%lu undated=%lu undated_held=%lu NOLOCKS=%lu UNHELD=%lu\n",
 				nm, "", s->sa_asked, s->sa_noowner, s->sa_self,
@@ -5979,6 +6243,33 @@ static enum ft_sa_rv ft_sa_rec_verdict(const struct cds_ft *ft,
 		const struct ft_flip_txn *t, const struct ft_lock_ctx *ctx,
 		struct cds_ft_metadata *owner, void **slot, void *new_ptr);
 
+/*
+ * The owner and every ancestor of it the op holds right now, by any witness,
+ * climbing the parent words without locks.  Up to @max, nearest first.
+ */
+static unsigned int ft_sa_held_path(const struct ft_flip_txn *t,
+		const struct ft_lock_ctx *ctx, struct cds_ft_metadata *m,
+		struct cds_ft_metadata **out, unsigned int max)
+{
+	unsigned int n = 0, guard = 0;
+
+	while (m && guard++ < FT_SA_PATH_MAX) {
+		struct cds_ft_inode_flag *pw, *parent;
+
+		if (n < max && ft_sa_witness(t, ctx, m))
+			out[n++] = m;
+		pw = ft_resolve_flip_proxy(rcu_dereference(m->parent_word));
+		if (!pw || ft_parent_is_root_position(pw))
+			break;
+		parent = ft_parent_node(ft_parent_prefix_strip(pw));
+		if (!parent || ft_node_flip_proxy(parent) ||
+				ft_node_external(parent))
+			break;
+		m = ft_flag_to_metadata(t->sa_ft, parent);
+	}
+	return n;
+}
+
 /* Uncovered records whose txn never reached the engine (ft_flip_txn_destroy). */
 static void ft_sa_pend_bailed(const struct ft_flip_txn *t)
 {
@@ -6046,6 +6337,8 @@ static void ft_sa_lane_ask(struct ft_flip_txn *t,
 		sp->rv = (unsigned char) v;
 		sp->nlocks = t->nr_locks;
 		sp->nhold = ft_hold_trace_count();
+		sp->nanc_rec = (unsigned char) ft_sa_held_path(t, ctx, owner,
+			sp->anc_rec, CAA_ARRAY_SIZE(sp->anc_rec));
 	} else {
 		ft_sa_rec_count(site, pc0, pc1, FT_SA_RV_C_OVERFLOW, false);
 	}
@@ -6356,6 +6649,7 @@ enum urcu_txn_status ft_flip_txn_commit(struct cds_ft *ft,
 			FT_STATE_PROXY);
 
 	enum ft_sa_rv sa_cv[CAA_ARRAY_SIZE(t->sa_pend)];
+	struct cds_ft_metadata *sa_anc[CAA_ARRAY_SIZE(t->sa_pend)];
 	unsigned int sa_nhold = ft_hold_trace_count();
 
 	for (sa_i = 0; sa_i < t->sa_npend; sa_i++) {
@@ -6372,6 +6666,9 @@ enum urcu_txn_status ft_flip_txn_commit(struct cds_ft *ft,
 			 */
 			sa_cv[sa_i] = ft_sa_rec_verdict(t->sa_ft, t, NULL,
 				t->sa_pend[sa_i].owner, NULL, NULL);
+			if (!ft_sa_struct_anchor(t->sa_ft,
+					t->sa_pend[sa_i].owner, &sa_anc[sa_i]))
+				sa_anc[sa_i] = NULL;
 			sa_held[sa_i] = sa_cv[sa_i] == FT_SA_RV_HELD ||
 				sa_cv[sa_i] == FT_SA_RV_HELD_COARSE ||
 				sa_cv[sa_i] == FT_SA_RV_UNDATED_HELD;
@@ -6412,7 +6709,7 @@ enum urcu_txn_status ft_flip_txn_commit(struct cds_ft *ft,
 		if ((sp->lane || sp->rv == FT_SA_RV_UNDATED) &&
 				cv != FT_SA_RV_C_NEVER_AB &&
 				uatomic_add_return(&ft_sa_lane_commit_reports,
-					1) <= 16) {
+					1) <= 64) {
 			char o0[256], o1[256];
 			/*
 			 * Still undatable at commit: is ANY ancestor held?  The
@@ -6420,32 +6717,43 @@ enum urcu_txn_status ft_flip_txn_commit(struct cds_ft *ft,
 			 * is a gap and "one held" is consistent with coverage
 			 * (not a proof: it may be the wrong ancestor).
 			 */
-			int anc = -1;
+			int anc = -1, arec = -1;
 
 			if (sa_cv[sa_i] == FT_SA_RV_UNDATED) {
-				struct cds_ft_inode_flag *af =
-					ft_resolve_flip_proxy(ft_parent_node(
-						sp->owner->parent_word));
-				unsigned int ag = 0;
+				/*
+				 * No anchor to compare: is every ancestor held
+				 * now one that was held at the record?  1 = no
+				 * hold arrived in between on the owner's path.
+				 */
+				struct cds_ft_metadata *hp[8];
+				unsigned int nh = ft_sa_held_path(t, NULL,
+					sp->owner, hp, CAA_ARRAY_SIZE(hp));
+				unsigned int hi, ai;
 
-				anc = 0;
-				while (af && ag++ < FT_MAX_DEPTH &&
-						!ft_node_external(af) &&
-						!ft_parent_is_trie(af)) {
-					struct cds_ft_metadata *am =
-						ft_flag_to_metadata(t->sa_ft,
-							af);
+				anc = nh > 0;
+				arec = 1;
+				for (hi = 0; hi < nh; hi++) {
+					bool seen = false;
 
-					if (!am)
-						break;
-					if (ft_sa_witness(t, NULL, am)) {
-						anc = 1;
-						break;
-					}
-					af = ft_resolve_flip_proxy(
-						ft_parent_node(
-							am->parent_word));
+					for (ai = 0; ai < sp->nanc_rec; ai++)
+						if (sp->anc_rec[ai] == hp[hi])
+							seen = true;
+					if (!seen)
+						arec = 0;
 				}
+			}
+			/*
+			 * Was the anchor that covers the owner at commit ALREADY
+			 * held at the record?  1 settles the SW precondition for
+			 * this record; 0 means it was taken in between.
+			 */
+			else if (sa_anc[sa_i]) {
+				unsigned int ai;
+
+				arec = 0;
+				for (ai = 0; ai < sp->nanc_rec; ai++)
+					if (sp->anc_rec[ai] == sa_anc[sa_i])
+						arec = 1;
 			}
 			ft_sa_off(sp->pc0, o0, sizeof(o0));
 			ft_sa_off(sp->pc1, o1, sizeof(o1));
@@ -6457,14 +6765,14 @@ enum urcu_txn_status ft_flip_txn_commit(struct cds_ft *ft,
 			fprintf(stderr, "FT SA %s COMMIT %s site=%s:%d "
 				"pc0=%s pc1=%s owner %p verdict rec %d commit "
 				"%d locks %u->%u ledger %u->%u ancestor_held "
-				"%d owner state %#lx\n",
+				"%d anchor_held_at_record %d owner state %#lx\n",
 				sp->lane ? "LANE" : "UNDATED",
 				cv == FT_SA_RV_C_LATE ? "LATE" : "NEVER_OK",
 				sp->site ? sp->site->file : "?",
 				sp->site ? sp->site->line : 0, o0, o1,
 				(void *) sp->owner, (int) sp->rv,
 				(int) sa_cv[sa_i], sp->nlocks, t->nr_locks,
-				sp->nhold, sa_nhold, anc,
+				sp->nhold, sa_nhold, anc, arec,
 				(unsigned long) urcu_txn_resolve((void *)
 					CMM_LOAD_SHARED(sp->owner->state),
 					FT_STATE_PROXY));
@@ -6651,6 +6959,9 @@ void __ft_flip_txn_record_tag_ctx(struct ft_flip_txn *t,
 				sp->rv = (unsigned char) v;
 				sp->nlocks = t->nr_locks;
 				sp->nhold = ft_hold_trace_count();
+				sp->nanc_rec = (unsigned char) ft_sa_held_path(t,
+					dbg_ctx, owner, sp->anc_rec,
+					CAA_ARRAY_SIZE(sp->anc_rec));
 			} else {
 				ft_sa_rec_count(FT_TK_TXN_SITE(t), pc0, pc1,
 					FT_SA_RV_C_OVERFLOW, false);
@@ -13337,8 +13648,15 @@ int ft_remove_one_commit(struct cds_ft *ft,
 			 * (FT_FLIP_PROXY_TAG) carries a meaningful owner.
 			 *
 			 * Not held -- the ordinary in-place delete, whose holder is
-			 * self-guarded by this very CAS -- it rides @edges[] and
-			 * stays MW, as before.
+			 * self-guarded by this very CAS -- it stays MW, as before.
+			 * ☞ RECORDED HERE, NOT THROUGH @edges[]: both edge replays
+			 * record a non-structural tag MW under the CELL class, and
+			 * this state word shares bit 0 with a cell edge, so the
+			 * always-MW census read it as part of the cell sibling list
+			 * (MW by design).  The same MW record, class NR_CHILD_DEC.
+			 * Above per-node the op holds the holder's anchor
+			 * (ft_sa_anchor_props: 481,980 of 481,980 exponential,
+			 * 2,084,317 of 2,084,321 root-only, 4 undatable).
 			 */
 			if (ft_flip_txn_owns(txn, state_meta)) {
 				ft_flip_txn_record_state(txn, state_meta,
@@ -13348,23 +13666,20 @@ int ft_remove_one_commit(struct cds_ft *ft,
 #ifdef FT_DEBUG_STRUCT_ANCHOR
 				ft_sa_anchor_props(txn, NULL, state_meta, NULL);
 #endif
-				ft_state_edge(&edges[n], &state_meta->state, live,
-					live - FT_STATE_NR_CHILD_ONE);
 				/*
-				 * FT-SLOT-1's RED CONTROL, kept as the regression
-				 * detector (it fired at ft_unit test 24 of the
-				 * -DFEATURE_FT_INSERT_IN_PLACE build, the only
-				 * config that reaches this branch): the load above
-				 * used FT_STATE_PROXY, so the RECORD must too.  One
-				 * tag per slot, globally -- a record planted with a
-				 * wider tag than a resolver strips fabricates a
-				 * misaligned record pointer instead of aborting,
-				 * and the engine's own debug net covers only the
-				 * record path.
+				 * FT-SLOT-1: the load above used FT_STATE_PROXY, so
+				 * the RECORD must too.  One tag per slot, globally --
+				 * a record planted with a wider tag than a resolver
+				 * strips fabricates a misaligned record pointer
+				 * instead of aborting.  Spelled explicitly here, so
+				 * the untagged-edge default cannot reach it.
 				 */
-				urcu_assert_debug(ft_edge_tag(&edges[n]) ==
-						FT_STATE_PROXY);
-				n++;
+				ft_flip_txn_record_tag_mw(txn,
+					(void **) &state_meta->state,
+					(void *) live,
+					(void *) (live - FT_STATE_NR_CHILD_ONE),
+					FT_STATE_PROXY
+					FT_TK_MWA(FT_TK_MWA_NR_CHILD_DEC));
 			}
 		}
 		/*

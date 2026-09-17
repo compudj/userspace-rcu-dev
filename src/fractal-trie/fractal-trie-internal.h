@@ -1183,7 +1183,7 @@ struct ft_pub_rec {
  * INVARIANT this relies on (exhaustively audited 2026-07-23): NO op calls these
  * standalone primitives on a node it ITSELF holds LOCK on.  A LOCK-held
  * node's count / offset change always rides the flip-txn as a RECORDED edge
- * (ft_state_edge / ft_flip_txn_record_release_lock / ft_flip_txn_record_count_
+ * (ft_flip_txn_record_tag_mw / ft_flip_txn_record_release_lock / ft_flip_txn_record_count_
  * parent), never these primitives -- so the spin is on a PEER's lock only and
  * cannot self-deadlock.  A future guard->lock conversion that routes a locked
  * node's nr_child through these standalone primitives (instead of a recorded
@@ -1460,7 +1460,9 @@ struct ft_pub_rec {
  *              IS now extended to concurrent tries for the point ops
  *              (ft_in_place_ok), which is what the assert beside the edge
  *              is armed for.
- *              ☞ ft_state_edge, and the assert beside its caller.
+ *              ☞ ft_state_edge; its one caller (ft_remove_one_commit's
+ *              not-held nr_child--) now records with FT_STATE_PROXY spelled
+ *              explicitly and no longer builds the edge.
  *
  *   FT-SLOT-2  ☑ CLOSED IN BOTH PLACES.  The MARK CHECK is BACK in
  *              ft_hlist_insert_after_prepare -- as a REFUSAL (-ENOENT), not an
