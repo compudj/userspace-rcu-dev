@@ -55,8 +55,8 @@ below are readings, not a blind instrument.
 green in every leg. Numbers are per single leg (one ft_inv run covers its
 list-on, list-off and MW rows).
 
-**Limits.** Only paths the two suites reach (§4). The always-MW lanes name no
-owner, so B can count them but not score them (§3). HIDDEN declarations are
+**Limits.** Only paths the two suites reach (§4). The always-MW lanes are
+lockless by design, so B counts them and does not score them (§3). HIDDEN declarations are
 believed on the raw lanes. Record time asks the SW question on purpose: an SW
 park is legal only if the lock was held when the overwritten value was read.
 
@@ -126,12 +126,12 @@ has its anchor or its member TOMBSTONED at the check. That is the §2.1
 
 ---
 
-## 3. The always-MW lanes — counted, not scored
+## 3. The always-MW lanes — lockless by design, counted not scored
 
-`ft_flip_txn_record_tag_mw` names no owner, so these records carry no coverage
-verdict. They are the part of the surface where the lock-set question has not
-yet been asked per record; asking it needs an owner argument, the way the
-structural lane got one. ft_inv, per-node:
+`ft_flip_txn_record_tag_mw` names no owner because these writes take no lock.
+They are LOCKLESS BY DESIGN (Mathieu): the MCAS arbitrates them on their
+expected values, and the lock-set question does not apply. They are counted
+here only to size the surface. ft_inv, per-node:
 
 | class | records | producers (call site) |
 |---|---|---|
@@ -319,10 +319,9 @@ spacings; HELD 38.3M + held-coarse 1.7M (exponential), HELD 44.7M (per-node).
 
 ### 7.3 What the measurement does NOT cover
 
-- **The always-MW lanes carry no owner**, so nothing asks about them: 21.4M
-  (exponential) / 19.8M (per-node) records per ft_inv leg. These are HEAD_BACK,
-  PARENT_WORD/STATE, PSO and DUAL_UNNAMED (§3). They need an owner argument,
-  the same prerequisite §3 names for coverage.
+- **The always-MW lanes are out of scope, not a gap**: they are lockless by
+  design (§3), so they have no lock holder to audit. That is 21.4M
+  (exponential) / 19.8M (per-node) records per ft_inv leg.
 - **Raw stores outside the record layer** (`ft_hlist_store_*` chain words,
   `ft_set_parent_excl` HIDDEN) never reach a record.
 - **Bulk ops (WLOCK)** are excluded by design: the FT-wide lock with the point
