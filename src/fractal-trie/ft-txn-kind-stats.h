@@ -171,7 +171,12 @@ enum ft_tk_rec_class {
  *                count here is an upper bound on "unheld SKIP_X duals", and
  *                the G4 / Phase-E readings taken from it are stale in both
  *                directions.  Split the branch before trusting the number.
- *   CELL         an ordered-cell / duplicate-chain edge (a non-structural tag).
+ *   CELL         a non-structural-tag edge replayed through ft_ord_cell_flip_into:
+ *                the key-ordered CELL LIST (ft_ord_cell.lnode links and the
+ *                deletion mark, MW by design) -- NOT the duplicate chain, a
+ *                different list stored on the engine handle -- plus the one
+ *                ft_state_edge producer (ft_remove_one_commit's not-held
+ *                nr_child--), whose FT_STATE_PROXY tag is the same bit 0.
  *                THE G4 LANE.  Convertible only if cells grow a state word and
  *                join lock-sets -- the separately-planned workstream.
  *   RANK         nr_keys propagated up the ancestor chain.  A rank-stats trie
