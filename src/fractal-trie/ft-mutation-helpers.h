@@ -1705,6 +1705,10 @@ struct ft_flip_txn {
 		struct cds_ft_metadata *owner;
 		const struct ft_tk_site *site;
 		void *pc0, *pc1;
+		/* An unfinished lane's owner (ft_sa_lane_ask), and its verdict. */
+		unsigned char lane, rv;
+		/* Holds at the record (registry, ledger): did any arrive since? */
+		unsigned int nlocks, nhold;
 	} sa_pend[16];
 	unsigned int sa_npend;
 	/*
@@ -5492,6 +5496,10 @@ void ft_flip_txn_lock_release_all(struct ft_flip_txn *t)
 	t->nr_locks = 0;
 }
 
+#ifdef FT_DEBUG_STRUCT_ANCHOR
+static void ft_sa_pend_bailed(const struct ft_flip_txn *t);
+#endif
+
 /*
  * Drop an FT flip-txn that was NOT committed (an op aborted before publishing --
  * an OOM or a no-op path).  Nothing was stored into any slot
@@ -5503,6 +5511,9 @@ static inline
 void ft_flip_txn_destroy(struct ft_flip_txn *t)
 {
 	FT_TK_COUNT_END(t, FT_TK_BAILED);
+#ifdef FT_DEBUG_STRUCT_ANCHOR
+	ft_sa_pend_bailed(t);
+#endif
 	ft_flip_txn_lock_release_all(t);
 	if (t->mtxn->desc && t->mtxn->desc != URCU_TXN_ENOMEM) {
 		urcu_txn_destroy(t->mtxn->desc);
@@ -5680,6 +5691,7 @@ enum ft_sa_rv {
 	FT_SA_RV_C_NEVER_OK,	/* still not held, and the commit landed */
 	FT_SA_RV_C_NEVER_AB,	/* still not held, commit aborted/failed */
 	FT_SA_RV_C_OVERFLOW,	/* more uncovered records than sa_pend holds */
+	FT_SA_RV_C_BAILED,	/* never reached the engine: acquire miss, op bail */
 	/* every owner-bearing record, owner resolved at commit ENTRY */
 	FT_SA_RV_T_DEAD_HELD_OK,	/* owner TOMBSTONED, record was covered, commit landed */
 	FT_SA_RV_T_DEAD_UNCOV_OK,	/* owner TOMBSTONED, record NOT covered, commit landed */
@@ -5817,7 +5829,7 @@ void ft_sa_rec_report(void)
 		"total", "sw", "WLOCK", "coarse", "miss", "NOOWNER", "HELD",
 		"held_coarse", "SELF_ONLY", "retire_wit", "undated_held",
 		"UNDATED", "NOLOCKS", "UNHELD", "c_LATE", "c_NEVER_OK",
-		"c_NEVER_AB", "c_OVERFLOW", "T_DEAD_HELD_OK",
+		"c_NEVER_AB", "c_OVERFLOW", "c_BAILED", "T_DEAD_HELD_OK",
 		"T_DEAD_UNCOV_OK", "t_dead_ab", "t_overflow", "p_asked",
 		"P_UNDATED", "p_anchor_held", "P_ANCHOR_NOT_HELD",
 		"P_SELF_ANCHORED", "p_parent_shares", "P_PARENT_DIFFERS",
@@ -5941,10 +5953,20 @@ static bool ft_sa_witness(const struct ft_flip_txn *t,
  * @lock is the word the op's acquire took for @node (NULL: ask the witness).
  */
 static unsigned long ft_sa_props_reports;
-static unsigned long ft_sa_lane_reports;
+static unsigned long ft_sa_lane_reports, ft_sa_lane_commit_reports;
 static enum ft_sa_rv ft_sa_rec_verdict(const struct cds_ft *ft,
 		const struct ft_flip_txn *t, const struct ft_lock_ctx *ctx,
 		struct cds_ft_metadata *owner, void **slot, void *new_ptr);
+
+/* Uncovered records whose txn never reached the engine (ft_flip_txn_destroy). */
+static void ft_sa_pend_bailed(const struct ft_flip_txn *t)
+{
+	unsigned int i;
+
+	for (i = 0; i < t->sa_npend; i++)
+		ft_sa_rec_count(t->sa_pend[i].site, t->sa_pend[i].pc0,
+			t->sa_pend[i].pc1, FT_SA_RV_C_BAILED, false);
+}
 
 /*
  * THE UNFINISHED LANES' LOCK-SET QUESTION.  Their records name no owner, so the
@@ -5955,7 +5977,7 @@ static enum ft_sa_rv ft_sa_rec_verdict(const struct cds_ft *ft,
  * separates "uncovered" from "covered only because the op holds the child".
  */
 __attribute__((noinline))
-static void ft_sa_lane_ask(const struct ft_flip_txn *t,
+static void ft_sa_lane_ask(struct ft_flip_txn *t,
 		const struct ft_lock_ctx *ctx,
 		struct cds_ft_metadata *owner, struct cds_ft_metadata *child)
 {
@@ -5986,6 +6008,25 @@ static void ft_sa_lane_ask(const struct ft_flip_txn *t,
 			ft_sa_witness(t, ctx, ca)) {
 		ft_sa_rec_count(site, pc0, pc1, FT_SA_RV_O_CHILD_ONLY, false);
 		return;
+	}
+	/*
+	 * Re-asked at COMMIT (ft_flip_txn_commit): a stale plan the commit
+	 * discards (c_NEVER_AB / c_BAILED), a lock taken after the record
+	 * (c_LATE), or a record the op commits without its owner (c_NEVER_OK).
+	 */
+	if (t->sa_npend < CAA_ARRAY_SIZE(t->sa_pend)) {
+		struct ft_sa_pend *sp = &t->sa_pend[t->sa_npend++];
+
+		sp->owner = owner;
+		sp->site = site;
+		sp->pc0 = pc0;
+		sp->pc1 = pc1;
+		sp->lane = 1;
+		sp->rv = (unsigned char) v;
+		sp->nlocks = t->nr_locks;
+		sp->nhold = ft_hold_trace_count();
+	} else {
+		ft_sa_rec_count(site, pc0, pc1, FT_SA_RV_C_OVERFLOW, false);
 	}
 	if (uatomic_add_return(&ft_sa_lane_reports, 1) <= 8) {
 		char o0[256], o1[256];
@@ -6293,9 +6334,25 @@ enum urcu_txn_status ft_flip_txn_commit(struct cds_ft *ft,
 			CMM_LOAD_SHARED(t->sa_tpend[sa_i].owner->state),
 			FT_STATE_PROXY);
 
+	enum ft_sa_rv sa_cv[CAA_ARRAY_SIZE(t->sa_pend)];
+	unsigned int sa_nhold = ft_hold_trace_count();
+
 	for (sa_i = 0; sa_i < t->sa_npend; sa_i++) {
 		struct cds_ft_metadata *sa_anchor;
 
+		if (t->sa_pend[sa_i].lane) {
+			/*
+			 * The whole question again, without the site's ctx
+			 * (its frame may be gone): the ledger still answers
+			 * for every hold this thread took.
+			 */
+			sa_cv[sa_i] = ft_sa_rec_verdict(t->sa_ft, t, NULL,
+				t->sa_pend[sa_i].owner, NULL, NULL);
+			sa_held[sa_i] = sa_cv[sa_i] == FT_SA_RV_HELD ||
+				sa_cv[sa_i] == FT_SA_RV_HELD_COARSE ||
+				sa_cv[sa_i] == FT_SA_RV_UNDATED_HELD;
+			continue;
+		}
 		sa_held[sa_i] = ft_sa_struct_anchor(ft, t->sa_pend[sa_i].owner,
 				&sa_anchor) &&
 			ft_sa_witness(t, NULL, sa_anchor);
@@ -6321,12 +6378,40 @@ enum urcu_txn_status ft_flip_txn_commit(struct cds_ft *ft,
 	}
 	st = urcu_txn_commit_flavor(t->mtxn, reclaim);
 #ifdef FT_DEBUG_STRUCT_ANCHOR
-	for (sa_i = 0; sa_i < t->sa_npend; sa_i++)
-		ft_sa_rec_count(t->sa_pend[sa_i].site, t->sa_pend[sa_i].pc0,
-			t->sa_pend[sa_i].pc1,
-			sa_held[sa_i] ? FT_SA_RV_C_LATE :
+	for (sa_i = 0; sa_i < t->sa_npend; sa_i++) {
+		const struct ft_sa_pend *sp = &t->sa_pend[sa_i];
+		enum ft_sa_rv cv = sa_held[sa_i] ? FT_SA_RV_C_LATE :
 			(st == URCU_TXN_STATUS_OK ? FT_SA_RV_C_NEVER_OK :
-				FT_SA_RV_C_NEVER_AB), false);
+				FT_SA_RV_C_NEVER_AB);
+
+		ft_sa_rec_count(sp->site, sp->pc0, sp->pc1, cv, false);
+		if (sp->lane && cv != FT_SA_RV_C_NEVER_AB &&
+				uatomic_add_return(&ft_sa_lane_commit_reports,
+					1) <= 16) {
+			char o0[256], o1[256];
+
+			ft_sa_off(sp->pc0, o0, sizeof(o0));
+			ft_sa_off(sp->pc1, o1, sizeof(o1));
+			/*
+			 * locks/ledger unchanged since the record: no acquire
+			 * came between, so a LATE answer was held at the record
+			 * too and only the record-time climb could not date it.
+			 */
+			fprintf(stderr, "FT SA LANE COMMIT %s site=%s:%d "
+				"pc0=%s pc1=%s owner %p verdict rec %d commit "
+				"%d locks %u->%u ledger %u->%u owner state "
+				"%#lx\n",
+				cv == FT_SA_RV_C_LATE ? "LATE" : "NEVER_OK",
+				sp->site ? sp->site->file : "?",
+				sp->site ? sp->site->line : 0, o0, o1,
+				(void *) sp->owner, (int) sp->rv,
+				(int) sa_cv[sa_i], sp->nlocks, t->nr_locks,
+				sp->nhold, sa_nhold,
+				(unsigned long) urcu_txn_resolve((void *)
+					CMM_LOAD_SHARED(sp->owner->state),
+					FT_STATE_PROXY));
+		}
+	}
 	if (st == URCU_TXN_STATUS_OK && t->sa_ntpend)
 		uatomic_add(&ft_sa_tdead_asked, t->sa_ntpend);
 	for (sa_i = 0; sa_i < t->sa_ntpend; sa_i++) {
@@ -6499,6 +6584,8 @@ void __ft_flip_txn_record_tag_ctx(struct ft_flip_txn *t,
 				sp->site = FT_TK_TXN_SITE(t);
 				sp->pc0 = pc0;
 				sp->pc1 = pc1;
+				sp->lane = 0;
+				sp->rv = (unsigned char) v;
 			} else {
 				ft_sa_rec_count(FT_TK_TXN_SITE(t), pc0, pc1,
 					FT_SA_RV_C_OVERFLOW, false);

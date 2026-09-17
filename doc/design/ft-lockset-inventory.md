@@ -200,7 +200,7 @@ Records per ft_inv leg, by class (the `-DFT_DEBUG_STRUCT_ANCHOR` legs of §7.2):
 | HEAD_BACK | 6,449,049 | 6,288,104 | head back edges: `ft_node_recompact`'s re-home sweep 4.4M, `ft_chain_compress_fused` 0.88M, `ft_park_live_parent_edge` 1.08M, detach, remove_all | **unfinished** (owner: the chain holder) |
 | STATE | 1,673,695 | 984,569 | `{live -> live}` validations of re-homed children (= the PARENT_WORD count); at exponential also **599,063 MW anchored retires** (`ft_chain_compress_fused`, `ft_detach_freeze_one`, insert, recompact, glue) | the retires are **unfinished** writes; the validation is a read check, which the register keeps MW ("a park validates nothing") -- ☐ to confirm |
 | PARENT_WORD | 1,074,632 | 984,569 | `ft_reparent_record_meta`, the child not held | **unfinished** (owner: the parent) |
-| DUAL_UNNAMED | 463,642 | 451,030 | `_cds_ft_insert_replace`'s cell lanes 437k, `ft_ord_cell_swap_publish_multi` 27k -- cell edges with a NULL owner, misfiled under the dual | not split (see CELL) |
+| DUAL_UNNAMED | 463,642 | 451,030 | `_cds_ft_insert_replace`'s leaf replace: the list-off arm 437k (`ft_ord_cell_flip_into`), the list-on arm 27k (`ft_ord_cell_swap_publish_multi`). ☠ NOT cell edges: STRUCTURAL edges built by hand with no owner -- the forward edge, or a SKIP_X dual plus `cn->child` | ☑ asked at every arm (§10.3); the dual's grandparent was NOT held, now taken |
 | PSO | 411,687 | 408,417 | the same re-parent sweeps | **unfinished** |
 | RANK | 1,515 | 1,515 | `nr_keys` via `ft_flip_txn_record_count_parent` (coarse tries only) | **unfinished**: SW under the FT-wide lock, COARSE only |
 
@@ -613,10 +613,8 @@ live only in the context's `extra[]` frames, and without it the probe reads
 | per-node | 8,666,129 | **0** | 0 |
 | exponential | 8,381,861 | **4** (1 recompact head back edge, 2 fuse `parent_word`, 1 insert_replace) | 1 |
 
-ft_unit: 0 uncovered at both spacings. ☐ The 4 need a commit-time re-ask (a stale
-plan, or a gap). ☠ The DUAL_UNNAMED hot path is NOT asked: the hook sits on a cold
-`_cds_ft_insert_replace` flip (asked twice per leg). The ~460k records go through
-`ft_pub_rec_sedges` → `ft_ord_cell_flip_into`, where `rec->owner` is NULL.
+ft_unit: 0 uncovered at both spacings. The 4 were re-asked at commit, and one arm of
+`_cds_ft_insert_replace` was never asked: see §10.3.
 
 ### 10.2 The pair stored plain on a reachable node
 
@@ -660,3 +658,63 @@ The glue site stores a live child's offset plain before the commit parks its
   RED `-DFT_DT_GLUE_RED` resolves right after the store: 67,880 of 67,880.
   `ft_txn_parent_slot_at` reads both words through the txn, so it is coherent by
   construction.
+
+### 10.3 Every DUAL_UNNAMED record asked, and the uncovered re-asked at commit
+
+**Commit-time re-ask.** An uncovered lane record is kept on the txn and asked
+again when its commit goes to the engine, this time without the site's lock
+context:
+- `c_LATE`: covered by then;
+- `c_NEVER_OK`: still uncovered, and the commit landed;
+- `c_NEVER_AB`: still uncovered, and the commit aborted;
+- `c_BAILED`: the txn never reached the engine (an acquire miss, an op bail).
+
+A LATE report prints the registry and ledger counts at the record and at the
+commit. If they are unchanged, no lock arrived in between, so the owner was
+covered at the record too. RED `FT_SA_RED=root` (ft_inv exponential): late
+2,697,912, NEVER_OK 24,941,870, never_ab 57,301, bailed 59,932, overflow 337,714.
+
+**The arm that was never asked.** §10.1 said the hot DUAL_UNNAMED path was
+unasked. That was a misread: the ask with 2 hits per leg is the list-off leaf
+arm's SKIP_X variant. Its single-edge ask read 493,072 (exponential) / 582,596
+(per-node) asked, 0 uncovered. The arm that had no ask was the LIST-ON leaf arm
+(`ft_ord_cell_swap_publish_multi`). DUAL_UNNAMED is filed by `_cds_ft_insert_replace`
+alone, every arm of it. The per-site split (`mwa5`) names no other producer. Its
+edges are built by hand and never pass `ft_pub_rec_add_at`, so the recorder that
+read `unnamed = 0` never saw them.
+
+Asked at the list-on leaf arm, per leg:
+
+| | ft_inv per-node | ft_inv exponential | ft_unit |
+|---|---|---|---|
+| single forward edge (owner P) | 10,620 held | 10,313 held (4 exact, 10,309 via an ancestor) | 1,713 held |
+| SKIP_X variant, `cn->child` (owner cn = P) | 15,729 held | 10,279 held | 130 held |
+| SKIP_X variant, the dual (owner GP) | **15,729 UNCOVERED, all NEVER_OK** | **10,279 UNCOVERED, all NEVER_OK** | **130 UNCOVERED** |
+
+The leaf replace under a compressed parent wrote the grandparent's dual slot
+holding only {P}. §8.1 A drops the live check on the premise that a writer of a
+child's slot holds the node it lives in, and this writer broke that premise. The
+list-off arm has the same shape, reached about once per leg. `cds_ft_replace`
+already takes GP (`ft_lock_skip_dual_gp`, §9.3's third member).
+
+**Fix.** Both leaf arms take GP with `ft_lock_skip_dual_gp` after {P}. They
+derive the edges after that acquire (`ft_insert_replace_leaf_sedges`), from the
+same read-your-own-writes derivation the acquire used. Each reserves one more
+record. The records stay MW.
+
+After, per leg (the `gp`/`gl` legs):
+
+| | uncovered | re-ask at commit |
+|---|---|---|
+| ft_inv per-node x2 | 0 | -- |
+| ft_inv root-only | 0 | -- |
+| ft_inv exponential x7 | 0-4 per leg, all `UNDATED` at the record: 14 total, 1 covered through its child | the other **13: all LATE, 0 NEVER_OK**; the 8 printed with counts all read `locks 1->1 ledger 0->0` |
+| ft_unit per-node, exponential | 0 | -- |
+
+The dual asks now read held: 7,948 of 7,948 (per-node), 12,331 and 9,156
+(exponential), and held_coarse at root-only. The exponential residue is head
+back edges (txn sites ft-insert.h:1163 and ft-remove.h:4785) and the fuse's
+`parent_word`. The climb that dates the owner reads the words without locks, and
+could not date it past a peer's park. At commit the owner's anchor is held, and no
+lock was taken in between. **No lane record commits uncovered.**
+

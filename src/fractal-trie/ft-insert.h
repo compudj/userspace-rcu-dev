@@ -4291,6 +4291,101 @@ enum cds_ft_status cds_ft_insert_unique(struct cds_ft *ft,
 }
 
 /*
+ * The leaf replace's reader-visible edges: the forward edge at @nfp, or -- a
+ * leaf reached through a SKIP_X suffix -- the grandparent's dual slot and
+ * cn->child.  Called AFTER the arm's acquires ({P}, and GP by
+ * ft_lock_skip_dual_gp), from the derivation that acquire used, so the dual
+ * names the grandparent the lock set holds rather than the one a plan made
+ * before it saw.
+ */
+static
+unsigned int ft_insert_replace_leaf_sedges(struct cds_ft *ft,
+		struct urcu_txn *mtxn, struct cds_ft_inode_flag *pnf,
+		struct cds_ft_inode_flag **nfp, struct cds_ft_inode_flag *nf,
+		struct cds_ft_node *node, struct ft_ord_cell_edge *sedges)
+{
+	sedges[0].slot = (struct ft_ord_cell **) nfp;
+	sedges[0].old_target = (struct ft_ord_cell *) nf;
+	sedges[0].new_target = (struct ft_ord_cell *) node;
+
+#ifdef FEATURE_FT_SKIP_COMPRESSED
+	if (ft_node_compressed(pnf)) {
+		struct cds_ft_compressed_node *cn = ft_compressed_node_ptr(pnf);
+		struct cds_ft_metadata *cn_meta =
+			cds_ft_item_to_metadata((struct cds_ft_inode *) cn);
+		struct cds_ft_inode_flag **sslot =
+			ft_txn_parent_slot(cn_meta, ft, mtxn);
+
+		if (sslot && ft_node_skip_compressed(*sslot)) {
+			/*
+			 * ☠ BOTH EXPECTED-OLDS ARE RESOLVED, and both used to
+			 * be RAW loads.  The acquires do not make a raw load
+			 * safe: a MISS still records (the commit discards it),
+			 * and a coarse trie or a root dual holds nothing here.
+			 * A same-key peer's commit can then have a flip proxy
+			 * PARKED on either word at the instant it is read.
+			 * Handing that descriptor to the engine as an
+			 * expected-old trips its own raw-read-of-a-parked-slot
+			 * self-check -- measured, `urcu_txn_add: Assertion
+			 * `!urcu_txn_is_proxy(old_ptr, tag)' failed` (tag 15,
+			 * kind MW), reproducible in ~2.5 min by
+			 * inv_concurrent_insert_replace_nolist.
+			 *
+			 * ☠ AND A RELEASE BUILD HAS NO SUCH ASSERT: the op would
+			 * POISON the descriptor and its own retry loop would
+			 * absorb it, so the arm reads green and is wrong.
+			 * Resolved, each value is the word before or after that
+			 * peer's commit and never a descriptor; a STALE-but-valid
+			 * one simply fails this MW edge's install CAS, which is
+			 * an ABORT the retry loop re-derives from -- the same
+			 * discipline cds_ft_remove's cell capture and ft_graft's
+			 * publish slot follow.
+			 */
+			sedges[0].slot = (struct ft_ord_cell **) sslot;
+			sedges[0].old_target = (struct ft_ord_cell *)
+				ft_resolve_flip_proxy(*sslot);
+			sedges[0].new_target = (struct ft_ord_cell *)
+				ft_skip_compressed_flag(
+					(struct cds_ft_inode_flag *) node,
+					cn->len);
+			/* edge 1: cn->child forward (exact descent). */
+			sedges[1].slot = (struct ft_ord_cell **) &cn->child;
+			sedges[1].old_target = (struct ft_ord_cell *)
+				ft_resolve_flip_proxy(cn->child);
+			sedges[1].new_target = (struct ft_ord_cell *) node;
+			return 2;
+		}
+	}
+#else
+	(void) ft; (void) mtxn; (void) pnf;
+#endif
+	return 1;
+}
+
+#ifdef FT_DEBUG_STRUCT_ANCHOR
+/*
+ * Owners of the leaf replace's structural edges, filed as DUAL_UNNAMED: edge 0
+ * lives in @pnf, or -- the skip variant -- in cn's parent, and edge 1 in cn
+ * (= @pnf).  A macro so each arm keeps its own call-site pc.
+ */
+#define FT_IR_SEDGE_LANE_ASK(ft, txn, actx, pnf, n_sedge)		\
+	do {								\
+		struct cds_ft_metadata *pm__ =				\
+			ft_flag_to_metadata(ft, pnf);			\
+									\
+		if ((n_sedge) == 1) {					\
+			ft_sa_lane_ask(txn, actx, pm__, NULL);		\
+		} else {						\
+			ft_sa_lane_ask(txn, actx,			\
+				ft_sa_owner_of_parent_word(ft,		\
+					rcu_dereference(pm__->parent_word)), \
+				NULL);					\
+			ft_sa_lane_ask(txn, actx, pm__, NULL);		\
+		}							\
+	} while (0)
+#endif
+
+/*
  * Insert a node, replacing the entire existing duplicate chain at the
  * same key if one exists.
  *
@@ -4646,6 +4741,10 @@ restart_replace_attempt:
 						ft_hlist_freeze_chain_prepare(ft, ft_flip_txn_handle(txn),
 							displaced, nr_disp);
 					}
+#ifdef FT_DEBUG_STRUCT_ANCHOR
+					/* &metadata->external_nodes: the holder's own slot. */
+					ft_sa_lane_ask(txn, &actx, metadata, NULL);
+#endif
 					if (ft_ord_cell_swap_publish_multi(ft, old_cell,
 							precell, &sedge, 1, txn) != 0) {
 						ret = -EAGAIN;
@@ -4767,6 +4866,10 @@ restart_replace_attempt:
 						ft_hlist_freeze_chain_prepare(ft, ft_flip_txn_handle(txn),
 							displaced, nr_disp);
 					}
+#ifdef FT_DEBUG_STRUCT_ANCHOR
+					/* &metadata->external_nodes: the holder's own slot. */
+					ft_sa_lane_ask(txn, &actx, metadata, NULL);
+#endif
 					ret = ft_flip_status_to_errno(
 						ft_ord_cell_flip_into(ft, txn,
 							&sedge, 1));
@@ -4833,71 +4936,8 @@ restart_replace_attempt:
 				 * rides the same flip when the list is on.
 				 */
 				struct ft_ord_cell_edge sedges[2] = { 0 };
-				unsigned int n_sedge = 0;
+				unsigned int n_sedge;
 
-				sedges[0].slot = (struct ft_ord_cell **) d.nfp;
-				sedges[0].old_target = (struct ft_ord_cell *) d.nf;
-				sedges[0].new_target = (struct ft_ord_cell *) node;
-				n_sedge = 1;
-
-#ifdef FEATURE_FT_SKIP_COMPRESSED
-				if (ft_node_compressed(d.pnf)) {
-					struct cds_ft_compressed_node *cn =
-						ft_compressed_node_ptr(d.pnf);
-					struct cds_ft_metadata *cn_meta =
-						cds_ft_item_to_metadata(
-							(struct cds_ft_inode *) cn);
-					struct cds_ft_inode_flag **sslot =
-						ft_get_parent_slot(cn_meta, ft);
-
-					if (sslot && ft_node_skip_compressed(*sslot)) {
-						/*
-						 * ☠ BOTH EXPECTED-OLDS ARE RESOLVED, and both
-						 * used to be RAW loads.  Nothing is held here:
-						 * this pair is derived before the commit, and a
-						 * same-key peer's commit can have a flip proxy
-						 * PARKED on either word at the instant it is
-						 * read.  Handing that descriptor to the engine
-						 * as an expected-old trips its own
-						 * raw-read-of-a-parked-slot self-check --
-						 * measured, `urcu_txn_add: Assertion
-						 * `!urcu_txn_is_proxy(old_ptr, tag)' failed`
-						 * (tag 15, kind MW), reproducible in ~2.5 min by
-						 * inv_concurrent_insert_replace_nolist.
-						 *
-						 * ☠ AND A RELEASE BUILD HAS NO SUCH ASSERT: the
-						 * op would POISON the descriptor and its own
-						 * retry loop would absorb it, so the arm reads
-						 * green and is wrong.  Resolved, each value is
-						 * the word before or after that peer's commit
-						 * and never a descriptor; a STALE-but-valid one
-						 * simply fails this MW edge's install CAS, which
-						 * is an ABORT the retry loop re-derives from --
-						 * the same discipline cds_ft_remove's cell
-						 * capture and ft_graft's publish slot follow.
-						 */
-						sedges[0].slot =
-							(struct ft_ord_cell **) sslot;
-						sedges[0].old_target =
-							(struct ft_ord_cell *)
-							ft_resolve_flip_proxy(*sslot);
-						sedges[0].new_target =
-							(struct ft_ord_cell *)
-							ft_skip_compressed_flag(
-								(struct cds_ft_inode_flag *)
-									node, cn->len);
-						/* edge 1: cn->child forward (exact descent). */
-						sedges[1].slot =
-							(struct ft_ord_cell **) &cn->child;
-						sedges[1].old_target =
-							(struct ft_ord_cell *)
-							ft_resolve_flip_proxy(cn->child);
-						sedges[1].new_target =
-							(struct ft_ord_cell *) node;
-						n_sedge = 2;
-					}
-				}
-#endif
 				if (ft->ordered_list) {
 					/*
 					 * Swap the structural slot(s) AND the head's
@@ -4922,6 +4962,7 @@ restart_replace_attempt:
 						ft_flip_txn_create_bounded(ft,
 							FT_ORD_CELL_SWAP_PUBLISH_MAX_EDGES +
 							1 /* §4.B parent guard */ +
+							1 /* §9.3 dual GP: release-lock XOR guard */ +
 							nr_disp * FT_HLIST_FREEZE_MAX_EDGES);
 
 					if (!txn) {
@@ -4955,6 +4996,21 @@ restart_replace_attempt:
 					ft_lock_ctx_init(&actx, &d, txn, &optxn);
 					ft_flip_txn_lock_or_guard_parent(ft, txn, &actx, d.pnf,
 						FT_DEPTH_FROM_DESCENT);
+					/*
+					 * §9.3's THIRD LOCK-SET MEMBER, as cds_ft_replace takes
+					 * it.  Under a compressed @d.pnf the SKIP_X dual lives in
+					 * the GRANDPARENT's body, which {P} does not cover.
+					 * -DFT_DEBUG_STRUCT_ANCHOR measured it: 15,729 (per-node)
+					 * / 10,279 (exponential) dual records per ft_inv leg
+					 * committed with GP not held, and a GP recompact copies
+					 * that slot trusting its own lock.  The edges are derived
+					 * after both acquires (ft_insert_replace_leaf_sedges).
+					 * The record stays MW: a slot is SW xor MW globally.
+					 */
+					(void) ft_lock_skip_dual_gp(ft, &actx, txn, d.pnf,
+						txn->mtxn);
+					n_sedge = ft_insert_replace_leaf_sedges(ft,
+						txn->mtxn, d.pnf, d.nfp, d.nf, node, sedges);
 					ft_replace_fault_arm_abort(txn);
 					/*
 					 * On a peer-conflict ABORT the commit installs
@@ -5016,6 +5072,10 @@ restart_replace_attempt:
 						ft_hlist_freeze_chain_prepare(ft, ft_flip_txn_handle(txn),
 							displaced, nr_disp);
 					}
+#ifdef FT_DEBUG_STRUCT_ANCHOR
+					FT_IR_SEDGE_LANE_ASK(ft, txn, &actx, d.pnf,
+						n_sedge);
+#endif
 					if (ft_ord_cell_swap_publish_multi(ft, old_cell,
 							precell, sedges, n_sedge,
 							txn) != 0) {
@@ -5041,6 +5101,7 @@ restart_replace_attempt:
 						ft_flip_txn_create_bounded(ft,
 							FT_PUB_SEDGE_MAX_EDGES +
 							1 /* §4.B parent guard */ +
+							1 /* §9.3 dual GP: release-lock XOR guard */ +
 							nr_disp * FT_HLIST_FREEZE_MAX_EDGES);
 
 					if (!txn) {
@@ -5074,6 +5135,21 @@ restart_replace_attempt:
 					ft_lock_ctx_init(&actx, &d, txn, &optxn);
 					ft_flip_txn_lock_or_guard_parent(ft, txn, &actx, d.pnf,
 						FT_DEPTH_FROM_DESCENT);
+					/*
+					 * §9.3's THIRD LOCK-SET MEMBER, as cds_ft_replace takes
+					 * it.  Under a compressed @d.pnf the SKIP_X dual lives in
+					 * the GRANDPARENT's body, which {P} does not cover.
+					 * -DFT_DEBUG_STRUCT_ANCHOR measured it: 15,729 (per-node)
+					 * / 10,279 (exponential) dual records per ft_inv leg
+					 * committed with GP not held, and a GP recompact copies
+					 * that slot trusting its own lock.  The edges are derived
+					 * after both acquires (ft_insert_replace_leaf_sedges).
+					 * The record stays MW: a slot is SW xor MW globally.
+					 */
+					(void) ft_lock_skip_dual_gp(ft, &actx, txn, d.pnf,
+						txn->mtxn);
+					n_sedge = ft_insert_replace_leaf_sedges(ft,
+						txn->mtxn, d.pnf, d.nfp, d.nf, node, sedges);
 					ft_replace_fault_arm_abort(txn);
 					/* -EAGAIN on a peer-conflict ABORT (nothing
 					 * installed); the op's own retry loop re-descends. */
@@ -5130,25 +5206,8 @@ restart_replace_attempt:
 							displaced, nr_disp);
 					}
 #ifdef FT_DEBUG_STRUCT_ANCHOR
-					/*
-					 * Owners of the structural edges filed as
-					 * DUAL_UNNAMED: edge 0 lives in @d.pnf, or -- the
-					 * skip variant -- in cn's parent, and edge 1 in cn
-					 * (= @d.pnf).
-					 */
-					if (n_sedge == 1) {
-						ft_sa_lane_ask(txn, &actx,
-							ft_flag_to_metadata(ft, d.pnf), NULL);
-					} else {
-						struct cds_ft_metadata *pm__ =
-							ft_flag_to_metadata(ft, d.pnf);
-
-						ft_sa_lane_ask(txn, &actx,
-							ft_sa_owner_of_parent_word(ft,
-								rcu_dereference(pm__->parent_word)),
-							NULL);
-						ft_sa_lane_ask(txn, &actx, pm__, NULL);
-					}
+					FT_IR_SEDGE_LANE_ASK(ft, txn, &actx, d.pnf,
+						n_sedge);
 #endif
 					if (ft_ord_cell_flip_into(ft, txn, sedges,
 							n_sedge) != 0) {

@@ -1347,15 +1347,19 @@ struct ft_pub_rec {
  *     armed per-op, MW_STRUCT when it did not.  The measurement says the dual
  *     is no longer MW BY CLASS; it does not claim every record is SW.
  *
- *     ☐ DO NOT READ `DUAL_UNNAMED` (~401k per leg) AS THIS ROW'S RESIDUE.  It
- *     counts a STRUCTURAL edge (FT_FLIP_PROXY_TAG) whose producer named no
- *     owner, and a dual is never one: every dual is recorded through
- *     ft_pub_rec_add_at, which reports unnamed = 0 in the SAME RUN.  Those
- *     edges reach the recorder through the ordered-cell lanes carrying a NULL
- *     owner, so the bucket names them after a row they do not belong to -- the
- *     tag-dispatch trap this file already warns about ("a word class is named
- *     by its PRODUCER SITE, not by a tag bit").  Attributing them wants a
- *     per-site split keyed on @t->dbg_site.
+ *     ☠ `DUAL_UNNAMED` (~470k-620k per ft_inv leg) WAS READ AS "NOT THIS ROW",
+ *     on the claim that every dual is recorded through ft_pub_rec_add_at
+ *     (unnamed = 0 in the same run).  That claim was FALSE.
+ *     _cds_ft_insert_replace's leaf replace builds its edges BY HAND (the
+ *     forward edge, or the SKIP_X dual plus cn->child) and names no owner, so
+ *     its dual never reached that recorder.  The per-site split (FT_SA_REC,
+ *     keyed on the txn site) puts the whole bucket on that one op.
+ *     -DFT_DEBUG_STRUCT_ANCHOR asked each edge's owner.  The forward edge and
+ *     cn->child were held.  The dual's GRANDPARENT was not: 15,729 (per-node) /
+ *     10,279 (exponential) records per ft_inv leg, every one committed.
+ *     ☑ The op now takes GP (ft_lock_skip_dual_gp) in both leaf arms and derives
+ *     the edges after that acquire: 0 uncovered at every spacing.  The records
+ *     stay MW and still carry no owner.
  *     ☠ NOT a backtrace at the classification: backtrace_symbols_fd takes the
  *     loader lock, and from 207 threads inside the commit loop it WEDGED the
  *     leg -- 0 of 152 tests in 1800 s.
