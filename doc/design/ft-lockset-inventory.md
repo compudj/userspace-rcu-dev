@@ -909,12 +909,14 @@ exponential is a separate decision.
 
 The always-MW LANES are unchanged by §11.5 -- they call
 `ft_flip_txn_record_tag_mw` directly, so they are MW at every spacing:
-HEAD_BACK, PARENT_WORD, PSO, `_cds_ft_insert_replace`'s structural edges
-(DUAL_UNNAMED), the exponential anchored retires, RANK, NR_CHILD_DEC (§11.4),
-and the duplicate CHAIN class (`cds_ft_node.next`/`.prev`,
-`ft_ord_cell.parent`), which Mathieu put in scope. Each needs its owner named
-at the producer and then the ordinary dispatch; §11.2-§11.3 is the measurement
-that says their owners are held.
+`_cds_ft_insert_replace`'s structural edges (DUAL_UNNAMED), the exponential
+anchored retires, RANK, NR_CHILD_DEC (§11.4), and the duplicate CHAIN class
+(`cds_ft_node.next`/`.prev`, `ft_ord_cell.parent`), which Mathieu put in scope.
+Each needs its owner named at the producer and then the ordinary dispatch;
+§11.2-§11.3 is the measurement that says their owners are held. (HEAD_BACK went
+first, §11.8; PARENT_WORD and PSO came with FT-SLOT-3, §11.7. ☠ The CHAIN class
+is NOT one of them -- §11.9 is why the same recipe FAILS there, and the six
+things that must happen before it can be re-asked.)
 
 ### 11.7 FT-SLOT-3 settled: the back edge belongs to the PARENT
 
@@ -977,6 +979,105 @@ ft_inv leg:
 
 Gate 18/18 GREEN, probe tree with the owner assert armed 6/6 at the three
 spacings, NO_FEATURE_FT_SKIP_COMPRESSED 6/6.
+
+### 11.9 The duplicate CHAIN class: step 1 is DONE, step 2 was ATTEMPTED and REFUTED
+
+Mathieu's design for this class is two steps: *"add the missing lock acquire of
+nearest parent -- in some cases those may already be held.  Once this is
+thorough, ONLY THEN can we switch the chain mutation ops to SW."*  Under the
+governing rule: **the duplicate chain is protected by the NEAREST ANCESTOR
+LOCK.  Period.**
+
+#### ☑ Step 1 is done, and the ops' own lock sets did it
+
+Re-measured at @d6550af9 (`-DFT_DEBUG_CHAIN_HOLD -DFEATURE_FT_HOLD_TRACE`),
+every FULL row of the chain hold audit:
+
+| | ft_unit | ft_inv |
+|---|---|---|
+| per-node | 0 UNHELD | 0 UNHELD |
+| exponential | 0 UNHELD | 0 UNHELD |
+
+`FT CHAIN-DATE on_descent=3,963,730 no_holder=0`; `derived(off-path)` 0 in
+seven of eight audit legs and **2** in one exponential ft_inv leg. The gap this
+class was blocked on -- `ft_detach_node`'s fused `freeze_leaf`, 2,340,730
+UNHELD, plus 678 members reachable only by a back-pointer walk -- closed when
+the delete tier converted. `ft_lock_chain_holder`, written for step 1 and never
+wired, is not needed for the acquire.
+
+☞ BUT THE AUDIT ANSWERS A WEAKER QUESTION THAN THE FLIP ASKS. Its HELD verdict
+is a UNION of three witnesses -- `ft_flip_txn_owns` (the registry), the
+per-thread hold LEDGER, and the lock CONTEXT. A park can only be licensed by
+the first: the ledger is debug-only (`FEATURE_FT_HOLD_TRACE`) and a record
+helper has no ctx. **So "0 UNHELD" does not certify the dispatch**, and reading
+it as the step-2 gate was the error below.
+
+#### ☠☠ Step 2 attempted, and refuted before landing
+
+The attempt: make a chain word's kind the ordinary ownership question
+(`ft_chain_word_sw_ok`: coarse -> SW, the txn owns the chain's HOLDER -> SW,
+else MW), asked once per prepare, with the two caller-DERIVED expected-olds
+(`ft_hlist_freeze_sole_prepare`, and the TAIL of
+`ft_hlist_freeze_chain_prepare`) re-read under the lock so a park could only
+happen on a value read there. It measured 98% converted on ft_unit, 63-77% on
+ft_inv, and passed the 18-leg gate including `--enable-rcu-debug`.
+
+**It is still wrong, and the tree had already written the reason.** An
+adversarial review found six, of which these are decisive:
+
+1. **The kind became a property of the ASKING TXN, not of the SLOT.** The
+   engine's rule is "a slot is SW xor MW, **globally**". The three point-op
+   sites -- `ft_chain_node`, `ft_unchain_node`, `_cds_ft_replace_locked` --
+   acquire the holder into a STACK `ft_held_anchor` BEFORE creating the content
+   txn, so their registry is empty and they can only ever answer MW; the
+   structural sites (`ft_detach_node`'s commit, `_cds_ft_remove_all_locked`,
+   `cds_ft_insert_replace`) carry registered holder locks and answer SW. Same
+   slot, two kinds, by construction.
+2. **THE GATE THIS TREE SET WAS NOT MET.** `ft_lock_chain_holder`'s header:
+   *"STEP 2 IS GATED ON THIS BRANCH BEING MEASURED UNREACHABLE (a counter
+   reading ZERO across every spacing), never on it being 'safe'."* The
+   attempt's own counter read 4.8M unowned per ft_inv leg, and I argued the
+   residue safe instead of zero -- the exact move the header forbids.
+3. **An SW abort WRITES.** `settle()` stores `old_ptr` (abort) or `new_ptr`
+   (commit) **BLIND** (rcu-txn-mcas.h). A failed MW CAS never parks, so its
+   abort writes nothing; an SW record always parks, so its abort restores
+   `old_ptr` into a live slot. Three chain stores pass an expected-old that is
+   an ARGUMENT, never loaded (`succ->prev = pos`, `next->prev = elem`,
+   `next->prev = old`) -- under SW those become abort-time WRITES of a derived
+   value.
+4. **`ft_hlist_append_run_prepare` was missed**, and it is the same shape as
+   `freeze_sole`: its literal `NULL` expected-old is, by its own header, *"the
+   serializing one (CAS old = NULL: a concurrent freeze of the tail fails this
+   commit)"*. The attempt made it parkable without the re-read.
+5. **The re-read is RYW.** `urcu_txn_load` returns this txn's own pending value
+   when the slot is already in its write set, so for a FUSED commit the "re-read
+   under the lock" is not a read of the word at all. It needs
+   `urcu_txn_load_committed`.
+6. **Raw producers remain**, and a raw store cannot be SW-parked: a bare
+   `uatomic_cmpxchg` on `node->next` holding NOTHING in `ft_detach_node`'s
+   standalone freeze fallback (ft-remove.h, audited with a NULL txn), and four
+   plain `new_node->next->prev = ...` stores in `_cds_ft_replace_locked`.
+
+One RED was seen with the attempt in tree -- ft_inv per-node on
+`NO_FEATURE_FT_SKIP_COMPRESSED`, SIGKILLed by the 16G memcg at 395s on
+`inv_concurrent_same_key_removes`, with a writer spinning in
+`urcu_txn_install_mw_depth`. It did NOT reproduce (3 runs with the flip, 3 with
+it compiled out, 6/6 GREEN), so it is recorded, not attributed.
+
+#### The work list before this can be re-asked
+
+1. Make every producer of `cds_ft_node.next` / a member's `.prev` reach the SAME
+   answer -- which means the point ops must REGISTER their holder hold on the
+   content txn (`ft_flip_txn_lock_register_held`), not hold it on the stack.
+   Until then the class stays MW.
+2. Discharge the raw producers in (6).
+3. Give `ft_hlist_append_run_prepare` the re-read, or prove its NULL is loaded
+   under the lock.
+4. Make the freeze re-reads non-RYW (`urcu_txn_load_committed`).
+5. Every store's expected-old must be LOADED, not derived -- including the three
+   `prev` back-edges -- because of (3).
+6. Then meet the tree's own gate: the unowned counter reads ZERO at every
+   spacing.
 
 ## 12. API / design questions queued by Mathieu (2026-09-17)
 
