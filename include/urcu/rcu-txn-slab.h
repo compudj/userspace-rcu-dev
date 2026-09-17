@@ -935,6 +935,36 @@ struct urcu_slab_sb *urcu_slab_sb_new(struct urcu_slab *s, struct urcu_slab_aren
 		munmap(p, base - p);
 	if (base + URCU_SLAB_RANGE != p + raw)
 		munmap(base + URCU_SLAB_RANGE, (p + raw) - (base + URCU_SLAB_RANGE));
+#ifdef MADV_NOHUGEPAGE
+	/*
+	 * ☠ KEEP THE 2 MiB REGION, BUT BACK IT WITH 4 KiB PAGES.
+	 *
+	 * RANGE is 2 MiB and this mapping is RANGE-ALIGNED by construction (that
+	 * is what the two trims above are for), which makes every superblock a
+	 * PERFECT transparent-huge-page candidate -- and a huge page is the one
+	 * backing this allocator must not get:
+	 *
+	 *  - A SUPERBLOCK IS MOSTLY EMPTY BY DESIGN.  There is one arena per
+	 *    (size class x cpu), so on a many-cpu host most arenas hold a
+	 *    handful of blocks.  Backed by a THP, an arena holding ONE 272-byte
+	 *    descriptor costs 2 MiB RESIDENT; backed by 4 KiB pages it costs one
+	 *    page, because only the pages actually touched fault in.  Measured
+	 *    on a 384-hw-thread host: AnonHugePages was 82-84%% of RSS.
+	 *  - AND THE FAULT ITSELF CAN STALL.  On a fragmented host the kernel
+	 *    tries to compact for each huge page: the same binary, THP left
+	 *    enabled, burned 80%% of its CPU in the kernel (stime 10242 vs utime
+	 *    2515) and made ZERO test progress, on a host reading
+	 *    compact_fail/compact_stall = 104,965/109,590 (95.8%%).  With THP
+	 *    disabled it completes in ~100s.
+	 *
+	 * So the mapping stays 2 MiB -- free() derives sb->owner by masking a
+	 * block address with ~RANGE_MASK, and the largest class is 6224 bytes,
+	 * so RANGE cannot simply shrink to a page -- and only its BACKING
+	 * changes.  Nothing here depends on the call succeeding: if the kernel
+	 * refuses, the mapping is exactly what it was before.
+	 */
+	(void) madvise(base, URCU_SLAB_RANGE, MADV_NOHUGEPAGE);
+#endif
 	sb = (struct urcu_slab_sb *) base;
 	sb->owner = a;
 	sb->bump = (sizeof(*sb) + 15) & ~(size_t) 15;	/* objects start past the header */
