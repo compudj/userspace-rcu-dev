@@ -174,9 +174,10 @@ enum ft_tk_rec_class {
  *   CELL         an ordered-cell / duplicate-chain edge (a non-structural tag).
  *                THE G4 LANE.  Convertible only if cells grow a state word and
  *                join lock-sets -- the separately-planned workstream.
- *   RANK         nr_keys propagated up UNLOCKED ancestors.  Convertible only
- *                where the whole path is covered (root-only spacing), which is
- *                Phase E's fold, not G4's.
+ *   RANK         nr_keys propagated up the ancestor chain.  A rank-stats trie
+ *                is coerced COARSE (ft-lifecycle.h), so every writer holds the
+ *                FT-wide writer lock: convertible to SW under that condition
+ *                only (the register's note 9).  MW today is debt.
  *   PARENT_WORD  a child's parent_word written by the recompaction re-parent
  *                sweep, whose acquire takes {C,P,(GP)} and never C's children.
  *                Same shape as DUAL: a lock-set reach question.

@@ -1303,7 +1303,7 @@ struct ft_pub_rec {
  *   metadata.state  {live->live}  --                  MW         MW   [DESIGN]
  *   metadata.parent_word          parent (3)          SW if held MW by constr.
  *   metadata.parent_slot_offset   parent (3)          SW if held MW by constr.
- *   metadata.nr_keys              NONE (climbs up)    MW         MW   [DESIGN]
+ *   metadata.nr_keys              FT-wide lock (9)    MW         MW   [debt]
  *   metadata.incoming_byte        not transacted (7)
  *   metadata.alloc_index          ALLOCATOR-PRIVATE (7) -- never transacted
  *   cds_ft_node.next              the chain HOLDER    MW  (4)    MW   [debt]
@@ -1314,7 +1314,7 @@ struct ft_pub_rec {
  *   ft_ord_cell.node              BUILD-INVISIBLE (8) -- never transacted
  *
  * ☞ "[DESIGN]" means the word can never convert: it has no single owner (the
- * root slot lives in no node; nr_keys climbs ancestors nobody locked; an
+ * root slot lives in no node; an
  * ordered-list splice rewrites the cells of NEIGHBOURING keys, whose holders
  * the op never acquires) or it IS the arbitration point (the lock take).
  * Everything else marked [debt] has a named owner and is on the conversion
@@ -1423,6 +1423,13 @@ struct ft_pub_rec {
  *     No site writes a LIVE cell's @node, so it never needed a kind -- listed
  *     because "absent from the register" and "cannot be written" are different
  *     claims, and only the second one is true here.
+ * (9) Decided 2026-09-17: this row was [DESIGN] on "the count climbs
+ *     ancestors nobody locked", which is true only of a FINE writer, and
+ *     ft-lifecycle.h never lets a rank-stats trie be one: the group is coerced
+ *     to CDS_FT_WRITER_LOCK_COARSE.  Every writer of the word therefore holds
+ *     the FT-wide writer lock (door 1 above), so it may be SW under that
+ *     condition, and ONLY that one: a rank-stats trie that ever runs FINE
+ *     puts the word back to MW.
  *
  * ----------------------------------------------------------------------------
  * OPEN DEFECTS AND OPEN QUESTIONS IN THIS TABLE, tagged so they can be found:
@@ -1612,11 +1619,13 @@ struct cds_ft_metadata {
 	 * Stored with uatomic_store release, loaded with acquire.
 	 */
 	/*
-	 * ☞ Register: NO lock excludes this word, at any spacing -- the count is
-	 * propagated up the ancestor chain to the root, through nodes the op
-	 * never acquired, so every writer whose key path crosses this node writes
-	 * it.  MW by DESIGN, not debt; only a root-only lock-set would cover the
-	 * whole path.  Stored as (count << 1); bit 0 is FT_NR_KEYS_PROXY_TAG.
+	 * ☞ Register: the count is propagated up the ancestor chain to the root,
+	 * through nodes a FINE op never acquires -- which is why a rank-stats
+	 * group is COERCED to CDS_FT_WRITER_LOCK_COARSE (ft-lifecycle.h).  So
+	 * every writer of this word holds the FT-wide writer lock, and the word
+	 * may be SW under that condition and that condition only.  Its MW today
+	 * is debt, not design.  Stored as (count << 1); bit 0 is
+	 * FT_NR_KEYS_PROXY_TAG.
 	 * ☠ One txn may walk one ancestor TWICE (-1 then +1): the expected old
 	 * must come from the DESCRIPTOR first, or the second walk poisons the
 	 * commit and the op livelocks with no contention at all.

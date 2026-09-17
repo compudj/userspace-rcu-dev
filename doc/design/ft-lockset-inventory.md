@@ -55,8 +55,9 @@ below are readings, not a blind instrument.
 green in every leg. Numbers are per single leg (one ft_inv run covers its
 list-on, list-off and MW rows).
 
-**Limits.** Only paths the two suites reach (§4). The always-MW lanes are
-lockless by design, so B counts them and does not score them (§3). HIDDEN declarations are
+**Limits.** Only paths the two suites reach (§4). The always-MW lanes carry
+no owner, so B counts them but cannot score them. §3 says which are MW on
+purpose and which are unfinished. HIDDEN declarations are
 believed on the raw lanes. Record time asks the SW question on purpose: an SW
 park is legal only if the lock was held when the overwritten value was read.
 
@@ -126,22 +127,29 @@ has its anchor or its member TOMBSTONED at the check. That is the §2.1
 
 ---
 
-## 3. The always-MW lanes — lockless by design, counted not scored
+## 3. The always-MW lanes — two by design, the rest unfinished
 
-`ft_flip_txn_record_tag_mw` names no owner because these writes take no lock.
-They are LOCKLESS BY DESIGN (Mathieu): the MCAS arbitrates them on their
-expected values, and the lock-set question does not apply. They are counted
-here only to size the surface. ft_inv, per-node:
+`ft_flip_txn_record_tag_mw` names no owner, so these records carry no coverage
+verdict. Mathieu's classification (2026-09-17):
+- **MW on purpose:** the root pointer, and the cell sibling list.
+- **Everything else should be SW under lock.** Anything still MW here is an
+  unfinished transition, not a design choice.
+- **`nr_keys`:** a rank-stats group is coerced to `CDS_FT_WRITER_LOCK_COARSE`
+  (`ft-lifecycle.h`), so every writer holds the FT-wide writer lock. It may be
+  SW under that condition only (register note 9).
 
-| class | records | producers (call site) |
-|---|---|---|
-| HEAD_BACK | 7,404,358 | `ft_node_recompact` re-homing heads into its copy (insert reserve relocation ~3.3M, detach `ft_node_replace_ptr` ~1.66M), `ft_park_live_parent_edge` 1.25M, `ft_chain_compress_fused`'s child back edge 1.02M, `ft_detach_node_replace_compressed_parent` ~85k, `cds_ft_remove_all` 36k, rekey COW, compaction, merge |
-| PARENT_WORD / STATE | 990,002 each | `ft_reparent_record_meta` from `ft_node_recompact`, `ft_chain_compress_fused`, `ft_park_live_parent_edge`, graft, merge |
-| PSO | 417,404 | the same re-parent sweeps |
-| DUAL_UNNAMED | 410,491 | `_cds_ft_insert_replace`'s ordered-cell lanes (the register already says these are cell edges filed under the dual's name) |
-| CELL / ROOT / RANK | 12.6M / 2.0M / 1.5k | [DESIGN] per the register |
+Records per ft_inv leg, by class (the `-DFT_DEBUG_STRUCT_ANCHOR` legs of §7.2):
 
----
+| class | exponential | per-node | what it is | classification |
+|---|---|---|---|---|
+| ROOT | 1,911,262 | 1,892,283 | `&ft->root` (graft swap, remove, root list swaps, graft/merge publishes) | **MW on purpose** |
+| CELL | 9,405,804 | 8,837,644 | ordered-cell edges through `ft_ord_cell_flip_into` / `ft_ord_cell_record_into_ft` (remove 4.6M, swap publish 1.8M, remove rec 1.3M, root list swaps, graft) | MIXED: the sibling-list links are **MW on purpose**, the other cell edges are unfinished; the records do not say which link, so not split yet |
+| HEAD_BACK | 6,449,049 | 6,288,104 | head back edges: `ft_node_recompact`'s re-home sweep 4.4M, `ft_chain_compress_fused` 0.88M, `ft_park_live_parent_edge` 1.08M, detach, remove_all | **unfinished** (owner: the chain holder) |
+| STATE | 1,673,695 | 984,569 | `{live -> live}` validations of re-homed children (= the PARENT_WORD count); at exponential also **599,063 MW anchored retires** (`ft_chain_compress_fused`, `ft_detach_freeze_one`, insert, recompact, glue) | the retires are **unfinished** writes; the validation is a read check, which the register keeps MW ("a park validates nothing") -- ☐ to confirm |
+| PARENT_WORD | 1,074,632 | 984,569 | `ft_reparent_record_meta`, the child not held | **unfinished** (owner: the parent) |
+| DUAL_UNNAMED | 463,642 | 451,030 | `_cds_ft_insert_replace`'s cell lanes 437k, `ft_ord_cell_swap_publish_multi` 27k -- cell edges with a NULL owner, misfiled under the dual | not split (see CELL) |
+| PSO | 411,687 | 408,417 | the same re-parent sweeps | **unfinished** |
+| RANK | 1,515 | 1,515 | `nr_keys` via `ft_flip_txn_record_count_parent` (coarse tries only) | **unfinished**: SW under the FT-wide lock, COARSE only |
 
 ## 4. Not reached by either suite
 
@@ -319,9 +327,16 @@ spacings; HELD 38.3M + held-coarse 1.7M (exponential), HELD 44.7M (per-node).
 
 ### 7.3 What the measurement does NOT cover
 
-- **The always-MW lanes are out of scope, not a gap**: they are lockless by
-  design (§3), so they have no lock holder to audit. That is 21.4M
+- **The always-MW lanes carry no owner**, so nothing asks about them: 21.4M
   (exponential) / 19.8M (per-node) records per ft_inv leg.
+  - The root pointer and the cell sibling list are MW on purpose and have no
+    lock holder to audit.
+  - The rest should be SW under lock (§3), so they ARE a gap in this audit.
+    That is HEAD_BACK 6.4M, PARENT_WORD 1.1M, PSO 0.4M, the 0.6M exponential MW
+    retires, and the non-sibling part of CELL and DUAL_UNNAMED (not yet split).
+    Asking about them needs the owner named on each record, which is the same
+    step their conversion to SW needs.
+  - `nr_keys` writers all hold the FT-wide writer lock (COARSE only).
 - **Raw stores outside the record layer** (`ft_hlist_store_*` chain words,
   `ft_set_parent_excl` HIDDEN) never reach a record.
 - **Bulk ops (WLOCK)** are excluded by design: the FT-wide lock with the point
