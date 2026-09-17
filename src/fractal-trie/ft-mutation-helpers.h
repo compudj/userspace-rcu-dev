@@ -26,34 +26,6 @@
 #error "ft-mutation-helpers.h is an implementation unit; #include it from fractal-trie.c only"
 #endif
 
-/*
- * -DFT_DEBUG_LIVE_VALIDATE: a SPAN-PRESERVING re-home (a node copied with every
- * span unchanged, so no anchor moves) is bracketed, and FT_LV_RED_DROP=1 -- a
- * RED CONTROL, never shipped -- skips the child-state live validation inside
- * the bracket.  Everywhere else the bracket is just the statement.
- */
-#ifdef FT_DEBUG_LIVE_VALIDATE
-static __thread unsigned int ft_lv_span_depth;
-static int ft_lv_red_drop;
-static unsigned long ft_lv_red_dropped;
-static __attribute__((constructor))
-void ft_lv_red_init(void)
-{
-	ft_lv_red_drop = getenv("FT_LV_RED_DROP") != NULL;
-}
-static __attribute__((destructor))
-void ft_lv_red_report(void)
-{
-	if (ft_lv_red_drop)
-		fprintf(stderr, "FT_LV RED_DROP dropped=%lu\n",
-			ft_lv_red_dropped);
-}
-# define FT_LV_SPAN(stmt)						\
-	do { ft_lv_span_depth++; stmt; ft_lv_span_depth--; } while (0)
-#else
-# define FT_LV_SPAN(stmt)	do { stmt; } while (0)
-#endif
-
 #ifdef FT_DEBUG_INTERLEAVE
 /*
  * -DFT_DEBUG_INTERLEAVE: a TEST-ONLY hook called on the op's own thread at
@@ -13208,7 +13180,7 @@ static void ft_reparent_record_meta(struct cds_ft *ft, struct ft_flip_txn *txn,
 		struct cds_ft_metadata *meta,
 		struct cds_ft_inode_flag *parent_nf,
 		struct cds_ft_inode_flag **slot, bool child_marked,
-		const struct ft_lock_ctx *hold_ctx);
+		const struct ft_lock_ctx *hold_ctx, bool check_child);
 
 static
 void ft_record_child_back_edge(struct cds_ft *ft, struct ft_flip_txn *txn,
@@ -13288,8 +13260,20 @@ void ft_record_child_back_edge(struct cds_ft *ft, struct ft_flip_txn *txn,
 		 * it -- unlike the @child_marked arm, where the edge IS the
 		 * mark's release.
 		 */
+		/*
+		 * NO LIVE CHECK: the chain-compress fuse is this helper's only
+		 * caller, and it moves boundaries only by REMOVING them -- the
+		 * boundary node, and a fused compressed child -- each of which it
+		 * retires and holds.  A node whose anchor was one of those is
+		 * excluded by the fuse's own lock (and a plan made before the
+		 * fuse hits the tombstone), and a node anchored on this child or
+		 * below keeps its anchor.  Contrast the split, which ADDS a
+		 * boundary above a child it does not retire, and so takes that
+		 * child's lock (ft_insert_dlm_acquire_split).
+		 * doc/design/ft-lockset-inventory.md §8.
+		 */
 		ft_reparent_record_meta(ft, txn, meta, new_parent, slot,
-			/*child_marked=*/ false, hold_ctx);
+			/*child_marked=*/ false, hold_ctx, /*check_child=*/ false);
 		return;
 	} else if (ft->ordered_list) {
 		/* Resolved: a parked demotion record may sit on prev (see
@@ -16357,7 +16341,7 @@ void ft_reparent_record_meta(struct cds_ft *ft, struct ft_flip_txn *txn,
 		struct cds_ft_metadata *meta,
 		struct cds_ft_inode_flag *parent_nf,
 		struct cds_ft_inode_flag **slot, bool child_marked,
-		const struct ft_lock_ctx *hold_ctx)
+		const struct ft_lock_ctx *hold_ctx, bool check_child)
 {
 	/*
 	 * THE THIRD STATE @child_marked cannot express: the op HOLDS this
@@ -16540,7 +16524,7 @@ void ft_reparent_record_meta(struct cds_ft *ft, struct ft_flip_txn *txn,
 		ft_hold_trace_drop(meta);
 		ft_flip_txn_record_state(txn, meta,
 			(void *) live_state, (void *) live_state);
-	} else {
+	} else if (check_child) {
 #ifdef FT_DEBUG_LIVE_VALIDATE
 		int lv_self = -1, lv_held = -1;
 # ifdef FT_DEBUG_STRUCT_ANCHOR
@@ -16554,17 +16538,20 @@ void ft_reparent_record_meta(struct cds_ft *ft, struct ft_flip_txn *txn,
 # endif
 		ft_lv_note((void **) &meta->state, __builtin_return_address(0),
 			lv_self, lv_held);
-		if (ft_lv_red_drop && ft_lv_span_depth) {
-			uatomic_inc(&ft_lv_red_dropped);
-			goto lv_dropped;
-		}
 #endif
 		ft_flip_txn_record_state_mw(txn, meta,
 			(void *) live_state, (void *) live_state);
 	}
-#ifdef FT_DEBUG_LIVE_VALIDATE
-lv_dropped:
-#endif
+	/*
+	 * !@check_child: the caller re-homes this child while keeping EVERY span
+	 * (a node copied in place: ft_node_recompact's sweep, compaction's
+	 * compressed relocation), so no anchor moves, and any peer that could
+	 * freeze or retire the child must rewrite its slot in the node being
+	 * copied -- whose lock this op holds.  The live check would observe what
+	 * that lock already excludes (doc/design/ft-lockset-inventory.md §8:
+	 * about 1M checks per ft_inv leg dropped, 0 exclusion violations, dead
+	 * members or dead-owner writes).
+	 */
 	/*
 	 * THE OFFSET IS THE THIRD WORD OF THE SAME CHILD, and it takes the same
 	 * kind dispatch as the two above it -- @meta->parent_word
@@ -16615,7 +16602,7 @@ void ft_reparent_record(struct cds_ft *ft, struct ft_flip_txn *txn,
 		struct cds_ft_inode_flag *child_nf,
 		struct cds_ft_inode_flag *parent_nf,
 		struct cds_ft_inode_flag **slot, bool child_marked,
-		const struct ft_lock_ctx *hold_ctx)
+		const struct ft_lock_ctx *hold_ctx, bool check_child)
 {
 	if (!child_nf)
 		return;
@@ -16628,7 +16615,7 @@ void ft_reparent_record(struct cds_ft *ft, struct ft_flip_txn *txn,
 
 		ft_reparent_record_meta(ft, txn,
 			cds_ft_item_to_metadata((struct cds_ft_inode *) cn),
-			parent_nf, slot, child_marked, hold_ctx);
+			parent_nf, slot, child_marked, hold_ctx, check_child);
 		return;
 	}
 	if (ft_node_compressed(child_nf)) {
@@ -16637,7 +16624,7 @@ void ft_reparent_record(struct cds_ft *ft, struct ft_flip_txn *txn,
 
 		ft_reparent_record_meta(ft, txn,
 			cds_ft_item_to_metadata((struct cds_ft_inode *) cn),
-			parent_nf, slot, child_marked, hold_ctx);
+			parent_nf, slot, child_marked, hold_ctx, check_child);
 		return;
 	}
 #endif
@@ -16692,7 +16679,7 @@ void ft_reparent_record(struct cds_ft *ft, struct ft_flip_txn *txn,
 	}
 	ft_reparent_record_meta(ft, txn,
 		cds_ft_item_to_metadata(ft_node_ptr(child_nf)), parent_nf, slot,
-		child_marked, hold_ctx);
+		child_marked, hold_ctx, check_child);
 }
 
 static
@@ -18293,7 +18280,8 @@ void ft_glue_apply_deferred(struct cds_ft *ft, struct ft_glue *g)
 #endif
 			ft_reparent_record(ft, g->txn, g->deferred[i].child,
 				g->deferred[i].parent, g->deferred[i].slot,
-				g->deferred[i].held_lock, /*hold_ctx=*/ NULL);
+				g->deferred[i].held_lock, /*hold_ctx=*/ NULL,
+				/*check_child=*/ true);
 			continue;
 		}
 		ft_set_parent(ft, g->deferred[i].child, g->deferred[i].parent,
@@ -18443,7 +18431,8 @@ enum urcu_txn_status ft_glue_txn_commit_edges(struct cds_ft *ft, struct ft_glue 
 		if (g->txn->structural_sw) {
 			ft_reparent_record(ft, g->txn, g->deferred[i].child,
 				g->deferred[i].parent, g->deferred[i].slot,
-				g->deferred[i].held_lock, /*hold_ctx=*/ NULL);
+				g->deferred[i].held_lock, /*hold_ctx=*/ NULL,
+				/*check_child=*/ true);
 			continue;
 		}
 		ft_glue_record_back_edge(ft, g->txn, g->deferred[i].child,

@@ -566,13 +566,13 @@ int ft_rekey_cow_reparent_child(struct cds_ft *ft,
 		ft_reparent_record_meta(ft, txn, cm, new_flag, slot,
 			/*child_marked=*/ ft_rekey_mark_holds_child_word(
 				&marks[*nm - 1], cm),
-			/*hold_ctx=*/ NULL);
+			/*hold_ctx=*/ NULL, /*check_child=*/ true);
 	else
 		ft_reparent_record(ft, txn, iter, new_flag, slot,
 			/*child_marked=*/ cm != NULL &&
 				ft_rekey_mark_holds_child_word(&marks[*nm - 1],
 					cm),
-			/*hold_ctx=*/ NULL);
+			/*hold_ctx=*/ NULL, /*check_child=*/ true);
 	return 0;
 }
 
@@ -758,7 +758,7 @@ int ft_rekey_cow_stop(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 			/*child_marked=*/ cm != NULL &&
 				ft_rekey_mark_holds_child_word(&marks[nm - 1],
 					cm),
-			/*hold_ctx=*/ NULL);
+			/*hold_ctx=*/ NULL, /*check_child=*/ true);
 		/*
 		 * 5'. Retire @stop and hand back the NODE flag, not the skip-encoded
 		 *     slot form.
@@ -885,7 +885,8 @@ int ft_rekey_cow_stop(struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 				new_meta->external_nodes),
 			new_flag,
 			(struct cds_ft_inode_flag **) &new_meta->external_nodes,
-			/*child_marked=*/ false, /*hold_ctx=*/ NULL);
+			/*child_marked=*/ false, /*hold_ctx=*/ NULL,
+			/*check_child=*/ true);
 	}
 
 	/*

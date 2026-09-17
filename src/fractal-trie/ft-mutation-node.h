@@ -3339,11 +3339,11 @@ skip_copy:
 					if (retire_txn->pending_del_replace_pub)
 						*slot = retire_txn->pending_del_replace_pub;
 				} else
-					FT_LV_SPAN(ft_reparent_record(ft,
-							retire_txn, iter,
-							new_node_flag, slot,
+					ft_reparent_record(ft, retire_txn,
+							iter, new_node_flag, slot,
 							/*child_marked=*/ false,
-							ctx));
+							ctx,
+							/*check_child=*/ false);
 				} else
 					/*
 					 * HIDDEN by the @cluster_leaf contract
@@ -3440,11 +3440,11 @@ skip_copy:
 					if (retire_txn->pending_del_replace_pub)
 						*slot = retire_txn->pending_del_replace_pub;
 				} else
-					FT_LV_SPAN(ft_reparent_record(ft,
-							retire_txn, iter,
-							new_node_flag, slot,
+					ft_reparent_record(ft, retire_txn,
+							iter, new_node_flag, slot,
 							/*child_marked=*/ false,
-							ctx));
+							ctx,
+							/*check_child=*/ false);
 				} else
 					ft_set_parent(ft, iter, new_node_flag,
 							slot);

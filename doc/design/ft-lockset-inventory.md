@@ -527,3 +527,66 @@ Two shapes for later:
 - **B (per site):** each bulk site stops acquiring and drops its lifecycle code.
 
 `doc/design/ft-compact-bulk-rig.c` is the harness for it.
+
+### 8.1 The live check removed where it observed an exclusion the op already holds, and TAKEN where it did not (Mathieu: "let's try" it)
+
+**A. Span-preserving re-homes, no check.** `ft_node_recompact`'s sweep and
+compaction's compressed relocation now pass `check_child = false`. No anchor
+moves, and a peer that could freeze or retire the child must rewrite its slot in
+the node being copied, whose lock the re-homer holds.
+
+**B1. The split TAKES its live child.** A compressed split ADDS a boundary above
+cn's only child without retiring that child, so everything anchored on the child
+re-anchors under the fresh junction. `ft_insert_dlm_acquire_split` now takes the
+child (when internal) in the same lock set as {cn, P}, and re-reads `cn->child`
+under cn's lock. The lock is carried on the insert commit like P's, released on a
+pre-publish bail, and registered with its release record in
+`ft_insert_publish_or_park` before the arm. `ft_park_live_parent_edge` asks the
+txn registry, so a held child records no state edge.
+
+Rig `splitheld` (the §5 held order):
+
+| tree | split while the victim holds A | peer while held |
+|---|---|---|
+| child locked | waited | waited |
+| RED `-DFT_RED_SPLIT_NO_CHILD_LOCK` (child neither locked nor checked) | COMPLETED | COMPLETED -- **HOLE, 3/3** |
+
+**B2. The fuse, no check.** The chain-compress fuse moves boundaries only by
+REMOVING them: the boundary node, and a fused compressed child. It retires and
+holds both. A node anchored on either one is excluded by the fuse, and a plan
+made before it hits the tombstone. A node anchored on the surviving child or
+below keeps its anchor. Its per-node losses (4,839 of 92,772) were aborts for
+nothing.
+
+Measured, `-DFT_DEBUG_LIVE_VALIDATE`, ft_inv, per-node / exponential:
+
+| | before | after |
+|---|---|---|
+| live checks recorded (all sites) | ~1.02M / ~1.02M | 150 / 307 (the split's untaken children, 0 lost) |
+| checks lost | 6,826 / 321 | 0 / 0 |
+| always-MW STATE records | 984,569 / 1,673,695 | 150 / 646,693 (the rest: MW anchored retires) |
+| exclusion violations, dead members, dead-owner writes | 0 | 0 |
+
+**Skeptic: refuted=false.** Two hardening items, both applied:
+- the re-read of `cn->child` under cn's lock is unconditional, so a child that
+  became internal after the plan is re-planned, never re-homed unlocked;
+- the child's release is recorded through the txn
+  (`ft_flip_txn_record_anchor_release_held`, as P's is), not as a fixed
+  `{LOCK|snap -> snap}`.
+
+The skeptic's open question was LIVENESS: the split now also conflicts with ops
+that hold the child but not cn, and escalation rescues a refused commit, not a
+refused acquire. Measured with `-DFT_DEBUG_LIVE_VALIDATE` counters in
+`ft_insert_dlm_acquire_split`, ft_inv, against the same tree with the child lock
+compiled out:
+
+| | split acquires | with a child member | refused | longest refusal streak (one thread) |
+|---|---|---|---|---|
+| per-node, child locked | 1,035,083 | 24,367 | 87,592 | 132 |
+| per-node, no child lock | 1,044,292 | 0 | 101,638 | 545 |
+| exponential, child locked | 923,969 | 27,903 | 123,205 | 134 |
+| exponential, no child lock | 931,228 | 0 | 100,605 | 150 |
+
+No starvation signal. Refusals move by run-to-run amounts in both directions, and
+the longest streak is not worse. Only about 2.5% of splits have an internal child
+to lock.

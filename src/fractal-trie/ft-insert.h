@@ -171,6 +171,22 @@ struct ft_insert_commit {
 	struct cds_ft_metadata *parent_locked_holder;
 	uintptr_t parent_locked_snap;
 	bool parent_lock_shared;
+	/*
+	 * The split's LIVE CHILD -- CN's only child, which the split re-homes
+	 * under its fresh junction or suffix -- held the same way as P: taken in
+	 * the one lock set, carried here until ft_insert_publish_or_park registers
+	 * its release into @txn (and clears this), released on a pre-publish
+	 * bail.  NULL when the child was not taken (not internal, not fine) or
+	 * shares a word the op already holds.
+	 *
+	 * WHY TAKE IT: the re-home moves a boundary, so the child's anchor for
+	 * everything below it moves too, and an op holding the child as that
+	 * anchor must exclude the split (doc/design/ft-lockset-inventory.md §5,
+	 * §8).  That exclusion used to be OBSERVED -- a {live -> live} MW check on
+	 * the child's state word -- and is now TAKEN.  One child, not a fan.
+	 */
+	struct cds_ft_metadata *child_locked_holder;
+	uintptr_t child_locked_snap;
 };
 
 static void ft_free_unpublished_split_cluster(struct cds_ft *ft,
@@ -269,9 +285,24 @@ void ft_park_live_parent_edge(struct cds_ft *ft,
 		 * pair feeding ft_resolve_parent_slot / the split (parent, slot)
 		 * guards after the fresh cluster was freed, under the MW retry
 		 * loop that makes ABORT routine.
+		 *
+		 * Ask THIS txn's registry whether the op holds the child: a split
+		 * that took its live child (ft_insert_dlm_acquire_split) registered
+		 * it here, and a held child needs no live check -- the lock is the
+		 * exclusion the check approximated.  @ctx cannot answer it: it is
+		 * NULL on the compressed-split paths.
 		 */
+		struct ft_lock_ctx hctx;
+
+		(void) ctx;
+		ft_lock_ctx_init(&hctx, NULL, txn, NULL);
 		ft_reparent_record_meta(ft, txn, meta, new_parent, slot,
-			/*child_marked=*/ false, /*hold_ctx=*/ NULL);
+			/*child_marked=*/ false, &hctx,
+#ifdef FT_RED_SPLIT_NO_CHILD_LOCK
+			/*check_child=*/ false);	/* RED: neither taken nor checked */
+#else
+			/*check_child=*/ true);
+#endif
 		return;
 	}
 	if (ft->ordered_list) {
@@ -792,6 +823,23 @@ void ft_insert_publish_or_park(struct cds_ft *ft,
 		ft_flip_txn_hold_or_lock_parent(ft, ic->txn, ctx, parent_nf,
 			parent_depth, ic->parent_locked_holder,
 			ic->parent_locked_snap);
+	/*
+	 * The split's live child, held since the lock set: hand its release to
+	 * the txn, whose terminals now own it, BEFORE the arm below (the arm must
+	 * follow the op's last register).  Cleared, so no bail releases it twice.
+	 */
+	if (ic->child_locked_holder) {
+		ft_flip_txn_lock_register(ic->txn, ic->child_locked_holder,
+			ic->child_locked_snap);
+		/*
+		 * Through the txn, as P's is: a fixed {LOCK|snap -> snap} would
+		 * silently abort every commit the day another edge of this txn
+		 * lands on the child's word.
+		 */
+		ft_flip_txn_record_anchor_release_held(ic->txn,
+			ic->child_locked_holder);
+		ic->child_locked_holder = NULL;
+	}
 	dual_gp_held = ft_insert_lock_skip_dual_gp(ft, ctx, parent_nf, ic);
 	/*
 	 * PHASE B, STEP B1 -- THE ARM, and this is the only point in the op where
@@ -872,6 +920,43 @@ void ft_insert_publish_or_park(struct cds_ft *ft,
  * Returns 0 (whole set acquired), -EAGAIN (a member is held / a re-home aborted
  * the commit -- NOTHING acquired, abort-and-regrow), or -ENOMEM.
  */
+#ifdef FT_DEBUG_LIVE_VALIDATE
+/*
+ * Liveness of the split's child lock: acquires, those with a child member,
+ * refusals, and the longest run of consecutive refusals on one thread.
+ */
+static unsigned long ft_split_acq_calls, ft_split_acq_child,
+	ft_split_acq_refused, ft_split_acq_reread, ft_split_acq_max_streak;
+static __thread unsigned long ft_split_acq_streak;
+static void ft_split_acq_report(void) __attribute__((destructor));
+static void ft_split_acq_report(void)
+{
+	fprintf(stderr, "FT_SPLIT_ACQ calls=%lu child=%lu refused=%lu "
+		"child_reread_refused=%lu max_streak=%lu%s\n",
+		ft_split_acq_calls, ft_split_acq_child, ft_split_acq_refused,
+		ft_split_acq_reread, ft_split_acq_max_streak,
+#ifdef FT_RED_SPLIT_NO_CHILD_LOCK
+		" [RED: no child lock]"
+#else
+		""
+#endif
+		);
+}
+static void ft_split_acq_note(bool child, int outcome)
+{
+	uatomic_inc(&ft_split_acq_calls);
+	if (child)
+		uatomic_inc(&ft_split_acq_child);
+	if (!outcome) {
+		ft_split_acq_streak = 0;
+		return;
+	}
+	uatomic_inc(outcome == 2 ? &ft_split_acq_reread : &ft_split_acq_refused);
+	if (++ft_split_acq_streak > CMM_LOAD_SHARED(ft_split_acq_max_streak))
+		CMM_STORE_SHARED(ft_split_acq_max_streak, ft_split_acq_streak);
+}
+#endif
+
 static inline
 int ft_insert_dlm_acquire_split(struct cds_ft *ft,
 		const struct ft_descent *d, struct cds_ft_inode_flag *cn_flag,
@@ -880,10 +965,12 @@ int ft_insert_dlm_acquire_split(struct cds_ft *ft,
 		struct ft_insert_commit *ic)
 {
 	struct cds_ft_inode_flag *pf_p = NULL;
-	struct ft_dlm_member set[2];
+	struct ft_dlm_member set[3];
 	struct ft_lock_ctx lctx;
 	unsigned int p_depth = 0;
-	int dret;
+	struct cds_ft_compressed_node *cn = ft_compressed_node_ptr(cn_flag);
+	struct cds_ft_inode_flag *child_plan;
+	int dret, i;
 
 	/* PLAN (read-only, racy): resolve CN's parent P. */
 	(void) ft_resolve_parent_slot(cn_meta, ft, &pf_p);
@@ -918,6 +1005,22 @@ int ft_insert_dlm_acquire_split(struct cds_ft *ft,
 	set[1] = (struct ft_dlm_member){ .nf = pf_p,
 		.node = pf_p ? ft_flag_to_metadata(ft, pf_p) : NULL,
 		.depth = p_depth };
+	/*
+	 * CN's only child, when it carries a state word: the split re-homes it,
+	 * and the boundary move re-anchors it (see @child_locked_holder).  CN's
+	 * child is never compressed (no two adjacent compressed nodes), so only an
+	 * internal child qualifies.  Planned from a racy read; re-read under CN's
+	 * lock below.
+	 */
+	child_plan = ft_resolve_flip_proxy(rcu_dereference(cn->child));
+	set[2] = (struct ft_dlm_member){ .nf = NULL };
+#ifndef FT_RED_SPLIT_NO_CHILD_LOCK
+	if (child_plan && ft_node_internal(child_plan)) {
+		set[2].nf = child_plan;
+		set[2].node = cds_ft_item_to_metadata(ft_node_ptr(child_plan));
+		set[2].depth = cn_depth + cn->len;
+	}
+#endif
 
 	/*
 	 * ACQUIRE {CN, P} + the read-set guard CN.parent==P in ONE MCAS.  The set
@@ -931,9 +1034,32 @@ int ft_insert_dlm_acquire_split(struct cds_ft *ft,
 	 * this txn's records here.
 	 */
 	ft_lock_ctx_init(&lctx, d, NULL, ic ? ic->op : NULL);
-	dret = ft_dlm_acquire_set(ft, &lctx, set, 2);
+	dret = ft_dlm_acquire_set(ft, &lctx, set, 3);
+#ifdef FT_DEBUG_LIVE_VALIDATE
+	if (dret)
+		ft_split_acq_note(set[2].nf != NULL, 1);
+#endif
 	if (dret)
 		return dret == -ENOMEM ? -ENOMEM : -EAGAIN;
+	/*
+	 * CN is held now, so CN->child is stable: a child that moved between the
+	 * plan and the acquire is not the one locked.  Release and re-plan --
+	 * ALSO when no child was planned (external or empty then): a child that
+	 * became internal since would otherwise be re-homed unlocked, leaving the
+	 * live check as its only exclusion.
+	 */
+	if (ft_resolve_flip_proxy(rcu_dereference(cn->child)) != child_plan) {
+		for (i = 0; i < 3; i++)
+			if (set[i].nf && !set[i].held.shared)
+				ft_meta_lock_release(set[i].held.lock);
+#ifdef FT_DEBUG_LIVE_VALIDATE
+		ft_split_acq_note(set[2].nf != NULL, 2);
+#endif
+		return -EAGAIN;
+	}
+#ifdef FT_DEBUG_LIVE_VALIDATE
+	ft_split_acq_note(set[2].nf != NULL, 0);
+#endif
 
 	*held = set[0].held;
 	/*
@@ -946,6 +1072,9 @@ int ft_insert_dlm_acquire_split(struct cds_ft *ft,
 	ic->parent_locked_holder = (pf_p && !set[1].held.shared) ?
 		set[1].held.lock : NULL;
 	ic->parent_locked_snap = pf_p ? set[1].held.lock_snap : 0;
+	ic->child_locked_holder = (set[2].nf && !set[2].held.shared) ?
+		set[2].held.lock : NULL;
+	ic->child_locked_snap = set[2].nf ? set[2].held.lock_snap : 0;
 	return 0;
 }
 
@@ -967,6 +1096,11 @@ void ft_insert_dlm_release_parent(struct ft_insert_commit *ic)
 		ic->parent_locked_holder = NULL;
 	}
 	ic->parent_lock_shared = false;
+	/* The live child's lock, taken in the same set (see the field). */
+	if (ic->child_locked_holder) {
+		ft_meta_lock_release(ic->child_locked_holder);
+		ic->child_locked_holder = NULL;
+	}
 }
 
 /*
