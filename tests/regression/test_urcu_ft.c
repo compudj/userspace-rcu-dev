@@ -2124,11 +2124,25 @@ int main(int argc, char **argv)
 			wdelay = atol(optarg);
 			break;
 		case 'W':
-			/* E.4: writer strategy, "fine" (default) or "coarse". */
+			/*
+			 * E.4: writer strategy, "fine" (default), "coarse", or
+			 * "excl-caller".
+			 *
+			 * ☠ "excl-caller" IS A CONTRACT, AND THIS HARNESS CAN
+			 * BREAK IT: the application promises writer exclusion,
+			 * so it is only in contract with a SINGLE writer thread
+			 * (-n 1).  Run it with more and the trie is being used
+			 * out of contract on purpose -- which is what a
+			 * -DFEATURE_FT_EXCL_VALIDATE build is for: the access
+			 * validator keeps its single-owner claim on any
+			 * non-fine trie and reports the overlap.
+			 */
 			if (!strcmp(optarg, "coarse"))
 				writer_strategy = CDS_FT_WRITER_LOCK_COARSE;
 			else if (!strcmp(optarg, "fine"))
 				writer_strategy = CDS_FT_WRITER_LOCK_FINE;
+			else if (!strcmp(optarg, "excl-caller"))
+				writer_strategy = CDS_FT_WRITER_EXCL_CALLER;
 			else
 				goto usage_error;
 			break;

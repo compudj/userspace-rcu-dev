@@ -3223,6 +3223,32 @@ enum cds_ft_status cds_ft_group_attr_set_optimize(
 enum cds_ft_writer_strategy {
 	CDS_FT_WRITER_LOCK_COARSE = 1,
 	CDS_FT_WRITER_LOCK_FINE = 2,
+	/*
+	 * The APPLICATION provides writer exclusion; the library takes no
+	 * writer lock of its own.  Named for the CONTRACT rather than a lock,
+	 * because the caller is free to meet it however it likes -- a single
+	 * mutating thread, its own mutex around every mutating call, a
+	 * partitioned schedule.
+	 *
+	 * Behaves as CDS_FT_WRITER_LOCK_COARSE in every other respect (the
+	 * record kinds, the lock-set derivation, the bulk-op handling), which
+	 * is what "the contract comes from the caller" means: only the FT-wide
+	 * writer mutex goes away.
+	 *
+	 * ☠ THIS IS NOT cds_ft_attr_set_exclusive / cds_ft_make_exclusive.
+	 * Those additionally promise NO CONCURRENT RCU READERS, and the library
+	 * uses that to skip reader-visible publication discipline.  Here
+	 * READERS ARE UNAFFECTED: proxies, tags and grace periods all stay, and
+	 * concurrent lookups and iterations remain legal exactly as under
+	 * COARSE.  The only promise is about WRITERS.
+	 *
+	 * ☞ Violating it is undefined behaviour, and a build with
+	 * -DFEATURE_FT_EXCL_VALIDATE catches it: the access validator keeps its
+	 * single-OWNER claim for any non-fine trie, so a second writer entering
+	 * concurrently reports "writer conflict -- owner ..., entering thread
+	 * ...".  Run the test suite that way at least once.
+	 */
+	CDS_FT_WRITER_EXCL_CALLER = 3,
 };
 
 /*
@@ -3231,12 +3257,15 @@ enum cds_ft_writer_strategy {
  *   CDS_FT_WRITER_LOCK_FINE.  Returns CDS_FT_STATUS_OK, or
  *   CDS_FT_STATUS_INVALID_ARGUMENT_ERROR for an unknown @strategy.
  *
- * Any strategy combined with order statistics
+ * CDS_FT_WRITER_LOCK_FINE combined with order statistics
  * (cds_ft_group_attr_set_rank_stats) is coerced to CDS_FT_WRITER_LOCK_COARSE:
  * rank stats serialize every count-changing writer on the root count, so
  * fine-grained locking buys no parallelism there, and it would run the count
  * walk without the FT-wide-lock exclusion the walk requires.  (The optimistic
- * engine this sentence also weighed no longer exists.)
+ * engine this sentence also weighed no longer exists.)  COARSE and
+ * CDS_FT_WRITER_EXCL_CALLER are left ALONE: both already serialize every
+ * structural writer, the latter by the caller's own contract, so the walk has
+ * the exclusion it requires without the library coercing anything.
  */
 enum cds_ft_status cds_ft_group_attr_set_writer_strategy(
 		struct cds_ft_group_attr *attr,

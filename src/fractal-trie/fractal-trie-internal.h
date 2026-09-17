@@ -2600,6 +2600,24 @@ struct cds_ft {
 	 * state and re-serialize only inside a bulk window.
 	 */
 	bool lock_fine;
+	/*
+	 * CDS_FT_WRITER_EXCL_CALLER: the APPLICATION provides writer exclusion
+	 * -- a single thread, its own mutex around every mutating call, or any
+	 * other means.  The library therefore takes NO writer lock of its own.
+	 *
+	 * ☠ THIS IS NOT @exclusive, and the difference is the READERS.
+	 * cds_ft_make_exclusive additionally promises NO CONCURRENT RCU READERS,
+	 * which licenses skipping reader-visible publication discipline.  This
+	 * mode keeps readers, so proxies, tags and grace periods all stay: it is
+	 * a COARSE trie in every respect except who provides the exclusion.
+	 * @lock_fine is false here, so door 1 arms it SW trie-wide and every
+	 * consumer of @exclusive is untouched.
+	 *
+	 * ☞ AND THE PROMOTION LANES ARE INERT, not special-cased: rekey and the
+	 * bulk gate exist to promote FINE locking to a wider exclusion, and
+	 * there is no fine locking in this mode (nor in COARSE) to promote.
+	 */
+	bool excl_caller;
 
 	/*
 	 * Hot-path copy of the group's lock-set granularity, read by the
@@ -3353,6 +3371,20 @@ void ft_writer_lock_scope_enter(struct cds_ft *ft)
 {
 	if (ft_wlock_held == ft) {
 		ft_wlock_depth++;		/* reentry on the trie we hold */
+		return;
+	}
+	if (ft->excl_caller) {
+		/*
+		 * CDS_FT_WRITER_EXCL_CALLER: the caller excludes every writer,
+		 * so there is no FT-wide lock to take -- that is the whole
+		 * point of the mode.  Readers are UNAFFECTED (see @excl_caller):
+		 * this skips the writer mutex, nothing else.
+		 *
+		 * Placed beside the @exclusive early-out and after the
+		 * reentrancy test for the same reason, and safe for the same
+		 * reason: ft_writer_lock_scope_exit keys its release off
+		 * @ft_wlock_held IDENTITY, never a re-read of either flag.
+		 */
 		return;
 	}
 	if (ft->exclusive) {
@@ -4273,7 +4305,7 @@ void ft_bulk_lock_enter(struct cds_ft *ft)
 {
 	const struct rcu_flavor_struct *flavor = ft->group->flavor;
 
-	if (ft->exclusive)
+	if (ft->exclusive || ft->excl_caller)
 		return;
 	if (ft_bulk_lock_held == ft) {
 		ft_bulk_lock_depth++;

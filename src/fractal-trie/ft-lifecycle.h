@@ -300,6 +300,7 @@ enum cds_ft_status cds_ft_group_attr_set_writer_strategy(
 	switch (strategy) {
 	case CDS_FT_WRITER_LOCK_COARSE:
 	case CDS_FT_WRITER_LOCK_FINE:
+	case CDS_FT_WRITER_EXCL_CALLER:
 		attr->writer_strategy = strategy;
 		attr->writer_strategy_set = true;
 		return CDS_FT_STATUS_OK;
@@ -599,9 +600,17 @@ enum cds_ft_status _cds_ft_group_create(const struct cds_ft_group_attr *attr,
 		 * the COARSE single-lock target (§10.5): coerce ANY non-coarse
 		 * strategy to COARSE so it keeps the FT-wide lock (writer exclusion).
 		 */
+		/*
+		 * ☞ ONLY *FINE* IS COERCED.  COARSE is already the target, and
+		 * CDS_FT_WRITER_EXCL_CALLER already serializes every structural
+		 * writer -- by the caller's contract rather than by the FT-wide
+		 * mutex -- so the count walk has the exclusion it requires.
+		 * Coercing it would silently hand back a lock the caller
+		 * explicitly asked the library not to take.
+		 */
 		if (ft_group->rank_stats_set
 				&& ft_group->writer_strategy
-					!= CDS_FT_WRITER_LOCK_COARSE)
+					== CDS_FT_WRITER_LOCK_FINE)
 			ft_group->writer_strategy = CDS_FT_WRITER_LOCK_COARSE;
 	} else {
 		/*
@@ -925,6 +934,14 @@ enum cds_ft_status cds_ft_create(struct cds_ft_group *ft_group,
 	 * of the group strategy so the hooks read one trie field each.
 	 */
 	ft->lock_fine = (ft_group->writer_strategy == CDS_FT_WRITER_LOCK_FINE);
+	/*
+	 * The caller's contract replaces the FT-wide writer mutex, and NOTHING
+	 * else: @lock_fine is false here, so every kind, lock-set and door
+	 * decision reads exactly as it does on a COARSE trie, and @exclusive
+	 * stays false so the reader-visible discipline is untouched.
+	 */
+	ft->excl_caller = (ft_group->writer_strategy
+			== CDS_FT_WRITER_EXCL_CALLER);
 	/*
 	 * Spacing is a FINE-mode property, and this is where it is made inert
 	 * everywhere else (every reader takes it from here, ft_descent_init
