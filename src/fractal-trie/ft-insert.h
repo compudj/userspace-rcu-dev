@@ -2261,8 +2261,9 @@ int ft_attach_node(struct cds_ft *ft,
 			 *
 			 * @ctx, NOT @rctx, is handed to lock_or_guard: it builds
 			 * its own lctx with .held.txn = ic->txn and copies
-			 * .extra/.glue from what it is given but NOT .outer, so
-			 * passing @rctx would drop the caller's extras.
+			 * .extra/.glue/.outer from what it is given, so @ctx
+			 * already carries every frame and @rctx would only add
+			 * this txn a second time.
 			 */
 			if (!old_node_flag && ft_in_place_ok(ft)) {
 				/*

@@ -2638,6 +2638,11 @@ int ft_detach_node(struct cds_ft *ft,
 	 * non-canonical state.  See ft_chain_compress_fused.
 	 */
 	bool boundary_fused = false;
+	/*
+	 * The in-place leaf delete took its holder ahead of the plan (the hoist
+	 * above ft_node_replace_ptr).  Read at the B2 arm, which stays off for it.
+	 */
+	bool leaf_hoisted = false;
 	struct cds_ft_inode_flag *cur;
 	unsigned int cur_depth;
 	unsigned int cur_span;
@@ -4875,6 +4880,90 @@ int ft_detach_node(struct cds_ft *ft,
 					.parent_guard = src_held_hint->parent_guard };
 				replace_hint = &elevated_hint;
 			}
+			/*
+			 * THE LEAF-DELETE HOIST: LOCK THE HOLDER BEFORE THE PLAN IS
+			 * READ (doc/design/ft-lockset-inventory.md §1, row 1).
+			 *
+			 * ft_node_replace_ptr's in-place arm decides "stay in place"
+			 * from the holder's nr_child and defers the slot clear plus
+			 * the fused nr_child-- into @pub -- and until now this op
+			 * held NOTHING when it read that count, when it recorded
+			 * those two words, and when it committed them: 2.6M commits
+			 * per ft_inv run, arbitrated only by the fused CAS.  The
+			 * promote arm below acquires the holder, but AFTER the plan;
+			 * the leaf arm never did.
+			 *
+			 * So take the holder -- its own word at per-node, its ANCHOR
+			 * above -- here, ahead of the decision, exactly as the insert
+			 * tier's hoist takes the attach node ahead of its reserve.
+			 * The count replace_ptr reads is then the count under the
+			 * lock, and the freeze_leaf chain word recorded below is
+			 * under its nearest ancestor lock.  Registered in @commit_txn
+			 * with its {LOCK|s -> s} release, so every exit reaches a
+			 * terminal: the commit consumes it, and @end's destroy of an
+			 * unused txn releases it.  If replace_ptr routes to a DEL
+			 * recompaction instead, its {C,P,GP} acquire finds C held
+			 * through @lctx and dedupes rather than refusing its own mark.
+			 *
+			 * Scope: the point removes on a SHARED trie.  An exclusive
+			 * trie has no peer to exclude, the bulk callers pass the
+			 * exclusive-only tier, and the FOLD's @shared_txn belongs to
+			 * its caller.  A promote keeps its own acquire below.
+			 *
+			 * ☞ LOCKS FIRST, SW LATER.  @leaf_hoisted keeps the B2 arm
+			 * below from converting this commit's records to SW: the
+			 * transition flips MW to SW once, when every writer of these
+			 * words holds its lock, not one producer at a time.
+			 */
+			if (ft->lock_fine && !ft->exclusive && in_place &&
+					!record_only && commit_txn &&
+					!topmost_external_nodes) {
+				enum ft_lock_or_guard_exit hex;
+
+				/*
+				 * LOCK THE HOLDER THE PLAN NAMES.  @iter_node_flag is
+				 * RE-READ from the parent slot after the climb, and
+				 * @metadata_stack is what the climb derived: a peer
+				 * that republished that slot in between (a
+				 * recompaction of the holder into a copy) leaves the
+				 * two naming DIFFERENT nodes.  MEASURED 1,819 times
+				 * per ft_inv run at per-node, climb or no climb.  The
+				 * pre-hoist code carried that torn plan to its commit
+				 * and aborted there; locking @iter_node_flag would
+				 * instead hold the COPY while the records name the
+				 * planned node.  So refuse the torn plan before the
+				 * acquire, and re-check the slot under the lock.
+				 */
+				if (ft_flag_to_metadata(ft, iter_node_flag) !=
+						metadata_stack[nr_branch - 1]) {
+					ret = -EAGAIN;
+					goto end;
+				}
+				lctx.held.txn = commit_txn;
+				lctx.held.nr_extra = (unsigned int) nr_orphan_locked;
+				ft_flip_txn_lock_or_guard_parent_ex(__func__,
+					__LINE__, ft, commit_txn, &lctx,
+					iter_node_flag, cur_depth, &hex);
+#ifdef FT_DEBUG_STRUCT_ANCHOR
+				ft_sa_hoist_exit_count(1, hex);
+#endif
+				if (hex == FT_LOG_EXIT_MISS) {
+					ret = -EAGAIN;
+					goto end;
+				}
+				leaf_hoisted = true;
+				/*
+				 * Under the lock the holder can no longer be retired
+				 * or relocated, so a slot that still names it names a
+				 * LIVE, LINKED holder.  A registered lock is released
+				 * by @end's destroy of the unused @commit_txn.
+				 */
+				if (rcu_dereference(*detach_parent_flag_ptr) !=
+						iter_node_flag) {
+					ret = -EAGAIN;
+					goto end;
+				}
+			}
 			ret = ft_node_replace_ptr(ft,
 				detach_node_flag_ptr,
 				elevated_old_child,
@@ -5110,7 +5199,7 @@ int ft_detach_node(struct cds_ft *ft,
 				 * passes the owner check, not merely the ones this arm
 				 * converts.
 				 */
-				if (commit_txn)
+				if (commit_txn && !leaf_hoisted)
 					ft_flip_txn_arm_per_op(ft, commit_txn);
 #ifdef FT_DEBUG_DEL_TOMB
 				/*

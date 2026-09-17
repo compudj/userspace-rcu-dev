@@ -5712,6 +5712,36 @@ void ft_sa_rec_report(void)
 			"ft_tk_mwa_class index)\n", ft_sa_rec_overflow);
 }
 
+/*
+ * How each lock-set HOIST's acquire exited, per hoist (index 1 = the delete
+ * tier's leaf hoist in ft_detach_node): NOT_FINE / REGISTERED / SHARED / MISS.
+ * A SHARED exit files no registry entry, so a record-time witness can only see
+ * it through the ctx chain or the ledger -- which is what this separates.
+ */
+#define FT_SA_HOISTS	4
+static unsigned long ft_sa_hoist_exits[FT_SA_HOISTS][4];
+
+static void ft_sa_hoist_exit_count(int hoist, int ex)
+{
+	if (hoist >= 0 && hoist < FT_SA_HOISTS && ex >= 0 && ex < 4)
+		uatomic_inc(&ft_sa_hoist_exits[hoist][ex]);
+}
+
+static __attribute__((destructor))
+void ft_sa_hoist_report(void)
+{
+	int h;
+
+	for (h = 0; h < FT_SA_HOISTS; h++) {
+		unsigned long *e = ft_sa_hoist_exits[h];
+
+		if (e[0] | e[1] | e[2] | e[3])
+			fprintf(stderr, "FT_SA_HOIST %d not_fine=%lu registered=%lu "
+				"shared=%lu miss=%lu\n", h, e[0], e[1], e[2],
+				e[3]);
+	}
+}
+
 static bool ft_sa_witness(const struct ft_flip_txn *t,
 		const struct ft_lock_ctx *ctx, struct cds_ft_metadata *m)
 {
@@ -10352,10 +10382,18 @@ void ft_flip_txn_lock_or_guard_parent_ex(const char *fn, int line,
 			 * one site, all from callers that had a handle.
 			 */
 			.op = ctx ? ctx->op : NULL,
+			/*
+			 * AND CARRY THE OUTER FRAME.  An op's held set is a CHAIN
+			 * of frames, and a frame naming a subset of it refuses
+			 * the op's own fence (ft-dlm-lock-coarseness.md, "a
+			 * carrier the frame does not name").  Dropping @outer here
+			 * made a word held by the CALLER's frame read as a peer's.
+			 */
 			.held = { .txn = t,
 				.extra = ctx ? ctx->held.extra : NULL,
 				.nr_extra = ctx ? ctx->held.nr_extra : 0,
-				.glue = ctx ? ctx->held.glue : NULL },
+				.glue = ctx ? ctx->held.glue : NULL,
+				.outer = ctx ? ctx->held.outer : NULL },
 		};
 		struct ft_held_anchor held;
 
