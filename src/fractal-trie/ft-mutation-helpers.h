@@ -6436,6 +6436,7 @@ enum ft_be_site {
 	FT_BE_PARK_ATTACH,		/* ft_attach_node */
 	FT_BE_PARK_PAST,		/* ft_insert_compressed_past_child */
 	FT_BE_PARK_KSHORT,		/* ft_insert_compressed_key_shorter */
+	FT_BE_COMPACT_CELL,		/* ft_compact_relocate_cell */
 	FT_BE_SITE_NR,
 };
 # define FT_BE_SITE_PARAM	, enum ft_be_site dbg_be_site,		\
@@ -6457,6 +6458,7 @@ const char *const ft_be_site_name[FT_BE_SITE_NR] = {
 	"park_live_parent", "recompact", "detach_cn_parent", "detach_unchain",
 	"child_back_edge", "parent_word", "reparent_meta",
 	"park:split", "park:attach", "park:past_child", "park:key_shorter",
+	"compact_cell",
 };
 /*
  * ★ THE LEDGER COLUMNS -- the second witness, and the one the registry cannot
@@ -12083,9 +12085,10 @@ enum urcu_txn_status ft_ord_cell_unsplice(struct cds_ft *ft,
  * The compaction cell relocation (ft-compact.h) is the sole caller, and it is
  * a best-effort relocation that ABORTS by leaving a node in place on OOM, so
  * the swap is its commit boundary: commit through a pre-reserved flip-txn
- * and propagate its status.  Returns 0 (swapped), or
- * -ENOMEM with NOTHING installed -- @old_cell stays fully in the list and the
- * caller discards the never-published @new_cell.  This was the last
+ * and propagate its status.  Returns 0 (swapped), or -ENOMEM (reservation)
+ * or -EAGAIN (a refused prepare or an aborted commit: a peer) with NOTHING
+ * installed -- @old_cell stays fully in the list and the caller discards the
+ * never-published @new_cell.  This was the last
  * ft_ord_cell_flip (transitional bare-store) caller; with it on a flip-txn
  * descriptor, ft_ord_cell_flip is gone and every reader-visible cell commit
  * rides the latch (readiness §6).
@@ -12123,9 +12126,28 @@ int ft_ord_cell_swap(struct cds_ft *ft, struct ft_ord_cell *old_cell,
 	 * the old head / tail relocation -- no endpoint edge.  The concurrent op
 	 * takes (old, new), matching the single-updater list and cds_list_replace_rcu().
 	 */
-	(void) urcu_txn_list_replace_prepare(t->mtxn, ft_ord_cell_lnode(old_cell),
-		ft_ord_cell_lnode(new_cell));
-	return ft_flip_txn_commit(ft, t) < 0 ? -ENOMEM : 0;
+	/*
+	 * ☠ NEITHER STATUS MAY BE DROPPED.  A prepare that returns -ENOENT (@old
+	 * already deleted) or -EAGAIN (a neighbour mid-delete) records NOTHING,
+	 * and the empty txn would then commit OK; and URCU_TXN_STATUS_ABORT is 1,
+	 * so `commit < 0` read an aborted swap as success.  Either way the caller
+	 * went on to retarget @head->prev at a cell the list does not hold and to
+	 * free @old while still linked.  Both are a peer's doing, so -EAGAIN.
+	 */
+	{
+		int pret = urcu_txn_list_replace_prepare(t->mtxn,
+			ft_ord_cell_lnode(old_cell), ft_ord_cell_lnode(new_cell));
+		enum urcu_txn_status st;
+
+		if (pret) {
+			ft_flip_txn_destroy(t);
+			return -EAGAIN;
+		}
+		st = ft_flip_txn_commit(ft, t);
+		if (st == URCU_TXN_STATUS_OK)
+			return 0;
+		return st == URCU_TXN_STATUS_ABORT ? -EAGAIN : -ENOMEM;
+	}
 }
 
 /*

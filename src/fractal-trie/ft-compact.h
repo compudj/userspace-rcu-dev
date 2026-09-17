@@ -176,6 +176,42 @@ void ft_compact_relocate_at(struct cds_ft *ft, struct cds_ft_inode_flag **holder
 }
 
 /*
+ * Hand a relocation's marks to its commit: @set[0] is RETIRED (its tombstone
+ * chains onto the mark at per-node, sits beside the anchor's release above),
+ * @set[1] is RELEASED.  The shape ft_node_recompact records for {C, P}.
+ */
+static inline
+void ft_compact_record_terminals(struct ft_flip_txn *t,
+		const struct ft_lock_ctx *ctx, const struct ft_dlm_member *set,
+		struct cds_ft_metadata *retired)
+{
+	if (!set[0].held.shared) {
+		ft_flip_txn_lock_register(t, set[0].held.lock,
+			set[0].held.lock_snap);
+		(void) ft_flip_txn_record_anchor_release(t, &set[0].held,
+			retired);
+	}
+	ft_flip_txn_record_retire_anchored(t, ctx, &set[0].held, retired);
+	if (set[1].nf && !set[1].held.shared) {
+		ft_flip_txn_lock_register(t, set[1].held.lock,
+			set[1].held.lock_snap);
+		ft_flip_txn_record_release_lock(t, set[1].held.lock,
+			set[1].held.lock_snap);
+	}
+}
+
+/* Drop the marks a relocation's acquire took, before any txn owns them. */
+static inline
+void ft_compact_unlock_set(const struct ft_dlm_member *set, unsigned int nr)
+{
+	unsigned int i;
+
+	for (i = 0; i < nr; i++)
+		if (set[i].nf && !set[i].held.shared)
+			ft_meta_lock_release(set[i].held.lock);
+}
+
+/*
  * Relocate a compressed node @cn into a fresh slot, keeping the same length.
  * Because the length is unchanged, the skip pointer's encoded length still
  * matches the relocated node (cn2->len == skip_len, whether a reader resolves
@@ -200,6 +236,8 @@ struct cds_ft_compressed_node *ft_compact_relocate_compressed(struct cds_ft *ft,
 		struct cds_ft_compressed_node *cn,
 		struct cds_ft_inode_flag **gp_slot,
 		struct cds_ft_inode_flag *gp_nf,
+		unsigned int cn_depth,
+		const struct ft_lock_ctx *ctx,
 		int *bail)
 {
 	struct cds_ft_metadata *cn_meta =
@@ -208,10 +246,70 @@ struct cds_ft_compressed_node *ft_compact_relocate_compressed(struct cds_ft *ft,
 	struct cds_ft_compressed_node *cn2;
 	struct cds_ft_inode_flag *cn2_flag;
 	enum urcu_txn_status cst;
-	uint8_t len = cn->len;
+	/*
+	 * THE RELOCATION'S LOCK SET (doc/design/ft-lockset-inventory.md §1,
+	 * row 4).  This relocation RETIRES @cn and rewrites the words @cn owns:
+	 * its child's back edge and, for a traditional compressed node, the
+	 * grandparent slot that names it.  It used to do all of that holding
+	 * NOTHING -- the exclusion was the caller's writer scope, a "caller's
+	 * responsibility" TODO rather than a contract.  Under the FINE strategy
+	 * it now takes the same shape ft_node_recompact takes for {C, P}: @cn
+	 * with a RETIRE terminal, the grandparent (traditional only) with a
+	 * RELEASE terminal, one all-or-none acquire, and the plan read UNDER the
+	 * lock.  A COARSE or EXCLUSIVE trie keeps the unlocked shape below: no
+	 * per-node peer exists there.
+	 */
+	bool fine = ft->lock_fine && !ft->exclusive;
+	struct ft_dlm_member set[2];
+	uint8_t len;
 
+	memset(set, 0, sizeof(set));
+	if (fine) {
+		int dret;
+
+		set[0] = (struct ft_dlm_member){
+			.nf = ft_compressed_node_flag(cn), .node = cn_meta,
+			.depth = cn_depth,
+			/* validates @cn is still the grandparent's child */
+			.guard_child = gp_slot ? cn_meta : NULL,
+			.guard_pf = gp_slot ? gp_nf : NULL };
+		if (gp_slot && gp_nf) {
+			unsigned int gp_span = ft_node_span(ft, gp_nf);
+
+			if (gp_span > cn_depth) {
+				*bail = -EAGAIN;	/* not @cn's parent: stale */
+				return cn;
+			}
+			set[1] = (struct ft_dlm_member){
+				.nf = gp_nf,
+				.node = ft_flag_to_metadata(ft, gp_nf),
+				.depth = cn_depth - gp_span };
+		}
+		dret = ft_dlm_acquire_set(ft, ctx, set, 2);
+		if (dret) {
+			*bail = dret == -ENOMEM ? -ENOMEM : -EAGAIN;
+			return cn;
+		}
+		/*
+		 * RE-VALIDATE under the lock: the walk sampled the grandparent
+		 * slot with nothing held.  @cn itself cannot be retired or split
+		 * any more, and re-homing its child needs @cn's lock.
+		 */
+		if (gp_slot) {
+			struct cds_ft_inode_flag *cur = rcu_dereference(*gp_slot);
+
+			if (ft_node_flip_proxy(cur) || !ft_node_compressed(cur) ||
+					ft_compressed_node_ptr(cur) != cn) {
+				ft_compact_unlock_set(set, 2);
+				*bail = -EAGAIN;
+				return cn;
+			}
+		}
+	}
+	len = cn->len;
 	cn2 = alloc_compressed_node(ft, len, &cn2_meta);
 	if (!cn2) {
+		ft_compact_unlock_set(set, 2);
 		*bail = -ENOMEM;
 		return cn;	/* OOM: leave in place (best-effort) */
 	}
@@ -252,10 +350,16 @@ struct cds_ft_compressed_node *ft_compact_relocate_compressed(struct cds_ft *ft,
 		 * installed -- destroy the txn, free the unpublished copy, leave
 		 * @cn in place and stop the pass.
 		 */
-		struct ft_flip_txn *t = ft_flip_txn_create_bounded(ft, 3);
+		/*
+		 * + (fine) @cn's anchor release, its retire, and the
+		 * grandparent's release.
+		 */
+		struct ft_flip_txn *t = ft_flip_txn_create_bounded(ft,
+			fine ? 6 : 3);
 
 		if (!t) {
 			free_compressed_node_unpublished(ft, cn2);
+			ft_compact_unlock_set(set, 2);
 			*bail = -ENOMEM;
 			return cn;
 		}
@@ -283,14 +387,49 @@ struct cds_ft_compressed_node *ft_compact_relocate_compressed(struct cds_ft *ft,
 		 * producers note (1) of the word-kind table names as blocking
 		 * the dual's conversion.
 		 */
+		/*
+		 * Under the lock, hand the marks to @t BEFORE the slot record so
+		 * the record's owner is in the registry when it is made, and read
+		 * the slot's expected-old THROUGH @t (a raw re-read could land on
+		 * a peer's parked proxy).
+		 */
+		if (fine)
+			ft_compact_record_terminals(t, ctx, set, cn_meta);
 		ft_flip_txn_record_reserved(t,
 			gp_nf ? ft_flag_to_metadata(ft, gp_nf) :
 				FT_OWNER_UNPLUMBED,
-			(void **) gp_slot, *gp_slot, cn2_flag);
+			(void **) gp_slot,
+			fine ? urcu_txn_load(t->mtxn, (void **) gp_slot,
+				FT_FLIP_PROXY_TAG) : *gp_slot,
+			cn2_flag);
 		cst = ft_flip_txn_commit(ft, t);
 		if (cst != URCU_TXN_STATUS_OK) {
 			free_compressed_node_unpublished(ft, cn2);
 			/* An ABORT is a peer, not memory pressure. */
+			*bail = cst == URCU_TXN_STATUS_ABORT ? -EAGAIN : -ENOMEM;
+			return cn;
+		}
+	} else if (fine) {
+		/*
+		 * Skip form under the lock: the child's back-reference redirect
+		 * is still the publish, but it rides a txn WITH @cn's retire, so
+		 * the relocation and the old copy's tombstone flip together and
+		 * the lock's release is the commit's.
+		 */
+		struct ft_flip_txn *t = ft_flip_txn_create_bounded(ft, 5);
+
+		if (!t) {
+			free_compressed_node_unpublished(ft, cn2);
+			ft_compact_unlock_set(set, 2);
+			*bail = -ENOMEM;
+			return cn;
+		}
+		ft_reparent_record(ft, t, cn2->child, cn2_flag, &cn2->child,
+			/*child_marked=*/ false, /*hold_ctx=*/ NULL);
+		ft_compact_record_terminals(t, ctx, set, cn_meta);
+		cst = ft_flip_txn_commit(ft, t);
+		if (cst != URCU_TXN_STATUS_OK) {
+			free_compressed_node_unpublished(ft, cn2);
 			*bail = cst == URCU_TXN_STATUS_ABORT ? -EAGAIN : -ENOMEM;
 			return cn;
 		}
@@ -317,7 +456,8 @@ struct cds_ft_compressed_node *ft_compact_relocate_compressed(struct cds_ft *ft,
 	 * tolerates; the mark just adds the advisory tombstone bit a future
 	 * concurrent writer's freeze-guard CAS will consult.
 	 */
-	ft_meta_tombstone_set_flip(cn_meta);
+	if (!fine)	/* fine: the commit's retire record already did */
+		ft_meta_tombstone_set_flip(cn_meta);
 #ifdef FT_DEBUG_TOMBSTONE_AUDIT
 	/*
 	 * Freeze-on-free guard (doc §4.B): the compactor's always-deferred free
@@ -361,14 +501,72 @@ struct cds_ft_compressed_node *ft_compact_relocate_compressed(struct cds_ft *ft,
  */
 static
 struct ft_ord_cell *ft_compact_relocate_cell(struct cds_ft *ft,
-		struct ft_ord_cell *old, int *bail)
+		struct ft_ord_cell *old, struct cds_ft_inode_flag *holder_nf,
+		unsigned int holder_depth, const struct ft_lock_ctx *ctx,
+		int *bail)
 {
-	struct cds_ft_metadata *meta = cds_ft_alloc_cell_item(ft);
+	struct cds_ft_metadata *meta;
 	struct cds_ft_node *head = old->node;
 	struct ft_ord_cell *new_cell;
 	int sret;
+	/*
+	 * THE CELL'S LOCK (doc/design/ft-lockset-inventory.md §1, row 4).  The
+	 * relocation rewrites the head's back edge (@head->prev), whose owner is
+	 * the chain's HOLDER -- the node whose slot or @external_nodes names
+	 * @head -- and it used to do so holding nothing.  Under the FINE strategy
+	 * take the holder first, re-read the plan under it, and commit the list
+	 * replace and the back edge in ONE txn with the holder's release.  The
+	 * list edges themselves stay the [DESIGN] MW lane.  A COARSE or EXCLUSIVE
+	 * trie keeps the unlocked two-store shape below.
+	 */
+	bool fine = ft->lock_fine && !ft->exclusive;
+	struct ft_held_anchor h = { 0 };
+	void *prev_old = NULL;
 
+	if (fine) {
+		int aret;
+
+		if (!holder_nf || !head) {
+			*bail = -EAGAIN;
+			return old;
+		}
+		aret = ft_acquire_member(ft, ctx, holder_nf,
+			ft_flag_to_metadata(ft, holder_nf), holder_depth, &h);
+		if (aret) {
+			*bail = aret == -ENOMEM ? -ENOMEM : -EAGAIN;
+			return old;
+		}
+		/*
+		 * RE-VALIDATE under the lock: the cell still carries @head, @head
+		 * still names the cell, and the cell still names @holder_nf.  A
+		 * peer that re-parented or replaced the chain in between is a
+		 * -EAGAIN the step reports as BUSY, never an OOM.
+		 */
+		/*
+		 * @old->parent names the holder WITH the prefix-head bit when
+		 * @head is its @external_nodes (ft_head_parent_word), so strip it
+		 * before comparing -- ft_node_ptr_raw keeps bit 4 on a type-0
+		 * internal flag, and an unstripped compare refuses the right
+		 * holder on every attempt, a BUSY the step would resume forever.
+		 * A parked proxy on it is a peer's re-home in flight: stale.
+		 */
+		prev_old = rcu_dereference(head->prev);
+		if (old->node != head || ft_node_flip_proxy(prev_old) ||
+				ft_ord_cell_ptr(prev_old) != old ||
+				ft_node_flip_proxy(old->parent) ||
+				ft_node_ptr_raw(ft_parent_prefix_strip(
+					ft_parent_node(old->parent))) !=
+				ft_node_ptr_raw(holder_nf)) {
+			if (!h.shared)
+				ft_meta_lock_release(h.lock);
+			*bail = -EAGAIN;
+			return old;
+		}
+	}
+	meta = cds_ft_alloc_cell_item(ft);
 	if (!meta) {
+		if (fine && !h.shared)
+			ft_meta_lock_release(h.lock);
 		*bail = -ENOMEM;
 		return old;		/* OOM: best-effort, leave in place */
 	}
@@ -379,12 +577,70 @@ struct ft_ord_cell *ft_compact_relocate_cell(struct cds_ft *ft,
 	new_cell->parent = old->parent;
 	/* Carry the head's edge byte across the relocation (up-walk key source). */
 	meta->incoming_byte = cds_ft_item_to_metadata(old)->incoming_byte;
+	if (fine) {
+		/*
+		 * ONE commit under the holder: the list replace, the back edge
+		 * and the holder's release.  The two-store shape below is legal
+		 * because its window is observationally empty (see there), but
+		 * under the lock the back edge is a word of the locked holder and
+		 * belongs in the lock's commit like every other one.  An ABORT
+		 * installed nothing and released the lock with it.
+		 */
+		struct ft_flip_txn *t = ft_flip_txn_create_bounded(ft,
+			FT_ORD_CELL_SWAP_REC_MAX_EDGES +
+			1 /* @head->prev */ + 1 /* the holder's release */);
+		enum urcu_txn_status st;
+
+		if (!t) {
+			if (ft_debug_counters())
+				uatomic_inc(&ft->group->nr_cells_freed);
+			cds_ft_free_item_unpublished(ft, meta);
+			if (!h.shared)
+				ft_meta_lock_release(h.lock);
+			*bail = -ENOMEM;
+			return old;
+		}
+		if (!h.shared) {
+			ft_flip_txn_lock_register(t, h.lock, h.lock_snap);
+			ft_flip_txn_record_release_lock(t, h.lock, h.lock_snap);
+		}
+		/*
+		 * ord_prev / ord_next are set from @old's neighbours by the
+		 * replace.  ☠ ITS STATUS IS NOT OPTIONAL: -ENOENT (@old already
+		 * deleted) and -EAGAIN (a neighbour mid-delete) record NOTHING
+		 * for the list, and committing the back edge alone would point
+		 * @head->prev at a cell that is not in the list.
+		 */
+		sret = urcu_txn_list_replace_prepare(t->mtxn,
+			ft_ord_cell_lnode(old), ft_ord_cell_lnode(new_cell));
+		if (sret) {
+			ft_flip_txn_destroy(t);	/* releases the registered lock */
+			if (ft_debug_counters())
+				uatomic_inc(&ft->group->nr_cells_freed);
+			cds_ft_free_item_unpublished(ft, meta);
+			*bail = -EAGAIN;
+			return old;
+		}
+		ft_flip_txn_record_head_back_edge(t, (void **) &head->prev,
+			prev_old, (void *) ft_ord_cell_flag(new_cell)
+			FT_BE_SITE(FT_BE_COMPACT_CELL, ctx));
+		st = ft_flip_txn_commit(ft, t);
+		if (st != URCU_TXN_STATUS_OK) {
+			if (ft_debug_counters())
+				uatomic_inc(&ft->group->nr_cells_freed);
+			cds_ft_free_item_unpublished(ft, meta);
+			*bail = st == URCU_TXN_STATUS_ABORT ? -EAGAIN : -ENOMEM;
+			return old;
+		}
+		goto relocated;
+	}
 	/* ord_prev / ord_next are set from @old's neighbours by the swap. */
 	sret = ft_ord_cell_swap(ft, old, new_cell);
 	if (sret != 0) {
 		/*
-		 * OOM reserving the swap flip-txn: the abortable commit
-		 * installed nothing, so @old stays fully in the ordered list.
+		 * The swap installed nothing -- a reservation OOM (-ENOMEM), or
+		 * a prepare refused / a commit aborted by a peer (-EAGAIN) --
+		 * so @old stays fully in the ordered list.
 		 * Discard @new_cell (never published -- no reader can reach it)
 		 * and leave @old in place, the same best-effort contract as the
 		 * cell-allocation failure above.
@@ -426,10 +682,36 @@ struct ft_ord_cell *ft_compact_relocate_cell(struct cds_ft *ft,
 
 		ft_ord_cell_flip_one(&edge);
 	}
+relocated:
 	/* Always-deferred free: see ft_compact_relocate_at. */
 	/* cds_ft_free_item_deferred owns the balance (fractal-trie-alloc.c). */
 	cds_ft_free_item_deferred(ft, cds_ft_item_to_metadata(old));
 	return new_cell;
+}
+
+/*
+ * The chain the step's lookup landed on, reached by the walk: relocate its
+ * ordered cell unless this pass already moved it (its range is
+ * recompact_private), mirroring the node descent so a re-visit does not
+ * re-allocate.
+ */
+static inline
+void ft_compact_cell_at(struct cds_ft *ft, struct cds_ft_node *cell_head,
+		struct cds_ft_inode_flag *holder_nf, unsigned int holder_depth,
+		const struct ft_lock_ctx *ctx, unsigned long *relocated,
+		int *bail)
+{
+	void *prev = rcu_dereference(cell_head->prev);
+	struct ft_ord_cell *cell;
+
+	if (ft_node_flip_proxy(prev))
+		return;		/* a peer's commit in flight on the head: skip */
+	cell = ft_ord_cell_ptr(prev);
+	if (cds_ft_metadata_in_recompact_private(
+			cds_ft_item_to_metadata(cell)))
+		return;
+	ft_compact_relocate_cell(ft, cell, holder_nf, holder_depth, ctx, bail);
+	(*relocated)++;
 }
 
 /*
@@ -451,17 +733,34 @@ struct ft_ord_cell *ft_compact_relocate_cell(struct cds_ft *ft,
  * depth alone is not enough -- the one-hop rule DATES a member without a
  * descent, but only the table can name the boundary node its anchor IS -- so
  * this walk enters every node it passes, exactly as the read descent does, and
- * with the same flag the parent slot holds (a skip-compressed node is entered
- * by its SKIP flag, which ft_flag_to_metadata resolves through the child's
- * back-pointer and so survives the node's own relocation).
+ * with the PLAIN flag of the node it enters (a skip-compressed node is entered
+ * by its compressed node's own flag -- the relocated one -- not by the skip
+ * word: a skip word in the table defeats ft_anchor_meta's `anchor == nf`
+ * identity and names the elided node, the ft_node_recompact row of
+ * doc/design/ft-lockset-inventory.md §2).
+ *
+ * ☞ THE CURSOR IS KEPT ON THE NODE AT @d.depth.  ft_walk_extend leaves @d.nf on
+ * the node it ENTERED while @d.depth moves past it, and the table's pending-
+ * level fallback answers with @d.nf -- the member's PARENT -- for a member that
+ * starts exactly at a still-pending boundary (the ft_detach_orphan_planlock row
+ * of the same section).  Every acquire this walk makes names the node at
+ * @d.depth, so the walk points the cursor at it before asking.
+ *
+ * @cell_head, when set, is the chain the step's lookup landed on: its ordered
+ * cell is relocated from HERE (ft_compact_cell_at), the one frame that knows the
+ * chain's holder and the holder's depth, which is what the cell's lock is taken
+ * on.
  */
 static
 void ft_compact_descend(struct cds_ft *ft, const uint8_t *key,
-		size_t key_len, unsigned long *relocated, int *bail,
-		struct urcu_txn *op)
+		size_t key_len, struct cds_ft_node *cell_head,
+		unsigned long *relocated, int *bail, struct urcu_txn *op)
 {
 	const struct cds_ft_key_map *km = &ft->group->key_map;
 	struct cds_ft_inode_flag **holder = &ft->root;
+	/* The node containing *@holder (NULL at the root slot), and its start. */
+	struct cds_ft_inode_flag *holder_owner = NULL;
+	unsigned int holder_owner_depth = 0;
 	struct ft_descent d;
 	struct ft_lock_ctx ctx;
 	size_t depth = 0;
@@ -488,8 +787,17 @@ void ft_compact_descend(struct cds_ft *ft, const uint8_t *key,
 		struct cds_ft_inode_flag *raw;
 		uint8_t ord;
 
-		if (ft_node_external(nf))
-			return;		/* reached a leaf */
+		if (ft_node_external(nf)) {
+			/* reached a leaf: is it the chain the lookup landed on? */
+			if (cell_head && holder_owner &&
+					ft_node_ptr(nf) ==
+						(struct cds_ft_inode *) cell_head)
+				ft_compact_cell_at(ft, cell_head, holder_owner,
+					holder_owner_depth, &ctx, relocated,
+					bail);
+			return;
+		}
+		d.nf = nf;	/* the cursor names the node at @d.depth (above) */
 		if (!cds_ft_metadata_in_recompact_private(
 				cds_ft_item_to_metadata(ft_node_ptr(nf)))) {
 			ft_compact_relocate_at(ft, holder, (unsigned int) depth,
@@ -508,12 +816,22 @@ void ft_compact_descend(struct cds_ft *ft, const uint8_t *key,
 		 * the same one byte the depth++ below consumes.
 		 */
 		(void) ft_walk_extend(&d, true, nf, (unsigned int) depth, 1);
-		if (depth >= key_len)
-			return;		/* consumed the whole key */
+		if (depth >= key_len) {
+			/* consumed the whole key: a PREFIX head, held by @nf */
+			if (cell_head && cds_ft_item_to_metadata(
+					ft_node_ptr(nf))->external_nodes ==
+						cell_head)
+				ft_compact_cell_at(ft, cell_head, nf,
+					(unsigned int) depth, &ctx, relocated,
+					bail);
+			return;
+		}
 		ord = key_to_ordinal(key[depth], km);
 		raw = ft_node_get_nth_skip(nf, &child_slot, ord, FT_PF_NONE);
 		if (!raw)
 			return;		/* child absent (e.g. concurrent removal) */
+		holder_owner = nf;
+		holder_owner_depth = (unsigned int) depth;
 		depth++;		/* child-index byte (matches iter_key = *key++) */
 		if (ft_node_skip_compressed(raw)) {
 			struct cds_ft_compressed_node *cn =
@@ -532,35 +850,43 @@ void ft_compact_descend(struct cds_ft *ft, const uint8_t *key,
 			 * while an external leaf (not itself relocatable) ends the
 			 * descent at the loop's ft_node_external check.
 			 */
+			d.nf = ft_compressed_node_flag(cn);	/* the node at @d.depth */
 			if (!cds_ft_metadata_in_recompact_private(
 					cds_ft_item_to_metadata((struct cds_ft_inode *) cn))) {
-				cn = ft_compact_relocate_compressed(ft, cn, NULL, NULL, bail);
+				cn = ft_compact_relocate_compressed(ft, cn, NULL,
+					NULL, (unsigned int) depth, &ctx, bail);
 				(*relocated)++;
 				if (*bail)
 					return;		/* memory pressure: stop the descent */
 			}
 			/*
-			 * The skip flag addresses the TARGET, not cn, so the
-			 * relocation leaves it valid: enter it as the parent slot
-			 * holds it, and ft_flag_to_metadata resolves it to the
-			 * LIVE compressed node through the child's back-pointer.
+			 * Enter the LIVE compressed node by its own flag.  The skip
+			 * word would also resolve to it (through the child's
+			 * back-pointer), but a skip word in the table is what makes
+			 * a later anchor query name the elided node instead of a
+			 * member (see the header).
 			 */
-			depth = ft_walk_extend(&d, true, raw, (unsigned int) depth,
-				span);
+			holder_owner = ft_compressed_node_flag(cn);
+			holder_owner_depth = (unsigned int) depth;
+			depth = ft_walk_extend(&d, true, ft_compressed_node_flag(cn),
+				(unsigned int) depth, span);
 			holder = &cn->child;
 		} else if (ft_node_compressed(raw)) {
 			struct cds_ft_compressed_node *cn = ft_compressed_node_ptr(raw);
 			unsigned int span = cn->len;
 
+			d.nf = raw;	/* the node at @d.depth */
 			/* Traditional: the grandparent slot (child_slot) holds the cn flag. */
 			if (!cds_ft_metadata_in_recompact_private(
 					cds_ft_item_to_metadata((struct cds_ft_inode *) cn))) {
 				cn = ft_compact_relocate_compressed(ft, cn, child_slot,
-					nf, bail);
+					nf, (unsigned int) depth, &ctx, bail);
 				(*relocated)++;
 				if (*bail)
 					return;		/* memory pressure: stop the descent */
 			}
+			holder_owner = ft_compressed_node_flag(cn);
+			holder_owner_depth = (unsigned int) depth;
 			/* The grandparent slot now holds the relocated node's flag. */
 			depth = ft_walk_extend(&d, true, ft_compressed_node_flag(cn),
 				(unsigned int) depth, span);
@@ -692,10 +1018,16 @@ enum cds_ft_compact_status cds_ft_compact_step(struct cds_ft_compact_state *st,
 			break;
 		}
 		urcu_txn_begin(&optxn);
-		ft_compact_descend(ft, key, key_len, &relocated, &st->bail,
-				&optxn);
+		ft_compact_descend(ft, key, key_len,
+				ft->group->ordered_list_set ? st->iter->node : NULL,
+				&relocated, &st->bail, &optxn);
 		urcu_txn_end(&optxn);
 		/*
+		 * ☞ THE CELL IS NOW RELOCATED INSIDE THE WALK (ft_compact_descend),
+		 * the frame that has the chain's HOLDER and its depth, which is what
+		 * the cell's lock is taken on.  The rest of this note describes that
+		 * relocation.
+		 *
 		 * Relocate this key's cell into a dense private cell range, in the
 		 * same key order the iterator visits -- so the ordered cell list
 		 * becomes a near-sequential scan.  iter->node is the chain head;
@@ -705,16 +1037,6 @@ enum cds_ft_compact_status cds_ft_compact_step(struct cds_ft_compact_state *st,
 		 * too when the descent stopped on OOM: the head node may be un-
 		 * relocated, and the resume re-attempts this whole key anyway.
 		 */
-		if (!st->bail && ft->group->ordered_list_set && st->iter->node) {
-			struct ft_ord_cell *cell = ft_ord_cell_ptr(
-				rcu_dereference(st->iter->node->prev));
-
-			if (!cds_ft_metadata_in_recompact_private(
-					cds_ft_item_to_metadata(cell))) {
-				ft_compact_relocate_cell(ft, cell, &st->bail);
-				relocated++;
-			}
-		}
 		if (st->bail)
 			break;		/* stop the pass; the resume re-attempts */
 	}

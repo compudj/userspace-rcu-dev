@@ -69,13 +69,13 @@
 #endif
 
 /*
- * 332 unconditional + 51 fault-injection-only RUN_TEST registrations, on top of
+ * 333 unconditional + 51 fault-injection-only RUN_TEST registrations, on top of
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (395 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (396 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (344 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (345 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -32329,6 +32329,83 @@ out:
 }
 
 /*
+ * Compaction of PREFIX heads' ordered cells on a FINE trie.
+ *
+ * Under the FINE strategy the cell relocation locks the chain's holder and
+ * re-validates, under the lock, that the cell still names it.  A prefix head's
+ * cell->parent carries FT_PARENT_PREFIX_HEAD, and a re-validation that
+ * compares it unstripped refuses the right holder on EVERY attempt -- measured:
+ * cds_ft_compact returned BUSY on 1000 consecutive calls on exactly this shape
+ * ("ab" heads a 2-child node).  The contract says BUSY is "just resume", so a
+ * caller that does spins forever with no peer involved.  Require DONE within a
+ * bounded number of resumes, and the keys intact.
+ */
+static int test_compact_ordered_list_prefix_heads(void)
+{
+	static const char *const keys[] = {
+		"ab", "abc", "abd",		/* prefix head on a 2-child node */
+		"q", "qr", "qrs", "qrt",	/* nested prefix heads */
+		"zz",
+	};
+	struct cds_ft_group *group;
+	struct cds_ft *ft = create_varlen_fine_lock_ft(&group);
+	struct cds_ft_iter *iter = NULL;
+	enum cds_ft_compact_status cs;
+	unsigned int i, calls = 0;
+	int ret = 0;
+
+	if (cds_ft_iter_create(ft, &iter) < 0) {
+		ret = -1;
+		goto out;
+	}
+	for (i = 0; i < CAA_ARRAY_SIZE(keys); i++) {
+		struct ft_test_node *n = node_alloc(i);
+		enum cds_ft_status st;
+
+		rcu_read_lock();
+		st = cds_ft_insert(ft, (const uint8_t *) keys[i],
+				strlen(keys[i]), &n->node);
+		rcu_read_unlock();
+		if (st != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "compact_prefix: insert %s failed\n",
+				keys[i]);
+			node_free(n);
+			ret = -1;
+			goto out_iter;
+		}
+	}
+	do {
+		cs = cds_ft_compact(ft);
+	} while (cs == CDS_FT_COMPACT_BUSY && ++calls < 1000);
+	if (cs != CDS_FT_COMPACT_DONE) {
+		fprintf(stderr, "compact_prefix: status %d after %u resumes\n",
+			(int) cs, calls);
+		ret = -1;
+	}
+	rcu_read_lock();
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK) {
+		fprintf(stderr, "compact_prefix: post-compact verify failed\n");
+		ret = -1;
+	}
+	for (i = 0; i < CAA_ARRAY_SIZE(keys); i++) {
+		cds_ft_iter_set_key(iter, (const uint8_t *) keys[i],
+			strlen(keys[i]));
+		if (cds_ft_lookup(ft, iter) != CDS_FT_STATUS_OK) {
+			fprintf(stderr, "compact_prefix: lost %s\n", keys[i]);
+			ret = -1;
+		}
+	}
+	rcu_read_unlock();
+out_iter:
+	cds_ft_iter_destroy(iter);
+out:
+	drain_trie(ft);
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return ret;
+}
+
+/*
  * Compaction on an ORDERED-LIST trie: each library-owned ordinal cell is
  * relocated through ft_ord_cell_swap (the flip-latch cell-swap, the migrated
  * sole former ft_ord_cell_flip caller).  Build a fixed-key ordered trie, drain
@@ -39497,6 +39574,7 @@ int main(int argc, char **argv)
 	diag("Compaction tests");
 	RUN_TEST(test_compact_integrity);
 	RUN_TEST(test_compact_ordered_list);
+	RUN_TEST(test_compact_ordered_list_prefix_heads);
 	RUN_TEST(test_compact_skip_over_leaf);
 	RUN_TEST(test_compact_concurrent_mutation);
 	RUN_TEST(test_compact_forgotten_end);
