@@ -916,6 +916,40 @@ and the duplicate CHAIN class (`cds_ft_node.next`/`.prev`,
 at the producer and then the ordinary dispatch; §11.2-§11.3 is the measurement
 that says their owners are held.
 
+### 11.7 FT-SLOT-3 settled: the back edge belongs to the PARENT
+
+Mathieu asked what is wrong with keying the kind on the CHILD, as the code did,
+and whether the model might be outdated. It is not, for a mechanical reason: a
+re-home changes WHICH SLOT names the child, so every writer of that word
+rewrites the slot in the parent and therefore holds the parent, while only some
+of them also hold the child. The parent is what makes those writers exclude
+each other. Keying on the child left the recompaction sweep -- which re-homes
+every child of the node it copies and holds none of them -- permanently MW.
+
+Taken literally, "lock both" would mean the sweep locks each child: the fan of
+up to 256 acquires that was implemented in full and reverted ("a contended
+child fails the acquire, and escalation cannot rescue it"). The parent rule
+needs NO new acquire.
+
+Priced first (`-DFT_DEBUG_SLOT3`, per ft_inv leg, one producer):
+
+| | total | parent held | child held | neither |
+|---|---|---|---|---|
+| per-node | 1,246,659 | 1,246,594 | 25,762 | 65 |
+| exponential | 1,390,475 | 1,390,410 | 24,864 | 65 |
+| root-only | 1,272,917 | 1,272,852 | 1,162,228 | 65 |
+
+Every record the child licensed, the parent licensed too, so the switch loses
+nothing. The identical 65 are compaction's own txns (ft-compact.h:92 / :418,
+`nr_locks` 0) -- the exclusion the API leaves to the caller (§12.1) -- and they
+stay MW.
+
+After the switch, per leg at EVERY spacing: **PARENT_WORD 65, PSO 0** (from
+1.22M-1.37M and 0.42M). `@child_held` survives as a legacy branch, counted:
+5-18 per ft_unit leg with **FINE SHARED = 0**, i.e. only on tries whose
+exclusion is trie-wide, where door 1 decides the kind and the named owner does
+not. Both branches record the same kind, so one word can never get two.
+
 ## 12. API / design questions queued by Mathieu (2026-09-17)
 
 Not implemented; recorded so the flip does not silently decide them.

@@ -944,6 +944,29 @@ void ft_held_anchor_set(struct ft_held_anchor *h, struct cds_ft_metadata *lock,
 	h->txn_owned = false;
 }
 
+/*
+ * THE NODE A PARENT WORD NAMES -- §8.2's owner of a child's back edge -- or
+ * NULL where the question has no answer: a root-position word (no node owns the
+ * trie's root slot), a word a peer has PARKED (a descriptor is not a node), or
+ * an EXTERNAL parent (no state word to lock).  Dereference-free beyond the flag
+ * bits, so a hot-path producer can ask it.
+ */
+static inline
+struct cds_ft_metadata *ft_owner_of_parent_word(const struct cds_ft *ft,
+		void *pw)
+{
+	struct cds_ft_inode_flag *raw = (struct cds_ft_inode_flag *) pw;
+	struct cds_ft_inode_flag *p;
+
+	if (!ft || !raw || ft_node_flip_proxy(raw) ||
+			ft_parent_is_root_position(raw))
+		return NULL;
+	p = ft_parent_node(ft_parent_prefix_strip(raw));
+	if (!p || ft_node_flip_proxy(p) || ft_node_external(p))
+		return NULL;
+	return ft_flag_to_metadata((struct cds_ft *) ft, p);
+}
+
 static
 void ft_descent_init(struct ft_descent *d, struct cds_ft *ft)
 {
@@ -16971,14 +16994,181 @@ void ft_red_pw_sw_report(void)
 }
 #endif
 
+/*
+ * FT-SLOT-3's LEGACY LICENCE, COUNTED IN EVERY BUILD: a record the op could
+ * vouch for through the CHILD but not through the PARENT the word belongs to
+ * (§8.2).  The parent is the single rule the kind rests on; this counts the
+ * shape that would contradict it, and it is MEASURED ZERO per ft_inv leg at
+ * all three spacings (every +child record was also +parent).  Three words, and
+ * it is the evidence the rule rests on -- so it is not behind a debug macro.
+ */
+static unsigned long ft_slot3_child_only;	/* [0] trie-wide, [1] fine shared */
+static unsigned long ft_slot3_child_only_fine;
+
+static void ft_slot3_child_only_report(void) __attribute__((destructor));
+static void ft_slot3_child_only_report(void)
+{
+	if (uatomic_read(&ft_slot3_child_only))
+		fprintf(stderr, "FT_SLOT3 child_only=%lu of which FINE SHARED=%lu -- a re-homed child's back edge the CHILD licensed and its PARENT did not\n",
+			uatomic_read(&ft_slot3_child_only),
+			uatomic_read(&ft_slot3_child_only_fine));
+}
+
+#ifdef FT_DEBUG_SLOT3
+/*
+ * FT-SLOT-3, PRICED PER PRODUCER (probe): a child's back-edge word has two
+ * stakeholders -- the CHILD whose word moves, and the PARENT whose slot names
+ * it -- and during a re-home there are TWO parents, the one being vacated and
+ * the one being filled.  Which of them the op holds decides which rule can
+ * carry the word into the SW transition, so count all three, per site.
+ */
+static struct ft_slot3_site {
+	const char *fn;
+	int line;
+	unsigned long n[8];	/* child | old_parent<<1 | new_parent<<2 */
+} ft_slot3_sites[64];
+static unsigned int ft_slot3_n;
+static pthread_mutex_t ft_slot3_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void ft_slot3_count(const char *fn, int line, int child, int oldp,
+		int newp, const struct ft_flip_txn *txn)
+{
+	unsigned int i;
+	struct ft_slot3_site *st = NULL;
+
+	pthread_mutex_lock(&ft_slot3_lock);
+	for (i = 0; i < ft_slot3_n; i++)
+		if (ft_slot3_sites[i].line == line &&
+				ft_slot3_sites[i].fn == fn) {
+			st = &ft_slot3_sites[i];
+			break;
+		}
+	if (!st && ft_slot3_n < CAA_ARRAY_SIZE(ft_slot3_sites)) {
+		st = &ft_slot3_sites[ft_slot3_n++];
+		st->fn = fn;
+		st->line = line;
+	}
+	if (st)
+		st->n[(!!child) | (!!oldp << 1) | (!!newp << 2)]++;
+	pthread_mutex_unlock(&ft_slot3_lock);
+	if (!child && !oldp) {
+		static unsigned long nr;
+
+		/*
+		 * ☠ RETURN ADDRESSES, NOT backtrace_symbols_fd: that takes the
+		 * loader lock and has wedged a leg from this many threads.
+		 * Symbolize the offsets offline with addr2line.
+		 */
+		if (uatomic_add_return(&nr, 1) <= 8) {
+			void *ra0 = __builtin_return_address(0);
+			void *ra1;
+
+			_Pragma("GCC diagnostic push")
+			_Pragma("GCC diagnostic ignored \"-Wframe-address\"")
+			ra1 = __builtin_return_address(1);
+			_Pragma("GCC diagnostic pop")
+			fprintf(stderr, "FT_SLOT3 NEITHER at %s:%d txn=%s:%d ra0=%p ra1=%p nr_locks=%u nr_covered=%u\n",
+				fn, line,
+				FT_TK_TXN_SITE(txn) ?
+					FT_TK_TXN_SITE(txn)->file : "?",
+				FT_TK_TXN_SITE(txn) ?
+					FT_TK_TXN_SITE(txn)->line : 0,
+				ra0, ra1, txn->nr_locks, txn->nr_covered);
+		}
+	}
+}
+
+static void ft_slot3_count_txn(const struct ft_flip_txn *txn, const char *fn,
+		int line, int child, int oldp, int newp)
+{
+	ft_slot3_count(fn, line, child, oldp, newp, txn);
+}
+
+static void ft_slot3_report(void) __attribute__((destructor));
+static void ft_slot3_report(void)
+{
+	unsigned int i, k;
+
+	if (!ft_slot3_n)
+		return;
+	fprintf(stderr, "\n=== FT_SLOT3: who holds a re-homed child's back-edge stakeholders, per producer ===\n");
+	for (i = 0; i < ft_slot3_n; i++) {
+		unsigned long tot = 0;
+
+		for (k = 0; k < 8; k++)
+			tot += ft_slot3_sites[i].n[k];
+		fprintf(stderr, "FT_SLOT3 %s:%d total=%lu", ft_slot3_sites[i].fn,
+			ft_slot3_sites[i].line, tot);
+		for (k = 0; k < 8; k++)
+			if (ft_slot3_sites[i].n[k])
+				fprintf(stderr, " [%schild %soldP %snewP]=%lu",
+					(k & 1) ? "+" : "-",
+					(k & 2) ? "+" : "-",
+					(k & 4) ? "+" : "-",
+					ft_slot3_sites[i].n[k]);
+		fprintf(stderr, "\n");
+	}
+}
+
+# define FT_SLOT3_COUNT(ft, txn, meta, parent_nf, old_pw)		\
+	do {								\
+		struct cds_ft_metadata *_op = ft_owner_of_parent_word((ft), \
+			(old_pw));					\
+		struct cds_ft_metadata *_np = (parent_nf) &&		\
+			!ft_node_flip_proxy(parent_nf) &&		\
+			!ft_node_external(parent_nf) ?			\
+			ft_flag_to_metadata((struct cds_ft *) (ft),	\
+				(parent_nf)) : NULL;			\
+									\
+		ft_slot3_count_txn((txn), __func__, __LINE__,		\
+			ft_flip_txn_owns((txn), (meta)),			\
+			(_op && ft_flip_txn_owns((txn), _op)) ||		\
+				!(ft)->lock_fine || (ft)->exclusive ||	\
+				ft_wlock_held == (ft),			\
+			_np && ft_flip_txn_owns((txn), _np));		\
+	} while (0)
+#else
+# define FT_SLOT3_COUNT(ft, txn, meta, parent_nf, old_pw)	do { } while (0)
+#endif
+
 static inline
-void ft_flip_txn_record_parent_word(const struct cds_ft *ft,
+struct cds_ft_metadata *ft_flip_txn_record_parent_word(const struct cds_ft *ft,
 		struct ft_flip_txn *txn, struct cds_ft_metadata *meta,
 		struct cds_ft_inode_flag *parent_nf, bool child_held)
 {
 	void *old_pw = urcu_txn_load(txn->mtxn, (void **) &meta->parent_word,
 			FT_FLIP_PROXY_TAG);
 	void *new_pw = ft_parent_word(ft, parent_nf);
+	/*
+	 * FT-SLOT-3, SETTLED (Mathieu, 2026-09-17): the word belongs to the
+	 * PARENT whose slot names this child (§8.2), and that is the rule the
+	 * KIND rests on -- not @child_held, which the code used to key it on.
+	 *
+	 * WHY THE PARENT AND NOT THE CHILD.  A re-home changes WHICH SLOT names
+	 * the child, so every writer of this word rewrites that slot in the
+	 * parent and therefore holds the parent; only SOME of them also hold the
+	 * child (the recompaction sweep re-homes every child of the node it
+	 * copies and holds none of them).  So the parent is what makes those
+	 * writers exclude each other, and keying on the child left the sweep's
+	 * 1.22M-1.37M records per ft_inv leg permanently MW.
+	 *
+	 * MEASURED before the switch (-DFT_DEBUG_SLOT3, per ft_inv leg): the old
+	 * parent is held for 1,246,594 of 1,246,659 records at per-node,
+	 * 1,390,410 of 1,390,475 at exponential, 1,272,852 of 1,272,917 at
+	 * root-only -- and EVERY +child record was also +oldP, so the parent
+	 * rule strictly covers the child one.  The residue is compaction's own
+	 * txns (ft-compact.h:92 / :418, nr_locks 0), the exclusion the API still
+	 * leaves to the caller; they stay MW.
+	 *
+	 * ☠ NOT A THIRD PREDICATE.  The register's rule is "two predicates, one
+	 * word -- do not add a third": this REPLACES the child predicate as the
+	 * licence.  @child_held survives only as the legacy path below, counted
+	 * by @ft_slot3_child_only, and BOTH branches produce the same kind, so
+	 * they cannot disagree on one word.
+	 */
+	struct cds_ft_metadata *pow = ft_owner_of_parent_word(ft, old_pw);
+
+	FT_SLOT3_COUNT(ft, txn, meta, parent_nf, old_pw);
 
 	/*
 	 * EDGE KIND follows who HOLDS the child, exactly as the state edge in
@@ -17024,7 +17214,7 @@ void ft_flip_txn_record_parent_word(const struct cds_ft *ft,
 		uatomic_inc(&ft_red_pw_sw_held);
 	ft_flip_txn_record_reserved(txn, /*owner=*/ meta,
 		(void **) &meta->parent_word, old_pw, new_pw);
-	return;
+	return pow;
 #endif
 	/*
 	 * @child_held IS the ownership predicate this word needs, and @meta --
@@ -17035,19 +17225,35 @@ void ft_flip_txn_record_parent_word(const struct cds_ft *ft,
 	 * registry, which is where a hold taken on a frame the txn never
 	 * registered shows up.
 	 */
-	if (child_held)
+	if (pow && ft_flip_txn_owns(txn, pow)) {
+		/* The word's own parent, held: the ordinary dispatch. */
+		ft_flip_txn_record_reserved(txn, /*owner=*/ pow,
+			(void **) &meta->parent_word, old_pw, new_pw);
+		return pow;
+	}
+	if (child_held) {
+		uatomic_inc(&ft_slot3_child_only);
+		/*
+		 * On a trie whose exclusion is TRIE-WIDE (coarse, exclusive, or
+		 * inside the FT-wide writer lock) the named owner does not
+		 * decide the kind -- door 1 armed the txn -- so only a FINE
+		 * SHARED record here would contradict the parent rule.
+		 */
+		if (ft->lock_fine && !ft->exclusive &&
+				ft_wlock_held != (struct cds_ft *) ft)
+			uatomic_inc(&ft_slot3_child_only_fine);
 		ft_flip_txn_record_reserved(txn, /*owner=*/ meta,
 			(void **) &meta->parent_word, old_pw, new_pw);
-	else {
+	} else {
 #ifdef FT_DEBUG_STRUCT_ANCHOR
 		/* Owner: the parent being replaced (§8.2). */
-		ft_sa_lane_ask(txn, NULL, ft_sa_owner_of_parent_word(ft, old_pw),
-			meta);
+		ft_sa_lane_ask(txn, NULL, pow, meta);
 #endif
 		ft_flip_txn_record_tag_mw(txn, (void **) &meta->parent_word,
 			old_pw, new_pw, FT_FLIP_PROXY_TAG
 			FT_TK_MWA(FT_TK_MWA_PARENT_WORD));
 	}
+	return pow;
 }
 
 /*
@@ -17377,8 +17583,8 @@ void ft_reparent_record_meta(struct cds_ft *ft, struct ft_flip_txn *txn,
 		urcu_txn_load(txn->mtxn, (void **) &meta->parent_word,
 			FT_FLIP_PROXY_TAG));
 #endif
-	ft_flip_txn_record_parent_word(ft, txn, meta, parent_nf,
-		child_marked || held_earlier);
+	struct cds_ft_metadata *pow = ft_flip_txn_record_parent_word(ft, txn,
+		meta, parent_nf, child_marked || held_earlier);
 	/*
 	 * The state edge is now a pure {live_state -> live_state} GUARD: it no
 	 * longer carries the offset, so its whole job is the §4.B validate the
@@ -17476,7 +17682,20 @@ void ft_reparent_record_meta(struct cds_ft *ft, struct ft_flip_txn *txn,
 	 * with structural_sw false, record_tag IS record_tag_mw.
 	 */
 	if (record_pso) {
-		if (child_marked || held_earlier)
+		/*
+		 * THE SAME WORD'S SECOND HALF, so the SAME RULE: the offset
+		 * travels with the parent word (they are recorded together so no
+		 * reader sees half a pair), and FT-SLOT-3 puts both under the
+		 * parent whose slot names the child.  @pow is the parent the
+		 * recorder above already resolved -- asking again would load
+		 * @meta->parent_word a second time for one answer.
+		 */
+		if (pow && ft_flip_txn_owns(txn, pow))
+			ft_flip_txn_record_tag(txn, /*owner=*/ pow,
+				(void **) &meta->parent_slot_offset,
+				(void *) old_pso, (void *) new_pso,
+				FT_STATE_PROXY);
+		else if (child_marked || held_earlier)
 			ft_flip_txn_record_tag(txn, /*owner=*/ meta,
 				(void **) &meta->parent_slot_offset,
 				(void *) old_pso, (void *) new_pso,

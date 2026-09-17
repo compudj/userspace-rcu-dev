@@ -1311,8 +1311,8 @@ struct ft_pub_rec {
  *   metadata.state  nr_child++    ditto               SW armed   SW if owned
  *   metadata.state  nr_child--    ditto               MW  (2)    MW   [DESIGN]
  *   metadata.state  {live->live}  --                  MW         MW   [DESIGN]
- *   metadata.parent_word          parent (3)          SW if held SW if held
- *   metadata.parent_slot_offset   parent (3)          SW if held SW if held
+ *   metadata.parent_word          the PARENT (3)      SW if parent held
+ *   metadata.parent_slot_offset   the PARENT (3)      SW if parent held
  *   metadata.nr_keys              FT-wide lock (9)    MW         MW   [debt]
  *   metadata.incoming_byte        not transacted (7)
  *   metadata.alloc_index          ALLOCATOR-PRIVATE (7) -- never transacted
@@ -1379,14 +1379,29 @@ struct ft_pub_rec {
  *     every other producer and resolver tags FT_STATE_PROXY (0x1).  is_proxy
  *     with 0x1 accepts it and untag yields desc|0xE -- a misaligned record
  *     pointer.  Debug builds trap tag aliasing on the RECORD path only.
- * (3) ☑ FT-SLOT-3 (SOUND, on a DEPENDENCY -- see its entry below; this row read
- *     ☐ long after that entry closed it, which is the kind of drift the tag
- *     exists to prevent).  The MODEL owns the back edge by the PARENT (§8.2,
- *     decision 09-03); the CODE keys its kind on holding the CHILD
- *     (@child_held).  Two predicates, one word -- do not add a third.  A
- *     re-parent that already recorded the word chains by the EXISTING record's
- *     kind.  The two predicates DISAGREE and that is legal only while the
- *     FT-wide lock stands: the entry names what to revisit, and when.
+ * (3) ☑ FT-SLOT-3 SETTLED 2026-09-17 (Mathieu): the KIND rests on the PARENT
+ *     whose slot names the child -- §8.2's owner -- and no longer on holding
+ *     the CHILD.  The two predicates no longer disagree, because there is one.
+ *
+ *     WHY THE PARENT.  A re-home changes WHICH SLOT names the child, so every
+ *     writer of this word rewrites that slot in the parent and therefore holds
+ *     the parent; only SOME also hold the child (the recompaction sweep
+ *     re-homes every child of the node it copies and holds none of them).  The
+ *     parent is what makes those writers exclude each other; the child was a
+ *     sufficient extra licence that left the sweep MW forever.
+ *
+ *     MEASURED (-DFT_DEBUG_SLOT3, per ft_inv leg): the parent is held for
+ *     1,246,594 of 1,246,659 records at per-node, 1,390,410 of 1,390,475 at
+ *     exponential, 1,272,852 of 1,272,917 at root-only, and EVERY record the
+ *     child licensed was one the parent licensed too.  After the switch the
+ *     lane reads PARENT_WORD 65 and PSO 0 per leg at every spacing -- the 65
+ *     being compaction's own txns (nr_locks 0), whose exclusion the API still
+ *     leaves to the caller.
+ *     ☞ @child_held survives as a LEGACY branch, counted by
+ *     @ft_slot3_child_only: 5-18 per ft_unit leg, FINE SHARED = 0, i.e. only
+ *     on tries whose exclusion is trie-wide, where door 1 decides the kind and
+ *     the named owner does not.  Both branches record the same kind, so they
+ *     cannot disagree on one word.
  * (4) ☠ See FT-SLOT-2 for this word's dropped mark check.  And MW is
  *     load-bearing here TODAY: ft_hlist_freeze_sole_prepare's derived
  *     NULL is the only thing that turns an UNHELD sole-entry derivation into
