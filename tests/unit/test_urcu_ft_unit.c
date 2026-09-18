@@ -69,13 +69,13 @@
 #endif
 
 /*
- * 333 unconditional + 51 fault-injection-only RUN_TEST registrations, on top of
+ * 336 unconditional + 51 fault-injection-only RUN_TEST registrations, on top of
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (396 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (399 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (345 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (348 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -29180,6 +29180,315 @@ static int test_excl_validate_concurrent_reader_writer_no_rcu(void)
 	return excl_neg_expect_sigabrt(excl_neg_concurrent_reader_writer_child);
 }
 
+/* ------------------------------------------------------------------ */
+/* CDS_FT_WRITER_EXTERNAL_SYNC: the caller synchronizes its writers.  */
+/*                                                                    */
+/* Three runs of ONE body, differing in exactly one variable, so the  */
+/* negative row below cannot be explained away as "two writer threads */
+/* on a trie":                                                        */
+/*                                                                    */
+/*   strategy        caller mutex  expected                           */
+/*   EXTERNAL_SYNC   held          survives, trie coherent (contract) */
+/*   LOCK_COARSE     none          survives, trie coherent (control)  */
+/*   EXTERNAL_SYNC   none          SIGABRT under the validator (bug)  */
+/*                                                                    */
+/* The middle row is what makes the pair a measurement.  COARSE takes */
+/* the FT-wide writer mutex in ft_writer_lock_scope_enter BEFORE the  */
+/* validator's owner CAS, so its two writers can never overlap and    */
+/* the same body is silent.  EXTERNAL_SYNC skips that mutex -- so row */
+/* 3 aborting IS the proof the library took no writer lock of its     */
+/* own, and row 1 surviving is the proof the caller's lock suffices.  */
+/* Both surviving rows also assert the trie is COHERENT afterwards,   */
+/* not merely that nothing crashed.                                   */
+/*                                                                    */
+/* Note this is NOT cds_ft_make_exclusive, which the writer/writer    */
+/* provocation above uses: an EXCLUSIVE trie additionally promises no */
+/* concurrent RCU readers.  The two reach the same owner CAS by       */
+/* DIFFERENT flags, so both rows are worth having.                    */
+/*                                                                    */
+/* /!\ THE STRESS TEST DOES NOT COVER THIS.  test_urcu_ft -W          */
+/* external-sync ran clean against a build whose contract check was   */
+/* never reached: its writers rarely overlap inside the claim window. */
+/* The barrier plus the tight insert loop below make the overlap      */
+/* guaranteed, and that found it immediately.                         */
+/* ------------------------------------------------------------------ */
+/* ------------------------------------------------------------------ */
+
+/*
+ * /!\ VAM SCALES THIS DOWN; IT DOES NOT SKIP IT.  Under
+ * FEATURE_FT_VERIFY_AT_MUTATION every one of these inserts triggers a
+ * full-trie cds_ft_verify, so 50k per writer is O(keys^2): MEASURED as
+ * "not ok 290 - test_external_sync_in_contract" (the child blew through its
+ * alarm) followed by a leg timeout on the row after it.
+ *
+ * But unlike test_compact_dense_full_node, this shape does not NEED volume.
+ * What the two surviving rows assert is that concurrent writers under a
+ * serializing discipline leave a COHERENT trie, and per-mutation verify
+ * checks that harder than their own end-state cds_ft_verify does.  So keep
+ * the rows and shrink them, rather than buying speed by deleting coverage.
+ *
+ * The row that DOES need volume is the overlap provocation, and it needs
+ * FEATURE_FT_EXCL_VALIDATE, which the VAM config does not carry -- so it
+ * SKIPs there regardless, and keeps its full count in every config where it
+ * is actually armed.
+ */
+#ifdef FEATURE_FT_VERIFY_AT_MUTATION
+#define FT_EXTERNAL_SYNC_ITERATIONS	2000UL
+#else
+#define FT_EXTERNAL_SYNC_ITERATIONS	50000UL
+#endif
+
+struct external_sync_ctx {
+	struct cds_ft *ft;
+	pthread_barrier_t *start;
+	pthread_mutex_t *caller_lock;	/* NULL: no caller exclusion at all */
+	unsigned long id;		/* 0 or 1; selects this writer's keys */
+	unsigned long nr_failed;
+};
+
+/*
+ * Writer thread.  Keys are 2*i + @id, so the two writers never collide on a
+ * KEY: everything they contend for is STRUCTURE, which is the point -- a key
+ * collision serializes on the duplicate chain and could mask a missing writer
+ * exclusion.  The body is identical in all three rows (it asserts nothing:
+ * an out-of-contract trie is undefined, not merely wrong), so the only
+ * difference between them is @caller_lock and the trie's strategy.
+ */
+static void *external_sync_writer(void *arg)
+{
+	struct external_sync_ctx *ctx = (struct external_sync_ctx *) arg;
+	unsigned long i;
+
+	rcu_register_thread();
+	pthread_barrier_wait(ctx->start);
+	for (i = 0; i < FT_EXTERNAL_SYNC_ITERATIONS; i++) {
+		struct ft_test_node *n = node_alloc(2 * i + ctx->id);
+		uint8_t key[4];
+
+		cds_ft_u64_to_key(ctx->ft, n->key, key, 4);
+		if (ctx->caller_lock)
+			pthread_mutex_lock(ctx->caller_lock);
+		if (cds_ft_insert(ctx->ft, key, 4, &n->node) !=
+				CDS_FT_STATUS_OK) {
+			ctx->nr_failed++;
+			node_free(n);
+		}
+		if (ctx->caller_lock)
+			pthread_mutex_unlock(ctx->caller_lock);
+		rcu_quiescent_state();
+	}
+	rcu_unregister_thread();
+	return NULL;
+}
+
+/*
+ * The shared body, run in a forked child.  @caller_excl arms an application
+ * mutex around every mutating call -- the contract CDS_FT_WRITER_EXTERNAL_SYNC
+ * asks the caller to meet, met here with the simplest of the options its
+ * enumerator lists.  @verify runs the post-join coherence check, which only
+ * the rows expected to survive may run.
+ *
+ * Exit codes: 42 survived; 3/4 setup; 5 a refused insert; 6 count; 7 a lost
+ * key; 8 cds_ft_verify.  Never returns.
+ */
+__attribute__((noreturn))
+static void external_sync_run(enum cds_ft_writer_strategy strategy,
+		bool caller_excl, bool verify)
+{
+	pthread_mutex_t caller_lock = PTHREAD_MUTEX_INITIALIZER;
+	struct cds_ft_group_attr *attr;
+	struct external_sync_ctx ctx[2];
+	struct cds_ft_group *group;
+	pthread_barrier_t start;
+	unsigned long i, cnt;
+	struct cds_ft *ft;
+	pthread_t t[2];
+
+	if (cds_ft_group_attr_create(&attr) < 0)
+		_exit(3);
+	if (cds_ft_group_attr_set_key_len(attr, 4) < 0)
+		_exit(3);
+	if (cds_ft_group_attr_set_writer_strategy(attr, strategy) !=
+			CDS_FT_STATUS_OK) {
+		fprintf(stderr, "external_sync: set_writer_strategy(%d) refused\n",
+			(int) strategy);
+		_exit(4);
+	}
+	if (cds_ft_group_create(attr, &group) < 0)
+		_exit(3);
+	cds_ft_group_attr_destroy(attr);
+	if (cds_ft_create(group, NULL, &ft) < 0)
+		_exit(3);
+
+	pthread_barrier_init(&start, NULL, 2);
+	for (i = 0; i < 2; i++) {
+		ctx[i].ft = ft;
+		ctx[i].start = &start;
+		ctx[i].caller_lock = caller_excl ? &caller_lock : NULL;
+		ctx[i].id = i;
+		ctx[i].nr_failed = 0;
+	}
+	for (i = 0; i < 2; i++)
+		pthread_create(&t[i], NULL, external_sync_writer, &ctx[i]);
+	/*
+	 * /!\ OFFLINE ACROSS THE JOIN, OR THIS THREAD STALLS EVERY GRACE
+	 * PERIOD.  QSBR infers quiescence from threads REPORTING it; an online
+	 * thread that reports nothing holds the grace period open for as long
+	 * as it blocks.  The writers pass rcu_quiescent_state() every
+	 * iteration, but the thread WAITING ON THEM would sit online inside
+	 * pthread_join for the whole run, so every callback the library defers
+	 * -- and any synchronize_rcu it takes -- waits for a join that is
+	 * itself waiting for them.  MEASURED: "not ok 290" in 8 legs of a gate
+	 * run, in every config and at all three spacings, never alone and never
+	 * for the row beside it.
+	 *
+	 * The provocations above share this shape and never showed it: they are
+	 * SUPPOSED to abort within the first iterations, so their main thread
+	 * is never online for long.  This row runs to completion, which is what
+	 * makes the discipline load-bearing here.
+	 */
+	rcu_thread_offline();
+	for (i = 0; i < 2; i++)
+		pthread_join(t[i], NULL);
+	rcu_thread_online();
+
+	if (!verify)
+		_exit(42);	/* the negative row: surviving IS the failure */
+
+	if (ctx[0].nr_failed || ctx[1].nr_failed) {
+		fprintf(stderr, "external_sync: %lu + %lu inserts refused\n",
+			ctx[0].nr_failed, ctx[1].nr_failed);
+		_exit(5);
+	}
+	rcu_read_lock();
+	cnt = cds_ft_count_entries(ft);
+	rcu_read_unlock();
+	if (cnt != 2 * FT_EXTERNAL_SYNC_ITERATIONS) {
+		fprintf(stderr, "external_sync: count %lu != %lu\n", cnt,
+			2 * FT_EXTERNAL_SYNC_ITERATIONS);
+		_exit(6);
+	}
+	rcu_read_lock();
+	for (i = 0; i < 2 * FT_EXTERNAL_SYNC_ITERATIONS; i++) {
+		struct cds_ft_node *found = NULL;
+		uint8_t key[4];
+
+		cds_ft_u64_to_key(ft, i, key, 4);
+		if (cds_ft_eager_lookup_key(ft, key, 4, 0, &found) !=
+				CDS_FT_STATUS_OK) {
+			rcu_read_unlock();
+			fprintf(stderr, "external_sync: key %lu not found\n", i);
+			_exit(7);
+		}
+	}
+	rcu_read_unlock();
+	if (cds_ft_verify(ft, stderr) != CDS_FT_STATUS_OK)
+		_exit(8);
+	_exit(42);
+}
+
+/* Row 1: in contract -- the application serializes its own writers. */
+__attribute__((noreturn))
+static void external_sync_in_contract_child(void)
+{
+	alarm(300);		/* generous: the gate runs these under load */
+	external_sync_run(CDS_FT_WRITER_EXTERNAL_SYNC, true, true);
+}
+
+/* Row 2: the matched control -- COARSE serializes them in the library. */
+__attribute__((noreturn))
+static void external_sync_coarse_control_child(void)
+{
+	alarm(300);
+	external_sync_run(CDS_FT_WRITER_LOCK_COARSE, false, true);
+}
+
+/* Row 3: out of contract -- nobody serializes them.  Must be caught. */
+__attribute__((noreturn))
+static void external_sync_unserialized_child(void)
+{
+	/* Don't clutter the test harness with the validator's abort msg. */
+	(void) freopen("/dev/null", "w", stderr);
+	alarm(30);
+	external_sync_run(CDS_FT_WRITER_EXTERNAL_SYNC, false, false);
+}
+
+/*
+ * Parent side of the two surviving rows.  A regression here is an abort or a
+ * hang inside the child, so it runs forked for the same reason the
+ * provocations do: it becomes a reported failure instead of taking the suite
+ * down with it.  Cores are NOT suppressed -- unlike the provocations, an
+ * abort in these two is evidence.
+ */
+static int external_sync_expect_survival(void (*child_fn)(void),
+		const char *what)
+{
+	pid_t pid;
+	int status;
+
+	/* Same fork discipline as the other sites; see same_path's note. */
+	rcu_thread_offline();
+	call_rcu_before_fork();
+	pid = fork();
+	if (pid < 0) {
+		call_rcu_after_fork_parent();
+		rcu_thread_online();
+		fprintf(stderr, "%s: fork failed\n", what);
+		return -1;
+	}
+	if (pid == 0) {
+		call_rcu_after_fork_child();
+		rcu_thread_online();
+		child_fn();
+		_exit(9);		/* unreachable */
+	}
+	call_rcu_after_fork_parent();
+	rcu_thread_online();
+	if (waitpid(pid, &status, 0) != pid) {
+		fprintf(stderr, "%s: waitpid failed\n", what);
+		return -1;
+	}
+	if (WIFSIGNALED(status)) {
+		fprintf(stderr, "%s: child killed by signal %d%s\n", what,
+			WTERMSIG(status),
+			WTERMSIG(status) == SIGABRT ?
+				" (SIGABRT -- the access validator reported a "
+				"conflict on a trie whose writers ARE "
+				"serialized)" :
+			WTERMSIG(status) == SIGALRM ?
+				" (SIGALRM -- the writers did not finish)" : "");
+		return -1;
+	}
+	if (!WIFEXITED(status) || WEXITSTATUS(status) != 42) {
+		fprintf(stderr, "%s: child exit %d, expected 42\n", what,
+			WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+		return -1;
+	}
+	return 0;
+}
+
+static int test_external_sync_in_contract(void)
+{
+	return external_sync_expect_survival(external_sync_in_contract_child,
+			"external-sync in contract");
+}
+
+static int test_external_sync_coarse_control(void)
+{
+	return external_sync_expect_survival(external_sync_coarse_control_child,
+			"coarse two-writer control");
+}
+
+static int test_excl_validate_external_sync_unserialized(void)
+{
+	if (!cds_ft_excl_validate_enabled()) {
+		diag("FEATURE_FT_EXCL_VALIDATE not compiled in; "
+			"EXTERNAL_SYNC unserialized-writer provocation is a no-op");
+		return 0;
+	}
+	return excl_neg_expect_sigabrt(external_sync_unserialized_child);
+}
+
 /* ================================================================== */
 /*                                                                    */
 /*                  19. cds_ft_merge tests                            */
@@ -39541,6 +39850,9 @@ int main(int argc, char **argv)
 	RUN_TEST(test_excl_validate_writer_writer);
 	RUN_TEST(test_excl_validate_excl_reader_writer);
 	RUN_TEST(test_excl_validate_concurrent_reader_writer_no_rcu);
+	RUN_TEST(test_external_sync_in_contract);
+	RUN_TEST(test_external_sync_coarse_control);
+	RUN_TEST(test_excl_validate_external_sync_unserialized);
 
 	/* 19. cds_ft_merge tests */
 	diag("cds_ft_merge tests");

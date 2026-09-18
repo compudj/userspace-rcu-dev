@@ -3249,7 +3249,8 @@ enum cds_ft_writer_strategy {
 	 * -DFEATURE_FT_EXCL_VALIDATE catches it: the access validator keeps its
 	 * single-OWNER claim for any non-fine trie, so a second writer entering
 	 * concurrently reports "writer conflict -- owner ..., entering thread
-	 * ...".  Run the test suite that way at least once.
+	 * ...".  Run the test suite that way at least once --
+	 * test_external_sync_* in tests/unit/test_urcu_ft_unit.c is that run.
 	 */
 	CDS_FT_WRITER_EXTERNAL_SYNC = 3,
 };

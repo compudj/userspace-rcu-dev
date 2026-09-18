@@ -1230,6 +1230,15 @@ C++ consumer including `test_urcu_ft_unit_cxx`. `FEATURE_FT_EXCL_VALIDATE` and
 the `ft_excl_*` validator internals keep their names on purpose: that machinery
 polices BOTH modes, so its "excl" means access exclusion in general.
 
+☑ THE CONTRACT IS NOW TESTED, not just documented. `test_urcu_ft -W
+external-sync` did NOT catch a violation -- its writers rarely overlap inside
+the claim window. Three matched rows in `tests/unit/test_urcu_ft_unit.c` do,
+one body with one variable changed per row: EXTERNAL_SYNC + a caller mutex
+survives and verifies coherent; LOCK_COARSE with no caller mutex survives and
+verifies coherent (the control: the library's own mutex is what serialises it);
+EXTERNAL_SYNC with no caller mutex aborts under the validator. The third row
+SKIPs, loudly, on a build without `-DFEATURE_FT_EXCL_VALIDATE`.
+
 The original statement of the item follows.
 
 Planned, removed from the API, to be restored: the app guarantees writer
