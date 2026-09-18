@@ -1351,7 +1351,7 @@ so they retire completely:
 | ROOT (pinned) | 380 | 638 |
 
 ☠ ft_unit is the wrong place to SIZE it -- that leg is fine-dominated. The
-in-tree counter (`FT MWA DOOR1`, compiled into every build) reads per leg:
+in-tree counter (`FT MWA DOOR1`, under `-DFT_DEBUG_MWA_DOOR1`) reads per leg:
 ft_unit 8,298 converted; ft_inv 2.0M-2.7M. And for a user who runs a coarse
 trie, or the app-provided exclusion mode of §12.1 when it returns, this is 100%
 of the always-MW traffic, every record of it a CAS that arbitrates against

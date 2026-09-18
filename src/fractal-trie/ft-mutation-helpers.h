@@ -7470,6 +7470,21 @@ void ft_flip_txn_record_tag(struct ft_flip_txn *t,
  * root, so "the named trie excludes everyone" does not cover that slot -- which
  * is the per-slot uniformity trap the CHAIN flip fell into (§11.9).
  */
+/*
+ * ☠ DEBUG INSTRUMENTATION, AND IT MUST BE GATED.  These counters and their
+ * destructor shipped ungated, so ANY application linking the release library
+ * paid an atomic increment per recorded slot and then got
+ * "FT MWA DOOR1 converted=..." on its stderr at exit -- measured on a plain
+ * -O2 -DNDEBUG build.  A library does not print its own debug counters to an
+ * application's stderr.  Its twin below was gated from the start; this half
+ * simply never was.
+ *
+ * Nothing here is load-bearing: the convert arm's branch, and its choice of
+ * urcu_txn_store_sw vs _mw, do not read any of these words.  Compiled out they
+ * cost nothing and report nothing; -DFT_DEBUG_MWA_DOOR1 is how you measure,
+ * which is the tree the door-1 numbers in doc §12.1 were taken on.
+ */
+#ifdef FT_DEBUG_MWA_DOOR1
 static unsigned long ft_mwa_door1_conv;
 static unsigned long ft_mwa_door1_kept[2];	/* [0] fine trie, [1] a VALIDATE */
 /*
@@ -7507,6 +7522,7 @@ static void ft_mwa_door1_conv_report(void)
 #define FT_MWA_DOOR1_CONV()	uatomic_inc(&ft_mwa_door1_conv)
 #define FT_MWA_DOOR1_KEPT(t, val)					\
 	uatomic_inc(&ft_mwa_door1_kept[(val) ? 1 : 0])
+#define FT_MWA_DOOR1_ROOT_SLOT()	uatomic_inc(&ft_mwa_door1_root_slot)
 
 /*
  * Called by every recorder that carries a trie argument of its own: does it
@@ -7518,6 +7534,17 @@ void ft_mwa_door1_note_ft(const struct cds_ft *ft, const struct ft_flip_txn *t)
 	if (ft && t && t->ft && ft != t->ft)
 		uatomic_inc(&ft_mwa_door1_foreign);
 }
+#else
+# define FT_MWA_DOOR1_CONV()		do { } while (0)
+# define FT_MWA_DOOR1_KEPT(t, val)	do { (void) (t); (void) (val); } while (0)
+# define FT_MWA_DOOR1_ROOT_SLOT()	do { } while (0)
+static inline
+void ft_mwa_door1_note_ft(const struct cds_ft *ft, const struct ft_flip_txn *t)
+{
+	(void) ft;
+	(void) t;
+}
+#endif	/* FT_DEBUG_MWA_DOOR1 */
 
 #ifdef FT_DEBUG_MWA_DOOR1
 static unsigned long ft_mwa_door1[FT_TK_MWA_NR][2];
@@ -7636,7 +7663,7 @@ void __ft_flip_txn_record_tag_mw(struct ft_flip_txn *t, void **slot,
 		ret = urcu_txn_store_sw(t->mtxn, slot, old_ptr, new_ptr, tag);
 	} else {
 		if (!pinned && old_ptr != new_ptr && t->trie_wide_sw)
-			uatomic_inc(&ft_mwa_door1_root_slot);
+			FT_MWA_DOOR1_ROOT_SLOT();
 		FT_MWA_DOOR1_KEPT(t, old_ptr == new_ptr);
 		ret = urcu_txn_store_mw(t->mtxn, slot, old_ptr, new_ptr, tag);
 	}
