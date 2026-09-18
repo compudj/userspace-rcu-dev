@@ -116,7 +116,19 @@
 #include <urcu/assert.h>	/* urcu_assert_debug: the engine self-checks' arm */
 #include <urcu/call-rcu.h>
 #include <urcu/uatomic.h>
-#include <urcu/fractal-trie.h>	/* enum cds_ft_numa_policy, cds_ft_optimize */
+#include <urcu/fractal-trie.h>
+
+/*
+ * The public header declares CDS_FT_LOCK_SPACING_ROOT_ONLY only in a build that
+ * asks for the development axis (-DFEATURE_FT_LOCK_SPACING_ROOT_ONLY).  The
+ * library's own spacing dispatch still has to NAME the reserved value -- a
+ * dozen sites branch on it -- so give it an internal spelling here.  Without
+ * the gate nothing can SET the spacing (the attr setter and the environment
+ * knob both refuse it), so those branches are unreachable rather than wrong.
+ */
+#ifndef FEATURE_FT_LOCK_SPACING_ROOT_ONLY
+# define CDS_FT_LOCK_SPACING_ROOT_ONLY	((enum cds_ft_lock_spacing) 3)
+#endif	/* enum cds_ft_numa_policy, cds_ft_optimize */
 #include <assert.h>
 
 /*

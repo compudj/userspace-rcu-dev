@@ -1377,11 +1377,33 @@ machinery, not as a configuration: every gap this flip had to close (members
 deduping onto one word with nothing filing them, and a record whose owner is
 covered only by the root) was invisible at per-node and exponential.
 
-### 12.3 Gate ROOT_ONLY as non-public (Mathieu)
+### 12.3 Gate ROOT_ONLY as non-public (Mathieu) -- ☑ LANDED
 
-`cds_ft_group_attr_set_lock_spacing` already refuses EXPONENTIAL and ROOT_ONLY
-unless `FEATURE_FT_ANCHOR_VALIDATE`, but the ENUMERATOR sits in the public
-header, so the option reads as public API. Once the flip makes EXPONENTIAL a
-real setting, the two part ways: exponential graduates, root-only stays a dev
-axis behind its own config gate (its own macro name, not the anchor-validation
-one it shares today).
+The ENUMERATOR sat in the public header, so root-only read as public API even
+though the setter refused it. Now:
+
+- `CDS_FT_LOCK_SPACING_ROOT_ONLY` is declared **only** under
+  `-DFEATURE_FT_LOCK_SPACING_ROOT_ONLY` -- its own macro, not the
+  anchor-validation one it shared -- with the value 3 documented as RESERVED.
+  Code that names the symbol fails to COMPILE without the gate, which is the
+  strongest "not public" signal there is;
+- the library's own dozen spacing branches keep compiling through an internal
+  spelling of the reserved value in `fractal-trie-internal.h`; without the gate
+  nothing can SET the spacing, so those branches are unreachable, not wrong;
+- `cds_ft_group_attr_set_lock_spacing` refuses the raw value 3 without the gate,
+  and the unit test asserts exactly that -- by NUMBER, since the name does not
+  exist there. That assertion IS the "not public" property.
+
+☠ THE ENVIRONMENT KNOB WAS THE TRAP. The 18-leg gate reaches root-only through
+`CDS_FT_LOCK_SPACING=root-only`, not the setter. Gated silently, every root-only
+leg would have degraded to per-node and read GREEN -- a trie CREATOR is a feature
+gate, and a degraded creator is the wrong zero. So the knob now ABORTS loudly:
+`[Fatal] Fractal Trie: CDS_FT_LOCK_SPACING=root-only requested, but this build
+has no -DFEATURE_FT_LOCK_SPACING_ROOT_ONLY` (measured, rc=134). The dev trees
+carry the macro; a shipping build cannot be talked into the axis by an env var.
+
+☞ EXPONENTIAL IS UNCHANGED BY THIS: still refused at the setter without
+`FEATURE_FT_ANCHOR_VALIDATE`, still reachable through the env knob under
+`FEATURE_FT_LOCK_SPACING_ENV`. Whether it GRADUATES -- the flip (§11.5) serves
+it, and it has been green at 18/18 for every gate since -- is a separate,
+deliberate decision, not folded in here.

@@ -337,8 +337,23 @@ enum cds_ft_lock_spacing ft_lock_spacing_default(void)
 	if (env) {
 		if (!strcmp(env, "exponential"))
 			return CDS_FT_LOCK_SPACING_EXPONENTIAL;
-		if (!strcmp(env, "root-only"))
+		if (!strcmp(env, "root-only")) {
+#ifdef FEATURE_FT_LOCK_SPACING_ROOT_ONLY
 			return CDS_FT_LOCK_SPACING_ROOT_ONLY;
+#else
+			/*
+			 * ☠ LOUD, NOT SILENT.  A test leg that asks for root-only
+			 * on a build without the axis must not quietly run
+			 * per-node and read GREEN -- a trie CREATOR is a feature
+			 * gate, and a degraded creator is the wrong zero that
+			 * costs a whole gate round.  Refuse where it can be seen.
+			 */
+			fprintf(stderr, "[Fatal] Fractal Trie: CDS_FT_LOCK_SPACING="
+				"root-only requested, but this build has no "
+				"-DFEATURE_FT_LOCK_SPACING_ROOT_ONLY\n");
+			abort();
+#endif
+		}
 	}
 #endif
 	return CDS_FT_LOCK_SPACING_PER_NODE;
@@ -351,8 +366,19 @@ enum cds_ft_status cds_ft_group_attr_set_lock_spacing(
 	switch (spacing) {
 	case CDS_FT_LOCK_SPACING_PER_NODE:
 		break;
-	case CDS_FT_LOCK_SPACING_EXPONENTIAL:
 	case CDS_FT_LOCK_SPACING_ROOT_ONLY:
+		/*
+		 * A DEVELOPMENT AXIS, gated on its OWN macro -- not on the
+		 * anchor-validation one it used to share, so that turning the
+		 * validator on does not quietly make a non-setting settable.
+		 * See the enumerator's comment in the public header.
+		 */
+#ifndef FEATURE_FT_LOCK_SPACING_ROOT_ONLY
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+#else
+		break;
+#endif
+	case CDS_FT_LOCK_SPACING_EXPONENTIAL:
 		/*
 		 * ANCHORING IS ALL-OR-NOTHING: two ops that mutate one node must
 		 * acquire the SAME word, so a spacing coarser than per-node is

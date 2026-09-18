@@ -3422,7 +3422,9 @@ static int test_lifecycle_lock_spacing(void)
 		 */
 #ifdef FEATURE_FT_ANCHOR_COMPLETE
 		CDS_FT_LOCK_SPACING_EXPONENTIAL,
+# ifdef FEATURE_FT_LOCK_SPACING_ROOT_ONLY
 		CDS_FT_LOCK_SPACING_ROOT_ONLY,
+# endif
 #endif
 	};
 	static const char *const keys[] = {
@@ -3448,6 +3450,22 @@ static int test_lifecycle_lock_spacing(void)
 			cds_ft_group_attr_destroy(attr);
 			return -1;
 		}
+#ifndef FEATURE_FT_LOCK_SPACING_ROOT_ONLY
+		/*
+		 * Root-only is a DEVELOPMENT AXIS, not public API: without its
+		 * build gate the enumerator does not exist, so the test that it
+		 * is refused has to name the reserved VALUE -- which is exactly
+		 * the "not public" property being asserted.
+		 */
+		if (cds_ft_group_attr_set_lock_spacing(attr,
+				(enum cds_ft_lock_spacing) 3)
+					!= CDS_FT_STATUS_INVALID_ARGUMENT_ERROR) {
+			fprintf(stderr, "root-only spacing was accepted by a build "
+				"without -DFEATURE_FT_LOCK_SPACING_ROOT_ONLY\n");
+			cds_ft_group_attr_destroy(attr);
+			return -1;
+		}
+#endif
 #ifndef FEATURE_FT_ANCHOR_VALIDATE
 		/*
 		 * Anchoring is all-or-nothing, so a spacing coarser than per-node
@@ -3455,9 +3473,6 @@ static int test_lifecycle_lock_spacing(void)
 		 */
 		if (cds_ft_group_attr_set_lock_spacing(attr,
 				CDS_FT_LOCK_SPACING_EXPONENTIAL)
-					!= CDS_FT_STATUS_INVALID_ARGUMENT_ERROR ||
-		    cds_ft_group_attr_set_lock_spacing(attr,
-				CDS_FT_LOCK_SPACING_ROOT_ONLY)
 					!= CDS_FT_STATUS_INVALID_ARGUMENT_ERROR) {
 			fprintf(stderr, "coarser-than-per-node spacing was accepted "
 				"while the conversion is incomplete\n");

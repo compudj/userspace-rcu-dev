@@ -3294,7 +3294,22 @@ enum cds_ft_status cds_ft_group_attr_set_writer_strategy(
 enum cds_ft_lock_spacing {
 	CDS_FT_LOCK_SPACING_PER_NODE = 1,
 	CDS_FT_LOCK_SPACING_EXPONENTIAL = 2,
+#ifdef FEATURE_FT_LOCK_SPACING_ROOT_ONLY
+	/*
+	 * NOT PUBLIC API.  Root-only is the development axis that drives every
+	 * lock-set member onto ONE word -- the maximal-collapse test of the
+	 * anchor machinery, which is where the gaps a coarser spacing can open
+	 * (members deduping onto one word with nothing filing them, an owner
+	 * covered only by the root) become visible at all.  As a
+	 * configuration it is redundant with CDS_FT_WRITER_LOCK_COARSE, which
+	 * serializes every writer on a plain mutex instead of a CAS through the
+	 * engine.  So the enumerator exists only in a build that asks for it,
+	 * and both cds_ft_group_attr_set_lock_spacing and the
+	 * CDS_FT_LOCK_SPACING environment knob refuse it otherwise.
+	 */
 	CDS_FT_LOCK_SPACING_ROOT_ONLY = 3,
+#endif
+	/* The value 3 is RESERVED for the development-only root-only axis. */
 };
 
 /*
@@ -3310,9 +3325,13 @@ enum cds_ft_lock_spacing {
  * Anchoring is ALL-OR-NOTHING: two ops mutating one node must acquire the SAME
  * word, so a spacing coarser than per-node is correct only once every acquire
  * site maps its members through the anchor.  Until then
- * CDS_FT_LOCK_SPACING_EXPONENTIAL and CDS_FT_LOCK_SPACING_ROOT_ONLY are
- * REFUSED with CDS_FT_STATUS_INVALID_ARGUMENT_ERROR, rather than offered as a
- * setting that silently excludes nothing.
+ * CDS_FT_LOCK_SPACING_EXPONENTIAL is REFUSED with
+ * CDS_FT_STATUS_INVALID_ARGUMENT_ERROR, rather than offered as a setting that
+ * silently excludes nothing.
+ *
+ * The value 3 (root-only) is a development axis, not a setting: it is refused
+ * unless the library was built with -DFEATURE_FT_LOCK_SPACING_ROOT_ONLY, and
+ * its enumerator is not even declared without it.
  */
 enum cds_ft_status cds_ft_group_attr_set_lock_spacing(
 		struct cds_ft_group_attr *attr,
