@@ -8664,7 +8664,26 @@ bool ft_locate_chain_head(struct cds_ft *ft, struct cds_ft_node *head,
 		if (!child)
 			return false;
 	}
-	return (struct cds_ft_node *) ft_node_ptr(**head_slot_p) == head;
+	/*
+	 * /!\ RESOLVE BEFORE COMPARING.  A peer writer's committed-but-unsettled
+	 * txn parks a flip proxy in this very slot, and ft_node_ptr's contract is
+	 * a RESOLVED pointer -- it asserts on a parked one under
+	 * -DFT_DEBUG_PROXY_ASSERT, which is how this was found (9 legs of a gate
+	 * run, deterministically at the same test).
+	 *
+	 * Read RAW, the mask lands on a DESCRIPTOR, the compare fails, and this
+	 * answers "not the live head" for a head that IS live.  The first caller
+	 * absorbs that as a stale cache and re-seeds, but the second asks again
+	 * AFTER a fresh lookup has already found the node, and turns a false here
+	 * into CDS_FT_STATUS_NOT_FOUND -- a wrong answer for a key that is
+	 * present, and one the oracles cannot see, because a concurrent
+	 * remove_all lane legitimately reports NOT_FOUND too.
+	 *
+	 * A refusal is a claim about the trie; it must not be decided by a word
+	 * that merely happened to be in flight.
+	 */
+	return (struct cds_ft_node *) ft_node_ptr(
+			ft_resolve_flip_proxy(**head_slot_p)) == head;
 }
 
 
