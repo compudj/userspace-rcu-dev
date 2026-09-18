@@ -726,6 +726,86 @@ static void ft_snapshot_record(void)
 	(void) system(cmd);
 }
 
+/*
+ * /!\ A LIVENESS VIOLATION IS A CLAIM ABOUT THE CODE, AND THE KERNEL CAN FAKE
+ * IT.  Every no-progress detector here measures WALL time, so a thread that is
+ * simply not running looks exactly like a thread that is wedged -- and on a
+ * fragmented box a transparent-hugepage fault can sit in direct compaction with
+ * no syscall, no context switch and no counter moving until it ends.
+ *
+ * So a violation reports what separates the two, at the moment it fires:
+ * this process's user vs system CPU, and the kernel's compaction / THP
+ * counters since the run began.  A genuine spin burns USER time with compaction
+ * idle; a fragmentation stall shows SYSTEM time with compact_stall / _fail
+ * climbing and thp_fault_fallback non-zero.  Neither is inferred from the other.
+ */
+struct ft_kstat {
+	unsigned long compact_stall, compact_fail, compact_success;
+	unsigned long thp_fault_alloc, thp_fault_fallback;
+};
+
+static struct ft_kstat ft_kstat_base;
+
+static void ft_kstat_read(struct ft_kstat *k)
+{
+	static const struct { const char *key; size_t off; } map[] = {
+		{ "compact_stall",	offsetof(struct ft_kstat, compact_stall) },
+		{ "compact_fail",	offsetof(struct ft_kstat, compact_fail) },
+		{ "compact_success",	offsetof(struct ft_kstat, compact_success) },
+		{ "thp_fault_alloc",	offsetof(struct ft_kstat, thp_fault_alloc) },
+		{ "thp_fault_fallback",	offsetof(struct ft_kstat, thp_fault_fallback) },
+	};
+	char line[128];
+	FILE *f;
+	size_t i;
+
+	memset(k, 0, sizeof(*k));
+	f = fopen("/proc/vmstat", "r");
+	if (!f)
+		return;			/* not Linux, or restricted: report zeros */
+	while (fgets(line, sizeof(line), f)) {
+		for (i = 0; i < sizeof(map) / sizeof(map[0]); i++) {
+			size_t n = strlen(map[i].key);
+
+			if (strncmp(line, map[i].key, n) || line[n] != ' ')
+				continue;
+			*(unsigned long *) ((char *) k + map[i].off) =
+				strtoul(line + n + 1, NULL, 10);
+			break;
+		}
+	}
+	fclose(f);
+}
+
+/* Baseline for the deltas; called once, before any test runs. */
+static void ft_kstat_init(void)
+{
+	ft_kstat_read(&ft_kstat_base);
+}
+
+/* One line of "was it us or was it the kernel?", printed beside a violation. */
+static void ft_kstat_report(const char *test)
+{
+	struct ft_kstat now;
+	struct rusage ru;
+
+	ft_kstat_read(&now);
+	if (getrusage(RUSAGE_SELF, &ru) != 0)
+		return;
+	fprintf(stderr,
+		"[VIOLATION-CTX] %s: cpu user=%ld.%03lds sys=%ld.%03lds | "
+		"since start: compact_stall=%lu compact_fail=%lu compact_success=%lu "
+		"thp_fault_alloc=%lu thp_fault_fallback=%lu\n",
+		test,
+		(long) ru.ru_utime.tv_sec, (long) (ru.ru_utime.tv_usec / 1000),
+		(long) ru.ru_stime.tv_sec, (long) (ru.ru_stime.tv_usec / 1000),
+		now.compact_stall	- ft_kstat_base.compact_stall,
+		now.compact_fail	- ft_kstat_base.compact_fail,
+		now.compact_success	- ft_kstat_base.compact_success,
+		now.thp_fault_alloc	- ft_kstat_base.thp_fault_alloc,
+		now.thp_fault_fallback	- ft_kstat_base.thp_fault_fallback);
+}
+
 static void report_violation(const char *test, const char *fmt, ...)
 	__attribute__((format(printf, 2, 3)));
 
@@ -739,6 +819,7 @@ static void report_violation(const char *test, const char *fmt, ...)
 	vsnprintf(msg, sizeof(msg), fmt, ap);
 	va_end(ap);
 	fprintf(stderr, "[VIOLATION] %s: %s\n", test, msg);
+	ft_kstat_report(test);
 	FT_TEST_TP(inv_violation, test, msg);
 	/*
 	 * Abort on first violation so lttng-ust snapshot captures the
@@ -25441,6 +25522,8 @@ int main(int argc, char **argv)
 {
 	const char *filter = (argc >= 2) ? argv[1] : NULL;
 	int err;
+
+	ft_kstat_init();
 
 #ifdef FT_ENABLE_TRACING
 	if (getenv("FT_INV_SNAPSHOT_ON_SEGV")) {
