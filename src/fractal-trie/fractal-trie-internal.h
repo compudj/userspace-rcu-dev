@@ -2613,7 +2613,7 @@ struct cds_ft {
 	 */
 	bool lock_fine;
 	/*
-	 * CDS_FT_WRITER_EXCL_CALLER: the APPLICATION provides writer exclusion
+	 * CDS_FT_WRITER_EXTERNAL_SYNC: the APPLICATION provides writer exclusion
 	 * -- a single thread, its own mutex around every mutating call, or any
 	 * other means.  The library therefore takes NO writer lock of its own.
 	 *
@@ -2629,7 +2629,7 @@ struct cds_ft {
 	 * bulk gate exist to promote FINE locking to a wider exclusion, and
 	 * there is no fine locking in this mode (nor in COARSE) to promote.
 	 */
-	bool excl_caller;
+	bool external_sync;
 
 	/*
 	 * Hot-path copy of the group's lock-set granularity, read by the
@@ -3385,11 +3385,11 @@ void ft_writer_lock_scope_enter(struct cds_ft *ft)
 		ft_wlock_depth++;		/* reentry on the trie we hold */
 		return;
 	}
-	if (ft->excl_caller) {
+	if (ft->external_sync) {
 		/*
-		 * CDS_FT_WRITER_EXCL_CALLER: the caller excludes every writer,
+		 * CDS_FT_WRITER_EXTERNAL_SYNC: the caller excludes every writer,
 		 * so there is no FT-wide lock to take -- that is the whole
-		 * point of the mode.  Readers are UNAFFECTED (see @excl_caller):
+		 * point of the mode.  Readers are UNAFFECTED (see @external_sync):
 		 * this skips the writer mutex, nothing else.
 		 *
 		 * Placed beside the @exclusive early-out and after the
@@ -3528,9 +3528,9 @@ void ft_writer_lock_scope_exit(struct cds_ft *ft)
 	 * trie's lock, @ft_wlock_held != ft and there is nothing to release.
 	 * Keying off identity (not a re-read of @ft->exclusive) means an
 	 * @exclusive flip between enter and exit -- cds_ft_make_exclusive
-	 * (false->true) or cds_ft_make_concurrent (true->false) -- can never
+	 * (false->true) or cds_ft_make_shared (true->false) -- can never
 	 * unbalance us: make_exclusive took the lock at enter (exclusive was
-	 * false) and releases it here (held == ft), make_concurrent skipped it
+	 * false) and releases it here (held == ft), make_shared skipped it
 	 * at enter (exclusive was true) and skips it here (held != ft).
 	 */
 	if (ft_wlock_held != ft)
@@ -4317,7 +4317,7 @@ void ft_bulk_lock_enter(struct cds_ft *ft)
 {
 	const struct rcu_flavor_struct *flavor = ft->group->flavor;
 
-	if (ft->exclusive || ft->excl_caller)
+	if (ft->exclusive || ft->external_sync)
 		return;
 	if (ft_bulk_lock_held == ft) {
 		ft_bulk_lock_depth++;

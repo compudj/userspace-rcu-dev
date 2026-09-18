@@ -28471,7 +28471,7 @@ static int test_exclusive_attr_set_true(void)
 }
 
 /*
- * cds_ft_make_exclusive / cds_ft_make_concurrent round-trips; also
+ * cds_ft_make_exclusive / cds_ft_make_shared round-trips; also
  * exercises the idempotent exclusive → exclusive case (no-op).
  */
 static int test_exclusive_make_transitions(void)
@@ -28496,7 +28496,7 @@ static int test_exclusive_make_transitions(void)
 		ret = -1;
 		goto end;
 	}
-	cds_ft_make_concurrent(ft);
+	cds_ft_make_shared(ft);
 	if (cds_ft_is_exclusive(ft)) {
 		ret = -1;
 		goto end;
@@ -33042,7 +33042,7 @@ static int test_compact_exclusive(void)
 		}
 	}
 out_concurrent:
-	cds_ft_make_concurrent(ft);
+	cds_ft_make_shared(ft);
 	rcu_barrier();	/* flush the compactor's deferred old-copy frees */
 out:
 	drain_trie(ft);

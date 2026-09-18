@@ -300,7 +300,7 @@ enum cds_ft_status cds_ft_group_attr_set_writer_strategy(
 	switch (strategy) {
 	case CDS_FT_WRITER_LOCK_COARSE:
 	case CDS_FT_WRITER_LOCK_FINE:
-	case CDS_FT_WRITER_EXCL_CALLER:
+	case CDS_FT_WRITER_EXTERNAL_SYNC:
 		attr->writer_strategy = strategy;
 		attr->writer_strategy_set = true;
 		return CDS_FT_STATUS_OK;
@@ -453,7 +453,7 @@ void cds_ft_make_exclusive(struct cds_ft *ft)
 	ft->exclusive = true;
 }
 
-void cds_ft_make_concurrent(struct cds_ft *ft)
+void cds_ft_make_shared(struct cds_ft *ft)
 {
 	CDS_FT_SCOPED_WRITER(ft);
 	ft->exclusive = false;
@@ -628,7 +628,7 @@ enum cds_ft_status _cds_ft_group_create(const struct cds_ft_group_attr *attr,
 		 */
 		/*
 		 * ☞ ONLY *FINE* IS COERCED.  COARSE is already the target, and
-		 * CDS_FT_WRITER_EXCL_CALLER already serializes every structural
+		 * CDS_FT_WRITER_EXTERNAL_SYNC already serializes every structural
 		 * writer -- by the caller's contract rather than by the FT-wide
 		 * mutex -- so the count walk has the exclusion it requires.
 		 * Coercing it would silently hand back a lock the caller
@@ -966,8 +966,8 @@ enum cds_ft_status cds_ft_create(struct cds_ft_group *ft_group,
 	 * decision reads exactly as it does on a COARSE trie, and @exclusive
 	 * stays false so the reader-visible discipline is untouched.
 	 */
-	ft->excl_caller = (ft_group->writer_strategy
-			== CDS_FT_WRITER_EXCL_CALLER);
+	ft->external_sync = (ft_group->writer_strategy
+			== CDS_FT_WRITER_EXTERNAL_SYNC);
 	/*
 	 * Spacing is a FINE-mode property, and this is where it is made inert
 	 * everywhere else (every reader takes it from here, ft_descent_init

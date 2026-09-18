@@ -1752,7 +1752,7 @@ struct ft_flip_txn {
 	 * DOOR 1's ANSWER, LATCHED AT CONSTRUCTION.  The always-MW lanes consult
 	 * this rather than re-deriving ft_txn_content_sw_ok per record, because
 	 * @ft->exclusive is a PLAIN MUTABLE BOOL (cds_ft_make_exclusive /
-	 * _make_concurrent, and the graft_swap restore): sampled per record it
+	 * _make_shared, and the graft_swap restore): sampled per record it
 	 * could answer differently within ONE txn, and disagree with the
 	 * structural_sw the constructor latched from the same call.  The whole
 	 * argument for parking those lanes is "every writer of every slot in this

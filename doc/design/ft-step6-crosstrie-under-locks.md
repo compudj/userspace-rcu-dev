@@ -53,7 +53,7 @@ or stranded; there is nothing to hand back.
 Two facts compose (fractal-trie-internal.h):
 
 1. **An exclusive trie is private / single-writer by contract** — no concurrent
-   writers, no concurrent readers until `cds_ft_make_concurrent`. So it needs no
+   writers, no concurrent readers until `cds_ft_make_shared`. So it needs no
    FT-wide writer lock at all.
 2. `ft_writer_lock_scope_enter/_exit` **skip** the FT-wide lock when
    `ft->exclusive`. Then a cross-trie op with a live `dst` and an exclusive source
@@ -67,12 +67,12 @@ live lock actually held), never the exclusive trie.
 
 **HAZARD — the `exclusive` flag must not unbalance the lock if it flips inside a
 scope.** `graft_swap` sets `swap_ft->exclusive` to `dst`'s mode mid-op (mode
-inheritance), and `cds_ft_make_exclusive`/`_make_concurrent` flip the flag inside
+inheritance), and `cds_ft_make_exclusive`/`_make_shared` flip the flag inside
 their own writer scope. Resolved structurally: the exclusive-skip is checked
 **after** the reentrancy test, and `_exit` releases off `ft_wlock_held`
 **identity**, never a re-read of `ft->exclusive`. So a flag flip between enter and
 exit cannot unbalance the TLS depth — `make_exclusive` took the lock at enter
-(flag was false) and releases it at exit (`held == ft`); `make_concurrent` /
+(flag was false) and releases it at exit (`held == ft`); `make_shared` /
 graft_swap's inheritance skipped it at enter (flag was true) and skips it at exit
 (`held != ft`).
 

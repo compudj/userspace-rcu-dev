@@ -2126,9 +2126,9 @@ int main(int argc, char **argv)
 		case 'W':
 			/*
 			 * E.4: writer strategy, "fine" (default), "coarse", or
-			 * "excl-caller".
+			 * "external-sync".
 			 *
-			 * ☠ "excl-caller" IS A CONTRACT, AND THIS HARNESS CAN
+			 * ☠ "external-sync" IS A CONTRACT, AND THIS HARNESS CAN
 			 * BREAK IT: the application promises writer exclusion,
 			 * so it is only in contract with a SINGLE writer thread
 			 * (-n 1).  Run it with more and the trie is being used
@@ -2141,8 +2141,8 @@ int main(int argc, char **argv)
 				writer_strategy = CDS_FT_WRITER_LOCK_COARSE;
 			else if (!strcmp(optarg, "fine"))
 				writer_strategy = CDS_FT_WRITER_LOCK_FINE;
-			else if (!strcmp(optarg, "excl-caller"))
-				writer_strategy = CDS_FT_WRITER_EXCL_CALLER;
+			else if (!strcmp(optarg, "external-sync"))
+				writer_strategy = CDS_FT_WRITER_EXTERNAL_SYNC;
 			else
 				goto usage_error;
 			break;

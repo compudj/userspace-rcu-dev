@@ -1225,7 +1225,7 @@ static int inv_concurrent_writers_disjoint(void)
 	 * the flavor's call_rcu, so a writer's rcu_read_lock-guarded descent keeps
 	 * every node it touches live until its grace period.
 	 */
-	cds_ft_make_concurrent(ft);
+	cds_ft_make_shared(ft);
 	struct mw_writer_arg *w;
 	pthread_t writers[MW_NR_WRITERS];
 	struct timespec t0;
@@ -1474,7 +1474,7 @@ static int inv_rekey_graft_disjoint(void)
 	leak_reset();
 
 	ft = create_fixed_fine_lock_ft(4, &group);	/* list ON (default) */
-	cds_ft_make_concurrent(ft);
+	cds_ft_make_shared(ft);
 
 	/* Global guard leaves so no writer's subtree is ever the list head/tail. */
 	guard_lo = node_alloc(0x00000000ULL);
@@ -1969,7 +1969,7 @@ static int rkm_run(const char *name, int nsib, int churn)
 	 * test_rekey_merge_occupied_dst_liston covers the disjoint shape.
 	 */
 	ft = create_fixed_fine_lock_listoff_ft(4, &group);
-	cds_ft_make_concurrent(ft);
+	cds_ft_make_shared(ft);
 
 	w = (struct rkm_writer_arg *) calloc(RKM_NW, sizeof(*w));
 	if (!w)
@@ -2355,7 +2355,7 @@ static int inv_rekey_merge_shared_dst(void)
 	leak_reset();
 
 	ft = create_fixed_fine_lock_listoff_ft(4, &group);	/* LIST OFF */
-	cds_ft_make_concurrent(ft);
+	cds_ft_make_shared(ft);
 
 	rcu_read_lock();
 	for (i = 0; i < RKMS_NJ; i++) {
@@ -2674,7 +2674,7 @@ static int inv_rekey_graft_run_junction(void)
 	leak_reset();
 
 	ft = create_fixed_fine_lock_ft(5, &group);	/* list ON (default) */
-	cds_ft_make_concurrent(ft);
+	cds_ft_make_shared(ft);
 
 	/*
 	 * Global guards so no writer's subtree is ever the list head or tail.
@@ -2918,7 +2918,7 @@ static int inv_rekey_graft_elevating_junction(void)
 	leak_reset();
 
 	ft = create_fixed_fine_lock_ft(5, &group);	/* list ON (default) */
-	cds_ft_make_concurrent(ft);
+	cds_ft_make_shared(ft);
 
 	guard_lo = node_alloc(RKX_KEY(0x00, 0, 0, 0, 0));
 	guard_hi = node_alloc(RKX_KEY(0xff, 0, 0, 0, 0));
@@ -3091,7 +3091,7 @@ static int inv_rekey_graft_cross_junction(void)
 	leak_reset();
 
 	ft = create_fixed_fine_lock_ft(5, &group);	/* list ON (default) */
-	cds_ft_make_concurrent(ft);
+	cds_ft_make_shared(ft);
 
 	/* Global guard leaves so no writer's subtree is ever the list head/tail. */
 	guard_lo = node_alloc(RKX_KEY(0x00, 0, 0, 0, 0));
@@ -3405,7 +3405,7 @@ static int inv_rekey_graft_glue_dst(void)
 	leak_reset();
 
 	ft = create_fixed_fine_lock_ft(5, &group);	/* list ON (default) */
-	cds_ft_make_concurrent(ft);
+	cds_ft_make_shared(ft);
 
 	guard_lo = node_alloc(RKX_KEY(0x00, 0, 0, 0, 0));
 	guard_hi = node_alloc(RKX_KEY(0xff, 0, 0, 0, 0));
@@ -3745,7 +3745,7 @@ static int inv_rekey_graft_coherent_readers(void)
 	leak_reset();
 
 	ft = create_fixed_rekey_coherent_ft(4, &group);
-	cds_ft_make_concurrent(ft);
+	cds_ft_make_shared(ft);
 
 	guard_lo = node_alloc(0x00000000ULL);
 	guard_hi = node_alloc(0xff000000ULL);
@@ -4287,7 +4287,7 @@ static void rksp_child(void)
 	leak_reset();
 
 	ft = create_fixed_rekey_coherent_ft(RKSP_KLEN, &group);
-	cds_ft_make_concurrent(ft);
+	cds_ft_make_shared(ft);
 
 	guard_lo = node_alloc(0x00000000ULL);
 	guard_hi = node_alloc(0xff000000ULL);
@@ -4564,7 +4564,7 @@ static int inv_rekey_graft_shared(void)
 	leak_reset();
 
 	ft = create_fixed_fine_lock_ft(4, &group);	/* list ON (default) */
-	cds_ft_make_concurrent(ft);
+	cds_ft_make_shared(ft);
 
 	/* Per-junction guard leaves at byte1 0x00 / 0xff (see the layout note). */
 	rcu_read_lock();
@@ -5036,7 +5036,7 @@ static int inv_rekey_linearizability(void)
 	leak_reset();
 
 	ft = create_fixed_rekey_coherent_ft(4, &group);	/* EAGER + ordered list */
-	cds_ft_make_concurrent(ft);
+	cds_ft_make_shared(ft);
 
 	guard_lo = node_alloc(0x00000000ULL);
 	guard_hi = node_alloc(0xff000000ULL);
@@ -5715,7 +5715,7 @@ static int inv_rekey_public_no_gap_run(enum rkp_mode mode, enum rkp_gap gap,
 	leak_reset();
 
 	ft = create_rekey_coherent_ft(mode, &group);
-	cds_ft_make_concurrent(ft);
+	cds_ft_make_shared(ft);
 
 	guard_lo = node_alloc(0x00000000ULL);
 	guard_hi = node_alloc(0xff000000ULL);
@@ -6643,7 +6643,7 @@ static int inv_widen_deep_junction(void)
 	if (cds_ft_create(group, attr, &ft) < 0)
 		abort();
 	cds_ft_attr_destroy(attr);
-	cds_ft_make_concurrent(ft);
+	cds_ft_make_shared(ft);
 
 	/*
 	 * ☠☠ BYTE DEPTH IS NOT NODE DEPTH, and the widening walks NODES.
@@ -6811,7 +6811,7 @@ static int inv_rekey_mixed_writers_run(enum rkp_mode mode,
 	 * therefore impossible by BOTH routes and the arm measures nothing.
 	 */
 	ft = create_rekey_coherent_ft(mode, &group);
-	cds_ft_make_concurrent(ft);
+	cds_ft_make_shared(ft);
 
 	guard_lo = node_alloc(0x00000000ULL);
 	guard_hi = node_alloc(0xff000000ULL);
@@ -7857,7 +7857,7 @@ static int inv_rekey_src_mutated(void)
 	leak_reset();
 
 	ft = create_fixed_fine_lock_listoff_ft(4, &group);	/* LIST OFF */
-	cds_ft_make_concurrent(ft);
+	cds_ft_make_shared(ft);
 
 	mv = (struct rksm_arg *) calloc(RKSM_NW, sizeof(*mv));
 	mu = (struct rksm_arg *) calloc(RKSM_NW, sizeof(*mu));
@@ -8132,7 +8132,7 @@ static int sibling_split_compress_body(const char *name, bool pin_prefix)
 	leak_reset();
 
 	ft = create_fixed_fine_lock_listoff_ft(4, &group);
-	cds_ft_make_concurrent(ft);
+	cds_ft_make_shared(ft);
 
 	w = (struct sibp_arg *) calloc(SIBP_NW * 2, sizeof(*w));
 	if (!w)
@@ -8458,7 +8458,7 @@ static int inv_concurrent_writers_shared(void)
 	 * and cannot arbitrate same-key removers"; that strategy is gone.)
 	 */
 	ft = create_fixed_fine_lock_ft(8, &group);
-	cds_ft_make_concurrent(ft);
+	cds_ft_make_shared(ft);
 	leak_reset();
 
 	w = (struct mw_shared_arg *) calloc(MW_NR_WRITERS, sizeof(*w));
@@ -8564,7 +8564,7 @@ static int inv_concurrent_writers_coarse_lock(void)
 	mw_install_fatal_handler();
 	ft = create_fixed_coarse_lock_ft(8, &group);
 	/* Concurrent mode: deferred reclaim keeps a peer's touched nodes live. */
-	cds_ft_make_concurrent(ft);
+	cds_ft_make_shared(ft);
 
 	leak_reset();
 
@@ -8678,7 +8678,7 @@ static int inv_concurrent_writers_fine_lock(void)
 	mw_install_fatal_handler();
 	ft = create_fixed_fine_lock_ft(8, &group);
 	/* Concurrent mode: deferred reclaim keeps a peer's touched nodes live. */
-	cds_ft_make_concurrent(ft);
+	cds_ft_make_shared(ft);
 
 	leak_reset();
 
@@ -9311,7 +9311,7 @@ static int mw_xt_oracle(const char *tname, int attach_mode, bool list_on,
 		? create_varlen_fine_lock_cfg_ft(&group, list_on, rank_on)
 		: create_varlen_fine_lock_ft(&group);
 	/* Concurrent mode: deferred reclaim keeps a peer's touched nodes live. */
-	cds_ft_make_concurrent(ft);
+	cds_ft_make_shared(ft);
 
 	leak_reset();
 
@@ -9806,7 +9806,7 @@ static int mw_gs_oracle(void)
 	 */
 	mw_install_fatal_handler();
 	ft = create_varlen_fine_lock_ft(&group);
-	cds_ft_make_concurrent(ft);
+	cds_ft_make_shared(ft);
 	leak_reset();
 
 	x = (struct mw_xt_arg *) calloc(MW_XT_NR_WRITERS, sizeof(*x));
@@ -14668,7 +14668,7 @@ static int inv_writer_progress_chainmerge(void)
 	memset(&c, 0, sizeof(c));
 	/* SPECULATIVE: skip-compression is what makes the span encodable. */
 	c.ft = create_varlen_nolist_ft_ws_spec(&c.group, &ws);
-	cds_ft_make_concurrent(c.ft);
+	cds_ft_make_shared(c.ft);
 
 	/* Anchor keeps the long span alive so it stays compressed. */
 	anchor_node = node_alloc(0);
@@ -22529,7 +22529,7 @@ static int inv_concurrent_same_key_removes_run(bool ordered_list,
 	memset(&c, 0, sizeof(c));
 	if (cds_ft_create(group, NULL, &c.ft) < 0)
 		abort();
-	cds_ft_make_concurrent(c.ft);
+	cds_ft_make_shared(c.ft);
 	c.nodes = (struct skr_node *) calloc((size_t) SKR_K * SKR_D,
 			sizeof(*c.nodes));
 	c.fresh = (struct skr_node *) calloc(SKR_K, sizeof(*c.fresh));
@@ -22932,7 +22932,7 @@ static int inv_concurrent_same_key_append_run(bool ordered_list, bool coarse,
 	memset(&c, 0, sizeof(c));
 	if (cds_ft_create(group, NULL, &c.ft) < 0)
 		abort();
-	cds_ft_make_concurrent(c.ft);
+	cds_ft_make_shared(c.ft);
 	c.resident = (struct ft_test_node **) calloc(SKA_K,
 		sizeof(*c.resident));
 	c.guest = (struct ft_test_node **) calloc(SKA_K, sizeof(*c.guest));
@@ -23218,7 +23218,7 @@ static int inv_concurrent_same_key_inserts_run(bool ordered_list, bool coarse,
 	memset(&c, 0, sizeof(c));
 	if (cds_ft_create(group, NULL, &c.ft) < 0)
 		abort();
-	cds_ft_make_concurrent(c.ft);
+	cds_ft_make_shared(c.ft);
 	for (i = 0; i < 2; i++) {
 		c.in[i] = (unsigned char *) calloc(SKI_K, 1);
 		c.cur[i] = (struct ft_test_node **) calloc(SKI_K,
@@ -23593,7 +23593,7 @@ static int inv_concurrent_insert_unique_run(bool coarse, const char *name)
 	memset(&c, 0, sizeof(c));
 	if (cds_ft_create(group, NULL, &c.ft) < 0)
 		abort();
-	cds_ft_make_concurrent(c.ft);
+	cds_ft_make_shared(c.ft);
 	for (i = 0; i < 2; i++) {
 		c.in[i] = (unsigned char *) calloc(SKI_K, 1);
 		c.cur[i] = (struct ft_test_node **) calloc(SKI_K,
@@ -23908,7 +23908,7 @@ static int inv_concurrent_same_key_replace_run(bool coarse, const char *name)
 	memset(&c, 0, sizeof(c));
 	if (cds_ft_create(group, NULL, &c.ft) < 0)
 		abort();
-	cds_ft_make_concurrent(c.ft);
+	cds_ft_make_shared(c.ft);
 	for (i = 0; i < 2; i++) {
 		c.in[i] = (unsigned char *) calloc(SKI_K, 1);
 		c.cur[i] = (struct ft_test_node **) calloc(SKI_K,
@@ -24418,7 +24418,7 @@ static int inv_concurrent_remove_all_run(bool ordered_list, bool coarse,
 		if (cds_ft_create(group, NULL, &c.ft) < 0)
 			abort();
 	}
-	cds_ft_make_concurrent(c.ft);
+	cds_ft_make_shared(c.ft);
 	c.nodes = (struct skra_node *) calloc((size_t) SKRA_K * SKRA_D,
 			sizeof(*c.nodes));
 	c.fresh = (struct skra_node *) calloc(SKRA_K, sizeof(*c.fresh));
@@ -25236,7 +25236,7 @@ static int inv_concurrent_insert_replace_run(bool coarse, const char *name)
 	memset(&c, 0, sizeof(c));
 	if (cds_ft_create(group, NULL, &c.ft) < 0)
 		abort();
-	cds_ft_make_concurrent(c.ft);
+	cds_ft_make_shared(c.ft);
 	for (i = 0; i < 2; i++) {
 		c.pool[i] = (struct sir_node *) calloc(SIR_POOL_N,
 			sizeof(*c.pool[i]));

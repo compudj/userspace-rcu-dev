@@ -76,7 +76,7 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 		 * graft of @detached therefore skips its synchronize_rcu,
 		 * coalescing the detach+graft pair to a single grace
 		 * period.  Callers that publish @detached to concurrent
-		 * readers must call cds_ft_make_concurrent first.
+		 * readers must call cds_ft_make_shared first.
 		 */
 		detached->exclusive = true;
 #ifdef FEATURE_FT_VERIFY_AT_MUTATION
@@ -313,7 +313,7 @@ enum cds_ft_status ft_detach_keylen(struct cds_ft *ft,
 			 * the source before publishing @child as @detached's
 			 * root, so no RCU reader is inside @detached at
 			 * return.  Callers that publish @detached to
-			 * concurrent readers must call cds_ft_make_concurrent
+			 * concurrent readers must call cds_ft_make_shared
 			 * first.
 			 */
 			detached->exclusive = true;

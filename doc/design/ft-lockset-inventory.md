@@ -1173,7 +1173,7 @@ Not implemented; recorded so the flip does not silently decide them.
 
 ### 12.1 An application-provided writer exclusion mode -- ☑ LANDED @f6ab074d
 
-☑ **RESTORED as `CDS_FT_WRITER_EXCL_CALLER`**, the third
+☑ **RESTORED as `CDS_FT_WRITER_EXTERNAL_SYNC`**, the third
 `cds_ft_writer_strategy`. Named for the CONTRACT, not a lock (Mathieu): the
 other two are named for the lock the LIBRARY takes, and here it takes none --
 the caller meets the contract however it likes, a single mutating thread or its
@@ -1188,20 +1188,47 @@ take) and `ft_bulk_lock_enter` (nothing to promote: the bulk gate and rekey
 promote FINE locking, and there is none here, nor in COARSE).
 
 ☞ RANK STATS NOW COERCE *FINE* ONLY. The coercion read "any strategy !=
-COARSE"; EXCL_CALLER already serialises every structural writer, so coercing it
+COARSE"; EXTERNAL_SYNC already serialises every structural writer, so coercing it
 would hand back the very lock the caller asked the library not to take.
 
 ☑ THE CONTRACT CHECK NEEDED NO NEW CODE. The access validator keeps its
-single-OWNER claim for any non-fine trie, so EXCL_CALLER lands on the owner CAS.
+single-OWNER claim for any non-fine trie, so EXTERNAL_SYNC lands on the owner CAS.
 Measured with a guaranteed-overlap control (two writers, one trie,
 `-DFEATURE_FT_EXCL_VALIDATE`): COARSE **survives** (the mutex serialises them)
-while EXCL_CALLER reports *"writer conflict -- owner 0x…, entering thread 0x…"*
+while EXTERNAL_SYNC reports *"writer conflict -- owner 0x…, entering thread 0x…"*
 and aborts -- which is also the proof that the mutex is genuinely skipped, since
 under COARSE those two writers cannot overlap at all.
 
-In contract (`test_urcu_ft -W excl-caller`, 4 readers + 1 writer, 5s):
+In contract (`test_urcu_ft -W external-sync`, 4 readers + 1 writer, 5s):
 380,623,969 reads / 864,142 writes, and the always-MW lanes converted
 (`FT MWA DOOR1 converted=1,107,522`).
+
+☞ THE NAME CHANGED, AND THE OTHER SIDE OF THE COLLISION MOVED. It landed as
+`CDS_FT_WRITER_EXCL_CALLER`, which read too close to `cds_ft_make_exclusive`
+even though the two promise different things -- the strategy is about WRITERS,
+the trie flag is about writers AND readers. Mathieu asked whether the trie mode
+should be renamed; the mapping says otherwise. In Rust's vocabulary an
+EXCLUSIVE trie is `&mut T`, the *exclusive* (unique) reference -- no concurrent
+access of any kind -- and the default trie is `&T` where `T: Sync`, the *shared*
+reference. So "exclusive trie" is already the right name and its antonym is
+SHARED; what was misnamed is the strategy, which is not about exclusive ACCESS
+at all but about WHERE the synchronization lives. Hence:
+
+- `CDS_FT_WRITER_EXCL_CALLER` -> **`CDS_FT_WRITER_EXTERNAL_SYNC`**. Still named
+  for the contract, not a lock -- it says the synchronization is the
+  application's, without claiming it is a mutex;
+- `cds_ft_make_concurrent` -> **`cds_ft_make_shared`**, completing the
+  exclusive/shared pair at the call site;
+- `cds_ft_make_exclusive` / `cds_ft_attr_set_exclusive` / `cds_ft_is_exclusive`
+  are UNCHANGED, and "exclusive" now has exactly one meaning in the API.
+
+☠ `private` was considered and REJECTED, twice over: it is already the FT
+allocator's word for a range owned by one compactor or writer and not yet
+published (~85 sites in the same files), and it is a C++ keyword -- a trial
+rename put `bool private` in the public header, which would have broken every
+C++ consumer including `test_urcu_ft_unit_cxx`. `FEATURE_FT_EXCL_VALIDATE` and
+the `ft_excl_*` validator internals keep their names on purpose: that machinery
+polices BOTH modes, so its "excl" means access exclusion in general.
 
 The original statement of the item follows.
 
@@ -1285,7 +1312,7 @@ gate was green.)
 #### ☠ 2. The answer must be LATCHED, because `exclusive` is mutable
 
 `ft->exclusive` is a plain bool that `cds_ft_make_exclusive` /
-`_make_concurrent` and the graft_swap restore assign. Sampled per record it
+`_make_shared` and the graft_swap restore assign. Sampled per record it
 could answer differently within ONE txn and disagree with the `structural_sw`
 the constructor latched from the same call -- and the whole argument needs the
 answer fixed for the txn's life. It is now latched into `t->trie_wide_sw` at

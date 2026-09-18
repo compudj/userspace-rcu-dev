@@ -1955,7 +1955,7 @@ enum cds_ft_status cds_ft_graft(struct cds_ft *dst_ft,
  * @swap_ft may end up concurrent again if @dst_ft is a live trie).  This
  * changes the RCU rules the caller must follow on @swap_ft afterward
  * (including the drain above), so re-establish the desired mode with
- * cds_ft_make_exclusive() / cds_ft_make_concurrent() if it matters.
+ * cds_ft_make_exclusive() / cds_ft_make_shared() if it matters.
  *
  * Source-exclusivity requirement (fine-grained locking).  @swap_ft is the
  * consumed source of the exchange, so like cds_ft_graft it must be
@@ -2041,7 +2041,7 @@ enum cds_ft_status cds_ft_graft_swap(struct cds_ft *dst_ft,
  * therefore needs no grace-period drain of its own, coalescing
  * detach+graft into a single grace period.  Callers that publish
  * the detached trie to concurrent readers must call
- * cds_ft_make_concurrent() first.
+ * cds_ft_make_shared() first.
  *
  * Returns CDS_FT_STATUS_OK on success.
  * Returns CDS_FT_STATUS_NOT_FOUND if nothing exists at @key.
@@ -3224,23 +3224,26 @@ enum cds_ft_writer_strategy {
 	CDS_FT_WRITER_LOCK_COARSE = 1,
 	CDS_FT_WRITER_LOCK_FINE = 2,
 	/*
-	 * The APPLICATION provides writer exclusion; the library takes no
-	 * writer lock of its own.  Named for the CONTRACT rather than a lock,
-	 * because the caller is free to meet it however it likes -- a single
-	 * mutating thread, its own mutex around every mutating call, a
-	 * partitioned schedule.
+	 * Writer synchronization is EXTERNAL to the library: the application
+	 * serializes its own writers and the library takes no writer lock.
+	 * The name says WHERE the synchronization lives, not what it is,
+	 * because the caller is free to meet the contract however it likes --
+	 * a single mutating thread, its own mutex around every mutating call,
+	 * a partitioned schedule.  The other two enumerators name the lock THE
+	 * LIBRARY takes; here there is none to name.
 	 *
 	 * Behaves as CDS_FT_WRITER_LOCK_COARSE in every other respect (the
 	 * record kinds, the lock-set derivation, the bulk-op handling), which
-	 * is what "the contract comes from the caller" means: only the FT-wide
+	 * is what "the synchronization is external" means: only the FT-wide
 	 * writer mutex goes away.
 	 *
-	 * ☠ THIS IS NOT cds_ft_attr_set_exclusive / cds_ft_make_exclusive.
-	 * Those additionally promise NO CONCURRENT RCU READERS, and the library
-	 * uses that to skip reader-visible publication discipline.  Here
-	 * READERS ARE UNAFFECTED: proxies, tags and grace periods all stay, and
-	 * concurrent lookups and iterations remain legal exactly as under
-	 * COARSE.  The only promise is about WRITERS.
+	 * ☠ THIS IS NOT cds_ft_attr_set_exclusive / cds_ft_make_exclusive,
+	 * and the distinction is READERS.  An EXCLUSIVE trie is the stronger,
+	 * &mut-like promise -- no concurrent access of ANY kind -- and the
+	 * library spends it by skipping reader-visible publication discipline.
+	 * Here READERS ARE UNAFFECTED: proxies, tags and grace periods all
+	 * stay, and concurrent lookups and iterations remain legal exactly as
+	 * under COARSE.  The only promise is about WRITERS.
 	 *
 	 * ☞ Violating it is undefined behaviour, and a build with
 	 * -DFEATURE_FT_EXCL_VALIDATE catches it: the access validator keeps its
@@ -3248,7 +3251,7 @@ enum cds_ft_writer_strategy {
 	 * concurrently reports "writer conflict -- owner ..., entering thread
 	 * ...".  Run the test suite that way at least once.
 	 */
-	CDS_FT_WRITER_EXCL_CALLER = 3,
+	CDS_FT_WRITER_EXTERNAL_SYNC = 3,
 };
 
 /*
@@ -3263,7 +3266,7 @@ enum cds_ft_writer_strategy {
  * fine-grained locking buys no parallelism there, and it would run the count
  * walk without the FT-wide-lock exclusion the walk requires.  (The optimistic
  * engine this sentence also weighed no longer exists.)  COARSE and
- * CDS_FT_WRITER_EXCL_CALLER are left ALONE: both already serialize every
+ * CDS_FT_WRITER_EXTERNAL_SYNC are left ALONE: both already serialize every
  * structural writer, the latter by the caller's own contract, so the walk has
  * the exclusion it requires without the library coercing anything.
  */
@@ -3442,15 +3445,16 @@ enum cds_ft_status cds_ft_attr_set_speculative_keys(struct cds_ft_attr *attr,
  * The caller asserts that no new RCU readers will enter the trie
  * after this call returns (e.g. single-threaded access, or
  * mutex-protected access without RCU readers) until a matching
- * cds_ft_make_concurrent() call, if any.
+ * cds_ft_make_shared() call, if any.
  *
  * No-op if the trie is already exclusive.
  */
 void cds_ft_make_exclusive(struct cds_ft *ft);
 
 /*
- * cds_ft_make_concurrent - Transition a Fractal Trie to concurrent
- *                          access discipline.
+ * cds_ft_make_shared - Transition a Fractal Trie to SHARED access
+ *                          discipline -- the inverse of
+ *                          cds_ft_make_exclusive.
  * @ft: The Fractal Trie.
  *
  * Marks the trie as permitting concurrent RCU readers.  Cheap:
@@ -3462,7 +3466,7 @@ void cds_ft_make_exclusive(struct cds_ft *ft);
  * content elsewhere -- unlike an exclusive trie, which skips that
  * drain.
  */
-void cds_ft_make_concurrent(struct cds_ft *ft);
+void cds_ft_make_shared(struct cds_ft *ft);
 
 /*
  * cds_ft_is_exclusive - Query the access discipline of a Fractal Trie.

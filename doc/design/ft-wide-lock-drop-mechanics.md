@@ -69,7 +69,7 @@ Placed after the reentrancy and exclusive tests. Everything else falls out:
 - **`ft_writer_lock_scope_exit` no-ops.** It keys its release off the TLS
   `ft_wlock_held` *identity*, which the skipping enter never sets, so
   `ft_wlock_held != ft` ⇒ nothing to release. (Same reason the exclusive-skip
-  and mid-scope `make_exclusive`/`make_concurrent` flips can't unbalance it.)
+  and mid-scope `make_exclusive`/`make_shared` flips can't unbalance it.)
 - **`ft_writer_lock_gp_wait` degrades to a plain `synchronize_rcu`.** Its
   `held = ft_wlock_held` is NULL (nothing held) ⇒ the drop/retake bracket is
   skipped and it is just the GP wait. **Bonus:** after the drop, a mid-op GP no
