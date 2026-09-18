@@ -186,7 +186,7 @@ ALL_CONFIGS=(
 	# peer can park in it; root-only serialises every op on one word; only
 	# coarsening-to-an-ancestor leaves the slot open.  A defect can live in
 	# the MIDDLE of this axis, so testing its two ends proves nothing about it.
-	"txndbg|-DDEBUG_RCU -DURCU_TXN_DEBUG_READ_POLICY -DURCU_TXN_DEBUG_SETTLE -DFEATURE_FT_ANCHOR_VALIDATE|u ion ioff imw sp|per-node exponential root-only"
+	"txndbg|-DDEBUG_RCU -DURCU_TXN_DEBUG_READ_POLICY -DURCU_TXN_DEBUG_SETTLE -DFEATURE_FT_ANCHOR_VALIDATE -DFEATURE_FT_LOCK_SPACING_ROOT_ONLY|u ion ioff imw sp|per-node exponential root-only"
 	# The FT's own resolved-pointer assertion (ft_assert_resolved): a parked
 	# flip proxy handed to an accessor that requires a resolved flag.  It is
 	# the embedder-side counterpart to txndbg's engine-side DEBUG_RCU, and it
@@ -204,7 +204,7 @@ ALL_CONFIGS=(
 	# 10 without skip-compression and never with it.
 	# Swept for the same reason txndbg is: this is the embedder-side detector
 	# for the same class, so it is blind to the same spacings.
-	"proxyassert|-DFT_DEBUG_PROXY_ASSERT -DNO_FEATURE_FT_SKIP_COMPRESSED -DFEATURE_FT_ANCHOR_VALIDATE|u ion ioff imw|per-node exponential root-only"
+	"proxyassert|-DFT_DEBUG_PROXY_ASSERT -DNO_FEATURE_FT_SKIP_COMPRESSED -DFEATURE_FT_ANCHOR_VALIDATE -DFEATURE_FT_LOCK_SPACING_ROOT_ONLY|u ion ioff imw|per-node exponential root-only"
 	# Phase E.3's certification config: the self-collision ledger
 	# (FEATURE_FT_HOLD_TRACE) armed across the spacing sweep.  A collision
 	# aborts (ft_hold_trace_refused), so a red here is a leg abort, not a
@@ -218,7 +218,7 @@ ALL_CONFIGS=(
 	# ever collapse onto one word.  Its abort IS the failure signal -- a
 	# violation kills the leg rather than printing a line a grep must
 	# find.
-	"holdtrace|-DDEBUG_RCU -DFEATURE_FT_HOLD_TRACE -DFEATURE_FT_ANCHOR_VALIDATE|u ion ioff imw|per-node exponential root-only"
+	"holdtrace|-DDEBUG_RCU -DFEATURE_FT_HOLD_TRACE -DFEATURE_FT_ANCHOR_VALIDATE -DFEATURE_FT_LOCK_SPACING_ROOT_ONLY|u ion ioff imw|per-node exponential root-only"
 	# ★ THE CONFIG THAT ACTUALLY CATCHES THE RAW-READ CLASS.
 	#
 	# txndbg above arms the same engine assert and NEVER FIRES IT: with
@@ -246,7 +246,7 @@ ALL_CONFIGS=(
 	# ★ The rate is ~1-4%, so ONE run of this config proves nothing -- it is
 	# here to be run with FT_GATE_REPEAT when hunting, and the 3-spacing sweep
 	# is mandatory because the defect it was built from is exponential-only.
-	"anchorval|-DDEBUG_RCU -DFEATURE_FT_ANCHOR_VALIDATE|u ion ioff imw|per-node exponential root-only"
+	"anchorval|-DDEBUG_RCU -DFEATURE_FT_ANCHOR_VALIDATE -DFEATURE_FT_LOCK_SPACING_ROOT_ONLY|u ion ioff imw|per-node exponential root-only"
 	# ★ THE PROBE-FREE COARSE-SPACING LEG -- Phase E.5's missing control.
 	#
 	# Every other config that sweeps the spacing axis (txndbg, proxyassert,
@@ -278,7 +278,7 @@ ALL_CONFIGS=(
 	# run the all-MW content path -- sound, and stricter, but NOT the engine
 	# Phase B built.  Reading a green here as "E.5 is clear" would be reading a
 	# control as a result.
-	"spacingenv|-DFEATURE_FT_LOCK_SPACING_ENV|u ion ioff imw|per-node exponential root-only"
+	"spacingenv|-DFEATURE_FT_LOCK_SPACING_ENV -DFEATURE_FT_LOCK_SPACING_ROOT_ONLY|u ion ioff imw|per-node exponential root-only"
 	"noskip|-DNO_FEATURE_FT_SKIP_COMPRESSED|u ioff"
 	"nocompress|-DNO_FEATURE_FT_COMPRESS|u ioff"
 	# Concurrent legs are SAFE here since the in-place tier became runtime
@@ -623,6 +623,22 @@ run_one() {	# $1=name $2=tests $3=spacings $4=cppflags -- build lib+tests, run T
 		*FEATURE_FT_ANCHOR_VALIDATE*|*FEATURE_FT_HOLD_TRACE*|*FEATURE_FT_LOCK_SPACING_ENV*) ;;
 		*)
 			echo "$name: CONFIG ERROR (sweeps [$spacings] but its flags cannot select one -- add -DFEATURE_FT_ANCHOR_VALIDATE)" >> "$GATE/$name.result"
+			return ;;
+		esac ;;
+	esac
+	# ★ AND ROOT-ONLY NEEDS ITS OWN MACRO.  Since @20fcf938 the enumerator is
+	# declared only under -DFEATURE_FT_LOCK_SPACING_ROOT_ONLY, and the env knob
+	# ABORTS (rc=134) rather than degrading to per-node -- deliberately, so a
+	# degraded creator cannot read GREEN.  Selecting a spacing at all is
+	# therefore no longer sufficient: without this check the leg still launches
+	# and dies on its first group create, which reads as a red of the SUITE when
+	# it is a red of the CONFIG.
+	case " $spacings " in
+	*" root-only "*)
+		case "$flags" in
+		*FEATURE_FT_LOCK_SPACING_ROOT_ONLY*) ;;
+		*)
+			echo "$name: CONFIG ERROR (sweeps root-only but its flags lack -DFEATURE_FT_LOCK_SPACING_ROOT_ONLY -- the env knob aborts by design)" >> "$GATE/$name.result"
 			return ;;
 		esac ;;
 	esac
