@@ -155,6 +155,51 @@ extern "C" {
 #ifndef URCU_TXN_STAT_ABORT
 #define URCU_TXN_STAT_ABORT(t, r)	do { } while (0)
 #endif
+/*
+ * ABORT RECLAIM ATTRIBUTION (opt-in: -DURCU_TXN_DEBUG_ABORT_PLANTED).
+ *
+ * A contention abort reclaims its descriptor through call_rcu because install
+ * may have PLANTED proxies: a peer that loaded one still holds &t->recs[i], so
+ * the descriptor owes a grace period.  But install returns the count it
+ * planted, and that count can be ZERO -- the very first CAS lost, no slot ever
+ * carried a tag into this descriptor, and (the engine does no helping) nothing
+ * else can reach it.  Such an abort owes NO grace period, and paying one
+ * defers a block that could have gone straight back to the slab.
+ *
+ * This counts the two populations so the opportunity can be SIZED before any
+ * fast path is written for it.  Counted at the abort site, where @planted is
+ * in scope -- NOT through URCU_TXN_STAT_ABORT, which also fires on the
+ * lone-MW-edge path that never builds a descriptor at all.
+ */
+#ifdef URCU_TXN_DEBUG_ABORT_PLANTED
+extern unsigned long urcu_txn_abort_planted0;
+extern unsigned long urcu_txn_abort_plantedN;
+/*
+ * ☞ AND WHAT KIND OF RECORD LOST.  "The abort rate is high" does not say what
+ * is contending.  A record whose old == new is a VALIDATE -- a read-set guard,
+ * asserting a word has not moved -- and it loses its CAS whenever a PEER writes
+ * that word, which says nothing about whether anyone holds a lock.  A record
+ * whose old != new is a real WRITE.  Splitting them is the difference between
+ * "our writes collide" and "our guards are being invalidated", and those have
+ * completely different cures.
+ */
+extern unsigned long urcu_txn_abort_lost_validate;
+extern unsigned long urcu_txn_abort_lost_write;
+#define URCU_TXN_ABORT_PLANTED_COUNT(planted)				\
+	uatomic_inc((planted) == 0 ? &urcu_txn_abort_planted0 :		\
+			&urcu_txn_abort_plantedN)
+#define URCU_TXN_ABORT_KIND_COUNT(t, planted)				\
+	do {								\
+		const struct urcu_txn_record *l__ = &(t)->recs[planted];\
+									\
+		uatomic_inc(l__->old_ptr == l__->new_ptr ?		\
+			&urcu_txn_abort_lost_validate :			\
+			&urcu_txn_abort_lost_write);			\
+	} while (0)
+#else
+#define URCU_TXN_ABORT_PLANTED_COUNT(planted)	do { (void) (planted); } while (0)
+#define URCU_TXN_ABORT_KIND_COUNT(t, planted)	do { } while (0)
+#endif
 #ifndef URCU_TXN_REC_DBG_STAMP
 #define URCU_TXN_REC_DBG_STAMP(r)	do { } while (0)
 #endif
@@ -363,6 +408,21 @@ struct urcu_txn_desc {
 	 * record.  NULL keeps the two-pass order exactly.
 	 */
 	bool (*late_last)(void *arg, void **slot);
+	/*
+	 * SEMANTIC RETRY (opt-in: -DURCU_TXN_SEMANTIC_RETRY).  The install
+	 * aborts on `v != old_ptr`, which conflates two unlike things: a peer
+	 * COMMITTED a different value (the plan is stale -- re-derive), and the
+	 * word is the one we want but TRANSIENTLY OBSTRUCTED (an embedder lock
+	 * bit set by a peer that will clear it).  The engine cannot tell them
+	 * apart: it knows old_ptr and its own tag, and nothing about what any
+	 * other bit MEANS.  Only the embedder does, so it says so here.
+	 *
+	 * Returns true iff @cur is a transient obstruction of @expected_old.
+	 * Runs on the committing thread inside install; it must not block and
+	 * must not allocate.  NULL restores the plain abort.
+	 */
+	bool (*busy)(void *arg, void **slot, void *cur, void *expected_old);
+	void *busy_arg;
 	void *late_last_arg;
 	struct urcu_txn_record recs[];	/* frozen at commit */
 };
@@ -611,6 +671,50 @@ unsigned int urcu_txn_install_mw_flat(struct urcu_txn_desc *t,
  * it) before escalating.  Decides FAILED on a read-set mismatch or a capped wait;
  * on success leaves the status UNDECIDED and returns nr_mw.
  */
+#ifdef URCU_TXN_SEMANTIC_RETRY
+extern unsigned long urcu_txn_sem_wait, urcu_txn_sem_won, urcu_txn_sem_capped;
+/* Spins before giving up; 0 = BLOCK until released (needs the total order). */
+extern unsigned long urcu_txn_sem_patience;
+
+/*
+ * Spin a bounded patience while the embedder calls @cur a transient
+ * obstruction.  Returns true when the slot came back to @expected_old (caller
+ * re-evaluates), false to abort exactly as before -- so an expired budget is
+ * byte-for-byte today's behaviour.
+ */
+static inline
+bool urcu_txn_busy_wait(struct urcu_txn_desc *t, struct urcu_txn_record *r,
+		void **vp)
+{
+	unsigned long patience = urcu_txn_sem_patience;	/* 0 == BLOCK */
+	void *v = *vp;
+
+	if (!t->busy || !t->busy(t->busy_arg, r->slot, v, r->old_ptr))
+		return false;
+	uatomic_inc(&urcu_txn_sem_wait);
+	for (;;) {
+		if (patience && patience-- == 1) {
+			uatomic_inc(&urcu_txn_sem_capped);
+			*vp = v;
+			return false;
+		}
+		caa_cpu_relax();
+		v = uatomic_load(r->slot, CMM_ACQUIRE);
+		if (v == r->old_ptr) {
+			uatomic_inc(&urcu_txn_sem_won);
+			*vp = v;
+			return true;
+		}
+		if (!t->busy(t->busy_arg, r->slot, v, r->old_ptr)) {
+			*vp = v;	/* no longer transient: a real change */
+			return false;
+		}
+	}
+}
+#else
+#define urcu_txn_busy_wait(t, r, vp)	(false)
+#endif
+
 static inline
 unsigned int urcu_txn_install_mw_depth(struct urcu_txn_desc *t,
 		unsigned int nr_mw, int *failed)
@@ -667,6 +771,8 @@ unsigned int urcu_txn_install_mw_depth(struct urcu_txn_desc *t,
 				}
 			}
 			if (v != r->old_ptr) {
+				if (urcu_txn_busy_wait(t, r, &v))
+					continue;	/* freed: re-evaluate */
 				URCU_TXN_REC_LOST(r, v);
 				urcu_txn_decide(t, URCU_TXN_DESC_FAILED);
 				*failed = 1;
@@ -776,6 +882,41 @@ void urcu_txn_dbg_parked_check(const struct urcu_txn_desc *t,
 #define urcu_txn_dbg_parked_check(t, r, i)	do { } while (0)
 #endif /* URCU_TXN_DEBUG_SETTLE */
 
+#ifdef URCU_TXN_SETTLE_DELAY
+/*
+ * =====================================================================
+ * DIAGNOSTIC (opt-in: -DURCU_TXN_SETTLE_DELAY).  NOT part of the engine.
+ * =====================================================================
+ *
+ * WIDEN THE PARKED WINDOW ON PURPOSE.  A settle converts a parked slot; until
+ * it runs, peers find that slot OCCUPIED.  Anything that slows the settle
+ * therefore keeps the descriptor installed longer and raises the rate at which
+ * peers collide with it -- which is a claim about latency, not about whatever
+ * the slow thing happens to be computing.
+ *
+ * This seam is how that claim gets tested independently: it burns @spins of
+ * cpu_relax immediately before the release store, in the SAME place the
+ * URCU_TXN_DEBUG_SETTLE check sits, while computing nothing at all.  If a pure
+ * delay reproduces an effect attributed to that check, the check's COST is the
+ * cause and its logic is incidental.
+ *
+ * URCU_TXN_SETTLE_DELAY_SPINS selects the width; 0 (the default) makes the seam
+ * inert, which is the control that proves the seam itself costs nothing.
+ */
+extern unsigned long urcu_txn_settle_delay_spins;
+
+static inline
+void urcu_txn_settle_delay(void)
+{
+	unsigned long n = uatomic_load(&urcu_txn_settle_delay_spins, CMM_RELAXED);
+
+	while (n--)
+		caa_cpu_relax();
+}
+#else
+#define urcu_txn_settle_delay()	do { } while (0)
+#endif
+
 static inline
 void urcu_txn_settle(struct urcu_txn_desc *t, unsigned int planted)
 {
@@ -790,6 +931,7 @@ void urcu_txn_settle(struct urcu_txn_desc *t, unsigned int planted)
 		if (t->late_tag && r->proxy_tag == t->late_tag)
 			continue;		/* second pass, below */
 		urcu_txn_dbg_parked_check(t, r, i);
+		urcu_txn_settle_delay();
 		uatomic_store(r->slot, want, CMM_RELEASE);
 		URCU_TXN_REC_WROTE(r, want);
 	}
@@ -808,6 +950,7 @@ void urcu_txn_settle(struct urcu_txn_desc *t, unsigned int planted)
 							r->slot) != (pass == 1))
 					continue;
 				urcu_txn_dbg_parked_check(t, r, i);
+				urcu_txn_settle_delay();
 				uatomic_store(r->slot,
 					st == URCU_TXN_DESC_SUCCEEDED ?
 						r->new_ptr : r->old_ptr,
@@ -841,6 +984,17 @@ void urcu_txn_desc_set_late_tag(struct urcu_txn_desc *t, uintptr_t tag)
  * the others (see @late_last).  Call before commit; NULL restores two passes.
  * @last runs on the committing thread, inside the settle, and must not block.
  */
+/* Install the semantic-retry predicate; NULL restores the plain abort. */
+static inline
+void urcu_txn_desc_set_busy(struct urcu_txn_desc *t,
+		bool (*busy)(void *, void **, void *, void *), void *arg)
+{
+	if (t && t != (struct urcu_txn_desc *) -1L) {
+		t->busy = busy;
+		t->busy_arg = arg;
+	}
+}
+
 static inline
 void urcu_txn_desc_set_late_last(struct urcu_txn_desc *t,
 		bool (*last)(void *arg, void **slot), void *arg)
@@ -1292,15 +1446,28 @@ bool urcu_txn_desc_commit(struct urcu_txn_desc *t,
 			urcu_assert_debug(t->recs[i].slot != t->recs[j].slot);
 	}
 #endif
+#ifdef URCU_TXN_SEMANTIC_RETRY
+	/*
+	 * The semantic wait lives in the DEPTH installer, and blocking on a
+	 * held word is only safe in a total order -- so arm both together:
+	 * sort every attempt by slot address and always take the waiting
+	 * installer.  (Without the facility the flat fast path is unchanged.)
+	 */
+	urcu_txn_sort(t, nr_mw);
+	planted = urcu_txn_install_mw_depth(t, nr_mw, &failed);
+#else
 	if (t->retry != 0)
 		urcu_txn_sort(t, nr_mw);
 	if (t->retry == 0)
 		planted = urcu_txn_install_mw_flat(t, nr_mw, &failed);
 	else
 		planted = urcu_txn_install_mw_depth(t, nr_mw, &failed);
+#endif
 	if (failed) {
 		/* Abort: restore the parked MW prefix to old, then reclaim. */
 		URCU_TXN_STAT_ABORT(t, &t->recs[planted]);
+		URCU_TXN_ABORT_PLANTED_COUNT(planted);
+		URCU_TXN_ABORT_KIND_COUNT(t, planted);
 		urcu_txn_settle(t, planted);
 		call_rcu_fn(&t->rcu_head, urcu_txn_free_rcu);
 		return false;
