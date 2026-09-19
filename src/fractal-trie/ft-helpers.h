@@ -1816,6 +1816,14 @@ bool ft_head_is_prefix(const struct cds_ft *ft, struct cds_ft_node *head)
 		struct cds_ft_inode_flag *_hpw = ft_head_parent_word(	\
 			(struct cds_ft_inode_flag *) (parent), (prefix)); \
 									\
+		/*						\
+		 * The [debt] HEAD-WORD class, same as			\
+		 * ft_publish_external_nodes_prev and ft_set_parent's	\
+		 * external arm -- and this spelling had NO audit arm, so	\
+		 * it could not appear in the class's zeros either way.	\
+		 */						\
+		ft_ch_audit_head((ft), (node),				\
+			(struct cds_ft_inode_flag *) (parent));		\
 		if ((ft)->ordered_list)					\
 			ft_ord_cell_set_parent((node), _hpw);		\
 		else							\

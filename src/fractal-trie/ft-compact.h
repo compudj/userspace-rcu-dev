@@ -680,6 +680,14 @@ struct ft_ord_cell *ft_compact_relocate_cell(struct cds_ft *ft,
 				ft_ord_cell_flag(new_cell),
 		};
 
+		/*
+		 * The [debt] HEAD-WORD class again, and this arm -- the
+		 * COARSE / EXCLUSIVE lone-edge flip, which the FINE path above
+		 * replaces with a recorded back edge under the holder -- had NO
+		 * audit arm, so compaction could not appear in the class's zeros
+		 * either way.  @holder_nf is the owner the fine path locks.
+		 */
+		ft_ch_audit_head(ft, head, holder_nf);
 		ft_ord_cell_flip_one(&edge);
 	}
 relocated:

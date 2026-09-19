@@ -15540,6 +15540,16 @@ void ft_set_parent_raw(struct cds_ft *ft, struct cds_ft_inode_flag *child,
 		 * proxy @value cannot hold the bit -- its bit 4 is address --
 		 * and the real re-parent that replaces it re-derives the answer.
 		 */
+		/*
+		 * ☞ THE [debt] HEAD-WORD CLASS, and this spelling had NO audit
+		 * arm.  @value is a flip PROXY being parked, so it does not name
+		 * the owner; the owner is whoever the head's back edge names
+		 * right now, which is exactly ft_chain_head_holder's answer and
+		 * the same one the chain audit's own predicate uses.
+		 */
+		ft_ch_audit_head(ft, (struct cds_ft_node *) child,
+			ft_chain_head_holder((struct cds_ft *) ft,
+				(struct cds_ft_node *) child));
 		if (ft->ordered_list) {
 			struct ft_ord_cell *cell = ft_ord_cell_ptr(
 				((struct cds_ft_node *) child)->prev);
