@@ -1363,8 +1363,9 @@ bool ft_hlist_chain_plan_ok(const struct cds_ft *ft, struct urcu_txn *txn,
  * walk off by FT_HLIST_MARK into nothing.  Such a member owes no second mark.
  */
 static inline
-void ft_hlist_freeze_chain_prepare(const struct cds_ft *ft, struct urcu_txn *txn,
-		struct cds_ft_node *head, unsigned int len)
+void ft_hlist_freeze_chain_prepare_at(const struct cds_ft *ft,
+		struct urcu_txn *txn, struct cds_ft_node *head,
+		unsigned int len, bool plan_checked)
 {
 	unsigned int i;
 
@@ -1396,8 +1397,67 @@ void ft_hlist_freeze_chain_prepare(const struct cds_ft *ft, struct urcu_txn *txn
 		 * ft_hlist_store_chain_at's parked note.
 		 */
 		if (i + 1 == len) {
-			succ = NULL;
 			next = NULL;
+			/*
+			 * ☠☠ THE TAIL MUST READ ITS WORD, NOT ASSUME IT -- but
+			 * only once the plan has been CHECKED under the holder.
+			 *
+			 * Forcing @succ to NULL here also defeats this walk's own
+			 * already-marked skip below, so on a tail that is frozen
+			 * but still LINKED (its word holding MARK(NULL), which
+			 * ft_hlist_chain_len counts as the end of the chain
+			 * because ft_hlist_resolve unmarks) this records
+			 * {NULL -> MARK(NULL)} against a word already holding
+			 * MARK(NULL).  Under MW that CAS merely fails and the op
+			 * retries -- which is why it has been invisible.  ☠ Under
+			 * SW the record PARKS and its abort writes @old_ptr back
+			 * BLIND, UNMARKING a node a peer froze.  MEASURED as the
+			 * entire residual tail-disagreement population once the
+			 * appended-duplicate race was closed: 11,425 / 10,772 /
+			 * 12,722 per ft_inv leg at the three spacings.
+			 *
+			 * ft_hlist_chain_plan_ok has just proved unmark(word) is
+			 * NULL, so this load can only answer NULL or MARK(NULL):
+			 * the first records as before, the second takes the skip.
+			 * ☠ WITHOUT that proof the load is the "re-loading the
+			 * tail LOSES THE KEY" hazard in the header above -- it
+			 * would mark a duplicate appended since the count and the
+			 * prune would orphan it -- so an UNCHECKED caller keeps
+			 * the derived NULL and its arbitration.
+			 */
+			succ = NULL;
+			if (plan_checked) {
+				void *raw = urcu_txn_load_committed(txn,
+					(void **) &head->next, FT_HLIST_TAG);
+
+				/*
+				 * ☠☠ ONLY AN ALREADY-MARKED TAIL MAY BE READ
+				 * BACK.  The plan check and this load are TWO
+				 * READS, and the window between them is real --
+				 * it is exactly the patience window
+				 * ft_hlist_chain_plan_ok's header describes, an
+				 * UNDECIDED peer proxy that reads as the
+				 * pre-commit value there and as a LIVE duplicate
+				 * here.  Taking that value would mark the
+				 * freshly appended duplicate and let the prune
+				 * orphan it: "key LOST after an OK concurrent
+				 * insert", and WORSE than the derived NULL,
+				 * because the CAS would then SUCCEED.  MEASURED
+				 * at 16 / 15 / 32 events per ft_inv leg, so the
+				 * window is small and non-empty -- the two
+				 * numbers that make it a defect rather than a
+				 * theory.
+				 *
+				 * So take the read ONLY where it can lose
+				 * nothing: a MARK means the node is already
+				 * frozen and the skip below is right.  Anything
+				 * else keeps the derived NULL and its
+				 * arbitration, which is what aborts the commit
+				 * and sends the caller back to re-derive.
+				 */
+				if ((uintptr_t) raw & FT_HLIST_MARK)
+					succ = (struct cds_ft_node *) raw;
+			}
 		} else {
 			succ = (struct cds_ft_node *) urcu_txn_load(txn,
 				(void **) &head->next, FT_HLIST_TAG);
@@ -1415,5 +1475,16 @@ void ft_hlist_freeze_chain_prepare(const struct cds_ft *ft, struct urcu_txn *txn
 		head = next;
 	}
 }
+
+/*
+ * The two entry points.  The plain form keeps the derived tail NULL and the
+ * arbitration that goes with it; the _checked form is for a caller that has
+ * just run ft_hlist_chain_plan_ok under the chain's holder, and only that form
+ * may read the tail's word.
+ */
+#define ft_hlist_freeze_chain_prepare(ft, txn, head, len)		\
+	ft_hlist_freeze_chain_prepare_at((ft), (txn), (head), (len), false)
+#define ft_hlist_freeze_chain_prepare_checked(ft, txn, head, len)	\
+	ft_hlist_freeze_chain_prepare_at((ft), (txn), (head), (len), true)
 
 #endif	/* _FT_TXN_HLIST_H */

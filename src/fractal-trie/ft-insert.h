@@ -4847,7 +4847,8 @@ restart_replace_attempt:
 							ret = -EAGAIN;
 							goto insert_replace_done;
 						}
-						ft_hlist_freeze_chain_prepare(ft, ft_flip_txn_handle(txn),
+						ft_hlist_freeze_chain_prepare_checked(ft,
+							ft_flip_txn_handle(txn),
 							displaced, nr_disp);
 					}
 #ifdef FT_DEBUG_STRUCT_ANCHOR
@@ -5024,7 +5025,8 @@ restart_replace_attempt:
 							ret = -EAGAIN;
 							goto insert_replace_done;
 						}
-						ft_hlist_freeze_chain_prepare(ft, ft_flip_txn_handle(txn),
+						ft_hlist_freeze_chain_prepare_checked(ft,
+							ft_flip_txn_handle(txn),
 							displaced, nr_disp);
 					}
 #ifdef FT_DEBUG_STRUCT_ANCHOR
@@ -5286,7 +5288,8 @@ restart_replace_attempt:
 							ret = -EAGAIN;
 							goto insert_replace_done;
 						}
-						ft_hlist_freeze_chain_prepare(ft, ft_flip_txn_handle(txn),
+						ft_hlist_freeze_chain_prepare_checked(ft,
+							ft_flip_txn_handle(txn),
 							displaced, nr_disp);
 					}
 #ifdef FT_DEBUG_STRUCT_ANCHOR
@@ -5474,7 +5477,8 @@ restart_replace_attempt:
 							ret = -EAGAIN;
 							goto insert_replace_done;
 						}
-						ft_hlist_freeze_chain_prepare(ft, ft_flip_txn_handle(txn),
+						ft_hlist_freeze_chain_prepare_checked(ft,
+							ft_flip_txn_handle(txn),
 							displaced, nr_disp);
 					}
 #ifdef FT_DEBUG_STRUCT_ANCHOR

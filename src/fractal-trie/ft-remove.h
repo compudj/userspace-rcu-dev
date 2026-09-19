@@ -5213,7 +5213,8 @@ int ft_detach_node(struct cds_ft *ft,
 					ret = -EAGAIN;
 					goto end;
 				}
-				ft_hlist_freeze_chain_prepare(ft, ft_flip_txn_handle(commit_txn),
+				ft_hlist_freeze_chain_prepare_checked(ft,
+					ft_flip_txn_handle(commit_txn),
 					freeze_leaf, freeze_len);
 				freeze_leaf_fused = true;
 			}
@@ -9282,7 +9283,38 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 				 * commit, leaving the key in place for the retry.
 				 */
 				ft_ch_audit_ctx(ft, txn, &lctx, chain_head);
-				ft_hlist_freeze_chain_prepare(ft, ft_flip_txn_handle(txn), chain_head,
+				/*
+				 * ★ VALIDATE THE PLAN UNDER THE LOCK.  @nr_frozen was
+				 * counted before the §4.B acquire just above, so the
+				 * freeze's derived tail NULL has been standing in for
+				 * an exclusion the count did not have.  We hold the
+				 * holder here; ask the word.  (It shrinks the window
+				 * the install CAS arbitrates -- it does not replace
+				 * the CAS; see ft_hlist_chain_plan_ok's header.)
+				 *
+				 * ☠ PRE-COMMIT TERMINAL, BOTH HANDLES.  @txn already
+				 * carries the §4.B guard, the count records and the
+				 * registered holder lock, and @unsplice_txn is a
+				 * reservation this return would otherwise strand -- the
+				 * tail that frees them (and ft_remove_one_commit, which
+				 * drains @txn on a failed commit) is below and is
+				 * skipped by a retry return.  Leaving without both
+				 * destroys is how a bail leaks FT_STATE_LOCK and
+				 * refuses every peer the holder forever.
+				 */
+				if (!ft_hlist_chain_plan_ok(ft, ft_flip_txn_handle(txn),
+						chain_head, nr_frozen)) {
+					FT_HLIST_PLAN_BAIL();
+					ft_flip_txn_destroy(txn);
+					if (unsplice_txn)
+						ft_flip_txn_destroy(unsplice_txn);
+					*result_node = NULL;
+					FT_DBG_RETRY_SITE();
+					*need_retry = true;
+					return CDS_FT_STATUS_OK;
+				}
+				ft_hlist_freeze_chain_prepare_checked(ft,
+					ft_flip_txn_handle(txn), chain_head,
 					nr_frozen);
 				/*
 				 * The commit's status is the ANSWER, not a
