@@ -217,6 +217,7 @@ struct ft_canary_ent {
 	const char *fn;
 	int line;
 	bool raw;		/* last writer bypassed the record layer */
+	unsigned char raw_id;	/* which raw producer, when @raw */
 	unsigned long tid;
 };
 extern struct ft_canary_ent ft_canary_tab[FT_CANARY_SLOTS];
@@ -253,28 +254,61 @@ unsigned int ft_canary_hash(const void *slot)
  * design -- one open-addressed probe, last writer wins -- so a miss is an
  * evicted entry, not a transition, and scoring it would manufacture a mix.
  */
-extern unsigned long ft_canary_mix_raw_after_rec, ft_canary_mix_rec_after_raw,
-	ft_canary_raw_stores, ft_canary_rec_stores;
-unsigned long ft_canary_mix_raw_after_rec, ft_canary_mix_rec_after_raw,
-	ft_canary_raw_stores, ft_canary_rec_stores;
+/*
+ * ☞ SPLIT BY PRODUCER, because "is one slot written both ways" and "does that
+ * MATTER" are different questions and only the second decides the flip.  Each
+ * raw producer has a very different exposure, already measured by the head-word
+ * audit, so attributing a transition to one of them answers Mathieu's question
+ * -- are these raw stores on HIDDEN nodes? -- instead of inferring it:
+ *
+ *   0 MARK_REMOVED  ft_node_mark_removed_flip, &node->next on a LIVE node it is
+ *                   tombstoning.  NOT hidden.  It is the only one that is not,
+ *                   and it is proxy-aware (it spins out a parked FT_HLIST_TAG
+ *                   rather than trampling it).
+ *   1 PUB_EXT_PREV  ft_publish_external_nodes_prev, &head->prev list-off.
+ *                   Audited 33,667/33,667 under the FT-wide writer lock.
+ *   2 SET_PARENT    ft_set_parent's external arm.  Its callers' audit rows read
+ *                   HIDDEN with LIVE=0 (ft_attach_node 1.5M, the splits, the
+ *                   recompact), i.e. FRESH nodes no reader can reach.
+ *   3 SET_PARENT_RAW  ft_set_parent_raw's external arm.  Audited 25,021/25,195
+ *                   wlock-held, 174 NOHOLDER.
+ */
+#define FT_CANARY_RAW_NR	4
+extern unsigned long ft_canary_mix_raw_after_rec[FT_CANARY_RAW_NR],
+	ft_canary_mix_rec_after_raw[FT_CANARY_RAW_NR],
+	ft_canary_raw_stores[FT_CANARY_RAW_NR], ft_canary_rec_stores;
+unsigned long ft_canary_mix_raw_after_rec[FT_CANARY_RAW_NR],
+	ft_canary_mix_rec_after_raw[FT_CANARY_RAW_NR],
+	ft_canary_raw_stores[FT_CANARY_RAW_NR], ft_canary_rec_stores;
 
 static inline
-void ft_chain_canary_stamp_at(const char *fn, int line, void **slot, bool raw)
+void ft_chain_canary_stamp_id(const char *fn, int line, void **slot, bool raw,
+		unsigned char id)
 {
 	struct ft_canary_ent *e = &ft_canary_tab[ft_canary_hash(slot)];
 
 	if (raw)
-		uatomic_inc(&ft_canary_raw_stores);
+		uatomic_inc(&ft_canary_raw_stores[id]);
 	else
 		uatomic_inc(&ft_canary_rec_stores);
-	if (e->slot == slot && e->raw != raw)
-		uatomic_inc(raw ? &ft_canary_mix_raw_after_rec
-				: &ft_canary_mix_rec_after_raw);
+	if (e->slot == slot && e->raw != raw) {
+		if (raw)
+			uatomic_inc(&ft_canary_mix_raw_after_rec[id]);
+		else
+			uatomic_inc(&ft_canary_mix_rec_after_raw[e->raw_id]);
+	}
 	e->slot = slot;
 	e->fn = fn;
 	e->line = line;
 	e->raw = raw;
+	e->raw_id = raw ? id : e->raw_id;
 	e->tid = (unsigned long) pthread_self();
+}
+
+static inline
+void ft_chain_canary_stamp_at(const char *fn, int line, void **slot, bool raw)
+{
+	ft_chain_canary_stamp_id(fn, line, slot, raw, 0);
 }
 
 static inline
@@ -286,13 +320,22 @@ void ft_chain_canary_stamp(const char *fn, int line, void **slot)
 static void ft_canary_mix_report(void) __attribute__((destructor));
 static void ft_canary_mix_report(void)
 {
-	fprintf(stderr, "FT CHAIN SLOT-MIX (one address written BOTH ways -- "
-		"must be 0 for the SW flip): raw_after_recorded=%lu "
-		"recorded_after_raw=%lu  | raw stores=%lu recorded=%lu\n",
-		uatomic_read(&ft_canary_mix_raw_after_rec),
-		uatomic_read(&ft_canary_mix_rec_after_raw),
-		uatomic_read(&ft_canary_raw_stores),
-		uatomic_read(&ft_canary_rec_stores));
+	{
+		static const char * const nm[FT_CANARY_RAW_NR] = {
+			"MARK_REMOVED(live node)", "PUB_EXT_PREV(wlock)",
+			"SET_PARENT(hidden)", "SET_PARENT_RAW(wlock)" };
+		unsigned int i;
+
+		fprintf(stderr, "FT CHAIN SLOT-MIX by raw producer "
+			"(recorded=%lu):\n",
+			uatomic_read(&ft_canary_rec_stores));
+		for (i = 0; i < FT_CANARY_RAW_NR; i++)
+			fprintf(stderr, "  %-26s raw=%-10lu "
+				"raw_after_rec=%-8lu rec_after_raw=%lu\n",
+				nm[i], uatomic_read(&ft_canary_raw_stores[i]),
+				uatomic_read(&ft_canary_mix_raw_after_rec[i]),
+				uatomic_read(&ft_canary_mix_rec_after_raw[i]));
+	}
 }
 
 /* NULL when the word has never been stored through a chain store helper. */

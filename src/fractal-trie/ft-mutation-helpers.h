@@ -12972,7 +12972,7 @@ struct cds_ft_node *ft_node_mark_removed_flip(struct cds_ft *ft,
 			caa_cpu_relax();
 			continue;
 		}
-		FT_CHAIN_CANARY_RAW(&node->next);
+		FT_CHAIN_CANARY_RAW(&node->next, 0);
 		if (caa_likely(uatomic_cmpxchg(&node->next, old,
 				(struct cds_ft_node *) ((uintptr_t) old |
 					CDS_FT_NODE_REMOVED_FLAG)) == old)) {
@@ -15560,7 +15560,7 @@ void ft_set_parent_raw(struct cds_ft *ft, struct cds_ft_inode_flag *child,
 		} else {
 			struct cds_ft_node *en = (struct cds_ft_node *) child;
 
-			FT_CHAIN_CANARY_RAW(&en->prev);
+			FT_CHAIN_CANARY_RAW(&en->prev, 3);
 			en->prev = ft_head_parent_word_carry(value, en->prev);
 		}
 		return;

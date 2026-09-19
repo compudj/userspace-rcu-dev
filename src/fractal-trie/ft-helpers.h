@@ -77,12 +77,12 @@ enum ft_word_excl {
  * declared.  The single TU resolves the function.
  */
 #ifdef FT_DEBUG_CHAIN_CANARY
-static void ft_chain_canary_stamp_at(const char *fn, int line, void **slot,
-		bool raw);
-# define FT_CHAIN_CANARY_RAW(slot)					\
-	ft_chain_canary_stamp_at(__func__, __LINE__, (void **) (slot), true)
+static void ft_chain_canary_stamp_id(const char *fn, int line, void **slot,
+		bool raw, unsigned char id);
+# define FT_CHAIN_CANARY_RAW(slot, id)					\
+	ft_chain_canary_stamp_id(__func__, __LINE__, (void **) (slot), true, (id))
 #else
-# define FT_CHAIN_CANARY_RAW(slot)	do { (void) (slot); } while (0)
+# define FT_CHAIN_CANARY_RAW(slot, id)	do { (void) (slot); } while (0)
 #endif
 
 #ifdef FT_DEBUG_CHAIN_HOLD
@@ -1909,7 +1909,7 @@ void ft_publish_external_nodes_prev(struct cds_ft *ft,
 	if (ft->ordered_list) {
 		ft_ord_cell_set_parent(external_nodes, word);
 	} else {
-		FT_CHAIN_CANARY_RAW(&external_nodes->prev);
+		FT_CHAIN_CANARY_RAW(&external_nodes->prev, 1);
 		rcu_assign_pointer(external_nodes->prev, word);
 	}
 	FT_TP(set_parent, (const void *) external_nodes, (const void *) word);
@@ -4372,7 +4372,7 @@ void ft_set_parent_at(const char *fn, int line, struct cds_ft *ft,
 		if (ft->ordered_list) {
 			ft_ord_cell_set_parent(en, word);
 		} else {
-			FT_CHAIN_CANARY_RAW(&en->prev);
+			FT_CHAIN_CANARY_RAW(&en->prev, 2);
 			rcu_assign_pointer(en->prev, word);
 		}
 		return;
