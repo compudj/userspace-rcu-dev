@@ -12959,6 +12959,27 @@ void ft_flip_txn_hold_or_lock_parent_at(const char *fn, int line,
  * proxy -- the loop validated bit 0 clear): the ONE proxy-safe way for a
  * chain sweep to advance, since a raw ft_node_next masks only the mark bit
  * and would hand a parked latch pointer to the next iteration.
+ *
+ * ☠☠ AND THE SPIN PROTECTS ONE ORDERING, NOT BOTH -- which is what makes this
+ * the last raw producer standing between cds_ft_node.next and the SW flip.
+ *
+ * A multi-record SW commit parks urcu_txn_tag(r, r->proxy_tag), i.e. a proxy
+ * carrying the EMBEDDER's tag, so FT_HLIST_TAG is set and the loop above does
+ * wait it out.  That covers park-then-CAS.  The reverse does not: if this CAS
+ * lands FIRST, on a clean word, the parker's old_ptr/new_ptr were derived
+ * before the mark existed and urcu_txn_park writes its proxy with a blind
+ * uatomic_store -- so the settle republishes a successor with the tombstone
+ * ERASED.  Under MW the install CAS rejects that; an SW park cannot fail.
+ * (The LONE SW edge is different again and is fine: rcu-txn-mcas.h commits it
+ * as a single plain release store with no proxy window at all, so this CAS
+ * either precedes or follows it and its own expected-old arbitrates.)
+ *
+ * ☞ MEASURED UNREACHABLE, which is why the flip is not blocked on it today:
+ * -DFT_DEBUG_CHAIN_CANARY scores this producer at raw = 0 in ft_inv AND
+ * ft_unit at all three spacings, and 0 slot-mix transitions.  That is a
+ * COVERAGE statement about two suites, not a proof -- so if this path ever
+ * becomes reachable, it must be converted to a recorded store BEFORE the chain
+ * class parks, not merely re-argued.
  */
 static
 struct cds_ft_node *ft_node_mark_removed_flip(struct cds_ft *ft,
