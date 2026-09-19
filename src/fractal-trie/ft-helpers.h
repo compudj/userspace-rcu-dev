@@ -1821,9 +1821,24 @@ bool ft_head_is_prefix(const struct cds_ft *ft, struct cds_ft_node *head)
 		 * ft_publish_external_nodes_prev and ft_set_parent's	\
 		 * external arm -- and this spelling had NO audit arm, so	\
 		 * it could not appear in the class's zeros either way.	\
+		 *						\
+		 * ☞ DECLARED HIDDEN, AND THAT IS A CHECKED CLAIM here,	\
+		 * not a believed one: every caller of this macro writes	\
+		 * the back edge of a FRESH node it is still building --	\
+		 * `node->next = NULL` follows immediately and the	\
+		 * external_nodes publish is parked for a later commit --	\
+		 * so no reader can reach the word.  The audit's HIDDEN	\
+		 * arm scores that against ft_ch_head_reachable, whose	\
+		 * positive control fires in the same run (HEAD-CONTROL	\
+		 * live removed leaf, reachable 3,514,638 of 3,514,798),	\
+		 * so a wrong claim here reads as hw_hidden_live.	\
+		 * UNDECLARED was the wrong spelling: with a non-NULL	\
+		 * owner the audit counts it and returns WITHOUT scoring,	\
+		 * which left ~4M writes per leg visible but unverdicted.	\
 		 */						\
-		ft_ch_audit_head((ft), (node),				\
-			(struct cds_ft_inode_flag *) (parent));		\
+		ft_ch_audit_head_at(__func__, __LINE__, (ft), (node),	\
+			(struct cds_ft_inode_flag *) (parent),		\
+			FT_EXCL_HIDDEN);				\
 		if ((ft)->ordered_list)					\
 			ft_ord_cell_set_parent((node), _hpw);		\
 		else							\
