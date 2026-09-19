@@ -305,6 +305,20 @@ ALL_CONFIGS=(
 	# counts writers instead of claiming a single owner, because disjoint
 	# writers running in parallel is the design there, not a violation.
 	"excl|-DFEATURE_FT_EXCL_VALIDATE|u ion ioff imw"
+	# ★ THE ORDERED LOCK TAKE.  Lock words are taken by a plain CAS in
+	# ascending ANCHOR order instead of being recorded into a txn and
+	# installed by its commit -- exclusion needs ORDERING, not atomicity, and
+	# a failed CAS writes nothing a peer can reference, so a losing acquire
+	# no longer owes a grace period for its descriptor (165,006 -> 18,334
+	# grace-period-owing aborts on one ft_inv MW leg).
+	#
+	# ☠ IT NEEDS imw.  The property at risk is EXCLUSION under concurrent
+	# writers, and the two bugs this change already produced were both
+	# invisible single-threaded: an in-place sort of the caller's set (SEGV,
+	# caught by ft_unit) and a leaked lock on the commit-failure exit (a HANG
+	# at ft_inv test 40 with ZERO test failures, which only the MW oracle
+	# reaches).  A config that ran u alone would have shipped the second.
+	"lockordered|-DFEATURE_FT_LOCK_TAKE_ORDERED|u ion ioff imw"
 	# -DNO_FEATURE_FT_MERGE compiles out the merge subsystem (~20 KiB .text;
 	# cds_ft_merge then returns NOT_SUPPORTED).  It had no gate config and had
 	# ROTTED: the rekey fold's occupied-dst arm -- which IS a merge -- was not

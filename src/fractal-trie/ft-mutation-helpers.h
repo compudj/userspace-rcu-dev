@@ -6062,6 +6062,7 @@ static void ft_sa_pend_bailed(const struct ft_flip_txn *t);
  * and the handle; no grace period is owed.  Registered LOCK fences are
  * cleared (the marked nodes stay live; nothing retires them).
  */
+
 static inline
 void ft_flip_txn_destroy(struct ft_flip_txn *t)
 {
@@ -6866,6 +6867,7 @@ static bool ft_flip_txn_late_last(void *arg, void **slot)
  * ABORT never occurs, so this is behaviour-identical there.  @t is consumed.
  */
 static inline
+
 enum urcu_txn_status ft_flip_txn_commit(struct cds_ft *ft,
 		struct ft_flip_txn *t)
 {
@@ -8901,6 +8903,96 @@ int ft_dlm_lock(struct ft_flip_txn *t, struct cds_ft_metadata *meta,
 	return 0;
 }
 
+#ifdef FEATURE_FT_LOCK_TAKE_ORDERED
+/*
+ * TAKE THE WORD NOW, with a plain CAS, instead of recording the edge for a
+ * commit to install.
+ *
+ * ☞ WHY THIS IS SOUND WITHOUT THE ENGINE.  A lock-set needs EXCLUSION, not
+ * atomicity: taken in a total order (ascending anchor address, see the sort in
+ * ft_dlm_acquire_set_at) no cycle can form, so all-or-none buys nothing that
+ * ordering does not already give.  The refusal set is IDENTICAL to
+ * ft_dlm_lock's -- PROXY, dead, or already LOCKED -- so a word this refuses is
+ * exactly a word that one refuses.
+ *
+ * ☞ AND THIS IS THE POINT OF THE EXERCISE.  An engine acquire that loses its
+ * CAS has already PLANTED proxies, so its descriptor owes a grace period
+ * (rcu-txn-mcas.h: the abort path calls call_rcu_fn unconditionally) -- MEASURED
+ * at 1.2M such aborts per leg once contention feeds back on itself, against
+ * ~150k healthy.  A failed CAS here writes nothing anyone can reference: no
+ * descriptor, no proxy, no reclaim, nothing to defer.  The retry costs a
+ * re-descend and not a grace period.
+ *
+ * ☠ THE CALLER OWES AN UNWIND.  The recorded form applies nothing until the
+ * commit, so a bail before it left the structure untouched ("nothing acquired,
+ * all-or-none").  Here every success is IMMEDIATELY visible, so the failure
+ * path must ft_meta_lock_release() what it already took.
+ */
+static inline
+int ft_dlm_lock_now(struct cds_ft_metadata *meta, uintptr_t *snap)
+{
+	uintptr_t s = CMM_LOAD_SHARED(meta->state);
+
+	if (caa_unlikely(s & (FT_STATE_PROXY | FT_SA_DEAD_REFUSE |
+			FT_STATE_LOCK)))
+		return -EAGAIN;
+	if (caa_unlikely(uatomic_cmpxchg(&meta->state, s,
+			s | FT_STATE_LOCK) != s))
+		return -EAGAIN;		/* a peer won it between load and CAS */
+	*snap = s;
+	return 0;
+}
+
+/*
+ * Order @set by the address of the word each member will actually lock -- its
+ * ANCHOR, not the member: at a coarse spacing several members resolve to ONE
+ * anchor (which is what the dedupe downstream exists for), so sorting by
+ * set[i].node would order the wrong thing.
+ *
+ * Insertion sort: a lock set is a handful of members, and this runs on the
+ * acquire path.  Returns false when @nr exceeds the scratch bound, and the
+ * caller then keeps the recorded path -- correctness never depends on which
+ * one runs, only the reclaim cost does.
+ */
+#define FT_LOCK_ORDER_MAX	16
+/*
+ * ☠ THE SET ITSELF MUST NOT MOVE.  Callers fill @set positionally -- {C, P, GP}
+ * -- and read set[i].held back by that same index afterwards, so permuting the
+ * array hands every caller a different member's anchor.  (Measured the blunt
+ * way: sorting in place SEGVs test 2 of the unit suite.)  So the order is
+ * returned SEPARATELY and only the TAKE walks it; @set keeps the caller's
+ * indexing untouched.
+ */
+static inline
+bool ft_lock_set_order_by_anchor(const struct cds_ft *ft,
+		const struct ft_lock_ctx *ctx, const struct ft_dlm_member *set,
+		int nr, int *order)
+{
+	struct cds_ft_metadata *key[FT_LOCK_ORDER_MAX];
+	int i, j;
+
+	if (nr > FT_LOCK_ORDER_MAX)
+		return false;
+	for (i = 0; i < nr; i++) {
+		key[i] = ft_anchor_meta(ft, ft_lock_ctx_descent(ctx),
+			set[i].nf, set[i].node, set[i].depth);
+		order[i] = i;
+	}
+	for (i = 1; i < nr; i++) {
+		struct cds_ft_metadata *k = key[i];
+		int o = order[i];
+
+		for (j = i; j > 0 && key[j - 1] > k; j--) {
+			key[j] = key[j - 1];
+			order[j] = order[j - 1];
+		}
+		key[j] = k;
+		order[j] = o;
+	}
+	return true;
+}
+#endif /* FEATURE_FT_LOCK_TAKE_ORDERED */
+
 /*
  * Guard a back-edge into the SAME acquire commit: the commit aborts unless
  * @child->parent still holds @expected_pf (the tagged parent flag the plan
@@ -9661,6 +9753,11 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 		const struct cds_ft *ft, const struct ft_lock_ctx *ctx,
 		struct ft_dlm_member *set, int nr)
 {
+#ifdef FEATURE_FT_LOCK_TAKE_ORDERED
+	bool ordered = false;
+	int lock_order[FT_LOCK_ORDER_MAX];
+#endif
+	int ii;
 	struct cds_ft_metadata *taken_embed[FT_FLIP_TXN_MAX_LOCKS];
 	uintptr_t taken_snap_embed[FT_FLIP_TXN_MAX_LOCKS];
 	/*
@@ -9821,9 +9918,22 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 		free(taken_heap);	/* allocated above; nothing acquired yet */
 		return -ENOMEM;
 	}
-	for (i = 0; i < nr; i++) {
+#ifdef FEATURE_FT_LOCK_TAKE_ORDERED
+	/*
+	 * ASCENDING ANCHOR ORDER, and the whole deadlock argument rides on it:
+	 * with a total order on the words no cycle can form, which is what lets
+	 * the takes below be plain CASes instead of one atomic commit.
+	 */
+	ordered = ft_lock_set_order_by_anchor(ft, ctx, set, nr, lock_order);
+#endif
+	for (ii = 0; ii < nr; ii++) {
 		struct cds_ft_metadata *node, *lock;
 		uintptr_t node_snap = 0, lock_snap, held_snap = 0;
+#ifdef FEATURE_FT_LOCK_TAKE_ORDERED
+		i = ordered ? lock_order[ii] : ii;
+#else
+		i = ii;
+#endif
 		bool coarsened, deduped = false, held_ratified = true;
 		bool node_held = false;
 
@@ -10119,7 +10229,12 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 #endif
 			continue;
 		}
+#ifdef FEATURE_FT_LOCK_TAKE_ORDERED
+		if (ordered ? ft_dlm_lock_now(lock, &lock_snap)
+			    : ft_dlm_lock(acq, lock, &lock_snap)) {
+#else
 		if (ft_dlm_lock(acq, lock, &lock_snap)) {
+#endif
 			ft_hold_trace_refused(lock, fn, line);
 			do { FT_DBG_ACQ_SITE(); goto eagain; } while (0);
 		}
@@ -10135,6 +10250,19 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 	if (ft_flip_txn_commit((struct cds_ft *) ft, acq) != URCU_TXN_STATUS_OK) {
 #ifdef FT_DEBUG_REMOVE_RETRY_CAP
 		ft_dbg_acq_cabort++;
+#endif
+#ifdef FEATURE_FT_LOCK_TAKE_ORDERED
+		/*
+		 * ☠ "nothing acquired" IS ONLY TRUE OF THE RECORDED PATH, whose
+		 * takes are edges a commit has yet to apply.  An ordered CAS take
+		 * is held the instant it succeeds, so this exit LEAKS every word
+		 * it took -- and a leaked lock is permanent: peers refuse it
+		 * forever and the op retries forever.  MEASURED as a hang of
+		 * ft_inv at test 40 (rc=124), not as a failure.
+		 */
+		if (ordered)
+			while (nr_taken)
+				ft_meta_lock_release(taken[--nr_taken]);
 #endif
 		free(taken_heap);
 		return -EAGAIN;		/* commit freed @acq; nothing acquired */
@@ -10321,6 +10449,17 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 	free(taken_heap);
 	return 0;
 eagain:
+#ifdef FEATURE_FT_LOCK_TAKE_ORDERED
+	/*
+	 * ☠ THE RECORDED PATH APPLIES NOTHING UNTIL ITS COMMIT, so its bail is
+	 * "nothing acquired" by construction.  A CAS take is visible the instant
+	 * it succeeds, so this path owes the release the commit would have
+	 * skipped.  Same primitive the post-commit stale-anchor bail uses.
+	 */
+	if (ordered)
+		while (nr_taken)
+			ft_meta_lock_release(taken[--nr_taken]);
+#endif
 	ft_flip_txn_destroy(acq);
 	free(taken_heap);
 	/*
