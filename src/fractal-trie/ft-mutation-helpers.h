@@ -1835,6 +1835,16 @@ struct ft_flip_txn {
 static inline
 struct urcu_txn *ft_flip_txn_handle(struct ft_flip_txn *t)
 {
+#ifdef FT_DEBUG_HLIST_TAIL_WHY
+	/*
+	 * ☞ THE ONE PLACE A *_prepare FORM'S CALLER CONVERTS ITS WRAPPER INTO
+	 * THE ENGINE HANDLE, so it is the only stamp point that needs no change
+	 * at thirteen call sites.  Debug-gated and never read by shipping code;
+	 * the classifier that consumes it VERIFIES the stamp against the handle
+	 * it was actually given rather than trusting this.
+	 */
+	ft_hlist_why_ftxn = t;
+#endif
 	return t->mtxn;
 }
 
@@ -2949,6 +2959,27 @@ out:
  * control) or through two words (anchor disagreement).  Both owners are
  * named.  The fn/line store after the xchg is racy only in the already-
  * aborting case.
+ *
+ * ☠☠ IT IS A CLAIM ORACLE, NOT A HOLD ORACLE, AND READING IT AS ONE HAS
+ * ALREADY INVERTED A CONCLUSION.  The stamp is set here and YIELDED by
+ * ft_hold_trace_drop, which ft_flip_txn_record_release_lock calls the instant
+ * it RECORDS the release -- so every op that acquires a word and immediately
+ * plants its {LOCK|s -> s} terminal (every lock_or_guard hoist) stops claiming
+ * the word while still owning it, through the commit.  Two consequences, both
+ * measured:
+ *
+ *   - a reader of dbg_owner_tid sees NOBODY for a registry-held word.  Asked
+ *     at the duplicate chain's freeze tail it read "claimed by US = 0" of
+ *     ~27,000 and was written up as "this path holds nothing"; the registry
+ *     owns the holder at 100% of the same events
+ *     (ft_hlist_store_chain_at's parked note).
+ *   - this oracle is correspondingly blind to a collision in which either side
+ *     has already recorded its release.  A ZERO HERE IS NOT A CLEARANCE.
+ *
+ * The cure is not to keep the stamp longer -- the yield is what keeps a
+ * completed op from reporting a self-collision against a peer's legitimate
+ * lock (ft_flip_txn_record_release_lock's own header) -- it is to read this
+ * oracle BESIDE ft_flip_txn_owns, never instead of it.
  */
 static inline
 void ft_owner_stamp_claim(struct cds_ft_metadata *member,

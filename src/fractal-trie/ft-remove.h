@@ -7957,6 +7957,16 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 			 * metadata->parent.  Propagate -1 before detach, which may
 			 * free internal nodes.
 			 */
+			/*
+			 * NAME THE DERIVATION.  The freeze this detach fuses is
+			 * given a LITERAL length, so it never passes through
+			 * ft_hlist_chain_len and the tail-why classifier filed it
+			 * as "(unstamped)" -- a bucket that has to be reasoned
+			 * into a site instead of read off the table.  The literal
+			 * is derived HERE, from the @succ_node read above, so
+			 * stamp it here.
+			 */
+			FT_HLIST_WHY_STAMP();
 			ret = ft_detach_node(ft, &lctx, head_slot,
 				ft_get_parent_slot(holder_meta, ft),
 				key_len, true, fuse_cell, pubp, NULL, NULL, node,
@@ -8197,6 +8207,8 @@ enum cds_ft_status _cds_ft_remove_locked(struct cds_ft *ft,
 			 * Last/only entry: prune the now-empty branch.
 			 * Propagate -1 before detach, which may free internal nodes.
 			 */
+			/* Name the derivation: see the compressed-holder arm above. */
+			FT_HLIST_WHY_STAMP();
 			ret = ft_detach_node(ft, &lctx, head_slot,
 				ft_get_parent_slot(holder_meta, ft),
 				key_len, true, fuse_cell, pubp, NULL, NULL, node,

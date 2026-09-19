@@ -275,27 +275,64 @@ int ft_hlist_store_chain_at(const char *fn, int line, const struct cds_ft *ft,
 	 *
 	 * ☠ THE `UNHELD = 0` THAT LICENSED IT IS A UNION-OF-WITNESSES ZERO.  The
 	 * chain hold audit scores HELD if ANY of the txn registry, the per-thread
-	 * ledger or the lock ctx can see a hold.  Asked instead for a POSITIVE
-	 * claim -- cds_ft_metadata.dbg_owner_tid, which the ledger sets when an op
-	 * takes a member and clears when it drops it -- the answer inverts.
-	 * MEASURED at the moment ft_hlist_freeze_chain_prepare records its tail
-	 * against a word that disagrees with the derivation, per ft_inv leg:
+	 * ledger or the lock ctx can see a hold, and a park is licensed by the
+	 * REGISTRY alone.  That objection stands and is why the flip came out.
 	 *
-	 *   holder claimed by US        0   (of ~28,000, at BOTH spacings)
-	 *   holder claimed by a PEER  890   (at _cds_ft_insert_replace)
-	 *   holder claimed by NOBODY  ~27k
+	 * ☠☠ BUT THE POSITIVE-CLAIM PROBE THAT REPLACED IT IS WRONG THE OTHER
+	 * WAY, AND ITS READING HAS BEEN WITHDRAWN.  That probe asked
+	 * cds_ft_metadata.dbg_owner_tid -- "who claims the holder right now" --
+	 * and read US = 0 of ~28,000 at both spacings, which was recorded here as
+	 * "these paths never claim the holder".  The stamp is maintained by the
+	 * hold LEDGER, and ft_flip_txn_record_release_lock calls
+	 * ft_hold_trace_drop() -- which YIELDS the stamp -- the moment it RECORDS
+	 * the release.  Every site that acquires a word and immediately plants its
+	 * {LOCK|s -> s} terminal, which is precisely what the lock-or-guard hoists
+	 * do, therefore reads US = 0 from the instant it acquires, while the word
+	 * still carries FT_STATE_LOCK and is still owned -- by the commit rather
+	 * than by the frame.  The tree already priced this twice: the ledger "is
+	 * not a hold count, it is an OUTSTANDING-RELEASE count"
+	 * (ft-mutation-helpers.h), and the canary's own header above measures the
+	 * chain hold audit at ft_detach_node REG = 2,579,201 / LED = 0.
 	 *
-	 * A PEER positively owning the chain's holder while this op records a
-	 * store into that chain is an exclusion gap, and it is a positive
-	 * observation rather than an absent one, so it does not explain away.
-	 * Under MW the install CAS arbitrates it and the commit aborts.  An SW
-	 * park cannot lose, so the same shape becomes a blind store into a chain
-	 * another writer owns.
+	 * ☑ RE-MEASURED WITH BOTH WITNESSES AT THE SAME EVENT (one run, so no
+	 * unmatched control), -DFT_DEBUG_HLIST_TAIL_WHY, ft_inv, per-node and
+	 * exponential.  LEDGER = 0 on EVERY row at BOTH spacings -- so the stamp
+	 * was reporting "this hold was registered", not "there is no hold":
+	 *
+	 *   len derived at            disagree   REGISTRY owns   peer CLAIMS
+	 *   _cds_ft_remove_locked:8211  10,157 /  16,219   100% /  100%     0
+	 *   _cds_ft_remove_locked:7969       8 /      37     0% /  100%     0
+	 *   _cds_ft_remove_all_locked:9301 347 /     523    37% /   62%     0
+	 *   _cds_ft_insert_replace:5160 13,683 /  14,337    22% /   22%   834 / 1,094
+	 *
+	 * ⇒ cds_ft_remove's SOLE-ENTRY path, the row the withdrawn reading named
+	 * as holding nothing, owns the chain's holder at 100% of its
+	 * disagreements, by the one witness a park is licensed by.  Since
+	 * ft_flip_txn_owns is EXACT at per-node and conservative above it, those
+	 * percentages are LOWER bounds on ownership.
+	 *
+	 * ☞ SO THE SOLE PATH'S DISAGREEMENT IS NOT AN UNHELD STORE, and the two
+	 * remaining histories need a different discriminator than this table:
+	 * either the append COMMITTED BEFORE we acquired the holder (a STALE PLAN
+	 * -- @len is a literal 1 derived from an unheld read of @succ_node, and
+	 * ft_hlist_chain_len's header already forbids counting unheld; the cure is
+	 * a re-validation of the sole-entry claim under the lock, with a retriable
+	 * bail), or it landed AFTER, which would be an exclusion gap on the
+	 * APPENDER's side.  ☐ The discriminator is a snapshot of the tail word
+	 * taken at the holder acquire; it has not been run.
+	 *
+	 * ☠ A PEER POSITIVELY OWNING THE HOLDER SURVIVES ALL OF THIS, at
+	 * _cds_ft_insert_replace:5160 (834 per-node / 1,094 exponential).  The
+	 * ledger can over-report a leaked entry but cannot invent a stack hold, so
+	 * this is a positive observation and does not explain away.  Under MW the
+	 * install CAS arbitrates it and the commit aborts.  An SW park cannot
+	 * lose, so the same shape becomes a blind store into a chain another
+	 * writer owns.
 	 *
 	 * ☠ AND THE EXCLUSION ORACLE'S SILENCE IS NOT A CLEARANCE.  The run
 	 * reported 0 EXCLUSION VIOLATIONS, but ft_owner_stamp_claim fires when
-	 * two ops CLAIM one member -- it is structurally blind to a writer that
-	 * never claims at all, which (given US = 0) is what these paths do.
+	 * two ops CLAIM one member -- and it claims through the same ledger, so it
+	 * is blind to every registered hold for the same reason.
 	 *
 	 * ☞ WHAT THE FLIP COSTS, so the next attempt does not rediscover it: the
 	 * MW expected-old is load-bearing BEYOND arbitration in three places, and
@@ -308,11 +345,15 @@ int ft_hlist_store_chain_at(const char *fn, int line, const struct cds_ft *ft,
 	 *   - the five structural expected-olds that are arguments rather than
 	 *     loads (measured: they always agree, so they are cheap to fix).
 	 *
-	 * Reinstating the flip means: close the gap at the two sites that do not
-	 * claim the holder (_cds_ft_insert_replace, and cds_ft_remove's sole-entry
-	 * path), re-run the POSITIVE-claim probe to a measured zero, then dispatch
-	 * SW here unconditionally -- never on a per-txn predicate, which is what
-	 * made the kind a property of the asking transaction the first time.
+	 * Reinstating the flip means, in this order: run the acquire-time snapshot
+	 * that separates a stale plan from an appender gap on the sole path; close
+	 * _cds_ft_insert_replace:5160 (78% registry-unowned, plus the peer claims
+	 * above) and _cds_ft_remove_all_locked:9301; account for the 8 per-node
+	 * events at :7969 that :8211 and both exponential rows do not have; re-run
+	 * this table to a measured zero UNOWNED -- on the REGISTRY, never on the
+	 * stamp -- and only then dispatch SW here unconditionally, never on a
+	 * per-txn predicate, which is what made the kind a property of the asking
+	 * transaction the first time.
 	 *
 	 * ☞ COARSE RECORDS SW, WHATEVER THE WORD IS.  A coarse trie takes the
 	 * FT-wide @writer_lock at its outermost writer scope, so every writer of
@@ -763,6 +804,18 @@ void ft_hlist_freeze_sole_prepare(const struct cds_ft *ft, struct urcu_txn *txn,
  * So report the HOLDER witness and the CALLER that counted @len, interned by
  * (fn, line).  The chain hold audit cannot answer this: it scores the moment of
  * the STORE, and this is a question about the moment of the DERIVATION.
+ *
+ * ☑ ANSWERED, AND THE FIRST ANSWER WAS THE WRONG ONE.  Asked of the hold
+ * ledger's stamp alone the table read US = 0 everywhere, which was recorded as
+ * UNHELD.  The stamp cannot see a REGISTERED hold at all -- see the withdrawal
+ * in ft_hlist_store_chain_at's parked note -- so the three witness columns are
+ * now read TOGETHER, at the same event, and the answer for cds_ft_remove's
+ * sole-entry path is STALE PLAN or an appender gap, never UNHELD: the registry
+ * owns the holder at 100% of its disagreements.
+ *
+ * ☠ WHICH IS WHY @reg_own EXISTS AND WHY THE STAMP IS KEPT BESIDE IT.  A
+ * single-witness verdict on this question has now been wrong in both
+ * directions; the columns are only meaningful as a set.
  */
 #ifdef FT_DEBUG_HLIST_TAIL_WHY
 #define FT_HLIST_WHY_MAX	16
@@ -784,6 +837,29 @@ struct ft_hlist_why_site {
 	 *            hold never reached the ledger (an ENTRY-less claim)
 	 */
 	unsigned long excl_own, excl_foreign, excl_none;
+	/*
+	 * ☠☠ AND THE SAME EVENT ASKED OF THE OTHER TWO WITNESSES, because the
+	 * stamp above CANNOT SEE A CONVERTED HOLD and the tree says so twice:
+	 *
+	 *   - ft_flip_txn_record_release_lock calls ft_hold_trace_drop() the
+	 *     moment it RECORDS the release (ft-mutation-helpers.h, "the ledger
+	 *     is not a hold count -- it is an OUTSTANDING-RELEASE count"), and
+	 *     that drop YIELDS the stamp.  Every site that acquires a word and
+	 *     immediately plants its {LOCK|s -> s} terminal -- which is what the
+	 *     lock-or-guard hoists do -- therefore reads US = 0 from then on,
+	 *     while the word still carries FT_STATE_LOCK and is still owned, by
+	 *     the commit rather than by the frame.
+	 *   - the chain canary's own header already prices it: the chain hold
+	 *     audit measures ft_detach_node at REG = 2,579,201 / LED = 0.
+	 *
+	 * So report the REGISTRY (@reg_own) beside it, at the SAME event, from
+	 * the ft_flip_txn whose handle this freeze was given.  A park is licensed
+	 * by that witness and by no other (§11.9), so it is the one the flip
+	 * actually needs -- and US = 0 with @reg_own large is the wrong zero,
+	 * not a gap.  @led_own is the ledger asked directly, to show the stamp
+	 * and the ledger agree and that the split is REGISTRY-vs-rest.
+	 */
+	unsigned long reg_own, led_own, reg_or_led, ftxn_none, ftxn_stale;
 	/*
 	 * ☠ AND THE MODE, because "NOBODY claims the holder" is only a gap
 	 * under FINE.  A COARSE trie serialises every writer behind the FT-wide
@@ -810,6 +886,24 @@ struct ft_hlist_why_site ft_hlist_why_sites[FT_HLIST_WHY_MAX];
 unsigned int ft_hlist_why_n;
 __thread const char *ft_hlist_why_fn;
 __thread int ft_hlist_why_line;
+/*
+ * THE REGISTRY WITNESS' SOURCE.  A freeze helper is handed the ENGINE handle
+ * (struct urcu_txn *), and the lock registry lives one level up in the
+ * ft_flip_txn that owns it -- so the wrapper cannot be recovered from the
+ * handle.  Every caller of a *_prepare form reaches it through
+ * ft_flip_txn_handle(), so stamp the wrapper THERE, in the one place that
+ * converts one into the other, and verify it here: the classifier counts
+ * @ftxn_stale whenever the stamped wrapper's handle is not the handle this
+ * record is going into, so a mis-stamp reads as its own column instead of
+ * silently answering for the wrong transaction.
+ */
+struct ft_flip_txn;
+extern __thread struct ft_flip_txn *ft_hlist_why_ftxn;
+__thread struct ft_flip_txn *ft_hlist_why_ftxn;
+static inline bool ft_flip_txn_owns(const struct ft_flip_txn *t,
+		const struct cds_ft_metadata *owner);
+static inline struct urcu_txn *ft_flip_txn_handle(struct ft_flip_txn *t);
+static bool ft_hold_trace_holds(const struct cds_ft_metadata *lock);
 
 static void ft_hlist_why_report(void) __attribute__((destructor));
 static void ft_hlist_why_report(void)
@@ -835,6 +929,11 @@ static void ft_hlist_why_report(void)
 			fprintf(stderr, "      holder claimed by: US(appender's gap)=%lu  "
 				"FOREIGN(our gap)=%lu  NOBODY=%lu\n",
 				e->excl_own, e->excl_foreign, e->excl_none);
+			fprintf(stderr, "      SAME EVENT, other witnesses: REGISTRY "
+				"owns=%lu  LEDGER holds=%lu  either=%lu   "
+				"(no ftxn stamped=%lu, stale=%lu)\n",
+				e->reg_own, e->led_own, e->reg_or_led,
+				e->ftxn_none, e->ftxn_stale);
 			fprintf(stderr, "      NOBODY splits: FINE(a real gap)=%lu  "
 				"coarse=%lu  exclusive=%lu  FT-wide-lock-held=%lu\n",
 				e->none_fine, e->none_coarse, e->none_excl,
@@ -851,7 +950,8 @@ static void ft_hlist_why_report(void)
 }
 
 static inline
-void ft_hlist_why_tail(struct cds_ft *ft, struct cds_ft_node *head)
+void ft_hlist_why_tail(struct cds_ft *ft, struct urcu_txn *txn,
+		struct cds_ft_node *head)
 {
 	void *live = (void *) CMM_LOAD_SHARED(head->next);
 
@@ -886,6 +986,31 @@ void ft_hlist_why_tail(struct cds_ft *ft, struct cds_ft_node *head)
 		unsigned long owner = hm ?
 			CMM_LOAD_SHARED(hm->dbg_owner_tid) : 0;
 
+		{
+			/*
+			 * THE TWO WITNESSES THE STAMP CANNOT BE, read here and
+			 * not in a second run: a verdict assembled from two
+			 * runs at two points is how an unmatched control gets
+			 * read as a result.
+			 */
+			struct ft_flip_txn *ftxn = ft_hlist_why_ftxn;
+			bool reg, led;
+
+			if (!ftxn)
+				uatomic_inc(&e->ftxn_none);
+			else if (ft_flip_txn_handle(ftxn) != txn) {
+				uatomic_inc(&e->ftxn_stale);
+				ftxn = NULL;
+			}
+			reg = ftxn && hm && ft_flip_txn_owns(ftxn, hm);
+			led = hm && ft_hold_trace_holds(hm);
+			if (reg)
+				uatomic_inc(&e->reg_own);
+			if (led)
+				uatomic_inc(&e->led_own);
+			if (reg || led)
+				uatomic_inc(&e->reg_or_led);
+		}
 		if (!owner) {
 			uatomic_inc(&e->excl_none);
 			if (ft->exclusive)
@@ -934,15 +1059,26 @@ void ft_hlist_why_tail(struct cds_ft *ft, struct cds_ft_node *head)
 		uatomic_inc(&e->prod_n[k]);
 	}
 #endif
+	/*
+	 * ☠ AND CLEAR IT.  The stamp is a THREAD-LOCAL set at the derivation and
+	 * read at the record, with nothing in between to bound it: left standing,
+	 * the next freeze on this thread whose @len is a LITERAL (cds_ft_remove's
+	 * "1 = SOLE entry", the detach's forwarded count) inherits whatever site
+	 * last called ft_hlist_chain_len and is filed under ITS name.  That is a
+	 * misattribution the table cannot show, so consume the stamp here and let
+	 * a genuinely unstamped site read "(unstamped)".
+	 */
+	ft_hlist_why_fn = NULL;
+	ft_hlist_why_line = 0;
 }
 
 # define FT_HLIST_WHY_STAMP()						\
 	((void) (ft_hlist_why_fn = __func__),				\
 	 (void) (ft_hlist_why_line = __LINE__))
-# define FT_HLIST_WHY_TAIL(ft, head)		ft_hlist_why_tail((ft), (head))
+# define FT_HLIST_WHY_TAIL(ft, txn, head)	ft_hlist_why_tail((ft), (txn), (head))
 #else
 # define FT_HLIST_WHY_STAMP()			((void) 0)
-# define FT_HLIST_WHY_TAIL(ft, head)		do { (void) (head); } while (0)
+# define FT_HLIST_WHY_TAIL(ft, txn, head)	do { (void) (head); } while (0)
 #endif
 
 static inline
@@ -1035,7 +1171,7 @@ void ft_hlist_freeze_chain_prepare(const struct cds_ft *ft, struct urcu_txn *txn
 		}
 		if (!((uintptr_t) succ & FT_HLIST_MARK)) {
 			if (i + 1 == len)
-				FT_HLIST_WHY_TAIL((struct cds_ft *) ft, head);
+				FT_HLIST_WHY_TAIL((struct cds_ft *) ft, txn, head);
 			ret = ft_hlist_store_chain(ft, txn, (void **) &head->next,
 					succ, ft_hlist_set_mark(succ),
 					FT_HLIST_TAG);

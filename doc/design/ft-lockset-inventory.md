@@ -1070,6 +1070,12 @@ spacings, NO_FEATURE_FT_SKIP_COMPRESSED 6/6.
 
 ### 11.9 The duplicate CHAIN class: step 1 is DONE, step 2 was ATTEMPTED and REFUTED
 
+☞ **Read the 2026-09-19 subsections at the end before the middle ones.** The
+first verdict recorded there ("the exclusion does not exist") was taken from a
+witness that cannot see a registered hold, and has been WITHDRAWN and
+re-measured. The flip is still parked, for a shorter and differently-placed
+list of reasons.
+
 Mathieu's design for this class is two steps: *"add the missing lock acquire of
 nearest parent -- in some cases those may already be held.  Once this is
 thorough, ONLY THEN can we switch the chain mutation ops to SW."*  Under the
@@ -1152,45 +1158,106 @@ One RED was seen with the attempt in tree -- ft_inv per-node on
 `urcu_txn_install_mw_depth`. It did NOT reproduce (3 runs with the flip, 3 with
 it compiled out, 6/6 GREEN), so it is recorded, not attributed.
 
-#### ☠☠ THE CLASS CANNOT PARK: THE EXCLUSION IT WOULD RELY ON DOES NOT EXIST
+#### ☠☠ THE FIRST VERDICT WAS A WRONG ZERO, AND IT HAS BEEN WITHDRAWN
 
 The flip was built, measured GREEN (ft_unit 361/361, ft_inv 152/152, per-node
-AND exponential) and **taken back out**. Green was not evidence.
+AND exponential) and **taken back out**. That part stands: green was not
+evidence, and the `UNHELD = 0` that licensed it is a UNION-OF-WITNESSES zero
+(txn registry, per-thread ledger, lock ctx -- a row scores HELD if ANY of them
+sees a hold, while a park is licensed by the registry alone).
 
-MATHIEU's framing is the right one and it is what exposed this: *"the duplicate
-chain is under a lock, so it should just become an SW list"*. Correct -- and the
-premise is false. The audit that licensed it, `UNHELD = 0`, is a UNION of three
-witnesses (txn registry, per-thread ledger, lock ctx): a row scores HELD if ANY
-of them can see a hold. Asked instead for a **POSITIVE CLAIM** --
-`cds_ft_metadata.dbg_owner_tid`, which the ledger SETS when an op takes a member
-and CLEARS when it drops it -- the answer inverts.
+What does **not** stand is the reading that replaced it. On 2026-09-19 the same
+question was asked of a POSITIVE claim -- `cds_ft_metadata.dbg_owner_tid` --
+and read `US = 0` over ~27,000 events at both spacings, which was written up as
+*"cds_ft_remove holds NOTHING; the chain SW flip is blocked on locking"*.
 
-Measured at the moment `ft_hlist_freeze_chain_prepare` records its tail against a
-word that disagrees with the caller's derivation, per ft_inv per-node leg:
+**That instrument cannot see a registered hold**, and the tree had already said
+so in two places:
 
-| `len` derived at | disagree | holder claimed by US | by a PEER | by NOBODY, under FINE |
+* `ft_flip_txn_record_release_lock` calls `ft_hold_trace_drop()` -- which
+  **yields the stamp** -- the moment it RECORDS the release. The note beside it
+  spells out the consequence: *"the ledger is not a hold count, it is an
+  OUTSTANDING-RELEASE count ... a site that acquires a word and immediately
+  records its {LOCK|s->s} terminal reads as ledger-EMPTY from then on, while
+  the lock is still set on the word and still owned, by the commit rather than
+  by the frame. Reading BARE as exposure would invert the meaning of the
+  conversion this instrument exists to measure."* Every `lock_or_guard` hoist
+  has exactly that shape.
+* the duplicate-chain canary's own header prices it numerically: the chain hold
+  audit measures **`ft_detach_node` at REG = 2,579,201 / LED = 0**, *"so a
+  ledger-only verdict calls every one of those holds a violation"*.
+
+`US = 0` beside `ft_chain_node`'s 2.6M was read as proof the instrument works.
+It is the opposite: `ft_chain_node` takes the holder into a **stack**
+`ft_held_anchor` and keeps it, so its stamp survives; every converted,
+registry-held site drops its stamp at the acquire. The asymmetry *is* the
+blindness.
+
+#### ☑ RE-MEASURED WITH THE WITNESSES SIDE BY SIDE (2026-09-19, later)
+
+`-DFT_DEBUG_HLIST_TAIL_WHY` now reports the REGISTRY (`ft_flip_txn_owns` on the
+`ft_flip_txn` whose handle the freeze was given) and the LEDGER **at the same
+event**, in one run -- not a second run at a second point, which is how an
+unmatched control gets read as a result. The stamp plumbing is self-checked:
+the classifier counts a stamped wrapper whose handle is not the handle the
+record is going into (`stale = 0`, `no ftxn = 0` in every leg below).
+
+The two sole-entry `ft_detach_node` call sites are now STAMPED, so the rows are
+named rather than reasoned into a `(unstamped)` bucket.
+
+ft_inv, `-O2 -g -DNDEBUG`, 152/152 green at both spacings:
+
+| `len` derived at | disagree (per-node / exp) | **REGISTRY owns** | LEDGER | peer CLAIMS |
 |---|---|---|---|---|
-| `cds_ft_remove` sole path (`ft-remove.h:7960`/`:8200`) | 15,331 | **0** | 0 | **15,331** |
-| `_cds_ft_insert_replace:5160` | 11,647 | **0** | **579** | **11,068** |
-| `_cds_ft_remove_all_locked:9289` | 365 | **0** | 0 | **365** |
-| `_cds_ft_remove_all_locked:9074` / `:8796`, `_cds_ft_insert_replace:5018` | **0** | | | |
+| `_cds_ft_remove_locked:8211` (internal holder, sole entry) | 10,157 / 16,219 | **100% / 100%** | 0 | 0 |
+| `_cds_ft_remove_locked:7969` (compressed holder, sole entry) | 8 / 37 | **0% / 100%** | 0 | 0 |
+| `_cds_ft_remove_all_locked:9301` | 347 / 523 | 37% / 62% | 0 | 0 |
+| `_cds_ft_insert_replace:5160` | 13,683 / 14,337 | 22% / 22% | 0 | **834 / 1,094** |
 
-`US = 0` exactly, over ~27,000 events at BOTH spacings, from an instrument that
-demonstrably works (it scores `ft_chain_node` at 2.6M holds). The NOBODY column
-is split by mode and is **100% FINE** -- coarse 0, exclusive 0, FT-wide-lock 0 --
-so it is not a configuration that has no locks by design.
+**LEDGER = 0 on every row at both spacings**, including the rows the registry
+owns outright -- the demonstration, at matched points, that the stamp was
+reporting *"this hold was registered"* and not *"there is no hold"*.
 
-☠ **AND `cds_ft_remove` HOLDS NOTHING AT ALL.** Its holder acquire lives inside
-`#ifdef FT_RM_REVALIDATE` (ft-remove.h:7657-7783), a macro defined in no build,
-no gate config and not in configure.ac. The comment immediately below it states
-the shipping disposition outright: *"@holder_flag is now fully derived and
-NOTHING is held."* The MW expected-old has been carrying this path's exclusion.
+`ft_flip_txn_owns` is EXACT at per-node and conservative above it (a coarser
+anchor is held while the owner itself is absent), so these percentages are
+**lower bounds** on ownership, which is the right direction for licensing a
+park: a registry HIT is a positive licence, a registry MISS is inconclusive and
+owes the ctx witness before it is called a gap.
 
-☠ **THE EXCLUSION ORACLE'S SILENCE IS NOT A CLEARANCE.** The same run reported
-**0 EXCLUSION VIOLATIONS**. `ft_owner_stamp_claim` fires when two ops CLAIM one
-member -- it is structurally blind to a writer that never claims, which (given
-`US = 0`) is exactly what these paths do. An oracle that detects double-claim
-cannot detect single-claim.
+ft_unit reads DISAGREE = 0 on every row -- the class is only visible under
+ft_inv's concurrency, so ft_unit cannot certify it either way.
+
+#### What this changes about the work list
+
+* **The 09-19 "SCOPE question" for `cds_ft_remove`'s holder lock is not the
+  work.** It was posed because the op appeared to hold nothing at the freeze;
+  it holds the holder at 100% of the sole path's disagreements. Nothing here
+  argues for widening a hold across the op -- the disposition measured at
+  20/41 hangs under `FT_RM_REVALIDATE` stays refuted and stays unneeded.
+* `cds_ft_remove`'s own acquire really is dead code (`#ifdef FT_RM_REVALIDATE`,
+  defined in no build). That static fact is unchanged and remains worth
+  deciding or deleting -- but it is about *that* acquire, not about whether the
+  chain freeze is covered: the freeze rides `ft_detach_node`'s commit, and it
+  is the detach's lock set that covers it.
+* ☐ **The sole path's remaining discriminator, and it has not been run.** We
+  own the holder at the record, and a duplicate is there anyway. Either the
+  append COMMITTED BEFORE our acquire -- a STALE PLAN, since `@len` is the
+  literal `1` derived from an unheld read of `@succ_node`, exactly what
+  `ft_hlist_chain_len`'s header forbids ("☠ CALL IT UNDER THE CHAIN HOLDER"),
+  cured by re-validating the sole-entry claim under the lock with a retriable
+  bail -- or it landed AFTER, which is an exclusion gap on the APPENDER's side
+  (`ft_hlist_insert_after_prepare:529`, the producer the canary names for
+  100% of them). **The discriminator is a snapshot of the tail word taken at
+  the holder acquire.** Both cures are local; neither is a scope change.
+* ☐ `_cds_ft_insert_replace:5160` is now the strongest real gap: 78%
+  registry-unowned, plus 834 / 1,094 events where a **peer positively claims**
+  the holder while this op records into that chain. A stack hold is what the
+  ledger CAN see, so that column does not explain away.
+* ☐ `_cds_ft_remove_all_locked:9301`: 63% / 38% registry-unowned.
+* ☐ The **8** per-node events at `:7969` the registry does not own, when
+  `:8211` is 100% and both exponential rows are 100%. Small is not zero and a
+  tolerated residue is not a licence.
+
 
 #### What the flip costs, so the next attempt does not rediscover it
 
@@ -1204,7 +1271,10 @@ abort and `new_ptr` on commit, BLIND, and an SW record always parks):
    wrote through `caa_container_of` from the slot and corrupted the heap within
    seven tests, "corrupted size vs. prev_size".)
 2. `ft_hlist_freeze_chain_prepare`'s TAIL, whose derived NULL detects a duplicate
-   appended since the caller counted `@len` -- live at ~27k/leg, above.
+   appended since the caller counted `@len` -- live at ~24k/leg, above. ☞ On
+   the sole-entry path this is the arbitration that absorbs the stale plan
+   today: the commit loses its install CAS and the caller re-derives. Parking
+   removes it, which is why that path owes the under-lock re-validation.
 3. Five structural expected-olds that are arguments rather than loads
    (`succ->prev <- pos`, `pred->next <- elem`, `next->prev <- elem`, and
    replace's two). MEASURED with `-DFT_DEBUG_HLIST_EXPECTED_OLD`: **0
@@ -1220,7 +1290,18 @@ abort and `new_ptr` on commit, BLIND, and an SW record always parks):
   ☠ Keyed on the slot, never on a field inside the node: a chain store's slot is
   not always inside a live `cds_ft_node` (see (1) above).
 - `-DFT_DEBUG_HLIST_TAIL_WHY` -- interns the `len` DERIVATION site, counts tail
-  disagreements, and reports the holder's positive claim split by trie mode.
+  disagreements, and reports the holder's ownership by **all three witnesses at
+  the same event**: the ledger's positive claim (split by trie mode), the
+  per-thread ledger asked directly, and the txn REGISTRY. ☠ It reports them
+  together on purpose: a single-witness verdict on this question has now been
+  wrong in both directions, the union reading it HELD and the stamp reading it
+  UNHELD. The registry source is stamped in `ft_flip_txn_handle()` -- the one
+  place a `*_prepare` caller converts its wrapper into the engine handle -- and
+  the classifier VERIFIES the stamp against the handle the record is going into
+  rather than trusting it (`stale`, `no ftxn` columns).
+  ☠ The derivation stamp is CLEARED once consumed: left standing, the next
+  freeze on the same thread whose `@len` is a literal is filed under whatever
+  site last called `ft_hlist_chain_len`.
 
 ## 12. API / design questions queued by Mathieu (2026-09-17)
 
