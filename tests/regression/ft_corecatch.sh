@@ -41,7 +41,7 @@
 #
 #   -b BUILD   build directory (default: the repo root -- an in-tree build).
 #              A gate per-config tree works as-is and is the usual target:
-#              -b ${TMPDIR:-/tmp}/ft-parallel-gate-$UID/anchorval
+#              -b $HOME/.cache/ft-parallel-gate/anchorval
 #   -t SUITE   inv (default) | unit
 #   -s SPACING per-node (default) | exponential | root-only
 #   -f FILTER  test-name filter, passed as argv[1] to the suite (both

@@ -28,8 +28,21 @@
 #
 # Env:
 #   FT_GATE_DIR  per-config tree copies live here   (default:
-#                ${TMPDIR:-/tmp}/ft-parallel-gate-$UID -- OUTSIDE the
-#                repo so the GB of copies never pollute git status)
+#                $HOME/.cache/ft-parallel-gate -- OUTSIDE the repo so the
+#                GB of copies never pollute git status)
+#
+#                ☠ AND NOT UNDER /tmp, WHICH IS A tmpfs ON THIS CLASS OF
+#                BOX.  The matrix keeps one CONFIGURED SOURCE TREE PER
+#                CONFIG -- fourteen of them, several GB in total -- so the
+#                old ${TMPDIR:-/tmp} default spent that out of RAM, on top
+#                of whatever the legs themselves were caged for.  Measured
+#                2026-09-18: a single default-dir gate run filled a 378 GB
+#                tmpfs that already held 138 GB, and every subsequent
+#                command on the box failed ENOSPC -- including the ones
+#                needed to clean it up.  A disk-backed default costs one
+#                rsync's worth of I/O and cannot take the machine with it.
+#                Override it to a tmpfs deliberately if you want the speed
+#                and have measured the room.
 #   FT_GATE_J    make -j per config                 (default: cores/12,
 #                so nconfigs*J stays near the core count)
 #   FT_GATE_SPACINGS  lock spacings to run every config at (default
@@ -82,7 +95,8 @@
 set -u
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
-GATE=${FT_GATE_DIR:-${TMPDIR:-/tmp}/ft-parallel-gate-$(id -u)}
+# Disk-backed by default, NEVER $TMPDIR: see the FT_GATE_DIR note above.
+GATE=${FT_GATE_DIR:-${HOME:-$(getent passwd "$(id -u)" | cut -d: -f6)}/.cache/ft-parallel-gate}
 NCPU=$( (nproc 2>/dev/null || echo 8) )
 J=${FT_GATE_J:-$(( NCPU/12 > 3 ? NCPU/12 : 4 ))}
 mkdir -p "$GATE"
