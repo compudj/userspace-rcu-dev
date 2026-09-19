@@ -70,6 +70,21 @@ enum ft_word_excl {
 	FT_EXCL_LOCKED,		/* the op holds the owner (per-node or FT-wide) */
 };
 
+/*
+ * THE RAW-PRODUCER CANARY TAG.  Defined here rather than beside the table in
+ * ft-txn-hlist.h because the producers it tags live in files included BEFORE
+ * that one, and a macro -- unlike the audit arms above -- cannot be forward
+ * declared.  The single TU resolves the function.
+ */
+#ifdef FT_DEBUG_CHAIN_CANARY
+static void ft_chain_canary_stamp_at(const char *fn, int line, void **slot,
+		bool raw);
+# define FT_CHAIN_CANARY_RAW(slot)					\
+	ft_chain_canary_stamp_at(__func__, __LINE__, (void **) (slot), true)
+#else
+# define FT_CHAIN_CANARY_RAW(slot)	do { (void) (slot); } while (0)
+#endif
+
 #ifdef FT_DEBUG_CHAIN_HOLD
 /*
  * The duplicate-chain hold audit lives in ft-mutation-helpers.h (it needs the
@@ -1891,10 +1906,12 @@ void ft_publish_external_nodes_prev(struct cds_ft *ft,
 	 * not held here, the write lands regardless.
 	 */
 	ft_ch_audit_head(ft, external_nodes, node_flag);
-	if (ft->ordered_list)
+	if (ft->ordered_list) {
 		ft_ord_cell_set_parent(external_nodes, word);
-	else
+	} else {
+		FT_CHAIN_CANARY_RAW(&external_nodes->prev);
 		rcu_assign_pointer(external_nodes->prev, word);
+	}
 	FT_TP(set_parent, (const void *) external_nodes, (const void *) word);
 }
 
@@ -4352,10 +4369,12 @@ void ft_set_parent_at(const char *fn, int line, struct cds_ft *ft,
 		ft_head_stamp_incoming_byte(ft, en, parent_nf, slot);
 		/* Same word class as the prefix-head store above. */
 		ft_ch_audit_head_at(fn, line, ft, en, parent_nf, excl);
-		if (ft->ordered_list)
+		if (ft->ordered_list) {
 			ft_ord_cell_set_parent(en, word);
-		else
+		} else {
+			FT_CHAIN_CANARY_RAW(&en->prev);
 			rcu_assign_pointer(en->prev, word);
+		}
 		return;
 	}
 	{

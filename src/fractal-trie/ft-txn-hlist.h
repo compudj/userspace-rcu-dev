@@ -216,6 +216,7 @@ struct ft_canary_ent {
 	void **slot;
 	const char *fn;
 	int line;
+	bool raw;		/* last writer bypassed the record layer */
 	unsigned long tid;
 };
 extern struct ft_canary_ent ft_canary_tab[FT_CANARY_SLOTS];
@@ -232,15 +233,66 @@ unsigned int ft_canary_hash(const void *slot)
 	return (unsigned int) (v & (FT_CANARY_SLOTS - 1));
 }
 
+/*
+ * ☞ THE SW-vs-RAW SLOT MIX, which is the question the flip actually turns on.
+ *
+ * rcu-txn.h's rule is "a slot is SW xor MW, GLOBALLY".  A RAW store -- one that
+ * never reaches the engine -- is outside that rule entirely: it cannot be
+ * parked, and if the same SLOT is also written through the record layer then
+ * the day that layer parks SW, the raw store and the settle race on one word.
+ * Reading the call graph cannot answer this, because a node's role changes: the
+ * same cds_ft_node.prev is a HEAD's back edge (written raw) at one moment and a
+ * chain MEMBER's prev (recorded) at another.
+ *
+ * The canary is keyed BY SLOT, so it can answer it directly: tag each entry
+ * with whether its last writer was raw, and count the transitions.  A non-zero
+ * count in either direction means one address is written both ways and the
+ * flip's hazard is LIVE; zero means the two populations are disjoint.
+ *
+ * ☠ Counted only on a canary HIT (e->slot == slot).  The table is lossy by
+ * design -- one open-addressed probe, last writer wins -- so a miss is an
+ * evicted entry, not a transition, and scoring it would manufacture a mix.
+ */
+extern unsigned long ft_canary_mix_raw_after_rec, ft_canary_mix_rec_after_raw,
+	ft_canary_raw_stores, ft_canary_rec_stores;
+unsigned long ft_canary_mix_raw_after_rec, ft_canary_mix_rec_after_raw,
+	ft_canary_raw_stores, ft_canary_rec_stores;
+
 static inline
-void ft_chain_canary_stamp(const char *fn, int line, void **slot)
+void ft_chain_canary_stamp_at(const char *fn, int line, void **slot, bool raw)
 {
 	struct ft_canary_ent *e = &ft_canary_tab[ft_canary_hash(slot)];
 
+	if (raw)
+		uatomic_inc(&ft_canary_raw_stores);
+	else
+		uatomic_inc(&ft_canary_rec_stores);
+	if (e->slot == slot && e->raw != raw)
+		uatomic_inc(raw ? &ft_canary_mix_raw_after_rec
+				: &ft_canary_mix_rec_after_raw);
 	e->slot = slot;
 	e->fn = fn;
 	e->line = line;
+	e->raw = raw;
 	e->tid = (unsigned long) pthread_self();
+}
+
+static inline
+void ft_chain_canary_stamp(const char *fn, int line, void **slot)
+{
+	ft_chain_canary_stamp_at(fn, line, slot, false);
+}
+
+static void ft_canary_mix_report(void) __attribute__((destructor));
+static void ft_canary_mix_report(void)
+{
+	fprintf(stderr, "FT CHAIN SLOT-MIX (one address written BOTH ways -- "
+		"must be 0 for the SW flip): raw_after_recorded=%lu "
+		"recorded_after_raw=%lu  | raw stores=%lu recorded=%lu\n",
+		uatomic_read(&ft_canary_mix_raw_after_rec),
+		uatomic_read(&ft_canary_mix_rec_after_raw),
+		uatomic_read(&ft_canary_raw_stores),
+		uatomic_read(&ft_canary_rec_stores));
 }
 
 /* NULL when the word has never been stored through a chain store helper. */
@@ -254,6 +306,8 @@ const struct ft_canary_ent *ft_chain_canary_of(void **slot)
 
 # define FT_CHAIN_CANARY_STAMP(fn, line, slot)				\
 	ft_chain_canary_stamp((fn), (line), (void **) (slot))
+/* FT_CHAIN_CANARY_RAW is declared in ft-helpers.h: the raw producers live in
+ * files this one is included AFTER, so the macro has to exist before here. */
 #else
 # define FT_CHAIN_CANARY_STAMP(fn, line, slot)		do { } while (0)
 #endif
