@@ -20548,6 +20548,15 @@ enum urcu_txn_status ft_glue_txn_commit_replace(struct cds_ft *ft,
 unsigned long ft_ss_store_all, ft_ss_store_wlock, ft_ss_store_bulk,
 	ft_ss_store_excl;
 /*
+ * ☠ AND THE SAME FOUR FOR THE *OTHER* STORE IN THAT LOOP.  The counters above
+ * score ft_hlist_store_sw on &src_head->prev; ft_hlist_append_run_prepare
+ * writes &tail->next two lines later, against a LITERAL NULL its own header
+ * calls "the serializing one".  Its exclusion has been resting on the prev
+ * store's numbers -- a NEIGHBOUR's measurement, which is exactly the move that
+ * has produced wrong zeros on this branch twice.  Score it where it happens.
+ */
+unsigned long ft_ss_run_all, ft_ss_run_wlock, ft_ss_run_bulk, ft_ss_run_excl;
+/*
  * ☠ PER CALL SITE.  ft_glue_record_splices has THREE callers -- the merge, the
  * same-trie ATOMIC rekey and the cross-trie STAGED rekey -- and only the staged
  * one has a ft_writer_lock_gp_wait anywhere under it (ft-rekey.h:9376, :9902,
@@ -20582,6 +20591,12 @@ static void ft_ss_report(void)
 		uatomic_read(&ft_ss_store_excl),
 		uatomic_read(&ft_ss_seam_all),
 		uatomic_read(&ft_ss_seam_in_window));
+	fprintf(stderr, "FT SPLICE-SEAM append_run (&tail->next, the serializing "
+		"NULL): stores=%lu wlock=%lu bulkdepth=%lu excl=%lu\n",
+		uatomic_read(&ft_ss_run_all),
+		uatomic_read(&ft_ss_run_wlock),
+		uatomic_read(&ft_ss_run_bulk),
+		uatomic_read(&ft_ss_run_excl));
 	fprintf(stderr, "FT SPLICE-SEAM sites (collided/called): merge=%lu/%lu "
 		"rekey_atomic=%lu/%lu rekey_staged=%lu/%lu\n",
 		uatomic_read(&ft_ss_site_merge),
@@ -21032,6 +21047,16 @@ void ft_glue_record_splices(struct cds_ft *ft, struct ft_glue *g,
 		 * expectation.
 		 */
 		FT_HLIST_PLAN_OBSERVE(ft, ft_flip_txn_handle(txn), tail, 1, 4);
+#ifdef FT_DEBUG_SPLICE_SEAM
+		/* Matched point: this store's OWN window, not the prev store's. */
+		uatomic_inc(&ft_ss_run_all);
+		if (ft_wlock_held == ft)
+			uatomic_inc(&ft_ss_run_wlock);
+		if (ft_bulk_self_depth)
+			uatomic_inc(&ft_ss_run_bulk);
+		if (ft->exclusive)
+			uatomic_inc(&ft_ss_run_excl);
+#endif
 		ft_hlist_append_run_prepare(ft, ft_flip_txn_handle(txn), tail, src_head);
 	}
 }
