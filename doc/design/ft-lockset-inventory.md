@@ -1068,7 +1068,36 @@ ft_inv leg:
 Gate 18/18 GREEN, probe tree with the owner assert armed 6/6 at the three
 spacings, NO_FEATURE_FT_SKIP_COMPRESSED 6/6.
 
-### 11.9 The duplicate CHAIN class: step 1 is DONE, step 2 was ATTEMPTED and REFUTED
+### 11.9 The duplicate CHAIN class: CONVERTED (2026-09-19)
+
+☑ **THE CLASS PARKS SW BY DEFAULT.** `cds_ft_node.next` / `.prev` dispatch
+`urcu_txn_store_sw` unconditionally; `-DNO_FEATURE_FT_CHAIN_SW` builds the MW
+arm back as an ablation, and the gate runs it (config `chainmw`, with `imw`,
+because the property the flip changes — an SW abort writes `old_ptr` back blind
+where a failed MW CAS writes nothing — is a multi-writer phenomenon).
+
+Proof the default parks, not merely that it compiles (`-DFT_DEBUG_TXN_KIND`,
+ft_inv per-node): chain **MW = 0, SW = 14,600,409**, against MW = 13,629,079 /
+SW = 1,346,661 on the ablation arm. This is the largest conversion in the tree.
+
+**Gate, 20 legs, all green with matched plans**: default and ablation, ft_inv
+153/153 + ft_unit 361/361 at all three spacings (12); the six same legs under
+`--enable-rcu-debug`, which arms the engine's nine `urcu_assert_debug`
+self-checks *including* the SW/MW-kind-conflict-on-one-slot detector — silent
+throughout, and its arming verified by a two-line TU rather than assumed;
+`NO_FEATURE_FT_SKIP_COMPRESSED` ft_inv 153/153 + ft_unit 361/361, the config
+where the 09-17 attempt saw its one unreproduced red.
+
+☠ **READ THE HISTORY BELOW BEFORE TOUCHING THIS.** The class was attempted and
+withdrawn TWICE, and *both attempts gated green*. On this surface a green gate
+has twice been produced by an instrument that could not see, so what licenses
+the conversion is the six refutations being PAID — each by a measurement,
+recorded in `ft_hlist_store_chain_at`'s header — and the gate is the last check
+rather than the argument.
+
+---
+
+#### The history: step 1 is DONE, step 2 was ATTEMPTED and REFUTED
 
 ☞ **Read the 2026-09-19 subsections at the end before the middle ones.** The
 first verdict recorded there ("the exclusion does not exist") was taken from a

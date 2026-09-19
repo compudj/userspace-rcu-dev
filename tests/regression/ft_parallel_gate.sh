@@ -294,6 +294,18 @@ ALL_CONFIGS=(
 	# control as a result.
 	"spacingenv|-DFEATURE_FT_LOCK_SPACING_ENV -DFEATURE_FT_LOCK_SPACING_ROOT_ONLY|u ion ioff imw|per-node exponential root-only"
 	"noskip|-DNO_FEATURE_FT_SKIP_COMPRESSED|u ioff"
+	# ★ THE DUPLICATE CHAIN'"'"'S MW ABLATION.  cds_ft_node.next/.prev park SW by
+	# default; this builds the MW arm back.  It is here so the arm cannot ROT:
+	# -DNO_FEATURE_FT_MERGE went unbuildable for fourteen commits precisely
+	# because no config compiled it, and an ablation nobody builds is worthless
+	# exactly when a bisect needs it.
+	#
+	# ☠ It needs imw.  The property the flip changes is what happens when a
+	# commit ABORTS -- an SW record parks and its abort writes old_ptr back
+	# blind, where a failed MW CAS writes nothing -- and aborts are a
+	# multi-writer phenomenon.  A leg without concurrent writers cannot tell
+	# the two arms apart at all.
+	"chainmw|-DNO_FEATURE_FT_CHAIN_SW|u ion ioff imw"
 	"nocompress|-DNO_FEATURE_FT_COMPRESS|u ioff"
 	# Concurrent legs are SAFE here since the in-place tier became runtime
 	# gated on ft->exclusive: on a shared trie every one of these builds

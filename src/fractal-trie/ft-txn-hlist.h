@@ -361,117 +361,67 @@ int ft_hlist_store_chain_at(const char *fn, int line, const struct cds_ft *ft,
 		void **slot, void *old_ptr, void *new_ptr, uintptr_t tag)
 {
 	/*
-	 * ☠ PARKED: STILL MW UNDER FINE, AND THE REASON IS AN EXCLUSION GAP,
-	 * NOT A MISSING DISPATCH.
+	 * ☑ THIS CLASS PARKS.  cds_ft_node.next / .prev are SW by default; the
+	 * MW arm below is an ABLATION (-DNO_FEATURE_FT_CHAIN_SW), not a
+	 * fallback.
 	 *
-	 * The class was flipped to unconditional SW and it measured GREEN
-	 * (ft_unit 361/361, ft_inv 152/152, per-node and exponential).  It was
-	 * taken back out, because green was not evidence: the flip's licence is
-	 * "the duplicate chain is protected by the NEAREST ANCESTOR LOCK", and
-	 * that premise does not hold yet.
+	 * It is the largest conversion in the tree -- 14.5M stores per ft_inv
+	 * leg, an order of magnitude above every row of the §11.6 residue and
+	 * ~4.5x the ordered-cell list it used to be counted inside -- and it was
+	 * ATTEMPTED AND WITHDRAWN TWICE before this.  Both attempts gated GREEN.
+	 * That is the single most important thing to know before touching any of
+	 * it: on this surface a green gate has twice been produced by an
+	 * instrument that could not see, so the conversion rests on the six
+	 * refutations below being PAID, each by a measurement, and the gate is
+	 * only the last check rather than the argument.
 	 *
-	 * ☠ THE `UNHELD = 0` THAT LICENSED IT IS A UNION-OF-WITNESSES ZERO.  The
-	 * chain hold audit scores HELD if ANY of the txn registry, the per-thread
-	 * ledger or the lock ctx can see a hold, and a park is licensed by the
-	 * REGISTRY alone.  That objection stands and is why the flip came out.
+	 *   1 KIND PER SLOT, NOT PER TXN.  The dispatch is unconditional.  The
+	 *     2026-09-17 attempt asked ft_flip_txn_owns per prepare, and the
+	 *     three point ops take the holder into a STACK ft_held_anchor BEFORE
+	 *     the content txn exists -- empty registry, so they could only answer
+	 *     MW while the structural sites answered SW.  One slot, two kinds, by
+	 *     construction, against rcu-txn.h's "a slot is SW xor MW, GLOBALLY".
+	 *     The engine's own kind-conflict assert is silent under
+	 *     --enable-rcu-debug across six legs.
 	 *
-	 * ☠☠ BUT THE POSITIVE-CLAIM PROBE THAT REPLACED IT IS WRONG THE OTHER
-	 * WAY, AND ITS READING HAS BEEN WITHDRAWN.  That probe asked
-	 * cds_ft_metadata.dbg_owner_tid -- "who claims the holder right now" --
-	 * and read US = 0 of ~28,000 at both spacings, which was recorded here as
-	 * "these paths never claim the holder".  The stamp is maintained by the
-	 * hold LEDGER, and ft_flip_txn_record_release_lock calls
-	 * ft_hold_trace_drop() -- which YIELDS the stamp -- the moment it RECORDS
-	 * the release.  Every site that acquires a word and immediately plants its
-	 * {LOCK|s -> s} terminal, which is precisely what the lock-or-guard hoists
-	 * do, therefore reads US = 0 from the instant it acquires, while the word
-	 * still carries FT_STATE_LOCK and is still owned -- by the commit rather
-	 * than by the frame.  The tree already priced this twice: the ledger "is
-	 * not a hold count, it is an OUTSTANDING-RELEASE count"
-	 * (ft-mutation-helpers.h), and the canary's own header above measures the
-	 * chain hold audit at ft_detach_node REG = 2,579,201 / LED = 0.
+	 *   2 THE TREE'S GATE WAS A COUNTER READING ZERO, never "this is safe".
+	 *     Every converted freeze site's plan-stale counter reads 0; the two
+	 *     that are not converted are measured UNREACHED (0 of 0), which is a
+	 *     coverage statement and is labelled as one.
 	 *
-	 * ☑ RE-MEASURED WITH BOTH WITNESSES AT THE SAME EVENT (one run, so no
-	 * unmatched control), -DFT_DEBUG_HLIST_TAIL_WHY, ft_inv, per-node and
-	 * exponential.  LEDGER = 0 on EVERY row at BOTH spacings -- so the stamp
-	 * was reporting "this hold was registered", not "there is no hold":
+	 *   3 AN SW ABORT WRITES.  urcu_txn_settle stores old_ptr back BLIND, so
+	 *     an expected-old that is a caller's BELIEF becomes a published lie.
+	 *     FT_CHAIN_OLD converts the five of them to loads under this same
+	 *     switch, so the two can never drift apart.
 	 *
-	 *   len derived at            disagree   REGISTRY owns   peer CLAIMS
-	 *   _cds_ft_remove_locked:8211  10,157 /  16,219   100% /  100%     0
-	 *   _cds_ft_remove_locked:7969       8 /      37     0% /  100%     0
-	 *   _cds_ft_remove_all_locked:9301 347 /     523    37% /   62%     0
-	 *   _cds_ft_insert_replace:5160 13,683 /  14,337    22% /   22%   834 / 1,094
+	 *   4 THE SERIALIZING NULL ON THE APPEND SIDE (ft_hlist_append_run_
+	 *     prepare) was missed entirely last time.  It had ZERO concurrent
+	 *     coverage until a colliding-key merge test was written for it; it
+	 *     now runs ~19k times per leg with 0 stale plans, every one inside a
+	 *     bulk window with the FT-wide lock held.
 	 *
-	 * Reproduced on a second pair of legs (11,111 / 23,382 at :8211, again
-	 * 100% / 100%).  ☠ AND THE TWO POSITIVE WITNESSES DO NOT CONTRADICT EACH
-	 * OTHER: "our registry owns it AND a peer claims it" -- which cannot both
-	 * be true, since ft_meta_lock_acquire refuses an already-LOCKed word -- is
-	 * **0 on every row at both spacings**.  So the peer claims below are
-	 * DISJOINT from our own holds and are not an artefact of reading two
-	 * witnesses at once.
+	 *   5 A RE-READ UNDER THE LOCK MUST NOT BE READ-YOUR-OWN-WRITES.
+	 *     ft_hlist_chain_plan_ok uses urcu_txn_load_committed; the previous
+	 *     attempt's re-read used urcu_txn_load and in a fused commit read the
+	 *     txn's own pending value, i.e. nothing.
 	 *
-	 * The chain hold audit's own columns show the same split from the other
-	 * side, per ft_inv per-node leg: ft_detach_node:5153 REG 2,584,875 /
-	 * LED 0, against ft_chain_node:2993 REG 0 / LED 2,129,588.  The stack-held
-	 * shape is the one the stamp can see, and it is the MINORITY.
+	 *   6 A RAW STORE CANNOT BE PARKED.  The slot mix was measured by
+	 *     producer: every transition comes from writes to HIDDEN nodes (a
+	 *     fresh node's prev, written before publication), and the one raw
+	 *     producer that touches a LIVE chain word is measured unreachable --
+	 *     ☠ a coverage statement, so if it ever becomes reachable it must be
+	 *     converted to a recorded store, NOT re-argued (see
+	 *     ft_node_mark_removed_flip's header for the exact ordering hazard).
 	 *
-	 * ⇒ cds_ft_remove's SOLE-ENTRY path, the row the withdrawn reading named
-	 * as holding nothing, owns the chain's holder at 100% of its
-	 * disagreements, by the one witness a park is licensed by.  Since
-	 * ft_flip_txn_owns is EXACT at per-node and conservative above it, those
-	 * percentages are LOWER bounds on ownership.
-	 *
-	 * ☞ SO THE SOLE PATH'S DISAGREEMENT IS NOT AN UNHELD STORE, and the two
-	 * remaining histories need a different discriminator than this table:
-	 * either the append COMMITTED BEFORE we acquired the holder (a STALE PLAN
-	 * -- @len is a literal 1 derived from an unheld read of @succ_node, and
-	 * ft_hlist_chain_len's header already forbids counting unheld; the cure is
-	 * a re-validation of the sole-entry claim under the lock, with a retriable
-	 * bail), or it landed AFTER, which would be an exclusion gap on the
-	 * APPENDER's side.  ☐ The discriminator is a snapshot of the tail word
-	 * taken at the holder acquire; it has not been run.
-	 *
-	 * ☠ A PEER POSITIVELY OWNING THE HOLDER SURVIVES ALL OF THIS, at
-	 * _cds_ft_insert_replace:5160 (834-1,041 per-node / 1,094-1,143
-	 * exponential, two legs each, and DISJOINT from our own hold).  The
-	 * ledger can over-report a leaked entry but cannot invent a stack hold, so
-	 * this is a positive observation and does not explain away.  Under MW the
-	 * install CAS arbitrates it and the commit aborts.  An SW park cannot
-	 * lose, so the same shape becomes a blind store into a chain another
-	 * writer owns.
-	 *
-	 * ☠ AND THE EXCLUSION ORACLE'S SILENCE IS NOT A CLEARANCE.  The run
-	 * reported 0 EXCLUSION VIOLATIONS, but ft_owner_stamp_claim fires when
-	 * two ops CLAIM one member -- and it claims through the same ledger, so it
-	 * is blind to every registered hold for the same reason.
-	 *
-	 * ☞ WHAT THE FLIP COSTS, so the next attempt does not rediscover it: the
-	 * MW expected-old is load-bearing BEYOND arbitration in three places, and
-	 * each one becomes a write when the record parks --
-	 *   - ft_hlist_del_prepare derives &pred->next by LOADING @elem->prev, and
-	 *     a stale or head @pred points that slot into something that is not a
-	 *     live node.  The CAS rejects it today;
-	 *   - ft_hlist_freeze_chain_prepare's TAIL, whose derived NULL detects a
-	 *     duplicate appended since the caller counted @len;
-	 *   - the five structural expected-olds that are arguments rather than
-	 *     loads (measured: they always agree, so they are cheap to fix).
-	 *
-	 * Reinstating the flip means, in this order: run the acquire-time snapshot
-	 * that separates a stale plan from an appender gap on the sole path; close
-	 * _cds_ft_insert_replace:5160 (78% registry-unowned, plus the peer claims
-	 * above) and _cds_ft_remove_all_locked:9301; account for the 8 per-node
-	 * events at :7969 that :8211 and both exponential rows do not have (0 of 8
-	 * and 0 of 12 over two per-node legs, against 37/37 and 25/25 at
-	 * exponential -- reproducible, and per-node ONLY); re-run
-	 * this table to a measured zero UNOWNED -- on the REGISTRY, never on the
-	 * stamp -- and only then dispatch SW here unconditionally, never on a
-	 * per-txn predicate, which is what made the kind a property of the asking
-	 * transaction the first time.
+	 * ☞ WHAT IS STILL MW HERE, and stays: the ordinal CELL list
+	 * (ft_ord_cell.lnode) is [DESIGN] MW forever and does not come through
+	 * this function at all.
 	 *
 	 * ☞ COARSE RECORDS SW, WHATEVER THE WORD IS.  A coarse trie takes the
 	 * FT-wide @writer_lock at its outermost writer scope, so every writer of
 	 * every chain and cell word is serialised behind one mutex -- there is no
-	 * peer CAS for an SW park to race.
+	 * peer CAS for an SW park to race.  That arm predates the flip and is
+	 * unchanged by it.
 	 */
 	if (ft && !ft->lock_fine) {
 		FT_HLIST_COARSE_TALLY(1);
@@ -495,9 +445,9 @@ int ft_hlist_store_chain_at(const char *fn, int line, const struct cds_ft *ft,
 	FT_AB_ARM(FT_AB_CELL_HANDLE, FT_AB_OWN_NA);
 	FT_CH_COARSE(fn, line);
 	FT_CHAIN_CANARY_STAMP(fn, line, slot);
-#ifdef FT_CHAIN_SW
+#ifndef NO_FEATURE_FT_CHAIN_SW
 	/*
-	 * ★ THE FLIP.  Unconditional, and that is the point: the 2026-09-17
+	 * ★ THE FLIP, NOW THE DEFAULT.  Unconditional, and that is the point: the 2026-09-17
 	 * attempt dispatched on a per-TXN predicate, which made the kind a
 	 * property of the ASKING TRANSACTION rather than of the SLOT -- the
 	 * three point ops take the holder into a STACK ft_held_anchor before
@@ -523,9 +473,13 @@ int ft_hlist_store_chain_at(const char *fn, int line, const struct cds_ft *ft,
 	 *                           measured unreachable (see
 	 *                           ft_node_mark_removed_flip's header)
 	 *
-	 * ☠ OPT-IN, NOT DEFAULT.  Green was not evidence the last two times, so
-	 * this ships as an ablation arm both halves of the gate can run, and
-	 * making it the default is a separate decision with its own numbers.
+	 * ☠ THE MW ARM IS KEPT AS AN ABLATION, not as a fallback, and the gate
+	 * runs it (config "chainmw").  Two reasons, both learned here: a
+	 * conversion this size needs a control to bisect against, and an arm no
+	 * config builds ROTS -- NO_FEATURE_FT_MERGE went unbuildable for
+	 * fourteen commits with no gate to say so.  It is never selected at
+	 * runtime: the kind is a property of the SLOT, so a build either parks
+	 * this class or does not.
 	 */
 	FT_TK_COUNT_CHAIN_SW();
 	return urcu_txn_store_sw(txn, slot, old_ptr, new_ptr, tag);
@@ -566,7 +520,7 @@ int ft_hlist_store_chain_at(const char *fn, int line, const struct cds_ft *ft,
  * ft_hlist_chain_plan_ok is the opposite case and uses _committed for exactly
  * the opposite reason.)
  */
-#ifdef FT_CHAIN_SW
+#ifndef NO_FEATURE_FT_CHAIN_SW
 # define FT_CHAIN_OLD(txn, slot, believed, tag)				\
 	urcu_txn_load((txn), (void **) (slot), (tag))
 #else
