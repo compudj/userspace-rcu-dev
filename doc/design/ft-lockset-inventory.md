@@ -1152,20 +1152,75 @@ One RED was seen with the attempt in tree -- ft_inv per-node on
 `urcu_txn_install_mw_depth`. It did NOT reproduce (3 runs with the flip, 3 with
 it compiled out, 6/6 GREEN), so it is recorded, not attributed.
 
-#### The work list before this can be re-asked
+#### ☠☠ THE CLASS CANNOT PARK: THE EXCLUSION IT WOULD RELY ON DOES NOT EXIST
 
-1. Make every producer of `cds_ft_node.next` / a member's `.prev` reach the SAME
-   answer -- which means the point ops must REGISTER their holder hold on the
-   content txn (`ft_flip_txn_lock_register_held`), not hold it on the stack.
-   Until then the class stays MW.
-2. Discharge the raw producers in (6).
-3. Give `ft_hlist_append_run_prepare` the re-read, or prove its NULL is loaded
-   under the lock.
-4. Make the freeze re-reads non-RYW (`urcu_txn_load_committed`).
-5. Every store's expected-old must be LOADED, not derived -- including the three
-   `prev` back-edges -- because of (3).
-6. Then meet the tree's own gate: the unowned counter reads ZERO at every
-   spacing.
+The flip was built, measured GREEN (ft_unit 361/361, ft_inv 152/152, per-node
+AND exponential) and **taken back out**. Green was not evidence.
+
+MATHIEU's framing is the right one and it is what exposed this: *"the duplicate
+chain is under a lock, so it should just become an SW list"*. Correct -- and the
+premise is false. The audit that licensed it, `UNHELD = 0`, is a UNION of three
+witnesses (txn registry, per-thread ledger, lock ctx): a row scores HELD if ANY
+of them can see a hold. Asked instead for a **POSITIVE CLAIM** --
+`cds_ft_metadata.dbg_owner_tid`, which the ledger SETS when an op takes a member
+and CLEARS when it drops it -- the answer inverts.
+
+Measured at the moment `ft_hlist_freeze_chain_prepare` records its tail against a
+word that disagrees with the caller's derivation, per ft_inv per-node leg:
+
+| `len` derived at | disagree | holder claimed by US | by a PEER | by NOBODY, under FINE |
+|---|---|---|---|---|
+| `cds_ft_remove` sole path (`ft-remove.h:7960`/`:8200`) | 15,331 | **0** | 0 | **15,331** |
+| `_cds_ft_insert_replace:5160` | 11,647 | **0** | **579** | **11,068** |
+| `_cds_ft_remove_all_locked:9289` | 365 | **0** | 0 | **365** |
+| `_cds_ft_remove_all_locked:9074` / `:8796`, `_cds_ft_insert_replace:5018` | **0** | | | |
+
+`US = 0` exactly, over ~27,000 events at BOTH spacings, from an instrument that
+demonstrably works (it scores `ft_chain_node` at 2.6M holds). The NOBODY column
+is split by mode and is **100% FINE** -- coarse 0, exclusive 0, FT-wide-lock 0 --
+so it is not a configuration that has no locks by design.
+
+☠ **AND `cds_ft_remove` HOLDS NOTHING AT ALL.** Its holder acquire lives inside
+`#ifdef FT_RM_REVALIDATE` (ft-remove.h:7657-7783), a macro defined in no build,
+no gate config and not in configure.ac. The comment immediately below it states
+the shipping disposition outright: *"@holder_flag is now fully derived and
+NOTHING is held."* The MW expected-old has been carrying this path's exclusion.
+
+☠ **THE EXCLUSION ORACLE'S SILENCE IS NOT A CLEARANCE.** The same run reported
+**0 EXCLUSION VIOLATIONS**. `ft_owner_stamp_claim` fires when two ops CLAIM one
+member -- it is structurally blind to a writer that never claims, which (given
+`US = 0`) is exactly what these paths do. An oracle that detects double-claim
+cannot detect single-claim.
+
+#### What the flip costs, so the next attempt does not rediscover it
+
+The MW expected-old is load-bearing BEYOND arbitration in three places, and each
+becomes a WRITE once the record parks (`urcu_txn_settle` stores `old_ptr` on
+abort and `new_ptr` on commit, BLIND, and an SW record always parks):
+
+1. `ft_hlist_del_prepare` derives `&pred->next` by LOADING `@elem->prev`; a
+   stale or head `@pred` points that slot at something that is not a live node.
+   The CAS rejects it today. (Found the hard way: the canary's first spelling
+   wrote through `caa_container_of` from the slot and corrupted the heap within
+   seven tests, "corrupted size vs. prev_size".)
+2. `ft_hlist_freeze_chain_prepare`'s TAIL, whose derived NULL detects a duplicate
+   appended since the caller counted `@len` -- live at ~27k/leg, above.
+3. Five structural expected-olds that are arguments rather than loads
+   (`succ->prev <- pos`, `pred->next <- elem`, `next->prev <- elem`, and
+   replace's two). MEASURED with `-DFT_DEBUG_HLIST_EXPECTED_OLD`: **0
+   disagreements** over both suites and all three spacings, so these are cheap
+   and safe to convert to loads whenever the class does park.
+
+#### The instruments, all in tree and debug-gated
+
+- `-DFT_DEBUG_CHAIN_CANARY` -- records, per chain WORD, the (fn, line) of the
+  site that last stored it, in a side table keyed BY SLOT ADDRESS. It named the
+  producer of every surprise duplicate in one run
+  (`ft_hlist_insert_after_prepare`) after three witness-based attempts failed.
+  ☠ Keyed on the slot, never on a field inside the node: a chain store's slot is
+  not always inside a live `cds_ft_node` (see (1) above).
+- `-DFT_DEBUG_HLIST_TAIL_WHY` -- interns the `len` DERIVATION site, counts tail
+  disagreements, and reports the holder's positive claim split by trie mode.
 
 ## 12. API / design questions queued by Mathieu (2026-09-17)
 

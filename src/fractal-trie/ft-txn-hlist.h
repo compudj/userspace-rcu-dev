@@ -139,7 +139,7 @@
 /*
  * The duplicate-chain hold audit lives in ft-mutation-helpers.h (it needs the
  * per-thread hold ledger, which is defined there, and this header is included
- * well before it).  Declare the coarse arm so ft_hlist_store_mw_at can report;
+ * well before it).  Declare the coarse arm so ft_hlist_store_chain_at can report;
  * one TU, so the later definition resolves it.
  */
 static inline
@@ -173,23 +173,151 @@ static inline void ft_ch_audit_coarse_at(const char *fn, int line);
 # define FT_CH_COARSE(fn, line)	do { (void) (fn); (void) (line); } while (0)
 #endif
 
+/*
+ * ☞ THE DUPLICATE-CHAIN CANARY  (-DFT_DEBUG_CHAIN_CANARY)
+ *
+ * The governing rule for this class is "the duplicate chain is protected by the
+ * NEAREST ANCESTOR LOCK, period".  Asking whether a given op HELD that lock has
+ * proved unanswerable from inside the library: the three witnesses (txn
+ * registry, per-thread hold ledger, lock ctx) each see a different subset, and
+ * the narrow ones produce WRONG ZEROS -- the chain hold audit measures
+ * ft_detach_node at REG=2,579,201 / LED=0, so a ledger-only verdict calls every
+ * one of those holds a violation.
+ *
+ * So stop interrogating the CONSUMER and tag the PRODUCER: record, for each
+ * chain WORD, the (fn, line) of the site that last stored it.  When a reader
+ * then finds a value it did not expect -- ft_hlist_freeze_chain_prepare's tail
+ * finding its derived NULL replaced by an appended duplicate -- the word names
+ * the site that put it there.  No witness, no inference.
+ *
+ * ☠ KEYED ON THE SLOT, NOT ON A FIELD INSIDE THE NODE, and that is not a
+ * stylistic choice.  The first spelling put the tag in struct cds_ft_node and
+ * recovered the node from the slot with caa_container_of.  It corrupted the
+ * heap within seven tests ("corrupted size vs. prev_size"), because a chain
+ * store's slot is not always inside a live cds_ft_node -- ft_hlist_del_prepare
+ * derives @pred by LOADING @elem->prev, and a stale or head @pred makes
+ * &pred->next point into something else entirely.  The existing code survives
+ * that because the store is RECORDED and the expected-old check rejects it at
+ * commit; an immediate debug write has no such protection.  (☞ that is worth
+ * remembering on its own: the MW CAS is load-bearing for more than
+ * arbitration here.)  A side table keyed by address writes only its own
+ * memory and can tag any word, node or not.
+ *
+ * Lossy by construction: one open-addressed probe, last writer wins, no
+ * locking.  A name for a human to read after the fact, never a value anything
+ * branches on -- so a collision costs a misattributed row, never correctness.
+ *
+ * Costs 32 MiB of BSS in a build that defines the flag, and nothing at all in
+ * one that does not (the stamp compiles to `do { } while (0)`).
+ */
+#ifdef FT_DEBUG_CHAIN_CANARY
+#define FT_CANARY_SLOTS		(1u << 20)
+struct ft_canary_ent {
+	void **slot;
+	const char *fn;
+	int line;
+	unsigned long tid;
+};
+extern struct ft_canary_ent ft_canary_tab[FT_CANARY_SLOTS];
+struct ft_canary_ent ft_canary_tab[FT_CANARY_SLOTS];
+
 static inline
-int ft_hlist_store_mw_at(const char *fn, int line, const struct cds_ft *ft,
+unsigned int ft_canary_hash(const void *slot)
+{
+	uintptr_t v = (uintptr_t) slot;
+
+	v ^= v >> 33;
+	v *= 0xff51afd7ed558ccdULL;
+	v ^= v >> 33;
+	return (unsigned int) (v & (FT_CANARY_SLOTS - 1));
+}
+
+static inline
+void ft_chain_canary_stamp(const char *fn, int line, void **slot)
+{
+	struct ft_canary_ent *e = &ft_canary_tab[ft_canary_hash(slot)];
+
+	e->slot = slot;
+	e->fn = fn;
+	e->line = line;
+	e->tid = (unsigned long) pthread_self();
+}
+
+/* NULL when the word has never been stored through a chain store helper. */
+static inline
+const struct ft_canary_ent *ft_chain_canary_of(void **slot)
+{
+	const struct ft_canary_ent *e = &ft_canary_tab[ft_canary_hash(slot)];
+
+	return e->slot == slot ? e : NULL;
+}
+
+# define FT_CHAIN_CANARY_STAMP(fn, line, slot)				\
+	ft_chain_canary_stamp((fn), (line), (void **) (slot))
+#else
+# define FT_CHAIN_CANARY_STAMP(fn, line, slot)		do { } while (0)
+#endif
+
+static inline
+int ft_hlist_store_chain_at(const char *fn, int line, const struct cds_ft *ft,
 		struct urcu_txn *txn,
 		void **slot, void *old_ptr, void *new_ptr, uintptr_t tag)
 {
 	/*
+	 * ☠ PARKED: STILL MW UNDER FINE, AND THE REASON IS AN EXCLUSION GAP,
+	 * NOT A MISSING DISPATCH.
+	 *
+	 * The class was flipped to unconditional SW and it measured GREEN
+	 * (ft_unit 361/361, ft_inv 152/152, per-node and exponential).  It was
+	 * taken back out, because green was not evidence: the flip's licence is
+	 * "the duplicate chain is protected by the NEAREST ANCESTOR LOCK", and
+	 * that premise does not hold yet.
+	 *
+	 * ☠ THE `UNHELD = 0` THAT LICENSED IT IS A UNION-OF-WITNESSES ZERO.  The
+	 * chain hold audit scores HELD if ANY of the txn registry, the per-thread
+	 * ledger or the lock ctx can see a hold.  Asked instead for a POSITIVE
+	 * claim -- cds_ft_metadata.dbg_owner_tid, which the ledger sets when an op
+	 * takes a member and clears when it drops it -- the answer inverts.
+	 * MEASURED at the moment ft_hlist_freeze_chain_prepare records its tail
+	 * against a word that disagrees with the derivation, per ft_inv leg:
+	 *
+	 *   holder claimed by US        0   (of ~28,000, at BOTH spacings)
+	 *   holder claimed by a PEER  890   (at _cds_ft_insert_replace)
+	 *   holder claimed by NOBODY  ~27k
+	 *
+	 * A PEER positively owning the chain's holder while this op records a
+	 * store into that chain is an exclusion gap, and it is a positive
+	 * observation rather than an absent one, so it does not explain away.
+	 * Under MW the install CAS arbitrates it and the commit aborts.  An SW
+	 * park cannot lose, so the same shape becomes a blind store into a chain
+	 * another writer owns.
+	 *
+	 * ☠ AND THE EXCLUSION ORACLE'S SILENCE IS NOT A CLEARANCE.  The run
+	 * reported 0 EXCLUSION VIOLATIONS, but ft_owner_stamp_claim fires when
+	 * two ops CLAIM one member -- it is structurally blind to a writer that
+	 * never claims at all, which (given US = 0) is what these paths do.
+	 *
+	 * ☞ WHAT THE FLIP COSTS, so the next attempt does not rediscover it: the
+	 * MW expected-old is load-bearing BEYOND arbitration in three places, and
+	 * each one becomes a write when the record parks --
+	 *   - ft_hlist_del_prepare derives &pred->next by LOADING @elem->prev, and
+	 *     a stale or head @pred points that slot into something that is not a
+	 *     live node.  The CAS rejects it today;
+	 *   - ft_hlist_freeze_chain_prepare's TAIL, whose derived NULL detects a
+	 *     duplicate appended since the caller counted @len;
+	 *   - the five structural expected-olds that are arguments rather than
+	 *     loads (measured: they always agree, so they are cheap to fix).
+	 *
+	 * Reinstating the flip means: close the gap at the two sites that do not
+	 * claim the holder (_cds_ft_insert_replace, and cds_ft_remove's sole-entry
+	 * path), re-run the POSITIVE-claim probe to a measured zero, then dispatch
+	 * SW here unconditionally -- never on a per-txn predicate, which is what
+	 * made the kind a property of the asking transaction the first time.
+	 *
 	 * ☞ COARSE RECORDS SW, WHATEVER THE WORD IS.  A coarse trie takes the
 	 * FT-wide @writer_lock at its outermost writer scope, so every writer of
-	 * every chain and cell word is serialised behind one mutex -- there is
-	 * no peer CAS for an SW park to race.  That is true even of the ORDINAL
-	 * CELL list (ft_ord_cell.lnode), which is [DESIGN] MW under FINE because
-	 * a splice rewrites NEIGHBOURING keys' cells whose holders the op never
-	 * acquires: coarse does not need those holders, it excludes everyone.
-	 *
-	 * Under FINE nothing changes here.  The cell list stays MW by design and
-	 * the duplicate chain stays MW until it migrates under the nearest
-	 * ancestor lock -- this dispatch settles only the COARSE half.
+	 * every chain and cell word is serialised behind one mutex -- there is no
+	 * peer CAS for an SW park to race.
 	 */
 	if (ft && !ft->lock_fine) {
 		FT_HLIST_COARSE_TALLY(1);
@@ -198,31 +326,29 @@ int ft_hlist_store_mw_at(const char *fn, int line, const struct cds_ft *ft,
 	}
 	FT_HLIST_COARSE_TALLY(0);
 	/*
-	 * ☑ THE COUNTER NOW SAYS "CHAIN", BECAUSE THIS IS NOT A CELL.  Every
-	 * store below writes a DUPLICATE-CHAIN word (cds_ft_node.next/.prev),
-	 * which is [debt] -- a named owner, bound for SW under the nearest
-	 * ancestor lock.  The ordinal CELL list (ft_ord_cell.lnode) is [DESIGN]
-	 * MW forever.  They shared @cell_mw, so neither could be sized and any
-	 * "MW is correct here" earned by the cell list read as though it covered
-	 * the chain.  Split.
+	 * ☑ THE COUNTER SAYS "CHAIN", BECAUSE THIS IS NOT A CELL.  Every store
+	 * here writes a DUPLICATE-CHAIN word (cds_ft_node.next/.prev).  The
+	 * ordinal CELL list (ft_ord_cell.lnode) is [DESIGN] MW forever and does
+	 * not come through this function.
 	 *
 	 * ☠ AND THE TAG CANNOT DO THIS JOB: FT_HLIST_TAG *IS* URCU_TXN_TAG (1),
 	 * the ordered-cell tag, so a tag test classes a chain word as a cell.
 	 * The PRODUCER is what names the class.
-	 */
-	FT_TK_COUNT_CHAIN_MW();
-	FT_AB_ARM(FT_AB_CELL_HANDLE, FT_AB_OWN_NA);
-	/*
+	 *
 	 * @fn/@line are the CALLER's, so every chain-word store gets its own
 	 * audit row -- the whole point, since the question is per SITE.
 	 */
+	FT_TK_COUNT_CHAIN_MW();
+	FT_AB_ARM(FT_AB_CELL_HANDLE, FT_AB_OWN_NA);
 	FT_CH_COARSE(fn, line);
+	FT_CHAIN_CANARY_STAMP(fn, line, slot);
 	return urcu_txn_store_mw(txn, slot, old_ptr, new_ptr, tag);
 }
 
-#define ft_hlist_store_mw(ft, txn, slot, old_ptr, new_ptr, tag)		\
-	ft_hlist_store_mw_at(__func__, __LINE__, (ft), (txn), (slot),	\
+#define ft_hlist_store_chain(ft, txn, slot, old_ptr, new_ptr, tag)	\
+	ft_hlist_store_chain_at(__func__, __LINE__, (ft), (txn), (slot),\
 		(old_ptr), (new_ptr), (tag))
+
 
 /*
  * THE SW TWIN -- for a chain word whose exclusion is ESTABLISHED, not merely
@@ -237,11 +363,13 @@ int ft_hlist_store_mw_at(const char *fn, int line, const struct cds_ft *ft,
  * the gate has flipped every point op onto that same lock (measured: 5401 of
  * 5401 stores wlock-held and inside a bulk body, 0 drain seams in-window).
  *
- * ☠ DO NOT COPY THIS SPELLING TO A POINT-OP CHAIN SITE.  Those run against each
- * other under per-node holder locks, and the duplicate list's migration to SW
- * is a SEPARATE, WHOLE-CLASS step that also has to account for the RAW
- * producers (ft_set_parent's external arm).  Converting one point-op site alone
- * is exactly the SW-park-races-an-MW-CAS the rule above forbids.
+ * ☑ AND THE WHOLE-CLASS STEP HAS NOW HAPPENED.  This header used to forbid
+ * copying the spelling to a point-op chain site, because converting ONE site
+ * while its peers stayed MW is exactly the SW-park-races-an-MW-CAS the rule
+ * above describes.  The duplicate chain migrated as a CLASS instead
+ * (ft_hlist_store_chain_at), so every writer of a chain word now parks, and
+ * this function remains only as the direct spelling for a site that is
+ * excluded by the FT-wide writer lock rather than by a node lock.
  */
 static inline
 int ft_hlist_store_sw_at(const char *fn, int line, const struct cds_ft *ft,
@@ -251,6 +379,7 @@ int ft_hlist_store_sw_at(const char *fn, int line, const struct cds_ft *ft,
 	FT_TK_COUNT_CHAIN_SW();
 	FT_AB_ARM(FT_AB_CELL_HANDLE, FT_AB_OWN_NA);
 	FT_CH_COARSE(fn, line);
+	FT_CHAIN_CANARY_STAMP(fn, line, slot);
 	return urcu_txn_store_sw(txn, slot, old_ptr, new_ptr, tag);
 }
 
@@ -397,9 +526,9 @@ int ft_hlist_insert_after_prepare(const struct cds_ft *ft, struct urcu_txn *txn,
 	newp->prev = pos;
 
 	/* pos->next: succ -> newp ; succ->prev: pos -> newp. */
-	ft_hlist_store_mw(ft, txn, (void **) &pos->next, succ, newp, FT_HLIST_TAG);
+	ft_hlist_store_chain(ft, txn, (void **) &pos->next, succ, newp, FT_HLIST_TAG);
 	if (succ != NULL)
-		ft_hlist_store_mw(ft, txn, (void **) &succ->prev, pos, newp, FT_HLIST_PREV_TAG);
+		ft_hlist_store_chain(ft, txn, (void **) &succ->prev, pos, newp, FT_HLIST_PREV_TAG);
 	return 0;
 }
 
@@ -437,7 +566,7 @@ void ft_hlist_append_run_prepare(const struct cds_ft *ft, struct urcu_txn *txn,
 {
 	int ret;
 
-	ret = ft_hlist_store_mw(ft, txn, (void **) &tail->next, NULL, run_head,
+	ret = ft_hlist_store_chain(ft, txn, (void **) &tail->next, NULL, run_head,
 			FT_HLIST_TAG);
 	assert(!ret);			/* caller reserved the edge up front */
 	(void) ret;
@@ -501,11 +630,11 @@ int ft_hlist_del_prepare(const struct cds_ft *ft, struct urcu_txn *txn, struct c
 	 * head ops fold it (ft_hlist_freeze_prepare) for atomicity with the
 	 * structural anchor edge.
 	 */
-	ft_hlist_store_mw(ft, txn, (void **) &elem->next, next,
+	ft_hlist_store_chain(ft, txn, (void **) &elem->next, next,
 			ft_hlist_set_mark(next), FT_HLIST_TAG);
-	ft_hlist_store_mw(ft, txn, (void **) &pred->next, elem, next, FT_HLIST_TAG);
+	ft_hlist_store_chain(ft, txn, (void **) &pred->next, elem, next, FT_HLIST_TAG);
 	if (next != NULL)
-		ft_hlist_store_mw(ft, txn, (void **) &next->prev, elem, pred, FT_HLIST_PREV_TAG);
+		ft_hlist_store_chain(ft, txn, (void **) &next->prev, elem, pred, FT_HLIST_PREV_TAG);
 	return 0;
 }
 
@@ -535,11 +664,11 @@ int ft_hlist_replace_prepare(const struct cds_ft *ft, struct urcu_txn *txn,
 	newp->next = next;
 	newp->prev = pred;
 
-	ft_hlist_store_mw(ft, txn, (void **) &old->next, next,
+	ft_hlist_store_chain(ft, txn, (void **) &old->next, next,
 			ft_hlist_set_mark(next), FT_HLIST_TAG);
-	ft_hlist_store_mw(ft, txn, (void **) &pred->next, old, newp, FT_HLIST_TAG);
+	ft_hlist_store_chain(ft, txn, (void **) &pred->next, old, newp, FT_HLIST_TAG);
 	if (next != NULL)
-		ft_hlist_store_mw(ft, txn, (void **) &next->prev, old, newp, FT_HLIST_PREV_TAG);
+		ft_hlist_store_chain(ft, txn, (void **) &next->prev, old, newp, FT_HLIST_PREV_TAG);
 	return 0;
 }
 
@@ -562,7 +691,7 @@ void ft_hlist_freeze_prepare(const struct cds_ft *ft, struct urcu_txn *txn, stru
 	void *en = urcu_txn_load(txn, (void **) &node->next, FT_HLIST_TAG);
 	int ret;
 
-	ret = ft_hlist_store_mw(ft, txn, (void **) &node->next, en,
+	ret = ft_hlist_store_chain(ft, txn, (void **) &node->next, en,
 			ft_hlist_set_mark((struct cds_ft_node *) en), FT_HLIST_TAG);
 	assert(!ret);			/* caller reserved the edge up front */
 	(void) ret;
@@ -589,7 +718,7 @@ void ft_hlist_freeze_sole_prepare(const struct cds_ft *ft, struct urcu_txn *txn,
 {
 	int ret;
 
-	ret = ft_hlist_store_mw(ft, txn, (void **) &node->next, NULL,
+	ret = ft_hlist_store_chain(ft, txn, (void **) &node->next, NULL,
 			ft_hlist_set_mark(NULL), FT_HLIST_TAG);
 	assert(!ret);			/* caller reserved the edge up front */
 	(void) ret;
@@ -605,11 +734,219 @@ void ft_hlist_freeze_sole_prepare(const struct cds_ft *ft, struct urcu_txn *txn,
  * size a reservation with: every producer that could APPEND takes the holder
  * first, so the chain cannot grow between this count and the record walk.
  * Counted without it the freeze would under-reserve and trip
- * ft_hlist_store_mw's assert at the extra node.  Already-marked members are
+ * ft_hlist_store_chain's assert at the extra node.  Already-marked members are
  * counted too -- they still cost the edge that re-records their mark.
  */
+/*
+ * ☞ WHY DOES THE TAIL DISAGREE?  (-DFT_DEBUG_HLIST_TAIL_WHY, with
+ * -DFEATURE_FT_HOLD_TRACE)
+ *
+ * ft_hlist_freeze_chain_prepare records its LAST node against the caller's
+ * derived NULL, and that derivation disagrees with the word 24,676 times per
+ * ft_inv per-node leg (36,427 at exponential) -- while the other six derived
+ * expected-olds in this file disagree ZERO times.
+ *
+ * If the governing rule holds -- every chain mutation under the nearest
+ * ancestor lock -- that number should be ZERO too: no append can land while we
+ * hold the holder.  It is not zero, so exactly one of two things is true, and
+ * they have entirely different fixes:
+ *
+ *   STALE PLAN   the op DOES hold the holder, but @len was counted BEFORE the
+ *                acquire, so the append landed legitimately, before our
+ *                exclusion existed.  ft_hlist_chain_len's own header already
+ *                forbids this ("☠ CALL IT UNDER THE CHAIN HOLDER"), so the fix
+ *                is at the naming site: derive under the lock, or bail.
+ *   UNHELD       the op does NOT hold the holder here, and the lock-set
+ *                transition is simply not done for this path.  The fix is an
+ *                acquire, and nothing in this file changes.
+ *
+ * So report the HOLDER witness and the CALLER that counted @len, interned by
+ * (fn, line).  The chain hold audit cannot answer this: it scores the moment of
+ * the STORE, and this is a question about the moment of the DERIVATION.
+ */
+#ifdef FT_DEBUG_HLIST_TAIL_WHY
+#define FT_HLIST_WHY_MAX	16
+struct ft_hlist_why_site {
+	const char *fn;
+	int line;
+	unsigned long tails, disagree;
+	/*
+	 * ☞ THE EXCLUSION ORACLE'S ANSWER, read at the moment of the
+	 * disagreement.  cds_ft_metadata.dbg_owner_tid is CLAIMED by the hold
+	 * ledger when an op takes a member and YIELDED when it drops it, so it
+	 * is a POSITIVE statement of who covers the chain's holder right now --
+	 * not the query that reads zero for ops whose hold only the registry
+	 * can see.
+	 *
+	 *   own      we hold the holder => the APPENDER did not  => its gap
+	 *   foreign  another op holds it => WE do not            => our gap
+	 *   none     nobody claims it    => neither is covered, or the op's
+	 *            hold never reached the ledger (an ENTRY-less claim)
+	 */
+	unsigned long excl_own, excl_foreign, excl_none;
+	/*
+	 * ☠ AND THE MODE, because "NOBODY claims the holder" is only a gap
+	 * under FINE.  A COARSE trie serialises every writer behind the FT-wide
+	 * mutex and an EXCLUSIVE trie has one writer, so neither ever claims a
+	 * member -- scoring those as unprotected would manufacture a gap out of
+	 * a configuration that has no locks by design.  Only @none_fine is owed
+	 * an explanation.
+	 */
+	unsigned long none_fine, none_coarse, none_excl, none_wlock;
+#define FT_HLIST_WHY_PROD	8
+	/* WHO stored the surprise: read off the duplicate's own canary. */
+	const char *prod_fn[FT_HLIST_WHY_PROD];
+	int prod_line[FT_HLIST_WHY_PROD];
+	unsigned long prod_tid[FT_HLIST_WHY_PROD];
+	unsigned long prod_n[FT_HLIST_WHY_PROD];
+	unsigned int nr_prod;
+	unsigned long prod_overflow;
+};
+extern struct ft_hlist_why_site ft_hlist_why_sites[FT_HLIST_WHY_MAX];
+extern unsigned int ft_hlist_why_n;
+extern __thread const char *ft_hlist_why_fn;
+extern __thread int ft_hlist_why_line;
+struct ft_hlist_why_site ft_hlist_why_sites[FT_HLIST_WHY_MAX];
+unsigned int ft_hlist_why_n;
+__thread const char *ft_hlist_why_fn;
+__thread int ft_hlist_why_line;
+
+static void ft_hlist_why_report(void) __attribute__((destructor));
+static void ft_hlist_why_report(void)
+{
+	unsigned int i;
+
+	fprintf(stderr, "FT HLIST TAIL-WHY  (canary %s)  sites=%u/%u\n",
+#ifdef FT_DEBUG_CHAIN_CANARY
+		"ON",
+#else
+		"OFF -- no producer can be named (rebuild with -DFT_DEBUG_CHAIN_CANARY)",
+#endif
+		ft_hlist_why_n, FT_HLIST_WHY_MAX);
+	for (i = 0; i < ft_hlist_why_n; i++) {
+		struct ft_hlist_why_site *e = &ft_hlist_why_sites[i];
+		unsigned int k;
+
+		if (!e->tails)
+			continue;
+		fprintf(stderr, "  len derived at %-28s:%-5d tails=%-10lu DISAGREE=%lu\n",
+			e->fn, e->line, e->tails, e->disagree);
+		if (e->disagree) {
+			fprintf(stderr, "      holder claimed by: US(appender's gap)=%lu  "
+				"FOREIGN(our gap)=%lu  NOBODY=%lu\n",
+				e->excl_own, e->excl_foreign, e->excl_none);
+			fprintf(stderr, "      NOBODY splits: FINE(a real gap)=%lu  "
+				"coarse=%lu  exclusive=%lu  FT-wide-lock-held=%lu\n",
+				e->none_fine, e->none_coarse, e->none_excl,
+				e->none_wlock);
+		}
+		for (k = 0; k < e->nr_prod; k++)
+			fprintf(stderr, "      <- stored by %-34s:%-5d n=%-8lu tid=%lx\n",
+				e->prod_fn[k], e->prod_line[k], e->prod_n[k],
+				e->prod_tid[k]);
+		if (e->prod_overflow)
+			fprintf(stderr, "      <- (%lu more, producer table full)\n",
+				e->prod_overflow);
+	}
+}
+
 static inline
-unsigned int ft_hlist_chain_len(struct cds_ft_node *head)
+void ft_hlist_why_tail(struct cds_ft *ft, struct cds_ft_node *head)
+{
+	void *live = (void *) CMM_LOAD_SHARED(head->next);
+
+	struct ft_hlist_why_site *e = NULL;
+	const char *fn = ft_hlist_why_fn ? ft_hlist_why_fn : "(unstamped)";
+	int line = ft_hlist_why_line;
+	unsigned int i;
+
+	(void) ft;
+	for (i = 0; i < ft_hlist_why_n; i++)
+		if (ft_hlist_why_sites[i].line == line &&
+				ft_hlist_why_sites[i].fn == fn) {
+			e = &ft_hlist_why_sites[i];
+			break;
+		}
+	if (!e) {
+		if (ft_hlist_why_n >= FT_HLIST_WHY_MAX)
+			return;
+		e = &ft_hlist_why_sites[ft_hlist_why_n++];
+		e->fn = fn;
+		e->line = line;
+	}
+	uatomic_inc(&e->tails);
+	if (!live)
+		return;
+	uatomic_inc(&e->disagree);
+#ifdef FEATURE_FT_HOLD_TRACE
+	{
+		struct cds_ft_inode_flag *hf = ft_chain_head_holder(ft, head);
+		struct cds_ft_metadata *hm = hf ?
+			ft_flag_to_metadata(ft, hf) : NULL;
+		unsigned long owner = hm ?
+			CMM_LOAD_SHARED(hm->dbg_owner_tid) : 0;
+
+		if (!owner) {
+			uatomic_inc(&e->excl_none);
+			if (ft->exclusive)
+				uatomic_inc(&e->none_excl);
+			else if (!ft->lock_fine)
+				uatomic_inc(&e->none_coarse);
+			else if (ft_wlock_held == ft)
+				uatomic_inc(&e->none_wlock);
+			else
+				uatomic_inc(&e->none_fine);
+		}
+		else if (owner == (unsigned long) pthread_self())
+			uatomic_inc(&e->excl_own);
+		else
+			uatomic_inc(&e->excl_foreign);
+	}
+#endif
+#ifdef FT_DEBUG_CHAIN_CANARY
+	/*
+	 * ☞ ASK THE NODE WHO PUT IT THERE.  @live is the duplicate that appeared
+	 * where the caller derived NULL, and &head->next is the word it landed
+	 * in -- so that SLOT's canary names the site that stored it.  A fact the
+	 * table carries, not an inference from a witness that can read zero.
+	 */
+	{
+		const struct ft_canary_ent *c = ft_chain_canary_of(
+			(void **) &head->next);
+		const char *pfn = c ? c->fn :
+			"(no canary -- evicted, or never stored through a chain helper)";
+		int pline = c ? c->line : 0;
+		unsigned int k;
+
+		for (k = 0; k < e->nr_prod; k++)
+			if (e->prod_fn[k] == pfn && e->prod_line[k] == pline) {
+				uatomic_inc(&e->prod_n[k]);
+				return;
+			}
+		if (e->nr_prod >= FT_HLIST_WHY_PROD) {
+			uatomic_inc(&e->prod_overflow);
+			return;
+		}
+		k = e->nr_prod++;
+		e->prod_fn[k] = pfn;
+		e->prod_line[k] = pline;
+		e->prod_tid[k] = c ? c->tid : 0;
+		uatomic_inc(&e->prod_n[k]);
+	}
+#endif
+}
+
+# define FT_HLIST_WHY_STAMP()						\
+	((void) (ft_hlist_why_fn = __func__),				\
+	 (void) (ft_hlist_why_line = __LINE__))
+# define FT_HLIST_WHY_TAIL(ft, head)		ft_hlist_why_tail((ft), (head))
+#else
+# define FT_HLIST_WHY_STAMP()			((void) 0)
+# define FT_HLIST_WHY_TAIL(ft, head)		do { (void) (head); } while (0)
+#endif
+
+static inline
+unsigned int ft_hlist_chain_len_at(struct cds_ft_node *head)
 {
 	unsigned int n = 0;
 
@@ -619,6 +956,13 @@ unsigned int ft_hlist_chain_len(struct cds_ft_node *head)
 	}
 	return n;
 }
+
+/*
+ * The naming site is what this question is about, so stamp it: the classifier
+ * above reports the DERIVATION's (fn, line), not the record's.
+ */
+#define ft_hlist_chain_len(head)					\
+	(FT_HLIST_WHY_STAMP(), ft_hlist_chain_len_at(head))
 
 /*
  * ft_hlist_freeze_chain_prepare: freeze the chain at @head into @txn -- one
@@ -664,6 +1008,22 @@ void ft_hlist_freeze_chain_prepare(const struct cds_ft *ft, struct urcu_txn *txn
 		 * expected-old is the derived NULL -- not a load.  Every earlier
 		 * node is interior, where no append can land, so its successor
 		 * is read here.
+		 *
+		 * ☠ THE DERIVED NULL IS AN ARBITRATION, NOT A DESCRIPTION, and
+		 * it is the one expected-old in this file that is.  @len is the
+		 * CALLER's, counted before this op's exclusion exists, so a
+		 * same-key cds_ft_insert can APPEND a duplicate in the gap.
+		 * Recorded against NULL, that append makes this commit LOSE its
+		 * install CAS and the caller re-derives; re-loading instead
+		 * would mark the duplicate into the tombstone and the prune
+		 * would orphan it ("key LOST after an OK concurrent insert",
+		 * measured in both list modes).
+		 *
+		 * ☞ MEASURED, per ft_inv leg: the tail disagrees with the
+		 * derivation 19,196 times at per-node and 18,712 at exponential,
+		 * so this arbitration is live -- and it is a REASON THE CLASS
+		 * CANNOT PARK YET, because an SW record always writes.  See
+		 * ft_hlist_store_chain_at's parked note.
 		 */
 		if (i + 1 == len) {
 			succ = NULL;
@@ -674,7 +1034,9 @@ void ft_hlist_freeze_chain_prepare(const struct cds_ft *ft, struct urcu_txn *txn
 			next = ft_hlist_unmark(succ);
 		}
 		if (!((uintptr_t) succ & FT_HLIST_MARK)) {
-			ret = ft_hlist_store_mw(ft, txn, (void **) &head->next,
+			if (i + 1 == len)
+				FT_HLIST_WHY_TAIL((struct cds_ft *) ft, head);
+			ret = ft_hlist_store_chain(ft, txn, (void **) &head->next,
 					succ, ft_hlist_set_mark(succ),
 					FT_HLIST_TAG);
 			assert(!ret);	/* caller reserved one edge per node */
