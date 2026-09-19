@@ -1374,6 +1374,57 @@ abort and `new_ptr` on commit, BLIND, and an SW record always parks):
   freeze on the same thread whose `@len` is a literal is filed under whatever
   site last called `ft_hlist_chain_len`.
 
+### 11.10 The post-flip census: where the conversion surface actually is
+
+With the duplicate chain parked (§11.9), re-measure rather than assume what is
+next. `-DFT_DEBUG_TXN_KIND`, ft_inv per-node, default build:
+
+| population | records/leg | disposition |
+|---|---|---|
+| MW_STRUCT | 133,822,009 | **the conversion surface** |
+| MW_LOCK | 35,441,459 | the lock take — stays MW forever |
+| MW_ALWAYS | 11,469,627 | ROOT 28% (never converts), CELL 71% (`[DESIGN]`) |
+| SW | 25,631,033 | — |
+
+☠ **AND OWN_MISS IS A WRONG ZERO'S MIRROR IMAGE WITHOUT THE LEDGER.** The census
+splits MW_STRUCT by whether the op holds the word's owner: OWN_HELD (the txn
+registry names it), OWN_LEDGER (only this thread's hold ledger does — a REGISTRY
+gap), OWN_MISS (neither — a real exclusion gap). `OWN_LEDGER` reads **0** unless
+the build carries `-DFEATURE_FT_HOLD_TRACE`, and the report says so — so a census
+without it folds the registry gap into OWN_MISS and over-reports:
+
+| | without the ledger | with it |
+|---|---|---|
+| OWN_MISS, total | 3,305,319 | **2,259,139** |
+| OWN_MISS, `ft-remove.h:4845` | 1,245,467 | **9,808** (LEDGER 1,266,317) |
+
+The detach's commit txn -- 58M records, the second-largest site in the tree --
+looks like the #2 exclusion gap and is in fact the CLEANEST big site at 0.02%.
+Its holds live in the orphan plan-lock chain, which is `FT_MAX_DEPTH` long
+against a registry of `FT_ENTRY_PER_NODE + 1` and therefore cannot be registered
+by construction. A no-ledger census would have sent the next piece of work
+straight at it.
+
+**The real ranking** (ledger armed, ft_inv per-node):
+
+| txn creation site | MW_STRUCT | OWN_MISS | miss % |
+|---|---|---|---|
+| `ft-insert.h:1183` (the insert's content txn) | 60,286,946 | **1,775,054** | 2.9% |
+| `ft-insert.h:5321` | 614,283 | 235,095 | **38.3%** |
+| `ft-graft.h:4137` | 1,299,312 | 89,974 | 6.9% |
+| `ft-graft.h:4161` | 218,374 | 85,920 | **39.3%** |
+| `ft-merge.h:1717` | 143,437 | 39,649 | **27.6%** |
+| `ft-graft.h:2368` | 407,488 | 23,639 | 5.8% |
+| `ft-remove.h:4845` | 58,183,980 | 9,808 | 0.0% |
+
+⇒ **`ft-insert.h:1183` carries 79% of the entire remaining exclusion gap.** It is
+the next piece of work by size. The three sites at 27-39% are the next by RATE,
+and small enough to be tractable individually — which of the two orders to take
+is a judgement, but both are now numbers rather than impressions.
+
+☞ The report's own rule still governs: *"a site with OWN_MISS == 0 is ready for
+the Phase B per-op arm; OWN_MISS is the size of its exclusion gap."*
+
 ## 12. API / design questions queued by Mathieu (2026-09-17)
 
 Not implemented; recorded so the flip does not silently decide them.
