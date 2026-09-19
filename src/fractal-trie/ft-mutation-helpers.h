@@ -21006,6 +21006,22 @@ void ft_glue_record_splices(struct cds_ft *ft, struct ft_glue *g,
 			(void) ret;
 		}
 		ft_ch_audit(ft, txn, tail);
+		/*
+		 * ☞ THE APPEND SIDE OF THE SERIALIZING WORD.  This records
+		 * &tail->next against a LITERAL NULL, which its own header calls
+		 * "the serializing one (CAS old = NULL: a concurrent freeze of
+		 * the tail fails this commit)" -- the same shape as the freeze's
+		 * derived tail, from the other direction, and the site the
+		 * 2026-09-17 flip attempt missed.
+		 *
+		 * Ask whether it can ever be stale before deciding it needs a
+		 * bail.  A splice runs inside a BULK WINDOW with the FT-wide
+		 * writer lock held (ft_hlist_store_sw_at's header measured this
+		 * site at 5401/5401 wlock-held, 0 drain seams in-window), so the
+		 * expectation is zero -- but the flip's gate is a counter, not an
+		 * expectation.
+		 */
+		FT_HLIST_PLAN_OBSERVE(ft, ft_flip_txn_handle(txn), tail, 1, 4);
 		ft_hlist_append_run_prepare(ft, ft_flip_txn_handle(txn), tail, src_head);
 	}
 }

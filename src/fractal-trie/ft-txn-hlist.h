@@ -961,10 +961,12 @@ unsigned long ft_hlist_plan_why[3];
  * gate for the SW flip is a counter reading ZERO across every spacing, never an
  * argument that a path is safe, so this is the measurement that gate wants.
  * Indices: 0 = the bulk fold, 1 = the external-promote arm, 2 = the src_cn
- * retire arm, 3 = the merge collapse.
+ * retire arm, 3 = the merge collapse, 4 = ft_glue_record_splices' run append
+ * (ft_hlist_append_run_prepare's literal NULL -- the same serializing word from
+ * the APPEND side, and the site the 2026-09-17 flip attempt missed entirely).
  */
-extern unsigned long ft_hlist_plan_obs[4], ft_hlist_plan_obs_n[4];
-unsigned long ft_hlist_plan_obs[4], ft_hlist_plan_obs_n[4];
+extern unsigned long ft_hlist_plan_obs[5], ft_hlist_plan_obs_n[5];
+unsigned long ft_hlist_plan_obs[5], ft_hlist_plan_obs_n[5];
 
 static inline
 void ft_hlist_plan_snap(void)
@@ -993,11 +995,12 @@ static void ft_hlist_why_report(void)
 		uatomic_read(&ft_hlist_plan_why[1]));
 	fprintf(stderr, "FT HLIST PLAN-OBSERVE (no bail; must read 0 before these "
 		"sites convert): fold=%lu/%lu promote=%lu/%lu src_cn=%lu/%lu "
-		"merge=%lu/%lu\n",
+		"merge=%lu/%lu append_run=%lu/%lu\n",
 		uatomic_read(&ft_hlist_plan_obs[0]), uatomic_read(&ft_hlist_plan_obs_n[0]),
 		uatomic_read(&ft_hlist_plan_obs[1]), uatomic_read(&ft_hlist_plan_obs_n[1]),
 		uatomic_read(&ft_hlist_plan_obs[2]), uatomic_read(&ft_hlist_plan_obs_n[2]),
-		uatomic_read(&ft_hlist_plan_obs[3]), uatomic_read(&ft_hlist_plan_obs_n[3]));
+		uatomic_read(&ft_hlist_plan_obs[3]), uatomic_read(&ft_hlist_plan_obs_n[3]),
+		uatomic_read(&ft_hlist_plan_obs[4]), uatomic_read(&ft_hlist_plan_obs_n[4]));
 	fprintf(stderr, "FT HLIST TAIL-WHY  (ledger %s)  (canary %s)  sites=%u/%u\n",
 #ifdef FEATURE_FT_HOLD_TRACE
 		"ON -- PERTURBING, see below",
