@@ -82,7 +82,7 @@
  */
 /* +4 inv_prefix_head_*_key_identity; +2 inv_split_point_lookup_identity*;
  * +2 inv_absent_key_never_found* */
-#define NR_TESTS	(129 + NR_TESTS_REKEY_DLM)
+#define NR_TESTS	(130 + NR_TESTS_REKEY_DLM)	/* +1: inv_concurrent_merge_colliding_chains */
 
 /* ------------------------------------------------------------------ */
 /* Tuning knobs                                                       */
@@ -11544,6 +11544,269 @@ static struct cds_ft *create_varlen_nolist_ft_ws(struct cds_ft_group **group_out
 		abort();
 	*group_out = group;
 	return ft;
+}
+
+/*
+ * ==========================================================================
+ * COLLIDING-KEY CROSS-TRIE MERGE -- the workload that reaches
+ * ft_hlist_append_run_prepare's serializing NULL.
+ *
+ * ☞ WHY THIS TEST EXISTS, and it is a coverage hole with a measured name.
+ * ft_hlist_append_run_prepare records &tail->next against a LITERAL NULL that
+ * its own header calls "the serializing one (CAS old = NULL: a concurrent
+ * freeze of the tail fails this commit)".  It is the same word the freeze's
+ * derived tail writes, from the APPEND side, and the 2026-09-17 SW flip
+ * attempt missed it entirely.  When every other freeze site was put through
+ * the plan check, this one could not be: -DFT_DEBUG_SPLICE_SEAM measured it at
+ * stores=0 in ft_inv and 19 in ft_unit.
+ *
+ * The zero was NOT "the path is cold".  The merge path is called 44,271 times
+ * per ft_inv leg and COLLIDES ZERO times (merge=0/44271): append_run only runs
+ * when the source hands the destination a DUPLICATE RUN to splice onto an
+ * existing chain tail, and no test built one.  Every cross-trie test in this
+ * file keeps its key bands disjoint on purpose -- even the one called
+ * _overlap, whose own comment says "the keys stay disjoint, so each writer's
+ * shadow is still exact".
+ *
+ * So build the collision deliberately: the destination and every source hold
+ * the SAME keys, each already carrying duplicates, and point writers churn
+ * duplicates at those keys while the merges run -- so the tail a splice aims
+ * at moves under it.  That is the only shape in which the literal NULL
+ * arbitrates anything.
+ *
+ * THE ORACLE IS A COUNT, and it is exact because every duplicate is accounted:
+ * the destination ends with (initial + merged + point_net) duplicates, where
+ * point_net is inserts minus removes rather than an assumption that they
+ * pair.  A lost splice shows up as a short count; a doubled one as a long
+ * count; cds_ft_verify and the teardown walk catch a structurally broken chain
+ * that still counts right.
+ * ==========================================================================
+ */
+#define MCC_KEYS	6
+#define MCC_DUPS	3
+#define MCC_POINT	3
+#define MCC_RUN_MS	1500
+#define MCC_PREFIX	'M'
+
+struct mcc_ctx {
+	struct cds_ft *dst;
+	unsigned long stop;
+	unsigned long merges;		/* successful cds_ft_merge calls */
+	unsigned long point_ins;
+	unsigned long point_del;
+};
+
+static size_t mcc_mkkey(uint8_t *buf, unsigned int i)
+{
+	buf[0] = MCC_PREFIX;
+	buf[1] = (uint8_t) i;
+	return 2;
+}
+
+/* MCC_DUPS duplicates of every colliding key; returns how many were added. */
+static unsigned int mcc_fill(struct cds_ft *ft)
+{
+	uint8_t k[2];
+	unsigned int i, d, n = 0;
+
+	rcu_read_lock();
+	for (i = 0; i < MCC_KEYS; i++) {
+		size_t kl = mcc_mkkey(k, i);
+
+		for (d = 0; d < MCC_DUPS; d++) {
+			struct ft_test_node *nd = node_alloc(i);
+
+			if (cds_ft_insert(ft, k, kl, &nd->node) !=
+					CDS_FT_STATUS_OK)
+				abort();
+			n++;
+		}
+	}
+	rcu_read_unlock();
+	return n;
+}
+
+/*
+ * Churn duplicates at ONE colliding key: add one, then take one away.  The
+ * removal targets whatever the lookup finds rather than the node just added --
+ * a merge may have spliced a run in between, and the point of this thread is
+ * to move the chain tail, not to police which duplicate leaves.
+ */
+static void *mcc_point_writer(void *arg)
+{
+	unsigned long *a = (unsigned long *) arg;
+	struct mcc_ctx *c = (struct mcc_ctx *) a[0];
+	unsigned int id = (unsigned int) a[1];
+	uint8_t k[2];
+	size_t kl;
+
+	rcu_register_thread();
+	kl = mcc_mkkey(k, id % MCC_KEYS);
+	while (!uatomic_load(&c->stop, CMM_ACQUIRE)) {
+		struct ft_test_node *nd = node_alloc(id);
+		struct cds_ft_iter *iter;
+		struct cds_ft_node *found;
+
+		rcu_read_lock();
+		if (cds_ft_insert(c->dst, k, kl, &nd->node) ==
+				CDS_FT_STATUS_OK)
+			uatomic_inc(&c->point_ins);
+		else
+			free(nd);
+		rcu_read_unlock();
+
+		if (cds_ft_iter_create(c->dst, &iter) < 0)
+			abort();
+		rcu_read_lock();
+		cds_ft_iter_set_key(iter, k, kl);
+		cds_ft_lookup(c->dst, iter);
+		found = cds_ft_iter_node(iter);
+		if (found && cds_ft_remove(c->dst, iter, found) ==
+				CDS_FT_STATUS_OK) {
+			uatomic_inc(&c->point_del);
+			node_free_rcu(to_test_node(found));
+		}
+		rcu_read_unlock();
+		cds_ft_iter_destroy(iter);
+		rcu_quiescent_state();
+	}
+	rcu_unregister_thread();
+	return NULL;
+}
+
+/* Count every duplicate currently in @ft. */
+static unsigned long mcc_count(struct cds_ft *ft)
+{
+	struct cds_ft_iter *iter;
+	unsigned long n = 0;
+
+	if (cds_ft_iter_create(ft, &iter) < 0)
+		abort();
+	rcu_read_lock();
+	{
+		enum cds_ft_status st;
+
+		for (st = cds_ft_lookup_first(ft, iter);
+				st == CDS_FT_STATUS_OK;
+				st = cds_ft_next(ft, iter)) {
+			struct cds_ft_node *head = cds_ft_iter_node(iter);
+
+			cds_ft_for_each_duplicate_rcu(head)
+				n++;
+		}
+	}
+	rcu_read_unlock();
+	cds_ft_iter_destroy(iter);
+	return n;
+}
+
+static int inv_concurrent_merge_colliding_chains(void)
+{
+	INV_NEED_MERGE("inv_concurrent_merge_colliding_chains");
+	{
+	const char *tname = "inv_concurrent_merge_colliding_chains";
+	enum cds_ft_writer_strategy ws = CDS_FT_WRITER_LOCK_FINE;
+	const uint8_t pfx[1] = { MCC_PREFIX };
+	struct cds_ft_group *group;
+	struct cds_ft *probe, *src;
+	struct mcc_ctx c;
+	pthread_t pt[MCC_POINT];
+	unsigned long pargs[MCC_POINT][2];
+	struct timespec t0;
+	unsigned long expect, got, merged_dups = 0;
+	unsigned int i;
+	int ret = 0;
+
+	memset(&c, 0, sizeof(c));
+	probe = create_varlen_nolist_ft_ws(&group, &ws);
+	if (cds_ft_create(group, NULL, &c.dst) < 0)
+		abort();
+	if (cds_ft_create(group, NULL, &src) < 0)
+		abort();
+	/*
+	 * The destination takes concurrent point writers, so it is SHARED; the
+	 * source stays EXCLUSIVE, which cds_ft_merge's contract requires.
+	 */
+	cds_ft_make_shared(c.dst);
+	/*
+	 * ☠ AND THE SOURCE MUST BE EXCLUSIVE, once, up front.  cds_ft_merge
+	 * rejects a live concurrent source with BUSY before touching anything
+	 * (a second trie's lock has no order against the destination's), and a
+	 * freshly created trie is SHARED -- measured: without this every merge
+	 * returned -4 and the test reached zero splices, which is the very
+	 * blindness it was written to remove.  Taken once rather than per
+	 * round: cds_ft_make_exclusive drains a grace period, and the source
+	 * stays exclusive across fill / merge / refill.
+	 */
+	cds_ft_make_exclusive(src);
+
+	expect = mcc_fill(c.dst);
+
+	for (i = 0; i < MCC_POINT; i++) {
+		pargs[i][0] = (unsigned long) &c;
+		pargs[i][1] = i;
+		pthread_create(&pt[i], NULL, mcc_point_writer, &pargs[i]);
+	}
+
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	while (elapsed_ms(&t0) < MCC_RUN_MS) {
+		unsigned int added = mcc_fill(src);
+
+		enum cds_ft_status mst;
+
+		rcu_read_lock();
+		mst = cds_ft_merge(c.dst, pfx, 1, src);
+		if (mst == CDS_FT_STATUS_OK) {
+			merged_dups += added;
+			uatomic_inc(&c.merges);
+		} else {
+			/*
+			 * A refused merge leaves @src intact by contract, so
+			 * drain it rather than counting keys that never moved.
+			 */
+			rcu_read_unlock();
+			ret = -1;
+			report_violation(tname,
+				"cds_ft_merge refused a colliding-key source: "
+				"status %d", (int) mst);
+			goto stop;
+		}
+		rcu_read_unlock();
+		rcu_quiescent_state();
+	}
+stop:
+	uatomic_store(&c.stop, 1, CMM_RELEASE);
+	for (i = 0; i < MCC_POINT; i++)
+		pthread_join(pt[i], NULL);
+
+	expect += merged_dups + uatomic_read(&c.point_ins)
+		- uatomic_read(&c.point_del);
+	got = mcc_count(c.dst);
+	if (got != expect) {
+		report_violation(tname,
+			"duplicate count %lu != expected %lu after %lu merges "
+			"(%lu merged dups, +%lu/-%lu point) -- a spliced run "
+			"was lost or doubled",
+			got, expect, c.merges, merged_dups,
+			c.point_ins, c.point_del);
+		ret = -1;
+	}
+	if (cds_ft_verify(c.dst, stderr) != CDS_FT_STATUS_OK) {
+		report_violation(tname, "cds_ft_verify failed on the merged dst");
+		ret = -1;
+	}
+	if (!c.merges) {
+		report_violation(tname,
+			"no merge completed -- the test did not exercise the "
+			"colliding splice it exists for");
+		ret = -1;
+	}
+
+	mw_gs_reclaim(src);
+	mw_gs_reclaim(c.dst);
+	drain_and_destroy(probe, group);
+	return ret;
+	}
 }
 
 static struct cds_ft *create_varlen_nolist_ft(struct cds_ft_group **group_out)
@@ -25593,6 +25856,7 @@ int main(int argc, char **argv)
 	RUN_TEST(inv_concurrent_point_vs_bulk_merge);
 	RUN_TEST(inv_concurrent_point_vs_bulk_ord);
 	RUN_TEST(inv_concurrent_point_vs_bulk_overlap);
+	RUN_TEST(inv_concurrent_merge_colliding_chains);
 	RUN_TEST(inv_bind_resume_order);
 	RUN_TEST(inv_ordered_bulk_consistency);
 	RUN_TEST(inv_compact_keycopy_terminates);
