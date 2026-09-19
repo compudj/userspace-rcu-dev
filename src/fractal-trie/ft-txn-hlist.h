@@ -953,6 +953,18 @@ unsigned long ft_hlist_plan_bail;
  */
 extern unsigned long ft_hlist_plan_why[3];
 unsigned long ft_hlist_plan_why[3];
+/*
+ * ☞ OBSERVE-ONLY ARM, for the freeze sites whose @len is their CALLER's and
+ * whose bail would need its own pre-commit terminal (the fold / glue / merge
+ * paths).  Before adding four more bails -- the change that already wedged this
+ * tree once by leaking a lock -- ASK WHETHER THEY CAN EVER FIRE.  The tree's own
+ * gate for the SW flip is a counter reading ZERO across every spacing, never an
+ * argument that a path is safe, so this is the measurement that gate wants.
+ * Indices: 0 = the bulk fold, 1 = the external-promote arm, 2 = the src_cn
+ * retire arm, 3 = the merge collapse.
+ */
+extern unsigned long ft_hlist_plan_obs[4], ft_hlist_plan_obs_n[4];
+unsigned long ft_hlist_plan_obs[4], ft_hlist_plan_obs_n[4];
 
 static inline
 void ft_hlist_plan_snap(void)
@@ -979,6 +991,13 @@ static void ft_hlist_why_report(void)
 		uatomic_read(&ft_hlist_plan_why[0]),
 		uatomic_read(&ft_hlist_plan_why[2]),
 		uatomic_read(&ft_hlist_plan_why[1]));
+	fprintf(stderr, "FT HLIST PLAN-OBSERVE (no bail; must read 0 before these "
+		"sites convert): fold=%lu/%lu promote=%lu/%lu src_cn=%lu/%lu "
+		"merge=%lu/%lu\n",
+		uatomic_read(&ft_hlist_plan_obs[0]), uatomic_read(&ft_hlist_plan_obs_n[0]),
+		uatomic_read(&ft_hlist_plan_obs[1]), uatomic_read(&ft_hlist_plan_obs_n[1]),
+		uatomic_read(&ft_hlist_plan_obs[2]), uatomic_read(&ft_hlist_plan_obs_n[2]),
+		uatomic_read(&ft_hlist_plan_obs[3]), uatomic_read(&ft_hlist_plan_obs_n[3]));
 	fprintf(stderr, "FT HLIST TAIL-WHY  (ledger %s)  (canary %s)  sites=%u/%u\n",
 #ifdef FEATURE_FT_HOLD_TRACE
 		"ON -- PERTURBING, see below",
@@ -1190,11 +1209,17 @@ void ft_hlist_why_tail(struct cds_ft *ft, struct urcu_txn *txn,
 static inline void ft_hlist_plan_snap(void);
 # define FT_HLIST_PLAN_BAIL()			ft_hlist_plan_snap()
 # define FT_HLIST_PLAN_WHY(i)			uatomic_inc(&ft_hlist_plan_why[(i)])
+# define FT_HLIST_PLAN_OBSERVE(ft, txn, head, len, i)	do {		\
+		uatomic_inc(&ft_hlist_plan_obs_n[(i)]);			\
+		if (!ft_hlist_chain_plan_ok((ft), (txn), (head), (len)))	\
+			uatomic_inc(&ft_hlist_plan_obs[(i)]);		\
+	} while (0)
 #else
 # define FT_HLIST_WHY_STAMP()			((void) 0)
 # define FT_HLIST_WHY_TAIL(ft, txn, head)	do { (void) (head); } while (0)
 # define FT_HLIST_PLAN_BAIL()			do { } while (0)
 # define FT_HLIST_PLAN_WHY(i)			do { (void) (i); } while (0)
+# define FT_HLIST_PLAN_OBSERVE(ft, txn, head, len, i)	do { } while (0)
 #endif
 
 static inline
@@ -1455,7 +1480,21 @@ void ft_hlist_freeze_chain_prepare_at(const struct cds_ft *ft,
 				 * arbitration, which is what aborts the commit
 				 * and sends the caller back to re-derive.
 				 */
-				if ((uintptr_t) raw & FT_HLIST_MARK)
+				/*
+				 * ☠ AND THE MARK ALONE IS NOT THE CONDITION --
+				 * MARK(NULL) IS.  A tail word of MARK(X) with X
+				 * live means the node is already frozen AND the
+				 * chain continues past @len: taking it would skip
+				 * the record and let the commit proceed, freezing
+				 * fewer nodes than the chain has, where the derived
+				 * NULL aborts instead.  So accept exactly the
+				 * already-frozen genuine tail and nothing else.
+				 * With that condition the read cannot lose anything
+				 * whether or not the plan was checked -- the gate
+				 * above limits the blast radius, it is not what
+				 * makes this safe.
+				 */
+				if (raw != NULL && ft_hlist_unmark(raw) == NULL)
 					succ = (struct cds_ft_node *) raw;
 			}
 		} else {

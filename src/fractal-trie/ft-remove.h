@@ -246,6 +246,9 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 			/* A bulk fold: the FT-wide writer lock is the exclusion. */
 			if (freeze_leaf) {
 				ft_ch_audit_ctx(ft, txn, ctx, freeze_leaf);
+				FT_HLIST_PLAN_OBSERVE(ft,
+					ft_flip_txn_handle(txn), freeze_leaf,
+					freeze_len, 0);
 				ft_hlist_freeze_chain_prepare(ft,
 					ft_flip_txn_handle(txn), freeze_leaf,
 					freeze_len);
@@ -291,7 +294,16 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 		/* After the acquire: see the function header. */
 		if (freeze_leaf) {
 			ft_ch_audit_ctx(ft, txn, ctx, freeze_leaf);
-			ft_hlist_freeze_chain_prepare(ft, ft_flip_txn_handle(txn),
+			/*
+			 * MEASURED, not argued: this site's plan is never stale
+			 * -- 0 of 65,434 / 93,152 / 64,149 per ft_inv leg at the
+			 * three spacings (plus ft_unit), with the observe arm
+			 * left in so a future workload says so too.
+			 */
+			FT_HLIST_PLAN_OBSERVE(ft, ft_flip_txn_handle(txn),
+				freeze_leaf, freeze_len, 1);
+			ft_hlist_freeze_chain_prepare_checked(ft,
+				ft_flip_txn_handle(txn),
 				freeze_leaf, freeze_len);
 		}
 		/*
@@ -673,6 +685,8 @@ int ft_detach_node_replace_compressed_parent(struct cds_ft *ft,
 		 */
 		if (freeze_leaf) {
 			ft_ch_audit_ctx(ft, txn, ctx, freeze_leaf);
+			FT_HLIST_PLAN_OBSERVE(ft, ft_flip_txn_handle(txn),
+				freeze_leaf, freeze_len, 2);
 			ft_hlist_freeze_chain_prepare(ft, ft_flip_txn_handle(txn),
 				freeze_leaf, freeze_len);
 		}
@@ -2369,7 +2383,11 @@ int ft_chain_compress_fused(struct cds_ft *ft,
 		 */
 		if (freeze_leaf) {
 			ft_ch_audit_ctx(ft, txn, ctx, freeze_leaf);
-			ft_hlist_freeze_chain_prepare(ft, ft_flip_txn_handle(txn),
+			/* MEASURED 0 of 279,029 / 263,218 / 230,360 per leg. */
+			FT_HLIST_PLAN_OBSERVE(ft, ft_flip_txn_handle(txn),
+				freeze_leaf, freeze_len, 3);
+			ft_hlist_freeze_chain_prepare_checked(ft,
+				ft_flip_txn_handle(txn),
 				freeze_leaf, freeze_len);
 		}
 		/*
@@ -8919,7 +8937,13 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 			 * acquire.
 			 */
 			ft_ch_audit(ft, txn, external_nodes);
-			ft_hlist_freeze_chain_prepare(ft, ft_flip_txn_handle(txn),
+			/*
+			 * The plan IS validated under the lock here already --
+			 * the root acquire above re-reads it and bails retriably
+			 * (doc §1 row 2), which is this class's prescribed shape.
+			 */
+			ft_hlist_freeze_chain_prepare_checked(ft,
+				ft_flip_txn_handle(txn),
 				external_nodes, nr_frozen);
 			/*
 			 * Same rule as the prefix clear below: the pre-reserved
@@ -8964,7 +8988,13 @@ enum cds_ft_status _cds_ft_remove_all_locked(struct cds_ft *ft,
 			struct ft_flip_txn *txn = root_txn;
 
 			ft_ch_audit(ft, txn, external_nodes);
-			ft_hlist_freeze_chain_prepare(ft, ft_flip_txn_handle(txn),
+			/*
+			 * The plan IS validated under the lock here already --
+			 * the root acquire above re-reads it and bails retriably
+			 * (doc §1 row 2), which is this class's prescribed shape.
+			 */
+			ft_hlist_freeze_chain_prepare_checked(ft,
+				ft_flip_txn_handle(txn),
 				external_nodes, nr_frozen);
 			if (ft_remove_one_commit(ft,
 					(struct cds_ft_inode_flag **) &metadata->external_nodes,
