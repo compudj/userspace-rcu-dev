@@ -492,16 +492,86 @@ int ft_hlist_store_chain_at(const char *fn, int line, const struct cds_ft *ft,
 	 * @fn/@line are the CALLER's, so every chain-word store gets its own
 	 * audit row -- the whole point, since the question is per SITE.
 	 */
-	FT_TK_COUNT_CHAIN_MW();
 	FT_AB_ARM(FT_AB_CELL_HANDLE, FT_AB_OWN_NA);
 	FT_CH_COARSE(fn, line);
 	FT_CHAIN_CANARY_STAMP(fn, line, slot);
+#ifdef FT_CHAIN_SW
+	/*
+	 * ★ THE FLIP.  Unconditional, and that is the point: the 2026-09-17
+	 * attempt dispatched on a per-TXN predicate, which made the kind a
+	 * property of the ASKING TRANSACTION rather than of the SLOT -- the
+	 * three point ops take the holder into a STACK ft_held_anchor before
+	 * the content txn exists, so their registry is empty and they could
+	 * only ever answer MW, while the structural sites answered SW.  Same
+	 * slot, two kinds, by construction, against rcu-txn.h's "a slot is SW
+	 * xor MW, GLOBALLY".  There is no predicate here.
+	 *
+	 * What the six refutations needed, each now discharged by measurement
+	 * rather than argument:
+	 *   1 kind per slot ....... no predicate (this arm)
+	 *   2 the tree's gate ..... plan-stale counters read 0 at every
+	 *                           converted site; the two unconverted ones
+	 *                           are measured UNREACHED, not argued safe
+	 *   3 SW abort WRITES ..... the five belief expected-olds become loads
+	 *                           with FT_CHAIN_OLD, under this same switch
+	 *   4 append_run missed ... covered at last by the colliding-key merge
+	 *                           test, 0 stale of ~19k concurrent events
+	 *   5 the re-read was RYW .. ft_hlist_chain_plan_ok uses
+	 *                           urcu_txn_load_committed
+	 *   6 raw producers ....... the slot mix is ALL hidden-node writes; the
+	 *                           one raw producer on a live chain word is
+	 *                           measured unreachable (see
+	 *                           ft_node_mark_removed_flip's header)
+	 *
+	 * ☠ OPT-IN, NOT DEFAULT.  Green was not evidence the last two times, so
+	 * this ships as an ablation arm both halves of the gate can run, and
+	 * making it the default is a separate decision with its own numbers.
+	 */
+	FT_TK_COUNT_CHAIN_SW();
+	return urcu_txn_store_sw(txn, slot, old_ptr, new_ptr, tag);
+#else
+	FT_TK_COUNT_CHAIN_MW();
 	return urcu_txn_store_mw(txn, slot, old_ptr, new_ptr, tag);
+#endif
 }
 
 #define ft_hlist_store_chain(ft, txn, slot, old_ptr, new_ptr, tag)	\
 	ft_hlist_store_chain_at(__func__, __LINE__, (ft), (txn), (slot),\
 		(old_ptr), (new_ptr), (tag))
+
+/*
+ * ☞ AN EXPECTED-OLD MUST DESCRIBE THE SLOT ONCE THE RECORD PARKS.
+ *
+ * Five chain stores pass an expected-old that is an ARGUMENT the caller
+ * believes rather than a value read from the word: succ->prev <- pos,
+ * pred->next <- elem and next->prev <- elem in the unlink, and replace's two.
+ * Under MW that is harmless and slightly stronger than a load -- a wrong belief
+ * just fails the install CAS.  ☠ Under SW it is a WRITE: urcu_txn_settle stores
+ * old_ptr back BLIND on an abort, so a belief that never matched the word is
+ * published into a live slot.  That was refutation #3 of the 2026-09-17
+ * attempt.
+ *
+ * MEASURED with -DFT_DEBUG_HLIST_EXPECTED_OLD: these five disagree with the
+ * word ZERO times over both suites and all three spacings, so the conversion is
+ * value-neutral -- which is exactly why it must ship WITH the flip and not
+ * before it.  Before the flip, replacing a belief with a load only weakens a
+ * check that is currently doing real work; after it, the belief is a blind
+ * write.  One macro, one switch, so the two can never drift apart.
+ *
+ * ☠ urcu_txn_load, not _load_committed: this IS the read-your-own-writes case
+ * the engine documents.  A fused commit chains several edges on one chain, and
+ * the expected-old owed here is the value the slot will hold at install time
+ * FROM THIS TXN'S POINT OF VIEW -- its own pending write when it already wrote
+ * that word, not the pre-commit value.  (The plan check in
+ * ft_hlist_chain_plan_ok is the opposite case and uses _committed for exactly
+ * the opposite reason.)
+ */
+#ifdef FT_CHAIN_SW
+# define FT_CHAIN_OLD(txn, slot, believed, tag)				\
+	urcu_txn_load((txn), (void **) (slot), (tag))
+#else
+# define FT_CHAIN_OLD(txn, slot, believed, tag)		((void *) (believed))
+#endif
 
 
 /*
@@ -682,7 +752,9 @@ int ft_hlist_insert_after_prepare(const struct cds_ft *ft, struct urcu_txn *txn,
 	/* pos->next: succ -> newp ; succ->prev: pos -> newp. */
 	ft_hlist_store_chain(ft, txn, (void **) &pos->next, succ, newp, FT_HLIST_TAG);
 	if (succ != NULL)
-		ft_hlist_store_chain(ft, txn, (void **) &succ->prev, pos, newp, FT_HLIST_PREV_TAG);
+		ft_hlist_store_chain(ft, txn, (void **) &succ->prev,
+			FT_CHAIN_OLD(txn, &succ->prev, pos, FT_HLIST_PREV_TAG),
+			newp, FT_HLIST_PREV_TAG);
 	return 0;
 }
 
@@ -786,9 +858,13 @@ int ft_hlist_del_prepare(const struct cds_ft *ft, struct urcu_txn *txn, struct c
 	 */
 	ft_hlist_store_chain(ft, txn, (void **) &elem->next, next,
 			ft_hlist_set_mark(next), FT_HLIST_TAG);
-	ft_hlist_store_chain(ft, txn, (void **) &pred->next, elem, next, FT_HLIST_TAG);
+	ft_hlist_store_chain(ft, txn, (void **) &pred->next,
+		FT_CHAIN_OLD(txn, &pred->next, elem, FT_HLIST_TAG),
+		next, FT_HLIST_TAG);
 	if (next != NULL)
-		ft_hlist_store_chain(ft, txn, (void **) &next->prev, elem, pred, FT_HLIST_PREV_TAG);
+		ft_hlist_store_chain(ft, txn, (void **) &next->prev,
+			FT_CHAIN_OLD(txn, &next->prev, elem, FT_HLIST_PREV_TAG),
+			pred, FT_HLIST_PREV_TAG);
 	return 0;
 }
 
@@ -820,9 +896,13 @@ int ft_hlist_replace_prepare(const struct cds_ft *ft, struct urcu_txn *txn,
 
 	ft_hlist_store_chain(ft, txn, (void **) &old->next, next,
 			ft_hlist_set_mark(next), FT_HLIST_TAG);
-	ft_hlist_store_chain(ft, txn, (void **) &pred->next, old, newp, FT_HLIST_TAG);
+	ft_hlist_store_chain(ft, txn, (void **) &pred->next,
+		FT_CHAIN_OLD(txn, &pred->next, old, FT_HLIST_TAG),
+		newp, FT_HLIST_TAG);
 	if (next != NULL)
-		ft_hlist_store_chain(ft, txn, (void **) &next->prev, old, newp, FT_HLIST_PREV_TAG);
+		ft_hlist_store_chain(ft, txn, (void **) &next->prev,
+			FT_CHAIN_OLD(txn, &next->prev, old, FT_HLIST_PREV_TAG),
+			newp, FT_HLIST_PREV_TAG);
 	return 0;
 }
 
