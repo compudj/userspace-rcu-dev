@@ -5151,6 +5151,68 @@ int ft_detach_node(struct cds_ft *ft,
 						freeze_leaf));
 #endif
 				ft_ch_audit_ctx(ft, commit_txn, &lctx, freeze_leaf);
+				/*
+				 * ★ VALIDATE THE PLAN UNDER THE LOCK (Mathieu,
+				 * 2026-09-19).  @freeze_len reached this op as a
+				 * LITERAL -- cds_ft_remove's "1 = this key's SOLE
+				 * entry" -- derived from a read of @succ_node taken
+				 * with NOTHING HELD, while the chain's holder is not
+				 * acquired until ft_node_replace_ptr above.  So a
+				 * same-key insert can append a duplicate in that
+				 * window, and the freeze's derived NULL has been
+				 * standing in for the exclusion the count did not
+				 * have: MEASURED 10,157 (per-node) / 16,219
+				 * (exponential) disagreements per ft_inv leg, with
+				 * the txn registry owning the holder at 100% of them.
+				 *
+				 * We hold it HERE, so ask the word.  A stale plan is
+				 * refused before any record is filed, which is the
+				 * SAME decision the commit's install CAS makes today
+				 * -- taken earlier, and mostly without needing the
+				 * CAS to make it.  ☠ NOT "instead of" the CAS: see
+				 * ft_hlist_chain_plan_ok's header -- an UNDECIDED
+				 * peer proxy that outlasts urcu_txn_read's patience
+				 * window still reads as NULL here, so the install CAS
+				 * remains the backstop until the lock set is
+				 * complete.  This shrinks the window the CAS
+				 * arbitrates; it does not on its own make the record
+				 * parkable.
+				 *
+				 * ☠ RETRIABLE, AND IT TERMINATES: the caller
+				 * re-derives and finds the longer chain, so the next
+				 * attempt takes the promote/unchain lane instead of
+				 * this prune -- it does not re-enter the same refusal.
+				 *
+				 * ☠ AND NOTHING IS READER-VISIBLE YET.  On this arm
+				 * (@pub and @commit_txn both present) the forward
+				 * store, the head back edge and the recompaction
+				 * republish are all RECORDED into @commit_txn, which
+				 * ft_remove_one_commit does not reach until below; the
+				 * lone bare rcu_assign_pointer of the back edge is the
+				 * @commit_txn-NULL arm, which cannot be this one.  So
+				 * @end's sweep returns the structure byte-for-byte to
+				 * its pre-op state, exactly as for the leaf hoist's
+				 * two -EAGAIN exits above.
+				 */
+				if (!ft_hlist_chain_plan_ok(ft,
+						ft_flip_txn_handle(commit_txn),
+						freeze_leaf, freeze_len)) {
+					FT_HLIST_PLAN_BAIL();
+					FT_DBG_RETRY_SITE();
+					/*
+					 * ☠ THE ERRNO IS LOAD-BEARING, not just a
+					 * status.  @end's recompaction arm keys on it
+					 * EXACTLY: `ret == -EAGAIN` frees the
+					 * UNPUBLISHED fresh copy, anything else
+					 * call_rcu-frees @old_recompacted_node -- the
+					 * OLD, still-linked node.  -ENOENT is already a
+					 * legal detach return elsewhere, so a later
+					 * edit of this bail to any other negative value
+					 * is a use-after-free one token away.
+					 */
+					ret = -EAGAIN;
+					goto end;
+				}
 				ft_hlist_freeze_chain_prepare(ft, ft_flip_txn_handle(commit_txn),
 					freeze_leaf, freeze_len);
 				freeze_leaf_fused = true;

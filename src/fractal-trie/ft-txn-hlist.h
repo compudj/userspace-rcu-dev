@@ -890,14 +890,14 @@ struct ft_hlist_why_site {
 	 */
 	unsigned long reg_and_peer;
 	/*
-	 * ☠ AND THE MODE, because "NOBODY claims the holder" is only a gap
-	 * under FINE.  A COARSE trie serialises every writer behind the FT-wide
-	 * mutex and an EXCLUSIVE trie has one writer, so neither ever claims a
-	 * member -- scoring those as unprotected would manufacture a gap out of
-	 * a configuration that has no locks by design.  Only @none_fine is owed
-	 * an explanation.
+	 * ☠ AND THE MODE, because "the registry does not own the holder" is only
+	 * a gap under FINE.  A COARSE trie serialises every writer behind the
+	 * FT-wide mutex and an EXCLUSIVE trie has one writer, so neither takes a
+	 * per-node lock at all -- scoring those as unprotected would manufacture
+	 * a gap out of a configuration that has no locks by design.  Only
+	 * @unreg_fine is owed an explanation.
 	 */
-	unsigned long none_fine, none_coarse, none_excl, none_wlock;
+	unsigned long unreg_fine, unreg_coarse, unreg_excl, unreg_wlock;
 #define FT_HLIST_WHY_PROD	8
 	/* WHO stored the surprise: read off the duplicate's own canary. */
 	const char *prod_fn[FT_HLIST_WHY_PROD];
@@ -933,13 +933,58 @@ static inline bool ft_flip_txn_owns(const struct ft_flip_txn *t,
 		const struct cds_ft_metadata *owner);
 static inline struct urcu_txn *ft_flip_txn_handle(struct ft_flip_txn *t);
 static bool ft_hold_trace_holds(const struct cds_ft_metadata *lock);
+/*
+ * ☞ COUNT THE BAIL, DO NOT JUST PREVENT THE EVENT.  ft_hlist_chain_plan_ok
+ * turns a stale plan into a retry BEFORE the freeze records anything, so the
+ * DISAGREE rows above go quiet -- and a quiet row is indistinguishable from a
+ * path that stopped being taken.  This counter is what tells them apart: the
+ * traffic that used to land in DISAGREE has to reappear here, one for one.
+ */
+extern unsigned long ft_hlist_plan_bail;
+unsigned long ft_hlist_plan_bail;
+/*
+ * WHY the plan was refused -- SHORT (the walk hit the end before @len),
+ * TAIL_MARKED (the tail is already logically deleted but still linked, so
+ * ft_hlist_chain_len counted it while its word is MARK(NULL), not NULL) or
+ * TAIL_LIVE (a duplicate really was appended).  Only the last is the race the
+ * check exists for; the other two are disagreements between the COUNT's notion
+ * of "end of chain" and the RECORD's, and a refusal on either is stable across
+ * a retry -- i.e. a livelock, not an arbitration.
+ */
+extern unsigned long ft_hlist_plan_why[3];
+unsigned long ft_hlist_plan_why[3];
+
+static inline
+void ft_hlist_plan_snap(void)
+{
+	unsigned long n = uatomic_add_return(&ft_hlist_plan_bail, 1);
+
+	if (n <= 8 || !(n % 4096))
+		fprintf(stderr, "FT HLIST PLAN-BAIL %lu  SHORT=%lu "
+			"TAIL_LIVE=%lu (noted: TAIL_MARKED=%lu)\n", n,
+			uatomic_read(&ft_hlist_plan_why[0]),
+			uatomic_read(&ft_hlist_plan_why[2]),
+			uatomic_read(&ft_hlist_plan_why[1]));
+}
 
 static void ft_hlist_why_report(void) __attribute__((destructor));
 static void ft_hlist_why_report(void)
 {
 	unsigned int i;
 
-	fprintf(stderr, "FT HLIST TAIL-WHY  (canary %s)  sites=%u/%u\n",
+	fprintf(stderr, "FT HLIST PLAN-BAIL (stale plan refused UNDER THE LOCK, "
+		"before any record): %lu   BAILED: SHORT=%lu TAIL_LIVE(the race "
+		"this check exists for)=%lu | PASSED-but-noted: TAIL_MARKED=%lu\n",
+		uatomic_read(&ft_hlist_plan_bail),
+		uatomic_read(&ft_hlist_plan_why[0]),
+		uatomic_read(&ft_hlist_plan_why[2]),
+		uatomic_read(&ft_hlist_plan_why[1]));
+	fprintf(stderr, "FT HLIST TAIL-WHY  (ledger %s)  (canary %s)  sites=%u/%u\n",
+#ifdef FEATURE_FT_HOLD_TRACE
+		"ON -- PERTURBING, see below",
+#else
+		"off -- registry-only, the low-perturbation rig",
+#endif
 #ifdef FT_DEBUG_CHAIN_CANARY
 		"ON",
 #else
@@ -955,20 +1000,20 @@ static void ft_hlist_why_report(void)
 		fprintf(stderr, "  len derived at %-28s:%-5d tails=%-10lu DISAGREE=%lu\n",
 			e->fn, e->line, e->tails, e->disagree);
 		if (e->disagree) {
-			fprintf(stderr, "      holder claimed by: US(appender's gap)=%lu  "
-				"FOREIGN(our gap)=%lu  NOBODY=%lu\n",
-				e->excl_own, e->excl_foreign, e->excl_none);
-			fprintf(stderr, "      SAME EVENT, other witnesses: REGISTRY "
-				"owns=%lu  LEDGER holds=%lu  either=%lu   "
-				"(no ftxn stamped=%lu, stale=%lu)\n",
-				e->reg_own, e->led_own, e->reg_or_led,
-				e->ftxn_none, e->ftxn_stale);
-			fprintf(stderr, "      ☠ REGISTRY owns it AND a PEER claims it "
-				"(must be 0): %lu\n", e->reg_and_peer);
-			fprintf(stderr, "      NOBODY splits: FINE(a real gap)=%lu  "
+			fprintf(stderr, "      REGISTRY owns=%lu  (no ftxn stamped=%lu,"
+				" stale=%lu)\n",
+				e->reg_own, e->ftxn_none, e->ftxn_stale);
+			fprintf(stderr, "      NOT owned, by mode: FINE(a real gap)=%lu  "
 				"coarse=%lu  exclusive=%lu  FT-wide-lock-held=%lu\n",
-				e->none_fine, e->none_coarse, e->none_excl,
-				e->none_wlock);
+				e->unreg_fine, e->unreg_coarse, e->unreg_excl,
+				e->unreg_wlock);
+#ifdef FEATURE_FT_HOLD_TRACE
+			fprintf(stderr, "      LEDGER (perturbing; metadata 48->88 B, "
+				"2 atomics/acquire): holds=%lu either=%lu | stamp "
+				"US=%lu PEER=%lu NOBODY=%lu | ☠ reg+peer (must be 0)=%lu\n",
+				e->led_own, e->reg_or_led, e->excl_own,
+				e->excl_foreign, e->excl_none, e->reg_and_peer);
+#endif
 		}
 		for (k = 0; k < e->nr_prod; k++)
 			fprintf(stderr, "      <- stored by %-34s:%-5d n=%-8lu tid=%lx\n",
@@ -1009,58 +1054,85 @@ void ft_hlist_why_tail(struct cds_ft *ft, struct urcu_txn *txn,
 	if (!live)
 		return;
 	uatomic_inc(&e->disagree);
-#ifdef FEATURE_FT_HOLD_TRACE
 	{
+		/*
+		 * ☞ THE WHOLE VERDICT RUNS ONLY HERE, ON A DISAGREEMENT -- about
+		 * 1.4% of tails -- so the prev-walk in ft_chain_head_holder and
+		 * the registry scan are paid on a thousandth of the traffic, not
+		 * on every chain store.
+		 */
 		struct cds_ft_inode_flag *hf = ft_chain_head_holder(ft, head);
 		struct cds_ft_metadata *hm = hf ?
 			ft_flag_to_metadata(ft, hf) : NULL;
-		unsigned long owner = hm ?
-			CMM_LOAD_SHARED(hm->dbg_owner_tid) : 0;
+		struct ft_flip_txn *ftxn = ft_hlist_why_ftxn;
+		bool reg, led;
 
+		/*
+		 * ★ THE REGISTRY WITNESS COSTS NOTHING THE WORKLOAD CAN FEEL,
+		 * and that is why it is the one kept outside -DFEATURE_FT_HOLD_TRACE.
+		 * It reads the txn's own lock array, which every build already
+		 * maintains; it writes nothing, takes no atomic on a trie word
+		 * and changes no struct.
+		 *
+		 * ☠ THE LEDGER IS THE OPPOSITE ON ALL THREE COUNTS, so a finding
+		 * that needs it is a finding measured on a different data
+		 * structure: FEATURE_FT_HOLD_TRACE adds five fields to
+		 * cds_ft_metadata (48 -> 88 bytes, +83%, so slab packing and
+		 * cacheline sharing change for every node in the trie), and
+		 * ft_owner_stamp_claim / _yield put an atomic xchg AND an atomic
+		 * cmpxchg per acquire on the node's own metadata line -- the
+		 * line peers are CASing @state on.  ⇒ read this classifier
+		 * WITHOUT the ledger by default, and turn it on only to compare.
+		 */
+		if (!ftxn)
+			uatomic_inc(&e->ftxn_none);
+		else if (ft_flip_txn_handle(ftxn) != txn) {
+			uatomic_inc(&e->ftxn_stale);
+			ftxn = NULL;
+		}
+		reg = ftxn && hm && ft_flip_txn_owns(ftxn, hm);
+		led = hm && ft_hold_trace_holds(hm);	/* false without the ledger */
+		if (reg)
+			uatomic_inc(&e->reg_own);
+		if (led)
+			uatomic_inc(&e->led_own);
+		if (reg || led)
+			uatomic_inc(&e->reg_or_led);
+		/*
+		 * THE MODE SPLIT BELONGS TO THE REGISTRY VERDICT, not to the
+		 * stamp: "nobody owns the holder" is only owed an explanation
+		 * under FINE.  A COARSE trie serialises every writer behind the
+		 * FT-wide mutex and an EXCLUSIVE one has a single writer, so
+		 * scoring either as a gap manufactures one out of a
+		 * configuration that has no per-node locks by design.
+		 */
+		if (!reg) {
+			if (ft->exclusive)
+				uatomic_inc(&e->unreg_excl);
+			else if (!ft->lock_fine)
+				uatomic_inc(&e->unreg_coarse);
+			else if (ft_wlock_held == ft)
+				uatomic_inc(&e->unreg_wlock);
+			else
+				uatomic_inc(&e->unreg_fine);
+		}
+#ifdef FEATURE_FT_HOLD_TRACE
 		{
-			/*
-			 * THE TWO WITNESSES THE STAMP CANNOT BE, read here and
-			 * not in a second run: a verdict assembled from two
-			 * runs at two points is how an unmatched control gets
-			 * read as a result.
-			 */
-			struct ft_flip_txn *ftxn = ft_hlist_why_ftxn;
-			bool reg, led;
+			unsigned long owner = hm ?
+				CMM_LOAD_SHARED(hm->dbg_owner_tid) : 0;
 
-			if (!ftxn)
-				uatomic_inc(&e->ftxn_none);
-			else if (ft_flip_txn_handle(ftxn) != txn) {
-				uatomic_inc(&e->ftxn_stale);
-				ftxn = NULL;
-			}
-			reg = ftxn && hm && ft_flip_txn_owns(ftxn, hm);
-			led = hm && ft_hold_trace_holds(hm);
-			if (reg)
-				uatomic_inc(&e->reg_own);
-			if (led)
-				uatomic_inc(&e->led_own);
-			if (reg || led)
-				uatomic_inc(&e->reg_or_led);
-			if (reg && owner && owner != (unsigned long) pthread_self())
+			if (!owner)
+				uatomic_inc(&e->excl_none);
+			else if (owner == (unsigned long) pthread_self())
+				uatomic_inc(&e->excl_own);
+			else
+				uatomic_inc(&e->excl_foreign);
+			if (reg && owner &&
+					owner != (unsigned long) pthread_self())
 				uatomic_inc(&e->reg_and_peer);
 		}
-		if (!owner) {
-			uatomic_inc(&e->excl_none);
-			if (ft->exclusive)
-				uatomic_inc(&e->none_excl);
-			else if (!ft->lock_fine)
-				uatomic_inc(&e->none_coarse);
-			else if (ft_wlock_held == ft)
-				uatomic_inc(&e->none_wlock);
-			else
-				uatomic_inc(&e->none_fine);
-		}
-		else if (owner == (unsigned long) pthread_self())
-			uatomic_inc(&e->excl_own);
-		else
-			uatomic_inc(&e->excl_foreign);
-	}
 #endif
+	}
 #ifdef FT_DEBUG_CHAIN_CANARY
 	/*
 	 * ☞ ASK THE NODE WHO PUT IT THERE.  @live is the duplicate that appeared
@@ -1109,9 +1181,20 @@ void ft_hlist_why_tail(struct cds_ft *ft, struct urcu_txn *txn,
 	((void) (ft_hlist_why_fn = __func__),				\
 	 (void) (ft_hlist_why_line = __LINE__))
 # define FT_HLIST_WHY_TAIL(ft, txn, head)	ft_hlist_why_tail((ft), (txn), (head))
+/*
+ * ☠ atexit IS NOT ENOUGH.  A livelock is killed by a timeout or a memcg, and
+ * neither runs a destructor -- so the classification of the ONE run that
+ * reproduces would be lost exactly when it is needed.  Snapshot periodically:
+ * the last line in the log is the reading.
+ */
+static inline void ft_hlist_plan_snap(void);
+# define FT_HLIST_PLAN_BAIL()			ft_hlist_plan_snap()
+# define FT_HLIST_PLAN_WHY(i)			uatomic_inc(&ft_hlist_plan_why[(i)])
 #else
 # define FT_HLIST_WHY_STAMP()			((void) 0)
 # define FT_HLIST_WHY_TAIL(ft, txn, head)	do { (void) (head); } while (0)
+# define FT_HLIST_PLAN_BAIL()			do { } while (0)
+# define FT_HLIST_PLAN_WHY(i)			do { (void) (i); } while (0)
 #endif
 
 static inline
@@ -1132,6 +1215,124 @@ unsigned int ft_hlist_chain_len_at(struct cds_ft_node *head)
  */
 #define ft_hlist_chain_len(head)					\
 	(FT_HLIST_WHY_STAMP(), ft_hlist_chain_len_at(head))
+
+/*
+ * ft_hlist_chain_plan_ok: is the caller's @len still the truth about @head's
+ * chain?  Answer it HERE, where the caller holds the chain's holder, so the
+ * freeze below records a CHECKED value instead of an arbitration.
+ *
+ * ★ MATHIEU: "if we have proper locking, a load and check should be the same as
+ * an MW record."  Exactly so, and that is the whole point of this function.
+ * ft_hlist_freeze_chain_prepare's tail is the one expected-old in this file
+ * that is DERIVED rather than loaded, and the reason it has to be derived is
+ * not a property of the record -- it is that @len is counted BEFORE the op's
+ * exclusion exists (ft_hlist_chain_len's header already forbids that: "☠ CALL
+ * IT UNDER THE CHAIN HOLDER").  Close that window and the derived NULL and a
+ * committed load agree by construction, the MW CAS arbitrates nobody, and the
+ * record becomes parkable.
+ *
+ * ☠ COMMITTED, NOT urcu_txn_load: the plain load is READ-YOUR-OWN-WRITES, so in
+ * a FUSED commit -- which this is, the freeze rides ft_detach_node's structural
+ * txn -- it returns this txn's own pending value and never reads the word at
+ * all.  That was refutation #5 of the 2026-09-17 flip attempt: the "re-read
+ * under the lock" it added read nothing.
+ *
+ * ☠☠ AND THIS CHECK IS NOT BY ITSELF A LICENCE TO PARK.  "A load and check is
+ * the same as an MW record" holds ONLY where the holder lock really excludes
+ * every writer of the chain; the check cannot substitute for the exclusion, it
+ * can only be exact once the exclusion is.  The engine makes that concrete:
+ * urcu_txn_read spins a bounded URCU_TXN_WAIT_PATIENCE on an UNDECIDED peer
+ * descriptor parked on the word and then falls back to urcu_txn_resolve, which
+ * yields the PRE-COMMIT value.  So a peer whose append is in flight and does
+ * not decide inside that window reads here as NULL, this check answers "plan
+ * ok", and the install CAS is still the arbiter.
+ *
+ * That residue is exactly the exclusion gap and nothing else: a peer can only
+ * have a proxy parked on this chain if it did NOT take the holder.  ⇒ the SW
+ * flip stays gated on completing the lock set (the registry-unowned population
+ * at _cds_ft_insert_replace, the positively peer-claimed holders, and the raw
+ * producers with no audit arm), NOT on this function.  What it does buy is
+ * measured and large: the appended-duplicate race drops from ~12k-15k per
+ * ft_inv leg to the sliver the patience window leaves.
+ *
+ * ☠ VALIDATE EXACTLY WHAT THE WALK WILL RECORD, which is why the tail is
+ * compared against a BARE NULL and not against ft_hlist_unmark(raw): the walk
+ * records {NULL -> MARK(NULL)} there, so an already-marked tail fails that CAS
+ * today.  Answering false here reproduces that outcome through the caller's
+ * retry instead of through an abort -- same decision, made before any
+ * structural work rather than after it.
+ *
+ * A SHORTER chain matters too: the freeze walk stops at NULL (`i < len &&
+ * head`), so a chain that lost members since the count would silently freeze
+ * fewer than planned.  Both directions are the same staleness and both answer
+ * false.
+ *
+ * Returns true when the chain is EXACTLY @len nodes and the last one's forward
+ * word is still NULL.  The caller must treat false as RETRIABLE -- the plan is
+ * stale, not wrong -- and must not have made any reader-visible change yet.
+ */
+static inline
+bool ft_hlist_chain_plan_ok(const struct cds_ft *ft, struct urcu_txn *txn,
+		struct cds_ft_node *head, unsigned int len)
+{
+	unsigned int i;
+
+	(void) ft;
+	if (!len)
+		return true;		/* nothing planned, nothing to check */
+	for (i = 0; i < len; i++) {
+		void *raw;
+
+		if (!head) {
+			FT_HLIST_PLAN_WHY(0);
+			return false;	/* shorter than @len: stale */
+		}
+		raw = urcu_txn_load_committed(txn, (void **) &head->next,
+				FT_HLIST_TAG);
+		if (i + 1 == len) {
+			/*
+			 * ☠ END-OF-CHAIN MEANS WHAT THE COUNT MEANT BY IT.
+			 * ft_hlist_chain_len walks with ft_hlist_resolve, which
+			 * UNMARKS -- so a tail that is already logically deleted
+			 * but still linked (frozen without an unlink) is counted
+			 * as the last node, its word holding MARK(NULL).  A
+			 * check that demanded a bare NULL here refused that
+			 * shape, and the refusal is STABLE across the retry
+			 * because nothing about it changes: MEASURED as a
+			 * livelock in inv_concurrent_insert_replace_nolist,
+			 * with the classifier reading TAIL_MARKED=8,
+			 * TAIL_LIVE=0 -- i.e. every refusal was this
+			 * disagreement and NOT ONE was the appended duplicate
+			 * the check exists for.
+			 *
+			 * So agree with the count: the plan is stale only when
+			 * the chain really continues.
+			 *
+			 * ☠ AND A MARKED TAIL IS A SEPARATE, PRE-EXISTING
+			 * DEFECT, recorded here because this check is what
+			 * found it.  ft_hlist_freeze_chain_prepare FORCES its
+			 * tail's expected-old to NULL (`succ = NULL` at
+			 * i + 1 == len), which also defeats its own
+			 * already-marked skip -- so on that shape it records
+			 * {NULL -> MARK(NULL)} against a word already holding
+			 * MARK(NULL).  Under MW the CAS just fails and the op
+			 * retries.  ☠☠ Under SW that record PARKS, and its
+			 * ABORT writes old_ptr back BLIND -- UNMARKING a node a
+			 * peer froze.  The flip cannot happen until the tail
+			 * reads its word instead of assuming it.
+			 */
+			if (ft_hlist_unmark(raw) == NULL) {
+				if (raw != NULL)
+					FT_HLIST_PLAN_WHY(1);
+				return true;
+			}
+			FT_HLIST_PLAN_WHY(2);
+			return false;
+		}
+		head = ft_hlist_unmark(raw);
+	}
+	return false;			/* unreachable */
+}
 
 /*
  * ft_hlist_freeze_chain_prepare: freeze the chain at @head into @txn -- one

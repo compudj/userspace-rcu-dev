@@ -4795,6 +4795,58 @@ restart_replace_attempt:
 					 */
 					if (displaced) {
 						ft_ch_audit(ft, txn, displaced);
+						/*
+						 * ★ VALIDATE THE PLAN UNDER THE LOCK (Mathieu,
+						 * 2026-09-19).  @nr_disp was counted at the top of
+						 * this block, BEFORE the acquires above, so the
+						 * freeze's derived tail NULL has been standing in
+						 * for the exclusion that count did not have --
+						 * MEASURED at this arm's derivation site as 13,683
+						 * (per-node) / 14,337 (exponential) tail
+						 * disagreements per ft_inv leg, the largest of them.
+						 *
+						 * The holder is held HERE, so ask the word instead
+						 * of letting the install CAS arbitrate it.  Same
+						 * decision, taken before any record is filed.
+						 * ☠ It SHRINKS the window the CAS arbitrates; it
+						 * does not replace the CAS -- an UNDECIDED peer proxy
+						 * outlasting urcu_txn_read's patience window still
+						 * reads as NULL.  See ft_hlist_chain_plan_ok's header.
+						 *
+						 * ☠ Nothing is live-stored yet on this arm: the txn
+						 * is pre-reserved "BEFORE any live store", the
+						 * sedges are records, and the cell flip below is the
+						 * first install -- whose own failure path is this
+						 * very bail.  The retry re-descends against an
+						 * untouched structure.
+						 */
+						if (!ft_hlist_chain_plan_ok(ft,
+								ft_flip_txn_handle(txn),
+								displaced, nr_disp)) {
+							FT_HLIST_PLAN_BAIL();
+							/*
+							 * ☠ THE COMMIT IS ALSO THE CLEANUP, and
+							 * this bail is PRE-commit.  @txn already
+							 * carries the holder's registered lock
+							 * (the acquire above) and the sedge
+							 * records, and insert_replace_done's
+							 * -EAGAIN arm destroys @ic.txn -- a
+							 * DIFFERENT handle -- so leaving without
+							 * a terminal here leaks FT_STATE_LOCK on
+							 * the holder and every peer is refused it
+							 * forever.  MEASURED exactly that: the
+							 * first spelling of this bail wedged
+							 * inv_concurrent_insert_replace_nolist
+							 * past 120 s against a 4.7 s control,
+							 * with the ledger printing "FT REFUSED
+							 * (LOCK, unknown holder)" in a loop.
+							 * ft_flip_txn_destroy is the pre-commit
+							 * terminal that drains the registry.
+							 */
+							ft_flip_txn_destroy(txn);
+							ret = -EAGAIN;
+							goto insert_replace_done;
+						}
 						ft_hlist_freeze_chain_prepare(ft, ft_flip_txn_handle(txn),
 							displaced, nr_disp);
 					}
@@ -4920,6 +4972,58 @@ restart_replace_attempt:
 					 */
 					if (displaced) {
 						ft_ch_audit(ft, txn, displaced);
+						/*
+						 * ★ VALIDATE THE PLAN UNDER THE LOCK (Mathieu,
+						 * 2026-09-19).  @nr_disp was counted at the top of
+						 * this block, BEFORE the acquires above, so the
+						 * freeze's derived tail NULL has been standing in
+						 * for the exclusion that count did not have --
+						 * MEASURED at this arm's derivation site as 13,683
+						 * (per-node) / 14,337 (exponential) tail
+						 * disagreements per ft_inv leg, the largest of them.
+						 *
+						 * The holder is held HERE, so ask the word instead
+						 * of letting the install CAS arbitrate it.  Same
+						 * decision, taken before any record is filed.
+						 * ☠ It SHRINKS the window the CAS arbitrates; it
+						 * does not replace the CAS -- an UNDECIDED peer proxy
+						 * outlasting urcu_txn_read's patience window still
+						 * reads as NULL.  See ft_hlist_chain_plan_ok's header.
+						 *
+						 * ☠ Nothing is live-stored yet on this arm: the txn
+						 * is pre-reserved "BEFORE any live store", the
+						 * sedges are records, and the cell flip below is the
+						 * first install -- whose own failure path is this
+						 * very bail.  The retry re-descends against an
+						 * untouched structure.
+						 */
+						if (!ft_hlist_chain_plan_ok(ft,
+								ft_flip_txn_handle(txn),
+								displaced, nr_disp)) {
+							FT_HLIST_PLAN_BAIL();
+							/*
+							 * ☠ THE COMMIT IS ALSO THE CLEANUP, and
+							 * this bail is PRE-commit.  @txn already
+							 * carries the holder's registered lock
+							 * (the acquire above) and the sedge
+							 * records, and insert_replace_done's
+							 * -EAGAIN arm destroys @ic.txn -- a
+							 * DIFFERENT handle -- so leaving without
+							 * a terminal here leaks FT_STATE_LOCK on
+							 * the holder and every peer is refused it
+							 * forever.  MEASURED exactly that: the
+							 * first spelling of this bail wedged
+							 * inv_concurrent_insert_replace_nolist
+							 * past 120 s against a 4.7 s control,
+							 * with the ledger printing "FT REFUSED
+							 * (LOCK, unknown holder)" in a loop.
+							 * ft_flip_txn_destroy is the pre-commit
+							 * terminal that drains the registry.
+							 */
+							ft_flip_txn_destroy(txn);
+							ret = -EAGAIN;
+							goto insert_replace_done;
+						}
 						ft_hlist_freeze_chain_prepare(ft, ft_flip_txn_handle(txn),
 							displaced, nr_disp);
 					}
@@ -5130,6 +5234,58 @@ restart_replace_attempt:
 					 */
 					if (displaced) {
 						ft_ch_audit(ft, txn, displaced);
+						/*
+						 * ★ VALIDATE THE PLAN UNDER THE LOCK (Mathieu,
+						 * 2026-09-19).  @nr_disp was counted at the top of
+						 * this block, BEFORE the acquires above, so the
+						 * freeze's derived tail NULL has been standing in
+						 * for the exclusion that count did not have --
+						 * MEASURED at this arm's derivation site as 13,683
+						 * (per-node) / 14,337 (exponential) tail
+						 * disagreements per ft_inv leg, the largest of them.
+						 *
+						 * The holder is held HERE, so ask the word instead
+						 * of letting the install CAS arbitrate it.  Same
+						 * decision, taken before any record is filed.
+						 * ☠ It SHRINKS the window the CAS arbitrates; it
+						 * does not replace the CAS -- an UNDECIDED peer proxy
+						 * outlasting urcu_txn_read's patience window still
+						 * reads as NULL.  See ft_hlist_chain_plan_ok's header.
+						 *
+						 * ☠ Nothing is live-stored yet on this arm: the txn
+						 * is pre-reserved "BEFORE any live store", the
+						 * sedges are records, and the cell flip below is the
+						 * first install -- whose own failure path is this
+						 * very bail.  The retry re-descends against an
+						 * untouched structure.
+						 */
+						if (!ft_hlist_chain_plan_ok(ft,
+								ft_flip_txn_handle(txn),
+								displaced, nr_disp)) {
+							FT_HLIST_PLAN_BAIL();
+							/*
+							 * ☠ THE COMMIT IS ALSO THE CLEANUP, and
+							 * this bail is PRE-commit.  @txn already
+							 * carries the holder's registered lock
+							 * (the acquire above) and the sedge
+							 * records, and insert_replace_done's
+							 * -EAGAIN arm destroys @ic.txn -- a
+							 * DIFFERENT handle -- so leaving without
+							 * a terminal here leaks FT_STATE_LOCK on
+							 * the holder and every peer is refused it
+							 * forever.  MEASURED exactly that: the
+							 * first spelling of this bail wedged
+							 * inv_concurrent_insert_replace_nolist
+							 * past 120 s against a 4.7 s control,
+							 * with the ledger printing "FT REFUSED
+							 * (LOCK, unknown holder)" in a loop.
+							 * ft_flip_txn_destroy is the pre-commit
+							 * terminal that drains the registry.
+							 */
+							ft_flip_txn_destroy(txn);
+							ret = -EAGAIN;
+							goto insert_replace_done;
+						}
 						ft_hlist_freeze_chain_prepare(ft, ft_flip_txn_handle(txn),
 							displaced, nr_disp);
 					}
@@ -5266,6 +5422,58 @@ restart_replace_attempt:
 					 */
 					if (displaced) {
 						ft_ch_audit(ft, txn, displaced);
+						/*
+						 * ★ VALIDATE THE PLAN UNDER THE LOCK (Mathieu,
+						 * 2026-09-19).  @nr_disp was counted at the top of
+						 * this block, BEFORE the acquires above, so the
+						 * freeze's derived tail NULL has been standing in
+						 * for the exclusion that count did not have --
+						 * MEASURED at this arm's derivation site as 13,683
+						 * (per-node) / 14,337 (exponential) tail
+						 * disagreements per ft_inv leg, the largest of them.
+						 *
+						 * The holder is held HERE, so ask the word instead
+						 * of letting the install CAS arbitrate it.  Same
+						 * decision, taken before any record is filed.
+						 * ☠ It SHRINKS the window the CAS arbitrates; it
+						 * does not replace the CAS -- an UNDECIDED peer proxy
+						 * outlasting urcu_txn_read's patience window still
+						 * reads as NULL.  See ft_hlist_chain_plan_ok's header.
+						 *
+						 * ☠ Nothing is live-stored yet on this arm: the txn
+						 * is pre-reserved "BEFORE any live store", the
+						 * sedges are records, and the cell flip below is the
+						 * first install -- whose own failure path is this
+						 * very bail.  The retry re-descends against an
+						 * untouched structure.
+						 */
+						if (!ft_hlist_chain_plan_ok(ft,
+								ft_flip_txn_handle(txn),
+								displaced, nr_disp)) {
+							FT_HLIST_PLAN_BAIL();
+							/*
+							 * ☠ THE COMMIT IS ALSO THE CLEANUP, and
+							 * this bail is PRE-commit.  @txn already
+							 * carries the holder's registered lock
+							 * (the acquire above) and the sedge
+							 * records, and insert_replace_done's
+							 * -EAGAIN arm destroys @ic.txn -- a
+							 * DIFFERENT handle -- so leaving without
+							 * a terminal here leaks FT_STATE_LOCK on
+							 * the holder and every peer is refused it
+							 * forever.  MEASURED exactly that: the
+							 * first spelling of this bail wedged
+							 * inv_concurrent_insert_replace_nolist
+							 * past 120 s against a 4.7 s control,
+							 * with the ledger printing "FT REFUSED
+							 * (LOCK, unknown holder)" in a loop.
+							 * ft_flip_txn_destroy is the pre-commit
+							 * terminal that drains the registry.
+							 */
+							ft_flip_txn_destroy(txn);
+							ret = -EAGAIN;
+							goto insert_replace_done;
+						}
 						ft_hlist_freeze_chain_prepare(ft, ft_flip_txn_handle(txn),
 							displaced, nr_disp);
 					}
