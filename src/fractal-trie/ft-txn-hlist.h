@@ -305,6 +305,19 @@ int ft_hlist_store_chain_at(const char *fn, int line, const struct cds_ft *ft,
 	 *   _cds_ft_remove_all_locked:9301 347 /     523    37% /   62%     0
 	 *   _cds_ft_insert_replace:5160 13,683 /  14,337    22% /   22%   834 / 1,094
 	 *
+	 * Reproduced on a second pair of legs (11,111 / 23,382 at :8211, again
+	 * 100% / 100%).  ☠ AND THE TWO POSITIVE WITNESSES DO NOT CONTRADICT EACH
+	 * OTHER: "our registry owns it AND a peer claims it" -- which cannot both
+	 * be true, since ft_meta_lock_acquire refuses an already-LOCKed word -- is
+	 * **0 on every row at both spacings**.  So the peer claims below are
+	 * DISJOINT from our own holds and are not an artefact of reading two
+	 * witnesses at once.
+	 *
+	 * The chain hold audit's own columns show the same split from the other
+	 * side, per ft_inv per-node leg: ft_detach_node:5153 REG 2,584,875 /
+	 * LED 0, against ft_chain_node:2993 REG 0 / LED 2,129,588.  The stack-held
+	 * shape is the one the stamp can see, and it is the MINORITY.
+	 *
 	 * ⇒ cds_ft_remove's SOLE-ENTRY path, the row the withdrawn reading named
 	 * as holding nothing, owns the chain's holder at 100% of its
 	 * disagreements, by the one witness a park is licensed by.  Since
@@ -322,7 +335,8 @@ int ft_hlist_store_chain_at(const char *fn, int line, const struct cds_ft *ft,
 	 * taken at the holder acquire; it has not been run.
 	 *
 	 * ☠ A PEER POSITIVELY OWNING THE HOLDER SURVIVES ALL OF THIS, at
-	 * _cds_ft_insert_replace:5160 (834 per-node / 1,094 exponential).  The
+	 * _cds_ft_insert_replace:5160 (834-1,041 per-node / 1,094-1,143
+	 * exponential, two legs each, and DISJOINT from our own hold).  The
 	 * ledger can over-report a leaked entry but cannot invent a stack hold, so
 	 * this is a positive observation and does not explain away.  Under MW the
 	 * install CAS arbitrates it and the commit aborts.  An SW park cannot
@@ -349,7 +363,9 @@ int ft_hlist_store_chain_at(const char *fn, int line, const struct cds_ft *ft,
 	 * that separates a stale plan from an appender gap on the sole path; close
 	 * _cds_ft_insert_replace:5160 (78% registry-unowned, plus the peer claims
 	 * above) and _cds_ft_remove_all_locked:9301; account for the 8 per-node
-	 * events at :7969 that :8211 and both exponential rows do not have; re-run
+	 * events at :7969 that :8211 and both exponential rows do not have (0 of 8
+	 * and 0 of 12 over two per-node legs, against 37/37 and 25/25 at
+	 * exponential -- reproducible, and per-node ONLY); re-run
 	 * this table to a measured zero UNOWNED -- on the REGISTRY, never on the
 	 * stamp -- and only then dispatch SW here unconditionally, never on a
 	 * per-txn predicate, which is what made the kind a property of the asking
@@ -861,6 +877,19 @@ struct ft_hlist_why_site {
 	 */
 	unsigned long reg_own, led_own, reg_or_led, ftxn_none, ftxn_stale;
 	/*
+	 * ☠ THE CONTRADICTION COLUMN.  @excl_foreign says a PEER positively
+	 * claims the chain's holder; @reg_own says THIS txn's registry holds the
+	 * same word.  Both cannot be true -- ft_meta_lock_acquire refuses a word
+	 * that already carries FT_STATE_LOCK -- so an overlap is either a real
+	 * exclusion violation or an artefact of one of the two witnesses (a
+	 * ledger entry leaked past its op, or a registry entry whose release is
+	 * recorded but whose commit has not landed).  Counted rather than
+	 * assumed away, because "a peer holds it" is the one column in this table
+	 * that a blindness argument does NOT explain, and it only carries that
+	 * weight if it is disjoint from our own hold.
+	 */
+	unsigned long reg_and_peer;
+	/*
 	 * ☠ AND THE MODE, because "NOBODY claims the holder" is only a gap
 	 * under FINE.  A COARSE trie serialises every writer behind the FT-wide
 	 * mutex and an EXCLUSIVE trie has one writer, so neither ever claims a
@@ -934,6 +963,8 @@ static void ft_hlist_why_report(void)
 				"(no ftxn stamped=%lu, stale=%lu)\n",
 				e->reg_own, e->led_own, e->reg_or_led,
 				e->ftxn_none, e->ftxn_stale);
+			fprintf(stderr, "      ☠ REGISTRY owns it AND a PEER claims it "
+				"(must be 0): %lu\n", e->reg_and_peer);
 			fprintf(stderr, "      NOBODY splits: FINE(a real gap)=%lu  "
 				"coarse=%lu  exclusive=%lu  FT-wide-lock-held=%lu\n",
 				e->none_fine, e->none_coarse, e->none_excl,
@@ -1010,6 +1041,8 @@ void ft_hlist_why_tail(struct cds_ft *ft, struct urcu_txn *txn,
 				uatomic_inc(&e->led_own);
 			if (reg || led)
 				uatomic_inc(&e->reg_or_led);
+			if (reg && owner && owner != (unsigned long) pthread_self())
+				uatomic_inc(&e->reg_and_peer);
 		}
 		if (!owner) {
 			uatomic_inc(&e->excl_none);

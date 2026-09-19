@@ -1218,6 +1218,46 @@ ft_inv, `-O2 -g -DNDEBUG`, 152/152 green at both spacings:
 owns outright -- the demonstration, at matched points, that the stamp was
 reporting *"this hold was registered"* and not *"there is no hold"*.
 
+Reproduced on a second pair of legs (11,111 / 23,382 disagreements at `:8211`,
+again 100% / 100% registry-owned).
+
+☠ **AND THE TWO POSITIVE WITNESSES DO NOT CONTRADICT EACH OTHER.** "Our registry
+owns the holder AND a peer claims it" cannot both be true -- `ft_meta_lock_acquire`
+refuses a word that already carries `FT_STATE_LOCK` -- so the classifier counts
+the overlap. It is **0 on every row at both spacings**. The peer claims are
+therefore DISJOINT from our own holds, not an artefact of reading two witnesses
+at once, and they keep their weight as a finding.
+
+The chain hold audit shows the same split from the other side. Per ft_inv
+per-node leg, the `chain` word rows:
+
+| site | total | HELD(reg) | HELD(led) | HELD(ctx) | UNHELD |
+|---|---|---|---|---|---|
+| `ft_detach_node:5153` | 4,086,233 | **2,584,875** | **0** | 929,773 | 0 |
+| `ft_chain_node:2993` | 2,446,554 | **0** | **2,129,588** | 0 | 0 |
+| `ft_promote_head:6319` | 156,788 | 156,780 | 0 | 0 | 0 |
+| `ft_chain_compress_fused:2371` | 279,141 | 172,729 | 0 | 39,254 | 0 |
+| `_cds_ft_remove_all_locked:9222/8858/8903` | 145,704 / 84,432 / 22,505 | all | 0 | 0 | 0 |
+| `_cds_ft_replace_locked:6146` | 174,896 | 0 | 46,904 | 0 | 0 |
+| `ft_detach_node_replace_compressed_parent` | 75,664 | 0 | 0 | 75,549 | 0 |
+
+The stack-anchor shape (`ft_chain_node`, `_cds_ft_replace_locked` -- the point
+ops, which take the holder into an `ft_held_anchor` BEFORE creating the content
+txn) is the one the stamp CAN see, and it is the minority. Everything the
+transition has already converted reads REG-held / LED-zero, which is precisely
+the population the withdrawn verdict scored as unprotected.
+
+☞ And it re-frames what the union objection actually forbids. "A park is
+licensed by the registry alone" was written when the flip was PREDICATE-based
+(`ft_flip_txn_owns` choosing SW or MW per record); there, a hold the predicate
+cannot see is useless. For an UNCONDITIONAL dispatch there is no predicate, and
+`ft_flip_txn_owns`' own header applies -- *"read a miss as 'the registry cannot
+see this hold', never as 'the op does not hold it'"*. So the union is not
+disqualified as EVIDENCE OF EXCLUSION; it is disqualified as a RUNTIME GATE.
+Which of the two the next attempt needs decides whether `ft_chain_node`'s
+REG = 0 / LED = 2.1M row is a gap or a bookkeeping difference. ☐ Not decided
+here.
+
 `ft_flip_txn_owns` is EXACT at per-node and conservative above it (a coarser
 anchor is held while the owner itself is absent), so these percentages are
 **lower bounds** on ownership, which is the right direction for licensing a
@@ -1250,13 +1290,15 @@ ft_inv's concurrency, so ft_unit cannot certify it either way.
   100% of them). **The discriminator is a snapshot of the tail word taken at
   the holder acquire.** Both cures are local; neither is a scope change.
 * ☐ `_cds_ft_insert_replace:5160` is now the strongest real gap: 78%
-  registry-unowned, plus 834 / 1,094 events where a **peer positively claims**
-  the holder while this op records into that chain. A stack hold is what the
-  ledger CAN see, so that column does not explain away.
+  registry-unowned, plus 834-1,041 / 1,094-1,143 events (two legs each) where a
+  **peer positively claims** the holder while this op records into that chain,
+  DISJOINT from our own holds. A stack hold is what the ledger CAN see, so that
+  column does not explain away.
 * ☐ `_cds_ft_remove_all_locked:9301`: 63% / 38% registry-unowned.
-* ☐ The **8** per-node events at `:7969` the registry does not own, when
-  `:8211` is 100% and both exponential rows are 100%. Small is not zero and a
-  tolerated residue is not a licence.
+* ☐ The per-node events at `:7969` the registry does not own -- 0 of 8 and 0 of
+  12 over two legs, against 37/37 and 25/25 at exponential, and `:8211` at 100%
+  in all four. Reproducible, per-node ONLY, and small is not zero: a tolerated
+  residue is not a licence.
 
 
 #### What the flip costs, so the next attempt does not rediscover it
