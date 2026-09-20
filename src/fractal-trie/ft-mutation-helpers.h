@@ -7448,6 +7448,19 @@ void __ft_flip_txn_record_tag_ctx(struct ft_flip_txn *t,
 		FT_TK_COUNT_REC(t, FT_TK_TXN_IS_TAKE(t) ?
 				FT_TK_MW_LOCK : FT_TK_MW_STRUCT);
 		/*
+		 * ☞ AND IF THE TXN WAS ARMED, SAY SO HERE -- this is the only
+		 * point that knows the record stayed MW_STRUCT.  The OWN split
+		 * above skips an armed txn, so these used to be counted in
+		 * MW_STRUCT and in none of the OWN columns, which is why their
+		 * stated invariant fell ~350k short every leg.  Counted here it
+		 * closes by construction: unarmed MW_STRUCT goes to the OWN
+		 * three-way (plus RETIRE), armed MW_STRUCT goes to one of these
+		 * two, and nothing else reaches FT_TK_MW_STRUCT.
+		 */
+		if (t->structural_sw && !FT_TK_TXN_IS_TAKE(t))
+			FT_TK_COUNT_REC(t, t->sw_per_op ?
+				FT_TK_OWN_ARMED_PEROP : FT_TK_OWN_ARMED_WIDE);
+		/*
 		 * ★ THE WITNESS TRAVELS WITH THE RECORD, because that is the
 		 * whole detector: a structural edge whose owner the op HOLDS
 		 * losing its CAS is a lock that did not exclude somebody, not

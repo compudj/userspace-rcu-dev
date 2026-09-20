@@ -148,6 +148,32 @@ enum ft_tk_rec_class {
 	 * like the ordered cell list's [DESIGN] MW, and it is not answered here.
 	 */
 	FT_TK_OWN_RETIRE,
+	/*
+	 * ☠ THE POPULATION THE OWN SPLIT USED TO DROP ON THE FLOOR, and dropping
+	 * it is why this table's own stated invariant -- "OWN_HELD + OWN_MISS ==
+	 * MW_STRUCT is an invariant of the table, and a useful self-check on it"
+	 * -- did NOT hold: ~350k short per ft_inv leg, every leg, for as long as
+	 * the arm gate has existed.  A self-check that does not close is not a
+	 * self-check, so count what was dropped instead of narrating it.
+	 *
+	 * An ALREADY-ARMED txn is excluded from the three-way split, and the
+	 * reason given is that "a COARSE or exclusive trie excludes every peer".
+	 * That is true of the TRIE-WIDE arm and false of the PER-OP one, which
+	 * @sw_per_op exists to tell apart: the trie-wide arm rests on the FT-wide
+	 * mutex or an exclusive trie, while the per-op arm rests on THIS op's own
+	 * lock registry -- "Only the second can be wrong for a given record".
+	 * So the two are counted apart:
+	 *
+	 *   ARMED_WIDE   no question to ask; the exclusion is trie-wide.
+	 *   ARMED_PEROP  the PER-RECORD gate was asked and REFUSED the park --
+	 *                it kept the record MW because the op does not own the
+	 *                owner.  Safe (MW always is), and NOT a defect: it is the
+	 *                gate working.  But it is the conversion's own residue on
+	 *                an already-converted op, so it belongs in the table
+	 *                rather than outside it.
+	 */
+	FT_TK_OWN_ARMED_WIDE,
+	FT_TK_OWN_ARMED_PEROP,
 	FT_TK_REC_NR,
 };
 
@@ -1385,11 +1411,12 @@ void ft_tk_dump(void)
 	fprintf(stderr,
 "\n=== FT_DEBUG_TXN_KIND: record kind + commit outcome, per txn creation site ===\n"
 "    threads=%d sites=%d\n"
-"%-44s %9s %7s %10s %10s %10s %10s %8s %10s %10s %9s %10s %10s %9s %8s %7s %8s\n",
+"%-44s %9s %7s %10s %10s %10s %10s %8s %10s %10s %9s %10s %10s %10s %10s %9s %8s %7s %8s\n",
 		threads, nr,
 		"site", "created", "armSW",
 		"SW", "MW_STRUCT", "MW_ALWAYS", "MW_LOCK", "VALID",
 		"OWN_HELD", "OWN_LEDGER", "OWN_MISS", "OWN_RETIRE",
+		"ARM_WIDE", "ARM_OP",
 		"OK", "ABORT", "MEMERR", "MISS", "BAILED");
 	for (i = 0; i < nr; i++) {
 		int c;
@@ -1401,13 +1428,15 @@ void ft_tk_dump(void)
 		else
 			snprintf(name, sizeof(name), "%s", rows[i].site->file);
 		fprintf(stderr,
-"%-44s %9lu %7lu %10lu %10lu %10lu %10lu %8lu %10lu %10lu %9lu %10lu %10lu %9lu %8lu %7lu %8lu\n",
+"%-44s %9lu %7lu %10lu %10lu %10lu %10lu %8lu %10lu %10lu %9lu %10lu %10lu %10lu %10lu %9lu %8lu %7lu %8lu\n",
 			name, rows[i].created, rows[i].armed,
 			rows[i].rec[FT_TK_SW], rows[i].rec[FT_TK_MW_STRUCT],
 			rows[i].rec[FT_TK_MW_ALWAYS], rows[i].rec[FT_TK_MW_LOCK],
 			rows[i].rec[FT_TK_VALIDATE],
 			rows[i].rec[FT_TK_OWN_HELD], rows[i].rec[FT_TK_OWN_LEDGER],
 			rows[i].rec[FT_TK_OWN_MISS], rows[i].rec[FT_TK_OWN_RETIRE],
+			rows[i].rec[FT_TK_OWN_ARMED_WIDE],
+			rows[i].rec[FT_TK_OWN_ARMED_PEROP],
 			rows[i].end[FT_TK_OK], rows[i].end[FT_TK_ABORT],
 			rows[i].end[FT_TK_MEMERR], rows[i].end[FT_TK_MISS],
 			rows[i].end[FT_TK_BAILED]);
@@ -1419,13 +1448,14 @@ void ft_tk_dump(void)
 		tot.armed += rows[i].armed;
 	}
 	fprintf(stderr,
-"%-44s %9lu %7lu %10lu %10lu %10lu %10lu %8lu %10lu %10lu %9lu %10lu %10lu %9lu %8lu %7lu %8lu\n",
+"%-44s %9lu %7lu %10lu %10lu %10lu %10lu %8lu %10lu %10lu %9lu %10lu %10lu %10lu %10lu %9lu %8lu %7lu %8lu\n",
 		"TOTAL", tot.created, tot.armed,
 		tot.rec[FT_TK_SW], tot.rec[FT_TK_MW_STRUCT],
 		tot.rec[FT_TK_MW_ALWAYS], tot.rec[FT_TK_MW_LOCK],
 		tot.rec[FT_TK_VALIDATE],
 		tot.rec[FT_TK_OWN_HELD], tot.rec[FT_TK_OWN_LEDGER],
 		tot.rec[FT_TK_OWN_MISS], tot.rec[FT_TK_OWN_RETIRE],
+		tot.rec[FT_TK_OWN_ARMED_WIDE], tot.rec[FT_TK_OWN_ARMED_PEROP],
 		tot.end[FT_TK_OK], tot.end[FT_TK_ABORT],
 		tot.end[FT_TK_MEMERR], tot.end[FT_TK_MISS],
 		tot.end[FT_TK_BAILED]);
@@ -1622,7 +1652,30 @@ void ft_tk_dump(void)
 "    OWN_HELD/OWN_LEDGER/OWN_MISS split MW_STRUCT (the surface) by whether the op holds the word's owner; they sum to it:\n"
 "      OWN_HELD   the txn registry names it.  OWN_LEDGER  only this thread's hold ledger does (a REGISTRY gap;\n"
 "      needs -DFEATURE_FT_HOLD_TRACE or it reads 0).  OWN_MISS  neither: a real exclusion gap.\n"
-"    a site with OWN_MISS == 0 is ready for the Phase B per-op arm; OWN_MISS is the size of its exclusion gap.\n\n");
+"    a site with OWN_MISS == 0 is ready for the Phase B per-op arm; OWN_MISS is the size of its exclusion gap.\n"
+"      OWN_RETIRE  the record's owner IS the node it tombstones -- unregisterable by construction, not an obligation.\n"
+"      ARM_WIDE / ARM_OP  MW_STRUCT on an ALREADY-ARMED txn: trie-wide (no question) vs per-op (the per-record\n"
+"      gate was asked and REFUSED the park).\n");
+	{
+		unsigned long own_sum = tot.rec[FT_TK_OWN_HELD] +
+			tot.rec[FT_TK_OWN_LEDGER] + tot.rec[FT_TK_OWN_MISS] +
+			tot.rec[FT_TK_OWN_RETIRE] +
+			tot.rec[FT_TK_OWN_ARMED_WIDE] +
+			tot.rec[FT_TK_OWN_ARMED_PEROP];
+
+		/*
+		 * ☠ THE SELF-CHECK CHECKS.  It used to be a sentence claiming
+		 * the columns sum to MW_STRUCT; they did not, by ~350k a leg,
+		 * and nobody noticed because nothing subtracted them.  Print
+		 * the delta so an unattributed record branch announces itself.
+		 */
+		fprintf(stderr,
+"    SELF-CHECK  the six OWN_* columns vs MW_STRUCT: %lu vs %lu, delta %ld%s\n\n",
+			own_sum, tot.rec[FT_TK_MW_STRUCT],
+			(long) tot.rec[FT_TK_MW_STRUCT] - (long) own_sum,
+			own_sum == tot.rec[FT_TK_MW_STRUCT] ? "" :
+				"  ☠ a record branch counts into MW_STRUCT and into no OWN column");
+	}
 	free(rows);
 }
 
