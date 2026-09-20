@@ -121,6 +121,33 @@ enum ft_tk_rec_class {
 	 */
 	FT_TK_OWN_LEDGER,
 	FT_TK_OWN_MISS,
+	/*
+	 * ☠ A RETIRE CAN NEVER BE OWNER-HELD IN THE REGISTRY, so counting it in
+	 * OWN_MISS reads a lane that cannot close as open work -- exactly what
+	 * the DLM TAKE carve-out above exists to stop, and the same shape.
+	 *
+	 * ft_flip_txn_record_tombstone records {old -> old|TOMBSTONE} on the
+	 * RETIRED NODE'S OWN state word, so the record's owner IS the node being
+	 * killed.  ft_flip_txn_owns' header already names this as the documented
+	 * counterexample: where the anchor IS the retired node, the site
+	 * "records the fused terminal and REGISTERS NOTHING, because a
+	 * tombstoned word is unclaimable forever and the caller's release sweep
+	 * is therefore correct on BOTH outcomes with no per-commit bookkeeping."
+	 * Registering it would buy nothing -- nobody can take the word again.
+	 *
+	 * MEASURED: this lane was the ENTIRE remaining OWN_MISS after the
+	 * doomed-commit split -- 222,210 records per ft_inv leg, all reaching
+	 * ft_flip_txn_record_tombstone from the graft's three glue txns, whose
+	 * own comments call them "fused free-list tombstones (§4.B)".
+	 *
+	 * ☠☠ AND THIS IS A CLASSIFICATION, NOT A CLEARANCE.  It says the
+	 * REGISTRY cannot answer for a retire, which is why the lane does not
+	 * belong in a Phase B obligation count.  It does NOT say a retire may
+	 * park SW: whether {live -> tombstone} on a word peers still guard and
+	 * validate can be a blind store is a DISPOSITION question of its own,
+	 * like the ordered cell list's [DESIGN] MW, and it is not answered here.
+	 */
+	FT_TK_OWN_RETIRE,
 	FT_TK_REC_NR,
 };
 
@@ -1358,11 +1385,11 @@ void ft_tk_dump(void)
 	fprintf(stderr,
 "\n=== FT_DEBUG_TXN_KIND: record kind + commit outcome, per txn creation site ===\n"
 "    threads=%d sites=%d\n"
-"%-44s %9s %7s %10s %10s %10s %10s %8s %10s %10s %9s %10s %9s %8s %7s %8s\n",
+"%-44s %9s %7s %10s %10s %10s %10s %8s %10s %10s %9s %10s %10s %9s %8s %7s %8s\n",
 		threads, nr,
 		"site", "created", "armSW",
 		"SW", "MW_STRUCT", "MW_ALWAYS", "MW_LOCK", "VALID",
-		"OWN_HELD", "OWN_LEDGER", "OWN_MISS",
+		"OWN_HELD", "OWN_LEDGER", "OWN_MISS", "OWN_RETIRE",
 		"OK", "ABORT", "MEMERR", "MISS", "BAILED");
 	for (i = 0; i < nr; i++) {
 		int c;
@@ -1374,13 +1401,13 @@ void ft_tk_dump(void)
 		else
 			snprintf(name, sizeof(name), "%s", rows[i].site->file);
 		fprintf(stderr,
-"%-44s %9lu %7lu %10lu %10lu %10lu %10lu %8lu %10lu %10lu %9lu %10lu %9lu %8lu %7lu %8lu\n",
+"%-44s %9lu %7lu %10lu %10lu %10lu %10lu %8lu %10lu %10lu %9lu %10lu %10lu %9lu %8lu %7lu %8lu\n",
 			name, rows[i].created, rows[i].armed,
 			rows[i].rec[FT_TK_SW], rows[i].rec[FT_TK_MW_STRUCT],
 			rows[i].rec[FT_TK_MW_ALWAYS], rows[i].rec[FT_TK_MW_LOCK],
 			rows[i].rec[FT_TK_VALIDATE],
 			rows[i].rec[FT_TK_OWN_HELD], rows[i].rec[FT_TK_OWN_LEDGER],
-			rows[i].rec[FT_TK_OWN_MISS],
+			rows[i].rec[FT_TK_OWN_MISS], rows[i].rec[FT_TK_OWN_RETIRE],
 			rows[i].end[FT_TK_OK], rows[i].end[FT_TK_ABORT],
 			rows[i].end[FT_TK_MEMERR], rows[i].end[FT_TK_MISS],
 			rows[i].end[FT_TK_BAILED]);
@@ -1392,13 +1419,13 @@ void ft_tk_dump(void)
 		tot.armed += rows[i].armed;
 	}
 	fprintf(stderr,
-"%-44s %9lu %7lu %10lu %10lu %10lu %10lu %8lu %10lu %10lu %9lu %10lu %9lu %8lu %7lu %8lu\n",
+"%-44s %9lu %7lu %10lu %10lu %10lu %10lu %8lu %10lu %10lu %9lu %10lu %10lu %9lu %8lu %7lu %8lu\n",
 		"TOTAL", tot.created, tot.armed,
 		tot.rec[FT_TK_SW], tot.rec[FT_TK_MW_STRUCT],
 		tot.rec[FT_TK_MW_ALWAYS], tot.rec[FT_TK_MW_LOCK],
 		tot.rec[FT_TK_VALIDATE],
 		tot.rec[FT_TK_OWN_HELD], tot.rec[FT_TK_OWN_LEDGER],
-		tot.rec[FT_TK_OWN_MISS],
+		tot.rec[FT_TK_OWN_MISS], tot.rec[FT_TK_OWN_RETIRE],
 		tot.end[FT_TK_OK], tot.end[FT_TK_ABORT],
 		tot.end[FT_TK_MEMERR], tot.end[FT_TK_MISS],
 		tot.end[FT_TK_BAILED]);
@@ -1614,6 +1641,7 @@ void ft_tk_dump_at_exit(void)
 #define FT_TK_TXN_FIELDS						\
 	struct ft_tk_site *dbg_site;					\
 	bool dbg_lock_take;						\
+	bool dbg_retire;						\
 	bool dbg_ended;
 
 /*
@@ -1629,6 +1657,7 @@ void ft_tk_dump_at_exit(void)
 	do {								\
 		(t)->dbg_site = (site);					\
 		(t)->dbg_lock_take = false;				\
+		(t)->dbg_retire = false;				\
 		(t)->dbg_ended = false;					\
 		ft_tk_count_created(site);				\
 	} while (0)
@@ -1636,6 +1665,8 @@ void ft_tk_dump_at_exit(void)
 #define FT_TK_TXN_SITE(t)		((t)->dbg_site)
 #define FT_TK_TXN_IS_TAKE(t)		((t)->dbg_lock_take)
 #define FT_TK_TXN_SET_TAKE(t, v)	do { (t)->dbg_lock_take = (v); } while (0)
+#define FT_TK_TXN_IS_RETIRE(t)		((t)->dbg_retire)
+#define FT_TK_TXN_SET_RETIRE(t, v)	do { (t)->dbg_retire = (v); } while (0)
 #define FT_TK_COUNT_REC(t, c)		ft_tk_count_rec((t)->dbg_site, (c))
 /*
  * ☞ WHERE THE MISSES COME FROM, which the census cannot say.
@@ -1761,9 +1792,10 @@ static void ft_tk_miss_pc_report(void)
 #define FT_TK_COUNT_OWN(t, owner)					\
 	do {								\
 		enum ft_tk_rec_class c__ =					\
-			ft_flip_txn_owns((t), (owner)) ? FT_TK_OWN_HELD : \
+			FT_TK_TXN_IS_RETIRE(t) ? FT_TK_OWN_RETIRE :	\
+			(ft_flip_txn_owns((t), (owner)) ? FT_TK_OWN_HELD : \
 			(ft_hold_trace_holds((owner)) ? FT_TK_OWN_LEDGER : \
-				FT_TK_OWN_MISS);			\
+				FT_TK_OWN_MISS));			\
 									\
 		ft_tk_count_rec((t)->dbg_site, c__);			\
 		if (c__ == FT_TK_OWN_MISS)				\
@@ -1847,6 +1879,8 @@ struct ft_tk_site;	/* incomplete: the NULL the constructors take */
 #define FT_TK_TXN_INIT(t, site)		do { } while (0)
 #define FT_TK_TXN_IS_TAKE(t)		0
 #define FT_TK_TXN_SET_TAKE(t, v)	do { } while (0)
+#define FT_TK_TXN_IS_RETIRE(t)		0
+#define FT_TK_TXN_SET_RETIRE(t, v)	do { } while (0)
 #define FT_TK_COUNT_REC(t, c)		do { } while (0)
 #define FT_TK_COUNT_OWN(t, held)	do { } while (0)
 #define FT_TK_COUNT_END(t, c)		do { } while (0)

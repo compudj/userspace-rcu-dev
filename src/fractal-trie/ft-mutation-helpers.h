@@ -11385,8 +11385,19 @@ uintptr_t ft_flip_txn_record_tombstone(struct ft_flip_txn *t,
 	uintptr_t old = (uintptr_t) urcu_txn_load(t->mtxn,
 			(void **) &meta->state, FT_STATE_PROXY);
 
+	/*
+	 * ☞ TELL THE CENSUS THIS IS A RETIRE.  The record's owner IS the node
+	 * being killed, so ft_flip_txn_owns can never answer yes: the word ends
+	 * unclaimable and nothing registers it (ft_flip_txn_owns' own header
+	 * names this as its documented counterexample).  Counted in OWN_MISS it
+	 * reads as a Phase B obligation that can never be discharged -- the same
+	 * distortion the DLM-take carve-out exists to prevent -- so it gets its
+	 * own lane instead of being skipped silently.
+	 */
+	FT_TK_TXN_SET_RETIRE(t, true);
 	ft_flip_txn_record_state(t, meta,
 			(void *) old, (void *) (old | FT_STATE_TOMBSTONE));
+	FT_TK_TXN_SET_RETIRE(t, false);
 	/*
 	 * ☠ THE WORD ENDS DEAD, WHICHEVER SITE RECORDED THE EARLIER EDGE.  This
 	 * retire CHAINS onto a release already recorded on @meta in this same txn
