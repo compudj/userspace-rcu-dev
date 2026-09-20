@@ -1638,15 +1638,139 @@ void ft_tk_dump_at_exit(void)
 #define FT_TK_TXN_SET_TAKE(t, v)	do { (t)->dbg_lock_take = (v); } while (0)
 #define FT_TK_COUNT_REC(t, c)		ft_tk_count_rec((t)->dbg_site, (c))
 /*
+ * ☞ WHERE THE MISSES COME FROM, which the census cannot say.
+ *
+ * The census table is keyed by the TXN CREATION site, so it sizes a site's
+ * exclusion gap but never names the record that has it: ft-insert.h:1183 shows
+ * 1.78M OWN_MISS out of 60.3M, and converting it means knowing WHICH of those
+ * 60M records miss.  -DFT_DEBUG_STRUCT_ANCHOR captures the right thing but
+ * emits a CAPPED per-event trace, and -DFT_ABORT_ATTRIB keys by word class and
+ * is about aborts.  Neither aggregates.
+ *
+ * ☠ AND THE ALTERNATIVE WAS A SIGNATURE, WHICH IS WHY THIS USES THE PC.
+ * Keying by record site properly means threading fn/line through
+ * __ft_flip_txn_record_tag_ctx and every caller -- the plumbing the head-word
+ * arm is already blocked on.  Two return addresses cost nothing, change no
+ * signature, and are exactly what §0 already symbolizes offline with
+ * `addr2line -i`.
+ *
+ * ☠☠ AND THE SECOND KEY IS THE TXN SITE, NOT A SECOND FRAME.  One return
+ * address collapses distinct producers together once the recorder inlines, so
+ * the first spelling reached for __builtin_return_address(1) -- which is
+ * UNDEFINED when that frame does not exist, and under -O2 it does not: SIGSEGV
+ * at ft_inv test 45.  Pairing the record PC with the txn's CREATION site is the
+ * same (txn creation site, call site) keying §0 describes, distinguishes the
+ * producers just as well, and walks no frames at all.
+ *
+ * Lossy on overflow, and it SAYS SO rather than silently truncating -- a table
+ * that fills and keeps counting into the last row is how a class reads as one
+ * hot site.
+ */
+#include <dlfcn.h>
+#include <link.h>
+
+#define FT_TK_MISS_PC_MAX	64
+struct ft_tk_miss_pc_ent {
+	const struct ft_tk_site *site;	/* the txn's creation site */
+	const void *pc;			/* the record's own call site */
+	unsigned long n;
+	/*
+	 * ☠ OF WHICH, HOW MANY ARE ALREADY DOOMED.  A record whose txn carries
+	 * @acquire_miss will never commit -- lock_or_guard refused the acquire
+	 * and the commit ABORTS all-or-none -- so counting it as an exclusion
+	 * gap measures CONTENTION, not a word this op writes unexcluded.  The
+	 * two need different work and must not be pooled: the same mistake as
+	 * folding OWN_LEDGER into OWN_MISS, one level down.
+	 */
+	unsigned long n_amiss;
+};
+extern struct ft_tk_miss_pc_ent ft_tk_miss_pcs[FT_TK_MISS_PC_MAX];
+extern unsigned int ft_tk_miss_pc_n;
+extern unsigned long ft_tk_miss_pc_overflow;
+struct ft_tk_miss_pc_ent ft_tk_miss_pcs[FT_TK_MISS_PC_MAX];
+unsigned int ft_tk_miss_pc_n;
+unsigned long ft_tk_miss_pc_overflow;
+
+static inline
+void ft_tk_miss_pc(const struct ft_tk_site *site, const void *pc, bool amiss)
+{
+	unsigned int i;
+
+	for (i = 0; i < ft_tk_miss_pc_n; i++)
+		if (ft_tk_miss_pcs[i].site == site &&
+				ft_tk_miss_pcs[i].pc == pc) {
+			uatomic_inc(&ft_tk_miss_pcs[i].n);
+			if (amiss)
+				uatomic_inc(&ft_tk_miss_pcs[i].n_amiss);
+			return;
+		}
+	if (ft_tk_miss_pc_n >= FT_TK_MISS_PC_MAX) {
+		uatomic_inc(&ft_tk_miss_pc_overflow);
+		return;
+	}
+	i = ft_tk_miss_pc_n++;
+	ft_tk_miss_pcs[i].site = site;
+	ft_tk_miss_pcs[i].pc = pc;
+	uatomic_inc(&ft_tk_miss_pcs[i].n);
+	if (amiss)
+		uatomic_inc(&ft_tk_miss_pcs[i].n_amiss);
+}
+
+static void ft_tk_miss_pc_report(void) __attribute__((destructor));
+static void ft_tk_miss_pc_report(void)
+{
+	unsigned int i;
+
+	if (!ft_tk_miss_pc_n)
+		return;
+	fprintf(stderr, "\nFT OWN_MISS by RECORD SITE (txn site + record pc; "
+		"symbolize with addr2line -i -e <lib>)  rows=%u/%d overflow=%lu\n",
+		ft_tk_miss_pc_n, FT_TK_MISS_PC_MAX,
+		uatomic_read(&ft_tk_miss_pc_overflow));
+	for (i = 0; i < ft_tk_miss_pc_n; i++)
+	{
+		Dl_info info;
+		struct link_map *lm = NULL;
+		char off[160];
+		const void *pc = ft_tk_miss_pcs[i].pc;
+
+		if (pc && dladdr1((void *) pc, &info, (void **) &lm,
+				RTLD_DI_LINKMAP) && lm)
+			snprintf(off, sizeof(off), "%s+0x%lx",
+				info.dli_fname ? info.dli_fname : "?",
+				(unsigned long) ((uintptr_t) pc - lm->l_addr));
+		else
+			snprintf(off, sizeof(off), "%p", pc);
+		fprintf(stderr, "  MISSPC %s:%d %s %lu amiss=%lu\n",
+			ft_tk_miss_pcs[i].site &&
+				ft_tk_miss_pcs[i].site->file ?
+				ft_tk_miss_pcs[i].site->file : "(none)",
+			ft_tk_miss_pcs[i].site ?
+				ft_tk_miss_pcs[i].site->line : 0,
+			off,
+			uatomic_read(&ft_tk_miss_pcs[i].n),
+			uatomic_read(&ft_tk_miss_pcs[i].n_amiss));
+	}
+}
+
+/*
  * THE UNION IS THE HELD SET, and the three-way split says which witness saw it.
  * Asked registry-first because that is the cheap one and the one a shipped
  * (non-test) build can also answer.
  */
 #define FT_TK_COUNT_OWN(t, owner)					\
-	ft_tk_count_rec((t)->dbg_site,					\
-		ft_flip_txn_owns((t), (owner)) ? FT_TK_OWN_HELD :	\
-		(ft_hold_trace_holds((owner)) ? FT_TK_OWN_LEDGER :	\
-			FT_TK_OWN_MISS))
+	do {								\
+		enum ft_tk_rec_class c__ =					\
+			ft_flip_txn_owns((t), (owner)) ? FT_TK_OWN_HELD : \
+			(ft_hold_trace_holds((owner)) ? FT_TK_OWN_LEDGER : \
+				FT_TK_OWN_MISS);			\
+									\
+		ft_tk_count_rec((t)->dbg_site, c__);			\
+		if (c__ == FT_TK_OWN_MISS)				\
+			ft_tk_miss_pc((t)->dbg_site,			\
+				__builtin_return_address(0),		\
+				(t)->acquire_miss);			\
+	} while (0)
 #define FT_TK_COUNT_ARMED(t)		ft_tk_count_armed((t)->dbg_site)
 #define FT_TK_COUNT_CELL_MW()		ft_tk_count_cell_mw()
 #define FT_TK_COUNT_CELL_SW()		ft_tk_count_cell_sw()
