@@ -9165,6 +9165,188 @@ bool ft_lock_set_order_by_anchor(const struct cds_ft *ft,
 	}
 	return true;
 }
+
+/*
+ * ☞ THE ACQUIRE'S READ SET, CARRIED OUTSIDE THE ENGINE.
+ *
+ * The takes became plain CASes above, but the acquire also carries GUARDS --
+ * pure read-set validations (ft_dlm_guard_parent, ft_held_anchor_guard_node),
+ * no writes -- and those were the only remaining reason to build, commit and
+ * RCU-free a transaction per acquisition.  That is the incomplete half of the
+ * transition: the lock take left the engine, its validation did not, so every
+ * SUCCESSFUL acquire still owed a descriptor a grace period.  MEASURED before
+ * this change, on one leg of the per-node contention reproducer: 522,323
+ * descriptors retired by acquires that COMMITTED, against 12 that aborted.
+ *
+ * ☞ WHY A PLAIN LOAD AFTER THE TAKES IS AT LEAST AS STRONG.  The engine checked
+ * the guard AT THE COMMIT, i.e. at the linearization point of the takes.  Here
+ * every take has already succeeded, so this check observes a state no EARLIER
+ * than that one: a peer that disturbed the guarded word before our take is seen
+ * by the load and refused, and a peer that disturbs it after would have been
+ * missed by the commit-time validate just the same.  What the atomic form
+ * bought was all-or-none across takes AND guards; ordering already gives the
+ * takes their exclusion, and a failed guard unwinds them explicitly.
+ *
+ * ☠ RESOLVE THE PROXY.  urcu_txn_validate compared LOGICAL values, so a raw
+ * load here would read a committed-but-unsettled peer as a mismatch and refuse
+ * an acquire that is perfectly good -- and, worse, would compare a descriptor
+ * pointer against a node pointer.  urcu_txn_read resolves and waits out an
+ * undecided owner, which is exactly the value the validate would have seen.
+ */
+struct ft_acq_guard {
+	void **slot;
+	void *expected;
+	uintptr_t tag;
+};
+
+/*
+ * Bounded by the SAME condition that makes the ordered path available:
+ * ft_lock_set_order_by_anchor refuses above FT_LOCK_ORDER_MAX members, and a
+ * member contributes at most two guards (its own word and its back-edge).
+ */
+#define FT_ACQ_GUARD_MAX	(2 * FT_LOCK_ORDER_MAX)
+
+static inline
+void ft_acq_guard_add(struct ft_acq_guard *g, int *nr, void **slot,
+		void *expected, uintptr_t tag)
+{
+	if (*nr >= FT_ACQ_GUARD_MAX) {
+		/*
+		 * Unreachable by the bound above; fail-stop rather than drop,
+		 * because a DROPPED guard is an acquire that proceeds against a
+		 * stale plan -- silent, and exactly the class this read set
+		 * exists to refuse.
+		 */
+		fprintf(stderr, "[Fatal] Fractal Trie: acquire read set "
+			"overflow (%d)\n", *nr);
+		abort();
+	}
+	g[*nr].slot = slot;
+	g[*nr].expected = expected;
+	g[*nr].tag = tag;
+	(*nr)++;
+}
+
+/*
+ * ☞ DOES THE OP HOLD ANYTHING AT ALL?  The whole ctx chain, both registries.
+ *
+ * This is the precondition for touching the FIFO lane below, and it is not a
+ * nicety: a thread that queues on the lane WHILE HOLDING A LOCK closes a
+ * cycle -- the lane's turn-holder waits for that lock, and the lock's owner
+ * waits for the lane.  That deadlock is on record (5 threads in
+ * cds_fair_mutex_park, 2 blocked on a held word, 16 grace periods stalled
+ * behind them), and the rule it produced is that back-off and the lane are ONE
+ * strategy: a waiter must be able to FAIL, unwind, and only THEN escalate.
+ */
+static inline
+bool ft_lock_ctx_holds_nothing(const struct ft_lock_ctx *ctx)
+{
+	const struct ft_held_set *hs;
+
+	if (!ctx)
+		return true;
+	for (hs = &ctx->held; hs; hs = hs->outer) {
+		if (hs->nr_extra)
+			return false;
+		if (hs->txn && hs->txn->nr_locks)
+			return false;
+	}
+	return true;
+}
+
+/*
+ * The lane node must keep its address from lock to unlock (cds_fair_mutex
+ * enqueues BY ADDRESS), and a thread queues on at most one lane at a time.
+ */
+static __thread struct cds_fair_mutex_node ft_acq_lane_waiter;
+
+/*
+ * ☞ FAIR-LANE BACK-OFF FOR AN ACQUIRE THAT NO LONGER USES THE ENGINE.
+ *
+ * Taking the lock-set outside the transaction removed its descriptor -- and
+ * with it, silently, the ONLY thing that was arbitrating between contenders.
+ * The engine acquire escalated into the domain's FIFO lane when it kept
+ * losing; a bare CAS take refuses instantly and retries just as fast, so four
+ * writers on one chain head simply thrash.  MEASURED, matched A/B on the
+ * per-node contention reproducer: content-commit success 8.7% -> 0.9%, and
+ * 8/8 legs killed against 4/8.
+ *
+ * So put the arbitration back where it belongs -- on the SAME lane the engine
+ * uses (@ctx->op->domain), reached through the op's persistent handle, with no
+ * descriptor and no grace period owed.
+ *
+ * ☠ QUEUE HOLDING NOTHING (ft_lock_ctx_holds_nothing), and go QUIESCENT across
+ * the park: a thread parked online is a non-quiescent reader, which is how the
+ * grace periods stall in the first place.
+ *
+ * Aged, not immediate: @ft_acq_contended already counts this op's refusals, and
+ * escalating on the first one would serialize workloads that are merely
+ * unlucky.
+ */
+#ifndef FT_ACQ_LANE_AGE
+#define FT_ACQ_LANE_AGE		4
+#endif
+
+static inline
+void ft_acq_lane_backoff(const struct cds_ft *ft,
+		const struct ft_lock_ctx *ctx)
+{
+	const struct rcu_flavor_struct *flavor;
+	struct urcu_txn_domain *dom;
+
+	if (!ctx || !ctx->op || !ft)
+		return;
+	dom = ctx->op->domain;
+	if (!dom)
+		return;
+	if (ft_acq_contended < FT_ACQ_LANE_AGE)
+		return;
+	/*
+	 * ☠ AND NOT IF THIS THREAD IS ALREADY IN THE LANE.  urcu_txn_begin
+	 * escalates into the SAME domain->lock (urcu_txn__enter_fallback), and
+	 * cds_fair_mutex is not reentrant -- so a thread that reached here from
+	 * inside a fallback episode blocks for ever on a lock it is holding.
+	 *
+	 * ☠ @ft_lock_ctx_holds_nothing DOES NOT COVER THIS: an op sitting in
+	 * the lane holds no DLM lock at all, so that test says yes.  The two
+	 * guards refuse different cycles -- one a wait edge from a held WORD
+	 * into the lane, this one a second entry into the lane itself.
+	 *
+	 * MEASURED as a reproducible hang of ft_inv at test 87
+	 * (inv_prefix_key_park_vs_holder_churn), three lockordered legs, with
+	 * threads parked in cds_fair_mutex_park under BOTH ft_dlm_acquire_set_at
+	 * and urcu_txn_begin at once -- which is the cycle written out.
+	 */
+	if (urcu_txn_in_fallback())
+		return;
+	if (!ft_lock_ctx_holds_nothing(ctx))
+		return;		/* see ft_lock_ctx_holds_nothing: lane cycle */
+	flavor = ft->group->flavor;
+	flavor->thread_offline();
+	cds_fair_mutex_lock(&dom->lock, &ft_acq_lane_waiter);
+	/*
+	 * Released immediately: the point is the QUEUE, not the critical
+	 * section.  Passing through a FIFO once per aged refusal gives the
+	 * contenders an arrival order and lets the one at the head get far
+	 * enough ahead to finish -- while holding nothing, so nothing can be
+	 * waiting on us.  Holding it across the retry would serialize the whole
+	 * op and put a lock holder in the lane, which is the cycle above.
+	 */
+	(void) cds_fair_mutex_unlock(&dom->lock, &ft_acq_lane_waiter);
+	flavor->thread_online();
+}
+
+/* Every guard still holds?  Checked once, after the last take succeeded. */
+static inline
+bool ft_acq_guards_ok(const struct ft_acq_guard *g, int nr)
+{
+	int i;
+
+	for (i = 0; i < nr; i++)
+		if (urcu_txn_read(g[i].slot, g[i].tag) != g[i].expected)
+			return false;
+	return true;
+}
 #endif /* FEATURE_FT_LOCK_TAKE_ORDERED */
 
 /*
@@ -9930,6 +10112,8 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 #ifdef FEATURE_FT_LOCK_TAKE_ORDERED
 	bool ordered = false;
 	int lock_order[FT_LOCK_ORDER_MAX];
+	struct ft_acq_guard guards[FT_ACQ_GUARD_MAX];
+	int nr_guards = 0;
 #endif
 	int ii;
 	struct cds_ft_metadata *taken_embed[FT_FLIP_TXN_MAX_LOCKS];
@@ -10087,19 +10271,28 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 	 * its descriptor and its install lane, which measured WORSE (median 9.5
 	 * starving removes against 4 for aging alone, complete separation).
 	 */
-	acq = ft_flip_txn_acquire_bounded(3 * nr_present);
-	if (!acq) {
-		free(taken_heap);	/* allocated above; nothing acquired yet */
-		return -ENOMEM;
-	}
 #ifdef FEATURE_FT_LOCK_TAKE_ORDERED
 	/*
 	 * ASCENDING ANCHOR ORDER, and the whole deadlock argument rides on it:
 	 * with a total order on the words no cycle can form, which is what lets
 	 * the takes below be plain CASes instead of one atomic commit.
+	 *
+	 * ☞ DECIDED BEFORE THE TRANSACTION EXISTS, because on this path there is
+	 * no transaction: takes are CASes and guards are loads (ft_acq_guard),
+	 * so nothing is allocated, nothing is committed, and nothing is handed
+	 * to call_rcu.  @acq stays NULL and only the fallback builds one.
 	 */
 	ordered = ft_lock_set_order_by_anchor(ft, ctx, set, nr, lock_order);
+	acq = NULL;
+	if (!ordered)
 #endif
+	{
+		acq = ft_flip_txn_acquire_bounded(3 * nr_present);
+		if (!acq) {
+			free(taken_heap);	/* nothing acquired yet */
+			return -ENOMEM;
+		}
+	}
 	for (ii = 0; ii < nr; ii++) {
 		struct cds_ft_metadata *node, *lock;
 		uintptr_t node_snap = 0, lock_snap, held_snap = 0;
@@ -10179,8 +10372,18 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 			 * already in force, and validating the CLEAN value against
 			 * a word carrying the op's own LOCK aborts every attempt.
 			 */
-			if (!node_held)
-				ft_held_anchor_guard_node(acq, node, node_snap);
+			if (!node_held) {
+#ifdef FEATURE_FT_LOCK_TAKE_ORDERED
+				if (ordered)
+					ft_acq_guard_add(guards, &nr_guards,
+						(void **) &node->state,
+						(void *) node_snap,
+						FT_STATE_PROXY);
+				else
+#endif
+					ft_held_anchor_guard_node(acq, node,
+						node_snap);
+			}
 		}
 		/*
 		 * The guard is a read-set validation of the MEMBER's own
@@ -10189,9 +10392,18 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 		 * validated.  It rides the commit for EVERY member, deduped or
 		 * not -- dedupe merges LOCKS, never guards (§7.3).
 		 */
-		if (set[i].guard_child)
-			ft_dlm_guard_parent(acq, set[i].guard_child,
-				set[i].guard_pf);
+		if (set[i].guard_child) {
+#ifdef FEATURE_FT_LOCK_TAKE_ORDERED
+			if (ordered)
+				ft_acq_guard_add(guards, &nr_guards,
+					(void **) &set[i].guard_child->parent_word,
+					(void *) set[i].guard_pf,
+					FT_FLIP_PROXY_TAG);
+			else
+#endif
+				ft_dlm_guard_parent(acq, set[i].guard_child,
+					set[i].guard_pf);
+		}
 		/*
 		 * Dedupe against the op's held set AND against this set's own
 		 * earlier members, taking the CLEAN word from whichever holds it:
@@ -10421,22 +10633,36 @@ int ft_dlm_acquire_set_at(const char *fn, int line,
 		set[i].held.oracle_skip = false;
 #endif
 	}
+#ifdef FEATURE_FT_LOCK_TAKE_ORDERED
+	if (ordered) {
+		/*
+		 * THE READ SET, CHECKED ONCE, NOW THAT EVERY TAKE HAS SUCCEEDED.
+		 * This is what the acquire commit used to do -- and all it did,
+		 * the takes having become CASes -- so with it here the acquire
+		 * allocates no descriptor, commits nothing, and owes no grace
+		 * period.  See ft_acq_guards_ok.
+		 */
+		if (!ft_acq_guards_ok(guards, nr_guards)) {
+#ifdef FT_DEBUG_REMOVE_RETRY_CAP
+			ft_dbg_acq_cabort++;
+#endif
+			/*
+			 * ☠ A CAS TAKE IS HELD THE INSTANT IT SUCCEEDS, so this
+			 * exit owes the release the commit would have skipped.
+			 * A leaked lock is PERMANENT: peers refuse it forever
+			 * and the op retries forever -- measured once as an
+			 * ft_inv HANG at test 40 (rc=124), not as a failure.
+			 */
+			while (nr_taken)
+				ft_meta_lock_release(taken[--nr_taken]);
+			free(taken_heap);
+			return -EAGAIN;
+		}
+	} else
+#endif
 	if (ft_flip_txn_commit((struct cds_ft *) ft, acq) != URCU_TXN_STATUS_OK) {
 #ifdef FT_DEBUG_REMOVE_RETRY_CAP
 		ft_dbg_acq_cabort++;
-#endif
-#ifdef FEATURE_FT_LOCK_TAKE_ORDERED
-		/*
-		 * ☠ "nothing acquired" IS ONLY TRUE OF THE RECORDED PATH, whose
-		 * takes are edges a commit has yet to apply.  An ordered CAS take
-		 * is held the instant it succeeds, so this exit LEAKS every word
-		 * it took -- and a leaked lock is permanent: peers refuse it
-		 * forever and the op retries forever.  MEASURED as a hang of
-		 * ft_inv at test 40 (rc=124), not as a failure.
-		 */
-		if (ordered)
-			while (nr_taken)
-				ft_meta_lock_release(taken[--nr_taken]);
 #endif
 		free(taken_heap);
 		return -EAGAIN;		/* commit freed @acq; nothing acquired */
@@ -10634,7 +10860,8 @@ eagain:
 		while (nr_taken)
 			ft_meta_lock_release(taken[--nr_taken]);
 #endif
-	ft_flip_txn_destroy(acq);
+	if (acq)			/* NULL on the ordered path: none built */
+		ft_flip_txn_destroy(acq);
 	free(taken_heap);
 	/*
 	 * RECORD the refusal for the op's retry loop; do not age here.  Aging at
@@ -10650,6 +10877,15 @@ eagain:
 	 */
 	if (ctx && ctx->op)
 		ft_acq_contended++;
+#ifdef FEATURE_FT_LOCK_TAKE_ORDERED
+	/*
+	 * The arbitration the engine acquire used to provide; see
+	 * ft_acq_lane_backoff.  After the unwind above, so this queues holding
+	 * nothing.
+	 */
+	if (ordered)
+		ft_acq_lane_backoff(ft, ctx);
+#endif
 	return -EAGAIN;			/* nothing acquired (all-or-none) */
 }
 
