@@ -7499,6 +7499,69 @@ void __ft_flip_txn_record_tag_ctx(struct ft_flip_txn *t,
 	    (!t->sw_per_op || t->sw_body || ft_flip_txn_owns(t, owner))) {
 		FT_TK_COUNT_REC(t, FT_TK_SW);
 		FT_AB_ARM(FT_AB_SW, FT_AB_OWN_NA);
+#ifdef FT_DEBUG_TXN_KIND
+		/*
+		 * ☞ DOES THE TRIE-WIDE ARM ACTUALLY HAVE ITS EXCLUSION?
+		 *
+		 * @f6a0a680 restored ~2.9M SW parks per leg to doors 1 and 3 by
+		 * initialising @sw_per_op, and those doors do NOT rest on the
+		 * lock registry -- their claim is "no peer exists": an EXCLUSIVE
+		 * trie, a COARSE one, or this thread inside the FT-wide writer
+		 * scope.  Sixteen green legs say the suites did not break; they
+		 * do not say the claim holds, and a park that parks without its
+		 * exclusion is a blind store the engine cannot arbitrate.
+		 *
+		 * So ask the claim directly at every such park.  @none is the
+		 * only bucket owed an answer, and it must be ZERO: a FINE,
+		 * non-exclusive trie with no FT-wide lock held has peers by
+		 * definition, so a door-1/3 park there would have nothing
+		 * excluding it.  (@sw_body is door 3 -- the rekey / root-COW
+		 * whole-body writer, whose words it fenced itself -- so it is
+		 * counted apart rather than pooled with the trie-wide claim.)
+		 */
+		if (!t->sw_per_op || t->sw_body) {
+			const struct cds_ft *xft = t->ft;
+
+			if (t->sw_body) {
+				/*
+				 * ☠☠ AND DOOR 3 IS THE ONLY BUCKET HERE WHOSE
+				 * LICENCE IS NOT STRUCTURAL.  Door 1 arms through
+				 * ft_txn_content_sw_ok(), which IS
+				 * `!lock_fine || exclusive` -- so asking a
+				 * door-1 park whether the trie is coarse or
+				 * exclusive re-derives the arm's own predicate
+				 * and can only answer yes.  That zero is a
+				 * tautology, not a measurement, and reading it
+				 * as evidence is the "armed, firing and blind"
+				 * trap.
+				 *
+				 * @sw_body is the EXEMPTION: the rekey /
+				 * root-COW whole-body writer parks SW on the
+				 * claim that its edges sit on words it FENCED
+				 * ITSELF, which no predicate checks and which
+				 * holds on a FINE, non-exclusive trie too.  So
+				 * split it by mode: @fine is the population
+				 * whose exclusion rests on that claim alone.
+				 */
+				if (xft && xft->exclusive)
+					uatomic_inc(&ft_tk_d3_excl);
+				else if (xft && !xft->lock_fine)
+					uatomic_inc(&ft_tk_d3_coarse);
+				else if (xft && ft_wlock_held == xft)
+					uatomic_inc(&ft_tk_d3_wlock);
+				else
+					uatomic_inc(&ft_tk_d3_fine);
+				uatomic_inc(&ft_tk_d13_body);
+			} else if (xft && xft->exclusive)
+				uatomic_inc(&ft_tk_d13_excl);
+			else if (xft && !xft->lock_fine)
+				uatomic_inc(&ft_tk_d13_coarse);
+			else if (xft && ft_wlock_held == xft)
+				uatomic_inc(&ft_tk_d13_wlock);
+			else
+				uatomic_inc(&ft_tk_d13_none);
+		}
+#endif
 		ret = urcu_txn_store_sw(t->mtxn, slot, old_ptr, new_ptr, tag);
 	} else {
 		/*

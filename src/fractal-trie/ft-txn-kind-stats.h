@@ -188,6 +188,17 @@ enum ft_tk_rec_class {
 /* See the drift probe in __ft_flip_txn_record_tag_ctx. */
 extern unsigned long ft_tk_drift_armed, ft_tk_drift_take;
 unsigned long ft_tk_drift_armed, ft_tk_drift_take;
+/* See the door-1/3 exclusion probe at the SW park in __ft_flip_txn_record_tag_ctx. */
+extern unsigned long ft_tk_d13_body, ft_tk_d13_excl, ft_tk_d13_coarse,
+	ft_tk_d13_wlock, ft_tk_d13_none;
+extern unsigned long ft_tk_d3_excl, ft_tk_d3_coarse, ft_tk_d3_wlock,
+	ft_tk_d3_fine;
+unsigned long ft_tk_d3_excl, ft_tk_d3_coarse, ft_tk_d3_wlock, ft_tk_d3_fine;
+unsigned long ft_tk_d13_body, ft_tk_d13_excl, ft_tk_d13_coarse,
+	ft_tk_d13_wlock, ft_tk_d13_none;
+extern unsigned long ft_tk_d3_excl, ft_tk_d3_coarse, ft_tk_d3_wlock,
+	ft_tk_d3_fine;
+unsigned long ft_tk_d3_excl, ft_tk_d3_coarse, ft_tk_d3_wlock, ft_tk_d3_fine;
 
 /*
  * MW_ALWAYS IS NOT ONE POPULATION, and the G4 decision reads it as if it were.
@@ -1711,6 +1722,22 @@ void ft_tk_dump(void)
 "    SELF-CHECK  state drift between the OWN split and the kind decision: armed=%lu take=%lu\n",
 			uatomic_read(&ft_tk_drift_armed),
 			uatomic_read(&ft_tk_drift_take));
+		fprintf(stderr,
+"    DOOR 1/3 SW parks, is the trie-wide exclusion REALLY in force?\n"
+"      sw_body(door 3)=%lu  exclusive=%lu  coarse=%lu  FT-wide-lock=%lu  ☠ NONE(must be 0)=%lu\n",
+			uatomic_read(&ft_tk_d13_body),
+			uatomic_read(&ft_tk_d13_excl),
+			uatomic_read(&ft_tk_d13_coarse),
+			uatomic_read(&ft_tk_d13_wlock),
+			uatomic_read(&ft_tk_d13_none));
+		fprintf(stderr,
+"      ☞ door 1's zero above is TAUTOLOGICAL (its arm predicate IS !lock_fine||exclusive).\n"
+"      DOOR 3 (@sw_body) by mode -- the only licence here that no predicate checks:\n"
+"        exclusive=%lu  coarse=%lu  FT-wide-lock=%lu  ☠ FINE, self-fenced only=%lu\n",
+			uatomic_read(&ft_tk_d3_excl),
+			uatomic_read(&ft_tk_d3_coarse),
+			uatomic_read(&ft_tk_d3_wlock),
+			uatomic_read(&ft_tk_d3_fine));
 	}
 	free(rows);
 }
