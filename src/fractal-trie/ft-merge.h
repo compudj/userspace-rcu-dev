@@ -2364,32 +2364,37 @@ enum cds_ft_status ft_merge_spine_copy(struct cds_ft *dst_ft,
 	 *    src-run prev, which this collect leaves untouched.
 	 */
 	if (ms_ord) {
-		unsigned int i;
-
 		ms_n = ft_merge_ord_interleave_collect(dst_ft, dst_key_len,
 			ms_cursor, ms_succ, ms_prev, /*tail_link=*/ ms_succ,
 			/*head_linked=*/ true, ms_src_caps, ms_nsrc,
 			ms_src_pool, ms_edges, /*record_all=*/ false,
 			/*ncollide=*/ NULL, /*collided=*/ NULL);
 		/*
-		 * ☠ A RAW record_tag LOOP OVER ORD EDGES, which the sibling
-		 * graft path deliberately does NOT do (see the comment at
-		 * ft_ord_cell_record_into_ft's caller there): every edge here
-		 * takes the structural_sw dispatch, so a CELL edge parks SW
-		 * under an armed txn even though no cell carries a node lock.
-		 * Sound today only because the modes that arm -- COARSE and
-		 * exclusive -- exclude trie-wide.  The per-edge @owner is what
-		 * stops it at the PHASE B arm: a cell's owner is NULL, so the
-		 * record-time check refuses the park instead of taking it
-		 * silently.  Routing this loop through the tag-dispatching
-		 * recorder is the real fix and belongs with the site's arm.
+		 * ☑ ROUTED THROUGH THE TAG-DISPATCHING RECORDER, which is what
+		 * the comment that stood here asked for and what the sibling
+		 * GRAFT path has always done.
+		 *
+		 * This used to be a RAW record_tag loop, so every edge took the
+		 * structural_sw dispatch and a CELL edge parked SW under an
+		 * armed txn even though no cell carries a node lock -- sound
+		 * only because the modes that arm (COARSE, exclusive) exclude
+		 * trie-wide.  What stopped it at the Phase B arm was the
+		 * per-edge @owner: a cell's owner is NULL, so the record-time
+		 * check refused the park rather than taking it silently, and
+		 * every one of those refusals landed in OWN_MISS.
+		 *
+		 * ft_ord_cell_record_into_ft dispatches BY TAG instead: a
+		 * structural edge keeps the owner-checked path, and a CELL /
+		 * hlist edge goes to record_tag_mw as FT_TK_MWA_CELL -- the
+		 * ordered list's [DESIGN] MW class, which it was all along.
+		 * So the edges stop being counted as an exclusion gap because
+		 * they stop being ON the conversion surface, which is the
+		 * honest answer rather than a suppressed counter.
+		 *
+		 * MEASURED: ft-merge.h's REAL OWN_MISS (the population left
+		 * after the doomed-commit split) 40,280 -> 0 per ft_inv leg.
 		 */
-		for (i = 0; i < ms_n; i++)
-			ft_flip_txn_record_tag(txn, ms_edges[i].owner,
-				(void **) ms_edges[i].slot,
-				(void *) ms_edges[i].old_target,
-				(void *) ms_edges[i].new_target,
-				ft_edge_tag(&ms_edges[i]));
+		ft_ord_cell_record_into_ft(dst_ft, txn, ms_edges, ms_n);
 	}
 
 	/*
