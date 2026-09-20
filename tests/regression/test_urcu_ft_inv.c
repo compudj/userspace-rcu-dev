@@ -461,6 +461,16 @@ static struct cds_ft *create_fixed_ord_ft(size_t klen, struct cds_ft_group **gro
 	if (cds_ft_group_attr_set_ordered_list(attr, true) < 0)
 		abort();
 	inv_maybe_set_rank_stats(attr);
+	/*
+	 * REKEY OPT-IN (cds_ft_group_attr_set_rekey, default OFF).  Tries built
+	 * by this helper are used by the in-trie MOVE tests, so the capability
+	 * has to be declared or every one of them answers NOT_SUPPORTED.  Not
+	 * every creator opts in, deliberately: the helpers that stay off are what
+	 * cover the default path, where ft_install_lookup_ops selects the PLAIN
+	 * lookup specializations instead of the coherent ones.
+	 */
+	if (cds_ft_group_attr_set_rekey(attr, true) < 0)
+		abort();
 	if (cds_ft_group_create(attr, &group) < 0)
 		abort();
 	cds_ft_group_attr_destroy(attr);
@@ -594,6 +604,16 @@ static struct cds_ft *create_fixed_fine_lock_ft(size_t klen,
 	if (cds_ft_group_attr_set_writer_strategy(attr,
 			CDS_FT_WRITER_LOCK_FINE) < 0)
 		abort();
+	/*
+	 * REKEY OPT-IN (cds_ft_group_attr_set_rekey, default OFF).  Tries built
+	 * by this helper are used by the in-trie MOVE tests, so the capability
+	 * has to be declared or every one of them answers NOT_SUPPORTED.  Not
+	 * every creator opts in, deliberately: the helpers that stay off are what
+	 * cover the default path, where ft_install_lookup_ops selects the PLAIN
+	 * lookup specializations instead of the coherent ones.
+	 */
+	if (cds_ft_group_attr_set_rekey(attr, true) < 0)
+		abort();
 	if (cds_ft_group_create(attr, &group) < 0)
 		abort();
 	cds_ft_group_attr_destroy(attr);
@@ -647,6 +667,16 @@ static struct cds_ft *create_fixed_fine_lock_listoff_ft(size_t klen,
 			CDS_FT_WRITER_LOCK_FINE) < 0)
 		abort();
 	if (cds_ft_group_attr_set_ordered_list(attr, false) < 0)
+		abort();
+	/*
+	 * REKEY OPT-IN (cds_ft_group_attr_set_rekey, default OFF).  Tries built
+	 * by this helper are used by the in-trie MOVE tests, so the capability
+	 * has to be declared or every one of them answers NOT_SUPPORTED.  Not
+	 * every creator opts in, deliberately: the helpers that stay off are what
+	 * cover the default path, where ft_install_lookup_ops selects the PLAIN
+	 * lookup specializations instead of the coherent ones.
+	 */
+	if (cds_ft_group_attr_set_rekey(attr, true) < 0)
 		abort();
 	if (cds_ft_group_create(attr, &group) < 0)
 		abort();
@@ -3683,6 +3713,13 @@ static struct cds_ft *create_fixed_rekey_coherent_ft(size_t klen,
 		abort();
 	if (cds_ft_group_attr_set_ordered_list(gattr, true) < 0)	/* up-walk cell source */
 		abort();
+	/*
+	 * REKEY OPT-IN (cds_ft_group_attr_set_rekey, default OFF): this trie
+	 * hosts an in-trie MOVE, so the capability must be declared or the
+	 * rekey entries answer NOT_SUPPORTED and the test proves nothing.
+	 */
+	if (cds_ft_group_attr_set_rekey(gattr, true) < 0)
+		abort();
 	if (cds_ft_group_create(gattr, &group) < 0)
 		abort();
 	cds_ft_group_attr_destroy(gattr);
@@ -5434,6 +5471,13 @@ static struct cds_ft *create_rekey_coherent_ft(enum rkp_mode mode,
 		abort();
 	if (cds_ft_group_attr_set_ordered_list(gattr,
 			!rkp_mode_fixed_group(mode)) < 0)
+		abort();
+	/*
+	 * REKEY OPT-IN (cds_ft_group_attr_set_rekey, default OFF): this trie
+	 * hosts an in-trie MOVE, so the capability must be declared or the
+	 * rekey entries answer NOT_SUPPORTED and the test proves nothing.
+	 */
+	if (cds_ft_group_attr_set_rekey(gattr, true) < 0)
 		abort();
 	if (cds_ft_group_create(gattr, &group) < 0)
 		abort();
@@ -8868,6 +8912,16 @@ static struct cds_ft *create_varlen_fine_lock_ft(struct cds_ft_group **group_out
 	if (cds_ft_group_attr_set_writer_strategy(attr,
 			CDS_FT_WRITER_LOCK_FINE) < 0)
 		abort();
+	/*
+	 * REKEY OPT-IN (cds_ft_group_attr_set_rekey, default OFF).  Tries built
+	 * by this helper are used by the in-trie MOVE tests, so the capability
+	 * has to be declared or every one of them answers NOT_SUPPORTED.  Not
+	 * every creator opts in, deliberately: the helpers that stay off are what
+	 * cover the default path, where ft_install_lookup_ops selects the PLAIN
+	 * lookup specializations instead of the coherent ones.
+	 */
+	if (cds_ft_group_attr_set_rekey(attr, true) < 0)
+		abort();
 	if (cds_ft_group_create(attr, &group) < 0)
 		abort();
 	cds_ft_group_attr_destroy(attr);
@@ -8907,6 +8961,16 @@ static struct cds_ft *create_varlen_fine_lock_cfg_ft(
 		abort();
 	if (cds_ft_group_attr_set_writer_strategy(attr,
 			CDS_FT_WRITER_LOCK_FINE) < 0)
+		abort();
+	/*
+	 * REKEY OPT-IN (cds_ft_group_attr_set_rekey, default OFF).  Tries built
+	 * by this helper are used by the in-trie MOVE tests, so the capability
+	 * has to be declared or every one of them answers NOT_SUPPORTED.  Not
+	 * every creator opts in, deliberately: the helpers that stay off are what
+	 * cover the default path, where ft_install_lookup_ops selects the PLAIN
+	 * lookup specializations instead of the coherent ones.
+	 */
+	if (cds_ft_group_attr_set_rekey(attr, true) < 0)
 		abort();
 	if (cds_ft_group_create(attr, &group) < 0)
 		abort();
@@ -11440,6 +11504,16 @@ static struct cds_ft *create_varlen_ord_ft_ws(struct cds_ft_group **group_out,
 	if (cds_ft_group_attr_set_ordered_list(attr, true) < 0)
 		abort();
 	if (ws && cds_ft_group_attr_set_writer_strategy(attr, *ws) < 0)
+		abort();
+	/*
+	 * REKEY OPT-IN (cds_ft_group_attr_set_rekey, default OFF).  Tries built
+	 * by this helper are used by the in-trie MOVE tests, so the capability
+	 * has to be declared or every one of them answers NOT_SUPPORTED.  Not
+	 * every creator opts in, deliberately: the helpers that stay off are what
+	 * cover the default path, where ft_install_lookup_ops selects the PLAIN
+	 * lookup specializations instead of the coherent ones.
+	 */
+	if (cds_ft_group_attr_set_rekey(attr, true) < 0)
 		abort();
 	if (cds_ft_group_create(attr, &group) < 0)
 		abort();
@@ -20060,6 +20134,13 @@ static int inv_rekey_no_escape(void)
 		cds_ft_group_attr_destroy(gattr);
 		return -1;
 	}
+	/*
+	 * REKEY OPT-IN (cds_ft_group_attr_set_rekey, default OFF): this trie
+	 * hosts an in-trie MOVE, so the capability must be declared or the
+	 * rekey entries answer NOT_SUPPORTED and the test proves nothing.
+	 */
+	if (cds_ft_group_attr_set_rekey(gattr, true) < 0)
+		abort();
 	if (cds_ft_group_create(gattr, &group) < 0) {
 		cds_ft_group_attr_destroy(gattr);
 		return -1;

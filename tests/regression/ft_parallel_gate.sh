@@ -313,6 +313,14 @@ ALL_CONFIGS=(
 	# external-sync do not need it" stays a claim the matrix can refute
 	# rather than a remembered measurement.
 	"bulkfence|-DFT_RED_BULK_FENCE_ALWAYS|u ion ioff"
+	#
+	# THE REKEY OPT-IN's POSITIVE CONTROL (2026-09-20).  rekey is opt-in per
+	# group and OFF by default, so a test whose trie creator forgets
+	# cds_ft_group_attr_set_rekey keeps calling rekey, collects
+	# NOT_SUPPORTED every time, and reports GREEN with zero rekey coverage.
+	# This leg turns that refusal into an abort, which is the only form of
+	# the check a green run cannot absorb.
+	"rekeyoptin|-DFT_DEBUG_REKEY_OPTIN_STRICT|u ion ioff imw"
 	"nocompress|-DNO_FEATURE_FT_COMPRESS|u ioff"
 	# Concurrent legs are SAFE here since the in-place tier became runtime
 	# gated on ft->exclusive: on a shared trie every one of these builds

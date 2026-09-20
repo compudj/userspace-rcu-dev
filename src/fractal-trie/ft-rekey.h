@@ -10872,6 +10872,35 @@ enum cds_ft_status ft_rekey_dispatch(struct cds_ft *ft,
 	if (!ft)
 		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
 	/*
+	 * ☞ THE OPT-IN, and it is checked FIRST -- before the gate, before any
+	 * argument validation -- because a trie that did not declare the
+	 * capability must not pay a grace period, or take a lock, to be told so.
+	 * cds_ft_group_attr_set_rekey, default OFF.
+	 *
+	 * ☠ AND A REFUSAL HERE IS A CLAIM ABOUT THE TRIE: the caller gets
+	 * NOT_SUPPORTED and the trie is UNCHANGED, never a silent no-op.  The
+	 * hazard this creates is on the TEST side -- a suite whose trie creator
+	 * forgets to opt in keeps calling rekey, gets -7 every time, and reads
+	 * as green with zero rekey coverage.  That is the wrong-green shape this
+	 * tree has been bitten by before, so arm FT_DEBUG_REKEY_OPTIN_STRICT in
+	 * at least one gate configuration: it turns a refusal into an abort that
+	 * names the trie, which is the only form of the check a green run cannot
+	 * absorb.
+	 */
+	if (!ft->group->rekey_set) {
+#ifdef FT_DEBUG_REKEY_OPTIN_STRICT
+		fprintf(stderr, "[Fatal] Fractal Trie: cds_ft_rekey_* on cds_ft=%p "
+			"whose group did NOT opt in (cds_ft_group_attr_set_rekey). "
+			"Under -DFT_DEBUG_REKEY_OPTIN_STRICT this aborts rather "
+			"than returning NOT_SUPPORTED, so a test that lost its "
+			"rekey coverage cannot report green.\n", (void *) ft);
+		fflush(stderr);
+		abort();
+#else
+		return CDS_FT_STATUS_NOT_SUPPORTED;
+#endif
+	}
+	/*
 	 * The atomic writer's shape-independent preconditions, checked BEFORE the
 	 * gate so a trie that can never use it does not pay a grace period to be
 	 * told so.  Everything else it decides for itself, from the structure.

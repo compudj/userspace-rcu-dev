@@ -2893,6 +2893,41 @@ enum cds_ft_status cds_ft_group_attr_set_ordered_list(
 		struct cds_ft_group_attr *attr, bool ordered_list);
 
 /*
+ * cds_ft_group_attr_set_rekey - Opt this group's tries into in-trie MOVE (rekey).
+ * @attr: Group attributes.
+ * @rekey: true to allow cds_ft_rekey_graft() / cds_ft_rekey_merge() on tries
+ *         created from this group.
+ *
+ * DEFAULT: false.  Without this opt-in the rekey entry points answer
+ * CDS_FT_STATUS_NOT_SUPPORTED and leave the trie unchanged.
+ *
+ * Why it is opt-in rather than always available:
+ *
+ *  - A trie that can host a move must carry the COHERENT lookup path, in which
+ *    every exact lookup is able to run a second, key-rematerializing walk and
+ *    re-descend when a concurrent move restructured its path.  A trie that will
+ *    never rekey should not carry it.
+ *
+ *  - Under CDS_FT_WRITER_EXTERNAL_SYNC the move gate's grace period would be
+ *    taken while YOUR writer exclusion is held, and the library can neither
+ *    drop that lock nor place itself outside it.  Opting in on such a group
+ *    therefore selects a different reader discipline: readers run the coherent
+ *    two-pass path UNCONDITIONALLY, which removes the mode transition and with
+ *    it the grace period.  The cost is real and is charged to readers -- every
+ *    exact lookup on such a trie runs the second walk, always.  That is the
+ *    price of in-trie moves under an exclusion the library does not own.
+ *
+ * A move also requires an EAGER trie: it re-parents leaves without rewriting an
+ * application-stored speculative key, so a speculative trie refuses the move
+ * with CDS_FT_STATUS_INVALID_ARGUMENT_ERROR regardless of this flag.
+ *
+ * Returns CDS_FT_STATUS_OK, or CDS_FT_STATUS_INVALID_ARGUMENT_ERROR if @attr is
+ * NULL.
+ */
+enum cds_ft_status cds_ft_group_attr_set_rekey(
+		struct cds_ft_group_attr *attr, bool rekey);
+
+/*
  * cds_ft_group_attr_set_rank_stats - Enable (@rank_stats true) or disable
  *   (@rank_stats false) maintenance of the per-node order-statistics key
  *   counts.  DISABLED is the default.

@@ -257,6 +257,39 @@ enum cds_ft_status cds_ft_group_attr_set_ordered_list(
 	return CDS_FT_STATUS_OK;
 }
 
+/*
+ * ☞ REKEY IS OPT-IN, and the default is OFF.  (MATHIEU, 2026-09-20.)
+ *
+ * Two reasons, and the second is a correctness one:
+ *
+ * 1. A trie that can host an in-trie MOVE has to carry the COHERENT lookup
+ *    specializations -- every exact lookup able to run a second, key-
+ *    rematerializing walk -- because a move can start at any time.  A trie
+ *    that will never rekey pays for a capability it never uses.  This flag is
+ *    what lets ft_install_lookup_ops select the plain variants instead.
+ *
+ * 2. Under CDS_FT_WRITER_EXTERNAL_SYNC the move gate's grace period is taken
+ *    while the APPLICATION holds its own writer exclusion, which the library
+ *    can neither drop nor get outside of.  Opting IN there is what turns on
+ *    @rekey_always_coherent, which removes that grace period entirely -- so
+ *    the opt-in is also the place the library gets to decide how to serve the
+ *    request.  See cds_ft::rekey_always_coherent.
+ *
+ * ☠ A REFUSAL IS A CLAIM ABOUT THE TRIE, not a return code: a caller that
+ * does not opt in gets CDS_FT_STATUS_NOT_SUPPORTED from the rekey entries,
+ * NOT a silent no-op.  Tests that exercise rekey must opt in, and both suites
+ * carry a positive control that FAILS when no rekey actually ran -- otherwise
+ * a missed creator reads as a green suite with zero rekey coverage.
+ */
+enum cds_ft_status cds_ft_group_attr_set_rekey(
+		struct cds_ft_group_attr *attr, bool rekey)
+{
+	if (!attr)
+		return CDS_FT_STATUS_INVALID_ARGUMENT_ERROR;
+	attr->rekey_set = rekey;
+	return CDS_FT_STATUS_OK;
+}
+
 enum cds_ft_status cds_ft_group_attr_set_rank_stats(
 		struct cds_ft_group_attr *attr, bool rank_stats)
 {
@@ -593,6 +626,7 @@ enum cds_ft_status _cds_ft_group_create(const struct cds_ft_group_attr *attr,
 		ft_group->key_len_offset = attr->key_len_offset;
 		ft_group->key_len_offset_set = attr->key_len_offset_set;
 		ft_group->ordered_list_set = attr->ordered_list_set;
+		ft_group->rekey_set = attr->rekey_set;
 		ft_group->rank_stats_set = attr->rank_stats_set;
 		ft_group->numa_policy = attr->numa_policy;
 		ft_group->optimize = attr->optimize;
@@ -654,6 +688,7 @@ enum cds_ft_status _cds_ft_group_create(const struct cds_ft_group_attr *attr,
 			ft_group->flags |= CDS_FT_FLAG_SKIP_COMPRESSED;
 #endif
 		ft_group->ordered_list_set = true;	/* on by default; see attr_create */
+		ft_group->rekey_set = false;		/* OFF by default: opt-in */
 		ft_group->numa_policy = CDS_FT_NUMA_DEFAULT;
 		ft_group->optimize = CDS_FT_OPTIMIZE_THROUGHPUT;
 		ft_group->writer_strategy = CDS_FT_WRITER_LOCK_FINE;	/* DLM default */
@@ -936,7 +971,37 @@ enum cds_ft_status cds_ft_create(struct cds_ft_group *ft_group,
 	 * cell.  Set BEFORE
 	 * ft_install_lookup_ops, which selects the specializations off it.
 	 */
-	ft->rekey_coherence = !ft->speculative_key_offset_active;
+	/*
+	 * ☞ AND NOW IT IS AN OPT-IN AGAIN, for a reason the move gate does not
+	 * cover.  The note above is still right about COST -- the gate does make
+	 * coherence free while no move is in flight -- but it assumed the gate's
+	 * grace period is always payable.  Under CDS_FT_WRITER_EXTERNAL_SYNC it
+	 * is not: it is taken under an exclusion the library does not own.  So
+	 * the capability is declared (cds_ft_group_attr_set_rekey) and a trie
+	 * that never rekeys carries no coherent variant at all.
+	 *
+	 * Which tries can still host a move, given the opt-in: EAGER ones only
+	 * -- a move changes a leaf's key and the library cannot rewrite an
+	 * application-stored speculative key.
+	 */
+	ft->rekey_coherence = ft_group->rekey_set &&
+			!ft->speculative_key_offset_active;
+	/*
+	 * EXTERNAL_SYNC + rekey => readers never leave the coherent path, so the
+	 * move gate publishes no mode change and owes no grace period.  Decided
+	 * HERE, before ft_install_lookup_ops, and immutable after it for the
+	 * same reason @rekey_coherence is: the specializations are selected off
+	 * it, so a concurrent reader's fn-ptr choice is race-free.
+	 */
+	/*
+	 * ☠ FROM THE GROUP, NOT FROM @ft->external_sync, WHICH IS NOT SET YET --
+	 * that assignment is ~30 lines below this one.  Reading the trie's own
+	 * field here would be a constant false, and the failure would be
+	 * SILENT: every external-sync trie would quietly keep the move gate's
+	 * grace period, which is the exact thing this flag exists to remove.
+	 */
+	ft->rekey_always_coherent = ft->rekey_coherence &&
+			ft_group->writer_strategy == CDS_FT_WRITER_EXTERNAL_SYNC;
 	ft_install_lookup_ops(ft);
 #ifdef FEATURE_FT_VERIFY_AT_MUTATION
 	/*

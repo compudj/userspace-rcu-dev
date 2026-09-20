@@ -1549,6 +1549,85 @@ FT-wide mutex IS dropped at every `ft_writer_lock_gp_wait`, so without it two
 bulk bodies interleave at a seam. Flagged rather than removed.
 
 
+### 11.11.2 EXTERNAL_SYNC takes grace periods under the APPLICATION's lock; rekey becomes opt-in (Mathieu, 2026-09-20) -- ☑ LANDED
+
+> *"Our coarse mode findings will apply to the external sync contract. It's
+> important."* / *"I suspect that External sync will be fundamentally
+> incompatible with rekey"* / *"Unless readers always do two pass with external
+> sync"* / *"Maybe it should be opt in"*
+
+**First, the coarse question, measured.** Every bulk op does scope the FT-wide
+mutex around its whole body (`CDS_FT_SCOPED_WRITER`); the only holes are the
+eight `ft_writer_lock_gp_wait` drain seams, and those MUST drop -- a writer
+parked on the mutex is an online, non-quiescent QSBR reader, so a GP taken
+while holding it waits for the thread it is blocking. Instrumented at the
+RELEASE (`held != NULL`), not at the seam, because `ft_bl_seam_under` counts
+seams *reached* and scores on a FINE trie that holds nothing:
+
+```
+seams that ACTUALLY RELEASED the FT-wide mutex (ft_unit):
+  in a BULK body  coarse=16  fine=29  |  in a POINT op  coarse=34  fine=0
+  cross-trie=0
+```
+
+⇒ on COARSE the mutex is **not** held across a whole bulk op, so `ft_bulk_lock`
+is load-bearing there (it is the bulk-vs-bulk serializer held *across* the
+seams). It stays.
+
+**Then the consequence for EXTERNAL_SYNC, which is the important one.** Every
+seam guards on `@exclusive`, **none on `@external_sync`**, so they all fire
+there -- and the library holds no mutex of its own to drop. What it cannot drop
+is the APPLICATION's exclusion. Per-site, one op each:
+
+| site | op | GPs under the app's lock |
+|---|---|---|
+| `internal.h` bulk gate | rekey ×2 | 2 |
+| `ft-detach.h:513` | detach reader drain | 1 |
+| `ft-lifecycle.h:485` | `make_exclusive` drain | 1 |
+
+COARSE takes the *same four* -- the difference is entirely who holds a lock
+across them. The contract text says nothing about this; it mentions grace
+periods only to say readers are unaffected.
+
+**The cure, and its exact reach.** `cds_ft_group_attr_set_rekey()`, default OFF.
+On an EXTERNAL_SYNC group that opts in, `@rekey_always_coherent` makes
+`ft_move_active()` answer true outright: readers never leave the two-pass path,
+so the move gate publishes no mode *transition* and owes no grace period.
+Measured before / after, same program:
+
+```
+EXTERNAL_SYNC gate GPs:  2  ->  0        (COARSE unchanged at 2 -- correctly scoped)
+```
+
+☠ **It removes the rekey GPs and nothing else.** `ft-detach.h:513` and
+`ft-lifecycle.h:485` are reader DRAINS, not mode transitions; external sync
+excludes writers only, so they are exactly as necessary as under coarse. **The
+contract still owes a requirement that a writer blocked on the application's
+exclusion be RCU-quiescent** (`thread_offline` while waiting), which is what the
+library already does for its own locks (`ft_bulk_lock_enter`,
+`ft_writer_lock_park`). Forbidding rekey would NOT have closed this.
+
+**The opt-in also pays for itself off external sync**: a trie that will never
+rekey no longer carries the coherent lookup specializations at all
+(`ft_install_lookup_ops` selects the plain ones), which is what
+`ft-lifecycle.h`'s *"REKEY coherence is no longer an opt-in ... the opt-in attr
+is gone with it"* had traded away. The note was right about cost and wrong
+about the grace period always being payable.
+
+**Wrong-green guard, because this is exactly the shape that has bitten before.**
+A creator that forgets the opt-in keeps calling rekey, collects `-7` every time,
+and reports green with zero coverage. Three things prevent that:
+`-DFT_DEBUG_REKEY_OPTIN_STRICT` turns a refusal into an abort naming the trie;
+gate config `rekeyoptin` arms it (**0 aborts** over ft_unit + ft_inv); and
+`test_rekey_optin_default_refuses` covers the default arm, which every other
+rekey test opts out of exercising. Converting the suites was itself the
+evidence: 48 tests went RED on the flip, not silently green.
+
+☠ And the TAP plan has TWO arms -- `NR_TESTS` is defined once per
+`FEATURE_FT_FAULT_INJECT` branch. Bumping one left 363 tests running against
+`1..361`: every line `ok`, the `^ok` grep green, exit status 2.
+
+
 ## 12. API / design questions queued by Mathieu (2026-09-17)
 
 Not implemented; recorded so the flip does not silently decide them.

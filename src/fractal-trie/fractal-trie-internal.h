@@ -2223,6 +2223,16 @@ struct cds_ft_group {
 	 *   cds_ft_group_attr_set_ordered_list.
 	 */
 	bool ordered_list_set;
+
+	/*
+	 * @rekey_set: the application opted this group's tries into the in-trie
+	 * MOVE ops (cds_ft_rekey_graft / cds_ft_rekey_merge).  DEFAULT OFF --
+	 * see cds_ft_group_attr_set_rekey.  A trie that cannot host a move
+	 * needs no reader coherence at all, so this also decides
+	 * @rekey_coherence and with it which lookup specializations
+	 * ft_install_lookup_ops selects.
+	 */
+	bool rekey_set;
 	/*
 	 * @rank_stats_set: maintain the per-node order-statistics key counts
 	 *   (cds_ft_metadata.nr_keys) that back the rank / select / count
@@ -2437,6 +2447,37 @@ struct cds_ft {
 	 * really the fn-ptr choice -- is race-free.
 	 */
 	bool rekey_coherence;
+
+	/*
+	 * ALWAYS-COHERENT: readers on this trie take the two-pass path
+	 * unconditionally, never consulting @move_active (ft_move_active
+	 * returns true outright).  Set for an EXTERNAL_SYNC trie that opted
+	 * into rekey.
+	 *
+	 * ☠ IT IS NOT A PERFORMANCE KNOB -- IT IS WHAT MAKES REKEY LEGAL THERE.
+	 * The move gate's discipline is publish @move_active, wait ONE FULL
+	 * GRACE PERIOD, only then mutate; the GP is there so no reader is still
+	 * running under the old rule.  Under CDS_FT_WRITER_EXTERNAL_SYNC that
+	 * grace period is taken while the APPLICATION holds its own writer
+	 * exclusion, and the library can neither drop that lock nor place
+	 * itself outside it -- which is precisely the deadlock
+	 * ft_writer_lock_gp_wait exists to avoid for the library's OWN mutex
+	 * ("writers parked on the lock are RCU-online and non-quiescent, so
+	 * they are precisely what stops this grace period from ever
+	 * completing").  Measured 2026-09-20: 2 gate grace periods per pair of
+	 * rekeys, taken under the app's lock.
+	 *
+	 * With every reader ALREADY on the coherent path there is no reader
+	 * running under the old rule, so there is nothing to wait for and the
+	 * gate owns no grace period at all.  The trade the move gate makes --
+	 * pay one GP, keep the steady-state reader on the fast path -- is
+	 * simply the wrong way round in this mode.
+	 *
+	 * The price is honest: every exact lookup on such a trie runs the
+	 * second walk, always.  That is the cost of rekey under an exclusion
+	 * the library does not own.
+	 */
+	bool rekey_always_coherent;
 
 	/*
 	 * MOVE MODE GATE (doc/design: the per-trie move refcount).  An in-trie MOVE
@@ -4102,6 +4143,18 @@ bool ft_witness_equal(const struct ft_visit_witness *a,
 static inline
 bool ft_move_active(const struct cds_ft *ft)
 {
+	/*
+	 * ☞ ALWAYS-COHERENT TRIES ANSWER YES WITHOUT LOOKING.  See
+	 * @rekey_always_coherent: on such a trie readers never leave the
+	 * coherent path, so there is no mode to sample -- and, more to the
+	 * point, no mode TRANSITION for the move gate to fence with a grace
+	 * period.  That is the whole reason the flag exists.
+	 *
+	 * Immutable after cds_ft_create, so this is a predictable branch on a
+	 * value the reader already has in cache beside @move_active.
+	 */
+	if (ft->rekey_always_coherent)
+		return true;
 	return CMM_LOAD_SHARED(ft->move_active) != 0;
 }
 
@@ -4175,17 +4228,20 @@ bool ft_bulk_state_has_consumer(const struct cds_ft *ft)
  * cannot tell a real saving from a gate that never opens.
  */
 __attribute__((weak)) unsigned long ft_bg_gp_owned, ft_bg_gp_saved,
-	ft_bg_gp_coherent, ft_bg_reported;
+	ft_bg_gp_coherent, ft_bg_gp_coherent_saved, ft_bg_reported;
 static void ft_bg_report(void) __attribute__((destructor));
 static void ft_bg_report(void)
 {
-	if (!ft_bg_gp_owned && !ft_bg_gp_saved && !ft_bg_gp_coherent)
+	if (!ft_bg_gp_owned && !ft_bg_gp_saved && !ft_bg_gp_coherent
+			&& !ft_bg_gp_coherent_saved)
 		return;
 	if (__atomic_fetch_add(&ft_bg_reported, 1, __ATOMIC_RELAXED))
 		return;
 	fprintf(stderr, "FT_BULK_GATE_GP  writer-word opens: fenced=%lu "
-		"SAVED(no consumer)=%lu | reader-word (move_active) GPs=%lu\n",
-		ft_bg_gp_owned, ft_bg_gp_saved, ft_bg_gp_coherent);
+		"SAVED(no consumer)=%lu | reader-word (move_active) GPs=%lu "
+		"SAVED(always-coherent)=%lu\n",
+		ft_bg_gp_owned, ft_bg_gp_saved, ft_bg_gp_coherent,
+		ft_bg_gp_coherent_saved);
 }
 # define FT_BG_TALLY(c)	__atomic_fetch_add(&(c), 1, __ATOMIC_RELAXED)
 #else
@@ -4303,9 +4359,27 @@ void ft_bulk_gate_enter_gp(struct cds_ft *ft, enum ft_bulk_kind kind)
 	}
 	if (kind == FT_BULK_COHERENT && ft->move_gate_nr++ == 0) {
 		CMM_STORE_SHARED(ft->move_active, 1);
-		/* A READER word: every mode needs this fence. */
-		own_gp = true;
-		FT_BG_TALLY(ft_bg_gp_coherent);
+		/*
+		 * A READER word, so every mode that has a reader to TRANSITION
+		 * needs the fence -- and an ALWAYS-COHERENT trie has none.  Its
+		 * readers were on the two-pass path before this store and will
+		 * be after it; ft_move_active does not even load the word.  The
+		 * grace period would be waiting for a mode change that is not
+		 * happening.
+		 *
+		 * ☠ AND ON SUCH A TRIE IT IS NOT MERELY WASTE.  @external_sync
+		 * means the APPLICATION's writer exclusion is held across this
+		 * call, so this GP would wait while holding a lock the library
+		 * cannot drop -- see @rekey_always_coherent.
+		 *
+		 * The store stays, for the reason the @bulk_state store does:
+		 * one relaxed word, and it keeps the two paths reading alike.
+		 */
+		if (!ft->rekey_always_coherent) {
+			own_gp = true;
+			FT_BG_TALLY(ft_bg_gp_coherent);
+		} else
+			FT_BG_TALLY(ft_bg_gp_coherent_saved);
 	}
 	CMM_STORE_SHARED(ft->bulk_state, ft->bulk_gate_nr);
 	if (own_gp) {
@@ -5504,6 +5578,13 @@ struct cds_ft_group_attr {
 	 * See cds_ft_group_attr_set_ordered_list.
 	 */
 	bool ordered_list_set;
+	/*
+	 * Opt this group's tries into the in-trie MOVE ops (rekey).  DEFAULT
+	 * FALSE -- cds_ft_rekey_graft / cds_ft_rekey_merge answer
+	 * CDS_FT_STATUS_NOT_SUPPORTED unless it is set.  See
+	 * cds_ft_group_attr_set_rekey.
+	 */
+	bool rekey_set;
 	/*
 	 * Maintain the per-node order-statistics key counts (nr_keys) that back
 	 * cds_ft_count_keys / _prefix, cds_ft_lookup_nth / _last, and

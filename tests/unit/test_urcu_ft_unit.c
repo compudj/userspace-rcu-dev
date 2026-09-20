@@ -69,13 +69,19 @@
 #endif
 
 /*
- * 336 unconditional + 51 fault-injection-only RUN_TEST registrations, on top of
+ * 338 unconditional + 51 fault-injection-only RUN_TEST registrations, on top of
  * the NR_TESTS_DLM / NR_TESTS_DLM_FAULT groups counted above.
+ *
+ * ☠ BUMP BOTH ARMS.  A new unconditional test belongs to the fault-inject
+ * count as well, and raising only one leaves a TAP PLAN MISMATCH in the other
+ * configuration: every line reads `ok`, the `^ok` grep is green, and the
+ * process still exits non-zero.  Measured while adding the two rekey opt-in
+ * tests -- 363 ran against `1..361`.
  */
 #ifdef FEATURE_FT_FAULT_INJECT
-#define NR_TESTS (399 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (401 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #else
-#define NR_TESTS (348 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
+#define NR_TESTS (350 + NR_TESTS_DLM + NR_TESTS_DLM_FAULT)
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -251,6 +257,16 @@ static struct cds_ft *create_fixed_ord_ft(size_t klen,
 		abort();
 	if (cds_ft_group_attr_set_ordered_list(attr, true) < 0)
 		abort();
+	/*
+	 * REKEY OPT-IN (cds_ft_group_attr_set_rekey, default OFF).  Tries built
+	 * by this helper are used by the in-trie MOVE tests, so the capability
+	 * has to be declared or every one of them answers NOT_SUPPORTED.  Not
+	 * every creator opts in, deliberately: the helpers that stay off are what
+	 * cover the default path, where ft_install_lookup_ops selects the PLAIN
+	 * lookup specializations instead of the coherent ones.
+	 */
+	if (cds_ft_group_attr_set_rekey(attr, true) < 0)
+		abort();
 	if (cds_ft_group_create(attr, &group) < 0)
 		abort();
 	cds_ft_group_attr_destroy(attr);
@@ -316,6 +332,14 @@ static struct cds_ft *create_fixed_ord_rekey_ft(size_t klen,
 	if (cds_ft_group_attr_set_key_len(gattr, klen) < 0)
 		abort();
 	if (cds_ft_group_attr_set_ordered_list(gattr, true) < 0)
+		abort();
+	/*
+	 * REKEY OPT-IN (cds_ft_group_attr_set_rekey, default OFF).  Tries built
+	 * by this helper host in-trie MOVEs, so the capability has to be
+	 * declared or the rekey entries answer NOT_SUPPORTED.  Creators that
+	 * stay off are what cover the default path.
+	 */
+	if (cds_ft_group_attr_set_rekey(gattr, true) < 0)
 		abort();
 	if (cds_ft_group_create(gattr, &group) < 0)
 		abort();
@@ -383,11 +407,25 @@ static struct cds_ft *create_fixed_coarse_lock_ft(size_t klen,
 /* Create a variable-length trie (default attributes). */
 static struct cds_ft *create_varlen_ft(struct cds_ft_group **group_out)
 {
+	struct cds_ft_group_attr *attr;
 	struct cds_ft_group *group;
 	struct cds_ft *ft;
 
-	if (cds_ft_group_create(NULL, &group) < 0)
+	/*
+	 * REKEY OPT-IN (cds_ft_group_attr_set_rekey, default OFF).  Tries built
+	 * by this helper are used by the in-trie MOVE tests, so the capability
+	 * has to be declared or every one of them answers NOT_SUPPORTED.  Not
+	 * every creator opts in, deliberately: the helpers that stay off are what
+	 * cover the default path, where ft_install_lookup_ops selects the PLAIN
+	 * lookup specializations instead of the coherent ones.
+	 */
+	if (cds_ft_group_attr_create(&attr) < 0)
 		abort();
+	if (cds_ft_group_attr_set_rekey(attr, true) < 0)
+		abort();
+	if (cds_ft_group_create(attr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(attr);
 	if (cds_ft_create(group, NULL, &ft) < 0)
 		abort();
 	*group_out = group;
@@ -407,6 +445,16 @@ static struct cds_ft *create_varlen_rankstats_list_ft(bool ordered_list,
 	if (cds_ft_group_attr_set_rank_stats(attr, true) < 0)
 		abort();
 	if (cds_ft_group_attr_set_ordered_list(attr, ordered_list) < 0)
+		abort();
+	/*
+	 * REKEY OPT-IN (cds_ft_group_attr_set_rekey, default OFF).  Tries built
+	 * by this helper are used by the in-trie MOVE tests, so the capability
+	 * has to be declared or every one of them answers NOT_SUPPORTED.  Not
+	 * every creator opts in, deliberately: the helpers that stay off are what
+	 * cover the default path, where ft_install_lookup_ops selects the PLAIN
+	 * lookup specializations instead of the coherent ones.
+	 */
+	if (cds_ft_group_attr_set_rekey(attr, true) < 0)
 		abort();
 	if (cds_ft_group_create(attr, &group) < 0)
 		abort();
@@ -436,6 +484,16 @@ static struct cds_ft *create_fixed_fine_lock_ft(size_t klen,
 		abort();
 	if (cds_ft_group_attr_set_writer_strategy(attr,
 			CDS_FT_WRITER_LOCK_FINE) < 0)
+		abort();
+	/*
+	 * REKEY OPT-IN (cds_ft_group_attr_set_rekey, default OFF).  Tries built
+	 * by this helper are used by the in-trie MOVE tests, so the capability
+	 * has to be declared or every one of them answers NOT_SUPPORTED.  Not
+	 * every creator opts in, deliberately: the helpers that stay off are what
+	 * cover the default path, where ft_install_lookup_ops selects the PLAIN
+	 * lookup specializations instead of the coherent ones.
+	 */
+	if (cds_ft_group_attr_set_rekey(attr, true) < 0)
 		abort();
 	if (cds_ft_group_create(attr, &group) < 0)
 		abort();
@@ -467,6 +525,16 @@ static struct cds_ft *create_fixed_fine_lock_listoff_ft(size_t klen,
 		abort();
 	if (cds_ft_group_attr_set_ordered_list(attr, false) < 0)
 		abort();
+	/*
+	 * REKEY OPT-IN (cds_ft_group_attr_set_rekey, default OFF).  Tries built
+	 * by this helper are used by the in-trie MOVE tests, so the capability
+	 * has to be declared or every one of them answers NOT_SUPPORTED.  Not
+	 * every creator opts in, deliberately: the helpers that stay off are what
+	 * cover the default path, where ft_install_lookup_ops selects the PLAIN
+	 * lookup specializations instead of the coherent ones.
+	 */
+	if (cds_ft_group_attr_set_rekey(attr, true) < 0)
+		abort();
 	if (cds_ft_group_create(attr, &group) < 0)
 		abort();
 	cds_ft_group_attr_destroy(attr);
@@ -492,6 +560,16 @@ static struct cds_ft *create_varlen_fine_lock_ft(struct cds_ft_group **group_out
 		abort();
 	if (cds_ft_group_attr_set_writer_strategy(attr,
 			CDS_FT_WRITER_LOCK_FINE) < 0)
+		abort();
+	/*
+	 * REKEY OPT-IN (cds_ft_group_attr_set_rekey, default OFF).  Tries built
+	 * by this helper are used by the in-trie MOVE tests, so the capability
+	 * has to be declared or every one of them answers NOT_SUPPORTED.  Not
+	 * every creator opts in, deliberately: the helpers that stay off are what
+	 * cover the default path, where ft_install_lookup_ops selects the PLAIN
+	 * lookup specializations instead of the coherent ones.
+	 */
+	if (cds_ft_group_attr_set_rekey(attr, true) < 0)
 		abort();
 	if (cds_ft_group_create(attr, &group) < 0)
 		abort();
@@ -1336,6 +1414,13 @@ static int test_rekey_merge_colocated_chain_refused(void)
 
 		if (cds_ft_group_attr_create(&gattr) < 0)
 			abort();
+	/*
+	 * REKEY OPT-IN (cds_ft_group_attr_set_rekey, default OFF): this trie
+	 * hosts an in-trie MOVE, so the capability must be declared or the
+	 * rekey entries answer NOT_SUPPORTED and the test proves nothing.
+	 */
+	if (cds_ft_group_attr_set_rekey(gattr, true) < 0)
+		abort();
 		if (cds_ft_group_attr_set_max_key_len(gattr, 4) < 0 ||
 				cds_ft_group_attr_set_lookup_optimization(gattr,
 					CDS_FT_LOOKUP_OPTIMIZE_EAGER) < 0 ||
@@ -3906,6 +3991,13 @@ static int test_rekey_coherence_listoff(void)
 		cds_ft_group_attr_destroy(gattr);
 		return -1;
 	}
+	/*
+	 * REKEY OPT-IN (cds_ft_group_attr_set_rekey, default OFF): this trie
+	 * hosts an in-trie MOVE, so the capability must be declared or the
+	 * rekey entries answer NOT_SUPPORTED and the test proves nothing.
+	 */
+	if (cds_ft_group_attr_set_rekey(gattr, true) < 0)
+		abort();
 	if (cds_ft_group_create(gattr, &group) < 0) {
 		cds_ft_group_attr_destroy(gattr);
 		return -1;
@@ -12470,6 +12562,13 @@ static int rekey_bare_head_graft(const char *dst, int ordered_list)
 
 	if (cds_ft_group_attr_create(&attr) < 0)
 		return -1;
+	/*
+	 * REKEY OPT-IN (cds_ft_group_attr_set_rekey, default OFF): this trie
+	 * hosts an in-trie MOVE, so the capability must be declared or the
+	 * rekey entries answer NOT_SUPPORTED and the test proves nothing.
+	 */
+	if (cds_ft_group_attr_set_rekey(attr, true) < 0)
+		abort();
 	if (cds_ft_group_attr_set_ordered_list(attr, ordered_list) < 0 ||
 	    cds_ft_group_create(attr, &group) < 0) {
 		cds_ft_group_attr_destroy(attr);
@@ -12580,6 +12679,13 @@ static int rekey_merge_colocated_chain(int rank, int ordered_list)
 
 		if (cds_ft_group_attr_create(&attr) < 0)
 			return -1;
+	/*
+	 * REKEY OPT-IN (cds_ft_group_attr_set_rekey, default OFF): this trie
+	 * hosts an in-trie MOVE, so the capability must be declared or the
+	 * rekey entries answer NOT_SUPPORTED and the test proves nothing.
+	 */
+	if (cds_ft_group_attr_set_rekey(attr, true) < 0)
+		abort();
 		if (cds_ft_group_attr_set_ordered_list(attr, ordered_list) < 0 ||
 		    cds_ft_group_create(attr, &group) < 0) {
 			cds_ft_group_attr_destroy(attr);
@@ -12699,6 +12805,13 @@ static int rekey_merge_cut_source(int rank, int ordered_list)
 
 		if (cds_ft_group_attr_create(&attr) < 0)
 			return -1;
+	/*
+	 * REKEY OPT-IN (cds_ft_group_attr_set_rekey, default OFF): this trie
+	 * hosts an in-trie MOVE, so the capability must be declared or the
+	 * rekey entries answer NOT_SUPPORTED and the test proves nothing.
+	 */
+	if (cds_ft_group_attr_set_rekey(attr, true) < 0)
+		abort();
 		if (cds_ft_group_attr_set_ordered_list(attr, ordered_list) < 0 ||
 		    cds_ft_group_create(attr, &group) < 0) {
 			cds_ft_group_attr_destroy(attr);
@@ -12814,6 +12927,13 @@ static int rekey_merge_dst_run_start(int rank, int ordered_list)
 
 		if (cds_ft_group_attr_create(&attr) < 0)
 			return -1;
+	/*
+	 * REKEY OPT-IN (cds_ft_group_attr_set_rekey, default OFF): this trie
+	 * hosts an in-trie MOVE, so the capability must be declared or the
+	 * rekey entries answer NOT_SUPPORTED and the test proves nothing.
+	 */
+	if (cds_ft_group_attr_set_rekey(attr, true) < 0)
+		abort();
 		if (cds_ft_group_attr_set_ordered_list(attr, ordered_list) < 0 ||
 		    cds_ft_group_create(attr, &group) < 0) {
 			cds_ft_group_attr_destroy(attr);
@@ -12931,6 +13051,13 @@ static int rekey_bare_head_upwalk_key(const char *dst, const char *extra,
 	}
 	if (cds_ft_group_attr_create(&attr) < 0)
 		return -1;
+	/*
+	 * REKEY OPT-IN (cds_ft_group_attr_set_rekey, default OFF): this trie
+	 * hosts an in-trie MOVE, so the capability must be declared or the
+	 * rekey entries answer NOT_SUPPORTED and the test proves nothing.
+	 */
+	if (cds_ft_group_attr_set_rekey(attr, true) < 0)
+		abort();
 	/* The ordered list is the whole point: the byte lives in the CELL. */
 	if (cds_ft_group_attr_set_ordered_list(attr, 1) < 0 ||
 	    cds_ft_group_create(attr, &group) < 0) {
@@ -13152,6 +13279,13 @@ static int rekey_merge_dst_bare_head(int rank, int ordered_list)
 
 		if (cds_ft_group_attr_create(&attr) < 0)
 			return -1;
+	/*
+	 * REKEY OPT-IN (cds_ft_group_attr_set_rekey, default OFF): this trie
+	 * hosts an in-trie MOVE, so the capability must be declared or the
+	 * rekey entries answer NOT_SUPPORTED and the test proves nothing.
+	 */
+	if (cds_ft_group_attr_set_rekey(attr, true) < 0)
+		abort();
 		if (cds_ft_group_attr_set_ordered_list(attr, ordered_list) < 0 ||
 		    cds_ft_group_create(attr, &group) < 0) {
 			cds_ft_group_attr_destroy(attr);
@@ -13276,6 +13410,13 @@ static int rekey_fold_collapse_two_child(int rank, int ordered_list)
 
 		if (cds_ft_group_attr_create(&attr) < 0)
 			return -1;
+	/*
+	 * REKEY OPT-IN (cds_ft_group_attr_set_rekey, default OFF): this trie
+	 * hosts an in-trie MOVE, so the capability must be declared or the
+	 * rekey entries answer NOT_SUPPORTED and the test proves nothing.
+	 */
+	if (cds_ft_group_attr_set_rekey(attr, true) < 0)
+		abort();
 		if (cds_ft_group_attr_set_ordered_list(attr, ordered_list) < 0 ||
 		    cds_ft_group_create(attr, &group) < 0) {
 			cds_ft_group_attr_destroy(attr);
@@ -13371,6 +13512,13 @@ static int test_rekey_bare_head_collide_walk(void)
 	}
 	if (cds_ft_group_attr_create(&attr) < 0)
 		return -1;
+	/*
+	 * REKEY OPT-IN (cds_ft_group_attr_set_rekey, default OFF): this trie
+	 * hosts an in-trie MOVE, so the capability must be declared or the
+	 * rekey entries answer NOT_SUPPORTED and the test proves nothing.
+	 */
+	if (cds_ft_group_attr_set_rekey(attr, true) < 0)
+		abort();
 	if (cds_ft_group_attr_set_ordered_list(attr, 1) < 0 ||
 	    cds_ft_group_create(attr, &group) < 0) {
 		cds_ft_group_attr_destroy(attr);
@@ -13674,6 +13822,13 @@ static int rekey_displaced_external_plan(int ordered_list)
 	}
 	if (cds_ft_group_attr_create(&attr) < 0)
 		return -1;
+	/*
+	 * REKEY OPT-IN (cds_ft_group_attr_set_rekey, default OFF): this trie
+	 * hosts an in-trie MOVE, so the capability must be declared or the
+	 * rekey entries answer NOT_SUPPORTED and the test proves nothing.
+	 */
+	if (cds_ft_group_attr_set_rekey(attr, true) < 0)
+		abort();
 	if (cds_ft_group_attr_set_ordered_list(attr, ordered_list) < 0 ||
 	    cds_ft_group_create(attr, &group) < 0) {
 		cds_ft_group_attr_destroy(attr);
@@ -13929,6 +14084,13 @@ static int rekey_fold_writes_value(int ordered_list, int mode)
 	}
 	if (cds_ft_group_attr_create(&attr) < 0)
 		return -1;
+	/*
+	 * REKEY OPT-IN (cds_ft_group_attr_set_rekey, default OFF): this trie
+	 * hosts an in-trie MOVE, so the capability must be declared or the
+	 * rekey entries answer NOT_SUPPORTED and the test proves nothing.
+	 */
+	if (cds_ft_group_attr_set_rekey(attr, true) < 0)
+		abort();
 	if (cds_ft_group_attr_set_ordered_list(attr, ordered_list) < 0 ||
 	    cds_ft_group_create(attr, &group) < 0) {
 		cds_ft_group_attr_destroy(attr);
@@ -14072,6 +14234,13 @@ static int rekey_compressed_publish_parent(int ordered_list, int shape)
 	}
 	if (cds_ft_group_attr_create(&attr) < 0)
 		return -1;
+	/*
+	 * REKEY OPT-IN (cds_ft_group_attr_set_rekey, default OFF): this trie
+	 * hosts an in-trie MOVE, so the capability must be declared or the
+	 * rekey entries answer NOT_SUPPORTED and the test proves nothing.
+	 */
+	if (cds_ft_group_attr_set_rekey(attr, true) < 0)
+		abort();
 	if (cds_ft_group_attr_set_ordered_list(attr, ordered_list) < 0 ||
 	    (shapes[shape].rank_stats &&
 	     cds_ft_group_attr_set_rank_stats(attr, true) < 0) ||
@@ -14204,6 +14373,13 @@ static int rekey_fold_compressed_chain(int ordered_list, int shape)
 	}
 	if (cds_ft_group_attr_create(&attr) < 0)
 		return -1;
+	/*
+	 * REKEY OPT-IN (cds_ft_group_attr_set_rekey, default OFF): this trie
+	 * hosts an in-trie MOVE, so the capability must be declared or the
+	 * rekey entries answer NOT_SUPPORTED and the test proves nothing.
+	 */
+	if (cds_ft_group_attr_set_rekey(attr, true) < 0)
+		abort();
 	if (cds_ft_group_attr_set_ordered_list(attr, ordered_list) < 0 ||
 	    (shapes[shape].rank_stats &&
 	     cds_ft_group_attr_set_rank_stats(attr, true) < 0) ||
@@ -14367,6 +14543,13 @@ static int rekey_fold_cut_source(int ordered_list, int shape)
 	}
 	if (cds_ft_group_attr_create(&attr) < 0)
 		return -1;
+	/*
+	 * REKEY OPT-IN (cds_ft_group_attr_set_rekey, default OFF): this trie
+	 * hosts an in-trie MOVE, so the capability must be declared or the
+	 * rekey entries answer NOT_SUPPORTED and the test proves nothing.
+	 */
+	if (cds_ft_group_attr_set_rekey(attr, true) < 0)
+		abort();
 	if (cds_ft_group_attr_set_ordered_list(attr, ordered_list) < 0 ||
 	    (shapes[shape].rank_stats &&
 	     cds_ft_group_attr_set_rank_stats(attr, true) < 0) ||
@@ -14519,6 +14702,13 @@ static int rekey_split_old_dir_promote(int ordered_list, int shape)
 	}
 	if (cds_ft_group_attr_create(&attr) < 0)
 		return -1;
+	/*
+	 * REKEY OPT-IN (cds_ft_group_attr_set_rekey, default OFF): this trie
+	 * hosts an in-trie MOVE, so the capability must be declared or the
+	 * rekey entries answer NOT_SUPPORTED and the test proves nothing.
+	 */
+	if (cds_ft_group_attr_set_rekey(attr, true) < 0)
+		abort();
 	if (cds_ft_group_attr_set_ordered_list(attr, ordered_list) < 0 ||
 	    (shapes[shape].rank_stats &&
 	     cds_ft_group_attr_set_rank_stats(attr, true) < 0) ||
@@ -14796,6 +14986,13 @@ static int rekey_compressed_bp_atomic_or_refused(int ordered_list)
 	}
 	if (cds_ft_group_attr_create(&attr) < 0)
 		return -1;
+	/*
+	 * REKEY OPT-IN (cds_ft_group_attr_set_rekey, default OFF): this trie
+	 * hosts an in-trie MOVE, so the capability must be declared or the
+	 * rekey entries answer NOT_SUPPORTED and the test proves nothing.
+	 */
+	if (cds_ft_group_attr_set_rekey(attr, true) < 0)
+		abort();
 	if (cds_ft_group_attr_set_ordered_list(attr, ordered_list) < 0 ||
 	    cds_ft_group_create(attr, &group) < 0) {
 		cds_ft_group_attr_destroy(attr);
@@ -15108,6 +15305,13 @@ static int test_merge_rekey_same_trie_speculative_rejected(void)
 		cds_ft_group_attr_destroy(attr);
 		return -1;
 	}
+	/*
+	 * REKEY OPT-IN (cds_ft_group_attr_set_rekey, default OFF): this trie
+	 * hosts an in-trie MOVE, so the capability must be declared or the
+	 * rekey entries answer NOT_SUPPORTED and the test proves nothing.
+	 */
+	if (cds_ft_group_attr_set_rekey(attr, true) < 0)
+		abort();
 	if (cds_ft_group_create(attr, &group) < 0) {
 		cds_ft_group_attr_destroy(attr);
 		return -1;
@@ -15264,6 +15468,13 @@ static int test_rekey_colocated_external(void)
 				CDS_FT_WRITER_LOCK_FINE) < 0 ||
 			cds_ft_group_attr_set_ordered_list(gattr, true) < 0)
 		abort();
+	/*
+	 * REKEY OPT-IN (cds_ft_group_attr_set_rekey, default OFF): this trie
+	 * hosts an in-trie MOVE, so the capability must be declared or the
+	 * rekey entries answer NOT_SUPPORTED and the test proves nothing.
+	 */
+	if (cds_ft_group_attr_set_rekey(gattr, true) < 0)
+		abort();
 	if (cds_ft_group_create(gattr, &group) < 0)
 		abort();
 	cds_ft_group_attr_destroy(gattr);
@@ -15417,6 +15628,13 @@ static int test_rekey_compressed_stop(void)
 
 		if (cds_ft_group_attr_create(&gattr) < 0)
 			abort();
+	/*
+	 * REKEY OPT-IN (cds_ft_group_attr_set_rekey, default OFF): this trie
+	 * hosts an in-trie MOVE, so the capability must be declared or the
+	 * rekey entries answer NOT_SUPPORTED and the test proves nothing.
+	 */
+	if (cds_ft_group_attr_set_rekey(gattr, true) < 0)
+		abort();
 		if (cds_ft_group_attr_set_key_len(gattr, 4) < 0 ||
 				cds_ft_group_attr_set_lookup_optimization(gattr,
 					CDS_FT_LOOKUP_OPTIMIZE_EAGER) < 0 ||
@@ -15697,6 +15915,13 @@ static int test_rekey_varlen_ordered_splice(void)
 			cds_ft_group_attr_set_writer_strategy(gattr,
 				CDS_FT_WRITER_LOCK_FINE) < 0 ||
 			cds_ft_group_attr_set_ordered_list(gattr, true) < 0)
+		abort();
+	/*
+	 * REKEY OPT-IN (cds_ft_group_attr_set_rekey, default OFF): this trie
+	 * hosts an in-trie MOVE, so the capability must be declared or the
+	 * rekey entries answer NOT_SUPPORTED and the test proves nothing.
+	 */
+	if (cds_ft_group_attr_set_rekey(gattr, true) < 0)
 		abort();
 	if (cds_ft_group_create(gattr, &group) < 0)
 		abort();
@@ -16175,6 +16400,16 @@ static struct cds_ft *create_varlen_pernode_ft(struct cds_ft_group **group_out)
 		abort();
 	if (cds_ft_group_attr_set_lock_spacing(attr,
 			CDS_FT_LOCK_SPACING_PER_NODE) != CDS_FT_STATUS_OK)
+		abort();
+	/*
+	 * REKEY OPT-IN (cds_ft_group_attr_set_rekey, default OFF).  Tries built
+	 * by this helper are used by the in-trie MOVE tests, so the capability
+	 * has to be declared or every one of them answers NOT_SUPPORTED.  Not
+	 * every creator opts in, deliberately: the helpers that stay off are what
+	 * cover the default path, where ft_install_lookup_ops selects the PLAIN
+	 * lookup specializations instead of the coherent ones.
+	 */
+	if (cds_ft_group_attr_set_rekey(attr, true) < 0)
 		abort();
 	if (cds_ft_group_create(attr, &group) < 0)
 		abort();
@@ -17075,6 +17310,13 @@ static int test_merge_rekey_same_trie_ordered(void)
 		return -1;
 	cds_ft_group_attr_set_key_len(attr, CDS_FT_LEN_VARIABLE);
 	cds_ft_group_attr_set_ordered_list(attr, true);
+	/*
+	 * REKEY OPT-IN (cds_ft_group_attr_set_rekey, default OFF): this trie
+	 * hosts an in-trie MOVE, so the capability must be declared or the
+	 * rekey entries answer NOT_SUPPORTED and the test proves nothing.
+	 */
+	if (cds_ft_group_attr_set_rekey(attr, true) < 0)
+		abort();
 	if (cds_ft_group_create(attr, &group) < 0) {
 		cds_ft_group_attr_destroy(attr);
 		return -1;
@@ -17551,6 +17793,13 @@ static int rekey_sibling_two_child_bp_run(bool ordered_list, bool rank_stats)
 	if (cds_ft_group_attr_set_ordered_list(attr, ordered_list) < 0 ||
 	    cds_ft_group_attr_set_rank_stats(attr, rank_stats) < 0)
 		abort();
+	/*
+	 * REKEY OPT-IN (cds_ft_group_attr_set_rekey, default OFF): this trie
+	 * hosts an in-trie MOVE, so the capability must be declared or the
+	 * rekey entries answer NOT_SUPPORTED and the test proves nothing.
+	 */
+	if (cds_ft_group_attr_set_rekey(attr, true) < 0)
+		abort();
 	if (cds_ft_group_create(attr, &group) < 0)
 		abort();
 	cds_ft_group_attr_destroy(attr);
@@ -17618,6 +17867,204 @@ static int test_rekey_sibling_two_child_bp_keeps_keys(void)
 	    rekey_sibling_two_child_bp_run(false, false) < 0)
 		return -1;
 	return rekey_sibling_two_child_bp_run(true, false);
+}
+
+/*
+ * THE OPT-IN ITSELF: a group that did NOT declare rekey must REFUSE the in-trie
+ * move, and the refusal must be a claim about the trie -- NOT_SUPPORTED with
+ * the structure untouched, never a silent no-op that the caller reads as a
+ * move that happened.
+ *
+ * ☞ THIS TEST IS ALSO THE ONLY COVERAGE OF THE DEFAULT PATH's REFUSAL ARM.
+ * Every other rekey test opts in, so without this one the default -- which is
+ * what an application gets unless it asks -- is exercised nowhere.
+ */
+static int test_rekey_optin_default_refuses(void)
+{
+#ifdef FT_DEBUG_REKEY_OPTIN_STRICT
+	/*
+	 * ☠ THIS TEST AND THE STRICT CONTROL ARE MUTUALLY EXCLUSIVE BY
+	 * CONSTRUCTION, and the gate found it: the control exists to abort on a
+	 * rekey call that did not opt in, and this test's whole subject is
+	 * making exactly that call on purpose.  Run under
+	 * -DFT_DEBUG_REKEY_OPTIN_STRICT it is the one legitimate refusal in
+	 * either suite, and the abort killed the leg at test 158
+	 * (rekeyoptin: ft_unit INCOMPLETE, signal 6, after 157 ok).
+	 *
+	 * Skip rather than weaken the control: the control's value is that it
+	 * cannot be absorbed, and the DEFAULT-arm coverage this test provides is
+	 * delivered by every other configuration in the matrix.
+	 */
+	diag("test_rekey_optin_default_refuses: skipped, its deliberate "
+		"refusal is what -DFT_DEBUG_REKEY_OPTIN_STRICT aborts on");
+	return 0;
+#else
+	struct cds_ft_group *group;
+	struct cds_ft *ft = NULL;
+	struct cds_ft_iter *iter = NULL;
+	enum cds_ft_status s;
+	int ret = -1;
+
+	/* Default attributes: rekey NOT declared. */
+	if (cds_ft_group_create(NULL, &group) < 0)
+		return -1;
+	if (cds_ft_create(group, NULL, &ft) < 0) {
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	rcu_read_lock();
+	cds_ft_insert(ft, (const uint8_t *) "am", 2, &node_alloc(1)->node);
+	cds_ft_insert(ft, (const uint8_t *) "an", 2, &node_alloc(2)->node);
+	rcu_read_unlock();
+
+	s = cds_ft_rekey_graft(ft, (const uint8_t *) "z", 1,
+			(const uint8_t *) "a", 1);
+	if (s != CDS_FT_STATUS_NOT_SUPPORTED) {
+		diag("rekey_graft on a non-opted-in group: expected "
+			"NOT_SUPPORTED, got %s", cds_ft_status_to_string(s));
+		goto out;
+	}
+	s = cds_ft_rekey_merge(ft, (const uint8_t *) "z", 1,
+			(const uint8_t *) "a", 1);
+	if (s != CDS_FT_STATUS_NOT_SUPPORTED) {
+		diag("rekey_merge on a non-opted-in group: expected "
+			"NOT_SUPPORTED, got %s", cds_ft_status_to_string(s));
+		goto out;
+	}
+	/*
+	 * ☠ AND THE TRIE IS UNCHANGED.  A refusal that had already moved
+	 * something would be far worse than one that never ran.
+	 */
+	if (cds_ft_iter_create(ft, &iter) < 0)
+		goto out;
+	rcu_read_lock();
+	cds_ft_iter_set_key(iter, (const uint8_t *) "am", 2);
+	if (cds_ft_lookup(ft, iter) != CDS_FT_STATUS_OK) {
+		rcu_read_unlock();
+		diag("refused rekey lost key \"am\"");
+		goto out;
+	}
+	cds_ft_iter_set_key(iter, (const uint8_t *) "an", 2);
+	if (cds_ft_lookup(ft, iter) != CDS_FT_STATUS_OK) {
+		rcu_read_unlock();
+		diag("refused rekey lost key \"an\"");
+		goto out;
+	}
+	cds_ft_iter_set_key(iter, (const uint8_t *) "zm", 2);
+	if (cds_ft_lookup(ft, iter) == CDS_FT_STATUS_OK) {
+		rcu_read_unlock();
+		diag("refused rekey MOVED a key to the destination");
+		goto out;
+	}
+	rcu_read_unlock();
+	ret = 0;
+out:
+	if (iter)
+		cds_ft_iter_destroy(iter);
+	rcu_read_lock();
+	drain_trie(ft);
+	rcu_read_unlock();
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return ret;
+#endif
+}
+
+/*
+ * REKEY UNDER CDS_FT_WRITER_EXTERNAL_SYNC, which is the reason the opt-in is a
+ * DECISION POINT rather than a flag.
+ *
+ * There the move gate's grace period would be taken while the APPLICATION
+ * holds its own writer exclusion -- a lock the library can neither drop nor get
+ * outside of -- so opting in selects @rekey_always_coherent: readers run the
+ * two-pass path unconditionally, there is no reader mode TRANSITION, and the
+ * gate owes no grace period at all.  Measured 2026-09-20: 2 gate GPs per pair
+ * of rekeys before, 0 after.
+ *
+ * This test asserts the FUNCTIONAL half -- that the move actually happens and
+ * the keys land -- because the GP count is a property of the writer path that
+ * no TAP assertion can see.  A single writer thread satisfies the external-sync
+ * contract by construction.
+ */
+static int test_rekey_external_sync_always_coherent(void)
+{
+	struct cds_ft_group_attr *gattr;
+	struct cds_ft_group *group;
+	struct cds_ft *ft = NULL;
+	struct cds_ft_iter *iter = NULL;
+	enum cds_ft_status s;
+	int ret = -1;
+
+	if (cds_ft_group_attr_create(&gattr) < 0)
+		return -1;
+	if (cds_ft_group_attr_set_writer_strategy(gattr,
+			CDS_FT_WRITER_EXTERNAL_SYNC) < 0)
+		abort();
+	if (cds_ft_group_attr_set_lookup_optimization(gattr,
+			CDS_FT_LOOKUP_OPTIMIZE_EAGER) < 0)
+		abort();
+	if (cds_ft_group_attr_set_rekey(gattr, true) < 0)
+		abort();
+	if (cds_ft_group_create(gattr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(gattr);
+	if (cds_ft_create(group, NULL, &ft) < 0) {
+		cds_ft_group_destroy(group);
+		return -1;
+	}
+	rcu_read_lock();
+	cds_ft_insert(ft, (const uint8_t *) "am", 2, &node_alloc(1)->node);
+	cds_ft_insert(ft, (const uint8_t *) "an", 2, &node_alloc(2)->node);
+	cds_ft_insert(ft, (const uint8_t *) "bq", 2, &node_alloc(3)->node);
+	rcu_read_unlock();
+
+	s = cds_ft_rekey_graft(ft, (const uint8_t *) "z", 1,
+			(const uint8_t *) "a", 1);
+	if (s != CDS_FT_STATUS_OK) {
+		diag("external-sync rekey_graft: %s",
+			cds_ft_status_to_string(s));
+		goto out;
+	}
+	if (cds_ft_iter_create(ft, &iter) < 0)
+		goto out;
+	rcu_read_lock();
+	cds_ft_iter_set_key(iter, (const uint8_t *) "zm", 2);
+	if (cds_ft_lookup(ft, iter) != CDS_FT_STATUS_OK) {
+		rcu_read_unlock();
+		diag("external-sync rekey lost \"zm\"");
+		goto out;
+	}
+	cds_ft_iter_set_key(iter, (const uint8_t *) "zn", 2);
+	if (cds_ft_lookup(ft, iter) != CDS_FT_STATUS_OK) {
+		rcu_read_unlock();
+		diag("external-sync rekey lost \"zn\"");
+		goto out;
+	}
+	/* The untouched sibling is still there. */
+	cds_ft_iter_set_key(iter, (const uint8_t *) "bq", 2);
+	if (cds_ft_lookup(ft, iter) != CDS_FT_STATUS_OK) {
+		rcu_read_unlock();
+		diag("external-sync rekey lost the untouched \"bq\"");
+		goto out;
+	}
+	/* And the source is gone. */
+	cds_ft_iter_set_key(iter, (const uint8_t *) "am", 2);
+	if (cds_ft_lookup(ft, iter) == CDS_FT_STATUS_OK) {
+		rcu_read_unlock();
+		diag("external-sync rekey left the source key \"am\" behind");
+		goto out;
+	}
+	rcu_read_unlock();
+	ret = 0;
+out:
+	if (iter)
+		cds_ft_iter_destroy(iter);
+	rcu_read_lock();
+	drain_trie(ft);
+	rcu_read_unlock();
+	cds_ft_destroy(ft);
+	cds_ft_group_destroy(group);
+	return ret;
 }
 
 static int test_rekey_root_junction_folded(void)
@@ -17743,6 +18190,13 @@ static int test_merge_rekey_same_trie_listoff_collision(void)
 	enum cds_ft_status s;
 
 	if (cds_ft_group_attr_create(&attr) < 0)
+		abort();
+	/*
+	 * REKEY OPT-IN (cds_ft_group_attr_set_rekey, default OFF): this trie
+	 * hosts an in-trie MOVE, so the capability must be declared or the
+	 * rekey entries answer NOT_SUPPORTED and the test proves nothing.
+	 */
+	if (cds_ft_group_attr_set_rekey(attr, true) < 0)
 		abort();
 	if (cds_ft_group_attr_set_ordered_list(attr, false) < 0 ||
 	    cds_ft_group_create(attr, &group) < 0)
@@ -17974,6 +18428,13 @@ static int test_rekey_root_junction(void)
 	}
 	if (cds_ft_group_attr_create(&attr) < 0)
 		abort();
+	/*
+	 * REKEY OPT-IN (cds_ft_group_attr_set_rekey, default OFF): this trie
+	 * hosts an in-trie MOVE, so the capability must be declared or the
+	 * rekey entries answer NOT_SUPPORTED and the test proves nothing.
+	 */
+	if (cds_ft_group_attr_set_rekey(attr, true) < 0)
+		abort();
 	if (cds_ft_group_attr_set_ordered_list(attr, false) < 0 ||
 	    cds_ft_group_create(attr, &group) < 0)
 		abort();
@@ -18082,6 +18543,7 @@ out_unlocked:
  */
 static int test_rekey_binary_branch_point(void)
 {
+	struct cds_ft_group_attr *gattr;
 	struct cds_ft_group *group;
 	struct cds_ft *ft;
 	int ret = -1;
@@ -18092,8 +18554,19 @@ static int test_rekey_binary_branch_point(void)
 			"(-DNO_FEATURE_FT_MERGE)");
 		return 0;
 	}
-	if (cds_ft_group_create(NULL, &group) < 0)
+	/*
+	 * REKEY OPT-IN (cds_ft_group_attr_set_rekey, default OFF): this trie
+	 * hosts an in-trie MOVE, so the capability must be declared or the
+	 * rekey entries answer NOT_SUPPORTED and the test proves nothing.
+	 * The default attributes are otherwise unchanged.
+	 */
+	if (cds_ft_group_attr_create(&gattr) < 0)
 		abort();
+	if (cds_ft_group_attr_set_rekey(gattr, true) < 0)
+		abort();
+	if (cds_ft_group_create(gattr, &group) < 0)
+		abort();
+	cds_ft_group_attr_destroy(gattr);
 	if (cds_ft_create(group, NULL, &ft) < 0)
 		abort();
 	rcu_read_lock();
@@ -18181,6 +18654,13 @@ static int test_rekey_occupied_dst_behind_compressed(void)
 		abort();
 	cds_ft_group_attr_set_key_len(attr, CDS_FT_LEN_VARIABLE);
 	cds_ft_group_attr_set_ordered_list(attr, true);
+	/*
+	 * REKEY OPT-IN (cds_ft_group_attr_set_rekey, default OFF): this trie
+	 * hosts an in-trie MOVE, so the capability must be declared or the
+	 * rekey entries answer NOT_SUPPORTED and the test proves nothing.
+	 */
+	if (cds_ft_group_attr_set_rekey(attr, true) < 0)
+		abort();
 	if (cds_ft_group_create(attr, &group) < 0)
 		abort();
 	cds_ft_group_attr_destroy(attr);
@@ -18275,6 +18755,13 @@ static int test_rekey_merge_dst_behind_compressed_moves(void)
 		abort();
 	cds_ft_group_attr_set_key_len(attr, CDS_FT_LEN_VARIABLE);
 	cds_ft_group_attr_set_ordered_list(attr, true);
+	/*
+	 * REKEY OPT-IN (cds_ft_group_attr_set_rekey, default OFF): this trie
+	 * hosts an in-trie MOVE, so the capability must be declared or the
+	 * rekey entries answer NOT_SUPPORTED and the test proves nothing.
+	 */
+	if (cds_ft_group_attr_set_rekey(attr, true) < 0)
+		abort();
 	if (cds_ft_group_create(attr, &group) < 0)
 		abort();
 	cds_ft_group_attr_destroy(attr);
@@ -18403,6 +18890,13 @@ static int test_rekey_merge_unequal_key_lengths(void)
 
 		if (cds_ft_group_attr_create(&attr) < 0)
 			abort();
+	/*
+	 * REKEY OPT-IN (cds_ft_group_attr_set_rekey, default OFF): this trie
+	 * hosts an in-trie MOVE, so the capability must be declared or the
+	 * rekey entries answer NOT_SUPPORTED and the test proves nothing.
+	 */
+	if (cds_ft_group_attr_set_rekey(attr, true) < 0)
+		abort();
 		cds_ft_group_attr_set_key_len(attr, CDS_FT_LEN_VARIABLE);
 		cds_ft_group_attr_set_ordered_list(attr, list_on);
 		if (cds_ft_group_create(attr, &group) < 0)
@@ -18535,6 +19029,13 @@ static int test_rekey_merge_unequal_len_overflow(void)
 		abort();
 	cds_ft_group_attr_set_key_len(attr, CDS_FT_LEN_VARIABLE);
 	cds_ft_group_attr_set_max_key_len(attr, 8);
+	/*
+	 * REKEY OPT-IN (cds_ft_group_attr_set_rekey, default OFF): this trie
+	 * hosts an in-trie MOVE, so the capability must be declared or the
+	 * rekey entries answer NOT_SUPPORTED and the test proves nothing.
+	 */
+	if (cds_ft_group_attr_set_rekey(attr, true) < 0)
+		abort();
 	if (cds_ft_group_create(attr, &group) < 0)
 		abort();
 	cds_ft_group_attr_destroy(attr);
@@ -18572,6 +19073,15 @@ static int test_rekey_merge_unequal_len_overflow(void)
 		if (cds_ft_group_attr_create(&fattr) < 0)
 			abort();
 		cds_ft_group_attr_set_key_len(fattr, 4);
+		/*
+		 * REKEY OPT-IN: the SECOND group this test builds, and it is
+		 * the one the assertion is actually about -- without it the
+		 * rekey below answers NOT_SUPPORTED instead of the
+		 * INVALID_ARGUMENT the fixed-key-length arm is checking for,
+		 * and the test fails for a reason that is not its subject.
+		 */
+		if (cds_ft_group_attr_set_rekey(fattr, true) < 0)
+			abort();
 		if (cds_ft_group_create(fattr, &fgroup) < 0)
 			abort();
 		cds_ft_group_attr_destroy(fattr);
@@ -39685,6 +40195,8 @@ int main(int argc, char **argv)
 	RUN_TEST(test_merge_rekey_same_trie_listoff_collision);
 	RUN_TEST(test_rekey_rankstats_shared_ancestor);
 	RUN_TEST(test_rekey_root_junction_folded);
+	RUN_TEST(test_rekey_optin_default_refuses);
+	RUN_TEST(test_rekey_external_sync_always_coherent);
 	RUN_TEST(test_rekey_rankstats_sibling);
 	RUN_TEST(test_rekey_sibling_two_child_bp_keeps_keys);
 	RUN_TEST(test_rekey_root_junction);
