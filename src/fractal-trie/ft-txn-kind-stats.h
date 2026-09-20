@@ -177,6 +177,10 @@ enum ft_tk_rec_class {
 	FT_TK_REC_NR,
 };
 
+/* See the drift probe in __ft_flip_txn_record_tag_ctx. */
+extern unsigned long ft_tk_drift_armed, ft_tk_drift_take;
+unsigned long ft_tk_drift_armed, ft_tk_drift_take;
+
 /*
  * MW_ALWAYS IS NOT ONE POPULATION, and the G4 decision reads it as if it were.
  * The column mixes slots that can NEVER convert (a trie root has no node to
@@ -1675,6 +1679,10 @@ void ft_tk_dump(void)
 			(long) tot.rec[FT_TK_MW_STRUCT] - (long) own_sum,
 			own_sum == tot.rec[FT_TK_MW_STRUCT] ? "" :
 				"  ☠ a record branch counts into MW_STRUCT and into no OWN column");
+		fprintf(stderr,
+"    SELF-CHECK  state drift between the OWN split and the kind decision: armed=%lu take=%lu\n",
+			uatomic_read(&ft_tk_drift_armed),
+			uatomic_read(&ft_tk_drift_take));
 	}
 	free(rows);
 }
@@ -1695,6 +1703,8 @@ void ft_tk_dump_at_exit(void)
 	struct ft_tk_site *dbg_site;					\
 	bool dbg_lock_take;						\
 	bool dbg_retire;						\
+	bool dbg_armed_at_own;						\
+	bool dbg_take_at_own;						\
 	bool dbg_ended;
 
 /*

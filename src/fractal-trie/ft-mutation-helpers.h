@@ -7335,6 +7335,22 @@ void __ft_flip_txn_record_tag_ctx(struct ft_flip_txn *t,
 	 * also the one record that CANNOT be owner-held by construction: it is
 	 * what makes the op the owner.
 	 */
+#ifdef FT_DEBUG_TXN_KIND
+	/*
+	 * ☞ PROBE: did the txn's ARM or TAKE state change between the OWN split
+	 * and the kind decision below?  Both live in this one function with no
+	 * early exit, so the six OWN_* columns must sum to MW_STRUCT -- and they
+	 * fall 32,429 short per ft_inv leg.  Reading the code cannot explain it,
+	 * so ask the only thing reading cannot rule out.
+	 */
+	{
+		bool dbg_armed0 = t->structural_sw;
+		bool dbg_take0 = FT_TK_TXN_IS_TAKE(t);
+
+		t->dbg_armed_at_own = dbg_armed0;
+		t->dbg_take_at_own = dbg_take0;
+	}
+#endif
 	if (!FT_TK_TXN_IS_TAKE(t)) {
 		/*
 		 * COUNTED ONLY WHERE THE QUESTION IS OPEN, so that OWN_HELD +
@@ -7460,6 +7476,12 @@ void __ft_flip_txn_record_tag_ctx(struct ft_flip_txn *t,
 		if (t->structural_sw && !FT_TK_TXN_IS_TAKE(t))
 			FT_TK_COUNT_REC(t, t->sw_per_op ?
 				FT_TK_OWN_ARMED_PEROP : FT_TK_OWN_ARMED_WIDE);
+#ifdef FT_DEBUG_TXN_KIND
+		if (t->dbg_armed_at_own != t->structural_sw)
+			uatomic_inc(&ft_tk_drift_armed);
+		if (t->dbg_take_at_own != FT_TK_TXN_IS_TAKE(t))
+			uatomic_inc(&ft_tk_drift_take);
+#endif
 		/*
 		 * ★ THE WITNESS TRAVELS WITH THE RECORD, because that is the
 		 * whole detector: a structural edge whose owner the op HOLDS
