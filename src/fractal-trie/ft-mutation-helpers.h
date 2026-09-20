@@ -11537,6 +11537,56 @@ uintptr_t ft_flip_txn_record_tombstone(struct ft_flip_txn *t,
 	 * distortion the DLM-take carve-out exists to prevent -- so it gets its
 	 * own lane instead of being skipped silently.
 	 */
+#if defined(FT_DEBUG_TXN_KIND) && defined(FEATURE_FT_HOLD_TRACE)
+	/*
+	 * ☞ IS THE LOCK HELD WHEN WE TOMBSTONE?  That is the whole question for
+	 * this lane, and it is NOT "can a retire park".
+	 *
+	 * metadata.state is a LOCK-BEARING word: FT_STATE_TOMBSTONE is bit 1 and
+	 * FT_STATE_LOCK is bit 19 of the same word, so MATHIEU's protocol
+	 * applies -- an MW write TAKES the lock and SW updates to other bits
+	 * follow while it is held, across any number of txns.  "A slot is SW xor
+	 * MW, globally" is categorical only for words that carry NO lock (a body
+	 * child slot, the SKIP_X dual, the chain pointers, the back edge), where
+	 * nothing written to the slot establishes exclusion.  Reading it as
+	 * universal is the generalisation this tree has already had to correct
+	 * in two of its own comments.
+	 *
+	 * So MW-after-the-take is CORRECT, just a wasted CAS, and converting a
+	 * held retire is a PERFORMANCE step.  What the categorisation is for is
+	 * the other bucket: a retire recorded while NOBODY holds the word is a
+	 * genuinely unprotected writer racing sites that DO park SW on it -- and
+	 * that is a bug, not an inefficiency.
+	 *
+	 * ☠ THE WITNESS MUST BE THE UNION, AND MUST INCLUDE THE WORD ITSELF.
+	 * The registry alone cannot answer: a tombstone typically rides a fused
+	 * {LOCK|s -> TOMBSTONE|s} terminal, and ft_flip_txn_record_release_lock
+	 * drops the ledger entry the moment the release is RECORDED -- the wrong
+	 * zero this branch has already been burned by.  So ask the state word
+	 * whether the LOCK bit is set, and three witnesses who holds it.
+	 */
+	{
+		uintptr_t st = (uintptr_t) CMM_LOAD_SHARED(meta->state);
+		bool locked = !!(st & FT_STATE_LOCK);
+		bool ours = ft_flip_txn_owns(t, meta) ||
+			ft_hold_trace_holds(meta) ||
+			meta->dbg_owner_tid == (unsigned long) pthread_self();
+		const struct cds_ft *rft = t->ft;
+
+		if (locked && ours)
+			uatomic_inc(&ft_tk_ret_held_us);
+		else if (locked)
+			uatomic_inc(&ft_tk_ret_held_other);
+		else if (rft && rft->exclusive)
+			uatomic_inc(&ft_tk_ret_unlocked_excl);
+		else if (rft && !rft->lock_fine)
+			uatomic_inc(&ft_tk_ret_unlocked_coarse);
+		else if (rft && ft_wlock_held == rft)
+			uatomic_inc(&ft_tk_ret_unlocked_wlock);
+		else
+			uatomic_inc(&ft_tk_ret_unlocked_fine);
+	}
+#endif
 	FT_TK_TXN_SET_RETIRE(t, true);
 	ft_flip_txn_record_state(t, meta,
 			(void *) old, (void *) (old | FT_STATE_TOMBSTONE));

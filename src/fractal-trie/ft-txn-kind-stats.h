@@ -142,10 +142,31 @@ enum ft_tk_rec_class {
 	 *
 	 * ☠☠ AND THIS IS A CLASSIFICATION, NOT A CLEARANCE.  It says the
 	 * REGISTRY cannot answer for a retire, which is why the lane does not
-	 * belong in a Phase B obligation count.  It does NOT say a retire may
-	 * park SW: whether {live -> tombstone} on a word peers still guard and
-	 * validate can be a blind store is a DISPOSITION question of its own,
-	 * like the ordered cell list's [DESIGN] MW, and it is not answered here.
+	 * belong in a Phase B obligation count.
+	 *
+	 * ☠ IT IS ALSO NOT THE CELL LIST'S KIND OF PERMANENCE, and an earlier
+	 * spelling of this comment drew that analogy.  It is wrong in a way that
+	 * matters: the ordered cell list is a word carrying NO lock, so every
+	 * writer must agree and MW is forever.  metadata.state CARRIES the lock
+	 * -- FT_STATE_TOMBSTONE is bit 1, FT_STATE_LOCK is bit 19 of the same
+	 * word -- so urcu_txn_store_sw()'s lock-bearing exception applies: the
+	 * lock bit is taken MW, and while it is HELD the holder may update the
+	 * word's other bits SW, release included, across any number of txns.
+	 *
+	 * ⇒ A RETIRE MAY PARK, whenever the op HOLDS the word.  MW after the
+	 * take is correct-just-wasteful, so converting is PERFORMANCE.  The real
+	 * question this lane poses is not "may it park" but "is it held" -- and
+	 * the bucket that would be a BUG is a retire recorded while nobody holds
+	 * the word, racing sites that do park SW on it.
+	 *
+	 * MEASURED at the tombstone (ft_inv, per-node / exponential): held by
+	 * US 0 / 0, held by a PEER 0 / 0, and unlocked-under-FINE -- the only
+	 * bucket owed an answer -- 0 / 0.  Every retire runs on an exclusive
+	 * trie (812,314 / 895,568), inside the FT-wide writer scope (201,899 /
+	 * 206,953) or on a coarse one (29,674 / 27,454).  So there is no
+	 * unprotected retire in either suite's reach -- and equally, none of
+	 * them rides a HELD per-node lock, so the lock-bearing exception is not
+	 * what would license converting them.  Door 1's trie-wide exclusion is.
 	 */
 	FT_TK_OWN_RETIRE,
 	/*
@@ -191,14 +212,18 @@ unsigned long ft_tk_drift_armed, ft_tk_drift_take;
 /* See the door-1/3 exclusion probe at the SW park in __ft_flip_txn_record_tag_ctx. */
 extern unsigned long ft_tk_d13_body, ft_tk_d13_excl, ft_tk_d13_coarse,
 	ft_tk_d13_wlock, ft_tk_d13_none;
-extern unsigned long ft_tk_d3_excl, ft_tk_d3_coarse, ft_tk_d3_wlock,
-	ft_tk_d3_fine;
-unsigned long ft_tk_d3_excl, ft_tk_d3_coarse, ft_tk_d3_wlock, ft_tk_d3_fine;
 unsigned long ft_tk_d13_body, ft_tk_d13_excl, ft_tk_d13_coarse,
 	ft_tk_d13_wlock, ft_tk_d13_none;
 extern unsigned long ft_tk_d3_excl, ft_tk_d3_coarse, ft_tk_d3_wlock,
 	ft_tk_d3_fine;
 unsigned long ft_tk_d3_excl, ft_tk_d3_coarse, ft_tk_d3_wlock, ft_tk_d3_fine;
+/* See the lock-held probe in ft_flip_txn_record_tombstone. */
+extern unsigned long ft_tk_ret_held_us, ft_tk_ret_held_other,
+	ft_tk_ret_unlocked_fine, ft_tk_ret_unlocked_coarse,
+	ft_tk_ret_unlocked_excl, ft_tk_ret_unlocked_wlock;
+unsigned long ft_tk_ret_held_us, ft_tk_ret_held_other,
+	ft_tk_ret_unlocked_fine, ft_tk_ret_unlocked_coarse,
+	ft_tk_ret_unlocked_excl, ft_tk_ret_unlocked_wlock;
 
 /*
  * MW_ALWAYS IS NOT ONE POPULATION, and the G4 decision reads it as if it were.
@@ -1738,6 +1763,15 @@ void ft_tk_dump(void)
 			uatomic_read(&ft_tk_d3_coarse),
 			uatomic_read(&ft_tk_d3_wlock),
 			uatomic_read(&ft_tk_d3_fine));
+		fprintf(stderr,
+"    RETIRE, is the LOCK-BEARING word held at the tombstone?  held-by-US=%lu  held-by-OTHER=%lu\n"
+"      unlocked: FINE(the only one owed an answer)=%lu  coarse=%lu  exclusive=%lu  FT-wide-lock=%lu\n",
+			uatomic_read(&ft_tk_ret_held_us),
+			uatomic_read(&ft_tk_ret_held_other),
+			uatomic_read(&ft_tk_ret_unlocked_fine),
+			uatomic_read(&ft_tk_ret_unlocked_coarse),
+			uatomic_read(&ft_tk_ret_unlocked_excl),
+			uatomic_read(&ft_tk_ret_unlocked_wlock));
 	}
 	free(rows);
 }
