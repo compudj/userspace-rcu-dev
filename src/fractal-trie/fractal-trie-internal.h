@@ -4119,6 +4119,80 @@ bool ft_bulk_active(const struct cds_ft *ft)
 }
 
 /*
+ * ☞ DOES @bulk_state HAVE A CONSUMER ON THIS TRIE?
+ *
+ * The word has exactly one, and it is ft_writer_lock_scope_enter's FINE branch:
+ * a FINE trie skips the FT-wide writer mutex UNLESS a bulk op is live.  Every
+ * other writer mode already excludes the point writer without ever loading it:
+ *
+ *   COARSE         every writer scope takes the FT-wide mutex unconditionally,
+ *                  so bulk and point writers already arbitrate on one word;
+ *   EXTERNAL_SYNC  the caller excludes every writer by contract, and the scope
+ *                  returns BEFORE the FINE branch;
+ *   exclusive      single writer by contract, same early return.
+ *
+ * On those tries the word is published, FENCED WITH A GRACE PERIOD, and read by
+ * nobody.  (MATHIEU, 2026-09-20: "in external sync mode and coarse trie, there
+ * is no fine locking writers to contend with, so the bulk lock and fence is
+ * useless.")  Every other reference to ft_bulk_active in the tree is inside
+ * FT_ANC_LEDGER / FT_DEBUG_WIDEN_OWNER / FT_DEBUG_TXN_KIND instrumentation.
+ *
+ * ☠ AND THE FENCE IS THE EXPENSIVE HALF.  A FT_BULK_WRITER_ONLY op -- detach,
+ * graft, graft_swap, merge_at -- publishes NO reader word, so @bulk_state is
+ * the only thing that can make the 0->1 opener own a grace period.  On a coarse
+ * or external-sync trie that is a full synchronize_rcu per bulk window, paid to
+ * fence a word nothing reads.  A rekey (FT_BULK_COHERENT) is unaffected: it
+ * owns its GP for @move_active, which is a READER word and is needed in every
+ * mode -- readers stay concurrent under EXTERNAL_SYNC, which excludes writers
+ * and nothing else.
+ *
+ * ☠ THE STORE ITSELF STAYS UNCONDITIONAL, and deliberately.  It is one relaxed
+ * word, and keeping it means a trie that leaves @exclusive / @external_sync
+ * mid-window (cds_ft_make_shared) degrades to "peers take the FT-wide lock",
+ * which is the conservative side.  Only the fence is dropped, exactly as the
+ * exit already drops it ("No grace period is needed on the way out").
+ */
+static inline
+bool ft_bulk_state_has_consumer(const struct cds_ft *ft)
+{
+#ifdef FT_RED_BULK_FENCE_ALWAYS
+	/*
+	 * CONTROL, never a shipped configuration: fence unconditionally, which
+	 * is the pre-2026-09-20 behaviour.  Here so the saving can be measured
+	 * as an A/B in one tree rather than against a remembered number.
+	 */
+	(void) ft;
+	return true;
+#else
+	return FT_BULK_WIDE_LOCK && ft->lock_fine && !ft->exclusive
+		&& !ft->external_sync;
+#endif
+}
+
+#ifdef FT_DEBUG_BULK_GATE_GP
+/*
+ * ARM YIELD for the fence above: a "saved" count with no "owned" beside it
+ * cannot tell a real saving from a gate that never opens.
+ */
+__attribute__((weak)) unsigned long ft_bg_gp_owned, ft_bg_gp_saved,
+	ft_bg_gp_coherent, ft_bg_reported;
+static void ft_bg_report(void) __attribute__((destructor));
+static void ft_bg_report(void)
+{
+	if (!ft_bg_gp_owned && !ft_bg_gp_saved && !ft_bg_gp_coherent)
+		return;
+	if (__atomic_fetch_add(&ft_bg_reported, 1, __ATOMIC_RELAXED))
+		return;
+	fprintf(stderr, "FT_BULK_GATE_GP  writer-word opens: fenced=%lu "
+		"SAVED(no consumer)=%lu | reader-word (move_active) GPs=%lu\n",
+		ft_bg_gp_owned, ft_bg_gp_saved, ft_bg_gp_coherent);
+}
+# define FT_BG_TALLY(c)	__atomic_fetch_add(&(c), 1, __ATOMIC_RELAXED)
+#else
+# define FT_BG_TALLY(c)	do { } while (0)
+#endif
+
+/*
  * Which words a bulk op publishes.  Only a REKEY needs reader coherence; every
  * other bulk op publishes the writer word alone.
  */
@@ -4215,14 +4289,35 @@ void ft_bulk_gate_enter_gp(struct cds_ft *ft, enum ft_bulk_kind kind)
 	 * @bulk_active (G5.25 -- it sampled the gate clear at its writer scope
 	 * and skipped the lock, so it is not excluded against this op yet).
 	 */
-	if (ft->bulk_gate_nr++ == 0)
-		own_gp = true;
+	if (ft->bulk_gate_nr++ == 0) {
+		/*
+		 * Fence @bulk_state only where something LOADS it; see
+		 * ft_bulk_state_has_consumer.  Note this decides the FENCE
+		 * alone -- the store below is unconditional.
+		 */
+		if (ft_bulk_state_has_consumer(ft)) {
+			own_gp = true;
+			FT_BG_TALLY(ft_bg_gp_owned);
+		} else
+			FT_BG_TALLY(ft_bg_gp_saved);
+	}
 	if (kind == FT_BULK_COHERENT && ft->move_gate_nr++ == 0) {
 		CMM_STORE_SHARED(ft->move_active, 1);
+		/* A READER word: every mode needs this fence. */
 		own_gp = true;
+		FT_BG_TALLY(ft_bg_gp_coherent);
 	}
 	CMM_STORE_SHARED(ft->bulk_state, ft->bulk_gate_nr);
 	if (own_gp) {
+#ifdef FT_DEBUG_ES_GP
+		{
+			/* The GATE's own grace period, same question. */
+			static struct ft_es_gp_site _es_gate = {
+				.file = __FILE__, .line = __LINE__ };
+
+			ft_es_gp_note(&_es_gate, ft);
+		}
+#endif
 		ft->gate_gp_nr++;
 		pthread_mutex_unlock(&ft->move_gate_lock);
 		/*

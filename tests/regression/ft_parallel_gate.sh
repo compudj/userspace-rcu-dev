@@ -306,6 +306,13 @@ ALL_CONFIGS=(
 	# multi-writer phenomenon.  A leg without concurrent writers cannot tell
 	# the two arms apart at all.
 	"chainmw|-DNO_FEATURE_FT_CHAIN_SW|u ion ioff imw"
+	#
+	# THE ABLATION FOR THE BULK-GATE FENCE (2026-09-20).  The shipping build
+	# fences @bulk_state only where something LOADS it -- a FINE trie, at any
+	# spacing.  This leg restores the unconditional fence, so "coarse and
+	# external-sync do not need it" stays a claim the matrix can refute
+	# rather than a remembered measurement.
+	"bulkfence|-DFT_RED_BULK_FENCE_ALWAYS|u ion ioff"
 	"nocompress|-DNO_FEATURE_FT_COMPRESS|u ioff"
 	# Concurrent legs are SAFE here since the in-place tier became runtime
 	# gated on ft->exclusive: on a shared trie every one of these builds

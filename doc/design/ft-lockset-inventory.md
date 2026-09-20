@@ -1425,6 +1425,130 @@ is a judgement, but both are now numbers rather than impressions.
 ☞ The report's own rule still governs: *"a site with OWN_MISS == 0 is ready for
 the Phase B per-op arm; OWN_MISS is the size of its exclusion gap."*
 
+### 11.11 The OWN_RETIRE lane is an ARM-PREDICATE GAP, and the bulk gate's writer-word fence is FINE-only (2026-09-20)
+
+**Asked**: convert the `OWN_RETIRE` census lane from MW to SW.
+
+**What it turned out to be.** The tombstone record already takes the SW-capable
+path (`ft_flip_txn_record_state` → `record_state_kind(..., sw_ok=1)`). It does
+not park because the *txn* is unarmed, and it is unarmed because
+`ft_txn_content_sw_ok(ft)` is `!ft->lock_fine || ft->exclusive` and never asks
+whether the caller is inside the FT-wide writer scope. Measured, per ft_inv leg:
+
+| where the retire's lock-bearing word stands | records |
+|---|---|
+| held by US / by another thread | 0 / 0 |
+| unlocked, FINE (the only class owed an answer) | **0** |
+| unlocked, coarse / exclusive | 32,923 / 886,675 |
+| unlocked, FINE **inside the FT-wide writer scope** | **203,006** |
+
+All 203,006 are one shape: a FINE trie inside a bulk window, where G5.25 makes
+every writer re-take the FT-wide mutex. So this is not a retire-specific change
+— it is the arm predicate missing a case, and widening it would arm **every**
+record on those txns, not just the retire.
+
+**Two wrong zeros closed before the number was believed.**
+
+1. *Identity is not continuity.* The first probe re-read `ft_wlock_held == ft`
+   at the commit and reported `LOST=0`. It cannot mean anything:
+   `ft_writer_lock_gp_wait` DROPS the mutex across every grace period and
+   restores **the same pointer**, so a hold that a peer writer ran through reads
+   identical to one that never broke. Replaced by `ft_wlock_gen`, which counts
+   RELEASES, stamped at CREATE and compared at the commit — and given a positive
+   control, the total release count, because `DROPPED=0` against zero releases
+   is an inert probe, not a measurement.
+
+2. *The retire subset is not the population.* The flag was set at the RECORD,
+   which only covers retire-recording txns; widening the arm arms every txn
+   created in that scope. Moved to the three constructors, via a new
+   `FT_TXN_ARM_TRIE_WIDE` helper so the three cannot drift apart.
+
+Measured, create→commit, all three spacings plus ft_unit:
+
+```
+kept=1,578,876   LOST(identity)=0   DROPPED(a seam in between)=0
+watched txns=1,883,283   FT-wide lock releases this run=4,224,082
+```
+
+⇒ the mutex is genuinely held unbroken across those txns. **That is necessary
+and not sufficient**, see below.
+
+**☠ THE HAZARD THAT IS NOT A SEAM.** On a FINE trie the FT-wide lock is taken
+only while `ft_bulk_active(ft)`. A point op that took it because a **peer's**
+bulk gate was up keeps holding it — but `ft_bulk_gate_exit` lowers `bulk_state`
+with **no grace period and without the writer mutex** (deliberately: for a
+READER a stale gate is "never wrong, only slower"). Once the word reads 0 the
+next point writer skips the mutex entirely and runs beside us, and an SW park
+cannot fail — it erases. So the population splits:
+
+- **SELF-gated** (`ft_bulk_lock_held == ft`): this thread owns a refcount on
+  this trie's gate for its whole body, so `bulk_state` cannot reach 0 under it.
+  The exclusion is real for the whole txn.
+- **PEER-gated**: the exclusion is a refcount another thread owns and may drop
+  at any instant. **Not licensed.**
+
+**☐ PREREQUISITE, not yet done.** Three sites re-derive `ft_txn_content_sw_ok()`
+to ask "did the constructor arm this txn trie-wide?" --
+`ft_flip_txn_claim_per_op_armable`, `ft_flip_txn_arm_per_op_at` and
+`ft_flip_txn_arm_structural`. Today the predicate and `t->trie_wide_sw` agree
+exactly, so they are correct. The moment the arm gains a fourth licence they
+stop agreeing, and `ft_flip_txn_arm_per_op_at` would then fall through and set
+`sw_per_op = true` on a trie-wide-armed txn -- demanding a registered owner per
+record and DOWNGRADING it to MW, which is exactly the shape of the @f6ab074d
+uninitialised-`sw_per_op` defect. They must be changed to ask
+`t->trie_wide_sw` **before** any widening lands.
+
+### 11.11.1 The writer-word fence is FINE-only (Mathieu, 2026-09-20) — ☑ LANDED
+
+> *"In external sync mode and coarse trie, there is no fine locking writers to
+> contend with, so the bulk lock and fence is useless."*
+> *"Fine and exponential need the bulk fence."*
+
+`@bulk_state` has exactly one non-instrumentation consumer in the tree:
+`ft_writer_lock_scope_enter`'s FINE branch. Every other reference is inside
+`FT_ANC_LEDGER` / `FT_DEBUG_WIDEN_OWNER` / `FT_DEBUG_TXN_KIND`. COARSE takes the
+FT-wide mutex unconditionally; EXTERNAL_SYNC and exclusive return from the scope
+*before* the FINE branch. On those tries the word was published, **fenced with a
+full grace period**, and read by nobody.
+
+The fence is the expensive half: a `FT_BULK_WRITER_ONLY` op (detach / graft /
+graft_swap / merge_at) publishes no reader word, so `@bulk_state` is the only
+thing that can make the 0→1 opener own a grace period.
+
+⇒ `ft_bulk_state_has_consumer()` = `FT_BULK_WIDE_LOCK && lock_fine &&
+!exclusive && !external_sync`. The **store stays unconditional** (one relaxed
+word; a trie leaving `@external_sync` mid-window then degrades to "peers take
+the lock", the conservative side). A rekey is unaffected — it owns its GP for
+`@move_active`, a READER word needed in every mode, since EXTERNAL_SYNC excludes
+writers and nothing else.
+
+Measured, and it confirms Mathieu's rule rather than assuming it:
+
+| suite | writer-word opens fenced | SAVED (no consumer) |
+|---|---|---|
+| ft_inv, per-node / exponential / root-only | 875,357 / 875,081 / 825,456 | **0 / 0 / 0** |
+| ft_unit (mixed modes) | 753 | 123 |
+
+All three FINE spacings keep the fence; only coarse / exclusive / external-sync
+skip it. A/B against the `-DFT_RED_BULK_FENCE_ALWAYS` control (a coarse trie,
+100 × detach+merge = 200 gate opens):
+
+| readers | control | working | saved |
+|---|---|---|---|
+| 8 | 10,342 µs/op | 10,256 µs/op | 8.6 µs/op ≈ **4.3 µs per fence** |
+| 32 | 10,373 µs/op | 10,262 µs/op | 11.1 µs/op ≈ **5.5 µs per fence** |
+
+Reproducible in direction across every alternating pair, and it scales with
+grace-period cost, as a skipped `synchronize_rcu` should. The control is a gate
+config (`bulkfence`) so the claim stays refutable.
+
+**Not changed: `ft_bulk_lock` on a COARSE trie.** It already skips exclusive and
+external_sync. On coarse it still looks load-bearing to me: it is the
+bulk-vs-bulk serializer *held across the drain seams*, and a coarse trie's
+FT-wide mutex IS dropped at every `ft_writer_lock_gp_wait`, so without it two
+bulk bodies interleave at a seam. Flagged rather than removed.
+
+
 ## 12. API / design questions queued by Mathieu (2026-09-17)
 
 Not implemented; recorded so the flip does not silently decide them.
