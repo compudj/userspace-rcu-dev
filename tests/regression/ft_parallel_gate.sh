@@ -485,7 +485,17 @@ setup_tree() {	# $1=name $2=cppflags -- one-time: copy source + configure WITH f
 	# configure by the file the build actually needs (src/Makefile -- not
 	# config.status), and stamp .gate_flags ONLY on success so a failure
 	# retries from scratch instead of sticking.
-	if ! rsync -aS --exclude='.git' --exclude='build-*' --exclude='ft-parallel-gate-*' \
+	#
+	# ☠ AND EXCLUDE .claude/, WHICH IS NOT SOURCE.  Agent worktrees live in
+	# $ROOT/.claude/worktrees/ -- each a FULL checkout with a built src/.libs
+	# -- and they accumulate.  Measured 2026-09-20: 16 of them, 4.3 GB, which
+	# this copy multiplied by 21 configs.  It did not merely cost I/O: rsync
+	# hit "symlink ... failed: File exists (17)" on their libtool .so links,
+	# exited 23, and EVERY config then reported BUILD FAIL with "no makefile
+	# found" -- because configure never ran.  A gate that fails 21/21 on a
+	# directory that is not part of the build reads as a source regression.
+	if ! rsync -aS --exclude='.git' --exclude='.claude' \
+			--exclude='build-*' --exclude='ft-parallel-gate-*' \
 			--exclude='ft-hunt-*' --exclude='ft-segv-*' \
 			--exclude='core' --exclude='core.*' --exclude='vgcore.*' --exclude='*.core' \
 			"$ROOT/"  "$dir/" >"$GATE/$1.setup" 2>&1; then
