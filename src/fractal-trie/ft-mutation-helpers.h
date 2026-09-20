@@ -13211,21 +13211,6 @@ struct cds_ft_node *ft_node_mark_removed_flip(struct cds_ft *ft,
 	}
 }
 
-/*
- * Tombstone every node in a duplicate chain (cds_ft_remove_all detaches a whole
- * chain at once), each via ft_node_mark_removed_flip so the marks are committed
- * edges.  Successor pointers stay intact so the caller can still traverse the
- * returned chain to reclaim it.  The sweep advances on the successor the mark
- * VALIDATED (proxy-free), not a raw ft_node_next re-read that masks only the
- * mark bit -- a peer's latch parked on an interior next would otherwise walk
- * the sweep into descriptor memory.
- */
-static
-void ft_chain_mark_removed_flip(struct cds_ft *ft, struct cds_ft_node *head)
-{
-	while (head)
-		head = ft_node_mark_removed_flip(ft, head);
-}
 
 /*
  * Publish an in-place node child-slot replacement (@slot transitions @old ->

@@ -6076,6 +6076,36 @@ end:
 		 * no commit to abort, so the bound is the only thing holding
 		 * that line.
 		 */
+		/*
+		 * ☠☠ THE LAST RAW PRODUCER ON A CHAIN WORD, AND THE CHAIN NOW
+		 * PARKS.  ft_node_mark_removed_flip CASes &fn->next outside the
+		 * record layer, so it cannot be SW-parked; since @80e855f5 every
+		 * other writer of that word parks SW by default.  Its loop spins
+		 * out a parked FT_HLIST_TAG before its CAS, which covers
+		 * park-then-CAS -- but NOT the reverse: a CAS that lands first
+		 * on a clean word is overwritten by the parker's blind settle,
+		 * republishing the successor with the TOMBSTONE ERASED (see that
+		 * function's header for the full ordering).
+		 *
+		 * It is safe today only because this arm is not reached:
+		 * -DFT_DEBUG_CHAIN_CANARY scores the producer at raw = 0 in
+		 * ft_inv AND ft_unit at all three spacings, and the chain hold
+		 * audit gives this fallback no row at all.
+		 *
+		 * ☠ THAT IS A COVERAGE STATEMENT ABOUT TWO SUITES, NOT A PROOF,
+		 * and a stale one would be silent.  So count every entry and,
+		 * where the engine's own self-checks are armed, ABORT: if this
+		 * path ever becomes reachable it must be converted to a RECORDED
+		 * store before it runs, never re-argued.
+		 *
+		 * ☞ ASSERT ONLY, no counter: a counter on a path that never
+		 * executes is write-only in a release build (nothing prints
+		 * it), so it would be decoration.  The measurement above is the
+		 * record; this is what stops a silent regression.
+		 */
+		urcu_assert_debug(!"ft_detach_node standalone freeze reached: "
+			"raw CAS on a chain word that now parks SW -- convert "
+			"it to a recorded store");
 		for (fi = 0; fi < freeze_len && fn; fi++) {
 			struct cds_ft_node *fnext;
 
