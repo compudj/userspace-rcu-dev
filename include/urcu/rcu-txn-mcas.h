@@ -1278,7 +1278,8 @@ bool urcu_txn_desc_rebase_validate(struct urcu_txn_desc *t, void **slot,
  * aborts).
  *
  * Kind conflict on an already-recorded slot -- an SW record and an MW record on
- * the SAME slot in one txn -- is a contradiction (a slot is SW xor MW; see
+ * the SAME slot in one txn -- is a contradiction (a slot is SW xor MW, outside
+ * the lock-bearing-word exception urcu_txn_store_sw() documents; see
  * enum urcu_txn_kind).  Resolve it FAIL-SAFE: MW DOMINATES.  Promote the record
  * to the CAS-old install, which is correct whether or not the slot is actually
  * shared, where keeping the plain SW park would race a concurrent MW writer and

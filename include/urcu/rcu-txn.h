@@ -1108,6 +1108,34 @@ int urcu_txn_store_mw(struct urcu_txn *txn, void **slot,
  * just this one: a slot is SW xor MW, globally.  If any other transaction may
  * store_mw() the same slot, this park races that CAS -- store_mw() it here too.
  * See enum urcu_txn_kind in <urcu/rcu-txn-mcas.h>.
+ *
+ * ★ ONE EXCEPTION, AND IT IS A REAL ONE: A LOCK-BEARING WORD.  Where the slot
+ * itself carries a lock bit, a kind MIX on that one word is legal and is the
+ * intended protocol:
+ *
+ *   - the LOCK BIT is taken MW -- that CAS is the arbitration point, and it is
+ *     what makes the winner the exclusive writer;
+ *   - while the lock is HELD, the winner may update the word's OTHER bits and
+ *     sub-fields SW, including the bit that finally releases the lock;
+ *   - and it need not be one transaction: one txn may take the lock, a second
+ *     update state, a third unlock.
+ *
+ * So MW-then-SW on such a word is correct, and staying MW after the take is
+ * also correct -- just a wasted CAS.  Converting those follow-up writes to SW
+ * is therefore a PERFORMANCE step, never a correctness fix.
+ *
+ * ☠ SW-THEN-MW IS STILL THE BUG, and so is an MW writer that holds NOTHING: an
+ * MW CAS only arbitrates against writers that also CAS, so a store_mw() by an
+ * op that never took the lock races the holder's SW parks just as badly as a
+ * bare store would.  When you see a mix on a word, the question to ask is not
+ * "are the kinds consistent" but "does every MW writer of this word HOLD it".
+ *
+ * ☠ AND THE EXCEPTION IS ABOUT THE WORD, NOT THE STRUCTURE.  A word that
+ * carries no lock bit -- a child slot, a back edge, a list pointer -- gets no
+ * carve-out however well locked the surrounding operation is: nothing written
+ * TO that slot establishes exclusion over it, so every writer must agree on the
+ * kind.  Generalizing the carve-out from a lock-bearing word to an ordinary one
+ * is the mistake to avoid here; it has been made more than once.
  */
 static inline
 int urcu_txn_store_sw(struct urcu_txn *txn, void **slot,
