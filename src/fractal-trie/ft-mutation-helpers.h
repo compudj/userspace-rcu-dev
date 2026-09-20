@@ -2202,6 +2202,21 @@ struct ft_flip_txn *ft_flip_txn_create_at(FT_TK_SITE_PARAM struct cds_ft *ft)
 	t->nr_covered = 0;
 	t->sw_body = false;
 	/*
+	 * ☠ AND @sw_per_op, WHICH NOTHING USED TO SET.  Its only other writer is
+	 * ft_flip_txn_arm_per_op, so a txn armed TRIE-WIDE (door 1 / door 3) read
+	 * whatever the previous op left in the byte -- these constructors are
+	 * field-by-field with no memset, so an unset field IS the previous op.
+	 * Measured before the fix: of the armed non-take records in one ft_inv
+	 * leg, 272,835 read a byte that was neither 0 nor 1.
+	 *
+	 * It only ever DOWNGRADED -- garbage on a trie-wide arm reads as per-op,
+	 * so the kind decision below demanded an owner the op never registered
+	 * and recorded MW where door 1 licensed SW.  MW is always sound, so this
+	 * was a PERFORMANCE defect, never a wrong park: the per-op arm writes
+	 * true explicitly, and no path can read a spurious FALSE into it.
+	 */
+	t->sw_per_op = false;
+	/*
 	 * ☠ EXPLICITLY, EVERY TIME.  These structs are REUSED and this
 	 * constructor initialises field by field -- there is no memset -- so a
 	 * flag only ever SET would carry a previous op's trie answer into this
@@ -2453,6 +2468,21 @@ struct ft_flip_txn *ft_flip_txn_create_on_at(FT_TK_SITE_PARAM
 	t->nr_covered = 0;
 	t->sw_body = false;
 	/*
+	 * ☠ AND @sw_per_op, WHICH NOTHING USED TO SET.  Its only other writer is
+	 * ft_flip_txn_arm_per_op, so a txn armed TRIE-WIDE (door 1 / door 3) read
+	 * whatever the previous op left in the byte -- these constructors are
+	 * field-by-field with no memset, so an unset field IS the previous op.
+	 * Measured before the fix: of the armed non-take records in one ft_inv
+	 * leg, 272,835 read a byte that was neither 0 nor 1.
+	 *
+	 * It only ever DOWNGRADED -- garbage on a trie-wide arm reads as per-op,
+	 * so the kind decision below demanded an owner the op never registered
+	 * and recorded MW where door 1 licensed SW.  MW is always sound, so this
+	 * was a PERFORMANCE defect, never a wrong park: the per-op arm writes
+	 * true explicitly, and no path can read a spurious FALSE into it.
+	 */
+	t->sw_per_op = false;
+	/*
 	 * ☠ EXPLICITLY, EVERY TIME.  These structs are REUSED and this
 	 * constructor initialises field by field -- there is no memset -- so a
 	 * flag only ever SET would carry a previous op's trie answer into this
@@ -2536,6 +2566,21 @@ struct ft_flip_txn *ft_flip_txn_create_bounded_on_at(FT_TK_SITE_PARAM
 	t->cap_locks = FT_FLIP_TXN_FLOOR_LOCKS;
 	t->nr_covered = 0;
 	t->sw_body = false;
+	/*
+	 * ☠ AND @sw_per_op, WHICH NOTHING USED TO SET.  Its only other writer is
+	 * ft_flip_txn_arm_per_op, so a txn armed TRIE-WIDE (door 1 / door 3) read
+	 * whatever the previous op left in the byte -- these constructors are
+	 * field-by-field with no memset, so an unset field IS the previous op.
+	 * Measured before the fix: of the armed non-take records in one ft_inv
+	 * leg, 272,835 read a byte that was neither 0 nor 1.
+	 *
+	 * It only ever DOWNGRADED -- garbage on a trie-wide arm reads as per-op,
+	 * so the kind decision below demanded an owner the op never registered
+	 * and recorded MW where door 1 licensed SW.  MW is always sound, so this
+	 * was a PERFORMANCE defect, never a wrong park: the per-op arm writes
+	 * true explicitly, and no path can read a spurious FALSE into it.
+	 */
+	t->sw_per_op = false;
 	/*
 	 * ☠ EXPLICITLY, EVERY TIME.  These structs are REUSED and this
 	 * constructor initialises field by field -- there is no memset -- so a

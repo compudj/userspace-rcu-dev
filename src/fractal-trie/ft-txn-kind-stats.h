@@ -171,6 +171,14 @@ enum ft_tk_rec_class {
 	 *                gate working.  But it is the conversion's own residue on
 	 *                an already-converted op, so it belongs in the table
 	 *                rather than outside it.
+	 *
+	 * ☠ AND BOTH READ ZERO TODAY, which is worth stating because they did
+	 * not when they were added.  The 300-800k/leg that looked like "per-op
+	 * gate refusals" were TRIE-WIDE txns misread as per-op: @sw_per_op was
+	 * never initialised by any constructor, so an armed txn read the previous
+	 * op's byte.  With that fixed there are no genuine per-op refusals in
+	 * either suite -- so a NON-ZERO here is news, and the first thing to ask
+	 * of it is whether the flag it keys on is sound.
 	 */
 	FT_TK_OWN_ARMED_WIDE,
 	FT_TK_OWN_ARMED_PEROP,
@@ -480,6 +488,26 @@ struct ft_tk_tls *ft_tk_tls_get(void)
 static inline
 void ft_tk_count_rec(struct ft_tk_site *site, enum ft_tk_rec_class c)
 {
+	/*
+	 * ☞ A CLASS OUT OF RANGE IS NOT A COUNTING ERROR, IT IS A SPRAY.  @c is
+	 * a compile-time constant at every call site but one -- the ternary on
+	 * @sw_per_op -- and GCC compiles that as `base + (unsigned char)flag`
+	 * rather than a branch, so a flag byte that is neither 0 nor 1 indexes
+	 * PAST this row into whatever .bss follows it.  That is how an
+	 * uninitialised bool turned into a census that silently lost ~35k
+	 * records a leg AND corrupted its neighbours' counters, while every
+	 * static check ("one producer", "no state drift") came back clean.
+	 *
+	 * The bound costs a predicted compare in a debug build and turns that
+	 * whole failure mode into an immediate, located abort.
+	 */
+	if (caa_unlikely((unsigned int) c >= (unsigned int) FT_TK_REC_NR)) {
+		fprintf(stderr, "FT_TK BOUNDS: class=%d site=%s:%d ra=%p\n",
+			(int) c, site ? site->file : "?",
+			site ? site->line : -1,
+			__builtin_return_address(0));
+		abort();
+	}
 	ft_tk_tls_get()->rec[site ? ft_tk_site_id(site) : FT_TK_OVERFLOW_ID][c]++;
 }
 
